@@ -1019,7 +1019,10 @@ impl Kernel {
             }
             match stacks.iter_mut().find(|s| s.item == item) {
                 Some(stack) => stack.count = (stack.count + count).min(MAX_ITEM_STACK),
-                None => stacks.push(ItemStack { item, count: count.min(MAX_ITEM_STACK) }),
+                None => stacks.push(ItemStack {
+                    item,
+                    count: count.min(MAX_ITEM_STACK),
+                }),
             }
         }
         stacks
@@ -1029,7 +1032,9 @@ impl Kernel {
     /// equipment teach at the AP they start with. Empty for a character without a starting record
     /// (Cait Sith and Vincent) or without magic materia.
     pub fn equipped_spells(&self, who: CharacterId) -> Vec<u16> {
-        let record = u8::try_from(who.index()).ok().and_then(|id| self.init_character_by_id(id));
+        let record = u8::try_from(who.index())
+            .ok()
+            .and_then(|id| self.init_character_by_id(id));
         let mut spells: Vec<u16> = record
             .into_iter()
             .flat_map(|rec| rec.equipped_materia.iter())
@@ -1211,7 +1216,10 @@ mod tests {
         assert_eq!(k.sections()[26].file_type, 9);
         assert_eq!(k.section(0).unwrap().len(), 256);
         assert_eq!(k.section(4).unwrap().len(), ITEM_COUNT * ITEM_RECORD_SIZE);
-        assert_eq!(k.section(8).unwrap().len(), MATERIA_COUNT * MATERIA_RECORD_SIZE);
+        assert_eq!(
+            k.section(8).unwrap().len(),
+            MATERIA_COUNT * MATERIA_RECORD_SIZE
+        );
         assert!(k.section(27).is_none());
 
         // Commands.
@@ -1290,7 +1298,10 @@ mod tests {
         let k = Kernel::parse(&synthetic_kernel_bytes()).unwrap();
         // Potion: usable in battle, one ally, a flat heal (calc 0x26, Power 5), restorative element.
         let potion = k.item(0).unwrap();
-        assert_eq!((potion.target_flags, potion.damage_calc, potion.power), (0x01, 0x26, 5));
+        assert_eq!(
+            (potion.target_flags, potion.damage_calc, potion.power),
+            (0x01, 0x26, 5)
+        );
         assert_eq!(potion.element_mask, 0x0200);
         assert_eq!(potion.restrictions, 0xFFF8);
         assert!(potion.usable_in_battle());
@@ -1298,19 +1309,32 @@ mod tests {
         // Ether is the same with the "hits MP" bit (active low) cleared; Phoenix Down hits the dead.
         assert_eq!(k.item(3).unwrap().special_flags & 0x0001, 0);
         let phoenix = k.item(7).unwrap();
-        assert_eq!((phoenix.damage_calc, phoenix.power, phoenix.special_flags & 0x0100), (0x24, 8, 0));
+        assert_eq!(
+            (
+                phoenix.damage_calc,
+                phoenix.power,
+                phoenix.special_flags & 0x0100
+            ),
+            (0x24, 8, 0)
+        );
         assert_eq!(phoenix.status_mask, 1);
         // An item that restricts battle use says so; an unused record reads as calc 0xFF.
         assert!(!k.item(100).unwrap().usable_in_battle());
         assert_eq!(k.item(127).unwrap().damage_calc, 0xFF);
-        assert!(!k.item(127).unwrap().usable_in_battle(), "0xFFFF restrictions: nothing allowed");
+        assert!(
+            !k.item(127).unwrap().usable_in_battle(),
+            "0xFFFF restrictions: nothing allowed"
+        );
         // Past the table, and a truncated section, are `None`.
         assert!(k.item(128).is_none() && k.item(u16::MAX).is_none());
         let mut sections = synthetic_kernel_sections();
         sections[4].1.truncate(ITEM_RECORD_SIZE * 3 + 10);
         let short = Kernel::parse(&pack_kernel(&sections, &[])).unwrap();
         assert!(short.item(2).is_some());
-        assert!(short.item(3).is_none(), "a record cut short is not a record");
+        assert!(
+            short.item(3).is_none(),
+            "a record cut short is not a record"
+        );
         // Names come from the kernel's own text tables.
         assert_eq!(k.item_name(0).as_deref(), Some("Potion"));
         assert_eq!(k.item_name(7).as_deref(), Some("Phoenix Down"));
@@ -1325,7 +1349,10 @@ mod tests {
         let k = Kernel::parse(&synthetic_kernel_bytes()).unwrap();
         let fire = k.materia(49).unwrap();
         assert_eq!(fire.ap_levels, [20, 180, 350, 0xFFFF]);
-        assert_eq!((fire.kind, fire.attributes[..3].to_vec()), (0x19, vec![27, 28, 29]));
+        assert_eq!(
+            (fire.kind, fire.attributes[..3].to_vec()),
+            (0x19, vec![27, 28, 29])
+        );
         assert!(fire.is_magic());
         // Level 2 needs 2000 AP (20 * 100), level 3 18000, level 4 35000; the fourth threshold never comes.
         assert_eq!(fire.level_for_ap(0), 1);
@@ -1334,12 +1361,20 @@ mod tests {
         assert_eq!(fire.level_for_ap(17_999), 2);
         assert_eq!(fire.level_for_ap(18_000), 3);
         assert_eq!(fire.level_for_ap(35_000), 4);
-        assert_eq!(fire.level_for_ap(0xFF_FFFF), 4, "a threshold of 0xFFFF is never reached");
+        assert_eq!(
+            fire.level_for_ap(0xFF_FFFF),
+            4,
+            "a threshold of 0xFFFF is never reached"
+        );
         // The spells of a level are the attribute bytes of the slots up to it.
         assert_eq!(fire.spells_at_level(1), vec![27]);
         assert_eq!(fire.spells_at_level(2), vec![27, 28]);
         assert_eq!(fire.spells_at_level(3), vec![27, 28, 29]);
-        assert_eq!(fire.spells_at_level(9), vec![27, 28, 29], "levels past the fifth are clamped");
+        assert_eq!(
+            fire.spells_at_level(9),
+            vec![27, 28, 29],
+            "levels past the fifth are clamped"
+        );
         assert_eq!(fire.spells_at_level(0), vec![27], "there is no level 0");
         assert_eq!(fire.unlocked_spells(2000), vec![27, 28]);
         // Restore teaches Cure, Cure2, Regen (attack 3) and Cure3 (attack 2), listed in index order.
@@ -1364,20 +1399,42 @@ mod tests {
         let cloud = k.init_character_by_id(0).unwrap();
         assert_eq!(
             cloud.equipped_materia,
-            vec![EquippedMateria { id: 52, ap: 0 }, EquippedMateria { id: 50, ap: 0 }]
+            vec![
+                EquippedMateria { id: 52, ap: 0 },
+                EquippedMateria { id: 50, ap: 0 }
+            ]
         );
         // Weapon slots and armor slots are one list; a three-byte AP is read in full.
         let red = k.init_character_by_id(4).unwrap();
-        assert_eq!(red.equipped_materia, vec![EquippedMateria { id: 49, ap: 1000 }, EquippedMateria { id: 0, ap: 77 }]);
-        assert_eq!(k.init_character_by_id(8).unwrap().equipped_materia, vec![EquippedMateria { id: 73, ap: 0xFF_FFFF }]);
-        assert!(k.init_character_by_id(1).unwrap().equipped_materia.is_empty());
+        assert_eq!(
+            red.equipped_materia,
+            vec![
+                EquippedMateria { id: 49, ap: 1000 },
+                EquippedMateria { id: 0, ap: 77 }
+            ]
+        );
+        assert_eq!(
+            k.init_character_by_id(8).unwrap().equipped_materia,
+            vec![EquippedMateria {
+                id: 73,
+                ap: 0xFF_FFFF
+            }]
+        );
+        assert!(k
+            .init_character_by_id(1)
+            .unwrap()
+            .equipped_materia
+            .is_empty());
         // Cloud: Bolt (33) and Ice (30). Red XIII's Fire is still level 1 at 1000 AP, and his other
         // materia is not a magic one. The record with Restore at 2500 AP knows Cure and Cure2.
         assert_eq!(k.equipped_spells(CharacterId::Cloud), vec![30, 33]);
         assert_eq!(k.equipped_spells(CharacterId::RedXiii), vec![27]);
         assert_eq!(k.equipped_spells(CharacterId::Yuffie), vec![0, 1]);
         // Master Magic: everything up to Shield. Nobody else: nothing, and no record means no spells.
-        assert_eq!(k.equipped_spells(CharacterId::Cid), (0..=0x35).collect::<Vec<u16>>());
+        assert_eq!(
+            k.equipped_spells(CharacterId::Cid),
+            (0..=0x35).collect::<Vec<u16>>()
+        );
         assert!(k.equipped_spells(CharacterId::Barret).is_empty());
         assert!(k.equipped_spells(CharacterId::CaitSith).is_empty());
         assert!(k.equipped_spells(CharacterId::Vincent).is_empty());
@@ -1398,23 +1455,51 @@ mod tests {
         );
         // A stack never passes the game's cap of 99.
         let mut sections = synthetic_kernel_sections();
-        for (slot, raw) in [(10usize, (90u16 << 9) | 5), (11, (60 << 9) | 5), (12, (127 << 9) | 6)] {
+        for (slot, raw) in [
+            (10usize, (90u16 << 9) | 5),
+            (11, (60 << 9) | 5),
+            (12, (127 << 9) | 6),
+        ] {
             let at = OFF_INIT_ITEMS + slot * 2;
             sections[3].1[at..at + 2].copy_from_slice(&raw.to_le_bytes());
         }
-        let capped = Kernel::parse(&pack_kernel(&sections, &[])).unwrap().starting_inventory();
-        assert_eq!(capped.iter().find(|s| s.item == 5), Some(&ItemStack { item: 5, count: MAX_ITEM_STACK }));
-        assert_eq!(capped.iter().find(|s| s.item == 6), Some(&ItemStack { item: 6, count: MAX_ITEM_STACK }));
+        let capped = Kernel::parse(&pack_kernel(&sections, &[]))
+            .unwrap()
+            .starting_inventory();
+        assert_eq!(
+            capped.iter().find(|s| s.item == 5),
+            Some(&ItemStack {
+                item: 5,
+                count: MAX_ITEM_STACK
+            })
+        );
+        assert_eq!(
+            capped.iter().find(|s| s.item == 6),
+            Some(&ItemStack {
+                item: 6,
+                count: MAX_ITEM_STACK
+            })
+        );
         // A section that ends before the stock has none, whatever it holds before.
         let mut sections = synthetic_kernel_sections();
-        sections[3].1.truncate(CHARACTER_COUNT * INIT_CHARACTER_SIZE);
-        assert!(Kernel::parse(&pack_kernel(&sections, &[])).unwrap().starting_inventory().is_empty());
+        sections[3]
+            .1
+            .truncate(CHARACTER_COUNT * INIT_CHARACTER_SIZE);
+        assert!(Kernel::parse(&pack_kernel(&sections, &[]))
+            .unwrap()
+            .starting_inventory()
+            .is_empty());
         // And one that ends in the middle of it keeps what is there.
         let mut sections = synthetic_kernel_sections();
         sections[3].1.truncate(OFF_INIT_ITEMS + 4);
         assert_eq!(
-            Kernel::parse(&pack_kernel(&sections, &[])).unwrap().starting_inventory(),
-            vec![ItemStack { item: 0, count: 3 }, ItemStack { item: 3, count: 1 }]
+            Kernel::parse(&pack_kernel(&sections, &[]))
+                .unwrap()
+                .starting_inventory(),
+            vec![
+                ItemStack { item: 0, count: 3 },
+                ItemStack { item: 3, count: 1 }
+            ]
         );
     }
 

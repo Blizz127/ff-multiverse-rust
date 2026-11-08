@@ -552,7 +552,11 @@ fn real_kernel_has_spells_items_materia_and_a_starting_stock() {
         (42, "Demi"),
         (51, "FullCure"),
     ] {
-        assert_eq!(kernel.magic_name(index).as_deref(), Some(name), "spell {index}");
+        assert_eq!(
+            kernel.magic_name(index).as_deref(),
+            Some(name),
+            "spell {index}"
+        );
     }
     for (index, name) in [
         (0u16, "Potion"),
@@ -562,21 +566,48 @@ fn real_kernel_has_spells_items_materia_and_a_starting_stock() {
         (5, "Elixir"),
         (7, "Phoenix Down"),
     ] {
-        assert_eq!(kernel.item_name(index).as_deref(), Some(name), "item {index}");
+        assert_eq!(
+            kernel.item_name(index).as_deref(),
+            Some(name),
+            "item {index}"
+        );
     }
-    for (id, name) in [(49u8, "Fire"), (50, "Ice"), (52, "Lightning"), (53, "Restore")] {
-        assert_eq!(kernel.materia_name(id).as_deref(), Some(name), "materia {id}");
-        assert!(kernel.materia(id).unwrap().is_magic(), "{name} is a magic materia");
+    for (id, name) in [
+        (49u8, "Fire"),
+        (50, "Ice"),
+        (52, "Lightning"),
+        (53, "Restore"),
+    ] {
+        assert_eq!(
+            kernel.materia_name(id).as_deref(),
+            Some(name),
+            "materia {id}"
+        );
+        assert!(
+            kernel.materia(id).unwrap().is_magic(),
+            "{name} is a magic materia"
+        );
     }
-    assert_eq!(STARTER_MATERIA, [53, 49, 50, 52], "Restore, Fire, Ice, Lightning");
+    assert_eq!(
+        STARTER_MATERIA,
+        [53, 49, 50, 52],
+        "Restore, Fire, Ice, Lightning"
+    );
 
     // Restore teaches Cure at level 1; Fire, Ice and Lightning their first spell.
     let first = |id: u8| kernel.materia(id).unwrap().unlocked_spells(0);
-    assert_eq!([first(53), first(49), first(50), first(52)], [vec![0], vec![27], vec![30], vec![33]]);
+    assert_eq!(
+        [first(53), first(49), first(50), first(52)],
+        [vec![0], vec![27], vec![30], vec![33]]
+    );
 
     // Spells as the rules see them: Cure restores (Cure's own formula, MP 5), Fire damages with magic.
     let cure = Spell::from_attack(0, &kernel.attack(0).unwrap()).expect("Cure is castable");
-    assert!(cure.spec.heals() && cure.spec.kind == ActionKind::Magical && cure.spec.formula == Formula::Restore);
+    assert!(
+        cure.spec.heals()
+            && cure.spec.kind == ActionKind::Magical
+            && cure.spec.formula == Formula::Restore
+    );
     assert_eq!(cure.spec.mp_cost, 5);
     let fire = Spell::from_attack(27, &kernel.attack(27).unwrap()).expect("Fire is castable");
     assert!(!fire.spec.heals() && fire.spec.element_mask == element::FIRE);
@@ -585,7 +616,11 @@ fn real_kernel_has_spells_items_materia_and_a_starting_stock() {
 
     // Items: a Potion restores 100 HP, a Hi-Potion 500, an Ether 100 MP, a Phoenix Down revives.
     let table = ItemTable::from_kernel(&kernel);
-    let info = |i: u16| table.info(i).unwrap_or_else(|| panic!("item {i} is usable in battle"));
+    let info = |i: u16| {
+        table
+            .info(i)
+            .unwrap_or_else(|| panic!("item {i} is usable in battle"))
+    };
     assert_eq!(info(0).kind, ItemKind::RestoreHp);
     assert_eq!(info(2).kind, ItemKind::RestoreHp);
     assert_eq!(info(3).kind, ItemKind::RestoreMp);
@@ -597,15 +632,31 @@ fn real_kernel_has_spells_items_materia_and_a_starting_stock() {
     assert_eq!(amount(7), healthy.max_hp * 8 / 32);
     // Megalixir (every ally) is left out, and so are the status cures.
     assert!(table.info(6).is_none() && table.info(8).is_none());
-    assert!(table.len() >= 8 && table.len() < 60, "{} usable items", table.len());
+    assert!(
+        table.len() >= 8 && table.len() < 60,
+        "{} usable items",
+        table.len()
+    );
 
     // The starting stock and the materia of the starting records.
     assert_eq!(
         kernel.starting_inventory(),
-        vec![ItemStack { item: 0, count: 3 }, ItemStack { item: 3, count: 1 }, ItemStack { item: 7, count: 1 }]
+        vec![
+            ItemStack { item: 0, count: 3 },
+            ItemStack { item: 3, count: 1 },
+            ItemStack { item: 7, count: 1 }
+        ]
     );
-    assert_eq!(kernel.equipped_spells(CharacterId::Cloud), vec![30, 33], "Cloud starts with Ice and Lightning");
-    assert_eq!(kernel.equipped_spells(CharacterId::RedXiii), vec![27], "Red XIII starts with Fire");
+    assert_eq!(
+        kernel.equipped_spells(CharacterId::Cloud),
+        vec![30, 33],
+        "Cloud starts with Ice and Lightning"
+    );
+    assert_eq!(
+        kernel.equipped_spells(CharacterId::RedXiii),
+        vec![27],
+        "Red XIII starts with Fire"
+    );
     for who in [
         CharacterId::Barret,
         CharacterId::Tifa,
@@ -622,13 +673,22 @@ fn real_kernel_has_spells_items_materia_and_a_starting_stock() {
         let spells: Vec<u16> = party_spells(&kernel, who).iter().map(|s| s.index).collect();
         assert_eq!(spells, [0, 27, 30, 33], "{who:?}");
         let c = Combatant::from_character(&kernel, who, 10, None, None).unwrap();
-        assert!(c.magic > 0 && c.magic_defense > 0, "{who:?}: magic {} / magic defense {}", c.magic, c.magic_defense);
+        assert!(
+            c.magic > 0 && c.magic_defense > 0,
+            "{who:?}: magic {} / magic defense {}",
+            c.magic,
+            c.magic_defense
+        );
         assert!(c.max_mp >= 5, "{who:?} can cast Cure: {} MP", c.max_mp);
     }
     println!(
         "kernel: {} items usable in battle, starting stock {:?}",
         table.len(),
-        kernel.starting_inventory().iter().map(|s| (s.item, s.count)).collect::<Vec<_>>()
+        kernel
+            .starting_inventory()
+            .iter()
+            .map(|s| (s.item, s.count))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -640,7 +700,8 @@ fn real_enemies_have_attacks_and_affinities_the_rules_can_use() {
     let Some(sp) = scene_path() else { return };
     let bin = SceneBin::open(sp).expect("scene.bin");
 
-    let (mut enemies, mut with_actions, mut with_magic, mut with_cost, mut with_affinity) = (0, 0, 0, 0, 0);
+    let (mut enemies, mut with_actions, mut with_magic, mut with_cost, mut with_affinity) =
+        (0, 0, 0, 0, 0);
     for g in 0..bin.formation_count() {
         let formation = bin.formation(g).unwrap();
         for c in enemies_for_formation(formation.scene, formation.slot) {
@@ -650,15 +711,27 @@ fn real_enemies_have_attacks_and_affinities_the_rules_can_use() {
             with_cost += usize::from(c.actions.iter().any(|a| a.spec.mp_cost > 0));
             with_affinity += usize::from(!c.affinities.is_empty());
             // Every action is a damaging one the rules can play; every affinity is an element.
-            assert!(c.actions.iter().all(|a| a.spec.power > 0 && !a.spec.heals()), "{}", c.name);
+            assert!(
+                c.actions
+                    .iter()
+                    .all(|a| a.spec.power > 0 && !a.spec.heals()),
+                "{}",
+                c.name
+            );
             assert!(c.affinities.iter().all(|a| a.element < 16), "{}", c.name);
             assert!(c.actions.len() <= 16);
         }
     }
     assert!(enemies > 500, "{enemies} enemy placements");
     // Most enemies have a damaging attack of their own, a good many have a spell, some have affinities.
-    assert!(with_actions * 10 >= enemies * 8, "{with_actions} of {enemies} enemies have attacks");
-    assert!(with_magic > 20 && with_affinity > 100, "{with_magic} with magic, {with_affinity} with affinities");
+    assert!(
+        with_actions * 10 >= enemies * 8,
+        "{with_actions} of {enemies} enemies have attacks"
+    );
+    assert!(
+        with_magic > 20 && with_affinity > 100,
+        "{with_magic} with magic, {with_affinity} with affinities"
+    );
 
     // The first Midgar fights (the smoke formations 301 to 303): an MP with a gun and a tonfa, a Guard
     // Hound with a bite and a tentacle; physical, no MP, no affinities.
@@ -666,14 +739,23 @@ fn real_enemies_have_attacks_and_affinities_the_rules_can_use() {
         let formation = bin.formation(g).unwrap();
         for c in enemies_for_formation(formation.scene, formation.slot) {
             assert!(
-                !c.actions.is_empty() && c.actions.iter().all(|a| a.spec.kind == ActionKind::Physical && a.spec.mp_cost == 0),
+                !c.actions.is_empty()
+                    && c.actions
+                        .iter()
+                        .all(|a| a.spec.kind == ActionKind::Physical && a.spec.mp_cost == 0),
                 "{}",
                 c.name
             );
             assert!(c.affinities.is_empty(), "{}", c.name);
             match c.name.as_str() {
-                "MP" => assert_eq!(c.actions.iter().map(|a| a.id).collect::<Vec<_>>(), [272, 273]),
-                "Guard Hound" => assert_eq!(c.actions.iter().map(|a| a.id).collect::<Vec<_>>(), [274, 275]),
+                "MP" => assert_eq!(
+                    c.actions.iter().map(|a| a.id).collect::<Vec<_>>(),
+                    [272, 273]
+                ),
+                "Guard Hound" => assert_eq!(
+                    c.actions.iter().map(|a| a.id).collect::<Vec<_>>(),
+                    [274, 275]
+                ),
                 other => panic!("unexpected enemy {other} in formation {g}"),
             }
         }
@@ -692,7 +774,9 @@ fn real_battles_with_every_kind_of_command_are_deterministic_and_sane() {
     use fmv_ff7_battle::rules::{ActionRef, ActorId};
     use std::sync::Arc;
 
-    let (Some(sp), Some(kp)) = (scene_path(), kernel_path()) else { return };
+    let (Some(sp), Some(kp)) = (scene_path(), kernel_path()) else {
+        return;
+    };
     let bin = SceneBin::open(sp).expect("scene.bin");
     let kernel = Kernel::open(kp).expect("kernel.bin");
     let items = Arc::new(ItemTable::from_kernel(&kernel));
@@ -708,28 +792,50 @@ fn real_battles_with_every_kind_of_command_are_deterministic_and_sane() {
             seed,
             party,
             enemies_for_formation(f.scene, f.slot),
-            BattleConfig { start: StartMode::from_layout(f.setup().layout), ..BattleConfig::default() },
+            BattleConfig {
+                start: StartMode::from_layout(f.setup().layout),
+                ..BattleConfig::default()
+            },
         )
         .with_items(Arc::clone(&items))
     };
     // A policy that uses everything: attack, Fire (Cloud and Aerith both know it), Cure on the weakest
     // ally, a Potion, Defend, Phoenix Down on the dead.
     let policy = |state: &BattleState, actor: ActorId, round: u64| -> Command {
-        let enemy = state.enemy_ids().into_iter().find(|e| state.actor(*e).is_some_and(|c| c.is_alive())).unwrap();
+        let enemy = state
+            .enemy_ids()
+            .into_iter()
+            .find(|e| state.actor(*e).is_some_and(|c| c.is_alive()))
+            .unwrap();
         let weakest = state
             .party_ids()
             .into_iter()
             .filter(|a| state.actor(*a).is_some_and(|c| c.is_alive()))
             .min_by_key(|a| state.actor(*a).unwrap().hp)
             .unwrap();
-        let dead = state.party_ids().into_iter().find(|a| state.actor(*a).is_some_and(|c| !c.is_alive()));
+        let dead = state
+            .party_ids()
+            .into_iter()
+            .find(|a| state.actor(*a).is_some_and(|c| !c.is_alive()));
         let options = [
             Command::Attack { target: enemy },
-            Command::Magic { spell: 27, target: enemy },
-            Command::Magic { spell: 0, target: weakest },
-            Command::Item { item: 0, target: weakest },
+            Command::Magic {
+                spell: 27,
+                target: enemy,
+            },
+            Command::Magic {
+                spell: 0,
+                target: weakest,
+            },
+            Command::Item {
+                item: 0,
+                target: weakest,
+            },
             Command::Defend,
-            dead.map_or(Command::Attack { target: enemy }, |target| Command::Item { item: 7, target }),
+            dead.map_or(Command::Attack { target: enemy }, |target| Command::Item {
+                item: 7,
+                target,
+            }),
         ];
         let pick = options[(round + u64::from(actor.0)) as usize % options.len()];
         if state.check_command(actor, &pick).is_ok() {
@@ -753,7 +859,11 @@ fn real_battles_with_every_kind_of_command_are_deterministic_and_sane() {
                 }
                 round += 1;
                 let command = policy(&state, id, round);
-                log.extend(state.submit_command(id, command).expect("the policy only picks valid commands"));
+                log.extend(
+                    state
+                        .submit_command(id, command)
+                        .expect("the policy only picks valid commands"),
+                );
             }
             for c in state.actors() {
                 assert!(c.hp <= c.max_hp && c.mp <= c.max_mp);
@@ -768,7 +878,10 @@ fn real_battles_with_every_kind_of_command_are_deterministic_and_sane() {
             let (again, log_again) = play(seed, formation);
             assert_eq!(log, log_again, "formation {formation} seed {seed}");
             assert_eq!(state, again);
-            assert!(state.outcome().is_some(), "formation {formation} seed {seed} did not end");
+            assert!(
+                state.outcome().is_some(),
+                "formation {formation} seed {seed} did not end"
+            );
             runs += 1;
             wins += usize::from(state.outcome() == Some(Outcome::Victory));
             for e in &log {
@@ -784,6 +897,9 @@ fn real_battles_with_every_kind_of_command_are_deterministic_and_sane() {
         }
     }
     assert!(wins * 10 >= runs * 8, "the party won only {wins} of {runs}");
-    assert!(casts > 0 && items_used > 0 && enemy_attacks > 0, "casts {casts}, items {items_used}, enemy attacks {enemy_attacks}");
+    assert!(
+        casts > 0 && items_used > 0 && enemy_attacks > 0,
+        "casts {casts}, items {items_used}, enemy attacks {enemy_attacks}"
+    );
     println!("real battles with every command: {wins}/{runs} won; {casts} spells, {items_used} items, {enemy_attacks} enemy attacks");
 }

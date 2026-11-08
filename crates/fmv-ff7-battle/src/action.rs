@@ -138,7 +138,10 @@ impl Formula {
 
     /// Whether the random variance `(3841 + 0..=255)/4096` follows the formula (and so costs a roll).
     pub fn has_variance(self) -> bool {
-        matches!(self, Formula::Standard | Formula::Spell | Formula::Restore | Formula::Fixed)
+        matches!(
+            self,
+            Formula::Standard | Formula::Spell | Formula::Restore | Formula::Fixed
+        )
     }
 }
 
@@ -222,12 +225,21 @@ impl ActionSpec {
 
     /// A hand-made revival (Life's kind: a fraction `power / 32` of max HP, only for the dead).
     pub fn revive_spell(power: u32, mp_cost: u16) -> Self {
-        Self { formula: Formula::MaxHp, hits_dead: true, ..Self::cure_spell(power, mp_cost) }
+        Self {
+            formula: Formula::MaxHp,
+            hits_dead: true,
+            ..Self::cure_spell(power, mp_cost)
+        }
     }
 
     /// A hand-made flat restoring item (Potion's kind: `20 * power` HP, or MP when `mp` is set).
     pub fn flat_restore_item(power: u32, mp: bool) -> Self {
-        Self { formula: Formula::Flat, hits_mp: mp, rolls_accuracy: false, ..Self::cure_spell(power, 0) }
+        Self {
+            formula: Formula::Flat,
+            hits_mp: mp,
+            rolls_accuracy: false,
+            ..Self::cure_spell(power, 0)
+        }
     }
 
     /// Decode an attack record (a spell of the kernel's attack table or an enemy's attack of
@@ -247,7 +259,15 @@ impl ActionSpec {
     /// Decode an item record, or `None` if the rules do not model it. Items have no accuracy byte and
     /// are never missed.
     pub fn from_item(rec: &ItemRecord) -> Option<Self> {
-        let mut spec = Self::decode(rec.damage_calc, u32::from(rec.power), 255, 0, rec.target_flags, rec.element_mask, rec.special_flags)?;
+        let mut spec = Self::decode(
+            rec.damage_calc,
+            u32::from(rec.power),
+            255,
+            0,
+            rec.target_flags,
+            rec.element_mask,
+            rec.special_flags,
+        )?;
         // Items that do something else as well (Stardust, Smoke Bomb, Hero Drink) are not modelled.
         if rec.extra_effect != 0xFF {
             return None;
@@ -281,7 +301,8 @@ impl ActionSpec {
         if formula == Formula::Full && element_mask & element::RESTORATIVE == 0 {
             return None;
         }
-        let aimable = target_flags & TARGET_MULTI_DEFAULT == 0 || target_flags & TARGET_TOGGLE_MULTI != 0;
+        let aimable =
+            target_flags & TARGET_MULTI_DEFAULT == 0 || target_flags & TARGET_TOGGLE_MULTI != 0;
         Some(Self {
             kind,
             formula,
@@ -303,7 +324,10 @@ impl ActionSpec {
     /// with formula 4, 5, 6 or 8. Such an action is aimed at an ally.
     pub fn heals(&self) -> bool {
         self.element_mask & element::RESTORATIVE != 0
-            && matches!(self.formula, Formula::MaxHp | Formula::Restore | Formula::Flat | Formula::Full)
+            && matches!(
+                self.formula,
+                Formula::MaxHp | Formula::Restore | Formula::Flat | Formula::Full
+            )
     }
 }
 
@@ -327,13 +351,18 @@ impl Spell {
     /// magical, have a Power, hit one target (not a whole side), and have no extra effect.
     pub fn from_attack(index: u16, rec: &AttackRecord) -> Option<Self> {
         let spec = ActionSpec::from_attack(rec)?;
-        let castable = spec.kind == ActionKind::Magical && !spec.unaimable && rec.extra_effect == 0xFF;
+        let castable =
+            spec.kind == ActionKind::Magical && !spec.unaimable && rec.extra_effect == 0xFF;
         castable.then_some(Self { index, spec })
     }
 
     /// What a menu needs to know about the spell.
     pub fn info(&self) -> SpellInfo {
-        SpellInfo { spell: self.index, mp_cost: self.spec.mp_cost, targets_allies: self.spec.heals() }
+        SpellInfo {
+            spell: self.index,
+            mp_cost: self.spec.mp_cost,
+            targets_allies: self.spec.heals(),
+        }
     }
 }
 
@@ -366,7 +395,10 @@ impl EnemyAction {
         }
         spec.short_range = spec.kind == ActionKind::Physical;
         spec.unaimable = false;
-        Some(Self { id: attack.id, spec })
+        Some(Self {
+            id: attack.id,
+            spec,
+        })
     }
 }
 
@@ -389,9 +421,11 @@ pub fn affinity_response(affinities: &[ElementAffinity], mask: u16) -> Option<Af
         AffinityRate::Half,
         AffinityRate::Double,
     ];
-    ORDER
-        .into_iter()
-        .find(|rate| affinities.iter().any(|a| a.rate == *rate && a.element < 16 && mask & (1u16 << a.element) != 0))
+    ORDER.into_iter().find(|rate| {
+        affinities
+            .iter()
+            .any(|a| a.rate == *rate && a.element < 16 && mask & (1u16 << a.element) != 0)
+    })
 }
 
 /// A damage multiplier from an element: double for a weakness, half for a resistance.
@@ -469,7 +503,12 @@ impl ItemData {
     /// What a menu needs to know about item `item`.
     pub fn info(&self, item: u16) -> ItemInfo {
         let kind = self.kind();
-        ItemInfo { item, kind, targets_allies: kind != ItemKind::Damage, revives: kind == ItemKind::Revive }
+        ItemInfo {
+            item,
+            kind,
+            targets_allies: kind != ItemKind::Damage,
+            revives: kind == ItemKind::Revive,
+        }
     }
 }
 
@@ -498,7 +537,9 @@ pub struct ItemTable {
 impl ItemTable {
     /// A table of exactly these items (tests and hand-made rule sets).
     pub fn new(items: impl IntoIterator<Item = (u16, ItemData)>) -> Self {
-        Self { items: items.into_iter().collect() }
+        Self {
+            items: items.into_iter().collect(),
+        }
     }
 
     /// Every record of the kernel's item table that the rules can use in battle.
@@ -536,17 +577,29 @@ mod tests {
     use super::*;
     use crate::testutil::{attack_record, synthetic_kernel_bytes};
 
-    fn attack(calc: u8, power: u8, accuracy: u8, target: u8, element: u16, flags: u16) -> AttackRecord {
+    fn attack(
+        calc: u8,
+        power: u8,
+        accuracy: u8,
+        target: u8,
+        element: u16,
+        flags: u16,
+    ) -> AttackRecord {
         attack_record(calc, power, accuracy, target, element, flags, 7)
     }
 
     #[test]
     fn the_high_nybble_says_how_it_can_miss_and_the_low_one_what_the_formula_is() {
         // The restorative element, so that formula 8 (a recovery) has a meaning.
-        let spec = |calc| ActionSpec::from_attack(&attack(calc, 10, 100, 0x03, element::RESTORATIVE, 0xFFFF));
+        let spec = |calc| {
+            ActionSpec::from_attack(&attack(calc, 10, 100, 0x03, element::RESTORATIVE, 0xFFFF))
+        };
         // Physical, accuracy roll, can crit: the enemy's plain attack.
         let basic = spec(0x11).unwrap();
-        assert_eq!((basic.kind, basic.formula), (ActionKind::Physical, Formula::Standard));
+        assert_eq!(
+            (basic.kind, basic.formula),
+            (ActionKind::Physical, Formula::Standard)
+        );
         assert!(basic.rolls_accuracy && basic.can_crit);
         // 0x01 and 0x31 never miss and never crit; 0xA1 rolls and crits; 0xB1 rolls without crit.
         for calc in [0x01, 0x31] {
@@ -559,11 +612,16 @@ mod tests {
         assert!(b.rolls_accuracy && !b.can_crit);
         // Magic: 0x2X rolls, 0x4X / 0x5X never miss; magic never crits.
         let fire = spec(0x22).unwrap();
-        assert_eq!((fire.kind, fire.formula), (ActionKind::Magical, Formula::Spell));
+        assert_eq!(
+            (fire.kind, fire.formula),
+            (ActionKind::Magical, Formula::Spell)
+        );
         assert!(fire.rolls_accuracy && !fire.can_crit);
         assert!(!spec(0x42).unwrap().rolls_accuracy && !spec(0x52).unwrap().rolls_accuracy);
         // Every low nybble from 1 to 8 is a formula, and the others are not.
-        let formulas: Vec<Formula> = (1..=8).map(|low| spec(0x20 | low).unwrap().formula).collect();
+        let formulas: Vec<Formula> = (1..=8)
+            .map(|low| spec(0x20 | low).unwrap().formula)
+            .collect();
         assert_eq!(
             formulas,
             [
@@ -577,19 +635,28 @@ mod tests {
                 Formula::Full
             ]
         );
-        for calc in [0x20, 0x29, 0x2F, 0x00, 0x50, 0x60, 0x61, 0x69, 0x71, 0x83, 0x91, 0xC1, 0xFF] {
+        for calc in [
+            0x20, 0x29, 0x2F, 0x00, 0x50, 0x60, 0x61, 0x69, 0x71, 0x83, 0x91, 0xC1, 0xFF,
+        ] {
             assert!(spec(calc).is_none(), "{calc:#x} is not modelled");
         }
         // Variance follows formulas 1, 2, 5 and 7 only.
-        let with: Vec<bool> = (1..=8).map(|low| Formula::from_code(low).unwrap().has_variance()).collect();
+        let with: Vec<bool> = (1..=8)
+            .map(|low| Formula::from_code(low).unwrap().has_variance())
+            .collect();
         assert_eq!(with, [true, true, false, false, true, false, true, false]);
     }
 
     #[test]
     fn a_power_of_zero_is_a_status_and_is_left_out_except_for_the_full_restore() {
-        assert!(ActionSpec::from_attack(&attack(0x22, 0, 100, 0x0D, 0, 0xFDFF)).is_none(), "Regen: status only");
+        assert!(
+            ActionSpec::from_attack(&attack(0x22, 0, 100, 0x0D, 0, 0xFDFF)).is_none(),
+            "Regen: status only"
+        );
         assert!(ActionSpec::from_attack(&attack(0x11, 0, 100, 0x03, 0, 0xFFFF)).is_none());
-        let elixir = ActionSpec::from_attack(&attack(0x08, 0, 255, 0x01, element::RESTORATIVE, 0xFFFF)).unwrap();
+        let elixir =
+            ActionSpec::from_attack(&attack(0x08, 0, 255, 0x01, element::RESTORATIVE, 0xFFFF))
+                .unwrap();
         assert_eq!(elixir.formula, Formula::Full);
         assert!(elixir.heals());
         // "Everything" without the restorative element means nothing.
@@ -600,34 +667,91 @@ mod tests {
     fn the_flags_are_active_low_and_the_targeting_bits_decide_whether_it_can_be_aimed() {
         // Cure (0x25, Power 5): restorative, hits HP, the living, aimable (0x0D: selection, whole side
         // by default, toggle to one).
-        let cure = ActionSpec::from_attack(&attack(0x25, 5, 255, 0x0D, element::RESTORATIVE, 0xFDFF)).unwrap();
-        assert!(cure.heals() && !cure.hits_mp && !cure.hits_dead && !cure.unaimable && !cure.ignores_defense);
+        let cure =
+            ActionSpec::from_attack(&attack(0x25, 5, 255, 0x0D, element::RESTORATIVE, 0xFDFF))
+                .unwrap();
+        assert!(
+            cure.heals()
+                && !cure.hits_mp
+                && !cure.hits_dead
+                && !cure.unaimable
+                && !cure.ignores_defense
+        );
         // Life: the dead only (bit 0x0100 cleared).
-        let life = ActionSpec::from_attack(&attack(0x24, 8, 255, 0x0D, element::RESTORATIVE, 0xFCFD)).unwrap();
+        let life =
+            ActionSpec::from_attack(&attack(0x24, 8, 255, 0x0D, element::RESTORATIVE, 0xFCFD))
+                .unwrap();
         assert!(life.hits_dead && life.heals());
         // Ether: hits MP (bit 0x0001 cleared).
-        let ether = ActionSpec::from_attack(&attack(0x26, 5, 255, 0x01, element::RESTORATIVE, 0xFFFE)).unwrap();
+        let ether =
+            ActionSpec::from_attack(&attack(0x26, 5, 255, 0x01, element::RESTORATIVE, 0xFFFE))
+                .unwrap();
         assert!(ether.hits_mp && !ether.hits_dead);
         // Piercing: bit 0x0400 cleared.
-        assert!(ActionSpec::from_attack(&attack(0x22, 5, 100, 0x0F, 0, 0xFBFF)).unwrap().ignores_defense);
+        assert!(
+            ActionSpec::from_attack(&attack(0x22, 5, 100, 0x0F, 0, 0xFBFF))
+                .unwrap()
+                .ignores_defense
+        );
         // Ultima (0x07): a whole side with no toggle; random targets (0x80) cannot be aimed either.
-        assert!(ActionSpec::from_attack(&attack(0x22, 5, 100, 0x07, 0, 0xFFFF)).unwrap().unaimable);
-        assert!(ActionSpec::from_attack(&attack(0x22, 5, 100, 0x81, 0, 0xFFFF)).unwrap().unaimable);
+        assert!(
+            ActionSpec::from_attack(&attack(0x22, 5, 100, 0x07, 0, 0xFFFF))
+                .unwrap()
+                .unaimable
+        );
+        assert!(
+            ActionSpec::from_attack(&attack(0x22, 5, 100, 0x81, 0, 0xFFFF))
+                .unwrap()
+                .unaimable
+        );
         // Fire (0x0F: toggle) and Comet (0x03: one target) can be aimed; 0x20 is short range.
-        assert!(!ActionSpec::from_attack(&attack(0x22, 5, 100, 0x0F, 0, 0xFFFF)).unwrap().unaimable);
-        assert!(!ActionSpec::from_attack(&attack(0x22, 5, 100, 0x03, 0, 0xFFFF)).unwrap().unaimable);
-        assert!(ActionSpec::from_attack(&attack(0x11, 5, 100, 0x23, 0, 0xFFFF)).unwrap().short_range);
+        assert!(
+            !ActionSpec::from_attack(&attack(0x22, 5, 100, 0x0F, 0, 0xFFFF))
+                .unwrap()
+                .unaimable
+        );
+        assert!(
+            !ActionSpec::from_attack(&attack(0x22, 5, 100, 0x03, 0, 0xFFFF))
+                .unwrap()
+                .unaimable
+        );
+        assert!(
+            ActionSpec::from_attack(&attack(0x11, 5, 100, 0x23, 0, 0xFFFF))
+                .unwrap()
+                .short_range
+        );
         // Healing needs the restorative element AND a healing formula: Gravity-like MaxHp damage hurts.
-        assert!(!ActionSpec::from_attack(&attack(0x24, 8, 100, 0x0F, element::GRAVITY, 0xFFFF)).unwrap().heals());
-        assert!(!ActionSpec::from_attack(&attack(0x22, 8, 100, 0x0F, element::RESTORATIVE, 0xFFFF)).unwrap().heals());
+        assert!(
+            !ActionSpec::from_attack(&attack(0x24, 8, 100, 0x0F, element::GRAVITY, 0xFFFF))
+                .unwrap()
+                .heals()
+        );
+        assert!(!ActionSpec::from_attack(&attack(
+            0x22,
+            8,
+            100,
+            0x0F,
+            element::RESTORATIVE,
+            0xFFFF
+        ))
+        .unwrap()
+        .heals());
     }
 
     #[test]
     fn spells_must_be_magical_aimable_and_without_side_effects() {
         let fire = attack(0x22, 8, 100, 0x0F, element::FIRE, 0xFDFF);
         let spell = Spell::from_attack(27, &fire).unwrap();
-        assert_eq!(spell.info(), SpellInfo { spell: 27, mp_cost: 7, targets_allies: false });
-        let cure = Spell::from_attack(0, &attack(0x25, 5, 255, 0x0D, element::RESTORATIVE, 0xFDFF)).unwrap();
+        assert_eq!(
+            spell.info(),
+            SpellInfo {
+                spell: 27,
+                mp_cost: 7,
+                targets_allies: false
+            }
+        );
+        let cure = Spell::from_attack(0, &attack(0x25, 5, 255, 0x0D, element::RESTORATIVE, 0xFDFF))
+            .unwrap();
         assert!(cure.info().targets_allies);
         // A physical record, a whole-side spell, a status and a spell with an extra effect are not spells.
         assert!(Spell::from_attack(3, &attack(0x11, 24, 90, 0x03, 0, 0xFFFF)).is_none());
@@ -640,41 +764,122 @@ mod tests {
 
     #[test]
     fn an_enemy_attack_ignores_its_aim_and_is_row_sensitive_when_physical() {
-        let scene_attack = |id, record| SceneAttack { id, name: "x".into(), record };
-        let bite = EnemyAction::from_scene(&scene_attack(0x0301, attack(0x11, 16, 100, 0x03, element::HIT, 0xFFFF))).unwrap();
+        let scene_attack = |id, record| SceneAttack {
+            id,
+            name: "x".into(),
+            record,
+        };
+        let bite = EnemyAction::from_scene(&scene_attack(
+            0x0301,
+            attack(0x11, 16, 100, 0x03, element::HIT, 0xFFFF),
+        ))
+        .unwrap();
         assert!(bite.spec.short_range && bite.id == 0x0301);
-        let ultima = EnemyAction::from_scene(&scene_attack(9, attack(0x22, 105, 100, 0x07, 0, 0xFFFF))).unwrap();
-        assert!(!ultima.spec.unaimable && !ultima.spec.short_range, "an enemy picks its own target; magic ignores rows");
+        let ultima =
+            EnemyAction::from_scene(&scene_attack(9, attack(0x22, 105, 100, 0x07, 0, 0xFFFF)))
+                .unwrap();
+        assert!(
+            !ultima.spec.unaimable && !ultima.spec.short_range,
+            "an enemy picks its own target; magic ignores rows"
+        );
         // Healing and status attacks are not something an enemy is modelled to do.
-        assert!(EnemyAction::from_scene(&scene_attack(1, attack(0x25, 5, 255, 0x0D, element::RESTORATIVE, 0xFDFF))).is_none());
-        assert!(EnemyAction::from_scene(&scene_attack(2, attack(0x22, 0, 100, 0x03, 0, 0xFFFF))).is_none());
-        assert!(EnemyAction::from_scene(&scene_attack(3, attack(0x00, 0, 100, 0x03, 0, 0xFFFF))).is_none());
-        assert!(EnemyAction::from_scene(&scene_attack(4, attack(0x61, 0, 100, 0x03, 0, 0xFFFF))).is_none());
+        assert!(EnemyAction::from_scene(&scene_attack(
+            1,
+            attack(0x25, 5, 255, 0x0D, element::RESTORATIVE, 0xFDFF)
+        ))
+        .is_none());
+        assert!(
+            EnemyAction::from_scene(&scene_attack(2, attack(0x22, 0, 100, 0x03, 0, 0xFFFF)))
+                .is_none()
+        );
+        assert!(
+            EnemyAction::from_scene(&scene_attack(3, attack(0x00, 0, 100, 0x03, 0, 0xFFFF)))
+                .is_none()
+        );
+        assert!(
+            EnemyAction::from_scene(&scene_attack(4, attack(0x61, 0, 100, 0x03, 0, 0xFFFF)))
+                .is_none()
+        );
     }
 
     #[test]
     fn affinities_answer_by_element_with_a_fixed_precedence() {
         let aff = |element, rate| ElementAffinity { element, rate };
-        let table = [aff(0, AffinityRate::Double), aff(1, AffinityRate::Half), aff(2, AffinityRate::Nullify), aff(3, AffinityRate::Absorb), aff(4, AffinityRate::Death), aff(5, AffinityRate::FullHeal)];
-        assert_eq!(affinity_response(&table, element::FIRE), Some(AffinityRate::Double));
-        assert_eq!(affinity_response(&table, element::ICE), Some(AffinityRate::Half));
-        assert_eq!(affinity_response(&table, element::BOLT), Some(AffinityRate::Nullify));
-        assert_eq!(affinity_response(&table, element::EARTH), Some(AffinityRate::Absorb));
-        assert_eq!(affinity_response(&table, element::POISON), Some(AffinityRate::Death));
-        assert_eq!(affinity_response(&table, element::GRAVITY), Some(AffinityRate::FullHeal));
-        assert_eq!(affinity_response(&table, element::WATER), None, "no entry: normal damage");
-        assert_eq!(affinity_response(&table, 0), None, "no element: nothing applies");
+        let table = [
+            aff(0, AffinityRate::Double),
+            aff(1, AffinityRate::Half),
+            aff(2, AffinityRate::Nullify),
+            aff(3, AffinityRate::Absorb),
+            aff(4, AffinityRate::Death),
+            aff(5, AffinityRate::FullHeal),
+        ];
+        assert_eq!(
+            affinity_response(&table, element::FIRE),
+            Some(AffinityRate::Double)
+        );
+        assert_eq!(
+            affinity_response(&table, element::ICE),
+            Some(AffinityRate::Half)
+        );
+        assert_eq!(
+            affinity_response(&table, element::BOLT),
+            Some(AffinityRate::Nullify)
+        );
+        assert_eq!(
+            affinity_response(&table, element::EARTH),
+            Some(AffinityRate::Absorb)
+        );
+        assert_eq!(
+            affinity_response(&table, element::POISON),
+            Some(AffinityRate::Death)
+        );
+        assert_eq!(
+            affinity_response(&table, element::GRAVITY),
+            Some(AffinityRate::FullHeal)
+        );
+        assert_eq!(
+            affinity_response(&table, element::WATER),
+            None,
+            "no entry: normal damage"
+        );
+        assert_eq!(
+            affinity_response(&table, 0),
+            None,
+            "no element: nothing applies"
+        );
         // Several elements: the strongest answer in the order Absorb, Full heal, Nullify, Death, Half, Double.
-        assert_eq!(affinity_response(&table, element::FIRE | element::ICE), Some(AffinityRate::Half));
-        assert_eq!(affinity_response(&table, element::FIRE | element::BOLT), Some(AffinityRate::Nullify));
-        assert_eq!(affinity_response(&table, element::BOLT | element::EARTH | element::GRAVITY), Some(AffinityRate::Absorb));
-        assert_eq!(affinity_response(&table, element::POISON | element::ICE), Some(AffinityRate::Death));
+        assert_eq!(
+            affinity_response(&table, element::FIRE | element::ICE),
+            Some(AffinityRate::Half)
+        );
+        assert_eq!(
+            affinity_response(&table, element::FIRE | element::BOLT),
+            Some(AffinityRate::Nullify)
+        );
+        assert_eq!(
+            affinity_response(&table, element::BOLT | element::EARTH | element::GRAVITY),
+            Some(AffinityRate::Absorb)
+        );
+        assert_eq!(
+            affinity_response(&table, element::POISON | element::ICE),
+            Some(AffinityRate::Death)
+        );
         // Codes that are not elements (a status code, an unknown rate) never apply or scale damage.
-        let odd = [aff(0x22, AffinityRate::Double), aff(0, AffinityRate::Other(3)), aff(200, AffinityRate::Half)];
+        let odd = [
+            aff(0x22, AffinityRate::Double),
+            aff(0, AffinityRate::Other(3)),
+            aff(200, AffinityRate::Half),
+        ];
         assert_eq!(affinity_response(&odd, 0xFFFF), None);
         assert_eq!(Elemental::of(Some(AffinityRate::Double)), Elemental::Double);
         assert_eq!(Elemental::of(Some(AffinityRate::Half)), Elemental::Half);
-        for rate in [AffinityRate::Nullify, AffinityRate::Absorb, AffinityRate::Death, AffinityRate::FullHeal, AffinityRate::Other(1)] {
+        for rate in [
+            AffinityRate::Nullify,
+            AffinityRate::Absorb,
+            AffinityRate::Death,
+            AffinityRate::FullHeal,
+            AffinityRate::Other(1),
+        ] {
             assert_eq!(Elemental::of(Some(rate)), Elemental::Normal);
         }
         assert_eq!(Elemental::of(None), Elemental::Normal);
@@ -685,17 +890,42 @@ mod tests {
     #[test]
     fn the_hand_made_specs_equal_what_the_decoder_makes_of_the_real_kinds_of_record() {
         let from = |calc, power, accuracy, targets, element, flags, mp| {
-            ActionSpec::from_attack(&attack_record(calc, power, accuracy, targets, element, flags, mp)).unwrap()
+            ActionSpec::from_attack(&attack_record(
+                calc, power, accuracy, targets, element, flags, mp,
+            ))
+            .unwrap()
         };
-        assert_eq!(ActionSpec::damage_spell(8, 100, element::FIRE, 4), from(0x22, 8, 100, 0x0F, element::FIRE, 0xFDFF, 4));
-        assert_eq!(ActionSpec::cure_spell(5, 5), from(0x25, 5, 255, 0x0D, element::RESTORATIVE, 0xFDFF, 5));
-        assert_eq!(ActionSpec::revive_spell(8, 34), from(0x24, 8, 255, 0x0D, element::RESTORATIVE, 0xFCFD, 34));
+        assert_eq!(
+            ActionSpec::damage_spell(8, 100, element::FIRE, 4),
+            from(0x22, 8, 100, 0x0F, element::FIRE, 0xFDFF, 4)
+        );
+        assert_eq!(
+            ActionSpec::cure_spell(5, 5),
+            from(0x25, 5, 255, 0x0D, element::RESTORATIVE, 0xFDFF, 5)
+        );
+        assert_eq!(
+            ActionSpec::revive_spell(8, 34),
+            from(0x24, 8, 255, 0x0D, element::RESTORATIVE, 0xFCFD, 34)
+        );
         let table = ItemTable::from_kernel(&Kernel::parse(&synthetic_kernel_bytes()).unwrap());
-        assert_eq!(ActionSpec::flat_restore_item(5, false), table.get(0).unwrap().spec, "Potion");
-        assert_eq!(ActionSpec::flat_restore_item(5, true), table.get(3).unwrap().spec, "Ether");
+        assert_eq!(
+            ActionSpec::flat_restore_item(5, false),
+            table.get(0).unwrap().spec,
+            "Potion"
+        );
+        assert_eq!(
+            ActionSpec::flat_restore_item(5, true),
+            table.get(3).unwrap().spec,
+            "Ether"
+        );
         let hand = ItemTable::new([(0, ItemData::new(ActionSpec::flat_restore_item(5, false)))]);
         assert_eq!(hand.info(0).map(|i| i.kind), Some(ItemKind::RestoreHp));
-        assert_eq!(Spell::new(27, ActionSpec::damage_spell(8, 100, element::FIRE, 4)).info().mp_cost, 4);
+        assert_eq!(
+            Spell::new(27, ActionSpec::damage_spell(8, 100, element::FIRE, 4))
+                .info()
+                .mp_cost,
+            4
+        );
     }
 
     #[test]
@@ -704,23 +934,53 @@ mod tests {
         let table = ItemTable::from_kernel(&kernel);
         // Potion, Hi-Potion, X-Potion, Ether, Turbo Ether, Elixir, Phoenix Down, Grenade. Not: Megalixir
         // (every ally at once), Antidote (a status), the item that forbids battle use, unused records.
-        assert_eq!(table.indexes().collect::<Vec<_>>(), [0, 1, 2, 3, 4, 5, 7, 20]);
+        assert_eq!(
+            table.indexes().collect::<Vec<_>>(),
+            [0, 1, 2, 3, 4, 5, 7, 20]
+        );
         assert_eq!(table.len(), 8);
         assert!(!table.is_empty() && ItemTable::default().is_empty());
         let info = |i| table.info(i).unwrap();
-        assert_eq!(info(0), ItemInfo { item: 0, kind: ItemKind::RestoreHp, targets_allies: true, revives: false });
+        assert_eq!(
+            info(0),
+            ItemInfo {
+                item: 0,
+                kind: ItemKind::RestoreHp,
+                targets_allies: true,
+                revives: false
+            }
+        );
         assert_eq!(info(2).kind, ItemKind::RestoreHp);
         assert_eq!(info(3).kind, ItemKind::RestoreMp);
         assert_eq!(info(4).kind, ItemKind::RestoreMp);
         assert_eq!(info(5).kind, ItemKind::RestoreAll);
-        assert_eq!(info(7), ItemInfo { item: 7, kind: ItemKind::Revive, targets_allies: true, revives: true });
-        assert_eq!(info(20), ItemInfo { item: 20, kind: ItemKind::Damage, targets_allies: false, revives: false });
+        assert_eq!(
+            info(7),
+            ItemInfo {
+                item: 7,
+                kind: ItemKind::Revive,
+                targets_allies: true,
+                revives: true
+            }
+        );
+        assert_eq!(
+            info(20),
+            ItemInfo {
+                item: 20,
+                kind: ItemKind::Damage,
+                targets_allies: false,
+                revives: false
+            }
+        );
         for gone in [6u16, 8, 100, 127, 128, 9999] {
             assert!(table.info(gone).is_none(), "item {gone}");
         }
         // Potion: a flat heal that cannot miss; Ether hits MP; Phoenix Down hits the dead only.
         let potion = table.get(0).unwrap().spec;
-        assert_eq!((potion.formula, potion.power, potion.rolls_accuracy), (Formula::Flat, 5, false));
+        assert_eq!(
+            (potion.formula, potion.power, potion.rolls_accuracy),
+            (Formula::Flat, 5, false)
+        );
         assert!(table.get(3).unwrap().spec.hits_mp);
         assert!(table.get(7).unwrap().spec.hits_dead);
         // A hand-made table holds exactly what it is given.

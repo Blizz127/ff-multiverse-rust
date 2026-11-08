@@ -422,12 +422,12 @@ pub fn init_section() -> Vec<u8> {
         s[at..at + 2].copy_from_slice(&0xFFFFu16.to_le_bytes());
     }
     let stock: [u16; 6] = [
-        3 << 9,           // Potion x3
-        (1 << 9) | 3,     // Ether x1
-        (1 << 9) | 7,     // Phoenix Down x1
-        (1 << 9) | 130,   // a weapon (index 128 and up): not an item, left out
-        2 << 9,           // more Potions in another slot: merged into the first stack
-        0x0000,           // item 0 with a count of 0: nothing
+        3 << 9,         // Potion x3
+        (1 << 9) | 3,   // Ether x1
+        (1 << 9) | 7,   // Phoenix Down x1
+        (1 << 9) | 130, // a weapon (index 128 and up): not an item, left out
+        2 << 9,         // more Potions in another slot: merged into the first stack
+        0x0000,         // item 0 with a count of 0: nothing
     ];
     for (slot, raw) in stock.iter().enumerate() {
         let at = OFF_INIT_ITEMS + slot * 2;
@@ -673,15 +673,35 @@ pub fn synthetic_kernel_sections() -> Vec<(u16, Vec<u8>)> {
             SECTION_TEXT_COMMAND_NAMES => text_table(&["Cmd0", "Attack", "Magic"]),
             SECTION_TEXT_MAGIC_NAMES => sparse_text_table(
                 64,
-                &[(0, "Cure"), (1, "Cure2"), (2, "Cure3"), (7, "Life"), (27, "Fire"), (30, "Ice"), (33, "Bolt")],
+                &[
+                    (0, "Cure"),
+                    (1, "Cure2"),
+                    (2, "Cure3"),
+                    (7, "Life"),
+                    (27, "Fire"),
+                    (30, "Ice"),
+                    (33, "Bolt"),
+                ],
             ),
             SECTION_TEXT_ITEM_NAMES => sparse_text_table(
                 128,
-                &[(0, "Potion"), (1, "Hi-Potion"), (3, "Ether"), (7, "Phoenix Down"), (20, "Grenade")],
+                &[
+                    (0, "Potion"),
+                    (1, "Hi-Potion"),
+                    (3, "Ether"),
+                    (7, "Phoenix Down"),
+                    (20, "Grenade"),
+                ],
             ),
-            SECTION_TEXT_MATERIA_NAMES => {
-                sparse_text_table(96, &[(49, "Fire"), (50, "Ice"), (52, "Lightning"), (53, "Restore")])
-            }
+            SECTION_TEXT_MATERIA_NAMES => sparse_text_table(
+                96,
+                &[
+                    (49, "Fire"),
+                    (50, "Ice"),
+                    (52, "Lightning"),
+                    (53, "Restore"),
+                ],
+            ),
             SECTION_TEXT_WEAPON_NAMES => text_table(&["Test Blade", "Test Gun"]),
             SECTION_TEXT_ARMOR_NAMES => text_table(&["Test Bangle"]),
             _ => text_table(&["x"]),
