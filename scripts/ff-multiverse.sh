@@ -83,6 +83,7 @@ PORT=""
 READY_TIMEOUT=60
 STOP_TIMEOUT=30
 READY_LINE=""
+IMPORTED=0
 REC_PID=""
 REC_SHA=""
 CMD=()
@@ -216,7 +217,12 @@ pick_data_dir() {
   if [[ $chosen == / ]]; then
     fatal 2 "refusing to use / as the data directory"
   fi
-  DATA="$chosen"
+  if ! mkdir -p -- "$chosen" 2>/dev/null; then
+    fatal 1 "cannot create the data directory $chosen (from $origin)"
+  fi
+  # The physical path, so that one directory reached through a symlink or by another spelling
+  # is always the same string: the server's recorded command line is compared with it.
+  DATA=$(cd -- "$chosen" && pwd -P) || fatal 1 "cannot enter the data directory $chosen (from $origin)"
   LAUNCH_DIR="$DATA/launcher"
   IMPORT_LOG="$LAUNCH_DIR/import.log"
   SERVER_LOG="$LAUNCH_DIR/server.log"
@@ -224,7 +230,7 @@ pick_data_dir() {
   SERVER_STATE="$LAUNCH_DIR/server"
   CLIENT_STATE="$LAUNCH_DIR/client"
   if ! mkdir -p -- "$SERVER_STATE" "$CLIENT_STATE" 2>/dev/null; then
-    fatal 1 "cannot create the data directory $DATA (from $origin)"
+    fatal 1 "cannot create $LAUNCH_DIR (in the data directory from $origin)"
   fi
   LOG_FILE="$LAUNCH_DIR/launcher.log"
   rotate_log
@@ -392,6 +398,7 @@ ensure_library() {
       printf '==== import-pc %s (language %s): ok\n' "$cand" "$lang" >>"$IMPORT_LOG"
       cat -- "$attempt" >>"$IMPORT_LOG" 2>/dev/null || true
       rm -f -- "$attempt"
+      IMPORTED=1
       say "FF7 library imported from $cand"
       return 0
     fi
@@ -590,11 +597,13 @@ ensure_server() {
   want_sha=$(sha256_of "$HERE/fmv-server") || fatal 1 "cannot hash $HERE/fmv-server"
   server_args
   if read_pidfile && is_our_server "$REC_PID"; then
-    if [[ $REC_SHA == "$want_sha" ]] && runs_current_args && port_open; then
+    if ((IMPORTED == 0)) && [[ $REC_SHA == "$want_sha" ]] && runs_current_args && port_open; then
       say "using the local server that is already running (pid $REC_PID)"
       return 0
     fi
-    if [[ $REC_SHA != "$want_sha" ]]; then
+    if ((IMPORTED == 1)); then
+      say "the FF7 library was just imported; restarting pid $REC_PID so that it reads it"
+    elif [[ $REC_SHA != "$want_sha" ]]; then
       say "the packaged fmv-server changed since pid $REC_PID was started; restarting it"
     elif ! runs_current_args; then
       say "pid $REC_PID was started with other settings (port or options); restarting it"
