@@ -63,6 +63,7 @@ pub enum TargetRule {
     /// One living member of the party (Cure, Potion).
     Allies,
     /// One fallen member of the party (Phoenix Down).
+    #[allow(dead_code)] // the integrator gives a revive item this rule
     DeadAllies,
 }
 
@@ -195,16 +196,6 @@ impl Choice {
         match self {
             Choice::Attack { target } => Some(Command::Attack { target }),
             Choice::Magic { .. } | Choice::Item { .. } | Choice::Defend => None,
-        }
-    }
-
-    /// A few words for the log.
-    pub fn describe(self, actor: ActorId) -> String {
-        match self {
-            Choice::Attack { target } => format!("actor {} attacks {}", actor.0, target.0),
-            Choice::Magic { spell, target } => format!("actor {} casts spell {spell} on {}", actor.0, target.0),
-            Choice::Item { item, target } => format!("actor {} uses item {item} on {}", actor.0, target.0),
-            Choice::Defend => format!("actor {} defends", actor.0),
         }
     }
 }
@@ -355,6 +346,7 @@ impl BattleMenu {
     }
 
     /// The level the menu is at.
+    #[cfg(test)]
     pub fn level(&self) -> Level {
         match self.state {
             State::Commands => Level::Commands,
@@ -936,8 +928,6 @@ mod tests {
         for other in [Choice::Magic { spell: 1, target: ActorId(0) }, Choice::Item { item: 1, target: ActorId(0) }, Choice::Defend] {
             assert_eq!(other.to_command(), None, "{other:?} is not in this engine build yet");
         }
-        assert!(Choice::Defend.describe(ActorId(1)).contains("defends"));
-        assert!(Choice::Magic { spell: 7, target: ActorId(3) }.describe(ActorId(1)).contains("spell 7"));
     }
 
     /// Whatever is pressed in whatever order, the menu never panics, never leaves a level that does
@@ -945,7 +935,7 @@ mod tests {
     #[test]
     fn random_keys_over_changing_rosters_stay_sane() {
         use crate::ui::testkit::Rng;
-        let mut rng = Rng::new(0xB477_1E);
+        let mut rng = Rng::new(0x00B4_771E);
         let keys = [Up, Down, Left, Right, Confirm, Back];
         for round in 0..200 {
             let mut s = Scene::new();

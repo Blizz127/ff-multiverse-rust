@@ -29,6 +29,8 @@ mod menu;
 mod names;
 mod panels;
 mod popups;
+#[cfg(test)]
+mod shots;
 mod text;
 mod view;
 

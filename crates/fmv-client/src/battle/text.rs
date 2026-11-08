@@ -56,7 +56,7 @@ fn draw_token_labels(view: &BattleView, vw: u32, vh: u32, out: &mut DrawList) {
     let s = layout(vw, vh, view.party.len()).s;
     let scale = u32::try_from(s).unwrap_or(1);
     for card in cards(view, vw, vh) {
-        let cells = ((card.rect.width() as i32 + 8 * s * 2) / (8 * s)).max(1) as usize;
+        let cells = (card.slot as i32 / (8 * s)).max(1) as usize;
         let name = ellipsize(&card.bar.name, cells);
         let w = text_width(&name, scale);
         let color = if !card.bar.alive {
@@ -258,7 +258,7 @@ mod tests {
     fn popups_and_the_pointer_follow_the_anchors_a_scene_gives() {
         let mut v = view(vec![bar(0, "Me", 10, 10, true, true, true)], vec![bar(1, "Foe", 5, 5, false, true, false)], Status::Verified);
         open_menu(&mut v, &[MenuKey::Confirm]);
-        v.popups = vec![Popup { target: ActorId(1), kind: PopupKind::Damage { amount: 321, critical: false }, age_ms: 350, slot: 0 }];
+        v.popups = vec![Popup { target: ActorId(1), kind: PopupKind::Damage { amount: 321, critical: false }, age_ms: 350 }];
         let anchors = Anchors { party: vec![Some((900.0, 300.0))], enemies: vec![Some((200.0, 250.0))] };
         let mut list = DrawList::new();
         draw_battle_overlay(&v, &anchors, 1100, 680, &mut list);

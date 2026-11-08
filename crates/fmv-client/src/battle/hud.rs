@@ -135,7 +135,7 @@ impl BattleHud {
         view.popups = self.popups.views(now);
         view.banner = self.banner.as_ref().filter(|(_, at)| now - at < BANNER_S).map(|(text, at)| Banner {
             text: text.clone(),
-            age_ms: ((now - at).max(0.0) * 1000.0) as u32,
+            age_ms: ((now - at).max(0.0) * 1000.0).round() as u32,
         });
         if let Some(mp) = turn_mp(view) {
             let (allies, enemies) = (fighters(&view.party), fighters(&view.enemies));
@@ -174,7 +174,7 @@ impl BattleHud {
         view.finale = Some(Finale {
             outcome: ended.outcome,
             reward: ended.reward.clone(),
-            age_ms: (age * 1000.0) as u32,
+            age_ms: (age * 1000.0).round() as u32,
             dismissible: age >= DISMISS_AFTER_S,
         });
         Some(view)

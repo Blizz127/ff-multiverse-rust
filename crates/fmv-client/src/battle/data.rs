@@ -39,7 +39,7 @@ mod tests {
 
     #[test]
     fn names_need_the_same_library_as_the_rules() {
-        let err = open_names(&Ff7Source::Flevel { path: "/x/flevel.lgp".into(), labels: Ff7Labels::default() }).err().expect("no data");
+        let err = open_names(&Ff7Source::Flevel { path: "/x/flevel.lgp".into(), labels: Ff7Labels::default() }).expect_err("no data");
         assert!(err.contains("library"), "{err}");
     }
 

@@ -176,9 +176,9 @@ pub struct Finale {
 
 /// The colour of text that cannot be chosen: darker than [`DIM`], so that a greyed-out row is
 /// clearly not an ordinary one.
-pub const DISABLED: Rgba = [118, 124, 164, 255];
+pub const DISABLED: Rgba = [132, 138, 178, 255];
 /// The colour of an aimed-at row.
-const AIMED: Rgba = [255, 214, 80, 70];
+const AIMED: Rgba = [255, 214, 80, 90];
 /// The colour of HP that is low (a third or less).
 const HP_LOW: Rgba = WARN;
 const HEAL: Rgba = [112, 236, 132, 255];
@@ -225,9 +225,12 @@ fn fitted(c: &mut Canvas<'_>, x: i32, y: i32, width: i32, color: Rgba, text: &st
 
 /// The enemy list: the living enemies' names, the one aimed at highlighted.
 fn draw_enemies(c: &mut Canvas<'_>, l: &Layout, view: &BattleView, aim: Option<ActorId>) {
+    let living: Vec<&Bar> = view.enemies.iter().filter(|b| b.alive).collect();
+    if living.is_empty() {
+        return;
+    }
     window(c, l.enemy);
     let inner = l.enemy.inner();
-    let living: Vec<&Bar> = view.enemies.iter().filter(|b| b.alive).collect();
     let capacity = usize::try_from((inner.h / ROW_H).max(1)).unwrap_or(1);
     let aimed = aim.and_then(|a| living.iter().position(|b| b.actor == a));
     // Scroll so the aimed-at name is on screen.
@@ -265,7 +268,7 @@ const HP_W: i32 = 72;
 const MP_W: i32 = 56;
 const COL_GAP: i32 = 6;
 const BAR_MIN: i32 = 24;
-const BAR_MAX: i32 = 96;
+const BAR_MAX: i32 = 140;
 
 /// Name first, then HP, then MP with the bar, or the bar alone when MP does not fit too.
 fn columns(inner_x: i32, inner_w: i32) -> Columns {
@@ -317,10 +320,16 @@ fn draw_party(c: &mut Canvas<'_>, l: &Layout, view: &BattleView, aim: Option<Act
             row_band(c, inner, y, HILITE);
         }
         let commanding = bar.mine && bar.ready && bar.alive;
-        if commanding && aim != Some(bar.actor) {
+        if commanding && aim.is_none() {
             c.pointer(inner.x, y);
         }
-        let name_color = if !bar.alive { DISABLED } else if bar.mine { ACCENT } else { TEXT };
+        let name_color = if aim == Some(bar.actor) || (bar.mine && bar.alive) {
+            ACCENT
+        } else if !bar.alive {
+            DISABLED
+        } else {
+            TEXT
+        };
         let name = ellipsize(&bar.name, cols.name_cells);
         c.shadowed(cols.name_x, y, name_color, &name);
         if let Some(x) = cols.hp_x {
@@ -384,9 +393,9 @@ fn draw_list(c: &mut Canvas<'_>, l: &Layout, list: &ListView) {
             c.pointer(inner.x, y);
         }
         let color = if !row.enabled { DISABLED } else if selected { TEXT } else { SOFT };
-        let name_w = (inner.w - POINTER_W - right_w - 16).max(8);
+        let name_w = (inner.w - POINTER_W - right_w - 22).max(8);
         fitted(c, inner.x + POINTER_W, y, name_w, color, &row.label);
-        let rx = inner.right() - 8 - i32::try_from(cell_count(&row.right)).unwrap_or(0) * 8;
+        let rx = inner.right() - 14 - i32::try_from(cell_count(&row.right)).unwrap_or(0) * 8;
         c.shadowed(rx, y, color, &row.right);
     }
     let arrow_x = inner.right() - 8;
@@ -429,8 +438,8 @@ pub fn draw_banner(c: &mut Canvas<'_>, l: &Layout, banner: &Banner) {
 pub fn draw_pointer(out: &mut DrawList, l: &Layout, view: &BattleView, anchors: &Anchors, vw: u32) {
     let Some(aim) = view.menu.as_ref().and_then(|m| m.aim) else { return };
     let Some((ax, ay)) = anchors.of(view, aim.target) else { return };
-    let scale = u32::try_from(l.s + 1).unwrap_or(2);
-    let cell = i32::try_from(8 * scale).unwrap_or(16);
+    let scale = u32::try_from(l.s + 2).unwrap_or(3);
+    let cell = i32::try_from(8 * scale).unwrap_or(24);
     // The arrow is drawn in the lower rows of its cell: its tip is 7/8 of the way down.
     let shadow = l.s.max(1);
     let x = (ax as i32 - cell / 2).clamp(0, (i32::try_from(vw).unwrap_or(i32::MAX) - cell - shadow).max(0));
@@ -475,20 +484,32 @@ pub fn popup_alpha(age_ms: u32) -> u8 {
 }
 
 /// The floating numbers over the fighters they belong to (those the scene has no place for are
-/// skipped).
+/// skipped). A number rises from just over its fighter's head; when another lands on the same
+/// fighter before it has gone, the older ones are moved up out of the newer one's way, so no two
+/// numbers over a fighter are printed over each other.
 pub fn draw_popups(out: &mut DrawList, l: &Layout, view: &BattleView, anchors: &Anchors, vw: u32, vh: u32) {
     let scale = u32::try_from(l.s + 1).unwrap_or(2);
     let (vw, vh) = (i32::try_from(vw).unwrap_or(i32::MAX), i32::try_from(vh).unwrap_or(i32::MAX));
-    for p in &view.popups {
+    let h = text_height(scale);
+    // Per fighter: the lowest top edge the next, older popup may have (just above the newer one).
+    let mut ceiling: Vec<(ActorId, i32)> = Vec::new();
+    // Popups are oldest first: go through them newest first.
+    for p in view.popups.iter().rev() {
         let Some((ax, ay)) = anchors.of(view, p.target) else { continue };
         let (color, text) = popup_look(p);
         let alpha = popup_alpha(p.age_ms);
-        let (w, h) = (text_width(&text, scale), text_height(scale));
+        let w = text_width(&text, scale);
         // The margin holds the shadow too (it is drawn `scale` pixels down and to the right).
         let pad = i32::try_from(scale).unwrap_or(2) + 2;
         let x = (ax as i32 - w / 2).clamp(pad, (vw - w - pad).max(pad));
-        let lift = popup_rise(p.age_ms, l.s) + i32::from(p.slot) * (h + l.s);
-        let y = (ay as i32 - lift - h).clamp(pad, (vh - h - pad).max(pad));
+        let natural = ay as i32 - popup_rise(p.age_ms, l.s) - h;
+        let above = ceiling.iter_mut().find(|(t, _)| *t == p.target);
+        let top = above.as_ref().map_or(natural, |(_, c)| natural.min(*c));
+        match above {
+            Some(entry) => entry.1 = top - h - l.s,
+            None => ceiling.push((p.target, top - h - l.s)),
+        }
+        let y = top.clamp(pad, (vh - h - pad).max(pad));
         let fade = |c: Rgba| [c[0], c[1], c[2], (u16::from(c[3]) * u16::from(alpha) / 255) as u8];
         out.draw_text_shadowed(x, y, scale, fade(color), fade(SHADOW), &text);
     }
@@ -620,7 +641,7 @@ mod tests {
             let l = layout(w, h, party);
             assert!(!l.compact, "{w}x{h}");
             assert!(l.enemy.right() < l.command.x && l.command.right() < l.party.x, "{w}x{h}: enemy | command | party in that order");
-            assert!(l.party.right() <= l.cw - MARGIN + 0 && l.enemy.x >= MARGIN, "{w}x{h}");
+            assert!(l.party.right() <= l.cw - MARGIN && l.enemy.x >= MARGIN, "{w}x{h}");
             for a in [l.enemy, l.command, l.party, l.left] {
                 assert!(a.y >= 0 && a.y + a.h <= l.ch, "{w}x{h}: {a:?} is inside the canvas");
                 assert_eq!(a.y, l.enemy.y, "{w}x{h}: bottom-aligned, one height");
@@ -790,12 +811,12 @@ mod tests {
     fn popups_are_drawn_over_their_fighter_in_their_colour_and_skipped_without_one() {
         let mut v = battle();
         v.popups = vec![
-            Popup { target: ActorId(3), kind: PopupKind::Damage { amount: 1234, critical: false }, age_ms: 100, slot: 0 },
-            Popup { target: ActorId(5), kind: PopupKind::Damage { amount: 77, critical: true }, age_ms: 100, slot: 0 },
-            Popup { target: ActorId(0), kind: PopupKind::Heal { amount: 300 }, age_ms: 100, slot: 0 },
-            Popup { target: ActorId(1), kind: PopupKind::Mp { amount: 12 }, age_ms: 100, slot: 0 },
-            Popup { target: ActorId(4), kind: PopupKind::Miss, age_ms: 100, slot: 0 },
-            Popup { target: ActorId(99), kind: PopupKind::Miss, age_ms: 100, slot: 0 },
+            Popup { target: ActorId(3), kind: PopupKind::Damage { amount: 1234, critical: false }, age_ms: 100 },
+            Popup { target: ActorId(5), kind: PopupKind::Damage { amount: 77, critical: true }, age_ms: 100 },
+            Popup { target: ActorId(0), kind: PopupKind::Heal { amount: 300 }, age_ms: 100 },
+            Popup { target: ActorId(1), kind: PopupKind::Mp { amount: 12 }, age_ms: 100 },
+            Popup { target: ActorId(4), kind: PopupKind::Miss, age_ms: 100 },
+            Popup { target: ActorId(99), kind: PopupKind::Miss, age_ms: 100 },
         ];
         let anchors = crate::battle::view::flat_anchors(&v, 1100, 680);
         let l = layout(1100, 680, 3);
@@ -814,24 +835,36 @@ mod tests {
         let (w, h) = (text_width("1234", t.scale), text_height(t.scale));
         assert!(((t.x + w / 2) as f32 - ax).abs() <= 1.0 && (t.y + h) as f32 <= ay, "{t:?} vs ({ax}, {ay})");
         // A fading popup keeps its colour and loses its alpha, the shadow too.
-        v.popups = vec![Popup { target: ActorId(3), kind: PopupKind::Damage { amount: 5, critical: false }, age_ms: 1000, slot: 0 }];
+        v.popups = vec![Popup { target: ActorId(3), kind: PopupKind::Damage { amount: 5, critical: false }, age_ms: 1000 }];
         let mut faded = DrawList::new();
         draw_popups(&mut faded, &l, &v, &anchors, 1100, 680);
         assert!(faded.texts().iter().all(|t| t.color[3] < 255 && t.color[3] > 0), "{:?}", faded.texts());
     }
 
     #[test]
-    fn stacked_popups_are_drawn_higher_and_a_popup_stays_inside_the_window() {
+    fn numbers_over_one_fighter_never_overprint_and_a_popup_stays_inside_the_window() {
         let mut v = battle();
-        v.popups = (0..3)
-            .map(|slot| Popup { target: ActorId(3), kind: PopupKind::Damage { amount: 10 + u32::from(slot), critical: false }, age_ms: 400, slot })
-            .collect();
+        // Three hits on the first enemy, oldest first, and one on another fighter at the same moment.
+        v.popups = vec![
+            Popup { target: ActorId(3), kind: PopupKind::Damage { amount: 12, critical: false }, age_ms: 300 },
+            Popup { target: ActorId(3), kind: PopupKind::Damage { amount: 11, critical: false }, age_ms: 120 },
+            Popup { target: ActorId(4), kind: PopupKind::Damage { amount: 99, critical: false }, age_ms: 120 },
+            Popup { target: ActorId(3), kind: PopupKind::Damage { amount: 10, critical: false }, age_ms: 20 },
+        ];
         let anchors = crate::battle::view::flat_anchors(&v, 1100, 680);
         let l = layout(1100, 680, 3);
         let mut list = DrawList::new();
         draw_popups(&mut list, &l, &v, &anchors, 1100, 680);
         let y_of = |s: &str| list.texts().iter().find(|t| t.text == s && t.color[..3] != SHADOW_COLOR[..3]).unwrap().y;
-        assert!(y_of("10") > y_of("11") && y_of("11") > y_of("12"), "each stacked popup is higher than the one below");
+        let h = text_height(u32::try_from(l.s + 1).unwrap());
+        assert!(y_of("10") > y_of("11") && y_of("11") > y_of("12"), "the newest is lowest, the older ones are above it");
+        assert!(y_of("10") - y_of("11") >= h && y_of("11") - y_of("12") >= h, "a whole line apart at least: {} {} {}", y_of("12"), y_of("11"), y_of("10"));
+        // A lone popup over another fighter is not moved by them.
+        let mut alone = DrawList::new();
+        let mut one = v.clone();
+        one.popups = vec![v.popups[2]];
+        draw_popups(&mut alone, &l, &one, &anchors, 1100, 680);
+        assert_eq!(alone.texts().iter().find(|t| t.text == "99" && t.color[..3] != SHADOW_COLOR[..3]).unwrap().y, y_of("99"));
         // An anchor at the very edge, or above the window, is pulled inside it.
         let edge = Anchors { party: vec![Some((-50.0, -50.0)); 3], enemies: vec![Some((5000.0, 5000.0)); 3] };
         let mut list = DrawList::new();
@@ -939,7 +972,7 @@ mod tests {
         let c = columns(0, 300);
         assert!(c.hp_x.is_some() && c.mp_x.is_some() && c.bar.is_some());
         let (bx, bw) = c.bar.unwrap();
-        assert!(bw >= BAR_MIN && bw <= BAR_MAX && bx + bw <= 300);
+        assert!((BAR_MIN..=BAR_MAX).contains(&bw) && bx + bw <= 300);
         assert!(c.mp_x.unwrap() > c.hp_x.unwrap() && bx > c.mp_x.unwrap(), "name, HP, MP, bar from left to right");
         // Less: MP goes, the bar stays. Less still: the bar goes. Less: HP goes too.
         let c = columns(0, 200);
@@ -955,7 +988,7 @@ mod tests {
                 assert!(x >= 10);
             }
             if let Some((x, bw)) = c.bar {
-                assert!(x + bw <= 10 + w.max(0) + 0 && bw >= BAR_MIN);
+                assert!(x + bw <= 10 + w.max(0) && bw >= BAR_MIN);
             }
         }
     }
@@ -984,7 +1017,7 @@ mod tests {
                 v.menu = Some(menu_after(&v, &keys));
             }
             if rng.chance(2) {
-                v.popups = vec![Popup { target: ActorId(rng.below(30) as u8), kind: PopupKind::Miss, age_ms: rng.below(2000) as u32, slot: rng.below(5) as u8 }];
+                v.popups = vec![Popup { target: ActorId(rng.below(30) as u8), kind: PopupKind::Miss, age_ms: rng.below(2000) as u32 }];
             }
             if rng.chance(3) {
                 v.banner = Some(Banner { text: rng.string(60), age_ms: 0 });

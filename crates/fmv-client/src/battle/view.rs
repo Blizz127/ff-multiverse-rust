@@ -188,6 +188,8 @@ pub(super) struct Card<'a> {
     pub rect: Rect,
     pub bar: &'a Bar,
     pub enemy: bool,
+    /// The width of the slot the token stands in (its name may use all of it).
+    pub slot: f32,
 }
 
 /// Lay one row of tokens out in `region`, centred in it.
@@ -202,7 +204,7 @@ fn row<'a>(bars: &'a [Bar], enemy: bool, region: Rect, s: f32, out: &mut Vec<Car
     let y0 = region.y0 + (region.height() - card_h).max(0.0) * 0.5;
     for (i, bar) in bars.iter().enumerate() {
         let x0 = region.x0 + slot * i as f32 + (slot - card_w) * 0.5;
-        out.push(Card { rect: Rect { x0, y0, x1: x0 + card_w, y1: y0 + card_h }, bar, enemy });
+        out.push(Card { rect: Rect { x0, y0, x1: x0 + card_w, y1: y0 + card_h }, bar, enemy, slot });
     }
 }
 
