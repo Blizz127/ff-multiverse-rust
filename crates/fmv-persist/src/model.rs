@@ -383,6 +383,27 @@ pub struct CharacterProgress {
     /// stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inventory: Option<Vec<InventoryEntry>>,
+    /// The character's limit gauge between battles, in the game's own units (FF7: `0..=255`, 255 is
+    /// full): what the account's character fights its next battle with, saved at the end of every
+    /// one. Opaque here, like the other numbers: the store checks no maximum (a game's own limits
+    /// are its adapter's business, and the server clamps what it reads).
+    ///
+    /// # Compatibility
+    ///
+    /// Older records have no such key and read as 0 (an empty gauge, which is also what a new
+    /// character has), and `SCHEMA_VERSION` stays 1: the field is additive. A record whose gauge is 0
+    /// is written **without** the key, so it is byte for byte what a build from before this field
+    /// wrote. The reverse costs one thing: a build from before this field ignores the key when it
+    /// reads and **drops the gauge when it next rewrites the record** (a battle result, say), so the
+    /// character comes back with an empty gauge, nothing else lost. A value outside `0..=65535`
+    /// is not a `u16`: the record is [`PersistError::Corrupt`] on read, never clamped.
+    #[serde(default, skip_serializing_if = "is_empty_gauge")]
+    pub limit: u16,
+}
+
+/// `skip_serializing_if` of [`CharacterProgress::limit`]: an empty gauge is not written.
+fn is_empty_gauge(limit: &u16) -> bool {
+    *limit == 0
 }
 
 impl CharacterProgress {
@@ -408,6 +429,7 @@ impl CharacterProgress {
             gil: 0,
             updated_at,
             inventory: None,
+            limit: 0,
         }
     }
 
@@ -604,6 +626,39 @@ mod tests {
         assert_eq!(read(Some(serde_json::json!([]))), Some(vec![]));
     }
 
+    /// The limit gauge was added to records that exist on a running server: an empty gauge is no key at
+    /// all (byte for byte a record of the build before), a record without the key reads as empty, and
+    /// the gauge round-trips with the inventory beside it.
+    #[test]
+    fn the_limit_gauge_is_a_missing_key_when_empty_and_a_record_without_it_reads_as_empty() {
+        let fresh = CharacterProgress::new(AccountId(1), GameId::Ff7, 0, 5, 0);
+        assert_eq!(fresh.limit, 0);
+        let empty_json = serde_json::to_value(&fresh).unwrap();
+        assert_eq!(empty_json.get("limit"), None, "{empty_json}");
+
+        // A record of the v6 build (this one's JSON without the key) loads with an empty gauge.
+        let v6 = serde_json::from_value::<CharacterProgress>(empty_json.clone()).unwrap();
+        assert_eq!(v6, fresh);
+
+        // A gauge is written and read back, next to an inventory, and survives `Some(vec![])` too.
+        for limit in [1u16, 137, 255, u16::MAX] {
+            for inventory in [None, Some(vec![]), Some(stacks([(3, 9)]))] {
+                let record = CharacterProgress { limit, ..with_inventory(inventory) };
+                let json = serde_json::to_value(&record).unwrap();
+                assert_eq!(json["limit"], serde_json::json!(limit));
+                assert_eq!(serde_json::from_value::<CharacterProgress>(json).unwrap(), record);
+                assert!(record.validate().is_ok(), "the store checks no maximum: that is the game's business");
+            }
+        }
+
+        // Not a u16: the record does not read (and is not clamped into one that does).
+        for bad in [serde_json::json!(70_000), serde_json::json!(-1), serde_json::json!("full"), serde_json::json!(1.5)] {
+            let mut doc = empty_json.clone();
+            doc["limit"] = bad.clone();
+            assert!(serde_json::from_value::<CharacterProgress>(doc).is_err(), "{bad}");
+        }
+    }
+
     #[test]
     fn an_inventory_is_checked_for_size_empty_stacks_and_repeats() {
         // Fine: never stored, stored empty, a few stacks in any order, the widest numbers.
@@ -678,6 +733,7 @@ mod tests {
                     .map(|i| InventoryEntry::new(u16::MAX - u16::try_from(i).unwrap(), u16::MAX))
                     .collect(),
             ),
+            limit: u16::MAX,
         };
         assert!(widest.validate().is_ok());
         // What `fsio::write_json` writes: pretty-printed, plus a final newline.
