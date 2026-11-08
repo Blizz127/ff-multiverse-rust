@@ -95,14 +95,15 @@
 //!   animation references the enemy records make, 2 148 land on real slots, 45 on special entries
 //!   and 309 beyond the model's slots (all of them for attacks the record uses; 268 of the 309 belong
 //!   to the placeholder enemies 0 to 9): the consumer must be ready for both.
-//! * **Weapons** of the playable characters are one-bone [`FieldModel`]s in
-//!   [`BattleModel::weapons`]; where each is held is a separate per-animation track
+//! * **Weapons** are one-bone [`FieldModel`]s in [`BattleModel::weapons`]: 16 for each of the 16
+//!   character models (the party's weapons: Cloud's swords, Barret's gun arm) and one for each of 19
+//!   enemies (the MP's baton: 17 vertices, hanging at his belt in the idle clip and raised in his
+//!   melee slot). Where each is held is a separate per-animation track
 //!   ([`BattleModel::weapon_tracks`], slot-aligned with `animations`): draw the weapon as a second
-//!   model with the same placement and the same frame index as the body. Evidence that track `i`
-//!   belongs to slot `i`: for all ten characters every real track has exactly the frame count of
-//!   the real clip of its slot (Cloud: 40 of 40 pairs, none differ), and the Buster Sword is in
-//!   Cloud's hands in the idle clip and in eight other slots drawn mid-clip. Barret's gun arm is
-//!   his weapon model.
+//!   model with the same placement and the same frame index as the body, **for enemies as well**.
+//!   Evidence that track `i` belongs to slot `i`: all 776 real (track, slot) pairs of the 35 models
+//!   with weapons have exactly the same frame count (Cloud: 40 of 40), and the Buster Sword is in
+//!   Cloud's hands in the idle clip and in eight other slots drawn mid-clip.
 //!
 //! # Using it
 //!
@@ -280,7 +281,8 @@ pub struct BattleModel {
     /// Whether `animations[i]` is the slot's own clip (`false`: a stand-in copy of frame 0 of the
     /// first good slot).
     pub slot_ok: Vec<bool>,
-    /// The weapon meshes of a playable character (empty for the others), each a one-bone model.
+    /// The weapon meshes (16 for a character model, 1 for 19 enemies, none for the rest), each a
+    /// one-bone model.
     pub weapons: Vec<FieldModel>,
     /// Where the weapon is held, per animation slot: a one-bone animation whose root translation and
     /// rotation are the weapon's placement in the character's native space (the same frame index

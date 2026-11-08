@@ -366,7 +366,7 @@ impl Prop {
     }
 }
 
-/// A character with its body and its weapon 0 as props.
+/// A model that may carry a weapon (a character, or an enemy like the MP) with its body and its weapon 0 as props.
 struct Hero {
     model: BattleModel,
     body: Prop,
@@ -493,7 +493,11 @@ fn offscreen_battle_formation_301_enemies_posed_at_several_frames() {
     assert!(enemies.iter().all(|(id, _)| *id == 16), "both are enemy 16, the MP");
     let mp = data.models.load_enemy(16).expect("the MP loads");
     assert_eq!((mp.prefix.as_str(), mp.model.bones.len(), mp.animations.len()), ("aq", 27, 16));
-    let prop = Prop::new(&mp.model, &mp.animations[0]);
+    // an enemy can carry a weapon like a character does: the MP has one (`aqck`, a baton of 17
+    // vertices that hangs at his belt in the idle clip and is raised in his melee attack) with 16
+    // tracks, one per slot
+    assert_eq!((mp.weapons.len(), mp.weapon_tracks.len()), (1, 16));
+    let mp = Hero::new(mp);
 
     // In front of the enemies, looking at them (they face +z, towards the party): they stand
     // 1 000 units apart, 1 500 and 1 700 away from the party's side.
@@ -505,9 +509,9 @@ fn offscreen_battle_formation_301_enemies_posed_at_several_frames() {
         let models: Vec<SkinnedModel> = enemies
             .iter()
             .enumerate()
-            .map(|(k, (_, at))| {
+            .flat_map(|(k, (_, at))| {
                 // the second MP is a few frames behind the first, as two enemies of one formation are
-                prop.skinned(&mp.animations[0], frame + 5 * k, &place(*at, std::f32::consts::PI), &view)
+                mp.draw(0, frame + 5 * k, &place(*at, std::f32::consts::PI), &view)
             })
             .collect();
         let img = draw(&mut gpu, &frame_of(models, &view), &view);
@@ -555,14 +559,13 @@ fn offscreen_battle_formation_301_enemies_posed_at_several_frames() {
     let at = place([0.0, 0.0, -1600.0], std::f32::consts::PI);
     let mut tiles = Vec::new();
     let mut shown = Vec::new();
-    for slot in 0..8usize {
-        if !mp.slot_ok[slot] {
-            continue;
-        }
-        let frame = mp.animations[slot].frame_count() / 2;
-        let img = draw(&mut gpu, &frame_of(vec![prop.skinned(&mp.animations[slot], frame, &at, &single)], &single), &single);
+    // (the baton is in his hand in the raised pose of slot 8)
+    for slot in [0usize, 1, 2, 3, 5, 6, 8, 9] {
+        assert!(mp.model.slot_ok[slot], "slot {slot} is a real clip");
+        let frame = mp.model.animations[slot].frame_count() / 2;
+        let img = draw(&mut gpu, &frame_of(mp.draw(slot, frame, &at, &single), &single), &single);
         tiles.push(img);
-        shown.push((slot, frame, mp.animations[slot].frame_count()));
+        shown.push((slot, frame, mp.model.animations[slot].frame_count()));
     }
     eprintln!("MP slots shown (slot, frame, frames): {shown:?}");
     let (gw, gh, sheet) = grid(&tiles, 480, 360, 4);
@@ -601,7 +604,7 @@ fn offscreen_battle_location_of_formation_301_with_its_enemies_on_the_floor() {
         arena.model.parts.iter().filter(|p| p.texture.is_some()).count()
     );
     let location = Prop::new(&arena.model, &arena.animations[0]);
-    let mp_prop = Prop::new(&mp.model, &mp.animations[0]);
+    let mp = Hero::new(mp);
 
     let (w, h) = (1280u32, 720u32);
     // Through the formation's own cameras (the game's idle camera and the one its attacks cut to).
@@ -610,7 +613,7 @@ fn offscreen_battle_location_of_formation_301_with_its_enemies_on_the_floor() {
         let arena_only = draw(&mut gpu, &frame_of(vec![location.skinned(&arena.animations[0], 0, &mat4_identity(), &view)], &view), &view);
         let mut models = vec![location.skinned(&arena.animations[0], 0, &mat4_identity(), &view)];
         for (k, (_, at)) in enemies.iter().enumerate() {
-            models.push(mp_prop.skinned(&mp.animations[0], 3 * k, &place(*at, std::f32::consts::PI), &view));
+            models.extend(mp.draw(0, 3 * k, &place(*at, std::f32::consts::PI), &view));
         }
         let img = draw(&mut gpu, &frame_of(models, &view), &view);
         save_png(&format!("02-location-{code}-{}-formation301-enemies-on-the-floor-{name}", arena.prefix), w, h, &img);
@@ -636,7 +639,7 @@ fn offscreen_battle_location_of_formation_301_with_its_enemies_on_the_floor() {
     let view = View::new([9000.0, -7000.0, 9000.0], [0.0, -300.0, -500.0], 1100.0, w, h);
     let mut models = vec![location.skinned(&arena.animations[0], 0, &mat4_identity(), &view)];
     for (k, (_, at)) in enemies.iter().enumerate() {
-        models.push(mp_prop.skinned(&mp.animations[0], 3 * k, &place(*at, std::f32::consts::PI), &view));
+        models.extend(mp.draw(0, 3 * k, &place(*at, std::f32::consts::PI), &view));
     }
     let img = draw(&mut gpu, &frame_of(models, &view), &view);
     save_png(&format!("02b-location-{code}-{}-overview", arena.prefix), w, h, &img);
@@ -769,9 +772,8 @@ fn offscreen_battle_formation_301_whole_scene_through_the_formations_camera() {
     let enemies = formation_enemies(&data.scenes, FORMATION);
     let code = data.scenes.formation(FORMATION).expect("formation").setup().location;
     let arena = data.models.load_location(code).expect("location");
-    let mp = data.models.load_enemy(16).expect("MP");
+    let mp = Hero::new(data.models.load_enemy(16).expect("MP"));
     let location = Prop::new(&arena.model, &arena.animations[0]);
-    let mp_prop = Prop::new(&mp.model, &mp.animations[0]);
     let party: Vec<(Hero, [f32; 3])> = [
         (BattleCharacter::Cloud, [0.0, 0.0, 1500.0]),
         (BattleCharacter::Barret, [600.0, 0.0, 1100.0]),
@@ -786,7 +788,7 @@ fn offscreen_battle_formation_301_whole_scene_through_the_formations_camera() {
         let view = scene_view(&data.scenes, FORMATION, index, zoom, w, h);
         let mut models = vec![location.skinned(&arena.animations[0], 0, &mat4_identity(), &view)];
         for (k, (_, at)) in enemies.iter().enumerate() {
-            models.push(mp_prop.skinned(&mp.animations[0], 4 * k, &place(*at, std::f32::consts::PI), &view));
+            models.extend(mp.draw(0, 4 * k, &place(*at, std::f32::consts::PI), &view));
         }
         for (hero, at) in &party {
             models.extend(hero.draw(0, 2, &place(*at, 0.0), &view));

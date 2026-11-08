@@ -189,9 +189,10 @@ fn the_standing_clips_put_the_feet_on_the_ground() {
 
 #[test]
 #[ignore = "needs the owner's FF7 data (FMV_FF7_DATA or FMV_FF7_BATTLE_LGP)"]
-fn the_playable_characters_have_weapons_with_tracks_that_fit_their_slots() {
+fn weapons_and_their_tracks_fit_the_slots_of_characters_and_enemies() {
     let Some(path) = battle_lgp() else { return };
     let mut models = BattleModels::open(&path).unwrap();
+    // the ten characters of the table: 16 weapons each, and a track for most slots
     for c in BattleCharacter::ALL {
         let model = models.load_character(c).unwrap();
         eprintln!(
@@ -206,22 +207,39 @@ fn the_playable_characters_have_weapons_with_tracks_that_fit_their_slots() {
             model.weapon_track_ok.iter().filter(|ok| **ok).count(),
         );
         assert_eq!(model.weapons.len(), 16, "{c:?}");
-        assert!(model.weapons.iter().all(|w| w.bones.len() == 1 && !w.parts.is_empty()), "{c:?}");
-        // a track that exists has the frames of the slot it belongs to (the same frame index draws both)
-        let mut same = 0usize;
-        let mut differ = Vec::new();
+    }
+    // every model with weapons, characters and enemies alike: the weapons are one-bone models, and
+    // a track that exists has the frame count of the slot it belongs to (so the same frame index
+    // draws both: Cloud 40 of 40 pairs)
+    let (mut with_weapons, mut pairs, mut equal) = (BTreeMap::<BattleModelKind, usize>::new(), 0usize, 0usize);
+    let mut differ: Vec<(String, usize, usize, usize)> = Vec::new();
+    for id in 0..481usize {
+        let prefix = skeleton::prefix_of_id(id).unwrap();
+        let model = models.load_prefix(&prefix, None).unwrap();
+        if model.weapons.is_empty() {
+            assert!(model.weapon_tracks.is_empty(), "{prefix}");
+            continue;
+        }
+        *with_weapons.entry(model.kind).or_default() += 1;
+        assert!(model.weapons.iter().all(|w| w.bones.len() == 1 && !w.parts.is_empty()), "{prefix}");
+        assert!(model.weapon_tracks.len() <= model.animations.len() + 16, "{prefix}");
         for (slot, track) in model.weapon_tracks.iter().enumerate() {
-            if !model.weapon_track_ok[slot] || !model.slot_ok[slot] {
+            if !model.weapon_track_ok[slot] || !model.slot_ok.get(slot).copied().unwrap_or(false) {
                 continue;
             }
-            if track.frame_count() == model.animations[slot].frame_count() {
-                same += 1;
+            pairs += 1;
+            let body = model.animations[slot].frame_count();
+            if track.frame_count() == body {
+                equal += 1;
             } else {
-                differ.push((slot, track.frame_count(), model.animations[slot].frame_count()));
+                differ.push((prefix.clone(), slot, track.frame_count(), body));
             }
         }
-        eprintln!("   tracks with the slot's frame count: {same}, others (slot, track, body): {differ:?}");
     }
+    eprintln!("models with weapons by kind: {with_weapons:?}; real (track, slot) pairs {pairs}, with equal frame counts {equal}; others (model, slot, track, body): {differ:?}");
+    assert_eq!(with_weapons[&BattleModelKind::Character], 16);
+    assert_eq!(with_weapons[&BattleModelKind::Enemy], 19);
+    assert!(differ.is_empty(), "{differ:?}");
 }
 
 #[test]
