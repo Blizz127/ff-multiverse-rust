@@ -147,12 +147,39 @@
 //! are UNVERIFIED HYPOTHESES. [`Ff7FieldArea::max_speed`] is unchanged and stays the server's
 //! cap: it is 2.5 times the hypothetical run speed, so a wrong hypothesis (up to 2.5 times too
 //! slow) cannot make the server reject real movement.
+//!
+//! # Exits, NPCs, arrivals and encounters
+//!
+//! A loaded field answers four more `AreaRuntime` questions, all worked out once at load time
+//! from the field's own data (never an error: a missing or damaged section just means nothing is
+//! reported). The rules, with what was measured on the owned copy, are in the `area_content` module
+//! docs; in short:
+//!
+//! * [`AreaRuntime::exits`]: **only line gateways** (the used slots of the trigger section joined with
+//!   the archive's `maplist`, read once per adapter) become exits, with the target spelled as the
+//!   archive spells it (so it is also what `list_areas` reports). `MAPJUMP`s and line-trigger
+//!   scripts are script-driven and out of scope: which `REQ` chain turns a crossing into a jump
+//!   depends on the script VM and the story variables. A field whose only way out is a `MAPJUMP`
+//!   has no exits.
+//! * [`AreaRuntime::place_arrival`]: an exit's `arrival_hint` is the index of the target walkmesh
+//!   triangle that holds the arrival point; where that triangle holds the point, the arrival
+//!   stands at the triangle's height there (the right floor of a layered field), otherwise the
+//!   default rule (`validate_move` from the point to itself) applies.
+//! * [`AreaRuntime::npcs`]: the characters whose init script places them unconditionally (the
+//!   scripts are read, never run; see [`crate::field_direction_to_facing`] for the heading).
+//! * [`AreaRuntime::encounters`]: the table decoded from section 6
+//!   ([`crate::decode_encounter_section`]).
 
-use crate::field::{Background, Camera, FieldError, FieldFile, Palette, Triggers, Vertex, Walkmesh, FIELD_SCALE_ONE};
+use crate::area_content;
+use crate::encounter::decode_encounter_section;
+use crate::field::{section, Background, Camera, FieldError, FieldFile, Palette, Triggers, Vertex, Walkmesh, FIELD_SCALE_ONE};
 use crate::lgp::{LgpArchive, LgpError};
 use crate::lzss;
+use crate::script::{triangle_contains_xy, triangle_height_at, Maplist};
 use crate::walk::{LinkReport, Route, Surface};
-use fmv_adapter_api::{AdapterError, AreaInfo, AreaRuntime, Bounds, GameAdapter, MoveResult};
+use fmv_adapter_api::{
+    AdapterError, AreaInfo, AreaRuntime, Bounds, EncounterTable, Exit, GameAdapter, MoveResult, NpcSpawn,
+};
 use fmv_core::{AreaId, EditionProvenance, Fingerprint, GameId, Platform, Pos, ProvenanceSummary, SourceRef};
 use std::collections::HashSet;
 use std::io::{Read, Seek};
@@ -278,6 +305,15 @@ fn check_key(name: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// The key under which `list_areas` offers the archive entry called `name` (ASCII
+/// case-insensitive look-up; the archive's own spelling; the first entry of a name wins), or `None`
+/// when it does not offer one: no such entry, a name that fails [`check_key`], or the name list
+/// itself. These are the per-name rules of the index, without building it.
+fn listed_key(archive: &LgpArchive<Box<dyn ReadSeek>>, name: &str) -> Option<String> {
+    let entry = archive.find(name)?;
+    (!entry.name.eq_ignore_ascii_case(MAPLIST_NAME) && check_key(&entry.name).is_ok()).then(|| entry.name.clone())
+}
+
 /// Identifies this adapter build (crate version and fingerprint rule version) for build
 /// strings and logs. Two builds with different rule versions compute different fingerprints
 /// for identical media; folding this into `client_build`/`server_build` lets a mismatch be
@@ -318,8 +354,14 @@ pub struct Ff7Adapter {
     /// `provenance.summary()`, computed once for fingerprinting.
     summary: ProvenanceSummary,
     fixture: bool,
-    /// Cached area index. Lock order: `index` before `archive`, never the reverse.
+    /// Cached area index. Lock order: `index` and `maplist` before `archive`, never the reverse,
+    /// and never `index` and `maplist` together (so nothing may call [`Ff7Adapter::maplist`] or
+    /// `index()` while holding the `archive` guard: the mutexes are not reentrant).
     index: Mutex<Option<Arc<AreaIndex>>>,
+    /// The archive's `maplist` entry, read once: `None` = not read yet, `Some(None)` = the entry is
+    /// missing or damaged (cached), `Some(Some(list))` = the parsed name list. A read that fails
+    /// with an I/O error may be transient, so it is not cached (like the index).
+    maplist: Mutex<Option<Option<Arc<Maplist>>>>,
 }
 
 impl std::fmt::Debug for Ff7Adapter {
@@ -372,7 +414,7 @@ impl Ff7Adapter {
         let archive = LgpArchive::open(reader).map_err(lgp_error)?;
         let fixture = is_fixture_provenance(&provenance);
         let summary = provenance.summary();
-        Ok(Self { archive: Mutex::new(archive), provenance, summary, fixture, index: Mutex::new(None) })
+        Ok(Self { archive: Mutex::new(archive), provenance, summary, fixture, index: Mutex::new(None), maplist: Mutex::new(None) })
     }
 
     /// Open `flevel.lgp` at `path` **read-only** and build an adapter over it.
@@ -413,10 +455,49 @@ impl Ff7Adapter {
 
     /// Load a field as the concrete [`Ff7FieldArea`], which, unlike the `AreaRuntime` trait
     /// object, also exposes camera, palette, triggers and background data for rendering.
+    ///
+    /// Loading also works out what the field's own data says about its surroundings (its gateway
+    /// exits, NPCs and encounter table, see the module docs): a few milliseconds more than the
+    /// walkmesh alone, plus, on the first load of an adapter, one read of the archive's `maplist`.
     pub fn load_field(&self, key: &str) -> Result<Ff7FieldArea, AdapterError> {
         let loaded = self.load_validated(key)?;
         let info = self.info_for(&loaded.key, loaded.fingerprint);
-        Ok(Ff7FieldArea::new(info, loaded.field, loaded.walkmesh, loaded.surface))
+        // After `load_validated` has let go of the archive: `maplist` and the exit targets lock it.
+        let exits = self.gateway_exits(&loaded.field);
+        Ok(Ff7FieldArea::new(info, loaded.field, loaded.walkmesh, loaded.surface, exits))
+    }
+
+    /// The archive's name list, read and parsed once per adapter. `None` when the archive has no
+    /// `maplist` entry or it is damaged (the fields then have no exits; never an error). A read
+    /// that fails with an I/O error is not remembered, so a later load reads again.
+    pub(crate) fn maplist(&self) -> Option<Arc<Maplist>> {
+        let mut slot = self.maplist.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(cached) = slot.as_ref() {
+            return cached.clone();
+        }
+        let (list, cacheable) = {
+            let mut archive = self.archive.lock().unwrap_or_else(PoisonError::into_inner);
+            if archive.find(MAPLIST_NAME).is_none() {
+                (None, true)
+            } else {
+                match archive.read(MAPLIST_NAME) {
+                    Ok(bytes) => (Maplist::parse(&bytes).ok().map(Arc::new), true),
+                    Err(LgpError::Io(_)) => (None, false),
+                    Err(_) => (None, true),
+                }
+            }
+        };
+        if cacheable {
+            *slot = Some(list.clone());
+        }
+        list
+    }
+
+    /// The gateway exits of `field` (see the module docs).
+    fn gateway_exits(&self, field: &FieldFile) -> Vec<Exit> {
+        let Some(maplist) = self.maplist() else { return Vec::new() };
+        let archive = self.archive.lock().unwrap_or_else(PoisonError::into_inner);
+        area_content::gateway_exits(field, &maplist, |name| listed_key(&archive, name))
     }
 
     fn info_for(&self, key: &str, fingerprint: Fingerprint) -> AreaInfo {
@@ -574,6 +655,12 @@ pub struct Ff7FieldArea {
     spawns: Vec<Pos>,
     /// Field scale from the model-loader header; 512 when that header is missing or zero.
     field_scale: u16,
+    /// Gateway exits, resolved at load time (see the module docs).
+    exits: Vec<Exit>,
+    /// NPCs the field's scripts place unconditionally, worked out at load time.
+    npcs: Vec<NpcSpawn>,
+    /// The random-encounter table of the field's own section 6, decoded at load time.
+    encounters: Option<EncounterTable>,
 }
 
 impl std::fmt::Debug for Ff7FieldArea {
@@ -584,8 +671,9 @@ impl std::fmt::Debug for Ff7FieldArea {
 
 impl Ff7FieldArea {
     /// `surface` must have at least one usable triangle (checked by
-    /// `Ff7Adapter::load_validated`, the only caller).
-    fn new(info: AreaInfo, field: FieldFile, walkmesh: Walkmesh, surface: Surface) -> Self {
+    /// `Ff7Adapter::load_validated`, the only caller). `exits` are the gateway exits the adapter
+    /// resolved against the archive; the NPCs and the encounter table come from the field itself.
+    fn new(info: AreaInfo, field: FieldFile, walkmesh: Walkmesh, surface: Surface, exits: Vec<Exit>) -> Self {
         // Bounds over every vertex of every triangle, including degenerate ones.
         let mut min = [f32::MAX; 3];
         let mut max = [f32::MIN; 3];
@@ -606,7 +694,11 @@ impl Ff7FieldArea {
             Ok(scale) if scale != 0 => scale,
             _ => FIELD_SCALE_ONE,
         };
-        Self { info, field, walkmesh, surface, bounds, spawns, field_scale }
+        let encounters = field.section(section::ENCOUNTER).ok().and_then(decode_encounter_section);
+        let mut area = Self { info, field, walkmesh, surface, bounds, spawns, field_scale, exits, npcs: Vec::new(), encounters };
+        // NPCs without a literal height stand on this area's own surface, so they are worked out last.
+        area.npcs = area_content::npc_spawns(&area.field, &area.walkmesh, |x, y| area.height_at(x, y, None));
+        area
     }
 
     /// The field's scale ([`crate::field::ModelLoaderHeader::scale`]): 512 means 1.0 and speeds scale
@@ -742,6 +834,46 @@ impl AreaRuntime for Ff7FieldArea {
 
     fn max_speed(&self) -> f32 {
         FF7_FIELD_MAX_SPEED_PLACEHOLDER * f32::from(self.field_scale) / f32::from(FIELD_SCALE_ONE)
+    }
+
+    fn encounters(&self) -> Option<EncounterTable> {
+        self.encounters.clone()
+    }
+
+    fn exits(&self) -> Vec<Exit> {
+        self.exits.clone()
+    }
+
+    fn npcs(&self) -> Vec<NpcSpawn> {
+        self.npcs.clone()
+    }
+
+    /// The hint is the index of a triangle of this walkmesh (an exit's `arrival_hint`): when it
+    /// names one that holds the arrival point, the point stands on that triangle, at its height
+    /// there. That is what picks the right floor where triangles overlap and the point's own `z`
+    /// (a placeholder for exits) cannot. Otherwise the default rule applies. The point is not
+    /// moved: an arrival on a blocked edge stays on it (a move away from it is validated as usual).
+    fn place_arrival(&self, arrival: Pos, hint: Option<u32>) -> Pos {
+        self.hinted_arrival(arrival, hint).unwrap_or_else(|| self.validate_move(arrival, arrival).pos())
+    }
+}
+
+impl Ff7FieldArea {
+    /// `arrival` on the walkmesh triangle `hint`, if that is a triangle of this mesh that holds the
+    /// point (borders count; the point is rounded to the walkmesh's whole units for the test, as
+    /// gateway arrivals are whole numbers). `None` otherwise.
+    fn hinted_arrival(&self, arrival: Pos, hint: Option<u32>) -> Option<Pos> {
+        let triangle = self.walkmesh.triangles.get(usize::try_from(hint?).ok()?)?;
+        if !finite_xy(arrival) {
+            return None;
+        }
+        // (a float-to-int `as` saturates, so even absurd coordinates cannot wrap)
+        let (x, y) = (arrival.x.round() as i32, arrival.y.round() as i32);
+        if !triangle_contains_xy(triangle, x, y) {
+            return None;
+        }
+        let z = triangle_height_at(triangle, x, y)? as f32;
+        z.is_finite().then(|| Pos::new(arrival.x, arrival.y, z))
     }
 }
 

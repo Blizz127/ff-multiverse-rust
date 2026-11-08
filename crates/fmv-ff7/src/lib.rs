@@ -29,7 +29,12 @@
 //!   traits over a `flevel.lgp` source. Synthetic provenance is labelled FIXTURE; the area
 //!   fingerprint binds the edition provenance and is defined by [`area_fingerprint`].
 //!   Movement is validated against the walkmesh *and* its edge-access table (internal
-//!   `walk` module; see the `area` docs for the rule).
+//!   `walk` module; see the `area` docs for the rule). A loaded field also reports its gateway
+//!   exits, its non-player characters, an arrival placement and its random-encounter table
+//!   (`AreaRuntime::{exits, npcs, place_arrival, encounters}`, see the `area` docs).
+//! * [`decode_encounter_section`] - the random-encounter table of a field (section 6).
+//! * [`field_direction_to_facing`] - the script's `DIR` byte as a protocol heading (the one
+//!   conversion, with the evidence for it).
 //!
 //! Field character models (from `field/char.lgp`, verified on the same owned edition):
 //!
@@ -91,11 +96,18 @@ pub mod rsd;
 pub mod script;
 pub mod tex;
 
+mod area_content;
+mod encounter;
 mod util;
 mod walk;
 
 #[cfg(test)]
+mod area_hooks_tests;
+#[cfg(test)]
 mod testutil;
+
+pub use area_content::{field_direction_to_facing, MAX_NPCS_PER_AREA, MAX_NPC_LABEL_CHARS, MAX_NPC_SECTION_BYTES};
+pub use encounter::decode_encounter_section;
 
 pub use area::{
     adapter_version, area_fingerprint, Ff7Adapter, Ff7FieldArea, SkippedEntry, FF7_FIELD_FRAMES_PER_SECOND,
