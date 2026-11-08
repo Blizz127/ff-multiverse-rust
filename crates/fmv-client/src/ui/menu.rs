@@ -402,6 +402,25 @@ pub enum Screen {
     Loading(String),
 }
 
+/// What a game controller's buttons are about to act on, which decides what a few of them mean (see
+/// [`crate::ui::input::pad_menu_input`]): the same keys do different things on different screens,
+/// and some of them must never do anything dangerous by accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PadScreen {
+    /// The list of saved characters.
+    List,
+    /// The "forget this saved login?" question over the list.
+    Question,
+    /// The create form; `can_go_back`: there is a list to go back to.
+    Form { can_go_back: bool },
+    /// A connection attempt is running.
+    Connecting,
+    /// The area is being prepared after the join.
+    Loading,
+    /// A notice that takes the whole screen (a token that could not be saved) and must be read.
+    Alert,
+}
+
 /// The index of the first row shown when `rows` rows of a list of `count` entries fit on screen
 /// and `cursor` is the selected one: the cursor stays in the middle until the ends of the list.
 pub fn list_window(cursor: usize, count: usize, rows: usize) -> usize {
@@ -471,6 +490,29 @@ impl Menu {
     /// Is a connection attempt running?
     pub fn is_connecting(&self) -> bool {
         matches!(self.screen, Screen::Connecting(_))
+    }
+
+    /// Is a text field in focus (the name field of the create form)? That is where a keyboard
+    /// belongs: the window asks Steam for its on-screen keyboard when this becomes true. A notice
+    /// that takes the whole screen covers the form, so then nothing is in focus. (There is no
+    /// password field: if one is ever added it is masked by the field itself, and the keyboard
+    /// request is the same.)
+    pub fn text_input_focused(&self) -> bool {
+        !self.notice.as_ref().is_some_and(Notice::is_alert) && matches!(&self.screen, Screen::Create(f) if f.focus == Field::Name)
+    }
+
+    /// What a controller's buttons are about to act on.
+    pub fn pad_screen(&self) -> PadScreen {
+        if self.notice.as_ref().is_some_and(Notice::is_alert) {
+            return PadScreen::Alert;
+        }
+        match &self.screen {
+            Screen::Select(s) if s.confirm.is_some() => PadScreen::Question,
+            Screen::Select(_) => PadScreen::List,
+            Screen::Create(_) => PadScreen::Form { can_go_back: !self.accounts.is_empty() },
+            Screen::Connecting(_) => PadScreen::Connecting,
+            Screen::Loading(_) => PadScreen::Loading,
+        }
     }
 
     // ----- feeding ------------------------------------------------------------------------
@@ -1637,6 +1679,60 @@ mod tests {
         assert_eq!(form(&m).tint, [9, 9, 9], "every new form starts with the asked colour");
         let plain = Menu::new(cfg(GameId::Ff7), vec![]);
         assert!(!form(&plain).tint_chosen);
+    }
+
+    // ---- text focus and the controller's view of the screen --------------------------------------
+
+    /// The name field is the only text field: a fresh install opens in it, moving off it leaves it,
+    /// going to the form from the list enters it, and a notice over the whole screen covers it.
+    #[test]
+    fn the_name_field_is_the_only_text_field_and_a_covering_notice_hides_it() {
+        let mut m = menu_with(&[]);
+        assert!(m.text_input_focused(), "a fresh install opens in the name field");
+        press(&mut m, NavKey::Down);
+        assert_eq!(form(&m).focus, Field::Look);
+        assert!(!m.text_input_focused());
+        press(&mut m, NavKey::Up);
+        assert!(m.text_input_focused());
+        m.set_notice(Notice::error("the login could not be saved").with_secret("fmvt_abc"));
+        assert!(!m.text_input_focused(), "the alert covers the form");
+        assert_eq!(press(&mut m, NavKey::Enter), None);
+        assert!(m.text_input_focused(), "dismissed: the form is back");
+        // An ordinary notice does not cover anything.
+        m.set_notice(Notice::info("hello"));
+        assert!(m.text_input_focused());
+        // The list has no text field; going to the form enters the name field.
+        let mut m = menu_with(&["Cloud"]);
+        assert!(!m.text_input_focused());
+        m.text("n");
+        assert!(m.text_input_focused());
+        // Registering leaves the field (the attempt runs); a refusal puts the player back in it.
+        type_name(&mut m, "Tifa");
+        assert!(matches!(press(&mut m, NavKey::Enter), Some(MenuAction::Register { .. })));
+        assert!(!m.text_input_focused());
+        m.connect_failed(Notice::error("name taken"));
+        assert!(m.text_input_focused());
+    }
+
+    #[test]
+    fn the_pad_screen_says_where_a_controllers_buttons_are_heading() {
+        let mut m = menu_with(&["Cloud"]);
+        assert_eq!(m.pad_screen(), PadScreen::List);
+        press(&mut m, NavKey::Delete);
+        assert_eq!(m.pad_screen(), PadScreen::Question);
+        press(&mut m, NavKey::Escape);
+        assert_eq!(m.pad_screen(), PadScreen::List);
+        m.text("n");
+        assert_eq!(m.pad_screen(), PadScreen::Form { can_go_back: true });
+        assert_eq!(menu_with(&[]).pad_screen(), PadScreen::Form { can_go_back: false }, "nothing saved: no list to go back to");
+        let mut m = menu_with(&["Cloud"]);
+        press(&mut m, NavKey::Enter);
+        assert_eq!(m.pad_screen(), PadScreen::Connecting);
+        m.loading("FF7 md1stin");
+        assert_eq!(m.pad_screen(), PadScreen::Loading);
+        let mut m = menu_with(&["Cloud"]);
+        m.set_notice(Notice::error("the login could not be saved").with_secret("fmvt_abc"));
+        assert_eq!(m.pad_screen(), PadScreen::Alert);
     }
 }
 

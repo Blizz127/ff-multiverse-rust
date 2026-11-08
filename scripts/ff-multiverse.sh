@@ -239,12 +239,17 @@ pick_data_dir() {
 
 # rotate_log: keep one previous generation once the log passes LOG_LIMIT_BYTES.
 rotate_log() {
-  local size
-  if [[ -f $LOG_FILE ]]; then
-    size=$(wc -c <"$LOG_FILE" 2>/dev/null) || size=0
+  rotate_file "$LOG_FILE"
+}
+
+# rotate_file <file>: the same for any log of this script's (the client's, for one).
+rotate_file() {
+  local file="$1" size
+  if [[ -f $file ]]; then
+    size=$(wc -c <"$file" 2>/dev/null) || size=0
     size="${size//[[:space:]]/}"
     if [[ $size =~ ^[0-9]+$ ]] && ((size > LOG_LIMIT_BYTES)); then
-      mv -f -- "$LOG_FILE" "$LOG_FILE.1" 2>/dev/null || true
+      mv -f -- "$file" "$file.1" 2>/dev/null || true
     fi
   fi
 }
@@ -701,6 +706,15 @@ main() {
   fi
 
   log_line "starting fmv-client against 127.0.0.1:$PORT"
+  # The client's diagnostics (device:, window:, gamepad:, keyboard:, battle: lines) are copied to
+  # <data>/launcher/client.log: under a launcher nobody sees stderr, and the owner's device checks
+  # need them. stderr still reaches whoever started this script.
+  local client_log="$LAUNCH_DIR/client.log"
+  rotate_file "$client_log"
+  if have tee; then
+    exec "$HERE/fmv-client" --game ff7 --server "127.0.0.1:$PORT" \
+      --ff7-library "$DATA" --state-dir "$CLIENT_STATE" "$@" 2> >(tee -a "$client_log" >&2)
+  fi
   exec "$HERE/fmv-client" --game ff7 --server "127.0.0.1:$PORT" \
     --ff7-library "$DATA" --state-dir "$CLIENT_STATE" "$@"
 }
