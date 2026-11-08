@@ -903,3 +903,149 @@ fn real_battles_with_every_kind_of_command_are_deterministic_and_sane() {
     );
     println!("real battles with every command: {wins}/{runs} won; {casts} spells, {items_used} items, {enemy_attacks} enemy attacks");
 }
+
+/// The limit data of the owner's `kernel.bin`: the first limit of every character and what the engine
+/// builds from it, the requirements that reproduce GideonD's published table (so the layout is the one
+/// the guide documents) and the two attack records the damage table leans on. Plain `assert!`s: a
+/// failure names the character or the id, never what the file holds.
+#[test]
+#[ignore = "needs FMV_FF7_DATA pointing at the owner's FF7 data directory"]
+fn real_limits_have_the_documented_ids_names_requirements_and_records() {
+    use fmv_ff7_battle::action::element;
+    use fmv_ff7_battle::limit::LimitBreak;
+
+    let Some(path) = kernel_path() else { return };
+    let kernel = Kernel::open(&path).expect("kernel.bin parses");
+
+    // (character, first limit id, its name, kills for levels 2 and 3, uses for 1-2, 2-2 and 3-2).
+    type Row = (CharacterId, u16, &'static str, [u16; 2], [u16; 3]);
+    let table: [Row; 9] = [
+        (CharacterId::Cloud, 128, "Braver", [120, 320], [8, 7, 6]),
+        (CharacterId::Barret, 135, "Big Shot", [80, 160], [9, 8, 6]),
+        (CharacterId::Tifa, 149, "Beat Rush", [96, 192], [9, 7, 6]),
+        (CharacterId::Aeris, 142, "Healing Wind", [80, 160], [8, 6, 5]),
+        (CharacterId::RedXiii, 163, "Sled Fang", [72, 144], [8, 7, 6]),
+        (CharacterId::Yuffie, 177, "Greased Lightning", [64, 128], [8, 7, 6]),
+        (CharacterId::CaitSith, 170, "Dice", [40, 0xFFFF], [0xFFFF; 3]),
+        (CharacterId::Vincent, 173, "Galian Beast", [40, 96], [0xFFFF; 3]),
+        (CharacterId::Cid, 156, "Boost Jump", [60, 136], [7, 6, 5]),
+    ];
+    for (who, id, name, kills, uses) in table {
+        let limits = kernel.limits(who).expect("a record");
+        assert!(limits.first() == Some(id as u8), "{who:?}: the first limit");
+        let shown = kernel.magic_name(id).unwrap_or_default();
+        assert!(shown == name, "{who:?}: the name of limit {id} is not {name:?}");
+        assert!(shown.chars().all(|c| (' '..='~').contains(&c)), "{who:?}: the name has an escape left in it");
+        assert!(limits.kills == kills, "{who:?}: kills");
+        assert!(limits.uses == uses, "{who:?}: uses");
+        assert!(limits.divisors[0] > 0, "{who:?}: a level 1 divisor");
+        // The levels' divisors rise: a higher level fills more slowly.
+        let levels = if who == CharacterId::CaitSith { 2 } else { 4 };
+        assert!(limits.divisors[..levels].windows(2).all(|w| w[0] < w[1]), "{who:?}: divisors");
+        // What the engine builds: the id and divisor are the file's, and every one but Cait Sith plays.
+        let built = LimitBreak::for_character(&kernel, who);
+        assert!(built.is_some() == (who != CharacterId::CaitSith), "{who:?}: a limit break");
+        if let Some(limit) = built {
+            assert!(limit.attack == id && limit.divisor == limits.divisors[0], "{who:?}");
+        }
+    }
+    // Cloud's four divisors, and the divisors behind the two documented anchors of the gauge: at level 2
+    // Red XIII and Yuffie (300) and Cait Sith (180).
+    assert!(kernel.limits(CharacterId::Cloud).unwrap().divisors == [140, 324, 435, 506]);
+    assert!(kernel.limits(CharacterId::RedXiii).unwrap().divisors[1] == 300);
+    assert!(kernel.limits(CharacterId::Yuffie).unwrap().divisors[1] == 300);
+    assert!(kernel.limits(CharacterId::CaitSith).unwrap().divisors[1] == 180);
+
+    // The records the damage table cites: Tifa's Beat Rush (a Hit is 1.25x: Power 20) and Vincent's
+    // Beast Flare (3.75x, fire, magical: Power 60).
+    let beat_rush = kernel.attack(98).expect("record 98");
+    assert!(kernel.magic_name(98).unwrap_or_default().contains("Beat Rush") && beat_rush.power == 20);
+    let beast_flare = kernel.attack(113).expect("record 113");
+    assert!(kernel.magic_name(113).unwrap_or_default().contains("Beast Flare"));
+    assert!(beast_flare.power == 60 && beast_flare.element_mask == element::FIRE && beast_flare.damage_calc >> 4 == 2);
+    // The limit ids themselves (128 and up) are in no attack record of the kernel: there is nothing to decode.
+    assert!(kernel.attack(128).is_none(), "the kernel's attack data ends at record 127");
+}
+
+/// Every formation of the owner's `scene.bin`: the escapable flag and the escape counter agree on which
+/// fights cannot be run from, and the counters are the ones the community documents.
+#[test]
+#[ignore = "needs FMV_FF7_DATA pointing at the owner's FF7 data directory"]
+fn real_formations_agree_on_which_fights_cannot_be_escaped() {
+    use fmv_ff7_battle::scene::{BattleLayout, BattleSetup};
+
+    let Some(path) = scene_path() else { return };
+    let bin = SceneBin::open(&path).expect("scene.bin parses");
+    let (mut escapable, mut bosses, mut sure) = (0, 0, 0);
+    for id in 0..bin.formation_count() {
+        let Some(formation) = bin.formation(id) else { continue };
+        if formation.enemies().is_empty() {
+            continue;
+        }
+        let setup = formation.setup();
+        let flag = setup.flags & BattleSetup::ESCAPABLE_FLAG != 0;
+        let counter = setup.escape_counter;
+        assert!(flag == (counter < 9), "formation {id}: the flag and the counter disagree");
+        assert!(setup.run_difficulty().is_some() == flag, "formation {id}");
+        if flag {
+            assert!((1..=4).contains(&counter), "formation {id}: counter {counter}");
+            escapable += 1;
+            sure += usize::from(setup.layout.makes_running_sure());
+        } else {
+            assert!(counter == 9 || counter == 10, "formation {id}: counter {counter}");
+            bosses += 1;
+        }
+        // A back attack is never as easy to run from as a normal fight.
+        if setup.layout == BattleLayout::BackAttack {
+            assert!(counter != 1, "formation {id}: a back attack with difficulty 1");
+        }
+    }
+    assert!(escapable > 600 && bosses > 50 && sure > 5, "{escapable} escapable, {bosses} not, {sure} sure");
+    // md1stin's own formations (301, 302, 303) can be run from at difficulty 1.
+    for id in [301usize, 302, 303] {
+        assert!(bin.formation(id).unwrap().setup().run_difficulty() == Some(1), "formation {id}");
+    }
+}
+
+/// A real battle with a limit and an escape: Cloud at level 6 has Braver from the file, a full gauge
+/// lets him use it on the first enemy of 301, and an escape ends the battle with nothing paid.
+#[test]
+#[ignore = "needs FMV_FF7_DATA pointing at the owner's FF7 data directory"]
+fn real_cloud_uses_braver_and_the_party_can_run() {
+    use fmv_ff7_battle::rules::{ActionRef, ActorId, EscapeRule, Reward, LIMIT_MAX};
+
+    let (Some(scene), Some(kernel)) = (scene_path(), kernel_path()) else { return };
+    let scenes = SceneBin::open(&scene).expect("scene.bin parses");
+    let kernel = Kernel::open(&kernel).expect("kernel.bin parses");
+    let formation = scenes.formation(301).expect("formation 301");
+    let build = |limit: u16| {
+        let mut cloud = Combatant::from_character(&kernel, CharacterId::Cloud, 6, None, None).expect("Cloud");
+        cloud.limit = limit;
+        let enemies = enemies_for_formation(formation.scene, formation.slot);
+        let config = BattleConfig { start: StartMode::Preemptive, ..BattleConfig::default() };
+        let setup = formation.setup();
+        let rule = setup.run_difficulty().map(|difficulty| EscapeRule { difficulty, sure: setup.layout.makes_running_sure() });
+        BattleState::with_config(7, vec![cloud], enemies, config).with_escape(rule)
+    };
+    let mut battle = build(LIMIT_MAX);
+    let enemy = battle.enemy_ids()[0];
+    let info = battle.limit_for(ActorId(0)).expect("Cloud has a limit");
+    assert!(info.attack == 128 && !info.targets_allies);
+    let events = battle.submit_command(ActorId(0), Command::Limit { target: enemy }).expect("Braver");
+    assert!(events.contains(&BattleEvent::Action { actor: ActorId(0), action: ActionRef::Limit(128) }));
+    assert!(battle.limit_gauge(ActorId(0)) == 0);
+    let hp_start = formation.enemies()[0].record.hp;
+    assert!(battle.actor(enemy).unwrap().hp < hp_start, "Braver hurt the first enemy");
+    // Braver (3x) hurts more than a plain attack of the same Cloud.
+    let mut plain = build(0);
+    plain.submit_command(ActorId(0), Command::Attack { target: enemy }).expect("attack");
+    assert!(battle.actor(enemy).unwrap().hp <= plain.actor(enemy).unwrap().hp);
+
+    // Escape: the formation can be run from at difficulty 1, and with the party's first strike every check
+    // succeeds; the battle ends with nothing paid.
+    let mut running = build(0);
+    assert!(running.can_escape());
+    running.submit_command(ActorId(0), Command::Escape).expect("run");
+    assert!(running.outcome() == Some(Outcome::Escaped));
+    assert!(running.rewards() == Reward::default());
+}

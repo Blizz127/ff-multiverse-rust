@@ -10,7 +10,8 @@
 //! | [`scene`] | `scene.bin`: 256 scenes with formations, enemy stat records, attacks |
 //! | [`kernel`] | `kernel.bin` (commands, attacks, growth curves, starting data and stock, items, materia, weapons, armor) and `kernel2.bin` text |
 //! | [`action`] | what an action is: the damage-calculation byte, formulas, spells, enemy attacks, elements, the item table |
-//! | [`rules`] | the deterministic battle engine: ATB gauges, the commands (Attack, Magic, Item, Defend), enemy AI |
+//! | [`limit`] | the limit gauge and each character's first limit break (Braver, Big Shot, ...) |
+//! | [`rules`] | the deterministic battle engine: ATB gauges, the commands (Attack, Magic, Item, Defend, Limit, Escape), enemy AI |
 //! | [`rng`] | the seeded PCG32 generator behind every roll |
 //! | [`text`] | FF7 text encoding |
 //!
@@ -104,10 +105,13 @@
 pub mod action;
 mod bytes;
 pub mod kernel;
+pub mod limit;
 pub mod rng;
 pub mod rules;
 pub mod scene;
 pub mod text;
 
+#[cfg(test)]
+mod limit_tests;
 #[cfg(test)]
 mod testutil;
