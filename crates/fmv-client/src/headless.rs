@@ -148,7 +148,7 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
     }
     if battle_bot.is_active() {
         eprintln!(
-            "headless: battle behaviour: when the gauge is full, heal with the cheapest spell if HP is low, else attack; ask for a debug encounter: {}{}",
+            "headless: battle behaviour: when the ATB gauge is full, heal with the cheapest spell if HP is low, else give the limit break if the limit gauge is full, else attack; never escape; ask for a debug encounter: {}{}",
             args.debug_encounters,
             if args.debug_encounters && args.battle_wait_party > 1 {
                 format!(" (once leading a party of {})", args.battle_wait_party)

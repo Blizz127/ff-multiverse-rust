@@ -52,7 +52,9 @@ profiles (M2-a) and parties of up to three with story-phase placement (M2-b) wor
 from its own `scene.bin` and `kernel.bin`, and **every account keeps its own character progress
 (level, experience, AP, gil; protocol v5)**, paid by won battles and saved per account, and
 **battles have real commands (protocol v6)**: Attack, Magic, Item and Defend, with an inventory per
-account. The synthetic **FIXTURE** plaza still exists
+account, and **limit breaks and escape (protocol v7)**: a limit gauge that enemy blows fill and a
+full one turns Attack into the character's limit break, and any character may try to run. The
+synthetic **FIXTURE** plaza still exists
 as a labelled test area; it says nothing about FF7 support.
 
 | Milestone | Scope | State |
@@ -301,7 +303,8 @@ battle's own overlay is drawn over the scene (the enemy list, the party's HP, MP
 command menu on your turn, the floating numbers and the pointer over the models' heads, and a
 band across the top that is green while your client's replay agrees with the server and red if it
 ever diverges); the arrow keys (or WASD) move in the menu, **Space** or **Enter** confirm and
-**Backspace** goes back. A machine without battle data to replay the battle (or one started with
+**Backspace** goes back. The menu has Attack (which says **Limit** while your limit gauge is full),
+Magic, Item, Defend and **Escape** (greyed out in a battle that cannot be run from). A machine without battle data to replay the battle (or one started with
 `FMV_BATTLE_FLAT=1`) shows the flat view instead: one token per fighter with a thin HP bar. (The
 battle scene has been checked by unit tests and offscreen renders only: this box has no display,
 so the window itself was not run.)
@@ -411,7 +414,8 @@ gave the `i`-th member of a battle the `i`-th character of the game is gone), a 
 member that fought on, and the server adds the payment to that member's progress with FF7's own
 level-up rule, tells the player (`CharacterProgress`, which it also gets when it joins) and saves it:
 a new account starts at its character's starting level and experience from the kernel (Cloud: level 6
-with 610 experience, six short of level 7), nothing is written until its first win, and it is kept in
+with 610 experience, six short of level 7), nothing is written until its first win (or, since protocol v7,
+the first battle that ends with a limit gauge worth keeping), and it is kept in
 `<state>/server/progression/<account>/<Game>.character.json`, a record of its own beside, and
 never mixed with, the story blob that selects the account's story phase (so a battle can never move a
 player to another instance). The window shows it under the area name (`Cloud Lv 7  EXP 626/949
@@ -443,8 +447,33 @@ inventory is saved inside the account's character record (older records without 
 are not rewritten until an item is used or found), and the server tells the player what it carries
 when it joins, after every item used and after drops. A won battle drops items rolled by the server
 from the enemies' own drop rates (`scene.bin`), dealt to the living members, logged and not part of
-the replay. Known gaps: no statuses, no spells or items that hit a whole side, no summons, limits or
-escape, party elemental resistances are not modelled.
+the replay. Known gaps: no statuses, no spells or items that hit a whole side, no summons, party
+elemental resistances are not modelled (limit breaks and escape are in protocol v7, below).
+
+**Limit breaks and escape (protocol v7).** Every character has a **limit gauge** (0 to 255) that enemy
+blows fill (`damage * 76800 / (max HP * HP divisor)`; the divisor is the character's own, read from
+`kernel.bin`: Cloud's is 140, so he fills at about 46% of his max HP lost; the constant is calibrated on
+the community's documented figures and labelled an approximation in `crates/fmv-ff7-battle/src/limit.rs`),
+a knockout empties and a limit break spends. With it full, the first command of the menu says **Limit**
+where it said Attack, and the party panel draws a limit bar under each member's ATB bar. The limit of
+each character is its first (limit level 1: Braver, Big Shot, Beat Rush, Healing Wind, Sled Fang, Greased
+Lightning, Galian Beast, Boost Jump); its id, name and gauge divisor are the owner's own data, while the
+**damage of a limit is not in the owner's files** (the kernel's attack data stops before the limit ids),
+so it is the community's multiplier (Braver 3x a normal attack, Big Shot and Boost Jump 3.25x, ...), and
+Healing Wind heals one chosen ally for half of its max HP (FF7: the whole party). Not modelled: limit
+levels above 1 and the kills and uses that earn them, Cait Sith's Dice, Tifa's slot reels, Vincent's
+transformation, whole-side limits. **Escape** is the last row of the menu (FF7 runs by holding L1+R1,
+which this window cannot do cleanly): FF7's escape does not depend on levels but on the formation's *Run
+Difficulty* (`scene.bin`'s escape counter, 1 for most fights) and a Run Check that succeeds one time in
+four (always, after a preemptive strike or on a side attack); the actor spends its turn on four checks,
+the difficulty that is left is kept, and a formation whose flag bit `0x0004` is clear (every counter of 9
+or more in the owner's file: bosses and story fights) cannot be escaped at all. A successful escape ends
+the battle for the whole party with `Escaped`: nothing is paid. The **gauge is saved at the end of every
+battle**, whatever the outcome (escapes included), in the account's character record (a record of its own
+is made for an account that has never won, so "nothing is written until its first win" now reads "until
+its first win or the first battle that ends with a gauge worth keeping"); records written before v7 load
+with an empty gauge. The headless bot gives its limit when the gauge is full (a healing one only to a
+wounded ally) and never runs.
 
 `md1stin`'s own encounter table (section 6 of the field file, Steam PC build): the first of its
 two 24-byte tables is the enabled one, with rate 128 (a roll succeeds with probability 128/1024)
@@ -454,17 +483,24 @@ same way (checked over all 702 fields of that build: every enabled table's weigh
 and every formation exists in `scene.bin`). A starting party wins 301 and 303 every time (200 of
 200 seeded runs each, both members attacking), which is why the smoke script uses 301.
 
-**Protocol v6** (`fmv-protocol`) carries all of the above; its module docs describe the flow,
+**Protocol v7** (`fmv-protocol`) carries all of the above; its module docs describe the flow,
 and golden JSON tests pin the wire format (the engine's own event, command and outcome types
 included). A client or server of another protocol version is refused with a clear message:
 v5 added `CharacterProgress`, a message a v4 peer cannot decode (the server sends it right after
 every join), so the version was bumped like v4 was for `AreaChange`, and a v4 client is refused
 at the handshake instead of being cut off at its first join; v6 added `Inventory` (also sent
 right after every join), the new battle commands and events and the items in `BattleReward`, so a
-v5 client is refused the same way. Both sides must be built from this version or later. A server
-rolled back to a v5 build ignores (and, the next time it saves that account, drops) the inventory
-of a record written by this version, and refuses a record with more than about 70 stacks as too
-large: roll back only from a snapshot taken before any inventory was stored.
+v5 client is refused the same way; v7 added the `Limit` and `Escape` commands, the `LimitGauge` and
+`EscapeFailed` events, `Outcome::Escaped`, three refusals and the starting limit gauge of every
+battle member (`BattleMember::limit`, a required field: a v6 `EncounterStart` has none), so a v6
+client is refused at the handshake. Both sides must be built from this version or later. **Rolling
+back:** a server rolled back to a v6 build ignores the `limit` key of a record written by this
+version and drops it the next time it saves that account (the character comes back with an empty
+gauge, nothing else lost; a record whose gauge is empty is byte for byte what v6 writes); a v7 server
+reads every v6 record (no `limit` key reads as an empty gauge). The inventory caveat of v6 still
+applies: a server rolled back to a v5 build ignores (and drops) the inventory of a record and
+refuses a record with more than about 70 stacks as too large, so roll back past v6 only from a
+snapshot taken before any inventory was stored.
 
 ## Importing your own FF7 data
 

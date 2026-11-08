@@ -37,8 +37,13 @@
 //!   notes each message as one `inventory: stacks=.. total=.. items=<item>:<count>,..` line. The
 //!   server sends a fresh one on joining, after each item our character used and after drops; the
 //!   engine itself knows no inventory.
-//! * [`BattleBot`] is the headless `--battle-auto` player: it attacks, and heals itself with the
-//!   cheapest healing spell it can pay for when its HP is low ([`BattleClient::bot_command`]).
+//! * [`BattleBot`] is the headless `--battle-auto` player: it attacks, gives its limit break when the
+//!   gauge is full (protocol v7), and heals itself with the cheapest healing spell it can pay for when its
+//!   HP is low ([`BattleClient::bot_command`]).
+//! * Limit breaks and escape (protocol v7): the menu says `Limit` in place of `Attack` while our
+//!   character's limit gauge is full and has an `Escape` row; the party panel draws a limit bar per
+//!   member (`Bar::limit`); a battle the party got away from is `Outcome::Escaped` (counted by
+//!   [`BattleClient::escapes`], shown as "ESCAPED", nothing is paid).
 //! * [`open_rules`] reads this machine's battle data (the same library set as the field archive);
 //!   [`open_names`] reads the spell, item and enemy attack names the windows show from the same files.
 //!
@@ -75,7 +80,7 @@ pub use view::{battle_vertices, Bar, BattleView, Status};
 // The rest of the overlay's API, for the code that wires the names (`main`), the menu's data and the
 // 3D scene (the redraw): not all of it is used by this crate's own window yet.
 #[allow(unused_imports)]
-pub use menu::{BattleMenuModel, Level, MenuItem, MenuSpell, TargetRule};
+pub use menu::{BattleMenuModel, Level, MenuItem, MenuLimit, MenuSpell, TargetRule};
 #[allow(unused_imports)]
 pub use data::open_names;
 #[allow(unused_imports)]
@@ -94,7 +99,7 @@ use fmv_protocol::{
 };
 use hud::BattleHud;
 use menu::{Choice, Reply};
-use names::{item_name, spell_name};
+use names::{item_name, limit_name, spell_name};
 use panels::{RewardItem, RewardLine};
 use std::collections::VecDeque;
 use std::sync::{Arc, OnceLock};
@@ -189,6 +194,8 @@ struct Applied {
     magic: u64,
     item: u64,
     defend: u64,
+    limit: u64,
+    escape: u64,
 }
 
 impl Applied {
@@ -198,12 +205,14 @@ impl Applied {
             Command::Magic { .. } => &mut self.magic,
             Command::Item { .. } => &mut self.item,
             Command::Defend => &mut self.defend,
+            Command::Limit { .. } => &mut self.limit,
+            Command::Escape => &mut self.escape,
         };
         *kind += 1;
     }
 
     fn total(&self) -> u64 {
-        self.attack + self.magic + self.item + self.defend
+        self.attack + self.magic + self.item + self.defend + self.limit + self.escape
     }
 
     fn add(&mut self, other: Applied) {
@@ -211,6 +220,8 @@ impl Applied {
         self.magic += other.magic;
         self.item += other.item;
         self.defend += other.defend;
+        self.limit += other.limit;
+        self.escape += other.escape;
     }
 }
 
@@ -304,6 +315,8 @@ pub struct BattleClient {
     ended: u64,
     victories: u64,
     defeats: u64,
+    /// Battles the party got away from (protocol v7: `Outcome::Escaped`).
+    escapes: u64,
     divergences: u64,
     /// Ended battles whose whole log AND ending this machine reproduced with its own battle data.
     verified: u64,
@@ -349,6 +362,7 @@ impl BattleClient {
             ended: 0,
             victories: 0,
             defeats: 0,
+            escapes: 0,
             divergences: 0,
             verified: 0,
             applied: Applied::default(),
@@ -414,6 +428,12 @@ impl BattleClient {
         self.defeats
     }
 
+    /// Battles the party got away from (the server ended them with `Outcome::Escaped`: nothing was paid).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn escapes(&self) -> u64 {
+        self.escapes
+    }
+
     /// Times the replay disagreed with the server (or could not be made at all).
     pub fn divergences(&self) -> u64 {
         self.divergences
@@ -470,17 +490,20 @@ impl BattleClient {
         };
         let a = &self.applied;
         format!(
-            "{} battle(s) entered, {} won, {} lost, {} verified by replay, {} divergence(s), {} command(s) of ours applied ({} attack, {} magic, {} item, {} defend), {refusal}",
+            "{} battle(s) entered, {} won, {} lost, {} escaped, {} verified by replay, {} divergence(s), {} command(s) of ours applied ({} attack, {} magic, {} item, {} defend, {} limit, {} escape), {refusal}",
             self.entered,
             self.victories,
             self.defeats,
+            self.escapes,
             self.verified,
             self.divergences,
             a.total(),
             a.attack,
             a.magic,
             a.item,
-            a.defend
+            a.defend,
+            a.limit,
+            a.escape
         )
     }
 
@@ -643,6 +666,8 @@ impl BattleClient {
         if let Err(d) = replay.apply(tick, events, command.as_ref()) {
             self.diverged(format!("{battle_id} at tick {tick}: {d}"));
         }
+        // What the menu offers follows the replay: a limit gauge moves with these messages (and nowhere else).
+        self.refresh_menu_model();
     }
 
     fn on_end(&mut self, now: f64, battle_id: BattleId, outcome: Outcome, rewards: &[BattleReward]) {
@@ -655,6 +680,7 @@ impl BattleClient {
         match outcome {
             Outcome::Victory => self.victories += 1,
             Outcome::Defeat => self.defeats += 1,
+            Outcome::Escaped => self.escapes += 1,
         }
         let mine = rewards.iter().find(|r| r.account == self.me);
         // The items the server dropped to us (it rolled them after the battle: the replay cannot check them),
@@ -670,6 +696,7 @@ impl BattleClient {
         let last = self.render(&active, now);
         self.hud.finish(now, last, outcome, line);
         let paid = match mine {
+            _ if outcome == Outcome::Escaped => "the party got away: nothing is paid".to_string(),
             Some(r) if drops.is_empty() => format!("you earned {} exp, {} gil, {} ap", r.exp, r.gil, r.ap),
             Some(r) => format!("you earned {} exp, {} gil, {} ap, items={}", r.exp, r.gil, r.ap, item_list(&drops)),
             None => "no reward for you".to_string(),
@@ -729,10 +756,15 @@ impl BattleClient {
     /// * the inventory's items that the engine can use in battle ([`BattleState::item_info`]; an item it
     ///   cannot is not listed at all), a revival aimed at the fallen, other restoring items at the party
     ///   and the rest at the enemies;
-    /// * Defend.
+    /// * Defend;
+    /// * our character's limit break ([`BattleState::limit_for`]: its id and whether it aims at the party),
+    ///   with whether its gauge is full right now ([`BattleState::limit_ready`]: the menu then says `Limit`
+    ///   where it said `Attack`), and whether the battle can be run from ([`BattleState::can_escape`]).
     ///
-    /// Nothing is switched off here: the menu greys a spell out by comparing its cost with the MP it is
-    /// given every frame, and an item by its count, so the model never bakes in a number that moves.
+    /// Nothing is switched off here for MP and counts: the menu greys a spell out by comparing its cost with
+    /// the MP it is given every frame, and an item by its count, so the model never bakes in a number that
+    /// moves. The limit gauge is the one thing that is baked in: it moves only with the server's messages,
+    /// so the model is refreshed after every one of them.
     /// Without a battle, a replay (no battle data, or one that cannot be built) or a seat in the party
     /// the model is cleared: the menu then offers only Attack.
     fn refresh_menu_model(&mut self) {
@@ -763,7 +795,11 @@ impl BattleClient {
                 Some(MenuItem::new(stack.item, item_name(book, stack.item), stack.count, target))
             })
             .collect();
-        BattleMenuModel { spells, items, defend: true }
+        // Our limit break, if the character has one: whom it aims at and whether its gauge is full now.
+        let limit = state.limit_for(mine).map(|info| {
+            MenuLimit::new(info.attack, limit_name(book, info.attack), TargetRule::from_allies(info.targets_allies), state.limit_ready(mine))
+        });
+        BattleMenuModel { spells, items, defend: true, limit, escape: state.can_escape() }
     }
 
     fn on_rejected(&mut self, battle_id: Option<BattleId>, reason: BattleRejection) {
@@ -846,11 +882,36 @@ impl BattleClient {
         Some(BattleCmd::Command { battle_id: active.id, actor: mine, command: Command::Magic { spell: spell.spell, target: mine } })
     }
 
+    /// Our character's limit break, if it is our turn and the limit should be given: its gauge is full and
+    /// there is a worthwhile target. A damaging limit goes to the first living enemy; a healing one (Healing
+    /// Wind) only when somebody in the party is under half of its max HP, and then to the one with the
+    /// least HP left (by fraction, the lowest actor id on a tie): it is not wasted on a party that is fine.
+    /// The engine says whether the command is legal ([`BattleState::check_command`]).
+    fn limit_command(&self, now: f64) -> Option<BattleCmd> {
+        let (active, state, mine) = self.my_turn(now)?;
+        let info = state.limit_for(mine).filter(|_| state.limit_ready(mine))?;
+        let target = if info.targets_allies {
+            state
+                .party_ids()
+                .into_iter()
+                .filter_map(|id| state.actor(id).filter(|c| c.is_alive() && u64::from(c.hp) * 2 < u64::from(c.max_hp)).map(|c| (id, c)))
+                .min_by_key(|(id, c)| (u64::from(c.hp) * 1000 / u64::from(c.max_hp.max(1)), id.0))
+                .map(|(id, _)| id)?
+        } else {
+            state.enemy_ids().into_iter().find(|e| state.actor(*e).is_some_and(Combatant::is_alive))?
+        };
+        let command = Command::Limit { target };
+        state.check_command(mine, &command).ok()?;
+        Some(BattleCmd::Command { battle_id: active.id, actor: mine, command })
+    }
+
     /// What the headless bot does on our character's turn: heal itself when its HP is under 30% and a
-    /// restoring spell is affordable (the cheapest one, on itself), else attack the first living enemy
-    /// ([`BattleClient::attack_command`]).
+    /// restoring spell is affordable (the cheapest one, on itself), else give its limit when the gauge is
+    /// full and there is a worthwhile target ([`BattleClient::limit_command`]), else attack the first
+    /// living enemy ([`BattleClient::attack_command`]). It never runs: a bot that left a battle would never
+    /// win one.
     pub fn bot_command(&self, now: f64) -> Option<BattleCmd> {
-        self.heal_command(now).or_else(|| self.attack_command(now))
+        self.heal_command(now).or_else(|| self.limit_command(now)).or_else(|| self.attack_command(now))
     }
 
     /// Record that `cmd` was sent, so the same command is not sent again before the answer.
@@ -905,6 +966,7 @@ impl BattleClient {
                 ready: c.ready && c.is_alive(),
                 alive: c.is_alive(),
                 mine: Some(id) == active.my_actor,
+                limit: state.limit_gauge(id),
             })
         };
         BattleView {

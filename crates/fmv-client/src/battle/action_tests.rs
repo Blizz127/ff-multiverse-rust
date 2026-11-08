@@ -1,11 +1,11 @@
-//! Spells, items, Defend and the inventory through a real mirror: a simulated server runs the engine
-//! (`SyntheticRules`, or hand-made rules for what those cannot set up), the client mirrors it with the
-//! same rules, and the tests press the real menu keys, send what comes out, let the server apply it and
-//! look at what the client shows and counts. No game files are involved.
+//! Spells, items, Defend, limit breaks, escape and the inventory through a real mirror: a simulated server
+//! runs the engine (`SyntheticRules`, or hand-made rules for what those cannot set up), the client mirrors
+//! it with the same rules, and the tests press the real menu keys, send what comes out, let the server
+//! apply it and look at what the client shows and counts. No game files are involved.
 
 use super::*;
 use fmv_core::EntityId;
-use fmv_ff7_battle::rules::{element, ActionSpec, EnemyAction, ItemData, ItemTable, Reward, Spell};
+use fmv_ff7_battle::rules::{element, ActionSpec, EnemyAction, EscapeRule, Formula, ItemData, ItemTable, LimitBreak, Reward, Spell};
 use fmv_protocol::{split_rewards, BattleBuildError, BattleMember, FormationInfo, SyntheticRules};
 use super::popups::PopupKind;
 
@@ -36,11 +36,41 @@ struct Scenario {
     enemy_hp: u32,
     /// The enemy's own attacks (none: it attacks plainly).
     enemy_attacks: Vec<EnemyAction>,
+    /// Every member's limit break (none: no limit, so no gauge), whose starting gauge is the member's own
+    /// `BattleMember::limit`, as in the real builder.
+    limit: Option<LimitBreak>,
+    /// How hard the battle is to run from (none: it cannot be).
+    escape: Option<EscapeRule>,
 }
 
 impl Scenario {
     fn new() -> Self {
-        Self { hp: MAX_HP, mp: MAX_MP, spells: Self::spells(), ally_dead: false, enemy_hp: 1_200, enemy_attacks: Vec::new() }
+        Self {
+            hp: MAX_HP,
+            mp: MAX_MP,
+            spells: Self::spells(),
+            ally_dead: false,
+            enemy_hp: 1_200,
+            enemy_attacks: Vec::new(),
+            limit: None,
+            escape: Some(EscapeRule { difficulty: 1, sure: true }),
+        }
+    }
+
+    /// An enemy blow of exactly 20 damage that never misses (a flat formula): `n` of them fill a gauge by a
+    /// known amount (`20 * 76800 / (200 * 140)` = 54 for the Braver below).
+    fn flat_blow() -> EnemyAction {
+        EnemyAction { id: 1, spec: ActionSpec { formula: Formula::Flat, ..ActionSpec::damage_item(1, 0) } }
+    }
+
+    /// Braver: 3x, level 1 divisor 140 (the Cloud of the owner's file).
+    fn braver() -> LimitBreak {
+        LimitBreak::new(128, ActionSpec::limit_strike(48), 140)
+    }
+
+    /// Healing Wind: half of an ally's max HP.
+    fn healing_wind() -> LimitBreak {
+        LimitBreak::new(142, ActionSpec::limit_heal(16), 200)
     }
 
     /// Cure2 (1, 24 MP), Cure (0, 5 MP), Life (7, 34 MP), Fire (27, 4 MP): in this order, so that the
@@ -82,6 +112,8 @@ impl BattleRules for Scenario {
                 c.max_mp = MAX_MP;
                 c.mp = MAX_MP;
                 c.spells = self.spells.clone();
+                c.limit_break = self.limit;
+                c.limit = setup.party[i].limit;
                 if i == 0 {
                     c.hp = self.hp;
                     c.mp = self.mp;
@@ -100,7 +132,7 @@ impl BattleRules for Scenario {
         enemy.accuracy = 100;
         enemy.reward = Reward { exp: 12, gil: 20, ap: 2 };
         enemy.actions = self.enemy_attacks.clone();
-        Ok(BattleState::with_config(setup.seed, party, vec![enemy], setup.config()).with_items(Self::items()))
+        Ok(BattleState::with_config(setup.seed, party, vec![enemy], setup.config()).with_items(Self::items()).with_escape(self.escape))
     }
 
     fn data_fingerprint(&self) -> Fingerprint {
@@ -130,10 +162,23 @@ struct Sim {
 impl Sim {
     /// A battle of `formation` for `accounts` (member `i` is `ActorId(i)`, the enemy follows them).
     fn new(rules: &dyn BattleRules, formation: u16, accounts: &[AccountId], preemptive: bool) -> Self {
+        Self::with_limits(rules, formation, accounts, preemptive, &[])
+    }
+
+    /// Like [`Sim::new`], with member `i` starting with the limit gauge `limits[i]` (0 when not listed).
+    fn with_limits(rules: &dyn BattleRules, formation: u16, accounts: &[AccountId], preemptive: bool, limits: &[u16]) -> Self {
         let party = accounts
             .iter()
             .enumerate()
-            .map(|(i, &account)| BattleMember { entity: EntityId(100 + i as u64), account, character: i as u8, level: 6, weapon: None, armor: None })
+            .map(|(i, &account)| BattleMember {
+                entity: EntityId(100 + i as u64),
+                account,
+                character: i as u8,
+                level: 6,
+                weapon: None,
+                armor: None,
+                limit: limits.get(i).copied().unwrap_or(0),
+            })
             .collect();
         let setup = BattleSetup { formation_id: formation, seed: 7, party, preemptive, back_attack: false, battle_speed: 0, ticks_per_second: 1000 };
         let state = rules.build(&setup).expect("a battle");
@@ -209,7 +254,7 @@ fn names() -> Arc<NameBook> {
         }
         all
     };
-    let spells = table(28, &[(0, "Cure"), (1, "Cure2"), (7, "Life"), (27, "Fire")]);
+    let spells = table(143, &[(0, "Cure"), (1, "Cure2"), (7, "Life"), (27, "Fire"), (128, "Braver"), (142, "Healing Wind")]);
     let items = table(10, &[(0, "Potion"), (3, "Ether"), (7, "Phoenix Down"), (9, "Grenade")]);
     Arc::new(NameBook::from_tables(&spells, &items).with_enemy_attack(75, 272, "Machine Gun"))
 }
@@ -352,7 +397,7 @@ fn the_menu_model_is_filled_from_the_engine_at_the_start_and_from_the_inventory_
     assert!(c.menu_model_mut().defend);
     assert!(c.menu_model_mut().items.is_empty(), "no inventory message yet");
     let flags = |c: &BattleClient| menu(c, 1.0).commands.iter().map(|r| (r.label, r.enabled)).collect::<Vec<_>>();
-    assert_eq!(flags(&c), [("Attack", true), ("Magic", true), ("Item", false), ("Defend", true)]);
+    assert_eq!(flags(&c), [("Attack", true), ("Magic", true), ("Item", false), ("Defend", true), ("Escape", true)]);
 
     // The inventory arrives: what the engine can use in battle is listed in the order sent with its count
     // and whom it aims at (a revival at the fallen); an id the engine cannot use is not listed at all.
@@ -365,7 +410,7 @@ fn the_menu_model_is_filled_from_the_engine_at_the_start_and_from_the_inventory_
             MenuItem::new(7, "Item 7", 1, TargetRule::DeadAllies),
         ]
     );
-    assert_eq!(flags(&c), [("Attack", true), ("Magic", true), ("Item", true), ("Defend", true)]);
+    assert_eq!(flags(&c), [("Attack", true), ("Magic", true), ("Item", true), ("Defend", true), ("Escape", true)]);
 
     // The same lists carry this machine's names once it has them (the next message renames them).
     c.set_names(Some(names()));
@@ -564,7 +609,7 @@ fn spells_items_and_defend_chosen_with_the_keys_reach_the_server_as_engine_comma
     assert!(n.contains("verified: the server's") && !n.contains("NOT verified") && !n.contains("DIVERGENCE"), "{n}");
     assert!(n.contains("items=3:2,0:1)"), "the drops are in the note, by id and as sent: {n}");
     assert_eq!(c.commands_applied(), attacks + 6, "{n}");
-    assert!(c.summary().contains(&format!("{} command(s) of ours applied ({attacks} attack, 2 magic, 3 item, 1 defend)", attacks + 6)), "{}", c.summary());
+    assert!(c.summary().contains(&format!("{} command(s) of ours applied ({attacks} attack, 2 magic, 3 item, 1 defend, 0 limit, 0 escape)", attacks + 6)), "{}", c.summary());
     // The panel lists what was dropped, named from this machine's book, in the order the server sent.
     let finale = c.view(t + 1.0).and_then(|v| v.finale).expect("the panel");
     let reward = finale.reward.expect("we are in the party");
@@ -903,4 +948,220 @@ fn the_headless_bot_sends_its_heal_and_then_attacks_once_it_is_well_or_out_of_mp
     let me = c.active().and_then(ActiveBattle::replay).expect("the replay").state().actor(ME_AT_0).expect("us").clone();
     assert!(u64::from(me.hp) * 10 >= u64::from(me.max_hp) * 3 || me.mp < 5, "hp {} mp {}", me.hp, me.mp);
     assert_eq!(c.divergences(), 0, "{}", notes(&mut c));
+}
+
+// ----- limit breaks and escape (protocol v7) ------------------------------------------------------------
+
+fn no_divergence(c: &mut BattleClient, what: &str) {
+    let n = notes(c);
+    assert!(c.divergences() == 0 && !n.contains("DIVERGENCE"), "{what}: {n}");
+    assert!(!c.active().is_some_and(ActiveBattle::diverged), "{what}");
+}
+
+/// The events a command produced, without the `GaugeReady`s of the start that came with it (a preemptive
+/// start announces the full gauges with the first message).
+fn of_the_command(msg: &ServerMsg) -> Vec<BattleEvent> {
+    events_of(msg).iter().copied().filter(|e| !matches!(e, BattleEvent::GaugeReady { .. })).collect()
+}
+
+/// A battle of one dummy that hits for 20 (so the gauge of a 200 HP Braver user moves by 54 a blow) against `accounts`.
+fn limit_battle(scenario: Scenario, accounts: &[AccountId], limits: &[u16], preemptive: bool) -> (Sim, BattleClient) {
+    let rules: Arc<dyn BattleRules> = Arc::new(Scenario { enemy_attacks: vec![Scenario::flat_blow()], ..scenario });
+    let sim = Sim::with_limits(&*rules, 0, accounts, preemptive, limits);
+    let mut c = client(rules);
+    c.set_names(Some(names()));
+    c.on_message(0.0, sim.start());
+    (sim, c)
+}
+
+#[test]
+fn the_party_panel_carries_every_members_gauge_and_the_menu_says_limit_once_a_blow_has_filled_ours() {
+    let (mut sim, mut c) = limit_battle(Scenario { limit: Some(Scenario::braver()), ..Scenario::new() }, &[ME, PEER], &[100, 255], false);
+    let view = c.view(0.5).expect("a battle");
+    assert_eq!(view.party.iter().map(|b| b.limit).collect::<Vec<_>>(), [100, 255], "the gauges the server started them with");
+    assert!(view.enemies.iter().all(|b| b.limit == 0), "an enemy has none");
+    let limit = c.menu_model_mut().limit.clone().expect("our character has a limit");
+    assert_eq!((limit.id, limit.name.as_str(), limit.target, limit.ready), (128, "Braver", TargetRule::Enemies, false));
+
+    // Blows fill ours (54 each): the bar follows the replay, and the model follows it too, with no inventory
+    // message to prompt it. At our next turn the first row says Limit.
+    let mut t = 1.0;
+    sim.run_until(&mut c, &mut t, |s| s.limit_ready(ME_AT_0));
+    let seen = c.view(t).expect("a battle").party[0].limit;
+    assert_eq!((seen, sim.state.limit_gauge(ME_AT_0)), (255, 255), "capped at a full gauge");
+    assert!(c.menu_model_mut().limit.as_ref().is_some_and(|l| l.ready));
+    sim.until_our_turn(&mut c, &mut t);
+    let rows = menu(&c, t).commands.iter().map(|r| (r.label, r.enabled)).collect::<Vec<_>>();
+    assert_eq!(rows, [("Limit", true), ("Magic", true), ("Item", false), ("Defend", true), ("Escape", true)]);
+    no_divergence(&mut c, "the gauge filling");
+}
+
+#[test]
+fn a_full_gauge_turns_attack_into_limit_the_server_applies_it_and_attack_comes_back() {
+    let (mut sim, mut c) = limit_battle(Scenario { limit: Some(Scenario::braver()), ..Scenario::new() }, &[ME], &[255], true);
+    let mut t = 1.0;
+    assert_eq!(menu(&c, t).commands[0].label, "Limit");
+    let enemy = ActorId(1);
+    let cmd = choose(&mut c, t, 0, None, Some(enemy));
+    assert_eq!(cmd, BattleCmd::Command { battle_id: BattleId(1), actor: ME_AT_0, command: Command::Limit { target: enemy } });
+    let msg = send(&mut sim, &mut c, cmd, t);
+    no_divergence(&mut c, "the limit");
+    let events = of_the_command(&msg);
+    assert_eq!(events[0], BattleEvent::Action { actor: ME_AT_0, action: fmv_protocol::ActionRef::Limit(128) });
+    assert_eq!(events[1], BattleEvent::LimitGauge { actor: ME_AT_0, value: 0 });
+    assert!(matches!(events[2], BattleEvent::Damage { actor: ME_AT_0, target, critical: false, .. } if target == enemy), "{events:?}");
+    assert_eq!(c.view(t).expect("a battle").party[0].limit, 0, "the bar empties");
+    // It was our one command: the next turn has Attack back where Limit was.
+    t += 1.0;
+    sim.until_our_turn(&mut c, &mut t);
+    assert_eq!(menu(&c, t).commands[0].label, "Attack");
+    assert!(!c.menu_model_mut().limit.as_ref().expect("still has one").ready);
+}
+
+#[test]
+fn a_limit_that_wins_the_battle_ends_it_on_the_victory_and_is_counted_in_the_summary() {
+    // Braver (about 140 damage here) against a dummy of 100 HP.
+    let (mut sim, mut c) = limit_battle(Scenario { limit: Some(Scenario::braver()), enemy_hp: 100, ..Scenario::new() }, &[ME], &[255], true);
+    let t = 1.0;
+    let cmd = choose(&mut c, t, 0, None, Some(ActorId(1)));
+    let msg = send(&mut sim, &mut c, cmd, t);
+    no_divergence(&mut c, "the winning limit");
+    assert_eq!(of_the_command(&msg).last(), Some(&BattleEvent::Victory), "the gauge was spent before the blow, so the victory is still the last event");
+    c.on_message(t + 0.5, sim.end(&[]));
+    assert_eq!((c.victories(), c.verified(), c.divergences()), (1, 1, 0));
+    assert!(c.summary().contains("1 won") && c.summary().contains("1 limit, 0 escape)"), "{}", c.summary());
+}
+
+#[test]
+fn a_healing_limit_aims_at_the_party_through_the_real_menu() {
+    let (mut sim, mut c) = limit_battle(Scenario { limit: Some(Scenario::healing_wind()), hp: 60, ..Scenario::new() }, &[ME, PEER], &[255, 0], true);
+    let t = 1.0;
+    assert_eq!(menu(&c, t).commands[0].label, "Limit");
+    assert_eq!(c.menu_key(MenuKey::Confirm, t), MenuReply::Handled);
+    let aim = menu(&c, t).aim.expect("the pointer");
+    assert_eq!((aim.target, aim.enemy), (ActorId(0), false), "Healing Wind aims at the party, starting on ourselves");
+    let cmd = match confirm_target(&mut c, ME_AT_0, t) {
+        MenuReply::Send(cmd) => cmd,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(cmd, BattleCmd::Command { battle_id: BattleId(1), actor: ME_AT_0, command: Command::Limit { target: ME_AT_0 } });
+    let msg = send(&mut sim, &mut c, cmd, t);
+    no_divergence(&mut c, "Healing Wind");
+    // Half of 200 max HP on a character at 60: 100.
+    assert!(events_of(&msg).contains(&BattleEvent::Heal { actor: ME_AT_0, target: ME_AT_0, amount: 100 }), "{:?}", events_of(&msg));
+}
+
+#[test]
+fn escape_is_the_last_row_and_a_successful_one_ends_the_battle_for_everyone_with_nothing_paid() {
+    let (mut sim, mut c) = limit_battle(Scenario::new(), &[ME, PEER], &[], true);
+    let t = 1.0;
+    assert_eq!(menu(&c, t).commands[4], menu::CommandRow { label: "Escape", enabled: true });
+    let cmd = choose(&mut c, t, 4, None, None);
+    assert_eq!(cmd, BattleCmd::Command { battle_id: BattleId(1), actor: ME_AT_0, command: Command::Escape }, "no list and no pointer: it goes at once");
+    let msg = send(&mut sim, &mut c, cmd, t);
+    no_divergence(&mut c, "the escape");
+    assert_eq!(of_the_command(&msg), [BattleEvent::Action { actor: ME_AT_0, action: fmv_protocol::ActionRef::Escape }], "a successful escape has no event of its own");
+    assert_eq!(sim.state.outcome(), Some(Outcome::Escaped));
+    // The server ends the battle: nothing is paid, and the client counts an escape (not a win or a loss) that
+    // its own replay confirmed.
+    c.on_message(t + 0.5, sim.end(&[]));
+    assert!(!c.in_battle());
+    assert_eq!((c.escapes(), c.victories(), c.defeats()), (1, 0, 0));
+    assert_eq!((c.verified(), c.divergences()), (1, 0), "the replay reproduced the log and the ending, and the empty rewards");
+    let n = notes(&mut c);
+    assert!(n.contains("ended in Escaped") && n.contains("the party got away: nothing is paid") && n.contains("verified"), "{n}");
+    assert!(!n.contains("earned"), "{n}");
+    assert!(c.summary().contains("1 escaped") && c.summary().contains("0 won") && c.summary().contains("1 escape)"), "{}", c.summary());
+    // The panel says so for the few seconds it lingers, with no reward on it.
+    let finale = c.view(t + 1.5).and_then(|v| v.finale).expect("the panel");
+    assert_eq!((finale.outcome, finale.reward), (Outcome::Escaped, None));
+}
+
+#[test]
+fn a_failed_escape_costs_the_turn_only_and_a_boss_that_cannot_be_escaped_greys_the_row_out() {
+    // Difficulty 4 and no sure checks: four successes in four checks is 0.4%, so seed 7 fails.
+    let (mut sim, mut c) = limit_battle(Scenario { escape: Some(EscapeRule { difficulty: 4, sure: false }), ..Scenario::new() }, &[ME], &[], true);
+    let mut t = 1.0;
+    let cmd = choose(&mut c, t, 4, None, None);
+    let msg = send(&mut sim, &mut c, cmd, t);
+    no_divergence(&mut c, "the failed escape");
+    assert_eq!(
+        of_the_command(&msg),
+        [BattleEvent::Action { actor: ME_AT_0, action: fmv_protocol::ActionRef::Escape }, BattleEvent::EscapeFailed { actor: ME_AT_0 }]
+    );
+    assert!(c.in_battle() && c.escapes() == 0, "the battle goes on");
+    assert!(c.view(t).and_then(|v| v.menu).is_none(), "the turn is over: the menu closes until the gauge fills again");
+    t += 1.0;
+    sim.until_our_turn(&mut c, &mut t);
+    assert!(menu(&c, t).commands[4].enabled, "it can try again");
+
+    // A boss: the engine says it cannot be escaped, so the row is dim, says why and sends nothing.
+    let (_sim, mut c) = limit_battle(Scenario { escape: None, ..Scenario::new() }, &[ME], &[], true);
+    let v = menu(&c, 1.0);
+    assert_eq!((v.commands[4].label, v.commands[4].enabled), ("Escape", false));
+    assert!(!c.menu_model_mut().escape);
+    assert_eq!(confirm_command(&mut c, 4, 1.0), MenuReply::Refused("Cannot escape from this battle"));
+    assert_eq!(menu(&c, 1.0).hint, Some("Cannot escape from this battle"));
+}
+
+#[test]
+fn the_servers_refusals_of_a_limit_or_an_escape_are_counted_and_noted_and_free_the_command() {
+    let (_sim, mut c) = limit_battle(Scenario::new(), &[ME], &[], true);
+    let cmd = BattleCmd::Command { battle_id: BattleId(1), actor: ME_AT_0, command: Command::Limit { target: ActorId(1) } };
+    for (n, reason) in [BattleRejection::LimitNotReady, BattleRejection::NoLimit, BattleRejection::CannotEscape].into_iter().enumerate() {
+        c.note_sent(&cmd, 1.0);
+        assert_eq!(c.menu_key(MenuKey::Confirm, 1.1), MenuReply::Ignored, "the menu is closed while a command is in flight");
+        c.on_message(1.2, ServerMsg::BattleRejected { battle_id: Some(BattleId(1)), reason });
+        assert_eq!(c.rejections(), n as u64 + 1);
+        assert_eq!(c.last_rejection(), Some(reason));
+        assert!(notes(&mut c).contains(&format!("request refused: {reason}")));
+        // The refusal freed the command: the menu takes Confirm again (and aims, as Attack does).
+        assert_eq!(c.menu_key(MenuKey::Confirm, 1.3), MenuReply::Handled);
+        assert_eq!(c.menu_key(MenuKey::Back, 1.3), MenuReply::Handled);
+    }
+}
+
+#[test]
+fn the_bot_gives_a_full_limit_but_heals_first_when_hurt_aims_a_healing_limit_at_the_wounded_and_never_runs() {
+    // Full gauge, healthy: the limit goes to the first living enemy.
+    let (_sim, c) = limit_battle(Scenario { limit: Some(Scenario::braver()), ..Scenario::new() }, &[ME], &[255], true);
+    assert_eq!(command(&c, 1.0), Some(Command::Limit { target: THE_DUMMY }));
+    // Not full: a plain attack.
+    let (_sim, c) = limit_battle(Scenario { limit: Some(Scenario::braver()), ..Scenario::new() }, &[ME], &[254], true);
+    assert_eq!(command(&c, 1.0), Some(Command::Attack { target: THE_DUMMY }));
+    // Full gauge but hurt (40 of 200 is under 30%) and able to pay for a Cure: it heals first.
+    let (_sim, c) = limit_battle(Scenario { limit: Some(Scenario::braver()), hp: 40, ..Scenario::new() }, &[ME], &[255], true);
+    assert_eq!(command(&c, 1.0), Some(Command::Magic { spell: 0, target: ME_AT_0 }));
+    // Hurt and out of MP: no heal to give, so the limit.
+    let (_sim, c) = limit_battle(Scenario { limit: Some(Scenario::braver()), hp: 40, mp: 0, ..Scenario::new() }, &[ME], &[255], true);
+    assert_eq!(command(&c, 1.0), Some(Command::Limit { target: THE_DUMMY }));
+
+    // A healing limit is not wasted on a party that is fine ...
+    let (_sim, c) = limit_battle(Scenario { limit: Some(Scenario::healing_wind()), ..Scenario::new() }, &[ME, PEER], &[255, 0], true);
+    assert_eq!(command(&c, 1.0), Some(Command::Attack { target: ActorId(2) }));
+    // ... but goes to the one under half of its HP (here ourselves, at 90 of 200: not under 30%, so no spell).
+    let (_sim, c) = limit_battle(Scenario { limit: Some(Scenario::healing_wind()), hp: 90, ..Scenario::new() }, &[ME, PEER], &[255, 0], true);
+    assert_eq!(command(&c, 1.0), Some(Command::Limit { target: ME_AT_0 }));
+
+    // Whatever happens, a bot with a limit never runs: play a whole battle with it.
+    let (mut sim, mut c) = limit_battle(Scenario { limit: Some(Scenario::braver()), enemy_hp: 400, ..Scenario::new() }, &[ME], &[255], true);
+    let mut t = 1.0;
+    let mut limits = 0;
+    for _ in 0..500 {
+        t += 0.01;
+        sim.until_our_turn(&mut c, &mut t);
+        if sim.state.outcome().is_some() {
+            break;
+        }
+        let next = c.bot_command(t).expect("our turn");
+        match next {
+            BattleCmd::Command { command: Command::Escape, .. } => panic!("the bot ran"),
+            BattleCmd::Command { command: Command::Limit { .. }, .. } => limits += 1,
+            _ => {}
+        }
+        send(&mut sim, &mut c, next, t);
+    }
+    assert_eq!(sim.state.outcome(), Some(Outcome::Victory));
+    assert!(limits >= 1, "it gave its starting limit");
+    no_divergence(&mut c, "the whole battle");
 }

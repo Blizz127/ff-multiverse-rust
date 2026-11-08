@@ -1,5 +1,5 @@
-//! The command menu of our own character: Attack / Magic / Item / Defend, the Magic and Item lists
-//! and the pointer that picks a target.
+//! The command menu of our own character: Attack / Magic / Item / Defend / Escape, the Magic and Item
+//! lists and the pointer that picks a target.
 //!
 //! A pure state machine over plain data, no GPU and no clock: [`BattleMenu::press`] takes one
 //! [`MenuKey`] and what the battle looks like right now ([`Ctx`]) and answers with a [`Reply`];
@@ -8,11 +8,19 @@
 //! # Levels
 //!
 //! ```text
-//! Commands --Confirm on Attack----------------------------> Target --Confirm--> Send(Attack)
+//! Commands --Confirm on Attack (or Limit)-----------------> Target --Confirm--> Send(Attack or Limit)
 //!     |   \--Confirm on Magic--> Magic list --Confirm--------^  (Back returns to where it came from)
 //!     |    \-Confirm on Item---> Item list  --Confirm--------^
-//!     \--Confirm on Defend------------------------------------------> Send(Defend)
+//!     |--Confirm on Defend------------------------------------------> Send(Defend)
+//!     \--Confirm on Escape------------------------------------------> Send(Escape)
 //! ```
+//!
+//! **Limit** (protocol v7) takes the place of Attack, as in FF7, when our character's limit gauge is full:
+//! the first row of the list says `Limit` instead of `Attack` and opens the target selection among the
+//! limit's own targets (the enemies, or the party for a healing limit like Healing Wind). **Escape** is the
+//! last row (FF7 runs by holding L1+R1, which a window that only has keys cannot do cleanly: running is
+//! the actor's turn here, see `fmv_ff7_battle::rules`, "Escape"); it sends at once, and is greyed out when
+//! the battle cannot be run from.
 //!
 //! `Back` goes up one level. At the top level it is [`Reply::Ignored`], which is how the window
 //! knows that Esc was not for the menu and falls back to its own handling (which never quits in a
@@ -23,8 +31,9 @@
 //! Only what the owner's own data and the engine say, as plain numbers and strings the client
 //! hands over in a [`BattleMenuModel`] (it fills it from the replayed engine and the inventory the
 //! server sent, see `BattleClient::refresh_menu_model`): the spells (id, name, MP cost, whom they
-//! aim at), the items (id, name, count, whom they aim at) and whether Defend exists. What the model
-//! lacks is greyed out and cannot be opened: an empty model (this machine has no battle data, or we
+//! aim at), the items (id, name, count, whom they aim at), whether Defend exists, our character's limit
+//! (id, name, whom it aims at, whether its gauge is full) and whether the battle can be escaped. What the
+//! model lacks is greyed out and cannot be opened: an empty model (this machine has no battle data, or we
 //! are not in the party) leaves only Attack working.
 //!
 //! # Targets
@@ -39,11 +48,14 @@ use fmv_ff7_battle::rules::{ActorId, Command};
 pub const LIST_ROWS: usize = 4;
 
 /// The commands, in menu order.
-pub const COMMAND_LABELS: [&str; 4] = ["Attack", "Magic", "Item", "Defend"];
+pub const COMMAND_LABELS: [&str; 5] = ["Attack", "Magic", "Item", "Defend", "Escape"];
+/// What the first command says instead of "Attack" when the limit gauge is full.
+pub const LIMIT_LABEL: &str = "Limit";
 const ATTACK: usize = 0;
 const MAGIC: usize = 1;
 const ITEM: usize = 2;
 const DEFEND: usize = 3;
+const ESCAPE: usize = 4;
 
 /// A key as the menu understands it. The window maps arrows and WASD to the four directions,
 /// Space and Enter to `Confirm`, Backspace and Esc to `Back`.
@@ -125,14 +137,39 @@ impl MenuItem {
     }
 }
 
-/// What the menu offers: filled from the engine and the inventory at every battle start and every
-/// inventory message, empty (only Attack) while there is nothing to fill it from.
+/// Our character's limit break (protocol v7), as the menu needs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MenuLimit {
+    /// The limit's id (what `ActionRef::Limit` carries).
+    pub id: u16,
+    /// Its name from this machine's own text (Braver, Big Shot, ...).
+    pub name: String,
+    /// Whom it aims at: the enemies, or the party for a healing limit.
+    pub target: TargetRule,
+    /// The gauge is full: the first command says `Limit` instead of `Attack`. The client refreshes it with
+    /// every message of the battle (the gauge moves only with them).
+    pub ready: bool,
+}
+
+impl MenuLimit {
+    pub fn new(id: u16, name: impl Into<String>, target: TargetRule, ready: bool) -> Self {
+        Self { id, name: name.into(), target, ready }
+    }
+}
+
+/// What the menu offers: filled from the engine and the inventory at every battle start, every
+/// inventory message and every message of the battle (a limit gauge moves with them), empty (only Attack)
+/// while there is nothing to fill it from.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct BattleMenuModel {
     pub spells: Vec<MenuSpell>,
     pub items: Vec<MenuItem>,
     /// Defend exists (the engine takes the command).
     pub defend: bool,
+    /// Our character's limit break, if it has one.
+    pub limit: Option<MenuLimit>,
+    /// The battle can be run from (the engine takes `Escape`).
+    pub escape: bool,
 }
 
 impl BattleMenuModel {
@@ -142,6 +179,11 @@ impl BattleMenuModel {
 
     fn has_items(&self) -> bool {
         self.items.iter().any(MenuItem::usable)
+    }
+
+    /// The limit our character can give now: it has one and its gauge is full.
+    fn ready_limit(&self) -> Option<&MenuLimit> {
+        self.limit.as_ref().filter(|l| l.ready)
     }
 }
 
@@ -184,6 +226,10 @@ pub enum Choice {
     Magic { spell: u16, target: ActorId },
     Item { item: u16, target: ActorId },
     Defend,
+    /// Our character's limit break (protocol v7).
+    Limit { target: ActorId },
+    /// Run (protocol v7).
+    Escape,
 }
 
 impl Choice {
@@ -195,6 +241,8 @@ impl Choice {
             Choice::Magic { spell, target } => Command::Magic { spell, target },
             Choice::Item { item, target } => Command::Item { item, target },
             Choice::Defend => Command::Defend,
+            Choice::Limit { target } => Command::Limit { target },
+            Choice::Escape => Command::Escape,
         }
     }
 }
@@ -205,6 +253,8 @@ pub enum Refusal {
     NoMagic,
     NoItems,
     NoDefend,
+    /// The battle cannot be run from (a boss, or no battle data here to say it can).
+    NoEscape,
     NotEnoughMp,
     OutOfItem,
     Unusable,
@@ -217,6 +267,7 @@ impl Refusal {
             Refusal::NoMagic => "No magic to cast",
             Refusal::NoItems => "No items to use",
             Refusal::NoDefend => "Not available yet",
+            Refusal::NoEscape => "Cannot escape from this battle",
             Refusal::NotEnoughMp => "Not enough MP",
             Refusal::OutOfItem => "None left",
             Refusal::Unusable => "Cannot be used now",
@@ -254,6 +305,7 @@ enum Aimed {
     Attack,
     Magic(u16),
     Item(u16),
+    Limit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -392,7 +444,11 @@ impl BattleMenu {
             }
             MenuKey::Left | MenuKey::Right | MenuKey::Back => Reply::Ignored,
             MenuKey::Confirm => match self.command {
-                ATTACK => self.start_aim(Aimed::Attack, TargetRule::Enemies, Level::Commands, ctx),
+                // A full limit gauge puts the limit where Attack was.
+                ATTACK => match ctx.model.ready_limit() {
+                    Some(limit) => self.start_aim(Aimed::Limit, limit.target, Level::Commands, ctx),
+                    None => self.start_aim(Aimed::Attack, TargetRule::Enemies, Level::Commands, ctx),
+                },
                 MAGIC if ctx.model.has_magic() => {
                     self.state = State::Magic;
                     Reply::Handled
@@ -404,7 +460,9 @@ impl BattleMenu {
                 }
                 ITEM => Reply::Refused(Refusal::NoItems),
                 DEFEND if ctx.model.defend => Reply::Send(Choice::Defend),
-                _ => Reply::Refused(Refusal::NoDefend),
+                DEFEND => Reply::Refused(Refusal::NoDefend),
+                ESCAPE if ctx.model.escape => Reply::Send(Choice::Escape),
+                _ => Reply::Refused(Refusal::NoEscape),
             },
         }
     }
@@ -466,6 +524,7 @@ impl BattleMenu {
                     Aimed::Attack => Choice::Attack { target },
                     Aimed::Magic(spell) => Choice::Magic { spell, target },
                     Aimed::Item(item) => Choice::Item { item, target },
+                    Aimed::Limit => Choice::Limit { target },
                 });
             }
         }
@@ -475,11 +534,13 @@ impl BattleMenu {
     /// What to draw.
     pub fn view(&self, ctx: &Ctx<'_>) -> MenuView {
         let state = self.resolved(ctx);
+        let first = if ctx.model.ready_limit().is_some() { LIMIT_LABEL } else { COMMAND_LABELS[ATTACK] };
         let commands = [
-            CommandRow { label: COMMAND_LABELS[ATTACK], enabled: true },
+            CommandRow { label: first, enabled: true },
             CommandRow { label: COMMAND_LABELS[MAGIC], enabled: ctx.model.has_magic() },
             CommandRow { label: COMMAND_LABELS[ITEM], enabled: ctx.model.has_items() },
             CommandRow { label: COMMAND_LABELS[DEFEND], enabled: ctx.model.defend },
+            CommandRow { label: COMMAND_LABELS[ESCAPE], enabled: ctx.model.escape },
         ];
         let mut view = MenuView {
             level: Level::Commands,
@@ -495,6 +556,7 @@ impl BattleMenu {
                     MAGIC if !ctx.model.has_magic() => Some(Refusal::NoMagic.text()),
                     ITEM if !ctx.model.has_items() => Some(Refusal::NoItems.text()),
                     DEFEND if !ctx.model.defend => Some(Refusal::NoDefend.text()),
+                    ESCAPE if !ctx.model.escape => Some(Refusal::NoEscape.text()),
                     _ => None,
                 };
             }
@@ -603,7 +665,7 @@ pub struct AimView {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MenuView {
     pub level: Level,
-    pub commands: [CommandRow; 4],
+    pub commands: [CommandRow; 5],
     pub command_cursor: usize,
     /// The Magic or Item list, at those levels.
     pub list: Option<ListView>,
@@ -635,6 +697,8 @@ mod tests {
                 MenuItem::new(12, "Empty Vial", 0, TargetRule::Allies),
             ],
             defend: true,
+            limit: None,
+            escape: true,
         }
     }
 
@@ -672,7 +736,7 @@ mod tests {
         let mut m = BattleMenu::default();
         assert_eq!((m.level(), m.view(&s.ctx()).command_cursor), (Level::Commands, 0));
         assert_eq!(press(&mut m, &s, &[Up]), Reply::Handled);
-        assert_eq!(m.view(&s.ctx()).command_cursor, 3, "up from the top wraps to Defend");
+        assert_eq!(m.view(&s.ctx()).command_cursor, 4, "up from the top wraps to Escape");
         assert_eq!(press(&mut m, &s, &[Down]), Reply::Handled);
         assert_eq!(m.view(&s.ctx()).command_cursor, 0, "down from the bottom wraps to Attack");
         // Enter on Attack opens the target selection on the first enemy, a second Enter attacks it.
@@ -817,11 +881,13 @@ mod tests {
         let mut m = BattleMenu::default();
         let v = m.view(&s.ctx());
         let flags: Vec<(&str, bool)> = v.commands.iter().map(|c| (c.label, c.enabled)).collect();
-        assert_eq!(flags, [("Attack", true), ("Magic", false), ("Item", false), ("Defend", false)]);
+        assert_eq!(flags, [("Attack", true), ("Magic", false), ("Item", false), ("Defend", false), ("Escape", false)]);
         assert_eq!(press(&mut m, &s, &[Down, Confirm]), Reply::Refused(Refusal::NoMagic));
         assert_eq!(m.view(&s.ctx()).hint, Some("No magic to cast"));
         assert_eq!(press(&mut m, &s, &[Down, Confirm]), Reply::Refused(Refusal::NoItems));
         assert_eq!(press(&mut m, &s, &[Down, Confirm]), Reply::Refused(Refusal::NoDefend));
+        assert_eq!(press(&mut m, &s, &[Down, Confirm]), Reply::Refused(Refusal::NoEscape));
+        assert_eq!(m.view(&s.ctx()).hint, Some("Cannot escape from this battle"));
         assert_eq!(m.level(), Level::Commands);
         // Attack still works.
         assert_eq!(press(&mut m, &s, &[Down, Confirm]), Reply::Handled);
@@ -832,8 +898,91 @@ mod tests {
     fn defend_sends_at_once_when_the_engine_has_it() {
         let s = Scene::new();
         let mut m = BattleMenu::default();
-        assert_eq!(press(&mut m, &s, &[Up, Confirm]), Reply::Send(Choice::Defend));
+        assert_eq!(press(&mut m, &s, &[Down, Down, Down, Confirm]), Reply::Send(Choice::Defend));
         assert_eq!(m.level(), Level::Commands);
+    }
+
+    #[test]
+    fn escape_is_the_last_row_sends_at_once_and_is_greyed_out_when_the_battle_cannot_be_run_from() {
+        let mut s = Scene::new();
+        let mut m = BattleMenu::default();
+        assert_eq!(press(&mut m, &s, &[Up, Confirm]), Reply::Send(Choice::Escape));
+        assert_eq!(m.level(), Level::Commands, "no target, no list: the menu is back at the top");
+        assert_eq!(Choice::Escape.to_command(), Command::Escape);
+        let v = m.view(&s.ctx());
+        assert_eq!((v.commands[4].label, v.commands[4].enabled, v.hint), ("Escape", true, None));
+        // A boss: the row is there but dim, says why, and sends nothing.
+        s.model.escape = false;
+        let v = m.view(&s.ctx());
+        assert_eq!((v.commands[4].label, v.commands[4].enabled, v.hint), ("Escape", false, Some("Cannot escape from this battle")));
+        assert_eq!(press(&mut m, &s, &[Confirm]), Reply::Refused(Refusal::NoEscape));
+        assert_eq!(m.level(), Level::Commands);
+    }
+
+    fn with_limit(target: TargetRule, ready: bool) -> Scene {
+        let mut s = Scene::new();
+        s.model.limit = Some(MenuLimit::new(128, "Braver", target, ready));
+        s
+    }
+
+    #[test]
+    fn a_full_limit_gauge_puts_limit_where_attack_was_and_aims_at_the_limits_own_side() {
+        // Not full: the first row is Attack and does what Attack does.
+        let s = with_limit(TargetRule::Enemies, false);
+        let mut m = BattleMenu::default();
+        assert_eq!(m.view(&s.ctx()).commands[0].label, "Attack");
+        assert_eq!(press(&mut m, &s, &[Confirm, Confirm]), Reply::Send(Choice::Attack { target: ActorId(3) }));
+
+        // Full: the same row says Limit, is enabled, and Confirm aims among the enemies, the second Confirm
+        // gives the limit on the first living one.
+        let s = with_limit(TargetRule::Enemies, true);
+        let mut m = BattleMenu::default();
+        let v = m.view(&s.ctx());
+        assert_eq!((v.commands[0].label, v.commands[0].enabled, v.command_cursor), ("Limit", true, 0));
+        assert_eq!(press(&mut m, &s, &[Confirm]), Reply::Handled);
+        let aim = m.view(&s.ctx()).aim.expect("a pointer");
+        assert_eq!((aim.target, aim.enemy), (ActorId(3), true));
+        assert_eq!(press(&mut m, &s, &[Right, Confirm]), Reply::Send(Choice::Limit { target: ActorId(4) }));
+        assert_eq!(Choice::Limit { target: ActorId(4) }.to_command(), Command::Limit { target: ActorId(4) });
+        assert_eq!(m.level(), Level::Commands);
+        // Back from the pointer returns to the commands, where the row still says Limit.
+        press(&mut m, &s, &[Confirm]);
+        assert_eq!(press(&mut m, &s, &[Back]), Reply::Handled);
+        assert_eq!(m.view(&s.ctx()).commands[0].label, "Limit");
+
+        // A healing limit (Healing Wind) aims at the party, not at the enemies.
+        let s = with_limit(TargetRule::Allies, true);
+        let mut m = BattleMenu::default();
+        assert_eq!(press(&mut m, &s, &[Confirm]), Reply::Handled);
+        let aim = m.view(&s.ctx()).aim.expect("a pointer");
+        assert_eq!((aim.target, aim.enemy), (ActorId(0), false));
+        assert_eq!(press(&mut m, &s, &[Down, Confirm]), Reply::Send(Choice::Limit { target: ActorId(1) }));
+
+        // The other rows do not care: Magic still opens its list, and the gauge emptying puts Attack back.
+        let mut s = with_limit(TargetRule::Enemies, true);
+        let mut m = BattleMenu::default();
+        assert_eq!(press(&mut m, &s, &[Down, Confirm]), Reply::Handled);
+        assert_eq!(m.level(), Level::Magic);
+        press(&mut m, &s, &[Back]);
+        s.model.limit.as_mut().expect("a limit").ready = false;
+        assert_eq!(m.view(&s.ctx()).commands[0].label, "Attack");
+        // A character with no limit at all never shows one.
+        s.model.limit = None;
+        assert_eq!(m.view(&s.ctx()).commands[0].label, "Attack");
+    }
+
+    #[test]
+    fn a_limit_with_nobody_to_aim_at_refuses_like_attack_and_a_dead_target_is_replaced() {
+        let mut s = with_limit(TargetRule::Enemies, true);
+        let mut m = BattleMenu::default();
+        s.enemies = fighters(&[false; 3], 3);
+        assert_eq!(press(&mut m, &s, &[Confirm]), Reply::Refused(Refusal::NoTarget));
+        assert_eq!(m.level(), Level::Commands);
+        // The aimed-at enemy dies under the pointer: the pointer moves on, as it does for Attack.
+        s.enemies = fighters(&[true; 3], 3);
+        press(&mut m, &s, &[Confirm]);
+        s.enemies[0].alive = false;
+        assert_eq!(press(&mut m, &s, &[Confirm]), Reply::Send(Choice::Limit { target: ActorId(4) }));
     }
 
     #[test]
@@ -955,6 +1104,9 @@ mod tests {
         for round in 0..200 {
             let mut s = Scene::new();
             let mut m = BattleMenu::default();
+            // Whom the limit aims at is a fact of the character (Healing Wind heals, Braver strikes), not
+            // something that changes during a battle; whether its gauge is full, and the roster, do.
+            let limit_target = if rng.chance(2) { TargetRule::Enemies } else { TargetRule::Allies };
             for step in 0..120 {
                 if rng.chance(6) {
                     let n = rng.below(5);
@@ -966,6 +1118,9 @@ mod tests {
                         s.model.spells.truncate(rng.below(4));
                         s.model.items.truncate(rng.below(4));
                     }
+                    // A limit that is sometimes full (or the character has none), an escape that is sometimes barred.
+                    s.model.limit = (!rng.chance(3)).then(|| MenuLimit::new(128, "Limit", limit_target, rng.chance(2)));
+                    s.model.escape = rng.chance(2);
                 }
                 let reply = m.press(keys[rng.below(keys.len())], &s.ctx());
                 if let Reply::Send(choice) = reply {
@@ -973,7 +1128,8 @@ mod tests {
                         Choice::Attack { target } => (Some(target), TargetRule::Enemies),
                         Choice::Magic { spell, target } => (Some(target), s.model.spells.iter().find(|x| x.id == spell).map_or(TargetRule::Enemies, |x| x.target)),
                         Choice::Item { item, target } => (Some(target), s.model.items.iter().find(|x| x.id == item).map_or(TargetRule::Allies, |x| x.target)),
-                        Choice::Defend => (None, TargetRule::Enemies),
+                        Choice::Defend | Choice::Escape => (None, TargetRule::Enemies),
+                        Choice::Limit { target } => (Some(target), s.model.limit.as_ref().map_or(TargetRule::Enemies, |l| l.target)),
                     };
                     if let Some(t) = target {
                         assert!(s.ctx().candidates(rule).contains(&t), "round {round} step {step}: {choice:?} aims at a fighter the rule does not allow");

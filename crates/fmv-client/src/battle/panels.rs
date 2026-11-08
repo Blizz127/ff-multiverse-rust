@@ -14,7 +14,7 @@
 
 use super::menu::{AimView, Level, ListView, MenuView};
 use super::popups::{Popup, PopupKind};
-use super::view::{gauge_fraction, Anchors, Bar, BattleView, ATB_READY_RGB, ATB_RGB, BAND_H};
+use super::view::{gauge_fraction, limit_fraction, limit_full, Anchors, Bar, BattleView, ATB_READY_RGB, ATB_RGB, BAND_H, LIMIT_FULL_RGB, LIMIT_RGB};
 use crate::ui::draw::{DrawList, Rgba};
 use crate::ui::font::Special;
 use crate::ui::text::{cell_count, ellipsize, text_height, text_width};
@@ -342,6 +342,10 @@ fn draw_party(c: &mut Canvas<'_>, l: &Layout, view: &BattleView, aim: Option<Act
         }
         if let Some((x, w)) = cols.bar {
             atb_bar(c, x, y + 2, w, bar);
+            // A fighter with a limit has a thin limit gauge under its ATB bar (FF7's orange one).
+            if bar.limit > 0 {
+                limit_bar(c, x, y + 8, w, bar);
+            }
         }
     }
 }
@@ -356,6 +360,23 @@ fn atb_bar(c: &mut Canvas<'_>, x: i32, y: i32, w: i32, bar: &Bar) {
         let rgb = if bar.ready && bar.alive { ATB_READY_RGB } else { ATB_RGB };
         c.fill(x, y, filled.min(w), h, [rgb[0], rgb[1], rgb[2], 255]);
         c.fill(x, y, filled.min(w), 1, [255, 255, 255, 90]);
+    }
+}
+
+/// The limit gauge (protocol v7): a thin track under the ATB bar of a party member, orange while it
+/// fills and bright with a lit edge when it is full (the limit can be given). Drawn only for a member whose
+/// gauge is not empty, so a character that has no limit shows nothing.
+fn limit_bar(c: &mut Canvas<'_>, x: i32, y: i32, w: i32, bar: &Bar) {
+    let h = 2;
+    c.fill(x - 1, y - 1, w + 2, h + 2, OUTLINE);
+    c.fill(x, y, w, h, TRACK);
+    let filled = (f64::from(w) * f64::from(limit_fraction(bar))).round() as i32;
+    if filled > 0 {
+        let rgb = if limit_full(bar) { LIMIT_FULL_RGB } else { LIMIT_RGB };
+        c.fill(x, y, filled.min(w), h, [rgb[0], rgb[1], rgb[2], 255]);
+        if limit_full(bar) {
+            c.fill(x, y, filled.min(w), 1, [255, 255, 255, 140]);
+        }
     }
 }
 
@@ -521,11 +542,18 @@ pub fn draw_finale(c: &mut Canvas<'_>, l: &Layout, finale: &Finale) {
         return;
     }
     let victory = finale.outcome == Outcome::Victory;
-    let (title, title_color) = if victory { ("VICTORY", ACCENT) } else { ("DEFEAT", ERROR) };
+    let escaped = finale.outcome == Outcome::Escaped;
+    let (title, title_color) = match finale.outcome {
+        Outcome::Victory => ("VICTORY", ACCENT),
+        Outcome::Defeat => ("DEFEAT", ERROR),
+        Outcome::Escaped => ("ESCAPED", INFO),
+    };
     // The body: label and value rows, or a sentence.
     let mut rows: Vec<(String, String, Rgba)> = Vec::new();
     let mut note = None;
     match (&finale.reward, victory) {
+        // Nothing is paid for getting away, whoever you were.
+        _ if escaped => note = Some("Got away safely."),
         (Some(r), true) => {
             rows.push(("EXP".into(), format!("+{}", r.exp), TEXT));
             rows.push(("Gil".into(), format!("+{}", r.gil), TEXT));
@@ -576,7 +604,7 @@ mod tests {
     use fmv_protocol::BattleId;
 
     fn bar(actor: u8, name: &str, hp: u32, max_hp: u32, mp: u32, max_mp: u32, mine: bool) -> Bar {
-        Bar { actor: ActorId(actor), name: name.into(), hp, max_hp, mp, max_mp, gauge: 30_000, ready: false, alive: hp > 0, mine }
+        Bar { actor: ActorId(actor), name: name.into(), hp, max_hp, mp, max_mp, gauge: 30_000, ready: false, alive: hp > 0, mine, limit: 0 }
     }
 
     /// Three heroes (the second is ours) against three enemies.
@@ -599,6 +627,7 @@ mod tests {
             spells: vec![MenuSpell::new(1, "Fire", 4, TargetRule::Enemies), MenuSpell::new(2, "Cure", 5, TargetRule::from_allies(true)), MenuSpell::new(3, "Meteor", 40, TargetRule::Enemies)],
             items: vec![MenuItem::new(10, "Potion", 3, TargetRule::Allies), MenuItem::new(11, "Phoenix Down", 2, TargetRule::DeadAllies)],
             defend: true,
+            ..BattleMenuModel::default()
         };
         let (allies, enemies) = (fighters(&view.party), fighters(&view.enemies));
         let ctx = Ctx { model: &model, allies: &allies, enemies: &enemies, mp: 8 };
@@ -771,6 +800,7 @@ mod tests {
             spells: (0..10).map(|i| MenuSpell::new(i, format!("Spell{i}"), 1, TargetRule::Enemies)).collect(),
             items: vec![],
             defend: false,
+            ..BattleMenuModel::default()
         };
         let (a, e) = (fighters(&v.party), fighters(&v.enemies));
         let ctx = Ctx { model: &model, allies: &a, enemies: &e, mp: 8 };
@@ -937,6 +967,63 @@ mod tests {
         let many = RewardLine { items: (0..6).map(|i| RewardItem { name: format!("Thing{i}"), count: 1 }).collect(), ..RewardLine::default() };
         let list = panel(&finale(Outcome::Victory, Some(many), 5000, true));
         assert!(list.says("Thing2") && !list.says("Thing3") && list.says("and 3 more"));
+    }
+
+    #[test]
+    fn the_escaped_panel_says_so_pays_nothing_and_is_neither_a_victory_nor_a_defeat() {
+        let l = layout(1100, 680, 3);
+        let panel = |f: &Finale| {
+            let mut list = DrawList::new();
+            draw_finale(&mut Canvas { out: &mut list, s: l.s }, &l, f);
+            list
+        };
+        assert!(panel(&finale(Outcome::Escaped, None, PANEL_DELAY_MS - 1, true)).is_empty(), "it waits like the others");
+        // Whoever was watching and whatever a (hostile) server said it paid: nothing is shown as earned.
+        for reward in [None, Some(RewardLine { exp: 5, gil: 5, ap: 5, items: vec![RewardItem { name: "Potion".into(), count: 1 }] })] {
+            let list = panel(&finale(Outcome::Escaped, reward, 5000, true));
+            assert!(list.says("ESCAPED") && list.says("Got away safely."), "{:?}", list.texts());
+            assert!(!list.says("VICTORY") && !list.says("DEFEAT") && !list.says("EXP") && !list.says("Potion"), "{:?}", list.texts());
+            let title = list.texts().iter().find(|t| t.text == "ESCAPED" && t.color != SHADOW_COLOR).expect("the title");
+            assert_eq!(title.color, INFO);
+        }
+    }
+
+    /// A quad of exactly `rgb` (opaque), anywhere: what a test of a bar looks for.
+    fn has_fill(list: &DrawList, rgb: [u8; 3]) -> bool {
+        list.quads().iter().any(|q| q.color == [rgb[0], rgb[1], rgb[2], 255])
+    }
+
+    #[test]
+    fn a_member_with_a_limit_gauge_gets_a_thin_bar_under_its_atb_bar_that_lights_up_when_full() {
+        let mut v = battle();
+        let none = draw(&v, 1100, 680);
+        assert!(!has_fill(&none, LIMIT_RGB) && !has_fill(&none, LIMIT_FULL_RGB), "nobody has a gauge yet: no bar");
+        // Cloud's gauge is part full, Barret's (ours) full, Tifa is down with a stale one.
+        v.party[0].limit = 100;
+        v.party[1].limit = 255;
+        v.party[2].limit = 200;
+        let list = draw(&v, 1100, 680);
+        assert!(has_fill(&list, LIMIT_RGB), "the filling one is orange");
+        assert!(has_fill(&list, LIMIT_FULL_RGB), "the full one is bright");
+        // The bar sits under the ATB bar of its own row and is as wide as it, so the fill widths compare
+        // like the gauges: 100/255 of the track for Cloud, all of it for Barret.
+        let quads = list.quads();
+        let part = quads.iter().find(|q| q.color == [LIMIT_RGB[0], LIMIT_RGB[1], LIMIT_RGB[2], 255]).expect("Cloud's fill");
+        let full = quads.iter().find(|q| q.color == [LIMIT_FULL_RGB[0], LIMIT_FULL_RGB[1], LIMIT_FULL_RGB[2], 255]).expect("Barret's fill");
+        assert!(part.w > 0 && part.w < full.w, "{} against {}", part.w, full.w);
+        assert!((f64::from(part.w) - f64::from(full.w) * 100.0 / 255.0).abs() <= f64::from(l_scale()), "{} of {}", part.w, full.w);
+        assert!(part.y < full.y, "Cloud's row is above Barret's");
+        // A fallen member shows an empty gauge whatever it says: two fills only (Cloud's and Barret's).
+        let fills = quads.iter().filter(|q| q.color[..3] == LIMIT_RGB || q.color[..3] == LIMIT_FULL_RGB).count();
+        assert_eq!(fills, 2, "Tifa is down: her stale gauge shows nothing");
+        // Narrow windows have no room for any bar, and nothing breaks.
+        for (w, h) in [(320u32, 240u32), (1, 1)] {
+            let _ = draw(&v, w, h);
+        }
+    }
+
+    fn l_scale() -> i32 {
+        layout(1100, 680, 3).s
     }
 
     #[test]

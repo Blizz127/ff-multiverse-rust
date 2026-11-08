@@ -1,9 +1,10 @@
-//! The names the battle windows show that the battle engine does not carry: spells, items and the
-//! attacks of the enemies (a fighter's own name travels with it, see `Combatant::name`).
+//! The names the battle windows show that the battle engine does not carry: spells, limit breaks, items and
+//! the attacks of the enemies (a fighter's own name travels with it, see `Combatant::name`).
 //!
 //! They come from this machine's OWN battle data, like everything else about a battle: the
-//! spell and item names are the text tables of `kernel.bin` (sections 18 and 19, an FF text table:
-//! pointers, then strings), the enemy attack names are the attack name tables of `scene.bin`,
+//! spell, limit break and item names are the text tables of `kernel.bin` (sections 18 and 19, an FF text
+//! table: pointers, then strings; a limit break's id, 128 and up, indexes the same "Names - magic" table
+//! as a spell's), the enemy attack names are the attack name tables of `scene.bin`,
 //! keyed by the scene of the formation. Nothing here is ever sent anywhere.
 //!
 //! A name is looked up by the id the engine uses, never assumed to sit at that index of a table:
@@ -79,6 +80,12 @@ impl NameBook {
         Self::entry(&self.spells, id).map_or_else(|| format!("Spell {id}"), str::to_string)
     }
 
+    /// The name of limit break `id` (Braver, Big Shot, ...): the same table as the spells' (`ActionRef::Limit`
+    /// carries an index into it), or `Limit <id>` when the tables have none.
+    pub fn limit(&self, id: u16) -> String {
+        Self::entry(&self.spells, id).map_or_else(|| format!("Limit {id}"), str::to_string)
+    }
+
     /// The name of item `id`, or `Item <id>` when the tables have none.
     pub fn item(&self, id: u16) -> String {
         Self::entry(&self.items, id).map_or_else(|| format!("Item {id}"), str::to_string)
@@ -103,6 +110,11 @@ impl NameBook {
 /// same plain `Spell <id>` label a book gives an id it does not name.
 pub fn spell_name(book: Option<&NameBook>, id: u16) -> String {
     book.map_or_else(|| NameBook::default().spell(id), |b| b.spell(id))
+}
+
+/// [`NameBook::limit`] for a client that may have no book at all: `Limit <id>` then.
+pub fn limit_name(book: Option<&NameBook>, id: u16) -> String {
+    book.map_or_else(|| NameBook::default().limit(id), |b| b.limit(id))
 }
 
 /// [`NameBook::item`] for a client that may have no book at all: `Item <id>` then.
@@ -138,6 +150,19 @@ mod tests {
         let with_attack = book.with_enemy_attack(75, 272, "  Gnaw ");
         assert_eq!(with_attack.enemy_attack(301, 272), Some("Gnaw"), "formation 301 is scene 75, and a name is cleaned");
         assert_eq!(with_attack.enemy_attack(304, 272), None, "the next scene has not named it");
+    }
+
+    #[test]
+    fn a_limit_break_is_named_by_its_id_in_the_magic_table_and_unnamed_ones_get_a_plain_label() {
+        let mut table = vec![String::new(); 130];
+        table[128] = "Braver".into();
+        table[27] = "Fire".into();
+        let book = NameBook::from_tables(&table, &[]);
+        assert_eq!((book.limit(128).as_str(), book.spell(27).as_str()), ("Braver", "Fire"));
+        assert_eq!(book.limit(129), "Limit 129", "a blank entry is not a name");
+        assert_eq!(book.limit(900), "Limit 900", "past the table");
+        assert_eq!((limit_name(Some(&book), 128).as_str(), limit_name(None, 128).as_str()), ("Braver", "Limit 128"));
+        assert_eq!(NameBook::default().limit(0), "Limit 0");
     }
 
     #[test]
@@ -182,5 +207,9 @@ mod tests {
         }
         // Attack 272 of formation 301 (scene 75, slot 1) is an enemy's, named by its scene.
         assert!(book.enemy_attack(301, 272) == Some("Machine Gun"), "attack 272 of formation 301 is not named \"Machine Gun\"");
+        // The limit breaks sit in the same table from 128 on: named, with no colour escape left in front.
+        for (id, name) in [(128, "Braver"), (135, "Big Shot"), (149, "Beat Rush"), (142, "Healing Wind"), (156, "Boost Jump")] {
+            assert!(book.limit(id) == name, "limit {id} is not named {name:?}");
+        }
     }
 }
