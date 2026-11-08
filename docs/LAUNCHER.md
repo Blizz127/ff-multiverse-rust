@@ -251,7 +251,10 @@ controller with neither would do nothing and the log says so.
 every systemd distribution, Bazzite included). It reads `/dev/input/event*`, which normally the seat
 grants to the logged-in user. glibc floor: unchanged, still 2.43 on the current build machine.
 
-**Not run, and known gaps.** Nothing here has seen a real controller. The on-screen key hints (HUD and
+**Not run, and known gaps.** Nothing here has seen a real controller. On a fresh install the create
+screen asks for a name, which a controller alone can only type through Steam's keyboard: if the
+automatic keyboard does not appear, Steam+X opens it by hand in Game Mode, so the controller check can
+still be finished and the keyboard check reported on its own. The on-screen key hints (HUD and
 menu) still name keyboard keys; the table above is the reference. gilrs does not honour
 `SDL_GAMECONTROLLER_IGNORE_DEVICES`: if Steam Input hands over a virtual controller and the physical
 one stays readable, both are heard and a key is simply held while either holds it, which is right
@@ -278,6 +281,14 @@ mean Game Mode. A normal desktop session (KDE, started from a menu or a terminal
 three and stays windowed. The
 start-up line `device: ...` on stderr names the signals seen and the decision. Not done: a
 `--windowed` override and a run-time toggle.
+
+About the "white border": the renderer cannot draw one. It clears to a dark blue-black everywhere,
+the character menu paints a dark gradient over the whole window, and the bars around a field's 4:3
+picture on a wider screen are that same dark colour (only a battle's own sky shows its horizon colour
+in the part of the scene nothing covers). What full screen removes is the window frame and title bar,
+which is the likely source; if the owner still sees a light border under gamescope, it is not this
+window's frame and the report should say where it is (screen edge, around the picture, around the
+menu).
 
 ### On-screen keyboard
 
