@@ -454,13 +454,16 @@ scripts/package.sh
 ```
 
 Builds `fmv-server`, `fmv-client` and `fmv-import` in release mode, stages **only** the
-three binaries, this README, a generated `LICENSE-NOTICE.txt` and a `manifest.json` into
-`dist/ff-multiverse-<version>-<gitshort>-linux-x86_64/`, and writes the `.tar.gz` plus a
-sidecar `.manifest.json` next to it. The manifest records the version, git commit
+three binaries, the launcher entry point `ff-multiverse.sh`, this README, a generated
+`LICENSE-NOTICE.txt` and a `manifest.json` into
+`dist/ff-multiverse-<version>-<gitshort>-linux-x86_64/`, and writes the `.tar.gz`, a
+sidecar `.manifest.json` and `dist/SHA256SUMS` next to it. The manifest records the version,
+the revision and launcher build id (`ff-multiverse-r<revision>-<gitshort>`), git commit
 (`-dirty` if the tree is dirty), rustc version, target triple, build time and the sha256 of
-each binary; the sidecar adds the tarball's sha256. The script prints the tarball path
-and its sha256, honours `CARGO_TARGET_DIR`, and can be re-run safely. It fails if any
-staged file is off the allowlist or matches an owned-data pattern. It needs `jq`.
+each binary and file; the sidecar adds the tarball's sha256. The script prints the tarball
+path, its sha256 and the build id, honours `CARGO_TARGET_DIR`, and can be re-run safely. It
+fails if any staged file is off the allowlist or matches an owned-data pattern. It needs
+`jq`. The package is also a private launcher port, see `docs/LAUNCHER.md`.
 
 A name ending in `-dirty` came from uncommitted changes and one ending in `-prebuilt`
 came from `--skip-build`, which packages existing binaries without compiling (meant for
@@ -494,10 +497,12 @@ to a command). Never commit or share any of it.
 
 ```
 crates/                  the Cargo workspace (see the table above)
-scripts/package.sh       build and package a release tarball
+scripts/package.sh       build and package a release tarball (and dist/SHA256SUMS)
+scripts/ff-multiverse.sh the launcher entry point shipped in the package (docs/LAUNCHER.md)
 scripts/smoke.sh         two-bot local smoke test
 scripts/battle-smoke.sh  shared-battle smoke test (real data)
 scripts/travel-smoke.sh  walking between fields: two bots, md1stin -> md1_1 and back (real data)
 deploy/                  systemd user unit template and deployment procedure
+docs/LAUNCHER.md         the package as an owner-only launcher port: layout, entry point, data dir
 IMPLEMENTATION-PLAN.md   first-milestone plan and design constraints
 ```

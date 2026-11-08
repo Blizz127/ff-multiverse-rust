@@ -3,6 +3,7 @@
 //! copy), decoded read-only. The server never sends any of it; the client only compares the
 //! fingerprint the server announces with its own (see `BattleClient`).
 
+use super::names::NameBook;
 use crate::ff7::Ff7Source;
 use fmv_protocol::{BattleRules, Ff7BattleData};
 use std::sync::Arc;
@@ -15,6 +16,16 @@ pub fn open_rules(source: &Ff7Source) -> Result<(Arc<dyn BattleRules>, String), 
     Ok((Arc::new(data), files.origin))
 }
 
+/// The names the battle windows show (spells, items, enemy attacks), read from the same files as
+/// [`open_rules`] (see [`NameBook`]). `main` installs them with `install_local_names` next to the
+/// rules.
+#[cfg_attr(not(test), allow(dead_code))] // the integrator calls it from `main` next to `open_rules`
+pub fn open_names(source: &Ff7Source) -> Result<NameBook, String> {
+    let files = fmv_library::ff7::resolve_battle_files(source).map_err(|e| e.to_string())?;
+    let data = Ff7BattleData::open(&files.scene, &files.kernel).map_err(|e| e.to_string())?;
+    Ok(NameBook::from_data(data.kernel(), data.scenes()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -23,6 +34,12 @@ mod tests {
     #[test]
     fn a_direct_flevel_has_no_battle_data_and_says_why() {
         let err = open_rules(&Ff7Source::Flevel { path: "/x/flevel.lgp".into(), labels: Ff7Labels::default() }).err().expect("no data");
+        assert!(err.contains("library"), "{err}");
+    }
+
+    #[test]
+    fn names_need_the_same_library_as_the_rules() {
+        let err = open_names(&Ff7Source::Flevel { path: "/x/flevel.lgp".into(), labels: Ff7Labels::default() }).expect_err("no data");
         assert!(err.contains("library"), "{err}");
     }
 
