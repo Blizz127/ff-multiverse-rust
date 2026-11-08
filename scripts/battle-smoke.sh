@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/battle-smoke.sh - shared-battle smoke test for fmv-server + fmv-client (protocol v3).
 #
-# Usage: scripts/battle-smoke.sh [--fixture] [--release|--debug] [--bin-dir DIR] [--build]
+# Usage: scripts/battle-smoke.sh [--fixture|--random] [--release|--debug] [--bin-dir DIR] [--build]
 #                                [--library STATE_DIR] [--duration SECS] [--formation ID]
 #                                [--tick-rate TPS] [--battle-speed N] [--bot idle|circle]
 #                                [--keep-logs] [-h|--help]
@@ -18,6 +18,12 @@
 # both entered the SAME battle (same battle#N), both saw it end in Victory and return to the field,
 # nobody reported a BATTLE DIVERGENCE, and the server logged one battle with two members that ended
 # in Victory.
+#
+# --random: the same two bots, but WITHOUT --debug-encounters and with random encounters on: the
+# bots (--bot circle, party formed, both --battle-auto) walk md1stin and the server rolls the
+# field's own encounter table (rate 128; formations 301, 302, 303) as they walk. Expected: every bot
+# exits 0, entered at least one battle, won every battle it entered, nobody reported a BATTLE
+# DIVERGENCE, and at least one battle (the same battle#N) was shared by both bots.
 #
 # --fixture: the synthetic FIXTURE server (no battle data) with --debug-encounters and one
 # --battle-auto --debug-encounters bot. Expected: the request is refused cleanly ("this server
@@ -61,14 +67,16 @@ PARTY_SIZE=2
 
 usage() {
   cat <<'EOF'
-Usage: scripts/battle-smoke.sh [--fixture] [--release|--debug] [--bin-dir DIR] [--build]
+Usage: scripts/battle-smoke.sh [--fixture|--random] [--release|--debug] [--bin-dir DIR] [--build]
                                [--library STATE_DIR] [--duration SECS] [--formation ID]
                                [--tick-rate TPS] [--battle-speed N] [--bot idle|circle]
                                [--keep-logs] [-h|--help]
 
 Real-data mode (default): two headless bots form a party on the real FF7 field md1stin and fight
 one shared battle started with --debug-encounters; passes when both report battles=1 victories=1
-for the same battle. --fixture: checks that a FIXTURE server refuses battles cleanly.
+for the same battle. --random: the same bots walk md1stin without --debug-encounters and the
+server rolls the field's own encounter table (battles start by themselves). --fixture: checks that
+a FIXTURE server refuses battles cleanly.
 
   --library DIR      state directory that contains library/ (default $FMV_FF7_LIBRARY, else
                      ~/.local/share/ff-multiverse); only the library is read, never written
@@ -335,6 +343,105 @@ run_real() {
   say "PASS: two bots fought one shared battle on the real field and won it; $state_real unchanged ($after)"
 }
 
+# all_battle_ids_of <client log>: every distinct battle#N a client says it started, one per line.
+all_battle_ids_of() {
+  local line seen=" "
+  while IFS= read -r line || [[ -n $line ]]; do
+    if [[ $line == *"started: formation"* && $line =~ (battle#[0-9]+)\ started ]]; then
+      if [[ $seen != *" ${BASH_REMATCH[1]} "* ]]; then
+        seen+="${BASH_REMATCH[1]} "
+        printf '%s\n' "${BASH_REMATCH[1]}"
+      fi
+    fi
+  done <"$1"
+}
+
+run_random() {
+  local state_real="$LIBRARY"
+  [[ -d $state_real/library/sets ]] || {
+    err "no library under $state_real (needs owned FF7 content imported with fmv-import); pass --library STATE_DIR"
+    exit 1
+  }
+  local before after
+  before=$(ls -A -- "$state_real" | sort | tr '\n' ' ')
+  mkdir -p -- "$WORK/lib-state" "$WORK/state-env" "$WORK/server-state" "$WORK/client-A" "$WORK/client-B"
+  ln -s -- "$(cd -- "$state_real" && pwd -P)/library" "$WORK/lib-state/library"
+  export FMV_STATE_DIR="$WORK/state-env"
+
+  # No --debug-encounters and no --no-random-encounters: only the field's own table starts battles.
+  local -a server_args=(--bind 127.0.0.1:0 --ff7-library "$WORK/lib-state" --state-dir "$WORK/server-state"
+    --battle-speed "$BATTLE_SPEED" --battle-tick-rate "$TICK_RATE")
+  say "starting server: $SERVER_BIN ${server_args[*]}"
+  "$SERVER_BIN" "${server_args[@]}" >"$WORK/server.log" 2>&1 &
+  SERVER_PID=$!
+  wait_ready "$WORK/server.log"
+  say "server READY: $READY_LINE"
+  [[ $(field "$READY_LINE" area) == Ff7/md1stin ]] || fail "the server is not hosting the real FF7 field md1stin: $READY_LINE"
+
+  say "starting bots A and B for ${BATTLE_DURATION}s against $CONNECT (they walk; battles come from the field's encounter table)"
+  local common=(--server "$CONNECT" --headless --duration "$BATTLE_DURATION" --bot circle --ff7-library "$WORK/lib-state" --battle-auto)
+  "$CLIENT_BIN" "${common[@]}" --name A --state-dir "$WORK/client-A" --party-invite-first-peer \
+    >"$WORK/client-A.log" 2>&1 &
+  CPID[A]=$!
+  "$CLIENT_BIN" "${common[@]}" --name B --state-dir "$WORK/client-B" --party-accept \
+    >"$WORK/client-B.log" 2>&1 &
+  CPID[B]=$!
+  wait_clients $((BATTLE_DURATION + CLIENT_GRACE))
+
+  local n smoke_line battles victories
+  SMOKE_LINES=()
+  for n in "${CLIENT_NAMES[@]}"; do
+    local log="$WORK/client-$n.log"
+    if [[ ${CRC[$n]:-} == timeout ]]; then
+      problem "client $n was still running ${CLIENT_GRACE}s after its ${BATTLE_DURATION}s duration and was killed"
+    elif [[ ${CRC[$n]:-} != 0 ]]; then
+      problem "client $n exited with status ${CRC[$n]:-unknown}"
+    fi
+    if smoke_line=$(last_line_with "$log" "SMOKE name="); then
+      smoke_line=$(strip_ansi "$smoke_line")
+      SMOKE_LINES+=("$smoke_line")
+      battles=$(field "$smoke_line" battles)
+      victories=$(field "$smoke_line" victories)
+      if [[ ! $battles =~ ^[0-9]+$ || ! $victories =~ ^[0-9]+$ ]]; then
+        problem "client $n: the SMOKE line has no numeric battles/victories: $smoke_line"
+      elif ((battles < 1)); then
+        problem "client $n entered no battle in ${BATTLE_DURATION}s of walking (battles=$battles): $smoke_line"
+      elif ((victories != battles)); then
+        problem "client $n won only $victories of $battles battles: $smoke_line"
+      fi
+    else
+      problem "client $n printed no SMOKE line"
+    fi
+    if log_has "$log" "DIVERGENCE"; then
+      problem "client $n reported a BATTLE DIVERGENCE (its replay disagreed with the server)"
+    fi
+  done
+  # At least one battle was the SAME battle for both (the party fought together).
+  local shared=0 id b_ids
+  b_ids=" $(all_battle_ids_of "$WORK/client-B.log" | tr '\n' ' ')"
+  while IFS= read -r id; do
+    if [[ -n $id && $b_ids == *" $id "* ]]; then
+      shared=$((shared + 1))
+    fi
+  done < <(all_battle_ids_of "$WORK/client-A.log")
+  ((shared >= 1)) || problem "the bots never shared a battle"
+  log_has "$WORK/server.log" "members=2" || problem "the server never started a battle for the whole party"
+
+  stop_server
+  after=$(ls -A -- "$state_real" | sort | tr '\n' ' ')
+  [[ $before == "$after" ]] || problem "the library state directory changed: before [$before], after [$after]"
+  if ((${#PROBLEMS[@]})); then
+    finish_failed
+  fi
+  local l
+  for l in "${SMOKE_LINES[@]}"; do
+    say "client: $l"
+  done
+  say "server: $(count_lines_with "$WORK/server.log" "battle started") battle(s) started, $(count_lines_with "$WORK/server.log" "battle ended") ended; $shared shared by both bots"
+  RESULT=pass
+  say "PASS: random encounters from the real field's table started battles that the walking party won; $state_real unchanged ($after)"
+}
+
 run_fixture() {
   mkdir -p -- "$WORK/state-env" "$WORK/client-A"
   export FMV_STATE_DIR="$WORK/state-env"
@@ -374,6 +481,7 @@ main() {
   while (($#)); do
     case "$1" in
       --fixture) MODE=fixture ;;
+      --random) MODE=random ;;
       --release) PROFILE=release ;;
       --debug) PROFILE=debug ;;
       --bin-dir)
@@ -443,11 +551,11 @@ main() {
   export XDG_CONFIG_HOME="$WORK/xdg/config" XDG_CACHE_HOME="$WORK/xdg/cache"
   export NO_COLOR=1
 
-  if [[ $MODE == fixture ]]; then
-    run_fixture
-  else
-    run_real
-  fi
+  case "$MODE" in
+    fixture) run_fixture ;;
+    random) run_random ;;
+    *) run_real ;;
+  esac
 }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
