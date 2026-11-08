@@ -10,6 +10,9 @@
 //! `<field>_overlay.png` (walkmesh projected through the camera onto the background) to
 //! `/home/blizz/.cache/claude-tmp/ffmv-ff7-dump/`, outside the repository. The PNGs contain
 //! game art: never commit or share them.
+// `chunks_exact(n)` with a constant n would be `as_chunks` on Rust 1.88+; the workspace keeps its
+// MSRV lower (see `src/lgp.rs`), so the lint is allowed here.
+#![allow(clippy::chunks_exact_to_as_chunks)]
 use fmv_ff7::background::{decode_background, BackgroundImage, Projection};
 use fmv_ff7::field::{FieldFile, Triggers, Walkmesh, NO_ACCESS, SECTION_NAMES};
 use fmv_ff7::lgp::LgpArchive;

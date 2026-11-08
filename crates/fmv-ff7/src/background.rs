@@ -85,23 +85,36 @@
 //!
 //! # Drawing characters in front of and behind the background
 //!
-//! One flattened image puts everything behind the characters. For the common split render the
-//! field twice with the same options but different layers, and draw the characters between:
+//! One flattened image puts everything behind the characters. For the common split use
+//! [`decode_background_layers`]: it returns the **back** half (layers 1 and 3, [`BACK_LAYERS`])
+//! and the **front** half (layers 2 and 4, [`FRONT_LAYERS`]) as two images with the same size and
+//! origin as [`decode_background`] (the canvas does not depend on which layers are drawn), and the
+//! characters go between them:
 //!
 //! ```no_run
-//! # use fmv_ff7::background::{decode_background_with, BackgroundOptions};
+//! # use fmv_ff7::background::decode_background_layers;
 //! # fn demo(field: &fmv_ff7::field::FieldFile) -> Result<(), fmv_ff7::field::FieldError> {
-//! let back = decode_background_with(field, &BackgroundOptions { layers: [true, false, true, false], ..Default::default() })?;
-//! let front = decode_background_with(field, &BackgroundOptions { layers: [false, true, false, true], ..Default::default() })?;
-//! // identical size and origin: draw `back`, then the characters, then `front`
-//! # let _ = (back, front); Ok(()) }
+//! let layers = decode_background_layers(field)?;
+//! // draw `layers.back`, then the characters, then `layers.front` (alpha-over)
+//! # let _ = (layers.back, layers.front); Ok(()) }
 //! ```
 //!
 //! Caveats: blended tiles in the front-only image blend against black (additive tiles are fine,
-//! average and subtractive ones come out wrong); and the game depth-sorts layer-2 tiles against
-//! each character through the tile `id`, which this crate does not interpret (a client that wants
-//! that can build per-tile quads from [`crate::field::Background::tiles`] and
-//! [`crate::field::Background::tile_rgba`]).
+//! average and subtractive ones come out wrong); the front half is one flat image, whereas the game
+//! depth-sorts layer-2 tiles against each character through the tile `id`, which this crate does
+//! not interpret (a client that wants that can build per-tile quads from
+//! [`crate::field::Background::tiles`] and [`crate::field::Background::tile_rgba`]). In a field
+//! such as `md1stin`, whose layer 2 is large, a character standing behind a layer-2 object is
+//! covered by it in this split exactly as in the game, but a character the game would draw in front
+//! of a layer-2 tile is covered here too.
+//!
+//! **Never show the back half on its own**: it is not a finished picture. Under the layer-2
+//! objects of `md1stin` the back half holds 6 277 opaque pure-green `(0, 255, 0)` pixels (a key
+//! colour, the same one several palettes use at index 0), all of which the front half covers: drawing
+//! the front over the back reproduces [`decode_background`]'s picture exactly there (no blended
+//! tiles) and has none of that green. Checked on the owned data for all 702 fields: both halves have
+//! the canvas of [`decode_background`] (`depth_layers_of_real_fields` in `tests/real_data.rs`), and
+//! 642 of them have both back and front layers.
 //!
 //! # Safety against untrusted input
 //!
@@ -359,6 +372,8 @@ impl BackgroundImage {
     /// 255 everywhere. Handy for viewers that cannot show transparency.
     pub fn flatten_on_black(&self) -> Vec<u8> {
         let mut out = self.rgba.clone();
+        // (`as_chunks_mut` would satisfy the lint but needs Rust 1.88; see `lgp` for why the MSRV stays put)
+        #[allow(clippy::chunks_exact_to_as_chunks)]
         for px in out.chunks_exact_mut(4) {
             if let [r, g, b, a] = px {
                 let k = u16::from(*a);
@@ -456,11 +471,55 @@ pub fn decode_background(field: &FieldFile) -> Result<BackgroundImage, FieldErro
 pub fn decode_background_with(field: &FieldFile, options: &BackgroundOptions) -> Result<BackgroundImage, FieldError> {
     let background = field.background()?;
     let palette = field.palette()?;
-    let view = field.triggers().ok().map(|t| {
+    compose(&background, &palette, options, camera_range_view(field))
+}
+
+/// The camera range of the field's triggers section as a [`ScreenRect`], if that section parses.
+fn camera_range_view(field: &FieldFile) -> Option<ScreenRect> {
+    field.triggers().ok().map(|t| {
         let (min_x, min_y, max_x, max_y) = t.camera_range.bounds();
         ScreenRect { min_x, min_y, max_x, max_y }
-    });
-    compose(&background, &palette, options, view)
+    })
+}
+
+/// The layers drawn **behind** the characters (layers 1 and 3, indices 0 and 2 of
+/// [`BackgroundOptions::layers`]).
+pub const BACK_LAYERS: [bool; 4] = [true, false, true, false];
+
+/// The layers drawn **in front of** the characters (layers 2 and 4).
+pub const FRONT_LAYERS: [bool; 4] = [false, true, false, true];
+
+/// The background split for drawing characters between its two halves: draw
+/// [`DepthLayers::back`], then the characters, then [`DepthLayers::front`] (alpha-over; pixels no
+/// drawn tile touched have alpha 0). Both images have the same `width`, `height`, `origin_x`,
+/// `origin_y` and `view_bounds` as [`decode_background`] returns for the same field, so a point
+/// projects to the same pixel in all three ([`Projection::project`],
+/// [`BackgroundImage::screen_to_pixel`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DepthLayers {
+    /// Layers 1 and 3 ([`BACK_LAYERS`]).
+    pub back: BackgroundImage,
+    /// Layers 2 and 4 ([`FRONT_LAYERS`]).
+    pub front: BackgroundImage,
+}
+
+/// Decode the background as [`DepthLayers`] with the default options (static animation groups,
+/// blending on). See the module docs ("Drawing characters in front of and behind the
+/// background") for what the split does and does not model.
+pub fn decode_background_layers(field: &FieldFile) -> Result<DepthLayers, FieldError> {
+    decode_background_layers_with(field, &BackgroundOptions::default())
+}
+
+/// [`decode_background_layers`] with explicit options. `options.layers` is ignored (the two
+/// halves are [`BACK_LAYERS`] and [`FRONT_LAYERS`]); `groups` and `blending` apply to both. The
+/// field's background and palette are parsed once.
+pub fn decode_background_layers_with(field: &FieldFile, options: &BackgroundOptions) -> Result<DepthLayers, FieldError> {
+    let background = field.background()?;
+    let palette = field.palette()?;
+    let view = camera_range_view(field);
+    let back = compose(&background, &palette, &BackgroundOptions { layers: BACK_LAYERS, ..options.clone() }, view)?;
+    let front = compose(&background, &palette, &BackgroundOptions { layers: FRONT_LAYERS, ..options.clone() }, view)?;
+    Ok(DepthLayers { back, front })
 }
 
 /// Same as [`decode_background_with`] for an already parsed background and palette. `view` is
@@ -964,6 +1023,86 @@ mod tests {
                 exercise(b);
             }
         }
+    }
+
+    /// A spec with all four layers, no blending and no animation groups: layer 1 has two tiles,
+    /// layer 2 two tiles (the first over layer 1's second tile), layer 3 and 4 one tile each.
+    fn four_layer_spec() -> FieldSpec {
+        let t = |dst_x: i16, dst_y: i16, src_x: u8, page: u8, id: u16| TileSpec {
+            dst_x,
+            dst_y,
+            src_x,
+            src_y: 32,
+            palette_id: page,
+            id,
+            ..TileSpec::default()
+        };
+        let layer = |tiles: Vec<TileSpec>| Some(LayerSpec { width: 640, height: 480, tiles });
+        FieldSpec {
+            tiles: vec![t(0, 0, 16, 0, 0), t(16, 0, 16, 0, 0)],
+            layer2: layer(vec![t(16, 0, 64, 1, 5), t(48, 16, 48, 1, 6)]),
+            layer3: layer(vec![t(-32, -32, 32, 0, 0)]),
+            layer4: layer(vec![t(48, 48, 80, 1, 0)]),
+            texture_slots: vec![(0, 1)],
+            ..FieldSpec::default()
+        }
+    }
+
+    #[test]
+    fn depth_layers_have_the_canvas_of_the_full_decode_and_split_the_layers() {
+        let f = parse(&four_layer_spec());
+        let full = decode_background(&f).unwrap();
+        let split = decode_background_layers(&f).unwrap();
+        assert_eq!(BACK_LAYERS, [true, false, true, false]);
+        assert_eq!(FRONT_LAYERS, [false, true, false, true]);
+        for half in [&split.back, &split.front] {
+            assert_eq!(
+                (half.width, half.height, half.origin_x, half.origin_y, half.view_bounds),
+                (full.width, full.height, full.origin_x, full.origin_y, full.view_bounds)
+            );
+            assert_eq!(half.rgba.len(), full.rgba.len());
+        }
+        // layers 1 and 3 behind, 2 and 4 in front; the other half's tiles are only "hidden"
+        let drawn = |img: &BackgroundImage| img.layers.iter().map(|l| (l.layer, l.tiles_drawn, l.tiles_hidden)).collect::<Vec<_>>();
+        assert_eq!(drawn(&split.back), [(1, 2, 0), (2, 0, 2), (3, 1, 0), (4, 0, 1)]);
+        assert_eq!(drawn(&split.front), [(1, 0, 2), (2, 2, 0), (3, 0, 1), (4, 1, 0)]);
+        // alpha-over of the front onto the back reproduces the full composite exactly when
+        // nothing is blended (the draw order inside each half is the full draw order)
+        let mut over = split.back.rgba.clone();
+        for (dst, src) in over.chunks_exact_mut(4).zip(split.front.rgba.chunks_exact(4)) {
+            if src[3] == 255 {
+                dst.copy_from_slice(src);
+            } else {
+                assert_eq!(src[3], 0, "tiles are opaque or transparent here");
+            }
+        }
+        assert_eq!(over, full.rgba);
+        // the halves really differ: layer 2's tile over layer 1 shows only in the front image
+        let (px, py) = (u32::try_from(20 + full.origin_x).unwrap(), u32::try_from(4 + full.origin_y).unwrap());
+        assert_eq!(split.front.pixel(px, py).map(|p| p[3]), Some(255));
+        assert_ne!(split.front.pixel(px, py), split.back.pixel(px, py));
+        // a pixel only layer 1 draws is transparent in the front image
+        let (qx, qy) = (u32::try_from(4 + full.origin_x).unwrap(), u32::try_from(4 + full.origin_y).unwrap());
+        assert_eq!(split.front.pixel(qx, qy).map(|p| p[3]), Some(0));
+        assert_eq!(split.back.pixel(qx, qy).map(|p| p[3]), Some(255));
+    }
+
+    #[test]
+    fn depth_layers_with_options_ignore_the_layer_switches_but_keep_groups_and_blending() {
+        // the default spec has a layer-2 tile in animation group 5 and a blended tile
+        let f = parse(&FieldSpec::default());
+        let plain = decode_background_layers(&f).unwrap();
+        assert_eq!(plain.front.layers[1].tiles_drawn, 0, "group tiles are hidden by default");
+        let everything = BackgroundOptions { layers: [false; 4], groups: GroupFilter::All, blending: true };
+        let split = decode_background_layers_with(&f, &everything).unwrap();
+        assert_eq!(split.front.layers[1].tiles_drawn, 1, "groups apply to the split");
+        assert_eq!(split.front.layers[1].tiles_blended, 1);
+        assert_eq!(split.back.layers[0].tiles_drawn, 2, "the layers field is ignored: layer 1 is in the back half");
+        let opaque = BackgroundOptions { blending: false, groups: GroupFilter::All, ..BackgroundOptions::default() };
+        assert_eq!(decode_background_layers_with(&f, &opaque).unwrap().front.layers[1].tiles_blended, 0);
+        // the same errors as the plain decode
+        let broken = FieldSpec { corrupt_texture_tag: true, ..FieldSpec::default() };
+        assert!(matches!(decode_background_layers(&parse(&broken)), Err(FieldError::Invalid { .. })));
     }
 
     #[test]

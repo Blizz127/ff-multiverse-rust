@@ -1,6 +1,6 @@
 [package]
 name = "fmv-ff7"
-description = "FF7 adapter: format decoders (LGP, LZSS, field) and FF7 area runtime. Reads owned data only."
+description = "FF7 adapter: format decoders (LGP, LZSS, field, character models and animations) and FF7 area runtime. Reads owned data only."
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
@@ -13,5 +13,6 @@ blake3.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-# Only for `examples/field_dump.rs` (writes verification PNGs outside the repo).
+# Only for `examples/field_dump.rs` and `examples/model_dump.rs` (write verification PNGs outside
+# the repo).
 png = "0.18"
