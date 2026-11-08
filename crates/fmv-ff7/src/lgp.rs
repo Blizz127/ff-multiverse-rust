@@ -1,7 +1,25 @@
 //! LGP archive reader.
 //!
-//! **UNVERIFIED AGAINST OWNED MEDIA.** Written from public documentation only and exercised
-//! against synthetic archives built in test code. Confirm on the owner's `flevel.lgp`.
+//! **Verified on owned FF7 Steam Edition (en) on 2026-11-08** against `field/flevel.lgp`
+//! (131 431 170 bytes, 753 entries) and `field/char.lgp` (48 989 867 bytes, 12 649 entries);
+//! other editions are unverified. Measured facts (counts and sizes only):
+//!
+//! * Both archives parse with the layout below: `\0\0SQUARESOFT` + `u32` count, 27-byte table of
+//!   contents entries, every check code `0x0E`, every path index 0, and exactly 3 602 bytes
+//!   between the table of contents and the first data header (the 3 600-byte lookup table plus a
+//!   `u16` zero for an empty path table, so the path table really can be ignored).
+//! * Each entry's 24-byte data header repeats its table-of-contents name (0 mismatches in
+//!   either archive), entries are stored back to back in table order (no gaps), and the 14
+//!   bytes `FINAL FANTASY7` end the file right after the last entry.
+//! * No bare name repeats (case-insensitively) in either archive, so "first match wins" is
+//!   unambiguous. The largest entries are 614 328 bytes (`flevel`) and 124 236 bytes (`char`),
+//!   far below [`MAX_ENTRY_LEN`].
+//! * `flevel.lgp` holds 702 field entries plus 51 others: the name list `maplist` (stored raw,
+//!   not LZSS: a `u16` count, 788, then 32-byte NUL-padded names; `md1_1` is id 117) and 50
+//!   names containing a `.` (`*.tex` placeholders, `*.tut` tutorials and `*.NX` / `*.XOne`
+//!   console-port extras). `char.lgp` holds `.hrc` (385), `.a` (3 209), `.p` (4 180), `.rsd`
+//!   (4 180) and `.tex` (695) entries.
+//! * The table of contents is not sorted by name.
 //!
 //! # Sources
 //!
@@ -35,8 +53,8 @@
 //!
 //! * The lookup table is only an acceleration structure for the game; names are resolved
 //!   from the table of contents.
-//! * The path/conflict table is **not parsed**. Its 0- or 1-based TOC indexing is not clear
-//!   from the documentation, and `flevel.lgp` is expected to need no directories. Each
+//! * The path/conflict table is **not parsed**. Both owned archives need no directories (all
+//!   path indices are 0 and the table is empty); an archive that does would be a gap. Each
 //!   entry's raw path index is exposed as [`LgpEntry::path_index`]; when several entries
 //!   share a bare name, [`LgpArchive::read`] returns the first one in table order.
 //! * The data-header name is ignored (the wiki notes the game reads only TOC names).

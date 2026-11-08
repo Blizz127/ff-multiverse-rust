@@ -1,18 +1,27 @@
 //! fmv-ff7 — FF7 (PC) adapter: format decoders and the FF7 area runtime.
 //!
-//! **UNVERIFIED AGAINST OWNED MEDIA.** No owned FF7 data existed on the machine where this
-//! crate was written. Every format layout comes from public community documentation (URLs
-//! are cited in each module) that was fetched through a summarising tool, not copied
-//! verbatim, and cross-checked between two or more sources where each module says so.
-//! Nothing has been run against real game files; all tests use small synthetic data built
-//! in test code. Correctness must be confirmed on the owner's own files.
+//! **Verified on owned FF7 Steam Edition (en) on 2026-11-08; every other edition is
+//! unverified.** The format layouts come from public community documentation (URLs are cited in
+//! each module). They were written without game data and then checked against the owner's
+//! `flevel.lgp` (753 entries, 702 of them fields) and `char.lgp` (12 649 entries): the LGP
+//! reader, the LZSS decoder, the field container, walkmesh, camera, triggers/gateways, palette
+//! and background decoders all agree with the real files, and each module lists the measured
+//! facts it rests on (counts and sizes only, never game bytes). What the checks found and fixed:
+//! a palette section with zero pages is valid (14 direct-colour fields), palette index 0 is
+//! transparent whatever its colour, `control_direction` is unsigned, and the background section
+//! ends with an `END` tag. Unit tests use small synthetic data built in test code; the
+//! `#[ignore]`d tests in `tests/real_data.rs` and the `field_dump` example (both read the data
+//! directory from `FMV_FF7_DATA`) check the real files.
 //!
 //! Modules:
 //!
 //! * [`lgp`]   - LGP archive reader over any `Read + Seek` (a library blob path works).
 //! * [`lzss`]  - FF7 LZSS decompressor (plus a test-only compressor).
 //! * [`field`] - decompressed PC field file: sections, walkmesh, camera, palette,
-//!   triggers/gateways, background tiles.
+//!   triggers/gateways, background tiles and per-tile pixel decode.
+//! * [`background`] - the renderable background: [`background::decode_background`] composites
+//!   the layers into one RGBA image and [`background::Projection`] maps walkmesh coordinates
+//!   onto it through the field camera.
 //! * [`area`]  - [`Ff7Adapter`] / [`Ff7FieldArea`] implementing the `fmv-adapter-api`
 //!   traits over a `flevel.lgp` source. Synthetic provenance is labelled FIXTURE; the area
 //!   fingerprint binds the edition provenance and is defined by [`area_fingerprint`].
@@ -50,6 +59,7 @@
 )]
 
 pub mod area;
+pub mod background;
 pub mod field;
 pub mod lgp;
 pub mod lzss;
@@ -66,6 +76,7 @@ pub use area::{
 };
 pub use walk::LinkReport;
 
-/// Status string every surface that presents FF7 data from this crate should be able to show
-/// until the decoders have been confirmed against owned media.
-pub const VERIFICATION_STATUS: &str = "UNVERIFIED AGAINST OWNED MEDIA";
+/// Status string a surface that presents FF7 data from this crate can show. The decoders have
+/// been confirmed against one owned edition only; any other edition (PS1, 1998 PC, re-releases
+/// with different layouts) still counts as unverified.
+pub const VERIFICATION_STATUS: &str = "VERIFIED ON OWNED FF7 STEAM EDITION (EN) 2026-11-08; OTHER EDITIONS UNVERIFIED";

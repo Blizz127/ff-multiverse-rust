@@ -1,10 +1,50 @@
 //! PC field file (the decompressed contents of one `flevel.lgp` entry).
 //!
-//! **UNVERIFIED AGAINST OWNED MEDIA.** Written from public documentation only and exercised
-//! against synthetic field files built in test code. Confirm every layout on the owner's
-//! files before relying on it. The documentation was fetched through a summarising tool
-//! (not copied verbatim); where two sources are named they were compared, where only one
-//! or none is named the layout rests on that alone.
+//! **Verified on owned FF7 Steam Edition (en) on 2026-11-08** (the owner's `flevel.lgp`, 753
+//! entries, 702 of them field files); other editions are unverified. Measured facts (counts and
+//! sizes only, no game bytes):
+//!
+//! * Container: all 702 field entries parse. The nine section lengths plus the 78 header bytes
+//!   equal the decompressed size exactly in 120 fields; the other 582 carry the 14-byte ASCII
+//!   string `FINAL FANTASY7` after the last section (the same string that ends the archive),
+//!   which [`FieldFile`] simply ignores. `md1stin`: 414 915 bytes, sections 18 944 / 38 / 1 314 /
+//!   6 668 / 1 174 / 42 / 48 / 740 / 385 869.
+//! * Walkmesh: 81 542 triangles over the 702 fields; `md1stin` has 39 (x 3490..4055, y
+//!   27244..29405, z 310..432). All 181 202 access links point at a valid triangle, none points
+//!   at its own triangle, **every link shares the two edge vertices of the edge it is stored
+//!   under** (so "edge `e` runs `v[e]` -> `v[e+1]`" is exact), and 181 200 of them have a link
+//!   back (two do not).
+//! * Camera: one 38-byte record in 487 fields, two in 214, three in 1. In all 214 two-camera
+//!   fields the second record is a byte-for-byte copy of the first; only `mds5_1` (three
+//!   records) has differing ones. Use record 0. Projection model: see [`crate::background`].
+//! * Palette: 256 colours per page, 13 pages in `md1stin`. 14 fields (direct-colour backgrounds
+//!   such as `gldinfo`) have a 12-byte palette section with zero pages. Palette index 0 is the
+//!   transparent colour whatever its RGB value (chosen by comparing renderings; see
+//!   [`Palette::rgba`]).
+//! * Triggers: 740 bytes everywhere; the 9-byte name equals the entry name in 687 of 702 fields
+//!   (the other 15, such as `qa` or `min71`, carry a different internal name).
+//!   `control_direction` is an unsigned angle (572 fields store
+//!   a value above 127). `camera_range` is the extent of the background in field-screen
+//!   coordinates (equal to the layer-1 tile bounds in 399 of 699 fields; in the others layer 1
+//!   covers less than the range). Gateways: 1 036 in use (target `0x7FFF` marks an unused slot,
+//!   whose bytes are all zero); `target_field_id` indexes the 788-entry `maplist` entry of
+//!   `flevel.lgp` (`md1stin` -> 117 -> `md1_1`), and for all 978 gateways whose target is in
+//!   the archive the arrival `(x, y)` lies inside the target walkmesh triangle named by the
+//!   gateway's third destination value. 1 030 of 1 036 exit lines lie within 64 units of their
+//!   own walkmesh's bounding box; of 119 trigger slots in use, 118 do.
+//! * Background: layer presence (layers 1-4) is 1100 in 618 fields, 1110 in 34, 1111 in 50.
+//!   `md1stin`: layer 1 528x528 header with 795 tiles, layer 2 with 320, five 8-bit pages (slots
+//!   0-4), 13 palette pages, 1 115 tiles in total. The texture block ends at the section end
+//!   in every field except for a 3-byte `END` tag (578 fields end right after it; 121 have the
+//!   14 bytes `FINAL FANTASY7` after it inside the declared length; `blackbgb`, `las2_1` and
+//!   `fship_4` have 131, 17 and 19 further bytes). Page depths seen: 8-bit (3 276 pages, slots
+//!   0-25) and 16-bit direct colour (51 pages, slots 26-28); depth 0 never occurs.
+//!   Layer 1-2 tiles always sit on pages whose big-tile flag is 0 and layer 3-4 tiles on pages
+//!   whose flag is 1 (so tile size 16 / 32 by layer is exact); `texture_id` is the slot number.
+//!   The destination rule of [`MAX_TILE_DST`] drops 650 records in 7 fields, all unusable
+//!   (for example 640 odd-indexed layer-2 records of `md_e1`); no usable tile is ever dropped.
+//!   312 tiles in two fields (`lastmap`, `fr_e`) name a palette page past the end of the
+//!   palette section and cannot be decoded.
 //!
 //! # Sources
 //!
@@ -75,35 +115,29 @@
 //!
 //! # Known gaps and unverified points
 //!
-//! * **Gateway/trigger vertex components are raw `[i16; 3]` in file order.** The FFRTT page
-//!   names them `x, z, y`; PyFF7 reads gateways as `x, z, y` but trigger corners as
-//!   `x, y, z`; some tools treat the third component of a gateway destination as a walkmesh
-//!   triangle id. This crate does not interpret them.
-//! * Gateway "unused slot" marker, arrows, and the section 3/6/7 internals are not decoded.
-//! * Background: `texture_id` is the **slot index** (0..42) into the texture list (empty
-//!   slots are `None`), as in Makou Reactor's reader. The older Fergusson write-up's page
-//!   formula counts existing pages only; the two readings differ when leading slots are
-//!   empty, and neither has been checked on real data here.
-//! * Texture pages of depth 0 (32768 bytes, presumably 4 bits per pixel) are located but not
-//!   decoded; depth 1 (8-bit palette indices) and depth 2 (16-bit direct colour) are decoded.
-//! * Colour transparency is an assumption (UNVERIFIED): for palette lookups only index 0 can
-//!   be transparent, and only when its raw colour is `0x0000` (Makou Reactor's notes say PC
-//!   palette transparency is limited to the first entry); for 16-bit direct colour a raw
-//!   `0x0000` is transparent. The "mask" bit (bit 15) is not interpreted.
-//! * `blending` / `type_trans` / `param` / `state` / `id` are exposed raw; their effect on
-//!   rendering (additive/subtractive blending, animation groups, draw order) is not
-//!   implemented.
-//! * Tile destinations are signed and centre-relative per the community notes; the
-//!   background size/centre to use for compositing is not decided here. Records whose
-//!   destination is at or beyond `+-`[`MAX_TILE_DST`] (1024) on either axis are **dropped**
-//!   while parsing, on all four layers, exactly as Makou Reactor's PC tile reader does
-//!   (`#define MAX_TILE_DST 1024` in `BackgroundTilesIO.h`; `BackgroundTilesIOPC::readData`
-//!   keeps a tile only if `qAbs(dstX) < MAX_TILE_DST && qAbs(dstY) < MAX_TILE_DST`, warns
-//!   "Tile destination overflow" otherwise and leaves the index gap). They are counted in
-//!   [`Background::discarded_tiles`] and the surviving tiles keep their file `index`, so a
-//!   consumer never sees an unused or garbage record far off-screen. Whether real files
-//!   contain such records, or legitimate tiles beyond 1024, is unverified: if a real field
-//!   turns out to lose tiles to this rule, the constant is the thing to revisit.
+//! * Section 1 camera: only record 0 is interpreted (see above). The wiki still says the vector
+//!   order and zoom are not fully understood; [`crate::background`] documents the projection
+//!   that was checked against the real art.
+//! * Trigger corners and gateway exit points are `(x, y, z)` in walkmesh order (verified, see
+//!   above); a gateway's `destination` is `(x, y, triangle id)` in the **target** field's
+//!   coordinates. Arrow data after the 12 triggers, `bg_animation_sizes` and the section 3/6/7
+//!   internals are not decoded. The script, model-loader, tilemap and encounter sections are
+//!   raw bytes.
+//! * Background `blending` / `type_trans` / `param` / `state` / `id` are exposed as stored. How
+//!   they are *used* is in [`crate::background`]: blend modes and draw order were checked by eye
+//!   on real fields; which animation groups are on at field start is script state that this
+//!   crate does not evaluate; how a layer-2 `id` maps to character depth is unverified.
+//! * Depth-0 (4-bit) texture pages never occur in the owned data; their decode (low nibble =
+//!   first pixel) rests on Makou Reactor's description only.
+//! * Colour: palette entries and 16-bit direct-colour pixels use the same layout (red in the
+//!   low five bits, verified by eye on the Gold Saucer page of `gldinfo`; blue-in-the-low-bits
+//!   readings give blue "gold" text). Bit 15 is not interpreted. For direct colour a raw
+//!   `0x0000` is treated as transparent (Makou Reactor's rule; no owned field tests it).
+//! * Tile destinations are signed, top-left-corner, relative to the centre of the unscrolled
+//!   320x240 screen, in the same space as the camera projection ([`crate::background`]).
+//!   Records at or beyond `+-`[`MAX_TILE_DST`] (1024) on either axis are dropped while parsing
+//!   on all four layers, as Makou Reactor's PC reader does; they are counted in
+//!   [`Background::discarded_tiles`] and the surviving tiles keep their file `index`.
 //!
 //! # Safety against untrusted input
 //!
@@ -239,9 +273,6 @@ impl<'a> Reader<'a> {
 
     fn u8(&mut self) -> Result<u8, FieldError> {
         Ok(u8::from_le_bytes(self.array()?))
-    }
-    fn i8(&mut self) -> Result<i8, FieldError> {
-        Ok(i8::from_le_bytes(self.array()?))
     }
     fn u16(&mut self) -> Result<u16, FieldError> {
         Ok(u16::from_le_bytes(self.array()?))
@@ -534,10 +565,11 @@ pub fn parse_cameras(section: &[u8]) -> Result<Vec<Camera>, FieldError> {
 
 /// Convert a raw 15-bit field colour to RGBA8.
 ///
-/// Bit layout (both sources agree): bits 0-4 red, 5-9 green, 10-14 blue, bit 15 "mask".
-/// 5-bit channels are expanded with `(v << 3) | (v >> 2)`. Alpha is an assumption
-/// (UNVERIFIED): raw `0x0000` is transparent, everything else opaque; bit 15 is not
-/// interpreted. (Palette lookups use their own alpha rule, see [`Palette::rgba`].)
+/// Bit layout (both sources agree, and verified by eye on real palette and direct-colour
+/// pages): bits 0-4 red, 5-9 green, 10-14 blue, bit 15 "mask" (not interpreted). 5-bit channels
+/// are expanded with `(v << 3) | (v >> 2)`. Alpha: raw `0x0000` is transparent, everything
+/// else opaque; this is the rule for 16-bit direct-colour pixels (Makou Reactor's, untested by
+/// the owned fields). Palette lookups use their own alpha rule, see [`Palette::rgba`].
 pub fn rgb555_to_rgba(raw: u16) -> [u8; 4] {
     let expand = |v: u16| -> u8 {
         let v = (v & 0x1F) as u8;
@@ -547,23 +579,34 @@ pub fn rgb555_to_rgba(raw: u16) -> [u8; 4] {
     [expand(raw), expand(raw >> 5), expand(raw >> 10), alpha]
 }
 
-/// Alpha for a palette lookup (UNVERIFIED assumption): only palette index 0 can be
-/// transparent, and only when its raw colour is `0x0000`.
-fn palette_alpha(index: usize, raw: u16) -> u8 {
-    if index == 0 && raw == 0 {
+/// Alpha for a palette lookup: palette index 0 is the transparent colour, every other index
+/// is opaque, whatever the RGB values are.
+///
+/// Verified on owned data by comparing renderings: many palette pages store a non-black key
+/// colour at index 0 (pure green `0x03E0` in several fields, for example) that must not show,
+/// while 2.2 million layer-2 pixels use a non-zero index whose colour is exactly `0x0000` and
+/// must stay opaque. "Transparent only if index 0 is also black" paints green blotches over
+/// `cosmin2` and fills the trestle gaps of `mtcrl_5`; "any black is transparent" punches holes
+/// in dark foreground objects.
+fn palette_alpha(index: usize) -> u8 {
+    if index == 0 {
         0
     } else {
         255
     }
 }
 
-/// Palette section: header + pages of colours (normally 256 per page).
+/// Palette section: header + pages of colours (256 per page in every owned field).
 ///
 /// Layout after the section's own length prefix: `u32` duplicate length (ignored), `u16`
-/// palX, `u16` palY (PlayStation VRAM position, ignored by PC), `u16` colours per page,
-/// `u16` page count, then `u16` colours until the end of the section. All complete pages
+/// palX (0), `u16` palY (480; PlayStation VRAM position, ignored by PC), `u16` colours per page
+/// (256), `u16` page count, then `u16` colours until the end of the section. All complete pages
 /// present are kept even if the header page count disagrees (the header value is kept in
-/// [`Palette::declared_pages`]).
+/// [`Palette::declared_pages`]). A section with no colours is valid (zero pages): the 14
+/// direct-colour fields have one.
+///
+/// A tile's `palette_id` is the page number. That holds for every tile of 700 of the 702 owned
+/// fields; `lastmap` and `fr_e` have 312 blended tiles that name a page past the end.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Palette {
     pub pal_x: u16,
@@ -599,13 +642,10 @@ impl Palette {
         }
         let per_page = usize::from(colors_per_page);
         let available = r.remaining() / 2;
+        // A header with no colours is valid real data: 14 owned fields (direct-colour
+        // backgrounds such as `gldinfo`) carry a 12-byte palette section with zero pages, so
+        // zero complete pages is an empty palette, not an error.
         let pages = available / per_page;
-        if pages == 0 {
-            return Err(FieldError::Invalid {
-                what: "palette",
-                why: format!("no complete page: {available} colours present, {per_page} per page"),
-            });
-        }
         let total = pages * per_page; // <= available, so bounded by the section size
         let mut colors = Vec::with_capacity(total);
         for _ in 0..total {
@@ -629,12 +669,12 @@ impl Palette {
         self.colors.get(at).copied()
     }
 
-    /// RGBA8 colour `index` of `page`. Only index 0 can be transparent (alpha 0 when its raw
-    /// colour is zero); see the module's known gaps.
+    /// RGBA8 colour `index` of `page`. **Index 0 is always transparent** (alpha 0, RGB as
+    /// stored), every other index is opaque. See `palette_alpha` for the evidence.
     pub fn rgba(&self, page: usize, index: usize) -> Option<[u8; 4]> {
         let raw = self.raw(page, index)?;
         let [r, g, b, _] = rgb555_to_rgba(raw);
-        Some([r, g, b, palette_alpha(index, raw)])
+        Some([r, g, b, palette_alpha(index)])
     }
 
     /// Every colour of `page` as RGBA8 (same alpha rule as [`Palette::rgba`]).
@@ -649,7 +689,7 @@ impl Palette {
                 .enumerate()
                 .map(|(index, &raw)| {
                     let [r, g, b, _] = rgb555_to_rgba(raw);
-                    [r, g, b, palette_alpha(index, raw)]
+                    [r, g, b, palette_alpha(index)]
                 })
                 .collect(),
         )
@@ -660,8 +700,11 @@ impl Palette {
 // Triggers / gateways (section 7)
 // ---------------------------------------------------------------------------------------
 
-/// Visible camera range (`left, bottom, right, top`; the wiki is unsure `bottom`/`top` are
-/// not swapped).
+/// Extent of the background in field-screen coordinates (`left, bottom, right, top`). The
+/// stored order is `bottom <= top` numerically in a y-down space (`md1stin`: -256..256), so
+/// "bottom" is not the screen's bottom; use [`CameraRange::bounds`] for a normalised rectangle.
+/// This is the area the view may scroll over: 320x240 for non-scrolling fields (176 owned
+/// fields), 512x512 for `md1stin`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CameraRange {
     pub left: i16,
@@ -670,10 +713,28 @@ pub struct CameraRange {
     pub top: i16,
 }
 
-/// One gateway slot (24 bytes). `exit_a`/`exit_b` are the exit line's end points and
-/// `destination` the arrival position; all three are 3 x `i16` **in file order, meaning not
-/// interpreted** (see the module's known gaps). `target_field_id` is the destination field's
-/// id. Unused slots are present too; this crate does not decide which they are.
+impl CameraRange {
+    /// `(min_x, min_y, max_x, max_y)` regardless of how the corners are stored.
+    pub fn bounds(&self) -> (i32, i32, i32, i32) {
+        (
+            i32::from(self.left.min(self.right)),
+            i32::from(self.bottom.min(self.top)),
+            i32::from(self.left.max(self.right)),
+            i32::from(self.bottom.max(self.top)),
+        )
+    }
+}
+
+/// One gateway slot (24 bytes), verified on the owned data.
+///
+/// * `exit_a`/`exit_b`: the exit line's end points as `(x, y, z)` in this field's walkmesh
+///   coordinates.
+/// * `destination`: `(x, y, triangle)` in the **target** field's walkmesh coordinates; the
+///   third value is the index of the target walkmesh triangle containing the arrival point (it
+///   is not a height). See [`Gateway::destination_xy`] and [`Gateway::destination_triangle`].
+/// * `target_field_id`: index into the archive's `maplist` entry (a `u16` count followed by
+///   32-byte NUL-padded field names). [`Gateway::UNUSED_FIELD_ID`] marks an unused slot, whose
+///   other bytes are all zero.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Gateway {
     pub exit_a: [i16; 3],
@@ -681,6 +742,27 @@ pub struct Gateway {
     pub destination: [i16; 3],
     pub target_field_id: u16,
     pub unknown: [u8; 4],
+}
+
+impl Gateway {
+    /// `target_field_id` of an unused slot.
+    pub const UNUSED_FIELD_ID: u16 = 0x7FFF;
+
+    /// Whether the slot describes a real gateway.
+    pub fn is_used(&self) -> bool {
+        self.target_field_id != Self::UNUSED_FIELD_ID
+    }
+
+    /// Arrival `(x, y)` in the target field's walkmesh coordinates.
+    pub fn destination_xy(&self) -> [i16; 2] {
+        let [x, y, _] = self.destination;
+        [x, y]
+    }
+
+    /// Index of the target field's walkmesh triangle that contains the arrival point.
+    pub fn destination_triangle(&self) -> Option<usize> {
+        usize::try_from(self.destination[2]).ok()
+    }
 }
 
 /// One trigger slot (16 bytes): two corners (3 x `i16`, file order), background group and
@@ -696,12 +778,14 @@ pub struct Trigger {
 }
 
 /// Triggers section: 56-byte header, 12 gateways, 12 triggers (arrow data, present in
-/// non-Japanese releases, is not parsed).
+/// non-Japanese releases, is not parsed). The section is 740 bytes in every owned field.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Triggers {
     /// Field name stored in the section (9-byte NUL-terminated field).
     pub name: String,
-    pub control_direction: i8,
+    /// Direction of the field's "up" for movement controls, an unsigned angle where 256 is a
+    /// full turn (`124` in `md1stin`; 572 of 702 owned fields exceed 127, so it is not signed).
+    pub control_direction: u8,
     /// Camera focus height relative to the character (0 = default).
     pub focus_height: i16,
     pub camera_range: CameraRange,
@@ -712,13 +796,18 @@ pub struct Triggers {
 }
 
 impl Triggers {
+    /// The gateway slots that are in use.
+    pub fn used_gateways(&self) -> impl Iterator<Item = &Gateway> {
+        self.gateways.iter().filter(|g| g.is_used())
+    }
+
     pub fn parse(section: &[u8]) -> Result<Self, FieldError> {
         let mut r = Reader::new(section, "triggers");
         if r.remaining() < TRIGGERS_MIN_LEN {
             return Err(r.truncated(TRIGGERS_MIN_LEN));
         }
         let name = nul_padded_name(r.take(9)?);
-        let control_direction = r.i8()?;
+        let control_direction = r.u8()?;
         let focus_height = r.i16()?;
         let camera_range = CameraRange { left: r.i16()?, bottom: r.i16()?, right: r.i16()?, top: r.i16()? };
         r.skip(4)?; // 2 x u16 unknown, tied to layers 3/4
@@ -816,11 +905,12 @@ pub struct LayerHeader {
 
 /// Location of one 256x256 texture page inside the background section. `pixels` borrows
 /// the field bytes (no copy), row-major, 256 pixels per row, and is `depth * 65536` bytes
-/// (32768 for depth 0). Depth 1 = 8-bit palette indices; depth 2 = 16-bit direct colour
-/// (same 15-bit layout as the palette); depth 0 is presumably 4 bits per pixel and is
-/// located but not decoded. `big_tile_flag` is the first per-page `u16`, stored as found
-/// (Makou Reactor: 0 = the page holds 16x16 tiles, 1 = 32x32 tiles; PyFF7 calls it "size"
-/// and its writer stores 0).
+/// (32768 for depth 0). Depth 1 = 8-bit palette indices (every paletted page in the owned
+/// data); depth 2 = 16-bit direct colour (same 15-bit layout as the palette; slots 26-28 in the
+/// owned data); depth 0 = 4-bit palette indices, low nibble first (never occurs in the owned
+/// data, so unverified). `big_tile_flag` is the first per-page `u16`, stored as found: 0 for
+/// pages holding 16x16 tiles (layers 1-2), 1 for pages holding 32x32 tiles (layers 3-4), which
+/// is exactly how the owned data uses it.
 #[derive(Clone, Copy)]
 pub struct TexturePage<'a> {
     pub slot: u8,
@@ -858,7 +948,8 @@ impl fmt::Debug for TexturePage<'_> {
 /// Tile records are 52 bytes; see [`TileSprite`]. Records whose destination is at or beyond
 /// `+-`[`MAX_TILE_DST`] are dropped (see the module docs). A texture-section problem does NOT
 /// fail the parse: the tiles are still returned and [`Background::texture_error`] says why the
-/// pages are missing. Pixel decode is partial: see [`Background::tile_rgba`].
+/// pages are missing. Pixels: [`Background::tile_rgba`] decodes one tile;
+/// [`crate::background`] composites all of them.
 #[derive(Clone)]
 pub struct Background<'a> {
     /// Section-level `depth` field (almost always 1).
@@ -875,6 +966,13 @@ pub struct Background<'a> {
     pub textures: Vec<Option<TexturePage<'a>>>,
     /// Why `textures` is empty, if the texture section failed to parse.
     pub texture_error: Option<FieldError>,
+    /// Whether the 3-byte tag `END` follows the last texture slot (it does in every owned
+    /// field). Only meaningful when `texture_error` is `None`.
+    pub end_tag: bool,
+    /// Bytes of the section after the texture slots and the `END` tag: 0 in 578 owned fields,
+    /// 14 (`FINAL FANTASY7`) in 121 and 17, 19 or 131 in three. Only meaningful when
+    /// `texture_error` is `None`.
+    pub trailing_bytes: usize,
 }
 
 /// `Debug` prints layer headers and counts only (no tiles, no pixels).
@@ -888,6 +986,8 @@ impl fmt::Debug for Background<'_> {
             .field("discarded_tiles", &self.discarded_tiles)
             .field("texture_slots", &present)
             .field("texture_error", &self.texture_error)
+            .field("end_tag", &self.end_tag)
+            .field("trailing_bytes", &self.trailing_bytes)
             .finish()
     }
 }
@@ -1061,7 +1161,16 @@ impl<'a> Background<'a> {
             Ok(t) => (t, None),
             Err(e) => (Vec::new(), Some(e)),
         };
-        Ok(Self { depth, layers, tiles, discarded_tiles, textures, texture_error })
+        let (end_tag, trailing_bytes) = if texture_error.is_none() {
+            let end_tag = slice_at(section, r.pos, 3) == Some(b"END".as_slice());
+            if end_tag {
+                r.pos += 3; // slice_at succeeded, so pos + 3 <= len
+            }
+            (end_tag, r.remaining())
+        } else {
+            (false, 0)
+        };
+        Ok(Self { depth, layers, tiles, discarded_tiles, textures, texture_error, end_tag, trailing_bytes })
     }
 
     /// Tiles of one layer (1-4) in file order.
@@ -1077,34 +1186,39 @@ impl<'a> Background<'a> {
     /// Decode one tile to `tile_size * tile_size` RGBA8 pixels (row-major) using the tile's
     /// effective source (see [`TileSprite::effective_source`]).
     ///
-    /// **Partial / UNVERIFIED:** depth-1 pages are looked up in palette page `palette_id`
-    /// ([`Palette::rgba`] alpha rule); depth-2 pages are read as direct 15-bit colour
-    /// ([`rgb555_to_rgba`]); depth-0 pages are not decoded; `blending` is not applied.
-    /// Returns `None` if the texture slot or palette page is missing, the page depth is not
-    /// decodable, or the tile would read outside its 256x256 page.
+    /// Depth-0 and depth-1 pages are looked up in palette page `palette_id` (palette index 0 is
+    /// transparent, see [`Palette::rgba`]); depth-2 pages are read as direct 15-bit colour
+    /// ([`rgb555_to_rgba`], raw `0x0000` transparent). `blending` is not applied here.
+    ///
+    /// Returns `None` if the texture slot or palette page is missing, the page depth is
+    /// unknown, or the tile would read outside its 256x256 page (for the 312 owned tiles that
+    /// name a palette page past the palette section this is the answer).
     pub fn tile_rgba(&self, tile: &TileSprite, palette: &Palette) -> Option<Vec<[u8; 4]>> {
         let (slot, src_x, src_y) = tile.effective_source();
         let page = self.texture(slot)?;
-        if page.depth != 1 && page.depth != 2 {
-            return None;
-        }
         let size = usize::from(tile.tile_size);
         let (src_x, src_y) = (usize::from(src_x), usize::from(src_y));
         if src_x.checked_add(size)? > BG_PAGE_SIDE || src_y.checked_add(size)? > BG_PAGE_SIDE {
             return None;
         }
-        let bytes_per_pixel = usize::from(page.depth);
+        let palette_page = usize::from(tile.palette_id);
         let mut out = Vec::with_capacity(size * size);
         for y in 0..size {
             for x in 0..size {
                 let pixel = (src_y + y) * BG_PAGE_SIDE + (src_x + x);
-                let at = pixel.checked_mul(bytes_per_pixel)?;
-                let rgba = if page.depth == 1 {
-                    let index = usize::from(*page.pixels.get(at)?);
-                    palette.rgba(usize::from(tile.palette_id), index)?
-                } else {
-                    let raw = u16::from_le_bytes([*page.pixels.get(at)?, *page.pixels.get(at + 1)?]);
-                    rgb555_to_rgba(raw)
+                let rgba = match page.depth {
+                    0 => {
+                        let byte = *page.pixels.get(pixel / 2)?;
+                        let index = if pixel % 2 == 0 { byte & 0x0F } else { byte >> 4 };
+                        palette.rgba(palette_page, usize::from(index))?
+                    }
+                    1 => palette.rgba(palette_page, usize::from(*page.pixels.get(pixel)?))?,
+                    2 => {
+                        let at = pixel.checked_mul(2)?;
+                        let raw = u16::from_le_bytes([*page.pixels.get(at)?, *page.pixels.get(at + 1)?]);
+                        rgb555_to_rgba(raw)
+                    }
+                    _ => return None,
                 };
                 out.push(rgba);
             }
@@ -1246,14 +1360,38 @@ mod tests {
     }
 
     #[test]
+    fn palette_index_zero_is_transparent_even_when_its_colour_is_not_black() {
+        // Owned data stores key colours (pure green 0x03E0, white) at index 0 and uses a non-zero
+        // index for opaque black: index 0 is transparent, nothing else is.
+        let mut bytes = vec![0u8; 4];
+        for v in [0u16, 480, 3, 1] {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        for c in [0x03E0u16, 0x0000, 0x7FFF] {
+            bytes.extend_from_slice(&c.to_le_bytes());
+        }
+        let p = Palette::parse(&bytes).unwrap();
+        assert_eq!(p.rgba(0, 0), Some([0, 255, 0, 0]));
+        assert_eq!(p.rgba(0, 1), Some([0, 0, 0, 255]));
+        assert_eq!(p.rgba(0, 2), Some([255, 255, 255, 255]));
+        assert_eq!(p.page_rgba(0).unwrap(), vec![[0, 255, 0, 0], [0, 0, 0, 255], [255, 255, 255, 255]]);
+    }
+
+    #[test]
     fn palette_rejects_bad_headers() {
         assert!(matches!(Palette::parse(&[]), Err(FieldError::Truncated { .. })));
         let mut zero_cpp = vec![0u8; 12];
         zero_cpp[8..10].copy_from_slice(&0u16.to_le_bytes());
         assert!(matches!(Palette::parse(&zero_cpp), Err(FieldError::Invalid { .. })));
-        let mut no_page = vec![0u8; 12 + 20];
-        no_page[8..10].copy_from_slice(&256u16.to_le_bytes());
-        assert!(matches!(Palette::parse(&no_page), Err(FieldError::Invalid { .. })));
+        // Zero complete pages is a valid, empty palette: 14 owned direct-colour fields have a
+        // header-only section; a partial page is dropped.
+        for len in [12usize, 12 + 20] {
+            let mut no_page = vec![0u8; len];
+            no_page[8..10].copy_from_slice(&256u16.to_le_bytes());
+            let p = Palette::parse(&no_page).unwrap();
+            assert_eq!((p.page_count(), p.declared_pages), (0, 0));
+            assert_eq!((p.raw(0, 0), p.rgba(0, 0), p.page_rgba(0)), (None, None, None));
+        }
         // a header that claims more pages than exist keeps the complete pages present
         let mut short = vec![0u8; 12 + 2 * 256];
         short[8..10].copy_from_slice(&256u16.to_le_bytes());
@@ -1283,6 +1421,38 @@ mod tests {
         let tr = t.triggers[2];
         assert_eq!((tr.corner_a, tr.corner_b), ([-1, -2, -3], [11, 12, 13]));
         assert_eq!((tr.bg_group_id, tr.bg_frame_id, tr.behavior, tr.sound_id), (3, 4, 2, 9));
+    }
+
+    #[test]
+    fn control_direction_is_an_unsigned_angle() {
+        let mut raw = vec![0u8; 740];
+        for value in [0u8, 124, 127, 128, 200, 255] {
+            raw[9] = value;
+            assert_eq!(Triggers::parse(&raw).unwrap().control_direction, value);
+        }
+    }
+
+    #[test]
+    fn gateway_helpers_follow_the_verified_layout() {
+        let t = parse(&FieldSpec::default()).triggers().unwrap();
+        assert_eq!(t.used_gateways().count(), 1);
+        let g = t.gateways[0];
+        assert!(g.is_used());
+        assert_eq!(g.destination_xy(), [7, 8]); // destination = (x, y, triangle id)
+        assert_eq!(g.destination_triangle(), Some(9));
+        assert!(!t.gateways[1].is_used());
+        assert_eq!(Gateway::UNUSED_FIELD_ID, 0x7FFF);
+        let negative = Gateway { destination: [1, 2, -1], ..g };
+        assert_eq!(negative.destination_triangle(), None);
+    }
+
+    #[test]
+    fn camera_range_bounds_are_normalised() {
+        // md1stin stores bottom = -256 and top = +256 in a y-down space
+        let r = CameraRange { left: -256, bottom: -256, right: 256, top: 256 };
+        assert_eq!(r.bounds(), (-256, -256, 256, 256));
+        let swapped = CameraRange { left: 10, bottom: 20, right: -10, top: -20 };
+        assert_eq!(swapped.bounds(), (-10, -20, 10, 20));
     }
 
     #[test]
@@ -1416,7 +1586,7 @@ mod tests {
     }
 
     #[test]
-    fn depth_zero_pages_are_located_but_not_decoded() {
+    fn depth_zero_pages_are_located_and_decoded_low_nibble_first() {
         // slot 1 is a depth-0 page (32768 bytes); slots after it must still be found
         let spec = FieldSpec { texture_slots: vec![(0, 1), (1, 0), (3, 2)], ..FieldSpec::default() };
         let f = parse(&spec);
@@ -1426,9 +1596,41 @@ mod tests {
         assert_eq!((zero.depth, zero.pixels.len()), (0, 32_768));
         assert_eq!(bg.texture(3).unwrap().pixels.len(), 131_072);
         let pal = f.palette().unwrap();
+        // tile 0 on the 4-bit page, source (16, 32), palette page 0 (colour = index). Page pixel
+        // p = y * 256 + x is nibble (p & 1) of byte p / 2, and byte i holds `i % 253`.
         let mut tile = bg.tiles[0];
         tile.texture_id = 1;
+        tile.palette_id = 0;
+        let px = bg.tile_rgba(&tile, &pal).unwrap();
+        assert_eq!(px.len(), 256);
+        let nibble = |x: usize, y: usize| -> u16 {
+            let p = (32 + y) * 256 + 16 + x;
+            let byte = ((p / 2) % 253) as u16;
+            if p % 2 == 0 { byte & 15 } else { byte >> 4 }
+        };
+        for (x, y) in [(0usize, 0usize), (1, 0), (2, 0), (15, 15), (7, 3)] {
+            let index = nibble(x, y);
+            let expect = pal.rgba(0, index as usize).unwrap();
+            assert_eq!(px[y * 16 + x], expect, "pixel ({x}, {y}) index {index}");
+        }
+        // a palette page past the end is still reported as None
+        tile.palette_id = 9;
         assert!(bg.tile_rgba(&tile, &pal).is_none());
+    }
+
+    #[test]
+    fn background_end_tag_and_trailing_bytes() {
+        // the synthetic section ends "END" + "FINAL FANTASY7" like the owned files
+        let bg_of = |cut: usize| {
+            let spec = FieldSpec { truncate_background_bytes: cut, ..FieldSpec::default() };
+            let f = parse(&spec);
+            let bg = f.background().unwrap();
+            (bg.texture_error.is_none(), bg.end_tag, bg.trailing_bytes)
+        };
+        assert_eq!(bg_of(0), (true, true, 14));
+        assert_eq!(bg_of(14), (true, true, 0)); // exactly the layout of 578 owned fields
+        assert_eq!(bg_of(17), (true, false, 0)); // no tag at all
+        assert_eq!(bg_of(15), (true, false, 2)); // a partial "EN" is not a tag
     }
 
     #[test]

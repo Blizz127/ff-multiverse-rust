@@ -1,14 +1,16 @@
 //! Walkmesh navigation: point location, edge-access aware movement validation and spawn
 //! selection over a decoded [`Walkmesh`].
 //!
-//! **UNVERIFIED AGAINST OWNED MEDIA.** Everything here rests on the walkmesh layout described
-//! in [`crate::field`] (FFRTT "FF7/Field/Walkmesh"): three vertices per triangle and, per
+//! **Verified on owned FF7 Steam Edition (en) on 2026-11-08.** The walkmesh layout described in
+//! [`crate::field`] (FFRTT "FF7/Field/Walkmesh") is three vertices per triangle and, per
 //! triangle, three access words, where word `e` is "the triangle you should be in if you cross
 //! edge `e`" (edge 0 = v0-v1, 1 = v1-v2, 2 = v2-v0) and `0xFFFF` means "this edge cannot be
-//! crossed". The page does not say whether links are symmetric or whether indices are 0-based;
-//! this module assumes 0-based and does not require symmetry (a link is followed in the
-//! direction it is stored). x/y are the ground plane and z is height, as everywhere in this
-//! crate (also unconfirmed).
+//! crossed". On the 702 owned fields (81 542 triangles, 181 202 links) the indices are 0-based
+//! and always in range, no link points at its own triangle, **every link shares the two edge
+//! vertices of the edge it is stored under** (so the edge order above is exact), and 181 200
+//! links have a link back (two do not, which is why symmetry is still not required: a link is
+//! followed in the direction it is stored). x/y are the ground plane and z is height (the field
+//! camera confirms it, see [`crate::background`]).
 //!
 //! # Why not just "is the destination inside some triangle"
 //!
@@ -69,6 +71,10 @@
 //! * Heights are not otherwise constrained: any climb the links allow is allowed.
 //! * Links are trusted as stored. [`Surface::link_report`] counts how many are symmetric and
 //!   geometrically adjacent so the layout assumptions can be checked on real data.
+//! * Real meshes are larger than the `f32` caveat above assumes: `md1stin` spans y 27 244 to
+//!   29 405, where `f32` resolves about 0.002 units. The real-data test still sees off-mesh
+//!   moves and exits through blocked edges refused there; the wall nudge may simply leave a
+//!   position on the closed boundary.
 
 use crate::field::{Vertex, Walkmesh};
 use fmv_core::Pos;

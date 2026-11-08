@@ -131,7 +131,7 @@ fn lists_loads_and_validates_two_fields_through_the_trait() {
     let adapter: Box<dyn GameAdapter> =
         Box::new(Ff7Adapter::from_flevel_reader(Cursor::new(synthetic_flevel()), provenance()).unwrap());
     assert_eq!(adapter.game(), GameId::Ff7);
-    assert_eq!(VERIFICATION_STATUS, "UNVERIFIED AGAINST OWNED MEDIA");
+    assert_eq!(VERIFICATION_STATUS, "VERIFIED ON OWNED FF7 STEAM EDITION (EN) 2026-11-08; OTHER EDITIONS UNVERIFIED");
 
     // Listing does not decode: every plausibly named entry is offered (sorted), only the name
     // list is left out. An entry that is not a field is listed and refuses to load.

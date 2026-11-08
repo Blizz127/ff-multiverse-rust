@@ -1,10 +1,12 @@
 //! FF7 area runtime: [`Ff7Adapter`] (a `GameAdapter` over one `flevel.lgp`) and
 //! [`Ff7FieldArea`] (an `AreaRuntime` over one decoded field).
 //!
-//! **UNVERIFIED AGAINST OWNED MEDIA.** This adapter has only ever seen synthetic data. Its
-//! behaviour on a real `flevel.lgp` is exactly as unproven as the decoders it sits on (see
-//! the `lgp`, `lzss`, `field` and `walk` module docs). [`crate::VERIFICATION_STATUS`] is
-//! available to any surface that wants to show the verification state.
+//! **Verified on owned FF7 Steam Edition (en) on 2026-11-08** (`tests/real_data.rs`, run with
+//! `FMV_FF7_DATA` set): on the real `flevel.lgp` the adapter lists exactly the 702 field
+//! entries (the name list `maplist` and the 50 names containing a `.` are skipped), loads
+//! `md1stin` (39 triangles), accepts moves between linked triangles, refuses moves off the
+//! platform and more than twenty exits through blocked edges, and accepts every spawn point.
+//! Other editions are unverified; see [`crate::VERIFICATION_STATUS`].
 //!
 //! # FIXTURE labelling
 //!

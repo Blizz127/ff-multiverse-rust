@@ -11,3 +11,7 @@ fmv-core.workspace = true
 fmv-adapter-api.workspace = true
 blake3.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+# Only for `examples/field_dump.rs` (writes verification PNGs outside the repo).
+png = "0.18"

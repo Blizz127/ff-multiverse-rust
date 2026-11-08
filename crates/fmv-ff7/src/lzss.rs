@@ -1,9 +1,13 @@
 //! FF7 LZSS decompressor.
 //!
-//! **UNVERIFIED AGAINST OWNED MEDIA.** No owned FF7 data was available when this was
-//! written; every rule below comes from public community documentation and has only been
-//! exercised against synthetic streams. Confirm on the owner's `flevel.lgp` before relying
-//! on it.
+//! **Verified on owned FF7 Steam Edition (en) on 2026-11-08.** Decoding all 702 field entries of
+//! the owner's `flevel.lgp` (279 241 487 bytes in total, the largest field 1 296 532 bytes)
+//! reproduces the file layout exactly: the nine section lengths plus the 78 header bytes equal
+//! the decompressed size in 120 fields and fall short by exactly the 14-byte `FINAL FANTASY7`
+//! trailer in the other 582, with every section then parsing. The size header equals the stored
+//! entry length minus 4 in all 702 entries (none uses the "header counts itself" variant, which
+//! stays accepted). `md1stin`: 201 335 stored bytes, header 201 331, 414 915 bytes expanded.
+//! No decompressed size is stored anywhere, so that section-table equality is the check.
 //!
 //! # Sources
 //!
