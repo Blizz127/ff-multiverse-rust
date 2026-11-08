@@ -21,3 +21,4 @@
 library/
 import-sessions/
 /u.cli.*
+/.claude/
