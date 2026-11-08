@@ -89,6 +89,7 @@ mod accounts;
 mod config;
 mod conn;
 mod deferred;
+mod inventory;
 pub mod ff7;
 mod limits;
 mod progress;

@@ -1,4 +1,4 @@
-//! Saving what battles pay, off the world lock and off the async executor.
+//! Saving what battles pay and what players use, off the world lock and off the async executor.
 //!
 //! The world applies a payment to a player's mirror in memory (microseconds, under its lock) and hands
 //! the SAME payment to the saver, which applies it to the stored record as an atomic read-modify-write
@@ -6,10 +6,21 @@
 //! payments reach the store in the order the world made them, whether or not the player is still
 //! connected. What is queued is a payment (a delta), never a whole record: two results for one
 //! account, or a result for an account that logged in again while it was queued, add up instead of one
-//! overwriting the other.
+//! overwriting the other. A payment is a won battle's experience, gil, AP and dropped items
+//! ([`SavedChange::Reward`]) or one item an account used in a battle ([`SavedChange::UsedItem`]).
+//!
+//! # The inventory in the record
+//!
+//! The stored inventory is part of the same record, so every write carries it over: the record is built
+//! from the numbers ([`Progress::to_record`], which has none) and then given the inventory the stored
+//! record had, changed by the payment. A record with no inventory (`None`: an account of an older build,
+//! or one that has never held anything) stays without one unless the payment is about items; the first
+//! payment that is gives it the game's starting stock with the change applied (`inventory`: the same
+//! rule the world's mirror follows, which is what keeps the two equal).
 //!
 //! The queue is unbounded on purpose: a payment is a few dozen bytes, there is one per member per won
-//! battle, and the world, which sends them under its lock, can neither wait for room nor drop one.
+//! battle (and one per item used), and the world, which sends them under its lock, can neither wait for
+//! room nor drop one.
 //!
 //! # Shutdown
 //!
@@ -36,19 +47,48 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
+use crate::inventory::{Change, Inventory};
 use crate::progress::{self, Progress};
 
 /// How long to wait before each further attempt at a write that failed with an I/O error.
 const RETRY_WAITS: [Duration; 2] = [Duration::from_millis(250), Duration::from_secs(1)];
 
-/// One payment to save: `reward` goes to `account`, who fought as `character`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// One payment to save: a change to the record of `account`, who fought as `character`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SaveJob {
     pub account: AccountId,
     /// The character that fought: a record that does not exist yet starts as this one, and the stored
     /// record follows it (see `progress`: a look changes who the account plays).
     pub character: u8,
-    pub reward: BattleReward,
+    pub change: SavedChange,
+}
+
+/// What a [`SaveJob`] changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SavedChange {
+    /// What a won battle paid: experience, gil, AP and the items it dropped to this account.
+    Reward(BattleReward),
+    /// One item the account used in a battle (taken out of the stored inventory).
+    UsedItem(u16),
+}
+
+impl SaveJob {
+    pub(crate) fn reward(account: AccountId, character: u8, reward: BattleReward) -> Self {
+        Self { account, character, change: SavedChange::Reward(reward) }
+    }
+
+    pub(crate) fn used_item(account: AccountId, character: u8, item: u16) -> Self {
+        Self { account, character, change: SavedChange::UsedItem(item) }
+    }
+
+    /// The payment of a reward job.
+    #[cfg(test)]
+    pub(crate) fn paid(&self) -> Option<&BattleReward> {
+        match &self.change {
+            SavedChange::Reward(reward) => Some(reward),
+            SavedChange::UsedItem(_) => None,
+        }
+    }
 }
 
 /// What the saver's queue carries.
@@ -115,23 +155,48 @@ impl Saver {
     }
 }
 
+/// What [`persist`] stored: the progress as it is now and how many items the inventory holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Saved {
+    pub progress: Progress,
+    pub items: u32,
+}
+
 /// Apply one payment to the stored record of `job.account` (creating it from a fresh start if there is
 /// none), as one atomic step, and return what is stored now. Blocking: run it off the executor.
-pub(crate) fn persist(store: &Store, game: GameId, rules: &dyn BattleRules, job: &SaveJob, now: u64) -> Result<Progress, PersistError> {
+pub(crate) fn persist(store: &Store, game: GameId, rules: &dyn BattleRules, job: &SaveJob, now: u64) -> Result<Saved, PersistError> {
+    let mut items = 0u32;
     let record = store.update_character_progress(job.account, game, |current| {
-        let mut progress = match current {
-            Some(record) => Progress::from_record(&record),
-            None => progress::fresh(rules, job.character),
+        let (mut progress, stored) = match current {
+            Some(record) => (Progress::from_record(&record), record.inventory),
+            None => (progress::fresh(rules, job.character), None),
         };
         // The same steps the world takes for a player that joins and then wins (`progress::resolve`,
-        // `progress::apply_reward`), so the mirror and the store agree (the store is the authority; see
-        // the `progress` module docs for the one case in which the mirror lags it).
+        // `progress::apply_reward`, `Inventory::resolve`, `Inventory::apply`), so the mirror and the store
+        // agree (the store is the authority; see the `progress` module docs for the one case in which the
+        // mirror lags it).
         progress.character = job.character;
         progress::clamp(rules.progress_limits(), &mut progress);
-        progress::apply_reward(rules, &mut progress, &job.reward);
-        progress.to_record(job.account, game, now)
+        let max_stack = rules.max_item_stack();
+        let mut inventory = Inventory::resolve(rules, stored.as_deref());
+        let about_items = match &job.change {
+            SavedChange::Reward(reward) => {
+                progress::apply_reward(rules, &mut progress, reward);
+                inventory.apply(&Change::Found(reward.items.clone()), max_stack);
+                !reward.items.is_empty()
+            }
+            SavedChange::UsedItem(item) => {
+                inventory.apply(&Change::Used(*item), max_stack);
+                true
+            }
+        };
+        items = inventory.total();
+        let mut record = progress.to_record(job.account, game, now);
+        // An inventory that was stored stays stored; one that was not appears with the first change to it.
+        record.inventory = (stored.is_some() || about_items).then(|| inventory.entries().to_vec());
+        record
     })?;
-    Ok(Progress::from_record(&record))
+    Ok(Saved { progress: Progress::from_record(&record), items })
 }
 
 fn unix_now() -> u64 {
@@ -159,14 +224,14 @@ async fn save_one(store: &Arc<Store>, game: GameId, rules: &Arc<dyn BattleRules>
     let mut waits = RETRY_WAITS.into_iter();
     let mut attempt = 1u32;
     loop {
-        let (store, rules) = (Arc::clone(store), Arc::clone(rules));
-        let result = tokio::task::spawn_blocking(move || persist(&store, game, rules.as_ref(), &job, unix_now())).await;
+        let (store, rules, attempt_job) = (Arc::clone(store), Arc::clone(rules), job.clone());
+        let result = tokio::task::spawn_blocking(move || persist(&store, game, rules.as_ref(), &attempt_job, unix_now())).await;
         let failure = match result {
             Ok(Ok(saved)) => {
-                // `key=value` layout: `scripts/battle-smoke.sh --progress` reads it.
+                // `key=value` layout: `scripts/battle-smoke.sh --progress` reads it (new keys at the end).
                 info!(
-                    "progress saved account={} character={} level={} exp={} gil={} ap={}",
-                    job.account.0, saved.character, saved.level, saved.exp, saved.gil, saved.ap
+                    "progress saved account={} character={} level={} exp={} gil={} ap={} items={}",
+                    job.account.0, saved.progress.character, saved.progress.level, saved.progress.exp, saved.progress.gil, saved.progress.ap, saved.items
                 );
                 return;
             }
@@ -184,8 +249,8 @@ async fn save_one(store: &Arc<Store>, game: GameId, rules: &Arc<dyn BattleRules>
             }
             _ => {
                 error!(
-                    "character progress NOT SAVED (the player has it, the store does not): account={} character={} exp={} gil={} ap={} error={failure}",
-                    job.account.0, job.character, job.reward.exp, job.reward.gil, job.reward.ap
+                    "character progress NOT SAVED (the player has it, the store does not): account={} character={} change={:?} error={failure}",
+                    job.account.0, job.character, job.change
                 );
                 return;
             }
@@ -213,7 +278,12 @@ mod tests {
     }
 
     fn job(account: AccountId, character: u8, exp: u32, gil: u32, ap: u32) -> SaveJob {
-        SaveJob { account, character, reward: BattleReward { account, exp, gil, ap } }
+        SaveJob::reward(account, character, BattleReward::new(account, exp, gil, ap))
+    }
+
+    /// What [`persist`] left of the progress (most tests are about the numbers only).
+    fn persist_progress(store: &Store, game: GameId, rules: &dyn BattleRules, job: &SaveJob, now: u64) -> Result<Progress, PersistError> {
+        persist(store, game, rules, job, now).map(|saved| saved.progress)
     }
 
     fn stored(store: &Store, account: AccountId) -> Option<Progress> {
@@ -227,14 +297,14 @@ mod tests {
         assert_eq!(stored(&store, account), None, "nothing is written until the first payment");
 
         // A fresh Cloud is level 5 with 40 experience; 12 more is 52, no level.
-        let saved = persist(&store, GameId::Ff7, rules.as_ref(), &job(account, 0, 12, 20, 2), NOW).unwrap();
+        let saved = persist_progress(&store, GameId::Ff7, rules.as_ref(), &job(account, 0, 12, 20, 2), NOW).unwrap();
         assert_eq!(saved, Progress { character: 0, level: 5, exp: 52, ap: 2, gil: 20 });
         assert_eq!(stored(&store, account), Some(saved));
         let record = store.get_character_progress(account, GameId::Ff7).unwrap().unwrap();
         assert_eq!((record.updated_at, record.account_id, record.game), (NOW, account, GameId::Ff7));
 
         // 52 + 24 = 76: level 6 (60). The next payment starts from what is stored.
-        let saved = persist(&store, GameId::Ff7, rules.as_ref(), &job(account, 0, 24, 40, 4), NOW + 1).unwrap();
+        let saved = persist_progress(&store, GameId::Ff7, rules.as_ref(), &job(account, 0, 24, 40, 4), NOW + 1).unwrap();
         assert_eq!(saved, Progress { character: 0, level: 6, exp: 76, ap: 6, gil: 60 });
         assert_eq!(store.get_character_progress(account, GameId::Ff7).unwrap().unwrap().updated_at, NOW + 1);
     }
@@ -243,9 +313,9 @@ mod tests {
     fn the_stored_record_follows_the_character_that_fought_and_keeps_what_was_earned() {
         let (_dir, store, account) = store();
         let rules = rules();
-        persist(&store, GameId::Ff7, rules.as_ref(), &job(account, 0, 30, 10, 1), NOW).unwrap();
+        persist_progress(&store, GameId::Ff7, rules.as_ref(), &job(account, 0, 30, 10, 1), NOW).unwrap();
         // The account's look changed to Tifa (2): she carries the level and the totals over.
-        let saved = persist(&store, GameId::Ff7, rules.as_ref(), &job(account, 2, 1, 0, 0), NOW).unwrap();
+        let saved = persist_progress(&store, GameId::Ff7, rules.as_ref(), &job(account, 2, 1, 0, 0), NOW).unwrap();
         assert_eq!(saved, Progress { character: 2, level: 6, exp: 71, ap: 1, gil: 10 }, "40 + 30 + 1 is level 6");
     }
 
@@ -257,7 +327,7 @@ mod tests {
         // A hand-edited record far outside the caps (the store has no opinion on them).
         let wild = Progress { character: 0, level: 250, exp: u32::MAX, ap: u32::MAX, gil: u32::MAX };
         store.put_character_progress(&wild.to_record(account, GameId::Ff7, NOW)).unwrap();
-        let saved = persist(&store, GameId::Ff7, rules.as_ref(), &job(account, 0, 5, 5, 5), NOW).unwrap();
+        let saved = persist_progress(&store, GameId::Ff7, rules.as_ref(), &job(account, 0, 5, 5, 5), NOW).unwrap();
         assert_eq!(
             saved,
             Progress { character: 0, level: limits.max_level, exp: limits.max_exp, ap: limits.max_ap, gil: limits.max_gil }
@@ -268,7 +338,7 @@ mod tests {
     fn a_payment_for_an_account_that_does_not_exist_is_an_error_and_writes_nothing() {
         let (dir, store, _account) = store();
         let ghost = AccountId(77);
-        let err = persist(&store, GameId::Ff7, rules().as_ref(), &job(ghost, 0, 1, 1, 1), NOW).unwrap_err();
+        let err = persist_progress(&store, GameId::Ff7, rules().as_ref(), &job(ghost, 0, 1, 1, 1), NOW).unwrap_err();
         assert!(matches!(err, PersistError::UnknownAccount(_)), "{err}");
         assert!(!is_transient(&err), "waiting does not create an account");
         assert!(!dir.path().join("state").join("progression").join("77").exists());
@@ -281,7 +351,7 @@ mod tests {
     fn the_mirror_and_the_store_agree_after_every_payment() {
         let (_dir, store, account) = store();
         let rules = rules();
-        let mut mirror = progress::resolve(rules.as_ref(), progress::ProgressSeed { character: 3, stored: None });
+        let mut mirror = progress::resolve(rules.as_ref(), &progress::ProgressSeed::of(3, None));
         let mut x = 0x2545_F491_4F6C_DD1Du64;
         let mut next = move |n: u32| {
             x ^= x << 13;
@@ -290,13 +360,130 @@ mod tests {
             (x % u64::from(n)) as u32
         };
         for step in 0..300 {
-            let reward = BattleReward { account, exp: next(90), gil: next(40), ap: next(6) };
+            let reward = BattleReward::new(account, next(90), next(40), next(6));
             let leveled = progress::apply_reward(rules.as_ref(), &mut mirror, &reward);
-            let saved = persist(&store, GameId::Ff7, rules.as_ref(), &SaveJob { account, character: 3, reward }, NOW).unwrap();
+            let saved = persist_progress(&store, GameId::Ff7, rules.as_ref(), &SaveJob::reward(account, 3, reward), NOW).unwrap();
             assert_eq!(saved, mirror, "step {step} (leveled up in the mirror: {leveled})");
         }
         assert!(mirror.level > 5, "300 payments level a character up: {mirror:?}");
         assert_eq!(stored(&store, account), Some(mirror));
+    }
+
+    // ---- the inventory in the record ----
+
+    fn e(item: u16, count: u16) -> fmv_core::InventoryEntry {
+        fmv_core::InventoryEntry::new(item, count)
+    }
+
+    fn stored_inventory(store: &Store, account: AccountId) -> Option<Vec<fmv_core::InventoryEntry>> {
+        store.get_character_progress(account, GameId::Ff7).unwrap().and_then(|r| r.inventory)
+    }
+
+    fn drop_job(account: AccountId, items: &[fmv_core::InventoryEntry]) -> SaveJob {
+        SaveJob::reward(account, 0, BattleReward { items: items.to_vec(), ..BattleReward::new(account, 1, 0, 0) })
+    }
+
+    /// The starting stock is written into the record once, by the first change that is about items, and
+    /// from then on the record is the inventory.
+    #[test]
+    fn the_first_item_change_writes_the_starting_stock_with_the_change_applied_once() {
+        let (_dir, store, account) = store();
+        let rules = rules();
+        // A payment of numbers only writes no inventory: the account has none to speak of yet.
+        let saved = persist(&store, GameId::Ff7, rules.as_ref(), &job(account, 0, 12, 20, 2), NOW).unwrap();
+        assert_eq!(stored_inventory(&store, account), None);
+        assert_eq!(saved.items, 5, "the mirror's stock (3 Potions, an Ether, a Phoenix Down) is what it counts");
+        // Using a Potion writes the stock minus one: Potion x2, Ether x1, Phoenix Down x1.
+        let saved = persist(&store, GameId::Ff7, rules.as_ref(), &SaveJob::used_item(account, 0, 0), NOW).unwrap();
+        assert_eq!(stored_inventory(&store, account), Some(vec![e(0, 2), e(3, 1), e(7, 1)]));
+        assert_eq!(saved.items, 4);
+        // The numbers of the first payment are still there (an item job pays nothing).
+        assert_eq!(stored(&store, account), Some(Progress { character: 0, level: 5, exp: 52, ap: 2, gil: 20 }));
+        // A later payment of numbers keeps the inventory exactly as it is (it is stored now).
+        persist(&store, GameId::Ff7, rules.as_ref(), &job(account, 0, 1, 1, 1), NOW + 1).unwrap();
+        assert_eq!(stored_inventory(&store, account), Some(vec![e(0, 2), e(3, 1), e(7, 1)]));
+        // Drops add (a new item, and more of one held; a stack stops at the cap).
+        persist(&store, GameId::Ff7, rules.as_ref(), &drop_job(account, &[e(1, 2), e(0, 200)]), NOW + 2).unwrap();
+        assert_eq!(stored_inventory(&store, account), Some(vec![e(0, 99), e(1, 2), e(3, 1), e(7, 1)]));
+        // The last of an item takes the stack away; using what is not there changes nothing.
+        persist(&store, GameId::Ff7, rules.as_ref(), &SaveJob::used_item(account, 0, 7), NOW + 3).unwrap();
+        persist(&store, GameId::Ff7, rules.as_ref(), &SaveJob::used_item(account, 0, 7), NOW + 4).unwrap();
+        assert_eq!(stored_inventory(&store, account), Some(vec![e(0, 99), e(1, 2), e(3, 1)]));
+    }
+
+    /// The old v5 records have no inventory: a battle's payment must neither invent one nor lose one that
+    /// exists (the record is replaced as a whole on every payment).
+    #[test]
+    fn a_payment_neither_invents_an_inventory_nor_loses_the_one_the_record_has() {
+        let (_dir, store, account) = store();
+        let rules = rules();
+        // A record of the previous version: numbers, no inventory.
+        let old = Progress { character: 0, level: 5, exp: 40, ap: 0, gil: 0 }.to_record(account, GameId::Ff7, NOW);
+        assert_eq!(old.inventory, None);
+        store.put_character_progress(&old).unwrap();
+        persist(&store, GameId::Ff7, rules.as_ref(), &job(account, 0, 12, 20, 2), NOW).unwrap();
+        assert_eq!(stored_inventory(&store, account), None, "still a record of the old shape");
+
+        // A record with an inventory, even an empty one, keeps it through payments.
+        let mut with = store.get_character_progress(account, GameId::Ff7).unwrap().unwrap();
+        with.inventory = Some(vec![]);
+        store.put_character_progress(&with).unwrap();
+        persist(&store, GameId::Ff7, rules.as_ref(), &job(account, 0, 5, 5, 5), NOW + 1).unwrap();
+        assert_eq!(stored_inventory(&store, account), Some(vec![]), "an empty inventory stays empty: the stock is given once");
+        let mut with = store.get_character_progress(account, GameId::Ff7).unwrap().unwrap();
+        with.inventory = Some(vec![e(2, 7), e(9, 1)]);
+        store.put_character_progress(&with).unwrap();
+        for i in 0..3 {
+            persist(&store, GameId::Ff7, rules.as_ref(), &job(account, 0, 5, 5, 5), NOW + 2 + i).unwrap();
+        }
+        assert_eq!(stored_inventory(&store, account), Some(vec![e(2, 7), e(9, 1)]));
+    }
+
+    /// What is stored is not trusted: a hostile inventory is brought inside the rules by the first change
+    /// (the store only checks what is true of every game).
+    #[test]
+    fn a_stored_inventory_outside_the_rules_is_brought_inside_by_the_next_change() {
+        let (_dir, store, account) = store();
+        let rules = rules();
+        let mut wild = Progress { character: 0, level: 5, exp: 40, ap: 0, gil: 0 }.to_record(account, GameId::Ff7, NOW);
+        wild.inventory = Some(vec![e(5, 60_000), e(2, 3)]);
+        store.put_character_progress(&wild).unwrap();
+        persist(&store, GameId::Ff7, rules.as_ref(), &SaveJob::used_item(account, 0, 2), NOW).unwrap();
+        assert_eq!(stored_inventory(&store, account), Some(vec![e(2, 2), e(5, 99)]));
+    }
+
+    /// The mirror (what the world keeps as items are used and found) and the store (what the saver keeps)
+    /// are two computations of one thing, like the numbers: for any changes in any order they agree.
+    #[test]
+    fn the_mirror_and_the_store_agree_on_the_inventory_after_every_change() {
+        let (_dir, store, account) = store();
+        let rules = rules();
+        let max_stack = rules.max_item_stack();
+        let mut mirror = Inventory::resolve(rules.as_ref(), None);
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        for step in 0..400 {
+            let job = if next(3) == 0 {
+                let item = next(12) as u16;
+                mirror.apply(&Change::Used(item), max_stack);
+                SaveJob::used_item(account, 0, item)
+            } else {
+                let found: Vec<fmv_core::InventoryEntry> = (0..next(4)).map(|_| e(next(12) as u16, 1 + next(40) as u16)).collect();
+                let reward = BattleReward { items: found.clone(), ..BattleReward::new(account, next(20) as u32, 0, 0) };
+                mirror.apply(&Change::Found(found), max_stack);
+                SaveJob::reward(account, 0, reward)
+            };
+            let saved = persist(&store, GameId::Ff7, rules.as_ref(), &job, NOW).unwrap();
+            assert_eq!(saved.items, mirror.total(), "step {step}");
+            // The stored inventory, once there is one, is the mirror (before that, the stock is).
+            let stored = stored_inventory(&store, account);
+            assert_eq!(Inventory::resolve(rules.as_ref(), stored.as_deref()), mirror, "step {step}");
+        }
     }
 
     /// Everything queued before the stop marker is saved, in order, before `shutdown` returns, and

@@ -826,7 +826,7 @@ pub const DEFAULT_LEVEL: u8 = 5;
 /// loses), `3` like `0` but with a preemptive layout, `4` one brute that kills a hero per hit (the
 /// party usually wins, with losses). Any `character` below 9 is a fighter whose strength grows
 /// with its level, who knows Cure (spell 0, 5 MP), Life (spell 7, 34 MP) and Fire (spell 27, 4 MP), and
-/// whose battles accept Potion (item 0), Ether (item 3) and Phoenix Down (item 7). A new account starts
+/// whose battles accept Potion (item 0), Ether (item 3), Phoenix Down (item 7) and Grenade (item 20). A new account starts
 /// with 3 Potions, 1 Ether and 1 Phoenix Down; a won battle drops [`SyntheticRules::drop_item`], one per
 /// enemy, if it is set. The enemies only ever attack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -847,12 +847,14 @@ impl SyntheticRules {
     /// The fingerprint every synthetic rule set reports.
     pub const FINGERPRINT: Fingerprint = Fingerprint([0x5a; 32]);
 
-    /// The items of a synthetic battle: Potion (0), Ether (3), Phoenix Down (7).
+    /// The items of a synthetic battle: Potion (0), Ether (3), Phoenix Down (7) and Grenade (20, hurts an
+    /// enemy for about `512 * 10 / 32` = 160).
     pub fn item_table() -> Arc<ItemTable> {
         Arc::new(ItemTable::new([
             (0, ItemData::new(ActionSpec::flat_restore_item(5, false))),
             (3, ItemData::new(ActionSpec::flat_restore_item(5, true))),
             (7, ItemData::new(ActionSpec::revive_spell(8, 0))),
+            (20, ItemData::new(ActionSpec::damage_item(10, element::SHOOT))),
         ]))
     }
 
@@ -1262,7 +1264,7 @@ mod tests {
         assert_eq!(spells.iter().map(|s| (s.spell, s.mp_cost, s.targets_allies)).collect::<Vec<_>>(), [(0, 5, true), (7, 34, true), (27, 4, false)]);
         assert_eq!(state.actor(ActorId(1)).unwrap().max_mp, 60);
         assert!(state.spells_for(ActorId(2)).is_empty());
-        for item in [0u16, 3, 7] {
+        for item in [0u16, 3, 7, 20] {
             assert!(state.item_info(item).is_some(), "item {item}");
         }
         assert!(state.item_info(1).is_none());

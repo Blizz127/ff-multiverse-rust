@@ -94,6 +94,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, watch};
 
 use crate::deferred::{DeferredLogs, Line};
+use crate::inventory::Inventory;
 use crate::progress::{self, Progress, ProgressSeed};
 use crate::saver::SaverHandle;
 use crate::ServerError;
@@ -212,6 +213,9 @@ struct Player {
     /// What this player's character has earned (the mirror of its stored character progress; see
     /// `progress`). `None` on a server that runs no battles.
     progress: Option<Progress>,
+    /// What this player carries (the mirror of its stored inventory; see `inventory`). `None` on a server
+    /// that runs no battles.
+    inventory: Option<Inventory>,
     /// Horizontal distance walked since the last random-encounter roll.
     walked: f64,
     /// The area the player stands in (a key of `World::areas`). While the player is in transit it
@@ -394,8 +398,10 @@ impl World {
         let pos = self.areas.get_mut(&home).map_or_else(Pos::default, areas::AreaState::next_spawn_point);
         let entity = new.entity;
         let account = new.account;
-        // Only a server that runs battles has characters to level (see `progress`).
-        let progress = self.battle.as_ref().map(|bw| progress::resolve(bw.rules(), new.progress));
+        // Only a server that runs battles has characters to level and items to carry (see `progress`,
+        // `inventory`).
+        let progress = self.battle.as_ref().map(|bw| progress::resolve(bw.rules(), &new.progress));
+        let inventory = self.battle.as_ref().map(|bw| Inventory::resolve(bw.rules(), new.progress.inventory.as_deref()));
         let snapshot = EntitySnapshot { id: entity, pos, facing: 0.0, anim: AnimState::Idle, avatar: new.avatar };
         self.players.insert(
             entity,
@@ -413,6 +419,7 @@ impl World {
                 placement: None,
                 battle: None,
                 progress,
+                inventory,
                 walked: 0.0,
                 area: home,
                 transit: None,
@@ -421,11 +428,12 @@ impl World {
         self.by_account.insert(account, entity);
 
         // The snapshot to the joiner, `PlayerJoined` to the others of the area, then the joiner's
-        // first placement (a solo player is placed by its own phase) and, third, where its character
-        // stands.
+        // first placement (a solo player is placed by its own phase), third, where its character
+        // stands and, fourth, what it carries.
         let mut failed = Vec::new();
         self.announce_entry(entity, &mut failed);
         self.tell_progress(entity, false, &mut failed);
+        self.tell_inventory(entity, &mut failed);
         self.drop_failed(failed);
         Ok(pos)
     }
