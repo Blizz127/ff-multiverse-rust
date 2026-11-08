@@ -1,0 +1,19 @@
+[package]
+name = "fmv-persist"
+description = "Server-side persistence for FF Multiverse: accounts, avatar profiles and per-game progression in an atomic file-based store. References only, never asset bytes."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+fmv-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+blake3.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
