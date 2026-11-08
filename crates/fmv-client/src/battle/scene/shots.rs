@@ -21,7 +21,7 @@
 use super::*;
 use crate::avatar::library::tests::Counting;
 use crate::avatar::source::LgpLoader;
-use crate::battle::scene::model::{BattleActorModel, BattleModelSource, EnemyLook, PartyLook, StandInModels};
+use crate::battle::scene::model::{ArchiveModels, BattleActorModel, BattleModelSource, EnemyLook, PartyLook, StandInModels};
 use crate::battle::view::BAND_VERIFIED_RGB;
 use crate::battle::{draw_battle_overlay, BattleClient};
 use crate::ui::draw::DrawList;
@@ -292,25 +292,29 @@ fn offscreen_synthetic_battle_with_a_location_model() {
 struct Real {
     rules: Arc<dyn BattleRules>,
     char_lgp: PathBuf,
+    /// The battle model archive, when this machine has one (the models of the picture are real then).
+    battle_lgp: Option<PathBuf>,
 }
 
 /// `FMV_FF7_DATA` (the game's `data/`: `lang-en/battle/scene.bin`, `lang-en/kernel/kernel.bin` or the
-/// classic layout, and `field/char.lgp`), else `FMV_FF7_LIBRARY` (the state directory of the
-/// imported library, read-only). `None` (with a note) when neither is set.
+/// classic layout, `field/char.lgp` and `battle/battle.lgp`), else `FMV_FF7_LIBRARY` (the state
+/// directory of the imported library, read-only). `None` (with a note) when neither is set.
 fn open_real() -> Option<Real> {
     if let Some(data) = std::env::var_os("FMV_FF7_DATA").map(PathBuf::from) {
         let first = |paths: &[&str]| paths.iter().map(|p| data.join(p)).find(|p| p.is_file());
         let scene = first(&["lang-en/battle/scene.bin", "battle/scene.bin"]).expect("scene.bin under FMV_FF7_DATA");
         let kernel = first(&["lang-en/kernel/kernel.bin", "kernel/KERNEL.BIN", "kernel/kernel.bin"]).expect("kernel.bin under FMV_FF7_DATA");
         let char_lgp = first(&["field/char.lgp", "field/CHAR.LGP"]).expect("char.lgp under FMV_FF7_DATA");
+        let battle_lgp = first(&["battle/battle.lgp", "battle/BATTLE.LGP"]);
         let rules: Arc<dyn BattleRules> = Arc::new(Ff7BattleData::open(&scene, &kernel).expect("the battle data opens"));
-        return Some(Real { rules, char_lgp });
+        return Some(Real { rules, char_lgp, battle_lgp });
     }
     if let Some(dir) = std::env::var_os("FMV_FF7_LIBRARY") {
         let source = crate::ff7::Ff7Source::Library { state_dir: Some(dir.into()), set: None };
         let (rules, _) = crate::battle::open_rules(&source).expect("the battle data opens");
         let char_lgp = crate::ff7::resolve_char_lgp(&source).expect("looked for").expect("a char.lgp");
-        return Some(Real { rules, char_lgp });
+        let battle_lgp = crate::ff7::resolve_battle_lgp(&source).expect("looked for");
+        return Some(Real { rules, char_lgp, battle_lgp });
     }
     eprintln!("skipped: neither FMV_FF7_DATA nor FMV_FF7_LIBRARY is set");
     None
@@ -347,9 +351,37 @@ fn offscreen_real_ff7_battle_formation() {
     assert!(client.in_battle());
     let start = client.scene_start().expect("a battle to draw");
     assert_eq!(start.formation.as_ref(), Some(&placement));
-    let mut kit = ModelKit::new(Box::new(StandInModels), Some(Box::new(LgpLoader::new(&real.char_lgp))));
+    // The real battle models of the owner's own battle.lgp when it is there (as the window has them),
+    // the stand-ins otherwise.
+    let source: Box<dyn BattleModelSource> = match &real.battle_lgp {
+        Some(path) => Box::new(ArchiveModels::open(path).expect("battle.lgp opens")),
+        None => Box::new(StandInModels),
+    };
+    let mut kit = ModelKit::new(source, Some(Box::new(LgpLoader::new(&real.char_lgp))));
     let looks = [None, None, None];
     let mut scene = BattleScene::new(&start, client.engine(), &looks, &mut kit).expect("a scene");
+    if real.battle_lgp.is_some() {
+        // Who is a real battle model: scale 1 (battle units), a heads-and-shoulders taller than the
+        // old stand-ins' boxes or field models, enemies carrying their weapons, and the location.
+        for (i, actor) in scene.actors.iter().enumerate() {
+            let r = &actor.rig;
+            eprintln!(
+                "actor {i} ({:?}): scale {}, height {:.0}, radius {:.0}, {} attachment(s), idle {}",
+                actor.side,
+                r.scale,
+                r.height,
+                r.radius,
+                r.attachments.len(),
+                if r.procedural_idle { "swayed (a still pose)" } else { "plays the clip" }
+            );
+            assert_eq!(r.scale, 1.0, "actor {i} is a battle model in battle units, not a stand-in");
+            assert!(r.height > 600.0 && r.height < 1300.0, "actor {i}: {}", r.height);
+            assert!(!r.procedural_idle, "actor {i}'s idle loop is the archive's clip");
+        }
+        let weapons = scene.actors.iter().filter(|a| !a.rig.attachments.is_empty()).count();
+        assert!(weapons >= 1, "somebody carries a weapon (the party's swords and guns, the MP's baton)");
+        assert!(scene.location.is_some(), "the formation's battle location is the real model");
+    }
     let battle_view = |client: &BattleClient, now: f64| client.view(now).expect("a view");
 
     // 1. The picture of a battle that has just begun, at three window sizes.

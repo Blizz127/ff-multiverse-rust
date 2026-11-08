@@ -13,7 +13,8 @@
 //!   lens that fits everyone in the window at any aspect ratio.
 //! * [`layout`]: who stands where: the enemies from the formation, the party opposite them.
 //! * [`model`]: where each actor's model comes from ([`BattleActorModel`]: a field model, a real
-//!   battle model, or a box) and who decides ([`BattleModelSource`]). Stand-ins today.
+//!   battle model, or a box) and who decides ([`BattleModelSource`]): the real models of the
+//!   machine's own `battle.lgp` when the client found one ([`model::ArchiveModels`]), stand-ins otherwise.
 //! * [`motion`]: what the actors do with time: lunges, flinches, dodges, deaths.
 //! * [`stage`]: the stand-in location: sky, haze, a round tiled floor. A real location model, when
 //!   the [`BattleModelSource`] has one, replaces its floor (and is cut to the camera first, see
@@ -77,6 +78,9 @@ use std::sync::{Arc, OnceLock};
 const DEFAULT_POSE: (V3, V3) = ([12_000.0, -3_600.0, 7_000.0], [0.0, -300.0, -200.0]);
 /// Where the camera of last resort stands relative to the middle of the cast.
 const AUTO_OFFSET: V3 = [12_000.0, -3_600.0, 4_500.0];
+/// Seconds of the idle loop between one actor and the next (a real model plays its own loop; two
+/// of one kind would otherwise move as one).
+const IDLE_PHASE_STEP: f32 = 0.37;
 /// How much bigger than its model the shadow under an actor is.
 const SHADOW_RATIO: f32 = 1.15;
 /// The rings under a party member, as multiples of its model's radius (inner, outer). The ground is
@@ -432,12 +436,15 @@ impl BattleScene {
             if !motion.visible {
                 continue;
             }
-            let Some(pose) = actor.rig.idle_pose(self.now as f32) else { continue };
+            // Each actor is at its own point of the idle loop, so that two of one kind (two MPs) do not
+            // breathe in step.
+            let phase = self.now as f32 + i as f32 * IDLE_PHASE_STEP;
+            let Some(pose) = actor.rig.idle_pose(phase) else { continue };
             let mut positions = Vec::new();
             if skin(&actor.rig.asset, &pose, &place, &camera_matrix, &mut positions) {
                 models.push(SkinnedModel { asset: Arc::clone(&actor.rig.asset), positions });
                 // A weapon moves with its owner: the same placement, the same frame.
-                for (asset, pose) in actor.rig.attachment_poses(self.now as f32) {
+                for (asset, pose) in actor.rig.attachment_poses(phase) {
                     let mut positions = Vec::new();
                     if skin(asset, &pose, &place, &camera_matrix, &mut positions) {
                         models.push(SkinnedModel { asset: Arc::clone(asset), positions });
