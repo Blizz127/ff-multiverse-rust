@@ -13,8 +13,9 @@
 //!
 //! # Rules of the field while a battle runs
 //!
-//! * A battle starts for the requester's whole party (the members that are in the area and in no
-//!   battle yet) or for the requester alone. Member `i` (ascending entity id, the requester
+//! * A battle starts for the requester's whole party (the members that are in the requester's area,
+//!   not between two areas, and in no battle yet) or for the requester alone. A party member who is
+//!   in another area is not pulled in, and a player in a battle cannot travel. Member `i` (ascending entity id, the requester
 //!   included) fights as `ActorId(i)`, as the `i`-th character of the fixed order Cloud, Barret,
 //!   Tifa, Aerith, Red XIII, Yuffie, Cait Sith, Vincent, Cid: accounts have no character of their
 //!   own yet (that needs per-account progression), so this is the interim rule.
@@ -35,9 +36,10 @@
 //!
 //! # Random encounters
 //!
-//! In an area whose `AreaRuntime::encounters()` is a non-empty table, every `encounter_step_units`
-//! of horizontal distance a player moves is one roll: it triggers with probability `rate / 1024`
-//! and then picks a formation by the table's weights. APPROXIMATION: this is not FF7's own step
+//! In an area whose `AreaRuntime::encounters()` is a non-empty table (each loaded area has its own,
+//! read when it is loaded), every `encounter_step_units` of horizontal distance a player moves in
+//! it is one roll: it triggers with probability `rate / 1024` and then picks a formation by the
+//! table's weights. APPROXIMATION: this is not FF7's own step
 //! counter, only a rate knob over the same table. By default a step is the area's `max_speed`
 //! (one roll per second of walking at full speed, so the table's rate 128 means roughly one battle
 //! per eight seconds of full-speed walking); `random_encounters: false` switches the rolls off.
@@ -53,7 +55,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use fmv_adapter_api::EncounterTable;
+use fmv_adapter_api::{AreaRuntime, EncounterTable};
 use fmv_core::EntityId;
 use fmv_ff7_battle::rng::Rng;
 use fmv_ff7_battle::rules::{ActorId, BattleState, Command, CommandError, Outcome, MAX_STEP_MS};
@@ -131,22 +133,32 @@ impl Battle {
 pub(super) struct BattleWorld {
     settings: BattleSettings,
     debug_encounters: bool,
-    /// The area's random encounters, when it has any and they are on.
-    encounters: Option<EncounterTable>,
-    /// Horizontal distance between two random-encounter rolls.
-    step: f64,
     battles: BTreeMap<BattleId, Battle>,
     next_id: u64,
     /// Seeds, random-encounter rolls and weighted formation picks.
     rng: Rng,
 }
 
+/// An area's random encounters as they run here: its table (only a table that can trigger at all,
+/// and only when random encounters are on) and the distance between two rolls.
+#[derive(Debug, Clone)]
+pub(super) struct AreaEncounters {
+    pub table: EncounterTable,
+    /// Horizontal distance between two random-encounter rolls.
+    pub step: f64,
+}
+
 impl BattleWorld {
-    pub(super) fn new(settings: BattleSettings, debug_encounters: bool, encounters: Option<EncounterTable>, max_speed: f32) -> Self {
+    pub(super) fn new(settings: BattleSettings, debug_encounters: bool) -> Self {
         let rng = Rng::new(settings.fixed_seed.unwrap_or_else(fresh_seed));
-        let step = f64::from(settings.encounter_step_units.unwrap_or(max_speed)).max(1.0);
-        let encounters = encounters.filter(|t| settings.random_encounters && !t.is_empty());
-        Self { settings, debug_encounters, encounters, step, battles: BTreeMap::new(), next_id: 1, rng }
+        Self { settings, debug_encounters, battles: BTreeMap::new(), next_id: 1, rng }
+    }
+
+    /// The random encounters of `area` under these settings (`None`: it rolls none).
+    pub(super) fn area_encounters(&self, area: &dyn AreaRuntime) -> Option<AreaEncounters> {
+        let table = area.encounters().filter(|t| self.settings.random_encounters && !t.is_empty())?;
+        let step = f64::from(self.settings.encounter_step_units.unwrap_or_else(|| area.max_speed())).max(1.0);
+        Some(AreaEncounters { table, step })
     }
 
     /// The seed of the next battle.
@@ -154,19 +166,19 @@ impl BattleWorld {
         self.settings.fixed_seed.unwrap_or_else(|| (u64::from(self.rng.next_u32()) << 32) | u64::from(self.rng.next_u32()))
     }
 
-    /// A weighted pick from the area's table, if it has one.
-    fn pick_from_table(&mut self) -> Option<u16> {
-        let total = self.encounters.as_ref()?.total_weight();
+    /// A weighted pick from `table`.
+    fn pick_from(&mut self, table: &EncounterTable) -> Option<u16> {
+        let total = table.total_weight();
         let roll = self.rng.below(total);
-        self.encounters.as_ref()?.pick(roll)
+        table.pick(roll)
     }
 
-    /// The formation for a debug request that names none: the operator's choice, else the area's
-    /// table, else the rules' default.
-    fn default_formation(&mut self) -> Option<u16> {
+    /// The formation for a debug request that names none: the operator's choice, else a pick from
+    /// the area's table, else the rules' default.
+    fn default_formation(&mut self, table: Option<&EncounterTable>) -> Option<u16> {
         self.settings
             .debug_formation
-            .or_else(|| self.pick_from_table())
+            .or_else(|| table.and_then(|t| self.pick_from(t)))
             .or_else(|| self.settings.rules.default_formation())
     }
 }
@@ -200,11 +212,13 @@ fn rejection_of(e: CommandError) -> BattleRejection {
 
 impl World {
     /// Switch battles on (`settings` of `Some`) or leave them unsupported (`None`, every request is
-    /// refused). The area's encounter table is read here, once.
+    /// refused). The encounter table of every loaded area is read here, once; an area loaded later
+    /// reads its own when it is loaded.
     pub fn configure_battle(&mut self, settings: Option<BattleSettings>, debug_encounters: bool) {
-        let table = self.area.encounters();
-        let max_speed = self.area.max_speed();
-        self.battle = settings.map(|s| BattleWorld::new(s, debug_encounters, table, max_speed));
+        self.battle = settings.map(|s| BattleWorld::new(s, debug_encounters));
+        for area in self.areas.values_mut() {
+            area.refresh_encounters(self.battle.as_ref());
+        }
     }
 
     /// Whether this world can run battles at all.
@@ -228,16 +242,21 @@ impl World {
     /// `ClientMsg::RequestEncounter`: start a battle for `entity`'s party, if the server allows
     /// debug encounters. `formation` of `None` lets the server choose.
     pub fn request_encounter(&mut self, entity: EntityId, formation: Option<u16>, now: Instant) -> BattleReply {
-        if !self.players.contains_key(&entity) {
+        let Some(player) = self.players.get(&entity) else {
             return BattleReply::Gone;
-        }
+        };
         let Some(bw) = self.battle.as_mut() else {
             return refused(None, BattleRejection::Unsupported);
         };
         if !bw.debug_encounters {
             return refused(None, BattleRejection::DebugDisabled);
         }
-        let Some(formation) = formation.or_else(|| bw.default_formation()) else {
+        if player.transit.is_some() {
+            // Between two areas there is no field to fight in (the protocol has no sharper word).
+            return refused(None, BattleRejection::Unsupported);
+        }
+        let table = self.areas.get(&player.area).and_then(|a| a.encounters()).map(|e| &e.table);
+        let Some(formation) = formation.or_else(|| bw.default_formation(table)) else {
             return refused(None, BattleRejection::UnknownFormation);
         };
         match self.begin_battle(entity, formation, now) {
@@ -257,14 +276,20 @@ impl World {
         if player.battle.is_some() {
             return Err(BattleRejection::AlreadyInBattle);
         }
+        if player.transit.is_some() {
+            return Err(BattleRejection::Unsupported);
+        }
         let info = bw.settings.rules.formation(formation).ok_or(BattleRejection::UnknownFormation)?;
 
-        // Who fights: the requester and the rest of its party that are here and free.
+        // Who fights: the requester and the rest of its party that are here (in its area, not
+        // between two areas) and free.
         let mut others: BTreeSet<EntityId> = BTreeSet::new();
         if let Some(party) = self.parties.party_of(player.account) {
             for member in &party.members {
                 let Some(&entity) = self.by_account.get(member) else { continue };
-                if entity != requester && self.players.get(&entity).is_some_and(|p| p.battle.is_none()) {
+                if entity != requester
+                    && self.players.get(&entity).is_some_and(|p| p.battle.is_none() && p.transit.is_none() && p.area == player.area)
+                {
                     others.insert(entity);
                 }
             }
@@ -477,9 +502,11 @@ impl World {
     pub(super) fn roll_encounter(&mut self, entity: EntityId, dist: f64, now: Instant) {
         let triggered = {
             let Some(bw) = self.battle.as_mut() else { return };
-            let Some(rate) = bw.encounters.as_ref().map(|t| u32::from(t.rate)) else { return };
-            let step = bw.step;
             let Some(p) = self.players.get_mut(&entity) else { return };
+            // The table of the area the player walks in.
+            let Some(encounters) = self.areas.get(&p.area).and_then(|a| a.encounters()) else { return };
+            let rate = u32::from(encounters.table.rate);
+            let step = encounters.step;
             p.walked += dist;
             let rolls = ((p.walked / step) as u32).min(MAX_ROLLS_PER_MOVE);
             p.walked = (p.walked - f64::from(rolls) * step).clamp(0.0, step);
@@ -491,7 +518,7 @@ impl World {
                 }
             }
             if hit {
-                bw.pick_from_table()
+                bw.pick_from(&encounters.table)
             } else {
                 None
             }

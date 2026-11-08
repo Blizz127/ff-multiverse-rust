@@ -10,10 +10,18 @@
 //! character that fails to load, the player keeps the plain marker, exactly as before; FIXTURE areas
 //! always do.
 //!
+//! The area's non-player characters go through the same pipeline: each is an [`AvatarPlayer`] with
+//! [`frame::NpcRef`] (the skeleton and the standing clip its data names, see `crate::npc`), drawn
+//! standing in that clip with a shadow under it and no rings, and a marker when its model is not
+//! to be had (never the default character). The players come before them when the number of
+//! models drawn is capped, and the models are cached under the names the area gave, bounded
+//! ([`library::MAX_NPC_MODELS`]) because a server can name new ones in every area.
+//!
 //! The pieces:
 //!
 //! * [`source`]: where `char.lgp` is and the loader over it (the [`source::CharacterLoader`] seam).
-//! * [`library`]: each appearance loaded once, merged ([`mesh`]) and cached by the table's own id.
+//! * [`library`]: each appearance loaded once, merged ([`mesh`]) and cached by the table's own id;
+//!   the non-player models by the stems the area names.
 //! * [`anim`]: which clip an avatar plays (idle, walk, run) and its phase in it.
 //! * [`stage`]: the field facts models need (camera, model scale, speeds, the scenery in front).
 //! * [`frame`]: pose, place and skin the visible players into camera space, plus the ground marks

@@ -7,6 +7,8 @@
 use fmv_adapter_api::{AdapterError, AreaInfo, AreaRuntime, Bounds, GameAdapter, MoveResult};
 use fmv_core::{AreaId, EditionProvenance, Fingerprint, GameId, Platform, Pos, SourceRef};
 
+pub mod rooms;
+
 pub const FIXTURE_AREA_KEY: &str = "plaza";
 
 /// L-shaped plaza made of four triangles (two quads), units roughly match FF7 field scale.

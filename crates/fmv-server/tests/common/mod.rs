@@ -63,6 +63,19 @@ impl TestServer {
         Ok(Self { addr, stop, task })
     }
 
+    /// A server over any adapter (`config.area_key` names the entry area; a bare `ServerConfig::default()`
+    /// names the FIXTURE plaza, so say which area you mean).
+    pub async fn start_over(config: ServerConfig, adapter: Box<dyn GameAdapter>) -> Self {
+        let config = ServerConfig { bind: "127.0.0.1:0".parse().unwrap(), ..config };
+        let server = Server::bind(config, adapter).await.expect("bind");
+        let addr = server.local_addr();
+        let (stop, stopped) = oneshot::channel::<()>();
+        let task = tokio::spawn(server.serve(async move {
+            let _ = stopped.await;
+        }));
+        Self { addr, stop, task }
+    }
+
     /// Stop the server and wait until everything it held (connections, the account store and its
     /// lock) is gone.
     pub async fn shutdown(self) {

@@ -117,7 +117,7 @@ async fn serve(stream: TcpStream, on_request: OnRequest) -> Report {
     report.received.push((at, join));
     write_msg(
         &mut wr,
-        &ServerMsg::AreaSnapshot { area: info.id.clone(), tick: 1, entities: vec![entity(7, "Tester", -100.0), entity(8, "peer", 100.0)] },
+        &ServerMsg::AreaSnapshot { area: info.id.clone(), tick: 1, entities: vec![entity(7, "Tester", -100.0), entity(8, "peer", 100.0)], npcs: vec![] },
     )
     .await
     .unwrap();
@@ -227,7 +227,7 @@ fn a_bot_that_is_refused_logs_it_once_never_retries_and_exits_cleanly() {
     let (stdout, stderr) = (stdout_line(&out), String::from_utf8_lossy(&out.stderr).into_owned());
     assert!(out.status.success(), "a refused battle must not fail the bot: {:?}\n{stderr}", out.status);
     assert!(stdout.starts_with("SMOKE name=Tester area=Fixture/plaza fixture=true "), "{stdout}");
-    assert!(stdout.ends_with(" battles=0 victories=0"), "{stdout}");
+    assert!(stdout.ends_with(" battles=0 victories=0 area_changes=0"), "{stdout}");
     assert!(stderr.contains("battle: request refused: this server cannot run battles"), "{stderr}");
     assert_eq!(report.count(|m| matches!(m, ClientMsg::RequestEncounter { formation_id: None })), 1, "asked exactly once, never again");
     assert_eq!(report.count(|m| matches!(m, ClientMsg::BattleCommand { .. })), 0);
@@ -244,7 +244,7 @@ fn without_the_debug_flag_a_battle_bot_never_asks_for_a_battle() {
     let out = run_client(port, &["--duration", "3", "--bot", "idle", "--battle-auto"], state.path());
     let report = server.join().expect("fake server");
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert!(stdout_line(&out).ends_with(" battles=0 victories=0"));
+    assert!(stdout_line(&out).ends_with(" battles=0 victories=0 area_changes=0"));
     assert_eq!(report.count(|m| matches!(m, ClientMsg::RequestEncounter { .. })), 0);
     // And a client that is not a battle bot at all sends nothing about battles either.
     let state = tempfile::tempdir().unwrap();
@@ -266,7 +266,7 @@ fn a_battle_freezes_the_player_and_play_goes_on_after_it() {
     assert!(out.status.success(), "{:?}\n{stderr}", out.status);
     // No battle data on this machine (FIXTURE): the client says so, cannot replay, but is not
     // "diverged" and counts the battle and the server's victory.
-    assert!(stdout.ends_with(" battles=1 victories=1"), "{stdout}");
+    assert!(stdout.ends_with(" battles=1 victories=1 area_changes=0"), "{stdout}");
     assert!(stderr.contains("battle: battle#1 started: formation 3, party of 1, you fight as actor 0"), "{stderr}");
     assert!(stderr.contains("no battle data"), "{stderr}");
     assert!(stderr.contains("battle: battle#1 ended in Victory (you earned 5 exp, 7 gil, 1 ap); back in the field"), "{stderr}");

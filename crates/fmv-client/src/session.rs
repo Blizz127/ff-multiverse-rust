@@ -2,10 +2,12 @@
 //! headless bot loop and the window loop.
 
 use crate::battle::BattleCmd;
-use crate::net::{Joined, NetCommand, NetEvent, NetHandle, PartyCommand};
+use crate::net::{check_local_content, clean, AreaAnswer, Joined, LocalContent, NetCommand, NetEvent, NetHandle, PartyCommand};
 use crate::state::ClientState;
-use fmv_adapter_api::AreaRuntime;
-use fmv_core::{AreaId, AvatarAppearance, EntityId, EntitySnapshot, Pos};
+use fmv_adapter_api::{AreaRuntime, GameAdapter};
+use fmv_core::{AreaId, AvatarAppearance, EntityId, EntitySnapshot, Fingerprint, Pos, ProvenanceSummary};
+use fmv_protocol::ServerMsg;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// What we know about the joined area (for titles, banners and logs).
@@ -37,9 +39,31 @@ pub fn own_identity(entities: &[EntitySnapshot], entity: EntityId) -> (String, [
     }
 }
 
+/// What the server's `AreaChange` offered and this session accepted (see [`Session::take_area_change`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AreaChanged {
+    pub area: AreaId,
+    /// Where the server put us in it.
+    pub arrival: Pos,
+    /// A change to another area (not the way back after a transfer this client refused).
+    pub forward: bool,
+}
+
+/// The server's `AreaChange`, as the session receives it.
+struct AreaOffer {
+    area: AreaId,
+    display_name: String,
+    fingerprint: Fingerprint,
+    provenance: ProvenanceSummary,
+    fixture: bool,
+    arrival: Pos,
+    arrival_facing: f32,
+}
+
 pub struct Session {
     pub net: NetHandle,
     /// The area decoded from this machine's own content (used for local movement validation).
+    /// Replaced when the server moves us to another area.
     pub area: Box<dyn AreaRuntime>,
     pub state: ClientState,
     pub info: SessionInfo,
@@ -47,6 +71,12 @@ pub struct Session {
     /// The session already has to end because of a message from the handshake backlog; the first
     /// `pump` reports it.
     pending_end: Option<String>,
+    /// This machine's own game content, to check an `AreaChange` against and load the new area
+    /// from (the same content the handshake used). Without it the session cannot follow the server
+    /// to another area: it refuses (`CannotJoin`) and the server sends it back.
+    content: Option<Arc<dyn GameAdapter>>,
+    /// The last area change not yet picked up by [`Session::take_area_change`].
+    area_changed: Option<AreaChanged>,
 }
 
 impl Session {
@@ -92,7 +122,23 @@ impl Session {
             info,
             origin,
             pending_end,
+            content: None,
+            area_changed: None,
         }
+    }
+
+    /// Give the session this machine's own game content, so it can follow the server to other
+    /// areas (see the `content` field).
+    pub fn with_content(mut self, content: Arc<dyn GameAdapter>) -> Self {
+        self.content = Some(content);
+        self
+    }
+
+    /// The area change that happened since the last call, if any: the window rebuilds its view and
+    /// the headless bot its walking pattern for the new area. Several changes between two calls
+    /// are reported as the last one.
+    pub fn take_area_change(&mut self) -> Option<AreaChanged> {
+        self.area_changed.take()
     }
 
     /// Seconds since the session started (monotonic).
@@ -109,6 +155,17 @@ impl Session {
         while let Some(ev) = self.net.try_next() {
             let now = self.now();
             match ev {
+                // The server moves us to another area. Handled here and in order with everything
+                // else: the answer is sent before the snapshot of the new area can be read.
+                NetEvent::Server(ServerMsg::AreaChange {
+                    area,
+                    display_name,
+                    fingerprint,
+                    provenance,
+                    fixture,
+                    arrival,
+                    arrival_facing,
+                }) => self.on_area_change(AreaOffer { area, display_name, fingerprint, provenance, fixture, arrival, arrival_facing }),
                 NetEvent::Server(msg) => {
                     if let Some(reason) = self.state.apply(now, msg) {
                         return Some(reason);
@@ -121,6 +178,55 @@ impl Session {
             }
         }
         None
+    }
+
+    /// The server offers another area (`AreaChange`): check it against this machine's own content,
+    /// exactly like the handshake does for the first area. If we hold it, answer `JoinArea` (with our
+    /// OWN provenance), load it as the area we walk in, and tell the state; if not, answer
+    /// `CannotJoin` and stay where we are (the server sends us back with another `AreaChange`).
+    fn on_area_change(&mut self, offer: AreaOffer) {
+        let AreaOffer { area, display_name, fingerprint, provenance, fixture, arrival, arrival_facing } = offer;
+        let name = clean(&display_name);
+        let checked = match &self.content {
+            Some(content) => check_local_content(content.as_ref(), &area, &fingerprint, &provenance),
+            None => Err(crate::net::ContentMismatch {
+                wire: "this client has no local content to load the area from".to_string(),
+                local: "this session has no local content to load areas from".to_string(),
+            }),
+        };
+        match checked {
+            Ok(LocalContent { runtime, provenance: own }) => {
+                self.net.send(NetCommand::Area(AreaAnswer::Join { area: area.clone(), fingerprint, provenance: own }));
+                // Where the server says we stand, if it says something usable; else on our own
+                // area's first spawn point (the snapshot that follows corrects it anyway).
+                let arrival = if arrival.is_finite() {
+                    arrival
+                } else {
+                    runtime.spawn_points().first().copied().unwrap_or_default()
+                };
+                let forward = area != self.info.area_id;
+                eprintln!(
+                    "travel: {} `{name}` ({}), arriving at ({:.0}, {:.0}); {} peer(s) were seen in `{}`, the area left",
+                    if forward { "entering" } else { "back in" },
+                    clean(&area.to_string()),
+                    arrival.x,
+                    arrival.y,
+                    self.state.peers_seen(),
+                    self.info.area_id
+                );
+                // FIXTURE is judged from OUR content as well as the server's flag, like at the
+                // handshake: synthetic content can never be presented as real by a wrong flag.
+                self.info.fixture = fixture || runtime.info().fixture || area.game.is_fixture();
+                self.info.area_id = area.clone();
+                self.area = runtime;
+                self.state.change_area(area.clone(), arrival, arrival_facing, forward);
+                self.area_changed = Some(AreaChanged { area, arrival, forward });
+            }
+            Err(mismatch) => {
+                eprintln!("travel: cannot hold area `{}`: {} (staying; the server sends us back)", clean(&area.to_string()), mismatch.local);
+                self.net.send(NetCommand::Area(AreaAnswer::Cannot { area, reason: mismatch.wire }));
+            }
+        }
     }
 
     /// Send the next `MoveIntent` if one is due (rate limited, only on change).
@@ -195,6 +301,220 @@ mod tests {
         let entities = [entity(8, "Peer", [9, 9, 9]), entity(7, "Cloud", [1, 2, 3])];
         assert_eq!(own_identity(&entities, EntityId(7)), ("Cloud".to_string(), [1, 2, 3]));
         assert_eq!(own_identity(&entities, EntityId(8)), ("Peer".to_string(), [9, 9, 9]));
+    }
+
+    // ---- following the server to another area (against a fake server on a real socket) ----
+
+    use crate::net::{NetConfig, SessionTiming, TokenSink};
+    use fmv_adapter_api::{AdapterError, AreaInfo};
+    use fmv_core::{AccountId, GameId, SessionId};
+    use fmv_fixture::rooms::{RoomsAdapter, HALL, YARD, YARD_ARRIVAL};
+    use fmv_protocol::{read_msg, write_msg, Auth, ClientMsg, NpcSnapshot, ServerMsg, PROTOCOL_VERSION};
+
+    /// Only the hall of the rooms: a machine that does not hold the yard.
+    struct OnlyHall(RoomsAdapter);
+
+    impl GameAdapter for OnlyHall {
+        fn game(&self) -> GameId {
+            GameId::Fixture
+        }
+        fn list_areas(&self) -> Vec<AreaInfo> {
+            self.0.list_areas().into_iter().filter(|i| i.id.key == HALL).collect()
+        }
+        fn load_area(&self, key: &str) -> Result<Box<dyn AreaRuntime>, AdapterError> {
+            if key == HALL {
+                self.0.load_area(key)
+            } else {
+                Err(AdapterError::AreaNotFound(key.to_string()))
+            }
+        }
+    }
+
+    fn info_of(key: &str) -> AreaInfo {
+        RoomsAdapter::new().list_areas().into_iter().find(|i| i.id.key == key).expect("a listed room")
+    }
+
+    fn me(pos: Pos) -> EntitySnapshot {
+        EntitySnapshot { id: EntityId(7), pos, facing: 0.0, anim: fmv_core::AnimState::Idle, avatar: AvatarAppearance::new("Me", [1, 2, 3], None) }
+    }
+
+    fn change_for(key: &str, arrival: Pos) -> ServerMsg {
+        let info = info_of(key);
+        ServerMsg::AreaChange {
+            area: info.id,
+            display_name: info.display_name,
+            fingerprint: info.fingerprint,
+            provenance: info.provenance.summary(),
+            fixture: true,
+            arrival,
+            arrival_facing: 1.5,
+        }
+    }
+
+    fn config(addr: std::net::SocketAddr) -> NetConfig {
+        NetConfig {
+            server: addr.to_string(),
+            auth: Auth::Register { display_name: "Me".into() },
+            tint: [1, 2, 3],
+            appearance_ref: None,
+            client_build: "test".into(),
+            timing: SessionTiming::DEFAULT,
+            token_sink: TokenSink::new(|_| Ok(())),
+        }
+    }
+
+    /// The server side of ONE connection: the handshake into the hall, then the `AreaChange`
+    /// offers in `offers`, one after the other (each waits for its answer; a `JoinArea` is
+    /// followed by the snapshot of that area, with one NPC, like the real server does), and the
+    /// answers it got. Ends when the client says `Leave`.
+    async fn serve(listener: tokio::net::TcpListener, offers: Vec<ServerMsg>) -> Vec<ClientMsg> {
+        let (stream, _) = listener.accept().await.expect("a client");
+        let (mut rd, mut wr) = stream.into_split();
+        let mut answers = Vec::new();
+        let hall = info_of(HALL);
+        let spawn = Pos::new(-100.0, 0.0, 0.0);
+        let _hello: ClientMsg = read_msg(&mut rd).await.expect("Hello");
+        let welcome = ServerMsg::Welcome {
+            protocol_version: PROTOCOL_VERSION,
+            server_build: "fake".into(),
+            session: SessionId(1),
+            entity: EntityId(7),
+            account: AccountId(1),
+            issued_token: None,
+        };
+        write_msg(&mut wr, &welcome).await.unwrap();
+        let manifest = ServerMsg::AreaManifest {
+            area: hall.id.clone(),
+            display_name: hall.display_name.clone(),
+            fingerprint: hall.fingerprint,
+            provenance: hall.provenance.summary(),
+            fixture: true,
+        };
+        write_msg(&mut wr, &manifest).await.unwrap();
+        let join: ClientMsg = read_msg(&mut rd).await.expect("JoinArea");
+        answers.push(join);
+        write_msg(&mut wr, &ServerMsg::AreaSnapshot { area: hall.id.clone(), tick: 1, entities: vec![me(spawn)], npcs: vec![] })
+            .await
+            .unwrap();
+        for offer in offers {
+            write_msg(&mut wr, &offer).await.unwrap();
+            let ServerMsg::AreaChange { area, arrival, .. } = &offer else { panic!("offers are AreaChanges") };
+            loop {
+                match read_msg::<_, ClientMsg>(&mut rd).await.expect("an answer") {
+                    ClientMsg::Ping { .. } | ClientMsg::MoveIntent { .. } => {}
+                    answer @ ClientMsg::JoinArea { .. } => {
+                        answers.push(answer);
+                        let npc = NpcSnapshot {
+                            id: 0,
+                            name: "guard".into(),
+                            model: "guardm".into(),
+                            idle_animation: None,
+                            pos: Pos::new(200.0, 100.0, 0.0),
+                            facing: 0.5,
+                        };
+                        let snapshot = ServerMsg::AreaSnapshot { area: area.clone(), tick: 2, entities: vec![me(*arrival)], npcs: vec![npc] };
+                        write_msg(&mut wr, &snapshot).await.unwrap();
+                        break;
+                    }
+                    answer @ ClientMsg::CannotJoin { .. } => {
+                        answers.push(answer);
+                        break;
+                    }
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+        }
+        loop {
+            match read_msg::<_, ClientMsg>(&mut rd).await {
+                Ok(ClientMsg::Leave) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+        answers
+    }
+
+    /// Pump `session` until `done` says so (or ten seconds pass).
+    fn pump_until(session: &mut Session, what: &str, mut done: impl FnMut(&mut Session) -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !done(session) {
+            if let Some(reason) = session.pump() {
+                panic!("the session ended while waiting for {what}: {reason}");
+            }
+            assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn an_area_change_is_answered_from_local_content_and_the_session_moves_to_the_new_area() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let arrival = Pos::new(YARD_ARRIVAL.0, YARD_ARRIVAL.1, 0.0);
+        let server = tokio::spawn(serve(listener, vec![change_for(YARD, arrival)]));
+        let client = tokio::task::spawn_blocking(move || {
+            let mut net = NetHandle::spawn(config(addr), Box::new(RoomsAdapter::new())).expect("net thread");
+            let joined = net.wait_joined().expect("joined");
+            let mut session = Session::new(net, joined).with_content(Arc::new(RoomsAdapter::new()));
+            assert_eq!((session.info.area_id.key.as_str(), session.state.area_changes()), (HALL, 0));
+            let hall_speed = session.area.max_speed();
+            // The offer arrives, is answered, and the session is in the yard...
+            pump_until(&mut session, "the area change", |s| s.info.area_id.key == YARD);
+            let changed = session.take_area_change().expect("the change is reported once");
+            assert!(session.take_area_change().is_none());
+            assert_eq!((changed.area.key.as_str(), changed.forward, changed.arrival), (YARD, true, arrival));
+            assert_eq!(session.state.area_changes(), 1);
+            assert_eq!(session.state.own.pos(), arrival, "we stand where the server put us");
+            assert!(session.info.fixture);
+            assert!(session.area.max_speed() > hall_speed, "local movement now follows the yard's own rules");
+            // ...and the snapshot of the new area, which the server sends after our answer, is accepted.
+            pump_until(&mut session, "the yard's snapshot", |s| !s.state.npc_views().is_empty());
+            let npcs: Vec<String> = session.state.npc_views().iter().map(|n| n.name.clone()).collect();
+            session.leave(Duration::from_secs(2));
+            npcs
+        });
+        let npcs = client.await.expect("the client thread");
+        assert_eq!(npcs, ["guard"]);
+        let answers = server.await.expect("the server task");
+        match &answers[..] {
+            [ClientMsg::JoinArea { area: first, .. }, ClientMsg::JoinArea { area, fingerprint, provenance }] => {
+                assert_eq!(first.key, HALL);
+                // The answer is about the area offered, from OUR content (and our own provenance).
+                let yard = info_of(YARD);
+                assert_eq!((area, *fingerprint), (&yard.id, yard.fingerprint));
+                assert_eq!(*provenance, yard.provenance.summary());
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn an_area_this_machine_does_not_hold_is_refused_and_the_way_back_is_not_a_change() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // The server offers the yard, gets "cannot", and sends the player back to the hall.
+        let back = change_for(HALL, Pos::new(250.0, 0.0, 0.0));
+        let server = tokio::spawn(serve(listener, vec![change_for(YARD, Pos::new(YARD_ARRIVAL.0, YARD_ARRIVAL.1, 0.0)), back]));
+        let client = tokio::task::spawn_blocking(move || {
+            let mut net = NetHandle::spawn(config(addr), Box::new(OnlyHall(RoomsAdapter::new()))).expect("net thread");
+            let joined = net.wait_joined().expect("joined");
+            let mut session = Session::new(net, joined).with_content(Arc::new(OnlyHall(RoomsAdapter::new())));
+            pump_until(&mut session, "the way back", |s| s.take_area_change().is_some());
+            let (area, changes, pos) = (session.info.area_id.key.clone(), session.state.area_changes(), session.state.own.pos());
+            session.leave(Duration::from_secs(2));
+            (area, changes, pos)
+        });
+        let (area, changes, pos) = client.await.expect("the client thread");
+        assert_eq!((area.as_str(), changes), (HALL, 0), "we never left the hall: the way back is not a change");
+        assert_eq!((pos.x, pos.y), (250.0, 0.0));
+        let answers = server.await.expect("the server task");
+        match &answers[..] {
+            [ClientMsg::JoinArea { .. }, ClientMsg::CannotJoin { area, reason }, ClientMsg::JoinArea { area: again, .. }] => {
+                assert_eq!(area.key, YARD);
+                assert!(reason.contains("yard"), "the reason says which area: {reason}");
+                assert_eq!(again.key, HALL);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

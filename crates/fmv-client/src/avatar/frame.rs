@@ -43,6 +43,17 @@ pub const RING_RADIUS_UNITS: f32 = 5.5;
 const WHITE: [u8; 3] = [255, 255, 255];
 const GOLD: [u8; 3] = crate::render::RING_RGB;
 
+/// The model of a non-player character, as an area's data names it: untrusted text from the
+/// server's snapshot, only ever looked up as `char.lgp` entry stems
+/// ([`super::library::AvatarLibrary::get_npc`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NpcRef<'a> {
+    /// The skeleton's stem (`<model>.hrc`); empty when the data names none (always a marker).
+    pub model: &'a str,
+    /// The stem of the clip that shows it standing (`<idle>.a`).
+    pub idle: Option<&'a str>,
+}
+
 /// A player to draw: where it stands, which way it faces and how it moves, and who it is.
 #[derive(Debug, Clone, Copy)]
 pub struct AvatarPlayer<'a> {
@@ -53,6 +64,10 @@ pub struct AvatarPlayer<'a> {
     pub anim: AnimState,
     /// The look the avatar names (untrusted text; only looked up in the table).
     pub appearance: Option<&'a str>,
+    /// `Some` for a non-player character of the area instead of a player: the model its data
+    /// names. It is drawn with that model standing (shadow only under it, no rings), and as a
+    /// marker (`tint` its colour) when there is no such model here; `appearance` is not used.
+    pub npc: Option<NpcRef<'a>>,
     pub tint: [u8; 3],
     /// The local player.
     pub own: bool,
@@ -168,6 +183,10 @@ fn ground_marks(view: &FieldView, player: &AvatarPlayer<'_>, stand_in: bool, sca
     if let Some(shadow) = circle(0.95) {
         marks.push(GroundShape::disc(shadow, [0, 0, 0], 0.30));
     }
+    // A non-player character is scenery: a shadow, and none of the rings that tell players apart.
+    if player.npc.is_some() {
+        return marks;
+    }
     // A stand-in (the player's own look is unknown here) leans on the tint more: a stronger ring.
     let tint_alpha = if stand_in { 1.0 } else { 0.85 };
     if let (Some(outer), Some(inner)) = (circle(1.0), circle(0.78)) {
@@ -208,10 +227,22 @@ impl Avatars {
         self.library.get(appearance);
     }
 
+    /// The area's non-player characters changed: these are the models they name. Loads them now
+    /// (so the first frame that shows them does not stall) and drops what the area left behind.
+    pub fn set_npcs(&mut self, npcs: &[NpcRef<'_>]) {
+        self.library.keep_npcs(npcs.iter().map(|n| (n.model, n.idle)));
+    }
+
     /// Characters held by the cache.
     #[cfg(test)]
     pub fn cached(&self) -> usize {
         self.library.cached()
+    }
+
+    /// Non-player models held by the cache.
+    #[cfg(test)]
+    pub fn cached_npcs(&self) -> usize {
+        self.library.cached_npcs()
     }
 
     /// Build the frame for `players` standing in `view`'s field. A player that cannot be drawn at
@@ -223,7 +254,9 @@ impl Avatars {
         let camera = stage.camera.matrix();
         let scale = stage.model_scale;
 
-        // Which players can be drawn, nearest first (the cap keeps the nearest).
+        // Which players can be drawn, nearest first (the cap keeps the nearest). The players come
+        // before the area's non-player characters, so that a crowd of those can never take the
+        // place of a player: the cap is spent on players first.
         let mut order: Vec<(usize, f64)> = players
             .iter()
             .enumerate()
@@ -233,7 +266,8 @@ impl Avatars {
                 Some((i, depth))
             })
             .collect();
-        order.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+        let is_npc = |i: usize| players.get(i).is_some_and(|p| p.npc.is_some());
+        order.sort_by(|a, b| is_npc(a.0).cmp(&is_npc(b.0)).then(a.1.total_cmp(&b.1)).then(a.0.cmp(&b.0)));
 
         let mut models: Vec<SkinnedModel> = Vec::new();
         let mut ground_marks_by_player: Vec<(usize, Vec<GroundShape>)> = Vec::new();
@@ -246,8 +280,16 @@ impl Avatars {
                 markers.push(i);
                 continue;
             }
-            let look = self.library.get(p.appearance);
-            let Some(asset) = look.asset else {
+            // A player is its table character (the default, flagged, when it names none that
+            // exists); a non-player character is the model its data names, or a marker.
+            let (asset, stand_in) = match p.npc {
+                Some(npc) => (self.library.get_npc(npc.model, npc.idle), false),
+                None => {
+                    let look = self.library.get(p.appearance);
+                    (look.asset, look.stand_in)
+                }
+            };
+            let Some(asset) = asset else {
                 markers.push(i);
                 continue;
             };
@@ -271,7 +313,7 @@ impl Avatars {
             if let Some(anchor) = view.to_view(head).or_else(|| view.to_view(p.pos)) {
                 anchors.insert(p.who, anchor);
             }
-            ground_marks_by_player.push((i, ground_marks(view, p, look.stand_in, scale)));
+            ground_marks_by_player.push((i, ground_marks(view, p, stand_in, scale)));
             models.push(SkinnedModel { asset, positions });
         }
 
@@ -348,12 +390,12 @@ pub(crate) mod tests {
     }
 
     fn player(id: u64, pos: Pos, facing: f32, anim: AnimState) -> AvatarPlayer<'static> {
-        AvatarPlayer { who: Who(id), pos, facing, anim, appearance: Some("ff7/cloud"), tint: [10, 200, 30], own: false, party: false }
+        AvatarPlayer { who: Who(id), pos, facing, anim, appearance: Some("ff7/cloud"), npc: None, tint: [10, 200, 30], own: false, party: false }
     }
 
     fn avatars(fail: Vec<&'static str>) -> (Avatars, Rc<RefCell<Vec<&'static str>>>) {
         let asked = Rc::new(RefCell::new(Vec::new()));
-        let loader = Counting { asked: Rc::clone(&asked), fail };
+        let loader = Counting::new(Rc::clone(&asked), fail);
         (Avatars::new(AvatarLibrary::new(Box::new(loader))), asked)
     }
 
@@ -564,6 +606,119 @@ pub(crate) mod tests {
         // The nearest to the camera (smallest y: the camera looks along +y) are the models.
         assert!(built.markers.iter().all(|&i| i >= MAX_MODELS), "{:?}", built.markers);
         assert_eq!(avatars.cached(), 1);
+    }
+
+    /// A non-player character standing at `pos`, with the model `agyb` and the clip `acfe`.
+    fn npc(id: u64, pos: Pos, facing: f32) -> AvatarPlayer<'static> {
+        AvatarPlayer {
+            who: Who(id),
+            pos,
+            facing,
+            anim: AnimState::Idle,
+            appearance: None,
+            npc: Some(NpcRef { model: "agyb", idle: Some("acfe") }),
+            tint: [120, 130, 140],
+            own: false,
+            party: false,
+        }
+    }
+
+    /// Avatars whose non-player loads are counted (as `model/clip`) and fail for the skeletons
+    /// `fail_npc`.
+    fn npc_avatars(fail_npc: Vec<&'static str>) -> (Avatars, Rc<RefCell<Vec<String>>>) {
+        let mut loader = Counting::new(Rc::default(), vec![]);
+        loader.fail_npc = fail_npc;
+        let asked = Rc::clone(&loader.asked_npc);
+        (Avatars::new(AvatarLibrary::new(Box::new(loader))), asked)
+    }
+
+    #[test]
+    fn a_non_player_character_stands_where_its_data_puts_it_facing_its_way_with_only_a_shadow() {
+        let (mut avatars, asked) = npc_avatars(vec![]);
+        let (view, stage) = (view(), stage());
+        let at = Pos::new(0.0, 0.0, 0.0);
+        let id = 1 << 63;
+        let built = avatars.frame(&view, &stage, &[npc(id, at, 0.0)], 0.0);
+        assert_eq!((built.frame.models.len(), built.markers.len()), (1, 0), "a model, not a marker");
+        assert_eq!(*asked.borrow(), ["agyb/acfe"]);
+        assert_eq!(avatars.cached(), 0, "no playable character was needed: no stand-in Cloud");
+        // Feet at its position, head above, like a player.
+        let ys: Vec<f64> = built.frame.models[0].positions.iter().map(|&v| screen(v, 400.0).1).collect();
+        let (top, bottom) = (ys.iter().copied().fold(f64::MAX, f64::min), ys.iter().copied().fold(f64::MIN, f64::max));
+        assert!(bottom.abs() < 3.0 && top < -30.0, "feet {bottom}, head {top}");
+        // A shadow, and no ring of any kind (a non-player character is scenery).
+        assert_eq!(built.frame.ground.len(), 1);
+        assert_eq!(built.frame.ground[0].rgb, [0, 0, 0]);
+        // Its label goes over its head.
+        let anchor = built.anchors[&Who(id)];
+        assert!(anchor.y > view.to_view(at).unwrap().y + 10.0, "{anchor:?}");
+        // It faces its heading: toward the camera puts the nose (vertices 3..6 of the stick
+        // figure) nearer than away from it.
+        let mut nose = |facing: f32| {
+            let m = &avatars.frame(&view, &stage, &[npc(id, at, facing)], 0.0).frame.models[0];
+            (3..6).map(|k| m.positions[k][2]).sum::<f32>() / 3.0
+        };
+        let half_turn = std::f32::consts::FRAC_PI_2;
+        assert!(nose(-half_turn) < nose(half_turn) - 10.0, "facing the camera puts the nose nearer");
+        // Standing still: asking again loads nothing.
+        assert_eq!(asked.borrow().len(), 1);
+    }
+
+    #[test]
+    fn a_non_player_character_without_a_model_here_is_a_marker_and_never_a_stand_in() {
+        let (mut avatars, asked) = npc_avatars(vec!["failing"]);
+        let (view, stage) = (view(), stage());
+        let mut failing = npc(11, Pos::new(0.0, 0.0, 0.0), 0.0);
+        failing.npc = Some(NpcRef { model: "failing", idle: Some("acfe") });
+        let mut unnamed = npc(12, Pos::new(30.0, 0.0, 0.0), 0.0);
+        unnamed.npc = Some(NpcRef { model: "", idle: None });
+        let mut standing_nowhere = npc(13, Pos::new(60.0, 0.0, 0.0), 0.0);
+        standing_nowhere.npc = Some(NpcRef { model: "agyb", idle: None });
+        let mut hostile = npc(14, Pos::new(90.0, 0.0, 0.0), 0.0);
+        hostile.npc = Some(NpcRef { model: "../../char", idle: Some("acfe") });
+        let built = avatars.frame(&view, &stage, &[failing, unnamed, standing_nowhere, hostile], 0.0);
+        assert!(built.frame.models.is_empty(), "nothing is drawn as a model");
+        assert_eq!(built.markers, [0, 1, 2, 3], "every one of them is a marker instead");
+        assert!(built.frame.ground.is_empty() && built.anchors.is_empty());
+        assert_eq!(avatars.cached(), 0, "the default character does not stand in for a non-player one");
+        assert_eq!(*asked.borrow(), ["failing/acfe"], "only the one that could name an entry was asked for, once");
+        avatars.frame(&view, &stage, &[failing], 0.0);
+        assert_eq!(asked.borrow().len(), 1, "a failure is not retried");
+    }
+
+    #[test]
+    fn a_crowd_of_non_player_characters_never_takes_a_players_model() {
+        let (mut avatars, _) = npc_avatars(vec![]);
+        let (view, stage) = (view(), stage());
+        // The non-player characters are all NEARER to the camera than the three players.
+        let mut things: Vec<AvatarPlayer<'static>> =
+            (0..MAX_MODELS + 10).map(|i| npc((1 << 63) + i as u64, Pos::new(i as f32 * 2.0 - 60.0, -300.0 + i as f32, 0.0), 0.0)).collect();
+        for i in 0..3 {
+            let mut p = player(i, Pos::new(i as f32 * 20.0, 500.0, 0.0), 0.0, AnimState::Idle);
+            p.appearance = Some("ff7/cloud");
+            things.push(p);
+        }
+        let n = things.len();
+        let built = avatars.frame(&view, &stage, &things, 0.0);
+        assert_eq!(built.frame.models.len(), MAX_MODELS);
+        // The players are the last three in the list and all have models; the markers are the
+        // non-player characters that did not fit.
+        assert!((n - 3..n).all(|i| !built.markers.contains(&i)), "{:?}", built.markers);
+        assert_eq!(built.markers.len(), 13);
+        assert!(built.markers.iter().all(|&i| i < MAX_MODELS + 10));
+        assert!((0..3).all(|i| built.anchors.contains_key(&Who(i))));
+    }
+
+    #[test]
+    fn setting_the_npcs_loads_their_models_ahead_of_the_first_frame() {
+        let (mut avatars, asked) = npc_avatars(vec![]);
+        avatars.set_npcs(&[NpcRef { model: "agyb", idle: Some("acfe") }, NpcRef { model: "agyb", idle: Some("acfe") }, NpcRef { model: "", idle: None }]);
+        assert_eq!(*asked.borrow(), ["agyb/acfe"]);
+        let built = avatars.frame(&view(), &stage(), &[npc(1 << 63, Pos::new(0.0, 0.0, 0.0), 0.0)], 0.0);
+        assert_eq!(built.frame.models.len(), 1);
+        assert_eq!(asked.borrow().len(), 1, "the frame found it ready");
+        avatars.set_npcs(&[]);
+        assert_eq!(avatars.cached_npcs(), 0, "an area without characters holds none");
     }
 
     #[test]

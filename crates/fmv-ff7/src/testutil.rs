@@ -43,6 +43,143 @@ fn padded_name(name: &str) -> [u8; 20] {
     n
 }
 
+/// An LZSS stream made only of literals (control byte with the low bits set, then up to 8 bytes
+/// each), prefixed with its length like a stored `flevel.lgp` entry. Instant to build, unlike the
+/// crate's test compressor, and decodable by [`crate::lzss::decompress`].
+pub(crate) fn pack_literals(data: &[u8]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(data.len() + data.len() / 8 + 8);
+    for chunk in data.chunks(8) {
+        body.push(0xFFu8 >> (8 - chunk.len()));
+        body.extend_from_slice(chunk);
+    }
+    let mut out = (body.len() as u32).to_le_bytes().to_vec();
+    out.extend_from_slice(&body);
+    out
+}
+
+/// The `maplist` entry of `flevel.lgp`: a `u16` count, then 32-byte NUL-padded names.
+pub(crate) fn maplist_bytes(names: &[&str]) -> Vec<u8> {
+    let mut out = (names.len() as u16).to_le_bytes().to_vec();
+    for name in names {
+        assert!(name.len() <= 32, "maplist names are at most 32 bytes");
+        let mut record = [0u8; 32];
+        record[..name.len()].copy_from_slice(name.as_bytes());
+        out.extend_from_slice(&record);
+    }
+    out
+}
+
+/// Encoders for the few field-script instructions the area-hook tests use (invented scripts only;
+/// layouts as documented in `script::opcodes`). Operands are literals unless the name says
+/// otherwise.
+pub(crate) mod asm {
+    pub(crate) fn cat(parts: &[Vec<u8>]) -> Vec<u8> {
+        parts.concat()
+    }
+
+    pub(crate) fn ret() -> Vec<u8> {
+        vec![0x00]
+    }
+
+    /// `JMPB 0`: a jump to itself, the idle loop that ends a main part.
+    pub(crate) fn idle() -> Vec<u8> {
+        vec![0x12, 0x00]
+    }
+
+    pub(crate) fn char_model(id: u8) -> Vec<u8> {
+        vec![0xA1, id]
+    }
+
+    pub(crate) fn player(character: u8) -> Vec<u8> {
+        vec![0xA0, character]
+    }
+
+    pub(crate) fn visible(visible: u8) -> Vec<u8> {
+        vec![0xA4, visible]
+    }
+
+    pub(crate) fn direction(direction: u8) -> Vec<u8> {
+        vec![0xB3, 0x00, direction]
+    }
+
+    /// `DIR` whose operand is the variable at `address` of bank 1.
+    pub(crate) fn direction_var(address: u8) -> Vec<u8> {
+        vec![0xB3, 0x01, address]
+    }
+
+    fn words(values: &[i16]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    pub(crate) fn xyzi(x: i16, y: i16, z: i16, triangle: u16) -> Vec<u8> {
+        cat(&[vec![0xA5, 0x00, 0x00], words(&[x, y, z]), triangle.to_le_bytes().to_vec()])
+    }
+
+    /// `XYZI` whose x names the variable at `address` of bank 1.
+    pub(crate) fn xyzi_var_x(address: u8, y: i16, z: i16, triangle: u16) -> Vec<u8> {
+        cat(&[vec![0xA5, 0x10, 0x00], words(&[i16::from(address), y, z]), triangle.to_le_bytes().to_vec()])
+    }
+
+    pub(crate) fn xyi(x: i16, y: i16, triangle: u16) -> Vec<u8> {
+        cat(&[vec![0xA6, 0x00, 0x00], words(&[x, y]), triangle.to_le_bytes().to_vec()])
+    }
+
+    pub(crate) fn xyz(x: i16, y: i16, z: i16) -> Vec<u8> {
+        cat(&[vec![0xA7, 0x00, 0x00], words(&[x, y, z])])
+    }
+
+    /// `code` behind an `IFUB` that skips it on some paths: the analysis calls it conditional.
+    pub(crate) fn skipped(code: &[u8]) -> Vec<u8> {
+        let distance = u8::try_from(code.len() + 1).expect("a short region");
+        cat(&[vec![0x14, 0x00, 0x00, 0x00, 0x00, distance], code.to_vec()])
+    }
+}
+
+/// A script section (section 0) with the given entities, each with the bytes of its script 0
+/// (every other slot is a bare `RET`), no dialogs and no AKAO blocks; `scale` is the header's field
+/// scale. Layout as documented in `script::layout`.
+pub(crate) fn script_section(entities: &[(&str, Vec<u8>)], scale: u16) -> Vec<u8> {
+    const HEADER: usize = 0x20;
+    let e = entities.len();
+    let code_start = HEADER + e * 8 + e * 32 * 2;
+    let mut table = Vec::new();
+    let mut code: Vec<u8> = Vec::new();
+    for (_, script0) in entities {
+        for slot in 0..32 {
+            table.extend_from_slice(&u16::try_from(code_start + code.len()).expect("a small section").to_le_bytes());
+            code.extend_from_slice(if slot == 0 { script0 } else { &[0x00] });
+        }
+    }
+    let string_offset = code_start + code.len();
+    let mut out = vec![0u8; HEADER];
+    out[0] = 2; // event data version
+    out[1] = 5; // event version
+    out[2] = u8::try_from(e).expect("at most 255 entities");
+    out[4..6].copy_from_slice(&u16::try_from(string_offset).expect("a small section").to_le_bytes());
+    out[8..10].copy_from_slice(&scale.to_le_bytes());
+    out[0x10..0x15].copy_from_slice(b"maker");
+    out[0x18..0x1D].copy_from_slice(b"synth");
+    for (name, _) in entities {
+        let mut n = [0u8; 8];
+        n[..name.len().min(8)].copy_from_slice(&name.as_bytes()[..name.len().min(8)]);
+        out.extend_from_slice(&n);
+    }
+    out.extend_from_slice(&table);
+    out.extend_from_slice(&code);
+    out.extend_from_slice(&[0, 0]); // the dialog table: no dialogs
+    out
+}
+
+/// One gateway slot of a synthetic field's triggers section.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GatewaySpec {
+    pub exit_a: [i16; 3],
+    pub exit_b: [i16; 3],
+    pub destination: [i16; 3],
+    /// `0x7FFF` marks an unused slot.
+    pub target_field_id: u16,
+}
+
 /// One 38-byte camera record.
 pub(crate) fn camera_record(axes: [[i16; 3]; 3], position: [i32; 3], zoom: u16) -> Vec<u8> {
     let mut r = Vec::with_capacity(38);
@@ -193,6 +330,11 @@ pub(crate) struct FieldSpec {
     pub model_scale: u16,
     /// Model records of the model-loader section (none by default).
     pub models: Vec<LoaderModelSpec>,
+    /// `None` keeps the default triggers section (one gateway to field id 0x123); `Some` replaces
+    /// all twelve gateway slots with these (in order, the rest unused).
+    pub gateways: Option<Vec<GatewaySpec>>,
+    /// Raw replacements for whole sections, applied last: `(section index, payload)`.
+    pub overrides: Vec<(usize, Vec<u8>)>,
 }
 
 impl Default for FieldSpec {
@@ -242,6 +384,8 @@ impl Default for FieldSpec {
             script_len: 32,
             model_scale: 512,
             models: Vec::new(),
+            gateways: None,
+            overrides: Vec::new(),
         }
     }
 }
@@ -254,7 +398,7 @@ impl FieldSpec {
 
     /// The decompressed field file.
     pub(crate) fn build(&self) -> Vec<u8> {
-        let sections: [Vec<u8>; 9] = [
+        let mut sections: [Vec<u8>; 9] = [
             (0..self.script_len).map(|i| (i * 3 + 1) as u8).collect(), // script: arbitrary
             self.camera_section(),
             self.model_loader_section(), // model loader: always-zero, 0 models, scale
@@ -265,6 +409,11 @@ impl FieldSpec {
             self.triggers_section(),
             self.background_section(),
         ];
+        for (index, payload) in &self.overrides {
+            if let Some(slot) = sections.get_mut(*index) {
+                *slot = payload.clone();
+            }
+        }
         let table_end = 2 + 4 + 4 * 9;
         let mut out = Vec::new();
         out.extend_from_slice(&0u16.to_le_bytes());
@@ -344,16 +493,30 @@ impl FieldSpec {
             out[24 + 2 * i..26 + 2 * i].copy_from_slice(&v.to_le_bytes());
         }
         // gateways: 12 x 24 at 56
-        for g in 0..12 {
-            let base = 56 + g * 24;
-            let field_id: u16 = if g == 0 { 0x0123 } else { 0x7FFF };
-            out[base + 18..base + 20].copy_from_slice(&field_id.to_le_bytes());
+        if let Some(gateways) = &self.gateways {
+            for g in 0..12 {
+                let base = 56 + g * 24;
+                let spec = gateways.get(g);
+                let field_id = spec.map_or(0x7FFF, |s| s.target_field_id);
+                if let Some(s) = spec {
+                    for (i, v) in s.exit_a.iter().chain(&s.exit_b).chain(&s.destination).enumerate() {
+                        out[base + 2 * i..base + 2 * i + 2].copy_from_slice(&v.to_le_bytes());
+                    }
+                }
+                out[base + 18..base + 20].copy_from_slice(&field_id.to_le_bytes());
+            }
+        } else {
+            for g in 0..12 {
+                let base = 56 + g * 24;
+                let field_id: u16 = if g == 0 { 0x0123 } else { 0x7FFF };
+                out[base + 18..base + 20].copy_from_slice(&field_id.to_le_bytes());
+            }
+            let g0 = 56;
+            for (i, v) in [1i16, 2, 3, 4, 5, 6, 7, 8, 9].iter().enumerate() {
+                out[g0 + 2 * i..g0 + 2 * i + 2].copy_from_slice(&v.to_le_bytes());
+            }
+            out[g0 + 20..g0 + 24].copy_from_slice(&[0xAB; 4]);
         }
-        let g0 = 56;
-        for (i, v) in [1i16, 2, 3, 4, 5, 6, 7, 8, 9].iter().enumerate() {
-            out[g0 + 2 * i..g0 + 2 * i + 2].copy_from_slice(&v.to_le_bytes());
-        }
-        out[g0 + 20..g0 + 24].copy_from_slice(&[0xAB; 4]);
         // triggers: 12 x 16 at 344; fill slot 2
         let t2 = 344 + 2 * 16;
         for (i, v) in [-1i16, -2, -3, 11, 12, 13].iter().enumerate() {

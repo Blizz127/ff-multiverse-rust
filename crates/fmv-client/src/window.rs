@@ -4,18 +4,21 @@
 //! reported cleanly before any network traffic. Every start-up failure (window, GPU) becomes an
 //! error message and a non-zero exit code, never a panic.
 
+use crate::avatar::frame::Built;
 use crate::avatar::{AvatarPlayer, Avatars, Stage, Who};
 use crate::backdrop::FieldView;
 use crate::battle::{battle_vertices, draw_battle_text, BattleCmd};
 use crate::cli::exit;
 use crate::interp::render_time;
 use crate::net::PartyCommand;
+use crate::npc::{npc_models, npc_players, npc_who};
 use crate::render::{FrameResult, PlayerSprite, Renderer, Scene};
 use crate::session::{Session, SessionInfo};
 use crate::state::ClientState;
 use crate::ui::draw::DrawList;
-use crate::ui::hud;
+use crate::ui::hud::{self, Subject};
 use fmv_core::{AnimState, GameId, Pos};
+use fmv_ff7::Ff7Adapter;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
@@ -83,8 +86,10 @@ pub fn window_attributes(title: String) -> winit::window::WindowAttributes {
         .with_min_inner_size(LogicalSize::new(320.0, 240.0))
 }
 
-pub fn run(event_loop: EventLoop<()>, session: Session, view: FieldView) -> u8 {
-    let mut app = App::new(session, view);
+/// `ff7` is where the views of the areas the server moves us to are read from (see
+/// [`App::with_ff7`]).
+pub fn run(event_loop: EventLoop<()>, session: Session, view: FieldView, ff7: Option<Arc<Ff7Adapter>>) -> u8 {
+    let mut app = App::new(session, view).with_ff7(ff7);
     // A panic inside the windowing or GPU stack must not skip the goodbye or end as a raw abort.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| event_loop.run_app(&mut app)));
     app.finish(result)
@@ -261,7 +266,11 @@ pub fn movement_pace(stage: Option<&Stage>, walking: bool, max_speed: f32) -> (f
 pub(crate) struct App {
     session: Session,
     /// How the area is drawn: walkmesh and bounds in view space, the mapping, the picture.
+    /// Rebuilt when the server moves us to another area.
     view: FieldView,
+    /// This machine's own FF7 data, to read the view of the next area from (`None`: areas are
+    /// drawn from above).
+    ff7: Option<Arc<Ff7Adapter>>,
     base_title: String,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
@@ -277,6 +286,8 @@ pub(crate) struct App {
     failure: Option<String>,
     /// The players' character models (FF7 fields with this machine's own `char.lgp` only).
     avatars: Option<Avatars>,
+    /// The [`ClientState::npc_epoch`] the avatars were last told the NPCs of.
+    npc_epoch: u64,
     /// F1: draw the walkmesh over the picture (a debugging aid, off by default).
     show_walkmesh: bool,
     /// Session time of the previous frame (for animation).
@@ -296,6 +307,7 @@ impl App {
         Self {
             session,
             view,
+            ff7: None,
             base_title,
             window: None,
             renderer: None,
@@ -307,9 +319,25 @@ impl App {
             left: false,
             failure: None,
             avatars,
+            npc_epoch: 0,
             show_walkmesh: false,
             last_draw_t: 0.0,
         }
+    }
+
+    /// Where the views of later areas come from: when the server moves the player to another
+    /// area, its view (camera, background, walkmesh) is built from this machine's own FF7 data.
+    pub(crate) fn with_ff7(mut self, ff7: Option<Arc<Ff7Adapter>>) -> Self {
+        self.ff7 = ff7;
+        self
+    }
+
+    /// The session entered another area: draw it (a new view, a new title).
+    fn rebuild_view(&mut self) {
+        self.view = crate::field_view(self.ff7.as_deref(), &self.session);
+        self.base_title = base_title(&self.session.info);
+        // The next `update_title` must not wait for its refresh interval.
+        self.last_title = Instant::now().checked_sub(TITLE_REFRESH).unwrap_or_else(Instant::now);
     }
 
     /// Take over a window and renderer that already exist (the character menu opens them first
@@ -435,6 +463,10 @@ impl App {
             self.fail(el, reason);
             return;
         }
+        // The server moved us to another area: draw it before anything is drawn again.
+        if self.session.take_area_change().is_some() {
+            self.rebuild_view();
+        }
         self.session.log_party_notes();
         self.session.log_battle_notes();
         self.session.flush_party_sync();
@@ -482,50 +514,10 @@ impl App {
             }
             return;
         }
-        // Players are placed through the view; one that cannot be drawn (behind the camera) is
-        // simply not shown this frame.
         let view = &self.view;
         let state = &self.session.state;
-
-        // Everyone who is drawn: the remote players, then the local one last. A player that cannot
-        // be placed (behind the camera) is simply not shown this frame.
-        let remotes = state.remote_views(render_t);
-        let mut players: Vec<AvatarPlayer<'_>> = remotes
-            .iter()
-            .map(|v| AvatarPlayer {
-                who: Who(v.id.0),
-                pos: v.pose.pos,
-                facing: v.pose.facing,
-                anim: v.pose.anim,
-                appearance: v.appearance.as_deref(),
-                tint: v.tint,
-                own: false,
-                party: state.party.is_party_entity(v.id),
-            })
-            .collect();
-        let own_who = Who(state.self_entity().0);
-        players.push(AvatarPlayer {
-            who: own_who,
-            pos: state.own.pos(),
-            facing: state.own.facing(),
-            anim: state.own.anim(),
-            appearance: state.own_appearance(),
-            tint: self.session.info.tint,
-            own: true,
-            party: state.party.party_size() > 0,
-        });
-
-        // Models where the character is available, markers for everyone else.
-        let built = match (self.avatars.as_mut(), view.stage.as_ref()) {
-            (Some(avatars), Some(stage)) => Some(avatars.frame(view, stage, &players, dt)),
-            _ => None,
-        };
-        let markers: Vec<PlayerSprite> = players
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| built.as_ref().is_none_or(|b| b.markers.contains(i)))
-            .filter_map(|(_, p)| marker(view, p))
-            .collect();
+        let draw = field_draw(self.avatars.as_mut(), &mut self.npc_epoch, view, state, self.session.info.tint, render_t, dt);
+        let (built, markers) = (draw.built, draw.markers);
 
         // The walkmesh is the scenery of an area without a picture; over a picture it is a
         // debugging aid, shown on request (F1).
@@ -541,10 +533,7 @@ impl App {
         // the head of a model instead of over the marker's centre.
         let (vw, vh) = renderer.size();
         let mut overlay = DrawList::new();
-        let anchor = |id: Option<fmv_core::EntityId>, at: Pos| -> Option<Pos> {
-            let who = id.map_or(own_who, |id| Who(id.0));
-            built.as_ref().and_then(|b| b.anchors.get(&who).copied()).or_else(|| view.to_view(at))
-        };
+        let anchor = |subject: Subject, at: Pos| label_anchor(built.as_ref(), view, draw.own_who, subject, at);
         hud::draw_hud(&hud::gather_anchored(state, &self.session.info, view, render_t, &anchor), vw, vh, &mut overlay);
         let result = renderer.render_layers(&scene, built.as_ref().map(|b| &b.frame), Some(&overlay));
         let gpu_error = renderer.first_gpu_error();
@@ -556,10 +545,97 @@ impl App {
     }
 }
 
-/// The marker of a player: where its feet are in view space, in its tint. `None` if it cannot be
-/// drawn (behind the camera).
+/// What a frame of the field shows apart from the picture and the overlay: the models that were
+/// built and the markers for everyone who has none.
+pub(crate) struct FieldDraw {
+    /// The avatars' frame, `None` when this window draws markers only (no models here, or a field
+    /// without a camera).
+    pub built: Option<Built>,
+    /// Markers for whoever is not drawn as a model, the area's characters first and the local
+    /// player last, so that every player is drawn over the characters.
+    pub markers: Vec<PlayerSprite>,
+    /// The key of the local player in `built`.
+    pub own_who: Who,
+}
+
+/// Everyone who is drawn in this frame of the field: the area's non-player characters first, then
+/// the remote players, then the local one last (so every player is drawn over the characters, the
+/// local one over everyone). Models where the character is available, markers for everyone else
+/// (the characters of the area included: a model that is not to be had here is a marker with a
+/// name). One that cannot be placed (behind the camera) is simply not shown.
+///
+/// When the area's characters changed since the last call (`npc_epoch` tells), the models they
+/// name are loaded now and the last area's are dropped, so the first frame that shows them does
+/// not stall. The window and the offscreen shots both draw through here.
+pub(crate) fn field_draw(
+    avatars: Option<&mut Avatars>,
+    npc_epoch: &mut u64,
+    view: &FieldView,
+    state: &ClientState,
+    own_tint: [u8; 3],
+    render_t: f64,
+    dt: f32,
+) -> FieldDraw {
+    let mut avatars = avatars;
+    if *npc_epoch != state.npc_epoch() {
+        *npc_epoch = state.npc_epoch();
+        if let Some(avatars) = avatars.as_deref_mut() {
+            avatars.set_npcs(&npc_models(state.npc_views()));
+        }
+    }
+    let remotes = state.remote_views(render_t);
+    let mut players: Vec<AvatarPlayer<'_>> = npc_players(state.npc_views());
+    players.extend(remotes.iter().map(|v| AvatarPlayer {
+        who: Who(v.id.0),
+        pos: v.pose.pos,
+        facing: v.pose.facing,
+        anim: v.pose.anim,
+        appearance: v.appearance.as_deref(),
+        npc: None,
+        tint: v.tint,
+        own: false,
+        party: state.party.is_party_entity(v.id),
+    }));
+    let own_who = Who(state.self_entity().0);
+    players.push(AvatarPlayer {
+        who: own_who,
+        pos: state.own.pos(),
+        facing: state.own.facing(),
+        anim: state.own.anim(),
+        appearance: state.own_appearance(),
+        npc: None,
+        tint: own_tint,
+        own: true,
+        party: state.party.party_size() > 0,
+    });
+    let built = match (avatars, view.stage.as_ref()) {
+        (Some(avatars), Some(stage)) => Some(avatars.frame(view, stage, &players, dt)),
+        _ => None,
+    };
+    let markers = players
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| built.as_ref().is_none_or(|b| b.markers.contains(i)))
+        .filter_map(|(_, p)| marker(view, p))
+        .collect();
+    FieldDraw { built, markers, own_who }
+}
+
+/// The marker of a player or of a non-player character: where its feet are in view space, in its
+/// tint. `None` if it cannot be drawn (behind the camera).
 fn marker(view: &FieldView, player: &AvatarPlayer<'_>) -> Option<PlayerSprite> {
     view.to_view(player.pos).map(|p| PlayerSprite { x: p.x, y: p.y, tint: player.tint, own: player.own, party: player.party })
+}
+
+/// Where the name of `subject` goes, in view space: over the head of its model when it was drawn
+/// as one (`built` says), else at its marker (`at` is where it stands).
+pub(crate) fn label_anchor(built: Option<&Built>, view: &FieldView, own: Who, subject: Subject, at: Pos) -> Option<Pos> {
+    let who = match subject {
+        Subject::Own => own,
+        Subject::Remote(id) => Who(id.0),
+        Subject::Npc(id) => npc_who(id),
+    };
+    built.and_then(|b| b.anchors.get(&who).copied()).or_else(|| view.to_view(at))
 }
 
 impl ApplicationHandler for App {
@@ -925,5 +1001,91 @@ mod tests {
             assert!(!describe_request(cmd).contains('\n'));
         }
         assert!(describe_request(PartyCommand::Invite(EntityId(3))).contains("entity 3"));
+    }
+
+    // ---- the frame of the field: players, the area's characters, models and markers -------------
+
+    /// A state in the fixture's plaza whose snapshot names the given non-player characters
+    /// (name, model, standing clip, x) and no other player.
+    fn state_with_npcs(npcs: &[(&str, &str, Option<&str>, f32)]) -> ClientState {
+        let area = AreaId { game: GameId::Fixture, key: "plaza".into() };
+        let mut s = ClientState::new(EntityId(1), AccountId(1), Pos::new(0.0, -40.0, 0.0), area.clone());
+        let npcs = npcs
+            .iter()
+            .enumerate()
+            .map(|(i, (name, model, idle, x))| fmv_protocol::NpcSnapshot {
+                id: i as u32,
+                name: (*name).into(),
+                model: (*model).into(),
+                idle_animation: idle.map(str::to_string),
+                pos: Pos::new(*x, 0.0, 0.0),
+                facing: 0.0,
+            })
+            .collect();
+        assert!(s.apply(0.0, ServerMsg::AreaSnapshot { area, tick: 1, entities: vec![], npcs }).is_none());
+        s
+    }
+
+    /// Without models (no `char.lgp`, a fixture area) the characters of the area are markers, drawn
+    /// before the players so that every player is over them, in the colour `npc_appearance` gives.
+    #[test]
+    fn without_models_the_areas_characters_are_markers_under_the_players() {
+        use crate::npc::npc_appearance;
+        let state = state_with_npcs(&[("gu0", "agyb", Some("acfe"), -60.0), ("gu1", "aagb", None, 60.0)]);
+        let adapter = fmv_fixture::FixtureAdapter::new();
+        let view = FieldView::top_down(fmv_adapter_api::GameAdapter::load_area(&adapter, "plaza").unwrap().as_ref());
+        let mut epoch = 0;
+        let draw = field_draw(None, &mut epoch, &view, &state, [1, 2, 3], 1.0, 0.0);
+        assert!(draw.built.is_none());
+        assert_eq!(epoch, state.npc_epoch(), "the frame noted which list of characters it saw");
+        assert_eq!(draw.markers.len(), 3, "two characters and the local player");
+        let npcs = state.npc_views();
+        for (marker, npc) in draw.markers.iter().zip(npcs) {
+            assert_eq!(marker.tint, npc_appearance(npc).marker_tint);
+            assert!(!marker.own && !marker.party, "a character is neither the local player nor a party member");
+            let at = view.to_view(npc.pos).unwrap();
+            assert_eq!((marker.x, marker.y), (at.x, at.y), "it stands where its data puts it");
+        }
+        let own = draw.markers.last().unwrap();
+        assert!(own.own && own.tint == [1, 2, 3], "the local player comes last");
+        // The names are over the markers (there is no model to put them over).
+        let spot = view.to_view(npcs[0].pos).unwrap();
+        assert_eq!(label_anchor(None, &view, draw.own_who, Subject::Npc(0), npcs[0].pos), Some(spot));
+    }
+
+    /// With models: the character whose model loads is a model (and not also a marker), the one
+    /// whose data names no model stays a marker, the player is a model too; the models were loaded
+    /// when the list of characters was first seen, and their names go over their heads.
+    #[test]
+    fn with_models_the_areas_characters_are_models_and_the_ones_without_stay_markers() {
+        use crate::avatar::frame::tests as scene;
+        use crate::avatar::library::tests::Counting;
+        use crate::avatar::library::AvatarLibrary;
+        let state = state_with_npcs(&[("gu0", "agyb", Some("acfe"), -60.0), ("ghost", "", None, 60.0)]);
+        let mut view = scene::view();
+        view.stage = Some(scene::stage());
+        let loader = Counting::new(std::rc::Rc::default(), vec![]);
+        let asked = std::rc::Rc::clone(&loader.asked_npc);
+        let mut avatars = Avatars::new(AvatarLibrary::new(Box::new(loader)));
+        let mut epoch = 0;
+        let draw = field_draw(Some(&mut avatars), &mut epoch, &view, &state, [1, 2, 3], 1.0, 0.016);
+        assert_eq!(*asked.borrow(), ["agyb/acfe"], "asked for once, by the time the first frame was built");
+        let built = draw.built.as_ref().expect("a stage and avatars: models");
+        assert_eq!(built.frame.models.len(), 2, "the character with a model and the local player");
+        // The players list is [gu0, ghost, own]: only `ghost` (index 1) has no model.
+        assert_eq!(built.markers, [1]);
+        assert_eq!(draw.markers.len(), 1, "one marker: the character the data names no model for");
+        assert!(!draw.markers[0].own);
+        // A second frame in the same state loads nothing and keeps the epoch.
+        let again = field_draw(Some(&mut avatars), &mut epoch, &view, &state, [1, 2, 3], 1.0, 0.016);
+        assert_eq!(asked.borrow().len(), 1);
+        assert_eq!(again.built.unwrap().frame.models.len(), 2);
+        // The model's name goes over its head; the markers' over the marker.
+        let npcs = state.npc_views();
+        let feet = view.to_view(npcs[0].pos).unwrap();
+        let over = label_anchor(Some(built), &view, draw.own_who, Subject::Npc(0), npcs[0].pos).unwrap();
+        assert!(over.y > feet.y + 10.0, "{over:?} over {feet:?}");
+        let marker_spot = view.to_view(npcs[1].pos).unwrap();
+        assert_eq!(label_anchor(Some(built), &view, draw.own_who, Subject::Npc(1), npcs[1].pos), Some(marker_spot));
     }
 }

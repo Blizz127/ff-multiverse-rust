@@ -8,7 +8,9 @@
 //! `Hello` (token or registration, checked against the account store) -> `Welcome` +
 //! `AreaManifest` -> `JoinArea` (or `CannotJoin`; the area, fingerprint and edition are checked)
 //! -> spawn -> `AreaSnapshot` and `InstancePlacement` to the joiner / `PlayerJoined` to the
-//! others -> `MoveIntent` / `Ping` / party requests / `Leave`.
+//! others -> `MoveIntent` / `Ping` / party requests / `Leave`. Walking through an exit makes the
+//! world offer the player another area (`AreaChange`); it answers `JoinArea` or `CannotJoin`
+//! exactly as at the first join.
 //!
 //! Everything read from the socket is untrusted: no `unwrap`/indexing on it, every string that
 //! is echoed to other players or to the log is clamped first, and frame size is bounded by
@@ -69,7 +71,9 @@ use crate::accounts::{self, Login, Release};
 use crate::config::ServerConfig;
 use crate::deferred;
 use crate::limits::{throttle_notice, Limits, LogVerdict, PeerKey, RegistrationRefusal};
-use crate::world::{BattleReply, CloseFlag, JoinError, MoveOutcome, NewPlayer, Outbound, OutboundTx, PartyOutcome, World};
+use crate::world::{
+    BattleReply, CloseFlag, JoinError, MoveOutcome, NewPlayer, Outbound, OutboundTx, PartyOutcome, TravelReply, World,
+};
 
 /// Reported in `Welcome::server_build` and the READY line.
 pub const SERVER_BUILD: &str = env!("CARGO_PKG_VERSION");
@@ -613,10 +617,28 @@ impl Conn {
                 ClientMsg::BattleCommand { battle_id, actor, command } => {
                     self.battle(|w, now| w.battle_command(entity, battle_id, actor, command, now))?
                 }
-                ClientMsg::Hello { .. } | ClientMsg::JoinArea { .. } | ClientMsg::CannotJoin { .. } => {
+                // The answer to an `AreaChange` (a transfer between areas, see `world::areas`).
+                ClientMsg::JoinArea { area, fingerprint, provenance } => {
+                    self.travel(|w, now| w.join_area(entity, &area, &fingerprint, &provenance, now))?
+                }
+                ClientMsg::CannotJoin { area, .. } => self.travel(|w, now| w.cannot_join(entity, &area, now))?,
+                ClientMsg::Hello { .. } => {
                     return Err(Close::reject(RejectCode::BadRequest, "unexpected message after joining"));
                 }
             }
+        }
+    }
+
+    /// Run the answer to an `AreaChange` against the world. An answer that does not fit (no
+    /// transfer is under way, the area or edition is not the one offered, a second refusal) ends the
+    /// connection like any other message out of place.
+    fn travel(&mut self, op: impl FnOnce(&mut World, Instant) -> TravelReply) -> Result<(), Close> {
+        let reply = self.shared.with_world(|world| op(world, Instant::now()));
+        match reply {
+            TravelReply::Done => Ok(()),
+            TravelReply::Refused(code, reason) => Err(Close::reject(code, reason)),
+            TravelReply::NotTravelling => Err(Close::reject(RejectCode::BadRequest, "unexpected message after joining")),
+            TravelReply::Gone => Err(Close::Dropped("removed from the world")),
         }
     }
 

@@ -355,7 +355,7 @@ impl ServerConfig {
 mod tests {
     use super::*;
     use fmv_core::{AnimState, AreaId, AvatarAppearance, EntityId, EntitySnapshot, GameId, Pos};
-    use fmv_protocol::{encode, ServerMsg, MAX_FRAME};
+    use fmv_protocol::{encode, NpcSnapshot, ServerMsg, MAX_FRAME, MAX_NPCS_PER_AREA};
 
     #[test]
     fn default_is_valid_and_matches_spec_defaults() {
@@ -518,10 +518,22 @@ mod tests {
                 appearance_ref: Some(wide(crate::MAX_APPEARANCE_REF)),
             },
         };
+        // The area's NPCs (static, at most `MAX_NPCS_PER_AREA`) ride in the same frame: the worst
+        // case counts them too (the server clips a name to 24 characters, a model and an animation
+        // to 16).
+        let npc = |i: u32| NpcSnapshot {
+            id: u32::MAX - i,
+            name: wide(24),
+            model: wide(16),
+            idle_animation: Some(wide(16)),
+            pos: Pos::new(-f32::MAX, f32::MIN_POSITIVE, -f32::MAX),
+            facing: -f32::MAX,
+        };
         let snapshot = |n: usize| ServerMsg::AreaSnapshot {
             area: AreaId { game: GameId::Fixture, key: "x".repeat(64) },
             tick: u64::MAX,
             entities: (0..n as u64).map(entity).collect(),
+            npcs: (0..MAX_NPCS_PER_AREA as u32).map(npc).collect(),
         };
         let len = |n: usize| encode(&snapshot(n)).expect("a snapshot of a full server must fit in one frame").len();
         let per_entity = len(2) - len(1);

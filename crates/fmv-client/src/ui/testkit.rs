@@ -216,7 +216,7 @@ pub fn serve_join(reply: Reply) -> (String, std::thread::JoinHandle<Seen>) {
             write_msg(&mut wr, &manifest).await.expect("manifest");
             seen.join = Some(tokio::time::timeout(limit, read_msg(&mut rd)).await.expect("JoinArea in time").expect("JoinArea"));
             let me = EntitySnapshot { id: EntityId(7), pos: spawn_of(&adapter), facing: 0.0, anim: AnimState::Idle, avatar: own };
-            write_msg(&mut wr, &ServerMsg::AreaSnapshot { area: info.id, tick: 1, entities: vec![me] }).await.expect("snapshot");
+            write_msg(&mut wr, &ServerMsg::AreaSnapshot { area: info.id, tick: 1, entities: vec![me], npcs: vec![] }).await.expect("snapshot");
             loop {
                 match tokio::time::timeout(limit, read_msg::<_, ClientMsg>(&mut rd)).await {
                     Ok(Ok(ClientMsg::Leave)) => {

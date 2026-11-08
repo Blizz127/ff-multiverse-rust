@@ -1,9 +1,12 @@
-//! Authoritative FF Multiverse server for protocol v3 (`fmv-protocol`).
+//! Authoritative FF Multiverse server for protocol v4 (`fmv-protocol`).
 //!
-//! The server hosts exactly one area, obtained from a `GameAdapter` (`Box<dyn GameAdapter>`, so
-//! wiring a real game later is a one-line change in the binary). It owns all positions: clients
-//! send `MoveIntent`s, the server checks them against the speed rule and the adapter's
-//! `validate_move`, and broadcasts the result on a fixed tick.
+//! The server hosts the areas of one `GameAdapter` (`Box<dyn GameAdapter>`, so wiring a real game
+//! later is a one-line change in the binary): the *entry* area named by the configuration, which
+//! every player joins, and every other area the adapter can load, which is loaded when a player
+//! walks through an exit that leads there and unloaded some time after the last player left it
+//! (see `world::areas`, and `fmv_protocol`, "Area travel"). It owns all positions: clients send
+//! `MoveIntent`s, the server checks them against the speed rule and the adapter's `validate_move`,
+//! and broadcasts the result, per area, on a fixed tick.
 //!
 //! It never sends asset bytes. Clients are offered the area by id, content fingerprint and
 //! path-free provenance summary, and must confirm they hold the same copy locally.
@@ -212,16 +215,19 @@ impl Server {
     /// Load the configured area from `adapter` and bind the listener (port 0 picks a free port).
     pub async fn bind(config: ServerConfig, adapter: Box<dyn GameAdapter>) -> Result<Self, ServerError> {
         config.validate()?;
+        // The adapter stays with the world: the areas behind the entry area's exits are loaded
+        // from it when a player first walks there.
+        let adapter: Arc<dyn GameAdapter> = Arc::from(adapter);
         let area = adapter.load_area(&config.area_key).map_err(|source| ServerError::Area {
             key: config.area_key.clone(),
             available: list_available(adapter.as_ref()),
             source,
         })?;
-        drop(adapter);
 
         // `AreaInfo::provenance` carries local install paths. Only the path-free summary may be
         // sent or logged; never format the full `AreaInfo` or `EditionProvenance`.
         let info = area.info().clone();
+        let (exit_count, npc_count) = (area.exits().len(), area.npcs().len());
         let label = label_area(&info)?;
         let fixture = label.fixture;
         if fixture && !info.fixture {
@@ -240,6 +246,8 @@ impl Server {
         let display_name = label.display_name;
 
         let mut world = World::with_party_config(area, config.party)?;
+        world.set_area_source(adapter);
+        world.set_travel_timeout(config.join_timeout);
         world.configure_battle(config.battle.clone(), config.debug_encounters);
         let (store, ephemeral_state) = open_store(&config).await?;
         let listener = TcpListener::bind(config.bind)
@@ -247,7 +255,7 @@ impl Server {
             .map_err(|source| ServerError::Bind { addr: config.bind, source })?;
         let local_addr = listener.local_addr()?;
 
-        info!(area = %area_id, name = %display_name, ?provenance, fixture, "hosting area");
+        info!(area = %area_id, name = %display_name, ?provenance, fixture, exits = exit_count, npcs = npc_count, "hosting area (the entry area; the areas its exits lead to are loaded when a player walks there)");
         if fixture {
             warn!("hosting a FIXTURE area: synthetic test content, NOT FF7 support");
         }
@@ -263,7 +271,7 @@ impl Server {
             (None, false) => info!("battles unsupported on this server (no owned battle data); battle requests are refused"),
         }
         if !local_addr.ip().is_loopback() {
-            warn!(%local_addr, "listening on a non-loopback address; protocol v3 is not encrypted (account tokens and game traffic cross the network in the clear): use it only on a network you trust");
+            warn!(%local_addr, "listening on a non-loopback address; protocol v4 is not encrypted (account tokens and game traffic cross the network in the clear): use it only on a network you trust");
         }
 
         let build = config.build_string();
@@ -497,6 +505,7 @@ async fn tick_loop(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) {
                     world.advance_tick();
                     world.expire_parties(now);
                     world.advance_battles(now);
+                    world.manage_areas(now);
                 });
             }
             () = wait_flag(&mut shutdown) => break,

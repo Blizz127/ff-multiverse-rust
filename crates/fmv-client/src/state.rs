@@ -30,7 +30,7 @@ use crate::interp::{normalize_angle, Pose, Sample, SnapshotBuffer};
 use crate::party::{nearest_peer, PartyMirror};
 use fmv_adapter_api::{AreaRuntime, MoveResult};
 use fmv_core::{AccountId, AnimState, AreaId, AvatarAppearance, EntityId, EntitySnapshot, Pos};
-use fmv_protocol::ServerMsg;
+use fmv_protocol::{NpcSnapshot, ServerMsg, MAX_NPCS_PER_AREA, NPC_NAME_CHARS, NPC_REF_CHARS};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
@@ -81,13 +81,20 @@ pub struct OwnPlayer {
 
 impl OwnPlayer {
     pub fn new(pos: Pos) -> Self {
+        Self::at(pos, 0.0)
+    }
+
+    /// A player standing at `pos`, heading `facing`, that the server knows about as it is (nothing
+    /// to announce): what it is after arriving in a new area, where the server put it.
+    pub fn at(pos: Pos, facing: f32) -> Self {
+        let facing = if facing.is_finite() { facing } else { 0.0 };
         Self {
             pos,
-            facing: 0.0,
+            facing,
             anim: AnimState::Idle,
             seq: 0,
             last_intent_t: f64::NEG_INFINITY,
-            last_sent: (pos, 0.0, AnimState::Idle),
+            last_sent: (pos, facing, AnimState::Idle),
             resync: false,
             resync_seq: None,
             server_pos: None,
@@ -270,6 +277,46 @@ struct Remote {
     buf: SnapshotBuffer,
 }
 
+/// A non-player character of the area as the renderer sees it: static scenery that stands where
+/// the server's snapshot of the area put it. Every text is cleaned and bounded on arrival (it is
+/// the server's, so untrusted); `model` and `idle_animation` are references into this machine's
+/// own game files that [`crate::npc::npc_appearance`] resolves.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NpcView {
+    /// Index in the area's NPC list (not an entity id).
+    pub id: u32,
+    /// What the area's data calls it (FF7: the script entity name, `gu0`): its label.
+    pub name: String,
+    /// Adapter-defined model reference (FF7: the `char.lgp` skeleton stem).
+    pub model: String,
+    /// The clip that shows it standing, if the data names one.
+    pub idle_animation: Option<String>,
+    pub pos: Pos,
+    pub facing: f32,
+}
+
+/// Clean untrusted server text and clamp it to `max` characters.
+fn clean_text(s: &str, max: usize) -> String {
+    crate::net::clean(s).chars().take(max).collect()
+}
+
+impl NpcView {
+    /// `None` for an NPC the renderer must not touch: a position or heading that is not finite.
+    fn from_snapshot(n: NpcSnapshot) -> Option<Self> {
+        if !n.pos.is_finite() || !n.facing.is_finite() {
+            return None;
+        }
+        Some(Self {
+            id: n.id,
+            name: clean_text(&n.name, NPC_NAME_CHARS),
+            model: clean_text(&n.model, NPC_REF_CHARS),
+            idle_animation: n.idle_animation.map(|a| clean_text(&a, NPC_REF_CHARS)).filter(|a| !a.is_empty()),
+            pos: n.pos,
+            facing: normalize_angle(n.facing),
+        })
+    }
+}
+
 /// Longest `appearance_ref` kept from the network (the server's own limit); a longer one is
 /// dropped, which draws the default look.
 pub const MAX_APPEARANCE_REF: usize = 64;
@@ -282,7 +329,8 @@ fn kept_appearance(avatar: &AvatarAppearance) -> Option<String> {
 #[derive(Debug)]
 pub struct ClientState {
     self_entity: EntityId,
-    /// The area we joined (verified against local content during the handshake).
+    /// The area we are in (verified against local content: during the handshake for the first
+    /// one, when the server offers it for every later one, see [`ClientState::change_area`]).
     area: AreaId,
     pub own: OwnPlayer,
     /// Our party and pending invites, as the server announced them.
@@ -290,9 +338,18 @@ pub struct ClientState {
     /// The battle we are in, replayed from the server's messages (see `crate::battle`).
     pub battle: BattleClient,
     remotes: BTreeMap<EntityId, Remote>,
+    /// The non-player characters of the current area (from its `AreaSnapshot`).
+    npcs: Vec<NpcView>,
+    /// Counts the times the NPC list was replaced (a snapshot, a change of area): a renderer that
+    /// keeps something per set of NPCs knows by it when to rebuild.
+    npc_epoch: u64,
+    /// Peers seen in the CURRENT area (cleared when the area changes).
     peers_seen: BTreeSet<EntityId>,
     updates: u64,
     rejected: u64,
+    /// How many times the server moved us on to another area (a refused transfer and the way back
+    /// to where we were do not count).
+    area_changes: u64,
     last_rtt: Option<Duration>,
     /// The look the server shows for our own entity (from its snapshots).
     own_appearance: Option<String>,
@@ -309,9 +366,12 @@ impl ClientState {
             party: PartyMirror::new(account),
             battle: BattleClient::new(account),
             remotes: BTreeMap::new(),
+            npcs: Vec::new(),
+            npc_epoch: 0,
             peers_seen: BTreeSet::new(),
             updates: 0,
             rejected: 0,
+            area_changes: 0,
             last_rtt: None,
             own_appearance: None,
         }
@@ -319,6 +379,41 @@ impl ClientState {
 
     pub fn self_entity(&self) -> EntityId {
         self.self_entity
+    }
+    /// The area we are in.
+    #[cfg(test)]
+    pub fn area(&self) -> &AreaId {
+        &self.area
+    }
+    /// How many times the server moved us on to another area.
+    pub fn area_changes(&self) -> u64 {
+        self.area_changes
+    }
+    /// The non-player characters of the current area, in the server's order.
+    pub fn npc_views(&self) -> &[NpcView] {
+        &self.npcs
+    }
+    /// Changes whenever the list [`ClientState::npc_views`] answers was replaced.
+    pub fn npc_epoch(&self) -> u64 {
+        self.npc_epoch
+    }
+
+    /// The server moved us to `area` and we hold it (the session checked it against local content
+    /// and answered `JoinArea`): everything that belongs to the old area goes (the other players,
+    /// the NPCs, the peers seen), and we stand at `arrival` heading `facing` (the server's own
+    /// placement; it repeats it in the `AreaSnapshot` that follows). The party, the battle mirror
+    /// and the counters are ours, not the area's, and stay. `forward` is false for the way back
+    /// after a transfer we refused (it is not a change).
+    pub fn change_area(&mut self, area: AreaId, arrival: Pos, facing: f32, forward: bool) {
+        self.area = area;
+        self.remotes.clear();
+        self.npcs.clear();
+        self.npc_epoch += 1;
+        self.peers_seen.clear();
+        self.own = OwnPlayer::at(arrival, facing);
+        if forward {
+            self.area_changes += 1;
+        }
     }
     /// Number of `EntityUpdate` messages received.
     pub fn updates(&self) -> u64 {
@@ -347,24 +442,30 @@ impl ClientState {
     }
 
     /// Apply one server message. Returns `Some(reason)` when the session must end: the server
-    /// ended it, or broke the protocol in a way that would mix content (the area was agreed once,
-    /// during the handshake, after checking it against local content; it never changes).
+    /// ended it, or broke the protocol in a way that would mix content (an area is only ever
+    /// entered after checking it against local content: the first one in the handshake, every later
+    /// one through [`ClientState::change_area`], which the session calls on an `AreaChange`).
     pub fn apply(&mut self, now: f64, msg: ServerMsg) -> Option<String> {
         match msg {
-            ServerMsg::AreaSnapshot { area, entities, .. } => {
+            ServerMsg::AreaSnapshot { area, entities, npcs, .. } => {
                 if area != self.area {
                     return Some(format!(
-                        "protocol error: the server sent a snapshot of area `{}` after we joined `{}`",
+                        "protocol error: the server sent a snapshot of area `{}` while we are in `{}`",
                         crate::net::clean(&area.to_string()),
                         self.area
                     ));
                 }
-                // A full snapshot replaces the set of remote entities.
+                // A full snapshot replaces the set of remote entities and the area's NPCs.
                 self.remotes.clear();
                 for e in entities {
                     self.upsert(now, e);
                 }
+                self.npcs = npcs.into_iter().take(MAX_NPCS_PER_AREA).filter_map(NpcView::from_snapshot).collect();
+                self.npc_epoch += 1;
             }
+            // Handled before it gets here: the session answers it (JoinArea / CannotJoin) and then
+            // calls `change_area`. Nothing for the state to do with the offer itself.
+            ServerMsg::AreaChange { .. } => {}
             ServerMsg::EntityUpdate { entities, .. } => {
                 self.updates += 1;
                 for e in entities {
@@ -523,6 +624,7 @@ mod tests {
                 area: plaza(),
                 tick: 0,
                 entities: vec![snap(1, 0.0, 0.0), snap(2, 5.0, 5.0)],
+                npcs: vec![],
             },
         );
         assert_eq!((s.peers_seen(), s.updates(), s.rejected()), (1, 0, 0));
@@ -724,6 +826,7 @@ mod tests {
                 area: plaza(),
                 tick: 5,
                 entities: vec![snap(3, 1.0, 1.0)],
+                npcs: vec![],
             },
         );
         assert!(r.is_none(), "a resync of the joined area is fine");
@@ -749,6 +852,7 @@ mod tests {
                     area: other,
                     tick: 9,
                     entities: vec![snap(3, 1.0, 1.0)],
+                    npcs: vec![],
                 },
             )
             .expect("a snapshot of another area must end the session");
@@ -873,6 +977,7 @@ mod tests {
                     avatar_snap(4, Some(&long)),
                     avatar_snap(5, Some(&exact)),
                 ],
+                npcs: Vec::new(),
             },
         );
         assert_eq!(s.own_appearance(), Some("ff7/barret"));
@@ -1091,5 +1196,167 @@ mod tests {
         s.apply(0.2, ServerMsg::PlayerLeft { entity: EntityId(4) });
         s.apply(0.2, ServerMsg::PlayerLeft { entity: EntityId(3) });
         assert_eq!(s.nearest_invitable(1.0), None, "everybody left is already in the party");
+    }
+
+    // ---- areas: NPCs and moving on to another area ----
+
+    fn npc_snapshot(id: u32, name: &str) -> NpcSnapshot {
+        NpcSnapshot {
+            id,
+            name: name.into(),
+            model: "aaaa".into(),
+            idle_animation: Some("acfe".into()),
+            pos: Pos::new(10.0 * id as f32, 5.0, 0.0),
+            facing: 0.5,
+        }
+    }
+
+    fn snapshot_of(area: AreaId, entities: Vec<EntitySnapshot>, npcs: Vec<NpcSnapshot>) -> ServerMsg {
+        ServerMsg::AreaSnapshot { area, tick: 1, entities, npcs }
+    }
+
+    #[test]
+    fn a_snapshot_brings_the_areas_npcs_and_the_next_one_replaces_them() {
+        let mut s = state(Pos::default());
+        assert!(s.npc_views().is_empty());
+        let r = s.apply(0.0, snapshot_of(plaza(), vec![snap(1, 0.0, 0.0)], vec![npc_snapshot(0, "gu0"), npc_snapshot(1, "gu1")]));
+        assert!(r.is_none());
+        let names: Vec<&str> = s.npc_views().iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, ["gu0", "gu1"]);
+        assert_eq!((s.npc_views()[1].pos, s.npc_views()[1].model.as_str(), s.npc_views()[1].idle_animation.as_deref()), (Pos::new(10.0, 5.0, 0.0), "aaaa", Some("acfe")));
+        // NPCs never count as players: they are not remotes and not peers.
+        assert_eq!((s.remote_count(), s.peers_seen()), (0, 0));
+        // A new snapshot is the whole truth about the area's NPCs.
+        s.apply(1.0, snapshot_of(plaza(), vec![], vec![npc_snapshot(0, "only")]));
+        assert_eq!(s.npc_views().len(), 1);
+        s.apply(2.0, snapshot_of(plaza(), vec![], vec![]));
+        assert!(s.npc_views().is_empty());
+    }
+
+    /// A renderer that keeps something per set of NPCs rebuilds when the epoch moves: on every
+    /// snapshot and every change of area, and not on the traffic in between.
+    #[test]
+    fn the_npc_epoch_moves_when_the_list_is_replaced_and_only_then() {
+        let mut s = state(Pos::default());
+        let start = s.npc_epoch();
+        s.apply(0.0, snapshot_of(plaza(), vec![snap(1, 0.0, 0.0)], vec![npc_snapshot(0, "gu0")]));
+        let first = s.npc_epoch();
+        assert_ne!(first, start);
+        // Updates, joins and leaves do not touch the NPCs.
+        s.apply(0.1, update(vec![snap(1, 1.0, 1.0)]));
+        s.apply(0.2, ServerMsg::PlayerLeft { entity: EntityId(9) });
+        assert_eq!(s.npc_epoch(), first);
+        // Another snapshot (even of the same list) is a new list; so is leaving the area.
+        s.apply(1.0, snapshot_of(plaza(), vec![], vec![npc_snapshot(0, "gu0")]));
+        let second = s.npc_epoch();
+        assert_ne!(second, first);
+        s.change_area(plaza(), Pos::default(), 0.0, true);
+        assert_ne!(s.npc_epoch(), second);
+        assert!(s.npc_views().is_empty());
+    }
+
+    #[test]
+    fn npc_text_is_cleaned_and_bounded_and_unusable_ones_are_dropped() {
+        let mut s = state(Pos::default());
+        let mut hostile = npc_snapshot(0, "\u{1b}[2JSMOKE\nforged\u{202e}");
+        hostile.model = "m".repeat(500);
+        hostile.idle_animation = Some("\u{1b}".into());
+        let mut nan = npc_snapshot(1, "nan");
+        nan.pos = Pos::new(f32::NAN, 0.0, 0.0);
+        let mut inf_facing = npc_snapshot(2, "inf");
+        inf_facing.facing = f32::INFINITY;
+        let mut huge_facing = npc_snapshot(3, "huge");
+        huge_facing.facing = 3.0e38;
+        s.apply(0.0, snapshot_of(plaza(), vec![], vec![hostile, nan, inf_facing, huge_facing]));
+        let views = s.npc_views();
+        assert_eq!(views.len(), 2, "the two with a position or heading that is not finite are dropped");
+        assert!(!views[0].name.chars().any(|c| c.is_control() || c == '\u{202e}'), "{:?}", views[0].name);
+        assert_eq!(views[0].model.chars().count(), NPC_REF_CHARS);
+        assert_eq!(views[0].idle_animation, None, "an animation that is nothing visible is none");
+        assert!(views[1].facing.is_finite() && views[1].facing.abs() <= std::f32::consts::PI, "{}", views[1].facing);
+        // The list is bounded however much the server sends.
+        let many: Vec<NpcSnapshot> = (0..3 * MAX_NPCS_PER_AREA as u32).map(|i| npc_snapshot(i, "n")).collect();
+        s.apply(1.0, snapshot_of(plaza(), vec![], many));
+        assert_eq!(s.npc_views().len(), MAX_NPCS_PER_AREA);
+    }
+
+    fn yard() -> AreaId {
+        AreaId { game: GameId::Fixture, key: "yard".into() }
+    }
+
+    #[test]
+    fn changing_area_drops_the_old_areas_things_and_keeps_ours() {
+        let mut s = state(Pos::new(-100.0, 0.0, 0.0));
+        s.apply(0.0, snapshot_of(plaza(), vec![snap(1, -100.0, 0.0), snap(2, 5.0, 5.0)], vec![npc_snapshot(0, "gu0")]));
+        s.apply(0.1, update(vec![snap(3, 9.0, 9.0)]));
+        s.apply(0.2, ServerMsg::MoveRejected { seq: 9, corrected: Pos::new(1.0, 1.0, 0.0) });
+        assert_eq!((s.peers_seen(), s.remote_count(), s.npc_views().len(), s.area_changes()), (2, 2, 1, 0));
+        let (updates, rejected) = (s.updates(), s.rejected());
+
+        s.change_area(yard(), Pos::new(-200.0, 0.0, 0.0), 1.25, true);
+        assert_eq!(s.area(), &yard());
+        assert_eq!(s.area_changes(), 1);
+        assert_eq!((s.peers_seen(), s.remote_count(), s.npc_views().len()), (0, 0, 0), "peers are counted per area");
+        assert_eq!((s.updates(), s.rejected()), (updates, rejected), "the other counters are the session's");
+        assert_eq!((s.own.pos(), s.own.facing()), (Pos::new(-200.0, 0.0, 0.0), 1.25));
+        assert_eq!(s.self_entity(), EntityId(1), "the entity is the same in every area");
+        // Standing where the server put us announces nothing; the first step does.
+        assert!(s.own.next_intent(10.0).is_none());
+        s.own.set_motion(Pos::new(-190.0, 0.0, 0.0), 1.25, AnimState::Walk);
+        let first = s.own.next_intent(10.1).expect("the first step is announced");
+        assert_eq!(first.seq, 1, "a new area starts a new sequence");
+
+        // The snapshot of the NEW area is accepted, the old one is not any more.
+        let r = s.apply(11.0, snapshot_of(yard(), vec![snap(1, -190.0, 0.0), snap(7, 5.0, 5.0)], vec![npc_snapshot(0, "guard")]));
+        assert!(r.is_none());
+        assert_eq!((s.peers_seen(), s.npc_views().len()), (1, 1));
+        let why = s.apply(12.0, snapshot_of(plaza(), vec![], vec![])).expect("the old area's snapshot is a protocol error now");
+        assert!(why.contains("protocol error"), "{why}");
+
+        // The way back after a refused transfer is not a change.
+        s.change_area(plaza(), Pos::new(250.0, 0.0, 0.0), 0.0, false);
+        assert_eq!(s.area_changes(), 1);
+        s.change_area(yard(), Pos::new(-200.0, 0.0, 0.0), 0.0, true);
+        assert_eq!(s.area_changes(), 2);
+        // A non-finite heading from a broken server does not poison the player.
+        s.change_area(plaza(), Pos::default(), f32::NAN, true);
+        assert_eq!(s.own.facing(), 0.0);
+    }
+
+    /// The party mirror and the battle mirror are the player's, not the area's.
+    #[test]
+    fn the_party_survives_a_change_of_area() {
+        use fmv_protocol::{InviteId, PartyEvent, PartyId};
+        let mut s = state(Pos::default());
+        let formed = PartyEvent::PartyFormed {
+            party: PartyId(1),
+            invite: InviteId(1),
+            leader: AccountId(1),
+            members: vec![AccountId(1), AccountId(2)],
+        };
+        s.apply(0.0, ServerMsg::PartyEvent { seq: 1, event: formed, names: vec![party_name(1, "Me", 1), party_name(2, "Tifa", 2)] });
+        assert_eq!(s.party.party_size(), 2);
+        s.change_area(yard(), Pos::default(), 0.0, true);
+        assert_eq!(s.party.party_size(), 2);
+        assert!(!s.battle.in_battle());
+    }
+
+    /// An `AreaChange` is the session's to answer, never the state's: applied to the state alone
+    /// it changes nothing (and above all never moves us without the local content check).
+    #[test]
+    fn the_state_alone_ignores_an_area_change_offer() {
+        let mut s = state(Pos::default());
+        let info = FixtureAdapter::new().list_areas().remove(0);
+        let offer = ServerMsg::AreaChange {
+            area: yard(),
+            display_name: "yard".into(),
+            fingerprint: info.fingerprint,
+            provenance: info.provenance.summary(),
+            fixture: true,
+            arrival: Pos::new(-200.0, 0.0, 0.0),
+            arrival_facing: 0.0,
+        };
+        assert!(s.apply(0.0, offer).is_none());
+        assert_eq!((s.area(), s.area_changes()), (&plaza(), 0));
     }
 }

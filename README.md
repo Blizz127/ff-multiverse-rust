@@ -60,9 +60,16 @@ as a labelled test area; it says nothing about FF7 support.
 | M2-c/d | Shared battle, battle return, per-player rewards | done (battle subset; rewards logged and sent, not stored yet) |
 | Later | FF8, FF9, FF10 and FF12 adapters on the same core | planned |
 
-Not done yet: choosing an FF7 character model for your avatar, NPCs, field scripts, music, and
-the window's scrolling camera (it shows the whole background). The increment-by-increment plan
-is in `IMPLEMENTATION-PLAN.md`.
+**Walking between fields (protocol v4).** The server hosts many fields: the entry field
+(`md1stin`) is always loaded and any field behind one of its gateways is loaded the first time a
+player walks through the gateway and unloaded a minute after the last player left it. Parties may
+span fields, and the fields' NPCs (the characters a field's own data places: Sector 1's guards,
+for example) are announced with every snapshot. See "Walking between fields" below.
+
+Not done yet: field scripts (exits that scripts decide, such as the `MAPJUMP`s of story scenes,
+are not followed; only a field's own gateways are), NPC animation and talking, music, and the
+window's scrolling camera (it shows the whole background). The increment-by-increment plan is in
+`IMPLEMENTATION-PLAN.md`.
 
 ## Workspace
 
@@ -283,6 +290,60 @@ default; `--debug`, `--build` and `--bin-dir <dir>` are available, and `--help` 
 rest. It runs the processes with throw-away XDG directories, so it never touches your real
 library or state.
 
+## Walking between fields
+
+A field's gateways (up to twelve line segments in its trigger section, each naming a target
+field and an arrival point) are its **exits**. The **server** watches every move it applies:
+a move that crosses an exit line (from strictly one side of the line to the other or onto it)
+takes the player out of the field. It is then *in transit*: nobody sees it, its moves are
+ignored and it cannot start a battle. The server loads the target field if it must (from the
+same owned archive; a target that cannot be loaded closes the exit), settles the arrival on
+the target's walkable surface and offers it to the client (`AreaChange`: area, fingerprint,
+path-free provenance, arrival position and heading). The client checks the offer against **its
+own** copy of the field exactly as it checks the first field, loads it, answers `JoinArea` (or
+`CannotJoin`, in which case the server sends it back where it stood) and the server answers
+with the new field's `AreaSnapshot` (players and NPCs) and `InstancePlacement`. The players of
+the old field hear `PlayerLeft`, those of the new one `PlayerJoined`; every broadcast reaches
+only the field it is about. Unanswered offers time out like the first join. Nothing but ids,
+fingerprints, positions and NPC names crosses the wire: the client draws the new field from
+its own files.
+
+Parties, accounts and battles belong to the world, not to a field: a party can be spread over
+several fields (each member is placed in its own field with the leader's phase), and a battle
+takes the party members that stand in the requester's field. A player in a battle cannot
+travel. The window rebuilds its view (camera, background, walkmesh) on arrival; the HUD names
+the field. **NPCs** are the characters whose placement is unconditional in the field's init
+script (not player-bound, not hidden at start). The window draws each as the field model its data
+names (the skeleton and the standing clip the field's model loader lists for it: the guards of
+`md1stin`, the AVALANCHE members and the doors of `md1_1`) with the same renderer as the players'
+models: standing still where the data puts it, facing the way it says, a shadow under it and its
+name over its head, from **your own** `char.lgp` (only the two names cross the wire, and they are
+only ever looked up as entries of that archive). A character whose model is not to be had here (no
+`char.lgp`, a FIXTURE area, a model that does not load, or an area naming more than 24 different
+models) is a marker with its name over it instead, never a stand-in character. `npc_appearance` in
+`crates/fmv-client/src/npc.rs` is the one place that decides which. The offscreen test
+`cargo test -p fmv-client -- --ignored offscreen_real_ff7_npcs_in_two_fields` (see
+`crates/fmv-client/src/avatar/shots.rs` for the variables) draws `md1stin` and `md1_1` this way.
+
+Headless bots: `--travel md1_1,md1stin` walks through the exits to those fields in order
+(`area_changes=` at the end of the SMOKE line counts the moves; `peers_seen` counts the peers of
+the field the bot ended in), a bot that has a party to form waits for it first, and bots
+without `--travel` never walk across an exit by accident. `scripts/travel-smoke.sh` runs two
+bots in a party from `md1stin` through its gateway to `md1_1` against your own library
+(read-only, throw-away state) and back; `scripts/travel-smoke.sh --fixture` does the same on the
+synthetic FIXTURE rooms (`fmv-server --game fixture-rooms`, `fmv-client --game fixture-rooms
+--name X`: a hall and a yard joined by an exit each way, with one NPC in the yard; **not FF7**) and
+needs no owned data.
+
+Area travel is what **protocol v4** adds to v3: a v3 client does not know `AreaChange`, so the
+version was bumped and a server refuses a v3 client at the handshake with a clear
+`ProtocolMismatch` reject (instead of losing it at the first exit it crosses). Both sides must be
+built from this version or later.
+
+Not done: exits that scripts decide (FF7 `MAPJUMP`s and line triggers; they need the script VM
+and the game's story variables), conditional NPCs, NPC animation and talking, and per-phase
+instances (an area is one instance whatever the story phases of the players in it).
+
 ## Accounts, avatars and parties
 
 **Accounts.** A client connects with a token or registers a display name. Registering creates
@@ -329,7 +390,7 @@ same way (checked over all 702 fields of that build: every enabled table's weigh
 and every formation exists in `scene.bin`). A starting party wins 301 and 303 every time (200 of
 200 seeded runs each, both members attacking), which is why the smoke script uses 301.
 
-**Protocol v3** (`fmv-protocol`) carries all of the above; its module docs describe the flow,
+**Protocol v4** (`fmv-protocol`) carries all of the above; its module docs describe the flow,
 and golden JSON tests pin the wire format (the engine's own event, command and outcome types
 included). A client or server of another protocol version is refused with a clear message.
 
@@ -397,6 +458,8 @@ to a command). Never commit or share any of it.
 crates/                  the Cargo workspace (see the table above)
 scripts/package.sh       build and package a release tarball
 scripts/smoke.sh         two-bot local smoke test
+scripts/battle-smoke.sh  shared-battle smoke test (real data)
+scripts/travel-smoke.sh  walking between fields: two bots, md1stin -> md1_1 and back (real data)
 deploy/                  systemd user unit template and deployment procedure
 IMPLEMENTATION-PLAN.md   first-milestone plan and design constraints
 ```

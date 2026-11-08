@@ -35,7 +35,7 @@
 #
 # --fixture: the synthetic FIXTURE server (no battle data) with --debug-encounters and one
 # --battle-auto --debug-encounters bot. Expected: the request is refused cleanly ("this server
-# cannot run battles"), the bot exits 0 and prints battles=0 victories=0.
+# cannot run battles"), the bot exits 0 and prints battles=0 victories=0 (and area_changes=0, the last field of the line).
 #
 # Isolation (the owner's state directory is never touched, only its LIBRARY is read): the server and
 # the clients run with XDG_DATA_HOME/XDG_STATE_HOME/XDG_CONFIG_HOME/XDG_CACHE_HOME and FMV_STATE_DIR
@@ -537,7 +537,7 @@ run_fixture() {
   local smoke_line
   if smoke_line=$(last_line_with "$WORK/client-A.log" "SMOKE name="); then
     smoke_line=$(strip_ansi "$smoke_line")
-    [[ $smoke_line == *" battles=0 victories=0" ]] || problem "the SMOKE line does not end in battles=0 victories=0: $smoke_line"
+    [[ $smoke_line == *" battles=0 victories=0 area_changes=0" ]] || problem "the SMOKE line does not end in battles=0 victories=0 area_changes=0: $smoke_line"
     SMOKE_LINES=("$smoke_line")
   else
     problem "the bot printed no SMOKE line"

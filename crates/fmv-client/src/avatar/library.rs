@@ -88,15 +88,42 @@ enum Slot {
     Failed,
 }
 
+/// What identifies a loaded non-player model: its skeleton stem and standing clip, lower case.
+type NpcKey = (String, String);
+
+/// Most distinct non-player models the library holds at once, loaded or failed. The references
+/// come from the server, which can name a new model in every area, so the cache is bounded; the
+/// GPU keeps at most 32 characters (`gpu::MAX_GPU_MODELS`), which is why this leaves room under
+/// that for the eight playable ones. Beyond it a model is not loaded (its NPCs are markers) until
+/// [`AvatarLibrary::keep_npcs`] has dropped those of the area that was left.
+pub const MAX_NPC_MODELS: usize = 24;
+
+/// A model or clip reference worth looking up: a stem of the archive's entry names (letters,
+/// digits and underscores) within the length the protocol allows. Anything else cannot name an
+/// entry and is not looked up at all.
+fn plausible_stem(text: &str) -> bool {
+    !text.is_empty() && text.len() <= fmv_protocol::NPC_REF_CHARS && text.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// The cache key of a non-player model, or `None` when its references cannot be looked up.
+fn npc_key(model: &str, idle: Option<&str>) -> Option<NpcKey> {
+    let idle = idle?;
+    (plausible_stem(model) && plausible_stem(idle)).then(|| (model.to_ascii_lowercase(), idle.to_ascii_lowercase()))
+}
+
 /// The cache of loaded characters.
 pub struct AvatarLibrary {
     loader: Box<dyn CharacterLoader>,
     slots: HashMap<&'static str, Slot>,
+    /// The non-player models, by what the area's data names. Bounded by [`MAX_NPC_MODELS`].
+    npc_slots: HashMap<NpcKey, Slot>,
+    /// The cap was said once already (so a crowded field does not repeat it every frame).
+    npc_cap_reported: bool,
 }
 
 impl AvatarLibrary {
     pub fn new(loader: Box<dyn CharacterLoader>) -> Self {
-        Self { loader, slots: HashMap::new() }
+        Self { loader, slots: HashMap::new(), npc_slots: HashMap::new(), npc_cap_reported: false }
     }
 
     /// The table entry `appearance_ref` means, and whether the default had to stand in.
@@ -129,10 +156,62 @@ impl AvatarLibrary {
         Appearance { id, stand_in, asset }
     }
 
+    /// The model of a non-player character: `model` is its skeleton stem, `idle` the stem of the
+    /// clip that shows it standing (both untrusted, see [`plausible_stem`]). Loaded on first use,
+    /// then served from the cache (a failure is cached too). `None` is the answer for every
+    /// case in which the NPC is drawn as a marker instead: references that cannot name archive
+    /// entries, no standing clip named, a model or clip that does not load or does not fit, or the
+    /// area already uses [`MAX_NPC_MODELS`] other models. Never a stand-in character: a field full
+    /// of Clouds is worse than markers.
+    pub fn get_npc(&mut self, model: &str, idle: Option<&str>) -> Option<Arc<AvatarAsset>> {
+        let key = npc_key(model, idle)?;
+        if !self.npc_slots.contains_key(&key) {
+            if self.npc_slots.len() >= MAX_NPC_MODELS {
+                if !self.npc_cap_reported {
+                    self.npc_cap_reported = true;
+                    eprintln!("avatar: this area names more than {MAX_NPC_MODELS} different non-player models; the others are drawn as markers");
+                }
+                return None;
+            }
+            let slot = match self.loader.load_npc(&key.0, &key.1).and_then(AvatarAsset::new) {
+                Ok(asset) => Slot::Loaded(Arc::new(asset)),
+                Err(why) => {
+                    // The stems are plain ASCII (checked above), so they are safe to print.
+                    eprintln!("avatar: cannot load the non-player model {} with clip {} ({why}); its characters are drawn as markers", key.0, key.1);
+                    Slot::Failed
+                }
+            };
+            self.npc_slots.insert(key.clone(), slot);
+        }
+        match self.npc_slots.get(&key) {
+            Some(Slot::Loaded(asset)) => Some(Arc::clone(asset)),
+            _ => None,
+        }
+    }
+
+    /// The area changed (or its characters did): `models` are the non-player models its characters
+    /// name, as (skeleton, standing clip). What no longer appears there is dropped (so the cap
+    /// counts only the area being shown) and what does is loaded now, so that the first frame that
+    /// shows them does not stall.
+    pub fn keep_npcs<'a>(&mut self, models: impl IntoIterator<Item = (&'a str, Option<&'a str>)>) {
+        let wanted: Vec<NpcKey> = models.into_iter().filter_map(|(model, idle)| npc_key(model, idle)).collect();
+        self.npc_slots.retain(|key, _| wanted.contains(key));
+        self.npc_cap_reported = false;
+        for (model, idle) in &wanted {
+            self.get_npc(model, Some(idle));
+        }
+    }
+
     /// Characters currently held (loaded or failed): never more than the table has.
     #[cfg(test)]
     pub fn cached(&self) -> usize {
         self.slots.len()
+    }
+
+    /// Non-player models currently held (loaded or failed): never more than [`MAX_NPC_MODELS`].
+    #[cfg(test)]
+    pub fn cached_npcs(&self) -> usize {
+        self.npc_slots.len()
     }
 }
 
@@ -191,6 +270,16 @@ pub(crate) mod tests {
     pub(crate) struct Counting {
         pub asked: Rc<RefCell<Vec<&'static str>>>,
         pub fail: Vec<&'static str>,
+        /// The non-player models asked for, as `model/clip`.
+        pub asked_npc: Rc<RefCell<Vec<String>>>,
+        /// Non-player skeleton stems whose load fails.
+        pub fail_npc: Vec<&'static str>,
+    }
+
+    impl Counting {
+        pub(crate) fn new(asked: Rc<RefCell<Vec<&'static str>>>, fail: Vec<&'static str>) -> Self {
+            Self { asked, fail, asked_npc: Rc::default(), fail_npc: Vec::new() }
+        }
     }
 
     impl CharacterLoader for Counting {
@@ -201,11 +290,28 @@ pub(crate) mod tests {
             }
             Ok(character(*appearance, 1, 4, 3))
         }
+
+        fn load_npc(&mut self, model: &str, idle: &str) -> Result<Character, String> {
+            self.asked_npc.borrow_mut().push(format!("{model}/{idle}"));
+            if self.fail_npc.contains(&model) {
+                return Err("synthetic failure".into());
+            }
+            Ok(character(crate::avatar::source::NON_PLAYABLE, 1, 1, 1))
+        }
     }
 
     fn library(fail: Vec<&'static str>) -> (AvatarLibrary, Rc<RefCell<Vec<&'static str>>>) {
         let asked = Rc::new(RefCell::new(Vec::new()));
-        (AvatarLibrary::new(Box::new(Counting { asked: Rc::clone(&asked), fail })), asked)
+        (AvatarLibrary::new(Box::new(Counting::new(Rc::clone(&asked), fail))), asked)
+    }
+
+    /// A library over a [`Counting`] loader that fails for the NPC skeletons `fail_npc`, and the
+    /// list of the NPC models it was asked for.
+    fn npc_library(fail_npc: Vec<&'static str>) -> (AvatarLibrary, Rc<RefCell<Vec<String>>>) {
+        let mut loader = Counting::new(Rc::default(), vec![]);
+        loader.fail_npc = fail_npc;
+        let asked = Rc::clone(&loader.asked_npc);
+        (AvatarLibrary::new(Box::new(loader)), asked)
     }
 
     #[test]
@@ -287,6 +393,101 @@ pub(crate) mod tests {
         let mut lib = AvatarLibrary::new(Box::new(Bare));
         assert!(lib.get(Some("ff7/cloud")).asset.is_none());
         assert_eq!(lib.cached(), 1);
+    }
+
+    #[test]
+    fn a_non_player_model_is_loaded_once_by_its_stems_whatever_the_spelling() {
+        let (mut lib, asked) = npc_library(vec![]);
+        let guard = lib.get_npc("agyb", Some("acfe")).expect("loads");
+        let again = lib.get_npc("agyb", Some("acfe")).expect("cached");
+        assert!(Arc::ptr_eq(&guard, &again));
+        assert!(Arc::ptr_eq(&guard, &lib.get_npc("AGYB", Some("ACFE")).unwrap()), "the archive does not care about case, so neither does the cache");
+        // Another skeleton, or the same one with another standing clip, is another model.
+        let other = lib.get_npc("aagb", Some("acfe")).unwrap();
+        let other_clip = lib.get_npc("agyb", Some("aafe")).unwrap();
+        assert!(!Arc::ptr_eq(&guard, &other) && !Arc::ptr_eq(&guard, &other_clip));
+        assert_ne!(guard.id, other.id, "every model has its own identity for the GPU cache");
+        assert_eq!(*asked.borrow(), ["agyb/acfe", "aagb/acfe", "agyb/aafe"]);
+        assert_eq!(lib.cached_npcs(), 3);
+        // It is a character like any other for the renderer, standing: all three clips are the one.
+        assert_eq!(guard.appearance.appearance_ref, "npc");
+        assert_eq!(guard.character.pose(AnimState::Idle, 0).map(|p| p.len()), Some(1));
+        assert_eq!(guard.character.animation(AnimState::Run).frame_count(), 1);
+        // The players' table is not touched by any of this.
+        assert_eq!(lib.cached(), 0);
+    }
+
+    #[test]
+    fn references_that_cannot_name_an_archive_entry_are_never_looked_up() {
+        let (mut lib, asked) = npc_library(vec![]);
+        let long = "a".repeat(fmv_protocol::NPC_REF_CHARS + 1);
+        for (model, idle) in [
+            ("", Some("acfe")),
+            ("agyb", None),
+            ("agyb", Some("")),
+            ("../../etc/passwd", Some("acfe")),
+            ("agyb\0", Some("acfe")),
+            ("ag yb", Some("acfe")),
+            ("agyb.hrc", Some("acfe")),
+            ("agyb", Some("a/b")),
+            ("\u{10FFFF}", Some("acfe")),
+            (long.as_str(), Some("acfe")),
+            ("agyb", Some(long.as_str())),
+        ] {
+            assert!(lib.get_npc(model, idle).is_none(), "{model:?} {idle:?}");
+        }
+        assert!(asked.borrow().is_empty(), "nothing odd reached the archive: {:?}", asked.borrow());
+        assert_eq!(lib.cached_npcs(), 0, "and nothing odd is kept");
+        // The longest reference the protocol allows is fine.
+        assert!(lib.get_npc(&"a".repeat(fmv_protocol::NPC_REF_CHARS), Some("acfe")).is_some());
+    }
+
+    #[test]
+    fn a_non_player_model_that_fails_is_remembered_and_never_retried_and_is_never_a_stand_in() {
+        let (mut lib, asked) = npc_library(vec!["aagb"]);
+        for _ in 0..5 {
+            assert!(lib.get_npc("aagb", Some("acfe")).is_none(), "a marker, not another character");
+        }
+        assert_eq!(*asked.borrow(), ["aagb/acfe"], "asked once");
+        assert!(lib.get_npc("agyb", Some("acfe")).is_some(), "the others are unaffected");
+        assert_eq!(lib.cached(), 0, "no playable character was loaded to stand in for it");
+    }
+
+    #[test]
+    fn a_hostile_stream_of_models_cannot_grow_the_cache_past_its_cap() {
+        let (mut lib, asked) = npc_library(vec![]);
+        for i in 0..MAX_NPC_MODELS + 40 {
+            let name = format!("m{i}");
+            let loaded = lib.get_npc(&name, Some("acfe")).is_some();
+            assert_eq!(loaded, i < MAX_NPC_MODELS, "model {i}");
+        }
+        assert_eq!(lib.cached_npcs(), MAX_NPC_MODELS);
+        assert_eq!(asked.borrow().len(), MAX_NPC_MODELS, "the ones over the cap were not even asked for");
+        // What is held keeps working.
+        assert!(lib.get_npc("m0", Some("acfe")).is_some());
+        // Leaving the area drops what the next one does not name, which makes room.
+        lib.keep_npcs([("agyb", Some("acfe"))]);
+        assert_eq!(lib.cached_npcs(), 1);
+        assert!(lib.get_npc("m99", Some("acfe")).is_some());
+    }
+
+    #[test]
+    fn keeping_an_areas_models_loads_them_now_and_forgets_the_rest() {
+        let (mut lib, asked) = npc_library(vec!["aagb"]);
+        lib.keep_npcs([("agyb", Some("acfe")), ("agyb", Some("ACFE")), ("aagb", Some("acfe")), ("bad name", Some("acfe")), ("acgd", None)]);
+        // Loaded before any frame asks, once each (the spelling does not make a second one, a
+        // failure is remembered, what cannot be looked up is left out).
+        assert_eq!(*asked.borrow(), ["agyb/acfe", "aagb/acfe"]);
+        assert_eq!(lib.cached_npcs(), 2);
+        asked.borrow_mut().clear();
+        // The next area keeps one of them and brings another: the first is not loaded again, the
+        // one that is gone is dropped.
+        lib.keep_npcs([("agyb", Some("acfe")), ("acgd", Some("adcb"))]);
+        assert_eq!(*asked.borrow(), ["acgd/adcb"]);
+        assert_eq!(lib.cached_npcs(), 2);
+        // An area without any characters drops them all.
+        lib.keep_npcs([]);
+        assert_eq!(lib.cached_npcs(), 0);
     }
 
     #[test]

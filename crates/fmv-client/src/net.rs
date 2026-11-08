@@ -211,12 +211,34 @@ impl PartyCommand {
     }
 }
 
+/// The client's answer to an `AreaChange` (the server moves the player to another area): it holds
+/// that area locally (`JoinArea`, with its OWN path-free provenance) or does not (`CannotJoin`, and
+/// the server sends the player back).
+#[derive(Debug, Clone, PartialEq)]
+pub enum AreaAnswer {
+    Join { area: AreaId, fingerprint: Fingerprint, provenance: ProvenanceSummary },
+    /// `reason` is path-free text (see [`ContentMismatch::wire`]).
+    Cannot { area: AreaId, reason: String },
+}
+
+impl AreaAnswer {
+    /// The message that carries this answer.
+    pub fn into_msg(self) -> ClientMsg {
+        match self {
+            AreaAnswer::Join { area, fingerprint, provenance } => ClientMsg::JoinArea { area, fingerprint, provenance },
+            AreaAnswer::Cannot { area, reason } => ClientMsg::CannotJoin { area, reason },
+        }
+    }
+}
+
 /// Messages from the game loop to the network thread.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum NetCommand {
     Intent(Intent),
     Party(PartyCommand),
     Battle(BattleCmd),
+    /// The answer to an `AreaChange`.
+    Area(AreaAnswer),
     Leave,
 }
 
@@ -545,7 +567,7 @@ where
                     }
                 }
             }
-            ServerMsg::AreaSnapshot { area, tick, entities } => {
+            ServerMsg::AreaSnapshot { area, tick, entities, npcs } => {
                 let Some(o) = &offer else {
                     return Err(NetError::Protocol("AreaSnapshot before AreaManifest".into()));
                 };
@@ -559,7 +581,12 @@ where
                 if snapshot.is_none() {
                     snapshot = Some(entities.clone());
                 }
-                push_backlog(&mut backlog, ServerMsg::AreaSnapshot { area, tick, entities });
+                push_backlog(&mut backlog, ServerMsg::AreaSnapshot { area, tick, entities, npcs });
+            }
+            // A transfer between areas is something that happens in the game, never in the
+            // handshake: honouring one here would skip the checks of the first area.
+            ServerMsg::AreaChange { .. } => {
+                return Err(NetError::Protocol("AreaChange during the handshake".into()));
             }
             ServerMsg::Pong { .. } => {}
             other @ (ServerMsg::EntityUpdate { .. }
@@ -679,6 +706,7 @@ async fn session_loop<R, W>(
                 Some(NetCommand::Intent(i)) => ClientMsg::MoveIntent { seq: i.seq, pos: i.pos, facing: i.facing, anim: i.anim },
                 Some(NetCommand::Party(p)) => p.to_msg(),
                 Some(NetCommand::Battle(b)) => b.to_msg(),
+                Some(NetCommand::Area(a)) => a.into_msg(),
                 Some(NetCommand::Leave) | None => {
                     let _ = timeout(WRITE_TIMEOUT, write_msg(&mut wr, &ClientMsg::Leave)).await;
                     break;
@@ -963,6 +991,7 @@ mod tests {
             area: adapter.list_areas().remove(0).id,
             tick: 3,
             entities,
+            npcs: Vec::new(),
         }
     }
 
@@ -1791,6 +1820,81 @@ mod tests {
             })
             .collect();
         assert_eq!(kinds, ["event 1", "rejected", "event 2", "snapshot"]);
+    }
+
+    /// A transfer between areas is something that happens in the game: one offered in the middle of
+    /// the handshake would skip the checks of the first area, so it ends the handshake.
+    #[tokio::test]
+    async fn an_area_change_during_the_handshake_is_a_protocol_error() {
+        let adapter = FixtureAdapter::new();
+        let info = adapter.list_areas().remove(0);
+        let (client, server) = duplex(64 * 1024);
+        let (mut crd, mut cwr) = split(client);
+        let (_srd, mut swr) = split(server);
+        write_msg(&mut swr, &welcome()).await.unwrap();
+        write_msg(&mut swr, &manifest(&adapter, |_| {})).await.unwrap();
+        write_msg(
+            &mut swr,
+            &ServerMsg::AreaChange {
+                area: info.id.clone(),
+                display_name: info.display_name.clone(),
+                fingerprint: info.fingerprint,
+                provenance: info.provenance.summary(),
+                fixture: true,
+                arrival: Pos::default(),
+                arrival_facing: 0.0,
+            },
+        )
+        .await
+        .unwrap();
+        let err = handshake(&mut crd, &mut cwr, &cfg(), &adapter, Duration::from_secs(5)).await.err().unwrap();
+        assert!(matches!(&err, NetError::Protocol(m) if m.contains("AreaChange during the handshake")), "{err}");
+    }
+
+    #[test]
+    fn area_answers_become_the_matching_messages() {
+        let info = FixtureAdapter::new().list_areas().remove(0);
+        let join = AreaAnswer::Join { area: info.id.clone(), fingerprint: info.fingerprint, provenance: info.provenance.summary() };
+        assert_eq!(
+            join.into_msg(),
+            ClientMsg::JoinArea { area: info.id.clone(), fingerprint: info.fingerprint, provenance: info.provenance.summary() }
+        );
+        let cannot = AreaAnswer::Cannot { area: info.id.clone(), reason: "no such area here".into() };
+        assert_eq!(cannot.into_msg(), ClientMsg::CannotJoin { area: info.id, reason: "no such area here".into() });
+    }
+
+    /// The session loop sends the answer to an `AreaChange` like any other command: in order with
+    /// the rest, before the `Leave` that follows it.
+    #[tokio::test]
+    async fn the_session_loop_sends_area_answers_in_order() {
+        let info = FixtureAdapter::new().list_areas().remove(0);
+        let (client, server) = duplex(64 * 1024);
+        let (crd, cwr) = split(client);
+        let (mut srd, _swr) = split(server);
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (evt_tx, _evt_rx) = mpsc::channel(64);
+        let session = tokio::spawn(session_loop(crd, cwr, cmd_rx, evt_tx, Instant::now(), SessionTiming::DEFAULT));
+        cmd_tx.send(NetCommand::Area(AreaAnswer::Cannot { area: info.id.clone(), reason: "no".into() })).unwrap();
+        cmd_tx
+            .send(NetCommand::Area(AreaAnswer::Join { area: info.id.clone(), fingerprint: info.fingerprint, provenance: info.provenance.summary() }))
+            .unwrap();
+        cmd_tx.send(NetCommand::Leave).unwrap();
+        let mut got = Vec::new();
+        loop {
+            match timeout(Duration::from_secs(10), read_msg::<_, ClientMsg>(&mut srd)).await.expect("a message") {
+                Ok(ClientMsg::Ping { .. }) => {}
+                Ok(msg) => {
+                    let done = msg == ClientMsg::Leave;
+                    got.push(msg);
+                    if done {
+                        break;
+                    }
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        assert!(matches!(&got[..], [ClientMsg::CannotJoin { .. }, ClientMsg::JoinArea { .. }, ClientMsg::Leave]), "{got:?}");
+        session.await.unwrap();
     }
 
     #[test]

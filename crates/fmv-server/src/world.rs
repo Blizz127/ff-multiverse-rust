@@ -1,4 +1,11 @@
-//! Authoritative world state for the single hosted area.
+//! Authoritative world state: the hosted areas and the players in them.
+//!
+//! The world hosts many areas (see the `areas` module): the entry area the server was started with
+//! is always loaded, any other is loaded when the first player walks through an exit that leads
+//! there and unloaded again some time after the last one left. Every area has its own players,
+//! rules, exits and NPCs; broadcasts (`PlayerJoined`, `PlayerLeft`, `EntityUpdate`) reach only the
+//! players of the area they are about. Parties, accounts and battles span the world: a party may
+//! be spread over several areas (a battle takes the members that stand in one area).
 //!
 //! Everything in here is synchronous and never touches a socket. Outbound messages are
 //! pushed with non-blocking `try_send` into each connection's bounded queue. A client whose
@@ -46,23 +53,30 @@
 //! shutdown, a slow client being dropped) leaves its party and has its pending invites withdrawn
 //! in the same step, so no ghost member or ghost invite can outlive a connection. The party clock
 //! is milliseconds of the `Instant`s the caller passes in. Placement
-//! (`fmv_party::InstanceSelector`) is told to each player on join and whenever a party change
-//! alters it; it is informational: there is one hosted area, one instance.
+//! (`fmv_party::InstanceSelector`) is told to each player on join, whenever a party change
+//! alters it and whenever the player enters an area (it names the player's own area and the
+//! phase of its leader); it is informational: an area is one instance, whatever the phases of the
+//! players in it.
+//!
+//! # Areas and travel
+//!
+//! See the `areas` module: exits, the transfer between areas, lazy loading and unloading.
 //!
 //! # Battles
 //!
 //! A server with battle support runs shared battles in the world (see the `battle` module): a
 //! player in a battle is frozen (its moves are ignored), the engine is stepped on the world tick
-//! and every member is told what happened. The area's random-encounter table, if it has one, is
-//! rolled as players walk.
+//! and every member is told what happened. The random-encounter table of the area a player walks
+//! in, if it has one, is rolled as it walks; a battle takes the party members that stand in the
+//! requester's area.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use fmv_adapter_api::{AreaRuntime, MoveResult};
-use fmv_core::{AccountId, AnimState, AreaId, AvatarAppearance, EntityId, EntitySnapshot, PhaseKey, Pos, SessionId};
+use fmv_adapter_api::{AreaKey, AreaRuntime, GameAdapter, MoveResult};
+use fmv_core::{AccountId, AnimState, AvatarAppearance, EntityId, EntitySnapshot, PhaseKey, Pos, SessionId};
 use fmv_party::{InstanceSelector, Invite, PartyConfig, PartyEvent, PartyManager, PhaseMap, Placement, Tick};
 use fmv_protocol::{BattleId, PartyName, ServerMsg};
 use tokio::sync::mpsc::error::TrySendError;
@@ -71,8 +85,10 @@ use tokio::sync::{mpsc, watch};
 use crate::deferred::{DeferredLogs, Line};
 use crate::ServerError;
 
+mod areas;
 mod battle;
 mod party;
+pub use areas::{TravelReply, AREA_UNLOAD_GRACE, TRAVEL_TIMEOUT};
 pub use battle::BattleReply;
 pub use party::PartyOutcome;
 
@@ -135,6 +151,14 @@ impl MoveBudget {
         Self { tokens: 0.0, last: now }
     }
 
+    /// Full at `now`: what a player arrives with after crossing into another area. The client
+    /// keeps walking through the transfer and sends its first move there before the server has
+    /// had the time to earn it anything; an empty budget would turn that into a rejection (and a
+    /// visible snap-back) at every crossing. A full one is worth at most half a second of travel.
+    fn full(now: Instant, rules: &MoveRules) -> Self {
+        Self { tokens: rules.cap, last: now }
+    }
+
     fn refill(&mut self, now: Instant, rules: &MoveRules) {
         // `None` means `now` is not after `last` (callers pass monotonic times); nothing to add.
         if let Some(dt) = now.checked_duration_since(self.last) {
@@ -174,6 +198,12 @@ struct Player {
     battle: Option<BattleId>,
     /// Horizontal distance walked since the last random-encounter roll.
     walked: f64,
+    /// The area the player stands in (a key of `World::areas`). While the player is in transit it
+    /// is the area it left, which stays loaded until the transfer is over.
+    area: AreaKey,
+    /// Set while the player is between two areas (see the `areas` module): it is in no area,
+    /// nobody sees it and its moves are ignored.
+    transit: Option<areas::Transit>,
 }
 
 /// Everything the world needs to admit a player into the area.
@@ -218,11 +248,17 @@ pub enum MoveOutcome {
 }
 
 pub struct World {
-    area: Box<dyn AreaRuntime>,
-    area_id: AreaId,
-    spawn_points: Vec<Pos>,
-    rules: MoveRules,
-    next_spawn: usize,
+    /// The loaded areas by key. The entry area (`home`) is always among them; the others come and
+    /// go (see the `areas` module).
+    areas: BTreeMap<AreaKey, areas::AreaState>,
+    /// The key of the entry area: where every player joins, and the one area that is never unloaded.
+    home: AreaKey,
+    /// Where the other areas come from (`None`: a single-area world, which has no exits to follow).
+    source: Option<Arc<dyn GameAdapter>>,
+    /// How long a player may take to answer an `AreaChange`, and how long an empty area stays
+    /// loaded.
+    travel_timeout: Duration,
+    unload_grace: Duration,
     next_entity: u64,
     next_session: u64,
     tick: u64,
@@ -246,22 +282,17 @@ impl World {
         Self::with_party_config(area, PartyConfig::default())
     }
 
+    /// A world whose entry area is `area`. It has no other areas until
+    /// [`World::set_area_source`] says where to get them.
     pub fn with_party_config(area: Box<dyn AreaRuntime>, party: PartyConfig) -> Result<Self, ServerError> {
-        let area_id = area.info().id.clone();
-        let spawn_points: Vec<Pos> = area.spawn_points().into_iter().filter(|p| p.is_finite()).collect();
-        if spawn_points.is_empty() {
-            return Err(ServerError::BadArea(area_id, "the area has no usable (finite) spawn points".into()));
-        }
-        let max_speed = area.max_speed();
-        if !(max_speed.is_finite() && max_speed > 0.0) {
-            return Err(ServerError::BadArea(area_id, format!("max_speed must be finite and positive (got {max_speed})")));
-        }
+        let state = areas::AreaState::new(area, None)?;
+        let home = state.key().clone();
         Ok(Self {
-            area,
-            area_id,
-            spawn_points,
-            rules: MoveRules::new(max_speed),
-            next_spawn: 0,
+            areas: BTreeMap::from([(home.clone(), state)]),
+            home,
+            source: None,
+            travel_timeout: TRAVEL_TIMEOUT,
+            unload_grace: AREA_UNLOAD_GRACE,
             next_entity: 1,
             next_session: 1,
             tick: 0,
@@ -329,8 +360,9 @@ impl World {
         if self.by_account.contains_key(&new.account) {
             return Err(JoinError::AlreadyOnline);
         }
-        let pos = self.spawn_points[self.next_spawn % self.spawn_points.len()];
-        self.next_spawn = self.next_spawn.wrapping_add(1);
+        // Everyone joins the entry area, which is always loaded.
+        let home = self.home.clone();
+        let pos = self.areas.get_mut(&home).map_or_else(Pos::default, areas::AreaState::next_spawn_point);
         let entity = new.entity;
         let account = new.account;
         let snapshot = EntitySnapshot { id: entity, pos, facing: 0.0, anim: AnimState::Idle, avatar: new.avatar };
@@ -340,7 +372,7 @@ impl World {
                 session: new.session,
                 account,
                 phase: new.phase,
-                snapshot: snapshot.clone(),
+                snapshot,
                 budget: MoveBudget::new(now),
                 dirty: false,
                 tx: new.tx,
@@ -350,26 +382,16 @@ impl World {
                 placement: None,
                 battle: None,
                 walked: 0.0,
+                area: home,
+                transit: None,
             },
         );
         self.by_account.insert(account, entity);
 
-        let area_snapshot = Arc::new(ServerMsg::AreaSnapshot {
-            area: self.area_id.clone(),
-            tick: self.tick,
-            entities: self.players.values().map(|p| p.snapshot.clone()).collect(),
-        });
-        let joined = Arc::new(ServerMsg::PlayerJoined { snapshot });
-
+        // The snapshot to the joiner, `PlayerJoined` to the others of the area, then the joiner's
+        // first placement (a solo player is placed by its own phase).
         let mut failed = Vec::new();
-        for (id, p) in &self.players {
-            let msg = if *id == entity { &area_snapshot } else { &joined };
-            if let Err(e) = p.tx.try_send(Arc::clone(msg)) {
-                failed.push((*id, is_full(&e)));
-            }
-        }
-        // The joiner's first placement (a solo player is placed by its own phase).
-        self.refresh_placements(&BTreeSet::from([account]), &mut failed);
+        self.announce_entry(entity, &mut failed);
         self.drop_failed(failed);
         Ok(pos)
     }
@@ -394,11 +416,9 @@ impl World {
             self.member_gone(battle, entity);
         }
         self.leave_party_state(&player, failed);
-        let left = Arc::new(ServerMsg::PlayerLeft { entity });
-        for (id, other) in &self.players {
-            if let Err(e) = other.tx.try_send(Arc::clone(&left)) {
-                failed.push((*id, is_full(&e)));
-            }
+        // A player in transit is in no area: the area it left was told already.
+        if player.transit.is_none() {
+            self.tell_area(&player.area, Arc::new(ServerMsg::PlayerLeft { entity }), failed);
         }
         Some(player)
     }
@@ -407,26 +427,53 @@ impl World {
     /// check, speed budget, walking the chord through the adapter. Only an accepted move spends
     /// budget, and facing and anim are tracked only from accepted moves.
     pub fn apply_move(&mut self, entity: EntityId, to: Pos, facing: f32, anim: AnimState, now: Instant) -> MoveOutcome {
-        let Some(p) = self.players.get_mut(&entity) else {
-            return MoveOutcome::Gone;
+        // The rules are the rules of the area the player stands in (areas differ in speed).
+        let (from, chord, crossed) = {
+            let Some(p) = self.players.get_mut(&entity) else {
+                return MoveOutcome::Gone;
+            };
+            // A player in a battle, or between two areas, is frozen: its moves are ignored.
+            if p.battle.is_some() || p.transit.is_some() {
+                return MoveOutcome::Frozen;
+            }
+            let Some(area) = self.areas.get(&p.area) else {
+                return MoveOutcome::Gone;
+            };
+            let from = p.snapshot.pos;
+            if !to.is_finite() || !facing.is_finite() {
+                return MoveOutcome::Rejected { corrected: from, reason: Rejection::NonFinite };
+            }
+
+            p.budget.refill(now, area.rules());
+            let dist = dist_xy(from, to);
+            if !p.budget.can_afford(dist, area.rules()) {
+                return MoveOutcome::Rejected { corrected: from, reason: Rejection::TooFast };
+            }
+            let chord = walk_chord(area.runtime(), from, to, dist, area.rules());
+            // Crossing an exit line leaves the area. Judged on the move as the adapter accepted
+            // it, and only where there is somewhere to go (a single-area world has no exits).
+            let crossed = match &chord {
+                Chord::Clear(accepted) if self.source.is_some() => area.crossed_exit(from, *accepted).cloned(),
+                _ => None,
+            };
+            (from, chord, crossed)
         };
-        if p.battle.is_some() {
-            return MoveOutcome::Frozen;
-        }
-        let from = p.snapshot.pos;
-        if !to.is_finite() || !facing.is_finite() {
-            return MoveOutcome::Rejected { corrected: from, reason: Rejection::NonFinite };
-        }
         let facing = normalize_facing(facing);
-
-        p.budget.refill(now, &self.rules);
         let dist = dist_xy(from, to);
-        if !p.budget.can_afford(dist, &self.rules) {
-            return MoveOutcome::Rejected { corrected: from, reason: Rejection::TooFast };
-        }
 
-        match walk_chord(self.area.as_ref(), from, to, dist, &self.rules) {
+        match chord {
             Chord::Clear(accepted) => {
+                if let Some(exit) = crossed {
+                    // `from` is where a refused transfer puts the player back (on the near side
+                    // of the line, so that crossing again is a new crossing).
+                    if self.start_travel(entity, &exit, from, facing, now) {
+                        return MoveOutcome::Applied;
+                    }
+                    // The target is unusable and its exit is now closed: the move is an ordinary one.
+                }
+                let Some(p) = self.players.get_mut(&entity) else {
+                    return MoveOutcome::Gone;
+                };
                 let changed = accepted != from || facing != p.snapshot.facing || anim != p.snapshot.anim;
                 p.snapshot.pos = accepted;
                 p.snapshot.facing = facing;
@@ -438,6 +485,9 @@ impl World {
                 MoveOutcome::Applied
             }
             Chord::Blocked { place } => {
+                let Some(p) = self.players.get_mut(&entity) else {
+                    return MoveOutcome::Gone;
+                };
                 // `place` is where the entity already is, unless the adapter relocated it
                 // (for example back onto the walkable surface).
                 if place != from {
@@ -449,34 +499,25 @@ impl World {
         }
     }
 
-    /// Advance the tick counter and broadcast one `EntityUpdate` with every entity that changed
-    /// since the previous tick (nothing is sent if nothing changed). Returns the new tick.
+    /// Advance the tick counter and broadcast, per area, one `EntityUpdate` with every entity of
+    /// that area that changed since the previous tick (nothing is sent to an area where nothing
+    /// changed). Returns the new tick.
     pub fn advance_tick(&mut self) -> u64 {
         self.tick += 1;
-        let changed: Vec<EntitySnapshot> = self
-            .players
-            .values_mut()
-            .filter(|p| p.dirty)
-            .map(|p| {
-                p.dirty = false;
-                p.snapshot.clone()
-            })
-            .collect();
-        if !changed.is_empty() {
-            self.fan_out(Arc::new(ServerMsg::EntityUpdate { tick: self.tick, entities: changed }));
-        }
-        self.tick
-    }
-
-    /// Queue `msg` for every joined player. Players whose queue is full or closed are dropped.
-    fn fan_out(&mut self, msg: Outbound) {
-        let mut failed = Vec::new();
-        for (id, p) in &self.players {
-            if let Err(e) = p.tx.try_send(Arc::clone(&msg)) {
-                failed.push((*id, is_full(&e)));
+        let mut changed: BTreeMap<AreaKey, Vec<EntitySnapshot>> = BTreeMap::new();
+        for p in self.players.values_mut().filter(|p| p.dirty) {
+            p.dirty = false;
+            // A player in transit is in no area: nobody is told about it moving.
+            if p.transit.is_none() {
+                changed.entry(p.area.clone()).or_default().push(p.snapshot.clone());
             }
         }
-        self.drop_failed(failed);
+        for (area, entities) in changed {
+            let mut failed = Vec::new();
+            self.tell_area(&area, Arc::new(ServerMsg::EntityUpdate { tick: self.tick, entities }), &mut failed);
+            self.drop_failed(failed);
+        }
+        self.tick
     }
 
     /// Remove players whose queue failed (through the one removal path: party and invites
@@ -566,8 +607,19 @@ impl World {
         let phases: PhaseMap = self.players.values().map(|p| (p.account, p.phase.clone())).collect();
         for &account in accounts {
             let Some(&entity) = self.by_account.get(&account) else { continue };
+            // Placement is per area: the player's own, with its party leader's phase. A player in
+            // transit has none until it has entered the next area.
+            let Some(area_id) = self
+                .players
+                .get(&entity)
+                .filter(|p| p.transit.is_none())
+                .and_then(|p| self.areas.get(&p.area))
+                .map(|a| a.id().clone())
+            else {
+                continue;
+            };
             let party = self.parties.party_of(account).cloned();
-            let placement = match InstanceSelector::select(&self.area_id, account, party.as_ref(), &phases) {
+            let placement = match InstanceSelector::select(&area_id, account, party.as_ref(), &phases) {
                 Ok(placement) => placement,
                 Err(e) => {
                     self.logs.warn(format!("cannot compute a placement account={} error={e}", account.0));

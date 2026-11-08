@@ -25,6 +25,8 @@ const PLATE: Rgba = [6, 8, 24, 175];
 const GOOD: Rgba = [124, 232, 148, 255];
 const PARTY_RING: Rgba = [255, 208, 64, 255];
 const OTHER: Rgba = [214, 222, 240, 255];
+/// Non-player characters: a dimmer, cooler tone than any player's name.
+const NPC_TONE: Rgba = [150, 184, 208, 255];
 const FIXTURE_BG: Rgba = [255, 196, 0, 255];
 const FIXTURE_INK: Rgba = [24, 24, 24, 255];
 /// Most characters of a name shown in a corner list or a label.
@@ -55,6 +57,8 @@ pub enum LabelKind {
     /// A member of the local player's party.
     Party,
     Other,
+    /// A non-player character of the area (its name, over its marker).
+    Npc,
 }
 
 /// A player's name, at the player's marker (view space, as the renderer gets it).
@@ -102,26 +106,44 @@ pub fn gather_from(state: &ClientState, info: &SessionInfo, view: &FieldView, re
     gather_anchored(state, info, view, render_t, &|_, at| view.to_view(at))
 }
 
-/// [`gather_from`] with the label's anchor chosen by `anchor` (given the entity, `None` for the
-/// local player, and where it stands; it answers the view-space point the name goes over, or `None`
-/// if the player cannot be drawn). The marker view anchors at the marker; the model view at the
-/// top of the head (see `crate::avatar`).
+/// Whose name a label is: what [`gather_anchored`] asks its `anchor` about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Subject {
+    /// The local player.
+    Own,
+    /// Another player.
+    Remote(EntityId),
+    /// A non-player character of the area (its index in the area's list, `NpcView::id`).
+    Npc(u32),
+}
+
+/// [`gather_from`] with the label's anchor chosen by `anchor` (given whose name it is and where
+/// that one stands; it answers the view-space point the name goes over, or `None` if it cannot be
+/// drawn). The marker view anchors at the marker; the model view at the top of the head (see
+/// `crate::avatar`).
 pub fn gather_anchored(
     state: &ClientState,
     info: &SessionInfo,
     view: &FieldView,
     render_t: f64,
-    anchor: &dyn Fn(Option<EntityId>, Pos) -> Option<Pos>,
+    anchor: &dyn Fn(Subject, Pos) -> Option<Pos>,
 ) -> HudInput {
     let mut labels = Vec::new();
+    // The area's NPCs (static: they are named where they stand; one that cannot be drawn has no
+    // label either).
+    for npc in state.npc_views() {
+        if let Some(p) = anchor(Subject::Npc(npc.id), npc.pos) {
+            labels.push(Label { x: p.x, y: p.y, text: npc.name.clone(), kind: LabelKind::Npc });
+        }
+    }
     for remote in state.remote_views(render_t) {
         // One that cannot be drawn (behind the camera) has no marker, so no label either.
-        if let Some(p) = anchor(Some(remote.id), remote.pose.pos) {
+        if let Some(p) = anchor(Subject::Remote(remote.id), remote.pose.pos) {
             let kind = if state.party.is_party_entity(remote.id) { LabelKind::Party } else { LabelKind::Other };
             labels.push(Label { x: p.x, y: p.y, text: remote.name.clone(), kind });
         }
     }
-    if let Some(p) = anchor(None, state.own.pos()) {
+    if let Some(p) = anchor(Subject::Own, state.own.pos()) {
         labels.push(Label { x: p.x, y: p.y, text: info.name.clone(), kind: LabelKind::Own });
     }
     HudInput {
@@ -272,6 +294,7 @@ fn draw_labels(input: &HudInput, w: u32, h: u32, s: i32, top: i32, out: &mut Dra
             LabelKind::Own => [255, 255, 255, 255],
             LabelKind::Party => PARTY_RING,
             LabelKind::Other => OTHER,
+            LabelKind::Npc => NPC_TONE,
         };
         out.fill_rect(x - 3 * s, y - 2 * s, tw + 6 * s, cell + 4 * s, [0, 0, 0, 150]);
         out.draw_text_shadowed(x, y, s as u32, tone, SHADOW, &text);
@@ -644,6 +667,53 @@ mod tests {
         assert!(hud.party.is_empty() && hud.invite_from.is_none() && hud.rtt.is_none());
         // Every label has a finite place in view space.
         assert!(hud.labels.iter().all(|l| l.x.is_finite() && l.y.is_finite()));
+    }
+
+    /// The area's characters are named where the anchor says (over the head of a model, at the
+    /// marker otherwise), and one the anchor cannot place has no label.
+    #[test]
+    fn an_npc_is_named_where_the_anchor_puts_its_name_and_one_that_cannot_be_placed_is_not_named() {
+        let mut s = state_with(&[]);
+        let npc = |id: u32, name: &str, x: f32| fmv_protocol::NpcSnapshot {
+            id,
+            name: name.into(),
+            model: "agyb".into(),
+            idle_animation: Some("acfe".into()),
+            pos: Pos::new(x, 5.0, 0.0),
+            facing: 0.0,
+        };
+        let area = AreaId { game: GameId::Fixture, key: "plaza".into() };
+        let tifa = EntitySnapshot {
+            id: EntityId(2),
+            pos: Pos::new(10.0, 0.0, 0.0),
+            facing: 0.0,
+            anim: AnimState::Idle,
+            avatar: AvatarAppearance::new("Tifa", [1, 2, 3], None),
+        };
+        s.apply(0.0, ServerMsg::AreaSnapshot { area, tick: 1, entities: vec![tifa], npcs: vec![npc(0, "gu0", 30.0), npc(1, "gu1", -30.0)] });
+        let (info, view) = (info(true), top_down());
+        let name_of = |hud: &HudInput, text: &str| hud.labels.iter().find(|l| l.text == text).map(|l| (l.x, l.y, l.kind));
+        // The marker view: at the marker, whoever it is.
+        let plain = gather_from(&s, &info, &view, 1.0);
+        let at_marker = view.to_view(Pos::new(30.0, 5.0, 0.0)).unwrap();
+        assert_eq!(name_of(&plain, "gu0"), Some((at_marker.x, at_marker.y, LabelKind::Npc)));
+        assert!(name_of(&plain, "gu1").is_some());
+        // The model view: the anchor is asked about the NPC by its index and says where its head is.
+        let over_head = Pos::new(1.0, 2.0, 0.0);
+        let asked = std::cell::RefCell::new(Vec::new());
+        let anchored = gather_anchored(&s, &info, &view, 1.0, &|subject, at| {
+            asked.borrow_mut().push(subject);
+            match subject {
+                Subject::Npc(0) => Some(over_head),
+                Subject::Npc(_) => None, // cannot be drawn: no label
+                _ => view.to_view(at),
+            }
+        });
+        assert_eq!(name_of(&anchored, "gu0"), Some((1.0, 2.0, LabelKind::Npc)));
+        assert_eq!(name_of(&anchored, "gu1"), None);
+        assert!(asked.borrow().contains(&Subject::Npc(0)) && asked.borrow().contains(&Subject::Npc(1)));
+        assert!(asked.borrow().contains(&Subject::Remote(EntityId(2))) && asked.borrow().contains(&Subject::Own));
+        assert!(name_of(&anchored, "Tifa").is_some() && name_of(&anchored, "Cloud").is_some(), "players are named as before");
     }
 
     #[test]

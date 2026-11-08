@@ -4,7 +4,7 @@
 //! including the one-line `party:` notes about party events and refusals.
 
 use crate::battle::BattleBot;
-use crate::bot::{Bot, PartyBot};
+use crate::bot::{Bot, PartyBot, TravelBot, TravelGate};
 use crate::cli::{exit, Args};
 use crate::interp::render_time;
 use crate::session::Session;
@@ -90,19 +90,23 @@ pub struct Smoke<'a> {
     pub battles: u64,
     /// Battles the server ended in victory.
     pub victories: u64,
+    /// How many times the server moved this client on to another area (a transfer the client
+    /// refused, and the way back, do not count). `area` is where it ended up and `peers_seen` is
+    /// counted in that final area only.
+    pub area_changes: u64,
 }
 
-/// `SMOKE name=<n> area=<AreaId> fixture=<bool> peers_seen=<n> updates=<n> rejected=<n> rtt_ms=<n|-1> party=<n> battles=<n> victories=<n>`
+/// `SMOKE name=<n> area=<AreaId> fixture=<bool> peers_seen=<n> updates=<n> rejected=<n> rtt_ms=<n|-1> party=<n> battles=<n> victories=<n> area_changes=<n>`
 ///
 /// `<n>` in `name=` is the display name percent-encoded by [`encode_name`]; the other fields
 /// never contain whitespace (the area comes from the local adapter's catalog, not from the
-/// network). `battles=` and `victories=` were appended in protocol v3; the fields before them are
-/// unchanged.
+/// network). `battles=` and `victories=` were appended in protocol v3 and `area_changes=` after
+/// them (area travel); the fields before are unchanged.
 pub fn smoke_line(smoke: &Smoke<'_>) -> String {
-    let Smoke { name, area, fixture, peers_seen, updates, rejected, rtt, party, battles, victories } = smoke;
+    let Smoke { name, area, fixture, peers_seen, updates, rejected, rtt, party, battles, victories, area_changes } = smoke;
     let rtt_ms = rtt.map_or(-1, |d| (d.as_secs_f64() * 1000.0).round() as i64);
     let name = encode_name(name);
-    format!("SMOKE name={name} area={area} fixture={fixture} peers_seen={peers_seen} updates={updates} rejected={rejected} rtt_ms={rtt_ms} party={party} battles={battles} victories={victories}")
+    format!("SMOKE name={name} area={area} fixture={fixture} peers_seen={peers_seen} updates={updates} rejected={rejected} rtt_ms={rtt_ms} party={party} battles={battles} victories={victories} area_changes={area_changes}")
 }
 
 pub fn run(args: &Args, mut session: Session) -> u8 {
@@ -113,6 +117,8 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
         session.area.max_speed(),
     );
     let mut party_bot = PartyBot::new(args.party_invite_first_peer, args.party_accept);
+    // `--travel`: walk through the exits to these areas; with a party to form first it waits for it.
+    let mut travel_bot = TravelBot::new(args.travel.clone(), args.party_invite_first_peer || args.party_accept);
     let mut battle_bot = BattleBot::new(args.battle_auto, args.debug_encounters, args.battle_wait_party);
     eprintln!(
         "headless: joined {} as `{}` (entity {}), bot={:?} for {:.1} s",
@@ -127,6 +133,9 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
             "headless: party behaviour: invite the first peer: {}, accept invites: {}",
             args.party_invite_first_peer, args.party_accept
         );
+    }
+    if travel_bot.is_active() {
+        eprintln!("headless: travel behaviour: walk through the exits to {}", args.travel.join(", then "));
     }
     if battle_bot.is_active() {
         eprintln!(
@@ -148,6 +157,8 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
     // What the world looked like when the last battle ended, to show that play went on afterwards.
     let mut after_battle: Option<(f32, u64)> = None;
     let mut battles_ended = 0;
+    // The names of the area's NPCs as last reported (the snapshot of an area says who they are).
+    let mut last_npcs: Vec<String> = Vec::new();
     while start.elapsed() < args.duration
         || finishing_a_battle(battle_bot.is_active(), session.state.battle.in_battle(), start.elapsed(), args.duration)
     {
@@ -158,6 +169,32 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
         }
         session.log_party_notes();
         session.log_battle_notes();
+        // The server moved us to another area: walk the pattern of the new one, and cross it off
+        // the route if that is where the bot meant to go.
+        if let Some(change) = session.take_area_change() {
+            bot = Bot::new(args.bot, session.state.own.pos(), session.area.bounds(), session.area.max_speed());
+            let reached = travel_bot.arrived(&change.area.key, session.now());
+            eprintln!(
+                "headless: now in {} (area change {}){}",
+                change.area,
+                session.state.area_changes(),
+                match (reached, travel_bot.next_area()) {
+                    (true, Some(next)) => format!("; next stop: {next}"),
+                    (true, None) => "; the route is done".to_string(),
+                    (false, _) => String::new(),
+                }
+            );
+            // The peers of the area we left are not seen any more: the counters of the pattern's
+            // walk start again in the new one.
+            peer_walks.clear();
+        }
+        let npc_names: Vec<String> = session.state.npc_views().iter().map(|n| n.name.clone()).collect();
+        if npc_names != last_npcs {
+            if !npc_names.is_empty() {
+                eprintln!("headless: {} NPC(s) in {}: {}", npc_names.len(), session.info.area_id, npc_names.join(", "));
+            }
+            last_npcs = npc_names;
+        }
         if session.state.battle.ended() > battles_ended {
             battles_ended = session.state.battle.ended();
             after_battle = Some((own_walk.total, session.state.updates()));
@@ -182,7 +219,16 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
         // A player in a battle is frozen in the field: it neither walks nor sends movement.
         let frozen = session.state.battle.in_battle();
         if dt > 0.0 && !frozen {
-            let step = bot.step(session.area.as_ref(), session.state.own.pos(), dt);
+            let step = if travel_bot.is_active() {
+                let gate = TravelGate { now, party_size: session.state.party.party_size(), peers_seen: session.state.peers_seen() };
+                if travel_bot.may_walk(gate) {
+                    travel_bot.step(session.area.as_ref(), session.state.own.pos(), dt, session.area.max_speed() * crate::bot::BOT_SPEED_FACTOR)
+                } else {
+                    crate::bot::BotStep { pos: session.state.own.pos(), facing: None, moved: false }
+                }
+            } else {
+                bot.step(session.area.as_ref(), session.state.own.pos(), dt)
+            };
             let facing = step.facing.unwrap_or_else(|| session.state.own.facing());
             let anim = if step.moved { AnimState::Walk } else { AnimState::Idle };
             session.state.own.set_motion(step.pos, facing, anim);
@@ -194,6 +240,13 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
         if let Some(rest) = TICK.checked_sub(tick_start.elapsed()) {
             std::thread::sleep(rest);
         }
+    }
+    if let Some(why) = travel_bot.gave_up() {
+        eprintln!("headless: travel: gave up: {why}");
+    } else if let Some(next) = travel_bot.next_area() {
+        eprintln!("headless: travel: did not reach {next} in time");
+    } else if !args.travel.is_empty() {
+        eprintln!("headless: travel: the route {} was walked to the end", args.travel.join(", then "));
     }
     eprintln!(
         "headless: walked {:.0} units (bot pattern shrunk to nothing: {}); {} peer(s) seen moving {:.0} units in total",
@@ -243,6 +296,7 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
         party: session.state.party.peak_party_size(),
         battles: session.state.battle.entered(),
         victories: session.state.battle.victories(),
+        area_changes: session.state.area_changes(),
     });
     // Ignore write errors (e.g. a closed pipe): the exit code still tells the story.
     let _ = writeln!(std::io::stdout().lock(), "{line}");
@@ -285,7 +339,7 @@ mod tests {
     }
 
     fn smoke<'a>(name: &'a str, area: &'a AreaId, fixture: bool, rtt: Option<Duration>) -> Smoke<'a> {
-        Smoke { name, area, fixture, peers_seen: 2, updates: 31, rejected: 1, rtt, party: 3, battles: 1, victories: 1 }
+        Smoke { name, area, fixture, peers_seen: 2, updates: 31, rejected: 1, rtt, party: 3, battles: 1, victories: 1, area_changes: 2 }
     }
 
     #[test]
@@ -297,7 +351,7 @@ mod tests {
         let l = smoke_line(&smoke("botA", &area, true, Some(Duration::from_micros(2_600))));
         assert_eq!(
             l,
-            "SMOKE name=botA area=Fixture/plaza fixture=true peers_seen=2 updates=31 rejected=1 rtt_ms=3 party=3 battles=1 victories=1"
+            "SMOKE name=botA area=Fixture/plaza fixture=true peers_seen=2 updates=31 rejected=1 rtt_ms=3 party=3 battles=1 victories=1 area_changes=2"
         );
         let l = smoke_line(&Smoke {
             name: "b",
@@ -310,17 +364,18 @@ mod tests {
             party: 0,
             battles: 0,
             victories: 0,
+            area_changes: 0,
         });
         assert_eq!(
             l,
-            "SMOKE name=b area=Fixture/plaza fixture=false peers_seen=0 updates=0 rejected=0 rtt_ms=-1 party=0 battles=0 victories=0"
+            "SMOKE name=b area=Fixture/plaza fixture=false peers_seen=0 updates=0 rejected=0 rtt_ms=-1 party=0 battles=0 victories=0 area_changes=0"
         );
         assert!(!l.contains('\n'));
     }
 
     /// `scripts/smoke.sh` parses the line by key, and new fields are only ever appended: the
-    /// protocol-v2 keys keep their names and their order, and `battles` and `victories` (v3) come
-    /// last.
+    /// protocol-v2 keys keep their names and their order, `battles` and `victories` (v3) follow and
+    /// `area_changes` (area travel) comes last.
     #[test]
     fn the_smoke_keys_keep_their_order_and_the_battle_fields_are_last() {
         let area = AreaId { game: GameId::Fixture, key: "plaza".into() };
@@ -328,10 +383,10 @@ mod tests {
         let keys: Vec<&str> = l.split_whitespace().skip(1).map(|f| f.split_once('=').unwrap().0).collect();
         assert_eq!(
             keys,
-            ["name", "area", "fixture", "peers_seen", "updates", "rejected", "rtt_ms", "party", "battles", "victories"]
+            ["name", "area", "fixture", "peers_seen", "updates", "rejected", "rtt_ms", "party", "battles", "victories", "area_changes"]
         );
         assert!(l.starts_with("SMOKE "), "{l}");
-        assert!(l.ends_with(" party=3 battles=1 victories=1"), "{l}");
+        assert!(l.ends_with(" party=3 battles=1 victories=1 area_changes=2"), "{l}");
         // A v2 parser that reads the first eight fields (and `party` among them) still works.
         assert!(l.contains(" rtt_ms=-1 party=3 "), "{l}");
     }
@@ -383,9 +438,9 @@ mod tests {
             );
             assert_eq!(decode(&enc), name);
 
-            let line = smoke_line(&Smoke { name, area: &area, fixture: true, peers_seen: 1, updates: 2, rejected: 3, rtt: None, party: 1, battles: 0, victories: 0 });
+            let line = smoke_line(&Smoke { name, area: &area, fixture: true, peers_seen: 1, updates: 2, rejected: 3, rtt: None, party: 1, battles: 0, victories: 0, area_changes: 0 });
             assert_eq!(line.lines().count(), 1, "{line:?}");
-            assert_eq!(line.split_whitespace().count(), 11, "SMOKE + 10 fields: {line:?}");
+            assert_eq!(line.split_whitespace().count(), 12, "SMOKE + 11 fields: {line:?}");
             for field in line.split_whitespace().skip(1) {
                 assert!(field.split_once('=').is_some(), "{field:?} in {line:?}");
             }

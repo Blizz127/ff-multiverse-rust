@@ -15,15 +15,51 @@
 //! loader) explicitly and never touch it.
 
 use fmv_ff7::lgp::LgpArchive;
+use fmv_ff7::model::{load_field_animation, load_field_model, ModelError};
 use fmv_ff7::playable::{load_playable, Character, PlayableModel};
 use std::fs::File;
+use std::io::{Read, Seek};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-/// Reads one playable character (skeleton, meshes, textures and the idle, walk and run clips).
+/// The `appearance` of a [`Character`] that is not one of the playable ones (a field's non-player
+/// character): it names no entry of the table of playable characters.
+pub const NON_PLAYABLE: PlayableModel = PlayableModel {
+    appearance_ref: "npc",
+    display_name: "Non-player character",
+    hrc: "",
+    idle_anim: "",
+    walk_anim: "",
+    run_anim: "",
+};
+
+/// Reads characters: the playable ones by table entry, the non-player ones by the references an
+/// area's data holds.
 pub trait CharacterLoader {
     /// The character for `appearance`, or why it cannot be had (shown on stderr, once).
     fn load(&mut self, appearance: &PlayableModel) -> Result<Character, String>;
+
+    /// The non-player character whose skeleton is `model` (`<model>.hrc`), shown standing with the
+    /// clip `idle` (`<idle>.a`): a [`Character`] whose three clips are all that standing clip (it
+    /// is never walked or run). Both are untrusted text, only ever looked up as archive entries.
+    /// The default has no such models.
+    fn load_npc(&mut self, model: &str, idle: &str) -> Result<Character, String> {
+        let _ = (model, idle);
+        Err("this loader has no non-player models".to_string())
+    }
+}
+
+/// A non-player character standing: the skeleton `model` with the clip `idle`, which must fit it.
+pub fn load_standing<R: Read + Seek>(lgp: &mut LgpArchive<R>, model: &str, idle: &str) -> Result<Character, ModelError> {
+    let skeleton = load_field_model(lgp, model)?;
+    let clip = load_field_animation(lgp, idle)?;
+    if !skeleton.fits(&clip) {
+        return Err(ModelError::Invalid {
+            what: "non-player model",
+            why: format!("the clip drives {} bones but the skeleton has {}", clip.bone_count(), skeleton.bones.len()),
+        });
+    }
+    Ok(Character { appearance: NON_PLAYABLE, model: skeleton, idle: clip.clone(), walk: clip.clone(), run: clip })
 }
 
 /// Reads characters from a `char.lgp` on disk, read-only. The archive is opened (its table of
@@ -45,16 +81,26 @@ impl LgpLoader {
     }
 }
 
-impl CharacterLoader for LgpLoader {
-    fn load(&mut self, appearance: &PlayableModel) -> Result<Character, String> {
+impl LgpLoader {
+    /// The open archive (opened by the first call).
+    fn archive(&mut self) -> Result<&mut LgpArchive<File>, String> {
         if self.archive.is_none() {
             let archive = LgpArchive::open_path(&self.path).map_err(|e| format!("cannot open char.lgp: {e}"))?;
             self.archive = Some(archive);
         }
-        let Some(archive) = self.archive.as_mut() else {
-            return Err("cannot open char.lgp".to_string());
-        };
+        self.archive.as_mut().ok_or_else(|| "cannot open char.lgp".to_string())
+    }
+}
+
+impl CharacterLoader for LgpLoader {
+    fn load(&mut self, appearance: &PlayableModel) -> Result<Character, String> {
+        let archive = self.archive()?;
         load_playable(archive, appearance).map_err(|e| e.to_string())
+    }
+
+    fn load_npc(&mut self, model: &str, idle: &str) -> Result<Character, String> {
+        let archive = self.archive()?;
+        load_standing(archive, model, idle).map_err(|e| e.to_string())
     }
 }
 
