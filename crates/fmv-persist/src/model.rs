@@ -3,10 +3,10 @@
 //! Records hold references only (ids, names, opaque adapter blobs). Nothing here ever holds
 //! game asset bytes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use fmv_core::{AccountId, AvatarAppearance, GameId};
+use fmv_core::{AccountId, AvatarAppearance, GameId, InventoryEntry, MAX_INVENTORY_STACKS};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{PersistError, Result};
@@ -14,6 +14,10 @@ use crate::error::{PersistError, Result};
 /// Record format version written by this build. Loaders accept `1..=SCHEMA_VERSION` and
 /// reject anything newer with [`PersistError::FutureSchema`]. This versions the account,
 /// avatar and progression record files; the index has its own [`INDEX_LOG_VERSION`].
+///
+/// An optional field that reads as "absent" when it is missing is additive and does not change
+/// the version: [`CharacterProgress::inventory`] was added that way. (What that costs a build
+/// that is rolled back is documented there.)
 pub const SCHEMA_VERSION: u32 = 1;
 /// Format version of the account index (`index.log`, and the small `index.json` marker beside
 /// it). Version 1 was a single `index.json` holding every name and token; it is migrated
@@ -33,9 +37,17 @@ pub const MAX_INDEX_BYTES: u64 = 16 * 1024 * 1024;
 /// serialized as a list of numbers is several times its size), so a server must keep it in the
 /// store and put only a short key of it (an id, a hash) on the wire.
 pub const MAX_BLOB_BYTES: usize = 256 * 1024;
-/// Largest accepted [`CharacterProgress`] record file. A record is a few hundred bytes; this is
-/// the cap a corrupt or hostile file is held to, on read and on write.
-pub const MAX_CHARACTER_RECORD_BYTES: u64 = 4 * 1024;
+/// Largest accepted [`CharacterProgress`] record file: the cap a corrupt or hostile file is held
+/// to, on read (before it is parsed) and on write.
+///
+/// A record without an inventory is about 170 bytes. The store writes pretty-printed JSON, which
+/// costs about 50 bytes per inventory stack (55 when the numbers have five digits), so the
+/// largest valid record ([`MAX_INVENTORY_STACKS`] stacks) is under 18 KB and this cap leaves it
+/// nearly twice that. A record that passes the store's checks can therefore never be refused as
+/// too large; a unit test pins that, so raising the stack limit in `fmv-core` fails there instead
+/// of in production. (Builds from before the inventory held this to 4 KiB, which an inventory
+/// outgrows: see [`CharacterProgress::inventory`].)
+pub const MAX_CHARACTER_RECORD_BYTES: u64 = 32 * 1024;
 /// Longest accepted `base_archetype` (bytes).
 pub const MAX_ARCHETYPE_BYTES: usize = 64;
 /// Longest accepted per-game appearance reference, in **characters**: exactly the limit the
@@ -299,22 +311,30 @@ impl Progression {
     }
 }
 
-/// One account's character progress for one game: which of the game's characters it plays, and
-/// what that character has earned. **Not** [`Progression`]: that blob is the account's story
+/// One account's character progress for one game: which of the game's characters it plays, what
+/// that character has earned (level, experience, AP, gil) and, once the game stores one, what the
+/// account carries (the inventory). **Not** [`Progression`]: that blob is the account's story
 /// state and also the key of its story phase (the server builds a `PhaseKey` from it), so
 /// battle results written into it would move the player to another instance. This record is
 /// separate, has its own file and API, and no adapter reads a phase from it.
 ///
 /// The store is game-agnostic: `character` is the game's own character id (FF7: Cloud 0,
 /// Barret 1, ...), and the numbers mean whatever the game says. The caps and curves of a game
-/// (FF7's level 99, its EXP table, its gil limit) belong to its adapter, which applies them
-/// before it stores. The store only checks what is true in every game: the record belongs to
-/// the account and game it is filed under, `level` is at least 1, the schema is one it knows and
-/// the file is small.
+/// (FF7's level 99, its EXP table, its gil limit, its item table and stack sizes) belong to its
+/// adapter, which applies them before it stores. The store only checks what is true in every
+/// game: the record belongs to the account and game it is filed under, `level` is at least 1,
+/// the inventory (if there is one) is well formed (see [`CharacterProgress::inventory`]), the
+/// schema is one it knows and the file is small ([`MAX_CHARACTER_RECORD_BYTES`]).
 ///
 /// A record that was never stored is absent (`Store::get_character_progress` returns `None`),
 /// not a default: the starting values come from the game's own data, which only the adapter
-/// has, so there is nothing to migrate when a game starts using this record.
+/// has, so there is nothing to migrate when a game starts using this record. The same goes one
+/// level down: a record that is there but has no inventory is not an empty inventory (see
+/// [`CharacterProgress::inventory`]).
+///
+/// Every write replaces the whole record. A record built with [`CharacterProgress::new`] has no
+/// inventory, so putting it **clears a stored one**; to change the numbers and keep the items,
+/// change the record that was read (`Store::update_character_progress` hands it to the closure).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CharacterProgress {
     /// Record format version. The store stamps [`SCHEMA_VERSION`] on every write.
@@ -332,11 +352,44 @@ pub struct CharacterProgress {
     /// Money.
     pub gil: u32,
     pub updated_at: u64,
+    /// What the account carries: one [`InventoryEntry`] per item. Item ids and counts are the
+    /// game's own (FF7: an index into the kernel's item table) and mean nothing here; the order
+    /// is the caller's and is kept as it is.
+    ///
+    /// **`None` and `Some(vec![])` are different.** `None` means "never stored": the caller (the
+    /// server) then starts from its game's own starting stock, which only the game's adapter and
+    /// the server know. The store never makes one up and never fills in a default. `Some(vec![])`
+    /// is a real, stored, empty inventory (the account has used or sold everything) and stays
+    /// empty: it is not replaced by the starting stock. On disk `None` is a missing `inventory`
+    /// key, so a record that has none is byte for byte what a build from before this field wrote,
+    /// and `Some(vec![])` is `"inventory": []`. (A JSON `null` reads as `None`, like a missing
+    /// key.)
+    ///
+    /// Checked on every read and write: at most [`MAX_INVENTORY_STACKS`] entries, no entry with a
+    /// `count` of 0 (an item the account does not have is not listed) and no item twice. A file
+    /// that breaks them is [`PersistError::Corrupt`] on read; a record that does is refused with
+    /// [`PersistError::InvalidField`] (`field: "inventory"`) on write, and the old record stays.
+    /// A game's own limits (its item table, its stack size) are its adapter's business.
+    ///
+    /// # Compatibility
+    ///
+    /// Older records have no such key and read as `None`, and `SCHEMA_VERSION` stays 1: the field
+    /// is additive. The reverse is not free. A build from before this field ignores the key when
+    /// it reads, and **drops the inventory when it next rewrites the record** (a battle result,
+    /// say). It also held a record to 4 KiB (see [`MAX_CHARACTER_RECORD_BYTES`]), so it refuses
+    /// one of more than 70 to 80 stacks (about 50 bytes each, 160 to 180 bytes for the rest) as
+    /// [`PersistError::TooLarge`] instead of ignoring the key, which fails that account's login.
+    /// Going back to such a build is safe only from a snapshot taken before any inventory was
+    /// stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory: Option<Vec<InventoryEntry>>,
 }
 
 impl CharacterProgress {
     /// A fresh record: `character` at `level` with no experience, AP or gil (an adapter that
-    /// starts a character with experience sets `exp` itself).
+    /// starts a character with experience sets `exp` itself) and **no inventory** (`None`: the
+    /// game's starting stock applies). Putting it replaces a stored record whole, so it also
+    /// clears a stored inventory; see the type's documentation.
     pub fn new(
         account_id: AccountId,
         game: GameId,
@@ -354,10 +407,12 @@ impl CharacterProgress {
             ap: 0,
             gil: 0,
             updated_at,
+            inventory: None,
         }
     }
 
-    /// What is true of every game's record (see the type's documentation).
+    /// What is true of every game's record (see the type's documentation). Checked on every read
+    /// (a failure is `Corrupt`) and every write (a failure is `InvalidField`).
     pub(crate) fn validate(&self) -> Result<()> {
         if self.level == 0 {
             return Err(PersistError::InvalidField {
@@ -365,8 +420,41 @@ impl CharacterProgress {
                 reason: "must be at least 1".into(),
             });
         }
+        if let Some(inventory) = &self.inventory {
+            check_inventory(inventory)?;
+        }
         Ok(())
     }
+}
+
+/// The checks every game's inventory shares: bounded, no empty stack, no item twice. The length
+/// is checked first, so a caller's oversized list costs nothing more than that comparison.
+fn check_inventory(inventory: &[InventoryEntry]) -> Result<()> {
+    if inventory.len() > MAX_INVENTORY_STACKS {
+        return Err(PersistError::InvalidField {
+            field: "inventory",
+            reason: format!(
+                "has {} stacks, over the {MAX_INVENTORY_STACKS} stack limit",
+                inventory.len()
+            ),
+        });
+    }
+    let mut seen = BTreeSet::new();
+    for entry in inventory {
+        if entry.count == 0 {
+            return Err(PersistError::InvalidField {
+                field: "inventory",
+                reason: format!("item {} has a stack of zero", entry.item),
+            });
+        }
+        if !seen.insert(entry.item) {
+            return Err(PersistError::InvalidField {
+                field: "inventory",
+                reason: format!("item {} appears more than once", entry.item),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// `Vec<u8>` <-> hex string, rejecting oversized input before decoding it.
@@ -442,5 +530,168 @@ mod tests {
             "{{\"schema_version\":1,\"account_id\":3,\"game\":\"Ff7\",\"blob\":\"{huge}\",\"updated_at\":0}}"
         );
         assert!(serde_json::from_str::<Progression>(&doc).is_err());
+    }
+
+    // ---- the inventory of a CharacterProgress ----------------------------------------------
+
+    fn with_inventory(inventory: Option<Vec<InventoryEntry>>) -> CharacterProgress {
+        CharacterProgress {
+            inventory,
+            ..CharacterProgress::new(AccountId(1), GameId::Ff7, 0, 5, 0)
+        }
+    }
+
+    fn stacks(items: impl IntoIterator<Item = (u16, u16)>) -> Vec<InventoryEntry> {
+        items
+            .into_iter()
+            .map(|(item, count)| InventoryEntry::new(item, count))
+            .collect()
+    }
+
+    /// The reason a record is refused for its inventory (and that the refusal names that field).
+    fn refusal(record: &CharacterProgress) -> String {
+        match record.validate() {
+            Err(PersistError::InvalidField {
+                field: "inventory",
+                reason,
+            }) => reason,
+            other => panic!("expected the inventory to be refused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_new_record_has_no_inventory_and_none_is_not_empty() {
+        let fresh = CharacterProgress::new(AccountId(1), GameId::Ff7, 0, 5, 0);
+        assert_eq!(fresh.inventory, None);
+
+        // On disk: None is a missing key, Some(empty) is an empty list, never the other way round.
+        let none = with_inventory(None);
+        let empty = with_inventory(Some(vec![]));
+        let some = with_inventory(Some(stacks([(3, 99), (1, 2)])));
+        let none_json = serde_json::to_value(&none).unwrap();
+        assert_eq!(none_json.get("inventory"), None, "{none_json}");
+        assert_eq!(
+            serde_json::to_value(&empty).unwrap()["inventory"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            serde_json::to_value(&some).unwrap()["inventory"],
+            serde_json::json!([{"item": 3, "count": 99}, {"item": 1, "count": 2}])
+        );
+        // Each reads back as it was written: the distinction and the caller's order survive.
+        for record in [&none, &empty, &some] {
+            let text = serde_json::to_string(record).unwrap();
+            assert_eq!(
+                &serde_json::from_str::<CharacterProgress>(&text).unwrap(),
+                record,
+                "{text}"
+            );
+        }
+
+        // A record from a build that did not know the field has no key and reads as None; so does
+        // a JSON null (nothing was stored); `[]` is a stored, empty inventory.
+        let read = |inventory: Option<serde_json::Value>| {
+            let mut doc = none_json.clone();
+            if let Some(value) = inventory {
+                doc["inventory"] = value;
+            }
+            serde_json::from_value::<CharacterProgress>(doc)
+                .unwrap()
+                .inventory
+        };
+        assert_eq!(read(None), None);
+        assert_eq!(read(Some(serde_json::Value::Null)), None);
+        assert_eq!(read(Some(serde_json::json!([]))), Some(vec![]));
+    }
+
+    #[test]
+    fn an_inventory_is_checked_for_size_empty_stacks_and_repeats() {
+        // Fine: never stored, stored empty, a few stacks in any order, the widest numbers.
+        for ok in [
+            None,
+            Some(vec![]),
+            Some(stacks([(9, 1), (2, 99), (300, 1)])),
+            Some(stacks([(0, 1), (u16::MAX, u16::MAX)])),
+        ] {
+            assert!(with_inventory(ok.clone()).validate().is_ok(), "{ok:?}");
+        }
+
+        // Exactly the limit is fine; one more stack is not.
+        let limit = u16::try_from(MAX_INVENTORY_STACKS).unwrap();
+        let full = stacks((0..limit).map(|item| (item, 1)));
+        assert_eq!(full.len(), MAX_INVENTORY_STACKS);
+        assert!(with_inventory(Some(full.clone())).validate().is_ok());
+        let mut over = full;
+        over.push(InventoryEntry::new(limit, 1));
+        let why = refusal(&with_inventory(Some(over)));
+        assert!(why.contains("321 stacks") && why.contains("320"), "{why}");
+
+        // A huge list is refused by its length alone (no pass over it, no mention of its content).
+        let huge = vec![InventoryEntry::new(0, 0); 100_000];
+        let why = refusal(&with_inventory(Some(huge)));
+        assert!(
+            why.contains("100000 stacks") && !why.contains("zero"),
+            "{why}"
+        );
+
+        // A stack of zero is an item the account does not have: it is not listed.
+        let why = refusal(&with_inventory(Some(stacks([(1, 1), (2, 0)]))));
+        assert!(why.contains("item 2") && why.contains("zero"), "{why}");
+
+        // An item twice, wherever the two stacks are (the counts are not added up here).
+        let why = refusal(&with_inventory(Some(stacks([(1, 1), (2, 1), (1, 5)]))));
+        assert!(
+            why.contains("item 1") && why.contains("more than once"),
+            "{why}"
+        );
+        refusal(&with_inventory(Some(stacks([(7, 3), (7, 3)]))));
+
+        // The other checks still apply to a record that has an inventory.
+        let zero_level = CharacterProgress {
+            level: 0,
+            ..with_inventory(Some(stacks([(1, 1)])))
+        };
+        assert!(matches!(
+            zero_level.validate(),
+            Err(PersistError::InvalidField { field: "level", .. })
+        ));
+    }
+
+    /// The record cap must stay above the largest *valid* record, or the store could accept a
+    /// record on `put` that it then refuses to write (or one that it wrote and cannot read).
+    /// `MAX_INVENTORY_STACKS` lives in `fmv-core`: this is where raising it is noticed.
+    #[test]
+    fn the_largest_valid_record_fits_the_record_cap_with_room_to_spare() {
+        // The widest numbers everywhere: five-digit items and counts, 64-bit ids and times.
+        let widest = CharacterProgress {
+            schema_version: u32::MAX,
+            account_id: AccountId(u64::MAX),
+            game: GameId::Fixture,
+            character: u8::MAX,
+            level: u8::MAX,
+            exp: u32::MAX,
+            ap: u32::MAX,
+            gil: u32::MAX,
+            updated_at: u64::MAX,
+            inventory: Some(
+                (0..MAX_INVENTORY_STACKS)
+                    .map(|i| InventoryEntry::new(u16::MAX - u16::try_from(i).unwrap(), u16::MAX))
+                    .collect(),
+            ),
+        };
+        assert!(widest.validate().is_ok());
+        // What `fsio::write_json` writes: pretty-printed, plus a final newline.
+        let bytes = serde_json::to_vec_pretty(&widest).unwrap().len() as u64 + 1;
+        assert!(
+            bytes < MAX_CHARACTER_RECORD_BYTES,
+            "{bytes} bytes against a cap of {MAX_CHARACTER_RECORD_BYTES}"
+        );
+        // Room to grow by half again, so that a field added later does not leave it on the edge.
+        assert!(
+            bytes * 3 / 2 < MAX_CHARACTER_RECORD_BYTES,
+            "{bytes} bytes is too close to the cap of {MAX_CHARACTER_RECORD_BYTES}"
+        );
+        // It is more than the 4 KiB that the cap was before the inventory: that is why it grew.
+        assert!(bytes > 4 * 1024, "{bytes}");
     }
 }
