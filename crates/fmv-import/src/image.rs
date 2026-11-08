@@ -1,10 +1,22 @@
 //! Disc image access: plain `.iso`, raw 2352-byte `.bin` and `.cue` sheets as [`SectorSource`]s.
 //!
 //! Images are opened read-only. Physical drives are out of scope for this increment.
+//!
+//! # Symbolic links
+//!
+//! An image, a cue sheet or the `.bin` a cue sheet names may be a symbolic link (a rip kept on
+//! another disk and linked in is common): that is allowed. What matters is that the file READ is
+//! the file GUARDED: every link is resolved once, up front, and the resolved file is the one that
+//! is opened, stamped (size, mtime, device and inode, taken from the open handle, not from the
+//! name) and later compared again. A link that is re-pointed while the import runs therefore
+//! shows up as a changed source instead of silently switching the image under the importer.
+//! The paths in [`OpenedImage`] are the resolved ones.
 
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+
+use fmv_library::SourceStamp;
 
 use crate::cue::{parse_cue, resolve_cue_file, CueError, TrackMode, MAX_CUE_BYTES};
 use crate::iso9660::{Form2Sector, IsoError, SectorSource, SECTOR_SIZE};
@@ -174,10 +186,16 @@ impl SectorSource for ImageSource {
 #[derive(Debug)]
 pub struct OpenedImage {
     pub source: ImageSource,
-    /// The file that holds the sectors (the `.bin`/`.iso`).
+    /// The file that holds the sectors (the `.bin`/`.iso`), symbolic links resolved: the file
+    /// that was actually opened.
     pub data_path: PathBuf,
-    /// The `.cue` sheet, when one was given.
+    /// `data_path`'s size, mtime and identity, taken from the handle the sectors are read
+    /// through. Compare with [`SourceStamp::verify`] after the import.
+    pub data_stamp: SourceStamp,
+    /// The `.cue` sheet, when one was given (links resolved).
     pub cue_path: Option<PathBuf>,
+    /// The cue sheet's stamp, taken from the handle it was read through.
+    pub cue_stamp: Option<SourceStamp>,
     pub layout: Layout,
     /// Set when the cue sheet's declared mode disagreed with what the data actually looks like.
     pub note: Option<String>,
@@ -197,17 +215,20 @@ pub fn open_image(path: &Path) -> Result<OpenedImage, ImageError> {
 }
 
 fn open_cue(cue_path: &Path) -> Result<OpenedImage, ImageError> {
-    let meta = fs::metadata(cue_path).map_err(io_at(cue_path))?;
+    // Resolve links once: the cue sheet that is read and stamped is the real file.
+    let cue_real = fs::canonicalize(cue_path).map_err(io_at(cue_path))?;
+    // stat before open: a FIFO or device named like a cue sheet must never be opened
+    let meta = fs::metadata(&cue_real).map_err(io_at(cue_path))?;
     if !meta.is_file() {
         return Err(ImageError::NotAFile(cue_path.to_path_buf()));
     }
     if meta.len() > MAX_CUE_BYTES {
         return Err(ImageError::CueTooLarge(cue_path.to_path_buf()));
     }
+    let file = File::open(&cue_real).map_err(io_at(cue_path))?;
+    let cue_stamp = SourceStamp::from_metadata(&file.metadata().map_err(io_at(cue_path))?);
     let mut bytes = Vec::new();
-    File::open(cue_path)
-        .map_err(io_at(cue_path))?
-        .take(MAX_CUE_BYTES + 1)
+    file.take(MAX_CUE_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(io_at(cue_path))?;
     if bytes.len() as u64 > MAX_CUE_BYTES {
@@ -215,7 +236,15 @@ fn open_cue(cue_path: &Path) -> Result<OpenedImage, ImageError> {
     }
     let sheet = parse_cue(&String::from_utf8_lossy(&bytes))?;
     let track = sheet.data_track()?;
-    let data_path = resolve_cue_file(cue_path, &track.file)?;
+    // The sheet names its file by leaf; it sits beside the sheet as the user named it. A sheet
+    // reached through a link may instead have its file beside the REAL sheet.
+    let mut data_path = resolve_cue_file(cue_path, &track.file)?;
+    if !data_path.exists() {
+        let beside_real = resolve_cue_file(&cue_real, &track.file)?;
+        if beside_real.exists() {
+            data_path = beside_real;
+        }
+    }
     let declared = match track.mode {
         TrackMode::Mode1Cooked => Layout::Cooked2048,
         TrackMode::Mode1Raw => Layout::RawMode1,
@@ -233,7 +262,7 @@ fn open_cue(cue_path: &Path) -> Result<OpenedImage, ImageError> {
         &data_path,
         Some(declared),
         u64::from(track.index01_frames.unwrap_or(0)),
-        Some(cue_path.to_path_buf()),
+        Some((cue_real, cue_stamp)),
     )
 }
 
@@ -241,19 +270,29 @@ fn open_data(
     path: &Path,
     declared: Option<Layout>,
     start_sector: u64,
-    cue_path: Option<PathBuf>,
+    cue: Option<(PathBuf, SourceStamp)>,
 ) -> Result<OpenedImage, ImageError> {
-    let meta = fs::metadata(path).map_err(io_at(path))?;
+    // A link is followed ONCE, here. The resolved file is opened (once: every layout that is
+    // tried reads through a duplicate of that one handle) and stamped from the handle, so the
+    // file that is read is the file that is guarded.
+    let real = fs::canonicalize(path).map_err(io_at(path))?;
+    let meta = fs::metadata(&real).map_err(io_at(path))?;
     if !meta.is_file() {
         return Err(ImageError::NotAFile(path.to_path_buf()));
     }
+    let base = File::open(&real).map_err(io_at(path))?;
+    let opened = base.metadata().map_err(io_at(path))?;
+    if !opened.is_file() {
+        return Err(ImageError::NotAFile(path.to_path_buf()));
+    }
+    let data_stamp = SourceStamp::from_metadata(&opened);
     let mut candidates = vec![Layout::Cooked2048, Layout::RawMode2, Layout::RawMode1];
     if let Some(d) = declared {
         candidates.retain(|c| *c != d);
         candidates.insert(0, d);
     }
     for layout in candidates {
-        let file = File::open(path).map_err(io_at(path))?;
+        let file = base.try_clone().map_err(io_at(path))?;
         let mut source = ImageSource::new(file, layout, start_sector).map_err(io_at(path))?;
         if source.looks_like_iso() {
             let note = match declared {
@@ -265,10 +304,16 @@ fn open_data(
                 )),
                 _ => None,
             };
+            let (cue_path, cue_stamp) = match cue {
+                Some((p, st)) => (Some(p), Some(st)),
+                None => (None, None),
+            };
             return Ok(OpenedImage {
                 source,
-                data_path: path.to_path_buf(),
+                data_path: real,
+                data_stamp,
                 cue_path,
+                cue_stamp,
                 layout,
                 note,
             });
@@ -356,11 +401,12 @@ mod tests {
         std::fs::write(dir.path().join("d2.cue"), cue_for("m2.bin", "MODE2/2352")).unwrap();
         let o = check_reads(&dir.path().join("d2.cue"));
         assert_eq!((o.layout, o.note.is_none()), (Layout::RawMode2, true));
-        assert_eq!(o.data_path, dir.path().join("m2.bin"));
-        assert_eq!(
-            o.cue_path.as_deref(),
-            Some(dir.path().join("d2.cue").as_path())
-        );
+        // the paths are the resolved ones (the temp dir itself may sit behind a link)
+        let real = |name: &str| std::fs::canonicalize(dir.path().join(name)).unwrap();
+        assert_eq!(o.data_path, real("m2.bin"));
+        assert_eq!(o.cue_path.as_deref(), Some(real("d2.cue").as_path()));
+        assert!(o.data_stamp.verify(&o.data_path).is_ok());
+        assert!(o.cue_stamp.as_ref().unwrap().verify(o.cue_path.as_ref().unwrap()).is_ok());
         std::fs::write(dir.path().join("d1.CUE"), cue_for("m1.bin", "MODE1/2352")).unwrap();
         assert_eq!(
             check_reads(&dir.path().join("d1.CUE")).layout,
@@ -386,8 +432,80 @@ mod tests {
         .unwrap();
         assert_eq!(
             open_image(&dir.path().join("win.cue")).unwrap().data_path,
-            dir.path().join("m2.bin")
+            real("m2.bin")
         );
+    }
+
+    /// Finding 8: images given as symbolic links are allowed, and the image that is read is the
+    /// one the link leads to: resolved once, opened once, stamped from the handle.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_images_are_read_through_their_target_and_guarded_by_it() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = std::fs::canonicalize(tmp.path()).unwrap().join("store");
+        let links = std::fs::canonicalize(tmp.path()).unwrap().join("links");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::create_dir_all(&links).unwrap();
+        let cooked = iso();
+        let other = build_iso(&[
+            ("SYSTEM.CNF", &system_cnf("SCUS_941.64")),
+            ("FIELD/OTHER.DAT", b"another image"),
+        ]);
+        std::fs::write(store.join("real.iso"), &cooked).unwrap();
+        std::fs::write(store.join("other.iso"), &other).unwrap();
+        std::fs::write(store.join("raw.bin"), wrap_raw(&cooked, RawMode::Mode2Form1)).unwrap();
+
+        // a linked .iso: allowed, and the paths in the result are the resolved ones
+        symlink(store.join("real.iso"), links.join("disc.iso")).unwrap();
+        let o = check_reads(&links.join("disc.iso"));
+        assert_eq!(o.data_path, store.join("real.iso"));
+        assert!(o.cue_path.is_none() && o.cue_stamp.is_none());
+        assert!(o.data_stamp.verify(&o.data_path).is_ok());
+        assert_eq!(o.data_stamp, SourceStamp::capture(&store.join("real.iso")).unwrap());
+
+        // re-pointing the link after the open changes nothing: the image that was opened is the
+        // image that is read, and it is the one that is guarded
+        let opened = open_image(&links.join("disc.iso")).unwrap();
+        std::fs::remove_file(links.join("disc.iso")).unwrap();
+        symlink(store.join("other.iso"), links.join("disc.iso")).unwrap();
+        let mut vol = Volume::open(opened.source).unwrap();
+        let walk = vol.walk().unwrap();
+        assert!(walk.files.iter().any(|f| f.path == "FIELD/MD1STIN.DAT"), "still the first image");
+        assert!(opened.data_stamp.verify(&opened.data_path).is_ok());
+        // while replacing the image FILE itself is caught, as it always was
+        std::fs::remove_file(store.join("real.iso")).unwrap();
+        std::fs::write(store.join("real.iso"), &cooked).unwrap();
+        assert!(matches!(
+            opened.data_stamp.verify(&opened.data_path),
+            Err(fmv_library::LibraryError::SourceChanged(_))
+        ));
+
+        // a cue sheet that is a link, with its .bin beside the LINK ...
+        std::fs::write(store.join("sheet.cue"), cue_for("raw.bin", "MODE2/2352")).unwrap();
+        symlink(store.join("raw.bin"), links.join("raw.bin")).unwrap(); // the bin is a link too
+        symlink(store.join("sheet.cue"), links.join("sheet.cue")).unwrap();
+        let o = check_reads(&links.join("sheet.cue"));
+        assert_eq!(o.cue_path.as_deref(), Some(store.join("sheet.cue").as_path()));
+        assert_eq!(o.data_path, store.join("raw.bin"), "the linked bin resolves to the real one");
+        // ... and with its .bin only beside the REAL sheet
+        std::fs::remove_file(links.join("raw.bin")).unwrap();
+        let o = check_reads(&links.join("sheet.cue"));
+        assert_eq!(o.data_path, store.join("raw.bin"));
+
+        // a link to a directory, a dangling link and a loop are errors, not hangs or panics
+        symlink(&store, links.join("dir-link")).unwrap();
+        assert!(matches!(open_image(&links.join("dir-link")), Err(ImageError::NotAFile(_))));
+        symlink(store.join("nothing.iso"), links.join("dangling.iso")).unwrap();
+        assert!(matches!(open_image(&links.join("dangling.iso")), Err(ImageError::Io { .. })));
+        symlink(links.join("loop-b.iso"), links.join("loop-a.iso")).unwrap();
+        symlink(links.join("loop-a.iso"), links.join("loop-b.iso")).unwrap();
+        assert!(matches!(open_image(&links.join("loop-a.iso")), Err(ImageError::Io { .. })));
+        // a cue sheet that is a link to a directory
+        symlink(&store, links.join("dir.cue")).unwrap();
+        assert!(matches!(open_image(&links.join("dir.cue")), Err(ImageError::NotAFile(_))));
+        // the images themselves were never written to
+        assert_eq!(std::fs::read(store.join("other.iso")).unwrap(), other);
     }
 
     #[test]

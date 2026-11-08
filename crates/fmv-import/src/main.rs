@@ -10,7 +10,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use fmv_import::commands::{
-    import_disc, import_pc, import_status, list_sets, ImportDiscArgs, ImportPcArgs,
+    import_disc, import_pc, import_status, list_sets, remove_set, ImportDiscArgs, ImportPcArgs,
+    RemoveSetArgs,
 };
 use fmv_import::scan::scan_pc;
 use serde::Serialize;
@@ -36,6 +37,19 @@ use serde::Serialize;
 /// is found automatically. The Steam Edition is recognised from its files and, when the install
 /// sits in a Steam library, from Steam's appmanifest_3837340.acf (the only file whose contents
 /// are read): its build becomes the revision label.
+///
+/// Symbolic links: inside a PC install a link that stays within the directory given is followed;
+/// one that leads out of it is refused (scan-pc lists it under refused_links). A disc image, cue
+/// sheet or .bin may be a link: the file it leads to is what is read and guarded.
+///
+/// Limits: a disc image may not list files that share sectors, more than 20000 files, or more
+/// than 1 GiB of files (a CD holds less); a library manifest is capped at 64 MiB, in both
+/// directions (an import that would exceed it is refused; nothing is written).
+///
+/// Imported discs are recorded by content: importing a different image under a disc number the
+/// library already holds is refused ("different disc content") unless --replace-disc is given.
+/// remove-set drops a set, even a broken one (blobs are kept, originals are never touched).
+/// An empty --state-dir (or FMV_STATE_DIR) is an error, not the default directory.
 #[derive(Parser, Debug)]
 #[command(name = "fmv-import", version)]
 struct Cli {
@@ -101,6 +115,13 @@ enum Command {
         /// Revision label (fixed by the first disc of the session)
         #[arg(long)]
         revision: Option<String>,
+        /// Let this image take the place of whatever the library (and the session) records under
+        /// its disc number: use it when the earlier import of that number was the wrong disc, a
+        /// damaged rip or a crafted image (without it such an image is refused as "different
+        /// disc content"). The old files leave the set only once this image has been read in
+        /// full; their blobs stay in the store
+        #[arg(long)]
+        replace_disc: bool,
     },
     /// Show which discs of an import session are imported and which are still missing (FF7 has 3)
     ImportStatus {
@@ -112,6 +133,18 @@ enum Command {
         /// Also print the install paths recorded in each set's sources
         #[arg(long)]
         show_paths: bool,
+    },
+    /// Remove a library set, even a broken one (damaged or oversized manifest), and the import sessions that point at it. Blobs are kept and originals are never touched
+    ///
+    /// Without --yes nothing is changed and the command only says what it would remove. It
+    /// refuses while an import is writing the set. Re-import afterwards to rebuild the set: the
+    /// blobs that were kept are reused.
+    RemoveSet {
+        /// Id of the set, as `list` shows it
+        set_id: String,
+        /// Confirm the removal
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -133,6 +166,8 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
 }
 
 fn run(cli: Cli) -> Result<()> {
+    // An empty value is a mistake (an unset shell variable), never "use the default library":
+    // clap refuses an empty --state-dir, and the library refuses an empty $FMV_STATE_DIR.
     let state_dir = cli.state_dir;
     match cli.command {
         Command::ScanPc { dir } => {
@@ -162,6 +197,7 @@ fn run(cli: Cli) -> Result<()> {
             set_name,
             disc,
             revision,
+            replace_disc,
         } => {
             let args = ImportDiscArgs {
                 image,
@@ -169,11 +205,20 @@ fn run(cli: Cli) -> Result<()> {
                 state_dir,
                 disc,
                 revision,
+                replace_disc,
             };
             print_json(&import_disc(&args, now_unix())?)
         }
         Command::ImportStatus { name } => print_json(&import_status(&name, state_dir.as_deref())?),
         Command::List { show_paths } => print_json(&list_sets(state_dir.as_deref(), show_paths)?),
+        Command::RemoveSet { set_id, yes } => {
+            let args = RemoveSetArgs {
+                set_id,
+                state_dir,
+                confirmed: yes,
+            };
+            print_json(&remove_set(&args)?)
+        }
     }
 }
 

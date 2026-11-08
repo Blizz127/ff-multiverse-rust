@@ -6,6 +6,10 @@ use std::path::{Path, PathBuf};
 pub enum LibraryError {
     #[error("cannot determine a state directory: pass one explicitly, set FMV_STATE_DIR, or provide a user data directory")]
     NoStateDir,
+    /// An empty state directory is a mistake (an unset shell variable, say), never a request for
+    /// the default: falling back to the default library silently would act on the wrong one.
+    #[error("{origin} is empty: give a real directory, or leave it out to use the default state directory")]
+    EmptyStateDir { origin: &'static str },
     #[error("no library at {0} (nothing has been imported there yet)")]
     NoLibrary(PathBuf),
     #[error("I/O error on {path}: {source}")]
@@ -67,8 +71,28 @@ pub enum LibraryError {
     SetBusy(String),
     #[error("set {set_id} already holds {limit} entries, the most a set may have; refusing to add more")]
     TooManyEntries { set_id: String, limit: usize },
+    /// The writer refuses what the reader would refuse: see [`crate::MAX_MANIFEST_BYTES`].
+    /// Raised when the manifest is written (`size` is then exact) and, a little earlier, before
+    /// an entry's blob is stored (`size` is then an estimate that includes a small headroom).
+    #[error("the manifest of set {set_id} would be {size} bytes, over the {limit} byte limit every reader enforces; refusing to write it (the set on disk is unchanged)")]
+    ManifestTooLarge {
+        set_id: String,
+        size: u64,
+        limit: u64,
+    },
     #[error("manifest of set {set_id} is invalid: {reason}")]
     BadManifest { set_id: String, reason: String },
+    #[error("source {path} resolves to a place outside {root}; refusing to follow a symbolic link out of the tree it was found in")]
+    SourceOutsideRoot { path: PathBuf, root: PathBuf },
+    /// A set may not gain new entries under this prefix (see `ImportBatch::freeze_prefix`).
+    #[error("set {set_id} may not gain {logical_path}: it is not among the {prefix}* files the set already holds")]
+    PrefixFrozen {
+        set_id: String,
+        logical_path: String,
+        prefix: String,
+    },
+    #[error("{0} is not a set directory of this library (it is a symbolic link or not a directory); refusing to remove it")]
+    NotASetDirectory(PathBuf),
     #[error("blob for {logical_path} in set {set_id} is missing or damaged: {reason}")]
     BlobProblem {
         set_id: String,
