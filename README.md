@@ -436,7 +436,9 @@ who left mid-battle (its character fought on) is saved too; it is told nothing. 
 saves everything still queued first. `scripts/battle-smoke.sh --progress` runs the whole chain on
 your real data: two bots fight, reconnect with their saved tokens, fight again at the level the
 first win left them at, and reconnect once more to see what was kept (the progress and, since
-protocol v6, the inventory: the starting stock once, plus what the wins dropped).
+protocol v6, the inventory: the starting stock once, plus what the wins dropped; since protocol v7, the
+limit gauge: what the first battle ended with is what the second starts with, and every queued gauge
+is written when the server stops).
 
 **Battle commands and items (protocol v6).** A party member whose gauge is full gives Attack, Magic
 (a spell it knows, for MP), Item (one the account owns) or Defend (physical damage halved until its
