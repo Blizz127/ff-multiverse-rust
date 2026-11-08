@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/battle-smoke.sh - shared-battle smoke test for fmv-server + fmv-client (protocol v5).
+# scripts/battle-smoke.sh - shared-battle smoke test for fmv-server + fmv-client (protocol v6).
 #
 # Usage: scripts/battle-smoke.sh [--fixture|--random|--progress] [--release|--debug] [--bin-dir DIR] [--build]
 #                                [--library STATE_DIR] [--duration SECS] [--formation ID]
@@ -21,8 +21,11 @@
 #   * each bot's mirror REPLAYED the battle from its own scene.bin/kernel.bin and matched: its end
 #     note says "verified: the server's N message(s) replayed ..." (a machine without battle data
 #     says "NOT verified"), and its closing `headless: battles:` line counts 1 verified by replay;
-#   * both members attacked: the server's "battle ended" line carries commands=[a, b] (accepted
-#     commands per actor, both at least 1) and each bot counts a command of its own applied.
+#   * both members acted: the server's "battle ended" line carries commands=[a, b] (accepted
+#     commands per actor, of any kind: Attack, Magic, Item or Defend; both at least 1) and each bot
+#     counts a command of its own applied;
+#   * each bot was told its inventory (protocol v6): its SMOKE line ends with items=N, the total
+#     of what it carries (a new account starts with the game's starting stock, so N is at least 1).
 #
 # --random: the same two bots, but WITHOUT --debug-encounters and with random encounters on: the
 # bots (--bot circle, party formed, both --battle-auto) walk md1stin and the server rolls the
@@ -36,22 +39,35 @@
 # --fixture: the synthetic FIXTURE server (no battle data) with --debug-encounters and one
 # --battle-auto --debug-encounters bot. Expected: the request is refused cleanly ("this server
 # cannot run battles"), the bot exits 0 and prints battles=0 victories=0 area_changes=0 level=0
-# exp=0 (the FIXTURE server has no characters, so it reports no progress: 0 is "unknown").
+# exp=0 items=0 (the FIXTURE server has no characters and no items, so it reports no progress and
+# no inventory: 0 is "unknown").
 #
-# --progress (real data): character progress, protocol v5. ONE server stays up through three runs of
-# the same two bots, which keep their client state directories and so log in again with the tokens
-# the first run saved. Run 1: the party fights one shared battle; each bot's progress notes ("progress:
-# ... level=L exp=E exp_to_next=N ...", first on joining, then after the win) must show experience
-# gained and, if E reached the threshold (E0 + N0), a level gained and leveled_up=true; the SMOKE line
-# ends with that level and exp. Run 2 (a reconnect): each bot is told on joining exactly what run 1
-# ended with (the progress was SAVED and read back), the server's second "battle started" line carries
-# those levels (levels=[..]: the second battle's EncounterStart carries the level gained), and the
-# second win adds on. Run 3 (a reconnect, no fighting): the SMOKE line shows what run 2 ended with.
-# The server must also have logged one "progress saved" line per member per battle. Both bots are
-# Cloud (a headless bot registers without a look); on the Steam data he starts at level 6 with 610
-# experience, six short of level 7, so the first win levels him up. The server is not restarted here
-# (the client's token files are keyed by server address, and the server binds a free port): that the
-# saved progress survives a restart is tested by crates/fmv-server/tests/progress.rs.
+# --progress (real data): character progress and inventory, protocol v6. ONE server stays up through
+# three runs of the same two bots, which keep their client state directories and so log in again with
+# the tokens the first run saved. Run 1: the party fights one shared battle; each bot's progress notes
+# ("progress: ... level=L exp=E exp_to_next=N ...", first on joining, then after the win) must show
+# experience gained and, if E reached the threshold (E0 + N0), a level gained and leveled_up=true; the
+# SMOKE line ends with that level and exp (and the items it carries). Run 2 (a reconnect): each bot is
+# told on joining exactly what run 1 ended with (the progress was SAVED and read back), the server's
+# second "battle started" line carries those levels (levels=[..]: the second battle's EncounterStart
+# carries the level gained), and the second win adds on. Run 3 (a reconnect, no fighting): the SMOKE line
+# shows what run 2 ended with. The server must also have logged one "progress saved" line per member
+# per battle. Both bots are Cloud (a headless bot registers without a look); on the Steam data he
+# starts at level 6 with 610 experience, six short of level 7, so the first win levels him up. The
+# server is not restarted here (the client's token files are keyed by server address, and the server
+# binds a free port): that the saved progress survives a restart is tested by
+# crates/fmv-server/tests/progress.rs.
+#
+# The same chain for ITEMS: each bot's "inventory: stacks=S total=T items=item:count,.." notes (one per
+# Inventory message of the server, the whole inventory) must show, on joining in run 1, the game's
+# starting stock (a new account: at least one item), on joining in runs 2 and 3 exactly the items the
+# run before ended with (the inventory was SAVED, not given again, and read back), and, after a won
+# battle, the stock plus the drops: the two bots' inventories together grew by exactly the items the
+# server logged as dealt out to its two members ("battle reward ... dropped=[(item, count), ..]"). The
+# bots use no item (they attack, and cast a healing spell when hurt), so an item that went missing is a
+# failure; an "item used" line in the server log turns that exact comparison off and says so. A run that
+# does not fight leaves the inventory as it was, the SMOKE line's items=N is the last total the server
+# reported, and every "progress saved" line carries the inventory's total (items=N).
 #
 # Isolation (the owner's state directory is never touched, only its LIBRARY is read): the server and
 # the clients run with XDG_DATA_HOME/XDG_STATE_HOME/XDG_CONFIG_HOME/XDG_CACHE_HOME and FMV_STATE_DIR
@@ -103,7 +119,8 @@ Usage: scripts/battle-smoke.sh [--fixture|--random|--progress] [--release|--debu
 Real-data mode (default): two headless bots form a party on the real FF7 field md1stin and fight
 one shared battle started with --debug-encounters; passes when both report battles=1 victories=1
 for the same battle, each replayed it from its own battle data ("verified by replay") and both
-members attacked (the server's commands=[a, b] are both at least 1). --random: the same bots walk
+members acted (the server's commands=[a, b] are both at least 1) and told their inventory (the SMOKE
+line's items=N). --random: the same bots walk
 md1stin without --debug-encounters and the server rolls the field's own encounter table (battles
 start by themselves); every battle they enter must be verified by replay. --fixture: checks that
 a FIXTURE server refuses battles cleanly. --progress: the real-data bots fight, then reconnect with
@@ -378,6 +395,48 @@ progress_note() {
   strip_ansi "$line"
 }
 
+# inventory_note <first|last> <client log>: that `inventory: stacks=S total=T items=item:count,..` note of
+# a client (the client's battle module writes one per Inventory message of the server, which always
+# carries the WHOLE inventory; `items=-` is an empty one), ANSI stripped; nothing if it has none.
+inventory_note() {
+  local which="$1" log="$2" line
+  if [[ $which == first ]]; then
+    line=$(first_line_with "$log" "inventory: stacks=") || return 0
+  else
+    line=$(last_line_with "$log" "inventory: stacks=") || return 0
+  fi
+  strip_ansi "$line"
+}
+
+# dropped_total <server log line>: the number of items a `battle reward ... dropped=[(item, count), ..]`
+# line says were dealt to that member (0 for a line without drops).
+dropped_total() {
+  local line rest sum=0
+  line=$(strip_ansi "$1")
+  if [[ $line =~ dropped=\[([^]]*)\] ]]; then
+    rest="${BASH_REMATCH[1]}"
+    while [[ $rest =~ \(([0-9]+),\ ([0-9]+)\) ]]; do
+      sum=$((sum + BASH_REMATCH[2]))
+      rest="${rest#*"${BASH_REMATCH[0]}"}"
+    done
+  fi
+  printf '%s' "$sum"
+}
+
+# check_saved_items <server log>: every `progress saved` line carries the inventory's total (items=N): the
+# saver reports the inventory it stored (or would store) with the progress.
+check_saved_items() {
+  local log="$1" line total bad=0 seen=0
+  while IFS= read -r line || [[ -n $line ]]; do
+    if [[ $line == *"progress saved account="* ]]; then
+      seen=$((seen + 1))
+      total=$(field "$(strip_ansi "$line")" items)
+      [[ $total =~ ^[0-9]+$ ]] && ((total >= 1)) || bad=$((bad + 1))
+    fi
+  done <"$log"
+  ((bad == 0)) || problem "$bad of $seen 'progress saved' line(s) of the server carry no items=N total of at least 1"
+}
+
 run_real() {
   local state_real="$LIBRARY"
   [[ -d $state_real/library/sets ]] || {
@@ -432,12 +491,15 @@ run_real() {
         [[ $smoke_line == *" $value"* ]] || problem "client $n: the SMOKE line lacks $value: $smoke_line"
       done
       [[ $(field "$smoke_line" fixture) == false ]] || problem "client $n: fixture is not false: $smoke_line"
-      # Character progress (protocol v5): the line ends with the level and experience the server last
+      # Character progress (protocol v5): the line carries the level and experience the server last
       # reported, which the won battle has just paid (see --progress for the full chain).
       value=$(field "$smoke_line" level)
       [[ $value =~ ^[0-9]+$ ]] && ((value >= 1)) || problem "client $n: the SMOKE line has no level of at least 1 (level=$value): $smoke_line"
       value=$(field "$smoke_line" exp)
       [[ $value =~ ^[0-9]+$ ]] && ((value >= 1)) || problem "client $n: the SMOKE line has no experience (exp=$value): $smoke_line"
+      # Inventory (protocol v6): a new account carries the game's starting stock, and the server told it.
+      value=$(field "$smoke_line" items)
+      [[ $value =~ ^[0-9]+$ ]] && ((value >= 1)) || problem "client $n: the SMOKE line has no items (items=$value): the server told the bot no inventory: $smoke_line"
     else
       problem "client $n printed no SMOKE line"
     fi
@@ -466,13 +528,14 @@ run_real() {
     local ended
     ended=$(last_line_with "$WORK/server.log" "battle ended" || true)
     [[ $ended == *Victory* ]] || problem "the server's battle did not end in Victory: $ended"
-    # Both members attacked: the server's own count of accepted commands per actor, e.g. [2, 3].
+    # Both members acted: the server's own count of accepted commands per actor (of any kind: attacks,
+    # and spells when a bot was hurt), e.g. [2, 3].
     local counts actor_counts=() c
     counts=$(commands_of "$ended")
     read -r -a actor_counts <<<"$counts"
     ((${#actor_counts[@]} == 2)) || problem "the server's battle-end line has no two-member commands=[..]: $ended"
     for c in "${actor_counts[@]}"; do
-      ((c >= 1)) || problem "a member of the battle never attacked (server: commands per actor [$counts])"
+      ((c >= 1)) || problem "a member of the battle never gave a command (server: commands per actor [$counts])"
     done
   fi
   (($(count_lines_with "$WORK/server.log" "battle started") <= 1)) || problem "the server started more than one battle"
@@ -499,7 +562,7 @@ run_real() {
     say "client $n: $(last_line_with "$WORK/client-$n.log" "after the last battle:" || true)"
   done
   RESULT=pass
-  say "PASS: two bots fought one shared battle on the real field, both attacked, each replayed it from its own battle data and won it; $state_real unchanged ($after)"
+  say "PASS: two bots fought one shared battle on the real field, both gave commands, each replayed it from its own battle data, won it and carries an inventory; $state_real unchanged ($after)"
 }
 
 # all_battle_ids_of <client log>: every distinct battle#N a client says it started, one per line.
@@ -610,6 +673,9 @@ run_random() {
 # this on joining), the level each was told on joining in each run, and a line per bot and run for the
 # PASS message.
 declare -A PREV_LEVEL=() PREV_EXP=() RUN_JOIN_LEVEL=()
+# The same for the items: what each bot carried at the end of the previous run (`item:count,..`), the
+# total each run's battle added to the two bots' inventories together, and the stock they started with.
+declare -A PREV_ITEMS=() RUN_GAIN=()
 PROGRESS_SUMMARY=()
 
 # start_bots <run> <duration> <battle|idle>: run bots A and B against the server, which stays up, and
@@ -638,6 +704,74 @@ start_bots() {
   wait_clients $((duration + CLIENT_GRACE))
 }
 
+# check_items <run> <battle|idle> <client> <client log> <SMOKE line>: the inventory chain of one run of one
+# bot (see the --progress paragraph of the header). It is told on joining: the starting stock in run 1, and
+# in a reconnect exactly the items the run before ended with (saved, not given again, read back). A run
+# that does not fight leaves it alone, and the SMOKE line's items=N is the last total the server reported.
+# What a won battle adds is summed over both bots in RUN_GAIN and compared with the server's log by
+# check_drops.
+check_items() {
+  local run="$1" kind="$2" n="$3" log="$4" smoke_line="$5"
+  local join end t0 t1 list0 list1
+  join=$(inventory_note first "$log")
+  end=$(inventory_note last "$log")
+  if [[ -z $join ]]; then
+    problem "$run: client $n was not told its inventory on joining (no 'inventory: stacks=' note)"
+    return 0
+  fi
+  t0=$(field "$join" total)
+  list0=$(field "$join" items)
+  if [[ ! $t0 =~ ^[0-9]+$ || -z $list0 ]]; then
+    problem "$run: client $n: the inventory note on joining has no usable total/items: $join"
+    return 0
+  fi
+  if [[ -z ${PREV_ITEMS[$n]:-} ]]; then
+    # The first login of a new account: the game's own starting stock, never empty.
+    ((t0 >= 1)) || problem "$run: client $n: a new account was told an empty inventory instead of the starting stock: $join"
+  elif [[ $list0 != "${PREV_ITEMS[$n]}" ]]; then
+    problem "$run: client $n joined carrying [$list0], but the run before ended with [${PREV_ITEMS[$n]}]: the inventory was not kept (or the starting stock was given again)"
+  fi
+  t1=$t0
+  list1=$list0
+  if [[ -n $end ]]; then
+    t1=$(field "$end" total)
+    list1=$(field "$end" items)
+  fi
+  if [[ ! $t1 =~ ^[0-9]+$ || -z $list1 ]]; then
+    problem "$run: client $n: the last inventory note has no usable total/items: $end"
+    return 0
+  fi
+  [[ $(field "$smoke_line" items) == "$t1" ]] || problem "$run: client $n: the SMOKE line says items=$(field "$smoke_line" items) but its last inventory note says total=$t1: $smoke_line"
+  if [[ $kind == battle ]]; then
+    RUN_GAIN[$run]=$((${RUN_GAIN[$run]:-0} + t1 - t0))
+  elif [[ $list1 != "$list0" ]]; then
+    problem "$run: client $n did not fight, yet its inventory changed from [$list0] to [$list1]"
+  fi
+  PREV_ITEMS[$n]=$list1
+  PROGRESS_SUMMARY+=("$run client $n: items $t0 -> $t1 ([$list0] -> [$list1])")
+}
+
+# check_drops <run> <number of the first "battle reward" line of the run>: what the server dealt out in the
+# battle of <run> (the "battle reward" lines of its two members, which it logs one after the other) is
+# exactly what the two bots' inventories grew by together. Skipped, with a note, when an item was used in
+# a battle (the bots use none: a use would make the sum differ for a good reason).
+check_drops() {
+  local run="$1" first="$2" dropped=0 line k
+  if log_has "$WORK/server.log" "item used battle="; then
+    say "note: an item was used in a battle, so the drops of $run are not compared with the inventories"
+    return 0
+  fi
+  for k in "$first" $((first + 1)); do
+    line=$(nth_line_with "$WORK/server.log" "battle reward battle=" "$k" || true)
+    if [[ -z $line ]]; then
+      problem "$run: the server logged no 'battle reward' line number $k"
+      return 0
+    fi
+    dropped=$((dropped + $(dropped_total "$line")))
+  done
+  [[ ${RUN_GAIN[$run]:-0} == "$dropped" ]] || problem "$run: the bots' inventories grew by ${RUN_GAIN[$run]:-0} item(s) together, but the server logged $dropped item(s) dropped to the party"
+}
+
 # check_phase <run> <battle|idle>: the checks of one run of both bots (see the --progress paragraph of
 # the header): clean exit, a SMOKE line that ends with the last level and exp the server reported, a
 # progress note on joining that equals what the run before ended with, and for a battle run a win that
@@ -662,6 +796,7 @@ check_phase() {
     if log_has "$log" "DIVERGENCE"; then
       problem "$run: client $n reported a BATTLE DIVERGENCE (its replay disagreed with the server)"
     fi
+    check_items "$run" "$kind" "$n" "$log" "$smoke_line"
 
     # What the server said on joining.
     join_note=$(progress_note first "$log")
@@ -785,11 +920,16 @@ run_progress() {
   local ended
   ended=$(last_line_with "$WORK/server.log" "battle ended" || true)
   [[ $ended == *Victory* ]] || problem "the server's last battle did not end in Victory: $ended"
+  # The items: what each win dropped to the party is what the bots' inventories grew by (two "battle
+  # reward" lines per battle: the first battle's are lines 1 and 2, the second's 3 and 4).
+  check_drops run1 1
+  check_drops run2 3
 
   stop_server
   # Stopping the server saved everything queued: one payment per member per battle, none lost.
   value=$(count_lines_with "$WORK/server.log" "progress saved account=")
   [[ $value == 4 ]] || problem "the server logged $value 'progress saved' line(s), expected 4 (two members, two battles)"
+  check_saved_items "$WORK/server.log"
   if log_has "$WORK/server.log" "NOT SAVED" || log_has "$WORK/server.log" "NOT QUEUED"; then
     problem "the server lost a payment: $(last_line_with "$WORK/server.log" "NOT SAVED" || last_line_with "$WORK/server.log" "NOT QUEUED")"
   fi
@@ -809,7 +949,7 @@ run_progress() {
   say "server: $started_1"
   say "server: $started_2"
   RESULT=pass
-  say "PASS: two bots fought two battles on the real field across three logins; each win paid experience (and a level where the threshold was crossed), the progress was saved and read back on every reconnect, and the second battle was fought at the level the first one left; $state_real unchanged ($after)"
+  say "PASS: two bots fought two battles on the real field across three logins; each win paid experience (and a level where the threshold was crossed), the progress and the inventory (the starting stock once, plus the drops) were saved and read back on every reconnect, and the second battle was fought at the level the first one left; $state_real unchanged ($after)"
 }
 
 run_fixture() {
@@ -830,8 +970,9 @@ run_fixture() {
   local smoke_line
   if smoke_line=$(last_line_with "$WORK/client-A.log" "SMOKE name="); then
     smoke_line=$(strip_ansi "$smoke_line")
-    # The FIXTURE server has no characters and reports no progress: level=0 exp=0 ("unknown"), last.
-    [[ $smoke_line == *" battles=0 victories=0 area_changes=0 level=0 exp=0" ]] || problem "the SMOKE line does not end in battles=0 victories=0 area_changes=0 level=0 exp=0: $smoke_line"
+    # The FIXTURE server has no characters and no items and reports no progress and no inventory:
+    # level=0 exp=0 items=0 ("unknown"), last.
+    [[ $smoke_line == *" battles=0 victories=0 area_changes=0 level=0 exp=0 items=0" ]] || problem "the SMOKE line does not end in battles=0 victories=0 area_changes=0 level=0 exp=0 items=0: $smoke_line"
     SMOKE_LINES=("$smoke_line")
   else
     problem "the bot printed no SMOKE line"

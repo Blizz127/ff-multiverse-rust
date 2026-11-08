@@ -216,7 +216,7 @@ one SMOKE line:
 ```
 target/release/fmv-client --server <addr> --name A --headless --duration 5
 target/release/fmv-client --server <addr> --name B --headless --duration 5
-SMOKE name=<n> area=<AreaId> fixture=<bool> peers_seen=<n> updates=<n> rejected=<n> rtt_ms=<n> party=<n> battles=<n> victories=<n> area_changes=<n> level=<n> exp=<n>
+SMOKE name=<n> area=<AreaId> fixture=<bool> peers_seen=<n> updates=<n> rejected=<n> rtt_ms=<n> party=<n> battles=<n> victories=<n> area_changes=<n> level=<n> exp=<n> items=<n>
 ```
 
 `peers_seen` of at least 1 means that client saw the other player; `party` is the largest
@@ -226,7 +226,9 @@ party this client was in during the run (0 if none). Bots can form a party: give
 entered and the server ended in victory; `area_changes` (area travel) counts the times the server
 moved the client to another field; `level` and `exp` (appended in protocol v5) are the level and
 total experience of the player's character as the server last reported them (`0` and `0` from a
-server that reports none, such as the FIXTURE one). These line formats are a contract: new fields
+server that reports none, such as the FIXTURE one); `items` (appended in protocol v6) is the total
+count of the items the player carries, as the server last told it (`0` from a server with none).
+These line formats are a contract: new fields
 are only ever appended, and `scripts/smoke.sh` parses them by key (it ignores the fields it does
 not know).
 
@@ -399,7 +401,7 @@ rewards (experience and gil shared among the living, AP to each), which the serv
 member's own character progress (see below). A server without
 battle data (the FIXTURE one, or `--ff7-flevel`) refuses every battle request cleanly.
 `scripts/battle-smoke.sh` runs two bots through one real battle on `md1stin` and checks that both
-members attacked (the server logs the accepted commands per actor) and that each bot replayed the
+members acted (the server logs the accepted commands per actor) and were told their inventory, and that each bot replayed the
 battle from its own game files and matched (`verified by replay`, not merely "no divergence").
 
 **Character progress (protocol v5).** Every account has its own progress in the game it plays: the
@@ -413,7 +415,7 @@ with 610 experience, six short of level 7), nothing is written until its first w
 `<state>/server/progression/<account>/<Game>.character.json`, a record of its own beside, and
 never mixed with, the story blob that selects the account's story phase (so a battle can never move a
 player to another instance). The window shows it under the area name (`Cloud Lv 7  EXP 626/949
-Gil 20`) and the headless bot's SMOKE line ends with `level=` and `exp=`. The experience needed for
+Gil 20`) and the headless bot's SMOKE line ends with `level=`, `exp=` and `items=`. The experience needed for
 each level comes from the character's EXP curve in `kernel.bin` (`needed = modifier * level^2 / 10`
 per level, the rule the community documents; checked against Cloud's known 6, 33, 94, 202 EXP for
 levels 2 to 5 and against the shipped starting record). The store is game-agnostic: the game's caps
@@ -421,7 +423,8 @@ levels 2 to 5 and against the shipped starting record). The store is game-agnost
 who left mid-battle (its character fought on) is saved too; it is told nothing. Stopping the server
 saves everything still queued first. `scripts/battle-smoke.sh --progress` runs the whole chain on
 your real data: two bots fight, reconnect with their saved tokens, fight again at the level the
-first win left them at, and reconnect once more to see what was kept.
+first win left them at, and reconnect once more to see what was kept (the progress and, since
+protocol v6, the inventory: the starting stock once, plus what the wins dropped).
 
 **Battle commands and items (protocol v6).** A party member whose gauge is full gives Attack, Magic
 (a spell it knows, for MP), Item (one the account owns) or Defend (physical damage halved until its
