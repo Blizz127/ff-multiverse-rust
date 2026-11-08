@@ -46,11 +46,11 @@
 //!   `--debug-encounters`): every member of every battle this server starts begins with a FULL limit gauge,
 //!   whatever its account's is, so that a smoke run can force a Limit. It changes the gauge the battle STARTS
 //!   with (`BattleMember::limit`, so the `battle started` line says `limits=[255, ..]` and every replay
-//!   starts from it) and nothing else: the end-of-battle save is the normal `keep_limits` below, which
-//!   writes a member's end gauge only when it is not the one the battle started with. So a full gauge that
-//!   nobody spends is never stored (the account keeps the gauge it has), and a member that spent its limit
-//!   or was knocked out is stored with the lower gauge it ended with, like after any other battle. The
-//!   server logs the flag loudly when it starts.
+//!   starts from it), and under it NO limit gauge is ever stored: a gauge that started from a faked full one
+//!   is not the account's own, so `keep_limits` below skips the whole save (logged as `limit not kept ...
+//!   reason=debug-limit-full`) and every account keeps the gauge it really has, even when a member spent
+//!   its limit or was knocked out. A test run with this flag can therefore never overwrite a real account's
+//!   gauge. The server logs the flag loudly when it starts.
 //! * A victory pays the members that fought on (`BattleEnd::rewards`, split by
 //!   `fmv_protocol::split_rewards`) and drops items: the server rolls them after the outcome from the
 //!   battle's seed (`BattleRules::roll_drops`, logged) and deals them to the living members
@@ -650,6 +650,12 @@ impl World {
     /// on) and put in its mirror (found by its account, which may have logged in again). A gauge that did
     /// not move writes nothing. A knocked-out character ended with an empty one, which is what is kept.
     fn keep_limits(&mut self, id: BattleId, battle: &Battle) {
+        // `--debug-limit-full` faked every starting gauge: what a member ends with is not its account's
+        // own gauge, so nothing is stored and a test run can never overwrite a real account's gauge.
+        if self.battle.as_ref().is_some_and(|bw| bw.settings.debug_limit_full) {
+            self.logs.info(format!("limit not kept battle={} reason=debug-limit-full", id.0));
+            return;
+        }
         for (i, member) in battle.members.iter().enumerate() {
             let Some(end) = u8::try_from(i).ok().map(|i| battle.state.limit_gauge(ActorId(i))) else { continue };
             if end == member.info.limit {
@@ -1818,11 +1824,11 @@ mod tests {
         }
     }
 
-    /// `--debug-limit-full`: the battle STARTS with full gauges, whatever the accounts have, and the end-of-battle
-    /// save is the normal one: a full gauge nobody spent is not stored (the account keeps its own), a spent one is
-    /// stored as the lower gauge the member ended with.
+    /// `--debug-limit-full`: the battle STARTS with full gauges, whatever the accounts have, and NO gauge is ever
+    /// stored under it: not a full one nobody spent, and not a spent one either (it started from a faked gauge, so
+    /// it is not the account's own). The accounts keep what they really have.
     #[test]
-    fn debug_limit_full_only_changes_the_gauge_a_battle_starts_with_and_the_end_save_is_the_normal_one() {
+    fn debug_limit_full_only_changes_the_gauge_a_battle_starts_with_and_never_stores_a_gauge() {
         let rules = SyntheticRules::default();
         let t0 = Instant::now();
         let mut s = settings(rules);
@@ -1861,20 +1867,12 @@ mod tests {
         let gauges = replayed_gauges(&mut a, &rules);
         assert_ne!(gauges[0], 255, "A's limit emptied its gauge");
         let jobs = saved_all(&mut rx);
-        let mut kept = limits_of(&jobs);
-        kept.sort();
-        let mut want: Vec<(AccountId, u8, u16)> =
-            [(a.account, gauges[0]), (b.account, gauges[1])].into_iter().filter(|(_, g)| *g != 255).map(|(account, g)| (account, 0, g)).collect();
-        want.sort();
-        assert_eq!(kept, want, "exactly the end gauges that are not the full one the battle started with");
-        assert!(kept.iter().all(|(_, _, g)| *g != 255), "the full gauge the flag gave is never stored");
-        assert_eq!(mirrored_limit(&w, &a), gauges[0]);
-        if gauges[1] == 255 {
-            assert_eq!(mirrored_limit(&w, &b), 100, "B never spent its gauge: its account keeps the gauge it really has");
-        }
+        assert!(limits_of(&jobs).is_empty(), "a gauge that started from the faked full one is never stored: {jobs:?}");
+        assert_eq!((mirrored_limit(&w, &a), mirrored_limit(&w, &b)), (0, 100), "both accounts keep the gauges they really have");
         let logs = logs_of(&mut w);
         assert!(logs.iter().any(|l| l.starts_with("limit used battle=2 actor=0")), "{logs:?}");
-        assert!(!logs.iter().any(|l| l.starts_with("limit kept") && l.contains("limit=255")), "{logs:?}");
+        assert!(logs.iter().any(|l| l == "limit not kept battle=2 reason=debug-limit-full"), "{logs:?}");
+        assert!(!logs.iter().any(|l| l.starts_with("limit kept")), "{logs:?}");
 
         // Without the flag, the same accounts start with their own gauges.
         let (mut w, _rx) = world_with_saver(settings(rules));

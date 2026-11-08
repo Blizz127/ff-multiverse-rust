@@ -1,4 +1,4 @@
-//! `fmv-server`: authoritative FF Multiverse server (protocol v6).
+//! `fmv-server`: authoritative FF Multiverse server (protocol v7).
 //!
 //! Thin wrapper over the `fmv_server` library: parse flags, pick the game adapter, install
 //! signal handlers, run. Logs go to stderr; stdout carries exactly one line, the READY line.
@@ -99,13 +99,12 @@ DEBUG FLAGS (smoke-test aids; leave them off on a server real players use):
   --debug-encounters is given too, and warned about at start-up) makes every member of every battle
   start with a FULL limit gauge instead of its account's own, so that a smoke run can force a Limit
   command. It changes only the gauge a battle starts with (the `battle started ... limits=[..]` log
-  line shows it): the end-of-battle gauge save is the normal one, which stores a member's end gauge
-  only when it is not the gauge the battle started with. A full gauge that nobody spends is therefore
-  never stored (the account keeps the gauge it has), and a member that spent its limit or was knocked
-  out is stored with the lower gauge it ended with, like after any other battle.";
+  line shows it), and under it a limit gauge is never stored: the end-of-battle gauge save is skipped
+  (`limit not kept ... reason=debug-limit-full`), so every account keeps the gauge it really has, even
+  after a member spent its limit or was knocked out.";
 
 #[derive(Parser, Debug)]
-#[command(name = "fmv-server", version, about = "Authoritative FF Multiverse server (protocol v6)", after_help = AFTER_HELP)]
+#[command(name = "fmv-server", version, about = "Authoritative FF Multiverse server (protocol v7)", after_help = AFTER_HELP)]
 struct Cli {
     /// Address to listen on. Port 0 picks a free port (reported on the READY line).
     #[arg(long, value_name = "ADDR", default_value_t = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), DEFAULT_DEV_PORT))]

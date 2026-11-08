@@ -89,11 +89,10 @@ pub struct BattleSettings {
     /// every member of every battle this server starts begins it with a FULL limit gauge (the game's cap)
     /// instead of its account's own, so that a smoke run can force a Limit command. ONLY the gauge the
     /// battle starts with changes (`BattleMember::limit`: `EncounterStart`, the `battle started` log line
-    /// and every client's replay carry it); nothing else about the battle or the account does, and the
-    /// end-of-battle save is the normal one (`World::keep_limits`): it stores a member's end gauge only when
-    /// that is not the gauge the battle STARTED with, so a faked full gauge that nobody spends is never
-    /// stored (the account keeps the gauge it really has) and a member that spent its limit or was knocked
-    /// out is stored with the lower gauge it ended with, as after any other battle. Off by default.
+    /// and every client's replay carry it); nothing else about the battle or the account does, and no
+    /// limit gauge is ever stored under it (`World::keep_limits` skips the save): a gauge that started from a
+    /// faked full one is not the account's own, so every account keeps the gauge it really has, even when a
+    /// member spent its limit or was knocked out. Off by default.
     pub debug_limit_full: bool,
 }
 
