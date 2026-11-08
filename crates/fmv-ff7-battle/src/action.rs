@@ -191,6 +191,45 @@ impl ActionSpec {
         }
     }
 
+    /// A hand-made magical damage spell (Fire's kind: formula 2, an accuracy roll, one target): for rule
+    /// sets that have no game files (`SyntheticRules`) and for tests.
+    pub fn damage_spell(power: u32, accuracy: u32, element_mask: u16, mp_cost: u16) -> Self {
+        Self {
+            kind: ActionKind::Magical,
+            formula: Formula::Spell,
+            power,
+            accuracy,
+            rolls_accuracy: true,
+            can_crit: false,
+            element_mask,
+            hits_mp: false,
+            hits_dead: false,
+            ignores_defense: false,
+            short_range: false,
+            mp_cost,
+            unaimable: false,
+        }
+    }
+
+    /// A hand-made restoring spell (Cure's kind: formula 5, restorative, aimed at an ally).
+    pub fn cure_spell(power: u32, mp_cost: u16) -> Self {
+        Self {
+            formula: Formula::Restore,
+            element_mask: element::RESTORATIVE,
+            ..Self::damage_spell(power, 255, 0, mp_cost)
+        }
+    }
+
+    /// A hand-made revival (Life's kind: a fraction `power / 32` of max HP, only for the dead).
+    pub fn revive_spell(power: u32, mp_cost: u16) -> Self {
+        Self { formula: Formula::MaxHp, hits_dead: true, ..Self::cure_spell(power, mp_cost) }
+    }
+
+    /// A hand-made flat restoring item (Potion's kind: `20 * power` HP, or MP when `mp` is set).
+    pub fn flat_restore_item(power: u32, mp: bool) -> Self {
+        Self { formula: Formula::Flat, hits_mp: mp, rolls_accuracy: false, ..Self::cure_spell(power, 0) }
+    }
+
     /// Decode an attack record (a spell of the kernel's attack table or an enemy's attack of
     /// `scene.bin`), or `None` if the rules do not model it (see the module docs).
     pub fn from_attack(rec: &AttackRecord) -> Option<Self> {
@@ -278,6 +317,12 @@ pub struct Spell {
 }
 
 impl Spell {
+    /// A hand-made spell (see the `ActionSpec` constructors); a spell from the kernel is
+    /// [`Spell::from_attack`].
+    pub fn new(index: u16, spec: ActionSpec) -> Self {
+        Self { index, spec }
+    }
+
     /// The spell for attack record `index`, or `None` if it is not one the rules can cast: it must be
     /// magical, have a Power, hit one target (not a whole side), and have no extra effect.
     pub fn from_attack(index: u16, rec: &AttackRecord) -> Option<Self> {
@@ -391,6 +436,11 @@ pub struct ItemData {
 }
 
 impl ItemData {
+    /// A hand-made item (see the `ActionSpec` constructors).
+    pub fn new(spec: ActionSpec) -> Self {
+        Self { spec }
+    }
+
     /// The item for a kernel record, or `None` if it cannot be used in battle or is not modelled
     /// (status cures, stat boosts, escape items, whole-party items).
     pub fn from_record(rec: &ItemRecord) -> Option<Self> {
@@ -628,6 +678,24 @@ mod tests {
             assert_eq!(Elemental::of(Some(rate)), Elemental::Normal);
         }
         assert_eq!(Elemental::of(None), Elemental::Normal);
+    }
+
+    /// The hand-made constructors (for rule sets without game files) describe exactly what the decoder
+    /// makes of the real kind of record, so a synthetic battle plays like a real one.
+    #[test]
+    fn the_hand_made_specs_equal_what_the_decoder_makes_of_the_real_kinds_of_record() {
+        let from = |calc, power, accuracy, targets, element, flags, mp| {
+            ActionSpec::from_attack(&attack_record(calc, power, accuracy, targets, element, flags, mp)).unwrap()
+        };
+        assert_eq!(ActionSpec::damage_spell(8, 100, element::FIRE, 4), from(0x22, 8, 100, 0x0F, element::FIRE, 0xFDFF, 4));
+        assert_eq!(ActionSpec::cure_spell(5, 5), from(0x25, 5, 255, 0x0D, element::RESTORATIVE, 0xFDFF, 5));
+        assert_eq!(ActionSpec::revive_spell(8, 34), from(0x24, 8, 255, 0x0D, element::RESTORATIVE, 0xFCFD, 34));
+        let table = ItemTable::from_kernel(&Kernel::parse(&synthetic_kernel_bytes()).unwrap());
+        assert_eq!(ActionSpec::flat_restore_item(5, false), table.get(0).unwrap().spec, "Potion");
+        assert_eq!(ActionSpec::flat_restore_item(5, true), table.get(3).unwrap().spec, "Ether");
+        let hand = ItemTable::new([(0, ItemData::new(ActionSpec::flat_restore_item(5, false)))]);
+        assert_eq!(hand.info(0).map(|i| i.kind), Some(ItemKind::RestoreHp));
+        assert_eq!(Spell::new(27, ActionSpec::damage_spell(8, 100, element::FIRE, 4)).info().mp_cost, 4);
     }
 
     #[test]
