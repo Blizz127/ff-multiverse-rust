@@ -445,7 +445,7 @@ impl BattleClient {
 
     /// What the server last said our account carries: no stack of zero, one stack per item, at most
     /// [`MAX_INVENTORY_STACKS`] of them (whatever was sent). Empty until it says.
-    #[cfg(test)]
+    #[cfg_attr(not(test), allow(dead_code))] // for whatever shows the bag; the menu and the SMOKE line use their own views of it
     pub fn inventory(&self) -> &[InventoryEntry] {
         &self.inventory
     }
@@ -457,7 +457,7 @@ impl BattleClient {
     }
 
     /// `Inventory` messages received.
-    #[cfg(test)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn inventory_updates(&self) -> u64 {
         self.inventory_updates
     }
