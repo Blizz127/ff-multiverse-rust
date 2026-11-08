@@ -39,7 +39,18 @@
 //!   `InvalidTarget`); an `Escape` too (`CannotEscape` when the formation forbids it). A successful escape
 //!   ends the battle with `Outcome::Escaped` for everyone: no rewards, no drops, the members are back in
 //!   the field; a failed one only costs the turn. Both are logged as they happen (`limit used`,
-//!   `escape tried`).
+//!   `escape tried`), and so are the other commands that are not a plain attack (`magic used`, `item used`,
+//!   `defend used`), each as `key=value` with `battle`, `actor`, `account` and `character`: a smoke run reads
+//!   them as the server's own record of what it applied.
+//! * **`--debug-limit-full`** (`BattleSettings::debug_limit_full`, a debug flag that needs
+//!   `--debug-encounters`): every member of every battle this server starts begins with a FULL limit gauge,
+//!   whatever its account's is, so that a smoke run can force a Limit. It changes the gauge the battle STARTS
+//!   with (`BattleMember::limit`, so the `battle started` line says `limits=[255, ..]` and every replay
+//!   starts from it) and nothing else: the end-of-battle save is the normal `keep_limits` below, which
+//!   writes a member's end gauge only when it is not the one the battle started with. So a full gauge that
+//!   nobody spends is never stored (the account keeps the gauge it has), and a member that spent its limit
+//!   or was knocked out is stored with the lower gauge it ended with, like after any other battle. The
+//!   server logs the flag loudly when it starts.
 //! * A victory pays the members that fought on (`BattleEnd::rewards`, split by
 //!   `fmv_protocol::split_rewards`) and drops items: the server rolls them after the outcome from the
 //!   battle's seed (`BattleRules::roll_drops`, logged) and deals them to the living members
@@ -353,8 +364,10 @@ impl World {
                 let p = self.players.get(&entity)?;
                 let own = p.progress.unwrap_or_else(|| progress::fresh(bw.rules(), progress::DEFAULT_CHARACTER));
                 let level = bw.settings.level.unwrap_or(own.level);
-                // The limit gauge is the account's own, inside the game's cap (the engine would refuse more).
-                let limit = own.limit.min(bw.rules().progress_limits().max_limit);
+                // The limit gauge is the account's own, inside the game's cap (the engine would refuse more);
+                // `--debug-limit-full` starts everybody at the cap (see the module docs: only the start changes).
+                let max_limit = bw.rules().progress_limits().max_limit;
+                let limit = if bw.settings.debug_limit_full { max_limit } else { own.limit.min(max_limit) };
                 Some(BattleMember { entity, account: p.account, character: own.character, level, weapon: None, armor: None, limit })
             })
             .collect();
@@ -468,9 +481,17 @@ impl World {
                 if let Some(n) = battle.commands.get_mut(usize::from(actor.0)) {
                     *n += 1;
                 }
-                // Limits and escapes are logged as they happen (`key=value`, new keys at the end); the
-                // number a failed escape has left is what the next attempt starts from.
+                // Magic, defends, limits and escapes are logged as they happen (`key=value`, new keys at the
+                // end); the number a failed escape has left is what the next attempt starts from. (An item is
+                // logged by `spend_item`, after the engine took it; a plain attack is not logged.)
                 let note = match (command, who) {
+                    (Command::Magic { spell, target }, Some((account, character))) => Some(format!(
+                        "magic used battle={} actor={} account={} character={character} spell={spell} target={}",
+                        battle_id.0, actor.0, account.0, target.0
+                    )),
+                    (Command::Defend, Some((account, character))) => {
+                        Some(format!("defend used battle={} actor={} account={} character={character}", battle_id.0, actor.0, account.0))
+                    }
                     (Command::Limit { target }, Some((account, character))) => Some(format!(
                         "limit used battle={} actor={} account={} character={character} attack={} target={}",
                         battle_id.0,
@@ -1795,6 +1816,107 @@ mod tests {
             Some(ServerMsg::EncounterStart { party, .. }) => assert_eq!(party[0].limit, end),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// `--debug-limit-full`: the battle STARTS with full gauges, whatever the accounts have, and the end-of-battle
+    /// save is the normal one: a full gauge nobody spent is not stored (the account keeps its own), a spent one is
+    /// stored as the lower gauge the member ended with.
+    #[test]
+    fn debug_limit_full_only_changes_the_gauge_a_battle_starts_with_and_the_end_save_is_the_normal_one() {
+        let rules = SyntheticRules::default();
+        let t0 = Instant::now();
+        let mut s = settings(rules);
+        s.debug_limit_full = true;
+        let (mut w, mut rx) = world_with_saver(s);
+        // Two accounts with gauges of their own: an empty one, and 100.
+        let stored = Progress { character: 0, level: 5, exp: 40, ap: 0, gil: 0, limit: 100 };
+        let (mut a, b) = party_of_two_as(&mut w, t0, ProgressSeed::default(), ProgressSeed::of(0, Some(stored)));
+        assert_eq!((mirrored_limit(&w, &a), mirrored_limit(&w, &b)), (0, 100));
+        let started_with = |seat: &mut Seat| match seat.battle_msgs().last() {
+            Some(ServerMsg::EncounterStart { party, .. }) => party.iter().map(|m| m.limit).collect::<Vec<_>>(),
+            other => panic!("{other:?}"),
+        };
+
+        // Formation 3 is the preemptive one: a sure escape, with every party gauge full at once. Both start
+        // with a full limit gauge, and nobody spends it: it ends where it started, so NOTHING is written and the
+        // accounts keep what they really have.
+        assert_eq!(w.request_encounter(a.entity, Some(3), t0), BattleReply::Done);
+        assert_eq!(started_with(&mut a), vec![255, 255], "full, whatever the accounts have");
+        let first = seat_battle_id(&a.log);
+        assert_eq!(w.battle_command(a.entity, first, ActorId(0), Command::Escape, t0), BattleReply::Done);
+        assert_eq!(w.battle_count(), 0);
+        assert!(saved_all(&mut rx).is_empty(), "a faked full gauge that nobody spent is not stored");
+        assert_eq!((mirrored_limit(&w, &a), mirrored_limit(&w, &b)), (0, 100), "the accounts keep their own gauges");
+        let logs = logs_of(&mut w);
+        assert!(logs.iter().any(|l| l.starts_with("battle started battle=1") && l.contains("limits=[255, 255]")), "{logs:?}");
+        assert!(!logs.iter().any(|l| l.starts_with("limit kept")), "{logs:?}");
+
+        // Next battle: A gives its limit (B does nothing). What each member ENDS with is stored, as after any
+        // battle, unless it is the gauge the battle started with; and the fake full one is never written.
+        assert_eq!(w.request_encounter(a.entity, Some(3), t0), BattleReply::Done);
+        assert_eq!(started_with(&mut a), vec![255, 255], "every battle starts them full again");
+        let second = seat_battle_id(&a.log);
+        assert_eq!(w.battle_command(a.entity, second, ActorId(0), Command::Limit { target: ActorId(2) }, t0), BattleReply::Done);
+        play_out(&mut w, &mut [&mut a], &rules, t0);
+        let gauges = replayed_gauges(&mut a, &rules);
+        assert_ne!(gauges[0], 255, "A's limit emptied its gauge");
+        let jobs = saved_all(&mut rx);
+        let mut kept = limits_of(&jobs);
+        kept.sort();
+        let mut want: Vec<(AccountId, u8, u16)> =
+            [(a.account, gauges[0]), (b.account, gauges[1])].into_iter().filter(|(_, g)| *g != 255).map(|(account, g)| (account, 0, g)).collect();
+        want.sort();
+        assert_eq!(kept, want, "exactly the end gauges that are not the full one the battle started with");
+        assert!(kept.iter().all(|(_, _, g)| *g != 255), "the full gauge the flag gave is never stored");
+        assert_eq!(mirrored_limit(&w, &a), gauges[0]);
+        if gauges[1] == 255 {
+            assert_eq!(mirrored_limit(&w, &b), 100, "B never spent its gauge: its account keeps the gauge it really has");
+        }
+        let logs = logs_of(&mut w);
+        assert!(logs.iter().any(|l| l.starts_with("limit used battle=2 actor=0")), "{logs:?}");
+        assert!(!logs.iter().any(|l| l.starts_with("limit kept") && l.contains("limit=255")), "{logs:?}");
+
+        // Without the flag, the same accounts start with their own gauges.
+        let (mut w, _rx) = world_with_saver(settings(rules));
+        let (mut a, _b) = party_of_two_as(&mut w, t0, ProgressSeed::default(), ProgressSeed::of(0, Some(stored)));
+        assert_eq!(w.request_encounter(a.entity, Some(3), t0), BattleReply::Done);
+        assert_eq!(started_with(&mut a), vec![0, 100], "the accounts' own gauges");
+    }
+
+    /// Magic, Defend and Item are logged when the engine applies them (the server's own record, next to
+    /// `limit used` and `escape tried`); a command that is refused is not.
+    #[test]
+    fn magic_defend_and_item_are_logged_as_they_are_applied_and_a_refused_command_is_not() {
+        let rules = SyntheticRules::default();
+        let t0 = Instant::now();
+        let mut w = world_with(Some(settings(rules)), true);
+        let mut a = seat(&mut w, "A", t0);
+        assert_eq!(w.request_encounter(a.entity, Some(3), t0), BattleReply::Done);
+        a.battle_msgs();
+        let id = seat_battle_id(&a.log);
+        // A spell the character does not know is refused, and says nothing in the log.
+        assert_eq!(
+            w.battle_command(a.entity, id, ActorId(0), Command::Magic { spell: 99, target: ActorId(0) }, t0),
+            refused(Some(id), BattleRejection::UnknownSpell)
+        );
+        let mut turn = 0;
+        play_with(&mut w, &mut [&mut a], &rules, t0, &mut |state, me| {
+            turn += 1;
+            match turn {
+                1 => Command::Defend,
+                2 => Command::Magic { spell: 0, target: me },
+                3 => Command::Item { item: 0, target: me },
+                _ => Command::Attack { target: state.enemy_ids().into_iter().find(|e| state.actor(*e).is_some_and(|c| c.is_alive())).unwrap() },
+            }
+        });
+        let logs = logs_of(&mut w);
+        let account = a.account.0;
+        let has = |line: String| logs.contains(&line);
+        assert!(has(format!("defend used battle=1 actor=0 account={account} character=0")), "{logs:?}");
+        assert!(has(format!("magic used battle=1 actor=0 account={account} character=0 spell=0 target=0")), "{logs:?}");
+        assert!(logs.iter().any(|l| l.starts_with("item used battle=1 ") && l.contains("item=0 left=2")), "a Potion of three: {logs:?}");
+        assert_eq!(logs.iter().filter(|l| l.starts_with("magic used")).count(), 1, "the refused spell is not logged: {logs:?}");
+        assert!(!logs.iter().any(|l| l.contains("spell=99")), "{logs:?}");
     }
 
     #[test]

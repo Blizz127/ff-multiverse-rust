@@ -1,6 +1,7 @@
 //! Command line interface, plus the small pure helpers behind it (tint parsing, name-hash tint,
 //! server address normalisation, duration validation).
 
+use crate::battle::ScriptStep;
 use crate::ff7::{Ff7Labels, Ff7Source};
 use clap::{Parser, ValueEnum};
 use fmv_core::AvatarAppearance;
@@ -75,14 +76,28 @@ HEADLESS OUTPUT:
   --party-invite-first-peer invites the visible player with the lowest entity id (a refused invite
   is retried, at most 5 times, 1 s apart); --party-accept accepts every invite sent to this player.
   --battle-auto plays battles: whenever its gauge is full it casts its cheapest healing spell on
-  itself if its HP is under 30% and it has the MP, and otherwise attacks the first living enemy;
-  with --debug-encounters it also asks the server for one battle (see BATTLES). Battle events and
-  refusals are logged on stderr as `battle:` lines; when a battle ends the line says whether this
-  machine replayed it from its own battle data and matched (`verified: ...`) or could not
+  itself if its HP is under 30% and it has the MP, otherwise gives its limit break if the limit
+  gauge is full, and otherwise attacks the first living enemy; it never runs unless a script says
+  so. With --debug-encounters it also asks the server for one battle (see BATTLES). Battle events
+  and refusals are logged on stderr as `battle:` lines; when a battle ends the line says whether
+  this machine replayed it from its own battle data and matched (`verified: ...`) or could not
   (`NOT verified: ...`), and the closing `headless: battles:` line counts the verified ones and
-  the commands of this player the server applied, by kind (attack, magic, item, defend). A
-  --battle-auto bot that is in a battle when --duration runs out plays it to the end (at most 12 s
-  longer).
+  the commands of this player the server applied, by kind:
+  `(<n> attack, <n> magic, <n> item, <n> defend, <n> limit, <n> escape)`. A --battle-auto bot that
+  is in a battle when --duration runs out plays it to the end (at most 12 s longer).
+  --battle-script LIST (with --battle-auto) makes the bot give these commands first, in order, one
+  per full ATB gauge, and only then play as above. Entries, separated by commas: attack, defend,
+  escape, limit, magic:<spell id> and item:<item id> (the game's own ids: Cure is spell 0, Potion
+  is item 0, Phoenix Down is item 7), for example --battle-script defend,item:0,magic:0,limit.
+  An offensive spell, item or limit, and attack, aim at the first living enemy; a healing spell,
+  item or limit at the party member with the least HP left (the bot itself on a tie); a reviving
+  one at a fallen member. An entry this character cannot give at that moment (not enough MP, none
+  of the item left, the limit gauge is not full, a battle that cannot be escaped, nobody has
+  fallen) is logged as a `battle: script: ... skipped: <why>` line, counted and skipped for good,
+  and the next entry is tried at once. An entry is used up when the server applies (or refuses)
+  it; an escape can fail, so list it more than once. The script goes on across battles, and the
+  closing `headless: battle script: entries=<n> applied=<n> skipped=<n> refused=<n> lost=<n>
+  unused=<n>` line says how it went.
 
 BATTLES:
   A battle starts for a whole party (random encounters in a field that has a table, or on request
@@ -262,10 +277,20 @@ pub struct Args {
 
     // ---- battles (protocol v3): one contiguous block ----
     /// Play battles as a bot: whenever this player's ATB gauge is full, cast its cheapest healing
-    /// spell on itself if its HP is under 30% and it has the MP, else attack the first living enemy
-    /// (headless only). Battles start from random encounters, or with --debug-encounters.
+    /// spell on itself if its HP is under 30% and it has the MP, else give its limit break if the
+    /// limit gauge is full, else attack the first living enemy; it never runs unless --battle-script
+    /// says so (headless only). Battles start from random encounters, or with --debug-encounters.
     #[arg(long, requires = "headless")]
     pub battle_auto: bool,
+
+    /// With --battle-auto: the commands to give first, in order, one per full ATB gauge, before
+    /// playing as usual. Entries, separated by commas: attack, defend, escape, limit, magic:<spell
+    /// id>, item:<item id> (Cure is spell 0, Potion is item 0), for example
+    /// `defend,item:0,magic:0,limit`. An entry the character cannot give at that moment (no MP, none
+    /// of the item, the limit gauge not full, a battle that cannot be escaped) is logged, skipped and
+    /// counted; an escape can fail, so list it more than once.
+    #[arg(long, value_name = "STEP[,STEP...]", value_delimiter = ',', value_parser = parse_script_step, requires = "battle_auto")]
+    pub battle_script: Vec<ScriptStep>,
 
     /// With --battle-auto: also ask the server for a debug encounter, once (the server must run
     /// with --debug-encounters; a refusal is logged and not retried).
@@ -425,6 +450,11 @@ pub fn parse_area_key(s: &str) -> Result<String, String> {
         return Err(format!("`{}` is not an area key (ASCII letters, digits, `_` and `-`, at most 32 characters)", clean_for_error(s)));
     }
     Ok(key.to_string())
+}
+
+/// One entry of `--battle-script` (`attack`, `defend`, `escape`, `limit`, `magic:<id>`, `item:<id>`).
+pub fn parse_script_step(s: &str) -> Result<ScriptStep, String> {
+    s.parse()
 }
 
 /// Text from the command line made safe to put into an error message.
@@ -711,6 +741,49 @@ mod tests {
             "invalid or unknown token",
         ] {
             assert!(help.contains(needle), "--help must mention {needle:?}:\n{help}");
+        }
+    }
+
+    #[test]
+    fn battle_script_takes_comma_separated_commands_and_needs_battle_auto() {
+        use crate::battle::ScriptStep::{Attack, Defend, Escape, Item, Limit, Magic};
+        let parse = |extra: &[&str]| Args::try_parse_from(["fmv-client", "--headless", "--battle-auto"].into_iter().chain(extra.iter().copied()));
+        let a = parse(&["--battle-script", "defend,item:0,magic:0,limit,escape,attack"]).unwrap();
+        assert_eq!(a.battle_script, [Defend, Item(0), Magic(0), Limit, Escape, Attack]);
+        assert_eq!(parse(&["--battle-script", "Magic:27"]).unwrap().battle_script, [Magic(27)], "case does not matter");
+        assert!(parse(&[]).unwrap().battle_script.is_empty(), "no script unless asked for");
+        // Given twice, the lists add up.
+        let a = parse(&["--battle-script", "defend", "--battle-script", "escape,escape"]).unwrap();
+        assert_eq!(a.battle_script, [Defend, Escape, Escape]);
+        // It is a bot's flag: it needs --battle-auto, and so --headless.
+        assert!(Args::try_parse_from(["fmv-client", "--headless", "--battle-script", "attack"]).is_err());
+        assert!(Args::try_parse_from(["fmv-client", "--battle-auto", "--battle-script", "attack"]).is_err());
+        assert!(Args::try_parse_from(["fmv-client", "--battle-script", "attack"]).is_err());
+        // A bad entry is a usage error before anything runs, and the message says what is expected.
+        for bad in ["run", "defend,", ",defend", "magic", "magic:", "item:x", "item:70000", "limit:3", "", "defend,fire"] {
+            assert!(parse(&["--battle-script", bad]).is_err(), "{bad:?} is not a script");
+        }
+        let err = parse(&["--battle-script", "defend,run"]).unwrap_err().to_string();
+        assert!(err.contains("magic:<spell id>") && err.contains("run"), "{err}");
+    }
+
+    #[test]
+    fn the_help_documents_the_battle_script_and_the_breakdown_of_the_applied_commands() {
+        use clap::CommandFactory;
+        let help = Args::command().render_long_help().to_string();
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        for needle in [
+            "--battle-script",
+            "attack, defend, escape, limit, magic:<spell id> and item:<item id>",
+            "defend,item:0,magic:0,limit",
+            "Cure is spell 0, Potion is item 0",
+            "one per full ATB gauge",
+            "skipped for good",
+            "(<n> attack, <n> magic, <n> item, <n> defend, <n> limit, <n> escape)",
+            "headless: battle script: entries=<n> applied=<n> skipped=<n> refused=<n> lost=<n> unused=<n>",
+            "it never runs unless a script says so",
+        ] {
+            assert!(flat.contains(needle), "--help must mention {needle:?}:\n{help}");
         }
     }
 

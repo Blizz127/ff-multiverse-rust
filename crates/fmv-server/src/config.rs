@@ -85,6 +85,16 @@ pub struct BattleSettings {
     /// Horizontal distance a player walks between two random-encounter rolls. `None` is the
     /// area's `max_speed`: one roll per second of walking at full speed.
     pub encounter_step_units: Option<f32>,
+    /// DEBUG, `--debug-limit-full` (refused without `--debug-encounters`, see [`ServerConfig::validate`]):
+    /// every member of every battle this server starts begins it with a FULL limit gauge (the game's cap)
+    /// instead of its account's own, so that a smoke run can force a Limit command. ONLY the gauge the
+    /// battle starts with changes (`BattleMember::limit`: `EncounterStart`, the `battle started` log line
+    /// and every client's replay carry it); nothing else about the battle or the account does, and the
+    /// end-of-battle save is the normal one (`World::keep_limits`): it stores a member's end gauge only when
+    /// that is not the gauge the battle STARTED with, so a faked full gauge that nobody spends is never
+    /// stored (the account keeps the gauge it really has) and a member that spent its limit or was knocked
+    /// out is stored with the lower gauge it ended with, as after any other battle. Off by default.
+    pub debug_limit_full: bool,
 }
 
 impl BattleSettings {
@@ -99,6 +109,7 @@ impl BattleSettings {
             debug_formation: None,
             random_encounters: true,
             encounter_step_units: None,
+            debug_limit_full: false,
         }
     }
 }
@@ -115,6 +126,7 @@ impl fmt::Debug for BattleSettings {
             .field("debug_formation", &self.debug_formation)
             .field("random_encounters", &self.random_encounters)
             .field("encounter_step_units", &self.encounter_step_units)
+            .field("debug_limit_full", &self.debug_limit_full)
             .finish()
     }
 }
@@ -329,6 +341,10 @@ impl ServerConfig {
             if b.encounter_step_units.is_some_and(|u| !(u.is_finite() && u > 0.0)) {
                 return bad(format!("encounter_step_units must be finite and positive (got {:?})", b.encounter_step_units));
             }
+            // A debug aid never runs on its own: it belongs to a server that was asked for debug encounters.
+            if b.debug_limit_full && !self.debug_encounters {
+                return bad("debug_limit_full (--debug-limit-full) is a debug flag and needs debug_encounters (--debug-encounters) too".into());
+            }
         }
         // The build string is one whitespace-free token on the line-based READY message.
         if let Some(suffix) = &self.build_suffix {
@@ -414,6 +430,23 @@ mod tests {
         let shown = format!("{:?}", with(&|_| {}));
         assert!(shown.contains("data_fingerprint") && shown.contains("BattleSettings"), "{shown}");
         assert!(!shown.contains("SyntheticRules"), "{shown}");
+    }
+
+    #[test]
+    fn the_debug_limit_flag_is_off_by_default_and_never_runs_without_debug_encounters() {
+        use fmv_protocol::SyntheticRules;
+        assert!(!BattleSettings::new(Arc::new(SyntheticRules::default())).debug_limit_full, "off unless asked for");
+        let with = |debug_encounters: bool, limit_full: bool| {
+            let mut b = BattleSettings::new(Arc::new(SyntheticRules::default()));
+            b.debug_limit_full = limit_full;
+            ServerConfig { battle: Some(b), debug_encounters, ..ServerConfig::default() }
+        };
+        with(true, true).validate().unwrap();
+        with(true, false).validate().unwrap();
+        with(false, false).validate().unwrap();
+        let err = with(false, true).validate().expect_err("a debug flag without --debug-encounters is refused").to_string();
+        assert!(err.contains("--debug-limit-full") && err.contains("--debug-encounters"), "{err}");
+        assert!(format!("{:?}", with(true, true).battle).contains("debug_limit_full: true"));
     }
 
     #[test]

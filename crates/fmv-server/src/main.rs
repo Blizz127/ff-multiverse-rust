@@ -92,7 +92,17 @@ CHARACTER PROGRESS:
   (`CharacterProgress`, which it also gets when it joins) and saves it. An account that has earned
   nothing yet starts at its character's starting level and experience from the game data.
   --battle-speed, --battle-tick-rate, --battle-level, --battle-seed and --debug-formation pin the
-  pace, level, seed and fight for reproducible runs; --no-random-encounters turns the rolls off.";
+  pace, level, seed and fight for reproducible runs; --no-random-encounters turns the rolls off.
+
+DEBUG FLAGS (smoke-test aids; leave them off on a server real players use):
+  --debug-encounters lets a player start a battle on request. --debug-limit-full (refused unless
+  --debug-encounters is given too, and warned about at start-up) makes every member of every battle
+  start with a FULL limit gauge instead of its account's own, so that a smoke run can force a Limit
+  command. It changes only the gauge a battle starts with (the `battle started ... limits=[..]` log
+  line shows it): the end-of-battle gauge save is the normal one, which stores a member's end gauge
+  only when it is not the gauge the battle started with. A full gauge that nobody spends is therefore
+  never stored (the account keeps the gauge it has), and a member that spent its limit or was knocked
+  out is stored with the lower gauge it ended with, like after any other battle.";
 
 #[derive(Parser, Debug)]
 #[command(name = "fmv-server", version, about = "Authoritative FF Multiverse server (protocol v6)", after_help = AFTER_HELP)]
@@ -230,6 +240,14 @@ struct Cli {
     /// Default: a weighted pick from the field's encounter table, else the first formation.
     #[arg(long, value_name = "ID")]
     debug_formation: Option<u16>,
+
+    /// DEBUG, needs --debug-encounters: every member of every battle starts with a FULL limit gauge
+    /// instead of its account's own, so that a smoke run can force a Limit command. Only the gauge a
+    /// battle STARTS with changes; the end-of-battle save is the normal one (a gauge is stored only when
+    /// it is not the one the battle started with: a full gauge nobody spends is never stored, a spent or
+    /// emptied one is stored as the gauge the member ended with). Logged as a warning at start-up.
+    #[arg(long, requires = "debug_encounters")]
+    debug_limit_full: bool,
 }
 
 /// `--idle-timeout-secs` and `--inactivity-timeout-secs`: 0 disables the timeout.
@@ -334,6 +352,7 @@ impl Cli {
             fixed_seed: self.battle_seed,
             debug_formation: self.debug_formation,
             random_encounters: !self.no_random_encounters,
+            debug_limit_full: self.debug_limit_full,
             ..BattleSettings::new(rules)
         }
     }
@@ -429,6 +448,11 @@ fn info_signal(name: &str) {
 async fn real_main(cli: Cli) -> Result<(), String> {
     let hosted = build_adapter(&cli).await.map_err(|e| e.to_string())?;
     let state_dir = server_state_dir(cli.state_dir.as_deref(), cli.ephemeral, || fmv_library::resolve_state_dir(None))?;
+    // The library says the same about --debug-encounters; the flag lives in the battle settings, which a
+    // server without battle data does not have, so this is the one place that can say it.
+    if cli.debug_limit_full && hosted.battle.is_none() {
+        warn!("--debug-limit-full has no effect: this server has no battle data, so battles are unsupported");
+    }
     let config = cli.with_limits(ServerConfig {
         bind: cli.bind,
         area_key: hosted.area,
@@ -650,6 +674,33 @@ mod tests {
             &["--battle-seed", "-1"],
         ] {
             assert!(parse(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn debug_limit_full_is_off_by_default_needs_debug_encounters_and_maps_into_the_settings() {
+        use fmv_protocol::SyntheticRules;
+        let rules = || std::sync::Arc::new(SyntheticRules::default());
+        let cli = parse(&["--debug-encounters"]).unwrap();
+        assert!(!cli.debug_limit_full, "off unless asked for");
+        assert!(!cli.battle_settings(rules()).debug_limit_full);
+
+        let cli = parse(&["--debug-encounters", "--debug-limit-full"]).unwrap();
+        assert!(cli.debug_limit_full);
+        let s = cli.battle_settings(rules());
+        assert!(s.debug_limit_full);
+        ServerConfig { battle: Some(s), debug_encounters: true, ..ServerConfig::default() }.validate().unwrap();
+
+        // A debug flag never runs alone: the parser refuses it without --debug-encounters (a usage error).
+        assert!(parse(&["--debug-limit-full"]).is_err());
+        assert!(parse(&["--no-random-encounters", "--debug-limit-full"]).is_err());
+
+        // The help says what it does and what it leaves alone.
+        use clap::CommandFactory;
+        let help = Cli::command().render_long_help().to_string();
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        for needle in ["--debug-limit-full", "FULL limit gauge", "refused unless --debug-encounters is given too", "never stored"] {
+            assert!(flat.contains(needle), "--help must mention {needle:?}:\n{help}");
         }
     }
 

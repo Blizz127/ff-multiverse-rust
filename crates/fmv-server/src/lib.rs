@@ -287,13 +287,22 @@ impl Server {
             warn!("hosting a FIXTURE area: synthetic test content, NOT FF7 support");
         }
         match (&config.battle, config.debug_encounters) {
-            (Some(b), debug_on) => info!(
-                debug_encounters = debug_on,
-                battle_speed = b.battle_speed,
-                ticks_per_second = b.ticks_per_second,
-                fixed_seed = b.fixed_seed.is_some(),
-                "battles supported (server-authoritative; clients replay them from their own battle data)"
-            ),
+            (Some(b), debug_on) => {
+                info!(
+                    debug_encounters = debug_on,
+                    debug_limit_full = b.debug_limit_full,
+                    battle_speed = b.battle_speed,
+                    ticks_per_second = b.ticks_per_second,
+                    fixed_seed = b.fixed_seed.is_some(),
+                    "battles supported (server-authoritative; clients replay them from their own battle data)"
+                );
+                if b.debug_limit_full {
+                    warn!(
+                        "DEBUG: --debug-limit-full is on: every member of every battle starts with a FULL limit gauge instead of its account's own (a smoke-test aid; leave it off on a server real players use). \
+                         Only the starting gauge changes: the end-of-battle gauge save is the normal one, so a full gauge that nobody spends is never stored and a spent or emptied one is stored as the gauge the member ended with"
+                    );
+                }
+            }
             (None, true) => warn!("--debug-encounters has no effect: this server has no battle data, so battles are unsupported"),
             (None, false) => info!("battles unsupported on this server (no owned battle data); battle requests are refused"),
         }

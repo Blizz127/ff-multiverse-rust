@@ -39,7 +39,9 @@
 //!   engine itself knows no inventory.
 //! * [`BattleBot`] is the headless `--battle-auto` player: it attacks, gives its limit break when the
 //!   gauge is full (protocol v7), and heals itself with the cheapest healing spell it can pay for when its
-//!   HP is low ([`BattleClient::bot_command`]).
+//!   HP is low ([`BattleClient::bot_command`]). With `--battle-script` it first gives the commands of that
+//!   script, in order, one per full gauge (`script`: Defend, Magic, Item, Limit and Escape can be fired from
+//!   the command line, so that a real-process smoke run proves each of them), and only then plays as above.
 //! * Limit breaks and escape (protocol v7): the menu says `Limit` in place of `Attack` while our
 //!   character's limit gauge is full and has an `Escape` row; the party panel draws a limit bar per
 //!   member (`Bar::limit`); a battle the party got away from is `Outcome::Escaped` (counted by
@@ -63,6 +65,7 @@ mod names;
 mod panels;
 mod popups;
 pub mod scene;
+mod script;
 #[cfg(test)]
 mod glue_tests;
 #[cfg(test)]
@@ -74,6 +77,7 @@ pub use bot::BattleBot;
 pub use data::open_rules;
 pub use menu::MenuKey;
 use scene::SceneStart;
+pub use script::ScriptStep;
 pub use text::draw_battle_text;
 pub use view::{battle_vertices, Bar, BattleView, Status};
 
@@ -322,6 +326,10 @@ pub struct BattleClient {
     verified: u64,
     /// Commands of our character the server applied, over the ended battles, by kind.
     applied: Applied,
+    /// Commands of our character the server has applied since this client was made, counted as each one
+    /// arrives and never lowered (the `applied` above only gains a battle's commands when it ends, and loses
+    /// those of a battle that was dropped): what a script watches to know that its entry was applied.
+    my_applied: u64,
     rejections: u64,
     last_rejection: Option<BattleRejection>,
     /// What the server last said our account carries (see [`normalise_inventory`]); empty until it says.
@@ -366,6 +374,7 @@ impl BattleClient {
             divergences: 0,
             verified: 0,
             applied: Applied::default(),
+            my_applied: 0,
             rejections: 0,
             last_rejection: None,
             inventory: Vec::new(),
@@ -453,12 +462,19 @@ impl BattleClient {
         self.applied.total()
     }
 
+    /// Commands of our own character that the server has applied since this client was made, counted as each
+    /// one arrives (also in a battle that is still running, unlike [`BattleClient::summary`], which counts the
+    /// ended ones) and never lowered: a script watches it to know that its entry was applied.
+    pub fn my_commands_applied(&self) -> u64 {
+        self.my_applied
+    }
+
     /// How many requests and commands the server refused.
     pub fn rejections(&self) -> u64 {
         self.rejections
     }
 
-    #[cfg(test)]
+    /// Why the server refused the last request or command (`None` if it never did).
     pub fn last_rejection(&self) -> Option<BattleRejection> {
         self.last_rejection
     }
@@ -652,6 +668,7 @@ impl BattleClient {
         if let Some(applied) = mine {
             active.pending = None;
             active.my_commands.count(&applied.command);
+            self.my_applied += 1;
         }
         // What happened, for the scene, whether or not this machine can replay it.
         for event in events {
@@ -909,7 +926,8 @@ impl BattleClient {
     /// restoring spell is affordable (the cheapest one, on itself), else give its limit when the gauge is
     /// full and there is a worthwhile target ([`BattleClient::limit_command`]), else attack the first
     /// living enemy ([`BattleClient::attack_command`]). It never runs: a bot that left a battle would never
-    /// win one.
+    /// win one (only a `--battle-script` makes it, see [`BattleClient::scripted_command`], and that comes
+    /// before this rule).
     pub fn bot_command(&self, now: f64) -> Option<BattleCmd> {
         self.heal_command(now).or_else(|| self.limit_command(now)).or_else(|| self.attack_command(now))
     }

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # scripts/battle-smoke.sh - shared-battle smoke test for fmv-server + fmv-client (protocol v7).
 #
-# Usage: scripts/battle-smoke.sh [--fixture|--random|--progress] [--release|--debug] [--bin-dir DIR] [--build]
-#                                [--library STATE_DIR] [--duration SECS] [--formation ID]
-#                                [--tick-rate TPS] [--battle-speed N] [--seed N] [--bot idle|circle]
-#                                [--keep-logs] [-h|--help]
+# Usage: scripts/battle-smoke.sh [--fixture|--random|--progress|--commands] [--release|--debug]
+#                                [--bin-dir DIR] [--build] [--library STATE_DIR] [--duration SECS]
+#                                [--formation ID] [--tick-rate TPS] [--battle-speed N] [--seed N]
+#                                [--bot idle|circle] [--keep-logs] [-h|--help]
 #
 # DEFAULT MODE (real data): the server hosts the real FF7 field md1stin from the owner's own
 # imported library (read-only) with --debug-encounters, and two headless bots form a party and
@@ -79,10 +79,44 @@
 # one "limit saved account=" line per "saving=queued" (those are not "progress saved" lines, which stay one
 # per member per won battle). Every "battle started" line also says how hard the fight is to run from
 # (run_difficulty=N, or none), read from scene.bin's own flags and counters. The bots give their limit break
-# when the gauge is full and never escape, but these weak enemies rarely fill a gauge in one battle: a limit
-# and an escape over a real connection, and the gauge a battle ends with surviving a restart, are tested by
-# crates/fmv-server/tests/progress.rs; Braver and running with the owner's own kernel and scenes by
-# crates/fmv-ff7-battle/tests/real_data.rs.
+# when the gauge is full and never escape, but these weak enemies rarely fill a gauge in one battle, so this
+# mode does not fire a limit or an escape: --commands (below) does, over real processes. The gauge a battle
+# ends with surviving a restart is tested by crates/fmv-server/tests/progress.rs; Braver and running with the
+# owner's own kernel and scenes by crates/fmv-ff7-battle/tests/real_data.rs.
+#
+# --commands (real data): EVERY battle command over real processes. The headless bots only attack (and
+# heal below 30% HP, which the first enemies never bring about), so the server runs with --debug-limit-full
+# (every battle member starts with a FULL limit gauge; it needs --debug-encounters, and what it leaves
+# alone is in `fmv-server --help`) and the bots follow a --battle-script. ONE server stays up through two
+# runs of the same two bots (they log in again with the tokens the first run saved; each run is one
+# battle of formation 301, whose run difficulty is 1, so it can be escaped):
+#   run 1 "cmds":   A: defend,item:0,magic:0,limit   B: magic:0,magic:9999,item:0,defend,limit
+#                   (Potion is item 0, Cure is spell 0; spell 9999 does not exist: the entry must be skipped,
+#                   counted and not retried, and the next one tried in the same turn; the limit goes last, as
+#                   the enemies of this formation die in one blow, so nothing ends the battle before the
+#                   other entries are applied). Expected: both bots win it.
+#   run 2 "escape": A and B: escape x6 (a run check succeeds 68% of the time per attempt, so several attempts
+#                   are listed; the first success ends the battle). Expected: the battle ends in Escaped.
+# The scripts can be overridden to try the mode's failure paths: FMV_SMOKE_SCRIPT_A, FMV_SMOKE_SCRIPT_B
+# (run 1) and FMV_SMOKE_ESCAPE_SCRIPT (run 2), in the syntax of `fmv-client --battle-script`.
+# The mode FAILS unless:
+#   * every bot exits 0 and entered exactly one battle per run, the same battle as the other bot, each battle
+#     was REPLAYED by each bot from its own scene.bin/kernel.bin and matched ("verified by replay"), 0
+#     divergences, run 1 ended in Victory and run 2 in Escaped;
+#   * the commands the server applied for the bots' own characters, read from each bot's closing
+#     `headless: battles:` breakdown "(N attack, N magic, N item, N defend, N limit, N escape)" and summed
+#     over both bots and both runs, include each of magic, item, defend, limit and escape at least once
+#     (a missing or unparseable breakdown is a failure, never a zero);
+#   * the server's own key=value lines agree: one "magic used", "defend used", "item used", "limit used" and
+#     "escape tried" line per command the bots counted (and an "escape tried ... result=escaped" for run 2),
+#     with the item's stock going down (left=N) and every queued write saved when the server stops;
+#   * both "battle started" lines say limits=[255, 255] (the --debug-limit-full gauge), the second one says how
+#     hard the fight is to run from (run_difficulty=N, a number), and the server warned about the debug flag
+#     when it started;
+#   * the debug gauge is never stored: no "limit kept" line says limit=255, and the escape battle, in which
+#     nobody spent a gauge, kept none (unless a member was knocked out and kept 0);
+#   * each bot's script line "entries=N applied=N skipped=N refused=N lost=N unused=N" adds up, and the
+#     default script B skipped exactly its one impossible entry.
 #
 # Isolation (the owner's state directory is never touched, only its LIBRARY is read): the server and
 # the clients run with XDG_DATA_HOME/XDG_STATE_HOME/XDG_CONFIG_HOME/XDG_CACHE_HOME and FMV_STATE_DIR
@@ -125,13 +159,22 @@ SEED=
 BATTLE_SPEED=0
 BOT=idle
 PARTY_SIZE=2
+# --commands runs the bots twice and a battle with a script takes a few seconds, so each run is short (an explicit
+# --duration still wins).
+COMMANDS_DURATION=12
+# The scripts of --commands (see the header; fmv-client --battle-script syntax). Overridable to try its failure paths.
+# Potion is item 0, Cure is spell 0 (checked against the owner's data by the --ignored real-data tests of
+# fmv-ff7-battle and fmv-client); spell 9999 does not exist, so script B has one entry that must be skipped.
+SCRIPT_A="${FMV_SMOKE_SCRIPT_A:-defend,item:0,magic:0,limit}"
+SCRIPT_B="${FMV_SMOKE_SCRIPT_B:-magic:0,magic:9999,item:0,defend,limit}"
+ESCAPE_SCRIPT="${FMV_SMOKE_ESCAPE_SCRIPT:-escape,escape,escape,escape,escape,escape}"
 
 usage() {
   cat <<'EOF'
-Usage: scripts/battle-smoke.sh [--fixture|--random|--progress] [--release|--debug] [--bin-dir DIR] [--build]
-                               [--library STATE_DIR] [--duration SECS] [--formation ID]
-                               [--tick-rate TPS] [--battle-speed N] [--seed N] [--bot idle|circle]
-                               [--keep-logs] [-h|--help]
+Usage: scripts/battle-smoke.sh [--fixture|--random|--progress|--commands] [--release|--debug]
+                               [--bin-dir DIR] [--build] [--library STATE_DIR] [--duration SECS]
+                               [--formation ID] [--tick-rate TPS] [--battle-speed N] [--seed N]
+                               [--bot idle|circle] [--keep-logs] [-h|--help]
 
 Real-data mode (default): two headless bots form a party on the real FF7 field md1stin and fight
 one shared battle started with --debug-encounters; passes when both report battles=1 victories=1
@@ -144,11 +187,17 @@ a FIXTURE server refuses battles cleanly. --progress: the real-data bots fight, 
 their saved tokens and fight again, then reconnect once more: each run's progress notes must be
 consistent (a win pays experience and a level where the threshold was crossed), the second battle
 must carry the level gained and the limit gauges the first battle ended with (protocol v7), and every
-reconnect must show what the run before ended with.
+reconnect must show what the run before ended with. --commands: every battle command over real
+processes: the server runs with --debug-limit-full (every member starts with a full limit gauge) and
+the bots follow a --battle-script, once to use defend, item, magic and limit in a battle they win and
+once to escape; each command must be applied by the server at least once (the bots' own breakdown
+"(N attack, N magic, N item, N defend, N limit, N escape)" and the server's own log lines must agree)
+and every battle must be verified by replay with 0 divergences. The scripts can be overridden with
+FMV_SMOKE_SCRIPT_A, FMV_SMOKE_SCRIPT_B and FMV_SMOKE_ESCAPE_SCRIPT (see the header of this script).
 
   --library DIR     state directory that contains library/ (default $FMV_FF7_LIBRARY, else
                      ~/.local/share/ff-multiverse); only the library is read, never written
-  --duration SECS    how long each bot runs (default 40)
+  --duration SECS    how long each bot runs (default 40; --progress 16, --commands 12)
   --formation ID     the enemy formation of the debug battle (default 301: a two-enemy formation of
                      md1stin's own encounter table in the Steam build)
   --tick-rate TPS    engine ticks per second of battle time (default 240)
@@ -432,6 +481,41 @@ count_limits_queued() {
     fi
   done <"$1"
   printf '%s' "$n"
+}
+
+# count_queued <server log> <prefix>: how many lines start their message with <prefix> (e.g. "item used battle=")
+# and say saving=queued: the writes the server handed to its saver.
+count_queued() {
+  local line n=0
+  [[ -r $1 ]] || {
+    printf '0'
+    return 0
+  }
+  while IFS= read -r line || [[ -n $line ]]; do
+    if [[ $line == *"$2"* && $line == *"saving=queued"* ]]; then
+      n=$((n + 1))
+    fi
+  done <"$1"
+  printf '%s' "$n"
+}
+
+# breakdown_of <client log>: the commands of the client's own character that the server applied, by kind, from the
+# parenthesis of its last `headless: battles:` line, "(N attack, N magic, N item, N defend, N limit, N escape)", as
+# "<attack> <magic> <item> <defend> <limit> <escape>". Nothing if the line is missing or the parenthesis is not
+# exactly that: a caller must treat that as a failure, never as zeros.
+breakdown_of() {
+  local line re
+  line=$(last_line_with "$1" "headless: battles:") || return 0
+  line=$(strip_ansi "$line")
+  re='\(([0-9]+) attack, ([0-9]+) magic, ([0-9]+) item, ([0-9]+) defend, ([0-9]+) limit, ([0-9]+) escape\)'
+  if [[ $line =~ $re ]]; then
+    printf '%s %s %s %s %s %s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}" "${BASH_REMATCH[5]}" "${BASH_REMATCH[6]}"
+  fi
+}
+
+# script_has <script> <entry>: is <entry> one of the comma-separated entries of <script>?
+script_has() {
+  [[ ",$1," == *",$2,"* ]]
 }
 
 # progress_note <first|last> <client log>: that `progress:` note of a client (the client's `progress`
@@ -1040,6 +1124,260 @@ run_progress() {
   say "PASS: two bots fought two battles on the real field across three logins; each win paid experience (and a level where the threshold was crossed), the progress and the inventory (the starting stock once, plus the drops) were saved and read back on every reconnect, and the second battle was fought at the level and with the limit gauges the first one left; $state_real unchanged ($after)"
 }
 
+# --commands: what the server applied for the bots' own characters, by kind, summed over every bot and run (read from
+# each bot's `headless: battles:` breakdown; see breakdown_of).
+COMMAND_KINDS=(attack magic item defend limit escape)
+declare -A CMD_TOTAL=([attack]=0 [magic]=0 [item]=0 [defend]=0 [limit]=0 [escape]=0)
+
+# start_script_bots <run> <duration> <script A> <script B>: bots A and B against the running server, each with its own
+# --battle-script (they log in again with the tokens the run before saved), and wait for both.
+start_script_bots() {
+  local run="$1" duration="$2" script_a="$3" script_b="$4"
+  CPID=()
+  CRC=()
+  local common=(--server "$CONNECT" --headless --duration "$duration" --bot "$BOT" --ff7-library "$WORK/lib-state")
+  "$CLIENT_BIN" "${common[@]}" --name A --state-dir "$WORK/client-A" \
+    --party-invite-first-peer --battle-auto --debug-encounters --battle-wait-party "$PARTY_SIZE" --battle-script "$script_a" \
+    >"$WORK/client-A.$run.log" 2>&1 &
+  CPID[A]=$!
+  "$CLIENT_BIN" "${common[@]}" --name B --state-dir "$WORK/client-B" \
+    --party-accept --battle-auto --battle-script "$script_b" \
+    >"$WORK/client-B.$run.log" 2>&1 &
+  CPID[B]=$!
+  wait_clients $((duration + CLIENT_GRACE))
+}
+
+# check_commands_phase <cmds|escape> <Victory|Escaped>: the checks of one run of both bots of --commands (see the header):
+# clean exit, one battle that both bots entered, replayed from their own data and matched, that ended the way the run
+# is meant to, a breakdown of the commands the server applied (added to CMD_TOTAL) and a script line that adds up.
+check_commands_phase() {
+  local run="$1" want="$2" n log smoke_line counts script_line value k id wins=1
+  local e a s r l u
+  local -a c ids=()
+  [[ $want == Victory ]] || wins=0
+  for n in "${CLIENT_NAMES[@]}"; do
+    log="$WORK/client-$n.$run.log"
+    if [[ ${CRC[$n]:-} == timeout ]]; then
+      problem "$run: client $n was still running ${CLIENT_GRACE}s after its duration and was killed"
+    elif [[ ${CRC[$n]:-} != 0 ]]; then
+      problem "$run: client $n exited with status ${CRC[$n]:-unknown}"
+    fi
+    if ! smoke_line=$(last_line_with "$log" "SMOKE name="); then
+      problem "$run: client $n printed no SMOKE line"
+      continue
+    fi
+    smoke_line=$(strip_ansi "$smoke_line")
+    SMOKE_LINES+=("$run client $n: $smoke_line")
+    for value in "party=2" "battles=1" "victories=$wins"; do
+      [[ $smoke_line == *" $value "* ]] || problem "$run: client $n: the SMOKE line lacks $value: $smoke_line"
+    done
+    [[ $(field "$smoke_line" fixture) == false ]] || problem "$run: client $n: fixture is not false: $smoke_line"
+    if log_has "$log" "DIVERGENCE"; then
+      problem "$run: client $n reported a BATTLE DIVERGENCE (its replay disagreed with the server)"
+    fi
+    # The bot REPLAYED the battle from its own scene.bin/kernel.bin and matched (one battle entered, one verified, none
+    # diverged), and it ended the way this run is meant to: won by the party, or escaped from.
+    check_mirror "$n ($run)" "$log" 1
+    log_has "$log" "ended in $want" || problem "$run: client $n never saw the battle end in $want"
+    [[ $(summary_number "$log" 'escaped,') == "$((1 - wins))" ]] || problem "$run: client $n: its summary does not say $((1 - wins)) battle(s) escaped: $(last_line_with "$log" "headless: battles:" || true)"
+    ids+=("$(battle_id_of "$log" || true)")
+
+    # The commands the server applied for this bot's own character, by kind: a missing breakdown is a failure.
+    counts=$(breakdown_of "$log")
+    if [[ -z $counts ]]; then
+      problem "$run: client $n printed no parseable '(N attack, N magic, N item, N defend, N limit, N escape)' breakdown on its 'headless: battles:' line"
+    else
+      read -r -a c <<<"$counts"
+      for k in "${!COMMAND_KINDS[@]}"; do
+        CMD_TOTAL[${COMMAND_KINDS[$k]}]=$((CMD_TOTAL[${COMMAND_KINDS[$k]}] + c[k]))
+      done
+    fi
+
+    # How the script went: every entry is exactly one of applied, skipped, refused, lost or unused.
+    script_line=$(last_line_with "$log" "headless: battle script:" || true)
+    script_line=$(strip_ansi "$script_line")
+    if [[ -z $script_line ]]; then
+      problem "$run: client $n printed no 'headless: battle script:' line"
+      continue
+    fi
+    e=$(field "$script_line" entries)
+    a=$(field "$script_line" applied)
+    s=$(field "$script_line" skipped)
+    r=$(field "$script_line" refused)
+    l=$(field "$script_line" lost)
+    u=$(field "$script_line" unused)
+    if [[ ! $e =~ ^[0-9]+$ || ! $a =~ ^[0-9]+$ || ! $s =~ ^[0-9]+$ || ! $r =~ ^[0-9]+$ || ! $l =~ ^[0-9]+$ || ! $u =~ ^[0-9]+$ ]]; then
+      problem "$run: client $n: its script line has no numeric entries/applied/skipped/refused/lost/unused: $script_line"
+      continue
+    fi
+    if ((a + s + r + l + u != e)); then
+      problem "$run: client $n: its script entries do not add up ($e entries; $a applied + $s skipped + $r refused + $l lost + $u unused): $script_line"
+    fi
+    # The default scripts of run 1 are exactly known: A's entries can all be given, and B's one impossible entry
+    # (spell 9999) is skipped, counted and not retried, with the entry after it given in the same turn.
+    if [[ $run == cmds && $n == A && -z ${FMV_SMOKE_SCRIPT_A:-} ]] && ((s != 0)); then
+      problem "$run: client $n: the default script skipped $s entr(y/ies), expected none: $script_line"
+    fi
+    if [[ $run == cmds && $n == B && -z ${FMV_SMOKE_SCRIPT_B:-} ]] && ((s != 1 || a < 3)); then
+      problem "$run: client $n: the default script should skip exactly its one impossible entry (magic:9999) and apply the others (at least 3): $script_line"
+    fi
+  done
+  if [[ -z ${ids[0]:-} || ${ids[0]} != "${ids[1]:-}" ]]; then
+    problem "$run: the bots did not enter the same battle (A: '${ids[0]:-}', B: '${ids[1]:-}')"
+  fi
+  id=${ids[0]:-}
+  PROGRESS_SUMMARY+=("$run: both bots fought ${id:-?}")
+}
+
+run_commands() {
+  local state_real="$LIBRARY"
+  [[ -d $state_real/library/sets ]] || {
+    err "no library under $state_real (needs owned FF7 content imported with fmv-import); pass --library STATE_DIR"
+    exit 1
+  }
+  local before after
+  before=$(ls -A -- "$state_real" | sort | tr '\n' ' ')
+
+  mkdir -p -- "$WORK/lib-state" "$WORK/state-env" "$WORK/server-state" "$WORK/client-A" "$WORK/client-B"
+  ln -s -- "$(cd -- "$state_real" && pwd -P)/library" "$WORK/lib-state/library"
+  export FMV_STATE_DIR="$WORK/state-env"
+
+  local -a server_args=(--bind 127.0.0.1:0 --ff7-library "$WORK/lib-state" --state-dir "$WORK/server-state"
+    --debug-encounters --debug-limit-full --no-random-encounters --battle-speed "$BATTLE_SPEED" --battle-tick-rate "$TICK_RATE")
+  server_args+=(--debug-formation "$FORMATION")
+  if [[ -n $SEED ]]; then
+    server_args+=(--battle-seed "$SEED")
+  fi
+  say "starting server: $SERVER_BIN ${server_args[*]}"
+  "$SERVER_BIN" "${server_args[@]}" >"$WORK/server.log" 2>&1 &
+  SERVER_PID=$!
+  wait_ready "$WORK/server.log"
+  say "server READY: $READY_LINE"
+  [[ $(field "$READY_LINE" area) == Ff7/md1stin && $(field "$READY_LINE" fixture) == false ]] || fail "the server is not hosting the real FF7 field md1stin: $READY_LINE"
+
+  local duration=$BATTLE_DURATION
+  ((DURATION_SET)) || duration=$COMMANDS_DURATION
+  SMOKE_LINES=()
+  say "run 1 of 2 (cmds): A --battle-script $SCRIPT_A, B --battle-script $SCRIPT_B (${duration}s)"
+  start_script_bots cmds "$duration" "$SCRIPT_A" "$SCRIPT_B"
+  check_commands_phase cmds Victory
+  say "run 2 of 2 (escape): A and B --battle-script $ESCAPE_SCRIPT (${duration}s)"
+  start_script_bots escape "$duration" "$ESCAPE_SCRIPT" "$ESCAPE_SCRIPT"
+  check_commands_phase escape Escaped
+
+  # What the bots counted, summed over both bots and both runs: every command the server applied for them.
+  local pair kind needle value line got started_1 started_2 ended_1 ended_2 escape_battle
+  for kind in magic item defend limit escape; do
+    ((CMD_TOTAL[$kind] >= 1)) || problem "the server applied no $kind command for either bot in either run (the bots' breakdowns add up to ${CMD_TOTAL[$kind]})"
+  done
+
+  # The server's side: two battles of the whole party, both started with the full gauge --debug-limit-full gives.
+  log_has "$WORK/server.log" "DEBUG: --debug-limit-full is on" || problem "the server did not warn about --debug-limit-full when it started"
+  (($(count_lines_with "$WORK/server.log" "battle started") == 2)) || problem "the server started $(count_lines_with "$WORK/server.log" "battle started") battle(s), expected 2 (one per run)"
+  started_1=$(nth_line_with "$WORK/server.log" "battle started" 1 || true)
+  started_2=$(nth_line_with "$WORK/server.log" "battle started" 2 || true)
+  ended_1=$(nth_line_with "$WORK/server.log" "battle ended" 1 || true)
+  ended_2=$(nth_line_with "$WORK/server.log" "battle ended" 2 || true)
+  escape_battle=
+  if [[ -z $started_1 || -z $started_2 ]]; then
+    problem "the server did not log both battle starts"
+  else
+    for line in "$started_1" "$started_2"; do
+      [[ $line == *"members=2"* ]] || problem "a battle did not have both members: $line"
+      got=$(limits_of "$line")
+      [[ $got == "255 255" ]] || problem "a battle was started with limit gauges [$got], expected [255 255] (the --debug-limit-full gauge): $line"
+    done
+    escape_battle=$(field "$(strip_ansi "$started_2")" battle)
+    value=$(field "$(strip_ansi "$started_2")" run_difficulty)
+    [[ $value =~ ^[0-9]+$ ]] || problem "the escape battle's start says run_difficulty='$value' (a number is expected: this fight can be run from): $started_2"
+  fi
+  [[ $ended_1 == *"outcome=Victory"* ]] || problem "the server's first battle did not end in Victory: $ended_1"
+  [[ $ended_2 == *"outcome=Escaped"* ]] || problem "the server's second battle did not end in Escaped: $ended_2"
+
+  # The server's own key=value record of every command it applied must agree with what the bots counted (one line
+  # per command, both bots together; a plain attack is not logged).
+  for pair in "magic|magic used battle=" "item|item used battle=" "defend|defend used battle=" "limit|limit used battle=" "escape|escape tried battle="; do
+    kind=${pair%%|*}
+    needle=${pair#*|}
+    value=$(count_lines_with "$WORK/server.log" "$needle")
+    ((value >= 1)) || problem "the server logged no '$needle' line"
+    ((value == CMD_TOTAL[$kind])) || problem "the server logged $value '$needle' line(s), but the bots counted ${CMD_TOTAL[$kind]} $kind command(s) applied"
+  done
+  log_has "$WORK/server.log" "magic used battle=" && { log_has "$WORK/server.log" " spell=0 " || problem "the server's 'magic used' lines name no spell=0 (Cure)"; }
+  log_has "$WORK/server.log" "item used battle=" && { log_has "$WORK/server.log" " item=0 left=" || problem "the server's 'item used' lines name no item=0 (Potion)"; }
+  while IFS= read -r line || [[ -n $line ]]; do
+    if [[ $line == *"item used battle="* ]]; then
+      value=$(field "$(strip_ansi "$line")" left)
+      [[ $value =~ ^[0-9]+$ ]] || problem "an 'item used' line has no numeric left=: $line"
+    elif [[ $line == *"limit used battle="* ]]; then
+      value=$(field "$(strip_ansi "$line")" attack)
+      [[ $value =~ ^[0-9]+$ ]] && ((value >= 128)) || problem "a 'limit used' line has no limit id (128 and up) in attack=: $line"
+    fi
+  done <"$WORK/server.log"
+  # Exactly one escape got away (it ended the battle for everyone), and nothing else did.
+  value=$(count_lines_with "$WORK/server.log" "result=escaped")
+  [[ $value == 1 ]] || problem "the server logged $value successful escape(s), expected exactly 1"
+  # An escape pays nothing: no reward line for the escape battle, and the won one paid both members.
+  if [[ -n $escape_battle ]]; then
+    value=$(count_lines_with "$WORK/server.log" "battle reward battle=$escape_battle ")
+    [[ $value == 0 ]] || problem "the server paid $value reward(s) for the battle that was escaped from (battle=$escape_battle)"
+    # The debug gauge is never stored: a full gauge nobody spent is not written, and the escape battle spent none.
+    while IFS= read -r line || [[ -n $line ]]; do
+      if [[ $line == *"limit kept battle="* ]]; then
+        line=$(strip_ansi "$line")
+        value=$(field "$line" limit)
+        [[ $value != 255 ]] || problem "the server kept the debug gauge of 255: $line"
+        if [[ $line == *"limit kept battle=$escape_battle "* && $value != 0 ]]; then
+          problem "the server kept a gauge of $value after the escape battle, in which nobody spent one (only a knocked-out member may keep 0): $line"
+        fi
+      fi
+    done <"$WORK/server.log"
+  fi
+
+  stop_server
+  # Stopping the server saved everything queued: the two payments of the won battle, every gauge and item use that was queued.
+  value=$(count_lines_with "$WORK/server.log" "progress saved account=")
+  [[ $value == 2 ]] || problem "the server logged $value 'progress saved' line(s), expected 2 (two members, one won battle)"
+  got=$(count_limits_queued "$WORK/server.log")
+  value=$(count_lines_with "$WORK/server.log" "limit saved account=")
+  [[ $value == "$got" ]] || problem "the server queued $got limit gauge(s) for the saver but logged $value 'limit saved' line(s)"
+  got=$(count_queued "$WORK/server.log" "item used battle=")
+  value=$(count_lines_with "$WORK/server.log" "item use saved account=")
+  [[ $value == "$got" ]] || problem "the server queued $got item use(s) for the saver but logged $value 'item use saved' line(s)"
+  if log_has "$WORK/server.log" "NOT SAVED" || log_has "$WORK/server.log" "NOT QUEUED"; then
+    problem "the server lost a write: $(last_line_with "$WORK/server.log" "NOT SAVED" || last_line_with "$WORK/server.log" "NOT QUEUED")"
+  fi
+  after=$(ls -A -- "$state_real" | sort | tr '\n' ' ')
+  [[ $before == "$after" ]] || problem "the library state directory changed: before [$before], after [$after]"
+
+  if ((${#PROBLEMS[@]})); then
+    finish_failed
+  fi
+  local n run
+  for line in "${SMOKE_LINES[@]}"; do
+    say "$line"
+  done
+  for run in cmds escape; do
+    for n in "${CLIENT_NAMES[@]}"; do
+      say "$run client $n: $(last_line_with "$WORK/client-$n.$run.log" "headless: battles:" || true)"
+      say "$run client $n: $(last_line_with "$WORK/client-$n.$run.log" "headless: battle script:" || true)"
+    done
+  done
+  for line in "${PROGRESS_SUMMARY[@]}"; do
+    say "$line"
+  done
+  say "server: $started_1"
+  say "server: $ended_1"
+  say "server: $started_2"
+  say "server: $ended_2"
+  for needle in "magic used battle=" "defend used battle=" "item used battle=" "limit used battle=" "escape tried battle="; do
+    say "server: $(count_lines_with "$WORK/server.log" "$needle") line(s) '$needle', e.g. $(last_line_with "$WORK/server.log" "$needle" || true)"
+  done
+  say "commands applied by the server for the bots, both runs: ${CMD_TOTAL[attack]} attack, ${CMD_TOTAL[magic]} magic, ${CMD_TOTAL[item]} item, ${CMD_TOTAL[defend]} defend, ${CMD_TOTAL[limit]} limit, ${CMD_TOTAL[escape]} escape"
+  RESULT=pass
+  say "PASS: every battle command was applied by the real server for the real-data bots (${CMD_TOTAL[magic]} magic, ${CMD_TOTAL[item]} item, ${CMD_TOTAL[defend]} defend, ${CMD_TOTAL[limit]} limit, ${CMD_TOTAL[escape]} escape; the server's own log lines match), the first battle was won and the second escaped from, and every battle was replayed by each bot from its own battle data with 0 divergences; $state_real unchanged ($after)"
+}
+
 run_fixture() {
   mkdir -p -- "$WORK/state-env" "$WORK/client-A"
   export FMV_STATE_DIR="$WORK/state-env"
@@ -1083,6 +1421,7 @@ main() {
       --fixture) MODE=fixture ;;
       --random) MODE=random ;;
       --progress) MODE=progress ;;
+      --commands) MODE=commands ;;
       --release) PROFILE=release ;;
       --debug) PROFILE=debug ;;
       --bin-dir)
@@ -1145,6 +1484,11 @@ main() {
   if [[ $DO_BUILD == 1 && -n $BIN_DIR ]]; then
     usage_error "--build cannot be combined with --bin-dir"
   fi
+  # The scripts of --commands go to `fmv-client --battle-script` as they are: words, ids, ':' and ','.
+  local script
+  for script in "$SCRIPT_A" "$SCRIPT_B" "$ESCAPE_SCRIPT"; do
+    [[ $script =~ ^[A-Za-z0-9:,]+$ ]] || usage_error "a smoke script is made of command words, ids, ':' and ',' (see fmv-client --help), got '$script'"
+  done
 
   locate_binaries
 
@@ -1163,6 +1507,7 @@ main() {
     fixture) run_fixture ;;
     random) run_random ;;
     progress) run_progress ;;
+    commands) run_commands ;;
     *) run_real ;;
   esac
 }
