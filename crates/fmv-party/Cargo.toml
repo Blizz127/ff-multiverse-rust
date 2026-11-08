@@ -1,0 +1,16 @@
+[package]
+name = "fmv-party"
+description = "Game-agnostic party management and story-phase instance selection for FF Multiverse (pure, deterministic, no networking or clocks)."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+fmv-core.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# Tests only (serde round-trips); not a runtime dependency of the crate.
+serde_json.workspace = true
