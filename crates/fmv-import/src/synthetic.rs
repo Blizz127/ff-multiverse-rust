@@ -7,6 +7,8 @@
 #![allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use crate::iso9660::{IsoError, SectorSource, Volume, SECTOR_SIZE};
 
@@ -318,4 +320,120 @@ pub fn lba_of(iso: &[u8], path: &str) -> Option<u32> {
     let mut vol = Volume::open(MemImage(iso.to_vec())).ok()?;
     let walk = vol.walk().ok()?;
     walk.files.iter().find(|f| f.path == path).map(|f| f.lba)
+}
+
+// ---------------------------------------------------------------------------------------------
+// fake PC installs: directory trees of placeholder files
+// ---------------------------------------------------------------------------------------------
+
+/// Folder Steam installs the Steam Edition into (`<library>/steamapps/common/<this>`).
+pub const STEAM_EDITION_DIR: &str = "FINAL FANTASY VII Steam Edition";
+/// Build id of the fake Steam Edition appmanifest: the build of the owner's install, which the
+/// pinned revision label `build 21140793` stands for.
+pub const STEAM_EDITION_BUILD: &str = "21140793";
+/// Languages of the fake Steam Edition (`data/lang-<xx>`), sorted.
+pub const STEAM_EDITION_LANGS: [&str; 5] = ["de", "en", "es", "fr", "ja"];
+
+/// Files below `ff7/workingdir/data` of a fake Steam Edition (besides the per-language ones).
+/// The field archives are the observed ones: `flevel.lgp` plus the `fflevel`/`gflevel`/
+/// `sflevel`/`jfleve` variants.
+const STEAM_EDITION_DATA: &[&str] = &[
+    "field/flevel.lgp",
+    "field/fflevel.lgp",
+    "field/gflevel.lgp",
+    "field/sflevel.lgp",
+    "field/jfleve.lgp",
+    "field/char.lgp",
+    "battle/battle.lgp",
+    "battle/magic.lgp",
+    "cd/placeholder.txt",
+    "menu/placeholder.txt",
+    "midi/placeholder.txt",
+    "minigame/placeholder.txt",
+];
+
+/// Placeholder content of the fake file `name`: never empty, different for every name, never
+/// game data.
+pub fn placeholder(name: &str) -> Vec<u8> {
+    format!("SYNTHETIC placeholder for {name}: not game data").into_bytes()
+}
+
+/// Write `bytes` to `root/rel`, creating the directories.
+pub fn write_file(root: &Path, rel: &str, bytes: &[u8]) {
+    let p = root.join(rel);
+    fs::create_dir_all(p.parent().unwrap()).unwrap();
+    fs::write(p, bytes).unwrap();
+}
+
+/// Text of a Steam `appmanifest_<appid>.acf` as Steam writes it (tabs, nested blocks).
+pub fn steam_appmanifest(appid: &str, installdir: &str, buildid: &str) -> String {
+    format!(
+        "\"AppState\"\n{{\n\t\"appid\"\t\t\"{appid}\"\n\t\"Universe\"\t\t\"1\"\n\
+         \t\"name\"\t\t\"synthetic test app\"\n\t\"StateFlags\"\t\t\"4\"\n\
+         \t\"installdir\"\t\t\"{installdir}\"\n\t\"buildid\"\t\t\"{buildid}\"\n\
+         \t\"InstalledDepots\"\n\t{{\n\t\t\"1\"\n\t\t{{\n\t\t\t\"manifest\"\t\t\"1\"\n\t\t}}\n\t}}\n\
+         \t\"UserConfig\"\n\t{{\n\t\t\"language\"\t\t\"english\"\n\t}}\n}}\n"
+    )
+}
+
+/// A fake FINAL FANTASY VII Steam Edition install at `install`: the observed layout, with
+/// placeholder files (see [`placeholder`]; a file's placeholder is made from its path below
+/// `install`).
+pub fn steam_edition_install(install: &Path) {
+    let mut files: Vec<String> = [
+        "FFVII.exe",
+        "FFVII_LAUNCHER.exe",
+        "SharpDX.dll",
+        "NAudio.dll",
+        "steam_api64.dll",
+        "Steamworks.NET.dll",
+        "xaudio2_9redist.dll",
+        "Assets/placeholder.txt",
+        "be_loc/placeholder.txt",
+        "ff7/font/placeholder.txt",
+        "ff7/resources/ff7_1.02/ff7_en/placeholder.txt",
+        "ff7/resources/ff7_1.02/ff7_ja/placeholder.txt",
+        "ff7/Shaders/placeholder.txt",
+        "ff7/workingdir/ff7input.cfg",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    for lang in STEAM_EDITION_LANGS {
+        files.push(format!("{lang}/placeholder.txt"));
+        for rest in [
+            "battle/scene.bin",
+            "kernel/kernel.bin",
+            "kernel/kernel2.bin",
+        ] {
+            files.push(format!("ff7/workingdir/data/lang-{lang}/{rest}"));
+        }
+    }
+    files.extend(
+        STEAM_EDITION_DATA
+            .iter()
+            .map(|d| format!("ff7/workingdir/data/{d}")),
+    );
+    for rel in files {
+        write_file(install, &rel, &placeholder(&rel));
+    }
+}
+
+/// A fake Steam library under `library`: the Steam Edition install in
+/// `steamapps/common/FINAL FANTASY VII Steam Edition` and, when `manifest` is true, Steam's
+/// `steamapps/appmanifest_3837340.acf` for it. Returns the install root.
+pub fn steam_edition_library(library: &Path, manifest: bool) -> PathBuf {
+    let install = library
+        .join("steamapps")
+        .join("common")
+        .join(STEAM_EDITION_DIR);
+    steam_edition_install(&install);
+    if manifest {
+        write_file(
+            &library.join("steamapps"),
+            "appmanifest_3837340.acf",
+            steam_appmanifest("3837340", STEAM_EDITION_DIR, STEAM_EDITION_BUILD).as_bytes(),
+        );
+    }
+    install
 }

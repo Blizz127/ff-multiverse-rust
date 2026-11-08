@@ -16,8 +16,9 @@ use super::*;
 use crate::scan::{scan_pc, LanguageError};
 use crate::session::{load_session, lock_session, SessionError};
 use crate::synthetic::{
-    build_iso, build_iso_labeled, cue_for, lba_of, mark_form2, system_cnf, wrap_raw, RawMode,
-    DISC_LABEL, TEST_PAYLOAD_A, TEST_PAYLOAD_B,
+    build_iso, build_iso_labeled, cue_for, lba_of, mark_form2, placeholder, steam_appmanifest,
+    steam_edition_library, system_cnf, wrap_raw, write_file, RawMode, DISC_LABEL, TEST_PAYLOAD_A,
+    TEST_PAYLOAD_B,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -623,6 +624,421 @@ fn scan_does_not_touch_the_state_dir() {
         Err(CommandError::NoSuchSession(_))
     ));
     assert!(!state.exists());
+}
+
+// ---------------------------------------------------------------------------------------------
+// import-pc of the Steam Edition (appid 3837340): auto-detected labels keep the owner's set
+// ---------------------------------------------------------------------------------------------
+
+/// The id of the library set the owner's Steam Edition copy lives in. It was imported with
+/// `--edition "Steam Edition (appid 3837340)" --language en --revision "build 21140793"`. A set
+/// id is a directory name inside persisted libraries, and the edition/region/revision behind it
+/// are bound into the area fingerprint that decides which players share an instance: neither may
+/// ever drift.
+const OWNERS_SET_ID: &str = "ff7-pc-steam-edition-appid-3837-unknown-build-21140793-63e94f91";
+
+/// The six library paths of that set.
+const OWNERS_SIX: [&str; 6] = [
+    "data/battle/battle.lgp",
+    "data/field/char.lgp",
+    "data/field/flevel.lgp",
+    "data/lang-en/battle/scene.bin",
+    "data/lang-en/kernel/kernel.bin",
+    "data/lang-en/kernel/kernel2.bin",
+];
+
+/// The arguments the owner's import used: every label spelled out.
+fn owners_args(dir: &Path, state: &Path) -> ImportPcArgs {
+    let mut a = pc_args(dir, state);
+    a.edition = Some("Steam Edition (appid 3837340)".into());
+    a.language = Some("en".into());
+    a.revision = Some("build 21140793".into());
+    a
+}
+
+fn paths_and_hashes(r: &ImportPcResult) -> Vec<(String, String)> {
+    r.files
+        .iter()
+        .map(|f| (f.logical_path.clone(), f.blake3.clone()))
+        .collect()
+}
+
+/// The tightest constraint of the whole feature, pinned on its own: these exact label strings
+/// (and language `en`, not modded) are what the owner's set id was made from.
+#[test]
+fn the_owners_labels_are_pinned_to_the_owners_set_id() {
+    let provenance = |edition: &str, region: &str, language: &str, revision: &str, modded: bool| {
+        EditionProvenance {
+            game: GameId::Ff7,
+            platform: Platform::Pc,
+            edition: edition.into(),
+            region: region.into(),
+            language: language.into(),
+            revision: revision.into(),
+            sources: vec![],
+            modded,
+        }
+    };
+    let owners = provenance(
+        "Steam Edition (appid 3837340)",
+        "unknown",
+        "en",
+        "build 21140793",
+        false,
+    );
+    assert_eq!(fmv_library::set_id_for(&owners), OWNERS_SET_ID);
+    // the labels the scan produces are those very strings
+    assert_eq!(crate::steam::STEAM_EDITION_LABEL, owners.edition);
+    assert_eq!(crate::steam::build_revision("21140793"), owners.revision);
+    // every label matters: any drift is another set
+    for other in [
+        provenance(
+            "Steam Edition (appid 3837340)",
+            "unknown",
+            "en",
+            "build 21140793",
+            true,
+        ),
+        provenance(
+            "Steam Edition (appid 3837340)",
+            "unknown",
+            "fr",
+            "build 21140793",
+            false,
+        ),
+        provenance(
+            "Steam Edition (appid 3837340)",
+            "unknown",
+            "en",
+            "unknown",
+            false,
+        ),
+        provenance(
+            "Steam Edition (appid 3837340)",
+            "NTSC-U",
+            "en",
+            "build 21140793",
+            false,
+        ),
+        provenance("Steam Edition", "unknown", "en", "build 21140793", false),
+        provenance("Steam 2013", "unknown", "en", "build 21140793", false),
+    ] {
+        assert_ne!(fmv_library::set_id_for(&other), OWNERS_SET_ID, "{other:?}");
+    }
+}
+
+/// Fake tree + fake appmanifest in, the owner's set id and the owner's six files out, whichever
+/// way the install is named and whether or not the labels are spelled out.
+#[test]
+fn the_steam_editions_auto_labels_reach_the_set_the_explicit_labels_made() {
+    let tmp = tempfile::tempdir().unwrap();
+    let install = steam_edition_library(tmp.path(), true);
+    let workingdir = install.join("ff7/workingdir");
+    let state = tmp.path().join("state");
+    let library_before = snapshot(&tmp.path().join("steamapps"));
+
+    // the owner's import: the labels spelled out, from the folder that holds data/
+    let explicit = import_pc(&owners_args(&workingdir, &state), 1).unwrap();
+    assert_eq!(explicit.set_id, OWNERS_SET_ID);
+    let paths: Vec<&str> = explicit
+        .files
+        .iter()
+        .map(|f| f.logical_path.as_str())
+        .collect();
+    assert_eq!(paths, OWNERS_SIX);
+
+    // nothing spelled out, from the install root: the same set, and nothing to add to it
+    let auto = import_pc(&pc_args(&install, &state), 2).unwrap();
+    assert_eq!(auto.set_id, OWNERS_SET_ID);
+    assert_eq!(
+        auto.provenance, explicit.provenance,
+        "every label is the same"
+    );
+    assert_eq!(auto.provenance.edition, "Steam Edition (appid 3837340)");
+    assert_eq!(auto.provenance.region, "unknown");
+    assert_eq!(auto.provenance.language, "en");
+    assert_eq!(auto.provenance.revision, "build 21140793");
+    assert!(!auto.provenance.modded);
+    assert!(
+        explicit.provenance.compatible_with(&auto.provenance),
+        "players of the two imports share an instance"
+    );
+    assert_eq!(
+        paths_and_hashes(&auto),
+        paths_and_hashes(&explicit),
+        "the same files, byte for byte (the content fingerprints)"
+    );
+    assert_eq!(auto.totals.entries_added, 0);
+    assert_eq!(auto.totals.entries_unchanged, 6);
+    assert_eq!(auto.totals.blobs_created, 0);
+    assert_eq!(
+        Library::open_existing(&state).unwrap().list_sets().unwrap(),
+        vec![OWNERS_SET_ID.to_string()],
+        "one set, not two"
+    );
+    assert_eq!(
+        manifest_of(&state, OWNERS_SET_ID).entries.len(),
+        6,
+        "and no seventh entry"
+    );
+
+    // alone in a fresh library, every way of naming the install reaches that very id
+    for (i, given) in [install.clone(), install.join("ff7"), workingdir.clone()]
+        .into_iter()
+        .enumerate()
+    {
+        let fresh = tmp.path().join(format!("fresh-{i}"));
+        let r = import_pc(&pc_args(&given, &fresh), 3).unwrap();
+        assert_eq!(r.set_id, OWNERS_SET_ID, "{given:?}");
+        assert_eq!(
+            paths_and_hashes(&r),
+            paths_and_hashes(&explicit),
+            "{given:?}"
+        );
+        assert!(r.source_files_unchanged);
+    }
+    // Steam's library, appmanifest included, was only read
+    assert_eq!(snapshot(&tmp.path().join("steamapps")), library_before);
+}
+
+#[test]
+fn the_steam_edition_result_says_how_it_was_labelled_and_names_no_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let install = steam_edition_library(tmp.path(), true);
+    let state = tmp.path().join("state");
+    let r = import_pc(&pc_args(&install, &state), 7).unwrap();
+
+    // path-free output: neither the install nor the Steam library it sits in is named anywhere
+    // (the state directory is: it is the user's own choice and the place the library lives)
+    let printed = serde_json::to_string(&r).unwrap();
+    for local in [
+        install.display().to_string(),
+        tmp.path().join("steamapps").display().to_string(),
+    ] {
+        assert!(!printed.contains(&local), "{local} in {printed}");
+    }
+    assert_eq!(r.source, SourceSummary::Install { path: None });
+
+    assert_eq!(r.language, "en");
+    assert_eq!(r.languages_left_out, ["de", "es", "fr", "ja"]);
+    assert_eq!(r.edition_guess.confidence, "high");
+    assert!(!r.edition_guess.verified && !r.identification.verified);
+    assert_eq!(r.identification.method, "pc-steam-appmanifest");
+    let caveats = r.identification.caveats.join(" | ");
+    for expected in [
+        "appmanifest_3837340.acf",
+        "not compared with hashes",
+        "language defaulted to en",
+        "revision was read from Steam's appmanifest (build 21140793)",
+        "assumption",
+        "assigned to language en from file names alone",
+        "[verify]",
+    ] {
+        assert!(
+            caveats.contains(expected),
+            "{expected} missing from {caveats}"
+        );
+    }
+    assert!(!caveats.contains("given by the user"), "{caveats}");
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.starts_with("language defaulted to")),
+        "{:?}",
+        r.warnings
+    );
+    assert!(r
+        .warnings
+        .iter()
+        .any(|w| w.contains("NOT imported") && w.contains("de, es, fr, ja")));
+
+    // the manifest records exactly that, and an unchanged re-import does not rewrite it
+    assert_eq!(
+        manifest_of(&state, &r.set_id).identification.as_ref(),
+        Some(&r.identification)
+    );
+    let manifest_path = state
+        .join("library")
+        .join("sets")
+        .join(&r.set_id)
+        .join("manifest.json");
+    let before = fs::read(&manifest_path).unwrap();
+    import_pc(&pc_args(&install, &state), 8).unwrap();
+    assert_eq!(
+        fs::read(&manifest_path).unwrap(),
+        before,
+        "same inputs, same manifest"
+    );
+
+    // labels given on the command line are recorded as the user's, and the scan's are not
+    let mut given = owners_args(&install, &tmp.path().join("state2"));
+    given.region = Some("NTSC-U".into());
+    let g = import_pc(&given, 1).unwrap();
+    let caveats = g.identification.caveats.join(" | ");
+    for expected in ["--edition", "--region", "--language", "--revision"] {
+        assert!(
+            caveats.contains(expected),
+            "{expected} missing from {caveats}"
+        );
+    }
+    assert!(!caveats.contains("language defaulted"), "{caveats}");
+    assert_eq!(
+        g.identification.method, "pc-file-presence",
+        "nothing was taken from Steam's record"
+    );
+}
+
+/// A non-English set takes that language's own field archive. The library readers look for a
+/// language's `flevel.lgp` in `data/lang-<xx>/field/`, so the variant is stored under that name.
+#[test]
+fn a_non_english_steam_edition_import_stores_its_field_archive_where_readers_look() {
+    let tmp = tempfile::tempdir().unwrap();
+    let install = steam_edition_library(tmp.path(), true);
+    let state = tmp.path().join("state");
+    let en = import_pc(&pc_args(&install, &state), 1).unwrap();
+    let mut a = pc_args(&install, &state);
+    a.language = Some("FR".into());
+    let fr = import_pc(&a, 2).unwrap();
+
+    assert_ne!(fr.set_id, en.set_id);
+    assert_eq!(fr.provenance.language, "fr");
+    assert_eq!(fr.provenance.edition, "Steam Edition (appid 3837340)");
+    assert_eq!(fr.provenance.revision, "build 21140793");
+    assert!(
+        en.provenance.compatible_with(&fr.provenance),
+        "same edition and build, another language"
+    );
+    assert_eq!(fr.languages_left_out, ["de", "en", "es", "ja"]);
+    let names: Vec<String> = manifest_of(&state, &fr.set_id)
+        .entries
+        .into_iter()
+        .map(|e| e.logical_path)
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "data/battle/battle.lgp",
+            "data/field/char.lgp",
+            "data/lang-fr/battle/scene.bin",
+            "data/lang-fr/field/flevel.lgp",
+            "data/lang-fr/kernel/kernel.bin",
+            "data/lang-fr/kernel/kernel2.bin",
+        ],
+        "never the English archive"
+    );
+    // the French archive is the French file
+    let lib = Library::open_existing(&state).unwrap();
+    let mut got = Vec::new();
+    lib.open_reader(&fr.set_id, "data/lang-fr/field/flevel.lgp")
+        .unwrap()
+        .read_to_end(&mut got)
+        .unwrap();
+    assert_eq!(got, placeholder("ff7/workingdir/data/field/fflevel.lgp"));
+    // and the resolver the server and the client share finds each set's own archive
+    for (set, file) in [(&fr, "fflevel.lgp"), (&en, "flevel.lgp")] {
+        let source = fmv_library::ff7::Ff7Source::Library {
+            state_dir: Some(state.clone()),
+            set: Some(set.set_id.clone()),
+        };
+        let resolved = fmv_library::ff7::resolve_flevel(&source).unwrap();
+        assert_eq!(
+            fs::read(&resolved.path).unwrap(),
+            placeholder(&format!("ff7/workingdir/data/field/{file}")),
+            "{file}"
+        );
+    }
+    // the manifest says the mapping is an inference from the names
+    let caveats = fr.identification.caveats.join(" | ");
+    for expected in [
+        "fflevel.lgp",
+        "language fr",
+        "data/lang-fr/field/flevel.lgp",
+        "[verify]",
+        "chosen by the user (--language)",
+    ] {
+        assert!(
+            caveats.contains(expected),
+            "{expected} missing from {caveats}"
+        );
+    }
+    assert!(!caveats.contains("language defaulted"), "{caveats}");
+
+    // a language without a field archive of its own is refused, not given the English one
+    fs::remove_file(install.join("ff7/workingdir/data/field/sflevel.lgp")).unwrap();
+    let mut es = pc_args(&install, &tmp.path().join("state-es"));
+    es.language = Some("es".into());
+    assert!(matches!(
+        import_pc(&es, 3).unwrap_err(),
+        CommandError::NoFlevelForLanguage { .. }
+    ));
+    assert!(!tmp.path().join("state-es").exists());
+}
+
+#[test]
+fn the_state_directory_may_not_live_in_the_steam_install_whichever_folder_was_given() {
+    let tmp = tempfile::tempdir().unwrap();
+    let install = steam_edition_library(tmp.path(), true);
+    for (given, state) in [
+        (install.clone(), install.join("state")),
+        // above the folder that was given, but inside the install Steam manages
+        (install.join("ff7/workingdir"), install.join("state")),
+        (
+            install.join("ff7/workingdir"),
+            install.join("ff7/resources/state"),
+        ),
+        (install.join("ff7"), install.join("be_loc/state")),
+    ] {
+        let err = import_pc(&pc_args(&given, &state), 1).unwrap_err();
+        assert!(
+            matches!(err, CommandError::StateInsideSource { .. }),
+            "{given:?} / {state:?}: {err}"
+        );
+        assert!(!state.exists(), "{state:?}");
+    }
+    // beside the install, in the same Steam library, is fine
+    import_pc(
+        &pc_args(&install.join("ff7/workingdir"), &tmp.path().join("state")),
+        1,
+    )
+    .unwrap();
+}
+
+/// The Steam 2013 build id is evidence, not a label: 2013 sets keep the ids they always had.
+#[test]
+fn an_appmanifest_does_not_move_a_steam_2013_set_to_another_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let apps = tmp.path().join("steamapps");
+    let install = apps.join("common").join("FINAL FANTASY VII");
+    for f in [
+        "ff7_en.exe",
+        "data/lang-en/field/flevel.lgp",
+        "data/lang-en/field/char.lgp",
+    ] {
+        touch(&install, f, f.as_bytes());
+    }
+    let plain = import_pc(&pc_args(&install, &tmp.path().join("s1")), 1).unwrap();
+    write_file(
+        &apps,
+        "appmanifest_39140.acf",
+        steam_appmanifest("39140", "FINAL FANTASY VII", "5012345").as_bytes(),
+    );
+    let with = import_pc(&pc_args(&install, &tmp.path().join("s2")), 1).unwrap();
+    assert_eq!(plain.set_id, with.set_id);
+    assert_eq!(with.provenance.edition, "Steam 2013");
+    assert_eq!(with.provenance.revision, "unknown");
+    assert_eq!(plain.edition_guess.confidence, "medium");
+    assert_eq!(with.edition_guess.confidence, "high");
+    assert_eq!(plain.identification.method, "pc-file-presence");
+    assert_eq!(with.identification.method, "pc-steam-appmanifest");
+    assert!(with.identification.caveats[0].contains("appmanifest_39140.acf"));
+    // the folder name is part of the evidence: the same manifest says nothing about another folder
+    let moved = apps.join("common").join("FINAL FANTASY VII copy");
+    for f in ["ff7_en.exe", "data/lang-en/field/flevel.lgp"] {
+        touch(&moved, f, f.as_bytes());
+    }
+    let r = import_pc(&pc_args(&moved, &tmp.path().join("s3")), 1).unwrap();
+    assert_eq!(r.edition_guess.confidence, "medium");
+    assert!(r.edition_guess.steam.is_none());
 }
 
 // ---------------------------------------------------------------------------------------------
