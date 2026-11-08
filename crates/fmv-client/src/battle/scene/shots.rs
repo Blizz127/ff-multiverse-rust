@@ -13,6 +13,11 @@
 //!   runs. It writes PNGs to `$FMV_SHOT_DIR` (`~/.cache/claude-tmp/fmv-client-shots` without it).
 //!   It needs `FMV_FF7_DATA` (the game's `data/` directory) or `FMV_FF7_LIBRARY` (the state directory
 //!   of the imported library); `FMV_BATTLE_FORMATION` picks another formation (default 301).
+//!
+//! The pictures of the presentation (the real clips, the numbers at the impact, the effects, the
+//! fade, the victory pose) and the evidence for which slot is which are in [`super::sheets`]; its
+//! fights use the helpers here ([`Real`], [`Server`], [`contact_sheet`]). **GPU tests must run one at a
+//! time** (`--test-threads=1`): several lavapipe devices in one process crash it.
 
 // `chunks_exact(4)` over RGBA bytes would be `as_chunks` on Rust 1.88+; the workspace keeps its MSRV
 // lower (see `avatar`), so the lint is allowed here as it is there.
@@ -33,12 +38,12 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-const W: u32 = 1100;
-const H: u32 = 680;
-const ME: AccountId = AccountId(1);
+pub(super) const W: u32 = 1100;
+pub(super) const H: u32 = 680;
+pub(super) const ME: AccountId = AccountId(1);
 
 /// A frame as the window draws it: the scene, then the battle overlay over the fighters' heads.
-fn draw(gpu: &mut Offscreen, scene: &BattleScene, battle: &BattleView, w: u32, h: u32) -> Vec<u8> {
+pub(super) fn draw(gpu: &mut Offscreen, scene: &BattleScene, battle: &BattleView, w: u32, h: u32) -> Vec<u8> {
     let view = scene.view(w, h);
     let mut overlay = DrawList::new();
     draw_battle_overlay(battle, &scene.head_anchors(&view), w, h, &mut overlay);
@@ -79,7 +84,7 @@ fn drawn_at(shot: &[u8], bare: &[u8], w: u32, a: &ActorScreen) -> bool {
 }
 
 /// `frames` (each `w` x `h`) halved and laid out `columns` to a row: one picture of a sequence.
-fn contact_sheet(frames: &[Vec<u8>], w: u32, h: u32, columns: usize) -> (u32, u32, Vec<u8>) {
+pub(super) fn contact_sheet(frames: &[Vec<u8>], w: u32, h: u32, columns: usize) -> (u32, u32, Vec<u8>) {
     let (cw, ch) = (w / 2, h / 2);
     let rows = frames.len().div_ceil(columns);
     let (sw, sh) = (cw * columns as u32, ch * rows as u32);
@@ -106,7 +111,7 @@ fn contact_sheet(frames: &[Vec<u8>], w: u32, h: u32, columns: usize) -> (u32, u3
 }
 
 /// Hand the client a message (if any) and the scene what it did, as the window does each frame.
-fn feed(client: &mut BattleClient, scene: &mut BattleScene, msg: Option<ServerMsg>, now: f64) {
+pub(super) fn feed(client: &mut BattleClient, scene: &mut BattleScene, msg: Option<ServerMsg>, now: f64) {
     if let Some(msg) = msg {
         client.on_message(now, msg);
     }
@@ -114,13 +119,13 @@ fn feed(client: &mut BattleClient, scene: &mut BattleScene, msg: Option<ServerMs
 }
 
 /// What the rules' server would say: one engine, its messages in the order a server sends them.
-struct Server {
-    id: BattleId,
-    state: BattleState,
+pub(super) struct Server {
+    pub(super) id: BattleId,
+    pub(super) state: BattleState,
 }
 
 impl Server {
-    fn start(&self, setup: &BattleSetup, fingerprint: fmv_core::Fingerprint) -> ServerMsg {
+    pub(super) fn start(&self, setup: &BattleSetup, fingerprint: fmv_core::Fingerprint) -> ServerMsg {
         ServerMsg::EncounterStart {
             battle_id: self.id,
             formation_id: setup.formation_id,
@@ -134,21 +139,30 @@ impl Server {
         }
     }
 
-    fn step(&mut self, ticks: u64) -> Option<ServerMsg> {
+    pub(super) fn step(&mut self, ticks: u64) -> Option<ServerMsg> {
         let events = self.state.step_ticks(ticks);
         (!events.is_empty()).then(|| ServerMsg::BattleEvent { battle_id: self.id, tick: self.state.tick(), events, command: None })
     }
 
     /// `actor` attacks the first living enemy.
-    fn attack(&mut self, actor: ActorId) -> Option<ServerMsg> {
-        let target = self.state.enemy_ids().into_iter().find(|e| self.state.actor(*e).is_some_and(Combatant::is_alive))?;
-        let command = Command::Attack { target };
+    pub(super) fn attack(&mut self, actor: ActorId) -> Option<ServerMsg> {
+        let target = self.first_enemy()?;
+        self.command(actor, Command::Attack { target })
+    }
+
+    /// The first enemy that is alive.
+    pub(super) fn first_enemy(&self) -> Option<ActorId> {
+        self.state.enemy_ids().into_iter().find(|e| self.state.actor(*e).is_some_and(Combatant::is_alive))
+    }
+
+    /// `actor`'s command, if the engine takes it, as the server's message.
+    pub(super) fn command(&mut self, actor: ActorId, command: Command) -> Option<ServerMsg> {
         let events = self.state.submit_command(actor, command).ok()?;
         Some(ServerMsg::BattleEvent { battle_id: self.id, tick: self.state.tick(), events, command: Some(AppliedCommand { actor, command }) })
     }
 }
 
-fn member(i: u64, character: u8) -> BattleMember {
+pub(super) fn member(i: u64, character: u8) -> BattleMember {
     BattleMember { entity: EntityId(10 + i), account: if i == 0 { ME } else { AccountId(10 + i) }, character, level: 12, weapon: None, armor: None }
 }
 
@@ -289,17 +303,35 @@ fn offscreen_synthetic_battle_with_a_location_model() {
 // The owner's own game data
 // ---------------------------------------------------------------------------------------------
 
-struct Real {
-    rules: Arc<dyn BattleRules>,
-    char_lgp: PathBuf,
+pub(super) struct Real {
+    pub(super) rules: Arc<dyn BattleRules>,
+    pub(super) char_lgp: PathBuf,
     /// The battle model archive, when this machine has one (the models of the picture are real then).
-    battle_lgp: Option<PathBuf>,
+    pub(super) battle_lgp: Option<PathBuf>,
+    /// `scene.bin`, which names the clips of the enemies' attacks.
+    pub(super) scene_bin: Option<PathBuf>,
+}
+
+impl Real {
+    /// The models of the picture as the window has them: the archive's own battle models, the enemies'
+    /// attacks playing the clips `scene.bin` names; stand-ins without an archive.
+    pub(super) fn kit(&self) -> ModelKit {
+        let source: Box<dyn BattleModelSource> = match &self.battle_lgp {
+            Some(path) => {
+                let archive = ArchiveModels::open(path).expect("battle.lgp opens");
+                let book = self.scene_bin.as_ref().and_then(|p| fmv_ff7_battle::scene::SceneBin::open(p).ok()).map(|s| model::EnemyBook::from_scenes(&s)).unwrap_or_default();
+                Box::new(archive.with_enemy_book(book))
+            }
+            None => Box::new(StandInModels),
+        };
+        ModelKit::new(source, Some(Box::new(LgpLoader::new(&self.char_lgp))))
+    }
 }
 
 /// `FMV_FF7_DATA` (the game's `data/`: `lang-en/battle/scene.bin`, `lang-en/kernel/kernel.bin` or the
 /// classic layout, `field/char.lgp` and `battle/battle.lgp`), else `FMV_FF7_LIBRARY` (the state
 /// directory of the imported library, read-only). `None` (with a note) when neither is set.
-fn open_real() -> Option<Real> {
+pub(super) fn open_real() -> Option<Real> {
     if let Some(data) = std::env::var_os("FMV_FF7_DATA").map(PathBuf::from) {
         let first = |paths: &[&str]| paths.iter().map(|p| data.join(p)).find(|p| p.is_file());
         let scene = first(&["lang-en/battle/scene.bin", "battle/scene.bin"]).expect("scene.bin under FMV_FF7_DATA");
@@ -307,14 +339,15 @@ fn open_real() -> Option<Real> {
         let char_lgp = first(&["field/char.lgp", "field/CHAR.LGP"]).expect("char.lgp under FMV_FF7_DATA");
         let battle_lgp = first(&["battle/battle.lgp", "battle/BATTLE.LGP"]);
         let rules: Arc<dyn BattleRules> = Arc::new(Ff7BattleData::open(&scene, &kernel).expect("the battle data opens"));
-        return Some(Real { rules, char_lgp, battle_lgp });
+        return Some(Real { rules, char_lgp, battle_lgp, scene_bin: Some(scene) });
     }
     if let Some(dir) = std::env::var_os("FMV_FF7_LIBRARY") {
         let source = crate::ff7::Ff7Source::Library { state_dir: Some(dir.into()), set: None };
         let (rules, _) = crate::battle::open_rules(&source).expect("the battle data opens");
         let char_lgp = crate::ff7::resolve_char_lgp(&source).expect("looked for").expect("a char.lgp");
         let battle_lgp = crate::ff7::resolve_battle_lgp(&source).expect("looked for");
-        return Some(Real { rules, char_lgp, battle_lgp });
+        let scene_bin = fmv_library::ff7::resolve_battle_files(&source).ok().map(|files| files.scene);
+        return Some(Real { rules, char_lgp, battle_lgp, scene_bin });
     }
     eprintln!("skipped: neither FMV_FF7_DATA nor FMV_FF7_LIBRARY is set");
     None
@@ -387,13 +420,9 @@ fn offscreen_real_ff7_battle_formation() {
     assert!(client.in_battle());
     let start = client.scene_start().expect("a battle to draw");
     assert_eq!(start.formation.as_ref(), Some(&placement));
-    // The real battle models of the owner's own battle.lgp when it is there (as the window has them),
-    // the stand-ins otherwise.
-    let source: Box<dyn BattleModelSource> = match &real.battle_lgp {
-        Some(path) => Box::new(ArchiveModels::open(path).expect("battle.lgp opens")),
-        None => Box::new(StandInModels),
-    };
-    let mut kit = ModelKit::new(source, Some(Box::new(LgpLoader::new(&real.char_lgp))));
+    // The real battle models of the owner's own battle.lgp when it is there (as the window has them,
+    // with the clips scene.bin names for the enemies' attacks), the stand-ins otherwise.
+    let mut kit = real.kit();
     let looks = [None, None, None];
     let mut scene = BattleScene::new(&start, client.engine(), &looks, &mut kit).expect("a scene");
     if real.battle_lgp.is_some() {

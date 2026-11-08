@@ -124,6 +124,8 @@ pub struct Lunge {
 }
 
 impl Lunge {
+    /// When the run is over (tests).
+    #[cfg(test)]
     pub fn end(&self) -> f64 {
         self.start + self.out + self.hold + self.back
     }
@@ -300,7 +302,7 @@ fn strike_plan(kit: &Kit, reach: f32, strike: Option<Strike>, melee: bool, arriv
                 segments.push(Segment { start: at, len, slot, from: 0.0, rate: (f64::from(m.saturating_sub(1)) / len) as f32, looping: false });
                 len
             }
-            None => f64::from(out_nat) * 1.2,
+            None => out_nat * 1.2,
         };
         let hop = if kit.run.is_some() { 0.0 } else { PROCEDURAL_HOP };
         // It stands at its target from arriving to the end of the follow-through: the swing up to the

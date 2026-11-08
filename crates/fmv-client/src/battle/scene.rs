@@ -71,7 +71,7 @@ pub mod model;
 pub mod motion;
 pub mod plan;
 #[cfg(test)]
-mod probe;
+mod sheets;
 #[cfg(test)]
 mod shots;
 pub mod stage;

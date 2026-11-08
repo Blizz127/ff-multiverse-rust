@@ -106,7 +106,8 @@ pub fn landing(event: &BattleEvent) -> Option<Landing> {
 /// Seconds from a batch's arrival to the moment `event` lands, inside a performance of `action`.
 pub fn delay_of(action: Option<ActionRef>, event: &BattleEvent) -> f64 {
     match landing(event) {
-        Some(Landing::Death { .. }) => impact_delay(action) + DEATH_BEAT,
+        // After its blow, a beat later, and never later than the cap says (whatever the table holds).
+        Some(Landing::Death { .. }) => (impact_delay(action) + DEATH_BEAT).min(MAX_DEATH_DELAY),
         Some(Landing::Impact { .. }) => impact_delay(action),
         None => 0.0,
     }

@@ -225,7 +225,8 @@ pub struct Director {
 }
 
 impl Director {
-    /// For actors with these sides and places, in the engine's order (party first), all procedural.
+    /// For actors with these sides and places, in the engine's order (party first), all procedural (tests).
+    #[cfg(test)]
     pub fn new(sides: Vec<Side>, anchors: Vec<Anchor>) -> Self {
         let n = sides.len().min(anchors.len());
         Self::with_kits(sides, anchors, vec![Kit::none(); n])
@@ -562,6 +563,18 @@ impl Director {
     #[cfg(test)]
     pub fn pending(&self) -> usize {
         self.effects.len()
+    }
+
+    /// The clips scheduled for actor `i`, oldest first (tests).
+    #[cfg(test)]
+    pub fn segments_of(&self, i: usize) -> &[Segment] {
+        self.segments.get(i).map_or(&[], Vec::as_slice)
+    }
+
+    /// When the last blow of any performance lands (tests).
+    #[cfg(test)]
+    pub fn last_impact(&self) -> f64 {
+        self.last_impact
     }
 }
 

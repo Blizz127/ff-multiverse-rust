@@ -218,7 +218,7 @@ pub fn burst_layers(kind: BurstKind, element: Element, age: f32, height: f32) ->
                 Element::Bolt => {
                     for k in 0..3 {
                         let x = (k as f32 - 1.0) * 0.28 * h;
-                        let flicker = if ((age * 14.0) as u32 + k) % 2 == 0 { 1.0 } else { 0.55 };
+                        let flicker = if ((age * 14.0) as u32 + k).is_multiple_of(2) { 1.0 } else { 0.55 };
                         push(Prim::Streak, [x, -0.5 * h, 0.0], 0.95 * h, (k as f32 - 1.0) * 0.12, mixed(col, WHITE, 0.5), fade(age, 0.8) * flicker);
                     }
                 }
@@ -512,7 +512,7 @@ mod tests {
             let part = prim_part(prim);
             assert_eq!(part.blend, PartBlend::Additive, "{prim:?}");
             assert_eq!(part.positions.len(), part.colors.len());
-            assert!(part.indices.len() >= 12 && part.indices.len() % 3 == 0 && part.indices.iter().all(|&i| (i as usize) < part.positions.len()));
+            assert!(part.indices.len() >= 12 && part.indices.len().is_multiple_of(3) && part.indices.iter().all(|&i| (i as usize) < part.positions.len()));
             // Brightest at the middle, nothing at the rim (the colour of an additive part is its light).
             assert!(part.colors.iter().any(|c| c[0] == 255) && part.colors.iter().any(|c| c[0] == 0), "{prim:?}");
             let radius = part.positions.iter().map(|p| p[0].hypot(p[1])).fold(0.0, f32::max);

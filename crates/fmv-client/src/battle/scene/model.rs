@@ -39,6 +39,17 @@
 //! [`Rigs`] turns a model into an [`ActorRig`] (its [`AvatarAsset`] for the GPU, its idle clip, its
 //! size) once and shares it between actors that look alike, so each distinct model is uploaded
 //! once however many stand in the battle, and never per frame.
+//!
+//! # Which clip plays what
+//!
+//! A real battle model comes with its [`ModelRole`] (a playable character's, an enemy's) and the
+//! slots its pack really has ([`BattleModelData::slot_ok`]); an enemy also with the attacks `scene.bin`
+//! names for it ([`EnemyBook`], read from the `scene.bin` that [`remember_scene_bin`] was told of, keyed
+//! by the enemy's id). [`Rigs`] makes a [`Kit`] of them ([`super::clips`] says which slot is which,
+//! verified on contact sheets) that the scene's choreography reads; a stand-in or a box has none and
+//! moves procedurally. A clip is posed IN PLACE ([`ActorRig::clip_pose`]): the root's travel along the
+//! ground is taken out (the weapon's track too, which is in the character's space) and the scene moves
+//! the actor itself.
 
 use super::clips::{ClipSet, Kit, Slot};
 use super::effects::EffectKit;

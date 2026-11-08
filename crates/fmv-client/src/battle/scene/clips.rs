@@ -173,7 +173,8 @@ impl Kit {
         self.attacks.iter().find(|&&(a, _)| a == id).map(|&(_, s)| s)
     }
 
-    /// Does this kit play any real clip at all?
+    /// Does this kit play any real clip at all? (tests)
+    #[cfg(test)]
     pub fn is_real(&self) -> bool {
         self.clips.fps > 0.0 && !self.clips.frames.is_empty()
     }

@@ -76,6 +76,56 @@ fn a_blow_lands_the_instant_its_numbers_are_born_and_what_lands_follows_the_tabl
 }
 
 #[test]
+fn the_overlays_numbers_and_the_scenes_impacts_are_the_same_instants_for_the_same_batch() {
+    use crate::battle::hud::BattleHud;
+    use crate::battle::popups::Popups;
+    let cure = |_: ActorId, _: ActionRef| Look { melee: false, element: Element::Cure };
+    // Every kind of action that has something land, with the effects it can have.
+    type LookFn<'a> = &'a dyn Fn(ActorId, ActionRef) -> Look;
+    let batches: [(Vec<BattleEvent>, LookFn); 6] = [
+        (blow(0, 2), PLAIN),
+        (vec![action(2, ActionRef::EnemyAttack(272)), damage(2, 0, false), damage(2, 1, true)], PLAIN),
+        (vec![action(0, ActionRef::Magic(27)), BattleEvent::MpSpent { actor: ActorId(0), amount: 4 }, damage(0, 2, false), damage(0, 3, false)], PLAIN),
+        (vec![action(1, ActionRef::Magic(0)), BattleEvent::Heal { actor: ActorId(1), target: ActorId(0), amount: 80 }], &cure),
+        (vec![action(0, ActionRef::Item(3)), BattleEvent::MpRestored { actor: ActorId(0), target: ActorId(1), amount: 30 }], PLAIN),
+        // No announcement at all: the short beat of an older server.
+        (vec![damage(0, 2, false)], PLAIN),
+    ];
+    for now in [3.0, 77.123456, 1.0e6] {
+        for (events, look) in &batches {
+            let mut popups = Popups::default();
+            popups.on_events(now, events);
+            let mut scene = with_clips();
+            scene.on_batch(now, events, *look);
+            // The instants the numbers are born at and the instants the blows land at are the same ones.
+            let mut born: Vec<f64> = popups.births().iter().map(|(_, at)| *at).collect();
+            let mut landed = impacts(&scene);
+            born.sort_by(f64::total_cmp);
+            landed.sort_by(f64::total_cmp);
+            assert!(!born.is_empty() && born == landed, "{events:?} at {now}: numbers {born:?}, impacts {landed:?}");
+            assert!(born.iter().all(|&at| at - now <= MAX_IMPACT_DELAY + 1e-6));
+        }
+    }
+    // A death too: an enemy leaves the list at the instant the director begins its collapse.
+    let events = [action(0, ActionRef::Attack), damage(0, 2, false), BattleEvent::Death { actor: ActorId(2) }];
+    let mut hud = BattleHud::new(None);
+    hud.begin(1, Some(ActorId(0)));
+    hud.on_events(10.0, &events, false);
+    let mut scene = with_clips();
+    scene.on_batch(10.0, &events, PLAIN);
+    let begins = scene.deaths[2].expect("a death is scheduled");
+    let listed = |t: f64| {
+        let mut view = crate::battle::BattleView {
+            enemies: vec![crate::battle::Bar { actor: ActorId(2), alive: false, ..crate::battle::Bar::default() }],
+            ..crate::battle::BattleView::default()
+        };
+        hud.decorate(&mut view, t);
+        view.enemies[0].alive
+    };
+    assert!(listed(begins - 0.001) && !listed(begins + 0.001), "the list drops the enemy at the instant its collapse begins ({begins})");
+}
+
+#[test]
 fn no_blow_lands_later_than_the_cap_whatever_its_clips_its_reach_or_what_its_actor_was_doing() {
     // Very long clips (200 frames: 13 seconds), every kind of action, at several distances, with the
     // actor busy with an earlier performance that is still running.
