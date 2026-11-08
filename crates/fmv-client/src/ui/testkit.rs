@@ -116,8 +116,8 @@ pub enum Reply {
     /// sends the `Welcome`: a test can change something on disk and then release it, with no
     /// timing involved.
     Join { stored: Option<fmv_core::AvatarAppearance>, token: Option<&'static str>, gate: Option<std::sync::mpsc::Receiver<()>> },
-    /// Refuse the `Hello` with this reason.
-    Reject(&'static str),
+    /// Refuse the `Hello` with this code and sentence (the client acts on the code).
+    Reject(fmv_protocol::RejectCode, &'static str),
 }
 
 /// What a [`serve_join`] server saw.
@@ -157,8 +157,8 @@ pub fn serve_join(reply: Reply) -> (String, std::thread::JoinHandle<Seen>) {
             let hello: ClientMsg = tokio::time::timeout(limit, read_msg(&mut rd)).await.expect("a Hello in time").expect("Hello");
             let mut seen = Seen { hello: hello.clone(), join: None, left: false };
             let (stored, token) = match reply {
-                Reply::Reject(reason) => {
-                    write_msg(&mut wr, &ServerMsg::Reject { reason: reason.to_string() }).await.expect("reject");
+                Reply::Reject(code, reason) => {
+                    write_msg(&mut wr, &ServerMsg::reject(code, reason)).await.expect("reject");
                     return seen;
                 }
                 Reply::Join { stored, token, gate } => {

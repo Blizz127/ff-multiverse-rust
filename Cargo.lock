@@ -745,6 +745,7 @@ dependencies = [
 name = "fmv-server"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "clap",
  "fmv-adapter-api",
  "fmv-core",

@@ -1,4 +1,4 @@
-//! `fmv-server`: authoritative FF Multiverse server (protocol v2).
+//! `fmv-server`: authoritative FF Multiverse server (protocol v3).
 //!
 //! Thin wrapper over the `fmv_server` library: parse flags, pick the game adapter, install
 //! signal handlers, run. Logs go to stderr; stdout carries exactly one line, the READY line.
@@ -28,7 +28,10 @@ use fmv_ff7_battle::rules::{DEFAULT_BATTLE_SPEED, DEFAULT_TICKS_PER_SECOND};
 use fmv_fixture::{FixtureAdapter, FIXTURE_AREA_KEY};
 use fmv_protocol::DEFAULT_DEV_PORT;
 use fmv_server::ff7::{self, Ff7Labels, Ff7Source, SharedFf7, DEFAULT_FF7_AREA};
-use fmv_server::{BattleSettings, ServerConfig, DEFAULT_IDLE_TIMEOUT, MAX_CONNECTIONS_LIMIT, MAX_TICK_HZ};
+use fmv_server::{
+    BattleSettings, ServerConfig, DEFAULT_HELLO_TIMEOUT, DEFAULT_IDLE_TIMEOUT, DEFAULT_INACTIVITY_TIMEOUT, DEFAULT_MAX_CONNECTIONS_PER_IP,
+    DEFAULT_REGISTRATIONS_PER_IP, DEFAULT_REGISTRATIONS_PER_MINUTE, MAX_CONNECTIONS_LIMIT, MAX_REGISTRATIONS_PER_MINUTE, MAX_TICK_HZ,
+};
 use tracing::{info, warn};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -53,6 +56,17 @@ ACCOUNTS:
   runs (a second server on the same directory is refused). Default: `server/` inside $FMV_STATE_DIR
   (else the user data directory's ff-multiverse); --state-dir DIR uses DIR itself. --ephemeral keeps
   accounts only until the server stops. --no-registration refuses new accounts.
+
+LIMITS (the defaults suit a small private server; the protocol is not encrypted, so keep it on a network you trust):
+  A connection that never sends Hello is cut after --hello-timeout-secs. One address (an IPv6 /64
+  counts as one; players behind one NAT share it) may hold --max-connections-per-ip connections and
+  create --registrations-per-ip accounts per 10 minutes; the whole server creates at most
+  --registrations-per-minute accounts per minute and holds at most --max-accounts, after which
+  registration is refused and logins go on. Only accounts that are actually created use up a
+  registration limit. A joined client that sends nothing at all is dropped after --idle-timeout-secs
+  (a vanished peer); one that only answers pings and sends no game input (no move, party request or
+  battle command) is dropped after --inactivity-timeout-secs (a squatter: it would hold its slot
+  forever), and logs in again when its player is back. 0 turns a limit off.
 
 BATTLES:
   With --game ff7 from a library, the server also reads that set's scene.bin and kernel.bin
@@ -131,11 +145,42 @@ struct Cli {
     #[arg(long, value_name = "N", default_value_t = 64, value_parser = clap::value_parser!(u32).range(1..=MAX_CONNECTIONS_LIMIT as i64))]
     max_connections: u32,
 
+    /// Most simultaneous connections from ONE address (an IPv6 /64 counts as one address; players
+    /// behind one NAT share it). A connection beyond it is refused before it takes a slot. 0 = no cap.
+    #[arg(long, value_name = "N", default_value_t = DEFAULT_MAX_CONNECTIONS_PER_IP as u32,
+          value_parser = clap::value_parser!(u32).range(0..=MAX_CONNECTIONS_LIMIT as i64))]
+    max_connections_per_ip: u32,
+
+    /// Accounts ONE address may create per 10 minutes (an IPv6 /64 counts as one address). 0 = no limit.
+    #[arg(long, value_name = "N", default_value_t = DEFAULT_REGISTRATIONS_PER_IP,
+          value_parser = clap::value_parser!(u32).range(0..=i64::from(MAX_REGISTRATIONS_PER_MINUTE)))]
+    registrations_per_ip: u32,
+
+    /// Accounts the whole server creates per minute at most.
+    #[arg(long, value_name = "N", default_value_t = DEFAULT_REGISTRATIONS_PER_MINUTE,
+          value_parser = clap::value_parser!(u32).range(1..=i64::from(MAX_REGISTRATIONS_PER_MINUTE)))]
+    registrations_per_minute: u32,
+
+    /// Most accounts the store holds; at the limit new registrations are refused and logins go on.
+    #[arg(long, value_name = "N", default_value_t = fmv_persist::DEFAULT_MAX_ACCOUNTS,
+          value_parser = clap::value_parser!(u64).range(1..))]
+    max_accounts: u64,
+
+    /// A new connection must send Hello within this many seconds.
+    #[arg(long, value_name = "SECS", default_value_t = DEFAULT_HELLO_TIMEOUT.as_secs(),
+          value_parser = clap::value_parser!(u64).range(1..))]
+    hello_timeout_secs: u64,
+
     /// Disconnect joined clients that send no message for this many seconds (0 = never). Clients
     /// must send something, for example a Ping (the reference client pings every second), well
     /// inside this window. The default frees the slot and avatar of silent or vanished peers.
     #[arg(long, value_name = "SECS", default_value_t = DEFAULT_IDLE_TIMEOUT.as_secs())]
     idle_timeout_secs: u64,
+
+    /// Disconnect joined clients that send no game input (only Pings) for this many seconds
+    /// (0 = never). Without it an account that merely answers pings holds its slot forever.
+    #[arg(long, value_name = "SECS", default_value_t = DEFAULT_INACTIVITY_TIMEOUT.as_secs())]
+    inactivity_timeout_secs: u64,
 
     /// Let players start a battle on request (the client's B key, `--battle-auto` bots). OFF by
     /// default: a normal server only starts battles from random encounters. Needs battle data
@@ -170,9 +215,14 @@ struct Cli {
     debug_formation: Option<u16>,
 }
 
-/// `--idle-timeout-secs`: 0 disables the timeout.
+/// `--idle-timeout-secs` and `--inactivity-timeout-secs`: 0 disables the timeout.
 fn idle_timeout(secs: u64) -> Option<Duration> {
     (secs > 0).then(|| Duration::from_secs(secs))
+}
+
+/// `--max-connections-per-ip` and `--registrations-per-ip`: 0 lifts the limit.
+fn limit(n: u32) -> Option<u32> {
+    (n > 0).then_some(n)
 }
 
 /// Where the account store lives: `None` for `--ephemeral`, an explicit `--state-dir` as given,
@@ -244,6 +294,20 @@ struct Hosted {
 }
 
 impl Cli {
+    /// `config` with every limit and timeout the flags set (see the LIMITS section of `--help`).
+    fn with_limits(&self, config: ServerConfig) -> ServerConfig {
+        ServerConfig {
+            max_connections_per_ip: limit(self.max_connections_per_ip).map(|n| n as usize),
+            registrations_per_ip: limit(self.registrations_per_ip),
+            registrations_per_minute: self.registrations_per_minute,
+            max_accounts: self.max_accounts,
+            hello_timeout: Duration::from_secs(self.hello_timeout_secs),
+            idle_timeout: idle_timeout(self.idle_timeout_secs),
+            inactivity_timeout: idle_timeout(self.inactivity_timeout_secs),
+            ..config
+        }
+    }
+
     /// How battles run, over `rules` (the server's own battle data).
     fn battle_settings(&self, rules: std::sync::Arc<dyn fmv_protocol::BattleRules>) -> BattleSettings {
         BattleSettings {
@@ -342,19 +406,18 @@ fn info_signal(name: &str) {
 async fn real_main(cli: Cli) -> Result<(), String> {
     let hosted = build_adapter(&cli).await.map_err(|e| e.to_string())?;
     let state_dir = server_state_dir(cli.state_dir.as_deref(), cli.ephemeral, || fmv_library::resolve_state_dir(None))?;
-    let config = ServerConfig {
+    let config = cli.with_limits(ServerConfig {
         bind: cli.bind,
         area_key: hosted.area,
         state_dir,
         allow_registration: !cli.no_registration,
         tick_hz: cli.tick_hz,
         max_connections: cli.max_connections as usize,
-        idle_timeout: idle_timeout(cli.idle_timeout_secs),
         build_suffix: hosted.build_suffix,
         battle: hosted.battle,
         debug_encounters: cli.debug_encounters,
         ..ServerConfig::default()
-    };
+    });
     let shutdown = shutdown_signal().map_err(|e| format!("cannot install signal handlers: {e}"))?;
     fmv_server::run(config, hosted.adapter, shutdown).await.map_err(|e| e.to_string())
 }
@@ -547,6 +610,66 @@ mod tests {
             &["--battle-speed", "256"],
             &["--debug-formation", "70000"],
             &["--battle-seed", "-1"],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_limit_flags_default_to_the_servers_defaults_and_zero_lifts_them() {
+        // The flags' defaults and the library's are one set of values, so they cannot drift.
+        let defaults = ServerConfig::default();
+        let made = parse(&[]).unwrap().with_limits(ServerConfig::default());
+        assert_eq!(made.max_connections_per_ip, defaults.max_connections_per_ip);
+        assert_eq!(made.registrations_per_ip, defaults.registrations_per_ip);
+        assert_eq!(made.registrations_per_minute, defaults.registrations_per_minute);
+        assert_eq!(made.max_accounts, defaults.max_accounts);
+        assert_eq!(made.hello_timeout, defaults.hello_timeout);
+        assert_eq!(made.idle_timeout, defaults.idle_timeout);
+        assert_eq!(made.inactivity_timeout, defaults.inactivity_timeout);
+        made.validate().unwrap();
+
+        let cli = parse(&[
+            "--max-connections-per-ip",
+            "3",
+            "--registrations-per-ip",
+            "2",
+            "--registrations-per-minute",
+            "30",
+            "--max-accounts",
+            "500",
+            "--hello-timeout-secs",
+            "7",
+            "--idle-timeout-secs",
+            "12",
+            "--inactivity-timeout-secs",
+            "90",
+        ])
+        .unwrap();
+        let made = cli.with_limits(ServerConfig::default());
+        assert_eq!(made.max_connections_per_ip, Some(3));
+        assert_eq!(made.registrations_per_ip, Some(2));
+        assert_eq!(made.registrations_per_minute, 30);
+        assert_eq!(made.max_accounts, 500);
+        assert_eq!(made.hello_timeout, Duration::from_secs(7));
+        assert_eq!(made.idle_timeout, Some(Duration::from_secs(12)));
+        assert_eq!(made.inactivity_timeout, Some(Duration::from_secs(90)));
+        made.validate().unwrap();
+
+        // 0 lifts a limit (and `--inactivity-timeout-secs 0` is "never").
+        let off = parse(&["--max-connections-per-ip", "0", "--registrations-per-ip", "0", "--inactivity-timeout-secs", "0"])
+            .unwrap()
+            .with_limits(ServerConfig::default());
+        assert_eq!((off.max_connections_per_ip, off.registrations_per_ip, off.inactivity_timeout), (None, None, None));
+        off.validate().unwrap();
+
+        // Out-of-range values are usage errors, not panics later.
+        for bad in [
+            &["--registrations-per-minute", "0"][..],
+            &["--max-accounts", "0"],
+            &["--hello-timeout-secs", "0"],
+            &["--max-connections-per-ip", "300"],
+            &["--registrations-per-ip", "99999"],
         ] {
             assert!(parse(bad).is_err(), "{bad:?}");
         }

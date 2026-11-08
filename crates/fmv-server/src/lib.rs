@@ -36,6 +36,21 @@
 //! (the FIXTURE one) refuses every request with `BattleRejection::Unsupported`. See the `world`
 //! module for the rules, and `fmv_protocol::battle` for the wire contract.
 //!
+//! # Limits and refusals
+//!
+//! The protocol is not encrypted and the server is for a network you trust, but one host must not be
+//! able to hold it hostage: [`ServerConfig`] bounds the connections one address may hold
+//! (`max_connections_per_ip`), the time a connection may stay silent before its `Hello`
+//! (`hello_timeout`), the accounts one address and the whole server may create
+//! (`registrations_per_ip`, `registrations_per_minute`, `max_accounts`), and how long a joined session
+//! may idle (`idle_timeout`: it sent nothing; `inactivity_timeout`: it only pinged). Only accounts that
+//! really come into being use up a registration limit (see `limits`). Every refusal is
+//! `Reject { reason, code }` with a [`fmv_protocol::RejectCode`] a client acts on. A registration is
+//! validated before it takes a place in the limits and before anything is written, is created in one
+//! store call, and is released again if its `Welcome` (the only copy of the token) was never written
+//! (see `accounts` and `conn`). Log lines a stranger can cause at will are budgeted per address, and
+//! nothing is logged while the world lock is held (see `deferred`).
+//!
 //! # What the server trusts an adapter for
 //!
 //! * **FIXTURE labeling does not rest on the adapter's flag alone.** An area is announced as
@@ -60,34 +75,38 @@
 mod accounts;
 mod config;
 mod conn;
+mod deferred;
 pub mod ff7;
+mod limits;
 mod world;
 
 pub use accounts::MAX_APPEARANCE_REF;
 
 pub use config::{
-    BattleSettings, ConfigError, ServerConfig, DEFAULT_IDLE_TIMEOUT, DEFAULT_KEEPALIVE, DEFAULT_REGISTRATIONS_PER_MINUTE, MAX_BUILD_SUFFIX, MAX_CONNECTIONS_LIMIT, MAX_REGISTRATIONS_PER_MINUTE, MAX_TICK_HZ,
+    BattleSettings, ConfigError, ServerConfig, DEFAULT_HELLO_TIMEOUT, DEFAULT_IDLE_TIMEOUT, DEFAULT_INACTIVITY_TIMEOUT, DEFAULT_KEEPALIVE,
+    DEFAULT_MAX_CONNECTIONS_PER_IP, DEFAULT_REGISTRATIONS_PER_IP, DEFAULT_REGISTRATIONS_PER_MINUTE, MAX_BUILD_SUFFIX,
+    MAX_CONNECTIONS_LIMIT, MAX_REGISTRATIONS_PER_MINUTE, MAX_TICK_HZ,
 };
 pub use conn::{SERVER_BUILD, SHUTDOWN_REASON};
+pub use limits::PEER_REGISTRATION_WINDOW;
 
-use std::collections::VecDeque;
 use std::future::Future;
 use std::io::Write;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use fmv_adapter_api::{AdapterError, AreaInfo, GameAdapter};
 use fmv_core::{AreaId, Platform, SourceRef};
-use fmv_persist::Store;
-use fmv_protocol::{ServerMsg, PROTOCOL_VERSION};
-use tokio::net::TcpListener;
+use fmv_persist::{Store, StoreOptions};
+use fmv_protocol::{RejectCode, ServerMsg, PROTOCOL_VERSION};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, Semaphore};
 use tokio::time::MissedTickBehavior;
-use tracing::{info, warn, Instrument};
+use tracing::{debug, info, warn, Instrument};
 
 use crate::conn::{reject_and_close, serve_connection, wait_flag, Shared};
+use crate::limits::{throttle_notice, Limits, LogVerdict, PeerKey};
 use crate::world::World;
 
 /// Pause after a failed `accept` (for example file-descriptor exhaustion) to avoid a hot loop.
@@ -244,10 +263,11 @@ impl Server {
             (None, false) => info!("battles unsupported on this server (no owned battle data); battle requests are refused"),
         }
         if !local_addr.ip().is_loopback() {
-            warn!(%local_addr, "listening on a non-loopback address; protocol v2 is not encrypted (account tokens and game traffic cross the network in the clear): use it only on a network you trust");
+            warn!(%local_addr, "listening on a non-loopback address; protocol v3 is not encrypted (account tokens and game traffic cross the network in the clear): use it only on a network you trust");
         }
 
         let build = config.build_string();
+        let limits = Limits::new(&config);
         let shared = Arc::new(Shared {
             cfg: config,
             world: Mutex::new(world),
@@ -257,7 +277,7 @@ impl Server {
             provenance: provenance.clone(),
             build,
             store,
-            registrations: Mutex::new(VecDeque::new()),
+            limits,
             _ephemeral_state: ephemeral_state,
         });
         Ok(Self { listener, local_addr, shared, fixture })
@@ -307,7 +327,6 @@ impl Server {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let slots = Arc::new(Semaphore::new(shared.cfg.max_connections));
         let reject_slots = Arc::new(Semaphore::new(MAX_REJECT_TASKS));
-        let full_rejections = AtomicU64::new(0);
         let tick = tokio::spawn(tick_loop(Arc::clone(&shared), shutdown_rx.clone()));
 
         tokio::pin!(shutdown);
@@ -318,8 +337,36 @@ impl Server {
                     let (stream, peer) = match accepted {
                         Ok(ok) => ok,
                         Err(e) => {
-                            warn!(error = %e, "accept failed");
+                            // Not routine (file-descriptor exhaustion), but it repeats every
+                            // `ACCEPT_BACKOFF` for as long as it lasts: throttled like the rest.
+                            match shared.limits.logs.allow(None, Instant::now()) {
+                                LogVerdict::Emit { .. } => warn!(error = %e, "accept failed"),
+                                LogVerdict::FirstSuppressed => {
+                                    throttle_notice();
+                                    debug!(error = %e, "accept failed (log throttled)");
+                                }
+                                LogVerdict::Suppress => debug!(error = %e, "accept failed (log throttled)"),
+                            }
                             tokio::time::sleep(ACCEPT_BACKOFF).await;
+                            continue;
+                        }
+                    };
+                    let key = PeerKey::of(peer.ip());
+                    // One address holds at most its share of the connection slots (handshaking
+                    // ones included): checked first, so a flood from one host is refused as that
+                    // host's and never even reaches the global count.
+                    let peer_permit = match shared.limits.connections.admit(key) {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            let max = shared.cfg.max_connections_per_ip.unwrap_or(0);
+                            refuse(
+                                &shared,
+                                &reject_slots,
+                                stream,
+                                peer,
+                                RejectCode::TooManyConnections,
+                                format!("too many connections from your address (at most {max} at once)"),
+                            );
                             continue;
                         }
                     };
@@ -329,27 +376,18 @@ impl Server {
                             let shutdown_rx = shutdown_rx.clone();
                             tokio::spawn(
                                 async move {
+                                    // Both places are given back together, when the connection (its
+                                    // farewell and linger included) is over.
                                     let _permit = permit;
-                                    serve_connection(shared, stream, shutdown_rx).await;
+                                    let _peer_permit = peer_permit;
+                                    serve_connection(shared, stream, peer, shutdown_rx).await;
                                 }
                                 .instrument(tracing::info_span!("conn", %peer)),
                             );
                         }
                         Err(_) => {
-                            if full_rejections.fetch_add(1, Ordering::Relaxed).is_multiple_of(100) {
-                                warn!(%peer, limit = shared.cfg.max_connections, "connection limit reached; rejecting (logged once per 100 rejections)");
-                            }
-                            match Arc::clone(&reject_slots).try_acquire_owned() {
-                                Ok(reject_permit) => {
-                                    let wt = shared.cfg.write_timeout.min(Duration::from_secs(2));
-                                    tokio::spawn(async move {
-                                        let _reject_permit = reject_permit;
-                                        reject_and_close(stream, "server full", wt).await;
-                                    });
-                                }
-                                // Too many farewells already in flight: just hang up.
-                                Err(_) => drop(stream),
-                            }
+                            drop(peer_permit);
+                            refuse(&shared, &reject_slots, stream, peer, RejectCode::ServerFull, "server full".to_string());
                         }
                     }
                 }
@@ -367,6 +405,35 @@ impl Server {
         }
         let _ = tick.await;
         Ok(())
+    }
+}
+
+/// Turn away a connection that was accepted but gets no slot (the server is full, or its address
+/// holds its share): say why while a farewell task is free (at most `MAX_REJECT_TASKS` at once;
+/// past that the socket is simply closed) and log it within the log throttle's budget, so a flood of
+/// refused connections is not a flood of log lines.
+fn refuse(shared: &Arc<Shared>, reject_slots: &Arc<Semaphore>, stream: TcpStream, peer: SocketAddr, code: RejectCode, text: String) {
+    match shared.limits.logs.allow(Some(PeerKey::of(peer.ip())), Instant::now()) {
+        LogVerdict::Emit { suppressed: 0 } => warn!(%peer, ?code, reason = %text, "connection refused"),
+        LogVerdict::Emit { suppressed } => {
+            warn!(%peer, ?code, suppressed, reason = %text, "connection refused (earlier refusals were throttled; see debug)")
+        }
+        LogVerdict::FirstSuppressed => {
+            throttle_notice();
+            debug!(%peer, ?code, reason = %text, "connection refused (log throttled)");
+        }
+        LogVerdict::Suppress => debug!(%peer, ?code, reason = %text, "connection refused (log throttled)"),
+    }
+    match Arc::clone(reject_slots).try_acquire_owned() {
+        Ok(reject_permit) => {
+            let wt = shared.cfg.write_timeout.min(Duration::from_secs(2));
+            tokio::spawn(async move {
+                let _reject_permit = reject_permit;
+                reject_and_close(stream, code, &text, wt).await;
+            });
+        }
+        // Too many farewells already in flight: just hang up.
+        Err(_) => drop(stream),
     }
 }
 
@@ -395,7 +462,8 @@ async fn open_store(config: &ServerConfig) -> Result<(Arc<Store>, Option<tempfil
     };
     let opened = {
         let root = root.clone();
-        tokio::task::spawn_blocking(move || Store::open(root))
+        let options = StoreOptions::default().with_max_accounts(config.max_accounts);
+        tokio::task::spawn_blocking(move || Store::open_with(root, options))
             .await
             .map_err(|e| ServerError::Io(std::io::Error::other(format!("store open task failed: {e}"))))?
     };
@@ -407,6 +475,8 @@ async fn open_store(config: &ServerConfig) -> Result<(Arc<Store>, Option<tempfil
         state = %root.display(),
         ephemeral = ephemeral.is_some(),
         registration = config.allow_registration,
+        accounts = store.account_count(),
+        max_accounts = store.max_accounts(),
         "account store open"
     );
     Ok((Arc::new(store), ephemeral))
@@ -423,10 +493,11 @@ async fn tick_loop(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) {
         tokio::select! {
             _ = interval.tick() => {
                 let now = Instant::now();
-                let mut world = shared.world();
-                world.advance_tick();
-                world.expire_parties(now);
-                world.advance_battles(now);
+                shared.with_world(|world| {
+                    world.advance_tick();
+                    world.expire_parties(now);
+                    world.advance_battles(now);
+                });
             }
             () = wait_flag(&mut shutdown) => break,
         }

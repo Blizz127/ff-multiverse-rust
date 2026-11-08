@@ -17,7 +17,7 @@ use fmv_adapter_api::{AreaInfo, GameAdapter};
 use fmv_core::{AccountId, EntityId, EntitySnapshot, Pos};
 use fmv_fixture::FixtureAdapter;
 use fmv_protocol::{
-    read_msg, write_msg, Auth, ClientMsg, Placement, ProtoError, Secret, ServerMsg, PROTOCOL_VERSION,
+    read_msg, write_msg, Auth, ClientMsg, Placement, ProtoError, RejectCode, Secret, ServerMsg, PROTOCOL_VERSION,
 };
 use fmv_server::{Server, ServerConfig, ServerError};
 use tokio::io::AsyncWriteExt;
@@ -91,6 +91,15 @@ impl Client {
         Self { stream }
     }
 
+    /// Connect from another loopback address (all of 127.0.0.0/8 is loopback on Linux), so that the
+    /// server sees a different peer: the per-address limits are per peer.
+    pub async fn connect_from(addr: SocketAddr, source: &str) -> Self {
+        let socket = TcpSocket::new_v4().expect("socket");
+        socket.bind(format!("{source}:0").parse().expect("source address")).expect("bind the source address");
+        let stream = timeout(STEP, socket.connect(addr)).await.expect("connect timed out").expect("connect");
+        Self { stream }
+    }
+
     /// A client whose kernel receive buffer is tiny, so that it fills up (and the server's writes
     /// to it block) after a few KiB once the client stops reading.
     pub async fn connect_with_tiny_receive_buffer(addr: SocketAddr) -> Self {
@@ -140,25 +149,42 @@ impl Client {
         out
     }
 
-    /// The server must close the connection (anything still queued is skipped).
+    /// The server must close the connection (anything still queued is skipped). Our own end is closed
+    /// too: after a farewell the server keeps reading (and discarding) for a moment, so that its
+    /// reset cannot destroy the farewell, and it counts the connection against the address's share
+    /// until we hang up. A well-behaved client hangs up as soon as it has seen the end.
     pub async fn expect_closed(&mut self) {
         loop {
             match timeout(STEP, read_msg::<_, ServerMsg>(&mut self.stream)).await.expect("timed out waiting for close") {
-                Err(ProtoError::Closed | ProtoError::Io(_)) => return,
+                Err(ProtoError::Closed | ProtoError::Io(_)) => break,
                 Err(e) => panic!("unexpected error while waiting for close: {e}"),
                 Ok(_) => continue,
             }
         }
+        let _ = self.stream.shutdown().await;
+    }
+
+    /// The next `Reject`: its code and its text (everything before it is skipped).
+    pub async fn next_reject(&mut self) -> (RejectCode, String) {
+        self.until("Reject", |m| match m {
+            ServerMsg::Reject { reason, code } => Some((*code, reason.clone())),
+            _ => None,
+        })
+        .await
     }
 
     /// Expect a `Reject` whose reason contains `needle`, then the connection closing.
     pub async fn expect_reject(&mut self, needle: &str) {
-        let reason = self
-            .until("Reject", |m| match m {
-                ServerMsg::Reject { reason } => Some(reason.clone()),
-                _ => None,
-            })
-            .await;
+        let (_code, reason) = self.next_reject().await;
+        assert!(reason.contains(needle), "reject reason {reason:?} should mention {needle:?}");
+        self.expect_closed().await;
+    }
+
+    /// Expect a `Reject` with this CODE (what a client acts on) whose reason contains `needle` (what
+    /// the player reads), then the connection closing.
+    pub async fn expect_reject_as(&mut self, expected: RejectCode, needle: &str) {
+        let (code, reason) = self.next_reject().await;
+        assert_eq!(code, expected, "reject code (reason {reason:?})");
         assert!(reason.contains(needle), "reject reason {reason:?} should mention {needle:?}");
         self.expect_closed().await;
     }

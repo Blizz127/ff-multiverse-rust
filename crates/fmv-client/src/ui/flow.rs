@@ -8,8 +8,9 @@ use super::looks::LookCache;
 use super::menu::{CharacterEntry, Look, MenuAction, Notice};
 use crate::accounts::{SavedAccount, TokenStore};
 use crate::cli::tint_from_name;
-use crate::login::{plan_login, LoginPlan, STALE_TOKEN_REJECT};
+use crate::login::{plan_login, LoginPlan};
 use crate::net::{clean, NetConfig, NetError, SessionTiming, TokenSink};
+use fmv_protocol::RejectCode;
 
 /// What a connection attempt needs to know about this client.
 pub struct Env<'a> {
@@ -110,9 +111,14 @@ pub fn prepare(env: &Env<'_>, accounts: &[SavedAccount], action: &MenuAction) ->
     }
 }
 
+/// The advice for a failure nobody can do anything specific about.
+const TRY_AGAIN: &str = "Press Enter to try again.";
+
 /// The message for a failed attempt. The server's own words are always shown (cleaned, they are
-/// text from the network), followed by what the player can do about it. A token that could not
-/// be saved is carried as a secret: it is the player's only chance to keep the account.
+/// text from the network), followed by what the player can do about it. For a refusal that advice
+/// comes from the server's [`RejectCode`] alone (see `reject_hint`), never from its words,
+/// which are free to change. A token that could not be saved is carried as a secret: it is the
+/// player's only chance to keep the account.
 pub fn failure_notice(error: &NetError, plan: &LoginPlan) -> Notice {
     match error {
         NetError::TokenNotSaved { reason, token } => Notice::error(format!(
@@ -120,32 +126,48 @@ pub fn failure_notice(error: &NetError, plan: &LoginPlan) -> Notice {
         ))
         .with_hint("Write the token below into a file by hand: it is shown only once.")
         .with_secret(token.expose()),
-        NetError::Rejected(reason) => {
-            let said = format!("The server refused: {reason}");
-            let lower = reason.to_lowercase();
-            let hint = if reason == STALE_TOKEN_REJECT && matches!(plan, LoginPlan::Token(_)) {
-                "The server does not know this saved login (its accounts may have been reset). Press Del to forget it, then N to create a new character."
-            } else if lower.contains("already taken") {
-                "Change the name and press Enter again."
-            } else if lower.contains("registration is closed") {
-                "This server takes no new characters. Press Esc and play a saved one."
-            } else if lower.contains("too many registrations") || lower.contains("rate limit") {
-                "Wait a minute, then press Enter again."
-            } else if lower.contains("already logged in") {
-                "That character is online elsewhere. Close it there, then press Enter again."
-            } else if lower.contains("must not be empty") {
-                "Type a name and press Enter again."
-            } else {
-                "Press Enter to try again."
-            };
-            Notice::error(said).with_hint(hint)
+        NetError::Rejected { code, reason } => {
+            Notice::error(format!("The server refused: {reason}")).with_hint(reject_hint(*code, plan))
         }
         NetError::Content(text) => Notice::error(format!("Cannot join: {text}"))
             .with_hint("This computer's game files must be the same edition as the server's."),
         NetError::Connect { .. } | NetError::ConnectTimeout(..) | NetError::Timeout(_) | NetError::Io { .. } => {
             Notice::error(error.to_string()).with_hint("Check the server address and that the server is running, then press Enter.")
         }
-        NetError::Protocol(_) | NetError::Runtime(_) => Notice::error(error.to_string()).with_hint("Press Enter to try again."),
+        NetError::Protocol(_) | NetError::Runtime(_) => Notice::error(error.to_string()).with_hint(TRY_AGAIN),
+    }
+}
+
+/// What the player can do about a refusal, decided from the code alone. The match is exhaustive
+/// on purpose, without a catch-all arm: a code added to the protocol has to be given its advice
+/// here before this client builds. A server that sends no code (or one this build does not know)
+/// is `Unspecified` and gets the generic advice; its words are never read for a clue.
+fn reject_hint(code: RejectCode, plan: &LoginPlan) -> &'static str {
+    match code {
+        RejectCode::NameTaken => "Change the name and press Enter again.",
+        RejectCode::InvalidName => "Type a name and press Enter again.",
+        RejectCode::RegistrationClosed => "This server takes no new characters. Press Esc and play a saved one.",
+        RejectCode::RateLimited => "Wait a minute, then press Enter again.",
+        RejectCode::AlreadyOnline => "That character is online elsewhere. Close it there, then press Enter again.",
+        // Only a saved login can be stale: a registration sends no token for the server to refuse.
+        RejectCode::InvalidToken => match plan {
+            LoginPlan::Token(_) => {
+                "The server does not know this saved login (its accounts may have been reset). Press Del to forget it, then N to create a new character."
+            }
+            LoginPlan::Register { .. } => TRY_AGAIN,
+        },
+        RejectCode::ServerFull => "The server is full. Wait a moment, then press Enter again.",
+        RejectCode::TooManyConnections => {
+            "Too many connections from this computer or network. Close other copies of the game, wait a moment, then press Enter again."
+        }
+        RejectCode::ProtocolMismatch => "This client and the server speak different protocol versions: update the older one.",
+        RejectCode::ShuttingDown => "The server is restarting. Wait a moment, then press Enter again.",
+        RejectCode::Timeout
+        | RejectCode::IdleTimeout
+        | RejectCode::Internal
+        | RejectCode::ContentMismatch
+        | RejectCode::BadRequest
+        | RejectCode::Unspecified => TRY_AGAIN,
     }
 }
 
@@ -392,7 +414,7 @@ mod tests {
         let (mut srd, mut swr) = split(server);
         let script = tokio::spawn(async move {
             let _hello: ClientMsg = read_msg(&mut srd).await.unwrap();
-            write_msg(&mut swr, &ServerMsg::Reject { reason: "that display name is already taken".into() }).await.unwrap();
+            write_msg(&mut swr, &ServerMsg::reject(RejectCode::NameTaken, "that display name is already taken")).await.unwrap();
         });
         let error = handshake(&mut crd, &mut cwr, &attempt.cfg, &adapter, Duration::from_secs(5)).await.err().expect("refused");
         script.await.unwrap();
@@ -419,34 +441,93 @@ mod tests {
         LoginPlan::Token(f.store.list(SERVER).accounts.remove(0))
     }
 
+    fn refused(code: RejectCode, reason: &str) -> NetError {
+        NetError::Rejected { code, reason: reason.to_string() }
+    }
+
     #[test]
     fn every_refusal_shows_the_servers_words_and_a_way_forward() {
         let register = register_plan();
-        for (reason, hint) in [
-            ("that display name is already taken", "Change the name"),
-            ("registration is closed on this server; log in with a saved token", "no new characters"),
-            ("too many registrations on this server right now; try again in a minute", "Wait a minute"),
-            ("rate limit exceeded", "Wait a minute"),
-            ("this account is already logged in", "online elsewhere"),
-            ("display name must not be empty", "Type a name"),
-            ("some reason nobody foresaw", "try again"),
-        ] {
-            let n = failure_notice(&NetError::Rejected(reason.to_string()), &register);
+        // (the server's code, its words, a fragment of the advice). Every code has a row.
+        let table = [
+            (RejectCode::NameTaken, "that display name is already taken", "Change the name"),
+            (RejectCode::InvalidName, "display name must not be empty", "Type a name"),
+            (RejectCode::RegistrationClosed, "registration is closed on this server; log in with a saved token", "no new characters"),
+            (RejectCode::RateLimited, "too many registrations on this server right now; try again in a minute", "Wait a minute"),
+            (RejectCode::RateLimited, "rate limit exceeded", "Wait a minute"),
+            (RejectCode::AlreadyOnline, "this account is already logged in", "online elsewhere"),
+            // A registration sends no token, so a refused token has no saved login to blame (the
+            // saved-token plan has its own test below).
+            (RejectCode::InvalidToken, "invalid or unknown token", "Press Enter to try again"),
+            (RejectCode::ServerFull, "server full", "The server is full"),
+            (RejectCode::TooManyConnections, "too many connections from your address", "Too many connections"),
+            (RejectCode::ProtocolMismatch, "protocol version mismatch", "different protocol versions"),
+            (RejectCode::ShuttingDown, "the server is shutting down", "restarting"),
+            (RejectCode::Timeout, "no Hello within 10 s", "Press Enter to try again"),
+            (RejectCode::IdleTimeout, "session closed for inactivity", "Press Enter to try again"),
+            (RejectCode::Internal, "internal error", "Press Enter to try again"),
+            (RejectCode::ContentMismatch, "area fingerprint is not the server's", "Press Enter to try again"),
+            (RejectCode::BadRequest, "malformed message", "Press Enter to try again"),
+            (RejectCode::Unspecified, "some reason nobody foresaw", "Press Enter to try again"),
+            // The hint comes from the code and NOT from the words: another sentence with the same
+            // code gets the same advice...
+            (RejectCode::NameTaken, "computer says no", "Change the name"),
+            (RejectCode::RateLimited, "that display name is already taken", "Wait a minute"),
+            // ...and the words of an old server (no code) get nothing but the generic advice.
+            (RejectCode::Unspecified, "that display name is already taken", "Press Enter to try again"),
+            (RejectCode::Unspecified, "registration is closed on this server", "Press Enter to try again"),
+            (RejectCode::Unspecified, "this account is already logged in", "Press Enter to try again"),
+            (RejectCode::Unspecified, "rate limit exceeded", "Press Enter to try again"),
+        ];
+        for (code, reason, hint) in table {
+            let n = failure_notice(&refused(code, reason), &register);
             assert_eq!(n.kind, NoticeKind::Error);
-            assert!(n.text.contains(reason), "{reason}: {n:?}");
-            assert!(n.hint.as_deref().is_some_and(|h| h.contains(hint)), "{reason}: {n:?}");
+            assert_eq!(n.text, format!("The server refused: {reason}"), "{code:?}");
+            assert!(n.hint.as_deref().is_some_and(|h| h.contains(hint)), "{code:?} {reason}: {n:?}");
             assert!(n.secret.is_none());
+        }
+        // The generic advice is exactly that, not some other sentence that happens to contain it.
+        for (code, reason, hint) in table {
+            if hint == "Press Enter to try again" {
+                let n = failure_notice(&refused(code, reason), &register);
+                assert_eq!(n.hint.as_deref(), Some("Press Enter to try again."), "{code:?} {reason}");
+            }
+        }
+        // No code is left without a row, so a code added to the protocol shows up here too.
+        let covered: std::collections::HashSet<RejectCode> = table.iter().map(|(code, ..)| *code).collect();
+        for code in RejectCode::ALL {
+            assert!(covered.contains(&code), "{code:?} has no row in the table");
+        }
+        // Whatever the code, the notice is an error that quotes the server and says what to do.
+        let saved = token_plan();
+        for plan in [&register, &saved] {
+            for code in RejectCode::ALL {
+                let n = failure_notice(&refused(code, "words of the server"), plan);
+                assert_eq!((n.kind, n.text.as_str()), (NoticeKind::Error, "The server refused: words of the server"), "{code:?}");
+                assert!(n.hint.as_deref().is_some_and(|h| !h.is_empty()), "{code:?}: {n:?}");
+            }
         }
     }
 
     #[test]
     fn a_stale_saved_token_points_at_forget_and_new_character() {
-        let n = failure_notice(&NetError::Rejected(STALE_TOKEN_REJECT.to_string()), &token_plan());
-        assert!(n.text.contains(STALE_TOKEN_REJECT));
+        let stale = refused(RejectCode::InvalidToken, "invalid or unknown token");
+        let saved = token_plan();
+        let n = failure_notice(&stale, &saved);
+        assert!(n.text.contains("invalid or unknown token"));
         let hint = n.hint.unwrap();
         assert!(hint.contains("Del") && hint.contains("forget") && hint.contains("N to create"), "{hint}");
-        // For a registration the same words have no saved token to blame.
-        let n = failure_notice(&NetError::Rejected(STALE_TOKEN_REJECT.to_string()), &register_plan());
+        // The code points at the saved login, not the sentence: any words do for InvalidToken...
+        let other_words = failure_notice(&refused(RejectCode::InvalidToken, "we lost your account"), &saved);
+        assert_eq!(other_words.hint.as_deref(), Some(hint.as_str()));
+        // ...and the very same words with another code do not.
+        for code in RejectCode::ALL.into_iter().filter(|code| *code != RejectCode::InvalidToken) {
+            let n = failure_notice(&refused(code, "invalid or unknown token"), &saved);
+            let other = n.hint.unwrap();
+            assert!(other != hint && !other.contains("forget"), "{code:?}: {other}");
+        }
+        // For a registration the same refusal has no saved token to blame.
+        let n = failure_notice(&stale, &register_plan());
         assert_eq!(n.hint.as_deref(), Some("Press Enter to try again."));
     }
 

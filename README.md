@@ -145,6 +145,53 @@ The server keeps **accounts** in a state directory it holds locked while it runs
 `~/.local/share/ff-multiverse`). `--ephemeral` keeps accounts only until it stops, and
 `--no-registration` refuses new accounts.
 
+**Limits.** The protocol is not encrypted and the server is meant for a network you trust, but it
+does not let one host hold it hostage either. Every limit has a flag (`--help` lists them; `0`
+turns a limit off) and every refusal says why, in words and as a typed code (see below).
+
+| What | Default | Flag |
+|---|---|---|
+| A connection must send `Hello` within | 3 s | `--hello-timeout-secs` |
+| Connections one address may hold at once (handshaking ones count; an IPv6 /64 is one address, players behind one NAT share it) | 8 | `--max-connections-per-ip` |
+| Accounts one address may create per 10 minutes | 10 | `--registrations-per-ip` |
+| Accounts the whole server creates per minute | 120 | `--registrations-per-minute` |
+| Accounts the store holds, then registration closes and logins go on | 100000 | `--max-accounts` |
+| A joined client that sends nothing at all is dropped after | 30 s | `--idle-timeout-secs` |
+| A joined client that only pings, with no game input, is dropped after | 30 min | `--inactivity-timeout-secs` |
+
+The per-address limits go by the address the TCP connection comes from. A tunnel or proxy that makes
+every player arrive from one address (an SSH forward, for example) shares one allowance between them:
+raise or lift `--max-connections-per-ip` and `--registrations-per-ip` there.
+
+*Registration limits count accounts that were created.* A registration is checked for its name
+and look first, then takes a place in the per-address and server-wide limits, and only an account
+that really comes into being uses the place up: a refused name, a name that is taken or a client that
+hung up costs nobody a place, so a flood of junk registrations cannot lock real players out.
+
+*Idle sessions.* Two clocks end a joined session. Silence (`--idle-timeout-secs`) is a peer that
+vanished. Pinging without playing (`--inactivity-timeout-secs`) is a squatter: an account that only
+answers pings would otherwise hold its slot forever, and 64 of them the whole server. "Game input"
+is anything but a `Ping` (a move, a party request, a battle command); the reference client pings
+every second and moves when its player walks. Whoever steps away for half an hour is told
+"closed for inactivity" and logs in again with the saved token.
+
+*Registration and its token.* The token is sent once, in the `Welcome` that answers the
+registration. The account is created in one step with its avatar (a name is never taken without a
+token having been produced), a client that has already hung up gets no account, and if the `Welcome`
+cannot be written the account is released again, so the name is free for the next try. A look
+(`appearance_ref`) is only ever one of the ids the hosted game offers (`ff7/cloud`, ...); anything
+else keeps the default look instead of failing the registration.
+
+*Refusals are typed.* `Reject { reason, code }`: the `reason` is a sentence for the screen, the `code`
+(`NameTaken`, `InvalidName`, `InvalidToken`, `RegistrationClosed`, `RateLimited`, `AlreadyOnline`,
+`ServerFull`, `TooManyConnections`, `ProtocolMismatch`, `ContentMismatch`, `BadRequest`, `Timeout`,
+`IdleTimeout`, `ShuttingDown`, `Internal`) is what a client acts on. It is additive within protocol
+v3 (an older peer ignores it, a missing or unknown code reads as `Unspecified`).
+
+*Logging.* Junk connections cannot fill the log: past a small budget per address and in total,
+connection events are logged at the debug level and one line says so. Nothing is logged while the
+world lock is held, so a stalled log reader cannot stall the players.
+
 **Run two headless bots** (use `addr` from the READY line, the same `--game ff7` flags as the
 server when it hosts FF7). The first time a bot connects it registers its `--name` as a new
 account and saves the token it is given; each bot runs for the given duration and then prints
