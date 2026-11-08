@@ -126,6 +126,7 @@ fn facing_camera(id: u64, appearance: &'static str, at: Pos) -> AvatarPlayer<'st
         facing: -std::f32::consts::FRAC_PI_2,
         anim: AnimState::Idle,
         appearance: Some(appearance),
+        npc: None,
         tint: [10, 200, 30],
         own: false,
         party: false,
@@ -510,7 +511,7 @@ mod real {
                 if depth < depth_range.0 || depth > depth_range.1 {
                     return None;
                 }
-                let player = AvatarPlayer { who: Who(0), pos, facing: 0.0, anim: AnimState::Idle, appearance: Some("ff7/cloud"), tint: [0; 3], own: false, party: false };
+                let player = AvatarPlayer { who: Who(0), pos, facing: 0.0, anim: AnimState::Idle, appearance: Some("ff7/cloud"), npc: None, tint: [0; 3], own: false, party: false };
                 let built = avatars.frame(view, stage, &[player], 0.0);
                 let model = built.frame.models.first()?;
                 let mut rect = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
@@ -628,6 +629,7 @@ fn offscreen_real_ff7_avatars_in_the_field() {
         facing,
         anim,
         appearance,
+        npc: None,
         tint: [[90, 125, 245], [235, 80, 80], [60, 200, 90], [250, 190, 40]][(id as usize - 1) % 4],
         own,
         party,
@@ -758,6 +760,221 @@ fn offscreen_real_ff7_avatars_in_the_field() {
         }
     }
     assert!(opaque > 10_000, "{opaque} px of scenery in front");
+}
+
+/// The non-player characters of two real fields (`md1stin`, the platform with its two guards, and
+/// `md1_1`, the next field, with five characters), drawn as the models their data names, through
+/// the real renderer, by the window's own `field_draw` and label anchors, next to two players for
+/// scale: PNGs to look at (`60-npcs-<field>.png`, a 1920x1080 one, and a 3x close-up of every
+/// character, `61-...`) and numbers: how many characters the data reported, how many became models,
+/// markers or were culled, where each one's feet are on the screen against where it stands, whether
+/// its name is over its head, and which way each faces against the camera. `FMV_FF7_AREAS` (comma
+/// separated) picks other fields.
+#[test]
+#[ignore = "needs the owner's real FF7 data (FMV_FF7_DATA, FMV_FF7_FLEVEL or FMV_FF7_LIBRARY) and a GPU or software Vulkan/GL driver"]
+fn offscreen_real_ff7_npcs_in_two_fields() {
+    use crate::backdrop::FieldView;
+    use crate::npc::npc_who;
+    use crate::session::SessionInfo;
+    use crate::state::ClientState;
+    use crate::ui::hud::{self, Subject};
+    use crate::window::{field_draw, label_anchor};
+    use fmv_adapter_api::AreaRuntime;
+    use fmv_core::{AccountId, AreaId, AvatarAppearance, EntityId, EntitySnapshot, GameId};
+    use fmv_protocol::{NpcSnapshot, ServerMsg, NPC_NAME_CHARS, NPC_REF_CHARS};
+    use real::*;
+
+    let Some(real) = open() else { return };
+    let Some(mut gpu) = Offscreen::new() else { return };
+    let keys = std::env::var("FMV_FF7_AREAS").unwrap_or_else(|_| "md1stin,md1_1".to_string());
+    for key in keys.split(',').map(str::trim).filter(|k| !k.is_empty()) {
+        let view = timed(&format!("{key}: field view with the scenery in front"), || FieldView::ff7_with(&real.adapter, key, true)).expect("field view");
+        let stage = view.stage.clone().expect("an FF7 field has a stage");
+        let area = real.adapter.load_field(key).expect("field");
+
+        // What the server announces (its own rule: the unconditional characters, texts clipped),
+        // as the wire carries it; the client reads it through `NpcView::from_snapshot` like live.
+        let clip = |text: &str, max: usize| -> String { text.chars().filter(|c| !c.is_control()).take(max).collect() };
+        let reported = area.npcs();
+        let announced: Vec<NpcSnapshot> = reported
+            .iter()
+            .filter(|n| n.unconditional && n.pos.is_finite() && n.facing.is_finite())
+            .enumerate()
+            .map(|(i, n)| NpcSnapshot {
+                id: i as u32,
+                name: clip(&n.entity_name, NPC_NAME_CHARS),
+                model: clip(&n.appearance.model, NPC_REF_CHARS),
+                idle_animation: n.appearance.idle_animation.as_deref().map(|a| clip(a, NPC_REF_CHARS)),
+                pos: n.pos,
+                facing: n.facing,
+            })
+            .collect();
+        eprintln!(
+            "{key}: the data reports {} character(s), {} announced: {:?}",
+            reported.len(),
+            announced.len(),
+            announced.iter().map(|n| (n.name.as_str(), n.model.as_str(), n.idle_animation.as_deref())).collect::<Vec<_>>()
+        );
+        assert!(!announced.is_empty(), "{key} has characters to draw");
+
+        // Two players for scale: Cloud (the local one) beside the first character, and Tifa at the
+        // spot that is farthest on the screen from every character and from Cloud, among the spots
+        // around the characters that the area accepts as they are and that are not much farther
+        // from the camera than Cloud (so she is not tiny).
+        let ring = |npc: Pos| -> Vec<Pos> {
+            [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0), (0.7, 0.7), (-0.7, 0.7), (0.7, -0.7), (-0.7, -0.7)]
+                .iter()
+                .filter_map(|(dx, dy)| {
+                    let want = Pos::new(npc.x + dx * 170.0, npc.y + dy * 170.0, npc.z);
+                    let placed = area.place_arrival(want, None);
+                    (placed.is_finite() && placed.dist_xy(want) < 1.0).then_some(placed)
+                })
+                .collect()
+        };
+        let spawn = area.spawn_points()[0];
+        let own_pos = ring(announced[0].pos).first().copied().unwrap_or(spawn);
+        let depth = |p: Pos| stage.camera.project([f64::from(p.x), f64::from(p.y), f64::from(p.z)]).map_or(f64::MAX, |s| s[2]);
+        let on_screen = |p: Pos| view.to_view(p).map_or((f32::MAX, f32::MAX), |v| (v.x, v.y));
+        let taken: Vec<(f32, f32)> = announced.iter().map(|n| on_screen(n.pos)).chain([on_screen(own_pos)]).collect();
+        let room = |p: Pos| {
+            let (x, y) = on_screen(p);
+            taken.iter().map(|t| (t.0 - x).hypot(t.1 - y)).fold(f32::MAX, f32::min)
+        };
+        let peer_pos = announced
+            .iter()
+            .flat_map(|n| ring(n.pos))
+            .filter(|p| depth(*p) < 1.6 * depth(own_pos))
+            .max_by(|a, b| room(*a).total_cmp(&room(*b)))
+            .unwrap_or(spawn);
+        let forward = {
+            let cams = area.cameras().expect("cameras");
+            let axes = cams[0].axes_f32();
+            [f64::from(axes[2][0]), f64::from(axes[2][1]), f64::from(axes[2][2])]
+        };
+        let toward = toward_camera(forward);
+        let area_id = AreaId { game: GameId::Ff7, key: key.to_string() };
+        let own_tint = [90, 125, 245];
+        let mut state = ClientState::new(EntityId(1), AccountId(1), own_pos, area_id.clone());
+        state.change_area(area_id.clone(), own_pos, toward, false);
+        let entity = |id: u64, pos: Pos, facing: f32, name: &str, look: &str, tint: [u8; 3]| EntitySnapshot {
+            id: EntityId(id),
+            pos,
+            facing,
+            anim: AnimState::Idle,
+            avatar: AvatarAppearance::new(name, tint, Some(look.to_string())),
+        };
+        let snapshot = ServerMsg::AreaSnapshot {
+            area: area_id.clone(),
+            tick: 1,
+            entities: vec![
+                entity(1, own_pos, toward, "Cloud", "ff7/cloud", own_tint),
+                entity(2, peer_pos, toward + 0.9, "Tifa", "ff7/tifa", [235, 80, 80]),
+            ],
+            npcs: announced.clone(),
+        };
+        assert!(state.apply(0.0, snapshot).is_none());
+        let npcs = state.npc_views().to_vec();
+        assert_eq!(npcs.len(), announced.len(), "the client keeps every character it was told of");
+
+        // The window's own composition of the frame, twice: the first call loads the models the
+        // area names (the epoch moved), the second is the steady state.
+        let mut avatars = avatars(&real);
+        let mut epoch = 0;
+        let render_t = 1.0;
+        timed(&format!("{key}: first frame (loads the characters)"), || field_draw(Some(&mut avatars), &mut epoch, &view, &state, own_tint, render_t, 0.0));
+        let draw = timed(&format!("{key}: a frame in the steady state"), || field_draw(Some(&mut avatars), &mut epoch, &view, &state, own_tint, render_t, 0.0));
+        let built = draw.built.as_ref().expect("the models were built");
+        let drawn: Vec<usize> =
+            built.frame.models.iter().enumerate().filter(|(_, m)| m.asset.appearance.appearance_ref == "npc").map(|(i, _)| i).collect();
+        let marker_npcs: Vec<usize> = built.markers.iter().copied().filter(|&i| i < npcs.len()).collect();
+        let culled = npcs.len() - drawn.len() - marker_npcs.len();
+        eprintln!(
+            "{key}: {} announced = {} drawn as models + {} markers {:?} + {culled} culled (behind the camera); {} avatar model(s) in all, {} player(s)",
+            npcs.len(),
+            drawn.len(),
+            marker_npcs.len(),
+            marker_npcs.iter().map(|&i| npcs[i].name.as_str()).collect::<Vec<_>>(),
+            built.frame.models.len(),
+            built.frame.models.len() - drawn.len(),
+        );
+        assert!(!drawn.is_empty(), "{key}: at least one character is a model");
+        assert_eq!(built.frame.models.len() - drawn.len(), 2, "both players are models too");
+
+        // Pixels.
+        let scene = Scene { bounds: view.bounds, triangles: &[], players: &draw.markers, fixture_banner: false, backdrop: view.backdrop.as_ref() };
+        let info = SessionInfo { name: "Cloud".into(), tint: own_tint, area_id: area_id.clone(), fixture: false };
+        let anchor = |subject: Subject, at: Pos| label_anchor(draw.built.as_ref(), &view, draw.own_who, subject, at);
+        let hud_input = hud::gather_anchored(&state, &info, &view, render_t, &anchor);
+        for npc in &npcs {
+            assert!(hud_input.labels.iter().any(|l| l.text == npc.name && l.kind == hud::LabelKind::Npc), "{key}: {} is named", npc.name);
+        }
+        for (w, h, tag) in [(1100u32, 680u32, ""), (1920, 1080, "-1920x1080")] {
+            let mut overlay = DrawList::new();
+            hud::draw_hud(&hud_input, w, h, &mut overlay);
+            let img = timed(&format!("{key}: render {w}x{h}"), || gpu.render_field(w, h, &scene, Some(&built.frame), &overlay));
+            save(&format!("60-npcs-{key}{tag}"), w, h, &img);
+            if w != 1920 {
+                continue;
+            }
+            // Where the feet should be on this screen, from the character's own position and the
+            // field camera, against where its model's lowest vertices are.
+            let cam = Camera::fit(&scene.bounds, w as f32, h as f32, MARGIN_PX);
+            let feet = |p: Pos| {
+                let c = stage.camera.to_camera([f64::from(p.x), f64::from(p.y), f64::from(p.z)]);
+                project_pixel(&cam, built.frame.zoom, w, h, [c[0] as f32, c[1] as f32, c[2] as f32])
+            };
+            let boxes: Vec<(f32, f32, f32, f32)> = drawn.iter().map(|&m| model_bbox(&built.frame, m, &scene, w, h)).collect();
+            let player_heights: Vec<f32> =
+                (0..built.frame.models.len()).filter(|i| !drawn.contains(i)).map(|m| { let b = model_bbox(&built.frame, m, &scene, w, h); b.3 - b.1 }).collect();
+            for (i, npc) in npcs.iter().enumerate() {
+                if marker_npcs.contains(&i) {
+                    continue;
+                }
+                let (fx, fy) = feet(npc.pos);
+                // The model of this character is the one whose bottom centre is nearest to its feet.
+                let Some((n, near)) = boxes
+                    .iter()
+                    .enumerate()
+                    .map(|(n, b)| (n, ((b.0 + b.2) / 2.0 - fx).hypot(b.3 - fy)))
+                    .min_by(|a, b| a.1.total_cmp(&b.1))
+                else {
+                    continue;
+                };
+                let (x0, y0, x1, y1) = boxes[n];
+                // Which way it faces: the heading of the character against the one that looks
+                // at the camera, in degrees (0 = at the camera, 180 = away from it).
+                let mut turn = (npc.facing - toward).to_degrees().rem_euclid(360.0);
+                if turn > 180.0 {
+                    turn -= 360.0;
+                }
+                let anchor_y = built.anchors.get(&npc_who(npc.id)).map(|a| a.y);
+                eprintln!(
+                    "{key}: {} ({}, clip {:?}) at ({:.0}, {:.0}, {:.0}) facing {:.0} deg = {:+.0} deg from the camera heading; feet at pixel ({fx:.0}, {fy:.0}), model box ({x0:.0},{y0:.0})-({x1:.0},{y1:.0}) = {:.0} px tall (players {:?}); label anchor y {:?}; model-to-feet distance {near:.1} px",
+                    npc.name,
+                    npc.model,
+                    npc.idle_animation,
+                    npc.pos.x,
+                    npc.pos.y,
+                    npc.pos.z,
+                    npc.facing.to_degrees(),
+                    turn,
+                    y1 - y0,
+                    player_heights.iter().map(|h| h.round()).collect::<Vec<_>>(),
+                    anchor_y,
+                );
+                // (A humanoid's soles are within a few pixels; a door or the like has its origin
+                // elsewhere. A wrong height would be off by far more than this.)
+                assert!(near < 20.0, "{key}: the feet of {} are on the floor where it stands ({near:.1} px off)", npc.name);
+                assert!(anchor_y.is_some_and(|y| y > view.to_view(npc.pos).map_or(0.0, |p| p.y) + 10.0), "{key}: the name of {} is over its head", npc.name);
+                // A 3x close-up around it.
+                let (cx, cy) = (((x0 + x1) / 2.0) as i64, ((y0 + y1) / 2.0) as i64);
+                let half = (((x1 - x0).max(y1 - y0) / 2.0) as i64 + 20).clamp(40, 300);
+                let (ox, oy) = ((cx - half).clamp(0, i64::from(w) - 2 * half) as u32, (cy - half).clamp(0, i64::from(h) - 2 * half) as u32);
+                let (cw, ch, crop) = zoom_crop(&img, w, ox, oy, 2 * half as u32, 2 * half as u32, 3);
+                save_png(&format!("61-npcs-{key}-closeup-{i}-{}", npc.name), cw, ch, &crop);
+            }
+        }
+    }
 }
 
 /// The pixel rectangle (left, top, right, bottom) that model `model` of `frame` covers in a `w` x
