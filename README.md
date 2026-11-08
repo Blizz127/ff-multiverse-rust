@@ -413,7 +413,8 @@ member's own character progress (see below). A server without
 battle data (the FIXTURE one, or `--ff7-flevel`) refuses every battle request cleanly.
 `scripts/battle-smoke.sh` runs two bots through one real battle on `md1stin` and checks that both
 members acted (the server logs the accepted commands per actor) and were told their inventory, and that each bot replayed the
-battle from its own game files and matched (`verified by replay`, not merely "no divergence").
+battle from its own game files and matched (`verified by replay`, not merely "no divergence"). Its `--commands`
+mode fires every command over real processes (see "Every command over real processes", below).
 
 **Character progress (protocol v5).** Every account has its own progress in the game it plays: the
 character its look names (Cloud unless it chose another look) and that character's level, experience,
@@ -483,7 +484,44 @@ battle**, whatever the outcome (escapes included), in the account's character re
 is made for an account that has never won, so "nothing is written until its first win" now reads "until
 its first win or the first battle that ends with a gauge worth keeping"); records written before v7 load
 with an empty gauge. The headless bot gives its limit when the gauge is full (a healing one only to a
-wounded ally) and never runs.
+wounded ally) and never runs, unless a `--battle-script` tells it to (next paragraph).
+
+**Every command over real processes (`--battle-script`, `--debug-limit-full`).** The headless bots only attack
+(and heal below 30% HP, which the first enemies never bring about) and a limit gauge fills by only a few points
+of 255 in a battle against them, so Magic, Item, Defend, Limit and Escape were verified by in-process tests
+only. Two debug aids close that gap. `fmv-client --headless --battle-auto --battle-script <list>` makes a bot
+give the commands of the list first, in order, one per full ATB gauge, and only then play as before. The
+entries, separated by commas: `attack`, `defend`, `escape`, `limit`, `magic:<spell id>` and `item:<item id>`
+(the game's own ids: Cure is spell 0, Potion is item 0, Phoenix Down is item 7; they were checked against the
+owner's data and the client's name book), for example `--battle-script defend,item:0,magic:0,limit`. An
+offensive spell, item or limit, and `attack`, aim at the first living enemy; a healing spell, item or limit at the
+party member with the least HP left (the bot itself on a tie); a reviving one (Life, Phoenix Down) at a fallen
+member. An entry the character cannot give at that moment (not enough MP, none of the item left, the limit
+gauge not full, a battle that cannot be escaped, nobody fallen) is logged (`battle: script: ... skipped:
+<why>`), counted and skipped for good, and the next entry is tried in the same turn. An entry is used up when
+the server applies (or refuses) it, not when it is sent, so a slow answer cannot make the script lose one; the
+script goes on across battles, and an escape can fail, so list it more than once. The closing
+`headless: battle script: entries=<n> applied=<n> skipped=<n> refused=<n> lost=<n> unused=<n>` line says how it
+went, and the `headless: battles:` line counts what the server applied for the bot's character by kind:
+`(<n> attack, <n> magic, <n> item, <n> defend, <n> limit, <n> escape)`.
+`fmv-server --debug-encounters --debug-limit-full` (the second flag is refused unless the first is given, and is
+logged as a warning when the server starts) makes every member of every battle start with a **full limit
+gauge**, whatever its account's is. It changes only the gauge a battle STARTS with (the `battle started ...
+limits=[255, 255]` line and every replay carry it) and nothing else: the end-of-battle save is the normal one,
+which writes a member's end gauge only when it is not the gauge the battle started with. So a full gauge that
+nobody spends is never stored (the account keeps the gauge it has), and a member that spent its limit, or was
+knocked out, is stored with the lower gauge it ended with, as after any other battle. The server also logs
+every Magic, Defend and Item it applies (`magic used`, `defend used`, `item used`) next to `limit used` and
+`escape tried`.
+`scripts/battle-smoke.sh --commands --build` uses all of it on the real field `md1stin` and owned data: one
+server (with both debug flags) stays up through two runs of the same two bots; in the first they follow
+`defend,item:0,magic:0,limit` and `magic:0,magic:9999,item:0,defend,limit` (spell 9999 does not exist: that entry
+must be skipped and counted) and win, in the second both try `escape` until the battle ends in Escaped (formation
+301 has run difficulty 1; one attempt gets away 68% of the time). It FAILS unless the server applied each of
+magic, item, defend, limit and escape at least once (the bots' breakdowns and the server's own log lines must
+agree), every battle was replayed by each bot from its own battle data with 0 divergences, both battles started
+with `limits=[255, 255]` and the debug gauge was never stored. `FMV_SMOKE_SCRIPT_A`, `FMV_SMOKE_SCRIPT_B` and
+`FMV_SMOKE_ESCAPE_SCRIPT` override the scripts (to try its failure paths).
 
 `md1stin`'s own encounter table (section 6 of the field file, Steam PC build): the first of its
 two 24-byte tables is the enabled one, with rate 128 (a roll succeeds with probability 128/1024)
@@ -581,7 +619,7 @@ crates/                  the Cargo workspace (see the table above)
 scripts/package.sh       build and package a release tarball (and dist/SHA256SUMS)
 scripts/ff-multiverse.sh the launcher entry point shipped in the package (docs/LAUNCHER.md)
 scripts/smoke.sh         two-bot local smoke test
-scripts/battle-smoke.sh  shared-battle smoke test (real data)
+scripts/battle-smoke.sh  shared-battle smoke test (real data; modes --fixture --random --progress --commands)
 scripts/travel-smoke.sh  walking between fields: two bots, md1stin -> md1_1 and back (real data)
 deploy/                  systemd user unit template and deployment procedure
 docs/LAUNCHER.md         the package as an owner-only launcher port: layout, entry point, data dir
