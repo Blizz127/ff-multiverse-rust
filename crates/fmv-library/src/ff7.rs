@@ -242,6 +242,100 @@ pub fn resolve_char_lgp(source: &Ff7Source) -> Result<Option<PathBuf>, Ff7Resolv
     }
 }
 
+/// The logical path of the set's battle model archive (`battle/battle.lgp`: the enemy, battle
+/// location and playable character models and their animations), found by the same rule as
+/// [`flevel_logical_path`] (the Steam language directory, the classic layout, a lone file).
+fn battle_lgp_logical_path(m: &Manifest) -> Option<String> {
+    let language = m.provenance.language.to_ascii_lowercase();
+    battle_logical_path(
+        m,
+        &[
+            format!("data/lang-{language}/battle/battle.lgp"),
+            "data/battle/battle.lgp".to_string(),
+        ],
+        "battle.lgp",
+    )
+}
+
+/// The entry of `dir` named `name` in any letter case (the first in name order), a directory when
+/// `want_dir` and a file otherwise. Installs differ in the case of their folder and file names.
+fn child_ignoring_case(dir: &Path, name: &str, want_dir: bool) -> Option<PathBuf> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().eq_ignore_ascii_case(name))
+        .map(|e| e.path())
+        .filter(|p| if want_dir { p.is_dir() } else { p.is_file() })
+        .collect();
+    // Several spellings next to each other: pick the same one every time.
+    found.sort();
+    found.into_iter().next()
+}
+
+/// A directory path that can be listed: the empty path (a relative path's missing parent) is `.`.
+fn or_here(p: &Path) -> PathBuf {
+    if p.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        p.to_path_buf()
+    }
+}
+
+/// The `battle.lgp` of the install a `flevel.lgp` sits in: `field/flevel.lgp` and
+/// `battle/battle.lgp` are sibling folders (of the install's `data` directory), and for a
+/// `lang-xx/field/flevel.lgp` the language folder's own `battle/` is tried first, then the one
+/// above it.
+fn battle_lgp_beside_install(flevel: &Path) -> Option<PathBuf> {
+    let field_dir = flevel.parent().filter(|p| !p.as_os_str().is_empty())?;
+    let install = field_dir.parent()?;
+    let mut roots = vec![or_here(install)];
+    let is_language_dir = install
+        .file_name()
+        .is_some_and(|n| n.to_string_lossy().to_ascii_lowercase().starts_with("lang-"));
+    if is_language_dir {
+        if let Some(up) = install.parent() {
+            roots.push(or_here(up));
+        }
+    }
+    roots.into_iter().find_map(|root| {
+        let battle = child_ignoring_case(&root, "battle", true)?;
+        child_ignoring_case(&battle, "battle.lgp", false)
+    })
+}
+
+/// Find the battle model archive (`battle.lgp`) that belongs with the field archive
+/// [`resolve_flevel`] finds for `source`, read-only; `Ok(None)` when there is none.
+///
+/// A client draws battles with the models in that archive and has none to draw without it, so a
+/// missing archive is not an error here. A library set is chosen by exactly the rules of
+/// [`resolve_library_flevel`] (call it with the same `source`, and both read the same set; a wrong
+/// or ambiguous set is the same error). A direct `flevel.lgp` has the archive when its install has
+/// one in the layout `field/flevel.lgp` + `battle/battle.lgp` (folder and file names in any letter
+/// case; for a `lang-xx/field/flevel.lgp` also the language folder's own `battle/`): **not** a
+/// sibling file as `char.lgp` is, because `battle.lgp` lives in another folder of the install. Like
+/// `char.lgp` it is presentation only (decoded on this machine, never sent over the network, part
+/// of no fingerprint), unlike the battle *data* files of [`resolve_battle_files`], which a direct
+/// `flevel.lgp` cannot supply.
+pub fn resolve_battle_lgp(source: &Ff7Source) -> Result<Option<PathBuf>, Ff7ResolveError> {
+    match source {
+        Ff7Source::Library { state_dir, set } => {
+            let dir = resolve_state_dir(state_dir.as_deref())?;
+            let lib = Library::open_existing(&dir).map_err(|e| match e {
+                LibraryError::NoLibrary(_) => Ff7ResolveError::NoLibrary {
+                    dir: dir.display().to_string(),
+                },
+                other => Ff7ResolveError::Library(other),
+            })?;
+            let (set_id, manifest) = pick_set(&lib, set.as_deref())?;
+            match battle_lgp_logical_path(&manifest) {
+                Some(logical) => Ok(lib.get(&set_id, &logical)?),
+                None => Ok(None),
+            }
+        }
+        Ff7Source::Flevel { path, .. } => Ok(battle_lgp_beside_install(path)),
+    }
+}
+
 /// Find the `flevel.lgp` of an imported library set and its provenance. `state_dir` of `None`
 /// is the default state directory; `set` of `None` is the only FF7 PC set. Opens the library
 /// read-only (nothing is created or written).
@@ -849,5 +943,115 @@ mod tests {
         let err = resolve_battle_files(&Ff7Source::Flevel { path: "/x/flevel.lgp".into(), labels: Ff7Labels::default() }).unwrap_err();
         assert!(matches!(err, Ff7ResolveError::BattleNeedsLibrary), "{err}");
         assert!(err.to_string().contains("library"), "{err}");
+    }
+
+    #[test]
+    fn the_battle_model_archive_comes_from_the_same_set_by_the_same_layout_rules() {
+        let scratch = tempfile::tempdir().unwrap();
+        // The Steam language directory wins over the classic layout, as for the field archive.
+        let state = tempfile::tempdir().unwrap();
+        let lib = Library::open(state.path()).unwrap();
+        make_set(
+            &lib,
+            provenance("Steam", "en"),
+            &[
+                ("data/field/flevel.lgp", b"field"),
+                ("data/battle/battle.lgp", b"classic-battle"),
+                ("data/lang-en/battle/battle.lgp", b"steam-battle"),
+                ("data/battle/scene.bin", b"not the model archive"),
+            ],
+            scratch.path(),
+        );
+        let found = resolve_battle_lgp(&lib_source(state.path(), None)).unwrap().expect("a battle.lgp");
+        assert_eq!(fs::read(found).unwrap(), b"steam-battle");
+
+        // The classic layout, and a lone battle.lgp anywhere else, are found too (the real Steam
+        // library keeps it in `data/battle/`).
+        for (logical, body) in [("data/battle/battle.lgp", &b"classic"[..]), ("data/odd/place/battle.lgp", &b"odd"[..])] {
+            let state = tempfile::tempdir().unwrap();
+            let lib = Library::open(state.path()).unwrap();
+            make_set(&lib, provenance("PC 1998", "en"), &[("data/field/flevel.lgp", b"f"), (logical, body)], scratch.path());
+            let found = resolve_battle_lgp(&lib_source(state.path(), None)).unwrap().expect("a battle.lgp");
+            assert_eq!(fs::read(found).unwrap(), body, "{logical}");
+        }
+
+        // Two of them and no preferred place: never guessed, so no archive.
+        let state = tempfile::tempdir().unwrap();
+        let lib = Library::open(state.path()).unwrap();
+        make_set(
+            &lib,
+            provenance("PC 1998", "en"),
+            &[("data/field/flevel.lgp", b"f"), ("data/a/battle.lgp", b"a"), ("data/b/battle.lgp", b"b")],
+            scratch.path(),
+        );
+        assert_eq!(resolve_battle_lgp(&lib_source(state.path(), None)).unwrap(), None);
+
+        // A set without one has none (not an error); the set choice and the missing-library error
+        // are the field archive's.
+        let state = tempfile::tempdir().unwrap();
+        let lib = Library::open(state.path()).unwrap();
+        let id = make_set(&lib, provenance("Steam", "en"), &[("data/field/flevel.lgp", b"field")], scratch.path());
+        assert_eq!(resolve_battle_lgp(&lib_source(state.path(), None)).unwrap(), None);
+        assert_eq!(resolve_battle_lgp(&lib_source(state.path(), Some(&id))).unwrap(), None);
+        let other = make_set(
+            &lib,
+            provenance("PC 1998", "en"),
+            &[("data/field/flevel.lgp", b"f2"), ("data/battle/battle.lgp", b"other-battle")],
+            scratch.path(),
+        );
+        let err = resolve_battle_lgp(&lib_source(state.path(), None)).unwrap_err();
+        assert!(matches!(err, Ff7ResolveError::AmbiguousSet(_)), "{err}");
+        let found = resolve_battle_lgp(&lib_source(state.path(), Some(&other))).unwrap().expect("battle.lgp");
+        assert_eq!(fs::read(found).unwrap(), b"other-battle");
+        assert_eq!(resolve_battle_lgp(&lib_source(state.path(), Some(&id))).unwrap(), None);
+        let empty = tempfile::tempdir().unwrap();
+        let err = resolve_battle_lgp(&lib_source(empty.path(), None)).unwrap_err();
+        assert!(matches!(err, Ff7ResolveError::NoLibrary { .. }), "{err}");
+        assert!(fs::read_dir(empty.path()).unwrap().next().is_none(), "nothing is created");
+    }
+
+    #[test]
+    fn a_direct_flevel_finds_the_battle_archive_in_its_installs_battle_folder_not_beside_it() {
+        let source = |path: &Path| Ff7Source::Flevel { path: path.to_path_buf(), labels: Ff7Labels::default() };
+        let install = tempfile::tempdir().unwrap();
+        let data = install.path().join("data");
+        fs::create_dir_all(data.join("field")).unwrap();
+        let flevel = data.join("field").join("flevel.lgp");
+        fs::write(&flevel, b"field").unwrap();
+        assert_eq!(resolve_battle_lgp(&source(&flevel)).unwrap(), None, "no battle folder");
+
+        // A battle.lgp *beside* the flevel is not the model archive's place.
+        fs::write(data.join("field").join("battle.lgp"), b"beside").unwrap();
+        assert_eq!(resolve_battle_lgp(&source(&flevel)).unwrap(), None);
+
+        // `data/battle/battle.lgp`, in any case for the folder and the file; a directory of the file's name does not count.
+        fs::create_dir_all(data.join("Battle").join("battle.lgp")).unwrap();
+        assert_eq!(resolve_battle_lgp(&source(&flevel)).unwrap(), None);
+        fs::write(data.join("Battle").join("BATTLE.LGP"), b"models").unwrap();
+        let found = resolve_battle_lgp(&source(&flevel)).unwrap().expect("install layout");
+        assert_eq!(fs::read(found).unwrap(), b"models");
+
+        // A language directory's field folder: its own battle folder first, then the one above.
+        let steam = tempfile::tempdir().unwrap();
+        let lang_field = steam.path().join("data").join("lang-en").join("field");
+        fs::create_dir_all(&lang_field).unwrap();
+        let lang_flevel = lang_field.join("flevel.lgp");
+        fs::write(&lang_flevel, b"field").unwrap();
+        assert_eq!(resolve_battle_lgp(&source(&lang_flevel)).unwrap(), None);
+        fs::create_dir_all(steam.path().join("data").join("battle")).unwrap();
+        fs::write(steam.path().join("data").join("battle").join("battle.lgp"), b"above").unwrap();
+        let found = resolve_battle_lgp(&source(&lang_flevel)).unwrap().expect("the data folder's battle");
+        assert_eq!(fs::read(found).unwrap(), b"above");
+        fs::create_dir_all(steam.path().join("data").join("lang-en").join("battle")).unwrap();
+        fs::write(steam.path().join("data").join("lang-en").join("battle").join("battle.lgp"), b"own").unwrap();
+        let found = resolve_battle_lgp(&source(&lang_flevel)).unwrap().expect("the language folder's battle");
+        assert_eq!(fs::read(found).unwrap(), b"own");
+
+        // A path without a directory, one without an install above it, or one that is not there:
+        // no archive, no error.
+        assert_eq!(resolve_battle_lgp(&source(Path::new("flevel.lgp"))).unwrap(), None);
+        assert_eq!(resolve_battle_lgp(&source(Path::new("/flevel.lgp"))).unwrap(), None);
+        assert_eq!(resolve_battle_lgp(&source(Path::new("field/flevel.lgp"))).unwrap(), None);
+        assert_eq!(resolve_battle_lgp(&source(Path::new("/definitely/not/here/field/flevel.lgp"))).unwrap(), None);
     }
 }

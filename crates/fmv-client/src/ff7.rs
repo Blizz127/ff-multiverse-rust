@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use fmv_adapter_api::{AdapterError, AreaInfo, AreaRuntime, GameAdapter};
 use fmv_core::GameId;
 use fmv_ff7::Ff7Adapter;
-pub use fmv_library::ff7::{resolve_char_lgp, resolve_flevel, Ff7Labels, Ff7ResolveError, Ff7Source};
+pub use fmv_library::ff7::{resolve_battle_lgp, resolve_char_lgp, resolve_flevel, Ff7Labels, Ff7ResolveError, Ff7Source};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Ff7OpenError {
@@ -59,6 +59,20 @@ pub fn open_ff7(source: &Ff7Source) -> Result<OpenedFf7, Ff7OpenError> {
     );
     // The window, several layers away, finds it again here (see `avatar::source`).
     crate::avatar::source::remember(char_lgp);
+    // The battle models likewise (the same library set again); without them the battle scene draws
+    // its stand-ins (see `battle::scene::model`).
+    let battle_lgp = match resolve_battle_lgp(source) {
+        Ok(found) => found,
+        Err(e) => {
+            eprintln!("FF7: no battle models ({e}); battles are drawn with stand-ins");
+            None
+        }
+    };
+    eprintln!(
+        "FF7: battle models: {}",
+        if battle_lgp.is_some() { "this machine's own battle.lgp found" } else { "no battle.lgp (battles are drawn with stand-ins)" }
+    );
+    crate::battle::scene::model::remember_battle_lgp(battle_lgp);
     Ok(OpenedFf7 { adapter: Arc::new(adapter), origin: resolved.origin })
 }
 

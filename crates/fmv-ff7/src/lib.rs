@@ -48,6 +48,12 @@
 //! * [`playable`] - the stable appearance ids (`ff7/cloud`, ...) and which skeleton and
 //!   animations each means ([`resolve_appearance`]).
 //!
+//! Battle models (from `battle/battle.lgp`, verified on the same owned edition):
+//!
+//! * [`battle_model`] - enemies, battle locations and the playable characters' battle models,
+//!   with their bit-packed animations, as the same [`FieldModel`] and [`FieldAnimation`] types the
+//!   field characters use (`BattleModels::load_enemy` / `load_location` / `load_character`).
+//!
 //! # Wiring notes for the integrator
 //!
 //! * Call [`Ff7Adapter::prewarm`] on a blocking thread (for example `spawn_blocking`) before
@@ -85,6 +91,7 @@
 pub mod anim;
 pub mod area;
 pub mod background;
+pub mod battle_model;
 pub mod field;
 pub mod hrc;
 pub mod lgp;

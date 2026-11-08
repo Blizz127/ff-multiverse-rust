@@ -18,20 +18,23 @@
 //!   model cannot be had.
 //!
 //! WHICH model an actor gets is a [`BattleModelSource`]'s decision ([`StandInModels`] says Field for
-//! the party and Box for the enemies, and has no location). Swapping real models in is a new source
-//! that returns [`BattleActorModel::battle`] for them (and for the battle's location, which is drawn
-//! behind everyone), handed to [`ModelKit::new`]: nothing else changes.
+//! the party and Box for the enemies, and has no location; [`ArchiveModels`] says the real battle
+//! models of this machine's own `battle.lgp` and falls back to the stand-ins for whoever's it cannot
+//! have). The source is handed to [`ModelKit::new`]; the window's kit is made by
+//! [`ModelKit::from_local_content`] (called by [`super::scene_for`]), which uses the archive when the
+//! client found one ([`remember_battle_lgp`], called where `char.lgp` is found too).
 //!
-//! # Plugging in the battle archive
+//! # The battle archive
 //!
-//! A source over the battle archive's loader (`fmv_ff7::battle_model::BattleModels`) answers
-//! [`BattleModelSource::enemy`] with `load_enemy(who.enemy_id?)` as [`BattleActorModel::battle`] (its
-//! `model` and its `animations`, slot 0 being the idle loop; scale 1, native `y` down, facing `-z`,
-//! as the archive's models are), [`BattleModelSource::party_member`] with `load_character(..)` the same
-//! way with its weapons as [`Attachment`]s (clip `i` of a weapon goes with clip `i` of its owner), and
-//! [`BattleModelSource::location`] with `load_location(..)`. [`ModelKit::new`] takes that source (and
-//! the field characters' loader, for whoever it leaves to [`StandInModels`]); the one place the
-//! window makes its kit is [`super::scene_for`]. Nothing else of the scene changes.
+//! [`ArchiveModels`] is a source over `fmv_ff7::battle_model::BattleModels`. It answers
+//! [`BattleModelSource::enemy`] with `load_enemy(who.enemy_id?)` as a [`BattleActorModel::Battle`] (the
+//! loader's `model` and `animations`, slot 0 being the idle loop; scale 1, native `y` down, facing
+//! `-z`, as the archive's models are), [`BattleModelSource::party_member`] with `load_character(..)`
+//! the same way (the character the player's look names, else the one the engine fights as, else
+//! Cloud: see [`battle_character`]), both with weapon 0 as an [`Attachment`] whose clips are the
+//! weapon's tracks (track `i` goes with clip `i` of its owner; enemies carry weapons too: the MP's
+//! baton), and [`BattleModelSource::location`] with `load_location(..)`. Each distinct model is read
+//! once, however many actors share it.
 //!
 //! [`Rigs`] turns a model into an [`ActorRig`] (its [`AvatarAsset`] for the GPU, its idle clip, its
 //! size) once and shares it between actors that look alike, so each distinct model is uploaded
@@ -39,12 +42,14 @@
 
 use crate::avatar::library::{AvatarAsset, AvatarLibrary};
 use crate::avatar::source::{CharacterLoader, LgpLoader, NON_PLAYABLE};
+use fmv_ff7::battle_model::{BattleCharacter, BattleModel, BattleModelError, BattleModels};
 use fmv_ff7::model::ModelBone;
 use fmv_ff7::playable::Character;
 use fmv_ff7::{FieldAnimation, FieldModel, MeshPart, PartBlend};
 use fmv_ff7_battle::rules::ActorId;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 /// Battle units per field-model unit for a field model standing in for a party member: Cloud's field
 /// model is 33.2 units tall, so this makes him about 1 200 battle units, a bit more than half as
@@ -67,7 +72,6 @@ pub struct Attachment {
 }
 
 impl Attachment {
-    #[allow(dead_code)] // the seam real models plug into; nothing loads them yet
     pub fn new(key: impl Into<String>, model: FieldModel, clips: Vec<FieldAnimation>) -> Self {
         Self { key: key.into(), model: Arc::new(model), clips: Arc::new(clips) }
     }
@@ -96,7 +100,6 @@ impl BattleModelData {
     }
 
     /// This model with `attachment` riding along.
-    #[allow(dead_code)] // the seam real models plug into; nothing loads them yet
     pub fn with_attachment(mut self, attachment: Attachment) -> Self {
         self.attachments.push(attachment);
         self
@@ -160,8 +163,9 @@ pub enum BattleActorModel {
 
 impl BattleActorModel {
     /// A real battle model from its skeleton, meshes and clips (`clips[0]` the idle loop), at
-    /// battle scale 1: the entry point for a battle-archive loader.
-    #[allow(dead_code)] // the seam real models plug into; nothing loads them yet
+    /// battle scale 1: for a model without weapons (the archive's source builds the
+    /// [`BattleModelData`] itself, to attach the weapon).
+    #[allow(dead_code)] // used by the tests
     pub fn battle(key: impl Into<String>, model: FieldModel, clips: Vec<FieldAnimation>) -> Self {
         Self::Battle(BattleModelData::new(key, model, clips))
     }
@@ -250,6 +254,127 @@ impl BattleModelSource for StandInModels {
 
     fn enemy(&mut self, who: &EnemyLook) -> BattleActorModel {
         BattleActorModel::Box(BoxSpec::for_enemy(kind_of(who), who.max_hp))
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The battle archive
+// ---------------------------------------------------------------------------------------------
+
+static REMEMBERED_BATTLE_LGP: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Remember where this machine's `battle.lgp` is (`None`: it has none, so battles are drawn with
+/// stand-ins). [`open_ff7`](crate::ff7::open_ff7) calls it where it finds `char.lgp` (from the same
+/// library set); a later call replaces the earlier one. Only [`ModelKit::from_local_content`] reads
+/// it: the source and the tests take the location (or a stand-in) explicitly.
+pub fn remember_battle_lgp(path: Option<PathBuf>) {
+    if let Ok(mut slot) = REMEMBERED_BATTLE_LGP.lock() {
+        *slot = path;
+    }
+}
+
+/// The location [`remember_battle_lgp`] was given, if any.
+fn remembered_battle_lgp() -> Option<PathBuf> {
+    REMEMBERED_BATTLE_LGP.lock().ok().and_then(|slot| slot.clone())
+}
+
+/// The playable character whose battle model a party member gets: the player's own look when the
+/// table of playable characters knows it, else the character the engine fights as (FF7's ids:
+/// Cloud 0, Barret 1, Tifa 2, Aerith 3, Red XIII 4, Yuffie 5, Cait Sith 6, Vincent 7, Cid 8), else
+/// Cloud. The same order as [`party_appearance`] (a look is only taken from the table, never as
+/// free text), except that Cait Sith, who has no field model, has a battle model.
+pub fn battle_character(look: Option<&str>, character: u8) -> BattleCharacter {
+    let (known, stand_in) = AvatarLibrary::resolve(look);
+    if look.is_some() && !stand_in {
+        if let Some(chosen) = BattleCharacter::from_appearance_ref(known.appearance_ref) {
+            return chosen;
+        }
+    }
+    match character {
+        0 => BattleCharacter::Cloud,
+        1 => BattleCharacter::Barret,
+        2 => BattleCharacter::Tifa,
+        3 => BattleCharacter::Aerith,
+        4 => BattleCharacter::RedXiii,
+        5 => BattleCharacter::Yuffie,
+        6 => BattleCharacter::CaitSith,
+        7 => BattleCharacter::Vincent,
+        8 => BattleCharacter::Cid,
+        _ => BattleCharacter::Cloud,
+    }
+}
+
+/// The real battle models of this machine's own `battle.lgp` (see the module docs). A model that
+/// cannot be had (the archive has no such enemy, the file is damaged) is the stand-in's answer for
+/// that actor, reported once on stderr and never asked for again.
+pub struct ArchiveModels {
+    models: BattleModels,
+    /// The models made so far by key (the model's prefix): `None` for one that could not be had.
+    made: HashMap<String, Option<BattleModelData>>,
+}
+
+impl ArchiveModels {
+    /// Open `battle.lgp` (read-only).
+    pub fn open(path: &Path) -> Result<Self, String> {
+        Ok(Self { models: BattleModels::open(path).map_err(|e| e.to_string())?, made: HashMap::new() })
+    }
+
+    /// A loaded model as the scene's data: its clips, and weapon 0 with the weapon's tracks as an
+    /// attachment (track `i` goes with clip `i`). Keyed by the model's prefix.
+    fn data_of(loaded: BattleModel) -> BattleModelData {
+        let key = loaded.prefix.clone();
+        let mut data = BattleModelData::new(key.clone(), loaded.model, loaded.animations);
+        if let Some(weapon) = loaded.weapons.into_iter().next() {
+            if !loaded.weapon_tracks.is_empty() {
+                data = data.with_attachment(Attachment::new(format!("{key}ck"), weapon, loaded.weapon_tracks));
+            }
+        }
+        data
+    }
+
+    /// The model under `key`, made by `load` on first use (a failure is reported, with `what`
+    /// naming it, and remembered).
+    fn made(
+        &mut self,
+        key: String,
+        what: impl FnOnce() -> String,
+        load: impl FnOnce(&mut BattleModels) -> Result<BattleModel, BattleModelError>,
+    ) -> Option<BattleModelData> {
+        self.made
+            .entry(key)
+            .or_insert_with(|| match load(&mut self.models) {
+                Ok(model) => Some(Self::data_of(model)),
+                Err(why) => {
+                    eprintln!("battle: cannot load the model of {} ({why}); a stand-in is drawn", what());
+                    None
+                }
+            })
+            .clone()
+    }
+}
+
+impl BattleModelSource for ArchiveModels {
+    fn party_member(&mut self, who: &PartyLook) -> BattleActorModel {
+        let which = battle_character(who.look.as_deref(), who.character);
+        match self.made(which.prefix().to_string(), || which.display_name().to_string(), |m| m.load_character(which)) {
+            Some(data) => BattleActorModel::Battle(data),
+            None => StandInModels.party_member(who),
+        }
+    }
+
+    fn enemy(&mut self, who: &EnemyLook) -> BattleActorModel {
+        let Some(id) = who.enemy_id else { return StandInModels.enemy(who) };
+        // An enemy id that names no enemy model of this archive is a box, quietly.
+        let Some(prefix) = self.models.enemy_prefix(id) else { return StandInModels.enemy(who) };
+        match self.made(prefix, || format!("enemy {id}"), |m| m.load_enemy(id)) {
+            Some(data) => BattleActorModel::Battle(data),
+            None => StandInModels.enemy(who),
+        }
+    }
+
+    fn location(&mut self, location: u16) -> Option<BattleActorModel> {
+        let prefix = self.models.location_prefix(location)?;
+        self.made(prefix, || format!("battle location {location}"), |m| m.load_location(location)).map(BattleActorModel::Battle)
     }
 }
 
@@ -407,6 +532,34 @@ fn radius_of(asset: &AvatarAsset, scale: f32) -> f32 {
     }
 }
 
+/// Half the width of the main mass of a real battle model's idle pose, in battle units after
+/// `scale`: the 90th percentile of its vertices' horizontal distance from the model's own axis, so a
+/// hound's long tail or a serpent's neck does not give it a shadow (and a stand-off distance) twice
+/// its body. Never more than [`radius_of`]'s widest extent and never less than half of it.
+fn body_radius_of(asset: &AvatarAsset, scale: f32) -> f32 {
+    let widest = radius_of(asset, scale);
+    let Some(pose) = asset.character.pose(fmv_core::AnimState::Idle, 0) else { return widest };
+    let mesh = &asset.mesh;
+    let mut distances: Vec<f32> = Vec::with_capacity(mesh.positions.len());
+    for run in &mesh.bone_runs {
+        let (Some(bone), Some(vertices)) = (pose.get(run.bone), mesh.positions.get(run.start..run.start + run.len)) else { continue };
+        distances.extend(vertices.iter().map(|&p| {
+            let at = fmv_ff7::model::transform_point(bone, p);
+            at[0].hypot(at[2])
+        }));
+    }
+    if !widest.is_finite() || distances.is_empty() {
+        return widest;
+    }
+    distances.sort_by(f32::total_cmp);
+    let p90 = distances.get(distances.len() * 9 / 10).copied().unwrap_or(0.0) * scale;
+    if p90.is_finite() {
+        p90.clamp(widest * 0.5, widest)
+    } else {
+        widest
+    }
+}
+
 /// The drawable asset of a model and its clips, if every clip fits its skeleton. The asset's
 /// character has the model's first three clips (the avatar mesh wants three).
 fn battle_asset(model: &Arc<FieldModel>, clips: &Arc<Vec<FieldAnimation>>) -> Option<Arc<AvatarAsset>> {
@@ -508,7 +661,7 @@ impl Rigs {
         let rig = Arc::new(ActorRig {
             clips: Arc::clone(&battle.clips),
             height: asset.height_units * battle.scale,
-            radius: radius_of(&asset, battle.scale),
+            radius: body_radius_of(&asset, battle.scale),
             scale: battle.scale,
             procedural_idle: battle.clips.first().is_some_and(|c| c.frame_count() <= 1),
             fps: if battle.fps.is_finite() && battle.fps > 0.0 { battle.fps } else { BATTLE_CLIP_FPS },
@@ -542,11 +695,23 @@ impl ModelKit {
         Self { source, rigs: Rigs::new(loader) }
     }
 
-    /// The stand-ins ([`StandInModels`]) over this machine's own `char.lgp`, if it has one (see
-    /// [`crate::avatar::source`]); boxes for everyone without.
+    /// The models of this machine's own archives: the real battle models of its `battle.lgp` when
+    /// the client found one ([`remember_battle_lgp`]), the stand-ins ([`StandInModels`]) otherwise;
+    /// the field characters come from its `char.lgp` if it has one (see [`crate::avatar::source`]),
+    /// boxes for everyone without.
     pub fn from_local_content() -> Self {
         let loader = crate::avatar::source::remembered().map(|path| Box::new(LgpLoader::new(path)) as Box<dyn CharacterLoader>);
-        Self::new(Box::new(StandInModels), loader)
+        let source: Box<dyn BattleModelSource> = match remembered_battle_lgp() {
+            Some(path) => match ArchiveModels::open(&path) {
+                Ok(models) => Box::new(models),
+                Err(why) => {
+                    eprintln!("battle: cannot open battle.lgp ({why}); stand-ins are drawn");
+                    Box::new(StandInModels)
+                }
+            },
+            None => Box::new(StandInModels),
+        };
+        Self::new(source, loader)
     }
 }
 
@@ -794,3 +959,6 @@ mod tests {
         assert_eq!(rigs.resolve(&BattleActorModel::Battle(odd), fallback).fps, BATTLE_CLIP_FPS);
     }
 }
+
+#[cfg(test)]
+mod archive_tests;
