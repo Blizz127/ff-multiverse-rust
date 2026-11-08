@@ -494,11 +494,13 @@ fn a_scene_is_made_for_a_battle_kept_while_it_is_seen_and_rebuilt_for_the_next()
     // Seen again: the same scene (the scene clock moved on), not a new one.
     scene_for(&mut slot, &mut kit_slot, &s, &view, 2.5, &[]).unwrap();
     assert_eq!(slot.as_ref().unwrap().now, 2.5);
-    // The battle ended (nobody has a view of it, but the window still shows a lingering one): the
-    // same scene goes on, with what is left of the events.
+    // The battle ended: the client is out of it (no start, no engine) but the window still gets a
+    // lingering view with the end panel, and the same scene goes on with it, playing what is left.
     s.apply(3.0, ServerMsg::BattleEnd { battle_id: BattleId(4), outcome: fmv_protocol::battle::Outcome::Defeat, rewards: vec![] });
-    assert!(s.battle.scene_start().is_none() && s.battle.engine().is_none());
-    let scene = scene_for(&mut slot, &mut kit_slot, &s, &view, 3.5, &[BattleEvent::Defeat]).expect("the lingering view keeps its scene");
+    assert!(s.battle.scene_start().is_none() && s.battle.engine().is_none() && !s.battle.in_battle());
+    let lingering = s.battle.view(3.5).expect("the view lingers after the end");
+    assert!(lingering.finale.is_some() && lingering.id == BattleId(4));
+    let scene = scene_for(&mut slot, &mut kit_slot, &s, &lingering, 3.5, &[BattleEvent::Defeat]).expect("the lingering view keeps its scene");
     assert_eq!(scene.now, 3.5);
     // Another battle: another scene.
     s.apply(

@@ -22,6 +22,17 @@
 //! that returns [`BattleActorModel::battle`] for them (and for the battle's location, which is drawn
 //! behind everyone), handed to [`ModelKit::new`]: nothing else changes.
 //!
+//! # Plugging in the battle archive
+//!
+//! A source over the battle archive's loader (`fmv_ff7::battle_model::BattleModels`) answers
+//! [`BattleModelSource::enemy`] with `load_enemy(who.enemy_id?)` as [`BattleActorModel::battle`] (its
+//! `model` and its `animations`, slot 0 being the idle loop; scale 1, native `y` down, facing `-z`,
+//! as the archive's models are), [`BattleModelSource::party_member`] with `load_character(..)` the same
+//! way with its weapons as [`Attachment`]s (clip `i` of a weapon goes with clip `i` of its owner), and
+//! [`BattleModelSource::location`] with `load_location(..)`. [`ModelKit::new`] takes that source (and
+//! the field characters' loader, for whoever it leaves to [`StandInModels`]); the one place the
+//! window makes its kit is [`super::scene_for`]. Nothing else of the scene changes.
+//!
 //! [`Rigs`] turns a model into an [`ActorRig`] (its [`AvatarAsset`] for the GPU, its idle clip, its
 //! size) once and shares it between actors that look alike, so each distinct model is uploaded
 //! once however many stand in the battle, and never per frame.
