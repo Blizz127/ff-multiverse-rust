@@ -16,3 +16,7 @@
 /PROJECT-BRIEF.md
 /PROJECT-METADATA.json
 /DEPLOYMENT-CONTRACT.md
+# Release packaging output (scripts/package.sh). Built archives are never committed.
+/dist/
+# Local deployment env files can hold real host/port values; only placeholder templates are committed.
+/deploy/*.env
