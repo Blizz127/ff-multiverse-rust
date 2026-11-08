@@ -1,0 +1,16 @@
+[package]
+name = "fmv-ff7-battle"
+description = "FF7 battle data decoding (scene.bin, kernel.bin, kernel2.bin) and a deterministic, server-authoritative battle rules engine. Reads owned data only."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+# gzip (scene.bin scenes, kernel.bin sections). Not in the workspace table; cached version used offline.
+flate2 = "1.1"
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
