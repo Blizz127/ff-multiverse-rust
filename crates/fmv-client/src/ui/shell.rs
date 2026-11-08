@@ -315,9 +315,13 @@ impl Shell {
             eprintln!("account: logged in with the saved token for \"{}\"", clean(&account.name));
         }
         self.launch.looks.remember_joined(&self.launch.server, plan.name(), &joined.entities, joined.entity);
-        let session = Session::new(net, joined);
+        let mut session = Session::new(net, joined);
+        if let Some(adapter) = &self.launch.ff7 {
+            // This machine's own FF7 data lets the session follow the server to other areas.
+            session = session.with_content(adapter.clone());
+        }
         let view = crate::field_view(self.launch.ff7.as_deref(), &session);
-        App::new(session, view)
+        App::new(session, view).with_ff7(self.launch.ff7.clone())
     }
 
     fn tick(&mut self, el: &ActiveEventLoop) {

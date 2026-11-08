@@ -24,6 +24,7 @@ mod headless;
 mod interp;
 mod login;
 mod net;
+mod npc;
 mod party;
 mod render;
 mod session;
@@ -282,12 +283,16 @@ fn run(args: Args) -> u8 {
         ui::looks::LookCache::new(&state_dir).remember_joined(&args.server, plan.name(), &joined.entities, joined.entity);
     }
 
-    let session = Session::new(net, joined);
+    let mut session = Session::new(net, joined);
+    if let Some(adapter) = &ff7 {
+        // This machine's own FF7 data is what lets the session follow the server to other areas.
+        session = session.with_content(adapter.clone());
+    }
     match event_loop {
         None => headless::run(&args, session),
         Some(el) => {
             let view = field_view(ff7.as_deref(), &session);
-            window::run(el, session, view)
+            window::run(el, session, view, ff7)
         }
     }
 }

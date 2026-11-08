@@ -201,12 +201,34 @@ impl PartyCommand {
     }
 }
 
+/// The client's answer to an `AreaChange` (the server moves the player to another area): it holds
+/// that area locally (`JoinArea`, with its OWN path-free provenance) or does not (`CannotJoin`, and
+/// the server sends the player back).
+#[derive(Debug, Clone, PartialEq)]
+pub enum AreaAnswer {
+    Join { area: AreaId, fingerprint: Fingerprint, provenance: ProvenanceSummary },
+    /// `reason` is path-free text (see [`ContentMismatch::wire`]).
+    Cannot { area: AreaId, reason: String },
+}
+
+impl AreaAnswer {
+    /// The message that carries this answer.
+    pub fn to_msg(self) -> ClientMsg {
+        match self {
+            AreaAnswer::Join { area, fingerprint, provenance } => ClientMsg::JoinArea { area, fingerprint, provenance },
+            AreaAnswer::Cannot { area, reason } => ClientMsg::CannotJoin { area, reason },
+        }
+    }
+}
+
 /// Messages from the game loop to the network thread.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum NetCommand {
     Intent(Intent),
     Party(PartyCommand),
     Battle(BattleCmd),
+    /// The answer to an `AreaChange`.
+    Area(AreaAnswer),
     Leave,
 }
 
@@ -535,7 +557,7 @@ where
                     }
                 }
             }
-            ServerMsg::AreaSnapshot { area, tick, entities } => {
+            ServerMsg::AreaSnapshot { area, tick, entities, npcs } => {
                 let Some(o) = &offer else {
                     return Err(NetError::Protocol("AreaSnapshot before AreaManifest".into()));
                 };
@@ -549,7 +571,12 @@ where
                 if snapshot.is_none() {
                     snapshot = Some(entities.clone());
                 }
-                push_backlog(&mut backlog, ServerMsg::AreaSnapshot { area, tick, entities });
+                push_backlog(&mut backlog, ServerMsg::AreaSnapshot { area, tick, entities, npcs });
+            }
+            // A transfer between areas is something that happens in the game, never in the
+            // handshake: honouring one here would skip the checks of the first area.
+            ServerMsg::AreaChange { .. } => {
+                return Err(NetError::Protocol("AreaChange during the handshake".into()));
             }
             ServerMsg::Pong { .. } => {}
             other @ (ServerMsg::EntityUpdate { .. }
@@ -669,6 +696,7 @@ async fn session_loop<R, W>(
                 Some(NetCommand::Intent(i)) => ClientMsg::MoveIntent { seq: i.seq, pos: i.pos, facing: i.facing, anim: i.anim },
                 Some(NetCommand::Party(p)) => p.to_msg(),
                 Some(NetCommand::Battle(b)) => b.to_msg(),
+                Some(NetCommand::Area(a)) => a.to_msg(),
                 Some(NetCommand::Leave) | None => {
                     let _ = timeout(WRITE_TIMEOUT, write_msg(&mut wr, &ClientMsg::Leave)).await;
                     break;
@@ -953,6 +981,7 @@ mod tests {
             area: adapter.list_areas().remove(0).id,
             tick: 3,
             entities,
+            npcs: Vec::new(),
         }
     }
 

@@ -15,6 +15,7 @@ use crate::state::ClientState;
 use crate::ui::draw::DrawList;
 use crate::ui::hud;
 use fmv_core::GameId;
+use fmv_ff7::Ff7Adapter;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
@@ -82,8 +83,10 @@ pub fn window_attributes(title: String) -> winit::window::WindowAttributes {
         .with_min_inner_size(LogicalSize::new(320.0, 240.0))
 }
 
-pub fn run(event_loop: EventLoop<()>, session: Session, view: FieldView) -> u8 {
-    let mut app = App::new(session, view);
+/// `ff7` is where the views of the areas the server moves us to are read from (see
+/// [`App::with_ff7`]).
+pub fn run(event_loop: EventLoop<()>, session: Session, view: FieldView, ff7: Option<Arc<Ff7Adapter>>) -> u8 {
+    let mut app = App::new(session, view).with_ff7(ff7);
     // A panic inside the windowing or GPU stack must not skip the goodbye or end as a raw abort.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| event_loop.run_app(&mut app)));
     app.finish(result)
@@ -238,7 +241,11 @@ fn describe_request(cmd: PartyCommand) -> String {
 pub(crate) struct App {
     session: Session,
     /// How the area is drawn: walkmesh and bounds in view space, the mapping, the picture.
+    /// Rebuilt when the server moves us to another area.
     view: FieldView,
+    /// This machine's own FF7 data, to read the view of the next area from (`None`: areas are
+    /// drawn from above).
+    ff7: Option<Arc<Ff7Adapter>>,
     base_title: String,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
@@ -261,6 +268,7 @@ impl App {
         Self {
             session,
             view,
+            ff7: None,
             base_title,
             window: None,
             renderer: None,
@@ -272,6 +280,21 @@ impl App {
             left: false,
             failure: None,
         }
+    }
+
+    /// Where the views of later areas come from: when the server moves the player to another
+    /// area, its view (camera, background, walkmesh) is built from this machine's own FF7 data.
+    pub(crate) fn with_ff7(mut self, ff7: Option<Arc<Ff7Adapter>>) -> Self {
+        self.ff7 = ff7;
+        self
+    }
+
+    /// The session entered another area: draw it (a new view, a new title).
+    fn rebuild_view(&mut self) {
+        self.view = crate::field_view(self.ff7.as_deref(), &self.session);
+        self.base_title = base_title(&self.session.info);
+        // The next `update_title` must not wait for its refresh interval.
+        self.last_title = Instant::now().checked_sub(TITLE_REFRESH).unwrap_or_else(Instant::now);
     }
 
     /// Take over a window and renderer that already exist (the character menu opens them first
@@ -397,6 +420,10 @@ impl App {
             self.fail(el, reason);
             return;
         }
+        // The server moved us to another area: draw it before anything is drawn again.
+        if self.session.take_area_change().is_some() {
+            self.rebuild_view();
+        }
         self.session.log_party_notes();
         self.session.log_battle_notes();
         self.session.flush_party_sync();
@@ -444,21 +471,32 @@ impl App {
         // Players are placed through the view; one that cannot be drawn (behind the camera) is
         // simply not shown this frame.
         let view = &self.view;
+        // The area's NPCs first, so every player is drawn over them (a marker of the look
+        // `npc_appearance` decides on; the model renderer hooks in there).
         let mut players: Vec<PlayerSprite> = self
             .session
             .state
-            .remote_views(render_time(now))
+            .npc_views()
             .iter()
-            .filter_map(|v| {
-                view.to_view(v.pose.pos).map(|p| PlayerSprite {
+            .filter_map(|n| {
+                view.to_view(n.pos).map(|p| PlayerSprite {
                     x: p.x,
                     y: p.y,
-                    tint: v.tint,
+                    tint: crate::npc::npc_appearance(n).marker_tint(),
                     own: false,
-                    party: self.session.state.party.is_party_entity(v.id),
+                    party: false,
                 })
             })
             .collect();
+        players.extend(self.session.state.remote_views(render_time(now)).iter().filter_map(|v| {
+            view.to_view(v.pose.pos).map(|p| PlayerSprite {
+                x: p.x,
+                y: p.y,
+                tint: v.tint,
+                own: false,
+                party: self.session.state.party.is_party_entity(v.id),
+            })
+        }));
         if let Some(p) = view.to_view(self.session.state.own.pos()) {
             players.push(PlayerSprite {
                 x: p.x,

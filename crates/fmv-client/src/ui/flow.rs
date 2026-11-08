@@ -292,7 +292,7 @@ mod tests {
     // ---- the whole registration, on the wire ----------------------------------------------------
 
     fn snapshot_of(adapter: &FixtureAdapter, entities: Vec<EntitySnapshot>) -> ServerMsg {
-        ServerMsg::AreaSnapshot { area: adapter.list_areas().remove(0).id, tick: 1, entities }
+        ServerMsg::AreaSnapshot { area: adapter.list_areas().remove(0).id, tick: 1, entities, npcs: vec![] }
     }
 
     /// Press the keys of a new player (type the name, move to the look, pick the second one, Enter)

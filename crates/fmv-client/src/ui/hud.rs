@@ -25,6 +25,8 @@ const PLATE: Rgba = [6, 8, 24, 175];
 const GOOD: Rgba = [124, 232, 148, 255];
 const PARTY_RING: Rgba = [255, 208, 64, 255];
 const OTHER: Rgba = [214, 222, 240, 255];
+/// Non-player characters: a dimmer, cooler tone than any player's name.
+const NPC_TONE: Rgba = [150, 184, 208, 255];
 const FIXTURE_BG: Rgba = [255, 196, 0, 255];
 const FIXTURE_INK: Rgba = [24, 24, 24, 255];
 /// Most characters of a name shown in a corner list or a label.
@@ -55,6 +57,8 @@ pub enum LabelKind {
     /// A member of the local player's party.
     Party,
     Other,
+    /// A non-player character of the area (its name, over its marker).
+    Npc,
 }
 
 /// A player's name, at the player's marker (view space, as the renderer gets it).
@@ -98,6 +102,13 @@ pub fn gather(session: &Session, view: &FieldView) -> HudInput {
 /// [`gather`] over the pieces it reads, so it can be tested without a connection.
 pub fn gather_from(state: &ClientState, info: &SessionInfo, view: &FieldView, render_t: f64) -> HudInput {
     let mut labels = Vec::new();
+    // The area's NPCs (static: they are named where they stand; one that cannot be drawn has no
+    // label either).
+    for npc in state.npc_views() {
+        if let Some(p) = view.to_view(npc.pos) {
+            labels.push(Label { x: p.x, y: p.y, text: npc.name.clone(), kind: LabelKind::Npc });
+        }
+    }
     for remote in state.remote_views(render_t) {
         // One that cannot be drawn (behind the camera) has no marker, so no label either.
         if let Some(p) = view.to_view(remote.pose.pos) {
@@ -251,6 +262,7 @@ fn draw_labels(input: &HudInput, w: u32, h: u32, s: i32, top: i32, out: &mut Dra
             LabelKind::Own => [255, 255, 255, 255],
             LabelKind::Party => PARTY_RING,
             LabelKind::Other => OTHER,
+            LabelKind::Npc => NPC_TONE,
         };
         out.fill_rect(x - 3 * s, y - 2 * s, tw + 6 * s, cell + 4 * s, [0, 0, 0, 150]);
         out.draw_text_shadowed(x, y, s as u32, tone, SHADOW, &text);

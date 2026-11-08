@@ -222,6 +222,17 @@ pub struct Args {
     /// then (as its leader) ask, so one request starts one battle for the whole party.
     #[arg(long, value_name = "N", default_value_t = 1, requires = "debug_encounters")]
     pub battle_wait_party: usize,
+
+    // ---- area travel: one contiguous block ----
+    /// Walk through the exits to these areas, in order, as a bot (headless only): for each area
+    /// walk to the exit of the current area that leads there, cross it and wait for the server to
+    /// move this player, then go on to the next one. Several areas are separated by commas
+    /// (`--travel md1_1,md1stin`: there and back). A bot with --party-invite-first-peer or
+    /// --party-accept holds still until its party has two members (at most 12 s); in every area
+    /// but the last it also waits to see another player (at most 8 s) before it moves on. Bots
+    /// without --travel never cross an exit by accident.
+    #[arg(long, value_name = "AREA[,AREA...]", value_delimiter = ',', value_parser = parse_area_key, requires = "headless")]
+    pub travel: Vec<String>,
 }
 
 /// Default server for `--server`. Kept in sync with `DEFAULT_DEV_PORT` by a unit test.
@@ -350,6 +361,21 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [u8; 3] {
 pub fn parse_name(s: &str) -> Result<String, String> {
     AvatarAppearance::sanitize_name(s)
         .ok_or_else(|| "the display name is empty after removing control characters".to_string())
+}
+
+/// An area key for `--travel`: what adapters use as keys (ASCII letters, digits, `_` and `-`, at
+/// most 32 characters), so it can be compared and printed as it is.
+pub fn parse_area_key(s: &str) -> Result<String, String> {
+    let key = s.trim();
+    if key.is_empty() || key.len() > 32 || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
+        return Err(format!("`{}` is not an area key (ASCII letters, digits, `_` and `-`, at most 32 characters)", clean_for_error(s)));
+    }
+    Ok(key.to_string())
+}
+
+/// Text from the command line made safe to put into an error message.
+fn clean_for_error(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).take(40).collect()
 }
 
 /// Seconds, finite and within a day. Fractions are allowed (`0.5`).
@@ -559,6 +585,27 @@ mod tests {
         }
         let a = Args::try_parse_from(["fmv-client", "--headless", "--party-invite-first-peer", "--party-accept"]).unwrap();
         assert!(a.party_invite_first_peer && a.party_accept);
+    }
+
+    #[test]
+    fn travel_takes_a_comma_separated_route_of_area_keys_and_is_headless_only() {
+        assert!(Args::try_parse_from(["fmv-client", "--name", "x", "--travel", "md1_1"]).is_err(), "--travel needs --headless");
+        let a = Args::try_parse_from(["fmv-client", "--name", "x", "--headless", "--travel", "md1_1,md1stin"]).unwrap();
+        assert_eq!(a.travel, ["md1_1", "md1stin"]);
+        let a = Args::try_parse_from(["fmv-client", "--name", "x", "--headless", "--travel", "md1_1"]).unwrap();
+        assert_eq!(a.travel, ["md1_1"]);
+        let a = Args::try_parse_from(["fmv-client", "--name", "x", "--headless"]).unwrap();
+        assert!(a.travel.is_empty(), "no route unless asked for");
+        // Keys are what adapters use: a bad one is refused before anything runs.
+        for bad in ["", "md1 1", "../x", "a,,b", "x".repeat(33).as_str(), "caf\u{e9}", "line\nbreak"] {
+            assert!(
+                Args::try_parse_from(["fmv-client", "--name", "x", "--headless", "--travel", bad]).is_err(),
+                "{bad:?} is not an area key"
+            );
+        }
+        assert_eq!(parse_area_key(" md1_1 "), Ok("md1_1".to_string()), "surrounding blanks are not part of the key");
+        let err = parse_area_key("bad\u{1b}[2Jkey").unwrap_err();
+        assert!(!err.chars().any(char::is_control), "the message is safe to print: {err:?}");
     }
 
     #[test]

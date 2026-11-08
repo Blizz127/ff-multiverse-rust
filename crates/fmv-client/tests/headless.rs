@@ -277,7 +277,7 @@ async fn handle(stream: TcpStream, script: Script, db: Arc<Mutex<Accounts>>) -> 
     // The player's entity carries the name the SERVER stored for the account.
     write_msg(
         &mut wr,
-        &ServerMsg::AreaSnapshot { area: area.clone(), tick: 1, entities: vec![entity(7, &name, -100.0, 0.0), entity(8, "peer", 100.0, 0.0)] },
+        &ServerMsg::AreaSnapshot { area: area.clone(), tick: 1, entities: vec![entity(7, &name, -100.0, 0.0), entity(8, "peer", 100.0, 0.0)], npcs: vec![] },
     )
     .await
     .unwrap();
@@ -505,9 +505,10 @@ fn smoke_fields(line: &str) -> Vec<(String, String)> {
 }
 
 /// The contract of `scripts/smoke.sh`: these keys, in this order, and nothing else. The first eight
-/// are protocol v2's; `battles` and `victories` were appended in v3 (fields are only ever appended).
-const SMOKE_KEYS: [&str; 10] =
-    ["name", "area", "fixture", "peers_seen", "updates", "rejected", "rtt_ms", "party", "battles", "victories"];
+/// are protocol v2's; `battles` and `victories` were appended in v3 and `area_changes` after them for
+/// area travel (fields are only ever appended).
+const SMOKE_KEYS: [&str; 11] =
+    ["name", "area", "fixture", "peers_seen", "updates", "rejected", "rtt_ms", "party", "battles", "victories", "area_changes"];
 
 /// stdout is exactly one SMOKE line with exactly the documented keys in the documented order.
 fn assert_smoke_contract(stdout: &str) -> HashMap<String, String> {
@@ -517,7 +518,8 @@ fn assert_smoke_contract(stdout: &str) -> HashMap<String, String> {
     let keys: Vec<&str> = fields.iter().map(|(k, _)| k.as_str()).collect();
     assert_eq!(keys, SMOKE_KEYS, "the SMOKE keys and their order are a contract: {stdout}");
     assert_eq!(keys[..8], SMOKE_KEYS[..8], "the v2 keys come first, unchanged: {stdout}");
-    assert_eq!(keys.last(), Some(&"victories"), "the battle fields are the appended ones: {stdout}");
+    assert_eq!(keys[..10], SMOKE_KEYS[..10], "the v3 battle fields keep their place: {stdout}");
+    assert_eq!(keys.last(), Some(&"area_changes"), "the travel field is the last appended one: {stdout}");
     fields.into_iter().collect()
 }
 
@@ -660,6 +662,26 @@ fn headless_bot_joins_walks_and_prints_exactly_one_smoke_line() {
     for (_, p) in &intents {
         assert!(matches!(area.validate_move(*p, *p), MoveResult::Accepted(_)), "intent off the walkable area: {p:?}");
     }
+}
+
+/// `--travel` toward an area that no exit of the current one leads to: the bot says so on stderr
+/// instead of wandering off, the run still ends well, and the SMOKE line says no area changed
+/// (`area_changes=0`, its last field).
+#[test]
+fn a_travel_bot_with_no_exit_to_its_target_says_so_and_the_run_still_ends_well() {
+    let (port, server) = spawn_fake_server(Script::happy());
+    let args = headless_args(port, Some("botT"), &["--bot", "circle", "--duration", "1.5", "--travel", "elsewhere"]);
+    let sandbox = Sandbox::new();
+    let out = sandbox.run(&as_strs(&args));
+    let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+    assert!(out.status.success(), "status {:?}\nstdout: {stdout}\nstderr: {stderr}", out.status);
+    let smoke = assert_smoke_contract(&stdout);
+    assert_eq!(smoke["area"], "Fixture/plaza");
+    assert_eq!(smoke["area_changes"], "0", "{stdout}");
+    assert!(stderr.contains("travel behaviour: walk through the exits to elsewhere"), "{stderr}");
+    assert!(stderr.contains("travel: gave up: no exit of Fixture/plaza leads to elsewhere"), "{stderr}");
+    let report = server.join().unwrap();
+    assert!(matches!(report.received.last(), Some(ClientMsg::Leave)), "{:?}", report.received.last());
 }
 
 /// A display name with spaces, `=` and `%` must not break the one-line, whitespace-separated
