@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use fmv_adapter_api::{AdapterError, AreaInfo, AreaRuntime, GameAdapter};
 use fmv_core::GameId;
 use fmv_ff7::Ff7Adapter;
-pub use fmv_library::ff7::{resolve_flevel, Ff7Labels, Ff7ResolveError, Ff7Source};
+pub use fmv_library::ff7::{resolve_char_lgp, resolve_flevel, Ff7Labels, Ff7ResolveError, Ff7Source};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Ff7OpenError {
@@ -44,6 +44,21 @@ impl std::fmt::Debug for OpenedFf7 {
 pub fn open_ff7(source: &Ff7Source) -> Result<OpenedFf7, Ff7OpenError> {
     let resolved = resolve_flevel(source)?;
     let adapter = Ff7Adapter::from_flevel_path(&resolved.path, resolved.provenance)?;
+    // The character models come from the same library set (or directory) as the field archive.
+    // Missing models are no reason not to play: the window falls back to markers.
+    let char_lgp = match resolve_char_lgp(source) {
+        Ok(found) => found,
+        Err(e) => {
+            eprintln!("FF7: no character models ({e}); players will be drawn as markers");
+            None
+        }
+    };
+    eprintln!(
+        "FF7: character models: {}",
+        if char_lgp.is_some() { "this machine's own char.lgp found" } else { "no char.lgp (players are drawn as markers)" }
+    );
+    // The window, several layers away, finds it again here (see `avatar::source`).
+    crate::avatar::source::remember(char_lgp);
     Ok(OpenedFf7 { adapter: Arc::new(adapter), origin: resolved.origin })
 }
 

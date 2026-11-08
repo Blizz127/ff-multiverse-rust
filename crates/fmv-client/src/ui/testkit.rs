@@ -3,7 +3,7 @@
 //! (lavapipe/llvmpipe on a machine without a display), so the tests that use them are `#[ignore]`d:
 //! `cargo test -p fmv-client -- --ignored offscreen`.
 
-use crate::render::{backdrop_quad, build_vertices, Gpu, Scene, CLEAR_RGB};
+use crate::render::{Gpu, Scene};
 use crate::ui::draw::DrawList;
 use std::path::PathBuf;
 
@@ -21,11 +21,18 @@ pub struct Offscreen {
     device: wgpu::Device,
     queue: wgpu::Queue,
     gpu: Gpu,
+    format: wgpu::TextureFormat,
 }
 
 impl Offscreen {
     /// `None` (with a note on stderr) when no adapter is available.
     pub fn new() -> Option<Self> {
+        Self::with_format(wgpu::TextureFormat::Rgba8Unorm)
+    }
+
+    /// [`Offscreen::new`] drawing into targets of `format` (an sRGB one converts what the shaders
+    /// write, as the window's does when its surface is sRGB).
+    pub fn with_format(format: wgpu::TextureFormat) -> Option<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let adapter = match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())) {
             Ok(a) => a,
@@ -40,20 +47,33 @@ impl Offscreen {
             ..wgpu::DeviceDescriptor::default()
         }))
         .expect("device");
-        let gpu = Gpu::new(device.clone(), queue.clone(), wgpu::TextureFormat::Rgba8Unorm);
-        Some(Self { device, queue, gpu })
+        let gpu = Gpu::new(device.clone(), queue.clone(), format);
+        Some(Self { device, queue, gpu, format })
     }
 
     /// Render `scene` and then `overlay` into a `w` x `h` target; tightly packed RGBA8, top row
     /// first. Colours are not sRGB-converted (the target is plain `Rgba8Unorm`).
     pub fn render(&mut self, w: u32, h: u32, scene: &Scene<'_>, overlay: &DrawList) -> Vec<u8> {
-        let format = wgpu::TextureFormat::Rgba8Unorm;
-        let vertices = build_vertices(scene, w, h, false);
-        // The picture behind the walkmesh, if the scene has one, goes to the GPU like in the window.
-        let quad = match scene.backdrop {
-            Some(b) if self.gpu.ensure_backdrop(b) => backdrop_quad(scene, w, h),
-            _ => None,
-        };
+        self.render_field(w, h, scene, None, overlay)
+    }
+
+    /// Characters the avatar renderer has on the GPU (one per character, not per frame).
+    pub fn cached_avatar_models(&self) -> usize {
+        self.gpu.cached_avatar_models()
+    }
+
+    /// [`Offscreen::render`] with the players drawn as models over the scene (and the scenery in
+    /// front of them) when `avatars` is given: the window's own sequence, [`Gpu::draw_field`].
+    pub fn render_field(
+        &mut self,
+        w: u32,
+        h: u32,
+        scene: &Scene<'_>,
+        avatars: Option<&crate::avatar::AvatarFrame>,
+        overlay: &DrawList,
+    ) -> Vec<u8> {
+        let format = self.format;
+        let srgb = format.is_srgb();
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("offscreen"),
             size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
@@ -65,8 +85,8 @@ impl Offscreen {
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        self.gpu.draw_scene(&view, &vertices, quad.as_ref(), CLEAR_RGB, false);
-        self.gpu.draw_overlay(&view, &overlay.vertices(w, h, false));
+        self.gpu.draw_field(&view, (w, h), scene, avatars, srgb);
+        self.gpu.draw_overlay(&view, &overlay.vertices(w, h, srgb));
 
         // Rows of a texture-to-buffer copy are padded to 256 bytes.
         let padded = (w * 4).next_multiple_of(256);
