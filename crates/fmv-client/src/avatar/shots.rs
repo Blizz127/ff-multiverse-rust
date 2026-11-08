@@ -15,6 +15,7 @@
 //!   holding the imported library, read-only), or `FMV_FF7_DATA` (the game's `data/` directory),
 //!   or `FMV_FF7_FLEVEL` (a `flevel.lgp` with a `char.lgp` beside it).
 
+mod battle_models;
 mod depth;
 
 use super::anim::Who;
