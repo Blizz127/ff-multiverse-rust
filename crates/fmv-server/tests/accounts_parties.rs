@@ -432,20 +432,20 @@ async fn decline_kick_and_promote_work_over_the_wire() {
     }
     let invite_b = eb.invite(&mut b.client).await;
     let invite_c = ec.invite(&mut c.client).await;
+    // The two accepts must reach the server in a known order: they travel on different
+    // connections, so B's party formation is awaited before C accepts (otherwise C could form
+    // the party with A first, and B would then see a different event sequence).
     b.client.send(&ClientMsg::PartyAccept { invite: invite_b }).await;
+    // A saw: InviteSent, InviteDeclined (above), then InviteSent x2 and PartyFormed.
+    for _ in 0..3 {
+        let _ = ea.next(&mut a.client, "A's invites and PartyFormed").await;
+    }
+    let (event, _) = eb.next(&mut b.client, "B's PartyFormed").await;
+    assert!(matches!(event, PartyEvent::PartyFormed { .. }), "{event:?}");
     c.client.send(&ClientMsg::PartyAccept { invite: invite_c }).await;
-    // (A saw: InviteSent x2, PartyFormed, MemberJoined; B and C each saw their own sequence.)
-    for _ in 0..4 {
-        let _ = ea.next(&mut a.client, "A's formation events").await;
-    }
-    let (mut events_seen_b, mut events_seen_c) = (0, 0);
-    while events_seen_b < 2 {
-        let _ = eb.next(&mut b.client, "B's formation events").await;
-        events_seen_b += 1;
-    }
-    while events_seen_c < 1 {
-        let _ = ec.next(&mut c.client, "C's formation events").await;
-        events_seen_c += 1;
+    for (who, client, events) in [("A", &mut a.client, &mut ea), ("B", &mut b.client, &mut eb), ("C", &mut c.client, &mut ec)] {
+        let (event, _) = events.next(client, &format!("{who}'s MemberJoined")).await;
+        assert!(matches!(event, PartyEvent::MemberJoined { .. }), "{who}: {event:?}");
     }
     a.client.send(&ClientMsg::PartyPromote { target: b.entity }).await;
     let (event, _) = ea.next(&mut a.client, "LeaderChanged").await;

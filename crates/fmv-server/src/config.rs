@@ -13,7 +13,7 @@ pub const MAX_TICK_HZ: u32 = 240;
 
 /// Highest accepted connection cap (`--max-connections`).
 ///
-/// Protocol v1 sends the whole area snapshot in a single frame (`MAX_FRAME` = 256 KiB).
+/// Protocol v2 sends the whole area snapshot in a single frame (`MAX_FRAME` = 256 KiB).
 /// Display names (24 chars) and appearance refs (64 chars) are bounded, so one entity
 /// serializes to at most about 550 bytes of JSON (measured with 4-byte characters everywhere,
 /// 20-digit ids and extreme floats; see the `worst_case_snapshot_fits_in_one_frame` test) and 256
@@ -280,7 +280,7 @@ mod tests {
 
     /// The `MAX_CONNECTIONS_LIMIT` claim: the biggest snapshot the server can ever build (every
     /// player at the 4-byte-character worst case, extreme floats) is one frame, because protocol
-    /// v1 cannot split an `AreaSnapshot`. If this fails after a protocol change, every joiner of
+    /// v2 cannot split an `AreaSnapshot`. If this fails after a protocol change, every joiner of
     /// a full server would be dropped right after `JoinArea`.
     #[test]
     fn worst_case_snapshot_fits_in_one_frame() {

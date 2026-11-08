@@ -1,4 +1,4 @@
-//! Authoritative FF Multiverse server for protocol v1 (`fmv-protocol`).
+//! Authoritative FF Multiverse server for protocol v2 (`fmv-protocol`).
 //!
 //! The server hosts exactly one area, obtained from a `GameAdapter` (`Box<dyn GameAdapter>`, so
 //! wiring a real game later is a one-line change in the binary). It owns all positions: clients
@@ -32,12 +32,14 @@
 //!   has a `Synthetic` provenance platform or lists a `SourceRef::Fixture` source, and its
 //!   manifest display name is prefixed with `FIXTURE:` if it does not already say so. An area
 //!   whose provenance names a different game than its id is refused outright.
-//! * **`AreaInfo::fingerprint` is the only content check a joining client faces** (besides the
-//!   `AreaId`): `JoinArea` carries no provenance. It must therefore cover everything that makes
-//!   two copies of an area incompatible, the edition/region/revision provenance included and not
-//!   only the area's file bytes. Otherwise two clients on different editions with identical
-//!   bytes for the hosted area would share an instance. Protocol v1 cannot verify this, and a
-//!   client that simply echoes the public fingerprint cannot be told apart from an honest one.
+//! * **`AreaInfo::fingerprint` is the content check a joining client faces** (besides the
+//!   `AreaId`), and `JoinArea` also carries the client's own path-free provenance, which must be
+//!   `compatible_with` the area's (game, platform, edition, region, revision). The fingerprint
+//!   should therefore cover everything that makes two copies of an area incompatible, the
+//!   provenance included and not only the area's file bytes, so that two clients on different
+//!   editions with identical bytes for the hosted area cannot share an instance. Protocol v2
+//!   cannot verify either claim: a client that simply echoes the public fingerprint and
+//!   provenance cannot be told apart from an honest one.
 //! * **`AreaRuntime::validate_move` is called once per sub-step** of every `MoveIntent` that
 //!   passes the speed check (see `world`: at most `max_speed / 60` units per step, 64 steps at
 //!   most), always from the previous accepted step and never with a client-supplied height. A
@@ -220,7 +222,7 @@ impl Server {
             warn!("hosting a FIXTURE area: synthetic test content, NOT FF7 support");
         }
         if !local_addr.ip().is_loopback() {
-            warn!(%local_addr, "listening on a non-loopback address; protocol v1 has no authentication");
+            warn!(%local_addr, "listening on a non-loopback address; protocol v2 is not encrypted (account tokens and game traffic cross the network in the clear): use it only on a network you trust");
         }
 
         let build = config.build_string();

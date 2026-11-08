@@ -1,4 +1,4 @@
-//! `fmv-server`: authoritative FF Multiverse server (protocol v1).
+//! `fmv-server`: authoritative FF Multiverse server (protocol v2).
 //!
 //! Thin wrapper over the `fmv_server` library: parse flags, pick the game adapter, install
 //! signal handlers, run. Logs go to stderr; stdout carries exactly one line, the READY line.
@@ -49,7 +49,7 @@ ACCOUNTS:
   accounts only until the server stops. --no-registration refuses new accounts.";
 
 #[derive(Parser, Debug)]
-#[command(name = "fmv-server", version, about = "Authoritative FF Multiverse server (protocol v1)", after_help = AFTER_HELP)]
+#[command(name = "fmv-server", version, about = "Authoritative FF Multiverse server (protocol v2)", after_help = AFTER_HELP)]
 struct Cli {
     /// Address to listen on. Port 0 picks a free port (reported on the READY line).
     #[arg(long, value_name = "ADDR", default_value_t = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), DEFAULT_DEV_PORT))]
