@@ -1,18 +1,23 @@
-//! The battle view: a full-window overlay of flat coloured rectangles.
+//! The battle view: what the screen shows of a battle, as plain data, and the flat stand-ins.
 //!
-//! Enemies on the top half, the party on the bottom half, one card per fighter: a border, an HP
-//! bar and an ATB gauge. A party member whose gauge is full has a yellow border and a yellow
-//! gauge (it can be commanded now); our own character has a white marker. A status band across
-//! the top is green while the replay agrees with the server, RED after a divergence and grey
-//! when this machine has no battle data to replay with.
+//! [`BattleView`] is everything the 2D overlay ([`super::panels`], [`super::text`]) draws: the
+//! fighters as [`Bar`]s, the status of the replay, and the live parts of the battle UI (the command
+//! menu, the floating numbers, the action banner and the victory or defeat panel), all of them
+//! plain data that [`super::BattleClient::view`] puts together.
 //!
-//! The layout is pure: [`battle_vertices`] turns a [`BattleView`] into the renderer's flat
-//! vertices for a window size, and [`battle_labels`] says where the text of each card belongs
-//! ([`super::text`] draws it with the UI font over these rectangles; the window title repeats the
-//! words, see `BattleClient::title_suffix`).
+//! Without a 3D scene the fighters are drawn as flat tokens, one coloured box each with a thin HP
+//! bar, in the strip of the window above the bottom windows: [`battle_vertices`] turns a view into
+//! the renderer's flat vertices (the backdrop, the status band, the tokens) and [`flat_anchors`]
+//! says where each token's head is. A 3D scene gives its own [`Anchors`] (where the models'
+//! heads are on screen) to [`super::text::draw_battle_overlay`] instead, and draws no tokens.
+//!
+//! The layout is pure: no clock, no GPU.
 
+use super::menu::MenuView;
+use super::panels::{layout, Banner, Finale};
+use super::popups::Popup;
 use crate::render::{color, Vertex, MAX_VERTICES};
-use fmv_ff7_battle::rules::GAUGE_MAX;
+use fmv_ff7_battle::rules::{ActorId, GAUGE_MAX};
 use fmv_protocol::BattleId;
 
 // Palette (sRGB bytes).
@@ -34,17 +39,16 @@ pub const HP_DEAD_RGB: [u8; 3] = [90, 90, 100];
 pub const ATB_RGB: [u8; 3] = [90, 150, 255];
 pub const ATB_READY_RGB: [u8; 3] = [255, 238, 120];
 
-// Sizes in pixels.
+/// Height of the status band across the top of the window, in pixels.
 pub const BAND_H: f32 = 14.0;
-const MARGIN: f32 = 20.0;
-const GAP: f32 = 16.0;
-const CARD_W_MAX: f32 = 240.0;
-const CARD_H: f32 = 84.0;
-const BORDER: f32 = 4.0;
-const PAD: f32 = 8.0;
-const HP_H: f32 = 22.0;
-const ATB_H: f32 = 14.0;
-const MARKER: f32 = 12.0;
+
+// Token sizes in canvas units (see [`super::panels::Layout`]; a unit is `scale` pixels).
+const TOKEN_W: f32 = 26.0;
+const TOKEN_H: f32 = 34.0;
+const TOKEN_GAP: f32 = 6.0;
+const BORDER: f32 = 1.0;
+const MARKER: f32 = 4.0;
+const HP_H: f32 = 3.0;
 
 /// How the replay stands against the server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,13 +61,28 @@ pub enum Status {
     Unverified,
 }
 
+impl Status {
+    /// The colour of the status band.
+    pub fn band_rgb(self) -> [u8; 3] {
+        match self {
+            Status::Verified => BAND_VERIFIED_RGB,
+            Status::Diverged => BAND_DIVERGED_RGB,
+            Status::Unverified => BAND_UNVERIFIED_RGB,
+        }
+    }
+}
+
 /// One fighter as the view draws it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bar {
-    /// The fighter's name from this machine's own data (for the text labels).
+    /// Who it is in the battle (what events and commands call it).
+    pub actor: ActorId,
+    /// The fighter's name from this machine's own data.
     pub name: String,
     pub hp: u32,
     pub max_hp: u32,
+    pub mp: u32,
+    pub max_mp: u32,
     /// ATB gauge, `0..=GAUGE_MAX` (extrapolated between server messages for display).
     pub gauge: u32,
     /// The engine says this fighter can act now (a party member waits for a command).
@@ -71,6 +90,12 @@ pub struct Bar {
     pub alive: bool,
     /// Our own character.
     pub mine: bool,
+}
+
+impl Default for Bar {
+    fn default() -> Self {
+        Self { actor: ActorId(0), name: String::new(), hp: 0, max_hp: 0, mp: 0, max_mp: 0, gauge: 0, ready: false, alive: false, mine: false }
+    }
 }
 
 /// Everything the battle view draws.
@@ -82,22 +107,66 @@ pub struct BattleView {
     pub status: Status,
     /// A command of ours is waiting for the server's answer.
     pub waiting_for_answer: bool,
+    /// Our character's command menu (only on its turn).
+    pub menu: Option<MenuView>,
+    /// Damage, healing and misses floating over the fighters.
+    pub popups: Vec<Popup>,
+    /// The name of the action being performed.
+    pub banner: Option<Banner>,
+    /// The battle is over: the victory or defeat panel (the view lingers after the end).
+    pub finale: Option<Finale>,
 }
 
 impl BattleView {
     /// A view with nothing to show but the fact that a battle runs and cannot be replayed here.
     pub fn unverified(id: BattleId) -> Self {
-        Self { id, party: Vec::new(), enemies: Vec::new(), status: Status::Unverified, waiting_for_answer: false }
+        Self {
+            id,
+            party: Vec::new(),
+            enemies: Vec::new(),
+            status: Status::Unverified,
+            waiting_for_answer: false,
+            menu: None,
+            popups: Vec::new(),
+            banner: None,
+            finale: None,
+        }
+    }
+}
+
+impl Default for BattleView {
+    fn default() -> Self {
+        Self::unverified(BattleId(0))
+    }
+}
+
+/// Where the fighters are on screen: for each one the point just over its head, in window pixels
+/// from the top-left corner (the pointer and the floating numbers go there), in the order of
+/// [`BattleView::party`] and [`BattleView::enemies`]. `None` for one that is not on screen.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Anchors {
+    pub party: Vec<Option<(f32, f32)>>,
+    pub enemies: Vec<Option<(f32, f32)>>,
+}
+
+impl Anchors {
+    /// The anchor of `actor` in `view`, if it has one on screen.
+    pub fn of(&self, view: &BattleView, actor: ActorId) -> Option<(f32, f32)> {
+        let found = match view.party.iter().position(|b| b.actor == actor) {
+            Some(i) => self.party.get(i),
+            None => self.enemies.get(view.enemies.iter().position(|b| b.actor == actor)?),
+        };
+        found.copied().flatten().filter(|(x, y)| x.is_finite() && y.is_finite())
     }
 }
 
 /// An axis-aligned rectangle in pixels from the top-left corner of the window.
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct Rect {
-    x0: f32,
-    y0: f32,
-    x1: f32,
-    y1: f32,
+pub(super) struct Rect {
+    pub x0: f32,
+    pub y0: f32,
+    pub x1: f32,
+    pub y1: f32,
 }
 
 impl Rect {
@@ -105,85 +174,65 @@ impl Rect {
         Rect { x0: self.x0 + d, y0: self.y0 + d, x1: (self.x1 - d).max(self.x0 + d), y1: (self.y1 - d).max(self.y0 + d) }
     }
 
-    fn width(self) -> f32 {
+    pub fn width(self) -> f32 {
         self.x1 - self.x0
+    }
+
+    pub fn height(self) -> f32 {
+        self.y1 - self.y0
     }
 }
 
-/// One fighter's place in the window.
-struct Card<'a> {
-    rect: Rect,
-    bar: &'a Bar,
-    enemy: bool,
+/// One fighter's token.
+pub(super) struct Card<'a> {
+    pub rect: Rect,
+    pub bar: &'a Bar,
+    pub enemy: bool,
 }
 
-/// Lay one row of cards out in `region`, centred in it.
-fn row<'a>(bars: &'a [Bar], enemy: bool, region: Rect, out: &mut Vec<Card<'a>>) {
+/// Lay one row of tokens out in `region`, centred in it.
+fn row<'a>(bars: &'a [Bar], enemy: bool, region: Rect, s: f32, out: &mut Vec<Card<'a>>) {
     let n = bars.len();
     if n == 0 {
         return;
     }
     let slot = region.width() / n as f32;
-    let card_w = (slot - GAP).clamp(8.0, CARD_W_MAX);
-    let card_h = CARD_H.min((region.y1 - region.y0).max(8.0));
-    let y0 = region.y0 + ((region.y1 - region.y0) - card_h).max(0.0) * 0.5;
+    let card_w = (slot - TOKEN_GAP * s).clamp(8.0, TOKEN_W * s);
+    let card_h = (TOKEN_H * s).min(region.height().max(8.0));
+    let y0 = region.y0 + (region.height() - card_h).max(0.0) * 0.5;
     for (i, bar) in bars.iter().enumerate() {
         let x0 = region.x0 + slot * i as f32 + (slot - card_w) * 0.5;
         out.push(Card { rect: Rect { x0, y0, x1: x0 + card_w, y1: y0 + card_h }, bar, enemy });
     }
 }
 
-/// Every card of `view` for a `w` x `h` window: enemies above the middle, the party below it.
-fn cards(view: &BattleView, w: f32, h: f32) -> Vec<Card<'_>> {
+/// Every token of `view` for a `w` x `h` window: the enemies on the left, the party on the right,
+/// in the strip above the bottom windows.
+pub(super) fn cards(view: &BattleView, vw: u32, vh: u32) -> Vec<Card<'_>> {
+    let l = layout(vw, vh, view.party.len());
+    let s = l.s as f32;
+    let (x0, y0, x1, y1) = l.stage();
+    let (x0, y0, x1, y1) = (x0 as f32, y0 as f32, x1 as f32, y1 as f32);
+    let split = x0 + (x1 - x0) * 0.56;
+    let gap = TOKEN_GAP * s * 0.5;
     let mut out = Vec::with_capacity(view.party.len() + view.enemies.len());
-    let top = BAND_H + MARGIN;
-    let mid = (h * 0.5).max(top);
-    row(&view.enemies, true, Rect { x0: MARGIN, y0: top, x1: (w - MARGIN).max(MARGIN + 1.0), y1: (mid - MARGIN * 0.5).max(top + 1.0) }, &mut out);
-    row(&view.party, false, Rect { x0: MARGIN, y0: mid + MARGIN * 0.5, x1: (w - MARGIN).max(MARGIN + 1.0), y1: (h - MARGIN).max(mid + MARGIN * 0.5 + 1.0) }, &mut out);
+    row(&view.enemies, true, Rect { x0, y0, x1: (split - gap).max(x0 + 1.0), y1: y1.max(y0 + 1.0) }, s, &mut out);
+    row(&view.party, false, Rect { x0: (split + gap).min(x1), y0, x1: x1.max(split + gap + 1.0), y1: y1.max(y0 + 1.0) }, s, &mut out);
     out
 }
 
-/// What a label says.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LabelKind {
-    /// A fighter's name.
-    Name,
-    /// A fighter's HP as `HP now/max`.
-    Hp,
-}
-
-/// Where the text of a card belongs.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Label {
-    /// Top-left corner in pixels from the top-left of the window.
-    pub x: f32,
-    pub y: f32,
-    /// The width of the card the text belongs to: the text must fit in it.
-    pub max_width: f32,
-    pub text: String,
-    pub kind: LabelKind,
-    /// The text belongs to our own character.
-    pub mine: bool,
-}
-
-/// The labels of `view` for a `vw` x `vh` window: each fighter's name above its card and its HP
-/// below it ([`super::text::draw_battle_text`] draws them).
-pub fn battle_labels(view: &BattleView, vw: u32, vh: u32) -> Vec<Label> {
-    let (w, h) = (vw.max(1) as f32, vh.max(1) as f32);
-    let mut labels = Vec::new();
-    for card in cards(view, w, h) {
-        let (x, max_width, mine) = (card.rect.x0, card.rect.width(), card.bar.mine);
-        labels.push(Label { x, y: card.rect.y0 - 20.0, max_width, text: card.bar.name.clone(), kind: LabelKind::Name, mine });
-        labels.push(Label {
-            x,
-            y: card.rect.y1 + 4.0,
-            max_width,
-            text: format!("HP {}/{}", card.bar.hp, card.bar.max_hp),
-            kind: LabelKind::Hp,
-            mine,
-        });
+/// Where the flat tokens' heads are (the point over the middle of each token's top edge).
+pub fn flat_anchors(view: &BattleView, vw: u32, vh: u32) -> Anchors {
+    let s = layout(vw, vh, view.party.len()).s as f32;
+    let mut anchors = Anchors { party: vec![None; view.party.len()], enemies: vec![None; view.enemies.len()] };
+    let (mut enemy, mut party) = (0, 0);
+    for card in cards(view, vw, vh) {
+        let at = Some(((card.rect.x0 + card.rect.x1) * 0.5, card.rect.y0 - 2.0 * s));
+        let (list, i) = if card.enemy { (&mut anchors.enemies, &mut enemy) } else { (&mut anchors.party, &mut party) };
+        list[*i] = at;
+        *i += 1;
     }
-    labels
+    anchors
 }
 
 /// Accumulates rectangles given in pixels and emits NDC triangles.
@@ -210,7 +259,7 @@ impl Rects {
 }
 
 /// `part / whole` as a fraction in `0..=1` (an empty whole is empty).
-fn fraction(part: u32, whole: u32) -> f32 {
+pub(super) fn fraction(part: u32, whole: u32) -> f32 {
     if whole == 0 {
         0.0
     } else {
@@ -232,21 +281,18 @@ fn hp_rgb(bar: &Bar) -> [u8; 3] {
     }
 }
 
-/// The frame's vertices for a `vw` x `vh` window (flat colours, painter's order: backdrop,
-/// status band, then each card). Non-finite or degenerate rectangles are skipped, never forwarded
-/// to the GPU.
+/// The frame's flat vertices for a `vw` x `vh` window, painter's order: the backdrop, the status
+/// band, then a token for each fighter. Non-finite or degenerate rectangles are skipped, never
+/// forwarded to the GPU. (The overlay draws the band again, in the same colour, so a 3D scene
+/// that skips this function still has one.)
 pub fn battle_vertices(view: &BattleView, vw: u32, vh: u32, srgb: bool) -> Vec<Vertex> {
     let (w, h) = (vw.max(1) as f32, vh.max(1) as f32);
+    let s = layout(vw, vh, view.party.len()).s as f32;
     let mut r = Rects { out: Vec::with_capacity(256), w, h, srgb };
     r.rect(Rect { x0: 0.0, y0: 0.0, x1: w, y1: h }, BACKDROP_RGB);
-    let band = match view.status {
-        Status::Verified => BAND_VERIFIED_RGB,
-        Status::Diverged => BAND_DIVERGED_RGB,
-        Status::Unverified => BAND_UNVERIFIED_RGB,
-    };
-    r.rect(Rect { x0: 0.0, y0: 0.0, x1: w, y1: BAND_H }, band);
+    r.rect(Rect { x0: 0.0, y0: 0.0, x1: w, y1: BAND_H }, view.status.band_rgb());
 
-    for card in cards(view, w, h) {
+    for card in cards(view, vw, vh) {
         let bar = card.bar;
         let ready = bar.ready && bar.alive;
         let border = if !bar.alive {
@@ -259,41 +305,44 @@ pub fn battle_vertices(view: &BattleView, vw: u32, vh: u32, srgb: bool) -> Vec<V
             BORDER_PARTY_RGB
         };
         r.rect(card.rect, border);
-        let inner = card.rect.inset(BORDER);
+        let inner = card.rect.inset(BORDER * s);
         r.rect(inner, CARD_RGB);
 
-        let bars = inner.inset(PAD - BORDER);
-        let hp_back = Rect { x0: bars.x0, y0: bars.y0, x1: bars.x1, y1: (bars.y0 + HP_H).min(bars.y1) };
+        // A thin HP bar along the bottom of the token.
+        let pad = 2.0 * s;
+        let hp_back = Rect { x0: inner.x0 + pad, y0: (inner.y1 - pad - HP_H * s).max(inner.y0), x1: (inner.x1 - pad).max(inner.x0 + pad), y1: (inner.y1 - pad).max(inner.y0) };
         r.rect(hp_back, BAR_BACK_RGB);
         let hp_fill = if bar.alive { fraction(bar.hp, bar.max_hp) } else { 0.0 };
         r.rect(Rect { x1: hp_back.x0 + hp_back.width() * hp_fill, ..hp_back }, hp_rgb(bar));
 
-        let atb_top = hp_back.y1 + PAD * 0.5;
-        let atb_back = Rect { x0: bars.x0, y0: atb_top, x1: bars.x1, y1: (atb_top + ATB_H).min(bars.y1.max(atb_top)) };
-        r.rect(atb_back, BAR_BACK_RGB);
-        if bar.alive {
-            let (fill, rgb) = if ready { (1.0, ATB_READY_RGB) } else { (fraction(bar.gauge, GAUGE_MAX), ATB_RGB) };
-            r.rect(Rect { x1: atb_back.x0 + atb_back.width() * fill, ..atb_back }, rgb);
-        }
-
         if bar.mine {
-            // A white marker in the card's top-left corner: this one is you.
-            r.rect(Rect { x0: card.rect.x0, y0: card.rect.y0, x1: card.rect.x0 + MARKER, y1: card.rect.y0 + MARKER }, MARKER_RGB);
+            // A white marker in the token's top-left corner: this one is you.
+            let m = MARKER * s;
+            r.rect(Rect { x0: card.rect.x0, y0: card.rect.y0, x1: card.rect.x0 + m, y1: card.rect.y0 + m }, MARKER_RGB);
         }
     }
     r.out
+}
+
+/// The gauge of `bar` as a fraction of a full one (the ATB bars use it).
+pub(super) fn gauge_fraction(bar: &Bar) -> f32 {
+    if bar.ready && bar.alive {
+        1.0
+    } else {
+        fraction(bar.gauge, GAUGE_MAX)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn bar(hp: u32, max: u32, gauge: u32, ready: bool, alive: bool, mine: bool) -> Bar {
-        Bar { name: "x".into(), hp, max_hp: max, gauge, ready, alive, mine }
+    fn bar(hp: u32, max: u32, ready: bool, alive: bool, mine: bool) -> Bar {
+        Bar { name: "x".into(), hp, max_hp: max, ready, alive, mine, ..Bar::default() }
     }
 
     fn view(party: Vec<Bar>, enemies: Vec<Bar>, status: Status) -> BattleView {
-        BattleView { id: BattleId(1), party, enemies, status, waiting_for_answer: false }
+        BattleView { id: BattleId(1), party, enemies, status, ..BattleView::default() }
     }
 
     /// Pixel extent `(min_x, max_x, min_y, max_y)` of the vertices of one colour, in a `w` x `h` window.
@@ -305,12 +354,7 @@ mod tests {
         }
         let xs = mine.iter().map(|p| (p.pos[0] + 1.0) * 0.5 * w);
         let ys = mine.iter().map(|p| (1.0 - p.pos[1]) * 0.5 * h);
-        Some((
-            xs.clone().fold(f32::MAX, f32::min),
-            xs.fold(f32::MIN, f32::max),
-            ys.clone().fold(f32::MAX, f32::min),
-            ys.fold(f32::MIN, f32::max),
-        ))
+        Some((xs.clone().fold(f32::MAX, f32::min), xs.fold(f32::MIN, f32::max), ys.clone().fold(f32::MAX, f32::min), ys.fold(f32::MIN, f32::max)))
     }
 
     fn count(v: &[Vertex], rgb: [u8; 3]) -> usize {
@@ -326,7 +370,7 @@ mod tests {
         assert_eq!(count(&v, BAND_VERIFIED_RGB), 6);
         // The band is a strip across the top, the backdrop the whole window.
         let (x0, x1, y0, y1) = extent(&v, BAND_VERIFIED_RGB, 800.0, 600.0).unwrap();
-        assert!((x0, x1, y0, y1) == (0.0, 800.0, 0.0, BAND_H) || ((x0 - 0.0).abs() < 0.01 && (x1 - 800.0).abs() < 0.01 && (y1 - BAND_H).abs() < 0.01));
+        assert!(x0.abs() < 0.01 && y0.abs() < 0.01 && (x1 - 800.0).abs() < 0.01 && (y1 - BAND_H).abs() < 0.01);
         let (bx0, bx1, by0, by1) = extent(&v, BACKDROP_RGB, 800.0, 600.0).unwrap();
         assert!(bx0.abs() < 0.01 && by0.abs() < 0.01 && (bx1 - 800.0).abs() < 0.01 && (by1 - 600.0).abs() < 0.01);
     }
@@ -341,14 +385,16 @@ mod tests {
             let v = battle_vertices(&view(vec![], vec![], status), 400, 300, false);
             assert_eq!(count(&v, rgb), 6, "{status:?}");
             assert!(others.iter().all(|o| count(&v, *o) == 0), "{status:?}");
+            assert_eq!(status.band_rgb(), rgb);
         }
         assert_eq!(BattleView::unverified(BattleId(3)).status, Status::Unverified);
+        assert_eq!(BattleView::default().id, BattleId(0));
     }
 
     #[test]
     fn the_hp_bar_fills_in_proportion_and_changes_colour_as_it_empties() {
         let (w, h) = (1000u32, 700u32);
-        let at = |hp: u32| battle_vertices(&view(vec![bar(hp, 100, 0, false, true, false)], vec![], Status::Verified), w, h, false);
+        let at = |hp: u32| battle_vertices(&view(vec![bar(hp, 100, false, true, false)], vec![], Status::Verified), w, h, false);
         let full = at(100);
         let (fx0, fx1, ..) = extent(&full, HP_GOOD_RGB, w as f32, h as f32).unwrap();
         let (hx0, hx1, ..) = extent(&at(75), HP_GOOD_RGB, w as f32, h as f32).unwrap();
@@ -357,90 +403,90 @@ mod tests {
         assert!(count(&at(51), HP_GOOD_RGB) > 0 && count(&at(50), HP_GOOD_RGB) == 0);
         assert!(count(&at(50), HP_WARN_RGB) > 0 && count(&at(26), HP_WARN_RGB) > 0 && count(&at(25), HP_WARN_RGB) == 0);
         assert!(count(&at(25), HP_LOW_RGB) > 0 && count(&at(1), HP_LOW_RGB) > 0);
-        // No HP at all: nothing is filled.
-        assert_eq!(count(&at(0), HP_GOOD_RGB) + count(&at(0), HP_WARN_RGB), 0);
-        let dead = battle_vertices(&view(vec![bar(0, 100, 0, false, false, false)], vec![], Status::Verified), w, h, false);
+        assert_eq!(count(&at(0), HP_GOOD_RGB) + count(&at(0), HP_WARN_RGB), 0, "no HP at all: nothing is filled");
+        let dead = battle_vertices(&view(vec![bar(0, 100, false, false, false)], vec![], Status::Verified), w, h, false);
         assert_eq!(count(&dead, HP_GOOD_RGB) + count(&dead, HP_WARN_RGB) + count(&dead, HP_LOW_RGB), 0);
         assert!(count(&dead, BORDER_DEAD_RGB) > 0);
     }
 
     #[test]
-    fn the_atb_gauge_fills_and_a_ready_member_is_highlighted() {
+    fn a_ready_member_is_highlighted_and_a_dead_one_never_is() {
         let (w, h) = (1000u32, 700u32);
-        let half = battle_vertices(&view(vec![bar(10, 10, GAUGE_MAX / 2, false, true, true)], vec![], Status::Verified), w, h, false);
-        let (a0, a1, ..) = extent(&half, ATB_RGB, w as f32, h as f32).unwrap();
-        let full = battle_vertices(&view(vec![bar(10, 10, GAUGE_MAX, true, true, true)], vec![], Status::Verified), w, h, false);
-        let (r0, r1, ..) = extent(&full, ATB_READY_RGB, w as f32, h as f32).unwrap();
-        assert!(((a1 - a0) / (r1 - r0) - 0.5).abs() < 0.01, "half a gauge: {} of {}", a1 - a0, r1 - r0);
-        // Waiting: blue gauge and a plain border; ready: yellow gauge AND a yellow border.
-        assert_eq!(count(&half, ATB_READY_RGB) + count(&half, BORDER_READY_RGB), 0);
-        assert!(count(&full, BORDER_READY_RGB) > 0 && count(&full, ATB_RGB) == 0);
-        assert!(count(&half, BORDER_PARTY_RGB) > 0);
-        // A dead member is never "ready", whatever the flag says.
-        let ghost = battle_vertices(&view(vec![bar(0, 10, GAUGE_MAX, true, false, false)], vec![], Status::Verified), w, h, false);
-        assert_eq!(count(&ghost, BORDER_READY_RGB) + count(&ghost, ATB_READY_RGB), 0);
+        let waiting = battle_vertices(&view(vec![bar(10, 10, false, true, true)], vec![], Status::Verified), w, h, false);
+        let ready = battle_vertices(&view(vec![bar(10, 10, true, true, true)], vec![], Status::Verified), w, h, false);
+        assert_eq!(count(&waiting, BORDER_READY_RGB), 0);
+        assert!(count(&ready, BORDER_READY_RGB) > 0 && count(&ready, BORDER_PARTY_RGB) == 0);
+        assert!(count(&waiting, BORDER_PARTY_RGB) > 0);
+        let ghost = battle_vertices(&view(vec![bar(0, 10, true, false, false)], vec![], Status::Verified), w, h, false);
+        assert_eq!(count(&ghost, BORDER_READY_RGB), 0);
+        // An enemy that is "ready" is still an enemy.
+        let foe = battle_vertices(&view(vec![], vec![bar(10, 10, true, true, false)], Status::Verified), w, h, false);
+        assert!(count(&foe, BORDER_ENEMY_RGB) > 0 && count(&foe, BORDER_READY_RGB) == 0);
     }
 
     #[test]
     fn our_own_character_is_marked_and_the_others_are_not() {
         let (w, h) = (900u32, 600u32);
-        let party = vec![bar(5, 10, 0, false, true, false), bar(5, 10, 0, false, true, true), bar(5, 10, 0, false, true, false)];
+        let party = vec![bar(5, 10, false, true, false), bar(5, 10, false, true, true), bar(5, 10, false, true, false)];
         let v = battle_vertices(&view(party, vec![], Status::Verified), w, h, false);
         assert_eq!(count(&v, MARKER_RGB), 6, "exactly one marker (one rectangle)");
         let (x0, x1, y0, y1) = extent(&v, MARKER_RGB, w as f32, h as f32).unwrap();
-        assert!((x1 - x0 - MARKER).abs() < 0.01 && (y1 - y0 - MARKER).abs() < 0.01);
-        // It sits on the middle of three cards.
-        assert!(x0 > w as f32 / 3.0 && x1 < w as f32 * 2.0 / 3.0, "{x0}..{x1}");
+        assert!((x1 - x0 - y1 + y0).abs() < 0.01, "a square");
     }
 
     #[test]
-    fn enemies_are_above_and_the_party_below_and_cards_never_overlap() {
-        let (w, h) = (1100u32, 680u32);
-        let party: Vec<Bar> = (0..3).map(|_| bar(5, 10, 0, false, true, false)).collect();
-        let enemies: Vec<Bar> = (0..4).map(|_| bar(5, 10, 0, false, true, false)).collect();
-        let v = view(party, enemies, Status::Verified);
-        let cs = cards(&v, w as f32, h as f32);
-        assert_eq!(cs.len(), 7);
-        let (enemy_cards, party_cards): (Vec<_>, Vec<_>) = cs.iter().partition(|c| c.enemy);
-        assert_eq!((enemy_cards.len(), party_cards.len()), (4, 3));
-        assert!(enemy_cards.iter().all(|c| c.rect.y1 <= h as f32 / 2.0));
-        assert!(party_cards.iter().all(|c| c.rect.y0 >= h as f32 / 2.0));
-        for group in [&enemy_cards, &party_cards] {
-            for pair in group.windows(2) {
-                assert!(pair[0].rect.x1 <= pair[1].rect.x0, "cards in a row do not overlap");
+    fn enemies_are_on_the_left_the_party_on_the_right_and_tokens_stay_above_the_windows() {
+        for (w, h) in [(1100u32, 680u32), (1920, 1080), (800, 600), (640, 480), (320, 240)] {
+            let party: Vec<Bar> = (0..3).map(|i| Bar { actor: ActorId(i), ..bar(5, 10, false, true, false) }).collect();
+            let enemies: Vec<Bar> = (0..4).map(|i| Bar { actor: ActorId(3 + i), ..bar(5, 10, false, true, false) }).collect();
+            let v = view(party, enemies, Status::Verified);
+            let cs = cards(&v, w, h);
+            assert_eq!(cs.len(), 7);
+            let (enemy_cards, party_cards): (Vec<_>, Vec<_>) = cs.iter().partition(|c| c.enemy);
+            assert_eq!((enemy_cards.len(), party_cards.len()), (4, 3));
+            let l = layout(w, h, 3);
+            let (_, _, _, stage_bottom) = l.stage();
+            let enemy_right = enemy_cards.iter().map(|c| c.rect.x1).fold(0.0, f32::max);
+            let party_left = party_cards.iter().map(|c| c.rect.x0).fold(f32::MAX, f32::min);
+            assert!(enemy_right <= party_left, "{w}x{h}: the enemies' side ends before the party's begins ({enemy_right} vs {party_left})");
+            for group in [&enemy_cards, &party_cards] {
+                for pair in group.windows(2) {
+                    assert!(pair[0].rect.x1 <= pair[1].rect.x0, "{w}x{h}: tokens in a row do not overlap");
+                }
+            }
+            let windows_top = (l.enemy.y * l.s) as f32;
+            for c in &cs {
+                assert!(c.rect.x0 >= 0.0 && c.rect.x1 <= w as f32 && c.rect.y0 >= BAND_H, "{w}x{h}: {:?}", c.rect);
+                assert!(c.rect.y1 <= stage_bottom as f32 + 0.5 && c.rect.y1 <= windows_top, "{w}x{h}: a token reaches into the bottom windows: {:?} vs {windows_top}", c.rect);
             }
         }
-        for c in &cs {
-            assert!(c.rect.x0 >= 0.0 && c.rect.x1 <= w as f32 && c.rect.y0 >= BAND_H && c.rect.y1 <= h as f32, "{:?}", c.rect);
-        }
     }
 
     #[test]
-    fn labels_name_every_fighter_and_follow_the_cards() {
-        let mut p = bar(7, 10, 0, false, true, true);
-        p.name = "Cloud".into();
-        let mut e = bar(9, 90, 0, false, true, false);
-        e.name = "Guard".into();
-        let v = view(vec![p], vec![e], Status::Verified);
-        let labels = battle_labels(&v, 800, 600);
-        let texts: Vec<&str> = labels.iter().map(|l| l.text.as_str()).collect();
-        assert_eq!(texts, ["Guard", "HP 9/90", "Cloud", "HP 7/10"]);
-        assert!(labels.iter().all(|l| l.x.is_finite() && l.y.is_finite() && l.max_width > 0.0));
-        // The enemy's label is above the party's, names above their card and HP below it.
-        assert!(labels[0].y < labels[2].y);
-        let kinds: Vec<LabelKind> = labels.iter().map(|l| l.kind).collect();
-        assert_eq!(kinds, [LabelKind::Name, LabelKind::Hp, LabelKind::Name, LabelKind::Hp]);
-        assert_eq!(labels.iter().map(|l| l.mine).collect::<Vec<_>>(), [false, false, true, true]);
-        // A label sits on its card's left edge and may not be wider than the card.
-        let cs = cards(&v, 800.0, 600.0);
-        assert_eq!(labels[0].x, cs[0].rect.x0);
-        assert_eq!(labels[0].max_width, cs[0].rect.width());
+    fn anchors_sit_over_the_tokens_in_view_order_and_are_found_by_actor() {
+        let party = vec![Bar { actor: ActorId(0), ..bar(5, 10, false, true, true) }, Bar { actor: ActorId(1), ..bar(5, 10, false, true, false) }];
+        let enemies = vec![Bar { actor: ActorId(2), ..bar(5, 10, false, true, false) }];
+        let v = view(party, enemies, Status::Verified);
+        let a = flat_anchors(&v, 1100, 680);
+        assert_eq!((a.party.len(), a.enemies.len()), (2, 1));
+        let cs = cards(&v, 1100, 680);
+        let enemy = cs.iter().find(|c| c.enemy).unwrap();
+        let (ex, ey) = a.of(&v, ActorId(2)).unwrap();
+        assert!((ex - (enemy.rect.x0 + enemy.rect.x1) * 0.5).abs() < 0.01 && ey < enemy.rect.y0);
+        let (x0, _) = a.of(&v, ActorId(0)).unwrap();
+        let (x1, _) = a.of(&v, ActorId(1)).unwrap();
+        assert!(x0 < x1, "the party's order is kept");
+        assert!(x0 > ex, "the party is on the right of the enemies");
+        assert_eq!(a.of(&v, ActorId(9)), None, "an actor the view does not have");
+        // A 3D scene's anchors with a hole or a non-finite point give nothing.
+        let holey = Anchors { party: vec![None, Some((f32::NAN, 1.0))], enemies: vec![] };
+        assert_eq!((holey.of(&v, ActorId(0)), holey.of(&v, ActorId(1)), holey.of(&v, ActorId(2))), (None, None, None));
     }
 
     #[test]
     fn any_window_size_and_any_numbers_give_finite_vertices_in_the_viewport() {
-        let party: Vec<Bar> = (0..8).map(|i| bar(i * 3, 20, i * 9_000, i % 2 == 0, i != 5, i == 2)).collect();
-        let enemies: Vec<Bar> = (0..6).map(|i| bar(u32::MAX, 0, u32::MAX, true, true, false).clone_with(i)).collect();
+        let party: Vec<Bar> = (0..8).map(|i| Bar { actor: ActorId(i as u8), ..bar(i * 3, 20, i % 2 == 0, i != 5, i == 2) }).collect();
+        let enemies: Vec<Bar> = (0..6).map(|_| bar(u32::MAX, 0, true, true, false)).collect();
         let v = view(party, enemies, Status::Diverged);
         for (w, h) in [(1, 1), (0, 0), (10, 10), (100, 50), (320, 240), (1100, 680), (4000, 3000)] {
             let out = battle_vertices(&v, w, h, false);
@@ -451,178 +497,14 @@ mod tests {
                 assert!(p.pos[0].is_finite() && p.pos[1].is_finite(), "{w}x{h}: {:?}", p.pos);
                 assert!(p.color.iter().all(|c| (0.0..=1.0).contains(c)));
             }
-            let _ = battle_labels(&v, w, h);
+            let _ = flat_anchors(&v, w, h);
         }
         // An empty max_hp or an absurd gauge neither divides by zero nor overflows the bar.
         assert_eq!(fraction(5, 0), 0.0);
         assert_eq!(fraction(u32::MAX, 1), 1.0);
-    }
-
-    trait CloneWith {
-        fn clone_with(self, i: u32) -> Self;
-    }
-
-    impl CloneWith for Bar {
-        fn clone_with(mut self, i: u32) -> Self {
-            self.name = format!("e{i}");
-            self
-        }
-    }
-
-    /// Draw `v` offscreen through the real GPU pipeline (`crate::render::Gpu`) and read the pixels
-    /// back as tightly packed RGBA8. `None` (with a note) when no adapter is available.
-    fn render_offscreen(v: &BattleView, w: u32, h: u32, overlay: Option<&crate::ui::draw::DrawList>) -> Option<Vec<u8>> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let adapter = match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())) {
-            Ok(a) => a,
-            Err(e) => {
-                eprintln!("skipped: no GPU adapter available ({e})");
-                return None;
-            }
-        };
-        eprintln!("offscreen adapter: {:?}", adapter.get_info().name);
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            required_limits: wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits()),
-            ..wgpu::DeviceDescriptor::default()
-        }))
-        .expect("device");
-        let format = wgpu::TextureFormat::Rgba8Unorm;
-        let mut gpu = crate::render::Gpu::new(device.clone(), queue.clone(), format);
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("battle-offscreen"),
-            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let target = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        gpu.draw_scene(&target, &battle_vertices(v, w, h, false), None, crate::render::CLEAR_RGB, false);
-        if let Some(overlay) = overlay {
-            gpu.draw_overlay(&target, &overlay.vertices(w, h, false));
-        }
-        let padded = (w * 4).next_multiple_of(256);
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("battle-readback"),
-            size: u64::from(padded * h),
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        enc.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &readback,
-                layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(padded), rows_per_image: Some(h) },
-            },
-            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-        );
-        queue.submit(std::iter::once(enc.finish()));
-        let (tx, rx) = std::sync::mpsc::channel();
-        readback.slice(..).map_async(wgpu::MapMode::Read, move |r| tx.send(r).expect("send"));
-        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
-        rx.recv().expect("map callback").expect("map");
-        let data = readback.slice(..).get_mapped_range().expect("mapped range");
-        let mut out = Vec::with_capacity((w * h * 4) as usize);
-        for row in data.chunks(padded as usize).take(h as usize) {
-            out.extend_from_slice(&row[..(w * 4) as usize]);
-        }
-        Some(out)
-    }
-
-    /// The battle view through the real GPU pipeline: the pixels have the colours the layout says.
-    /// (This is as close as this box gets to the window: the surface itself needs a display.) Like
-    /// the other offscreen tests it is ignored by default and run with
-    /// `cargo test -p fmv-client -- --ignored offscreen`; it prints the adapter it drew with.
-    #[test]
-    #[ignore = "needs a GPU or software Vulkan/GL driver"]
-    fn offscreen_the_battle_view_has_the_status_band_the_ready_card_and_the_filled_bars() {
-        let (w, h) = (800u32, 600u32);
-        let mut cloud = bar(30, 100, GAUGE_MAX, true, true, true);
-        cloud.name = "Cloud".into();
-        let v = view(
-            vec![bar(100, 100, GAUGE_MAX / 2, false, true, false), cloud],
-            vec![bar(10, 10, 0, false, true, false), bar(0, 10, 0, false, false, false)],
-            Status::Diverged,
-        );
-        let mut text = crate::ui::draw::DrawList::new();
-        crate::battle::draw_battle_text(&v, w, h, &mut text);
-        let Some(img) = render_offscreen(&v, w, h, Some(&text)) else { return };
-        // To look at it: `FMV_SHOT_DIR=<dir> cargo test -p fmv-client -- --ignored offscreen_the_battle_view`
-        // writes `battle-view.ppm` (a plain RGB image) there.
-        if let Some(dir) = std::env::var_os("FMV_SHOT_DIR") {
-            let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
-            ppm.extend(img.chunks(4).flat_map(|p| [p[0], p[1], p[2]]));
-            let path = std::path::Path::new(&dir).join("battle-view.ppm");
-            std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, ppm)).expect("write the picture");
-            eprintln!("wrote {}", path.display());
-        }
-        let px = |x: f32, y: f32| {
-            let i = (((y as u32) * w + x as u32) * 4) as usize;
-            [img[i], img[i + 1], img[i + 2]]
-        };
-        // The band across the top is red because the replay diverged; the gap between the two rows
-        // is the plain backdrop.
-        assert_eq!(px(400.0, 5.0), BAND_DIVERGED_RGB);
-        assert_eq!(px(400.0, h as f32 / 2.0), BACKDROP_RGB);
-        let cs = cards(&v, w as f32, h as f32);
-        assert_eq!(cs.len(), 4);
-        let party: Vec<&Card<'_>> = cs.iter().filter(|c| !c.enemy).collect();
-        for (card, ready) in party.iter().zip([false, true]) {
-            let r = card.rect;
-            let (cy, border_x) = ((r.y0 + r.y1) * 0.5, r.x0 + 1.0);
-            let want = if ready { BORDER_READY_RGB } else { BORDER_PARTY_RGB };
-            assert_eq!(px(border_x, cy), want, "card border (ready: {ready})");
-            // The gauge row: yellow when ready, blue (half full: its left half) otherwise.
-            let inner = r.inset(BORDER).inset(PAD - BORDER);
-            let atb_y = inner.y0 + HP_H + PAD * 0.5 + ATB_H * 0.5;
-            let gauge = px(inner.x0 + 4.0, atb_y);
-            assert_eq!(gauge, if ready { ATB_READY_RGB } else { ATB_RGB }, "gauge (ready: {ready})");
-            if !ready {
-                assert_eq!(px(inner.x1 - 4.0, atb_y), BAR_BACK_RGB, "the empty half of a half-full gauge");
-            }
-            // The HP bar: green when full, red at 30%.
-            let hp = px(inner.x0 + 4.0, inner.y0 + HP_H * 0.5);
-            assert_eq!(hp, if ready { HP_WARN_RGB } else { HP_GOOD_RGB }, "hp (ready: {ready})");
-        }
-        // Our own character carries the white marker in its card's corner.
-        assert_eq!(px(party[1].rect.x0 + 3.0, party[1].rect.y0 + 3.0), MARKER_RGB);
-        // The dead enemy's card is grey, the living one's red-brown.
-        let enemies: Vec<&Card<'_>> = cs.iter().filter(|c| c.enemy).collect();
-        let mid = |c: &Card<'_>| ((c.rect.x0 + 1.0), (c.rect.y0 + c.rect.y1) * 0.5);
-        assert_eq!(px(mid(enemies[0]).0, mid(enemies[0]).1), BORDER_ENEMY_RGB);
-        assert_eq!(px(mid(enemies[1]).0, mid(enemies[1]).1), BORDER_DEAD_RGB);
-
-        // The text really reaches the screen: the status line under the band (red, because the view
-        // is "diverged") and our character's name above its card (accent colour) have glyph pixels.
-        let near = |got: [u8; 3], want: [u8; 4]| (0..3).all(|i| got[i].abs_diff(want[i]) <= 3);
-        let count_in = |x0: u32, x1: u32, y0: u32, y1: u32, want: [u8; 4]| {
-            (y0..y1).flat_map(|y| (x0..x1).map(move |x| (x, y))).filter(|&(x, y)| near(px(x as f32, y as f32), want)).count()
-        };
-        let band_text_rows = (BAND_H as u32 + 6, BAND_H as u32 + 6 + 18);
-        assert!(
-            count_in(0, w, band_text_rows.0, band_text_rows.1, crate::ui::widgets::ERROR) > 100,
-            "the red status line is drawn under the band"
-        );
-        let me = party[1].rect;
-        assert!(
-            count_in(me.x0 as u32, me.x1 as u32, me.y0 as u32 - 22, me.y0 as u32 - 2, crate::ui::widgets::ACCENT) > 20,
-            "our character's name is drawn in the accent colour above its card"
-        );
-        // The same view without the text has none of those pixels there (so the test cannot pass on
-        // the rectangles alone).
-        let Some(plain) = render_offscreen(&v, w, h, None) else { return };
-        let px_plain = |x: u32, y: u32| {
-            let i = ((y * w + x) * 4) as usize;
-            [plain[i], plain[i + 1], plain[i + 2]]
-        };
-        let stray = (band_text_rows.0..band_text_rows.1)
-            .flat_map(|y| (0..w).map(move |x| (x, y)))
-            .filter(|&(x, y)| near(px_plain(x, y), crate::ui::widgets::ERROR))
-            .count();
-        assert_eq!(stray, 0, "without the overlay the status line is absent");
+        assert_eq!(gauge_fraction(&Bar { ready: true, alive: true, gauge: 0, ..Bar::default() }), 1.0);
+        assert_eq!(gauge_fraction(&Bar { ready: true, alive: false, gauge: 0, ..Bar::default() }), 0.0);
+        assert_eq!(gauge_fraction(&Bar { gauge: u32::MAX, ..Bar::default() }), 1.0);
     }
 
     #[test]

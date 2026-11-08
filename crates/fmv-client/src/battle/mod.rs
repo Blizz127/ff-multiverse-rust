@@ -24,17 +24,38 @@
 
 mod bot;
 mod data;
+mod hud;
 mod menu;
+mod names;
+mod panels;
+mod popups;
 mod text;
 mod view;
 
 pub use bot::BattleBot;
 pub use data::open_rules;
+pub use menu::MenuKey;
 pub use text::draw_battle_text;
 pub use view::{battle_vertices, Bar, BattleView, Status};
 
+// The rest of the overlay's API, for the code that wires the names (`main`), the menu's data and the
+// 3D scene (the redraw): not all of it is used by this crate's own window yet.
+#[allow(unused_imports)]
+pub use menu::{BattleMenuModel, Level, MenuItem, MenuSpell, TargetRule};
+#[allow(unused_imports)]
+pub use data::open_names;
+#[allow(unused_imports)]
+pub use names::NameBook;
+#[allow(unused_imports)]
+pub use text::draw_battle_overlay;
+#[allow(unused_imports)]
+pub use view::{flat_anchors, Anchors};
+
 use fmv_core::{AccountId, Fingerprint};
 use fmv_ff7_battle::rules::{Combatant, GAUGE_MAX};
+use hud::BattleHud;
+use menu::{Choice, Reply};
+use panels::RewardLine;
 use fmv_protocol::battle::{BattleEvent, Command, Outcome};
 use fmv_protocol::{
     ActorId, AppliedCommand, BattleId, BattleRejection, BattleReplay, BattleReward, BattleRules, BattleSetup, ClientMsg, ServerMsg,
@@ -56,6 +77,21 @@ pub fn install_local_rules(rules: Option<Arc<dyn BattleRules>>) {
 
 fn local_rules() -> Option<Arc<dyn BattleRules>> {
     LOCAL_RULES.get().and_then(Clone::clone)
+}
+
+/// This machine's own spell, item and attack names for the battle windows, installed once per
+/// process like the rules (see [`open_names`]). Without them the windows use plain labels.
+static LOCAL_NAMES: OnceLock<Option<Arc<NameBook>>> = OnceLock::new();
+
+/// Install this machine's names for every [`BattleClient`] made from now on (only the first call
+/// counts).
+#[allow(dead_code)] // `main` calls it next to `install_local_rules`
+pub fn install_local_names(names: Option<Arc<NameBook>>) {
+    let _ = LOCAL_NAMES.set(names);
+}
+
+fn local_names() -> Option<Arc<NameBook>> {
+    LOCAL_NAMES.get().and_then(Clone::clone)
 }
 
 /// A command sent for our character is considered lost (and may be sent again) after this long
@@ -84,6 +120,19 @@ impl BattleCmd {
             BattleCmd::RequestEncounter { formation } => ClientMsg::RequestEncounter { formation_id: formation },
         }
     }
+}
+
+/// What a key of the battle menu comes to (see [`BattleClient::menu_key`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuReply {
+    /// The menu changed (the cursor moved, a level opened or closed): nothing to send.
+    Handled,
+    /// No menu was open for this key (not our turn), or `Back` at the top level.
+    Ignored,
+    /// The key was understood but cannot be done, and why.
+    Refused(&'static str),
+    /// Send this request.
+    Send(BattleCmd),
 }
 
 /// The content of an `EncounterStart`.
@@ -160,6 +209,8 @@ pub struct BattleClient {
     rejections: u64,
     last_rejection: Option<BattleRejection>,
     notes: VecDeque<String>,
+    /// The live state of the battle UI: command menu, floating numbers, banner, the lingering end.
+    hud: BattleHud,
 }
 
 impl std::fmt::Debug for BattleClient {
@@ -193,6 +244,7 @@ impl BattleClient {
             rejections: 0,
             last_rejection: None,
             notes: VecDeque::new(),
+            hud: BattleHud::new(local_names()),
         }
     }
 
@@ -201,6 +253,13 @@ impl BattleClient {
     #[cfg(test)]
     pub fn set_rules(&mut self, rules: Option<Arc<dyn BattleRules>>) {
         self.rules = rules;
+    }
+
+    /// What the command menu offers: the spells, the items, whether Defend exists. Empty (only
+    /// Attack) until the integrator fills it from the engine's spell list and the inventory.
+    #[cfg_attr(not(test), allow(dead_code))] // filled where the engine's spells and the inventory arrive
+    pub fn menu_model_mut(&mut self) -> &mut menu::BattleMenuModel {
+        self.hud.model_mut()
     }
 
     // ----- queries ------------------------------------------------------------------------
@@ -306,7 +365,7 @@ impl BattleClient {
                 },
             ),
             ServerMsg::BattleEvent { battle_id, tick, events, command } => self.on_event(now, battle_id, tick, &events, command),
-            ServerMsg::BattleEnd { battle_id, outcome, rewards } => self.on_end(battle_id, outcome, &rewards),
+            ServerMsg::BattleEnd { battle_id, outcome, rewards } => self.on_end(now, battle_id, outcome, &rewards),
             ServerMsg::BattleRejected { battle_id, reason } => self.on_rejected(battle_id, reason),
             _ => {}
         }
@@ -324,6 +383,7 @@ impl BattleClient {
             .position(|m| m.account == self.me)
             .and_then(|i| u8::try_from(i).ok())
             .map(ActorId);
+        self.hud.begin(setup.formation_id, my_actor);
         let mut failure = None;
         let rules = self.rules.clone();
         let replay = match &rules {
@@ -384,17 +444,20 @@ impl BattleClient {
         };
         active.last_message = now;
         active.messages += 1;
-        if command.is_some_and(|c| Some(c.actor) == active.my_actor) {
+        let my_command = command.is_some_and(|c| Some(c.actor) == active.my_actor);
+        if my_command {
             active.pending = None;
             active.my_commands += 1;
         }
+        // Floating numbers and the menu follow the events, whether or not this machine can replay them.
+        self.hud.on_events(now, events, my_command);
         let Some(replay) = active.replay.as_mut() else { return };
         if let Err(d) = replay.apply(tick, events, command.as_ref()) {
             self.diverged(format!("{battle_id} at tick {tick}: {d}"));
         }
     }
 
-    fn on_end(&mut self, battle_id: BattleId, outcome: Outcome, rewards: &[BattleReward]) {
+    fn on_end(&mut self, now: f64, battle_id: BattleId, outcome: Outcome, rewards: &[BattleReward]) {
         if self.active.as_ref().map(ActiveBattle::id) != Some(battle_id) {
             self.note(format!("{battle_id} ended, but it is not the battle we are in: ignored"));
             return;
@@ -406,6 +469,9 @@ impl BattleClient {
             Outcome::Defeat => self.defeats += 1,
         }
         let mine = rewards.iter().find(|r| r.account == self.me);
+        // The screen keeps this last view, with the panel, for a few seconds.
+        let last = self.render(&active, now);
+        self.hud.finish(now, last, outcome, mine.map(|r| RewardLine { exp: r.exp, gil: r.gil, ap: r.ap, items: Vec::new() }));
         let paid = match mine {
             Some(r) => format!("you earned {} exp, {} gil, {} ap", r.exp, r.gil, r.ap),
             None => "no reward for you".to_string(),
@@ -499,13 +565,28 @@ impl BattleClient {
         }
     }
 
-    /// What to draw now (`None` outside a battle). Gauges are extrapolated from the last server
-    /// message for display only.
+    /// What to draw now: the battle that runs, or for a few seconds after its end the last view of
+    /// the one that just ended, with its victory or defeat panel (see [`BattleClient::lingering`]);
+    /// `None` otherwise. Gauges are extrapolated from the last server message for display only.
     pub fn view(&self, now: f64) -> Option<BattleView> {
-        let active = self.active.as_ref()?;
+        let Some(active) = self.active.as_ref() else { return self.hud.linger_view(now) };
+        let mut view = self.render(active, now);
+        self.hud.decorate(&mut view, now);
+        Some(view)
+    }
+
+    /// Is the end of a battle still on screen (the view lingers after `BattleEnd`)? The player is
+    /// already free in the field then ([`BattleClient::in_battle`] is false), but the window keeps drawing the
+    /// battle and should not let the player walk until it is gone.
+    pub fn lingering(&self, now: f64) -> bool {
+        self.hud.lingering(now)
+    }
+
+    /// The fighters and the replay's standing, without the live parts of the UI.
+    fn render(&self, active: &ActiveBattle, now: f64) -> BattleView {
         let elapsed_ticks = ((now - active.last_message).max(0.0) * f64::from(active.ticks_per_second)).min(1_000_000.0) as u64;
         let Some(replay) = active.replay.as_ref() else {
-            return Some(BattleView::unverified(active.id));
+            return BattleView::unverified(active.id);
         };
         let state = replay.state();
         let bar = |id: ActorId| -> Option<Bar> {
@@ -517,31 +598,70 @@ impl BattleClient {
                 c.gauge
             };
             Some(Bar {
+                actor: id,
                 name: c.name.clone(),
                 hp: c.hp,
                 max_hp: c.max_hp,
+                mp: c.mp,
+                max_mp: c.max_mp,
                 gauge,
                 ready: c.ready && c.is_alive(),
                 alive: c.is_alive(),
                 mine: Some(id) == active.my_actor,
             })
         };
-        Some(BattleView {
+        BattleView {
             id: active.id,
             party: state.party_ids().into_iter().filter_map(bar).collect(),
             enemies: state.enemy_ids().into_iter().filter_map(bar).collect(),
             status: if active.diverged { Status::Diverged } else { Status::Verified },
             waiting_for_answer: active.pending.is_some_and(|sent| now - sent < PENDING_TIMEOUT_S),
-        })
+            ..BattleView::default()
+        }
+    }
+
+    /// A key of the battle UI (see [`menu::BattleMenu`]): the menu of our character's turn takes it
+    /// when one is open, and the lingering end of a battle takes `Confirm` and `Back` (closing the
+    /// panel, or keeping the key from doing anything else while it cannot be closed yet).
+    pub fn menu_key(&mut self, key: MenuKey, now: f64) -> MenuReply {
+        if matches!(key, MenuKey::Confirm | MenuKey::Back) && self.hud.dismiss(now) {
+            return MenuReply::Handled;
+        }
+        let Some(active) = self.active.as_ref() else { return MenuReply::Ignored };
+        let view = self.render(active, now);
+        match self.hud.press(key, &view) {
+            Reply::Handled => MenuReply::Handled,
+            Reply::Ignored => MenuReply::Ignored,
+            Reply::Refused(why) => MenuReply::Refused(why.text()),
+            Reply::Send(choice) => self.command_for(choice, now).map_or_else(MenuReply::Refused, MenuReply::Send),
+        }
+    }
+
+    /// Esc or Backspace: goes back one level of the menu, or closes the lingering end of a battle.
+    /// Returns whether it did anything; when it did not, the key is the window's to handle (and
+    /// in a battle that never quits).
+    pub fn back(&mut self, now: f64) -> bool {
+        self.menu_key(MenuKey::Back, now) == MenuReply::Handled
+    }
+
+    /// The request for `choice` of our own character, or why there is none.
+    fn command_for(&self, choice: Choice, now: f64) -> Result<BattleCmd, &'static str> {
+        let active = self.active.as_ref().ok_or("there is no battle")?;
+        let actor = active.my_actor.ok_or("you are not in this battle")?;
+        if active.pending.is_some_and(|sent| now - sent < PENDING_TIMEOUT_S) {
+            return Err("your last command is still waiting for the server");
+        }
+        let command = choice.to_command().ok_or("that command is not available yet")?;
+        Ok(BattleCmd::Command { battle_id: active.id, actor, command })
     }
 
     /// A short text for the window title while a battle runs (empty otherwise).
     pub fn title_suffix(&self, now: f64) -> String {
-        let Some(view) = self.view(now) else { return String::new() };
+        let Some(view) = self.active.as_ref().map(|a| self.render(a, now)) else { return String::new() };
         let enemies = view.enemies.iter().filter(|b| b.alive).count();
         let me = match view.party.iter().find(|b| b.mine) {
             Some(b) if !b.alive => "you are down",
-            Some(b) if b.ready => "YOUR TURN: Space/Enter attacks",
+            Some(b) if b.ready => "YOUR TURN: choose a command",
             Some(_) => "waiting for your gauge",
             None => "watching",
         };
