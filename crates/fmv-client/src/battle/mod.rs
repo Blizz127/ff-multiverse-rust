@@ -20,12 +20,21 @@
 //!   [`draw_battle_text`] is the overlay over them; a scene gives its own [`Anchors`] instead.
 //! * The command menu is a pure state machine (`menu`); [`BattleClient::menu_key`] feeds it the
 //!   player's keys and answers with the request to send ([`MenuReply`]). Its model (spells, items,
-//!   Defend) is filled by the integrator from the engine ([`BattleClient::menu_model_mut`]); empty,
-//!   only Attack works and the rest is greyed out. `hud` keeps what the battle itself does not:
-//!   the menu, the floating numbers, the banner and the LINGER: for a few seconds after
+//!   Defend) is filled by the client itself from the replayed engine (the spells our character
+//!   knows, which items the engine can use) and the inventory the server sent: at every battle
+//!   start and at every `Inventory` message while a battle runs (`BattleClient::refresh_menu_model`).
+//!   Without a replay, or when we are not in the party, it stays empty: only Attack works and the
+//!   rest is greyed out. `hud` keeps what the battle itself does not: the menu, the floating
+//!   numbers, the banner (the name of each action) and the LINGER: for a few seconds after
 //!   `BattleEnd` ([`BattleClient::lingering`]) [`BattleClient::view`] still returns the last view
 //!   with its panel, while [`BattleClient::in_battle`] is already false (the server freed us).
-//! * [`BattleBot`] is the headless `--battle-auto` player.
+//! * The inventory (protocol v6) is the server's word about what our account carries; the client
+//!   keeps the last one it said ([`BattleClient::on_inventory`]), bounded whatever it says, and
+//!   notes each message as one `inventory: stacks=.. total=.. items=<item>:<count>,..` line. The
+//!   server sends a fresh one on joining, after each item our character used and after drops; the
+//!   engine itself knows no inventory.
+//! * [`BattleBot`] is the headless `--battle-auto` player: it attacks, and heals itself with the
+//!   cheapest healing spell it can pay for when its HP is low ([`BattleClient::bot_command`]).
 //! * [`open_rules`] reads this machine's battle data (the same library set as the field archive);
 //!   [`open_names`] reads the spell, item and enemy attack names the windows show from the same files.
 //!
@@ -35,6 +44,8 @@
 //! one. Everything from the server is untrusted: it is bounds-checked by the replay and nothing
 //! here can panic on it.
 
+#[cfg(test)]
+mod action_tests;
 mod bot;
 mod data;
 mod hud;
@@ -69,14 +80,16 @@ pub use text::draw_battle_overlay;
 pub use view::{flat_anchors, Anchors};
 
 use fmv_core::{AccountId, Fingerprint};
-use fmv_ff7_battle::rules::{Combatant, GAUGE_MAX};
+use fmv_ff7_battle::rules::{BattleState, Combatant, GAUGE_MAX};
 use fmv_protocol::battle::{BattleEvent, Command, Outcome};
 use fmv_protocol::{
-    ActorId, AppliedCommand, BattleId, BattleRejection, BattleReplay, BattleReward, BattleRules, BattleSetup, ClientMsg, ServerMsg,
+    ActorId, AppliedCommand, BattleId, BattleRejection, BattleReplay, BattleReward, BattleRules, BattleSetup, ClientMsg, InventoryEntry,
+    ServerMsg, MAX_INVENTORY_STACKS,
 };
 use hud::BattleHud;
 use menu::{Choice, Reply};
-use panels::RewardLine;
+use names::{item_name, spell_name};
+use panels::{RewardItem, RewardLine};
 use std::collections::VecDeque;
 use std::sync::{Arc, OnceLock};
 
@@ -159,6 +172,67 @@ struct Start {
     data_fingerprint: Fingerprint,
 }
 
+/// The commands of our own character that the server applied, by kind (counted from the
+/// `AppliedCommand` the server echoes in each event).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Applied {
+    attack: u64,
+    magic: u64,
+    item: u64,
+    defend: u64,
+}
+
+impl Applied {
+    fn count(&mut self, command: &Command) {
+        let kind = match command {
+            Command::Attack { .. } => &mut self.attack,
+            Command::Magic { .. } => &mut self.magic,
+            Command::Item { .. } => &mut self.item,
+            Command::Defend => &mut self.defend,
+        };
+        *kind += 1;
+    }
+
+    fn total(&self) -> u64 {
+        self.attack + self.magic + self.item + self.defend
+    }
+
+    fn add(&mut self, other: Applied) {
+        self.attack += other.attack;
+        self.magic += other.magic;
+        self.item += other.item;
+        self.defend += other.defend;
+    }
+}
+
+/// An inventory as this client keeps it, whatever the server sent (it is untrusted): no stack of
+/// zero, an item that appears twice merged into its first place (the count saturating at `u16`),
+/// at most [`MAX_INVENTORY_STACKS`] different items (the first ones), otherwise in the order sent. A
+/// well-formed inventory, which the server sends (one stack per item, ascending), comes out as it went in.
+fn normalise_inventory(items: Vec<InventoryEntry>) -> Vec<InventoryEntry> {
+    let mut kept: Vec<InventoryEntry> = Vec::new();
+    for entry in items {
+        if entry.count == 0 {
+            continue;
+        }
+        if let Some(have) = kept.iter_mut().find(|have| have.item == entry.item) {
+            have.count = have.count.saturating_add(entry.count);
+        } else if kept.len() < MAX_INVENTORY_STACKS {
+            kept.push(entry);
+        }
+    }
+    kept
+}
+
+/// `item:count` pairs, comma separated, for a note (`-` when there are none): ids and counts only,
+/// never a name.
+fn item_list(items: &[InventoryEntry]) -> String {
+    if items.is_empty() {
+        return "-".to_string();
+    }
+    items.iter().map(|e| format!("{}:{}", e.item, e.count)).collect::<Vec<_>>().join(",")
+}
+
 /// One battle this client is in.
 #[derive(Debug)]
 pub struct ActiveBattle {
@@ -175,8 +249,8 @@ pub struct ActiveBattle {
     pending: Option<f64>,
     diverged: bool,
     messages: u64,
-    /// Commands of OUR character that the server applied (it echoes each one in its event).
-    my_commands: u64,
+    /// Commands of OUR character that the server applied (it echoes each one in its event), by kind.
+    my_commands: Applied,
 }
 
 impl ActiveBattle {
@@ -220,10 +294,14 @@ pub struct BattleClient {
     divergences: u64,
     /// Ended battles whose whole log AND ending this machine reproduced with its own battle data.
     verified: u64,
-    /// Commands of our character the server applied, over the ended battles.
-    commands_applied: u64,
+    /// Commands of our character the server applied, over the ended battles, by kind.
+    applied: Applied,
     rejections: u64,
     last_rejection: Option<BattleRejection>,
+    /// What the server last said our account carries (see [`normalise_inventory`]); empty until it says.
+    inventory: Vec<InventoryEntry>,
+    /// `Inventory` messages received.
+    inventory_updates: u64,
     notes: VecDeque<String>,
     /// The live state of the battle UI: command menu, floating numbers, banner, the lingering end.
     hud: BattleHud,
@@ -256,9 +334,11 @@ impl BattleClient {
             defeats: 0,
             divergences: 0,
             verified: 0,
-            commands_applied: 0,
+            applied: Applied::default(),
             rejections: 0,
             last_rejection: None,
+            inventory: Vec::new(),
+            inventory_updates: 0,
             notes: VecDeque::new(),
             hud: BattleHud::new(local_names()),
         }
@@ -271,9 +351,15 @@ impl BattleClient {
         self.rules = rules;
     }
 
-    /// What the command menu offers: the spells, the items, whether Defend exists. Empty (only
-    /// Attack) until the integrator fills it from the engine's spell list and the inventory.
-    #[cfg_attr(not(test), allow(dead_code))] // filled where the engine's spells and the inventory arrive
+    /// Replace the names the battle windows show (tests; a running client uses the process-wide ones).
+    #[cfg(test)]
+    pub fn set_names(&mut self, names: Option<Arc<NameBook>>) {
+        self.hud.set_names(names);
+    }
+
+    /// What the command menu offers: the spells, the items, whether Defend exists. The client fills it
+    /// itself (`refresh_menu_model`); tests change it to try the menu on other lists.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn menu_model_mut(&mut self) -> &mut menu::BattleMenuModel {
         self.hud.model_mut()
     }
@@ -326,7 +412,7 @@ impl BattleClient {
     /// Commands of our own character that the server applied, over the ended battles.
     #[cfg(test)]
     pub fn commands_applied(&self) -> u64 {
-        self.commands_applied
+        self.applied.total()
     }
 
     /// How many requests and commands the server refused.
@@ -339,15 +425,44 @@ impl BattleClient {
         self.last_rejection
     }
 
+    /// What the server last said our account carries: no stack of zero, one stack per item, at most
+    /// [`MAX_INVENTORY_STACKS`] of them (whatever was sent). Empty until it says.
+    #[cfg(test)]
+    pub fn inventory(&self) -> &[InventoryEntry] {
+        &self.inventory
+    }
+
+    /// How many items our account carries in all, the counts of every stack added up (0 until the
+    /// server has said: the SMOKE line's `items=`).
+    pub fn inventory_total(&self) -> u32 {
+        self.inventory.iter().map(|e| u32::from(e.count)).sum()
+    }
+
+    /// `Inventory` messages received.
+    #[cfg(test)]
+    pub fn inventory_updates(&self) -> u64 {
+        self.inventory_updates
+    }
+
     /// One line about the whole battle situation (the headless bot logs it when it finishes).
     pub fn summary(&self) -> String {
         let refusal = match self.last_rejection {
             Some(r) => format!("{} refusal(s), the last: {r}", self.rejections),
             None => "no refusals".to_string(),
         };
+        let a = &self.applied;
         format!(
-            "{} battle(s) entered, {} won, {} lost, {} verified by replay, {} divergence(s), {} command(s) of ours applied, {refusal}",
-            self.entered, self.victories, self.defeats, self.verified, self.divergences, self.commands_applied
+            "{} battle(s) entered, {} won, {} lost, {} verified by replay, {} divergence(s), {} command(s) of ours applied ({} attack, {} magic, {} item, {} defend), {refusal}",
+            self.entered,
+            self.victories,
+            self.defeats,
+            self.verified,
+            self.divergences,
+            a.total(),
+            a.attack,
+            a.magic,
+            a.item,
+            a.defend
         )
     }
 
@@ -446,11 +561,14 @@ impl BattleClient {
             pending: None,
             diverged: false,
             messages: 0,
-            my_commands: 0,
+            my_commands: Applied::default(),
         });
         if let Some(why) = failure {
             self.diverged(why);
         }
+        // The menu model outlives a battle: this battle's spells (and the inventory's items) replace
+        // whatever the last one left.
+        self.refresh_menu_model();
     }
 
     fn on_event(&mut self, now: f64, battle_id: BattleId, tick: u64, events: &[BattleEvent], command: Option<AppliedCommand>) {
@@ -460,10 +578,11 @@ impl BattleClient {
         };
         active.last_message = now;
         active.messages += 1;
-        let my_command = command.is_some_and(|c| Some(c.actor) == active.my_actor);
-        if my_command {
+        let mine = command.filter(|c| Some(c.actor) == active.my_actor);
+        let my_command = mine.is_some();
+        if let Some(applied) = mine {
             active.pending = None;
-            active.my_commands += 1;
+            active.my_commands.count(&applied.command);
         }
         // Floating numbers and the menu follow the events, whether or not this machine can replay them.
         self.hud.on_events(now, events, my_command);
@@ -485,11 +604,21 @@ impl BattleClient {
             Outcome::Defeat => self.defeats += 1,
         }
         let mine = rewards.iter().find(|r| r.account == self.me);
+        // The items the server dropped to us (it rolled them after the battle: the replay cannot check them),
+        // bounded like an inventory because they come from the same untrusted place.
+        let drops = mine.map(|r| normalise_inventory(r.items.clone())).unwrap_or_default();
+        let line = mine.map(|r| RewardLine {
+            exp: r.exp,
+            gil: r.gil,
+            ap: r.ap,
+            items: drops.iter().map(|d| RewardItem { name: item_name(self.hud.names(), d.item), count: d.count }).collect(),
+        });
         // The screen keeps this last view, with the panel, for a few seconds.
         let last = self.render(&active, now);
-        self.hud.finish(now, last, outcome, mine.map(|r| RewardLine { exp: r.exp, gil: r.gil, ap: r.ap, items: Vec::new() }));
+        self.hud.finish(now, last, outcome, line);
         let paid = match mine {
-            Some(r) => format!("you earned {} exp, {} gil, {} ap", r.exp, r.gil, r.ap),
+            Some(r) if drops.is_empty() => format!("you earned {} exp, {} gil, {} ap", r.exp, r.gil, r.ap),
+            Some(r) => format!("you earned {} exp, {} gil, {} ap, items={}", r.exp, r.gil, r.ap, item_list(&drops)),
             None => "no reward for you".to_string(),
         };
         let mut failure = None;
@@ -508,16 +637,80 @@ impl BattleClient {
                 format!("verified: the server's {} message(s) replayed from this machine's own battle data and matched", active.messages)
             }
         };
-        self.commands_applied += active.my_commands;
+        self.applied.add(active.my_commands);
         self.note(format!(
             "{battle_id} ended in {outcome:?} ({paid}); back in the field; {} command(s) of yours applied; {how}",
-            active.my_commands
+            active.my_commands.total()
         ));
         if let Some(why) = failure {
             // The battle is gone, so the flag has nothing to mark: count and report it.
             self.divergences += 1;
             self.note(format!("BATTLE DIVERGENCE: {why}"));
         }
+    }
+
+    /// The server told us what our account carries (protocol v6): the WHOLE inventory, on joining, after
+    /// an item of ours was used in a battle and after a win that dropped items. It replaces the last one
+    /// (kept bounded: see `normalise_inventory`), is noted as one line, and while a battle runs the
+    /// command menu's Item list follows it. `_now` is seconds on the local monotonic clock, like
+    /// [`BattleClient::on_message`]'s.
+    pub fn on_inventory(&mut self, _now: f64, items: Vec<InventoryEntry>) {
+        self.inventory = normalise_inventory(items);
+        self.inventory_updates += 1;
+        // `key=value` layout, ids and counts only: `scripts` and the tests read it.
+        self.note(format!(
+            "inventory: stacks={} total={} items={}",
+            self.inventory.len(),
+            self.inventory_total(),
+            item_list(&self.inventory)
+        ));
+        if self.active.is_some() {
+            self.refresh_menu_model();
+        }
+    }
+
+    /// What the command menu offers our character, from the replayed engine and the inventory:
+    ///
+    /// * the spells it knows ([`BattleState::spells_for`]), each with its cost and the side it aims at,
+    ///   named from this machine's book (`Spell <id>` without one);
+    /// * the inventory's items that the engine can use in battle ([`BattleState::item_info`]; an item it
+    ///   cannot is not listed at all), a revival aimed at the fallen, other restoring items at the party
+    ///   and the rest at the enemies;
+    /// * Defend.
+    ///
+    /// Nothing is switched off here: the menu greys a spell out by comparing its cost with the MP it is
+    /// given every frame, and an item by its count, so the model never bakes in a number that moves.
+    /// Without a battle, a replay (no battle data, or one that cannot be built) or a seat in the party
+    /// the model is cleared: the menu then offers only Attack.
+    fn refresh_menu_model(&mut self) {
+        let model = self.menu_model_of_battle();
+        *self.hud.model_mut() = model;
+    }
+
+    fn menu_model_of_battle(&self) -> BattleMenuModel {
+        let Some(active) = self.active.as_ref() else { return BattleMenuModel::default() };
+        let (Some(replay), Some(mine)) = (active.replay.as_ref(), active.my_actor) else { return BattleMenuModel::default() };
+        let state = replay.state();
+        let book = self.hud.names();
+        let spells = state
+            .spells_for(mine)
+            .into_iter()
+            .map(|s| MenuSpell::new(s.spell, spell_name(book, s.spell), s.mp_cost, TargetRule::from_allies(s.targets_allies)))
+            .collect();
+        let items = self
+            .inventory
+            .iter()
+            .filter_map(|stack| {
+                let info = state.item_info(stack.item)?;
+                let target = match (info.revives, info.targets_allies) {
+                    (true, _) => TargetRule::DeadAllies,
+                    (false, true) => TargetRule::Allies,
+                    (false, false) => TargetRule::Enemies,
+                };
+                Some(MenuItem::new(stack.item, item_name(book, stack.item), stack.count, target))
+            })
+            .collect();
+        BattleMenuModel { spells, items, defend: true }
     }
 
     fn on_rejected(&mut self, battle_id: Option<BattleId>, reason: BattleRejection) {
@@ -555,10 +748,10 @@ impl BattleClient {
 
     // ----- playing ------------------------------------------------------------------------
 
-    /// The attack our own character can make right now: our gauge is full (as far as the replay
-    /// knows, which is as far as the server has said), no command of ours is in flight, and there
-    /// is a living enemy to hit (the first one).
-    pub fn attack_command(&self, now: f64) -> Option<BattleCmd> {
+    /// Is it our own character's turn to command, as far as the replay knows (which is as far as the
+    /// server has said)? Our gauge is full, the battle is not over and no command of ours is in flight:
+    /// then the battle, its engine and our actor.
+    fn my_turn(&self, now: f64) -> Option<(&ActiveBattle, &BattleState, ActorId)> {
         let active = self.active.as_ref()?;
         let state = active.replay.as_ref()?.state();
         let mine = active.my_actor?;
@@ -568,8 +761,43 @@ impl BattleClient {
         if active.pending.is_some_and(|sent| now - sent < PENDING_TIMEOUT_S) {
             return None;
         }
+        Some((active, state, mine))
+    }
+
+    /// The attack our own character can make right now: it is our turn (our gauge is full as far as the
+    /// replay knows, which is as far as the server has said, and no command of ours is in flight) and
+    /// there is a living enemy to hit (the first one).
+    pub fn attack_command(&self, now: f64) -> Option<BattleCmd> {
+        let (active, state, mine) = self.my_turn(now)?;
         let target = state.enemy_ids().into_iter().find(|e| state.actor(*e).is_some_and(Combatant::is_alive))?;
         Some(BattleCmd::Command { battle_id: active.id, actor: mine, command: Command::Attack { target } })
+    }
+
+    /// Our own character healing itself, if it is our turn and it should: its HP is under 30% of its
+    /// maximum and it knows a restoring spell it can pay for, the cheapest of which (then the lowest
+    /// spell id) it casts on itself. A revival never qualifies: the engine refuses to aim one at a
+    /// character who stands, which is what [`BattleState::check_command`] says here (it also says
+    /// whether the MP is there).
+    fn heal_command(&self, now: f64) -> Option<BattleCmd> {
+        let (active, state, mine) = self.my_turn(now)?;
+        let me = state.actor(mine)?;
+        if u64::from(me.hp) * 10 >= u64::from(me.max_hp) * 3 {
+            return None;
+        }
+        let spell = state
+            .spells_for(mine)
+            .into_iter()
+            .filter(|s| s.targets_allies)
+            .filter(|s| state.check_command(mine, &Command::Magic { spell: s.spell, target: mine }).is_ok())
+            .min_by_key(|s| (s.mp_cost, s.spell))?;
+        Some(BattleCmd::Command { battle_id: active.id, actor: mine, command: Command::Magic { spell: spell.spell, target: mine } })
+    }
+
+    /// What the headless bot does on our character's turn: heal itself when its HP is under 30% and a
+    /// restoring spell is affordable (the cheapest one, on itself), else attack the first living enemy
+    /// ([`BattleClient::attack_command`]).
+    pub fn bot_command(&self, now: f64) -> Option<BattleCmd> {
+        self.heal_command(now).or_else(|| self.attack_command(now))
     }
 
     /// Record that `cmd` was sent, so the same command is not sent again before the answer.
@@ -667,8 +895,7 @@ impl BattleClient {
         if active.pending.is_some_and(|sent| now - sent < PENDING_TIMEOUT_S) {
             return Err("your last command is still waiting for the server");
         }
-        let command = choice.to_command().ok_or("that command is not available yet")?;
-        Ok(BattleCmd::Command { battle_id: active.id, actor, command })
+        Ok(BattleCmd::Command { battle_id: active.id, actor, command: choice.to_command() })
     }
 
     /// A short text for the window title while a battle runs (empty otherwise).

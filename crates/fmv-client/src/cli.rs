@@ -56,7 +56,7 @@ CONTENT:
 
 HEADLESS OUTPUT:
   stdout carries exactly one line:
-    SMOKE name=<n> area=<AreaId> fixture=<bool> peers_seen=<n> updates=<n> rejected=<n> rtt_ms=<n|-1> party=<n> battles=<n> victories=<n> area_changes=<n> level=<n> exp=<n>
+    SMOKE name=<n> area=<AreaId> fixture=<bool> peers_seen=<n> updates=<n> rejected=<n> rtt_ms=<n|-1> party=<n> battles=<n> victories=<n> area_changes=<n> level=<n> exp=<n> items=<n>
   <n> in name= is the display name percent-encoded: letters, digits and - . _ ~ are kept, every
   other byte becomes %XX (\"Red XIII\" prints as Red%20XIII), so the line always splits on spaces.
   party=<n> is the LARGEST party this client was in at any moment of the run (0: never in one).
@@ -65,17 +65,24 @@ HEADLESS OUTPUT:
   area_changes=<n> is how many times the server moved this client on to another area. level=<n> and
   exp=<n> are the level and total experience of this player's character as the server last reported
   them (0 and 0 when it reports none: a server without battle data, such as the FIXTURE one, has no
-  characters); every report is also logged on stderr as a `progress:` line.
+  characters); every report is also logged on stderr as a `progress:` line. items=<n> is how many
+  items this player's account carries as the server last reported it (the counts of all stacks
+  added up, 0 when it reports none); every report is also logged on stderr as a
+  `battle: inventory: stacks=<n> total=<n> items=<item>:<count>,...` line (item ids, never names).
+  New keys are only ever added at the end of the line.
   A server that goes silent for 10 s is treated as gone (exit code 1, the summary is still printed).
   Party events and refusals are logged on stderr, one `party:` line each.
   --party-invite-first-peer invites the visible player with the lowest entity id (a refused invite
   is retried, at most 5 times, 1 s apart); --party-accept accepts every invite sent to this player.
-  --battle-auto plays battles (attacks whenever its gauge is full); with --debug-encounters it also
-  asks the server for one battle (see BATTLES). Battle events and refusals are logged on stderr as
-  `battle:` lines; when a battle ends the line says whether this machine replayed it from its own
-  battle data and matched (`verified: ...`) or could not (`NOT verified: ...`), and the closing
-  `headless: battles:` line counts the verified ones. A --battle-auto bot that is in a battle when
-  --duration runs out plays it to the end (at most 12 s longer).
+  --battle-auto plays battles: whenever its gauge is full it casts its cheapest healing spell on
+  itself if its HP is under 30% and it has the MP, and otherwise attacks the first living enemy;
+  with --debug-encounters it also asks the server for one battle (see BATTLES). Battle events and
+  refusals are logged on stderr as `battle:` lines; when a battle ends the line says whether this
+  machine replayed it from its own battle data and matched (`verified: ...`) or could not
+  (`NOT verified: ...`), and the closing `headless: battles:` line counts the verified ones and
+  the commands of this player the server applied, by kind (attack, magic, item, defend). A
+  --battle-auto bot that is in a battle when --duration runs out plays it to the end (at most 12 s
+  longer).
 
 BATTLES:
   A battle starts for a whole party (random encounters in a field that has a table, or on request
@@ -107,8 +114,9 @@ WINDOW CONTROLS:
   area is labelled \"FIXTURE (synthetic, not FF7)\". The window title shows your party size and a
   pending invite; party members are drawn with a gold ring. B asks the server for a debug battle
   (refused unless it runs with --debug-encounters). In a battle the window shows enemy and party
-  bars (HP, ATB gauge; a yellow border means that character can act) and Space or Enter attacks the
-  first living enemy with your character.";
+  panels (HP, MP, ATB gauge) and, on your character's turn, its command menu: the arrow keys or
+  WASD move, Space or Enter chooses (Attack, Magic, Item, Defend; the lists hold the spells your
+  character knows and the items your account carries) and Esc or Backspace goes back.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum BotKind {
@@ -221,8 +229,9 @@ pub struct Args {
     pub ff7_revision: Option<String>,
 
     // ---- battles (protocol v3): one contiguous block ----
-    /// Play battles as a bot: attack the first living enemy whenever this player's ATB gauge is
-    /// full (headless only). Battles start from random encounters, or with --debug-encounters.
+    /// Play battles as a bot: whenever this player's ATB gauge is full, cast its cheapest healing
+    /// spell on itself if its HP is under 30% and it has the MP, else attack the first living enemy
+    /// (headless only). Battles start from random encounters, or with --debug-encounters.
     #[arg(long, requires = "headless")]
     pub battle_auto: bool,
 
@@ -661,6 +670,8 @@ mod tests {
             "--party-accept",
             "ACCOUNTS:",
             "rtt_ms=<n|-1> party=<n>",
+            "level=<n> exp=<n> items=<n>",
+            "New keys are only ever added at the end of the line.",
             "LARGEST party",
             "P invites the nearest other player",
             "Y accepts",

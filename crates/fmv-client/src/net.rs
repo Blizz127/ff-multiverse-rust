@@ -598,7 +598,9 @@ where
                 }
             }
             // Party traffic does not depend on the area: it is kept whenever it arrives, so the
-            // party mirror never misses an event (a gap in `seq` would only cost a resync).
+            // party mirror never misses an event (a gap in `seq` would only cost a resync). The
+            // player's own numbers (`CharacterProgress`, and the `Inventory` that follows it on
+            // joining, protocol v6) are kept for the same reason: they are said once, not repeated.
             other @ (ServerMsg::InstancePlacement { .. }
             | ServerMsg::PartyEvent { .. }
             | ServerMsg::PartyState { .. }
@@ -607,7 +609,8 @@ where
             | ServerMsg::BattleEvent { .. }
             | ServerMsg::BattleEnd { .. }
             | ServerMsg::BattleRejected { .. }
-            | ServerMsg::CharacterProgress { .. }) => push_backlog(&mut backlog, other),
+            | ServerMsg::CharacterProgress { .. }
+            | ServerMsg::Inventory { .. }) => push_backlog(&mut backlog, other),
         }
         if let (Some(_), Some(_), Some(_)) = (&welcome, &offer, &snapshot) {
             let (Some(w), Some(o), Some(entities)) = (welcome, offer, snapshot) else {
@@ -1821,6 +1824,38 @@ mod tests {
             })
             .collect();
         assert_eq!(kinds, ["event 1", "rejected", "event 2", "snapshot"]);
+    }
+
+    /// What the server says about our own character when we join (the progress of protocol v5, then the
+    /// inventory of v6) may reach us before the snapshot completes the handshake. It is said once and
+    /// never repeated, so it is kept, in order, for the game loop; dropping it would leave the player
+    /// with a character at level 0 and an empty bag.
+    #[tokio::test]
+    async fn our_progress_and_inventory_during_the_handshake_are_kept_in_order() {
+        use fmv_protocol::InventoryEntry;
+        let adapter = FixtureAdapter::new();
+        let (client, server) = duplex(64 * 1024);
+        let (mut crd, mut cwr) = split(client);
+        let (mut srd, mut swr) = split(server);
+        let srv_adapter = FixtureAdapter::new();
+        let progress = ServerMsg::CharacterProgress { character: 0, level: 6, exp: 610, exp_to_next: 6, gil: 0, ap: 0, leveled_up: false };
+        let inventory = ServerMsg::Inventory { items: vec![InventoryEntry::new(0, 3), InventoryEntry::new(7, 1)] };
+        let (sent_progress, sent_inventory) = (progress.clone(), inventory.clone());
+        let server_task = tokio::spawn(async move {
+            let _hello: ClientMsg = read_msg(&mut srd).await.unwrap();
+            write_msg(&mut swr, &welcome()).await.unwrap();
+            write_msg(&mut swr, &manifest(&srv_adapter, |_| {})).await.unwrap();
+            let _join: ClientMsg = read_msg(&mut srd).await.unwrap();
+            write_msg(&mut swr, &sent_progress).await.unwrap();
+            write_msg(&mut swr, &sent_inventory).await.unwrap();
+            write_msg(&mut swr, &area_snapshot(&srv_adapter, vec![snap(7, 0.0)])).await.unwrap();
+        });
+        let joined = handshake(&mut crd, &mut cwr, &cfg(), &adapter, Duration::from_secs(5)).await.unwrap();
+        server_task.await.unwrap();
+        assert_eq!(joined.backlog.len(), 3, "{:?}", joined.backlog);
+        assert_eq!(joined.backlog[0], progress);
+        assert_eq!(joined.backlog[1], inventory);
+        assert!(matches!(joined.backlog[2], ServerMsg::AreaSnapshot { .. }));
     }
 
     /// A transfer between areas is something that happens in the game: one offered in the middle of

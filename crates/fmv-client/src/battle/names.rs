@@ -75,23 +75,39 @@ impl NameBook {
     }
 
     /// The name of spell `id`, or `Spell <id>` when the tables have none.
-    #[cfg_attr(not(test), allow(dead_code))] // the integrator names the engine's spells with it
     pub fn spell(&self, id: u16) -> String {
         Self::entry(&self.spells, id).map_or_else(|| format!("Spell {id}"), str::to_string)
     }
 
     /// The name of item `id`, or `Item <id>` when the tables have none.
-    #[cfg_attr(not(test), allow(dead_code))] // the integrator names the inventory with it
     pub fn item(&self, id: u16) -> String {
         Self::entry(&self.items, id).map_or_else(|| format!("Item {id}"), str::to_string)
     }
 
     /// The name of attack `id` of the scene of `formation` (`scene * 4 + slot`), if the scene names
     /// it.
-    #[cfg_attr(not(test), allow(dead_code))] // the integrator names the enemies' actions with it
     pub fn enemy_attack(&self, formation: u16, id: u16) -> Option<&str> {
         self.attacks.get(&(formation / 4, id)).map(String::as_str)
     }
+
+    /// This book with attack `id` of `scene` named `name` (tests: a book made from tables has no
+    /// enemy attacks).
+    #[cfg(test)]
+    pub fn with_enemy_attack(mut self, scene: u16, id: u16, name: &str) -> Self {
+        self.attacks.insert((scene, id), clean_name(name));
+        self
+    }
+}
+
+/// [`NameBook::spell`] for a client that may have no book at all (no battle data on this machine): the
+/// same plain `Spell <id>` label a book gives an id it does not name.
+pub fn spell_name(book: Option<&NameBook>, id: u16) -> String {
+    book.map_or_else(|| NameBook::default().spell(id), |b| b.spell(id))
+}
+
+/// [`NameBook::item`] for a client that may have no book at all: `Item <id>` then.
+pub fn item_name(book: Option<&NameBook>, id: u16) -> String {
+    book.map_or_else(|| NameBook::default().item(id), |b| b.item(id))
 }
 
 #[cfg(test)]
@@ -111,6 +127,17 @@ mod tests {
         assert_eq!((book.item(1).as_str(), book.item(9).as_str()), ("Elixir", "Item 9"));
         assert_eq!(book.enemy_attack(8, 0x10), None);
         assert_eq!(NameBook::default().spell(0), "Spell 0");
+    }
+
+    #[test]
+    fn a_client_without_a_book_labels_ids_the_way_a_book_labels_what_it_does_not_name() {
+        let book = NameBook::from_tables(&names(&["Bolt"]), &names(&["Tonic"]));
+        assert_eq!((spell_name(Some(&book), 0).as_str(), item_name(Some(&book), 0).as_str()), ("Bolt", "Tonic"));
+        assert_eq!((spell_name(Some(&book), 5).as_str(), item_name(Some(&book), 5).as_str()), ("Spell 5", "Item 5"));
+        assert_eq!((spell_name(None, 27).as_str(), item_name(None, 7).as_str()), ("Spell 27", "Item 7"));
+        let with_attack = book.with_enemy_attack(75, 272, "  Gnaw ");
+        assert_eq!(with_attack.enemy_attack(301, 272), Some("Gnaw"), "formation 301 is scene 75, and a name is cleaned");
+        assert_eq!(with_attack.enemy_attack(304, 272), None, "the next scene has not named it");
     }
 
     #[test]
@@ -145,5 +172,15 @@ mod tests {
         for i in 0..256 {
             assert!(book.spell(i).chars().all(|c| (' '..='~').contains(&c)));
         }
+        // The ids the engine uses (the kernel's attack and item indexes, `ActionRef`) index these tables.
+        // Plain `assert!`s on purpose: a failure names the id, never what the owner's data holds.
+        for (id, name) in [(0, "Cure"), (7, "Life"), (27, "Fire"), (30, "Ice"), (33, "Bolt")] {
+            assert!(book.spell(id) == name, "spell {id} is not named {name:?}");
+        }
+        for (id, name) in [(0, "Potion"), (3, "Ether"), (7, "Phoenix Down")] {
+            assert!(book.item(id) == name, "item {id} is not named {name:?}");
+        }
+        // Attack 272 of formation 301 (scene 75, slot 1) is an enemy's, named by its scene.
+        assert!(book.enemy_attack(301, 272) == Some("Machine Gun"), "attack 272 of formation 301 is not named \"Machine Gun\"");
     }
 }

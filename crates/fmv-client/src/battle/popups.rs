@@ -9,10 +9,18 @@
 //!
 //! # Events
 //!
-//! [`popup_of`] is the one place that says which event makes which popup. The engine's `Heal`,
-//! `MpRestored` and `Revive` events (the contract of the Magic/Item commands) get their arms there
-//! when they exist: `Heal { target, amount }` is [`PopupKind::Heal`], `MpRestored { target, amount }` is
-//! [`PopupKind::Mp`], `Revive { target, hp }` is [`PopupKind::Heal`] with `hp`.
+//! [`popup_of`] is the one place that says which event makes which popup:
+//!
+//! | event | popup |
+//! |---|---|
+//! | `Damage { target, amount, critical }` | [`PopupKind::Damage`] over `target` |
+//! | `Miss { target }` | [`PopupKind::Miss`] |
+//! | `Heal { target, amount }` | [`PopupKind::Heal`] with `amount` |
+//! | `Revive { target, hp }` | [`PopupKind::Heal`] with `hp` (the HP it came back with) |
+//! | `MpRestored { target, amount }` | [`PopupKind::Mp`] with `amount` |
+//!
+//! Everything else says nothing over a fighter: gauges filling, deaths and the end, an `Action` (its
+//! name goes to the banner, see `hud`) and `MpSpent` (the caster's own MP bar shows it).
 //!
 //! Popups over one fighter that are on screen together (a second hit lands while the first number is
 //! still rising) are kept apart where they are drawn, newest lowest: see `panels::draw_popups`.
@@ -31,11 +39,9 @@ const MAX_POPUPS: usize = 48;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PopupKind {
     Damage { amount: u32, critical: bool },
-    /// HP restored (the engine's `Heal` and `Revive` events make these once they exist).
-    #[allow(dead_code)]
+    /// HP restored (the engine's `Heal` and `Revive` events).
     Heal { amount: u32 },
-    /// MP restored (the engine's `MpRestored` event makes these once it exists).
-    #[allow(dead_code)]
+    /// MP restored (the engine's `MpRestored` event).
     Mp { amount: u32 },
     Miss,
 }
@@ -65,9 +71,17 @@ pub fn popup_of(event: &BattleEvent) -> Option<(ActorId, PopupKind)> {
     match *event {
         BattleEvent::Damage { target, amount, critical, .. } => Some((target, PopupKind::Damage { amount, critical })),
         BattleEvent::Miss { target, .. } => Some((target, PopupKind::Miss)),
-        // Gauges filling, deaths and the end say nothing over a fighter. Events this build does not
-        // know yet (the Magic/Item contract's) make no popup until they get their arm above.
-        _ => None,
+        BattleEvent::Heal { target, amount, .. } => Some((target, PopupKind::Heal { amount })),
+        BattleEvent::Revive { target, hp, .. } => Some((target, PopupKind::Heal { amount: hp })),
+        BattleEvent::MpRestored { target, amount, .. } => Some((target, PopupKind::Mp { amount })),
+        // Gauges filling, deaths and the end say nothing over a fighter, nor does an action's start
+        // (the banner has its name) or the MP it cost (the caster's bar shows it).
+        BattleEvent::GaugeReady { .. }
+        | BattleEvent::Death { .. }
+        | BattleEvent::Victory
+        | BattleEvent::Defeat
+        | BattleEvent::Action { .. }
+        | BattleEvent::MpSpent { .. } => None,
     }
 }
 
@@ -120,13 +134,14 @@ impl Popups {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fmv_ff7_battle::rules::ActionRef;
 
     fn damage(target: u8, amount: u32) -> BattleEvent {
         BattleEvent::Damage { actor: ActorId(0), target: ActorId(target), amount, critical: false }
     }
 
     #[test]
-    fn damage_and_misses_make_popups_and_other_events_do_not() {
+    fn damage_misses_heals_restored_mp_and_revivals_make_popups_and_other_events_do_not() {
         let mut p = Popups::default();
         p.on_events(
             1.0,
@@ -138,6 +153,17 @@ mod tests {
                 BattleEvent::Death { actor: ActorId(3) },
                 BattleEvent::Victory,
                 BattleEvent::Defeat,
+                // An action's start and what it cost make no number; what it did does.
+                BattleEvent::Action { actor: ActorId(0), action: ActionRef::Magic(0) },
+                BattleEvent::MpSpent { actor: ActorId(0), amount: 5 },
+                BattleEvent::Heal { actor: ActorId(0), target: ActorId(1), amount: 271 },
+                BattleEvent::Action { actor: ActorId(1), action: ActionRef::Item(3) },
+                BattleEvent::MpRestored { actor: ActorId(1), target: ActorId(2), amount: 100 },
+                BattleEvent::Action { actor: ActorId(2), action: ActionRef::Item(7) },
+                BattleEvent::Revive { actor: ActorId(2), target: ActorId(0), hp: 88 },
+                BattleEvent::Action { actor: ActorId(3), action: ActionRef::Attack },
+                BattleEvent::Action { actor: ActorId(3), action: ActionRef::Defend },
+                BattleEvent::Action { actor: ActorId(3), action: ActionRef::EnemyAttack(272) },
             ],
         );
         let kinds: Vec<(u8, PopupKind)> = p.views(1.0).iter().map(|v| (v.target.0, v.kind)).collect();
@@ -146,13 +172,27 @@ mod tests {
             [
                 (3, PopupKind::Damage { amount: 120, critical: false }),
                 (4, PopupKind::Damage { amount: 999, critical: true }),
-                (5, PopupKind::Miss)
-            ]
+                (5, PopupKind::Miss),
+                (1, PopupKind::Heal { amount: 271 }),
+                (2, PopupKind::Mp { amount: 100 }),
+                (0, PopupKind::Heal { amount: 88 }),
+            ],
+            "a revival floats the HP the fighter came back with, like a heal"
         );
         assert_eq!(PopupKind::Damage { amount: 120, critical: false }.text(), "120");
         assert_eq!(PopupKind::Miss.text(), "Miss");
         assert_eq!(PopupKind::Heal { amount: 7 }.text(), "7");
         assert_eq!(PopupKind::Mp { amount: 30 }.text(), "30");
+    }
+
+    #[test]
+    fn popup_of_says_which_event_makes_which_popup() {
+        let (a, t) = (ActorId(0), ActorId(2));
+        assert_eq!(popup_of(&BattleEvent::Heal { actor: a, target: t, amount: 5 }), Some((t, PopupKind::Heal { amount: 5 })));
+        assert_eq!(popup_of(&BattleEvent::Revive { actor: a, target: t, hp: 9 }), Some((t, PopupKind::Heal { amount: 9 })));
+        assert_eq!(popup_of(&BattleEvent::MpRestored { actor: a, target: t, amount: 4 }), Some((t, PopupKind::Mp { amount: 4 })));
+        assert_eq!(popup_of(&BattleEvent::Action { actor: a, action: ActionRef::Defend }), None);
+        assert_eq!(popup_of(&BattleEvent::MpSpent { actor: a, amount: 4 }), None);
     }
 
     #[test]
