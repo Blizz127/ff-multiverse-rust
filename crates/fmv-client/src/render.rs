@@ -406,6 +406,14 @@ pub fn backdrop_quad(scene: &Scene<'_>, vw: u32, vh: u32) -> Option<[QuadVertex;
     quad.iter().all(|v| v.pos.iter().all(|c| c.is_finite())).then_some(quad)
 }
 
+/// Where a view-space point lands in a `vw` x `vh` viewport drawn by [`build_vertices`], in window
+/// pixels from the TOP LEFT (+y down): how the HUD places a name label over a player's marker.
+pub fn view_to_window(bounds: &Bounds, vw: u32, vh: u32, x: f32, y: f32) -> [f32; 2] {
+    let (fw, fh) = (vw.max(1) as f32, vh.max(1) as f32);
+    let p = Camera::fit(bounds, fw, fh, MARGIN_PX).project(x, y);
+    [fw * 0.5 + p[0], fh * 0.5 - p[1]]
+}
+
 // ---------------------------------------------------------------------------------------------
 // GPU
 // ---------------------------------------------------------------------------------------------
@@ -432,6 +440,8 @@ pub struct Gpu {
     quad_buf: wgpu::Buffer,
     /// The picture currently on the GPU, replaced when a scene brings a different one.
     backdrop: Option<GpuBackdrop>,
+    /// The text/panel overlay (menus, HUD), drawn over the scene by [`Gpu::draw_overlay`].
+    ui: crate::ui::gpu::UiGpu,
 }
 
 const MIN_VERTEX_BYTES: u64 = 64 * 1024;
@@ -518,6 +528,7 @@ impl Gpu {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let ui = crate::ui::gpu::UiGpu::new(&device, &queue, format);
         Self {
             device,
             queue,
@@ -529,7 +540,14 @@ impl Gpu {
             quad_sampler,
             quad_buf,
             backdrop: None,
+            ui,
         }
+    }
+
+    /// Draw the UI overlay `vertices` (see [`crate::ui::draw::DrawList::vertices`]) over what
+    /// `target` holds, after [`Gpu::draw_scene`]. An empty list draws nothing.
+    pub fn draw_overlay(&mut self, target: &wgpu::TextureView, vertices: &[crate::ui::draw::UiVertex]) {
+        self.ui.draw(&self.device, &self.queue, target, vertices);
     }
 
     /// Make sure `backdrop` is the picture on the GPU (uploading it if it is a different one).
@@ -807,6 +825,11 @@ impl Renderer {
         self.gpu_errors.lock().ok().and_then(|v| v.first().cloned())
     }
 
+    /// The size of the window surface in pixels, as last reported by [`Renderer::resize`].
+    pub fn size(&self) -> (u32, u32) {
+        self.size
+    }
+
     /// Window size changed (a zero size means minimised: drawing is skipped until it grows).
     pub fn resize(&mut self, width: u32, height: u32) {
         self.size = (width, height);
@@ -833,7 +856,14 @@ impl Renderer {
         Ok(())
     }
 
+    /// Draw `scene` alone (no overlay).
+    #[allow(dead_code)] // the window always draws an overlay now; kept as the plain entry point
     pub fn render(&mut self, scene: &Scene<'_>) -> FrameResult {
+        self.render_with(scene, None)
+    }
+
+    /// Draw `scene`, then the UI `overlay` (text, panels) over it.
+    pub fn render_with(&mut self, scene: &Scene<'_>, overlay: Option<&crate::ui::draw::DrawList>) -> FrameResult {
         let (w, h) = self.size;
         if w == 0 || h == 0 {
             return FrameResult::Skipped;
@@ -875,6 +905,9 @@ impl Renderer {
         };
         let vertices = build_vertices(scene, w, h, self.srgb);
         self.gpu.draw_scene(&view, &vertices, quad.as_ref(), CLEAR_RGB, self.srgb);
+        if let Some(overlay) = overlay {
+            self.gpu.draw_overlay(&view, &overlay.vertices(w, h, self.srgb));
+        }
         self.window.pre_present_notify();
         self.gpu.queue.present(frame);
         FrameResult::Presented

@@ -180,6 +180,9 @@ pub enum AccountsError {
     /// The token or name cannot be stored in the file format.
     #[error("cannot save the account: {0}")]
     Invalid(String),
+    /// A saved login was not removed (see [`TokenStore::forget`]).
+    #[error("cannot forget the saved login: {0}")]
+    Forget(String),
     #[error("{what} {}: {source}", .path.display())]
     Io { what: &'static str, path: PathBuf, source: io::Error },
 }
@@ -352,6 +355,24 @@ fn publish_replacing(path: &Path, write: Writer<'_>) -> io::Result<()> {
 // The store
 // ---------------------------------------------------------------------------------------------
 
+/// Atomically replace (or create) a small private file next to the token files with `text`:
+/// temporary file, fsync, `rename(2)`. A failure leaves the old file as it was. The character
+/// menu keeps its display-only notes about saved characters this way (see `ui::looks`).
+pub fn write_private_atomic(path: &Path, text: &str) -> io::Result<()> {
+    publish_replacing(path, &|f: &mut File| f.write_all(text.as_bytes()))
+}
+
+/// Every saved account of one server, for the character menu: the usable ones, and a line for
+/// each file that could not be used (a menu lists what works instead of refusing to start).
+#[derive(Debug, Clone, Default)]
+pub struct AccountList {
+    /// The default file's account first, then the named ones in file-name order. One entry per
+    /// display name (compared case-insensitively), the default file winning, as in `find`.
+    pub accounts: Vec<SavedAccount>,
+    /// Why a candidate file was skipped; never contains a token.
+    pub problems: Vec<String>,
+}
+
 /// The token files of one client state directory.
 #[derive(Debug, Clone)]
 pub struct TokenStore {
@@ -362,6 +383,84 @@ impl TokenStore {
     /// The store under `<state_dir>/accounts/` (nothing is created until a token is saved).
     pub fn new(state_dir: &Path) -> Self {
         Self { dir: state_dir.join(ACCOUNTS_DIR) }
+    }
+
+    /// Every account saved for `server`. Unlike [`find`](Self::find) this never fails as a whole:
+    /// a file that cannot be used is reported in [`AccountList::problems`] and the rest is
+    /// listed.
+    pub fn list(&self, server: &str) -> AccountList {
+        let mut list = AccountList::default();
+        let mut seen: Vec<String> = Vec::new();
+        let mut take = |list: &mut AccountList, account: SavedAccount| {
+            let key = account.name.to_lowercase();
+            if !seen.contains(&key) {
+                seen.push(key);
+                list.accounts.push(account);
+            }
+        };
+        match read_account(&self.default_path(server)) {
+            Ok(Some(account)) => take(&mut list, account),
+            Ok(None) => {}
+            Err(e) => list.problems.push(e.to_string()),
+        }
+        let prefix = format!("{}.", server_key(server));
+        let entries = match fs::read_dir(&self.dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return list,
+            Err(e) => {
+                list.problems.push(io_err("cannot list", &self.dir, e).to_string());
+                return list;
+            }
+        };
+        let mut candidates: Vec<(PathBuf, String)> = entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let file_name = entry.file_name();
+                let file_name = file_name.to_str()?;
+                let key = file_name.strip_prefix(&prefix)?.strip_suffix(TOKEN_SUFFIX)?;
+                (!key.is_empty()).then(|| (entry.path(), key.to_string()))
+            })
+            .collect();
+        candidates.sort();
+        for (path, key) in candidates {
+            match read_account(&path) {
+                // A file only counts if the name stored in it belongs to its file name (another
+                // server's default file can start with this server's key).
+                Ok(Some(account)) if name_key(&account.name) == key => take(&mut list, account),
+                Ok(_) => {}
+                Err(e) => list.problems.push(e.to_string()),
+            }
+        }
+        list
+    }
+
+    /// Forget a saved login: delete its token file from THIS machine. The server is not told and
+    /// keeps the account, but without the token nobody on this machine can log in as it again, so
+    /// callers ask first. Only a token file of this store, for `server`, that still holds exactly
+    /// this account and token is removed: a file replaced since the account was listed (a new
+    /// registration under the same file name) is refused, never deleted.
+    pub fn forget(&self, server: &str, account: &SavedAccount) -> Result<(), AccountsError> {
+        let in_store = account.path.parent() == Some(self.dir.as_path());
+        let named_for_server = account
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(&server_key(server)) && n.ends_with(TOKEN_SUFFIX));
+        if !in_store || !named_for_server {
+            return Err(AccountsError::Forget("that is not a saved login of this server".into()));
+        }
+        match read_account(&account.path)? {
+            // Already gone (forgotten in another window): nothing left to do.
+            None => Ok(()),
+            Some(current) if names_equal(&current.name, &account.name) && current.token == account.token => {
+                fs::remove_file(&account.path).map_err(|e| io_err("cannot remove", &account.path, e))?;
+                sync_dir(&account.path);
+                Ok(())
+            }
+            Some(_) => Err(AccountsError::Forget(
+                "the saved login changed since it was listed; it was not removed".into(),
+            )),
+        }
     }
 
     /// The default account file of `server`.
@@ -1096,5 +1195,130 @@ mod tests {
         assert!(matches!(err, AccountsError::Io { .. }), "{err}");
         assert!(!err.to_string().contains("fmvt_secret"), "{err}");
         assert!(s.find(SERVER, None).is_err() || s.find(SERVER, None).unwrap().is_none());
+    }
+
+    // ---- listing and forgetting (the character menu) ---------------------------------------
+
+    fn names(list: &AccountList) -> Vec<&str> {
+        list.accounts.iter().map(|a| a.name.as_str()).collect()
+    }
+
+    #[test]
+    fn the_list_has_the_default_account_first_then_the_named_ones_in_file_order() {
+        let (_d, s) = store();
+        assert!(s.list(SERVER).accounts.is_empty() && s.list(SERVER).problems.is_empty(), "nothing saved, nothing wrong");
+        s.save_new(SERVER, "Cloud", &tok("tok_cloud")).unwrap(); // the default file
+        s.save_new(SERVER, "Tifa", &tok("tok_tifa")).unwrap();
+        s.save_new(SERVER, "Aerith", &tok("tok_aerith")).unwrap();
+        s.save_new(SERVER, "Barret", &tok("tok_barret")).unwrap();
+        let list = s.list(SERVER);
+        assert_eq!(names(&list), ["Cloud", "Aerith", "Barret", "Tifa"]);
+        assert!(list.problems.is_empty());
+        // Tokens are really there (the menu logs in with them) but never in a Debug print.
+        assert_eq!(list.accounts[1].token.expose(), "tok_aerith");
+        assert!(!format!("{list:?}").contains("tok_"), "{list:?}");
+        // Another server sees none of them.
+        assert!(s.list("10.0.0.9:1").accounts.is_empty());
+    }
+
+    #[test]
+    fn the_list_survives_a_broken_file_and_says_which() {
+        let (_d, s) = store();
+        s.save_new(SERVER, "Cloud", &tok("tok_cloud")).unwrap();
+        let tifa = s.save_new(SERVER, "Tifa", &tok("tok_tifa")).unwrap();
+        s.save_new(SERVER, "Aerith", &tok("tok_aerith")).unwrap();
+        fs::write(&tifa, "tok_but_no_name_line\n").unwrap();
+        let list = s.list(SERVER);
+        assert_eq!(names(&list), ["Cloud", "Aerith"], "the usable ones are listed");
+        assert_eq!(list.problems.len(), 1);
+        assert!(list.problems[0].contains("unusable") && list.problems[0].contains("tifa"), "{:?}", list.problems);
+        assert!(!list.problems[0].contains("tok_"), "never a token: {:?}", list.problems);
+        // `find` would have refused as a whole.
+        assert!(s.find(SERVER, Some("Tifa")).is_err());
+        // A broken DEFAULT file is a problem too, and does not hide the named accounts.
+        let (_d2, s2) = store();
+        let default = s2.save_new(SERVER, "Cloud", &tok("tok_cloud")).unwrap();
+        s2.save_new(SERVER, "Tifa", &tok("tok_tifa")).unwrap();
+        fs::write(&default, "garbage").unwrap();
+        let list = s2.list(SERVER);
+        assert_eq!(names(&list), ["Tifa"]);
+        assert_eq!(list.problems.len(), 1);
+    }
+
+    #[test]
+    fn the_list_skips_files_of_other_names_other_servers_and_leftovers() {
+        let (_d, s) = store();
+        s.save_new(SERVER, "Cloud", &tok("tok_cloud")).unwrap();
+        // Another server's default file starting with this server's key, a temp file, a note.
+        put(&s, &format!("{KEY}.x_80.token"), "tok_other_server", "Barret");
+        put(&s, &format!(".{KEY}.token.tmp-1-2-3"), "tok_tmp", "Tmp");
+        put(&s, "notes.txt", "t", "n");
+        // The same name saved twice (a default file and a named one) is listed once.
+        put(&s, &format!("{KEY}.cloud.token"), "tok_cloud_again", "cloud");
+        let list = s.list(SERVER);
+        assert_eq!(names(&list), ["Cloud"]);
+        assert_eq!(list.accounts[0].token.expose(), "tok_cloud", "the default file wins, as in find()");
+        assert!(list.problems.is_empty(), "{:?}", list.problems);
+    }
+
+    #[test]
+    fn forgetting_deletes_that_one_token_file_and_nothing_else() {
+        let (_d, s) = store();
+        s.save_new(SERVER, "Cloud", &tok("tok_cloud")).unwrap();
+        let tifa_path = s.save_new(SERVER, "Tifa", &tok("tok_tifa")).unwrap();
+        s.save_new(SERVER, "Aerith", &tok("tok_aerith")).unwrap();
+        let list = s.list(SERVER);
+        let tifa = list.accounts.iter().find(|a| a.name == "Tifa").unwrap().clone();
+        s.forget(SERVER, &tifa).unwrap();
+        assert!(!tifa_path.exists());
+        assert_eq!(names(&s.list(SERVER)), ["Cloud", "Aerith"]);
+        // Forgetting what is already gone is not an error (another window did it).
+        s.forget(SERVER, &tifa).unwrap();
+        // The default account can be forgotten too, and the rest remains.
+        let cloud = s.list(SERVER).accounts[0].clone();
+        assert_eq!(cloud.name, "Cloud");
+        s.forget(SERVER, &cloud).unwrap();
+        assert_eq!(names(&s.list(SERVER)), ["Aerith"]);
+        assert!(listing(&s).iter().all(|f| !f.contains("tmp")), "{:?}", listing(&s));
+    }
+
+    #[test]
+    fn forgetting_never_removes_a_file_that_changed_or_is_not_a_login_of_this_store() {
+        let (_d, s) = store();
+        let path = s.save_new(SERVER, "Cloud", &tok("tok_old")).unwrap();
+        let listed = s.list(SERVER).accounts[0].clone();
+        // The file was replaced by a new registration under the same name since it was listed.
+        s.save_replacing(SERVER, "Cloud", &tok("tok_new")).unwrap();
+        let err = s.forget(SERVER, &listed).unwrap_err();
+        assert!(matches!(err, AccountsError::Forget(_)), "{err}");
+        assert!(path.exists(), "the new login is still there");
+        assert_eq!(s.find(SERVER, None).unwrap().unwrap().token.expose(), "tok_new");
+        // A path outside the store, or one that is not a token file of this server, is refused.
+        let outside = tempfile::tempdir().unwrap();
+        let stray = outside.path().join(format!("{KEY}.token"));
+        fs::write(&stray, "tok\nname=Cloud\n").unwrap();
+        let fake = SavedAccount { token: tok("tok"), name: "Cloud".into(), path: stray.clone(), loose_mode: None };
+        assert!(s.forget(SERVER, &fake).is_err());
+        assert!(stray.exists());
+        let other_server = SavedAccount { path: s.dir.join("10.0.0.9_1.token"), ..fake.clone() };
+        assert!(s.forget(SERVER, &other_server).is_err());
+        let not_a_token = SavedAccount { path: s.dir.join("notes.txt"), ..fake };
+        assert!(s.forget(SERVER, &not_a_token).is_err());
+    }
+
+    #[test]
+    fn private_notes_are_replaced_atomically_and_leave_nothing_behind() {
+        let (_d, s) = store();
+        s.ensure_dir().unwrap();
+        let path = s.dir.join("127.0.0.1_47770.cloud.look");
+        write_private_atomic(&path, "first\n").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "first\n");
+        write_private_atomic(&path, "second\n").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "second\n");
+        #[cfg(unix)]
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(listing(&s), vec!["127.0.0.1_47770.cloud.look".to_string()], "no temporary file is left");
+        // Notes are not logins: they never show up in the list or in find().
+        assert!(s.list(SERVER).accounts.is_empty() && s.find(SERVER, None).unwrap().is_none());
     }
 }
