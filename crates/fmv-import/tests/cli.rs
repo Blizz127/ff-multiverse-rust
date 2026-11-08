@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use fmv_import::synthetic::{
-    build_iso, build_iso_labeled, cue_for, system_cnf, wrap_raw, RawMode, DISC_LABEL,
-    TEST_PAYLOAD_A, TEST_PAYLOAD_B,
+    build_iso, build_iso_labeled, cue_for, steam_edition_library, system_cnf, wrap_raw, RawMode,
+    DISC_LABEL, TEST_PAYLOAD_A, TEST_PAYLOAD_B,
 };
 use serde_json::Value;
 
@@ -259,6 +259,120 @@ fn multi_language_install_needs_a_language() {
     assert_eq!(names, ["data/lang-fr/field/flevel.lgp", "ff7_fr.exe"]);
 }
 
+/// The Steam Edition's install root, as `scan-pc` and `import-pc` take it from the command line:
+/// no labels, no flags, and the same set the explicit labels made.
+fn steam_edition_install_root_flow() {
+    let env = Env::new();
+    // a fake Steam library (placeholder files + a fake appmanifest), away from the state directory
+    let install = steam_edition_library(&env.root.join("steamlib"), true);
+    let workingdir = install.join("ff7/workingdir");
+    let install_text = install.to_str().unwrap();
+    let owners_set = "ff7-pc-steam-edition-appid-3837-unknown-build-21140793-63e94f91";
+
+    // scan-pc: read-only, names the edition with its evidence, defaults the language out loud
+    let report = json(&env.run(&["scan-pc", install_text]));
+    assert_eq!(report["read_only"], true);
+    assert_eq!(report["data_dir"], "ff7/workingdir/data");
+    assert_eq!(
+        report["edition_guess"]["edition"],
+        "Steam Edition (appid 3837340)"
+    );
+    assert_eq!(report["edition_guess"]["confidence"], "high");
+    assert_eq!(report["edition_guess"]["revision"], "build 21140793");
+    assert_eq!(report["edition_guess"]["verified"], false);
+    assert_eq!(report["edition_guess"]["steam"]["buildid"], "21140793");
+    assert_eq!(report["language_guess"], "en");
+    assert_eq!(report["language_defaulted"], true);
+    assert_eq!(report["language_selection_required"], false);
+    assert_eq!(report["modded"], false);
+    assert!(
+        report["m1"]["ready"] == true && report["m2"]["ready"] == true,
+        "{report}"
+    );
+    assert!(report["warnings"][0]
+        .as_str()
+        .unwrap()
+        .starts_with("language defaulted to"));
+    assert!(
+        !env.state.exists(),
+        "scan-pc must not create the state directory"
+    );
+    assert!(!env.root.join("xdg").exists());
+    // the folder that holds data/ scans alike
+    let inner = json(&env.run(&["scan-pc", workingdir.to_str().unwrap()]));
+    assert_eq!(inner["data_dir"], "data");
+    assert_eq!(
+        inner["edition_guess"]["edition"],
+        report["edition_guess"]["edition"]
+    );
+    assert_eq!(
+        inner["edition_guess"]["revision"],
+        report["edition_guess"]["revision"]
+    );
+
+    // import-pc with nothing but the install root
+    let imported = json(&env.run_with_state(&["import-pc", install_text]));
+    assert_eq!(imported["set_id"], owners_set);
+    assert_eq!(
+        imported["provenance"]["edition"],
+        "Steam Edition (appid 3837340)"
+    );
+    assert_eq!(imported["provenance"]["region"], "unknown");
+    assert_eq!(imported["provenance"]["language"], "en");
+    assert_eq!(imported["provenance"]["revision"], "build 21140793");
+    assert_eq!(imported["totals"]["files"], 6);
+    assert_eq!(imported["source_files_unchanged"], true);
+    assert_eq!(imported["identification"]["verified"], false);
+    assert!(
+        !imported.to_string().contains(install_text),
+        "the result names no install path: {imported}"
+    );
+
+    // the owner's explicit labels, from the folder that holds data/: the same set, nothing added
+    let explicit = json(&env.run_with_state(&[
+        "import-pc",
+        workingdir.to_str().unwrap(),
+        "--edition",
+        "Steam Edition (appid 3837340)",
+        "--language",
+        "en",
+        "--revision",
+        "build 21140793",
+    ]));
+    assert_eq!(explicit["set_id"], owners_set);
+    assert_eq!(explicit["totals"]["entries_added"], 0);
+    assert_eq!(explicit["totals"]["entries_unchanged"], 6);
+
+    // another language is a set of its own, with that language's field archive
+    let fr = json(&env.run_with_state(&["import-pc", install_text, "--language", "fr"]));
+    assert_ne!(fr["set_id"], owners_set);
+    assert_eq!(fr["provenance"]["edition"], "Steam Edition (appid 3837340)");
+    assert_eq!(fr["provenance"]["revision"], "build 21140793");
+    let names: Vec<&str> = fr["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["logical_path"].as_str().unwrap())
+        .collect();
+    assert!(
+        names.contains(&"data/lang-fr/field/flevel.lgp"),
+        "{names:?}"
+    );
+    assert!(!names.contains(&"data/field/flevel.lgp"), "{names:?}");
+
+    // list shows both, recorded as unverified, without the install path
+    let listed = json(&env.run(&["list"]));
+    assert_eq!(listed["sets"].as_array().unwrap().len(), 2);
+    for set in listed["sets"].as_array().unwrap() {
+        assert_eq!(set["edition"], "Steam Edition (appid 3837340)");
+        assert_eq!(set["identification_verified"], false);
+    }
+    assert!(!listed.to_string().contains(install_text));
+
+    // nothing was written into the Steam library
+    assert!(!install.join("state").exists() && !workingdir.join("library").exists());
+}
+
 fn help_says_physical_drives_are_out_of_scope() {
     let env = Env::new();
     for args in [&["--help"][..], &["import-disc", "--help"][..]] {
@@ -303,6 +417,7 @@ fn import_flows_end_to_end() {
     pc_scan_import_and_list_flow();
     disc_session_flow_and_family_refusal();
     multi_language_install_needs_a_language();
+    steam_edition_install_root_flow();
 }
 
 /// `--help` wording and the default state directory, without touching the real user dirs.

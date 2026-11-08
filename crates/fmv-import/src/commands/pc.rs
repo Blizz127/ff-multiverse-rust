@@ -5,6 +5,13 @@
 //! the files of exactly one language, so a multi-language install never ends up as a single set
 //! labelled with one (or an unknown) language. Adapters reading the set should look in
 //! `data/lang-<set language>/` first and fall back to the classic `data/` layout.
+//!
+//! The directory given is the folder that holds `data/`, or the install root of the Steam Edition
+//! (or its `ff7` folder): the scan finds `ff7/workingdir/data` itself. Library paths are always
+//! relative to the folder that holds `data/` (`data/field/flevel.lgp`), so every spelling of one
+//! install imports the same set. Labels not given on the command line come from the scan:
+//! the Steam Edition is `Steam Edition (appid 3837340)` / region `unknown` / revision
+//! `build <id>`, the exact strings `--edition` and `--revision` took for the sets that exist.
 
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -18,7 +25,9 @@ use serde::Serialize;
 use super::{
     imported, importer_version, CommandError, ImportedFile, SourceEvidence, SourceSummary, Totals,
 };
-use crate::scan::{scan_pc, EditionGuess, ScanError, WouldImport};
+use crate::scan::{
+    scan_pc, EditionGuess, ScanError, ScanReport, WouldImport, LANGUAGE_DEFAULT_PREFIX,
+};
 
 /// Absolute, symlink-resolved form of `p` even when `p` (or its tail) does not exist yet.
 ///
@@ -81,13 +90,19 @@ fn is_flevel(logical_path: &str) -> bool {
 
 #[derive(Debug, Clone)]
 pub struct ImportPcArgs {
+    /// The folder that holds `data/`, or the install root of the Steam Edition (or its `ff7`
+    /// folder).
     pub dir: PathBuf,
     pub state_dir: Option<PathBuf>,
+    /// Overrides the scan's edition label.
     pub edition: Option<String>,
     pub region: Option<String>,
-    /// Language to import. Required when the install holds several; must match one of them
+    /// Language to import. Required when the install holds several and says nothing about which
+    /// one is meant (the Steam Edition defaults to `en`, with a warning); must match one of them
     /// (case-insensitively). On an install without any language marker it is just a label.
     pub language: Option<String>,
+    /// Overrides the scan's revision label (`build <id>` for a Steam Edition whose Steam
+    /// appmanifest was found, else `unknown`).
     pub revision: Option<String>,
 }
 
@@ -154,11 +169,15 @@ pub fn import_pc(args: &ImportPcArgs, now: u64) -> Result<ImportPcResult, Comman
     // opened at that resolved path: the guard and the writes cannot disagree about where it is.
     let requested_state = resolve_state_dir(args.state_dir.as_deref())?;
     let state_dir = canonical_lenient(&requested_state);
+    // the directory given, and the Steam Edition install root it belongs to (which can sit above
+    // it): Steam manages that folder, nothing of ours may be written there either
+    let mut protected = vec![install.clone()];
+    protected.extend(report.steam_install_root.iter().cloned());
     for guarded in [state_dir.clone(), canonical_lenient(&state_dir.join("library"))] {
-        if guarded.starts_with(&install) {
+        if let Some(inside) = protected.iter().find(|p| guarded.starts_with(p)) {
             return Err(CommandError::StateInsideSource {
                 state: requested_state,
-                install,
+                install: inside.clone(),
             });
         }
     }
@@ -176,9 +195,11 @@ pub fn import_pc(args: &ImportPcArgs, now: u64) -> Result<ImportPcResult, Comman
             .unwrap_or_else(|| report.edition_guess.edition.clone()),
         region: args.region.clone().unwrap_or_else(|| "unknown".to_string()),
         language: language.clone(),
+        // not given: the scan's (`build <id>` from Steam's appmanifest), else unknown
         revision: args
             .revision
             .clone()
+            .or_else(|| report.edition_guess.revision.clone())
             .unwrap_or_else(|| "unknown".to_string()),
         sources: vec![source_ref.clone()],
         modded: report.modded,
@@ -190,7 +211,13 @@ pub fn import_pc(args: &ImportPcArgs, now: u64) -> Result<ImportPcResult, Comman
         && chosen
             .iter()
             .any(|w| w.language.is_none() && w.role != "identify");
-    let identification = identification_for(args, &report.warnings, neutral_data_beside_languages);
+    let identification = identification_for(
+        args,
+        &report,
+        &chosen,
+        &language,
+        neutral_data_beside_languages,
+    );
     let handle =
         SetHandle::new(provenance.clone()).with_identification(identification.clone());
 
@@ -272,14 +299,25 @@ pub fn import_pc(args: &ImportPcArgs, now: u64) -> Result<ImportPcResult, Comman
 /// for the same inputs, so re-importing an unchanged install does not rewrite the manifest.
 fn identification_for(
     args: &ImportPcArgs,
-    scan_warnings: &[String],
+    report: &ScanReport,
+    chosen: &[WouldImport],
+    language: &str,
     neutral_data_beside_languages: bool,
 ) -> Identification {
     let given = |v: &Option<String>| v.as_ref().is_some_and(|s| !s.trim().is_empty());
-    let mut caveats = vec![
-        "edition is a guess from file presence; it was not compared with hashes of known releases"
+    let guess = &report.edition_guess;
+    // Steam's appmanifest decided a label that was not given on the command line
+    let edition_from_steam = guess.steam.is_some() && !given(&args.edition);
+    let revision_from_steam = guess.revision.is_some() && !given(&args.revision);
+    let mut caveats = Vec::new();
+    caveats.push(match &guess.steam {
+        Some(s) if edition_from_steam => format!(
+            "edition was identified from the install files and Steam's {} (appid {}); it was not compared with hashes of known releases",
+            s.manifest_file, s.appid
+        ),
+        _ => "edition is a guess from file presence; it was not compared with hashes of known releases"
             .to_string(),
-    ];
+    });
     if given(&args.edition) {
         caveats.push("edition was given by the user (--edition) and is not checked".to_string());
     }
@@ -290,20 +328,60 @@ fn identification_for(
     });
     caveats.push(if given(&args.language) {
         "language was chosen by the user (--language)".to_string()
+    } else if report.language_defaulted && report.language_guess.as_deref() == Some(language) {
+        format!(
+            "language defaulted to {language}: the install holds several languages and none was chosen (--language)"
+        )
     } else {
         "language is inferred from the executable / language directory names, or unknown"
             .to_string()
     });
     caveats.push(if given(&args.revision) {
         "revision was given by the user (--revision) and is not checked".to_string()
+    } else if let Some(rev) = &guess.revision {
+        format!("revision was read from Steam's appmanifest ({rev}): the depot build, not compared with hashes of known releases")
     } else {
         "revision is unknown: it cannot be told from the files".to_string()
     });
     if neutral_data_beside_languages {
         caveats.push("files outside data/lang-<xx>/ (the classic layout) were taken as language-neutral and kept beside the chosen language's own files: that is an assumption, the layout of installs with language directories is uncertain [verify]".to_string());
     }
-    if let Some(first) = scan_warnings.first() {
+    // the field archive's language comes from file names alone: flevel.lgp = English and
+    // fflevel / gflevel / sflevel / jfleve.lgp = French / German / Spanish / Japanese
+    if let Some(f) = chosen
+        .iter()
+        .find(|w| w.language_inferred && is_flevel(&w.logical_path))
+    {
+        let file = f
+            .source_relative_path
+            .rsplit('/')
+            .next()
+            .unwrap_or(&f.source_relative_path);
+        let stored = if f.variant_of.is_some() {
+            format!(
+                ", stored as {} so that readers find it as that language's flevel.lgp",
+                f.logical_path
+            )
+        } else {
+            String::new()
+        };
+        caveats.push(format!(
+            "the field archive ({file}) was assigned to language {} from file names alone (flevel.lgp = English; fflevel, gflevel, sflevel, jfleve.lgp = French, German, Spanish, Japanese) [verify]{stored}",
+            f.language.as_deref().unwrap_or("unknown")
+        ));
+    }
+    // the first warning about the files themselves (the language default has its own caveat)
+    if let Some(first) = report
+        .warnings
+        .iter()
+        .find(|w| !w.starts_with(LANGUAGE_DEFAULT_PREFIX))
+    {
         caveats.push(first.clone());
     }
-    Identification::unverified("pc-file-presence", caveats)
+    let method = if edition_from_steam || revision_from_steam {
+        "pc-steam-appmanifest"
+    } else {
+        "pc-file-presence"
+    };
+    Identification::unverified(method, caveats)
 }
