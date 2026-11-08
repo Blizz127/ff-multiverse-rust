@@ -216,12 +216,19 @@ Per release, record next to this table: build id, source commit, package sha256,
 its result. Never record PASS without an actual observation; virtual pads, unit tests and a headless
 run support development but are not device results. Latest record: none (no build published).
 
+Also not yet observed on a device: a start from a launcher that itself runs under Steam Game Mode.
+The script and the binaries inherit the launcher's environment unchanged, so Steam's runtime
+library path and overlay preload would reach `fmv-client`, and the detached local server may keep
+the launcher's entry looking busy (see section 5). Both are NOT RUN.
+
 ## 9. Verification
 
 Run on the build machine, from an unpacked `scripts/package.sh` tarball, with a temporary data
 directory and the owner's own FF7 copy read-only:
 
-- `bash -n scripts/ff-multiverse.sh scripts/package.sh`; shellcheck is not installed there: NOT RUN.
+- `bash -n scripts/ff-multiverse.sh` and, as a separate command, `bash -n scripts/package.sh`
+  (`package.sh` also refuses to package an entry point that does not parse); shellcheck is not
+  installed there: NOT RUN.
 - `ff-multiverse.sh --headless --name Test --duration 5`: imports, prints the server's READY line,
   the bot prints its `SMOKE` line, exit 0. Second run reuses the server; a replaced `fmv-server`
   restarts it; a foreign listener on the port stops the start; `--stop-server` ends only the
