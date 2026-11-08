@@ -32,8 +32,8 @@
 //! runs off the screen), `BattleEvent::EscapeFailed` (a short stumble back) and `Outcome::Escaped` (no
 //! victory pose) make the compiler list every arm to add. See the TODO(v7) notes of [`cue`].
 
-use super::clips::{Kit, Slot};
-use super::cue::{self, Cue, Landing, DEATH_BEAT};
+use super::clips::{AttackClip, Kit, Slot};
+use super::cue::{self, Cue, Landing};
 use super::effects::{Burst, BurstKind, Charge, Element, Look};
 use super::plan::{self, Lunge, Segment, Shape};
 use fmv_ff7_battle::rules::{ActionRef, ActorId, BattleEvent, Side};
@@ -332,7 +332,8 @@ impl Director {
                 Some(Landing::Death { actor }) => {
                     if let Some((i, _)) = self.anchor(actor) {
                         if self.deaths[i].is_none() {
-                            self.deaths[i] = Some(impact + DEATH_BEAT);
+                            // The very function the overlay's list uses: the two cannot drift apart.
+                            self.deaths[i] = Some(arrival + cue::delay_of(action, event));
                         }
                     }
                 }
@@ -353,7 +354,13 @@ impl Director {
     fn strike_shape(&self, kit: &Kit, attack: Option<u16>, melee: bool, reach: f32, actor: usize) -> Shape {
         let strike = match self.sides[actor] {
             Side::Party => plan::party_strike(kit),
-            Side::Enemy => attack.and_then(|id| kit.attack_slot(id)).or(kit.plain).map(|slot| plan::Strike { slot, impact: 0.5 }),
+            // The clip its attack names; an attack whose clip cannot be played moves procedurally (it does not
+            // borrow another attack's); a plain attack, or an id the scene does not name, plays its first.
+            Side::Enemy => match attack.and_then(|id| kit.attack_clip(id)) {
+                Some(AttackClip::Slot(slot)) => Some(plan::Strike { slot, impact: 0.5 }),
+                Some(AttackClip::Procedural) => None,
+                None => kit.plain.map(|slot| plan::Strike { slot, impact: 0.5 }),
+            },
         };
         if melee {
             Shape::Melee { reach, strike }

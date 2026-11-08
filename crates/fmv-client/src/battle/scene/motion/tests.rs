@@ -233,6 +233,34 @@ fn an_enemys_attack_plays_the_clip_scene_bin_names_and_runs_up_with_its_run_clip
 }
 
 #[test]
+fn an_attack_whose_clip_cannot_be_played_moves_procedurally_and_does_not_borrow_anothers() {
+    let sides = vec![Side::Party, Side::Party, Side::Enemy, Side::Enemy];
+    let mut set = pack(8, 15);
+    set.travel[2] = -1000.0;
+    set.travel[5] = 1000.0;
+    // Attack 272 plays slot 3 (real); attack 273 names slot 4, which is not the slot's own clip; 274 names slot 40,
+    // past the pack.
+    set.ok[4] = false;
+    let enemy = Kit::enemy(set, &[(272, 3), (273, 4), (274, 40)]);
+    let mut d = Director::with_kits(sides, anchors(), vec![Kit::none(), Kit::none(), enemy.clone(), enemy]);
+    d.on_batch(5.0, &[action(2, ActionRef::EnemyAttack(272)), damage(2, 1, false)], PLAIN);
+    assert!(d.segments_of(2).iter().any(|s| s.slot == 3), "the playable attack plays its clip");
+    for bad in [273u16, 274] {
+        let mut d = d.clone();
+        d.on_batch(9.0, &[action(3, ActionRef::EnemyAttack(bad)), damage(3, 1, false)], PLAIN);
+        assert!(d.segments_of(3).iter().all(|s| s.slot != 3), "attack {bad} does not play attack 272's clip: {:?}", d.segments_of(3));
+        let run = d.effects.iter().filter(|e| matches!(e, Effect::Lunge { actor: 3, .. })).count();
+        assert_eq!(run, 1, "it runs up to its target like an actor without clips");
+        // It lands on schedule all the same.
+        assert!(d.bursts().iter().any(|b| (b.at - (9.0 + cue::impact_delay(Some(ActionRef::EnemyAttack(bad))))).abs() < 1e-9));
+    }
+    // An attack the scene does not name for it at all (or a plain attack) plays the first attack's clip.
+    let mut named_nowhere = d.clone();
+    named_nowhere.on_batch(20.0, &[action(3, ActionRef::EnemyAttack(999)), damage(3, 1, false)], PLAIN);
+    assert!(named_nowhere.segments_of(3).iter().any(|s| s.slot == 3));
+}
+
+#[test]
 fn a_miss_is_a_step_aside_with_no_burst_and_a_spell_that_misses_shows_nothing_either() {
     let mut d = with_clips();
     d.on_batch(3.0, &[action(0, ActionRef::Attack), BattleEvent::Miss { actor: ActorId(0), target: ActorId(3) }], PLAIN);

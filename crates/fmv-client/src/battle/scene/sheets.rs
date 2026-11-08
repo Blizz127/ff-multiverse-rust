@@ -103,6 +103,11 @@ fn party_clips_agree_across_the_characters() {
         }
         assert!(kit.attack.is_some() && kit.hurt.is_some() && kit.death.is_some() && kit.dead.is_some(), "{name}");
         assert!(kit.victory.is_some() && kit.defend.is_some() && kit.item.is_some() && kit.cast.iter().all(Option::is_some), "{name}");
+        // The weapon rides on a track of its own for each slot played: every slot the kit uses has a real one (a
+        // slot with a stand-in track would draw the weapon at some other slot's place).
+        for slot in [0usize, 2, 4, 6, 7, 8, 9, 10, 12, 13, 14, 15, 18] {
+            assert!(model.weapon_track_ok.get(slot).copied().unwrap_or(false), "{name}: the weapon's track for slot {slot} is a stand-in or missing");
+        }
         // The death clip lands lying down, in the pose the dead slot holds: the same height (±40 units) and the
         // same root height.
         let (death, dead) = (kit.death.unwrap(), kit.dead.unwrap());
@@ -152,6 +157,10 @@ fn enemy_book_is_the_same_in_every_scene() {
     let Some(path) = battle_lgp() else { return };
     let mut models = BattleModels::open(path).expect("battle.lgp");
     let mp = models.load_enemy(16).expect("the MP");
+    // The baton rides on a real track of its own in every slot the MP plays.
+    for slot in 0..=5usize {
+        assert!(mp.weapon_track_ok.get(slot).copied().unwrap_or(false), "the MP's baton track for slot {slot}");
+    }
     let kit = Kit::enemy(clip_set(&mp), &book.attacks_of(16));
     eprintln!("the MP: hurt {:?}, run {:?}, back {:?}, attacks {:?}", kit.hurt, kit.run, kit.back, kit.attacks);
     assert_eq!((kit.hurt, kit.run, kit.back), (Some(1), Some(2), Some(5)));
@@ -225,7 +234,11 @@ impl Rig {
             camera: view.gpu_camera(),
         };
         let mut overlay = DrawList::new();
-        overlay.draw_text_shadowed(3, 3, 1, [255, 255, 120, 255], [0, 0, 0, 255], label);
+        // One line of text per line of the label (the first yellow, the others white).
+        for (i, line) in label.lines().enumerate() {
+            let color = if i == 0 { [255, 255, 120, 255] } else { [255, 255, 255, 255] };
+            overlay.draw_text_shadowed(3, 3 + 10 * i as i32, 1, color, [0, 0, 0, 255], line);
+        }
         gpu.render_battle(TILE_W, TILE_H, &frame_data, &overlay)
     }
 
@@ -247,6 +260,67 @@ impl Rig {
         }
         (sw, sh, sheet)
     }
+}
+
+/// Equal tiles laid out `per_row` to a row.
+fn grid(tiles: &[Vec<u8>], per_row: usize) -> (u32, u32, Vec<u8>) {
+    let rows = tiles.len().div_ceil(per_row);
+    let (sw, sh) = (TILE_W * per_row as u32, TILE_H * rows as u32);
+    let mut sheet = vec![0u8; (sw * sh * 4) as usize];
+    for (n, tile) in tiles.iter().enumerate() {
+        let (ox, oy) = ((n % per_row) as u32 * TILE_W, (n / per_row) as u32 * TILE_H);
+        for y in 0..TILE_H {
+            let src = &tile[(y * TILE_W * 4) as usize..((y + 1) * TILE_W * 4) as usize];
+            let dst = (((oy + y) * sw + ox) * 4) as usize;
+            sheet[dst..dst + src.len()].copy_from_slice(src);
+        }
+    }
+    (sw, sh, sheet)
+}
+
+/// What the scene plays for each role, for all nine characters at once: one row per character, one picture per
+/// role (the attack at its impact frame, the cast's hold, the item gesture, a hurt flinch, a fall, the end of the
+/// victory): the one picture that says the shared table of [`super::clips`] holds for everybody.
+#[test]
+#[ignore = "needs the owner's real FF7 data (FMV_FF7_DATA) and a GPU or a software Vulkan/GL driver"]
+fn party_roles_overview_sheets() {
+    let (Some(path), Some(mut gpu)) = (battle_lgp(), Offscreen::new()) else { return };
+    let mut models = BattleModels::open(path).expect("battle.lgp");
+    let mut rows: Vec<Vec<Vec<u8>>> = Vec::new();
+    for which in BattleCharacter::ALL.into_iter().filter(|c| *c != BattleCharacter::Sephiroth) {
+        let model = models.load_character(which).expect("the character loads");
+        let kit = Kit::party(clip_set(&model));
+        let standing = model.pose(0, 0).and_then(|p| model.model.posed_bounds(&p, &fmv_ff7::model::mat4_identity())).map_or(900.0, |(lo, _)| f64::from(-lo[1]));
+        let rig = Rig::new(model, standing);
+        let name = which.display_name().to_string();
+        let roles = [
+            ("attack", kit.attack, party_impact()),
+            ("cast hold", kit.cast[1], 0.5),
+            ("item", kit.item, 0.5),
+            ("hurt", kit.hurt, 0.4),
+            ("death", kit.death, 0.35),
+            ("victory", kit.victory, 1.0),
+        ];
+        let tiles = roles
+            .iter()
+            .map(|&(role, slot, at)| {
+                let slot = usize::from(slot.expect("the role has a slot"));
+                let frames = rig.model.animations[slot].frame_count();
+                let frame = (at * (frames - 1) as f32).round() as usize;
+                rig.tile(&mut gpu, slot, frame, &format!("{role} s{slot} f{frame}/{frames}\n{name}"))
+            })
+            .collect();
+        rows.push(tiles);
+    }
+    for (half, chunk) in rows.chunks(5).enumerate() {
+        let tiles: Vec<Vec<u8>> = chunk.iter().flatten().cloned().collect();
+        let (w, h, sheet) = grid(&tiles, 6);
+        save(&format!("party-roles-overview-{half}"), w, h, &sheet);
+    }
+}
+
+fn party_impact() -> f32 {
+    super::clips::party::ATTACK_IMPACT
 }
 
 /// The slots the choreography plays, as rows, for every one of the nine characters: the evidence for the

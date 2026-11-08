@@ -122,8 +122,20 @@ pub struct Kit {
     pub back: Option<Slot>,
     /// An enemy's attacks: `scene.bin` attack id and its slot.
     pub attacks: Vec<(u16, Slot)>,
+    /// The attacks `scene.bin` names whose slot cannot be played (it is past the model's pack, or not the
+    /// slot's own clip): they move procedurally, they do NOT borrow another attack's clip.
+    pub unplayable: Vec<u16>,
     /// The slot of an enemy's first attack: what a plain attack plays.
     pub plain: Option<Slot>,
+}
+
+/// What an enemy plays for an attack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttackClip {
+    /// The clip `scene.bin` names for it.
+    Slot(Slot),
+    /// `scene.bin` names it but the clip cannot be played: the procedural motion.
+    Procedural,
 }
 
 impl Kit {
@@ -154,6 +166,7 @@ impl Kit {
     /// The kit of an enemy's battle model, with the attacks `scene.bin` names for it (`attacks`: attack
     /// id and slot; one that points at a slot the model cannot play is left out).
     pub fn enemy(clips: ClipSet, attacks: &[(u16, u8)]) -> Self {
+        let unplayable: Vec<u16> = attacks.iter().filter(|&&(_, slot)| clips.usable(usize::from(slot)).is_none()).map(|&(id, _)| id).collect();
         let attacks: Vec<(u16, Slot)> = attacks.iter().filter_map(|&(id, slot)| clips.usable(usize::from(slot)).map(|s| (id, s))).collect();
         let run = find_run(&clips, &attacks);
         Self {
@@ -162,15 +175,20 @@ impl Kit {
             run,
             plain: attacks.first().map(|&(_, s)| s),
             attacks,
+            unplayable,
             clips,
             ..Self::default()
         }
     }
 
-    /// The slot the enemy attack `id` plays (`None`: the scene has no such attack for it, or the slot
-    /// cannot be played).
-    pub fn attack_slot(&self, id: u16) -> Option<Slot> {
-        self.attacks.iter().find(|&&(a, _)| a == id).map(|&(_, s)| s)
+    /// What the enemy attack `id` plays: its own clip, or `Procedural` when `scene.bin` names the attack
+    /// with a slot that cannot be played. `None` for an id `scene.bin` does not name for this enemy at all
+    /// (a plain attack's clip is [`Kit::plain`]).
+    pub fn attack_clip(&self, id: u16) -> Option<AttackClip> {
+        if self.unplayable.contains(&id) {
+            return Some(AttackClip::Procedural);
+        }
+        self.attacks.iter().find(|&&(a, _)| a == id).map(|&(_, s)| AttackClip::Slot(s))
     }
 
     /// Does this kit play any real clip at all? (tests)
@@ -268,7 +286,7 @@ mod tests {
         let kit = Kit::enemy(the_mp(), &[(272, 3), (273, 4)]);
         assert_eq!(kit.hurt, Some(1));
         assert_eq!((kit.run, kit.back), (Some(2), Some(5)), "the run-up carries it forward, the way back returns it");
-        assert_eq!((kit.attack_slot(272), kit.attack_slot(273), kit.attack_slot(999)), (Some(3), Some(4), None));
+        assert_eq!((kit.attack_clip(272), kit.attack_clip(273), kit.attack_clip(999)), (Some(AttackClip::Slot(3)), Some(AttackClip::Slot(4)), None));
         assert_eq!(kit.plain, Some(3), "a plain attack plays the first of its attacks");
         assert_eq!((kit.death, kit.victory, kit.attack), (None, None, None), "an enemy has no death clip: it fades");
     }
@@ -279,6 +297,9 @@ mod tests {
         set.ok[4] = false;
         let kit = Kit::enemy(set, &[(272, 3), (273, 4), (274, 40), (275, 255)]);
         assert_eq!(kit.attacks, [(272, 3)], "slot 4 is not the slot's own clip, 40 and 255 are not in the pack");
+        // What the record names but cannot be played is kept apart: procedural, never another attack's clip.
+        assert_eq!(kit.unplayable, [273, 274, 275]);
+        assert_eq!((kit.attack_clip(273), kit.attack_clip(275), kit.attack_clip(272), kit.attack_clip(9999)), (Some(AttackClip::Procedural), Some(AttackClip::Procedural), Some(AttackClip::Slot(3)), None));
     }
 
     #[test]
