@@ -60,9 +60,17 @@ as a labelled test area; it says nothing about FF7 support.
 | M2-c/d | Shared battle, battle return, per-player rewards | done (battle subset; rewards logged and sent, not stored yet) |
 | Later | FF8, FF9, FF10 and FF12 adapters on the same core | planned |
 
-Not done yet: choosing an FF7 character model for your avatar, NPCs, field scripts, music, and
-the window's scrolling camera (it shows the whole background). The increment-by-increment plan
-is in `IMPLEMENTATION-PLAN.md`.
+**Walking between fields (additive in protocol v3).** The server hosts many fields: the entry field
+(`md1stin`) is always loaded and any field behind one of its gateways is loaded the first time a
+player walks through the gateway and unloaded a minute after the last player left it. Parties may
+span fields, and the fields' NPCs (the characters a field's own data places: Sector 1's guards,
+for example) are announced with every snapshot. See "Walking between fields" below.
+
+Not done yet: choosing an FF7 character model for your avatar, drawing NPCs as models (they are
+markers with a name for now), field scripts (exits that scripts decide, such as the `MAPJUMP`s
+of story scenes, are not followed; only a field's own gateways are), music, and the window's
+scrolling camera (it shows the whole background). The increment-by-increment plan is in
+`IMPLEMENTATION-PLAN.md`.
 
 ## Workspace
 
@@ -213,6 +221,45 @@ default; `--debug`, `--build` and `--bin-dir <dir>` are available, and `--help` 
 rest. It runs the processes with throw-away XDG directories, so it never touches your real
 library or state.
 
+## Walking between fields
+
+A field's gateways (up to twelve line segments in its trigger section, each naming a target
+field and an arrival point) are its **exits**. The **server** watches every move it applies:
+a move that crosses an exit line (from strictly one side of the line to the other or onto it)
+takes the player out of the field. It is then *in transit*: nobody sees it, its moves are
+ignored and it cannot start a battle. The server loads the target field if it must (from the
+same owned archive; a target that cannot be loaded closes the exit), settles the arrival on
+the target's walkable surface and offers it to the client (`AreaChange`: area, fingerprint,
+path-free provenance, arrival position and heading). The client checks the offer against **its
+own** copy of the field exactly as it checks the first field, loads it, answers `JoinArea` (or
+`CannotJoin`, in which case the server sends it back where it stood) and the server answers
+with the new field's `AreaSnapshot` (players and NPCs) and `InstancePlacement`. The players of
+the old field hear `PlayerLeft`, those of the new one `PlayerJoined`; every broadcast reaches
+only the field it is about. Unanswered offers time out like the first join. Nothing but ids,
+fingerprints, positions and NPC names crosses the wire: the client draws the new field from
+its own files.
+
+Parties, accounts and battles belong to the world, not to a field: a party can be spread over
+several fields (each member is placed in its own field with the leader's phase), and a battle
+takes the party members that stand in the requester's field. A player in a battle cannot
+travel. The window rebuilds its view (camera, background, walkmesh) on arrival; the HUD names
+the field. **NPCs** are the characters whose placement is unconditional in the field's init
+script (not player-bound, not hidden at start): static markers with their name over them, with
+`npc_appearance` in the client as the one place the model renderer will hook in.
+
+Headless bots: `--travel md1_1,md1stin` walks through the exits to those fields in order
+(`area_changes=` at the end of the SMOKE line counts the moves; `peers_seen` counts the peers of
+the field the bot ended in), a bot that has a party to form waits for it first, and bots
+without `--travel` never walk across an exit by accident. `scripts/travel-smoke.sh` runs two
+bots in a party from `md1stin` through its gateway to `md1_1` against your own library
+(read-only, throw-away state) and back.
+
+Not done: exits that scripts decide (FF7 `MAPJUMP`s and line triggers; they need the script VM
+and the game's story variables), conditional NPCs, NPC animation and talking, per-phase
+instances (an area is one instance whatever the story phases of the players in it), and a
+protocol version bump: a client built before this change does not know `AreaChange` and
+disconnects at the first exit it crosses.
+
 ## Accounts, avatars and parties
 
 **Accounts.** A client connects with a token or registers a display name. Registering creates
@@ -327,6 +374,8 @@ to a command). Never commit or share any of it.
 crates/                  the Cargo workspace (see the table above)
 scripts/package.sh       build and package a release tarball
 scripts/smoke.sh         two-bot local smoke test
+scripts/battle-smoke.sh  shared-battle smoke test (real data)
+scripts/travel-smoke.sh  walking between fields: two bots, md1stin -> md1_1 and back (real data)
 deploy/                  systemd user unit template and deployment procedure
 IMPLEMENTATION-PLAN.md   first-milestone plan and design constraints
 ```

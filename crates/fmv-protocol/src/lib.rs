@@ -41,6 +41,36 @@
 //! S -> C  BattleEvent { .., events: [.., Victory] }, then BattleEnd { battle_id, outcome, rewards }
 //! ```
 //!
+//! # Area travel (additive in v3)
+//!
+//! A server hosts many areas. The one in the handshake is the entry area; a player leaves it by
+//! walking across one of its exit lines (`fmv_adapter_api::Exit`), which the SERVER detects on the
+//! move it applies. The player is then in transit: nobody sees it, and its `MoveIntent`s are
+//! ignored (not answered) until it answers. Nothing new is asked of the client: it answers an
+//! [`ServerMsg::AreaChange`] exactly as it answers an [`ServerMsg::AreaManifest`], from its OWN
+//! copy of the target area (fingerprint and provenance are checked on both sides, no asset bytes
+//! travel).
+//!
+//! ```text
+//! (S -> old peers  PlayerLeft { entity })
+//! S -> C  AreaChange { area, display_name, fingerprint, provenance, fixture, arrival, arrival_facing }
+//! C -> S  JoinArea { area, fingerprint, provenance }   (or CannotJoin: the server sends it back)
+//! S -> C  AreaSnapshot { area, tick, entities, npcs }  (always followed directly by InstancePlacement)
+//! (S -> new peers  PlayerJoined { snapshot })
+//! ```
+//!
+//! `arrival` is where the server will put the player (already settled on the target's walkable
+//! surface) and `arrival_facing` its heading; the snapshot repeats both in the player's own entity.
+//! A client that cannot hold the area answers `CannotJoin`; the server then sends the player back
+//! where it was with a second `AreaChange` (for the area it came from), which is answered the same
+//! way. A player that does not answer within the join timeout is disconnected. An old v3 client
+//! does not know `AreaChange` and disconnects at the first exit it crosses (the protocol version
+//! was not bumped; bump it when builds are mixed in a deployment).
+//!
+//! `AreaSnapshot::npcs` lists the non-player characters the area's data places ([`NpcSnapshot`]):
+//! static, with no `EntityUpdate`s of their own, sent with every snapshot of the area. It is left
+//! out of the JSON when empty, so a snapshot of an area without any is byte-for-byte what it was.
+//!
 //! # Accounts
 //!
 //! `Hello::auth` is [`Auth::Register`] (create an account with that display name) or
@@ -134,6 +164,41 @@ pub enum Auth {
     /// Create an account with this display name (cleaned by `AvatarAppearance::sanitize_name`
     /// and unique, case-insensitively). The reply carries the new token.
     Register { display_name: String },
+}
+
+// =============================================================================================
+// Area travel (additive in v3): non-player characters.
+// =============================================================================================
+
+/// Most NPCs one `AreaSnapshot` carries. With 256 players (about 140 KB) a full snapshot must
+/// still fit one frame: a sender clips an NPC's name to 24 characters and its model and animation
+/// to 16 ([`NPC_NAME_CHARS`], [`NPC_REF_CHARS`]), which is at most about 350 bytes of JSON per NPC
+/// (all characters 4 bytes wide, extreme floats) and about 45 KB for the list. Enforced by the
+/// sender; a receiver bounds what it keeps by the same numbers.
+pub const MAX_NPCS_PER_AREA: usize = 128;
+/// Longest NPC name a sender puts in an [`NpcSnapshot`] (characters).
+pub const NPC_NAME_CHARS: usize = 24;
+/// Longest model and animation reference a sender puts in an [`NpcSnapshot`] (characters).
+pub const NPC_REF_CHARS: usize = 16;
+
+/// A non-player character of an area: placed by the area's own data, standing still where and
+/// facing the way it says. Carries references only, never mesh or texture bytes: the client
+/// resolves `model` from its own copy.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NpcSnapshot {
+    /// Index in the area's NPC list, stable while the area is hosted (not an `EntityId`: NPCs
+    /// are not players and never appear in `EntityUpdate`).
+    pub id: u32,
+    /// The character's name in the area's data (FF7: the script entity name, `gu0`). For labels.
+    pub name: String,
+    /// Adapter-defined model reference (FF7: the `char.lgp` skeleton stem, `aaaa`).
+    pub model: String,
+    /// The clip that shows it standing, if the data names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_animation: Option<String>,
+    pub pos: Pos,
+    /// Heading in radians, adapter space.
+    pub facing: f32,
 }
 
 /// Who an account id in a party message is. Entities are only known for accounts that are
@@ -233,7 +298,29 @@ pub enum ServerMsg {
         provenance: ProvenanceSummary,
         fixture: bool,
     },
-    AreaSnapshot { area: AreaId, tick: u64, entities: Vec<EntitySnapshot> },
+    AreaSnapshot {
+        area: AreaId,
+        tick: u64,
+        entities: Vec<EntitySnapshot>,
+        /// The area's non-player characters (static scenery; see the module docs, "Area travel").
+        /// At most [`MAX_NPCS_PER_AREA`]; absent from the JSON when empty.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        npcs: Vec<NpcSnapshot>,
+    },
+    /// The server moves this player to another area (see the module docs, "Area travel"). Offers
+    /// the target exactly like `AreaManifest` does, plus where the player will stand.
+    /// The client must answer `JoinArea` or `CannotJoin`.
+    AreaChange {
+        area: AreaId,
+        display_name: String,
+        fingerprint: Fingerprint,
+        provenance: ProvenanceSummary,
+        fixture: bool,
+        /// Where the player will stand in the new area (already on its walkable surface).
+        arrival: Pos,
+        /// The heading it will have there, radians in adapter space.
+        arrival_facing: f32,
+    },
     EntityUpdate { tick: u64, entities: Vec<EntitySnapshot> },
     MoveRejected { seq: u32, corrected: Pos },
     PlayerJoined { snapshot: EntitySnapshot },
@@ -559,6 +646,98 @@ mod tests {
                 r#""party":1,"phase_owner":1,"story_advance_allowed":true}}}"#
             ),
         );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Area travel (additive in v3)
+    // -----------------------------------------------------------------------------------------
+
+    fn md1stin() -> AreaId {
+        AreaId { game: GameId::Ff7, key: "md1stin".into() }
+    }
+
+    fn npc(id: u32) -> NpcSnapshot {
+        NpcSnapshot {
+            id,
+            name: "gu0".into(),
+            model: "aaaa".into(),
+            idle_animation: Some("acfe".into()),
+            pos: Pos::new(3700.0, 29000.0, 353.0),
+            facing: 0.5,
+        }
+    }
+
+    #[test]
+    fn golden_area_travel_messages() {
+        let provenance = ProvenanceSummary {
+            game: GameId::Ff7,
+            platform: Platform::Pc,
+            edition: "Steam".into(),
+            region: "unknown".into(),
+            language: "en".into(),
+            revision: "r1".into(),
+            modded: false,
+        };
+        golden(
+            ServerMsg::AreaChange {
+                area: AreaId { game: GameId::Ff7, key: "md1_1".into() },
+                display_name: "FF7 field md1_1".into(),
+                fingerprint: Fingerprint([0xab; 32]),
+                provenance,
+                fixture: false,
+                arrival: Pos::new(1049.0, 400.0, 90.0),
+                arrival_facing: 1.5,
+            },
+            concat!(
+                r#"{"AreaChange":{"area":{"game":"Ff7","key":"md1_1"},"display_name":"FF7 field md1_1","fingerprint":""#,
+                "abababababababababababababababababababababababababababababababab",
+                r#"","provenance":{"game":"Ff7","platform":"Pc","edition":"Steam","region":"unknown","language":"en","revision":"r1","modded":false},"#,
+                r#""fixture":false,"arrival":{"x":1049.0,"y":400.0,"z":90.0},"arrival_facing":1.5}}"#
+            ),
+        );
+        golden(
+            ServerMsg::AreaSnapshot { area: md1stin(), tick: 7, entities: vec![], npcs: vec![npc(0), npc(1)] },
+            concat!(
+                r#"{"AreaSnapshot":{"area":{"game":"Ff7","key":"md1stin"},"tick":7,"entities":[],"npcs":["#,
+                r#"{"id":0,"name":"gu0","model":"aaaa","idle_animation":"acfe","pos":{"x":3700.0,"y":29000.0,"z":353.0},"facing":0.5},"#,
+                r#"{"id":1,"name":"gu0","model":"aaaa","idle_animation":"acfe","pos":{"x":3700.0,"y":29000.0,"z":353.0},"facing":0.5}]}}"#
+            ),
+        );
+        // An NPC without a known idle clip leaves the key out.
+        let mut bare = npc(2);
+        bare.idle_animation = None;
+        golden(
+            bare,
+            r#"{"id":2,"name":"gu0","model":"aaaa","pos":{"x":3700.0,"y":29000.0,"z":353.0},"facing":0.5}"#,
+        );
+    }
+
+    /// A snapshot of an area without NPCs is exactly what it was before NPCs existed, and one that
+    /// an older server sent (no `npcs` key) still reads, as an area without any.
+    #[test]
+    fn a_snapshot_without_npcs_keeps_its_old_wire_shape() {
+        let old = r#"{"AreaSnapshot":{"area":{"game":"Ff7","key":"md1stin"},"tick":3,"entities":[]}}"#;
+        golden(ServerMsg::AreaSnapshot { area: md1stin(), tick: 3, entities: vec![], npcs: vec![] }, old);
+        let spelled: ServerMsg = decode(br#"{"AreaSnapshot":{"area":{"game":"Ff7","key":"md1stin"},"tick":3,"entities":[],"npcs":[]}}"#).unwrap();
+        assert!(matches!(spelled, ServerMsg::AreaSnapshot { npcs, .. } if npcs.is_empty()));
+    }
+
+    /// The NPC list is bounded so that a full server's snapshot still fits one frame: the budget
+    /// documented on [`MAX_NPCS_PER_AREA`] holds for the worst-case NPC.
+    #[test]
+    fn the_worst_case_npc_list_fits_its_budget() {
+        let worst = NpcSnapshot {
+            id: u32::MAX,
+            name: "\u{10FFFF}".repeat(NPC_NAME_CHARS),
+            model: "\u{10FFFF}".repeat(NPC_REF_CHARS),
+            idle_animation: Some("\u{10FFFF}".repeat(NPC_REF_CHARS)),
+            pos: Pos::new(f32::MIN, f32::MIN, f32::MIN),
+            facing: f32::MIN,
+        };
+        let one = serde_json::to_vec(&worst).unwrap().len();
+        // `\u{10FFFF}` is written as a raw 4-byte character; serde_json does not escape it.
+        assert!(one < 400, "{one} bytes per NPC");
+        assert!(MAX_NPCS_PER_AREA * (one + 1) < 51_000, "{} bytes of NPCs", MAX_NPCS_PER_AREA * (one + 1));
     }
 
     /// Every `PartyEvent` variant keeps its shape (the wire embeds fmv-party's type).
