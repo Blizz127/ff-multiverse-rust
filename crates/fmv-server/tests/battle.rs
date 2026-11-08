@@ -346,7 +346,7 @@ async fn a_solo_player_can_fight_and_win_alone_and_a_hopeless_fight_is_a_defeat_
     let ServerMsg::EncounterStart { formation_id, party, .. } = &won.start else { unreachable!() };
     assert_eq!((*formation_id, party.len()), (0, 1), "no formation named: the rules' default, for a party of one");
     assert_eq!(won.outcome, Outcome::Victory);
-    assert_eq!(won.rewards, vec![BattleReward { account: a.account, exp: 12, gil: 20, ap: 2 }]);
+    assert_eq!(won.rewards, vec![BattleReward::new(a.account, 12, 20, 2)]);
 
     // Formation 2 is overwhelming.
     a.client.send(&ClientMsg::RequestEncounter { formation_id: Some(2) }).await;

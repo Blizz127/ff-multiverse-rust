@@ -41,7 +41,7 @@
 //! game's own data ([`BattleRules::starting_level`], [`BattleRules::starting_exp`]) with no AP and no
 //! gil. Nothing is written until the first payment, so there is nothing to migrate.
 
-use fmv_core::GameId;
+use fmv_core::{GameId, InventoryEntry};
 use fmv_persist::CharacterProgress;
 use fmv_protocol::{BattleReward, BattleRules, ProgressLimits, ServerMsg};
 
@@ -95,7 +95,9 @@ impl Progress {
         Self { character: record.character, level: record.level, exp: record.exp, ap: record.ap, gil: record.gil }
     }
 
-    /// The record to store for `account` in `game`.
+    /// The record to store for `account` in `game`: the numbers, and NO inventory (`None`). A record
+    /// replaces the whole file, so whoever stores one over an existing record must carry the stored
+    /// inventory over (see `saver::persist`); an inventory that is silently dropped would be lost.
     pub fn to_record(self, account: fmv_core::AccountId, game: GameId, now: u64) -> CharacterProgress {
         CharacterProgress {
             exp: self.exp,
@@ -107,18 +109,30 @@ impl Progress {
 }
 
 /// What the login found out about an account's progress: who it plays, and what the store held.
-/// The world turns it into a [`Progress`] when the player joins ([`resolve`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The world turns it into a [`Progress`] when the player joins ([`resolve`]) and into an
+/// [`crate::inventory::Inventory`] with the game's starting stock where the store had none.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProgressSeed {
     /// The character its look names ([`character_for_look`]).
     pub character: u8,
     /// The stored record, `None` if the account has never earned anything.
     pub stored: Option<Progress>,
+    /// The inventory the stored record holds. `None` is "never stored" (no record, or one of an older build
+    /// that had no inventory): the player then starts with the game's starting stock (see
+    /// `inventory`), which is not the same as `Some` of an empty list.
+    pub inventory: Option<Vec<InventoryEntry>>,
+}
+
+impl ProgressSeed {
+    /// A seed with no stored inventory.
+    pub fn of(character: u8, stored: Option<Progress>) -> Self {
+        Self { character, stored, inventory: None }
+    }
 }
 
 impl Default for ProgressSeed {
     fn default() -> Self {
-        Self { character: DEFAULT_CHARACTER, stored: None }
+        Self::of(DEFAULT_CHARACTER, None)
     }
 }
 
@@ -142,7 +156,7 @@ pub fn clamp(limits: ProgressLimits, progress: &mut Progress) {
 
 /// The mirror of a player that joins: its stored progress (or a fresh start) as the character its look
 /// names, inside the game's caps.
-pub fn resolve(rules: &dyn BattleRules, seed: ProgressSeed) -> Progress {
+pub fn resolve(rules: &dyn BattleRules, seed: &ProgressSeed) -> Progress {
     match seed.stored {
         Some(mut stored) => {
             stored.character = seed.character;
@@ -208,7 +222,7 @@ mod tests {
     }
 
     fn reward(exp: u32, gil: u32, ap: u32) -> BattleReward {
-        BattleReward { account: AccountId(1), exp, gil, ap }
+        BattleReward::new(AccountId(1), exp, gil, ap)
     }
 
     #[test]
@@ -248,14 +262,14 @@ mod tests {
     fn a_new_account_starts_where_the_game_says_with_nothing_earned() {
         let p = fresh(&rules(), 2);
         assert_eq!(p, Progress { character: 2, level: 5, exp: 40, ap: 0, gil: 0 });
-        assert_eq!(resolve(&rules(), ProgressSeed { character: 2, stored: None }), p);
-        assert_eq!(resolve(&rules(), ProgressSeed::default()).character, DEFAULT_CHARACTER);
+        assert_eq!(resolve(&rules(), &ProgressSeed::of(2, None)), p);
+        assert_eq!(resolve(&rules(), &ProgressSeed::default()).character, DEFAULT_CHARACTER);
     }
 
     #[test]
     fn a_stored_record_wins_and_follows_the_look_but_keeps_what_was_earned() {
         let stored = Progress { character: 0, level: 9, exp: 700, ap: 31, gil: 2500 };
-        let p = resolve(&rules(), ProgressSeed { character: 3, stored: Some(stored) });
+        let p = resolve(&rules(), &ProgressSeed::of(3, Some(stored)));
         assert_eq!(p, Progress { character: 3, ..stored }, "who it plays changed, what it earned did not");
     }
 
@@ -263,10 +277,10 @@ mod tests {
     fn what_is_stored_is_brought_inside_the_games_caps() {
         let limits = rules().progress_limits();
         let hostile = Progress { character: 0, level: 255, exp: u32::MAX, ap: u32::MAX, gil: u32::MAX };
-        let p = resolve(&rules(), ProgressSeed { character: 0, stored: Some(hostile) });
+        let p = resolve(&rules(), &ProgressSeed::of(0, Some(hostile)));
         assert_eq!(p, Progress { character: 0, level: limits.max_level, exp: limits.max_exp, ap: limits.max_ap, gil: limits.max_gil });
         let zero = Progress { character: 0, level: 0, exp: 0, ap: 0, gil: 0 };
-        assert_eq!(resolve(&rules(), ProgressSeed { character: 0, stored: Some(zero) }).level, 1, "level 0 never exists");
+        assert_eq!(resolve(&rules(), &ProgressSeed::of(0, Some(zero))).level, 1, "level 0 never exists");
     }
 
     #[test]

@@ -25,10 +25,18 @@
 //!   changed, so the next tick's `EntityUpdate` tells it (and everyone) where that is.
 //! * A member that disconnects stays in the engine as an uncontrolled character; a battle with no
 //!   connected member left is dropped.
+//! * An item command is checked against the ACCOUNT's inventory by the server (the engine knows none): the
+//!   engine's own checks come first (gauge, target, MP, spell and item known), then the count
+//!   (`BattleRejection::OutOfItems`), and the item is taken only when the engine accepted the command: the
+//!   player's mirror loses one, the saver is queued the change and the player is told its inventory
+//!   (`ServerMsg::Inventory`) right after the `BattleEvent` that applied it.
 //! * A victory pays the members that fought on (`BattleEnd::rewards`, split by
-//!   `fmv_protocol::split_rewards`). Each payment is added to the member's character progress with the
+//!   `fmv_protocol::split_rewards`) and drops items: the server rolls them after the outcome from the
+//!   battle's seed (`BattleRules::roll_drops`, logged) and deals them to the living members
+//!   (`fmv_protocol::assign_drops`, `BattleReward::items`). Each payment is added to the member's character progress with the
 //!   game's level-up rule (`progress::apply_reward`): the member that is online gets its mirror updated
-//!   and a `CharacterProgress` message right after `BattleEnd`, and every payment, online or not (a
+//!   and a `CharacterProgress` message right after `BattleEnd` (then an `Inventory` one if it was dropped
+//!   items), and every payment, online or not (a
 //!   member that left mid-battle fought on), is queued for the saver, which adds it to the stored
 //!   record. The stored record is a separate one from the account's progression blob, which is also its
 //!   story phase key (`accounts::login` builds `PhaseKey(progression.blob)`): battle results written
@@ -61,16 +69,17 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fmv_adapter_api::{AreaRuntime, EncounterTable};
-use fmv_core::EntityId;
+use fmv_core::{AccountId, EntityId};
 use fmv_ff7_battle::rng::Rng;
 use fmv_ff7_battle::rules::{ActorId, BattleState, Command, CommandError, Outcome, MAX_STEP_MS};
 use fmv_protocol::{
-    split_rewards, AppliedCommand, BattleId, BattleMember, BattleRejection, BattleReward, BattleRules, BattleSetup, ServerMsg,
-    MAX_BATTLE_PARTY,
+    assign_drops, split_rewards, AppliedCommand, BattleId, BattleMember, BattleRejection, BattleReward, BattleRules, BattleSetup,
+    ServerMsg, MAX_BATTLE_PARTY,
 };
 
 use super::{is_full, Outbound, World};
 use crate::config::BattleSettings;
+use crate::inventory::Change;
 use crate::progress;
 use crate::saver::SaveJob;
 
@@ -109,6 +118,10 @@ struct Battle {
     commands: Vec<u32>,
     /// The engine has consumed time up to here.
     clock: Instant,
+    /// The formation (`scene * 4 + slot`) and the seed the battle was started with: what the drops of a
+    /// win are rolled from (they are not part of the replayed battle).
+    formation: u16,
+    seed: u64,
 }
 
 impl Battle {
@@ -225,6 +238,10 @@ fn rejection_of(e: CommandError) -> BattleRejection {
         CommandError::GaugeNotFull(_) => BattleRejection::GaugeNotFull,
         CommandError::UnknownTarget(_) | CommandError::InvalidTarget(_) => BattleRejection::InvalidTarget,
         CommandError::TargetDead(_) => BattleRejection::TargetDead,
+        CommandError::TargetNotDead(_) => BattleRejection::TargetNotDead,
+        CommandError::UnknownSpell(_) => BattleRejection::UnknownSpell,
+        CommandError::NotEnoughMp(_) => BattleRejection::NotEnoughMp,
+        CommandError::UnknownItem(_) => BattleRejection::UnknownItem,
     }
 }
 
@@ -364,6 +381,8 @@ impl World {
                 members: party.iter().cloned().map(|info| Member { info, connected: true }).collect(),
                 commands: vec![0; party.len()],
                 clock: now,
+                formation,
+                seed,
             },
         );
         for entity in &entities {
@@ -411,6 +430,19 @@ impl World {
         if actor != own {
             return refused(Some(battle_id), BattleRejection::NotYourActor);
         }
+        // The engine's own checks come first (gauge, target, MP, spell and item known): what it would refuse is
+        // refused the same way whether or not the account owns the item, and the check changes nothing.
+        if let Err(e) = battle.state.check_command(actor, &command) {
+            return refused(Some(battle_id), rejection_of(e));
+        }
+        // The engine knows no inventory: an item needs one in the ACCOUNT's, checked here.
+        if let Command::Item { item, .. } = command {
+            let owns = self.players.get(&entity).and_then(|p| p.inventory.as_ref()).is_some_and(|inventory| inventory.count(item) > 0);
+            if !owns {
+                return refused(Some(battle_id), BattleRejection::OutOfItems);
+            }
+        }
+        let who = battle.members.get(usize::from(actor.0)).map(|m| (m.info.account, m.info.character));
         match battle.state.submit_command(actor, command) {
             Ok(events) => {
                 if let Some(n) = battle.commands.get_mut(usize::from(actor.0)) {
@@ -424,12 +456,43 @@ impl World {
                 };
                 let (ended, recipients) = (battle.state.outcome().is_some(), battle.connected());
                 self.fan_to(&recipients, Arc::new(msg));
+                // The engine took the command, so the item is spent (even if the player dropped meanwhile).
+                if let (Command::Item { item, .. }, Some((account, character))) = (command, who) {
+                    self.spend_item(battle_id, entity, account, character, item);
+                }
                 if ended {
                     self.finish_battle(battle_id);
                 }
                 BattleReply::Done
             }
             Err(e) => refused(Some(battle_id), rejection_of(e)),
+        }
+    }
+
+    /// An item of `account` was used in battle `battle`: the player's mirror loses one (if it is still
+    /// online), the saver is queued the change (whether or not it is) and the player is told what it carries
+    /// now. The player was `entity` when it gave the command.
+    fn spend_item(&mut self, battle: BattleId, entity: EntityId, account: AccountId, character: u8, item: u16) {
+        let mut told: Option<Outbound> = None;
+        let mut left = None;
+        if let Some(inventory) = self.players.get_mut(&entity).and_then(|p| p.inventory.as_mut()) {
+            inventory.take_one(item);
+            left = Some(inventory.count(item));
+            told = Some(Arc::new(inventory.message()));
+        }
+        let saving = match self.saver.as_ref().map(|saver| saver.save(SaveJob::used_item(account, character, item))) {
+            Some(true) => "queued",
+            Some(false) => "NOT QUEUED (the saver has stopped: the server is shutting down)",
+            None => "off (no saver)",
+        };
+        self.logs.info(format!(
+            "item used battle={} account={} character={character} item={item} left={} saving={saving}",
+            battle.0,
+            account.0,
+            left.map_or_else(|| "?".to_string(), |n| n.to_string()),
+        ));
+        if let Some(msg) = told {
+            self.fan_to(&[entity], msg);
         }
     }
 
@@ -464,6 +527,7 @@ impl World {
     fn finish_battle(&mut self, id: BattleId) {
         let Some(bw) = self.battle.as_mut() else { return };
         let Some(outcome) = bw.battles.get(&id).and_then(|b| b.state.outcome()) else { return };
+        let rules = Arc::clone(&bw.settings.rules);
         let Some(battle) = bw.battles.remove(&id) else { return };
         let roster: Vec<(fmv_core::AccountId, bool)> = battle
             .members
@@ -471,7 +535,20 @@ impl World {
             .enumerate()
             .map(|(i, m)| (m.info.account, u8::try_from(i).ok().and_then(|i| battle.state.actor(ActorId(i))).is_some_and(|c| c.is_alive())))
             .collect();
-        let rewards = if outcome == Outcome::Victory { split_rewards(battle.state.rewards(), &roster) } else { Vec::new() };
+        let mut rewards = if outcome == Outcome::Victory { split_rewards(battle.state.rewards(), &roster) } else { Vec::new() };
+        if outcome == Outcome::Victory {
+            // The drops are rolled now, after the outcome, from the battle's seed on a stream of its own: they
+            // are not part of the replayed battle (a client cannot check them), and they are logged.
+            let drops = rules.roll_drops(battle.formation, battle.seed);
+            assign_drops(&mut rewards, &roster, &drops, rules.max_item_stack());
+            self.logs.info(format!(
+                "battle drops battle={} formation={} seed={} items={:?}",
+                id.0,
+                battle.formation,
+                battle.seed,
+                drops.iter().map(|d| (d.item, d.count)).collect::<Vec<_>>(),
+            ));
+        }
         // The `key=value` layout is read by `scripts/battle-smoke.sh` ("commands=[2, 3]"): keep it.
         self.logs.info(format!(
             "battle ended battle={} outcome={outcome:?} ticks={} members={} commands={:?}",
@@ -514,7 +591,7 @@ impl World {
         for r in rewards {
             let Some(member) = members.iter().find(|m| m.info.account == r.account) else { continue };
             let connected = member.connected;
-            if r.exp == 0 && r.gil == 0 && r.ap == 0 {
+            if r.is_nothing() {
                 let online = self.by_account.get(&r.account).copied();
                 if let Some((entity, own)) = online.and_then(|entity| self.players.get(&entity).and_then(|p| p.progress.map(|own| (entity, own)))) {
                     told.push((entity, Arc::new(progress::message(rules.as_ref(), &own, false))));
@@ -526,10 +603,7 @@ impl World {
                 continue;
             }
             // The store is first in line: it gets every payment, a player online or not.
-            let queued = self
-                .saver
-                .as_ref()
-                .map(|saver| saver.save(SaveJob { account: r.account, character: member.info.character, reward: *r }));
+            let queued = self.saver.as_ref().map(|saver| saver.save(SaveJob::reward(r.account, member.info.character, r.clone())));
             let mut effect = String::from("no mirror: the player is not online");
             let online = self.by_account.get(&r.account).copied();
             if let Some((entity, player)) = online.and_then(|entity| self.players.get_mut(&entity).map(|p| (entity, p))) {
@@ -542,15 +616,29 @@ impl World {
                     );
                     told.push((entity, Arc::new(progress::message(rules.as_ref(), own, leveled_up))));
                 }
+                // The drops go into the mirror like the numbers do, and the player is told what it carries.
+                if !r.items.is_empty() {
+                    if let Some(inventory) = player.inventory.as_mut() {
+                        inventory.apply(&Change::Found(r.items.clone()), rules.max_item_stack());
+                        effect.push_str(&format!(" items={}", inventory.total()));
+                        told.push((entity, Arc::new(inventory.message())));
+                    }
+                }
             }
             let saving = match queued {
                 Some(true) => "queued",
                 Some(false) => "NOT QUEUED (the saver has stopped: the server is shutting down)",
                 None => "off (no saver)",
             };
+            // New keys go at the end of the `key=value` part (scripts read it by key).
             self.logs.info(format!(
-                "battle reward battle={} account={} exp={} gil={} ap={} delivered={connected} saving={saving}: {effect}",
-                id.0, r.account.0, r.exp, r.gil, r.ap,
+                "battle reward battle={} account={} exp={} gil={} ap={} delivered={connected} saving={saving} dropped={:?}: {effect}",
+                id.0,
+                r.account.0,
+                r.exp,
+                r.gil,
+                r.ap,
+                r.items.iter().map(|e| (e.item, e.count)).collect::<Vec<_>>(),
             ));
         }
         told
@@ -564,6 +652,18 @@ impl World {
         let Some(player) = self.players.get(&entity) else { return };
         let Some(own) = player.progress.as_ref() else { return };
         let msg: Outbound = Arc::new(progress::message(bw.rules(), own, leveled_up));
+        if let Err(e) = player.tx.try_send(msg) {
+            failed.push((entity, is_full(&e)));
+        }
+    }
+
+    /// Tell `entity` what it carries (`ServerMsg::Inventory`); a player without an inventory (a server that
+    /// runs no battles) is told nothing. Players whose queue fails are appended to `failed` for the caller
+    /// to drop.
+    pub(super) fn tell_inventory(&mut self, entity: EntityId, failed: &mut Vec<(EntityId, bool)>) {
+        let Some(player) = self.players.get(&entity) else { return };
+        let Some(inventory) = player.inventory.as_ref() else { return };
+        let msg: Outbound = Arc::new(inventory.message());
         if let Err(e) = player.tx.try_send(msg) {
             failed.push((entity, is_full(&e)));
         }
@@ -644,7 +744,7 @@ mod tests {
     use crate::progress::{Progress, ProgressSeed};
     use crate::saver::{Msg, SaverHandle};
     use fmv_protocol::battle::BattleEvent;
-    use fmv_protocol::{BattleReplay, SyntheticRules};
+    use fmv_protocol::{BattleReplay, InventoryEntry, SyntheticRules};
     use tokio::sync::{mpsc, watch};
 
     struct Seat {
@@ -919,7 +1019,7 @@ mod tests {
         let mut w = world_with(Some(settings(SyntheticRules::default())), true);
         // A plays Cloud, B plays Barret (their looks, as the login found out): the character is the
         // account's own, no longer the member's place in the battle.
-        let barret = ProgressSeed { character: 1, stored: None };
+        let barret = ProgressSeed::of(1, None);
         let (mut a, mut b) = party_of_two_as(&mut w, t0, ProgressSeed::default(), barret);
         assert_eq!(w.party_size_of(a.account), 2);
         let mut c = seat(&mut w, "C", t0); // not in the party
@@ -1025,7 +1125,7 @@ mod tests {
         let mut w = world_with(Some(settings(SyntheticRules::default())), true);
         // Level 9 starts at 144 experience on the synthetic curve and level 10 at 180: 154 is ten in.
         let stored = Progress { character: 2, level: 9, exp: 154, ap: 31, gil: 2500 };
-        let mut a = seat_as(&mut w, "A", t0, ProgressSeed { character: 2, stored: Some(stored) });
+        let mut a = seat_as(&mut w, "A", t0, ProgressSeed::of(2, Some(stored)));
         let msgs = a.drain();
         assert!(matches!(msgs[0], ServerMsg::AreaSnapshot { .. }), "{msgs:?}");
         assert!(matches!(msgs[1], ServerMsg::InstancePlacement { .. }), "{msgs:?}");
@@ -1033,7 +1133,8 @@ mod tests {
             msgs[2],
             ServerMsg::CharacterProgress { character: 2, level: 9, exp: 154, exp_to_next: 26, gil: 2500, ap: 31, leveled_up: false }
         );
-        assert_eq!(msgs.len(), 3, "{msgs:?}");
+        assert_eq!(msgs[3], ServerMsg::Inventory { items: vec![InventoryEntry::new(0, 3), InventoryEntry::new(3, 1), InventoryEntry::new(7, 1)] });
+        assert_eq!(msgs.len(), 4, "{msgs:?}");
 
         // A new account starts where the rules say: level 5 with the experience of level 5 (40).
         let mut b = seat(&mut w, "B", t0);
@@ -1046,7 +1147,325 @@ mod tests {
         let mut w = world_with(None, true);
         let mut a = seat(&mut w, "A", t0);
         assert!(progress_msgs(&mut a).is_empty());
-        assert!(w.players.values().all(|p| p.progress.is_none()));
+        assert!(inventory_msgs(&mut a).is_empty(), "no items on a server without battle data");
+        assert!(w.players.values().all(|p| p.progress.is_none() && p.inventory.is_none()));
+    }
+
+    // ---- inventory (M2-e) ----
+
+    /// The `Inventory` messages a seat has received so far, in order, as `(item, count)` lists.
+    fn inventory_msgs(seat: &mut Seat) -> Vec<Vec<(u16, u16)>> {
+        seat.drain();
+        seat.log
+            .iter()
+            .filter_map(|m| match m {
+                ServerMsg::Inventory { items } => Some(items.iter().map(|e| (e.item, e.count)).collect()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Run the clock of battle `id` until `actor` can act; returns the time it got to.
+    fn until_ready(w: &mut World, id: BattleId, actor: ActorId, from: Instant) -> Instant {
+        let mut t = from;
+        for _ in 0..5_000 {
+            t += Duration::from_millis(10);
+            w.advance_battles(t);
+            if w.battle.as_ref().and_then(|b| b.battles.get(&id)).is_some_and(|b| b.state.ready_actors().contains(&actor)) {
+                return t;
+            }
+        }
+        panic!("{actor:?} never became ready");
+    }
+
+    /// 3 Potions, an Ether and a Phoenix Down: what `SyntheticRules` starts an account with.
+    fn stock() -> Vec<(u16, u16)> {
+        vec![(0, 3), (3, 1), (7, 1)]
+    }
+
+    /// A login that found this inventory in the store.
+    fn seeded_with(items: &[(u16, u16)]) -> ProgressSeed {
+        ProgressSeed { inventory: Some(items.iter().map(|&(item, count)| InventoryEntry::new(item, count)).collect()), ..ProgressSeed::default() }
+    }
+
+    /// The server's mirror of what a player carries.
+    fn mirror_of(w: &World, who: &Seat) -> Vec<(u16, u16)> {
+        let inventory = w.players.get(&who.entity).and_then(|p| p.inventory.as_ref());
+        inventory.map(|i| i.entries().iter().map(|e| (e.item, e.count)).collect()).unwrap_or_default()
+    }
+
+    #[test]
+    fn a_new_account_carries_the_starting_stock_and_a_stored_inventory_replaces_it() {
+        let t0 = Instant::now();
+        let mut w = world_with(Some(settings(SyntheticRules::default())), true);
+        let mut a = seat(&mut w, "A", t0);
+        assert_eq!(inventory_msgs(&mut a), vec![stock()]);
+        assert_eq!(mirror_of(&w, &a), stock());
+        // Right after the progress, which is right after the snapshot and the placement.
+        let order: Vec<&str> = a
+            .log
+            .iter()
+            .filter_map(|m| match m {
+                ServerMsg::AreaSnapshot { .. } => Some("snapshot"),
+                ServerMsg::InstancePlacement { .. } => Some("placement"),
+                ServerMsg::CharacterProgress { .. } => Some("progress"),
+                ServerMsg::Inventory { .. } => Some("inventory"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(order, ["snapshot", "placement", "progress", "inventory"]);
+        // A stored inventory is what the player has, and an empty one is empty: the stock is given once.
+        let mut b = seat_as(&mut w, "B", t0, seeded_with(&[(7, 2)]));
+        assert_eq!(inventory_msgs(&mut b), vec![vec![(7, 2)]]);
+        let mut c = seat_as(&mut w, "C", t0, seeded_with(&[]));
+        assert_eq!(inventory_msgs(&mut c), vec![Vec::<(u16, u16)>::new()]);
+        // What is stored is brought inside the rules before it is believed or sent.
+        let mut d = seat_as(&mut w, "D", t0, seeded_with(&[(5, 60_000), (1, 0), (5, 3)]));
+        assert_eq!(inventory_msgs(&mut d), vec![vec![(5, 99)]]);
+    }
+
+    #[test]
+    fn an_item_is_spent_told_and_saved_only_when_the_engine_accepts_the_command() {
+        let t0 = Instant::now();
+        let (mut w, mut rx) = world_with_saver(settings(SyntheticRules::default()));
+        // 3 Potions, an Ether, a Phoenix Down, and 5 of an item (6) that the engine cannot use in battle.
+        let mut a = seat_as(&mut w, "A", t0, seeded_with(&[(0, 3), (3, 1), (6, 5), (7, 1)]));
+        assert_eq!(w.request_encounter(a.entity, Some(0), t0), BattleReply::Done);
+        a.drain();
+        let id = BattleId(1);
+        let t = until_ready(&mut w, id, ActorId(0), t0);
+        let item = |item, target: u8| Command::Item { item, target: ActorId(target) };
+        let before = mirror_of(&w, &a);
+
+        // What the engine refuses is refused as the engine says, whatever the account owns, and costs nothing.
+        for (command, reason) in [
+            (item(6, 0), BattleRejection::UnknownItem),
+            (item(99, 0), BattleRejection::UnknownItem),
+            (item(0, 1), BattleRejection::InvalidTarget),
+            (item(0, 9), BattleRejection::InvalidTarget),
+            (item(20, 0), BattleRejection::InvalidTarget),
+            (item(7, 0), BattleRejection::TargetNotDead),
+        ] {
+            assert_eq!(w.battle_command(a.entity, id, ActorId(0), command, t), refused(Some(id), reason), "{command:?}");
+        }
+        assert_eq!(mirror_of(&w, &a), before);
+        assert!(saved(&mut rx).is_empty(), "a refused command saves nothing");
+        assert!(
+            a.drain().iter().all(|m| !matches!(m, ServerMsg::Inventory { .. } | ServerMsg::BattleEvent { command: Some(_), .. })),
+            "a refused command tells nobody anything"
+        );
+
+        // A Potion on itself is accepted: the event that applied it, then the inventory, right after.
+        assert_eq!(w.battle_command(a.entity, id, ActorId(0), item(0, 0), t), BattleReply::Done);
+        let msgs = a.drain();
+        let applied = msgs
+            .iter()
+            .position(|m| matches!(m, ServerMsg::BattleEvent { command: Some(AppliedCommand { command: Command::Item { item: 0, .. }, .. }), .. }))
+            .expect("the command is announced");
+        let want = vec![(0, 2), (3, 1), (6, 5), (7, 1)];
+        assert_eq!(msgs[applied + 1], ServerMsg::Inventory { items: want.iter().map(|&(i, c)| InventoryEntry::new(i, c)).collect() });
+        assert_eq!(msgs.len(), applied + 2, "{msgs:?}");
+        assert_eq!(mirror_of(&w, &a), want);
+        assert_eq!(saved(&mut rx), vec![crate::saver::SaveJob::used_item(a.account, 0, 0)]);
+        let logs: Vec<String> = w.take_logs().iter().map(|l| l.text().to_string()).collect();
+        let line = logs.iter().find(|l| l.starts_with("item used")).expect("the log says it");
+        assert!(
+            line.contains(&format!("battle=1 account={} character=0 item=0 left=2 saving=queued", a.account.0)),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn an_account_without_the_item_is_refused_even_when_the_engine_would_accept_it() {
+        let t0 = Instant::now();
+        let (mut w, mut rx) = world_with_saver(settings(SyntheticRules::default()));
+        // Only an Ether.
+        let mut a = seat_as(&mut w, "A", t0, seeded_with(&[(3, 1)]));
+        assert_eq!(w.request_encounter(a.entity, Some(0), t0), BattleReply::Done);
+        a.drain();
+        let id = BattleId(1);
+        let mut t = until_ready(&mut w, id, ActorId(0), t0);
+        let item = |item| Command::Item { item, target: ActorId(0) };
+        let still_ready = |w: &World| w.battle.as_ref().unwrap().battles.get(&id).unwrap().state.ready_actors().contains(&ActorId(0));
+        // A Potion is something the engine accepts, and the account has none: refused, the turn is not spent.
+        assert_eq!(w.battle_command(a.entity, id, ActorId(0), item(0), t), refused(Some(id), BattleRejection::OutOfItems));
+        assert!(still_ready(&w));
+        assert_eq!(w.battle.as_ref().unwrap().battles.get(&id).unwrap().commands, vec![0]);
+        assert!(saved(&mut rx).is_empty());
+        // The Ether it has goes, and the stack is gone from what it carries; the same again is refused.
+        assert_eq!(w.battle_command(a.entity, id, ActorId(0), item(3), t), BattleReply::Done);
+        assert_eq!(inventory_msgs(&mut a).last(), Some(&Vec::<(u16, u16)>::new()));
+        assert_eq!(mirror_of(&w, &a), Vec::<(u16, u16)>::new());
+        t = until_ready(&mut w, id, ActorId(0), t);
+        assert_eq!(w.battle_command(a.entity, id, ActorId(0), item(3), t), refused(Some(id), BattleRejection::OutOfItems));
+        assert_eq!(saved(&mut rx).len(), 1, "one Ether, one saved change");
+        // Spells and Defend need no item and touch no inventory.
+        assert_eq!(w.battle_command(a.entity, id, ActorId(0), Command::Magic { spell: 27, target: ActorId(1) }, t), BattleReply::Done);
+        t = until_ready(&mut w, id, ActorId(0), t);
+        assert_eq!(w.battle_command(a.entity, id, ActorId(0), Command::Defend, t), BattleReply::Done);
+        assert!(saved(&mut rx).is_empty());
+        // The refusals of spells are the engine's too.
+        t = until_ready(&mut w, id, ActorId(0), t);
+        for (command, reason) in [
+            (Command::Magic { spell: 99, target: ActorId(1) }, BattleRejection::UnknownSpell),
+            (Command::Magic { spell: 27, target: ActorId(0) }, BattleRejection::InvalidTarget),
+            (Command::Magic { spell: 7, target: ActorId(0) }, BattleRejection::TargetNotDead),
+        ] {
+            assert_eq!(w.battle_command(a.entity, id, ActorId(0), command, t), refused(Some(id), reason), "{command:?}");
+        }
+    }
+
+    #[test]
+    fn a_command_that_wins_the_battle_still_spends_its_item_before_the_end() {
+        let t0 = Instant::now();
+        // One Grenade (about 160 damage) kills a 100 HP dummy.
+        let rules = SyntheticRules { enemy_hp: 100, ..SyntheticRules::default() };
+        let (mut w, mut rx) = world_with_saver(settings(rules));
+        let mut a = seat_as(&mut w, "A", t0, seeded_with(&[(20, 2)]));
+        assert_eq!(w.request_encounter(a.entity, Some(0), t0), BattleReply::Done);
+        a.drain();
+        let id = BattleId(1);
+        let t = until_ready(&mut w, id, ActorId(0), t0);
+        a.drain(); // the gauge-ready event of the wait
+        assert_eq!(w.battle_command(a.entity, id, ActorId(0), Command::Item { item: 20, target: ActorId(1) }, t), BattleReply::Done);
+        let kinds: Vec<&str> = a
+            .drain()
+            .iter()
+            .filter_map(|m| match m {
+                ServerMsg::BattleEvent { .. } => Some("event"),
+                ServerMsg::Inventory { .. } => Some("inventory"),
+                ServerMsg::BattleEnd { .. } => Some("end"),
+                ServerMsg::CharacterProgress { .. } => Some("progress"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(kinds, ["event", "inventory", "end", "progress"], "the item is spent before the battle ends");
+        assert_eq!(mirror_of(&w, &a), vec![(20, 1)]);
+        let jobs = saved(&mut rx);
+        assert_eq!(jobs.len(), 2, "the Grenade, and the win: {jobs:?}");
+        assert_eq!(jobs[0], crate::saver::SaveJob::used_item(a.account, 0, 20));
+        assert!(jobs[1].paid().is_some());
+    }
+
+    #[test]
+    fn a_win_drops_items_to_the_living_tells_them_after_their_progress_and_queues_them() {
+        let t0 = Instant::now();
+        // Every dummy drops a Potion: formation 1 has two, so one each for the two living members.
+        let rules = SyntheticRules { drop_item: Some(0), ..SyntheticRules::default() };
+        let (mut w, mut rx) = world_with_saver(settings(rules));
+        let (mut a, mut b) = party_of_two(&mut w, t0);
+        a.drain();
+        b.drain();
+        assert_eq!(w.request_encounter(a.entity, Some(1), t0), BattleReply::Done);
+        // play_out replays every message and checks the end with `BattleReplay::check_end`, which does not
+        // compare the drops: a replay cannot reproduce them.
+        play_out(&mut w, &mut [&mut a, &mut b], &rules, t0);
+        for seat in [&mut a, &mut b] {
+            let tail: Vec<&str> = seat
+                .log
+                .iter()
+                .filter_map(|m| match m {
+                    ServerMsg::BattleEnd { rewards, .. } => {
+                        assert!(rewards.iter().all(|r| r.items == vec![InventoryEntry::new(0, 1)]), "{rewards:?}");
+                        Some("end")
+                    }
+                    ServerMsg::CharacterProgress { .. } => Some("progress"),
+                    ServerMsg::Inventory { .. } => Some("inventory"),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(tail, ["progress", "inventory", "end", "progress", "inventory"], "join, then the end, the payment and the drops");
+            assert_eq!(inventory_msgs(seat).last(), Some(&vec![(0, 4), (3, 1), (7, 1)]), "3 Potions and the one dropped");
+        }
+        assert_eq!(mirror_of(&w, &a), vec![(0, 4), (3, 1), (7, 1)]);
+        assert_eq!(mirror_of(&w, &b), vec![(0, 4), (3, 1), (7, 1)]);
+        // Both payments carry the item to the saver.
+        let jobs = saved(&mut rx);
+        assert_eq!(jobs.len(), 2);
+        assert!(jobs.iter().all(|j| j.paid().is_some_and(|r| r.items == vec![InventoryEntry::new(0, 1)])), "{jobs:?}");
+        // The roll is logged with the formation and the seed it came from.
+        let logs: Vec<String> = w.take_logs().iter().map(|l| l.text().to_string()).collect();
+        assert!(logs.iter().any(|l| l == "battle drops battle=1 formation=1 seed=7 items=[(0, 2)]"), "{logs:?}");
+        assert!(logs.iter().any(|l| l.starts_with("battle reward") && l.contains("dropped=[(0, 1)]")), "{logs:?}");
+    }
+
+    /// A member that is dead at the end gets nothing (not even a message about items), the living one gets
+    /// the drop, and the store hears of the living one's items only.
+    #[test]
+    fn drops_go_to_the_living_member_and_a_dead_one_gets_nothing() {
+        let t0 = Instant::now();
+        let (mut w, mut rx) = world_with_saver(settings(SyntheticRules::default()));
+        let (mut a, mut b) = party_of_two(&mut w, t0);
+        a.drain();
+        b.drain();
+        let members: Vec<Member> = [(&a, 0u8), (&b, 1u8)]
+            .iter()
+            .map(|(seat, character)| Member {
+                info: BattleMember { entity: seat.entity, account: seat.account, character: *character, level: 5, weapon: None, armor: None },
+                connected: true,
+            })
+            .collect();
+        let mut rewards = vec![BattleReward::new(a.account, 24, 40, 4), BattleReward::new(b.account, 0, 0, 0)];
+        rewards[0].items = vec![InventoryEntry::new(0, 2), InventoryEntry::new(7, 1)];
+        let told = w.pay_members(BattleId(1), &members, &rewards);
+        let kinds: Vec<(EntityId, &str)> = told
+            .iter()
+            .map(|(e, m)| (*e, if matches!(**m, ServerMsg::Inventory { .. }) { "inventory" } else { "progress" }))
+            .collect();
+        assert_eq!(kinds, vec![(a.entity, "progress"), (a.entity, "inventory"), (b.entity, "progress")]);
+        assert_eq!(mirror_of(&w, &a), vec![(0, 5), (3, 1), (7, 2)]);
+        assert_eq!(mirror_of(&w, &b), stock(), "the dead member's items are what they were");
+        let jobs = saved(&mut rx);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].paid().map(|r| r.items.clone()), Some(vec![InventoryEntry::new(0, 2), InventoryEntry::new(7, 1)]));
+        // A payment of items alone is a payment, whatever the numbers are.
+        let mut only_items = vec![BattleReward::new(b.account, 0, 0, 0)];
+        only_items[0].items = vec![InventoryEntry::new(3, 1)];
+        let told = w.pay_members(BattleId(2), &members, &only_items);
+        assert_eq!(told.len(), 2, "its progress and its inventory");
+        assert_eq!(mirror_of(&w, &b), vec![(0, 3), (3, 2), (7, 1)]);
+        assert_eq!(saved(&mut rx).len(), 1);
+    }
+
+    /// A member that left mid-battle fought on: the drops reach the store (nobody is online to be told).
+    #[test]
+    fn a_member_who_left_is_handed_its_drops_in_the_store_too() {
+        let t0 = Instant::now();
+        let rules = SyntheticRules { drop_item: Some(3), ..SyntheticRules::default() };
+        let (mut w, mut rx) = world_with_saver(settings(rules));
+        let (mut a, b) = party_of_two(&mut w, t0);
+        assert_eq!(w.request_encounter(a.entity, Some(1), t0), BattleReply::Done);
+        let (b_account, b_entity) = (b.account, b.entity);
+        assert!(w.leave(b_entity));
+        drop(b);
+        play_out(&mut w, &mut [&mut a], &rules, t0);
+        let jobs = saved(&mut rx);
+        let b_items: Option<Vec<InventoryEntry>> = jobs.iter().find(|j| j.account == b_account).and_then(|j| j.paid()).map(|r| r.items.clone());
+        let a_items: Option<Vec<InventoryEntry>> = jobs.iter().find(|j| j.account == a.account).and_then(|j| j.paid()).map(|r| r.items.clone());
+        // Two Ethers, dealt one to each of the two living members of the roster.
+        assert_eq!(b_items, Some(vec![InventoryEntry::new(3, 1)]), "{jobs:?}");
+        assert_eq!(a_items, Some(vec![InventoryEntry::new(3, 1)]), "{jobs:?}");
+        assert_eq!(mirror_of(&w, &a), vec![(0, 3), (3, 2), (7, 1)]);
+    }
+
+    /// An item command from a player whose session is gone by the time the engine takes it still spends
+    /// the item in the store: the engine already acted.
+    #[test]
+    fn the_item_a_command_spent_is_saved_even_if_the_player_is_dropped_meanwhile() {
+        let t0 = Instant::now();
+        let (mut w, mut rx) = world_with_saver(settings(SyntheticRules::default()));
+        let a = seat(&mut w, "A", t0);
+        // A queue too small to hold what the battle says: the first fan-out of the command drops the player.
+        // (Seats have a 4096-message queue, so simulate the drop directly.)
+        assert_eq!(w.request_encounter(a.entity, Some(0), t0), BattleReply::Done);
+        let id = BattleId(1);
+        let t = until_ready(&mut w, id, ActorId(0), t0);
+        let (account, entity) = (a.account, a.entity);
+        assert_eq!(w.battle_command(entity, id, ActorId(0), Command::Item { item: 0, target: ActorId(0) }, t), BattleReply::Done);
+        assert_eq!(saved(&mut rx), vec![crate::saver::SaveJob::used_item(account, 0, 0)]);
+        // `spend_item` for an entity that is no longer there still queues the change and says nothing to anyone.
+        w.spend_item(id, EntityId(999), account, 0, 0);
+        assert_eq!(saved(&mut rx), vec![crate::saver::SaveJob::used_item(account, 0, 0)]);
     }
 
     #[test]
@@ -1057,8 +1476,8 @@ mod tests {
         let (mut a, mut b) = party_of_two_as(
             &mut w,
             t0,
-            ProgressSeed { character: 0, stored: Some(veteran) },
-            ProgressSeed { character: 2, stored: None }, // Tifa, never earned anything: level 5
+            ProgressSeed::of(0, Some(veteran)),
+            ProgressSeed::of(2, None), // Tifa, never earned anything: level 5
         );
         assert_eq!(w.request_encounter(a.entity, Some(0), t0), BattleReply::Done);
         let start = a.battle_msgs();
@@ -1081,7 +1500,7 @@ mod tests {
         s.level = Some(3);
         let (mut w, mut rx) = world_with_saver(s);
         let veteran = Progress { character: 0, level: 12, exp: 270, ap: 0, gil: 0 }; // level 12 starts at 264, 13 at 312
-        let mut a = seat_as(&mut w, "A", t0, ProgressSeed { character: 0, stored: Some(veteran) });
+        let mut a = seat_as(&mut w, "A", t0, ProgressSeed::of(0, Some(veteran)));
         assert_eq!(w.request_encounter(a.entity, Some(0), t0), BattleReply::Done);
         match &a.battle_msgs()[..] {
             [ServerMsg::EncounterStart { party, .. }] => assert_eq!((party[0].character, party[0].level), (0, 3)),
@@ -1119,11 +1538,7 @@ mod tests {
         assert_eq!(progress_msgs(&mut a).last(), Some(&(0, 5, 52, 8, 20, 2, false)));
         assert_eq!(
             saved(&mut rx),
-            vec![crate::saver::SaveJob {
-                account: a.account,
-                character: 0,
-                reward: fmv_protocol::BattleReward { account: a.account, exp: 12, gil: 20, ap: 2 }
-            }]
+            vec![crate::saver::SaveJob::reward(a.account, 0, fmv_protocol::BattleReward::new(a.account, 12, 20, 2))]
         );
 
         // Formation 1 is two dummies: 24 experience, 40 gil, 4 AP. 52 + 24 = 76: level 6 (60), the
@@ -1157,8 +1572,8 @@ mod tests {
         let (mut a, mut b) = party_of_two_as(
             &mut w,
             t0,
-            ProgressSeed { character: 0, stored: None },
-            ProgressSeed { character: 3, stored: Some(Progress { character: 3, level: 5, exp: 52, ap: 1, gil: 5 }) },
+            ProgressSeed::of(0, None),
+            ProgressSeed::of(3, Some(Progress { character: 3, level: 5, exp: 52, ap: 1, gil: 5 })),
         );
         a.drain();
         b.drain();
@@ -1177,7 +1592,7 @@ mod tests {
         assert_eq!(pa.last().map(|p| (p.1, p.6)), Some((5, false)));
         // One queue entry per payment, in roster order, each for the character that fought.
         let jobs = saved(&mut rx);
-        assert_eq!(jobs.iter().map(|j| (j.account, j.character, j.reward.exp)).collect::<Vec<_>>(), vec![(a.account, 0, 12), (b.account, 3, 12)]);
+        assert_eq!(jobs.iter().map(|j| (j.account, j.character, j.paid().map(|r| r.exp))).collect::<Vec<_>>(), vec![(a.account, 0, Some(12)), (b.account, 3, Some(12))]);
     }
 
     #[test]
@@ -1232,8 +1647,8 @@ mod tests {
             })
             .collect();
         let rewards = [
-            BattleReward { account: a.account, exp: 24, gil: 40, ap: 4 },
-            BattleReward { account: b.account, exp: 0, gil: 0, ap: 0 },
+            BattleReward::new(a.account, 24, 40, 4),
+            BattleReward::new(b.account, 0, 0, 0),
         ];
         let told = w.pay_members(BattleId(1), &members, &rewards);
         assert_eq!(told.iter().map(|(entity, _)| *entity).collect::<Vec<_>>(), vec![a.entity, b.entity], "everybody online hears where it stands, in roster order");

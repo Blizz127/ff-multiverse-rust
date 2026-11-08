@@ -335,17 +335,20 @@ async fn a_member_who_left_mid_battle_is_still_paid_in_the_store() {
     again.shutdown().await;
 }
 
-/// The reason for v5: a client of the version before it is refused at the handshake, with the version
-/// in the reason, instead of being sent a message it cannot decode.
+/// The reason for v5 and again for v6: a client of the version before is refused at the handshake, with
+/// the version in the reason, instead of being sent a message it cannot decode (v5: the progress that
+/// follows every join; v6: the inventory that follows it, and the new battle events).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_client_of_the_previous_protocol_version_is_refused_at_the_handshake() {
-    assert_eq!(PROTOCOL_VERSION, 5);
+    assert_eq!(PROTOCOL_VERSION, 6);
     let server = TestServer::start(fast(None)).await;
-    let mut old = Client::connect(server.addr).await;
-    old.send_json(
-        r#"{"Hello":{"protocol_version":4,"client_build":"v4","auth":{"Register":{"display_name":"Old"}},"tint":[1,2,3],"appearance_ref":null}}"#,
-    )
-    .await;
-    old.expect_reject_as(RejectCode::ProtocolMismatch, "server speaks v5, client sent v4").await;
+    for old_version in [5u16, 4] {
+        let mut old = Client::connect(server.addr).await;
+        old.send_json(&format!(
+            r#"{{"Hello":{{"protocol_version":{old_version},"client_build":"old","auth":{{"Register":{{"display_name":"Old{old_version}"}}}},"tint":[1,2,3],"appearance_ref":null}}}}"#
+        ))
+        .await;
+        old.expect_reject_as(RejectCode::ProtocolMismatch, &format!("server speaks v6, client sent v{old_version}")).await;
+    }
     server.shutdown().await;
 }

@@ -365,6 +365,72 @@ pub trait BattleRules: Send + Sync {
     fn roll_drops(&self, _formation_id: u16, _seed: u64) -> Vec<InventoryEntry> {
         Vec::new()
     }
+
+    // ---- used by the client to DRAW a battle (the default keeps older rule sets valid) ----
+
+    /// Where the enemies of formation `id` stand and where the battle camera looks from, in the
+    /// game's battle units, or `None` if this rule set has no such data (a client then draws a
+    /// default view and layout). Placement only, never sent over the wire: it is read from the
+    /// peer's own files like everything else.
+    fn formation_scene(&self, _id: u16) -> Option<FormationScene> {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Where a formation stands (what a client needs to draw it)
+// ---------------------------------------------------------------------------------------------
+
+/// One enemy's place in a formation, in the game's battle units. For FF7: y points DOWN with the
+/// ground at y = 0 (a flying enemy has a negative y), and in a normal battle the enemies stand at
+/// negative z and the party at positive z.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnemyPlacement {
+    /// The scene's enemy id (which of the scene's enemy records this entry is).
+    pub enemy_id: u16,
+    pub position: [i16; 3],
+    /// Row (higher is further back).
+    pub row: u16,
+}
+
+/// A camera in battle units: where it stands and the point it looks at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CameraPose {
+    pub position: [i16; 3],
+    pub target: [i16; 3],
+}
+
+/// What a peer needs to draw a formation (see [`BattleRules::formation_scene`]): placement and
+/// camera only. Names, stats and models are the peer's own business.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FormationScene {
+    /// The battle location (arena) the data names.
+    pub location: u16,
+    /// The arrival layout (normal, back attack, pincer, ...).
+    pub layout: BattleLayout,
+    /// The formation's idle camera.
+    pub camera: CameraPose,
+    /// One entry per enemy of the engine, in the engine's enemy order (`BattleState::enemy_ids`):
+    /// the placement of the k-th enemy of a built battle is `enemies[k]`.
+    pub enemies: Vec<EnemyPlacement>,
+}
+
+impl FormationScene {
+    /// The scene of a formation of a decoded `scene.bin`. Its enemies are the ones
+    /// `enemies_for_formation` builds, in the same order.
+    pub fn of(formation: &fmv_ff7_battle::scene::FormationRef<'_>) -> Self {
+        let camera = formation.camera().cameras[0];
+        Self {
+            location: formation.setup().location,
+            layout: formation.setup().layout,
+            camera: CameraPose { position: camera.position, target: camera.direction },
+            enemies: formation
+                .enemies()
+                .iter()
+                .map(|e| EnemyPlacement { enemy_id: e.entry.enemy_id, position: e.entry.position, row: e.entry.row })
+                .collect(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -809,6 +875,13 @@ impl BattleRules for Ff7BattleData {
             formation.enemies().iter().map(|e| (e.record.item_rates, e.record.item_ids)).collect();
         roll_enemy_drops(seed, &tables, self.max_item_stack())
     }
+
+    /// The formation's enemy placements and idle camera from `scene.bin` (see
+    /// [`FormationScene::of`]); `None` for a formation that does not exist or has no enemies.
+    fn formation_scene(&self, id: u16) -> Option<FormationScene> {
+        let scene = FormationScene::of(&self.scenes.formation(usize::from(id))?);
+        (!scene.enemies.is_empty()).then_some(scene)
+    }
 }
 
 /// The level used when the data has no starting level for a character.
@@ -826,7 +899,7 @@ pub const DEFAULT_LEVEL: u8 = 5;
 /// loses), `3` like `0` but with a preemptive layout, `4` one brute that kills a hero per hit (the
 /// party usually wins, with losses). Any `character` below 9 is a fighter whose strength grows
 /// with its level, who knows Cure (spell 0, 5 MP), Life (spell 7, 34 MP) and Fire (spell 27, 4 MP), and
-/// whose battles accept Potion (item 0), Ether (item 3) and Phoenix Down (item 7). A new account starts
+/// whose battles accept Potion (item 0), Ether (item 3), Phoenix Down (item 7) and Grenade (item 20). A new account starts
 /// with 3 Potions, 1 Ether and 1 Phoenix Down; a won battle drops [`SyntheticRules::drop_item`], one per
 /// enemy, if it is set. The enemies only ever attack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -847,12 +920,14 @@ impl SyntheticRules {
     /// The fingerprint every synthetic rule set reports.
     pub const FINGERPRINT: Fingerprint = Fingerprint([0x5a; 32]);
 
-    /// The items of a synthetic battle: Potion (0), Ether (3), Phoenix Down (7).
+    /// The items of a synthetic battle: Potion (0), Ether (3), Phoenix Down (7) and Grenade (20, hurts an
+    /// enemy for about `512 * 10 / 32` = 160).
     pub fn item_table() -> Arc<ItemTable> {
         Arc::new(ItemTable::new([
             (0, ItemData::new(ActionSpec::flat_restore_item(5, false))),
             (3, ItemData::new(ActionSpec::flat_restore_item(5, true))),
             (7, ItemData::new(ActionSpec::revive_spell(8, 0))),
+            (20, ItemData::new(ActionSpec::damage_item(10, element::SHOOT))),
         ]))
     }
 
@@ -1262,7 +1337,7 @@ mod tests {
         assert_eq!(spells.iter().map(|s| (s.spell, s.mp_cost, s.targets_allies)).collect::<Vec<_>>(), [(0, 5, true), (7, 34, true), (27, 4, false)]);
         assert_eq!(state.actor(ActorId(1)).unwrap().max_mp, 60);
         assert!(state.spells_for(ActorId(2)).is_empty());
-        for item in [0u16, 3, 7] {
+        for item in [0u16, 3, 7, 20] {
             assert!(state.item_info(item).is_some(), "item {item}");
         }
         assert!(state.item_info(1).is_none());
@@ -1550,5 +1625,61 @@ mod tests {
         assert_eq!(bare.exp_for_level(0, 5), None);
         assert_eq!(bare.starting_exp(0, 5), 0);
         assert_eq!(bare.progress_limits(), ProgressLimits::FF7);
+        assert_eq!(bare.formation_scene(0), None, "no placement data unless the rule set has some");
+    }
+
+    /// A decompressed scene (7808 bytes) laid out as the `scene.bin` module documents it, with
+    /// made-up numbers: enemy ids 7 and 9, and in formation slot 1 two entries (a, b) and a camera.
+    fn raw_scene() -> Vec<u8> {
+        let mut raw = vec![0u8; 7808];
+        let mut put = |at: usize, bytes: &[u8]| raw[at..at + bytes.len()].copy_from_slice(bytes);
+        for (k, id) in [7u16, 9, 0xFFFF].iter().enumerate() {
+            put(k * 2, &id.to_le_bytes());
+        }
+        // Battle setup of slot 1 (20 bytes at 0x08 + 20): location 5, no chained formation, layout 2.
+        put(0x08 + 20, &5u16.to_le_bytes());
+        put(0x08 + 20 + 2, &0xFFFFu16.to_le_bytes());
+        put(0x08 + 20 + 0x12, &[2]);
+        // Cameras of slot 1 (48 bytes at 0x58 + 48): the idle one stands at (1000, -200, 300) looking at (10, -20, 30).
+        for (i, v) in [1000i16, -200, 300, 10, -20, 30, 7, 7, 7, 8, 8, 8].iter().enumerate() {
+            put(0x58 + 48 + i * 2, &v.to_le_bytes());
+        }
+        // Formation slot 1 (96 bytes at 0x118 + 96): entry 0 is enemy 9 at (-40, 0, -500) row 2, entry 2 enemy 7.
+        let entry = |k: usize| 0x118 + 96 + k * 16;
+        put(entry(0), &9u16.to_le_bytes());
+        for (i, v) in [-40i16, 0, -500].iter().enumerate() {
+            put(entry(0) + 2 + i * 2, &v.to_le_bytes());
+        }
+        put(entry(0) + 8, &2u16.to_le_bytes());
+        for k in [1usize, 3, 4, 5] {
+            put(entry(k), &0xFFFFu16.to_le_bytes());
+        }
+        put(entry(2), &7u16.to_le_bytes());
+        for (i, v) in [60i16, -300, -700].iter().enumerate() {
+            put(entry(2) + 2 + i * 2, &v.to_le_bytes());
+        }
+        put(entry(2) + 8, &1u16.to_le_bytes());
+        raw
+    }
+
+    #[test]
+    fn a_formation_scene_lists_the_placements_in_the_engines_enemy_order_and_the_idle_camera() {
+        use fmv_ff7_battle::scene::{BattleLayout, FormationRef, Scene};
+        let scene = Scene::parse(&raw_scene(), 0).unwrap();
+        let formation = FormationRef { scene: &scene, slot: 1, global_index: 1 };
+        let drawn = FormationScene::of(&formation);
+        assert_eq!((drawn.location, drawn.layout), (5, BattleLayout::BackAttack));
+        assert_eq!(drawn.camera, CameraPose { position: [1000, -200, 300], target: [10, -20, 30] });
+        // The engine builds its enemies from the same entries in the same order: the k-th enemy of a
+        // built battle stands where the k-th placement says.
+        assert_eq!(
+            drawn.enemies,
+            [
+                EnemyPlacement { enemy_id: 9, position: [-40, 0, -500], row: 2 },
+                EnemyPlacement { enemy_id: 7, position: [60, -300, -700], row: 1 },
+            ]
+        );
+        let engine = fmv_ff7_battle::rules::enemies_for_formation(&scene, 1);
+        assert_eq!(engine.len(), drawn.enemies.len(), "one placement per engine enemy");
     }
 }

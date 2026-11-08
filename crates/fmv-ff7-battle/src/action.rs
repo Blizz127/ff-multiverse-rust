@@ -232,6 +232,18 @@ impl ActionSpec {
         }
     }
 
+    /// A hand-made damage item (Grenade's kind: `(512 - Defense) * power / 32` with variance, never misses,
+    /// no critical hit).
+    pub fn damage_item(power: u32, element_mask: u16) -> Self {
+        Self {
+            kind: ActionKind::Physical,
+            formula: Formula::Fixed,
+            rolls_accuracy: false,
+            can_crit: false,
+            ..Self::damage_spell(power, 255, element_mask, 0)
+        }
+    }
+
     /// A hand-made flat restoring item (Potion's kind: `20 * power` HP, or MP when `mp` is set).
     pub fn flat_restore_item(power: u32, mp: bool) -> Self {
         Self {
@@ -917,6 +929,11 @@ mod tests {
             ActionSpec::flat_restore_item(5, true),
             table.get(3).unwrap().spec,
             "Ether"
+        );
+        assert_eq!(
+            ActionSpec::damage_item(10, element::SHOOT),
+            table.get(20).unwrap().spec,
+            "Grenade"
         );
         let hand = ItemTable::new([(0, ItemData::new(ActionSpec::flat_restore_item(5, false)))]);
         assert_eq!(hand.info(0).map(|i| i.kind), Some(ItemKind::RestoreHp));

@@ -50,7 +50,9 @@ profiles (M2-a) and parties of up to three with story-phase placement (M2-b) wor
 (protocol v2), and **shared battles (M2-c/d, protocol v3)** run on the deterministic
 `fmv-ff7-battle` engine: the server steps a battle for the whole party, each client replays it
 from its own `scene.bin` and `kernel.bin`, and **every account keeps its own character progress
-(level, experience, AP, gil; protocol v5)**, paid by won battles and saved per account. The synthetic **FIXTURE** plaza still exists
+(level, experience, AP, gil; protocol v5)**, paid by won battles and saved per account, and
+**battles have real commands (protocol v6)**: Attack, Magic, Item and Defend, with an inventory per
+account. The synthetic **FIXTURE** plaza still exists
 as a labelled test area; it says nothing about FF7 support.
 
 | Milestone | Scope | State |
@@ -214,7 +216,7 @@ one SMOKE line:
 ```
 target/release/fmv-client --server <addr> --name A --headless --duration 5
 target/release/fmv-client --server <addr> --name B --headless --duration 5
-SMOKE name=<n> area=<AreaId> fixture=<bool> peers_seen=<n> updates=<n> rejected=<n> rtt_ms=<n> party=<n> battles=<n> victories=<n> area_changes=<n> level=<n> exp=<n>
+SMOKE name=<n> area=<AreaId> fixture=<bool> peers_seen=<n> updates=<n> rejected=<n> rtt_ms=<n> party=<n> battles=<n> victories=<n> area_changes=<n> level=<n> exp=<n> items=<n>
 ```
 
 `peers_seen` of at least 1 means that client saw the other player; `party` is the largest
@@ -224,7 +226,9 @@ party this client was in during the run (0 if none). Bots can form a party: give
 entered and the server ended in victory; `area_changes` (area travel) counts the times the server
 moved the client to another field; `level` and `exp` (appended in protocol v5) are the level and
 total experience of the player's character as the server last reported them (`0` and `0` from a
-server that reports none, such as the FIXTURE one). These line formats are a contract: new fields
+server that reports none, such as the FIXTURE one); `items` (appended in protocol v6) is the total
+count of the items the player carries, as the server last told it (`0` from a server with none).
+These line formats are a contract: new fields
 are only ever appended, and `scripts/smoke.sh` parses them by key (it ignores the fields it does
 not know).
 
@@ -287,14 +291,20 @@ flat picture as before.
 
 *In a battle.* **B** asks the server for a debug battle (refused unless it runs with
 `--debug-encounters`; random encounters start battles by themselves in a field that has an
-encounter table). The window then shows the battle: enemy bars on top, your party below, one card
-per fighter with an HP bar and an ATB gauge; a yellow border and a yellow gauge mean that
-character can act, a white corner marks yours, and a band across the top is green while your
-client's replay agrees with the server (red if it ever diverges). **Space** or **Enter** attacks
-the first living enemy with your character. Each fighter's name and HP numbers and a line that
-says whose turn it is are drawn in the UI font over the cards (the window title repeats the
-headline). (The battle view has been checked by unit tests and an offscreen render only: this
-box has no display, so the window itself was not run.)
+encounter table). The window then shows the battle as a 3D scene: the formation's own camera
+(from your `scene.bin`), the enemies where the formation puts them, your party opposite them
+facing them (their field models, from your own `char.lgp`), on a stand-in arena; boxes stand in
+for the enemies until battle models are read. A blow makes its attacker run at its target and the
+target blink and shake; a miss makes it step aside; a beaten enemy collapses and a fallen party
+member lies down. A gold ring under a character means it can act, a white ring marks yours. The
+battle's own overlay is drawn over the scene (the enemy list, the party's HP, MP and ATB, the
+command menu on your turn, the floating numbers and the pointer over the models' heads, and a
+band across the top that is green while your client's replay agrees with the server and red if it
+ever diverges); the arrow keys (or WASD) move in the menu, **Space** or **Enter** confirm and
+**Backspace** goes back. A machine without battle data to replay the battle (or one started with
+`FMV_BATTLE_FLAT=1`) shows the flat view instead: one token per fighter with a thin HP bar. (The
+battle scene has been checked by unit tests and offscreen renders only: this box has no display,
+so the window itself was not run.)
 
 **One command for the basics:** `scripts/smoke.sh` starts the server, runs two headless bots
 concurrently, checks both SMOKE lines and stops the server. It uses `target/release` by
@@ -391,7 +401,7 @@ rewards (experience and gil shared among the living, AP to each), which the serv
 member's own character progress (see below). A server without
 battle data (the FIXTURE one, or `--ff7-flevel`) refuses every battle request cleanly.
 `scripts/battle-smoke.sh` runs two bots through one real battle on `md1stin` and checks that both
-members attacked (the server logs the accepted commands per actor) and that each bot replayed the
+members acted (the server logs the accepted commands per actor) and were told their inventory, and that each bot replayed the
 battle from its own game files and matched (`verified by replay`, not merely "no divergence").
 
 **Character progress (protocol v5).** Every account has its own progress in the game it plays: the
@@ -405,7 +415,7 @@ with 610 experience, six short of level 7), nothing is written until its first w
 `<state>/server/progression/<account>/<Game>.character.json`, a record of its own beside, and
 never mixed with, the story blob that selects the account's story phase (so a battle can never move a
 player to another instance). The window shows it under the area name (`Cloud Lv 7  EXP 626/949
-Gil 20`) and the headless bot's SMOKE line ends with `level=` and `exp=`. The experience needed for
+Gil 20`) and the headless bot's SMOKE line ends with `level=`, `exp=` and `items=`. The experience needed for
 each level comes from the character's EXP curve in `kernel.bin` (`needed = modifier * level^2 / 10`
 per level, the rule the community documents; checked against Cloud's known 6, 33, 94, 202 EXP for
 levels 2 to 5 and against the shipped starting record). The store is game-agnostic: the game's caps
@@ -413,7 +423,28 @@ levels 2 to 5 and against the shipped starting record). The store is game-agnost
 who left mid-battle (its character fought on) is saved too; it is told nothing. Stopping the server
 saves everything still queued first. `scripts/battle-smoke.sh --progress` runs the whole chain on
 your real data: two bots fight, reconnect with their saved tokens, fight again at the level the
-first win left them at, and reconnect once more to see what was kept.
+first win left them at, and reconnect once more to see what was kept (the progress and, since
+protocol v6, the inventory: the starting stock once, plus what the wins dropped).
+
+**Battle commands and items (protocol v6).** A party member whose gauge is full gives Attack, Magic
+(a spell it knows, for MP), Item (one the account owns) or Defend (physical damage halved until its
+next turn). The engine (`fmv-ff7-battle`) plays them with FF7's own formulas decoded from the
+owner's `kernel.bin` (spell, Cure, Life/Phoenix Down, potion and Grenade formulas; elemental
+weakness, resistance, nullify, absorb and full-heal from `scene.bin`), and the enemies use their own
+`scene.bin` attacks (a uniform pick among the damaging ones they have the MP for; the original's AI
+scripts are not decoded). Spells: the magic materia a character's starting record equips, plus a
+starter grimoire every character is given (Restore, Fire, Ice and Lightning at level 1: Cure, Fire,
+Ice, Bolt), because on the Steam copy only Cloud and Red XIII start with magic materia. **The engine
+knows no inventory**: the server checks the account owns the item, submits the command and takes the
+item only when the engine accepted it, so every client still replays every battle from its own files
+without knowing anyone's items. A new account (and an existing one that never had an inventory)
+starts with the kernel's own starting stock (Potion x3, Ether x1, Phoenix Down x1) exactly once; the
+inventory is saved inside the account's character record (older records without it still load and
+are not rewritten until an item is used or found), and the server tells the player what it carries
+when it joins, after every item used and after drops. A won battle drops items rolled by the server
+from the enemies' own drop rates (`scene.bin`), dealt to the living members, logged and not part of
+the replay. Known gaps: no statuses, no spells or items that hit a whole side, no summons, limits or
+escape, party elemental resistances are not modelled.
 
 `md1stin`'s own encounter table (section 6 of the field file, Steam PC build): the first of its
 two 24-byte tables is the enabled one, with rate 128 (a roll succeeds with probability 128/1024)
@@ -423,13 +454,17 @@ same way (checked over all 702 fields of that build: every enabled table's weigh
 and every formation exists in `scene.bin`). A starting party wins 301 and 303 every time (200 of
 200 seeded runs each, both members attacking), which is why the smoke script uses 301.
 
-**Protocol v5** (`fmv-protocol`) carries all of the above; its module docs describe the flow,
+**Protocol v6** (`fmv-protocol`) carries all of the above; its module docs describe the flow,
 and golden JSON tests pin the wire format (the engine's own event, command and outcome types
 included). A client or server of another protocol version is refused with a clear message:
 v5 added `CharacterProgress`, a message a v4 peer cannot decode (the server sends it right after
 every join), so the version was bumped like v4 was for `AreaChange`, and a v4 client is refused
-at the handshake instead of being cut off at its first join. Both sides must be built from this
-version or later.
+at the handshake instead of being cut off at its first join; v6 added `Inventory` (also sent
+right after every join), the new battle commands and events and the items in `BattleReward`, so a
+v5 client is refused the same way. Both sides must be built from this version or later. A server
+rolled back to a v5 build ignores (and, the next time it saves that account, drops) the inventory
+of a record written by this version, and refuses a record with more than about 70 stacks as too
+large: roll back only from a snapshot taken before any inventory was stored.
 
 ## Importing your own FF7 data
 
