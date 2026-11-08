@@ -88,6 +88,7 @@ pub mod model;
 pub mod playable;
 pub mod pmodel;
 pub mod rsd;
+pub mod script;
 pub mod tex;
 
 mod util;
