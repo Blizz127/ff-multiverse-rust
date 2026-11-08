@@ -10,17 +10,18 @@
 //!
 //!   Checks 1 and 2 are exported by gamescope itself (its `main.cpp`) to everything it starts, so a
 //!   game started from Game Mode, by Steam or by a launcher that Steam started, inherits them.
-//!   Check 3 is Steam's: it sets it for games started from its gamepad UI, which is also Big Picture
-//!   on an ordinary desktop, so that alone gets full screen but no keyboard (below). A normal
-//!   desktop session (KDE, started from a menu or a terminal) has none of the three and stays
-//!   windowed.
+//!   Check 3 is Steam's: it sets it for games started from its gamepad UI, which is reported to be
+//!   Big Picture on an ordinary desktop too, so that alone gets full screen but no keyboard
+//!   (below). A normal desktop session (KDE, started from a menu or a terminal) has none of the
+//!   three and stays windowed.
 //! * **The on-screen keyboard.** Steam's keyboard is asked for only when check 1 or 2 is true, i.e.
 //!   inside a gamescope session ([`Signals::gamescope`]), and only when a text field gains focus
 //!   (see [`osk_transition`]). On the desktop nothing is ever asked: the call would hand a
 //!   `steam://` address to the desktop, which can start Steam.
 //!
-//! `SteamDeck=1` is deliberately not a check: Steam sets it for every game it starts on Deck
-//! hardware, desktop mode included, so on its own it does not mean Game Mode.
+//! `SteamDeck=1` is deliberately not a check: Steam sets it for the games it starts on Deck
+//! hardware, desktop mode is expected to be no exception (not verified here), so on its own it
+//! does not mean Game Mode.
 //!
 //! The environment is read in one place, `main`, through [`Signals::from_env`]; everything else
 //! receives the decision ([`DeviceMode`]) as a value, so no test depends on the machine it runs on.
@@ -39,9 +40,7 @@
 //! the keys arrived as ordinary key events (Laeresh/CSVM issue 111). It has NOT been run by us on a
 //! device: the owner's device check is the first real observation here.
 
-#[cfg(not(test))]
 use std::process::{Command, Stdio};
-#[cfg(not(test))]
 use std::time::{Duration, Instant};
 
 /// What the environment says about the session.
@@ -186,15 +185,20 @@ pub fn run_osk(request: Osk, runner: &impl Runner) -> Result<(), String> {
 }
 
 /// How long a helper program may take before it is killed (a hung opener must not pile up).
-#[cfg(not(test))]
 const SPAWN_LIMIT: Duration = Duration::from_secs(10);
 
 /// Runs the real programs: no input, no output, the environment as it is (the one test of the
 /// addresses on a device ran with it), and a time limit.
-#[cfg(not(test))]
-struct SystemRunner;
+pub struct SystemRunner {
+    pub limit: Duration,
+}
 
-#[cfg(not(test))]
+impl Default for SystemRunner {
+    fn default() -> Self {
+        Self { limit: SPAWN_LIMIT }
+    }
+}
+
 impl Runner for SystemRunner {
     fn run(&self, spawn: &Spawn) -> Result<(), String> {
         let mut child = Command::new(spawn.program)
@@ -204,7 +208,7 @@ impl Runner for SystemRunner {
             .stderr(Stdio::null())
             .spawn()
             .map_err(|e| e.to_string())?;
-        let deadline = Instant::now() + SPAWN_LIMIT;
+        let deadline = Instant::now() + self.limit;
         loop {
             match child.try_wait() {
                 Ok(Some(status)) if status.success() => return Ok(()),
@@ -230,7 +234,7 @@ pub fn request_osk(request: Osk) {
         Osk::Close => "close",
     };
     let spawned = std::thread::Builder::new().name("steam-keyboard".to_string()).spawn(move || {
-        match run_osk(request, &SystemRunner) {
+        match run_osk(request, &SystemRunner::default()) {
             Ok(()) => eprintln!("keyboard: asked Steam to {what} its on-screen keyboard"),
             Err(e) => eprintln!("keyboard: could not ask Steam to {what} its on-screen keyboard ({e})"),
         }
@@ -412,6 +416,24 @@ mod tests {
         let runner = Script::new(vec![Err("exited with 3".to_string()), Err("exited with 1".to_string())]);
         let error = run_osk(Osk::Open, &runner).unwrap_err();
         assert_eq!(error, "xdg-open: exited with 3; steam: exited with 1");
+    }
+
+    /// The real runner, on programs that cannot do anything (never `xdg-open` or `steam`).
+    #[test]
+    fn the_system_runner_reports_success_failure_a_missing_program_and_a_hang() {
+        let run = |program: &'static str, args: &[&str], limit: Duration| {
+            SystemRunner { limit }.run(&Spawn { program, args: args.iter().map(|a| (*a).to_string()).collect() })
+        };
+        let long = Duration::from_secs(5);
+        assert_eq!(run("true", &[], long), Ok(()));
+        let failed = run("false", &[], long).unwrap_err();
+        assert!(failed.starts_with("exited with"), "{failed}");
+        assert!(run("fmv-no-such-program-anywhere", &[], long).is_err());
+        // A program that does not finish is killed at the limit and reported, not waited for.
+        let started = Instant::now();
+        assert_eq!(run("sleep", &["30"], Duration::from_millis(200)), Err("did not finish in time".to_string()));
+        assert!(started.elapsed() < Duration::from_secs(5), "it was killed, not waited for");
+        assert_eq!(SystemRunner::default().limit, SPAWN_LIMIT);
     }
 
     #[test]

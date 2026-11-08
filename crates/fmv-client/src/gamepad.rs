@@ -452,7 +452,8 @@ fn describe(gamepad: &Gamepad<'_>) -> String {
         _ => "no usb id".to_string(),
     };
     // Without an SDL mapping the buttons are named after the driver's codes, and the Linux xpad
-    // driver sends the Xbox X as the "north" code and the Y as "west": there X and Y come out swapped.
+    // driver is reported to send the Xbox X as the "north" code and the Y as "west" (against the
+    // kernel's own positional rule): there X and Y would come out swapped.
     let mapping = match gamepad.mapping_source() {
         MappingSource::SdlMappings => "SDL mapping",
         MappingSource::Driver => "no SDL mapping, the driver's own layout (X and Y may be swapped)",
@@ -803,6 +804,20 @@ mod tests {
         // A value beyond the range is clamped, not trusted.
         logic.feed(0, RawInput::Axis(Axis::LeftStickX, 7.5));
         assert_eq!(flat(logic.update(now + ms(16), PadMode::Field)), [(PadKey::Right, true, false)]);
+    }
+
+    /// By hand only (`cargo test -p fmv-client -- --ignored gamepad --nocapture`): opens the real
+    /// backend (udev, `/dev/input`) and polls it for a moment. It proves the linking and the start-up
+    /// on this machine, not any button: whatever is plugged in is idle during it.
+    #[test]
+    #[ignore = "opens the real gamepad backend (udev); run it by hand"]
+    fn the_real_backend_opens_and_polls_without_trouble() {
+        let mut pads = Pads::open();
+        for _ in 0..30 {
+            let events = pads.poll(Instant::now(), PadMode::Menu);
+            eprintln!("poll: {events:?}");
+            std::thread::sleep(ms(10));
+        }
     }
 
     #[test]

@@ -244,8 +244,8 @@ listened to (losing it lets go of everything). Two controllers at once act as on
 come from an SDL mapping (gilrs's built-in database, plus `SDL_GAMECONTROLLERCONFIG`, which Steam
 sets for the games it starts) or, failing that, from the driver's own codes. In that second case the
 log line for the controller says "the driver's own layout" and X and Y may be swapped (the Linux xpad
-driver sends the Xbox X as the "north" code), which only exchanges invite and accept; a controller
-with neither would do nothing and the log says so.
+driver is reported to send the Xbox X as the "north" code), which only exchanges invite and accept; a
+controller with neither would do nothing and the log says so.
 
 **Runtime dependency (new).** `fmv-client` is now linked to `libudev.so.1` (systemd-libs: present on
 every systemd distribution, Bazzite included). It reads `/dev/input/event*`, which normally the seat
@@ -268,10 +268,14 @@ that offers none) when `--fullscreen` is given or when ANY of these is true:
 3. `SteamGamepadUI` is `1`.
 
 Checks 1 and 2 are exported by gamescope itself (its `main.cpp`) to everything it starts, so a game
-started from Game Mode inherits them, also through a launcher that Steam started. Check 3 is Steam's;
-it is also set for a game started from Big Picture on an ordinary desktop. `SteamDeck=1` is not a
-check: it is set for every game Steam starts on Deck hardware, desktop mode included. A normal desktop
-session (KDE, started from a menu or a terminal) has none of the three and stays windowed. The
+started from Game Mode inherits them, also through a launcher that Steam started (checked in
+gamescope's source: both are set unconditionally before it starts the program, and
+`WAYLAND_DISPLAY` is left unset unless gamescope runs with `--expose-wayland`, so under Game Mode the
+client is normally an X11 client). Check 3 is Steam's, and is reported to be set for a game started
+from Big Picture on an ordinary desktop too. `SteamDeck=1` is not a check: Steam sets it for games it
+starts on Deck hardware, desktop mode is expected to be no exception (not verified), so it does not
+mean Game Mode. A normal desktop session (KDE, started from a menu or a terminal) has none of the
+three and stays windowed. The
 start-up line `device: ...` on stderr names the signals seen and the decision. Not done: a
 `--windowed` override and a run-time toggle.
 
