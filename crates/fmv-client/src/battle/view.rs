@@ -25,7 +25,7 @@ pub const BAND_UNVERIFIED_RGB: [u8; 3] = [120, 120, 130];
 pub const CARD_RGB: [u8; 3] = [26, 30, 46];
 pub const BORDER_PARTY_RGB: [u8; 3] = [90, 110, 160];
 pub const BORDER_ENEMY_RGB: [u8; 3] = [150, 60, 60];
-pub const BORDER_READY_RGB: [u8; 3] = [255, 225, 70];
+pub const BORDER_READY_RGB: [u8; 3] = [255, 200, 40];
 pub const BORDER_DEAD_RGB: [u8; 3] = [70, 70, 78];
 pub const MARKER_RGB: [u8; 3] = [255, 255, 255];
 pub const BAR_BACK_RGB: [u8; 3] = [8, 9, 14];
@@ -34,7 +34,7 @@ pub const HP_WARN_RGB: [u8; 3] = [230, 180, 60];
 pub const HP_LOW_RGB: [u8; 3] = [225, 70, 60];
 pub const HP_DEAD_RGB: [u8; 3] = [90, 90, 100];
 pub const ATB_RGB: [u8; 3] = [90, 150, 255];
-pub const ATB_READY_RGB: [u8; 3] = [255, 225, 70];
+pub const ATB_READY_RGB: [u8; 3] = [255, 238, 120];
 
 // Sizes in pixels.
 const BAND_H: f32 = 14.0;
@@ -146,6 +146,7 @@ fn cards(view: &BattleView, w: f32, h: f32) -> Vec<Card<'_>> {
 }
 
 /// Where the text of a card belongs (see the module docs: nothing draws it yet).
+#[allow(dead_code)] // the hook for the text renderer: only the tests use it until that lands
 #[derive(Debug, Clone, PartialEq)]
 pub struct Label {
     /// Top-left corner in pixels from the top-left of the window.
@@ -156,6 +157,7 @@ pub struct Label {
 
 /// The labels of `view` for a `vw` x `vh` window: each fighter's name above its card and its HP
 /// below it. TODO(text): draw these with the text renderer.
+#[allow(dead_code)] // see `Label`
 pub fn battle_labels(view: &BattleView, vw: u32, vh: u32) -> Vec<Label> {
     let (w, h) = (vw.max(1) as f32, vh.max(1) as f32);
     let mut labels = Vec::new();
@@ -252,7 +254,7 @@ pub fn battle_vertices(view: &BattleView, vw: u32, vh: u32, srgb: bool) -> Vec<V
         let atb_back = Rect { x0: bars.x0, y0: atb_top, x1: bars.x1, y1: (atb_top + ATB_H).min(bars.y1.max(atb_top)) };
         r.rect(atb_back, BAR_BACK_RGB);
         if bar.alive {
-            let (fill, rgb) = if ready { (1.0, ATB_READY_RGB) } else { (fraction(bar.gauge, GAUGE_MAX), ATB) };
+            let (fill, rgb) = if ready { (1.0, ATB_READY_RGB) } else { (fraction(bar.gauge, GAUGE_MAX), ATB_RGB) };
             r.rect(Rect { x1: atb_back.x0 + atb_back.width() * fill, ..atb_back }, rgb);
         }
 
@@ -440,6 +442,114 @@ mod tests {
             self.name = format!("e{i}");
             self
         }
+    }
+
+    /// Draw `v` offscreen through the real GPU pipeline (`crate::render::Gpu`) and read the pixels
+    /// back as tightly packed RGBA8. `None` (with a note) when no adapter is available.
+    fn render_offscreen(v: &BattleView, w: u32, h: u32) -> Option<Vec<u8>> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let adapter = match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("skipped: no GPU adapter available ({e})");
+                return None;
+            }
+        };
+        eprintln!("offscreen adapter: {:?}", adapter.get_info().name);
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_limits: wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits()),
+            ..wgpu::DeviceDescriptor::default()
+        }))
+        .expect("device");
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let mut gpu = crate::render::Gpu::new(device.clone(), queue.clone(), format);
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("battle-offscreen"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let target = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        gpu.draw_scene(&target, &battle_vertices(v, w, h, false), None, crate::render::CLEAR_RGB, false);
+        let padded = (w * 4).next_multiple_of(256);
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("battle-readback"),
+            size: u64::from(padded * h),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        enc.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(padded), rows_per_image: Some(h) },
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        queue.submit(std::iter::once(enc.finish()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        readback.slice(..).map_async(wgpu::MapMode::Read, move |r| tx.send(r).expect("send"));
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+        rx.recv().expect("map callback").expect("map");
+        let data = readback.slice(..).get_mapped_range().expect("mapped range");
+        let mut out = Vec::with_capacity((w * h * 4) as usize);
+        for row in data.chunks(padded as usize).take(h as usize) {
+            out.extend_from_slice(&row[..(w * 4) as usize]);
+        }
+        Some(out)
+    }
+
+    /// The battle view through the real GPU pipeline: the pixels have the colours the layout says.
+    /// (This is as close as this box gets to the window: the surface itself needs a display.)
+    #[test]
+    fn offscreen_the_battle_view_has_the_status_band_the_ready_card_and_the_filled_bars() {
+        let (w, h) = (800u32, 600u32);
+        let v = view(
+            vec![bar(100, 100, GAUGE_MAX / 2, false, true, false), bar(30, 100, GAUGE_MAX, true, true, true)],
+            vec![bar(10, 10, 0, false, true, false), bar(0, 10, 0, false, false, false)],
+            Status::Diverged,
+        );
+        let Some(img) = render_offscreen(&v, w, h) else { return };
+        let px = |x: f32, y: f32| {
+            let i = (((y as u32) * w + x as u32) * 4) as usize;
+            [img[i], img[i + 1], img[i + 2]]
+        };
+        // The band across the top is red because the replay diverged; the gap between the two rows
+        // is the plain backdrop.
+        assert_eq!(px(400.0, 5.0), BAND_DIVERGED_RGB);
+        assert_eq!(px(400.0, h as f32 / 2.0), BACKDROP_RGB);
+        let cs = cards(&v, w as f32, h as f32);
+        assert_eq!(cs.len(), 4);
+        let party: Vec<&Card<'_>> = cs.iter().filter(|c| !c.enemy).collect();
+        for (card, ready) in party.iter().zip([false, true]) {
+            let r = card.rect;
+            let (cy, border_x) = ((r.y0 + r.y1) * 0.5, r.x0 + 1.0);
+            let want = if ready { BORDER_READY_RGB } else { BORDER_PARTY_RGB };
+            assert_eq!(px(border_x, cy), want, "card border (ready: {ready})");
+            // The gauge row: yellow when ready, blue (half full: its left half) otherwise.
+            let inner = r.inset(BORDER).inset(PAD - BORDER);
+            let atb_y = inner.y0 + HP_H + PAD * 0.5 + ATB_H * 0.5;
+            let gauge = px(inner.x0 + 4.0, atb_y);
+            assert_eq!(gauge, if ready { ATB_READY_RGB } else { ATB_RGB }, "gauge (ready: {ready})");
+            if !ready {
+                assert_eq!(px(inner.x1 - 4.0, atb_y), BAR_BACK_RGB, "the empty half of a half-full gauge");
+            }
+            // The HP bar: green when full, red at 30%.
+            let hp = px(inner.x0 + 4.0, inner.y0 + HP_H * 0.5);
+            assert_eq!(hp, if ready { HP_WARN_RGB } else { HP_GOOD_RGB }, "hp (ready: {ready})");
+        }
+        // Our own character carries the white marker in its card's corner.
+        assert_eq!(px(party[1].rect.x0 + 3.0, party[1].rect.y0 + 3.0), MARKER_RGB);
+        // The dead enemy's card is grey, the living one's red-brown.
+        let enemies: Vec<&Card<'_>> = cs.iter().filter(|c| c.enemy).collect();
+        let mid = |c: &Card<'_>| ((c.rect.x0 + 1.0), (c.rect.y0 + c.rect.y1) * 0.5);
+        assert_eq!(px(mid(enemies[0]).0, mid(enemies[0]).1), BORDER_ENEMY_RGB);
+        assert_eq!(px(mid(enemies[1]).0, mid(enemies[1]).1), BORDER_DEAD_RGB);
     }
 
     #[test]

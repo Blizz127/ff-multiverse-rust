@@ -33,8 +33,7 @@ use fmv_core::{AccountId, Fingerprint};
 use fmv_ff7_battle::rules::{Combatant, GAUGE_MAX};
 use fmv_protocol::battle::{BattleEvent, Command, Outcome};
 use fmv_protocol::{
-    ActorId, AppliedCommand, BattleId, BattleMember, BattleRejection, BattleReplay, BattleReward, BattleRules, BattleSetup, ClientMsg,
-    ServerMsg,
+    ActorId, AppliedCommand, BattleId, BattleRejection, BattleReplay, BattleReward, BattleRules, BattleSetup, ClientMsg, ServerMsg,
 };
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -79,11 +78,9 @@ struct Start {
 #[derive(Debug)]
 pub struct ActiveBattle {
     id: BattleId,
-    formation: u16,
     /// `None` when this client cannot rebuild the battle (no local battle data, or the data
     /// cannot build it): the battle then runs on the server without being mirrored.
     replay: Option<BattleReplay>,
-    members: Vec<BattleMember>,
     /// Our own character (`ActorId` = our index in the party), if we are in it.
     my_actor: Option<ActorId>,
     ticks_per_second: u32,
@@ -100,29 +97,25 @@ impl ActiveBattle {
         self.id
     }
 
-    pub fn formation(&self) -> u16 {
-        self.formation
-    }
-
-    pub fn members(&self) -> &[BattleMember] {
-        &self.members
-    }
-
     /// The replayed engine, if this client could build it.
+    #[cfg(test)]
     pub fn replay(&self) -> Option<&BattleReplay> {
         self.replay.as_ref()
     }
 
+    #[cfg(test)]
     pub fn my_actor(&self) -> Option<ActorId> {
         self.my_actor
     }
 
     /// Did the replay ever disagree with the server?
+    #[cfg(test)]
     pub fn diverged(&self) -> bool {
         self.diverged
     }
 
     /// Server messages applied to this battle so far.
+    #[cfg(test)]
     pub fn messages(&self) -> u64 {
         self.messages
     }
@@ -187,6 +180,7 @@ impl BattleClient {
         self.active.is_some()
     }
 
+    #[cfg(test)]
     pub fn active(&self) -> Option<&ActiveBattle> {
         self.active.as_ref()
     }
@@ -206,6 +200,7 @@ impl BattleClient {
         self.victories
     }
 
+    #[cfg(test)]
     pub fn defeats(&self) -> u64 {
         self.defeats
     }
@@ -220,6 +215,7 @@ impl BattleClient {
         self.rejections
     }
 
+    #[cfg(test)]
     pub fn last_rejection(&self) -> Option<BattleRejection> {
         self.last_rejection
     }
@@ -285,7 +281,8 @@ impl BattleClient {
             .and_then(|i| u8::try_from(i).ok())
             .map(ActorId);
         let mut failure = None;
-        let replay = match &self.rules {
+        let rules = self.rules.clone();
+        let replay = match &rules {
             None => {
                 self.note(format!(
                     "{battle_id} started, but this machine has no battle data (scene.bin, kernel.bin): it cannot take part or check the server"
@@ -322,9 +319,7 @@ impl BattleClient {
         ));
         self.active = Some(ActiveBattle {
             id: battle_id,
-            formation: setup.formation_id,
             replay,
-            members: setup.party,
             my_actor,
             ticks_per_second: setup.ticks_per_second,
             last_message: now,

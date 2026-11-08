@@ -43,10 +43,17 @@ SELF_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 # shellcheck source=smoke.sh
 source "$SELF_DIR/smoke.sh"
 
+# The sourced helpers print "smoke.sh:"; this script says who it is.
+say() { printf 'battle-smoke.sh: %s\n' "$*"; }
+err() { printf 'battle-smoke.sh: error: %s\n' "$*" >&2; }
+
 MODE=real
 LIBRARY="${FMV_FF7_LIBRARY:-$HOME/.local/share/ff-multiverse}"
 BATTLE_DURATION=40
-FORMATION=""
+# md1stin's first random-encounter formation in the Steam build (two enemies): a starting party wins
+# it every time and both members attack in every fight (checked over 200 seeds by
+# crates/fmv-server/tests/battle_real.rs, `the_smoke_formations_are_won_every_time_...`).
+FORMATION=301
 TICK_RATE=240
 BATTLE_SPEED=0
 BOT=idle
@@ -66,7 +73,8 @@ for the same battle. --fixture: checks that a FIXTURE server refuses battles cle
   --library DIR      state directory that contains library/ (default $FMV_FF7_LIBRARY, else
                      ~/.local/share/ff-multiverse); only the library is read, never written
   --duration SECS    how long each bot runs (default 40)
-  --formation ID     the enemy formation of the debug battle (default: the server's choice)
+  --formation ID     the enemy formation of the debug battle (default 301: a two-enemy formation of
+                     md1stin's own encounter table in the Steam build)
   --tick-rate TPS    engine ticks per second of battle time (default 240)
   --battle-speed N   FF7 battle speed, 0 fastest (default 0)
   --bot KIND         idle (default) or circle: how the bots move while not in battle
@@ -240,7 +248,7 @@ run_real() {
 
   local -a server_args=(--bind 127.0.0.1:0 --ff7-library "$WORK/lib-state" --state-dir "$WORK/server-state"
     --debug-encounters --no-random-encounters --battle-speed "$BATTLE_SPEED" --battle-tick-rate "$TICK_RATE")
-  [[ -z $FORMATION ]] || server_args+=(--debug-formation "$FORMATION")
+  server_args+=(--debug-formation "$FORMATION")
   say "starting server: $SERVER_BIN ${server_args[*]}"
   "$SERVER_BIN" "${server_args[@]}" >"$WORK/server.log" 2>&1 &
   SERVER_PID=$!
@@ -416,7 +424,7 @@ main() {
   [[ $BATTLE_DURATION =~ ^[1-9][0-9]*$ ]] || usage_error "--duration must be a positive whole number of seconds"
   [[ $TICK_RATE =~ ^[1-9][0-9]*$ ]] || usage_error "--tick-rate must be a positive whole number"
   [[ $BATTLE_SPEED =~ ^[0-9]+$ ]] || usage_error "--battle-speed must be a whole number"
-  [[ -z $FORMATION || $FORMATION =~ ^[0-9]+$ ]] || usage_error "--formation must be a whole number"
+  [[ $FORMATION =~ ^[0-9]+$ ]] || usage_error "--formation must be a whole number"
   [[ $BOT == idle || $BOT == circle ]] || usage_error "--bot must be idle or circle"
   if [[ $DO_BUILD == 1 && -n $BIN_DIR ]]; then
     usage_error "--build cannot be combined with --bin-dir"

@@ -4,7 +4,7 @@
 use super::*;
 use fmv_core::EntityId;
 use fmv_ff7_battle::rules::{BattleState, GAUGE_MAX};
-use fmv_protocol::{split_rewards, SyntheticRules};
+use fmv_protocol::{split_rewards, BattleMember, SyntheticRules};
 
 const ME: AccountId = AccountId(11);
 const PEER: AccountId = AccountId(12);
@@ -142,11 +142,11 @@ fn a_start_builds_the_mirror_and_says_who_we_are() {
     assert!(c.in_battle());
     assert_eq!(c.entered(), 1);
     let a = c.active().unwrap();
-    assert_eq!((a.id(), a.formation(), a.my_actor()), (BattleId(1), 1, Some(ActorId(1))), "we are the second member");
-    assert_eq!(a.members().len(), 2);
-    assert!(a.replay().is_some() && !a.diverged());
+    assert_eq!((a.id(), a.my_actor()), (BattleId(1), Some(ActorId(1))), "we are the second member");
+    assert_eq!(a.replay().map(|r| r.party().len()), Some(2));
+    assert!(!a.diverged() && a.messages() == 0);
     let n = notes(&mut c);
-    assert!(n.contains("battle#1 started") && n.contains("you fight as actor 1"), "{n}");
+    assert!(n.contains("battle#1 started: formation 1, party of 2") && n.contains("you fight as actor 1"), "{n}");
     assert_eq!(c.divergences(), 0);
 }
 

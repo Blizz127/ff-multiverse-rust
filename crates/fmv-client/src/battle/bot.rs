@@ -42,6 +42,7 @@ impl BattleBot {
     }
 
     /// Whether the one request was sent.
+    #[cfg(test)]
     pub fn requested(&self) -> bool {
         self.requested
     }

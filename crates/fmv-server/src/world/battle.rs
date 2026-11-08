@@ -711,6 +711,25 @@ mod tests {
     }
 
     #[test]
+    fn without_a_fixed_seed_every_battle_gets_its_own_seed() {
+        let t0 = Instant::now();
+        let mut s = settings(SyntheticRules::default());
+        s.fixed_seed = None;
+        let mut w = world_with(Some(s), true);
+        let mut seeds = BTreeSet::new();
+        for i in 0..6 {
+            let mut a = seat(&mut w, &format!("S{i}"), t0);
+            assert_eq!(w.request_encounter(a.entity, Some(0), t0), BattleReply::Done);
+            let seed = a.battle_msgs().iter().find_map(|m| match m {
+                ServerMsg::EncounterStart { seed, .. } => Some(*seed),
+                _ => None,
+            });
+            seeds.insert(seed.expect("a start"));
+        }
+        assert_eq!(seeds.len(), 6, "{seeds:?}");
+    }
+
+    #[test]
     fn a_party_fights_one_shared_battle_ordered_by_entity() {
         let t0 = Instant::now();
         let mut w = world_with(Some(settings(SyntheticRules::default())), true);
