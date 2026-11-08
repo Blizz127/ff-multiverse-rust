@@ -9,7 +9,16 @@
 //!   symlink, a symlinked `library`, ...);
 //! - `scan-pc`, `list` and `import-status` never create or modify anything;
 //! - every refusal that can be decided from the source and the saved sessions alone (wrong
-//!   edition, ambiguous language, disc number clashes, ...) happens BEFORE anything is written;
+//!   edition, ambiguous language, disc number clashes, an image inside the library, ...) happens
+//!   BEFORE anything is written: no lock, directory or file is created for it;
+//! - symbolic links: in a PC install a link that stays inside the directory given is followed
+//!   and one that leads out of it is refused (see [`crate::scan`]); a disc image, cue sheet or
+//!   `.bin` may be a link and the file it leads to is what is read and guarded (see
+//!   [`crate::image`]);
+//! - a disc number that is already in the library is only ever CONFIRMED: an image that holds
+//!   other content for it is refused ("different disc content") unless `--replace-disc` says it
+//!   is to take the place of what is there;
+//! - everything the importer creates under the state directory is private (0700 / 0600);
 //! - one library set holds one language (PC) or one disc family (discs); content the importer
 //!   cannot identify gets a set of its own, private to the import session;
 //! - what the importer only GUESSED (edition, region, language, the game itself for an unknown
@@ -32,15 +41,19 @@ use crate::session::SessionError;
 mod disc;
 mod list;
 mod pc;
+mod remove;
+#[cfg(test)]
+mod hardening;
 #[cfg(test)]
 mod tests;
 
 pub use disc::{
     import_disc, import_status, DiscKind, DiscSummary, ImportDiscArgs, ImportDiscResult,
-    MissingDisc, SessionStatus,
+    MissingDisc, ReplacedDisc, SessionStatus,
 };
 pub use list::{list_sets, ListResult, SetListing};
 pub use pc::{import_pc, ImportPcArgs, ImportPcResult};
+pub use remove::{remove_set, RemoveSetArgs, RemoveSetResult};
 
 /// How many files an import processes between manifest checkpoints.
 const CHECKPOINT_EVERY: usize = 200;
@@ -67,6 +80,10 @@ pub enum CommandError {
     NoFlevel(String),
     #[error("refusing to import language {language:?}: the install has no flevel.lgp for it (it has one for: {have}); run scan-pc to see what is there")]
     NoFlevelForLanguage { language: String, have: String },
+    #[error("refusing to import: no flevel.lgp was found in {dir}, but {links} is a symbolic link that leads outside it and was not followed (an install is only read from inside the directory it was given as); run scan-pc to see what is there")]
+    NoFlevelOnlyLinks { dir: String, links: String },
+    #[error("{path} is a symbolic link that leads outside the install directory (to {target}); refusing to follow it: an install is only read from inside the directory it was given as. Copy the real file into the install, or import the directory that really holds it")]
+    SymlinkOutsideInstall { path: String, target: PathBuf },
     #[error("the state directory {state} is inside the install directory {install}; refusing to write there (originals are never modified)")]
     StateInsideSource { state: PathBuf, install: PathBuf },
     #[error("disc belongs to {disc}, session is {session}")]
@@ -94,6 +111,13 @@ pub enum CommandError {
         requested: u8,
         session: String,
     },
+    /// The library already holds disc `index` of this set, from content that is not this image's.
+    #[error("different disc content for {serial} disc {index}: {detail}. The library already holds disc {index} of this set from other content; if that earlier import was the wrong, a damaged or a crafted disc, import this image again with --replace-disc to replace it (the earlier files stay in the blob store but leave the set). The same disc imported another way (a plain .iso of what was a raw .bin: streams are skipped in one and not the other) also needs --replace-disc")]
+    DiscContentDiffers {
+        serial: String,
+        index: u8,
+        detail: String,
+    },
     #[error("invalid disc number {0}: use 1-16")]
     BadDiscNumber(u8),
     #[error("--revision {given} contradicts the session's revision {session}")]
@@ -102,6 +126,9 @@ pub enum CommandError {
     EmptyDisc,
     #[error("no import session named {0:?}")]
     NoSuchSession(String),
+    /// A destructive command that was not confirmed: nothing was changed.
+    #[error("{0}")]
+    ConfirmationRequired(String),
 }
 
 fn importer_version() -> String {

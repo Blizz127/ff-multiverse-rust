@@ -411,9 +411,157 @@ fn default_state_dir_follows_xdg_when_nothing_else_is_set() {
     );
 }
 
+/// A crafted image that claims a genuine disc is refused in plain words, `--replace-disc` is the
+/// documented way to replace it, and `remove-set` drops a set only when told to.
+fn replace_disc_and_remove_set_flow() {
+    let env = Env::new();
+    let genuine = disc(&env, "genuine", "SCUS_941.63", "the real disc");
+    let crafted = disc(&env, "crafted", "SCUS_941.63", "someone else's image");
+    let first = json(&env.run_with_state(&["import-disc", genuine.to_str().unwrap(), "--set-name", "ff7"]));
+    let set_id = first["set_id"].as_str().unwrap().to_string();
+    assert_eq!(first["content"]["files"], 4);
+    assert_eq!(first["content"]["blake3"].as_str().unwrap().len(), 64);
+    assert!(first["replaced"].is_null());
+
+    // another image of "the same disc": refused with a clear message, nothing changed
+    let out = env.run_with_state(&["import-disc", crafted.to_str().unwrap(), "--set-name", "other"]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("different disc content for SCUS-94163 disc 1") && err.contains("--replace-disc"),
+        "{err}"
+    );
+    assert!(!err.contains("EntryConflict") && !err.contains("not supported yet"), "{err}");
+    let listed = json(&env.run(&["list"]));
+    assert_eq!(listed["sets"][0]["discs"][0]["blake3"], first["content"]["blake3"], "{listed}");
+
+    // the explicit way
+    let replaced = json(&env.run_with_state(&[
+        "import-disc",
+        crafted.to_str().unwrap(),
+        "--set-name",
+        "other",
+        "--replace-disc",
+    ]));
+    assert_eq!(replaced["replaced"]["entries"], 4);
+    assert_eq!(replaced["replaced"]["serial"], "SCUS-94163");
+    assert_ne!(replaced["content"]["blake3"], first["content"]["blake3"]);
+    let help = String::from_utf8_lossy(&env.run(&["import-disc", "--help"]).stdout).to_string();
+    assert!(help.contains("--replace-disc"), "{help}");
+
+    // remove-set: no --yes, no change
+    let out = env.run_with_state(&["remove-set", &set_id]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--yes") && err.contains(&set_id) && err.contains("Nothing was changed"), "{err}");
+    assert_eq!(json(&env.run(&["list"]))["sets"].as_array().unwrap().len(), 1);
+    // an id that is no set id is refused outright
+    let out = env.run_with_state(&["remove-set", "../library", "--yes"]);
+    assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("invalid set id"));
+    assert!(env.state.join("library/blobs").is_dir());
+    // with --yes: the set and the sessions that point at it go, the blobs and the images stay
+    let blobs_before = count_files(&env.state.join("library/blobs"));
+    let removed = json(&env.run_with_state(&["remove-set", &set_id, "--yes"]));
+    assert_eq!(removed["command"], "remove-set");
+    assert_eq!(removed["entries"], 4);
+    let mut gone: Vec<&str> = removed["sessions_removed"].as_array().unwrap().iter().map(|s| s.as_str().unwrap()).collect();
+    gone.sort_unstable();
+    assert_eq!(gone, ["ff7", "other"]);
+    assert!(removed["blobs"].as_str().unwrap().starts_with("kept"));
+    assert_eq!(json(&env.run(&["list"]))["sets"].as_array().unwrap().len(), 0);
+    assert_eq!(count_files(&env.state.join("library/blobs")), blobs_before);
+    assert!(genuine.is_file() && crafted.is_file(), "the images are never touched");
+    let missing = env.run_with_state(&["remove-set", &set_id, "--yes"]);
+    assert!(!missing.status.success() && String::from_utf8_lossy(&missing.stderr).contains("not found"));
+}
+
+fn count_files(dir: &Path) -> usize {
+    fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| if e.path().is_dir() { count_files(&e.path()) } else { 1 })
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+/// An empty state directory is an error, never "use the default library".
+fn an_empty_state_dir_is_refused_not_replaced_by_the_default() {
+    let env = Env::new();
+    let install = env.root.join("FF7");
+    touch(&install, "ff7.exe", b"x");
+    touch(&install, "data/field/flevel.lgp", b"x");
+
+    // FMV_STATE_DIR set but empty: refused by every command that would have used it
+    for args in [&["list"][..], &["import-status", "ff7"][..], &["remove-set", "x-00000000", "--yes"][..]] {
+        let out = Command::new(env!("CARGO_BIN_EXE_fmv-import"))
+            .args(args)
+            .env("FMV_STATE_DIR", "")
+            .env("XDG_DATA_HOME", env.root.join("xdg"))
+            .env("HOME", env.root.join("home"))
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{args:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("FMV_STATE_DIR") && err.contains("empty"), "{args:?}: {err}");
+    }
+    let out = Command::new(env!("CARGO_BIN_EXE_fmv-import"))
+        .args(["import-pc", install.to_str().unwrap()])
+        .env("FMV_STATE_DIR", "")
+        .env("XDG_DATA_HOME", env.root.join("xdg"))
+        .env("HOME", env.root.join("home"))
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(!env.root.join("xdg").exists(), "the default library was not touched or created");
+    assert!(!env.root.join("home").exists());
+
+    // an empty --state-dir (the shell variable that was never set) is refused for every command
+    for args in [&["list"][..], &["import-status", "ff7"][..], &["scan-pc", install.to_str().unwrap()][..]] {
+        let out = env.command().args(args).args(["--state-dir", ""]).output().unwrap();
+        assert!(!out.status.success(), "{args:?}");
+    }
+    let out = env.command().args(["import-pc", install.to_str().unwrap(), "--state-dir", ""]).output().unwrap();
+    assert!(!out.status.success());
+    assert!(!env.state.exists() && !env.root.join("xdg").exists());
+
+    // scan-pc never looks at the environment's state directory, so an empty one is no business of its
+    let out = Command::new(env!("CARGO_BIN_EXE_fmv-import"))
+        .args(["scan-pc", install.to_str().unwrap()])
+        .env("FMV_STATE_DIR", "")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// A link out of the install is reported by `scan-pc` and never imported.
+#[cfg(unix)]
+fn links_out_of_an_install_are_reported_and_never_imported() {
+    let env = Env::new();
+    let install = env.root.join("FF7");
+    touch(&install, "ff7.exe", b"exe");
+    touch(&install, "data/field/char.lgp", b"char");
+    touch(&env.root.join("elsewhere"), "secret.txt", b"NOT-A-REAL-SECRET");
+    std::os::unix::fs::symlink(env.root.join("elsewhere/secret.txt"), install.join("data/field/flevel.lgp")).unwrap();
+    let report = json(&env.run(&["scan-pc", install.to_str().unwrap()]));
+    assert_eq!(report["refused_links"][0]["relative_path"], "data/field/flevel.lgp");
+    assert!(report["refused_links"][0]["reason"].as_str().unwrap().contains("outside"));
+    assert_eq!(report["m1"]["ready"], false);
+    assert!(!report.to_string().contains("secret.txt"), "the target is not reported: {report}");
+    let out = env.run_with_state(&["import-pc", install.to_str().unwrap()]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("symbolic link") && err.contains("flevel.lgp"), "{err}");
+    assert!(!env.state.exists(), "a refusal creates nothing");
+}
+
 /// scan / import-pc / list, then a three-disc session with a foreign-region refusal.
 #[test]
 fn import_flows_end_to_end() {
+    replace_disc_and_remove_set_flow();
+    an_empty_state_dir_is_refused_not_replaced_by_the_default();
+    #[cfg(unix)]
+    links_out_of_an_install_are_reported_and_never_imported();
     pc_scan_import_and_list_flow();
     disc_session_flow_and_family_refusal();
     multi_language_install_needs_a_language();

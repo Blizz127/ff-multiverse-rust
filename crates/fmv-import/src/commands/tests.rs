@@ -25,13 +25,13 @@ use crate::synthetic::{
 // helpers
 // ---------------------------------------------------------------------------------------------
 
-fn touch(root: &Path, rel: &str, bytes: &[u8]) {
+pub(super) fn touch(root: &Path, rel: &str, bytes: &[u8]) {
     let p = root.join(rel);
     fs::create_dir_all(p.parent().unwrap()).unwrap();
     fs::write(p, bytes).unwrap();
 }
 
-fn snapshot(root: &Path) -> BTreeMap<String, (u64, Option<SystemTime>)> {
+pub(super) fn snapshot(root: &Path) -> BTreeMap<String, (u64, Option<SystemTime>)> {
     let mut out = BTreeMap::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(d) = stack.pop() {
@@ -46,7 +46,7 @@ fn snapshot(root: &Path) -> BTreeMap<String, (u64, Option<SystemTime>)> {
     out
 }
 
-fn pc_args(dir: &Path, state: &Path) -> ImportPcArgs {
+pub(super) fn pc_args(dir: &Path, state: &Path) -> ImportPcArgs {
     ImportPcArgs {
         dir: dir.to_path_buf(),
         state_dir: Some(state.to_path_buf()),
@@ -58,7 +58,7 @@ fn pc_args(dir: &Path, state: &Path) -> ImportPcArgs {
 }
 
 /// A fake install with empty placeholder files (and one with a few synthetic bytes).
-fn fake_install(root: &Path) {
+pub(super) fn fake_install(root: &Path) {
     touch(root, "ff7_en.exe", b"");
     touch(root, "data/field/flevel.lgp", b"");
     touch(root, "data/field/char.lgp", b"");
@@ -70,7 +70,7 @@ fn fake_install(root: &Path) {
 }
 
 /// A fake Steam-style install holding three languages, with different bytes per language.
-fn multi_language_install(root: &Path) {
+pub(super) fn multi_language_install(root: &Path) {
     touch(root, "ff7_en.exe", b"exe-en");
     touch(root, "ff7_fr.exe", b"exe-fr");
     touch(root, "data/field/char.lgp", b"neutral char");
@@ -83,7 +83,7 @@ fn multi_language_install(root: &Path) {
     }
 }
 
-fn disc_iso(exe: &str, tag: &str) -> Vec<u8> {
+pub(super) fn disc_iso(exe: &str, tag: &str) -> Vec<u8> {
     let unique = format!("{tag}: synthetic data for {exe}");
     build_iso_labeled(
         DISC_LABEL,
@@ -96,7 +96,7 @@ fn disc_iso(exe: &str, tag: &str) -> Vec<u8> {
     )
 }
 
-fn write_raw(dir: &Path, name: &str, raw: &[u8]) -> PathBuf {
+pub(super) fn write_raw(dir: &Path, name: &str, raw: &[u8]) -> PathBuf {
     fs::create_dir_all(dir).unwrap();
     fs::write(dir.join(format!("{name}.bin")), raw).unwrap();
     fs::write(
@@ -107,21 +107,22 @@ fn write_raw(dir: &Path, name: &str, raw: &[u8]) -> PathBuf {
     dir.join(format!("{name}.cue"))
 }
 
-fn write_disc(dir: &Path, name: &str, iso: &[u8]) -> PathBuf {
+pub(super) fn write_disc(dir: &Path, name: &str, iso: &[u8]) -> PathBuf {
     write_raw(dir, name, &wrap_raw(iso, RawMode::Mode2Form1))
 }
 
-fn disc_args(image: &Path, state: &Path, set: &str) -> ImportDiscArgs {
+pub(super) fn disc_args(image: &Path, state: &Path, set: &str) -> ImportDiscArgs {
     ImportDiscArgs {
         image: image.to_path_buf(),
         set_name: set.to_string(),
         state_dir: Some(state.to_path_buf()),
         disc: None,
         revision: None,
+        replace_disc: false,
     }
 }
 
-fn owned(v: &[(String, Vec<u8>)]) -> Vec<(&str, &[u8])> {
+pub(super) fn owned(v: &[(String, Vec<u8>)]) -> Vec<(&str, &[u8])> {
     v.iter().map(|(n, d)| (n.as_str(), d.as_slice())).collect()
 }
 
@@ -129,7 +130,7 @@ fn owned(v: &[(String, Vec<u8>)]) -> Vec<(&str, &[u8])> {
 /// sector with a broken sync pattern when `break_last`: its import fails after the checkpoints.
 /// The file CONTENT depends on `tag` only, so two images with the same tag are two rips of one
 /// disc (`name` is just the image's file name).
-fn big_disc(images: &Path, name: &str, tag: &str, exe: &str, n: usize, break_last: bool) -> PathBuf {
+pub(super) fn big_disc(images: &Path, name: &str, tag: &str, exe: &str, n: usize, break_last: bool) -> PathBuf {
     let mut files: Vec<(String, Vec<u8>)> = (0..n)
         .map(|i| (format!("FIELD/F{i:03}.DAT"), format!("{tag} file {i}").into_bytes()))
         .collect();
@@ -144,7 +145,7 @@ fn big_disc(images: &Path, name: &str, tag: &str, exe: &str, n: usize, break_las
     write_raw(images, name, &raw)
 }
 
-fn manifest_of(state: &Path, set_id: &str) -> fmv_library::Manifest {
+pub(super) fn manifest_of(state: &Path, set_id: &str) -> fmv_library::Manifest {
     Library::open_existing(state)
         .unwrap()
         .load_manifest(set_id)
@@ -1459,6 +1460,8 @@ fn refusals_that_need_no_lock_leave_no_trace() {
     u.disc = Some(1);
     import_disc(&u, 1).unwrap();
     import_disc(&disc_args(&d1, &state, "ff7"), 2).unwrap();
+    // an image that sits inside the library (planted before the picture is taken)
+    let inside = write_disc(&state.join("library"), "inside", &disc_iso("SCUS_941.65", "inside"));
     let before = snapshot(&state);
 
     let mut wrong_number = disc_args(&d2, &state, "ff7");
@@ -1475,6 +1478,8 @@ fn refusals_that_need_no_lock_leave_no_trace() {
         ("revision", bad_revision),
         ("same serial, second number", twice),
         ("not an image", disc_args(&junk, &state, "ff7")),
+        ("image inside the library", disc_args(&inside, &state, "ff7")),
+        ("image inside the library, new session", disc_args(&inside, &state, "brand-new")),
     ] {
         assert!(import_disc(&args, 9).is_err(), "{what}");
         assert_eq!(snapshot(&state), before, "{what}: a refusal must leave no trace");
@@ -1620,9 +1625,16 @@ fn unusable_names_are_skipped_and_flag_the_disc_but_conflicts_stay_fatal() {
     assert!(lib.get(&r.set_id, "disc1/SYSTEM.CNF").unwrap().is_some());
     assert!(lib.get(&r.set_id, "disc1/DUP.TXT").unwrap().is_some());
 
-    // a different rip of the SAME disc whose file differs: a conflict with what the set holds
+    // another image that claims the SAME disc (same serial, other files) is no longer merged into
+    // it: it is refused as a different disc ...
     let d1 = write_disc(&images, "d1", &disc_iso("SCUS_941.63", "one"));
-    import_disc(&disc_args(&d1, &state, "ok"), 2).unwrap();
+    let err = import_disc(&disc_args(&d1, &state, "ok"), 2).unwrap_err();
+    assert!(matches!(err, CommandError::DiscContentDiffers { index: 1, .. }), "{err}");
+    // ... unless it is explicitly meant to take its place
+    let mut replace = disc_args(&d1, &state, "ok");
+    replace.replace_disc = true;
+    import_disc(&replace, 2).unwrap();
+    // a different rip of THAT disc whose file differs: a conflict with what the set holds
     let changed = build_iso_labeled(
         DISC_LABEL,
         &[
@@ -1635,8 +1647,14 @@ fn unusable_names_are_skipped_and_flag_the_disc_but_conflicts_stay_fatal() {
     let d1b = write_disc(&images, "d1b", &changed);
     let manifest_before = manifest_of(&state, &r.set_id).entries.len();
     let err = import_disc(&disc_args(&d1b, &state, "ok"), 3).unwrap_err();
+    // a conflict with the disc as imported is reported as what it is: another disc's content,
+    // not a confusing library-level EntryConflict
     assert!(
-        matches!(err, CommandError::Library(LibraryError::EntryConflict { .. })),
+        matches!(err, CommandError::DiscContentDiffers { index: 1, .. }),
+        "{err}"
+    );
+    assert!(
+        !matches!(err, CommandError::Library(LibraryError::EntryConflict { .. })),
         "{err}"
     );
     let st = import_status("ok", Some(&state)).unwrap();

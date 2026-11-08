@@ -9,7 +9,13 @@
 //! The directory given is the folder that holds `data/`, or the install root of the Steam Edition
 //! (or its `ff7` folder): the scan finds `ff7/workingdir/data` itself. Library paths are always
 //! relative to the folder that holds `data/` (`data/field/flevel.lgp`), so every spelling of one
-//! install imports the same set. Labels not given on the command line come from the scan:
+//! install imports the same set.
+//!
+//! Symbolic links: a file that is a link (or sits behind one) is followed only while it stays
+//! inside the directory given, resolved to its real path; one that leads out of it is refused
+//! (the scan leaves it out and says so, and the import checks again, on the real path, right
+//! before it reads the file). The logical path of a file is always the scan's, never the
+//! resolved one, so a link inside the tree changes nothing about what the set holds. Labels not given on the command line come from the scan:
 //! the Steam Edition is `Steam Edition (appid 3837340)` / region `unknown` / revision
 //! `build <id>`, the exact strings `--edition` and `--revision` took for the sets that exist.
 
@@ -66,6 +72,24 @@ pub(super) fn canonical_lenient(p: &Path) -> PathBuf {
         }
     }
     cur
+}
+
+/// The real file behind `rel` (a path relative to the install directory `install`, which is
+/// canonical already): every link resolved, and refused when the real path is not inside the
+/// install. What is stamped, copied and hashed again is this real path.
+pub(super) fn resolve_in_install(install: &Path, rel: &str) -> Result<PathBuf, CommandError> {
+    let joined = install.join(rel);
+    let real = fs::canonicalize(&joined).map_err(|source| ScanError::Io {
+        path: joined.clone(),
+        source,
+    })?;
+    if !real.starts_with(install) {
+        return Err(CommandError::SymlinkOutsideInstall {
+            path: rel.to_string(),
+            target: real,
+        });
+    }
+    Ok(real)
 }
 
 /// Err unless every source still has its stamp (size, mtime, identity) AND, read a second time,
@@ -137,9 +161,23 @@ pub struct ImportPcResult {
 
 pub fn import_pc(args: &ImportPcArgs, now: u64) -> Result<ImportPcResult, CommandError> {
     let report = scan_pc(&args.dir)?;
+    #[cfg(test)]
+    seam::after_scan(&args.dir);
 
     // Every refusal up to the library being opened happens before anything is written.
     if !report.would_import.iter().any(|w| is_flevel(&w.logical_path)) {
+        if !report.refused_links.is_empty() {
+            return Err(CommandError::NoFlevelOnlyLinks {
+                dir: args.dir.display().to_string(),
+                links: report
+                    .refused_links
+                    .iter()
+                    .take(4)
+                    .map(|l| l.relative_path.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            });
+        }
         return Err(CommandError::NoFlevel(args.dir.display().to_string()));
     }
     let selection = report.select(args.language.as_deref())?;
@@ -182,6 +220,18 @@ pub fn import_pc(args: &ImportPcArgs, now: u64) -> Result<ImportPcResult, Comman
         }
     }
 
+    // The REAL files (links resolved, confined to the install): they are what is stamped, copied
+    // and hashed again; the logical paths stay the scan's. Everything that can refuse an import
+    // from the install alone happens here, before the library is opened: a refusal creates
+    // nothing.
+    let dir_mtime_before = fs::metadata(&install).and_then(|m| m.modified()).ok();
+    let mut sources: Vec<(PathBuf, SourceStamp)> = Vec::new();
+    for w in &chosen {
+        let path = resolve_in_install(&install, &w.source_relative_path)?;
+        let stamp = SourceStamp::capture(&path)?;
+        sources.push((path, stamp));
+    }
+
     let lib = Library::open(&state_dir)?.with_importer_version(importer_version());
     let source_ref = SourceRef::Install {
         path: install.display().to_string(),
@@ -221,20 +271,14 @@ pub fn import_pc(args: &ImportPcArgs, now: u64) -> Result<ImportPcResult, Comman
     let handle =
         SetHandle::new(provenance.clone()).with_identification(identification.clone());
 
-    let dir_mtime_before = fs::metadata(&install).and_then(|m| m.modified()).ok();
-    let mut sources: Vec<(PathBuf, SourceStamp)> = Vec::new();
-    for w in &chosen {
-        let path = install.join(&w.source_relative_path);
-        let stamp = SourceStamp::capture(&path)?;
-        sources.push((path, stamp));
-    }
-
     let mut batch = lib.begin_import(&handle, now)?;
+    let batch_locked = batch.is_locked();
     let mut files = Vec::new();
     let mut hashes = Vec::new();
     let mut totals = Totals::default();
     for (w, (path, _)) in chosen.iter().zip(&sources) {
-        let outcome = batch.add_file(&w.logical_path, path, source_ref.clone())?;
+        let outcome =
+            batch.add_file_within(&w.logical_path, path, &install, source_ref.clone())?;
         totals.add(&outcome);
         hashes.push(outcome.blake3.clone());
         files.push(imported(&outcome));
@@ -256,6 +300,9 @@ pub fn import_pc(args: &ImportPcArgs, now: u64) -> Result<ImportPcResult, Comman
             "{} damaged blob(s) already in the library were replaced from this install",
             totals.blobs_repaired
         ));
+    }
+    if !batch_locked {
+        warnings.push("this filesystem does not support advisory file locks, so nothing could stop a second import into this set from running at the same time: do not run two imports at once (a collision can lose entries, which importing again restores)".to_string());
     }
     if !languages_left_out.is_empty() {
         warnings.push(format!(
@@ -384,4 +431,26 @@ fn identification_for(
         "pc-file-presence"
     };
     Identification::unverified(method, caveats)
+}
+
+/// Test seam: lets a test change the install between the scan and the import's own checks (a
+/// file swapped for a link, say), which no file-system fixture can do from outside.
+#[cfg(test)]
+pub(super) mod seam {
+    use std::cell::RefCell;
+    use std::path::Path;
+
+    type Hook = Box<dyn Fn(&Path)>;
+
+    thread_local! {
+        pub(in crate::commands) static AFTER_SCAN: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn after_scan(dir: &Path) {
+        AFTER_SCAN.with(|h| {
+            if let Some(f) = h.borrow().as_ref() {
+                f(dir);
+            }
+        });
+    }
 }

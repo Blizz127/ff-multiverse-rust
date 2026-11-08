@@ -16,6 +16,14 @@
 //! relative to the game directory, so every accepted spelling of one install imports the same
 //! set.
 //!
+//! Symbolic links: a link INSIDE the scanned directory is followed (a layout that links
+//! `data/field/flevel.lgp` to a file elsewhere in the install is fine), a link that leads OUT of
+//! it is not. A candidate file whose real path (every link resolved) is not under the scanned
+//! directory is left out of the report as if it were not there, and listed in
+//! [`ScanReport::refused_links`] with a warning, so that an install tree cannot make an import
+//! copy some other file of the machine into the library under the name of a game file.
+//! `import-pc` applies the same rule again, to the real files, right before it reads them.
+//!
 //! One library set holds ONE language. The scan reports every candidate file tagged with its
 //! language (`None` for the language-neutral classic layout and `ff7.exe`), and
 //! [`ScanReport::select`] picks "the neutral files plus exactly one language": an install that
@@ -238,6 +246,17 @@ impl SteamEvidence {
     }
 }
 
+/// A file that would have been a candidate but is a symbolic link leading out of the scanned
+/// directory (see the module docs).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RefusedLink {
+    /// Relative to the scanned directory.
+    pub relative_path: String,
+    pub reason: &'static str,
+}
+
+const LINK_REFUSED: &str = "symbolic link that leads outside the scanned directory (not followed)";
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Milestone {
     pub ready: bool,
@@ -351,6 +370,10 @@ pub struct ScanReport {
     /// Things that make the install look like something other than the real game (empty files),
     /// and the language default (a warning starting with [`LANGUAGE_DEFAULT_PREFIX`]).
     pub warnings: Vec<String>,
+    /// Candidate files that were left out because they are symbolic links leading out of the
+    /// scanned directory. Absent from the report when there are none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub refused_links: Vec<RefusedLink>,
     pub notes: Vec<&'static str>,
     /// The canonical install root of the Steam Edition the scanned directory belongs to, when it
     /// was identified (it can sit above the scanned directory). `import-pc` keeps its state
@@ -462,6 +485,29 @@ fn regular_file_size(path: &Path) -> Option<u64> {
 
 fn is_dir(path: &Path) -> bool {
     fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false)
+}
+
+/// [`regular_file_size`] for a file that an import may take: `None` (and a note in `refused`)
+/// when it is a symbolic link, or sits behind one, that leads out of `canon_root`. `shown` is
+/// the file's path relative to the scanned directory.
+fn candidate_size(
+    path: &Path,
+    shown: &str,
+    canon_root: &Path,
+    refused: &mut Vec<RefusedLink>,
+) -> Option<u64> {
+    let size = regular_file_size(path)?;
+    match fs::canonicalize(path) {
+        Ok(real) if real.starts_with(canon_root) => Some(size),
+        Ok(_) => {
+            refused.push(RefusedLink {
+                relative_path: shown.to_string(),
+                reason: LINK_REFUSED,
+            });
+            None
+        }
+        Err(_) => None,
+    }
 }
 
 /// The language code of a `lang-<code>` directory name (lower-cased), if it is a sane one:
@@ -816,6 +862,8 @@ pub fn scan_pc(root: &Path) -> Result<ScanReport, ScanError> {
     let canon_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let canon_game = fs::canonicalize(&game.dir).unwrap_or_else(|_| game.dir.clone());
     let steam_edition = detect_steam_edition(&canon_root, &canon_game);
+    // candidates that are links out of the scanned directory (see the module docs)
+    let mut refused_links: Vec<RefusedLink> = Vec::new();
 
     // executables in the scanned directory
     let mut executables = Vec::new();
@@ -823,7 +871,9 @@ pub fn scan_pc(root: &Path) -> Result<ScanReport, ScanError> {
         for ent in rd.flatten() {
             let name = ent.file_name().to_string_lossy().into_owned();
             if let Some(language) = classify_exe(&name) {
-                if let Some(size) = regular_file_size(&ent.path()) {
+                if let Some(size) =
+                    candidate_size(&ent.path(), &name, &canon_root, &mut refused_links)
+                {
                     executables.push(Executable {
                         relative_path: name,
                         size,
@@ -856,7 +906,12 @@ pub fn scan_pc(root: &Path) -> Result<ScanReport, ScanError> {
         let mut locations = Vec::new();
         let rest = w.rel.strip_prefix("data/").unwrap_or(w.rel);
         if let Some((path, rel_in_game)) = find_ci(&game.dir, w.rel) {
-            if let Some(size) = regular_file_size(&path) {
+            if let Some(size) = candidate_size(
+                &path,
+                &game.join(&rel_in_game),
+                &canon_root,
+                &mut refused_links,
+            ) {
                 locations.push(FoundFile::at(
                     &game,
                     &rel_in_game,
@@ -869,8 +924,13 @@ pub fn scan_pc(root: &Path) -> Result<ScanReport, ScanError> {
         if let Some((data_name, _)) = &data {
             for (lang_name, lang_path) in &lang_dirs {
                 if let Some((file_path, rel_in_lang)) = find_ci(lang_path, rest) {
-                    if let Some(size) = regular_file_size(&file_path) {
-                        let rel_in_game = format!("{data_name}/{lang_name}/{rel_in_lang}");
+                    let rel_in_game = format!("{data_name}/{lang_name}/{rel_in_lang}");
+                    if let Some(size) = candidate_size(
+                        &file_path,
+                        &game.join(&rel_in_game),
+                        &canon_root,
+                        &mut refused_links,
+                    ) {
                         let mut f = FoundFile::at(
                             &game,
                             &rel_in_game,
@@ -893,7 +953,12 @@ pub fn scan_pc(root: &Path) -> Result<ScanReport, ScanError> {
             let Some((path, rel_in_game)) = find_ci(&game.dir, &format!("{dir}/{}", v.file)) else {
                 continue;
             };
-            let Some(size) = regular_file_size(&path) else {
+            let Some(size) = candidate_size(
+                &path,
+                &game.join(&rel_in_game),
+                &canon_root,
+                &mut refused_links,
+            ) else {
                 continue;
             };
             let logical = format!("data/lang-{}/{rest}", v.language);
@@ -1114,6 +1179,20 @@ pub fn scan_pc(root: &Path) -> Result<ScanReport, ScanError> {
             "empty (0-byte) files present: the edition guess rests on file names alone".to_string(),
         );
     }
+    refused_links.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    refused_links.dedup();
+    if !refused_links.is_empty() {
+        warnings.push(format!(
+            "{} file(s) that would have been imported are symbolic links that lead outside the scanned directory and were left out: {}. Links that stay inside the directory are followed; for these, scan the directory that really holds the files, or copy them into the install.",
+            refused_links.len(),
+            refused_links
+                .iter()
+                .take(8)
+                .map(|l| l.relative_path.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
     if language_defaulted {
         warnings.push(format!(
             "{LANGUAGE_DEFAULT_PREFIX} \"en\": this install holds several languages ({}) and none was chosen; pass --language <code> to import another one (every language is a set of its own)",
@@ -1189,6 +1268,7 @@ pub fn scan_pc(root: &Path) -> Result<ScanReport, ScanError> {
         would_import_bytes,
         default_import_bytes: 0,
         warnings,
+        refused_links,
         notes,
         steam_install_root: steam_edition.map(|s| s.install),
     };
