@@ -4,6 +4,7 @@
 //! reported cleanly before any network traffic. Every start-up failure (window, GPU) becomes an
 //! error message and a non-zero exit code, never a panic.
 
+use crate::avatar::{AvatarPlayer, Avatars, Stage, Who};
 use crate::backdrop::FieldView;
 use crate::battle::{battle_vertices, draw_battle_text, BattleCmd};
 use crate::cli::exit;
@@ -14,7 +15,7 @@ use crate::session::{Session, SessionInfo};
 use crate::state::ClientState;
 use crate::ui::draw::DrawList;
 use crate::ui::hud;
-use fmv_core::GameId;
+use fmv_core::{AnimState, GameId, Pos};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
@@ -203,19 +204,29 @@ pub struct Input {
     down: bool,
     left: bool,
     right: bool,
+    /// The two Shift keys (left, right): either one means walk instead of run.
+    shift: [bool; 2],
 }
 
 impl Input {
-    /// Record a key change; returns false for keys that are not movement keys.
+    /// Record a key change; returns false for keys that are not movement keys (Shift counts: it
+    /// changes how fast the movement keys move).
     pub fn set(&mut self, code: KeyCode, pressed: bool) -> bool {
         match code {
             KeyCode::KeyW | KeyCode::ArrowUp => self.up = pressed,
             KeyCode::KeyS | KeyCode::ArrowDown => self.down = pressed,
             KeyCode::KeyA | KeyCode::ArrowLeft => self.left = pressed,
             KeyCode::KeyD | KeyCode::ArrowRight => self.right = pressed,
+            KeyCode::ShiftLeft => self.shift[0] = pressed,
+            KeyCode::ShiftRight => self.shift[1] = pressed,
             _ => return false,
         }
         true
+    }
+
+    /// Is Shift held (walk instead of run)?
+    pub fn walking(&self) -> bool {
+        self.shift.iter().any(|&held| held)
     }
 
     /// Movement direction in area axes (+x right, +y up); opposite keys cancel.
@@ -232,6 +243,18 @@ fn describe_request(cmd: PartyCommand) -> String {
         PartyCommand::Accept(invite) => format!("accepting {invite}"),
         PartyCommand::Leave => "leaving the party".to_string(),
         other => format!("{other:?}"),
+    }
+}
+
+/// How fast the local player moves and which animation it announces, for the keys held: in an FF7
+/// field (a [`Stage`]) it runs at the field's run speed, or walks at its walk speed while Shift is
+/// held, never beyond the server's cap `max_speed`; anywhere else it keeps the old single pace
+/// (`WALK_SPEED_FACTOR` of the cap, announced as walking).
+pub fn movement_pace(stage: Option<&Stage>, walking: bool, max_speed: f32) -> (f32, AnimState) {
+    match stage {
+        Some(stage) if walking => (stage.walk_speed.min(max_speed), AnimState::Walk),
+        Some(stage) => (stage.run_speed.min(max_speed), AnimState::Run),
+        None => (WALK_SPEED_FACTOR * max_speed, AnimState::Walk),
     }
 }
 
@@ -252,12 +275,24 @@ pub(crate) struct App {
     last_title_battle: String,
     left: bool,
     failure: Option<String>,
+    /// The players' character models (FF7 fields with this machine's own `char.lgp` only).
+    avatars: Option<Avatars>,
+    /// F1: draw the walkmesh over the picture (a debugging aid, off by default).
+    show_walkmesh: bool,
+    /// Session time of the previous frame (for animation).
+    last_draw_t: f64,
 }
 
 impl App {
     pub(crate) fn new(session: Session, view: FieldView) -> Self {
         let base_title = base_title(&session.info);
         let now = Instant::now();
+        // Models only for real FF7 fields that have the camera data and this machine's archive.
+        let mut avatars = if view.stage.is_some() && !session.info.fixture { Avatars::from_local_content() } else { None };
+        if let Some(avatars) = avatars.as_mut() {
+            // The first frame should not wait for the archive.
+            avatars.preload(session.state.own_appearance());
+        }
         Self {
             session,
             view,
@@ -271,6 +306,9 @@ impl App {
             last_title_battle: String::new(),
             left: false,
             failure: None,
+            avatars,
+            show_walkmesh: false,
+            last_draw_t: 0.0,
         }
     }
 
@@ -405,7 +443,7 @@ impl App {
             self.update_title();
             return;
         }
-        let speed = WALK_SPEED_FACTOR * self.session.area.max_speed();
+        let (speed, moving) = movement_pace(self.view.stage.as_ref(), self.input.walking(), self.session.area.max_speed());
         // The keys mean directions on the SCREEN; the area is walked in its own axes.
         let keys = self.input.dir();
         let dir = if keys == (0.0, 0.0) {
@@ -418,7 +456,7 @@ impl App {
         self.session
             .state
             .own
-            .walk(self.session.area.as_ref(), dir, speed, dt);
+            .walk_as(self.session.area.as_ref(), dir, speed, dt, moving);
         self.session.flush_intent();
         self.update_title();
     }
@@ -426,6 +464,9 @@ impl App {
     fn redraw(&mut self, el: &ActiveEventLoop) {
         let Some(renderer) = self.renderer.as_mut() else { return };
         let now = self.session.now();
+        let render_t = render_time(now);
+        let dt = (now - self.last_draw_t).clamp(0.0, f64::from(MAX_DT)) as f32;
+        self.last_draw_t = now;
         // In a battle the whole window is the battle view: flat rectangles with the UI font's text
         // (names, HP, whose turn) over them.
         if let Some(battle) = self.session.state.battle.view(now) {
@@ -444,42 +485,68 @@ impl App {
         // Players are placed through the view; one that cannot be drawn (behind the camera) is
         // simply not shown this frame.
         let view = &self.view;
-        let mut players: Vec<PlayerSprite> = self
-            .session
-            .state
-            .remote_views(render_time(now))
+        let state = &self.session.state;
+
+        // Everyone who is drawn: the remote players, then the local one last. A player that cannot
+        // be placed (behind the camera) is simply not shown this frame.
+        let remotes = state.remote_views(render_t);
+        let mut players: Vec<AvatarPlayer<'_>> = remotes
             .iter()
-            .filter_map(|v| {
-                view.to_view(v.pose.pos).map(|p| PlayerSprite {
-                    x: p.x,
-                    y: p.y,
-                    tint: v.tint,
-                    own: false,
-                    party: self.session.state.party.is_party_entity(v.id),
-                })
+            .map(|v| AvatarPlayer {
+                who: Who(v.id.0),
+                pos: v.pose.pos,
+                facing: v.pose.facing,
+                anim: v.pose.anim,
+                appearance: v.appearance.as_deref(),
+                tint: v.tint,
+                own: false,
+                party: state.party.is_party_entity(v.id),
             })
             .collect();
-        if let Some(p) = view.to_view(self.session.state.own.pos()) {
-            players.push(PlayerSprite {
-                x: p.x,
-                y: p.y,
-                tint: self.session.info.tint,
-                own: true,
-                party: self.session.state.party.party_size() > 0,
-            });
-        }
+        let own_who = Who(state.self_entity().0);
+        players.push(AvatarPlayer {
+            who: own_who,
+            pos: state.own.pos(),
+            facing: state.own.facing(),
+            anim: state.own.anim(),
+            appearance: state.own_appearance(),
+            tint: self.session.info.tint,
+            own: true,
+            party: state.party.party_size() > 0,
+        });
+
+        // Models where the character is available, markers for everyone else.
+        let built = match (self.avatars.as_mut(), view.stage.as_ref()) {
+            (Some(avatars), Some(stage)) => Some(avatars.frame(view, stage, &players, dt)),
+            _ => None,
+        };
+        let markers: Vec<PlayerSprite> = players
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| built.as_ref().is_none_or(|b| b.markers.contains(i)))
+            .filter_map(|(_, p)| marker(view, p))
+            .collect();
+
+        // The walkmesh is the scenery of an area without a picture; over a picture it is a
+        // debugging aid, shown on request (F1).
+        let walkmesh = view.backdrop.is_none() || self.show_walkmesh;
         let scene = Scene {
             bounds: view.bounds,
-            triangles: &view.triangles,
-            players: &players,
+            triangles: if walkmesh { &view.triangles } else { &[] },
+            players: &markers,
             fixture_banner: self.session.info.fixture,
             backdrop: view.backdrop.as_ref(),
         };
-        // Names, party, area, connection (and the FIXTURE label) over the scene.
+        // Names, party, area, connection (and the FIXTURE label) over the scene; a name stays over
+        // the head of a model instead of over the marker's centre.
         let (vw, vh) = renderer.size();
         let mut overlay = DrawList::new();
-        hud::draw_hud(&hud::gather(&self.session, view), vw, vh, &mut overlay);
-        let result = renderer.render_with(&scene, Some(&overlay));
+        let anchor = |id: Option<fmv_core::EntityId>, at: Pos| -> Option<Pos> {
+            let who = id.map_or(own_who, |id| Who(id.0));
+            built.as_ref().and_then(|b| b.anchors.get(&who).copied()).or_else(|| view.to_view(at))
+        };
+        hud::draw_hud(&hud::gather_anchored(state, &self.session.info, view, render_t, &anchor), vw, vh, &mut overlay);
+        let result = renderer.render_layers(&scene, built.as_ref().map(|b| &b.frame), Some(&overlay));
         let gpu_error = renderer.first_gpu_error();
         match (result, gpu_error) {
             (FrameResult::Fatal(msg), _) => self.fail(el, msg),
@@ -487,6 +554,12 @@ impl App {
             _ => {}
         }
     }
+}
+
+/// The marker of a player: where its feet are in view space, in its tint. `None` if it cannot be
+/// drawn (behind the camera).
+fn marker(view: &FieldView, player: &AvatarPlayer<'_>) -> Option<PlayerSprite> {
+    view.to_view(player.pos).map(|p| PlayerSprite { x: p.x, y: p.y, tint: player.tint, own: player.own, party: player.party })
 }
 
 impl ApplicationHandler for App {
@@ -532,6 +605,10 @@ impl ApplicationHandler for App {
                 if code == KeyCode::Escape {
                     if pressed {
                         self.quit(el);
+                    }
+                } else if code == KeyCode::F1 {
+                    if pressed && !repeat {
+                        self.show_walkmesh = !self.show_walkmesh;
                     }
                 } else if let Some(key) = PartyKey::from_event(code, pressed, repeat) {
                     self.party_key(key);
@@ -638,6 +715,48 @@ mod tests {
         // Losing focus resets everything.
         i = Input::default();
         assert_eq!(i.dir(), (0.0, 0.0));
+    }
+
+    /// Shift (either one) means walk instead of run; it is not a direction, and losing focus (which
+    /// resets the whole input) lets go of it.
+    #[test]
+    fn shift_is_tracked_as_walking_and_focus_loss_lets_go_of_it() {
+        let mut i = Input::default();
+        assert!(!i.walking(), "running is the default");
+        assert!(i.set(KeyCode::ShiftLeft, true));
+        assert!(i.walking());
+        assert_eq!(i.dir(), (0.0, 0.0), "Shift alone is no movement");
+        assert!(i.set(KeyCode::ShiftRight, true) && i.set(KeyCode::ShiftLeft, false));
+        assert!(i.walking(), "the right Shift is still held");
+        assert!(i.set(KeyCode::ShiftRight, false));
+        assert!(!i.walking());
+        // Shift and a direction are independent.
+        i.set(KeyCode::KeyW, true);
+        i.set(KeyCode::ShiftLeft, true);
+        assert_eq!((i.dir(), i.walking()), ((0.0, 1.0), true));
+        // What a lost focus does: back to the default, nothing held.
+        i = Input::default();
+        assert_eq!((i.dir(), i.walking()), ((0.0, 0.0), false));
+    }
+
+    /// In an FF7 field the local player runs at the field's run speed, walks at its walk speed
+    /// with Shift, never faster than the server allows; anywhere else the old single pace.
+    #[test]
+    fn the_local_player_runs_by_default_and_walks_with_shift_within_the_servers_cap() {
+        let stage = crate::avatar::frame::tests::stage(); // walk 60, run 240
+        assert_eq!(movement_pace(Some(&stage), false, 600.0), (240.0, AnimState::Run));
+        assert_eq!(movement_pace(Some(&stage), true, 600.0), (60.0, AnimState::Walk));
+        // The server's cap wins over both paces.
+        assert_eq!(movement_pace(Some(&stage), false, 100.0), (100.0, AnimState::Run));
+        assert_eq!(movement_pace(Some(&stage), true, 40.0), (40.0, AnimState::Walk));
+        // Walking is slower than running, and both are within the cap for the field's own numbers.
+        let (run, _) = movement_pace(Some(&stage), false, 600.0);
+        let (walk, _) = movement_pace(Some(&stage), true, 600.0);
+        assert!(walk < run && run <= 600.0);
+        // No stage (a fixture, or a field seen from above): 0.8 of the cap, announced as walking,
+        // Shift or not: exactly what the window did before.
+        assert_eq!(movement_pace(None, false, 500.0), (400.0, AnimState::Walk));
+        assert_eq!(movement_pace(None, true, 500.0), (400.0, AnimState::Walk));
     }
 
     #[test]

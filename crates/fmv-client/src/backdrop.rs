@@ -15,11 +15,14 @@
 //! decoded from this machine's own copy of the game and only ever go to this machine's GPU:
 //! nothing here is sent anywhere.
 
+use crate::avatar::stage::{Stage, StageCamera};
 use fmv_adapter_api::{AreaRuntime, Bounds};
 use fmv_core::Pos;
-use fmv_ff7::background::{decode_background, BackgroundImage, Projection};
-use fmv_ff7::Ff7Adapter;
+use fmv_ff7::background::{decode_background, decode_background_layers, BackgroundImage, Projection};
+use fmv_ff7::field::FieldFile;
+use fmv_ff7::{default_model_scale, Ff7Adapter};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// Largest backdrop side accepted (pixels). A field background is a few hundred pixels wide; the
 /// cap only keeps a corrupt image from asking the GPU for an absurd texture.
@@ -82,6 +85,22 @@ impl Backdrop {
             [b.max_x as f32, -(b.min_y as f32)],
         )
     }
+
+    /// A decoded FF7 background layer set (the half in front of the characters, see
+    /// [`fmv_ff7::background::decode_background_layers`]) with its transparency kept, on the same
+    /// rectangle [`Backdrop::from_ff7`] gives the whole picture. Every pixel of such an image is
+    /// either untouched (all four bytes zero) or opaque, so the bytes are already premultiplied and
+    /// the renderer blends them as such.
+    pub fn from_ff7_layer(image: &BackgroundImage) -> Option<Self> {
+        let b = image.bounds();
+        Self::new(
+            image.width,
+            image.height,
+            image.rgba.clone(),
+            [b.min_x as f32, -(b.max_y as f32)],
+            [b.max_x as f32, -(b.min_y as f32)],
+        )
+    }
 }
 
 /// World -> view mapping. `None` means "cannot be drawn" (behind the camera, not finite).
@@ -99,6 +118,10 @@ pub struct FieldView {
     pub backdrop: Option<Backdrop>,
     /// One line for the log: how the view was built.
     pub description: String,
+    /// FF7 fields only: what drawing the players as the game's character models, and pacing them,
+    /// needs (the camera, the model scale, the speeds, the scenery in front). `None` for
+    /// everything else, which keeps the plain markers.
+    pub stage: Option<Stage>,
 }
 
 impl std::fmt::Debug for FieldView {
@@ -108,6 +131,7 @@ impl std::fmt::Debug for FieldView {
             .field("bounds", &self.bounds)
             .field("backdrop", &self.backdrop)
             .field("description", &self.description)
+            .field("stage", &self.stage.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -152,6 +176,7 @@ impl FieldView {
             bounds: area.bounds(),
             backdrop: None,
             description: "top-down walkmesh view".to_string(),
+            stage: None,
         }
     }
 
@@ -174,7 +199,7 @@ impl FieldView {
             Some(b) => Bounds { min: Pos::new(b.min[0], b.min[1], 0.0), max: Pos::new(b.max[0], b.max[1], 0.0) },
             None => extent(&triangles).unwrap_or(fallback),
         };
-        Self { map: Box::new(map), triangles, bounds, backdrop, description: description.into() }
+        Self { map: Box::new(map), triangles, bounds, backdrop, description: description.into(), stage: None }
     }
 
     /// An FF7 field seen through its own camera, with its decoded background behind it.
@@ -183,6 +208,14 @@ impl FieldView {
     /// switch between them as the player walks, which this free-roam view does not do). Needs
     /// this machine's own copy of the game: `adapter` decodes the field again from it.
     pub fn ff7(adapter: &Ff7Adapter, key: &str) -> Result<Self, String> {
+        // The scenery in front of the characters is only worth decoding when this machine has the
+        // character archive to draw them from.
+        Self::ff7_with(adapter, key, crate::avatar::source::remembered().is_some())
+    }
+
+    /// [`FieldView::ff7`] with the choice of whether to prepare the scenery that goes in front of
+    /// the characters (`front`) made by the caller.
+    pub fn ff7_with(adapter: &Ff7Adapter, key: &str, front: bool) -> Result<Self, String> {
         let area = adapter.load_field(key).map_err(|e| format!("cannot load field {key} for rendering: {e}"))?;
         let cameras = area.cameras().map_err(|e| format!("field {key} has no readable camera: {e}"))?;
         let camera = cameras.first().ok_or_else(|| format!("field {key} has no camera"))?;
@@ -200,7 +233,7 @@ impl FieldView {
             Err(e) => (None, format!("background not decoded ({e})")),
         };
         let world = area.walk_triangles();
-        let view = Self::projected(
+        let mut view = Self::projected(
             &world,
             area.bounds(),
             map,
@@ -210,8 +243,61 @@ impl FieldView {
         if view.triangles.is_empty() {
             return Err(format!("no walkmesh triangle of field {key} is in front of its camera"));
         }
+        let (front, note) = if front {
+            front_layer(area.field_file(), view.backdrop.as_ref())
+        } else {
+            (None, "characters are drawn as markers".to_string())
+        };
+        view.description.push_str(&format!("; {note}"));
+        view.stage = Some(Stage {
+            camera: StageCamera::from_camera(camera),
+            model_scale: default_model_scale(area.field_scale()),
+            walk_speed: area.walk_speed(),
+            run_speed: area.run_speed(),
+            front,
+        });
         Ok(view)
     }
+}
+
+/// The scenery to draw over the characters: the front half of the field's background (layers 2
+/// and 4) on the picture's own rectangle, and a note for the log on what was decided. `None` when
+/// the characters are to be drawn over the whole picture instead (see [`choose_front`]) or the
+/// layers could not be decoded.
+fn front_layer(field: &FieldFile, picture: Option<&Backdrop>) -> (Option<Arc<Backdrop>>, String) {
+    let Some(picture) = picture else {
+        return (None, "no picture, so nothing goes in front of the characters".to_string());
+    };
+    match decode_background_layers(field) {
+        Ok(layers) => choose_front(&layers.front, picture),
+        Err(e) => (None, format!("background layers not decoded ({e}); characters over the whole picture")),
+    }
+}
+
+/// Decide whether the front half of a field's background (`front`, from
+/// `decode_background_layers`) goes over the characters drawn on `picture` (the whole picture):
+/// `None`, with the reason, when the front half has blended tiles (which a flat image cannot show
+/// correctly: the same test `fmv_ff7`'s `model_dump` uses), when it holds nothing, or when it does
+/// not share the picture's canvas, in which case the characters are drawn over the whole picture
+/// and nothing goes over them.
+// (`chunks_exact(4)` over RGBA bytes would be `as_chunks` on Rust 1.88+; the workspace keeps its MSRV
+// lower, see `fmv-ff7`'s `lgp` module.)
+#[allow(clippy::chunks_exact_to_as_chunks)]
+fn choose_front(front: &BackgroundImage, picture: &Backdrop) -> (Option<Arc<Backdrop>>, String) {
+    if front.layers.iter().any(|l| l.tiles_blended > 0) {
+        return (None, "front layers have blended tiles; characters over the whole picture".to_string());
+    }
+    let Some(front) = Backdrop::from_ff7_layer(front) else {
+        return (None, "front layer unusable; characters over the whole picture".to_string());
+    };
+    if (front.width, front.height, front.min, front.max) != (picture.width, picture.height, picture.min, picture.max) {
+        return (None, "front layer is not on the picture's canvas; characters over the whole picture".to_string());
+    }
+    let covered = front.rgba.chunks_exact(4).filter(|p| p.get(3).is_some_and(|&a| a != 0)).count();
+    if covered == 0 {
+        return (None, "nothing in front of the characters".to_string());
+    }
+    (Some(Arc::new(front)), format!("{covered} px of scenery in front of the characters"))
 }
 
 /// Smallest rectangle (view space) around every vertex, if there is any.
@@ -227,6 +313,7 @@ fn extent(triangles: &[[Pos; 3]]) -> Option<Bounds> {
 }
 
 #[cfg(test)]
+#[allow(clippy::chunks_exact_to_as_chunks)] // see `choose_front`
 mod tests {
     use super::*;
     use fmv_adapter_api::GameAdapter;
@@ -252,6 +339,86 @@ mod tests {
         let other = Backdrop::new(2, 3, px(2, 3), [-1.0, -2.0], [1.0, 2.0]).unwrap();
         assert_ne!(ok.id, other.id);
         assert!(!format!("{ok:?}").contains("rgba"), "Debug must not print pixels");
+    }
+
+    #[test]
+    fn a_background_layer_keeps_its_transparency_on_the_pictures_own_rectangle() {
+        use fmv_ff7::background::ScreenRect;
+        // 4 x 3 pixels whose pixel (0, 0) is field-screen (-2, -1); one opaque pixel, the rest untouched.
+        let mut rgba = vec![0u8; 4 * 3 * 4];
+        rgba[(4 + 1) * 4..(4 + 1) * 4 + 4].copy_from_slice(&[10, 20, 30, 255]);
+        let image = BackgroundImage {
+            width: 4,
+            height: 3,
+            rgba,
+            origin_x: 2,
+            origin_y: 1,
+            view_bounds: ScreenRect { min_x: -2, min_y: -1, max_x: 2, max_y: 2 },
+            layers: vec![],
+        };
+        let picture = Backdrop::from_ff7(&image).expect("picture");
+        let layer = Backdrop::from_ff7_layer(&image).expect("layer");
+        // The same rectangle (view space has y up, field-screen y down), so the two line up exactly.
+        assert_eq!((layer.width, layer.height, layer.min, layer.max), (picture.width, picture.height, picture.min, picture.max));
+        assert_eq!((layer.min, layer.max), ([-2.0, -2.0], [2.0, 1.0]));
+        // The picture is shown over black (opaque everywhere); the layer keeps its holes.
+        assert!(picture.rgba.chunks_exact(4).all(|p| p[3] == 255));
+        assert_eq!(layer.rgba.chunks_exact(4).filter(|p| p[3] == 255).count(), 1);
+        assert_eq!(layer.rgba.chunks_exact(4).filter(|p| **p == [0, 0, 0, 0]).count(), 11);
+        assert_ne!(picture.id, layer.id);
+    }
+
+    fn layer_image(width: u32, height: u32, opaque_pixels: usize, blended_tiles: usize) -> BackgroundImage {
+        use fmv_ff7::background::{LayerInfo, ScreenRect};
+        let mut rgba = vec![0u8; (width * height * 4) as usize];
+        for px in rgba.chunks_exact_mut(4).take(opaque_pixels) {
+            px.copy_from_slice(&[1, 2, 3, 255]);
+        }
+        let layer = |layer: u8, tiles_blended: usize| LayerInfo {
+            layer,
+            tile_size: 16,
+            header_width: 0,
+            header_height: 0,
+            tiles_total: 1,
+            tiles_drawn: 1,
+            tiles_blended,
+            tiles_hidden: 0,
+            tiles_unrenderable: 0,
+            bounds: None,
+            groups: vec![],
+        };
+        BackgroundImage {
+            width,
+            height,
+            rgba,
+            origin_x: 0,
+            origin_y: 0,
+            view_bounds: ScreenRect { min_x: 0, min_y: 0, max_x: width as i32, max_y: height as i32 },
+            layers: vec![layer(2, blended_tiles), layer(4, 0)],
+        }
+    }
+
+    /// The decision about the scenery in front of the characters: it goes over them only when a flat
+    /// image can show it correctly (no blended tiles), it holds something and it is on the picture's
+    /// canvas; every other case draws the characters over the whole picture, with the reason.
+    #[test]
+    fn the_scenery_in_front_goes_over_the_characters_only_when_a_flat_image_can_show_it() {
+        let picture = Backdrop::from_ff7(&layer_image(8, 6, 0, 0)).expect("picture");
+        // Something opaque, nothing blended, same canvas: it is used.
+        let (front, note) = choose_front(&layer_image(8, 6, 5, 0), &picture);
+        let front = front.expect(&note);
+        assert_eq!((front.width, front.height, front.min, front.max), (8, 6, picture.min, picture.max));
+        assert!(note.contains("5 px"), "{note}");
+        // Blended tiles in front (shadows, glows): the characters go over the whole picture.
+        let (front, note) = choose_front(&layer_image(8, 6, 5, 1), &picture);
+        assert!(front.is_none() && note.contains("blended"), "{note}");
+        // Nothing in front at all.
+        let (front, note) = choose_front(&layer_image(8, 6, 0, 0), &picture);
+        assert!(front.is_none() && note.contains("nothing"), "{note}");
+        // Not the picture's canvas (cannot happen with the crate's decoder, but never drawn
+        // misaligned).
+        let (front, note) = choose_front(&layer_image(9, 6, 5, 0), &picture);
+        assert!(front.is_none() && note.contains("canvas"), "{note}");
     }
 
     #[test]

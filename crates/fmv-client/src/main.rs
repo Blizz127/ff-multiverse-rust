@@ -15,6 +15,7 @@
 //! moment it arrives (see `net` and `accounts`).
 
 mod accounts;
+mod avatar;
 mod backdrop;
 mod battle;
 mod bot;

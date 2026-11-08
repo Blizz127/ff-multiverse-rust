@@ -100,8 +100,9 @@ fmv-client --game ff7 --name Tifa                                          # ter
 `.../steamapps/common/FINAL FANTASY VII Steam Edition/ff7/workingdir`.) The server hosts
 `md1stin` from the library `import-pc` wrote under `~/.local/share/ff-multiverse` and keeps its
 accounts next to it; each client reads the same library and saves its login token next to it. In
-the window, **WASD** walks, **P** invites the nearest player, **Y** accepts an invite, **L**
-leaves the party. A missing display, GPU or server is reported with one clear line.
+the window, **WASD** runs (hold **Shift** to walk), **P** invites the nearest player, **Y**
+accepts an invite, **L** leaves the party. A missing display, GPU or server is reported with one
+clear line.
 
 Without `--name` the window opens on the **character menu** instead (see "Window mode"): pick a
 saved character, or press **N** to create one: `fmv-client --game ff7`.
@@ -224,8 +225,8 @@ this computer (it asks first, and the default answer keeps it: the character sta
 server, but its token, shown only once at registration, cannot be recovered), **Esc** quits.
 With nothing saved yet it opens on the create screen: a **name** (up to 24 characters, cleaned
 exactly as the server cleans it), a **look** (FF7: Cloud, Tifa, Barret or Aerith; the ids
-`ff7/cloud`, `ff7/tifa`, `ff7/barret`, `ff7/aerith` are stored in the avatar profile and a model
-decoded from your own copy will show them later), and a **tint** (a palette grid plus red, green
+`ff7/cloud`, `ff7/tifa`, `ff7/barret`, `ff7/aerith` are stored in the avatar profile and the game
+draws the matching field model from your own copy, see "In the game"), and a **tint** (a palette grid plus red, green
 and blue sliders; until you pick one it is the colour the command line would derive from the
 name). **Tab** or **Up/Down** move between the fields, **Left/Right** change a value, **Enter**
 registers. If the server refuses (name taken, registration closed, rate limited) the reason is
@@ -235,13 +236,30 @@ token is saved before anything else can fail. `--name` skips the menu (the old b
 machine last saw (the server keeps the real profile and sends it on join), so a login that has
 not joined from this machine yet says "look unknown".
 
-*In the game.* WASD or the arrow keys walk (up walks up the screen, whatever the camera looks
-like), **P** invites the nearest player to your party, **Y** accepts the pending invite, **L**
-leaves the party, Esc quits. Party members get a gold ring around their marker. The window now
-also shows player names over their markers, your party (leader starred) in the top right, the
-area name (`FF7 md1stin`), the connection status (players, round-trip time) and a pending invite;
-a FIXTURE area wears the label `FIXTURE (synthetic, not FF7)`. The window title still shows your
-party size and a pending invite.
+*In the game.* WASD or the arrow keys move (up goes up the screen, whatever the camera looks
+like); in an FF7 field you run, and walk while **Shift** is held (at the field's run and walk
+speeds: hypotheses used for pacing only, the server's own cap is unchanged). **P** invites the
+nearest player to your party, **Y** accepts the pending invite, **L** leaves the party, Esc
+quits, **F1** shows or hides the walkmesh over the picture (hidden by default). The window shows
+player names (over the head of a model, or the marker), your party (leader starred) in the top
+right, the area name (`FF7 md1stin`), the connection status (players, round-trip time) and a
+pending invite; a FIXTURE area wears the label `FIXTURE (synthetic, not FF7)`. The window title
+still shows your party size and a pending invite.
+
+*Characters.* In an FF7 field every player, you included, is drawn as the field model of the
+look they chose (`ff7/cloud`, `ff7/tifa`, ... `ff7/vincent`), standing on the walkmesh at their
+position and facing the way they face, with the idle, walk or run animation of what they are
+doing. The models are read from **your own copy** of the game's `char.lgp` (found in the same
+library set, or next to a `--ff7-flevel` file) and are never sent over the network: the wire
+carries only the look's id. A look this table does not know is drawn as Cloud; every player gets
+a ring on the ground in their tint (yours has a white outline, a party member's a gold ring
+around it). Without a `char.lgp`, in a FIXTURE area, or for a character that fails to load, the
+plain markers are drawn as before. The scenery in front of the characters (background layers 2
+and 4) is drawn over them, but as **one flat picture**: the game sorts each object against each
+character by depth and this does not, so a character standing in front of an object that is
+farther away can be covered by it (in `md1stin` the front layer overlaps a character's outline
+box at 59 of 73 sampled walkable places, most of them because of the far left wall; see
+`crates/fmv-client/src/avatar/mod.rs`); sorting objects against characters is the next step.
 
 *In a battle.* **B** asks the server for a debug battle (refused unless it runs with
 `--debug-encounters`; random encounters start battles by themselves in a field that has an

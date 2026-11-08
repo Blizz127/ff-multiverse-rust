@@ -175,6 +175,73 @@ fn flevel_logical_path(m: &Manifest) -> Option<String> {
     }
 }
 
+/// The logical path of the set's field *character* archive (`field/char.lgp`, the models and
+/// animations of the playable characters), found by the same rule as [`flevel_logical_path`].
+fn char_logical_path(m: &Manifest) -> Option<String> {
+    let language = m.provenance.language.to_ascii_lowercase();
+    let preferred = [
+        format!("data/lang-{language}/field/char.lgp"),
+        "data/field/char.lgp".to_string(),
+    ];
+    if let Some(path) = preferred.into_iter().find(|p| m.find(p).is_some()) {
+        return Some(path);
+    }
+    let mut any = m
+        .entries
+        .iter()
+        .filter(|e| e.logical_path.rsplit('/').next() == Some("char.lgp"));
+    match (any.next(), any.next()) {
+        (Some(only), None) => Some(only.logical_path.clone()),
+        _ => None,
+    }
+}
+
+/// Find the field character archive (`char.lgp`) that belongs with the field archive
+/// [`resolve_flevel`] finds for `source`, read-only; `Ok(None)` when there is none.
+///
+/// A client draws the players as the models in that archive and falls back to plain markers
+/// without it, so a missing archive is not an error. A library set is chosen by exactly the rules
+/// of [`resolve_library_flevel`] (call it with the same `source`, and both read the same set; a
+/// wrong or ambiguous set is the same error). A direct `flevel.lgp` has the archive only when a
+/// file named `char.lgp` (any case) sits in the same directory, as in an install's `field/`
+/// folder; a library blob has no siblings and so no archive. The archive is never sent over the
+/// network: it is decoded on this machine only.
+pub fn resolve_char_lgp(source: &Ff7Source) -> Result<Option<PathBuf>, Ff7ResolveError> {
+    match source {
+        Ff7Source::Library { state_dir, set } => {
+            let dir = resolve_state_dir(state_dir.as_deref())?;
+            let lib = Library::open_existing(&dir).map_err(|e| match e {
+                LibraryError::NoLibrary(_) => Ff7ResolveError::NoLibrary {
+                    dir: dir.display().to_string(),
+                },
+                other => Ff7ResolveError::Library(other),
+            })?;
+            let (set_id, manifest) = pick_set(&lib, set.as_deref())?;
+            match char_logical_path(&manifest) {
+                Some(logical) => Ok(lib.get(&set_id, &logical)?),
+                None => Ok(None),
+            }
+        }
+        Ff7Source::Flevel { path, .. } => {
+            let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
+                return Ok(None);
+            };
+            let Ok(entries) = std::fs::read_dir(parent) else {
+                return Ok(None);
+            };
+            let mut found: Vec<PathBuf> = entries
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().eq_ignore_ascii_case("char.lgp"))
+                .map(|e| e.path())
+                .filter(|p| p.is_file())
+                .collect();
+            // Several spellings next to each other: pick the same one every time.
+            found.sort();
+            Ok(found.into_iter().next())
+        }
+    }
+}
+
 /// Find the `flevel.lgp` of an imported library set and its provenance. `state_dir` of `None`
 /// is the default state directory; `set` of `None` is the only FF7 PC set. Opens the library
 /// read-only (nothing is created or written).
@@ -419,6 +486,95 @@ mod tests {
             let r = resolve_flevel(&lib_source(state.path(), None)).unwrap();
             assert_eq!(fs::read(&r.path).unwrap(), body, "{logical}");
         }
+    }
+
+    #[test]
+    fn the_character_archive_comes_from_the_same_set_by_the_same_layout_rules() {
+        let scratch = tempfile::tempdir().unwrap();
+        // The Steam language directory wins over the classic layout, as for the field archive.
+        let state = tempfile::tempdir().unwrap();
+        let lib = Library::open(state.path()).unwrap();
+        make_set(
+            &lib,
+            provenance("Steam", "en"),
+            &[
+                ("data/field/flevel.lgp", b"field"),
+                ("data/field/char.lgp", b"classic-char"),
+                ("data/lang-en/field/char.lgp", b"steam-char"),
+            ],
+            scratch.path(),
+        );
+        let found = resolve_char_lgp(&lib_source(state.path(), None)).unwrap().expect("a char.lgp");
+        assert_eq!(fs::read(found).unwrap(), b"steam-char");
+
+        // The classic layout, and a lone char.lgp anywhere else, are found too.
+        for (logical, body) in [("data/field/char.lgp", &b"classic"[..]), ("data/odd/place/char.lgp", &b"odd"[..])] {
+            let state = tempfile::tempdir().unwrap();
+            let lib = Library::open(state.path()).unwrap();
+            make_set(&lib, provenance("PC 1998", "en"), &[("data/field/flevel.lgp", b"f"), (logical, body)], scratch.path());
+            let found = resolve_char_lgp(&lib_source(state.path(), None)).unwrap().expect("a char.lgp");
+            assert_eq!(fs::read(found).unwrap(), body, "{logical}");
+        }
+
+        // Two of them and no preferred place: never guessed, so no archive (markers, not a guess).
+        let state = tempfile::tempdir().unwrap();
+        let lib = Library::open(state.path()).unwrap();
+        make_set(
+            &lib,
+            provenance("PC 1998", "en"),
+            &[("data/field/flevel.lgp", b"f"), ("data/a/char.lgp", b"a"), ("data/b/char.lgp", b"b")],
+            scratch.path(),
+        );
+        assert_eq!(resolve_char_lgp(&lib_source(state.path(), None)).unwrap(), None);
+    }
+
+    #[test]
+    fn a_set_without_character_models_has_none_and_set_errors_are_the_field_archives() {
+        let scratch = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let lib = Library::open(state.path()).unwrap();
+        let id = make_set(&lib, provenance("Steam", "en"), &[("data/field/flevel.lgp", b"field")], scratch.path());
+        // Not an error: the client then shows markers.
+        assert_eq!(resolve_char_lgp(&lib_source(state.path(), None)).unwrap(), None);
+        assert_eq!(resolve_char_lgp(&lib_source(state.path(), Some(&id))).unwrap(), None);
+
+        // The same set choice as `resolve_flevel`: several sets need an explicit id, naming a set
+        // picks it, and the char.lgp is that set's own.
+        let other = make_set(
+            &lib,
+            provenance("PC 1998", "en"),
+            &[("data/field/flevel.lgp", b"f2"), ("data/field/char.lgp", b"other-char")],
+            scratch.path(),
+        );
+        let err = resolve_char_lgp(&lib_source(state.path(), None)).unwrap_err();
+        assert!(matches!(err, Ff7ResolveError::AmbiguousSet(_)), "{err}");
+        let found = resolve_char_lgp(&lib_source(state.path(), Some(&other))).unwrap().expect("char.lgp");
+        assert_eq!(fs::read(found).unwrap(), b"other-char");
+        assert_eq!(resolve_char_lgp(&lib_source(state.path(), Some(&id))).unwrap(), None);
+
+        // No library at all: the same pointer at fmv-import, and nothing is created.
+        let empty = tempfile::tempdir().unwrap();
+        let err = resolve_char_lgp(&lib_source(empty.path(), None)).unwrap_err();
+        assert!(matches!(err, Ff7ResolveError::NoLibrary { .. }), "{err}");
+        assert!(fs::read_dir(empty.path()).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn a_direct_flevel_has_a_character_archive_only_beside_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let flevel = dir.path().join("flevel.lgp");
+        fs::write(&flevel, b"field").unwrap();
+        let source = |path: &Path| Ff7Source::Flevel { path: path.to_path_buf(), labels: Ff7Labels::default() };
+        assert_eq!(resolve_char_lgp(&source(&flevel)).unwrap(), None, "nothing beside it");
+        // Any case of the name counts (installs differ), a directory of that name does not.
+        fs::create_dir(dir.path().join("char.lgp")).unwrap();
+        assert_eq!(resolve_char_lgp(&source(&flevel)).unwrap(), None);
+        fs::write(dir.path().join("CHAR.LGP"), b"models").unwrap();
+        let found = resolve_char_lgp(&source(&flevel)).unwrap().expect("sibling");
+        assert_eq!(fs::read(found).unwrap(), b"models");
+        // A path without a directory, or one that is not there: no archive, no error.
+        assert_eq!(resolve_char_lgp(&source(Path::new("flevel.lgp"))).unwrap(), None);
+        assert_eq!(resolve_char_lgp(&source(Path::new("/definitely/not/here/flevel.lgp"))).unwrap(), None);
     }
 
     #[test]
