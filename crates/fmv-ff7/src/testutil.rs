@@ -133,6 +133,8 @@ pub(crate) struct FieldSpec {
     pub truncate_background_bytes: usize,
     /// Extra bytes appended to the script section (arbitrary content).
     pub script_len: usize,
+    /// Field scale stored in the model-loader header (512 = 1.0).
+    pub model_scale: u16,
 }
 
 impl Default for FieldSpec {
@@ -180,6 +182,7 @@ impl Default for FieldSpec {
             bad_texture_depth: false,
             truncate_background_bytes: 0,
             script_len: 32,
+            model_scale: 512,
         }
     }
 }
@@ -195,7 +198,7 @@ impl FieldSpec {
         let sections: [Vec<u8>; 9] = [
             (0..self.script_len).map(|i| (i * 3 + 1) as u8).collect(), // script: arbitrary
             self.camera_section(),
-            vec![0, 0, 0, 0, 0x10, 0x00], // model loader: always-zero, 0 models, scale
+            self.model_loader_section(), // model loader: always-zero, 0 models, scale
             self.palette_section(),
             self.walkmesh_section(),
             vec![0xEE; 8], // tilemap (unused on PC)
@@ -216,6 +219,12 @@ impl FieldSpec {
             out.extend_from_slice(&(s.len() as u32).to_le_bytes());
             out.extend_from_slice(s);
         }
+        out
+    }
+
+    fn model_loader_section(&self) -> Vec<u8> {
+        let mut out = vec![0, 0, 0, 0];
+        out.extend_from_slice(&self.model_scale.to_le_bytes());
         out
     }
 

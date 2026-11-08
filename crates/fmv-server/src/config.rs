@@ -1,9 +1,11 @@
 //! Server configuration and its validation.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use fmv_fixture::FIXTURE_AREA_KEY;
+use fmv_party::PartyConfig;
 use fmv_protocol::DEFAULT_DEV_PORT;
 
 /// Highest accepted tick rate (`--tick-hz`).
@@ -21,6 +23,12 @@ pub const MAX_CONNECTIONS_LIMIT: usize = 256;
 /// Bounds for `ServerConfig::outbound_queue` (messages per connection).
 pub const MIN_OUTBOUND_QUEUE: usize = 8;
 pub const MAX_OUTBOUND_QUEUE: usize = 65_536;
+
+/// Highest accepted `ServerConfig::registrations_per_minute`.
+pub const MAX_REGISTRATIONS_PER_MINUTE: u32 = 10_000;
+
+/// Default for `ServerConfig::registrations_per_minute`.
+pub const DEFAULT_REGISTRATIONS_PER_MINUTE: u32 = 120;
 
 /// Default for `ServerConfig::idle_timeout`.
 ///
@@ -73,7 +81,30 @@ pub struct ServerConfig {
     pub outbound_queue: usize,
     /// On shutdown, how long to wait for clients to flush their farewell and close.
     pub shutdown_grace: Duration,
+    /// Directory of the account store (`fmv_persist::Store`: accounts, avatar profiles,
+    /// progression), which the server opens for its whole life and holds locked (a second server
+    /// on the same directory is refused). `None` gives the server a private temporary directory
+    /// that is deleted when it stops: accounts then last only as long as the process (tests, a
+    /// quick local run). The binary always passes a real directory unless `--ephemeral` is used.
+    pub state_dir: Option<PathBuf>,
+    /// Whether `Auth::Register` creates accounts. When false only tokens already issued work.
+    pub allow_registration: bool,
+    /// Accounts the whole server creates per minute at most (a sliding window over all
+    /// connections), so a flood of connections cannot fill the store with accounts.
+    pub registrations_per_minute: u32,
+    /// Party rules. The party clock is milliseconds of server monotonic time, so
+    /// `party.invite_ttl()` is in milliseconds; the default is 3 members and 60 s.
+    pub party: PartyConfig,
+    /// Identity of the game adapter, appended to the build string as `<version>+<suffix>`
+    /// (`Welcome::server_build` and the READY line). A real-game adapter names itself here so that
+    /// two servers with different content-fingerprint rules are told apart by their build instead
+    /// of being mistaken for two players with different media. One token: see
+    /// [`ServerConfig::validate`]. `None` (the FIXTURE default) leaves the build string unchanged.
+    pub build_suffix: Option<String>,
 }
+
+/// Longest accepted `ServerConfig::build_suffix` (bytes).
+pub const MAX_BUILD_SUFFIX: usize = 96;
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -90,6 +121,11 @@ impl Default for ServerConfig {
             max_msgs_per_sec: 120,
             outbound_queue: 256,
             shutdown_grace: Duration::from_secs(5),
+            state_dir: None,
+            allow_registration: true,
+            registrations_per_minute: DEFAULT_REGISTRATIONS_PER_MINUTE,
+            party: PartyConfig::default(),
+            build_suffix: None,
         }
     }
 }
@@ -134,7 +170,31 @@ impl ServerConfig {
         if self.keepalive.is_some_and(|d| d < Duration::from_secs(1)) {
             return bad("keepalive must be at least one second (use None to disable)".into());
         }
+        if !(1..=MAX_REGISTRATIONS_PER_MINUTE).contains(&self.registrations_per_minute) {
+            return bad(format!(
+                "registrations_per_minute must be 1..={MAX_REGISTRATIONS_PER_MINUTE} (got {})",
+                self.registrations_per_minute
+            ));
+        }
+        // The build string is one whitespace-free token on the line-based READY message.
+        if let Some(suffix) = &self.build_suffix {
+            let token = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'/' | b'+' | b'-');
+            if suffix.is_empty() || suffix.len() > MAX_BUILD_SUFFIX || !suffix.bytes().all(token) {
+                return bad(format!(
+                    "build_suffix must be 1..={MAX_BUILD_SUFFIX} characters from [A-Za-z0-9._/+-] (got {suffix:?})"
+                ));
+            }
+        }
         Ok(())
+    }
+
+    /// The build string reported in `Welcome` and on the READY line: the crate version, plus
+    /// `+<build_suffix>` when the configuration names the adapter.
+    pub fn build_string(&self) -> String {
+        match &self.build_suffix {
+            Some(suffix) => format!("{}+{suffix}", crate::SERVER_BUILD),
+            None => crate::SERVER_BUILD.to_string(),
+        }
     }
 }
 
@@ -154,6 +214,28 @@ mod tests {
         assert_eq!(c.max_connections, 64);
         assert_eq!(c.area_key, FIXTURE_AREA_KEY);
         assert_eq!(c.hello_timeout, Duration::from_secs(10));
+        // FIXTURE keeps the plain version as its build string.
+        assert_eq!(c.build_suffix, None);
+        assert_eq!(c.build_string(), crate::SERVER_BUILD);
+        // Accounts: an ephemeral store, open registration, a three-member party with 60 s invites
+        // (the party clock is in milliseconds).
+        assert_eq!(c.state_dir, None);
+        assert!(c.allow_registration);
+        assert_eq!(c.registrations_per_minute, DEFAULT_REGISTRATIONS_PER_MINUTE);
+        assert_eq!((c.party.max_size(), c.party.invite_ttl()), (3, 60_000));
+    }
+
+    #[test]
+    fn the_build_suffix_is_one_validated_token() {
+        let ok = ServerConfig::default();
+        let with = |s: &str| ServerConfig { build_suffix: Some(s.to_string()), ..ok.clone() };
+        let c = with("fmv-ff7/0.1.0+fingerprint-rule/1");
+        c.validate().unwrap();
+        assert_eq!(c.build_string(), format!("{}+fmv-ff7/0.1.0+fingerprint-rule/1", crate::SERVER_BUILD));
+        for bad in ["", "has space", "line\nbreak", "tab\t", "caf\u{e9}", "=", &"x".repeat(MAX_BUILD_SUFFIX + 1)] {
+            assert!(with(bad).validate().is_err(), "{bad:?} must be rejected");
+        }
+        with(&"x".repeat(MAX_BUILD_SUFFIX)).validate().unwrap();
     }
 
     #[test]
@@ -184,6 +266,8 @@ mod tests {
             ServerConfig { idle_timeout: Some(Duration::ZERO), ..ok.clone() },
             ServerConfig { keepalive: Some(Duration::ZERO), ..ok.clone() },
             ServerConfig { keepalive: Some(Duration::from_millis(900)), ..ok.clone() },
+            ServerConfig { registrations_per_minute: 0, ..ok.clone() },
+            ServerConfig { registrations_per_minute: MAX_REGISTRATIONS_PER_MINUTE + 1, ..ok.clone() },
         ] {
             assert!(c.validate().is_err(), "{c:?} should be rejected");
         }

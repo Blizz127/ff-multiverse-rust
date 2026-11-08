@@ -17,7 +17,7 @@ use fmv_ff7::background::{decode_background, decode_background_with, BackgroundO
 use fmv_ff7::field::{FieldFile, NO_ACCESS};
 use fmv_ff7::lgp::{LgpArchive, MAX_ENTRY_LEN};
 use fmv_ff7::{lzss, Ff7Adapter};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
 fn data_dir() -> Option<PathBuf> {
@@ -155,6 +155,7 @@ fn every_field_entry_decodes_with_the_recorded_totals() {
     let names: Vec<String> = lgp.list().iter().map(|e| e.name.clone()).collect();
     let (mut fields, mut triangles, mut tiles, mut discarded) = (0usize, 0usize, 0usize, 0usize);
     let (mut unrenderable, mut unrenderable_all_groups, mut hidden_by_default) = (0usize, 0usize, 0usize);
+    let mut scales: BTreeMap<u16, usize> = BTreeMap::new();
     let (mut zero_page_palettes, mut trailer, mut gateways_in_use) = (0usize, 0usize, 0usize);
     for (i, name) in names.iter().enumerate() {
         if !is_field_name(name) {
@@ -172,6 +173,11 @@ fn every_field_entry_decodes_with_the_recorded_totals() {
             }
             other => panic!("{name}: {other} unexplained bytes after the last section"),
         }
+        // field scale: the model-loader header and the script header (offset 8) carry the same value
+        let scale = field.field_scale().unwrap();
+        assert_eq!(u16::from_le_bytes(field.section(0).unwrap()[8..10].try_into().unwrap()), scale, "{name}");
+        assert_eq!(field.model_loader_header().unwrap().scale, scale);
+        *scales.entry(scale).or_default() += 1;
         let walk = field.walkmesh().unwrap();
         triangles += walk.len();
         for (t, acc) in walk.access.iter().enumerate() {
@@ -205,6 +211,27 @@ fn every_field_entry_decodes_with_the_recorded_totals() {
         unrenderable_all_groups += image.layers.iter().map(|l| l.tiles_unrenderable).sum::<usize>();
     }
     assert_eq!(fields, 702);
+    // ... and every value equals the FF7 Speedrun Wiki's per-field "Field Scale" list (checked once,
+    // field by field through the maplist ids, 702 of 702)
+    let expected: BTreeMap<u16, usize> = [
+        (400, 4),
+        (448, 1),
+        (480, 2),
+        (512, 643),
+        (576, 5),
+        (600, 5),
+        (640, 2),
+        (650, 2),
+        (700, 6),
+        (720, 1),
+        (768, 12),
+        (1024, 9),
+        (2048, 7),
+        (4096, 2),
+        (5120, 1),
+    ]
+    .into();
+    assert_eq!(scales, expected);
     assert_eq!(triangles, 81_542);
     assert_eq!(trailer, 582);
     assert_eq!(gateways_in_use, 1_036);
@@ -241,6 +268,10 @@ fn adapter_lists_and_loads_real_fields_and_validates_real_moves() {
 
     let area = adapter.load_field("md1stin").unwrap();
     assert_eq!(area.walkmesh().len(), 39);
+    // the speed follows the field scale: md1stin is 512 (the base), md1_1 is 1024 (twice as fast)
+    assert_eq!((area.field_scale(), area.max_speed()), (512, fmv_ff7::FF7_FIELD_MAX_SPEED_PLACEHOLDER));
+    let md1_1 = adapter.load_field("md1_1").unwrap();
+    assert_eq!((md1_1.field_scale(), md1_1.max_speed()), (1024, 2.0 * fmv_ff7::FF7_FIELD_MAX_SPEED_PLACEHOLDER));
     let walk = area.walkmesh().clone();
 
     // ground-plane centroid of a triangle, at its own height

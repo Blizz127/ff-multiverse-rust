@@ -8,6 +8,9 @@ license.workspace = true
 
 [dependencies]
 fmv-core.workspace = true
+# The party messages carry fmv-party's own serde types (events, party, invites, placement) so a
+# client mirror replays exactly what the party state machine decided. Pinned by golden JSON tests.
+fmv-party = { path = "../fmv-party" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

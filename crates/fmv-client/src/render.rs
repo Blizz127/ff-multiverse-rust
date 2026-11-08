@@ -1,12 +1,19 @@
-//! Renderer: a tiny vertex-coloured wgpu pipeline that draws an orthographic debug view of the
-//! area (walkable triangles, players, FIXTURE banner).
+//! Renderer: a tiny wgpu renderer that draws an orthographic view of the area (an optional
+//! background picture, the walkable triangles over it, players, the FIXTURE banner).
 //!
-//! * CPU side ([`Camera`], [`build_vertices`]): world -> pixels -> NDC, pure and unit-tested.
-//! * GPU side ([`Gpu`]): one pipeline, one growing vertex buffer, renders into any texture view,
-//!   so it can also be exercised offscreen.
+//! Everything is in *view space* (+x right, +y up, any units); how an area's own coordinates
+//! become view space (top-down, or through a game's field camera) is decided by
+//! [`crate::backdrop::FieldView`], not here.
+//!
+//! * CPU side ([`Camera`], [`build_vertices`], [`backdrop_quad`]): view space -> pixels -> NDC,
+//!   pure and unit-tested.
+//! * GPU side ([`Gpu`]): a flat-colour pipeline with one growing vertex buffer and a textured
+//!   quad pipeline for the backdrop; renders into any texture view, so it can also be exercised
+//!   offscreen.
 //! * Surface side ([`Renderer`]): window surface lifecycle (resize, minimise, suboptimal,
 //!   outdated, lost) without panics.
 
+use crate::backdrop::Backdrop;
 use bytemuck::{Pod, Zeroable};
 use fmv_adapter_api::Bounds;
 use fmv_core::Pos;
@@ -34,6 +41,51 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     return in.color;
 }
 "#;
+
+/// WGSL of the backdrop quad: position is already in NDC, the picture is sampled as is (it is
+/// opaque; pixels no tile touched were flattened onto black when the picture was made).
+pub const QUAD_SHADER_WGSL: &str = r#"
+struct QuadOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@group(0) @binding(0) var backdrop_tex: texture_2d<f32>;
+@group(0) @binding(1) var backdrop_samp: sampler;
+
+@vertex
+fn vs_quad(@location(0) position: vec2<f32>, @location(1) uv: vec2<f32>) -> QuadOut {
+    var out: QuadOut;
+    out.position = vec4<f32>(position, 0.0, 1.0);
+    out.uv = uv;
+    return out;
+}
+
+@fragment
+fn fs_quad(in: QuadOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(textureSample(backdrop_tex, backdrop_samp, in.uv).rgb, 1.0);
+}
+"#;
+
+/// One corner of the backdrop quad: NDC position and texture coordinate (`(0,0)` = top left).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
+pub struct QuadVertex {
+    pub pos: [f32; 2],
+    pub uv: [f32; 2],
+}
+
+impl QuadVertex {
+    const ATTRIBUTES: [wgpu::VertexAttribute; 2] = wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2];
+
+    fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<QuadVertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRIBUTES,
+        }
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
@@ -63,8 +115,14 @@ pub const FLOOR_RGB: [u8; 3] = [52, 70, 96];
 pub const EDGE_RGB: [u8; 3] = [92, 120, 160];
 const OUTLINE_RGB: [u8; 3] = [8, 8, 12];
 const OWN_OUTLINE_RGB: [u8; 3] = [255, 255, 255];
+/// Over a backdrop the floor is a see-through wash and the edges are brighter, so the scenery
+/// stays visible with the walkable area readable on top of it.
+pub const BACKDROP_FLOOR_ALPHA: f32 = 0.30;
+pub const BACKDROP_EDGE_RGB: [u8; 3] = [200, 230, 255];
 pub const BANNER_YELLOW: [u8; 3] = [255, 196, 0];
 pub const BANNER_BLACK: [u8; 3] = [24, 24, 24];
+/// The ring drawn around every member of the player's party.
+pub const RING_RGB: [u8; 3] = [255, 208, 64];
 
 // Sizes in pixels.
 const MARGIN_PX: f32 = 24.0;
@@ -73,6 +131,12 @@ const PLAYER_HALF_PX: f32 = 9.0;
 const OWN_HALF_PX: f32 = 10.0;
 const OUTLINE_PX: f32 = 2.5;
 pub const BANNER_PX: f32 = 18.0;
+/// A party ring is a closed band (a 24-sided polygon outline) between these radii around the
+/// marker's centre: a few pixels outside the furthest corner of any marker's outline (about 16.3
+/// px for a player, 15.6 px for the own diamond), and thin.
+const RING_INNER_PX: f32 = 18.0;
+const RING_OUTER_PX: f32 = 20.5;
+const RING_SEGMENTS: usize = 24;
 
 /// One player marker.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -82,6 +146,9 @@ pub struct PlayerSprite {
     pub tint: [u8; 3],
     /// The local player: drawn as an outlined, brightened diamond on top of everyone else.
     pub own: bool,
+    /// A member of the local player's party (the local player included when in a party): drawn
+    /// with a gold ring around the marker.
+    pub party: bool,
 }
 
 /// Everything needed to draw one frame.
@@ -92,6 +159,8 @@ pub struct Scene<'a> {
     pub players: &'a [PlayerSprite],
     /// Draw the hazard-stripe FIXTURE banner across the top.
     pub fixture_banner: bool,
+    /// A picture drawn behind everything, covering its own rectangle of view space.
+    pub backdrop: Option<&'a Backdrop>,
 }
 
 /// Orthographic camera fitting the area bounds into the viewport, +y up, aspect preserved.
@@ -177,10 +246,15 @@ impl Builder {
     }
 
     fn tri(&mut self, a: [f32; 2], b: [f32; 2], c: [f32; 2], rgb: [u8; 3]) {
+        self.tri_alpha(a, b, c, rgb, 1.0);
+    }
+
+    fn tri_alpha(&mut self, a: [f32; 2], b: [f32; 2], c: [f32; 2], rgb: [u8; 3], alpha: f32) {
         if self.out.len() + 3 > MAX_VERTICES || ![a, b, c].iter().all(|p| p[0].is_finite() && p[1].is_finite()) {
             return;
         }
-        let col = color(rgb, self.srgb);
+        let mut col = color(rgb, self.srgb);
+        col[3] = alpha;
         self.vertex(a, col);
         self.vertex(b, col);
         self.vertex(c, col);
@@ -211,6 +285,19 @@ impl Builder {
             [c[0] - r, c[1]],
             rgb,
         );
+    }
+
+    /// A closed band between the radii `r_in` and `r_out` around `c`: a polygon outline of
+    /// [`RING_SEGMENTS`] segments, each a quad, so neighbouring segments share their corners and
+    /// the band has no gaps.
+    fn ring(&mut self, c: [f32; 2], r_in: f32, r_out: f32, rgb: [u8; 3]) {
+        let at = |i: usize, r: f32| {
+            let angle = i as f32 / RING_SEGMENTS as f32 * std::f32::consts::TAU;
+            [c[0] + r * angle.cos(), c[1] + r * angle.sin()]
+        };
+        for i in 0..RING_SEGMENTS {
+            self.quad(at(i, r_in), at(i, r_out), at(i + 1, r_out), at(i + 1, r_in), rgb);
+        }
     }
 
     fn line(&mut self, a: [f32; 2], b: [f32; 2], width: f32, rgb: [u8; 3]) {
@@ -250,7 +337,8 @@ impl Builder {
 }
 
 /// Build the frame's vertex list. Painter's order: floor, edges, remote players, own player,
-/// banner. Non-finite input is skipped, never propagated to the GPU.
+/// banner; each marker is followed by its party ring, if it has one. Non-finite input is skipped,
+/// never propagated to the GPU.
 pub fn build_vertices(scene: &Scene<'_>, vw: u32, vh: u32, srgb: bool) -> Vec<Vertex> {
     let (fw, fh) = (vw.max(1) as f32, vh.max(1) as f32);
     let cam = Camera::fit(&scene.bounds, fw, fh, MARGIN_PX);
@@ -263,12 +351,17 @@ pub fn build_vertices(scene: &Scene<'_>, vw: u32, vh: u32, srgb: bool) -> Vec<Ve
     };
 
     let px = |p: &Pos| cam.project(p.x, p.y);
+    let (floor_alpha, edge_rgb) = if scene.backdrop.is_some() {
+        (BACKDROP_FLOOR_ALPHA, BACKDROP_EDGE_RGB)
+    } else {
+        (1.0, EDGE_RGB)
+    };
     for t in scene.triangles {
-        b.tri(px(&t[0]), px(&t[1]), px(&t[2]), FLOOR_RGB);
+        b.tri_alpha(px(&t[0]), px(&t[1]), px(&t[2]), FLOOR_RGB, floor_alpha);
     }
     for t in scene.triangles {
         for (i, j) in [(0, 1), (1, 2), (2, 0)] {
-            b.line(px(&t[i]), px(&t[j]), EDGE_PX, EDGE_RGB);
+            b.line(px(&t[i]), px(&t[j]), EDGE_PX, edge_rgb);
         }
     }
     let remote = scene.players.iter().filter(|p| !p.own);
@@ -282,6 +375,9 @@ pub fn build_vertices(scene: &Scene<'_>, vw: u32, vh: u32, srgb: bool) -> Vec<Ve
             b.square(c, PLAYER_HALF_PX + OUTLINE_PX, OUTLINE_RGB);
             b.square(c, PLAYER_HALF_PX, p.tint);
         }
+        if p.party {
+            b.ring(c, RING_INNER_PX, RING_OUTER_PX, RING_RGB);
+        }
     }
     if scene.fixture_banner {
         b.banner();
@@ -289,17 +385,53 @@ pub fn build_vertices(scene: &Scene<'_>, vw: u32, vh: u32, srgb: bool) -> Vec<Ve
     b.out
 }
 
+/// The backdrop's two triangles in NDC for a `vw` x `vh` viewport, placed by the same camera as
+/// everything else, so the picture and the walkmesh drawn over it stay aligned. The picture's
+/// top row is at the top of its rectangle (view-space `max.y`). `None` without a backdrop, or if
+/// a corner does not come out finite.
+pub fn backdrop_quad(scene: &Scene<'_>, vw: u32, vh: u32) -> Option<[QuadVertex; 6]> {
+    let backdrop = scene.backdrop?;
+    let (fw, fh) = (vw.max(1) as f32, vh.max(1) as f32);
+    let cam = Camera::fit(&scene.bounds, fw, fh, MARGIN_PX);
+    let corner = |x: f32, y: f32, u: f32, v: f32| {
+        let p = cam.project(x, y);
+        QuadVertex { pos: [p[0] / (fw * 0.5), p[1] / (fh * 0.5)], uv: [u, v] }
+    };
+    let (min, max) = (backdrop.min, backdrop.max);
+    let top_left = corner(min[0], max[1], 0.0, 0.0);
+    let top_right = corner(max[0], max[1], 1.0, 0.0);
+    let bottom_right = corner(max[0], min[1], 1.0, 1.0);
+    let bottom_left = corner(min[0], min[1], 0.0, 1.0);
+    let quad = [top_left, bottom_left, bottom_right, top_left, bottom_right, top_right];
+    quad.iter().all(|v| v.pos.iter().all(|c| c.is_finite())).then_some(quad)
+}
+
 // ---------------------------------------------------------------------------------------------
 // GPU
 // ---------------------------------------------------------------------------------------------
 
-/// Pipeline + vertex buffer, independent of any window surface.
+/// A backdrop picture uploaded to the GPU, with the bind group that samples it.
+struct GpuBackdrop {
+    id: u64,
+    bind_group: wgpu::BindGroup,
+    /// Owns the pixels the bind group's view looks at.
+    _texture: wgpu::Texture,
+}
+
+/// Pipelines + buffers, independent of any window surface.
 pub struct Gpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::RenderPipeline,
     vertex_buf: wgpu::Buffer,
     vertex_cap: u64,
+    /// The colour format of every target this renderer draws into.
+    format: wgpu::TextureFormat,
+    quad_pipeline: wgpu::RenderPipeline,
+    quad_sampler: wgpu::Sampler,
+    quad_buf: wgpu::Buffer,
+    /// The picture currently on the GPU, replaced when a scene brings a different one.
+    backdrop: Option<GpuBackdrop>,
 }
 
 const MIN_VERTEX_BYTES: u64 = 64 * 1024;
@@ -340,13 +472,138 @@ impl Gpu {
             cache: None,
         });
         let vertex_buf = Self::create_vertex_buffer(&device, MIN_VERTEX_BYTES);
+
+        let quad_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("fmv-quad-shader"),
+            source: wgpu::ShaderSource::Wgsl(QUAD_SHADER_WGSL.into()),
+        });
+        let quad_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("fmv-quad-pipeline"),
+            layout: None,
+            vertex: wgpu::VertexState {
+                module: &quad_shader,
+                entry_point: Some("vs_quad"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[Some(QuadVertex::layout())],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &quad_shader,
+                entry_point: Some("fs_quad"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..wgpu::PrimitiveState::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let quad_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("fmv-backdrop-sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..wgpu::SamplerDescriptor::default()
+        });
+        let quad_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fmv-backdrop-quad"),
+            size: (6 * std::mem::size_of::<QuadVertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         Self {
             device,
             queue,
             pipeline,
             vertex_buf,
             vertex_cap: MIN_VERTEX_BYTES,
+            format,
+            quad_pipeline,
+            quad_sampler,
+            quad_buf,
+            backdrop: None,
         }
+    }
+
+    /// Make sure `backdrop` is the picture on the GPU (uploading it if it is a different one).
+    /// Returns false if it cannot be used (larger than the device's texture limit): the scene is
+    /// then drawn without it.
+    pub fn ensure_backdrop(&mut self, backdrop: &Backdrop) -> bool {
+        if self.backdrop.as_ref().is_some_and(|g| g.id == backdrop.id) {
+            return true;
+        }
+        self.backdrop = None;
+        let limit = self.device.limits().max_texture_dimension_2d;
+        if backdrop.width > limit || backdrop.height > limit {
+            return false;
+        }
+        // The pixels are sRGB bytes. An sRGB target converts what the shader writes from linear,
+        // so the texture is sampled as sRGB (decoded to linear) for those targets: either way the
+        // colours come out as authored.
+        let format = if self.format.is_srgb() {
+            wgpu::TextureFormat::Rgba8UnormSrgb
+        } else {
+            wgpu::TextureFormat::Rgba8Unorm
+        };
+        let size = wgpu::Extent3d {
+            width: backdrop.width,
+            height: backdrop.height,
+            depth_or_array_layers: 1,
+        };
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("fmv-backdrop"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &backdrop.rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(backdrop.width * 4),
+                rows_per_image: Some(backdrop.height),
+            },
+            size,
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let layout = self.quad_pipeline.get_bind_group_layout(0);
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fmv-backdrop-bind"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.quad_sampler),
+                },
+            ],
+        });
+        self.backdrop = Some(GpuBackdrop {
+            id: backdrop.id,
+            bind_group,
+            _texture: texture,
+        });
+        true
     }
 
     fn create_vertex_buffer(device: &wgpu::Device, bytes: u64) -> wgpu::Buffer {
@@ -358,8 +615,16 @@ impl Gpu {
         })
     }
 
-    /// Clear `target` and draw `vertices` into it.
-    pub fn draw(&mut self, target: &wgpu::TextureView, vertices: &[Vertex], clear_rgb: [u8; 3], srgb: bool) {
+    /// Clear `target`, draw the backdrop `quad` first when there is one and a picture was
+    /// uploaded with [`Gpu::ensure_backdrop`], then `vertices` over it.
+    pub fn draw_scene(
+        &mut self,
+        target: &wgpu::TextureView,
+        vertices: &[Vertex],
+        quad: Option<&[QuadVertex; 6]>,
+        clear_rgb: [u8; 3],
+        srgb: bool,
+    ) {
         let vertices = &vertices[..vertices.len().min(MAX_VERTICES)];
         let bytes: &[u8] = bytemuck::cast_slice(vertices);
         let need = bytes.len() as u64;
@@ -370,6 +635,9 @@ impl Gpu {
         }
         if !bytes.is_empty() {
             self.queue.write_buffer(&self.vertex_buf, 0, bytes);
+        }
+        if let Some(quad) = quad {
+            self.queue.write_buffer(&self.quad_buf, 0, bytemuck::cast_slice(quad));
         }
         let c = color(clear_rgb, srgb);
         let clear = wgpu::Color {
@@ -399,6 +667,12 @@ impl Gpu {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            if let (Some(_), Some(backdrop)) = (quad, &self.backdrop) {
+                pass.set_pipeline(&self.quad_pipeline);
+                pass.set_bind_group(0, &backdrop.bind_group, &[]);
+                pass.set_vertex_buffer(0, self.quad_buf.slice(..));
+                pass.draw(0..6, 0..1);
+            }
             // `set_vertex_buffer` panics on an empty slice, so only draw when there is geometry.
             if !bytes.is_empty() {
                 pass.set_pipeline(&self.pipeline);
@@ -593,8 +867,14 @@ impl Renderer {
             wgpu::CurrentSurfaceTexture::Validation => return FrameResult::Skipped,
         };
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        // The picture goes to the GPU once (again only if it changes); without one, or if the
+        // device cannot hold it, the walkmesh is drawn on its own.
+        let quad = match scene.backdrop {
+            Some(b) if self.gpu.ensure_backdrop(b) => backdrop_quad(scene, w, h),
+            _ => None,
+        };
         let vertices = build_vertices(scene, w, h, self.srgb);
-        self.gpu.draw(&view, &vertices, CLEAR_RGB, self.srgb);
+        self.gpu.draw_scene(&view, &vertices, quad.as_ref(), CLEAR_RGB, self.srgb);
         self.window.pre_present_notify();
         self.gpu.queue.present(frame);
         FrameResult::Presented
@@ -693,12 +973,14 @@ mod tests {
                 y: 0.0,
                 tint: [200, 50, 50],
                 own: false,
+                party: false,
             },
             PlayerSprite {
                 x: 10.0,
                 y: 10.0,
                 tint: [50, 200, 50],
                 own: true,
+                party: false,
             },
         ];
         let scene = Scene {
@@ -706,6 +988,7 @@ mod tests {
             triangles: &t,
             players: &players,
             fixture_banner: false,
+            backdrop: None,
         };
         let v = build_vertices(&scene, 800, 600, false);
         // 2 floor triangles + 6 edge quads (2 tris each) + remote (2 squares) + own (2 diamonds).
@@ -750,12 +1033,14 @@ mod tests {
                 y: 0.0,
                 tint: [1, 2, 3],
                 own: false,
+                party: false,
             },
             PlayerSprite {
                 x: 1.0,
                 y: nan,
                 tint: [1, 2, 3],
                 own: true,
+                party: false,
             },
         ];
         let scene = Scene {
@@ -763,6 +1048,7 @@ mod tests {
             triangles: &t,
             players: &players,
             fixture_banner: false,
+            backdrop: None,
         };
         let v = build_vertices(&scene, 640, 480, true);
         assert!(v
@@ -788,9 +1074,84 @@ mod tests {
             triangles: &t,
             players: &[],
             fixture_banner: true,
+            backdrop: None,
         };
         let v = build_vertices(&scene, 640, 480, false);
         assert!(v.len() <= MAX_VERTICES);
+    }
+
+    fn sprite(x: f32, y: f32, own: bool, party: bool) -> PlayerSprite {
+        PlayerSprite { x, y, tint: [60, 200, 90], own, party }
+    }
+
+    /// Pixels from the viewport centre of a vertex (the vertices are in NDC).
+    fn px_of(v: &Vertex, vw: u32, vh: u32) -> (f32, f32) {
+        (v.pos[0] * vw as f32 * 0.5, v.pos[1] * vh as f32 * 0.5)
+    }
+
+    #[test]
+    fn the_ring_clears_every_marker_and_is_thin() {
+        // Furthest corner of a remote square's outline and of the own diamond's outline.
+        let square = (PLAYER_HALF_PX + OUTLINE_PX) * std::f32::consts::SQRT_2;
+        let diamond = (OWN_HALF_PX + OUTLINE_PX) * 1.25;
+        assert!(RING_INNER_PX > square + 1.0 && RING_INNER_PX > diamond + 1.0, "{square} {diamond}");
+        assert!(RING_OUTER_PX - RING_INNER_PX <= 3.0 && RING_OUTER_PX > RING_INNER_PX);
+        assert_eq!(RING_SEGMENTS, 24);
+    }
+
+    /// Party members get a 24-segment ring (48 triangles) around their marker, in a gold colour;
+    /// others get none; the own marker gets one when it is in a party.
+    #[test]
+    fn party_members_are_drawn_with_a_ring_and_nobody_else() {
+        let t = tris();
+        let (vw, vh) = (800_u32, 600_u32);
+        let build = |players: &[PlayerSprite]| {
+            let scene = Scene { bounds: bounds(-400.0, -300.0, 400.0, 300.0), triangles: &t, players, fixture_banner: false, backdrop: None };
+            build_vertices(&scene, vw, vh, false)
+        };
+        let plain = [sprite(-100.0, 0.0, false, false), sprite(100.0, 0.0, false, false), sprite(0.0, 100.0, true, false)];
+        let with_party = [sprite(-100.0, 0.0, false, true), sprite(100.0, 0.0, false, false), sprite(0.0, 100.0, true, true)];
+        let (a, b) = (build(&plain), build(&with_party));
+        let ring_tris = RING_SEGMENTS * 2;
+        assert_eq!(b.len() - a.len(), 2 * ring_tris * 3, "two rings: the remote member's and the own marker's");
+
+        let ring_color = color(RING_RGB, false);
+        let ring: Vec<&Vertex> = b.iter().filter(|v| v.color == ring_color).collect();
+        assert_eq!(ring.len(), 2 * ring_tris * 3);
+        assert!(a.iter().all(|v| v.color != ring_color), "no ring without party members");
+        assert!(ring.iter().all(|v| v.color[3] == 1.0), "the ring is opaque");
+
+        // Every ring vertex lies on the inner or the outer circle of one of the two markers.
+        let cam = Camera::fit(&bounds(-400.0, -300.0, 400.0, 300.0), vw as f32, vh as f32, MARGIN_PX);
+        let centres = [cam.project(-100.0, 0.0), cam.project(0.0, 100.0)];
+        for v in &ring {
+            let (x, y) = px_of(v, vw, vh);
+            let on_a_circle = centres.iter().any(|c| {
+                let d = (x - c[0]).hypot(y - c[1]);
+                (d - RING_INNER_PX).abs() < 1e-2 || (d - RING_OUTER_PX).abs() < 1e-2
+            });
+            assert!(on_a_circle, "({x}, {y}) is not on a ring of a party member");
+        }
+        // Each ring sits right after its own marker (so a marker is never covered by another's
+        // ring): the first ring vertex comes after the remote marker's fill and before the own
+        // marker's outline.
+        let first_ring = b.iter().position(|v| v.color == ring_color).unwrap();
+        let own_outline = b.iter().position(|v| v.color == color(OWN_OUTLINE_RGB, false)).unwrap();
+        assert!(first_ring < own_outline, "remote markers (and their rings) come before the own marker");
+        assert_eq!(b.iter().rposition(|v| v.color == ring_color).unwrap() + 1, b.len(), "the own ring is last");
+        // The geometry does not depend on the party flag: everything else is identical.
+        let strip = |v: &[Vertex]| v.iter().filter(|x| x.color != ring_color).copied().collect::<Vec<_>>();
+        assert_eq!(strip(&a), strip(&b));
+    }
+
+    #[test]
+    fn a_ring_around_a_marker_that_cannot_be_drawn_is_skipped_not_forwarded() {
+        let t = tris();
+        let players = [sprite(f32::NAN, 0.0, false, true), sprite(0.0, f32::INFINITY, true, true)];
+        let scene = Scene { bounds: bounds(-400.0, -300.0, 400.0, 300.0), triangles: &t, players: &players, fixture_banner: false, backdrop: None };
+        let v = build_vertices(&scene, 640, 480, true);
+        assert!(v.iter().all(|v| v.pos.iter().chain(v.color.iter()).all(|c| c.is_finite())));
+        assert!(v.iter().all(|v| v.color != color(RING_RGB, true)), "no ring for a marker with no position");
     }
 
     #[test]
@@ -804,20 +1165,21 @@ mod tests {
         assert!(SHADER_WGSL.contains("vs_main") && SHADER_WGSL.contains("fs_main"));
     }
 
-    /// Renders a scene into an offscreen texture and checks real pixels. Needs a GPU or a software
-    /// Vulkan/GL driver (e.g. lavapipe), so it only runs on request:
-    /// `cargo test -p fmv-client -- --ignored offscreen`.
-    #[test]
-    #[ignore = "needs a GPU or software Vulkan/GL driver"]
-    fn offscreen_render_shows_floor_players_and_banner() {
-        const W: u32 = 128;
-        const H: u32 = 96;
+    // ------------------------------------------------------------------------------------
+    // Offscreen GPU tests (they need a GPU or a software Vulkan/GL driver, e.g. lavapipe, so they
+    // only run on request: `cargo test -p fmv-client -- --ignored offscreen`)
+    // ------------------------------------------------------------------------------------
+
+    /// Render `scene` into an offscreen `w` x `h` texture exactly the way the window does
+    /// (backdrop upload, quad, vertices) and read the pixels back as tightly packed RGBA8.
+    /// `None` (with a note) when no adapter is available.
+    fn render_offscreen(w: u32, h: u32, scene: &Scene<'_>) -> Option<Vec<u8>> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let adapter = match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())) {
             Ok(a) => a,
             Err(e) => {
                 eprintln!("skipped: no GPU adapter available ({e})");
-                return;
+                return None;
             }
         };
         eprintln!("offscreen adapter: {:?}", adapter.get_info().name);
@@ -829,28 +1191,15 @@ mod tests {
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let mut gpu = Gpu::new(device.clone(), queue.clone(), format);
 
-        let t = tris();
-        let players = [PlayerSprite {
-            x: 0.0,
-            y: 0.0,
-            tint: [200, 40, 40],
-            own: false,
-        }];
-        let scene = Scene {
-            bounds: bounds(-400.0, -300.0, 400.0, 300.0),
-            triangles: &t,
-            players: &players,
-            fixture_banner: true,
+        let quad = match scene.backdrop {
+            Some(b) if gpu.ensure_backdrop(b) => backdrop_quad(scene, w, h),
+            _ => None,
         };
-        let vertices = build_vertices(&scene, W, H, false);
+        let vertices = build_vertices(scene, w, h, false);
 
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("offscreen"),
-            size: wgpu::Extent3d {
-                width: W,
-                height: H,
-                depth_or_array_layers: 1,
-            },
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -859,11 +1208,13 @@ mod tests {
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        gpu.draw(&view, &vertices, CLEAR_RGB, false);
+        gpu.draw_scene(&view, &vertices, quad.as_ref(), CLEAR_RGB, false);
 
+        // Rows of a texture-to-buffer copy are padded to 256 bytes.
+        let padded = (w * 4).next_multiple_of(256);
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback"),
-            size: u64::from(W * 4 * H),
+            size: u64::from(padded * h),
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -877,50 +1228,380 @@ mod tests {
             },
             wgpu::TexelCopyBufferInfo {
                 buffer: &readback,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(W * 4),
-                    rows_per_image: Some(H),
-                },
+                layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(padded), rows_per_image: Some(h) },
             },
-            wgpu::Extent3d {
-                width: W,
-                height: H,
-                depth_or_array_layers: 1,
-            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
         );
         queue.submit(std::iter::once(enc.finish()));
         let (tx, rx) = std::sync::mpsc::channel();
-        readback
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, move |r| tx.send(r).expect("send"));
+        readback.slice(..).map_async(wgpu::MapMode::Read, move |r| tx.send(r).expect("send"));
         device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
         rx.recv().expect("map callback").expect("map");
         let data = readback.slice(..).get_mapped_range().expect("mapped range");
-        let px = |x: u32, y: u32| -> [u8; 3] {
-            let i = ((y * W + x) * 4) as usize;
-            [data[i], data[i + 1], data[i + 2]]
+        let mut out = Vec::with_capacity((w * h * 4) as usize);
+        for row in data.chunks(padded as usize).take(h as usize) {
+            out.extend_from_slice(&row[..(w * 4) as usize]);
+        }
+        Some(out)
+    }
+
+    fn pixel(img: &[u8], w: u32, x: u32, y: u32) -> [u8; 3] {
+        let i = ((y * w + x) * 4) as usize;
+        [img[i], img[i + 1], img[i + 2]]
+    }
+
+    fn close(a: [u8; 3], b: [u8; 3], tol: u8) -> bool {
+        a.iter().zip(b).all(|(x, y)| x.abs_diff(y) <= tol)
+    }
+
+    #[test]
+    #[ignore = "needs a GPU or software Vulkan/GL driver"]
+    fn offscreen_render_shows_floor_players_and_banner() {
+        const W: u32 = 128;
+        const H: u32 = 96;
+        let t = tris();
+        let players = [PlayerSprite { x: 0.0, y: 0.0, tint: [200, 40, 40], own: false, party: false }];
+        let scene = Scene {
+            bounds: bounds(-400.0, -300.0, 400.0, 300.0),
+            triangles: &t,
+            players: &players,
+            fixture_banner: true,
+            backdrop: None,
         };
-        let close = |a: [u8; 3], b: [u8; 3]| a.iter().zip(b).all(|(x, y)| x.abs_diff(y) <= 2);
+        let Some(img) = render_offscreen(W, H, &scene) else { return };
+        let px = |x: u32, y: u32| pixel(&img, W, x, y);
 
         // Margin corner (below the banner): clear colour.
-        assert!(close(px(2, H - 3), CLEAR_RGB), "clear: {:?}", px(2, H - 3));
+        assert!(close(px(2, H - 3), CLEAR_RGB, 2), "clear: {:?}", px(2, H - 3));
         // A point on the floor away from the player and the diagonal edge: floor colour.
         assert!(
-            close(px(W / 2 + 30, H / 2 + 10), FLOOR_RGB) || close(px(W / 2 - 30, H / 2 - 10), FLOOR_RGB),
+            close(px(W / 2 + 30, H / 2 + 10), FLOOR_RGB, 2) || close(px(W / 2 - 30, H / 2 - 10), FLOOR_RGB, 2),
             "floor: {:?}",
             px(W / 2 + 30, H / 2 + 10)
         );
         // The player marker at the centre: its tint.
-        assert!(close(px(W / 2, H / 2), [200, 40, 40]), "player: {:?}", px(W / 2, H / 2));
+        assert!(close(px(W / 2, H / 2), [200, 40, 40], 2), "player: {:?}", px(W / 2, H / 2));
         // The top row belongs to the hazard banner: yellow or black stripes.
-        let top = px(0, 0);
         let mut seen_yellow = false;
         let mut seen_black = false;
         for x in 0..W {
-            seen_yellow |= close(px(x, 1), BANNER_YELLOW);
-            seen_black |= close(px(x, 1), BANNER_BLACK);
+            seen_yellow |= close(px(x, 1), BANNER_YELLOW, 2);
+            seen_black |= close(px(x, 1), BANNER_BLACK, 2);
         }
-        assert!(seen_yellow && seen_black, "banner stripes: first pixel {top:?}");
+        assert!(seen_yellow && seen_black, "banner stripes: first pixel {:?}", px(0, 0));
+    }
+
+    /// A gold ring surrounds party members' markers (and only theirs), at the ring radius.
+    #[test]
+    #[ignore = "needs a GPU or software Vulkan/GL driver"]
+    fn offscreen_party_ring_surrounds_party_members_only() {
+        const W: u32 = 240;
+        const H: u32 = 180;
+        let t = tris();
+        // Far enough apart that no ring touches another marker or the floor's diagonal edge.
+        let players = [
+            PlayerSprite { x: -200.0, y: 0.0, tint: [40, 200, 40], own: false, party: true },
+            PlayerSprite { x: 200.0, y: 0.0, tint: [40, 40, 200], own: false, party: false },
+            PlayerSprite { x: 0.0, y: 200.0, tint: [200, 200, 40], own: true, party: true },
+        ];
+        let scene = Scene {
+            bounds: bounds(-400.0, -300.0, 400.0, 300.0),
+            triangles: &t,
+            players: &players,
+            fixture_banner: false,
+            backdrop: None,
+        };
+        let Some(img) = render_offscreen(W, H, &scene) else { return };
+        let px = |x: u32, y: u32| pixel(&img, W, x, y);
+
+        // Where the markers are, in image pixels (the viewport centre is the middle of the image).
+        let cam = Camera::fit(&scene.bounds, W as f32, H as f32, MARGIN_PX);
+        let at = |p: &PlayerSprite| {
+            let c = cam.project(p.x, p.y);
+            ((W as f32 / 2.0 + c[0]).round() as i32, (H as f32 / 2.0 - c[1]).round() as i32)
+        };
+        let (member, outsider, own) = (at(&players[0]), at(&players[1]), at(&players[2]));
+        eprintln!("markers at {member:?} (party member), {outsider:?} (not in the party), {own:?} (own, in the party)");
+        let get = |c: (i32, i32), dx: i32, dy: i32| px((c.0 + dx) as u32, (c.1 + dy) as u32);
+
+        // The ring radius is 18..20.5 px: the pixel at +19 in each direction is on the ring.
+        // (Pixel (x, y) covers x..x+1; a ring pixel's centre is 19.5 px from the marker centre.)
+        for (dx, dy) in [(19, 0), (-20, 0), (0, 19), (0, -20)] {
+            let got = get(member, dx, dy);
+            assert!(close(got, RING_RGB, 2), "member ring at ({dx}, {dy}): {got:?}");
+            let got = get(own, dx, dy);
+            assert!(close(got, RING_RGB, 2), "own ring at ({dx}, {dy}): {got:?}");
+        }
+        // Between the marker's outline and the ring there is floor; so there is outside the ring.
+        for (dx, dy) in [(15, 0), (-16, 0), (24, 0), (-25, 0)] {
+            let got = get(member, dx, dy);
+            assert!(close(got, FLOOR_RGB, 2), "member gap/outside at ({dx}, {dy}): {got:?}");
+        }
+        // The marker itself is untouched: its tint at the centre.
+        assert!(close(get(member, 0, 0), [40, 200, 40], 2), "member marker: {:?}", get(member, 0, 0));
+        // Someone who is not in the party has no ring at that radius.
+        for (dx, dy) in [(19, 0), (-20, 0), (0, 19), (0, -20)] {
+            let got = get(outsider, dx, dy);
+            assert!(close(got, FLOOR_RGB, 2), "no ring around a non-member at ({dx}, {dy}): {got:?}");
+        }
+        assert!(close(get(outsider, 0, 0), [40, 40, 200], 2), "outsider marker: {:?}", get(outsider, 0, 0));
+    }
+
+    /// A 2x2 picture (red, green / blue, yellow) covers a wide rectangle; a small floor is drawn
+    /// over its middle. The picture must be the right way up, fill exactly its rectangle (the
+    /// outside stays the clear colour), and the floor must be a translucent wash on top of it.
+    #[test]
+    #[ignore = "needs a GPU or software Vulkan/GL driver"]
+    fn offscreen_backdrop_is_drawn_behind_the_walkmesh_and_the_right_way_up() {
+        const W: u32 = 200;
+        const H: u32 = 100;
+        let rgba: Vec<u8> = [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255], [255, 255, 0, 255]].concat();
+        let picture = Backdrop::new(2, 2, rgba, [-200.0, -100.0], [200.0, 100.0]).unwrap();
+        // A floor of 100 x 40 units around the centre, well inside the picture.
+        let floor = vec![
+            [Pos::new(-50.0, -20.0, 0.0), Pos::new(50.0, -20.0, 0.0), Pos::new(50.0, 20.0, 0.0)],
+            [Pos::new(-50.0, -20.0, 0.0), Pos::new(50.0, 20.0, 0.0), Pos::new(-50.0, 20.0, 0.0)],
+        ];
+        let scene = Scene {
+            // A viewport twice as wide as the picture's 4:2 shape needs, so there are side margins.
+            bounds: bounds(-200.0, -100.0, 200.0, 100.0),
+            triangles: &floor,
+            players: &[],
+            fixture_banner: false,
+            backdrop: Some(&picture),
+        };
+        let Some(img) = render_offscreen(W, H, &scene) else { return };
+        let px = |x: u32, y: u32| pixel(&img, W, x, y);
+        // The same picture without the floor, to know what is behind the floor pixels.
+        let bare_scene = Scene { triangles: &[], ..scene };
+        let bare = render_offscreen(W, H, &bare_scene).expect("the first render found an adapter");
+
+        // Fit: 24 px margins, 4:2 picture in a 200 x 100 window => 104 x 52 px, centred.
+        let cam = Camera::fit(&scene.bounds, W as f32, H as f32, MARGIN_PX);
+        let (left, right) = (cam.project(-200.0, 0.0)[0] + W as f32 / 2.0, cam.project(200.0, 0.0)[0] + W as f32 / 2.0);
+        let (top, bottom) = (-cam.project(0.0, 100.0)[1] + H as f32 / 2.0, -cam.project(0.0, -100.0)[1] + H as f32 / 2.0);
+        eprintln!("picture covers x {left:.1}..{right:.1}, y {top:.1}..{bottom:.1}");
+        // Quarter points of the picture are the centres of its four texels: pure colours, with the
+        // top row of the picture at the top of the window.
+        let at = |fx: f32, fy: f32| px((left + (right - left) * fx) as u32, (top + (bottom - top) * fy) as u32);
+        assert!(close(at(0.25, 0.10), [255, 0, 0], 3), "top left is red: {:?}", at(0.25, 0.10));
+        assert!(close(at(0.75, 0.10), [0, 255, 0], 3), "top right is green: {:?}", at(0.75, 0.10));
+        assert!(close(at(0.25, 0.90), [0, 0, 255], 3), "bottom left is blue: {:?}", at(0.25, 0.90));
+        assert!(close(at(0.75, 0.90), [255, 255, 0], 3), "bottom right is yellow: {:?}", at(0.75, 0.90));
+        // Outside the picture's rectangle: the clear colour.
+        assert!(close(px(1, H / 2), CLEAR_RGB, 2), "outside: {:?}", px(1, H / 2));
+        assert!(close(px(W - 2, H / 2), CLEAR_RGB, 2), "outside: {:?}", px(W - 2, H / 2));
+        // The floor is a translucent wash: its colour mixed with what is behind it, at every
+        // sampled pixel of the floor (the picture there blends all four texels).
+        // (Away from the floor's diagonal edge, which is drawn as a bright line.)
+        for (x, y) in [(W / 2 - 5, H / 2 - 3), (W / 2 + 5, H / 2 + 3), (W / 2 - 8, H / 2), (W / 2 + 8, H / 2)] {
+            let behind = pixel(&bare, W, x, y);
+            let a = BACKDROP_FLOOR_ALPHA;
+            let mix = |f: u8, b: u8| (f32::from(f) * a + f32::from(b) * (1.0 - a)).round() as u8;
+            let want = [mix(FLOOR_RGB[0], behind[0]), mix(FLOOR_RGB[1], behind[1]), mix(FLOOR_RGB[2], behind[2])];
+            assert!(close(px(x, y), want, 3), "floor wash at ({x},{y}): {:?}, want {want:?} over {behind:?}", px(x, y));
+            assert!(!close(px(x, y), behind, 20), "the floor must be visible over the picture at ({x},{y})");
+        }
+    }
+
+    /// Real FF7 data, on request: render the field the way the window does and keep a PNG to look
+    /// at. `FMV_FF7_FLEVEL` names the flevel.lgp (read-only), `FMV_FF7_AREA` the field (default
+    /// `md1stin`), `FMV_SHOT_DIR` where the PNG goes (default `~/.cache/claude-tmp/fmv-client-shots`).
+    /// Checks that the camera, the walkmesh and the picture agree: the walkmesh must project
+    /// inside the picture, and a player standing on a spawn point must show up at its tint.
+    #[test]
+    #[ignore = "needs the owner's real flevel.lgp (FMV_FF7_FLEVEL) and a GPU or software Vulkan/GL driver"]
+    fn offscreen_real_ff7_field_through_its_camera() {
+        use crate::backdrop::FieldView;
+        use crate::ff7::{open_ff7, prewarm, Ff7Labels, Ff7Source};
+        use fmv_adapter_api::AreaRuntime;
+
+        let Some(path) = std::env::var_os("FMV_FF7_FLEVEL") else {
+            eprintln!("skipped: FMV_FF7_FLEVEL is not set");
+            return;
+        };
+        let key = std::env::var("FMV_FF7_AREA").unwrap_or_else(|_| "md1stin".to_string());
+        let opened = open_ff7(&Ff7Source::Flevel { path: path.into(), labels: Ff7Labels::default() }).expect("open");
+        prewarm(&opened.adapter);
+        let view = FieldView::ff7(&opened.adapter, &key).expect("the field has a camera and a walkmesh in front of it");
+        eprintln!("{}", view.description);
+        let picture = view.backdrop.as_ref().expect("the field's background decodes");
+        eprintln!("backdrop {:?}; {} triangles; fit {:?}", picture, view.triangles.len(), view.bounds);
+
+        // The walkmesh lies inside the picture's rectangle (it is drawn over that scenery).
+        let (mut inside, mut total) = (0, 0);
+        for p in view.triangles.iter().flatten() {
+            total += 1;
+            inside += usize::from(
+                p.x >= picture.min[0] && p.x <= picture.max[0] && p.y >= picture.min[1] && p.y <= picture.max[1],
+            );
+        }
+        assert!(total > 0 && inside * 10 >= total * 9, "{inside}/{total} walkmesh vertices project inside the background");
+
+        // A player on every spawn point, drawn through the same mapping as the window uses.
+        let area = opened.adapter.load_field(&key).expect("field");
+        let spawns = area.spawn_points();
+        let players: Vec<PlayerSprite> = spawns
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| {
+                let p = view.to_view(*s)?;
+                Some(PlayerSprite { x: p.x, y: p.y, tint: [[255, 40, 40], [40, 255, 40], [255, 255, 40], [40, 255, 255]][i % 4], own: i == 0, party: false })
+            })
+            .collect();
+        assert!(!players.is_empty(), "no spawn point can be drawn");
+        let (w, h) = (960_u32, 720_u32);
+        let scene = Scene {
+            bounds: view.bounds,
+            triangles: &view.triangles,
+            players: &players,
+            fixture_banner: false,
+            backdrop: view.backdrop.as_ref(),
+        };
+        let Some(img) = render_offscreen(w, h, &scene) else { return };
+
+        // The first (own) player's marker is drawn in its brightened tint at its projected spot.
+        let cam = Camera::fit(&scene.bounds, w as f32, h as f32, MARGIN_PX);
+        let c = cam.project(players[0].x, players[0].y);
+        let (mx, my) = ((c[0] + w as f32 / 2.0) as u32, (h as f32 / 2.0 - c[1]) as u32);
+        let got = pixel(&img, w, mx, my);
+        assert!(close(got, brighten(players[0].tint), 3), "own marker at ({mx},{my}): {got:?}");
+
+        let dir = std::env::var("FMV_SHOT_DIR").unwrap_or_else(|_| {
+            format!("{}/.cache/claude-tmp/fmv-client-shots", std::env::var("HOME").unwrap_or_else(|_| ".".into()))
+        });
+        std::fs::create_dir_all(&dir).expect("shot dir");
+        let file = format!("{dir}/{key}-through-camera.png");
+        std::fs::write(&file, write_png(w, h, &img)).expect("write png");
+        eprintln!("wrote {file}");
+    }
+
+    /// Minimal PNG encoder for the shots above (stored deflate blocks, no compression).
+    fn write_png(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
+        fn crc32(data: &[u8]) -> u32 {
+            let mut crc = 0xFFFF_FFFF_u32;
+            for &b in data {
+                crc ^= u32::from(b);
+                for _ in 0..8 {
+                    crc = if crc & 1 != 0 { 0xEDB8_8320 ^ (crc >> 1) } else { crc >> 1 };
+                }
+            }
+            !crc
+        }
+        fn adler32(data: &[u8]) -> u32 {
+            let (mut a, mut b) = (1_u32, 0_u32);
+            for &x in data {
+                a = (a + u32::from(x)) % 65_521;
+                b = (b + a) % 65_521;
+            }
+            (b << 16) | a
+        }
+        fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+            out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            let mut body = kind.to_vec();
+            body.extend_from_slice(data);
+            out.extend_from_slice(&body);
+            out.extend_from_slice(&crc32(&body).to_be_bytes());
+        }
+        let mut raw = Vec::with_capacity((w as usize * 4 + 1) * h as usize);
+        for row in rgba.chunks(w as usize * 4) {
+            raw.push(0); // filter: none
+            raw.extend_from_slice(row);
+        }
+        let mut z = vec![0x78, 0x01];
+        let mut blocks = raw.chunks(65_535).peekable();
+        while let Some(block) = blocks.next() {
+            z.push(u8::from(blocks.peek().is_none()));
+            z.extend_from_slice(&(block.len() as u16).to_le_bytes());
+            z.extend_from_slice(&(!(block.len() as u16)).to_le_bytes());
+            z.extend_from_slice(block);
+        }
+        z.extend_from_slice(&adler32(&raw).to_be_bytes());
+        let mut out = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&w.to_be_bytes());
+        ihdr.extend_from_slice(&h.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+        chunk(&mut out, b"IHDR", &ihdr);
+        chunk(&mut out, b"IDAT", &z);
+        chunk(&mut out, b"IEND", &[]);
+        out
+    }
+
+    #[test]
+    fn the_png_writer_makes_a_valid_header_and_checksums() {
+        let png = write_png(2, 1, &[1, 2, 3, 255, 4, 5, 6, 255]);
+        assert_eq!(&png[..8], &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+        assert_eq!(&png[12..16], b"IHDR");
+        assert_eq!(u32::from_be_bytes(png[16..20].try_into().unwrap()), 2);
+        assert_eq!(&png[png.len() - 8..png.len() - 4], b"IEND");
+        // The well-known CRC-32 check value.
+        let crc = |data: &[u8]| {
+            let mut c = 0xFFFF_FFFF_u32;
+            for &b in data {
+                c ^= u32::from(b);
+                for _ in 0..8 {
+                    c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+                }
+            }
+            !c
+        };
+        assert_eq!(crc(b"123456789"), 0xCBF4_3926);
+    }
+
+    // ------------------------------------------------------------------------------------
+    // CPU-side backdrop geometry
+    // ------------------------------------------------------------------------------------
+
+    #[test]
+    fn the_backdrop_quad_follows_the_camera_and_the_picture_is_the_right_way_up() {
+        let picture = Backdrop::new(2, 2, vec![0; 16], [-200.0, -100.0], [200.0, 100.0]).unwrap();
+        let none = Scene { bounds: bounds(-1.0, -1.0, 1.0, 1.0), triangles: &[], players: &[], fixture_banner: false, backdrop: None };
+        assert!(backdrop_quad(&none, 100, 100).is_none(), "no picture, no quad");
+
+        let scene = Scene { backdrop: Some(&picture), bounds: bounds(-200.0, -100.0, 200.0, 100.0), ..none };
+        let q = backdrop_quad(&scene, 200, 100).expect("quad");
+        // Fit with 24 px margins: 152 x 52 px are free, the 4:2 picture is limited by the height
+        // (scale 0.26) and ends up 104 x 52 px, centred: NDC +-0.52 on both axes (52/100, 26/50).
+        let (xs, ys): (Vec<f32>, Vec<f32>) = (q.iter().map(|v| v.pos[0]).collect(), q.iter().map(|v| v.pos[1]).collect());
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-4;
+        assert!(xs.iter().all(|x| near(x.abs(), 0.52)) && ys.iter().all(|y| near(y.abs(), 0.52)), "{q:?}");
+        // The picture's top-left texel (uv 0,0) is at the top left of the screen (NDC +y is up).
+        let corner = |u: f32, v: f32| q.iter().find(|c| c.uv == [u, v]).expect("corner").pos;
+        assert!(corner(0.0, 0.0)[0] < 0.0 && corner(0.0, 0.0)[1] > 0.0, "top left");
+        assert!(corner(1.0, 0.0)[0] > 0.0 && corner(1.0, 0.0)[1] > 0.0, "top right");
+        assert!(corner(0.0, 1.0)[0] < 0.0 && corner(0.0, 1.0)[1] < 0.0, "bottom left");
+        assert!(corner(1.0, 1.0)[0] > 0.0 && corner(1.0, 1.0)[1] < 0.0, "bottom right");
+        // Six vertices, two triangles covering all four corners.
+        assert_eq!(q.len(), 6);
+        // A zero-sized viewport does not divide by zero.
+        assert!(backdrop_quad(&scene, 0, 0).is_some_and(|q| q.iter().all(|v| v.pos.iter().all(|c| c.is_finite()))));
+    }
+
+    #[test]
+    fn a_backdrop_turns_the_floor_into_a_see_through_wash_without_changing_the_geometry() {
+        let picture = Backdrop::new(1, 1, vec![9, 9, 9, 255], [-400.0, -300.0], [400.0, 300.0]).unwrap();
+        let t = tris();
+        let plain = Scene { bounds: bounds(-400.0, -300.0, 400.0, 300.0), triangles: &t, players: &[], fixture_banner: false, backdrop: None };
+        let over = Scene { backdrop: Some(&picture), ..plain };
+        let (a, b) = (build_vertices(&plain, 800, 600, false), build_vertices(&over, 800, 600, false));
+        assert_eq!(a.len(), b.len(), "same triangles either way");
+        assert!(a.iter().zip(&b).all(|(x, y)| x.pos == y.pos));
+        // Floor triangles (the first two) are translucent over a picture; edges are brighter.
+        assert!(a[..6].iter().all(|v| v.color[3] == 1.0));
+        assert!(b[..6].iter().all(|v| (v.color[3] - BACKDROP_FLOOR_ALPHA).abs() < 1e-6));
+        assert_eq!(b[6].color, color(BACKDROP_EDGE_RGB, false));
+        assert_eq!(a[6].color, color(EDGE_RGB, false));
+        assert!(b.iter().skip(6).all(|v| v.color[3] == 1.0), "edges and markers stay opaque");
+    }
+
+    #[test]
+    fn the_quad_vertex_layout_matches_its_shader() {
+        assert_eq!(std::mem::size_of::<QuadVertex>(), 16);
+        let l = QuadVertex::layout();
+        assert_eq!(l.array_stride, 16);
+        assert_eq!((l.attributes[0].shader_location, l.attributes[0].offset), (0, 0));
+        assert_eq!((l.attributes[1].shader_location, l.attributes[1].offset), (1, 8));
+        assert!(QUAD_SHADER_WGSL.contains("vs_quad") && QUAD_SHADER_WGSL.contains("fs_quad"));
     }
 }

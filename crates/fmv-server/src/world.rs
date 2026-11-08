@@ -35,20 +35,37 @@
 //! The speed rule measures horizontal distance only. Height is never taken from the client: the
 //! adapter is shown the entity's own height and decides the new one, so vertical travel is
 //! whatever the walkable surface allows for the horizontal travel that was paid for.
+//!
+//! # Accounts, parties, placement
+//!
+//! Every player belongs to an authenticated account (one session per account at a time: a second
+//! `join` for an account that is already in the world is refused, atomically). The world owns the
+//! one [`PartyManager`] and routes its events: a request acts for the account of the REQUESTING
+//! session (never an id from a message), every event goes to exactly the accounts in
+//! `PartyEvent::audience`, and a player that leaves the world for any reason (disconnect,
+//! shutdown, a slow client being dropped) leaves its party and has its pending invites withdrawn
+//! in the same step, so no ghost member or ghost invite can outlive a connection. The party clock
+//! is milliseconds of the `Instant`s the caller passes in. Placement
+//! (`fmv_party::InstanceSelector`) is told to each player on join and whenever a party change
+//! alters it; it is informational: there is one hosted area, one instance.
 
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use fmv_adapter_api::{AreaRuntime, MoveResult};
-use fmv_core::{AnimState, AreaId, AvatarAppearance, EntityId, EntitySnapshot, Pos, SessionId};
-use fmv_protocol::ServerMsg;
+use fmv_core::{AccountId, AnimState, AreaId, AvatarAppearance, EntityId, EntitySnapshot, PhaseKey, Pos, SessionId};
+use fmv_party::{InstanceSelector, Invite, PartyConfig, PartyEvent, PartyManager, PhaseMap, Placement, Tick};
+use fmv_protocol::{PartyName, ServerMsg};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, warn};
 
 use crate::ServerError;
+
+mod party;
+pub use party::PartyOutcome;
 
 /// A message queued for one or more connections. Broadcasts share one allocation.
 pub type Outbound = Arc<ServerMsg>;
@@ -127,6 +144,10 @@ impl MoveBudget {
 
 struct Player {
     session: SessionId,
+    /// The authenticated account of this session (never taken from a message).
+    account: AccountId,
+    /// The account's story phase for the hosted game (opaque to everything but equality).
+    phase: PhaseKey,
     snapshot: EntitySnapshot,
     /// Travel budget for the speed rule.
     budget: MoveBudget,
@@ -134,15 +155,32 @@ struct Player {
     dirty: bool,
     tx: OutboundTx,
     close: CloseFlag,
+    /// Party events delivered to this player so far (the `seq` of the last one).
+    party_seq: u64,
+    /// When this player's recent invites were created, oldest first (the invite rate limit).
+    invites: VecDeque<Instant>,
+    /// What the last `InstancePlacement` sent to this player said.
+    placement: Option<Placement>,
 }
 
 /// Everything the world needs to admit a player into the area.
 pub struct NewPlayer {
     pub session: SessionId,
     pub entity: EntityId,
+    /// The authenticated account. At most one session per account may be in the world.
+    pub account: AccountId,
     pub avatar: AvatarAppearance,
+    /// The account's story phase for the hosted game.
+    pub phase: PhaseKey,
     pub tx: OutboundTx,
     pub close: CloseFlag,
+}
+
+/// Why a player could not be admitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinError {
+    /// The account already has a session in the world.
+    AlreadyOnline,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,10 +213,21 @@ pub struct World {
     tick: u64,
     /// Ordered by entity id so snapshots are deterministic.
     players: BTreeMap<EntityId, Player>,
+    /// The entity of each account's session.
+    by_account: BTreeMap<AccountId, EntityId>,
+    parties: PartyManager,
+    /// Origin of the party clock: party `Tick`s are milliseconds since this instant.
+    epoch: Instant,
 }
 
 impl World {
+    /// A world with the default party rules (three members, 60 s invites).
+    #[cfg(test)]
     pub fn new(area: Box<dyn AreaRuntime>) -> Result<Self, ServerError> {
+        Self::with_party_config(area, PartyConfig::default())
+    }
+
+    pub fn with_party_config(area: Box<dyn AreaRuntime>, party: PartyConfig) -> Result<Self, ServerError> {
         let area_id = area.info().id.clone();
         let spawn_points: Vec<Pos> = area.spawn_points().into_iter().filter(|p| p.is_finite()).collect();
         if spawn_points.is_empty() {
@@ -198,6 +247,9 @@ impl World {
             next_session: 1,
             tick: 0,
             players: BTreeMap::new(),
+            by_account: BTreeMap::new(),
+            parties: PartyManager::new(party),
+            epoch: Instant::now(),
         })
     }
 
@@ -218,26 +270,43 @@ impl World {
         ids
     }
 
-    /// Spawn the player (round-robin over the spawn points), queue the full `AreaSnapshot` to
-    /// the joiner (always the first thing in its queue after the handshake replies) and
-    /// `PlayerJoined` to everyone else. The movement budget starts empty. Returns the spawn
-    /// position.
-    pub fn join(&mut self, new: NewPlayer, now: Instant) -> Pos {
+    /// Whether `account` has a session in the world.
+    pub fn is_online(&self, account: AccountId) -> bool {
+        self.by_account.contains_key(&account)
+    }
+
+    /// Spawn the player (round-robin over the spawn points), queue the full `AreaSnapshot` and
+    /// then the `InstancePlacement` to the joiner (always the first things in its queue after the
+    /// handshake replies) and `PlayerJoined` to everyone else. The movement budget starts empty.
+    /// Returns the spawn position, or refuses a second session for the same account.
+    pub fn join(&mut self, new: NewPlayer, now: Instant) -> Result<Pos, JoinError> {
+        // Checked here, under the world lock, because two handshakes with the same token can both
+        // pass authentication.
+        if self.by_account.contains_key(&new.account) {
+            return Err(JoinError::AlreadyOnline);
+        }
         let pos = self.spawn_points[self.next_spawn % self.spawn_points.len()];
         self.next_spawn = self.next_spawn.wrapping_add(1);
         let entity = new.entity;
+        let account = new.account;
         let snapshot = EntitySnapshot { id: entity, pos, facing: 0.0, anim: AnimState::Idle, avatar: new.avatar };
         self.players.insert(
             entity,
             Player {
                 session: new.session,
+                account,
+                phase: new.phase,
                 snapshot: snapshot.clone(),
                 budget: MoveBudget::new(now),
                 dirty: false,
                 tx: new.tx,
                 close: new.close,
+                party_seq: 0,
+                invites: VecDeque::new(),
+                placement: None,
             },
         );
+        self.by_account.insert(account, entity);
 
         let area_snapshot = Arc::new(ServerMsg::AreaSnapshot {
             area: self.area_id.clone(),
@@ -253,17 +322,36 @@ impl World {
                 failed.push((*id, is_full(&e)));
             }
         }
+        // The joiner's first placement (a solo player is placed by its own phase).
+        self.refresh_placements(&BTreeSet::from([account]), &mut failed);
         self.drop_failed(failed);
-        pos
+        Ok(pos)
     }
 
-    /// Remove a player and tell the others. Returns `false` if it was already gone.
+    /// Remove a player and tell the others. Returns `false` if it was already gone. The player
+    /// also leaves its party and its pending invites are withdrawn (see the module docs).
     pub fn leave(&mut self, entity: EntityId) -> bool {
-        if self.players.remove(&entity).is_none() {
-            return false;
+        let mut failed = Vec::new();
+        let removed = self.remove_player(entity, &mut failed).is_some();
+        self.drop_failed(failed);
+        removed
+    }
+
+    /// THE removal path, for a voluntary leave and for a dropped client alike: take the player out
+    /// of the world and the account map, take it out of its party (announcing that to the
+    /// others), then tell everyone else it left. Players whose queues fail on the way are
+    /// appended to `failed` for the caller to drop.
+    fn remove_player(&mut self, entity: EntityId, failed: &mut Vec<(EntityId, bool)>) -> Option<Player> {
+        let player = self.players.remove(&entity)?;
+        self.by_account.remove(&player.account);
+        self.leave_party_state(&player, failed);
+        let left = Arc::new(ServerMsg::PlayerLeft { entity });
+        for (id, other) in &self.players {
+            if let Err(e) = other.tx.try_send(Arc::clone(&left)) {
+                failed.push((*id, is_full(&e)));
+            }
         }
-        self.fan_out(Arc::new(ServerMsg::PlayerLeft { entity }));
-        true
+        Some(player)
     }
 
     /// Validate and apply one `MoveIntent` (see the module docs for the rules). Order: finite
@@ -337,24 +425,165 @@ impl World {
         self.drop_failed(failed);
     }
 
-    /// Remove players whose queue failed and announce their departure. Announcing can expose
-    /// further failures, so keep going until the set is stable.
+    /// Remove players whose queue failed (through the one removal path: party and invites
+    /// included) and tell their connections to close. Removing can expose further failures, so
+    /// keep going until the set is stable.
     fn drop_failed(&mut self, mut failed: Vec<(EntityId, bool)>) {
         while let Some((id, queue_full)) = failed.pop() {
-            let Some(p) = self.players.remove(&id) else { continue };
+            let Some(p) = self.remove_player(id, &mut failed) else { continue };
             if queue_full {
                 warn!(entity = id.0, session = p.session.0, "outbound queue full; disconnecting slow client");
             } else {
                 debug!(entity = id.0, session = p.session.0, "outbound queue closed; removing player");
             }
             p.close.send_replace(true);
-            let left = Arc::new(ServerMsg::PlayerLeft { entity: id });
-            for (other_id, other) in &self.players {
-                if let Err(e) = other.tx.try_send(Arc::clone(&left)) {
-                    failed.push((*other_id, is_full(&e)));
+        }
+    }
+
+    // ---- parties: the pieces shared by every party operation (the operations are in `party`) ----
+
+    /// The party clock: milliseconds of server monotonic time.
+    fn party_clock(&self, now: Instant) -> Tick {
+        u64::try_from(now.saturating_duration_since(self.epoch).as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Who the accounts in a party message are: display name and entity for every account that is
+    /// online, the name from `gone` for one that just left (its player is no longer here).
+    fn names_for(&self, accounts: &[AccountId], gone: &[(AccountId, String)]) -> Vec<PartyName> {
+        accounts
+            .iter()
+            .filter_map(|&account| {
+                if let Some(&entity) = self.by_account.get(&account) {
+                    let name = self.players.get(&entity)?.snapshot.avatar.display_name.clone();
+                    return Some(PartyName { account, name, entity: Some(entity) });
+                }
+                let (_, name) = gone.iter().find(|(a, _)| *a == account)?;
+                Some(PartyName { account, name: name.clone(), entity: None })
+            })
+            .collect()
+    }
+
+    /// Send every event to exactly the accounts of its audience (each gets its own `seq`), then
+    /// refresh the placement of everyone a membership change touched. `gone` names accounts that
+    /// are no longer online. Failing queues are appended to `failed`.
+    fn route_party_events(
+        &mut self,
+        events: Vec<PartyEvent>,
+        gone: &[(AccountId, String)],
+        failed: &mut Vec<(EntityId, bool)>,
+    ) {
+        let mut moved: BTreeSet<AccountId> = BTreeSet::new();
+        for event in events {
+            let mut audience = event.audience();
+            audience.sort();
+            audience.dedup();
+            let names = self.names_for(&audience, gone);
+            for account in &audience {
+                let Some(&entity) = self.by_account.get(account) else { continue };
+                let Some(player) = self.players.get_mut(&entity) else { continue };
+                player.party_seq += 1;
+                let msg = ServerMsg::PartyEvent { seq: player.party_seq, event: event.clone(), names: names.clone() };
+                if let Err(e) = player.tx.try_send(Arc::new(msg)) {
+                    failed.push((entity, is_full(&e)));
                 }
             }
+            // Joining, leaving, a new leader or a disbanded party can all change where (and
+            // whose phase decides where) the members are placed.
+            if !matches!(
+                event,
+                PartyEvent::InviteSent { .. }
+                    | PartyEvent::InviteDeclined { .. }
+                    | PartyEvent::InviteExpired { .. }
+                    | PartyEvent::InviteCancelled { .. }
+            ) {
+                moved.extend(audience);
+            }
         }
+        self.refresh_placements(&moved, failed);
+    }
+
+    /// Compute the placement of each online account in `accounts` (`InstanceSelector`: solo by its
+    /// own phase, in a party by the leader's) and tell the ones whose placement differs from what
+    /// they were last told.
+    fn refresh_placements(&mut self, accounts: &BTreeSet<AccountId>, failed: &mut Vec<(EntityId, bool)>) {
+        if accounts.is_empty() {
+            return;
+        }
+        let phases: PhaseMap = self.players.values().map(|p| (p.account, p.phase.clone())).collect();
+        for &account in accounts {
+            let Some(&entity) = self.by_account.get(&account) else { continue };
+            let party = self.parties.party_of(account).cloned();
+            let placement = match InstanceSelector::select(&self.area_id, account, party.as_ref(), &phases) {
+                Ok(placement) => placement,
+                Err(e) => {
+                    warn!(account = account.0, error = %e, "cannot compute a placement");
+                    continue;
+                }
+            };
+            let Some(player) = self.players.get_mut(&entity) else { continue };
+            if player.placement.as_ref() == Some(&placement) {
+                continue;
+            }
+            player.placement = Some(placement.clone());
+            if let Err(e) = player.tx.try_send(Arc::new(ServerMsg::InstancePlacement { placement })) {
+                failed.push((entity, is_full(&e)));
+            }
+        }
+    }
+
+    /// A player is leaving the world: leave its party (the others hear `LeaderChanged` /
+    /// `MemberLeft` / `Disbanded`) and withdraw its pending invites. `fmv-party` has no
+    /// "remove this account" operation, so invites to the leaver are declined for it and invites
+    /// from a leaver that was solo are declined on the invitee's behalf; either way nobody can
+    /// later accept an invite from, or into, a player who is not there.
+    fn leave_party_state(&mut self, gone: &Player, failed: &mut Vec<(EntityId, bool)>) {
+        let account = gone.account;
+        let pending: Vec<Invite> =
+            self.parties.invites().filter(|i| i.from == account || i.to == account).copied().collect();
+        let mut events = Vec::new();
+        if self.parties.party_of(account).is_some() {
+            match self.parties.leave(account) {
+                Ok(e) => events.extend(e),
+                Err(e) => warn!(account = account.0, error = %e, "party leave failed while removing a player"),
+            }
+        }
+        for invite in pending {
+            // Leaving a party already cancelled the invites the leaver sent as a member.
+            if self.parties.get_invite(invite.id).is_none() {
+                continue;
+            }
+            let acting_as = if invite.to == account { account } else { invite.to };
+            match self.parties.decline(invite.id, acting_as) {
+                Ok(e) => events.extend(e),
+                Err(e) => warn!(invite = invite.id.0, error = %e, "cannot withdraw an invite while removing a player"),
+            }
+        }
+        let name = gone.snapshot.avatar.display_name.clone();
+        self.route_party_events(events, &[(account, name)], failed);
+    }
+
+    /// Expire timed-out invites (`InviteExpired` to both sides). Call it every tick.
+    pub fn expire_parties(&mut self, now: Instant) {
+        let clock = self.party_clock(now);
+        let events = match self.parties.expire(clock) {
+            Ok(events) => events,
+            Err(e) => {
+                warn!(error = %e, "party expiry failed");
+                return;
+            }
+        };
+        if events.is_empty() {
+            return;
+        }
+        let mut failed = Vec::new();
+        self.route_party_events(events, &[], &mut failed);
+        self.drop_failed(failed);
+    }
+
+    /// How many players are in `account`'s party (0 when it is solo).
+    #[cfg(test)]
+    pub fn party_size_of(&self, account: AccountId) -> usize {
+        self.parties.party_of(account).map_or(0, |p| p.size())
     }
 
     #[cfg(test)]
@@ -467,7 +696,9 @@ mod tests {
         let close = Arc::new(watch::channel(false).0);
         let close_rx = close.subscribe();
         let avatar = AvatarAppearance { display_name: name.into(), tint: [1, 2, 3], appearance_ref: None };
-        w.join(NewPlayer { session, entity, avatar, tx, close }, now);
+        let account = AccountId(entity.0);
+        w.join(NewPlayer { session, entity, account, avatar, phase: PhaseKey::default(), tx, close }, now)
+            .expect("a fresh account joins");
         Seat { entity, rx, close: close_rx }
     }
 
@@ -538,18 +769,22 @@ mod tests {
         let t0 = Instant::now();
         let mut w = world();
         let mut a = seat(&mut w, "A", 16, t0);
+        // The snapshot comes first, then where the player is placed (solo: by its own phase).
         match &a.drain()[..] {
-            [ServerMsg::AreaSnapshot { entities, area, .. }] => {
+            [ServerMsg::AreaSnapshot { entities, area, .. }, ServerMsg::InstancePlacement { placement }] => {
                 assert_eq!(area.key, FIXTURE_AREA_KEY);
                 assert_eq!(entities.len(), 1);
                 assert_eq!(entities[0].id, a.entity);
                 assert_eq!(entities[0].pos, Pos::new(-100.0, 0.0, 0.0));
+                assert_eq!(placement.account, AccountId(a.entity.0));
+                assert_eq!(placement.key.area.key, FIXTURE_AREA_KEY);
+                assert_eq!((placement.party, placement.phase_owner, placement.story_advance_allowed), (None, AccountId(a.entity.0), true));
             }
             other => panic!("unexpected: {other:?}"),
         }
         let mut b = seat(&mut w, "B", 16, t0);
         match &b.drain()[..] {
-            [ServerMsg::AreaSnapshot { entities, .. }] => {
+            [ServerMsg::AreaSnapshot { entities, .. }, ServerMsg::InstancePlacement { .. }] => {
                 assert_eq!(entities.len(), 2);
                 assert_eq!(w.snapshot_of(b.entity).unwrap().pos, Pos::new(100.0, 0.0, 0.0));
             }
@@ -936,6 +1171,551 @@ mod tests {
         assert_eq!(w.player_count(), 1);
         assert!(*gone.close.borrow());
         assert!(stay.drain().iter().any(|m| matches!(m, ServerMsg::PlayerLeft { entity } if *entity == gone.entity)));
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Accounts, parties, placement
+    // ---------------------------------------------------------------------------------------------
+
+    use fmv_party::{DisbandReason, InviteId, LeaderChangeReason, LeaveReason, PartyError};
+    use fmv_protocol::PartyFailure;
+
+    /// A seat with an explicit story phase (the account is still the entity's number).
+    fn seat_phase(w: &mut World, name: &str, now: Instant, phase: &[u8]) -> Seat {
+        let (session, entity) = w.allocate_ids();
+        let (tx, rx) = mpsc::channel(64);
+        let close = Arc::new(watch::channel(false).0);
+        let close_rx = close.subscribe();
+        let avatar = AvatarAppearance { display_name: name.into(), tint: [1, 2, 3], appearance_ref: None };
+        let new = NewPlayer { session, entity, account: AccountId(entity.0), avatar, phase: PhaseKey(phase.to_vec()), tx, close };
+        w.join(new, now).expect("join");
+        Seat { entity, rx, close: close_rx }
+    }
+
+    fn acct(s: &Seat) -> AccountId {
+        AccountId(s.entity.0)
+    }
+
+    /// The party events in `msgs`, in order, with their per-recipient sequence numbers.
+    fn party_events(msgs: &[ServerMsg]) -> Vec<(u64, PartyEvent)> {
+        msgs.iter()
+            .filter_map(|m| match m {
+                ServerMsg::PartyEvent { seq, event, .. } => Some((*seq, event.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn placements(msgs: &[ServerMsg]) -> Vec<Placement> {
+        msgs.iter()
+            .filter_map(|m| match m {
+                ServerMsg::InstancePlacement { placement } => Some(placement.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Everything but party events and placements (joins, leaves, updates).
+    fn world_traffic(msgs: &[ServerMsg]) -> Vec<&ServerMsg> {
+        msgs.iter()
+            .filter(|m| !matches!(m, ServerMsg::PartyEvent { .. } | ServerMsg::InstancePlacement { .. }))
+            .collect()
+    }
+
+    /// The invite id announced by the last `InviteSent` in `msgs`.
+    fn last_invite(msgs: &[ServerMsg]) -> InviteId {
+        party_events(msgs)
+            .into_iter()
+            .rev()
+            .find_map(|(_, e)| match e {
+                PartyEvent::InviteSent { invite, .. } => Some(invite),
+                _ => None,
+            })
+            .expect("an InviteSent")
+    }
+
+    /// `a` invites `b`, `b` accepts; returns nothing, but the parties are formed.
+    fn form(w: &mut World, a: &mut Seat, b: &mut Seat, now: Instant) {
+        assert_eq!(w.party_invite(a.entity, b.entity, now), PartyOutcome::Done);
+        let invite = last_invite(&b.drain());
+        assert_eq!(w.party_accept(b.entity, invite, now), PartyOutcome::Done);
+        a.drain();
+        b.drain();
+    }
+
+    #[test]
+    fn a_second_session_for_an_account_is_refused_and_leaves_no_trace() {
+        let t0 = Instant::now();
+        let mut w = world();
+        let a = seat(&mut w, "A", 16, t0);
+        let (session, entity) = w.allocate_ids();
+        let (tx, _rx) = mpsc::channel(16);
+        let close = Arc::new(watch::channel(false).0);
+        let avatar = AvatarAppearance { display_name: "A again".into(), tint: [0; 3], appearance_ref: None };
+        let dup = NewPlayer { session, entity, account: acct(&a), avatar, phase: PhaseKey::default(), tx, close };
+        assert_eq!(w.join(dup, t0).unwrap_err(), JoinError::AlreadyOnline);
+        assert_eq!(w.player_count(), 1);
+        assert!(w.snapshot_of(entity).is_none());
+        assert!(w.is_online(acct(&a)));
+        // Once the first session ends, the account can come back.
+        assert!(w.leave(a.entity));
+        assert!(!w.is_online(acct(&a)));
+        let (session, entity) = w.allocate_ids();
+        let (tx, _rx2) = mpsc::channel(16);
+        let close = Arc::new(watch::channel(false).0);
+        let again = NewPlayer {
+            session,
+            entity,
+            account: acct(&a),
+            avatar: AvatarAppearance { display_name: "A".into(), tint: [0; 3], appearance_ref: None },
+            phase: PhaseKey::default(),
+            tx,
+            close,
+        };
+        assert!(w.join(again, t0).is_ok());
+    }
+
+    #[test]
+    fn an_invite_and_its_acceptance_reach_exactly_their_audience() {
+        let t0 = Instant::now();
+        let mut w = world();
+        let mut a = seat(&mut w, "A", 64, t0);
+        let mut b = seat(&mut w, "B", 64, t0);
+        let mut c = seat(&mut w, "C", 64, t0);
+        for s in [&mut a, &mut b, &mut c] {
+            s.drain();
+        }
+
+        assert_eq!(w.party_invite(a.entity, b.entity, ms(t0, 10)), PartyOutcome::Done);
+        let (a_msgs, b_msgs, c_msgs) = (a.drain(), b.drain(), c.drain());
+        assert!(c_msgs.is_empty(), "a bystander hears nothing: {c_msgs:?}");
+        for msgs in [&a_msgs, &b_msgs] {
+            match &msgs[..] {
+                [ServerMsg::PartyEvent { seq: 1, event: PartyEvent::InviteSent { from, to, .. }, names }] => {
+                    assert_eq!((*from, *to), (acct(&a), acct(&b)));
+                    // The names say who these accounts are, entities included, so a client can mark them.
+                    assert_eq!(names.len(), 2);
+                    let n = |acc: AccountId| names.iter().find(|n| n.account == acc).unwrap();
+                    assert_eq!((n(acct(&a)).name.as_str(), n(acct(&a)).entity), ("A", Some(a.entity)));
+                    assert_eq!((n(acct(&b)).name.as_str(), n(acct(&b)).entity), ("B", Some(b.entity)));
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
+
+        let invite = last_invite(&b_msgs);
+        assert_eq!(w.party_accept(b.entity, invite, ms(t0, 20)), PartyOutcome::Done);
+        let (a_msgs, b_msgs) = (a.drain(), b.drain());
+        assert!(c.drain().is_empty());
+        for (msgs, seat_name) in [(&a_msgs, "A"), (&b_msgs, "B")] {
+            let events = party_events(msgs);
+            assert_eq!(events.len(), 1, "{seat_name}: {msgs:?}");
+            assert_eq!(events[0].0, 2, "{seat_name}'s second party event");
+            assert!(matches!(&events[0].1, PartyEvent::PartyFormed { leader, members, .. }
+                if *leader == acct(&a) && members == &vec![acct(&a), acct(&b)]));
+            // Being in a party changes the placement: the instance now follows the leader's phase.
+            let p = placements(msgs);
+            assert_eq!(p.len(), 1, "{seat_name}: {msgs:?}");
+            assert!(p[0].party.is_some() && p[0].phase_owner == acct(&a), "{seat_name}: {:?}", p[0]);
+        }
+        assert_eq!(w.party_size_of(acct(&a)), 2);
+        assert_eq!(w.party_size_of(acct(&c)), 0);
+    }
+
+    #[test]
+    fn the_party_holds_three_and_refuses_a_fourth() {
+        let t0 = Instant::now();
+        let mut w = world();
+        let mut a = seat(&mut w, "A", 64, t0);
+        let mut b = seat(&mut w, "B", 64, t0);
+        let mut c = seat(&mut w, "C", 64, t0);
+        let mut d = seat(&mut w, "D", 64, t0);
+        form(&mut w, &mut a, &mut b, ms(t0, 1));
+        assert_eq!(w.party_invite(a.entity, c.entity, ms(t0, 2)), PartyOutcome::Done);
+        let invite = last_invite(&c.drain());
+        assert_eq!(w.party_accept(c.entity, invite, ms(t0, 3)), PartyOutcome::Done);
+        // Everyone in the party, including the first member, hears about the third.
+        let id_c = acct(&c);
+        for s in [&mut a, &mut b, &mut c] {
+            let events = party_events(&s.drain());
+            assert!(
+                events.iter().any(|(_, e)| matches!(e, PartyEvent::MemberJoined { account, members, .. }
+                    if *account == id_c && members.len() == 3)),
+                "{events:?}"
+            );
+        }
+        assert_eq!(w.party_size_of(acct(&a)), 3);
+        // The fourth cannot even be invited.
+        let out = w.party_invite(a.entity, d.entity, ms(t0, 4));
+        assert!(matches!(out, PartyOutcome::Refused(PartyFailure::Rules(PartyError::PartyFull { max_size: 3, .. }))), "{out:?}");
+        assert!(party_events(&d.drain()).is_empty(), "the refused invitee hears nothing about it");
+    }
+
+    #[test]
+    fn refusals_go_to_the_requester_only_and_change_nothing() {
+        let t0 = Instant::now();
+        let mut w = world();
+        let mut a = seat(&mut w, "A", 64, t0);
+        let mut b = seat(&mut w, "B", 64, t0);
+        let mut c = seat(&mut w, "C", 64, t0);
+        form(&mut w, &mut a, &mut b, ms(t0, 1));
+        c.drain();
+
+        // A member that is not the leader may not invite.
+        let out = w.party_invite(b.entity, c.entity, ms(t0, 2));
+        assert!(matches!(out, PartyOutcome::Refused(PartyFailure::Rules(PartyError::NotLeader { .. }))), "{out:?}");
+        // Nobody to invite / yourself / somebody already in a party.
+        assert_eq!(w.party_invite(a.entity, EntityId(999), ms(t0, 3)), PartyOutcome::Refused(PartyFailure::UnknownPlayer));
+        assert!(matches!(
+            w.party_invite(a.entity, a.entity, ms(t0, 3)),
+            PartyOutcome::Refused(PartyFailure::Rules(PartyError::SelfInvite))
+        ));
+        assert!(matches!(
+            w.party_invite(c.entity, b.entity, ms(t0, 3)),
+            PartyOutcome::Refused(PartyFailure::Rules(PartyError::AlreadyInParty { .. }))
+        ));
+        // Accepting somebody else's invite, or one that does not exist.
+        assert_eq!(w.party_invite(a.entity, c.entity, ms(t0, 4)), PartyOutcome::Done);
+        let invite = last_invite(&c.drain());
+        assert!(matches!(
+            w.party_accept(b.entity, invite, ms(t0, 5)),
+            PartyOutcome::Refused(PartyFailure::Rules(PartyError::NotInvitee { .. }))
+        ));
+        assert!(matches!(
+            w.party_accept(c.entity, InviteId(4242), ms(t0, 5)),
+            PartyOutcome::Refused(PartyFailure::Rules(PartyError::UnknownInvite { .. }))
+        ));
+        // Kicking and promoting need a party, leadership and a member.
+        assert!(matches!(
+            w.party_kick(c.entity, a.entity),
+            PartyOutcome::Refused(PartyFailure::Rules(PartyError::NotInParty { .. }))
+        ));
+        assert!(matches!(
+            w.party_kick(b.entity, a.entity),
+            PartyOutcome::Refused(PartyFailure::Rules(PartyError::NotLeader { .. }))
+        ));
+        assert!(matches!(
+            w.party_promote(a.entity, c.entity),
+            PartyOutcome::Refused(PartyFailure::Rules(PartyError::TargetNotInParty { .. }))
+        ));
+        assert_eq!(w.party_kick(a.entity, EntityId(999)), PartyOutcome::Refused(PartyFailure::UnknownPlayer));
+        // Only the invite sent at ms 4 produced traffic (to A and C); the refusals produced none.
+        assert_eq!(party_events(&a.drain()).len(), 1);
+        assert_eq!(party_events(&b.drain()).len(), 0);
+        assert_eq!(w.party_size_of(acct(&a)), 2);
+    }
+
+    #[test]
+    fn invites_are_rate_limited_per_player_and_the_window_slides() {
+        let t0 = Instant::now();
+        let mut w = world();
+        let a = seat(&mut w, "A", 256, t0);
+        let others: Vec<Seat> = (0..7).map(|i| seat(&mut w, &format!("P{i}"), 64, t0)).collect();
+        for (i, other) in others.iter().take(super::party::MAX_INVITES_PER_WINDOW).enumerate() {
+            assert_eq!(w.party_invite(a.entity, other.entity, ms(t0, i as u64)), PartyOutcome::Done, "invite {i}");
+        }
+        let sixth = &others[super::party::MAX_INVITES_PER_WINDOW];
+        assert_eq!(w.party_invite(a.entity, sixth.entity, ms(t0, 100)), PartyOutcome::Refused(PartyFailure::RateLimited));
+        // Another player's allowance is its own.
+        assert_eq!(w.party_invite(others[0].entity, sixth.entity, ms(t0, 100)), PartyOutcome::Done);
+        // Once the oldest invites fall out of the window, A may invite again.
+        let later = ms(t0, 10_500);
+        assert_eq!(w.party_invite(a.entity, sixth.entity, later), PartyOutcome::Done);
+    }
+
+    #[test]
+    fn a_member_who_disconnects_leaves_the_party_and_the_leader_role_moves() {
+        let t0 = Instant::now();
+        let mut w = world();
+        let mut a = seat(&mut w, "A", 64, t0);
+        let mut b = seat(&mut w, "B", 64, t0);
+        let mut c = seat(&mut w, "C", 64, t0);
+        form(&mut w, &mut a, &mut b, ms(t0, 1));
+        assert_eq!(w.party_invite(a.entity, c.entity, ms(t0, 2)), PartyOutcome::Done);
+        let invite = last_invite(&c.drain());
+        assert_eq!(w.party_accept(c.entity, invite, ms(t0, 3)), PartyOutcome::Done);
+        for s in [&mut a, &mut b, &mut c] {
+            s.drain();
+        }
+
+        // B disconnects: the others hear MemberLeft with the roster after it, naming B even though
+        // B's player is already gone (entity None).
+        let (id_a, id_b, id_c) = (acct(&a), acct(&b), acct(&c));
+        assert!(w.leave(b.entity));
+        for s in [&mut a, &mut c] {
+            let msgs = s.drain();
+            let ev: Vec<_> = msgs
+                .iter()
+                .filter_map(|m| match m {
+                    ServerMsg::PartyEvent { event, names, .. } => Some((event.clone(), names.clone())),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(ev.len(), 1, "{msgs:?}");
+            assert!(matches!(&ev[0].0, PartyEvent::MemberLeft { account, reason: LeaveReason::Left, members, .. }
+                if *account == id_b && members == &vec![id_a, id_c]));
+            let leaver = ev[0].1.iter().find(|n| n.account == id_b).expect("the leaver is named");
+            assert_eq!((leaver.name.as_str(), leaver.entity), ("B", None));
+        }
+        assert_eq!(w.party_size_of(acct(&a)), 2);
+
+        // The leader disconnects: leadership passes to the longest-standing remaining member
+        // BEFORE the leaver is removed (every intermediate state is valid).
+        assert!(w.leave(a.entity));
+        let events = party_events(&c.drain());
+        assert!(matches!(&events[0].1, PartyEvent::LeaderChanged { new_leader, reason: LeaderChangeReason::LeaderLeft, .. }
+            if *new_leader == acct(&c)));
+        assert!(matches!(&events[1].1, PartyEvent::MemberLeft { account, .. } if *account == acct(&a)));
+        // A party of one is a party; the last one out disbands it.
+        assert_eq!(w.party_size_of(acct(&c)), 1);
+        assert_eq!(w.party_leave(c.entity), PartyOutcome::Done);
+        let events = party_events(&c.drain());
+        assert!(matches!(&events[0].1, PartyEvent::Disbanded { reason: DisbandReason::LastMemberLeft, .. }));
+        assert_eq!(w.party_size_of(acct(&c)), 0);
+    }
+
+    #[test]
+    fn a_dropped_slow_client_leaves_its_party_through_the_same_path() {
+        let t0 = Instant::now();
+        let mut w = world();
+        let mut a = seat(&mut w, "A", 64, t0);
+        // B's queue holds the snapshot and placement and one more message: the party formation
+        // overflows it, the world drops B, and A must still be told that B left the party.
+        let b = seat(&mut w, "B", 3, t0);
+        a.drain();
+        assert_eq!(w.party_invite(a.entity, b.entity, ms(t0, 1)), PartyOutcome::Done); // B's 3rd message
+        let invite = last_invite(&[ServerMsg::PartyEvent {
+            seq: 0,
+            event: PartyEvent::InviteSent { invite: InviteId(1), from: acct(&a), to: AccountId(b.entity.0), expires_at: 0 },
+            names: vec![],
+        }]);
+        assert_eq!(w.party_accept(b.entity, invite, ms(t0, 2)), PartyOutcome::Done);
+        assert!(*b.close.borrow(), "the slow client is told to close");
+        assert_eq!(w.player_count(), 1);
+        assert!(!w.is_online(AccountId(b.entity.0)));
+        let msgs = a.drain();
+        let events = party_events(&msgs);
+        assert!(events.iter().any(|(_, e)| matches!(e, PartyEvent::PartyFormed { .. })), "{events:?}");
+        assert!(
+            events.iter().any(|(_, e)| matches!(e, PartyEvent::MemberLeft { account, .. } if *account == AccountId(b.entity.0))),
+            "A must hear that B left: {events:?}"
+        );
+        assert!(msgs.iter().any(|m| matches!(m, ServerMsg::PlayerLeft { entity } if *entity == b.entity)));
+        assert_eq!(w.party_size_of(acct(&a)), 1, "no ghost member");
+    }
+
+    #[test]
+    fn pending_invites_are_withdrawn_when_either_side_leaves() {
+        let t0 = Instant::now();
+        let mut w = world();
+        let mut a = seat(&mut w, "A", 64, t0);
+        let mut b = seat(&mut w, "B", 64, t0);
+        let mut c = seat(&mut w, "C", 64, t0);
+        for s in [&mut a, &mut b, &mut c] {
+            s.drain();
+        }
+        // A (solo) invites B and then disconnects: B must not be able to accept an invite from a
+        // player who is not there (that would form a party with a ghost).
+        assert_eq!(w.party_invite(a.entity, b.entity, ms(t0, 1)), PartyOutcome::Done);
+        let invite = last_invite(&b.drain());
+        assert!(w.leave(a.entity));
+        let events = party_events(&b.drain());
+        assert!(
+            events.iter().any(|(_, e)| matches!(e, PartyEvent::InviteDeclined { invite: i, .. } if *i == invite)),
+            "B hears the invite is over: {events:?}"
+        );
+        assert!(matches!(
+            w.party_accept(b.entity, invite, ms(t0, 2)),
+            PartyOutcome::Refused(PartyFailure::Rules(PartyError::UnknownInvite { .. }))
+        ));
+        assert_eq!(w.party_size_of(acct(&b)), 0);
+
+        // The invitee disconnecting withdraws the invite from the inviter's side as well.
+        assert_eq!(w.party_invite(b.entity, c.entity, ms(t0, 3)), PartyOutcome::Done);
+        let invite = last_invite(&c.drain());
+        b.drain();
+        assert!(w.leave(c.entity));
+        let events = party_events(&b.drain());
+        assert!(events.iter().any(|(_, e)| matches!(e, PartyEvent::InviteDeclined { invite: i, .. } if *i == invite)), "{events:?}");
+    }
+
+    #[test]
+    fn invites_expire_on_the_server_clock() {
+        let t0 = Instant::now();
+        let mut w = world();
+        let mut a = seat(&mut w, "A", 64, t0);
+        let mut b = seat(&mut w, "B", 64, t0);
+        a.drain();
+        b.drain();
+        assert_eq!(w.party_invite(a.entity, b.entity, ms(t0, 1_000)), PartyOutcome::Done);
+        let invite = last_invite(&b.drain());
+        a.drain();
+
+        w.expire_parties(ms(t0, 30_000));
+        assert!(party_events(&a.drain()).is_empty(), "still alive after 30 s");
+        w.expire_parties(ms(t0, 62_000));
+        for s in [&mut a, &mut b] {
+            let events = party_events(&s.drain());
+            assert!(matches!(&events[..], [(_, PartyEvent::InviteExpired { invite: i, .. })] if *i == invite), "{events:?}");
+        }
+        assert!(matches!(
+            w.party_accept(b.entity, invite, ms(t0, 63_000)),
+            PartyOutcome::Refused(PartyFailure::Rules(PartyError::UnknownInvite { .. }))
+        ));
+        // Expiring again announces nothing.
+        w.expire_parties(ms(t0, 70_000));
+        assert!(party_events(&a.drain()).is_empty());
+    }
+
+    #[test]
+    fn kick_promote_and_leave_tell_everyone_concerned() {
+        let t0 = Instant::now();
+        let mut w = world();
+        let mut a = seat(&mut w, "A", 64, t0);
+        let mut b = seat(&mut w, "B", 64, t0);
+        let mut c = seat(&mut w, "C", 64, t0);
+        form(&mut w, &mut a, &mut b, ms(t0, 1));
+        assert_eq!(w.party_invite(a.entity, c.entity, ms(t0, 2)), PartyOutcome::Done);
+        let invite = last_invite(&c.drain());
+        assert_eq!(w.party_accept(c.entity, invite, ms(t0, 3)), PartyOutcome::Done);
+        for s in [&mut a, &mut b, &mut c] {
+            s.drain();
+        }
+
+        // Promote B: everyone is told, and the placement's phase owner follows the leader.
+        let id_b = acct(&b);
+        assert_eq!(w.party_promote(a.entity, b.entity), PartyOutcome::Done);
+        for s in [&mut a, &mut b, &mut c] {
+            let msgs = s.drain();
+            let events = party_events(&msgs);
+            assert!(matches!(&events[..], [(_, PartyEvent::LeaderChanged { new_leader, reason: LeaderChangeReason::Promoted, .. })]
+                if *new_leader == id_b), "{events:?}");
+            assert!(placements(&msgs).iter().all(|p| p.phase_owner == id_b));
+        }
+        // The old leader can no longer kick; the new one can. The kicked player hears it too and
+        // is placed on its own again.
+        assert!(matches!(
+            w.party_kick(a.entity, c.entity),
+            PartyOutcome::Refused(PartyFailure::Rules(PartyError::NotLeader { .. }))
+        ));
+        assert_eq!(w.party_kick(b.entity, c.entity), PartyOutcome::Done);
+        let msgs = c.drain();
+        let events = party_events(&msgs);
+        assert!(matches!(&events[..], [(_, PartyEvent::MemberLeft { account, reason: LeaveReason::Kicked, members, .. })]
+            if *account == acct(&c) && members == &vec![acct(&a), acct(&b)]), "{events:?}");
+        assert!(matches!(&placements(&msgs)[..], [p] if p.party.is_none() && p.phase_owner == acct(&c)));
+        assert_eq!(w.party_size_of(acct(&c)), 0);
+        assert_eq!(w.party_size_of(acct(&a)), 2);
+        // A member leaves on its own.
+        a.drain();
+        b.drain();
+        assert_eq!(w.party_leave(a.entity), PartyOutcome::Done);
+        let events = party_events(&b.drain());
+        assert!(matches!(&events[..], [(_, PartyEvent::MemberLeft { account, reason: LeaveReason::Left, .. })] if *account == acct(&a)), "{events:?}");
+    }
+
+    #[test]
+    fn sync_answers_with_the_whole_situation_and_the_sequence_to_continue_from() {
+        let t0 = Instant::now();
+        let mut w = world();
+        let mut a = seat(&mut w, "A", 64, t0);
+        let mut b = seat(&mut w, "B", 64, t0);
+        let mut c = seat(&mut w, "C", 64, t0);
+        form(&mut w, &mut a, &mut b, ms(t0, 1));
+        assert_eq!(w.party_invite(a.entity, c.entity, ms(t0, 2)), PartyOutcome::Done);
+        a.drain();
+        c.drain();
+
+        assert_eq!(w.party_sync(a.entity, ms(t0, 3)), PartyOutcome::Done);
+        match &a.drain()[..] {
+            [ServerMsg::PartyState { seq, party: Some(party), invites, names }] => {
+                // A saw: InviteSent (1), PartyFormed (2), InviteSent (3).
+                assert_eq!(*seq, 3);
+                assert_eq!((party.leader, &party.members), (acct(&a), &vec![acct(&a), acct(&b)]));
+                assert_eq!(invites.len(), 1);
+                assert_eq!((invites[0].from, invites[0].to), (acct(&a), acct(&c)));
+                let who: Vec<&str> = names.iter().map(|n| n.name.as_str()).collect();
+                assert_eq!(who, ["A", "B", "C"]);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        // The invitee sees the same invite and no party.
+        assert_eq!(w.party_sync(c.entity, ms(t0, 3)), PartyOutcome::Done);
+        match &c.drain()[..] {
+            [ServerMsg::PartyState { seq: 1, party: None, invites, .. }] => assert_eq!(invites.len(), 1),
+            other => panic!("unexpected: {other:?}"),
+        }
+        // A timed-out invite that was not reaped yet is not reported.
+        assert_eq!(w.party_sync(c.entity, ms(t0, 120_000)), PartyOutcome::Done);
+        assert!(matches!(&c.drain()[..], [ServerMsg::PartyState { invites, .. }] if invites.is_empty()));
+        // Sequence numbers continue from the state: the next event is seq 4 for A.
+        assert_eq!(w.party_kick(a.entity, b.entity), PartyOutcome::Done);
+        assert_eq!(party_events(&a.drain())[0].0, 4);
+    }
+
+    #[test]
+    fn story_phases_decide_the_instance_and_whether_the_story_may_advance() {
+        let t0 = Instant::now();
+        let mut w = world();
+        let mut a = seat_phase(&mut w, "A", t0, &[1]);
+        let mut b = seat_phase(&mut w, "B", t0, &[2]);
+        // Solo, everyone is placed by their own phase.
+        let a_join = placements(&a.drain());
+        let b_join = placements(&b.drain());
+        assert_eq!(a_join[0].key.phase, PhaseKey(vec![1]));
+        assert_eq!(b_join[0].key.phase, PhaseKey(vec![2]));
+        assert!(a_join[0].story_advance_allowed && b_join[0].story_advance_allowed);
+
+        // In A's party both are placed by the LEADER's phase; B keeps its own progression but
+        // may not advance A's story.
+        assert_eq!(w.party_invite(a.entity, b.entity, ms(t0, 1)), PartyOutcome::Done);
+        let invite = last_invite(&b.drain());
+        assert_eq!(w.party_accept(b.entity, invite, ms(t0, 2)), PartyOutcome::Done);
+        let b_party = placements(&b.drain());
+        assert_eq!(b_party.len(), 1);
+        assert_eq!(b_party[0].key.phase, PhaseKey(vec![1]));
+        assert_eq!(b_party[0].phase_owner, acct(&a));
+        assert!(!b_party[0].story_advance_allowed);
+        // A's own placement did not change (same key, same flag): it is not told again.
+        assert!(placements(&a.drain()).iter().all(|p| p.party.is_some()));
+
+        // Leaving puts B back on its own phase.
+        assert_eq!(w.party_leave(b.entity), PartyOutcome::Done);
+        let back = placements(&b.drain());
+        assert_eq!(back.last().unwrap().key.phase, PhaseKey(vec![2]));
+        assert!(back.last().unwrap().party.is_none() && back.last().unwrap().story_advance_allowed);
+    }
+
+    #[test]
+    fn requests_from_players_who_are_gone_report_gone() {
+        let t0 = Instant::now();
+        let mut w = world();
+        let a = seat(&mut w, "A", 16, t0);
+        let ghost = EntityId(777);
+        assert_eq!(w.party_invite(ghost, a.entity, t0), PartyOutcome::Gone);
+        assert_eq!(w.party_accept(ghost, InviteId(1), t0), PartyOutcome::Gone);
+        assert_eq!(w.party_decline(ghost, InviteId(1)), PartyOutcome::Gone);
+        assert_eq!(w.party_leave(ghost), PartyOutcome::Gone);
+        assert_eq!(w.party_kick(ghost, a.entity), PartyOutcome::Gone);
+        assert_eq!(w.party_promote(ghost, a.entity), PartyOutcome::Gone);
+        assert_eq!(w.party_sync(ghost, t0), PartyOutcome::Gone);
+    }
+
+    #[test]
+    fn party_traffic_does_not_disturb_world_traffic() {
+        let t0 = Instant::now();
+        let mut w = world();
+        let mut a = seat(&mut w, "A", 64, t0);
+        let mut b = seat(&mut w, "B", 64, t0);
+        form(&mut w, &mut a, &mut b, ms(t0, 1));
+        // Walking still broadcasts exactly one update per tick, and parties add nothing to it.
+        assert_eq!(walk(&mut w, &a, -80.0, 0.0, ms(t0, 200)), MoveOutcome::Applied);
+        w.advance_tick();
+        for s in [&mut a, &mut b] {
+            let msgs = s.drain();
+            assert_eq!(world_traffic(&msgs).len(), 1, "{msgs:?}");
+            assert!(party_events(&msgs).is_empty());
+        }
     }
 
     #[test]

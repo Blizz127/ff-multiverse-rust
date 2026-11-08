@@ -26,8 +26,9 @@
 //!   changes: an update that arrives while we are busy would otherwise be lost for good.
 
 use crate::interp::{normalize_angle, Pose, Sample, SnapshotBuffer};
+use crate::party::{nearest_peer, PartyMirror};
 use fmv_adapter_api::{AreaRuntime, MoveResult};
-use fmv_core::{AnimState, AreaId, AvatarAppearance, EntityId, EntitySnapshot, Pos};
+use fmv_core::{AccountId, AnimState, AreaId, AvatarAppearance, EntityId, EntitySnapshot, Pos};
 use fmv_protocol::ServerMsg;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -264,6 +265,8 @@ pub struct ClientState {
     /// The area we joined (verified against local content during the handshake).
     area: AreaId,
     pub own: OwnPlayer,
+    /// Our party and pending invites, as the server announced them.
+    pub party: PartyMirror,
     remotes: BTreeMap<EntityId, Remote>,
     peers_seen: BTreeSet<EntityId>,
     updates: u64,
@@ -272,11 +275,14 @@ pub struct ClientState {
 }
 
 impl ClientState {
-    pub fn new(self_entity: EntityId, spawn: Pos, area: AreaId) -> Self {
+    /// `account` is ours: party events name accounts, so it is how the party mirror recognises
+    /// itself in them.
+    pub fn new(self_entity: EntityId, account: AccountId, spawn: Pos, area: AreaId) -> Self {
         Self {
             self_entity,
             area,
             own: OwnPlayer::new(spawn),
+            party: PartyMirror::new(account),
             remotes: BTreeMap::new(),
             peers_seen: BTreeSet::new(),
             updates: 0,
@@ -356,6 +362,10 @@ impl ClientState {
             }
             // `Welcome` and `Pong` carry nothing the game state needs after the handshake.
             ServerMsg::Welcome { .. } | ServerMsg::Pong { .. } => {}
+            ServerMsg::InstancePlacement { placement } => self.party.on_placement(placement),
+            ServerMsg::PartyEvent { seq, event, names } => self.party.on_event(seq, event, names),
+            ServerMsg::PartyState { seq, party, invites, names } => self.party.on_state(seq, party, invites, names),
+            ServerMsg::PartyRejected { error } => self.party.on_rejected(&error),
         }
         None
     }
@@ -391,6 +401,15 @@ impl ClientState {
                 anim: snap.anim,
             },
         });
+    }
+
+    /// The visible remote player nearest to us (distance in area coordinates) who is not already
+    /// in our party: who "invite the nearest player" means. `None` if there is nobody to invite.
+    pub fn nearest_invitable(&self, render_t: f64) -> Option<EntityId> {
+        let views = self.remote_views(render_t);
+        nearest_peer(self.own.pos(), views.iter().map(|v| (v.id, v.pose.pos)), |id| {
+            self.party.is_party_entity(id)
+        })
     }
 
     /// Interpolated remote entities at `render_t`, in a stable (id) order.
@@ -443,7 +462,7 @@ mod tests {
         }
     }
     fn state(spawn: Pos) -> ClientState {
-        ClientState::new(EntityId(1), spawn, plaza())
+        ClientState::new(EntityId(1), AccountId(1), spawn, plaza())
     }
     fn at(x: f32) -> Pos {
         Pos::new(x, 0.0, 0.0)
@@ -583,7 +602,7 @@ mod tests {
 
     #[test]
     fn untrusted_snapshots_are_filtered_and_bounded() {
-        let mut s = ClientState::new(EntityId(1), Pos::default(), plaza());
+        let mut s = ClientState::new(EntityId(1), AccountId(1), Pos::default(), plaza());
         let mut bad = snap(2, f32::NAN, 0.0);
         s.apply(0.0, update(vec![bad.clone()]));
         bad.pos = Pos::new(0.0, f32::INFINITY, 0.0);
@@ -599,7 +618,7 @@ mod tests {
         assert_eq!(s.peers_seen(), 3 * MAX_REMOTES);
 
         // Hostile names are cleaned before they can reach a terminal or a window title.
-        let mut s = ClientState::new(EntityId(1), Pos::default(), plaza());
+        let mut s = ClientState::new(EntityId(1), AccountId(1), Pos::default(), plaza());
         let mut e = snap(2, 0.0, 0.0);
         e.avatar.display_name = "\u{1b}[31mEvil\u{7}\n".into();
         s.apply(0.0, update(vec![e]));
@@ -882,5 +901,78 @@ mod tests {
         s.own.next_intent(20.2).unwrap();
         assert!(s.own.next_intent(21.0).is_none());
         assert_eq!(s.own.pos().x, 130.0, "the superseded server position must not come back");
+    }
+
+    fn party_name(account: u64, name: &str, entity: u64) -> fmv_protocol::PartyName {
+        fmv_protocol::PartyName { account: AccountId(account), name: name.into(), entity: Some(EntityId(entity)) }
+    }
+
+    /// The party messages reach the mirror through `apply`, none of them ends the session, and
+    /// the mirror knows which account is ours.
+    #[test]
+    fn party_messages_feed_the_mirror_and_never_end_the_session() {
+        use fmv_protocol::{InviteId, PartyEvent, PartyFailure, PartyId, Placement};
+        let mut s = state(Pos::default()); // we are account 1, entity 1
+        let names = vec![party_name(1, "Me", 1), party_name(2, "Tifa", 2)];
+        let ev = |seq: u64, event: PartyEvent| ServerMsg::PartyEvent { seq, event, names: names.clone() };
+        let sent = PartyEvent::InviteSent { invite: InviteId(1), from: AccountId(2), to: AccountId(1), expires_at: 9 };
+        assert!(s.apply(0.0, ev(1, sent)).is_none());
+        assert_eq!(s.party.newest_invite_to_me().map(|i| (i.id, i.from_name)), Some((InviteId(1), "Tifa".to_string())));
+        let formed = PartyEvent::PartyFormed {
+            party: PartyId(1),
+            invite: InviteId(1),
+            leader: AccountId(2),
+            members: vec![AccountId(2), AccountId(1)],
+        };
+        assert!(s.apply(0.1, ev(2, formed)).is_none());
+        assert_eq!((s.party.party_size(), s.party.peak_party_size()), (2, 2));
+        assert!(s.party.is_party_entity(EntityId(2)));
+
+        assert!(s.apply(0.2, ServerMsg::PartyRejected { error: PartyFailure::UnknownPlayer }).is_none());
+        assert_eq!(s.party.rejection_count(), 1);
+
+        let placement = Placement {
+            account: AccountId(1),
+            key: fmv_protocol::InstanceKey::new(plaza(), fmv_core::PhaseKey(vec![])),
+            party: Some(PartyId(1)),
+            phase_owner: AccountId(2),
+            story_advance_allowed: true,
+        };
+        assert!(s.apply(0.3, ServerMsg::InstancePlacement { placement }).is_none());
+        assert_eq!(s.party.last_placement().map(|p| p.party), Some(Some(PartyId(1))));
+
+        // A `PartyState` replaces the party; the mirror's seq follows it.
+        let none = ServerMsg::PartyState { seq: 9, party: None, invites: vec![], names: vec![] };
+        assert!(s.apply(0.4, none).is_none());
+        assert_eq!(s.party.party_size(), 0);
+        // None of this counts as game traffic.
+        assert_eq!((s.updates(), s.rejected(), s.peers_seen()), (0, 0, 0));
+    }
+
+    /// "Invite the nearest player" means the nearest VISIBLE player who is not in our party yet.
+    #[test]
+    fn the_nearest_invitable_player_is_the_closest_visible_one_outside_the_party() {
+        use fmv_protocol::{InviteId, PartyEvent, PartyId};
+        let mut s = state(Pos::new(0.0, 0.0, 0.0));
+        assert_eq!(s.nearest_invitable(1.0), None, "nobody is here");
+        s.apply(0.0, update(vec![snap(1, 0.0, 0.0), snap(2, 10.0, 0.0), snap(3, 50.0, 0.0), snap(4, -30.0, 0.0)]));
+        assert_eq!(s.nearest_invitable(1.0), Some(EntityId(2)), "our own entity is never a candidate");
+        // The distance is measured from where WE are now.
+        s.own.set_motion(Pos::new(60.0, 0.0, 0.0), 0.0, AnimState::Idle);
+        assert_eq!(s.nearest_invitable(1.0), Some(EntityId(3)));
+        s.own.set_motion(Pos::new(0.0, 0.0, 0.0), 0.0, AnimState::Idle);
+        // Entity 2 (account 2) joins our party: the next closest is chosen instead.
+        let names = vec![party_name(1, "Me", 1), party_name(2, "Tifa", 2)];
+        let formed = PartyEvent::PartyFormed {
+            party: PartyId(1),
+            invite: InviteId(1),
+            leader: AccountId(1),
+            members: vec![AccountId(1), AccountId(2)],
+        };
+        s.apply(0.1, ServerMsg::PartyEvent { seq: 1, event: formed, names });
+        assert_eq!(s.nearest_invitable(1.0), Some(EntityId(4)));
+        s.apply(0.2, ServerMsg::PlayerLeft { entity: EntityId(4) });
+        s.apply(0.2, ServerMsg::PlayerLeft { entity: EntityId(3) });
+        assert_eq!(s.nearest_invitable(1.0), None, "everybody left is already in the party");
     }
 }

@@ -1,207 +1,20 @@
 //! End-to-end protocol tests: real TCP sockets, raw protocol clients (`fmv_protocol`
-//! `read_msg`/`write_msg`), in-process server hosting the FIXTURE area.
+//! `read_msg`/`write_msg`), in-process server hosting the FIXTURE area. The helpers (and the rule
+//! that every server gets its own private account store) are in `common`.
 //!
-//! Replies are always awaited with a loop that skips unrelated messages (joins, updates, pongs)
-//! and a timeout, so tests never depend on the exact interleaving of server broadcasts.
+//! This file covers movement, limits and robustness; accounts and parties are in
+//! `accounts_parties.rs`.
 
-use std::net::SocketAddr;
+mod common;
+
 use std::time::Duration;
 
-use fmv_adapter_api::{AreaInfo, GameAdapter};
-use fmv_core::{AnimState, EntityId, EntitySnapshot, GameId, Pos};
-use fmv_fixture::FixtureAdapter;
-use fmv_protocol::{encode, read_msg, write_msg, ClientMsg, ProtoError, ServerMsg, MAX_FRAME, PROTOCOL_VERSION};
-use fmv_server::{Server, ServerConfig, ServerError};
+use common::*;
+use fmv_core::{AnimState, Pos};
+use fmv_protocol::{encode, write_msg, Auth, ClientMsg, ServerMsg, MAX_FRAME, PROTOCOL_VERSION};
+use fmv_server::ServerConfig;
 use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpSocket, TcpStream};
-use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout, Instant};
-
-const STEP: Duration = Duration::from_secs(5);
-
-struct TestServer {
-    addr: SocketAddr,
-    stop: oneshot::Sender<()>,
-    task: JoinHandle<Result<(), ServerError>>,
-}
-
-impl TestServer {
-    async fn start(config: ServerConfig) -> Self {
-        let config = ServerConfig { bind: "127.0.0.1:0".parse().unwrap(), ..config };
-        let server = Server::bind(config, Box::new(FixtureAdapter::new())).await.expect("bind");
-        let addr = server.local_addr();
-        assert!(server.is_fixture());
-        assert_eq!(
-            server.ready_line(),
-            format!("READY protocol={PROTOCOL_VERSION} build={} addr={addr} area=Fixture/plaza fixture=true", env!("CARGO_PKG_VERSION"))
-        );
-        let (stop, stopped) = oneshot::channel::<()>();
-        let task = tokio::spawn(server.serve(async move {
-            let _ = stopped.await;
-        }));
-        Self { addr, stop, task }
-    }
-
-    async fn shutdown(self) {
-        let _ = self.stop.send(());
-        timeout(STEP * 2, self.task).await.expect("server stops in time").expect("server task did not panic").expect("serve returns Ok");
-    }
-}
-
-fn fixture_info() -> AreaInfo {
-    FixtureAdapter::new().list_areas().remove(0)
-}
-
-struct Client {
-    stream: TcpStream,
-}
-
-impl Client {
-    async fn connect(addr: SocketAddr) -> Self {
-        let stream = timeout(STEP, TcpStream::connect(addr)).await.expect("connect timed out").expect("connect");
-        Self { stream }
-    }
-
-    /// A client whose kernel receive buffer is tiny, so that it fills up (and the server's writes
-    /// to it block) after a few KiB once the client stops reading.
-    async fn connect_with_tiny_receive_buffer(addr: SocketAddr) -> Self {
-        let socket = TcpSocket::new_v4().expect("socket");
-        socket.set_recv_buffer_size(4096).expect("SO_RCVBUF");
-        let stream = timeout(STEP, socket.connect(addr)).await.expect("connect timed out").expect("connect");
-        Self { stream }
-    }
-
-    async fn send(&mut self, msg: &ClientMsg) {
-        write_msg(&mut self.stream, msg).await.expect("send");
-    }
-
-    /// Send a hand-written JSON payload inside a valid length-prefixed frame.
-    async fn send_json(&mut self, json: &str) {
-        let mut frame = u32::try_from(json.len()).unwrap().to_le_bytes().to_vec();
-        frame.extend_from_slice(json.as_bytes());
-        self.stream.write_all(&frame).await.expect("send raw frame");
-    }
-
-    async fn next(&mut self) -> ServerMsg {
-        timeout(STEP, read_msg::<_, ServerMsg>(&mut self.stream))
-            .await
-            .expect("timed out waiting for a server message")
-            .expect("read server message")
-    }
-
-    /// Read until `pick` matches, skipping everything else.
-    async fn until<T>(&mut self, what: &str, mut pick: impl FnMut(&ServerMsg) -> Option<T>) -> T {
-        loop {
-            let msg = timeout(STEP, read_msg::<_, ServerMsg>(&mut self.stream))
-                .await
-                .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
-                .unwrap_or_else(|e| panic!("connection ended while waiting for {what}: {e}"));
-            if let Some(found) = pick(&msg) {
-                return found;
-            }
-        }
-    }
-
-    /// The server must close the connection (anything still queued is skipped).
-    async fn expect_closed(&mut self) {
-        loop {
-            match timeout(STEP, read_msg::<_, ServerMsg>(&mut self.stream)).await.expect("timed out waiting for close") {
-                Err(ProtoError::Closed | ProtoError::Io(_)) => return,
-                Err(e) => panic!("unexpected error while waiting for close: {e}"),
-                Ok(_) => continue,
-            }
-        }
-    }
-
-    /// Expect a `Reject` whose reason contains `needle`, then the connection closing.
-    async fn expect_reject(&mut self, needle: &str) {
-        let reason = self
-            .until("Reject", |m| match m {
-                ServerMsg::Reject { reason } => Some(reason.clone()),
-                _ => None,
-            })
-            .await;
-        assert!(reason.contains(needle), "reject reason {reason:?} should mention {needle:?}");
-        self.expect_closed().await;
-    }
-
-    async fn hello(&mut self, name: &str) {
-        self.send(&ClientMsg::Hello {
-            protocol_version: PROTOCOL_VERSION,
-            client_build: "integration-test".into(),
-            display_name: name.into(),
-            tint: [10, 20, 30],
-            appearance_ref: Some("test-model".into()),
-        })
-        .await;
-    }
-}
-
-struct Joined {
-    client: Client,
-    entity: EntityId,
-    snapshot: Vec<EntitySnapshot>,
-}
-
-/// Full happy-path handshake. The order Welcome, AreaManifest, AreaSnapshot is part of the protocol
-/// and is asserted strictly.
-async fn join(addr: SocketAddr, name: &str) -> Joined {
-    join_on(Client::connect(addr).await, name).await
-}
-
-async fn join_on(mut client: Client, name: &str) -> Joined {
-    client.hello(name).await;
-    let entity = match client.next().await {
-        ServerMsg::Welcome { protocol_version, server_build, entity, .. } => {
-            assert_eq!(protocol_version, PROTOCOL_VERSION);
-            assert_eq!(server_build, env!("CARGO_PKG_VERSION"));
-            entity
-        }
-        other => panic!("expected Welcome, got {other:?}"),
-    };
-    let snapshot = finish_join(&mut client).await;
-    Joined { client, entity, snapshot }
-}
-
-/// The rest of the handshake after `Welcome`: check the manifest, answer `JoinArea`, return the
-/// `AreaSnapshot`'s entities.
-async fn finish_join(client: &mut Client) -> Vec<EntitySnapshot> {
-    let info = fixture_info();
-    match client.next().await {
-        ServerMsg::AreaManifest { area, display_name, fingerprint, provenance, fixture } => {
-            assert_eq!(area, info.id);
-            assert_eq!(fingerprint, info.fingerprint);
-            assert!(fixture, "the fixture area must be flagged as fixture");
-            assert!(display_name.contains("FIXTURE"), "display name must carry the FIXTURE label: {display_name}");
-            assert_eq!(provenance, info.provenance.summary());
-            assert_eq!(provenance.game, GameId::Fixture);
-        }
-        other => panic!("expected AreaManifest, got {other:?}"),
-    }
-    client.send(&ClientMsg::JoinArea { area: info.id.clone(), fingerprint: info.fingerprint }).await;
-    match client.next().await {
-        ServerMsg::AreaSnapshot { area, entities, .. } => {
-            assert_eq!(area, info.id);
-            entities
-        }
-        other => panic!("expected AreaSnapshot, got {other:?}"),
-    }
-}
-
-fn update_for(msg: &ServerMsg, id: EntityId) -> Option<EntitySnapshot> {
-    match msg {
-        ServerMsg::EntityUpdate { entities, .. } => entities.iter().find(|e| e.id == id).cloned(),
-        _ => None,
-    }
-}
-
-fn rejected(msg: &ServerMsg) -> Option<(u32, Pos)> {
-    match msg {
-        ServerMsg::MoveRejected { seq, corrected } => Some((*seq, *corrected)),
-        _ => None,
-    }
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_players_move_get_corrected_and_leave() {
@@ -337,12 +150,18 @@ async fn two_players_move_get_corrected_and_leave() {
     old.send(&ClientMsg::Hello {
         protocol_version: PROTOCOL_VERSION + 1,
         client_build: "from the future".into(),
-        display_name: "Eve".into(),
+        auth: Auth::Register { display_name: "Eve".into() },
         tint: [0; 3],
         appearance_ref: None,
     })
     .await;
     old.expect_reject("protocol version").await;
+
+    // A protocol v1 Hello has another shape (the name was at the top level). It is told the
+    // versions differ, not that its message is malformed.
+    let mut v1 = Client::connect(server.addr).await;
+    v1.send_json(r#"{"Hello":{"protocol_version":1,"client_build":"old","display_name":"Old","tint":[1,2,3],"appearance_ref":null}}"#).await;
+    v1.expect_reject("protocol version mismatch").await;
 
     server.shutdown().await;
 }
@@ -355,27 +174,27 @@ async fn bad_input_is_rejected_limits_hold_and_the_server_survives() {
 
     // JoinArea with a fingerprint the server does not host.
     let mut c = Client::connect(server.addr).await;
-    c.hello("Mallory").await;
+    c.hello(&uniq("Mallory")).await;
     let _ = c.next().await; // Welcome
     let _ = c.next().await; // AreaManifest
     let mut wrong = info.fingerprint;
     wrong.0[0] ^= 0xff;
-    c.send(&ClientMsg::JoinArea { area: info.id.clone(), fingerprint: wrong }).await;
+    c.send(&ClientMsg::JoinArea { area: info.id.clone(), fingerprint: wrong, provenance: info.provenance.summary() }).await;
     c.expect_reject("fingerprint mismatch").await;
 
     // JoinArea for another area.
     let mut c = Client::connect(server.addr).await;
-    c.hello("Mallory").await;
+    c.hello(&uniq("Mallory")).await;
     let _ = c.next().await;
     let _ = c.next().await;
     let mut other = info.id.clone();
     other.key = "elsewhere".into();
-    c.send(&ClientMsg::JoinArea { area: other, fingerprint: info.fingerprint }).await;
+    c.send(&ClientMsg::JoinArea { area: other, fingerprint: info.fingerprint, provenance: info.provenance.summary() }).await;
     c.expect_reject("area mismatch").await;
 
     // CannotJoin: the server just closes.
     let mut c = Client::connect(server.addr).await;
-    c.hello("Mallory").await;
+    c.hello(&uniq("Mallory")).await;
     let _ = c.next().await;
     let _ = c.next().await;
     c.send(&ClientMsg::CannotJoin { area: info.id.clone(), reason: "I have no owned copy".into() }).await;
@@ -407,7 +226,7 @@ async fn bad_input_is_rejected_limits_hold_and_the_server_survives() {
     c.hello("Flooder").await;
     let _ = c.next().await;
     let _ = c.next().await;
-    c.send(&ClientMsg::JoinArea { area: info.id.clone(), fingerprint: info.fingerprint }).await;
+    c.send(&join_area()).await;
     for nonce in 0..200 {
         // The server may already have hung up on us mid-flood; that is the expected outcome.
         if write_msg(&mut c.stream, &ClientMsg::Ping { nonce }).await.is_err() {
@@ -450,7 +269,7 @@ async fn bad_input_is_rejected_limits_hold_and_the_server_survives() {
     let mut freed = None;
     for _ in 0..50 {
         let mut again = Client::connect(idle.addr).await;
-        again.hello("Replacement").await;
+        again.hello(&uniq("Replacement")).await;
         match again.next().await {
             ServerMsg::Welcome { .. } => {
                 freed = Some(again);
@@ -461,7 +280,7 @@ async fn bad_input_is_rejected_limits_hold_and_the_server_survives() {
         }
     }
     let mut replacement = freed.expect("the evicted client's connection slot must be freed");
-    let entities = finish_join(&mut replacement).await;
+    let (entities, _placement) = finish_join(&mut replacement).await;
     assert!(entities.iter().all(|e| e.id != quiet_entity), "the evicted client's avatar must be gone");
     idle.shutdown().await;
 
@@ -477,7 +296,7 @@ async fn bad_input_is_rejected_limits_hold_and_the_server_survives() {
     let mut accepted = false;
     for _ in 0..50 {
         let mut again = Client::connect(small.addr).await;
-        again.hello("Again").await;
+        again.hello(&uniq("Again")).await;
         match again.next().await {
             ServerMsg::Welcome { .. } => {
                 accepted = true;

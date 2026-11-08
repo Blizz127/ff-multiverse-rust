@@ -11,11 +11,26 @@ fmv-core.workspace = true
 fmv-protocol.workspace = true
 fmv-adapter-api.workspace = true
 fmv-fixture.workspace = true
+# FF7 wiring: the adapter over the owner's flevel.lgp and the imported-content library it is
+# resolved from (both read-only; nothing here writes into the library or an install).
+fmv-ff7.workspace = true
+fmv-library.workspace = true
+# Accounts, avatar profiles and per-game progression (file store, single writer) and the party
+# state machine with story-phase instance selection. Path dependencies: neither is a workspace
+# dependency entry.
+fmv-persist = { path = "../fmv-persist" }
+fmv-party = { path = "../fmv-party" }
 tokio.workspace = true
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 thiserror.workspace = true
+# The ephemeral account store (`--ephemeral`, and the in-process default of `ServerConfig`) lives in
+# a temporary directory that is removed when the server stops; the tests also use it for hermetic
+# state directories.
+tempfile.workspace = true
 # Already in the lockfile through tokio. Used only to configure TCP keepalive timers on accepted
 # sockets (tokio exposes just the on/off switch, and the Linux default idle time is 2 hours).
 socket2 = { version = "0.6", features = ["all"] }
+
+

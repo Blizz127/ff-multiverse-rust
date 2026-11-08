@@ -19,6 +19,23 @@ pub enum GameId {
 }
 
 impl GameId {
+    /// Every game, in declaration order.
+    pub const ALL: [GameId; 6] = [GameId::Ff7, GameId::Ff8, GameId::Ff9, GameId::Ff10, GameId::Ff12, GameId::Fixture];
+
+    /// Stable machine-readable name: exactly the serde variant name (`"Ff7"`, `"Fixture"`, ...),
+    /// which is also what `fmv-persist` uses as a file name and map key. It is safe in file
+    /// names and log lines (ASCII letters and digits), and [`GameId::from_str`] is its inverse.
+    pub fn key(self) -> &'static str {
+        match self {
+            GameId::Ff7 => "Ff7",
+            GameId::Ff8 => "Ff8",
+            GameId::Ff9 => "Ff9",
+            GameId::Ff10 => "Ff10",
+            GameId::Ff12 => "Ff12",
+            GameId::Fixture => "Fixture",
+        }
+    }
+
     pub fn is_fixture(self) -> bool {
         matches!(self, GameId::Fixture)
     }
@@ -31,6 +48,27 @@ impl GameId {
             GameId::Ff12 => "FINAL FANTASY XII",
             GameId::Fixture => "FIXTURE (synthetic, not a real game)",
         }
+    }
+}
+
+/// `s` is not the [`GameId::key`] of any game.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseGameIdError;
+
+impl fmt::Display for ParseGameIdError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "not a game key (expected one of Ff7, Ff8, Ff9, Ff10, Ff12, Fixture)")
+    }
+}
+
+impl std::error::Error for ParseGameIdError {}
+
+impl std::str::FromStr for GameId {
+    type Err = ParseGameIdError;
+
+    /// Exact, case-sensitive inverse of [`GameId::key`].
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        GameId::ALL.into_iter().find(|g| g.key() == s).ok_or(ParseGameIdError)
     }
 }
 
@@ -209,11 +247,23 @@ pub struct AvatarAppearance {
 
 impl AvatarAppearance {
     pub const MAX_NAME: usize = 24;
-    /// Trim, strip control chars and clamp length. Returns None if empty after cleaning.
+
+    /// Build an appearance. Prefer this to a struct literal: new optional fields can then be
+    /// added without breaking callers.
+    pub fn new(display_name: impl Into<String>, tint: [u8; 3], appearance_ref: Option<String>) -> Self {
+        Self { display_name: display_name.into(), tint, appearance_ref }
+    }
+
+    /// Clean a player-supplied display name: drop control characters and invisible formatting
+    /// characters (see [`is_invisible_format`]), clamp to [`Self::MAX_NAME`] characters, trim
+    /// surrounding whitespace. Returns `None` if nothing visible is left.
+    ///
+    /// Names are shown to every player and used to tell players apart, so a name that looks
+    /// like another one but carries zero-width or bidi-override characters must not survive.
     pub fn sanitize_name(raw: &str) -> Option<String> {
         let s: String = raw
             .chars()
-            .filter(|c| !c.is_control())
+            .filter(|c| !c.is_control() && !is_invisible_format(*c))
             .take(Self::MAX_NAME)
             .collect::<String>()
             .trim()
@@ -224,6 +274,37 @@ impl AvatarAppearance {
             Some(s)
         }
     }
+}
+
+/// Characters that draw nothing, or change how the text around them is drawn or ordered, so
+/// that two different strings can look identical (Unicode category Cf, plus the line and
+/// paragraph separators U+2028/U+2029 that split a line for many log parsers). This is the
+/// list of format characters of Unicode 16, written out because `std` has no category query.
+pub fn is_invisible_format(c: char) -> bool {
+    matches!(
+        u32::from(c),
+        0x00AD                       // soft hyphen
+        | 0x0600..=0x0605            // Arabic number signs
+        | 0x061C                     // Arabic letter mark
+        | 0x06DD                     // Arabic end of ayah
+        | 0x070F                     // Syriac abbreviation mark
+        | 0x0890..=0x0891            // Arabic pound / piastre marks above
+        | 0x08E2                     // Arabic disputed end of ayah
+        | 0x180E                     // Mongolian vowel separator
+        | 0x200B..=0x200F            // zero-width space/joiners, LRM, RLM
+        | 0x2028..=0x2029            // line and paragraph separators
+        | 0x202A..=0x202E            // bidi embeddings and overrides
+        | 0x2060..=0x2064            // word joiner, invisible operators
+        | 0x2066..=0x206F            // bidi isolates, deprecated format characters
+        | 0xFEFF                     // zero-width no-break space (BOM)
+        | 0xFFF9..=0xFFFB            // interlinear annotation
+        | 0x110BD | 0x110CD          // Kaithi number signs
+        | 0x13430..=0x1343F          // Egyptian hieroglyph format controls
+        | 0x1BCA0..=0x1BCA3          // shorthand format controls
+        | 0x1D173..=0x1D17A          // musical symbol format controls
+        | 0xE0001                    // language tag
+        | 0xE0020..=0xE007F          // tag characters
+    )
 }
 
 /// Replicated state of one entity in an area.
@@ -250,5 +331,57 @@ mod tests {
     fn name_sanitize() {
         assert_eq!(AvatarAppearance::sanitize_name("  Cloud\n "), Some("Cloud".into()));
         assert_eq!(AvatarAppearance::sanitize_name(" \t"), None);
+    }
+
+    #[test]
+    fn names_lose_invisible_formatting_characters() {
+        // Zero-width characters cannot make "Cloud" look like "Cloud" while being another string.
+        let zw = "Cl\u{200B}ou\u{200D}d\u{FEFF}";
+        assert_eq!(AvatarAppearance::sanitize_name(zw), Some("Cloud".into()));
+        // Bidi overrides and isolates, the soft hyphen, the word joiner and tag characters.
+        for ch in ['\u{202E}', '\u{202D}', '\u{2066}', '\u{2069}', '\u{200E}', '\u{061C}', '\u{00AD}', '\u{2060}', '\u{E0041}'] {
+            let n = format!("A{ch}B");
+            assert_eq!(AvatarAppearance::sanitize_name(&n), Some("AB".into()), "U+{:04X}", u32::from(ch));
+        }
+        // Line and paragraph separators.
+        assert_eq!(AvatarAppearance::sanitize_name("a\u{2028}b\u{2029}c"), Some("abc".into()));
+        // A name of nothing visible is no name.
+        assert_eq!(AvatarAppearance::sanitize_name("\u{200B}\u{202E}\u{FEFF}"), None);
+        assert_eq!(AvatarAppearance::sanitize_name(" \u{200B} \u{3000}"), None);
+        // The invisible characters are removed BEFORE the length clamp, so they cannot eat the
+        // visible budget and two names that differ only in them clamp to the same string.
+        let padded: String = std::iter::repeat('\u{200B}').take(40).chain("x".repeat(30).chars()).collect();
+        let clean = AvatarAppearance::sanitize_name(&padded).unwrap();
+        assert_eq!(clean.chars().count(), AvatarAppearance::MAX_NAME);
+        assert!(clean.chars().all(|c| c == 'x'));
+        // Ordinary text, including non-ASCII letters, emoji and ZWJ-free scripts, is untouched.
+        for ok in ["Cloud", "Red XIII", "Ärger", "\u{30af}\u{30e9}\u{30a6}\u{30c9}", "Aerith \u{1F338}", "O'Neil-2"] {
+            assert_eq!(AvatarAppearance::sanitize_name(ok), Some(ok.into()), "{ok}");
+        }
+        // Idempotent: cleaning twice changes nothing more.
+        let once = AvatarAppearance::sanitize_name(zw).unwrap();
+        assert_eq!(AvatarAppearance::sanitize_name(&once), Some(once));
+    }
+
+    #[test]
+    fn game_keys_are_the_serde_names_and_round_trip() {
+        use std::str::FromStr;
+        for g in GameId::ALL {
+            // The same strings fmv-persist uses on disk, so the two can never drift.
+            assert_eq!(serde_json::to_value(g).unwrap(), serde_json::Value::String(g.key().to_string()));
+            assert_eq!(GameId::from_str(g.key()), Ok(g));
+            assert!(g.key().bytes().all(|b| b.is_ascii_alphanumeric()));
+        }
+        assert_eq!(GameId::ALL.len(), 6);
+        for bad in ["ff7", "FF7", "Ff 7", "", "Fixture\n", "../Ff7", "Ff13"] {
+            assert_eq!(GameId::from_str(bad), Err(ParseGameIdError), "{bad:?}");
+        }
+        assert!(ParseGameIdError.to_string().contains("Ff7"));
+    }
+
+    #[test]
+    fn appearance_constructor_matches_the_literal() {
+        let a = AvatarAppearance::new("Tifa", [1, 2, 3], Some("model".into()));
+        assert_eq!(a, AvatarAppearance { display_name: "Tifa".into(), tint: [1, 2, 3], appearance_ref: Some("model".into()) });
     }
 }

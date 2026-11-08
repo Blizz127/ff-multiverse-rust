@@ -11,10 +11,19 @@
 //! **The FIXTURE area is synthetic test content and is not evidence of FF7 support.** Wherever
 //! it is surfaced (READY line, manifest, logs) it is labeled as fixture.
 //!
-//! Layout: `world` is the synchronous authoritative state, `conn` is the per-connection task
-//! (handshake, message loop, teardown), and this file owns the listener, the tick loop and
+//! Layout: `world` is the synchronous authoritative state (positions, accounts online, parties),
+//! `accounts` is login and registration over the persistent store, `conn` is the per-connection
+//! task (handshake, message loop, teardown), and this file owns the listener, the tick loop and
 //! graceful shutdown. Entry points are [`run`] (what the binary uses) and [`Server::bind`] +
 //! [`Server::serve`] (what tests use, to learn the bound port first).
+//!
+//! # Accounts and parties
+//!
+//! Every connection authenticates with a token or registers an account (`fmv_persist::Store`,
+//! opened for the server's whole life; see `ServerConfig::state_dir`). A player's display name,
+//! tint and appearance come from its stored avatar profile, never from the client after
+//! registration. Parties are one `fmv_party::PartyManager` inside the `World`; a player that
+//! disconnects leaves its party. The protocol is documented in `fmv_protocol`.
 //!
 //! # What the server trusts an adapter for
 //!
@@ -35,22 +44,31 @@
 //!   destination-only check is therefore enough to keep clients off holes and walls between two
 //!   walkable points, as long as those are wider than one step.
 
+mod accounts;
 mod config;
 mod conn;
+pub mod ff7;
 mod world;
 
-pub use config::{ConfigError, ServerConfig, DEFAULT_IDLE_TIMEOUT, DEFAULT_KEEPALIVE, MAX_CONNECTIONS_LIMIT, MAX_TICK_HZ};
-pub use conn::{MAX_APPEARANCE_REF, SERVER_BUILD, SHUTDOWN_REASON};
+pub use accounts::MAX_APPEARANCE_REF;
 
+pub use config::{
+    ConfigError, ServerConfig, DEFAULT_IDLE_TIMEOUT, DEFAULT_KEEPALIVE, DEFAULT_REGISTRATIONS_PER_MINUTE, MAX_BUILD_SUFFIX,
+    MAX_CONNECTIONS_LIMIT, MAX_REGISTRATIONS_PER_MINUTE, MAX_TICK_HZ,
+};
+pub use conn::{SERVER_BUILD, SHUTDOWN_REASON};
+
+use std::collections::VecDeque;
 use std::future::Future;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fmv_adapter_api::{AdapterError, AreaInfo, GameAdapter};
 use fmv_core::{AreaId, Platform, SourceRef};
+use fmv_persist::Store;
 use fmv_protocol::{ServerMsg, PROTOCOL_VERSION};
 use tokio::net::TcpListener;
 use tokio::sync::{watch, Semaphore};
@@ -72,6 +90,7 @@ pub enum ServerError {
     Config(#[from] ConfigError),
     #[error("cannot load area {key:?}: {source} (areas offered by this adapter: {available})")]
     Area {
+        // `available` is capped (see `list_available`): a real game offers hundreds of areas.
         key: String,
         available: String,
         #[source]
@@ -79,6 +98,8 @@ pub enum ServerError {
     },
     #[error("area {0} cannot be hosted: {1}")]
     BadArea(AreaId, String),
+    #[error("cannot open the account store: {0}")]
+    Store(#[from] fmv_persist::PersistError),
     #[error("cannot bind {addr}: {source}")]
     Bind {
         addr: SocketAddr,
@@ -87,6 +108,20 @@ pub enum ServerError {
     },
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+/// Most area keys named in the "area not found" error; the rest is summarized by a count.
+const MAX_LISTED_AREAS: usize = 20;
+
+/// The adapter's area keys for an error message, capped so a whole game (FF7 has hundreds of
+/// fields) does not become one enormous line.
+fn list_available(adapter: &dyn GameAdapter) -> String {
+    let areas = adapter.list_areas();
+    let mut text = areas.iter().take(MAX_LISTED_AREAS).map(|a| a.id.key.as_str()).collect::<Vec<_>>().join(", ");
+    if areas.len() > MAX_LISTED_AREAS {
+        text.push_str(&format!(", ... ({} more)", areas.len() - MAX_LISTED_AREAS));
+    }
+    text
 }
 
 /// How the hosted area is announced, derived from everything the adapter reports.
@@ -148,7 +183,7 @@ impl Server {
         config.validate()?;
         let area = adapter.load_area(&config.area_key).map_err(|source| ServerError::Area {
             key: config.area_key.clone(),
-            available: adapter.list_areas().iter().map(|a| a.id.key.as_str()).collect::<Vec<_>>().join(", "),
+            available: list_available(adapter.as_ref()),
             source,
         })?;
         drop(adapter);
@@ -173,7 +208,8 @@ impl Server {
         });
         let display_name = label.display_name;
 
-        let world = World::new(area)?;
+        let world = World::with_party_config(area, config.party)?;
+        let (store, ephemeral_state) = open_store(&config).await?;
         let listener = TcpListener::bind(config.bind)
             .await
             .map_err(|source| ServerError::Bind { addr: config.bind, source })?;
@@ -187,7 +223,19 @@ impl Server {
             warn!(%local_addr, "listening on a non-loopback address; protocol v1 has no authentication");
         }
 
-        let shared = Arc::new(Shared { cfg: config, world: Mutex::new(world), manifest, area_id, fingerprint });
+        let build = config.build_string();
+        let shared = Arc::new(Shared {
+            cfg: config,
+            world: Mutex::new(world),
+            manifest,
+            area_id,
+            fingerprint,
+            provenance: provenance.clone(),
+            build,
+            store,
+            registrations: Mutex::new(VecDeque::new()),
+            _ephemeral_state: ephemeral_state,
+        });
         Ok(Self { listener, local_addr, shared, fixture })
     }
 
@@ -209,16 +257,22 @@ impl Server {
     pub fn ready_line(&self) -> String {
         format!(
             "READY protocol={} build={} addr={} area={} fixture={}",
-            PROTOCOL_VERSION, SERVER_BUILD, self.local_addr, self.shared.area_id, self.fixture
+            PROTOCOL_VERSION, self.shared.build, self.local_addr, self.shared.area_id, self.fixture
         )
     }
 
-    /// Print the READY line (and nothing else) to stdout and flush. All logging goes to stderr.
+    /// Print the READY line (and nothing else) to stdout and flush. All logging goes to stderr,
+    /// including a hint for a person at the terminal on how to connect.
     pub fn announce_ready(&self) {
         let mut out = std::io::stdout().lock();
         if let Err(e) = writeln!(out, "{}", self.ready_line()).and_then(|()| out.flush()) {
             warn!(error = %e, "could not write the READY line to stdout");
         }
+        let game = self.shared.area_id.game.key().to_ascii_lowercase();
+        info!(
+            "ready on {}: connect a client with `fmv-client --server {} --game {game} --name <your name>`",
+            self.local_addr, self.local_addr
+        );
     }
 
     /// Accept and serve clients until `shutdown` resolves, then stop accepting, send every client
@@ -303,7 +357,39 @@ pub async fn run<F: Future<Output = ()>>(
     server.serve(shutdown).await
 }
 
-/// Advance the world once per tick; each tick broadcasts the entities that changed (if any).
+/// Open the account store: `config.state_dir`, or a private temporary directory that lives as long
+/// as the server when none is configured. Opening takes the store's single-writer lock and may
+/// sweep leftovers of a crashed run; what it noticed is logged. Blocking disk I/O, so it runs off
+/// the async executor.
+async fn open_store(config: &ServerConfig) -> Result<(Arc<Store>, Option<tempfile::TempDir>), ServerError> {
+    let (root, ephemeral) = match &config.state_dir {
+        Some(dir) => (dir.clone(), None),
+        None => {
+            let dir = tempfile::Builder::new().prefix("fmv-server-state-").tempdir()?;
+            (dir.path().to_path_buf(), Some(dir))
+        }
+    };
+    let opened = {
+        let root = root.clone();
+        tokio::task::spawn_blocking(move || Store::open(root))
+            .await
+            .map_err(|e| ServerError::Io(std::io::Error::other(format!("store open task failed: {e}"))))?
+    };
+    let store = opened?;
+    for warning in store.open_warnings() {
+        warn!(%warning, "account store");
+    }
+    info!(
+        state = %root.display(),
+        ephemeral = ephemeral.is_some(),
+        registration = config.allow_registration,
+        "account store open"
+    );
+    Ok((Arc::new(store), ephemeral))
+}
+
+/// Advance the world once per tick; each tick broadcasts the entities that changed (if any) and
+/// expires timed-out party invites.
 async fn tick_loop(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) {
     // `validate()` guarantees tick_hz >= 1, so the period is never zero.
     let period = Duration::from_secs_f64(1.0 / f64::from(shared.cfg.tick_hz));
@@ -312,7 +398,9 @@ async fn tick_loop(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) {
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                shared.world().advance_tick();
+                let mut world = shared.world();
+                world.advance_tick();
+                world.expire_parties(Instant::now());
             }
             () = wait_flag(&mut shutdown) => break,
         }
@@ -390,6 +478,39 @@ mod tests {
     async fn bind(info: AreaInfo) -> Result<Server, ServerError> {
         let config = ServerConfig { bind: "127.0.0.1:0".parse().unwrap(), area_key: info.id.key.clone(), ..ServerConfig::default() };
         Server::bind(config, Box::new(StubAdapter(info))).await
+    }
+
+    /// An adapter that offers `n` areas (`a0`, `a1`, ...), like a whole game does.
+    struct ManyAreas(usize);
+
+    impl GameAdapter for ManyAreas {
+        fn game(&self) -> GameId {
+            GameId::Ff7
+        }
+        fn list_areas(&self) -> Vec<AreaInfo> {
+            (0..self.0)
+                .map(|i| {
+                    let mut info = real_info();
+                    info.id.key = format!("a{i}");
+                    info
+                })
+                .collect()
+        }
+        fn load_area(&self, key: &str) -> Result<Box<dyn AreaRuntime>, AdapterError> {
+            Err(AdapterError::AreaNotFound(key.to_string()))
+        }
+    }
+
+    #[test]
+    fn the_list_of_available_areas_in_an_error_is_capped() {
+        assert_eq!(list_available(&ManyAreas(3)), "a0, a1, a2");
+        assert_eq!(list_available(&ManyAreas(0)), "");
+        let exactly = list_available(&ManyAreas(MAX_LISTED_AREAS));
+        assert!(!exactly.contains("more"), "{exactly}");
+        let many = list_available(&ManyAreas(MAX_LISTED_AREAS + 7));
+        assert!(many.starts_with("a0, a1, a2") && many.contains("a19") && !many.contains("a20,"), "{many}");
+        assert!(many.ends_with("... (7 more)"), "{many}");
+        assert!(many.len() < 200, "a whole game must not become one enormous line: {} bytes", many.len());
     }
 
     #[test]

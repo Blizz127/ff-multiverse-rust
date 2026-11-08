@@ -5,37 +5,46 @@
 //! `try_send`, and a full queue ends the connection.
 //!
 //! Connection flow:
-//! `Hello` -> `Welcome` + `AreaManifest` -> `JoinArea` (or `CannotJoin`) -> spawn ->
-//! `AreaSnapshot` to the joiner / `PlayerJoined` to the others -> `MoveIntent`/`Ping`/`Leave`.
+//! `Hello` (token or registration, checked against the account store) -> `Welcome` +
+//! `AreaManifest` -> `JoinArea` (or `CannotJoin`; the area, fingerprint and edition are checked)
+//! -> spawn -> `AreaSnapshot` and `InstancePlacement` to the joiner / `PlayerJoined` to the
+//! others -> `MoveIntent` / `Ping` / party requests / `Leave`.
 //!
 //! Everything read from the socket is untrusted: no `unwrap`/indexing on it, every string that
 //! is echoed to other players or to the log is clamped first, and frame size is bounded by
 //! `fmv_protocol::MAX_FRAME`.
 
+use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use fmv_core::{AnimState, AreaId, AvatarAppearance, EntityId, Fingerprint, Pos, SessionId};
-use fmv_protocol::{read_msg, write_msg, ClientMsg, ProtoError, ServerMsg, MAX_FRAME, PROTOCOL_VERSION};
+use fmv_core::{AnimState, AreaId, EntityId, Fingerprint, Pos, ProvenanceSummary, SessionId};
+use fmv_persist::Store;
+use fmv_protocol::{
+    decode, probe_hello_version, read_frame, write_msg, Auth, ClientMsg, ProtoError, Secret, ServerMsg, MAX_FRAME,
+    PROTOCOL_VERSION,
+};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
-use tracing::{debug, info, warn, Instrument};
+use tracing::{debug, error, info, warn, Instrument};
 
+use crate::accounts::{self, Login};
 use crate::config::ServerConfig;
-use crate::world::{CloseFlag, MoveOutcome, NewPlayer, Outbound, OutboundTx, World};
+use crate::world::{CloseFlag, JoinError, MoveOutcome, NewPlayer, Outbound, OutboundTx, PartyOutcome, World};
 
 /// Reported in `Welcome::server_build` and the READY line.
 pub const SERVER_BUILD: &str = env!("CARGO_PKG_VERSION");
 /// Text of the `Reject` sent to every client when the server stops.
 pub const SHUTDOWN_REASON: &str = "server shutting down";
-/// Longest `appearance_ref` (in chars) the server keeps. Together with the 24-char display name
-/// this bounds every entity snapshot, and therefore the size of the `AreaSnapshot` frame.
-pub const MAX_APPEARANCE_REF: usize = 64;
+/// Text of the `Reject` for a second session of an account that is already in the world.
+const ALREADY_ONLINE: &str = "this account is already logged in";
+/// How long registrations count against `ServerConfig::registrations_per_minute`.
+const REGISTRATION_WINDOW: Duration = Duration::from_secs(60);
 
 /// Longest client-supplied string (in chars) copied into a log line.
 const MAX_LOG_STR: usize = 64;
@@ -58,9 +67,37 @@ pub(crate) struct Shared {
     pub manifest: Outbound,
     pub area_id: AreaId,
     pub fingerprint: Fingerprint,
+    /// The hosted area's path-free provenance: a joining client's must be `compatible_with` it.
+    pub provenance: ProvenanceSummary,
+    /// `Welcome::server_build` and the READY line's `build=`: the crate version, plus the
+    /// adapter's identity when the configuration names one (see `ServerConfig::build_suffix`).
+    pub build: String,
+    /// Accounts, avatar profiles and progression. Blocking: use it under `spawn_blocking`.
+    pub store: Arc<Store>,
+    /// When recent registrations happened, oldest first (the global registration rate limit).
+    pub registrations: Mutex<VecDeque<Instant>>,
+    /// Keeps an ephemeral state directory alive. Declared after `store` so the store (and its
+    /// lock file) is dropped before the directory is removed.
+    pub _ephemeral_state: Option<tempfile::TempDir>,
 }
 
 impl Shared {
+    /// May another account be registered now? Counts the attempt against the global limit.
+    fn admit_registration(&self, now: Instant) -> Result<(), String> {
+        if !self.cfg.allow_registration {
+            return Err("registration is closed on this server; log in with a saved token".to_string());
+        }
+        let mut recent = self.registrations.lock().unwrap_or_else(PoisonError::into_inner);
+        while recent.front().is_some_and(|t| now.saturating_duration_since(*t) >= REGISTRATION_WINDOW) {
+            recent.pop_front();
+        }
+        if recent.len() >= self.cfg.registrations_per_minute as usize {
+            return Err("too many registrations on this server right now; try again in a minute".to_string());
+        }
+        recent.push_back(now);
+        Ok(())
+    }
+
     /// Lock the world. The lock is only ever held for short in-memory sections and never across
     /// an `.await`. A poisoned lock is recovered rather than cascading panics into every
     /// connection.
@@ -153,30 +190,19 @@ impl Drop for JoinGuard {
     }
 }
 
-/// Validate the fields of `Hello` and build the avatar. `Err` carries the `Reject` reason.
-pub(crate) fn check_hello(
-    protocol_version: u16,
-    display_name: &str,
-    tint: [u8; 3],
-    appearance_ref: Option<String>,
-) -> Result<AvatarAppearance, String> {
+/// A `Hello` of another protocol version is refused with a clear reason (`Err` carries it).
+pub(crate) fn check_version(protocol_version: u16) -> Result<(), String> {
     if protocol_version != PROTOCOL_VERSION {
         return Err(format!(
             "protocol version mismatch: server speaks v{PROTOCOL_VERSION}, client sent v{protocol_version}"
         ));
     }
-    let Some(display_name) = AvatarAppearance::sanitize_name(display_name) else {
-        return Err("display name must not be empty".to_string());
-    };
-    Ok(AvatarAppearance { display_name, tint, appearance_ref: clean_appearance_ref(appearance_ref) })
+    Ok(())
 }
 
-/// The appearance ref is broadcast to every player, so it is bounded and stripped of control
-/// characters exactly like the display name.
-fn clean_appearance_ref(raw: Option<String>) -> Option<String> {
-    let cleaned: String = raw?.chars().filter(|c| !c.is_control()).take(MAX_APPEARANCE_REF).collect();
-    let cleaned = cleaned.trim();
-    (!cleaned.is_empty()).then(|| cleaned.to_string())
+/// Seconds since the unix epoch (the store timestamps accounts with it).
+fn unix_now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
 /// Clamp untrusted text before it goes into a log line.
@@ -184,8 +210,17 @@ fn clip_for_log(raw: &str) -> String {
     raw.chars().filter(|c| !c.is_control()).take(MAX_LOG_STR).collect()
 }
 
-fn check_join(shared: &Shared, area: &AreaId, fingerprint: &Fingerprint) -> Result<(), String> {
-    // Never echo client-supplied strings back: they are unbounded.
+/// The fingerprint is the content check; the provenance the client names for its own copy must
+/// ALSO be compatible with the area's (same game, platform, edition, region and revision). The
+/// fingerprint of a real adapter binds the provenance already, but an adapter's fingerprint rule
+/// is not something the server can assume, and a client may lie about either.
+fn check_join(
+    shared: &Shared,
+    area: &AreaId,
+    fingerprint: &Fingerprint,
+    provenance: &ProvenanceSummary,
+) -> Result<(), String> {
+    // Never echo client-supplied strings back unbounded.
     if *area != shared.area_id {
         return Err(format!("area mismatch: this server hosts {}", shared.area_id));
     }
@@ -193,6 +228,23 @@ fn check_join(shared: &Shared, area: &AreaId, fingerprint: &Fingerprint) -> Resu
         return Err(format!(
             "fingerprint mismatch for area {}: your owned copy differs from the server's (different edition, region or revision?); client sent {:?}, server has {:?}",
             shared.area_id, fingerprint, shared.fingerprint
+        ));
+    }
+    if !shared.provenance.compatible_with(provenance) {
+        let server = &shared.provenance;
+        return Err(format!(
+            "edition mismatch for area {}: the server's copy is {:?}/{:?}/{:?} ({:?} {:?}), yours is {:?}/{:?}/{:?} ({:?} {:?})",
+            shared.area_id,
+            server.edition,
+            server.region,
+            server.revision,
+            server.game,
+            server.platform,
+            clip_for_log(&provenance.edition),
+            clip_for_log(&provenance.region),
+            clip_for_log(&provenance.revision),
+            provenance.game,
+            provenance.platform,
         ));
     }
     Ok(())
@@ -276,6 +328,8 @@ struct Conn {
     limiter: RateLimiter,
     guard: Option<JoinGuard>,
     rejected_moves: u64,
+    /// Nothing has been read yet (the first message is where a protocol mismatch is diagnosed).
+    first_message: bool,
 }
 
 /// Run one accepted connection to completion.
@@ -290,7 +344,8 @@ pub(crate) async fn serve_connection(shared: Arc<Shared>, stream: TcpStream, shu
         writer_task(wr, rx, shared.cfg.write_timeout, Arc::clone(&close)).in_current_span(),
     );
     let limiter = RateLimiter::new(shared.cfg.max_msgs_per_sec, Instant::now());
-    let mut conn = Conn { shared, rd, tx, close, close_rx, shutdown, limiter, guard: None, rejected_moves: 0 };
+    let mut conn =
+        Conn { shared, rd, tx, close, close_rx, shutdown, limiter, guard: None, rejected_moves: 0, first_message: true };
     let reason = match conn.drive().await {
         Err(reason) => reason,
         Ok(never) => match never {},
@@ -304,30 +359,46 @@ impl Conn {
 
         // 1. Hello
         let hello = self.recv(Some(shared.cfg.hello_timeout), "timed out waiting for Hello").await?;
-        let ClientMsg::Hello { protocol_version, client_build, display_name, tint, appearance_ref } = hello else {
+        let ClientMsg::Hello { protocol_version, client_build, auth, tint, appearance_ref } = hello else {
             return Err(Close::Reject("expected Hello as the first message".to_string()));
         };
-        let avatar = check_hello(protocol_version, &display_name, tint, appearance_ref).map_err(Close::Reject)?;
-        debug!(client_build = %clip_for_log(&client_build), name = ?avatar.display_name, "hello accepted");
+        check_version(protocol_version).map_err(Close::Reject)?;
 
-        // 2. Welcome + the area on offer
+        // 2. Who is this? Registration or token login, against the persistent store.
+        let Login { account, avatar, phase, issued_token } = self.authenticate(auth, tint, appearance_ref).await?;
+        debug!(
+            client_build = %clip_for_log(&client_build),
+            account = account.0,
+            name = ?avatar.display_name,
+            registered = issued_token.is_some(),
+            "hello accepted"
+        );
+        // Refused early (before `Welcome`) for a quick answer; `World::join` re-checks it
+        // atomically because two handshakes can authenticate the same account at once.
+        if shared.world().is_online(account) {
+            return Err(Close::Reject(ALREADY_ONLINE.to_string()));
+        }
+
+        // 3. Welcome (the only message that ever carries a token) + the area on offer
         let (session, entity) = shared.world().allocate_ids();
         self.send(ServerMsg::Welcome {
             protocol_version: PROTOCOL_VERSION,
-            server_build: SERVER_BUILD.to_string(),
+            server_build: shared.build.clone(),
             session,
             entity,
+            account,
+            issued_token: issued_token.map(Secret::from),
         })?;
         self.send_shared(Arc::clone(&shared.manifest))?;
 
-        // 3. The client confirms it holds exactly this area locally, or declines.
+        // 4. The client confirms it holds exactly this area locally, or declines.
         // One total deadline for the whole step, so trickling Pings cannot hold the slot open.
         let join_started = Instant::now();
         loop {
             let remaining = shared.cfg.join_timeout.saturating_sub(join_started.elapsed());
             match self.recv(Some(remaining), "timed out waiting for JoinArea").await? {
-                ClientMsg::JoinArea { area, fingerprint } => {
-                    check_join(&shared, &area, &fingerprint).map_err(Close::Reject)?;
+                ClientMsg::JoinArea { area, fingerprint, provenance } => {
+                    check_join(&shared, &area, &fingerprint, &provenance).map_err(Close::Reject)?;
                     break;
                 }
                 ClientMsg::CannotJoin { area, reason } => {
@@ -340,23 +411,36 @@ impl Conn {
                 }
                 ClientMsg::Leave => return Err(Close::Left),
                 ClientMsg::Ping { nonce } => self.pong(nonce)?,
-                ClientMsg::Hello { .. } | ClientMsg::MoveIntent { .. } => {
+                ClientMsg::Hello { .. }
+                | ClientMsg::MoveIntent { .. }
+                | ClientMsg::PartyInvite { .. }
+                | ClientMsg::PartyAccept { .. }
+                | ClientMsg::PartyDecline { .. }
+                | ClientMsg::PartyLeave
+                | ClientMsg::PartyKick { .. }
+                | ClientMsg::PartyPromote { .. }
+                | ClientMsg::PartySync => {
                     return Err(Close::Reject("unexpected message before JoinArea".to_string()));
                 }
             }
         }
 
-        // 4. Spawn. The guard is created first so that every exit path removes the entity.
+        // 5. Spawn. The guard is created first so that every exit path removes the entity.
         self.guard = Some(JoinGuard { shared: Arc::clone(&shared), entity, session });
         let name = avatar.display_name.clone();
-        let (spawn, online) = {
+        let joined = {
             let mut world = shared.world();
-            let new = NewPlayer { session, entity, avatar, tx: self.tx.clone(), close: Arc::clone(&self.close) };
-            (world.join(new, Instant::now()), world.player_count())
+            let new = NewPlayer { session, entity, account, avatar, phase, tx: self.tx.clone(), close: Arc::clone(&self.close) };
+            world.join(new, Instant::now()).map(|spawn| (spawn, world.player_count()))
+        };
+        let (spawn, online) = match joined {
+            Ok(joined) => joined,
+            Err(JoinError::AlreadyOnline) => return Err(Close::Reject(ALREADY_ONLINE.to_string())),
         };
         info!(
             entity = entity.0,
             session = session.0,
+            account = account.0,
             name = ?name,
             spawn_x = spawn.x,
             spawn_y = spawn.y,
@@ -364,16 +448,61 @@ impl Conn {
             "player joined"
         );
 
-        // 5. In-game
+        // 6. In-game
         loop {
             match self.recv(shared.cfg.idle_timeout, "idle timeout (no message received; send a Ping every second or so to stay connected)").await? {
                 ClientMsg::MoveIntent { seq, pos, facing, anim } => self.on_move(entity, seq, pos, facing, anim)?,
                 ClientMsg::Ping { nonce } => self.pong(nonce)?,
                 ClientMsg::Leave => return Err(Close::Left),
+                ClientMsg::PartyInvite { target } => self.party(|w, now| w.party_invite(entity, target, now))?,
+                ClientMsg::PartyAccept { invite } => self.party(|w, now| w.party_accept(entity, invite, now))?,
+                ClientMsg::PartyDecline { invite } => self.party(|w, _| w.party_decline(entity, invite))?,
+                ClientMsg::PartyLeave => self.party(|w, _| w.party_leave(entity))?,
+                ClientMsg::PartyKick { target } => self.party(|w, _| w.party_kick(entity, target))?,
+                ClientMsg::PartyPromote { target } => self.party(|w, _| w.party_promote(entity, target))?,
+                ClientMsg::PartySync => self.party(|w, now| w.party_sync(entity, now))?,
                 ClientMsg::Hello { .. } | ClientMsg::JoinArea { .. } | ClientMsg::CannotJoin { .. } => {
                     return Err(Close::Reject("unexpected message after joining".to_string()));
                 }
             }
+        }
+    }
+
+    /// Registration or token login. The store does blocking disk I/O, so it runs off the async
+    /// executor; the client is told why a refusal happened, but never anything about which
+    /// tokens or names exist, and never a local path.
+    async fn authenticate(&mut self, auth: Auth, tint: [u8; 3], appearance_ref: Option<String>) -> Result<Login, Close> {
+        let shared = Arc::clone(&self.shared);
+        if matches!(auth, Auth::Register { .. }) {
+            shared.admit_registration(Instant::now()).map_err(Close::Reject)?;
+        }
+        let store = Arc::clone(&shared.store);
+        let game = shared.area_id.game;
+        let now = unix_now();
+        let task = tokio::task::spawn_blocking(move || accounts::login(&store, game, auth, tint, appearance_ref, now));
+        match task.await {
+            Ok(Ok(login)) => Ok(login),
+            Ok(Err(e)) => {
+                match &e {
+                    accounts::LoginError::Internal(cause) => error!(%cause, "account store failure during login"),
+                    accounts::LoginError::Refused(why) => debug!(%why, "login refused"),
+                }
+                Err(Close::Reject(e.client_text().to_string()))
+            }
+            Err(e) => {
+                error!(error = %e, "login task failed");
+                Err(Close::Reject("internal error; try again later".to_string()))
+            }
+        }
+    }
+
+    /// Run one party request against the world and answer a refusal to this client alone.
+    fn party(&mut self, op: impl FnOnce(&mut World, Instant) -> PartyOutcome) -> Result<(), Close> {
+        let outcome = op(&mut self.shared.world(), Instant::now());
+        match outcome {
+            PartyOutcome::Done => Ok(()),
+            PartyOutcome::Refused(error) => self.send(ServerMsg::PartyRejected { error }),
+            PartyOutcome::Gone => Err(Close::Dropped("removed from the world")),
         }
     }
 
@@ -385,7 +514,7 @@ impl Conn {
         let shutdown = &mut self.shutdown;
         let close_rx = &mut self.close_rx;
         let read = async {
-            let fut = read_msg::<_, ClientMsg>(rd);
+            let fut = read_frame(rd);
             match limit {
                 Some(d) => tokio::time::timeout(d, fut).await.ok(),
                 None => Some(fut.await),
@@ -397,14 +526,31 @@ impl Conn {
             () = wait_flag(close_rx) => return Err(Close::Dropped("closed by the world or the writer")),
             r = read => r,
         };
-        let msg = match outcome {
+        let payload = match outcome {
             None => return Err(Close::Reject(on_timeout.to_string())),
-            Some(Ok(msg)) => msg,
+            Some(Ok(payload)) => payload,
             Some(Err(ProtoError::Closed | ProtoError::Io(_))) => return Err(Close::PeerGone),
             Some(Err(ProtoError::FrameTooLarge(n))) => {
                 return Err(Close::Reject(format!("frame too large ({n} bytes, maximum {MAX_FRAME})")));
             }
+            // `read_frame` does not decode, so it cannot fail this way.
             Some(Err(ProtoError::Codec(_))) => return Err(Close::Reject("malformed message".to_string())),
+        };
+        let first = std::mem::replace(&mut self.first_message, false);
+        let msg = match decode::<ClientMsg>(&payload) {
+            Ok(msg) => msg,
+            Err(_) => {
+                // A Hello of another protocol version has another shape: say so, instead of
+                // "malformed message" (the version is readable whatever else changed).
+                if first {
+                    if let Some(version) = probe_hello_version(&payload) {
+                        if let Err(why) = check_version(version) {
+                            return Err(Close::Reject(why));
+                        }
+                    }
+                }
+                return Err(Close::Reject("malformed message".to_string()));
+            }
         };
         if !self.limiter.allow(Instant::now()) {
             return Err(Close::Reject("rate limit exceeded".to_string()));
@@ -516,26 +662,13 @@ mod tests {
     }
 
     #[test]
-    fn hello_checks() {
-        let ok = check_hello(PROTOCOL_VERSION, "  Cloud\n", [1, 2, 3], Some("cloud".into())).unwrap();
-        assert_eq!(ok.display_name, "Cloud");
-        assert_eq!(ok.tint, [1, 2, 3]);
-        assert_eq!(ok.appearance_ref.as_deref(), Some("cloud"));
-
-        let err = check_hello(PROTOCOL_VERSION + 1, "Cloud", [0; 3], None).unwrap_err();
-        assert!(err.contains("protocol version mismatch"), "{err}");
-        assert!(check_hello(PROTOCOL_VERSION, " \t\n", [0; 3], None).is_err());
-        assert!(check_hello(PROTOCOL_VERSION, "\u{7}\u{0}", [0; 3], None).is_err());
-
-        // Overlong names are clamped, overlong/dirty appearance refs are bounded and cleaned.
-        let long = "x".repeat(10_000);
-        let a = check_hello(PROTOCOL_VERSION, &long, [0; 3], Some(format!("\u{1b}[31m{long}"))).unwrap();
-        assert_eq!(a.display_name.chars().count(), AvatarAppearance::MAX_NAME);
-        let r = a.appearance_ref.unwrap();
-        assert_eq!(r.chars().count(), MAX_APPEARANCE_REF);
-        assert!(!r.chars().any(char::is_control));
-        // A ref that is empty after cleaning means "no ref".
-        assert_eq!(check_hello(PROTOCOL_VERSION, "A", [0; 3], Some(" \n".into())).unwrap().appearance_ref, None);
+    fn only_the_current_protocol_version_is_accepted() {
+        assert!(check_version(PROTOCOL_VERSION).is_ok());
+        for other in [0, 1, PROTOCOL_VERSION + 1, u16::MAX] {
+            let err = check_version(other).unwrap_err();
+            assert!(err.contains("protocol version mismatch"), "{err}");
+            assert!(err.contains(&format!("v{PROTOCOL_VERSION}")) && err.contains(&format!("v{other}")), "{err}");
+        }
     }
 
     /// Collects what a subscriber at the default level (`info`) would print.

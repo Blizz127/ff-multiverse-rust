@@ -99,11 +99,42 @@
 //!
 //! # Speed
 //!
-//! [`FF7_FIELD_MAX_SPEED_PLACEHOLDER`] is a PLACEHOLDER of the same order of magnitude as the
-//! FIXTURE adapter's value; it is not derived from FF7 data and must be replaced once field
-//! walk/run speed is verified on owned media.
+//! [`Ff7FieldArea::max_speed`] is [`FF7_FIELD_MAX_SPEED_PLACEHOLDER`] (the value for a field of
+//! scale 512) multiplied by the field's own scale over 512 ([`Ff7FieldArea::field_scale`]). The
+//! **scaling is documented, the base value is not**: no public document or source this crate could
+//! reach gives the absolute distance a field character moves per frame in walkmesh units, so the
+//! base stays a PLACEHOLDER. What was checked (all 2026-11-08):
+//!
+//! * Field scale: every owned field has one (`u16`, the model-loader header's last field and the
+//!   script section's offset 8 in all 702 fields), identical to the FF7 Speedrun Wiki's per-field
+//!   "Field Scale" list <https://ff7speedruns.com/index.php/Field_map_encounter_mechanics> (list
+//!   at <https://pastebin.com/UrRQ7ezH>) for 702 of 702 fields. FFNx's reverse-engineered
+//!   `ff7.h` <https://github.com/julianxhokaxhiu/FFNx/blob/master/src/ff7.h> describes it as
+//!   "Scale of field. For move and talk calculation (9bit fixed point)": 512 is 1.0, and
+//!   movement scales with it (md1stin is 512, md1_1 is 1024, one field is 5120).
+//! * Direction of the scaling, from the data: through each field's camera 0 the walkmesh centre
+//!   sits at `depth / zoom` world units per screen pixel, whose median is 3.2 at scale 512 (642
+//!   fields), 6.0 at 768 (12), 7.7 at 1024 (9) and 16.7 at 2048 (7). Larger-scale fields are
+//!   built in coarser units (roughly the scale to the power 1.1, not exactly proportional), so a
+//!   speed in walkmesh units has to grow with the scale for the same pace on screen.
+//! * The same wiki says the field module runs at [`FF7_FIELD_FRAMES_PER_SECOND`] frames per
+//!   second and gives the engine's "Run Value" as `Field Scale * 4` while the run button is held
+//!   and `Field Scale * 1` otherwise, so running is [`FF7_RUN_WALK_SPEED_RATIO`] times walking.
+//! * Scripted movement (`MOVE`) uses `MSPED` (opcode 0xB2) <https://wiki.ffrtt.ru/index.php/FF7/Field/Script/Opcodes/B2_MSPED>:
+//!   an "8-bit fixed point" speed with default 1024 meaning a relative movement time scale of 1;
+//!   a Qhimm forum thread <https://forums.qhimm.com/index.php?topic=6535.0> says values above
+//!   0x600 make the entity run. `MSPED` does not set the player's walking speed.
+//! * Not found: units per frame. Q-Gears' own defaults (0.7 walk, 0.8 run) are in its rescaled
+//!   engine units, and FFNx only wraps the engine's step routine.
+//!
+//! One hypothesis fits all of the above but is NOT verified: speeds are `scale * k / 256` walkmesh
+//! units per frame with `k` 1 (walk), 4 (run) and 2 (default `MOVE`), i.e. 8 units per frame (240
+//! units per second) running and 2 (60) walking at scale 512; it would put the 0x600 run switch
+//! between the default `MOVE` speed and the run speed and cross `md1stin`'s 2 161-unit platform
+//! in about 9 seconds. Use a measurement of the real game, not this paragraph, to replace the
+//! placeholder.
 
-use crate::field::{Background, Camera, FieldError, FieldFile, Palette, Triggers, Vertex, Walkmesh};
+use crate::field::{Background, Camera, FieldError, FieldFile, Palette, Triggers, Vertex, Walkmesh, FIELD_SCALE_ONE};
 use crate::lgp::{LgpArchive, LgpError};
 use crate::lzss;
 use crate::walk::{LinkReport, Route, Surface};
@@ -124,9 +155,17 @@ pub const MAX_FIELD_BYTES: usize = 16 * 1024 * 1024;
 /// entries all point at the same large body cannot make `list_areas` run for long.
 pub const MAX_INDEX_READ_BYTES: u64 = 512 * 1024 * 1024;
 
-/// PLACEHOLDER maximum movement speed in walkmesh units per second. Not derived from FF7
-/// data; replace once the field walk/run speed is verified on owned media.
+/// PLACEHOLDER maximum movement speed in walkmesh units per second **for a field of scale 512**
+/// ([`crate::field::FIELD_SCALE_ONE`]; `Ff7FieldArea::max_speed` multiplies it by the field's own
+/// scale over 512). Not derived from FF7 data: see the module docs ("Speed").
 pub const FF7_FIELD_MAX_SPEED_PLACEHOLDER: f32 = 600.0;
+
+/// Logic frame rate of the field module (FF7 Speedrun Wiki, "Field map encounter mechanics").
+pub const FF7_FIELD_FRAMES_PER_SECOND: f32 = 30.0;
+
+/// Running speed divided by walking speed: the engine's "Run Value" is `Field Scale * 4` with the
+/// run button held and `Field Scale * 1` without (same source as [`FF7_FIELD_FRAMES_PER_SECOND`]).
+pub const FF7_RUN_WALK_SPEED_RATIO: f32 = 4.0;
 
 /// Version of the fingerprint rule (see the module docs). Bumped whenever the rule changes.
 pub const FINGERPRINT_RULE_VERSION: u32 = 1;
@@ -500,6 +539,8 @@ pub struct Ff7FieldArea {
     surface: Surface,
     bounds: Bounds,
     spawns: Vec<Pos>,
+    /// Field scale from the model-loader header; 512 when that header is missing or zero.
+    field_scale: u16,
 }
 
 impl std::fmt::Debug for Ff7FieldArea {
@@ -528,7 +569,17 @@ impl Ff7FieldArea {
         // Everyone who spawns must be able to reach everyone else: the walk module picks them
         // from the largest connected region only.
         let spawns = surface.spawn_points(MAX_SPAWNS);
-        Self { info, field, walkmesh, surface, bounds, spawns }
+        let field_scale = match field.field_scale() {
+            Ok(scale) if scale != 0 => scale,
+            _ => FIELD_SCALE_ONE,
+        };
+        Self { info, field, walkmesh, surface, bounds, spawns, field_scale }
+    }
+
+    /// The field's scale ([`crate::field::ModelLoaderHeader::scale`]): 512 means 1.0 and speeds scale
+    /// with it. Falls back to 512 when the header is unreadable or zero.
+    pub fn field_scale(&self) -> u16 {
+        self.field_scale
     }
 
     /// The decoded field file (all sections, raw).
@@ -637,7 +688,7 @@ impl AreaRuntime for Ff7FieldArea {
     }
 
     fn max_speed(&self) -> f32 {
-        FF7_FIELD_MAX_SPEED_PLACEHOLDER
+        FF7_FIELD_MAX_SPEED_PLACEHOLDER * f32::from(self.field_scale) / f32::from(FIELD_SCALE_ONE)
     }
 }
 
@@ -1280,6 +1331,37 @@ mod tests {
         let area = a.load_field("testfld").unwrap();
         let report = area.link_report();
         assert_eq!(report, LinkReport { links: 2, symmetric: 2, adjacent: 2, blocked_edges: 4 });
+    }
+
+    #[test]
+    fn max_speed_scales_with_the_field_scale_and_survives_a_damaged_header() {
+        let load = |bytes: Vec<u8>| {
+            let lgp = build_lgp(&[("scalefld", &lzss::compress(&bytes))]);
+            let adapter = Ff7Adapter::from_flevel_reader(Cursor::new(lgp), provenance()).unwrap();
+            let area = adapter.load_field("scalefld").unwrap();
+            (area.field_scale(), area.max_speed())
+        };
+        let base = FF7_FIELD_MAX_SPEED_PLACEHOLDER;
+        let with_scale = |model_scale: u16| FieldSpec { model_scale, ..FieldSpec::default() }.build();
+        assert_eq!(load(with_scale(512)), (512, base));
+        assert_eq!(load(with_scale(1024)), (1024, base * 2.0));
+        assert_eq!(load(with_scale(256)), (256, base * 0.5));
+        let (scale, speed) = load(with_scale(400));
+        assert_eq!(scale, 400);
+        assert!((speed - base * 400.0 / 512.0).abs() < 1e-3, "{speed}");
+        let (scale, speed) = load(with_scale(u16::MAX));
+        assert_eq!(scale, u16::MAX);
+        assert!(speed.is_finite() && speed > base);
+        // a zero scale is treated as the neutral 512
+        assert_eq!(load(with_scale(0)), (512, base));
+        // a model-loader section shorter than its header: still a usable area at the base speed
+        let mut short = with_scale(1024);
+        let loader_start = u32::from_le_bytes(short[6 + 4 * 2..10 + 4 * 2].try_into().unwrap()) as usize;
+        short[loader_start..loader_start + 4].copy_from_slice(&3u32.to_le_bytes());
+        assert_eq!(load(short), (512, base));
+        // the documented constants
+        assert_eq!(FF7_FIELD_FRAMES_PER_SECOND, 30.0);
+        assert_eq!(FF7_RUN_WALK_SPEED_RATIO, 4.0);
     }
 
     #[test]

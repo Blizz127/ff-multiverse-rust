@@ -81,6 +81,8 @@ fn dump_field(lgp: &mut LgpArchive<std::fs::File>, name: &str) -> Result<(), Str
         triggers.gateways.iter().filter(|g| g.target_field_id != 0x7FFF).count(),
         triggers.triggers.iter().filter(|t| t.corner_a != [0; 3] || t.corner_b != [0; 3]).count()
     );
+    let loader = field.model_loader_header().map_err(|e| e.to_string())?;
+    println!("model loader: {} models, field scale {} (speed factor {:.3})", loader.model_count, loader.scale, loader.scale_factor());
     let palette = field.palette().map_err(|e| e.to_string())?;
     println!("palette: {palette:?}");
     let bg = field.background().map_err(|e| e.to_string())?;
@@ -298,6 +300,7 @@ fn survey(lgp: &mut LgpArchive<std::fs::File>) {
     let (mut tiles, mut drawn, mut unrenderable, mut trailer14, mut decompressed) = (0usize, 0usize, 0usize, 0usize, 0usize);
     let mut cameras: BTreeMap<usize, usize> = BTreeMap::new();
     let mut trailing: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut scales: BTreeMap<u16, usize> = BTreeMap::new();
     let (mut range_eq_layer1, mut range_total) = (0usize, 0usize);
     let (mut multi_camera, mut multi_camera_copies) = (0usize, 0usize);
     let mut multi_camera_differ: Vec<String> = Vec::new();
@@ -337,6 +340,10 @@ fn survey(lgp: &mut LgpArchive<std::fs::File>) {
             Some(0) => {}
             Some(14) if field.bytes().get(declared..) == Some(b"FINAL FANTASY7") => trailer14 += 1,
             _ => note("sections do not tile the file".into(), name),
+        }
+        match field.field_scale() {
+            Ok(scale) => *scales.entry(scale).or_default() += 1,
+            Err(e) => note(format!("field scale: {e}"), name),
         }
         if (0..9).any(|k| field.section(k).is_err()) {
             note("a section is inaccessible".into(), name);
@@ -439,6 +446,7 @@ fn survey(lgp: &mut LgpArchive<std::fs::File>) {
     println!("decompressed total {decompressed} bytes; {trailer14} fields carry the 14-byte FINAL FANTASY7 trailer");
     println!("layer presence (L1..L4): {layer_presence:?}; texture depths {tex_depth:?}; camera records per field {cameras:?}");
     println!("bytes after the END tag of the background section -> fields: {trailing:?}");
+    println!("field scale (512 = 1.0) -> fields: {scales:?}");
     println!("tiles kept {tiles}; drawn with default options {drawn}; unrenderable {unrenderable}");
     println!("camera range == layer-1 tile bounds in {range_eq_layer1}/{range_total} fields that have layer-1 tiles");
     println!("fields with several camera records: {multi_camera}; all records byte-identical in {multi_camera_copies}; differing: {multi_camera_differ:?}");

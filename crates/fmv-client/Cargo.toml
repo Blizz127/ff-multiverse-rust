@@ -11,6 +11,10 @@ fmv-core.workspace = true
 fmv-protocol.workspace = true
 fmv-adapter-api.workspace = true
 fmv-fixture.workspace = true
+# FF7 wiring: the adapter over this machine's own flevel.lgp and the imported-content library it
+# is resolved from (both read-only; nothing here writes into the library or an install).
+fmv-ff7.workspace = true
+fmv-library.workspace = true
 tokio.workspace = true
 clap.workspace = true
 thiserror.workspace = true
@@ -23,3 +27,5 @@ bytemuck.workspace = true
 # Paused-clock liveness tests (deterministic under load). `test-util` only enables tokio's
 # own features (rt, sync, time): it adds no packages, so Cargo.lock is unaffected.
 tokio = { workspace = true, features = ["test-util"] }
+# Hermetic temporary libraries for the FF7 source tests.
+tempfile.workspace = true

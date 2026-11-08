@@ -32,6 +32,14 @@
 //!   the archive the arrival `(x, y)` lies inside the target walkmesh triangle named by the
 //!   gateway's third destination value. 1 030 of 1 036 exit lines lie within 64 units of their
 //!   own walkmesh's bounding box; of 119 trigger slots in use, 118 do.
+//! * Field scale: the last `u16` of the six-byte model-loader header (and, identically in all
+//!   702 fields, the `u16` at offset 8 of the script section) is the field's scale. Its values
+//!   equal, field by field through the maplist ids, the community "Field Scale" list of the FF7
+//!   Speedrun Wiki (702 of 702 match): 512 in 643 fields, 1024 in 9, 768 in 12, 2048 in 7, 700 in
+//!   6, 576 and 600 in 5 each, 400 in 4, 4096, 650, 640 and 480 in 2 each, and 448, 720 and 5120
+//!   in one each. `md1stin` is 512, `md1_1` 1024. The header's first `u16` is 0 in every field.
+//!   FFNx's `ff7.h` describes it as "Scale of field. For move and talk calculation (9bit fixed
+//!   point)", so 512 is 1.0; see [`ModelLoaderHeader`] and `Ff7FieldArea::max_speed`.
 //! * Background: layer presence (layers 1-4) is 1100 in 618 fields, 1110 in 34, 1111 in 50.
 //!   `md1stin`: layer 1 528x528 header with 795 tiles, layer 2 with 320, five 8-bit pages (slots
 //!   0-4), 13 palette pages, 1 115 tiles in total. The texture block ends at the section end
@@ -110,8 +118,9 @@
 //! | triggers | [`Triggers`] | name, camera range, 12 gateways, 12 triggers (arrows not parsed) |
 //! | background | [`Background`] | header tags, layers 1-4 tile records ([`TileSprite`]), texture page locations |
 //!
-//! Script, model loader, tilemap and encounter sections are exposed only as raw payload
-//! bytes via [`FieldFile::section`].
+//! Script, model loader, tilemap and encounter sections are exposed as raw payload bytes via
+//! [`FieldFile::section`]; only the model-loader header (model count and field scale) is decoded,
+//! as [`ModelLoaderHeader`].
 //!
 //! # Known gaps and unverified points
 //!
@@ -426,6 +435,53 @@ impl FieldFile {
 
     pub fn background(&self) -> Result<Background<'_>, FieldError> {
         Background::parse(self.section(section::BACKGROUND)?)
+    }
+
+    /// Model count and field scale from the model-loader section's header.
+    pub fn model_loader_header(&self) -> Result<ModelLoaderHeader, FieldError> {
+        ModelLoaderHeader::parse(self.section(section::MODEL_LOADER)?)
+    }
+
+    /// The field's scale ([`ModelLoaderHeader::scale`]): 512 for most fields.
+    pub fn field_scale(&self) -> Result<u16, FieldError> {
+        self.model_loader_header().map(|h| h.scale)
+    }
+}
+
+/// `scale` value that means 1.0: the field scale is a 9-bit fixed-point multiplier.
+pub const FIELD_SCALE_ONE: u16 = 512;
+
+/// Header of the model-loader section (section 2): `u16` always 0, `u16` model count, `u16` scale.
+/// The per-model records after it are not decoded here.
+///
+/// `scale` is the per-field "Field Scale": 643 of the 702 owned fields have 512 and the rest
+/// range from 400 to 5120. The same value sits at offset 8 of the script section. FFNx's
+/// reverse-engineered headers call it "Scale of field. For move and talk calculation (9bit fixed
+/// point)", so [`FIELD_SCALE_ONE`] (512) is 1.0 and walking/running speed and talk distances scale
+/// with it; the FFRTT wiki page for this section calls the field "(unused)", which the data
+/// contradict. Verified field by field against the FF7 Speedrun Wiki's per-field list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelLoaderHeader {
+    pub model_count: u16,
+    pub scale: u16,
+}
+
+impl ModelLoaderHeader {
+    pub fn parse(section: &[u8]) -> Result<Self, FieldError> {
+        let mut r = Reader::new(section, "model loader");
+        r.skip(2)?; // always 0 in the owned data
+        let model_count = r.u16()?;
+        let scale = r.u16()?;
+        Ok(Self { model_count, scale })
+    }
+
+    /// `scale` as a multiplier (1.0 for 512). Zero (a damaged header) counts as 1.0.
+    pub fn scale_factor(&self) -> f32 {
+        if self.scale == 0 {
+            1.0
+        } else {
+            f32::from(self.scale) / f32::from(FIELD_SCALE_ONE)
+        }
     }
 }
 
@@ -1424,6 +1480,31 @@ mod tests {
     }
 
     #[test]
+    fn model_loader_header_and_field_scale() {
+        let f = parse(&FieldSpec::default());
+        assert_eq!(f.model_loader_header().unwrap(), ModelLoaderHeader { model_count: 0, scale: 512 });
+        assert_eq!(f.field_scale().unwrap(), 512);
+        assert_eq!(f.model_loader_header().unwrap().scale_factor(), 1.0);
+        let big = parse(&FieldSpec { model_scale: 1024, ..FieldSpec::default() });
+        assert_eq!(big.field_scale().unwrap(), 1024);
+        assert!((big.model_loader_header().unwrap().scale_factor() - 2.0).abs() < 1e-6);
+        let small = parse(&FieldSpec { model_scale: 400, ..FieldSpec::default() });
+        assert!((small.model_loader_header().unwrap().scale_factor() - 400.0 / 512.0).abs() < 1e-6);
+        // a header shorter than six bytes is an error, never a panic
+        for len in 0..6 {
+            assert!(matches!(ModelLoaderHeader::parse(&[0u8; 6][..len]), Err(FieldError::Truncated { .. })), "{len}");
+        }
+        // the model count is read from the second u16; extra bytes (the model records) are ignored
+        assert_eq!(
+            ModelLoaderHeader::parse(&[0, 0, 7, 0, 0x00, 0x04, 9, 9, 9]).unwrap(),
+            ModelLoaderHeader { model_count: 7, scale: 1024 }
+        );
+        // a zero scale (damaged header) counts as 1.0
+        assert_eq!(ModelLoaderHeader { model_count: 0, scale: 0 }.scale_factor(), 1.0);
+        assert_eq!(FIELD_SCALE_ONE, 512);
+    }
+
+    #[test]
     fn control_direction_is_an_unsigned_angle() {
         let mut raw = vec![0u8; 740];
         for value in [0u8, 124, 127, 128, 200, 255] {
@@ -1782,6 +1863,7 @@ mod tests {
                 let _ = f.walkmesh();
                 let _ = f.cameras();
                 let _ = f.triggers();
+                let _ = f.model_loader_header();
                 if let (Ok(pal), Ok(bg)) = (f.palette(), f.background()) {
                     for tile in &bg.tiles {
                         let _ = bg.tile_rgba(tile, &pal);

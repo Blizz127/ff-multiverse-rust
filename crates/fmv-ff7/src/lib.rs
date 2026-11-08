@@ -71,8 +71,9 @@ mod walk;
 mod testutil;
 
 pub use area::{
-    adapter_version, area_fingerprint, Ff7Adapter, Ff7FieldArea, SkippedEntry, FF7_FIELD_MAX_SPEED_PLACEHOLDER,
-    FINGERPRINT_RULE_VERSION, MAX_FIELD_BYTES, MAX_INDEX_READ_BYTES,
+    adapter_version, area_fingerprint, Ff7Adapter, Ff7FieldArea, SkippedEntry, FF7_FIELD_FRAMES_PER_SECOND,
+    FF7_FIELD_MAX_SPEED_PLACEHOLDER, FF7_RUN_WALK_SPEED_RATIO, FINGERPRINT_RULE_VERSION, MAX_FIELD_BYTES,
+    MAX_INDEX_READ_BYTES,
 };
 pub use walk::LinkReport;
 

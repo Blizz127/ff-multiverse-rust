@@ -10,3 +10,7 @@ license.workspace = true
 serde.workspace = true
 hex.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+# Pins GameId::key to the serde variant names (the strings fmv-persist stores).
+serde_json.workspace = true

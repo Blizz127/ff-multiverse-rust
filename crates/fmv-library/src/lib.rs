@@ -31,6 +31,7 @@
 )]
 
 mod error;
+pub mod ff7;
 mod fsutil;
 mod library;
 mod manifest;

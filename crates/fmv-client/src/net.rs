@@ -13,12 +13,20 @@
 //! * Text that comes from the server (including the text of decoding errors, which echoes what
 //!   the server sent) is cleaned before it is shown, and local-only detail (adapter errors may
 //!   name file paths) never goes onto the wire.
+//! * Accounts: `Hello` carries an [`Auth`] (a saved token, or a display name to register). A
+//!   registration is answered by a `Welcome` that carries the new account's token exactly once;
+//!   the handshake hands it to the [`TokenSink`] the instant it arrives, before anything else can
+//!   fail, because the registered name is unusable without it. The token is a [`Secret`]: it is
+//!   never logged, and appears in text only in [`NetError::TokenNotSaved`], the one case where
+//!   showing it is the user's only way to keep the account.
 
 use crate::cli::exit;
 use crate::state::Intent;
 use fmv_adapter_api::{AreaRuntime, GameAdapter};
-use fmv_core::{AreaId, EntityId, EntitySnapshot, Fingerprint, GameId, ProvenanceSummary, SessionId};
-use fmv_protocol::{read_msg, write_msg, ClientMsg, ProtoError, ServerMsg, PROTOCOL_VERSION};
+use fmv_core::{AccountId, AreaId, EntityId, EntitySnapshot, Fingerprint, GameId, ProvenanceSummary, SessionId};
+use fmv_protocol::{read_msg, write_msg, Auth, ClientMsg, InviteId, ProtoError, Secret, ServerMsg, PROTOCOL_VERSION};
+use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -54,14 +62,47 @@ impl SessionTiming {
     };
 }
 
+/// Where a freshly issued account token is stored. Called by the handshake the instant a
+/// `Welcome` with `issued_token: Some(..)` arrives (see the module docs); an `Err` aborts the
+/// handshake with [`NetError::TokenNotSaved`].
+///
+/// A small cloneable wrapper so [`NetConfig`] stays `Clone + Debug`: the closure is shared, and
+/// its `Debug` shows nothing (it may capture paths, never the token).
+#[derive(Clone)]
+pub struct TokenSink(Arc<dyn Fn(&Secret) -> Result<(), String> + Send + Sync>);
+
+impl TokenSink {
+    /// A sink that runs `save`. Its error text is shown to the user, so it must not contain the
+    /// token (the handshake adds the token to the message itself, in that one case).
+    pub fn new(save: impl Fn(&Secret) -> Result<(), String> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(save))
+    }
+
+    /// Store `token` (the handshake calls this; tests of the sinks do too).
+    pub(crate) fn save(&self, token: &Secret) -> Result<(), String> {
+        (self.0)(token)
+    }
+}
+
+impl fmt::Debug for TokenSink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("TokenSink(..)")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct NetConfig {
     pub server: String,
-    pub display_name: String,
+    /// How to authenticate: the saved token, or the display name to register.
+    pub auth: Auth,
+    /// The look requested for a NEW avatar (only used when `auth` is a registration; a login
+    /// takes the stored profile).
     pub tint: [u8; 3],
     pub appearance_ref: Option<String>,
     pub client_build: String,
     pub timing: SessionTiming,
+    /// Stores the token a registration issues.
+    pub token_sink: TokenSink,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -84,6 +125,11 @@ pub enum NetError {
     Content(String),
     #[error("network thread failed: {0}")]
     Runtime(String),
+    /// A registration succeeded, but the token it issued could not be stored. The token IS part
+    /// of the text, on purpose and only here: it is shown once and the account's name is taken,
+    /// so printing it is the user's only chance to keep the account. (`Debug` still redacts it.)
+    #[error("the account was created on the server, but its token could not be saved ({reason}); save this token by hand, it is shown only once: {}", .token.expose())]
+    TokenNotSaved { reason: String, token: Secret },
 }
 
 impl NetError {
@@ -99,6 +145,9 @@ impl NetError {
 pub struct Joined {
     pub session: SessionId,
     pub entity: EntityId,
+    /// The authenticated account (party events name accounts, so this is how the session
+    /// recognises itself in them).
+    pub account: AccountId,
     pub server_build: String,
     pub area_id: AreaId,
     pub area_name: String,
@@ -113,10 +162,49 @@ pub struct Joined {
     pub backlog: Vec<ServerMsg>,
 }
 
+/// A party request the player (or the headless bot) makes. Each one is sent as the matching
+/// `ClientMsg`; the server decides and answers with `PartyEvent` / `PartyRejected`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartyCommand {
+    /// Invite the player with this entity (into your party, or to form one).
+    Invite(EntityId),
+    /// Accept an invite addressed to you.
+    Accept(InviteId),
+    /// Decline an invite addressed to you. (No key or bot flag sends it yet; the protocol has it.)
+    #[allow(dead_code)]
+    Decline(InviteId),
+    /// Leave your party.
+    Leave,
+    /// Leader only: remove a member. (No key or bot flag sends it yet; the protocol has it.)
+    #[allow(dead_code)]
+    Kick(EntityId),
+    /// Leader only: hand leadership to a member. (No key or bot flag sends it yet.)
+    #[allow(dead_code)]
+    Promote(EntityId),
+    /// Ask for the full party state (answered by `PartyState`).
+    Sync,
+}
+
+impl PartyCommand {
+    /// The message that carries this command.
+    pub fn to_msg(self) -> ClientMsg {
+        match self {
+            PartyCommand::Invite(target) => ClientMsg::PartyInvite { target },
+            PartyCommand::Accept(invite) => ClientMsg::PartyAccept { invite },
+            PartyCommand::Decline(invite) => ClientMsg::PartyDecline { invite },
+            PartyCommand::Leave => ClientMsg::PartyLeave,
+            PartyCommand::Kick(target) => ClientMsg::PartyKick { target },
+            PartyCommand::Promote(target) => ClientMsg::PartyPromote { target },
+            PartyCommand::Sync => ClientMsg::PartySync,
+        }
+    }
+}
+
 /// Messages from the game loop to the network thread.
 #[derive(Debug, Clone, Copy)]
 pub enum NetCommand {
     Intent(Intent),
+    Party(PartyCommand),
     Leave,
 }
 
@@ -199,15 +287,24 @@ impl ContentMismatch {
     }
 }
 
+/// What a successful local content check yields.
+pub struct LocalContent {
+    /// The area decoded from this machine's own content.
+    pub runtime: Box<dyn AreaRuntime>,
+    /// This machine's OWN path-free provenance of that area (what `JoinArea` sends; the server
+    /// requires it to be `compatible_with` the area's, in addition to the fingerprint matching).
+    pub provenance: ProvenanceSummary,
+}
+
 /// Compare what the server offers with what this client holds locally. On success returns the
-/// area decoded from local content; on failure a concrete reason for `CannotJoin` (and the
-/// fuller one for the user).
+/// area decoded from local content together with the local provenance; on failure a concrete
+/// reason for `CannotJoin` (and the fuller one for the user).
 pub fn check_local_content(
     adapter: &dyn GameAdapter,
     area: &AreaId,
     fingerprint: &Fingerprint,
     provenance: &ProvenanceSummary,
-) -> Result<Box<dyn AreaRuntime>, ContentMismatch> {
+) -> Result<LocalContent, ContentMismatch> {
     let local_game = adapter.game();
     // Everything the server supplied is cleaned before it is interpolated into a message that
     // is printed locally and sent back in `CannotJoin`.
@@ -267,7 +364,7 @@ pub fn check_local_content(
             "local area `{key}` decoded to a different fingerprint than its catalog entry"
         )));
     }
-    Ok(runtime)
+    Ok(LocalContent { runtime, provenance: local })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -292,6 +389,7 @@ async fn send<W: AsyncWrite + Unpin>(
 struct Welcome {
     session: SessionId,
     entity: EntityId,
+    account: AccountId,
     server_build: String,
 }
 
@@ -306,6 +404,9 @@ struct Offer {
 /// Run the client side of the handshake:
 /// `Hello` -> (`Welcome`, `AreaManifest`) -> local content check -> `JoinArea` or `CannotJoin`
 /// -> `AreaSnapshot`.
+///
+/// A `Welcome` that carries a newly issued token is handed to `cfg.token_sink` first of all: before
+/// the version check, the local content check and everything else that can fail.
 pub async fn handshake<R, W>(
     rd: &mut R,
     wr: &mut W,
@@ -321,7 +422,7 @@ where
     let hello = ClientMsg::Hello {
         protocol_version: PROTOCOL_VERSION,
         client_build: cfg.client_build.clone(),
-        display_name: cfg.display_name.clone(),
+        auth: cfg.auth.clone(),
         tint: cfg.tint,
         appearance_ref: cfg.appearance_ref.clone(),
     };
@@ -331,6 +432,8 @@ where
     let mut offer: Option<Offer> = None;
     let mut snapshot: Option<Vec<EntitySnapshot>> = None;
     let mut backlog: Vec<ServerMsg> = Vec::new();
+    // The sink is called once per handshake, however many Welcomes a broken server sends.
+    let mut token_handled = false;
 
     loop {
         let waiting = if welcome.is_none() {
@@ -357,7 +460,20 @@ where
                 server_build,
                 session,
                 entity,
+                account,
+                issued_token,
             } => {
+                // FIRST, before any check that could fail: a registered name is unique and cannot
+                // be recovered without this token, which the server shows exactly once.
+                if let (Some(token), false) = (&issued_token, token_handled) {
+                    token_handled = true;
+                    if let Err(reason) = cfg.token_sink.save(token) {
+                        return Err(NetError::TokenNotSaved {
+                            reason: clean_to(&reason, MAX_LOCAL_DETAIL),
+                            token: token.clone(),
+                        });
+                    }
+                }
                 if protocol_version != PROTOCOL_VERSION {
                     return Err(NetError::Protocol(format!(
                         "server speaks protocol v{protocol_version}, this client speaks v{PROTOCOL_VERSION}"
@@ -369,6 +485,7 @@ where
                 welcome = Some(Welcome {
                     session,
                     entity,
+                    account,
                     server_build,
                 });
             }
@@ -383,10 +500,13 @@ where
                     return Err(NetError::Protocol("duplicate AreaManifest".into()));
                 }
                 match check_local_content(adapter, &area, &fingerprint, &provenance) {
-                    Ok(runtime) => {
+                    Ok(LocalContent { runtime, provenance: local_provenance }) => {
+                        // Our OWN path-free provenance (not an echo of the server's): the server
+                        // requires it to be compatible with the area's.
                         let join = ClientMsg::JoinArea {
                             area: area.clone(),
                             fingerprint,
+                            provenance: local_provenance,
                         };
                         send(wr, &join, "sending JoinArea", deadline).await?;
                         // FIXTURE is judged from OUR content as well as the server's flag, so
@@ -438,6 +558,12 @@ where
                     push_backlog(&mut backlog, other);
                 }
             }
+            // Party traffic does not depend on the area: it is kept whenever it arrives, so the
+            // party mirror never misses an event (a gap in `seq` would only cost a resync).
+            other @ (ServerMsg::InstancePlacement { .. }
+            | ServerMsg::PartyEvent { .. }
+            | ServerMsg::PartyState { .. }
+            | ServerMsg::PartyRejected { .. }) => push_backlog(&mut backlog, other),
         }
         if let (Some(_), Some(_), Some(_)) = (&welcome, &offer, &snapshot) {
             let (Some(w), Some(o), Some(entities)) = (welcome, offer, snapshot) else {
@@ -446,6 +572,7 @@ where
             return Ok(Joined {
                 session: w.session,
                 entity: w.entity,
+                account: w.account,
                 server_build: clean(&w.server_build),
                 area_id: o.area,
                 area_name: clean(&o.display_name),
@@ -534,6 +661,7 @@ async fn session_loop<R, W>(
         let msg = tokio::select! {
             cmd = cmd_rx.recv() => match cmd {
                 Some(NetCommand::Intent(i)) => ClientMsg::MoveIntent { seq: i.seq, pos: i.pos, facing: i.facing, anim: i.anim },
+                Some(NetCommand::Party(p)) => p.to_msg(),
                 Some(NetCommand::Leave) | None => {
                     let _ = timeout(WRITE_TIMEOUT, write_msg(&mut wr, &ClientMsg::Leave)).await;
                     break;
@@ -715,11 +843,12 @@ mod tests {
     fn cfg() -> NetConfig {
         NetConfig {
             server: "unused".into(),
-            display_name: "tester".into(),
+            auth: Auth::Register { display_name: "tester".into() },
             tint: [1, 2, 3],
             appearance_ref: None,
             client_build: "test".into(),
             timing: SessionTiming::DEFAULT,
+            token_sink: TokenSink::new(|_| Ok(())),
         }
     }
 
@@ -784,11 +913,17 @@ mod tests {
     }
 
     fn welcome() -> ServerMsg {
+        welcome_with(None)
+    }
+
+    fn welcome_with(issued_token: Option<&str>) -> ServerMsg {
         ServerMsg::Welcome {
             protocol_version: PROTOCOL_VERSION,
             server_build: "srv".into(),
             session: SessionId(5),
             entity: EntityId(7),
+            account: AccountId(42),
+            issued_token: issued_token.map(Secret::new),
         }
     }
 
@@ -825,7 +960,7 @@ mod tests {
             let hello: ClientMsg = read_msg(&mut srd).await.unwrap();
             let ClientMsg::Hello {
                 protocol_version,
-                display_name,
+                auth,
                 tint,
                 ..
             } = hello
@@ -833,8 +968,8 @@ mod tests {
                 panic!("expected Hello")
             };
             assert_eq!(
-                (protocol_version, display_name.as_str(), tint),
-                (PROTOCOL_VERSION, "tester", [1, 2, 3])
+                (protocol_version, auth, tint),
+                (PROTOCOL_VERSION, Auth::Register { display_name: "tester".into() }, [1, 2, 3])
             );
             // Unusual order: manifest first, welcome only after the client joined.
             write_msg(&mut swr, &manifest(&srv_adapter, |_| {})).await.unwrap();
@@ -856,6 +991,7 @@ mod tests {
             .unwrap();
         server_task.await.unwrap();
         assert_eq!((joined.session, joined.entity), (SessionId(5), EntityId(7)));
+        assert_eq!(joined.account, AccountId(42), "the Welcome's account is returned");
         assert_eq!(joined.server_build, "srv");
         assert!(joined.fixture);
         assert_eq!(joined.area_id.key, "plaza");
@@ -1056,6 +1192,8 @@ mod tests {
                 server_build: "x".into(),
                 session: SessionId(1),
                 entity: EntityId(1),
+                account: AccountId(1),
+                issued_token: None,
             },
         )
         .await
@@ -1281,5 +1419,388 @@ mod tests {
         assert_eq!(rtt_from_nonce(now, 5_000_001), None, "nonce from the future");
         assert_eq!(rtt_from_nonce(now, u64::MAX), None);
         assert_eq!(rtt_from_nonce(Duration::from_secs(100), 1), None, "older than a minute");
+    }
+
+    // ------------------------------------------------------------------------------------
+    // Accounts: the token, the authentication, the provenance
+    // ------------------------------------------------------------------------------------
+
+    /// A sink that records every token it is given (and what `result` says), plus a `Notify` that
+    /// fires on every call.
+    fn recording_sink(result: Result<(), String>) -> (TokenSink, Arc<std::sync::Mutex<Vec<String>>>, Arc<tokio::sync::Notify>) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let sink = {
+            let (seen, notify) = (Arc::clone(&seen), Arc::clone(&notify));
+            TokenSink::new(move |t: &Secret| {
+                seen.lock().expect("lock").push(t.expose().to_string());
+                notify.notify_one();
+                result.clone()
+            })
+        };
+        (sink, seen, notify)
+    }
+
+    fn cfg_with(sink: TokenSink) -> NetConfig {
+        NetConfig { token_sink: sink, ..cfg() }
+    }
+
+    /// The token reaches the sink when its `Welcome` arrives, not later: the server holds back
+    /// everything else until the sink has been called.
+    #[tokio::test]
+    async fn the_token_is_saved_the_instant_the_welcome_arrives() {
+        let adapter = FixtureAdapter::new();
+        let (client, server) = duplex(64 * 1024);
+        let (mut crd, mut cwr) = split(client);
+        let (mut srd, mut swr) = split(server);
+        let (sink, seen, notify) = recording_sink(Ok(()));
+        let (srv_adapter, srv_notify) = (FixtureAdapter::new(), Arc::clone(&notify));
+        let server_task = tokio::spawn(async move {
+            let _hello: ClientMsg = read_msg(&mut srd).await.unwrap();
+            write_msg(&mut swr, &welcome_with(Some("fmvt_issued"))).await.unwrap();
+            // Nothing else is sent until the sink was called: if the client waited for the
+            // manifest (or anything else) before saving, this times out.
+            timeout(Duration::from_secs(5), srv_notify.notified())
+                .await
+                .expect("the token must be saved as soon as the Welcome arrives");
+            write_msg(&mut swr, &manifest(&srv_adapter, |_| {})).await.unwrap();
+            let _join: ClientMsg = read_msg(&mut srd).await.unwrap();
+            write_msg(&mut swr, &area_snapshot(&srv_adapter, vec![snap(7, 0.0)])).await.unwrap();
+        });
+        let joined = handshake(&mut crd, &mut cwr, &cfg_with(sink), &adapter, Duration::from_secs(10))
+            .await
+            .unwrap();
+        server_task.await.unwrap();
+        assert_eq!(joined.account, AccountId(42));
+        assert_eq!(*seen.lock().unwrap(), vec!["fmvt_issued".to_string()], "saved once");
+    }
+
+    /// Prove "before the content check": the area offered cannot be joined (a mismatching
+    /// fingerprint), the handshake fails with a content error, and the token was saved anyway.
+    #[tokio::test]
+    async fn the_token_is_saved_before_the_content_check_can_fail() {
+        let adapter = FixtureAdapter::new();
+        let (client, server) = duplex(64 * 1024);
+        let (mut crd, mut cwr) = split(client);
+        let (mut srd, mut swr) = split(server);
+        let (sink, seen, _notify) = recording_sink(Ok(()));
+        let srv_adapter = FixtureAdapter::new();
+        let server_task = tokio::spawn(async move {
+            let _hello: ClientMsg = read_msg(&mut srd).await.unwrap();
+            write_msg(&mut swr, &welcome_with(Some("fmvt_before_content"))).await.unwrap();
+            let tampered = manifest(&srv_adapter, |m| {
+                if let ServerMsg::AreaManifest { fingerprint, .. } = m {
+                    fingerprint.0[0] ^= 0xff;
+                }
+            });
+            write_msg(&mut swr, &tampered).await.unwrap();
+            read_msg::<_, ClientMsg>(&mut srd).await.unwrap()
+        });
+        let err = handshake(&mut crd, &mut cwr, &cfg_with(sink), &adapter, Duration::from_secs(5))
+            .await
+            .err()
+            .expect("the content check fails");
+        assert!(matches!(&err, NetError::Content(r) if r.contains("fingerprint mismatch")), "{err}");
+        assert!(matches!(server_task.await.unwrap(), ClientMsg::CannotJoin { .. }));
+        assert_eq!(*seen.lock().unwrap(), vec!["fmvt_before_content".to_string()], "the token was saved first");
+        assert!(!err.to_string().contains("fmvt_before_content"), "an ordinary failure never shows the token: {err}");
+    }
+
+    /// The same for the other checks that can fail on a `Welcome`: a wrong protocol version and
+    /// a duplicate (the sink is called once however many Welcomes arrive).
+    #[tokio::test]
+    async fn the_token_is_saved_before_the_version_check_and_only_once() {
+        let adapter = FixtureAdapter::new();
+        // Wrong protocol version, with a token.
+        let (client, server) = duplex(4096);
+        let (mut crd, mut cwr) = split(client);
+        let (_srd, mut swr) = split(server);
+        let (sink, seen, _notify) = recording_sink(Ok(()));
+        let ServerMsg::Welcome { server_build, session, entity, account, issued_token, .. } = welcome_with(Some("fmvt_v99")) else {
+            panic!("a Welcome")
+        };
+        let wrong = ServerMsg::Welcome { protocol_version: 99, server_build, session, entity, account, issued_token };
+        write_msg(&mut swr, &wrong).await.unwrap();
+        let err = handshake(&mut crd, &mut cwr, &cfg_with(sink), &adapter, Duration::from_secs(5)).await.err().unwrap();
+        assert!(matches!(&err, NetError::Protocol(m) if m.contains("v99")), "{err}");
+        assert_eq!(*seen.lock().unwrap(), vec!["fmvt_v99".to_string()]);
+
+        // Two Welcomes with tokens: one call, then the duplicate is a protocol error.
+        let (client, server) = duplex(4096);
+        let (mut crd, mut cwr) = split(client);
+        let (_srd, mut swr) = split(server);
+        let (sink, seen, _notify) = recording_sink(Ok(()));
+        write_msg(&mut swr, &welcome_with(Some("fmvt_first"))).await.unwrap();
+        write_msg(&mut swr, &welcome_with(Some("fmvt_second"))).await.unwrap();
+        let err = handshake(&mut crd, &mut cwr, &cfg_with(sink), &adapter, Duration::from_secs(5)).await.err().unwrap();
+        assert!(matches!(&err, NetError::Protocol(m) if m.contains("duplicate Welcome")), "{err}");
+        assert_eq!(*seen.lock().unwrap(), vec!["fmvt_first".to_string()], "the second token is not offered to the sink");
+    }
+
+    /// A login (no token issued) never calls the sink.
+    #[tokio::test]
+    async fn no_token_means_no_sink_call() {
+        let adapter = FixtureAdapter::new();
+        let (client, server) = duplex(64 * 1024);
+        let (mut crd, mut cwr) = split(client);
+        let (mut srd, mut swr) = split(server);
+        let (sink, seen, _notify) = recording_sink(Ok(()));
+        let srv_adapter = FixtureAdapter::new();
+        let server_task = tokio::spawn(async move {
+            let _hello: ClientMsg = read_msg(&mut srd).await.unwrap();
+            write_msg(&mut swr, &welcome()).await.unwrap();
+            write_msg(&mut swr, &manifest(&srv_adapter, |_| {})).await.unwrap();
+            let _join: ClientMsg = read_msg(&mut srd).await.unwrap();
+            write_msg(&mut swr, &area_snapshot(&srv_adapter, vec![snap(7, 0.0)])).await.unwrap();
+        });
+        let mut config = cfg_with(sink);
+        config.auth = Auth::Token(Secret::new("fmvt_saved"));
+        handshake(&mut crd, &mut cwr, &config, &adapter, Duration::from_secs(5)).await.unwrap();
+        server_task.await.unwrap();
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    /// If the token cannot be saved the handshake stops there: the account exists on the server,
+    /// so the user must be told, with the token, and nothing else is sent.
+    #[tokio::test]
+    async fn a_failing_sink_aborts_the_handshake_and_shows_the_token_once() {
+        let adapter = FixtureAdapter::new();
+        let (client, server) = duplex(64 * 1024);
+        let (mut crd, mut cwr) = split(client);
+        let (mut srd, mut swr) = split(server);
+        let (sink, seen, _notify) = recording_sink(Err("no space left on device".into()));
+        let srv_adapter = FixtureAdapter::new();
+        let server_task = tokio::spawn(async move {
+            let _hello: ClientMsg = read_msg(&mut srd).await.unwrap();
+            write_msg(&mut swr, &welcome_with(Some("fmvt_unsaved_secret"))).await.unwrap();
+            let _ = write_msg(&mut swr, &manifest(&srv_adapter, |_| {})).await;
+            // The client must not answer the manifest: it gives up, and the connection closes.
+            read_msg::<_, ClientMsg>(&mut srd).await
+        });
+        let err = handshake(&mut crd, &mut cwr, &cfg_with(sink), &adapter, Duration::from_secs(5))
+            .await
+            .err()
+            .expect("an unsaved token aborts the handshake");
+        drop((crd, cwr));
+        assert!(matches!(server_task.await.unwrap(), Err(ProtoError::Closed)), "nothing was sent after the Welcome");
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert_eq!(err.exit_code(), exit::FAILURE);
+        // The user is told what happened, why, and gets the token (the one place it is shown).
+        let text = err.to_string();
+        assert!(text.contains("created on the server") && text.contains("could not be saved"), "{text}");
+        assert!(text.contains("no space left on device"), "{text}");
+        assert!(text.contains("fmvt_unsaved_secret"), "the token is shown so it can be saved by hand: {text}");
+        // ...but never through Debug (logs, assertion messages).
+        assert!(!format!("{err:?}").contains("fmvt_unsaved_secret"), "{err:?}");
+    }
+
+    /// `Hello` carries the authentication exactly as configured, tint and appearance included.
+    #[tokio::test]
+    async fn hello_carries_the_configured_auth() {
+        let adapter = FixtureAdapter::new();
+        for auth in [Auth::Token(Secret::new("fmvt_saved_token")), Auth::Register { display_name: "Cloud".into() }] {
+            let (client, server) = duplex(4096);
+            let (mut crd, mut cwr) = split(client);
+            let (mut srd, mut swr) = split(server);
+            let server_task = tokio::spawn(async move {
+                let hello: ClientMsg = read_msg(&mut srd).await.unwrap();
+                write_msg(&mut swr, &ServerMsg::Reject { reason: "stop here".into() }).await.unwrap();
+                hello
+            });
+            let mut config = cfg();
+            config.auth = auth.clone();
+            config.appearance_ref = Some("cloud_model".into());
+            config.client_build = "fmv-client/test".into();
+            let err = handshake(&mut crd, &mut cwr, &config, &adapter, Duration::from_secs(5)).await.err().unwrap();
+            assert!(matches!(err, NetError::Rejected(_)));
+            match server_task.await.unwrap() {
+                ClientMsg::Hello { protocol_version, client_build, auth: sent, tint, appearance_ref } => {
+                    assert_eq!(protocol_version, PROTOCOL_VERSION);
+                    assert_eq!(client_build, "fmv-client/test");
+                    assert_eq!(sent, auth);
+                    assert_eq!((tint, appearance_ref.as_deref()), ([1, 2, 3], Some("cloud_model")));
+                }
+                other => panic!("expected Hello, got {other:?}"),
+            }
+        }
+    }
+
+    /// The fixture's catalog with another language and the `modded` flag: both are part of the
+    /// provenance but not of `compatible_with`, so a server still accepts such a client.
+    struct Relabeled(FixtureAdapter);
+
+    impl GameAdapter for Relabeled {
+        fn game(&self) -> GameId {
+            self.0.game()
+        }
+        fn list_areas(&self) -> Vec<AreaInfo> {
+            self.0
+                .list_areas()
+                .into_iter()
+                .map(|mut a| {
+                    a.provenance.language = "xx-local".into();
+                    a.provenance.modded = true;
+                    a
+                })
+                .collect()
+        }
+        fn load_area(&self, key: &str) -> Result<Box<dyn AreaRuntime>, AdapterError> {
+            self.0.load_area(key)
+        }
+    }
+
+    /// `JoinArea` carries THIS client's own path-free provenance, not an echo of the server's.
+    #[tokio::test]
+    async fn join_area_carries_the_local_provenance() {
+        let local = Relabeled(FixtureAdapter::new());
+        let (client, server) = duplex(64 * 1024);
+        let (mut crd, mut cwr) = split(client);
+        let (mut srd, mut swr) = split(server);
+        let srv_adapter = FixtureAdapter::new();
+        let server_task = tokio::spawn(async move {
+            let _hello: ClientMsg = read_msg(&mut srd).await.unwrap();
+            write_msg(&mut swr, &welcome()).await.unwrap();
+            write_msg(&mut swr, &manifest(&srv_adapter, |_| {})).await.unwrap();
+            let join: ClientMsg = read_msg(&mut srd).await.unwrap();
+            write_msg(&mut swr, &area_snapshot(&srv_adapter, vec![snap(7, 0.0)])).await.unwrap();
+            join
+        });
+        handshake(&mut crd, &mut cwr, &cfg(), &local, Duration::from_secs(5)).await.unwrap();
+        let ClientMsg::JoinArea { area, fingerprint, provenance } = server_task.await.unwrap() else {
+            panic!("expected JoinArea")
+        };
+        let info = local.list_areas().remove(0);
+        assert_eq!((area, fingerprint), (info.id.clone(), info.fingerprint));
+        assert_eq!(provenance, info.provenance.summary(), "the client's own provenance");
+        assert_eq!((provenance.language.as_str(), provenance.modded), ("xx-local", true));
+        let offered = FixtureAdapter::new().list_areas().remove(0).provenance.summary();
+        assert_ne!(provenance, offered, "it is not a copy of what the server offered");
+        assert!(provenance.compatible_with(&offered), "but it is compatible with it, which is what the server checks");
+        // No local path can be in it: it is the path-free summary type.
+        assert!(!format!("{provenance:?}").contains('/'));
+    }
+
+    /// The content check hands back the local provenance together with the runtime.
+    #[test]
+    fn the_content_check_returns_the_local_provenance() {
+        let adapter = Relabeled(FixtureAdapter::new());
+        let info = adapter.list_areas().remove(0);
+        let offered = FixtureAdapter::new().list_areas().remove(0).provenance.summary();
+        let ok = check_local_content(&adapter, &info.id, &info.fingerprint, &offered).ok().expect("compatible");
+        assert_eq!(ok.provenance, info.provenance.summary());
+        assert_eq!(ok.runtime.info().fingerprint, info.fingerprint);
+    }
+
+    /// Party traffic that arrives while the handshake completes is kept, in order, wherever it
+    /// falls (even before the manifest); `InstancePlacement` after the snapshot is the session's.
+    #[tokio::test]
+    async fn party_messages_during_the_handshake_are_queued_in_order() {
+        use fmv_protocol::{PartyEvent, PartyFailure};
+        let adapter = FixtureAdapter::new();
+        let (client, server) = duplex(64 * 1024);
+        let (mut crd, mut cwr) = split(client);
+        let (mut srd, mut swr) = split(server);
+        let srv_adapter = FixtureAdapter::new();
+        let event = |seq: u64| ServerMsg::PartyEvent {
+            seq,
+            event: PartyEvent::InviteExpired { invite: fmv_protocol::InviteId(seq), from: AccountId(1), to: AccountId(2) },
+            names: vec![],
+        };
+        let server_task = tokio::spawn(async move {
+            let _hello: ClientMsg = read_msg(&mut srd).await.unwrap();
+            write_msg(&mut swr, &welcome()).await.unwrap();
+            write_msg(&mut swr, &event(1)).await.unwrap(); // before the manifest
+            write_msg(&mut swr, &manifest(&srv_adapter, |_| {})).await.unwrap();
+            write_msg(&mut swr, &ServerMsg::PartyRejected { error: PartyFailure::RateLimited }).await.unwrap();
+            let _join: ClientMsg = read_msg(&mut srd).await.unwrap();
+            write_msg(&mut swr, &event(2)).await.unwrap();
+            write_msg(&mut swr, &area_snapshot(&srv_adapter, vec![snap(7, 0.0)])).await.unwrap();
+        });
+        let joined = handshake(&mut crd, &mut cwr, &cfg(), &adapter, Duration::from_secs(5)).await.unwrap();
+        server_task.await.unwrap();
+        let kinds: Vec<&str> = joined
+            .backlog
+            .iter()
+            .map(|m| match m {
+                ServerMsg::PartyEvent { seq: 1, .. } => "event 1",
+                ServerMsg::PartyEvent { seq: 2, .. } => "event 2",
+                ServerMsg::PartyRejected { .. } => "rejected",
+                ServerMsg::AreaSnapshot { .. } => "snapshot",
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(kinds, ["event 1", "rejected", "event 2", "snapshot"]);
+    }
+
+    #[test]
+    fn party_commands_become_the_matching_messages() {
+        use fmv_protocol::InviteId;
+        let cases = [
+            (PartyCommand::Invite(EntityId(8)), ClientMsg::PartyInvite { target: EntityId(8) }),
+            (PartyCommand::Accept(InviteId(3)), ClientMsg::PartyAccept { invite: InviteId(3) }),
+            (PartyCommand::Decline(InviteId(4)), ClientMsg::PartyDecline { invite: InviteId(4) }),
+            (PartyCommand::Leave, ClientMsg::PartyLeave),
+            (PartyCommand::Kick(EntityId(9)), ClientMsg::PartyKick { target: EntityId(9) }),
+            (PartyCommand::Promote(EntityId(10)), ClientMsg::PartyPromote { target: EntityId(10) }),
+            (PartyCommand::Sync, ClientMsg::PartySync),
+        ];
+        for (command, msg) in cases {
+            assert_eq!(command.to_msg(), msg, "{command:?}");
+        }
+    }
+
+    /// The session loop sends party commands as their messages, in order with everything else.
+    #[tokio::test]
+    async fn the_session_loop_sends_party_commands() {
+        use fmv_protocol::InviteId;
+        let (client, server) = duplex(64 * 1024);
+        let (crd, cwr) = split(client);
+        let (mut srd, _swr) = split(server);
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (evt_tx, _evt_rx) = mpsc::channel(64);
+        let session = tokio::spawn(session_loop(crd, cwr, cmd_rx, evt_tx, Instant::now(), SessionTiming::DEFAULT));
+        for command in [
+            PartyCommand::Invite(EntityId(8)),
+            PartyCommand::Accept(InviteId(3)),
+            PartyCommand::Leave,
+            PartyCommand::Sync,
+        ] {
+            cmd_tx.send(NetCommand::Party(command)).unwrap();
+        }
+        cmd_tx.send(NetCommand::Leave).unwrap();
+        let mut got = Vec::new();
+        loop {
+            match timeout(Duration::from_secs(10), read_msg::<_, ClientMsg>(&mut srd)).await.expect("a message") {
+                Ok(ClientMsg::Ping { .. }) => {}
+                Ok(msg) => {
+                    let done = msg == ClientMsg::Leave;
+                    got.push(msg);
+                    if done {
+                        break;
+                    }
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        assert_eq!(
+            got,
+            vec![
+                ClientMsg::PartyInvite { target: EntityId(8) },
+                ClientMsg::PartyAccept { invite: InviteId(3) },
+                ClientMsg::PartyLeave,
+                ClientMsg::PartySync,
+                ClientMsg::Leave,
+            ]
+        );
+        timeout(Duration::from_secs(10), session).await.expect("the loop ends").unwrap();
+    }
+
+    #[test]
+    fn the_token_sink_debug_shows_nothing_and_the_config_never_prints_a_token() {
+        let (sink, _seen, _n) = recording_sink(Ok(()));
+        assert_eq!(format!("{sink:?}"), "TokenSink(..)");
+        let mut c = cfg_with(sink.clone());
+        c.auth = Auth::Token(Secret::new("fmvt_do_not_print"));
+        assert!(!format!("{c:?}").contains("fmvt_do_not_print"), "{c:?}");
     }
 }
