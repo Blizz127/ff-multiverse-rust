@@ -13,7 +13,9 @@ use crate::model::AvatarId;
 
 pub type Result<T, E = PersistError> = std::result::Result<T, E>;
 
+/// Callers should keep a catch-all arm when matching: variants are added as the store grows.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum PersistError {
     /// An operating-system failure, with what we were doing and to which path.
     #[error("{action} {}: {source}", .path.display())]
@@ -69,15 +71,22 @@ pub enum PersistError {
     )]
     LockCorrupt { path: PathBuf, detail: String },
 
-    /// Records exist but `index.json` does not. Opening would reuse ids over live records.
+    /// Records exist but the index (`index.log`, or a pre-v2 `index.json`) does not. Opening
+    /// would reuse ids over live records.
     #[error(
-        "state directory {} has records but no index.json; refusing to open it so existing \
-         records are not overwritten (restore index.json or a snapshot)",
+        "state directory {} has records but no index (index.log); refusing to open it so \
+         existing records are not overwritten (restore index.log or a snapshot)",
         .root.display()
     )]
     IndexMissing { root: PathBuf },
 
-    #[error("display name is empty after sanitizing")]
+    /// The display name cannot be registered: nothing visible is left after cleaning it, or
+    /// it mixes writing systems (see `fmv_core::AvatarAppearance::validate_new_name`, which
+    /// says which).
+    #[error(
+        "display name is empty or not allowed after cleaning (it needs visible characters \
+         from a single writing system)"
+    )]
     InvalidName,
 
     #[error("display name {0:?} is already taken")]
@@ -108,6 +117,32 @@ pub enum PersistError {
 
     #[error("id space exhausted")]
     IdExhausted,
+
+    /// The store already holds the configured maximum number of accounts
+    /// ([`StoreOptions::max_accounts`](crate::StoreOptions)). Only registration is refused;
+    /// logins, avatars and progression are unaffected, and the limit is checked before any
+    /// disk work, so a flood of refused registrations costs the store nothing.
+    #[error(
+        "the account limit of {max} has been reached; no new account can be registered \
+         (existing accounts are not affected)"
+    )]
+    AccountLimitReached { max: u64 },
+
+    /// `release_unclaimed` was asked to remove an account that is not an orphan.
+    #[error("account {account:?} cannot be released: {reason}")]
+    NotReleasable {
+        account: AccountId,
+        reason: &'static str,
+    },
+
+    /// A write to `index.log` failed and could not be rolled back, so appending more would
+    /// make the file disagree with memory. Logins keep working; registration is refused until
+    /// the server restarts (opening the store repairs the log from what is on disk).
+    #[error(
+        "the account index could not be written and is not safe to append to ({detail}); \
+         restart the server so the log is repaired"
+    )]
+    IndexPoisoned { detail: String },
 
     #[error("snapshot: {0}")]
     Snapshot(String),
