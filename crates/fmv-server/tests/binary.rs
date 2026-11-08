@@ -201,6 +201,24 @@ async fn a_fixture_server_with_debug_encounters_warns_and_refuses_battle_request
     assert!(log.contains("battles unsupported") || log.contains("no battle data"), "{log}");
 }
 
+/// `--debug-limit-full` is a debug flag: alone it is a usage error (exit code 2, nothing printed or bound), and
+/// on a server without battle data (the FIXTURE one) it says at start-up that it does nothing there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_debug_limit_flag_needs_debug_encounters_and_a_fixture_server_says_it_has_no_effect() {
+    let env_state = tempfile::tempdir().expect("tempdir");
+    let state = env_state.path().to_str().expect("utf-8 temp path");
+    let out = run_failing(&["--ephemeral", "--debug-limit-full"], state).await;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("--debug-encounters"), "the usage error names the flag it needs: {stderr}");
+    assert!(out.stdout.is_empty(), "no READY line");
+
+    let server = start(&["--ephemeral", "--debug-encounters", "--debug-limit-full"], env_state.path()).await;
+    let (status, log) = server.stop("TERM").await;
+    assert_eq!(status.code(), Some(0), "{log}");
+    assert!(log.contains("--debug-limit-full has no effect"), "the operator is told that the flag does nothing here:\n{log}");
+}
+
 /// Accounts live in the state directory: a registration made against one process is honoured by the
 /// next process on the same `--state-dir`, the directory is held locked while a server runs, and
 /// a refused second server says so without printing a READY line.
