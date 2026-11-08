@@ -7,6 +7,7 @@
 #   ff-multiverse-<version>-<gitshort>[-dirty][-prebuilt]-linux-x86_64/     staging dir (kept)
 #   ff-multiverse-<version>-<gitshort>[-dirty][-prebuilt]-linux-x86_64.tar.gz
 #   ff-multiverse-<version>-<gitshort>[-dirty][-prebuilt]-linux-x86_64.manifest.json (sidecar)
+#   SHA256SUMS                                                              "<sha256>  <tarball name>"
 #
 # Steps:
 #   1. cargo build --release --offline --locked for fmv-server, fmv-client, fmv-import.
@@ -18,14 +19,15 @@
 #      name gets a -prebuilt suffix and manifest.json gets "build_mode": "prebuilt",
 #      because the commit, rustc and target fields then describe the packaging host and
 #      checkout, not necessarily how the binaries were made. Real releases use the default.
-#   2. Stage ONLY the allowlist (ALLOWLIST below): the three binaries, README.md, a
-#      generated LICENSE-NOTICE.txt and a generated manifest.json.
+#   2. Stage ONLY the allowlist (ALLOWLIST below): the three binaries, the launcher entry
+#      point ff-multiverse.sh (scripts/ff-multiverse.sh, which must pass `bash -n`),
+#      README.md, a generated LICENSE-NOTICE.txt and a generated manifest.json.
 #   3. Guard: fail if anything staged is not on the allowlist, is not a plain file, or
 #      looks like owned game data (*.lgp *.bin *.iso *.cue *.chd *.ff7 *.mcr
 #      PROVENANCE.json, matched case-insensitively). The SAME check runs three times:
 #      on a pre-existing staging directory (before it is touched), on the freshly staged
 #      directory, and on the listing of the finished archive.
-#   4. Create a deterministic .tar.gz, then write the sidecar manifest.
+#   4. Create a deterministic .tar.gz, then write the sidecar manifest and SHA256SUMS.
 #
 # Idempotent: re-running replaces this package's staging directory, archive and sidecar.
 # A staging directory is only ever removed after it has passed the guard, and then
@@ -43,6 +45,16 @@
 # be circular); the sidecar <name>.manifest.json is the same document plus a "tarball"
 # object with the archive's file name, size and sha256.
 #
+# Launcher hand-off (docs/LAUNCHER.md): the tarball name always matches
+# ^ff-multiverse-.*linux-(x86_64|x64).*\.tar\.gz$, dist/SHA256SUMS is the checksum asset
+# (one line, for the package built by THIS run: it always describes the latest package, so
+# publish a package together with the SHA256SUMS its own run wrote), and manifest.json carries
+# "revision" (git rev-list --count HEAD) and "build_id" (ff-multiverse-r<revision>-<gitshort>
+# plus -dirty/-prebuilt): the launcher offers an update only when the installed and the
+# available version labels both contain an r<N> tag and the available N is larger, so publish
+# with build_id as the version label. The revision only grows along one branch: publish
+# packages built from the integration branch, never from a side branch.
+#
 # Requires: bash >= 4, cargo, rustc, git, jq, tar (GNU), gzip, sha256sum, wc, date, sort.
 # This script never contacts any host and never reads or copies game data.
 
@@ -53,7 +65,7 @@ PLATFORM="linux-x86_64"
 # Cargo packages to release; each builds a binary of the same name.
 PACKAGES=(fmv-server fmv-client fmv-import)
 # The ONLY names allowed in a package (flat: no subdirectories, no symlinks).
-ALLOWLIST=(fmv-server fmv-client fmv-import README.md LICENSE-NOTICE.txt manifest.json)
+ALLOWLIST=(fmv-server fmv-client fmv-import ff-multiverse.sh README.md LICENSE-NOTICE.txt manifest.json)
 # Owned-data lookalikes, lower case. Matched against the lower-cased basename and
 # reported with a clearer message than "not in the allowlist". There are no exceptions:
 # no *.bin file may ever ship.
@@ -70,9 +82,12 @@ usage() {
 Usage: scripts/package.sh [--skip-build [--bin-dir DIR]] [-h|--help]
 
 Builds release binaries for fmv-server, fmv-client and fmv-import, stages an explicit
-allowlist into dist/ff-multiverse-<version>-<gitshort>-linux-x86_64/, verifies that no
-owned game data is present, and writes a .tar.gz plus manifests under dist/.
-Prints the tarball path and sha256 on success. See the header of this script for details.
+allowlist (the three binaries, the launcher entry point ff-multiverse.sh, README.md, a
+LICENSE-NOTICE.txt and a manifest.json) into
+dist/ff-multiverse-<version>-<gitshort>-linux-x86_64/, verifies that no owned game data is
+present, and writes a .tar.gz, a sidecar manifest and dist/SHA256SUMS under dist/.
+Prints the tarball path, sha256 and launcher build id on success. See the header of this
+script for details.
 
   --skip-build     do not compile; package binaries that already exist. The package is
                    marked -prebuilt (name) and "build_mode": "prebuilt" (manifest).
@@ -230,6 +245,25 @@ size_of() {
   printf '%s' "${out//[[:space:]]/}"
 }
 
+# check_launcher_script <file>: the launcher entry point must be a plain (non-symlink) bash
+# script that parses, or it must not ship.
+check_launcher_script() {
+  local file="$1" first
+  if [[ -L $file || ! -f $file ]]; then
+    err "the launcher entry point is not a plain file: $file"
+    return 1
+  fi
+  IFS= read -r first <"$file" || true
+  if [[ $first != '#!/usr/bin/env bash' ]]; then
+    err "the launcher entry point must start with '#!/usr/bin/env bash': $file"
+    return 1
+  fi
+  if ! "$BASH" -n "$file"; then
+    err "the launcher entry point does not parse (bash -n): $file"
+    return 1
+  fi
+}
+
 # prepare_stage <dir>: make <dir> an empty directory. An existing directory is deleted
 # only if it passes the guard; deletion is file-by-file then rmdir, never rm -rf.
 prepare_stage() {
@@ -367,10 +401,12 @@ main() {
   done
 
   # --- identity --------------------------------------------------------------
-  local git_commit git_short git_status dirty=false git_field git_desc epoch built_at name
+  local git_commit git_short git_status dirty=false git_field git_desc epoch built_at name revision build_id
   git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not inside a git work tree; refusing to package an untraceable build"
   git_commit=$(git rev-parse HEAD) || die "cannot resolve HEAD"
   git_short=$(git rev-parse --short=9 HEAD) || die "cannot resolve HEAD"
+  revision=$(git rev-list --count HEAD) || die "cannot count the commits of HEAD"
+  [[ $revision =~ ^[1-9][0-9]*$ ]] || die "unusable revision '$revision' (git rev-list --count HEAD)"
   git_status=$(git status --porcelain --untracked-files=normal) || die "git status failed"
   git_field="$git_commit"
   git_desc="$git_short"
@@ -392,10 +428,12 @@ main() {
   built_at=$(date -u -d "@$epoch" +%Y-%m-%dT%H:%M:%SZ) || die "cannot format timestamp for epoch $epoch"
 
   name="$PRODUCT-$version-$git_desc-$PLATFORM"
+  build_id="$PRODUCT-r$revision-$git_desc"
   local stage_dir="$dist_dir/$name"
   local tarball="$dist_dir/$name.tar.gz"
   local sidecar="$dist_dir/$name.manifest.json"
-  log "package: $name"
+  log "package: $name (launcher build id: $build_id)"
+  check_launcher_script "$repo_root/scripts/ff-multiverse.sh" || die "scripts/ff-multiverse.sh cannot be packaged"
 
   # --- stage -----------------------------------------------------------------
   mkdir -p -- "$dist_dir"
@@ -405,6 +443,8 @@ main() {
     cp -- "$bin_src_dir/$pkg" "$stage_dir/$pkg"
     chmod 0755 -- "$stage_dir/$pkg"
   done
+  cp -- "$repo_root/scripts/ff-multiverse.sh" "$stage_dir/ff-multiverse.sh"
+  chmod 0755 -- "$stage_dir/ff-multiverse.sh"
   cp -- "$repo_root/README.md" "$stage_dir/README.md"
   chmod 0644 -- "$stage_dir/README.md"
 
@@ -441,7 +481,7 @@ EOF
     binaries_json=$(jq -c --arg k "$file" --arg sha "$sha" --argjson bytes "$size" \
       '. + {($k): {sha256: $sha, bytes: $bytes}}' <<<"$binaries_json")
   done
-  for file in README.md LICENSE-NOTICE.txt; do
+  for file in ff-multiverse.sh README.md LICENSE-NOTICE.txt; do
     sha=$(sha256_of "$stage_dir/$file")
     size=$(size_of "$stage_dir/$file")
     files_json=$(jq -c --arg k "$file" --arg sha "$sha" --argjson bytes "$size" \
@@ -453,6 +493,8 @@ EOF
     --arg name "$name" \
     --arg product "$PRODUCT" \
     --arg version "$version" \
+    --argjson revision "$revision" \
+    --arg build_id "$build_id" \
     --arg git_commit "$git_field" \
     --argjson git_dirty "$dirty" \
     --arg rustc "$rustc_version" \
@@ -464,6 +506,7 @@ EOF
     --argjson binaries "$binaries_json" \
     --argjson files "$files_json" \
     '{name: $name, product: $product, version: $version,
+      revision: $revision, build_id: $build_id,
       git_commit: $git_commit, git_dirty: $git_dirty,
       rustc: $rustc, target: $target, profile: "release", built_at: $built_at,
       build_mode: $build_mode,
@@ -479,7 +522,8 @@ EOF
 
   # --- archive ----------------------------------------------------------------
   local tmp_tar="$dist_dir/.$name.tar.gz.tmp.$$" tmp_side="$dist_dir/.$name.manifest.json.tmp.$$"
-  TMP_FILES+=("$tmp_tar" "$tmp_side")
+  local sums="$dist_dir/SHA256SUMS" tmp_sums="$dist_dir/.SHA256SUMS.tmp.$$"
+  TMP_FILES+=("$tmp_tar" "$tmp_side" "$tmp_sums")
   local -a sorted=() members=()
   local member
   mapfile -t sorted < <(printf '%s\n' "${ALLOWLIST[@]}" | LC_ALL=C sort)
@@ -508,15 +552,23 @@ EOF
   jq --arg file "$name.tar.gz" --arg sha "$tar_sha" --argjson bytes "$tar_size" \
     '. + {tarball: {file: $file, bytes: $bytes, sha256: $sha}}' "$stage_dir/manifest.json" >"$tmp_side"
 
-  # Drop a stale sidecar first so a crash between the moves can never leave a
-  # mismatched archive/sidecar pair behind.
-  rm -f -- "$sidecar"
+  # The checksum asset a launcher verifies the archive with: "<sha256>  <asset file name>".
+  printf '%s  %s\n' "$tar_sha" "$name.tar.gz" >"$tmp_sums"
+
+  # Drop a stale sidecar and checksum file first so a crash between the moves can never
+  # leave a mismatched archive/sidecar/SHA256SUMS set behind.
+  rm -f -- "$sidecar" "$sums"
   mv -f -- "$tmp_tar" "$tarball"
   mv -f -- "$tmp_side" "$sidecar"
+  mv -f -- "$tmp_sums" "$sums"
+  (cd -- "$dist_dir" && sha256sum --check --status -- SHA256SUMS) ||
+    die "dist/SHA256SUMS does not match $name.tar.gz"
 
   printf 'tarball:  %s\n' "$tarball"
   printf 'sha256:   %s\n' "$tar_sha"
   printf 'manifest: %s\n' "$sidecar"
+  printf 'sums:     %s\n' "$sums"
+  printf 'build_id: %s\n' "$build_id"
 }
 
 # Keep this as the last statement: bash parses every function above before running
