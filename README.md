@@ -66,10 +66,9 @@ player walks through the gateway and unloaded a minute after the last player lef
 span fields, and the fields' NPCs (the characters a field's own data places: Sector 1's guards,
 for example) are announced with every snapshot. See "Walking between fields" below.
 
-Not done yet: choosing an FF7 character model for your avatar, drawing NPCs as models (they are
-markers with a name for now), field scripts (exits that scripts decide, such as the `MAPJUMP`s
-of story scenes, are not followed; only a field's own gateways are), music, and the window's
-scrolling camera (it shows the whole background). The increment-by-increment plan is in
+Not done yet: field scripts (exits that scripts decide, such as the `MAPJUMP`s of story scenes,
+are not followed; only a field's own gateways are), NPC animation and talking, music, and the
+window's scrolling camera (it shows the whole background). The increment-by-increment plan is in
 `IMPLEMENTATION-PLAN.md`.
 
 ## Workspace
@@ -314,8 +313,17 @@ several fields (each member is placed in its own field with the leader's phase),
 takes the party members that stand in the requester's field. A player in a battle cannot
 travel. The window rebuilds its view (camera, background, walkmesh) on arrival; the HUD names
 the field. **NPCs** are the characters whose placement is unconditional in the field's init
-script (not player-bound, not hidden at start): static markers with their name over them, with
-`npc_appearance` in the client as the one place the model renderer will hook in.
+script (not player-bound, not hidden at start). The window draws each as the field model its data
+names (the skeleton and the standing clip the field's model loader lists for it: the guards of
+`md1stin`, the AVALANCHE members and the doors of `md1_1`) with the same renderer as the players'
+models: standing still where the data puts it, facing the way it says, a shadow under it and its
+name over its head, from **your own** `char.lgp` (only the two names cross the wire, and they are
+only ever looked up as entries of that archive). A character whose model is not to be had here (no
+`char.lgp`, a FIXTURE area, a model that does not load, or an area naming more than 24 different
+models) is a marker with its name over it instead, never a stand-in character. `npc_appearance` in
+`crates/fmv-client/src/npc.rs` is the one place that decides which. The offscreen test
+`cargo test -p fmv-client -- --ignored offscreen_real_ff7_npcs_in_two_fields` (see
+`crates/fmv-client/src/avatar/shots.rs` for the variables) draws `md1stin` and `md1_1` this way.
 
 Headless bots: `--travel md1_1,md1stin` walks through the exits to those fields in order
 (`area_changes=` at the end of the SMOKE line counts the moves; `peers_seen` counts the peers of

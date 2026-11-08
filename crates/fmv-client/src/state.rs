@@ -340,6 +340,9 @@ pub struct ClientState {
     remotes: BTreeMap<EntityId, Remote>,
     /// The non-player characters of the current area (from its `AreaSnapshot`).
     npcs: Vec<NpcView>,
+    /// Counts the times the NPC list was replaced (a snapshot, a change of area): a renderer that
+    /// keeps something per set of NPCs knows by it when to rebuild.
+    npc_epoch: u64,
     /// Peers seen in the CURRENT area (cleared when the area changes).
     peers_seen: BTreeSet<EntityId>,
     updates: u64,
@@ -364,6 +367,7 @@ impl ClientState {
             battle: BattleClient::new(account),
             remotes: BTreeMap::new(),
             npcs: Vec::new(),
+            npc_epoch: 0,
             peers_seen: BTreeSet::new(),
             updates: 0,
             rejected: 0,
@@ -389,6 +393,10 @@ impl ClientState {
     pub fn npc_views(&self) -> &[NpcView] {
         &self.npcs
     }
+    /// Changes whenever the list [`ClientState::npc_views`] answers was replaced.
+    pub fn npc_epoch(&self) -> u64 {
+        self.npc_epoch
+    }
 
     /// The server moved us to `area` and we hold it (the session checked it against local content
     /// and answered `JoinArea`): everything that belongs to the old area goes (the other players,
@@ -400,6 +408,7 @@ impl ClientState {
         self.area = area;
         self.remotes.clear();
         self.npcs.clear();
+        self.npc_epoch += 1;
         self.peers_seen.clear();
         self.own = OwnPlayer::at(arrival, facing);
         if forward {
@@ -452,6 +461,7 @@ impl ClientState {
                     self.upsert(now, e);
                 }
                 self.npcs = npcs.into_iter().take(MAX_NPCS_PER_AREA).filter_map(NpcView::from_snapshot).collect();
+                self.npc_epoch += 1;
             }
             // Handled before it gets here: the session answers it (JoinArea / CannotJoin) and then
             // calls `change_area`. Nothing for the state to do with the offer itself.
@@ -1220,6 +1230,28 @@ mod tests {
         s.apply(1.0, snapshot_of(plaza(), vec![], vec![npc_snapshot(0, "only")]));
         assert_eq!(s.npc_views().len(), 1);
         s.apply(2.0, snapshot_of(plaza(), vec![], vec![]));
+        assert!(s.npc_views().is_empty());
+    }
+
+    /// A renderer that keeps something per set of NPCs rebuilds when the epoch moves: on every
+    /// snapshot and every change of area, and not on the traffic in between.
+    #[test]
+    fn the_npc_epoch_moves_when_the_list_is_replaced_and_only_then() {
+        let mut s = state(Pos::default());
+        let start = s.npc_epoch();
+        s.apply(0.0, snapshot_of(plaza(), vec![snap(1, 0.0, 0.0)], vec![npc_snapshot(0, "gu0")]));
+        let first = s.npc_epoch();
+        assert_ne!(first, start);
+        // Updates, joins and leaves do not touch the NPCs.
+        s.apply(0.1, update(vec![snap(1, 1.0, 1.0)]));
+        s.apply(0.2, ServerMsg::PlayerLeft { entity: EntityId(9) });
+        assert_eq!(s.npc_epoch(), first);
+        // Another snapshot (even of the same list) is a new list; so is leaving the area.
+        s.apply(1.0, snapshot_of(plaza(), vec![], vec![npc_snapshot(0, "gu0")]));
+        let second = s.npc_epoch();
+        assert_ne!(second, first);
+        s.change_area(plaza(), Pos::default(), 0.0, true);
+        assert_ne!(s.npc_epoch(), second);
         assert!(s.npc_views().is_empty());
     }
 
