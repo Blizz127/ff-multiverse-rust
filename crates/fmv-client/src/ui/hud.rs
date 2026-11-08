@@ -285,9 +285,9 @@ pub fn draw_hud_with(input: &HudInput, progress: Option<&ProgressLine>, w: u32, 
     // Bottom right: the keys, when there is room beside the status. Shift (walk) and F1 (the
     // walkmesh) only mean something over a real field's picture, not in a fixture.
     let hint = if input.fixture {
-        "WASD move   P invite   Y accept   L leave   Esc quit"
+        "WASD move   P invite   Y accept   L leave   Esc x2 quit"
     } else {
-        "WASD move   Shift walk   F1 mesh   P invite   Y accept   L leave   Esc quit"
+        "WASD move   Shift walk   F1 mesh   P invite   Y accept   L leave   Esc x2 quit"
     };
     let hint_w = text_width(hint, s as u32) + 2 * pad(s);
     if status.2 + hint_w + 2 * m < wi {
@@ -460,7 +460,7 @@ mod tests {
         let list = draw(&i, 1100, 680);
         assert!(list.texts().iter().any(|t| t.text == "ONLINE" && t.color == GOOD));
         assert!(list.says("players 3") && list.says("rtt 12 ms"));
-        assert!(list.says("WASD move") && list.says("Esc quit"), "the keys are listed");
+        assert!(list.says("WASD move") && list.says("Esc x2 quit"), "the keys are listed");
         // On a narrow window the key list gives way instead of overlapping the status.
         let narrow = draw(&i, 320, 240);
         assert!(!narrow.says("WASD") && narrow.says("ONLINE"));

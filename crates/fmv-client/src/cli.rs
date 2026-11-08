@@ -100,7 +100,8 @@ CHARACTER MENU:
   closed, rate limited) the reason is shown on screen and you can try again.
 
 WINDOW CONTROLS:
-  WASD / arrow keys move, Esc quits. P invites the nearest other player to your party, Y accepts
+  WASD / arrow keys move, Esc twice quits (never during a battle: close the window to quit
+  there). P invites the nearest other player to your party, Y accepts
   the newest pending invite, L leaves your party. The window shows player names over their
   markers, your party in the top right corner, the area name and the connection status; a FIXTURE
   area is labelled \"FIXTURE (synthetic, not FF7)\". The window title shows your party size and a

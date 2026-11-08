@@ -37,6 +37,48 @@ const MAX_DT: f32 = 0.1;
 const TITLE_REFRESH: Duration = Duration::from_secs(1);
 /// How long quitting waits for `Leave` to be flushed.
 const LEAVE_WAIT: Duration = Duration::from_secs(1);
+/// After a first Esc in the field, a second one within this time quits.
+const QUIT_CONFIRM: Duration = Duration::from_secs(3);
+/// How long a notice (the quit confirmation, the battle's Esc hint) stays on screen.
+const NOTICE_TIME: Duration = Duration::from_secs(3);
+
+/// What a press of Escape does. Escape used to quit at once, which closed the window of a player
+/// looking for a way out of the battle screen: in a battle it now does nothing (and says so), and
+/// in the field quitting takes a second press.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EscapeAction {
+    /// In a battle: do not quit; a notice says how to quit instead.
+    IgnoreInBattle,
+    /// A first press in the field: show "press Esc again to quit" and wait for a second one.
+    Arm,
+    /// A second press within [`QUIT_CONFIRM`] of the first: quit.
+    Quit,
+}
+
+/// The action of an Escape press, `in_battle` or not, with quitting `armed` by an earlier press.
+pub fn escape_action(in_battle: bool, armed: bool) -> EscapeAction {
+    if in_battle {
+        EscapeAction::IgnoreInBattle
+    } else if armed {
+        EscapeAction::Quit
+    } else {
+        EscapeAction::Arm
+    }
+}
+
+/// Whether a first Escape press, which armed quitting until `armed_until`, still counts at `now`.
+pub fn quit_armed(armed_until: Option<Instant>, now: Instant) -> bool {
+    armed_until.is_some_and(|until| now < until)
+}
+
+/// Draw `text` centred in the lower part of a `vw` x `vh` window, over everything else.
+fn draw_notice(text: &str, vw: u32, vh: u32, out: &mut DrawList) {
+    let scale = if vw >= 1000 { 2 } else { 1 };
+    let width = crate::ui::text::text_width(text, scale);
+    let x = ((vw as i32 - width) / 2).max(2);
+    let y = (vh as i32 * 3 / 4).max(2);
+    out.draw_text_shadowed(x, y, scale, crate::ui::widgets::WARN, crate::ui::widgets::SHADOW, text);
+}
 
 pub fn create_event_loop() -> Result<EventLoop<()>, String> {
     // winit panics instead of returning an error when a system library it needs is missing
@@ -292,6 +334,10 @@ pub(crate) struct App {
     show_walkmesh: bool,
     /// Session time of the previous frame (for animation).
     last_draw_t: f64,
+    /// Until when a first Escape press in the field keeps quitting armed (see [`escape_action`]).
+    quit_armed_until: Option<Instant>,
+    /// A short notice drawn over the frame, and when it goes away.
+    notice: Option<(&'static str, Instant)>,
 }
 
 impl App {
@@ -322,7 +368,31 @@ impl App {
             npc_epoch: 0,
             show_walkmesh: false,
             last_draw_t: 0.0,
+            quit_armed_until: None,
+            notice: None,
         }
+    }
+
+    /// Escape was pressed: quit only on a second press in the field, never in a battle.
+    fn escape(&mut self, el: &ActiveEventLoop) {
+        let now = Instant::now();
+        let in_battle = self.session.state.battle.in_battle();
+        match escape_action(in_battle, quit_armed(self.quit_armed_until, now)) {
+            EscapeAction::IgnoreInBattle => {
+                eprintln!("battle: Esc does not quit during a battle (close the window to quit)");
+                self.notice = Some(("Esc does not quit in a battle: close the window to quit", now + NOTICE_TIME));
+            }
+            EscapeAction::Arm => {
+                self.quit_armed_until = Some(now + QUIT_CONFIRM);
+                self.notice = Some(("Press Esc again to quit", now + QUIT_CONFIRM));
+            }
+            EscapeAction::Quit => self.quit(el),
+        }
+    }
+
+    /// The notice to draw now, if one is up.
+    fn current_notice(&self) -> Option<&'static str> {
+        self.notice.filter(|(_, until)| Instant::now() < *until).map(|(text, _)| text)
     }
 
     /// Where the views of later areas come from: when the server moves the player to another
@@ -494,6 +564,7 @@ impl App {
     }
 
     fn redraw(&mut self, el: &ActiveEventLoop) {
+        let notice = self.current_notice();
         let Some(renderer) = self.renderer.as_mut() else { return };
         let now = self.session.now();
         let render_t = render_time(now);
@@ -505,6 +576,9 @@ impl App {
             let (vw, vh) = renderer.size();
             let mut overlay = DrawList::new();
             draw_battle_text(&battle, vw, vh, &mut overlay);
+            if let Some(text) = notice {
+                draw_notice(text, vw, vh, &mut overlay);
+            }
             let result = renderer.render_flat(|w, h, srgb| battle_vertices(&battle, w, h, srgb), Some(&overlay));
             let gpu_error = renderer.first_gpu_error();
             match (result, gpu_error) {
@@ -536,6 +610,9 @@ impl App {
         let anchor = |subject: Subject, at: Pos| label_anchor(built.as_ref(), view, draw.own_who, subject, at);
         let hud_input = hud::gather_anchored(state, &self.session.info, view, render_t, &anchor);
         hud::draw_hud_with(&hud_input, hud::progress_line(state, render_t).as_ref(), vw, vh, &mut overlay);
+        if let Some(text) = notice {
+            draw_notice(text, vw, vh, &mut overlay);
+        }
         let result = renderer.render_layers(&scene, built.as_ref().map(|b| &b.frame), Some(&overlay));
         let gpu_error = renderer.first_gpu_error();
         match (result, gpu_error) {
@@ -680,8 +757,8 @@ impl ApplicationHandler for App {
             } => {
                 let pressed = state == ElementState::Pressed;
                 if code == KeyCode::Escape {
-                    if pressed {
-                        self.quit(el);
+                    if pressed && !repeat {
+                        self.escape(el);
                     }
                 } else if code == KeyCode::F1 {
                     if pressed && !repeat {
@@ -868,6 +945,26 @@ mod tests {
         // And a party key is not a movement key.
         let mut input = Input::default();
         assert!(!input.set(KeyCode::KeyP, true) && !input.set(KeyCode::KeyY, true) && !input.set(KeyCode::KeyL, true));
+    }
+
+    /// Escape never quits in a battle (a player looking for a way out of the battle screen closed
+    /// the whole window that way), and in the field it takes a second press.
+    #[test]
+    fn escape_never_quits_in_a_battle_and_needs_a_second_press_in_the_field() {
+        assert_eq!(escape_action(true, false), EscapeAction::IgnoreInBattle);
+        assert_eq!(escape_action(true, true), EscapeAction::IgnoreInBattle, "even when armed before the battle began");
+        assert_eq!(escape_action(false, false), EscapeAction::Arm);
+        assert_eq!(escape_action(false, true), EscapeAction::Quit);
+    }
+
+    #[test]
+    fn a_first_escape_only_counts_for_a_while() {
+        let t = Instant::now();
+        let until = Some(t + QUIT_CONFIRM);
+        assert!(quit_armed(until, t));
+        assert!(quit_armed(until, t + QUIT_CONFIRM - Duration::from_millis(1)));
+        assert!(!quit_armed(until, t + QUIT_CONFIRM), "the second press came too late");
+        assert!(!quit_armed(None, t), "nothing armed");
     }
 
     #[test]
