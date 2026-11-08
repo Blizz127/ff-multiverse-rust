@@ -20,16 +20,23 @@ use std::time::Duration;
 use common::*;
 use fmv_ff7_battle::rules::{BattleState, Command, Outcome};
 use fmv_protocol::{
-    ActorId, BattleRejection, BattleReplay, BattleReward, BattleSetup, ClientMsg, InventoryEntry, PartyEvent, ServerMsg, SyntheticRules,
+    ActorId, BattleRejection, BattleReplay, BattleReward, BattleRules, BattleSetup, ClientMsg, InventoryEntry, PartyEvent, ServerMsg,
+    SyntheticRules,
 };
+use fmv_server::ff7::{open_battle_data, Ff7Source};
 use fmv_server::{BattleSettings, ServerConfig};
 use tempfile::TempDir;
 
 /// Fast battles (speed 0, 1000 engine ticks a second) on a server that starts them on request, with
 /// `rules`, keeping its accounts in `state_dir` (or in a private temporary one).
 fn fast(rules: SyntheticRules, state_dir: Option<PathBuf>) -> ServerConfig {
+    fast_with(Arc::new(rules), state_dir)
+}
+
+/// [`fast`] with any rules (the real-data test passes the owner's own).
+fn fast_with(rules: Arc<dyn BattleRules>, state_dir: Option<PathBuf>) -> ServerConfig {
     ServerConfig {
-        battle: Some(BattleSettings { battle_speed: 0, ticks_per_second: 1000, ..BattleSettings::new(Arc::new(rules)) }),
+        battle: Some(BattleSettings { battle_speed: 0, ticks_per_second: 1000, ..BattleSettings::new(rules) }),
         debug_encounters: true,
         state_dir,
         ..ServerConfig::default()
@@ -73,7 +80,7 @@ struct Fought {
 /// whenever our gauge is full (one at a time; `turn` counts our commands), and check the end.
 async fn fight_with(
     j: &mut Joined,
-    rules: &SyntheticRules,
+    rules: &dyn BattleRules,
     mut choose: impl FnMut(&BattleState, ActorId, u32) -> Command,
 ) -> Fought {
     let start = j.client.until("EncounterStart", |m| matches!(m, ServerMsg::EncounterStart { .. }).then(|| m.clone())).await;
@@ -400,5 +407,69 @@ async fn an_account_of_the_previous_version_gets_the_starting_stock_once() {
     let server = TestServer::start(fast(rules, Some(state))).await;
     let mut a = join_with_token(server.addr, &token).await;
     assert_eq!(joined_with(&mut a).await, vec![(0, 2), (3, 1), (7, 1)], "the stock is given once, not again");
+    server.shutdown().await;
+}
+
+/// The new commands against the owner's REAL FF7 data over a real socket: the kernel's own spells, items
+/// and starting stock, Defend, and the scene's enemies with their own attacks, played by a client that
+/// replays the battle from the same files (so a divergence between the server's engine and the client's
+/// is a failure here). `#[ignore]`d: it needs `FMV_FF7_LIBRARY`, a state directory that holds the owner's
+/// imported library, which is only read (the server keeps its accounts in a private temporary directory):
+///
+/// ```text
+/// FMV_FF7_LIBRARY=<state dir with library/> \
+///   cargo test --offline -p fmv-server --test inventory -- --ignored --nocapture
+/// ```
+///
+/// One fighter (the FIXTURE plaza gives the account Cloud) takes the debug formation 301 and gives, in
+/// turn: Defend, the first stack of its stock (the Potion) on itself, a healing spell on itself, a
+/// damaging spell at the first living enemy, then attacks. Passes when the replay never diverges, every
+/// command is applied, and the account has lost exactly the one item it used. Only ids and counts are
+/// compared; nothing of the data is printed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs the owner's library: set FMV_FF7_LIBRARY"]
+async fn real_data_spells_guards_and_items_replay_without_a_divergence_and_only_the_item_is_spent() {
+    let Some(dir) = std::env::var_os("FMV_FF7_LIBRARY").map(PathBuf::from) else {
+        eprintln!("skipped: FMV_FF7_LIBRARY is not set");
+        return;
+    };
+    let data = open_battle_data(&Ff7Source::Library { state_dir: Some(dir), set: None }).expect("the library has scene.bin and kernel.bin").0;
+    let rules: Arc<dyn BattleRules> = data;
+    let stock: Items = rules.starting_inventory().iter().map(|e| (e.item, e.count)).collect();
+    let potion = stock.first().map(|&(item, _)| item).expect("the kernel's starting stock is not empty");
+
+    let server = TestServer::start(fast_with(Arc::clone(&rules), None)).await;
+    let mut a = join(server.addr, &uniq("Rl")).await;
+    assert_eq!(joined_with(&mut a).await, stock, "a new account starts with the kernel's own stock");
+    request(&mut a, 301).await;
+    let fought = fight_with(&mut a, rules.as_ref(), |state, me, turn| {
+        let foe = first_enemy(state);
+        let spells = state.spells_for(me);
+        let heal = spells.iter().find(|s| s.targets_allies && state.check_command(me, &Command::Magic { spell: s.spell, target: me }).is_ok());
+        let harm = spells.iter().find(|s| !s.targets_allies);
+        assert!(state.item_info(potion).is_some(), "the engine knows the item the stock starts with");
+        match (turn, heal, harm) {
+            (0, ..) => Command::Defend,
+            (1, ..) => Command::Item { item: potion, target: me },
+            (2, Some(s), _) => Command::Magic { spell: s.spell, target: me },
+            (3, _, Some(s)) => Command::Magic { spell: s.spell, target: foe },
+            _ => Command::Attack { target: foe },
+        }
+    })
+    .await;
+
+    assert!(fought.refused.is_empty(), "every command was one the real engine accepts: {:?}", fought.refused);
+    assert!(fought.applied.len() >= 4, "the four commands before the first attack were all applied: {:?}", fought.applied);
+    assert_eq!(fought.applied[0], Command::Defend);
+    assert!(matches!(fought.applied[1], Command::Item { item, target } if item == potion && target == ActorId(0)), "{:?}", fought.applied[1]);
+    assert!(matches!(fought.applied[2], Command::Magic { target, .. } if target == ActorId(0)), "a healing spell on ourselves: {:?}", fought.applied[2]);
+    assert!(matches!(fought.applied[3], Command::Magic { target, .. } if target != ActorId(0)), "a damaging spell at an enemy: {:?}", fought.applied[3]);
+    let mut left = stock.clone();
+    left[0].1 -= 1;
+    if left[0].1 == 0 {
+        left.remove(0);
+    }
+    assert_eq!(fought.inventories, vec![left], "one item used, one inventory told, nothing else spent");
+    eprintln!("real data: outcome {:?}, {} command(s) applied, {} reward(s)", fought.outcome, fought.applied.len(), fought.rewards.len());
     server.shutdown().await;
 }
