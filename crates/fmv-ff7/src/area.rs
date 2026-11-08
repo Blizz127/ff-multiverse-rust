@@ -133,6 +133,20 @@
 //! between the default `MOVE` speed and the run speed and cross `md1stin`'s 2 161-unit platform
 //! in about 9 seconds. Use a measurement of the real game, not this paragraph, to replace the
 //! placeholder.
+//!
+//! A rough consistency check, not evidence: Cloud's walk and run animations move the planted foot
+//! back 9.06 and 14.86 model units per step (see [`crate::model::DEFAULT_MODEL_SCALE_UNITS`]), which
+//! at the model scale chosen against the `md1stin` art (4 walkmesh units per model unit) is about
+//! 2.0-2.4 and 8-10 units per frame, the hypothesised 2 and 8: the three guesses agree with each
+//! other, and with a game in which the animation was authored not to slide on the ground.
+//!
+//! That hypothesis is exposed as [`Ff7FieldArea::walk_speed`] (base
+//! [`FF7_FIELD_WALK_SPEED_BASE`], 60 units per second) and [`Ff7FieldArea::run_speed`] (base
+//! [`FF7_FIELD_RUN_SPEED_BASE`], 240), each multiplied by the field scale over 512 exactly like
+//! `max_speed`. They are for pacing animation and client-side prediction **only**; both bases
+//! are UNVERIFIED HYPOTHESES. [`Ff7FieldArea::max_speed`] is unchanged and stays the server's
+//! cap: it is 2.5 times the hypothetical run speed, so a wrong hypothesis (up to 2.5 times too
+//! slow) cannot make the server reject real movement.
 
 use crate::field::{Background, Camera, FieldError, FieldFile, Palette, Triggers, Vertex, Walkmesh, FIELD_SCALE_ONE};
 use crate::lgp::{LgpArchive, LgpError};
@@ -166,6 +180,25 @@ pub const FF7_FIELD_FRAMES_PER_SECOND: f32 = 30.0;
 /// Running speed divided by walking speed: the engine's "Run Value" is `Field Scale * 4` with the
 /// run button held and `Field Scale * 1` without (same source as [`FF7_FIELD_FRAMES_PER_SECOND`]).
 pub const FF7_RUN_WALK_SPEED_RATIO: f32 = 4.0;
+
+/// UNVERIFIED HYPOTHESIS: walking speed in walkmesh units **per frame** for a field of scale 512
+/// (`scale * 1 / 256`, see the module docs, "Speed"). The ratio to
+/// [`FF7_FIELD_RUN_UNITS_PER_FRAME`] is the documented [`FF7_RUN_WALK_SPEED_RATIO`]; the absolute
+/// value is not documented anywhere this crate could reach.
+pub const FF7_FIELD_WALK_UNITS_PER_FRAME: f32 = 2.0;
+
+/// UNVERIFIED HYPOTHESIS: running speed in walkmesh units per frame for a field of scale 512
+/// (`scale * 4 / 256`).
+pub const FF7_FIELD_RUN_UNITS_PER_FRAME: f32 = 8.0;
+
+/// UNVERIFIED HYPOTHESIS: walking speed in walkmesh units per second for a field of scale 512 (2
+/// units per frame at [`FF7_FIELD_FRAMES_PER_SECOND`]). [`Ff7FieldArea::walk_speed`] multiplies it
+/// by the field's own scale over 512.
+pub const FF7_FIELD_WALK_SPEED_BASE: f32 = FF7_FIELD_WALK_UNITS_PER_FRAME * FF7_FIELD_FRAMES_PER_SECOND;
+
+/// UNVERIFIED HYPOTHESIS: running speed in walkmesh units per second for a field of scale 512 (8
+/// units per frame). [`Ff7FieldArea::run_speed`] multiplies it by the field's own scale over 512.
+pub const FF7_FIELD_RUN_SPEED_BASE: f32 = FF7_FIELD_RUN_UNITS_PER_FRAME * FF7_FIELD_FRAMES_PER_SECOND;
 
 /// Version of the fingerprint rule (see the module docs). Bumped whenever the rule changes.
 pub const FINGERPRINT_RULE_VERSION: u32 = 1;
@@ -580,6 +613,26 @@ impl Ff7FieldArea {
     /// with it. Falls back to 512 when the header is unreadable or zero.
     pub fn field_scale(&self) -> u16 {
         self.field_scale
+    }
+
+    /// The field scale as a multiplier (1.0 for 512): what every speed is multiplied by.
+    fn scale_factor(&self) -> f32 {
+        f32::from(self.field_scale) / f32::from(FIELD_SCALE_ONE)
+    }
+
+    /// Walking speed in walkmesh units per second: [`FF7_FIELD_WALK_SPEED_BASE`] times the field
+    /// scale over 512. **UNVERIFIED HYPOTHESIS** (2 units per frame at 30 frames per second for a
+    /// scale-512 field, see the module docs, "Speed"): meant for pacing animation and client-side
+    /// prediction, never for validation (that is [`AreaRuntime::max_speed`]).
+    pub fn walk_speed(&self) -> f32 {
+        FF7_FIELD_WALK_SPEED_BASE * self.scale_factor()
+    }
+
+    /// Running speed in walkmesh units per second: [`FF7_FIELD_RUN_SPEED_BASE`] times the field
+    /// scale over 512 ([`FF7_RUN_WALK_SPEED_RATIO`] times [`Ff7FieldArea::walk_speed`]).
+    /// **UNVERIFIED HYPOTHESIS** (8 units per frame for a scale-512 field).
+    pub fn run_speed(&self) -> f32 {
+        FF7_FIELD_RUN_SPEED_BASE * self.scale_factor()
     }
 
     /// The decoded field file (all sections, raw).
@@ -1362,6 +1415,37 @@ mod tests {
         // the documented constants
         assert_eq!(FF7_FIELD_FRAMES_PER_SECOND, 30.0);
         assert_eq!(FF7_RUN_WALK_SPEED_RATIO, 4.0);
+    }
+
+    #[test]
+    fn walk_and_run_speeds_follow_the_documented_hypothesis_and_never_exceed_the_server_cap() {
+        let load = |scale: u16| {
+            let bytes = FieldSpec { model_scale: scale, ..FieldSpec::default() }.build();
+            let lgp = build_lgp(&[("speedfld", &lzss::compress(&bytes))]);
+            Ff7Adapter::from_flevel_reader(Cursor::new(lgp), provenance()).unwrap().load_field("speedfld").unwrap()
+        };
+        // the base constants are the stated hypothesis: 2 and 8 units per frame at 30 fps
+        assert_eq!(FF7_FIELD_WALK_UNITS_PER_FRAME, 2.0);
+        assert_eq!(FF7_FIELD_RUN_UNITS_PER_FRAME, 8.0);
+        assert_eq!(FF7_FIELD_WALK_SPEED_BASE, 60.0);
+        assert_eq!(FF7_FIELD_RUN_SPEED_BASE, 240.0);
+        assert_eq!(FF7_FIELD_RUN_SPEED_BASE, FF7_FIELD_WALK_SPEED_BASE * FF7_RUN_WALK_SPEED_RATIO);
+        let base = load(512);
+        assert_eq!((base.walk_speed(), base.run_speed()), (60.0, 240.0));
+        // the scaling is the one `max_speed` uses, and the cap stays well above running
+        for scale in [256u16, 400, 512, 768, 1024, 5120, u16::MAX, 0] {
+            let area = load(scale);
+            let factor = f32::from(area.field_scale()) / 512.0;
+            assert!((area.walk_speed() - 60.0 * factor).abs() < 1e-2, "scale {scale}");
+            assert!((area.run_speed() - 240.0 * factor).abs() < 1e-2, "scale {scale}");
+            assert!((area.run_speed() / area.walk_speed() - FF7_RUN_WALK_SPEED_RATIO).abs() < 1e-4);
+            assert!(area.walk_speed() < area.run_speed() && area.run_speed() < area.max_speed(), "scale {scale}");
+            assert_eq!(area.max_speed(), FF7_FIELD_MAX_SPEED_PLACEHOLDER * factor, "max_speed is unchanged");
+        }
+        // a 1024 field (such as md1_1) is twice as fast as a 512 one; a zero scale counts as 512
+        assert_eq!(load(1024).walk_speed(), 2.0 * base.walk_speed());
+        assert_eq!(load(1024).run_speed(), 2.0 * base.run_speed());
+        assert_eq!((load(0).walk_speed(), load(0).run_speed()), (60.0, 240.0));
     }
 
     #[test]

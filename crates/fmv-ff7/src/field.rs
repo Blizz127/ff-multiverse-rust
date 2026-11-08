@@ -118,9 +118,10 @@
 //! | triggers | [`Triggers`] | name, camera range, 12 gateways, 12 triggers (arrows not parsed) |
 //! | background | [`Background`] | header tags, layers 1-4 tile records ([`TileSprite`]), texture page locations |
 //!
-//! Script, model loader, tilemap and encounter sections are exposed as raw payload bytes via
-//! [`FieldFile::section`]; only the model-loader header (model count and field scale) is decoded,
-//! as [`ModelLoaderHeader`].
+//! Script, tilemap and encounter sections are exposed as raw payload bytes via
+//! [`FieldFile::section`]. The model-loader section is decoded as [`ModelLoader`] (the characters
+//! a field uses, their skeletons and animations; its two-field header alone is
+//! [`ModelLoaderHeader`]).
 //!
 //! # Known gaps and unverified points
 //!
@@ -130,7 +131,7 @@
 //! * Trigger corners and gateway exit points are `(x, y, z)` in walkmesh order (verified, see
 //!   above); a gateway's `destination` is `(x, y, triangle id)` in the **target** field's
 //!   coordinates. Arrow data after the 12 triggers, `bg_animation_sizes` and the section 3/6/7
-//!   internals are not decoded. The script, model-loader, tilemap and encounter sections are
+//!   internals are not decoded. The script, tilemap and encounter sections are
 //!   raw bytes.
 //! * Background `blending` / `type_trans` / `param` / `state` / `id` are exposed as stored. How
 //!   they are *used* is in [`crate::background`]: blend modes and draw order were checked by eye
@@ -442,6 +443,11 @@ impl FieldFile {
         ModelLoaderHeader::parse(self.section(section::MODEL_LOADER)?)
     }
 
+    /// The model-loader section's records: the characters the field uses (parsed on demand).
+    pub fn model_loader(&self) -> Result<ModelLoader, FieldError> {
+        ModelLoader::parse(self.section(section::MODEL_LOADER)?)
+    }
+
     /// The field's scale ([`ModelLoaderHeader::scale`]): 512 for most fields.
     pub fn field_scale(&self) -> Result<u16, FieldError> {
         self.model_loader_header().map(|h| h.scale)
@@ -482,6 +488,126 @@ impl ModelLoaderHeader {
         } else {
             f32::from(self.scale) / f32::from(FIELD_SCALE_ONE)
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Model loader records (section 2): which characters a field uses
+// ---------------------------------------------------------------------------------------
+
+/// Most model records accepted in one loader section (real fields have at most a few dozen).
+pub const MAX_LOADER_MODELS: usize = 1024;
+/// Most animation names accepted on one model record.
+pub const MAX_LOADER_ANIMATIONS: usize = 1024;
+
+/// One of the three light entries of a model record: a colour and a direction (3 x `i16`, a
+/// vector of length about 4096 in the defaults Makou Reactor writes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoaderLight {
+    pub color: [u8; 3],
+    pub direction: [i16; 3],
+}
+
+/// One animation of a model record: the `char.lgp` entry name without its `.a` extension plus the
+/// author tag that follows it in the file (`ACFE.aki`, `BVJF.yos`: the three-letter tag is not an
+/// archive extension), and an unidentified `u16`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoaderAnimation {
+    /// As stored, for example `ACFE.aki`.
+    pub name: String,
+    pub unknown: u16,
+}
+
+impl LoaderAnimation {
+    /// The lower-case archive stem (`acfe`): load `<stem>.a` from `char.lgp`.
+    pub fn stem(&self) -> String {
+        crate::util::entry_stem(&self.name)
+    }
+}
+
+/// One model record of the loader section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoaderModel {
+    /// The entity's model name, `<field prefix><character>.char` (for example
+    /// `md1stinmain_n_cloud.char`).
+    pub name: String,
+    pub unknown: u16,
+    /// The skeleton entry as stored, for example `AAAA.HRC`.
+    pub hrc: String,
+    /// The per-model scale, stored as ASCII digits (`512` in every `md1stin` record); `None` if
+    /// the text is not a number.
+    pub scale: Option<u16>,
+    pub lights: [LoaderLight; 3],
+    pub global_color: [u8; 3],
+    pub animations: Vec<LoaderAnimation>,
+}
+
+impl LoaderModel {
+    /// The lower-case archive stem of the skeleton (`aaaa`): load `<stem>.hrc` from `char.lgp`.
+    pub fn hrc_stem(&self) -> String {
+        crate::util::entry_stem(&self.hrc)
+    }
+}
+
+/// The model-loader section (section 2) of a field: the characters it uses and their animations.
+///
+/// **Verified on owned FF7 Steam Edition (en) on 2026-11-08**: the layout below consumes every
+/// byte of the section in all 702 fields (5 454 model records in total), and `md1stin` lists ten
+/// records, the first being Cloud (`md1stinmain_n_cloud.char`, `AAAA.HRC`, animations `ACFE.aki`,
+/// `AAFF.aki`, `AAGA.aki`, `BVJF.yos`).
+///
+/// Layout (Makou Reactor `src/core/field/FieldModelLoaderPC.cpp`
+/// <https://github.com/myst6re/makoureactor>; the FFRTT wiki only locates the section):
+///
+/// ```text
+/// u16 0 | u16 model count | u16 field scale
+/// per model:  u16 L | name[L]  (NUL-terminated)  | u16 unknown | char hrc[8] | char scale[4]
+///             u16 animation count | 3 x { u8 r, g, b, i16 x, y, z }  (lights) | u8 r, g, b (global)
+///             per animation: u16 A | name[A] | u16 unknown
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelLoader {
+    /// The third header `u16`, also returned by [`ModelLoaderHeader::scale`].
+    pub field_scale: u16,
+    pub models: Vec<LoaderModel>,
+    /// Bytes left in the section after the last record (0 in every owned field).
+    pub trailing_bytes: usize,
+}
+
+impl ModelLoader {
+    pub fn parse(section: &[u8]) -> Result<Self, FieldError> {
+        let mut r = Reader::new(section, "model loader");
+        r.skip(2)?;
+        let count = usize::from(r.u16()?);
+        let field_scale = r.u16()?;
+        if count > MAX_LOADER_MODELS {
+            return Err(FieldError::TooMany { what: "loader models", count: count as u64, limit: MAX_LOADER_MODELS as u64 });
+        }
+        let mut models = Vec::with_capacity(count);
+        for _ in 0..count {
+            let name_len = usize::from(r.u16()?);
+            let name = nul_padded_name(r.take(name_len)?);
+            let unknown = r.u16()?;
+            let hrc = nul_padded_name(r.take(8)?);
+            let scale = nul_padded_name(r.take(4)?).trim().parse::<u16>().ok();
+            let animation_count = usize::from(r.u16()?);
+            if animation_count > MAX_LOADER_ANIMATIONS {
+                return Err(FieldError::TooMany { what: "loader animations", count: animation_count as u64, limit: MAX_LOADER_ANIMATIONS as u64 });
+            }
+            let mut lights = [LoaderLight { color: [0; 3], direction: [0; 3] }; 3];
+            for light in &mut lights {
+                *light = LoaderLight { color: r.array::<3>()?, direction: r.i16x3()? };
+            }
+            let global_color = r.array::<3>()?;
+            let mut animations = Vec::with_capacity(animation_count);
+            for _ in 0..animation_count {
+                let len = usize::from(r.u16()?);
+                let name = nul_padded_name(r.take(len)?);
+                animations.push(LoaderAnimation { name, unknown: r.u16()? });
+            }
+            models.push(LoaderModel { name, unknown, hrc, scale, lights, global_color, animations });
+        }
+        Ok(Self { field_scale, models, trailing_bytes: r.remaining() })
     }
 }
 
@@ -1265,7 +1391,7 @@ impl<'a> Background<'a> {
                 let rgba = match page.depth {
                     0 => {
                         let byte = *page.pixels.get(pixel / 2)?;
-                        let index = if pixel % 2 == 0 { byte & 0x0F } else { byte >> 4 };
+                        let index = if pixel & 1 == 0 { byte & 0x0F } else { byte >> 4 };
                         palette.rgba(palette_page, usize::from(index))?
                     }
                     1 => palette.rgba(palette_page, usize::from(*page.pixels.get(pixel)?))?,
@@ -1502,6 +1628,78 @@ mod tests {
         // a zero scale (damaged header) counts as 1.0
         assert_eq!(ModelLoaderHeader { model_count: 0, scale: 0 }.scale_factor(), 1.0);
         assert_eq!(FIELD_SCALE_ONE, 512);
+    }
+
+    #[test]
+    fn model_loader_records_are_decoded_in_the_documented_layout() {
+        use crate::testutil::LoaderModelSpec;
+        let mut cloud = LoaderModelSpec::new("testfldmain_n_cloud.char", "AAAA.HRC", &["ACFE.aki", "AAFF.aki", "AAGA.aki", "BVJF.yos"]);
+        cloud.unknown = 0;
+        let mut other = LoaderModelSpec::new("x.char", "BWAB.HRC", &["ACFE.aki"]);
+        other.scale = "1024".into();
+        let mut odd = LoaderModelSpec::new("", "ZZ", &[]);
+        odd.scale = "n/a".into();
+        let f = parse(&FieldSpec { models: vec![cloud, other, odd], model_scale: 768, ..FieldSpec::default() });
+        // the header-only reader still works and now reports the real count
+        assert_eq!(f.model_loader_header().unwrap(), ModelLoaderHeader { model_count: 3, scale: 768 });
+        let loader = f.model_loader().unwrap();
+        assert_eq!((loader.field_scale, loader.models.len(), loader.trailing_bytes), (768, 3, 0));
+        let m = &loader.models[0];
+        assert_eq!((m.name.as_str(), m.unknown, m.hrc.as_str(), m.scale), ("testfldmain_n_cloud.char", 0, "AAAA.HRC", Some(512)));
+        assert_eq!(m.hrc_stem(), "aaaa");
+        assert_eq!(m.lights[0], LoaderLight { color: [1, 2, 3], direction: [-659, 411, 4034] });
+        assert_eq!(m.lights[2], LoaderLight { color: [7, 8, 9], direction: [10, 11, 12] });
+        assert_eq!(m.global_color, [13, 14, 15]);
+        let names: Vec<&str> = m.animations.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["ACFE.aki", "AAFF.aki", "AAGA.aki", "BVJF.yos"]);
+        let stems: Vec<String> = m.animations.iter().map(LoaderAnimation::stem).collect();
+        assert_eq!(stems, ["acfe", "aaff", "aaga", "bvjf"]);
+        assert_eq!(m.animations[2].unknown, 3);
+        assert_eq!(loader.models[1].scale, Some(1024));
+        assert_eq!(loader.models[1].animations.len(), 1);
+        // a non-numeric scale and an empty name are kept as such, not errors
+        assert_eq!((loader.models[2].scale, loader.models[2].name.as_str(), loader.models[2].animations.len()), (None, "", 0));
+        // trailing bytes after the last record are reported, not rejected
+        let mut section = f.section(section::MODEL_LOADER).unwrap().to_vec();
+        section.extend_from_slice(&[1, 2, 3]);
+        assert_eq!(ModelLoader::parse(&section).unwrap().trailing_bytes, 3);
+        // a field without models
+        let none = parse(&FieldSpec::default()).model_loader().unwrap();
+        assert_eq!((none.models.len(), none.trailing_bytes), (0, 0));
+    }
+
+    #[test]
+    fn damaged_model_loader_sections_are_errors_not_panics() {
+        use crate::testutil::LoaderModelSpec;
+        let f = parse(&FieldSpec { models: vec![LoaderModelSpec::new("a.char", "AAAA.HRC", &["ACFE.aki", "AAFF.aki"])], ..FieldSpec::default() });
+        let good = f.section(section::MODEL_LOADER).unwrap().to_vec();
+        assert!(ModelLoader::parse(&good).is_ok());
+        // every prefix is an error (the section is exactly the records) or, for the empty prefix,
+        // a truncation; never a panic
+        for n in 0..good.len() {
+            assert!(ModelLoader::parse(good.get(..n).unwrap()).is_err(), "prefix {n}");
+        }
+        // single-byte damage never panics
+        for i in 0..good.len() {
+            for flip in [0x01u8, 0x80, 0xFF] {
+                let mut b = good.clone();
+                b[i] ^= flip;
+                let _ = ModelLoader::parse(&b);
+            }
+        }
+        // absurd counts are refused before anything is allocated
+        let mut b = good.clone();
+        b[2..4].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert!(matches!(ModelLoader::parse(&b), Err(FieldError::TooMany { .. })));
+        // an animation count over the cap
+        let mut b = good.clone();
+        let count_at = 6 + 2 + "a.char".len() + 1 + 2 + 8 + 4;
+        b[count_at..count_at + 2].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert!(matches!(ModelLoader::parse(&b), Err(FieldError::TooMany { .. })));
+        // a name length that runs past the section
+        let mut b = good.clone();
+        b[6..8].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert!(matches!(ModelLoader::parse(&b), Err(FieldError::Truncated { .. })));
     }
 
     #[test]

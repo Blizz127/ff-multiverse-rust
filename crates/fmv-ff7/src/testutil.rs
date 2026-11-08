@@ -61,6 +61,62 @@ pub(crate) fn camera_record(axes: [[i16; 3]; 3], position: [i32; 3], zoom: u16) 
     r
 }
 
+/// One synthetic model record of the model-loader section (invented names and values).
+#[derive(Clone, Debug)]
+pub(crate) struct LoaderModelSpec {
+    pub name: String,
+    pub unknown: u16,
+    pub hrc: String,
+    pub scale: String,
+    pub lights: [([u8; 3], [i16; 3]); 3],
+    pub global: [u8; 3],
+    pub anims: Vec<(String, u16)>,
+}
+
+impl LoaderModelSpec {
+    /// A record named `name` that uses skeleton `hrc` and the given animation names.
+    pub(crate) fn new(name: &str, hrc: &str, anims: &[&str]) -> Self {
+        Self {
+            name: name.to_string(),
+            unknown: 1,
+            hrc: hrc.to_string(),
+            scale: "512".to_string(),
+            lights: [([1, 2, 3], [-659, 411, 4034]), ([4, 5, 6], [1, -2, 3]), ([7, 8, 9], [10, 11, 12])],
+            global: [13, 14, 15],
+            anims: anims.iter().enumerate().map(|(i, a)| ((*a).to_string(), 1 + i as u16)).collect(),
+        }
+    }
+
+    /// The record's bytes, written field by field at the documented offsets.
+    fn record(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(self.name.len() as u16 + 1).to_le_bytes()); // length includes the NUL
+        out.extend_from_slice(self.name.as_bytes());
+        out.push(0);
+        out.extend_from_slice(&self.unknown.to_le_bytes());
+        let mut hrc = [0u8; 8];
+        hrc[..self.hrc.len()].copy_from_slice(self.hrc.as_bytes());
+        out.extend_from_slice(&hrc);
+        let mut scale = [0u8; 4];
+        scale[..self.scale.len()].copy_from_slice(self.scale.as_bytes());
+        out.extend_from_slice(&scale);
+        out.extend_from_slice(&(self.anims.len() as u16).to_le_bytes());
+        for (color, dir) in &self.lights {
+            out.extend_from_slice(color);
+            for d in dir {
+                out.extend_from_slice(&d.to_le_bytes());
+            }
+        }
+        out.extend_from_slice(&self.global);
+        for (name, unknown) in &self.anims {
+            out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(&unknown.to_le_bytes());
+        }
+        out
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TileSpec {
     pub dst_x: i16,
@@ -135,6 +191,8 @@ pub(crate) struct FieldSpec {
     pub script_len: usize,
     /// Field scale stored in the model-loader header (512 = 1.0).
     pub model_scale: u16,
+    /// Model records of the model-loader section (none by default).
+    pub models: Vec<LoaderModelSpec>,
 }
 
 impl Default for FieldSpec {
@@ -183,6 +241,7 @@ impl Default for FieldSpec {
             truncate_background_bytes: 0,
             script_len: 32,
             model_scale: 512,
+            models: Vec::new(),
         }
     }
 }
@@ -223,8 +282,12 @@ impl FieldSpec {
     }
 
     fn model_loader_section(&self) -> Vec<u8> {
-        let mut out = vec![0, 0, 0, 0];
+        let mut out = vec![0, 0];
+        out.extend_from_slice(&(self.models.len() as u16).to_le_bytes());
         out.extend_from_slice(&self.model_scale.to_le_bytes());
+        for m in &self.models {
+            out.extend_from_slice(&m.record());
+        }
         out
     }
 

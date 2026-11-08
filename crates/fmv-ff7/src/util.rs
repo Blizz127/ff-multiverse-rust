@@ -23,6 +23,26 @@ pub(crate) fn u32_at(data: &[u8], off: usize) -> Option<u32> {
     Some(u32::from_le_bytes(bytes))
 }
 
+/// Little-endian `f32` at `off`. Not sanitised: callers that must never see NaN or infinity use
+/// [`finite_f32_at`].
+pub(crate) fn f32_at(data: &[u8], off: usize) -> Option<f32> {
+    u32_at(data, off).map(f32::from_bits)
+}
+
+/// Little-endian `f32` at `off`, with NaN and infinities replaced by zero so that decoded game
+/// geometry can never poison later arithmetic.
+pub(crate) fn finite_f32_at(data: &[u8], off: usize) -> Option<f32> {
+    f32_at(data, off).map(|v| if v.is_finite() { v } else { 0.0 })
+}
+
+/// The lower-case stem of an archive entry name: any extension is removed (`AAAA.HRC`, `aaaa.hrc`
+/// and `aaaa` all give `aaaa`) and surrounding whitespace is ignored.
+pub(crate) fn entry_stem(name: &str) -> String {
+    let name = name.trim();
+    let stem = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
+    stem.to_ascii_lowercase()
+}
+
 /// Decode a fixed-width, NUL-padded ASCII name field. Bytes >= 0x80 are mapped through
 /// Latin-1 so the result is always valid UTF-8 and the mapping never fails.
 pub(crate) fn nul_padded_name(raw: &[u8]) -> String {
@@ -46,6 +66,30 @@ mod tests {
         assert_eq!(u32_at(&d, usize::MAX), None);
         assert_eq!(slice_at(&d, usize::MAX - 1, 8), None);
         assert_eq!(slice_at(&d, 5, 0), Some(&[][..]));
+    }
+
+    #[test]
+    fn float_readers_are_bounds_checked_and_sanitised() {
+        let mut d = 1.5f32.to_le_bytes().to_vec();
+        d.extend_from_slice(&f32::NAN.to_le_bytes());
+        d.extend_from_slice(&f32::INFINITY.to_le_bytes());
+        assert_eq!(f32_at(&d, 0), Some(1.5));
+        assert_eq!(finite_f32_at(&d, 0), Some(1.5));
+        assert!(f32_at(&d, 4).is_some_and(f32::is_nan));
+        assert_eq!(finite_f32_at(&d, 4), Some(0.0));
+        assert_eq!(finite_f32_at(&d, 8), Some(0.0));
+        assert_eq!(f32_at(&d, 9), None);
+        assert_eq!(finite_f32_at(&d, usize::MAX), None);
+    }
+
+    #[test]
+    fn entry_stems_drop_extensions_and_case() {
+        assert_eq!(entry_stem("AAAA.HRC"), "aaaa");
+        assert_eq!(entry_stem(" acfe.aki "), "acfe");
+        assert_eq!(entry_stem("Bare"), "bare");
+        assert_eq!(entry_stem("a.b.c"), "a.b");
+        assert_eq!(entry_stem(""), "");
+        assert_eq!(entry_stem(".hrc"), "");
     }
 
     #[test]
