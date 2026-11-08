@@ -20,6 +20,16 @@ const TICK: Duration = Duration::from_millis(10);
 const MAX_DT: f32 = 0.2;
 /// How long to wait for the `Leave` message to be flushed before exiting.
 const LEAVE_WAIT: Duration = Duration::from_secs(2);
+/// A bot that plays battles (`--battle-auto`) does not walk out of one when its duration is up: it
+/// plays the battle it is in to the end, for at most this much longer (a stalled server must not
+/// hold it here forever). Without this a run could end in the middle of a battle, and `battles=`
+/// would count one that never got a result.
+const BATTLE_FINISH_GRACE: Duration = Duration::from_secs(12);
+
+/// Is the run past its `duration` only because the battle it plays is still going?
+fn finishing_a_battle(plays_battles: bool, in_battle: bool, elapsed: Duration, duration: Duration) -> bool {
+    plays_battles && in_battle && elapsed < duration + BATTLE_FINISH_GRACE
+}
 
 /// Horizontal distance covered by one entity, for the stderr summary. The SMOKE line is a fixed
 /// contract, and `updates` alone cannot show that anybody walked (a player also receives the
@@ -138,7 +148,9 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
     // What the world looked like when the last battle ended, to show that play went on afterwards.
     let mut after_battle: Option<(f32, u64)> = None;
     let mut battles_ended = 0;
-    while start.elapsed() < args.duration {
+    while start.elapsed() < args.duration
+        || finishing_a_battle(battle_bot.is_active(), session.state.battle.in_battle(), start.elapsed(), args.duration)
+    {
         let tick_start = Instant::now();
         if let Some(reason) = session.pump() {
             ended = Some(reason);
@@ -258,6 +270,18 @@ mod tests {
         o.feed(Pos::new(3.0, 4.0, 0.0));
         o.feed(Pos::new(f32::NAN, 0.0, 0.0)); // a non-finite sample adds nothing
         assert_eq!(o.total, 5.0);
+    }
+
+    #[test]
+    fn a_battle_bot_finishes_the_battle_it_is_in_but_only_for_a_while() {
+        let d = Duration::from_secs(40);
+        let at = |s: u64| Duration::from_secs(s);
+        // Within the duration the loop runs anyway; the rule only matters after it.
+        assert!(finishing_a_battle(true, true, at(41), d), "a running battle is played out");
+        assert!(finishing_a_battle(true, true, at(40 + 11), d));
+        assert!(!finishing_a_battle(true, true, at(40 + 12), d), "but not forever");
+        assert!(!finishing_a_battle(true, false, at(41), d), "no battle, nothing to finish");
+        assert!(!finishing_a_battle(false, true, at(41), d), "a bot that does not play battles just stops");
     }
 
     fn smoke<'a>(name: &'a str, area: &'a AreaId, fixture: bool, rtt: Option<Duration>) -> Smoke<'a> {

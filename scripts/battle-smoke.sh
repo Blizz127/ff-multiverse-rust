@@ -17,13 +17,21 @@
 #   SMOKE ... party=2 battles=1 victories=1
 # both entered the SAME battle (same battle#N), both saw it end in Victory and return to the field,
 # nobody reported a BATTLE DIVERGENCE, and the server logged one battle with two members that ended
-# in Victory.
+# in Victory. Two further checks keep the SMOKE line from passing on the server's word alone:
+#   * each bot's mirror REPLAYED the battle from its own scene.bin/kernel.bin and matched: its end
+#     note says "verified: the server's N message(s) replayed ..." (a machine without battle data
+#     says "NOT verified"), and its closing `headless: battles:` line counts 1 verified by replay;
+#   * both members attacked: the server's "battle ended" line carries commands=[a, b] (accepted
+#     commands per actor, both at least 1) and each bot counts a command of its own applied.
 #
 # --random: the same two bots, but WITHOUT --debug-encounters and with random encounters on: the
 # bots (--bot circle, party formed, both --battle-auto) walk md1stin and the server rolls the
 # field's own encounter table (rate 128; formations 301, 302, 303) as they walk. Expected: every bot
 # exits 0, entered at least one battle, won every battle it entered, nobody reported a BATTLE
-# DIVERGENCE, and at least one battle (the same battle#N) was shared by both bots.
+# DIVERGENCE, every battle it entered was replayed from its own battle data and matched (the count
+# of "verified by replay" equals the count of battles entered), and at least one battle (the same
+# battle#N) was shared by both bots. A bot that is in a battle when its duration runs out plays it
+# to the end first, so the counts are never cut off mid-battle.
 #
 # --fixture: the synthetic FIXTURE server (no battle data) with --debug-encounters and one
 # --battle-auto --debug-encounters bot. Expected: the request is refused cleanly ("this server
@@ -241,6 +249,54 @@ battle_id_of() {
   fi
 }
 
+# summary_number <client log> <regex>: the integer right in front of <regex> on the client's last
+# `headless: battles:` line, e.g. summary_number log 'verified by replay' (empty if there is none).
+summary_number() {
+  local line
+  line=$(last_line_with "$1" "headless: battles:") || return 0
+  line=$(strip_ansi "$line")
+  if [[ $line =~ ([0-9]+)\ $2 ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+  fi
+}
+
+# commands_of <server log line>: the per-actor counts of accepted commands the server logged when a
+# battle ended (`commands=[2, 3]`), as "2 3" (empty if the line has none).
+commands_of() {
+  local line
+  line=$(strip_ansi "$1")
+  if [[ $line =~ commands=\[([0-9,\ ]*)\] ]]; then
+    local counts="${BASH_REMATCH[1]//,/}"
+    printf '%s' "$counts"
+  fi
+}
+
+# check_mirror <name> <client log> <expected battles>: the proof that the client really REPLAYED the
+# battles from its own scene.bin/kernel.bin and the replay matched (a mirror without battle data
+# also ends battles, but says "NOT verified" and counts none as verified; the SMOKE line alone could
+# not tell the two apart). <expected battles> is "any" (at least one) or a number.
+check_mirror() {
+  local n="$1" log="$2" want="$3" entered verified divergences
+  entered=$(summary_number "$log" 'battle\(s\) entered')
+  verified=$(summary_number "$log" 'verified by replay')
+  divergences=$(summary_number "$log" 'divergence\(s\)')
+  if [[ -z $entered || -z $verified || -z $divergences ]]; then
+    problem "client $n printed no 'headless: battles:' summary with its verified-by-replay count"
+    return 0
+  fi
+  if [[ $want == any ]]; then
+    ((entered >= 1)) || problem "client $n entered no battle"
+  elif ((entered != want)); then
+    problem "client $n entered $entered battle(s), expected $want"
+  fi
+  ((verified == entered)) || problem "client $n: $entered battle(s) entered but only $verified verified by replay from its own battle data"
+  ((divergences == 0)) || problem "client $n: $divergences divergence(s)"
+  if log_has "$log" "NOT verified" || log_has "$log" "no battle data"; then
+    problem "client $n says a battle was NOT verified or that it has no battle data: $(last_line_with "$log" "NOT verified" || last_line_with "$log" "no battle data")"
+  fi
+  log_has "$log" "; verified: the server's " || problem "client $n never logged a 'verified:' end note"
+}
+
 run_real() {
   local state_real="$LIBRARY"
   [[ -d $state_real/library/sets ]] || {
@@ -304,6 +360,11 @@ run_real() {
     if log_has "$log" "DIVERGENCE"; then
       problem "client $n reported a BATTLE DIVERGENCE (its replay disagreed with the server)"
     fi
+    # The mirror replayed the battle from the client's OWN data (not merely "no divergence"), and
+    # the client's own character really attacked: the server applied at least one command of its.
+    check_mirror "$n" "$log" 1
+    value=$(summary_number "$log" 'command\(s\) of ours applied')
+    [[ $value =~ ^[0-9]+$ ]] && ((value >= 1)) || problem "client $n: the server applied none of its commands (command(s) of ours applied: '${value}')"
     ids+=("$(battle_id_of "$log" || true)")
   done
   if [[ -z ${ids[0]} || ${ids[0]} != "${ids[1]}" ]]; then
@@ -318,6 +379,14 @@ run_real() {
     local ended
     ended=$(last_line_with "$WORK/server.log" "battle ended" || true)
     [[ $ended == *Victory* ]] || problem "the server's battle did not end in Victory: $ended"
+    # Both members attacked: the server's own count of accepted commands per actor, e.g. [2, 3].
+    local counts actor_counts=() c
+    counts=$(commands_of "$ended")
+    read -r -a actor_counts <<<"$counts"
+    ((${#actor_counts[@]} == 2)) || problem "the server's battle-end line has no two-member commands=[..]: $ended"
+    for c in "${actor_counts[@]}"; do
+      ((c >= 1)) || problem "a member of the battle never attacked (server: commands per actor [$counts])"
+    done
   fi
   (($(count_lines_with "$WORK/server.log" "battle started") <= 1)) || problem "the server started more than one battle"
 
@@ -337,10 +406,11 @@ run_real() {
   for n in "${CLIENT_NAMES[@]}"; do
     say "client $n: $(last_line_with "$WORK/client-$n.log" "started: formation" || true)"
     say "client $n: $(last_line_with "$WORK/client-$n.log" "ended in Victory" || true)"
+    say "client $n: $(last_line_with "$WORK/client-$n.log" "headless: battles:" || true)"
     say "client $n: $(last_line_with "$WORK/client-$n.log" "after the last battle:" || true)"
   done
   RESULT=pass
-  say "PASS: two bots fought one shared battle on the real field and won it; $state_real unchanged ($after)"
+  say "PASS: two bots fought one shared battle on the real field, both attacked, each replayed it from its own battle data and won it; $state_real unchanged ($after)"
 }
 
 # all_battle_ids_of <client log>: every distinct battle#N a client says it started, one per line.
@@ -415,6 +485,8 @@ run_random() {
     if log_has "$log" "DIVERGENCE"; then
       problem "client $n reported a BATTLE DIVERGENCE (its replay disagreed with the server)"
     fi
+    # Every battle it entered was replayed from its own battle data and matched.
+    check_mirror "$n" "$log" any
   done
   # At least one battle was the SAME battle for both (the party fought together).
   local shared=0 id b_ids
@@ -438,6 +510,9 @@ run_random() {
     say "client: $l"
   done
   say "server: $(count_lines_with "$WORK/server.log" "battle started") battle(s) started, $(count_lines_with "$WORK/server.log" "battle ended") ended; $shared shared by both bots"
+  for n in "${CLIENT_NAMES[@]}"; do
+    say "client $n: $(last_line_with "$WORK/client-$n.log" "headless: battles:" || true)"
+  done
   RESULT=pass
   say "PASS: random encounters from the real field's table started battles that the walking party won; $state_real unchanged ($after)"
 }

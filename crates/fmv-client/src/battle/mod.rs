@@ -109,6 +109,8 @@ pub struct ActiveBattle {
     pending: Option<f64>,
     diverged: bool,
     messages: u64,
+    /// Commands of OUR character that the server applied (it echoes each one in its event).
+    my_commands: u64,
 }
 
 impl ActiveBattle {
@@ -150,6 +152,10 @@ pub struct BattleClient {
     victories: u64,
     defeats: u64,
     divergences: u64,
+    /// Ended battles whose whole log AND ending this machine reproduced with its own battle data.
+    verified: u64,
+    /// Commands of our character the server applied, over the ended battles.
+    commands_applied: u64,
     rejections: u64,
     last_rejection: Option<BattleRejection>,
     notes: VecDeque<String>,
@@ -181,6 +187,8 @@ impl BattleClient {
             victories: 0,
             defeats: 0,
             divergences: 0,
+            verified: 0,
+            commands_applied: 0,
             rejections: 0,
             last_rejection: None,
             notes: VecDeque::new(),
@@ -231,6 +239,20 @@ impl BattleClient {
         self.divergences
     }
 
+    /// Ended battles that this machine replayed from its own battle data, event for event, with
+    /// the same ending and rewards as the server's: the ones that were really CHECKED (a battle
+    /// on a machine without battle data ends too, but is not counted here).
+    #[cfg(test)]
+    pub fn verified(&self) -> u64 {
+        self.verified
+    }
+
+    /// Commands of our own character that the server applied, over the ended battles.
+    #[cfg(test)]
+    pub fn commands_applied(&self) -> u64 {
+        self.commands_applied
+    }
+
     /// How many requests and commands the server refused.
     pub fn rejections(&self) -> u64 {
         self.rejections
@@ -248,8 +270,8 @@ impl BattleClient {
             None => "no refusals".to_string(),
         };
         format!(
-            "{} battle(s) entered, {} won, {} lost, {} divergence(s), {refusal}",
-            self.entered, self.victories, self.defeats, self.divergences
+            "{} battle(s) entered, {} won, {} lost, {} verified by replay, {} divergence(s), {} command(s) of ours applied, {refusal}",
+            self.entered, self.victories, self.defeats, self.verified, self.divergences, self.commands_applied
         )
     }
 
@@ -347,6 +369,7 @@ impl BattleClient {
             pending: None,
             diverged: false,
             messages: 0,
+            my_commands: 0,
         });
         if let Some(why) = failure {
             self.diverged(why);
@@ -362,6 +385,7 @@ impl BattleClient {
         active.messages += 1;
         if command.is_some_and(|c| Some(c.actor) == active.my_actor) {
             active.pending = None;
+            active.my_commands += 1;
         }
         let Some(replay) = active.replay.as_mut() else { return };
         if let Err(d) = replay.apply(tick, events, command.as_ref()) {
@@ -391,7 +415,21 @@ impl BattleClient {
                 failure = Some(format!("{battle_id} end: {d}"));
             }
         }
-        self.note(format!("{battle_id} ended in {outcome:?} ({paid}); back in the field"));
+        // Verified: this machine rebuilt the battle from its OWN data and the server's whole log and
+        // ending matched what that engine did. Without data, or after any divergence, it is not.
+        let how = match (&active.replay, active.diverged || failure.is_some()) {
+            (_, true) => "NOT verified: the replay diverged or could not be made".to_string(),
+            (None, false) => "NOT verified: this machine has no battle data".to_string(),
+            (Some(_), false) => {
+                self.verified += 1;
+                format!("verified: the server's {} message(s) replayed from this machine's own battle data and matched", active.messages)
+            }
+        };
+        self.commands_applied += active.my_commands;
+        self.note(format!(
+            "{battle_id} ended in {outcome:?} ({paid}); back in the field; {} command(s) of yours applied; {how}",
+            active.my_commands
+        ));
         if let Some(why) = failure {
             // The battle is gone, so the flag has nothing to mark: count and report it.
             self.divergences += 1;

@@ -533,8 +533,11 @@ mod tests {
     }
 
     /// The battle view through the real GPU pipeline: the pixels have the colours the layout says.
-    /// (This is as close as this box gets to the window: the surface itself needs a display.)
+    /// (This is as close as this box gets to the window: the surface itself needs a display.) Like
+    /// the other offscreen tests it is ignored by default and run with
+    /// `cargo test -p fmv-client -- --ignored offscreen`; it prints the adapter it drew with.
     #[test]
+    #[ignore = "needs a GPU or software Vulkan/GL driver"]
     fn offscreen_the_battle_view_has_the_status_band_the_ready_card_and_the_filled_bars() {
         let (w, h) = (800u32, 600u32);
         let mut cloud = bar(30, 100, GAUGE_MAX, true, true, true);
@@ -547,8 +550,8 @@ mod tests {
         let mut text = crate::ui::draw::DrawList::new();
         crate::battle::draw_battle_text(&v, w, h, &mut text);
         let Some(img) = render_offscreen(&v, w, h, Some(&text)) else { return };
-        // To look at it: `FMV_SHOT_DIR=<dir> cargo test -p fmv-client offscreen_the_battle_view` writes
-        // `battle-view.ppm` (a plain RGB image) there.
+        // To look at it: `FMV_SHOT_DIR=<dir> cargo test -p fmv-client -- --ignored offscreen_the_battle_view`
+        // writes `battle-view.ppm` (a plain RGB image) there.
         if let Some(dir) = std::env::var_os("FMV_SHOT_DIR") {
             let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
             ppm.extend(img.chunks(4).flat_map(|p| [p[0], p[1], p[2]]));

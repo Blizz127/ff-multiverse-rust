@@ -246,7 +246,9 @@ with the server's. When it ends everyone is back in the field and `BattleEnd` ca
 rewards (experience and gil shared among the living, AP to each): they are logged and sent, not
 stored, because an account's progression blob is also its story phase. A server without
 battle data (the FIXTURE one, or `--ff7-flevel`) refuses every battle request cleanly.
-`scripts/battle-smoke.sh` runs two bots through one real battle on `md1stin`.
+`scripts/battle-smoke.sh` runs two bots through one real battle on `md1stin` and checks that both
+members attacked (the server logs the accepted commands per actor) and that each bot replayed the
+battle from its own game files and matched (`verified by replay`, not merely "no divergence").
 
 `md1stin`'s own encounter table (section 6 of the field file, Steam PC build): the first of its
 two 24-byte tables is the enabled one, with rate 128 (a roll succeeds with probability 128/1024)

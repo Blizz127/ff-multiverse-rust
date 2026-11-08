@@ -164,13 +164,33 @@ fn a_whole_battle_replays_without_divergence_on_every_client_and_counts_a_victor
         for c in [&mut a, &mut b] {
             assert!(!c.in_battle(), "back in the field");
             assert_eq!((c.entered(), c.ended(), c.victories(), c.defeats(), c.divergences()), (1, 1, 1, 0, 0));
+            assert_eq!(c.verified(), 1, "replayed from this machine's own data and matched, ending included");
             let n = notes(c);
             assert!(!n.contains("DIVERGENCE"), "{n}");
             assert!(n.contains("ended in Victory") && n.contains("back in the field"), "{n}");
+            assert!(n.contains("verified: the server's") && !n.contains("NOT verified"), "{n}");
         }
         assert!(notes(&mut a).is_empty(), "notes are drained once");
         assert_eq!(b.active().map(ActiveBattle::id), None);
+        // The party member's own commands were applied (and counted from the server's echo); the
+        // spectator, who is nobody's actor, has none.
+        assert!(a.commands_applied() >= 1, "our character attacked");
+        assert_eq!(b.commands_applied(), 0);
+        assert!(a.summary().contains("1 verified by replay") && a.summary().contains("0 divergence(s)"), "{}", a.summary());
     }
+}
+
+#[test]
+fn the_end_note_counts_our_commands_and_says_how_it_was_verified() {
+    let mut sim = Sim::new(1, &[PEER, ME]);
+    let mut c = client(true);
+    c.on_message(0.0, sim.start());
+    sim.play(&mut [&mut c]);
+    let n = notes(&mut c);
+    let mine = c.commands_applied();
+    assert!(mine >= 1);
+    assert!(n.contains(&format!("{mine} command(s) of yours applied")), "{n}");
+    assert!(n.contains("message(s) replayed from this machine's own battle data and matched"), "{n}");
 }
 
 #[test]
@@ -180,6 +200,7 @@ fn a_lost_battle_counts_a_defeat_and_pays_nothing() {
     c.on_message(0.0, sim.start());
     sim.play(&mut [&mut c]);
     assert_eq!((c.entered(), c.victories(), c.defeats(), c.divergences()), (1, 0, 1, 0));
+    assert_eq!(c.verified(), 1, "a defeat is replayed and checked like a victory");
     let n = notes(&mut c);
     assert!(n.contains("ended in Defeat") && n.contains("no reward for you"), "{n}");
 }
@@ -223,6 +244,8 @@ fn a_tampered_event_is_a_loud_divergence_and_the_mirror_keeps_going() {
     assert!(c.divergences() >= 1);
     let n = notes(&mut c);
     assert!(n.contains("BATTLE DIVERGENCE") && n.contains("events differ"), "{n}");
+    assert!(n.contains("NOT verified: the replay diverged"), "{n}");
+    assert_eq!(c.verified(), 0, "a battle that diverged is never counted as verified");
     assert!(!c.in_battle(), "the end still ends it");
     assert_eq!(c.victories(), 1, "the server's word on the outcome is counted");
 }
@@ -278,6 +301,8 @@ fn a_battle_this_machine_cannot_build_is_reported_not_hidden() {
     assert_eq!(c.view(0.1).unwrap().status, Status::Unverified);
     c.on_message(0.2, ServerMsg::BattleEnd { battle_id: BattleId(1), outcome: Outcome::Victory, rewards: vec![] });
     assert!(!c.in_battle());
+    assert_eq!(c.verified(), 0, "a battle that could not be rebuilt here was not checked");
+    assert!(notes(&mut c).contains("NOT verified: the replay diverged or could not be made"));
 }
 
 #[test]
@@ -298,6 +323,12 @@ fn a_machine_without_battle_data_says_so_and_cannot_play() {
     let v = c.view(1.0).unwrap();
     assert_eq!((v.status, v.party.len(), v.enemies.len()), (Status::Unverified, 0, 0));
     assert!(c.title_suffix(1.0).contains("no local battle data"));
+    // The battle ends all the same, but it was never checked here and is not counted as verified.
+    c.on_message(2.0, ServerMsg::BattleEnd { battle_id: BattleId(1), outcome: Outcome::Victory, rewards: vec![] });
+    assert_eq!((c.ended(), c.victories(), c.verified(), c.divergences()), (1, 1, 0, 0));
+    let n = notes(&mut c);
+    assert!(n.contains("NOT verified: this machine has no battle data") && !n.contains("DIVERGENCE"), "{n}");
+    assert!(c.summary().contains("0 verified by replay"), "{}", c.summary());
 }
 
 #[test]

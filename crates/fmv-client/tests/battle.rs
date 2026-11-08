@@ -231,7 +231,10 @@ fn a_bot_that_is_refused_logs_it_once_never_retries_and_exits_cleanly() {
     assert!(stderr.contains("battle: request refused: this server cannot run battles"), "{stderr}");
     assert_eq!(report.count(|m| matches!(m, ClientMsg::RequestEncounter { formation_id: None })), 1, "asked exactly once, never again");
     assert_eq!(report.count(|m| matches!(m, ClientMsg::BattleCommand { .. })), 0);
-    assert!(stderr.contains("battles: 0 battle(s) entered, 0 won, 0 lost, 0 divergence(s), 1 refusal(s)"), "{stderr}");
+    assert!(
+        stderr.contains("battles: 0 battle(s) entered, 0 won, 0 lost, 0 verified by replay, 0 divergence(s), 0 command(s) of ours applied, 1 refusal(s)"),
+        "{stderr}"
+    );
 }
 
 #[test]

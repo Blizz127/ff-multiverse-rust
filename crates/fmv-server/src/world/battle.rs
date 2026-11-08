@@ -95,6 +95,9 @@ struct Battle {
     state: BattleState,
     /// `members[i]` fights as `ActorId(i)`.
     members: Vec<Member>,
+    /// `commands[i]`: how many commands of `ActorId(i)` the engine accepted (logged when the battle
+    /// ends, so a log shows that every member really fought).
+    commands: Vec<u32>,
     /// The engine has consumed time up to here.
     clock: Instant,
 }
@@ -313,7 +316,12 @@ impl World {
         });
         bw.battles.insert(
             id,
-            Battle { state, members: party.iter().cloned().map(|info| Member { info, connected: true }).collect(), clock: now },
+            Battle {
+                state,
+                members: party.iter().cloned().map(|info| Member { info, connected: true }).collect(),
+                commands: vec![0; party.len()],
+                clock: now,
+            },
         );
         for entity in &entities {
             if let Some(p) = self.players.get_mut(entity) {
@@ -360,6 +368,9 @@ impl World {
         }
         match battle.state.submit_command(actor, command) {
             Ok(events) => {
+                if let Some(n) = battle.commands.get_mut(usize::from(actor.0)) {
+                    *n += 1;
+                }
                 let msg = ServerMsg::BattleEvent {
                     battle_id,
                     tick: battle.state.tick(),
@@ -416,7 +427,14 @@ impl World {
             .map(|(i, m)| (m.info.account, u8::try_from(i).ok().and_then(|i| battle.state.actor(ActorId(i))).is_some_and(|c| c.is_alive())))
             .collect();
         let rewards = if outcome == Outcome::Victory { split_rewards(battle.state.rewards(), &roster) } else { Vec::new() };
-        info!(battle = id.0, ?outcome, ticks = battle.state.tick(), members = battle.members.len(), "battle ended");
+        info!(
+            battle = id.0,
+            ?outcome,
+            ticks = battle.state.tick(),
+            members = battle.members.len(),
+            commands = ?battle.commands,
+            "battle ended"
+        );
         for r in &rewards {
             let delivered = battle.members.iter().any(|m| m.info.account == r.account && m.connected);
             info!(
@@ -828,6 +846,9 @@ mod tests {
         }
         // The gauge was spent: the same character cannot act again at once.
         assert_eq!(w.battle_command(a.entity, id, ActorId(0), Command::Attack { target: enemy }, t), refused(Some(id), BattleRejection::GaugeNotFull));
+        // Only the accepted command was counted, for the actor that gave it (the end-of-battle log
+        // line shows these totals; every refusal above left them alone).
+        assert_eq!(w.battle.as_ref().unwrap().battles.get(&id).unwrap().commands, vec![1, 0]);
     }
 
     #[test]

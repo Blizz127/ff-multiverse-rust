@@ -68,7 +68,10 @@ HEADLESS OUTPUT:
   is retried, at most 5 times, 1 s apart); --party-accept accepts every invite sent to this player.
   --battle-auto plays battles (attacks whenever its gauge is full); with --debug-encounters it also
   asks the server for one battle (see BATTLES). Battle events and refusals are logged on stderr as
-  `battle:` lines.
+  `battle:` lines; when a battle ends the line says whether this machine replayed it from its own
+  battle data and matched (`verified: ...`) or could not (`NOT verified: ...`), and the closing
+  `headless: battles:` line counts the verified ones. A --battle-auto bot that is in a battle when
+  --duration runs out plays it to the end (at most 12 s longer).
 
 BATTLES:
   A battle starts for a whole party (random encounters in a field that has a table, or on request
