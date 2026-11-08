@@ -271,7 +271,11 @@ fn look_in(engine: Option<&BattleState>, actor: ActorId, action: ActionRef) -> L
             Look { melee: false, element: if heals { Element::Cure } else { Element::Plain } }
         }
         ActionRef::Defend => Look { melee: false, element: Element::Plain },
-        // TODO(v7): `ActionRef::Limit(_)` (not melee, a strong effect) and `ActionRef::Escape` (plain).
+        // A limit break does not run up to its target (the performer gathers its power, see `motion`): its
+        // effect is cure green when it heals (Healing Wind) and the element of its blow otherwise.
+        ActionRef::Limit(_) => Look { melee: false, element: who.limit_break.map_or(Element::Plain, |l| of(&l.spec).element) },
+        // Running is no blow: nothing to colour.
+        ActionRef::Escape => Look { melee: false, element: Element::Plain },
     }
 }
 
@@ -443,7 +447,7 @@ impl BattleScene {
             actor.home.pos[2] + motion.offset[2],
         ];
         let height = actor.rig.scale * motion.squash * idle.breath;
-        let place = placement(pos, actor.home.yaw + idle.sway, [actor.rig.scale, height, actor.rig.scale], motion.fall);
+        let place = placement(pos, actor.home.yaw + idle.sway + motion.turn, [actor.rig.scale, height, actor.rig.scale], motion.fall);
         Some((pos.map(f64::from), place, motion, idle))
     }
 

@@ -27,10 +27,12 @@
 //! the procedural motion that stood here first: the lunge with its hop, the blink and shake, the
 //! collapse.
 //!
-//! The matches on actions and events here and in [`cue`] are exhaustive on purpose: protocol v7's
-//! `ActionRef::Limit` (a big attack or special clip with a strong effect), `ActionRef::Escape` (the party
-//! runs off the screen), `BattleEvent::EscapeFailed` (a short stumble back) and `Outcome::Escaped` (no
-//! victory pose) make the compiler list every arm to add. See the TODO(v7) notes of [`cue`].
+//! The matches on actions and events here and in [`cue`] are exhaustive on purpose. Protocol v7: a limit
+//! break ([`ActionRef::Limit`]) is a spell-like show (the performer gathers with the cast clips and a
+//! glow, then a strong burst: a bloom and a gold star, breaks over the target); an escape that fails
+//! ([`BattleEvent::EscapeFailed`]) makes the performer stumble a little way back; one that succeeds (an
+//! [`ActionRef::Escape`] with no failure after it, and no victory pose: a battle that was escaped has no
+//! `Victory`) makes the whole party turn and run off the screen with the run clip ([`Director::on_escape`]).
 
 use super::clips::{AttackClip, Kit, Slot};
 use super::cue::{self, Cue, Landing};
@@ -71,6 +73,16 @@ const MAX_HURT: f64 = 0.8;
 /// The party's victory poses start this far apart, in seconds, and this long after the last blow.
 const VICTORY_STAGGER: f64 = 0.18;
 const VICTORY_AFTER: f64 = 0.45;
+/// The party members start running off this far apart, in seconds, when the party escapes.
+const ESCAPE_STAGGER: f64 = 0.10;
+/// How fast a runner covers the ground at the full speed it ramps up to in [`RUN_RAMP`] seconds, in battle
+/// units a second, and how long it takes to be off the screen (it is gone then).
+const RUN_SPEED: f32 = 3_600.0;
+const RUN_RAMP: f32 = 0.35;
+const RUN_OFF: f32 = 1.6;
+/// A failed escape: the performer is thrown this far back and returns, in this many seconds.
+const STUMBLE_DISTANCE: f32 = 280.0;
+const STUMBLE: f32 = 0.55;
 
 /// Where an actor stands and how big it is, for aiming reactions at it.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -103,13 +115,16 @@ pub struct Motion {
     pub alpha: f32,
     /// Drawn this instant (false in the dark half of a blink).
     pub visible: bool,
-    /// Not drawn at all any more (a collapsed or faded enemy), shadow included.
+    /// Not drawn at all any more (a collapsed or faded enemy, a party that ran off), shadow included.
     pub gone: bool,
+    /// A turn about the vertical axis added to the actor's facing, in radians (a party that runs away
+    /// turns its back on the enemies: pi).
+    pub turn: f32,
 }
 
 impl Default for Motion {
     fn default() -> Self {
-        Self { offset: [0.0; 3], clip: None, squash: 1.0, fall: 0.0, alpha: 1.0, visible: true, gone: false }
+        Self { offset: [0.0; 3], clip: None, squash: 1.0, fall: 0.0, alpha: 1.0, visible: true, gone: false, turn: 0.0 }
     }
 }
 
@@ -140,19 +155,21 @@ enum Effect {
     Flinch { actor: usize, start: f64, critical: bool, dir: [f32; 2] },
     /// The target steps aside, across `dir`, and back.
     Dodge { actor: usize, start: f64, dir: [f32; 2] },
+    /// An actor whose escape failed is thrown back along `dir` and returns.
+    Stumble { actor: usize, start: f64, dir: [f32; 2] },
 }
 
 impl Effect {
     fn actor(&self) -> usize {
         match *self {
-            Effect::Lunge { actor, .. } | Effect::Flinch { actor, .. } | Effect::Dodge { actor, .. } => actor,
+            Effect::Lunge { actor, .. } | Effect::Flinch { actor, .. } | Effect::Dodge { actor, .. } | Effect::Stumble { actor, .. } => actor,
         }
     }
 
     fn start(&self) -> f64 {
         match *self {
             Effect::Lunge { lunge, .. } => lunge.start,
-            Effect::Flinch { start, .. } | Effect::Dodge { start, .. } => start,
+            Effect::Flinch { start, .. } | Effect::Dodge { start, .. } | Effect::Stumble { start, .. } => start,
         }
     }
 
@@ -167,6 +184,7 @@ impl Effect {
                 }
             }
             Effect::Dodge { .. } => DODGE,
+            Effect::Stumble { .. } => STUMBLE,
         }
     }
 
@@ -217,6 +235,9 @@ pub struct Director {
     deaths: Vec<Option<f64>>,
     /// When each actor's victory pose began (`None`: not yet).
     victories: Vec<Option<f64>>,
+    /// When each party member began to run off after a successful escape, and the unit direction on the
+    /// ground it runs along (`None`: it stays).
+    escapes: Vec<Option<(f64, [f32; 2])>>,
     /// What flashes at whom, for [`super::effects`].
     bursts: Vec<Burst>,
     charges: Vec<Charge>,
@@ -244,6 +265,7 @@ impl Director {
             segments: vec![Vec::new(); n],
             deaths: vec![None; n],
             victories: vec![None; n],
+            escapes: vec![None; n],
             bursts: Vec::new(),
             charges: Vec::new(),
             last_impact: f64::NEG_INFINITY,
@@ -299,15 +321,19 @@ impl Director {
             dir = d;
             let kit = &self.kits[pi];
             let melee = action.is_none() || look.melee;
-            // TODO(v7): `Some(ActionRef::Limit(_))` plays the performer's special clip with a strong
-            // effect; `Some(ActionRef::Escape)` is `Shape::Guard` with no hold and starts the run off.
             let shape = match action {
                 None | Some(ActionRef::Attack) => self.strike_shape(kit, None, melee, reach, pi),
                 Some(ActionRef::EnemyAttack(id)) => self.strike_shape(kit, Some(id), melee, reach, pi),
-                Some(ActionRef::Magic(_)) if self.sides[pi] == Side::Party => Shape::Cast,
-                Some(ActionRef::Magic(_)) => Shape::Stand { strike: kit.plain.map(|slot| plan::Strike { slot, impact: 0.5 }) },
+                // A limit break (the clips that are its own, from slot 19 up, are not decoded) is played like a
+                // spell: the performer gathers its power with the cast clips and a glow, and it breaks over the
+                // target with a strong effect (see `land`).
+                Some(ActionRef::Magic(_) | ActionRef::Limit(_)) if self.sides[pi] == Side::Party => Shape::Cast,
+                Some(ActionRef::Magic(_) | ActionRef::Limit(_)) => Shape::Stand { strike: kit.plain.map(|slot| plan::Strike { slot, impact: 0.5 }) },
                 Some(ActionRef::Item(_)) => Shape::Stand { strike: plan::item_strike(kit) },
                 Some(ActionRef::Defend) => Shape::Guard,
+                // Running has no clip of its own here: a failed attempt only stumbles (below), a successful one
+                // makes the whole party run off (`on_escape`, which plays the run clip).
+                Some(ActionRef::Escape) => Shape::Stand { strike: None },
             };
             let performance = plan::plan(kit, shape, arrival, cue.impact());
             let cap = |v: &mut Vec<Segment>| {
@@ -320,9 +346,19 @@ impl Director {
             if let Some(lunge) = performance.lunge {
                 self.effects.push(Effect::Lunge { actor: pi, lunge, reach, dir });
             }
-            // A spell's caster glows while it gathers the spell.
-            if matches!(action, Some(ActionRef::Magic(_))) {
+            // A spell's caster glows while it gathers the spell, a limit's performer while it gathers its power.
+            if matches!(action, Some(ActionRef::Magic(_) | ActionRef::Limit(_))) {
                 self.charges.push(Charge { caster: pi, start: arrival, end: impact, element: look.element });
+            }
+            // An escape: the performer that failed is thrown back (away from the enemies); one that
+            // got away takes the whole party with it.
+            if matches!(action, Some(ActionRef::Escape)) {
+                if cue.events.iter().any(|e| matches!(e, BattleEvent::EscapeFailed { .. })) {
+                    let away = self.away_from_enemies(pi);
+                    self.effects.push(Effect::Stumble { actor: pi, start: arrival, dir: away });
+                } else {
+                    self.on_escape(arrival);
+                }
             }
         }
         // What lands on whom, at the impact.
@@ -388,7 +424,12 @@ impl Director {
                     }
                     None => self.effects.push(Effect::Flinch { actor: i, start: impact, critical, dir }),
                 }
-                self.burst(impact, i, if matches!(action, Some(ActionRef::Magic(_))) { BurstKind::Spell } else { BurstKind::Hit { critical } }, look.element);
+                let spellish = matches!(action, Some(ActionRef::Magic(_) | ActionRef::Limit(_)));
+                self.burst(impact, i, if spellish { BurstKind::Spell } else { BurstKind::Hit { critical } }, look.element);
+                // A limit break breaks with a strong effect: the gold star of a critical hit on top of the bloom.
+                if matches!(action, Some(ActionRef::Limit(_))) {
+                    self.burst(impact, i, BurstKind::Hit { critical: true }, look.element);
+                }
             }
             BattleEvent::Miss { .. } => {
                 // Step to alternating sides, so a run of misses does not all go the same way.
@@ -396,7 +437,7 @@ impl Director {
                 self.effects.push(Effect::Dodge { actor: i, start: impact, dir: [-dir[1] * side, dir[0] * side] });
             }
             BattleEvent::Heal { .. } | BattleEvent::Revive { .. } | BattleEvent::MpRestored { .. } => {
-                let kind = if matches!(action, Some(ActionRef::Magic(_))) { BurstKind::Spell } else { BurstKind::Item };
+                let kind = if matches!(action, Some(ActionRef::Magic(_) | ActionRef::Limit(_))) { BurstKind::Spell } else { BurstKind::Item };
                 self.burst(impact, i, kind, if look.element == Element::Plain { Element::Cure } else { look.element });
             }
             // Not a landing at the target (the cue's own `landing` does not make these).
@@ -405,6 +446,8 @@ impl Director {
             | BattleEvent::Victory
             | BattleEvent::Defeat
             | BattleEvent::Action { .. }
+            | BattleEvent::LimitGauge { .. }
+            | BattleEvent::EscapeFailed { .. }
             | BattleEvent::MpSpent { .. } => {}
         }
     }
@@ -421,6 +464,31 @@ impl Director {
         for i in 0..self.sides.len() {
             if self.sides[i] == Side::Party && self.deaths[i].is_none() && self.victories[i].is_none() {
                 self.victories[i] = Some(first + k * VICTORY_STAGGER);
+                k += 1.0;
+            }
+        }
+    }
+
+    /// The unit direction on the ground from the living enemies' middle to actor `i`: straight away from the
+    /// fight (across the field's depth when there is nobody to run from, or no enemy is left).
+    fn away_from_enemies(&self, i: usize) -> [f32; 2] {
+        let foes: Vec<[f32; 2]> =
+            (0..self.sides.len()).filter(|&j| self.sides[j] == Side::Enemy && self.deaths[j].is_none()).map(|j| self.anchors[j].ground).collect();
+        let (Some(me), false) = (self.anchors.get(i), foes.is_empty()) else { return [0.0, 1.0] };
+        let n = foes.len() as f32;
+        let centre = [foes.iter().map(|g| g[0]).sum::<f32>() / n, foes.iter().map(|g| g[1]).sum::<f32>() / n];
+        direction(centre, me.ground)
+    }
+
+    /// The party got away at `now` (an `Escape` that no `EscapeFailed` followed): every member still standing
+    /// turns its back on the enemies and runs off the screen with the run clip, one after the other, and is gone
+    /// [`RUN_OFF`] seconds later. No victory pose follows: a battle that was escaped has no `Victory`.
+    pub fn on_escape(&mut self, now: f64) {
+        let mut k = 0.0;
+        for i in 0..self.sides.len() {
+            if self.sides[i] == Side::Party && self.deaths[i].is_none() && self.escapes[i].is_none() {
+                let dir = self.away_from_enemies(i);
+                self.escapes[i] = Some((now + k * ESCAPE_STAGGER, dir));
                 k += 1.0;
             }
         }
@@ -518,6 +586,12 @@ impl Director {
                     m.offset[0] += dir[0] * DODGE_DISTANCE * bump;
                     m.offset[2] += dir[1] * DODGE_DISTANCE * bump;
                 }
+                Effect::Stumble { dir, .. } => {
+                    // Thrown back at once (the farthest after a third of the time), then comes back.
+                    let back = (std::f32::consts::PI * ease_out(u / STUMBLE)).sin().max(0.0);
+                    m.offset[0] += dir[0] * STUMBLE_DISTANCE * back;
+                    m.offset[2] += dir[1] * STUMBLE_DISTANCE * back;
+                }
             }
         }
         let kit = self.kits.get(i);
@@ -527,6 +601,22 @@ impl Director {
             if let Some(slot) = kit.victory {
                 let last = f32::from(kit.clips.frames_of(slot).saturating_sub(1));
                 m.clip = Some(ClipPose { slot, frame: ((t - start) as f32 * kit.clips.fps).clamp(0.0, last) });
+            }
+        }
+        // Running away (a successful escape): the run clip loops, the actor turns its back on the fight and
+        // runs off, faster as it gets going; once it is off the screen it is gone.
+        if let Some((start, dir)) = self.escapes.get(i).copied().flatten().filter(|&(s, _)| t >= s) {
+            let u = (t - start) as f32;
+            if let Some(slot) = kit.and_then(|k| k.run) {
+                let frames = f32::from(kit.map_or(1, |k| k.clips.frames_of(slot)).max(1));
+                m.clip = Some(ClipPose { slot, frame: (u * kit.map_or(15.0, |k| k.clips.fps)).rem_euclid(frames) });
+            }
+            let covered = RUN_SPEED * u * ease_in((u / RUN_RAMP).min(1.0));
+            m.offset[0] += dir[0] * covered;
+            m.offset[2] += dir[1] * covered;
+            m.turn = std::f32::consts::PI;
+            if u >= RUN_OFF {
+                m.gone = true;
             }
         }
         if let Some(start) = self.deaths.get(i).copied().flatten().filter(|&s| t >= s) {

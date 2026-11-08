@@ -1282,7 +1282,7 @@ mod tests {
                 battle_id: BattleId(1),
                 formation_id: 3,
                 seed: 5,
-                party: vec![BattleMember { entity: EntityId(1), account: AccountId(1), character: 0, level: 5, weapon: None, armor: None }],
+                party: vec![BattleMember { entity: EntityId(1), account: AccountId(1), character: 0, level: 5, weapon: None, armor: None, limit: 0 }],
                 preemptive: true,
                 back_attack: false,
                 battle_speed: 0,

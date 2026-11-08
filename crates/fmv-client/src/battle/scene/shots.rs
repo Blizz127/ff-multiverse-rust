@@ -163,7 +163,7 @@ impl Server {
 }
 
 pub(super) fn member(i: u64, character: u8) -> BattleMember {
-    BattleMember { entity: EntityId(10 + i), account: if i == 0 { ME } else { AccountId(10 + i) }, character, level: 12, weapon: None, armor: None }
+    BattleMember { entity: EntityId(10 + i), account: if i == 0 { ME } else { AccountId(10 + i) }, character, level: 12, weapon: None, armor: None, limit: 0 }
 }
 
 // ---------------------------------------------------------------------------------------------

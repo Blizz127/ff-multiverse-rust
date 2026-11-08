@@ -40,7 +40,7 @@
 //! battle does not skip it) and so does time ([`LINGER_S`]).
 
 use super::menu::{BattleMenu, BattleMenuModel, Ctx, Fighter, MenuKey, Reply};
-use super::names::{item_name, spell_name, NameBook};
+use super::names::{item_name, limit_name, spell_name, NameBook};
 use super::panels::{Banner, Finale, RewardLine, BANNER_S, PANEL_DELAY_MS};
 use super::popups::Popups;
 use super::scene::cue;
@@ -143,15 +143,16 @@ impl BattleHud {
 
     /// The words the banner shows for `action`, if it shows any (see the module docs).
     fn action_text(&self, action: ActionRef) -> Option<String> {
-        // TODO(v7): `ActionRef::Limit(id)` is named by `spell_name(self.names(), id)` (the kernel's "Names -
-        // magic" table: Braver 128, Big Shot 135, Healing Wind 142, Beat Rush 149) and `ActionRef::Escape`
-        // says nothing (its words belong to the panels).
         match action {
             ActionRef::Attack => None,
             ActionRef::Defend => Some("Defend".to_string()),
             ActionRef::Magic(id) => Some(spell_name(self.names(), id)),
             ActionRef::Item(id) => Some(item_name(self.names(), id)),
             ActionRef::EnemyAttack(id) => self.names()?.enemy_attack(self.formation, id).map(str::to_string),
+            // A limit break is named from the kernel's "Names - magic" table, like a spell (Braver 128, Big
+            // Shot 135, Healing Wind 142, Beat Rush 149); `Limit <id>` where this machine's book has no name.
+            ActionRef::Limit(id) => Some(limit_name(self.names(), id)),
+            ActionRef::Escape => Some("Escape".to_string()),
         }
     }
 
@@ -170,10 +171,15 @@ impl BattleHud {
             }
         }
         for event in events {
-            if let BattleEvent::Action { action, .. } = event {
-                if let Some(text) = self.action_text(*action) {
-                    self.show_banner(now, text);
+            match event {
+                BattleEvent::Action { action, .. } => {
+                    if let Some(text) = self.action_text(*action) {
+                        self.show_banner(now, text);
+                    }
                 }
+                // The attempt to run failed: the banner of `Escape` gives way to the verdict (the last one wins).
+                BattleEvent::EscapeFailed { .. } => self.show_banner(now, "Couldn't escape".to_string()),
+                _ => {}
             }
         }
         let mine = |actor: &ActorId| Some(*actor) == self.my_actor;

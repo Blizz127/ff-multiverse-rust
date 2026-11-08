@@ -536,7 +536,16 @@ pub fn draw_popups(out: &mut DrawList, l: &Layout, view: &BattleView, anchors: &
     }
 }
 
-/// The victory or defeat panel, once its moment has come.
+/// Where the end-of-battle panel goes: centred across the window and **hung from the top of the stage**, just
+/// under the banner. (It used to be centred in the stage, where it covered the leftmost party member's
+/// victory pose; the poses are played in the stage below it now.) On a window too small for it, as high as
+/// the room allows.
+fn finale_area(l: &Layout, w: i32, h: i32) -> Area {
+    let (top, bottom) = (l.banner_y + BANNER_H + 4, l.enemy.y - 4);
+    Area { x: (l.cw - w) / 2, y: top.min(bottom - h).max(0), w, h }
+}
+
+/// The victory, defeat or escaped panel, once its moment has come.
 pub fn draw_finale(c: &mut Canvas<'_>, l: &Layout, finale: &Finale) {
     if finale.age_ms < PANEL_DELAY_MS {
         return;
@@ -571,10 +580,7 @@ pub fn draw_finale(c: &mut Canvas<'_>, l: &Layout, finale: &Finale) {
     let body_rows = i32::try_from(rows.len().max(usize::from(note.is_some()))).unwrap_or(1);
     let w = 216.min((l.cw - 2 * MARGIN).max(40));
     let h = PAD + 16 + 6 + body_rows * ROW_H + 4 + if finale.dismissible { 12 } else { 0 } + PAD;
-    // Centred in the strip between the banner and the bottom windows.
-    let (top, bottom) = (l.banner_y + BANNER_H + 4, l.enemy.y - 4);
-    let y = (top + (bottom - top - h) / 2).max(top.min(bottom - h).max(0));
-    let a = Area { x: (l.cw - w) / 2, y, w, h };
+    let a = finale_area(l, w, h);
     window(c, a);
     let inner = a.inner();
     let title_w = i32::try_from(cell_count(title)).unwrap_or(0) * 16;
@@ -1051,6 +1057,29 @@ mod tests {
                 assert!(t.x >= 0 && t.x + text_width(&t.text, t.scale) <= w as i32 && t.y >= 0 && t.y + text_height(t.scale) <= h as i32, "{w}x{h}: {t:?}");
             }
         }
+    }
+
+    #[test]
+    fn the_finale_panel_hangs_from_the_top_of_the_stage_so_the_victory_poses_below_it_show() {
+        for (w, h) in [(1100u32, 680u32), (1920, 1080), (1280, 720), (800, 600)] {
+            let l = layout(w, h, 3);
+            let (x0, top, x1, bottom) = l.stage();
+            for panel_h in [60, 100, 130] {
+                let a = finale_area(&l, 216, panel_h);
+                // Centred across the window, directly under the banner (the stage begins 4 units below it)...
+                assert_eq!(a.x, (l.cw - 216) / 2, "{w}x{h}");
+                assert_eq!(a.y, l.banner_y + BANNER_H + 4, "{w}x{h}: under the banner");
+                // ... and well clear of the bottom of the stage, where the party stands: the panel ends in the
+                // upper part of the stage on every window that has room for the three windows.
+                let panel_bottom = (a.y + a.h) * l.s;
+                assert!(panel_bottom <= top + (bottom - top) * 3 / 4, "{w}x{h} panel of {panel_h}: it ends at {panel_bottom}, the stage is {top}..{bottom}");
+                assert!(x0 <= a.x * l.s && (a.x + a.w) * l.s <= x1 + 2 * l.s, "{w}x{h}");
+            }
+        }
+        // A window with no room for it: as high as it can go, never above the window.
+        let tiny = layout(320, 240, 3);
+        let a = finale_area(&tiny, 216, 400);
+        assert!(a.y >= 0 && a.y <= tiny.banner_y + BANNER_H + 4);
     }
 
     #[test]

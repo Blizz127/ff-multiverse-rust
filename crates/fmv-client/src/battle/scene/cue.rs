@@ -21,26 +21,23 @@
 //! moment its message arrives (at most a frame, unless the window stopped drawing: then the scene
 //! catches up by skipping, see [`super::plan::fit`], and the numbers keep their own clock).
 //!
-//! # Adding an action (protocol v7: sw-blimit's final names)
+//! # Protocol v7: limit breaks and escape
 //!
-//! `ActionRef::Limit`, `ActionRef::Escape`, `BattleEvent::LimitGauge`, `BattleEvent::EscapeFailed` and
-//! `Outcome::Escaped` are not in this engine yet; the matches on them are exhaustive on purpose, so
-//! when they arrive the compiler lists every arm to add (here, in [`super::motion`], in `look_in` of
-//! the scene, in the hud's banner). What each one is to the show:
+//! The matches on actions and events are exhaustive on purpose, which is how the v7 arms were found.
+//! What each is to the show:
 //!
-//! * TODO(v7) `ActionRef::Limit(id)`: [`impact_delay`] [`MAX_IMPACT_DELAY`] (a long show); the
-//!   performer plays a big attack or special clip with a strong effect; the id indexes the kernel's
-//!   "Names - magic" table (`NameBook::spell(id)` names it).
-//! * TODO(v7) `ActionRef::Escape`: no impact (delay 0). A successful escape is `Action { Escape }`
-//!   followed directly by `BattleEnd { outcome: Escaped }` and no other event: the party runs off the
-//!   screen during the linger (a director effect started by the action itself).
-//! * TODO(v7) `BattleEvent::EscapeFailed { actor }`: [`landing`] says nothing at a target; `actor`
-//!   stumbles a little way back (a short procedural effect of the director; the overlay's words are
-//!   the panels').
-//! * TODO(v7) `BattleEvent::LimitGauge { actor, value }`: shows nothing in the scene ([`landing`] is
-//!   `None`); it arrives right after `Action { Limit }` and after a `Death` that empties a gauge.
-//! * TODO(v7) `Outcome::Escaped`: no victory pose ([`super::motion::Director::on_victory`] is for a
-//!   `Victory` event only).
+//! * `ActionRef::Limit(id)`: [`impact_delay`] is [`MAX_IMPACT_DELAY`] (a long show); the performer gathers
+//!   its power (the cast clips and a glow) and a strong effect breaks over the target; the id indexes the
+//!   kernel's "Names - magic" table (`NameBook::spell(id)` names it).
+//! * `ActionRef::Escape`: no impact (delay 0). A successful escape is `Action { Escape }` followed directly
+//!   by `BattleEnd { outcome: Escaped }` and no other event: the party turns and runs off the screen (a
+//!   director effect started by the action itself, see [`super::motion::Director::on_escape`]).
+//! * `BattleEvent::EscapeFailed { actor }`: [`landing`] says nothing at a target; `actor` stumbles a little
+//!   way back (a short procedural effect of the director; the overlay's words are the hud's).
+//! * `BattleEvent::LimitGauge { actor, value }`: shows nothing in the scene ([`landing`] is `None`); it
+//!   arrives right after `Action { Limit }` and after a `Death` that empties a gauge.
+//! * `Outcome::Escaped`: no victory pose ([`super::motion::Director::on_victory`] is for a `Victory`
+//!   event only).
 
 use fmv_ff7_battle::rules::{ActionRef, ActorId, BattleEvent};
 
@@ -60,7 +57,6 @@ pub const MAX_DEATH_DELAY: f64 = MAX_IMPACT_DELAY + DEATH_BEAT;
 /// action announced, as an older server sends them). Fixed per kind so that the overlay and the
 /// scene need not talk; every entry is at most [`MAX_IMPACT_DELAY`].
 pub fn impact_delay(action: Option<ActionRef>) -> f64 {
-    // TODO(v7): `Some(ActionRef::Limit(_)) => MAX_IMPACT_DELAY`, `Some(ActionRef::Escape) => 0.0`.
     match action {
         // No announcement: the short beat the lunge always had.
         None => 0.30,
@@ -71,6 +67,10 @@ pub fn impact_delay(action: Option<ActionRef>) -> f64 {
         Some(ActionRef::Item(_)) => 0.45,
         // Nothing lands (a guard has no results).
         Some(ActionRef::Defend) => 0.0,
+        // A limit break is the longest show there is: the performer gathers, then it breaks.
+        Some(ActionRef::Limit(_)) => MAX_IMPACT_DELAY,
+        // Running has no results to wait for: a failed attempt only stumbles, a successful one runs off.
+        Some(ActionRef::Escape) => 0.0,
     }
 }
 
@@ -86,8 +86,6 @@ pub enum Landing {
 /// What `event` does on screen when it lands, `None` for those that show nothing at the actor
 /// (gauges, the cost of an action, the end of the battle, an announcement).
 pub fn landing(event: &BattleEvent) -> Option<Landing> {
-    // TODO(v7): `BattleEvent::LimitGauge { .. }` and `BattleEvent::EscapeFailed { .. }` join the arm
-    // of the events that show nothing at a target (the stumble is the director's).
     match *event {
         BattleEvent::Damage { target, .. }
         | BattleEvent::Miss { target, .. }
@@ -99,6 +97,9 @@ pub fn landing(event: &BattleEvent) -> Option<Landing> {
         | BattleEvent::Victory
         | BattleEvent::Defeat
         | BattleEvent::Action { .. }
+        // The gauge's bar is the overlay's; the stumble of a failed escape is the director's own.
+        | BattleEvent::LimitGauge { .. }
+        | BattleEvent::EscapeFailed { .. }
         | BattleEvent::MpSpent { .. } => None,
     }
 }
@@ -196,7 +197,16 @@ mod tests {
 
     #[test]
     fn no_action_lands_later_than_the_cap_and_a_death_is_after_its_blow() {
-        for what in [None, Some(ActionRef::Attack), Some(ActionRef::EnemyAttack(272)), Some(ActionRef::Magic(27)), Some(ActionRef::Item(3)), Some(ActionRef::Defend)] {
+        for what in [
+            None,
+            Some(ActionRef::Attack),
+            Some(ActionRef::EnemyAttack(272)),
+            Some(ActionRef::Magic(27)),
+            Some(ActionRef::Item(3)),
+            Some(ActionRef::Defend),
+            Some(ActionRef::Limit(128)),
+            Some(ActionRef::Escape),
+        ] {
             let d = impact_delay(what);
             assert!((0.0..=MAX_IMPACT_DELAY).contains(&d), "{what:?}: {d}");
             let death = delay_of(what, &BattleEvent::Death { actor: T });
@@ -204,9 +214,35 @@ mod tests {
             assert_eq!(delay_of(what, &damage(0, 2)), d);
         }
         // What shows nothing at the actor lands at once.
-        for e in [BattleEvent::GaugeReady { actor: A }, BattleEvent::Victory, BattleEvent::MpSpent { actor: A, amount: 3 }, action(0, ActionRef::Attack)] {
+        for e in [
+            BattleEvent::GaugeReady { actor: A },
+            BattleEvent::Victory,
+            BattleEvent::MpSpent { actor: A, amount: 3 },
+            action(0, ActionRef::Attack),
+            BattleEvent::LimitGauge { actor: A, value: 137 },
+            BattleEvent::EscapeFailed { actor: A },
+        ] {
             assert_eq!((landing(&e), delay_of(Some(ActionRef::Attack), &e)), (None, 0.0), "{e:?}");
         }
+        // A limit break is the longest show (the cap), an escape has nothing to wait for.
+        assert_eq!((impact_delay(Some(ActionRef::Limit(128))), impact_delay(Some(ActionRef::Escape))), (MAX_IMPACT_DELAY, 0.0));
+    }
+
+    #[test]
+    fn a_limit_is_one_cue_with_its_gauge_and_blow_and_an_escape_is_one_cue_with_no_target() {
+        let limit = [action(0, ActionRef::Limit(128)), BattleEvent::LimitGauge { actor: A, value: 0 }, damage(0, 2)];
+        let of_limit = cues(&limit);
+        assert_eq!(of_limit.len(), 1);
+        assert_eq!((of_limit[0].action, of_limit[0].events.len(), of_limit[0].performer()), (Some((A, ActionRef::Limit(128))), 2, Some(A)));
+        assert_eq!(of_limit[0].targets(), [T], "the gauge lands on nobody: the blow does");
+        assert_eq!(of_limit[0].impact(), MAX_IMPACT_DELAY);
+        // A failed escape: the announcement and the failure, nothing lands.
+        let failed = [action(1, ActionRef::Escape), BattleEvent::EscapeFailed { actor: ActorId(1) }];
+        let of_failed = cues(&failed);
+        assert_eq!((of_failed.len(), of_failed[0].events.len(), of_failed[0].targets().len(), of_failed[0].impact()), (1, 1, 0, 0.0));
+        // A successful one is a bare announcement.
+        let away = [action(1, ActionRef::Escape)];
+        assert!(cues(&away)[0].events.is_empty());
     }
 
     #[test]
