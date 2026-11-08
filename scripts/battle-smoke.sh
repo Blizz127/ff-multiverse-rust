@@ -3,7 +3,7 @@
 #
 # Usage: scripts/battle-smoke.sh [--fixture|--random|--progress] [--release|--debug] [--bin-dir DIR] [--build]
 #                                [--library STATE_DIR] [--duration SECS] [--formation ID]
-#                                [--tick-rate TPS] [--battle-speed N] [--bot idle|circle]
+#                                [--tick-rate TPS] [--battle-speed N] [--seed N] [--bot idle|circle]
 #                                [--keep-logs] [-h|--help]
 #
 # DEFAULT MODE (real data): the server hosts the real FF7 field md1stin from the owner's own
@@ -67,7 +67,9 @@
 # bots use no item (they attack, and cast a healing spell when hurt), so an item that went missing is a
 # failure; an "item used" line in the server log turns that exact comparison off and says so. A run that
 # does not fight leaves the inventory as it was, the SMOKE line's items=N is the last total the server
-# reported, and every "progress saved" line carries the inventory's total (items=N).
+# reported, and every "progress saved" line carries the inventory's total (items=N). These weak enemies
+# often drop nothing under a random seed (a note says when neither battle did); --seed 5 pins one under
+# which formation 301 drops a Potion in every battle, so the whole drop chain runs.
 #
 # Isolation (the owner's state directory is never touched, only its LIBRARY is read): the server and
 # the clients run with XDG_DATA_HOME/XDG_STATE_HOME/XDG_CONFIG_HOME/XDG_CACHE_HOME and FMV_STATE_DIR
@@ -105,6 +107,8 @@ DURATION_SET=0
 # crates/fmv-server/tests/battle_real.rs, `the_smoke_formations_are_won_every_time_...`).
 FORMATION=301
 TICK_RATE=240
+# Empty: every battle gets a fresh seed. --seed N pins it (the server's --battle-seed).
+SEED=
 BATTLE_SPEED=0
 BOT=idle
 PARTY_SIZE=2
@@ -113,7 +117,7 @@ usage() {
   cat <<'EOF'
 Usage: scripts/battle-smoke.sh [--fixture|--random|--progress] [--release|--debug] [--bin-dir DIR] [--build]
                                [--library STATE_DIR] [--duration SECS] [--formation ID]
-                               [--tick-rate TPS] [--battle-speed N] [--bot idle|circle]
+                               [--tick-rate TPS] [--battle-speed N] [--seed N] [--bot idle|circle]
                                [--keep-logs] [-h|--help]
 
 Real-data mode (default): two headless bots form a party on the real FF7 field md1stin and fight
@@ -134,6 +138,10 @@ must carry the level gained, and every reconnect must show what the run before e
   --formation ID     the enemy formation of the debug battle (default 301: a two-enemy formation of
                      md1stin's own encounter table in the Steam build)
   --tick-rate TPS    engine ticks per second of battle time (default 240)
+  --seed N           pin the seed of every battle (the server's --battle-seed); by default each
+                     battle gets a fresh one. Seed 5 makes formation 301 drop a Potion (see the
+                     real-data test the_formations_of_the_first_field_drop_items_for_some_seeds in
+                     crates/fmv-server/tests/battle_real.rs), which runs the drop chain of --progress
   --battle-speed N   FF7 battle speed, 0 fastest (default 0)
   --bot KIND         idle (default) or circle: how the bots move while not in battle
 EOF
@@ -453,6 +461,9 @@ run_real() {
   local -a server_args=(--bind 127.0.0.1:0 --ff7-library "$WORK/lib-state" --state-dir "$WORK/server-state"
     --debug-encounters --no-random-encounters --battle-speed "$BATTLE_SPEED" --battle-tick-rate "$TICK_RATE")
   server_args+=(--debug-formation "$FORMATION")
+  if [[ -n $SEED ]]; then
+    server_args+=(--battle-seed "$SEED")
+  fi
   say "starting server: $SERVER_BIN ${server_args[*]}"
   "$SERVER_BIN" "${server_args[@]}" >"$WORK/server.log" 2>&1 &
   SERVER_PID=$!
@@ -593,6 +604,9 @@ run_random() {
   # No --debug-encounters and no --no-random-encounters: only the field's own table starts battles.
   local -a server_args=(--bind 127.0.0.1:0 --ff7-library "$WORK/lib-state" --state-dir "$WORK/server-state"
     --battle-speed "$BATTLE_SPEED" --battle-tick-rate "$TICK_RATE")
+  if [[ -n $SEED ]]; then
+    server_args+=(--battle-seed "$SEED")
+  fi
   say "starting server: $SERVER_BIN ${server_args[*]}"
   "$SERVER_BIN" "${server_args[@]}" >"$WORK/server.log" 2>&1 &
   SERVER_PID=$!
@@ -676,6 +690,7 @@ declare -A PREV_LEVEL=() PREV_EXP=() RUN_JOIN_LEVEL=()
 # The same for the items: what each bot carried at the end of the previous run (`item:count,..`), the
 # total each run's battle added to the two bots' inventories together, and the stock they started with.
 declare -A PREV_ITEMS=() RUN_GAIN=()
+TOTAL_DROPPED=0
 PROGRESS_SUMMARY=()
 
 # start_bots <run> <duration> <battle|idle>: run bots A and B against the server, which stays up, and
@@ -769,6 +784,7 @@ check_drops() {
     fi
     dropped=$((dropped + $(dropped_total "$line")))
   done
+  TOTAL_DROPPED=$((TOTAL_DROPPED + dropped))
   [[ ${RUN_GAIN[$run]:-0} == "$dropped" ]] || problem "$run: the bots' inventories grew by ${RUN_GAIN[$run]:-0} item(s) together, but the server logged $dropped item(s) dropped to the party"
 }
 
@@ -880,6 +896,9 @@ run_progress() {
   local -a server_args=(--bind 127.0.0.1:0 --ff7-library "$WORK/lib-state" --state-dir "$WORK/server-state"
     --debug-encounters --no-random-encounters --battle-speed "$BATTLE_SPEED" --battle-tick-rate "$TICK_RATE")
   server_args+=(--debug-formation "$FORMATION")
+  if [[ -n $SEED ]]; then
+    server_args+=(--battle-seed "$SEED")
+  fi
   say "starting server: $SERVER_BIN ${server_args[*]}"
   "$SERVER_BIN" "${server_args[@]}" >"$WORK/server.log" 2>&1 &
   SERVER_PID=$!
@@ -924,6 +943,11 @@ run_progress() {
   # reward" lines per battle: the first battle's are lines 1 and 2, the second's 3 and 4).
   check_drops run1 1
   check_drops run2 3
+  if ((TOTAL_DROPPED == 0)); then
+    say "note: neither battle dropped an item, so the drop chain (deal, tell, save, read back) was not exercised over real processes; --seed 5 makes formation 301 drop a Potion"
+  else
+    say "the battles dropped $TOTAL_DROPPED item(s) in all, and both bots' inventories grew by exactly that"
+  fi
 
   stop_server
   # Stopping the server saved everything queued: one payment per member per battle, none lost.
@@ -1019,6 +1043,11 @@ main() {
         FORMATION="$2"
         shift
         ;;
+      --seed)
+        (($# >= 2)) || usage_error "--seed needs a whole number"
+        SEED="$2"
+        shift
+        ;;
       --tick-rate)
         (($# >= 2)) || usage_error "--tick-rate needs a number"
         TICK_RATE="$2"
@@ -1047,6 +1076,7 @@ main() {
   [[ $TICK_RATE =~ ^[1-9][0-9]*$ ]] || usage_error "--tick-rate must be a positive whole number"
   [[ $BATTLE_SPEED =~ ^[0-9]+$ ]] || usage_error "--battle-speed must be a whole number"
   [[ $FORMATION =~ ^[0-9]+$ ]] || usage_error "--formation must be a whole number"
+  [[ -z $SEED || $SEED =~ ^[0-9]+$ ]] || usage_error "--seed must be a whole number"
   [[ $BOT == idle || $BOT == circle ]] || usage_error "--bot must be idle or circle"
   if [[ $DO_BUILD == 1 && -n $BIN_DIR ]]; then
     usage_error "--build cannot be combined with --bin-dir"

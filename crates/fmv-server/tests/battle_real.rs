@@ -269,6 +269,45 @@ fn the_smoke_formations_are_won_every_time_by_both_members_and_quickly() {
     }
 }
 
+/// What the formations of md1stin's table drop (protocol v6): for each, how many of the first 2000 seeds
+/// drop at least one item, and the first seeds that do, with what they drop (item ids and counts, nothing
+/// else). It is how `scripts/battle-smoke.sh --seed N` gets a seed under which the drop chain (rolled by the
+/// server after a win, dealt to the living members, saved, told, kept across a reconnect) runs over real
+/// processes: a random seed often drops nothing from these weak enemies. The gate is that the drop tables
+/// are read at all (some seed of some formation drops something) and that a roll never drops more than
+/// one item per enemy.
+#[test]
+#[ignore = "needs the owner's library: set FMV_FF7_LIBRARY"]
+fn the_formations_of_the_first_field_drop_items_for_some_seeds() {
+    let Some(source) = source() else { return };
+    let opened = open_ff7(&source).expect("the library opens");
+    let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    rt.block_on(prewarm(&opened.adapter)).expect("prewarm");
+    let data = battle_data(&source);
+    let table = {
+        let field = opened.adapter.load_field("md1stin").expect("md1stin");
+        decode_encounter_section(field.field_file().section(section::ENCOUNTER).expect("section")).expect("md1stin has a table")
+    };
+    let mut any = false;
+    let mut formations: Vec<u16> = table.entries.iter().map(|e| e.formation).collect();
+    formations.sort_unstable();
+    formations.dedup();
+    for formation in formations {
+        let enemies = data.formation(formation).map_or(0, |f| f.enemies);
+        let mut dropping = Vec::new();
+        for seed in 0..2000u64 {
+            let drops = data.roll_drops(formation, seed);
+            assert!(drops.iter().map(|d| usize::from(d.count)).sum::<usize>() <= enemies, "formation {formation}, seed {seed}: at most one item per enemy");
+            if !drops.is_empty() {
+                dropping.push((seed, drops.iter().map(|d| (d.item, d.count)).collect::<Vec<_>>()));
+            }
+        }
+        any |= !dropping.is_empty();
+        eprintln!("formation {formation} ({enemies} enemies): {} of 2000 seeds drop something; the first: {:?}", dropping.len(), &dropping[..dropping.len().min(3)]);
+    }
+    assert!(any, "some formation of the table drops something for some seed");
+}
+
 /// The server's default debug formation (the weakest one in the data) is a real fight that a
 /// starting party wins.
 #[test]
