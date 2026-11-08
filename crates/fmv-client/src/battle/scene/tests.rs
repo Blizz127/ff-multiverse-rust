@@ -6,7 +6,6 @@
 use super::*;
 use crate::avatar::library::tests::{character, Counting};
 use crate::battle::scene::model::{BattleActorModel, BattleModelSource, StandInModels};
-use crate::ui::widgets::SHADOW;
 use fmv_core::{AccountId, AnimState, AreaId, AvatarAppearance, EntityId, EntitySnapshot, GameId};
 use fmv_ff7::model::transform_point;
 use fmv_ff7_battle::rules::{BattleConfig, Command, StartMode};
@@ -317,9 +316,8 @@ fn killing_blow() -> (BattleState, Vec<BattleEvent>, ActorId, ActorId) {
 }
 
 #[test]
-fn a_blow_makes_the_attacker_lunge_and_the_target_blink_and_float_its_damage() {
+fn a_blow_makes_the_attacker_lunge_and_the_target_blink_and_collapse() {
     let (state, events, attacker, target) = killing_blow();
-    let damage = events.iter().find_map(|e| if let BattleEvent::Damage { amount, .. } = e { Some(*amount) } else { None }).unwrap();
     let engine_before = SyntheticRules::default().build(&setup_for(1, 2)).unwrap();
     // A scene for the engine's actors (2 party, 2 enemies), started before the blow.
     let mut scene = BattleScene::new(&start(2, Some(formation())), Some(&engine_before), &[], &mut kit()).unwrap();
@@ -327,7 +325,7 @@ fn a_blow_makes_the_attacker_lunge_and_the_target_blink_and_float_its_damage() {
     let home = scene.screen_anchors(&view)[usize::from(attacker.0)].feet.unwrap();
     scene.update(10.0, &events, Some(&state));
 
-    let (mut lunged, mut hidden, mut shown_damage) = (0.0f32, 0, false);
+    let (mut lunged, mut hidden) = (0.0f32, 0);
     let mut t = 10.0;
     while t < 13.0 {
         scene.update(t, &[], Some(&state));
@@ -335,19 +333,12 @@ fn a_blow_makes_the_attacker_lunge_and_the_target_blink_and_float_its_damage() {
         let feet = anchors[usize::from(attacker.0)].feet.unwrap();
         lunged = lunged.max((feet[0] - home[0]).hypot(feet[1] - home[1]));
         hidden += usize::from(!anchors[usize::from(target.0)].drawn);
-        let mut list = DrawList::new();
-        scene.draw_overlay(&view, Status::Verified, &mut list);
-        shown_damage |= list.says(&damage.to_string());
         t += 0.01;
     }
     assert!(lunged > 60.0, "the attacker ran at its target: {lunged} px");
     assert!(hidden > 10, "the target blinked ({hidden} dark frames)");
-    assert!(shown_damage, "the damage {damage} floated over the target");
-    // Long after, the damage is gone and the dead enemy is not drawn; the attacker is home again.
+    // Long after, the dead enemy is not drawn; the attacker is home again.
     scene.update(20.0, &[], Some(&state));
-    let mut list = DrawList::new();
-    scene.draw_overlay(&view, Status::Verified, &mut list);
-    assert!(!list.says(&damage.to_string()));
     let anchors = scene.screen_anchors(&view);
     assert!(!anchors[usize::from(target.0)].drawn, "the enemy that died is gone");
     let back = anchors[usize::from(attacker.0)].feet.unwrap();
@@ -394,21 +385,24 @@ fn a_scene_that_starts_after_an_enemy_died_does_not_draw_it() {
 }
 
 #[test]
-fn a_miss_says_so_and_a_clock_that_goes_wrong_does_not_break_the_scene() {
+fn a_miss_makes_the_target_step_aside_and_a_clock_that_goes_wrong_does_not_break_the_scene() {
     let (mut scene, engine) = scene(2, true);
     let view = view(&scene);
+    let home = scene.screen_anchors(&view)[2].feet.unwrap();
     let miss = [BattleEvent::Miss { actor: ActorId(0), target: ActorId(2) }];
     scene.update(3.0, &miss, Some(&engine));
-    let mut said = false;
+    let (mut stepped, mut ever_hidden) = (0.0f32, false);
     let mut t = 3.0;
     while t < 5.0 {
         scene.update(t, &[], Some(&engine));
-        let mut list = DrawList::new();
-        scene.draw_overlay(&view, Status::Verified, &mut list);
-        said |= list.says("MISS");
+        let target = scene.screen_anchors(&view)[2];
+        let feet = target.feet.unwrap();
+        stepped = stepped.max((feet[0] - home[0]).hypot(feet[1] - home[1]));
+        ever_hidden |= !target.drawn;
         t += 0.02;
     }
-    assert!(said);
+    assert!(stepped > 20.0, "the target stepped aside: {stepped} px");
+    assert!(!ever_hidden, "and was never hit (no blinking)");
     // Time that is not a time leaves the clock where it was.
     let before = scene.now;
     scene.update(f64::NAN, &[], Some(&engine));
@@ -418,50 +412,27 @@ fn a_miss_says_so_and_a_clock_that_goes_wrong_does_not_break_the_scene() {
     assert_eq!(scene.frame(&view, false).models.models.len(), 4);
 }
 
-// ----- the overlay ------------------------------------------------------------------------------
+// ----- the overlay: the scene only says where the heads are ---------------------------------------
 
 #[test]
-fn the_status_band_is_green_red_or_grey_across_the_whole_window() {
-    for (status, rgb) in [(Status::Verified, BAND_VERIFIED_RGB), (Status::Diverged, BAND_DIVERGED_RGB), (Status::Unverified, BAND_UNVERIFIED_RGB)] {
-        let mut list = DrawList::new();
-        status_band(status, 900, &mut list);
-        assert_eq!(list.len(), 1);
-        let q = list.quads()[0];
-        assert_eq!((q.x, q.y, q.w, q.h), (0, 0, 900, BAND_H as i32));
-        assert_eq!(q.color, [rgb[0], rgb[1], rgb[2], 255]);
-    }
-    // The scene draws it first, before anything else of its overlay.
-    let (scene, _) = scene(1, true);
-    let mut list = DrawList::new();
-    scene.draw_overlay(&view(&scene), Status::Diverged, &mut list);
-    assert_eq!(list.quads()[0].color[..3], BAND_DIVERGED_RGB);
-}
-
-#[test]
-fn a_popup_is_over_its_target_rises_and_fades() {
-    let (mut scene, engine) = scene(2, true);
-    let view = view(&scene);
-    let hit = [BattleEvent::Damage { actor: ActorId(0), target: ActorId(2), amount: 4321, critical: true }];
-    scene.update(1.0, &hit, Some(&engine));
-    let mut seen: Vec<(f64, i32, i32, u8)> = Vec::new();
-    let mut t = 1.0;
-    while t < 3.0 {
-        scene.update(t, &[], Some(&engine));
-        let mut list = DrawList::new();
-        scene.draw_overlay(&view, Status::Verified, &mut list);
-        if let Some(text) = list.texts().iter().find(|d| d.text == "4321" && d.color != SHADOW) {
-            seen.push((t, text.x, text.y, text.color[3]));
+fn the_heads_are_given_in_the_order_of_the_views_bars_so_the_overlay_finds_each_fighter() {
+    use crate::battle::view::Anchors;
+    let s = state_in_battle();
+    let battle = s.battle.view(1.0).unwrap();
+    let mut slot = None;
+    let mut kit_slot = None;
+    let scene = scene_for(&mut slot, &mut kit_slot, &s, &battle, 1.0, &[]).unwrap();
+    let view = scene.view(W, H);
+    let anchors = scene.head_anchors(&view);
+    assert_eq!((anchors.party.len(), anchors.enemies.len()), (battle.party.len(), battle.enemies.len()));
+    // Every bar's actor finds its own point, and they differ (nobody stands on a head).
+    let points: Vec<(f32, f32)> = battle.party.iter().chain(&battle.enemies).map(|b| Anchors::of(&anchors, &battle, b.actor).expect("on screen")).collect();
+    for (i, a) in points.iter().enumerate() {
+        for b in &points[i + 1..] {
+            assert!((a.0 - b.0).hypot(a.1 - b.1) > 5.0, "{a:?} {b:?}");
         }
-        t += 0.02;
+        assert!(a.0 > 0.0 && a.0 < W as f32 && a.1 > 0.0 && a.1 < H as f32, "{a:?} is in the window");
     }
-    assert!(seen.len() > 20, "it was on screen for a while: {}", seen.len());
-    // It rises (smaller y), over the target's column (x within the target's width of its feet).
-    assert!(seen.last().unwrap().2 < seen.first().unwrap().2 - 20, "{:?} -> {:?}", seen.first(), seen.last());
-    let target_x = scene.screen_anchors(&view)[2].feet.unwrap()[0] as i32;
-    assert!(seen.iter().all(|s| (s.1 - target_x).abs() < 160), "over the target ({target_x}): {seen:?}");
-    // It fades out by the end and is opaque at the start.
-    assert_eq!(seen.first().unwrap().3, 255);
-    assert!(seen.last().unwrap().3 < 160, "{:?}", seen.last());
 }
 
 // ----- when the window gets a scene ---------------------------------------------------------------
@@ -696,13 +667,56 @@ fn a_location_model_replaces_the_stand_in_floor_and_is_placed_as_it_is() {
     assert!(scene.frame(&scene.view(W, H), false).location.is_none());
 }
 
+/// A location as big as the field around the camera: a flat slab with the camera inside its extent.
+struct Slab;
+
+impl BattleModelSource for Slab {
+    fn party_member(&mut self, who: &PartyLook) -> BattleActorModel {
+        StandInModels.party_member(who)
+    }
+
+    fn enemy(&mut self, who: &EnemyLook) -> BattleActorModel {
+        StandInModels.enemy(who)
+    }
+
+    fn location(&mut self, _location: u16) -> Option<BattleActorModel> {
+        Some(BattleActorModel::Box(BoxSpec { width: 40_000.0, depth: 40_000.0, height: 30.0, rgb: [60, 130, 70] }))
+    }
+}
+
+#[test]
+fn a_location_around_the_camera_is_cut_to_what_is_in_front_of_it_once_per_camera() {
+    let engine = engine(1, 2);
+    let mut kit = ModelKit::new(Box::new(Slab), None);
+    let scene = BattleScene::new(&start(2, Some(formation())), Some(&engine), &[], &mut kit).unwrap();
+    let view = view(&scene);
+    let frame = scene.frame(&view, false);
+    let location = frame.location.expect("a location");
+    // The slab is 40 000 wide and the camera stands over it: half of it is behind the camera. Nothing
+    // of that half reaches the GPU (it would be drawn wrongly), and the half in front does.
+    let positions = &location.models[0].positions;
+    assert!(positions.len() > 8, "something of the slab is left");
+    assert!(positions.iter().all(|p| f64::from(p[2]) >= LOCATION_NEAR - 0.05), "nothing behind the near plane");
+    // The cut is made once per camera: the same asset (one GPU upload) every frame, for any window size.
+    let again = scene.frame(&scene.view(640, 480), false).location.unwrap();
+    assert!(Arc::ptr_eq(&location.models[0].asset, &again.models[0].asset));
+    // Another camera has its own cut (it has other things behind it).
+    let other = View { camera: scene.cameras[1], ..view };
+    let elsewhere = scene.frame(&other, false).location.unwrap();
+    assert!(!Arc::ptr_eq(&location.models[0].asset, &elsewhere.models[0].asset));
+    assert!(elsewhere.models[0].positions.iter().all(|p| f64::from(p[2]) >= LOCATION_NEAR - 0.05));
+    // A view through a camera the scene does not know draws no location rather than a wrong one.
+    let stranger = BattleCamera::look_at([5000.0, -900.0, 5000.0], [0.0, -300.0, 0.0]).unwrap();
+    assert!(scene.frame(&View { camera: stranger, ..view }, false).location.is_none());
+}
+
 // ----- anchors for the battle overlay -----------------------------------------------------------
 
 #[test]
 fn head_anchors_are_over_each_head_party_first_then_enemies_in_the_engines_order() {
     let (mut scene, _) = scene(3, true);
     let view = view(&scene);
-    let HeadAnchors { party, enemies } = scene.head_anchors(&view);
+    let Anchors { party, enemies } = scene.head_anchors(&view);
     assert_eq!((party.len(), enemies.len()), (3, 2));
     let screen = scene.screen_anchors(&view);
     for (i, anchor) in party.iter().chain(&enemies).enumerate() {
@@ -720,7 +734,7 @@ fn head_anchors_are_over_each_head_party_first_then_enemies_in_the_engines_order
     scene = BattleScene::new(&start(2, Some(formation())), Some(&engine_for_two()), &[], &mut kit()).unwrap();
     scene.update(1.0, &events, Some(&state));
     scene.update(30.0, &[], Some(&state));
-    let HeadAnchors { party, enemies } = scene.head_anchors(&scene.view(W, H));
+    let Anchors { party, enemies } = scene.head_anchors(&scene.view(W, H));
     assert!(party.iter().all(Option::is_some));
     let dead = usize::from(target.0) - 2;
     assert!(enemies[dead].is_none() && enemies[1 - dead].is_some(), "{enemies:?}");

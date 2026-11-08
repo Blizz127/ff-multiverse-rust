@@ -1,9 +1,10 @@
 //! The battle as a 3D scene: a camera, a location, the enemies where the formation puts them, the
 //! party facing them, everyone breathing, and what happens in the fight played as short reactions.
 //!
-//! It replaces the flat rectangles of [`super::view`] as the window's battle picture; the UI
-//! overlay (names, HP, the turn line) still draws on top of it through the same overlay pass, and
-//! the flat view remains the fallback ([`scene_for`] says when).
+//! It replaces the flat tokens of [`super::view`] as the window's battle picture. It draws no text
+//! and no windows: the battle overlay ([`super::draw_battle_overlay`]) draws over it through the same
+//! overlay pass, told where the fighters' heads are ([`BattleScene::head_anchors`]) for its pointer and
+//! its floating numbers. The flat view remains the fallback ([`scene_for`] says when).
 //!
 //! # The pieces
 //!
@@ -13,8 +14,10 @@
 //! * [`layout`]: who stands where: the enemies from the formation, the party opposite them.
 //! * [`model`]: where each actor's model comes from ([`BattleActorModel`]: a field model, a real
 //!   battle model, or a box) and who decides ([`BattleModelSource`]). Stand-ins today.
-//! * [`motion`]: what the actors do with time: lunges, flinches, dodges, deaths, popups.
-//! * [`stage`]: the stand-in location: sky, haze, a round tiled floor.
+//! * [`motion`]: what the actors do with time: lunges, flinches, dodges, deaths.
+//! * [`stage`]: the stand-in location: sky, haze, a round tiled floor. A real location model, when
+//!   the [`BattleModelSource`] has one, replaces its floor (and is cut to the camera first, see
+//!   `clip`).
 //!
 //! The models go through the avatar renderer ([`crate::avatar`]): skinned on the CPU into camera
 //! space with the same pose and skinning code the field's players use, drawn depth-tested by
@@ -27,7 +30,8 @@
 //! BattleClient::scene_start()  --> BattleScene::new   (formation, party, enemies, models)
 //! BattleClient::take_events()  --> BattleScene::update (events become reactions; the engine's
 //! BattleClient::engine()                                state keeps who is alive and ready true)
-//! per frame:   view(w, h) -> frame(view, srgb) -> BattleFrame  (GPU)     draw_overlay(view) -> DrawList
+//! per frame:   view(w, h) -> frame(view, srgb) -> BattleFrame  (GPU)
+//!                          \-> head_anchors(view) -> Anchors     (the battle overlay)
 //! ```
 //!
 //! Actors are keyed by the engine's [`ActorId`] (party members first, then the enemies, in the
@@ -38,6 +42,7 @@
 //! the [`ModelKit`]'s loader from this machine's own archives. Nothing is sent anywhere.
 
 pub mod camera;
+mod clip;
 pub mod layout;
 pub mod model;
 pub mod motion;
@@ -47,14 +52,12 @@ pub mod stage;
 
 pub use model::ModelKit;
 
-use super::view::{BattleView, Status, BAND_DIVERGED_RGB, BAND_H, BAND_UNVERIFIED_RGB, BAND_VERIFIED_RGB};
+use super::view::{Anchors, BattleView, Status};
 use crate::avatar::frame::{skin, AvatarFrame, SkinnedModel, OVERLAY_BIAS_MODEL_UNITS};
 use crate::avatar::ground::{circle, GroundShape};
+use crate::avatar::library::AvatarAsset;
 use crate::render::{Camera, Vertex};
 use crate::state::ClientState;
-use crate::ui::draw::{DrawList, Rgba};
-use crate::ui::text::text_width;
-use crate::ui::widgets::{ACCENT, DIM, SHADOW, TEXT};
 use camera::{fit, BattleCamera, View, V3, NOMINAL_TAN_HALF_V};
 use fmv_core::Pos;
 use fmv_ff7::model::{mat4_mul, mat4_translate, transform_point};
@@ -63,8 +66,9 @@ use fmv_protocol::battle::FormationScene;
 use fmv_protocol::{BattleId, BattleMember};
 use layout::Spot;
 use model::{ActorRig, BoxSpec, EnemyLook, PartyLook};
-use motion::{Anchor, Director, PopupKind};
+use motion::{Anchor, Director};
 use stage::Arena;
+use std::cell::OnceCell;
 use std::sync::{Arc, OnceLock};
 
 /// The view used when the formation has no camera, or its camera does not suit the cast: the shape
@@ -96,6 +100,68 @@ pub struct SceneStart {
     pub formation: Option<FormationScene>,
 }
 
+/// The nearest a location's triangles are drawn to the camera, in battle units: nothing nearer is
+/// kept (see [`clip`]).
+const LOCATION_NEAR: f64 = 300.0;
+
+/// The location's model, and for each camera the scene may use, the model cut to that camera's near
+/// plane and skinned into its camera space (made when that camera is first drawn with).
+struct Location {
+    rig: Arc<ActorRig>,
+    cuts: Vec<OnceCell<Option<LocationCut>>>,
+}
+
+/// A location as one camera sees it: nothing of it behind the camera, in camera space already.
+struct LocationCut {
+    asset: Arc<AvatarAsset>,
+    positions: Vec<[f32; 3]>,
+}
+
+impl LocationCut {
+    /// `rig` cut to `camera`'s near plane. A model that is not one bone (the contract says a
+    /// location is one identity bone) is drawn as it is, uncut.
+    fn make(rig: &ActorRig, camera: &BattleCamera) -> Option<Self> {
+        let camera_matrix = camera.matrix();
+        let identity = mat4_translate([0.0; 3]);
+        let pose = rig.idle_pose(0.0)?;
+        let model = &rig.asset.character.model;
+        let cut_asset = (model.bones.len() == 1)
+            .then(|| {
+                // The one bone's pose is baked into the vertices, which are then cut in battle space.
+                let bone = pose.first()?;
+                let parts: Vec<_> = model
+                    .parts
+                    .iter()
+                    .filter_map(|part| {
+                        let mut baked = part.clone();
+                        baked.positions = part.positions.iter().map(|&p| transform_point(bone, p)).collect();
+                        baked.bone_index = 0;
+                        clip::clip_part(&baked, camera.position(), camera.forward(), LOCATION_NEAR)
+                    })
+                    .collect();
+                let still = model::still_clip(1);
+                let character = fmv_ff7::playable::Character {
+                    appearance: crate::avatar::source::NON_PLAYABLE,
+                    model: fmv_ff7::FieldModel { parts, ..model.clone() },
+                    idle: still.clone(),
+                    walk: still.clone(),
+                    run: still,
+                };
+                AvatarAsset::new(character).ok().map(Arc::new)
+            })
+            .flatten();
+        let (asset, pose) = match cut_asset {
+            Some(asset) => {
+                let pose = asset.character.pose(fmv_core::AnimState::Idle, 0)?;
+                (asset, pose)
+            }
+            None => (Arc::clone(&rig.asset), pose),
+        };
+        let mut positions = Vec::new();
+        skin(&asset, &pose, &identity, &camera_matrix, &mut positions).then_some(Self { asset, positions })
+    }
+}
+
 /// One combatant of the scene.
 struct Actor {
     side: Side,
@@ -116,14 +182,6 @@ pub struct ActorScreen {
     pub head: Option<[f32; 2]>,
     /// The model is drawn this frame (not collapsed away, not in the dark half of a blink).
     pub drawn: bool,
-}
-
-/// Where each fighter's head is on the screen, in window pixels from the top left, in the order of
-/// the battle view's bars ([`BattleScene::head_anchors`]).
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct HeadAnchors {
-    pub party: Vec<Option<(f32, f32)>>,
-    pub enemies: Vec<Option<(f32, f32)>>,
 }
 
 /// One frame of the battle for the GPU ([`crate::render::Gpu::draw_battle`]).
@@ -151,7 +209,7 @@ pub struct BattleScene {
     cast: Vec<V3>,
     arena: Arena,
     /// The location's model, drawn behind everyone in place of the stand-in floor (`None`: the stand-in).
-    location: Option<Arc<ActorRig>>,
+    location: Option<Location>,
     director: Director,
     my_actor: Option<ActorId>,
     /// The party members waiting for a command.
@@ -229,7 +287,8 @@ impl BattleScene {
             .formation
             .as_ref()
             .and_then(|f| kit.source.location(f.location))
-            .and_then(|model| kit.rigs.resolve_optional(&model));
+            .and_then(|model| kit.rigs.resolve_optional(&model))
+            .map(|rig| Location { rig, cuts: cameras.iter().map(|_| OnceCell::new()).collect() });
         let sides: Vec<Side> = actors.iter().map(|a| a.side).collect();
         let anchors: Vec<Anchor> = actors.iter().map(|a| Anchor { ground: a.home.ground(), radius: a.rig.radius }).collect();
         let n = actors.len();
@@ -388,12 +447,13 @@ impl BattleScene {
         }
         // The far marks first, so that a near one is drawn over theirs.
         marks.sort_by(|a, b| b.0.total_cmp(&a.0));
-        // The location, as it is: its vertices are in battle coordinates already.
-        let location = self.location.as_ref().and_then(|rig| {
-            let identity = mat4_translate([0.0; 3]);
-            let mut positions = Vec::new();
-            skin(&rig.asset, &rig.idle_pose(0.0)?, &identity, &camera_matrix, &mut positions).then(|| AvatarFrame {
-                models: vec![SkinnedModel { asset: Arc::clone(&rig.asset), positions }],
+        // The location, as it is (its vertices are in battle coordinates already), cut to this
+        // camera's near plane and skinned once: the camera does not move.
+        let location = self.location.as_ref().and_then(|location| {
+            let k = self.cameras.iter().position(|c| *c == view.camera)?;
+            let cut = location.cuts.get(k)?.get_or_init(|| LocationCut::make(&location.rig, &view.camera)).as_ref()?;
+            Some(AvatarFrame {
+                models: vec![SkinnedModel { asset: Arc::clone(&cut.asset), positions: cut.positions.clone() }],
                 zoom: view.zoom as f32,
                 overlay_bias: 0.0,
                 ground: Vec::new(),
@@ -417,11 +477,11 @@ impl BattleScene {
 
     /// The point over each fighter's head in window pixels from the top left (a little above the top
     /// of its model wherever the model is now: lunging, lying down, collapsing), for the battle
-    /// overlay's pointer and numbers: the party's, then the enemies', each in the engine's order,
-    /// which is the order of the battle view's bars. `None`: not on the screen (an enemy that has
-    /// collapsed away, or one behind the camera).
-    pub fn head_anchors(&self, view: &View) -> HeadAnchors {
-        let mut anchors = HeadAnchors::default();
+    /// overlay's pointer and numbers ([`super::draw_battle_overlay`]): the party's, then the
+    /// enemies', each in the engine's order, which is the order of the battle view's bars. `None`:
+    /// not on the screen (an enemy that has collapsed away, or one behind the camera).
+    pub fn head_anchors(&self, view: &View) -> Anchors {
+        let mut anchors = Anchors::default();
         for (i, actor) in self.actors.iter().enumerate() {
             let anchor = self.head_of(i, view);
             match actor.side {
@@ -446,52 +506,6 @@ impl BattleScene {
         Some((x, y))
     }
 
-    /// The overlay of the scene itself: the status band across the top ([`status_band`]) and the
-    /// popups ([`BattleScene::draw_popups`]). A battle overlay that draws both (and takes
-    /// [`BattleScene::head_anchors`]) makes this unnecessary.
-    pub fn draw_overlay(&self, view: &View, status: Status, out: &mut DrawList) {
-        status_band(status, view.width, out);
-        self.draw_popups(view, out);
-    }
-
-    /// The popups (damage numbers, MISS) over the actors, in the UI font.
-    pub fn draw_popups(&self, view: &View, out: &mut DrawList) {
-        let scale = if view.width >= 1000 { 3 } else { 2 };
-        let HeadAnchors { party, enemies } = self.head_anchors(view);
-        for popup in self.director.popups(self.now) {
-            let anchor = match popup.actor.checked_sub(party.len()) {
-                None => party.get(popup.actor).copied().flatten(),
-                Some(enemy) => enemies.get(enemy).copied().flatten(),
-            };
-            let Some((x, y)) = anchor else { continue };
-            // It floats up from over the head, easing out (the rise is in battle units, so it is
-            // as many pixels as the actor's distance makes them), and fades over its last third.
-            let depth = self.pose_of(popup.actor).map_or(1.0, |(pos, ..)| view.camera.to_camera(pos)[2].max(1.0));
-            let rise = f64::from(motion::POPUP_RISE * (1.0 - (1.0 - popup.progress).powi(2))) * view.zoom / depth;
-            let y = y - rise as f32;
-            let (text, color, size) = match popup.kind {
-                PopupKind::Damage { amount, critical: false } => (amount.to_string(), TEXT, scale),
-                PopupKind::Damage { amount, critical: true } => (amount.to_string(), ACCENT, scale + 1),
-                PopupKind::Miss => ("MISS".to_string(), DIM, scale),
-            };
-            let fade = ((1.0 - popup.progress) / 0.33).clamp(0.0, 1.0);
-            let with_alpha = |c: Rgba| [c[0], c[1], c[2], (f32::from(c[3]) * fade).round() as u8];
-            let width = text_width(&text, size);
-            out.draw_text_shadowed(x as i32 - width / 2, y as i32, size, with_alpha(color), with_alpha(SHADOW), &text);
-        }
-    }
-}
-
-/// The status band across the top of the window: green while the replay agrees with the server,
-/// red after a divergence, grey without battle data. (The flat view draws the same band; when the
-/// battle overlay draws its own this is the one to drop.)
-fn status_band(status: Status, width: u32, out: &mut DrawList) {
-    let rgb = match status {
-        Status::Verified => BAND_VERIFIED_RGB,
-        Status::Diverged => BAND_DIVERGED_RGB,
-        Status::Unverified => BAND_UNVERIFIED_RGB,
-    };
-    out.fill_rect(0, 0, i32::try_from(width).unwrap_or(i32::MAX), BAND_H as i32, [rgb[0], rgb[1], rgb[2], 255]);
 }
 
 /// The matrix from a model's native space to battle space: scaled by `scale` (per axis), turned

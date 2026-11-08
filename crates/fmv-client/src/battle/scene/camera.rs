@@ -96,9 +96,13 @@ impl BattleCamera {
         Some(Self { position, right, down, forward })
     }
 
-    #[cfg(test)]
     pub fn position(&self) -> V3 {
         self.position
+    }
+
+    /// The direction the camera looks in.
+    pub fn forward(&self) -> V3 {
+        self.forward
     }
 
     /// A point of battle space in camera space.

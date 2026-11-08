@@ -306,7 +306,7 @@ impl std::fmt::Debug for ActorRig {
 }
 
 /// A `.a` clip of one frame in which none of `bones` is rotated and the root is where it stands.
-fn still_clip(bones: usize) -> FieldAnimation {
+pub(super) fn still_clip(bones: usize) -> FieldAnimation {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&1u32.to_le_bytes());
     bytes.extend_from_slice(&1u32.to_le_bytes());

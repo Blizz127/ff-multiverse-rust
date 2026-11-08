@@ -21,8 +21,10 @@
 use super::*;
 use crate::avatar::library::tests::Counting;
 use crate::avatar::source::LgpLoader;
-use crate::battle::scene::model::StandInModels;
-use crate::battle::{draw_battle_text, BattleClient};
+use crate::battle::scene::model::{BattleActorModel, BattleModelSource, EnemyLook, PartyLook, StandInModels};
+use crate::battle::view::BAND_VERIFIED_RGB;
+use crate::battle::{draw_battle_overlay, BattleClient};
+use crate::ui::draw::DrawList;
 use crate::ui::testkit::{pixel, save, Offscreen};
 use fmv_core::{AccountId, EntityId};
 use fmv_ff7_battle::rules::Command;
@@ -35,12 +37,11 @@ const W: u32 = 1100;
 const H: u32 = 680;
 const ME: AccountId = AccountId(1);
 
-/// A frame as the window draws it: the scene, the popups and band, then the battle text.
+/// A frame as the window draws it: the scene, then the battle overlay over the fighters' heads.
 fn draw(gpu: &mut Offscreen, scene: &BattleScene, battle: &BattleView, w: u32, h: u32) -> Vec<u8> {
     let view = scene.view(w, h);
     let mut overlay = DrawList::new();
-    scene.draw_overlay(&view, battle.status, &mut overlay);
-    draw_battle_text(battle, w, h, &mut overlay);
+    draw_battle_overlay(battle, &scene.head_anchors(&view), w, h, &mut overlay);
     gpu.render_battle(w, h, &scene.frame(&view, false), &overlay)
 }
 
@@ -155,13 +156,9 @@ fn member(i: u64, character: u8) -> BattleMember {
 // No game data
 // ---------------------------------------------------------------------------------------------
 
-/// Stick-figure party, box enemies, the formation's own placement (made-up numbers) and a camera
-/// to the side: the composition of a normal battle, checked on pixels.
-#[test]
-#[ignore = "needs a GPU or a software Vulkan/GL driver"]
-fn offscreen_synthetic_battle_scene() {
-    let Some(mut gpu) = Offscreen::new() else { return };
-    let rules = fmv_protocol::SyntheticRules::default();
+/// The synthetic battle: a party of three against the two dummies of the synthetic rules' formation 1,
+/// with the formation's own placement and a camera to the side (made-up numbers), at `location`.
+fn synthetic_scene(kit: &mut ModelKit, location: u16) -> BattleScene {
     let setup = BattleSetup {
         formation_id: 1,
         seed: 3,
@@ -171,9 +168,9 @@ fn offscreen_synthetic_battle_scene() {
         battle_speed: 0,
         ticks_per_second: 1000,
     };
-    let engine = rules.build(&setup).unwrap();
+    let engine = fmv_protocol::SyntheticRules::default().build(&setup).unwrap();
     let formation = FormationScene {
-        location: 0,
+        location,
         layout: fmv_ff7_battle::scene::BattleLayout::Normal,
         camera: fmv_protocol::battle::CameraPose { position: [9000, -2400, 1800], target: [0, -300, 100] },
         enemies: vec![
@@ -182,16 +179,49 @@ fn offscreen_synthetic_battle_scene() {
         ],
     };
     let start = SceneStart { id: BattleId(1), party: setup.party.clone(), my_actor: Some(ActorId(0)), formation: Some(formation) };
-    let mut kit = ModelKit::new(Box::new(StandInModels), Some(Box::new(Counting::new(Rc::new(RefCell::new(Vec::new())), vec![]))));
-    let mut scene = BattleScene::new(&start, Some(&engine), &[], &mut kit).expect("a scene");
+    let mut scene = BattleScene::new(&start, Some(&engine), &[], kit).expect("a scene");
     scene.update(1.0, &[], Some(&engine));
-    let battle = BattleView {
-        id: BattleId(1),
-        party: Vec::new(),
-        enemies: Vec::new(),
-        status: Status::Verified,
-        waiting_for_answer: false,
-    };
+    scene
+}
+
+fn stand_ins() -> ModelKit {
+    ModelKit::new(Box::new(StandInModels), Some(Box::new(Counting::new(Rc::new(RefCell::new(Vec::new())), vec![]))))
+}
+
+fn verified_view() -> BattleView {
+    let mut battle = BattleView::unverified(BattleId(1));
+    battle.status = Status::Verified;
+    battle
+}
+
+/// A source with a location: a big flat slab for the floor (the stand-ins for everything else), to
+/// run the location's own pass through the real renderer.
+struct Slab;
+
+const SLAB_RGB: [u8; 3] = [60, 130, 70];
+
+impl BattleModelSource for Slab {
+    fn party_member(&mut self, who: &PartyLook) -> BattleActorModel {
+        StandInModels.party_member(who)
+    }
+
+    fn enemy(&mut self, who: &EnemyLook) -> BattleActorModel {
+        StandInModels.enemy(who)
+    }
+
+    fn location(&mut self, location: u16) -> Option<BattleActorModel> {
+        (location == 5).then_some(BattleActorModel::Box(BoxSpec { width: 40_000.0, depth: 40_000.0, height: 30.0, rgb: SLAB_RGB }))
+    }
+}
+
+/// Stick-figure party, box enemies, the formation's own placement (made-up numbers) and a camera
+/// to the side: the composition of a normal battle, checked on pixels.
+#[test]
+#[ignore = "needs a GPU or a software Vulkan/GL driver"]
+fn offscreen_synthetic_battle_scene() {
+    let Some(mut gpu) = Offscreen::new() else { return };
+    let scene = synthetic_scene(&mut stand_ins(), 0);
+    let battle = verified_view();
     let shot = draw(&mut gpu, &scene, &battle, W, H);
     save("synthetic-battle", W, H, &shot);
     let bare = stage_only(&mut gpu, &scene, W, H);
@@ -223,6 +253,36 @@ fn offscreen_synthetic_battle_scene() {
         })
         .count();
     assert!(gold > 10, "the ready ring is gold: {gold} px near {me:?}");
+}
+
+/// The same battle with a location model (a flat slab standing in for one): drawn through the
+/// location's own pass, under the actors, whose shadows and rings are then not covered by its floor.
+#[test]
+#[ignore = "needs a GPU or a software Vulkan/GL driver"]
+fn offscreen_synthetic_battle_with_a_location_model() {
+    let Some(mut gpu) = Offscreen::new() else { return };
+    let mut kit = ModelKit::new(Box::new(Slab), Some(Box::new(Counting::new(Rc::new(RefCell::new(Vec::new())), vec![]))));
+    let scene = synthetic_scene(&mut kit, 5);
+    let battle = verified_view();
+    let shot = draw(&mut gpu, &scene, &battle, W, H);
+    save("synthetic-battle-location", W, H, &shot);
+    let bare = stage_only(&mut gpu, &scene, W, H);
+    let view = scene.view(W, H);
+    let anchors = scene.screen_anchors(&view);
+
+    // The slab is the floor: a ground pixel low in the window is its (lit) top colour, and where the
+    // stand-in floor's tiles would be there is nothing of them.
+    let slab_top = [SLAB_RGB[0], SLAB_RGB[1], SLAB_RGB[2]].map(|c| (f32::from(c) * 1.18).round() as u8);
+    let floor = pixel(&shot, W, W / 2, H - 150);
+    assert!(floor.iter().zip(slab_top).all(|(a, b)| a.abs_diff(b) <= 3), "the floor is the slab: {floor:?} vs {slab_top:?}");
+    // The actors are drawn over it...
+    for a in &anchors {
+        assert!(drawn_at(&shot, &bare, W, a), "{a:?} is drawn over the location");
+    }
+    // ...with their shadows on it: under an enemy's feet the slab is darker than beside it.
+    let enemy = anchors.iter().find(|a| a.side == Side::Enemy).unwrap().feet.unwrap();
+    let (under, beside) = (pixel(&shot, W, enemy[0] as u32, enemy[1] as u32 + 3), pixel(&shot, W, (enemy[0] as u32).saturating_sub(300), enemy[1] as u32 + 3));
+    assert!(under[1] + 12 < beside[1], "the shadow lies on the location's floor: {under:?} under, {beside:?} beside");
 }
 
 // ---------------------------------------------------------------------------------------------

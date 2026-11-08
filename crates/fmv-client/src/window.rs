@@ -8,7 +8,7 @@ use crate::avatar::frame::Built;
 use crate::avatar::{AvatarPlayer, Avatars, Stage, Who};
 use crate::backdrop::FieldView;
 use crate::battle::scene::{scene_for, BattleScene, ModelKit};
-use crate::battle::{battle_vertices, draw_battle_text, BattleCmd};
+use crate::battle::{battle_vertices, draw_battle_overlay, draw_battle_text, BattleCmd, MenuKey, MenuReply};
 use crate::cli::exit;
 use crate::interp::render_time;
 use crate::net::PartyCommand;
@@ -64,6 +64,27 @@ pub fn escape_action(in_battle: bool, armed: bool) -> EscapeAction {
         EscapeAction::Quit
     } else {
         EscapeAction::Arm
+    }
+}
+
+/// Where an Escape press goes: the battle UI takes it first, else it is the window's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EscapeRoute {
+    /// The battle menu went back a level, or the end-of-battle panel closed (or the panel is on
+    /// screen and cannot close yet): nothing else happens.
+    Battle,
+    /// Nobody in the battle UI wanted it: the window's own action.
+    Action(EscapeAction),
+}
+
+/// Route one Escape press: back out of the battle menu (or close the panel that follows a battle)
+/// if there is one open, else [`escape_action`]. In a battle this never ends in [`EscapeAction::Quit`],
+/// whatever level the menu is at.
+pub fn escape_route(state: &mut ClientState, now: f64, armed: bool) -> EscapeRoute {
+    if state.battle.back(now) {
+        EscapeRoute::Battle
+    } else {
+        EscapeRoute::Action(escape_action(state.battle.in_battle(), armed))
     }
 }
 
@@ -212,37 +233,125 @@ pub fn party_request(key: PartyKey, state: &ClientState, render_t: f64) -> Optio
     }
 }
 
-/// The battle keys: `B` asks the server for a debug battle (refused unless it runs with
-/// `--debug-encounters`), `Space` or `Enter` attacks the first living enemy with your character.
+/// The battle keys. `B` asks the server for a debug battle (refused unless it runs with
+/// `--debug-encounters`). In a battle the arrows (and W, A, S, D) move the menu's cursor, `Space` and
+/// `Enter` confirm (they open a level, pick an entry or a target), `Backspace` goes back a level
+/// (so does `Esc`, see [`escape_route`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BattleKey {
     Request,
-    Attack,
+    Confirm,
+    Back,
+    Up,
+    Down,
+    Left,
+    Right,
 }
 
 impl BattleKey {
-    /// The battle action a keyboard event stands for. Only a fresh PRESS counts, like the party
-    /// keys: holding `B` must not flood the server with requests.
-    pub fn from_event(code: KeyCode, pressed: bool, repeat: bool) -> Option<Self> {
-        if !pressed || repeat {
+    /// The battle action a keyboard event stands for. Only a fresh PRESS counts for `B`, `Confirm`
+    /// and `Back`, like the party keys: holding `B` must not flood the server with requests, and
+    /// holding Enter must not confirm twice. The direction keys do repeat (a held arrow scrolls a long
+    /// list), but only in a battle: in the field they are the movement keys and must reach
+    /// [`Input::set`]. A release is never a battle key, so a movement key let go in a battle still
+    /// stops the walk.
+    pub fn from_event(code: KeyCode, pressed: bool, repeat: bool, in_battle: bool) -> Option<Self> {
+        if !pressed {
             return None;
         }
+        let fresh = !repeat;
+        let direction = |key| in_battle.then_some(key);
         match code {
-            KeyCode::KeyB => Some(BattleKey::Request),
-            KeyCode::Space | KeyCode::Enter | KeyCode::NumpadEnter => Some(BattleKey::Attack),
+            KeyCode::KeyB if fresh => Some(BattleKey::Request),
+            KeyCode::Space | KeyCode::Enter | KeyCode::NumpadEnter if fresh => Some(BattleKey::Confirm),
+            KeyCode::Backspace if fresh => Some(BattleKey::Back),
+            KeyCode::ArrowUp | KeyCode::KeyW => direction(BattleKey::Up),
+            KeyCode::ArrowDown | KeyCode::KeyS => direction(BattleKey::Down),
+            KeyCode::ArrowLeft | KeyCode::KeyA => direction(BattleKey::Left),
+            KeyCode::ArrowRight | KeyCode::KeyD => direction(BattleKey::Right),
             _ => None,
+        }
+    }
+
+    /// The menu key this stands for (`None` for `B`).
+    fn menu_key(self) -> Option<MenuKey> {
+        match self {
+            BattleKey::Request => None,
+            BattleKey::Confirm => Some(MenuKey::Confirm),
+            BattleKey::Back => Some(MenuKey::Back),
+            BattleKey::Up => Some(MenuKey::Up),
+            BattleKey::Down => Some(MenuKey::Down),
+            BattleKey::Left => Some(MenuKey::Left),
+            BattleKey::Right => Some(MenuKey::Right),
         }
     }
 }
 
-/// The request a battle key makes in the current situation, if any: `B` outside a battle asks for
-/// one, `Space`/`Enter` in a battle attacks when our gauge is full (see
-/// `BattleClient::attack_command`).
-pub fn battle_request(key: BattleKey, state: &ClientState, now: f64) -> Option<BattleCmd> {
-    match key {
-        BattleKey::Request => (!state.battle.in_battle()).then_some(BattleCmd::RequestEncounter { formation: None }),
-        BattleKey::Attack => state.battle.attack_command(now),
+/// What a battle key comes to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BattleRequest {
+    /// Send this to the server.
+    Send(BattleCmd),
+    /// The battle menu took the key (a cursor moved, a level opened or closed, a panel closed).
+    Menu,
+    /// Nothing happened, and why (empty when that needs no saying: a direction nobody listens to).
+    Nothing(&'static str),
+}
+
+/// The request a battle key makes in the current situation: `B` outside a battle asks for one; in
+/// a battle the keys drive the command menu of our character's turn, and `Confirm` on the last step
+/// of a choice sends the command (see `BattleClient::menu_key`). After a battle, `Confirm` and
+/// `Back` close its panel.
+pub fn battle_request(key: BattleKey, state: &mut ClientState, now: f64) -> BattleRequest {
+    let Some(menu_key) = key.menu_key() else {
+        return if state.battle.in_battle() {
+            BattleRequest::Nothing("you are already in a battle")
+        } else {
+            BattleRequest::Send(BattleCmd::RequestEncounter { formation: None })
+        };
+    };
+    match state.battle.menu_key(menu_key, now) {
+        MenuReply::Send(cmd) => BattleRequest::Send(cmd),
+        MenuReply::Handled => BattleRequest::Menu,
+        MenuReply::Refused(why) => BattleRequest::Nothing(why),
+        MenuReply::Ignored => BattleRequest::Nothing(match (key, state.battle.in_battle()) {
+            (BattleKey::Confirm, true) => "your gauge is not full yet",
+            (BattleKey::Confirm, false) => "no battle to fight in (press B to ask for one)",
+            _ => "",
+        }),
     }
+}
+
+/// What a keyboard event is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyRoute {
+    Escape,
+    /// F1: show or hide the walkmesh.
+    WalkMesh,
+    Party(PartyKey),
+    Battle(BattleKey),
+    /// Everything else is for the held-key state of walking (a release always is).
+    Movement,
+    /// A repeat or a release of a key that acts only on a fresh press.
+    Ignored,
+}
+
+/// Where a key goes. The battle keys come after the party keys and before walking, and the direction
+/// keys are the battle's only `in_battle`, so the field keeps its arrows and WASD.
+fn route_key(code: KeyCode, pressed: bool, repeat: bool, in_battle: bool) -> KeyRoute {
+    if code == KeyCode::Escape {
+        return if pressed && !repeat { KeyRoute::Escape } else { KeyRoute::Ignored };
+    }
+    if code == KeyCode::F1 {
+        return if pressed && !repeat { KeyRoute::WalkMesh } else { KeyRoute::Ignored };
+    }
+    if let Some(key) = PartyKey::from_event(code, pressed, repeat) {
+        return KeyRoute::Party(key);
+    }
+    if let Some(key) = BattleKey::from_event(code, pressed, repeat, in_battle) {
+        return KeyRoute::Battle(key);
+    }
+    KeyRoute::Movement
 }
 
 /// Held movement keys.
@@ -381,20 +490,22 @@ impl App {
         }
     }
 
-    /// Escape was pressed: quit only on a second press in the field, never in a battle.
+    /// Escape was pressed: the battle menu goes back a level first (or the panel after a battle
+    /// closes); otherwise quit only on a second press in the field, never in a battle.
     fn escape(&mut self, el: &ActiveEventLoop) {
         let now = Instant::now();
-        let in_battle = self.session.state.battle.in_battle();
-        match escape_action(in_battle, quit_armed(self.quit_armed_until, now)) {
-            EscapeAction::IgnoreInBattle => {
+        let (session_now, armed) = (self.session.now(), quit_armed(self.quit_armed_until, now));
+        match escape_route(&mut self.session.state, session_now, armed) {
+            EscapeRoute::Battle => {}
+            EscapeRoute::Action(EscapeAction::IgnoreInBattle) => {
                 eprintln!("battle: Esc does not quit during a battle (close the window to quit)");
                 self.notice = Some(("Esc does not quit in a battle: close the window to quit", now + NOTICE_TIME));
             }
-            EscapeAction::Arm => {
+            EscapeRoute::Action(EscapeAction::Arm) => {
                 self.quit_armed_until = Some(now + QUIT_CONFIRM);
                 self.notice = Some(("Press Esc again to quit", now + QUIT_CONFIRM));
             }
-            EscapeAction::Quit => self.quit(el),
+            EscapeRoute::Action(EscapeAction::Quit) => self.quit(el),
         }
     }
 
@@ -491,25 +602,20 @@ impl App {
     /// A battle key was pressed: send the request it stands for, and say what it did on stderr.
     fn battle_key(&mut self, key: BattleKey) {
         let now = self.session.now();
-        match battle_request(key, &self.session.state, now) {
-            Some(cmd) => {
+        match battle_request(key, &mut self.session.state, now) {
+            BattleRequest::Send(cmd) => {
                 eprintln!(
                     "battle: {}",
                     match cmd {
                         BattleCmd::RequestEncounter { .. } => "asking the server for a debug battle".to_string(),
-                        BattleCmd::Command { actor, .. } => format!("attacking with actor {}", actor.0),
+                        // Debug text, so a command kind the engine gains later needs no change here.
+                        BattleCmd::Command { actor, command, .. } => format!("actor {} sends {command:?}", actor.0),
                     }
                 );
                 self.session.send_battle(cmd);
             }
-            None => eprintln!(
-                "battle: {}",
-                match key {
-                    BattleKey::Request => "you are already in a battle",
-                    BattleKey::Attack if self.session.state.battle.in_battle() => "your gauge is not full yet",
-                    BattleKey::Attack => "no battle to fight in (press B to ask for one)",
-                }
-            ),
+            BattleRequest::Menu | BattleRequest::Nothing("") => {}
+            BattleRequest::Nothing(why) => eprintln!("battle: {why}"),
         }
     }
 
@@ -548,8 +654,9 @@ impl App {
         self.session.log_party_notes();
         self.session.log_battle_notes();
         self.session.flush_party_sync();
-        // A player in a battle is frozen in the field: no walking, no movement intents.
-        if self.session.state.battle.in_battle() {
+        // A player in a battle is frozen in the field: no walking, no movement intents. So is one whose
+        // battle just ended, while the window still shows its victory or defeat panel.
+        if self.session.state.battle.in_battle() || self.session.state.battle.lingering(self.session.now()) {
             self.update_title();
             return;
         }
@@ -579,18 +686,22 @@ impl App {
         let dt = (now - self.last_draw_t).clamp(0.0, f64::from(MAX_DT)) as f32;
         self.last_draw_t = now;
         // In a battle the whole window is the battle: the 3D scene when it can be had, else the flat
-        // rectangles of the battle view, with the UI font's text (names, HP, whose turn) over it.
+        // tokens of the battle view, with the battle overlay (the windows, the numbers, the status
+        // band) over it: over the scene's own fighters' heads, or over the tokens'.
         if let Some(battle) = self.session.state.battle.view(now) {
             let (vw, vh) = renderer.size();
             let mut overlay = DrawList::new();
-            // What the last messages did is taken every frame, drawn as a scene or not.
+            // What the last messages did is taken every frame, drawn as a scene or not (the view
+            // lingers after the battle's end, and the last events are played with it).
             let events = self.session.state.battle.take_events();
             let drawn = scene_for(&mut self.battle_scene, &mut self.battle_kit, &self.session.state, &battle, now, &events).map(|scene| {
                 let view = scene.view(vw, vh);
-                scene.draw_overlay(&view, battle.status, &mut overlay);
+                draw_battle_overlay(&battle, &scene.head_anchors(&view), vw, vh, &mut overlay);
                 (scene, view)
             });
-            draw_battle_text(&battle, vw, vh, &mut overlay);
+            if drawn.is_none() {
+                draw_battle_text(&battle, vw, vh, &mut overlay);
+            }
             if let Some(text) = notice {
                 draw_notice(text, vw, vh, &mut overlay);
             }
@@ -776,20 +887,15 @@ impl ApplicationHandler for App {
                 ..
             } => {
                 let pressed = state == ElementState::Pressed;
-                if code == KeyCode::Escape {
-                    if pressed && !repeat {
-                        self.escape(el);
+                match route_key(code, pressed, repeat, self.session.state.battle.in_battle()) {
+                    KeyRoute::Escape => self.escape(el),
+                    KeyRoute::WalkMesh => self.show_walkmesh = !self.show_walkmesh,
+                    KeyRoute::Party(key) => self.party_key(key),
+                    KeyRoute::Battle(key) => self.battle_key(key),
+                    KeyRoute::Movement => {
+                        self.input.set(code, pressed);
                     }
-                } else if code == KeyCode::F1 {
-                    if pressed && !repeat {
-                        self.show_walkmesh = !self.show_walkmesh;
-                    }
-                } else if let Some(key) = PartyKey::from_event(code, pressed, repeat) {
-                    self.party_key(key);
-                } else if let Some(key) = BattleKey::from_event(code, pressed, repeat) {
-                    self.battle_key(key);
-                } else {
-                    self.input.set(code, pressed);
+                    KeyRoute::Ignored => {}
                 }
             }
             // Releases while unfocused are never delivered: do not keep walking.
@@ -988,23 +1094,76 @@ mod tests {
     }
 
     #[test]
-    fn battle_keys_act_on_a_fresh_press_only_and_are_not_movement_or_party_keys() {
+    fn b_confirm_and_back_act_on_a_fresh_press_only_and_are_not_movement_or_party_keys() {
         for (code, key) in [
             (KeyCode::KeyB, BattleKey::Request),
-            (KeyCode::Space, BattleKey::Attack),
-            (KeyCode::Enter, BattleKey::Attack),
-            (KeyCode::NumpadEnter, BattleKey::Attack),
+            (KeyCode::Space, BattleKey::Confirm),
+            (KeyCode::Enter, BattleKey::Confirm),
+            (KeyCode::NumpadEnter, BattleKey::Confirm),
+            (KeyCode::Backspace, BattleKey::Back),
         ] {
-            assert_eq!(BattleKey::from_event(code, true, false), Some(key), "{code:?} pressed");
-            assert_eq!(BattleKey::from_event(code, false, false), None, "{code:?} released");
-            assert_eq!(BattleKey::from_event(code, true, true), None, "{code:?} auto-repeat of a held key");
+            for in_battle in [false, true] {
+                assert_eq!(BattleKey::from_event(code, true, false, in_battle), Some(key), "{code:?} pressed (in a battle: {in_battle})");
+                assert_eq!(BattleKey::from_event(code, false, false, in_battle), None, "{code:?} released");
+                assert_eq!(BattleKey::from_event(code, true, true, in_battle), None, "{code:?} auto-repeat of a held key");
+            }
             let mut input = Input::default();
             assert!(!input.set(code, true), "{code:?} is not a movement key");
             assert_eq!(PartyKey::from_event(code, true, false), None, "{code:?} is not a party key");
         }
-        for code in [KeyCode::KeyW, KeyCode::KeyP, KeyCode::KeyY, KeyCode::KeyL, KeyCode::Escape, KeyCode::ArrowUp] {
-            assert_eq!(BattleKey::from_event(code, true, false), None, "{code:?}");
+        for code in [KeyCode::KeyP, KeyCode::KeyY, KeyCode::KeyL, KeyCode::Escape, KeyCode::F1, KeyCode::KeyN, KeyCode::ShiftLeft] {
+            assert_eq!(BattleKey::from_event(code, true, false, true), None, "{code:?}");
         }
+    }
+
+    #[test]
+    fn the_directions_are_battle_keys_only_in_a_battle_and_they_repeat_there() {
+        for (codes, key) in [
+            ([KeyCode::ArrowUp, KeyCode::KeyW], BattleKey::Up),
+            ([KeyCode::ArrowDown, KeyCode::KeyS], BattleKey::Down),
+            ([KeyCode::ArrowLeft, KeyCode::KeyA], BattleKey::Left),
+            ([KeyCode::ArrowRight, KeyCode::KeyD], BattleKey::Right),
+        ] {
+            for code in codes {
+                assert_eq!(BattleKey::from_event(code, true, false, true), Some(key), "{code:?} in a battle");
+                assert_eq!(BattleKey::from_event(code, true, true, true), Some(key), "{code:?} held in a battle scrolls a list");
+                assert_eq!(BattleKey::from_event(code, false, false, true), None, "{code:?} released");
+                assert_eq!(BattleKey::from_event(code, true, false, false), None, "{code:?} outside a battle is a movement key");
+                assert_eq!(BattleKey::from_event(code, true, true, false), None);
+            }
+        }
+    }
+
+    /// Walking keeps working outside a battle, a battle takes the directions, and a key let go of in a
+    /// battle still stops the walk it started in the field.
+    #[test]
+    fn the_field_keeps_its_arrows_and_wasd_and_a_release_always_reaches_the_walk() {
+        let walk = [KeyCode::ArrowUp, KeyCode::KeyW, KeyCode::ArrowDown, KeyCode::KeyS, KeyCode::ArrowLeft, KeyCode::KeyA, KeyCode::ArrowRight, KeyCode::KeyD];
+        for code in walk {
+            for repeat in [false, true] {
+                assert_eq!(route_key(code, true, repeat, false), KeyRoute::Movement, "{code:?} in the field walks");
+            }
+            assert!(matches!(route_key(code, true, false, true), KeyRoute::Battle(_)), "{code:?} in a battle drives the menu");
+            for in_battle in [false, true] {
+                assert_eq!(route_key(code, false, false, in_battle), KeyRoute::Movement, "{code:?} released (in a battle: {in_battle}) reaches the walk");
+            }
+        }
+        // A walk started in the field, a battle begins, the key is let go: the walk stops.
+        let mut input = Input::default();
+        assert_eq!(route_key(KeyCode::KeyW, true, false, false), KeyRoute::Movement);
+        input.set(KeyCode::KeyW, true);
+        assert_eq!(input.dir(), (0.0, 1.0));
+        assert_eq!(route_key(KeyCode::KeyW, false, false, true), KeyRoute::Movement);
+        input.set(KeyCode::KeyW, false);
+        assert_eq!(input.dir(), (0.0, 0.0));
+        // The other keys keep their routes.
+        assert_eq!(route_key(KeyCode::Escape, true, false, true), KeyRoute::Escape);
+        assert_eq!(route_key(KeyCode::Escape, true, true, true), KeyRoute::Ignored, "a held Esc is not a second press");
+        assert_eq!(route_key(KeyCode::Escape, false, false, true), KeyRoute::Ignored);
+        assert_eq!(route_key(KeyCode::F1, true, false, false), KeyRoute::WalkMesh);
+        assert_eq!(route_key(KeyCode::KeyP, true, false, true), KeyRoute::Party(PartyKey::Invite));
+        assert_eq!(route_key(KeyCode::Space, true, false, false), KeyRoute::Battle(BattleKey::Confirm));
+        assert_eq!(route_key(KeyCode::ShiftLeft, true, false, true), KeyRoute::Movement, "Shift is still tracked");
     }
 
     /// A state in a battle that starts preemptive (our character's gauge is full at once), with
@@ -1031,23 +1190,131 @@ mod tests {
         s
     }
 
+    use crate::battle::Level;
+    use fmv_protocol::battle::Command as EngineCommand;
+
     #[test]
-    fn b_asks_for_a_battle_outside_one_only_and_space_attacks_on_our_turn_only() {
-        // Outside a battle: B asks, Space has nothing to attack.
-        let outside = state_with_peers(&[]);
-        assert_eq!(battle_request(BattleKey::Request, &outside, 1.0), Some(BattleCmd::RequestEncounter { formation: None }));
-        assert_eq!(battle_request(BattleKey::Attack, &outside, 1.0), None);
-        // In one: B has nothing to ask (the server would refuse), Space attacks the first enemy.
-        let inside = state_in_a_preemptive_battle();
+    fn b_asks_for_a_battle_outside_one_only_and_the_menu_attacks_on_our_turn_only() {
+        // Outside a battle: B asks, Enter has nothing to fight, the menu keys say nothing.
+        let mut outside = state_with_peers(&[]);
+        assert_eq!(battle_request(BattleKey::Request, &mut outside, 1.0), BattleRequest::Send(BattleCmd::RequestEncounter { formation: None }));
+        assert_eq!(battle_request(BattleKey::Confirm, &mut outside, 1.0), BattleRequest::Nothing("no battle to fight in (press B to ask for one)"));
+        for key in [BattleKey::Back, BattleKey::Up, BattleKey::Down, BattleKey::Left, BattleKey::Right] {
+            assert_eq!(battle_request(key, &mut outside, 1.0), BattleRequest::Nothing(""), "{key:?}");
+        }
+        // In one: B has nothing to ask (the server would refuse). Enter opens the target selection,
+        // a second Enter attacks the first enemy.
+        let mut inside = state_in_a_preemptive_battle();
         assert!(inside.battle.in_battle());
-        assert_eq!(battle_request(BattleKey::Request, &inside, 1.0), None);
-        match battle_request(BattleKey::Attack, &inside, 1.0) {
-            Some(BattleCmd::Command { actor, command: fmv_protocol::battle::Command::Attack { target }, .. }) => {
+        assert_eq!(battle_request(BattleKey::Request, &mut inside, 1.0), BattleRequest::Nothing("you are already in a battle"));
+        assert_eq!(battle_request(BattleKey::Confirm, &mut inside, 1.0), BattleRequest::Menu, "Attack opens the target selection");
+        match battle_request(BattleKey::Confirm, &mut inside, 1.0) {
+            BattleRequest::Send(BattleCmd::Command { actor, command: EngineCommand::Attack { target }, .. }) => {
                 assert_eq!((actor.0, target.0), (0, 1), "our character hits the first enemy, which follows the party");
             }
             other => panic!("{other:?}"),
         }
         assert_eq!(inside.battle.view(1.0).map(|v| v.enemies.len()), Some(1));
+    }
+
+    #[test]
+    fn the_menu_moves_with_the_directions_and_greyed_out_commands_say_why() {
+        let mut s = state_in_a_preemptive_battle();
+        let level = |s: &ClientState| s.battle.view(1.0).and_then(|v| v.menu).map(|m| (m.level, m.command_cursor));
+        assert_eq!(level(&s), Some((Level::Commands, 0)));
+        assert_eq!(battle_request(BattleKey::Down, &mut s, 1.0), BattleRequest::Menu);
+        assert_eq!(level(&s).map(|l| l.1), Some(1), "the cursor is on Magic");
+        // This engine build has no spells yet: the Magic command is refused with its reason.
+        assert_eq!(battle_request(BattleKey::Confirm, &mut s, 1.0), BattleRequest::Nothing("No magic to cast"));
+        assert_eq!(battle_request(BattleKey::Up, &mut s, 1.0), BattleRequest::Menu);
+        assert_eq!(level(&s).map(|l| l.1), Some(0));
+        // Back at the top level is nobody's: it falls through to the window.
+        assert_eq!(battle_request(BattleKey::Back, &mut s, 1.0), BattleRequest::Nothing(""));
+    }
+
+    /// Spells and items are in the menu once the model has them, and what they send is refused until
+    /// the engine's command can say it.
+    #[test]
+    fn magic_and_items_open_their_lists_and_refuse_to_send_what_the_engine_lacks() {
+        use crate::battle::{MenuItem, MenuSpell, TargetRule};
+        let mut s = state_in_a_preemptive_battle();
+        s.battle.menu_model_mut().spells = vec![MenuSpell::new(1, "Fire", 0, TargetRule::Enemies)];
+        s.battle.menu_model_mut().items = vec![MenuItem::new(2, "Potion", 1, TargetRule::Allies)];
+        s.battle.menu_model_mut().defend = true;
+        for key in [BattleKey::Down, BattleKey::Confirm] {
+            assert_eq!(battle_request(key, &mut s, 1.0), BattleRequest::Menu);
+        }
+        assert_eq!(s.battle.view(1.0).and_then(|v| v.menu).and_then(|m| m.list).map(|l| l.title), Some("Magic"));
+        // Pick Fire, aim at the dummy, confirm: the menu has a Magic choice, the engine has no such command yet.
+        assert_eq!(battle_request(BattleKey::Confirm, &mut s, 1.0), BattleRequest::Menu);
+        assert_eq!(battle_request(BattleKey::Confirm, &mut s, 1.0), BattleRequest::Nothing("that command is not available yet"));
+        assert_eq!(s.battle.view(1.0).and_then(|v| v.menu).map(|m| m.command_cursor), Some(1), "back at the top, on Magic");
+        // Defend sends at once when the model has it, and is refused the same way.
+        assert_eq!(battle_request(BattleKey::Down, &mut s, 1.0), BattleRequest::Menu);
+        assert_eq!(battle_request(BattleKey::Down, &mut s, 1.0), BattleRequest::Menu);
+        assert_eq!(battle_request(BattleKey::Confirm, &mut s, 1.0), BattleRequest::Nothing("that command is not available yet"));
+    }
+
+    /// Esc backs out of the menu one level at a time, and at no level of a battle (nor after one, until
+    /// the panel is gone) does it end in a quit, armed or not.
+    #[test]
+    fn escape_goes_back_through_the_menu_and_never_quits_in_a_battle() {
+        use crate::battle::{MenuItem, MenuSpell, TargetRule};
+        let never_quits = |s: &mut ClientState, armed: bool| {
+            let route = escape_route(s, 1.0, armed);
+            assert_ne!(route, EscapeRoute::Action(EscapeAction::Quit), "Esc quit in a battle (armed: {armed})");
+            route
+        };
+        let mut s = state_in_a_preemptive_battle();
+        s.battle.menu_model_mut().spells = vec![MenuSpell::new(1, "Fire", 0, TargetRule::Enemies)];
+        s.battle.menu_model_mut().items = vec![MenuItem::new(2, "Potion", 1, TargetRule::Allies)];
+        let at = |s: &ClientState| s.battle.view(1.0).and_then(|v| v.menu).map(|m| m.level);
+        // Commands -> Magic -> Target and back out again, Esc at every step.
+        battle_request(BattleKey::Down, &mut s, 1.0);
+        battle_request(BattleKey::Confirm, &mut s, 1.0);
+        battle_request(BattleKey::Confirm, &mut s, 1.0);
+        assert_eq!(at(&s), Some(Level::Target));
+        for want in [Level::Magic, Level::Commands] {
+            assert_eq!(never_quits(&mut s, true), EscapeRoute::Battle, "Esc backs out of the menu");
+            assert_eq!(at(&s), Some(want));
+        }
+        // At the top it is nobody's: the window's own action, which in a battle is to ignore it (and say so).
+        for armed in [false, true] {
+            assert_eq!(never_quits(&mut s, armed), EscapeRoute::Action(EscapeAction::IgnoreInBattle));
+        }
+        assert_eq!(at(&s), Some(Level::Commands), "and it does not close the menu");
+        // In the field it is the window's: the first press arms quitting, a second one quits.
+        let mut field = state_with_peers(&[]);
+        assert_eq!(escape_route(&mut field, 1.0, false), EscapeRoute::Action(EscapeAction::Arm));
+        assert_eq!(escape_route(&mut field, 1.0, true), EscapeRoute::Action(EscapeAction::Quit));
+    }
+
+    #[test]
+    fn after_a_battle_its_panel_takes_confirm_and_back_and_esc_does_not_quit_until_it_is_gone() {
+        use fmv_protocol::{BattleId, BattleReward};
+        let mut s = state_in_a_preemptive_battle();
+        s.apply(
+            10.0,
+            ServerMsg::BattleEnd {
+                battle_id: BattleId(1),
+                outcome: fmv_protocol::battle::Outcome::Victory,
+                rewards: vec![BattleReward { account: AccountId(1), exp: 5, gil: 6, ap: 7 }],
+            },
+        );
+        assert!(!s.battle.in_battle(), "the server freed the player");
+        assert!(s.battle.lingering(10.1), "but the screen lingers on the end");
+        let finale = s.battle.view(10.1).and_then(|v| v.finale).expect("the panel");
+        assert_eq!(finale.reward.map(|r| (r.exp, r.gil, r.ap)), Some((5, 6, 7)));
+        // Too early to close it: the keys are taken and do nothing else (Esc must not arm quitting).
+        for key in [BattleKey::Confirm, BattleKey::Back] {
+            assert_eq!(battle_request(key, &mut s, 10.2), BattleRequest::Menu, "{key:?}");
+        }
+        assert_eq!(escape_route(&mut s, 10.2, false), EscapeRoute::Battle);
+        assert!(s.battle.lingering(10.3), "still there");
+        // Later a key closes it, and then the field's own rules are back.
+        assert_eq!(battle_request(BattleKey::Confirm, &mut s, 12.0), BattleRequest::Menu);
+        assert!(!s.battle.lingering(12.0) && s.battle.view(12.0).is_none());
+        assert_eq!(escape_route(&mut s, 12.1, false), EscapeRoute::Action(EscapeAction::Arm));
     }
 
     fn state_with_peers(peers: &[(u64, f32)]) -> ClientState {

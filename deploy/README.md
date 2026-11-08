@@ -13,6 +13,7 @@ addresses and machine identifiers (`/deploy/*.env` is git-ignored for that reaso
 ## What gets deployed
 
 One tarball from `scripts/package.sh`: `fmv-server`, `fmv-client`, `fmv-import`,
+`ff-multiverse.sh` (the launcher entry point; a server deployment does not use it),
 `README.md`, `LICENSE-NOTICE.txt` and `manifest.json`, and nothing else (an allowlist
 guard enforces this). **It contains no game data.** The `FIXTURE` area needs none; any
 real FF7 area needs the owner's own legally owned copy, imported on that host with

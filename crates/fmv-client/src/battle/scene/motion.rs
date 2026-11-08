@@ -1,5 +1,4 @@
-//! What the actors do: breathe, lunge at their target, flinch, dodge, fall; and the numbers that
-//! float up from whoever was hit.
+//! What the actors do: breathe, lunge at their target, flinch, dodge, fall.
 //!
 //! The engine's events say WHAT happened, instantly; this module spreads it over time. It is a pure
 //! function of the scene clock `t` (seconds) and the effects started so far, so every phase is
@@ -35,6 +34,11 @@ use fmv_ff7_battle::rules::{ActorId, BattleEvent, Side};
 pub const LUNGE_GAP: f32 = 160.0;
 /// How long the lunge's holding pose lasts, in seconds.
 pub const LUNGE_HOLD: f32 = 0.12;
+/// The run up to the target takes this long at the least and at the most, in seconds (it is the
+/// delay between the announcement of a blow and its landing, which the overlay's number shows no
+/// delay for: kept short).
+pub const MIN_LUNGE_OUT: f32 = 0.18;
+pub const MAX_LUNGE_OUT: f32 = 0.30;
 /// How long a flinch blinks (a critical blow: [`FLINCH_BLINK_CRITICAL`]).
 pub const FLINCH_BLINK: f32 = 0.42;
 pub const FLINCH_BLINK_CRITICAL: f32 = 0.66;
@@ -45,9 +49,6 @@ const FLINCH_SHAKE: f32 = 0.30;
 /// How long an enemy takes to collapse, and a party member to fall over.
 pub const COLLAPSE: f32 = 0.85;
 pub const FALL: f32 = 0.55;
-/// How long a number floats over its target, and how high it rises, in seconds and battle units.
-pub const POPUP_LIFE: f32 = 1.05;
-pub const POPUP_RISE: f32 = 650.0;
 /// A death that was not seen coming (the engine says dead, no event was played) is already over
 /// by this long.
 const LONG_AGO: f64 = 1000.0;
@@ -59,8 +60,8 @@ pub const MAX_BACKLOG: f64 = 2.5;
 /// What happened, as the scene tells it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SceneEvent {
-    /// `attacker` struck `target` for `amount`.
-    Hit { attacker: ActorId, target: ActorId, amount: u32, critical: bool },
+    /// `attacker` struck `target`.
+    Hit { attacker: ActorId, target: ActorId, critical: bool },
     /// `attacker`'s blow missed `target`.
     Miss { attacker: ActorId, target: ActorId },
     /// `actor` was reduced to 0 HP.
@@ -71,7 +72,7 @@ pub enum SceneEvent {
 /// the end of the battle, today, and whatever newer engines add). See the module docs.
 pub fn scene_event(event: &BattleEvent) -> Option<SceneEvent> {
     match *event {
-        BattleEvent::Damage { actor, target, amount, critical } => Some(SceneEvent::Hit { attacker: actor, target, amount, critical }),
+        BattleEvent::Damage { actor, target, critical, .. } => Some(SceneEvent::Hit { attacker: actor, target, critical }),
         BattleEvent::Miss { actor, target } => Some(SceneEvent::Miss { attacker: actor, target }),
         BattleEvent::Death { actor } => Some(SceneEvent::Death { actor }),
         _ => None,
@@ -124,29 +125,6 @@ pub fn idle(index: usize, t: f64) -> Idle {
     let phase = index as f64 * 1.9;
     let w = t * std::f64::consts::TAU / 3.4 + phase;
     Idle { breath: 1.0 + 0.025 * w.sin() as f32, sway: 0.05 * (w * 0.5).sin() as f32, bob: 22.0 * (0.5 + 0.5 * w.sin()) as f32 }
-}
-
-/// A number or word that floats up over an actor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PopupKind {
-    Damage { amount: u32, critical: bool },
-    Miss,
-}
-
-/// A popup that is on screen at some instant: who it floats over and how far along it is.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct PopupView {
-    pub actor: usize,
-    pub kind: PopupKind,
-    /// 0 when it appears, 1 when it is gone.
-    pub progress: f32,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct Popup {
-    actor: usize,
-    start: f64,
-    kind: PopupKind,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -229,7 +207,6 @@ pub struct Director {
     deaths: Vec<Option<f64>>,
     /// Until when each actor's lunge occupies it.
     busy_until: Vec<f64>,
-    popups: Vec<Popup>,
 }
 
 impl Director {
@@ -242,7 +219,6 @@ impl Director {
             effects: Vec::new(),
             deaths: vec![None; n],
             busy_until: vec![f64::NEG_INFINITY; n],
-            popups: Vec::new(),
         }
     }
 
@@ -255,12 +231,11 @@ impl Director {
     /// have are ignored.
     pub fn on_event(&mut self, t: f64, event: SceneEvent) {
         match event {
-            SceneEvent::Hit { attacker, target, amount, critical } => {
+            SceneEvent::Hit { attacker, target, critical } => {
                 let Some(impact) = self.strike(t, attacker, target) else { return };
                 let Some((i, _)) = self.anchor(target) else { return };
                 let dir = self.line(attacker, target).map_or([0.0, 1.0], |(d, _)| d);
                 self.effects.push(Effect::Flinch { actor: i, start: impact, critical, dir });
-                self.popups.push(Popup { actor: i, start: impact, kind: PopupKind::Damage { amount, critical } });
             }
             SceneEvent::Miss { attacker, target } => {
                 let Some(impact) = self.strike(t, attacker, target) else { return };
@@ -269,7 +244,6 @@ impl Director {
                 // Step to alternating sides, so a run of misses does not all go the same way.
                 let side = if i % 2 == 0 { 1.0 } else { -1.0 };
                 self.effects.push(Effect::Dodge { actor: i, start: impact, dir: [-dir[1] * side, dir[0] * side] });
-                self.popups.push(Popup { actor: i, start: impact, kind: PopupKind::Miss });
             }
             SceneEvent::Death { actor } => {
                 let Some((i, _)) = self.anchor(actor) else { return };
@@ -304,7 +278,7 @@ impl Director {
         let (_, b) = self.anchor(target)?;
         let (dir, dist) = self.line(attacker, target)?;
         let reach = (dist - a.radius - b.radius - LUNGE_GAP).max(0.0);
-        let out = (0.16 + reach / 9000.0).clamp(0.20, 0.50);
+        let out = (0.14 + reach / 12_000.0).clamp(MIN_LUNGE_OUT, MAX_LUNGE_OUT);
         let start = t.max(self.busy_until.get(ai).copied().unwrap_or(t));
         if start > t + MAX_BACKLOG {
             return None;
@@ -330,10 +304,9 @@ impl Director {
         }
     }
 
-    /// Forget what is over (effects, popups) as of `t`.
+    /// Forget what is over (effects) as of `t`.
     pub fn prune(&mut self, t: f64) {
         self.effects.retain(|e| e.end() > t);
-        self.popups.retain(|p| t < p.start + f64::from(POPUP_LIFE));
         self.busy_until.iter_mut().for_each(|b| {
             if *b <= t {
                 *b = f64::NEG_INFINITY;
@@ -407,19 +380,10 @@ impl Director {
         m
     }
 
-    /// The popups on screen at `t`.
-    pub fn popups(&self, t: f64) -> Vec<PopupView> {
-        self.popups
-            .iter()
-            .filter(|p| t >= p.start && t < p.start + f64::from(POPUP_LIFE))
-            .map(|p| PopupView { actor: p.actor, kind: p.kind, progress: ((t - p.start) as f32 / POPUP_LIFE).clamp(0.0, 1.0) })
-            .collect()
-    }
-
-    /// How much is still being played (tests).
+    /// How many effects are still being played (tests).
     #[cfg(test)]
-    pub fn pending(&self) -> (usize, usize) {
-        (self.effects.len(), self.popups.len())
+    pub fn pending(&self) -> usize {
+        self.effects.len()
     }
 }
 
@@ -434,8 +398,8 @@ mod tests {
         Director::new(sides, vec![at(-500.0, 2000.0), at(500.0, 2000.0), at(-500.0, -1500.0), at(500.0, -1500.0)])
     }
 
-    fn hit(attacker: u8, target: u8, amount: u32, critical: bool) -> SceneEvent {
-        SceneEvent::Hit { attacker: ActorId(attacker), target: ActorId(target), amount, critical }
+    fn hit(attacker: u8, target: u8, critical: bool) -> SceneEvent {
+        SceneEvent::Hit { attacker: ActorId(attacker), target: ActorId(target), critical }
     }
 
     fn near(a: f32, b: f32, tol: f32) -> bool {
@@ -446,7 +410,7 @@ mod tests {
     fn engine_events_map_to_scene_events_and_the_rest_is_ignored() {
         use fmv_ff7_battle::rules::BattleEvent as E;
         let (a, b) = (ActorId(0), ActorId(2));
-        assert_eq!(scene_event(&E::Damage { actor: a, target: b, amount: 42, critical: true }), Some(hit(0, 2, 42, true)));
+        assert_eq!(scene_event(&E::Damage { actor: a, target: b, amount: 42, critical: true }), Some(hit(0, 2, true)));
         assert_eq!(scene_event(&E::Miss { actor: a, target: b }), Some(SceneEvent::Miss { attacker: a, target: b }));
         assert_eq!(scene_event(&E::Death { actor: b }), Some(SceneEvent::Death { actor: b }));
         for ignored in [E::GaugeReady { actor: a }, E::Victory, E::Defeat] {
@@ -457,7 +421,7 @@ mod tests {
     #[test]
     fn a_blow_makes_the_attacker_run_up_to_its_target_and_back() {
         let mut d = director();
-        d.on_event(10.0, hit(0, 3, 30, false));
+        d.on_event(10.0, hit(0, 3, false));
         // Nothing moves before the event.
         assert_eq!(d.motion(0, 9.9), Motion::default());
         let at_start = d.motion(0, 10.0);
@@ -490,7 +454,7 @@ mod tests {
     #[test]
     fn the_target_flinches_when_the_blow_lands_blinking_and_shaking_then_settles() {
         let mut d = director();
-        d.on_event(5.0, hit(0, 2, 30, false));
+        d.on_event(5.0, hit(0, 2, false));
         let Effect::Lunge { out, .. } = d.effects[0] else { panic!() };
         let impact = 5.0 + f64::from(out);
         // Before the impact the target is untouched.
@@ -507,7 +471,7 @@ mod tests {
         // A critical blow blinks longer (still dark half a blink after a normal one is over) and
         // shakes harder.
         let mut c = director();
-        c.on_event(5.0, hit(0, 2, 30, true));
+        c.on_event(5.0, hit(0, 2, true));
         let strong = c.motion(2, impact + 0.02);
         assert!(!c.motion(2, impact + 0.50).visible && d.motion(2, impact + 0.50).visible);
         let magnitude = |m: Motion| m.offset[0].hypot(m.offset[2]);
@@ -515,23 +479,7 @@ mod tests {
     }
 
     #[test]
-    fn a_blow_floats_its_damage_over_the_target_from_the_impact_for_a_while() {
-        let mut d = director();
-        d.on_event(2.0, hit(1, 3, 1234, true));
-        let Effect::Lunge { out, .. } = d.effects[0] else { panic!() };
-        let impact = 2.0 + f64::from(out);
-        assert!(d.popups(impact - 0.01).is_empty(), "not before the blow lands");
-        let shown = d.popups(impact + 0.5);
-        assert_eq!(shown.len(), 1);
-        assert_eq!((shown[0].actor, shown[0].kind), (3, PopupKind::Damage { amount: 1234, critical: true }));
-        assert!(near(shown[0].progress, 0.5 / POPUP_LIFE, 1e-3));
-        assert!(d.popups(impact + f64::from(POPUP_LIFE) + 0.01).is_empty());
-        d.prune(impact + f64::from(POPUP_LIFE) + 5.0);
-        assert_eq!(d.pending(), (0, 0), "everything that is over is forgotten");
-    }
-
-    #[test]
-    fn a_miss_is_a_lunge_and_a_side_step_and_says_miss() {
+    fn a_miss_is_a_lunge_and_a_side_step() {
         let mut d = director();
         d.on_event(0.0, SceneEvent::Miss { attacker: ActorId(1), target: ActorId(3) });
         let Effect::Lunge { out, .. } = d.effects[0] else { panic!() };
@@ -543,7 +491,6 @@ mod tests {
         // Across the line: the attack runs mostly along z, so the step is mostly along x.
         assert!(mid.offset[0].abs() > mid.offset[2].abs(), "{mid:?}");
         assert_eq!(d.motion(3, impact + f64::from(DODGE) + 0.01), Motion::default());
-        assert_eq!(d.popups(impact + 0.1)[0].kind, PopupKind::Miss);
         // Different targets step to different sides.
         d.on_event(3.0, SceneEvent::Miss { attacker: ActorId(1), target: ActorId(2) });
         let a = d.effects.iter().find_map(|e| if let Effect::Dodge { actor: 3, dir, .. } = e { Some(*dir) } else { None }).unwrap();
@@ -554,7 +501,7 @@ mod tests {
     #[test]
     fn an_enemy_that_dies_blinks_collapses_and_is_gone_after_the_blow_has_played() {
         let mut d = director();
-        d.on_event(1.0, hit(0, 2, 99, false));
+        d.on_event(1.0, hit(0, 2, false));
         d.on_event(1.0, SceneEvent::Death { actor: ActorId(2) });
         let flinch_end = d.effects.iter().filter(|e| matches!(e, Effect::Flinch { .. })).map(Effect::end).next().unwrap();
         // Standing (flinching) until the blow has played out.
@@ -585,7 +532,7 @@ mod tests {
     #[test]
     fn a_party_member_who_dies_falls_over_and_stays_down_until_revived() {
         let mut d = director();
-        d.on_event(0.0, hit(2, 1, 500, false));
+        d.on_event(0.0, hit(2, 1, false));
         d.on_event(0.0, SceneEvent::Death { actor: ActorId(1) });
         let start = d.deaths[1].unwrap();
         assert_eq!(d.motion(1, start - 0.01).fall, 0.0);
@@ -624,14 +571,14 @@ mod tests {
     #[test]
     fn blows_that_arrive_together_are_played_one_after_the_other_by_the_same_attacker() {
         let mut d = director();
-        d.on_event(4.0, hit(0, 2, 10, false));
-        d.on_event(4.0, hit(0, 3, 10, false));
+        d.on_event(4.0, hit(0, 2, false));
+        d.on_event(4.0, hit(0, 3, false));
         let starts: Vec<f64> = d.effects.iter().filter_map(|e| if let Effect::Lunge { start, .. } = e { Some(*start) } else { None }).collect();
         assert_eq!(starts.len(), 2);
         let first_end = d.effects.iter().find(|e| matches!(e, Effect::Lunge { .. })).unwrap().end();
         assert!(near(starts[1] as f32, first_end as f32, 1e-4), "the second lunge starts when the first is over: {starts:?}");
         // Another attacker is not held up by it.
-        d.on_event(4.0, hit(1, 2, 10, false));
+        d.on_event(4.0, hit(1, 2, false));
         let third = d.effects.iter().rev().find_map(|e| if let Effect::Lunge { actor: 1, start, .. } = e { Some(*start) } else { None }).unwrap();
         assert_eq!(third, 4.0);
     }
@@ -640,12 +587,12 @@ mod tests {
     fn a_flood_of_blows_is_not_played_as_a_backlog_that_lags_the_fight() {
         let mut d = director();
         for _ in 0..500 {
-            d.on_event(10.0, hit(0, 2, 5, false));
+            d.on_event(10.0, hit(0, 2, false));
         }
         let lunges: Vec<f64> = d.effects.iter().filter_map(|e| if let Effect::Lunge { start, .. } = e { Some(*start) } else { None }).collect();
         assert!(!lunges.is_empty() && lunges.len() < 10, "{} lunges", lunges.len());
         assert!(lunges.iter().all(|&s| s <= 10.0 + MAX_BACKLOG), "none starts further ahead than the backlog allows");
-        assert!(d.effects.len() < 30 && d.popups.len() < 10, "the rest were dropped, not queued: {:?}", d.pending());
+        assert!(d.effects.len() < 30, "the rest were dropped, not queued: {}", d.pending());
         // A death still counts, whatever was dropped.
         d.on_event(10.0, SceneEvent::Death { actor: ActorId(2) });
         assert!(d.deaths[2].is_some());
@@ -655,22 +602,21 @@ mod tests {
     fn nonsense_never_breaks_anything() {
         let mut d = director();
         // Actors the scene does not have, an attacker that is its own target, a target on top of it.
-        d.on_event(0.0, hit(99, 2, 1, false));
-        d.on_event(0.0, hit(0, 99, 1, false));
+        d.on_event(0.0, hit(99, 2, false));
+        d.on_event(0.0, hit(0, 99, false));
         d.on_event(0.0, SceneEvent::Miss { attacker: ActorId(200), target: ActorId(0) });
         d.on_event(0.0, SceneEvent::Death { actor: ActorId(77) });
-        d.on_event(1.0, hit(2, 2, 7, false));
+        d.on_event(1.0, hit(2, 2, false));
         assert_eq!(d.effects.iter().filter(|e| matches!(e, Effect::Lunge { .. })).count(), 1, "only the self-blow was playable");
         for t in [-5.0, 0.0, 1.0, 1.3, 2.0, 1e9] {
             for i in 0..6 {
                 let m = d.motion(i, t);
                 assert!(m.offset.iter().all(|c| c.is_finite()) && m.squash.is_finite() && m.fall.is_finite(), "{i} at {t}: {m:?}");
             }
-            assert!(d.popups(t).iter().all(|p| p.progress.is_finite()));
         }
         // No actors, no panics.
         let mut none = Director::new(vec![], vec![]);
-        none.on_event(0.0, hit(0, 1, 1, false));
+        none.on_event(0.0, hit(0, 1, false));
         none.sync(0.0, |_| Some(false));
         none.prune(1.0);
         assert_eq!(none.motion(0, 0.0), Motion::default());
