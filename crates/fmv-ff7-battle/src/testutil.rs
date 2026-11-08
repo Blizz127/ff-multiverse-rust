@@ -13,7 +13,9 @@ use crate::kernel::{
     SECTION_TEXT_MATERIA_NAMES, SECTION_TEXT_WEAPON_NAMES, WEAPON_RECORD_SIZE,
 };
 use crate::scene::layout::*;
-use crate::scene::{ATTACK_RECORD_SIZE, BLOCK_HEADER_SIZE, BLOCK_POINTERS, BLOCK_SIZE, SCENE_SIZE};
+use crate::scene::{
+    AttackRecord, ATTACK_RECORD_SIZE, BLOCK_HEADER_SIZE, BLOCK_POINTERS, BLOCK_SIZE, SCENE_SIZE,
+};
 use crate::text;
 
 pub fn gzip(data: &[u8]) -> Vec<u8> {
@@ -459,6 +461,7 @@ pub fn attack_section() -> Vec<u8> {
     // Record 3 stays the plain physical attack above: Restore's third spell slot names it, which
     // is the case of a materia that points at something that is not a castable spell.
     #[rustfmt::skip]
+    #[allow(clippy::type_complexity)] // a table of record rows
     let spells: [(usize, u16, u8, u8, u8, u8, u16, u16, u32); 14] = [
         (0, 5, 0x25, 5, 255, 0x0D, 0x0200, 0xFDFF, 0xFFFF_FFFF),    // Cure
         (1, 24, 0x25, 35, 255, 0x0D, 0x0200, 0xFDFF, 0xFFFF_FFFF),  // Cure2
@@ -499,6 +502,7 @@ pub fn item_section() -> Vec<u8> {
     let mut s = vec![0xFFu8; ITEM_COUNT * ITEM_RECORD_SIZE];
     // index, restrictions, targets, calc, power, element, special flags, status
     #[rustfmt::skip]
+    #[allow(clippy::type_complexity)] // a table of record rows
     let items: [(usize, u16, u8, u8, u8, u16, u16, u32); 11] = [
         (0, 0xFFF8, 0x01, 0x26, 5, 0x0200, 0xFFFF, 0xFFFF_FFFF),
         (1, 0xFFF8, 0x01, 0x26, 25, 0x0200, 0xFFFF, 0xFFFF_FFFF),
@@ -559,6 +563,38 @@ pub fn materia_section() -> Vec<u8> {
     s[o + 0x0D] = 0x16;
     s[o + 0x0E..o + 0x14].copy_from_slice(&[5, 17, 0xFF, 0xFF, 0xFF, 0xFF]);
     s
+}
+
+/// An attack record with these numbers, no extra effect and no status.
+pub fn attack_record(
+    calc: u8,
+    power: u8,
+    accuracy: u8,
+    target_flags: u8,
+    element_mask: u16,
+    special_flags: u16,
+    mp_cost: u16,
+) -> AttackRecord {
+    AttackRecord {
+        accuracy,
+        impact_effect: 0,
+        hurt_action: 0,
+        mp_cost,
+        impact_sound: 0,
+        camera_single: 0,
+        camera_multi: 0,
+        target_flags,
+        attack_effect: 0,
+        damage_calc: calc,
+        power,
+        condition_submenu: 0,
+        status_chance_mode: 0xFF,
+        extra_effect: 0xFF,
+        extra_effect_param: 0xFF,
+        status_mask: 0xFFFF_FFFF,
+        element_mask,
+        special_flags,
+    }
 }
 
 /// A text table of `len` strings, empty except for the given `(index, text)` entries.

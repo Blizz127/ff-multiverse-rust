@@ -1460,7 +1460,7 @@ mod tests {
     use super::*;
     use crate::kernel::Kernel;
     use crate::scene::SceneBin;
-    use crate::testutil::{demo_scene, gzip, pack_scene_bin, synthetic_kernel_bytes};
+    use crate::testutil::{attack_record, demo_scene, gzip, pack_scene_bin, synthetic_kernel_bytes};
 
     fn fighter(name: &str, level: u8, hp: u32, attack: u32, defense: u32, dex: u32) -> Combatant {
         let mut c = Combatant::new(name, level, hp);
@@ -2437,6 +2437,1019 @@ mod tests {
         assert_eq!(play_out(&mut replay, 5000), log);
     }
 
+    // --- magic, items, Defend, elements and the enemies' own attacks ---
+    //
+    // These fixtures use hand-made combatants whose numbers are easy to follow by hand. Enemies that
+    // must not act have Dex 0 (their gauge never fills); heroes start from empty gauges
+    // (`zero_start`) and `wait_ready` runs the clock until they can act, so the RNG is untouched and
+    // the draws of one command can be replayed in the test and compared with `state.rng`.
+
+    #[allow(clippy::too_many_arguments)] // a table row of an attack record, spelled out
+    fn spell(index: u16, calc: u8, power: u8, accuracy: u8, targets: u8, element: u16, flags: u16, mp: u16) -> Spell {
+        Spell::from_attack(index, &attack_record(calc, power, accuracy, targets, element, flags, mp))
+            .expect("a castable spell")
+    }
+
+    fn fire() -> Spell {
+        spell(27, 0x22, 8, 100, 0x0F, element::FIRE, 0xFDFF, 4)
+    }
+
+    fn cure() -> Spell {
+        spell(0, 0x25, 5, 255, 0x0D, element::RESTORATIVE, 0xFDFF, 5)
+    }
+
+    fn life() -> Spell {
+        spell(7, 0x24, 8, 255, 0x0D, element::RESTORATIVE, 0xFCFD, 34)
+    }
+
+    /// Level 10, 500 HP, 50 MP, Magic 20, Strength 30, Cure, Fire and Life.
+    fn mage() -> Combatant {
+        let mut c = Combatant::new("Mage", 10, 500);
+        c.mp = 50;
+        c.max_mp = 50;
+        c.magic = 20;
+        c.attack = 30;
+        c.defense = 10;
+        c.dex = 40;
+        c.spells = vec![cure(), fire(), life()];
+        c
+    }
+
+    /// A dead party member (400 max HP).
+    fn corpse() -> Combatant {
+        let mut c = Combatant::new("Corpse", 10, 400);
+        c.hp = 0;
+        c.mp = 20;
+        c.max_mp = 20;
+        c.dex = 40;
+        c
+    }
+
+    /// An enemy that stands there: 1000 HP, no defense, magic defense 8, never acts.
+    fn dummy() -> Combatant {
+        let mut c = Combatant::new("Dummy", 5, 1000);
+        c.magic_defense = 8;
+        c
+    }
+
+    fn item_table() -> Arc<ItemTable> {
+        Arc::new(ItemTable::from_kernel(&Kernel::parse(&synthetic_kernel_bytes()).unwrap()))
+    }
+
+    fn battle(party: Vec<Combatant>, enemies: Vec<Combatant>, seed: u64) -> BattleState {
+        BattleState::with_config(seed, party, enemies, zero_start()).with_items(item_table())
+    }
+
+    /// Run the clock until `who` can act.
+    fn wait_ready(state: &mut BattleState, who: ActorId) {
+        for _ in 0..5000 {
+            if state.actor(who).is_some_and(|c| c.ready) {
+                return;
+            }
+            state.step(100);
+        }
+        panic!("{who:?} never became ready");
+    }
+
+    /// The generator after the draws a command is documented to make.
+    fn rng_after(seed: u64, draws: impl FnOnce(&mut Rng)) -> Rng {
+        let mut rng = Rng::new(seed);
+        draws(&mut rng);
+        rng
+    }
+
+    fn hero() -> ActorId {
+        ActorId(0)
+    }
+
+    fn foe() -> ActorId {
+        ActorId(1)
+    }
+
+    #[test]
+    fn the_formulas_are_hand_computed() {
+        let (me, target) = (mage(), dummy());
+        let dmg = |spec: &ActionSpec, who: &Combatant, victim: &Combatant, elemental, variance| {
+            action_damage(spec, who, victim, elemental, Rolls { critical: false, variance })
+        };
+        // Fire (spell formula): (Lvl 10 + Mag 20) * 6 = 180; 180 * (512 - MDef 8) * Power 8 >> 13 = 88; the
+        // variance scales 3841..=4096 of 4096 (82 at the bottom).
+        assert_eq!(dmg(&fire().spec, &me, &target, Elemental::Normal, 255), 88);
+        assert_eq!(dmg(&fire().spec, &me, &target, Elemental::Normal, 0), 82);
+        // Weak: doubled before the variance; resistant: halved.
+        assert_eq!(dmg(&fire().spec, &me, &target, Elemental::Double, 255), 176);
+        assert_eq!(dmg(&fire().spec, &me, &target, Elemental::Half, 255), 44);
+        // The standard formula with magic: Stat 20 at level 10: x = 200 / 32 = 6, y = 30 / 32 = 0, base 20;
+        // 20 * 504 * 16 >> 13 = 19.
+        let standard_magic = spell(1, 0x21, 16, 100, 0x0F, 0, 0xFFFF, 0);
+        assert_eq!(dmg(&standard_magic.spec, &me, &target, Elemental::Normal, 255), 19);
+        // Demi: a quarter of the target's CURRENT HP (8 / 32), no variance.
+        let demi = spell(42, 0x23, 8, 75, 0x0F, element::GRAVITY, 0xFFFF, 14);
+        assert_eq!(dmg(&demi.spec, &me, &target, Elemental::Normal, 0), 250);
+        let mut hurt = dummy();
+        hurt.hp = 400;
+        assert_eq!(dmg(&demi.spec, &me, &hurt, Elemental::Normal, 0), 100);
+        // The max-HP fraction as damage (not restorative), the flat one, Cure's formula as damage and the
+        // fixed one that defense reduces (magic defense 8 for magic, defense 0 for a physical one).
+        let gravity_max = spell(2, 0x24, 16, 100, 0x0F, element::GRAVITY, 0xFFFF, 0);
+        assert_eq!(dmg(&gravity_max.spec, &me, &target, Elemental::Normal, 0), 500);
+        let flat = spell(3, 0x26, 12, 100, 0x0F, element::GRAVITY, 0xFFFF, 0);
+        assert_eq!(dmg(&flat.spec, &me, &target, Elemental::Normal, 0), 240);
+        let restore_formula = spell(4, 0x25, 10, 100, 0x0F, element::GRAVITY, 0xFFFF, 0);
+        assert_eq!(dmg(&restore_formula.spec, &me, &target, Elemental::Normal, 255), 400, "22 * 10 + 6 * 30");
+        let fixed_magic = spell(5, 0x27, 16, 100, 0x0F, 0, 0xFFFF, 0);
+        assert_eq!(dmg(&fixed_magic.spec, &me, &target, Elemental::Normal, 255), 252);
+        let grenade = ItemTable::from_kernel(&Kernel::parse(&synthetic_kernel_bytes()).unwrap()).get(20).unwrap().spec;
+        assert_eq!(dmg(&grenade, &me, &target, Elemental::Normal, 255), 160, "512 * 10 / 32");
+        // The attack command: Str 30, level 10: base 30 + 9 * 1 = 39; 39 * 512 * 16 >> 13 = 39; a critical
+        // hit doubles it, Defend halves it (physical damage only).
+        let attack = me.attack_spec();
+        assert_eq!(dmg(&attack, &me, &target, Elemental::Normal, 255), 39);
+        assert_eq!(action_damage(&attack, &me, &target, Elemental::Normal, Rolls { critical: true, variance: 255 }), 78);
+        let mut guard = dummy();
+        guard.defending = true;
+        assert_eq!(dmg(&attack, &me, &guard, Elemental::Normal, 255), 19);
+        assert_eq!(dmg(&fire().spec, &me, &guard, Elemental::Normal, 255), 88, "a guard does not stop magic");
+        // Pierce: a cleared 0x0400 flag leaves defense out (magic defense 8 -> 0: 180 * 512 * 8 >> 13 = 90).
+        let piercing = spell(6, 0x22, 8, 100, 0x0F, element::FIRE, 0xFBFF, 0);
+        assert_eq!(dmg(&piercing.spec, &me, &target, Elemental::Normal, 255), 90);
+        // The damage never drops under 1 or passes the cap, whatever the stats.
+        let weak = Combatant::new("Weak", 1, 10);
+        assert_eq!(dmg(&fire().spec, &weak, &target, Elemental::Half, 0), 1);
+        let mut god = mage();
+        god.magic = u32::MAX;
+        god.level = 255;
+        assert_eq!(dmg(&spell(8, 0x22, 255, 100, 0x0F, 0, 0xFFFF, 0).spec, &god, &Combatant::new("T", 1, 1), Elemental::Double, 255), MAX_DAMAGE);
+
+        // Restoring: Cure (22 * 5 + 6 * (10 + 20) = 290, with the variance), Life and Phoenix Down (max HP * 8 / 32),
+        // a potion's 20 * Power, an Ether on MP, a Turbo Ether (all the MP) and an Elixir (everything).
+        let ally = mage();
+        assert_eq!(restore_amount(&cure().spec, &me, &ally, 255), 290);
+        assert_eq!(restore_amount(&cure().spec, &me, &ally, 0), 271);
+        let table = item_table();
+        let spec = |item: u16| table.get(item).unwrap().spec;
+        assert_eq!(restore_amount(&life().spec, &me, &ally, 0), 125);
+        assert_eq!(restore_amount(&spec(7), &me, &ally, 0), 125);
+        assert_eq!(restore_amount(&spec(0), &me, &ally, 0), 100);
+        assert_eq!(restore_amount(&spec(1), &me, &ally, 0), 500);
+        assert_eq!(restore_amount(&spec(2), &me, &ally, 0), 500, "X-Potion: all the max HP");
+        assert_eq!(restore_amount(&spec(3), &me, &ally, 0), 100, "Ether: 20 * 5 MP");
+        assert_eq!(restore_amount(&spec(4), &me, &ally, 0), 50, "Turbo Ether: all the max MP");
+        assert_eq!(restore_amount(&spec(5), &me, &ally, 0), 500);
+    }
+
+    #[test]
+    fn a_damaging_spell_costs_mp_rolls_to_hit_and_follows_the_spell_formula() {
+        let seed = 31;
+        let mut state = battle(vec![mage()], vec![dummy()], seed);
+        wait_ready(&mut state, hero());
+        let events = state.submit_command(hero(), Command::Magic { spell: 27, target: foe() }).unwrap();
+        // The draws, replayed: the roll to hit (a magical action has no luck roll), then the variance.
+        let mut replay = Rng::new(seed);
+        let miss_roll = percent_roll(replay.next_u16());
+        let variance = replay.range_inclusive(0, 255);
+        assert!(miss_roll <= 100, "Fire's 100% cannot miss");
+        let amount = action_damage(&fire().spec, &mage(), &dummy(), Elemental::Normal, Rolls { critical: false, variance });
+        assert!((82..=88).contains(&amount));
+        assert_eq!(
+            events,
+            vec![
+                BattleEvent::Action { actor: hero(), action: ActionRef::Magic(27) },
+                BattleEvent::MpSpent { actor: hero(), amount: 4 },
+                BattleEvent::Damage { actor: hero(), target: foe(), amount, critical: false },
+            ]
+        );
+        assert_eq!(state.rng, replay, "exactly those two draws, in that order");
+        let me = state.actor(hero()).unwrap();
+        assert_eq!((me.mp, me.gauge, me.ready), (46, 0, false), "4 MP paid, the turn is spent");
+        assert_eq!(state.actor(foe()).unwrap().hp, 1000 - amount);
+    }
+
+    #[test]
+    fn a_spell_that_misses_says_so_and_still_costs_the_mp() {
+        // Demi's 75% misses for some rolls: find a seed where the roll is above 75.
+        let demi = spell(42, 0x23, 8, 75, 0x0F, element::GRAVITY, 0xFFFF, 14);
+        let mut caster = mage();
+        caster.spells.push(demi);
+        let miss_seed = (0..200u64)
+            .find(|&seed| percent_roll(Rng::new(seed).next_u16()) > 75)
+            .expect("a seed with a high roll");
+        let mut state = battle(vec![caster.clone()], vec![dummy()], miss_seed);
+        wait_ready(&mut state, hero());
+        let events = state.submit_command(hero(), Command::Magic { spell: 42, target: foe() }).unwrap();
+        assert_eq!(
+            events,
+            vec![
+                BattleEvent::Action { actor: hero(), action: ActionRef::Magic(42) },
+                BattleEvent::MpSpent { actor: hero(), amount: 14 },
+                BattleEvent::Miss { actor: hero(), target: foe() },
+            ]
+        );
+        assert_eq!(state.rng, rng_after(miss_seed, |r| _ = r.next_u16()), "a miss draws only the roll to hit");
+        assert_eq!(state.actor(hero()).unwrap().mp, 36);
+        assert_eq!(state.actor(foe()).unwrap().hp, 1000);
+        // And a seed with a low roll hits for a quarter of the target's current HP, with no variance draw.
+        let hit_seed = (0..200u64).find(|&seed| percent_roll(Rng::new(seed).next_u16()) <= 75).unwrap();
+        let mut state = battle(vec![caster], vec![dummy()], hit_seed);
+        wait_ready(&mut state, hero());
+        let events = state.submit_command(hero(), Command::Magic { spell: 42, target: foe() }).unwrap();
+        assert_eq!(events[2], BattleEvent::Damage { actor: hero(), target: foe(), amount: 250, critical: false });
+        assert_eq!(state.rng, rng_after(hit_seed, |r| _ = r.next_u16()), "Demi has no variance: one draw");
+    }
+
+    #[test]
+    fn a_magic_hit_can_win_the_battle() {
+        let mut weak = dummy();
+        weak.hp = 10;
+        weak.max_hp = 10;
+        weak.reward = Reward { exp: 5, gil: 6, ap: 1 };
+        let mut state = battle(vec![mage()], vec![weak], 3);
+        wait_ready(&mut state, hero());
+        let events = state.submit_command(hero(), Command::Magic { spell: 27, target: foe() }).unwrap();
+        assert!(matches!(events[2], BattleEvent::Damage { .. }));
+        assert_eq!(events[3..], [BattleEvent::Death { actor: foe() }, BattleEvent::Victory]);
+        assert_eq!(state.outcome(), Some(Outcome::Victory));
+        assert_eq!(state.rewards(), Reward { exp: 5, gil: 6, ap: 1 });
+        assert_eq!(state.submit_command(hero(), Command::Defend), Err(CommandError::BattleOver));
+    }
+
+    #[test]
+    fn cure_heals_with_a_variance_roll_and_never_more_than_is_missing() {
+        let seed = 77;
+        let mut hurt = mage();
+        hurt.hp = 100;
+        let mut state = battle(vec![hurt.clone()], vec![dummy()], seed);
+        wait_ready(&mut state, hero());
+        let events = state.submit_command(hero(), Command::Magic { spell: 0, target: hero() }).unwrap();
+        // Restoring never rolls to hit: the one draw is the variance.
+        let mut replay = Rng::new(seed);
+        let variance = replay.range_inclusive(0, 255);
+        let amount = restore_amount(&cure().spec, &hurt, &hurt, variance);
+        assert!((271..=290).contains(&amount));
+        assert_eq!(
+            events,
+            vec![
+                BattleEvent::Action { actor: hero(), action: ActionRef::Magic(0) },
+                BattleEvent::MpSpent { actor: hero(), amount: 5 },
+                BattleEvent::Heal { actor: hero(), target: hero(), amount },
+            ]
+        );
+        assert_eq!(state.rng, replay);
+        assert_eq!(state.actor(hero()).unwrap().hp, 100 + amount);
+        assert_eq!(state.actor(hero()).unwrap().mp, 45);
+
+        // One HP short of full: one HP is healed, and that is what the event says.
+        let mut nearly = mage();
+        nearly.hp = 499;
+        let mut state = battle(vec![nearly], vec![dummy()], seed);
+        wait_ready(&mut state, hero());
+        let events = state.submit_command(hero(), Command::Magic { spell: 0, target: hero() }).unwrap();
+        assert_eq!(events[2], BattleEvent::Heal { actor: hero(), target: hero(), amount: 1 });
+        assert_eq!(state.actor(hero()).unwrap().hp, 500);
+        // At full health it is a wasted spell, reported as a heal of 0.
+        let events = {
+            wait_ready(&mut state, hero());
+            state.submit_command(hero(), Command::Magic { spell: 0, target: hero() }).unwrap()
+        };
+        assert_eq!(events[2], BattleEvent::Heal { actor: hero(), target: hero(), amount: 0 });
+    }
+
+    #[test]
+    fn spell_commands_are_validated_in_a_fixed_order_and_check_command_agrees() {
+        let mut party = vec![mage(), corpse()];
+        party[0].mp = 10;
+        let mut dead_enemy = dummy();
+        dead_enemy.hp = 0;
+        let mut state = battle(party, vec![dummy(), dead_enemy], 9);
+        let magic = |spell, target: u8| Command::Magic { spell, target: ActorId(target) };
+        // The gauge comes first, then everything about the command itself.
+        assert_eq!(state.check_command(hero(), &magic(27, 2)), Err(CommandError::GaugeNotFull(hero())));
+        wait_ready(&mut state, hero());
+        let cases: Vec<(Command, Result<(), CommandError>)> = vec![
+            (magic(99, 2), Err(CommandError::UnknownSpell(99))),
+            (magic(27, 9), Err(CommandError::UnknownTarget(ActorId(9)))),
+            (magic(27, 0), Err(CommandError::InvalidTarget(ActorId(0)))), // Fire on an ally
+            (magic(0, 2), Err(CommandError::InvalidTarget(ActorId(2)))),  // Cure on an enemy
+            (magic(27, 3), Err(CommandError::TargetDead(ActorId(3)))),
+            (magic(0, 1), Err(CommandError::TargetDead(ActorId(1)))),     // Cure on a dead ally
+            // The MP is checked before the target: Life costs 34 and the mage has 10.
+            (magic(7, 1), Err(CommandError::NotEnoughMp(hero()))),
+            (magic(7, 0), Err(CommandError::NotEnoughMp(hero()))),
+            (magic(27, 2), Ok(())),
+            (magic(0, 0), Ok(())),
+            (Command::Defend, Ok(())),
+        ];
+        let before = state.clone();
+        for (command, expected) in &cases {
+            assert_eq!(state.check_command(hero(), command), *expected, "{command:?}");
+            assert_eq!(state, before, "checking changes nothing ({command:?})");
+        }
+        // Every refusal changes nothing either (no MP paid, no draw, no event, the gauge stays full).
+        for (command, expected) in &cases {
+            if let Err(e) = expected {
+                assert_eq!(state.submit_command(hero(), *command), Err(*e), "{command:?}");
+                assert_eq!(state, before, "a refused command changes nothing ({command:?})");
+            }
+        }
+        // The same checks for an enemy, a dead hero and an unknown actor.
+        assert_eq!(state.check_command(ActorId(2), &Command::Defend), Err(CommandError::NotControllable(ActorId(2))));
+        assert_eq!(state.check_command(ActorId(1), &Command::Defend), Err(CommandError::ActorDead(ActorId(1))));
+        assert_eq!(state.check_command(ActorId(9), &Command::Defend), Err(CommandError::UnknownActor(ActorId(9))));
+        // With enough MP, Life brings the dead back, and only the dead.
+        let mut rich = battle(vec![mage(), corpse()], vec![dummy()], 9);
+        wait_ready(&mut rich, hero());
+        assert_eq!(rich.check_command(hero(), &magic(7, 1)), Ok(()));
+        assert_eq!(rich.check_command(hero(), &magic(7, 0)), Err(CommandError::TargetNotDead(hero())));
+        assert_eq!(rich.check_command(hero(), &magic(7, 2)), Err(CommandError::InvalidTarget(ActorId(2))));
+    }
+
+    #[test]
+    fn life_and_phoenix_down_revive_with_a_fraction_of_max_hp_and_an_empty_gauge() {
+        let mut state = battle(vec![mage(), corpse(), corpse()], vec![dummy()], 12);
+        wait_ready(&mut state, hero());
+        let events = state.submit_command(hero(), Command::Magic { spell: 7, target: ActorId(1) }).unwrap();
+        // Life: 400 * 8 / 32 = 100 HP, 34 MP, no draws (not a formula with variance, it never misses).
+        assert_eq!(
+            events,
+            vec![
+                BattleEvent::Action { actor: hero(), action: ActionRef::Magic(7) },
+                BattleEvent::MpSpent { actor: hero(), amount: 34 },
+                BattleEvent::Revive { actor: hero(), target: ActorId(1), hp: 100 },
+            ]
+        );
+        assert_eq!(state.rng, Rng::new(12));
+        let revived = state.actor(ActorId(1)).unwrap();
+        assert_eq!((revived.hp, revived.gauge, revived.ready), (100, 0, false));
+        assert!(revived.is_alive());
+        // A revived ally is no longer a target for another revival, and fights on (its gauge fills again).
+        wait_ready(&mut state, hero());
+        assert_eq!(
+            state.check_command(hero(), &Command::Item { item: 7, target: ActorId(1) }),
+            Err(CommandError::TargetNotDead(ActorId(1)))
+        );
+        wait_ready(&mut state, ActorId(1));
+        // Phoenix Down (item 7) on the other one: the same fraction, no MP, still no draw.
+        let events = state.submit_command(hero(), Command::Item { item: 7, target: ActorId(2) }).unwrap();
+        assert_eq!(
+            events,
+            vec![
+                BattleEvent::Action { actor: hero(), action: ActionRef::Item(7) },
+                BattleEvent::Revive { actor: hero(), target: ActorId(2), hp: 100 },
+            ]
+        );
+        assert_eq!(state.actor(hero()).unwrap().mp, 16, "the item cost no MP");
+    }
+
+    #[test]
+    fn items_restore_hp_and_mp_by_their_own_numbers_and_never_roll() {
+        let seed = 5;
+        let mut me = mage();
+        me.hp = 100;
+        me.max_hp = 2000;
+        me.mp = 10;
+        me.max_mp = 150;
+        let mut state = battle(vec![me], vec![dummy()], seed);
+        let item = |item: u16| Command::Item { item, target: hero() };
+        let cases: [(u16, Vec<BattleEvent>); 5] = [
+            // Potion: 20 * 5 = 100.
+            (0, vec![BattleEvent::Heal { actor: hero(), target: hero(), amount: 100 }]),
+            // Hi-Potion: 20 * 25 = 500.
+            (1, vec![BattleEvent::Heal { actor: hero(), target: hero(), amount: 500 }]),
+            // X-Potion: all the max HP (2000), limited to what is missing (2000 - 700 = 1300).
+            (2, vec![BattleEvent::Heal { actor: hero(), target: hero(), amount: 1300 }]),
+            // Ether: 100 MP of the 140 missing.
+            (3, vec![BattleEvent::MpRestored { actor: hero(), target: hero(), amount: 100 }]),
+            // Elixir: HP (nothing is missing) and the MP that is (40).
+            (
+                5,
+                vec![
+                    BattleEvent::Heal { actor: hero(), target: hero(), amount: 0 },
+                    BattleEvent::MpRestored { actor: hero(), target: hero(), amount: 40 },
+                ],
+            ),
+        ];
+        for (id, effects) in cases {
+            wait_ready(&mut state, hero());
+            let events = state.submit_command(hero(), item(id)).unwrap();
+            let mut expected = vec![BattleEvent::Action { actor: hero(), action: ActionRef::Item(id) }];
+            expected.extend(effects);
+            assert_eq!(events, expected, "item {id}");
+            assert_eq!(state.rng, Rng::new(seed), "item {id}: a potion draws nothing");
+        }
+        let me = state.actor(hero()).unwrap();
+        assert_eq!((me.hp, me.mp), (2000, 150));
+        // The same item can be used again and again: the engine has no inventory.
+        for _ in 0..3 {
+            wait_ready(&mut state, hero());
+            assert!(state.submit_command(hero(), item(0)).is_ok());
+        }
+    }
+
+    #[test]
+    fn a_damage_item_hurts_an_enemy_and_rolls_only_the_variance() {
+        let seed = 14;
+        let mut state = battle(vec![mage()], vec![dummy()], seed);
+        wait_ready(&mut state, hero());
+        let events = state.submit_command(hero(), Command::Item { item: 20, target: foe() }).unwrap();
+        let mut replay = Rng::new(seed);
+        let variance = replay.range_inclusive(0, 255);
+        // Grenade never misses and cannot be a critical hit; its damage is (512 - Def) * 10 / 32 = 160 with variance.
+        let amount = 160 * (3841 + u64::from(variance)) / 4096;
+        assert_eq!(
+            events,
+            vec![
+                BattleEvent::Action { actor: hero(), action: ActionRef::Item(20) },
+                BattleEvent::Damage { actor: hero(), target: foe(), amount: amount as u32, critical: false },
+            ]
+        );
+        assert_eq!(state.rng, replay);
+    }
+
+    #[test]
+    fn item_commands_are_validated_by_the_item_table_and_the_side_of_the_target() {
+        let mut state = battle(vec![mage(), corpse()], vec![dummy()], 4);
+        wait_ready(&mut state, hero());
+        let item = |item, target: u8| Command::Item { item, target: ActorId(target) };
+        let cases: Vec<(Command, Result<(), CommandError>)> = vec![
+            // Not in the table: Megalixir hits everyone at once, Antidote is a status, 100 forbids battle use.
+            (item(6, 0), Err(CommandError::UnknownItem(6))),
+            (item(8, 0), Err(CommandError::UnknownItem(8))),
+            (item(100, 0), Err(CommandError::UnknownItem(100))),
+            (item(127, 0), Err(CommandError::UnknownItem(127))),
+            (item(5000, 0), Err(CommandError::UnknownItem(5000))),
+            (item(0, 9), Err(CommandError::UnknownTarget(ActorId(9)))),
+            (item(0, 2), Err(CommandError::InvalidTarget(ActorId(2)))), // Potion on an enemy
+            (item(20, 0), Err(CommandError::InvalidTarget(hero()))),    // Grenade on an ally
+            (item(0, 1), Err(CommandError::TargetDead(ActorId(1)))),    // Potion on a dead ally
+            (item(7, 0), Err(CommandError::TargetNotDead(hero()))),     // Phoenix Down on a living one
+            (item(7, 2), Err(CommandError::InvalidTarget(ActorId(2)))), // ... or an enemy
+            (item(0, 0), Ok(())),
+            (item(3, 0), Ok(())),
+            (item(7, 1), Ok(())),
+            (item(20, 2), Ok(())),
+        ];
+        let before = state.clone();
+        for (command, expected) in &cases {
+            assert_eq!(state.check_command(hero(), command), *expected, "{command:?}");
+            if let Err(e) = expected {
+                assert_eq!(state.submit_command(hero(), *command), Err(*e), "{command:?}");
+                assert_eq!(state, before, "{command:?}");
+            }
+        }
+        // What a menu asks of the engine about an item.
+        assert_eq!(state.item_info(0).map(|i| (i.kind, i.targets_allies, i.revives)), Some((ItemKind::RestoreHp, true, false)));
+        assert_eq!(state.item_info(7).map(|i| (i.kind, i.targets_allies, i.revives)), Some((ItemKind::Revive, true, true)));
+        assert_eq!(state.item_info(20).map(|i| (i.kind, i.targets_allies)), Some((ItemKind::Damage, false)));
+        assert!(state.item_info(6).is_none() && state.items().len() == 8);
+        // A battle without an item table refuses every item.
+        let mut bare = BattleState::with_config(4, vec![mage()], vec![dummy()], zero_start());
+        wait_ready(&mut bare, hero());
+        assert_eq!(bare.check_command(hero(), &item(0, 0)), Err(CommandError::UnknownItem(0)));
+        assert!(bare.items().is_empty());
+    }
+
+    #[test]
+    fn defend_halves_physical_damage_until_the_next_turn_and_draws_nothing() {
+        // The brute is faster than the hero's second gauge fill (it hits at tick ~541; the hero is ready
+        // at 361 and again at 722), so its first blow lands while the hero guards.
+        let brute = || {
+            let mut c = Combatant::new("Brute", 10, 5000);
+            c.attack = 60;
+            c.dex = 60;
+            c.accuracy = 255;
+            c
+        };
+        let tough = || {
+            let mut c = mage();
+            c.hp = 9000;
+            c.max_hp = 9000;
+            c
+        };
+        let seed = 21;
+        let first_blow = |guard: bool| {
+            let mut state = battle(vec![tough()], vec![brute()], seed);
+            wait_ready(&mut state, hero());
+            if guard {
+                let events = state.submit_command(hero(), Command::Defend).unwrap();
+                assert_eq!(events, vec![BattleEvent::Action { actor: hero(), action: ActionRef::Defend }]);
+                assert!(state.is_defending(hero()));
+                assert_eq!(state.rng, Rng::new(seed), "Defend draws nothing");
+                let me = state.actor(hero()).unwrap();
+                assert_eq!((me.gauge, me.ready), (0, false), "the turn is spent");
+            } else {
+                assert!(!state.is_defending(hero()));
+            }
+            for _ in 0..400 {
+                for event in state.step(10) {
+                    if let BattleEvent::Damage { actor, target, amount, critical } = event {
+                        assert_eq!((actor, target), (foe(), hero()));
+                        return (amount, critical, state);
+                    }
+                }
+            }
+            panic!("the brute never hit");
+        };
+        let (guarded, guarded_crit, state) = first_blow(true);
+        let (open, open_crit, _) = first_blow(false);
+        assert_eq!(guarded_crit, open_crit, "the same rolls, the same blow");
+        assert!(open >= 4 && guarded < open, "guarded {guarded}, open {open}");
+        assert!(2 * guarded <= open && open <= 2 * guarded + 3, "about half: guarded {guarded}, open {open}");
+        // Still guarding at the blow; the guard ends when the hero's gauge is full again (its next turn).
+        assert!(state.is_defending(hero()));
+        let mut state = state;
+        wait_ready(&mut state, hero());
+        assert!(!state.is_defending(hero()), "a new turn ends the guard");
+        assert!(!state.is_defending(foe()) && !state.is_defending(ActorId(9)));
+    }
+
+    #[test]
+    fn elements_double_halve_nullify_absorb_heal_or_kill() {
+        use crate::scene::AffinityRate as Rate;
+        let seed = 62;
+        let aff = |element: u16, rate| ElementAffinity { element: element.trailing_zeros() as u8, rate };
+        let elemental_dummy = |hp: u32| {
+            let mut d = dummy();
+            d.hp = hp;
+            d.affinities = vec![
+                aff(element::FIRE, Rate::Double),
+                aff(element::ICE, Rate::Half),
+                aff(element::BOLT, Rate::Nullify),
+                aff(element::EARTH, Rate::Absorb),
+                aff(element::POISON, Rate::Death),
+                aff(element::GRAVITY, Rate::FullHeal),
+            ];
+            d
+        };
+        // One spell per element (and one with an element the dummy has no entry for), 0 MP so that the
+        // hero can cast any of them.
+        let element_spell = |index: u16, mask: u16| spell(index, 0x22, 8, 100, 0x0F, mask, 0xFFFF, 0);
+        let book = [
+            element_spell(10, element::FIRE),
+            element_spell(11, element::ICE),
+            element_spell(12, element::BOLT),
+            element_spell(13, element::EARTH),
+            element_spell(14, element::POISON),
+            element_spell(15, element::GRAVITY),
+            element_spell(16, element::WATER),
+            element_spell(17, 0),
+        ];
+        let mut caster = mage();
+        caster.spells = book.to_vec();
+        // The draws are the same whatever the target's affinity: the roll to hit, then the variance.
+        let mut replay = Rng::new(seed);
+        replay.next_u16();
+        let variance = replay.range_inclusive(0, 255);
+        let normal = action_damage(&book[6].spec, &caster, &elemental_dummy(1000), Elemental::Normal, Rolls { critical: false, variance });
+        let cast = |spell: u16, hp: u32| {
+            let mut state = battle(vec![caster.clone()], vec![elemental_dummy(hp)], seed);
+            wait_ready(&mut state, hero());
+            let events = state.submit_command(hero(), Command::Magic { spell, target: foe() }).unwrap();
+            assert_eq!(state.rng, replay, "spell {spell}: the same two draws");
+            assert_eq!(events[0], BattleEvent::Action { actor: hero(), action: ActionRef::Magic(spell) });
+            (events[1..].to_vec(), state.actor(foe()).unwrap().hp, state.outcome())
+        };
+        let damage = |amount| BattleEvent::Damage { actor: hero(), target: foe(), amount, critical: false };
+        // No entry, and no element: the plain number.
+        assert_eq!(cast(16, 1000), (vec![damage(normal)], 1000 - normal, None));
+        assert_eq!(cast(17, 1000), (vec![damage(normal)], 1000 - normal, None));
+        // Fire: weak, so doubled before the variance; Ice: halved.
+        let double = action_damage(&book[0].spec, &caster, &elemental_dummy(1000), Elemental::Double, Rolls { critical: false, variance });
+        let half = action_damage(&book[1].spec, &caster, &elemental_dummy(1000), Elemental::Half, Rolls { critical: false, variance });
+        assert!(double >= 2 * normal - 1 && double <= 2 * normal + 1 && half * 2 <= normal + 1 && half * 2 + 2 >= normal, "{normal} {double} {half}");
+        assert_eq!(cast(10, 1000), (vec![damage(double)], 1000 - double, None));
+        assert_eq!(cast(11, 1000), (vec![damage(half)], 1000 - half, None));
+        // Bolt: nullified, a hit of 0 that changes nothing.
+        assert_eq!(cast(12, 1000), (vec![damage(0)], 1000, None));
+        // Earth: absorbed, so the damage heals (limited to what is missing); at full HP it heals 0.
+        let heal = |amount| BattleEvent::Heal { actor: hero(), target: foe(), amount };
+        assert_eq!(cast(13, 600), (vec![heal(normal)], 600 + normal, None));
+        assert_eq!(cast(13, 1000), (vec![heal(0)], 1000, None));
+        // Gravity: full heal.
+        assert_eq!(cast(15, 600), (vec![heal(400)], 1000, None));
+        // Poison: death, whatever the HP; it ends this battle.
+        assert_eq!(
+            cast(14, 777),
+            (vec![damage(777), BattleEvent::Death { actor: foe() }, BattleEvent::Victory], 0, Some(Outcome::Victory))
+        );
+    }
+
+    #[test]
+    fn an_enemy_picks_among_the_attacks_it_can_pay_for_and_announces_each() {
+        let bite = EnemyAction { id: 0x101, spec: ActionSpec::basic_attack(16, 255, true) };
+        let blaze = EnemyAction {
+            id: 0x102,
+            spec: Spell::from_attack(0, &attack_record(0x22, 10, 255, 0x0F, element::FIRE, 0xFDFF, 6)).unwrap().spec,
+        };
+        let sorcerer = || {
+            let mut c = Combatant::new("Sorcerer", 10, 5000);
+            c.attack = 40;
+            c.magic = 40;
+            c.dex = 60;
+            c.mp = 12;
+            c.max_mp = 12;
+            c.accuracy = 255;
+            c.actions = vec![bite, blaze];
+            c
+        };
+        let target = || {
+            let mut c = mage();
+            c.hp = 1_000_000;
+            c.max_hp = 1_000_000;
+            c
+        };
+        for seed in 0..12u64 {
+            let mut state = battle(vec![target()], vec![sorcerer()], seed);
+            let mut log = Vec::new();
+            for _ in 0..40_000 {
+                log.extend(state.step(100));
+                if log.iter().filter(|e| matches!(e, BattleEvent::Action { actor, .. } if *actor == foe())).count() >= 80 {
+                    break;
+                }
+            }
+            let actions: Vec<ActionRef> = log
+                .iter()
+                .filter_map(|e| match e {
+                    BattleEvent::Action { actor, action } if *actor == foe() => Some(*action),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(actions.len(), 80, "seed {seed}");
+            assert!(actions.iter().all(|a| matches!(a, ActionRef::EnemyAttack(0x101 | 0x102))), "{actions:?}");
+            // 12 MP pay for two Blazes and no more: afterwards only the Bite is usable.
+            let casts = actions.iter().filter(|a| **a == ActionRef::EnemyAttack(0x102)).count();
+            assert_eq!(casts, 2, "seed {seed}");
+            assert_eq!(state.actor(foe()).unwrap().mp, 0);
+            let spent: Vec<&BattleEvent> = log.iter().filter(|e| matches!(e, BattleEvent::MpSpent { .. })).collect();
+            assert_eq!(spent, vec![&BattleEvent::MpSpent { actor: foe(), amount: 6 }; 2]);
+            // Each cast is announced, then paid, then lands as magic (a hit or a miss) on the hero.
+            for (i, event) in log.iter().enumerate() {
+                if *event == (BattleEvent::Action { actor: foe(), action: ActionRef::EnemyAttack(0x102) }) {
+                    assert_eq!(log[i + 1], BattleEvent::MpSpent { actor: foe(), amount: 6 });
+                    assert!(matches!(log[i + 2], BattleEvent::Damage { actor, target, critical: false, .. } if actor == foe() && target == hero()));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_enemy_with_one_usable_attack_draws_exactly_what_a_plain_attacker_draws() {
+        // The same numbers as a plain attack of Power 16 / 255%: with a single usable attack there is no
+        // pick, so the whole log is the plain one apart from the name of the announced action.
+        let build = |actions: Vec<EnemyAction>| {
+            let mut c = Combatant::new("Foe", 10, 100_000);
+            c.attack = 40;
+            c.dex = 60;
+            c.accuracy = 255;
+            c.attack_power = 16;
+            c.actions = actions;
+            let mut hero = mage();
+            hero.hp = 100_000;
+            hero.max_hp = 100_000;
+            BattleState::with_config(40, vec![hero], vec![c], zero_start())
+        };
+        let one = EnemyAction { id: 0x201, spec: ActionSpec::basic_attack(16, 255, true) };
+        let run = |actions: Vec<EnemyAction>| {
+            let mut state = build(actions);
+            let mut log = Vec::new();
+            for _ in 0..600 {
+                log.extend(state.step(100));
+            }
+            log
+        };
+        let with_attack = run(vec![one]);
+        let plain = run(vec![]);
+        let renamed: Vec<BattleEvent> = with_attack
+            .iter()
+            .map(|e| match e {
+                BattleEvent::Action { actor, action: ActionRef::EnemyAttack(0x201) } => {
+                    BattleEvent::Action { actor: *actor, action: ActionRef::Attack }
+                }
+                other => *other,
+            })
+            .collect();
+        assert!(renamed.len() > 10 && renamed.iter().any(|e| matches!(e, BattleEvent::Damage { .. })));
+        assert_eq!(renamed, plain);
+        assert!(with_attack.iter().any(|e| matches!(e, BattleEvent::Action { action: ActionRef::EnemyAttack(0x201), .. })));
+        // An attack the enemy cannot pay for leaves it with the plain attack too.
+        let pricey = EnemyAction { id: 0x202, spec: ActionSpec { mp_cost: 5, ..one.spec } };
+        assert_eq!(run(vec![pricey]), plain);
+    }
+
+    #[test]
+    fn enemies_know_their_scene_attacks_and_their_affinities() {
+        let bin = SceneBin::parse(&pack_scene_bin(&[gzip(&demo_scene(0).raw)], 4)).unwrap();
+        let enemies = enemies_for_formation(bin.scene(0).unwrap(), 0);
+        let (grunt, hound) = (&enemies[0], &enemies[1]);
+        // The grunt lists Test Fire (a magical attack, Power 30) and Test Bite (physical, Power 20), in
+        // that order; the hound has one claw. Magic ignores the row, a physical attack respects it.
+        assert_eq!(grunt.actions.iter().map(|a| a.id).collect::<Vec<_>>(), [0x0302, 0x0301]);
+        assert_eq!((grunt.actions[0].spec.kind, grunt.actions[0].spec.power), (ActionKind::Magical, 30));
+        assert_eq!((grunt.actions[1].spec.kind, grunt.actions[1].spec.power), (ActionKind::Physical, 20));
+        assert!(grunt.actions[1].spec.short_range && !grunt.actions[0].spec.short_range);
+        assert_eq!(hound.actions.iter().map(|a| a.id).collect::<Vec<_>>(), [0x0303]);
+        // The plain attack still comes from the first plain physical attack (Test Bite), as before.
+        assert_eq!((grunt.accuracy, grunt.attack_power), (95, 20));
+        // Stats the magic formulas use, and the affinities (Fire halved, Holy absorbed) from the record.
+        assert_eq!((grunt.magic, grunt.magic_defense), (4, 9));
+        assert_eq!(
+            grunt.affinities,
+            vec![
+                ElementAffinity { element: 0, rate: AffinityRate::Half },
+                ElementAffinity { element: 8, rate: AffinityRate::Absorb },
+            ]
+        );
+        assert_eq!(grunt.affinity_for(element::FIRE), Some(AffinityRate::Half));
+        assert_eq!(grunt.affinity_for(element::HOLY), Some(AffinityRate::Absorb));
+        assert_eq!(grunt.affinity_for(element::ICE), None);
+        assert!(hound.affinities.is_empty() && hound.spells.is_empty());
+        // The enemy built the old way (no scene) has no attack list: a plain attacker.
+        let rec = bin.scene(0).unwrap().enemies[0].as_ref().unwrap();
+        assert!(Combatant::from_enemy(rec, None).actions.is_empty());
+    }
+
+    #[test]
+    fn characters_know_the_spells_of_their_materia_plus_the_starter_grimoire() {
+        let kernel = Kernel::parse(&synthetic_kernel_bytes()).unwrap();
+        let ids = |who| party_spells(&kernel, who).iter().map(|s| s.index).collect::<Vec<_>>();
+        // The starter grimoire (Restore, Fire, Ice, Lightning at level 1): Cure, Fire, Ice, Bolt; nobody
+        // is without. Cloud's own Lightning and Ice and Red XIII's Fire add nothing to it.
+        for who in [CharacterId::Barret, CharacterId::Tifa, CharacterId::Aeris, CharacterId::Cloud, CharacterId::RedXiii, CharacterId::CaitSith, CharacterId::Vincent] {
+            assert_eq!(ids(who), [0, 27, 30, 33], "{who:?}");
+        }
+        // A Restore materia at 2500 AP is level 2 (Cure2 too); Master Magic teaches everything the rules
+        // can cast: the Cure family, Life, the Fire, Ice and Bolt spells that exist, and Demi. Not the
+        // record that is not magic, not Ultima (it hits a whole side), not what has no record.
+        assert_eq!(ids(CharacterId::Yuffie), [0, 1, 27, 30, 33]);
+        assert_eq!(ids(CharacterId::Cid), [0, 1, 2, 7, 27, 28, 29, 30, 31, 32, 33, 34, 42]);
+        // What a menu is told: the cost, and the side.
+        let cloud = Combatant::from_character(&kernel, CharacterId::Cloud, 6, None, None).unwrap();
+        let info: Vec<SpellInfo> = cloud.spells.iter().map(Spell::info).collect();
+        assert_eq!(
+            info,
+            vec![
+                SpellInfo { spell: 0, mp_cost: 5, targets_allies: true },
+                SpellInfo { spell: 27, mp_cost: 4, targets_allies: false },
+                SpellInfo { spell: 30, mp_cost: 4, targets_allies: false },
+                SpellInfo { spell: 33, mp_cost: 4, targets_allies: false },
+            ]
+        );
+        // Magic stat, magic defense (Spirit 16 + the armor's 2) and magic evade come from the kernel.
+        assert_eq!((cloud.magic, cloud.magic_defense, cloud.magic_evade), (16, 18, 0));
+        // A kernel without the starter materia's records gives only what the character equips.
+        let mut sections = crate::testutil::synthetic_kernel_sections();
+        sections[8].1 = vec![0xFF; MATERIA_COUNT_FOR_TESTS * 20];
+        let bare = Kernel::parse(&crate::testutil::pack_kernel(&sections, &[])).unwrap();
+        assert!(party_spells(&bare, CharacterId::Barret).is_empty());
+    }
+
+    const MATERIA_COUNT_FOR_TESTS: usize = crate::kernel::MATERIA_COUNT;
+
+    #[test]
+    fn spells_for_lists_what_the_actor_can_cast_for_a_menu() {
+        let mut state = battle(vec![mage(), corpse()], vec![dummy()], 1);
+        assert_eq!(
+            state.spells_for(hero()),
+            vec![
+                SpellInfo { spell: 0, mp_cost: 5, targets_allies: true },
+                SpellInfo { spell: 27, mp_cost: 4, targets_allies: false },
+                SpellInfo { spell: 7, mp_cost: 34, targets_allies: true },
+            ]
+        );
+        assert!(state.spells_for(ActorId(1)).is_empty(), "this party member knows none");
+        assert!(state.spells_for(ActorId(2)).is_empty(), "enemies cast nothing from a menu");
+        assert!(state.spells_for(ActorId(77)).is_empty());
+        // The list does not depend on the MP at the moment (the menu greys an unaffordable spell out).
+        wait_ready(&mut state, hero());
+        let before = state.spells_for(hero());
+        state.submit_command(hero(), Command::Magic { spell: 7, target: ActorId(1) }).unwrap();
+        assert_eq!(state.actor(hero()).unwrap().mp, 16);
+        assert_eq!(state.spells_for(hero()), before);
+    }
+
+    #[test]
+    fn construction_keeps_mp_inside_the_maximum() {
+        let mut c = fighter("Over", 5, 50, 5, 5, 5);
+        c.mp = 99;
+        c.max_mp = 10;
+        let state = BattleState::new(1, vec![c], vec![fighter("E", 5, 50, 5, 5, 5)]);
+        assert_eq!(state.actor(hero()).unwrap().mp, 10);
+    }
+
+    /// A deterministic mixed policy: whatever the actor can do, chosen by the tick and the actor.
+    fn mixed_policy(state: &BattleState, actor: ActorId) -> Command {
+        let enemy = state.enemy_ids().into_iter().find(|e| state.actor(*e).is_some_and(Combatant::is_alive));
+        let dead = state.party_ids().into_iter().find(|a| state.actor(*a).is_some_and(|c| !c.is_alive()));
+        let attack = enemy.map(|target| Command::Attack { target });
+        let candidates = [
+            attack,
+            enemy.map(|target| Command::Magic { spell: 27, target }),
+            Some(Command::Magic { spell: 0, target: actor }),
+            Some(Command::Defend),
+            Some(Command::Item { item: 0, target: actor }),
+            dead.map(|target| Command::Item { item: 7, target }),
+            dead.map(|target| Command::Magic { spell: 7, target }),
+            Some(Command::Item { item: 3, target: actor }),
+        ];
+        let pick = (state.tick() / 13 + u64::from(actor.0)) as usize % candidates.len();
+        candidates[pick]
+            .filter(|c| state.check_command(actor, c).is_ok())
+            .or(attack)
+            .unwrap_or(Command::Defend)
+    }
+
+    fn assert_sane(state: &BattleState) {
+        for (i, c) in state.actors().iter().enumerate() {
+            assert!(c.hp <= c.max_hp, "actor {i}: hp {} over {}", c.hp, c.max_hp);
+            assert!(c.mp <= c.max_mp, "actor {i}: mp {} over {}", c.mp, c.max_mp);
+            assert!(c.gauge <= GAUGE_MAX);
+            assert!(!c.ready || c.is_alive(), "actor {i} is ready but dead");
+            assert!(!c.defending || c.is_alive() || c.side == Side::Enemy, "actor {i} guards while dead");
+        }
+    }
+
+    fn mixed_battle(seed: u64) -> BattleState {
+        let knight = || {
+            let mut c = Combatant::new("Knight", 12, 900);
+            c.attack = 60;
+            c.defense = 20;
+            c.magic = 12;
+            c.magic_defense = 10;
+            c.dex = 50;
+            c.mp = 30;
+            c.max_mp = 30;
+            c.spells = vec![cure(), fire(), life()];
+            c
+        };
+        let goblin = |name: &str| {
+            let mut c = Combatant::new(name, 8, 700);
+            c.attack = 45;
+            c.magic = 30;
+            c.defense = 12;
+            c.magic_defense = 10;
+            c.dex = 45;
+            c.accuracy = 120;
+            c.evade = 40; // the heroes miss now and then
+            c.mp = 24;
+            c.max_mp = 24;
+            c.reward = Reward { exp: 20, gil: 30, ap: 2 };
+            c.actions = vec![
+                EnemyAction { id: 1, spec: ActionSpec::basic_attack(16, 120, true) },
+                EnemyAction {
+                    id: 2,
+                    spec: Spell::from_attack(0, &attack_record(0x22, 12, 100, 0x0F, element::BOLT, 0xFDFF, 8)).unwrap().spec,
+                },
+            ];
+            c
+        };
+        BattleState::with_config(seed, vec![mage(), knight(), corpse()], vec![goblin("Goblin A"), goblin("Goblin B")], zero_start())
+            .with_items(item_table())
+    }
+
+    /// Play a mixed battle: 100 ms slices, every ready hero follows the policy.
+    fn play_mixed(state: &mut BattleState, slice_ms: u32) -> Vec<BattleEvent> {
+        let mut log = Vec::new();
+        for _ in 0..200_000 {
+            if state.outcome().is_some() {
+                break;
+            }
+            log.extend(state.step(slice_ms));
+            for id in state.ready_actors() {
+                if state.outcome().is_some() {
+                    break;
+                }
+                let command = mixed_policy(state, id);
+                match state.submit_command(id, command) {
+                    Ok(events) => log.extend(events),
+                    Err(e) => panic!("the policy chose a command the engine refuses: {command:?}: {e}"),
+                }
+                assert_sane(state);
+            }
+        }
+        log
+    }
+
+    #[test]
+    fn a_battle_of_mixed_commands_is_deterministic_ends_once_and_stays_sane() {
+        let mut outcomes = [0u32; 2];
+        let mut kinds = std::collections::HashSet::new();
+        for seed in 0..24u64 {
+            let (mut a, mut b) = (mixed_battle(seed), mixed_battle(seed));
+            let (log_a, log_b) = (play_mixed(&mut a, 100), play_mixed(&mut b, 100));
+            assert_eq!(log_a, log_b, "seed {seed}");
+            assert_eq!(a, b);
+            let outcome = a.outcome().unwrap_or_else(|| panic!("seed {seed} never ended"));
+            outcomes[usize::from(outcome == Outcome::Defeat)] += 1;
+            let ends: Vec<&BattleEvent> = log_a.iter().filter(|e| matches!(e, BattleEvent::Victory | BattleEvent::Defeat)).collect();
+            assert_eq!(ends.len(), 1, "seed {seed}");
+            assert_eq!(log_a.last(), ends.first().copied());
+            for e in &log_a {
+                kinds.insert(std::mem::discriminant(e));
+            }
+            // Every command shows up as an announced action followed by its effects.
+            let announced = log_a.iter().filter(|e| matches!(e, BattleEvent::Action { .. })).count();
+            assert!(announced > 5, "seed {seed}");
+        }
+        // Over the seeds every kind of event but a defeat happened (this party is strong), and every
+        // battle ended one way or the other.
+        let (a, t) = (ActorId(0), ActorId(1));
+        let every_kind = [
+            BattleEvent::GaugeReady { actor: a },
+            BattleEvent::Damage { actor: a, target: t, amount: 1, critical: false },
+            BattleEvent::Miss { actor: a, target: t },
+            BattleEvent::Death { actor: a },
+            BattleEvent::Victory,
+            BattleEvent::Action { actor: a, action: ActionRef::Defend },
+            BattleEvent::Heal { actor: a, target: t, amount: 1 },
+            BattleEvent::MpSpent { actor: a, amount: 1 },
+            BattleEvent::MpRestored { actor: a, target: t, amount: 1 },
+            BattleEvent::Revive { actor: a, target: t, hp: 1 },
+        ];
+        for e in every_kind {
+            assert!(kinds.contains(&std::mem::discriminant(&e)), "no {e:?} in 24 battles");
+        }
+        assert_eq!(outcomes.iter().sum::<u32>(), 24);
+        assert!(outcomes[0] > 0, "the party wins some");
+    }
+
+    #[test]
+    fn the_slicing_of_the_clock_does_not_change_a_mixed_battle() {
+        // The policy looks at the tick, so the commands only agree when they land on the same ticks:
+        // slices of whole ticks (60 ticks per second: 1000 ms is 60 ticks) are the same battle as long
+        // as the commands are given at the same ticks. Using the step that never overshoots a tick
+        // boundary keeps that true: 1000 ms and 100 ms slices both end on tick boundaries every 1000 ms.
+        let mut coarse = mixed_battle(5);
+        let mut fine = mixed_battle(5);
+        let mut log_coarse = Vec::new();
+        let mut log_fine = Vec::new();
+        for _ in 0..4000 {
+            if coarse.outcome().is_some() {
+                break;
+            }
+            log_coarse.extend(coarse.step(1000));
+            for _ in 0..10 {
+                log_fine.extend(fine.step(100));
+            }
+            assert_eq!(coarse.tick(), fine.tick());
+            // Both are ready at the same time only if no command is pending: give both the same commands
+            // at the end of the second.
+            for id in coarse.ready_actors() {
+                let command = mixed_policy(&coarse, id);
+                log_coarse.extend(coarse.submit_command(id, command).unwrap());
+                log_fine.extend(fine.submit_command(id, command).unwrap());
+            }
+        }
+        assert_eq!(coarse, fine);
+        assert_eq!(log_coarse, log_fine);
+    }
+
+    /// A small deterministic generator for the fuzz tests.
+    struct Xorshift(u64);
+
+    impl Xorshift {
+        fn next(&mut self, bound: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % bound
+        }
+    }
+
+    #[test]
+    fn random_commands_never_panic_and_check_command_always_agrees_with_submit() {
+        let mut rnd = Xorshift(0x2545_F491_4F6C_DD1D);
+        let mut accepted = 0;
+        for seed in 0..40u64 {
+            let mut state = mixed_battle(seed);
+            for _ in 0..600 {
+                if state.outcome().is_some() {
+                    break;
+                }
+                let _ = state.step(rnd.next(900) as u32);
+                for _ in 0..4 {
+                    let actor = ActorId(rnd.next(8) as u8);
+                    let target = ActorId(rnd.next(9) as u8);
+                    let command = match rnd.next(4) {
+                        0 => Command::Attack { target },
+                        1 => Command::Magic { spell: rnd.next(60) as u16, target },
+                        2 => Command::Item { item: rnd.next(140) as u16, target },
+                        _ => Command::Defend,
+                    };
+                    let checked = state.check_command(actor, &command);
+                    let before = state.clone();
+                    let submitted = state.submit_command(actor, command);
+                    assert_eq!(checked, submitted.as_ref().map(|_| ()).map_err(|e| *e), "{command:?} by {actor:?}");
+                    if submitted.is_err() {
+                        assert_eq!(state, before, "a refused command changes nothing: {command:?}");
+                    } else {
+                        accepted += 1;
+                    }
+                    assert_sane(&state);
+                }
+            }
+        }
+        assert!(accepted > 200, "only {accepted} random commands were valid");
+    }
+
     // --- serde ---
 
     #[test]
@@ -2456,14 +3469,29 @@ mod tests {
             BattleEvent::Death { actor: ActorId(3) },
             BattleEvent::Victory,
             BattleEvent::Defeat,
+            BattleEvent::Action { actor: ActorId(0), action: ActionRef::Attack },
+            BattleEvent::Action { actor: ActorId(0), action: ActionRef::Magic(27) },
+            BattleEvent::Action { actor: ActorId(0), action: ActionRef::Item(7) },
+            BattleEvent::Action { actor: ActorId(0), action: ActionRef::Defend },
+            BattleEvent::Action { actor: ActorId(3), action: ActionRef::EnemyAttack(0x0302) },
+            BattleEvent::Heal { actor: ActorId(0), target: ActorId(1), amount: 271 },
+            BattleEvent::MpSpent { actor: ActorId(0), amount: 5 },
+            BattleEvent::MpRestored { actor: ActorId(0), target: ActorId(0), amount: 100 },
+            BattleEvent::Revive { actor: ActorId(0), target: ActorId(2), hp: 100 },
         ];
         let json = serde_json::to_string(&events).unwrap();
         let back: Vec<BattleEvent> = serde_json::from_str(&json).unwrap();
         assert_eq!(back, events);
 
-        let cmd = Command::Attack { target: ActorId(4) };
-        let back: Command = serde_json::from_str(&serde_json::to_string(&cmd).unwrap()).unwrap();
-        assert_eq!(back, cmd);
+        for cmd in [
+            Command::Attack { target: ActorId(4) },
+            Command::Magic { spell: 33, target: ActorId(2) },
+            Command::Item { item: 3, target: ActorId(1) },
+            Command::Defend,
+        ] {
+            let back: Command = serde_json::from_str(&serde_json::to_string(&cmd).unwrap()).unwrap();
+            assert_eq!(back, cmd);
+        }
         let out: Outcome =
             serde_json::from_str(&serde_json::to_string(&Outcome::Victory).unwrap()).unwrap();
         assert_eq!(out, Outcome::Victory);

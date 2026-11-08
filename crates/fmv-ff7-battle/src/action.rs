@@ -484,29 +484,10 @@ impl ItemTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::synthetic_kernel_bytes;
+    use crate::testutil::{attack_record, synthetic_kernel_bytes};
 
     fn attack(calc: u8, power: u8, accuracy: u8, target: u8, element: u16, flags: u16) -> AttackRecord {
-        AttackRecord {
-            accuracy,
-            impact_effect: 0,
-            hurt_action: 0,
-            mp_cost: 7,
-            impact_sound: 0,
-            camera_single: 0,
-            camera_multi: 0,
-            target_flags: target,
-            attack_effect: 0,
-            damage_calc: calc,
-            power,
-            condition_submenu: 0,
-            status_chance_mode: 0xFF,
-            extra_effect: 0xFF,
-            extra_effect_param: 0xFF,
-            status_mask: 0xFFFF_FFFF,
-            element_mask: element,
-            special_flags: flags,
-        }
+        attack_record(calc, power, accuracy, target, element, flags, 7)
     }
 
     #[test]
