@@ -36,9 +36,10 @@ ACCOUNTS:
   The server knows you by an account. The first run with --name registers one: the server issues a
   token ONCE, and this client saves it at once, before anything else can fail, to
   <state dir>/accounts/<server>.token (mode 0600). Later runs log in with the saved token and need
-  no --name. The state dir is --state-dir, else $FMV_STATE_DIR/client, else
-  ~/.local/share/ff-multiverse/client. A second account on the same server gets its own file
-  (<server>.<name>.token); when several are saved, pass --name to choose one.
+  no --name (a window opens the character menu to choose, see below). The state dir is
+  --state-dir, else $FMV_STATE_DIR/client, else ~/.local/share/ff-multiverse/client. A second
+  account on the same server gets its own file (<server>.<name>.token); when several are saved,
+  pass --name to choose one.
   --register creates a NEW account with --name and replaces the token saved for that name: use it
   when the server's accounts were reset (\"invalid or unknown token\"). The token is a password: it
   is never printed, except in the error shown when it could not be saved (so it is not lost).
@@ -76,9 +77,22 @@ BATTLES:
   and shouts `BATTLE DIVERGENCE` if its replay ever disagrees with the server. Without battle data
   in your library you can only wait the battle out.
 
+CHARACTER MENU:
+  A window started without --name opens on a character menu instead of logging in at once; with
+  --name the menu is skipped and the run behaves as before, and --headless never shows it. The
+  menu lists the characters saved for the server (name, colour, look). Up/Down choose, Enter
+  plays, N creates a new one, Del forgets a saved login on THIS computer (it asks first; the
+  character stays on the server, but you can only log in as it again if you still have its
+  token), Esc quits. The create screen takes a name (up to 24 characters), a look (FF7: Cloud,
+  Tifa, Barret or Aerith) and a tint (a palette plus red, green and blue sliders); Tab or Up/Down
+  move between the fields and Enter registers. When the server refuses (name taken, registration
+  closed, rate limited) the reason is shown on screen and you can try again.
+
 WINDOW CONTROLS:
   WASD / arrow keys move, Esc quits. P invites the nearest other player to your party, Y accepts
-  the newest pending invite, L leaves your party. The window title shows your party size and a
+  the newest pending invite, L leaves your party. The window shows player names over their
+  markers, your party in the top right corner, the area name and the connection status; a FIXTURE
+  area is labelled \"FIXTURE (synthetic, not FF7)\". The window title shows your party size and a
   pending invite; party members are drawn with a gold ring. B asks the server for a debug battle
   (refused unless it runs with --debug-encounters). In a battle the window shows enemy and party
   bars (HP, ATB gauge; a yellow border means that character can act) and Space or Enter attacks the
@@ -115,7 +129,8 @@ pub struct Args {
     pub server: String,
 
     /// Display name shown to other players (at most 24 characters). Needed to register an
-    /// account; without it the account saved for the server is used.
+    /// account from the command line; without it a window opens the character menu (choose or
+    /// create a character) and --headless uses the account saved for the server.
     #[arg(long, value_name = "NAME", value_parser = parse_name)]
     pub name: Option<String>,
 
@@ -219,6 +234,13 @@ impl Args {
     /// This client's state directory (see [`client_state_dir`]).
     pub fn client_state_dir(&self) -> Result<PathBuf, String> {
         client_state_dir(self.state_dir.as_deref())
+    }
+
+    /// Does this run open on the character menu? A window without `--name` does: the player
+    /// chooses or creates a character there. `--name` (log in as, or register, that name) keeps
+    /// the command-line behaviour, and `--headless` never shows a menu.
+    pub fn wants_menu(&self) -> bool {
+        !self.headless && self.name.is_none()
     }
 
     /// The game whose content to use. Any `--ff7-*` source flag asks for FF7, even next to
@@ -578,6 +600,42 @@ mod tests {
             "invalid or unknown token",
         ] {
             assert!(help.contains(needle), "--help must mention {needle:?}:\n{help}");
+        }
+    }
+
+    #[test]
+    fn a_window_without_a_name_opens_the_character_menu_and_nothing_else_does() {
+        let wants = |args: &[&str]| {
+            Args::try_parse_from(std::iter::once("fmv-client").chain(args.iter().copied())).unwrap().wants_menu()
+        };
+        assert!(wants(&[]));
+        assert!(wants(&["--server", "10.0.0.1:1"]));
+        assert!(wants(&["--game", "ff7"]));
+        assert!(wants(&["--tint", "ff8800"]), "a tint alone does not name a character");
+        // --name keeps the command-line behaviour (log in as, or register, that name).
+        assert!(!wants(&["--name", "Cloud"]));
+        assert!(!wants(&["--name", "Cloud", "--register"]));
+        // A headless run never shows a menu.
+        assert!(!wants(&["--headless"]));
+        assert!(!wants(&["--headless", "--name", "x"]));
+    }
+
+    #[test]
+    fn the_help_describes_the_character_menu_and_the_hud() {
+        use clap::CommandFactory;
+        let help = Args::command().render_long_help().to_string();
+        for needle in [
+            "CHARACTER MENU:",
+            "N creates a new one",
+            "Del forgets a saved login on THIS computer",
+            "the menu is skipped",
+            "--headless never shows it",
+            "name taken, registration closed, rate limited",
+            "player names over their",
+            "FIXTURE (synthetic, not FF7)",
+        ] {
+            let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(flat.contains(needle), "--help must mention {needle:?}:\n{help}");
         }
     }
 

@@ -11,7 +11,8 @@
 //! * [`BattleClient`] is the mirror of the whole battle situation (no active battle, or one), fed
 //!   by the four battle messages ([`BattleClient::on_message`]); it counts battles entered,
 //!   victories, defeats, divergences and refusals, and says what happened as one-line notes.
-//! * [`BattleView`] / [`battle_vertices`] draw the battle as flat coloured rectangles (the window).
+//! * [`BattleView`] / [`battle_vertices`] draw the battle as flat coloured rectangles (the window),
+//!   [`draw_battle_text`] adds names, HP numbers and the turn hint in the UI font over them.
 //! * [`BattleBot`] is the headless `--battle-auto` player.
 //! * [`open_rules`] reads this machine's battle data (the same library set as the field archive).
 //!
@@ -23,10 +24,12 @@
 
 mod bot;
 mod data;
+mod text;
 mod view;
 
 pub use bot::BattleBot;
 pub use data::open_rules;
+pub use text::draw_battle_text;
 pub use view::{battle_vertices, Bar, BattleView, Status};
 
 use fmv_core::{AccountId, Fingerprint};
@@ -36,7 +39,23 @@ use fmv_protocol::{
     ActorId, AppliedCommand, BattleId, BattleRejection, BattleReplay, BattleReward, BattleRules, BattleSetup, ClientMsg, ServerMsg,
 };
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+/// This machine's own battle rules, installed once per process by [`install_local_rules`]. A process
+/// reads its game data once (at start-up, before any session exists) and every [`BattleClient`] it
+/// creates afterwards, whichever way the session came about (command line or character menu), uses
+/// the same data.
+static LOCAL_RULES: OnceLock<Option<Arc<dyn BattleRules>>> = OnceLock::new();
+
+/// Install this machine's battle rules for every [`BattleClient`] made from now on (only the first
+/// call counts: the data is read once per process).
+pub fn install_local_rules(rules: Option<Arc<dyn BattleRules>>) {
+    let _ = LOCAL_RULES.set(rules);
+}
+
+fn local_rules() -> Option<Arc<dyn BattleRules>> {
+    LOCAL_RULES.get().and_then(Clone::clone)
+}
 
 /// A command sent for our character is considered lost (and may be sent again) after this long
 /// without the server's answer.
@@ -150,11 +169,12 @@ impl std::fmt::Debug for BattleClient {
 }
 
 impl BattleClient {
-    /// A client with no battle and no local battle data (see [`BattleClient::set_rules`]).
+    /// A client with no battle, using this machine's installed battle data (see
+    /// [`install_local_rules`]; without any it cannot mirror a battle).
     pub fn new(me: AccountId) -> Self {
         Self {
             me,
-            rules: None,
+            rules: local_rules(),
             active: None,
             entered: 0,
             ended: 0,
@@ -167,8 +187,9 @@ impl BattleClient {
         }
     }
 
-    /// Give the client this machine's battle rules (its own `scene.bin` and `kernel.bin`). Without
-    /// them it cannot mirror a battle.
+    /// Replace the battle rules this client mirrors with (tests; a running client uses the
+    /// process-wide ones).
+    #[cfg(test)]
     pub fn set_rules(&mut self, rules: Option<Arc<dyn BattleRules>>) {
         self.rules = rules;
     }

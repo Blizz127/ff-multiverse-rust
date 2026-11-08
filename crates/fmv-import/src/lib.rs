@@ -1,6 +1,9 @@
 //! fmv-import: the owned-content import pipeline (plan section 7.3).
 //!
 //! - [`scan`]: read-only identification of an FF7 PC install (edition guess, mods, M1/M2 files);
+//!   it accepts the folder that holds `data/` or the install root of the Steam Edition;
+//! - [`steam`]: read-only reading of Steam's `appmanifest_<appid>.acf` (appid, install folder,
+//!   build), the evidence that lets the scan name the Steam Edition with high confidence;
 //! - [`iso9660`] + [`image`] + [`cue`]: a read-only disc reader (plain 2048-byte `.iso`, raw
 //!   2352-byte MODE1/MODE2 `.bin`, `.cue` sheets);
 //! - [`serial`]: SYSTEM.CNF boot-serial parsing and the (UNVERIFIED) FF7 serial table;
@@ -18,7 +21,15 @@
 //!   language-neutral files plus that language's own, never another language's. Adapters reading
 //!   a set should look in `data/lang-<set language>/` first and fall back to the classic `data/`.
 //!   Treating the classic layout as language-neutral is an assumption on installs that also have
-//!   language directories, and the manifest says so.
+//!   language directories, and the manifest says so. An install that holds several languages
+//!   and nothing that says which one is meant (the Steam Edition has no per-language
+//!   executables) is imported as `en` when `en` is among them, with a warning in the report and
+//!   a caveat in the manifest; the language is still never mixed.
+//! - **Labels that fix compatibility never drift.** Edition, region and revision are part of the
+//!   set id and of the area fingerprint that decides which players share an instance. The
+//!   Steam Edition is labelled `Steam Edition (appid 3837340)` / `unknown` / `build <id>`
+//!   (the build from Steam's appmanifest), exactly as `--edition`/`--revision` spell them, so
+//!   the auto-detected path reaches the sets that explicit labels made.
 //! - **A guess is never stored as a fact.** Edition, region, language and the FF7 serial table are
 //!   unverified; each manifest carries an [`Identification`](fmv_library::Identification) saying
 //!   so. A serial the table does not know is ASSUMED to be FF7, its region is `unknown` (the
@@ -44,6 +55,7 @@ pub mod iso9660;
 pub mod scan;
 pub mod serial;
 pub mod session;
+pub mod steam;
 /// SYNTHETIC test-data builders (fake ISO images). Never game data, never surfaced by the CLI.
 #[doc(hidden)]
 pub mod synthetic;

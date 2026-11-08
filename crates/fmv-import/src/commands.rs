@@ -4,8 +4,9 @@
 //! - sources (installs, disc images, cue sheets) are opened read-only and re-checked after the
 //!   import: size, mtime and identity must be unchanged (and, for PC installs, a second read of
 //!   every file must hash to what the copy saw);
-//! - the state directory must not live inside a PC install being imported, however the path is
-//!   spelled (`..` after a symlink, a symlinked `library`, ...);
+//! - the state directory must not live inside a PC install being imported (nor inside the Steam
+//!   Edition install root that directory belongs to), however the path is spelled (`..` after a
+//!   symlink, a symlinked `library`, ...);
 //! - `scan-pc`, `list` and `import-status` never create or modify anything;
 //! - every refusal that can be decided from the source and the saved sessions alone (wrong
 //!   edition, ambiguous language, disc number clashes, ...) happens BEFORE anything is written;

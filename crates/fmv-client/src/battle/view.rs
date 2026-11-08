@@ -7,11 +7,9 @@
 //! when this machine has no battle data to replay with.
 //!
 //! The layout is pure: [`battle_vertices`] turns a [`BattleView`] into the renderer's flat
-//! vertices for a window size, and [`battle_labels`] says where the text of each card belongs.
-//!
-//! TODO(text): sw-charui is building text rendering. When it lands, draw [`battle_labels`] (names
-//! and HP numbers); until then the window title carries the words (see
-//! `BattleClient::title_suffix`) and nothing draws the labels.
+//! vertices for a window size, and [`battle_labels`] says where the text of each card belongs
+//! ([`super::text`] draws it with the UI font over these rectangles; the window title repeats the
+//! words, see `BattleClient::title_suffix`).
 
 use crate::render::{color, Vertex, MAX_VERTICES};
 use fmv_ff7_battle::rules::GAUGE_MAX;
@@ -37,7 +35,7 @@ pub const ATB_RGB: [u8; 3] = [90, 150, 255];
 pub const ATB_READY_RGB: [u8; 3] = [255, 238, 120];
 
 // Sizes in pixels.
-const BAND_H: f32 = 14.0;
+pub const BAND_H: f32 = 14.0;
 const MARGIN: f32 = 20.0;
 const GAP: f32 = 16.0;
 const CARD_W_MAX: f32 = 240.0;
@@ -145,25 +143,45 @@ fn cards(view: &BattleView, w: f32, h: f32) -> Vec<Card<'_>> {
     out
 }
 
-/// Where the text of a card belongs (see the module docs: nothing draws it yet).
-#[allow(dead_code)] // the hook for the text renderer: only the tests use it until that lands
+/// What a label says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LabelKind {
+    /// A fighter's name.
+    Name,
+    /// A fighter's HP as `HP now/max`.
+    Hp,
+}
+
+/// Where the text of a card belongs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Label {
     /// Top-left corner in pixels from the top-left of the window.
     pub x: f32,
     pub y: f32,
+    /// The width of the card the text belongs to: the text must fit in it.
+    pub max_width: f32,
     pub text: String,
+    pub kind: LabelKind,
+    /// The text belongs to our own character.
+    pub mine: bool,
 }
 
 /// The labels of `view` for a `vw` x `vh` window: each fighter's name above its card and its HP
-/// below it. TODO(text): draw these with the text renderer.
-#[allow(dead_code)] // see `Label`
+/// below it ([`super::text::draw_battle_text`] draws them).
 pub fn battle_labels(view: &BattleView, vw: u32, vh: u32) -> Vec<Label> {
     let (w, h) = (vw.max(1) as f32, vh.max(1) as f32);
     let mut labels = Vec::new();
     for card in cards(view, w, h) {
-        labels.push(Label { x: card.rect.x0, y: card.rect.y0 - 16.0, text: card.bar.name.clone() });
-        labels.push(Label { x: card.rect.x0, y: card.rect.y1 + 2.0, text: format!("HP {}/{}", card.bar.hp, card.bar.max_hp) });
+        let (x, max_width, mine) = (card.rect.x0, card.rect.width(), card.bar.mine);
+        labels.push(Label { x, y: card.rect.y0 - 20.0, max_width, text: card.bar.name.clone(), kind: LabelKind::Name, mine });
+        labels.push(Label {
+            x,
+            y: card.rect.y1 + 4.0,
+            max_width,
+            text: format!("HP {}/{}", card.bar.hp, card.bar.max_hp),
+            kind: LabelKind::Hp,
+            mine,
+        });
     }
     labels
 }
@@ -407,9 +425,16 @@ mod tests {
         let labels = battle_labels(&v, 800, 600);
         let texts: Vec<&str> = labels.iter().map(|l| l.text.as_str()).collect();
         assert_eq!(texts, ["Guard", "HP 9/90", "Cloud", "HP 7/10"]);
-        assert!(labels.iter().all(|l| l.x.is_finite() && l.y.is_finite()));
-        // The enemy's label is above the party's.
+        assert!(labels.iter().all(|l| l.x.is_finite() && l.y.is_finite() && l.max_width > 0.0));
+        // The enemy's label is above the party's, names above their card and HP below it.
         assert!(labels[0].y < labels[2].y);
+        let kinds: Vec<LabelKind> = labels.iter().map(|l| l.kind).collect();
+        assert_eq!(kinds, [LabelKind::Name, LabelKind::Hp, LabelKind::Name, LabelKind::Hp]);
+        assert_eq!(labels.iter().map(|l| l.mine).collect::<Vec<_>>(), [false, false, true, true]);
+        // A label sits on its card's left edge and may not be wider than the card.
+        let cs = cards(&v, 800.0, 600.0);
+        assert_eq!(labels[0].x, cs[0].rect.x0);
+        assert_eq!(labels[0].max_width, cs[0].rect.width());
     }
 
     #[test]
@@ -446,7 +471,7 @@ mod tests {
 
     /// Draw `v` offscreen through the real GPU pipeline (`crate::render::Gpu`) and read the pixels
     /// back as tightly packed RGBA8. `None` (with a note) when no adapter is available.
-    fn render_offscreen(v: &BattleView, w: u32, h: u32) -> Option<Vec<u8>> {
+    fn render_offscreen(v: &BattleView, w: u32, h: u32, overlay: Option<&crate::ui::draw::DrawList>) -> Option<Vec<u8>> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let adapter = match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())) {
             Ok(a) => a,
@@ -475,6 +500,9 @@ mod tests {
         });
         let target = texture.create_view(&wgpu::TextureViewDescriptor::default());
         gpu.draw_scene(&target, &battle_vertices(v, w, h, false), None, crate::render::CLEAR_RGB, false);
+        if let Some(overlay) = overlay {
+            gpu.draw_overlay(&target, &overlay.vertices(w, h, false));
+        }
         let padded = (w * 4).next_multiple_of(256);
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("battle-readback"),
@@ -509,12 +537,25 @@ mod tests {
     #[test]
     fn offscreen_the_battle_view_has_the_status_band_the_ready_card_and_the_filled_bars() {
         let (w, h) = (800u32, 600u32);
+        let mut cloud = bar(30, 100, GAUGE_MAX, true, true, true);
+        cloud.name = "Cloud".into();
         let v = view(
-            vec![bar(100, 100, GAUGE_MAX / 2, false, true, false), bar(30, 100, GAUGE_MAX, true, true, true)],
+            vec![bar(100, 100, GAUGE_MAX / 2, false, true, false), cloud],
             vec![bar(10, 10, 0, false, true, false), bar(0, 10, 0, false, false, false)],
             Status::Diverged,
         );
-        let Some(img) = render_offscreen(&v, w, h) else { return };
+        let mut text = crate::ui::draw::DrawList::new();
+        crate::battle::draw_battle_text(&v, w, h, &mut text);
+        let Some(img) = render_offscreen(&v, w, h, Some(&text)) else { return };
+        // To look at it: `FMV_SHOT_DIR=<dir> cargo test -p fmv-client offscreen_the_battle_view` writes
+        // `battle-view.ppm` (a plain RGB image) there.
+        if let Some(dir) = std::env::var_os("FMV_SHOT_DIR") {
+            let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
+            ppm.extend(img.chunks(4).flat_map(|p| [p[0], p[1], p[2]]));
+            let path = std::path::Path::new(&dir).join("battle-view.ppm");
+            std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, ppm)).expect("write the picture");
+            eprintln!("wrote {}", path.display());
+        }
         let px = |x: f32, y: f32| {
             let i = (((y as u32) * w + x as u32) * 4) as usize;
             [img[i], img[i + 1], img[i + 2]]
@@ -550,6 +591,35 @@ mod tests {
         let mid = |c: &Card<'_>| ((c.rect.x0 + 1.0), (c.rect.y0 + c.rect.y1) * 0.5);
         assert_eq!(px(mid(enemies[0]).0, mid(enemies[0]).1), BORDER_ENEMY_RGB);
         assert_eq!(px(mid(enemies[1]).0, mid(enemies[1]).1), BORDER_DEAD_RGB);
+
+        // The text really reaches the screen: the status line under the band (red, because the view
+        // is "diverged") and our character's name above its card (accent colour) have glyph pixels.
+        let near = |got: [u8; 3], want: [u8; 4]| (0..3).all(|i| got[i].abs_diff(want[i]) <= 3);
+        let count_in = |x0: u32, x1: u32, y0: u32, y1: u32, want: [u8; 4]| {
+            (y0..y1).flat_map(|y| (x0..x1).map(move |x| (x, y))).filter(|&(x, y)| near(px(x as f32, y as f32), want)).count()
+        };
+        let band_text_rows = (BAND_H as u32 + 6, BAND_H as u32 + 6 + 18);
+        assert!(
+            count_in(0, w, band_text_rows.0, band_text_rows.1, crate::ui::widgets::ERROR) > 100,
+            "the red status line is drawn under the band"
+        );
+        let me = party[1].rect;
+        assert!(
+            count_in(me.x0 as u32, me.x1 as u32, me.y0 as u32 - 22, me.y0 as u32 - 2, crate::ui::widgets::ACCENT) > 20,
+            "our character's name is drawn in the accent colour above its card"
+        );
+        // The same view without the text has none of those pixels there (so the test cannot pass on
+        // the rectangles alone).
+        let Some(plain) = render_offscreen(&v, w, h, None) else { return };
+        let px_plain = |x: u32, y: u32| {
+            let i = ((y * w + x) * 4) as usize;
+            [plain[i], plain[i + 1], plain[i + 2]]
+        };
+        let stray = (band_text_rows.0..band_text_rows.1)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .filter(|&(x, y)| near(px_plain(x, y), crate::ui::widgets::ERROR))
+            .count();
+        assert_eq!(stray, 0, "without the overlay the status line is absent");
     }
 
     #[test]

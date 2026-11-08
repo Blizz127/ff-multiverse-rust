@@ -26,9 +26,16 @@ use serde::Serialize;
 /// (.cue, .bin, .iso) can be imported. Every command prints JSON on stdout. FF7 identification
 /// (edition guesses, the disc serial table) is UNVERIFIED [verify]: it is labelled as such in the
 /// output and recorded as unverified in each set's manifest. A library set holds ONE language
-/// (PC installs with several languages need --language) and one disc family; discs the serial
-/// table does not know get a set private to their import session, and images whose volume label
-/// starts with SYNTHETIC are imported as FIXTURE content, never as FF7.
+/// (PC installs with several languages need --language, except that an install which says
+/// nothing about it, like the Steam Edition, defaults to en with a warning) and one disc family;
+/// discs the serial table does not know get a set private to their import session, and images
+/// whose volume label starts with SYNTHETIC are imported as FIXTURE content, never as FF7.
+///
+/// PC installs: pass the install root of the Steam Edition (the folder named FINAL FANTASY VII
+/// Steam Edition) or the folder that holds data/ (ff7/workingdir for the Steam Edition); the data
+/// is found automatically. The Steam Edition is recognised from its files and, when the install
+/// sits in a Steam library, from Steam's appmanifest_3837340.acf (the only file whose contents
+/// are read): its build becomes the revision label.
 #[derive(Parser, Debug)]
 #[command(name = "fmv-import", version)]
 struct Cli {
@@ -43,27 +50,35 @@ struct Cli {
 enum Command {
     /// Read-only scan of an FF7 PC install; prints a JSON report. Writes nothing and never touches the state directory
     ScanPc {
-        /// FF7 PC install directory
+        /// FF7 PC install: the folder that holds data/ (for the Steam Edition: ff7/workingdir), or
+        /// the Steam Edition's install root, which is searched for ff7/workingdir/data
         dir: PathBuf,
     },
     /// Import the needed files of an FF7 PC install into a library set (refuses without flevel.lgp)
     ImportPc {
-        /// FF7 PC install directory (opened read-only)
+        /// FF7 PC install (opened read-only): the folder that holds data/ (for the Steam Edition:
+        /// ff7/workingdir), or the Steam Edition's install root, which is searched for
+        /// ff7/workingdir/data
         dir: PathBuf,
-        /// Edition label, overriding the scan's guess (e.g. "PC 1998", "Steam 2013")
+        /// Edition label, overriding the scan's guess (e.g. "PC 1998", "Steam 2013"). Default:
+        /// the guess, which is "Steam Edition (appid 3837340)" for that edition
         #[arg(long)]
         edition: Option<String>,
         /// Region label (default "unknown")
         #[arg(long)]
         region: Option<String>,
-        /// Language to import (e.g. en). A set holds exactly one language: required when the
-        /// install holds several (ff7_<xx>.exe / data/lang-<xx>), and then only that language's
+        /// Language to import (e.g. en). A set holds exactly one language: only that language's
         /// files plus the language-neutral ones are imported; run again for another language.
-        /// Default: the one the install implies, else "unknown". Must match what the install
-        /// holds; on an install without language markers it is just a label
+        /// Required when the install holds several and nothing picks one (several ff7_<xx>.exe,
+        /// or several data/lang-<xx> without en). Default: the language the install implies (one
+        /// ff7_<xx>.exe, or one data/lang-<xx>); en, with a warning, when it holds several
+        /// languages, no ff7_<xx>.exe names one and en is among them (the Steam Edition); else
+        /// "unknown". Must match what the install holds; on an install without language markers
+        /// it is just a label
         #[arg(long)]
         language: Option<String>,
-        /// Revision label (default "unknown")
+        /// Revision label. Default: "build <id>" read from Steam's appmanifest of the Steam
+        /// Edition when it is found, else "unknown"
         #[arg(long)]
         revision: Option<String>,
     },

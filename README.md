@@ -103,6 +103,9 @@ accounts next to it; each client reads the same library and saves its login toke
 the window, **WASD** walks, **P** invites the nearest player, **Y** accepts an invite, **L**
 leaves the party. A missing display, GPU or server is reported with one clear line.
 
+Without `--name` the window opens on the **character menu** instead (see "Window mode"): pick a
+saved character, or press **N** to create one: `fmv-client --game ff7`.
+
 Requirements for building: a recent stable Rust toolchain on Linux. Dependencies resolve from
 the local cargo cache (`.cargo/config.toml` sets `net.offline = true`; remove that line when
 adding new crates). A prebuilt binary needs a glibc at least as new as the machine that built
@@ -163,17 +166,45 @@ parses them by key (it ignores the fields it does not know).
 **Window mode** (needs a display):
 
 ```
-target/release/fmv-client --server <addr> --name Me
+target/release/fmv-client --server <addr>             # the character menu
+target/release/fmv-client --server <addr> --name Me   # straight in as Me (registers it the first time)
 ```
 
-WASD or the arrow keys walk (up walks up the screen, whatever the camera looks like), **P**
-invites the nearest player to your party, **Y** accepts the pending invite, **L** leaves the
-party, Esc quits. Party members get a gold ring around their marker, and the window title
-shows your party size and a pending invite. **B** asks the server for a debug battle (refused
-unless it runs with `--debug-encounters`). In a battle the window shows enemy and party bars
-(HP and ATB gauge; a yellow border means that character can act) and **Space** or **Enter**
-attacks the first living enemy with your character. (The battle view has been checked by unit
-tests only: this box has no display.)
+*Character menu.* A window started without `--name` opens on a menu, in the same window the game
+then runs in. It lists the characters saved for that server (name, colour swatch, look):
+**Up/Down** choose, **Enter** plays, **N** creates a new one, **Del** forgets a saved login on
+this computer (it asks first, and the default answer keeps it: the character stays on the
+server, but its token, shown only once at registration, cannot be recovered), **Esc** quits.
+With nothing saved yet it opens on the create screen: a **name** (up to 24 characters, cleaned
+exactly as the server cleans it), a **look** (FF7: Cloud, Tifa, Barret or Aerith; the ids
+`ff7/cloud`, `ff7/tifa`, `ff7/barret`, `ff7/aerith` are stored in the avatar profile and a model
+decoded from your own copy will show them later), and a **tint** (a palette grid plus red, green
+and blue sliders; until you pick one it is the colour the command line would derive from the
+name). **Tab** or **Up/Down** move between the fields, **Left/Right** change a value, **Enter**
+registers. If the server refuses (name taken, registration closed, rate limited) the reason is
+shown on screen and you can edit and try again; the first time a registration succeeds its
+token is saved before anything else can fail. `--name` skips the menu (the old behaviour) and
+`--headless` never shows it. The colour and look the menu shows for a saved login are what this
+machine last saw (the server keeps the real profile and sends it on join), so a login that has
+not joined from this machine yet says "look unknown".
+
+*In the game.* WASD or the arrow keys walk (up walks up the screen, whatever the camera looks
+like), **P** invites the nearest player to your party, **Y** accepts the pending invite, **L**
+leaves the party, Esc quits. Party members get a gold ring around their marker. The window now
+also shows player names over their markers, your party (leader starred) in the top right, the
+area name (`FF7 md1stin`), the connection status (players, round-trip time) and a pending invite;
+a FIXTURE area wears the label `FIXTURE (synthetic, not FF7)`. The window title still shows your
+party size and a pending invite.
+
+*In a battle.* **B** asks the server for a debug battle (refused unless it runs with
+`--debug-encounters`; random encounters start battles by themselves in a field that has an
+encounter table). The window then shows the battle: enemy bars on top, your party below, one card
+per fighter with an HP bar and an ATB gauge; a yellow border and a yellow gauge mean that
+character can act, a white corner marks yours, and a band across the top is green while your
+client's replay agrees with the server (red if it ever diverges). **Space** or **Enter** attacks
+the first living enemy with your character. The battle's words (whose turn, how many enemies)
+are in the window title for now. (The battle view has been checked by unit tests and an
+offscreen render only: this box has no display.)
 
 **One command for the basics:** `scripts/smoke.sh` starts the server, runs two headless bots
 concurrently, checks both SMOKE lines and stops the server. It uses `target/release` by
@@ -270,7 +301,9 @@ UNKNOWN placeholders; see `deploy/README.md`.
 ```
 <state>/library/     owned-content library (fmv-import): blobs and one manifest per edition
 <state>/server/      the server's accounts, avatar profiles, progression (LOCK = single writer)
-<state>/client/      a client's saved login tokens: accounts/<server>.token (mode 0600)
+<state>/client/      a client's saved login tokens: accounts/<server>.token (mode 0600), and next to
+                     each one a display-only note of how that character looked when last seen
+                     (accounts/<server>.<name>.look: tint and look, no secret; safe to delete)
 ```
 
 `<state>` is `$FMV_STATE_DIR`, else `~/.local/share/ff-multiverse`. Back up `server/` by
