@@ -13,6 +13,10 @@
 //!   victories, defeats, divergences and refusals, and says what happened as one-line notes.
 //! * [`BattleView`] / [`battle_vertices`] draw the battle as flat coloured rectangles (the window),
 //!   [`draw_battle_text`] adds names, HP numbers and the turn hint in the UI font over them.
+//! * [`BattleScene`] draws it as a 3D scene instead (a camera, a location, the enemies where the
+//!   formation puts them, the party facing them) and plays what happened as short reactions; it
+//!   is fed by [`BattleClient::scene_start`], [`BattleClient::take_events`] and
+//!   [`BattleClient::engine`], and the flat view above remains the fallback.
 //! * [`BattleBot`] is the headless `--battle-auto` player.
 //! * [`open_rules`] reads this machine's battle data (the same library set as the field archive).
 //!
@@ -24,19 +28,22 @@
 
 mod bot;
 mod data;
+pub mod scene;
 mod text;
 mod view;
 
 pub use bot::BattleBot;
 pub use data::open_rules;
+use scene::SceneStart;
 pub use text::draw_battle_text;
 pub use view::{battle_vertices, Bar, BattleView, Status};
 
 use fmv_core::{AccountId, Fingerprint};
-use fmv_ff7_battle::rules::{Combatant, GAUGE_MAX};
+use fmv_ff7_battle::rules::{BattleState, Combatant, GAUGE_MAX};
 use fmv_protocol::battle::{BattleEvent, Command, Outcome};
 use fmv_protocol::{
-    ActorId, AppliedCommand, BattleId, BattleRejection, BattleReplay, BattleReward, BattleRules, BattleSetup, ClientMsg, ServerMsg,
+    ActorId, AppliedCommand, BattleId, BattleMember, BattleRejection, BattleReplay, BattleReward, BattleRules, BattleSetup, ClientMsg,
+    ServerMsg,
 };
 use std::collections::VecDeque;
 use std::sync::{Arc, OnceLock};
@@ -62,6 +69,9 @@ fn local_rules() -> Option<Arc<dyn BattleRules>> {
 pub const PENDING_TIMEOUT_S: f64 = 1.0;
 /// Notes kept until the loop prints them; beyond this the oldest are dropped.
 const MAX_NOTES: usize = 64;
+/// Events kept for the scene ([`BattleClient::take_events`]); beyond this the oldest are dropped.
+/// A drawn frame takes them, so this only bounds a window that stops drawing.
+const MAX_EVENTS: usize = 256;
 /// Divergences reported one by one; later ones are only counted.
 const MAX_DIVERGENCE_NOTES: u64 = 5;
 
@@ -97,6 +107,10 @@ struct Start {
 #[derive(Debug)]
 pub struct ActiveBattle {
     id: BattleId,
+    /// The formation id of the setup (`scene * 4 + slot`).
+    formation_id: u16,
+    /// The party of the setup, `party[i]` fighting as `ActorId(i)` (kept even without a replay).
+    party: Vec<BattleMember>,
     /// `None` when this client cannot rebuild the battle (no local battle data, or the data
     /// cannot build it): the battle then runs on the server without being mirrored.
     replay: Option<BattleReplay>,
@@ -159,6 +173,10 @@ pub struct BattleClient {
     rejections: u64,
     last_rejection: Option<BattleRejection>,
     notes: VecDeque<String>,
+    /// What the server's messages did, oldest first, until [`BattleClient::take_events`] takes it. Kept
+    /// here and not on the battle itself so that the last messages of a battle (the killing blow)
+    /// can still be taken after the battle has ended.
+    events: VecDeque<BattleEvent>,
 }
 
 impl std::fmt::Debug for BattleClient {
@@ -192,6 +210,7 @@ impl BattleClient {
             rejections: 0,
             last_rejection: None,
             notes: VecDeque::new(),
+            events: VecDeque::new(),
         }
     }
 
@@ -280,6 +299,30 @@ impl BattleClient {
         self.notes.drain(..).collect()
     }
 
+    /// What the server's messages did since the last call, oldest first (the events of every
+    /// `BattleEvent` message, also after the battle has ended). The scene plays them as reactions.
+    pub fn take_events(&mut self) -> Vec<BattleEvent> {
+        self.events.drain(..).collect()
+    }
+
+    /// The replayed engine of the battle we are in, if this client could build it: who fights,
+    /// their names, hit points and gauges. Read-only (it moves only with the server's messages).
+    pub fn engine(&self) -> Option<&BattleState> {
+        self.active.as_ref()?.replay.as_ref().map(BattleReplay::state)
+    }
+
+    /// What the scene needs to start drawing the battle we are in (`None` outside one): the
+    /// formation, the party and, from this machine's own rules, where the enemies stand.
+    pub fn scene_start(&self) -> Option<SceneStart> {
+        let active = self.active.as_ref()?;
+        Some(SceneStart {
+            id: active.id,
+            party: active.party.clone(),
+            my_actor: active.my_actor,
+            formation: self.rules.as_ref().and_then(|rules| rules.formation_scene(active.formation_id)),
+        })
+    }
+
     // ----- feeding ------------------------------------------------------------------------
 
     /// Apply a battle message (`EncounterStart`, `BattleEvent`, `BattleEnd`, `BattleRejected`);
@@ -317,6 +360,8 @@ impl BattleClient {
         }
         let Start { battle_id, setup, data_fingerprint } = start;
         self.entered += 1;
+        // Nothing of an earlier battle is for the scene of this one.
+        self.events.clear();
         let my_actor = setup
             .party
             .iter()
@@ -362,6 +407,8 @@ impl BattleClient {
         ));
         self.active = Some(ActiveBattle {
             id: battle_id,
+            formation_id: setup.formation_id,
+            party: setup.party.clone(),
             replay,
             my_actor,
             ticks_per_second: setup.ticks_per_second,
@@ -386,6 +433,13 @@ impl BattleClient {
         if command.is_some_and(|c| Some(c.actor) == active.my_actor) {
             active.pending = None;
             active.my_commands += 1;
+        }
+        // What happened, for the scene, whether or not this machine can replay it.
+        for event in events {
+            if self.events.len() >= MAX_EVENTS {
+                self.events.pop_front();
+            }
+            self.events.push_back(*event);
         }
         let Some(replay) = active.replay.as_mut() else { return };
         if let Err(d) = replay.apply(tick, events, command.as_ref()) {

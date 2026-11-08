@@ -7,6 +7,7 @@
 use crate::avatar::frame::Built;
 use crate::avatar::{AvatarPlayer, Avatars, Stage, Who};
 use crate::backdrop::FieldView;
+use crate::battle::scene::{scene_for, BattleScene, ModelKit};
 use crate::battle::{battle_vertices, draw_battle_text, BattleCmd};
 use crate::cli::exit;
 use crate::interp::render_time;
@@ -324,6 +325,11 @@ pub(crate) struct App {
     last_title_party: (usize, Option<fmv_protocol::InviteId>),
     /// What the title last said about the battle (empty outside one).
     last_title_battle: String,
+    /// The 3D scene of the battle being fought (made when a battle is first drawn, dropped when
+    /// the window is out of battles; `None` draws the flat view).
+    battle_scene: Option<BattleScene>,
+    /// The models the battle scenes use (this machine's own character archive), loaded on first use.
+    battle_kit: Option<ModelKit>,
     left: bool,
     failure: Option<String>,
     /// The players' character models (FF7 fields with this machine's own `char.lgp` only).
@@ -362,6 +368,8 @@ impl App {
             last_title: now.checked_sub(TITLE_REFRESH).unwrap_or(now),
             last_title_party: (0, None),
             last_title_battle: String::new(),
+            battle_scene: None,
+            battle_kit: None,
             left: false,
             failure: None,
             avatars,
@@ -570,16 +578,26 @@ impl App {
         let render_t = render_time(now);
         let dt = (now - self.last_draw_t).clamp(0.0, f64::from(MAX_DT)) as f32;
         self.last_draw_t = now;
-        // In a battle the whole window is the battle view: flat rectangles with the UI font's text
-        // (names, HP, whose turn) over them.
+        // In a battle the whole window is the battle: the 3D scene when it can be had, else the flat
+        // rectangles of the battle view, with the UI font's text (names, HP, whose turn) over it.
         if let Some(battle) = self.session.state.battle.view(now) {
             let (vw, vh) = renderer.size();
             let mut overlay = DrawList::new();
+            // What the last messages did is taken every frame, drawn as a scene or not.
+            let events = self.session.state.battle.take_events();
+            let drawn = scene_for(&mut self.battle_scene, &mut self.battle_kit, &self.session.state, &battle, now, &events).map(|scene| {
+                let view = scene.view(vw, vh);
+                scene.draw_overlay(&view, battle.status, &mut overlay);
+                (scene, view)
+            });
             draw_battle_text(&battle, vw, vh, &mut overlay);
             if let Some(text) = notice {
                 draw_notice(text, vw, vh, &mut overlay);
             }
-            let result = renderer.render_flat(|w, h, srgb| battle_vertices(&battle, w, h, srgb), Some(&overlay));
+            let result = match drawn {
+                Some((scene, view)) => renderer.render_battle(|_, _, srgb| scene.frame(&view, srgb), Some(&overlay)),
+                None => renderer.render_flat(|w, h, srgb| battle_vertices(&battle, w, h, srgb), Some(&overlay)),
+            };
             let gpu_error = renderer.first_gpu_error();
             match (result, gpu_error) {
                 (FrameResult::Fatal(msg), _) => self.fail(el, msg),
@@ -588,6 +606,8 @@ impl App {
             }
             return;
         }
+        // Out of battles: whatever scene there was is over.
+        self.battle_scene = None;
         let view = &self.view;
         let state = &self.session.state;
         let draw = field_draw(self.avatars.as_mut(), &mut self.npc_epoch, view, state, self.session.info.tint, render_t, dt);
