@@ -8,6 +8,7 @@
 //! there, exactly as the server will place it.
 
 use crate::cli::BotKind;
+use crate::nav::plan_path;
 use crate::net::PartyCommand;
 use crate::party::PartyMirror;
 use fmv_adapter_api::{AreaKey, AreaRuntime, Bounds, Exit, MoveResult};
@@ -207,11 +208,14 @@ pub struct TravelGate {
 /// What `--travel` does: walk through the exits to a list of areas, in order. A pure state machine
 /// over the area's own exits and `validate_move`; nothing here touches the network or the clock.
 ///
-/// Each step heads for the middle of the exit that leads to the next area (aiming a little past it,
-/// so the crossing really happens) and, when the straight way is not walkable, takes the nearest
-/// heading that is and gets closer to the goal. It never crosses an exit other than the one it
-/// wants. The bot gives up (and says so) when no exit of the current area leads to the next area, or
-/// when it makes no headway for [`STUCK_LIMIT`] steps.
+/// It plans a way to the middle of the exit that leads to the next area (aiming a little past it, so
+/// the crossing really happens) with [`plan_path`]: a few long straight legs that keep clear of the
+/// walls, which is what the server's chord check agrees to (a bot that slid along walls step by step
+/// made chords it refused, over and over). Should the planner find no way, or a leg turn out blocked,
+/// it falls back to the greedy fan: each step takes the heading nearest the goal's that is walkable
+/// and gets closer. It never crosses an exit other than the one it wants. The bot gives up (and says
+/// so) when no exit of the current area leads to the next area, or when it makes no headway for
+/// [`STUCK_LIMIT`] steps.
 #[derive(Debug)]
 pub struct TravelBot {
     /// The areas still to go to; the front one is next.
@@ -224,7 +228,29 @@ pub struct TravelBot {
     stuck: u32,
     /// Why the bot gave up, if it did.
     gave_up: Option<String>,
+    /// The planned legs to the exit of the area it is in.
+    plan: Option<Plan>,
+    /// Steps to go before planning is tried again after it found nothing or a leg was blocked.
+    plan_cooldown: u32,
+    /// Plans that came to nothing in this area (the greedy fan takes over for good after a few).
+    failed_plans: u32,
 }
+
+/// The planned way to an exit.
+#[derive(Debug, Clone)]
+struct Plan {
+    /// The area it is for, and the area it leads to.
+    area: AreaKey,
+    target: String,
+    /// The first waypoint is where the bot was; `next` is the one it walks to.
+    waypoints: Vec<Pos>,
+    next: usize,
+}
+
+/// Steps to wait before planning again after a plan failed (a second at 100 steps per second).
+const PLAN_COOLDOWN_STEPS: u32 = 100;
+/// Plans that may fail in one area before the bot stops planning there.
+const MAX_FAILED_PLANS: u32 = 4;
 
 /// Steps without headway after which a [`TravelBot`] gives up (at 100 steps per second: 5 s).
 pub const STUCK_LIMIT: u32 = 500;
@@ -232,7 +258,16 @@ pub const STUCK_LIMIT: u32 = 500;
 impl TravelBot {
     /// `route`: the areas to travel to, in order (empty: the bot does not travel).
     pub fn new(route: Vec<String>, wait_for_party: bool) -> Self {
-        Self { route: route.into(), wait_for_party, arrived_at: None, stuck: 0, gave_up: None }
+        Self {
+            route: route.into(),
+            wait_for_party,
+            arrived_at: None,
+            stuck: 0,
+            gave_up: None,
+            plan: None,
+            plan_cooldown: 0,
+            failed_plans: 0,
+        }
     }
 
     /// There is somewhere left to go (and the bot has not given up).
@@ -255,6 +290,9 @@ impl TravelBot {
     /// as it was: the bot goes on from wherever it is).
     pub fn arrived(&mut self, area: &str, now: f64) -> bool {
         self.stuck = 0;
+        self.plan = None;
+        self.plan_cooldown = 0;
+        self.failed_plans = 0;
         self.arrived_at = Some(now);
         if self.route.front().is_some_and(|next| next.eq_ignore_ascii_case(area)) {
             self.route.pop_front();
@@ -284,12 +322,12 @@ impl TravelBot {
     /// Advance the bot by `dt` seconds from `cur` at `speed` units per second.
     pub fn step(&mut self, area: &dyn AreaRuntime, cur: Pos, dt: f32, speed: f32) -> BotStep {
         let still = BotStep { pos: cur, facing: None, moved: false };
-        let Some(next) = self.route.front().filter(|_| self.gave_up.is_none()) else { return still };
+        let Some(next) = self.route.front().filter(|_| self.gave_up.is_none()).cloned() else { return still };
         if !(dt.is_finite() && dt > 0.0 && speed.is_finite() && speed > 0.0) {
             return still;
         }
         let exits = area.exits();
-        let Some(goal_exit) = exits.iter().find(|e| e.target.eq_ignore_ascii_case(next)) else {
+        let Some(goal_exit) = exits.iter().find(|e| e.target.eq_ignore_ascii_case(&next)) else {
             self.gave_up = Some(format!("no exit of {} leads to {next}", area.info().id));
             return still;
         };
@@ -304,6 +342,10 @@ impl TravelBot {
         let aim = Pos::new(mid.x + ux * OVERSHOOT, mid.y + uy * OVERSHOOT, mid.z);
         let heading = (aim.y - cur.y).atan2(aim.x - cur.x);
         let len = speed * dt;
+
+        if let Some(step) = self.follow_plan(area, &exits, goal_exit, cur, (aim, mid), len, &next) {
+            return step;
+        }
 
         let mut best: Option<(f32, Pos, f32)> = None; // (distance to the aim afterwards, position, heading)
         for deg in FANOUT_DEG {
@@ -335,6 +377,73 @@ impl TravelBot {
                     self.gave_up = Some(format!("stuck on the way to the exit to {next} at ({:.0}, {:.0})", cur.x, cur.y));
                 }
                 still
+            }
+        }
+    }
+
+    /// One step along the planned legs to the exit (planning them first when there is no plan for
+    /// this area and target). `None`: no plan could be made or the next leg is blocked; the caller
+    /// takes a greedy step instead and the plan is made again after a pause.
+    #[allow(clippy::too_many_arguments)]
+    fn follow_plan(
+        &mut self,
+        area: &dyn AreaRuntime,
+        exits: &[Exit],
+        goal_exit: &Exit,
+        cur: Pos,
+        (aim, mid): (Pos, Pos),
+        len: f32,
+        next: &str,
+    ) -> Option<BotStep> {
+        if self.failed_plans >= MAX_FAILED_PLANS {
+            return None;
+        }
+        let key = area.info().id.key.clone();
+        if self.plan.as_ref().is_none_or(|p| p.area != key || !p.target.eq_ignore_ascii_case(next)) {
+            self.plan = None;
+            if self.plan_cooldown > 0 {
+                self.plan_cooldown -= 1;
+                return None;
+            }
+            match plan_path(area, cur, aim).or_else(|| plan_path(area, cur, mid)) {
+                Some(waypoints) => self.plan = Some(Plan { area: key, target: next.to_string(), waypoints, next: 1 }),
+                None => {
+                    self.failed_plans += 1;
+                    self.plan_cooldown = PLAN_COOLDOWN_STEPS;
+                    return None;
+                }
+            }
+        }
+        let plan = self.plan.as_mut()?;
+        while plan.waypoints.get(plan.next).is_some_and(|wp| cur.dist_xy(*wp) < 1.0) {
+            plan.next += 1;
+        }
+        let Some(wp) = plan.waypoints.get(plan.next).copied() else {
+            // Every waypoint is behind us and the exit was not crossed: the plan has run out.
+            self.plan = None;
+            self.failed_plans += 1;
+            return None;
+        };
+        let dist = cur.dist_xy(wp);
+        let (ux, uy) = ((wp.x - cur.x) / dist, (wp.y - cur.y) / dist);
+        let step_len = len.min(dist);
+        let want = Pos::new(cur.x + ux * step_len, cur.y + uy * step_len, cur.z);
+        // Other exits are not for us; the wanted one is crossed on purpose.
+        let blocked = exits.iter().any(|e| !std::ptr::eq(e, goal_exit) && e.is_crossed_by(cur, want));
+        match area.validate_move(cur, want) {
+            MoveResult::Accepted(p) if p.is_finite() && !blocked => {
+                if step_len >= dist {
+                    plan.next += 1;
+                }
+                self.stuck = 0;
+                Some(BotStep { pos: p, facing: Some(uy.atan2(ux)), moved: true })
+            }
+            _ => {
+                // The leg is not walkable after all (or crosses another exit): plan again later.
+                self.plan = None;
+                self.failed_plans += 1;
+                self.plan_cooldown = PLAN_COOLDOWN_STEPS;
+                None
             }
         }
     }
@@ -955,4 +1064,99 @@ mod travel_tests {
 
     /// Near the hall's exit line (x = 300).
     const EXIT_X_NEAR: f32 = 280.0;
+
+    /// The L-shaped FIXTURE plaza with an exit at the far end of its arm: a notch between the main
+    /// part and the arm cuts the straight way from the top left to the exit.
+    struct PlazaWithExit {
+        inner: Box<dyn AreaRuntime>,
+        exit: Exit,
+    }
+
+    impl AreaRuntime for PlazaWithExit {
+        fn info(&self) -> &fmv_adapter_api::AreaInfo {
+            self.inner.info()
+        }
+        fn spawn_points(&self) -> Vec<Pos> {
+            self.inner.spawn_points()
+        }
+        fn validate_move(&self, from: Pos, to: Pos) -> MoveResult {
+            self.inner.validate_move(from, to)
+        }
+        fn bounds(&self) -> Bounds {
+            self.inner.bounds()
+        }
+        fn walk_triangles(&self) -> Vec<[Pos; 3]> {
+            self.inner.walk_triangles()
+        }
+        fn max_speed(&self) -> f32 {
+            self.inner.max_speed()
+        }
+        fn exits(&self) -> Vec<Exit> {
+            vec![self.exit.clone()]
+        }
+    }
+
+    fn plaza_with_exit() -> PlazaWithExit {
+        let inner = fmv_fixture::FixtureAdapter::new().load_area(fmv_fixture::FIXTURE_AREA_KEY).unwrap();
+        let exit = Exit {
+            line: (Pos::new(680.0, -100.0, 0.0), Pos::new(680.0, -20.0, 0.0)),
+            target: "far".into(),
+            arrival: Pos::default(),
+            arrival_facing: None,
+            arrival_hint: None,
+            kind: fmv_adapter_api::ExitKind::Gateway,
+        };
+        PlazaWithExit { inner, exit }
+    }
+
+    /// What the server does with the chord between two announced positions: walk it in short steps
+    /// (at most `max_speed / 60` each), every one accepted from where the last one ended.
+    fn server_accepts_chord(area: &dyn AreaRuntime, from: Pos, to: Pos) -> bool {
+        let step = f64::from(area.max_speed()) / 60.0;
+        let dist = f64::from(from.dist_xy(to));
+        let n = ((dist / step).ceil() as usize).clamp(1, 64);
+        let mut cur = from;
+        for i in 1..=n {
+            let t = i as f32 / n as f32;
+            let want = Pos::new(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t, cur.z);
+            match area.validate_move(cur, want) {
+                MoveResult::Accepted(p) => cur = p,
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    #[test]
+    fn a_travel_bot_plans_around_a_corner_and_its_announcements_are_chords_the_server_accepts() {
+        let area = plaza_with_exit();
+        let start = Pos::new(-350.0, 280.0, 0.0);
+        // The straight way to the exit crosses the notch: the greedy fan alone would have to slide.
+        let mid = area.exit.midpoint();
+        assert!(!server_accepts_chord(&area, start, mid), "the premise: the straight way is blocked");
+        let mut bot = TravelBot::new(vec!["far".into()], false);
+        let speed = area.max_speed() * BOT_SPEED_FACTOR;
+        let mut cur = start;
+        let mut positions = vec![cur];
+        let mut crossed_at = None;
+        for i in 0..4000 {
+            let step = bot.step(&area, cur, DT, speed);
+            assert!(cur.dist_xy(step.pos) <= speed * DT * 1.001);
+            if area.exit.is_crossed_by(cur, step.pos) {
+                crossed_at = Some(i);
+                break;
+            }
+            cur = step.pos;
+            positions.push(cur);
+        }
+        let steps = crossed_at.expect("the bot reached the exit");
+        assert!(bot.gave_up().is_none(), "{:?}", bot.gave_up());
+        // About the length of the detour at the bot's speed, not a wander.
+        assert!((steps as f32) * speed * DT < start.dist_xy(mid) * 1.4, "{steps} steps");
+        // The client announces a position every 50 ms (here: every step is 50 ms): any two announced
+        // positions a few steps apart must be a chord the server walks.
+        for window in positions.windows(4) {
+            assert!(server_accepts_chord(&area, window[0], window[3]), "the chord {:?} -> {:?} would be refused", window[0], window[3]);
+        }
+    }
 }

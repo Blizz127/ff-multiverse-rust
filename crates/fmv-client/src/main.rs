@@ -23,6 +23,7 @@ mod ff7;
 mod headless;
 mod interp;
 mod login;
+mod nav;
 mod net;
 mod npc;
 mod party;
