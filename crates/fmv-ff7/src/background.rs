@@ -30,6 +30,12 @@
 //! * Across the 702 field entries every tile of 700 fields decodes; the 312 tiles of `lastmap`
 //!   and `fr_e` that name a palette page past the palette section are skipped
 //!   ([`LayerInfo::tiles_unrenderable`]).
+//! * Depth (see [`depth`]): a layer-2 tile's depth in [`Projection`] units is `4 * id`. The PC-only
+//!   `IDBig` of the tiles is the Direct3D z-buffer value of that depth with the engine's near plane 50
+//!   and far plane 32 000 in 394 of 451 fitted fields, and the floor at the foot of 4 015 layer-2
+//!   objects lies at 1.01 (median; 0.98 to 1.06 for the middle half) times `4 * id` from the camera.
+//!   Painting [`decode_background_tiles_with_depth`]'s tiles in order reproduces
+//!   [`decode_background`]'s picture bit for bit in all 702 fields.
 //!
 //! # Sources
 //!
@@ -101,12 +107,18 @@
 //!
 //! Caveats: blended tiles in the front-only image blend against black (additive tiles are fine,
 //! average and subtractive ones come out wrong); the front half is one flat image, whereas the game
-//! depth-sorts layer-2 tiles against each character through the tile `id`, which this crate does
-//! not interpret (a client that wants that can build per-tile quads from
-//! [`crate::field::Background::tiles`] and [`crate::field::Background::tile_rgba`]). In a field
-//! such as `md1stin`, whose layer 2 is large, a character standing behind a layer-2 object is
-//! covered by it in this split exactly as in the game, but a character the game would draw in front
-//! of a layer-2 tile is covered here too.
+//! depth-sorts layer-2 tiles against each character. In a field such as `md1stin`, whose layer 2 is
+//! large, a character standing behind a layer-2 object is covered by it in this split exactly as in
+//! the game, but a character the game would draw in front of a layer-2 tile is covered here too.
+//!
+//! **For the game's own layering use per-tile depth** ([`depth`]): a layer-2 tile's depth is `4 *
+//! id` in the camera-space units of [`Projection::project`]'s `depth` (verified on all 702 owned
+//! fields, see that module), and a character is hidden by the tiles it overlaps that are nearer
+//! than it. [`decode_background_tiles_with_depth`] returns every tile as a quad with its depth,
+//! blend mode, pixels and rectangle, back to front, for a renderer that draws the tiles in the
+//! same depth-tested pass as the characters (layer 1 and 3 at their far depths, layer 4 at 0);
+//! [`depth_of_point`] gives a world point's depth in the same units and [`depth::pack_atlas`] puts
+//! the tiles' pixels in one texture.
 //!
 //! **Never show the back half on its own**: it is not a finished picture. Under the layer-2
 //! objects of `md1stin` the back half holds 6 277 opaque pure-green `(0, 255, 0)` pixels (a key
@@ -123,6 +135,13 @@
 //! access is bounds-checked and no input value is used as an unchecked index.
 
 use crate::field::{Background, Camera, FieldError, FieldFile, Palette, TileSprite, MAX_TILE_DST};
+
+pub mod depth;
+
+pub use depth::{
+    decode_background_tiles_with_depth, decode_background_tiles_with_depth_options, depth_of_id, depth_of_point,
+    tile_depth, tile_hides_point, DepthTile, TILE_DEPTH_PER_ID,
+};
 
 /// Logical width of the field screen in field-screen units.
 pub const SCREEN_WIDTH: i32 = 320;
