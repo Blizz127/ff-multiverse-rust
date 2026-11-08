@@ -129,6 +129,60 @@ impl Offscreen {
         }
         out
     }
+
+    /// Draw with `draw` (given the GPU, a `w` x `h` target and whether it is sRGB) and read the
+    /// target back: tightly packed RGBA8, top row first.
+    pub fn render_with(&mut self, w: u32, h: u32, draw: impl FnOnce(&mut Gpu, &wgpu::TextureView, bool)) -> Vec<u8> {
+        let format = self.format;
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("offscreen-battle"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        draw(&mut self.gpu, &view, format.is_srgb());
+        let padded = (w * 4).next_multiple_of(256);
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback-battle"),
+            size: u64::from(padded * h),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        enc.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(padded), rows_per_image: Some(h) },
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        self.queue.submit(std::iter::once(enc.finish()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        readback.slice(..).map_async(wgpu::MapMode::Read, move |r| tx.send(r).expect("send"));
+        self.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+        rx.recv().expect("map callback").expect("map");
+        let data = readback.slice(..).get_mapped_range().expect("mapped range");
+        let mut out = Vec::with_capacity((w * h * 4) as usize);
+        for row in data.chunks(padded as usize).take(h as usize) {
+            out.extend_from_slice(&row[..(w * 4) as usize]);
+        }
+        out
+    }
+
+    /// Render a frame of the 3D battle scene ([`crate::battle::scene`]) and then the UI `overlay`
+    /// into a `w` x `h` target, the window's own sequence ([`Gpu::draw_battle`]).
+    pub fn render_battle(&mut self, w: u32, h: u32, frame: &crate::battle::scene::BattleFrame, overlay: &DrawList) -> Vec<u8> {
+        self.render_with(w, h, |gpu, view, srgb| {
+            gpu.draw_battle(view, (w, h), frame, srgb);
+            gpu.draw_overlay(view, &overlay.vertices(w, h, srgb));
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
