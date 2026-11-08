@@ -63,6 +63,7 @@ pub mod background;
 pub mod field;
 pub mod lgp;
 pub mod lzss;
+pub mod script;
 
 mod util;
 mod walk;
