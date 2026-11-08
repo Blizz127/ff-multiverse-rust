@@ -107,7 +107,6 @@ impl OwnPlayer {
     pub fn facing(&self) -> f32 {
         self.facing
     }
-    #[cfg(test)]
     pub fn anim(&self) -> AnimState {
         self.anim
     }
@@ -159,7 +158,14 @@ impl OwnPlayer {
     /// (`MoveResult::Corrected` to a different spot: we were off the walkable surface, or at the
     /// wrong height) we are placed there, as the server will do. Returns true if the position
     /// changed.
+    #[allow(dead_code)] // the plain entry point (the window uses `walk_as`); tests and bots walk with it
     pub fn walk(&mut self, area: &dyn AreaRuntime, dir: (f32, f32), speed: f32, dt: f32) -> bool {
+        self.walk_as(area, dir, speed, dt, AnimState::Walk)
+    }
+
+    /// [`OwnPlayer::walk`] announcing `moving` (`Walk` or `Run`) as the animation while the player
+    /// moves: the window runs by default and walks while Shift is held.
+    pub fn walk_as(&mut self, area: &dyn AreaRuntime, dir: (f32, f32), speed: f32, dt: f32, moving: AnimState) -> bool {
         let len = dir.0.hypot(dir.1);
         if !(len.is_finite() && len > 1e-6 && dt.is_finite() && dt > 0.0 && speed.is_finite()) {
             self.anim = AnimState::Idle;
@@ -177,7 +183,7 @@ impl OwnPlayer {
             match area.validate_move(self.pos, to) {
                 MoveResult::Accepted(p) if p.is_finite() => {
                     self.pos = p;
-                    self.anim = AnimState::Walk;
+                    self.anim = moving;
                     return true;
                 }
                 // Refused AND told to stand elsewhere. (A correction onto the spot we already
@@ -257,6 +263,9 @@ pub struct RemoteView {
     pub id: EntityId,
     pub name: String,
     pub tint: [u8; 3],
+    /// The look the avatar names (untrusted text, at most [`MAX_APPEARANCE_REF`] bytes): the
+    /// window looks it up in its table of characters and never trusts it for anything else.
+    pub appearance: Option<String>,
     pub pose: Pose,
 }
 
@@ -264,6 +273,7 @@ pub struct RemoteView {
 struct Remote {
     name: String,
     tint: [u8; 3],
+    appearance: Option<String>,
     buf: SnapshotBuffer,
 }
 
@@ -307,6 +317,15 @@ impl NpcView {
     }
 }
 
+/// Longest `appearance_ref` kept from the network (the server's own limit); a longer one is
+/// dropped, which draws the default look.
+pub const MAX_APPEARANCE_REF: usize = 64;
+
+/// An `appearance_ref` from the network as stored: at most [`MAX_APPEARANCE_REF`] bytes.
+fn kept_appearance(avatar: &AvatarAppearance) -> Option<String> {
+    avatar.appearance_ref.as_deref().filter(|r| r.len() <= MAX_APPEARANCE_REF).map(str::to_string)
+}
+
 #[derive(Debug)]
 pub struct ClientState {
     self_entity: EntityId,
@@ -329,6 +348,8 @@ pub struct ClientState {
     /// to where we were do not count).
     area_changes: u64,
     last_rtt: Option<Duration>,
+    /// The look the server shows for our own entity (from its snapshots).
+    own_appearance: Option<String>,
 }
 
 impl ClientState {
@@ -348,6 +369,7 @@ impl ClientState {
             rejected: 0,
             area_changes: 0,
             last_rtt: None,
+            own_appearance: None,
         }
     }
 
@@ -405,6 +427,10 @@ impl ClientState {
     pub fn set_rtt(&mut self, rtt: Duration) {
         self.last_rtt = Some(rtt);
     }
+    /// The look the server shows for our own entity (`appearance_ref`), if it said.
+    pub fn own_appearance(&self) -> Option<&str> {
+        self.own_appearance.as_deref()
+    }
 
     /// Apply one server message. Returns `Some(reason)` when the session must end: the server
     /// ended it, or broke the protocol in a way that would mix content (an area is only ever
@@ -452,7 +478,9 @@ impl ClientState {
                     self.area
                 ));
             }
-            ServerMsg::Reject { reason } => {
+            // The server's own sentence, cleaned, is all the player is told: nothing here decides
+            // anything from the words, and the code has no use yet for a session that is over.
+            ServerMsg::Reject { reason, code: _ } => {
                 return Some(format!("server ended the session: {}", crate::net::clean(&reason)));
             }
             // `Welcome` and `Pong` carry nothing the game state needs after the handshake.
@@ -477,6 +505,7 @@ impl ClientState {
         }
         if snap.id == self.self_entity {
             self.own.note_server_pos(now, snap.pos);
+            self.own_appearance = kept_appearance(&snap.avatar);
             return;
         }
         if self.peers_seen.len() < MAX_PEERS_SEEN {
@@ -489,10 +518,12 @@ impl ClientState {
         let r = self.remotes.entry(snap.id).or_insert_with(|| Remote {
             name: String::new(),
             tint: snap.avatar.tint,
+            appearance: None,
             buf: SnapshotBuffer::default(),
         });
         r.name = name;
         r.tint = snap.avatar.tint;
+        r.appearance = kept_appearance(&snap.avatar);
         r.buf.push(Sample {
             t: now,
             pose: Pose {
@@ -522,6 +553,7 @@ impl ClientState {
                     id: *id,
                     name: r.name.clone(),
                     tint: r.tint,
+                    appearance: r.appearance.clone(),
                     pose,
                 })
             })
@@ -535,6 +567,7 @@ mod tests {
     use fmv_adapter_api::{AreaInfo, Bounds, GameAdapter};
     use fmv_core::{Fingerprint, GameId};
     use fmv_fixture::{FixtureAdapter, FIXTURE_AREA_KEY};
+    use fmv_protocol::RejectCode;
     use std::f32::consts::PI;
 
     fn snap(id: u64, x: f32, y: f32) -> EntitySnapshot {
@@ -835,13 +868,14 @@ mod tests {
     #[test]
     fn reject_ends_the_session() {
         let mut s = state(Pos::default());
-        let r = s.apply(
-            0.0,
-            ServerMsg::Reject {
-                reason: "server full".into(),
-            },
-        );
-        assert!(r.unwrap().contains("server full"));
+        let r = s.apply(0.0, ServerMsg::reject(RejectCode::ServerFull, "server full"));
+        assert_eq!(r.as_deref(), Some("server ended the session: server full"));
+        // Whatever the code, the session ends and the player is told the server's own words.
+        for code in RejectCode::ALL {
+            let mut s = state(Pos::default());
+            let r = s.apply(0.0, ServerMsg::reject(code, "gone\u{1b}[0m for now"));
+            assert_eq!(r.as_deref(), Some("server ended the session: gone[0m for now"), "{code:?}");
+        }
     }
 
     #[test]
@@ -878,6 +912,80 @@ mod tests {
         assert_eq!(last.anim, AnimState::Idle);
         assert!(o.next_intent(t + 2.0).is_none());
         assert!(o.next_intent(t + 3.0).is_none());
+    }
+
+    /// The window runs by default and walks while Shift is held: `walk_as` announces the pace it
+    /// is given, `walk` stays the plain walk, and standing still is still Idle.
+    #[test]
+    fn walk_as_announces_run_or_walk_and_a_blocked_step_is_idle() {
+        let area = area();
+        for moving in [AnimState::Run, AnimState::Walk] {
+            let mut s = state(Pos::new(0.0, 0.0, 0.0));
+            assert!(s.own.walk_as(area.as_ref(), (1.0, 0.0), 240.0, 1.0 / 20.0, moving));
+            assert_eq!(s.own.anim(), moving);
+            let intent = s.own.next_intent(1.0).expect("moving is announced");
+            assert_eq!(intent.anim, moving, "the intent a server sees carries the pace");
+            assert!(intent.pos.x > 0.0);
+            // Stopping announces Idle, whatever pace was asked for.
+            assert!(!s.own.walk_as(area.as_ref(), (0.0, 0.0), 240.0, 1.0 / 20.0, moving));
+            assert_eq!(s.own.anim(), AnimState::Idle);
+            assert_eq!(s.own.next_intent(2.0).expect("the stop is announced").anim, AnimState::Idle);
+        }
+        // The plain walk is a Walk.
+        let mut o = OwnPlayer::new(Pos::new(0.0, 0.0, 0.0));
+        assert!(o.walk(area.as_ref(), (1.0, 0.0), 240.0, 1.0 / 20.0));
+        assert_eq!(o.anim(), AnimState::Walk);
+        // A blocked step (the corner) is Idle even when running was asked for.
+        let mut o = OwnPlayer::new(Pos::new(-400.0, 300.0, 0.0));
+        assert!(!o.walk_as(area.as_ref(), (-1.0, 1.0), 240.0, 1.0 / 60.0, AnimState::Run));
+        assert_eq!(o.anim(), AnimState::Idle);
+    }
+
+    fn avatar_snap(id: u64, appearance: Option<&str>) -> EntitySnapshot {
+        let mut e = snap(id, 0.0, 0.0);
+        e.avatar.appearance_ref = appearance.map(str::to_string);
+        e
+    }
+
+    /// The look a peer names reaches the renderer (untrusted text, bounded), and our own look is
+    /// taken from the server's snapshot of our own entity.
+    #[test]
+    fn appearances_from_the_network_are_kept_bounded_and_the_own_one_comes_from_our_snapshot() {
+        let mut s = state(Pos::new(0.0, 0.0, 0.0));
+        assert_eq!(s.own_appearance(), None, "nothing is known before the first snapshot");
+        let long = "x".repeat(MAX_APPEARANCE_REF + 1);
+        let exact = "y".repeat(MAX_APPEARANCE_REF);
+        s.apply(
+            0.0,
+            ServerMsg::AreaSnapshot {
+                area: plaza(),
+                tick: 1,
+                entities: vec![
+                    avatar_snap(1, Some("ff7/barret")), // our own entity
+                    avatar_snap(2, Some("ff7/tifa")),
+                    avatar_snap(3, None),
+                    avatar_snap(4, Some(&long)),
+                    avatar_snap(5, Some(&exact)),
+                ],
+                npcs: Vec::new(),
+            },
+        );
+        assert_eq!(s.own_appearance(), Some("ff7/barret"));
+        let looks = |s: &ClientState| -> Vec<(u64, Option<String>)> { s.remote_views(1.0).iter().map(|v| (v.id.0, v.appearance.clone())).collect() };
+        assert_eq!(
+            looks(&s),
+            [(2, Some("ff7/tifa".to_string())), (3, None), (4, None), (5, Some(exact.clone()))],
+            "an over-long ref is dropped (the default look is drawn), one at the limit is kept"
+        );
+        // A later update replaces it (and an update without one clears it).
+        s.apply(0.1, update(vec![avatar_snap(2, Some("ff7/aerith")), avatar_snap(3, Some("ff7/cid")), avatar_snap(1, None)]));
+        let now = looks(&s);
+        assert_eq!(now[0], (2, Some("ff7/aerith".to_string())));
+        assert_eq!(now[1], (3, Some("ff7/cid".to_string())));
+        assert_eq!(s.own_appearance(), None);
+        // Players that leave take their look with them.
+        s.apply(0.2, ServerMsg::PlayerLeft { entity: EntityId(2) });
+        assert!(looks(&s).iter().all(|(id, _)| *id != 2));
     }
 
     #[test]

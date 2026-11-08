@@ -11,7 +11,7 @@ use common::*;
 use fmv_core::{AccountId, EntityId, Platform};
 use fmv_persist::Store;
 use fmv_protocol::{
-    ClientMsg, InviteId, PartyError, PartyEvent, PartyFailure, PartyName, Party, ServerMsg, LeaveReason,
+    ClientMsg, InviteId, PartyError, PartyEvent, PartyFailure, PartyName, Party, RejectCode, ServerMsg, LeaveReason,
     LeaderChangeReason,
 };
 use fmv_server::ServerConfig;
@@ -29,14 +29,14 @@ async fn relogin(addr: SocketAddr, token: &str) -> Joined {
                 let (snapshot, placement) = finish_join(&mut client).await;
                 return Joined { client, entity, account, token: token.to_string(), snapshot, placement };
             }
-            ServerMsg::Reject { reason } if reason.contains("already logged in") => sleep(Duration::from_millis(100)).await,
+            ServerMsg::Reject { code: RejectCode::AlreadyOnline, .. } => sleep(Duration::from_millis(100)).await,
             other => panic!("expected Welcome, got {other:?}"),
         }
     }
     panic!("the account's previous session was never released");
 }
 
-fn own<'a>(joined: &'a Joined) -> &'a fmv_core::EntitySnapshot {
+fn own(joined: &Joined) -> &fmv_core::EntitySnapshot {
     joined.snapshot.iter().find(|e| e.id == joined.entity).expect("the joiner is in its own snapshot")
 }
 
@@ -52,7 +52,9 @@ async fn registration_issues_the_token_once_and_a_token_login_uses_the_stored_pr
     let me = own(&first);
     assert_eq!(me.avatar.display_name, name);
     assert_eq!(me.avatar.tint, [10, 20, 30]);
-    assert_eq!(me.avatar.appearance_ref.as_deref(), Some("test-model"));
+    // The test client asks for "test-model", which the FIXTURE game does not offer: the avatar keeps
+    // the default look (the registration is not refused for it).
+    assert_eq!(me.avatar.appearance_ref, None);
     assert!(first.token.starts_with("fmvt_"), "tokens look like tokens: {}", first.token.len());
     // The placement of a joiner is its own: solo, by its own (default) phase, free to advance.
     assert_eq!(first.placement.account, first.account);
@@ -62,7 +64,7 @@ async fn registration_issues_the_token_once_and_a_token_login_uses_the_stored_pr
     // changes nothing about the first.
     let mut dup = Client::connect(server.addr).await;
     dup.hello_token(&first.token).await;
-    dup.expect_reject("already logged in").await;
+    dup.expect_reject_as(RejectCode::AlreadyOnline, "already logged in").await;
 
     // After the first session ends the token logs the same account in again. The look sent with a
     // token login (tint 99/98/97, "ignored-model") is ignored: the stored profile decides.
@@ -71,7 +73,7 @@ async fn registration_issues_the_token_once_and_a_token_login_uses_the_stored_pr
     assert_eq!(again.account, first.account);
     let me = own(&again);
     assert_eq!((me.avatar.display_name.as_str(), me.avatar.tint), (name.as_str(), [10, 20, 30]));
-    assert_eq!(me.avatar.appearance_ref.as_deref(), Some("test-model"));
+    assert_eq!(me.avatar.appearance_ref, None);
     server.shutdown().await;
 }
 
@@ -85,19 +87,23 @@ async fn refusals_say_why_without_leaking_and_burn_nothing() {
     for spelling in [taken.to_uppercase(), format!("  {taken} "), format!("{taken}\u{200B}"), format!("\u{202E}{taken}")] {
         let mut c = Client::connect(server.addr).await;
         c.hello(&spelling).await;
-        c.expect_reject("already taken").await;
+        c.expect_reject_as(RejectCode::NameTaken, "already taken").await;
     }
     // Nothing visible left of the name.
     for empty in ["", "   ", "\u{200B}\u{FEFF}", "\u{7}"] {
         let mut c = Client::connect(server.addr).await;
         c.hello(empty).await;
-        c.expect_reject("display name must not be empty").await;
+        c.expect_reject_as(RejectCode::InvalidName, "display name must not be empty").await;
     }
+    // A look-alike name (Latin with a Cyrillic letter) is refused with its own reason.
+    let mut c = Client::connect(server.addr).await;
+    c.hello("\u{0422}ifa").await;
+    c.expect_reject_as(RejectCode::InvalidName, "writing systems").await;
     // Unknown, malformed and enormous tokens all get the same answer.
     for bad in ["", "nope", "fmvt_0000000000", &"x".repeat(100_000)] {
         let mut c = Client::connect(server.addr).await;
         c.hello_token(bad).await;
-        c.expect_reject("invalid or unknown token").await;
+        c.expect_reject_as(RejectCode::InvalidToken, "invalid or unknown token").await;
     }
     // A refused attempt took neither the id space nor the name: a normal registration still works.
     let ok = join(server.addr, &uniq("Yuffie")).await;
@@ -135,13 +141,95 @@ async fn accounts_survive_a_server_restart_on_the_same_state_directory() {
     let again = join_with_token(server.addr, &token).await;
     assert_eq!(again.account, account);
     assert_eq!(own(&again).avatar.display_name, name);
-    assert_eq!(own(&again).avatar.appearance_ref.as_deref(), Some("test-model"));
+    assert_eq!(own(&again).avatar.appearance_ref, None);
     // The name is still taken across the restart.
     drop(again.client);
     let mut c = Client::connect(server.addr).await;
     c.hello(&name).await;
-    c.expect_reject("already taken").await;
+    c.expect_reject_as(RejectCode::NameTaken, "already taken").await;
     server.shutdown().await;
+}
+
+/// A registration is answered with the token, so its session never logs in with it. What marks the
+/// account as one whose token arrived is the client's FIRST MESSAGE after the `Welcome`, whatever it
+/// asks for: from then on `release_if_unclaimed` (and so `fmv-accounts release-older-than`) refuses it.
+/// Only an account whose client never said anything that decodes stays an orphan candidate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_registration_stops_being_an_orphan_when_its_client_answers_the_welcome() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("claim-state");
+    let server = TestServer::start(ServerConfig { state_dir: Some(state.clone()), ..ServerConfig::default() }).await;
+
+    /// Register and read the `Welcome` (the client then holds its token): the client and its account.
+    async fn welcomed(addr: SocketAddr, prefix: &str) -> (Client, AccountId) {
+        let mut client = Client::connect(addr).await;
+        client.hello(&uniq(prefix)).await;
+        let account = client
+            .until("Welcome", |m| match m {
+                ServerMsg::Welcome { account, issued_token: Some(_), .. } => Some(*account),
+                _ => None,
+            })
+            .await;
+        (client, account)
+    }
+
+    // The first message after the Welcome is...
+    // ...a JoinArea, the normal path (the full handshake follows),
+    let joiner = join(server.addr, &uniq("Joiner")).await;
+    // ...a Ping, answered with a Pong,
+    let (mut pinger, pinged) = welcomed(server.addr, "Pinger").await;
+    pinger.send(&ClientMsg::Ping { nonce: 7 }).await;
+    pinger.until("Pong", |m| matches!(m, ServerMsg::Pong { nonce: 7, .. }).then_some(())).await;
+    // ...a CannotJoin (the client holds the token but not the area),
+    let (mut decliner, declined) = welcomed(server.addr, "Decliner").await;
+    decliner.send(&ClientMsg::CannotJoin { area: fixture_info().id, reason: "no copy of the area".into() }).await;
+    decliner.expect_closed().await;
+    // ...a Leave,
+    let (mut leaver, left) = welcomed(server.addr, "Leaver").await;
+    leaver.send(&ClientMsg::Leave).await;
+    leaver.expect_closed().await;
+    // ...or a message the server refuses (it decoded, so the client spoke the protocol).
+    let (mut eager, eager_account) = welcomed(server.addr, "Eager").await;
+    eager.send(&ClientMsg::PartySync).await;
+    eager.expect_reject_as(RejectCode::BadRequest, "before JoinArea").await;
+
+    // Two clients never answer: one reads the Welcome and says nothing, one sends something that is
+    // not a message. Neither shows that it has its token.
+    let (silent, silent_account) = welcomed(server.addr, "Silent").await;
+    drop(silent);
+    let (mut garbler, garbler_account) = welcomed(server.addr, "Garbler").await;
+    garbler.send_json("this is not json").await;
+    garbler.expect_reject_as(RejectCode::BadRequest, "malformed").await;
+
+    drop((joiner.client, pinger));
+    server.shutdown().await;
+
+    // What the store says afterwards (the server is gone, so the directory can be opened).
+    let store = Store::open(&state).unwrap();
+    let orphans: Vec<AccountId> = store.unclaimed_accounts().into_iter().map(|(account, _)| account).collect();
+    assert_eq!(
+        orphans,
+        {
+            let mut expected = vec![silent_account, garbler_account];
+            expected.sort();
+            expected
+        },
+        "only the two accounts whose clients never answered are orphans"
+    );
+    for (what, account) in [
+        ("joined", joiner.account),
+        ("pinged", pinged),
+        ("cannot-joined", declined),
+        ("left", left),
+        ("was refused", eager_account),
+    ] {
+        assert!(!store.release_if_unclaimed(account).unwrap(), "an account whose client {what} must not be released");
+        assert!(store.find_account_by_name(&store.account_info(account).unwrap().unwrap().display_name).is_some(), "{what}: still there");
+    }
+    // The ghosts are the ones that can be freed.
+    assert!(store.release_if_unclaimed(silent_account).unwrap());
+    assert!(store.release_if_unclaimed(garbler_account).unwrap());
+    assert_eq!(store.account_count(), 5);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -167,7 +255,7 @@ async fn registration_can_be_closed_and_is_rate_limited() {
     let closed = TestServer::start(ServerConfig { state_dir: Some(state), allow_registration: false, ..ServerConfig::default() }).await;
     let mut c = Client::connect(closed.addr).await;
     c.hello(&uniq("Newcomer")).await;
-    c.expect_reject("registration is closed").await;
+    c.expect_reject_as(RejectCode::RegistrationClosed, "registration is closed").await;
     let veteran = join_with_token(closed.addr, &token).await;
     assert_eq!(own(&veteran).avatar.display_name, "Veteran", "tokens keep working (an avatar is made on demand)");
     closed.shutdown().await;
@@ -178,7 +266,7 @@ async fn registration_can_be_closed_and_is_rate_limited() {
     let _two = join(limited.addr, &uniq("Rl")).await;
     let mut c = Client::connect(limited.addr).await;
     c.hello(&uniq("Rl")).await;
-    c.expect_reject("too many registrations").await;
+    c.expect_reject_as(RejectCode::RateLimited, "too many registrations").await;
     drop(one.client);
     let back = relogin(limited.addr, &one.token).await;
     assert_eq!(back.account, one.account);
@@ -197,7 +285,8 @@ async fn the_edition_a_client_names_must_match_next_to_the_fingerprint() {
 
     // The right fingerprint with a different edition, region, revision, platform or game is
     // refused with the reason (the fingerprint alone would have let it in).
-    let wrong: [(&str, fn(&mut fmv_core::ProvenanceSummary)); 5] = [
+    type Change = fn(&mut fmv_core::ProvenanceSummary);
+    let wrong: [(&str, Change); 5] = [
         ("edition", |p| p.edition = "another edition".into()),
         ("region", |p| p.region = "PAL".into()),
         ("revision", |p| p.revision = "other".into()),
@@ -211,7 +300,7 @@ async fn the_edition_a_client_names_must_match_next_to_the_fingerprint() {
         let _ = c.next().await; // Welcome
         let _ = c.next().await; // AreaManifest
         c.send(&attempt(change)).await;
-        c.expect_reject("edition mismatch").await;
+        c.expect_reject_as(RejectCode::ContentMismatch, "edition mismatch").await;
     }
 
     // The language and the modded flag do not make a peer incompatible (`compatible_with`).
@@ -232,12 +321,7 @@ async fn the_edition_a_client_names_must_match_next_to_the_fingerprint() {
     let _ = long.next().await;
     let _ = long.next().await;
     long.send(&attempt(|p| p.edition = "e".repeat(5_000))).await;
-    let reason = long
-        .until("Reject", |m| match m {
-            ServerMsg::Reject { reason } => Some(reason.clone()),
-            _ => None,
-        })
-        .await;
+    let (_, reason) = long.next_reject().await;
     assert!(reason.contains("edition mismatch") && reason.len() < 600, "{} bytes", reason.len());
     server.shutdown().await;
 }
@@ -480,7 +564,7 @@ async fn party_requests_before_joining_the_area_are_refused() {
     let _ = c.next().await; // Welcome
     let _ = c.next().await; // AreaManifest
     c.send(&ClientMsg::PartyInvite { target: EntityId(1) }).await;
-    c.expect_reject("unexpected message before JoinArea").await;
+    c.expect_reject_as(RejectCode::BadRequest, "unexpected message before JoinArea").await;
     server.shutdown().await;
 }
 

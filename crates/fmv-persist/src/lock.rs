@@ -8,8 +8,16 @@
 //! A LOCK whose owner is gone is taken over with a warning; a LOCK whose owner is alive, or
 //! cannot be judged, refuses the open. Acquisition is serialized with an advisory `flock`
 //! on the state directory so two servers starting at once after a crash cannot both take over.
+//!
+//! A pid says nothing across PID namespaces: a second server in another container that shares
+//! the state directory cannot see the owner's pid, or sees another process under it, and would
+//! judge a live owner dead and take the directory over, leaving two writers. So the owner also
+//! holds an exclusive `flock` on the LOCK file itself for as long as it lives (the kernel
+//! drops it when the process dies, however it dies), and a takeover is only done when that
+//! lock can be taken, that is, when nobody on this kernel holds it. Where the filesystem has no
+//! `flock` the pid judgement stands alone, as before.
 
-use std::fs::{self, File};
+use std::fs::{self, File, TryLockError};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
@@ -26,6 +34,9 @@ pub(crate) struct LockGuard {
     path: PathBuf,
     pid: u32,
     start_ticks: Option<u64>,
+    /// The `flock` on the LOCK file, held until the guard is gone. `None` where the filesystem
+    /// does not support it. (Dropped after `Drop::drop` has removed the file.)
+    _flock: Option<File>,
 }
 
 /// Parsed LOCK file.
@@ -214,6 +225,31 @@ fn serialize_acquire(_root: &Path) -> Option<AcquireSerializer> {
     None
 }
 
+/// Take an exclusive `flock` on `path` and keep it open. `None` if it cannot be had (the
+/// filesystem has no `flock`, or somebody else holds it), which the caller treats as "no
+/// lifetime lock".
+fn hold_flock(path: &Path) -> Option<File> {
+    let file = File::open(path).ok()?;
+    file.try_lock().ok()?;
+    Some(file)
+}
+
+/// Does a live process on this kernel hold the `flock` of `path`? Only a definite "yes" counts;
+/// any other answer (not held, no `flock` support, cannot open) leaves the pid judgement alone.
+fn flock_held_elsewhere(path: &Path) -> bool {
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    match file.try_lock() {
+        Ok(()) => {
+            let _ = file.unlock();
+            false
+        }
+        Err(TryLockError::WouldBlock) => true,
+        Err(TryLockError::Error(_)) => false,
+    }
+}
+
 impl LockGuard {
     /// Take `<root>/LOCK`, taking over a stale one with a warning. `root` must exist.
     pub(crate) fn acquire(root: &Path, warnings: &mut Vec<String>) -> Result<LockGuard> {
@@ -229,6 +265,7 @@ impl LockGuard {
             match create_lock_file(&path, &me) {
                 Ok(()) => {
                     return Ok(LockGuard {
+                        _flock: hold_flock(&path),
                         path,
                         pid: me.pid,
                         start_ticks: me.start_ticks,
@@ -248,6 +285,18 @@ impl LockGuard {
                         path,
                         pid: holder.pid,
                         detail,
+                    })
+                }
+                // The pid says the owner is gone, but a pid is only meaningful in its own PID
+                // namespace: if the owner still holds the flock it is alive, somewhere.
+                Verdict::Stale(_) if flock_held_elsewhere(&path) => {
+                    return Err(PersistError::Locked {
+                        path,
+                        pid: holder.pid,
+                        detail: "the lock file's pid is not visible here, but a live process \
+                                 holds its flock (a server in another PID namespace or \
+                                 container on the same state directory?)"
+                            .into(),
                     })
                 }
                 Verdict::Stale(reason) => {

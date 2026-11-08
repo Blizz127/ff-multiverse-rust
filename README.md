@@ -108,8 +108,9 @@ fmv-client --game ff7 --name Tifa                                          # ter
 `.../steamapps/common/FINAL FANTASY VII Steam Edition/ff7/workingdir`.) The server hosts
 `md1stin` from the library `import-pc` wrote under `~/.local/share/ff-multiverse` and keeps its
 accounts next to it; each client reads the same library and saves its login token next to it. In
-the window, **WASD** walks, **P** invites the nearest player, **Y** accepts an invite, **L**
-leaves the party. A missing display, GPU or server is reported with one clear line.
+the window, **WASD** runs (hold **Shift** to walk), **P** invites the nearest player, **Y**
+accepts an invite, **L** leaves the party. A missing display, GPU or server is reported with one
+clear line.
 
 Without `--name` the window opens on the **character menu** instead (see "Window mode"): pick a
 saved character, or press **N** to create one: `fmv-client --game ff7`.
@@ -153,6 +154,58 @@ The server keeps **accounts** in a state directory it holds locked while it runs
 `~/.local/share/ff-multiverse`). `--ephemeral` keeps accounts only until it stops, and
 `--no-registration` refuses new accounts.
 
+**Limits.** The protocol is not encrypted and the server is meant for a network you trust, but it
+does not let one host hold it hostage either. Every limit has a flag (`--help` lists them; `0`
+turns a limit off) and every refusal says why, in words and as a typed code (see below).
+
+| What | Default | Flag |
+|---|---|---|
+| A connection must send `Hello` within | 3 s | `--hello-timeout-secs` |
+| Connections one address may hold at once (handshaking ones count; an IPv6 /64 is one address, players behind one NAT share it) | 8 | `--max-connections-per-ip` |
+| Accounts one address may create per 10 minutes | 10 | `--registrations-per-ip` |
+| Accounts the whole server creates per minute | 120 | `--registrations-per-minute` |
+| Accounts the store holds, then registration closes and logins go on | 100000 | `--max-accounts` |
+| A joined client that sends nothing at all is dropped after | 30 s | `--idle-timeout-secs` |
+| A joined client that only pings, with no game input, is dropped after | 30 min | `--inactivity-timeout-secs` |
+
+The per-address limits go by the address the TCP connection comes from. A tunnel or proxy that makes
+every player arrive from one address (an SSH forward, for example) shares one allowance between them:
+raise or lift `--max-connections-per-ip` and `--registrations-per-ip` there.
+
+*Registration limits count accounts that were created.* A registration is checked for its name
+and look first, then takes a place in the per-address and server-wide limits, and only an account
+that really comes into being uses the place up: a refused name, a name that is taken or a client that
+hung up costs nobody a place, so a flood of junk registrations cannot lock real players out.
+
+*Idle sessions.* Two clocks end a joined session. Silence (`--idle-timeout-secs`) is a peer that
+vanished. Pinging without playing (`--inactivity-timeout-secs`) is a squatter: an account that only
+answers pings would otherwise hold its slot forever, and 64 of them the whole server. "Game input"
+is anything but a `Ping` (a move, a party request, a battle command); the reference client pings
+every second and moves when its player walks. Whoever steps away for half an hour is told
+"closed for inactivity" and logs in again with the saved token.
+
+*Registration and its token.* The token is sent once, in the `Welcome` that answers the
+registration. The account is created in one step with its avatar (a name is never taken without a
+token having been produced), a client that has already hung up gets no account, and if the `Welcome`
+cannot be written the account is released again, so the name is free for the next try, and once the
+client answers it (its first message after the `Welcome`, whatever it asks for) the account is recorded
+as claimed: `fmv-accounts release-older-than` then only ever frees a registration whose client never
+answered, never a player who registered, played and has not logged in again. (A store written by an
+earlier server has no such records: until each player logs in once with the saved token they look
+unclaimed to `fmv-accounts`, so check `list` and release by id there instead of `release-older-than`.) A look
+(`appearance_ref`) is only ever one of the ids the hosted game offers (`ff7/cloud`, ...); anything
+else keeps the default look instead of failing the registration.
+
+*Refusals are typed.* `Reject { reason, code }`: the `reason` is a sentence for the screen, the `code`
+(`NameTaken`, `InvalidName`, `InvalidToken`, `RegistrationClosed`, `RateLimited`, `AlreadyOnline`,
+`ServerFull`, `TooManyConnections`, `ProtocolMismatch`, `ContentMismatch`, `BadRequest`, `Timeout`,
+`IdleTimeout`, `ShuttingDown`, `Internal`) is what a client acts on. It is additive within protocol
+v3 (an older peer ignores it, a missing or unknown code reads as `Unspecified`).
+
+*Logging.* Junk connections cannot fill the log: past a small budget per address and in total,
+connection events are logged at the debug level and one line says so. Nothing is logged while the
+world lock is held, so a stalled log reader cannot stall the players.
+
 **Run two headless bots** (use `addr` from the READY line, the same `--game ff7` flags as the
 server when it hosts FF7). The first time a bot connects it registers its `--name` as a new
 account and saves the token it is given; each bot runs for the given duration and then prints
@@ -185,8 +238,8 @@ this computer (it asks first, and the default answer keeps it: the character sta
 server, but its token, shown only once at registration, cannot be recovered), **Esc** quits.
 With nothing saved yet it opens on the create screen: a **name** (up to 24 characters, cleaned
 exactly as the server cleans it), a **look** (FF7: Cloud, Tifa, Barret or Aerith; the ids
-`ff7/cloud`, `ff7/tifa`, `ff7/barret`, `ff7/aerith` are stored in the avatar profile and a model
-decoded from your own copy will show them later), and a **tint** (a palette grid plus red, green
+`ff7/cloud`, `ff7/tifa`, `ff7/barret`, `ff7/aerith` are stored in the avatar profile and the game
+draws the matching field model from your own copy, see "In the game"), and a **tint** (a palette grid plus red, green
 and blue sliders; until you pick one it is the colour the command line would derive from the
 name). **Tab** or **Up/Down** move between the fields, **Left/Right** change a value, **Enter**
 registers. If the server refuses (name taken, registration closed, rate limited) the reason is
@@ -196,13 +249,30 @@ token is saved before anything else can fail. `--name` skips the menu (the old b
 machine last saw (the server keeps the real profile and sends it on join), so a login that has
 not joined from this machine yet says "look unknown".
 
-*In the game.* WASD or the arrow keys walk (up walks up the screen, whatever the camera looks
-like), **P** invites the nearest player to your party, **Y** accepts the pending invite, **L**
-leaves the party, Esc quits. Party members get a gold ring around their marker. The window now
-also shows player names over their markers, your party (leader starred) in the top right, the
-area name (`FF7 md1stin`), the connection status (players, round-trip time) and a pending invite;
-a FIXTURE area wears the label `FIXTURE (synthetic, not FF7)`. The window title still shows your
-party size and a pending invite.
+*In the game.* WASD or the arrow keys move (up goes up the screen, whatever the camera looks
+like); in an FF7 field you run, and walk while **Shift** is held (at the field's run and walk
+speeds: hypotheses used for pacing only, the server's own cap is unchanged). **P** invites the
+nearest player to your party, **Y** accepts the pending invite, **L** leaves the party, Esc
+quits, **F1** shows or hides the walkmesh over the picture (hidden by default). The window shows
+player names (over the head of a model, or the marker), your party (leader starred) in the top
+right, the area name (`FF7 md1stin`), the connection status (players, round-trip time) and a
+pending invite; a FIXTURE area wears the label `FIXTURE (synthetic, not FF7)`. The window title
+still shows your party size and a pending invite.
+
+*Characters.* In an FF7 field every player, you included, is drawn as the field model of the
+look they chose (`ff7/cloud`, `ff7/tifa`, ... `ff7/vincent`), standing on the walkmesh at their
+position and facing the way they face, with the idle, walk or run animation of what they are
+doing. The models are read from **your own copy** of the game's `char.lgp` (found in the same
+library set, or next to a `--ff7-flevel` file) and are never sent over the network: the wire
+carries only the look's id. A look this table does not know is drawn as Cloud; every player gets
+a ring on the ground in their tint (yours has a white outline, a party member's a gold ring
+around it). Without a `char.lgp`, in a FIXTURE area, or for a character that fails to load, the
+plain markers are drawn as before. The scenery in front of the characters (background layers 2
+and 4) is drawn over them, but as **one flat picture**: the game sorts each object against each
+character by depth and this does not, so a character standing in front of an object that is
+farther away can be covered by it (in `md1stin` the front layer overlaps a character's outline
+box at 59 of 73 sampled walkable places, most of them because of the far left wall; see
+`crates/fmv-client/src/avatar/mod.rs`); sorting objects against characters is the next step.
 
 *In a battle.* **B** asks the server for a debug battle (refused unless it runs with
 `--debug-encounters`; random encounters start battles by themselves in a field that has an

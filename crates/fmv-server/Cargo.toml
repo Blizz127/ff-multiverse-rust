@@ -1,6 +1,6 @@
 [package]
 name = "fmv-server"
-description = "Authoritative FF Multiverse server (protocol v1). Hosts one area; the FIXTURE area is synthetic and NOT FF7 support."
+description = "Authoritative FF Multiverse server (protocol v3). Hosts one area; the FIXTURE area is synthetic and NOT FF7 support."
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
@@ -23,6 +23,9 @@ fmv-party = { path = "../fmv-party" }
 # The battle engine (server-authoritative; clients replay it) and the rules over the owner's own
 # scene.bin/kernel.bin (read-only; nothing from them is logged or sent).
 fmv-ff7-battle = { path = "../fmv-ff7-battle" }
+# Digest of an oversized progression blob, so it can serve as a bounded `PhaseKey` (see
+# `accounts::phase_key`).
+blake3.workspace = true
 tokio.workspace = true
 clap.workspace = true
 tracing.workspace = true

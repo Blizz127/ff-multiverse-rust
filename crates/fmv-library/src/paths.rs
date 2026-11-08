@@ -15,10 +15,15 @@ pub const MAX_COMPONENT: usize = 255;
 const MAX_SET_ID: usize = 160;
 
 /// State directory: the explicit path, else `$FMV_STATE_DIR`, else `<user data dir>/ff-multiverse`.
+///
+/// A value that is PRESENT but empty (`--state-dir ""`, `FMV_STATE_DIR=`) is an error
+/// ([`LibraryError::EmptyStateDir`]), not "unset": it is almost always an unset shell variable
+/// (`--state-dir "$DIR"`), and silently falling back to the default library would act on the
+/// wrong one.
 pub fn resolve_state_dir(explicit: Option<&Path>) -> Result<PathBuf, LibraryError> {
     // an explicit path never consults the environment or the user directories
-    if let Some(p) = explicit.filter(|p| !p.as_os_str().is_empty()) {
-        return Ok(p.to_path_buf());
+    if explicit.is_some() {
+        return resolve_state_dir_from(explicit, None, None);
     }
     resolve_state_dir_from(None, std::env::var_os(STATE_DIR_ENV), dirs::data_dir())
 }
@@ -30,10 +35,20 @@ pub fn resolve_state_dir_from(
     env_value: Option<OsString>,
     data_dir: Option<PathBuf>,
 ) -> Result<PathBuf, LibraryError> {
-    if let Some(p) = explicit.filter(|p| !p.as_os_str().is_empty()) {
+    if let Some(p) = explicit {
+        if p.as_os_str().is_empty() {
+            return Err(LibraryError::EmptyStateDir {
+                origin: "the explicit state directory",
+            });
+        }
         return Ok(p.to_path_buf());
     }
-    if let Some(e) = env_value.filter(|e| !e.is_empty()) {
+    if let Some(e) = env_value {
+        if e.is_empty() {
+            return Err(LibraryError::EmptyStateDir {
+                origin: "$FMV_STATE_DIR",
+            });
+        }
         return Ok(PathBuf::from(e));
     }
     data_dir
@@ -251,15 +266,46 @@ mod tests {
             resolve_state_dir_from(None, None, data.clone()).unwrap(),
             PathBuf::from("/data/ff-multiverse")
         );
-        // empty values are treated as unset
-        assert_eq!(
-            resolve_state_dir_from(Some(Path::new("")), Some(OsString::new()), data).unwrap(),
-            PathBuf::from("/data/ff-multiverse")
-        );
         assert!(matches!(
             resolve_state_dir_from(None, None, None),
             Err(LibraryError::NoStateDir)
         ));
+    }
+
+    /// Finding 10: an empty value is an error, never "unset" (it would silently select the
+    /// default library, which is the wrong one when a shell variable was simply not set).
+    #[test]
+    fn an_empty_state_dir_is_an_error_not_the_default() {
+        let data = Some(PathBuf::from("/data"));
+        let empty_flag = resolve_state_dir_from(Some(Path::new("")), None, data.clone());
+        assert!(
+            matches!(empty_flag, Err(LibraryError::EmptyStateDir { .. })),
+            "{empty_flag:?}"
+        );
+        // ... even when a perfectly good environment value or default exists
+        assert!(matches!(
+            resolve_state_dir_from(Some(Path::new("")), Some(OsString::from("/env")), data.clone()),
+            Err(LibraryError::EmptyStateDir { .. })
+        ));
+        let empty_env = resolve_state_dir_from(None, Some(OsString::new()), data.clone());
+        match empty_env {
+            Err(LibraryError::EmptyStateDir { origin }) => assert!(origin.contains("FMV_STATE_DIR")),
+            other => panic!("{other:?}"),
+        }
+        // an explicit directory wins over an (empty) environment value: the environment is not consulted
+        assert_eq!(
+            resolve_state_dir_from(Some(Path::new("/x")), Some(OsString::new()), data).unwrap(),
+            PathBuf::from("/x")
+        );
+        // the error says what to do about it
+        let msg = LibraryError::EmptyStateDir { origin: "$FMV_STATE_DIR" }.to_string();
+        assert!(msg.contains("is empty") && msg.contains("default"), "{msg}");
+        // the public entry point refuses an explicit empty path without looking at anything
+        assert!(matches!(
+            resolve_state_dir(Some(Path::new(""))),
+            Err(LibraryError::EmptyStateDir { .. })
+        ));
+        assert_eq!(resolve_state_dir(Some(Path::new("/y"))).unwrap(), PathBuf::from("/y"));
     }
 
     #[test]

@@ -1,7 +1,8 @@
 //! `import-disc` and `import-status`: sequential multi-disc import sessions.
 //!
 //! The order of things matters for crash and refusal safety:
-//! 1. read the image and identify the disc (no writes);
+//! 1. read the image and identify the disc (no writes); an image inside the library is refused
+//!    here, before any lock, directory or file exists;
 //! 2. PLAN against the saved session (pure): family, disc number, every refusal that needs no
 //!    lock. A refused disc leaves no trace;
 //! 3. take the session lock, reload the session and plan again (another import may have
@@ -10,13 +11,24 @@
 //!    gets an "in progress" record for the disc, so the invariant "the library holds files of
 //!    disc N  =>  the session has a record for disc N" survives a failure or a kill at any point;
 //! 5. record the disc as complete.
+//!
+//! A disc number the library already holds is CONFIRMED, never grown or mixed: once a disc is
+//! imported the set records what it held (file count, bytes and one digest over every stored
+//! file's path, size and content hash, see [`fmv_library::DiscContent`]). A later image for that
+//! number may only match it. A new file, a file with other bytes or a file fewer is refused as
+//! "different disc content for <serial> disc N" (the first mismatch ends the import: nothing is
+//! written, and a file that is only new costs one temporary copy), so a crafted image claiming
+//! a genuine serial cannot get its files into the genuine disc's set, nor shut the genuine disc
+//! out with an `EntryConflict` that cannot be undone. `--replace-disc` is the explicit way to
+//! put another image in the number's place: the old entries leave the set only when the new
+//! image has been read in full.
 
 use std::path::{Path, PathBuf};
 
 use fmv_core::{GameId, Platform, SourceRef};
 use fmv_library::{
-    resolve_state_dir, Identification, ImportOutcome, Library, LibraryError, SetHandle,
-    SourceStamp,
+    resolve_state_dir, DiscContent, DiscDigest, Identification, ImportOutcome, Library,
+    LibraryError, SetHandle, SourceStamp,
 };
 use serde::Serialize;
 
@@ -144,6 +156,10 @@ pub struct ImportDiscArgs {
     pub state_dir: Option<PathBuf>,
     pub disc: Option<u8>,
     pub revision: Option<String>,
+    /// `--replace-disc`: the image takes the place of whatever the set (and the session) record
+    /// under its disc number, even when that is other content or another serial. Without it an
+    /// image that does not match what is recorded is refused.
+    pub replace_disc: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -246,6 +262,11 @@ pub struct ImportDiscResult {
     pub disc: DiscSummary,
     /// How far the set's labels can be trusted. Also stored in the manifest.
     pub identification: Identification,
+    /// What this disc held, as recorded in the set: later images for this disc number are
+    /// compared with it.
+    pub content: DiscContent,
+    /// Set when `--replace-disc` replaced a disc the set held under this number.
+    pub replaced: Option<ReplacedDisc>,
     pub totals: Totals,
     /// XA/STR stream files (Mode 2 Form 2) that were NOT imported, by design.
     pub skipped_xa_count: u64,
@@ -313,6 +334,8 @@ struct Facts<'a> {
     disc: Option<u8>,
     /// `--revision`
     revision: Option<&'a str>,
+    /// `--replace-disc`
+    replace: bool,
 }
 
 /// Decide, from the saved session alone, whether and as which disc this disc may be imported.
@@ -325,6 +348,7 @@ fn plan_disc(existing: Option<Session>, f: &Facts<'_>, now: u64) -> Result<Plan,
         serial,
         disc,
         revision,
+        replace,
     } = *f;
     let session = match existing {
         Some(s) => {
@@ -355,7 +379,7 @@ fn plan_disc(existing: Option<Session>, f: &Facts<'_>, now: u64) -> Result<Plan,
     let table_disc = (kind == DiscKind::TableMatch)
         .then_some(ident.table_disc)
         .flatten();
-    let (index, index_assumed) = choose_index(&session, serial, disc, table_disc)?;
+    let (index, index_assumed) = choose_index(&session, serial, disc, table_disc, replace)?;
     Ok(Plan {
         session,
         index,
@@ -364,13 +388,15 @@ fn plan_disc(existing: Option<Session>, f: &Facts<'_>, now: u64) -> Result<Plan,
 }
 
 /// Pick the disc number and refuse contradictions: a number the table disagrees with, a number
-/// already taken by another serial, and the same serial under a second number (which would let
-/// a set count as complete although a disc was never imported).
+/// already taken by another serial (unless `replace`: `--replace-disc` takes the number over),
+/// and the same serial under a second number (which would let a set count as complete although
+/// a disc was never imported).
 fn choose_index(
     session: &Session,
     serial: &str,
     explicit: Option<u8>,
     table_disc: Option<u8>,
+    replace: bool,
 ) -> Result<(u8, bool), CommandError> {
     let same_serial = session.discs.iter().find(|d| d.serial == serial);
     let (index, assumed) = match (explicit, table_disc) {
@@ -405,7 +431,7 @@ fn choose_index(
         }
     }
     if let Some(prev) = session.disc(index) {
-        if prev.serial != serial {
+        if prev.serial != serial && !replace {
             return Err(CommandError::DiscIndexTaken {
                 index,
                 session: format!("session {}", session.name),
@@ -472,6 +498,72 @@ impl Intent<'_> {
     }
 }
 
+/// How an import treats the disc number it is about to fill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Nothing is recorded for the number: copy, checkpoint as usual, record what the disc held.
+    Normal,
+    /// The library holds a content record for the number: this image may only CONFIRM it. New
+    /// files are refused, other content is refused, and nothing is written (so no checkpoints)
+    /// until the whole image has been checked against the record.
+    Compare,
+    /// `--replace-disc`: what is recorded under the number is dropped and replaced by this image.
+    /// Nothing is written until the whole image has been read (no checkpoints), so a replacement
+    /// that fails halfway leaves the old disc exactly as it was.
+    Replace,
+}
+
+/// What `--replace-disc` took out of the set.
+#[derive(Debug, Serialize)]
+pub struct ReplacedDisc {
+    /// The serial the replaced disc was recorded with.
+    pub serial: Option<String>,
+    /// Entries removed from the set (the blobs stay in the store).
+    pub entries: usize,
+    pub bytes: u64,
+}
+
+/// Turn the library's refusals to add to a disc number that is already there into the plain
+/// "different disc content" error.
+fn disc_error(
+    e: LibraryError,
+    index: u8,
+    serial: &str,
+    prefix: &str,
+    recorded: Option<&DiscContent>,
+) -> CommandError {
+    let shown = |p: &str| p.strip_prefix(prefix).unwrap_or(p).chars().take(80).collect::<String>();
+    let about = recorded.map_or(String::new(), |r| {
+        format!(" (the disc as imported: {} files, {} bytes)", r.files, r.bytes)
+    });
+    match &e {
+        LibraryError::PrefixFrozen { logical_path, .. } => CommandError::DiscContentDiffers {
+            serial: serial.to_string(),
+            index,
+            detail: format!(
+                "this image has a file the disc as imported did not have, {}{about}",
+                shown(logical_path)
+            ),
+        },
+        LibraryError::EntryConflict {
+            logical_path,
+            existing,
+            incoming,
+            ..
+        } if logical_path.starts_with(prefix) => CommandError::DiscContentDiffers {
+            serial: serial.to_string(),
+            index,
+            detail: format!(
+                "{} holds other bytes on this image than on the disc as imported (blake3 {} there, {} here){about}",
+                shown(logical_path),
+                existing.get(..16).unwrap_or(existing),
+                incoming.get(..16).unwrap_or(incoming)
+            ),
+        },
+        _ => CommandError::Library(e),
+    }
+}
+
 pub fn import_disc(args: &ImportDiscArgs, now: u64) -> Result<ImportDiscResult, CommandError> {
     validate_session_name(&args.set_name)?;
     if let Some(d) = args.disc {
@@ -481,16 +573,20 @@ pub fn import_disc(args: &ImportDiscArgs, now: u64) -> Result<ImportDiscResult, 
     }
     let state_dir = resolve_state_dir(args.state_dir.as_deref())?;
 
-    // 1. read the image (read-only) and identify the disc before anything is written
+    // 1. read the image (read-only) and identify the disc before anything is written. Links are
+    //    resolved once, here: the file that is read is the file that is guarded
     let opened = open_image(&args.image)?;
     let layout = opened.layout;
     let image_note = opened.note.clone();
-    let data_path = opened.data_path.clone();
-    let cue_path = opened.cue_path.clone();
     let mut guards: Vec<(PathBuf, SourceStamp)> =
-        vec![(data_path.clone(), SourceStamp::capture(&data_path)?)];
-    if let Some(c) = &cue_path {
-        guards.push((c.clone(), SourceStamp::capture(c)?));
+        vec![(opened.data_path.clone(), opened.data_stamp.clone())];
+    if let (Some(c), Some(stamp)) = (&opened.cue_path, &opened.cue_stamp) {
+        guards.push((c.clone(), stamp.clone()));
+    }
+    // An image inside the library is refused before a lock, a directory or a file is created
+    // for it (nothing needs to exist yet for that to be decided).
+    for (path, _) in &guards {
+        Library::ensure_source_outside_library(&state_dir, path)?;
     }
     let mut vol = Volume::open(opened.source)?;
     let walk = vol.walk()?;
@@ -516,6 +612,7 @@ pub fn import_disc(args: &ImportDiscArgs, now: u64) -> Result<ImportDiscResult, 
         serial: &boot.serial,
         disc: args.disc,
         revision: args.revision.as_deref(),
+        replace: args.replace_disc,
     };
 
     // 2. plan against the saved session: every refusal that needs no lock, with nothing written
@@ -523,14 +620,15 @@ pub fn import_disc(args: &ImportDiscArgs, now: u64) -> Result<ImportDiscResult, 
 
     // 3. lock the session, then plan again on a fresh copy: another import into the same
     //    session may have finished since the first look
-    let _session_lock = lock_session(&state_dir, &args.set_name)?;
+    let session_lock = lock_session(&state_dir, &args.set_name)?;
     let Plan {
         mut session,
         index,
         index_assumed,
     } = plan_disc(load_session(&state_dir, &args.set_name)?, &facts, now)?;
-    // `choose_index` guarantees that a record at this number belongs to this very serial, so a
-    // record here means this disc was seen before (a re-import, or a retry of a failed attempt)
+    // `choose_index` guarantees that a record at this number belongs to this very serial (unless
+    // `--replace-disc` is replacing it), so a record here means this disc was seen before (a
+    // re-import, or a retry of a failed attempt)
     let had_record = session.disc(index).is_some();
 
     let lib = Library::open(&state_dir)?.with_importer_version(importer_version());
@@ -548,6 +646,47 @@ pub fn import_disc(args: &ImportDiscArgs, now: u64) -> Result<ImportDiscResult, 
         serial: boot.serial.clone(),
     };
     let mut batch = lib.begin_import(&handle, now)?;
+
+    // How this import treats the number: confirm what the library holds for it, replace it
+    // (`--replace-disc`), or fill it
+    let prefix = format!("disc{index}/");
+    let recorded = batch.disc_content(index).cloned();
+    let mode = if args.replace_disc {
+        Mode::Replace
+    } else if recorded.is_some() {
+        Mode::Compare
+    } else {
+        Mode::Normal
+    };
+    let mut warnings = Vec::new();
+    let mut replaced = None;
+    match mode {
+        Mode::Replace => {
+            let dropped = batch.drop_disc(index, &prefix, Some(&source_ref));
+            if dropped.entries > 0 || dropped.serial.is_some() {
+                warnings.push(format!(
+                    "--replace-disc: disc {index} as imported ({} files, {} bytes{}) was replaced by this image; its files stay in the blob store but are no longer part of the set",
+                    dropped.entries,
+                    dropped.bytes,
+                    dropped
+                        .serial
+                        .as_deref()
+                        .map_or(String::new(), |s| format!(", serial {s}"))
+                ));
+                replaced = Some(ReplacedDisc {
+                    serial: dropped.serial,
+                    entries: dropped.entries,
+                    bytes: dropped.bytes,
+                });
+            } else {
+                warnings.push(format!(
+                    "--replace-disc: nothing was recorded as disc {index} of this set, so there was nothing to replace; the disc was imported as usual"
+                ));
+            }
+        }
+        Mode::Compare => batch.freeze_prefix(prefix.clone()),
+        Mode::Normal => {}
+    }
     check_library_consistency(
         &session.set_id,
         &batch.manifest().provenance.sources,
@@ -563,7 +702,7 @@ pub fn import_disc(args: &ImportDiscArgs, now: u64) -> Result<ImportDiscResult, 
         .unwrap_or_default();
     let mut intent = Intent {
         state_dir: &state_dir,
-        pending: (!had_record).then(|| {
+        pending: (!had_record || args.replace_disc).then(|| {
             DiscRecord::in_progress(
                 index,
                 &boot.serial,
@@ -575,8 +714,12 @@ pub fn import_disc(args: &ImportDiscArgs, now: u64) -> Result<ImportDiscResult, 
         }),
     };
     let mut totals = Totals::default();
+    let mut digest = DiscDigest::new();
     let mut skipped_xa: Vec<String> = Vec::new();
     let mut unstorable: Vec<SkippedEntry> = Vec::new();
+    // Checkpoints write the manifest before the disc is known to be right: only a disc that is
+    // being FILLED does that. Confirming or replacing one writes once, at the very end.
+    let checkpoints = mode == Mode::Normal;
     for (n, file) in walk.files.iter().enumerate() {
         let logical = format!("disc{index}/{}", file.path);
         let mut reader = vol.file_reader(file)?;
@@ -586,12 +729,17 @@ pub fn import_disc(args: &ImportDiscArgs, now: u64) -> Result<ImportDiscResult, 
             Some(u64::from(file.size)),
             source_ref.clone(),
         );
-        match classify_copy(copied, &file.path)? {
-            Copied::Imported(outcome) => totals.add(&outcome),
+        let copied = classify_copy(copied, &file.path)
+            .map_err(|e| disc_error(e, index, &boot.serial, &prefix, recorded.as_ref()))?;
+        match copied {
+            Copied::Imported(outcome) => {
+                digest.add(&outcome.logical_path, outcome.size, &outcome.blake3);
+                totals.add(&outcome);
+            }
             Copied::Stream => skipped_xa.push(file.path.clone()),
             Copied::Unstorable(entry) => unstorable.push(entry),
         }
-        if (n + 1) % CHECKPOINT_EVERY == 0 {
+        if checkpoints && (n + 1) % CHECKPOINT_EVERY == 0 {
             for (path, stamp) in &guards {
                 stamp.verify(path)?;
             }
@@ -602,7 +750,26 @@ pub fn import_disc(args: &ImportDiscArgs, now: u64) -> Result<ImportDiscResult, 
     for (path, stamp) in &guards {
         stamp.verify(path)?;
     }
+    let content = digest.finish(index, &boot.serial);
+    match (&mode, &recorded) {
+        (Mode::Compare, Some(rec)) => {
+            // every file of this image matched what the library holds, and none was new; what
+            // can still differ is that the image has FEWER files than the disc as imported
+            if rec.blake3 != content.blake3 {
+                return Err(CommandError::DiscContentDiffers {
+                    serial: boot.serial.clone(),
+                    index,
+                    detail: format!(
+                        "this image has {} files ({} bytes), all of them as imported, but the disc as imported had {} files ({} bytes): files are missing from this image",
+                        content.files, content.bytes, rec.files, rec.bytes
+                    ),
+                });
+            }
+        }
+        _ => batch.record_disc(content.clone())?,
+    }
     intent.ensure_written(&mut session, now)?;
+    let batch_locked = batch.is_locked();
     batch.commit()?;
     // the crash window: the manifest holds the disc, the session says "complete" nowhere yet
     #[cfg(test)]
@@ -628,7 +795,6 @@ pub fn import_disc(args: &ImportDiscArgs, now: u64) -> Result<ImportDiscResult, 
     session.updated_at = now;
     save_session(&state_dir, &session)?;
 
-    let mut warnings = Vec::new();
     match kind {
         DiscKind::TableMatch => warnings.push("the FF7 serial table is UNVERIFIED [verify]: the match above is a guess until checked against the real disc".to_string()),
         DiscKind::UnknownSerial => {
@@ -682,6 +848,9 @@ pub fn import_disc(args: &ImportDiscArgs, now: u64) -> Result<ImportDiscResult, 
             totals.blobs_repaired
         ));
     }
+    if !session_lock.is_held() || !batch_locked {
+        warnings.push("this filesystem does not support advisory file locks, so nothing could stop a second import into the same session or set from running at the same time: do not run two imports at once (a collision can lose entries, which importing again restores)".to_string());
+    }
     let skipped_xa_count = skipped_xa.len() as u64;
     skipped_xa.truncate(MAX_LISTED);
     skipped_other.truncate(MAX_LISTED);
@@ -705,13 +874,15 @@ pub fn import_disc(args: &ImportDiscArgs, now: u64) -> Result<ImportDiscResult, 
             image_note,
         },
         identification,
+        content,
+        replaced,
         totals,
         skipped_xa_count,
         skipped_xa,
         skipped_other_count,
         skipped_other,
         source_evidence: SourceEvidence {
-            method: "size, mtime and inode of the image (and cue sheet) compared before and after the copy; disc images are not re-read",
+            method: "size, mtime and inode of the image (and cue sheet), taken from the files as opened, compared before and after the copy; disc images are not re-read",
             files_checked: guards.len() as u64,
             stamps_unchanged: true,
             content_rehash_unchanged: None,

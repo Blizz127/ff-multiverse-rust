@@ -6,13 +6,33 @@
 //!
 //! # Guarantees
 //!
-//! * **Atomic, durable writes.** Temp file in the same directory, fsync, rename, fsync the
-//!   directory. A crash leaves the old file or the new file, never a torn one.
-//! * **Single writer.** [`Store::open`] holds `<root>/LOCK` (the owner's pid) for its lifetime.
-//!   A second server on the same directory is refused; a lock left by a dead process is taken
-//!   over with a warning.
+//! * **Atomic, durable writes.** Record files: temp file in the same directory, fsync, rename,
+//!   fsync the directory. A crash leaves the old file or the new file, never a torn one. The
+//!   account index is an append-only, checksummed log: one synced line commits a registration.
+//! * **A registration costs the same at any size.** Two small record files and one log line,
+//!   whatever the number of accounts (the version 1 index was rewritten whole, twice, per
+//!   registration and stopped accepting registrations for good at about 121,000 accounts). The
+//!   number of accounts is bounded by [`StoreOptions::max_accounts`] instead, with a clear
+//!   error ([`PersistError::AccountLimitReached`]) that costs nothing and touches no login.
+//! * **Logins never wait for writes.** Token lookups read in-memory tables; no registration,
+//!   avatar or progression write, and no fsync, ever blocks one.
+//! * **Atomic registration.** [`Store::register`] validates every input before it writes
+//!   anything, then creates the account and its avatar together; there is no failure path that
+//!   leaves a name taken without a token having been returned. [`Store::release_unclaimed`]
+//!   removes a registration whose token never reached its client, and [`Store::mark_claimed`] is
+//!   how a server says that one did (the registering session never logs in with the token, so
+//!   without it every player who has not logged in again would look like an orphan).
+//! * **Names that cannot impersonate.** Display names are unique by `fmv_core::name_key` (case,
+//!   canonical form, width, invisible characters and look-alike letters make no difference),
+//!   and a new name must come from one writing system.
+//! * **Single writer.** [`Store::open`] holds `<root>/LOCK` (the owner's pid) and an `flock` on
+//!   it for its lifetime. A second server on the same directory is refused, also one in
+//!   another PID namespace or container that cannot see the owner's pid; a lock left by a dead
+//!   process is taken over with a warning.
 //! * **Versioned records.** Every file carries `schema_version`. A newer version than
-//!   [`SCHEMA_VERSION`] is rejected with a clear error instead of being misread.
+//!   [`SCHEMA_VERSION`] (records) or [`INDEX_LOG_VERSION`] (index) is rejected with a clear
+//!   error instead of being misread. A version 1 `index.json` is migrated on open, keeping the
+//!   old file as `index.json.v1.bak`.
 //! * **Bounded and panic-free.** File sizes, blob sizes and names are capped; corrupt or hostile
 //!   files produce errors, never panics.
 //! * **No hidden clocks.** Callers pass unix-second timestamps in.
@@ -20,12 +40,14 @@
 //!   `blake3(token)` is stored.
 //!
 //! The on-disk layout and the crash-consistency argument are documented at the top of
-//! `store.rs`. State dirs hold token hashes, so files are created owner-only on unix.
+//! `store.rs` and `index.rs`. State dirs hold token hashes, so files are created owner-only on
+//! unix.
 //!
 //! # Concurrency
 //!
 //! [`Store`] is `Send + Sync` and every method takes `&self`; share it as `Arc<Store>`. Calls
-//! block on disk I/O, so async code should call them from `spawn_blocking`.
+//! block on disk I/O, so async code should call them from `spawn_blocking`. Writers are
+//! serialized with each other; readers (everything a login needs) are not blocked by them.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(
@@ -40,6 +62,8 @@
 
 mod error;
 mod fsio;
+mod index;
+mod legacy;
 mod lock;
 mod model;
 mod snapshot;
@@ -47,9 +71,9 @@ mod store;
 
 pub use error::{PersistError, Result};
 pub use model::{
-    game_key, parse_game_key, AccountInfo, AvatarId, AvatarProfile, Progression,
-    MAX_APPEARANCE_REF_BYTES, MAX_ARCHETYPE_BYTES, MAX_BLOB_BYTES, MAX_INDEX_BYTES,
-    MAX_RECORD_BYTES, MAX_TOKEN_BYTES, SCHEMA_VERSION,
+    game_key, parse_game_key, AccountInfo, AvatarId, AvatarProfile, Progression, Registered,
+    INDEX_LOG_VERSION, MAX_APPEARANCE_REF_BYTES, MAX_APPEARANCE_REF_CHARS, MAX_ARCHETYPE_BYTES,
+    MAX_BLOB_BYTES, MAX_INDEX_BYTES, MAX_RECORD_BYTES, MAX_TOKEN_BYTES, SCHEMA_VERSION,
 };
 pub use snapshot::{restore_snapshot, SnapshotInfo};
-pub use store::Store;
+pub use store::{Store, StoreOptions, DEFAULT_MAX_ACCOUNTS};

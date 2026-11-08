@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use fmv_core::{Platform, ProvenanceSummary, SourceRef};
-use fmv_library::{resolve_state_dir, Identification, Library, LibraryError};
+use fmv_library::{resolve_state_dir, DiscContent, Identification, Library, LibraryError};
 use serde::Serialize;
 
 use super::{CommandError, SourceSummary};
@@ -30,6 +30,10 @@ pub struct SetListing {
     pub identification: Option<Identification>,
     /// Where the files came from. Install paths are left out unless `--show-paths` was given.
     pub sources: Vec<SourceSummary>,
+    /// What each imported disc held (disc sets only): the fingerprint later images of that disc
+    /// number are compared with.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub discs: Vec<DiscContent>,
     /// Set instead of the fields above when the manifest could not be read.
     pub error: Option<String>,
 }
@@ -86,6 +90,7 @@ pub fn list_sets(state_dir: Option<&Path>, show_paths: bool) -> Result<ListResul
                         .iter()
                         .map(|s| SourceSummary::from_source(s, show_paths))
                         .collect(),
+                    discs: m.discs.clone(),
                     error: None,
                 });
             }
@@ -101,6 +106,7 @@ pub fn list_sets(state_dir: Option<&Path>, show_paths: bool) -> Result<ListResul
                 identification_verified: None,
                 identification: None,
                 sources: Vec::new(),
+                discs: Vec::new(),
                 error: Some(e.to_string()),
             }),
         }

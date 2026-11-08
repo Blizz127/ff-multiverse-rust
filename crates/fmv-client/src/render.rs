@@ -125,7 +125,8 @@ pub const BANNER_BLACK: [u8; 3] = [24, 24, 24];
 pub const RING_RGB: [u8; 3] = [255, 208, 64];
 
 // Sizes in pixels.
-const MARGIN_PX: f32 = 24.0;
+/// Margin around the fitted area, in pixels (the camera every drawn thing is placed by).
+pub const MARGIN_PX: f32 = 24.0;
 const EDGE_PX: f32 = 1.25;
 const PLAYER_HALF_PX: f32 = 9.0;
 const OWN_HALF_PX: f32 = 10.0;
@@ -195,6 +196,16 @@ impl Camera {
     /// World position -> pixels from the viewport centre (+y up).
     pub fn project(&self, x: f32, y: f32) -> [f32; 2] {
         [(x - self.cx) * self.scale, (y - self.cy) * self.scale]
+    }
+
+    /// The view-space point at the viewport centre.
+    pub fn centre(&self) -> [f32; 2] {
+        [self.cx, self.cy]
+    }
+
+    /// Pixels per view-space unit.
+    pub fn pixels_per_unit(&self) -> f32 {
+        self.scale
     }
 
     #[cfg(test)]
@@ -442,6 +453,8 @@ pub struct Gpu {
     backdrop: Option<GpuBackdrop>,
     /// The text/panel overlay (menus, HUD), drawn over the scene by [`Gpu::draw_overlay`].
     ui: crate::ui::gpu::UiGpu,
+    /// The players as models, drawn over the scene by [`Gpu::draw_field`] (see [`crate::avatar`]).
+    avatars: crate::avatar::gpu::AvatarGpu,
 }
 
 const MIN_VERTEX_BYTES: u64 = 64 * 1024;
@@ -529,6 +542,7 @@ impl Gpu {
             mapped_at_creation: false,
         });
         let ui = crate::ui::gpu::UiGpu::new(&device, &queue, format);
+        let avatars = crate::avatar::gpu::AvatarGpu::new(&device, &queue, format);
         Self {
             device,
             queue,
@@ -541,6 +555,46 @@ impl Gpu {
             quad_buf,
             backdrop: None,
             ui,
+            avatars,
+        }
+    }
+
+    /// Characters the avatar renderer has uploaded so far (one entry per character, not per frame).
+    #[cfg(test)]
+    pub fn cached_avatar_models(&self) -> usize {
+        self.avatars.cached_models()
+    }
+
+    /// Draw one frame of a field view into `target` (`size` pixels): the scene (picture, then the
+    /// flat shapes), and, when `avatars` is given, the players' ground marks with it and then the
+    /// models and the scenery in front of them over it. Without avatars this is exactly
+    /// [`Gpu::draw_scene`] over the scene's backdrop and vertices.
+    pub fn draw_field(
+        &mut self,
+        target: &wgpu::TextureView,
+        size: (u32, u32),
+        scene: &Scene<'_>,
+        avatars: Option<&crate::avatar::AvatarFrame>,
+        srgb: bool,
+    ) {
+        let (w, h) = size;
+        // The picture goes to the GPU once (again only if it changes); without one, or if the
+        // device cannot hold it, the walkmesh is drawn on its own.
+        let quad = match scene.backdrop {
+            Some(b) if self.ensure_backdrop(b) => backdrop_quad(scene, w, h),
+            _ => None,
+        };
+        let mut vertices = build_vertices(scene, w, h, srgb);
+        // The one fitted camera everything of the frame is placed by.
+        let cam = Camera::fit(&scene.bounds, w.max(1) as f32, h.max(1) as f32, MARGIN_PX);
+        if let Some(frame) = avatars {
+            vertices.extend(frame.ground_vertices(&cam, w, h, srgb));
+        }
+        self.draw_scene(target, &vertices, quad.as_ref(), CLEAR_RGB, srgb);
+        if let Some(frame) = avatars {
+            // The scenery in front of the models lies on the picture's own rectangle.
+            let front_quad = frame.front.as_deref().and_then(|front| backdrop_quad(&Scene { backdrop: Some(front), ..*scene }, w, h));
+            self.avatars.draw(target, size, &cam, frame, front_quad.as_ref());
         }
     }
 
@@ -864,6 +918,17 @@ impl Renderer {
 
     /// Draw `scene`, then the UI `overlay` (text, panels) over it.
     pub fn render_with(&mut self, scene: &Scene<'_>, overlay: Option<&crate::ui::draw::DrawList>) -> FrameResult {
+        self.render_layers(scene, None, overlay)
+    }
+
+    /// Draw `scene`, then the players as models (and the scenery in front of them) when `avatars`
+    /// is given, then the UI `overlay`. Without avatars it is exactly [`Renderer::render_with`].
+    pub fn render_layers(
+        &mut self,
+        scene: &Scene<'_>,
+        avatars: Option<&crate::avatar::AvatarFrame>,
+        overlay: Option<&crate::ui::draw::DrawList>,
+    ) -> FrameResult {
         let (w, h) = self.size;
         if w == 0 || h == 0 {
             return FrameResult::Skipped;
@@ -897,14 +962,7 @@ impl Renderer {
             wgpu::CurrentSurfaceTexture::Validation => return FrameResult::Skipped,
         };
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        // The picture goes to the GPU once (again only if it changes); without one, or if the
-        // device cannot hold it, the walkmesh is drawn on its own.
-        let quad = match scene.backdrop {
-            Some(b) if self.gpu.ensure_backdrop(b) => backdrop_quad(scene, w, h),
-            _ => None,
-        };
-        let vertices = build_vertices(scene, w, h, self.srgb);
-        self.gpu.draw_scene(&view, &vertices, quad.as_ref(), CLEAR_RGB, self.srgb);
+        self.gpu.draw_field(&view, (w, h), scene, avatars, self.srgb);
         if let Some(overlay) = overlay {
             self.gpu.draw_overlay(&view, &overlay.vertices(w, h, self.srgb));
         }
@@ -1181,7 +1239,7 @@ mod tests {
         let square = (PLAYER_HALF_PX + OUTLINE_PX) * std::f32::consts::SQRT_2;
         let diamond = (OWN_HALF_PX + OUTLINE_PX) * 1.25;
         assert!(RING_INNER_PX > square + 1.0 && RING_INNER_PX > diamond + 1.0, "{square} {diamond}");
-        assert!(RING_OUTER_PX - RING_INNER_PX <= 3.0 && RING_OUTER_PX > RING_INNER_PX);
+        const { assert!(RING_OUTER_PX - RING_INNER_PX <= 3.0 && RING_OUTER_PX > RING_INNER_PX) };
         assert_eq!(RING_SEGMENTS, 24);
     }
 

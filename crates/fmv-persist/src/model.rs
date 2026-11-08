@@ -12,18 +12,43 @@ use serde::{Deserialize, Serialize};
 use crate::error::{PersistError, Result};
 
 /// Record format version written by this build. Loaders accept `1..=SCHEMA_VERSION` and
-/// reject anything newer with [`PersistError::FutureSchema`].
+/// reject anything newer with [`PersistError::FutureSchema`]. This versions the account,
+/// avatar and progression record files; the index has its own [`INDEX_LOG_VERSION`].
 pub const SCHEMA_VERSION: u32 = 1;
+/// Format version of the account index (`index.log`, and the small `index.json` marker beside
+/// it). Version 1 was a single `index.json` holding every name and token; it is migrated
+/// transparently on open. An older build that finds the marker refuses to open the directory
+/// with [`PersistError::FutureSchema`] instead of misreading it.
+pub const INDEX_LOG_VERSION: u32 = 2;
 /// Largest accepted account/avatar/progression record file.
 pub const MAX_RECORD_BYTES: u64 = 1024 * 1024;
-/// Largest accepted `index.json`. It holds one name entry and one token entry per account
-/// (roughly 200 bytes per account), so this caps the store at tens of thousands of accounts.
+/// Largest `index.json` that is read: the pre-v2 index (migrated on open) and the v2 marker.
+/// The v2 index itself (`index.log`) has no total size cap, so the number of accounts is no
+/// longer limited by it; what bounds it is [`StoreOptions::max_accounts`](crate::StoreOptions)
+/// and a per-line cap while it is read. (A v1 index cost about 140 bytes per account and
+/// stopped accepting registrations for good at about 121,000 accounts.)
 pub const MAX_INDEX_BYTES: u64 = 16 * 1024 * 1024;
-/// Largest accepted opaque progression blob (bytes, before hex encoding).
+/// Largest accepted opaque progression blob (bytes, before hex encoding). Note that a blob
+/// this large cannot travel in a protocol frame (a frame holds 256 KiB, and a blob that is
+/// serialized as a list of numbers is several times its size), so a server must keep it in the
+/// store and put only a short key of it (an id, a hash) on the wire.
 pub const MAX_BLOB_BYTES: usize = 256 * 1024;
 /// Longest accepted `base_archetype` (bytes).
 pub const MAX_ARCHETYPE_BYTES: usize = 64;
-/// Longest accepted per-game appearance reference (bytes).
+/// Longest accepted per-game appearance reference, in **characters**: exactly the limit the
+/// server applies to a client's `appearance_ref` (`AvatarAppearance::MAX_APPEARANCE_REF`).
+/// 64 four-byte characters (256 bytes) are valid. Share this constant instead of copying the
+/// number: a limit counted in different units on the two sides is what used to burn a name when
+/// the server accepted a reference that the store refused.
+///
+/// Only the length and control characters are checked: a reference is an opaque, adapter-defined
+/// token (it may contain `/`, `\` or `..`), stored and shown to other players as it is. An
+/// adapter must validate it against what it knows before it ever names a model or a file.
+pub const MAX_APPEARANCE_REF_CHARS: usize = AvatarAppearance::MAX_APPEARANCE_REF;
+/// Longest per-game appearance reference of the older, byte-counted rule. Newly registered
+/// references are limited by [`MAX_APPEARANCE_REF_CHARS`]; [`Store::put_avatar`](crate::Store)
+/// still accepts a stored reference up to this many bytes so that an avatar written by an
+/// older build can be updated.
 pub const MAX_APPEARANCE_REF_BYTES: usize = 128;
 /// Longest token string `authenticate` will even hash.
 pub const MAX_TOKEN_BYTES: usize = 256;
@@ -73,7 +98,7 @@ pub struct AccountInfo {
 pub(crate) struct AccountRecord {
     pub schema_version: u32,
     pub account_id: AccountId,
-    /// Sanitized, case preserved. Uniqueness is on the lowercase form (see the index).
+    /// Sanitized, case preserved. Uniqueness is on `fmv_core::name_key` of it (see the index).
     pub display_name: String,
     /// blake3(token) as lowercase hex. The plaintext token is never stored.
     pub token_hash: String,
@@ -82,8 +107,9 @@ pub(crate) struct AccountRecord {
 
 /// Persistent avatar: references only, never mesh or texture bytes.
 ///
-/// `display_name` always equals the owning account's display name (case-insensitively);
-/// the store enforces this so in-world names stay unique. Renaming is not supported yet.
+/// `display_name` always has the same `fmv_core::name_key` as the owning account's display
+/// name (so it can differ in case only); the store enforces this so in-world names stay unique.
+/// Renaming is not supported yet.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AvatarProfile {
     /// Record format version. The store stamps [`SCHEMA_VERSION`] on every write.
@@ -143,7 +169,7 @@ impl AvatarProfile {
                     reason: format!("{key:?} is not a known game"),
                 });
             }
-            check_text("per_game_overrides", value, MAX_APPEARANCE_REF_BYTES)?;
+            check_stored_appearance_ref(value)?;
         }
         Ok(())
     }
@@ -170,6 +196,73 @@ fn check_text(field: &'static str, value: &str, max_bytes: usize) -> Result<()> 
         });
     }
     Ok(())
+}
+
+/// The rule for a **new** per-game appearance reference (registration): exactly what the
+/// server accepts, [`AvatarAppearance::is_valid_appearance_ref`]. Nothing stricter, so a value
+/// the server cleaned can never be refused here.
+pub(crate) fn check_new_appearance_ref(value: &str) -> Result<()> {
+    if value.is_empty() {
+        return Err(PersistError::InvalidField {
+            field: "appearance_ref",
+            reason: "must not be empty".into(),
+        });
+    }
+    let chars = value.chars().count();
+    if chars > MAX_APPEARANCE_REF_CHARS {
+        return Err(PersistError::InvalidField {
+            field: "appearance_ref",
+            reason: format!(
+                "is {chars} characters, over the {MAX_APPEARANCE_REF_CHARS} character limit"
+            ),
+        });
+    }
+    if value.chars().any(char::is_control) {
+        return Err(PersistError::InvalidField {
+            field: "appearance_ref",
+            reason: "must not contain control characters".into(),
+        });
+    }
+    Ok(())
+}
+
+/// The rule for a reference in an avatar that is being stored again (`put_avatar`): the new
+/// character rule, or the older byte rule, so that an avatar written by a build that allowed
+/// up to [`MAX_APPEARANCE_REF_BYTES`] ASCII characters stays updatable.
+fn check_stored_appearance_ref(value: &str) -> Result<()> {
+    let older_rule_ok = !value.is_empty()
+        && value.len() <= MAX_APPEARANCE_REF_BYTES
+        && !value.chars().any(char::is_control);
+    if older_rule_ok {
+        return Ok(());
+    }
+    check_new_appearance_ref(value).map_err(|e| match e {
+        PersistError::InvalidField { reason, .. } => PersistError::InvalidField {
+            field: "per_game_overrides",
+            reason,
+        },
+        other => other,
+    })
+}
+
+/// What [`Store::register`](crate::Store::register) returns: the new account, the one-time
+/// plaintext token, and the avatar that was created with it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Registered {
+    pub account_id: AccountId,
+    /// Shown exactly once: only `blake3(token)` is stored. `Debug` does not print it.
+    pub token: String,
+    pub avatar: AvatarProfile,
+}
+
+impl fmt::Debug for Registered {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Registered")
+            .field("account_id", &self.account_id)
+            .field("token", &"<redacted>")
+            .field("avatar", &self.avatar)
+            .finish()
+    }
 }
 
 /// One account's progression for one game. The blob is opaque to core and to this crate;

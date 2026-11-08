@@ -67,6 +67,15 @@ inline comments):
 FMV_BIND=<HOST>:<PORT>
 ```
 
+The unit starts `fmv-server` with its defaults for everything else. The ones that matter once
+the port is reachable by more than one machine are the abuse limits (each has a flag; see
+the "Limits" table in the top-level README and `fmv-server --help`): a connection must say
+`Hello` within 3 s, one address holds at most 8 connections and may create 10 accounts per 10
+minutes (players behind one NAT share that), the server creates at most 120 accounts per
+minute and holds at most 100000, and a joined session that only answers pings is dropped after
+30 minutes. To change one, add the flag to `ExecStart` (for example `--max-connections-per-ip 16`
+for a LAN party behind one NAT). The protocol is still not encrypted: that does not change.
+
 ## First install
 
 Run on the target host as `<USER>`, after the owner has assigned the UNKNOWN values.

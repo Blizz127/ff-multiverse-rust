@@ -15,7 +15,7 @@ use crate::render::{view_to_window, BANNER_PX};
 use crate::session::{Session, SessionInfo};
 use crate::state::ClientState;
 use fmv_adapter_api::Bounds;
-use fmv_core::AreaId;
+use fmv_core::{AreaId, EntityId, Pos};
 use std::time::Duration;
 
 /// What the HUD says for synthetic content. Shown whenever the area is a fixture.
@@ -95,12 +95,28 @@ pub struct HudInput {
 }
 
 /// Read the live session into a [`HudInput`].
+#[allow(dead_code)] // the window gathers with its own label anchors (`gather_anchored`)
 pub fn gather(session: &Session, view: &FieldView) -> HudInput {
     gather_from(&session.state, &session.info, view, render_time(session.now()))
 }
 
 /// [`gather`] over the pieces it reads, so it can be tested without a connection.
+#[allow(dead_code)]
 pub fn gather_from(state: &ClientState, info: &SessionInfo, view: &FieldView, render_t: f64) -> HudInput {
+    gather_anchored(state, info, view, render_t, &|_, at| view.to_view(at))
+}
+
+/// [`gather_from`] with the label's anchor chosen by `anchor` (given the entity, `None` for the
+/// local player, and where it stands; it answers the view-space point the name goes over, or `None`
+/// if the player cannot be drawn). The marker view anchors at the marker; the model view at the
+/// top of the head (see `crate::avatar`).
+pub fn gather_anchored(
+    state: &ClientState,
+    info: &SessionInfo,
+    view: &FieldView,
+    render_t: f64,
+    anchor: &dyn Fn(Option<EntityId>, Pos) -> Option<Pos>,
+) -> HudInput {
     let mut labels = Vec::new();
     // The area's NPCs (static: they are named where they stand; one that cannot be drawn has no
     // label either).
@@ -111,12 +127,12 @@ pub fn gather_from(state: &ClientState, info: &SessionInfo, view: &FieldView, re
     }
     for remote in state.remote_views(render_t) {
         // One that cannot be drawn (behind the camera) has no marker, so no label either.
-        if let Some(p) = view.to_view(remote.pose.pos) {
+        if let Some(p) = anchor(Some(remote.id), remote.pose.pos) {
             let kind = if state.party.is_party_entity(remote.id) { LabelKind::Party } else { LabelKind::Other };
             labels.push(Label { x: p.x, y: p.y, text: remote.name.clone(), kind });
         }
     }
-    if let Some(p) = view.to_view(state.own.pos()) {
+    if let Some(p) = anchor(None, state.own.pos()) {
         labels.push(Label { x: p.x, y: p.y, text: info.name.clone(), kind: LabelKind::Own });
     }
     HudInput {
@@ -220,8 +236,13 @@ pub fn draw_hud(input: &HudInput, w: u32, h: u32, out: &mut DrawList) {
     let status_lines = vec![(status_tone, status_text.to_string()), (DIM, format!("players {}   rtt {rtt}", input.players))];
     let status = block(out, m, hi - m - block_h(2, s), s, &status_lines);
 
-    // Bottom right: the keys, when there is room beside the status.
-    let hint = "WASD move   P invite   Y accept   L leave   Esc quit";
+    // Bottom right: the keys, when there is room beside the status. Shift (walk) and F1 (the
+    // walkmesh) only mean something over a real field's picture, not in a fixture.
+    let hint = if input.fixture {
+        "WASD move   P invite   Y accept   L leave   Esc quit"
+    } else {
+        "WASD move   Shift walk   F1 mesh   P invite   Y accept   L leave   Esc quit"
+    };
     let hint_w = text_width(hint, s as u32) + 2 * pad(s);
     if status.2 + hint_w + 2 * m < wi {
         block(out, wi - m - hint_w, hi - m - block_h(1, s), s, &[(DIM, hint.to_string())]);

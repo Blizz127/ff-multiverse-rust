@@ -3,6 +3,9 @@
 //! * [`handshake`] is generic over the reader/writer so it can be tested with in-memory pipes.
 //!   It tolerates `Welcome` / `AreaManifest` / `AreaSnapshot` arriving in any order, treats
 //!   `Reject` as fatal at every stage and bounds everything by one overall deadline.
+//! * A `Reject` becomes [`NetError::Rejected`], which keeps the server's [`RejectCode`]: what to
+//!   tell the player and what to do about a refusal is decided from that code, never from the
+//!   server's sentence (the sentence is shown, cleaned, but is free to change).
 //! * After the handshake a reader task forwards server messages and a writer loop sends
 //!   `MoveIntent`s, a `Ping` every second and finally `Leave`. The reader is a separate task
 //!   because `read_msg` is not cancel-safe and must never be dropped inside `select!`.
@@ -25,7 +28,7 @@ use crate::cli::exit;
 use crate::state::Intent;
 use fmv_adapter_api::{AreaRuntime, GameAdapter};
 use fmv_core::{AccountId, AreaId, EntityId, EntitySnapshot, Fingerprint, GameId, ProvenanceSummary, SessionId};
-use fmv_protocol::{read_msg, write_msg, Auth, ClientMsg, InviteId, ProtoError, Secret, ServerMsg, PROTOCOL_VERSION};
+use fmv_protocol::{read_msg, write_msg, Auth, ClientMsg, InviteId, ProtoError, RejectCode, Secret, ServerMsg, PROTOCOL_VERSION};
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -70,7 +73,10 @@ impl SessionTiming {
 /// A small cloneable wrapper so [`NetConfig`] stays `Clone + Debug`: the closure is shared, and
 /// its `Debug` shows nothing (it may capture paths, never the token).
 #[derive(Clone)]
-pub struct TokenSink(Arc<dyn Fn(&Secret) -> Result<(), String> + Send + Sync>);
+pub struct TokenSink(Arc<SaveToken>);
+
+/// What a [`TokenSink`] runs.
+type SaveToken = dyn Fn(&Secret) -> Result<(), String> + Send + Sync;
 
 impl TokenSink {
     /// A sink that runs `save`. Its error text is shown to the user, so it must not contain the
@@ -112,8 +118,12 @@ pub enum NetError {
     Connect { addr: String, source: std::io::Error },
     #[error("connecting to {0} timed out after {1} s")]
     ConnectTimeout(String, u64),
-    #[error("server rejected the connection: {0}")]
-    Rejected(String),
+    /// The server refused the connection. `code` is what a program decides on (the hint for the
+    /// player, whether a saved token is to blame); `reason` is the server's own sentence, already
+    /// cleaned, which is only ever shown and never matched against. A server that sends no code
+    /// (or one this build does not know) reads as [`RejectCode::Unspecified`].
+    #[error("server rejected the connection: {reason}")]
+    Rejected { code: RejectCode, reason: String },
     #[error("timed out waiting for {0} from the server")]
     Timeout(&'static str),
     #[error("protocol error: {0}")]
@@ -478,7 +488,7 @@ where
             Ok(Ok(m)) => m,
         };
         match msg {
-            ServerMsg::Reject { reason } => return Err(NetError::Rejected(clean(&reason))),
+            ServerMsg::Reject { reason, code } => return Err(NetError::Rejected { code, reason: clean(&reason) }),
             ServerMsg::Welcome {
                 protocol_version,
                 server_build,
@@ -1191,14 +1201,7 @@ mod tests {
                     write_msg(&mut swr, &manifest(&srv_adapter, |_| {})).await.unwrap();
                     let _join: ClientMsg = read_msg(&mut srd).await.unwrap();
                 }
-                write_msg(
-                    &mut swr,
-                    &ServerMsg::Reject {
-                        reason: "server full".into(),
-                    },
-                )
-                .await
-                .unwrap();
+                write_msg(&mut swr, &ServerMsg::reject(RejectCode::ServerFull, "server full")).await.unwrap();
             });
             let err = handshake(&mut crd, &mut cwr, &cfg(), &adapter, Duration::from_secs(5))
                 .await
@@ -1206,10 +1209,61 @@ mod tests {
                 .expect("must fail");
             server_task.await.unwrap();
             assert!(
-                matches!(&err, NetError::Rejected(r) if r == "server full"),
+                matches!(&err, NetError::Rejected { code: RejectCode::ServerFull, reason } if reason == "server full"),
                 "stage {stage}: {err}"
             );
             assert_eq!(err.exit_code(), exit::FAILURE);
+        }
+    }
+
+    /// Every code survives the trip from the wire to the error unchanged (callers decide on it),
+    /// and the sentence that travels with it is cleaned like all server text.
+    #[tokio::test]
+    async fn a_reject_keeps_its_code_and_a_cleaned_reason() {
+        for code in RejectCode::ALL {
+            let adapter = FixtureAdapter::new();
+            let (client, server) = duplex(4096);
+            let (mut crd, mut cwr) = split(client);
+            let (mut srd, mut swr) = split(server);
+            let server_task = tokio::spawn(async move {
+                let _hello: ClientMsg = read_msg(&mut srd).await.unwrap();
+                write_msg(&mut swr, &ServerMsg::reject(code, "no\u{1b}[31m way\n")).await.unwrap();
+            });
+            let err = handshake(&mut crd, &mut cwr, &cfg(), &adapter, Duration::from_secs(5)).await.err().expect("must fail");
+            server_task.await.unwrap();
+            assert!(
+                matches!(&err, NetError::Rejected { code: got, reason } if *got == code && reason == "no[31m way"),
+                "{code:?}: {err}"
+            );
+            assert_eq!(err.to_string(), "server rejected the connection: no[31m way", "{code:?}");
+        }
+    }
+
+    /// A server without codes (an older build) or with a code this build does not know still gets
+    /// its refusal through, as `Unspecified` with its words intact. The frames are written by hand
+    /// so they are exactly what such a server sends, whatever `ServerMsg` serializes today.
+    #[tokio::test]
+    async fn a_reject_without_a_known_code_reads_as_unspecified() {
+        for payload in [
+            r#"{"Reject":{"reason":"server full"}}"#,
+            r#"{"Reject":{"reason":"server full","code":"SomethingNew"}}"#,
+        ] {
+            let adapter = FixtureAdapter::new();
+            let (client, server) = duplex(4096);
+            let (mut crd, mut cwr) = split(client);
+            let (mut srd, mut swr) = split(server);
+            let server_task = tokio::spawn(async move {
+                let _hello: ClientMsg = read_msg(&mut srd).await.unwrap();
+                // A frame is a little-endian u32 length and the JSON payload.
+                swr.write_all(&u32::try_from(payload.len()).unwrap().to_le_bytes()).await.unwrap();
+                swr.write_all(payload.as_bytes()).await.unwrap();
+            });
+            let err = handshake(&mut crd, &mut cwr, &cfg(), &adapter, Duration::from_secs(5)).await.err().expect("must fail");
+            server_task.await.unwrap();
+            assert!(
+                matches!(&err, NetError::Rejected { code: RejectCode::Unspecified, reason } if reason == "server full"),
+                "{payload}: {err}"
+            );
         }
     }
 
@@ -1640,7 +1694,7 @@ mod tests {
             let (mut srd, mut swr) = split(server);
             let server_task = tokio::spawn(async move {
                 let hello: ClientMsg = read_msg(&mut srd).await.unwrap();
-                write_msg(&mut swr, &ServerMsg::Reject { reason: "stop here".into() }).await.unwrap();
+                write_msg(&mut swr, &ServerMsg::reject(RejectCode::ShuttingDown, "stop here")).await.unwrap();
                 hello
             });
             let mut config = cfg();
@@ -1648,7 +1702,7 @@ mod tests {
             config.appearance_ref = Some("cloud_model".into());
             config.client_build = "fmv-client/test".into();
             let err = handshake(&mut crd, &mut cwr, &config, &adapter, Duration::from_secs(5)).await.err().unwrap();
-            assert!(matches!(err, NetError::Rejected(_)));
+            assert!(matches!(err, NetError::Rejected { code: RejectCode::ShuttingDown, .. }));
             match server_task.await.unwrap() {
                 ClientMsg::Hello { protocol_version, client_build, auth: sent, tint, appearance_ref } => {
                     assert_eq!(protocol_version, PROTOCOL_VERSION);
@@ -1722,7 +1776,7 @@ mod tests {
         let adapter = Relabeled(FixtureAdapter::new());
         let info = adapter.list_areas().remove(0);
         let offered = FixtureAdapter::new().list_areas().remove(0).provenance.summary();
-        let ok = check_local_content(&adapter, &info.id, &info.fingerprint, &offered).ok().expect("compatible");
+        let ok = check_local_content(&adapter, &info.id, &info.fingerprint, &offered).expect("compatible");
         assert_eq!(ok.provenance, info.provenance.summary());
         assert_eq!(ok.runtime.info().fingerprint, info.fingerprint);
     }

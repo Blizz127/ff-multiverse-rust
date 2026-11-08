@@ -44,8 +44,7 @@ use std::time::{Duration, Instant};
 
 use fmv_adapter_api::{AreaKey, AreaRuntime, Exit, GameAdapter};
 use fmv_core::{AnimState, AreaId, EntityId, Fingerprint, Pos, ProvenanceSummary};
-use fmv_protocol::{NpcSnapshot, ServerMsg, MAX_NPCS_PER_AREA, NPC_NAME_CHARS, NPC_REF_CHARS};
-use tracing::{info, warn};
+use fmv_protocol::{NpcSnapshot, RejectCode, ServerMsg, MAX_NPCS_PER_AREA, NPC_NAME_CHARS, NPC_REF_CHARS};
 
 use super::battle::{AreaEncounters, BattleWorld};
 use super::{is_full, normalize_facing, MoveBudget, MoveRules, Outbound, World};
@@ -241,8 +240,8 @@ pub(super) struct Transit {
 pub enum TravelReply {
     /// Handled (the messages that follow were queued).
     Done,
-    /// The answer is not acceptable: end the connection with this reason.
-    Refused(String),
+    /// The answer is not acceptable: end the connection with this code and reason.
+    Refused(RejectCode, String),
     /// The player is not in transit: the message is out of place.
     NotTravelling,
     /// The player is no longer in the world.
@@ -357,7 +356,14 @@ impl World {
             // The adapter spelled the key differently from the one asked for.
             return Ok(stored);
         }
-        info!(area = %state.id(), name = %state.offer.display_name, exits = state.exits.len(), npcs = state.npcs.len(), "area loaded");
+        // The `key=value` layout is read by `scripts/travel-smoke.sh` ("area loaded area=..."): keep it.
+        self.logs.info(format!(
+            "area loaded area={} name={} exits={} npcs={}",
+            state.id(),
+            state.offer.display_name,
+            state.exits.len(),
+            state.npcs.len()
+        ));
         self.areas.insert(stored.clone(), state);
         Ok(stored)
     }
@@ -376,7 +382,10 @@ impl World {
         let target_key = match self.ensure_area(&exit.target) {
             Ok(key) => key,
             Err(why) => {
-                warn!(area = %old_key, target = %clip_text(&exit.target), %why, "an exit leads nowhere; it is closed for as long as the area stays loaded");
+                self.logs.warn(format!(
+                    "an exit leads nowhere; it is closed for as long as the area stays loaded area={old_key} target={} why={why}",
+                    clip_text(&exit.target)
+                ));
                 if let Some(area) = self.areas.get_mut(&old_key) {
                     area.closed.insert(exit.target.clone());
                 }
@@ -386,7 +395,7 @@ impl World {
         let Some(target) = self.areas.get(&target_key) else { return false };
         let arrival = target.runtime.place_arrival(exit.arrival, exit.arrival_hint);
         if !arrival.is_finite() {
-            warn!(area = %old_key, target = %target_key, "an exit's arrival cannot be placed; it is closed");
+            self.logs.warn(format!("an exit's arrival cannot be placed; it is closed area={old_key} target={target_key}"));
             if let Some(area) = self.areas.get_mut(&old_key) {
                 area.closed.insert(exit.target.clone());
             }
@@ -407,7 +416,7 @@ impl World {
             bounced: false,
         });
         p.dirty = false;
-        info!(entity = entity.0, from = %old_key, to = %target_key, "player leaves through an exit");
+        self.logs.info(format!("player leaves through an exit entity={} from={old_key} to={target_key}", entity.0));
 
         // Everyone left behind hears it (the player is in transit now, so it is not one of them),
         // then the player hears where it goes.
@@ -436,30 +445,36 @@ impl World {
         let Some(p) = self.players.get(&entity) else { return TravelReply::Gone };
         let Some(transit) = p.transit.clone() else { return TravelReply::NotTravelling };
         let Some(target) = self.areas.get(&transit.to) else {
-            return TravelReply::Refused("the area you were sent to is gone".to_string());
+            return TravelReply::Refused(RejectCode::Internal, "the area you were sent to is gone".to_string());
         };
         // Never echo client-supplied strings back unbounded.
         if *area != target.id {
-            return TravelReply::Refused(format!("area mismatch: the server sent you to {}", target.id));
+            return TravelReply::Refused(RejectCode::ContentMismatch, format!("area mismatch: the server sent you to {}", target.id));
         }
         if *fingerprint != target.offer.fingerprint {
-            return TravelReply::Refused(format!(
-                "fingerprint mismatch for area {}: your owned copy differs from the server's (different edition, region or revision?); client sent {:?}, server has {:?}",
-                target.id, fingerprint, target.offer.fingerprint
-            ));
+            return TravelReply::Refused(
+                RejectCode::ContentMismatch,
+                format!(
+                    "fingerprint mismatch for area {}: your owned copy differs from the server's (different edition, region or revision?); client sent {:?}, server has {:?}",
+                    target.id, fingerprint, target.offer.fingerprint
+                ),
+            );
         }
         let server = &target.offer.provenance;
         if !server.compatible_with(provenance) {
-            return TravelReply::Refused(format!(
-                "edition mismatch for area {}: the server's copy is {:?}/{:?}/{:?}, yours is {:?}/{:?}/{:?}",
-                target.id,
-                server.edition,
-                server.region,
-                server.revision,
-                clip_text(&provenance.edition),
-                clip_text(&provenance.region),
-                clip_text(&provenance.revision),
-            ));
+            return TravelReply::Refused(
+                RejectCode::ContentMismatch,
+                format!(
+                    "edition mismatch for area {}: the server's copy is {:?}/{:?}/{:?}, yours is {:?}/{:?}/{:?}",
+                    target.id,
+                    server.edition,
+                    server.region,
+                    server.revision,
+                    clip_text(&provenance.edition),
+                    clip_text(&provenance.region),
+                    clip_text(&provenance.revision),
+                ),
+            );
         }
         let budget = MoveBudget::full(now, target.rules());
         let Some(p) = self.players.get_mut(&entity) else { return TravelReply::Gone };
@@ -471,7 +486,7 @@ impl World {
         p.budget = budget;
         p.walked = 0.0;
         p.dirty = false;
-        info!(entity = entity.0, to = %transit.to, "player entered the area");
+        self.logs.info(format!("player entered the area entity={} to={}", entity.0, transit.to));
         let mut failed = Vec::new();
         self.announce_entry(entity, &mut failed);
         self.drop_failed(failed);
@@ -484,13 +499,13 @@ impl World {
     pub fn cannot_join(&mut self, entity: EntityId, area: &AreaId, now: Instant) -> TravelReply {
         let Some(p) = self.players.get(&entity) else { return TravelReply::Gone };
         let Some(transit) = p.transit.clone() else { return TravelReply::NotTravelling };
-        info!(entity = entity.0, area = %clip_text(&area.to_string()), "client cannot hold the area it was sent to");
+        self.logs.info(format!("client cannot hold the area it was sent to entity={} area={}", entity.0, clip_text(&area.to_string())));
         if transit.bounced {
-            return TravelReply::Refused("you cannot hold the area you came from either".to_string());
+            return TravelReply::Refused(RejectCode::ContentMismatch, "you cannot hold the area you came from either".to_string());
         }
         let origin = p.area.clone();
         let Some(origin_area) = self.areas.get(&origin) else {
-            return TravelReply::Refused("the area you came from is gone".to_string());
+            return TravelReply::Refused(RejectCode::Internal, "the area you came from is gone".to_string());
         };
         let offer = Arc::new(origin_area.change_message(transit.from_pos, transit.from_facing));
         let Some(p) = self.players.get_mut(&entity) else { return TravelReply::Gone };
@@ -522,7 +537,7 @@ impl World {
             .collect();
         if !late.is_empty() {
             for id in &late {
-                warn!(entity = id.0, "no answer to AreaChange in time; disconnecting");
+                self.logs.warn(format!("no answer to AreaChange in time; disconnecting entity={}", id.0));
             }
             self.drop_failed(late.into_iter().map(|id| (id, false)).collect());
         }
@@ -545,7 +560,7 @@ impl World {
         }
         for key in unload {
             self.areas.remove(&key);
-            info!(area = %key, "area unloaded (empty)");
+            self.logs.info(format!("area unloaded (empty) area={key}"));
         }
     }
 }
@@ -782,12 +797,12 @@ mod tests {
         let offer = area_change(&a.drain());
         let ServerMsg::AreaChange { area, fingerprint, provenance, .. } = &offer else { panic!() };
         // The wrong area, the wrong fingerprint and an incompatible edition are all refused...
-        assert!(matches!(w.join_area(a.entity, &hall, fingerprint, provenance, now), TravelReply::Refused(m) if m.contains("area mismatch")));
-        assert!(matches!(w.join_area(a.entity, area, &Fingerprint([9; 32]), provenance, now), TravelReply::Refused(m) if m.contains("fingerprint mismatch")));
+        assert!(matches!(w.join_area(a.entity, &hall, fingerprint, provenance, now), TravelReply::Refused(RejectCode::ContentMismatch, m) if m.contains("area mismatch")));
+        assert!(matches!(w.join_area(a.entity, area, &Fingerprint([9; 32]), provenance, now), TravelReply::Refused(RejectCode::ContentMismatch, m) if m.contains("fingerprint mismatch")));
         let mut other_edition = provenance.clone();
         other_edition.edition = "something\nelse".into();
         let refused = w.join_area(a.entity, area, fingerprint, &other_edition, now);
-        assert!(matches!(&refused, TravelReply::Refused(m) if m.contains("edition mismatch") && !m.contains('\n')), "{refused:?}");
+        assert!(matches!(&refused, TravelReply::Refused(RejectCode::ContentMismatch, m) if m.contains("edition mismatch") && !m.contains('\n')), "{refused:?}");
         // ...without changing anything: the player is still in transit and can still answer right.
         assert_eq!(w.transit_target(a.entity), Some(YARD.to_string()));
         assert_eq!(w.join_area(a.entity, area, fingerprint, provenance, now), TravelReply::Done);
@@ -831,7 +846,7 @@ mod tests {
         assert_eq!(w.cannot_join(a.entity, area, now), TravelReply::Done);
         let ServerMsg::AreaChange { area: hall, .. } = area_change(&a.drain()) else { panic!() };
         assert_eq!(hall.key, HALL);
-        assert!(matches!(w.cannot_join(a.entity, &hall, now), TravelReply::Refused(_)));
+        assert!(matches!(w.cannot_join(a.entity, &hall, now), TravelReply::Refused(RejectCode::ContentMismatch, _)));
     }
 
     #[test]

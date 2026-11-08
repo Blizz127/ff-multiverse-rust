@@ -3,13 +3,23 @@
 //! The first disc of a session fixes its family (edition, region, language, revision). Every
 //! later disc must belong to the same family. Session files live in the state directory and are
 //! treated as untrusted when loaded: size-capped, parsed without panics and cross-checked.
+//!
+//! The directory is created private (0700) and so are the session files and the per-session
+//! lock files (0600): they name the owner's images. A session's lock is advisory; where the
+//! filesystem has none the import goes ahead UNLOCKED and says so ([`SessionLock::is_held`]).
+//! The temp files of a session writer that was killed are swept the next time the session is
+//! locked.
 
-use std::fs::{self, File, OpenOptions, TryLockError};
+use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use fmv_core::{EditionProvenance, GameId, Platform, SourceRef};
-use fmv_library::{atomic_write, set_id_for, validate_set_id};
+use fmv_library::{
+    atomic_write, create_private_dir_durable, open_lock_file, set_id_for, sweep_stale_temps,
+    try_lock_exclusive, validate_set_id, LockOutcome,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::serial::EXPECTED_DISCS;
@@ -262,33 +272,50 @@ impl Session {
 #[derive(Debug)]
 pub struct SessionLock {
     _file: File,
+    held: bool,
 }
 
-/// Take the session's lock (creating `import-sessions/` if needed). Never blocks: a session that
-/// is being updated by another import is reported as [`SessionError::Busy`].
+impl SessionLock {
+    /// False when the filesystem has no advisory locks: nothing is held, and a second import
+    /// into the same session at the same time cannot be told apart. The caller should say so.
+    pub fn is_held(&self) -> bool {
+        self.held
+    }
+}
+
+/// Take the session's lock (creating `import-sessions/`, private, if needed). Never blocks: a
+/// session that is being updated by another import is reported as [`SessionError::Busy`]. On a
+/// filesystem without advisory locks it succeeds without holding anything
+/// ([`SessionLock::is_held`] is then false). While the lock is held, the temp files of a session
+/// writer that was killed are swept.
 pub fn lock_session(state_dir: &Path, name: &str) -> Result<SessionLock, SessionError> {
     validate_session_name(name)?;
     let dir = state_dir.join(SESSIONS_DIR);
-    fs::create_dir_all(&dir).map_err(|source| SessionError::Io {
+    create_private_dir_durable(&dir).map_err(|source| SessionError::Io {
         path: dir.clone(),
         source,
     })?;
     // starts with '.', which no session name may: it can never collide with `<name>.json`
     let path = dir.join(format!(".{name}.lock"));
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)
-        .map_err(|source| SessionError::Io {
-            path: path.clone(),
-            source,
-        })?;
-    match file.try_lock() {
-        Ok(()) => Ok(SessionLock { _file: file }),
-        Err(TryLockError::WouldBlock) => Err(SessionError::Busy(name.to_string())),
-        Err(TryLockError::Error(source)) => Err(SessionError::Io { path, source }),
+    let file = open_lock_file(&path).map_err(|source| SessionError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    match try_lock_exclusive(&file) {
+        Ok(LockOutcome::Held) => {
+            // nobody else writes this session now, so a temp file of it is a corpse's
+            sweep_stale_temps(&dir, &format!("{name}.json"), SystemTime::now());
+            Ok(SessionLock {
+                _file: file,
+                held: true,
+            })
+        }
+        Ok(LockOutcome::Busy) => Err(SessionError::Busy(name.to_string())),
+        Ok(LockOutcome::Unsupported) => Ok(SessionLock {
+            _file: file,
+            held: false,
+        }),
+        Err(source) => Err(SessionError::Io { path, source }),
     }
 }
 
@@ -386,11 +413,11 @@ pub fn load_session(state_dir: &Path, name: &str) -> Result<Option<Session>, Ses
     Ok(Some(session))
 }
 
-/// Atomically write the session file (creating `import-sessions/` if needed).
+/// Atomically write the session file (creating `import-sessions/`, private, if needed).
 pub fn save_session(state_dir: &Path, session: &Session) -> Result<(), SessionError> {
     let path = session_path(state_dir, &session.name)?;
     if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir).map_err(|source| SessionError::Io {
+        create_private_dir_durable(dir).map_err(|source| SessionError::Io {
             path: dir.to_path_buf(),
             source,
         })?;
@@ -400,6 +427,46 @@ pub fn save_session(state_dir: &Path, session: &Session) -> Result<(), SessionEr
         reason: format!("cannot serialise: {e}"),
     })?;
     atomic_write(&path, &bytes).map_err(|source| SessionError::Io { path, source })
+}
+
+/// The sessions that record `set_id` as their library set, and the files in `import-sessions/`
+/// that could not be read as sessions (so it is unknown what they point at), both sorted.
+/// Never writes. `remove-set` uses it to find the session records a removed set leaves dangling.
+pub fn sessions_using_set(state_dir: &Path, set_id: &str) -> (Vec<String>, Vec<String>) {
+    let dir = state_dir.join(SESSIONS_DIR);
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return (Vec::new(), Vec::new());
+    };
+    let (mut using, mut unreadable) = (Vec::new(), Vec::new());
+    for ent in entries.flatten() {
+        let file_name = ent.file_name().to_string_lossy().into_owned();
+        // lock files and temp files start with '.', which no session name may
+        let Some(name) = file_name.strip_suffix(".json") else {
+            continue;
+        };
+        if validate_session_name(name).is_err() {
+            continue;
+        }
+        match load_session(state_dir, name) {
+            Ok(Some(session)) if session.set_id == set_id => using.push(name.to_string()),
+            Ok(_) => {}
+            Err(_) => unreadable.push(name.to_string()),
+        }
+    }
+    using.sort();
+    unreadable.sort();
+    (using, unreadable)
+}
+
+/// Delete the session file `name`. `Ok(false)` when there was none. The session's lock file
+/// stays (lock files are never deleted).
+pub fn remove_session(state_dir: &Path, name: &str) -> Result<bool, SessionError> {
+    let path = session_path(state_dir, name)?;
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(SessionError::Io { path, source }),
+    }
 }
 
 #[cfg(test)]

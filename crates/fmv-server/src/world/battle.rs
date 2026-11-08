@@ -60,7 +60,6 @@ use fmv_core::EntityId;
 use fmv_ff7_battle::rng::Rng;
 use fmv_ff7_battle::rules::{ActorId, BattleState, Command, CommandError, Outcome, MAX_STEP_MS};
 use fmv_protocol::{split_rewards, AppliedCommand, BattleId, BattleMember, BattleRejection, BattleSetup, ServerMsg, MAX_BATTLE_PARTY};
-use tracing::{debug, info, warn};
 
 use super::{is_full, Outbound, World};
 use crate::config::BattleSettings;
@@ -322,7 +321,7 @@ impl World {
         let state = match bw.settings.rules.build(&setup) {
             Ok(state) => state,
             Err(e) => {
-                warn!(formation, error = %e, "cannot build the battle from the server's own data");
+                self.logs.warn(format!("cannot build the battle from the server's own data formation={formation} error={e}"));
                 return Err(BattleRejection::UnknownFormation);
             }
         };
@@ -353,16 +352,15 @@ impl World {
                 p.battle = Some(id);
             }
         }
-        info!(
-            battle = id.0,
-            formation,
-            members = entities.len(),
-            enemies = info.enemies,
-            preemptive = info.preemptive,
-            back_attack = info.back_attack,
-            seed,
-            "battle started"
-        );
+        // The `key=value` layout is read by `scripts/battle-smoke.sh` ("members=2"): keep it.
+        self.logs.info(format!(
+            "battle started battle={} formation={formation} members={} enemies={} preemptive={} back_attack={} seed={seed}",
+            id.0,
+            entities.len(),
+            info.enemies,
+            info.preemptive,
+            info.back_attack,
+        ));
         self.fan_to(&entities, start);
         Ok(id)
     }
@@ -452,25 +450,21 @@ impl World {
             .map(|(i, m)| (m.info.account, u8::try_from(i).ok().and_then(|i| battle.state.actor(ActorId(i))).is_some_and(|c| c.is_alive())))
             .collect();
         let rewards = if outcome == Outcome::Victory { split_rewards(battle.state.rewards(), &roster) } else { Vec::new() };
-        info!(
-            battle = id.0,
-            ?outcome,
-            ticks = battle.state.tick(),
-            members = battle.members.len(),
-            commands = ?battle.commands,
-            "battle ended"
-        );
+        // The `key=value` layout is read by `scripts/battle-smoke.sh` ("commands=[2, 3]"): keep it.
+        self.logs.info(format!(
+            "battle ended battle={} outcome={outcome:?} ticks={} members={} commands={:?}",
+            id.0,
+            battle.state.tick(),
+            battle.members.len(),
+            battle.commands,
+        ));
         for r in &rewards {
             let delivered = battle.members.iter().any(|m| m.info.account == r.account && m.connected);
-            info!(
-                battle = id.0,
-                account = r.account.0,
-                exp = r.exp,
-                gil = r.gil,
-                ap = r.ap,
-                delivered,
-                "battle reward (logged and sent only: progression is not written, it is also the story phase)"
-            );
+            self.logs.info(format!(
+                "battle reward (logged and sent only: progression is not written, it is also the story phase) \
+                 battle={} account={} exp={} gil={} ap={} delivered={delivered}",
+                id.0, r.account.0, r.exp, r.gil, r.ap,
+            ));
         }
         let recipients = battle.connected();
         // Back in the field: free everyone first, and mark them changed so the next `EntityUpdate`
@@ -499,7 +493,7 @@ impl World {
         }
         if battle.members.iter().all(|m| !m.connected) {
             bw.battles.remove(&id);
-            info!(battle = id.0, "battle dropped: every member left");
+            self.logs.info(format!("battle dropped: every member left battle={}", id.0));
         }
     }
 
@@ -531,7 +525,7 @@ impl World {
         };
         if let Some(formation) = triggered {
             if let Err(reason) = self.begin_battle(entity, formation, now) {
-                debug!(entity = entity.0, formation, ?reason, "a random encounter could not start");
+                self.logs.debug(format!("a random encounter could not start entity={} formation={formation} reason={reason:?}", entity.0));
             }
         }
     }

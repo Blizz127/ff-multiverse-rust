@@ -3,6 +3,10 @@
 //! Manifests live on disk and are therefore treated as untrusted when loaded: size-capped,
 //! parsed without panics, and validated (hashes are hex, paths are normalised, no duplicates)
 //! before any value is used to build a filesystem path.
+//!
+//! The caps hold in BOTH directions: the writer refuses to produce a manifest the reader would
+//! refuse (see [`write_manifest`]), so a set can never be written into a state it cannot be read
+//! back from.
 
 use std::fs::File;
 use std::io::Read;
@@ -17,7 +21,7 @@ use crate::paths::{is_blake3_hex, normalize_logical_path};
 
 pub const MANIFEST_FORMAT_VERSION: u32 = 1;
 pub const MANIFEST_FILE: &str = "manifest.json";
-/// Hard cap on a manifest file read from disk.
+/// Hard cap on a manifest file. Enforced when reading AND when writing.
 pub const MAX_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
 /// Hard cap on entries in one set. Enforced when reading AND when writing, so a set can never
 /// grow into a state the reader would refuse.
@@ -26,6 +30,9 @@ pub const MAX_MANIFEST_ENTRIES: usize = 500_000;
 pub const MAX_IDENTIFICATION_METHOD: usize = 64;
 pub const MAX_IDENTIFICATION_CAVEATS: usize = 16;
 pub const MAX_IDENTIFICATION_TEXT: usize = 512;
+/// Bounds for the [`DiscContent`] records of a set.
+pub const MAX_DISC_RECORDS: usize = 64;
+pub const MAX_DISC_SERIAL: usize = 64;
 
 /// How far the provenance labels of a set can be trusted.
 ///
@@ -82,6 +89,85 @@ impl Identification {
     }
 }
 
+/// What one disc of a disc set held when it was first imported: the fingerprint of its content,
+/// so that a second image claiming to be the same disc number (the same serial, other bytes: a
+/// damaged rip, a different pressing, a crafted image) is recognised as a DIFFERENT disc instead
+/// of being merged into the first one entry by entry.
+///
+/// Optional in the manifest (`discs`); sets written before it existed simply have none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscContent {
+    /// Disc number within the set (1-based).
+    pub index: u8,
+    /// Boot serial the disc claimed, e.g. `SCUS-94163`.
+    pub serial: String,
+    /// Files of the disc that were stored (streams and unstorable names are not counted).
+    pub files: u64,
+    pub bytes: u64,
+    /// blake3 over the sorted `(logical path, size, content blake3)` of those files, see
+    /// [`DiscDigest`]. 64 lowercase hex characters.
+    pub blake3: String,
+}
+
+impl DiscContent {
+    /// The rules a record must keep. Applied when a manifest is read and when a record is added,
+    /// so that what the writer produces is always what the reader accepts.
+    pub(crate) fn check(&self) -> Result<(), String> {
+        if self.index == 0 {
+            return Err("disc record with disc number 0".to_string());
+        }
+        if self.serial.is_empty()
+            || self.serial.len() > MAX_DISC_SERIAL
+            || !self.serial.bytes().all(|b| (0x21..=0x7e).contains(&b))
+        {
+            return Err("disc record with an unusable serial".to_string());
+        }
+        if !is_blake3_hex(&self.blake3) {
+            return Err("disc record with a malformed blake3 digest".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// Accumulates the files of one disc into its [`DiscContent`]. Order of `add` does not matter.
+#[derive(Debug, Default)]
+pub struct DiscDigest {
+    files: Vec<(String, u64, String)>,
+}
+
+impl DiscDigest {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// One stored file: its logical path, size and content blake3 (hex).
+    pub fn add(&mut self, logical_path: &str, size: u64, blake3_hex: &str) {
+        self.files
+            .push((logical_path.to_string(), size, blake3_hex.to_string()));
+    }
+
+    pub fn finish(mut self, index: u8, serial: &str) -> DiscContent {
+        self.files.sort();
+        let mut h = blake3::Hasher::new();
+        h.update(b"fmv-library/disc-content/v1");
+        let mut bytes = 0u64;
+        for (path, size, hex) in &self.files {
+            h.update(&(path.len() as u64).to_le_bytes());
+            h.update(path.as_bytes());
+            h.update(&size.to_le_bytes());
+            h.update(hex.as_bytes());
+            bytes = bytes.saturating_add(*size);
+        }
+        DiscContent {
+            index,
+            serial: serial.to_string(),
+            files: self.files.len() as u64,
+            bytes,
+            blake3: h.finalize().to_hex().to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestEntry {
     /// Normalised, `/` separated; lowercase for PC sets.
@@ -114,6 +200,11 @@ pub struct Manifest {
     /// did not say (and for manifests from before this field existed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identification: Option<Identification>,
+    /// What each imported disc held (disc sets only), sorted by disc number. Absent from
+    /// manifests written before it existed and from every non-disc set: such a manifest is
+    /// written exactly as it always was.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discs: Vec<DiscContent>,
 }
 
 impl Manifest {
@@ -134,6 +225,7 @@ impl Manifest {
             imported_at: 0,
             importer_version: importer_version.to_string(),
             identification,
+            discs: Vec::new(),
         }
     }
 
@@ -167,6 +259,11 @@ impl Manifest {
             (Some(e), None) => Some(e),
             _ => None,
         }
+    }
+
+    /// The content record of disc `index`, when one was stored.
+    pub fn disc(&self, index: u8) -> Option<&DiscContent> {
+        self.discs.iter().find(|d| d.index == index)
     }
 
     pub fn total_bytes(&self) -> u64 {
@@ -218,6 +315,19 @@ fn validate(m: &mut Manifest, set_id: &str) -> Result<(), LibraryError> {
             return Err(bad(set_id, "identification record exceeds its size bounds"));
         }
     }
+    if m.discs.len() > MAX_DISC_RECORDS {
+        return Err(bad(set_id, "too many disc records"));
+    }
+    for d in &m.discs {
+        d.check().map_err(|why| bad(set_id, why))?;
+    }
+    m.discs.sort_by_key(|d| d.index);
+    if m.discs.windows(2).any(|w| match w {
+        [a, b] => a.index == b.index,
+        _ => false,
+    }) {
+        return Err(bad(set_id, "two disc records with the same disc number"));
+    }
     for e in &m.entries {
         if !is_blake3_hex(&e.blake3) {
             return Err(bad(set_id, "entry with a malformed blake3 digest"));
@@ -264,9 +374,57 @@ pub(crate) fn read_manifest(path: &Path, set_id: &str) -> Result<Manifest, Libra
     Ok(manifest)
 }
 
-/// Serialise and atomically replace the manifest file.
-pub(crate) fn write_manifest(path: &Path, manifest: &Manifest) -> Result<(), LibraryError> {
+/// Serialise and atomically replace the manifest file, refusing to produce anything the reader
+/// would refuse: more bytes than `max_bytes` (the reader's cap, [`MAX_MANIFEST_BYTES`]) or more
+/// entries or disc records than it accepts. Nothing is written in that case and the file that is
+/// there stays as it was.
+pub(crate) fn write_manifest(
+    path: &Path,
+    manifest: &Manifest,
+    max_bytes: u64,
+) -> Result<(), LibraryError> {
+    if manifest.entries.len() > MAX_MANIFEST_ENTRIES {
+        return Err(LibraryError::TooManyEntries {
+            set_id: manifest.set_id.clone(),
+            limit: MAX_MANIFEST_ENTRIES,
+        });
+    }
+    if manifest.discs.len() > MAX_DISC_RECORDS {
+        return Err(bad(&manifest.set_id, "too many disc records"));
+    }
     let bytes = serde_json::to_vec_pretty(manifest)
         .map_err(|e| bad(&manifest.set_id, format!("cannot serialise manifest: {e}")))?;
+    let size = bytes.len() as u64;
+    if size > max_bytes {
+        return Err(LibraryError::ManifestTooLarge {
+            set_id: manifest.set_id.clone(),
+            size,
+            limit: max_bytes,
+        });
+    }
     atomic_write(path, &bytes).map_err(io_err(path))
+}
+
+/// What one entry adds to the pretty-printed manifest, separators and indentation included.
+/// Never less than the truth (and at most a couple of bytes per entry more): it is what lets an
+/// import refuse an entry BEFORE its blob is stored, instead of finding out at the next
+/// checkpoint.
+pub(crate) fn entry_json_cost(e: &ManifestEntry) -> u64 {
+    match serde_json::to_vec_pretty(e) {
+        Ok(v) => {
+            // the entry sits two levels deep in the manifest (4 more spaces on every line); a
+            // comma and a newline follow it, and the array's own brackets are shared out as 2
+            let lines = v.iter().filter(|b| **b == b'\n').count() as u64 + 1;
+            (v.len() as u64).saturating_add(4 * lines).saturating_add(4)
+        }
+        Err(_) => (e.logical_path.len() as u64).saturating_mul(2).saturating_add(512),
+    }
+}
+
+/// Bytes of the pretty-printed manifest without its entries (the entries array is empty).
+pub(crate) fn fixed_json_size(m: &mut Manifest) -> u64 {
+    let entries = std::mem::take(&mut m.entries);
+    let size = serde_json::to_vec_pretty(&*m).map_or(0, |v| v.len() as u64);
+    m.entries = entries;
+    size
 }

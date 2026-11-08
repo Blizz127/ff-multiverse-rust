@@ -6,6 +6,15 @@
 //! directory sizes, nesting depth, entry counts, directory counts, total directory bytes and
 //! path lengths are bounded, and directory loops are cut.
 //!
+//! Three more things are refused outright, because each would let a crafted image multiply the
+//! work or the disk space an import costs far beyond the size of the image itself:
+//! - two files that share any sector ([`IsoError::OverlappingFiles`]; an empty file owns no
+//!   sector and is not affected): a genuine disc never lists them, and 200 records on one extent
+//!   would otherwise be read, hashed and stored 200 times;
+//! - more files than a disc can hold ([`MAX_FILES`]);
+//! - files that add up to more bytes than a CD-ROM holds ([`MAX_FILE_BYTES`], 1 GiB: above even
+//!   a 99-minute disc).
+//!
 //! Two kinds of trouble are told apart while walking:
 //! - a *format fault* (a malformed record, an unreadable extent) in a nested directory only
 //!   costs that directory: it is reported in [`WalkResult::skipped`] and the walk goes on. A
@@ -28,6 +37,14 @@ pub const MAX_ENTRIES: usize = 200_000;
 pub const MAX_DIRS: usize = 20_000;
 /// Most directory bytes the walker will read in total (a real disc has tens of KiB).
 pub const MAX_TOTAL_DIR_BYTES: u64 = 256 * 1024 * 1024;
+/// Most FILES (directories excluded) the walker lists. A PlayStation disc holds a few thousand
+/// at most; more means a corrupt or crafted image, and every file costs a manifest entry (and
+/// every checkpoint a rewrite of the whole manifest).
+pub const MAX_FILES: usize = 20_000;
+/// Most bytes the listed files may add up to: 1 GiB, more than any CD-ROM holds (a 99-minute disc
+/// is about 0.9 GB of 2048-byte sectors). With overlapping extents refused, the sum can only
+/// exceed the image's own size by lying about it, and this is the backstop.
+pub const MAX_FILE_BYTES: u64 = 1024 * 1024 * 1024;
 /// Longest path (bytes) the walker will list or descend into. Longer ones are reported as
 /// skipped: they could not be stored in the library anyway (its limit is 1024 bytes including
 /// the `disc<N>/` prefix), and the cap bounds the memory a crafted tree can make us hold.
@@ -42,6 +59,10 @@ pub struct WalkLimits {
     pub max_dirs: usize,
     pub max_total_dir_bytes: u64,
     pub max_path_len: usize,
+    /// Most files listed ([`MAX_FILES`]).
+    pub max_files: usize,
+    /// Most bytes the listed files may add up to ([`MAX_FILE_BYTES`]).
+    pub max_file_bytes: u64,
 }
 
 impl Default for WalkLimits {
@@ -51,6 +72,8 @@ impl Default for WalkLimits {
             max_dirs: MAX_DIRS,
             max_total_dir_bytes: MAX_TOTAL_DIR_BYTES,
             max_path_len: MAX_PATH_LEN,
+            max_files: MAX_FILES,
+            max_file_bytes: MAX_FILE_BYTES,
         }
     }
 }
@@ -83,6 +106,12 @@ pub enum IsoError {
     /// A resource limit of the walker was exceeded (see the module docs): always fatal.
     #[error("the image exceeds a safety limit of the importer: {0}")]
     LimitExceeded(&'static str),
+    #[error("the image lists more than {limit} files; a PlayStation disc has far fewer, so it is corrupt or crafted and is refused")]
+    TooManyFiles { limit: usize },
+    #[error("the files on the image add up to more than {limit} bytes, more than a CD-ROM holds; it is corrupt or crafted (it would multiply the data copied) and is refused")]
+    TooMuchData { limit: u64 },
+    #[error("files {first} and {second} share disc sectors; a genuine disc never lists overlapping files, so the image is corrupt or crafted (importing it would read, hash and store the same data over and over) and is refused")]
+    OverlappingFiles { first: String, second: String },
     #[error("{0}")]
     Form2(Form2Sector),
     #[error("sector {lba} of the raw image is malformed ({why})")]
@@ -251,6 +280,8 @@ enum DirFault {
     Format(&'static str),
     /// A resource limit was exceeded: always fatal.
     Limit(&'static str),
+    /// A resource limit with a message of its own: always fatal.
+    Fatal(IsoError),
 }
 
 /// Everything the directory scanner accumulates across the whole walk.
@@ -261,6 +292,8 @@ struct WalkState {
     stack: Vec<(u32, u32, String, usize)>,
     /// Directory records seen so far in all directories (not counting `.` and `..`).
     records: usize,
+    /// Bytes the files listed so far add up to.
+    file_bytes: u64,
 }
 
 /// Scan the records of one directory extent. Files and sub-directories found are added to
@@ -355,12 +388,63 @@ fn scan_dir(
                 reason: "file extent lies outside the image".to_string(),
             });
         } else {
+            // the caps are checked as files are found, so a crafted image cannot make the walk
+            // list (and hold in memory) more than they allow
+            st.file_bytes = st.file_bytes.saturating_add(u64::from(rec.size));
+            if st.result.files.len() >= limits.max_files {
+                return Err(DirFault::Fatal(IsoError::TooManyFiles {
+                    limit: limits.max_files,
+                }));
+            }
+            if st.file_bytes > limits.max_file_bytes {
+                return Err(DirFault::Fatal(IsoError::TooMuchData {
+                    limit: limits.max_file_bytes,
+                }));
+            }
             st.result.files.push(IsoFile {
                 path,
                 lba: rec.lba,
                 size: rec.size,
             });
         }
+    }
+    Ok(())
+}
+
+/// Err when two files that hold data share any sector. An empty file owns no sector, whatever
+/// LBA its record carries (builders put it anywhere), so it takes no part. Exact duplicates
+/// (same extent) are refused too: they are what makes the same data get read over and over.
+fn check_no_overlap(files: &[IsoFile]) -> Result<(), IsoError> {
+    let sector = SECTOR_SIZE as u64;
+    // (first sector, one past the last, file); files arrive sorted by path, and the sort below
+    // is stable, so the pair reported for a given image never changes
+    let mut spans: Vec<(u64, u64, &IsoFile)> = files
+        .iter()
+        .filter(|f| f.size > 0)
+        .map(|f| {
+            let start = u64::from(f.lba);
+            (start, start + u64::from(f.size).div_ceil(sector), f)
+        })
+        .collect();
+    spans.sort_by_key(|(start, end, _)| (*start, *end));
+    // sorted by start and disjoint so far: the previous span ends last
+    let mut prev: Option<&(u64, u64, &IsoFile)> = None;
+    for span in &spans {
+        if let Some((_, prev_end, prev_file)) = prev {
+            if span.0 < *prev_end {
+                let (a, b) = if prev_file.path <= span.2.path {
+                    (&prev_file.path, &span.2.path)
+                } else {
+                    (&span.2.path, &prev_file.path)
+                };
+                let shown = |p: &String| p.chars().take(80).collect::<String>();
+                return Err(IsoError::OverlappingFiles {
+                    first: shown(a),
+                    second: shown(b),
+                });
+            }
+        }
+        prev = Some(span);
     }
     Ok(())
 }
@@ -458,6 +542,7 @@ impl<S: SectorSource> Volume<S> {
             visited: HashSet::new(),
             stack: vec![(self.root_lba, self.root_size, String::new(), 0)],
             records: 0,
+            file_bytes: 0,
         };
         st.visited.insert(self.root_lba);
         let mut dirs_read = 0usize;
@@ -489,6 +574,7 @@ impl<S: SectorSource> Volume<S> {
             match scan_dir(&data, &prefix, depth, sectors, limits, &mut st) {
                 Ok(()) => {}
                 Err(DirFault::Limit(why)) => return Err(IsoError::LimitExceeded(why)),
+                Err(DirFault::Fatal(e)) => return Err(e),
                 Err(DirFault::Format(why)) if is_root => return Err(bad_dir(why)),
                 Err(DirFault::Format(why)) => st.result.skipped.push(SkippedEntry {
                     path: shown,
@@ -501,6 +587,7 @@ impl<S: SectorSource> Volume<S> {
         let mut result = st.result;
         result.files.sort_by(|a, b| a.path.cmp(&b.path));
         result.skipped.sort_by(|a, b| a.path.cmp(&b.path));
+        check_no_overlap(&result.files)?;
         Ok(result)
     }
 
@@ -1101,5 +1188,205 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Visit every FILE record of the root directory (all of its sectors): the closure gets the
+    /// name (without `;1`) and may rewrite the record's extent and size, as a crafted image would.
+    fn patch_root_records(img: &mut [u8], mut f: impl FnMut(&str, &mut u32, &mut u32)) {
+        let word = |img: &[u8], at: usize| u32::from_le_bytes(img[at..at + 4].try_into().unwrap());
+        let pvd = 16 * 2048;
+        let root = word(img, pvd + 158) as usize * 2048;
+        let root_size = word(img, pvd + 166) as usize;
+        let mut sector = 0;
+        while sector * 2048 < root_size {
+            let base = root + sector * 2048;
+            let mut off = 0;
+            while off < 2048 && img[base + off] != 0 {
+                let at = base + off;
+                let len = img[at] as usize;
+                let name_len = img[at + 32] as usize;
+                let name = String::from_utf8_lossy(&img[at + 33..at + 33 + name_len]).into_owned();
+                if img[at + 25] & 0x02 == 0 {
+                    let (mut lba, mut size) = (word(img, at + 2), word(img, at + 10));
+                    f(name.trim_end_matches(";1").trim_end_matches('.'), &mut lba, &mut size);
+                    img[at + 2..at + 10].copy_from_slice(&both32(lba));
+                    img[at + 10..at + 18].copy_from_slice(&both32(size));
+                }
+                off += len;
+            }
+            sector += 1;
+        }
+    }
+
+    /// Finding 6: files that share sectors are refused, whichever way they share them.
+    #[test]
+    fn overlapping_file_extents_are_refused() {
+        let big: Vec<u8> = (0..3 * 2048).map(|i| (i % 251) as u8).collect();
+        let base = build_iso(&[
+            ("SYSTEM.CNF", &system_cnf("SCUS_941.63")),
+            ("A.DAT", &big),
+            ("B.DAT", &big[..2048]),
+            ("C.DAT", &big[..100]),
+        ]);
+        let lba_of = |img: &[u8], name: &str| {
+            let mut found = None;
+            let mut copy = img.to_vec();
+            patch_root_records(&mut copy, |n, lba, size| {
+                if n == name {
+                    found = Some((*lba, *size));
+                }
+            });
+            found.unwrap()
+        };
+        let (a_lba, a_size) = lba_of(&base, "A.DAT");
+        let (b_lba, _) = lba_of(&base, "B.DAT");
+        assert_eq!(a_size, 3 * 2048);
+        assert!(b_lba >= a_lba + 3, "the builder lays files out one after another");
+        // untouched: fine (and the empty-file / adjacent-extent cases are the builder's normal output)
+        assert_eq!(Volume::open(MemImage(base.clone())).unwrap().walk().unwrap().files.len(), 4);
+
+        let refused = |patch: &dyn Fn(&str, &mut u32, &mut u32)| {
+            let mut img = base.clone();
+            patch_root_records(&mut img, |n, lba, size| patch(n, lba, size));
+            Volume::open(MemImage(img)).unwrap().walk()
+        };
+        // B starts in the middle of A
+        let r = refused(&|n, lba, _| {
+            if n == "B.DAT" {
+                *lba = a_lba + 1;
+            }
+        });
+        match r {
+            Err(IsoError::OverlappingFiles { first, second }) => {
+                assert_eq!((first.as_str(), second.as_str()), ("A.DAT", "B.DAT"), "reported in path order");
+            }
+            other => panic!("{other:?}"),
+        }
+        // B lies entirely inside A, at A's very start
+        assert!(matches!(
+            refused(&|n, lba, _| {
+                if n == "B.DAT" {
+                    *lba = a_lba;
+                }
+            }),
+            Err(IsoError::OverlappingFiles { .. })
+        ));
+        // an exact duplicate (same extent, same size) is the amplification probe's own shape
+        assert!(matches!(
+            refused(&|n, lba, size| {
+                if n == "C.DAT" {
+                    *lba = a_lba;
+                    *size = a_size;
+                }
+            }),
+            Err(IsoError::OverlappingFiles { .. })
+        ));
+        // one sector shared at the END of A
+        let r = refused(&|n, lba, size| {
+            if n == "C.DAT" {
+                *lba = a_lba + 2;
+                *size = 10;
+            }
+        });
+        assert!(matches!(r, Err(IsoError::OverlappingFiles { .. })), "{r:?}");
+        // the message says what is wrong in plain words
+        let msg = r.unwrap_err().to_string();
+        assert!(msg.contains("share disc sectors") && msg.contains("A.DAT") && msg.contains("C.DAT"), "{msg}");
+        // touching extents are not overlapping: C right behind A
+        let ok = refused(&|n, lba, size| {
+            if n == "C.DAT" {
+                *lba = a_lba + 3;
+                *size = 10;
+            } else if n == "B.DAT" {
+                *lba = a_lba + 4;
+                *size = 2048;
+            }
+        });
+        assert!(ok.is_ok(), "{ok:?}");
+        // an EMPTY file owns no sector, wherever its record points
+        let ok = refused(&|n, lba, size| {
+            if n == "C.DAT" {
+                *lba = a_lba + 1;
+                *size = 0;
+            }
+        });
+        assert_eq!(ok.unwrap().files.len(), 4);
+    }
+
+    /// The audit's amplification probe: 200 records on one extent. Refused at the walk, so not
+    /// one byte of the extent is ever read.
+    #[test]
+    fn two_hundred_records_on_one_extent_are_refused_before_anything_is_read() {
+        let payload = vec![7u8; 1024 * 2048]; // a 2 MiB extent
+        let names: Vec<String> = (0..200).map(|i| format!("F{i:05}.BIN")).collect();
+        let mut files: Vec<(&str, &[u8])> = names.iter().map(|n| (n.as_str(), &payload[..16])).collect();
+        files.push(("SYSTEM.CNF", b"cnf"));
+        files.push(("DATA.BIN", &payload));
+        let mut img = build_iso(&files);
+        let mut data_lba = 0;
+        patch_root_records(&mut img, |n, lba, _| {
+            if n == "DATA.BIN" {
+                data_lba = *lba;
+            }
+        });
+        // every F-record now claims the shared extent, each one sector longer than the last
+        patch_root_records(&mut img, |n, lba, size| {
+            if let Some(i) = n.strip_prefix('F').and_then(|r| r.strip_suffix(".BIN")).and_then(|r| r.parse::<u32>().ok()) {
+                *lba = data_lba;
+                *size = 1024 * 2048 - i;
+            }
+        });
+        for same_size in [false, true] {
+            let mut copy = img.clone();
+            if same_size {
+                patch_root_records(&mut copy, |n, _, size| {
+                    if n.starts_with('F') {
+                        *size = 1024 * 2048;
+                    }
+                });
+            }
+            let r = Volume::open(MemImage(copy)).unwrap().walk();
+            assert!(matches!(r, Err(IsoError::OverlappingFiles { .. })), "same_size={same_size}: {r:?}");
+        }
+    }
+
+    /// Finding 6: a disc holds a bounded number of files and a bounded number of bytes.
+    #[test]
+    fn a_disc_may_not_list_too_many_files_or_too_many_bytes() {
+        let names: Vec<String> = (0..10).map(|i| format!("FILE{i}.DAT")).collect();
+        let data = vec![5u8; 3000]; // 2 sectors each
+        let files: Vec<(&str, &[u8])> = names.iter().map(|n| (n.as_str(), data.as_slice())).collect();
+        let img = build_iso(&files);
+        let open = || Volume::open(MemImage(img.clone())).unwrap();
+        assert_eq!(open().walk().unwrap().files.len(), 10);
+
+        let few = WalkLimits { max_files: 9, ..WalkLimits::default() };
+        let r = open().walk_with_limits(&few);
+        assert!(matches!(r, Err(IsoError::TooManyFiles { limit: 9 })), "{r:?}");
+        assert!(r.unwrap_err().to_string().contains("more than 9 files"));
+        let exact = WalkLimits { max_files: 10, ..WalkLimits::default() };
+        assert_eq!(open().walk_with_limits(&exact).unwrap().files.len(), 10);
+
+        let small = WalkLimits { max_file_bytes: 29_999, ..WalkLimits::default() };
+        let r = open().walk_with_limits(&small);
+        assert!(matches!(r, Err(IsoError::TooMuchData { limit: 29_999 })), "{r:?}");
+        assert!(r.unwrap_err().to_string().contains("more than a CD-ROM holds"));
+        let exact = WalkLimits { max_file_bytes: 30_000, ..WalkLimits::default() };
+        assert_eq!(open().walk_with_limits(&exact).unwrap().files.len(), 10);
+
+        // the defaults are what the docs say they are
+        assert_eq!(WalkLimits::default().max_files, 20_000);
+        assert_eq!(WalkLimits::default().max_file_bytes, 1 << 30);
+        const { assert!(MAX_FILE_BYTES > 99 * 60 * 75 * 2048, "above the capacity of a 99-minute CD") };
+        // sizes that lie about themselves are caught by the byte cap even in one record: a
+        // 4 GiB-sized file in an image far smaller is "outside the image", and skipped as before
+        let mut crafted = img.clone();
+        patch_root_records(&mut crafted, |n, _, size| {
+            if n == "FILE0.DAT" {
+                *size = u32::MAX;
+            }
+        });
+        let walk = Volume::open(MemImage(crafted)).unwrap().walk().unwrap();
+        assert!(walk.skipped.iter().any(|s| s.reason.contains("outside")), "{:?}", walk.skipped);
     }
 }

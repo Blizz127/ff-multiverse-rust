@@ -475,7 +475,7 @@ mod tests {
     use super::*;
     use crate::ui::menu::{KeyPress, Look, NavKey, NoticeKind, Screen};
     use crate::ui::testkit::{serve_join, Reply};
-    use fmv_protocol::Secret;
+    use fmv_protocol::{RejectCode, Secret};
     use std::net::TcpListener;
 
     fn launch(dir: &std::path::Path, server: &str) -> Launch {
@@ -756,7 +756,7 @@ mod tests {
     #[test]
     fn a_refused_name_over_a_real_socket_is_shown_in_the_servers_words_and_nothing_is_saved() {
         let dir = tempfile::tempdir().unwrap();
-        let (addr, server) = serve_join(Reply::Reject("that display name is already taken"));
+        let (addr, server) = serve_join(Reply::Reject(RejectCode::NameTaken, "that display name is already taken"));
         let mut shell = Shell::new(launch(dir.path(), &addr));
         shell.handle_input(MenuInput::Text("Cloud".into()));
         shell.handle_input(nav(NavKey::Enter));

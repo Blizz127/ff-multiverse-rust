@@ -41,4 +41,4 @@ pub mod widgets;
 #[cfg(test)]
 mod shots;
 #[cfg(test)]
-mod testkit;
+pub(crate) mod testkit;

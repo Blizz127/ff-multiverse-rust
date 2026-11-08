@@ -11,7 +11,7 @@
 //!
 //! ```text
 //! C -> S  Hello { protocol_version, client_build, auth, tint, appearance_ref }
-//! S -> C  Welcome { .., account, issued_token }      (or Reject, then the server closes)
+//! S -> C  Welcome { .., account, issued_token }      (or Reject { reason, code }, then the server closes)
 //! S -> C  AreaManifest { area, fingerprint, provenance, fixture, .. }
 //! C -> S  JoinArea { area, fingerprint, provenance }  (or CannotJoin { reason })
 //! S -> C  AreaSnapshot, InstancePlacement             (always first after the handshake replies)
@@ -77,12 +77,21 @@
 //! [`Auth::Token`] (log in with the token a registration issued). A registration is answered by a
 //! `Welcome` whose `issued_token` is `Some`: **the only time the token is ever sent**; the server
 //! keeps just a hash. A client must store it before doing anything else (a registered name is
-//! unique and cannot be recovered without the token).
+//! unique and cannot be recovered without the token). The server creates the account and its avatar
+//! in one step and releases the account again if that `Welcome` is never written to the socket, so a
+//! connection that dies at that moment does not leave a name taken without a token.
 //!
 //! After registration the server never trusts client-supplied names: the display name, tint and
 //! per-game appearance of an entity come from the stored avatar profile. `Hello::tint` and
 //! `Hello::appearance_ref` are only the look requested for a NEW avatar (ignored when logging in
 //! with a token).
+//!
+//! # Rejections
+//!
+//! A refusal (or the end of a session the server decides to close) is `Reject { reason, code }`:
+//! `reason` is a sentence for the screen and the log, `code` is a [`RejectCode`] a program acts
+//! on. Never match on the sentence. The field is additive within v3 (see [`reject`] for why old
+//! and new peers still understand each other).
 //!
 //! # Parties
 //!
@@ -106,6 +115,9 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub mod battle;
+pub mod reject;
+
+pub use reject::RejectCode;
 
 /// The battle wire types (the engine's own `BattleEvent`, `Command` and `Outcome` stay under
 /// [`battle`], where their names say what they are).
@@ -161,8 +173,11 @@ impl fmt::Debug for Secret {
 pub enum Auth {
     /// Log in with the token a registration issued.
     Token(Secret),
-    /// Create an account with this display name (cleaned by `AvatarAppearance::sanitize_name`
-    /// and unique, case-insensitively). The reply carries the new token.
+    /// Create an account with this display name (cleaned and admitted by
+    /// `AvatarAppearance::validate_new_name`, and unique by `fmv_core::name_key`: case, width,
+    /// invisible characters and look-alike letters make no difference). A name that is unusable is
+    /// refused with `RejectCode::InvalidName`, one that is taken with `RejectCode::NameTaken`. The
+    /// reply carries the new token.
     Register { display_name: String },
 }
 
@@ -236,7 +251,9 @@ impl fmt::Display for PartyFailure {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ClientMsg {
     /// First message of a connection. `tint` and `appearance_ref` are used only to create a NEW
-    /// avatar (when `auth` is `Register`).
+    /// avatar (when `auth` is `Register`). The server keeps `appearance_ref` only if it is one of the
+    /// look ids the hosted game offers (for FF7 the `ff7/<character>` ids); any other value is not an
+    /// error, the avatar just keeps the default look.
     Hello {
         protocol_version: u16,
         client_build: String,
@@ -289,7 +306,13 @@ pub enum ServerMsg {
         /// once**. Never log this message with `{:?}` without redaction (`Secret` redacts).
         issued_token: Option<Secret>,
     },
-    Reject { reason: String },
+    /// The server refuses or ends the connection and closes it. `reason` is for people, `code` for
+    /// programs (`Unspecified`, and then absent from the JSON, from a server that sends none).
+    Reject {
+        reason: String,
+        #[serde(default, skip_serializing_if = "RejectCode::is_unspecified")]
+        code: RejectCode,
+    },
     /// Offer of the area the server is hosting. `fixture == true` must be shown to the user.
     AreaManifest {
         area: AreaId,
@@ -374,6 +397,13 @@ pub enum ServerMsg {
     /// A battle request or command of this client was refused. `battle_id` is the battle it was
     /// about, if any.
     BattleRejected { battle_id: Option<BattleId>, reason: BattleRejection },
+}
+
+impl ServerMsg {
+    /// A `Reject` with a code and its sentence.
+    pub fn reject(code: RejectCode, reason: impl Into<String>) -> Self {
+        ServerMsg::Reject { reason: reason.into(), code }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -649,7 +679,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------------------------
-    // Area travel (additive in v3)
+    // Area travel (protocol v4)
     // -----------------------------------------------------------------------------------------
 
     fn md1stin() -> AreaId {
@@ -738,6 +768,90 @@ mod tests {
         // `\u{10FFFF}` is written as a raw 4-byte character; serde_json does not escape it.
         assert!(one < 400, "{one} bytes per NPC");
         assert!(MAX_NPCS_PER_AREA * (one + 1) < 51_000, "{} bytes of NPCs", MAX_NPCS_PER_AREA * (one + 1));
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Rejection codes (additive within v3)
+    // -----------------------------------------------------------------------------------------
+
+    #[test]
+    fn golden_rejections() {
+        golden(
+            ServerMsg::reject(RejectCode::NameTaken, "that display name is already taken"),
+            r#"{"Reject":{"reason":"that display name is already taken","code":"NameTaken"}}"#,
+        );
+        // A reject without a code has exactly the shape it always had.
+        golden(
+            ServerMsg::Reject { reason: "server full".into(), code: RejectCode::Unspecified },
+            r#"{"Reject":{"reason":"server full"}}"#,
+        );
+        // Every code keeps its wire name (clients match on them).
+        let names = [
+            (RejectCode::ProtocolMismatch, "ProtocolMismatch"),
+            (RejectCode::ServerFull, "ServerFull"),
+            (RejectCode::TooManyConnections, "TooManyConnections"),
+            (RejectCode::RegistrationClosed, "RegistrationClosed"),
+            (RejectCode::RateLimited, "RateLimited"),
+            (RejectCode::NameTaken, "NameTaken"),
+            (RejectCode::InvalidName, "InvalidName"),
+            (RejectCode::InvalidToken, "InvalidToken"),
+            (RejectCode::AlreadyOnline, "AlreadyOnline"),
+            (RejectCode::ContentMismatch, "ContentMismatch"),
+            (RejectCode::BadRequest, "BadRequest"),
+            (RejectCode::Timeout, "Timeout"),
+            (RejectCode::IdleTimeout, "IdleTimeout"),
+            (RejectCode::ShuttingDown, "ShuttingDown"),
+            (RejectCode::Internal, "Internal"),
+        ];
+        for (code, name) in names {
+            golden(code, &format!("\"{name}\""));
+        }
+        assert_eq!(names.len() + 1, RejectCode::ALL.len(), "a new code needs a golden line here");
+        assert!(RejectCode::ALL.contains(&RejectCode::Unspecified));
+    }
+
+    /// The compatibility argument of `reject.rs`, as tests: old and new peers read each other.
+    #[test]
+    fn a_reject_with_or_without_a_code_is_read_by_old_and_new_peers() {
+        // A server that predates the codes: the new client reads `Unspecified`.
+        let text = "too many registrations on this server right now; try again in a minute";
+        let old: ServerMsg = decode(format!(r#"{{"Reject":{{"reason":"{text}"}}}}"#).as_bytes()).unwrap();
+        assert_eq!(old, ServerMsg::Reject { reason: text.into(), code: RejectCode::Unspecified });
+        // A newer server's code this build has never heard of is `Unspecified`, not "malformed".
+        let future: ServerMsg = decode(br#"{"Reject":{"reason":"x","code":"SomethingNew"}}"#).unwrap();
+        assert_eq!(future, ServerMsg::Reject { reason: "x".into(), code: RejectCode::Unspecified });
+        // An old client (the v3 shape without `code`) reads the new message by ignoring the field.
+        #[derive(Deserialize, Debug, PartialEq)]
+        enum OldServerMsg {
+            Reject { reason: String },
+        }
+        let new_json = serde_json::to_vec(&ServerMsg::reject(RejectCode::ServerFull, "server full")).unwrap();
+        assert_eq!(decode::<OldServerMsg>(&new_json).unwrap(), OldServerMsg::Reject { reason: "server full".into() });
+    }
+
+    #[test]
+    fn retryable_codes_are_about_the_servers_state_not_the_request() {
+        for code in RejectCode::ALL {
+            let retry = code.is_retryable();
+            match code {
+                RejectCode::ServerFull
+                | RejectCode::TooManyConnections
+                | RejectCode::RateLimited
+                | RejectCode::AlreadyOnline
+                | RejectCode::Timeout
+                | RejectCode::IdleTimeout
+                | RejectCode::ShuttingDown
+                | RejectCode::Internal => assert!(retry, "{code:?}"),
+                RejectCode::Unspecified
+                | RejectCode::ProtocolMismatch
+                | RejectCode::RegistrationClosed
+                | RejectCode::NameTaken
+                | RejectCode::InvalidName
+                | RejectCode::InvalidToken
+                | RejectCode::ContentMismatch
+                | RejectCode::BadRequest => assert!(!retry, "{code:?}"),
+            }
+        }
     }
 
     /// Every `PartyEvent` variant keeps its shape (the wire embeds fmv-party's type).

@@ -27,6 +27,25 @@ pub(crate) fn is_temp_name(name: &str) -> bool {
 
 /// Atomically replace (or create) `path` with `bytes`, durably.
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    atomic_replace(path, |file| file.write_all(bytes))
+}
+
+/// Like [`atomic_write`], but the content is produced by `fill` straight into the (buffered)
+/// temp file, for files too large to hold in memory. If `fill` fails nothing is replaced.
+pub(crate) fn atomic_write_with(
+    path: &Path,
+    fill: impl FnOnce(&mut dyn Write) -> io::Result<()>,
+) -> Result<()> {
+    atomic_replace(path, |file| {
+        let mut buffered = io::BufWriter::with_capacity(1 << 20, file);
+        fill(&mut buffered)?;
+        buffered.flush()
+    })
+}
+
+/// The shared core: write a temp file next to `path` with `write`, fsync it, rename it over
+/// `path` and fsync the directory.
+fn atomic_replace(path: &Path, write: impl FnOnce(&mut File) -> io::Result<()>) -> Result<()> {
     let (dir, name) = match (path.parent(), path.file_name().and_then(|n| n.to_str())) {
         (Some(dir), Some(name)) => (dir, name),
         _ => {
@@ -42,7 +61,7 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     };
 
     let (tmp_path, mut file) = create_temp(dir, name)?;
-    let written = file.write_all(bytes).and_then(|()| file.sync_all());
+    let written = write(&mut file).and_then(|()| file.sync_all());
     drop(file);
     if let Err(e) = written {
         let _ = fs::remove_file(&tmp_path);
@@ -195,6 +214,12 @@ struct VersionProbe {
 /// Validate `schema_version` before the typed decode, so a record from a newer build is
 /// reported as such instead of as an unhelpful shape error.
 pub(crate) fn check_schema_version(path: &Path, bytes: &[u8]) -> Result<u32> {
+    check_schema_version_upto(path, bytes, SCHEMA_VERSION)
+}
+
+/// [`check_schema_version`] for a file kind whose newest known version is `supported` (the
+/// index has its own version, independent of the record files).
+pub(crate) fn check_schema_version_upto(path: &Path, bytes: &[u8], supported: u32) -> Result<u32> {
     let probe: VersionProbe = serde_json::from_slice(bytes)
         .map_err(|e| PersistError::corrupt(path, format!("not a valid JSON record: {e}")))?;
     let value = probe
@@ -213,13 +238,13 @@ pub(crate) fn check_schema_version(path: &Path, bytes: &[u8]) -> Result<u32> {
         Err(PersistError::InvalidSchema {
             path: path.to_path_buf(),
             found,
-            supported: SCHEMA_VERSION,
+            supported,
         })
-    } else if found > SCHEMA_VERSION {
+    } else if found > supported {
         Err(PersistError::FutureSchema {
             path: path.to_path_buf(),
             found,
-            supported: SCHEMA_VERSION,
+            supported,
         })
     } else {
         Ok(found)

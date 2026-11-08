@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use common::*;
 use fmv_core::{AnimState, Pos};
-use fmv_protocol::{encode, write_msg, Auth, ClientMsg, ServerMsg, MAX_FRAME, PROTOCOL_VERSION};
+use fmv_protocol::{encode, write_msg, Auth, ClientMsg, RejectCode, ServerMsg, MAX_FRAME, PROTOCOL_VERSION};
 use fmv_server::ServerConfig;
 use tokio::io::AsyncWriteExt;
 use tokio::time::{sleep, timeout, Instant};
@@ -27,7 +27,7 @@ async fn two_players_move_get_corrected_and_leave() {
     assert_eq!(a.snapshot[0].pos, Pos::new(-100.0, 0.0, 0.0));
     assert_eq!(a.snapshot[0].avatar.display_name, "Alice");
     assert_eq!(a.snapshot[0].avatar.tint, [10, 20, 30]);
-    assert_eq!(a.snapshot[0].avatar.appearance_ref.as_deref(), Some("test-model"));
+    assert_eq!(a.snapshot[0].avatar.appearance_ref, None, "the FIXTURE game offers no looks: \"test-model\" is dropped, not refused");
 
     let mut b = join(server.addr, "Bob").await;
     assert_ne!(a.entity, b.entity);
@@ -155,13 +155,13 @@ async fn two_players_move_get_corrected_and_leave() {
         appearance_ref: None,
     })
     .await;
-    old.expect_reject("protocol version").await;
+    old.expect_reject_as(RejectCode::ProtocolMismatch, "protocol version").await;
 
     // A protocol v1 Hello has another shape (the name was at the top level). It is told the
     // versions differ, not that its message is malformed.
     let mut v1 = Client::connect(server.addr).await;
     v1.send_json(r#"{"Hello":{"protocol_version":1,"client_build":"old","display_name":"Old","tint":[1,2,3],"appearance_ref":null}}"#).await;
-    v1.expect_reject("protocol version mismatch").await;
+    v1.expect_reject_as(RejectCode::ProtocolMismatch, "protocol version mismatch").await;
 
     server.shutdown().await;
 }
@@ -180,7 +180,7 @@ async fn bad_input_is_rejected_limits_hold_and_the_server_survives() {
     let mut wrong = info.fingerprint;
     wrong.0[0] ^= 0xff;
     c.send(&ClientMsg::JoinArea { area: info.id.clone(), fingerprint: wrong, provenance: info.provenance.summary() }).await;
-    c.expect_reject("fingerprint mismatch").await;
+    c.expect_reject_as(RejectCode::ContentMismatch, "fingerprint mismatch").await;
 
     // JoinArea for another area.
     let mut c = Client::connect(server.addr).await;
@@ -190,7 +190,7 @@ async fn bad_input_is_rejected_limits_hold_and_the_server_survives() {
     let mut other = info.id.clone();
     other.key = "elsewhere".into();
     c.send(&ClientMsg::JoinArea { area: other, fingerprint: info.fingerprint, provenance: info.provenance.summary() }).await;
-    c.expect_reject("area mismatch").await;
+    c.expect_reject_as(RejectCode::ContentMismatch, "area mismatch").await;
 
     // CannotJoin: the server just closes.
     let mut c = Client::connect(server.addr).await;
@@ -203,23 +203,23 @@ async fn bad_input_is_rejected_limits_hold_and_the_server_survives() {
     // Empty display name, and a first message that is not Hello.
     let mut c = Client::connect(server.addr).await;
     c.hello(" \t ").await;
-    c.expect_reject("display name").await;
+    c.expect_reject_as(RejectCode::InvalidName, "display name").await;
     let mut c = Client::connect(server.addr).await;
     c.send(&ClientMsg::Ping { nonce: 1 }).await;
-    c.expect_reject("expected Hello").await;
+    c.expect_reject_as(RejectCode::BadRequest, "expected Hello").await;
 
     // Silence: no Hello within the (shortened) hello timeout.
     let mut c = Client::connect(server.addr).await;
-    c.expect_reject("timed out waiting for Hello").await;
+    c.expect_reject_as(RejectCode::Timeout, "timed out waiting for Hello").await;
 
     // Garbage inside a valid frame, and a frame announcing more than MAX_FRAME bytes. Neither may panic
     // the server; both get a reason.
     let mut c = Client::connect(server.addr).await;
     c.send_json("this is not json").await;
-    c.expect_reject("malformed").await;
+    c.expect_reject_as(RejectCode::BadRequest, "malformed").await;
     let mut c = Client::connect(server.addr).await;
     c.stream.write_all(&(MAX_FRAME + 1).to_le_bytes()).await.unwrap();
-    c.expect_reject("frame too large").await;
+    c.expect_reject_as(RejectCode::BadRequest, "frame too large").await;
 
     // Rate limit: 20 msgs/s sustained. Hello + JoinArea use two tokens, a flood of pings does the rest.
     let mut c = Client::connect(server.addr).await;
@@ -233,7 +233,7 @@ async fn bad_input_is_rejected_limits_hold_and_the_server_survives() {
             break;
         }
     }
-    c.expect_reject("rate limit").await;
+    c.expect_reject_as(RejectCode::RateLimited, "rate limit").await;
 
     // After all of that a normal player can still join, and sees only itself (no ghosts).
     let ok = join(server.addr, "Survivor").await;
@@ -251,7 +251,7 @@ async fn bad_input_is_rejected_limits_hold_and_the_server_survives() {
     let quiet_entity = quiet.entity;
     let mut chatty = join(idle.addr, "Chatty").await;
     let mut full = Client::connect(idle.addr).await;
-    full.expect_reject("server full").await; // both slots are taken
+    full.expect_reject_as(RejectCode::ServerFull, "server full").await; // both slots are taken
     for nonce in 0..10 {
         sleep(Duration::from_millis(150)).await;
         chatty.client.send(&ClientMsg::Ping { nonce }).await;
@@ -265,7 +265,7 @@ async fn bad_input_is_rejected_limits_hold_and_the_server_survives() {
             _ => None,
         })
         .await;
-    quiet.client.expect_reject("idle timeout").await;
+    quiet.client.expect_reject_as(RejectCode::IdleTimeout, "idle timeout").await;
     let mut freed = None;
     for _ in 0..50 {
         let mut again = Client::connect(idle.addr).await;
@@ -290,7 +290,7 @@ async fn bad_input_is_rejected_limits_hold_and_the_server_survives() {
     first.hello("First").await;
     assert!(matches!(first.next().await, ServerMsg::Welcome { .. }), "the first connection holds the only slot");
     let mut second = Client::connect(small.addr).await;
-    second.expect_reject("server full").await;
+    second.expect_reject_as(RejectCode::ServerFull, "server full").await;
     drop(first);
     // The slot frees up shortly after the first client is gone.
     let mut accepted = false;
