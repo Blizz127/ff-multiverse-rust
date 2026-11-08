@@ -29,6 +29,17 @@
 //!   store was edited by hand; neither goes negative).
 //! * [`Change::Found`]: the items a won battle dropped. A stack stops at the cap, and a new stack is not
 //!   started past [`MAX_INVENTORY_STACKS`].
+//!
+//! # A known narrow race (the same one character progress has)
+//!
+//! The store is written by the saver task, a moment after the world changed the mirror. A player who
+//! uses an item, disconnects, and logs back in before that write has landed is told the previous
+//! inventory (the item still there), and in that session can use it once more than the account really
+//! had. The saver applies each use to the stored record when it lands, and taking an item the record no
+//! longer holds does nothing, so no stored count ever goes negative and the account is right again from
+//! the next join on. The window is the saver's queue delay (milliseconds in practice), it cannot be
+//! opened by a second connection while the first is still in the world (that join is refused as
+//! `AlreadyOnline`), and it is the price of keeping all disk I/O off the world lock.
 
 use fmv_core::{InventoryEntry, MAX_INVENTORY_STACKS};
 use fmv_protocol::{BattleRules, ServerMsg};

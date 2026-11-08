@@ -1,6 +1,6 @@
 [package]
 name = "fmv-server"
-description = "Authoritative FF Multiverse server (protocol v5). Hosts the areas of one game (entry area plus the ones its exits lead to); the FIXTURE area is synthetic and NOT FF7 support."
+description = "Authoritative FF Multiverse server (protocol v6). Hosts the areas of one game (entry area plus the ones its exits lead to); the FIXTURE area is synthetic and NOT FF7 support."
 version.workspace = true
 edition.workspace = true
 publish.workspace = true

@@ -79,7 +79,9 @@
 //! as its own character at its own level, and a victory pays it (see the `battle` module): the mirror
 //! is updated under the world lock, in memory, and the same payment is queued for the saver
 //! (`crate::saver`), which writes it to the store off the lock and off the async executor. Nothing in
-//! the world does disk I/O.
+//! the world does disk I/O. The player's inventory (`crate::inventory`) follows the same pattern: a
+//! mirror per player, told to it as the fourth message of a join, changed by the items it uses and the
+//! drops it is paid, every change queued for the saver.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};

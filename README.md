@@ -50,7 +50,9 @@ profiles (M2-a) and parties of up to three with story-phase placement (M2-b) wor
 (protocol v2), and **shared battles (M2-c/d, protocol v3)** run on the deterministic
 `fmv-ff7-battle` engine: the server steps a battle for the whole party, each client replays it
 from its own `scene.bin` and `kernel.bin`, and **every account keeps its own character progress
-(level, experience, AP, gil; protocol v5)**, paid by won battles and saved per account. The synthetic **FIXTURE** plaza still exists
+(level, experience, AP, gil; protocol v5)**, paid by won battles and saved per account, and
+**battles have real commands (protocol v6)**: Attack, Magic, Item and Defend, with an inventory per
+account. The synthetic **FIXTURE** plaza still exists
 as a labelled test area; it says nothing about FF7 support.
 
 | Milestone | Scope | State |
@@ -415,6 +417,26 @@ saves everything still queued first. `scripts/battle-smoke.sh --progress` runs t
 your real data: two bots fight, reconnect with their saved tokens, fight again at the level the
 first win left them at, and reconnect once more to see what was kept.
 
+**Battle commands and items (protocol v6).** A party member whose gauge is full gives Attack, Magic
+(a spell it knows, for MP), Item (one the account owns) or Defend (physical damage halved until its
+next turn). The engine (`fmv-ff7-battle`) plays them with FF7's own formulas decoded from the
+owner's `kernel.bin` (spell, Cure, Life/Phoenix Down, potion and Grenade formulas; elemental
+weakness, resistance, nullify, absorb and full-heal from `scene.bin`), and the enemies use their own
+`scene.bin` attacks (a uniform pick among the damaging ones they have the MP for; the original's AI
+scripts are not decoded). Spells: the magic materia a character's starting record equips, plus a
+starter grimoire every character is given (Restore, Fire, Ice and Lightning at level 1: Cure, Fire,
+Ice, Bolt), because on the Steam copy only Cloud and Red XIII start with magic materia. **The engine
+knows no inventory**: the server checks the account owns the item, submits the command and takes the
+item only when the engine accepted it, so every client still replays every battle from its own files
+without knowing anyone's items. A new account (and an existing one that never had an inventory)
+starts with the kernel's own starting stock (Potion x3, Ether x1, Phoenix Down x1) exactly once; the
+inventory is saved inside the account's character record (older records without it still load and
+are not rewritten until an item is used or found), and the server tells the player what it carries
+when it joins, after every item used and after drops. A won battle drops items rolled by the server
+from the enemies' own drop rates (`scene.bin`), dealt to the living members, logged and not part of
+the replay. Known gaps: no statuses, no spells or items that hit a whole side, no summons, limits or
+escape, party elemental resistances are not modelled.
+
 `md1stin`'s own encounter table (section 6 of the field file, Steam PC build): the first of its
 two 24-byte tables is the enabled one, with rate 128 (a roll succeeds with probability 128/1024)
 and three formations whose weights add up to 64: 301 (weight 24, two enemies), 302 (22, one enemy)
@@ -423,13 +445,17 @@ same way (checked over all 702 fields of that build: every enabled table's weigh
 and every formation exists in `scene.bin`). A starting party wins 301 and 303 every time (200 of
 200 seeded runs each, both members attacking), which is why the smoke script uses 301.
 
-**Protocol v5** (`fmv-protocol`) carries all of the above; its module docs describe the flow,
+**Protocol v6** (`fmv-protocol`) carries all of the above; its module docs describe the flow,
 and golden JSON tests pin the wire format (the engine's own event, command and outcome types
 included). A client or server of another protocol version is refused with a clear message:
 v5 added `CharacterProgress`, a message a v4 peer cannot decode (the server sends it right after
 every join), so the version was bumped like v4 was for `AreaChange`, and a v4 client is refused
-at the handshake instead of being cut off at its first join. Both sides must be built from this
-version or later.
+at the handshake instead of being cut off at its first join; v6 added `Inventory` (also sent
+right after every join), the new battle commands and events and the items in `BattleReward`, so a
+v5 client is refused the same way. Both sides must be built from this version or later. A server
+rolled back to a v5 build ignores (and, the next time it saves that account, drops) the inventory
+of a record written by this version, and refuses a record with more than about 70 stacks as too
+large: roll back only from a snapshot taken before any inventory was stored.
 
 ## Importing your own FF7 data
 
