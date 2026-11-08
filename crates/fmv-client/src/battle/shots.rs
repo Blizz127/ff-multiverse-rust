@@ -320,8 +320,10 @@ fn offscreen_battle_damage_popups_and_the_action_banner() {
         let mut hud = hud();
         // Real events through the hud: a hit, a critical hit and a miss; a heal and restored MP are added
         // to the view by hand (the engine's events for them do not exist yet).
+        // (They arrive early enough that their blows have been landing for 300 ms: a number is born at the
+        // impact, see `scene::cue`.)
         hud.on_events(
-            NOW - 0.3,
+            NOW - 0.3 - super::scene::cue::impact_delay(None),
             &[
                 BattleEvent::Damage { actor: ActorId(1), target: ActorId(3), amount: 1234, critical: false },
                 BattleEvent::Damage { actor: ActorId(1), target: ActorId(5), amount: 9999, critical: true },

@@ -10,7 +10,7 @@ credentials, and neither does this document.
 
 **Status:** the package and its entry point work from a plain unpack (checked end to end on the
 build machine, see "Verification"). Not published. Controller, borderless full screen and the
-on-screen keyboard are NOT IMPLEMENTED (see "Device gate").
+on-screen keyboard are IMPLEMENTED but NOT RUN on a device (see "Device gate").
 
 ## 1. The package
 
@@ -202,19 +202,124 @@ repository's. The concrete places are in the hand-off note that accompanies each
 ## 8. Device gate (owner testing after install)
 
 The owner tests every private build on the handheld after installing it from the launcher. These
-checks are post-install test items, **not** a shipment hold. None of them is implemented yet:
-planned for the next wave. Each is recorded NOT RUN until the owner (or a later observed test)
-reports PASS or FAIL with the device, OS, Game Mode / Gamescope and controller / Steam Input setup.
+checks are post-install test items, **not** a shipment hold. All three are implemented in
+`fmv-client`; none has been run on a device, a display or a controller (the build machine has none
+of them). Each is recorded NOT RUN until the owner (or a later observed test) reports PASS or FAIL
+with the device, OS, Game Mode / Gamescope and controller / Steam Input setup.
 
 | Check | Implemented | Result |
 |---|---|---|
-| Controller works out of the box (gamepad through SDL / Steam Input, menus and gameplay) | **NOT IMPLEMENTED** (`fmv-client` reads keyboard events only; no gamepad input) | NOT RUN |
-| Window is borderless / full screen, no white border | **NOT IMPLEMENTED** (an ordinary decorated 1100x680 window; no full-screen option) | NOT RUN |
-| Focusing a text field opens the on-screen keyboard (the character name entry is drawn by the game and takes key events only, no input-method events) | **NOT IMPLEMENTED** | NOT RUN |
+| Controller works out of the box (gamepad through SDL / Steam Input, menus and gameplay) | **IMPLEMENTED** (NOT RUN: owner device test pending). gilrs, read as the same key events the keyboard makes; see "Controller" | NOT RUN |
+| Window is borderless / full screen, no white border | **IMPLEMENTED** (NOT RUN: owner device test pending). `--fullscreen`, and by itself under gamescope; see "Full screen" | NOT RUN |
+| Focusing a text field opens the on-screen keyboard | **IMPLEMENTED** (NOT RUN: owner device test pending). Steam's keyboard, gamescope sessions only; see "On-screen keyboard" | NOT RUN |
 
 Per release, record next to this table: build id, source commit, package sha256, and for each check
 its result. Never record PASS without an actual observation; virtual pads, unit tests and a headless
 run support development but are not device results. Latest record: none (no build published).
+
+### Controller
+
+`fmv-client` reads game controllers with gilrs 0.11 (evdev and udev on Linux, hot-plug included) and
+turns every button and stick into the key event the keyboard would have made, so there is no second
+input path: the window feeds it to the same key dispatch as a key press, and the character menu
+takes it as the same menu input. With no controller nothing changes.
+
+| Controller | Key | In the field | In a battle | In the character menu |
+|---|---|---|---|---|
+| left stick, D-pad | arrows | walk (eight ways) | menu cursor, target pointer | move, change a value |
+| A (south) | Enter | - | select / confirm | play, create, answer, dismiss a notice |
+| B (east) | Backspace | - | back a level | back / cancel; never quits |
+| X (west) | P | invite the nearest player | (same) | new character on the list, Backspace on the form |
+| Y (north) | Y | accept the newest invite | (same) | forget a saved login (asks first) |
+| Select / View | L | leave the party | (same) | - |
+| Start / Menu | Esc | quit prompt: a second press quits | backs out of the menu, never quits | Esc: back, cancel, or quit |
+| right bumper (R1/RB) | B | ask for a debug battle | - | - |
+| left trigger (L2/LT), held | Shift | walk instead of run | - | - |
+
+Nothing else is bound (the Guide/Steam button belongs to Steam). Details: a stick axis presses at 60 %
+of its travel and lets go at 40 %; in menus and battles only the stronger axis counts and a held
+direction repeats (after 0.4 s, then 8 times a second), in the field the stick reads in eight
+directions and nothing repeats; no other button repeats. Only the window with the focus is
+listened to (losing it lets go of everything). Two controllers at once act as one. The button names
+come from an SDL mapping (gilrs's built-in database, plus `SDL_GAMECONTROLLERCONFIG`, which Steam
+sets for the games it starts) or, failing that, from the driver's own codes. In that second case the
+log line for the controller says "the driver's own layout" and X and Y may be swapped (the Linux xpad
+driver is reported to send the Xbox X as the "north" code), which only exchanges invite and accept; a
+controller with neither would do nothing and the log says so.
+
+**Runtime dependency (new).** `fmv-client` is now linked to `libudev.so.1` (systemd-libs: present on
+every systemd distribution, Bazzite included). It reads `/dev/input/event*`, which normally the seat
+grants to the logged-in user. glibc floor: unchanged, still 2.43 on the current build machine.
+
+**Not run, and known gaps.** Nothing here has seen a real controller. On a fresh install the create
+screen asks for a name, which a controller alone can only type through Steam's keyboard: if the
+automatic keyboard does not appear, Steam+X opens it by hand in Game Mode, so the controller check can
+still be finished and the keyboard check reported on its own. The on-screen key hints (HUD and
+menu) still name keyboard keys; the table above is the reference. gilrs does not honour
+`SDL_GAMECONTROLLER_IGNORE_DEVICES`: if Steam Input hands over a virtual controller and the physical
+one stays readable, both are heard and a key is simply held while either holds it, which is right
+for the default layout but would mix with a custom Steam Input layout.
+
+### Full screen
+
+The window is a borderless full-screen window (winit `Fullscreen::Borderless` on the current monitor,
+decorations off, so no title bar, no frame and no client-side frame drawn by winit under a compositor
+that offers none) when `--fullscreen` is given or when ANY of these is true:
+
+1. `GAMESCOPE_WAYLAND_DISPLAY` is set and not empty;
+2. `XDG_CURRENT_DESKTOP`, a `:`-separated list, has an entry equal to `gamescope` (any case);
+3. `SteamGamepadUI` is `1`.
+
+Checks 1 and 2 are exported by gamescope itself (its `main.cpp`) to everything it starts, so a game
+started from Game Mode inherits them, also through a launcher that Steam started (checked in
+gamescope's source: both are set unconditionally before it starts the program, and
+`WAYLAND_DISPLAY` is left unset unless gamescope runs with `--expose-wayland`, so under Game Mode the
+client is normally an X11 client). Check 3 is Steam's, and is reported to be set for a game started
+from Big Picture on an ordinary desktop too. `SteamDeck=1` is not a check: Steam sets it for games it
+starts on Deck hardware, desktop mode is expected to be no exception (not verified), so it does not
+mean Game Mode. A normal desktop session (KDE, started from a menu or a terminal) has none of the
+three and stays windowed. The
+start-up line `device: ...` on stderr names the signals seen and the decision. Not done: a
+`--windowed` override and a run-time toggle.
+
+About the "white border": the renderer cannot draw one. It clears to a dark blue-black everywhere,
+the character menu paints a dark gradient over the whole window, and the bars around a field's 4:3
+picture on a wider screen are that same dark colour (only a battle's own sky shows its horizon colour
+in the part of the scene nothing covers). What full screen removes is the window frame and title bar,
+which is the likely source; if the owner still sees a light border under gamescope, it is not this
+window's frame and the report should say where it is (screen edge, around the picture, around the
+menu).
+
+### On-screen keyboard
+
+Only inside a gamescope session (checks 1 and 2 above; **not** check 3 alone, so Big Picture on a
+desktop gets full screen but no keyboard request) and only when a text field gains the focus (today:
+the name field of the create screen, which a fresh install opens in), the client asks Steam for its
+on-screen keyboard with `xdg-open steam://open/keyboard` (if that fails, `steam -ifrunning
+steam://open/keyboard`), and with `steam://close/keyboard` when the field loses the focus or the form
+is submitted. The request waits for the first frame on screen (or the first focus event), runs on a
+helper thread with the environment unchanged and a 10 s limit, and is logged on stderr
+(`keyboard: asked Steam to open its on-screen keyboard`, or why not). On a desktop nothing is ever
+asked. While Steam's keyboard is up the controller drives it (B closes it), and its keys arrive as
+ordinary key events with text, which the name field already takes: no input-method code is involved.
+There is no password field (a masked one would need nothing different from this).
+
+**Evidence, stated plainly.** Valve documents no such address for a program that is not a Steam
+title (the documented route is the Steamworks call `ShowFloatingGamepadTextInput`, which needs a
+Steam app id this owner-only port does not have). The addresses come from one third-party report of a
+test on a Steam Deck in Game Mode, from a non-Steam shortcut, where both worked and the keys arrived as
+key events (Laeresh/CSVM issue 111). We have not run them on a device. Open risks: whether
+`xdg-open` reaches Steam from the launcher's environment on Bazzite; and a client that gamescope runs
+as a Wayland client (`--expose-wayland`), where Steam may deliver text through the input-method
+protocol instead, which this client does not use (it would then see no text).
+
+### What to send back after a device test
+
+The client's stderr, which for a start from the launcher is wherever the launcher keeps the game's
+output. The lines that matter: `device: ...` (signals seen, window and keyboard decisions),
+`window: using the X11 | Wayland windowing backend`, `gamepad: found | connected "<name>" (<usb
+id>; <mapping>)`, `keyboard: ...`, and what the owner saw (borderless? a white border? did the
+keyboard open? did every button in the table do what it says?).
 
 Also not yet observed on a device: a start from a launcher that itself runs under Steam Game Mode.
 The script and the binaries inherit the launcher's environment unchanged, so Steam's runtime

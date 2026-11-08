@@ -364,8 +364,11 @@ fn events_of(msg: &ServerMsg) -> &[BattleEvent] {
     }
 }
 
+/// The numbers floating up over the fighters once the blows of the events that arrived at `t` have
+/// landed (a number is born when its blow lands, at most `MAX_IMPACT_DELAY` after the arrival).
 fn popups_over(c: &BattleClient, t: f64) -> Vec<(u8, PopupKind)> {
-    c.view(t).expect("a battle").popups.iter().map(|p| (p.target.0, p.kind)).collect()
+    let landed = t + crate::battle::scene::cue::MAX_IMPACT_DELAY;
+    c.view(landed).expect("a battle").popups.iter().map(|p| (p.target.0, p.kind)).collect()
 }
 
 fn banner(c: &BattleClient, t: f64) -> Option<String> {

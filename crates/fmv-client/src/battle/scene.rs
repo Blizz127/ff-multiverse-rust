@@ -15,22 +15,41 @@
 //! * [`model`]: where each actor's model comes from ([`BattleActorModel`]: a field model, a real
 //!   battle model, or a box) and who decides ([`BattleModelSource`]): the real models of the
 //!   machine's own `battle.lgp` when the client found one ([`model::ArchiveModels`]), stand-ins otherwise.
-//! * [`motion`]: what the actors do with time: lunges, flinches, dodges, deaths.
+//! * [`cue`]: a batch of events as performances, and WHEN each lands (the one table the overlay's
+//!   numbers and the scene share, so that the numbers appear at the impact frame without the two
+//!   talking; never later than [`cue::MAX_IMPACT_DELAY`] after the events arrived).
+//! * [`clips`]: which slot of a real battle model plays what (attack, cast, hurt, death, victory...),
+//!   verified on contact sheets; a slot that is missing or not the slot's own clip is never played.
+//! * [`plan`]: time-warps a performance's clips so that the impact frame lands on schedule: faster
+//!   when they are long, the start skipped when even that is not enough, so nothing lags.
+//! * [`motion`]: what the actors do with time: the clips that play, lunges, flinches, dodges, deaths
+//!   (a party member's clip, an enemy's fade), the victory pose; the procedural motion for an actor
+//!   without clips.
+//! * [`effects`]: simple additive effects (a spell's burst coloured by its element, an item's
+//!   sparkle, the sparks of a blow, the glow a caster gathers) made of four shared meshes.
 //! * [`stage`]: the stand-in location: sky, haze, a round tiled floor. A real location model, when
 //!   the [`BattleModelSource`] has one, replaces its floor (and is cut to the camera first, see
 //!   `clip`).
 //!
 //! The models go through the avatar renderer ([`crate::avatar`]): skinned on the CPU into camera
 //! space with the same pose and skinning code the field's players use, drawn depth-tested by
-//! `AvatarGpu::draw_models`; the stage is flat-coloured triangles under them. See
-//! [`crate::render::Gpu::draw_battle`] for the frame.
+//! `AvatarGpu::draw_models_tinted` (a per-model tint: a beaten enemy's opacity, an effect's glow); the
+//! stage is flat-coloured triangles under them. See [`crate::render::Gpu::draw_battle`] for the frame.
+//!
+//! # Presentation only
+//!
+//! The engine's state (the bars, the menu, who is alive) moves when a message arrives; the scene is
+//! presentation and **nothing waits on it**. A performance's impact lands at most
+//! [`cue::MAX_IMPACT_DELAY`] after its events arrived, however long its clips are, and an actor that
+//! is given a new performance takes it over from its start.
 //!
 //! # Data flow
 //!
 //! ```text
-//! BattleClient::scene_start()  --> BattleScene::new   (formation, party, enemies, models)
-//! BattleClient::take_events()  --> BattleScene::update (events become reactions; the engine's
-//! BattleClient::engine()                                state keeps who is alive and ready true)
+//! BattleClient::scene_start()  --> BattleScene::new   (formation, party, enemies, models, their clips)
+//! BattleClient::take_events()  --> BattleScene::update (events become performances; the engine's
+//! BattleClient::engine()                                state says who is alive and ready, and what
+//!                                                       an action looks like: melee, its element)
 //! per frame:   view(w, h) -> frame(view, srgb) -> BattleFrame  (GPU)
 //!                          \-> head_anchors(view) -> Anchors     (the battle overlay)
 //! ```
@@ -44,9 +63,15 @@
 
 pub mod camera;
 mod clip;
+pub mod clips;
+pub mod cue;
+pub mod effects;
 pub mod layout;
 pub mod model;
 pub mod motion;
+pub mod plan;
+#[cfg(test)]
+mod sheets;
 #[cfg(test)]
 mod shots;
 pub mod stage;
@@ -55,6 +80,7 @@ pub use model::ModelKit;
 
 use super::view::{Anchors, BattleView, Status};
 use crate::avatar::frame::{skin, AvatarFrame, SkinnedModel, OVERLAY_BIAS_MODEL_UNITS};
+use crate::avatar::gpu::Tint;
 use crate::avatar::ground::{circle, GroundShape};
 use crate::avatar::library::AvatarAsset;
 use crate::render::{Camera, Vertex};
@@ -62,7 +88,9 @@ use crate::state::ClientState;
 use camera::{fit, BattleCamera, View, V3, NOMINAL_TAN_HALF_V};
 use fmv_core::Pos;
 use fmv_ff7::model::{mat4_mul, mat4_translate, transform_point};
-use fmv_ff7_battle::rules::{ActorId, BattleEvent, BattleState, Combatant, Side};
+use clips::Kit;
+use effects::{EffectKit, Element, Look};
+use fmv_ff7_battle::rules::{ActionRef, ActorId, BattleEvent, BattleState, Combatant, Side};
 use fmv_protocol::battle::FormationScene;
 use fmv_protocol::{BattleId, BattleMember};
 use layout::Spot;
@@ -199,6 +227,9 @@ pub struct BattleFrame {
     pub location: Option<AvatarFrame>,
     /// The models in camera space and the marks on the ground, for the avatar renderer.
     pub models: AvatarFrame,
+    /// The tint of each of `models.models` (a model past the end of this list is drawn as it is): the
+    /// opacity of an enemy that is fading away, the glow of an effect.
+    pub tints: Vec<Tint>,
     /// The window camera the models and marks are placed with ([`View::gpu_camera`]).
     pub camera: Camera,
 }
@@ -215,11 +246,33 @@ pub struct BattleScene {
     /// The location's model, drawn behind everyone in place of the stand-in floor (`None`: the stand-in).
     location: Option<Location>,
     director: Director,
+    /// The meshes the effects are drawn with, shared with every other scene of the kit.
+    effects: Arc<EffectKit>,
     my_actor: Option<ActorId>,
     /// The party members waiting for a command.
     ready: Vec<bool>,
     /// The scene clock: the time of the last [`BattleScene::update`], seconds.
     now: f64,
+}
+
+/// What an action looks like, from the engine's own data: whether its performer runs up to its target
+/// (a party member's weapon is short-range, an enemy's physical attack is melee) and which colour its
+/// effect is (a spell's element, a restoring action's cure green). Without the engine, a plain blow.
+fn look_in(engine: Option<&BattleState>, actor: ActorId, action: ActionRef) -> Look {
+    use fmv_ff7_battle::rules::ActionKind;
+    let Some(who) = engine.and_then(|e| e.actor(actor)) else { return Look::PLAIN };
+    let of = |spec: &fmv_ff7_battle::rules::ActionSpec| Look { melee: spec.kind == ActionKind::Physical, element: Element::from_mask(spec.element_mask, spec.heals()) };
+    match action {
+        ActionRef::Attack => Look { melee: who.side == Side::Enemy || who.short_range, element: Element::Plain },
+        ActionRef::EnemyAttack(id) => who.actions.iter().find(|a| a.id == id).map_or(Look::PLAIN, |a| of(&a.spec)),
+        ActionRef::Magic(id) => who.spells.iter().find(|s| s.index == id).map_or(Look { melee: false, element: Element::Plain }, |s| Look { melee: false, element: of(&s.spec).element }),
+        ActionRef::Item(id) => {
+            let heals = engine.and_then(|e| e.item_info(id)).is_some_and(|info| info.targets_allies);
+            Look { melee: false, element: if heals { Element::Cure } else { Element::Plain } }
+        }
+        ActionRef::Defend => Look { melee: false, element: Element::Plain },
+        // TODO(v7): `ActionRef::Limit(_)` (not melee, a strong effect) and `ActionRef::Escape` (plain).
+    }
 }
 
 impl BattleScene {
@@ -295,6 +348,7 @@ impl BattleScene {
             .map(|rig| Location { rig, cuts: cameras.iter().map(|_| OnceCell::new()).collect() });
         let sides: Vec<Side> = actors.iter().map(|a| a.side).collect();
         let anchors: Vec<Anchor> = actors.iter().map(|a| Anchor { ground: a.home.ground(), radius: a.rig.radius }).collect();
+        let kits: Vec<Kit> = actors.iter().map(|a| a.rig.kit.clone()).collect();
         let n = actors.len();
         Some(Self {
             id: start.id,
@@ -303,7 +357,8 @@ impl BattleScene {
             cast,
             arena,
             location,
-            director: Director::new(sides, anchors),
+            director: Director::with_kits(sides, anchors, kits),
+            effects: Arc::clone(&kit.effects),
             my_actor: start.my_actor,
             ready: vec![false; n],
             now: 0.0,
@@ -345,10 +400,10 @@ impl BattleScene {
         if now.is_finite() {
             self.now = now;
         }
-        for event in events {
-            if let Some(event) = motion::scene_event(event) {
-                self.director.on_event(self.now, event);
-            }
+        // The batch that arrived is a set of performances, each landing at its own instant after `now`
+        // (the instants the overlay's numbers are born at: see `cue`).
+        if !events.is_empty() {
+            self.director.on_batch(self.now, events, &|actor, action| look_in(engine, actor, action));
         }
         match engine {
             Some(engine) => {
@@ -396,6 +451,7 @@ impl BattleScene {
     pub fn frame(&self, view: &View, srgb: bool) -> BattleFrame {
         let camera_matrix = view.camera.matrix();
         let mut models: Vec<SkinnedModel> = Vec::new();
+        let mut tints: Vec<Tint> = Vec::new();
         let mut marks: Vec<(f64, Vec<GroundShape>)> = Vec::new();
         let to_view = |p: Pos| {
             // `Pos` carries a ground position `(x, z)` in its first two fields; see `ground::circle`.
@@ -415,7 +471,8 @@ impl BattleScene {
             let lifted = (-actor.home.pos[1] + (-motion.offset[1]).max(0.0)) / 2500.0;
             let mut shapes = Vec::new();
             if let Some(outline) = circle(&to_view, centre, actor.rig.radius * SHADOW_RATIO) {
-                shapes.push(GroundShape::disc(outline, [0, 0, 0], 0.40 * (1.0 - lifted.clamp(0.0, 0.8)), depth as f32));
+                // The shadow of an enemy that is fading goes with it.
+                shapes.push(GroundShape::disc(outline, [0, 0, 0], 0.40 * (1.0 - lifted.clamp(0.0, 0.8)) * motion.alpha, depth as f32));
             }
             if actor.side == Side::Party && motion.fall < 0.5 {
                 let mine = Some(id) == self.my_actor;
@@ -439,19 +496,30 @@ impl BattleScene {
             // Each actor is at its own point of the idle loop, so that two of one kind (two MPs) do not
             // breathe in step.
             let phase = self.now as f32 + i as f32 * IDLE_PHASE_STEP;
-            let Some(pose) = actor.rig.idle_pose(phase) else { continue };
+            // The clip the director says it plays now (in place), else its idle loop; a weapon moves with
+            // its owner: the same placement, the same frame.
+            let (pose, weapons) = match motion.clip.and_then(|c| actor.rig.clip_pose(c.slot, c.frame).map(|(pose, root)| (pose, c, root))) {
+                Some((pose, c, root)) => (pose, actor.rig.attachment_clip_poses(c.slot, c.frame, root)),
+                None => {
+                    let Some(pose) = actor.rig.idle_pose(phase) else { continue };
+                    (pose, actor.rig.attachment_poses(phase))
+                }
+            };
+            let tint = Tint { alpha: motion.alpha, ..Tint::NONE };
             let mut positions = Vec::new();
             if skin(&actor.rig.asset, &pose, &place, &camera_matrix, &mut positions) {
                 models.push(SkinnedModel { asset: Arc::clone(&actor.rig.asset), positions });
-                // A weapon moves with its owner: the same placement, the same frame.
-                for (asset, pose) in actor.rig.attachment_poses(phase) {
+                tints.push(tint);
+                for (asset, pose) in weapons {
                     let mut positions = Vec::new();
                     if skin(asset, &pose, &place, &camera_matrix, &mut positions) {
                         models.push(SkinnedModel { asset: Arc::clone(asset), positions });
+                        tints.push(tint);
                     }
                 }
             }
         }
+        self.add_effects(view, &camera_matrix, &mut models, &mut tints);
         // The far marks first, so that a near one is drawn over theirs.
         marks.sort_by(|a, b| b.0.total_cmp(&a.0));
         // The location, as it is (its vertices are in battle coordinates already), cut to this
@@ -478,7 +546,55 @@ impl BattleScene {
                 ground: marks.into_iter().flat_map(|(_, shapes)| shapes).collect(),
                 scenery: None,
             },
+            tints,
             camera: view.gpu_camera(),
+        }
+    }
+
+    /// Where the middle of actor `i` is now (its chest) and its height, for an effect that centres on it:
+    /// a little towards the camera so that the effect is not hidden inside the model.
+    fn chest_of(&self, i: usize, view: &View) -> Option<(V3, f32)> {
+        let (pos, _, _, _) = self.pose_of(i)?;
+        let actor = self.actors.get(i)?;
+        let (_, _, forward) = view.camera.axes();
+        let (h, toward) = (f64::from(actor.rig.height), f64::from(actor.rig.radius) * 0.6);
+        Some(([pos[0] - forward[0] * toward, pos[1] - h * 0.55 - forward[1] * toward, pos[2] - forward[2] * toward], actor.rig.height))
+    }
+
+    /// The effects of the moment: what is gathered at each caster and the bursts at their targets, as
+    /// models facing the camera with a tint each (see [`effects`]).
+    fn add_effects(&self, view: &View, camera_matrix: &[f64; 16], models: &mut Vec<SkinnedModel>, tints: &mut Vec<Tint>) {
+        let (right, down, forward) = view.camera.axes();
+        let axes = |v: V3| v.map(|c| c as f32);
+        let (right, down, forward) = (axes(right), axes(down), axes(forward));
+        let identity = [fmv_ff7::model::mat4_identity()];
+        let mut layers: Vec<(V3, f32, effects::Layer)> = Vec::new();
+        for burst in self.director.bursts() {
+            let age = ((self.now - burst.at) / effects::BURST_LIFE) as f32;
+            if let Some((centre, height)) = self.chest_of(burst.target, view).filter(|_| age >= 0.0) {
+                layers.extend(effects::burst_layers(burst.kind, burst.element, age, height).into_iter().map(|l| (centre, height, l)));
+            }
+        }
+        for charge in self.director.charges() {
+            let span = (charge.end - charge.start).max(1e-6);
+            let progress = ((self.now - charge.start) / span) as f32;
+            if let Some((centre, height)) = self.chest_of(charge.caster, view).filter(|_| self.now >= charge.start) {
+                layers.extend(effects::charge_layers(charge.element, progress, height).into_iter().map(|l| (centre, height, l)));
+            }
+        }
+        for (centre, _, layer) in layers {
+            let at = [
+                centre[0] + f64::from(right[0] * layer.offset[0] + down[0] * layer.offset[1] - forward[0] * layer.offset[2]),
+                centre[1] + f64::from(right[1] * layer.offset[0] + down[1] * layer.offset[1] - forward[1] * layer.offset[2]),
+                centre[2] + f64::from(right[2] * layer.offset[0] + down[2] * layer.offset[1] - forward[2] * layer.offset[2]),
+            ];
+            let place = effects::billboard(at.map(|c| c as f32), layer.radius, layer.spin, (right, down, forward));
+            let asset = self.effects.asset(layer.prim);
+            let mut positions = Vec::new();
+            if skin(asset, &identity, &place, camera_matrix, &mut positions) {
+                models.push(SkinnedModel { asset: Arc::clone(asset), positions });
+                tints.push(effects::layer_tint(&layer));
+            }
         }
     }
 

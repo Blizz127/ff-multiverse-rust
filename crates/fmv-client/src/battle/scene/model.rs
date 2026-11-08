@@ -39,11 +39,24 @@
 //! [`Rigs`] turns a model into an [`ActorRig`] (its [`AvatarAsset`] for the GPU, its idle clip, its
 //! size) once and shares it between actors that look alike, so each distinct model is uploaded
 //! once however many stand in the battle, and never per frame.
+//!
+//! # Which clip plays what
+//!
+//! A real battle model comes with its [`ModelRole`] (a playable character's, an enemy's) and the
+//! slots its pack really has ([`BattleModelData::slot_ok`]); an enemy also with the attacks `scene.bin`
+//! names for it ([`EnemyBook`], read from the `scene.bin` that [`remember_scene_bin`] was told of, keyed
+//! by the enemy's id). [`Rigs`] makes a [`Kit`] of them ([`super::clips`] says which slot is which,
+//! verified on contact sheets) that the scene's choreography reads; a stand-in or a box has none and
+//! moves procedurally. A clip is posed IN PLACE ([`ActorRig::clip_pose`]): the root's travel along the
+//! ground is taken out (the weapon's track too, which is in the character's space) and the scene moves
+//! the actor itself.
 
+use super::clips::{ClipSet, Kit, Slot};
+use super::effects::EffectKit;
 use crate::avatar::library::{AvatarAsset, AvatarLibrary};
 use crate::avatar::source::{CharacterLoader, LgpLoader, NON_PLAYABLE};
 use fmv_ff7::battle_model::{BattleCharacter, BattleModel, BattleModelError, BattleModels};
-use fmv_ff7::model::ModelBone;
+use fmv_ff7::model::{mat4_mul, mat4_translate, ModelBone};
 use fmv_ff7::playable::Character;
 use fmv_ff7::{FieldAnimation, FieldModel, MeshPart, PartBlend};
 use fmv_ff7_battle::rules::ActorId;
@@ -77,6 +90,18 @@ impl Attachment {
     }
 }
 
+/// What a battle model is to the choreography: which table of slots its clips follow (see [`super::clips`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ModelRole {
+    /// Nothing is known of its slots: it plays its idle loop and moves procedurally.
+    #[default]
+    Plain,
+    /// A playable character's model: the shared table of the nine characters.
+    Character,
+    /// An enemy's model: slot 1 is the hurt clip, its attacks are the ones [`BattleModelData::attacks`] names.
+    Enemy,
+}
+
 /// The data of a battle model: what a battle-archive loader returns.
 #[derive(Clone)]
 pub struct BattleModelData {
@@ -91,12 +116,35 @@ pub struct BattleModelData {
     pub fps: f32,
     /// Models that move with this one (a weapon).
     pub attachments: Vec<Attachment>,
+    /// Which table of slots the clips follow.
+    pub role: ModelRole,
+    /// Whether each slot holds the slot's own clip (`false`: a stand-in the loader made); empty says
+    /// nothing is known (every slot is taken as real).
+    pub slot_ok: Arc<Vec<bool>>,
+    /// An enemy's attacks: `scene.bin` attack id and the slot it plays ([`EnemyBook`]).
+    pub attacks: Arc<Vec<(u16, u8)>>,
 }
 
 impl BattleModelData {
-    /// A model at battle scale 1 whose clips play at [`BATTLE_CLIP_FPS`].
+    /// A model at battle scale 1 whose clips play at [`BATTLE_CLIP_FPS`], with no role: plain.
     pub fn new(key: impl Into<String>, model: FieldModel, clips: Vec<FieldAnimation>) -> Self {
-        Self { key: key.into(), model: Arc::new(model), clips: Arc::new(clips), scale: 1.0, fps: BATTLE_CLIP_FPS, attachments: Vec::new() }
+        Self {
+            key: key.into(),
+            model: Arc::new(model),
+            clips: Arc::new(clips),
+            scale: 1.0,
+            fps: BATTLE_CLIP_FPS,
+            attachments: Vec::new(),
+            role: ModelRole::Plain,
+            slot_ok: Arc::new(Vec::new()),
+            attacks: Arc::new(Vec::new()),
+        }
+    }
+
+    /// This model with that role.
+    pub fn with_role(mut self, role: ModelRole) -> Self {
+        self.role = role;
+        self
     }
 
     /// This model with `attachment` riding along.
@@ -278,6 +326,57 @@ fn remembered_battle_lgp() -> Option<PathBuf> {
     REMEMBERED_BATTLE_LGP.lock().ok().and_then(|slot| slot.clone())
 }
 
+static REMEMBERED_SCENE_BIN: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Remember where this machine's `scene.bin` is (`None`: it has none): the enemies' attacks play the
+/// clips it names ([`EnemyBook`]). [`open_ff7`](crate::ff7::open_ff7) calls it next to
+/// [`remember_battle_lgp`]; without it the enemies' plain attacks play no clip of their own.
+pub fn remember_scene_bin(path: Option<PathBuf>) {
+    if let Ok(mut slot) = REMEMBERED_SCENE_BIN.lock() {
+        *slot = path;
+    }
+}
+
+fn remembered_scene_bin() -> Option<PathBuf> {
+    REMEMBERED_SCENE_BIN.lock().ok().and_then(|slot| slot.clone())
+}
+
+/// What `scene.bin` says about the clips of each enemy: which slot each attack plays. Attack `i` of an
+/// enemy record has the id `attack_ids[i]` and plays the slot `animation_indices[i]`.
+///
+/// Keyed by the enemy's id, which is also its model's id, because the scene's start does not say which
+/// formation it is: the ignored real-data test `book_is_the_same_in_every_scene` holds that every scene
+/// that has an enemy gives it the same attacks and slots.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct EnemyBook {
+    by_enemy: HashMap<u16, Vec<(u16, u8)>>,
+}
+
+impl EnemyBook {
+    /// Every enemy of every scene of `scenes` (the first scene that has an enemy decides).
+    pub fn from_scenes(scenes: &fmv_ff7_battle::scene::SceneBin) -> Self {
+        let mut by_enemy: HashMap<u16, Vec<(u16, u8)>> = HashMap::new();
+        for scene in scenes.scenes() {
+            for (id, record) in scene.enemy_ids.iter().zip(scene.enemies.iter()) {
+                let (Some(id), Some(record)) = (id, record) else { continue };
+                by_enemy.entry(*id).or_insert_with(|| Self::attacks_of_record(record));
+            }
+        }
+        Self { by_enemy }
+    }
+
+    /// The attacks of one record: the entries that have an attack id and an animation (255 is none).
+    pub fn attacks_of_record(record: &fmv_ff7_battle::scene::EnemyRecord) -> Vec<(u16, u8)> {
+        record.attack_ids.iter().zip(record.animation_indices.iter()).filter(|&(&id, &slot)| id != 0xFFFF && slot != 0xFF).map(|(&id, &slot)| (id, slot)).collect()
+    }
+
+    /// The attacks of enemy `enemy_id`: attack id and slot (none for an enemy the book does not have).
+    pub fn attacks_of(&self, enemy_id: u16) -> Vec<(u16, u8)> {
+        self.by_enemy.get(&enemy_id).cloned().unwrap_or_default()
+    }
+
+}
+
 /// The playable character whose battle model a party member gets: the player's own look when the
 /// table of playable characters knows it, else the character the engine fights as (FF7's ids:
 /// Cloud 0, Barret 1, Tifa 2, Aerith 3, Red XIII 4, Yuffie 5, Cait Sith 6, Vincent 7, Cid 8), else
@@ -311,19 +410,28 @@ pub struct ArchiveModels {
     models: BattleModels,
     /// The models made so far by key (the model's prefix): `None` for one that could not be had.
     made: HashMap<String, Option<BattleModelData>>,
+    /// What `scene.bin` says about the enemies' attacks (none: their plain attacks play no clip).
+    book: EnemyBook,
 }
 
 impl ArchiveModels {
     /// Open `battle.lgp` (read-only).
     pub fn open(path: &Path) -> Result<Self, String> {
-        Ok(Self { models: BattleModels::open(path).map_err(|e| e.to_string())?, made: HashMap::new() })
+        Ok(Self { models: BattleModels::open(path).map_err(|e| e.to_string())?, made: HashMap::new(), book: EnemyBook::default() })
+    }
+
+    /// This source with `book`: the enemies' attacks play the clips it names.
+    pub fn with_enemy_book(mut self, book: EnemyBook) -> Self {
+        self.book = book;
+        self
     }
 
     /// A loaded model as the scene's data: its clips, and weapon 0 with the weapon's tracks as an
     /// attachment (track `i` goes with clip `i`). Keyed by the model's prefix.
-    fn data_of(loaded: BattleModel) -> BattleModelData {
+    fn data_of(loaded: BattleModel, role: ModelRole) -> BattleModelData {
         let key = loaded.prefix.clone();
-        let mut data = BattleModelData::new(key.clone(), loaded.model, loaded.animations);
+        let mut data = BattleModelData::new(key.clone(), loaded.model, loaded.animations).with_role(role);
+        data.slot_ok = Arc::new(loaded.slot_ok);
         if let Some(weapon) = loaded.weapons.into_iter().next() {
             if !loaded.weapon_tracks.is_empty() {
                 data = data.with_attachment(Attachment::new(format!("{key}ck"), weapon, loaded.weapon_tracks));
@@ -337,13 +445,14 @@ impl ArchiveModels {
     fn made(
         &mut self,
         key: String,
+        role: ModelRole,
         what: impl FnOnce() -> String,
         load: impl FnOnce(&mut BattleModels) -> Result<BattleModel, BattleModelError>,
     ) -> Option<BattleModelData> {
         self.made
             .entry(key)
             .or_insert_with(|| match load(&mut self.models) {
-                Ok(model) => Some(Self::data_of(model)),
+                Ok(model) => Some(Self::data_of(model, role)),
                 Err(why) => {
                     eprintln!("battle: cannot load the model of {} ({why}); a stand-in is drawn", what());
                     None
@@ -356,7 +465,7 @@ impl ArchiveModels {
 impl BattleModelSource for ArchiveModels {
     fn party_member(&mut self, who: &PartyLook) -> BattleActorModel {
         let which = battle_character(who.look.as_deref(), who.character);
-        match self.made(which.prefix().to_string(), || which.display_name().to_string(), |m| m.load_character(which)) {
+        match self.made(which.prefix().to_string(), ModelRole::Character, || which.display_name().to_string(), |m| m.load_character(which)) {
             Some(data) => BattleActorModel::Battle(data),
             None => StandInModels.party_member(who),
         }
@@ -366,15 +475,19 @@ impl BattleModelSource for ArchiveModels {
         let Some(id) = who.enemy_id else { return StandInModels.enemy(who) };
         // An enemy id that names no enemy model of this archive is a box, quietly.
         let Some(prefix) = self.models.enemy_prefix(id) else { return StandInModels.enemy(who) };
-        match self.made(prefix, || format!("enemy {id}"), |m| m.load_enemy(id)) {
-            Some(data) => BattleActorModel::Battle(data),
+        match self.made(prefix, ModelRole::Enemy, || format!("enemy {id}"), |m| m.load_enemy(id)) {
+            Some(mut data) => {
+                // The attacks are the enemy's own (the model is shared, the clone is ours to dress).
+                data.attacks = Arc::new(self.book.attacks_of(id));
+                BattleActorModel::Battle(data)
+            }
             None => StandInModels.enemy(who),
         }
     }
 
     fn location(&mut self, location: u16) -> Option<BattleActorModel> {
         let prefix = self.models.location_prefix(location)?;
-        self.made(prefix, || format!("battle location {location}"), |m| m.load_location(location)).map(BattleActorModel::Battle)
+        self.made(prefix, ModelRole::Plain, || format!("battle location {location}"), |m| m.load_location(location)).map(BattleActorModel::Battle)
     }
 }
 
@@ -396,6 +509,8 @@ pub struct ActorRig {
     pub fps: f32,
     /// Models that move with this one (a weapon): drawn with the same placement at the same frame.
     pub attachments: Vec<RigAttachment>,
+    /// Which of the clips plays what ([`Kit::none`] for a stand-in or a box: it moves procedurally).
+    pub kit: Kit,
 }
 
 /// An [`Attachment`] made ready to draw.
@@ -404,7 +519,54 @@ pub struct RigAttachment {
     clips: Arc<Vec<FieldAnimation>>,
 }
 
+/// The root of `clip` at the (fractional, wrapping) frame position `frame`: its `x` and `z`
+/// translation, interpolated as [`FieldAnimation::pose_at`] interpolates.
+fn root_xz(clip: &FieldAnimation, frame: f32) -> [f32; 2] {
+    let n = clip.frame_count();
+    let time = if frame.is_finite() { frame.rem_euclid(n as f32) } else { 0.0 };
+    let lower = (time.floor() as usize).min(n - 1);
+    let t = time - time.floor();
+    let (Some(a), Some(b)) = (clip.frame(lower), clip.frame((lower + 1) % n)) else { return [0.0; 2] };
+    let mix = |k: usize| a.root_translation[k] + (b.root_translation[k] - a.root_translation[k]) * t;
+    [mix(0), mix(2)]
+}
+
+/// Take the root's travel along the ground out of a pose: every bone matrix moved by `-root`.
+fn in_place(pose: &mut [[f32; 16]], root: [f32; 2]) {
+    let shift = mat4_translate([-root[0], 0.0, -root[1]]);
+    for bone in pose.iter_mut() {
+        *bone = mat4_mul(&shift, bone);
+    }
+}
+
 impl ActorRig {
+    /// The pose of clip `slot` at the (fractional) frame position `frame`, standing IN PLACE: the root's
+    /// translation along the ground is taken out (see [`super::clips`]: the game's clips carry travel of
+    /// hundreds of units that this client composes itself), its height is kept. `None` when the rig has no
+    /// such slot or the clip does not fit the skeleton; the root's `(x, z)` that was taken out comes with
+    /// the pose, for the attachments.
+    pub fn clip_pose(&self, slot: Slot, frame: f32) -> Option<(Vec<[f32; 16]>, [f32; 2])> {
+        let clip = self.clips.get(usize::from(slot))?;
+        let mut pose = clip.pose_at(&self.asset.character.model.bones, frame)?;
+        let root = root_xz(clip, frame);
+        in_place(&mut pose, root);
+        Some((pose, root))
+    }
+
+    /// The poses of the attachments in clip `slot` at `frame` for a body whose root `(x, z)` was taken
+    /// out: the weapon's track is in the character's space, so it moves by the same. An attachment with no
+    /// track for `slot` is left out.
+    pub fn attachment_clip_poses(&self, slot: Slot, frame: f32, root: [f32; 2]) -> Vec<(&Arc<AvatarAsset>, Vec<[f32; 16]>)> {
+        self.attachments
+            .iter()
+            .filter_map(|a| {
+                let mut pose = a.clips.get(usize::from(slot))?.pose_at(&a.asset.character.model.bones, frame)?;
+                in_place(&mut pose, root);
+                Some((&a.asset, pose))
+            })
+            .collect()
+    }
+
     /// The frame position `seconds` into the idle loop: 0 for a still pose, else the loop's own.
     fn frame_at(&self, seconds: f32) -> Option<f32> {
         let clip = self.clips.first()?;
@@ -560,6 +722,19 @@ fn body_radius_of(asset: &AvatarAsset, scale: f32) -> f32 {
     }
 }
 
+/// The pack of `clips` as the choreography sees it (`ok` empty: every slot is real).
+fn clip_set(clips: &[FieldAnimation], ok: &[bool], fps: f32) -> ClipSet {
+    let frames = clips.iter().map(|c| u16::try_from(c.frame_count()).unwrap_or(u16::MAX)).collect();
+    let travel = clips
+        .iter()
+        .map(|c| match (c.frames().first(), c.frames().last()) {
+            (Some(a), Some(b)) => b.root_translation[2] - a.root_translation[2],
+            _ => 0.0,
+        })
+        .collect();
+    ClipSet { frames, ok: (0..clips.len()).map(|i| ok.get(i).copied().unwrap_or(true)).collect(), travel, fps }
+}
+
 /// The drawable asset of a model and its clips, if every clip fits its skeleton. The asset's
 /// character has the model's first three clips (the avatar mesh wants three).
 fn battle_asset(model: &Arc<FieldModel>, clips: &Arc<Vec<FieldAnimation>>) -> Option<Arc<AvatarAsset>> {
@@ -612,6 +787,7 @@ impl Rigs {
             procedural_idle: true,
             fps: BATTLE_CLIP_FPS,
             attachments: Vec::new(),
+            kit: Kit::none(),
             asset,
         });
         self.cache.insert(key, Arc::clone(&rig));
@@ -635,6 +811,7 @@ impl Rigs {
             procedural_idle: true,
             fps: crate::avatar::anim::FIELD_FPS,
             attachments: Vec::new(),
+            kit: Kit::none(),
             asset,
         });
         self.cache.insert(key, Arc::clone(&rig));
@@ -658,14 +835,23 @@ impl Rigs {
                 attachments.push(RigAttachment { asset, clips: Arc::clone(&a.clips) });
             }
         }
+        let procedural_idle = battle.clips.first().is_some_and(|c| c.frame_count() <= 1);
+        let fps = if battle.fps.is_finite() && battle.fps > 0.0 { battle.fps } else { BATTLE_CLIP_FPS };
+        // A model whose idle is a still pose has no motion of its own to dress: it stays procedural.
+        let kit = match (battle.role, procedural_idle) {
+            (ModelRole::Character, false) => Kit::party(clip_set(&battle.clips, &battle.slot_ok, fps)),
+            (ModelRole::Enemy, false) => Kit::enemy(clip_set(&battle.clips, &battle.slot_ok, fps), &battle.attacks),
+            _ => Kit::none(),
+        };
         let rig = Arc::new(ActorRig {
             clips: Arc::clone(&battle.clips),
             height: asset.height_units * battle.scale,
             radius: body_radius_of(&asset, battle.scale),
             scale: battle.scale,
-            procedural_idle: battle.clips.first().is_some_and(|c| c.frame_count() <= 1),
-            fps: if battle.fps.is_finite() && battle.fps > 0.0 { battle.fps } else { BATTLE_CLIP_FPS },
+            procedural_idle,
+            fps,
             attachments,
+            kit,
             asset,
         });
         self.cache.insert(key, Arc::clone(&rig));
@@ -687,12 +873,14 @@ impl Rigs {
 pub struct ModelKit {
     pub(super) source: Box<dyn BattleModelSource>,
     pub(super) rigs: Rigs,
+    /// The meshes of the effects, made once and shared by every scene of this kit.
+    pub(super) effects: Arc<EffectKit>,
 }
 
 impl ModelKit {
     /// A kit whose models are chosen by `source` and whose field models are read by `loader`.
     pub fn new(source: Box<dyn BattleModelSource>, loader: Option<Box<dyn CharacterLoader>>) -> Self {
-        Self { source, rigs: Rigs::new(loader) }
+        Self { source, rigs: Rigs::new(loader), effects: Arc::new(EffectKit::new()) }
     }
 
     /// The models of this machine's own archives: the real battle models of its `battle.lgp` when
@@ -703,7 +891,7 @@ impl ModelKit {
         let loader = crate::avatar::source::remembered().map(|path| Box::new(LgpLoader::new(path)) as Box<dyn CharacterLoader>);
         let source: Box<dyn BattleModelSource> = match remembered_battle_lgp() {
             Some(path) => match ArchiveModels::open(&path) {
-                Ok(models) => Box::new(models),
+                Ok(models) => Box::new(models.with_enemy_book(Self::local_enemy_book())),
                 Err(why) => {
                     eprintln!("battle: cannot open battle.lgp ({why}); stand-ins are drawn");
                     Box::new(StandInModels)
@@ -712,6 +900,19 @@ impl ModelKit {
             None => Box::new(StandInModels),
         };
         Self::new(source, loader)
+    }
+
+    /// What this machine's own `scene.bin` says about the enemies' attacks (empty when the client found
+    /// none or it does not read: the enemies' attacks then play no clip of their own).
+    fn local_enemy_book() -> EnemyBook {
+        let Some(path) = remembered_scene_bin() else { return EnemyBook::default() };
+        match fmv_ff7_battle::scene::SceneBin::open(&path) {
+            Ok(scenes) => EnemyBook::from_scenes(&scenes),
+            Err(why) => {
+                eprintln!("battle: cannot read scene.bin for the enemies' attack clips ({why}); their attacks play no clip");
+                EnemyBook::default()
+            }
+        }
     }
 }
 

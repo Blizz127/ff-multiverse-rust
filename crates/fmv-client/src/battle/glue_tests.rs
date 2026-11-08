@@ -140,20 +140,28 @@ fn hits_float_numbers_over_their_target_and_they_go_with_time() {
     let mut server = Server::new();
     let mut c = started(&server, 1.0);
     c.on_message(1.5, server.attack());
-    let v = c.view(1.5).expect("a battle");
+    // The number is born when the blow lands, not when the message arrives.
+    let landed = 1.5 + scene::cue::impact_delay(Some(fmv_protocol::ActionRef::Attack));
+    assert!(c.view(1.5).expect("a battle").popups.is_empty(), "the blow has not landed yet");
+    let v = c.view(landed).expect("a battle");
     let hit = v.popups.iter().find(|p| p.target == ActorId(1)).expect("a number over the dummy");
     assert!(matches!(hit.kind, popups::PopupKind::Damage { .. } | popups::PopupKind::Miss), "{hit:?}");
     assert_eq!(hit.age_ms, 0);
-    assert_eq!(c.view(1.8).expect("a battle").popups.first().map(|p| p.age_ms), Some(300), "it ages with the clock");
-    assert!(c.view(3.0).expect("a battle").popups.is_empty(), "and is gone after its lifetime");
+    assert_eq!(c.view(landed + 0.3).expect("a battle").popups.first().map(|p| p.age_ms), Some(300), "it ages with the clock");
+    assert!(c.view(landed + popups::LIFETIME_S + 0.1).expect("a battle").popups.is_empty(), "and is gone after its lifetime");
     // We stand still: the dummy's attack floats a number over us (our own gauge filling comes first
     // or after, a message without a hit makes no number).
     let over_us = |c: &BattleClient, t: f64| c.view(t).expect("a battle").popups.iter().any(|p| p.target == ActorId(0));
     let mut t = 4.0;
-    while !over_us(&c, t) {
+    loop {
         assert!(t < 400.0, "the dummy never attacked");
         t += 0.01;
         c.on_message(t, server.until_something_happens());
+        // The number is born when the blow lands, a moment after the message: look then, with no
+        // message in between (the battle goes on without us and a wait could outlast it).
+        if over_us(&c, t + scene::cue::MAX_IMPACT_DELAY) {
+            break;
+        }
     }
     assert!(server.state.actor(ActorId(0)).is_some_and(|me| me.hp <= me.max_hp), "the number is for something that happened");
 }
@@ -182,9 +190,12 @@ fn the_end_lingers_with_the_last_blow_the_rewards_and_a_panel_until_a_key_or_tim
     assert_eq!(c.victories(), 1);
     assert!(c.lingering(t + 0.5));
     let v = c.view(t + 0.5).expect("the view lingers");
-    assert!(v.enemies.iter().all(|b| !b.alive), "the last view: the dummy is dead");
+    // The killing blow lands half a second after it arrived; the beaten dummy stays in the list until
+    // its collapse begins (a beat later), and is dead in the last view after that.
+    assert!(v.enemies.iter().all(|b| b.alive), "still listed while the blow lands");
+    assert!(c.view(t + scene::cue::MAX_DEATH_DELAY + 0.01).expect("the view lingers").enemies.iter().all(|b| !b.alive), "the last view: the dummy is dead");
     assert!(v.menu.is_none() && v.banner.is_none());
-    assert!(v.popups.iter().any(|p| p.target == ActorId(1)), "the last blow's number is still floating");
+    assert!(v.popups.iter().any(|p| p.target == ActorId(1)), "the last blow's number floats up when it lands");
     let finale = v.finale.expect("the panel's data");
     assert_eq!(finale.outcome, Outcome::Victory);
     let reward = finale.reward.expect("we are in the party, so we are paid");

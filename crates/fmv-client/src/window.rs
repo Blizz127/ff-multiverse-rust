@@ -10,6 +10,8 @@ use crate::backdrop::FieldView;
 use crate::battle::scene::{scene_for, BattleScene, ModelKit};
 use crate::battle::{battle_vertices, draw_battle_overlay, draw_battle_text, BattleCmd, MenuKey, MenuReply};
 use crate::cli::exit;
+use crate::gamemode::DeviceMode;
+use crate::gamepad::{PadMode, Pads};
 use crate::interp::render_time;
 use crate::net::PartyCommand;
 use crate::npc::{npc_models, npc_players, npc_who};
@@ -27,7 +29,7 @@ use winit::dpi::LogicalSize;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{Window, WindowId};
+use winit::window::{Fullscreen, Window, WindowId};
 
 /// Walking speed as a fraction of the area's `max_speed` (the server enforces the maximum).
 const WALK_SPEED_FACTOR: f32 = 0.8;
@@ -93,6 +95,26 @@ pub fn quit_armed(armed_until: Option<Instant>, now: Instant) -> bool {
     armed_until.is_some_and(|until| now < until)
 }
 
+/// Where a key event came from: the keyboard, or a game controller (`crate::gamepad`), whose events
+/// are fed through the very same dispatch ([`App::key_event`]). Only the words of a notice differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputSource {
+    Keyboard,
+    Pad,
+}
+
+/// What an Escape press tells the player on screen, in the words of the device that pressed it
+/// (`None`: nothing, the press quit). The keyboard's words are the ones the window always had.
+pub fn escape_notice(action: EscapeAction, source: InputSource) -> Option<&'static str> {
+    match (action, source) {
+        (EscapeAction::IgnoreInBattle, InputSource::Keyboard) => Some("Esc does not quit in a battle: close the window to quit"),
+        (EscapeAction::IgnoreInBattle, InputSource::Pad) => Some("Start does not quit in a battle"),
+        (EscapeAction::Arm, InputSource::Keyboard) => Some("Press Esc again to quit"),
+        (EscapeAction::Arm, InputSource::Pad) => Some("Press Start again to quit"),
+        (EscapeAction::Quit, _) => None,
+    }
+}
+
 /// Draw `text` centred in the lower part of a `vw` x `vh` window, over everything else.
 fn draw_notice(text: &str, vw: u32, vh: u32, out: &mut DrawList) {
     let scale = if vw >= 1000 { 2 } else { 1 };
@@ -111,7 +133,12 @@ pub fn create_event_loop() -> Result<EventLoop<()>, String> {
     let created = std::panic::catch_unwind(EventLoop::<()>::new);
     std::panic::set_hook(previous_hook);
     match created {
-        Ok(Ok(event_loop)) => Ok(event_loop),
+        Ok(Ok(event_loop)) => {
+            // Which windowing system this run got (under gamescope that is X11 unless gamescope was
+            // started with --expose-wayland): the device report wants to know.
+            eprintln!("window: using the {} windowing backend", backend_name(&event_loop));
+            Ok(event_loop)
+        }
         Ok(Err(e)) => Err(friendly_os_error(&e.to_string())),
         Err(payload) => Err(format!(
             "the windowing system could not start ({}); is a required system library installed? \
@@ -119,6 +146,22 @@ pub fn create_event_loop() -> Result<EventLoop<()>, String> {
             panic_text(payload.as_ref())
         )),
     }
+}
+
+/// The windowing system `event_loop` runs on, for the log: on Linux winit has exactly two.
+#[cfg(target_os = "linux")]
+fn backend_name(event_loop: &EventLoop<()>) -> &'static str {
+    use winit::platform::wayland::EventLoopExtWayland;
+    if event_loop.is_wayland() {
+        "Wayland"
+    } else {
+        "X11"
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn backend_name(_event_loop: &EventLoop<()>) -> &'static str {
+    "native"
 }
 
 /// The message of a caught panic.
@@ -143,17 +186,25 @@ fn friendly_os_error(text: &str) -> String {
 pub type LoopResult = std::thread::Result<Result<(), winit::error::EventLoopError>>;
 
 /// The attributes of the client's window (shared by the menu and the game, which use one window).
-pub fn window_attributes(title: String) -> winit::window::WindowAttributes {
-    Window::default_attributes()
+/// On a device that asks for it (see `crate::gamemode`) it is a borderless full-screen window on the
+/// current monitor with no decorations at all: no title bar, no frame, and none of the client-side
+/// decorations winit draws itself under a compositor (gamescope) that offers none.
+pub fn window_attributes(title: String, device: DeviceMode) -> winit::window::WindowAttributes {
+    let attributes = Window::default_attributes()
         .with_title(title)
         .with_inner_size(LogicalSize::new(1100.0, 680.0))
-        .with_min_inner_size(LogicalSize::new(320.0, 240.0))
+        .with_min_inner_size(LogicalSize::new(320.0, 240.0));
+    if device.fullscreen {
+        attributes.with_decorations(false).with_fullscreen(Some(Fullscreen::Borderless(None)))
+    } else {
+        attributes
+    }
 }
 
 /// `ff7` is where the views of the areas the server moves us to are read from (see
-/// [`App::with_ff7`]).
-pub fn run(event_loop: EventLoop<()>, session: Session, view: FieldView, ff7: Option<Arc<Ff7Adapter>>) -> u8 {
-    let mut app = App::new(session, view).with_ff7(ff7);
+/// [`App::with_ff7`]); `device` is what the device asks of the window (full screen).
+pub fn run(event_loop: EventLoop<()>, session: Session, view: FieldView, ff7: Option<Arc<Ff7Adapter>>, device: DeviceMode) -> u8 {
+    let mut app = App::new(session, view).with_ff7(ff7).with_device(device);
     // A panic inside the windowing or GPU stack must not skip the goodbye or end as a raw abort.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| event_loop.run_app(&mut app)));
     app.finish(result)
@@ -453,6 +504,11 @@ pub(crate) struct App {
     quit_armed_until: Option<Instant>,
     /// A short notice drawn over the frame, and when it goes away.
     notice: Option<(&'static str, Instant)>,
+    /// What the device asks of the window (full screen). The window is only created here on the
+    /// command-line path; behind the character menu it was made by the menu, with the same value.
+    device: DeviceMode,
+    /// The game controllers. Closed until a window exists; the menu hands over the ones it opened.
+    pads: Pads,
 }
 
 impl App {
@@ -487,23 +543,66 @@ impl App {
             last_draw_t: 0.0,
             quit_armed_until: None,
             notice: None,
+            device: DeviceMode::DESKTOP,
+            pads: Pads::closed(),
+        }
+    }
+
+    /// What the device asks of the window (see `crate::gamemode`).
+    pub(crate) fn with_device(mut self, device: DeviceMode) -> Self {
+        self.device = device;
+        self
+    }
+
+    /// Take over the controllers the character menu was already reading (the window and the
+    /// renderer come over the same way, see [`App::adopt_surface`]).
+    pub(crate) fn adopt_pads(&mut self, pads: Pads) {
+        self.pads = pads;
+    }
+
+    /// A key went down, came up or repeated: from the keyboard or from a game controller, which
+    /// make the same key events (`PadKey::key_code`) and so go through this one dispatch.
+    fn key_event(&mut self, el: &ActiveEventLoop, code: KeyCode, pressed: bool, repeat: bool, source: InputSource) {
+        match route_key(code, pressed, repeat, self.session.state.battle.in_battle()) {
+            KeyRoute::Escape => self.escape(el, source),
+            KeyRoute::WalkMesh => self.show_walkmesh = !self.show_walkmesh,
+            KeyRoute::Party(key) => self.party_key(key),
+            KeyRoute::Battle(key) => self.battle_key(key),
+            KeyRoute::Movement => {
+                self.input.set(code, pressed);
+            }
+            KeyRoute::Ignored => {}
+        }
+    }
+
+    /// Read the game controllers and send what they did through [`App::key_event`]. In a battle (or
+    /// while its panel lingers) the stick reads in four directions and repeats; in the field it
+    /// reads in eight and a held direction is a held key.
+    fn poll_pads(&mut self, el: &ActiveEventLoop, now: Instant) {
+        let battle = &self.session.state.battle;
+        let mode = if battle.in_battle() || battle.lingering(self.session.now()) { PadMode::Menu } else { PadMode::Field };
+        for event in self.pads.poll(now, mode) {
+            self.key_event(el, event.key.key_code(), event.pressed, event.repeat, InputSource::Pad);
         }
     }
 
     /// Escape was pressed: the battle menu goes back a level first (or the panel after a battle
     /// closes); otherwise quit only on a second press in the field, never in a battle.
-    fn escape(&mut self, el: &ActiveEventLoop) {
+    fn escape(&mut self, el: &ActiveEventLoop, source: InputSource) {
         let now = Instant::now();
         let (session_now, armed) = (self.session.now(), quit_armed(self.quit_armed_until, now));
         match escape_route(&mut self.session.state, session_now, armed) {
             EscapeRoute::Battle => {}
             EscapeRoute::Action(EscapeAction::IgnoreInBattle) => {
-                eprintln!("battle: Esc does not quit during a battle (close the window to quit)");
-                self.notice = Some(("Esc does not quit in a battle: close the window to quit", now + NOTICE_TIME));
+                match source {
+                    InputSource::Keyboard => eprintln!("battle: Esc does not quit during a battle (close the window to quit)"),
+                    InputSource::Pad => eprintln!("battle: Start does not quit during a battle"),
+                }
+                self.notice = escape_notice(EscapeAction::IgnoreInBattle, source).map(|text| (text, now + NOTICE_TIME));
             }
             EscapeRoute::Action(EscapeAction::Arm) => {
                 self.quit_armed_until = Some(now + QUIT_CONFIRM);
-                self.notice = Some(("Press Esc again to quit", now + QUIT_CONFIRM));
+                self.notice = escape_notice(EscapeAction::Arm, source).map(|text| (text, now + QUIT_CONFIRM));
             }
             EscapeRoute::Action(EscapeAction::Quit) => self.quit(el),
         }
@@ -643,6 +742,12 @@ impl App {
         let now = Instant::now();
         let dt = now.duration_since(self.last_tick).as_secs_f32().min(MAX_DT);
         self.last_tick = now;
+        // Controllers first, before anything that can return early (a battle freezes the walk, not
+        // the menu): a press of Start may have just said goodbye, and then there is nothing to tick.
+        self.poll_pads(el, now);
+        if self.left {
+            return;
+        }
         if let Some(reason) = self.session.pump() {
             self.fail(el, reason);
             return;
@@ -852,7 +957,7 @@ impl ApplicationHandler for App {
         if self.window.is_some() {
             return;
         }
-        let attrs = window_attributes(self.base_title.clone());
+        let attrs = window_attributes(self.base_title.clone(), self.device);
         let window = match el.create_window(attrs) {
             Ok(w) => Arc::new(w),
             Err(e) => return self.fail(el, format!("cannot create the window: {e}")),
@@ -865,6 +970,7 @@ impl ApplicationHandler for App {
             Err(e) => return self.fail(el, format!("cannot start the renderer: {e}")),
         }
         self.window = Some(window);
+        self.pads = Pads::open();
         self.last_tick = Instant::now();
     }
 
@@ -887,19 +993,16 @@ impl ApplicationHandler for App {
                 ..
             } => {
                 let pressed = state == ElementState::Pressed;
-                match route_key(code, pressed, repeat, self.session.state.battle.in_battle()) {
-                    KeyRoute::Escape => self.escape(el),
-                    KeyRoute::WalkMesh => self.show_walkmesh = !self.show_walkmesh,
-                    KeyRoute::Party(key) => self.party_key(key),
-                    KeyRoute::Battle(key) => self.battle_key(key),
-                    KeyRoute::Movement => {
-                        self.input.set(code, pressed);
-                    }
-                    KeyRoute::Ignored => {}
+                self.key_event(el, code, pressed, repeat, InputSource::Keyboard);
+            }
+            WindowEvent::Focused(focused) => {
+                // Controllers are only heard while the window has the focus (see `crate::gamepad`).
+                self.pads.set_focused(focused);
+                // Releases while unfocused are never delivered: do not keep walking.
+                if !focused {
+                    self.input = Input::default();
                 }
             }
-            // Releases while unfocused are never delivered: do not keep walking.
-            WindowEvent::Focused(false) => self.input = Input::default(),
             WindowEvent::RedrawRequested => self.redraw(el),
             _ => {}
         }
@@ -1355,6 +1458,101 @@ mod tests {
         assert_eq!(battle_request(BattleKey::Confirm, &mut s, 12.0), BattleRequest::Menu);
         assert!(!s.battle.lingering(12.0) && s.battle.view(12.0).is_none());
         assert_eq!(escape_route(&mut s, 12.1, false), EscapeRoute::Action(EscapeAction::Arm));
+    }
+
+    // ---- the controller and the device -------------------------------------------------------------
+
+    /// The controller is not a second input path: each key it can press goes through `route_key`
+    /// like a key of the keyboard and lands where the documented keyboard key does.
+    #[test]
+    fn a_controller_key_lands_where_its_keyboard_key_does() {
+        use crate::gamepad::PadKey;
+        // (the key, where it goes in the field, where it goes in a battle)
+        let table = [
+            (PadKey::Up, KeyRoute::Movement, KeyRoute::Battle(BattleKey::Up)),
+            (PadKey::Down, KeyRoute::Movement, KeyRoute::Battle(BattleKey::Down)),
+            (PadKey::Left, KeyRoute::Movement, KeyRoute::Battle(BattleKey::Left)),
+            (PadKey::Right, KeyRoute::Movement, KeyRoute::Battle(BattleKey::Right)),
+            (PadKey::Confirm, KeyRoute::Battle(BattleKey::Confirm), KeyRoute::Battle(BattleKey::Confirm)),
+            (PadKey::Back, KeyRoute::Battle(BattleKey::Back), KeyRoute::Battle(BattleKey::Back)),
+            (PadKey::Invite, KeyRoute::Party(PartyKey::Invite), KeyRoute::Party(PartyKey::Invite)),
+            (PadKey::Accept, KeyRoute::Party(PartyKey::Accept), KeyRoute::Party(PartyKey::Accept)),
+            (PadKey::Leave, KeyRoute::Party(PartyKey::Leave), KeyRoute::Party(PartyKey::Leave)),
+            (PadKey::Battle, KeyRoute::Battle(BattleKey::Request), KeyRoute::Battle(BattleKey::Request)),
+            (PadKey::Escape, KeyRoute::Escape, KeyRoute::Escape),
+            (PadKey::Walk, KeyRoute::Movement, KeyRoute::Movement),
+        ];
+        assert_eq!(table.len(), PadKey::ALL.len(), "every key is in the table");
+        for (key, field, battle) in table {
+            assert_eq!(route_key(key.key_code(), true, false, false), field, "{key:?} in the field");
+            assert_eq!(route_key(key.key_code(), true, false, true), battle, "{key:?} in a battle");
+            // A release never reaches the party, battle or quit handling: at most the walk sees it.
+            for in_battle in [false, true] {
+                let route = route_key(key.key_code(), false, false, in_battle);
+                assert!(matches!(route, KeyRoute::Movement | KeyRoute::Ignored), "{key:?} released: {route:?}");
+            }
+        }
+        // The directions repeat in a battle (a held stick scrolls a list), and nothing else does:
+        // the pad only ever repeats directions, and Esc never counts twice.
+        for key in PadKey::DIRECTIONS {
+            assert!(matches!(route_key(key.key_code(), true, true, true), KeyRoute::Battle(_)), "{key:?}");
+        }
+        assert_eq!(route_key(PadKey::Escape.key_code(), true, true, false), KeyRoute::Ignored);
+    }
+
+    /// The directions and the left trigger drive the same held-key state the arrows and Shift do,
+    /// and the trigger and the keyboard's left Shift do not let go of each other.
+    #[test]
+    fn the_stick_directions_walk_and_the_left_trigger_walks_slowly() {
+        use crate::gamepad::PadKey;
+        let mut input = Input::default();
+        for (key, want) in [(PadKey::Up, (0.0, 1.0)), (PadKey::Down, (0.0, -1.0)), (PadKey::Left, (-1.0, 0.0)), (PadKey::Right, (1.0, 0.0))] {
+            assert!(input.set(key.key_code(), true), "{key:?}");
+            assert_eq!(input.dir(), want, "{key:?}");
+            assert!(input.set(key.key_code(), false));
+            assert_eq!(input.dir(), (0.0, 0.0));
+        }
+        assert!(!input.walking(), "running is the default");
+        assert!(input.set(PadKey::Walk.key_code(), true));
+        assert!(input.walking());
+        input.set(KeyCode::ShiftLeft, true);
+        input.set(PadKey::Walk.key_code(), false);
+        assert!(input.walking(), "the keyboard's Shift is still down");
+        input.set(KeyCode::ShiftLeft, false);
+        assert!(!input.walking());
+        // None of the other pad keys is a movement key.
+        for key in [PadKey::Confirm, PadKey::Back, PadKey::Invite, PadKey::Accept, PadKey::Leave, PadKey::Battle, PadKey::Escape] {
+            assert!(!input.set(key.key_code(), true), "{key:?}");
+        }
+    }
+
+    #[test]
+    fn a_notice_speaks_the_words_of_the_device_that_pressed_the_key() {
+        use EscapeAction::{Arm, IgnoreInBattle, Quit};
+        // The keyboard's words are the ones the window always showed.
+        assert_eq!(escape_notice(IgnoreInBattle, InputSource::Keyboard), Some("Esc does not quit in a battle: close the window to quit"));
+        assert_eq!(escape_notice(Arm, InputSource::Keyboard), Some("Press Esc again to quit"));
+        assert_eq!(escape_notice(IgnoreInBattle, InputSource::Pad), Some("Start does not quit in a battle"));
+        assert_eq!(escape_notice(Arm, InputSource::Pad), Some("Press Start again to quit"));
+        for source in [InputSource::Keyboard, InputSource::Pad] {
+            assert_eq!(escape_notice(Quit, source), None, "quitting says nothing");
+        }
+    }
+
+    /// Full screen is borderless, on the current monitor, without any decoration (so no frame or
+    /// title bar of any kind can show); a desktop gets the ordinary decorated window it always had.
+    #[test]
+    fn the_window_is_borderless_full_screen_only_when_the_device_asks_for_it() {
+        let windowed = window_attributes("t".to_string(), DeviceMode::DESKTOP);
+        assert_eq!(windowed.fullscreen, None);
+        assert!(windowed.decorations);
+        assert_eq!(windowed.inner_size, Some(LogicalSize::new(1100.0, 680.0).into()));
+        // The Steam keyboard alone is not a reason for full screen.
+        assert_eq!(window_attributes("t".to_string(), DeviceMode { fullscreen: false, steam_keyboard: true }).fullscreen, None);
+        let full = window_attributes("FF".to_string(), DeviceMode { fullscreen: true, steam_keyboard: false });
+        assert_eq!(full.fullscreen, Some(Fullscreen::Borderless(None)));
+        assert!(!full.decorations);
+        assert_eq!(full.title, "FF");
     }
 
     fn state_with_peers(peers: &[(u64, f32)]) -> ClientState {
