@@ -36,7 +36,9 @@
 //! name no archive entry) and become exits, spread over 454 of the 702 fields (248 have none; one
 //! has ten). All 978 arrival points lie inside the target triangle their hint names, every target
 //! loads, and for 22 exits (layered meshes) the hint changes the arrival height by more than a unit
-//! from what the unhinted rule would give.
+//! from what the unhinted rule would give. `place_arrival` returns the point without running it
+//! through the movement rules, and `validate_move` accepts each of the 978 placed arrivals as it is
+//! (at most the 0.05 wall nudge in x and y, under one unit in z).
 //!
 //! # NPCs: unconditional placements only
 //!
@@ -70,7 +72,8 @@
 //!
 //! **Measured on the owned copy:** 1 134 NPCs in 385 of the 702 fields (14 in the busiest); all of
 //! them stand at a literal `XYZI` height (the walkmesh height was never needed) and two of the
-//! points lie on no walkmesh triangle. Of the
+//! points lie on no walkmesh triangle (`pinball` of `mds7pb_2` and `fm1` of `mtcrl_7`; they are
+//! reported at their literal positions, so an NPC's `pos` is not always on the walkable surface). Of the
 //! entities that are not reported, 3 042 are players, 5 080 are no field model, 606 + 48 are hidden
 //! (init part + main part), 343 are placed only conditionally, 120 only by the main part, 144 have
 //! no placement and 17 have operands that name variables. Of the reported NPCs 352 have no `DIR`
@@ -126,12 +129,16 @@ const DIR_BYTE_OF_HEADING_ZERO: i32 = 64;
 /// so byte 64 faces +x, 128 faces +y, 192 faces -x and 0 faces -y, and the byte counts
 /// counter-clockwise seen from above (the way the heading angle does).
 ///
-/// **The map is inferred from the data; no document this crate could reach states it.** It is the
-/// linear map that carries the field's `control_direction` (the trigger section's byte for the
-/// direction of "up" in the movement controls, same unit) onto the world heading of "up the
-/// screen" through the field camera, and the one under which characters that arrive by `MAPJUMP`
-/// face into the field. The two checks are repeated by the `#[ignore]`d real-data tests of
-/// `tests/area_real.rs` (`dir_convention_*`). On the owned Steam copy (702 fields, 2026-11-08):
+/// **The map is inferred from the data only; no documentation was relied on.** The one community
+/// page that was checked (FFRTT, opcode B3 `DIR`,
+/// <https://wiki.ffrtt.ru/index.php/FF7/Field/Script/Opcodes/B3_DIR>, 2026-11-08) says just that the
+/// operand is "in the standard direction format for the game": no unit, no zero direction, no
+/// rotation sense, and nothing about the camera. The map is the linear one that carries the
+/// field's `control_direction` (the trigger section's byte for the direction of "up" in the
+/// movement controls, same unit) onto the world heading of "up the screen" through the field
+/// camera, and the one under which characters that arrive by `MAPJUMP` face into the field. The
+/// two checks are repeated by the `#[ignore]`d real-data tests of `tests/area_real.rs`
+/// (`dir_convention_*`). On the owned Steam copy (702 fields, 2026-11-08):
 ///
 /// * **The camera check.** The heading of the camera's forward axis on the ground against
 ///   `control_direction`, over the 688 fields whose camera is not near-vertical. Counting
@@ -148,6 +155,15 @@ const DIR_BYTE_OF_HEADING_ZERO: i32 = 64;
 ///   degrees, 24 % of the fields lie farther than 20 degrees and the worst is 53. So the byte is
 ///   only approximately the camera's heading (designers set it by hand, and a perspective camera has
 ///   no single "up"), which limits how well this check can pin the offset to about the 3 degrees seen.
+///   The other measure, the direction that appears as "up the screen" at the middle of the walkmesh
+///   (the local slope of the camera projection, inverted the way the client's
+///   `FieldView::screen_to_world_dir` does), gives the same sign and almost the same offset (-88.0
+///   degrees, resultant 0.85) but a looser fit: median 6.2 degrees, 73 % of the 699 fields within
+///   20 degrees, 91 % within 45, and 38 fields more than 90 degrees off (the twelve worst, among
+///   them `coloss`, `elevtr1` and `gaia_32`, 177 to 180 degrees). For 27 of those 38 the forward
+///   axis does fit (within 20 degrees), for the other 11 neither measure does; why the screen-up
+///   measure flips was not investigated. The forward axis is the steadier of the two, so the
+///   numbers above lead with it.
 /// * **The `MAPJUMP` check.** Over the 1 179 literal `MAPJUMP`s that land inside the triangle they
 ///   name (those in script 0's conditional part left out), the mean cosine between the facing this
 ///   map gives and the direction from the arrival toward the middle of the target's walkmesh is

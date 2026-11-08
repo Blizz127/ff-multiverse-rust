@@ -13,7 +13,7 @@
 //! files are only ever opened read-only, and what the tests print are counts, field names, entity
 //! names, model stems and numbers: no game bytes and no dialog text.
 
-use fmv_adapter_api::{AreaRuntime, GameAdapter};
+use fmv_adapter_api::{AreaRuntime, GameAdapter, MoveResult};
 use fmv_core::{EditionProvenance, GameId, Platform, Pos};
 use fmv_ff7::background::Projection;
 use fmv_ff7::field::{FieldFile, Walkmesh};
@@ -297,6 +297,16 @@ fn dir_convention_against_control_direction_and_the_camera() {
     fit_report("camera forward axis, fields whose control_direction is 128", &is_128);
     let at_centroid: Vec<HeadingRow> = facts.iter().map(|f| (f.name.as_str(), f.control_direction, f.up_at_centroid)).collect();
     fit_report("heading of 'up the screen' at the walkmesh centroid (all fields)", &at_centroid);
+    // the screen-up measure comes out about opposite for some fields: does the forward axis fit them?
+    let off_by = |heading: f64, cd: u8| wrap(heading - f64::from(field_direction_to_facing(cd))).abs().to_degrees();
+    let flipped: Vec<&UpFacts> = facts.iter().filter(|f| off_by(f.up_at_centroid, f.control_direction) > 90.0).collect();
+    let forward_fits = flipped.iter().filter(|f| f.forward_ground_len >= 0.25 && off_by(f.camera_forward, f.control_direction) <= 20.0).count();
+    let near_vertical = flipped.iter().filter(|f| f.forward_ground_len < 0.25).count();
+    println!(
+        "  {} fields are more than 90 deg off under the screen-up measure; the forward axis is within 20 deg for {forward_fits} of them ({near_vertical} have a near-vertical camera); {} of them have control_direction 128",
+        flipped.len(),
+        flipped.iter().filter(|f| f.control_direction == 128).count()
+    );
 
     println!("--- a handful of fields (control_direction 124 is {:.1} deg of a turn)", 124.0 / 256.0 * 360.0);
     for want in ["md1stin", "md1_1", "md1_2", "mds7st1", "kuro_4", "ancnt1", "nrthmk", "elevtr1", "bwhlin"] {
@@ -444,6 +454,7 @@ fn exits_of_every_field_arrive_on_the_hinted_target_triangle() {
     let (mut exits_total, mut zero_exit_fields, mut max_exits) = (0usize, 0usize, 0usize);
     let (mut target_load_failures, mut outside_triangle, mut hint_changes_z) = (Vec::new(), Vec::new(), 0usize);
     let mut self_exits = 0usize;
+    let (mut accepted_by_the_rules, mut not_accepted) = (0usize, Vec::<String>::new());
     let mut by_count: BTreeMap<usize, usize> = BTreeMap::new();
     for key in &keys {
         let Ok(area) = a.load_field(key) else {
@@ -503,6 +514,16 @@ fn exits_of_every_field_arrive_on_the_hinted_target_triangle() {
             let placed = target.place_arrival(e.arrival, e.arrival_hint);
             assert_eq!((placed.x, placed.y), (e.arrival.x, e.arrival.y), "{key} -> {}", e.target);
             assert!((placed.z - height).abs() < 1e-3, "{key} -> {}: placed z {} against the triangle's {height}", e.target, placed.z);
+            // the trait promises a position the area accepts: the movement rules take the placed
+            // point as it is (at most the small wall nudge) and keep it on the hinted floor
+            match target.validate_move(placed, placed) {
+                MoveResult::Accepted(p)
+                    if (p.x - placed.x).abs() <= 0.05 && (p.y - placed.y).abs() <= 0.05 && (p.z - placed.z).abs() <= 1.0 =>
+                {
+                    accepted_by_the_rules += 1;
+                }
+                other => not_accepted.push(format!("{key} -> {} at {placed:?}: {other:?}", e.target)),
+            }
             // where the default rule (no hint) would have put it, on a layered mesh
             let plain = target.place_arrival(e.arrival, None);
             hint_changes_z += usize::from((plain.z - placed.z).abs() > 1.0);
@@ -522,6 +543,11 @@ fn exits_of_every_field_arrive_on_the_hinted_target_triangle() {
         target_load_failures.len(),
         outside_triangle.len()
     );
+    println!(
+        "{accepted_by_the_rules} placed arrivals are accepted by validate_move as they are (xy within 0.05, z within 1); {} are not: {not_accepted:?}",
+        not_accepted.len()
+    );
+    assert!(not_accepted.is_empty(), "place_arrival returned positions the area does not accept: {not_accepted:?}");
     assert!(load_failures.is_empty(), "load_area failed where it used to succeed: {load_failures:?}");
     assert_eq!(used, 1036, "used gateways of the 702 fields");
     assert_eq!(used, exits_total + unresolved + not_in_archive + not_offered);
@@ -760,6 +786,7 @@ fn npcs_of_every_field_follow_the_rules() {
     let mut dir_kinds: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut visi_main_zero_with_placement = Vec::new();
     let (mut off_mesh, mut z_from_walkmesh, mut z_literal) = (0usize, 0usize, 0usize);
+    let (mut off_mesh_names, mut conditional_dir_names): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
     for key in &keys {
         let Ok(area) = a.load_field(key) else { continue };
         fields += 1;
@@ -783,11 +810,17 @@ fn npcs_of_every_field_follow_the_rules() {
                         z_from_walkmesh += 1;
                     }
                     let (x, y) = placement.xy().unwrap();
-                    off_mesh += usize::from(area.height_at(f32::from(x), f32::from(y), None).is_none());
+                    if area.height_at(f32::from(x), f32::from(y), None).is_none() {
+                        off_mesh += 1;
+                        off_mesh_names.push(format!("{key}/{} at ({x}, {y})", e.name));
+                    }
                     let kind = match e.direction {
                         None => "no DIR",
                         Some(d) if d.value.literal().is_none() => "DIR names a variable",
-                        Some(d) if d.conditional => "DIR only conditional",
+                        Some(d) if d.conditional => {
+                            conditional_dir_names.push(format!("{key}/{}", e.name));
+                            "DIR only conditional"
+                        }
                         Some(_) => "DIR unconditional literal",
                     };
                     *dir_kinds.entry(kind).or_default() += 1;
@@ -814,6 +847,8 @@ fn npcs_of_every_field_follow_the_rules() {
     );
     println!("entities not reported, by reason: {reasons:#?}");
     println!("DIR of the reported NPCs: {dir_kinds:?}");
+    println!("NPCs on no walkmesh triangle (reported at their literal positions): {off_mesh_names:?}");
+    println!("NPCs whose only DIR is conditional: {conditional_dir_names:?}");
     println!(
         "{} entities placed by the init part but hidden by an unconditional MAIN-part VISI 0 (the rule this adapter adds to the init-part one): {:?}",
         visi_main_zero_with_placement.len(),
