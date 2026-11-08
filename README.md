@@ -287,14 +287,20 @@ flat picture as before.
 
 *In a battle.* **B** asks the server for a debug battle (refused unless it runs with
 `--debug-encounters`; random encounters start battles by themselves in a field that has an
-encounter table). The window then shows the battle: enemy bars on top, your party below, one card
-per fighter with an HP bar and an ATB gauge; a yellow border and a yellow gauge mean that
-character can act, a white corner marks yours, and a band across the top is green while your
-client's replay agrees with the server (red if it ever diverges). **Space** or **Enter** attacks
-the first living enemy with your character. Each fighter's name and HP numbers and a line that
-says whose turn it is are drawn in the UI font over the cards (the window title repeats the
-headline). (The battle view has been checked by unit tests and an offscreen render only: this
-box has no display, so the window itself was not run.)
+encounter table). The window then shows the battle as a 3D scene: the formation's own camera
+(from your `scene.bin`), the enemies where the formation puts them, your party opposite them
+facing them (their field models, from your own `char.lgp`), on a stand-in arena; boxes stand in
+for the enemies until battle models are read. A blow makes its attacker run at its target and the
+target blink and shake; a miss makes it step aside; a beaten enemy collapses and a fallen party
+member lies down. A gold ring under a character means it can act, a white ring marks yours. The
+battle's own overlay is drawn over the scene (the enemy list, the party's HP, MP and ATB, the
+command menu on your turn, the floating numbers and the pointer over the models' heads, and a
+band across the top that is green while your client's replay agrees with the server and red if it
+ever diverges); the arrow keys (or WASD) move in the menu, **Space** or **Enter** confirm and
+**Backspace** goes back. A machine without battle data to replay the battle (or one started with
+`FMV_BATTLE_FLAT=1`) shows the flat view instead: one token per fighter with a thin HP bar. (The
+battle scene has been checked by unit tests and offscreen renders only: this box has no display,
+so the window itself was not run.)
 
 **One command for the basics:** `scripts/smoke.sh` starts the server, runs two headless bots
 concurrently, checks both SMOKE lines and stops the server. It uses `target/release` by
@@ -454,13 +460,16 @@ scripts/package.sh
 ```
 
 Builds `fmv-server`, `fmv-client` and `fmv-import` in release mode, stages **only** the
-three binaries, this README, a generated `LICENSE-NOTICE.txt` and a `manifest.json` into
-`dist/ff-multiverse-<version>-<gitshort>-linux-x86_64/`, and writes the `.tar.gz` plus a
-sidecar `.manifest.json` next to it. The manifest records the version, git commit
+three binaries, the launcher entry point `ff-multiverse.sh`, this README, a generated
+`LICENSE-NOTICE.txt` and a `manifest.json` into
+`dist/ff-multiverse-<version>-<gitshort>-linux-x86_64/`, and writes the `.tar.gz`, a
+sidecar `.manifest.json` and `dist/SHA256SUMS` next to it. The manifest records the version,
+the revision and launcher build id (`ff-multiverse-r<revision>-<gitshort>`), git commit
 (`-dirty` if the tree is dirty), rustc version, target triple, build time and the sha256 of
-each binary; the sidecar adds the tarball's sha256. The script prints the tarball path
-and its sha256, honours `CARGO_TARGET_DIR`, and can be re-run safely. It fails if any
-staged file is off the allowlist or matches an owned-data pattern. It needs `jq`.
+each binary and file; the sidecar adds the tarball's sha256. The script prints the tarball
+path, its sha256 and the build id, honours `CARGO_TARGET_DIR`, and can be re-run safely. It
+fails if any staged file is off the allowlist or matches an owned-data pattern. It needs
+`jq`. The package is also a private launcher port, see `docs/LAUNCHER.md`.
 
 A name ending in `-dirty` came from uncommitted changes and one ending in `-prebuilt`
 came from `--skip-build`, which packages existing binaries without compiling (meant for
@@ -494,10 +503,12 @@ to a command). Never commit or share any of it.
 
 ```
 crates/                  the Cargo workspace (see the table above)
-scripts/package.sh       build and package a release tarball
+scripts/package.sh       build and package a release tarball (and dist/SHA256SUMS)
+scripts/ff-multiverse.sh the launcher entry point shipped in the package (docs/LAUNCHER.md)
 scripts/smoke.sh         two-bot local smoke test
 scripts/battle-smoke.sh  shared-battle smoke test (real data)
 scripts/travel-smoke.sh  walking between fields: two bots, md1stin -> md1_1 and back (real data)
 deploy/                  systemd user unit template and deployment procedure
+docs/LAUNCHER.md         the package as an owner-only launcher port: layout, entry point, data dir
 IMPLEMENTATION-PLAN.md   first-milestone plan and design constraints
 ```

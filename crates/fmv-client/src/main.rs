@@ -113,6 +113,12 @@ fn open_game(args: &Args) -> Result<LocalGame, String> {
                 Ok((rules, origin)) => {
                     eprintln!("FF7: battle data (scene.bin, kernel.bin) read from this machine's own copy ({origin}), read-only");
                     battle::install_local_rules(Some(rules));
+                    // Spell, item and enemy-attack names for the battle menus and banners, from the
+                    // same files (without them the menus show plain labels such as "Spell 12").
+                    match battle::open_names(&args.ff7_source()) {
+                        Ok(names) => battle::install_local_names(Some(Arc::new(names))),
+                        Err(e) => eprintln!("note: battle names unavailable ({e}); menus show plain labels"),
+                    }
                 }
                 Err(e) => eprintln!("note: no battle data on this machine ({e}); shared battles cannot be replayed or fought here"),
             }
