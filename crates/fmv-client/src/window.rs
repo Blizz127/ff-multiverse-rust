@@ -600,9 +600,8 @@ impl App {
                     "battle: {}",
                     match cmd {
                         BattleCmd::RequestEncounter { .. } => "asking the server for a debug battle".to_string(),
-                        BattleCmd::Command { actor, command, .. } => match command {
-                            fmv_protocol::battle::Command::Attack { target } => format!("actor {} attacks {}", actor.0, target.0),
-                        },
+                        // Debug text, so a command kind the engine gains later needs no change here.
+                        BattleCmd::Command { actor, command, .. } => format!("actor {} sends {command:?}", actor.0),
                     }
                 );
                 self.session.send_battle(cmd);

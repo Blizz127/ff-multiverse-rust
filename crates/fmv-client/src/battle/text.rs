@@ -33,21 +33,24 @@ fn menu_line(menu: &MenuView) -> (&'static str, Rgba) {
 
 /// The one line under the status band, and its colour.
 pub fn status_line(view: &BattleView) -> (&'static str, Rgba) {
-    match view.status {
-        Status::Diverged => ("BATTLE DIVERGED FROM THE SERVER", ERROR),
-        Status::Unverified => ("No battle data on this computer: waiting for the battle to end", WARN),
-        Status::Verified => {
-            if let Some(finale) = &view.finale {
-                return if finale.outcome == Outcome::Victory { ("Victory!", ACCENT) } else { ("Defeat", ERROR) };
-            }
-            match view.party.iter().find(|b| b.mine) {
-                None => ("Watching the battle", DIM),
-                Some(b) if !b.alive => ("Your character is down", ERROR),
-                Some(b) if b.ready && view.waiting_for_answer => ("Waiting for the server...", INFO),
-                Some(b) if b.ready => view.menu.as_ref().map_or(("YOUR TURN", ACCENT), menu_line),
-                Some(_) => ("Waiting for your gauge", DIM),
+    match (view.status, &view.finale) {
+        (Status::Diverged, _) => ("BATTLE DIVERGED FROM THE SERVER", ERROR),
+        // The end of a battle is announced whether or not this machine could replay it.
+        (_, Some(finale)) => {
+            if finale.outcome == Outcome::Victory {
+                ("Victory!", ACCENT)
+            } else {
+                ("Defeat", ERROR)
             }
         }
+        (Status::Unverified, None) => ("No battle data on this computer: waiting for the battle to end", WARN),
+        (Status::Verified, None) => match view.party.iter().find(|b| b.mine) {
+            None => ("Watching the battle", DIM),
+            Some(b) if !b.alive => ("Your character is down", ERROR),
+            Some(b) if b.ready && view.waiting_for_answer => ("Waiting for the server...", INFO),
+            Some(b) if b.ready => view.menu.as_ref().map_or(("YOUR TURN", ACCENT), menu_line),
+            Some(_) => ("Waiting for your gauge", DIM),
+        },
     }
 }
 
@@ -202,6 +205,12 @@ mod tests {
         assert_eq!(status_line(&v), ("Defeat", ERROR));
         v.status = Status::Diverged;
         assert!(status_line(&v).0.contains("DIVERGED"));
+        // A machine without battle data (no replay) still announces the end of the battle.
+        let mut blind = BattleView::unverified(BattleId(1));
+        blind.finale = Some(Finale { outcome: Outcome::Victory, reward: Some(RewardLine::default()), age_ms: 0, dismissible: false });
+        assert_eq!(status_line(&blind), ("Victory!", ACCENT));
+        blind.finale = None;
+        assert!(status_line(&blind).0.contains("No battle data"));
     }
 
     #[test]

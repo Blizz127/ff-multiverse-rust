@@ -178,7 +178,7 @@ pub struct Finale {
 /// clearly not an ordinary one.
 pub const DISABLED: Rgba = [132, 138, 178, 255];
 /// The colour of an aimed-at row.
-const AIMED: Rgba = [255, 214, 80, 90];
+const AIMED: Rgba = [150, 180, 255, 110];
 /// The colour of HP that is low (a third or less).
 const HP_LOW: Rgba = WARN;
 const HEAL: Rgba = [112, 236, 132, 255];
