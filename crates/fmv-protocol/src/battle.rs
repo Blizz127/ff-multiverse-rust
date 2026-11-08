@@ -699,7 +699,7 @@ mod tests {
     pub(crate) fn setup(formation_id: u16, members: usize) -> BattleSetup {
         BattleSetup {
             formation_id,
-            seed: 0xBA77_1E,
+            seed: 0x00BA_771E,
             party: (0..members as u64).map(|i| member(i, i as u8)).collect(),
             preemptive: false,
             back_attack: false,
@@ -894,7 +894,7 @@ mod tests {
         // and the living share the experience.
         assert_eq!(rewards.iter().map(|r| r.account).collect::<Vec<_>>(), roster.iter().map(|r| r.0).collect::<Vec<_>>());
         let alive = roster.iter().filter(|r| r.1).count() as u32;
-        assert!(alive >= 1 && alive < 3);
+        assert!((1..3).contains(&alive));
         for (reward, (_, is_alive)) in rewards.iter().zip(&roster) {
             if *is_alive {
                 assert_eq!((reward.exp, reward.gil, reward.ap), (12 / alive, 20 / alive, 2));

@@ -56,10 +56,7 @@ fn the_admin_tool_lists_and_releases_orphaned_registrations() {
     let listed = run(&[dir, "list"]);
     assert!(listed.status.success(), "{}", text(&listed.stderr));
     let out = text(&listed.stdout);
-    assert!(
-        out.contains("3 of 4 accounts have never been logged into"),
-        "{out}"
-    );
+    assert!(out.contains("3 of 4 accounts are unclaimed"), "{out}");
     for name in ["Orphan", "Busy", "Ghost"] {
         assert!(out.contains(&format!("{name:?}")), "{out}");
     }

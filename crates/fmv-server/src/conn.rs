@@ -30,7 +30,13 @@
 //!   already hung up or reset gets no account;
 //! * the connection remembers which account it just registered until the writer reports that the
 //!   `Welcome` was written to the socket; if the connection ends first, the account is released
-//!   (`accounts::release_unclaimed`) and its name is free again.
+//!   (`accounts::release_unclaimed`) and its name is free again;
+//! * once the client answers (the first message that decodes after the `Welcome`, whatever it
+//!   asks for), the account is recorded as claimed (`accounts::claim_delivered`): the `Welcome` was
+//!   written and answered, so the store's orphan tools (`release_unclaimed`, `fmv-accounts
+//!   release-older-than`) can from then on only ever free an account whose token never got that far.
+//!   (A client that pipelines a second message behind its `Hello` without reading the `Welcome` is
+//!   claimed too: that costs nothing beyond the name squatting open registration already allows.)
 //!
 //! # Idle sessions
 //!
@@ -518,7 +524,11 @@ impl Conn {
         let join_started = Instant::now();
         loop {
             let remaining = shared.cfg.join_timeout.saturating_sub(join_started.elapsed());
-            match self.recv(Some(remaining), JOIN_TIMEOUT).await? {
+            let msg = self.recv(Some(remaining), JOIN_TIMEOUT).await?;
+            // The first message a client of a new account sends after its `Welcome` answers it: as far
+            // as the server can tell the token was delivered, so the account is no orphan any more.
+            self.acknowledge_welcome().await;
+            match msg {
                 ClientMsg::JoinArea { area, fingerprint, provenance } => {
                     check_join(&shared, &area, &fingerprint, &provenance)
                         .map_err(|why| Close::reject(RejectCode::ContentMismatch, why))?;
@@ -665,6 +675,24 @@ impl Conn {
                 error!(error = %e, "login task failed");
                 Err(Close::reject(RejectCode::Internal, "internal error; try again later"))
             }
+        }
+    }
+
+    /// The client of an account this connection just registered has answered the `Welcome` that
+    /// carried its token (any message that decodes, whatever it asks for): record that, so that the
+    /// account is never mistaken for a registration whose token was lost. A registering session never
+    /// logs in with its token, so nothing else would mark the account. From here on this connection
+    /// no longer releases the account when it ends. Failing to record it is only logged: the client
+    /// has its token and plays on (the account then looks like an orphan to the store's tools).
+    async fn acknowledge_welcome(&mut self) {
+        let Some(account) = self.registered.take() else { return };
+        let store = Arc::clone(&self.shared.store);
+        match tokio::task::spawn_blocking(move || accounts::claim_delivered(&store, account)).await {
+            Ok(Ok(_)) => debug!(account = account.0, "the client answered its Welcome: the account is claimed"),
+            Ok(Err(cause)) => {
+                warn!(account = account.0, %cause, "could not record that a new account's token reached its client; the store will treat it as unclaimed")
+            }
+            Err(e) => warn!(account = account.0, error = %e, "recording that a new account's token reached its client failed"),
         }
     }
 

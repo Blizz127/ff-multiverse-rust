@@ -534,6 +534,39 @@ impl Store {
         Ok(())
     }
 
+    /// Record that the owner of `account` holds its token, without using the token to log in.
+    ///
+    /// A registration is answered with the token itself, so the registering session never logs in
+    /// with it and the account would stay "unclaimed" (an orphan candidate for
+    /// [`Store::release_unclaimed`] and the `fmv-accounts` tool) even though its owner plays on
+    /// with the token they were just given. A server therefore calls this when the client answers
+    /// the reply that carried a new token (its first message after it): from then on the token
+    /// has been delivered as far as the server can tell, and only an account whose token never got
+    /// that far counts as an orphan. (A client that pipelines a message right behind its first
+    /// one, without reading the reply, is claimed too; that costs nothing beyond what open
+    /// registration already allows.) It has the same effect, and writes the same log entry, as the
+    /// first login with the token ([`Store::authenticate`]).
+    ///
+    /// `Ok(true)` if this call recorded it, `Ok(false)` if the account was already claimed,
+    /// [`PersistError::UnknownAccount`] if there is no such account (for example it was released
+    /// in the meantime: its token is void). Decided under the log lock, like a login: either this
+    /// is recorded first (and a release refuses) or the release is (and this fails). A failure to
+    /// write the entry is logged, not returned: the account counts as claimed for the rest of this
+    /// run and the next run asks again, as for a login.
+    pub fn mark_claimed(&self, account: AccountId) -> Result<bool> {
+        let mut log = self.log();
+        match self.index().account(account.0) {
+            None => return Err(PersistError::UnknownAccount(account)),
+            Some(entry) if entry.claimed => return Ok(false),
+            Some(_) => {}
+        }
+        if let Err(e) = log.append(&Op::Claim { account: account.0 }) {
+            tracing::warn!(account = account.0, error = %e, "could not record in the index log that an account's owner holds its token");
+        }
+        self.index_mut().set_claimed(account.0);
+        Ok(true)
+    }
+
     /// `Ok(None)` for an unknown account.
     pub fn account_info(&self, id: AccountId) -> Result<Option<AccountInfo>> {
         if !self.index().contains_account(id.0) {
@@ -560,10 +593,12 @@ impl Store {
 
     // ---- orphaned registrations ----------------------------------------------------------
 
-    /// Accounts that nobody has ever logged into, with their `created_at`, oldest id first.
-    /// These are the candidates for [`Store::release_unclaimed`]: a registration whose token
-    /// never reached its client (the connection dropped before the reply) or whose client
-    /// never came back. Accounts migrated from a version 1 index are never listed.
+    /// Accounts whose token has never been used to log in and whose owner nobody has recorded as
+    /// holding it ([`Store::mark_claimed`]), with their `created_at`, oldest id first. These are
+    /// the candidates for [`Store::release_unclaimed`]: a registration whose token never reached
+    /// its client (the connection dropped before the reply), or, for a caller that never calls
+    /// `mark_claimed`, one whose client never logged in with the token. Accounts migrated from a
+    /// version 1 index are never listed.
     pub fn unclaimed_accounts(&self) -> Vec<(AccountId, u64)> {
         let mut found: Vec<(AccountId, u64)> = self
             .index()
@@ -577,7 +612,8 @@ impl Store {
 
     /// Remove an orphaned registration so that its name can be registered again.
     ///
-    /// Allowed only for an account whose token has **never** been used to log in (see
+    /// Allowed only for an account whose token has **never** been used to log in and whose owner
+    /// is not recorded as holding it ([`Store::mark_claimed`]; see
     /// [`Store::unclaimed_accounts`]) and that has no stored progression; otherwise it fails
     /// with [`PersistError::NotReleasable`] and nothing changes. The check and the release are
     /// decided under the same lock a first login takes, so an account whose token was just
@@ -611,7 +647,8 @@ impl Store {
             if claimed {
                 return Err(PersistError::NotReleasable {
                     account,
-                    reason: "its token has been used to log in",
+                    reason:
+                        "its token has been used to log in, or its owner is recorded as holding it",
                 });
             }
             log.append(&Op::Release { account: account.0 })?;

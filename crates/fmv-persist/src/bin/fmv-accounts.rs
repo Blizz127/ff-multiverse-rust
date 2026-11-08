@@ -1,5 +1,6 @@
-//! Operator tool for orphaned registrations: list the accounts nobody has ever logged into and
-//! release them, so that their names can be registered again.
+//! Operator tool for orphaned registrations: list the accounts nobody has ever logged into (and
+//! that no server has recorded as holding its token) and release them, so that their names can
+//! be registered again.
 //!
 //! ```text
 //! cargo run -p fmv-persist --bin fmv-accounts -- <state-dir> list
@@ -13,9 +14,17 @@
 //! A registration whose token never reached its client (the connection dropped before the
 //! reply) leaves an account that nobody can log into and a name that cannot be registered
 //! again. `release` removes such an account; it refuses an account whose token has ever been
-//! used to log in, or that has stored progression, so a live player cannot be removed by
-//! mistake. Released ids are never reused. Accounts that were migrated from a version 1 index
-//! count as having logged in and are never listed.
+//! used to log in, or that the server recorded as holding its token (`Store::mark_claimed`: the
+//! `fmv-server` does it when the client answers the reply that carried a new token, so a player
+//! who registered and played one session but has not logged in again is not listed), or that has
+//! stored progression, so a live player cannot be removed by mistake. Released ids are never
+//! reused. Accounts that were migrated from a version 1 index count as having logged in and are
+//! never listed.
+//!
+//! **A store that was written by a server that did not record claims** (before `Store::mark_claimed`
+//! existed) lists every player who registered and has not logged in with the token since, because
+//! nothing marked their account: until each of them logs in once, `release-older-than` would free
+//! real accounts there. Look at `list` first and release by id.
 //!
 //! This is the same as calling `Store::unclaimed_accounts` and `Store::release_unclaimed`; it
 //! exists so that an operator has a documented way to do it without writing code.
@@ -80,7 +89,7 @@ fn main() -> ExitCode {
         ("list", []) => {
             let unclaimed = store.unclaimed_accounts();
             println!(
-                "{} of {} accounts have never been logged into",
+                "{} of {} accounts are unclaimed (their token was never used to log in and no server recorded their owner as holding it)",
                 unclaimed.len(),
                 store.account_count()
             );

@@ -951,6 +951,143 @@ fn a_first_login_and_a_release_cannot_both_succeed() {
     assert_eq!(store.account_count(), logged_in as u64);
 }
 
+// ---- a registration whose token arrived is not an orphan ----------------------------------------
+
+/// A registration is answered with the token, so its session never logs in with it. A server records
+/// that the client answered (`mark_claimed`), and from then on release, `unclaimed_accounts` and the
+/// operator tool leave the account alone: only a true ghost is ever freed.
+#[test]
+fn mark_claimed_keeps_a_registration_whose_token_arrived_from_ever_being_released() {
+    let (_guard, root) = fresh_root();
+    let store = open(&root);
+    let delivered = register(&store, "Cloud");
+    let ghost = register(&store, "Ghost");
+    assert_eq!(
+        store.unclaimed_accounts().len(),
+        2,
+        "nobody has logged in with either token"
+    );
+
+    // The client answered the reply that carried the first token.
+    let entries = log_lines(&root).len();
+    assert!(
+        store.mark_claimed(delivered.account_id).unwrap(),
+        "this call recorded it"
+    );
+    assert!(
+        !store.mark_claimed(delivered.account_id).unwrap(),
+        "already recorded: nothing to do"
+    );
+    assert_eq!(
+        log_lines(&root).len(),
+        entries + 1,
+        "one durable entry, written once"
+    );
+    assert_eq!(
+        log_lines(&root).last().unwrap(),
+        &json!({"op": "claim", "account": delivered.account_id.0})
+    );
+    assert_eq!(
+        store.unclaimed_accounts(),
+        vec![(ghost.account_id, NOW)],
+        "only the ghost is an orphan"
+    );
+
+    // The release refuses it, in both forms, and says why; nothing about the account changed.
+    assert!(!store.release_if_unclaimed(delivered.account_id).unwrap());
+    let err = store.release_unclaimed(delivered.account_id).unwrap_err();
+    assert!(matches!(err, PersistError::NotReleasable { .. }), "{err}");
+    assert!(
+        err.to_string().contains("used to log in") && err.to_string().contains("holding it"),
+        "{err}"
+    );
+    assert_eq!(
+        store.find_account_by_name("cloud"),
+        Some(delivered.account_id)
+    );
+    // The token works, and logging in with it adds nothing: the account is already claimed.
+    let entries = log_lines(&root).len();
+    assert_eq!(
+        store.authenticate(&delivered.token).unwrap(),
+        delivered.account_id
+    );
+    assert_eq!(
+        log_lines(&root).len(),
+        entries,
+        "a login after the claim appends nothing"
+    );
+
+    // The true ghost is still freed, and then is unknown to `mark_claimed`.
+    assert!(store.release_if_unclaimed(ghost.account_id).unwrap());
+    assert!(matches!(
+        store.mark_claimed(ghost.account_id),
+        Err(PersistError::UnknownAccount(_))
+    ));
+    assert!(matches!(
+        store.mark_claimed(AccountId(99)),
+        Err(PersistError::UnknownAccount(_))
+    ));
+
+    // The claim survives a restart: the account is still not an orphan.
+    drop(store);
+    let store = open(&root);
+    assert!(
+        store.open_warnings().is_empty(),
+        "{:?}",
+        store.open_warnings()
+    );
+    assert!(store.unclaimed_accounts().is_empty());
+    assert!(!store.release_if_unclaimed(delivered.account_id).unwrap());
+    assert_eq!(store.account_count(), 1);
+    assert_eq!(
+        store.authenticate(&delivered.token).unwrap(),
+        delivered.account_id
+    );
+}
+
+/// The same race as a first login against a release, with the server's claim in the login's place:
+/// exactly one of them wins, never both.
+#[test]
+fn a_claim_and_a_release_cannot_both_succeed() {
+    let (_guard, root) = fresh_root();
+    let store = Arc::new(open(&root));
+    let (mut claimed, mut released) = (0, 0);
+    for round in 0..120 {
+        let reg = register(&store, &format!("claimer-{round}"));
+        let barrier = Arc::new(Barrier::new(2));
+        let claim = {
+            let (store, barrier, id) = (Arc::clone(&store), Arc::clone(&barrier), reg.account_id);
+            std::thread::spawn(move || {
+                barrier.wait();
+                store.mark_claimed(id)
+            })
+        };
+        let release = {
+            let (store, barrier, id) = (Arc::clone(&store), Arc::clone(&barrier), reg.account_id);
+            std::thread::spawn(move || {
+                barrier.wait();
+                store.release_unclaimed(id)
+            })
+        };
+        match (claim.join().unwrap(), release.join().unwrap()) {
+            (Ok(true), Err(PersistError::NotReleasable { .. })) => claimed += 1,
+            (Err(PersistError::UnknownAccount(_)), Ok(())) => released += 1,
+            other => panic!("round {round}: the claim and the release must not both win or both lose: {other:?}"),
+        }
+    }
+    assert_eq!(claimed + released, 120);
+    // Whatever happened, the store is consistent after a restart.
+    drop(store);
+    let store = open(&root);
+    assert!(
+        store.open_warnings().is_empty(),
+        "{:?}",
+        store.open_warnings()
+    );
+    assert_eq!(store.account_count(), claimed as u64);
+    assert!(store.unclaimed_accounts().is_empty());
+}
+
 // ---- concurrency ------------------------------------------------------------------------------
 
 #[test]

@@ -22,7 +22,10 @@
 //!    before the token is in the caller's hands.
 //! 3. The caller delivers the token immediately. If the `Welcome` that carries it is never
 //!    written, [`release_unclaimed`] gives the account (and so the name) back: nobody holds a
-//!    token for it.
+//!    token for it. If it was written, the account stays until the client answers it: its first
+//!    message after the `Welcome` is recorded with [`claim_delivered`], which is what keeps the
+//!    store's orphan tools (`Store::unclaimed_accounts`, `fmv-accounts release-older-than`) away from
+//!    a player who registered, played, and has not logged in again.
 //!
 //! # Appearance
 //!
@@ -239,6 +242,17 @@ fn shown(game: GameId, profile: &AvatarProfile) -> AvatarAppearance {
     let mut avatar = profile.appearance_for(game);
     avatar.appearance_ref = avatar.appearance_ref.as_deref().and_then(|r| canonical_appearance(game, r)).map(str::to_string);
     avatar
+}
+
+/// Record that the client of a registration answered the `Welcome` that carried its new token (its
+/// first message after it): the token has been delivered as far as the server can tell, so the
+/// account is not an orphan and [`release_unclaimed`], `Store::unclaimed_accounts` and the
+/// `fmv-accounts` tool leave it alone. A registering session never logs in with its token, so without
+/// this every player who registered and has not logged in again would look like a registration whose
+/// token never arrived. `Ok(true)` if this recorded it, `Ok(false)` if it already was; `Err` is a text
+/// for the log (the account is unknown or the store failed).
+pub fn claim_delivered(store: &Store, account: AccountId) -> Result<bool, String> {
+    store.mark_claimed(account).map_err(|e| e.to_string())
 }
 
 /// What [`release_unclaimed`] did.

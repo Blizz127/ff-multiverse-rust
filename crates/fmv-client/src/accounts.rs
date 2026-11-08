@@ -726,10 +726,10 @@ mod tests {
             ("".to_string(), "empty"),
             ("  \n\n".to_string(), "empty"),
             (format!("{secret}\n"), "name="),
-            (format!("{secret}"), "name="),
+            (secret.to_string(), "name="),
             (format!("{secret}\nnam=N\n"), "name="),
             (format!("{secret}\nname=\n"), "empty"),
-            (format!("\nname=N\n"), "token is empty"),
+            ("\nname=N\n".to_string(), "token is empty"),
             (format!("{secret} x\nname=N\n"), "visible ASCII"),
             (format!("{secret}\tx\nname=N\n"), "visible ASCII"),
             (format!("{secret}\u{e9}\nname=N\n"), "visible ASCII"),
@@ -1125,7 +1125,7 @@ mod tests {
     /// A writer that writes half of its content and then fails (a full disk, say).
     fn failing_writer(f: &mut File) -> io::Result<()> {
         f.write_all(b"fmvt_half")?;
-        Err(io::Error::new(io::ErrorKind::Other, "disk full"))
+        Err(io::Error::other("disk full"))
     }
 
     #[test]

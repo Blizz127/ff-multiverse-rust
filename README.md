@@ -179,7 +179,12 @@ every second and moves when its player walks. Whoever steps away for half an hou
 *Registration and its token.* The token is sent once, in the `Welcome` that answers the
 registration. The account is created in one step with its avatar (a name is never taken without a
 token having been produced), a client that has already hung up gets no account, and if the `Welcome`
-cannot be written the account is released again, so the name is free for the next try. A look
+cannot be written the account is released again, so the name is free for the next try, and once the
+client answers it (its first message after the `Welcome`, whatever it asks for) the account is recorded
+as claimed: `fmv-accounts release-older-than` then only ever frees a registration whose client never
+answered, never a player who registered, played and has not logged in again. (A store written by an
+earlier server has no such records: until each player logs in once with the saved token they look
+unclaimed to `fmv-accounts`, so check `list` and release by id there instead of `release-older-than`.) A look
 (`appearance_ref`) is only ever one of the ids the hosted game offers (`ff7/cloud`, ...); anything
 else keeps the default look instead of failing the registration.
 

@@ -19,7 +19,9 @@
 //! * **Atomic registration.** [`Store::register`] validates every input before it writes
 //!   anything, then creates the account and its avatar together; there is no failure path that
 //!   leaves a name taken without a token having been returned. [`Store::release_unclaimed`]
-//!   removes a registration whose token never reached its client.
+//!   removes a registration whose token never reached its client, and [`Store::mark_claimed`] is
+//!   how a server says that one did (the registering session never logs in with the token, so
+//!   without it every player who has not logged in again would look like an orphan).
 //! * **Names that cannot impersonate.** Display names are unique by `fmv_core::name_key` (case,
 //!   canonical form, width, invisible characters and look-alike letters make no difference),
 //!   and a new name must come from one writing system.

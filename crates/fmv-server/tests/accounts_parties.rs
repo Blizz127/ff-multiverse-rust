@@ -36,7 +36,7 @@ async fn relogin(addr: SocketAddr, token: &str) -> Joined {
     panic!("the account's previous session was never released");
 }
 
-fn own<'a>(joined: &'a Joined) -> &'a fmv_core::EntitySnapshot {
+fn own(joined: &Joined) -> &fmv_core::EntitySnapshot {
     joined.snapshot.iter().find(|e| e.id == joined.entity).expect("the joiner is in its own snapshot")
 }
 
@@ -150,6 +150,88 @@ async fn accounts_survive_a_server_restart_on_the_same_state_directory() {
     server.shutdown().await;
 }
 
+/// A registration is answered with the token, so its session never logs in with it. What marks the
+/// account as one whose token arrived is the client's FIRST MESSAGE after the `Welcome`, whatever it
+/// asks for: from then on `release_if_unclaimed` (and so `fmv-accounts release-older-than`) refuses it.
+/// Only an account whose client never said anything that decodes stays an orphan candidate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_registration_stops_being_an_orphan_when_its_client_answers_the_welcome() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("claim-state");
+    let server = TestServer::start(ServerConfig { state_dir: Some(state.clone()), ..ServerConfig::default() }).await;
+
+    /// Register and read the `Welcome` (the client then holds its token): the client and its account.
+    async fn welcomed(addr: SocketAddr, prefix: &str) -> (Client, AccountId) {
+        let mut client = Client::connect(addr).await;
+        client.hello(&uniq(prefix)).await;
+        let account = client
+            .until("Welcome", |m| match m {
+                ServerMsg::Welcome { account, issued_token: Some(_), .. } => Some(*account),
+                _ => None,
+            })
+            .await;
+        (client, account)
+    }
+
+    // The first message after the Welcome is...
+    // ...a JoinArea, the normal path (the full handshake follows),
+    let joiner = join(server.addr, &uniq("Joiner")).await;
+    // ...a Ping, answered with a Pong,
+    let (mut pinger, pinged) = welcomed(server.addr, "Pinger").await;
+    pinger.send(&ClientMsg::Ping { nonce: 7 }).await;
+    pinger.until("Pong", |m| matches!(m, ServerMsg::Pong { nonce: 7, .. }).then_some(())).await;
+    // ...a CannotJoin (the client holds the token but not the area),
+    let (mut decliner, declined) = welcomed(server.addr, "Decliner").await;
+    decliner.send(&ClientMsg::CannotJoin { area: fixture_info().id, reason: "no copy of the area".into() }).await;
+    decliner.expect_closed().await;
+    // ...a Leave,
+    let (mut leaver, left) = welcomed(server.addr, "Leaver").await;
+    leaver.send(&ClientMsg::Leave).await;
+    leaver.expect_closed().await;
+    // ...or a message the server refuses (it decoded, so the client spoke the protocol).
+    let (mut eager, eager_account) = welcomed(server.addr, "Eager").await;
+    eager.send(&ClientMsg::PartySync).await;
+    eager.expect_reject_as(RejectCode::BadRequest, "before JoinArea").await;
+
+    // Two clients never answer: one reads the Welcome and says nothing, one sends something that is
+    // not a message. Neither shows that it has its token.
+    let (silent, silent_account) = welcomed(server.addr, "Silent").await;
+    drop(silent);
+    let (mut garbler, garbler_account) = welcomed(server.addr, "Garbler").await;
+    garbler.send_json("this is not json").await;
+    garbler.expect_reject_as(RejectCode::BadRequest, "malformed").await;
+
+    drop((joiner.client, pinger));
+    server.shutdown().await;
+
+    // What the store says afterwards (the server is gone, so the directory can be opened).
+    let store = Store::open(&state).unwrap();
+    let orphans: Vec<AccountId> = store.unclaimed_accounts().into_iter().map(|(account, _)| account).collect();
+    assert_eq!(
+        orphans,
+        {
+            let mut expected = vec![silent_account, garbler_account];
+            expected.sort();
+            expected
+        },
+        "only the two accounts whose clients never answered are orphans"
+    );
+    for (what, account) in [
+        ("joined", joiner.account),
+        ("pinged", pinged),
+        ("cannot-joined", declined),
+        ("left", left),
+        ("was refused", eager_account),
+    ] {
+        assert!(!store.release_if_unclaimed(account).unwrap(), "an account whose client {what} must not be released");
+        assert!(store.find_account_by_name(&store.account_info(account).unwrap().unwrap().display_name).is_some(), "{what}: still there");
+    }
+    // The ghosts are the ones that can be freed.
+    assert!(store.release_if_unclaimed(silent_account).unwrap());
+    assert!(store.release_if_unclaimed(garbler_account).unwrap());
+    assert_eq!(store.account_count(), 5);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_second_server_cannot_open_a_state_directory_that_is_in_use() {
     let dir = tempfile::tempdir().unwrap();
@@ -203,7 +285,8 @@ async fn the_edition_a_client_names_must_match_next_to_the_fingerprint() {
 
     // The right fingerprint with a different edition, region, revision, platform or game is
     // refused with the reason (the fingerprint alone would have let it in).
-    let wrong: [(&str, fn(&mut fmv_core::ProvenanceSummary)); 5] = [
+    type Change = fn(&mut fmv_core::ProvenanceSummary);
+    let wrong: [(&str, Change); 5] = [
         ("edition", |p| p.edition = "another edition".into()),
         ("region", |p| p.region = "PAL".into()),
         ("revision", |p| p.revision = "other".into()),
