@@ -102,7 +102,6 @@ static LOCAL_NAMES: OnceLock<Option<Arc<NameBook>>> = OnceLock::new();
 
 /// Install this machine's names for every [`BattleClient`] made from now on (only the first call
 /// counts).
-#[allow(dead_code)] // `main` calls it next to `install_local_rules`
 pub fn install_local_names(names: Option<Arc<NameBook>>) {
     let _ = LOCAL_NAMES.set(names);
 }
