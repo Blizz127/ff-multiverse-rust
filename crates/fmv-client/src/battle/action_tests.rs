@@ -685,6 +685,21 @@ fn an_inventory_message_is_kept_counted_and_noted_in_one_parseable_line() {
     assert_eq!(c.inventory_updates(), 3);
 }
 
+/// The real order of play: the server tells the inventory once on joining, long before any battle
+/// starts. Starting a battle rebuilds the command menu for the spells; it must keep those items.
+#[test]
+fn the_inventory_told_on_joining_fills_the_item_menu_of_a_later_battle() {
+    let rules: Arc<dyn BattleRules> = Arc::new(Scenario::new());
+    let sim = Sim::new(&*rules, 0, &[ME], true);
+    let mut c = client(rules);
+    c.on_inventory(0.5, vec![InventoryEntry::new(0, 3), InventoryEntry::new(3, 1)]);
+    assert!(c.menu_model_mut().items.is_empty(), "no battle yet, so no menu to fill");
+    c.on_message(1.0, sim.start());
+    let items: Vec<(u16, u16)> = c.menu_model_mut().items.iter().map(|i| (i.id, i.count)).collect();
+    assert_eq!(items, [(0, 3), (3, 1)], "the stock told on joining is in the first battle's Item list");
+    assert!(c.menu_model_mut().defend, "Defend is offered");
+}
+
 #[test]
 fn a_hostile_inventory_is_bounded_tidy_and_never_panics() {
     let rules: Arc<dyn BattleRules> = Arc::new(Scenario::new());
