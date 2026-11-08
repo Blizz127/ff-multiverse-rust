@@ -376,6 +376,20 @@ fn real_window_path_finds_the_battle_archive_through_open_ff7() {
     let rig = resolve(&mut kit, mp);
     eprintln!("MP: scale {}, height {:.0}, {} attachment(s)", rig.scale, rig.height, rig.attachments.len());
     assert!(rig.scale == 1.0 && rig.attachments.len() == 1 && (700.0..900.0).contains(&rig.height), "the real MP");
+    // The clips: slot 1 is its hurt clip whatever the source, and from a library (which has scene.bin) the
+    // attacks scene.bin names and the run-up and way back that go with them. A bare flevel.lgp has no scene.bin.
+    assert_eq!(rig.kit.hurt, Some(1));
+    if matches!(source, crate::ff7::Ff7Source::Library { .. }) {
+        eprintln!("MP kit: run {:?}, back {:?}, attacks {:?}", rig.kit.run, rig.kit.back, rig.kit.attacks);
+        assert_eq!((rig.kit.run, rig.kit.back), (Some(2), Some(5)));
+        assert_eq!(rig.kit.attacks, [(272, 3), (273, 4)], "Machine Gun and Tonfa, as scene.bin names them");
+    } else {
+        assert!(rig.kit.attacks.is_empty(), "without a library there is no scene.bin to name the attacks");
+    }
+    // A party member's kit is the shared table.
+    let cloud = kit.source.party_member(&PartyLook { actor: ActorId(0), character: 0, look: None, mine: true });
+    let cloud = resolve(&mut kit, cloud);
+    assert_eq!((cloud.kit.attack, cloud.kit.hurt, cloud.kit.death, cloud.kit.victory), (Some(10), Some(15), Some(18), Some(2)));
     // a party member by the engine's character id, and by the player's look over it
     for (character, look, height) in [(0u8, None, 862.0), (2, None, 837.0), (1, None, 919.0), (5, Some("ff7/tifa"), 837.0)] {
         let model = kit.source.party_member(&PartyLook { actor: ActorId(0), character, look: look.map(str::to_string), mine: true });
