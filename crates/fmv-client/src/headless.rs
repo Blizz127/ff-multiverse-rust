@@ -128,7 +128,7 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
     let mut party_bot = PartyBot::new(args.party_invite_first_peer, args.party_accept);
     // `--travel`: walk through the exits to these areas; with a party to form first it waits for it.
     let mut travel_bot = TravelBot::new(args.travel.clone(), args.party_invite_first_peer || args.party_accept);
-    let mut battle_bot = BattleBot::new(args.battle_auto, args.debug_encounters, args.battle_wait_party);
+    let mut battle_bot = BattleBot::new(args.battle_auto, args.debug_encounters, args.battle_wait_party).with_script(args.battle_script.clone());
     eprintln!(
         "headless: joined {} as `{}` (entity {}), bot={:?} for {:.1} s",
         session.info.area_id,
@@ -147,8 +147,10 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
         eprintln!("headless: travel behaviour: walk through the exits to {}", args.travel.join(", then "));
     }
     if battle_bot.is_active() {
+        let script = battle_bot.script_steps();
         eprintln!(
-            "headless: battle behaviour: when the ATB gauge is full, heal with the cheapest spell if HP is low, else give the limit break if the limit gauge is full, else attack; never escape; ask for a debug encounter: {}{}",
+            "headless: battle behaviour: when the ATB gauge is full, heal with the cheapest spell if HP is low, else give the limit break if the limit gauge is full, else attack; {}; ask for a debug encounter: {}{}",
+            if script.is_empty() { "never escape".to_string() } else { "escape only where the script says so".to_string() },
             args.debug_encounters,
             if args.debug_encounters && args.battle_wait_party > 1 {
                 format!(" (once leading a party of {})", args.battle_wait_party)
@@ -156,6 +158,13 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
                 String::new()
             }
         );
+        if !script.is_empty() {
+            eprintln!(
+                "headless: battle script given: {} entries, used first, one per full gauge: {}",
+                script.len(),
+                script.iter().map(ToString::to_string).collect::<Vec<_>>().join(",")
+            );
+        }
     }
 
     let start = Instant::now();
@@ -224,6 +233,9 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
         for cmd in battle_bot.step(now, &session.state.battle, &session.state.party) {
             session.send_battle(cmd);
         }
+        for note in battle_bot.drain_script_notes() {
+            eprintln!("battle: script: {note}");
+        }
         let dt = (tick_start - last).as_secs_f32().min(MAX_DT);
         last = tick_start;
         // A player in a battle is frozen in the field: it neither walks nor sends movement.
@@ -278,6 +290,14 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
     eprintln!("headless: {}", session.state.party.summary());
     if battle_bot.is_active() || session.state.battle.entered() > 0 || session.state.battle.rejections() > 0 {
         eprintln!("headless: battles: {}", session.state.battle.summary());
+        // How the script went (every entry is exactly one of applied, skipped, refused, lost or unused).
+        let script = battle_bot.script_summary(&session.state.battle);
+        for note in battle_bot.drain_script_notes() {
+            eprintln!("battle: script: {note}");
+        }
+        if let Some(script) = script {
+            eprintln!("headless: battle script: {script}");
+        }
         if let Some((walked, updates)) = after_battle {
             // The proof that the field went on: the player walked (or the server told us where
             // everyone stands, which it does at once when a battle ends) after the last battle.

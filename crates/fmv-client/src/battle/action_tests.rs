@@ -1168,3 +1168,309 @@ fn the_bot_gives_a_full_limit_but_heals_first_when_hurt_aims_a_healing_limit_at_
     assert!(limits >= 1, "it gave its starting limit");
     no_divergence(&mut c, "the whole battle");
 }
+
+// ----- the script (`--battle-script`) --------------------------------------------------------------------
+
+use super::script::{BattleScript, Next, Scripted};
+use super::ScriptStep::{Attack, Defend, Escape, Item, Limit, Magic};
+
+/// A preemptive battle for the script tests (everybody's gauge is full at once) for `accounts` (member `i` is
+/// `ActorId(i)`, the dummy follows them), starting with the limit gauges `limits`, whose account carries a
+/// Potion x3, a Phoenix Down and a Grenade (the server's `Inventory` message).
+fn script_battle(scenario: Scenario, accounts: &[AccountId], limits: &[u16]) -> (Sim, BattleClient) {
+    let rules: Arc<dyn BattleRules> = Arc::new(scenario);
+    let sim = Sim::with_limits(&*rules, 0, accounts, true, limits);
+    let mut c = client(rules);
+    c.on_message(0.0, sim.start());
+    c.on_inventory(0.0, vec![InventoryEntry::new(0, 3), InventoryEntry::new(7, 1), InventoryEntry::new(9, 1)]);
+    (sim, c)
+}
+
+/// The engine command a script entry comes to (it must be sendable).
+fn sends(c: &BattleClient, t: f64, step: ScriptStep) -> Command {
+    match c.scripted_command(t, step) {
+        Scripted::Send(BattleCmd::Command { command, .. }) => command,
+        other => panic!("{step}: {other:?}"),
+    }
+}
+
+/// Why a script entry is skipped.
+fn skips(c: &BattleClient, t: f64, step: ScriptStep) -> String {
+    match c.scripted_command(t, step) {
+        Scripted::Skip(why) => why,
+        other => panic!("{step}: {other:?}"),
+    }
+}
+
+/// The server applies a command the client sent and tells the client at `t`.
+fn applied(sim: &mut Sim, c: &mut BattleClient, cmd: BattleCmd, t: f64) {
+    let BattleCmd::Command { actor, command, .. } = cmd else { panic!("not a command: {cmd:?}") };
+    c.on_message(t, sim.command(actor, command));
+}
+
+#[test]
+fn a_script_entry_aims_offence_at_the_first_living_enemy_healing_at_the_most_hurt_member_and_revival_at_a_fallen_one() {
+    let dummy = ActorId(2);
+    // Everybody at full HP: healing goes to ourselves (the tie goes to us), offence to the dummy.
+    let (_sim, c) = script_battle(Scenario { limit: Some(Scenario::braver()), ..Scenario::new() }, &[ME, PEER], &[255, 0]);
+    assert_eq!(sends(&c, 1.0, Attack), Command::Attack { target: dummy });
+    assert_eq!(sends(&c, 1.0, Limit), Command::Limit { target: dummy });
+    assert_eq!(sends(&c, 1.0, Magic(27)), Command::Magic { spell: 27, target: dummy }, "Fire is offence");
+    assert_eq!(sends(&c, 1.0, Item(9)), Command::Item { item: 9, target: dummy }, "a Grenade is offence");
+    assert_eq!(sends(&c, 1.0, Magic(0)), Command::Magic { spell: 0, target: ME_AT_0 }, "Cure on a party that is fine: ourselves");
+    assert_eq!(sends(&c, 1.0, Item(0)), Command::Item { item: 0, target: ME_AT_0 });
+    assert_eq!(sends(&c, 1.0, Defend), Command::Defend);
+    assert_eq!(sends(&c, 1.0, Escape), Command::Escape);
+
+    // The ally the more hurt (the scenario hurts its first member, here PEER, actor 0; we are actor 1): the Cure,
+    // the Potion and Healing Wind go to it. When we are the one at 50 of 200, they go to us.
+    let (_sim, c) = script_battle(Scenario { hp: 50, limit: Some(Scenario::healing_wind()), ..Scenario::new() }, &[PEER, ME], &[0, 255]);
+    let peer = ActorId(0);
+    assert_eq!(sends(&c, 1.0, Magic(0)), Command::Magic { spell: 0, target: peer });
+    assert_eq!(sends(&c, 1.0, Item(0)), Command::Item { item: 0, target: peer });
+    assert_eq!(sends(&c, 1.0, Limit), Command::Limit { target: peer }, "Healing Wind aims at the party, scripted or not");
+    let (_sim, c) = script_battle(Scenario { hp: 50, ..Scenario::new() }, &[ME, PEER], &[]);
+    assert_eq!(sends(&c, 1.0, Magic(0)), Command::Magic { spell: 0, target: ME_AT_0 }, "we are the one at 50 of 200");
+
+    // A fallen member: Phoenix Down and Life go to it; with nobody fallen they are skipped. A fallen member is never
+    // "the most hurt": the Potion goes to one that stands.
+    let (_sim, c) = script_battle(Scenario { ally_dead: true, ..Scenario::new() }, &[ME, PEER], &[]);
+    assert_eq!(sends(&c, 1.0, Item(7)), Command::Item { item: 7, target: ActorId(1) });
+    assert_eq!(sends(&c, 1.0, Magic(7)), Command::Magic { spell: 7, target: ActorId(1) });
+    assert_eq!(sends(&c, 1.0, Item(0)), Command::Item { item: 0, target: ME_AT_0 });
+    let (_sim, c) = script_battle(Scenario::new(), &[ME, PEER], &[]);
+    assert!(skips(&c, 1.0, Item(7)).contains("nobody has fallen"));
+    assert!(skips(&c, 1.0, Magic(7)).contains("nobody has fallen"));
+}
+
+#[test]
+fn what_the_engine_or_the_bag_refuses_is_skipped_with_its_reason_and_it_is_only_our_turn_when_the_bot_says_so() {
+    let one = |scenario: Scenario, limits: &[u16]| script_battle(scenario, &[ME], limits).1;
+    // MP and spells.
+    let c = one(Scenario { mp: 0, ..Scenario::new() }, &[]);
+    assert!(skips(&c, 1.0, Magic(0)).contains("not enough MP"));
+    assert!(skips(&c, 1.0, Magic(99)).contains("does not know spell 99"));
+    let c = one(Scenario { mp: 4, ..Scenario::new() }, &[]);
+    assert!(skips(&c, 1.0, Magic(0)).contains("not enough MP"), "Cure costs 5");
+    assert_eq!(sends(&c, 1.0, Magic(27)), Command::Magic { spell: 27, target: THE_DUMMY }, "Fire costs 4");
+    // The bag: none left (the inventory the server told, zero stacks are no stacks) and not an item of the game at all.
+    let (_sim, mut c) = script_battle(Scenario::new(), &[ME], &[]);
+    c.on_inventory(0.5, vec![InventoryEntry::new(0, 0), InventoryEntry::new(9, 1)]);
+    assert!(skips(&c, 1.0, Item(0)).contains("none of item 0 is left"));
+    assert!(skips(&c, 1.0, Item(7)).contains("none of item 7 is left"), "a Phoenix Down it does not carry");
+    assert!(skips(&c, 1.0, Item(42)).contains("item 42 cannot be used in battle"));
+    assert_eq!(sends(&c, 1.0, Item(9)), Command::Item { item: 9, target: THE_DUMMY });
+    // The limit: not full, and none at all.
+    let c = one(Scenario { limit: Some(Scenario::braver()), ..Scenario::new() }, &[254]);
+    assert!(skips(&c, 1.0, Limit).contains("the limit gauge is not full"));
+    let c = one(Scenario::new(), &[255]);
+    assert!(skips(&c, 1.0, Limit).contains("no limit break"));
+    // A battle that cannot be escaped.
+    let c = one(Scenario { escape: None, ..Scenario::new() }, &[]);
+    assert!(skips(&c, 1.0, Escape).contains("cannot be escaped"));
+    assert_eq!(sends(&c, 1.0, Defend), Command::Defend, "whatever else cannot be done, Defend can");
+
+    // Not our turn: our gauge is not full, a command of ours is in flight, there is no battle, no replay.
+    let rules: Arc<dyn BattleRules> = Arc::new(Scenario::new());
+    let slow = Sim::new(&*rules, 0, &[ME], false);
+    let mut c = client(rules);
+    c.on_message(0.0, slow.start());
+    assert_eq!(c.scripted_command(1.0, Defend), Scripted::NotNow, "our gauge is not full");
+    let (_sim, mut c) = script_battle(Scenario::new(), &[ME], &[]);
+    let cmd = BattleCmd::Command { battle_id: BattleId(1), actor: ME_AT_0, command: Command::Defend };
+    c.note_sent(&cmd, 1.0);
+    assert_eq!(c.scripted_command(1.5, Defend), Scripted::NotNow, "in flight");
+    assert!(matches!(c.scripted_command(1.0 + PENDING_TIMEOUT_S, Defend), Scripted::Send(_)), "a lost command may be sent again");
+    assert_eq!(BattleClient::new(ME).scripted_command(1.0, Defend), Scripted::NotNow, "no battle");
+    let mut blind = BattleClient::new(ME);
+    blind.set_rules(None);
+    blind.on_message(0.0, script_battle(Scenario::new(), &[ME], &[]).0.start());
+    assert_eq!(blind.scripted_command(1.0, Defend), Scripted::NotNow, "no battle data to replay with");
+}
+
+#[test]
+fn a_refused_entry_is_skipped_for_good_and_the_next_one_is_tried_in_the_same_turn() {
+    // No MP for Cure and a limit gauge of 254: both are skipped at once and Defend goes out in the same call.
+    let (mut sim, mut c) = script_battle(Scenario { mp: 0, limit: Some(Scenario::braver()), ..Scenario::new() }, &[ME], &[254]);
+    let mut script = BattleScript::new(vec![Magic(0), Limit, Defend, Escape]);
+    let mut t = 1.0;
+    let Next::Send(cmd) = script.next_command(t, &c) else { panic!("{:?}", script.drain_notes()) };
+    assert_eq!(cmd, BattleCmd::Command { battle_id: BattleId(1), actor: ME_AT_0, command: Command::Defend });
+    let notes = script.drain_notes().join("\n");
+    assert!(notes.contains("entry 1 of 4 (magic:0) skipped: not enough MP"), "{notes}");
+    assert!(notes.contains("entry 2 of 4 (limit) skipped: the limit gauge is not full"), "{notes}");
+    assert!(notes.contains("entry 3 of 4 (defend): sent"), "{notes}");
+    assert_eq!((script.stats().skipped, script.stats().applied), (2, 0));
+
+    // Until the server answers the script waits; once Defend is applied it is used up and our gauge is spent.
+    c.note_sent(&cmd, t);
+    assert_eq!(script.next_command(t + 0.1, &c), Next::Wait);
+    applied(&mut sim, &mut c, cmd, t + 0.1);
+    assert_eq!(script.next_command(t + 0.2, &c), Next::Wait, "our gauge is spent");
+    assert_eq!(script.stats().applied, 1);
+    // The next turn gives the last entry, Escape (the skipped ones are never tried again), and then it is used up.
+    t += 1.0;
+    sim.until_our_turn(&mut c, &mut t);
+    let Next::Send(cmd) = script.next_command(t, &c) else { panic!("{:?}", script.drain_notes()) };
+    assert!(matches!(cmd, BattleCmd::Command { command: Command::Escape, .. }), "{cmd:?}");
+    c.note_sent(&cmd, t);
+    applied(&mut sim, &mut c, cmd, t);
+    assert_eq!(sim.state.outcome(), Some(Outcome::Escaped), "a sure escape");
+    c.on_message(t + 0.1, sim.end(&[]));
+    assert_eq!(script.next_command(t + 0.2, &c), Next::Done);
+    let s = script.stats();
+    assert_eq!((s.entries, s.applied, s.skipped, s.refused, s.lost, s.unused), (4, 2, 2, 0, 0, 0));
+    assert_eq!(script.summary(), "entries=4 applied=2 skipped=2 refused=0 lost=0 unused=0");
+    no_divergence(&mut c, "the script's battle");
+}
+
+#[test]
+fn an_entry_that_got_no_answer_is_sent_again_as_the_same_entry_and_a_late_refusal_of_the_duplicate_skips_nothing() {
+    let (mut sim, mut c) = script_battle(Scenario::new(), &[ME], &[]);
+    let mut script = BattleScript::new(vec![Defend, Magic(0), Escape]);
+    let t = 1.0;
+    let Next::Send(first) = script.next_command(t, &c) else { panic!() };
+    c.note_sent(&first, t);
+    // No answer yet: the script waits, the whole timeout through.
+    assert_eq!(script.next_command(t + 0.5, &c), Next::Wait);
+    assert_eq!(script.next_command(t + PENDING_TIMEOUT_S - 0.01, &c), Next::Wait);
+    // Then the same command goes again (the SAME entry, not the next one) and is noted as a resend.
+    let Next::Send(again) = script.next_command(t + PENDING_TIMEOUT_S, &c) else { panic!() };
+    assert_eq!(again, first, "the same entry, not the next one");
+    c.note_sent(&again, t + PENDING_TIMEOUT_S);
+    let notes = script.drain_notes().join("\n");
+    assert!(notes.contains("entry 1 of 3 (defend): sent") && notes.contains("entry 1 of 3 (defend): sent again"), "{notes}");
+    assert_eq!(script.stats().skipped, 0);
+
+    // The first copy was applied after all (a slow server); the duplicate is refused right behind it.
+    let late = t + PENDING_TIMEOUT_S + 0.05;
+    applied(&mut sim, &mut c, first, late);
+    c.on_message(late + 0.01, ServerMsg::BattleRejected { battle_id: Some(BattleId(1)), reason: BattleRejection::GaugeNotFull });
+    assert_eq!(script.next_command(late + 0.02, &c), Next::Wait, "our gauge is spent");
+    let s = script.stats();
+    assert_eq!((s.applied, s.refused, s.skipped, s.unused), (1, 0, 0, 2), "the entry is used up once, and the duplicate's refusal skipped nothing");
+
+    // The next turn gives the NEXT entry, which the server applies normally.
+    let mut t = late + 1.0;
+    sim.until_our_turn(&mut c, &mut t);
+    let Next::Send(second) = script.next_command(t, &c) else { panic!("{:?}", script.drain_notes()) };
+    assert!(matches!(second, BattleCmd::Command { command: Command::Magic { spell: 0, .. }, .. }), "{second:?}");
+    c.note_sent(&second, t);
+    applied(&mut sim, &mut c, second, t);
+    assert_eq!(script.next_command(t + 0.1, &c), Next::Wait);
+    let s = script.stats();
+    assert_eq!((s.applied, s.refused, s.lost, s.unused), (2, 0, 0, 1));
+
+    // Both the answer and the duplicate's refusal between two looks: the entry still counts as applied.
+    let (mut sim, mut c) = script_battle(Scenario::new(), &[ME], &[]);
+    let mut script = BattleScript::new(vec![Defend, Escape]);
+    let Next::Send(first) = script.next_command(1.0, &c) else { panic!() };
+    c.note_sent(&first, 1.0);
+    let Next::Send(_) = script.next_command(1.0 + PENDING_TIMEOUT_S, &c) else { panic!() };
+    applied(&mut sim, &mut c, first, 2.05);
+    c.on_message(2.06, ServerMsg::BattleRejected { battle_id: Some(BattleId(1)), reason: BattleRejection::GaugeNotFull });
+    assert_eq!(script.next_command(2.1, &c), Next::Wait);
+    let s = script.stats();
+    assert_eq!((s.applied, s.refused, s.unused), (1, 0, 1), "applied wins over the refusal that came with it");
+}
+
+#[test]
+fn an_entry_the_server_refuses_is_used_up_and_counted_and_the_script_goes_on() {
+    let (mut sim, mut c) = script_battle(Scenario::new(), &[ME], &[]);
+    let mut script = BattleScript::new(vec![Magic(0), Defend]);
+    let Next::Send(cmd) = script.next_command(1.0, &c) else { panic!() };
+    c.note_sent(&cmd, 1.0);
+    // The server says no (say its MP ran out first): the entry is gone, not retried, and it is noted why.
+    c.on_message(1.1, ServerMsg::BattleRejected { battle_id: Some(BattleId(1)), reason: BattleRejection::NotEnoughMp });
+    let Next::Send(next) = script.next_command(1.2, &c) else { panic!("{:?}", script.drain_notes()) };
+    assert!(matches!(next, BattleCmd::Command { command: Command::Defend, .. }), "{next:?}");
+    let s = script.stats();
+    assert_eq!((s.refused, s.skipped, s.applied, s.unused), (1, 0, 0, 1));
+    let notes = script.drain_notes().join("\n");
+    assert!(notes.contains("entry 1 of 2 (magic:0) was refused by the server") && notes.contains("MP"), "{notes}");
+    c.note_sent(&next, 1.2);
+    applied(&mut sim, &mut c, next, 1.3);
+    assert_eq!(script.next_command(1.4, &c), Next::Done);
+    assert_eq!(script.summary(), "entries=2 applied=1 skipped=0 refused=1 lost=0 unused=0");
+}
+
+#[test]
+fn a_battle_that_ends_before_the_server_answered_resolves_the_entry_and_the_script_goes_on_in_the_next_battle() {
+    let (_sim, mut c) = script_battle(Scenario::new(), &[ME], &[]);
+    let mut script = BattleScript::new(vec![Defend, Defend]);
+    let Next::Send(cmd) = script.next_command(1.0, &c) else { panic!() };
+    c.note_sent(&cmd, 1.0);
+    // The battle ends (the server's word) with no answer to the command: it is lost, never left in flight.
+    c.on_message(1.1, ServerMsg::BattleEnd { battle_id: BattleId(1), outcome: Outcome::Escaped, rewards: vec![] });
+    assert!(!c.in_battle());
+    script.settle(&c);
+    let s = script.stats();
+    assert_eq!((s.lost, s.applied, s.refused, s.unused), (1, 0, 0, 1));
+    assert!(script.drain_notes().join("\n").contains("got no answer before the battle ended"));
+
+    // A second battle: the second entry is the next one.
+    let rules: Arc<dyn BattleRules> = Arc::new(Scenario::new());
+    let mut sim2 = Sim::new(&*rules, 0, &[ME], true);
+    sim2.id = BattleId(2);
+    let mut c2 = client(rules);
+    c2.on_message(0.0, sim2.start());
+    let Next::Send(cmd) = script.next_command(2.0, &c2) else { panic!("{:?}", script.drain_notes()) };
+    assert_eq!(cmd, BattleCmd::Command { battle_id: BattleId(2), actor: ME_AT_0, command: Command::Defend });
+    c2.note_sent(&cmd, 2.0);
+    applied(&mut sim2, &mut c2, cmd, 2.1);
+    assert_eq!(script.next_command(2.2, &c2), Next::Done);
+    assert_eq!(script.summary(), "entries=2 applied=1 skipped=0 refused=0 lost=1 unused=0");
+
+    // An applied command that ended the battle (a limit that wins it) counts as applied, not lost.
+    let (mut sim, mut c) = script_battle(Scenario { limit: Some(Scenario::braver()), enemy_hp: 100, ..Scenario::new() }, &[ME], &[255]);
+    let mut script = BattleScript::new(vec![Limit]);
+    let Next::Send(cmd) = script.next_command(1.0, &c) else { panic!() };
+    c.note_sent(&cmd, 1.0);
+    applied(&mut sim, &mut c, cmd, 1.1);
+    c.on_message(1.2, sim.end(&[]));
+    assert!(!c.in_battle());
+    assert_eq!(script.next_command(1.3, &c), Next::Done);
+    let s = script.stats();
+    assert_eq!((s.applied, s.lost, s.unused), (1, 0, 0), "{}", script.summary());
+}
+
+#[test]
+fn the_headless_bot_gives_its_script_in_order_then_plays_as_usual() {
+    use crate::party::PartyMirror;
+    // Braver with a full gauge, Cure and a Potion in the bag; a tough dummy that keeps the battle going.
+    let (mut sim, mut c) = script_battle(Scenario { limit: Some(Scenario::braver()), enemy_hp: 5_000, ..Scenario::new() }, &[ME], &[255]);
+    let mut bot = BattleBot::new(true, false, 1).with_script(vec![Defend, Magic(0), Item(0), Limit]);
+    assert_eq!(bot.script_steps().len(), 4);
+    let party = PartyMirror::new(ME);
+    let mut t = 1.0;
+    let mut sent = Vec::new();
+    for _ in 0..7 {
+        let cmds = bot.step(t, &c, &party);
+        assert!(cmds.len() <= 1);
+        let Some(cmd) = cmds.into_iter().next() else {
+            sim.until_our_turn(&mut c, &mut t);
+            continue;
+        };
+        let BattleCmd::Command { command, .. } = cmd else { panic!("{cmd:?}") };
+        sent.push(command);
+        send(&mut sim, &mut c, cmd, t);
+        t += 0.5;
+        sim.until_our_turn(&mut c, &mut t);
+    }
+    let me = ME_AT_0;
+    assert_eq!(
+        sent[..4],
+        [Command::Defend, Command::Magic { spell: 0, target: me }, Command::Item { item: 0, target: me }, Command::Limit { target: THE_DUMMY }],
+        "{sent:?}"
+    );
+    assert!(sent[4..].iter().all(|c| matches!(c, Command::Attack { .. })), "then the usual rule: the limit gauge is empty, so it attacks: {sent:?}");
+    assert!(sent.len() >= 6, "{sent:?}");
+    assert_eq!(bot.script_summary(&c).as_deref(), Some("entries=4 applied=4 skipped=0 refused=0 lost=0 unused=0"));
+    let notes = bot.drain_script_notes().join("\n");
+    assert!(notes.contains("entry 4 of 4 (limit): sent, aimed at actor 1"), "{notes}");
+    no_divergence(&mut c, "the scripted bot");
+
+    // Without a script, or with an empty one, nothing changes: no steps, no summary.
+    let mut plain = BattleBot::new(true, false, 1).with_script(Vec::new());
+    assert!(plain.script_steps().is_empty() && plain.script_summary(&c).is_none() && plain.drain_script_notes().is_empty());
+}

@@ -5,7 +5,10 @@
 //! `BattleClient::bot_command`: when its character's HP is under 30% of the maximum and it knows a
 //! restoring spell it can pay for, it casts the cheapest one on itself; otherwise, when its limit gauge is
 //! full (protocol v7), it gives its limit break (a damaging one on the first living enemy, a healing one
-//! on a wounded ally); otherwise it attacks the first living enemy. It never escapes. With
+//! on a wounded ally); otherwise it attacks the first living enemy. It never escapes, unless a script
+//! tells it to: with `--battle-script` (see `script`) it first gives the commands of that script, in
+//! order, one per full gauge (Defend, Magic, Item, Limit and Escape included), and only when the script is
+//! used up does the rule above take over. With
 //! `--debug-encounters` it also asks the server for a debug encounter,
 //! ONCE: when the session has been up for a moment and, with `--battle-wait-party N`, only when
 //! our party has N members and we lead it (so one request starts one battle for everyone). A
@@ -13,7 +16,8 @@
 //! mirror and never retried: the bot just plays whatever battles come (random encounters), and
 //! the SMOKE line says `battles=0` when none did.
 
-use super::{BattleClient, BattleCmd};
+use super::script::{BattleScript, Next};
+use super::{BattleClient, BattleCmd, ScriptStep};
 use crate::party::PartyMirror;
 
 /// The request is not sent before the session has been running for this long (seconds), so the
@@ -31,18 +35,44 @@ pub struct BattleBot {
     wait_party: usize,
     requested: bool,
     first_seen: Option<f64>,
+    /// `--battle-script`: the commands to give first, in order (`None`: no script).
+    script: Option<BattleScript>,
 }
 
 impl BattleBot {
     /// `auto`: play battles (`--battle-auto`). `request`: also ask for a debug encounter
     /// (`--debug-encounters`). `wait_party`: see the module docs (`1`: do not wait).
     pub fn new(auto: bool, request: bool, wait_party: usize) -> Self {
-        Self { auto, request: auto && request, wait_party: wait_party.max(1), requested: false, first_seen: None }
+        Self { auto, request: auto && request, wait_party: wait_party.max(1), requested: false, first_seen: None, script: None }
+    }
+
+    /// The same bot, giving the commands of `steps` first (`--battle-script`; an empty list is no script).
+    pub fn with_script(mut self, steps: Vec<ScriptStep>) -> Self {
+        self.script = (!steps.is_empty()).then(|| BattleScript::new(steps));
+        self
     }
 
     /// Whether the bot plays battles at all.
     pub fn is_active(&self) -> bool {
         self.auto
+    }
+
+    /// The script's entries, in order (empty without a script).
+    pub fn script_steps(&self) -> &[ScriptStep] {
+        self.script.as_ref().map_or(&[], BattleScript::steps)
+    }
+
+    /// What the script noted since the last call (sends, skips, refusals), oldest first.
+    pub fn drain_script_notes(&mut self) -> Vec<String> {
+        self.script.as_mut().map_or_else(Vec::new, BattleScript::drain_notes)
+    }
+
+    /// The script's closing summary (`entries=N applied=N skipped=N refused=N lost=N unused=N`) after it has
+    /// settled whatever `battles` has answered since; `None` without a script.
+    pub fn script_summary(&mut self, battles: &BattleClient) -> Option<String> {
+        let script = self.script.as_mut()?;
+        script.settle(battles);
+        Some(script.summary())
     }
 
     /// Whether the one request was sent.
@@ -57,7 +87,19 @@ impl BattleBot {
             return Vec::new();
         }
         let first = *self.first_seen.get_or_insert(now);
+        // What the server answered since the last call settles the script's command in flight, in a battle or
+        // (a command that ended it) just after one.
+        if let Some(script) = self.script.as_mut() {
+            script.settle(battles);
+        }
         if battles.in_battle() {
+            if let Some(script) = self.script.as_mut() {
+                match script.next_command(now, battles) {
+                    Next::Send(cmd) => return vec![cmd],
+                    Next::Wait => return Vec::new(),
+                    Next::Done => {}
+                }
+            }
             return battles.bot_command(now).into_iter().collect();
         }
         if !self.request || self.requested || now - first < REQUEST_DELAY_S {

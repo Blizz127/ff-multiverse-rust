@@ -278,6 +278,42 @@ fn without_the_debug_flag_a_battle_bot_never_asks_for_a_battle() {
     assert_eq!(report.count(|m| matches!(m, ClientMsg::RequestEncounter { .. } | ClientMsg::BattleCommand { .. })), 0);
 }
 
+/// `--battle-script` through the real binary: it is announced, a machine without battle data cannot replay the battle and so
+/// sends no command at all (nothing to decide with), and the closing line says every entry was left unused. (That the
+/// script really fires Defend, Item, Magic, Limit and Escape over real processes is `scripts/battle-smoke.sh --commands`.)
+#[test]
+fn a_battle_script_is_announced_and_reported_and_a_bot_that_cannot_replay_the_battle_sends_none_of_it() {
+    let state = tempfile::tempdir().unwrap();
+    let (port, server) = spawn_fake(OnRequest::FightFor(Duration::from_millis(1000)));
+    let args = ["--duration", "4", "--bot", "idle", "--battle-auto", "--debug-encounters", "--battle-script", "defend,item:0,limit"];
+    let out = run_client(port, &args, state.path());
+    let report = server.join().expect("fake server");
+    let (stdout, stderr) = (stdout_line(&out), String::from_utf8_lossy(&out.stderr).into_owned());
+    assert!(out.status.success(), "{:?}\n{stderr}", out.status);
+    assert!(stdout.ends_with(" battles=1 victories=1 area_changes=0 level=0 exp=0 items=0"), "the SMOKE line is the same: {stdout}");
+    assert!(stderr.contains("headless: battle script given: 3 entries, used first, one per full gauge: defend,item:0,limit"), "{stderr}");
+    assert!(stderr.contains("escape only where the script says so"), "{stderr}");
+    assert!(stderr.contains("headless: battle script: entries=3 applied=0 skipped=0 refused=0 lost=0 unused=3"), "{stderr}");
+    assert_eq!(report.count(|m| matches!(m, ClientMsg::BattleCommand { .. })), 0, "no replay, no decision");
+
+    // Without a script the closing line is not printed and the start-up line still says the bot never escapes.
+    let state = tempfile::tempdir().unwrap();
+    let (port, server) = spawn_fake(OnRequest::Refuse);
+    let out = run_client(port, &["--duration", "2", "--bot", "idle", "--battle-auto", "--debug-encounters"], state.path());
+    server.join().expect("fake server");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "{stderr}");
+    assert!(stderr.contains("never escape;") && !stderr.contains("battle script"), "{stderr}");
+
+    // A script is a bot's flag and is checked before anything runs: a usage error (exit code 2).
+    for bad in [&["--battle-script", "defend"][..], &["--battle-auto", "--battle-script", "run"], &["--battle-auto", "--battle-script", "magic"]] {
+        let state = tempfile::tempdir().unwrap();
+        let out = run_client(1, bad, state.path());
+        assert_eq!(out.status.code(), Some(2), "{bad:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(out.stdout.is_empty(), "{bad:?}");
+    }
+}
+
 #[test]
 fn a_battle_freezes_the_player_and_play_goes_on_after_it() {
     let state = tempfile::tempdir().unwrap();
