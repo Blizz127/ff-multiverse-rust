@@ -11,10 +11,23 @@
 //! * [`BattleClient`] is the mirror of the whole battle situation (no active battle, or one), fed
 //!   by the four battle messages ([`BattleClient::on_message`]); it counts battles entered,
 //!   victories, defeats, divergences and refusals, and says what happened as one-line notes.
-//! * [`BattleView`] / [`battle_vertices`] draw the battle as flat coloured rectangles (the window),
-//!   [`draw_battle_text`] adds names, HP numbers and the turn hint in the UI font over them.
+//! * [`BattleView`] is what the screen shows, as plain data: the fighters ([`Bar`]), the replay's
+//!   standing, and the live parts of the battle UI (the command menu of our turn, the floating
+//!   numbers, the action banner, the victory or defeat panel). [`draw_battle_overlay`] draws all of
+//!   it in FF7-style blue windows (`panels`): enemy list, party panel with HP/MP/ATB, our menu with
+//!   its Magic and Item lists and the target pointer, the numbers over the fighters, the banner and
+//!   the end panel. Without a 3D scene, [`battle_vertices`] draws the fighters as flat tokens and
+//!   [`draw_battle_text`] is the overlay over them; a scene gives its own [`Anchors`] instead.
+//! * The command menu is a pure state machine (`menu`); [`BattleClient::menu_key`] feeds it the
+//!   player's keys and answers with the request to send ([`MenuReply`]). Its model (spells, items,
+//!   Defend) is filled by the integrator from the engine ([`BattleClient::menu_model_mut`]); empty,
+//!   only Attack works and the rest is greyed out. `hud` keeps what the battle itself does not:
+//!   the menu, the floating numbers, the banner and the LINGER: for a few seconds after
+//!   `BattleEnd` ([`BattleClient::lingering`]) [`BattleClient::view`] still returns the last view
+//!   with its panel, while [`BattleClient::in_battle`] is already false (the server freed us).
 //! * [`BattleBot`] is the headless `--battle-auto` player.
-//! * [`open_rules`] reads this machine's battle data (the same library set as the field archive).
+//! * [`open_rules`] reads this machine's battle data (the same library set as the field archive);
+//!   [`open_names`] reads the spell, item and enemy attack names the windows show from the same files.
 //!
 //! While a battle runs the player is frozen in the field: loops neither walk nor send movement.
 //! The mirror advances ONLY with server messages (so it can never run ahead of the server); the
@@ -29,6 +42,8 @@ mod menu;
 mod names;
 mod panels;
 mod popups;
+#[cfg(test)]
+mod glue_tests;
 #[cfg(test)]
 mod shots;
 mod text;
@@ -55,13 +70,13 @@ pub use view::{flat_anchors, Anchors};
 
 use fmv_core::{AccountId, Fingerprint};
 use fmv_ff7_battle::rules::{Combatant, GAUGE_MAX};
-use hud::BattleHud;
-use menu::{Choice, Reply};
-use panels::RewardLine;
 use fmv_protocol::battle::{BattleEvent, Command, Outcome};
 use fmv_protocol::{
     ActorId, AppliedCommand, BattleId, BattleRejection, BattleReplay, BattleReward, BattleRules, BattleSetup, ClientMsg, ServerMsg,
 };
+use hud::BattleHud;
+use menu::{Choice, Reply};
+use panels::RewardLine;
 use std::collections::VecDeque;
 use std::sync::{Arc, OnceLock};
 
