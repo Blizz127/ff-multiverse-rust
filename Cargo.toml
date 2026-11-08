@@ -32,6 +32,10 @@ pollster = "1"
 dirs = "7"
 hex = "0.4"
 tempfile = "3"
+# Display-name policy in fmv-core (NFC/NFKC normalization and Unicode script data). ICU4X's
+# normalizer is used without its default features: they only add UTF-16 helpers.
+icu_normalizer = { version = "2", default-features = false, features = ["compiled_data"] }
+unicode-script = "0.5"
 
 [profile.dev]
 opt-level = 1

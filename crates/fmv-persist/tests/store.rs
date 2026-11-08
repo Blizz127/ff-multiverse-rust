@@ -1,89 +1,18 @@
 //! Behavior of the store through its public API and on-disk layout.
 
-use std::collections::BTreeMap;
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use common::*;
 use fmv_core::{AccountId, AvatarAppearance, GameId};
 use fmv_persist::{
-    restore_snapshot, AvatarId, PersistError, Progression, Store, MAX_BLOB_BYTES, MAX_RECORD_BYTES,
-    SCHEMA_VERSION,
+    restore_snapshot, AvatarId, PersistError, Progression, Store, INDEX_LOG_VERSION,
+    MAX_BLOB_BYTES, MAX_RECORD_BYTES, SCHEMA_VERSION,
 };
 use serde_json::{json, Value};
-
-const NOW: u64 = 1_700_000_000;
-
-// ---- helpers -----------------------------------------------------------------------------
-
-/// A fresh state dir that does not exist yet (`open` must create it).
-fn fresh_root() -> (tempfile::TempDir, PathBuf) {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("state");
-    (dir, root)
-}
-
-fn open(root: &Path) -> Store {
-    Store::open(root).unwrap_or_else(|e| panic!("open {}: {e}", root.display()))
-}
-
-/// Every file under `root` as relative path -> bytes. `LOCK` is excluded.
-fn file_map(root: &Path) -> BTreeMap<String, Vec<u8>> {
-    fn walk(base: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
-        for entry in fs::read_dir(dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                walk(base, &path, out);
-            } else {
-                let rel = path
-                    .strip_prefix(base)
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned();
-                if rel != "LOCK" {
-                    out.insert(rel, fs::read(&path).unwrap());
-                }
-            }
-        }
-    }
-    let mut out = BTreeMap::new();
-    walk(root, root, &mut out);
-    out
-}
-
-fn has_temp_files(root: &Path) -> Vec<String> {
-    file_map(root)
-        .keys()
-        .filter(|k| {
-            k.rsplit('/')
-                .next()
-                .is_some_and(|n| n.starts_with('.') && n.contains(".tmp-"))
-        })
-        .cloned()
-        .collect()
-}
-
-fn read_json(path: &Path) -> Value {
-    serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
-}
-
-fn write_json(path: &Path, value: &Value) {
-    fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
-}
-
-fn account_file(root: &Path, id: AccountId) -> PathBuf {
-    root.join("accounts").join(format!("{}.json", id.0))
-}
-
-fn avatar_file(root: &Path, id: AvatarId) -> PathBuf {
-    root.join("avatars").join(format!("{}.json", id.0))
-}
-
-fn progression_file(root: &Path, id: AccountId, game: &str) -> PathBuf {
-    root.join("progression")
-        .join(id.0.to_string())
-        .join(format!("{game}.json"))
-}
 
 // ---- accounts ----------------------------------------------------------------------------
 
@@ -129,7 +58,15 @@ fn create_account_and_authenticate_roundtrip() {
     let account = read_json(&account_file(&root, cloud));
     assert_eq!(account["token_hash"], hash.as_str());
     assert_eq!(account["schema_version"], SCHEMA_VERSION);
-    assert_eq!(read_json(&root.join("index.json"))["tokens"][&hash], 1);
+    let entries = log_lines(&root);
+    let committed = entries
+        .iter()
+        .find(|e| e["op"] == "account" && e["id"] == 1)
+        .expect("the registration is one entry of index.log");
+    assert_eq!(
+        (committed["token"].as_str(), committed["name"].as_str()),
+        (Some(hash.as_str()), Some("Cloud"))
+    );
 
     // It all survives a restart.
     drop(store);
@@ -717,7 +654,7 @@ fn crash_between_record_and_index_leaves_an_ignorable_orphan() {
         store
             .open_warnings()
             .iter()
-            .any(|w| w.contains("not referenced by index.json")),
+            .any(|w| w.contains("not referenced by the index")),
         "{:?}",
         store.open_warnings()
     );
@@ -754,17 +691,19 @@ fn records_without_an_index_are_refused_not_overwritten() {
     let (id, token) = store.create_account("Alpha", NOW).unwrap();
     drop(store);
 
-    let index = fs::read(root.join("index.json")).unwrap();
-    fs::remove_file(root.join("index.json")).unwrap();
+    let index = fs::read(index_log(&root)).unwrap();
+    fs::remove_file(index_log(&root)).unwrap();
+    // The marker file is still there, but it is not an index.
+    assert!(root.join("index.json").exists());
     assert!(matches!(
         Store::open(&root),
         Err(PersistError::IndexMissing { .. })
     ));
     // The refusal released the lock and changed nothing.
     assert!(!root.join("LOCK").exists());
-    assert!(!root.join("index.json").exists());
+    assert!(!index_log(&root).exists());
 
-    fs::write(root.join("index.json"), index).unwrap();
+    fs::write(index_log(&root), index).unwrap();
     let store = open(&root);
     assert_eq!(store.authenticate(&token).unwrap(), id);
 }
@@ -775,15 +714,18 @@ fn an_empty_or_new_directory_initializes_cleanly() {
     fs::create_dir_all(root.join("accounts")).unwrap();
     let store = open(&root);
     assert!(store.open_warnings().is_empty());
-    let index = read_json(&root.join("index.json"));
-    assert_eq!(index["schema_version"], SCHEMA_VERSION);
-    assert_eq!(
-        (
-            index["next_account_id"].as_u64(),
-            index["next_avatar_id"].as_u64()
-        ),
-        (Some(1), Some(1))
-    );
+    // The log is just its header, and `index.json` is the format marker: it says version 2, so
+    // a build that only knows the old single-file index refuses the directory instead of
+    // misreading it.
+    let lines = log_lines(&root);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["schema_version"], INDEX_LOG_VERSION);
+    assert_eq!(lines[0]["kind"], "fmv-index-log");
+    let marker = read_json(&root.join("index.json"));
+    assert_eq!(marker["schema_version"], INDEX_LOG_VERSION);
+    assert_eq!(marker["index"], "index.log");
+    assert_eq!(store.account_count(), 0);
+    assert_eq!(store.create_account("First", NOW).unwrap().0, AccountId(1));
 }
 
 #[cfg(unix)]
@@ -960,20 +902,23 @@ fn future_and_zero_schema_versions_are_rejected_for_every_record_kind() {
     drop(kinds);
     let store = Arc::try_unwrap(store).expect("kinds were dropped, store is unique");
     drop(store);
-    let index_path = root.join("index.json");
-    let index_original = fs::read(&index_path).unwrap();
-    for future in [2u64, u64::from(u32::MAX)] {
-        set_schema(&index_path, Some(json!(future)));
-        assert!(matches!(
-            Store::open(&root),
-            Err(PersistError::FutureSchema { .. })
-        ));
+    // The index version lives in the header of index.log.
+    let log_original = fs::read(index_log(&root)).unwrap();
+    let newer = u64::from(INDEX_LOG_VERSION) + 1;
+    for future in [newer, u64::from(u32::MAX)] {
+        set_log_schema(&root, Some(json!(future)));
+        match Store::open(&root) {
+            Err(PersistError::FutureSchema {
+                found, supported, ..
+            }) => assert_eq!((u64::from(found), supported), (future, INDEX_LOG_VERSION)),
+            other => panic!("index.log v{future}: expected FutureSchema, got {other:?}"),
+        }
         assert!(
             !root.join("LOCK").exists(),
             "failed open must release the lock"
         );
     }
-    set_schema(&index_path, Some(json!(0)));
+    set_log_schema(&root, Some(json!(0)));
     assert!(matches!(
         Store::open(&root),
         Err(PersistError::InvalidSchema { .. })
@@ -985,13 +930,38 @@ fn future_and_zero_schema_versions_are_rejected_for_every_record_kind() {
         Some(json!(-3)),
         Some(json!(1u64 << 40)),
     ] {
-        set_schema(&index_path, value);
+        set_log_schema(&root, value);
         assert!(matches!(
             Store::open(&root),
             Err(PersistError::Corrupt { .. })
         ));
     }
-    fs::write(&index_path, index_original).unwrap();
+    fs::write(index_log(&root), log_original).unwrap();
+    open(&root);
+
+    // The index.json marker carries a version too: one from a newer build is refused, not
+    // overwritten.
+    let marker_path = root.join("index.json");
+    let marker_original = fs::read(&marker_path).unwrap();
+    for future in [newer, u64::from(u32::MAX)] {
+        set_schema(&marker_path, Some(json!(future)));
+        assert!(matches!(
+            Store::open(&root),
+            Err(PersistError::FutureSchema { .. })
+        ));
+        assert!(!root.join("LOCK").exists());
+    }
+    set_schema(&marker_path, Some(json!(0)));
+    assert!(matches!(
+        Store::open(&root),
+        Err(PersistError::InvalidSchema { .. })
+    ));
+    assert_eq!(
+        read_json(&marker_path)["schema_version"],
+        0,
+        "a refused open must not rewrite the file"
+    );
+    fs::write(&marker_path, marker_original).unwrap();
     open(&root);
 }
 
@@ -1063,28 +1033,97 @@ fn corrupt_files_are_errors_never_panics() {
     // The index gets the same treatment at open.
     drop(kinds);
     drop(Arc::try_unwrap(store).expect("unique"));
-    let index_path = root.join("index.json");
-    let original = fs::read(&index_path).unwrap();
+    //
+    // Damage is an error, never a panic and never a guess. The one shape that is tolerated is
+    // a torn *final* entry (see tests/registry.rs); damage with entries after it is corruption.
+    let original = fs::read(index_log(&root)).unwrap();
+    let flip_in_line = |line: usize| {
+        let mut bytes = original.clone();
+        let start: usize = original
+            .split_inclusive(|&b| b == b'\n')
+            .take(line)
+            .map(<[u8]>::len)
+            .sum();
+        bytes[start + 20] ^= 0x01;
+        bytes
+    };
+    let (t1, t2) = (hash_of("t1"), hash_of("t2"));
     let mut bad: Vec<(&str, Vec<u8>)> = vec![
         ("empty", Vec::new()),
         ("garbage", b"\x00\x01garbage".to_vec()),
-        ("truncated", original[..original.len() / 2].to_vec()),
+        (
+            "header without a checksum",
+            b"{\"schema_version\":2,\"kind\":\"fmv-index-log\"}\n".to_vec(),
+        ),
         ("nested", nested.into_bytes()),
-        ("maps not objects", br#"{"schema_version":1,"next_account_id":1,"next_avatar_id":1,"names":[1],"tokens":7}"#.to_vec()),
-        ("ids not numbers", br#"{"schema_version":1,"next_account_id":"a","next_avatar_id":1}"#.to_vec()),
-        ("next ids zero", br#"{"schema_version":1,"next_account_id":0,"next_avatar_id":0}"#.to_vec()),
-        ("token to nowhere", br#"{"schema_version":1,"next_account_id":2,"next_avatar_id":1,"tokens":{"00":1}}"#.to_vec()),
+        ("bit flip in the header", flip_in_line(0)),
+        (
+            "bit flip in an entry that is followed by more",
+            flip_in_line(1),
+        ),
+        (
+            "claim for nobody",
+            log_text(&[json!({"op": "claim", "account": 9})]).into_bytes(),
+        ),
+        (
+            "release of nobody",
+            log_text(&[json!({"op": "release", "account": 9})]).into_bytes(),
+        ),
+        (
+            "avatar for nobody",
+            log_text(&[json!({"op": "avatar", "account": 9, "avatar": 1})]).into_bytes(),
+        ),
+        (
+            "unknown op",
+            log_text(&[json!({"op": "explode"})]).into_bytes(),
+        ),
+        (
+            "unknown field",
+            log_text(&[json!({"op": "claim", "account": 1, "extra": true})]).into_bytes(),
+        ),
+        (
+            "next ids zero",
+            log_text(&[json!({"op": "next", "account": 0, "avatar": 0})]).into_bytes(),
+        ),
+        (
+            "account id zero",
+            log_text(&[account_entry(0, "A", &t1)]).into_bytes(),
+        ),
+        (
+            "ids that go backwards",
+            log_text(&[account_entry(5, "A", &t1), account_entry(3, "B", &t2)]).into_bytes(),
+        ),
+        (
+            "an id used twice",
+            log_text(&[account_entry(1, "A", &t1), account_entry(1, "B", &t2)]).into_bytes(),
+        ),
+        (
+            "one token for two accounts",
+            log_text(&[account_entry(1, "A", &t1), account_entry(2, "B", &t1)]).into_bytes(),
+        ),
+        (
+            "token that is not hex",
+            log_text(&[account_entry(1, "A", &"zz".repeat(32))]).into_bytes(),
+        ),
+        (
+            "token in capitals",
+            log_text(&[account_entry(1, "A", &t1.to_uppercase())]).into_bytes(),
+        ),
+        (
+            "name with nothing visible",
+            log_text(&[account_entry(1, "\u{3164}", &t1)]).into_bytes(),
+        ),
     ];
     bad.push(("oversized", vec![b' '; 17 * 1024 * 1024]));
     for (label, bytes) in bad {
-        fs::write(&index_path, bytes).unwrap();
+        fs::write(index_log(&root), bytes).unwrap();
         assert!(Store::open(&root).is_err(), "index / {label}");
         assert!(
             !root.join("LOCK").exists(),
             "index / {label}: lock must be released"
         );
     }
-    fs::write(&index_path, original).unwrap();
+    fs::write(index_log(&root), original).unwrap();
     open(&root);
 }
 
@@ -1261,7 +1300,7 @@ fn snapshot_destination_rules() {
     // A snapshot cut short has records but no index: it cannot be opened or restored.
     let cut = guard.path().join("cut");
     store.snapshot(&cut).unwrap();
-    fs::remove_file(cut.join("index.json")).unwrap();
+    fs::remove_file(cut.join("index.log")).unwrap();
     assert!(matches!(
         Store::open(&cut),
         Err(PersistError::IndexMissing { .. })
@@ -1284,12 +1323,12 @@ fn snapshot_destination_rules() {
         restore_snapshot(&good, &busy),
         Err(PersistError::Snapshot(_))
     ));
-    set_schema(&good.join("index.json"), Some(json!(2)));
+    set_log_schema(&good, Some(json!(u64::from(INDEX_LOG_VERSION) + 1)));
     assert!(matches!(
         restore_snapshot(&good, guard.path().join("from-good")),
         Err(PersistError::FutureSchema { .. })
     ));
-    assert!(!guard.path().join("from-good").join("index.json").exists());
+    assert!(!guard.path().join("from-good").join("index.log").exists());
 }
 
 #[test]
@@ -1436,12 +1475,15 @@ mod lock {
         fs::read_to_string(root.join("LOCK")).unwrap()
     }
 
-    /// True once the child server's account has been committed to the index.
+    /// True once the child server's account has been committed to the index: a complete
+    /// (newline-terminated) entry of index.log names it.
     fn child_account_committed(root: &Path) -> bool {
-        fs::read(root.join("index.json"))
+        fs::read_to_string(index_log(root))
             .ok()
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-            .is_some_and(|index| index["names"]["child-made"] == 1)
+            .is_some_and(|text| {
+                text.split_inclusive('\n')
+                    .any(|line| line.ends_with('\n') && line.contains("\"name\":\"child-made\""))
+            })
     }
 
     fn lock_pid(root: &Path) -> Option<u32> {
@@ -1735,13 +1777,82 @@ mod lock {
         assert_eq!(lock_pid(&root), Some(std::process::id()));
     }
 
+    /// A pid is only meaningful inside its own PID namespace. A second server in another
+    /// container that shares the state directory cannot see the owner's pid, so it used to judge
+    /// a live owner dead and take the directory over: two writers. The owner also holds an
+    /// `flock` on the LOCK file for as long as it lives, and a takeover needs that lock to be
+    /// free. (The other namespace is simulated by a LOCK file that names a pid that does not
+    /// exist here, which is what an invisible owner looks like.)
+    #[test]
+    fn a_live_owner_whose_pid_is_not_visible_is_not_taken_over() {
+        let (_guard, root) = fresh_root();
+        let exe = std::env::current_exe().unwrap();
+        let mut server = KillOnDrop(
+            Command::new(exe)
+                .args([
+                    "--exact",
+                    "lock::zz_hold_store_open_until_killed",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env("FMV_PERSIST_TEST_HOLD", &root)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn server process"),
+        );
+        let server_pid = server.0.id();
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while !(lock_pid(&root) == Some(server_pid) && child_account_committed(&root)) {
+            assert!(
+                server.0.try_wait().unwrap().is_none(),
+                "child server exited early"
+            );
+            assert!(Instant::now() < deadline, "child server never became ready");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // As seen from another PID namespace: the LOCK names a pid nobody here has.
+        let invisible = impossible_pid();
+        fs::write(root.join("LOCK"), format!("{invisible}\n")).unwrap();
+        match Store::open(&root) {
+            Err(PersistError::Locked { pid, detail, .. }) => {
+                assert_eq!(pid, invisible);
+                assert!(detail.contains("flock"), "{detail}");
+            }
+            other => panic!("a live owner must not be taken over, got {other:?}"),
+        }
+        // Nothing was taken over, removed or rewritten, and the owner is untouched.
+        assert_eq!(lock_pid(&root), Some(invisible));
+        assert!(server.0.try_wait().unwrap().is_none());
+        assert!(child_account_committed(&root));
+
+        // When the owner dies its flock goes with it, whatever the pid says: now the takeover
+        // is allowed, with the usual warning, and the owner's data is intact.
+        server.0.kill().unwrap();
+        server.0.wait().unwrap();
+        let store = open(&root);
+        assert!(has_takeover_warning(&store), "{:?}", store.open_warnings());
+        assert_eq!(store.find_account_by_name("child-made"), Some(AccountId(1)));
+        assert_eq!(lock_pid(&root), Some(std::process::id()));
+    }
+
     #[test]
     fn a_failed_open_does_not_leave_the_lock_behind() {
         let (_guard, root) = prepared_dir();
+        // A damaged old-format index...
         fs::write(root.join("index.json"), b"{ definitely not json").unwrap();
         assert!(Store::open(&root).is_err());
         assert!(!root.join("LOCK").exists());
         fs::write(root.join("index.json"), b"").unwrap();
+        assert!(Store::open(&root).is_err());
+        assert!(!root.join("LOCK").exists());
+        // ...and a damaged log.
+        fs::remove_file(root.join("index.json")).unwrap();
+        fs::write(index_log(&root), b"{ definitely not an index log").unwrap();
+        assert!(Store::open(&root).is_err());
+        assert!(!root.join("LOCK").exists());
+        fs::write(index_log(&root), b"").unwrap();
         assert!(Store::open(&root).is_err());
         assert!(!root.join("LOCK").exists());
     }
