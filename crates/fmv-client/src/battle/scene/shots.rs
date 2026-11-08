@@ -320,6 +320,42 @@ fn open_real() -> Option<Real> {
     None
 }
 
+/// The path the window takes to its models, with nothing but the environment's source: `open_ff7`
+/// resolves `char.lgp` and `battle.lgp` from the same library set (or install) as the field archive and
+/// remembers them, `ModelKit::from_local_content` (what `scene_for` makes the window's kit with) opens
+/// them. No GPU needed.
+#[test]
+#[ignore = "needs the owner's real FF7 data (FMV_FF7_DATA or FMV_FF7_LIBRARY)"]
+fn real_window_path_finds_the_battle_archive_through_open_ff7() {
+    let source = if let Some(dir) = std::env::var_os("FMV_FF7_LIBRARY") {
+        crate::ff7::Ff7Source::Library { state_dir: Some(dir.into()), set: None }
+    } else if let Some(dir) = std::env::var_os("FMV_FF7_DATA") {
+        crate::ff7::Ff7Source::Flevel { path: PathBuf::from(dir).join("field").join("flevel.lgp"), labels: crate::ff7::Ff7Labels::default() }
+    } else {
+        eprintln!("skipped: neither FMV_FF7_DATA nor FMV_FF7_LIBRARY is set");
+        return;
+    };
+    crate::ff7::open_ff7(&source).expect("the FF7 data opens");
+    let mut kit = ModelKit::from_local_content();
+    let resolve = |kit: &mut ModelKit, model: BattleActorModel| kit.rigs.resolve(&model, BoxSpec::for_party(0));
+    // an enemy by its id: the MP of the formation, with its baton
+    let mp = kit.source.enemy(&EnemyLook { actor: ActorId(3), enemy_id: Some(16), name: "MP".into(), max_hp: 30, level: 2 });
+    let rig = resolve(&mut kit, mp);
+    eprintln!("MP: scale {}, height {:.0}, {} attachment(s)", rig.scale, rig.height, rig.attachments.len());
+    assert!(rig.scale == 1.0 && rig.attachments.len() == 1 && (700.0..900.0).contains(&rig.height), "the real MP");
+    // a party member by the engine's character id, and by the player's look over it
+    for (character, look, height) in [(0u8, None, 862.0), (2, None, 837.0), (1, None, 919.0), (5, Some("ff7/tifa"), 837.0)] {
+        let model = kit.source.party_member(&PartyLook { actor: ActorId(0), character, look: look.map(str::to_string), mine: true });
+        let rig = resolve(&mut kit, model);
+        assert!(rig.scale == 1.0 && rig.attachments.len() == 1, "character {character} is a real battle model with its weapon");
+        assert!((rig.height - height).abs() < 5.0, "character {character}: {}", rig.height);
+    }
+    // the location of formation 301, and none for the 'no location' code
+    let arena = kit.source.location(9).expect("battle location 9 is a model");
+    assert!(kit.rigs.resolve_optional(&arena).is_some());
+    assert!(kit.source.location(0xFFFF).is_none());
+}
+
 /// The debug formation (301: `md1stin`'s) from the owner's own data, as the window shows it: a real
 /// `BattleClient` replays a real engine, the scene is made from what the client hands it, and the
 /// frames go through the renderer. Writes the PNGs and checks the composition.
@@ -361,8 +397,10 @@ fn offscreen_real_ff7_battle_formation() {
     let looks = [None, None, None];
     let mut scene = BattleScene::new(&start, client.engine(), &looks, &mut kit).expect("a scene");
     if real.battle_lgp.is_some() {
-        // Who is a real battle model: scale 1 (battle units), a heads-and-shoulders taller than the
-        // old stand-ins' boxes or field models, enemies carrying their weapons, and the location.
+        // Who is a real battle model: scale 1 (battle units, which a field stand-in at scale 36 is not;
+        // a box is 1 too), the party carrying its weapons, the location. For the default formation
+        // (the MPs) every actor also stands at a person's height and plays the archive's own idle
+        // loop; other formations have bosses, one-frame idles and the like, which these do not hold for.
         for (i, actor) in scene.actors.iter().enumerate() {
             let r = &actor.rig;
             eprintln!(
@@ -374,13 +412,22 @@ fn offscreen_real_ff7_battle_formation() {
                 r.attachments.len(),
                 if r.procedural_idle { "swayed (a still pose)" } else { "plays the clip" }
             );
-            assert_eq!(r.scale, 1.0, "actor {i} is a battle model in battle units, not a stand-in");
-            assert!(r.height > 600.0 && r.height < 1300.0, "actor {i}: {}", r.height);
-            assert!(!r.procedural_idle, "actor {i}'s idle loop is the archive's clip");
+            assert_eq!(r.scale, 1.0, "actor {i} is in battle units, not a field stand-in");
+            if actor.side == Side::Party {
+                assert_eq!(r.attachments.len(), 1, "party member {i} carries its weapon");
+            }
+            if formation_id == 301 {
+                assert!(r.height > 600.0 && r.height < 1300.0, "actor {i}: {}", r.height);
+                assert!(!r.procedural_idle, "actor {i}'s idle loop is the archive's clip");
+            }
         }
-        let weapons = scene.actors.iter().filter(|a| !a.rig.attachments.is_empty()).count();
-        assert!(weapons >= 1, "somebody carries a weapon (the party's swords and guns, the MP's baton)");
-        assert!(scene.location.is_some(), "the formation's battle location is the real model");
+        if formation_id == 301 {
+            let armed_enemies = scene.actors.iter().filter(|a| a.side == Side::Enemy && !a.rig.attachments.is_empty()).count();
+            assert_eq!(armed_enemies, 2, "both MPs carry their batons");
+        }
+        if placement.location <= 89 {
+            assert!(scene.location.is_some(), "the formation's battle location {} is the real model", placement.location);
+        }
     }
     let battle_view = |client: &BattleClient, now: f64| client.view(now).expect("a view");
 
