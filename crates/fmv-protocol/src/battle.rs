@@ -39,6 +39,28 @@
 //! commands from its own data and never needs a count (it learns its own from `ServerMsg::Inventory`).
 //! Every action is announced by a [`BattleEvent::Action`] before its effects.
 //!
+//! # Limit breaks and escape (v7)
+//!
+//! * **Limit.** Each character has a limit gauge `0..=255` that enemy blows fill and a knockout or a limit
+//!   empties (`fmv_ff7_battle::limit` has the rule). It is engine state, a pure function of the damage
+//!   dealt, so every peer's replay has the same gauge; its **starting value is an input** like the level:
+//!   [`BattleMember::limit`] carries the account's own, which the server keeps (in `fmv-persist`'s
+//!   `CharacterProgress`) and saves at the end of every battle, whatever the outcome. A value above 255
+//!   is refused when the battle is built ([`BattleBuildError::InvalidLimit`]). With the gauge and the
+//!   ATB gauge full a character gives [`Command::Limit`]: the engine announces
+//!   `Action { Limit(id) }`, `LimitGauge { actor, value: 0 }` and then the effects of one action on
+//!   one target (an enemy for a damaging limit, an ally for a healing one: `BattleState::limit_for`
+//!   says which), so a limit that ends the battle still ends on its `Victory`.
+//! * **Escape.** [`Command::Escape`] spends the actor's turn running. Whether and how hard a battle is to
+//!   run from comes from the peer's own `scene.bin` ([`BattleRules::build`] gives the engine its
+//!   `EscapeRule`; nothing travels). When the party gets away the battle ends with
+//!   [`Outcome::Escaped`]: the message that carries the command has `Action { Escape }` and no
+//!   terminal event, and `BattleEnd` follows it with no rewards; a failed attempt adds
+//!   `EscapeFailed { actor }` and the battle goes on. The server saves the limit gauges of an escaped
+//!   battle like any other, and pays nothing.
+//! * **Refusals.** `NoLimit` (the character has none), `LimitNotReady` (its gauge is not full) and
+//!   `CannotEscape` (the formation cannot be run from) join the v6 reasons.
+//!
 //! # Rewards
 //!
 //! [`split_rewards`] is a pure function of the engine's total reward and the ROSTER (every member
@@ -61,8 +83,9 @@ use fmv_ff7_battle::kernel::{
     CharacterId, Kernel, KernelError, ITEM_COUNT, MAX_AP, MAX_EXP, MAX_GIL, MAX_ITEM_STACK, MAX_KERNEL_BYTES, MAX_LEVEL,
 };
 use fmv_ff7_battle::rng::Rng;
+use fmv_ff7_battle::limit::LimitBreak;
 use fmv_ff7_battle::rules::{
-    element, enemies_for_formation, BattleConfig, BattleState, Combatant, Reward, StartMode, MAX_PER_SIDE,
+    element, enemies_for_formation, BattleConfig, BattleState, Combatant, EscapeRule, Reward, StartMode, LIMIT_MAX, MAX_PER_SIDE,
 };
 use fmv_ff7_battle::scene::{BattleLayout, SceneBin, SceneError, MAX_SCENE_BIN_BYTES};
 use serde::{Deserialize, Serialize};
@@ -105,6 +128,11 @@ pub struct BattleMember {
     /// Equipment override ids; `None` is the character's starting equipment.
     pub weapon: Option<u8>,
     pub armor: Option<u8>,
+    /// The character's limit gauge when the battle starts (protocol v7), `0..=LIMIT_MAX` (255; a
+    /// larger number is refused by [`BattleRules::build`]): the account's own, which the server keeps
+    /// and saves at the end of every battle. An input of the engine like the level, so every peer
+    /// replays the gauge the server had.
+    pub limit: u16,
 }
 
 impl BattleMember {
@@ -188,6 +216,12 @@ pub enum BattleRejection {
     UnknownItem,
     /// The account has none of that item.
     OutOfItems,
+    /// The actor has no limit break (protocol v7).
+    NoLimit,
+    /// The actor's limit gauge is not full (protocol v7).
+    LimitNotReady,
+    /// The party cannot run from this battle (protocol v7).
+    CannotEscape,
 }
 
 impl fmt::Display for BattleRejection {
@@ -209,6 +243,9 @@ impl fmt::Display for BattleRejection {
             BattleRejection::NotEnoughMp => "that character has not the MP for that spell",
             BattleRejection::UnknownItem => "that item cannot be used in battle",
             BattleRejection::OutOfItems => "you have none of that item",
+            BattleRejection::NoLimit => "that character has no limit break",
+            BattleRejection::LimitNotReady => "that character's limit gauge is not full",
+            BattleRejection::CannotEscape => "you cannot escape from this battle",
         })
     }
 }
@@ -270,6 +307,9 @@ pub enum BattleBuildError {
     UnknownCharacter(u8),
     #[error("the local game data has no stats for character id {0}")]
     NoCharacterData(u8),
+    /// A starting limit gauge above the most there is (a hostile or broken server; the real one never sends it).
+    #[error("character id {character} starts with a limit gauge of {limit}, the most there is is {max}")]
+    InvalidLimit { character: u8, limit: u16, max: u16 },
 }
 
 /// What a formation looks like to the server (for choosing flags and for logs). Names and stats
@@ -297,11 +337,15 @@ pub struct ProgressLimits {
     pub max_gil: u32,
     /// Most AP.
     pub max_ap: u32,
+    /// The fullest limit gauge (protocol v7): a battle refuses a starting gauge above it.
+    pub max_limit: u16,
 }
 
 impl ProgressLimits {
-    /// FF7's own caps (`fmv_ff7_battle::kernel::MAX_LEVEL`, `MAX_EXP`, `MAX_GIL`, `MAX_AP`).
-    pub const FF7: ProgressLimits = ProgressLimits { max_level: MAX_LEVEL, max_exp: MAX_EXP, max_gil: MAX_GIL, max_ap: MAX_AP };
+    /// FF7's own caps (`fmv_ff7_battle::kernel::MAX_LEVEL`, `MAX_EXP`, `MAX_GIL`, `MAX_AP` and
+    /// `fmv_ff7_battle::limit::LIMIT_MAX`).
+    pub const FF7: ProgressLimits =
+        ProgressLimits { max_level: MAX_LEVEL, max_exp: MAX_EXP, max_gil: MAX_GIL, max_ap: MAX_AP, max_limit: LIMIT_MAX };
 }
 
 /// The game's battle rules as one peer's own data provides them. The server and every client call
@@ -779,8 +823,13 @@ impl Ff7BattleData {
             .iter()
             .map(|m| {
                 let who = m.character_id().ok_or(BattleBuildError::UnknownCharacter(m.character))?;
-                Combatant::from_character(&self.kernel, who, m.level, m.weapon, m.armor)
-                    .ok_or(BattleBuildError::NoCharacterData(m.character))
+                if m.limit > LIMIT_MAX {
+                    return Err(BattleBuildError::InvalidLimit { character: m.character, limit: m.limit, max: LIMIT_MAX });
+                }
+                let mut c = Combatant::from_character(&self.kernel, who, m.level, m.weapon, m.armor)
+                    .ok_or(BattleBuildError::NoCharacterData(m.character))?;
+                c.limit = m.limit;
+                Ok(c)
             })
             .collect()
     }
@@ -797,7 +846,15 @@ impl BattleRules for Ff7BattleData {
             return Err(BattleBuildError::NoEnemies(setup.formation_id));
         }
         let party = self.party(setup)?;
-        Ok(BattleState::with_config(setup.seed, party, enemies, setup.config()).with_items(Arc::clone(&self.items)))
+        // How hard the fight is to run from is the scene's own: its escape counter and flags, and the
+        // arrival that makes every Run Check succeed (a preemptive strike, a side attack).
+        let scene_setup = formation.setup();
+        let escape = scene_setup
+            .run_difficulty()
+            .map(|difficulty| EscapeRule { difficulty, sure: scene_setup.layout.makes_running_sure() });
+        Ok(BattleState::with_config(setup.seed, party, enemies, setup.config())
+            .with_items(Arc::clone(&self.items))
+            .with_escape(escape))
     }
 
     fn data_fingerprint(&self) -> Fingerprint {
@@ -902,6 +959,12 @@ pub const DEFAULT_LEVEL: u8 = 5;
 /// whose battles accept Potion (item 0), Ether (item 3), Phoenix Down (item 7) and Grenade (item 20). A new account starts
 /// with 3 Potions, 1 Ether and 1 Phoenix Down; a won battle drops [`SyntheticRules::drop_item`], one per
 /// enemy, if it is set. The enemies only ever attack.
+///
+/// **Limits and escape (v7).** Every fighter has a limit that fills quickly (HP divisor 40): id 128, a
+/// strike of Power 48 on one enemy, except character 3, whose limit (id 142) heals one ally for half of its
+/// max HP, like Aerith's. Formations `0` and `1` can be run from at difficulty 1, formation `3` (the
+/// preemptive one) surely at difficulty 1, formation `4` at difficulty 2 and formation `2`, the
+/// overwhelming enemy, cannot be run from at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SyntheticRules {
     /// Hit points of each weak enemy.
@@ -949,6 +1012,16 @@ impl SyntheticRules {
         }
     }
 
+    /// How hard formation `id` is to run from (see the type's docs).
+    fn escape_rule(id: u16) -> Option<EscapeRule> {
+        match id {
+            0 | 1 => Some(EscapeRule { difficulty: 1, sure: false }),
+            3 => Some(EscapeRule { difficulty: 1, sure: true }),
+            4 => Some(EscapeRule { difficulty: 2, sure: false }),
+            _ => None,
+        }
+    }
+
     fn enemy(&self, name: &str, hp: u32, attack: u32) -> Combatant {
         let mut e = Combatant::new(name, 3, hp);
         e.attack = attack;
@@ -980,6 +1053,9 @@ impl BattleRules for SyntheticRules {
             .iter()
             .map(|m| {
                 let who = m.character_id().ok_or(BattleBuildError::UnknownCharacter(m.character))?;
+                if m.limit > LIMIT_MAX {
+                    return Err(BattleBuildError::InvalidLimit { character: m.character, limit: m.limit, max: LIMIT_MAX });
+                }
                 let level = u32::from(m.level.clamp(1, 99));
                 let mut c = Combatant::new(who.name(), m.level.clamp(1, 99), 120 + 20 * level);
                 c.attack = 30 + 4 * level;
@@ -991,10 +1067,17 @@ impl BattleRules for SyntheticRules {
                 c.dex = 40;
                 c.accuracy = 100;
                 c.spells = Self::spells();
+                c.limit = m.limit;
+                c.limit_break = Some(match who {
+                    CharacterId::Aeris => LimitBreak::new(142, ActionSpec::limit_heal(16), 40),
+                    _ => LimitBreak::new(128, ActionSpec::limit_strike(48), 40),
+                });
                 Ok(c)
             })
             .collect::<Result<Vec<_>, BattleBuildError>>()?;
-        Ok(BattleState::with_config(setup.seed, party, enemies, setup.config()).with_items(Self::item_table()))
+        Ok(BattleState::with_config(setup.seed, party, enemies, setup.config())
+            .with_items(Self::item_table())
+            .with_escape(Self::escape_rule(setup.formation_id)))
     }
 
     fn data_fingerprint(&self) -> Fingerprint {
@@ -1057,6 +1140,7 @@ mod tests {
             level: 6,
             weapon: None,
             armor: None,
+            limit: 0,
         }
     }
 
@@ -1139,7 +1223,21 @@ mod tests {
         let mut s = setup(0, 1);
         s.party[0].character = 77;
         assert_eq!(rules.build(&s).unwrap_err(), BattleBuildError::UnknownCharacter(77));
-        for e in [BattleBuildError::NoEnemies(3), BattleBuildError::NoCharacterData(2), BattleBuildError::PartyTooLarge(9)] {
+        // A starting limit gauge above the fullest one is refused, not clamped: a server that sends one is
+        // broken or hostile, and every peer says so instead of replaying something else.
+        let mut s = setup(0, 2);
+        s.party[1].limit = 256;
+        let err = rules.build(&s).unwrap_err();
+        assert_eq!(err, BattleBuildError::InvalidLimit { character: 1, limit: 256, max: 255 });
+        assert!(err.to_string().contains("256"), "{err}");
+        s.party[1].limit = 255;
+        assert!(rules.build(&s).is_ok(), "a full gauge is the most there is");
+        for e in [
+            BattleBuildError::NoEnemies(3),
+            BattleBuildError::NoCharacterData(2),
+            BattleBuildError::PartyTooLarge(9),
+            BattleBuildError::InvalidLimit { character: 0, limit: 999, max: 255 },
+        ] {
             assert!(!e.to_string().is_empty());
         }
     }
@@ -1302,6 +1400,126 @@ mod tests {
         for e in every_kind {
             assert!(seen.contains(&std::mem::discriminant(&e)), "no {e:?} in 60 battles");
         }
+    }
+
+    /// Like `serve`, but a ready member uses its limit when the engine says it is ready (a healing one on
+    /// the most wounded ally, a damaging one on the first living enemy), tries to escape on every
+    /// `escape_every`-th turn and attacks otherwise.
+    fn serve_limits(state: &mut BattleState, slice: u64, escape_every: usize) -> Vec<Message> {
+        let mut log = Vec::new();
+        let mut turn = 0usize;
+        for _ in 0..100_000 {
+            if state.outcome().is_some() {
+                break;
+            }
+            let events = state.step_ticks(slice);
+            if !events.is_empty() {
+                log.push((state.tick(), events, None));
+            }
+            for id in state.ready_actors() {
+                if state.outcome().is_some() {
+                    break;
+                }
+                turn += 1;
+                let Some(enemy) = state.enemy_ids().into_iter().find(|e| state.actor(*e).is_some_and(|c| c.is_alive())) else { break };
+                let wounded = state
+                    .party_ids()
+                    .into_iter()
+                    .filter(|a| state.actor(*a).is_some_and(|c| c.is_alive()))
+                    .min_by_key(|a| state.actor(*a).map_or(0, |c| u64::from(c.hp) * 1000 / u64::from(c.max_hp.max(1))));
+                let limit = state.limit_for(id).filter(|_| state.limit_ready(id)).and_then(|l| if l.targets_allies { wounded } else { Some(enemy) });
+                let command = if turn.is_multiple_of(escape_every) {
+                    Command::Escape
+                } else {
+                    limit.map_or(Command::Attack { target: enemy }, |target| Command::Limit { target })
+                };
+                let command = if state.check_command(id, &command).is_ok() { command } else { Command::Attack { target: enemy } };
+                if let Ok(events) = state.submit_command(id, command) {
+                    log.push((state.tick(), events, Some(AppliedCommand { actor: id, command })));
+                }
+            }
+        }
+        log
+    }
+
+    #[test]
+    fn a_replay_of_a_battle_with_limits_and_escapes_reproduces_it_and_ends_the_way_the_server_says() {
+        let rules = SyntheticRules::default();
+        let (mut escaped, mut won, mut gauges, mut failed, mut limits_used, mut heals) = (0, 0, 0, 0, 0, 0);
+        for seed in 0..120u64 {
+            let formation = [0u16, 1, 3, 4][seed as usize % 4];
+            let mut setup = BattleSetup { seed, ..setup(formation, 3) };
+            // Everybody starts with a full gauge (the third member is the Aerith-like healer); formation 3 is the preemptive one.
+            for m in &mut setup.party {
+                m.limit = 255;
+            }
+            setup.party[2].character = 3;
+            setup.preemptive = formation == 3;
+            let mut server = rules.build(&setup).unwrap();
+            let log = serve_limits(&mut server, [3u64, 11, 40][seed as usize % 3], 4 + (seed as usize % 5));
+            let outcome = server.outcome().unwrap_or_else(|| panic!("seed {seed} never ended"));
+            let replay = replay_all(&rules, &setup, &log).unwrap_or_else(|d| panic!("seed {seed}: {d}"));
+            assert_eq!(replay.state(), &server, "seed {seed}: the replayed engine IS the server's engine");
+            let rewards = replay.expected_rewards();
+            replay.check_end(outcome, &rewards).unwrap_or_else(|d| panic!("seed {seed}: {d}"));
+            let last = log.last().expect("something happened");
+            match outcome {
+                Outcome::Escaped => {
+                    escaped += 1;
+                    assert!(rewards.is_empty(), "an escape pays nothing");
+                    // The message of the escape carries the command and no terminal event; BattleEnd follows it.
+                    assert_eq!(last.2.map(|c| c.command), Some(Command::Escape), "seed {seed}");
+                    assert!(!last.1.iter().any(|e| matches!(e, BattleEvent::Victory | BattleEvent::Defeat | BattleEvent::EscapeFailed { .. })));
+                    // A server that announced another ending, or a payment for the escape, is caught.
+                    assert!(matches!(replay.check_end(Outcome::Victory, &[]), Err(Divergence::OutcomeDiffers { .. })));
+                    let paid = vec![BattleReward::new(AccountId(20), 1, 0, 0)];
+                    assert!(matches!(replay.check_end(Outcome::Escaped, &paid), Err(Divergence::RewardsDiffer { .. })));
+                }
+                Outcome::Victory => {
+                    won += 1;
+                    assert_eq!(last.1.last(), Some(&BattleEvent::Victory), "seed {seed}: the victory is the last event");
+                }
+                Outcome::Defeat => assert_eq!(last.1.last(), Some(&BattleEvent::Defeat), "seed {seed}"),
+            }
+            for (_, events, _) in &log {
+                for e in events {
+                    match e {
+                        BattleEvent::LimitGauge { value, .. } => {
+                            assert!(*value <= 255);
+                            gauges += 1;
+                        }
+                        BattleEvent::EscapeFailed { .. } => failed += 1,
+                        BattleEvent::Action { action: ActionRef::Limit(_), .. } => limits_used += 1,
+                        // Nobody casts or drinks here: the only healing is the third member's (Aerith's) limit.
+                        BattleEvent::Heal { actor, .. } if actor.0 == 2 => heals += 1,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        assert!(escaped > 10 && won > 10, "{escaped} escapes and {won} victories in 120 battles");
+        assert!(gauges > 100 && failed > 5 && limits_used > 100 && heals > 5, "{gauges} gauge events, {failed} failed escapes, {limits_used} limits, {heals} heals");
+    }
+
+    #[test]
+    fn a_limit_or_an_escape_the_engine_would_refuse_is_caught_in_a_replay() {
+        let rules = SyntheticRules::default();
+        // Formation 2 cannot be run from; a member without a full gauge has no limit to give.
+        let mut cannot = rules.build(&BattleSetup { preemptive: false, ..setup(2, 1) }).unwrap();
+        assert!(!cannot.can_escape());
+        assert_eq!(cannot.check_command(ActorId(0), &Command::Escape), Err(fmv_ff7_battle::rules::CommandError::GaugeNotFull(ActorId(0))));
+        let mut forged = BattleReplay::start(&rules, &setup(2, 1)).unwrap();
+        // The server "applied" an escape at tick 0, when nobody can act: the engine refuses it.
+        let refused = forged.apply(0, &[], Some(&AppliedCommand { actor: ActorId(0), command: Command::Escape }));
+        assert!(matches!(refused, Err(Divergence::CommandRefused(_))), "{refused:?}");
+        let refused = forged.apply(0, &[], Some(&AppliedCommand { actor: ActorId(0), command: Command::Limit { target: ActorId(1) } }));
+        assert!(matches!(refused, Err(Divergence::CommandRefused(_))), "{refused:?}");
+        // Make the actor ready, then run: the formation forbids it.
+        while cannot.ready_actors().is_empty() {
+            cannot.step_ticks(10);
+        }
+        assert_eq!(cannot.check_command(ActorId(0), &Command::Escape), Err(fmv_ff7_battle::rules::CommandError::CannotEscape));
+        assert_eq!(cannot.check_command(ActorId(0), &Command::Limit { target: ActorId(1) }), Err(fmv_ff7_battle::rules::CommandError::LimitNotReady(ActorId(0))));
     }
 
     #[test]
@@ -1575,9 +1793,18 @@ mod tests {
             BattleRejection::InvalidTarget,
             BattleRejection::TargetDead,
             BattleRejection::BattleOver,
+            BattleRejection::TargetNotDead,
+            BattleRejection::UnknownSpell,
+            BattleRejection::NotEnoughMp,
+            BattleRejection::UnknownItem,
+            BattleRejection::OutOfItems,
+            BattleRejection::NoLimit,
+            BattleRejection::LimitNotReady,
+            BattleRejection::CannotEscape,
         ] {
             assert!(!r.to_string().is_empty());
         }
+        assert!(BattleRejection::CannotEscape.to_string().contains("escape"));
         assert!(BattleRejection::DebugDisabled.to_string().contains("--debug-encounters"));
         assert_eq!(BattleId(4).to_string(), "battle#4");
     }
@@ -1595,7 +1822,7 @@ mod tests {
         assert_eq!(rules.starting_level(0), 5);
         assert_eq!(
             rules.progress_limits(),
-            ProgressLimits { max_level: 99, max_exp: 99_999_999, max_gil: 9_999_999, max_ap: 16_777_215 }
+            ProgressLimits { max_level: 99, max_exp: 99_999_999, max_gil: 9_999_999, max_ap: 16_777_215, max_limit: 255 }
         );
     }
 
