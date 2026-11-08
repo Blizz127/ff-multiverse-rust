@@ -293,10 +293,18 @@ flat picture as before.
 `--debug-encounters`; random encounters start battles by themselves in a field that has an
 encounter table). The window then shows the battle as a 3D scene: the formation's own camera
 (from your `scene.bin`), the enemies where the formation puts them, your party opposite them
-facing them (their field models, from your own `char.lgp`), on a stand-in arena; boxes stand in
-for the enemies until battle models are read. A blow makes its attacker run at its target and the
-target blink and shake; a miss makes it step aside; a beaten enemy collapses and a fallen party
-member lies down. A gold ring under a character means it can act, a white ring marks yours. The
+facing them, on the location's own model: all of them are the real battle models of your own
+`battle.lgp` (stand-ins when it has none). They play the game's own clips: a party member runs up,
+swings, and hops back (attack), gathers a spell with its cast clips (a glow, then a burst in the
+colour of the spell's element: fire, ice, bolt, cure), holds its guard, flinches when it is hit and
+falls when it is beaten, and rejoices when the battle is won; an enemy runs up and plays the clip
+`scene.bin` names for the attack it uses, flinches with its hurt clip and, when beaten, fades away.
+The presentation is only that: **nothing waits on an animation.** The bars, the menu and the
+command that is applied follow the battle at once; the numbers float up when the blow lands (never
+more than 0.6 s after the server said it), the clips are sped up (or their start skipped) so that
+the blow's impact frame lands then, and a beaten enemy leaves the enemy list as it starts to fade.
+An actor without real clips moves procedurally (a lunge, a blink, a collapse). A gold ring under a
+character means it can act, a white ring marks yours. The
 battle's own overlay is drawn over the scene (the enemy list, the party's HP, MP and ATB, the
 command menu on your turn, the floating numbers and the pointer over the models' heads, and a
 band across the top that is green while your client's replay agrees with the server and red if it

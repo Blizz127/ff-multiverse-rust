@@ -99,6 +99,9 @@ struct VsOut {
     @builtin(position) position: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
+    // The draw's own colour factor and opacity (per instance, one instance per model): `flat` so that
+    // the value reaches the fragment as it is, bit for bit (a white tint changes nothing).
+    @location(2) @interpolate(flat) tint: vec4<f32>,
 };
 
 @vertex
@@ -107,6 +110,7 @@ fn vs_model(
     @location(1) uv: vec2<f32>,
     @location(2) color: vec4<f32>,
     @location(3) overlay: f32,
+    @location(4) tint: vec4<f32>,
 ) -> VsOut {
     var out: VsOut;
     let w = cam.z;
@@ -120,6 +124,7 @@ fn vs_model(
     );
     out.uv = uv;
     out.color = color;
+    out.tint = tint;
     return out;
 }
 
@@ -137,7 +142,8 @@ fn fs_model(in: VsOut) -> @location(0) vec4<f32> {
     if (g.depth.w > 0.5) {
         rgb = to_linear(rgb);
     }
-    return vec4<f32>(rgb * texel.rgb, in.color.a);
+    // The draw's tint scales the colours (above 1 it brightens) and its alpha the part's own.
+    return vec4<f32>(rgb * texel.rgb * in.tint.rgb, in.color.a * in.tint.a);
 }
 "#
 );
@@ -180,6 +186,32 @@ pub struct StaticVertex {
 const STATIC_ATTRIBUTES: [wgpu::VertexAttribute; 3] =
     wgpu::vertex_attr_array![1 => Float32x2, 2 => Unorm8x4, 3 => Float32];
 const POSITION_ATTRIBUTES: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![0 => Float32x3];
+const TINT_ATTRIBUTES: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![4 => Float32x4];
+
+/// The per-draw tint of one model: a colour factor (`rgb`, above 1 it brightens) and an opacity
+/// (`alpha`). A model whose alpha is under 1 is drawn blended (all its batches, the opaque ones
+/// too), after the opaque models; an additive part of it stays additive and fades the same way.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Tint {
+    pub rgb: [f32; 3],
+    pub alpha: f32,
+}
+
+impl Tint {
+    /// Drawn as it is.
+    pub const NONE: Tint = Tint { rgb: [1.0; 3], alpha: 1.0 };
+
+    /// The four floats the shader reads.
+    pub fn to_array(self) -> [f32; 4] {
+        [self.rgb[0], self.rgb[1], self.rgb[2], self.alpha]
+    }
+}
+
+impl Default for Tint {
+    fn default() -> Self {
+        Self::NONE
+    }
+}
 
 fn position_layout() -> wgpu::VertexBufferLayout<'static> {
     wgpu::VertexBufferLayout {
@@ -194,6 +226,16 @@ fn static_layout() -> wgpu::VertexBufferLayout<'static> {
         array_stride: std::mem::size_of::<StaticVertex>() as wgpu::BufferAddress,
         step_mode: wgpu::VertexStepMode::Vertex,
         attributes: &STATIC_ATTRIBUTES,
+    }
+}
+
+/// The tint: one `[f32; 4]` per INSTANCE, and a model is drawn as the one instance of a 16-byte slice
+/// of the buffer (no `first_instance`, which the downlevel limits the renderer asks for do not promise).
+fn tint_layout() -> wgpu::VertexBufferLayout<'static> {
+    wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<[f32; 4]>() as wgpu::BufferAddress,
+        step_mode: wgpu::VertexStepMode::Instance,
+        attributes: &TINT_ATTRIBUTES,
     }
 }
 
@@ -237,6 +279,8 @@ impl Globals {
 /// Most characters kept on the GPU (the table has eight); beyond it the cache starts over.
 const MAX_GPU_MODELS: usize = 32;
 const MIN_POSITION_BYTES: u64 = 64 * 1024;
+/// Room for 256 tints to start with (a battle draws a few dozen models).
+const MIN_TINT_BYTES: u64 = 256 * 16;
 pub(super) const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 struct GpuBatch {
@@ -281,6 +325,9 @@ pub struct AvatarGpu {
     scenery: SceneryGpu,
     position_buf: wgpu::Buffer,
     position_cap: u64,
+    /// One tint per model of a frame (see [`tint_layout`]).
+    tint_buf: wgpu::Buffer,
+    tint_cap: u64,
     ground_buf: wgpu::Buffer,
     ground_cap: u64,
     depth: Option<DepthTarget>,
@@ -360,7 +407,7 @@ impl AvatarGpu {
                     module: &shader,
                     entry_point: Some("vs_model"),
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    buffers: &[Some(position_layout()), Some(static_layout())],
+                    buffers: &[Some(position_layout()), Some(static_layout()), Some(tint_layout())],
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
@@ -464,6 +511,7 @@ impl AvatarGpu {
         let white_texture = upload_texture(device, queue, texture_format, 1, 1, &[255, 255, 255, 255]);
         let white = texture_bind_group(device, &texture_layout, &white_texture, &model_sampler);
         let position_buf = create_position_buffer(device, MIN_POSITION_BYTES);
+        let tint_buf = create_vertex_buffer(device, "fmv-avatar-tints", MIN_TINT_BYTES);
         let ground_buf = create_vertex_buffer(device, "fmv-avatar-ground-vertices", MIN_POSITION_BYTES);
         Self {
             device: device.clone(),
@@ -484,6 +532,8 @@ impl AvatarGpu {
             scenery,
             position_buf,
             position_cap: MIN_POSITION_BYTES,
+            tint_buf,
+            tint_cap: MIN_TINT_BYTES,
             ground_buf,
             ground_cap: MIN_POSITION_BYTES,
             depth: None,
@@ -636,6 +686,14 @@ impl AvatarGpu {
     /// With `with_scenery` the depth is the one [`AvatarGpu::draw_scenery`] left (the marks, the
     /// models and the blended tiles are tested against it); without, it starts empty.
     pub fn draw_models(&mut self, target: &wgpu::TextureView, size: (u32, u32), cam: &Camera, frame: &AvatarFrame, with_scenery: bool) {
+        self.draw_models_tinted(target, size, cam, frame, &[], with_scenery);
+    }
+
+    /// [`AvatarGpu::draw_models`] with a [`Tint`] for each model: `tints[i]` is the colour factor and
+    /// the opacity of `frame.models[i]` (a model without one, or every model when `tints` is empty,
+    /// is drawn as it is, which is bit for bit what `draw_models` always drew). A model that is not
+    /// fully opaque is drawn blended with everything of it, in the pass of the semi-transparent ones.
+    pub fn draw_models_tinted(&mut self, target: &wgpu::TextureView, size: (u32, u32), cam: &Camera, frame: &AvatarFrame, tints: &[Tint], with_scenery: bool) {
         // Nothing to draw, so nothing to put the scenery in front of either.
         if size.0 == 0 || size.1 == 0 || frame.models.is_empty() {
             return;
@@ -644,6 +702,16 @@ impl AvatarGpu {
             self.ensure_model(&model.asset);
         }
         self.write_globals(size, cam, frame);
+
+        // One tint per model, in a buffer of its own, a 16-byte slice each (see `tint_layout`).
+        let tint_data: Vec<[f32; 4]> = (0..frame.models.len()).map(|i| tints.get(i).copied().unwrap_or(Tint::NONE).to_array()).collect();
+        let tint_need = (tint_data.len() * std::mem::size_of::<[f32; 4]>()) as u64;
+        if tint_need > self.tint_cap {
+            let cap = tint_need.next_power_of_two().max(MIN_TINT_BYTES);
+            self.tint_buf = create_vertex_buffer(&self.device, "fmv-avatar-tints", cap);
+            self.tint_cap = cap;
+        }
+        self.queue.write_buffer(&self.tint_buf, 0, bytemuck::cast_slice(&tint_data));
 
         // One buffer holds every player's skinned positions, one after the other.
         let total_vertices: usize = frame.models.iter().map(|m| m.positions.len()).sum();
@@ -667,9 +735,10 @@ impl AvatarGpu {
         }
         let depth_view = self.depth_view(size);
 
-        let mut spans: Vec<(u64, u64, &GpuModel)> = Vec::with_capacity(frame.models.len());
+        // (first byte, end byte, the model on the GPU, its index in the frame: that of its tint)
+        let mut spans: Vec<(u64, u64, &GpuModel, usize)> = Vec::with_capacity(frame.models.len());
         let mut offset = 0u64;
-        for model in &frame.models {
+        for (index, model) in frame.models.iter().enumerate() {
             let bytes: &[u8] = bytemuck::cast_slice(&model.positions);
             let end = offset + bytes.len() as u64;
             // A model whose positions do not match its uploaded mesh (cannot happen: both come from
@@ -677,7 +746,7 @@ impl AvatarGpu {
             if let Some(gpu) = self.models.get(&model.asset.id).filter(|g| g.vertex_count as usize == model.positions.len()) {
                 if !bytes.is_empty() {
                     self.queue.write_buffer(&self.position_buf, offset, bytes);
-                    spans.push((offset, end, gpu));
+                    spans.push((offset, end, gpu, index));
                 }
             }
             offset = end;
@@ -713,14 +782,20 @@ impl AvatarGpu {
             let pipelines = [(BatchKind::Opaque, &self.opaque), (BatchKind::Alpha, &self.alpha), (BatchKind::Additive, &self.additive)];
             for (kind, pipeline) in pipelines {
                 pass.set_pipeline(pipeline);
-                for &(from, to, gpu) in &spans {
-                    if !gpu.batches.iter().any(|b| b.kind == kind && b.index_count > 0) {
+                for &(from, to, gpu, index) in &spans {
+                    // A model that is not fully opaque is blended all over: its opaque batches go with the
+                    // semi-transparent ones, over everything that is opaque.
+                    let faded = tint_data[index][3] < 1.0;
+                    let drawn_now = |b: &GpuBatch| b.index_count > 0 && if faded && b.kind == BatchKind::Opaque { kind == BatchKind::Alpha } else { b.kind == kind };
+                    if !gpu.batches.iter().any(drawn_now) {
                         continue;
                     }
+                    let tint_at = (index * std::mem::size_of::<[f32; 4]>()) as u64;
                     pass.set_vertex_buffer(0, self.position_buf.slice(from..to));
                     pass.set_vertex_buffer(1, gpu.static_buf.slice(..));
+                    pass.set_vertex_buffer(2, self.tint_buf.slice(tint_at..tint_at + std::mem::size_of::<[f32; 4]>() as u64));
                     pass.set_index_buffer(gpu.index_buf.slice(..), wgpu::IndexFormat::Uint32);
-                    for batch in gpu.batches.iter().filter(|b| b.kind == kind && b.index_count > 0) {
+                    for batch in gpu.batches.iter().filter(|b| drawn_now(b)) {
                         pass.set_bind_group(1, &batch.bind_group, &[]);
                         pass.draw_indexed(batch.first_index..batch.first_index + batch.index_count, 0, 0..1);
                     }
@@ -825,6 +900,13 @@ mod tests {
         );
         let p = position_layout();
         assert_eq!((p.array_stride, p.attributes[0].shader_location, p.attributes[0].offset), (12, 0, 0));
+        // The per-draw tint: one vec4 per INSTANCE at location 4, which the vertex shader declares and passes
+        // on flat (so a white tint reaches the fragment exactly).
+        let t = tint_layout();
+        assert_eq!((t.array_stride, t.step_mode, t.attributes[0].shader_location, t.attributes[0].offset), (16, wgpu::VertexStepMode::Instance, 4, 0));
+        assert!(MODEL_SHADER_WGSL.contains("@location(4) tint: vec4<f32>") && MODEL_SHADER_WGSL.contains("@interpolate(flat) tint"));
+        assert_eq!(Tint::default().to_array(), [1.0; 4]);
+        assert_eq!(Tint { rgb: [0.5, 1.0, 2.0], alpha: 0.25 }.to_array(), [0.5, 1.0, 2.0, 0.25]);
         assert_eq!(std::mem::size_of::<Globals>(), 48, "three vec4s, as the shaders' uniform block");
         for entry in ["vs_model", "fs_model", "buffer_depth"] {
             assert!(MODEL_SHADER_WGSL.contains(entry), "{entry}");
