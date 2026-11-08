@@ -16,3 +16,8 @@
 /PROJECT-BRIEF.md
 /PROJECT-METADATA.json
 /DEPLOYMENT-CONTRACT.md
+
+# import/library state anywhere in the tree
+library/
+import-sessions/
+/u.cli.*

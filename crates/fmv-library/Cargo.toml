@@ -8,3 +8,11 @@ license.workspace = true
 
 [dependencies]
 fmv-core.workspace = true
+blake3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+dirs.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

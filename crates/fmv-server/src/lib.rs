@@ -1,0 +1,490 @@
+//! Authoritative FF Multiverse server for protocol v1 (`fmv-protocol`).
+//!
+//! The server hosts exactly one area, obtained from a `GameAdapter` (`Box<dyn GameAdapter>`, so
+//! wiring a real game later is a one-line change in the binary). It owns all positions: clients
+//! send `MoveIntent`s, the server checks them against the speed rule and the adapter's
+//! `validate_move`, and broadcasts the result on a fixed tick.
+//!
+//! It never sends asset bytes. Clients are offered the area by id, content fingerprint and
+//! path-free provenance summary, and must confirm they hold the same copy locally.
+//!
+//! **The FIXTURE area is synthetic test content and is not evidence of FF7 support.** Wherever
+//! it is surfaced (READY line, manifest, logs) it is labeled as fixture.
+//!
+//! Layout: `world` is the synchronous authoritative state, `conn` is the per-connection task
+//! (handshake, message loop, teardown), and this file owns the listener, the tick loop and
+//! graceful shutdown. Entry points are [`run`] (what the binary uses) and [`Server::bind`] +
+//! [`Server::serve`] (what tests use, to learn the bound port first).
+//!
+//! # What the server trusts an adapter for
+//!
+//! * **FIXTURE labeling does not rest on the adapter's flag alone.** An area is announced as
+//!   FIXTURE (READY line, manifest, log) when the adapter says so, belongs to the Fixture game,
+//!   has a `Synthetic` provenance platform or lists a `SourceRef::Fixture` source, and its
+//!   manifest display name is prefixed with `FIXTURE:` if it does not already say so. An area
+//!   whose provenance names a different game than its id is refused outright.
+//! * **`AreaInfo::fingerprint` is the only content check a joining client faces** (besides the
+//!   `AreaId`): `JoinArea` carries no provenance. It must therefore cover everything that makes
+//!   two copies of an area incompatible, the edition/region/revision provenance included and not
+//!   only the area's file bytes. Otherwise two clients on different editions with identical
+//!   bytes for the hosted area would share an instance. Protocol v1 cannot verify this, and a
+//!   client that simply echoes the public fingerprint cannot be told apart from an honest one.
+//! * **`AreaRuntime::validate_move` is called once per sub-step** of every `MoveIntent` that
+//!   passes the speed check (see `world`: at most `max_speed / 60` units per step, 64 steps at
+//!   most), always from the previous accepted step and never with a client-supplied height. A
+//!   destination-only check is therefore enough to keep clients off holes and walls between two
+//!   walkable points, as long as those are wider than one step.
+
+mod config;
+mod conn;
+mod world;
+
+pub use config::{ConfigError, ServerConfig, DEFAULT_IDLE_TIMEOUT, DEFAULT_KEEPALIVE, MAX_CONNECTIONS_LIMIT, MAX_TICK_HZ};
+pub use conn::{MAX_APPEARANCE_REF, SERVER_BUILD, SHUTDOWN_REASON};
+
+use std::future::Future;
+use std::io::Write;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use fmv_adapter_api::{AdapterError, AreaInfo, GameAdapter};
+use fmv_core::{AreaId, Platform, SourceRef};
+use fmv_protocol::{ServerMsg, PROTOCOL_VERSION};
+use tokio::net::TcpListener;
+use tokio::sync::{watch, Semaphore};
+use tokio::time::MissedTickBehavior;
+use tracing::{info, warn, Instrument};
+
+use crate::conn::{reject_and_close, serve_connection, wait_flag, Shared};
+use crate::world::World;
+
+/// Pause after a failed `accept` (for example file-descriptor exhaustion) to avoid a hot loop.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+/// At most this many "server full" farewells are written concurrently; beyond that the socket
+/// is simply closed.
+const MAX_REJECT_TASKS: usize = 32;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ServerError {
+    #[error(transparent)]
+    Config(#[from] ConfigError),
+    #[error("cannot load area {key:?}: {source} (areas offered by this adapter: {available})")]
+    Area {
+        key: String,
+        available: String,
+        #[source]
+        source: AdapterError,
+    },
+    #[error("area {0} cannot be hosted: {1}")]
+    BadArea(AreaId, String),
+    #[error("cannot bind {addr}: {source}")]
+    Bind {
+        addr: SocketAddr,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("i/o error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// How the hosted area is announced, derived from everything the adapter reports.
+#[derive(Debug, PartialEq, Eq)]
+struct AreaLabel {
+    /// Synthetic FIXTURE content, never evidence of support for a real game. Clients must show
+    /// this to the user (`AreaManifest::fixture`).
+    fixture: bool,
+    /// Why the area counts as FIXTURE (empty for real content), for the log.
+    reasons: Vec<&'static str>,
+    /// Display name for the manifest. Carries the FIXTURE label for fixture areas.
+    display_name: String,
+}
+
+/// Decide how to announce `info`. The adapter's own `fixture` flag is one input, not the
+/// verdict: a stricter reading of its provenance (the rule `fmv-import` applies to library sets)
+/// also marks the area FIXTURE. Refuses an area whose provenance names another game than its id,
+/// since one of the two is then wrong about what the content is.
+fn label_area(info: &AreaInfo) -> Result<AreaLabel, ServerError> {
+    if info.provenance.game != info.id.game {
+        return Err(ServerError::BadArea(
+            info.id.clone(),
+            format!("its provenance is for {:?} but the area belongs to {:?}", info.provenance.game, info.id.game),
+        ));
+    }
+    let mut reasons = Vec::new();
+    if info.fixture {
+        reasons.push("the adapter flags it as fixture");
+    }
+    if info.id.game.is_fixture() {
+        reasons.push("it belongs to the Fixture game");
+    }
+    if info.provenance.platform == Platform::Synthetic {
+        reasons.push("its provenance platform is Synthetic");
+    }
+    if info.provenance.sources.iter().any(|s| matches!(s, SourceRef::Fixture)) {
+        reasons.push("its provenance lists a Fixture source");
+    }
+    let fixture = !reasons.is_empty();
+    let display_name = if fixture && !info.display_name.to_uppercase().contains("FIXTURE") {
+        format!("FIXTURE: {}", info.display_name)
+    } else {
+        info.display_name.clone()
+    };
+    Ok(AreaLabel { fixture, reasons, display_name })
+}
+
+/// A bound, not yet serving server.
+pub struct Server {
+    listener: TcpListener,
+    local_addr: SocketAddr,
+    shared: Arc<Shared>,
+    fixture: bool,
+}
+
+impl Server {
+    /// Load the configured area from `adapter` and bind the listener (port 0 picks a free port).
+    pub async fn bind(config: ServerConfig, adapter: Box<dyn GameAdapter>) -> Result<Self, ServerError> {
+        config.validate()?;
+        let area = adapter.load_area(&config.area_key).map_err(|source| ServerError::Area {
+            key: config.area_key.clone(),
+            available: adapter.list_areas().iter().map(|a| a.id.key.as_str()).collect::<Vec<_>>().join(", "),
+            source,
+        })?;
+        drop(adapter);
+
+        // `AreaInfo::provenance` carries local install paths. Only the path-free summary may be
+        // sent or logged; never format the full `AreaInfo` or `EditionProvenance`.
+        let info = area.info().clone();
+        let label = label_area(&info)?;
+        let fixture = label.fixture;
+        if fixture && !info.fixture {
+            warn!(reasons = ?label.reasons, "the adapter did not flag this area as fixture; labeling it FIXTURE anyway");
+        }
+        let area_id = info.id.clone();
+        let fingerprint = info.fingerprint;
+        let provenance = info.provenance.summary();
+        let manifest = Arc::new(ServerMsg::AreaManifest {
+            area: info.id.clone(),
+            display_name: label.display_name.clone(),
+            fingerprint,
+            provenance: provenance.clone(),
+            fixture,
+        });
+        let display_name = label.display_name;
+
+        let world = World::new(area)?;
+        let listener = TcpListener::bind(config.bind)
+            .await
+            .map_err(|source| ServerError::Bind { addr: config.bind, source })?;
+        let local_addr = listener.local_addr()?;
+
+        info!(area = %area_id, name = %display_name, ?provenance, fixture, "hosting area");
+        if fixture {
+            warn!("hosting a FIXTURE area: synthetic test content, NOT FF7 support");
+        }
+        if !local_addr.ip().is_loopback() {
+            warn!(%local_addr, "listening on a non-loopback address; protocol v1 has no authentication");
+        }
+
+        let shared = Arc::new(Shared { cfg: config, world: Mutex::new(world), manifest, area_id, fingerprint });
+        Ok(Self { listener, local_addr, shared, fixture })
+    }
+
+    /// The address actually bound (useful with port 0).
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    pub fn area_id(&self) -> &AreaId {
+        &self.shared.area_id
+    }
+
+    /// Whether the hosted area is synthetic FIXTURE content.
+    pub fn is_fixture(&self) -> bool {
+        self.fixture
+    }
+
+    /// `READY protocol=<v> build=<version> addr=<bound addr> area=<AreaId> fixture=<bool>`
+    pub fn ready_line(&self) -> String {
+        format!(
+            "READY protocol={} build={} addr={} area={} fixture={}",
+            PROTOCOL_VERSION, SERVER_BUILD, self.local_addr, self.shared.area_id, self.fixture
+        )
+    }
+
+    /// Print the READY line (and nothing else) to stdout and flush. All logging goes to stderr.
+    pub fn announce_ready(&self) {
+        let mut out = std::io::stdout().lock();
+        if let Err(e) = writeln!(out, "{}", self.ready_line()).and_then(|()| out.flush()) {
+            warn!(error = %e, "could not write the READY line to stdout");
+        }
+    }
+
+    /// Accept and serve clients until `shutdown` resolves, then stop accepting, send every client
+    /// `Reject { reason: "server shutting down" }`, wait (bounded by `shutdown_grace`) for the
+    /// connections to close and return.
+    pub async fn serve<F: Future<Output = ()>>(self, shutdown: F) -> Result<(), ServerError> {
+        let Server { listener, shared, .. } = self;
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let slots = Arc::new(Semaphore::new(shared.cfg.max_connections));
+        let reject_slots = Arc::new(Semaphore::new(MAX_REJECT_TASKS));
+        let full_rejections = AtomicU64::new(0);
+        let tick = tokio::spawn(tick_loop(Arc::clone(&shared), shutdown_rx.clone()));
+
+        tokio::pin!(shutdown);
+        loop {
+            tokio::select! {
+                () = &mut shutdown => break,
+                accepted = listener.accept() => {
+                    let (stream, peer) = match accepted {
+                        Ok(ok) => ok,
+                        Err(e) => {
+                            warn!(error = %e, "accept failed");
+                            tokio::time::sleep(ACCEPT_BACKOFF).await;
+                            continue;
+                        }
+                    };
+                    match Arc::clone(&slots).try_acquire_owned() {
+                        Ok(permit) => {
+                            let shared = Arc::clone(&shared);
+                            let shutdown_rx = shutdown_rx.clone();
+                            tokio::spawn(
+                                async move {
+                                    let _permit = permit;
+                                    serve_connection(shared, stream, shutdown_rx).await;
+                                }
+                                .instrument(tracing::info_span!("conn", %peer)),
+                            );
+                        }
+                        Err(_) => {
+                            if full_rejections.fetch_add(1, Ordering::Relaxed).is_multiple_of(100) {
+                                warn!(%peer, limit = shared.cfg.max_connections, "connection limit reached; rejecting (logged once per 100 rejections)");
+                            }
+                            match Arc::clone(&reject_slots).try_acquire_owned() {
+                                Ok(reject_permit) => {
+                                    let wt = shared.cfg.write_timeout.min(Duration::from_secs(2));
+                                    tokio::spawn(async move {
+                                        let _reject_permit = reject_permit;
+                                        reject_and_close(stream, "server full", wt).await;
+                                    });
+                                }
+                                // Too many farewells already in flight: just hang up.
+                                Err(_) => drop(stream),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        info!("shutdown requested; no longer accepting connections");
+        drop(listener);
+        shutdown_tx.send_replace(true);
+        // Every connection task holds one permit, so owning all of them means all are done.
+        let all = u32::try_from(shared.cfg.max_connections).unwrap_or(u32::MAX);
+        match tokio::time::timeout(shared.cfg.shutdown_grace, slots.acquire_many(all)).await {
+            Ok(_) => info!("all connections closed"),
+            Err(_) => warn!(grace = ?shared.cfg.shutdown_grace, "grace period elapsed with connections still open"),
+        }
+        let _ = tick.await;
+        Ok(())
+    }
+}
+
+/// Bind, announce READY on stdout and serve until `shutdown` resolves.
+pub async fn run<F: Future<Output = ()>>(
+    config: ServerConfig,
+    adapter: Box<dyn GameAdapter>,
+    shutdown: F,
+) -> Result<(), ServerError> {
+    let server = Server::bind(config, adapter).await?;
+    server.announce_ready();
+    server.serve(shutdown).await
+}
+
+/// Advance the world once per tick; each tick broadcasts the entities that changed (if any).
+async fn tick_loop(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) {
+    // `validate()` guarantees tick_hz >= 1, so the period is never zero.
+    let period = Duration::from_secs_f64(1.0 / f64::from(shared.cfg.tick_hz));
+    let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                shared.world().advance_tick();
+            }
+            () = wait_flag(&mut shutdown) => break,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fmv_adapter_api::{AreaRuntime, Bounds, MoveResult};
+    use fmv_core::{EditionProvenance, Fingerprint, GameId, Pos};
+    use fmv_fixture::FixtureAdapter;
+
+    /// What a real FF7 PC area would report (the install path stays local).
+    fn real_info() -> AreaInfo {
+        AreaInfo {
+            id: AreaId { game: GameId::Ff7, key: "md1stin".into() },
+            display_name: "FF7 field md1stin".into(),
+            fingerprint: Fingerprint([9; 32]),
+            provenance: EditionProvenance {
+                game: GameId::Ff7,
+                platform: Platform::Pc,
+                edition: "PC 1998".into(),
+                region: "NTSC-U".into(),
+                language: "en".into(),
+                revision: "1.02".into(),
+                sources: vec![SourceRef::Install { path: "/home/owner/private/ff7".into() }],
+                modded: false,
+            },
+            fixture: false,
+        }
+    }
+
+    struct StubArea(AreaInfo);
+
+    impl AreaRuntime for StubArea {
+        fn info(&self) -> &AreaInfo {
+            &self.0
+        }
+        fn spawn_points(&self) -> Vec<Pos> {
+            vec![Pos::default()]
+        }
+        fn validate_move(&self, _from: Pos, to: Pos) -> MoveResult {
+            MoveResult::Accepted(to)
+        }
+        fn bounds(&self) -> Bounds {
+            Bounds { min: Pos::default(), max: Pos::default() }
+        }
+        fn walk_triangles(&self) -> Vec<[Pos; 3]> {
+            Vec::new()
+        }
+        fn max_speed(&self) -> f32 {
+            100.0
+        }
+    }
+
+    struct StubAdapter(AreaInfo);
+
+    impl GameAdapter for StubAdapter {
+        fn game(&self) -> GameId {
+            self.0.id.game
+        }
+        fn list_areas(&self) -> Vec<AreaInfo> {
+            vec![self.0.clone()]
+        }
+        fn load_area(&self, key: &str) -> Result<Box<dyn AreaRuntime>, AdapterError> {
+            if key == self.0.id.key {
+                Ok(Box::new(StubArea(self.0.clone())))
+            } else {
+                Err(AdapterError::AreaNotFound(key.to_string()))
+            }
+        }
+    }
+
+    async fn bind(info: AreaInfo) -> Result<Server, ServerError> {
+        let config = ServerConfig { bind: "127.0.0.1:0".parse().unwrap(), area_key: info.id.key.clone(), ..ServerConfig::default() };
+        Server::bind(config, Box::new(StubAdapter(info))).await
+    }
+
+    #[test]
+    fn real_content_is_not_labeled_fixture() {
+        let label = label_area(&real_info()).unwrap();
+        assert_eq!(label, AreaLabel { fixture: false, reasons: vec![], display_name: "FF7 field md1stin".into() });
+    }
+
+    #[test]
+    fn the_fixture_adapters_own_area_is_fixture_and_keeps_its_name() {
+        let info = FixtureAdapter::new().list_areas().remove(0);
+        let label = label_area(&info).unwrap();
+        assert!(label.fixture);
+        assert_eq!(label.display_name, info.display_name, "already carries the FIXTURE label");
+        assert!(label.display_name.contains("FIXTURE"));
+    }
+
+    #[test]
+    fn fixture_is_derived_from_provenance_not_only_from_the_adapters_flag() {
+        // Each of these claims to be a real game and says `fixture: false`.
+        let synthetic = {
+            let mut i = real_info();
+            i.provenance.platform = Platform::Synthetic;
+            i
+        };
+        let fixture_source = {
+            let mut i = real_info();
+            i.provenance.sources.push(SourceRef::Fixture);
+            i
+        };
+        let flagged_only = {
+            let mut i = real_info();
+            i.fixture = true;
+            i
+        };
+        for (info, why) in [(synthetic, "Synthetic"), (fixture_source, "Fixture source"), (flagged_only, "adapter flags")] {
+            let label = label_area(&info).unwrap();
+            assert!(label.fixture, "{why}");
+            assert!(label.reasons.iter().any(|r| r.contains(why)), "{why}: {:?}", label.reasons);
+            assert_eq!(label.display_name, "FIXTURE: FF7 field md1stin", "{why}: the manifest name must carry the label");
+        }
+    }
+
+    #[test]
+    fn an_area_whose_provenance_names_another_game_is_refused() {
+        let mut info = real_info();
+        info.provenance.game = GameId::Fixture;
+        let err = label_area(&info).unwrap_err();
+        assert!(matches!(err, ServerError::BadArea(..)), "{err}");
+        assert!(err.to_string().contains("provenance"), "{err}");
+
+        let mut info = FixtureAdapter::new().list_areas().remove(0);
+        info.provenance.game = GameId::Ff7; // a fixture id dressed up with real provenance
+        assert!(label_area(&info).is_err());
+    }
+
+    #[tokio::test]
+    async fn bind_announces_the_derived_label_on_the_ready_line_and_in_the_manifest() {
+        // Real-looking area: not fixture, name untouched, no local path anywhere in the manifest.
+        let server = bind(real_info()).await.unwrap();
+        assert!(!server.is_fixture());
+        assert!(server.ready_line().ends_with("area=Ff7/md1stin fixture=false"), "{}", server.ready_line());
+        match &*server.shared.manifest {
+            ServerMsg::AreaManifest { fixture, display_name, provenance, .. } => {
+                assert!(!fixture);
+                assert_eq!(display_name, "FF7 field md1stin");
+                assert!(!format!("{provenance:?}").contains("private"), "no install path may reach the wire");
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // Same area, but its provenance is synthetic while the adapter says `fixture: false`.
+        let mut sneaky = real_info();
+        sneaky.provenance.platform = Platform::Synthetic;
+        let server = bind(sneaky).await.unwrap();
+        assert!(server.is_fixture());
+        assert!(server.ready_line().ends_with("area=Ff7/md1stin fixture=true"), "{}", server.ready_line());
+        match &*server.shared.manifest {
+            ServerMsg::AreaManifest { fixture, display_name, .. } => {
+                assert!(fixture);
+                assert!(display_name.starts_with("FIXTURE"), "{display_name}");
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // Contradictory provenance never starts a listener.
+        let mut wrong = real_info();
+        wrong.provenance.game = GameId::Ff8;
+        match bind(wrong).await {
+            Err(ServerError::BadArea(id, why)) => {
+                assert_eq!(id.key, "md1stin");
+                assert!(why.contains("Ff8"), "{why}");
+            }
+            Err(other) => panic!("wrong error: {other}"),
+            Ok(_) => panic!("must not bind"),
+        }
+    }
+}

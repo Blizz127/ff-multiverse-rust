@@ -1,6 +1,6 @@
 [package]
 name = "fmv-server"
-description = "Authoritative FF Multiverse server."
+description = "Authoritative FF Multiverse server (protocol v1). Hosts one area; the FIXTURE area is synthetic and NOT FF7 support."
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
@@ -8,3 +8,14 @@ license.workspace = true
 
 [dependencies]
 fmv-core.workspace = true
+fmv-protocol.workspace = true
+fmv-adapter-api.workspace = true
+fmv-fixture.workspace = true
+tokio.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+thiserror.workspace = true
+# Already in the lockfile through tokio. Used only to configure TCP keepalive timers on accepted
+# sockets (tokio exposes just the on/off switch, and the Linux default idle time is 2 hours).
+socket2 = { version = "0.6", features = ["all"] }

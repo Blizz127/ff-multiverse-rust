@@ -8,3 +8,18 @@ license.workspace = true
 
 [dependencies]
 fmv-core.workspace = true
+fmv-protocol.workspace = true
+fmv-adapter-api.workspace = true
+fmv-fixture.workspace = true
+tokio.workspace = true
+clap.workspace = true
+thiserror.workspace = true
+wgpu.workspace = true
+winit.workspace = true
+pollster.workspace = true
+bytemuck.workspace = true
+
+[dev-dependencies]
+# Paused-clock liveness tests (deterministic under load). `test-util` only enables tokio's
+# own features (rt, sync, time): it adds no packages, so Cargo.lock is unaffected.
+tokio = { workspace = true, features = ["test-util"] }

@@ -8,3 +8,6 @@ license.workspace = true
 
 [dependencies]
 fmv-core.workspace = true
+fmv-adapter-api.workspace = true
+blake3.workspace = true
+thiserror.workspace = true
