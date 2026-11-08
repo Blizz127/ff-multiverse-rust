@@ -1,4 +1,4 @@
-//! `fmv-server`: authoritative FF Multiverse server (protocol v4).
+//! `fmv-server`: authoritative FF Multiverse server (protocol v5).
 //!
 //! Thin wrapper over the `fmv_server` library: parse flags, pick the game adapter, install
 //! signal handlers, run. Logs go to stderr; stdout carries exactly one line, the READY line.
@@ -7,10 +7,13 @@
 //! imported library (`--ff7-library`, `--ff7-set`) or a `flevel.lgp` read directly
 //! (`--ff7-flevel`). Both are opened read-only, and no asset byte ever leaves this process.
 //!
-//! Battles (protocol v3): an FF7 server opened from a library also loads that set's `scene.bin`
-//! and `kernel.bin` and runs shared, server-authoritative battles (random encounters in a field
-//! that has an encounter table, and on request with `--debug-encounters`). The FIXTURE server and
-//! a server over a direct `--ff7-flevel` have no battle data and refuse every battle request.
+//! Battles (protocol v3, with character progress since v5): an FF7 server opened from a library also
+//! loads that set's `scene.bin` and `kernel.bin` and runs shared, server-authoritative battles
+//! (random encounters in a field that has an encounter table, and on request with
+//! `--debug-encounters`). Every account fights as its own character at its own level and a victory
+//! pays it (level, experience, AP and gil are kept per account in the state directory). The FIXTURE
+//! server and a server over a direct `--ff7-flevel` have no battle data and refuse every battle
+//! request.
 //!
 //! Players have accounts: the server keeps them (with avatar profiles and progression) in a state
 //! directory it holds locked while it runs (`--state-dir`, default `<state>/server`;
@@ -78,12 +81,21 @@ BATTLES:
   seeds and levels are sent). A battle starts for the whole party from a random encounter in a
   field that has an encounter table (md1stin has one), or when a player asks for one and the server
   runs with --debug-encounters (off by default). Without battle data (--game fixture, a direct
-  --ff7-flevel) every battle request is refused. Rewards are logged and sent, not stored.
+  --ff7-flevel) every battle request is refused.
+
+CHARACTER PROGRESS:
+  Every account has its own progress in the game, kept in the state directory beside (and apart
+  from) its story state: the character its look names (Cloud unless it chose another) and that
+  character's level, experience, AP and gil. A battle's members fight as their own character at their
+  own level; a victory pays each member that fought on and the server applies it with the game's own
+  level-up rule (the experience curve of the character's kernel data), tells the player
+  (`CharacterProgress`, which it also gets when it joins) and saves it. An account that has earned
+  nothing yet starts at its character's starting level and experience from the game data.
   --battle-speed, --battle-tick-rate, --battle-level, --battle-seed and --debug-formation pin the
   pace, level, seed and fight for reproducible runs; --no-random-encounters turns the rolls off.";
 
 #[derive(Parser, Debug)]
-#[command(name = "fmv-server", version, about = "Authoritative FF Multiverse server (protocol v4)", after_help = AFTER_HELP)]
+#[command(name = "fmv-server", version, about = "Authoritative FF Multiverse server (protocol v5)", after_help = AFTER_HELP)]
 struct Cli {
     /// Address to listen on. Port 0 picks a free port (reported on the READY line).
     #[arg(long, value_name = "ADDR", default_value_t = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), DEFAULT_DEV_PORT))]
@@ -204,8 +216,9 @@ struct Cli {
     #[arg(long, value_name = "TPS", default_value_t = DEFAULT_TICKS_PER_SECOND, value_parser = clap::value_parser!(u32).range(1..=1000))]
     battle_tick_rate: u32,
 
-    /// The level every battle member fights at (default: each character's starting level from the
-    /// game data).
+    /// The level every battle member fights at, whatever its own level is (default: each member
+    /// fights at its account's own level). Only the fight is pinned: rewards still go to each
+    /// account's own progress.
     #[arg(long, value_name = "LEVEL", value_parser = clap::value_parser!(u8).range(1..=99))]
     battle_level: Option<u8>,
 

@@ -606,7 +606,8 @@ where
             | ServerMsg::EncounterStart { .. }
             | ServerMsg::BattleEvent { .. }
             | ServerMsg::BattleEnd { .. }
-            | ServerMsg::BattleRejected { .. }) => push_backlog(&mut backlog, other),
+            | ServerMsg::BattleRejected { .. }
+            | ServerMsg::CharacterProgress { .. }) => push_backlog(&mut backlog, other),
         }
         if let (Some(_), Some(_), Some(_)) = (&welcome, &offer, &snapshot) {
             let (Some(w), Some(o), Some(entities)) = (welcome, offer, snapshot) else {

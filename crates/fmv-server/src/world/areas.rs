@@ -609,7 +609,8 @@ mod tests {
         let close_rx = close.subscribe();
         let avatar = AvatarAppearance { display_name: name.into(), tint: [1, 2, 3], appearance_ref: None };
         let account = AccountId(entity.0);
-        w.join(NewPlayer { session, entity, account, avatar, phase: PhaseKey::default(), tx, close }, now).expect("joins");
+        w.join(NewPlayer { session, entity, account, avatar, phase: PhaseKey::default(), progress: Default::default(), tx, close }, now)
+            .expect("joins");
         Seat { entity, account, rx, close: close_rx }
     }
 

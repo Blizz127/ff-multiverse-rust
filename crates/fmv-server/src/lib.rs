@@ -1,4 +1,4 @@
-//! Authoritative FF Multiverse server for protocol v4 (`fmv-protocol`).
+//! Authoritative FF Multiverse server for protocol v5 (`fmv-protocol`).
 //!
 //! The server hosts the areas of one `GameAdapter` (`Box<dyn GameAdapter>`, so wiring a real game
 //! later is a one-line change in the binary): the *entry* area named by the configuration, which
@@ -38,6 +38,16 @@
 //! members what happened; clients replay it from their own files. A server without battle data
 //! (the FIXTURE one) refuses every request with `BattleRejection::Unsupported`. See the `world`
 //! module for the rules, and `fmv_protocol::battle` for the wire contract.
+//!
+//! # Character progress
+//!
+//! Every account has its own character progress in the game (`progress`): the character its look
+//! names and that character's level, experience, AP and gil, kept in the store as a record of its own,
+//! separate from the story state that selects its phase. A battle's `EncounterStart` carries each
+//! member's own character and level, a victory pays each member that fought on, and the payment is
+//! applied to the member's progress (with the game's level-up rule), told to it as a
+//! `CharacterProgress` message (which it also gets on joining) and saved by the `saver` task, which
+//! `serve` stops, after saving everything queued, before it returns.
 //!
 //! # Limits and refusals
 //!
@@ -81,6 +91,8 @@ mod conn;
 mod deferred;
 pub mod ff7;
 mod limits;
+mod progress;
+mod saver;
 mod world;
 
 pub use accounts::MAX_APPEARANCE_REF;
@@ -250,6 +262,11 @@ impl Server {
         world.set_travel_timeout(config.join_timeout);
         world.configure_battle(config.battle.clone(), config.debug_encounters);
         let (store, ephemeral_state) = open_store(&config).await?;
+        // A server that runs battles saves what they pay, off the world lock (see `saver`).
+        let saver = config.battle.as_ref().map(|b| saver::Saver::spawn(Arc::clone(&store), area_id.game, Arc::clone(&b.rules)));
+        if let Some(saver) = &saver {
+            world.set_progress_saver(saver.handle());
+        }
         let listener = TcpListener::bind(config.bind)
             .await
             .map_err(|source| ServerError::Bind { addr: config.bind, source })?;
@@ -271,7 +288,7 @@ impl Server {
             (None, false) => info!("battles unsupported on this server (no owned battle data); battle requests are refused"),
         }
         if !local_addr.ip().is_loopback() {
-            warn!(%local_addr, "listening on a non-loopback address; protocol v4 is not encrypted (account tokens and game traffic cross the network in the clear): use it only on a network you trust");
+            warn!(%local_addr, "listening on a non-loopback address; protocol v5 is not encrypted (account tokens and game traffic cross the network in the clear): use it only on a network you trust");
         }
 
         let build = config.build_string();
@@ -285,6 +302,7 @@ impl Server {
             provenance: provenance.clone(),
             build,
             store,
+            saver,
             limits,
             _ephemeral_state: ephemeral_state,
         });
@@ -412,6 +430,12 @@ impl Server {
             Err(_) => warn!(grace = ?shared.cfg.shutdown_grace, "grace period elapsed with connections still open"),
         }
         let _ = tick.await;
+        // Every connection is closed and the world no longer ticks: nothing more can be paid. Save what
+        // is queued and wait for the saver to let go of the store, so that whoever opens this state
+        // directory next finds everything in it and its lock free.
+        if let Some(saver) = &shared.saver {
+            saver.shutdown(shared.cfg.shutdown_grace).await;
+        }
         Ok(())
     }
 }

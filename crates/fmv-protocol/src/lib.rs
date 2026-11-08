@@ -1,10 +1,13 @@
-//! FF Multiverse wire protocol v4.
+//! FF Multiverse wire protocol v5.
 //!
-//! v4 is v3 (accounts, battles, rejection codes) plus area travel: [`ServerMsg::AreaChange`] and
-//! `AreaSnapshot::npcs` (see "Area travel"). A v3 peer cannot decode `AreaChange` (an unknown
-//! message is a decode error), so the version was bumped: a server answers a v3 `Hello` with
-//! `Reject { code: ProtocolMismatch }` at the handshake, a clean refusal instead of a dropped
-//! connection at the first exit a player crosses.
+//! v5 is v4 (area travel: [`ServerMsg::AreaChange`] and `AreaSnapshot::npcs`, see "Area travel") plus
+//! character progress: [`ServerMsg::CharacterProgress`] (see "Character progress"). v4 was v3
+//! (accounts, battles, rejection codes) plus area travel. A peer cannot decode a message variant it
+//! does not know (an unknown message is a decode error), so each of these changes bumped the
+//! version: a server answers an older `Hello` with `Reject { code: ProtocolMismatch }` at the
+//! handshake, a clean refusal instead of a dropped connection at the first exit a player crosses
+//! (v3) or the moment a player joins (v4: a v4 client would choke on the progress message that
+//! follows every join).
 //!
 //! Framing: `u32` little-endian payload length, then the payload. The payload codec is JSON
 //! (serde_json; postcard is not in the local crate cache). The codec is isolated in
@@ -77,6 +80,33 @@
 //! static, with no `EntityUpdate`s of their own, sent with every snapshot of the area. It is left
 //! out of the JSON when empty, so a snapshot of an area without any is byte-for-byte what it was.
 //!
+//! # Character progress (v5)
+//!
+//! Each account has its own progression in the game it plays, separate from the story phase: the
+//! character it plays (FF7: the one its avatar looks like), that character's level, experience, AP
+//! and gil. The SERVER keeps it (and stores it, see `fmv-persist`'s `CharacterProgress`); the
+//! client only mirrors what it is told. Three things use it:
+//!
+//! * `EncounterStart::party` names each member's own `character` and `level` (a client replays
+//!   the battle from them, as before: the numbers were always on the wire),
+//! * a victory pays each member that fought on (`BattleEnd::rewards`, see [`split_rewards`]): the
+//!   server adds it to that member's progress, applying the game's own level-up rule,
+//! * [`ServerMsg::CharacterProgress`] tells the player what its progress is now: on joining, and after
+//!   every won battle it was a member of (also when it was paid nothing, being dead at the end: then
+//!   the numbers are what they were and `leveled_up` is false). A lost battle pays nothing and sends
+//!   nothing.
+//!
+//! ```text
+//! S -> C  AreaSnapshot, InstancePlacement, CharacterProgress { .., leveled_up: false }   on join
+//! S -> C  BattleEnd { battle_id, outcome: Victory, rewards }
+//! S -> C  CharacterProgress { .., leveled_up }       right after, to each member that is still online
+//! ```
+//!
+//! `exp_to_next` is the experience still missing for the next level (0 at the highest level), so
+//! the next threshold is `exp + exp_to_next`. A server without battle data (the FIXTURE one) has no
+//! characters to level and sends none. Nothing in the message is a game datum: levels, experience,
+//! AP and gil are the player's own numbers, and the tables behind them stay in each peer's files.
+//!
 //! # Accounts
 //!
 //! `Hello::auth` is [`Auth::Register`] (create an account with that display name) or
@@ -129,7 +159,8 @@ pub use reject::RejectCode;
 /// [`battle`], where their names say what they are).
 pub use battle::{
     split_rewards, ActorId, AppliedCommand, BattleBuildError, BattleId, BattleMember, BattleRejection, BattleReplay, BattleReward,
-    BattleRules, BattleSetup, Divergence, Ff7BattleData, Ff7BattleDataError, FormationInfo, SyntheticRules, MAX_BATTLE_PARTY,
+    BattleRules, BattleSetup, Divergence, Ff7BattleData, Ff7BattleDataError, FormationInfo, ProgressLimits, SyntheticRules,
+    MAX_BATTLE_PARTY,
 };
 
 /// The party types carried on the wire, re-exported so a client needs no direct `fmv-party`
@@ -139,7 +170,7 @@ pub use fmv_party::{
     PartyEvent, PartyId, Placement,
 };
 
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 /// Hard cap on a single frame payload (bytes).
 pub const MAX_FRAME: u32 = 256 * 1024;
 /// Default TCP port for development. Deployment port is UNASSIGNED (see DEPLOYMENT-CONTRACT.md).
@@ -403,6 +434,14 @@ pub enum ServerMsg {
     /// A battle request or command of this client was refused. `battle_id` is the battle it was
     /// about, if any.
     BattleRejected { battle_id: Option<BattleId>, reason: BattleRejection },
+    /// This player's own character progress, as the server holds it: sent after the join messages
+    /// and again right after `BattleEnd` of every won battle this player was a member of, whether or
+    /// not it was paid (see the module docs, "Character progress").
+    /// `character` is the game's character id (FF7: Cloud 0, Barret 1, ...,
+    /// `fmv_ff7_battle::kernel::CharacterId::index`), `exp` the total experience, `exp_to_next` what is
+    /// still missing for the next level (0 at the highest), `gil` and `ap` what the player holds, and
+    /// `leveled_up` whether this message follows a level gained (never on the join message).
+    CharacterProgress { character: u8, level: u8, exp: u32, exp_to_next: u32, gil: u32, ap: u32, leveled_up: bool },
 }
 
 impl ServerMsg {
@@ -520,8 +559,8 @@ mod tests {
     }
 
     #[test]
-    fn the_version_is_four() {
-        assert_eq!(PROTOCOL_VERSION, 4);
+    fn the_version_is_five() {
+        assert_eq!(PROTOCOL_VERSION, 5);
     }
 
     // -----------------------------------------------------------------------------------------
@@ -575,13 +614,13 @@ mod tests {
     fn golden_client_messages() {
         golden(
             ClientMsg::Hello {
-                protocol_version: 4,
+                protocol_version: 5,
                 client_build: "c/1".into(),
                 auth: Auth::Register { display_name: "Cloud".into() },
                 tint: [10, 20, 30],
                 appearance_ref: Some("cloud_model".into()),
             },
-            r#"{"Hello":{"protocol_version":4,"client_build":"c/1","auth":{"Register":{"display_name":"Cloud"}},"tint":[10,20,30],"appearance_ref":"cloud_model"}}"#,
+            r#"{"Hello":{"protocol_version":5,"client_build":"c/1","auth":{"Register":{"display_name":"Cloud"}},"tint":[10,20,30],"appearance_ref":"cloud_model"}}"#,
         );
         golden(
             ClientMsg::JoinArea {
@@ -612,13 +651,13 @@ mod tests {
         golden(ClientMsg::PartySync, r#""PartySync""#);
         golden(
             ClientMsg::Hello {
-                protocol_version: 4,
+                protocol_version: 5,
                 client_build: "c/1".into(),
                 auth: Auth::Token(Secret::new("fmvt_x")),
                 tint: [0, 0, 0],
                 appearance_ref: None,
             },
-            r#"{"Hello":{"protocol_version":4,"client_build":"c/1","auth":{"Token":"fmvt_x"},"tint":[0,0,0],"appearance_ref":null}}"#,
+            r#"{"Hello":{"protocol_version":5,"client_build":"c/1","auth":{"Token":"fmvt_x"},"tint":[0,0,0],"appearance_ref":null}}"#,
         );
     }
 
@@ -626,14 +665,14 @@ mod tests {
     fn golden_server_messages() {
         golden(
             ServerMsg::Welcome {
-                protocol_version: 4,
+                protocol_version: 5,
                 server_build: "s/1".into(),
                 session: SessionId(4),
                 entity: EntityId(5),
                 account: AccountId(6),
                 issued_token: None,
             },
-            r#"{"Welcome":{"protocol_version":4,"server_build":"s/1","session":4,"entity":5,"account":6,"issued_token":null}}"#,
+            r#"{"Welcome":{"protocol_version":5,"server_build":"s/1","session":4,"entity":5,"account":6,"issued_token":null}}"#,
         );
         golden(
             ServerMsg::PartyRejected { error: PartyFailure::Rules(PartyError::PartyFull { party: PartyId(2), max_size: 3 }) },
@@ -1033,6 +1072,59 @@ mod tests {
             ServerMsg::BattleRejected { battle_id: None, reason: BattleRejection::Unsupported },
             r#"{"BattleRejected":{"battle_id":null,"reason":"Unsupported"}}"#,
         );
+    }
+
+    /// Character progress (v5): the message is pinned field by field, and it is small whatever its
+    /// numbers are (it goes to every player after every battle).
+    #[test]
+    fn golden_character_progress() {
+        golden(
+            ServerMsg::CharacterProgress { character: 0, level: 7, exp: 626, exp_to_next: 323, gil: 10, ap: 2, leveled_up: true },
+            r#"{"CharacterProgress":{"character":0,"level":7,"exp":626,"exp_to_next":323,"gil":10,"ap":2,"leveled_up":true}}"#,
+        );
+        golden(
+            ServerMsg::CharacterProgress { character: 2, level: 99, exp: 2_408_997, exp_to_next: 0, gil: 0, ap: 0, leveled_up: false },
+            r#"{"CharacterProgress":{"character":2,"level":99,"exp":2408997,"exp_to_next":0,"gil":0,"ap":0,"leveled_up":false}}"#,
+        );
+        let biggest = ServerMsg::CharacterProgress {
+            character: u8::MAX,
+            level: u8::MAX,
+            exp: u32::MAX,
+            exp_to_next: u32::MAX,
+            gil: u32::MAX,
+            ap: u32::MAX,
+            leveled_up: true,
+        };
+        let frame = encode(&biggest).unwrap();
+        assert!(frame.len() < 200, "{} bytes", frame.len());
+        assert_eq!(decode::<ServerMsg>(&frame[4..]).unwrap(), biggest);
+        // Every field is required: a message that lost one is refused, not guessed.
+        for missing in ["character", "level", "exp", "exp_to_next", "gil", "ap", "leveled_up"] {
+            let mut v = serde_json::json!({"character":0,"level":1,"exp":0,"exp_to_next":6,"gil":0,"ap":0,"leveled_up":false});
+            v.as_object_mut().unwrap().remove(missing);
+            let text = serde_json::json!({ "CharacterProgress": v }).to_string();
+            assert!(decode::<ServerMsg>(text.as_bytes()).is_err(), "decoded without {missing}");
+        }
+    }
+
+    /// The reason for the v5 bump: an older peer cannot decode `CharacterProgress`, which a server
+    /// sends right after every join, so the handshake has to refuse it first. (The older peer's
+    /// message enum is simulated by an enum that lacks the variant.)
+    #[test]
+    fn an_older_peer_cannot_decode_the_new_message_so_the_version_had_to_change() {
+        #[derive(Debug, Deserialize)]
+        enum ServerMsgV4 {
+            #[allow(dead_code)]
+            Pong { nonce: u64, tick: u64 },
+        }
+        let msg = ServerMsg::CharacterProgress { character: 0, level: 6, exp: 372, exp_to_next: 244, gil: 0, ap: 0, leveled_up: false };
+        let frame = encode(&msg).unwrap();
+        assert!(decode::<ServerMsgV4>(&frame[4..]).is_err());
+        assert!(decode::<ServerMsgV4>(br#"{"Pong":{"nonce":1,"tick":2}}"#).is_ok(), "the stand-in decodes what it knows");
+        // And the handshake check that refuses such a peer reads the version from any Hello.
+        let hello_v4 = br#"{"Hello":{"protocol_version":4,"client_build":"c","auth":{"Token":"x"},"tint":[0,0,0],"appearance_ref":null}}"#;
+        assert_eq!(probe_hello_version(hello_v4), Some(4));
+        assert_ne!(probe_hello_version(hello_v4), Some(PROTOCOL_VERSION));
     }
 
     /// The engine's own events, commands and outcomes are embedded in the messages, so their shape is

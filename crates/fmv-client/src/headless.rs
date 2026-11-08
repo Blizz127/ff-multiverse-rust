@@ -94,19 +94,25 @@ pub struct Smoke<'a> {
     /// refused, and the way back, do not count). `area` is where it ended up and `peers_seen` is
     /// counted in that final area only.
     pub area_changes: u64,
+    /// The level the server last said our character has (protocol v5), 0 if it never said (a server
+    /// without battles, such as the FIXTURE one, sends no progress; 0 is not a level).
+    pub level: u32,
+    /// The total experience the server last said our character has, 0 if it never said.
+    pub exp: u32,
 }
 
-/// `SMOKE name=<n> area=<AreaId> fixture=<bool> peers_seen=<n> updates=<n> rejected=<n> rtt_ms=<n|-1> party=<n> battles=<n> victories=<n> area_changes=<n>`
+/// `SMOKE name=<n> area=<AreaId> fixture=<bool> peers_seen=<n> updates=<n> rejected=<n> rtt_ms=<n|-1> party=<n> battles=<n> victories=<n> area_changes=<n> level=<n> exp=<n>`
 ///
 /// `<n>` in `name=` is the display name percent-encoded by [`encode_name`]; the other fields
 /// never contain whitespace (the area comes from the local adapter's catalog, not from the
-/// network). `battles=` and `victories=` were appended in protocol v3 and `area_changes=` after
-/// them (area travel); the fields before are unchanged.
+/// network). `battles=` and `victories=` were appended in protocol v3, `area_changes=` after
+/// them (area travel) and `level=` and `exp=` after that (character progress, protocol v5); the
+/// fields before are unchanged.
 pub fn smoke_line(smoke: &Smoke<'_>) -> String {
-    let Smoke { name, area, fixture, peers_seen, updates, rejected, rtt, party, battles, victories, area_changes } = smoke;
+    let Smoke { name, area, fixture, peers_seen, updates, rejected, rtt, party, battles, victories, area_changes, level, exp } = smoke;
     let rtt_ms = rtt.map_or(-1, |d| (d.as_secs_f64() * 1000.0).round() as i64);
     let name = encode_name(name);
-    format!("SMOKE name={name} area={area} fixture={fixture} peers_seen={peers_seen} updates={updates} rejected={rejected} rtt_ms={rtt_ms} party={party} battles={battles} victories={victories} area_changes={area_changes}")
+    format!("SMOKE name={name} area={area} fixture={fixture} peers_seen={peers_seen} updates={updates} rejected={rejected} rtt_ms={rtt_ms} party={party} battles={battles} victories={victories} area_changes={area_changes} level={level} exp={exp}")
 }
 
 pub fn run(args: &Args, mut session: Session) -> u8 {
@@ -169,6 +175,7 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
         }
         session.log_party_notes();
         session.log_battle_notes();
+        session.log_progress_notes();
         // The server moved us to another area: walk the pattern of the new one, and cross it off
         // the route if that is where the bot meant to go.
         if let Some(change) = session.take_area_change() {
@@ -264,6 +271,7 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
     }
     session.log_party_notes();
     session.log_battle_notes();
+    session.log_progress_notes();
     eprintln!("headless: {}", session.state.party.summary());
     if battle_bot.is_active() || session.state.battle.entered() > 0 || session.state.battle.rejections() > 0 {
         eprintln!("headless: battles: {}", session.state.battle.summary());
@@ -297,6 +305,8 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
         battles: session.state.battle.entered(),
         victories: session.state.battle.victories(),
         area_changes: session.state.area_changes(),
+        level: session.state.progress.level(),
+        exp: session.state.progress.exp(),
     });
     // Ignore write errors (e.g. a closed pipe): the exit code still tells the story.
     let _ = writeln!(std::io::stdout().lock(), "{line}");
@@ -339,7 +349,7 @@ mod tests {
     }
 
     fn smoke<'a>(name: &'a str, area: &'a AreaId, fixture: bool, rtt: Option<Duration>) -> Smoke<'a> {
-        Smoke { name, area, fixture, peers_seen: 2, updates: 31, rejected: 1, rtt, party: 3, battles: 1, victories: 1, area_changes: 2 }
+        Smoke { name, area, fixture, peers_seen: 2, updates: 31, rejected: 1, rtt, party: 3, battles: 1, victories: 1, area_changes: 2, level: 7, exp: 626 }
     }
 
     #[test]
@@ -351,7 +361,7 @@ mod tests {
         let l = smoke_line(&smoke("botA", &area, true, Some(Duration::from_micros(2_600))));
         assert_eq!(
             l,
-            "SMOKE name=botA area=Fixture/plaza fixture=true peers_seen=2 updates=31 rejected=1 rtt_ms=3 party=3 battles=1 victories=1 area_changes=2"
+            "SMOKE name=botA area=Fixture/plaza fixture=true peers_seen=2 updates=31 rejected=1 rtt_ms=3 party=3 battles=1 victories=1 area_changes=2 level=7 exp=626"
         );
         let l = smoke_line(&Smoke {
             name: "b",
@@ -365,28 +375,30 @@ mod tests {
             battles: 0,
             victories: 0,
             area_changes: 0,
+            level: 0,
+            exp: 0,
         });
         assert_eq!(
             l,
-            "SMOKE name=b area=Fixture/plaza fixture=false peers_seen=0 updates=0 rejected=0 rtt_ms=-1 party=0 battles=0 victories=0 area_changes=0"
+            "SMOKE name=b area=Fixture/plaza fixture=false peers_seen=0 updates=0 rejected=0 rtt_ms=-1 party=0 battles=0 victories=0 area_changes=0 level=0 exp=0"
         );
         assert!(!l.contains('\n'));
     }
 
     /// `scripts/smoke.sh` parses the line by key, and new fields are only ever appended: the
-    /// protocol-v2 keys keep their names and their order, `battles` and `victories` (v3) follow and
-    /// `area_changes` (area travel) comes last.
+    /// protocol-v2 keys keep their names and their order, `battles` and `victories` (v3) follow,
+    /// `area_changes` (area travel) after them and `level` and `exp` (character progress) come last.
     #[test]
-    fn the_smoke_keys_keep_their_order_and_the_battle_fields_are_last() {
+    fn the_smoke_keys_keep_their_order_and_the_newest_fields_are_last() {
         let area = AreaId { game: GameId::Fixture, key: "plaza".into() };
         let l = smoke_line(&smoke("x", &area, true, None));
         let keys: Vec<&str> = l.split_whitespace().skip(1).map(|f| f.split_once('=').unwrap().0).collect();
         assert_eq!(
             keys,
-            ["name", "area", "fixture", "peers_seen", "updates", "rejected", "rtt_ms", "party", "battles", "victories", "area_changes"]
+            ["name", "area", "fixture", "peers_seen", "updates", "rejected", "rtt_ms", "party", "battles", "victories", "area_changes", "level", "exp"]
         );
         assert!(l.starts_with("SMOKE "), "{l}");
-        assert!(l.ends_with(" party=3 battles=1 victories=1 area_changes=2"), "{l}");
+        assert!(l.ends_with(" party=3 battles=1 victories=1 area_changes=2 level=7 exp=626"), "{l}");
         // A v2 parser that reads the first eight fields (and `party` among them) still works.
         assert!(l.contains(" rtt_ms=-1 party=3 "), "{l}");
     }
@@ -438,9 +450,9 @@ mod tests {
             );
             assert_eq!(decode(&enc), name);
 
-            let line = smoke_line(&Smoke { name, area: &area, fixture: true, peers_seen: 1, updates: 2, rejected: 3, rtt: None, party: 1, battles: 0, victories: 0, area_changes: 0 });
+            let line = smoke_line(&Smoke { name, area: &area, fixture: true, peers_seen: 1, updates: 2, rejected: 3, rtt: None, party: 1, battles: 0, victories: 0, area_changes: 0, level: 0, exp: 0 });
             assert_eq!(line.lines().count(), 1, "{line:?}");
-            assert_eq!(line.split_whitespace().count(), 12, "SMOKE + 11 fields: {line:?}");
+            assert_eq!(line.split_whitespace().count(), 14, "SMOKE + 13 fields: {line:?}");
             for field in line.split_whitespace().skip(1) {
                 assert!(field.split_once('=').is_some(), "{field:?} in {line:?}");
             }

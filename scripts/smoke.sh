@@ -13,7 +13,10 @@
 #        fmv-client --server <host:port> --name <n> --headless --duration <secs>
 #      and expects each to print
 #        SMOKE name=<n> area=<AreaId> fixture=<bool> peers_seen=<n> updates=<n> rejected=<n> rtt_ms=<n>
-#      with peers_seen >= 1 and to exit 0.
+#             party=<n> battles=<n> victories=<n> area_changes=<n> level=<n> exp=<n>
+#      with peers_seen >= 1 and to exit 0. (Only the key=value tokens it needs are read, by key: new
+#      fields are appended at the end of the line and never move the ones before them. level and exp
+#      are the character progress the server reported, 0 and 0 from the FIXTURE server, which has none.)
 #   4. Sends the server SIGTERM and expects it to exit (status 0, or 143 when it has no
 #      SIGTERM handler and is simply terminated by the signal; the latter is reported).
 #

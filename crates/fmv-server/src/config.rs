@@ -66,8 +66,9 @@ pub const DEFAULT_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 pub struct BattleSettings {
     /// The battle rules over THIS server's own game data (see `fmv_protocol::BattleRules`).
     pub rules: Arc<dyn BattleRules>,
-    /// The level every battle member fights at; `None` is each character's starting level from
-    /// the game data.
+    /// The level every battle member fights at, whatever its own level is; `None` is each member's
+    /// own level (its account's character progress). Only the fight is pinned: rewards still go to
+    /// each account's own progress.
     pub level: Option<u8>,
     /// FF7 "Battle Speed" (0 fastest, 255 slowest), announced to clients in `EncounterStart`.
     pub battle_speed: u8,

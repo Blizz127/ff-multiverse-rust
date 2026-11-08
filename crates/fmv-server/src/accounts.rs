@@ -39,6 +39,8 @@ use fmv_core::{AccountId, AvatarAppearance, GameId, NameError, PhaseKey};
 use fmv_persist::{AvatarProfile, PersistError, Store};
 use fmv_protocol::{RejectCode, Secret};
 
+use crate::progress::{self, Progress, ProgressSeed};
+
 /// Base archetype of a new avatar (every adapter maps archetypes to its closest model).
 pub const DEFAULT_ARCHETYPE: &str = "default";
 
@@ -64,6 +66,9 @@ pub struct Login {
     pub phase: PhaseKey,
     /// `Some` only when this call registered the account: the token, to be sent once.
     pub issued_token: Option<String>,
+    /// The character its look names and what the store holds of its character progress (nothing for
+    /// a new account). Separate from `phase`: see `progress`.
+    pub progress: ProgressSeed,
 }
 
 /// Why a login failed.
@@ -205,7 +210,15 @@ pub fn login_with_token(store: &Store, game: GameId, token: &Secret, tint: [u8; 
         None => store.create_avatar(account, tint, DEFAULT_ARCHETYPE, now).map_err(map_store_error)?,
     };
     let progression = store.get_progression(account, game).map_err(map_store_error)?;
-    Ok(Login { account, avatar: shown(game, &profile), phase: phase_key(progression.blob), issued_token: None })
+    // A record that cannot be read (damaged, from a newer build) fails the login like a story blob that
+    // cannot be read does: it is never replaced by a default, which would later overwrite it.
+    let stored = store.get_character_progress(account, game).map_err(map_store_error)?;
+    let avatar = shown(game, &profile);
+    let progress = ProgressSeed {
+        character: progress::character_for_look(game, avatar.appearance_ref.as_deref()),
+        stored: stored.as_ref().map(Progress::from_record),
+    };
+    Ok(Login { account, avatar, phase: phase_key(progression.blob), issued_token: None, progress })
 }
 
 /// Create the account and its avatar in one store call. `on_created` runs the moment the account
@@ -227,11 +240,17 @@ pub fn register(
         .register(&name, tint, DEFAULT_ARCHETYPE, appearance.as_deref().map(|look| (game, look)), now)
         .map_err(map_store_error)?;
     on_created();
+    let avatar = shown(game, &registered.avatar);
+    let progress = ProgressSeed {
+        character: progress::character_for_look(game, avatar.appearance_ref.as_deref()),
+        stored: None,
+    };
     Ok(Login {
         account: registered.account_id,
-        avatar: shown(game, &registered.avatar),
+        avatar,
         phase: PhaseKey::default(),
         issued_token: Some(registered.token),
+        progress,
     })
 }
 
@@ -623,6 +642,66 @@ mod tests {
         with_token(&store, &player.issued_token.unwrap()).unwrap();
         assert_eq!(release_unclaimed(&store, player.account), Release::NotReleasable);
         assert!(register_ff7(&store, "Player", [0; 3], None).is_err(), "still taken");
+    }
+
+    // ---- character progress at login (M2-d) --------------------------------------------------------
+
+    #[test]
+    fn a_new_account_plays_the_character_its_look_names_and_has_earned_nothing() {
+        let (_dir, store) = store();
+        let tifa = register_ff7(&store, "Tifa", [0; 3], Some("ff7/tifa")).unwrap();
+        assert_eq!(tifa.progress, ProgressSeed { character: 2, stored: None });
+        // No look, or one the game does not offer: the default look and character.
+        let plain = register_ff7(&store, "Plain", [0; 3], None).unwrap();
+        assert_eq!(plain.progress, ProgressSeed::default());
+        let odd = register_ff7(&store, "Odd", [0; 3], Some("not-a-look")).unwrap();
+        assert_eq!(odd.progress.character, progress::DEFAULT_CHARACTER);
+        // A game that has no characters of its own: everybody is the default.
+        let fixture = register_for(GameId::Fixture, &store, "Fixy", [0; 3], Some("ff7/barret")).unwrap();
+        assert_eq!(fixture.progress, ProgressSeed::default());
+        // Nothing was written for any of them.
+        for login in [&tifa, &plain, &odd] {
+            assert_eq!(store.get_character_progress(login.account, GameId::Ff7).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn logging_in_loads_the_stored_character_progress_and_the_character_of_the_look() {
+        let (_dir, store) = store();
+        let reg = register_ff7(&store, "Barret", [0; 3], Some("ff7/barret")).unwrap();
+        let token = reg.issued_token.unwrap();
+        // Before anything was earned: the character of the look, nothing stored.
+        let first = with_token(&store, &token).unwrap();
+        assert_eq!(first.progress, ProgressSeed { character: 1, stored: None });
+
+        // After a battle: what the store holds comes back, as the stored numbers.
+        let record = fmv_persist::CharacterProgress { exp: 700, ap: 9, gil: 250, ..fmv_persist::CharacterProgress::new(reg.account, GameId::Ff7, 1, 8, NOW) };
+        store.put_character_progress(&record).unwrap();
+        let again = with_token(&store, &token).unwrap();
+        assert_eq!(again.progress.character, 1);
+        assert_eq!(again.progress.stored, Some(Progress { character: 1, level: 8, exp: 700, ap: 9, gil: 250 }));
+        // It is not the story: the phase is untouched by it.
+        assert_eq!(again.phase, PhaseKey::default());
+        // Another game's record is not this game's.
+        store.put_character_progress(&fmv_persist::CharacterProgress::new(reg.account, GameId::Ff8, 0, 40, NOW)).unwrap();
+        assert_eq!(with_token(&store, &token).unwrap().progress, again.progress);
+    }
+
+    /// A character record that cannot be read fails the login (like a story blob that cannot be read
+    /// does): a default would be written over it by the next battle, and an operator has to look at it
+    /// first. The client is told the store failed, nothing about the file.
+    #[test]
+    fn a_damaged_character_record_fails_the_login_and_is_left_for_the_operator() {
+        let (dir, store) = store();
+        let reg = register_ff7(&store, "Cid", [0; 3], Some("ff7/cid")).unwrap();
+        let token = reg.issued_token.unwrap();
+        store.put_character_progress(&fmv_persist::CharacterProgress::new(reg.account, GameId::Ff7, 8, 7, NOW)).unwrap();
+        let file = dir.path().join("state").join("progression").join(reg.account.0.to_string()).join("Ff7.character.json");
+        std::fs::write(&file, b"{ not json").unwrap();
+        let err = with_token(&store, &token).unwrap_err();
+        assert!(matches!(err, LoginError::Internal(_)), "{err:?}");
+        assert!(!err.client_text().contains("json") && !err.client_text().contains("state"), "{}", err.client_text());
+        assert_eq!(std::fs::read(&file).unwrap(), b"{ not json", "the damaged file is still there to be looked at");
     }
 
     #[test]

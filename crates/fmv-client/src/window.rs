@@ -534,7 +534,8 @@ impl App {
         let (vw, vh) = renderer.size();
         let mut overlay = DrawList::new();
         let anchor = |subject: Subject, at: Pos| label_anchor(built.as_ref(), view, draw.own_who, subject, at);
-        hud::draw_hud(&hud::gather_anchored(state, &self.session.info, view, render_t, &anchor), vw, vh, &mut overlay);
+        let hud_input = hud::gather_anchored(state, &self.session.info, view, render_t, &anchor);
+        hud::draw_hud_with(&hud_input, hud::progress_line(state, render_t).as_ref(), vw, vh, &mut overlay);
         let result = renderer.render_layers(&scene, built.as_ref().map(|b| &b.frame), Some(&overlay));
         let gpu_error = renderer.first_gpu_error();
         match (result, gpu_error) {

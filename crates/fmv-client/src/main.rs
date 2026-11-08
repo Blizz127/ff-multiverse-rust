@@ -28,6 +28,7 @@ mod nav;
 mod net;
 mod npc;
 mod party;
+mod progress;
 mod render;
 mod session;
 mod state;

@@ -1,9 +1,13 @@
 //! The in-game overlay: player name labels over their markers, the party list, the area name, the
-//! connection status and, for synthetic content, the FIXTURE label.
+//! local player's character progress, the connection status and, for synthetic content, the FIXTURE
+//! label.
 //!
 //! [`draw_hud`] is a pure function of a [`HudInput`] (names, view-space positions, counts) and the
-//! window size; [`gather`] reads the live session into one. Text is drawn at an integer scale on
-//! translucent plates so it stays readable over any background picture.
+//! window size; [`gather`] reads the live session into one. [`draw_hud_with`] adds the one line about
+//! the local player's character (`Cloud Lv 7  EXP 626/949  Gil 20`, see [`progress_line`]) under the
+//! area name; it is a separate argument, not a field of [`HudInput`], so that everything that builds
+//! or draws a plain `HudInput` is unchanged. Text is drawn at an integer scale on translucent plates
+//! so it stays readable over any background picture.
 
 use super::draw::{DrawList, Rgba};
 use super::widgets::{ACCENT, DIM, SHADOW, TEXT};
@@ -196,8 +200,32 @@ fn block(out: &mut DrawList, x: i32, y: i32, s: i32, lines: &[(Rgba, String)]) -
     rect
 }
 
-/// Draw the HUD for a `w` x `h` window.
+/// What the HUD says about the local player's character (see `crate::progress`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProgressLine {
+    /// `Cloud Lv 7  EXP 626/949  Gil 20`.
+    pub text: String,
+    /// The server reported a level gained a few seconds ago: say so on a line of its own.
+    pub level_up: bool,
+}
+
+/// The line about the local player's character as of local time `now`, or `None` while the server has
+/// not said anything about it (a server without battles never does).
+pub fn progress_line(state: &ClientState, now: f64) -> Option<ProgressLine> {
+    let view = state.progress.current()?;
+    Some(ProgressLine { text: view.hud_text(), level_up: state.progress.level_up_shown(now) })
+}
+
+/// Draw the HUD for a `w` x `h` window, without a line about the local player's character.
+#[allow(dead_code)] // the window draws with its character line (`draw_hud_with`); the shots and tests without
 pub fn draw_hud(input: &HudInput, w: u32, h: u32, out: &mut DrawList) {
+    draw_hud_with(input, None, w, h, out);
+}
+
+/// [`draw_hud`] plus, when there is one, the line about the local player's character: under the area
+/// name, on the same plate (so the FIXTURE label, which keeps clear of that plate, keeps clear of it
+/// too).
+pub fn draw_hud_with(input: &HudInput, progress: Option<&ProgressLine>, w: u32, h: u32, out: &mut DrawList) {
     let (wi, hi) = (w as i32, h as i32);
     let s = hud_scale(w, h) as i32;
     let m = 6 * s;
@@ -208,8 +236,15 @@ pub fn draw_hud(input: &HudInput, w: u32, h: u32, out: &mut DrawList) {
 
     draw_labels(input, w, h, s, top, out);
 
-    // Top left: where we are.
-    let area = block(out, m, top + m, s, &[(TEXT, fit(&ellipsize(&input.area, 40)))]);
+    // Top left: where we are, and how our character stands.
+    let mut place = vec![(TEXT, fit(&ellipsize(&input.area, 40)))];
+    if let Some(p) = progress {
+        place.push((OTHER, fit(&ellipsize(&p.text, 60))));
+        if p.level_up {
+            place.push((PARTY_RING, "LEVEL UP!".to_string()));
+        }
+    }
+    let area = block(out, m, top + m, s, &place);
 
     // The fixture label, centred under the banner (below the area name if they would collide).
     if input.fixture {
@@ -469,6 +504,75 @@ mod tests {
         for (w, h) in SIZES {
             assert_inside(&draw(&i, w, h), w, h, "invite");
         }
+    }
+
+    // ---- the local player's character ------------------------------------------------------------
+
+    fn line(text: &str, level_up: bool) -> ProgressLine {
+        ProgressLine { text: text.into(), level_up }
+    }
+
+    fn draw_with(input: &HudInput, progress: Option<&ProgressLine>, w: u32, h: u32) -> DrawList {
+        let mut list = DrawList::new();
+        draw_hud_with(input, progress, w, h, &mut list);
+        list
+    }
+
+    #[test]
+    fn the_character_line_sits_under_the_area_name_and_without_one_nothing_changes() {
+        let i = input();
+        let plain = draw(&i, 1100, 680);
+        assert_eq!(draw_with(&i, None, 1100, 680).texts(), plain.texts(), "no line, the same HUD as before");
+        assert!(!plain.says(" Lv "));
+
+        let list = draw_with(&i, Some(&line("Cloud Lv 7  EXP 626/949  Gil 20", false)), 1100, 680);
+        assert!(list.says("Cloud Lv 7  EXP 626/949  Gil 20") && list.says("FF7 md1stin"));
+        let area = list.texts().iter().find(|t| t.text == "FF7 md1stin").unwrap();
+        let mine = list.texts().iter().find(|t| t.text.starts_with("Cloud Lv 7")).unwrap();
+        assert!(mine.y > area.y, "below the area name ({} vs {})", mine.y, area.y);
+        assert_eq!(mine.x, area.x, "on the same plate, at the same indent");
+        assert!(!list.says("LEVEL UP"), "only when a level was just gained");
+        for (w, h) in SIZES {
+            assert_inside(&draw_with(&i, Some(&line("Cloud Lv 7  EXP 626/949  Gil 20", true)), w, h), w, h, "character line");
+        }
+    }
+
+    #[test]
+    fn a_level_just_gained_is_announced_on_its_own_line() {
+        let list = draw_with(&input(), Some(&line("Cloud Lv 7  EXP 626/949  Gil 20", true)), 1100, 680);
+        let mine = list.texts().iter().find(|t| t.text.starts_with("Cloud Lv 7")).unwrap();
+        let up = list.texts().iter().find(|t| t.text == "LEVEL UP!" && t.color == PARTY_RING).expect("a gold line");
+        assert!(up.y > mine.y);
+    }
+
+    #[test]
+    fn a_long_character_line_is_cut_to_the_window_and_the_fixture_label_clears_the_plate() {
+        let long = "Cloud Lv 99  EXP 99999999/99999999  Gil 9999999  and then some more words that cannot fit";
+        for (w, h) in SIZES {
+            assert_inside(&draw_with(&input(), Some(&line(long, true)), w, h), w, h, "long character line");
+        }
+        // A fixture's label drops below the plate when they would collide, which is taller now.
+        let mut i = input();
+        i.fixture = true;
+        i.area = "FIXTURE a_long_area_name".into();
+        for (w, h) in SIZES {
+            let list = draw_with(&i, Some(&line("Cloud Lv 7  EXP 6/33  Gil 0", true)), w, h);
+            let label = list.texts().iter().find(|t| t.text == FIXTURE_LABEL && t.color == FIXTURE_INK).unwrap();
+            for t in list.texts().iter().filter(|t| t.text.starts_with("Cloud Lv") || t.text == "LEVEL UP!" || t.text.starts_with("FIXTURE a_long")) {
+                assert!(!overlaps(rect_of(t), rect_of(label)), "{w}x{h}: {:?} vs the fixture label", t.text);
+            }
+        }
+    }
+
+    #[test]
+    fn the_session_gives_the_line_once_the_server_has_spoken() {
+        let mut s = state_with(&[]);
+        assert_eq!(progress_line(&s, 5.0), None, "nothing said: no line");
+        s.apply(5.0, ServerMsg::CharacterProgress { character: 0, level: 6, exp: 610, exp_to_next: 6, gil: 0, ap: 0, leveled_up: false });
+        assert_eq!(progress_line(&s, 5.1), Some(ProgressLine { text: "Cloud Lv 6  EXP 610/616  Gil 0".into(), level_up: false }));
+        s.apply(9.0, ServerMsg::CharacterProgress { character: 0, level: 7, exp: 626, exp_to_next: 323, gil: 20, ap: 4, leveled_up: true });
+        assert_eq!(progress_line(&s, 9.5), Some(ProgressLine { text: "Cloud Lv 7  EXP 626/949  Gil 20".into(), level_up: true }));
+        assert!(!progress_line(&s, 20.0).unwrap().level_up, "the announcement ends");
     }
 
     // ---- name labels -----------------------------------------------------------------------------

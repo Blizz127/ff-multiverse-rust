@@ -53,8 +53,19 @@
 //! continuously, at level 1 they reproduce the HP and MP stored in the populated starting
 //! records of the characters that join later, and Cloud's own starting record agrees for
 //! Strength, Vitality, Magic, Spirit and HP (his Dexterity, Luck and MP differ slightly,
-//! consistent with hand-tuned data). Random per-level rolls and the experience curves are
-//! not modelled; equipment stat bonuses are not applied either.
+//! consistent with hand-tuned data). Random per-level rolls are not modelled, and equipment stat
+//! bonuses are not applied either.
+//!
+//! ## Experience curves
+//!
+//! [`GrowthData::exp_for_level`], [`GrowthData::exp_to_next_level`] and
+//! [`GrowthData::level_for_exp`] turn a character's EXP curve (one of curves 55 to 63) into the
+//! experience thresholds of levels 2 to 99: `modifier * level^2 / 10` to go from `level` to
+//! `level + 1`, with the modifier of the band of the level being attained. This one is the
+//! documented rule and is checked against the owner's file (Cloud: 6, 33, 94, 202, 372, 616 for
+//! levels 2 to 7), not an invention; see [`GrowthData::exp_for_level`] for the source and the
+//! one remaining APPROXIMATION. [`MAX_LEVEL`], [`MAX_EXP`], [`MAX_GIL`] and [`MAX_AP`] are the
+//! game's own caps for what the battle rewards add up to.
 //!
 //! # `kernel2.bin`
 //!
@@ -349,6 +360,16 @@ pub const MAX_CHARACTER_HP: i32 = 9999;
 /// Maximum MP of a character.
 pub const MAX_CHARACTER_MP: i32 = 999;
 
+/// Highest character level (the stat curves end at 99).
+pub const MAX_LEVEL: u8 = 99;
+/// Most experience a character can hold. The savemap field is a `u32`; the game itself stops at
+/// 99,999,999. Level 99 needs only about 2.4 million, so the cap is never what limits a level.
+pub const MAX_EXP: u32 = 99_999_999;
+/// Most gil the party can hold (the game's own cap).
+pub const MAX_GIL: u32 = 9_999_999;
+/// Most AP one counter can hold: the savemap stores a materia's AP in three bytes.
+pub const MAX_AP: u32 = 0x00FF_FFFF;
+
 /// Battle and growth data (section 2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrowthData {
@@ -430,6 +451,87 @@ impl GrowthData {
             max_mp: mp.clamp(0, MAX_CHARACTER_MP) as u16,
         })
     }
+
+    /// The experience modifier of `who` for attaining `level_reached`: the gradient byte of the
+    /// character's EXP curve in the band that contains that level (the base byte of an EXP curve
+    /// is unused). `None` if the character or its EXP curve is missing.
+    pub fn exp_modifier(&self, who: CharacterId, level_reached: u8) -> Option<u8> {
+        let rec = self.characters.get(who.index())?;
+        let (gradient, _unused_base) = self.curve(rec.exp_curve)?.band(level_reached);
+        Some(gradient)
+    }
+
+    /// Experience needed to go from `level` (1..=98) to `level + 1`: `modifier * level^2 / 10`
+    /// in integer arithmetic, where the modifier is that of the level being attained.
+    fn exp_step(&self, who: CharacterId, level: u8) -> Option<u32> {
+        let modifier = u32::from(self.exp_modifier(who, level.saturating_add(1))?);
+        let level = u32::from(level);
+        Some(modifier * level * level / 10)
+    }
+
+    /// Experience needed to go from `level` to `level + 1` (`Some(0)` at [`MAX_LEVEL`], where
+    /// there is no next level; `level` is clamped to `1..=`[`MAX_LEVEL`]). `None` if the kernel
+    /// has no EXP curve for the character.
+    pub fn exp_to_next_level(&self, who: CharacterId, level: u8) -> Option<u32> {
+        let level = level.clamp(1, MAX_LEVEL);
+        if level >= MAX_LEVEL {
+            // Still `None` for a missing character, like every other level.
+            self.exp_modifier(who, level)?;
+            return Some(0);
+        }
+        self.exp_step(who, level)
+    }
+
+    /// Total experience at which `who` reaches `level` (clamped to `1..=`[`MAX_LEVEL`]; level 1
+    /// is 0): the sum of [`GrowthData::exp_to_next_level`] over the levels below it. `None` if
+    /// the kernel has no EXP curve for the character.
+    ///
+    /// # Source and checks
+    ///
+    /// The EXP curves are the nine curves 55 to 63 of section 2 (byte `0x08` of a character's
+    /// 56-byte record selects one), laid out like the other curves with the experience modifier in
+    /// the gradient byte of each of the eight level bands and the base byte unused (zero in the
+    /// owner's file). The rule is the one the community documents
+    /// (<https://wiki.ffrtt.ru/index.php/FF7/Battle_and_growth_data>):
+    /// `needed = modifier * level^2 / 10` to go from `level` to `level + 1`, with the modifier of
+    /// the band of the level being attained. Where the page's worked example truncates `level^2 /
+    /// 10` before multiplying, this does the multiplication first: that is what gives Cloud's
+    /// well-known thresholds 6, 33, 94 and 202 EXP for levels 2 to 5 (his band 0 modifier is 68),
+    /// and 372 and 616 for 6 and 7. Checked on the owner's Steam copy by the ignored test
+    /// `real_exp_curves_reproduce_the_known_thresholds` in `tests/real_data.rs` (Cloud's own
+    /// starting record, level 6 with 610 EXP, sits just below the level 7 threshold, as it should).
+    ///
+    /// APPROXIMATION: the savemap also stores a per-character "EXP to next level" counter that the
+    /// game recomputes only when it levels up; Cloud's initial record holds 35 there where the
+    /// curve says 6, a hand-set start value that is not modelled. Everything after the first
+    /// level-up follows the curve.
+    pub fn exp_for_level(&self, who: CharacterId, level: u8) -> Option<u32> {
+        let level = level.clamp(1, MAX_LEVEL);
+        let mut total = 0u32;
+        for k in 1..level {
+            total = total.saturating_add(self.exp_step(who, k)?);
+        }
+        // Reject a character without a curve even at level 1 (the loop above did not look).
+        self.exp_modifier(who, level)?;
+        Some(total)
+    }
+
+    /// The level `who` has reached with `exp` total experience: the highest level whose
+    /// threshold ([`GrowthData::exp_for_level`]) is at most `exp`, from 1 up to [`MAX_LEVEL`].
+    /// `None` if the kernel has no EXP curve for the character.
+    pub fn level_for_exp(&self, who: CharacterId, exp: u32) -> Option<u8> {
+        self.exp_modifier(who, 1)?;
+        let (mut level, mut total) = (1u8, 0u32);
+        while level < MAX_LEVEL {
+            let next = total.saturating_add(self.exp_step(who, level)?);
+            if next > exp {
+                break;
+            }
+            total = next;
+            level += 1;
+        }
+        Some(level)
+    }
 }
 
 /// One record of the initialization data (section 3): a savemap-format character record.
@@ -439,6 +541,10 @@ pub struct InitCharacter {
     /// slots for Cait Sith and Vincent hold other characters.
     pub id: u8,
     pub level: u8,
+    /// Total experience at the start (savemap offset `0x3C`). Cloud's record is the only one
+    /// that matches its level (see [`GrowthData::exp_for_level`]); the others hold small
+    /// placeholders while their level is 1, because they join the story later.
+    pub exp: u32,
     /// Strength, vitality, magic, spirit, dexterity, luck.
     pub stats: [u8; 6],
     pub name: String,
@@ -455,6 +561,7 @@ impl InitCharacter {
         Self {
             id: u8_at(b, 0x00),
             level: u8_at(b, 0x01),
+            exp: u32_at(b, 0x3C),
             stats: array_at(b, 0x02),
             name: text::decode_trimmed(b.get(0x10..0x1C).unwrap_or(&[])),
             weapon: u8_at(b, 0x1C),
@@ -671,6 +778,25 @@ impl Kernel {
     /// The initialization record whose savemap character id is `save_id`.
     pub fn init_character_by_id(&self, save_id: u8) -> Option<&InitCharacter> {
         self.init_characters.iter().find(|c| c.id == save_id)
+    }
+
+    /// The total experience `who` starts with when it starts at `level` (clamped to
+    /// `1..=`[`MAX_LEVEL`]): the kernel's own starting record when that record belongs to this
+    /// level on the character's EXP curve (Cloud's does: level 6 with 610 EXP, six short of level
+    /// 7), else the least that level takes ([`GrowthData::exp_for_level`]). The other characters'
+    /// records hold level 1 with a few placeholder points, because they join the story later and
+    /// start at the leader's level. `None` if the kernel has no EXP curve for the character.
+    pub fn starting_exp(&self, who: CharacterId, level: u8) -> Option<u32> {
+        let level = level.clamp(1, MAX_LEVEL);
+        let floor = self.growth.exp_for_level(who, level)?;
+        let own = u8::try_from(who.index())
+            .ok()
+            .and_then(|id| self.init_character_by_id(id))
+            .filter(|rec| {
+                rec.level == level && self.growth.level_for_exp(who, rec.exp) == Some(level)
+            })
+            .map(|rec| rec.exp);
+        Some(own.unwrap_or(floor))
     }
 
     /// String `index` of an FF text table section (a `u16` pointer table followed by
@@ -940,6 +1066,167 @@ mod tests {
         assert_eq!(CharacterId::from_index(8), Some(CharacterId::Cid));
         assert_eq!(CharacterId::from_index(9), None);
         assert_eq!(CharacterId::Aeris.index(), 3);
+    }
+
+    /// The synthetic kernel gives character `i` EXP curve `55 + i` with modifier
+    /// `100 + 10 * band + curve` in every band (see `testutil::growth_section`), so every number
+    /// below follows from `needed = modifier * level^2 / 10` by hand.
+    #[test]
+    fn exp_thresholds_follow_the_documented_rule() {
+        let k = Kernel::parse(&synthetic_kernel_bytes()).unwrap();
+        let g = &k.growth;
+        // Cloud: curve 55, band 0 modifier 155, band 1 165, band 7 225.
+        assert_eq!(g.exp_modifier(CharacterId::Cloud, 2), Some(155));
+        assert_eq!(g.exp_modifier(CharacterId::Cloud, 11), Some(155));
+        assert_eq!(g.exp_modifier(CharacterId::Cloud, 12), Some(165));
+        assert_eq!(g.exp_modifier(CharacterId::Cloud, 99), Some(225));
+        // Steps: 155 * k^2 / 10 for k = 1..=5 -> 15, 62, 139, 248, 387 (the product first, then
+        // the division: the first one is 15, not 155 * (1 / 10) = 0).
+        assert_eq!(
+            (1..=5)
+                .map(|l| g.exp_to_next_level(CharacterId::Cloud, l).unwrap())
+                .collect::<Vec<_>>(),
+            [15, 62, 139, 248, 387]
+        );
+        // Totals are the running sums, level 1 costs nothing.
+        assert_eq!(
+            (1..=6)
+                .map(|l| g.exp_for_level(CharacterId::Cloud, l).unwrap())
+                .collect::<Vec<_>>(),
+            [0, 15, 77, 216, 464, 851]
+        );
+        // The modifier is the one of the level being ATTAINED: 10 -> 11 is still band 0, but
+        // 11 -> 12 attains a level of band 1.
+        assert_eq!(
+            g.exp_to_next_level(CharacterId::Cloud, 10),
+            Some(155 * 100 / 10)
+        );
+        assert_eq!(
+            g.exp_to_next_level(CharacterId::Cloud, 11),
+            Some(165 * 121 / 10)
+        );
+        // Another character has another curve (curve 56: modifier 156).
+        assert_eq!(
+            g.exp_to_next_level(CharacterId::Barret, 3),
+            Some(156 * 9 / 10)
+        );
+        assert_eq!(g.exp_for_level(CharacterId::Barret, 4), Some(15 + 62 + 140));
+    }
+
+    #[test]
+    fn exp_levels_invert_the_thresholds_and_never_misbehave() {
+        let k = Kernel::parse(&synthetic_kernel_bytes()).unwrap();
+        let g = &k.growth;
+        for who in CharacterId::ALL {
+            let mut prev = 0;
+            for level in 1..=MAX_LEVEL {
+                let t = g.exp_for_level(who, level).unwrap();
+                assert!(
+                    level == 1 || t > prev,
+                    "{who:?} level {level}: thresholds rise"
+                );
+                // Exactly the threshold reaches the level, one EXP less is still the one before.
+                assert_eq!(g.level_for_exp(who, t), Some(level), "{who:?} {level}");
+                if level > 1 {
+                    assert_eq!(
+                        g.level_for_exp(who, t - 1),
+                        Some(level - 1),
+                        "{who:?} {level}"
+                    );
+                }
+                prev = t;
+            }
+            // Level 99 is far below the caps, and nothing goes past it.
+            assert!(prev < MAX_EXP, "{who:?}: {prev}");
+            assert_eq!(g.level_for_exp(who, u32::MAX), Some(MAX_LEVEL));
+            assert_eq!(g.level_for_exp(who, MAX_EXP), Some(MAX_LEVEL));
+        }
+        // Out-of-range levels are clamped, the top has no next level.
+        assert_eq!(g.exp_for_level(CharacterId::Cloud, 0), Some(0));
+        assert_eq!(
+            g.exp_for_level(CharacterId::Cloud, 200),
+            g.exp_for_level(CharacterId::Cloud, MAX_LEVEL)
+        );
+        assert_eq!(g.exp_to_next_level(CharacterId::Cloud, MAX_LEVEL), Some(0));
+        assert_eq!(g.exp_to_next_level(CharacterId::Cloud, 255), Some(0));
+        assert_eq!(
+            g.exp_to_next_level(CharacterId::Cloud, 0),
+            g.exp_to_next_level(CharacterId::Cloud, 1)
+        );
+        assert_eq!(g.level_for_exp(CharacterId::Cloud, 0), Some(1));
+        assert_eq!(g.level_for_exp(CharacterId::Cloud, 14), Some(1));
+        assert_eq!(g.level_for_exp(CharacterId::Cloud, 15), Some(2));
+    }
+
+    #[test]
+    fn a_missing_exp_curve_is_none_not_a_guess() {
+        let k = Kernel::parse(&synthetic_kernel_bytes()).unwrap();
+        let mut g = k.growth.clone();
+        g.characters[0].exp_curve = 200; // no such curve
+        assert_eq!(g.exp_modifier(CharacterId::Cloud, 5), None);
+        assert_eq!(g.exp_for_level(CharacterId::Cloud, 1), None);
+        assert_eq!(g.exp_for_level(CharacterId::Cloud, 50), None);
+        assert_eq!(g.exp_to_next_level(CharacterId::Cloud, 3), None);
+        assert_eq!(g.exp_to_next_level(CharacterId::Cloud, MAX_LEVEL), None);
+        assert_eq!(g.level_for_exp(CharacterId::Cloud, 1000), None);
+        // The other characters are unaffected.
+        assert!(g.exp_for_level(CharacterId::Barret, 50).is_some());
+        // A character record that is not there at all.
+        g.characters.truncate(3);
+        assert_eq!(g.exp_for_level(CharacterId::Cid, 5), None);
+    }
+
+    #[test]
+    fn the_init_records_carry_their_experience() {
+        let k = Kernel::parse(&synthetic_kernel_bytes()).unwrap();
+        // The synthetic init section leaves the savemap EXP field (0x3C) at zero.
+        assert_eq!(k.init_character_by_id(0).unwrap().exp, 0);
+        let mut sections = synthetic_kernel_sections();
+        let r = 2 * INIT_CHARACTER_SIZE; // slot 2 holds character id 2
+        sections[3].1[r + 0x3C..r + 0x40].copy_from_slice(&0x0001_0203u32.to_le_bytes());
+        let k = Kernel::parse(&pack_kernel(&sections, &[])).unwrap();
+        assert_eq!(k.init_character_by_id(2).unwrap().exp, 0x0001_0203);
+        assert_eq!(k.init_character_by_id(1).unwrap().exp, 0);
+    }
+
+    /// A starting record counts only when it fits its own level on the character's curve; the
+    /// synthetic Cloud (curve 55) reaches level 6 at 851 EXP and level 7 at 1,409 (see
+    /// `exp_thresholds_follow_the_documented_rule`).
+    #[test]
+    fn starting_exp_is_the_kernels_own_when_it_fits_the_level_and_the_least_of_the_level_otherwise()
+    {
+        let with_cloud = |level: u8, exp: u32| {
+            let mut sections = synthetic_kernel_sections();
+            sections[3].1[1] = level; // Cloud's record is slot 0: its level byte
+            sections[3].1[0x3C..0x40].copy_from_slice(&exp.to_le_bytes());
+            Kernel::parse(&pack_kernel(&sections, &[])).unwrap()
+        };
+        let cloud = CharacterId::Cloud;
+        // Level 6 with 861 EXP (851 <= 861 < 1409): that record is used for level 6 only.
+        let k = with_cloud(6, 861);
+        assert_eq!(k.growth.exp_for_level(cloud, 6), Some(851));
+        assert_eq!(k.growth.exp_for_level(cloud, 7), Some(1409));
+        assert_eq!(k.starting_exp(cloud, 6), Some(861));
+        assert_eq!(k.starting_exp(cloud, 7), k.growth.exp_for_level(cloud, 7));
+        assert_eq!(k.starting_exp(cloud, 1), Some(0));
+        // A record whose EXP is not a level-6 value (5 is level 1) is a placeholder: the least of
+        // the level is used instead, like for a character whose record says level 1.
+        assert_eq!(with_cloud(6, 5).starting_exp(cloud, 6), Some(851));
+        assert_eq!(with_cloud(6, 5000).starting_exp(cloud, 6), Some(851));
+        // Characters without such a record (and levels outside 1..=99) fall back the same way.
+        assert_eq!(
+            k.starting_exp(CharacterId::Barret, 6),
+            k.growth.exp_for_level(CharacterId::Barret, 6)
+        );
+        assert_eq!(k.starting_exp(cloud, 0), k.starting_exp(cloud, 1));
+        assert_eq!(
+            k.starting_exp(cloud, 200),
+            k.growth.exp_for_level(cloud, MAX_LEVEL)
+        );
+        // No EXP curve, no answer.
+        let mut broken = k.clone();
+        broken.growth.characters[0].exp_curve = 200;
+        assert_eq!(broken.starting_exp(cloud, 6), None);
     }
 
     #[test]

@@ -262,6 +262,21 @@ fn offscreen_hud_over_the_fixture_area() {
     save("31-hud-ff7", W, H, &img);
     assert_eq!(count(&img, [255, 196, 0]), 0, "nothing yellow-black about real content");
 
+    // Character progress (protocol v5): the line under the area name, and the gold LEVEL UP! line for a
+    // few seconds after a level was gained.
+    let plain_bright = bright(&img);
+    let plain_gold = count(&img, [255, 208, 64]);
+    let mut overlay = DrawList::new();
+    hud::draw_hud_with(&real, Some(&hud::ProgressLine { text: "Cloud Lv 7  EXP 626/949  Gil 20".into(), level_up: false }), W, H, &mut overlay);
+    let with_line = gpu.render(W, H, &scene, &overlay);
+    save("33-hud-ff7-character", W, H, &with_line);
+    assert!(bright(&with_line) > plain_bright, "the character line puts more text on screen");
+    let mut overlay = DrawList::new();
+    hud::draw_hud_with(&real, Some(&hud::ProgressLine { text: "Cloud Lv 7  EXP 626/949  Gil 20".into(), level_up: true }), W, H, &mut overlay);
+    let level_up = gpu.render(W, H, &scene, &overlay);
+    save("34-hud-ff7-level-up", W, H, &level_up);
+    assert!(count(&level_up, [255, 208, 64]) > plain_gold, "the gold LEVEL UP! text is on screen");
+
     // A bigger window gets a bigger HUD.
     let mut overlay = DrawList::new();
     hud::draw_hud(&input, 1920, 1080, &mut overlay);

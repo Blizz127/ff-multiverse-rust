@@ -8,7 +8,8 @@
 //!                                               see `legacy.rs`)
 //! <root>/accounts/<account_id>.json             AccountRecord
 //! <root>/avatars/<avatar_id>.json               AvatarProfile
-//! <root>/progression/<account_id>/<Game>.json   Progression
+//! <root>/progression/<account_id>/<Game>.json   Progression (the story blob, also the phase key)
+//! <root>/progression/<account_id>/<Game>.character.json   CharacterProgress (level, exp, ap, gil)
 //! ```
 //!
 //! # Crash consistency
@@ -54,8 +55,8 @@ use crate::index::{self, AccountEntry, Index, LogWriter, Op, TokenHash, INDEX_LO
 use crate::lock::LockGuard;
 use crate::model::{
     check_new_appearance_ref, game_key, is_safe_key, AccountInfo, AccountRecord, AvatarId,
-    AvatarProfile, Progression, Registered, MAX_BLOB_BYTES, MAX_RECORD_BYTES, MAX_TOKEN_BYTES,
-    SCHEMA_VERSION,
+    AvatarProfile, CharacterProgress, Progression, Registered, MAX_BLOB_BYTES,
+    MAX_CHARACTER_RECORD_BYTES, MAX_RECORD_BYTES, MAX_TOKEN_BYTES, SCHEMA_VERSION,
 };
 use crate::snapshot::{self, SnapshotInfo};
 
@@ -269,6 +270,22 @@ impl Store {
             });
         }
         Ok(self.progression_dir(account).join(format!("{key}.json")))
+    }
+
+    /// `<Game>.character.json` next to the story blob. A game key is letters, digits and `_`
+    /// (see `is_safe_key`), so no key can ever spell the `.character` part: the two records of a
+    /// game cannot name the same file.
+    fn character_path(&self, account: u64, game: GameId) -> Result<PathBuf> {
+        let key = game_key(game);
+        if !is_safe_key(&key) {
+            return Err(PersistError::InvalidField {
+                field: "game",
+                reason: format!("{key:?} cannot be used as a file name"),
+            });
+        }
+        Ok(self
+            .progression_dir(account)
+            .join(format!("{key}.character.json")))
     }
 
     // ---- shared plumbing ---------------------------------------------------------------
@@ -848,6 +865,121 @@ impl Store {
         let mut stored = progression.clone();
         stored.schema_version = SCHEMA_VERSION;
         fsio::write_json(&path, &stored, MAX_RECORD_BYTES)
+    }
+
+    // ---- character progress ------------------------------------------------------------
+
+    /// The account's [`CharacterProgress`] for `game`, or `None` if none was ever stored (the
+    /// caller starts from its game's own starting values; nothing is migrated). It is a separate
+    /// record from [`Store::get_progression`]'s story blob. Fails with
+    /// [`PersistError::UnknownAccount`] for an account that does not exist, and with
+    /// [`PersistError::Corrupt`] / [`PersistError::FutureSchema`] / [`PersistError::TooLarge`]
+    /// for a file that is damaged, written by a newer build or oversized: such a file is never
+    /// replaced by a default behind the caller's back.
+    ///
+    /// Takes no writer lock: a write replaces the file atomically, so this sees the whole old
+    /// record or the whole new one, and a login never waits for a battle result being saved.
+    pub fn get_character_progress(
+        &self,
+        account: AccountId,
+        game: GameId,
+    ) -> Result<Option<CharacterProgress>> {
+        if !self.index().contains_account(account.0) {
+            return Err(PersistError::UnknownAccount(account));
+        }
+        self.read_character_progress(account, game)
+    }
+
+    fn read_character_progress(
+        &self,
+        account: AccountId,
+        game: GameId,
+    ) -> Result<Option<CharacterProgress>> {
+        let path = self.character_path(account.0, game)?;
+        let Some(record) = fsio::read_json::<CharacterProgress>(&path, MAX_CHARACTER_RECORD_BYTES)?
+        else {
+            return Ok(None);
+        };
+        if record.account_id != account || record.game != game {
+            return Err(PersistError::corrupt(
+                &path,
+                format!(
+                    "record is for account {:?} / {}, not the requested account {:?} / {}",
+                    record.account_id,
+                    game_key(record.game),
+                    account,
+                    game_key(game)
+                ),
+            ));
+        }
+        record
+            .validate()
+            .map_err(|e| PersistError::corrupt(&path, e.to_string()))?;
+        Ok(Some(record))
+    }
+
+    /// Store (replacing) the account's [`CharacterProgress`] for `record.game`, atomically (a
+    /// crash leaves the old record or the new one). Other games and the story blob are
+    /// untouched. The record must pass the checks every game shares (`level` at least 1; the
+    /// game's own caps are its adapter's business) and the account must exist. Prefer
+    /// [`Store::update_character_progress`] when the new value depends on the old one.
+    pub fn put_character_progress(&self, record: &CharacterProgress) -> Result<()> {
+        record.validate()?;
+        let path = self.character_path(record.account_id.0, record.game)?;
+
+        let _counters = self.writer();
+        if !self.index().contains_account(record.account_id.0) {
+            return Err(PersistError::UnknownAccount(record.account_id));
+        }
+        fsio::ensure_dir(&self.progression_dir(record.account_id.0))?;
+        let mut stored = record.clone();
+        stored.schema_version = SCHEMA_VERSION;
+        fsio::write_json(&path, &stored, MAX_CHARACTER_RECORD_BYTES)
+    }
+
+    /// Read-modify-write of the account's [`CharacterProgress`] for `game`, as one step that no
+    /// other writer can interleave with: `change` gets the stored record (`None` if there is none
+    /// yet) and returns the record to store, which is returned in turn. Two battles that end at
+    /// once for one account therefore add up instead of one overwriting the other.
+    ///
+    /// `change` runs while the store's writer lock is held: it must be quick and must not call
+    /// back into this store (the lock is not reentrant, so that would deadlock). What it returns
+    /// must be for the same account and game and pass the checks of
+    /// [`Store::put_character_progress`]; otherwise nothing is written and the old record stays.
+    pub fn update_character_progress<F>(
+        &self,
+        account: AccountId,
+        game: GameId,
+        change: F,
+    ) -> Result<CharacterProgress>
+    where
+        F: FnOnce(Option<CharacterProgress>) -> CharacterProgress,
+    {
+        let path = self.character_path(account.0, game)?;
+
+        let _counters = self.writer();
+        if !self.index().contains_account(account.0) {
+            return Err(PersistError::UnknownAccount(account));
+        }
+        let mut next = change(self.read_character_progress(account, game)?);
+        if next.account_id != account || next.game != game {
+            return Err(PersistError::InvalidField {
+                field: "account_id",
+                reason: format!(
+                    "the updated record is for account {:?} / {}, not the account {:?} / {} it \
+                     replaces",
+                    next.account_id,
+                    game_key(next.game),
+                    account,
+                    game_key(game)
+                ),
+            });
+        }
+        next.validate()?;
+        next.schema_version = SCHEMA_VERSION;
+        fsio::ensure_dir(&self.progression_dir(account.0))?;
+        fsio::write_json(&path, &next, MAX_CHARACTER_RECORD_BYTES)?;
+        Ok(next)
     }
 
     // ---- maintenance -------------------------------------------------------------------

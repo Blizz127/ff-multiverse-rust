@@ -121,6 +121,9 @@ pub(crate) struct Shared {
     pub build: String,
     /// Accounts, avatar profiles and progression. Blocking: use it under `spawn_blocking`.
     pub store: Arc<Store>,
+    /// Saves what battles pay to the store (`None`: this server runs no battles). Stopped, and waited
+    /// for, when the server shuts down (see `Server::serve`).
+    pub saver: Option<crate::saver::Saver>,
     /// Per-address connection cap, registration rate limits and the log throttle.
     pub limits: Limits,
     /// Keeps an ephemeral state directory alive. Declared after `store` so the store (and its
@@ -489,7 +492,7 @@ impl Conn {
         check_version(protocol_version).map_err(|why| Close::reject(RejectCode::ProtocolMismatch, why))?;
 
         // 2. Who is this? Registration or token login, against the persistent store.
-        let Login { account, avatar, phase, issued_token } = self.authenticate(auth, tint, appearance_ref).await?;
+        let Login { account, avatar, phase, issued_token, progress } = self.authenticate(auth, tint, appearance_ref).await?;
         let registered = issued_token.is_some();
         if registered {
             // Until the Welcome with its token is known to be written, this account is released
@@ -568,7 +571,7 @@ impl Conn {
         self.guard = Some(JoinGuard { shared: Arc::clone(&shared), entity, session });
         let name = avatar.display_name.clone();
         let joined = {
-            let new = NewPlayer { session, entity, account, avatar, phase, tx: self.tx.clone(), close: Arc::clone(&self.close) };
+            let new = NewPlayer { session, entity, account, avatar, phase, progress, tx: self.tx.clone(), close: Arc::clone(&self.close) };
             shared.with_world(|world| world.join(new, Instant::now()).map(|spawn| (spawn, world.player_count())))
         };
         let (spawn, online) = match joined {
