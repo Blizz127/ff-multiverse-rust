@@ -1002,4 +1002,90 @@ mod tests {
         }
         assert!(describe_request(PartyCommand::Invite(EntityId(3))).contains("entity 3"));
     }
+
+    // ---- the frame of the field: players, the area's characters, models and markers -------------
+
+    /// A state in the fixture's plaza whose snapshot names the given non-player characters
+    /// (name, model, standing clip, x) and no other player.
+    fn state_with_npcs(npcs: &[(&str, &str, Option<&str>, f32)]) -> ClientState {
+        let area = AreaId { game: GameId::Fixture, key: "plaza".into() };
+        let mut s = ClientState::new(EntityId(1), AccountId(1), Pos::new(0.0, -40.0, 0.0), area.clone());
+        let npcs = npcs
+            .iter()
+            .enumerate()
+            .map(|(i, (name, model, idle, x))| fmv_protocol::NpcSnapshot {
+                id: i as u32,
+                name: (*name).into(),
+                model: (*model).into(),
+                idle_animation: idle.map(str::to_string),
+                pos: Pos::new(*x, 0.0, 0.0),
+                facing: 0.0,
+            })
+            .collect();
+        assert!(s.apply(0.0, ServerMsg::AreaSnapshot { area, tick: 1, entities: vec![], npcs }).is_none());
+        s
+    }
+
+    /// Without models (no `char.lgp`, a fixture area) the characters of the area are markers, drawn
+    /// before the players so that every player is over them, in the colour `npc_appearance` gives.
+    #[test]
+    fn without_models_the_areas_characters_are_markers_under_the_players() {
+        use crate::npc::npc_appearance;
+        let state = state_with_npcs(&[("gu0", "agyb", Some("acfe"), -60.0), ("gu1", "aagb", None, 60.0)]);
+        let adapter = fmv_fixture::FixtureAdapter::new();
+        let view = FieldView::top_down(fmv_adapter_api::GameAdapter::load_area(&adapter, "plaza").unwrap().as_ref());
+        let mut epoch = 0;
+        let draw = field_draw(None, &mut epoch, &view, &state, [1, 2, 3], 1.0, 0.0);
+        assert!(draw.built.is_none());
+        assert_eq!(epoch, state.npc_epoch(), "the frame noted which list of characters it saw");
+        assert_eq!(draw.markers.len(), 3, "two characters and the local player");
+        let npcs = state.npc_views();
+        for (marker, npc) in draw.markers.iter().zip(npcs) {
+            assert_eq!(marker.tint, npc_appearance(npc).marker_tint);
+            assert!(!marker.own && !marker.party, "a character is neither the local player nor a party member");
+            let at = view.to_view(npc.pos).unwrap();
+            assert_eq!((marker.x, marker.y), (at.x, at.y), "it stands where its data puts it");
+        }
+        let own = draw.markers.last().unwrap();
+        assert!(own.own && own.tint == [1, 2, 3], "the local player comes last");
+        // The names are over the markers (there is no model to put them over).
+        let spot = view.to_view(npcs[0].pos).unwrap();
+        assert_eq!(label_anchor(None, &view, draw.own_who, Subject::Npc(0), npcs[0].pos), Some(spot));
+    }
+
+    /// With models: the character whose model loads is a model (and not also a marker), the one
+    /// whose data names no model stays a marker, the player is a model too; the models were loaded
+    /// when the list of characters was first seen, and their names go over their heads.
+    #[test]
+    fn with_models_the_areas_characters_are_models_and_the_ones_without_stay_markers() {
+        use crate::avatar::frame::tests as scene;
+        use crate::avatar::library::tests::Counting;
+        use crate::avatar::library::AvatarLibrary;
+        let state = state_with_npcs(&[("gu0", "agyb", Some("acfe"), -60.0), ("ghost", "", None, 60.0)]);
+        let mut view = scene::view();
+        view.stage = Some(scene::stage());
+        let loader = Counting::new(std::rc::Rc::default(), vec![]);
+        let asked = std::rc::Rc::clone(&loader.asked_npc);
+        let mut avatars = Avatars::new(AvatarLibrary::new(Box::new(loader)));
+        let mut epoch = 0;
+        let draw = field_draw(Some(&mut avatars), &mut epoch, &view, &state, [1, 2, 3], 1.0, 0.016);
+        assert_eq!(*asked.borrow(), ["agyb/acfe"], "asked for once, by the time the first frame was built");
+        let built = draw.built.as_ref().expect("a stage and avatars: models");
+        assert_eq!(built.frame.models.len(), 2, "the character with a model and the local player");
+        // The players list is [gu0, ghost, own]: only `ghost` (index 1) has no model.
+        assert_eq!(built.markers, [1]);
+        assert_eq!(draw.markers.len(), 1, "one marker: the character the data names no model for");
+        assert!(!draw.markers[0].own);
+        // A second frame in the same state loads nothing and keeps the epoch.
+        let again = field_draw(Some(&mut avatars), &mut epoch, &view, &state, [1, 2, 3], 1.0, 0.016);
+        assert_eq!(asked.borrow().len(), 1);
+        assert_eq!(again.built.unwrap().frame.models.len(), 2);
+        // The model's name goes over its head; the markers' over the marker.
+        let npcs = state.npc_views();
+        let feet = view.to_view(npcs[0].pos).unwrap();
+        let over = label_anchor(Some(built), &view, draw.own_who, Subject::Npc(0), npcs[0].pos).unwrap();
+        assert!(over.y > feet.y + 10.0, "{over:?} over {feet:?}");
+        let marker_spot = view.to_view(npcs[1].pos).unwrap();
+        assert_eq!(label_anchor(Some(built), &view, draw.own_who, Subject::Npc(1), npcs[1].pos), Some(marker_spot));
+    }
 }
