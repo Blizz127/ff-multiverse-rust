@@ -5,8 +5,10 @@
 //!
 //! The area is the FIXTURE plaza and the rules are `fmv_protocol::SyntheticRules` (every fighter knows
 //! Cure, Life and Fire; the battle accepts Potion 0, Ether 3, Phoenix Down 7 and Grenade 20; a new
-//! account starts with 3 Potions, 1 Ether and 1 Phoenix Down). This tests the SERVER's inventory
-//! machinery, not FF7 data; the real-data checks are `scripts/battle-smoke.sh --progress`.
+//! account starts with 3 Potions, 1 Ether and 1 Phoenix Down). These tests cover the SERVER's inventory
+//! machinery, not FF7 data. The one exception is the last test, which is `#[ignore]`d and plays the same
+//! commands against the owner's real data (`FMV_FF7_LIBRARY`); the real data over real processes is
+//! `scripts/battle-smoke.sh --progress`.
 //!
 //! Every client here replays the battle exactly as the real client does (`BattleReplay`), so a passing
 //! test is also a proof that the messages carrying spells, items and guards are ones a replay accepts.
