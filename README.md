@@ -202,9 +202,10 @@ encounter table). The window then shows the battle: enemy bars on top, your part
 per fighter with an HP bar and an ATB gauge; a yellow border and a yellow gauge mean that
 character can act, a white corner marks yours, and a band across the top is green while your
 client's replay agrees with the server (red if it ever diverges). **Space** or **Enter** attacks
-the first living enemy with your character. The battle's words (whose turn, how many enemies)
-are in the window title for now. (The battle view has been checked by unit tests and an
-offscreen render only: this box has no display.)
+the first living enemy with your character. Each fighter's name and HP numbers and a line that
+says whose turn it is are drawn in the UI font over the cards (the window title repeats the
+headline). (The battle view has been checked by unit tests and an offscreen render only: this
+box has no display, so the window itself was not run.)
 
 **One command for the basics:** `scripts/smoke.sh` starts the server, runs two headless bots
 concurrently, checks both SMOKE lines and stops the server. It uses `target/release` by

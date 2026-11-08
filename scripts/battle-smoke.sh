@@ -82,11 +82,13 @@ Usage: scripts/battle-smoke.sh [--fixture|--random] [--release|--debug] [--bin-d
 
 Real-data mode (default): two headless bots form a party on the real FF7 field md1stin and fight
 one shared battle started with --debug-encounters; passes when both report battles=1 victories=1
-for the same battle. --random: the same bots walk md1stin without --debug-encounters and the
-server rolls the field's own encounter table (battles start by themselves). --fixture: checks that
+for the same battle, each replayed it from its own battle data ("verified by replay") and both
+members attacked (the server's commands=[a, b] are both at least 1). --random: the same bots walk
+md1stin without --debug-encounters and the server rolls the field's own encounter table (battles
+start by themselves); every battle they enter must be verified by replay. --fixture: checks that
 a FIXTURE server refuses battles cleanly.
 
-  --library DIR      state directory that contains library/ (default $FMV_FF7_LIBRARY, else
+  --library DIR     state directory that contains library/ (default $FMV_FF7_LIBRARY, else
                      ~/.local/share/ff-multiverse); only the library is read, never written
   --duration SECS    how long each bot runs (default 40)
   --formation ID     the enemy formation of the debug battle (default 301: a two-enemy formation of
