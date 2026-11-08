@@ -898,6 +898,11 @@ fn offscreen_real_ff7_npcs_in_two_fields() {
             built.frame.models.len() - drawn.len(),
         );
         assert!(!drawn.is_empty(), "{key}: at least one character is a model");
+        if matches!(key, "md1stin" | "md1_1") {
+            // Measured on the owner's data: all of them load (the guards, the three AVALANCHE
+            // members and the two door leaves), none is left a marker, none is out of view.
+            assert_eq!((drawn.len(), marker_npcs.len(), culled), (npcs.len(), 0, 0), "{key}: every character is a model");
+        }
         assert_eq!(built.frame.models.len() - drawn.len(), 2, "both players are models too");
 
         // Pixels.
