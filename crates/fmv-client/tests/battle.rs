@@ -169,6 +169,7 @@ async fn serve(stream: TcpStream, on_request: OnRequest) -> Report {
                                     level: 5,
                                     weapon: None,
                                     armor: None,
+                                    limit: 0,
                                 }],
                                 preemptive: false,
                                 back_attack: false,
@@ -254,7 +255,7 @@ fn a_bot_that_is_refused_logs_it_once_never_retries_and_exits_cleanly() {
     assert_eq!(report.count(|m| matches!(m, ClientMsg::RequestEncounter { formation_id: None })), 1, "asked exactly once, never again");
     assert_eq!(report.count(|m| matches!(m, ClientMsg::BattleCommand { .. })), 0);
     assert!(
-        stderr.contains("battles: 0 battle(s) entered, 0 won, 0 lost, 0 verified by replay, 0 divergence(s), 0 command(s) of ours applied (0 attack, 0 magic, 0 item, 0 defend), 1 refusal(s)"),
+        stderr.contains("battles: 0 battle(s) entered, 0 won, 0 lost, 0 escaped, 0 verified by replay, 0 divergence(s), 0 command(s) of ours applied (0 attack, 0 magic, 0 item, 0 defend, 0 limit, 0 escape), 1 refusal(s)"),
         "{stderr}"
     );
 }

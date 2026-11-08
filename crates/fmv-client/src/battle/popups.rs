@@ -84,12 +84,15 @@ pub fn popup_of(event: &BattleEvent) -> Option<(ActorId, PopupKind)> {
         BattleEvent::Revive { target, hp, .. } => Some((target, PopupKind::Heal { amount: hp })),
         BattleEvent::MpRestored { target, amount, .. } => Some((target, PopupKind::Mp { amount })),
         // Gauges filling, deaths and the end say nothing over a fighter, nor does an action's start
-        // (the banner has its name) or the MP it cost (the caster's bar shows it).
+        // (the banner has its name) or the MP it cost (the caster's bar shows it). Protocol v7: the limit
+        // gauge has its own bar in the party panel, and a failed escape its words in the banner.
         BattleEvent::GaugeReady { .. }
         | BattleEvent::Death { .. }
         | BattleEvent::Victory
         | BattleEvent::Defeat
         | BattleEvent::Action { .. }
+        | BattleEvent::LimitGauge { .. }
+        | BattleEvent::EscapeFailed { .. }
         | BattleEvent::MpSpent { .. } => None,
     }
 }

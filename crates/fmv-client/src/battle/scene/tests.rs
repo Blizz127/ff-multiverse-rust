@@ -22,7 +22,7 @@ fn kit() -> ModelKit {
 }
 
 fn member(i: u64, character: u8) -> BattleMember {
-    BattleMember { entity: EntityId(1 + i), account: AccountId(1 + i), character, level: 5, weapon: None, armor: None }
+    BattleMember { entity: EntityId(1 + i), account: AccountId(1 + i), character, level: 5, weapon: None, armor: None, limit: 0 }
 }
 
 fn setup_for(formation: u16, party: usize) -> BattleSetup {
@@ -410,6 +410,120 @@ fn a_miss_makes_the_target_step_aside_and_a_clock_that_goes_wrong_does_not_break
     // Events about actors the scene does not have change nothing.
     scene.update(6.0, &[BattleEvent::Death { actor: ActorId(99) }, BattleEvent::Damage { actor: ActorId(98), target: ActorId(0), amount: 1, critical: false }], Some(&engine));
     assert_eq!(scene.frame(&view, false).models.models.len(), 4);
+}
+
+// ----- protocol v7: limit breaks and escape -------------------------------------------------------
+
+#[test]
+fn a_limit_break_never_runs_up_and_takes_the_colour_of_what_it_does_and_running_is_no_blow() {
+    // Party of four: Cloud (actor 0) strikes with his limit, Aeris (actor 3) heals with hers.
+    let engine = engine(1, 4);
+    let plain = Look { melee: false, element: Element::Plain };
+    assert_eq!(look_in(Some(&engine), ActorId(0), ActionRef::Limit(128)), plain);
+    assert_eq!(look_in(Some(&engine), ActorId(3), ActionRef::Limit(142)), Look { melee: false, element: Element::Cure });
+    assert_eq!(look_in(Some(&engine), ActorId(0), ActionRef::Escape), plain);
+    // The id the server names is not looked up: the performer's own limit decides (a lie changes nothing).
+    assert_eq!(look_in(Some(&engine), ActorId(3), ActionRef::Limit(7)), Look { melee: false, element: Element::Cure });
+    // Without the engine, or for somebody who is not there, it is a plain blow like any other action.
+    assert_eq!(look_in(None, ActorId(0), ActionRef::Limit(128)), Look::PLAIN);
+    assert_eq!(look_in(Some(&engine), ActorId(99), ActionRef::Escape), Look::PLAIN);
+}
+
+/// A preemptive battle of two heroes against one foe, the engine before anything and the events of a
+/// command of the first hero (after the announcement of the full gauges).
+fn command_of_the_first_hero(limit: u16, command: impl Fn(&BattleState) -> Command) -> (BattleState, BattleState, Vec<BattleEvent>) {
+    let mut setup = setup_for(3, 2);
+    setup.preemptive = true;
+    setup.party[0].limit = limit;
+    let before = SyntheticRules::default().build(&setup).unwrap();
+    let mut engine = before.clone();
+    let mut events = engine.step_ticks(1);
+    let command = command(&engine);
+    events.extend(engine.submit_command(ActorId(0), command).expect("the first hero can act"));
+    (before, engine, events)
+}
+
+#[test]
+fn a_limit_break_from_the_engine_gathers_at_the_performer_and_breaks_over_the_target_late_in_one_burst_pair() {
+    let (before, engine, events) = command_of_the_first_hero(255, |e| Command::Limit { target: e.enemy_ids()[0] });
+    let target = engine.enemy_ids()[0];
+    assert!(events.contains(&BattleEvent::Action { actor: ActorId(0), action: ActionRef::Limit(128) }), "{events:?}");
+    assert!(events.contains(&BattleEvent::LimitGauge { actor: ActorId(0), value: 0 }), "the gauge is emptied");
+    let mut scene = BattleScene::new(&start(2, None), Some(&before), &[], &mut kit()).unwrap();
+    scene.update(10.0, &events, Some(&engine));
+    // One glow at the performer, a bloom and a star over the target, both at the cap of the delay.
+    let charges = scene.director.charges().to_vec();
+    assert_eq!(charges.len(), 1);
+    assert_eq!(charges[0].caster, 0);
+    let bursts = scene.director.bursts().to_vec();
+    assert!(bursts.len() >= 2 && bursts.iter().all(|b| b.target == usize::from(target.0)), "{bursts:?}");
+    assert!(bursts.iter().all(|b| b.at > 10.0 + 0.5), "a long show: nothing breaks at once ({bursts:?})");
+    // Nobody left: the party is drawn all the time, and after the show the enemy took the damage as numbers.
+    let view = view(&scene);
+    let mut t = 10.0;
+    while t < 14.0 {
+        scene.update(t, &[], Some(&engine));
+        assert!(scene.screen_anchors(&view)[0].drawn && scene.screen_anchors(&view)[1].drawn, "at {t}");
+        t += 0.05;
+    }
+}
+
+#[test]
+fn a_party_that_runs_away_turns_its_back_leaves_the_stage_and_shows_no_victory_while_the_enemy_stays() {
+    let (before, engine, events) = command_of_the_first_hero(0, |_| Command::Escape);
+    assert_eq!(engine.outcome(), Some(fmv_ff7_battle::rules::Outcome::Escaped), "a preemptive start gets away for sure");
+    let mut scene = BattleScene::new(&start(2, None), Some(&before), &[], &mut kit()).unwrap();
+    let view = view(&scene);
+    let home: Vec<Option<[f32; 2]>> = scene.screen_anchors(&view).iter().map(|a| a.feet).collect();
+    // The battle is over by the time the scene hears of it (no engine), and the run plays all the same.
+    scene.update(10.0, &events, None);
+    scene.update(10.8, &[], None);
+    let mid = scene.screen_anchors(&view);
+    let moved = |i: usize, now: &[ActorScreen]| match (home[i], now[i].feet) {
+        (Some(a), Some(b)) => (a[0] - b[0]).hypot(a[1] - b[1]) > 20.0,
+        _ => true,
+    };
+    assert!(moved(0, &mid) && moved(1, &mid), "both heroes are on their way: {mid:?} from {home:?}");
+    assert!(!moved(2, &mid), "the enemy stays where it is");
+    // Long after, the heroes are not drawn at all (no shadows, no models) and nothing stands up to cheer.
+    scene.update(20.0, &[], None);
+    let later = scene.screen_anchors(&view);
+    assert!(!later[0].drawn && !later[1].drawn && later[2].drawn, "{later:?}");
+    let frame = scene.frame(&view, false);
+    assert_eq!(frame.models.models.len(), 1, "only the enemy is left on the stage");
+    assert_eq!(frame.models.ground.iter().filter(|s| s.inner.is_empty()).count(), 1);
+}
+
+#[test]
+fn an_escape_that_fails_throws_the_runner_back_and_nobody_leaves() {
+    let mut setup = setup_for(4, 2);
+    setup.preemptive = false;
+    let before = SyntheticRules::default().build(&setup).unwrap();
+    let failed = [BattleEvent::Action { actor: ActorId(0), action: ActionRef::Escape }, BattleEvent::EscapeFailed { actor: ActorId(0) }];
+    // How far (px) the first hero strays from its mark in two seconds after `events`, and where it ends.
+    let sweep = |events: &[BattleEvent]| {
+        let mut scene = BattleScene::new(&start(2, None), Some(&before), &[], &mut kit()).unwrap();
+        let view = view(&scene);
+        let home = scene.screen_anchors(&view)[0].feet.unwrap();
+        scene.update(10.0, events, Some(&before));
+        let mut farthest = 0.0f32;
+        let mut t = 10.0;
+        while t < 12.0 {
+            scene.update(t, &[], Some(&before));
+            let anchors = scene.screen_anchors(&view);
+            assert!(anchors.iter().all(|a| a.drawn), "nobody leaves, at {t}");
+            if let Some(feet) = anchors[0].feet {
+                farthest = farthest.max((feet[0] - home[0]).hypot(feet[1] - home[1]));
+            }
+            t += 0.02;
+        }
+        (farthest, scene.screen_anchors(&view)[0].feet.unwrap(), home)
+    };
+    let (idle, _, _) = sweep(&[]);
+    let (thrown, back, home) = sweep(&failed);
+    assert!(thrown > idle + 8.0, "the runner is thrown back well beyond the idle sway: {thrown} px against {idle} px");
+    // And it is home again afterwards (up to the idle sway).
+    assert!((back[0] - home[0]).abs() < 1.0 && (back[1] - home[1]).abs() < 4.0, "home again: {back:?} vs {home:?}");
 }
 
 // ----- the overlay: the scene only says where the heads are ---------------------------------------

@@ -30,6 +30,7 @@ fn members(accounts: &[AccountId]) -> Vec<BattleMember> {
             level: 6,
             weapon: None,
             armor: None,
+            limit: 0,
         })
         .collect()
 }

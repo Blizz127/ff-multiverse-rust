@@ -379,11 +379,18 @@ impl Fight {
     /// Formation `formation` (301: two MPs) against Cloud, Tifa and Barret at level 12, the party ready (a
     /// preemptive start), the engine seeded with `seed`.
     fn new(real: &Real, formation: u16, seed: u64) -> Option<Self> {
+        Self::with_limits(real, formation, seed, [0; 3])
+    }
+
+    /// The same fight with the party starting with the limit gauges `limits` (Cloud, Tifa, Barret; 255 is
+    /// full: protocol v7).
+    fn with_limits(real: &Real, formation: u16, seed: u64, limits: [u16; 3]) -> Option<Self> {
         let gpu = Offscreen::new()?;
+        let limited = |i: u64, character: u8| BattleMember { limit: limits[i as usize], ..member(i, character) };
         let setup = BattleSetup {
             formation_id: formation,
             seed,
-            party: vec![member(0, 0), member(1, 2), member(2, 1)],
+            party: vec![limited(0, 0), limited(1, 2), limited(2, 1)],
             preemptive: true,
             back_attack: false,
             battle_speed: 0,
@@ -717,4 +724,79 @@ fn fight_the_victory_pose() {
     let held = fight.scene.director.motion(standing[0], first_pose + 30.0).clip.expect("holding the pose");
     assert_eq!(held.slot, 2);
     assert!(held.frame > 20.0, "held on the last frame of a long clip: {held:?}");
+}
+
+// ----- protocol v7: limit breaks and escape ----------------------------------------------------------
+
+/// A limit break: Cloud's gauge is full and he gives his limit (Braver) to the first MP. He gathers it with the
+/// cast clips under a glow, and it breaks over the target at the cap of the impact delay, hard: the bloom of a
+/// spell and the gold star of a critical hit in the same instant, with the number landing then.
+#[test]
+#[ignore = "needs the owner's real FF7 data (FMV_FF7_DATA or FMV_FF7_LIBRARY) and a GPU or a software Vulkan/GL driver"]
+fn fight_a_limit_break() {
+    let Some(real) = open_real() else { return };
+    let Some(mut fight) = Fight::with_limits(&real, 301, SEED, [255, 0, 0]) else { return };
+    fight.now = 2.0;
+    let first = fight.server.step(1);
+    fight.say(first);
+    let arrival = fight.now;
+    let target = fight.server.first_enemy().expect("an enemy");
+    assert!(fight.server.state.limit_ready(ActorId(0)), "Cloud starts with a full gauge");
+    let blow = fight.server.command(ActorId(0), Command::Limit { target });
+    assert!(blow.is_some(), "a full gauge gives the limit");
+    fight.say(blow);
+    assert!(fight.server.state.limit_gauge(ActorId(0)) < 255, "the limit spent the gauge");
+    // The glow gathers from the arrival to the cap of the delay, and the burst pair breaks on the target then.
+    let impact = arrival + cue::MAX_IMPACT_DELAY;
+    let charges = fight.scene.director.charges().to_vec();
+    assert_eq!((charges.len(), charges[0].caster), (1, 0));
+    assert!((charges[0].end - impact).abs() < 1e-9, "{charges:?}");
+    let bursts = fight.scene.director.bursts().to_vec();
+    assert!(bursts.len() >= 2 && bursts.iter().all(|b| (b.at - impact).abs() < 1e-9 && b.target == usize::from(target.0)), "{bursts:?}");
+    assert!(bursts.iter().any(|b| b.kind == effects::BurstKind::Spell) && bursts.iter().any(|b| matches!(b.kind, effects::BurstKind::Hit { critical: true })));
+    fight.sheet("limit-break-braver", arrival, &[0.05, 0.25, 0.45, 0.58, 0.64, 0.75, 0.95, 1.4], 2);
+}
+
+/// A failed escape (Cloud tries to run and is thrown back a little, the others stay) and a successful one (every
+/// member turns its back, runs off with the run clip and leaves the stage; no victory pose follows).
+#[test]
+#[ignore = "needs the owner's real FF7 data (FMV_FF7_DATA or FMV_FF7_LIBRARY) and a GPU or a software Vulkan/GL driver"]
+fn fight_a_failed_escape_and_a_successful_one() {
+    let Some(real) = open_real() else { return };
+    // The failure: the events a server sends when the Run Checks fail (the picture needs no engine for it).
+    let Some(mut fight) = Fight::new(&real, 301, SEED) else { return };
+    fight.now = 2.0;
+    let first = fight.server.step(1);
+    fight.say(first);
+    let arrival = fight.now;
+    let failed = [BattleEvent::Action { actor: ActorId(0), action: ActionRef::Escape }, BattleEvent::EscapeFailed { actor: ActorId(0) }];
+    fight.scene.update(arrival, &failed, fight.client.engine());
+    let thrown = fight.scene.director.motion(0, arrival + 0.17).offset;
+    assert!(thrown.iter().any(|c| c.abs() > 50.0), "thrown back: {thrown:?}");
+    assert!(fight.scene.director.motion(1, arrival + 0.17).offset.iter().all(|c| c.abs() < 1e-3), "the others stay");
+    fight.sheet("escape-failed", arrival, &[0.05, 0.17, 0.3, 0.45, 0.6, 1.0], 2);
+
+    // The success: this fight started with a preemptive strike, a sure escape.
+    let Some(mut fight) = Fight::new(&real, 301, SEED + 1) else { return };
+    fight.now = 2.0;
+    let first = fight.server.step(1);
+    fight.say(first);
+    let arrival = fight.now;
+    let run = fight.server.command(ActorId(0), Command::Escape);
+    assert!(run.is_some(), "the engine takes the command");
+    fight.say(run);
+    assert_eq!(fight.server.state.outcome(), Some(fmv_ff7_battle::rules::Outcome::Escaped), "a preemptive start gets away");
+    let ended = fight.server.id;
+    fight.say(Some(ServerMsg::BattleEnd { battle_id: ended, outcome: fmv_ff7_battle::rules::Outcome::Escaped, rewards: vec![] }));
+    for i in 0..3 {
+        let at = arrival + 0.12 * i as f64 + 0.6;
+        let running = fight.scene.director.motion(i, at);
+        assert_eq!(running.clip.map(|c| c.slot), Some(clips::party::RUN), "member {i} runs");
+        assert!((running.turn - std::f32::consts::PI).abs() < 1e-6, "with its back to the fight");
+        assert!(fight.scene.director.motion(i, arrival + 3.0).gone, "member {i} is off the stage");
+    }
+    for foe in 3..5 {
+        assert!(!fight.scene.director.motion(foe, arrival + 3.0).gone, "the enemies stay");
+    }
+    fight.sheet("escape-run-off", arrival, &[0.0, 0.3, 0.6, 0.9, 1.2, 1.6, 2.0, 3.0], 2);
 }

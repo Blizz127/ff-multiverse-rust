@@ -10,6 +10,9 @@
 //! * `0xFE` (`{FUNC}`, an escape followed by an argument, mostly colour codes) is dropped
 //!   together with its single argument byte. APPROXIMATION: some `FUNC` codes carry more than
 //!   one argument byte; they do not occur in the battle-name fields this crate reads.
+//! * `0xF8` (the box colour: the next byte picks the colour, and `0x02` is the red of the limit
+//!   breaks) is dropped together with its argument byte, so the names of the limit breaks in
+//!   "Names - magic", which begin with it, read as plain words.
 //! * Any other byte (accented Latin range `0x60..=0xDF`, controls, Japanese-encoding data in
 //!   test entries) becomes U+FFFD, so callers can detect non-plain-ASCII text with
 //!   [`is_plain_ascii`] instead of mistaking it for real names.
@@ -20,6 +23,8 @@ pub const TERMINATOR: u8 = 0xFF;
 pub const FUNC: u8 = 0xFE;
 /// `{EOL}` line break byte.
 pub const EOL: u8 = 0xE7;
+/// Box colour escape byte (followed by an argument byte): the limit breaks' names start with it.
+pub const BOX_COLOR: u8 = 0xF8;
 
 /// Decode FF7 text up to the first terminator (or the end of `bytes`).
 pub fn decode(bytes: &[u8]) -> String {
@@ -28,7 +33,7 @@ pub fn decode(bytes: &[u8]) -> String {
     while let Some(b) = iter.next() {
         match b {
             TERMINATOR => break,
-            FUNC => {
+            FUNC | BOX_COLOR => {
                 // Escape + one argument byte.
                 let _ = iter.next();
             }
@@ -92,6 +97,9 @@ mod tests {
         // FUNC drops its argument byte; a trailing FUNC with no argument is fine too.
         assert_eq!(decode(&[0x21, FUNC, 0xD2, 0x22, 0xFF]), "AB");
         assert_eq!(decode(&[0x21, FUNC]), "A");
+        // The box colour of a limit break's name (F8 02, red) is dropped with its argument, nothing else.
+        assert_eq!(decode_trimmed(&[BOX_COLOR, 0x02, 0x22, 0x52, 0x41, 0xFF]), "Bra");
+        assert_eq!(decode(&[0x21, BOX_COLOR]), "A");
         // Unmapped bytes are visibly substituted.
         let s = decode(&[0x70, 0x5F, 0x80, 0xFF]);
         assert_eq!(s, "\u{FFFD}\u{FFFD}\u{FFFD}");

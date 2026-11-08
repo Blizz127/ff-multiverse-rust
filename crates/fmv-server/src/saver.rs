@@ -7,7 +7,9 @@
 //! connected. What is queued is a payment (a delta), never a whole record: two results for one
 //! account, or a result for an account that logged in again while it was queued, add up instead of one
 //! overwriting the other. A payment is a won battle's experience, gil, AP and dropped items
-//! ([`SavedChange::Reward`]) or one item an account used in a battle ([`SavedChange::UsedItem`]).
+//! ([`SavedChange::Reward`]), one item an account used in a battle ([`SavedChange::UsedItem`]) or the limit
+//! gauge a character ended a battle with ([`SavedChange::Limit`]: the one change that is a value, not a delta,
+//! which is safe because an account is in one battle at a time and the queue keeps the order).
 //!
 //! # The inventory in the record
 //!
@@ -70,6 +72,11 @@ pub(crate) enum SavedChange {
     Reward(BattleReward),
     /// One item the account used in a battle (taken out of the stored inventory).
     UsedItem(u16),
+    /// The limit gauge the account's character ended a battle with (protocol v7; any outcome, an escape
+    /// included). It is set, not added: the world only queues it when it differs from the one the battle
+    /// started with, so a gauge that did not move writes nothing. An account with no stored record gets
+    /// one from a fresh start (it is the one change that can create a record before a first win).
+    Limit(u16),
 }
 
 impl SaveJob {
@@ -81,12 +88,16 @@ impl SaveJob {
         Self { account, character, change: SavedChange::UsedItem(item) }
     }
 
+    pub(crate) fn limit(account: AccountId, character: u8, limit: u16) -> Self {
+        Self { account, character, change: SavedChange::Limit(limit) }
+    }
+
     /// The payment of a reward job.
     #[cfg(test)]
     pub(crate) fn paid(&self) -> Option<&BattleReward> {
         match &self.change {
             SavedChange::Reward(reward) => Some(reward),
-            SavedChange::UsedItem(_) => None,
+            SavedChange::UsedItem(_) | SavedChange::Limit(_) => None,
         }
     }
 }
@@ -189,6 +200,10 @@ pub(crate) fn persist(store: &Store, game: GameId, rules: &dyn BattleRules, job:
                 inventory.apply(&Change::Used(*item), max_stack);
                 true
             }
+            SavedChange::Limit(value) => {
+                progress.limit = (*value).min(rules.progress_limits().max_limit);
+                false
+            }
         };
         items = inventory.total();
         let mut record = progress.to_record(job.account, game, now);
@@ -239,6 +254,11 @@ async fn save_one(store: &Arc<Store>, game: GameId, rules: &Arc<dyn BattleRules>
                     SavedChange::UsedItem(item) => {
                         info!("item use saved account={} character={} item={item} items={}", job.account.0, job.character, saved.items)
                     }
+                    // Not a `progress saved` line: the smoke test counts those, one per member per won battle.
+                    SavedChange::Limit(_) => info!(
+                        "limit saved account={} character={} limit={} level={} exp={}",
+                        job.account.0, saved.progress.character, saved.progress.limit, saved.progress.level, saved.progress.exp
+                    ),
                 }
                 return;
             }
@@ -305,14 +325,14 @@ mod tests {
 
         // A fresh Cloud is level 5 with 40 experience; 12 more is 52, no level.
         let saved = persist_progress(&store, GameId::Ff7, rules.as_ref(), &job(account, 0, 12, 20, 2), NOW).unwrap();
-        assert_eq!(saved, Progress { character: 0, level: 5, exp: 52, ap: 2, gil: 20 });
+        assert_eq!(saved, Progress { character: 0, level: 5, exp: 52, ap: 2, gil: 20, limit: 0 });
         assert_eq!(stored(&store, account), Some(saved));
         let record = store.get_character_progress(account, GameId::Ff7).unwrap().unwrap();
         assert_eq!((record.updated_at, record.account_id, record.game), (NOW, account, GameId::Ff7));
 
         // 52 + 24 = 76: level 6 (60). The next payment starts from what is stored.
         let saved = persist_progress(&store, GameId::Ff7, rules.as_ref(), &job(account, 0, 24, 40, 4), NOW + 1).unwrap();
-        assert_eq!(saved, Progress { character: 0, level: 6, exp: 76, ap: 6, gil: 60 });
+        assert_eq!(saved, Progress { character: 0, level: 6, exp: 76, ap: 6, gil: 60, limit: 0 });
         assert_eq!(store.get_character_progress(account, GameId::Ff7).unwrap().unwrap().updated_at, NOW + 1);
     }
 
@@ -323,7 +343,7 @@ mod tests {
         persist_progress(&store, GameId::Ff7, rules.as_ref(), &job(account, 0, 30, 10, 1), NOW).unwrap();
         // The account's look changed to Tifa (2): she carries the level and the totals over.
         let saved = persist_progress(&store, GameId::Ff7, rules.as_ref(), &job(account, 2, 1, 0, 0), NOW).unwrap();
-        assert_eq!(saved, Progress { character: 2, level: 6, exp: 71, ap: 1, gil: 10 }, "40 + 30 + 1 is level 6");
+        assert_eq!(saved, Progress { character: 2, level: 6, exp: 71, ap: 1, gil: 10, limit: 0 }, "40 + 30 + 1 is level 6");
     }
 
     #[test]
@@ -332,13 +352,55 @@ mod tests {
         let rules = rules();
         let limits = rules.progress_limits();
         // A hand-edited record far outside the caps (the store has no opinion on them).
-        let wild = Progress { character: 0, level: 250, exp: u32::MAX, ap: u32::MAX, gil: u32::MAX };
+        let wild = Progress { character: 0, level: 250, exp: u32::MAX, ap: u32::MAX, gil: u32::MAX, limit: u16::MAX };
         store.put_character_progress(&wild.to_record(account, GameId::Ff7, NOW)).unwrap();
         let saved = persist_progress(&store, GameId::Ff7, rules.as_ref(), &job(account, 0, 5, 5, 5), NOW).unwrap();
         assert_eq!(
             saved,
-            Progress { character: 0, level: limits.max_level, exp: limits.max_exp, ap: limits.max_ap, gil: limits.max_gil }
+            Progress { character: 0, level: limits.max_level, exp: limits.max_exp, ap: limits.max_ap, gil: limits.max_gil, limit: limits.max_limit }
         );
+    }
+
+    // ---- the limit gauge in the record ----
+
+    #[test]
+    fn a_gauge_is_set_not_added_and_a_payment_after_it_keeps_it() {
+        let (_dir, store, account) = store();
+        let rules = rules();
+        // Nothing stored yet, and a battle that was escaped (so paid nothing) ended with a gauge worth
+        // keeping: the record is made from a fresh start with the gauge in it.
+        assert_eq!(stored(&store, account), None);
+        let saved = persist(&store, GameId::Ff7, rules.as_ref(), &SaveJob::limit(account, 0, 137), NOW).unwrap();
+        assert_eq!(saved.progress, Progress { character: 0, level: 5, exp: 40, ap: 0, gil: 0, limit: 137 }, "a fresh Cloud, nothing earned, 137 of 255");
+        assert_eq!(saved.items, 3 + 1 + 1, "the inventory is told as the starting stock, and nothing was written for it");
+        assert_eq!(stored_inventory(&store, account), None, "a gauge is not about items: the starting stock is not written");
+        // A second battle's end value replaces it, whatever it was (this is no payment).
+        let saved = persist_progress(&store, GameId::Ff7, rules.as_ref(), &SaveJob::limit(account, 0, 20), NOW + 1).unwrap();
+        assert_eq!(saved.limit, 20);
+        // A win pays and leaves the gauge as it is; a gauge written after it leaves the payment as it is.
+        let saved = persist_progress(&store, GameId::Ff7, rules.as_ref(), &job(account, 0, 12, 20, 2), NOW + 2).unwrap();
+        assert_eq!(saved, Progress { character: 0, level: 5, exp: 52, ap: 2, gil: 20, limit: 20 });
+        let saved = persist_progress(&store, GameId::Ff7, rules.as_ref(), &SaveJob::limit(account, 0, 0), NOW + 3).unwrap();
+        assert_eq!(saved, Progress { character: 0, level: 5, exp: 52, ap: 2, gil: 20, limit: 0 });
+        assert_eq!(store.get_character_progress(account, GameId::Ff7).unwrap().unwrap().updated_at, NOW + 3);
+    }
+
+    #[test]
+    fn the_inventory_survives_a_gauge_and_a_gauge_above_the_cap_is_brought_inside() {
+        let (_dir, store, account) = store();
+        let rules = rules();
+        // A record that holds an inventory (a drop was the first change).
+        persist(&store, GameId::Ff7, rules.as_ref(), &drop_job(account, &[e(0, 2)]), NOW).unwrap();
+        let before = stored_inventory(&store, account).expect("an inventory");
+        let saved = persist_progress(&store, GameId::Ff7, rules.as_ref(), &SaveJob::limit(account, 0, 200), NOW + 1).unwrap();
+        assert_eq!(saved.limit, 200);
+        assert_eq!(stored_inventory(&store, account), Some(before), "writing the gauge touches no item");
+        // More than the game's cap is not kept.
+        let saved = persist_progress(&store, GameId::Ff7, rules.as_ref(), &SaveJob::limit(account, 0, u16::MAX), NOW + 2).unwrap();
+        assert_eq!(saved.limit, rules.progress_limits().max_limit);
+        // A record that was never given a gauge (what a v6 record reads as: see `fmv-persist`'s tests of
+        // the missing key) is an empty one in the mirror.
+        assert_eq!(Progress::from_record(&fmv_persist::CharacterProgress::new(account, GameId::Ff7, 0, 5, NOW)).limit, 0);
     }
 
     #[test]
@@ -405,7 +467,7 @@ mod tests {
         assert_eq!(stored_inventory(&store, account), Some(vec![e(0, 2), e(3, 1), e(7, 1)]));
         assert_eq!(saved.items, 4);
         // The numbers of the first payment are still there (an item job pays nothing).
-        assert_eq!(stored(&store, account), Some(Progress { character: 0, level: 5, exp: 52, ap: 2, gil: 20 }));
+        assert_eq!(stored(&store, account), Some(Progress { character: 0, level: 5, exp: 52, ap: 2, gil: 20, limit: 0 }));
         // A later payment of numbers keeps the inventory exactly as it is (it is stored now).
         persist(&store, GameId::Ff7, rules.as_ref(), &job(account, 0, 1, 1, 1), NOW + 1).unwrap();
         assert_eq!(stored_inventory(&store, account), Some(vec![e(0, 2), e(3, 1), e(7, 1)]));
@@ -425,7 +487,7 @@ mod tests {
         let (_dir, store, account) = store();
         let rules = rules();
         // A record of the previous version: numbers, no inventory.
-        let old = Progress { character: 0, level: 5, exp: 40, ap: 0, gil: 0 }.to_record(account, GameId::Ff7, NOW);
+        let old = Progress { character: 0, level: 5, exp: 40, ap: 0, gil: 0, limit: 0 }.to_record(account, GameId::Ff7, NOW);
         assert_eq!(old.inventory, None);
         store.put_character_progress(&old).unwrap();
         persist(&store, GameId::Ff7, rules.as_ref(), &job(account, 0, 12, 20, 2), NOW).unwrap();
@@ -452,7 +514,7 @@ mod tests {
     fn a_stored_inventory_outside_the_rules_is_brought_inside_by_the_next_change() {
         let (_dir, store, account) = store();
         let rules = rules();
-        let mut wild = Progress { character: 0, level: 5, exp: 40, ap: 0, gil: 0 }.to_record(account, GameId::Ff7, NOW);
+        let mut wild = Progress { character: 0, level: 5, exp: 40, ap: 0, gil: 0, limit: 0 }.to_record(account, GameId::Ff7, NOW);
         wild.inventory = Some(vec![e(5, 60_000), e(2, 3)]);
         store.put_character_progress(&wild).unwrap();
         persist(&store, GameId::Ff7, rules.as_ref(), &SaveJob::used_item(account, 0, 2), NOW).unwrap();

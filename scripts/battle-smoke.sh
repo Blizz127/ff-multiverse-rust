@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/battle-smoke.sh - shared-battle smoke test for fmv-server + fmv-client (protocol v6).
+# scripts/battle-smoke.sh - shared-battle smoke test for fmv-server + fmv-client (protocol v7).
 #
 # Usage: scripts/battle-smoke.sh [--fixture|--random|--progress] [--release|--debug] [--bin-dir DIR] [--build]
 #                                [--library STATE_DIR] [--duration SECS] [--formation ID]
@@ -22,8 +22,8 @@
 #     note says "verified: the server's N message(s) replayed ..." (a machine without battle data
 #     says "NOT verified"), and its closing `headless: battles:` line counts 1 verified by replay;
 #   * both members acted: the server's "battle ended" line carries commands=[a, b] (accepted
-#     commands per actor, of any kind: Attack, Magic, Item or Defend; both at least 1) and each bot
-#     counts a command of its own applied;
+#     commands per actor, of any kind: Attack, Magic, Item, Defend, Limit or Escape; both at least 1)
+#     and each bot counts a command of its own applied;
 #   * each bot was told its inventory (protocol v6): its SMOKE line ends with items=N, the total
 #     of what it carries (a new account starts with the game's starting stock, so N is at least 1).
 #
@@ -42,7 +42,7 @@
 # exp=0 items=0 (the FIXTURE server has no characters and no items, so it reports no progress and
 # no inventory: 0 is "unknown").
 #
-# --progress (real data): character progress and inventory, protocol v6. ONE server stays up through
+# --progress (real data): character progress, inventory and limit gauge, protocol v7. ONE server stays up through
 # three runs of the same two bots, which keep their client state directories and so log in again with
 # the tokens the first run saved. Run 1: the party fights one shared battle; each bot's progress notes
 # ("progress: ... level=L exp=E exp_to_next=N ...", first on joining, then after the win) must show
@@ -70,6 +70,19 @@
 # reported, and every "progress saved" line carries the inventory's total (items=N). These weak enemies
 # often drop nothing under a random seed (a note says when neither battle did); --seed 5 pins one under
 # which formation 301 drops a Potion in every battle, so the whole drop chain runs.
+#
+# The same chain for the LIMIT GAUGE (protocol v7): a new account starts its first battle with an empty
+# gauge (the server's "battle started ... limits=[0, 0]"), the damage the party takes fills it, and the
+# gauges the first battle ended with (the server's "battle ended ... limits=[a, b]") are exactly what the
+# second battle starts with (the server keeps the gauge in its mirror of the character and queues it for
+# the saver: "limit kept ... saving=queued"). Stopping the server must have written every queued gauge:
+# one "limit saved account=" line per "saving=queued" (those are not "progress saved" lines, which stay one
+# per member per won battle). Every "battle started" line also says how hard the fight is to run from
+# (run_difficulty=N, or none), read from scene.bin's own flags and counters. The bots give their limit break
+# when the gauge is full and never escape, but these weak enemies rarely fill a gauge in one battle: a limit
+# and an escape over a real connection, and the gauge a battle ends with surviving a restart, are tested by
+# crates/fmv-server/tests/progress.rs; Braver and running with the owner's own kernel and scenes by
+# crates/fmv-ff7-battle/tests/real_data.rs.
 #
 # Isolation (the owner's state directory is never touched, only its LIBRARY is read): the server and
 # the clients run with XDG_DATA_HOME/XDG_STATE_HOME/XDG_CONFIG_HOME/XDG_CACHE_HOME and FMV_STATE_DIR
@@ -130,7 +143,8 @@ start by themselves); every battle they enter must be verified by replay. --fixt
 a FIXTURE server refuses battles cleanly. --progress: the real-data bots fight, then reconnect with
 their saved tokens and fight again, then reconnect once more: each run's progress notes must be
 consistent (a win pays experience and a level where the threshold was crossed), the second battle
-must carry the level gained, and every reconnect must show what the run before ended with.
+must carry the level gained and the limit gauges the first battle ended with (protocol v7), and every
+reconnect must show what the run before ended with.
 
   --library DIR     state directory that contains library/ (default $FMV_FF7_LIBRARY, else
                      ~/.local/share/ff-multiverse); only the library is read, never written
@@ -388,6 +402,36 @@ levels_of() {
     sorted=$(printf '%s\n' "${levels[@]}" | sort -n | tr '\n' ' ')
     printf '%s' "${sorted% }"
   fi
+}
+
+# limits_of <server log line>: the limit gauges the server logged for a battle's members (`limits=[0, 37]`
+# on "battle started": what each began with; on "battle ended": what each ended with), sorted, as "0 37"
+# (nothing if the line has none). Sorted like levels_of: the two bots may be seated in either order.
+limits_of() {
+  local line sorted
+  local -a limits
+  line=$(strip_ansi "$1")
+  if [[ $line =~ limits=\[([0-9,\ ]*)\] ]]; then
+    read -r -a limits <<<"${BASH_REMATCH[1]//,/ }"
+    sorted=$(printf '%s\n' "${limits[@]}" | sort -n | tr '\n' ' ')
+    printf '%s' "${sorted% }"
+  fi
+}
+
+# count_limits_queued <server log>: how many limit gauges the server queued for the saver: its
+# "limit kept battle=.. saving=queued" lines.
+count_limits_queued() {
+  local line n=0
+  [[ -r $1 ]] || {
+    printf '0'
+    return 0
+  }
+  while IFS= read -r line || [[ -n $line ]]; do
+    if [[ $line == *"limit kept battle="* && $line == *"saving=queued"* ]]; then
+      n=$((n + 1))
+    fi
+  done <"$1"
+  printf '%s' "$n"
 }
 
 # progress_note <first|last> <client log>: that `progress:` note of a client (the client's `progress`
@@ -921,7 +965,7 @@ run_progress() {
 
   # The server's side: two battles of the whole party, the second fought at the levels the first one's
   # win left (the level gained is in the second EncounterStart), one saved payment per member and battle.
-  local started_1 started_2 got want value
+  local started_1 started_2 ended_1 got want value
   (($(count_lines_with "$WORK/server.log" "battle started") == 2)) || problem "the server started $(count_lines_with "$WORK/server.log" "battle started") battle(s), expected 2"
   started_1=$(nth_line_with "$WORK/server.log" "battle started" 1 || true)
   started_2=$(nth_line_with "$WORK/server.log" "battle started" 2 || true)
@@ -935,6 +979,21 @@ run_progress() {
     got=$(levels_of "$started_2")
     want=$(joined_levels run2)
     [[ $got == "$want" ]] || problem "the second battle carries levels [$got], but the first win left the bots at levels [$want]: the level gained was not used"
+    # The limit gauges (protocol v7): a new account starts with an empty one, and the gauges the first battle
+    # ended with are the ones the second starts with (kept in the server's mirror, queued for the saver).
+    got=$(limits_of "$started_1")
+    [[ $got == "0 0" ]] || problem "the first battle was started with limit gauges [$got], expected [0 0] for two new accounts: $started_1"
+    ended_1=$(nth_line_with "$WORK/server.log" "battle ended" 1 || true)
+    want=$(limits_of "$ended_1")
+    got=$(limits_of "$started_2")
+    [[ -n $want && $got == "$want" ]] || problem "the second battle starts with limit gauges [$got], but the first one ended with [$want]: the gauge was not kept (first end: $ended_1)"
+    if [[ $want =~ ^0( 0)*$ ]]; then
+      say "note: nobody was hurt in the first battle (every limit gauge ended at 0), so the carry-over of a non-empty gauge was not exercised over real processes; these weak enemies hurt somebody in only some runs, so run it again"
+    else
+      say "the first battle left the limit gauges [$want] and the second one started with exactly those"
+    fi
+    # Every fight says how hard it is to run from (scene.bin's counter; none: it cannot be run from).
+    [[ $started_1 == *" run_difficulty="* && $started_2 == *" run_difficulty="* ]] || problem "a battle start does not say how hard the fight is to run from (run_difficulty=): [$started_1] [$started_2]"
   fi
   local ended
   ended=$(last_line_with "$WORK/server.log" "battle ended" || true)
@@ -954,6 +1013,11 @@ run_progress() {
   value=$(count_lines_with "$WORK/server.log" "progress saved account=")
   [[ $value == 4 ]] || problem "the server logged $value 'progress saved' line(s), expected 4 (two members, two battles)"
   check_saved_items "$WORK/server.log"
+  # Every limit gauge the server queued was written too (one "limit saved" line per "limit kept ... saving=queued";
+  # the "battle reward" lines say saving=queued as well, so only the "limit kept" ones count).
+  got=$(count_limits_queued "$WORK/server.log")
+  value=$(count_lines_with "$WORK/server.log" "limit saved account=")
+  [[ $value == "$got" ]] || problem "the server queued $got limit gauge(s) for the saver but logged $value 'limit saved' line(s)"
   if log_has "$WORK/server.log" "NOT SAVED" || log_has "$WORK/server.log" "NOT QUEUED"; then
     problem "the server lost a payment: $(last_line_with "$WORK/server.log" "NOT SAVED" || last_line_with "$WORK/server.log" "NOT QUEUED")"
   fi
@@ -973,7 +1037,7 @@ run_progress() {
   say "server: $started_1"
   say "server: $started_2"
   RESULT=pass
-  say "PASS: two bots fought two battles on the real field across three logins; each win paid experience (and a level where the threshold was crossed), the progress and the inventory (the starting stock once, plus the drops) were saved and read back on every reconnect, and the second battle was fought at the level the first one left; $state_real unchanged ($after)"
+  say "PASS: two bots fought two battles on the real field across three logins; each win paid experience (and a level where the threshold was crossed), the progress and the inventory (the starting stock once, plus the drops) were saved and read back on every reconnect, and the second battle was fought at the level and with the limit gauges the first one left; $state_real unchanged ($after)"
 }
 
 run_fixture() {

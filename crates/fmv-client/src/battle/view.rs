@@ -17,7 +17,7 @@ use super::menu::MenuView;
 use super::panels::{layout, Banner, Finale};
 use super::popups::Popup;
 use crate::render::{color, Vertex, MAX_VERTICES};
-use fmv_ff7_battle::rules::{ActorId, GAUGE_MAX};
+use fmv_ff7_battle::rules::{ActorId, GAUGE_MAX, LIMIT_MAX};
 use fmv_protocol::BattleId;
 
 // Palette (sRGB bytes).
@@ -38,6 +38,9 @@ pub const HP_LOW_RGB: [u8; 3] = [225, 70, 60];
 pub const HP_DEAD_RGB: [u8; 3] = [90, 90, 100];
 pub const ATB_RGB: [u8; 3] = [90, 150, 255];
 pub const ATB_READY_RGB: [u8; 3] = [255, 238, 120];
+/// The limit gauge filling, and full (FF7 draws it in an orange that turns bright when the limit is ready).
+pub const LIMIT_RGB: [u8; 3] = [225, 120, 40];
+pub const LIMIT_FULL_RGB: [u8; 3] = [255, 190, 60];
 
 /// Height of the status band across the top of the window, in pixels.
 pub const BAND_H: f32 = 14.0;
@@ -90,11 +93,27 @@ pub struct Bar {
     pub alive: bool,
     /// Our own character.
     pub mine: bool,
+    /// The fighter's limit gauge, `0..=`[`LIMIT_MAX`] (protocol v7; always 0 for an enemy and for a
+    /// character that has no limit). Unlike the ATB gauge it is not extrapolated: it only moves with
+    /// the server's messages.
+    pub limit: u16,
 }
 
 impl Default for Bar {
     fn default() -> Self {
-        Self { actor: ActorId(0), name: String::new(), hp: 0, max_hp: 0, mp: 0, max_mp: 0, gauge: 0, ready: false, alive: false, mine: false }
+        Self {
+            actor: ActorId(0),
+            name: String::new(),
+            hp: 0,
+            max_hp: 0,
+            mp: 0,
+            max_mp: 0,
+            gauge: 0,
+            ready: false,
+            alive: false,
+            mine: false,
+            limit: 0,
+        }
     }
 }
 
@@ -335,6 +354,21 @@ pub(super) fn gauge_fraction(bar: &Bar) -> f32 {
     }
 }
 
+/// The limit gauge of `bar` as a fraction of a full one (the limit bars use it): a fallen character's is
+/// empty whatever it says.
+pub(super) fn limit_fraction(bar: &Bar) -> f32 {
+    if bar.alive {
+        fraction(u32::from(bar.limit), u32::from(LIMIT_MAX))
+    } else {
+        0.0
+    }
+}
+
+/// Whether `bar`'s limit gauge is full (and its owner stands): the limit can be given.
+pub(super) fn limit_full(bar: &Bar) -> bool {
+    bar.alive && bar.limit >= LIMIT_MAX
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -507,6 +541,17 @@ mod tests {
         assert_eq!(gauge_fraction(&Bar { ready: true, alive: true, gauge: 0, ..Bar::default() }), 1.0);
         assert_eq!(gauge_fraction(&Bar { ready: true, alive: false, gauge: 0, ..Bar::default() }), 0.0);
         assert_eq!(gauge_fraction(&Bar { gauge: u32::MAX, ..Bar::default() }), 1.0);
+    }
+
+    #[test]
+    fn the_limit_gauge_is_a_fraction_of_255_that_a_fallen_character_does_not_show() {
+        let limit = |limit: u16, alive: bool| Bar { limit, alive, ..Bar::default() };
+        assert_eq!(limit_fraction(&limit(0, true)), 0.0);
+        assert_eq!(limit_fraction(&limit(255, true)), 1.0);
+        assert!((limit_fraction(&limit(51, true)) - 0.2).abs() < 1e-6);
+        assert_eq!(limit_fraction(&limit(u16::MAX, true)), 1.0, "an absurd number does not overflow the bar");
+        assert_eq!(limit_fraction(&limit(255, false)), 0.0, "the fallen show an empty gauge");
+        assert!(limit_full(&limit(255, true)) && !limit_full(&limit(254, true)) && !limit_full(&limit(255, false)));
     }
 
     #[test]

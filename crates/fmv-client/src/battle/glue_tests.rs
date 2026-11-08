@@ -24,7 +24,7 @@ impl Server {
         let setup = BattleSetup {
             formation_id: FOE,
             seed: 5,
-            party: vec![BattleMember { entity: EntityId(100), account: ME, character: 0, level: 6, weapon: None, armor: None }],
+            party: vec![BattleMember { entity: EntityId(100), account: ME, character: 0, level: 6, weapon: None, armor: None, limit: 0 }],
             preemptive: true,
             back_attack: false,
             battle_speed: 0,

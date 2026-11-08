@@ -359,7 +359,9 @@ pub struct CharacterGrowth {
     /// shipped values are small signed numbers (negative and positive), consistent with a
     /// level offset applied when the character joins the party.
     pub level_modifier: i8,
-    /// The remaining limit-break data of the record is left raw.
+    /// The limit-break fields of the record (bytes `0x0C..0x38`).
+    pub limits: CharacterLimits,
+    /// The whole record, raw.
     pub raw: [u8; GROWTH_RECORD_SIZE],
 }
 
@@ -376,8 +378,60 @@ impl CharacterGrowth {
             mp_curve: u8_at(b, 7),
             exp_curve: u8_at(b, 8),
             level_modifier: i8_at(b, 0x0A),
+            limits: CharacterLimits::parse(b),
             raw: array_at(b, 0),
         }
+    }
+}
+
+/// The limit-break fields of a character's 56-byte growth record.
+///
+/// Layout (<https://ff7-mods.github.io/ff7-flat-wiki/FF7/Battle_and_growth_data.html>; the page names
+/// the fields and gives no meaning for their values, which are read here from the owner's Steam copy
+/// and checked by `tests/real_data.rs`):
+///
+/// | offset | size | field |
+/// |---|---|---|
+/// | `0x0C..0x18` | 4 x 3 bytes | the limit commands of limit levels 1 to 4, three slots each: the id of the limit in the "Names - magic" table (`0xFF`: no limit in that slot; the third slot of levels 1 to 3 and the second and third of level 4 are never used) |
+/// | `0x18`, `0x1A` | 2 x u16 | the total kills needed to reach limit level 2 and 3 |
+/// | `0x1C`, `0x20`, `0x24` | 3 x u16 | the uses of a level's first limit needed to learn its second (1-2, 2-2, 3-2) |
+/// | `0x28..0x38` | 4 x u32 | the "HP divisor" of limit levels 1 to 4: how slowly the limit gauge fills at that level |
+///
+/// Checked against the Limit Break Mechanics guide by GideonD (a copy of its requirements table:
+/// Cloud 8 uses for 1-2, 120 kills for level 2, 7 uses for 2-2, 320 kills in all for level 3, 6 uses for
+/// 3-2) which this record reproduces for the characters that guide lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CharacterLimits {
+    /// The limit ids by `[limit level - 1][slot]` (`None`: the slot holds no limit).
+    pub commands: [[Option<u8>; 3]; 4],
+    /// Total kills needed to reach limit level 2 and 3.
+    pub kills: [u16; 2],
+    /// Uses of the first limit of level 1, 2 and 3 needed to learn the level's second.
+    pub uses: [u16; 3],
+    /// The HP divisor of limit levels 1 to 4 (see [`crate::limit`]).
+    pub divisors: [u32; 4],
+}
+
+impl CharacterLimits {
+    fn parse(b: &[u8]) -> Self {
+        // A slot past the end of a short record holds nothing (reads are total, and 0 is a real id).
+        let slot = |level: usize, slot: usize| b.get(0x0C + level * 3 + slot).copied().filter(|id| *id != 0xFF);
+        Self {
+            commands: std::array::from_fn(|level| std::array::from_fn(|s| slot(level, s))),
+            kills: [u16_at(b, 0x18), u16_at(b, 0x1A)],
+            uses: [u16_at(b, 0x1C), u16_at(b, 0x20), u16_at(b, 0x24)],
+            divisors: [u32_at(b, 0x28), u32_at(b, 0x2C), u32_at(b, 0x30), u32_at(b, 0x34)],
+        }
+    }
+
+    /// The first limit of limit level 1: the one every character starts with (Braver, Big Shot, ...).
+    pub fn first(&self) -> Option<u8> {
+        self.commands[0][0]
+    }
+
+    /// The HP divisor of limit level 1, if the character has a limit at that level.
+    pub fn divisor_at_level_one(&self) -> Option<u32> {
+        self.first().map(|_| self.divisors[0]).filter(|d| *d > 0)
     }
 }
 
@@ -932,6 +986,11 @@ impl Kernel {
         self.commands.get(index)
     }
 
+    /// The limit-break fields of `who`'s growth record (see [`CharacterLimits`]).
+    pub fn limits(&self, who: CharacterId) -> Option<&CharacterLimits> {
+        self.growth.characters.get(who.index()).map(|c| &c.limits)
+    }
+
     /// Attack record `index` of the kernel attack data (section 1).
     pub fn attack(&self, index: usize) -> Option<AttackRecord> {
         let data = self.section(SECTION_ATTACKS)?;
@@ -1291,6 +1350,32 @@ mod tests {
         assert_eq!(g.mp_gain_percent[0], 12);
         assert_eq!(g.curves.len(), 64);
         assert_eq!(g.scene_block_starts(), vec![0, 5, 9, 14]);
+    }
+
+    #[test]
+    fn the_limit_fields_of_a_growth_record_are_read_by_offset() {
+        let k = Kernel::parse(&synthetic_kernel_bytes()).unwrap();
+        let barret = k.limits(CharacterId::Barret).expect("a record");
+        // Limit ids by [level][slot]: unused slots (0xFF) are None.
+        assert_eq!(barret.commands[0], [Some(0x81), Some(0x91), None]);
+        assert_eq!(barret.commands[1], [Some(0xA1), None, None]);
+        assert_eq!(barret.commands[2], [None, None, None]);
+        assert_eq!(barret.commands[3], [Some(0xB1), None, None]);
+        assert_eq!(barret.first(), Some(0x81));
+        assert_eq!((barret.kills, barret.uses), ([11, 31], [6, 7, 8]));
+        assert_eq!(barret.divisors, [110, 210, 310, 410]);
+        assert_eq!(barret.divisor_at_level_one(), Some(110));
+        // The raw record is still there and the typed fields are what it holds.
+        let record = &k.growth.characters[CharacterId::Barret.index()];
+        assert_eq!(record.raw[0x0C], 0x81);
+        assert_eq!(record.limits, *barret);
+        // A character with no limit in its record has none and no divisor to fill a gauge with.
+        let none = CharacterLimits::parse(&[0xFF; GROWTH_RECORD_SIZE]);
+        assert_eq!((none.first(), none.divisor_at_level_one()), (None, None));
+        let no_divisor = CharacterLimits { divisors: [0; 4], ..*barret };
+        assert_eq!(no_divisor.divisor_at_level_one(), None, "a divisor of 0 would fill nothing");
+        // A record cut short reads as empty, never as a panic.
+        assert_eq!(CharacterLimits::parse(&[]).first(), None);
     }
 
     #[test]

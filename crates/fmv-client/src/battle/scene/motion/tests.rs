@@ -2,7 +2,7 @@
 //! blow lands on schedule whatever the clips, and that nothing a server sends can grow the schedule
 //! without bound or break it.
 
-use super::super::clips::ClipSet;
+use super::super::clips::{party, ClipSet};
 use super::super::cue::{self, DEATH_BEAT, MAX_IMPACT_DELAY};
 use super::*;
 
@@ -507,4 +507,137 @@ fn idle_sway_is_small_distinct_per_actor_and_periodic() {
     let period = 3.4 * 2.0;
     let (a, b) = (idle(2, 0.7), idle(2, 0.7 + period));
     assert!(near(a.breath, b.breath, 1e-4) && near(a.sway, b.sway, 1e-4));
+}
+
+// ----- protocol v7: limit breaks and escape ----------------------------------------------------------
+
+/// What `look_in` says of a limit break that strikes (it does not run up) and of one that heals.
+const STRIKE_LIMIT: &dyn Fn(ActorId, ActionRef) -> Look = &|_, _| Look { melee: false, element: Element::Plain };
+const HEAL_LIMIT: &dyn Fn(ActorId, ActionRef) -> Look = &|_, _| Look { melee: false, element: Element::Cure };
+
+#[test]
+fn a_limit_break_is_a_long_spell_like_show_the_performer_gathers_and_a_strong_burst_breaks() {
+    let mut d = with_clips();
+    let batch = [action(0, ActionRef::Limit(128)), BattleEvent::LimitGauge { actor: ActorId(0), value: 0 }, damage(0, 2, false)];
+    d.on_batch(10.0, &batch, STRIKE_LIMIT);
+    // It lands at the cap, like the longest spell, and the gauge event lands nothing of its own.
+    assert_eq!(impacts(&d).len(), 2, "a bloom and a star at the same instant");
+    assert!(impacts(&d).iter().all(|&at| (at - (10.0 + MAX_IMPACT_DELAY)).abs() < 1e-9), "{:?}", impacts(&d));
+    let kinds: Vec<BurstKind> = d.bursts().iter().map(|b| b.kind).collect();
+    assert!(kinds.contains(&BurstKind::Spell) && kinds.contains(&BurstKind::Hit { critical: true }), "{kinds:?}");
+    assert!(d.bursts().iter().all(|b| b.target == 2));
+    // The performer glows from the arrival to the impact and plays the cast clips (it does not run up).
+    assert_eq!(d.charges().len(), 1);
+    assert_eq!((d.charges()[0].caster, d.charges()[0].start), (0, 10.0));
+    assert!((d.charges()[0].end - 10.6).abs() < 1e-9);
+    assert!(d.segments_of(0).iter().any(|s| s.slot == party::CAST[0]), "{:?}", d.segments_of(0));
+    assert_eq!(d.pending(), 0, "no lunge: nothing runs at the target");
+    // The same show for what the performer does without clips: the burst and the glow, no panic.
+    let mut plain = procedural();
+    plain.on_batch(10.0, &batch, STRIKE_LIMIT);
+    assert_eq!((plain.bursts().len(), plain.charges().len()), (2, 1));
+    // The numbers and the blow agree whatever the show: the same instant the overlay's number is born.
+    use crate::battle::popups::Popups;
+    let mut popups = Popups::default();
+    popups.on_events(10.0, &batch);
+    let born: Vec<f64> = popups.births().iter().map(|(_, at)| *at).collect();
+    assert_eq!(born.len(), 1);
+    assert!((born[0] - (10.0 + MAX_IMPACT_DELAY)).abs() < 1e-9);
+}
+
+#[test]
+fn a_healing_limit_glows_green_over_the_ally_it_heals() {
+    let mut d = with_clips();
+    let batch = [action(1, ActionRef::Limit(142)), BattleEvent::LimitGauge { actor: ActorId(1), value: 0 }, BattleEvent::Heal { actor: ActorId(1), target: ActorId(0), amount: 100 }];
+    d.on_batch(5.0, &batch, HEAL_LIMIT);
+    assert_eq!(d.bursts().len(), 1);
+    let burst = d.bursts()[0];
+    assert_eq!((burst.target, burst.kind, burst.element), (0, BurstKind::Spell, Element::Cure));
+    assert!((burst.at - (5.0 + MAX_IMPACT_DELAY)).abs() < 1e-9);
+    assert_eq!((d.charges().len(), d.charges()[0].element), (1, Element::Cure));
+}
+
+#[test]
+fn a_failed_escape_throws_the_performer_back_and_it_comes_back_and_nobody_runs() {
+    let mut d = with_clips();
+    d.on_batch(10.0, &[action(0, ActionRef::Escape), BattleEvent::EscapeFailed { actor: ActorId(0) }], PLAIN);
+    assert_eq!(d.pending(), 1, "one stumble");
+    assert!(d.bursts().is_empty() && d.charges().is_empty(), "nothing lands and nothing is gathered");
+    // Away from the enemies (they stand at z = -1500, the party at +2000): +z, to its farthest in a third of
+    // the time, and home again when it is over.
+    let at = |t: f64| d.motion(0, t).offset;
+    assert!(at(10.0)[2].abs() < 1e-3);
+    assert!(at(10.0 + 0.17)[2] > 200.0 && at(10.0 + 0.17)[2] <= 281.0, "{:?}", at(10.17));
+    assert!(at(10.0 + 0.5)[2] >= 0.0 && at(10.0 + 0.5)[2] < at(10.17)[2]);
+    assert!(at(10.0 + 0.6).iter().all(|c| c.abs() < 1e-3), "back where it stood");
+    // The other member stays, and nobody turns or leaves.
+    for t in [10.1, 11.0, 30.0] {
+        for i in 0..4 {
+            let m = d.motion(i, t);
+            assert!(!m.gone && m.turn == 0.0, "{i} at {t}: {m:?}");
+        }
+    }
+    // The stumble is bounded by the schedule like every effect: a flood does not grow it.
+    for k in 0..400 {
+        d.on_batch(20.0 + f64::from(k), &[action(0, ActionRef::Escape), BattleEvent::EscapeFailed { actor: ActorId(0) }], PLAIN);
+    }
+    assert!(d.pending() <= 128);
+}
+
+#[test]
+fn a_successful_escape_makes_the_living_party_turn_run_off_and_leave_with_no_victory_pose() {
+    let mut d = with_clips();
+    // Member 1 is down: it lies where it fell and does not run.
+    d.on_batch(5.0, &[action(2, ActionRef::Attack), damage(2, 1, false), BattleEvent::Death { actor: ActorId(1) }], PLAIN);
+    // The announcement alone: no failure after it, so the party is away.
+    d.on_batch(10.0, &[action(0, ActionRef::Escape)], PLAIN);
+    // Before it starts nothing moved; then the runner's back is turned, the run clip loops, and it covers
+    // the ground away from the fight (+z) faster and faster.
+    assert_eq!(d.motion(0, 9.9), Motion::default());
+    let (early, later) = (d.motion(0, 10.2), d.motion(0, 11.0));
+    assert!(early.turn == std::f32::consts::PI && early.offset[2] > 0.0 && later.offset[2] > early.offset[2], "{early:?} {later:?}");
+    assert_eq!(later.clip.map(|c| c.slot), Some(party::RUN), "the run clip, not the victory pose");
+    let (f1, f2) = (d.motion(0, 10.2).clip.expect("a clip").frame, d.motion(0, 10.2 + 0.1).clip.expect("a clip").frame);
+    assert!(f1 != f2, "the run loops: the frame advances");
+    // Off the screen after RUN_OFF seconds (and gone: not drawn, shadow included).
+    assert!(!d.motion(0, 10.0 + 1.5).gone && d.motion(0, 10.0 + 1.7).gone && d.motion(0, 99.0).gone);
+    // The fallen member does not move, and the enemies stay where they are.
+    for t in [10.5, 12.0, 99.0] {
+        let down = d.motion(1, t);
+        assert!(!down.gone && down.turn == 0.0 && down.offset[2].abs() < 1e-3, "{down:?}");
+        for foe in [2, 3] {
+            let m = d.motion(foe, t);
+            assert!(!m.gone && m.turn == 0.0 && m.offset.iter().all(|c| c.abs() < 1e-3), "{foe} at {t}: {m:?}");
+        }
+    }
+    // The announcement is all that was needed: a second one changes nothing (the first start counts).
+    let before = d.motion(0, 11.0);
+    d.on_batch(10.5, &[action(0, ActionRef::Escape)], PLAIN);
+    assert_eq!(d.motion(0, 11.0), before);
+    // Without clips the party still turns and leaves (the procedural model slides off).
+    let mut plain = procedural();
+    plain.on_batch(1.0, &[action(0, ActionRef::Escape)], PLAIN);
+    assert!(plain.motion(1, 1.8).turn == std::f32::consts::PI && plain.motion(1, 1.8).clip.is_none() && plain.motion(1, 5.0).gone);
+}
+
+#[test]
+fn nothing_a_server_sends_about_limits_or_escapes_breaks_the_director() {
+    let mut d = with_clips();
+    // Unknown performers, a gauge for nobody, an escape by an actor that is not there, absurd times.
+    d.on_batch(0.0, &[action(99, ActionRef::Limit(128)), BattleEvent::LimitGauge { actor: ActorId(99), value: u16::MAX }, damage(99, 98, true)], STRIKE_LIMIT);
+    d.on_batch(0.0, &[action(77, ActionRef::Escape), BattleEvent::EscapeFailed { actor: ActorId(77) }], PLAIN);
+    d.on_batch(f64::NAN, &[action(0, ActionRef::Escape)], PLAIN);
+    d.on_batch(f64::INFINITY, &[action(0, ActionRef::Limit(1))], STRIKE_LIMIT);
+    for t in [-5.0, 0.0, 1.0, 1e9] {
+        for i in 0..5 {
+            let m = d.motion(i, t);
+            assert!(m.offset.iter().all(|c| c.is_finite() || t.is_nan()) && m.turn.is_finite(), "{i} at {t}: {m:?}");
+        }
+    }
+    // An escape with nobody in the scene is a no-op, with no enemies the party runs along the field's depth.
+    let mut empty = Director::new(vec![], vec![]);
+    empty.on_escape(1.0);
+    let mut party_only = Director::new(vec![Side::Party], vec![Anchor { ground: [0.0, 2000.0], radius: 100.0 }]);
+    party_only.on_escape(1.0);
+    assert!(party_only.motion(0, 1.5).offset[2] > 0.0);
 }

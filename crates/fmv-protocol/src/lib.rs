@@ -1,4 +1,12 @@
-//! FF Multiverse wire protocol v6.
+//! FF Multiverse wire protocol v7.
+//!
+//! v7 is v6 plus limit breaks and escape: [`battle::Command`] gains `Limit { target }` and `Escape`,
+//! [`battle::ActionRef`] gains `Limit(id)` and `Escape`, [`battle::Outcome`] gains `Escaped`, battle
+//! events gain `LimitGauge` and `EscapeFailed`, [`BattleMember`] carries the character's limit gauge
+//! at the start of the battle (`limit`) and [`BattleRejection`] gains `NoLimit`, `LimitNotReady` and
+//! `CannotEscape`. A v6 peer cannot decode any of them (and a v6 `EncounterStart` has no `limit`), so
+//! the version was bumped: a v6 client or server is refused at the handshake instead of being cut off
+//! at the first limit or escape (see [`battle`], "Limit breaks and escape").
 //!
 //! v6 is v5 (character progress: [`ServerMsg::CharacterProgress`], see "Character progress") plus real
 //! battle commands and an inventory: [`battle::Command`] gains `Magic`, `Item` and `Defend`, battle
@@ -52,7 +60,12 @@
 //! C -> S  BattleCommand { battle_id, actor, command }                     gauge full
 //! S -> C  BattleEvent { battle_id, tick, events, command }                every member
 //! S -> C  BattleEvent { .., events: [.., Victory] }, then BattleEnd { battle_id, outcome, rewards }
+//! S -> C  BattleEvent { .., events: [Action { Escape }], command: Escape }, then BattleEnd { outcome: Escaped }
 //! ```
+//!
+//! A character whose limit gauge is full gives `Limit { target }` instead of Attack; any character
+//! may give `Escape`, which ends the battle for the whole party when it succeeds (nothing is paid) and
+//! otherwise only costs the turn (`EscapeFailed`); see [`battle`], "Limit breaks and escape".
 //!
 //! # Area travel (v4)
 //!
@@ -202,7 +215,7 @@ pub use fmv_party::{
     PartyEvent, PartyId, Placement,
 };
 
-pub const PROTOCOL_VERSION: u16 = 6;
+pub const PROTOCOL_VERSION: u16 = 7;
 /// Hard cap on a single frame payload (bytes).
 pub const MAX_FRAME: u32 = 256 * 1024;
 /// Default TCP port for development. Deployment port is UNASSIGNED (see DEPLOYMENT-CONTRACT.md).
@@ -461,10 +474,10 @@ pub enum ServerMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         command: Option<AppliedCommand>,
     },
-    /// The battle is over (the message before it carried `Victory` or `Defeat`). `rewards` has one
-    /// entry per member of the party when the outcome is `Victory` (see [`split_rewards`]; the items in
-    /// it are the drops, see [`assign_drops`]) and is empty on `Defeat`. The receiving player is back in
-    /// the field.
+    /// The battle is over (the message before it carried `Victory` or `Defeat`, or the `Escape` command
+    /// that got the party away, v7: `Escaped`). `rewards` has one entry per member of the party when the
+    /// outcome is `Victory` (see [`split_rewards`]; the items in it are the drops, see [`assign_drops`])
+    /// and is empty on `Defeat` and `Escaped`. The receiving player is back in the field.
     BattleEnd { battle_id: BattleId, outcome: battle::Outcome, rewards: Vec<BattleReward> },
     /// A battle request or command of this client was refused. `battle_id` is the battle it was
     /// about, if any.
@@ -599,8 +612,8 @@ mod tests {
     }
 
     #[test]
-    fn the_version_is_six() {
-        assert_eq!(PROTOCOL_VERSION, 6);
+    fn the_version_is_seven() {
+        assert_eq!(PROTOCOL_VERSION, 7);
     }
 
     // -----------------------------------------------------------------------------------------
@@ -1012,8 +1025,8 @@ mod tests {
 
     fn members() -> Vec<BattleMember> {
         vec![
-            BattleMember { entity: EntityId(10), account: AccountId(20), character: 0, level: 6, weapon: None, armor: None },
-            BattleMember { entity: EntityId(11), account: AccountId(21), character: 1, level: 7, weapon: Some(3), armor: Some(4) },
+            BattleMember { entity: EntityId(10), account: AccountId(20), character: 0, level: 6, weapon: None, armor: None, limit: 0 },
+            BattleMember { entity: EntityId(11), account: AccountId(21), character: 1, level: 7, weapon: Some(3), armor: Some(4), limit: 137 },
         ]
     }
 
@@ -1048,6 +1061,15 @@ mod tests {
             ClientMsg::BattleCommand { battle_id: BattleId(1), actor: ActorId(0), command: battle::Command::Defend },
             r#"{"BattleCommand":{"battle_id":1,"actor":0,"command":"Defend"}}"#,
         );
+        // v7: the limit break and the escape.
+        golden(
+            ClientMsg::BattleCommand { battle_id: BattleId(1), actor: ActorId(0), command: battle::Command::Limit { target: ActorId(3) } },
+            r#"{"BattleCommand":{"battle_id":1,"actor":0,"command":{"Limit":{"target":3}}}}"#,
+        );
+        golden(
+            ClientMsg::BattleCommand { battle_id: BattleId(1), actor: ActorId(2), command: battle::Command::Escape },
+            r#"{"BattleCommand":{"battle_id":1,"actor":2,"command":"Escape"}}"#,
+        );
         golden(ClientMsg::RequestEncounter { formation_id: None }, r#"{"RequestEncounter":{"formation_id":null}}"#);
         golden(ClientMsg::RequestEncounter { formation_id: Some(517) }, r#"{"RequestEncounter":{"formation_id":517}}"#);
     }
@@ -1068,8 +1090,8 @@ mod tests {
             },
             concat!(
                 r#"{"EncounterStart":{"battle_id":1,"formation_id":517,"seed":12345,"party":["#,
-                r#"{"entity":10,"account":20,"character":0,"level":6,"weapon":null,"armor":null},"#,
-                r#"{"entity":11,"account":21,"character":1,"level":7,"weapon":3,"armor":4}],"#,
+                r#"{"entity":10,"account":20,"character":0,"level":6,"weapon":null,"armor":null,"limit":0},"#,
+                r#"{"entity":11,"account":21,"character":1,"level":7,"weapon":3,"armor":4,"limit":137}],"#,
                 r#""preemptive":false,"back_attack":true,"battle_speed":128,"ticks_per_second":60,"data_fingerprint":""#,
                 "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
                 r#""}}"#
@@ -1124,6 +1146,37 @@ mod tests {
         golden(
             ServerMsg::BattleEnd { battle_id: BattleId(2), outcome: battle::Outcome::Defeat, rewards: vec![] },
             r#"{"BattleEnd":{"battle_id":2,"outcome":"Defeat","rewards":[]}}"#,
+        );
+        // v7: a limit (the gauge is spent before the blow), an escape that got away and the end it leads to.
+        golden(
+            ServerMsg::BattleEvent {
+                battle_id: BattleId(1),
+                tick: 200,
+                events: vec![
+                    battle::BattleEvent::Action { actor: ActorId(0), action: battle::ActionRef::Limit(128) },
+                    battle::BattleEvent::LimitGauge { actor: ActorId(0), value: 0 },
+                    battle::BattleEvent::Damage { actor: ActorId(0), target: ActorId(3), amount: 321, critical: false },
+                ],
+                command: Some(AppliedCommand { actor: ActorId(0), command: battle::Command::Limit { target: ActorId(3) } }),
+            },
+            concat!(
+                r#"{"BattleEvent":{"battle_id":1,"tick":200,"events":[{"Action":{"actor":0,"action":{"Limit":128}}},"#,
+                r#"{"LimitGauge":{"actor":0,"value":0}},{"Damage":{"actor":0,"target":3,"amount":321,"critical":false}}],"#,
+                r#""command":{"actor":0,"command":{"Limit":{"target":3}}}}}"#
+            ),
+        );
+        golden(
+            ServerMsg::BattleEvent {
+                battle_id: BattleId(1),
+                tick: 210,
+                events: vec![battle::BattleEvent::Action { actor: ActorId(1), action: battle::ActionRef::Escape }],
+                command: Some(AppliedCommand { actor: ActorId(1), command: battle::Command::Escape }),
+            },
+            r#"{"BattleEvent":{"battle_id":1,"tick":210,"events":[{"Action":{"actor":1,"action":"Escape"}}],"command":{"actor":1,"command":"Escape"}}}"#,
+        );
+        golden(
+            ServerMsg::BattleEnd { battle_id: BattleId(3), outcome: battle::Outcome::Escaped, rewards: vec![] },
+            r#"{"BattleEnd":{"battle_id":3,"outcome":"Escaped","rewards":[]}}"#,
         );
         golden(
             ServerMsg::BattleRejected { battle_id: Some(BattleId(1)), reason: BattleRejection::GaugeNotFull },
@@ -1231,6 +1284,18 @@ mod tests {
                 r#"{"MpRestored":{"actor":0,"target":3,"amount":100}}"#,
             ),
             (battle::BattleEvent::Revive { actor: a, target: t, hp: 100 }, r#"{"Revive":{"actor":0,"target":3,"hp":100}}"#),
+            // v7: the limit gauge, the limit break and the escape.
+            (battle::BattleEvent::LimitGauge { actor: a, value: 137 }, r#"{"LimitGauge":{"actor":0,"value":137}}"#),
+            (battle::BattleEvent::LimitGauge { actor: t, value: 255 }, r#"{"LimitGauge":{"actor":3,"value":255}}"#),
+            (battle::BattleEvent::EscapeFailed { actor: a }, r#"{"EscapeFailed":{"actor":0}}"#),
+            (
+                battle::BattleEvent::Action { actor: a, action: battle::ActionRef::Limit(128) },
+                r#"{"Action":{"actor":0,"action":{"Limit":128}}}"#,
+            ),
+            (
+                battle::BattleEvent::Action { actor: a, action: battle::ActionRef::Escape },
+                r#"{"Action":{"actor":0,"action":"Escape"}}"#,
+            ),
         ];
         for (event, expected) in events {
             golden(event, expected);
@@ -1239,8 +1304,11 @@ mod tests {
         golden(battle::Command::Magic { spell: 0, target: t }, r#"{"Magic":{"spell":0,"target":3}}"#);
         golden(battle::Command::Item { item: 3, target: a }, r#"{"Item":{"item":3,"target":0}}"#);
         golden(battle::Command::Defend, r#""Defend""#);
+        golden(battle::Command::Limit { target: t }, r#"{"Limit":{"target":3}}"#);
+        golden(battle::Command::Escape, r#""Escape""#);
         golden(battle::Outcome::Victory, r#""Victory""#);
         golden(battle::Outcome::Defeat, r#""Defeat""#);
+        golden(battle::Outcome::Escaped, r#""Escaped""#);
         golden(ActorId(7), "7");
         golden(BattleId(9), "9");
     }
@@ -1266,6 +1334,10 @@ mod tests {
             (BattleRejection::NotEnoughMp, r#""NotEnoughMp""#),
             (BattleRejection::UnknownItem, r#""UnknownItem""#),
             (BattleRejection::OutOfItems, r#""OutOfItems""#),
+            // v7
+            (BattleRejection::NoLimit, r#""NoLimit""#),
+            (BattleRejection::LimitNotReady, r#""LimitNotReady""#),
+            (BattleRejection::CannotEscape, r#""CannotEscape""#),
         ];
         for (reason, expected) in cases {
             golden(reason, expected);
@@ -1360,6 +1432,79 @@ mod tests {
         assert_ne!(probe_hello_version(hello_v5), Some(PROTOCOL_VERSION));
     }
 
+    /// The reason for the v7 bump: a v6 peer cannot decode a limit, an escape, the new events, the new
+    /// outcome or the new refusals, and a v6 `BattleMember` has no limit gauge to start from. (The older
+    /// peer's enums are simulated by enums that lack the variants.) The handshake refuses it first.
+    #[test]
+    fn a_v6_peer_cannot_decode_the_v7_messages_so_the_version_had_to_change() {
+        #[derive(Debug, Deserialize)]
+        enum CommandV6 {
+            #[allow(dead_code)]
+            Attack { target: ActorId },
+            #[allow(dead_code)]
+            Defend,
+        }
+        #[derive(Debug, Deserialize)]
+        enum ActionV6 {
+            #[allow(dead_code)]
+            Attack,
+            #[allow(dead_code)]
+            EnemyAttack(u16),
+        }
+        #[derive(Debug, Deserialize)]
+        enum EventV6 {
+            #[allow(dead_code)]
+            GaugeReady { actor: ActorId },
+            #[allow(dead_code)]
+            Action { actor: ActorId, action: ActionV6 },
+        }
+        #[derive(Debug, Deserialize)]
+        enum OutcomeV6 {
+            #[allow(dead_code)]
+            Victory,
+            #[allow(dead_code)]
+            Defeat,
+        }
+        #[derive(Debug, Deserialize)]
+        enum RejectionV6 {
+            #[allow(dead_code)]
+            OutOfItems,
+        }
+        #[derive(Debug, Deserialize)]
+        struct MemberV6 {
+            #[allow(dead_code)]
+            level: u8,
+            #[allow(dead_code)]
+            armor: Option<u8>,
+        }
+        for command in [battle::Command::Limit { target: ActorId(1) }, battle::Command::Escape] {
+            assert!(decode::<CommandV6>(&encode(&command).unwrap()[4..]).is_err(), "{command:?}");
+        }
+        assert!(decode::<CommandV6>(br#"{"Attack":{"target":1}}"#).is_ok(), "the stand-in decodes what it knows");
+        for event in [
+            battle::BattleEvent::LimitGauge { actor: ActorId(0), value: 5 },
+            battle::BattleEvent::EscapeFailed { actor: ActorId(0) },
+            battle::BattleEvent::Action { actor: ActorId(0), action: battle::ActionRef::Limit(128) },
+            battle::BattleEvent::Action { actor: ActorId(0), action: battle::ActionRef::Escape },
+        ] {
+            assert!(decode::<EventV6>(&encode(&event).unwrap()[4..]).is_err(), "{event:?}");
+        }
+        assert!(decode::<EventV6>(br#"{"Action":{"actor":0,"action":{"EnemyAttack":9}}}"#).is_ok());
+        assert!(decode::<OutcomeV6>(&encode(&battle::Outcome::Escaped).unwrap()[4..]).is_err());
+        assert!(decode::<OutcomeV6>(br#""Defeat""#).is_ok());
+        for reason in [BattleRejection::NoLimit, BattleRejection::LimitNotReady, BattleRejection::CannotEscape] {
+            assert!(decode::<RejectionV6>(&encode(&reason).unwrap()[4..]).is_err(), "{reason:?}");
+        }
+        // A v6 member is a v7 member without its gauge: a v6 server's `EncounterStart` cannot be a v7
+        // client's (the field is required), while a v7 member still reads as a v6 one.
+        let v6_member = br#"{"entity":10,"account":20,"character":0,"level":6,"weapon":null,"armor":null}"#;
+        assert!(decode::<BattleMember>(v6_member).is_err(), "a start from a v6 server has no limit gauge");
+        assert!(decode::<MemberV6>(&encode(&members()[1]).unwrap()[4..]).is_ok());
+        let hello_v6 = br#"{"Hello":{"protocol_version":6,"client_build":"c","auth":{"Token":"x"},"tint":[0,0,0],"appearance_ref":null}}"#;
+        assert_eq!(probe_hello_version(hello_v6), Some(6));
+        assert_ne!(probe_hello_version(hello_v6), Some(PROTOCOL_VERSION));
+    }
+
     /// No battle message can carry anything but ids, seeds, numbers and the engine's events: the
     /// fields of the largest one are all fixed-size numbers, flags, ids and a fingerprint.
     #[test]
@@ -1376,6 +1521,7 @@ mod tests {
                     level: u8::MAX,
                     weapon: Some(u8::MAX),
                     armor: Some(u8::MAX),
+                    limit: u16::MAX,
                 })
                 .collect(),
             preemptive: false,

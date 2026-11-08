@@ -3,8 +3,10 @@
 //! While a battle runs it acts whenever our own gauge is full (one command at a time: the mirror's
 //! `pending` guard keeps it from repeating a command before the server answered). Its rule is
 //! `BattleClient::bot_command`: when its character's HP is under 30% of the maximum and it knows a
-//! restoring spell it can pay for, it casts the cheapest one on itself; otherwise it attacks the first
-//! living enemy. With `--debug-encounters` it also asks the server for a debug encounter,
+//! restoring spell it can pay for, it casts the cheapest one on itself; otherwise, when its limit gauge is
+//! full (protocol v7), it gives its limit break (a damaging one on the first living enemy, a healing one
+//! on a wounded ally); otherwise it attacks the first living enemy. It never escapes. With
+//! `--debug-encounters` it also asks the server for a debug encounter,
 //! ONCE: when the session has been up for a moment and, with `--battle-wait-party N`, only when
 //! our party has N members and we lead it (so one request starts one battle for everyone). A
 //! refusal (a server without battle data, or without `--debug-encounters`) is logged by the

@@ -333,6 +333,21 @@ pub fn growth_section() -> Vec<u8> {
         s[r + 9] = 0xFF;
         // Invented signed level modifiers: 0, -1, -2, -3, 1, 2, 3, 4, 5.
         s[r + 10] = [0u8, 0xFF, 0xFE, 0xFD, 1, 2, 3, 4, 5][i];
+        // Invented limit data (the real layout, see `CharacterLimits`): the first limit of character `i` is
+        // id 0x80 + i, its second 0x90 + i, level 2 has 0xA0 + i and level 4 0xB0 + i (level 3 has none).
+        // Kills 10 + i and 30 + i, uses 5 + i, 6 + i and 7 + i, divisors 100 + 10 i, 200 + 10 i,
+        // 300 + 10 i and 400 + 10 i.
+        let id = |base: u8| base + i as u8;
+        s[r + 0x0C..r + 0x18].copy_from_slice(&[id(0x80), id(0x90), 0xFF, id(0xA0), 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, id(0xB0), 0xFF, 0xFF]);
+        s[r + 0x18..r + 0x1A].copy_from_slice(&(10 + i as u16).to_le_bytes());
+        s[r + 0x1A..r + 0x1C].copy_from_slice(&(30 + i as u16).to_le_bytes());
+        for (k, at) in [0x1C, 0x20, 0x24].into_iter().enumerate() {
+            s[r + at..r + at + 2].copy_from_slice(&(5 + k as u16 + i as u16).to_le_bytes());
+        }
+        for k in 0..4u32 {
+            let at = r + 0x28 + 4 * k as usize;
+            s[at..at + 4].copy_from_slice(&(100 + 100 * k + 10 * i as u32).to_le_bytes());
+        }
     }
     // Invented gain tables (strictly increasing so tests can tell entries apart).
     s[OFF_STAT_GAIN..OFF_STAT_GAIN + 12].copy_from_slice(&[1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6]);

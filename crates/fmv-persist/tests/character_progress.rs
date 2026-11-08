@@ -47,6 +47,7 @@ fn derived(account: AccountId, game: GameId, exp: u32) -> CharacterProgress {
         gil: exp * 3,
         updated_at: NOW + u64::from(exp),
         inventory: None,
+        limit: (exp % 256) as u16,
     }
 }
 
@@ -933,6 +934,100 @@ fn a_record_from_before_the_inventory_loads_without_one_and_is_written_back_unch
         fs::read_to_string(&path).unwrap(),
         RECORD_BEFORE_THE_INVENTORY
     );
+    assert_eq!(has_temp_files(&root), Vec::<String>::new());
+}
+
+/// What a v6 build wrote for an account that had items (the case of the owner's real account on the
+/// preview server): the `inventory` key, and no `limit` key, which did not exist yet.
+const RECORD_OF_THE_V6_BUILD: &str = concat!(
+    "{\n",
+    "  \"schema_version\": 1,\n",
+    "  \"account_id\": 1,\n",
+    "  \"game\": \"Ff7\",\n",
+    "  \"character\": 0,\n",
+    "  \"level\": 7,\n",
+    "  \"exp\": 626,\n",
+    "  \"ap\": 2,\n",
+    "  \"gil\": 10,\n",
+    "  \"updated_at\": 3,\n",
+    "  \"inventory\": [\n",
+    "    {\n",
+    "      \"item\": 0,\n",
+    "      \"count\": 3\n",
+    "    }\n",
+    "  ]\n",
+    "}\n",
+);
+
+/// The limit gauge was added to records that already exist: a record of the v6 build (with its items and
+/// without the key) loads with an empty gauge, and written back without one it is, byte for byte, what it
+/// was. A gauge is stored beside the items and the numbers, changing it touches nothing else, and a
+/// record that is emptied again loses the key.
+#[test]
+fn a_record_from_the_v6_build_loads_with_an_empty_gauge_and_a_gauge_is_stored_beside_the_rest() {
+    let (_guard, root) = fresh_root();
+    let store = open(&root);
+    let (a, _) = store.create_account("Alpha", NOW).unwrap();
+    let expected = CharacterProgress {
+        exp: 626,
+        ap: 2,
+        gil: 10,
+        inventory: Some(stacks([(0, 3)])),
+        ..CharacterProgress::new(a, GameId::Ff7, 0, 7, 3)
+    };
+    let path = put_raw(&root, a, "Ff7", RECORD_OF_THE_V6_BUILD.as_bytes());
+    let loaded = store.get_character_progress(a, GameId::Ff7).unwrap().unwrap();
+    assert_eq!(loaded, expected);
+    assert_eq!(loaded.limit, 0, "an empty gauge, which is also what a new character has");
+
+    // Written back as it was read, the record is byte for byte the v6 one: no `limit` key appears.
+    store.put_character_progress(&loaded).unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), RECORD_OF_THE_V6_BUILD);
+
+    // An update that stores a gauge changes the gauge and nothing else.
+    let updated = store
+        .update_character_progress(a, GameId::Ff7, |cur| CharacterProgress { limit: 200, ..cur.expect("the record is there") })
+        .unwrap();
+    assert_eq!(updated, CharacterProgress { limit: 200, ..expected.clone() });
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains("\"limit\": 200") && text.contains("\"inventory\""), "{text}");
+    assert_eq!(store.get_character_progress(a, GameId::Ff7).unwrap(), Some(updated.clone()));
+
+    // The same record read by a build that does not know the key (its struct ignores it) is the v6 record
+    // without the gauge: that build drops the gauge the next time it writes, and nothing else.
+    #[derive(serde::Deserialize, serde::Serialize)]
+    struct V6Record {
+        schema_version: u32,
+        account_id: AccountId,
+        game: GameId,
+        character: u8,
+        level: u8,
+        exp: u32,
+        ap: u32,
+        gil: u32,
+        updated_at: u64,
+        inventory: Option<Vec<InventoryEntry>>,
+    }
+    let v6: V6Record = serde_json::from_str(&text).expect("a v6 build reads a v7 record");
+    assert_eq!((v6.level, v6.exp, v6.inventory.clone()), (7, 626, Some(stacks([(0, 3)]))));
+    let rewritten = serde_json::to_string(&v6).unwrap();
+    assert!(!rewritten.contains("limit"), "{rewritten}");
+    let after_rollback: CharacterProgress = serde_json::from_str(&rewritten).unwrap();
+    assert_eq!(after_rollback, expected, "back to an empty gauge, nothing else lost");
+
+    // Emptying the gauge again writes the v6 bytes again.
+    store
+        .update_character_progress(a, GameId::Ff7, |cur| CharacterProgress { limit: 0, ..cur.expect("the record is there") })
+        .unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), RECORD_OF_THE_V6_BUILD);
+
+    // A gauge that is no u16 is a damaged file, never clamped and never replaced by a default.
+    for bad in [json!(70_000), json!(-1), json!("full")] {
+        let bytes = doc(|v| v["limit"] = bad.clone());
+        put_raw(&root, a, "Ff7", &bytes);
+        let err = store.get_character_progress(a, GameId::Ff7).unwrap_err();
+        assert!(matches!(err, PersistError::Corrupt { .. }), "{bad}: {err:?}");
+    }
     assert_eq!(has_temp_files(&root), Vec::<String>::new());
 }
 

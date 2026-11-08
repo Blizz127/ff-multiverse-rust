@@ -13,11 +13,11 @@
 //! up (no game data is read).
 
 use super::hud::BattleHud;
-use super::menu::{MenuItem, MenuKey, MenuSpell, TargetRule};
+use super::menu::{MenuItem, MenuKey, MenuLimit, MenuSpell, TargetRule};
 use super::panels::{layout, Banner, Layout, RewardItem, RewardLine, DISABLED, PANEL_DELAY_MS};
 use super::popups::{Popup, PopupKind};
 use super::text::draw_battle_text;
-use super::view::{battle_vertices, flat_anchors, Bar, BattleView, Status};
+use super::view::{battle_vertices, flat_anchors, Bar, BattleView, Status, LIMIT_FULL_RGB, LIMIT_RGB};
 use crate::render::{Gpu, Vertex, CLEAR_RGB};
 use crate::ui::draw::DrawList;
 use crate::ui::testkit::save;
@@ -112,7 +112,7 @@ impl Shooter {
 
 #[allow(clippy::too_many_arguments)] // a test fixture: one line per fighter reads best
 fn bar(actor: u8, name: &str, hp: u32, max_hp: u32, mp: u32, max_mp: u32, gauge: u32, ready: bool, mine: bool) -> Bar {
-    Bar { actor: ActorId(actor), name: name.into(), hp, max_hp, mp, max_mp, gauge, ready: ready && hp > 0, alive: hp > 0, mine }
+    Bar { actor: ActorId(actor), name: name.into(), hp, max_hp, mp, max_mp, gauge, ready: ready && hp > 0, alive: hp > 0, mine, limit: 0 }
 }
 
 /// Three heroes (Barret is ours and ready, Tifa is hurt) against three enemies.
@@ -407,7 +407,11 @@ fn offscreen_battle_victory_and_defeat_panels() {
         // Just before the panel's moment: the last view and the status line, no panel yet.
         let early = hud.linger_view(NOW + f64::from(PANEL_DELAY_MS) / 1000.0 - 0.2).expect("lingering");
         let img_early = gpu.shoot("09-victory-before-the-panel", &early, w, h);
-        let panel_area = (l.cw / 2 - 108, l.banner_y + 20, l.cw / 2 + 108, l.enemy.y - 4);
+        // The strip of the stage under the banner, across the window: the panel hangs from the top of it, over the
+        // left (where the beaten enemies were) when the party stands on the right, as it does on this stage.
+        let panel_area = (0, l.banner_y + 20, l.cw, l.enemy.y - 4);
+        let party_side = (l.cw / 2 + 20, l.banner_y + 20, l.cw, l.enemy.y - 4);
+        let in_px = |a: (i32, i32, i32, i32)| (a.0 * l.s, a.1 * l.s, a.2 * l.s, a.3 * l.s);
         let gold = [ACCENT[0], ACCENT[1], ACCENT[2], 255];
         let before = count_near(&img_early, w, h, (panel_area.0 * l.s, panel_area.1 * l.s, panel_area.2 * l.s, panel_area.3 * l.s), gold, 6);
         // The panel itself, with a key allowed to close it.
@@ -416,6 +420,11 @@ fn offscreen_battle_victory_and_defeat_panels() {
         let img = gpu.shoot("10-victory-panel", &view, w, h);
         let after = count_near(&img, w, h, (panel_area.0 * l.s, panel_area.1 * l.s, panel_area.2 * l.s, panel_area.3 * l.s), gold, 6);
         assert!(after > before + 40 * (l.s * l.s) as usize, "{w}x{h}: the gold VICTORY title appears with the panel ({before} -> {after})");
+        assert_eq!(
+            count_near(&img, w, h, in_px(party_side), gold, 6),
+            count_near(&img_early, w, h, in_px(party_side), gold, 6),
+            "{w}x{h}: the panel adds nothing over the side the party stands on"
+        );
         let border = count_near(&img, w, h, (panel_area.0 * l.s, panel_area.1 * l.s, panel_area.2 * l.s, panel_area.3 * l.s), [BORDER[0], BORDER[1], BORDER[2], 255], 0);
         assert!(border > 30, "{w}x{h}: in a bordered window");
         let white = count_near(&img, w, h, (panel_area.0 * l.s, panel_area.1 * l.s, panel_area.2 * l.s, panel_area.3 * l.s), [TEXT[0], TEXT[1], TEXT[2], 255], 6);
@@ -452,5 +461,73 @@ fn offscreen_battle_waiting_for_the_gauge_and_the_status_band() {
         // A machine with no battle data: the grey band, the warning, and no windows.
         let img = gpu.shoot("14-no-battle-data", &BattleView::unverified(BattleId(1)), w, h);
         assert_eq!(px(&img, w, 5, 5), [120, 120, 130], "{w}x{h}: the grey band");
+    }
+}
+
+/// Protocol v7: Barret's limit gauge is full, so the first command says Limit where it said Attack, and the party
+/// panel draws a thin limit bar under each ATB bar: orange while it fills (Cloud's and Tifa's), lit when it is full
+/// (Barret's). Defend and Escape are given, so nothing in the command window is greyed out.
+#[test]
+#[ignore = "needs a GPU or software Vulkan/GL driver"]
+fn offscreen_battle_limit_ready_menu_and_the_limit_bars() {
+    let Some(mut gpu) = Shooter::new() else { return };
+    let orange = [LIMIT_RGB[0], LIMIT_RGB[1], LIMIT_RGB[2], 255];
+    let lit = [LIMIT_FULL_RGB[0], LIMIT_FULL_RGB[1], LIMIT_FULL_RGB[2], 255];
+    for (w, h) in SIZES {
+        let l = layout(w, h, 3);
+        let unit = (l.s * l.s) as usize;
+        let mut view = battle();
+        view.party[0].limit = 100;
+        view.party[1].limit = 255;
+        view.party[2].limit = 200;
+        let mut hud = hud();
+        let model = hud.model_mut();
+        model.defend = true;
+        model.escape = true;
+        model.limit = Some(MenuLimit::new(135, "Big Shot", TargetRule::Enemies, true));
+        let dressed = pressed(&mut hud, &view, &[]);
+        let commands: Vec<&str> = dressed.menu.as_ref().expect("a menu").commands.iter().map(|c| c.label).collect();
+        assert_eq!(commands, ["Limit", "Magic", "Item", "Defend", "Escape"], "{w}x{h}");
+        let img = gpu.shoot("15-limit-ready", &dressed, w, h);
+        assert_windows(&img, w, h, &l, &[l.enemy, l.command, l.party]);
+        assert!(text_pixels(&img, w, h, &l, l.party, lit) > 40 * unit, "{w}x{h}: Barret's full limit bar is lit");
+        assert!(text_pixels(&img, w, h, &l, l.party, orange) > 40 * unit, "{w}x{h}: the others are filling in orange");
+        assert!(text_pixels(&img, w, h, &l, l.command, DISABLED) < 5 * unit, "{w}x{h}: nothing in the command window is greyed out");
+        // The same battle with empty gauges draws no limit bar at all (a character without a limit shows nothing).
+        let mut empty = battle();
+        empty.party.iter_mut().for_each(|b| b.limit = 0);
+        let mut hud = self::hud();
+        let img = gpu.shoot("15b-no-limit-bars", &pressed(&mut hud, &empty, &[]), w, h);
+        assert_eq!(text_pixels(&img, w, h, &l, l.party, orange) + text_pixels(&img, w, h, &l, l.party, lit), 0, "{w}x{h}: no bar without a gauge");
+        // The limit is chosen like an attack: Confirm on the first row aims at an enemy.
+        let mut hud = self::hud();
+        {
+            let model = hud.model_mut();
+            model.defend = true;
+            model.escape = true;
+            model.limit = Some(MenuLimit::new(135, "Big Shot", TargetRule::Enemies, true));
+        }
+        let aiming = pressed(&mut hud, &view, &[MenuKey::Confirm, MenuKey::Down]);
+        assert!(aiming.menu.as_ref().is_some_and(|m| m.aim.is_some()), "{w}x{h}: the limit aims at an enemy");
+        gpu.shoot("16-limit-target", &aiming, w, h);
+    }
+}
+
+/// Protocol v7: the end-of-battle panel after an escape says so, in the info colour, and pays nothing.
+#[test]
+#[ignore = "needs a GPU or software Vulkan/GL driver"]
+fn offscreen_battle_escaped_panel() {
+    let Some(mut gpu) = Shooter::new() else { return };
+    for (w, h) in SIZES {
+        let l = layout(w, h, 3);
+        let mut hud = hud();
+        let last = battle();
+        hud.finish(NOW, last, Outcome::Escaped, None);
+        let view = hud.linger_view(NOW + 2.0).expect("lingering");
+        let img = gpu.shoot("17-escaped-panel", &view, w, h);
+        let strip = (0, (l.banner_y + 20) * l.s, l.cw * l.s, (l.enemy.y - 4) * l.s);
+        let blue = [INFO[0], INFO[1], INFO[2], 255];
+        assert!(count_near(&img, w, h, strip, blue, 6) > 40 * (l.s * l.s) as usize, "{w}x{h}: the ESCAPED title is in the info colour");
+        assert_windows(&img, w, h, &l, &[l.party]);
     }
 }

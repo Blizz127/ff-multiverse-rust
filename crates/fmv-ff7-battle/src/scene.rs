@@ -202,6 +202,13 @@ impl BattleLayout {
             Self::Unknown(c) => c,
         }
     }
+
+    /// Whether every Run Check of the party succeeds in this arrival: it struck first (preemptive) or
+    /// surrounds the enemy (the three side attacks). The pincers, where the enemy surrounds the party, are
+    /// not (`crate::rules`, "Escape").
+    pub fn makes_running_sure(self) -> bool {
+        matches!(self, Self::Preemptive | Self::SideAttack | Self::SideAttack2 | Self::SideAttack3)
+    }
 }
 
 /// Battle setup record (20 bytes, one per formation slot).
@@ -222,6 +229,25 @@ pub struct BattleSetup {
 }
 
 impl BattleSetup {
+    /// The bit of [`BattleSetup::flags`] that says the party may run ("Escapable Flag (along with other
+    /// flags)" on <https://ff7-mods.github.io/ff7-flat-wiki/FF7/Battle/Battle_Scenes.html>, which names the
+    /// word and decodes none of its bits). Checked on every formation of the owner's Steam `scene.bin`
+    /// (`tests/real_data.rs`): the bit is set on every formation whose escape counter is 1 to 4 and clear on
+    /// every one whose counter is 9 or 10, the bosses and story fights.
+    pub const ESCAPABLE_FLAG: u16 = 0x0004;
+    /// From this escape counter on the fight cannot be escaped (the owner's file uses 9 and 10 for them).
+    pub const NO_ESCAPE_COUNTER: u16 = 9;
+
+    /// The Run Difficulty of the fight: how many Run Checks must succeed before the party is away (the
+    /// escape counter, at least 1), or `None` when the fight cannot be escaped (the escapable flag is clear,
+    /// or the counter is [`BattleSetup::NO_ESCAPE_COUNTER`] or more). See `crate::rules`, "Escape".
+    pub fn run_difficulty(&self) -> Option<u8> {
+        if self.flags & Self::ESCAPABLE_FLAG == 0 || self.escape_counter >= Self::NO_ESCAPE_COUNTER {
+            return None;
+        }
+        u8::try_from(self.escape_counter.max(1)).ok()
+    }
+
     fn parse(b: &[u8]) -> Self {
         let next = u16_at(b, 0x02);
         Self {
@@ -808,6 +834,43 @@ fn block_ranges(block: &[u8]) -> Result<Vec<std::ops::Range<usize>>, (usize, Sce
 mod tests {
     use super::*;
     use crate::testutil::{demo_scene, gzip, pack_scene_bin};
+
+    fn setup_of(escape_counter: u16, flags: u16) -> BattleSetup {
+        BattleSetup {
+            location: 0,
+            next_formation: None,
+            escape_counter,
+            next_arena_candidates: [0; 4],
+            flags,
+            layout: BattleLayout::Normal,
+            pre_battle_camera: 0,
+        }
+    }
+
+    #[test]
+    fn the_run_difficulty_is_the_escape_counter_unless_the_fight_cannot_be_escaped() {
+        // The flags the owner's file has (the high byte is always 0xFF): escapable ones carry bit 4.
+        for flags in [0xFFED, 0xFFEF, 0xFFF7, 0xFFFD, 0xFFFF] {
+            assert_eq!(setup_of(1, flags).run_difficulty(), Some(1), "{flags:04x}");
+            assert_eq!(setup_of(3, flags).run_difficulty(), Some(3));
+        }
+        for flags in [0xFFE3, 0xFFE9, 0xFFEB, 0xFFF1, 0xFFF3, 0xFFF9, 0xFFFB] {
+            assert_eq!(setup_of(1, flags).run_difficulty(), None, "{flags:04x}: the flag says no");
+            assert_eq!(setup_of(9, flags).run_difficulty(), None);
+        }
+        // Either signal alone forbids it: a counter of 9 or more, or a clear flag.
+        assert_eq!(setup_of(9, 0xFFFF).run_difficulty(), None);
+        assert_eq!(setup_of(10, 0xFFFF).run_difficulty(), None);
+        assert_eq!(setup_of(8, 0xFFFF).run_difficulty(), Some(8));
+        // A counter of 0 would be an escape that is already done: it counts as 1.
+        assert_eq!(setup_of(0, 0xFFFF).run_difficulty(), Some(1));
+    }
+
+    #[test]
+    fn running_is_sure_after_a_preemptive_strike_and_on_a_side_attack_only() {
+        let sure: Vec<u8> = (0..=9).filter(|c| BattleLayout::from_code(*c).makes_running_sure()).collect();
+        assert_eq!(sure, [1, 3, 6, 7]);
+    }
 
     fn demo_bin() -> Vec<u8> {
         let a = demo_scene(0);

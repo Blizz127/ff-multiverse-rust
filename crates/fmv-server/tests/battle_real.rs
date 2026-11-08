@@ -55,6 +55,7 @@ fn simulate(data: &Ff7BattleData, formation: u16, characters: &[u8], level: Opti
             level: level.unwrap_or_else(|| data.starting_level(character)),
             weapon: None,
             armor: None,
+            limit: 0,
         })
         .collect();
     let info = data.formation(formation).expect("a real formation");
@@ -121,6 +122,7 @@ fn stats(data: &Ff7BattleData, formation: u16, characters: &[u8], level: Option<
                 out.fewest_attacks = out.fewest_attacks.min(s.acted.iter().copied().min().unwrap_or(0));
             }
             Some(Outcome::Defeat) => out.lost += 1,
+            Some(Outcome::Escaped) => panic!("formation {formation} seed {seed}: nobody gave Escape"),
             None => panic!("formation {formation} seed {seed}: the battle never ended"),
         }
         out.longest_ticks = out.longest_ticks.max(s.ticks);
@@ -206,6 +208,7 @@ fn the_default_debug_formation_exists_and_every_formation_builds_for_every_chara
                     level: data.starting_level(character),
                     weapon: None,
                     armor: None,
+                    limit: 0,
                 }],
                 preemptive: info.preemptive,
                 back_attack: info.back_attack,

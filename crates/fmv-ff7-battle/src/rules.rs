@@ -23,15 +23,18 @@
 //!   inventory**: whether the account owns the item is the server's business (it checks the count,
 //!   submits, and takes the item only when the engine accepts), so a client replaying the battle never
 //!   needs to know a count;
-//! * [`Command::Defend`]: physical damage taken is halved until the actor's gauge is full again.
+//! * [`Command::Defend`]: physical damage taken is halved until the actor's gauge is full again;
+//! * [`Command::Limit`]: the character's limit break (see "Limit breaks" below), once its limit gauge
+//!   is full;
+//! * [`Command::Escape`]: the actor spends its turn running (see "Escape" below).
 //!
 //! An enemy whose gauge fills picks one random living party member and one of its own `scene.bin`
 //! attacks ([`Combatant::actions`]: the damaging ones the rules model), or a plain attack when it has
 //! none. Every action, party or enemy, is announced by a [`BattleEvent::Action`] before its effects
 //! ([`BattleEvent::MpSpent`], [`BattleEvent::Damage`], [`BattleEvent::Heal`], ...). Not modelled:
-//! statuses (Berserk, Sadness, Fury, Poison, ...), limit breaks, summons, escape, back-attack damage
+//! statuses (Berserk, Sadness, Fury, Poison, ...), summons, back-attack damage
 //! bonus, covering, enemy rows, AI scripts, spells and items that hit a whole side, AP/EXP growth, party
-//! elemental resistances.
+//! elemental resistances, limit levels above 1 (see [`crate::limit`]).
 //!
 //! # Formula sources and provenance
 //!
@@ -86,6 +89,13 @@
 //! * Draws never depend on the target's elemental affinity (a nullified or absorbed hit draws what a
 //!   normal hit draws), on defense, on rows or on statuses.
 //! * [`Command::Defend`] and every validation failure draw nothing.
+//! * [`Command::Limit`] draws what the limit's action draws: a damaging limit never misses and cannot
+//!   be a critical hit, so only its `variance = range_inclusive(0, 255)` (the standard formula has
+//!   one, the spell formula too; Healing Wind has none and draws nothing).
+//! * [`Command::Escape`] makes [`RUN_CHECKS_PER_TURN`] Run Checks in a row, stopping once the party is
+//!   away. A Run Check of a battle whose escape is [`EscapeRule::sure`] draws nothing; any other draws
+//!   `below(`[`RUN_CHECK_ODDS`]`)` and succeeds on 0. A battle with no escape rule and every refusal draw
+//!   nothing. The gauge the limit fills is arithmetic on the damage and draws nothing.
 //!
 //! # Defend, elements, MP
 //!
@@ -100,6 +110,44 @@
 //! * **MP.** A spell costs the MP of its record, announced by [`BattleEvent::MpSpent`] right after the
 //!   action. An enemy pays for its attacks the same way (and cannot use one it lacks the MP for).
 //!   Heals are reported as the amount actually restored (never more than was missing).
+//!
+//! # Limit breaks
+//!
+//! Every character that has a limit ([`Combatant::limit_break`]; [`crate::limit`] says where its id,
+//! divisor and effect come from) has a **limit gauge** `0..=`[`LIMIT_MAX`] ([`Combatant::limit`]). A hit
+//! of an enemy on a living party member adds [`crate::limit::limit_gain`] of the damage dealt and is
+//! announced by a [`BattleEvent::LimitGauge`] right after the [`BattleEvent::Damage`] (and after the
+//! [`BattleEvent::Death`], when the hit killed: a knocked-out character loses its whole gauge, which
+//! is announced with value 0). A character whose gauge is full and whose ATB gauge is full may give
+//! [`Command::Limit`]: the engine announces [`BattleEvent::Action`] with [`ActionRef::Limit`], then
+//! [`BattleEvent::LimitGauge`] with 0 (the gauge empties as the limit begins, before its effects, so
+//! that a battle that the limit ends still ends on its [`BattleEvent::Victory`]), then the effects of
+//! one action on one target. The **starting gauge is an input** like the level: the server keeps each
+//! account's gauge and sends it with the party, and the gauge at the end of a battle is what the server
+//! saves ([`BattleState::limit_gauge`]).
+//!
+//! # Escape
+//!
+//! FF7's escape does **not** depend on levels. Each formation has a *Run Difficulty* (`scene.bin`'s
+//! escape counter: 1 for most fights, 2 or 3 for a back attack and some bosses; the scene's flags say
+//! when the party may not run at all, which is the case of every counter of 9 or more in the owner's
+//! file), and holding L1+R1 makes a *Run Check* every quarter of a turn or so (Terence Fergusson's
+//! *Battle Mechanics* FAQ, as summarised by the Final Fantasy Wiki's "Escape (Final Fantasy VII)" and
+//! GameFAQs answers; the FAQ's text itself could not be fetched here): a check lowers the difficulty by
+//! one when the party had a preemptive attack or surrounds the enemy (a side attack), and otherwise
+//! with a chance of 25%; the party gets away when the difficulty reaches 0.
+//!
+//! Here [`Command::Escape`] is the actor spending its turn running: it makes [`RUN_CHECKS_PER_TURN`] (4)
+//! Run Checks, the difficulty that is left is kept for the rest of the battle (the party that tried
+//! once is halfway out the next time), and when it reaches 0 the battle ends with [`Outcome::Escaped`]
+//! (nothing is paid: no experience, gil, AP or drops). A failed attempt is announced by
+//! [`BattleEvent::EscapeFailed`] and ends the turn like any command. [`EscapeRule`] is a battle's
+//! definition like its items ([`BattleState::with_escape`]): the peers build it from their own
+//! `scene.bin`. Without one a battle can be run from with difficulty 1 (a preemptive start makes it
+//! sure). APPROXIMATION: the four checks per command stand in for the real timing (a turn is about
+//! four quarter-turns at the default speed), so one attempt at difficulty 1 succeeds 68% of the time
+//! (`1 - 0.75^4`), at difficulty 2 about 26%; holding the buttons is a menu entry here (the window can
+//! only press keys).
 //!
 //! # APPROXIMATION summary
 //!
@@ -149,6 +197,7 @@ pub use crate::action::{
     Formula, ItemData, ItemInfo, ItemKind, ItemTable, Spell, SpellInfo,
 };
 use crate::kernel::{CharacterId, Kernel};
+pub use crate::limit::{limit_gain, LimitBreak, LimitInfo, LIMIT_MAX};
 use crate::rng::Rng;
 use crate::scene::{AffinityRate, AttackRecord, BattleLayout, EnemyRecord, Scene};
 
@@ -170,6 +219,10 @@ pub const ATTACK_COMMAND_POWER: u32 = 16;
 pub const MAX_DAMAGE: u32 = 9_999;
 /// APPROXIMATION: upper bound of the random initial gauge of a normal start.
 pub const INITIAL_GAUGE_MAX: u32 = 0x7FFF;
+/// Run Checks one [`Command::Escape`] makes (see the module docs, "Escape").
+pub const RUN_CHECKS_PER_TURN: u32 = 4;
+/// A Run Check of a battle that is not [`EscapeRule::sure`] succeeds with a chance of 1 in this many.
+pub const RUN_CHECK_ODDS: u32 = 4;
 /// The materia every character's grimoire is built from on top of its own starting equipment (their ids
 /// in the kernel's materia table): Restore (Cure), Fire, Ice and Lightning (Bolt), at level 1.
 pub const STARTER_MATERIA: [u8; 4] = [53, 49, 50, 52];
@@ -251,6 +304,12 @@ pub struct Combatant {
     pub ready: bool,
     /// Defending: physical damage is halved. Runtime state owned by [`BattleState`].
     pub defending: bool,
+    /// The limit gauge, `0..=`[`LIMIT_MAX`] (party members only: the starting value is an input, the
+    /// battle changes it, see the module docs). Always 0 without a [`Combatant::limit_break`].
+    pub limit: u16,
+    /// The limit break this combatant can give once its limit gauge is full (`None`: it has none, and
+    /// no gauge).
+    pub limit_break: Option<LimitBreak>,
 }
 
 impl Combatant {
@@ -285,6 +344,8 @@ impl Combatant {
             gauge: 0,
             ready: false,
             defending: false,
+            limit: 0,
+            limit_break: None,
         }
     }
 
@@ -404,6 +465,7 @@ impl Combatant {
             Row::Front
         };
         c.spells = party_spells(kernel, who);
+        c.limit_break = LimitBreak::for_character(kernel, who);
         Some(c)
     }
 }
@@ -498,6 +560,14 @@ pub enum Command {
     Item { item: u16, target: ActorId },
     /// Guard: physical damage taken is halved until the actor's gauge is full again.
     Defend,
+    /// The actor's limit break (protocol v7), on `target`: a living enemy for a damaging limit, a living
+    /// ally for a healing one ([`BattleState::limit_for`] says which). Only when the actor's limit gauge
+    /// is full; it empties the gauge.
+    Limit { target: ActorId },
+    /// Try to run (protocol v7): the actor spends its turn on [`RUN_CHECKS_PER_TURN`] Run Checks. When the
+    /// party gets away the battle ends with [`Outcome::Escaped`] for everyone, and when not the turn is
+    /// over. Refused when the formation cannot be escaped.
+    Escape,
 }
 
 /// What an [`BattleEvent::Action`] announces.
@@ -512,6 +582,11 @@ pub enum ActionRef {
     Defend,
     /// An enemy's own attack, by its `scene.bin` attack id (the name is in the scene's attack table).
     EnemyAttack(u16),
+    /// A limit break (protocol v7), by its id in the kernel's character record (also its index in
+    /// "Names - magic": Braver 128, ...).
+    Limit(u16),
+    /// The actor tries to run (protocol v7).
+    Escape,
 }
 
 /// How the battle ended.
@@ -519,6 +594,8 @@ pub enum ActionRef {
 pub enum Outcome {
     Victory,
     Defeat,
+    /// The party got away (protocol v7): nothing is paid.
+    Escaped,
 }
 
 /// Something that happened in the battle, in order.
@@ -565,6 +642,13 @@ pub enum BattleEvent {
         target: ActorId,
         hp: u32,
     },
+    /// `actor`'s limit gauge is now `value` (`0..=`[`LIMIT_MAX`]): after a hit that raised it, when a
+    /// knockout emptied it and when a limit break used it up.
+    LimitGauge { actor: ActorId, value: u16 },
+    /// `actor` tried to run and the party did not get away (the turn is over). A successful escape has no
+    /// event of its own: the [`BattleEvent::Action`] with [`ActionRef::Escape`] is followed by the end of
+    /// the battle with [`Outcome::Escaped`].
+    EscapeFailed { actor: ActorId },
 }
 
 /// Why a command was refused.
@@ -594,6 +678,12 @@ pub enum CommandError {
     NotEnoughMp(ActorId),
     #[error("item {0} cannot be used in battle")]
     UnknownItem(u16),
+    #[error("actor {0:?} has no limit break")]
+    NoLimit(ActorId),
+    #[error("actor {0:?} has no full limit gauge")]
+    LimitNotReady(ActorId),
+    #[error("this battle cannot be escaped")]
+    CannotEscape,
 }
 
 /// How an action's damage is dealt, for [`action_damage`].
@@ -852,6 +942,18 @@ pub fn v_timer_increase(battle_speed: u8) -> u32 {
     2 * (32_768 / (120 + u32::from(battle_speed) * 15 / 8))
 }
 
+/// How hard a battle is to run from (see the module docs, "Escape"): part of the battle's definition,
+/// built by the peers from their own `scene.bin` ([`BattleState::with_escape`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EscapeRule {
+    /// The Run Difficulty: how many successful Run Checks the party needs in all (at least 1; the scene's
+    /// escape counter, 1 for most fights).
+    pub difficulty: u8,
+    /// Every Run Check succeeds (the party had a preemptive attack or surrounds the enemy) instead of one
+    /// in [`RUN_CHECK_ODDS`].
+    pub sure: bool,
+}
+
 /// A validated command, ready to resolve (indexes are positions in the actor list).
 enum Plan {
     Attack {
@@ -867,6 +969,11 @@ enum Plan {
         target: usize,
     },
     Defend,
+    Limit {
+        limit: LimitBreak,
+        target: usize,
+    },
+    Escape(EscapeRule),
 }
 
 /// A running battle.
@@ -886,6 +993,10 @@ pub struct BattleState {
     pending: Vec<BattleEvent>,
     /// The items a party member can use ([`Command::Item`]); empty unless [`BattleState::with_items`].
     items: Arc<ItemTable>,
+    /// How hard the battle is to run from (`None`: it cannot be escaped), see [`BattleState::with_escape`].
+    escape: Option<EscapeRule>,
+    /// The Run Difficulty still to bring down before the party is away (starts at the rule's).
+    escape_left: u8,
 }
 
 impl BattleState {
@@ -935,6 +1046,8 @@ impl BattleState {
             c.hp = c.hp.min(c.max_hp);
             c.mp = c.mp.min(c.max_mp);
             c.defending = false;
+            // A limit gauge is a living party member's, and one that has a limit.
+            c.limit = if c.side == Side::Party && c.limit_break.is_some() && c.is_alive() { c.limit.min(LIMIT_MAX) } else { 0 };
             c.gauge = match (config.start, c.side) {
                 (StartMode::Normal, _) => rng.range_inclusive(0, INITIAL_GAUGE_MAX),
                 (StartMode::Preemptive, Side::Party) | (StartMode::BackAttack, Side::Enemy) => {
@@ -957,7 +1070,10 @@ impl BattleState {
             outcome: None,
             pending: Vec::new(),
             items: Arc::new(ItemTable::default()),
-        };
+            escape: None,
+            escape_left: 0,
+        }
+        .with_escape(Some(EscapeRule { difficulty: 1, sure: config.start == StartMode::Preemptive }));
         for i in 0..state.actors.len() {
             let c = &mut state.actors[i];
             if c.is_alive() && c.gauge >= GAUGE_MAX {
@@ -979,6 +1095,15 @@ impl BattleState {
     /// from the same kernel, see [`ItemTable::from_kernel`]).
     pub fn with_items(mut self, items: Arc<ItemTable>) -> Self {
         self.items = items;
+        self
+    }
+
+    /// The same battle with `rule` as how hard it is to run from (`None`: it cannot be escaped, the
+    /// boss fights). Part of the battle's definition like the combatants: server and clients must give
+    /// it the same rule (they build it from the same `scene.bin`). A difficulty of 0 counts as 1.
+    pub fn with_escape(mut self, rule: Option<EscapeRule>) -> Self {
+        self.escape = rule.map(|r| EscapeRule { difficulty: r.difficulty.max(1), ..r });
+        self.escape_left = self.escape.map_or(0, |r| r.difficulty);
         self
     }
 
@@ -1041,6 +1166,37 @@ impl BattleState {
     /// Whether `id` is defending (halving physical damage until its next turn).
     pub fn is_defending(&self, id: ActorId) -> bool {
         self.actor(id).is_some_and(|c| c.defending)
+    }
+
+    /// `id`'s limit gauge, `0..=`[`LIMIT_MAX`] (0 for an enemy, a character with no limit, a dead one or
+    /// an unknown actor).
+    pub fn limit_gauge(&self, id: ActorId) -> u16 {
+        self.actor(id).map_or(0, |c| c.limit)
+    }
+
+    /// Whether `id` is alive, has a limit break and a full limit gauge (it may give [`Command::Limit`]
+    /// when its ATB gauge is full too).
+    pub fn limit_ready(&self, id: ActorId) -> bool {
+        self.actor(id).is_some_and(|c| c.is_alive() && c.limit_break.is_some() && c.limit >= LIMIT_MAX)
+    }
+
+    /// What `id`'s limit break is, for a menu: its id and whom it aims at (`None`: `id` has none, or is not
+    /// a party member).
+    pub fn limit_for(&self, id: ActorId) -> Option<LimitInfo> {
+        if usize::from(id.0) >= self.party_len {
+            return None;
+        }
+        self.actor(id)?.limit_break.map(|l| l.info())
+    }
+
+    /// Whether the battle can be run from at all (see [`Command::Escape`]).
+    pub fn can_escape(&self) -> bool {
+        self.escape.is_some()
+    }
+
+    /// The Run Difficulty the party still has to bring down (`None` when the battle cannot be escaped).
+    pub fn escape_left(&self) -> Option<u8> {
+        self.escape.map(|_| self.escape_left)
     }
 
     /// Whole ticks simulated so far.
@@ -1166,9 +1322,47 @@ impl BattleState {
                     c.defending = true;
                 }
             }
+            Plan::Limit { limit, target } => {
+                events.push(BattleEvent::Action {
+                    actor,
+                    action: ActionRef::Limit(limit.attack),
+                });
+                // The gauge empties as the limit begins: before its effects, so that a battle the limit
+                // ends still ends on its Victory event.
+                if let Some(c) = self.actors.get_mut(idx) {
+                    c.limit = 0;
+                }
+                events.push(BattleEvent::LimitGauge { actor, value: 0 });
+                self.resolve_action(idx, target, &limit.spec, &mut events);
+            }
+            Plan::Escape(rule) => {
+                events.push(BattleEvent::Action {
+                    actor,
+                    action: ActionRef::Escape,
+                });
+                self.run_checks(rule);
+                if self.escape_left == 0 {
+                    self.outcome = Some(Outcome::Escaped);
+                } else {
+                    events.push(BattleEvent::EscapeFailed { actor });
+                }
+            }
         }
         self.finish_turn(idx);
         Ok(events)
+    }
+
+    /// The Run Checks of one escape attempt (see the module docs): up to [`RUN_CHECKS_PER_TURN`], each
+    /// lowering the difficulty that is left by one when it succeeds, and none once it is 0.
+    fn run_checks(&mut self, rule: EscapeRule) {
+        for _ in 0..RUN_CHECKS_PER_TURN {
+            if self.escape_left == 0 {
+                break;
+            }
+            if rule.sure || self.rng.below(RUN_CHECK_ODDS) == 0 {
+                self.escape_left -= 1;
+            }
+        }
     }
 
     // --- internals ---
@@ -1230,6 +1424,15 @@ impl BattleState {
                 Plan::Item { item, data, target }
             }
             Command::Defend => Plan::Defend,
+            Command::Limit { target } => {
+                let limit = me.limit_break.ok_or(CommandError::NoLimit(actor))?;
+                if me.limit < LIMIT_MAX {
+                    return Err(CommandError::LimitNotReady(actor));
+                }
+                let target = self.check_target(target, limit.spec.heals(), limit.spec.hits_dead)?;
+                Plan::Limit { limit, target }
+            }
+            Command::Escape => Plan::Escape(self.escape.ok_or(CommandError::CannotEscape)?),
         };
         Ok((idx, plan))
     }
@@ -1455,6 +1658,9 @@ impl BattleState {
         match outcome {
             Offense::Damage { amount, critical } => {
                 let mut died = false;
+                // Only an enemy hurting a party member fills a limit gauge (see `crate::limit`).
+                let hurts_party = attacker >= self.party_len && target < self.party_len;
+                let mut gauge: Option<u16> = None;
                 if let Some(t) = self.actors.get_mut(target) {
                     t.hp = t.hp.saturating_sub(amount);
                     if t.hp == 0 {
@@ -1462,6 +1668,19 @@ impl BattleState {
                         t.gauge = 0;
                         t.ready = false;
                         t.defending = false;
+                        // A knocked-out character loses its whole limit gauge.
+                        if t.limit != 0 {
+                            t.limit = 0;
+                            gauge = Some(0);
+                        }
+                    } else if hurts_party && amount > 0 {
+                        if let Some(limit) = t.limit_break {
+                            let value = t.limit.saturating_add(limit_gain(amount, t.max_hp, limit.divisor)).min(LIMIT_MAX);
+                            if value != t.limit {
+                                t.limit = value;
+                                gauge = Some(value);
+                            }
+                        }
                     }
                 }
                 events.push(BattleEvent::Damage {
@@ -1472,6 +1691,9 @@ impl BattleState {
                 });
                 if died {
                     events.push(BattleEvent::Death { actor: target_id });
+                }
+                if let Some(value) = gauge {
+                    events.push(BattleEvent::LimitGauge { actor: target_id, value });
                 }
                 self.check_outcome(events);
             }
@@ -1652,6 +1874,8 @@ mod tests {
                     ActionRef::Item(i) => format!("item {i}"),
                     ActionRef::Defend => "defend".to_string(),
                     ActionRef::EnemyAttack(a) => format!("enemy-attack {a}"),
+                    ActionRef::Limit(l) => format!("limit {l}"),
+                    ActionRef::Escape => "escape".to_string(),
                 };
                 format!("act {} {what}", actor.0)
             }
@@ -1669,6 +1893,8 @@ mod tests {
             BattleEvent::Revive { actor, target, hp } => {
                 format!("revive {}->{} {hp}", actor.0, target.0)
             }
+            BattleEvent::LimitGauge { actor, value } => format!("limit-gauge {} {value}", actor.0),
+            BattleEvent::EscapeFailed { actor } => format!("escape-failed {}", actor.0),
         }
     }
 

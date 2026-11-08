@@ -36,13 +36,11 @@ pub fn status_line(view: &BattleView) -> (&'static str, Rgba) {
     match (view.status, &view.finale) {
         (Status::Diverged, _) => ("BATTLE DIVERGED FROM THE SERVER", ERROR),
         // The end of a battle is announced whether or not this machine could replay it.
-        (_, Some(finale)) => {
-            if finale.outcome == Outcome::Victory {
-                ("Victory!", ACCENT)
-            } else {
-                ("Defeat", ERROR)
-            }
-        }
+        (_, Some(finale)) => match finale.outcome {
+            Outcome::Victory => ("Victory!", ACCENT),
+            Outcome::Defeat => ("Defeat", ERROR),
+            Outcome::Escaped => ("Got away safely!", INFO),
+        },
         (Status::Unverified, None) => ("No battle data on this computer: waiting for the battle to end", WARN),
         (Status::Verified, None) => match view.party.iter().find(|b| b.mine) {
             None => ("Watching the battle", DIM),
@@ -91,7 +89,14 @@ pub fn draw_battle_overlay(view: &BattleView, anchors: &Anchors, vw: u32, vh: u3
             draw_banner(&mut c, &l, banner);
         }
         if let Some(finale) = &view.finale {
-            draw_finale(&mut c, &l, finale);
+            // After a win the party stands in its victory poses: the panel keeps off their heads. (After a
+            // defeat or an escape nobody stands there to be kept in view.)
+            let heads: Vec<(f32, f32)> = if finale.outcome == Outcome::Victory {
+                view.party.iter().zip(&anchors.party).filter(|(b, _)| b.alive).filter_map(|(_, head)| *head).filter(|(x, y)| x.is_finite() && y.is_finite()).collect()
+            } else {
+                Vec::new()
+            };
+            draw_finale(&mut c, &l, finale, &heads);
         }
     }
     draw_pointer(out, &l, view, anchors, vw);
@@ -125,7 +130,7 @@ mod tests {
     }
 
     fn open_menu(v: &mut BattleView, keys: &[MenuKey]) {
-        let model = BattleMenuModel { spells: vec![MenuSpell::new(1, "Fire", 4, TargetRule::Enemies), MenuSpell::new(2, "Meteor", 99, TargetRule::Enemies)], items: vec![], defend: false };
+        let model = BattleMenuModel { spells: vec![MenuSpell::new(1, "Fire", 4, TargetRule::Enemies), MenuSpell::new(2, "Meteor", 99, TargetRule::Enemies)], items: vec![], defend: false, ..BattleMenuModel::default() };
         let alive = |bars: &[Bar]| bars.iter().map(|b| Fighter { id: b.actor, alive: b.alive }).collect::<Vec<_>>();
         let (a, e) = (alive(&v.party), alive(&v.enemies));
         let ctx = Ctx { model: &model, allies: &a, enemies: &e, mp: 10 };
@@ -187,8 +192,11 @@ mod tests {
         assert_eq!(status_line(&v), ("Not enough MP", WARN));
         open_menu(&mut v, &[MenuKey::Confirm]);
         assert!(status_line(&v).0.contains("pick a target"));
-        // A greyed-out command says why while the cursor is on it.
+        // A greyed-out command says why while the cursor is on it (Up from the top is Escape, which this
+        // model bars, and one more is Defend).
         open_menu(&mut v, &[MenuKey::Up]);
+        assert_eq!(status_line(&v).0, "Cannot escape from this battle");
+        open_menu(&mut v, &[MenuKey::Up, MenuKey::Up]);
         assert_eq!(status_line(&v).0, "Not available yet");
         // Waiting for the server beats the menu (it is closed then anyway).
         v.menu = None;

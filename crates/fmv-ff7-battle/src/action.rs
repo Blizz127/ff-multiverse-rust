@@ -254,6 +254,38 @@ impl ActionSpec {
         }
     }
 
+    /// A limit break that strikes one enemy: the standard physical formula at `power` (16 is a plain
+    /// attack), which never misses, cannot be a critical hit, costs no MP and ignores the rows (see
+    /// [`crate::limit`]).
+    pub fn limit_strike(power: u32) -> Self {
+        Self {
+            kind: ActionKind::Physical,
+            formula: Formula::Standard,
+            power,
+            accuracy: 255,
+            rolls_accuracy: false,
+            can_crit: false,
+            element_mask: 0,
+            hits_mp: false,
+            hits_dead: false,
+            ignores_defense: false,
+            short_range: false,
+            mp_cost: 0,
+            unaimable: false,
+        }
+    }
+
+    /// A limit break that casts at one enemy: the spell formula at `power` and with `element_mask`,
+    /// otherwise like [`ActionSpec::limit_strike`] (Vincent's Galian Beast).
+    pub fn limit_blast(power: u32, element_mask: u16) -> Self {
+        Self { kind: ActionKind::Magical, formula: Formula::Spell, element_mask, ..Self::limit_strike(power) }
+    }
+
+    /// A limit break that heals one ally for `power / 32` of its max HP (16 is half; Healing Wind).
+    pub fn limit_heal(power: u32) -> Self {
+        Self { kind: ActionKind::Magical, formula: Formula::MaxHp, element_mask: element::RESTORATIVE, ..Self::limit_strike(power) }
+    }
+
     /// Decode an attack record (a spell of the kernel's attack table or an enemy's attack of
     /// `scene.bin`), or `None` if the rules do not model it (see the module docs).
     pub fn from_attack(rec: &AttackRecord) -> Option<Self> {
