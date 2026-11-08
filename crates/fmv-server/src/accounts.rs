@@ -678,7 +678,7 @@ mod tests {
         store.put_character_progress(&record).unwrap();
         let again = with_token(&store, &token).unwrap();
         assert_eq!(again.progress.character, 1);
-        assert_eq!(again.progress.stored, Some(Progress { character: 1, level: 8, exp: 700, ap: 9, gil: 250 }));
+        assert_eq!(again.progress.stored, Some(Progress { character: 1, level: 8, exp: 700, ap: 9, gil: 250, limit: 0 }));
         // It is not the story: the phase is untouched by it.
         assert_eq!(again.phase, PhaseKey::default());
         // Another game's record is not this game's.

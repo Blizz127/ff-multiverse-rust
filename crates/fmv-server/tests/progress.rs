@@ -18,10 +18,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::*;
-use fmv_ff7_battle::rules::{Command, Outcome};
+use fmv_ff7_battle::rules::{BattleEvent, Command, Outcome};
 use fmv_protocol::{
-    ActorId, BattleMember, BattleReplay, BattleReward, BattleSetup, ClientMsg, PartyEvent, RejectCode, ServerMsg, SyntheticRules,
-    PROTOCOL_VERSION,
+    ActionRef, ActorId, BattleMember, BattleReplay, BattleReward, BattleSetup, ClientMsg, PartyEvent, RejectCode, ServerMsg,
+    SyntheticRules, PROTOCOL_VERSION,
 };
 use fmv_server::{BattleSettings, ServerConfig};
 use tempfile::TempDir;
@@ -239,6 +239,127 @@ async fn what_a_win_paid_survives_a_restart_and_is_what_the_player_is_told_on_lo
     again.shutdown().await;
 }
 
+/// What a player saw of a battle it left by running.
+#[derive(Debug)]
+struct Ran {
+    party: Vec<BattleMember>,
+    outcome: Outcome,
+    rewards: Vec<BattleReward>,
+    limits_used: usize,
+    failed_escapes: usize,
+    /// The limit gauge of our character in our replay when the battle ended.
+    end_gauge: u16,
+}
+
+/// Play a battle as a player who attacks until blows have filled the gauge, gives its limit, attacks until
+/// a blow has filled the gauge again and then runs until it gets away. Every refusal is a failure of the
+/// test: the replay says when each command is legal.
+async fn limit_then_run(j: &mut Joined, rules: &SyntheticRules) -> Ran {
+    let start = j.client.until("EncounterStart", |m| matches!(m, ServerMsg::EncounterStart { .. }).then(|| m.clone())).await;
+    let ServerMsg::EncounterStart { battle_id, formation_id, seed, party, preemptive, back_attack, battle_speed, ticks_per_second, .. } = start
+    else {
+        unreachable!()
+    };
+    let setup = BattleSetup { formation_id, seed, party: party.clone(), preemptive, back_attack, battle_speed, ticks_per_second };
+    let mut replay = BattleReplay::start(rules, &setup).expect("the client builds the battle from its own data");
+    let mine = ActorId(party.iter().position(|m| m.entity == j.entity).expect("we are in the party") as u8);
+    let (mut pending, mut limits_used, mut failed_escapes) = (false, 0, 0);
+    loop {
+        let state = replay.state();
+        if !pending && state.outcome().is_none() && state.ready_actors().contains(&mine) {
+            let target = state.enemy_ids().into_iter().find(|e| state.actor(*e).is_some_and(|c| c.is_alive())).expect("a living enemy");
+            let command = match (limits_used, state.limit_ready(mine), state.limit_gauge(mine)) {
+                (0, true, _) => Command::Limit { target },
+                (0, false, _) => Command::Attack { target },
+                (_, _, 0) => Command::Attack { target },
+                _ => Command::Escape,
+            };
+            j.client.send(&ClientMsg::BattleCommand { battle_id, actor: mine, command }).await;
+            pending = true;
+        }
+        match j.client.next().await {
+            ServerMsg::BattleEvent { tick, events, command, .. } => {
+                replay.apply(tick, &events, command.as_ref()).unwrap_or_else(|d| panic!("the replay diverged: {d}"));
+                limits_used += events.iter().filter(|e| matches!(e, BattleEvent::Action { actor, action: ActionRef::Limit(_) } if *actor == mine)).count();
+                failed_escapes += events.iter().filter(|e| matches!(e, BattleEvent::EscapeFailed { actor } if *actor == mine)).count();
+                if command.is_some_and(|c| c.actor == mine) {
+                    pending = false;
+                }
+            }
+            ServerMsg::BattleRejected { reason, .. } => panic!("the server refused a command the replay allows: {reason}"),
+            ServerMsg::BattleEnd { outcome, rewards, .. } => {
+                replay.check_end(outcome, &rewards).unwrap_or_else(|d| panic!("the end diverged: {d}"));
+                let end_gauge = replay.state().limit_gauge(mine);
+                return Ran { party, outcome, rewards, limits_used, failed_escapes, end_gauge };
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Protocol v7 over real sockets and a real store: a player whose blows filled its limit gauge gives the
+/// limit, gets blows again and runs away; the battle ends for it in `Escaped` with nothing paid, the gauge
+/// it ended with was saved (a record is made for the account, though it never won) and is the one its next
+/// battle starts with, also after the server restarted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_limit_and_an_escape_over_the_wire_and_the_gauge_it_ends_with_survives_a_restart() {
+    // Enemies that do not die in the time it takes (the limit alone would end a battle with 200 HP).
+    let rules = SyntheticRules { enemy_hp: 1_000_000, ..SyntheticRules::default() };
+    let config = |state: PathBuf| ServerConfig {
+        battle: Some(BattleSettings { battle_speed: 0, ticks_per_second: 1000, ..BattleSettings::new(Arc::new(rules)) }),
+        debug_encounters: true,
+        state_dir: Some(state),
+        ..ServerConfig::default()
+    };
+    let dir = TempDir::new().unwrap();
+    let state = dir.path().join("server-state");
+
+    let server = TestServer::start(config(state.clone())).await;
+    let mut a = join(server.addr, &uniq("Lm")).await;
+    let (token, account) = (a.token.clone(), a.account);
+    assert_eq!(next_progress(&mut a).await.exp, 40);
+    request(&mut a, 0).await;
+    let ran = limit_then_run(&mut a, &rules).await;
+    assert_eq!((ran.outcome, ran.rewards.len(), ran.limits_used), (Outcome::Escaped, 0, 1), "{ran:?}");
+    assert_eq!(ran.party[0].limit, 0, "a new account starts with an empty gauge");
+    assert!(ran.end_gauge > 0, "a blow filled it again after the limit emptied it: {ran:?}");
+    assert!(ran.failed_escapes < 40, "a party that keeps trying gets away: {ran:?}");
+
+    // Nothing was paid: the next thing the server says is not a progress message (no win, no level), and
+    // the player is back in the field and can start another battle at once.
+    request(&mut a, 0).await;
+    let again = limit_then_run_start_gauge(&mut a).await;
+    assert_eq!(again, ran.end_gauge, "the next battle starts with the gauge the last one ended with");
+    drop(a);
+    server.shutdown().await;
+
+    // The record was made by the gauge alone: a fresh character's numbers and the gauge.
+    let file = state.join("progression").join(account.0.to_string()).join("Fixture.character.json");
+    let text = std::fs::read_to_string(&file).unwrap_or_else(|e| panic!("{file:?}: {e}"));
+    assert!(text.contains(&format!("\"limit\": {}", ran.end_gauge)) && text.contains("\"exp\": 40") && !text.contains("inventory"), "{text}");
+
+    // After a restart the gauge is what the player starts its next battle with, and nothing else changed.
+    let restarted = TestServer::start(config(state)).await;
+    let mut a2 = join_with_token(restarted.addr, &token).await;
+    let welcome = next_progress(&mut a2).await;
+    assert_eq!((welcome.level, welcome.exp, welcome.gil), (5, 40, 0));
+    request(&mut a2, 0).await;
+    assert_eq!(limit_then_run_start_gauge(&mut a2).await, ran.end_gauge);
+    drop(a2);
+    restarted.shutdown().await;
+}
+
+/// The limit gauge our character starts the battle that was just announced with.
+async fn limit_then_run_start_gauge(j: &mut Joined) -> u16 {
+    let entity = j.entity;
+    j.client
+        .until("EncounterStart", |m| match m {
+            ServerMsg::EncounterStart { party, .. } => party.iter().find(|p| p.entity == entity).map(|p| p.limit),
+            _ => None,
+        })
+        .await
+}
+
 /// A party fights one battle and every member that fought on is paid into its OWN progress, told its
 /// own numbers, and saved under its own account.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -335,20 +456,21 @@ async fn a_member_who_left_mid_battle_is_still_paid_in_the_store() {
     again.shutdown().await;
 }
 
-/// The reason for v5 and again for v6: a client of the version before is refused at the handshake, with
-/// the version in the reason, instead of being sent a message it cannot decode (v5: the progress that
-/// follows every join; v6: the inventory that follows it, and the new battle events).
+/// The reason for v5, v6 and again for v7: a client of the version before is refused at the handshake,
+/// with the version in the reason, instead of being sent a message it cannot decode (v5: the progress
+/// that follows every join; v6: the inventory that follows it, and the new battle events; v7: the limit
+/// and escape commands, events and outcome, and the limit gauge of every battle member).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_client_of_the_previous_protocol_version_is_refused_at_the_handshake() {
-    assert_eq!(PROTOCOL_VERSION, 6);
+    assert_eq!(PROTOCOL_VERSION, 7);
     let server = TestServer::start(fast(None)).await;
-    for old_version in [5u16, 4] {
+    for old_version in [6u16, 5, 4] {
         let mut old = Client::connect(server.addr).await;
         old.send_json(&format!(
             r#"{{"Hello":{{"protocol_version":{old_version},"client_build":"old","auth":{{"Register":{{"display_name":"Old{old_version}"}}}},"tint":[1,2,3],"appearance_ref":null}}}}"#
         ))
         .await;
-        old.expect_reject_as(RejectCode::ProtocolMismatch, &format!("server speaks v6, client sent v{old_version}")).await;
+        old.expect_reject_as(RejectCode::ProtocolMismatch, &format!("server speaks v7, client sent v{old_version}")).await;
     }
     server.shutdown().await;
 }

@@ -88,11 +88,23 @@ pub struct Progress {
     pub exp: u32,
     pub ap: u32,
     pub gil: u32,
+    /// The character's limit gauge between battles (protocol v7; FF7: `0..=255`, 255 is full): what its
+    /// next battle starts with ([`fmv_protocol::BattleMember::limit`]). Set at the end of every battle
+    /// (see `saver::SavedChange::Limit`), and carried by the record like the numbers above, so that a
+    /// payment never resets it.
+    pub limit: u16,
 }
 
 impl Progress {
     pub fn from_record(record: &CharacterProgress) -> Self {
-        Self { character: record.character, level: record.level, exp: record.exp, ap: record.ap, gil: record.gil }
+        Self {
+            character: record.character,
+            level: record.level,
+            exp: record.exp,
+            ap: record.ap,
+            gil: record.gil,
+            limit: record.limit,
+        }
     }
 
     /// The record to store for `account` in `game`: the numbers, and NO inventory (`None`). A record
@@ -103,6 +115,7 @@ impl Progress {
             exp: self.exp,
             ap: self.ap,
             gil: self.gil,
+            limit: self.limit,
             ..CharacterProgress::new(account, game, self.character, self.level, now)
         }
     }
@@ -141,7 +154,7 @@ pub fn fresh(rules: &dyn BattleRules, character: u8) -> Progress {
     let limits = rules.progress_limits();
     let level = rules.starting_level(character).clamp(1, limits.max_level);
     let exp = rules.starting_exp(character, level).min(limits.max_exp);
-    Progress { character, level, exp, ap: 0, gil: 0 }
+    Progress { character, level, exp, ap: 0, gil: 0, limit: 0 }
 }
 
 /// Bring a progress inside the game's caps. What is stored is not trusted to fit them: a hand-edited
@@ -152,6 +165,7 @@ pub fn clamp(limits: ProgressLimits, progress: &mut Progress) {
     progress.exp = progress.exp.min(limits.max_exp);
     progress.gil = progress.gil.min(limits.max_gil);
     progress.ap = progress.ap.min(limits.max_ap);
+    progress.limit = progress.limit.min(limits.max_limit);
 }
 
 /// The mirror of a player that joins: its stored progress (or a fresh start) as the character its look
@@ -261,14 +275,14 @@ mod tests {
     #[test]
     fn a_new_account_starts_where_the_game_says_with_nothing_earned() {
         let p = fresh(&rules(), 2);
-        assert_eq!(p, Progress { character: 2, level: 5, exp: 40, ap: 0, gil: 0 });
+        assert_eq!(p, Progress { character: 2, level: 5, exp: 40, ap: 0, gil: 0, limit: 0 });
         assert_eq!(resolve(&rules(), &ProgressSeed::of(2, None)), p);
         assert_eq!(resolve(&rules(), &ProgressSeed::default()).character, DEFAULT_CHARACTER);
     }
 
     #[test]
     fn a_stored_record_wins_and_follows_the_look_but_keeps_what_was_earned() {
-        let stored = Progress { character: 0, level: 9, exp: 700, ap: 31, gil: 2500 };
+        let stored = Progress { character: 0, level: 9, exp: 700, ap: 31, gil: 2500, limit: 0 };
         let p = resolve(&rules(), &ProgressSeed::of(3, Some(stored)));
         assert_eq!(p, Progress { character: 3, ..stored }, "who it plays changed, what it earned did not");
     }
@@ -276,10 +290,15 @@ mod tests {
     #[test]
     fn what_is_stored_is_brought_inside_the_games_caps() {
         let limits = rules().progress_limits();
-        let hostile = Progress { character: 0, level: 255, exp: u32::MAX, ap: u32::MAX, gil: u32::MAX };
+        let hostile = Progress { character: 0, level: 255, exp: u32::MAX, ap: u32::MAX, gil: u32::MAX, limit: 4000 };
         let p = resolve(&rules(), &ProgressSeed::of(0, Some(hostile)));
-        assert_eq!(p, Progress { character: 0, level: limits.max_level, exp: limits.max_exp, ap: limits.max_ap, gil: limits.max_gil });
-        let zero = Progress { character: 0, level: 0, exp: 0, ap: 0, gil: 0 };
+        assert_eq!(
+            p,
+            Progress { character: 0, level: limits.max_level, exp: limits.max_exp, ap: limits.max_ap, gil: limits.max_gil, limit: limits.max_limit },
+            "a limit gauge above the fullest one is brought inside it too: no battle could be built with it"
+        );
+        assert_eq!(limits.max_limit, 255);
+        let zero = Progress { character: 0, level: 0, exp: 0, ap: 0, gil: 0, limit: 0 };
         assert_eq!(resolve(&rules(), &ProgressSeed::of(0, Some(zero))).level, 1, "level 0 never exists");
     }
 
@@ -289,7 +308,7 @@ mod tests {
         let mut p = fresh(&rules, 0); // level 5, 40 exp; level 6 at 60
         assert_eq!(exp_to_next(&rules, &p), 20);
         assert!(!apply_reward(&rules, &mut p, &reward(19, 10, 1)));
-        assert_eq!(p, Progress { character: 0, level: 5, exp: 59, ap: 1, gil: 10 });
+        assert_eq!(p, Progress { character: 0, level: 5, exp: 59, ap: 1, gil: 10, limit: 0 });
         assert_eq!(exp_to_next(&rules, &p), 1);
         // One more point is level 6, and what is left over counts towards level 7 (84).
         assert!(apply_reward(&rules, &mut p, &reward(1, 0, 0)));
@@ -313,9 +332,9 @@ mod tests {
     fn nothing_goes_past_the_caps_and_the_top_level_has_nothing_next() {
         let rules = rules();
         let limits = rules.progress_limits();
-        let mut p = Progress { character: 0, level: limits.max_level - 1, exp: limits.max_exp - 5, ap: limits.max_ap - 1, gil: limits.max_gil - 1 };
+        let mut p = Progress { character: 0, level: limits.max_level - 1, exp: limits.max_exp - 5, ap: limits.max_ap - 1, gil: limits.max_gil - 1, limit: 0 };
         assert!(apply_reward(&rules, &mut p, &reward(u32::MAX, u32::MAX, u32::MAX)));
-        assert_eq!(p, Progress { character: 0, level: limits.max_level, exp: limits.max_exp, ap: limits.max_ap, gil: limits.max_gil });
+        assert_eq!(p, Progress { character: 0, level: limits.max_level, exp: limits.max_exp, ap: limits.max_ap, gil: limits.max_gil, limit: 0 });
         assert_eq!(exp_to_next(&rules, &p), 0);
         // At the top, more experience changes only the (capped) total.
         assert!(!apply_reward(&rules, &mut p, &reward(1, 1, 1)));
@@ -326,7 +345,7 @@ mod tests {
     fn a_character_the_rules_have_no_curve_for_gains_experience_but_never_a_level() {
         let rules = rules();
         // Character 9 does not exist in the synthetic rules: no curve.
-        let mut p = Progress { character: 9, level: 4, exp: 0, ap: 0, gil: 0 };
+        let mut p = Progress { character: 9, level: 4, exp: 0, ap: 0, gil: 0, limit: 0 };
         assert!(!apply_reward(&rules, &mut p, &reward(1_000_000, 7, 3)));
         assert_eq!((p.level, p.exp, p.gil, p.ap), (4, 1_000_000, 7, 3));
         assert_eq!(exp_to_next(&rules, &p), 0);
@@ -337,7 +356,7 @@ mod tests {
     fn a_curve_that_asks_for_less_than_the_account_has_levels_up_at_the_next_win() {
         let rules = rules();
         // 70 experience at level 5 is what a level-6 character (60) has, but this one is level 5.
-        let mut p = Progress { character: 0, level: 5, exp: 70, ap: 0, gil: 0 };
+        let mut p = Progress { character: 0, level: 5, exp: 70, ap: 0, gil: 0, limit: 0 };
         assert_eq!(exp_to_next(&rules, &p), 0, "already past the threshold");
         assert!(apply_reward(&rules, &mut p, &reward(0, 0, 0)), "a payment of nothing still settles the level");
         assert_eq!(p.level, 6);
@@ -346,7 +365,7 @@ mod tests {
     #[test]
     fn the_message_carries_exactly_what_the_player_has() {
         let rules = rules();
-        let p = Progress { character: 3, level: 6, exp: 64, ap: 4, gil: 40 };
+        let p = Progress { character: 3, level: 6, exp: 64, ap: 4, gil: 40, limit: 0 };
         assert_eq!(
             message(&rules, &p, true),
             ServerMsg::CharacterProgress { character: 3, level: 6, exp: 64, exp_to_next: 20, gil: 40, ap: 4, leveled_up: true }
@@ -356,7 +375,7 @@ mod tests {
 
     #[test]
     fn records_round_trip_through_the_mirror() {
-        let p = Progress { character: 2, level: 12, exp: 1234, ap: 9, gil: 77 };
+        let p = Progress { character: 2, level: 12, exp: 1234, ap: 9, gil: 77, limit: 0 };
         let record = p.to_record(AccountId(4), GameId::Ff7, 55);
         assert_eq!((record.account_id, record.game, record.updated_at), (AccountId(4), GameId::Ff7, 55));
         assert_eq!(Progress::from_record(&record), p);

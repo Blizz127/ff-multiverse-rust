@@ -30,6 +30,16 @@
 //!   (`BattleRejection::OutOfItems`), and the item is taken only when the engine accepted the command: the
 //!   player's mirror loses one, the saver is queued the change and the player is told its inventory
 //!   (`ServerMsg::Inventory`) right after the `BattleEvent` that applied it.
+//! * **Limits and escape (protocol v7).** A member starts with the limit gauge its account's character
+//!   carries (`BattleMember::limit`, the mirror's `Progress::limit` inside the game's cap) and every
+//!   member's end gauge is kept when the battle ends, whatever the outcome (`keep_limits`): queued for the
+//!   saver as a set (`SavedChange::Limit`) and put in the mirror, only when it is not the one the battle
+//!   started with, and logged (`limit kept`). A `Limit` command is checked by the engine alone (the
+//!   character has one, its gauge is full, the target is on the right side: `NoLimit`, `LimitNotReady`,
+//!   `InvalidTarget`); an `Escape` too (`CannotEscape` when the formation forbids it). A successful escape
+//!   ends the battle with `Outcome::Escaped` for everyone: no rewards, no drops, the members are back in
+//!   the field; a failed one only costs the turn. Both are logged as they happen (`limit used`,
+//!   `escape tried`).
 //! * A victory pays the members that fought on (`BattleEnd::rewards`, split by
 //!   `fmv_protocol::split_rewards`) and drops items: the server rolls them after the outcome from the
 //!   battle's seed (`BattleRules::roll_drops`, logged) and deals them to the living members
@@ -242,6 +252,9 @@ fn rejection_of(e: CommandError) -> BattleRejection {
         CommandError::UnknownSpell(_) => BattleRejection::UnknownSpell,
         CommandError::NotEnoughMp(_) => BattleRejection::NotEnoughMp,
         CommandError::UnknownItem(_) => BattleRejection::UnknownItem,
+        CommandError::NoLimit(_) => BattleRejection::NoLimit,
+        CommandError::LimitNotReady(_) => BattleRejection::LimitNotReady,
+        CommandError::CannotEscape => BattleRejection::CannotEscape,
     }
 }
 
@@ -340,7 +353,9 @@ impl World {
                 let p = self.players.get(&entity)?;
                 let own = p.progress.unwrap_or_else(|| progress::fresh(bw.rules(), progress::DEFAULT_CHARACTER));
                 let level = bw.settings.level.unwrap_or(own.level);
-                Some(BattleMember { entity, account: p.account, character: own.character, level, weapon: None, armor: None })
+                // The limit gauge is the account's own, inside the game's cap (the engine would refuse more).
+                let limit = own.limit.min(bw.rules().progress_limits().max_limit);
+                Some(BattleMember { entity, account: p.account, character: own.character, level, weapon: None, armor: None, limit })
             })
             .collect();
 
@@ -363,6 +378,8 @@ impl World {
         };
         let id = BattleId(bw.next_id);
         bw.next_id += 1;
+        // How hard the fight is to run from (`none`: it cannot be), for the log.
+        let escape = state.escape_left().map_or_else(|| "none".to_string(), |left| left.to_string());
         let start = Arc::new(ServerMsg::EncounterStart {
             battle_id: id,
             formation_id: formation,
@@ -393,7 +410,7 @@ impl World {
         // The `key=value` layout is read by `scripts/battle-smoke.sh` ("members=2", and with --progress
         // "levels=[6, 6]"): keep it, and add new keys at the end.
         self.logs.info(format!(
-            "battle started battle={} formation={formation} members={} enemies={} preemptive={} back_attack={} seed={seed} characters={:?} levels={:?}",
+            "battle started battle={} formation={formation} members={} enemies={} preemptive={} back_attack={} seed={seed} characters={:?} levels={:?} limits={:?} run_difficulty={escape}",
             id.0,
             entities.len(),
             info.enemies,
@@ -401,6 +418,7 @@ impl World {
             info.back_attack,
             party.iter().map(|m| m.character).collect::<Vec<_>>(),
             party.iter().map(|m| m.level).collect::<Vec<_>>(),
+            party.iter().map(|m| m.limit).collect::<Vec<_>>(),
         ));
         self.fan_to(&entities, start);
         Ok(id)
@@ -443,11 +461,34 @@ impl World {
             }
         }
         let who = battle.members.get(usize::from(actor.0)).map(|m| (m.info.account, m.info.character));
+        // A limit says which one it is, before it empties the gauge (for the log).
+        let limit_id = battle.state.limit_for(actor).map(|l| l.attack);
         match battle.state.submit_command(actor, command) {
             Ok(events) => {
                 if let Some(n) = battle.commands.get_mut(usize::from(actor.0)) {
                     *n += 1;
                 }
+                // Limits and escapes are logged as they happen (`key=value`, new keys at the end); the
+                // number a failed escape has left is what the next attempt starts from.
+                let note = match (command, who) {
+                    (Command::Limit { target }, Some((account, character))) => Some(format!(
+                        "limit used battle={} actor={} account={} character={character} attack={} target={}",
+                        battle_id.0,
+                        actor.0,
+                        account.0,
+                        limit_id.map_or_else(|| "?".to_string(), |id| id.to_string()),
+                        target.0
+                    )),
+                    (Command::Escape, Some((account, character))) => Some(format!(
+                        "escape tried battle={} actor={} account={} character={character} result={} difficulty_left={}",
+                        battle_id.0,
+                        actor.0,
+                        account.0,
+                        if battle.state.outcome() == Some(Outcome::Escaped) { "escaped" } else { "failed" },
+                        battle.state.escape_left().unwrap_or(0)
+                    )),
+                    _ => None,
+                };
                 let msg = ServerMsg::BattleEvent {
                     battle_id,
                     tick: battle.state.tick(),
@@ -455,6 +496,9 @@ impl World {
                     command: Some(AppliedCommand { actor, command }),
                 };
                 let (ended, recipients) = (battle.state.outcome().is_some(), battle.connected());
+                if let Some(note) = note {
+                    self.logs.info(note);
+                }
                 self.fan_to(&recipients, Arc::new(msg));
                 // The engine took the command, so the item is spent (even if the player dropped meanwhile).
                 if let (Command::Item { item, .. }, Some((account, character))) = (command, who) {
@@ -551,13 +595,15 @@ impl World {
         }
         // The `key=value` layout is read by `scripts/battle-smoke.sh` ("commands=[2, 3]"): keep it.
         self.logs.info(format!(
-            "battle ended battle={} outcome={outcome:?} ticks={} members={} commands={:?}",
+            "battle ended battle={} outcome={outcome:?} ticks={} members={} commands={:?} limits={:?}",
             id.0,
             battle.state.tick(),
             battle.members.len(),
             battle.commands,
+            (0..battle.members.len()).map(|i| u8::try_from(i).map_or(0, |i| battle.state.limit_gauge(ActorId(i)))).collect::<Vec<_>>(),
         ));
         let told = self.pay_members(id, &battle.members, &rewards);
+        self.keep_limits(id, &battle);
         let recipients = battle.connected();
         // Back in the field: free everyone first, and mark them changed so the next `EntityUpdate`
         // says where they stand.
@@ -574,6 +620,33 @@ impl World {
         // Where each paid player's character stands now, right after the battle's end.
         for (entity, msg) in told {
             self.fan_to(&[entity], msg);
+        }
+    }
+
+    /// Keep the limit gauge every member of a finished battle ended with, whatever the outcome (an
+    /// escape pays nothing, but its gauges are kept): a member whose gauge is not the one it started with
+    /// has the new one queued for the saver (whether or not it is still connected: its character fought
+    /// on) and put in its mirror (found by its account, which may have logged in again). A gauge that did
+    /// not move writes nothing. A knocked-out character ended with an empty one, which is what is kept.
+    fn keep_limits(&mut self, id: BattleId, battle: &Battle) {
+        for (i, member) in battle.members.iter().enumerate() {
+            let Some(end) = u8::try_from(i).ok().map(|i| battle.state.limit_gauge(ActorId(i))) else { continue };
+            if end == member.info.limit {
+                continue;
+            }
+            let (account, character) = (member.info.account, member.info.character);
+            let queued = self.saver.as_ref().map(|saver| saver.save(SaveJob::limit(account, character, end)));
+            let online = self.by_account.get(&account).copied();
+            let mirrored = online.and_then(|entity| self.players.get_mut(&entity)).and_then(|p| p.progress.as_mut()).map(|own| own.limit = end).is_some();
+            let saving = match queued {
+                Some(true) => "queued",
+                Some(false) => "NOT QUEUED (the saver has stopped: the server is shutting down)",
+                None => "off (no saver)",
+            };
+            self.logs.info(format!(
+                "limit kept battle={} account={} character={character} limit={end} was={} mirrored={mirrored} saving={saving}",
+                id.0, account.0, member.info.limit
+            ));
         }
     }
 
@@ -830,8 +903,8 @@ mod tests {
         (w, rx)
     }
 
-    /// Everything queued for saving so far.
-    fn saved(rx: &mut mpsc::UnboundedReceiver<Msg>) -> Vec<crate::saver::SaveJob> {
+    /// Everything queued for saving so far, the limit gauges too.
+    fn saved_all(rx: &mut mpsc::UnboundedReceiver<Msg>) -> Vec<crate::saver::SaveJob> {
         let mut jobs = Vec::new();
         while let Ok(msg) = rx.try_recv() {
             match msg {
@@ -840,6 +913,22 @@ mod tests {
             }
         }
         jobs
+    }
+
+    /// The payments and item uses queued for saving so far: what the tests of the rewards and the items are
+    /// about (the limit gauges a battle ends with are queued too, see `saved_all` and `limits_of`).
+    fn saved(rx: &mut mpsc::UnboundedReceiver<Msg>) -> Vec<crate::saver::SaveJob> {
+        saved_all(rx).into_iter().filter(|j| !matches!(j.change, crate::saver::SavedChange::Limit(_))).collect()
+    }
+
+    /// The limit gauges among `jobs`, as `(account, character, gauge)`.
+    fn limits_of(jobs: &[crate::saver::SaveJob]) -> Vec<(AccountId, u8, u16)> {
+        jobs.iter()
+            .filter_map(|j| match j.change {
+                crate::saver::SavedChange::Limit(value) => Some((j.account, j.character, value)),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The `CharacterProgress` messages a seat has received so far (in order), as
@@ -876,6 +965,21 @@ mod tests {
     /// first living enemy (judged from a replay of the seat's own messages, as a client would).
     /// Returns the time at which the battle ended.
     fn play_out(w: &mut World, seats: &mut [&mut Seat], rules: &SyntheticRules, t0: Instant) -> u64 {
+        play_with(w, seats, rules, t0, &mut |state, _| {
+            let target = state.enemy_ids().into_iter().find(|e| state.actor(*e).is_some_and(|c| c.is_alive())).unwrap();
+            Command::Attack { target }
+        })
+    }
+
+    /// [`play_out`] with another player: `policy` chooses the command of a ready character from the
+    /// replay of what its seat was told (it must choose one the server accepts).
+    fn play_with(
+        w: &mut World,
+        seats: &mut [&mut Seat],
+        rules: &SyntheticRules,
+        t0: Instant,
+        policy: &mut dyn FnMut(&fmv_ff7_battle::rules::BattleState, ActorId) -> Command,
+    ) -> u64 {
         let mut replays: Vec<Option<BattleReplay>> = seats.iter().map(|_| None).collect();
         let mut seen = vec![0usize; seats.len()];
         for step in 1..=60_000u64 {
@@ -912,11 +1016,11 @@ mod tests {
                     let state = replay.state();
                     let mine = ActorId(replay.party().iter().position(|m| m.entity == seat.entity).unwrap() as u8);
                     if state.outcome().is_none() && state.ready_actors().contains(&mine) {
-                        let target = state.enemy_ids().into_iter().find(|e| state.actor(*e).is_some_and(|c| c.is_alive())).unwrap();
+                        let command = policy(state, mine);
                         let id = seat_battle_id(&seat.log);
-                        match w.battle_command(seat.entity, id, mine, Command::Attack { target }, now) {
+                        match w.battle_command(seat.entity, id, mine, command, now) {
                             BattleReply::Done => {}
-                            BattleReply::Refused { reason, .. } => panic!("a ready actor's attack was refused: {reason}"),
+                            BattleReply::Refused { reason, .. } => panic!("a ready actor's {command:?} was refused: {reason}"),
                             BattleReply::Gone => panic!("gone"),
                         }
                         seat.drain();
@@ -1124,7 +1228,7 @@ mod tests {
         let t0 = Instant::now();
         let mut w = world_with(Some(settings(SyntheticRules::default())), true);
         // Level 9 starts at 144 experience on the synthetic curve and level 10 at 180: 154 is ten in.
-        let stored = Progress { character: 2, level: 9, exp: 154, ap: 31, gil: 2500 };
+        let stored = Progress { character: 2, level: 9, exp: 154, ap: 31, gil: 2500, limit: 0 };
         let mut a = seat_as(&mut w, "A", t0, ProgressSeed::of(2, Some(stored)));
         let msgs = a.drain();
         assert!(matches!(msgs[0], ServerMsg::AreaSnapshot { .. }), "{msgs:?}");
@@ -1401,7 +1505,7 @@ mod tests {
         let members: Vec<Member> = [(&a, 0u8), (&b, 1u8)]
             .iter()
             .map(|(seat, character)| Member {
-                info: BattleMember { entity: seat.entity, account: seat.account, character: *character, level: 5, weapon: None, armor: None },
+                info: BattleMember { entity: seat.entity, account: seat.account, character: *character, level: 5, weapon: None, armor: None, limit: 0 },
                 connected: true,
             })
             .collect();
@@ -1472,7 +1576,7 @@ mod tests {
     fn every_member_fights_as_its_own_character_at_its_own_level() {
         let t0 = Instant::now();
         let mut w = world_with(Some(settings(SyntheticRules::default())), true);
-        let veteran = Progress { character: 0, level: 12, exp: 270, ap: 0, gil: 0 }; // level 12 starts at 264
+        let veteran = Progress { character: 0, level: 12, exp: 270, ap: 0, gil: 0, limit: 0 }; // level 12 starts at 264
         let (mut a, mut b) = party_of_two_as(
             &mut w,
             t0,
@@ -1499,7 +1603,7 @@ mod tests {
         let mut s = settings(rules);
         s.level = Some(3);
         let (mut w, mut rx) = world_with_saver(s);
-        let veteran = Progress { character: 0, level: 12, exp: 270, ap: 0, gil: 0 }; // level 12 starts at 264, 13 at 312
+        let veteran = Progress { character: 0, level: 12, exp: 270, ap: 0, gil: 0, limit: 0 }; // level 12 starts at 264, 13 at 312
         let mut a = seat_as(&mut w, "A", t0, ProgressSeed::of(0, Some(veteran)));
         assert_eq!(w.request_encounter(a.entity, Some(0), t0), BattleReply::Done);
         match &a.battle_msgs()[..] {
@@ -1573,7 +1677,7 @@ mod tests {
             &mut w,
             t0,
             ProgressSeed::of(0, None),
-            ProgressSeed::of(3, Some(Progress { character: 3, level: 5, exp: 52, ap: 1, gil: 5 })),
+            ProgressSeed::of(3, Some(Progress { character: 3, level: 5, exp: 52, ap: 1, gil: 5, limit: 0 })),
         );
         a.drain();
         b.drain();
@@ -1595,6 +1699,233 @@ mod tests {
         assert_eq!(jobs.iter().map(|j| (j.account, j.character, j.paid().map(|r| r.exp))).collect::<Vec<_>>(), vec![(a.account, 0, Some(12)), (b.account, 3, Some(12))]);
     }
 
+    /// What a client that replayed everything `seat` was told computes as the limit gauges of the party
+    /// (`ActorId(0)` first) at the end of its last battle: an oracle for what the server saves.
+    fn replayed_gauges(seat: &mut Seat, rules: &SyntheticRules) -> Vec<u16> {
+        seat.drain();
+        let mut replay = None;
+        for m in &seat.log {
+            match m {
+                ServerMsg::EncounterStart { formation_id, seed, party, preemptive, back_attack, battle_speed, ticks_per_second, .. } => {
+                    let setup = BattleSetup {
+                        formation_id: *formation_id,
+                        seed: *seed,
+                        party: party.clone(),
+                        preemptive: *preemptive,
+                        back_attack: *back_attack,
+                        battle_speed: *battle_speed,
+                        ticks_per_second: *ticks_per_second,
+                    };
+                    replay = Some(BattleReplay::start(rules, &setup).expect("builds"));
+                }
+                ServerMsg::BattleEvent { tick, events, command, .. } => {
+                    replay.as_mut().expect("started").apply(*tick, events, command.as_ref()).unwrap_or_else(|d| panic!("diverged: {d}"));
+                }
+                _ => {}
+            }
+        }
+        let replay = replay.expect("a battle");
+        let state = replay.state();
+        state.party_ids().into_iter().map(|id| state.limit_gauge(id)).collect()
+    }
+
+    fn logs_of(w: &mut World) -> Vec<String> {
+        w.take_logs().iter().map(|l| l.text().to_string()).collect()
+    }
+
+    /// The limit gauge of `seat`'s mirror.
+    fn mirrored_limit(w: &World, seat: &Seat) -> u16 {
+        w.players.get(&seat.entity).and_then(|p| p.progress).expect("a mirror").limit
+    }
+
+    #[test]
+    fn a_member_starts_with_its_accounts_gauge_uses_its_limit_and_the_end_gauge_is_kept() {
+        let rules = SyntheticRules::default();
+        let t0 = Instant::now();
+        let (mut w, mut rx) = world_with_saver(settings(rules));
+        let stored = Progress { character: 0, level: 5, exp: 40, ap: 0, gil: 0, limit: 255 };
+        let mut a = seat_as(&mut w, "A", t0, ProgressSeed::of(0, Some(stored)));
+        assert_eq!(mirrored_limit(&w, &a), 255);
+        // Formation 3 is the preemptive one: the party's gauge is full at once and the limit can be given.
+        assert_eq!(w.request_encounter(a.entity, Some(3), t0), BattleReply::Done);
+        match &a.battle_msgs()[..] {
+            [ServerMsg::EncounterStart { party, preemptive: true, .. }] => assert_eq!((party[0].character, party[0].limit), (0, 255)),
+            other => panic!("{other:?}"),
+        }
+        let id = seat_battle_id(&a.log);
+        assert_eq!(w.battle_command(a.entity, id, ActorId(0), Command::Limit { target: ActorId(1) }, t0), BattleReply::Done);
+        // The message that carried it: the action, the gauge emptied before the blow, then the blow.
+        let applied = a.battle_msgs().into_iter().find_map(|m| match m {
+            ServerMsg::BattleEvent { events, command: Some(AppliedCommand { command: Command::Limit { .. }, .. }), .. } => Some(events),
+            _ => None,
+        });
+        let events = applied.expect("the limit was announced with its command");
+        assert!(matches!(events.last(), Some(BattleEvent::Damage { .. })), "{events:?}");
+        assert!(events.contains(&BattleEvent::Action { actor: ActorId(0), action: fmv_protocol::ActionRef::Limit(128) }));
+        assert!(events.contains(&BattleEvent::LimitGauge { actor: ActorId(0), value: 0 }));
+        // The same gauge a second time: the turn is over (and the gauge is empty).
+        assert_eq!(
+            w.battle_command(a.entity, id, ActorId(0), Command::Limit { target: ActorId(1) }, t0),
+            refused(Some(id), BattleRejection::GaugeNotFull)
+        );
+
+        play_out(&mut w, &mut [&mut a], &rules, t0);
+        // The gauge it ended with is what a replay of the log computes: queued for the saver (a gauge that
+        // is not the one the battle started with), in the mirror, and logged.
+        let end = replayed_gauges(&mut a, &rules)[0];
+        assert_ne!(end, 255, "the limit emptied it and a dummy's few blows did not fill it again");
+        let jobs = saved_all(&mut rx);
+        assert_eq!(limits_of(&jobs), vec![(a.account, 0, end)]);
+        assert_eq!(mirrored_limit(&w, &a), end);
+        let logs = logs_of(&mut w);
+        assert!(
+            logs.iter().any(|l| l.starts_with("limit used battle=1 actor=0") && l.ends_with("attack=128 target=1")),
+            "{logs:?}"
+        );
+        assert!(
+            logs.iter().any(|l| l.starts_with("limit kept battle=1") && l.contains(&format!("limit={end} was=255")) && l.contains("mirrored=true saving=queued")),
+            "{logs:?}"
+        );
+        assert!(logs.iter().any(|l| l.starts_with("battle started battle=1") && l.contains("limits=[255]") && l.ends_with("run_difficulty=1")), "{logs:?}");
+        assert!(logs.iter().any(|l| l.starts_with("battle ended battle=1 outcome=Victory") && l.ends_with(&format!("limits=[{end}]"))), "{logs:?}");
+        // A win pays as before: the payment is its own job, and the next battle starts from the gauge kept.
+        assert_eq!(jobs.iter().filter(|j| j.paid().is_some()).count(), 1);
+        assert_eq!(w.request_encounter(a.entity, Some(0), ms(t0, 700_000)), BattleReply::Done);
+        match a.battle_msgs().last() {
+            Some(ServerMsg::EncounterStart { party, .. }) => assert_eq!(party[0].limit, end),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_gauge_that_did_not_move_is_not_saved_and_a_stored_one_above_the_cap_is_brought_inside() {
+        let rules = SyntheticRules::default();
+        let t0 = Instant::now();
+        let (mut w, mut rx) = world_with_saver(settings(rules));
+        // A hostile or hand-edited record: the join brings it inside the cap, and so does the battle.
+        let wild = Progress { character: 0, level: 5, exp: 40, ap: 0, gil: 0, limit: u16::MAX };
+        let mut a = seat_as(&mut w, "A", t0, ProgressSeed::of(0, Some(wild)));
+        assert_eq!(mirrored_limit(&w, &a), 255);
+        assert_eq!(w.request_encounter(a.entity, Some(3), t0), BattleReply::Done);
+        match &a.battle_msgs()[..] {
+            [ServerMsg::EncounterStart { party, .. }] => assert_eq!(party[0].limit, 255),
+            other => panic!("{other:?}"),
+        }
+        let id = seat_battle_id(&a.log);
+        // Escape at once (the preemptive formation: a sure escape) before a single blow: nothing moved.
+        assert_eq!(w.battle_command(a.entity, id, ActorId(0), Command::Escape, t0), BattleReply::Done);
+        assert_eq!(w.battle_count(), 0);
+        assert!(saved_all(&mut rx).is_empty(), "the gauge ended as it started: nothing to write");
+        assert!(!logs_of(&mut w).iter().any(|l| l.starts_with("limit kept")));
+    }
+
+    #[test]
+    fn an_escape_ends_the_battle_for_the_whole_party_pays_nothing_and_keeps_the_gauges_the_blows_filled() {
+        let rules = SyntheticRules::default();
+        let t0 = Instant::now();
+        let (mut w, mut rx) = world_with_saver(settings(rules));
+        let (mut a, mut b) = party_of_two(&mut w, t0);
+        assert_eq!(w.request_encounter(a.entity, Some(1), t0), BattleReply::Done);
+        // A attacks until a blow has filled its gauge, then runs until it gets away; B never acts.
+        play_with(&mut w, &mut [&mut a], &rules, t0, &mut |state, me| {
+            if state.limit_gauge(me) > 0 {
+                Command::Escape
+            } else {
+                Command::Attack { target: state.enemy_ids().into_iter().find(|e| state.actor(*e).is_some_and(|c| c.is_alive())).unwrap() }
+            }
+        });
+        for seat in [&mut a, &mut b] {
+            let ends: Vec<_> = seat.battle_msgs().into_iter().filter_map(|m| match m {
+                ServerMsg::BattleEnd { outcome, rewards, .. } => Some((outcome, rewards)),
+                _ => None,
+            }).collect();
+            assert_eq!(ends, vec![(Outcome::Escaped, vec![])], "everyone hears it, and nothing is paid");
+            assert!(!w.in_battle(seat.entity), "back in the field");
+        }
+        assert_eq!(w.battle_count(), 0);
+        // Nothing was paid or used: the queue holds gauges only.
+        let jobs = saved_all(&mut rx);
+        assert!(jobs.iter().all(|j| matches!(j.change, crate::saver::SavedChange::Limit(_))), "{jobs:?}");
+        assert_eq!(progress_msgs(&mut a).len(), 1, "only the join message: an escape tells nobody a new level or total");
+        // The gauges the blows filled are the ones a replay computes, kept for every member, A's included.
+        let gauges = replayed_gauges(&mut a, &rules);
+        assert!(gauges[0] > 0, "the blows that made A run filled its gauge");
+        let mut kept = limits_of(&jobs);
+        kept.sort();
+        let mut want: Vec<(AccountId, u8, u16)> =
+            [(a.account, gauges[0]), (b.account, gauges[1])].into_iter().filter(|(_, g)| *g != 0).map(|(account, g)| (account, 0, g)).collect();
+        want.sort();
+        assert_eq!(kept, want);
+        assert_eq!(mirrored_limit(&w, &a), gauges[0]);
+        assert_eq!(mirrored_limit(&w, &b), gauges[1]);
+        let logs = logs_of(&mut w);
+        assert!(logs.iter().any(|l| l.starts_with("battle ended battle=1 outcome=Escaped")), "{logs:?}");
+        let tries: Vec<&String> = logs.iter().filter(|l| l.starts_with("escape tried battle=1 actor=0")).collect();
+        assert!(tries.last().is_some_and(|l| l.contains("result=escaped")), "{tries:?}");
+        assert!(tries.iter().rev().skip(1).all(|l| l.contains("result=failed")), "only the last attempt got away: {tries:?}");
+        // No reward line: an escape pays nothing, not even a payment of nothing.
+        assert!(!logs.iter().any(|l| l.starts_with("battle reward")), "{logs:?}");
+    }
+
+    #[test]
+    fn a_limit_or_an_escape_the_engine_refuses_is_refused_with_its_own_reason_and_changes_nothing() {
+        let rules = SyntheticRules::default();
+        let t0 = Instant::now();
+        let (mut w, mut rx) = world_with_saver(settings(rules));
+        // Formation 2 (the overwhelming enemy) cannot be run from; the stored gauge is half full.
+        let half = Progress { character: 0, level: 5, exp: 40, ap: 0, gil: 0, limit: 100 };
+        let a = seat_as(&mut w, "A", t0, ProgressSeed::of(0, Some(half)));
+        assert_eq!(w.request_encounter(a.entity, Some(2), t0), BattleReply::Done);
+        let id = BattleId(1);
+        // Until its turn comes nothing can be given; then the reasons are the engine's, in its order.
+        let mut reason = None;
+        for step in 1..=200u64 {
+            let now = ms(t0, step * 10);
+            w.advance_battles(now);
+            match w.battle_command(a.entity, id, ActorId(0), Command::Escape, now) {
+                BattleReply::Refused { reason: BattleRejection::GaugeNotFull, .. } => continue,
+                BattleReply::Refused { reason: r, .. } => {
+                    reason = Some((r, now));
+                    break;
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        let (r, now) = reason.expect("the character's turn comes");
+        assert_eq!(r, BattleRejection::CannotEscape);
+        assert_eq!(
+            w.battle_command(a.entity, id, ActorId(0), Command::Limit { target: ActorId(1) }, now),
+            refused(Some(id), BattleRejection::LimitNotReady),
+            "a gauge of 100 is not a full one"
+        );
+        assert_eq!(w.battle_count(), 1, "refusals end nothing");
+        assert!(saved_all(&mut rx).is_empty());
+        assert!(!logs_of(&mut w).iter().any(|l| l.starts_with("escape tried") || l.starts_with("limit used")));
+    }
+
+    #[test]
+    fn a_healing_limit_aims_at_the_party_and_a_damaging_one_at_the_enemies() {
+        let rules = SyntheticRules::default();
+        let t0 = Instant::now();
+        let (mut w, _rx) = world_with_saver(settings(rules));
+        // Character 3 (Aerith) heals; Cloud strikes. Both start with a full gauge in a preemptive battle.
+        let full = |character| ProgressSeed::of(character, Some(Progress { character, level: 5, exp: 40, ap: 0, gil: 0, limit: 255 }));
+        let (mut a, mut b) = party_of_two_as(&mut w, t0, full(0), full(3));
+        assert_eq!(w.request_encounter(a.entity, Some(3), t0), BattleReply::Done);
+        a.drain();
+        b.drain();
+        let id = seat_battle_id(&a.log);
+        let (cloud, aerith, enemy) = (ActorId(0), ActorId(1), ActorId(2));
+        let refuse = |reason| refused(Some(id), reason);
+        // Cloud's strike needs an enemy; Aerith's heal an ally (herself counts).
+        assert_eq!(w.battle_command(a.entity, id, cloud, Command::Limit { target: aerith }, t0), refuse(BattleRejection::InvalidTarget));
+        assert_eq!(w.battle_command(b.entity, id, aerith, Command::Limit { target: enemy }, t0), refuse(BattleRejection::InvalidTarget));
+        assert_eq!(w.battle_command(b.entity, id, aerith, Command::Limit { target: cloud }, t0), BattleReply::Done);
+        assert_eq!(w.battle_command(a.entity, id, cloud, Command::Limit { target: enemy }, t0), BattleReply::Done);
+        // A member cannot give another member's limit.
+        assert_eq!(w.battle_command(a.entity, id, aerith, Command::Escape, t0), refuse(BattleRejection::NotYourActor));
+    }
+
     #[test]
     fn a_defeat_pays_nothing_and_changes_nothing() {
         let rules = SyntheticRules::default();
@@ -1607,7 +1938,7 @@ mod tests {
         assert_eq!((progress_msgs(&mut a), progress_msgs(&mut b)), before, "no progress message after a defeat");
         assert!(saved(&mut rx).is_empty(), "nothing to save");
         let mirror: Vec<Progress> = w.players.values().filter_map(|p| p.progress).collect();
-        assert_eq!(mirror, vec![Progress { character: 0, level: 5, exp: 40, ap: 0, gil: 0 }; 2]);
+        assert_eq!(mirror, vec![Progress { character: 0, level: 5, exp: 40, ap: 0, gil: 0, limit: 0 }; 2]);
     }
 
     /// A member that left mid-battle still fought: what it earned reaches the store (the saver is
@@ -1642,7 +1973,7 @@ mod tests {
         let members: Vec<Member> = [(&a, 0u8), (&b, 1u8)]
             .iter()
             .map(|(seat, character)| Member {
-                info: BattleMember { entity: seat.entity, account: seat.account, character: *character, level: 5, weapon: None, armor: None },
+                info: BattleMember { entity: seat.entity, account: seat.account, character: *character, level: 5, weapon: None, armor: None, limit: 0 },
                 connected: true,
             })
             .collect();
@@ -1663,7 +1994,7 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].account, a.account);
         // B's mirror is exactly what it was.
-        assert_eq!(w.players.get(&b.entity).unwrap().progress, Some(Progress { character: 0, level: 5, exp: 40, ap: 0, gil: 0 }));
+        assert_eq!(w.players.get(&b.entity).unwrap().progress, Some(Progress { character: 0, level: 5, exp: 40, ap: 0, gil: 0, limit: 0 }));
     }
 
     /// Without a saver (the world's unit tests, a server that stores nothing) payments still reach
