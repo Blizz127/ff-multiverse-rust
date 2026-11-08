@@ -266,12 +266,19 @@ library set, or next to a `--ff7-flevel` file) and are never sent over the netwo
 carries only the look's id. A look this table does not know is drawn as Cloud; every player gets
 a ring on the ground in their tint (yours has a white outline, a party member's a gold ring
 around it). Without a `char.lgp`, in a FIXTURE area, or for a character that fails to load, the
-plain markers are drawn as before. The scenery in front of the characters (background layers 2
-and 4) is drawn over them, but as **one flat picture**: the game sorts each object against each
-character by depth and this does not, so a character standing in front of an object that is
-farther away can be covered by it (in `md1stin` the front layer overlaps a character's outline
-box at 59 of 73 sampled walkable places, most of them because of the far left wall; see
-`crates/fmv-client/src/avatar/mod.rs`); sorting objects against characters is the next step.
+plain markers are drawn as before. The picture of an FF7 field is drawn **tile by tile with a depth
+per tile**, in the same depth-tested pass as the models, as the game does it: a layer-2 tile is
+`4 * id` units from the camera (the rule is derived from the game's own stored values and checked
+on all 702 owned fields in `fmv-ff7`), layer 4 is in front of everything, layers 1 and 3 behind it,
+and a character is hidden by exactly the tiles that are nearer than it is. In `md1stin` Cloud
+stands fully visible in front of the far left wall piece that the old flat front layer covered him
+with (39% of him at the test spot), and is hidden behind it where he is farther away; the glows,
+shadows and glass (blended tiles) are drawn over the characters, which the flat split could not do.
+It is checked against software composites to within two pixels at each spot. The depth of an
+object is one value for the whole tile, so an object that reaches far in depth under one id is an
+approximation; see `crates/fmv-client/src/avatar/mod.rs` for the measured numbers and the remaining
+limits. A field with nothing in front of the characters, or a window with no models, shows the
+flat picture as before.
 
 *In a battle.* **B** asks the server for a debug battle (refused unless it runs with
 `--debug-encounters`; random encounters start battles by themselves in a field that has an

@@ -6,14 +6,16 @@
 //!
 //! * The *synthetic* tests (no game data) draw stick figures and hand-made models through the
 //!   camera of [`frame::tests`] and check pixels: where the models land, that the nearer one wins
-//!   whatever the draw order, that the scenery in front covers them, that texels the colour key
-//!   made transparent are discarded, that blended parts blend, that an sRGB target gets the
-//!   colours as authored.
-//! * The *real-data* test draws the owner's own `md1stin` with their own `char.lgp` and writes the
-//!   PNGs (`50-avatars-md1stin.png` and friends in `$FMV_SHOT_DIR`, default
-//!   `~/.cache/claude-tmp/fmv-client-shots`). It needs `FMV_FF7_LIBRARY` (the state directory
+//!   whatever the draw order, that texels the colour key made transparent are discarded, that
+//!   blended parts blend, that an sRGB target gets the colours as authored. (The depth-tested
+//!   scenery has its own, in the `depth` module.)
+//! * The *real-data* tests draw the owner's own `md1stin` and `md1_1` with their own `char.lgp` and
+//!   write the PNGs (`50-avatars-md1stin.png` and friends in `$FMV_SHOT_DIR`, default
+//!   `~/.cache/claude-tmp/fmv-client-shots`). They need `FMV_FF7_LIBRARY` (the state directory
 //!   holding the imported library, read-only), or `FMV_FF7_DATA` (the game's `data/` directory),
 //!   or `FMV_FF7_FLEVEL` (a `flevel.lgp` with a `char.lgp` beside it).
+
+mod depth;
 
 use super::anim::Who;
 use super::frame::tests::{stage, view};
@@ -221,47 +223,6 @@ fn offscreen_a_model_lands_where_the_camera_puts_it_and_the_nearer_one_wins_in_a
 
 #[test]
 #[ignore = "needs a GPU or software Vulkan/GL driver"]
-fn offscreen_the_scenery_in_front_covers_a_model_and_the_ground_ring_is_under_it() {
-    let Some(mut gpu) = Offscreen::new() else { return };
-    let red = facing_camera(1, "ff7/cloud", Pos::new(0.0, 0.0, 0.0));
-    let mut frame = built(&[red], false);
-    let (cx, cy) = centroid(&body(&frame, 0));
-    // Without a front layer the body shows.
-    assert!(close(pixel(&draw(&mut gpu, &frame), W, cx, cy), [255, 0, 0], 2));
-    // A front layer: one opaque green texel over the left half of the window rectangle (x < 0 in
-    // view space). The figure straddles that edge: its left half is covered, its right half not.
-    let green = Backdrop::new(1, 1, vec![0, 255, 0, 255], [-100.0, -100.0], [0.0, 100.0]).unwrap();
-    frame.front = Some(Arc::new(green));
-    let img = draw(&mut gpu, &frame);
-    let left = (cx - 6, cy);
-    let right = (cx + 6, cy);
-    assert!(close(pixel(&img, W, left.0, left.1), [0, 255, 0], 2), "left of the edge: {:?}", pixel(&img, W, left.0, left.1));
-    assert!(close(pixel(&img, W, right.0, right.1), [255, 0, 0], 2), "right of the edge: {:?}", pixel(&img, W, right.0, right.1));
-    // Where nothing is in front, the clear colour is not painted over (the front is transparent
-    // outside its rectangle).
-    assert!(close(pixel(&img, W, W - 20, 20), CLEAR_RGB, 2));
-    save("50x-avatars-synthetic-front", W, H, &img);
-
-    // The ground marks (shadow and rings) are in the scene pass, under the model: a pixel of the
-    // tint ring beside the feet shows the tint, and the body is still on top of what is under it.
-    let with_marks = built(&[red], true);
-    let img = draw(&mut gpu, &with_marks);
-    let ring = &with_marks.ground[1];
-    assert_eq!(ring.rgb, [10, 200, 30]);
-    // The middle of the ring's band at its rightmost point (world +x of the feet).
-    let at = |outline: &[[f32; 2]]| outline.iter().copied().max_by(|a, b| a[0].total_cmp(&b[0])).unwrap();
-    let (outer, inner) = (at(&ring.outer), at(&ring.inner));
-    let mid = fitted().project((outer[0] + inner[0]) / 2.0, (outer[1] + inner[1]) / 2.0);
-    let (px, py) = ((W as f32 / 2.0 + mid[0]).round() as u32, (H as f32 / 2.0 - mid[1]).round() as u32);
-    let got = pixel(&img, W, px, py);
-    // Ring (alpha 0.85) over the shadow disc (alpha 0.3 black) over the clear colour.
-    assert!(got[1] > 120 && got[0] < 80, "tint ring at ({px},{py}): {got:?}");
-    assert!(close(pixel(&img, W, cx, cy), [255, 0, 0], 2), "the model is over its own ring");
-    save("50x-avatars-synthetic-ring", W, H, &img);
-}
-
-#[test]
-#[ignore = "needs a GPU or software Vulkan/GL driver"]
 fn offscreen_transparent_texels_are_discarded_and_blended_parts_blend() {
     let Some(mut gpu) = Offscreen::new() else { return };
     // Barret: a quad, left texel transparent (colour key), right texel green.
@@ -341,7 +302,7 @@ fn offscreen_an_srgb_target_gets_the_colours_as_authored() {
 // The owner's own game data
 // ---------------------------------------------------------------------------------------------
 
-mod real {
+pub(super) mod real {
     use super::*;
     use crate::avatar::source::LgpLoader;
     use crate::ff7::{prewarm, resolve_char_lgp, resolve_flevel, Ff7Labels, Ff7Source};
@@ -487,14 +448,26 @@ mod real {
         }
     }
 
+    /// The flat front layer of a field (layers 2 and 4 as one image over the whole picture's
+    /// rectangle, premultiplied): what the client drew over the characters before the scenery had a
+    /// depth. Kept for the tests that compare the two.
+    pub fn flat_front(area: &fmv_ff7::Ff7FieldArea) -> Option<Backdrop> {
+        let layers = fmv_ff7::background::decode_background_layers(area.field_file()).ok()?;
+        let image = &layers.front;
+        let b = image.bounds();
+        Backdrop::new(image.width, image.height, image.rgba.clone(), [b.min_x as f32, -(b.max_y as f32)], [b.max_x as f32, -(b.min_y as f32)])
+    }
+
     /// Points of the walkmesh (corners, edge midpoints and centres of its triangles) where a
     /// character would be a good size on the screen (camera depth `depth_range`), with what they
-    /// would look like: found by skinning a character there and projecting it.
+    /// would look like: found by skinning a character there and projecting it. `front` is the flat
+    /// front layer whose coverage of each character's rectangle is reported (see [`flat_front`]).
     pub fn spots(
         avatars: &mut Avatars,
         view: &crate::backdrop::FieldView,
         stage: &crate::avatar::Stage,
         area: &dyn AreaRuntime,
+        front: Option<&Backdrop>,
         depth_range: (f32, f32),
     ) -> Vec<Spot> {
         let mut points: Vec<Pos> = Vec::new();
@@ -503,7 +476,6 @@ mod real {
             let centre = Pos::new((t[0].x + t[1].x + t[2].x) / 3.0, (t[0].y + t[1].y + t[2].y) / 3.0, (t[0].z + t[1].z + t[2].z) / 3.0);
             points.extend([centre, mid(t[0], t[1]), mid(t[1], t[2]), mid(t[2], t[0])]);
         }
-        let front = stage.front.as_deref();
         points
             .into_iter()
             .filter_map(|pos| {
@@ -526,10 +498,12 @@ mod real {
     }
 }
 
-/// Three players of different looks in the real `md1stin`, with the real models, through the real
-/// renderer, as the window draws them: PNGs to look at, plus numbers (where the pixels that
-/// changed are against where the model's vertices project, the picture of the scenery in front,
-/// that nothing of the back half shows). `FMV_FF7_AREA` picks another field.
+/// Four players of different looks in the real `md1stin`, with the real models, through the real
+/// renderer, as the window draws them (the picture as depth-tested tiles): PNGs to look at, plus
+/// numbers (where the pixels that changed are against where the model's vertices project, that the
+/// tile picture shows no key-colour pixel of the back layers, how far the old flat front layer
+/// reached into the walkable places). `FMV_FF7_AREA` picks another field. The depth rule itself is
+/// checked by the `depth` module's tests.
 #[test]
 #[ignore = "needs the owner's real FF7 data (FMV_FF7_LIBRARY, FMV_FF7_DATA or FMV_FF7_FLEVEL) and a GPU or software Vulkan/GL driver"]
 fn offscreen_real_ff7_avatars_in_the_field() {
@@ -540,25 +514,27 @@ fn offscreen_real_ff7_avatars_in_the_field() {
     let Some(real) = open() else { return };
     let Some(mut gpu) = Offscreen::new() else { return };
     let key = std::env::var("FMV_FF7_AREA").unwrap_or_else(|_| "md1stin".to_string());
-    let view = timed("field view with the scenery in front", || FieldView::ff7_with(&real.adapter, &key, true)).expect("field view");
+    let view = timed("field view with the depth-tested scenery", || FieldView::ff7_with(&real.adapter, &key, true)).expect("field view");
     eprintln!("{}", view.description);
     let stage = view.stage.clone().expect("an FF7 field has a stage");
+    assert!(stage.scenery.is_some(), "{key} has scenery in front of the characters");
     let area = real.adapter.load_field(&key).expect("field");
     eprintln!("field scale {}, model scale {}, walk {:.1} run {:.1}", area.field_scale(), stage.model_scale, stage.walk_speed, stage.run_speed);
 
-    if let Some(front) = &stage.front {
-        // The scenery in front of the characters, on black, to see what covers whom.
+    // The flat front layer (layers 2 and 4 as one image, what the client used to draw over every
+    // character), on black, to see what it would cover.
+    let flat_front = flat_front(&area);
+    if let Some(front) = &flat_front {
         let mut flat = front.rgba.clone();
         for px in flat.chunks_exact_mut(4) {
             px[3] = 255;
         }
         save_png(&format!("53-front-layer-{key}"), front.width, front.height, &flat);
     }
-    // Where to stand: places on the walkmesh where a character is a good size and the scenery in
-    // front does not cover it, spread over the screen; and one place where it is half behind
-    // the scenery.
+    // Where to stand: places on the walkmesh where a character is a good size and no scenery in
+    // front overlaps it (by the flat layer's reckoning), spread over the screen.
     let mut avatars = avatars(&real);
-    let candidates = spots(&mut avatars, &view, &stage, &area, (450.0, 1300.0));
+    let candidates = spots(&mut avatars, &view, &stage, &area, flat_front.as_ref(), (450.0, 1300.0));
     eprintln!("{} candidate places in depth 450..1300", candidates.len());
     let clear = spread(&candidates.iter().copied().filter(|s| s.covered == 0.0).collect::<Vec<_>>(), 4);
     assert_eq!(clear.len(), 4, "four uncovered places on the walkmesh");
@@ -595,19 +571,12 @@ fn offscreen_real_ff7_avatars_in_the_field() {
     let mut blame: Vec<_> = blame.into_iter().collect();
     blame.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
     eprintln!(
-        "FLAT FRONT LAYER REACH in {key}: it covers part of a character at {} of {} walkable places in depth 450..1300 ({} fully clear); by object (layer, id): {:?}",
+        "FLAT FRONT LAYER REACH (the layer the depth-tested tiles replace) in {key}: it covers part of a character at {} of {} walkable places in depth 450..1300 ({} fully clear); by object (layer, id): {:?}",
         touched.len(),
         candidates.len(),
         candidates.len() - touched.len(),
         blame
     );
-    // For the demonstration of the front layer being drawn over a character: a place where the
-    // character is about half covered by the near train (layer 2, id 1) if there is one.
-    let pick = |filter: &dyn Fn(&Spot) -> bool| {
-        candidates.iter().copied().filter(|s| filter(s)).min_by(|a, b| (a.covered - 0.5).abs().total_cmp(&(b.covered - 0.5).abs()))
-    };
-    let behind = pick(&|s| s.covered > 0.2 && s.covered < 0.9 && dominant(s.view_rect) == Some((2, 1)))
-        .or_else(|| pick(&|s| s.covered > 0.2 && s.covered < 0.9));
     let spots = clear.iter().map(|s| s.pos).collect::<Vec<_>>();
     for s in &clear {
         eprintln!("clear spot {:?}: depth {:.0}, rect {:?}", s.pos, s.depth, s.view_rect);
@@ -679,7 +648,7 @@ fn offscreen_real_ff7_avatars_in_the_field() {
     // over the whole picture (no scenery in front), no ground marks.
     for (n, p) in players.iter().enumerate() {
         let mut alone = avatars.frame(&view, &stage, &[*p], 0.0).frame;
-        alone.front = None;
+        alone.scenery = None;
         alone.ground.clear();
         let img = gpu.render_field(w, h, &none, Some(&alone), &DrawList::new());
         let (x0, y0, x1, y1) = model_bbox(&alone, 0, &none, w, h);
@@ -704,62 +673,13 @@ fn offscreen_real_ff7_avatars_in_the_field() {
         let _ = n;
     }
 
-    // 2. The back half never shows: the picture has the same pure-green key pixels with the
-    // avatars as without (md1stin has none in the whole picture; the model is not green).
+    // 2. The tile picture shows no key-colour pixel the flat picture does not have: under the layer-2
+    // objects the back layer holds 6 277 pure-green pixels that the objects cover (md1stin has none
+    // in the whole picture), so a wrong depth compare, order or a missing tile would show them. The
+    // model is not green.
     let green = |img: &[u8]| img.chunks_exact(4).filter(|p| p[..3] == [0, 255, 0]).count();
     let with = gpu.render_field(w, h, &scene, Some(&built.frame), &DrawList::new());
     assert_eq!(green(&with), green(&base), "no key-colour pixels appear");
-
-    // 3. The front layer is drawn over a character wherever it is opaque (the flat split: see the
-    // limits in `avatar`'s docs; this says nothing about whether the GAME would hide the character
-    // there). The same frame without the front layer differs from the one with it inside the
-    // character's rectangle, and the layer changes nothing where it covers no character, apart
-    // from the edge pixels of its silhouettes, where it blends over an identical picture.
-    let behind = behind.expect("a place where the front layer covers about half of a character");
-    let stand = player(5, Some("ff7/tifa"), behind.pos, toward, AnimState::Idle, false, false);
-    let with_front = avatars.frame(&view, &stage, &[stand], 0.0).frame;
-    let covered = gpu.render_field(w, h, &none, Some(&with_front), &DrawList::new());
-    let mut no_front = avatars.frame(&view, &stage, &[stand], 0.0).frame;
-    no_front.front = None;
-    let uncovered = gpu.render_field(w, h, &none, Some(&no_front), &DrawList::new());
-    let (x0, y0, x1, y1) = model_bbox(&with_front, 0, &none, w, h);
-    let differing = (y0 as u32..y1 as u32)
-        .flat_map(|y| (x0 as u32..x1 as u32).map(move |x| (x, y)))
-        .filter(|&(x, y)| {
-            let i = ((y * w + x) * 4) as usize;
-            covered[i..i + 3].iter().zip(&uncovered[i..i + 3]).any(|(a, b)| a.abs_diff(*b) > 24)
-        })
-        .count();
-    eprintln!(
-        "front layer over a character: {:.0}% of its rectangle is under the layer (mostly {:?}); {differing} pixels differ with it",
-        behind.covered * 100.0,
-        dominant(behind.view_rect)
-    );
-    assert!(differing > 100, "the front layer is drawn over the character where it is opaque: {differing} pixels");
-    let (cx, cy) = (((x0 + x1) / 2.0) as i64, ((y0 + y1) / 2.0) as i64);
-    let half = 90i64;
-    let (ox, oy) = ((cx - half).clamp(0, i64::from(w) - 2 * half) as u32, (cy - half).clamp(0, i64::from(h) - 2 * half) as u32);
-    let (cw, ch, crop) = zoom_crop(&covered, w, ox, oy, 2 * half as u32, 2 * half as u32, 3);
-    save_png("54-avatars-front-layer-over-character", cw, ch, &crop);
-    let (cw, ch, crop) = zoom_crop(&uncovered, w, ox, oy, 2 * half as u32, 2 * half as u32, 3);
-    save_png("54-avatars-front-layer-over-character-without-it", cw, ch, &crop);
-    save("54-avatars-front-layer-over-character-full", w, h, &covered);
-
-    // 4. The premise of drawing over the whole picture and then the front half over it: where
-    // the front half is opaque, it IS the picture (so redrawing it changes nothing).
-    let picture = view.backdrop.as_ref().expect("the picture");
-    let front = stage.front.as_ref().expect("a front layer");
-    assert_eq!((picture.width, picture.height), (front.width, front.height));
-    let mut opaque = 0;
-    for (a, b) in picture.rgba.chunks_exact(4).zip(front.rgba.chunks_exact(4)) {
-        if b[3] == 255 {
-            opaque += 1;
-            assert_eq!(a[..3], b[..3], "the front layer's colour is the picture's");
-        } else {
-            assert_eq!(b, [0, 0, 0, 0], "everything else of it is untouched (premultiplied)");
-        }
-    }
-    assert!(opaque > 10_000, "{opaque} px of scenery in front");
 }
 
 /// The non-player characters of two real fields (`md1stin`, the platform with its two guards, and
@@ -788,7 +708,7 @@ fn offscreen_real_ff7_npcs_in_two_fields() {
     let Some(mut gpu) = Offscreen::new() else { return };
     let keys = std::env::var("FMV_FF7_AREAS").unwrap_or_else(|_| "md1stin,md1_1".to_string());
     for key in keys.split(',').map(str::trim).filter(|k| !k.is_empty()) {
-        let view = timed(&format!("{key}: field view with the scenery in front"), || FieldView::ff7_with(&real.adapter, key, true)).expect("field view");
+        let view = timed(&format!("{key}: field view with the depth-tested scenery"), || FieldView::ff7_with(&real.adapter, key, true)).expect("field view");
         let stage = view.stage.clone().expect("an FF7 field has a stage");
         let area = real.adapter.load_field(key).expect("field");
 

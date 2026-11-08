@@ -19,11 +19,12 @@
 //! walkmesh are projected with.
 
 use super::anim::{Animator, Who};
-use super::ground::{self, GroundShape};
+use super::ground::{self, GroundShape, GroundVertex};
 use super::library::{AvatarAsset, AvatarLibrary};
+use super::scenery::Scenery;
 use super::stage::Stage;
-use crate::backdrop::{Backdrop, FieldView};
-use crate::render::{Camera, Vertex};
+use crate::backdrop::FieldView;
+use crate::render::Camera;
 use fmv_core::{AnimState, Pos};
 use fmv_ff7::model::model_to_field;
 use std::collections::HashMap;
@@ -86,39 +87,36 @@ pub struct AvatarFrame {
     pub models: Vec<SkinnedModel>,
     /// The camera's focal length ([`super::stage::StageCamera::zoom`]).
     pub zoom: f32,
-    /// Camera-space depth range of every skinned vertex, padded: the depth buffer covers exactly
-    /// this, which keeps its resolution fine whatever the field's size.
-    pub near: f32,
-    pub far: f32,
     /// Depth bias of the face overlays, in camera-space units.
     pub overlay_bias: f32,
-    /// Marks on the ground, under the models.
+    /// Marks on the ground, under the models (each at the depth of its feet).
     pub ground: Vec<GroundShape>,
-    /// Scenery drawn over the models (layers 2 and 4), if the field has some.
-    pub front: Option<Arc<Backdrop>>,
+    /// The field's picture as depth-tested tiles, if it has something in front of the characters:
+    /// drawn instead of the flat picture, around the models (see [`super::scenery`]).
+    pub scenery: Option<Arc<Scenery>>,
 }
 
 impl std::fmt::Debug for AvatarFrame {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AvatarFrame")
             .field("models", &self.models.len())
-            .field("depth", &(self.near, self.far))
             .field("ground", &self.ground.len())
-            .field("front", &self.front.is_some())
+            .field("scenery", &self.scenery.is_some())
             .finish()
     }
 }
 
 impl AvatarFrame {
-    /// The ground marks as flat-colour vertices for a `vw` x `vh` window fitted by `cam`.
-    pub fn ground_vertices(&self, cam: &Camera, vw: u32, vh: u32, srgb: bool) -> Vec<Vertex> {
+    /// The ground marks as flat-colour vertices (with their depth) for a `vw` x `vh` window fitted
+    /// by `cam`.
+    pub fn ground_vertices(&self, cam: &Camera, vw: u32, vh: u32, srgb: bool) -> Vec<GroundVertex> {
         ground::vertices(&self.ground, cam, vw, vh, srgb)
     }
 
-    /// Nothing to draw at all (no models, no front layer).
+    /// Nothing to draw at all (no models, no scenery).
     #[cfg(test)]
     pub fn is_empty(&self) -> bool {
-        self.models.is_empty() && self.front.is_none()
+        self.models.is_empty() && self.scenery.is_none()
     }
 }
 
@@ -174,14 +172,14 @@ pub fn skin(asset: &AvatarAsset, pose: &[[f32; 16]], place: &[f32; 16], camera: 
     out.len() == mesh.positions.len() && out.iter().flatten().all(|c| c.is_finite())
 }
 
-/// The ground marks of one player: a soft shadow, the tint ring, and for the local player a white
-/// outline and for a party member a gold ring around it all.
-fn ground_marks(view: &FieldView, player: &AvatarPlayer<'_>, stand_in: bool, scale: f32) -> Vec<GroundShape> {
+/// The ground marks of one player (`depth`: the camera depth of its feet): a soft shadow, the tint
+/// ring, and for the local player a white outline and for a party member a gold ring around it all.
+fn ground_marks(view: &FieldView, player: &AvatarPlayer<'_>, stand_in: bool, scale: f32, depth: f32) -> Vec<GroundShape> {
     let to_view = |p: Pos| view.to_view(p);
     let circle = |k: f32| ground::circle(&to_view, player.pos, RING_RADIUS_UNITS * scale * k);
     let mut marks = Vec::new();
     if let Some(shadow) = circle(0.95) {
-        marks.push(GroundShape::disc(shadow, [0, 0, 0], 0.30));
+        marks.push(GroundShape::disc(shadow, [0, 0, 0], 0.30, depth));
     }
     // A non-player character is scenery: a shadow, and none of the rings that tell players apart.
     if player.npc.is_some() {
@@ -190,16 +188,16 @@ fn ground_marks(view: &FieldView, player: &AvatarPlayer<'_>, stand_in: bool, sca
     // A stand-in (the player's own look is unknown here) leans on the tint more: a stronger ring.
     let tint_alpha = if stand_in { 1.0 } else { 0.85 };
     if let (Some(outer), Some(inner)) = (circle(1.0), circle(0.78)) {
-        marks.push(GroundShape::band(outer, inner, player.tint, tint_alpha));
+        marks.push(GroundShape::band(outer, inner, player.tint, tint_alpha, depth));
     }
     if player.own {
         if let (Some(outer), Some(inner)) = (circle(1.15), circle(1.0)) {
-            marks.push(GroundShape::band(outer, inner, WHITE, 1.0));
+            marks.push(GroundShape::band(outer, inner, WHITE, 1.0, depth));
         }
     }
     if player.party {
         if let (Some(outer), Some(inner)) = (circle(1.42), circle(1.26)) {
-            marks.push(GroundShape::band(outer, inner, GOLD, 1.0));
+            marks.push(GroundShape::band(outer, inner, GOLD, 1.0, depth));
         }
     }
     marks
@@ -273,8 +271,7 @@ impl Avatars {
         let mut ground_marks_by_player: Vec<(usize, Vec<GroundShape>)> = Vec::new();
         let mut markers: Vec<usize> = Vec::new();
         let mut anchors = HashMap::new();
-        let (mut near, mut far) = (f32::INFINITY, f32::NEG_INFINITY);
-        for (rank, &(i, _)) in order.iter().enumerate() {
+        for (rank, &(i, feet_depth)) in order.iter().enumerate() {
             let Some(p) = players.get(i) else { continue };
             if rank >= MAX_MODELS {
                 markers.push(i);
@@ -305,15 +302,11 @@ impl Avatars {
                 markers.push(i);
                 continue;
             }
-            for v in &positions {
-                near = near.min(v[2]);
-                far = far.max(v[2]);
-            }
             let head = Pos::new(p.pos.x, p.pos.y, p.pos.z + asset.height_units * scale);
             if let Some(anchor) = view.to_view(head).or_else(|| view.to_view(p.pos)) {
                 anchors.insert(p.who, anchor);
             }
-            ground_marks_by_player.push((i, ground_marks(view, p, stand_in, scale)));
+            ground_marks_by_player.push((i, ground_marks(view, p, stand_in, scale, feet_depth as f32)));
             models.push(SkinnedModel { asset, positions });
         }
 
@@ -321,22 +314,14 @@ impl Avatars {
         ground_marks_by_player.sort_by_key(|(i, _)| std::cmp::Reverse(order.iter().position(|(j, _)| j == i)));
         let ground: Vec<GroundShape> = ground_marks_by_player.into_iter().flat_map(|(_, marks)| marks).collect();
 
-        let (near, far) = if near.is_finite() && far.is_finite() {
-            let pad = ((far - near) * 0.1).max(1.0);
-            ((near - pad).max(0.5), far + pad)
-        } else {
-            (1.0, 2.0)
-        };
         markers.sort_unstable();
         Built {
             frame: AvatarFrame {
                 models,
                 zoom: stage.camera.zoom as f32,
-                near,
-                far,
                 overlay_bias: OVERLAY_BIAS_MODEL_UNITS * scale,
                 ground,
-                front: stage.front.clone(),
+                scenery: stage.scenery.clone(),
             },
             markers,
             anchors,
@@ -369,7 +354,7 @@ pub(crate) mod tests {
             model_scale: 4.0,
             walk_speed: 60.0,
             run_speed: 240.0,
-            front: None,
+            scenery: None,
         }
     }
 
@@ -460,10 +445,10 @@ pub(crate) mod tests {
         assert!(bottom.abs() < 3.0, "feet at {bottom}, the position projects to 0");
         // ...and the head is 30 model units = 120 field units up: about 36 screen units here.
         assert!(top < -30.0 && top > -45.0, "head at {top}");
-        // The whole figure is in front of the camera plane, inside the depth range of the frame.
+        // The whole figure is in front of the camera plane, between the depth mapping's planes (so
+        // the buffer tells its parts apart).
         assert!(m.positions.iter().all(|v| v[2] > 1.0));
-        assert!(built.frame.near < built.frame.far && built.frame.near >= 0.5);
-        assert!(m.positions.iter().all(|v| v[2] >= built.frame.near && v[2] <= built.frame.far));
+        assert!(m.positions.iter().all(|v| v[2] > crate::avatar::scenery::DEPTH_NEAR && v[2] < crate::avatar::scenery::DEPTH_FAR));
         // Moving the entity moves the figure with it, whole.
         let moved = avatars.frame(&view, &stage, &[player(1, Pos::new(200.0, 0.0, 0.0), 0.0, AnimState::Idle)], 0.0);
         let xs = |m: &SkinnedModel| m.positions.iter().map(|&v| screen(v, 400.0).0).sum::<f64>() / m.positions.len() as f64;
@@ -574,6 +559,13 @@ pub(crate) mod tests {
         // Shadow + tint ring.
         assert_eq!(plain.len(), 2);
         assert_eq!(plain[1].rgb, remote.tint);
+        // Every mark carries the camera depth of the feet it lies around (the depth test's value:
+        // a tile nearer than the feet hides the marks, as it hides the character).
+        let feet = stage.camera.project([0.0, 0.0, 0.0]).unwrap()[2] as f32;
+        assert!(feet > 1000.0 && plain.iter().all(|m| (m.depth - feet).abs() < 1e-3), "{feet} {:?}", plain.iter().map(|m| m.depth).collect::<Vec<_>>());
+        // (and a nearer player's marks are nearer)
+        let nearer = avatars.frame(&view, &stage, &[player(2, Pos::new(0.0, -200.0, 0.0), 0.0, AnimState::Idle)], 0.0).frame.ground;
+        assert!(nearer.iter().all(|m| m.depth < feet - 100.0));
         remote.party = true;
         let party = avatars.frame(&view, &stage, &[remote], 0.0).frame.ground;
         assert_eq!(party.len(), 3);
@@ -722,11 +714,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn an_empty_frame_has_a_sane_depth_range() {
+    fn an_empty_frame_draws_nothing() {
         let (mut avatars, _) = avatars(vec![]);
         let built = avatars.frame(&view(), &stage(), &[], 0.0);
         assert!(built.frame.is_empty() && built.markers.is_empty() && built.anchors.is_empty());
-        assert!(built.frame.near < built.frame.far);
         assert!(format!("{:?}", built.frame).contains("models"));
         let _ = built.frame.ground_vertices(&Camera::fit(&Bounds { min: Pos::default(), max: Pos::new(1.0, 1.0, 0.0) }, 10.0, 10.0, 0.0), 10, 10, false);
     }

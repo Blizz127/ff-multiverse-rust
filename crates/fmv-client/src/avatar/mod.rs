@@ -23,41 +23,81 @@
 //! * [`library`]: each appearance loaded once, merged ([`mesh`]) and cached by the table's own id;
 //!   the non-player models by the stems the area names.
 //! * [`anim`]: which clip an avatar plays (idle, walk, run) and its phase in it.
-//! * [`stage`]: the field facts models need (camera, model scale, speeds, the scenery in front).
+//! * [`stage`]: the field facts models need (camera, model scale, speeds, the depth-tested scenery).
 //! * [`frame`]: pose, place and skin the visible players into camera space, plus the ground marks
 //!   and the name-label anchors: a pure CPU step, unit-tested without a GPU.
 //! * [`ground`]: the shadow and rings under the players.
-//! * [`gpu`]: upload once per character, depth-tested drawing through the field camera, and the
-//!   scenery in front of the models.
+//! * [`scenery`]: the field's picture as depth-tested tiles (atlas, quads, blend runs, the depth
+//!   mapping every depth test of a frame shares), built once per field.
+//! * [`gpu`]: upload once per character, depth-tested drawing through the field camera, the marks on
+//!   the ground, and the passes of a frame; [`scenery_gpu`]: the tile pipelines.
 //!
 //! # Layers
 //!
-//! The picture is drawn first as one image (all background layers, as before), then the models
-//! with a depth buffer, then the *front* half of the scenery (layers 2 and 4) over them with alpha,
-//! so a character walking behind a pillar is hidden by it. The back half is never shown on its own
-//! (it is not a finished picture: it holds key-colour pixels that the front half covers). When the
-//! front layers hold blended tiles, which a flat image cannot reproduce, the models are drawn over
-//! the whole picture and nothing goes over them (see [`stage::Stage::front`]).
+//! The PC engine does not paste characters onto a finished picture: every background tile is a quad
+//! with a depth, in the same z-buffered pass as the models, and a character is hidden by exactly the
+//! tiles that are nearer to the camera than it is. A layer-2 tile's depth is `4 * id` in camera-space
+//! units (the unit of the camera depth the models are skinned to), layer 4 is in front of everything,
+//! layers 1 and 3 are far behind it; this is `fmv_ff7::background::depth`'s rule, derived there from
+//! the engine's own stored values and the walkmesh, and verified on all 702 owned fields.
+//!
+//! In window mode on a field with something in front of the characters (any tile of layer 2 or 4) the
+//! picture is therefore drawn **tile by tile** ([`scenery`]), in this order:
+//!
+//! 1. the picture's opaque tiles, depth written, over a black base (pixels no tile touches are black,
+//!    as in the game);
+//! 2. the walkmesh overlay (F1) and the markers of players without a model;
+//! 3. the marks on the ground, depth tested at the depth of the feet (so they are hidden when the
+//!    character is, and not when only something farther overlaps them);
+//! 4. the models, depth tested against the tiles;
+//! 5. the picture's blended tiles (glows, shadows, glass; any of the four PlayStation modes), over
+//!    the models, depth tested but not written, in paint order.
+//!
+//! Every depth of the frame goes through one fixed mapping, the engine's own perspective z (near 50,
+//! far 32 000); see [`scenery`] for why a mapping fitted to the models would be wrong. At one window
+//! pixel per picture pixel the tile picture is the flat picture bit for bit (a test checks it on
+//! `md1stin` and `md1_1`); a field with nothing in front, or a frame without models, still draws the
+//! flat picture as before.
 //!
 //! # Known limits
 //!
-//! * **The front half is one flat image.** The game depth-sorts layer-2 tiles against each
-//!   character through the tile `id`; this does not interpret it (`fmv_ff7` documents the mapping
-//!   as unverified, and measured on the owned data it is not a simple function of camera depth:
-//!   in `md1_1` the ids rise as objects get nearer, in `mds7st1` as they get farther, and
-//!   `md1stin`'s layer 2 has only six distinct ids). So wherever the front layer is opaque it is
-//!   drawn over a character, even one the game draws in front of that object. How far this
-//!   reaches in `md1stin` (`offscreen_real_ff7_avatars_in_the_field` prints it): of 73 sampled
-//!   walkable places where a character is a good size (camera depth 450 to 1300), the layer
-//!   overlaps the character's bounding box at 59 and leaves 14 clear; the objects behind that are
-//!   (layer, id) `(2, 544)` (the far left wall piece) at 23 places, `(2, 152)` and `(2, 294)` (posts
-//!   near the track) at 14 each, `(2, 1)` (the train) at 7, `(2, 4088)` at 1. The train and the
-//!   posts plausibly are in front of much of the walkable area; the left wall piece most likely
-//!   is not (the floor under its lower edge is 1 404 units from the camera, as far as the
-//!   deepest walkable place), so it probably hides the heads of characters standing before it
-//!   (`54-avatars-front-layer-over-character.png` shows such a case). The next step is a depth per object
-//!   (calibrated against the real engine, which this machine cannot run), drawn as quads in the
-//!   model pass so the depth buffer decides.
+//! * **The depth rule is verified; its inputs are approximate.** Measured on the owned data
+//!   (`md1stin`, offscreen, Cloud facing the camera; the numbers of `shots/depth.rs`, agreeing with
+//!   the software composites of `fmv-ff7`'s `examples/depth_composite.rs` to within two pixels at each
+//!   spot and to 0.2% over all of them): at the place where the old flat front layer hid 1 296 of Cloud's 3 304
+//!   pixels (39%) behind the far left wall piece (layer 2, id 544) although he is nearer than it, he
+//!   is now fully visible; behind that wall piece he is hidden (149 of 149 pixels on walkmesh triangle
+//!   38) or partly hidden (63 of 145 on triangle 36); behind the posts (ids 152 and 294) 27% and 25%;
+//!   behind the train 85%. Over the 73 walkable places where a character is a good size (camera depth
+//!   450 to 1 300), where the flat layer hid 44 784 of his 67 450 pixels, the depth rule hides 15 605
+//!   (35%). This replaces the earlier note that the id could not be interpreted (the flat layer's
+//!   overlap with a character's outline box at 59 of the 73 places was the flat layer's reach, not
+//!   what the game hides).
+//!   What is still approximate: depth is **per tile**, a plane at `4 * id`, so an object that extends
+//!   in depth under one id (a long wall, the train) hides a character as if it stood at one depth (the
+//!   floor at the foot of the layer-2 objects measured 0.89 to 1.20 times `4 * id`, median 1.01, 83.6%
+//!   of 4 015 objects within 0.8 to 1.25); and the engine's own tile depth carries the rounding of its
+//!   fixed-point camera, a few units (the stored value of `md1stin` fits `4 * id - 4.6`), which is
+//!   not applied.
+//! * Fields with several camera records are drawn through camera 0, like the rest of the crate; the
+//!   animation groups are the static ones (script state is not evaluated); the picture's blended
+//!   tiles are drawn after all the opaque tiles and the models, so a blended tile that shares its id
+//!   with an opaque tile that the file paints after it blends over it (the flat picture would
+//!   not); on an sRGB target the blend unit blends in linear space, not in the game's byte
+//!   arithmetic (the window prefers a non-sRGB surface, where they agree to rounding; the glows are
+//!   added after the filter instead of before it, so a few saturated lamp cores are brighter than in
+//!   the flat picture).
+//! * Tiles are filtered (the picture is shown at any window size) and cut at half alpha, so a silhouette
+//!   is hard-edged rather than blended with what is behind it; the texels a nearer tile covers
+//!   carry its colour so that no key-colour green runs round an object (`md1stin`'s back layer
+//!   holds 6 277 such pixels). At other window sizes the tile picture differs from the flat one by
+//!   more than 24 levels at 0.03 to 0.04% of the pixels of `md1stin` (1100x680 and 1920x1080), along
+//!   silhouettes.
+//! * The marks on the ground (shadow, rings) are tested at one depth, the feet's, for the whole mark
+//!   (about 30 units across); the markers of players and non-player characters that have no model
+//!   are drawn over the scenery without a depth test (they are a fallback, not a picture); and the
+//!   name label of a character that is hidden behind the scenery is still drawn over it (labels are
+//!   the UI overlay, placed over the head's position, with no notion of what hides it).
 //! * Model size and the walk/run speeds are the `fmv_ff7` measurements (see its docs): hypotheses
 //!   that agree with each other and with the art, not read from the game.
 //! * Models are lit by their vertex colours only, as `fmv_ff7` documents; the field's own light
@@ -73,6 +113,8 @@ pub mod gpu;
 pub mod ground;
 pub mod library;
 pub mod mesh;
+pub mod scenery;
+pub mod scenery_gpu;
 pub mod source;
 pub mod stage;
 
