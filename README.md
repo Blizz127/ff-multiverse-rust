@@ -248,6 +248,14 @@ stored, because an account's progression blob is also its story phase. A server 
 battle data (the FIXTURE one, or `--ff7-flevel`) refuses every battle request cleanly.
 `scripts/battle-smoke.sh` runs two bots through one real battle on `md1stin`.
 
+`md1stin`'s own encounter table (section 6 of the field file, Steam PC build): the first of its
+two 24-byte tables is the enabled one, with rate 128 (a roll succeeds with probability 128/1024)
+and three formations whose weights add up to 64: 301 (weight 24, two enemies), 302 (22, one enemy)
+and 303 (18, two enemies); the second table is disabled. The server reads every field's table the
+same way (checked over all 702 fields of that build: every enabled table's weights add up to 64
+and every formation exists in `scene.bin`). A starting party wins 301 and 303 every time (200 of
+200 seeded runs each, both members attacking), which is why the smoke script uses 301.
+
 **Protocol v3** (`fmv-protocol`) carries all of the above; its module docs describe the flow,
 and golden JSON tests pin the wire format (the engine's own event, command and outcome types
 included). A client or server of another protocol version is refused with a clear message.

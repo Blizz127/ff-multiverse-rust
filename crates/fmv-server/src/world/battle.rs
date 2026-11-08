@@ -41,6 +41,12 @@
 //! counter, only a rate knob over the same table. By default a step is the area's `max_speed`
 //! (one roll per second of walking at full speed, so the table's rate 128 means roughly one battle
 //! per eight seconds of full-speed walking); `random_encounters: false` switches the rolls off.
+//!
+//! The server's own default field, `md1stin` (section 6 of the field file, Steam PC build): the
+//! first of its two 24-byte tables is the enabled one, rate 128, with formations 301 (weight 24,
+//! two enemies), 302 (22, one enemy) and 303 (18, two enemies), weights adding up to 64; the second
+//! table is disabled. A starting party (levels from the kernel's own initial values) wins 301 and
+//! 303 every time, which is why `scripts/battle-smoke.sh` fights 301.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
