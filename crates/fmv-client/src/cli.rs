@@ -106,9 +106,11 @@ WINDOW CONTROLS:
   markers, your party in the top right corner, the area name and the connection status; a FIXTURE
   area is labelled \"FIXTURE (synthetic, not FF7)\". The window title shows your party size and a
   pending invite; party members are drawn with a gold ring. B asks the server for a debug battle
-  (refused unless it runs with --debug-encounters). In a battle the window shows enemy and party
-  bars (HP, ATB gauge; a yellow border means that character can act) and Space or Enter attacks the
-  first living enemy with your character.";
+  (refused unless it runs with --debug-encounters). A battle is drawn as a 3D scene with FF7-style
+  windows: the enemy list, your party's HP, MP and ATB gauges, and on your turn a command menu
+  (Attack, Magic, Item, Defend). In a battle the arrows (or WASD) move the menu and the target
+  pointer, Space or Enter selects, Backspace or Esc goes back (Esc never quits in a battle).
+  FMV_BATTLE_FLAT=1 draws the battle without the 3D scene.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum BotKind {
