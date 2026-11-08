@@ -13,8 +13,8 @@ use std::time::Duration;
 use fmv_core::AreaId;
 use fmv_fixture::{FixtureAdapter, FIXTURE_AREA_KEY};
 use fmv_adapter_api::GameAdapter;
-use fmv_protocol::{read_msg, write_msg, Auth, ClientMsg, Secret, ServerMsg, PROTOCOL_VERSION};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader, Lines};
+use fmv_protocol::{read_msg, write_msg, Auth, ClientMsg, RejectCode, Secret, ServerMsg, PROTOCOL_VERSION};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::TcpStream;
 use tokio::process::{Child, ChildStdout, Command};
 use tokio::task::JoinHandle;
@@ -148,8 +148,9 @@ async fn ready_serve_and_stop_on(signal: &str) {
     assert!(status.success());
     loop {
         match timeout(Duration::from_secs(10), read_msg::<_, ServerMsg>(&mut client)).await.expect("shutdown notice in time") {
-            Ok(ServerMsg::Reject { reason }) => {
+            Ok(ServerMsg::Reject { reason, code }) => {
                 assert_eq!(reason, "server shutting down", "SIG{signal}");
+                assert_eq!(code, RejectCode::ShuttingDown, "SIG{signal}");
                 break;
             }
             Ok(_) => continue,
@@ -187,7 +188,7 @@ async fn a_fixture_server_with_debug_encounters_warns_and_refuses_battle_request
     let rejected = loop {
         match timeout(Duration::from_secs(10), read_msg::<_, ServerMsg>(&mut client)).await.expect("an answer in time") {
             Ok(ServerMsg::BattleRejected { battle_id, reason }) => break (battle_id, reason),
-            Ok(ServerMsg::Reject { reason }) => panic!("the session was ended instead of the request refused: {reason}"),
+            Ok(ServerMsg::Reject { reason, .. }) => panic!("the session was ended instead of the request refused: {reason}"),
             Ok(_) => continue,
             Err(e) => panic!("connection ended: {e}"),
         }
@@ -253,7 +254,10 @@ async fn accounts_persist_across_processes_and_the_state_directory_is_locked() {
     }
     // The name is still taken.
     let (_c, refused) = hello(second.addr, Auth::Register { display_name: "persisted".into() }).await;
-    assert!(matches!(refused, ServerMsg::Reject { ref reason } if reason.contains("already taken")), "{refused:?}");
+    assert!(
+        matches!(refused, ServerMsg::Reject { ref reason, code: RejectCode::NameTaken } if reason.contains("already taken")),
+        "{refused:?}"
+    );
     let (status, log) = second.stop("TERM").await;
     assert_eq!(status.code(), Some(0), "{log}");
 
@@ -261,9 +265,48 @@ async fn accounts_persist_across_processes_and_the_state_directory_is_locked() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(state.join("index.json")).expect("index.json").permissions().mode() & 0o777;
-        assert_eq!(mode & 0o077, 0, "state files must not be group/other accessible (mode {mode:o})");
+        for file in ["index.json", "index.log"] {
+            let mode = std::fs::metadata(state.join(file)).unwrap_or_else(|e| panic!("{file}: {e}")).permissions().mode() & 0o777;
+            assert_eq!(mode & 0o077, 0, "{file}: state files must not be group/other accessible (mode {mode:o})");
+        }
     }
+}
+
+/// A flood of junk connections must not be a flood of log lines: each one used to write an INFO line
+/// ("closing connection"), which fills a disk under a sustained flood. Past a small budget the lines
+/// go to the debug level, and ONE line says so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_flood_of_junk_connections_cannot_fill_the_log() {
+    let env_state = tempfile::tempdir().expect("tempdir");
+    let server = start(&["--ephemeral"], env_state.path()).await;
+    let junk = 300;
+    let flood_started = std::time::Instant::now();
+    for _ in 0..junk {
+        let mut socket = TcpStream::connect(server.addr).await.expect("connect");
+        // A frame that is not a message: refused as malformed. The client hangs up as soon as it has
+        // the answer, so the server does not wait around for it.
+        let garbage = b"this is not json";
+        let mut frame = u32::try_from(garbage.len()).expect("small").to_le_bytes().to_vec();
+        frame.extend_from_slice(garbage);
+        socket.write_all(&frame).await.expect("send");
+        let answer = timeout(Duration::from_secs(10), read_msg::<_, ServerMsg>(&mut socket)).await.expect("an answer in time");
+        assert!(matches!(answer, Ok(ServerMsg::Reject { code: RejectCode::BadRequest, .. })), "{answer:?}");
+    }
+    // The budget renews every 10 s: a slow machine may cross a window boundary once or twice.
+    let windows = flood_started.elapsed().as_secs() / 10 + 2;
+    // The server is still fine afterwards: a real client registers.
+    let (_client, welcome) = hello(server.addr, Auth::Register { display_name: "AfterTheFlood".into() }).await;
+    assert!(matches!(welcome, ServerMsg::Welcome { .. }), "{welcome:?}");
+
+    let (status, log) = server.stop("TERM").await;
+    assert_eq!(status.code(), Some(0), "{log}");
+    let written = log.lines().filter(|l| l.contains("closing connection")).count() as u64;
+    // All the junk came from one address: its small per-address budget per window, then a notice.
+    assert!(written >= 1, "the first few are still logged:\n{log}");
+    assert!(written <= 4 * windows, "{written} 'closing connection' lines for {junk} junk connections:\n{log}");
+    let notices = log.lines().filter(|l| l.contains("being logged less")).count() as u64;
+    assert!((1..=windows).contains(&notices), "one line per window says that lines are held back ({notices}):\n{log}");
+    assert!(log.lines().count() < 60, "the whole log of the run stays small:\n{log}");
 }
 
 /// Run the server with arguments that must make it fail at startup, hermetically: the dev-port

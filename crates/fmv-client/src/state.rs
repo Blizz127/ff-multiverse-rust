@@ -361,7 +361,9 @@ impl ClientState {
                     self.area
                 ));
             }
-            ServerMsg::Reject { reason } => {
+            // The server's own sentence, cleaned, is all the player is told: nothing here decides
+            // anything from the words, and the code has no use yet for a session that is over.
+            ServerMsg::Reject { reason, code: _ } => {
                 return Some(format!("server ended the session: {}", crate::net::clean(&reason)));
             }
             // `Welcome` and `Pong` carry nothing the game state needs after the handshake.
@@ -444,6 +446,7 @@ mod tests {
     use fmv_adapter_api::{AreaInfo, Bounds, GameAdapter};
     use fmv_core::{Fingerprint, GameId};
     use fmv_fixture::{FixtureAdapter, FIXTURE_AREA_KEY};
+    use fmv_protocol::RejectCode;
     use std::f32::consts::PI;
 
     fn snap(id: u64, x: f32, y: f32) -> EntitySnapshot {
@@ -741,13 +744,14 @@ mod tests {
     #[test]
     fn reject_ends_the_session() {
         let mut s = state(Pos::default());
-        let r = s.apply(
-            0.0,
-            ServerMsg::Reject {
-                reason: "server full".into(),
-            },
-        );
-        assert!(r.unwrap().contains("server full"));
+        let r = s.apply(0.0, ServerMsg::reject(RejectCode::ServerFull, "server full"));
+        assert_eq!(r.as_deref(), Some("server ended the session: server full"));
+        // Whatever the code, the session ends and the player is told the server's own words.
+        for code in RejectCode::ALL {
+            let mut s = state(Pos::default());
+            let r = s.apply(0.0, ServerMsg::reject(code, "gone\u{1b}[0m for now"));
+            assert_eq!(r.as_deref(), Some("server ended the session: gone[0m for now"), "{code:?}");
+        }
     }
 
     #[test]

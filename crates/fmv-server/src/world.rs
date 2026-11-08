@@ -67,8 +67,8 @@ use fmv_party::{InstanceSelector, Invite, PartyConfig, PartyEvent, PartyManager,
 use fmv_protocol::{BattleId, PartyName, ServerMsg};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, watch};
-use tracing::{debug, warn};
 
+use crate::deferred::{DeferredLogs, Line};
 use crate::ServerError;
 
 mod battle;
@@ -235,6 +235,8 @@ pub struct World {
     epoch: Instant,
     /// Battle support (`None`: this server cannot run battles). See `battle`.
     battle: Option<battle::BattleWorld>,
+    /// Log lines recorded under the world lock, written after it is released (see `take_logs`).
+    logs: DeferredLogs,
 }
 
 impl World {
@@ -268,7 +270,31 @@ impl World {
             parties: PartyManager::new(party),
             epoch: Instant::now(),
             battle: None,
+            logs: DeferredLogs::default(),
         })
+    }
+
+    /// The log lines recorded while the world lock was held since the last call. Code in the
+    /// world never logs directly (a blocked log sink under the lock would stop every connection):
+    /// it records through `self.logs` and `deferred::with_locked` writes the lines once the lock
+    /// is released.
+    pub(crate) fn take_logs(&mut self) -> Vec<Line> {
+        self.logs.take()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn defer_warn(&mut self, text: &str) {
+        self.logs.warn(text.to_string());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn defer_info(&mut self, text: &str) {
+        self.logs.info(text.to_string());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn defer_debug(&mut self, text: &str) {
+        self.logs.debug(text.to_string());
     }
 
     pub fn current_tick(&self) -> u64 {
@@ -460,9 +486,9 @@ impl World {
         while let Some((id, queue_full)) = failed.pop() {
             let Some(p) = self.remove_player(id, &mut failed) else { continue };
             if queue_full {
-                warn!(entity = id.0, session = p.session.0, "outbound queue full; disconnecting slow client");
+                self.logs.warn(format!("outbound queue full; disconnecting slow client entity={} session={}", id.0, p.session.0));
             } else {
-                debug!(entity = id.0, session = p.session.0, "outbound queue closed; removing player");
+                self.logs.debug(format!("outbound queue closed; removing player entity={} session={}", id.0, p.session.0));
             }
             p.close.send_replace(true);
         }
@@ -544,7 +570,7 @@ impl World {
             let placement = match InstanceSelector::select(&self.area_id, account, party.as_ref(), &phases) {
                 Ok(placement) => placement,
                 Err(e) => {
-                    warn!(account = account.0, error = %e, "cannot compute a placement");
+                    self.logs.warn(format!("cannot compute a placement account={} error={e}", account.0));
                     continue;
                 }
             };
@@ -572,7 +598,7 @@ impl World {
         if self.parties.party_of(account).is_some() {
             match self.parties.leave(account) {
                 Ok(e) => events.extend(e),
-                Err(e) => warn!(account = account.0, error = %e, "party leave failed while removing a player"),
+                Err(e) => self.logs.warn(format!("party leave failed while removing a player account={} error={e}", account.0)),
             }
         }
         for invite in pending {
@@ -583,7 +609,7 @@ impl World {
             let acting_as = if invite.to == account { account } else { invite.to };
             match self.parties.decline(invite.id, acting_as) {
                 Ok(e) => events.extend(e),
-                Err(e) => warn!(invite = invite.id.0, error = %e, "cannot withdraw an invite while removing a player"),
+                Err(e) => self.logs.warn(format!("cannot withdraw an invite while removing a player invite={} error={e}", invite.id.0)),
             }
         }
         let name = gone.snapshot.avatar.display_name.clone();
@@ -596,7 +622,7 @@ impl World {
         let events = match self.parties.expire(clock) {
             Ok(events) => events,
             Err(e) => {
-                warn!(error = %e, "party expiry failed");
+                self.logs.warn(format!("party expiry failed error={e}"));
                 return;
             }
         };

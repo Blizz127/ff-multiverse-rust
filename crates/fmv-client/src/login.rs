@@ -5,10 +5,7 @@
 
 use crate::accounts::{AccountsError, SavedAccount, TokenStore};
 use crate::net::{clean, NetError, TokenSink};
-use fmv_protocol::{Auth, Secret};
-
-/// What the server answers a token it does not know (a reset account database, a mistyped token).
-pub const STALE_TOKEN_REJECT: &str = "invalid or unknown token";
+use fmv_protocol::{Auth, RejectCode, Secret};
 
 /// How this run authenticates.
 #[derive(Debug)]
@@ -114,21 +111,22 @@ pub fn registration_sink(store: TokenStore, server: String, name: String, replac
 }
 
 /// The explanation for a server that refuses the saved token, if that is what `error` is: the
-/// saved token was rejected, so either the server's accounts were reset (delete the file, or
-/// register again with `--register`) or it is the wrong server. `None` for every other failure.
+/// server answered the saved token with [`RejectCode::InvalidToken`], so either its accounts were
+/// reset (delete the file, or register again with `--register`) or it is the wrong server. The
+/// code alone decides: the server's own sentence is only quoted back, never matched. `None` for
+/// every other failure and for a registration (there is no saved token to blame).
 pub fn stale_token_help(error: &NetError, plan: &LoginPlan) -> Option<String> {
-    let (NetError::Rejected(reason), LoginPlan::Token(account)) = (error, plan) else {
+    let (NetError::Rejected { code: RejectCode::InvalidToken, reason }, LoginPlan::Token(account)) = (error, plan) else {
         return None;
     };
-    (reason == STALE_TOKEN_REJECT).then(|| {
-        let path = account.path.display();
-        format!(
-            "the server rejected the token saved for `{}` in {path} (\"{STALE_TOKEN_REJECT}\"). If the server's accounts \
-             were reset, delete that file to start over, or pass --register together with --name to create a new account \
-             (that replaces the saved token for the name)",
-            clean(&account.name)
-        )
-    })
+    let path = account.path.display();
+    Some(format!(
+        "the server rejected the token saved for `{}` in {path} (\"{}\"). If the server's accounts \
+         were reset, delete that file to start over, or pass --register together with --name to create a new account \
+         (that replaces the saved token for the name)",
+        clean(&account.name),
+        clean(reason)
+    ))
 }
 
 #[cfg(test)]
@@ -292,19 +290,33 @@ mod tests {
         let path = save(&s, "Cloud", "fmvt_stale_secret");
         let LoginPlan::Token(a) = plan(&s, None, false).unwrap() else { panic!("saved") };
         let token_plan = LoginPlan::Token(a);
-        let stale = NetError::Rejected(STALE_TOKEN_REJECT.to_string());
+        let rejected = |code, reason: &str| NetError::Rejected { code, reason: reason.to_string() };
+        let stale = rejected(RejectCode::InvalidToken, "invalid or unknown token");
         let help = stale_token_help(&stale, &token_plan).expect("help for a stale token");
         assert!(help.contains(&path.display().to_string()), "it names the token file: {help}");
         assert!(help.contains("--register") && help.contains("--name") && help.contains("delete that file"), "{help}");
         assert!(help.contains("`Cloud`") && help.contains("rejected"), "{help}");
+        assert!(help.contains("\"invalid or unknown token\""), "it quotes the server's own words: {help}");
         assert!(!help.contains("fmvt_stale_secret"), "the token is never printed: {help}");
         assert!(!help.contains('\n'));
-        // Only the exact text, only for a saved token.
-        for other in ["server full", "invalid or unknown token!", "Invalid or unknown token", "", "session already open"] {
-            assert_eq!(stale_token_help(&NetError::Rejected(other.to_string()), &token_plan), None, "{other:?}");
+        // The code decides, the words are only quoted: another sentence with the same code
+        // explains just the same, and a stray escape in it never reaches the terminal.
+        let other_words = stale_token_help(&rejected(RejectCode::InvalidToken, "we lost\u{1b}[31m it"), &token_plan);
+        let other_words = other_words.expect("the code is what counts");
+        assert!(other_words.contains("(\"we lost[31m it\")") && !other_words.contains('\u{1b}'), "{other_words}");
+        assert!(!other_words.contains("invalid or unknown token"), "{other_words}");
+        // Every other code gets nothing, even when the sentence is the very one the server uses
+        // for an unknown token: nothing here matches on the words.
+        for code in RejectCode::ALL.into_iter().filter(|code| *code != RejectCode::InvalidToken) {
+            for words in ["invalid or unknown token", "server full", ""] {
+                assert_eq!(stale_token_help(&rejected(code, words), &token_plan), None, "{code:?} {words:?}");
+            }
         }
+        // A registration has no saved token to blame, whatever the code.
         let register = LoginPlan::Register { name: "Cloud".into(), replace: false };
-        assert_eq!(stale_token_help(&stale, &register), None, "a registration has no saved token to blame");
+        for code in RejectCode::ALL {
+            assert_eq!(stale_token_help(&rejected(code, "invalid or unknown token"), &register), None, "{code:?}");
+        }
         assert_eq!(stale_token_help(&NetError::Protocol("x".into()), &token_plan), None);
     }
 }

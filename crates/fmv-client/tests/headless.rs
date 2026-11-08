@@ -8,15 +8,16 @@
 //!
 //! The fake server behaves like the real one where it matters to a client: a registration creates
 //! an account and issues its token exactly once, a token logs in (an unknown one is refused with
-//! "invalid or unknown token"), the player's entity carries the name the SERVER stored, and party
-//! requests are answered reactively with numbered `PartyEvent`s (never on a timer).
+//! the code `InvalidToken` and the words "invalid or unknown token"; a taken name with `NameTaken`),
+//! the player's entity carries the name the SERVER stored, and party requests are answered
+//! reactively with numbered `PartyEvent`s (never on a timer).
 
 use fmv_adapter_api::{GameAdapter, MoveResult};
 use fmv_core::{AccountId, AnimState, AreaId, AvatarAppearance, EntityId, EntitySnapshot, GameId, PhaseKey, Pos, SessionId};
 use fmv_fixture::FixtureAdapter;
 use fmv_protocol::{
     read_msg, write_msg, Auth, ClientMsg, InstanceKey, InviteId, Party, PartyEvent, PartyFailure, PartyId, PartyName, Placement,
-    Secret, ServerMsg, PROTOCOL_VERSION,
+    RejectCode, Secret, ServerMsg, PROTOCOL_VERSION,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -122,13 +123,16 @@ fn issued_token(n: u64, name: &str) -> String {
     format!("fmvt_fake_{n}_{letters}")
 }
 
+/// A refusal is a code (what the client acts on) and a sentence (what it shows).
+type Refusal = (RejectCode, &'static str);
+
 /// What the server makes of a `Hello`: the account, the name it stores, the token it issues.
-fn authenticate(db: &Mutex<Accounts>, auth: &Auth) -> Result<(AccountId, String, Option<Secret>), &'static str> {
+fn authenticate(db: &Mutex<Accounts>, auth: &Auth) -> Result<(AccountId, String, Option<Secret>), Refusal> {
     let mut db = db.lock().expect("accounts lock");
     match auth {
         Auth::Register { display_name } => {
             if db.by_token.values().any(|(_, n)| n.eq_ignore_ascii_case(display_name)) {
-                return Err("display name already taken");
+                return Err((RejectCode::NameTaken, "display name already taken"));
             }
             db.next += 1;
             let (id, token) = (AccountId(db.next), issued_token(db.next, display_name));
@@ -137,7 +141,7 @@ fn authenticate(db: &Mutex<Accounts>, auth: &Auth) -> Result<(AccountId, String,
         }
         Auth::Token(secret) => match db.by_token.get(secret.expose()) {
             Some((id, name)) => Ok((*id, name.clone(), None)),
-            None => Err("invalid or unknown token"),
+            None => Err((RejectCode::InvalidToken, "invalid or unknown token")),
         },
     }
 }
@@ -218,13 +222,13 @@ async fn handle(stream: TcpStream, script: Script, db: Arc<Mutex<Accounts>>) -> 
     report.push(at, hello);
 
     if script.kind == Kind::Reject {
-        let _ = write_msg(&mut wr, &ServerMsg::Reject { reason: "server full".into() }).await;
+        let _ = write_msg(&mut wr, &ServerMsg::reject(RejectCode::ServerFull, "server full")).await;
         return report;
     }
     let (account, name, issued) = match authenticate(&db, &auth) {
         Ok(ok) => ok,
-        Err(reason) => {
-            let _ = write_msg(&mut wr, &ServerMsg::Reject { reason: reason.into() }).await;
+        Err((code, reason)) => {
+            let _ = write_msg(&mut wr, &ServerMsg::reject(code, reason)).await;
             return report;
         }
     };

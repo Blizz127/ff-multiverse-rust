@@ -42,6 +42,23 @@ pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default for `ServerConfig::keepalive` (idle time before the first TCP keepalive probe).
 pub const DEFAULT_KEEPALIVE: Duration = Duration::from_secs(30);
 
+/// Default for `ServerConfig::hello_timeout`. A real client sends `Hello` the moment the connection
+/// is up (it has done all its local work before connecting), so a few seconds is generous even over
+/// a slow link, and a socket that only sits there frees its slot quickly.
+pub const DEFAULT_HELLO_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Default for `ServerConfig::max_connections_per_ip`: a household or a LAN party behind one NAT,
+/// not a farm.
+pub const DEFAULT_MAX_CONNECTIONS_PER_IP: usize = 8;
+
+/// Default for `ServerConfig::registrations_per_ip` (per ten minutes).
+pub const DEFAULT_REGISTRATIONS_PER_IP: u32 = 10;
+
+/// Default for `ServerConfig::inactivity_timeout`: half an hour without any game input. Long
+/// enough for a player who steps away, short enough that a script that only answers pings cannot
+/// keep a slot for the day.
+pub const DEFAULT_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
 /// How a server that can run battles runs them. `None` in [`ServerConfig::battle`] (the FIXTURE
 /// server, or an FF7 server without owned battle data) means battles are unsupported and every
 /// request is refused with `BattleRejection::Unsupported`.
@@ -116,7 +133,14 @@ pub struct ServerConfig {
     pub tick_hz: u32,
     /// Maximum simultaneous connections, handshaking ones included.
     pub max_connections: usize,
-    /// A new connection must send `Hello` within this time.
+    /// Most simultaneous connections ONE address may hold, handshaking ones included
+    /// ([`DEFAULT_MAX_CONNECTIONS_PER_IP`]; an IPv6 /64 counts as one address, an IPv4-mapped
+    /// IPv6 address as its IPv4 address). Beyond it a connection is refused with
+    /// `RejectCode::TooManyConnections` before it takes a slot, so one host cannot fill the server
+    /// with silent sockets or idle accounts. `None` lifts the cap. Players behind one NAT share it.
+    pub max_connections_per_ip: Option<usize>,
+    /// A new connection must send `Hello` within this time ([`DEFAULT_HELLO_TIMEOUT`]). Until it
+    /// does, the connection holds a slot (and a place in its address's share) for nothing.
     pub hello_timeout: Duration,
     /// A greeted connection must answer the area manifest (`JoinArea`/`CannotJoin`) within
     /// this total time.
@@ -129,7 +153,19 @@ pub struct ServerConfig {
     /// avatar of a silent socket or of a peer that vanished without a FIN/RST. Defaults to
     /// [`DEFAULT_IDLE_TIMEOUT`]; `None` disables it (then only `keepalive` and TCP's own
     /// retransmission give-up eventually evict a dead peer).
+    ///
+    /// Silence is only half of "idle": a client that keeps pinging is not silent. See
+    /// [`ServerConfig::inactivity_timeout`] for that half.
     pub idle_timeout: Option<Duration>,
+    /// Drop joined clients that send no GAME INPUT for this long, however often they ping
+    /// (`Reject { code: IdleTimeout, "closed for inactivity ..." }`). Input is anything but a `Ping`
+    /// (a move, a party request, a battle command); the reference client sends a `Ping` every second
+    /// and a move only when it walks. This is the policy for idle-but-pinging sessions: without it
+    /// an account that does nothing but answer pings holds its slot forever, and 64 of them (the
+    /// default `max_connections`, from at least eight addresses given `max_connections_per_ip`)
+    /// would hold the whole server. A player who steps away simply logs in again. Defaults to
+    /// [`DEFAULT_INACTIVITY_TIMEOUT`]; `None` disables it.
+    pub inactivity_timeout: Option<Duration>,
     /// Enable TCP keepalive on accepted sockets, probing after this much idle time (then every
     /// 10 s, giving up after 3 failed probes). A second line of defence against half-open
     /// connections that also works while `idle_timeout` is disabled. `None` leaves the OS
@@ -151,9 +187,21 @@ pub struct ServerConfig {
     pub state_dir: Option<PathBuf>,
     /// Whether `Auth::Register` creates accounts. When false only tokens already issued work.
     pub allow_registration: bool,
+    /// Most accounts the store holds (`fmv_persist::DEFAULT_MAX_ACCOUNTS` by default). A server at the
+    /// limit refuses new registrations with `RejectCode::RegistrationClosed` before any disk work;
+    /// logins and everything else are unaffected, and lowering it below the number of existing
+    /// accounts keeps them all. Registration spam therefore cannot grow the state directory
+    /// without bound.
+    pub max_accounts: u64,
     /// Accounts the whole server creates per minute at most (a sliding window over all
-    /// connections), so a flood of connections cannot fill the store with accounts.
+    /// connections), so a flood of connections cannot fill the store with accounts. Only accounts
+    /// that are actually created count: a registration refused for its name, a name that is taken or
+    /// a peer that vanished costs nobody a place.
     pub registrations_per_minute: u32,
+    /// Accounts one address may create per ten minutes ([`DEFAULT_REGISTRATIONS_PER_IP`]; an IPv6 /64
+    /// counts as one address). Without it one host can use up the whole server's
+    /// `registrations_per_minute` and lock everybody else out of registering. `None` lifts the limit.
+    pub registrations_per_ip: Option<u32>,
     /// Party rules. The party clock is milliseconds of server monotonic time, so
     /// `party.invite_ttl()` is in milliseconds; the default is 3 members and 60 s.
     pub party: PartyConfig,
@@ -181,17 +229,21 @@ impl Default for ServerConfig {
             area_key: FIXTURE_AREA_KEY.to_string(),
             tick_hz: 20,
             max_connections: 64,
-            hello_timeout: Duration::from_secs(10),
+            max_connections_per_ip: Some(DEFAULT_MAX_CONNECTIONS_PER_IP),
+            hello_timeout: DEFAULT_HELLO_TIMEOUT,
             join_timeout: Duration::from_secs(30),
             write_timeout: Duration::from_secs(10),
             idle_timeout: Some(DEFAULT_IDLE_TIMEOUT),
+            inactivity_timeout: Some(DEFAULT_INACTIVITY_TIMEOUT),
             keepalive: Some(DEFAULT_KEEPALIVE),
             max_msgs_per_sec: 120,
             outbound_queue: 256,
             shutdown_grace: Duration::from_secs(5),
             state_dir: None,
             allow_registration: true,
+            max_accounts: fmv_persist::DEFAULT_MAX_ACCOUNTS,
             registrations_per_minute: DEFAULT_REGISTRATIONS_PER_MINUTE,
+            registrations_per_ip: Some(DEFAULT_REGISTRATIONS_PER_IP),
             party: PartyConfig::default(),
             build_suffix: None,
             battle: None,
@@ -213,6 +265,13 @@ impl ServerConfig {
                 "max_connections must be 1..={MAX_CONNECTIONS_LIMIT} (got {})",
                 self.max_connections
             ));
+        }
+        if let Some(n) = self.max_connections_per_ip {
+            if !(1..=MAX_CONNECTIONS_LIMIT).contains(&n) {
+                return bad(format!(
+                    "max_connections_per_ip must be 1..={MAX_CONNECTIONS_LIMIT} (got {n}; use None for no cap)"
+                ));
+            }
         }
         if self.max_msgs_per_sec == 0 {
             return bad("max_msgs_per_sec must be at least 1".into());
@@ -236,6 +295,9 @@ impl ServerConfig {
         if self.idle_timeout.is_some_and(|d| d.is_zero()) {
             return bad("idle_timeout must be non-zero (use None to disable)".into());
         }
+        if self.inactivity_timeout.is_some_and(|d| d.is_zero()) {
+            return bad("inactivity_timeout must be non-zero (use None to disable)".into());
+        }
         // The kernel takes whole seconds and rejects 0, so anything under a second is invalid.
         if self.keepalive.is_some_and(|d| d < Duration::from_secs(1)) {
             return bad("keepalive must be at least one second (use None to disable)".into());
@@ -245,6 +307,16 @@ impl ServerConfig {
                 "registrations_per_minute must be 1..={MAX_REGISTRATIONS_PER_MINUTE} (got {})",
                 self.registrations_per_minute
             ));
+        }
+        if self.max_accounts == 0 {
+            return bad("max_accounts must be at least 1 (use allow_registration = false to close registration)".into());
+        }
+        if let Some(n) = self.registrations_per_ip {
+            if !(1..=MAX_REGISTRATIONS_PER_MINUTE).contains(&n) {
+                return bad(format!(
+                    "registrations_per_ip must be 1..={MAX_REGISTRATIONS_PER_MINUTE} (got {n}; use None for no limit)"
+                ));
+            }
         }
         if let Some(b) = &self.battle {
             if !(1..=1000).contains(&b.ticks_per_second) {
@@ -294,7 +366,8 @@ mod tests {
         assert_eq!(c.tick_hz, 20);
         assert_eq!(c.max_connections, 64);
         assert_eq!(c.area_key, FIXTURE_AREA_KEY);
-        assert_eq!(c.hello_timeout, Duration::from_secs(10));
+        assert_eq!(c.hello_timeout, DEFAULT_HELLO_TIMEOUT);
+        assert_eq!(c.hello_timeout, Duration::from_secs(3));
         // FIXTURE keeps the plain version as its build string.
         assert_eq!(c.build_suffix, None);
         assert_eq!(c.build_string(), crate::SERVER_BUILD);
@@ -303,6 +376,9 @@ mod tests {
         assert_eq!(c.state_dir, None);
         assert!(c.allow_registration);
         assert_eq!(c.registrations_per_minute, DEFAULT_REGISTRATIONS_PER_MINUTE);
+        assert_eq!(c.registrations_per_ip, Some(DEFAULT_REGISTRATIONS_PER_IP));
+        assert_eq!(c.max_connections_per_ip, Some(DEFAULT_MAX_CONNECTIONS_PER_IP));
+        assert_eq!(c.max_accounts, fmv_persist::DEFAULT_MAX_ACCOUNTS);
         assert_eq!((c.party.max_size(), c.party.invite_ttl()), (3, 60_000));
         // Battles: unsupported without battle data, and debug encounters are off.
         assert!(c.battle.is_none());
@@ -382,14 +458,46 @@ mod tests {
             ServerConfig { keepalive: Some(Duration::from_millis(900)), ..ok.clone() },
             ServerConfig { registrations_per_minute: 0, ..ok.clone() },
             ServerConfig { registrations_per_minute: MAX_REGISTRATIONS_PER_MINUTE + 1, ..ok.clone() },
+            ServerConfig { max_accounts: 0, ..ok.clone() },
+            ServerConfig { max_connections_per_ip: Some(0), ..ok.clone() },
+            ServerConfig { max_connections_per_ip: Some(MAX_CONNECTIONS_LIMIT + 1), ..ok.clone() },
+            ServerConfig { registrations_per_ip: Some(0), ..ok.clone() },
+            ServerConfig { registrations_per_ip: Some(MAX_REGISTRATIONS_PER_MINUTE + 1), ..ok.clone() },
+            ServerConfig { inactivity_timeout: Some(Duration::ZERO), ..ok.clone() },
         ] {
             assert!(c.validate().is_err(), "{c:?} should be rejected");
         }
         ServerConfig { tick_hz: MAX_TICK_HZ, max_connections: MAX_CONNECTIONS_LIMIT, ..ok.clone() }
             .validate()
             .unwrap();
-        // Both protections can be switched off explicitly.
-        ServerConfig { idle_timeout: None, keepalive: None, ..ok }.validate().unwrap();
+        // Every protection can be switched off explicitly.
+        ServerConfig {
+            idle_timeout: None,
+            keepalive: None,
+            inactivity_timeout: None,
+            max_connections_per_ip: None,
+            registrations_per_ip: None,
+            ..ok
+        }
+        .validate()
+        .unwrap();
+    }
+
+    /// The idle policy has two halves and both are on by default: silence is cut after
+    /// `idle_timeout` (a peer that vanished), and a session that only answers pings is cut after
+    /// `inactivity_timeout` (a squatter), which must be longer than the silence window and finite.
+    #[test]
+    fn pinging_without_playing_does_not_hold_a_slot_forever() {
+        let c = ServerConfig::default();
+        let inactivity = c.inactivity_timeout.expect("on by default");
+        assert_eq!(inactivity, DEFAULT_INACTIVITY_TIMEOUT);
+        assert!(inactivity > c.idle_timeout.expect("on by default"));
+        assert!(inactivity <= Duration::from_secs(60 * 60), "a squatter must not keep a slot for hours");
+        assert!(inactivity >= Duration::from_secs(5 * 60), "a player who steps away must not be kicked at once");
+        // A handshake that goes nowhere is cut in seconds, and one address holds a small share.
+        assert!(c.hello_timeout <= Duration::from_secs(5));
+        let per_ip = c.max_connections_per_ip.expect("on by default");
+        assert!(per_ip >= 2 && per_ip * 4 <= c.max_connections, "one address must not be able to fill the server");
     }
 
     /// The `MAX_CONNECTIONS_LIMIT` claim: the biggest snapshot the server can ever build (every
