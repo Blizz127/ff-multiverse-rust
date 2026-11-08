@@ -97,6 +97,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod action;
 mod bytes;
 pub mod kernel;
 pub mod rng;

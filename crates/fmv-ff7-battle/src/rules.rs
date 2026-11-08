@@ -1,4 +1,5 @@
-//! Deterministic, server-authoritative FF7-style battle rules (milestone M2-c subset).
+//! Deterministic, server-authoritative FF7-style battle rules (milestone M2-c, extended in M2-e with
+//! magic, items, Defend and the enemies' own attacks).
 //!
 //! The engine is a pure state machine: [`BattleState`] holds the combatants, the ATB gauges
 //! and a seeded [`Rng`]; it advances only through [`BattleState::step`] /
@@ -10,11 +11,27 @@
 //!
 //! # Scope
 //!
-//! Two sides: a *party* (one or more player characters) against *enemies*. The only command
-//! is [`Command::Attack`] (a single-target physical weapon attack). Enemies use a simple AI:
-//! when their gauge fills they attack a random living party member. Not modelled: statuses
-//! (Berserk, Defend, Sadness, Fury, ...), elements and affinities, magic, items, limit
-//! breaks, escape, back-attack damage bonus, covering, enemy rows, AI scripts, AP/EXP growth.
+//! Two sides: a *party* (one or more player characters) against *enemies*. A party member whose gauge
+//! is full gives one [`Command`]:
+//!
+//! * [`Command::Attack`]: the physical weapon attack on one living enemy;
+//! * [`Command::Magic`]: a spell the character knows ([`Combatant::spells`], see
+//!   [`BattleState::spells_for`]), which costs MP, on one ally (a restoring spell) or one enemy (a
+//!   damaging one);
+//! * [`Command::Item`]: one item of the engine's [`ItemTable`] on one ally (a potion, an Ether, a
+//!   Phoenix Down on a dead one) or one enemy (a damage item). **The engine knows nothing of an
+//!   inventory**: whether the account owns the item is the server's business (it checks the count,
+//!   submits, and takes the item only when the engine accepts), so a client replaying the battle never
+//!   needs to know a count;
+//! * [`Command::Defend`]: physical damage taken is halved until the actor's gauge is full again.
+//!
+//! An enemy whose gauge fills picks one random living party member and one of its own `scene.bin`
+//! attacks ([`Combatant::actions`]: the damaging ones the rules model), or a plain attack when it has
+//! none. Every action, party or enemy, is announced by a [`BattleEvent::Action`] before its effects
+//! ([`BattleEvent::MpSpent`], [`BattleEvent::Damage`], [`BattleEvent::Heal`], ...). Not modelled:
+//! statuses (Berserk, Sadness, Fury, Poison, ...), limit breaks, summons, escape, back-attack damage
+//! bonus, covering, enemy rows, AI scripts, spells and items that hit a whole side, AP/EXP growth, party
+//! elemental resistances.
 //!
 //! # Formula sources and provenance
 //!
@@ -40,18 +57,49 @@
 //!   `Damage = Power * (512 - Def) * Base / (16 * 512)`:
 //!   critical x2, short-range row penalty /2, then random variance `[3841..=4096] / 4096`
 //!   with a minimum of 1.
+//! * **Magic, healing, items.** The other formulas of the damage-calculation byte (`(Power/16) *
+//!   ((Lvl+Mag) * 6)` for spells, `22 * Power + 6 * (Lvl+Mag)` for Cure, `20 * Power` for potions, a
+//!   fraction of the target's max or current HP for Life, Full Cure, X-Potion and Demi, ...) are decoded
+//!   in [`crate::action`], which also says which records are not modelled. Magic uses the Magic stat and
+//!   the magic defense; it cannot be a critical hit; the random variance follows the formulas that have
+//!   one. Defend, elements and the enemies' attack choice are explained below.
 //! * **Row rule**: <https://wiki.ffrtt.ru/index.php/FF7/Battle/Targeting_Data> (bit `0x20`,
-//!   "short range").
+//!   "short range"). Only the standard physical formula is row-sensitive.
 //!
 //! # RNG draw order (part of the determinism contract)
 //!
 //! * Construction, [`StartMode::Normal`] only: one `range_inclusive(0, 0x7FFF)` per combatant
 //!   in [`ActorId`] order (party first, then enemies) for the initial gauge.
 //! * Enemy turn: first `below(living_party_count)` to pick the target (living party members
-//!   in id order), then the attack draws below.
-//! * Each attack, in this order: `luck_roll = range_inclusive(0, 99)`;
-//!   `miss_roll = next_u16() * 99 / 65535 + 1`; **only if it hits**
-//!   `crit_roll = next_u16() * 99 / 65535 + 1`, then `variance = range_inclusive(0, 255)`.
+//!   in id order); then, **only if the enemy has two or more usable attacks** (those it has the MP
+//!   for), `below(usable_count)` to pick one (so an enemy with one attack, or with none, draws exactly
+//!   what it drew before attacks existed); then the action's own draws below.
+//! * A physical action that rolls to hit, in this order: `luck_roll = range_inclusive(0, 99)`;
+//!   `miss_roll = next_u16() * 99 / 65535 + 1`; **only if it hits**, and only if it can be a critical
+//!   hit, `crit_roll = next_u16() * 99 / 65535 + 1`; then, if its formula has variance (the standard
+//!   one does), `variance = range_inclusive(0, 255)`. A physical action that never misses
+//!   (damage-calculation byte `0x0X` / `0x3X`) draws nothing for the roll.
+//! * A magical action that rolls to hit: `miss_roll = next_u16() * 99 / 65535 + 1` (no luck roll);
+//!   **only if it hits**, `variance = range_inclusive(0, 255)` when its formula has variance.
+//! * A restoring action (Cure, Life, a potion) never misses: it draws `variance` only if its formula
+//!   has one (Cure's does; potions' and Life's do not).
+//! * Draws never depend on the target's elemental affinity (a nullified or absorbed hit draws what a
+//!   normal hit draws), on defense, on rows or on statuses.
+//! * [`Command::Defend`] and every validation failure draw nothing.
+//!
+//! # Defend, elements, MP
+//!
+//! * **Defend** sets [`Combatant::defending`]; physical damage ([`ActionKind::Physical`]) taken while
+//!   it is set is halved (after the row penalty, before the elemental multiplier and the variance).
+//!   It ends when the actor's gauge fills again (its next turn), or when it dies.
+//! * **Elements.** An action's element mask is matched against the target's
+//!   [`Combatant::affinities`] (enemies only, from the record): weakness doubles the damage, a
+//!   resistance halves it (both before the variance), nullify makes it 0 (reported as a
+//!   [`BattleEvent::Damage`] of 0), absorb turns it into a [`BattleEvent::Heal`] of that amount, full
+//!   heal restores the target completely and Death kills it. These never miss.
+//! * **MP.** A spell costs the MP of its record, announced by [`BattleEvent::MpSpent`] right after the
+//!   action. An enemy pays for its attacks the same way (and cannot use one it lacks the MP for).
+//!   Heals are reported as the amount actually restored (never more than was missing).
 //!
 //! # APPROXIMATION summary
 //!
@@ -64,28 +112,45 @@
 //!   Layouts other than preemptive / back attack are treated as normal.
 //! * **Critical test**: `chance >= roll` as in the FAQ (an exact `chance`% rate); the
 //!   disassembly pseudocode uses a strict `>`, a difference of one roll value.
+//! * **Magic hit chance**: the documents give none; a spell hits when its accuracy minus the target's
+//!   magic evade percent (a party member's armor; enemies have none) is at least the roll. Nothing about
+//!   level or luck.
 //! * **Damage cap** [`MAX_DAMAGE`] = 9999 (community-documented, not in the cited pages).
 //!   Arithmetic is exact 64-bit; the original's 32-bit overflow glitch is not reproduced.
-//! * **Enemy attack**: the enemy's first plain physical scene attack supplies Power and
-//!   hit rate (see [`Combatant::from_enemy`]); the original picks attacks with AI scripts.
-//!   The Enemy Attack command is always row-sensitive (`short_range = true`).
-//! * **Party attack and defense** = Strength + weapon attack, Vitality + armor defense; the
-//!   weapon's hit/crit rates and the armor's evade percentage come from the kernel. Cait Sith
-//!   and Vincent have no starting equipment record, so they fight unarmed unless equipment
-//!   ids are passed explicitly.
+//! * **Enemy attacks**: the original picks them with AI scripts, which are not decoded. Here an enemy
+//!   picks uniformly among its damaging scene attacks (see [`crate::action::EnemyAction`]) it can pay
+//!   for, hitting one random living party member whatever the attack's own targeting says; a plain
+//!   physical attack of the enemy's first such attack ([`Combatant::from_enemy`]) is the fallback. The
+//!   Enemy Attack command is always row-sensitive (`short_range = true`), so physical enemy attacks are
+//!   halved against the back row.
+//! * **Party attack and defense** = Strength + weapon attack, Vitality + armor defense; magic attack
+//!   is the Magic stat, magic defense Spirit + armor magic defense; the weapon's hit/crit rates and
+//!   the armor's evade percentages come from the kernel. Cait Sith and Vincent have no starting
+//!   equipment record, so they fight unarmed unless equipment ids are passed explicitly.
+//! * **Spells** ([`Combatant::from_character`]): the spells of the magic materia equipped in the
+//!   character's kernel starting record at the AP it starts with, plus a documented STARTER grimoire
+//!   every character is given: the level-1 spells of Restore, Fire, Ice and Lightning
+//!   ([`STARTER_MATERIA`]), because on the owner's Steam copy only Cloud (Lightning, Ice) and Red XIII
+//!   (Fire) start with magic materia equipped.
 //! * Enemy rows from formations are ignored; party rows are honoured.
 //!
 //! # Events, not state, go on the wire
 //!
-//! [`BattleEvent`], [`Command`], [`ActorId`] and [`Outcome`] derive serde so they can travel in
-//! protocol messages. [`Combatant`] and [`BattleState`] deliberately do not: they carry
+//! [`BattleEvent`], [`Command`], [`ActionRef`], [`ActorId`] and [`Outcome`] derive serde so they can
+//! travel in protocol messages. [`Combatant`] and [`BattleState`] deliberately do not: they carry
 //! numbers derived from the owner's game files, which are never sent over the network.
+
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::action::{
+    affinity_response, element, ActionKind, ActionSpec, ElementAffinity, Elemental, EnemyAction, Formula, ItemData,
+    ItemInfo, ItemKind, ItemTable, Spell, SpellInfo,
+};
 use crate::kernel::{CharacterId, Kernel};
 use crate::rng::Rng;
-use crate::scene::{AttackRecord, BattleLayout, EnemyRecord, Scene};
+use crate::scene::{AffinityRate, AttackRecord, BattleLayout, EnemyRecord, Scene};
 
 /// Turn-timer value at which a combatant can act.
 pub const GAUGE_MAX: u32 = 65_535;
@@ -105,6 +170,9 @@ pub const ATTACK_COMMAND_POWER: u32 = 16;
 pub const MAX_DAMAGE: u32 = 9_999;
 /// APPROXIMATION: upper bound of the random initial gauge of a normal start.
 pub const INITIAL_GAUGE_MAX: u32 = 0x7FFF;
+/// The materia every character's grimoire is built from on top of its own starting equipment (their ids
+/// in the kernel's materia table): Restore (Cure), Fire, Ice and Lightning (Bolt), at level 1.
+pub const STARTER_MATERIA: [u8; 4] = [53, 49, 50, 52];
 
 /// Identifier of a combatant inside one battle: party members take ids `0..party`, enemies
 /// follow.
@@ -147,11 +215,17 @@ pub struct Combatant {
     pub attack: u32,
     /// "Def" of the damage formula (party: Vitality + armor defense; enemy: Defense).
     pub defense: u32,
+    /// "Mag" of the magic formulas (the Magic stat).
+    pub magic: u32,
+    /// Magic defense (party: Spirit + armor magic defense; enemy: its magic defense).
+    pub magic_defense: u32,
     /// Dexterity (an enemy's speed byte): drives the ATB gauge and hit chance.
     pub dex: u32,
     pub luck: u32,
     /// Physical evade percentage (party: armor "Defense %"; enemy: evade stat).
     pub evade: u32,
+    /// Magic evade percentage (party: armor "Magic Defense %"; enemies have none).
+    pub magic_evade: u32,
     /// Hit rate (percent) of the Attack action (weapon accuracy or the enemy attack's rate).
     pub accuracy: u32,
     /// Power of the Attack action (16 for the party's Attack command).
@@ -163,17 +237,25 @@ pub struct Combatant {
     pub row: Row,
     /// Rewards for defeating this combatant (enemies).
     pub reward: Reward,
+    /// The spells a party member can cast, by [`Spell::index`] (see [`BattleState::spells_for`]).
+    pub spells: Vec<Spell>,
+    /// The attacks an enemy picks from when its gauge fills (empty: a plain attack).
+    pub actions: Vec<EnemyAction>,
+    /// How the combatant answers elements (enemies only, from their record).
+    pub affinities: Vec<ElementAffinity>,
     /// Assigned by [`BattleState`]; any value passed in is overwritten.
     pub side: Side,
     /// Turn timer, `0..=`[`GAUGE_MAX`]. Runtime state owned by [`BattleState`].
     pub gauge: u32,
     /// True once the gauge is full and the combatant has not yet acted.
     pub ready: bool,
+    /// Defending: physical damage is halved. Runtime state owned by [`BattleState`].
+    pub defending: bool,
 }
 
 impl Combatant {
     /// A combatant with neutral defaults: no attack/defense/dex, 100% accuracy, Power 16,
-    /// front row, short range. Set the public fields to taste.
+    /// front row, short range, no spells, attacks or affinities. Set the public fields to taste.
     pub fn new(name: impl Into<String>, level: u8, max_hp: u32) -> Self {
         Self {
             name: name.into(),
@@ -184,18 +266,25 @@ impl Combatant {
             max_mp: 0,
             attack: 0,
             defense: 0,
+            magic: 0,
+            magic_defense: 0,
             dex: 0,
             luck: 0,
             evade: 0,
+            magic_evade: 0,
             accuracy: 100,
             attack_power: ATTACK_COMMAND_POWER,
             crit_bonus: 0,
             short_range: true,
             row: Row::Front,
             reward: Reward::default(),
+            spells: Vec::new(),
+            actions: Vec::new(),
+            affinities: Vec::new(),
             side: Side::Party,
             gauge: 0,
             ready: false,
+            defending: false,
         }
     }
 
@@ -203,9 +292,20 @@ impl Combatant {
         self.hp > 0
     }
 
+    /// The Attack command as an action: a physical attack of this combatant's Power and accuracy.
+    pub fn attack_spec(&self) -> ActionSpec {
+        ActionSpec::basic_attack(self.attack_power, self.accuracy, self.short_range)
+    }
+
+    /// How this combatant answers an action with element mask `mask` (see [`affinity_response`]).
+    pub fn affinity_for(&self, mask: u16) -> Option<AffinityRate> {
+        affinity_response(&self.affinities, mask)
+    }
+
     /// Build an enemy from its scene record. `basic_attack` (see [`Scene::basic_attack`])
     /// supplies the Attack action's Power and hit rate; without it the enemy uses Power 16 at
-    /// 100%.
+    /// 100%. The enemy has no attack list ([`Combatant::actions`]) and so only ever makes that plain
+    /// attack; [`Combatant::from_enemy_in_scene`] gives it its own attacks.
     pub fn from_enemy(record: &EnemyRecord, basic_attack: Option<&AttackRecord>) -> Self {
         let mut c = Combatant::new(record.name.clone(), record.level, record.hp);
         c.side = Side::Enemy;
@@ -213,6 +313,8 @@ impl Combatant {
         c.max_mp = u32::from(record.mp);
         c.attack = u32::from(record.strength);
         c.defense = u32::from(record.defense);
+        c.magic = u32::from(record.magic);
+        c.magic_defense = u32::from(record.magic_defense);
         c.dex = u32::from(record.speed);
         c.luck = u32::from(record.luck);
         c.evade = u32::from(record.evade);
@@ -226,16 +328,41 @@ impl Combatant {
             gil: record.gil,
             ap: u32::from(record.ap),
         };
+        // Element codes `0..=15` are elements; the codes from `0x20` are statuses (not modelled).
+        c.affinities = record
+            .affinities()
+            .into_iter()
+            .filter(|a| a.code < 16)
+            .map(|a| ElementAffinity { element: a.code, rate: a.rate })
+            .collect();
+        c
+    }
+
+    /// Build the enemy in slot `enemy_slot` of `scene` ([`Combatant::from_enemy`]) and give it the
+    /// scene's attacks it can use: its damaging attacks in its own order, each once.
+    pub fn from_enemy_in_scene(scene: &Scene, enemy_slot: usize, record: &EnemyRecord) -> Self {
+        let basic = scene.basic_attack(enemy_slot).map(|a| &a.record);
+        let mut c = Self::from_enemy(record, basic);
+        for attack in scene.enemy_attacks(enemy_slot) {
+            if let Some(action) = EnemyAction::from_scene(attack) {
+                if !c.actions.iter().any(|known| known.id == action.id) {
+                    c.actions.push(action);
+                }
+            }
+        }
         c
     }
 
     /// Build a party member from kernel data: a deterministic stat block for `level`
-    /// ([`crate::kernel::GrowthData::stat_block`]) plus equipment.
+    /// ([`crate::kernel::GrowthData::stat_block`]) plus equipment and spells.
     ///
     /// `weapon` / `armor` override the equipment ids; `None` uses the character's starting
     /// equipment from the kernel initialization data, and a character with no initialization
     /// record (Cait Sith, Vincent) is unarmed and unarmored. Returns `None` if the kernel
     /// has no growth curves for the character.
+    ///
+    /// The spells are [`party_spells`]: the magic materia of the starting record plus the starter
+    /// grimoire.
     pub fn from_character(
         kernel: &Kernel,
         who: CharacterId,
@@ -257,9 +384,12 @@ impl Combatant {
         c.max_mp = u32::from(stats.max_mp);
         c.attack = u32::from(stats.strength) + weapon.map_or(0, |w| u32::from(w.attack));
         c.defense = u32::from(stats.vitality) + armor.map_or(0, |a| u32::from(a.defense));
+        c.magic = u32::from(stats.magic);
+        c.magic_defense = u32::from(stats.spirit) + armor.map_or(0, |a| u32::from(a.magic_defense));
         c.dex = u32::from(stats.dexterity);
         c.luck = u32::from(stats.luck);
         c.evade = armor.map_or(0, |a| u32::from(a.evade_percent));
+        c.magic_evade = armor.map_or(0, |a| u32::from(a.magic_evade_percent));
         if let Some(w) = weapon {
             c.accuracy = u32::from(w.accuracy);
             c.crit_bonus = u32::from(w.crit_rate);
@@ -270,8 +400,28 @@ impl Combatant {
         } else {
             Row::Front
         };
+        c.spells = party_spells(kernel, who);
         Some(c)
     }
+}
+
+/// The spells `who` can cast, ascending by index: the spells that the magic materia of its kernel
+/// starting record teach at the AP they start with ([`Kernel::equipped_spells`]), plus the level-1 spells
+/// of the [`STARTER_MATERIA`] (Restore, Fire, Ice, Lightning: Cure, Fire, Ice, Bolt on the Steam copy).
+/// Only the records the rules can cast are kept ([`Spell::from_attack`]).
+pub fn party_spells(kernel: &Kernel, who: CharacterId) -> Vec<Spell> {
+    let mut indexes = kernel.equipped_spells(who);
+    for id in STARTER_MATERIA {
+        if let Some(materia) = kernel.materia(id) {
+            indexes.extend(materia.unlocked_spells(0));
+        }
+    }
+    indexes.sort_unstable();
+    indexes.dedup();
+    indexes
+        .into_iter()
+        .filter_map(|index| Spell::from_attack(index, &kernel.attack(usize::from(index))?))
+        .collect()
 }
 
 /// The enemies of formation `formation_slot` (0..4) of `scene`, in placement order. Empty if
@@ -280,10 +430,7 @@ pub fn enemies_for_formation(scene: &Scene, formation_slot: usize) -> Vec<Combat
     scene
         .formation_enemies(formation_slot)
         .into_iter()
-        .map(|r| {
-            let attack = scene.basic_attack(r.enemy_slot).map(|a| &a.record);
-            Combatant::from_enemy(r.record, attack)
-        })
+        .map(|r| Combatant::from_enemy_in_scene(scene, r.enemy_slot, r.record))
         .collect()
 }
 
@@ -337,6 +484,31 @@ impl Default for BattleConfig {
 pub enum Command {
     /// Physical weapon attack on one living enemy.
     Attack { target: ActorId },
+    /// Cast a spell the actor knows. `spell` is the kernel's attack index (Cure 0, Fire 27, Ice 30,
+    /// Bolt 33, ...); `target` is an ally for a restoring spell (a dead one for Life) and a living enemy
+    /// for a damaging one. Costs the spell's MP.
+    Magic { spell: u16, target: ActorId },
+    /// Use an item of the engine's item table. `item` is the kernel item index (Potion 0, Hi-Potion 1,
+    /// Ether 3, Phoenix Down 7, ...); `target` is an ally (a dead one for Phoenix Down) for a restoring
+    /// item and a living enemy for a damage item. Whether the account owns one is not the engine's
+    /// business (see the module docs).
+    Item { item: u16, target: ActorId },
+    /// Guard: physical damage taken is halved until the actor's gauge is full again.
+    Defend,
+}
+
+/// What an [`BattleEvent::Action`] announces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ActionRef {
+    /// A plain physical attack (a party member's Attack command, or an enemy without attacks of its own).
+    Attack,
+    /// A spell, by kernel attack index.
+    Magic(u16),
+    /// An item, by kernel item index.
+    Item(u16),
+    Defend,
+    /// An enemy's own attack, by its `scene.bin` attack id (the name is in the scene's attack table).
+    EnemyAttack(u16),
 }
 
 /// How the battle ended.
@@ -366,6 +538,30 @@ pub enum BattleEvent {
     Victory,
     /// All party members are dead.
     Defeat,
+    /// `actor` begins `action`: announced before the effects of every action, party and enemy.
+    Action { actor: ActorId, action: ActionRef },
+    /// `amount` HP were restored to `target` (a restoring spell or item, or an element it absorbed):
+    /// what was actually restored, never more than the target was missing.
+    Heal {
+        actor: ActorId,
+        target: ActorId,
+        amount: u32,
+    },
+    /// `actor` paid `amount` MP for its action.
+    MpSpent { actor: ActorId, amount: u32 },
+    /// `amount` MP were restored to `target` (Ether), never more than it was missing.
+    MpRestored {
+        actor: ActorId,
+        target: ActorId,
+        amount: u32,
+    },
+    /// `target` was brought back from the dead with `hp` HP (Life, Phoenix Down); its gauge starts
+    /// empty.
+    Revive {
+        actor: ActorId,
+        target: ActorId,
+        hp: u32,
+    },
 }
 
 /// Why a command was refused.
@@ -383,10 +579,27 @@ pub enum CommandError {
     GaugeNotFull(ActorId),
     #[error("unknown target {0:?}")]
     UnknownTarget(ActorId),
-    #[error("target {0:?} is not a valid target (attacks must target an enemy)")]
+    #[error("target {0:?} is not a valid target (damage goes to an enemy, restoring to an ally)")]
     InvalidTarget(ActorId),
     #[error("target {0:?} is already dead")]
     TargetDead(ActorId),
+    #[error("target {0:?} is alive (only a dead ally can be revived)")]
+    TargetNotDead(ActorId),
+    #[error("the actor does not know spell {0}")]
+    UnknownSpell(u16),
+    #[error("actor {0:?} does not have the MP for that spell")]
+    NotEnoughMp(ActorId),
+    #[error("item {0} cannot be used in battle")]
+    UnknownItem(u16),
+}
+
+/// How an action's damage is dealt, for [`action_damage`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Rolls {
+    /// The hit is a critical hit (only a physical action that can crit rolls for it).
+    pub critical: bool,
+    /// The random variance roll `0..=255` (used by the formulas that have variance).
+    pub variance: u32,
 }
 
 /// Inputs of the physical damage formula (all roll results are passed in).
@@ -399,14 +612,19 @@ pub struct DamageInput {
     pub critical: bool,
     /// Short-range attack with a back-row attacker or target: damage is halved.
     pub halve_for_row: bool,
+    /// The target is defending: damage is halved (after the row penalty).
+    pub defending: bool,
+    /// The element's effect on the damage: doubled for a weakness, halved for a resistance.
+    pub elemental: Elemental,
     /// Random variance roll `0..=255` (damage is multiplied by `(3841 + roll) / 4096`).
     pub variance_roll: u32,
 }
 
 /// The physical ("X1") damage formula, in the order of the disassembly:
 /// `Base = Att + ((Att + Lvl) / 32) * ((Att * Lvl) / 32)`,
-/// `damage = Power * (512 - Def) * Base / (16 * 512)`, critical x2, row penalty /2, then
-/// variance `(3841 + roll) / 4096` with a minimum of 1, capped at [`MAX_DAMAGE`].
+/// `damage = Power * (512 - Def) * Base / (16 * 512)`, critical x2, row penalty /2, Defend /2, the
+/// element (x2 or /2), then variance `(3841 + roll) / 4096` with a minimum of 1, capped at
+/// [`MAX_DAMAGE`].
 pub fn physical_damage(input: &DamageInput) -> u32 {
     // Real stats are tiny (attack <= ~510, level <= 255, power <= 255); the clamps only keep
     // absurd hand-made inputs from overflowing the 64-bit arithmetic.
@@ -417,28 +635,131 @@ pub fn physical_damage(input: &DamageInput) -> u32 {
     let y = (lvl + att) / 32;
     let base = att + x * y;
     let defense = u64::from(input.defense).min(511);
-    let mut dmg = (base * (512 - defense) * power) >> 13;
-    if input.critical {
+    let dmg = (base * (512 - defense) * power) >> 13;
+    finish_damage(
+        dmg,
+        input.critical,
+        input.halve_for_row,
+        input.defending,
+        input.elemental,
+        Some(input.variance_roll),
+    )
+}
+
+/// The common tail of every damage formula: critical x2, row penalty /2, Defend /2, the element, the
+/// variance (when the formula has one), a minimum of 1 and the cap.
+fn finish_damage(
+    mut dmg: u64,
+    critical: bool,
+    halve_for_row: bool,
+    defending: bool,
+    elemental: Elemental,
+    variance_roll: Option<u32>,
+) -> u32 {
+    if critical {
         dmg *= 2;
     }
-    if input.halve_for_row {
+    if halve_for_row {
         dmg /= 2;
     }
-    dmg = (dmg * (3841 + u64::from(input.variance_roll.min(255)))) >> 12;
+    if defending {
+        dmg /= 2;
+    }
+    match elemental {
+        Elemental::Normal => {}
+        Elemental::Double => dmg *= 2,
+        Elemental::Half => dmg /= 2,
+    }
+    if let Some(roll) = variance_roll {
+        dmg = (dmg * (3841 + u64::from(roll.min(255)))) >> 12;
+    }
     dmg.max(1).min(u64::from(MAX_DAMAGE)) as u32
+}
+
+/// The damage `spec` deals to `target` when `actor` uses it, from the formulas of
+/// [`crate::action`], for the given roll results and elemental multiplier. Physical actions use
+/// the actor's Strength and the target's Defense (halved for a short-range attack across the back
+/// row, and by Defend), magical ones Magic and magic defense. At least 1, at most [`MAX_DAMAGE`].
+/// A restoring spec is not damage: see [`restore_amount`].
+pub fn action_damage(spec: &ActionSpec, actor: &Combatant, target: &Combatant, elemental: Elemental, rolls: Rolls) -> u32 {
+    let (stat, defense) = match spec.kind {
+        ActionKind::Physical => (actor.attack, target.defense),
+        ActionKind::Magical => (actor.magic, target.magic_defense),
+    };
+    let defense = if spec.ignores_defense { 0 } else { defense };
+    let physical = spec.kind == ActionKind::Physical;
+    let defending = physical && target.defending;
+    // Only the standard formula has the row penalty (the others never look at rows).
+    let halve_for_row = physical
+        && spec.formula == Formula::Standard
+        && spec.short_range
+        && (target.row == Row::Back || actor.row == Row::Back);
+    let variance = spec.formula.has_variance().then_some(rolls.variance);
+    let level = u64::from(actor.level);
+    let stat64 = u64::from(stat.min(0xFFFF));
+    let power = u64::from(spec.power.min(0xFFFF));
+    let defense64 = u64::from(defense).min(511);
+    let finish = |dmg: u64| finish_damage(dmg, false, false, defending, elemental, variance);
+    match spec.formula {
+        Formula::Standard => physical_damage(&DamageInput {
+            attack: stat,
+            level: u32::from(actor.level),
+            power: spec.power,
+            defense,
+            critical: rolls.critical && spec.can_crit,
+            halve_for_row,
+            defending,
+            elemental,
+            variance_roll: rolls.variance,
+        }),
+        Formula::Spell => finish((((level + stat64) * 6) * (512 - defense64) * power) >> 13),
+        Formula::CurrentHp => finish(u64::from(target.hp) * power / 32),
+        Formula::MaxHp => finish(u64::from(target.max_hp) * power / 32),
+        Formula::Restore => finish(22 * power + 6 * (level + stat64)),
+        Formula::Flat => finish(20 * power),
+        Formula::Fixed => finish(((512 - defense64) * power) / 32),
+        // Only a restoring action has this formula (see `ActionSpec`); as damage it is the target's HP.
+        Formula::Full => finish(u64::from(target.hp)),
+    }
+}
+
+/// How much a restoring action ([`ActionSpec::heals`]) gives `target` before it is limited to what the
+/// target is missing: a fraction of its max HP (or MP, for an action that hits MP) for formula 4,
+/// Cure's formula with the variance for 5, a flat amount for 6. Formula 8 (Elixir) is "everything" and
+/// returns the target's whole max HP (or MP).
+pub fn restore_amount(spec: &ActionSpec, actor: &Combatant, target: &Combatant, variance: u32) -> u32 {
+    let pool = if spec.hits_mp { target.max_mp } else { target.max_hp };
+    let power = u64::from(spec.power.min(0xFFFF));
+    let amount: u64 = match spec.formula {
+        Formula::MaxHp => u64::from(pool) * power / 32,
+        Formula::Restore => {
+            let base = 22 * power + 6 * (u64::from(actor.level) + u64::from(actor.magic.min(0xFFFF)));
+            (base * (3841 + u64::from(variance.min(255)))) >> 12
+        }
+        Formula::Flat => 20 * power,
+        Formula::Full => u64::from(pool),
+        // Not restoring formulas: a restoring spec never has them.
+        Formula::Standard | Formula::Spell | Formula::CurrentHp | Formula::Fixed => 0,
+    };
+    amount.min(u64::from(u32::MAX)) as u32
 }
 
 /// Base hit chance (before luck) of a physical attack, as an unclamped percentage:
 /// `(Dex/4 + accuracy) + attacker_evade - target_evade`, where a party member's evade is
 /// `Dex/4 + armor evade%` and an enemy's is its evade stat. A result of exactly 0 becomes 1.
 pub fn hit_chance(actor: &Combatant, target: &Combatant) -> i32 {
+    hit_chance_with(actor, target, actor.accuracy)
+}
+
+/// [`hit_chance`] for an action whose own hit rate is `accuracy` (an enemy's attack has its own).
+pub fn hit_chance_with(actor: &Combatant, target: &Combatant, accuracy: u32) -> i32 {
     let evade_of = |c: &Combatant| -> i64 {
         match c.side {
             Side::Enemy => i64::from(c.evade),
             Side::Party => i64::from(c.dex >> 2) + i64::from(c.evade),
         }
     };
-    let physical = i64::from(actor.dex >> 2) + i64::from(actor.accuracy);
+    let physical = i64::from(actor.dex >> 2) + i64::from(accuracy);
     let chance = physical + evade_of(actor) - evade_of(target);
     let chance = chance.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
     if chance == 0 {
@@ -446,6 +767,12 @@ pub fn hit_chance(actor: &Combatant, target: &Combatant) -> i32 {
     } else {
         chance
     }
+}
+
+/// Hit chance of a magical action with hit rate `accuracy` against `target`, as an unclamped
+/// percentage: the rate minus the target's magic evade (APPROXIMATION: the documents give none).
+pub fn magic_hit_chance(accuracy: u32, target: &Combatant) -> i64 {
+    i64::from(accuracy) - i64::from(target.magic_evade)
 }
 
 /// Decide a physical hit from the chance and the three rolls.
@@ -506,6 +833,14 @@ pub fn v_timer_increase(battle_speed: u8) -> u32 {
     2 * (32_768 / (120 + u32::from(battle_speed) * 15 / 8))
 }
 
+/// A validated command, ready to resolve (indexes are positions in the actor list).
+enum Plan {
+    Attack { target: usize },
+    Magic { spell: Spell, target: usize },
+    Item { item: u16, data: ItemData, target: usize },
+    Defend,
+}
+
 /// A running battle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BattleState {
@@ -521,6 +856,8 @@ pub struct BattleState {
     outcome: Option<Outcome>,
     /// Events produced at construction, delivered with the next step or command.
     pending: Vec<BattleEvent>,
+    /// The items a party member can use ([`Command::Item`]); empty unless [`BattleState::with_items`].
+    items: Arc<ItemTable>,
 }
 
 impl BattleState {
@@ -568,6 +905,8 @@ impl BattleState {
         let mut rng = Rng::new(seed);
         for c in &mut actors {
             c.hp = c.hp.min(c.max_hp);
+            c.mp = c.mp.min(c.max_mp);
+            c.defending = false;
             c.gauge = match (config.start, c.side) {
                 (StartMode::Normal, _) => rng.range_inclusive(0, INITIAL_GAUGE_MAX),
                 (StartMode::Preemptive, Side::Party) | (StartMode::BackAttack, Side::Enemy) => {
@@ -589,6 +928,7 @@ impl BattleState {
             normal_speed,
             outcome: None,
             pending: Vec::new(),
+            items: Arc::new(ItemTable::default()),
         };
         for i in 0..state.actors.len() {
             let c = &mut state.actors[i];
@@ -604,6 +944,14 @@ impl BattleState {
         state.check_outcome(&mut initial);
         state.pending.extend(initial);
         state
+    }
+
+    /// The same battle with `items` as the items a party member can use. Part of the battle's
+    /// definition like the combatants: server and clients must give it the same table (they build it
+    /// from the same kernel, see [`ItemTable::from_kernel`]).
+    pub fn with_items(mut self, items: Arc<ItemTable>) -> Self {
+        self.items = items;
+        self
     }
 
     // --- accessors ---
@@ -637,6 +985,32 @@ impl BattleState {
             .filter(|&i| self.actors[i].is_alive() && self.actors[i].ready)
             .map(|i| ActorId(i as u8))
             .collect()
+    }
+
+    /// The spells `actor` can cast, in the order of its spell list (ascending by index for a character
+    /// built from the kernel), with their MP cost and which side they aim at. Empty for an enemy or an
+    /// unknown actor. Whether the actor has the MP right now is [`BattleState::check_command`]'s
+    /// business, so that a menu can show an unaffordable spell greyed out.
+    pub fn spells_for(&self, actor: ActorId) -> Vec<SpellInfo> {
+        match self.actor(actor) {
+            Some(c) if usize::from(actor.0) < self.party_len => c.spells.iter().map(Spell::info).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// What item `item` does, if the engine can use it in battle (`None`: not an item here).
+    pub fn item_info(&self, item: u16) -> Option<ItemInfo> {
+        self.items.info(item)
+    }
+
+    /// The items the engine can use in battle.
+    pub fn items(&self) -> &ItemTable {
+        &self.items
+    }
+
+    /// Whether `id` is defending (halving physical damage until its next turn).
+    pub fn is_defending(&self, id: ActorId) -> bool {
+        self.actor(id).is_some_and(|c| c.defending)
     }
 
     /// Whole ticks simulated so far.
@@ -708,6 +1082,14 @@ impl BattleState {
         events
     }
 
+    /// Whether `actor` could give `command` right now, without giving it: the same checks
+    /// [`BattleState::submit_command`] makes, in the same order, and no change to the battle. A menu uses
+    /// it to grey out what the engine would refuse (a spell the actor lacks the MP for, a target on the
+    /// wrong side). It knows nothing of an inventory.
+    pub fn check_command(&self, actor: ActorId, command: &Command) -> Result<(), CommandError> {
+        self.plan_command(actor, command).map(|_| ())
+    }
+
     /// Submit a command for a party member whose gauge is full. On success the command is
     /// resolved immediately and the resulting events (preceded by any undelivered start
     /// events) are returned; the actor's gauge resets to empty.
@@ -716,6 +1098,45 @@ impl BattleState {
         actor: ActorId,
         command: Command,
     ) -> Result<Vec<BattleEvent>, CommandError> {
+        let (idx, plan) = self.plan_command(actor, &command)?;
+        let mut events = Vec::new();
+        self.flush_pending(&mut events);
+        match plan {
+            Plan::Attack { target } => {
+                events.push(BattleEvent::Action { actor, action: ActionRef::Attack });
+                let spec = self.actors.get(idx).map(Combatant::attack_spec);
+                if let Some(spec) = spec {
+                    self.resolve_action(idx, target, &spec, &mut events);
+                }
+            }
+            Plan::Magic { spell, target } => {
+                events.push(BattleEvent::Action { actor, action: ActionRef::Magic(spell.index) });
+                self.spend_mp(idx, spell.spec.mp_cost, &mut events);
+                self.resolve_action(idx, target, &spell.spec, &mut events);
+            }
+            Plan::Item { item, data, target } => {
+                events.push(BattleEvent::Action { actor, action: ActionRef::Item(item) });
+                self.resolve_action(idx, target, &data.spec, &mut events);
+            }
+            Plan::Defend => {
+                events.push(BattleEvent::Action { actor, action: ActionRef::Defend });
+                if let Some(c) = self.actors.get_mut(idx) {
+                    c.defending = true;
+                }
+            }
+        }
+        self.finish_turn(idx);
+        Ok(events)
+    }
+
+    // --- internals ---
+
+    fn flush_pending(&mut self, out: &mut Vec<BattleEvent>) {
+        out.append(&mut self.pending);
+    }
+
+    /// Validate `command` (see [`BattleState::check_command`]) and say what it means.
+    fn plan_command(&self, actor: ActorId, command: &Command) -> Result<(usize, Plan), CommandError> {
         if self.outcome.is_some() {
             return Err(CommandError::BattleOver);
         }
@@ -733,32 +1154,54 @@ impl BattleState {
         if !me.ready {
             return Err(CommandError::GaugeNotFull(actor));
         }
-        match command {
-            Command::Attack { target } => {
-                let t_idx = usize::from(target.0);
-                let victim = self
-                    .actors
-                    .get(t_idx)
-                    .ok_or(CommandError::UnknownTarget(target))?;
-                if t_idx < self.party_len {
-                    return Err(CommandError::InvalidTarget(target));
+        let plan = match *command {
+            Command::Attack { target } => Plan::Attack { target: self.check_target(target, false, false)? },
+            Command::Magic { spell, target } => {
+                let known = me
+                    .spells
+                    .iter()
+                    .find(|s| s.index == spell)
+                    .copied()
+                    .ok_or(CommandError::UnknownSpell(spell))?;
+                if me.mp < u32::from(known.spec.mp_cost) {
+                    return Err(CommandError::NotEnoughMp(actor));
                 }
-                if !victim.is_alive() {
-                    return Err(CommandError::TargetDead(target));
-                }
-                let mut events = Vec::new();
-                self.flush_pending(&mut events);
-                self.resolve_attack(idx, t_idx, &mut events);
-                self.finish_turn(idx);
-                Ok(events)
+                let target = self.check_target(target, known.spec.heals(), known.spec.hits_dead)?;
+                Plan::Magic { spell: known, target }
             }
-        }
+            Command::Item { item, target } => {
+                let data = self
+                    .items
+                    .get(item)
+                    .copied()
+                    .ok_or(CommandError::UnknownItem(item))?;
+                let target = self.check_target(target, data.spec.heals(), data.spec.hits_dead)?;
+                Plan::Item { item, data, target }
+            }
+            Command::Defend => Plan::Defend,
+        };
+        Ok((idx, plan))
     }
 
-    // --- internals ---
-
-    fn flush_pending(&mut self, out: &mut Vec<BattleEvent>) {
-        out.append(&mut self.pending);
+    /// The position of `target` if it is a valid target: on the party's side when `ally`, else on the
+    /// enemies'; dead when `dead` (a revival), else alive.
+    fn check_target(&self, target: ActorId, ally: bool, dead: bool) -> Result<usize, CommandError> {
+        let t_idx = usize::from(target.0);
+        let victim = self
+            .actors
+            .get(t_idx)
+            .ok_or(CommandError::UnknownTarget(target))?;
+        if (t_idx < self.party_len) != ally {
+            return Err(CommandError::InvalidTarget(target));
+        }
+        if dead {
+            if victim.is_alive() {
+                return Err(CommandError::TargetNotDead(target));
+            }
+        } else if !victim.is_alive() {
+            return Err(CommandError::TargetDead(target));
+        }
+        Ok(t_idx)
     }
 
     /// One tick: fill gauges, then let ready enemies act (in id order).
@@ -774,6 +1217,8 @@ impl BattleState {
             c.gauge = (c.gauge + inc).min(GAUGE_MAX);
             if c.gauge >= GAUGE_MAX {
                 c.ready = true;
+                // The next turn has come: a guard from the last one is over.
+                c.defending = false;
                 events.push(BattleEvent::GaugeReady {
                     actor: ActorId(i as u8),
                 });
@@ -789,15 +1234,40 @@ impl BattleState {
         }
     }
 
-    /// Enemy AI: attack a uniformly random living party member.
+    /// Enemy AI: attack a uniformly random living party member with one of the attacks it can pay for
+    /// (a uniform pick among them), or with a plain attack when it has none (see the module docs for the
+    /// draw order).
     fn enemy_act(&mut self, idx: usize, events: &mut Vec<BattleEvent>) {
+        let actor = ActorId(idx as u8);
         let living: Vec<usize> = (0..self.party_len)
             .filter(|&p| self.actors[p].is_alive())
             .collect();
         if !living.is_empty() {
             let pick = self.rng.below(living.len() as u32) as usize;
             let target = living.get(pick).copied().unwrap_or(0);
-            self.resolve_attack(idx, target, events);
+            let usable: Vec<EnemyAction> = self.actors[idx]
+                .actions
+                .iter()
+                .filter(|a| u32::from(a.spec.mp_cost) <= self.actors[idx].mp)
+                .copied()
+                .collect();
+            let chosen = match usable.len() {
+                0 => None,
+                1 => usable.first().copied(),
+                n => usable.get(self.rng.below(n as u32) as usize).copied(),
+            };
+            match chosen {
+                Some(action) => {
+                    events.push(BattleEvent::Action { actor, action: ActionRef::EnemyAttack(action.id) });
+                    self.spend_mp(idx, action.spec.mp_cost, events);
+                    self.resolve_action(idx, target, &action.spec, events);
+                }
+                None => {
+                    events.push(BattleEvent::Action { actor, action: ActionRef::Attack });
+                    let spec = self.actors[idx].attack_spec();
+                    self.resolve_action(idx, target, &spec, events);
+                }
+            }
         }
         self.finish_turn(idx);
     }
@@ -809,71 +1279,147 @@ impl BattleState {
         }
     }
 
-    /// Resolve one physical attack with a fixed RNG draw order (see the module docs).
-    fn resolve_attack(&mut self, attacker: usize, target: usize, events: &mut Vec<BattleEvent>) {
+    /// Pay `cost` MP (announced; nothing for a cost of 0).
+    fn spend_mp(&mut self, idx: usize, cost: u16, events: &mut Vec<BattleEvent>) {
+        if cost == 0 {
+            return;
+        }
+        if let Some(c) = self.actors.get_mut(idx) {
+            c.mp = c.mp.saturating_sub(u32::from(cost));
+            events.push(BattleEvent::MpSpent { actor: ActorId(idx as u8), amount: u32::from(cost) });
+        }
+    }
+
+    /// Play one action on one target: restoring (an ally) or offensive (an enemy).
+    fn resolve_action(&mut self, actor: usize, target: usize, spec: &ActionSpec, events: &mut Vec<BattleEvent>) {
+        if spec.heals() {
+            self.resolve_restore(actor, target, spec, events);
+        } else {
+            self.resolve_offense(actor, target, spec, events);
+        }
+    }
+
+    /// Resolve one offensive action with a fixed RNG draw order (see the module docs).
+    fn resolve_offense(&mut self, attacker: usize, target: usize, spec: &ActionSpec, events: &mut Vec<BattleEvent>) {
         let actor_id = ActorId(attacker as u8);
         let target_id = ActorId(target as u8);
-        let luck_roll = self.rng.range_inclusive(0, 99);
-        let miss_roll = percent_roll(self.rng.next_u16());
+        // The rolls to hit come first, in a fixed order, whether or not the target's affinity makes
+        // them moot.
+        let (luck_roll, miss_roll) = match (spec.rolls_accuracy, spec.kind) {
+            (false, _) => (0, 0),
+            (true, ActionKind::Physical) => {
+                let luck = self.rng.range_inclusive(0, 99);
+                (luck, percent_roll(self.rng.next_u16()))
+            }
+            (true, ActionKind::Magical) => (0, percent_roll(self.rng.next_u16())),
+        };
 
-        let (hit, critical_chance_pct, damage_template) = {
+        let (hit, critical_chance_pct, response) = {
             let (Some(a), Some(t)) = (self.actors.get(attacker), self.actors.get(target)) else {
                 return;
             };
-            let chance = hit_chance(a, t);
-            let hit = resolve_hit(a, t, chance, luck_roll, miss_roll);
-            let halve = a.short_range && (t.row == Row::Back || a.row == Row::Back);
-            (
-                hit,
-                critical_chance(a, t),
-                DamageInput {
-                    attack: a.attack,
-                    level: u32::from(a.level),
-                    power: a.attack_power,
-                    defense: t.defense,
-                    critical: false,
-                    halve_for_row: halve,
-                    variance_roll: 0,
-                },
-            )
+            let response = t.affinity_for(spec.element_mask);
+            // What is nullified, absorbed or fully healed by an element is never missed.
+            let sure = matches!(response, Some(AffinityRate::Nullify | AffinityRate::Absorb | AffinityRate::FullHeal));
+            let hit = !spec.rolls_accuracy
+                || sure
+                || match spec.kind {
+                    ActionKind::Physical => {
+                        resolve_hit(a, t, hit_chance_with(a, t, spec.accuracy), luck_roll, miss_roll)
+                    }
+                    ActionKind::Magical => magic_hit_chance(spec.accuracy, t) >= i64::from(miss_roll),
+                };
+            (hit, critical_chance(a, t), response)
         };
 
         if !hit {
-            events.push(BattleEvent::Miss {
-                actor: actor_id,
-                target: target_id,
-            });
+            events.push(BattleEvent::Miss { actor: actor_id, target: target_id });
             return;
         }
 
-        let crit_roll = percent_roll(self.rng.next_u16());
-        let critical = critical_chance_pct >= crit_roll;
-        let variance_roll = self.rng.range_inclusive(0, 255);
-        let amount = physical_damage(&DamageInput {
-            critical,
-            variance_roll,
-            ..damage_template
-        });
+        let critical = spec.can_crit && critical_chance_pct >= percent_roll(self.rng.next_u16());
+        let variance = if spec.formula.has_variance() { self.rng.range_inclusive(0, 255) } else { 0 };
 
-        let mut died = false;
-        if let Some(t) = self.actors.get_mut(target) {
-            t.hp = t.hp.saturating_sub(amount);
-            if t.hp == 0 {
-                died = true;
-                t.gauge = 0;
-                t.ready = false;
+        let Some(victim) = self.actors.get(target) else { return };
+        let damage_of = |elemental: Elemental, critical: bool| {
+            self.actors
+                .get(attacker)
+                .map_or(0, |a| action_damage(spec, a, victim, elemental, Rolls { critical, variance }))
+        };
+        let outcome = match response {
+            Some(AffinityRate::Nullify) => Offense::Damage { amount: 0, critical: false },
+            Some(AffinityRate::Death) => Offense::Damage { amount: victim.hp.max(1), critical: false },
+            Some(AffinityRate::FullHeal) => Offense::Heal(victim.max_hp),
+            Some(AffinityRate::Absorb) => Offense::Heal(damage_of(Elemental::Normal, false)),
+            _ => Offense::Damage { amount: damage_of(Elemental::of(response), critical), critical },
+        };
+        match outcome {
+            Offense::Damage { amount, critical } => {
+                let mut died = false;
+                if let Some(t) = self.actors.get_mut(target) {
+                    t.hp = t.hp.saturating_sub(amount);
+                    if t.hp == 0 {
+                        died = true;
+                        t.gauge = 0;
+                        t.ready = false;
+                        t.defending = false;
+                    }
+                }
+                events.push(BattleEvent::Damage { actor: actor_id, target: target_id, amount, critical });
+                if died {
+                    events.push(BattleEvent::Death { actor: target_id });
+                }
+                self.check_outcome(events);
+            }
+            Offense::Heal(amount) => {
+                let gained = match self.actors.get_mut(target) {
+                    Some(t) => {
+                        let gained = amount.min(t.max_hp.saturating_sub(t.hp));
+                        t.hp += gained;
+                        gained
+                    }
+                    None => 0,
+                };
+                events.push(BattleEvent::Heal { actor: actor_id, target: target_id, amount: gained });
             }
         }
-        events.push(BattleEvent::Damage {
-            actor: actor_id,
-            target: target_id,
-            amount,
-            critical,
-        });
-        if died {
-            events.push(BattleEvent::Death { actor: target_id });
+    }
+
+    /// Resolve one restoring action on an ally: HP, MP, both (Elixir) or a revival.
+    fn resolve_restore(&mut self, user: usize, target: usize, spec: &ActionSpec, events: &mut Vec<BattleEvent>) {
+        let actor_id = ActorId(user as u8);
+        let target_id = ActorId(target as u8);
+        let variance = if spec.formula.has_variance() { self.rng.range_inclusive(0, 255) } else { 0 };
+        let amount = {
+            let (Some(u), Some(t)) = (self.actors.get(user), self.actors.get(target)) else {
+                return;
+            };
+            restore_amount(spec, u, t, variance)
+        };
+        let Some(t) = self.actors.get_mut(target) else { return };
+        if spec.formula == Formula::Full {
+            let hp = t.max_hp.saturating_sub(t.hp);
+            let mp = t.max_mp.saturating_sub(t.mp);
+            t.hp += hp;
+            t.mp += mp;
+            events.push(BattleEvent::Heal { actor: actor_id, target: target_id, amount: hp });
+            events.push(BattleEvent::MpRestored { actor: actor_id, target: target_id, amount: mp });
+        } else if spec.hits_dead {
+            let hp = amount.clamp(1, t.max_hp.max(1));
+            t.hp = hp;
+            t.gauge = 0;
+            t.ready = false;
+            t.defending = false;
+            events.push(BattleEvent::Revive { actor: actor_id, target: target_id, hp });
+        } else if spec.hits_mp {
+            let gained = amount.min(t.max_mp.saturating_sub(t.mp));
+            t.mp += gained;
+            events.push(BattleEvent::MpRestored { actor: actor_id, target: target_id, amount: gained });
+        } else {
+            let gained = amount.min(t.max_hp.saturating_sub(t.hp));
+            t.hp += gained;
+            events.push(BattleEvent::Heal { actor: actor_id, target: target_id, amount: gained });
         }
-        self.check_outcome(events);
     }
 
     /// Set the outcome if a side has been wiped out (enemies are checked first).
@@ -901,6 +1447,14 @@ impl BattleState {
     }
 }
 
+/// What an offensive action did to its target.
+enum Offense {
+    /// Hurt it by this much (0 for a nullified element).
+    Damage { amount: u32, critical: bool },
+    /// Healed it (an absorbed element, a full heal).
+    Heal(u32),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -920,6 +1474,38 @@ mod tests {
         BattleConfig {
             start: StartMode::Zero,
             ..BattleConfig::default()
+        }
+    }
+
+    /// One line per event, for golden logs: `ready 0 | act 0 attack | dmg 0->2 90 | ...`.
+    fn render(log: &[BattleEvent]) -> String {
+        log.iter().map(render_event).collect::<Vec<_>>().join(" | ")
+    }
+
+    fn render_event(e: &BattleEvent) -> String {
+        match e {
+            BattleEvent::GaugeReady { actor } => format!("ready {}", actor.0),
+            BattleEvent::Damage { actor, target, amount, critical } => {
+                format!("dmg {}->{} {}{}", actor.0, target.0, amount, if *critical { " crit" } else { "" })
+            }
+            BattleEvent::Miss { actor, target } => format!("miss {}->{}", actor.0, target.0),
+            BattleEvent::Death { actor } => format!("death {}", actor.0),
+            BattleEvent::Victory => "victory".to_string(),
+            BattleEvent::Defeat => "defeat".to_string(),
+            BattleEvent::Action { actor, action } => {
+                let what = match action {
+                    ActionRef::Attack => "attack".to_string(),
+                    ActionRef::Magic(s) => format!("magic {s}"),
+                    ActionRef::Item(i) => format!("item {i}"),
+                    ActionRef::Defend => "defend".to_string(),
+                    ActionRef::EnemyAttack(a) => format!("enemy-attack {a}"),
+                };
+                format!("act {} {what}", actor.0)
+            }
+            BattleEvent::Heal { actor, target, amount } => format!("heal {}->{} {amount}", actor.0, target.0),
+            BattleEvent::MpSpent { actor, amount } => format!("mp-spent {} {amount}", actor.0),
+            BattleEvent::MpRestored { actor, target, amount } => format!("mp-restored {}->{} {amount}", actor.0, target.0),
+            BattleEvent::Revive { actor, target, hp } => format!("revive {}->{} {hp}", actor.0, target.0),
         }
     }
 
@@ -984,6 +1570,8 @@ mod tests {
             defense: 2,
             critical: false,
             halve_for_row: false,
+            defending: false,
+            elemental: Elemental::Normal,
             variance_roll: 255,
         };
         assert_eq!(physical_damage(&base), 21);
@@ -1028,6 +1616,8 @@ mod tests {
             defense: 50,
             critical: false,
             halve_for_row: false,
+            defending: false,
+            elemental: Elemental::Normal,
             variance_roll: 255,
         };
         assert_eq!(physical_damage(&big), 785);
@@ -1248,35 +1838,14 @@ mod tests {
         // must never change silently, because server and clients rely on it.
         let mut state = simple_battle(1234, zero_start());
         let log = play_out(&mut state, 600);
-        let rendered: Vec<String> = log
-            .iter()
-            .map(|e| match e {
-                BattleEvent::GaugeReady { actor } => format!("ready {}", actor.0),
-                BattleEvent::Damage {
-                    actor,
-                    target,
-                    amount,
-                    critical,
-                } => {
-                    format!(
-                        "dmg {}->{} {}{}",
-                        actor.0,
-                        target.0,
-                        amount,
-                        if *critical { " crit" } else { "" }
-                    )
-                }
-                BattleEvent::Miss { actor, target } => format!("miss {}->{}", actor.0, target.0),
-                BattleEvent::Death { actor } => format!("death {}", actor.0),
-                BattleEvent::Victory => "victory".to_string(),
-                BattleEvent::Defeat => "defeat".to_string(),
-            })
-            .collect();
         assert_eq!(state.outcome(), Some(Outcome::Victory));
+        // The numbers are exactly the ones this battle had before magic, items and enemy attacks
+        // existed: hand-made fighters have no spells and no attack list, so they draw what they drew
+        // then. Only the "act" lines are new (every action is announced).
         assert_eq!(
-            rendered.join(" | "),
-            "ready 0 | dmg 0->2 90 | ready 1 | dmg 1->2 81 | death 2 | ready 3 | \
-             dmg 3->1 28 | ready 0 | dmg 0->3 92 | death 3 | victory"
+            render(&log),
+            "ready 0 | act 0 attack | dmg 0->2 90 | ready 1 | act 1 attack | dmg 1->2 81 | death 2 | \
+             ready 3 | act 3 attack | dmg 3->1 28 | ready 0 | act 0 attack | dmg 0->3 92 | death 3 | victory"
         );
     }
 
@@ -1712,6 +2281,8 @@ mod tests {
             defense: u32::MAX,
             critical: true,
             halve_for_row: false,
+            defending: true,
+            elemental: Elemental::Double,
             variance_roll: u32::MAX,
         };
         assert!((1..=MAX_DAMAGE).contains(&physical_damage(&max)));
