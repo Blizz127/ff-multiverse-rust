@@ -147,13 +147,17 @@ pub(super) struct BattleWorld {
     rng: Rng,
 }
 
-/// An area's random encounters as they run here: its table (only a table that can trigger at all,
-/// and only when random encounters are on) and the distance between two rolls.
+/// An area's encounters as they run here: its table (only a table that can trigger at all), the
+/// distance between two random rolls, and whether random rolls happen. The table is kept even when
+/// random encounters are off, so a debug encounter request that names no formation still picks
+/// from the area's own table instead of the rules' fallback formation.
 #[derive(Debug, Clone)]
 pub(super) struct AreaEncounters {
     pub table: EncounterTable,
     /// Horizontal distance between two random-encounter rolls.
     pub step: f64,
+    /// Whether walking here rolls random encounters (`--no-random-encounters` turns this off).
+    pub random: bool,
 }
 
 impl BattleWorld {
@@ -167,11 +171,12 @@ impl BattleWorld {
         Self { settings, debug_encounters, battles: BTreeMap::new(), next_id: 1, rng }
     }
 
-    /// The random encounters of `area` under these settings (`None`: it rolls none).
+    /// The encounters of `area` under these settings (`None`: it has no usable table). Random rolls
+    /// happen only when `random` is set; the table also serves debug requests that name no formation.
     pub(super) fn area_encounters(&self, area: &dyn AreaRuntime) -> Option<AreaEncounters> {
-        let table = area.encounters().filter(|t| self.settings.random_encounters && !t.is_empty())?;
+        let table = area.encounters().filter(|t| !t.is_empty())?;
         let step = f64::from(self.settings.encounter_step_units.unwrap_or_else(|| area.max_speed())).max(1.0);
-        Some(AreaEncounters { table, step })
+        Some(AreaEncounters { table, step, random: self.settings.random_encounters })
     }
 
     /// The seed of the next battle.
@@ -515,7 +520,7 @@ impl World {
                     told.push((entity, Arc::new(progress::message(rules.as_ref(), &own, false))));
                 }
                 self.logs.info(format!(
-                    "battle reward battle={} account={} exp=0 gil=0 ap=0 delivered={connected}: nothing to pay (dead at the end), nothing saved",
+                    "battle reward battle={} account={} exp=0 gil=0 ap=0 delivered={connected}: nothing to pay (no reward for this member: dead at the end, or the formation gives none), nothing saved",
                     id.0, r.account.0
                 ));
                 continue;
@@ -587,7 +592,7 @@ impl World {
             let Some(bw) = self.battle.as_mut() else { return };
             let Some(p) = self.players.get_mut(&entity) else { return };
             // The table of the area the player walks in.
-            let Some(encounters) = self.areas.get(&p.area).and_then(|a| a.encounters()) else { return };
+            let Some(encounters) = self.areas.get(&p.area).and_then(|a| a.encounters()).filter(|e| e.random) else { return };
             let rate = u32::from(encounters.table.rate);
             let step = encounters.step;
             p.walked += dist;
@@ -1516,5 +1521,30 @@ mod tests {
             _ => None,
         });
         assert!(matches!(f, Some(0 | 1)), "{f:?}");
+    }
+
+    #[test]
+    fn with_random_encounters_off_a_debug_request_still_picks_from_the_areas_table_and_walking_rolls_nothing() {
+        // Regression: `--no-random-encounters` used to drop the area's table entirely, so a debug
+        // request that named no formation fell through to the rules' default formation (in FF7 a
+        // one-enemy formation that pays nothing) instead of the field's own table.
+        let t0 = Instant::now();
+        let mut s = settings(SyntheticRules::default());
+        s.random_encounters = false;
+        s.encounter_step_units = Some(10.0);
+        // A table naming only formation 1, so the rules' default (0) is distinguishable.
+        let only_one = EncounterTable { rate: 255, entries: vec![EncounterEntry { formation: 1, weight: 64 }] };
+        let mut w = wild_world(Some(only_one.clone()), Some(s.clone()), true);
+        let mut a = seat(&mut w, "A", t0);
+        // Walking with random encounters off starts nothing, even at rate 255.
+        assert_eq!(pace(&mut w, &a, t0, 300), None);
+        assert_eq!(w.battle_count(), 0);
+        a.drain();
+        assert_eq!(w.request_encounter(a.entity, None, ms(t0, 120_000)), BattleReply::Done);
+        let f = a.battle_msgs().iter().find_map(|m| match m {
+            ServerMsg::EncounterStart { formation_id, .. } => Some(*formation_id),
+            _ => None,
+        });
+        assert_eq!(f, Some(1), "the area's table, not the rules' default");
     }
 }
