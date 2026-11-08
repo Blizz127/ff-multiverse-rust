@@ -62,8 +62,15 @@ impl Offscreen {
         self.gpu.cached_avatar_models()
     }
 
-    /// [`Offscreen::render`] with the players drawn as models over the scene (and the scenery in
-    /// front of them) when `avatars` is given: the window's own sequence, [`Gpu::draw_field`].
+    /// The scenery the avatar renderer holds: uploads so far (one per field, not per frame), the
+    /// identity of the current one and the draw calls it takes a frame.
+    pub fn scenery_state(&self) -> (u32, Option<u64>, usize) {
+        self.gpu.scenery_state()
+    }
+
+    /// [`Offscreen::render`] with the players drawn as models, and the picture as depth-tested tiles
+    /// around them when the frame has a scenery, when `avatars` is given: the window's own sequence,
+    /// [`Gpu::draw_field`].
     pub fn render_field(
         &mut self,
         w: u32,

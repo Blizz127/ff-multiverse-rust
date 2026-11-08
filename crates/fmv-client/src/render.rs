@@ -236,6 +236,12 @@ pub fn color(rgb: [u8; 3], srgb_target: bool) -> [f32; 4] {
     [f(rgb[0]), f(rgb[1]), f(rgb[2]), 1.0]
 }
 
+/// The clear colour for `rgb` (sRGB bytes) on a target that is `srgb` or not (see [`color`]).
+pub fn clear_color(rgb: [u8; 3], srgb: bool) -> wgpu::Color {
+    let c = color(rgb, srgb);
+    wgpu::Color { r: f64::from(c[0]), g: f64::from(c[1]), b: f64::from(c[2]), a: 1.0 }
+}
+
 fn brighten(rgb: [u8; 3]) -> [u8; 3] {
     rgb.map(|c| (f32::from(c) + (255.0 - f32::from(c)) * 0.4).round() as u8)
 }
@@ -565,10 +571,18 @@ impl Gpu {
         self.avatars.cached_models()
     }
 
-    /// Draw one frame of a field view into `target` (`size` pixels): the scene (picture, then the
-    /// flat shapes), and, when `avatars` is given, the players' ground marks with it and then the
-    /// models and the scenery in front of them over it. Without avatars this is exactly
-    /// [`Gpu::draw_scene`] over the scene's backdrop and vertices.
+    /// Draw one frame of a field view into `target` (`size` pixels). Without `avatars` this is
+    /// exactly [`Gpu::draw_scene`] over the scene's backdrop and vertices.
+    ///
+    /// With `avatars` the players are models, and the frame is drawn in one of two ways:
+    ///
+    /// * **Depth-tested scenery**, when the frame has models and a scenery
+    ///   ([`crate::avatar::scenery`]) the device can hold: pass 1 draws the picture as tiles with
+    ///   their depth (the flat picture is not drawn), pass 2 the flat shapes (walkmesh overlay,
+    ///   markers) over it, and pass 3 the marks on the ground, the models and the blended tiles, all
+    ///   tested against the tiles' depth ([`crate::avatar::gpu`]).
+    /// * **Flat picture**, otherwise: the scene as it always was (picture, flat shapes), then the
+    ///   marks and the models over it with a fresh depth buffer.
     pub fn draw_field(
         &mut self,
         target: &wgpu::TextureView,
@@ -578,24 +592,33 @@ impl Gpu {
         srgb: bool,
     ) {
         let (w, h) = size;
+        // The one fitted camera everything of the frame is placed by.
+        let cam = Camera::fit(&scene.bounds, w.max(1) as f32, h.max(1) as f32, MARGIN_PX);
+        let vertices = build_vertices(scene, w, h, srgb);
+        let tiled = avatars.filter(|f| !f.models.is_empty() && self.avatars.prepare_scenery(f));
+        if let Some(frame) = tiled {
+            self.avatars.draw_scenery(target, size, &cam, frame, clear_color(CLEAR_RGB, srgb));
+            self.draw_shapes(target, &vertices);
+            self.avatars.draw_models(target, size, &cam, frame, true);
+            return;
+        }
         // The picture goes to the GPU once (again only if it changes); without one, or if the
         // device cannot hold it, the walkmesh is drawn on its own.
         let quad = match scene.backdrop {
             Some(b) if self.ensure_backdrop(b) => backdrop_quad(scene, w, h),
             _ => None,
         };
-        let mut vertices = build_vertices(scene, w, h, srgb);
-        // The one fitted camera everything of the frame is placed by.
-        let cam = Camera::fit(&scene.bounds, w.max(1) as f32, h.max(1) as f32, MARGIN_PX);
-        if let Some(frame) = avatars {
-            vertices.extend(frame.ground_vertices(&cam, w, h, srgb));
-        }
         self.draw_scene(target, &vertices, quad.as_ref(), CLEAR_RGB, srgb);
         if let Some(frame) = avatars {
-            // The scenery in front of the models lies on the picture's own rectangle.
-            let front_quad = frame.front.as_deref().and_then(|front| backdrop_quad(&Scene { backdrop: Some(front), ..*scene }, w, h));
-            self.avatars.draw(target, size, &cam, frame, front_quad.as_ref());
+            self.avatars.draw_models(target, size, &cam, frame, false);
         }
+    }
+
+    /// What the avatar renderer holds of the scenery: uploads so far, the identity of the current
+    /// one and the draw calls it takes a frame (tests).
+    #[cfg(test)]
+    pub fn scenery_state(&self) -> (u32, Option<u64>, usize) {
+        self.avatars.scenery_state()
     }
 
     /// Draw the UI overlay `vertices` (see [`crate::ui::draw::DrawList::vertices`]) over what
@@ -687,16 +710,9 @@ impl Gpu {
         })
     }
 
-    /// Clear `target`, draw the backdrop `quad` first when there is one and a picture was
-    /// uploaded with [`Gpu::ensure_backdrop`], then `vertices` over it.
-    pub fn draw_scene(
-        &mut self,
-        target: &wgpu::TextureView,
-        vertices: &[Vertex],
-        quad: Option<&[QuadVertex; 6]>,
-        clear_rgb: [u8; 3],
-        srgb: bool,
-    ) {
+    /// Upload `vertices` (at most [`MAX_VERTICES`]) to the vertex buffer, growing it when needed.
+    /// Returns the vertices kept and the bytes they take.
+    fn upload_vertices<'v>(&mut self, vertices: &'v [Vertex]) -> (&'v [Vertex], u64) {
         let vertices = &vertices[..vertices.len().min(MAX_VERTICES)];
         let bytes: &[u8] = bytemuck::cast_slice(vertices);
         let need = bytes.len() as u64;
@@ -708,16 +724,60 @@ impl Gpu {
         if !bytes.is_empty() {
             self.queue.write_buffer(&self.vertex_buf, 0, bytes);
         }
+        (vertices, need)
+    }
+
+    /// Draw `vertices` (flat shapes, painter's order) over what `target` holds: no clear, no
+    /// picture, no depth. The shapes of a frame whose picture the avatar renderer drew as tiles.
+    pub fn draw_shapes(&mut self, target: &wgpu::TextureView, vertices: &[Vertex]) {
+        let (vertices, need) = self.upload_vertices(vertices);
+        // `set_vertex_buffer` panics on an empty slice, so only draw when there is geometry.
+        if need == 0 {
+            return;
+        }
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("fmv-shapes"),
+        });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("fmv-shapes-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_vertex_buffer(0, self.vertex_buf.slice(0..need));
+            pass.draw(0..u32::try_from(vertices.len()).unwrap_or(u32::MAX), 0..1);
+        }
+        self.queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    /// Clear `target`, draw the backdrop `quad` first when there is one and a picture was
+    /// uploaded with [`Gpu::ensure_backdrop`], then `vertices` over it.
+    pub fn draw_scene(
+        &mut self,
+        target: &wgpu::TextureView,
+        vertices: &[Vertex],
+        quad: Option<&[QuadVertex; 6]>,
+        clear_rgb: [u8; 3],
+        srgb: bool,
+    ) {
+        let (vertices, need) = self.upload_vertices(vertices);
+        let no_shapes = need == 0;
         if let Some(quad) = quad {
             self.queue.write_buffer(&self.quad_buf, 0, bytemuck::cast_slice(quad));
         }
-        let c = color(clear_rgb, srgb);
-        let clear = wgpu::Color {
-            r: f64::from(c[0]),
-            g: f64::from(c[1]),
-            b: f64::from(c[2]),
-            a: 1.0,
-        };
+        let clear = clear_color(clear_rgb, srgb);
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("fmv-frame"),
@@ -746,7 +806,7 @@ impl Gpu {
                 pass.draw(0..6, 0..1);
             }
             // `set_vertex_buffer` panics on an empty slice, so only draw when there is geometry.
-            if !bytes.is_empty() {
+            if !no_shapes {
                 pass.set_pipeline(&self.pipeline);
                 pass.set_vertex_buffer(0, self.vertex_buf.slice(0..need));
                 pass.draw(0..u32::try_from(vertices.len()).unwrap_or(u32::MAX), 0..1);
@@ -921,8 +981,9 @@ impl Renderer {
         self.render_layers(scene, None, overlay)
     }
 
-    /// Draw `scene`, then the players as models (and the scenery in front of them) when `avatars`
-    /// is given, then the UI `overlay`. Without avatars it is exactly [`Renderer::render_with`].
+    /// Draw `scene` and, when `avatars` is given, the players as models with the picture as
+    /// depth-tested tiles around them ([`Gpu::draw_field`]), then the UI `overlay`. Without avatars it
+    /// is exactly [`Renderer::render_with`].
     pub fn render_layers(
         &mut self,
         scene: &Scene<'_>,

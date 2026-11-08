@@ -1,11 +1,11 @@
 //! What drawing characters in an FF7 field needs to know about the field: its camera, how big a
-//! model is in it, how fast a character moves in it, and the part of the scenery that stands in
-//! front of the characters.
+//! model is in it, how fast a character moves in it, and its scenery as depth-tested tiles (what
+//! hides a character and what does not).
 //!
 //! [`crate::backdrop::FieldView::ff7`] builds the [`Stage`] next to the picture and the walkmesh
 //! view; it is the only place that reads these field facts. Nothing here is sent anywhere.
 
-use crate::backdrop::Backdrop;
+use super::scenery::Scenery;
 use fmv_ff7::field::Camera;
 use std::sync::Arc;
 
@@ -76,11 +76,12 @@ pub struct Stage {
     /// area's `max_speed`).
     pub walk_speed: f32,
     pub run_speed: f32,
-    /// The scenery in front of the characters (layers 2 and 4 of the background), drawn over them,
-    /// on the same rectangle as the picture. `None` when the characters are to be drawn over the
-    /// whole picture: no such layers, or they contain blended tiles, which a flat image cannot
-    /// show correctly (see `fmv_ff7::background`'s notes on drawing characters between layers).
-    pub front: Option<Arc<Backdrop>>,
+    /// The field's picture as depth-tested tiles ([`Scenery`]), drawn instead of the flat picture
+    /// when the characters are models: a tile nearer to the camera than a character hides it and a
+    /// farther one does not, as in the game. `None` when the characters are to be drawn over the
+    /// whole flat picture: nothing in front of them (no tile of layer 2 or 4), or tiles that do not
+    /// fit an atlas.
+    pub scenery: Option<Arc<Scenery>>,
 }
 
 #[cfg(test)]
