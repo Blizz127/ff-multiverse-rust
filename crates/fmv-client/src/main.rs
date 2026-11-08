@@ -38,6 +38,7 @@ use clap::Parser;
 use cli::{exit, Args, GameChoice};
 use fmv_adapter_api::GameAdapter;
 use fmv_core::GameId;
+use fmv_fixture::rooms::RoomsAdapter;
 use fmv_fixture::FixtureAdapter;
 use fmv_ff7::Ff7Adapter;
 use login::LoginPlan;
@@ -69,6 +70,9 @@ struct LocalGame {
     client_build: String,
     /// FF7 only: the same adapter, shared so the window can read render data from it.
     ff7: Option<Arc<Ff7Adapter>>,
+    /// The content the session loads the areas the server moves it to from (`None`: the game has
+    /// only one area, so there is nowhere to be moved to).
+    content: Option<Arc<dyn GameAdapter>>,
 }
 
 /// Open the content for `--game`. An `Err` is a message for the user and ends the run with
@@ -80,6 +84,13 @@ fn open_game(args: &Args) -> Result<LocalGame, String> {
             adapter: Box::new(FixtureAdapter::new()),
             client_build: format!("fmv-client/{version}"),
             ff7: None,
+            content: None,
+        }),
+        GameChoice::FixtureRooms => Ok(LocalGame {
+            adapter: Box::new(RoomsAdapter::new()),
+            client_build: format!("fmv-client/{version}"),
+            ff7: None,
+            content: Some(Arc::new(RoomsAdapter::new())),
         }),
         GameChoice::Ff7 => {
             let opened = ff7::open_ff7(&args.ff7_source()).map_err(|e| format!("--game ff7: {e}"))?;
@@ -105,6 +116,7 @@ fn open_game(args: &Args) -> Result<LocalGame, String> {
             Ok(LocalGame {
                 adapter: Box::new(ff7::SharedFf7(Arc::clone(&opened.adapter))),
                 client_build: format!("fmv-client/{version}+{}", ff7::build_tag()),
+                content: Some(opened.adapter.clone()),
                 ff7: Some(opened.adapter),
             })
         }
@@ -155,6 +167,10 @@ fn announce_joined(joined: &net::Joined) {
 /// content is opened first, as in every other mode, so the (slow) FF7 indexing never counts
 /// against a handshake deadline.
 fn run_menu(args: &Args, state_dir: &Path, store: TokenStore) -> u8 {
+    if args.effective_game() == GameChoice::FixtureRooms {
+        eprintln!("error: --game fixture-rooms is for command-line play: give --name (and --headless for a bot)");
+        return exit::FAILURE;
+    }
     let LocalGame { client_build, ff7, .. } = match open_game(args) {
         Ok(game) => game,
         Err(e) => {
@@ -172,7 +188,8 @@ fn run_menu(args: &Args, state_dir: &Path, store: TokenStore) -> u8 {
         }
     };
     let game = match args.effective_game() {
-        GameChoice::Fixture => GameId::Fixture,
+        // (`--game fixture-rooms` was refused above: the menu only knows the one-area fixture.)
+        GameChoice::Fixture | GameChoice::FixtureRooms => GameId::Fixture,
         GameChoice::Ff7 => GameId::Ff7,
     };
     ui::shell::run(
@@ -222,6 +239,7 @@ fn run(args: Args) -> u8 {
         adapter,
         client_build,
         ff7,
+        content,
     } = match open_game(&args) {
         Ok(game) => game,
         Err(e) => {
@@ -284,9 +302,9 @@ fn run(args: Args) -> u8 {
     }
 
     let mut session = Session::new(net, joined);
-    if let Some(adapter) = &ff7 {
-        // This machine's own FF7 data is what lets the session follow the server to other areas.
-        session = session.with_content(adapter.clone());
+    if let Some(content) = &content {
+        // This machine's own game content is what lets the session follow the server to other areas.
+        session = session.with_content(Arc::clone(content));
     }
     match event_loop {
         None => headless::run(&args, session),

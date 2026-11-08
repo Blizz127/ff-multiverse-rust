@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# scripts/travel-smoke.sh - area-travel smoke test for fmv-server + fmv-client (real FF7 data).
+# scripts/travel-smoke.sh - area-travel smoke test for fmv-server + fmv-client.
 #
-# Usage: scripts/travel-smoke.sh [--release|--debug] [--bin-dir DIR] [--build] [--library STATE_DIR]
-#                                [--duration SECS] [--keep-logs] [-h|--help]
+# Usage: scripts/travel-smoke.sh [--fixture] [--release|--debug] [--bin-dir DIR] [--build]
+#                                [--library STATE_DIR] [--duration SECS] [--keep-logs] [-h|--help]
 #
-# The server hosts the real FF7 field md1stin from the owner's own imported library (read-only) and
-# serves every other field its exits lead to (they are loaded when the first player walks there).
-# Two headless bots form a party in md1stin and walk through the exits:
+# DEFAULT MODE (real data): the server hosts the real FF7 field md1stin from the owner's own imported
+# library (read-only) and serves every other field its exits lead to (they are loaded when the first
+# player walks there). Two headless bots form a party in md1stin and walk through the exits:
 #   A: --travel md1_1,md1stin --party-invite-first-peer     (there, wait for B, and back again)
 #   B: --travel md1_1 --party-accept                        (there, and stays)
 # Both hold still until the party exists, walk to the gateway of md1stin that leads to md1_1 (the
@@ -18,21 +18,25 @@
 # plus, in the logs:
 #   * each bot's `travel:` lines say it entered md1_1, and A's say it saw B there (the peers counter
 #     of the area it left) before going back to md1stin;
-#   * the NPCs of md1stin were announced (`headless: N NPC(s) in Ff7/md1stin: ...`, N >= 1) and so
-#     were md1_1's;
+#   * the NPCs of md1stin were announced (`headless: N NPC(s) in Ff7/md1stin: ...`, N >= 1);
 #   * the server logged the load of md1_1 ("area loaded") and no bot reported a BATTLE DIVERGENCE.
 # Random encounters are off (--no-random-encounters): a bot without --battle-auto would stand frozen in
 # the first battle for good, and this smoke is about walking.
 #
+# --fixture: the same story on the synthetic FIXTURE rooms (no owned data needed; NOT FF7): the server
+# runs `--game fixture-rooms --ephemeral`, the bots `--game fixture-rooms`; A travels yard,hall and B
+# travels yard, starting in the hall. The yard has one NPC (`guard`). Expected: A ends in Fixture/hall
+# with area_changes=2, B in Fixture/yard with area_changes=1 and a peer seen, the yard's NPC announced.
+#
 # Isolation (the owner's state directory is never touched, only its LIBRARY is read): the server and the
 # clients run with XDG_DATA_HOME/XDG_STATE_HOME/XDG_CONFIG_HOME/XDG_CACHE_HOME and FMV_STATE_DIR
-# pointing into a throw-away directory, the server with --state-dir inside it, each client with its own
-# --state-dir. The library is reached through a symlink `<work>/lib-state/library -> <STATE_DIR>/library`
-# passed as --ff7-library, so nothing under STATE_DIR can be created or written. The script lists
-# STATE_DIR before and after and fails if it changed.
+# pointing into a throw-away directory, the server with --state-dir (or --ephemeral) inside it, each
+# client with its own --state-dir. The library is reached through a symlink
+# `<work>/lib-state/library -> <STATE_DIR>/library` passed as --ff7-library, so nothing under STATE_DIR
+# can be created or written. The script lists STATE_DIR before and after and fails if it changed.
 #
 # --library STATE_DIR is the directory that CONTAINS `library/` (default: $FMV_FF7_LIBRARY, else the
-# owner's default state directory ~/.local/share/ff-multiverse).
+# owner's default state directory ~/.local/share/ff-multiverse). Ignored with --fixture.
 #
 # Exit status: 0 = pass, 1 = failure (reasons and log tails are printed, logs are kept), 2 = usage.
 #
@@ -51,20 +55,23 @@ err() { printf 'travel-smoke.sh: error: %s\n' "$*" >&2; }
 
 LIBRARY="${FMV_FF7_LIBRARY:-$HOME/.local/share/ff-multiverse}"
 TRAVEL_DURATION=45
+MODE=real
 
 usage() {
   cat <<'EOF'
-Usage: scripts/travel-smoke.sh [--release|--debug] [--bin-dir DIR] [--build] [--library STATE_DIR]
-                               [--duration SECS] [--keep-logs] [-h|--help]
+Usage: scripts/travel-smoke.sh [--fixture] [--release|--debug] [--bin-dir DIR] [--build]
+                               [--library STATE_DIR] [--duration SECS] [--keep-logs] [-h|--help]
 
 Two headless bots form a party on the real FF7 field md1stin, both walk through its gateway to md1_1
 (the server watches the exit line and moves them; each client loads md1_1 from its own copy), see each
 other there, and one walks back to md1stin. Passes when both exit 0 with area_changes >= 1 (A ends in
 md1stin with area_changes 2, B in md1_1 with area_changes 1 and a peer seen), both were in a party of
-two, the NPCs of the fields were announced and the server loaded md1_1.
+two, the NPCs of the fields were announced and the server loaded md1_1. --fixture does the same on the
+synthetic FIXTURE rooms (hall and yard) and needs no owned data.
 
-  --library DIR     state directory that contains library/ (default $FMV_FF7_LIBRARY, else
-                     ~/.local/share/ff-multiverse); only the library is read, never written
+  --fixture          use the synthetic FIXTURE rooms instead of the real FF7 fields
+  --library DIR      state directory that contains library/ (default $FMV_FF7_LIBRARY, else
+                      ~/.local/share/ff-multiverse); only the library is read, never written
   --duration SECS    how long each bot runs (default 45)
 EOF
 }
@@ -75,19 +82,32 @@ area_changes_of() {
 }
 
 run_travel() {
-  local state_real="$LIBRARY"
-  [[ -d $state_real/library/sets ]] || {
-    err "no library under $state_real (needs owned FF7 content imported with fmv-import); pass --library STATE_DIR"
-    exit 1
-  }
-  local before after
-  before=$(ls -A -- "$state_real" | sort | tr '\n' ' ')
+  # The two areas of the story: START is where both bots join and A returns to, FAR is the one both
+  # walk to (md1stin -> md1_1 of FF7, or hall -> yard of the FIXTURE rooms); NPC_AREA is the area whose
+  # snapshot must announce NPCs.
+  local start_key far_key start_area far_area npc_area fixture_expected state_real="" before="" after=""
+  local -a server_args client_args
+  if [[ $MODE == fixture ]]; then
+    start_key=hall far_key=yard start_area=Fixture/hall far_area=Fixture/yard npc_area=Fixture/yard fixture_expected=true
+    mkdir -p -- "$WORK/state-env" "$WORK/client-A" "$WORK/client-B"
+    export FMV_STATE_DIR="$WORK/state-env"
+    server_args=(--bind 127.0.0.1:0 --game fixture-rooms --ephemeral)
+    client_args=(--game fixture-rooms)
+  else
+    start_key=md1stin far_key=md1_1 start_area=Ff7/md1stin far_area=Ff7/md1_1 npc_area=Ff7/md1stin fixture_expected=false
+    state_real="$LIBRARY"
+    [[ -d $state_real/library/sets ]] || {
+      err "no library under $state_real (needs owned FF7 content imported with fmv-import); pass --library STATE_DIR"
+      exit 1
+    }
+    before=$(ls -A -- "$state_real" | sort | tr '\n' ' ')
+    mkdir -p -- "$WORK/lib-state" "$WORK/state-env" "$WORK/server-state" "$WORK/client-A" "$WORK/client-B"
+    ln -s -- "$(cd -- "$state_real" && pwd -P)/library" "$WORK/lib-state/library"
+    export FMV_STATE_DIR="$WORK/state-env"
+    server_args=(--bind 127.0.0.1:0 --ff7-library "$WORK/lib-state" --state-dir "$WORK/server-state" --no-random-encounters)
+    client_args=(--ff7-library "$WORK/lib-state")
+  fi
 
-  mkdir -p -- "$WORK/lib-state" "$WORK/state-env" "$WORK/server-state" "$WORK/client-A" "$WORK/client-B"
-  ln -s -- "$(cd -- "$state_real" && pwd -P)/library" "$WORK/lib-state/library"
-  export FMV_STATE_DIR="$WORK/state-env"
-
-  local -a server_args=(--bind 127.0.0.1:0 --ff7-library "$WORK/lib-state" --state-dir "$WORK/server-state" --no-random-encounters)
   say "starting server: $SERVER_BIN ${server_args[*]}"
   "$SERVER_BIN" "${server_args[@]}" >"$WORK/server.log" 2>&1 &
   SERVER_PID=$!
@@ -96,16 +116,16 @@ run_travel() {
   local area fixture
   area=$(field "$READY_LINE" area)
   fixture=$(field "$READY_LINE" fixture)
-  [[ $area == Ff7/md1stin && $fixture == false ]] || fail "the server is not hosting the real FF7 field md1stin: $READY_LINE"
+  [[ $area == "$start_area" && $fixture == "$fixture_expected" ]] || fail "the server is not hosting $start_area (fixture=$fixture_expected): $READY_LINE"
 
   say "starting bots A and B for ${TRAVEL_DURATION}s against $CONNECT"
-  local common=(--server "$CONNECT" --headless --duration "$TRAVEL_DURATION" --bot circle --ff7-library "$WORK/lib-state")
+  local common=(--server "$CONNECT" --headless --duration "$TRAVEL_DURATION" --bot circle "${client_args[@]}")
   "$CLIENT_BIN" "${common[@]}" --name A --state-dir "$WORK/client-A" \
-    --party-invite-first-peer --travel md1_1,md1stin \
+    --party-invite-first-peer --travel "$far_key,$start_key" \
     >"$WORK/client-A.log" 2>&1 &
   CPID[A]=$!
   "$CLIENT_BIN" "${common[@]}" --name B --state-dir "$WORK/client-B" \
-    --party-accept --travel md1_1 \
+    --party-accept --travel "$far_key" \
     >"$WORK/client-B.log" 2>&1 &
   CPID[B]=$!
   wait_clients $((TRAVEL_DURATION + CLIENT_GRACE))
@@ -124,7 +144,7 @@ run_travel() {
       smoke_line=$(strip_ansi "$smoke_line")
       SMOKE_LINES+=("$smoke_line")
       LINE[$n]="$smoke_line"
-      [[ $(field "$smoke_line" fixture) == false ]] || problem "client $n: fixture is not false: $smoke_line"
+      [[ $(field "$smoke_line" fixture) == "$fixture_expected" ]] || problem "client $n: fixture is not $fixture_expected: $smoke_line"
       value=$(area_changes_of "$smoke_line")
       if [[ ! $value =~ ^[0-9]+$ ]]; then
         problem "client $n: the SMOKE line has no numeric area_changes: $smoke_line"
@@ -141,40 +161,41 @@ run_travel() {
     if log_has "$log" "DIVERGENCE"; then
       problem "client $n reported a BATTLE DIVERGENCE"
     fi
-    # The NPCs of the field it started in were announced (the snapshot of an area carries them).
-    log_has "$log" "NPC(s) in Ff7/md1stin" || problem "client $n was never told of any NPC in md1stin"
+    # The NPCs of the area were announced (the snapshot of an area carries them).
+    log_has "$log" "NPC(s) in $npc_area" || problem "client $n was never told of any NPC in $npc_area"
   done
 
-  # A: back in md1stin after two changes, and it saw B in md1_1 before leaving it.
+  # A: back in the start area after two changes, and it saw B in the far area before leaving it.
   if [[ -n ${LINE[A]:-} ]]; then
-    [[ $(field "${LINE[A]}" area) == Ff7/md1stin ]] || problem "A should end in Ff7/md1stin: ${LINE[A]}"
+    [[ $(field "${LINE[A]}" area) == "$start_area" ]] || problem "A should end in $start_area: ${LINE[A]}"
     [[ $(area_changes_of "${LINE[A]}") == 2 ]] || problem "A should have changed area twice (there and back): ${LINE[A]}"
     local leaving
-    leaving=$(last_line_with "$WORK/client-A.log" "peer(s) were seen in \`Ff7/md1_1\`" || true)
+    leaving=$(last_line_with "$WORK/client-A.log" "peer(s) were seen in \`$far_area\`" || true)
     if [[ -z $leaving ]]; then
-      problem "A never logged leaving md1_1"
-    elif [[ $(strip_ansi "$leaving") =~ ([0-9]+)\ peer\(s\)\ were\ seen\ in\ \`Ff7/md1_1\` ]] && ((BASH_REMATCH[1] >= 1)); then
-      say "A saw ${BASH_REMATCH[1]} peer(s) in md1_1 before it went back"
+      problem "A never logged leaving $far_key"
+    elif [[ $(strip_ansi "$leaving") =~ ([0-9]+)\ peer\(s\)\ were\ seen\ in\ \`$far_area\` ]] && ((BASH_REMATCH[1] >= 1)); then
+      say "A saw ${BASH_REMATCH[1]} peer(s) in $far_key before it went back"
     else
-      problem "A saw nobody in md1_1: $leaving"
+      problem "A saw nobody in $far_key: $leaving"
     fi
   fi
-  # B: stays in md1_1 and saw A there.
+  # B: stays in the far area and saw A there.
   if [[ -n ${LINE[B]:-} ]]; then
-    [[ $(field "${LINE[B]}" area) == Ff7/md1_1 ]] || problem "B should end in Ff7/md1_1: ${LINE[B]}"
+    [[ $(field "${LINE[B]}" area) == "$far_area" ]] || problem "B should end in $far_area: ${LINE[B]}"
     [[ $(area_changes_of "${LINE[B]}") == 1 ]] || problem "B should have changed area once: ${LINE[B]}"
     value=$(field "${LINE[B]}" peers_seen)
-    [[ $value =~ ^[0-9]+$ ]] && ((value >= 1)) || problem "B saw nobody in md1_1 (peers_seen=${value:-?}): ${LINE[B]}"
+    [[ $value =~ ^[0-9]+$ ]] && ((value >= 1)) || problem "B saw nobody in $far_key (peers_seen=${value:-?}): ${LINE[B]}"
   fi
-  log_has "$WORK/client-B.log" "NPC(s) in Ff7/md1_1" || say "note: B was told of no NPC in md1_1 (the field may place none unconditionally)"
 
   log_has "$WORK/server.log" "area loaded" || problem "the server never loaded another area"
-  log_has "$WORK/server.log" "area=Ff7/md1_1" || problem "the server never loaded md1_1"
+  log_has "$WORK/server.log" "area=$far_area" || problem "the server never loaded $far_key"
   log_has "$WORK/server.log" "player leaves through an exit" || problem "the server never moved a player through an exit"
 
   stop_server
-  after=$(ls -A -- "$state_real" | sort | tr '\n' ' ')
-  [[ $before == "$after" ]] || problem "the library state directory changed: before [$before], after [$after]"
+  if [[ $MODE == real ]]; then
+    after=$(ls -A -- "$state_real" | sort | tr '\n' ' ')
+    [[ $before == "$after" ]] || problem "the library state directory changed: before [$before], after [$after]"
+  fi
 
   if ((${#PROBLEMS[@]})); then
     finish_failed
@@ -184,17 +205,22 @@ run_travel() {
     say "client: $l"
   done
   for n in "${CLIENT_NAMES[@]}"; do
-    say "client $n: $(last_line_with "$WORK/client-$n.log" "NPC(s) in Ff7/md1stin" || true)"
+    say "client $n: $(last_line_with "$WORK/client-$n.log" "NPC(s) in $npc_area" || true)"
     say "client $n: $(last_line_with "$WORK/client-$n.log" "travel: entering" || true)"
   done
   say "server: $(last_line_with "$WORK/server.log" "area loaded" || true)"
   RESULT=pass
-  say "PASS: two bots in a party walked md1stin -> md1_1 through the gateway, saw each other there, and one walked back; $state_real unchanged ($after)"
+  if [[ $MODE == real ]]; then
+    say "PASS: two bots in a party walked $start_key -> $far_key through the gateway, saw each other there, and one walked back; $state_real unchanged ($after)"
+  else
+    say "PASS: two bots in a party walked $start_key -> $far_key through the exit on the FIXTURE rooms, saw each other there, and one walked back"
+  fi
 }
 
 main() {
   while (($#)); do
     case "$1" in
+      --fixture) MODE=fixture ;;
       --release) PROFILE=release ;;
       --debug) PROFILE=debug ;;
       --bin-dir)

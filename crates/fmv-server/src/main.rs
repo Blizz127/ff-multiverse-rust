@@ -35,6 +35,9 @@ use tracing::{info, warn};
 enum GameKind {
     /// Synthetic FIXTURE area. NOT FF7 support.
     Fixture,
+    /// Synthetic FIXTURE rooms: several connected areas (`hall`, `yard`) with exits, to try walking
+    /// between areas without owned data. NOT FF7 support.
+    FixtureRooms,
     /// Real FF7 content from the owner's own copy (see --ff7-library / --ff7-flevel).
     Ff7,
 }
@@ -76,7 +79,8 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = GameKind::Fixture)]
     game: GameKind,
 
-    /// Key of the area to host (default: `plaza` for the FIXTURE game, `md1stin` for FF7).
+    /// Key of the entry area (default: `plaza` for the FIXTURE game, `hall` for the FIXTURE rooms,
+    /// `md1stin` for FF7). Every player joins it; the areas its exits lead to are loaded on demand.
     #[arg(long, value_name = "KEY")]
     area: Option<String>,
 
@@ -266,6 +270,12 @@ async fn build_adapter(cli: &Cli) -> Result<Hosted, SetupError> {
         GameKind::Fixture => Ok(Hosted {
             adapter: Box::new(FixtureAdapter::new()),
             area: cli.area.clone().unwrap_or_else(|| FIXTURE_AREA_KEY.to_string()),
+            build_suffix: None,
+            battle: None,
+        }),
+        GameKind::FixtureRooms => Ok(Hosted {
+            adapter: Box::new(fmv_fixture::rooms::RoomsAdapter::new()),
+            area: cli.area.clone().unwrap_or_else(|| fmv_fixture::rooms::HALL.to_string()),
             build_suffix: None,
             battle: None,
         }),
@@ -486,6 +496,21 @@ mod tests {
             assert!(parse(&["--ff7-library", "/x", label, "x"]).is_err(), "{label} needs --ff7-flevel");
             assert!(parse(&["--ff7-flevel", "/y", label, "x"]).is_ok(), "{label}");
         }
+    }
+
+    #[test]
+    fn the_fixture_rooms_are_a_synthetic_game_with_several_areas() {
+        let cli = parse(&["--game", "fixture-rooms"]).unwrap();
+        assert_eq!(cli.effective_game(), GameKind::FixtureRooms);
+        // Real content asked for wins over it, like for the plain fixture.
+        assert_eq!(parse(&["--game", "fixture-rooms", "--ff7-library", "/x"]).unwrap().effective_game(), GameKind::Ff7);
+        let hosted = tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(build_adapter(&cli)).unwrap();
+        assert_eq!(hosted.area, "hall", "the entry area of the rooms");
+        assert!(hosted.battle.is_none() && hosted.build_suffix.is_none());
+        let areas: Vec<String> = hosted.adapter.list_areas().into_iter().map(|a| a.id.key).collect();
+        assert_eq!(areas, ["hall", "yard"]);
+        assert!(hosted.adapter.list_areas().iter().all(|a| a.fixture), "every one of them is labelled FIXTURE");
+        assert_eq!(parse(&["--game", "fixture-rooms", "--area", "yard"]).unwrap().area.as_deref(), Some("yard"));
     }
 
     #[test]

@@ -115,6 +115,10 @@ pub enum BotKind {
 pub enum GameChoice {
     /// Synthetic FIXTURE content. NOT FF7.
     Fixture,
+    /// Synthetic FIXTURE rooms (`hall`, `yard`): several connected areas, to try walking between
+    /// areas without owned data (needs --name or --headless; the character menu is not for it).
+    /// NOT FF7.
+    FixtureRooms,
     /// Real FF7 content from this machine's own copy (see --ff7-library / --ff7-flevel).
     Ff7,
 }
@@ -603,6 +607,11 @@ mod tests {
                 "{bad:?} is not an area key"
             );
         }
+        // The synthetic rooms (several areas, no owned data) are a game of their own.
+        let a = Args::try_parse_from(["fmv-client", "--name", "x", "--game", "fixture-rooms"]).unwrap();
+        assert_eq!(a.effective_game(), GameChoice::FixtureRooms);
+        let a = Args::try_parse_from(["fmv-client", "--name", "x", "--game", "fixture-rooms", "--ff7-library", "/x"]).unwrap();
+        assert_eq!(a.effective_game(), GameChoice::Ff7, "real content asked for wins, as for the plain fixture");
         assert_eq!(parse_area_key(" md1_1 "), Ok("md1_1".to_string()), "surrounding blanks are not part of the key");
         let err = parse_area_key("bad\u{1b}[2Jkey").unwrap_err();
         assert!(!err.chars().any(char::is_control), "the message is safe to print: {err:?}");
