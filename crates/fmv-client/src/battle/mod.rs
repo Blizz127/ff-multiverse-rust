@@ -24,6 +24,7 @@
 
 mod bot;
 mod data;
+mod menu;
 mod text;
 mod view;
 
