@@ -217,6 +217,8 @@ pub fn login_with_token(store: &Store, game: GameId, token: &Secret, tint: [u8; 
     let progress = ProgressSeed {
         character: progress::character_for_look(game, avatar.appearance_ref.as_deref()),
         stored: stored.as_ref().map(Progress::from_record),
+        // `None` (a record of an older build, or no record) is "never stored": the starting stock.
+        inventory: stored.as_ref().and_then(|record| record.inventory.clone()),
     };
     Ok(Login { account, avatar, phase: phase_key(progression.blob), issued_token: None, progress })
 }
@@ -241,10 +243,7 @@ pub fn register(
         .map_err(map_store_error)?;
     on_created();
     let avatar = shown(game, &registered.avatar);
-    let progress = ProgressSeed {
-        character: progress::character_for_look(game, avatar.appearance_ref.as_deref()),
-        stored: None,
-    };
+    let progress = ProgressSeed::of(progress::character_for_look(game, avatar.appearance_ref.as_deref()), None);
     Ok(Login {
         account: registered.account_id,
         avatar,
@@ -650,7 +649,7 @@ mod tests {
     fn a_new_account_plays_the_character_its_look_names_and_has_earned_nothing() {
         let (_dir, store) = store();
         let tifa = register_ff7(&store, "Tifa", [0; 3], Some("ff7/tifa")).unwrap();
-        assert_eq!(tifa.progress, ProgressSeed { character: 2, stored: None });
+        assert_eq!(tifa.progress, ProgressSeed::of(2, None));
         // No look, or one the game does not offer: the default look and character.
         let plain = register_ff7(&store, "Plain", [0; 3], None).unwrap();
         assert_eq!(plain.progress, ProgressSeed::default());
@@ -672,7 +671,7 @@ mod tests {
         let token = reg.issued_token.unwrap();
         // Before anything was earned: the character of the look, nothing stored.
         let first = with_token(&store, &token).unwrap();
-        assert_eq!(first.progress, ProgressSeed { character: 1, stored: None });
+        assert_eq!(first.progress, ProgressSeed::of(1, None));
 
         // After a battle: what the store holds comes back, as the stored numbers.
         let record = fmv_persist::CharacterProgress { exp: 700, ap: 9, gil: 250, ..fmv_persist::CharacterProgress::new(reg.account, GameId::Ff7, 1, 8, NOW) };

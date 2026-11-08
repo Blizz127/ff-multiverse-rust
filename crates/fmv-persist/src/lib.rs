@@ -30,14 +30,26 @@
 //!   another PID namespace or container that cannot see the owner's pid; a lock left by a dead
 //!   process is taken over with a warning.
 //! * **Character progress is not story progress.** [`CharacterProgress`] (the character an account
-//!   plays, its level, experience, AP and gil, per game) is its own record in its own file
-//!   (`progression/<account>/<Game>.character.json`), written atomically like the others, with an
-//!   atomic read-modify-write ([`Store::update_character_progress`]) so that two results for one
-//!   account add up. It is separate from [`Progression`], the opaque story blob that also selects
-//!   an account's story phase: a battle result must never move a player to another instance. A
-//!   record that was never stored is absent, not a default (the game's own data supplies the start,
-//!   so there is nothing to migrate), and the game's caps and curves stay with its adapter: the
-//!   store checks only what is true of every game.
+//!   plays, its level, experience, AP and gil, and once a game stores one its inventory, per game)
+//!   is its own record in its own file (`progression/<account>/<Game>.character.json`), written
+//!   atomically like the others, with an atomic read-modify-write
+//!   ([`Store::update_character_progress`]) so that two results for one account add up. It is
+//!   separate from [`Progression`], the opaque story blob that also selects an account's story
+//!   phase: a battle result must never move a player to another instance. A record that was never
+//!   stored is absent, not a default (the game's own data supplies the start, so there is nothing
+//!   to migrate), and the game's caps and curves stay with its adapter: the store checks only what
+//!   is true of every game.
+//! * **An inventory that was never stored is not an empty one.** The inventory is optional inside
+//!   the character record: `None` (no `inventory` key on disk, which is what every record written
+//!   before inventories existed looks like) means *never stored*, so the server starts from its
+//!   game's own starting stock, which the store never supplies; `Some(vec![])` is a stored, empty
+//!   inventory and stays empty. The store checks only its shape (at most
+//!   [`MAX_INVENTORY_STACKS`](fmv_core::MAX_INVENTORY_STACKS) stacks, none of zero, no item twice;
+//!   `Corrupt` on read, `InvalidField` on write). The record stays at [`SCHEMA_VERSION`] 1, so
+//!   going back to a build from before the field loses the inventory when that build next
+//!   rewrites the record, and fails the login of an account whose record has grown past that
+//!   build's 4 KiB limit (see [`MAX_CHARACTER_RECORD_BYTES`]): roll back only from a snapshot
+//!   taken before any inventory was stored.
 //! * **Versioned records.** Every file carries `schema_version`. A newer version than
 //!   [`SCHEMA_VERSION`] (records) or [`INDEX_LOG_VERSION`] (index) is rejected with a clear
 //!   error instead of being misread. A version 1 `index.json` is migrated on open, keeping the

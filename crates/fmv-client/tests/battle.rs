@@ -1,10 +1,11 @@
 //! The real `fmv-client` binary (headless) against a scripted fake server that speaks the battle
-//! part of the protocol (v3, with character progress since v5). All content is the synthetic FIXTURE
-//! area, so these tests cover what the client does with battle traffic WITHOUT game data: refusals
-//! are logged once and never retried, a battle freezes the player and play resumes afterwards, the
-//! SMOKE line counts battles and ends with the level and experience the server last reported (0 and
-//! 0 from a server that reports none). The replay itself (needs battle rules) is covered by the unit
-//! tests in `src/battle` and by the real-data smoke, `scripts/battle-smoke.sh`.
+//! part of the protocol (v3, with character progress since v5 and the inventory since v6). All
+//! content is the synthetic FIXTURE area, so these tests cover what the client does with battle
+//! traffic WITHOUT game data: refusals are logged once and never retried, a battle freezes the
+//! player and play resumes afterwards, the SMOKE line counts battles and ends with the level and
+//! experience and the item total the server last reported (0, 0 and 0 from a server that reports
+//! none). The replay itself (needs battle rules) is covered by the unit tests in `src/battle` and by
+//! the real-data smoke, `scripts/battle-smoke.sh`.
 //!
 //! Hermetic: the client always gets `--state-dir <tempdir>` and `FMV_STATE_DIR`, `XDG_DATA_HOME`
 //! and `HOME` inside that tempdir, so nothing here can read or write the real state directory.
@@ -13,8 +14,8 @@ use fmv_adapter_api::GameAdapter;
 use fmv_core::{AccountId, AnimState, AvatarAppearance, EntityId, EntitySnapshot, PhaseKey, Pos, SessionId};
 use fmv_fixture::FixtureAdapter;
 use fmv_protocol::{
-    read_msg, write_msg, BattleId, BattleMember, BattleRejection, BattleReward, ClientMsg, InstanceKey, Placement, Secret, ServerMsg,
-    PROTOCOL_VERSION,
+    read_msg, write_msg, BattleId, BattleMember, BattleRejection, BattleReward, ClientMsg, InstanceKey, InventoryEntry, Placement, Secret,
+    ServerMsg, PROTOCOL_VERSION,
 };
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
@@ -29,8 +30,10 @@ enum OnRequest {
     Refuse,
     /// `EncounterStart` at once, and `BattleEnd { Victory }` this long after it.
     FightFor(Duration),
-    /// Like `FightFor`, from a server that also reports the player's character progress: level 6 with
-    /// 610 experience when it joins, level 7 with 615 right after the win (a level gained).
+    /// Like `FightFor`, from a server that also reports the player's character progress and inventory:
+    /// level 6 with 610 experience and Potion x3, Ether x1, Phoenix Down x1 when it joins; the win
+    /// drops Potion x1 and Ether x2, and right after it come level 7 with 615 experience and an
+    /// inventory of Potion x4, Ether x3, Phoenix Down x1 (a level gained, the drops added).
     FightAndPay(Duration),
 }
 
@@ -136,6 +139,8 @@ async fn serve(stream: TcpStream, on_request: OnRequest) -> Report {
     if matches!(on_request, OnRequest::FightAndPay(_)) {
         let joined = ServerMsg::CharacterProgress { character: 0, level: 6, exp: 610, exp_to_next: 6, gil: 0, ap: 0, leveled_up: false };
         write_msg(&mut wr, &joined).await.unwrap();
+        let stock = ServerMsg::Inventory { items: vec![InventoryEntry::new(0, 3), InventoryEntry::new(3, 1), InventoryEntry::new(7, 1)] };
+        write_msg(&mut wr, &stock).await.unwrap();
     }
 
     let mut end_at: Option<tokio::time::Instant> = None;
@@ -191,11 +196,11 @@ async fn serve(stream: TcpStream, on_request: OnRequest) -> Report {
                 }
             } => {
                 end_at = None;
-                let end = ServerMsg::BattleEnd {
-                    battle_id: BattleId(1),
-                    outcome: fmv_protocol::battle::Outcome::Victory,
-                    rewards: vec![BattleReward { account, exp: 5, gil: 7, ap: 1 }],
-                };
+                let mut reward = BattleReward::new(account, 5, 7, 1);
+                if matches!(on_request, OnRequest::FightAndPay(_)) {
+                    reward.items = vec![InventoryEntry::new(0, 1), InventoryEntry::new(3, 2)];
+                }
+                let end = ServerMsg::BattleEnd { battle_id: BattleId(1), outcome: fmv_protocol::battle::Outcome::Victory, rewards: vec![reward] };
                 let _ = write_msg(&mut wr, &end).await;
                 report.battle_ended = Some(Instant::now());
                 // Everything where it stood: the server marks the member as changed.
@@ -204,6 +209,8 @@ async fn serve(stream: TcpStream, on_request: OnRequest) -> Report {
                     // What the win paid, right after the end: 5 experience, 7 gil, 1 AP, and level 7.
                     let paid = ServerMsg::CharacterProgress { character: 0, level: 7, exp: 615, exp_to_next: 334, gil: 7, ap: 1, leveled_up: true };
                     let _ = write_msg(&mut wr, &paid).await;
+                    let more = ServerMsg::Inventory { items: vec![InventoryEntry::new(0, 4), InventoryEntry::new(3, 3), InventoryEntry::new(7, 1)] };
+                    let _ = write_msg(&mut wr, &more).await;
                 }
             }
         }
@@ -241,13 +248,13 @@ fn a_bot_that_is_refused_logs_it_once_never_retries_and_exits_cleanly() {
     assert!(out.status.success(), "a refused battle must not fail the bot: {:?}\n{stderr}", out.status);
     assert!(stdout.starts_with("SMOKE name=Tester area=Fixture/plaza fixture=true "), "{stdout}");
     // A server that reports no progress (no battle data): level 0 and experience 0, which is "unknown".
-    assert!(stdout.ends_with(" battles=0 victories=0 area_changes=0 level=0 exp=0"), "{stdout}");
+    assert!(stdout.ends_with(" battles=0 victories=0 area_changes=0 level=0 exp=0 items=0"), "{stdout}");
     assert!(!stderr.contains("progress:"), "nothing was reported, so nothing is noted: {stderr}");
     assert!(stderr.contains("battle: request refused: this server cannot run battles"), "{stderr}");
     assert_eq!(report.count(|m| matches!(m, ClientMsg::RequestEncounter { formation_id: None })), 1, "asked exactly once, never again");
     assert_eq!(report.count(|m| matches!(m, ClientMsg::BattleCommand { .. })), 0);
     assert!(
-        stderr.contains("battles: 0 battle(s) entered, 0 won, 0 lost, 0 verified by replay, 0 divergence(s), 0 command(s) of ours applied, 1 refusal(s)"),
+        stderr.contains("battles: 0 battle(s) entered, 0 won, 0 lost, 0 verified by replay, 0 divergence(s), 0 command(s) of ours applied (0 attack, 0 magic, 0 item, 0 defend), 1 refusal(s)"),
         "{stderr}"
     );
 }
@@ -259,7 +266,7 @@ fn without_the_debug_flag_a_battle_bot_never_asks_for_a_battle() {
     let out = run_client(port, &["--duration", "3", "--bot", "idle", "--battle-auto"], state.path());
     let report = server.join().expect("fake server");
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert!(stdout_line(&out).ends_with(" battles=0 victories=0 area_changes=0 level=0 exp=0"));
+    assert!(stdout_line(&out).ends_with(" battles=0 victories=0 area_changes=0 level=0 exp=0 items=0"));
     assert_eq!(report.count(|m| matches!(m, ClientMsg::RequestEncounter { .. })), 0);
     // And a client that is not a battle bot at all sends nothing about battles either.
     let state = tempfile::tempdir().unwrap();
@@ -281,7 +288,7 @@ fn a_battle_freezes_the_player_and_play_goes_on_after_it() {
     assert!(out.status.success(), "{:?}\n{stderr}", out.status);
     // No battle data on this machine (FIXTURE): the client says so, cannot replay, but is not
     // "diverged" and counts the battle and the server's victory.
-    assert!(stdout.ends_with(" battles=1 victories=1 area_changes=0 level=0 exp=0"), "{stdout}");
+    assert!(stdout.ends_with(" battles=1 victories=1 area_changes=0 level=0 exp=0 items=0"), "{stdout}");
     assert!(stderr.contains("battle: battle#1 started: formation 3, party of 1, you fight as actor 0"), "{stderr}");
     assert!(stderr.contains("no battle data"), "{stderr}");
     assert!(stderr.contains("battle: battle#1 ended in Victory (you earned 5 exp, 7 gil, 1 ap); back in the field"), "{stderr}");
@@ -309,7 +316,8 @@ fn the_progress_the_server_reports_is_noted_and_ends_the_smoke_line() {
     let report = server.join().expect("fake server");
     let (stdout, stderr) = (stdout_line(&out), String::from_utf8_lossy(&out.stderr).into_owned());
     assert!(out.status.success(), "{:?}\n{stderr}", out.status);
-    assert!(stdout.ends_with(" battles=1 victories=1 area_changes=0 level=7 exp=615"), "{stdout}");
+    // The inventory the server said last: Potion x4, Ether x3 and Phoenix Down x1 are 8 items.
+    assert!(stdout.ends_with(" battles=1 victories=1 area_changes=0 level=7 exp=615 items=8"), "{stdout}");
     // Said once on joining and once after the win, in that order, with `key=value` numbers a script can read.
     let on_joining = "progress: Cloud level=6 exp=610 exp_to_next=6 gil=0 ap=0 leveled_up=false (on joining)";
     let after_the_win = "progress: Cloud level=7 exp=615 exp_to_next=334 gil=7 ap=1 leveled_up=true (was level 6)";
@@ -317,4 +325,12 @@ fn the_progress_the_server_reports_is_noted_and_ends_the_smoke_line() {
     assert!(a.is_some() && b.is_some() && a < b, "{stderr}");
     assert_eq!(stderr.matches("progress: ").count(), 2, "one note per message: {stderr}");
     assert_eq!(report.count(|m| matches!(m, ClientMsg::RequestEncounter { .. })), 1);
+    // The inventory too: one note per message (ids and counts only), the drops in the end note, and a
+    // client that cannot replay the battle (no battle data) still keeps and counts what it was told.
+    let on_joining = "battle: inventory: stacks=3 total=5 items=0:3,3:1,7:1";
+    let after_the_win = "battle: inventory: stacks=3 total=8 items=0:4,3:3,7:1";
+    let (a, b) = (stderr.find(on_joining), stderr.find(after_the_win));
+    assert!(a.is_some() && b.is_some() && a < b, "{stderr}");
+    assert_eq!(stderr.matches("inventory: ").count(), 2, "one note per message: {stderr}");
+    assert!(stderr.contains("(you earned 5 exp, 7 gil, 1 ap, items=0:1,3:2); back in the field"), "{stderr}");
 }

@@ -1,13 +1,17 @@
-//! FF Multiverse wire protocol v5.
+//! FF Multiverse wire protocol v6.
 //!
-//! v5 is v4 (area travel: [`ServerMsg::AreaChange`] and `AreaSnapshot::npcs`, see "Area travel") plus
-//! character progress: [`ServerMsg::CharacterProgress`] (see "Character progress"). v4 was v3
-//! (accounts, battles, rejection codes) plus area travel. A peer cannot decode a message variant it
-//! does not know (an unknown message is a decode error), so each of these changes bumped the
-//! version: a server answers an older `Hello` with `Reject { code: ProtocolMismatch }` at the
-//! handshake, a clean refusal instead of a dropped connection at the first exit a player crosses
-//! (v3) or the moment a player joins (v4: a v4 client would choke on the progress message that
-//! follows every join).
+//! v6 is v5 (character progress: [`ServerMsg::CharacterProgress`], see "Character progress") plus real
+//! battle commands and an inventory: [`battle::Command`] gains `Magic`, `Item` and `Defend`, battle
+//! events gain `Action`, `Heal`, `MpSpent`, `MpRestored` and `Revive`, [`ServerMsg::Inventory`] tells a
+//! player what it carries and [`BattleReward`] carries the items a won battle dropped (see "Inventory").
+//! v5 was v4 (area travel: [`ServerMsg::AreaChange`] and `AreaSnapshot::npcs`, see "Area travel") plus
+//! character progress; v4 was v3 (accounts, battles, rejection codes) plus area travel. A peer cannot
+//! decode a message variant it does not know (an unknown message is a decode error), so each of these
+//! changes bumped the version: a server answers an older `Hello` with `Reject { code: ProtocolMismatch }`
+//! at the handshake, a clean refusal instead of a dropped connection at the first exit a player crosses
+//! (v3), the moment a player joins (v4: a v4 client would choke on the progress message that follows
+//! every join) or the first spell a player casts (v6: a v5 client cannot decode the new events, and
+//! would choke on the inventory that follows every join too).
 //!
 //! Framing: `u32` little-endian payload length, then the payload. The payload codec is JSON
 //! (serde_json; postcard is not in the local crate cache). The codec is isolated in
@@ -107,6 +111,33 @@
 //! characters to level and sends none. Nothing in the message is a game datum: levels, experience,
 //! AP and gil are the player's own numbers, and the tables behind them stay in each peer's files.
 //!
+//! # Inventory (v6)
+//!
+//! Each account carries items (FF7: the kernel's item table indexes, `kernel.bin` section 4). The SERVER
+//! keeps the inventory (and stores it with the character progress, see `fmv-persist`) and is the only
+//! authority: a battle `Item` command is accepted only when the account has one, and the item is taken
+//! only when the battle engine accepted the command. The engine itself knows no inventory (see
+//! [`battle`]), which is what lets every client replay every battle without knowing anyone's items.
+//!
+//! * [`ServerMsg::Inventory`] tells a player what it carries: on joining (right after
+//!   `CharacterProgress`), after every item it used in a battle (right after the `BattleEvent` that
+//!   applied it) and after a won battle that dropped it items (after `CharacterProgress`). It is the whole
+//!   inventory every time, at most [`MAX_INVENTORY_STACKS`] entries, one per item, no entry of zero.
+//! * A new account, and an old one that has never had an inventory, starts with the game's starting stock
+//!   (FF7: the kernel's own: Potion x3, Ether x1 and Phoenix Down x1 on the Steam copy), once.
+//! * A won battle drops items ([`BattleReward::items`]): rolled by the server from the battle's seed after
+//!   the outcome, dealt to the living members, and not part of the replay (a client cannot check them).
+//!
+//! ```text
+//! S -> C  AreaSnapshot, InstancePlacement, CharacterProgress, Inventory { items }     on join
+//! C -> S  BattleCommand { battle_id, actor, command: Item { item, target } }
+//! S -> C  BattleEvent { .., command: Some(..), events: [Action(Item), Heal ..] }      every member
+//! S -> C  Inventory { items }                                                         the user, one fewer
+//! S -> C  BattleEnd { .., rewards: [.., items] }, CharacterProgress, Inventory        after a win with drops
+//! ```
+//!
+//! A server without battle data (the FIXTURE one) has no items and sends none.
+//!
 //! # Accounts
 //!
 //! `Hello::auth` is [`Auth::Register`] (create an account with that display name) or
@@ -146,6 +177,7 @@
 
 use std::fmt;
 
+pub use fmv_core::{InventoryEntry, MAX_INVENTORY_STACKS};
 use fmv_core::{AccountId, AnimState, AreaId, EntityId, EntitySnapshot, Fingerprint, Pos, ProvenanceSummary, SessionId};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -158,9 +190,9 @@ pub use reject::RejectCode;
 /// The battle wire types (the engine's own `BattleEvent`, `Command` and `Outcome` stay under
 /// [`battle`], where their names say what they are).
 pub use battle::{
-    split_rewards, ActorId, AppliedCommand, BattleBuildError, BattleId, BattleMember, BattleRejection, BattleReplay, BattleReward,
-    BattleRules, BattleSetup, Divergence, Ff7BattleData, Ff7BattleDataError, FormationInfo, ProgressLimits, SyntheticRules,
-    MAX_BATTLE_PARTY,
+    assign_drops, split_rewards, ActionRef, ActorId, AppliedCommand, BattleBuildError, BattleId, BattleMember, BattleRejection,
+    BattleReplay, BattleReward, BattleRules, BattleSetup, Divergence, Ff7BattleData, Ff7BattleDataError, FormationInfo,
+    ProgressLimits, SyntheticRules, MAX_BATTLE_PARTY,
 };
 
 /// The party types carried on the wire, re-exported so a client needs no direct `fmv-party`
@@ -170,7 +202,7 @@ pub use fmv_party::{
     PartyEvent, PartyId, Placement,
 };
 
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 /// Hard cap on a single frame payload (bytes).
 pub const MAX_FRAME: u32 = 256 * 1024;
 /// Default TCP port for development. Deployment port is UNASSIGNED (see DEPLOYMENT-CONTRACT.md).
@@ -320,7 +352,9 @@ pub enum ClientMsg {
     /// Ask for the full party state (answered by `PartyState`).
     PartySync,
     /// Command one of YOUR characters in a battle: `actor` must be the party member the server
-    /// assigned to this session, and its ATB gauge must be full. Refused with `BattleRejected`.
+    /// assigned to this session, and its ATB gauge must be full. The command is an attack, a spell the
+    /// character knows (it costs MP), an item the ACCOUNT owns (the server checks the count) or a guard
+    /// (see [`battle`]). Refused with `BattleRejected`.
     BattleCommand { battle_id: BattleId, actor: ActorId, command: battle::Command },
     /// Debug only (the server must run with `--debug-encounters`; refused with `BattleRejected`
     /// otherwise): start a battle for your party (or just you). `formation_id` names the enemy
@@ -428,8 +462,9 @@ pub enum ServerMsg {
         command: Option<AppliedCommand>,
     },
     /// The battle is over (the message before it carried `Victory` or `Defeat`). `rewards` has one
-    /// entry per member of the party when the outcome is `Victory` (see [`split_rewards`]) and is
-    /// empty on `Defeat`. The receiving player is back in the field.
+    /// entry per member of the party when the outcome is `Victory` (see [`split_rewards`]; the items in
+    /// it are the drops, see [`assign_drops`]) and is empty on `Defeat`. The receiving player is back in
+    /// the field.
     BattleEnd { battle_id: BattleId, outcome: battle::Outcome, rewards: Vec<BattleReward> },
     /// A battle request or command of this client was refused. `battle_id` is the battle it was
     /// about, if any.
@@ -442,6 +477,11 @@ pub enum ServerMsg {
     /// still missing for the next level (0 at the highest), `gil` and `ap` what the player holds, and
     /// `leveled_up` whether this message follows a level gained (never on the join message).
     CharacterProgress { character: u8, level: u8, exp: u32, exp_to_next: u32, gil: u32, ap: u32, leveled_up: bool },
+    /// This player's whole inventory, as the server holds it: sent after the join messages (right after
+    /// `CharacterProgress`), after every item the player used in a battle and after a won battle that
+    /// dropped it items (see the module docs, "Inventory"). `items` is at most
+    /// [`MAX_INVENTORY_STACKS`] entries, one per item, none of zero.
+    Inventory { items: Vec<InventoryEntry> },
 }
 
 impl ServerMsg {
@@ -559,8 +599,8 @@ mod tests {
     }
 
     #[test]
-    fn the_version_is_five() {
-        assert_eq!(PROTOCOL_VERSION, 5);
+    fn the_version_is_six() {
+        assert_eq!(PROTOCOL_VERSION, 6);
     }
 
     // -----------------------------------------------------------------------------------------
@@ -614,13 +654,13 @@ mod tests {
     fn golden_client_messages() {
         golden(
             ClientMsg::Hello {
-                protocol_version: 5,
+                protocol_version: 6,
                 client_build: "c/1".into(),
                 auth: Auth::Register { display_name: "Cloud".into() },
                 tint: [10, 20, 30],
                 appearance_ref: Some("cloud_model".into()),
             },
-            r#"{"Hello":{"protocol_version":5,"client_build":"c/1","auth":{"Register":{"display_name":"Cloud"}},"tint":[10,20,30],"appearance_ref":"cloud_model"}}"#,
+            r#"{"Hello":{"protocol_version":6,"client_build":"c/1","auth":{"Register":{"display_name":"Cloud"}},"tint":[10,20,30],"appearance_ref":"cloud_model"}}"#,
         );
         golden(
             ClientMsg::JoinArea {
@@ -651,13 +691,13 @@ mod tests {
         golden(ClientMsg::PartySync, r#""PartySync""#);
         golden(
             ClientMsg::Hello {
-                protocol_version: 5,
+                protocol_version: 6,
                 client_build: "c/1".into(),
                 auth: Auth::Token(Secret::new("fmvt_x")),
                 tint: [0, 0, 0],
                 appearance_ref: None,
             },
-            r#"{"Hello":{"protocol_version":5,"client_build":"c/1","auth":{"Token":"fmvt_x"},"tint":[0,0,0],"appearance_ref":null}}"#,
+            r#"{"Hello":{"protocol_version":6,"client_build":"c/1","auth":{"Token":"fmvt_x"},"tint":[0,0,0],"appearance_ref":null}}"#,
         );
     }
 
@@ -665,14 +705,14 @@ mod tests {
     fn golden_server_messages() {
         golden(
             ServerMsg::Welcome {
-                protocol_version: 5,
+                protocol_version: 6,
                 server_build: "s/1".into(),
                 session: SessionId(4),
                 entity: EntityId(5),
                 account: AccountId(6),
                 issued_token: None,
             },
-            r#"{"Welcome":{"protocol_version":5,"server_build":"s/1","session":4,"entity":5,"account":6,"issued_token":null}}"#,
+            r#"{"Welcome":{"protocol_version":6,"server_build":"s/1","session":4,"entity":5,"account":6,"issued_token":null}}"#,
         );
         golden(
             ServerMsg::PartyRejected { error: PartyFailure::Rules(PartyError::PartyFull { party: PartyId(2), max_size: 3 }) },
@@ -987,6 +1027,27 @@ mod tests {
             },
             r#"{"BattleCommand":{"battle_id":1,"actor":0,"command":{"Attack":{"target":2}}}}"#,
         );
+        // v6: the other commands.
+        golden(
+            ClientMsg::BattleCommand {
+                battle_id: BattleId(1),
+                actor: ActorId(1),
+                command: battle::Command::Magic { spell: 27, target: ActorId(3) },
+            },
+            r#"{"BattleCommand":{"battle_id":1,"actor":1,"command":{"Magic":{"spell":27,"target":3}}}}"#,
+        );
+        golden(
+            ClientMsg::BattleCommand {
+                battle_id: BattleId(1),
+                actor: ActorId(0),
+                command: battle::Command::Item { item: 7, target: ActorId(1) },
+            },
+            r#"{"BattleCommand":{"battle_id":1,"actor":0,"command":{"Item":{"item":7,"target":1}}}}"#,
+        );
+        golden(
+            ClientMsg::BattleCommand { battle_id: BattleId(1), actor: ActorId(0), command: battle::Command::Defend },
+            r#"{"BattleCommand":{"battle_id":1,"actor":0,"command":"Defend"}}"#,
+        );
         golden(ClientMsg::RequestEncounter { formation_id: None }, r#"{"RequestEncounter":{"formation_id":null}}"#);
         golden(ClientMsg::RequestEncounter { formation_id: Some(517) }, r#"{"RequestEncounter":{"formation_id":517}}"#);
     }
@@ -1051,8 +1112,8 @@ mod tests {
                 battle_id: BattleId(1),
                 outcome: battle::Outcome::Victory,
                 rewards: vec![
-                    BattleReward { account: AccountId(20), exp: 6, gil: 10, ap: 2 },
-                    BattleReward { account: AccountId(21), exp: 0, gil: 0, ap: 0 },
+                    BattleReward::new(AccountId(20), 6, 10, 2),
+                    BattleReward::new(AccountId(21), 0, 0, 0),
                 ],
             },
             concat!(
@@ -1142,11 +1203,42 @@ mod tests {
             (battle::BattleEvent::Death { actor: t }, r#"{"Death":{"actor":3}}"#),
             (battle::BattleEvent::Victory, r#""Victory""#),
             (battle::BattleEvent::Defeat, r#""Defeat""#),
+            // v6: every action is announced, and what it did.
+            (
+                battle::BattleEvent::Action { actor: a, action: battle::ActionRef::Attack },
+                r#"{"Action":{"actor":0,"action":"Attack"}}"#,
+            ),
+            (
+                battle::BattleEvent::Action { actor: a, action: battle::ActionRef::Magic(27) },
+                r#"{"Action":{"actor":0,"action":{"Magic":27}}}"#,
+            ),
+            (
+                battle::BattleEvent::Action { actor: a, action: battle::ActionRef::Item(7) },
+                r#"{"Action":{"actor":0,"action":{"Item":7}}}"#,
+            ),
+            (
+                battle::BattleEvent::Action { actor: a, action: battle::ActionRef::Defend },
+                r#"{"Action":{"actor":0,"action":"Defend"}}"#,
+            ),
+            (
+                battle::BattleEvent::Action { actor: t, action: battle::ActionRef::EnemyAttack(770) },
+                r#"{"Action":{"actor":3,"action":{"EnemyAttack":770}}}"#,
+            ),
+            (battle::BattleEvent::Heal { actor: a, target: t, amount: 271 }, r#"{"Heal":{"actor":0,"target":3,"amount":271}}"#),
+            (battle::BattleEvent::MpSpent { actor: a, amount: 5 }, r#"{"MpSpent":{"actor":0,"amount":5}}"#),
+            (
+                battle::BattleEvent::MpRestored { actor: a, target: t, amount: 100 },
+                r#"{"MpRestored":{"actor":0,"target":3,"amount":100}}"#,
+            ),
+            (battle::BattleEvent::Revive { actor: a, target: t, hp: 100 }, r#"{"Revive":{"actor":0,"target":3,"hp":100}}"#),
         ];
         for (event, expected) in events {
             golden(event, expected);
         }
         golden(battle::Command::Attack { target: t }, r#"{"Attack":{"target":3}}"#);
+        golden(battle::Command::Magic { spell: 0, target: t }, r#"{"Magic":{"spell":0,"target":3}}"#);
+        golden(battle::Command::Item { item: 3, target: a }, r#"{"Item":{"item":3,"target":0}}"#);
+        golden(battle::Command::Defend, r#""Defend""#);
         golden(battle::Outcome::Victory, r#""Victory""#);
         golden(battle::Outcome::Defeat, r#""Defeat""#);
         golden(ActorId(7), "7");
@@ -1168,10 +1260,104 @@ mod tests {
             (BattleRejection::InvalidTarget, r#""InvalidTarget""#),
             (BattleRejection::TargetDead, r#""TargetDead""#),
             (BattleRejection::BattleOver, r#""BattleOver""#),
+            // v6
+            (BattleRejection::TargetNotDead, r#""TargetNotDead""#),
+            (BattleRejection::UnknownSpell, r#""UnknownSpell""#),
+            (BattleRejection::NotEnoughMp, r#""NotEnoughMp""#),
+            (BattleRejection::UnknownItem, r#""UnknownItem""#),
+            (BattleRejection::OutOfItems, r#""OutOfItems""#),
         ];
         for (reason, expected) in cases {
             golden(reason, expected);
         }
+    }
+
+    /// v6: the inventory message, and the items a reward carries (absent from the JSON when empty, so a
+    /// reward without items is exactly what it was).
+    #[test]
+    fn golden_inventory_and_drops() {
+        golden(
+            ServerMsg::Inventory { items: vec![InventoryEntry::new(0, 3), InventoryEntry::new(7, 1)] },
+            r#"{"Inventory":{"items":[{"item":0,"count":3},{"item":7,"count":1}]}}"#,
+        );
+        golden(ServerMsg::Inventory { items: vec![] }, r#"{"Inventory":{"items":[]}}"#);
+        let mut with_drops = BattleReward::new(AccountId(20), 6, 10, 2);
+        with_drops.items = vec![InventoryEntry::new(0, 1), InventoryEntry::new(3, 2)];
+        golden(
+            ServerMsg::BattleEnd {
+                battle_id: BattleId(1),
+                outcome: battle::Outcome::Victory,
+                rewards: vec![with_drops.clone(), BattleReward::new(AccountId(21), 0, 0, 0)],
+            },
+            concat!(
+                r#"{"BattleEnd":{"battle_id":1,"outcome":"Victory","rewards":["#,
+                r#"{"account":20,"exp":6,"gil":10,"ap":2,"items":[{"item":0,"count":1},{"item":3,"count":2}]},"#,
+                r#"{"account":21,"exp":0,"gil":0,"ap":0}]}}"#
+            ),
+        );
+        // A reward from a v5 server (no `items` key) reads as one without items.
+        let old: BattleReward = serde_json::from_str(r#"{"account":20,"exp":6,"gil":10,"ap":2}"#).unwrap();
+        assert_eq!(old, BattleReward::new(AccountId(20), 6, 10, 2));
+        assert!(!old.is_nothing() && BattleReward::new(AccountId(1), 0, 0, 0).is_nothing());
+        assert!(!with_drops.is_nothing() && with_drops.without_items() == BattleReward::new(AccountId(20), 6, 10, 2));
+        let only_items = BattleReward { items: vec![InventoryEntry::new(1, 1)], ..BattleReward::new(AccountId(1), 0, 0, 0) };
+        assert!(!only_items.is_nothing(), "items alone are a payment");
+    }
+
+    /// The fullest inventory a server may send (every stack at its widest) is far from a frame, and a
+    /// message with more entries than the limit is the sender's bug, not something the codec refuses.
+    #[test]
+    fn an_inventory_is_small_whatever_it_holds() {
+        let full = ServerMsg::Inventory {
+            items: (0..MAX_INVENTORY_STACKS as u16).map(|i| InventoryEntry::new(60_000 + i, u16::MAX)).collect(),
+        };
+        let frame = encode(&full).unwrap();
+        assert!(frame.len() < 12_000, "{} bytes", frame.len());
+        assert_eq!(decode::<ServerMsg>(&frame[4..]).unwrap(), full);
+        // Every field is required and 16 bits wide.
+        for bad in [
+            r#"{"Inventory":{}}"#,
+            r#"{"Inventory":{"items":[{"item":1}]}}"#,
+            r#"{"Inventory":{"items":[{"item":70000,"count":1}]}}"#,
+            r#"{"Inventory":{"items":[{"item":1,"count":-1}]}}"#,
+        ] {
+            assert!(decode::<ServerMsg>(bad.as_bytes()).is_err(), "{bad}");
+        }
+    }
+
+    /// The reason for the v6 bump: a v5 peer cannot decode the inventory that follows every join, nor
+    /// the new events and commands. (The older peer's enums are simulated by enums that lack the
+    /// variants.) The handshake that refuses it reads the version from its `Hello`.
+    #[test]
+    fn a_v5_peer_cannot_decode_the_v6_messages_so_the_version_had_to_change() {
+        #[derive(Debug, Deserialize)]
+        enum ServerMsgV5 {
+            #[allow(dead_code)]
+            Pong { nonce: u64, tick: u64 },
+        }
+        #[derive(Debug, Deserialize)]
+        enum EventV5 {
+            #[allow(dead_code)]
+            GaugeReady { actor: ActorId },
+        }
+        #[derive(Debug, Deserialize)]
+        enum CommandV5 {
+            #[allow(dead_code)]
+            Attack { target: ActorId },
+        }
+        let inventory = encode(&ServerMsg::Inventory { items: vec![InventoryEntry::new(0, 3)] }).unwrap();
+        assert!(decode::<ServerMsgV5>(&inventory[4..]).is_err());
+        assert!(decode::<ServerMsgV5>(br#"{"Pong":{"nonce":1,"tick":2}}"#).is_ok(), "the stand-in decodes what it knows");
+        let heal = encode(&battle::BattleEvent::Heal { actor: ActorId(0), target: ActorId(1), amount: 3 }).unwrap();
+        assert!(decode::<EventV5>(&heal[4..]).is_err());
+        assert!(decode::<EventV5>(br#"{"GaugeReady":{"actor":1}}"#).is_ok());
+        for command in [battle::Command::Magic { spell: 0, target: ActorId(1) }, battle::Command::Defend] {
+            assert!(decode::<CommandV5>(&encode(&command).unwrap()[4..]).is_err(), "{command:?}");
+        }
+        assert!(decode::<CommandV5>(br#"{"Attack":{"target":1}}"#).is_ok());
+        let hello_v5 = br#"{"Hello":{"protocol_version":5,"client_build":"c","auth":{"Token":"x"},"tint":[0,0,0],"appearance_ref":null}}"#;
+        assert_eq!(probe_hello_version(hello_v5), Some(5));
+        assert_ne!(probe_hello_version(hello_v5), Some(PROTOCOL_VERSION));
     }
 
     /// No battle message can carry anything but ids, seeds, numbers and the engine's events: the

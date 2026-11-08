@@ -14,7 +14,13 @@
 //!   <https://wiki.ffrtt.ru/index.php/FF7/Savemap>
 //! * Sections 5 and 6: <https://ff7-mods.github.io/ff7-flat-wiki/FF7/Weapon_data.html> and
 //!   <https://ff7-mods.github.io/ff7-flat-wiki/FF7/Armor_data.html>
+//! * Section 4 (items, 28-byte records; the flat wiki counts sections from 1, so it calls it
+//!   section 5): <https://ff7-mods.github.io/ff7-flat-wiki/FF7/Item_data.html>
+//! * Section 8 (materia, 20-byte records; "section 9" on the flat wiki):
+//!   <https://ff7-mods.github.io/ff7-flat-wiki/FF7/Materia_data.html> and the type byte at
+//!   <https://wiki.ffrtt.ru/index.php/FF7/Materia_Types>
 //! * Targeting bits: <https://wiki.ffrtt.ru/index.php/FF7/Battle/Targeting_Data>
+//! * Special attack flags (active low): <https://wiki.ffrtt.ru/index.php/FF7/Battle/Special_Attack_Flags>
 //!
 //! The file is a run of gzip sections, each preceded by a 6-byte little-endian header:
 //! `u16` compressed size, `u16` decompressed size, `u16` file type (0..=8 for the data
@@ -26,12 +32,22 @@
 //! | 0 | 32 command records of 8 bytes | parsed ([`CommandRecord`]) |
 //! | 1 | 128 attack records of 28 bytes | on demand ([`Kernel::attack`]) |
 //! | 2 | battle and growth data | parsed ([`GrowthData`]) |
-//! | 3 | initialization data (9 savemap character records) | parsed ([`InitCharacter`]) |
+//! | 3 | initialization data (9 savemap character records, then the party, then the item stock) | parsed ([`InitCharacter`], [`Kernel::starting_inventory`]) |
+//! | 4 | 128 item records of 28 bytes | on demand ([`Kernel::item`]) |
 //! | 5, 6 | weapons (44 bytes), armor (36 bytes) | on demand ([`WeaponRecord`], [`ArmorRecord`]) |
-//! | 4, 7, 8 | items, accessories, materia | raw bytes only |
+//! | 8 | 96 materia records of 20 bytes | on demand ([`Kernel::materia`]) |
+//! | 7 | accessories | raw bytes only |
 //! | 9..27 | FF text tables | raw bytes; name lookup via [`Kernel::text_entry`] |
 //!
 //! Raw sections are available through [`Kernel::section`].
+//!
+//! ## What was checked against the owner's Steam copy
+//!
+//! The ignored tests in `tests/real_data.rs` check, on the owner's own files, that the attack index
+//! of the spells is the index of the "Names - magic" text table (Cure 0, Cure2 1, Cure3 2, Life 7,
+//! Fire 27, Ice 30, Bolt 33, ...), that item 0 is Potion (a flat heal of 20 x Power = 100 HP), 3 Ether
+//! (the same, on MP), 7 Phoenix Down, that the materia of the starting records are Lightning and Ice
+//! (Cloud) and Fire (Red XIII) and that the starting stock is Potion x3, Ether x1 and Phoenix Down x1.
 //!
 //! ## Stat derivation (APPROXIMATION)
 //!
@@ -107,10 +123,16 @@ pub const SECTION_ACCESSORIES: usize = 7;
 pub const SECTION_MATERIA: usize = 8;
 /// "Names - commands" text table.
 pub const SECTION_TEXT_COMMAND_NAMES: usize = 17;
+/// "Names - magic" text table: string `i` names attack `i` of section 1 for the spells.
+pub const SECTION_TEXT_MAGIC_NAMES: usize = 18;
+/// "Names - items" text table: string `i` names item `i` of section 4.
+pub const SECTION_TEXT_ITEM_NAMES: usize = 19;
 /// "Names - weapons" text table.
 pub const SECTION_TEXT_WEAPON_NAMES: usize = 20;
 /// "Names - armor" text table.
 pub const SECTION_TEXT_ARMOR_NAMES: usize = 21;
+/// "Names - materia" text table: string `i` names materia `i` of section 8.
+pub const SECTION_TEXT_MATERIA_NAMES: usize = 23;
 
 /// Command index of the Attack command.
 pub const COMMAND_ATTACK: usize = 1;
@@ -121,6 +143,24 @@ pub(crate) const WEAPON_RECORD_SIZE: usize = 44;
 pub(crate) const ARMOR_RECORD_SIZE: usize = 36;
 pub(crate) const INIT_CHARACTER_SIZE: usize = 0x84;
 pub(crate) const CHARACTER_COUNT: usize = 9;
+pub(crate) const ITEM_RECORD_SIZE: usize = 28;
+pub(crate) const MATERIA_RECORD_SIZE: usize = 20;
+/// Items in the kernel's item table (section 4). The savemap's 9-bit item index also reaches the
+/// weapons, armor and accessories (128 and up), which the inventory here does not hold.
+pub const ITEM_COUNT: usize = 128;
+/// Materia in the kernel's materia table (section 8).
+pub const MATERIA_COUNT: usize = 96;
+/// The game's own cap on one stack of an item (the savemap stores a count in 7 bits; the game stops at 99).
+pub const MAX_ITEM_STACK: u16 = 99;
+/// Slots of the item stock in the initialization data (the savemap's 320 item slots).
+pub const INIT_ITEM_SLOTS: usize = 320;
+/// Materia slots of a character record: eight on the weapon, eight on the armor, one after the other.
+pub(crate) const INIT_MATERIA_SLOTS: usize = 16;
+pub(crate) const OFF_INIT_MATERIA: usize = 0x40;
+/// The item stock follows the nine character records and four party bytes (three slots and a pad).
+pub(crate) const OFF_INIT_ITEMS: usize = CHARACTER_COUNT * INIT_CHARACTER_SIZE + 4;
+/// Attack index of the last spell Master Magic unlocks (Shield; the menu hides the two after it).
+const LAST_MASTER_MAGIC_SPELL: u16 = 0x35;
 pub(crate) const GROWTH_RECORD_SIZE: usize = 56;
 const GAIN_TABLE_LEN: usize = 12;
 pub(crate) const OFF_STAT_GAIN: usize = 0x1F8;
@@ -534,6 +574,15 @@ impl GrowthData {
     }
 }
 
+/// One materia in a character's equipment: which materia and its AP (savemap format: an id byte, then
+/// three bytes of AP; an empty slot is `0xFF` and `0xFFFFFF`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EquippedMateria {
+    /// Index into the kernel's materia table ([`Kernel::materia`]).
+    pub id: u8,
+    pub ap: u32,
+}
+
 /// One record of the initialization data (section 3): a savemap-format character record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InitCharacter {
@@ -554,10 +603,24 @@ pub struct InitCharacter {
     pub back_row: bool,
     pub base_hp: u16,
     pub base_mp: u16,
+    /// The materia equipped at the start (savemap offsets `0x40..0x80`: eight weapon slots, then
+    /// eight armor slots; empty slots are left out). On the owner's Steam copy only Cloud (Lightning
+    /// and Ice) and Red XIII (Fire among others) start with magic materia.
+    pub equipped_materia: Vec<EquippedMateria>,
 }
 
 impl InitCharacter {
     fn parse(b: &[u8]) -> Self {
+        let equipped_materia = (0..INIT_MATERIA_SLOTS)
+            .filter_map(|slot| {
+                let at = OFF_INIT_MATERIA + slot * 4;
+                let id = u8_at(b, at);
+                (id != 0xFF).then(|| EquippedMateria {
+                    id,
+                    ap: u32::from(u16_at(b, at + 1)) | (u32::from(u8_at(b, at + 3)) << 16),
+                })
+            })
+            .collect();
         Self {
             id: u8_at(b, 0x00),
             level: u8_at(b, 0x01),
@@ -570,6 +633,140 @@ impl InitCharacter {
             back_row: u8_at(b, 0x20) == 0xFE,
             base_hp: u16_at(b, 0x2E),
             base_mp: u16_at(b, 0x32),
+            equipped_materia,
+        }
+    }
+}
+
+/// One stack of the starting item stock: `count` of item `item` (an index into the item table).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ItemStack {
+    pub item: u16,
+    pub count: u16,
+}
+
+/// Item record (section 4, 28 bytes): the fields the battle rules use. Layout: the first eight bytes
+/// are unused (`0xFF`), then the camera ids and the fields below; the damage-calculation, power,
+/// element and special-flag fields mean what they mean in an attack record
+/// ([`crate::scene::AttackRecord`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ItemRecord {
+    /// Restriction bits (offset `0x0A`), active low: selling is allowed when bit `0x01` is clear,
+    /// use in battle when `0x02` is clear and use from the field menu when `0x04` is clear.
+    pub restrictions: u16,
+    pub target_flags: u8,
+    /// The animation id of the item's effect (offset `0x0D`).
+    pub effect_id: u8,
+    pub damage_calc: u8,
+    pub power: u8,
+    pub status_chance_mode: u8,
+    /// Extra effect (offset `0x12`, `0xFF` = none) and its parameter.
+    pub extra_effect: u8,
+    pub extra_effect_param: u8,
+    pub status_mask: u32,
+    pub element_mask: u16,
+    /// Special attack flags, **active low** (a cleared bit turns the effect on): `0x0001` hits MP
+    /// instead of HP, `0x0100` hits only the dead.
+    pub special_flags: u16,
+}
+
+impl ItemRecord {
+    fn parse(b: &[u8]) -> Option<Self> {
+        if b.len() < ITEM_RECORD_SIZE {
+            return None;
+        }
+        Some(Self {
+            restrictions: u16_at(b, 0x0A),
+            target_flags: u8_at(b, 0x0C),
+            effect_id: u8_at(b, 0x0D),
+            damage_calc: u8_at(b, 0x0E),
+            power: u8_at(b, 0x0F),
+            status_chance_mode: u8_at(b, 0x11),
+            extra_effect: u8_at(b, 0x12),
+            extra_effect_param: u8_at(b, 0x13),
+            status_mask: u32_at(b, 0x14),
+            element_mask: u16_at(b, 0x18),
+            special_flags: u16_at(b, 0x1A),
+        })
+    }
+
+    /// Whether the record allows use in battle (restriction bit `0x02` clear).
+    pub fn usable_in_battle(&self) -> bool {
+        self.restrictions & 0x0002 == 0
+    }
+}
+
+/// Materia record (section 8, 20 bytes): the fields the battle rules use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MateriaRecord {
+    /// Cumulative AP needed for levels 2 to 5, in units of 100 AP (`0xFFFF`: that level never comes).
+    pub ap_levels: [u16; 4],
+    /// The stat bonus index (offset `0x08`).
+    pub equip_effect: u8,
+    /// The element (offset `0x0C`).
+    pub element: u8,
+    /// The type byte (offset `0x0D`): the low nybble is the base type (`9` Magic, `0xA` Master Magic,
+    /// `0xB`/`0xC` Summon, ...), the high nybble the sub-type.
+    pub kind: u8,
+    /// The six attribute bytes (offset `0x0E`). For a Magic materia, the attack index of the spell it
+    /// teaches at level 1 to 5 (`0xFF`: none; the sixth byte is not a level).
+    pub attributes: [u8; 6],
+}
+
+impl MateriaRecord {
+    fn parse(b: &[u8]) -> Option<Self> {
+        if b.len() < MATERIA_RECORD_SIZE {
+            return None;
+        }
+        Some(Self {
+            ap_levels: [u16_at(b, 0), u16_at(b, 2), u16_at(b, 4), u16_at(b, 6)],
+            equip_effect: u8_at(b, 0x08),
+            element: u8_at(b, 0x0C),
+            kind: u8_at(b, 0x0D),
+            attributes: array_at(b, 0x0E),
+        })
+    }
+
+    /// A Magic (`9`) or Master Magic (`0xA`) materia: it grants the Magic command.
+    pub fn is_magic(&self) -> bool {
+        matches!(self.kind & 0x0F, 0x9 | 0xA)
+    }
+
+    /// The materia level (1 to 5) that `ap` raw AP reaches: each threshold is 100 times its stored
+    /// value, and a threshold of `0xFFFF` is never reached.
+    pub fn level_for_ap(&self, ap: u32) -> u8 {
+        let mut level = 1u8;
+        for threshold in self.ap_levels {
+            if threshold == 0xFFFF || ap < u32::from(threshold) * 100 {
+                break;
+            }
+            level += 1;
+        }
+        level
+    }
+
+    /// The spells (attack indexes, ascending) a Magic materia teaches at `level` or below: the
+    /// attribute bytes of the first `level` slots that are not `0xFF`.
+    pub fn spells_at_level(&self, level: u8) -> Vec<u16> {
+        let mut spells: Vec<u16> = self
+            .attributes
+            .iter()
+            .take(usize::from(level.clamp(1, 5)))
+            .filter(|a| **a != 0xFF)
+            .map(|a| u16::from(*a))
+            .collect();
+        spells.sort_unstable();
+        spells.dedup();
+        spells
+    }
+
+    /// The spells this materia gives at `ap`: nothing unless it is a Magic materia; Master Magic gives
+    /// every spell up to Shield, the others the spells of their level ([`MateriaRecord::spells_at_level`]).
+    pub fn unlocked_spells(&self, ap: u32) -> Vec<u16> {
+        match self.kind & 0x0F {
+            0xA => (0..=LAST_MASTER_MAGIC_SPELL).collect(),
+            0x9 => self.spells_at_level(self.level_for_ap(ap)),
+            _ => Vec::new(),
         }
     }
 }
@@ -780,6 +977,75 @@ impl Kernel {
         self.init_characters.iter().find(|c| c.id == save_id)
     }
 
+    /// Item record `index` of the item table (section 4; `None` past [`ITEM_COUNT`]).
+    pub fn item(&self, index: u16) -> Option<ItemRecord> {
+        if usize::from(index) >= ITEM_COUNT {
+            return None;
+        }
+        let data = self.section(SECTION_ITEMS)?;
+        ItemRecord::parse(data.get(usize::from(index) * ITEM_RECORD_SIZE..)?)
+    }
+
+    /// Materia record `id` of the materia table (section 8; `None` past [`MATERIA_COUNT`]).
+    pub fn materia(&self, id: u8) -> Option<MateriaRecord> {
+        if usize::from(id) >= MATERIA_COUNT {
+            return None;
+        }
+        let data = self.section(SECTION_MATERIA)?;
+        MateriaRecord::parse(data.get(usize::from(id) * MATERIA_RECORD_SIZE..)?)
+    }
+
+    /// The item stock a new game starts with, from the initialization data (section 3, after the
+    /// character records and the party): the savemap's 320 slots of a `u16` each, the item index in
+    /// the low nine bits and the count in the high seven, `0xFFFF` for an empty slot. Only consumable
+    /// items count (index below [`ITEM_COUNT`]; weapons, armor and accessories are not kept), the
+    /// same item in two slots is merged and a stack never passes [`MAX_ITEM_STACK`]. In file order.
+    /// Empty when the section is too short to hold a stock. On the owner's Steam copy: Potion x3,
+    /// Ether x1, Phoenix Down x1.
+    pub fn starting_inventory(&self) -> Vec<ItemStack> {
+        let Some(section) = self.section(SECTION_INITIALIZATION) else {
+            return Vec::new();
+        };
+        let mut stacks: Vec<ItemStack> = Vec::new();
+        for slot in 0..INIT_ITEM_SLOTS {
+            let raw = u16_at(section, OFF_INIT_ITEMS + slot * 2);
+            if raw == 0xFFFF {
+                continue;
+            }
+            let (item, count) = (raw & 0x01FF, raw >> 9);
+            // A count of zero is also what a read past the end of a short section gives.
+            if count == 0 || usize::from(item) >= ITEM_COUNT {
+                continue;
+            }
+            match stacks.iter_mut().find(|s| s.item == item) {
+                Some(stack) => stack.count = (stack.count + count).min(MAX_ITEM_STACK),
+                None => stacks.push(ItemStack {
+                    item,
+                    count: count.min(MAX_ITEM_STACK),
+                }),
+            }
+        }
+        stacks
+    }
+
+    /// The spells (attack indexes, ascending, no repeats) that the magic materia in `who`'s starting
+    /// equipment teach at the AP they start with. Empty for a character without a starting record
+    /// (Cait Sith and Vincent) or without magic materia.
+    pub fn equipped_spells(&self, who: CharacterId) -> Vec<u16> {
+        let record = u8::try_from(who.index())
+            .ok()
+            .and_then(|id| self.init_character_by_id(id));
+        let mut spells: Vec<u16> = record
+            .into_iter()
+            .flat_map(|rec| rec.equipped_materia.iter())
+            .filter_map(|m| self.materia(m.id).map(|rec| rec.unlocked_spells(m.ap)))
+            .flatten()
+            .collect();
+        spells.sort_unstable();
+        spells.dedup();
+        spells
+    }
+
     /// The total experience `who` starts with when it starts at `level` (clamped to
     /// `1..=`[`MAX_LEVEL`]): the kernel's own starting record when that record belongs to this
     /// level on the character's EXP curve (Cloud's does: level 6 with 610 EXP, six short of level
@@ -825,6 +1091,22 @@ impl Kernel {
 
     pub fn armor_name(&self, id: u8) -> Option<String> {
         self.text_entry(SECTION_TEXT_ARMOR_NAMES, usize::from(id))
+    }
+
+    /// Name of spell `index` (an attack index of section 1) from this file's "Names - magic" table.
+    /// The Steam edition's `kernel2.bin` text may differ from the text sections of `kernel.bin`.
+    pub fn magic_name(&self, index: u16) -> Option<String> {
+        self.text_entry(SECTION_TEXT_MAGIC_NAMES, usize::from(index))
+    }
+
+    /// Name of item `index` from this file's "Names - items" table.
+    pub fn item_name(&self, index: u16) -> Option<String> {
+        self.text_entry(SECTION_TEXT_ITEM_NAMES, usize::from(index))
+    }
+
+    /// Name of materia `id` from this file's "Names - materia" table.
+    pub fn materia_name(&self, id: u8) -> Option<String> {
+        self.text_entry(SECTION_TEXT_MATERIA_NAMES, usize::from(id))
     }
 }
 
@@ -933,7 +1215,11 @@ mod tests {
         assert_eq!(k.sections()[0].file_type, 0);
         assert_eq!(k.sections()[26].file_type, 9);
         assert_eq!(k.section(0).unwrap().len(), 256);
-        assert_eq!(k.section(4).unwrap(), &[1, 2, 3]);
+        assert_eq!(k.section(4).unwrap().len(), ITEM_COUNT * ITEM_RECORD_SIZE);
+        assert_eq!(
+            k.section(8).unwrap().len(),
+            MATERIA_COUNT * MATERIA_RECORD_SIZE
+        );
         assert!(k.section(27).is_none());
 
         // Commands.
@@ -1005,6 +1291,216 @@ mod tests {
         assert_eq!(g.mp_gain_percent[0], 12);
         assert_eq!(g.curves.len(), 64);
         assert_eq!(g.scene_block_starts(), vec![0, 5, 9, 14]);
+    }
+
+    #[test]
+    fn item_records_carry_what_the_battle_rules_use() {
+        let k = Kernel::parse(&synthetic_kernel_bytes()).unwrap();
+        // Potion: usable in battle, one ally, a flat heal (calc 0x26, Power 5), restorative element.
+        let potion = k.item(0).unwrap();
+        assert_eq!(
+            (potion.target_flags, potion.damage_calc, potion.power),
+            (0x01, 0x26, 5)
+        );
+        assert_eq!(potion.element_mask, 0x0200);
+        assert_eq!(potion.restrictions, 0xFFF8);
+        assert!(potion.usable_in_battle());
+        assert_eq!(potion.special_flags, 0xFFFF, "no special flag: it hits HP");
+        // Ether is the same with the "hits MP" bit (active low) cleared; Phoenix Down hits the dead.
+        assert_eq!(k.item(3).unwrap().special_flags & 0x0001, 0);
+        let phoenix = k.item(7).unwrap();
+        assert_eq!(
+            (
+                phoenix.damage_calc,
+                phoenix.power,
+                phoenix.special_flags & 0x0100
+            ),
+            (0x24, 8, 0)
+        );
+        assert_eq!(phoenix.status_mask, 1);
+        // An item that restricts battle use says so; an unused record reads as calc 0xFF.
+        assert!(!k.item(100).unwrap().usable_in_battle());
+        assert_eq!(k.item(127).unwrap().damage_calc, 0xFF);
+        assert!(
+            !k.item(127).unwrap().usable_in_battle(),
+            "0xFFFF restrictions: nothing allowed"
+        );
+        // Past the table, and a truncated section, are `None`.
+        assert!(k.item(128).is_none() && k.item(u16::MAX).is_none());
+        let mut sections = synthetic_kernel_sections();
+        sections[4].1.truncate(ITEM_RECORD_SIZE * 3 + 10);
+        let short = Kernel::parse(&pack_kernel(&sections, &[])).unwrap();
+        assert!(short.item(2).is_some());
+        assert!(
+            short.item(3).is_none(),
+            "a record cut short is not a record"
+        );
+        // Names come from the kernel's own text tables.
+        assert_eq!(k.item_name(0).as_deref(), Some("Potion"));
+        assert_eq!(k.item_name(7).as_deref(), Some("Phoenix Down"));
+        assert_eq!(k.magic_name(0).as_deref(), Some("Cure"));
+        assert_eq!(k.magic_name(27).as_deref(), Some("Fire"));
+        assert_eq!(k.materia_name(53).as_deref(), Some("Restore"));
+        assert_eq!(k.magic_name(500), None);
+    }
+
+    #[test]
+    fn materia_levels_follow_the_ap_thresholds_in_hundreds() {
+        let k = Kernel::parse(&synthetic_kernel_bytes()).unwrap();
+        let fire = k.materia(49).unwrap();
+        assert_eq!(fire.ap_levels, [20, 180, 350, 0xFFFF]);
+        assert_eq!(
+            (fire.kind, fire.attributes[..3].to_vec()),
+            (0x19, vec![27, 28, 29])
+        );
+        assert!(fire.is_magic());
+        // Level 2 needs 2000 AP (20 * 100), level 3 18000, level 4 35000; the fourth threshold never comes.
+        assert_eq!(fire.level_for_ap(0), 1);
+        assert_eq!(fire.level_for_ap(1999), 1);
+        assert_eq!(fire.level_for_ap(2000), 2);
+        assert_eq!(fire.level_for_ap(17_999), 2);
+        assert_eq!(fire.level_for_ap(18_000), 3);
+        assert_eq!(fire.level_for_ap(35_000), 4);
+        assert_eq!(
+            fire.level_for_ap(0xFF_FFFF),
+            4,
+            "a threshold of 0xFFFF is never reached"
+        );
+        // The spells of a level are the attribute bytes of the slots up to it.
+        assert_eq!(fire.spells_at_level(1), vec![27]);
+        assert_eq!(fire.spells_at_level(2), vec![27, 28]);
+        assert_eq!(fire.spells_at_level(3), vec![27, 28, 29]);
+        assert_eq!(
+            fire.spells_at_level(9),
+            vec![27, 28, 29],
+            "levels past the fifth are clamped"
+        );
+        assert_eq!(fire.spells_at_level(0), vec![27], "there is no level 0");
+        assert_eq!(fire.unlocked_spells(2000), vec![27, 28]);
+        // Restore teaches Cure, Cure2, Regen (attack 3) and Cure3 (attack 2), listed in index order.
+        let restore = k.materia(53).unwrap();
+        assert_eq!(restore.unlocked_spells(0), vec![0]);
+        assert_eq!(restore.unlocked_spells(2500), vec![0, 1]);
+        assert_eq!(restore.unlocked_spells(40_000), vec![0, 1, 2, 3]);
+        // Master Magic teaches every spell up to Shield; a command materia teaches no spell.
+        let master = k.materia(73).unwrap();
+        assert!(master.is_magic());
+        assert_eq!(master.unlocked_spells(0), (0..=0x35).collect::<Vec<u16>>());
+        let steal = k.materia(36).unwrap();
+        assert!(!steal.is_magic());
+        assert!(steal.unlocked_spells(0xFF_FFFF).is_empty());
+        assert!(!k.materia(0).unwrap().is_magic());
+        assert!(k.materia(96).is_none() && k.materia(255).is_none());
+    }
+
+    #[test]
+    fn the_starting_records_list_their_equipped_materia_and_the_spells_they_teach() {
+        let k = Kernel::parse(&synthetic_kernel_bytes()).unwrap();
+        let cloud = k.init_character_by_id(0).unwrap();
+        assert_eq!(
+            cloud.equipped_materia,
+            vec![
+                EquippedMateria { id: 52, ap: 0 },
+                EquippedMateria { id: 50, ap: 0 }
+            ]
+        );
+        // Weapon slots and armor slots are one list; a three-byte AP is read in full.
+        let red = k.init_character_by_id(4).unwrap();
+        assert_eq!(
+            red.equipped_materia,
+            vec![
+                EquippedMateria { id: 49, ap: 1000 },
+                EquippedMateria { id: 0, ap: 77 }
+            ]
+        );
+        assert_eq!(
+            k.init_character_by_id(8).unwrap().equipped_materia,
+            vec![EquippedMateria {
+                id: 73,
+                ap: 0xFF_FFFF
+            }]
+        );
+        assert!(k
+            .init_character_by_id(1)
+            .unwrap()
+            .equipped_materia
+            .is_empty());
+        // Cloud: Bolt (33) and Ice (30). Red XIII's Fire is still level 1 at 1000 AP, and his other
+        // materia is not a magic one. The record with Restore at 2500 AP knows Cure and Cure2.
+        assert_eq!(k.equipped_spells(CharacterId::Cloud), vec![30, 33]);
+        assert_eq!(k.equipped_spells(CharacterId::RedXiii), vec![27]);
+        assert_eq!(k.equipped_spells(CharacterId::Yuffie), vec![0, 1]);
+        // Master Magic: everything up to Shield. Nobody else: nothing, and no record means no spells.
+        assert_eq!(
+            k.equipped_spells(CharacterId::Cid),
+            (0..=0x35).collect::<Vec<u16>>()
+        );
+        assert!(k.equipped_spells(CharacterId::Barret).is_empty());
+        assert!(k.equipped_spells(CharacterId::CaitSith).is_empty());
+        assert!(k.equipped_spells(CharacterId::Vincent).is_empty());
+    }
+
+    #[test]
+    fn the_starting_stock_is_read_from_the_item_slots_after_the_party() {
+        let k = Kernel::parse(&synthetic_kernel_bytes()).unwrap();
+        // Potion x3 (merged with the later x2 into x5), Ether x1, Phoenix Down x1; the weapon and the
+        // count of zero are not there, and the file's order is kept.
+        assert_eq!(
+            k.starting_inventory(),
+            vec![
+                ItemStack { item: 0, count: 5 },
+                ItemStack { item: 3, count: 1 },
+                ItemStack { item: 7, count: 1 }
+            ]
+        );
+        // A stack never passes the game's cap of 99.
+        let mut sections = synthetic_kernel_sections();
+        for (slot, raw) in [
+            (10usize, (90u16 << 9) | 5),
+            (11, (60 << 9) | 5),
+            (12, (127 << 9) | 6),
+        ] {
+            let at = OFF_INIT_ITEMS + slot * 2;
+            sections[3].1[at..at + 2].copy_from_slice(&raw.to_le_bytes());
+        }
+        let capped = Kernel::parse(&pack_kernel(&sections, &[]))
+            .unwrap()
+            .starting_inventory();
+        assert_eq!(
+            capped.iter().find(|s| s.item == 5),
+            Some(&ItemStack {
+                item: 5,
+                count: MAX_ITEM_STACK
+            })
+        );
+        assert_eq!(
+            capped.iter().find(|s| s.item == 6),
+            Some(&ItemStack {
+                item: 6,
+                count: MAX_ITEM_STACK
+            })
+        );
+        // A section that ends before the stock has none, whatever it holds before.
+        let mut sections = synthetic_kernel_sections();
+        sections[3]
+            .1
+            .truncate(CHARACTER_COUNT * INIT_CHARACTER_SIZE);
+        assert!(Kernel::parse(&pack_kernel(&sections, &[]))
+            .unwrap()
+            .starting_inventory()
+            .is_empty());
+        // And one that ends in the middle of it keeps what is there.
+        let mut sections = synthetic_kernel_sections();
+        sections[3].1.truncate(OFF_INIT_ITEMS + 4);
+        assert_eq!(
+            Kernel::parse(&pack_kernel(&sections, &[]))
+                .unwrap()
+                .starting_inventory(),
+            vec![
+                ItemStack { item: 0, count: 3 },
+                ItemStack { item: 3, count: 1 }
+            ]
+        );
     }
 
     #[test]
@@ -1439,11 +1935,21 @@ mod tests {
             let _ = k.armor(id);
             let _ = k.weapon_name(id);
             let _ = k.init_character_by_id(id);
+            let _ = k.materia(id);
+            let _ = k.materia_name(id);
         }
         for i in 0..300 {
             let _ = k.attack(i);
             let _ = k.command(i);
             let _ = k.text_entry(i, i);
+            let _ = k.item(i as u16);
+            let _ = k.item_name(i as u16);
+            let _ = k.magic_name(i as u16);
+        }
+        let _ = k.item(u16::MAX);
+        let _ = k.starting_inventory();
+        for who in CharacterId::ALL {
+            let _ = k.equipped_spells(who);
         }
         for level in 0..=255u8 {
             for who in CharacterId::ALL {

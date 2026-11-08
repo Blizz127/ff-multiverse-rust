@@ -6,12 +6,16 @@ use flate2::{write::GzEncoder, Compression};
 
 use crate::kernel::{
     ARMOR_RECORD_SIZE, CHARACTER_COUNT, CURVE_COUNT, CURVE_SIZE, GROWTH_RECORD_SIZE,
-    INIT_CHARACTER_SIZE, OFF_CURVES, OFF_HP_GAIN, OFF_MP_GAIN, OFF_SCENE_LOOKUP, OFF_STAT_GAIN,
-    SECTION_TEXT_ARMOR_NAMES, SECTION_TEXT_COMMAND_NAMES, SECTION_TEXT_WEAPON_NAMES,
-    WEAPON_RECORD_SIZE,
+    INIT_CHARACTER_SIZE, INIT_ITEM_SLOTS, INIT_MATERIA_SLOTS, ITEM_COUNT, ITEM_RECORD_SIZE,
+    MATERIA_COUNT, MATERIA_RECORD_SIZE, OFF_CURVES, OFF_HP_GAIN, OFF_INIT_ITEMS, OFF_INIT_MATERIA,
+    OFF_MP_GAIN, OFF_SCENE_LOOKUP, OFF_STAT_GAIN, SECTION_TEXT_ARMOR_NAMES,
+    SECTION_TEXT_COMMAND_NAMES, SECTION_TEXT_ITEM_NAMES, SECTION_TEXT_MAGIC_NAMES,
+    SECTION_TEXT_MATERIA_NAMES, SECTION_TEXT_WEAPON_NAMES, WEAPON_RECORD_SIZE,
 };
 use crate::scene::layout::*;
-use crate::scene::{ATTACK_RECORD_SIZE, BLOCK_HEADER_SIZE, BLOCK_POINTERS, BLOCK_SIZE, SCENE_SIZE};
+use crate::scene::{
+    AttackRecord, ATTACK_RECORD_SIZE, BLOCK_HEADER_SIZE, BLOCK_POINTERS, BLOCK_SIZE, SCENE_SIZE,
+};
 use crate::text;
 
 pub fn gzip(data: &[u8]) -> Vec<u8> {
@@ -368,8 +372,15 @@ pub fn growth_section() -> Vec<u8> {
 /// slot index would be wrong); every other slot holds its own index as id. Record `i` has
 /// level `1 + i`, weapon id `i`, armor id `i % 3` and stats `10 + k + i`. Slot 3 starts in
 /// the back row.
+///
+/// Materia (invented, but in the savemap layout): record 0 has Lightning (id 52) and Ice (50) at 0 AP
+/// on its weapon, record 4 has Fire (49) at 1000 AP and a non-magic materia (id 0) on its armor,
+/// record 5 has Restore (53) at 2500 AP (level 2) and record 8 has Master Magic (73). The item
+/// stock follows four party bytes, as in the real file: Potion x3, Ether x1, Phoenix Down x1, and
+/// three slots that `Kernel::starting_inventory` must leave out or merge (a weapon, more Potions, a
+/// count of zero).
 pub fn init_section() -> Vec<u8> {
-    let mut s = vec![0u8; CHARACTER_COUNT * INIT_CHARACTER_SIZE];
+    let mut s = vec![0u8; OFF_INIT_ITEMS + INIT_ITEM_SLOTS * 2 + 0x100];
     let ids = [0u8, 1, 2, 3, 4, 5, 20, 21, 8];
     for (i, id) in ids.iter().enumerate() {
         let r = i * INIT_CHARACTER_SIZE;
@@ -387,6 +398,40 @@ pub fn init_section() -> Vec<u8> {
         s[r + 0x20] = if i == 3 { 0xFE } else { 0xFF };
         s[r + 0x2E..r + 0x30].copy_from_slice(&(200 + i as u16).to_le_bytes());
         s[r + 0x32..r + 0x34].copy_from_slice(&(10 + i as u16).to_le_bytes());
+        // Every materia slot is empty (id 0xFF, AP 0xFFFFFF) unless set below.
+        for slot in 0..INIT_MATERIA_SLOTS {
+            let at = r + OFF_INIT_MATERIA + slot * 4;
+            s[at..at + 4].copy_from_slice(&[0xFF; 4]);
+        }
+    }
+    let materia = |s: &mut Vec<u8>, record: usize, slot: usize, id: u8, ap: u32| {
+        let at = record * INIT_CHARACTER_SIZE + OFF_INIT_MATERIA + slot * 4;
+        s[at] = id;
+        s[at + 1..at + 4].copy_from_slice(&ap.to_le_bytes()[..3]);
+    };
+    materia(&mut s, 0, 0, 52, 0);
+    materia(&mut s, 0, 1, 50, 0);
+    materia(&mut s, 4, 0, 49, 1000);
+    materia(&mut s, 4, 8, 0, 77);
+    materia(&mut s, 5, 0, 53, 2500);
+    materia(&mut s, 8, 0, 73, 0xFF_FFFF);
+    // The party (three slots and a pad), then the 320 item slots.
+    s[OFF_INIT_ITEMS - 4..OFF_INIT_ITEMS].copy_from_slice(&[0, 1, 2, 0xFF]);
+    for slot in 0..INIT_ITEM_SLOTS {
+        let at = OFF_INIT_ITEMS + slot * 2;
+        s[at..at + 2].copy_from_slice(&0xFFFFu16.to_le_bytes());
+    }
+    let stock: [u16; 6] = [
+        3 << 9,         // Potion x3
+        (1 << 9) | 3,   // Ether x1
+        (1 << 9) | 7,   // Phoenix Down x1
+        (1 << 9) | 130, // a weapon (index 128 and up): not an item, left out
+        2 << 9,         // more Potions in another slot: merged into the first stack
+        0x0000,         // item 0 with a count of 0: nothing
+    ];
+    for (slot, raw) in stock.iter().enumerate() {
+        let at = OFF_INIT_ITEMS + slot * 2;
+        s[at..at + 2].copy_from_slice(&raw.to_le_bytes());
     }
     s
 }
@@ -411,7 +456,154 @@ pub fn attack_section() -> Vec<u8> {
     s[o + 0x0C] = 0x03;
     s[o + 0x0E] = 0x11;
     s[o + 0x0F] = 24;
+    // The spells, with the kinds of numbers the real data has (see `action` for how each is
+    // played): index, mp cost, calc, power, accuracy, targets, element, special flags, status.
+    // Record 3 stays the plain physical attack above: Restore's third spell slot names it, which
+    // is the case of a materia that points at something that is not a castable spell.
+    #[rustfmt::skip]
+    #[allow(clippy::type_complexity)] // a table of record rows
+    let spells: [(usize, u16, u8, u8, u8, u8, u16, u16, u32); 14] = [
+        (0, 5, 0x25, 5, 255, 0x0D, 0x0200, 0xFDFF, 0xFFFF_FFFF),    // Cure
+        (1, 24, 0x25, 35, 255, 0x0D, 0x0200, 0xFDFF, 0xFFFF_FFFF),  // Cure2
+        (2, 64, 0x25, 130, 255, 0x0D, 0x0200, 0xFDFF, 0xFFFF_FFFF), // Cure3
+        (7, 34, 0x24, 8, 255, 0x0D, 0x0200, 0xFCFD, 0x0000_0001),   // Life (hits the dead)
+        (27, 4, 0x22, 8, 100, 0x0F, 0x0001, 0xFDFF, 0xFFFF_FFFF),   // Fire
+        (28, 22, 0x22, 20, 100, 0x0F, 0x0001, 0xFDFF, 0xFFFF_FFFF), // Fire2
+        (29, 52, 0x22, 64, 100, 0x0F, 0x0001, 0xFDFD, 0xFFFF_FFFF), // Fire3
+        (30, 4, 0x22, 8, 100, 0x0F, 0x0002, 0xFDFF, 0xFFFF_FFFF),   // Ice
+        (31, 22, 0x22, 20, 100, 0x0F, 0x0002, 0xFDFF, 0xFFFF_FFFF), // Ice2
+        (32, 52, 0x22, 64, 100, 0x0F, 0x0002, 0xFDFD, 0xFFFF_FFFF), // Ice3
+        (33, 4, 0x22, 8, 100, 0x0F, 0x0004, 0xFDFF, 0xFFFF_FFFF),   // Bolt
+        (34, 22, 0x22, 20, 100, 0x0F, 0x0004, 0xFDFF, 0xFFFF_FFFF), // Bolt2
+        (42, 14, 0x23, 8, 75, 0x0F, 0x0020, 0xFFFF, 0xFFFF_FFFF),   // Demi (a fraction of the target's HP)
+        (52, 130, 0x22, 105, 100, 0x07, 0x0000, 0xFFFD, 0xFFFF_FFFF), // Ultima (every enemy at once: not aimable)
+    ];
+    for (index, mp, calc, power, accuracy, targets, element, flags, status) in spells {
+        let o = index * ATTACK_RECORD_SIZE;
+        s[o] = accuracy;
+        s[o + 4..o + 6].copy_from_slice(&mp.to_le_bytes());
+        s[o + 0x0C] = targets;
+        s[o + 0x0E] = calc;
+        s[o + 0x0F] = power;
+        s[o + 0x11] = 0xFF;
+        s[o + 0x12] = 0xFF;
+        s[o + 0x13] = 0xFF;
+        s[o + 0x14..o + 0x18].copy_from_slice(&status.to_le_bytes());
+        s[o + 0x18..o + 0x1A].copy_from_slice(&element.to_le_bytes());
+        s[o + 0x1A..o + 0x1C].copy_from_slice(&flags.to_le_bytes());
+    }
     s
+}
+
+/// Items with the numbers of the real data: 0 Potion, 1 Hi-Potion, 2 X-Potion, 3 Ether, 4 Turbo Ether,
+/// 5 Elixir, 6 Megalixir (every ally at once), 7 Phoenix Down, 8 Antidote (a status only), 20 Grenade,
+/// 100 an item that cannot be used in battle. Everything else is an unused record (calc 0xFF).
+pub fn item_section() -> Vec<u8> {
+    let mut s = vec![0xFFu8; ITEM_COUNT * ITEM_RECORD_SIZE];
+    // index, restrictions, targets, calc, power, element, special flags, status
+    #[rustfmt::skip]
+    #[allow(clippy::type_complexity)] // a table of record rows
+    let items: [(usize, u16, u8, u8, u8, u16, u16, u32); 11] = [
+        (0, 0xFFF8, 0x01, 0x26, 5, 0x0200, 0xFFFF, 0xFFFF_FFFF),
+        (1, 0xFFF8, 0x01, 0x26, 25, 0x0200, 0xFFFF, 0xFFFF_FFFF),
+        (2, 0xFFF8, 0x01, 0x24, 32, 0x0200, 0xFFFF, 0xFFFF_FFFF),
+        (3, 0xFFF8, 0x01, 0x26, 5, 0x0200, 0xFFFE, 0xFFFF_FFFF),
+        (4, 0xFFF8, 0x01, 0x24, 32, 0x0200, 0xFFFE, 0xFFFF_FFFF),
+        (5, 0xFFF8, 0x01, 0x08, 32, 0x0200, 0xFFFF, 0xFFFF_FFFF),
+        (6, 0xFFF8, 0x05, 0x08, 32, 0x0200, 0xFFFE, 0xFFFF_FFFF),
+        (7, 0xFFF8, 0x01, 0x24, 8, 0x0200, 0xFEFF, 0x0000_0001),
+        (8, 0xFFFC, 0x01, 0x47, 0, 0xFFFF, 0xFFFF, 0x0000_0008),
+        (20, 0xFFFC, 0x03, 0x37, 10, 0x2000, 0xFFFF, 0xFFFF_FFFF),
+        (100, 0xFFFF, 0x03, 0xFF, 255, 0xFFFF, 0xFFFF, 0xFFFF_FFFF),
+    ];
+    for (index, restrictions, targets, calc, power, element, flags, status) in items {
+        let o = index * ITEM_RECORD_SIZE;
+        s[o..o + ITEM_RECORD_SIZE].fill(0xFF);
+        s[o + 0x0A..o + 0x0C].copy_from_slice(&restrictions.to_le_bytes());
+        s[o + 0x0C] = targets;
+        s[o + 0x0E] = calc;
+        s[o + 0x0F] = power;
+        s[o + 0x14..o + 0x18].copy_from_slice(&status.to_le_bytes());
+        s[o + 0x18..o + 0x1A].copy_from_slice(&element.to_le_bytes());
+        s[o + 0x1A..o + 0x1C].copy_from_slice(&flags.to_le_bytes());
+    }
+    s
+}
+
+/// Materia: every record starts as a plain independent materia that never levels; then 49 Fire,
+/// 50 Ice, 52 Lightning (three spells each, levels at 2000, 18000 and 35000 AP), 53 Restore (Cure,
+/// Cure2, Regen, Cure3 at 2500, 17000, 25000 and 40000 AP), 73 Master Magic and 36 Steal (a command
+/// materia).
+pub fn materia_section() -> Vec<u8> {
+    let mut s = vec![0u8; MATERIA_COUNT * MATERIA_RECORD_SIZE];
+    for id in 0..MATERIA_COUNT {
+        let o = id * MATERIA_RECORD_SIZE;
+        s[o..o + 8].fill(0xFF);
+        s[o + 0x0D] = 0x20;
+        s[o + 0x0E..o + 0x14].fill(0xFF);
+    }
+    #[rustfmt::skip]
+    let magic: [(usize, [u16; 4], u8, [u8; 6]); 5] = [
+        (49, [20, 180, 350, 0xFFFF], 0x19, [27, 28, 29, 0xFF, 0xFF, 0xFF]),
+        (50, [20, 180, 350, 0xFFFF], 0x19, [30, 31, 32, 0xFF, 0xFF, 0xFF]),
+        (52, [20, 180, 350, 0xFFFF], 0x19, [33, 34, 35, 0xFF, 0xFF, 0xFF]),
+        (53, [25, 170, 250, 400], 0x19, [0, 1, 3, 2, 0xFF, 0xFF]),
+        (73, [0xFFFF; 4], 0x0A, [0xFF; 6]),
+    ];
+    for (id, levels, kind, attributes) in magic {
+        let o = id * MATERIA_RECORD_SIZE;
+        for (k, v) in levels.iter().enumerate() {
+            s[o + k * 2..o + k * 2 + 2].copy_from_slice(&v.to_le_bytes());
+        }
+        s[o + 0x08] = 11;
+        s[o + 0x0D] = kind;
+        s[o + 0x0E..o + 0x14].copy_from_slice(&attributes);
+    }
+    let o = 36 * MATERIA_RECORD_SIZE;
+    s[o + 0x0D] = 0x16;
+    s[o + 0x0E..o + 0x14].copy_from_slice(&[5, 17, 0xFF, 0xFF, 0xFF, 0xFF]);
+    s
+}
+
+/// An attack record with these numbers, no extra effect and no status.
+pub fn attack_record(
+    calc: u8,
+    power: u8,
+    accuracy: u8,
+    target_flags: u8,
+    element_mask: u16,
+    special_flags: u16,
+    mp_cost: u16,
+) -> AttackRecord {
+    AttackRecord {
+        accuracy,
+        impact_effect: 0,
+        hurt_action: 0,
+        mp_cost,
+        impact_sound: 0,
+        camera_single: 0,
+        camera_multi: 0,
+        target_flags,
+        attack_effect: 0,
+        damage_calc: calc,
+        power,
+        condition_submenu: 0,
+        status_chance_mode: 0xFF,
+        extra_effect: 0xFF,
+        extra_effect_param: 0xFF,
+        status_mask: 0xFFFF_FFFF,
+        element_mask,
+        special_flags,
+    }
+}
+
+/// A text table of `len` strings, empty except for the given `(index, text)` entries.
+pub fn sparse_text_table(len: usize, entries: &[(usize, &str)]) -> Vec<u8> {
+    let mut strings = vec![""; len];
+    for (index, name) in entries {
+        strings[*index] = name;
+    }
+    text_table(&strings)
 }
 
 /// Weapons 0..8: even ids are short range (`0x23`), odd ids long range (`0x03`); attack
@@ -470,15 +662,46 @@ pub fn synthetic_kernel_sections() -> Vec<(u16, Vec<u8>)> {
         (1, attack_section()),
         (2, growth_section()),
         (3, init_section()),
-        (4, vec![1, 2, 3]),
+        (4, item_section()),
         (5, weapon_section()),
         (6, armor_section()),
         (7, vec![9; 16]),
-        (8, vec![8; 20]),
+        (8, materia_section()),
     ];
     for i in 9..27usize {
         let table = match i {
             SECTION_TEXT_COMMAND_NAMES => text_table(&["Cmd0", "Attack", "Magic"]),
+            SECTION_TEXT_MAGIC_NAMES => sparse_text_table(
+                64,
+                &[
+                    (0, "Cure"),
+                    (1, "Cure2"),
+                    (2, "Cure3"),
+                    (7, "Life"),
+                    (27, "Fire"),
+                    (30, "Ice"),
+                    (33, "Bolt"),
+                ],
+            ),
+            SECTION_TEXT_ITEM_NAMES => sparse_text_table(
+                128,
+                &[
+                    (0, "Potion"),
+                    (1, "Hi-Potion"),
+                    (3, "Ether"),
+                    (7, "Phoenix Down"),
+                    (20, "Grenade"),
+                ],
+            ),
+            SECTION_TEXT_MATERIA_NAMES => sparse_text_table(
+                96,
+                &[
+                    (49, "Fire"),
+                    (50, "Ice"),
+                    (52, "Lightning"),
+                    (53, "Restore"),
+                ],
+            ),
             SECTION_TEXT_WEAPON_NAMES => text_table(&["Test Blade", "Test Gun"]),
             SECTION_TEXT_ARMOR_NAMES => text_table(&["Test Bangle"]),
             _ => text_table(&["x"]),

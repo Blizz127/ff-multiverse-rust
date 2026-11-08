@@ -513,6 +513,10 @@ impl ClientState {
             // Our own character's numbers (protocol v5). Like battle traffic it never ends the session:
             // it is the server's word about us, shown and counted, and nothing here acts on it.
             msg @ ServerMsg::CharacterProgress { .. } => self.progress.on_message(now, msg),
+            // What our account carries (protocol v6): the battle mirror keeps it, because the command
+            // menu's Item list is made of it. Like the progress it is the server's word and never ends
+            // the session.
+            ServerMsg::Inventory { items } => self.battle.on_inventory(now, items),
         }
         None
     }
@@ -1366,5 +1370,21 @@ mod tests {
         };
         assert!(s.apply(0.0, offer).is_none());
         assert_eq!((s.area(), s.area_changes()), (&plaza(), 0));
+    }
+
+    /// What our account carries (protocol v6) is the battle mirror's: it keeps the last message, which
+    /// is the whole inventory every time, notes it, and an inventory is never a reason to end the session.
+    #[test]
+    fn an_inventory_message_reaches_the_battle_mirror_and_never_ends_the_session() {
+        use fmv_protocol::InventoryEntry;
+        let mut s = state(Pos::default());
+        assert_eq!((s.battle.inventory_total(), s.battle.inventory_updates()), (0, 0));
+        let said = vec![InventoryEntry::new(0, 3), InventoryEntry::new(3, 1), InventoryEntry::new(7, 1)];
+        assert_eq!(s.apply(0.1, ServerMsg::Inventory { items: said.clone() }), None);
+        assert_eq!(s.battle.inventory(), said.as_slice());
+        assert_eq!((s.battle.inventory_total(), s.battle.inventory_updates()), (5, 1));
+        assert_eq!(s.battle.drain_notes(), ["inventory: stacks=3 total=5 items=0:3,3:1,7:1"]);
+        assert_eq!(s.apply(0.2, ServerMsg::Inventory { items: vec![] }), None, "the next message replaces it, an empty one too");
+        assert_eq!((s.battle.inventory_total(), s.battle.inventory_updates()), (0, 2));
     }
 }

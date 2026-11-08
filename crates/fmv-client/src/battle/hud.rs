@@ -15,6 +15,13 @@
 //! command list every time our gauge fills (the cursor stays on the command used last), and it is
 //! reset when a command of ours is applied or our character falls.
 //!
+//! # The banner
+//!
+//! Every `Action` event names what is being done, for [`BANNER_S`] seconds: a spell or an item by its
+//! name from this machine's [`NameBook`] (`Spell 27` / `Item 7` without one), an enemy's own attack by
+//! its scene's name (no banner when the scene has none), `Defend`; a plain attack says nothing. When
+//! several actions arrive together the last one wins.
+//!
 //! # The linger
 //!
 //! When the server ends the battle, the client drops its mirror at once (the player is free in the
@@ -23,11 +30,11 @@
 //! battle does not skip it) and so does time ([`LINGER_S`]).
 
 use super::menu::{BattleMenu, BattleMenuModel, Ctx, Fighter, MenuKey, Reply};
-use super::names::NameBook;
+use super::names::{item_name, spell_name, NameBook};
 use super::panels::{Banner, Finale, RewardLine, BANNER_S, PANEL_DELAY_MS};
 use super::popups::Popups;
 use super::view::{Bar, BattleView};
-use fmv_ff7_battle::rules::{ActorId, BattleEvent, Outcome};
+use fmv_ff7_battle::rules::{ActionRef, ActorId, BattleEvent, Outcome};
 use std::sync::Arc;
 
 /// How long the last view of a battle stays on screen after its end, in seconds.
@@ -93,33 +100,54 @@ impl BattleHud {
     }
 
     /// The names this machine knows (spells, items, enemy attacks).
-    #[cfg_attr(not(test), allow(dead_code))] // the integrator names the engine's spells and actions with it
     pub fn names(&self) -> Option<&NameBook> {
         self.names.as_deref()
     }
 
+    /// Use these names from now on (tests: the process-wide ones are installed once and for all).
+    #[cfg(test)]
+    pub fn set_names(&mut self, names: Option<Arc<NameBook>>) {
+        self.names = names;
+    }
+
     /// The formation of the battle that runs (`scene * 4 + slot`).
-    #[cfg_attr(not(test), allow(dead_code))] // the integrator names an enemy's attack through its scene
+    #[cfg(test)]
     pub fn formation(&self) -> u16 {
         self.formation
     }
 
     /// What the menu offers: the spells, the items, whether Defend exists.
-    #[cfg_attr(not(test), allow(dead_code))] // the integrator fills it from the engine and the inventory
     pub fn model_mut(&mut self) -> &mut BattleMenuModel {
         &mut self.model
     }
 
     /// The action banner shows `text` from `now` for [`BANNER_S`] seconds.
-    #[cfg_attr(not(test), allow(dead_code))] // the integrator calls it for the engine's `Action` event
     pub fn show_banner(&mut self, now: f64, text: String) {
         self.banner = Some((text, now));
+    }
+
+    /// The words the banner shows for `action`, if it shows any (see the module docs).
+    fn action_text(&self, action: ActionRef) -> Option<String> {
+        match action {
+            ActionRef::Attack => None,
+            ActionRef::Defend => Some("Defend".to_string()),
+            ActionRef::Magic(id) => Some(spell_name(self.names(), id)),
+            ActionRef::Item(id) => Some(item_name(self.names(), id)),
+            ActionRef::EnemyAttack(id) => self.names()?.enemy_attack(self.formation, id).map(str::to_string),
+        }
     }
 
     /// Battle events arrived at `now`. `my_command` says that one of them is the command of our
     /// own character being applied.
     pub fn on_events(&mut self, now: f64, events: &[BattleEvent], my_command: bool) {
         self.popups.on_events(now, events);
+        for event in events {
+            if let BattleEvent::Action { action, .. } = event {
+                if let Some(text) = self.action_text(*action) {
+                    self.show_banner(now, text);
+                }
+            }
+        }
         let mine = |actor: &ActorId| Some(*actor) == self.my_actor;
         let own_turn_starts_or_ends = events.iter().any(|e| match e {
             BattleEvent::GaugeReady { actor } | BattleEvent::Death { actor } => mine(actor),
@@ -324,6 +352,97 @@ mod tests {
         hud.show_banner(9.0, "Bite".into());
         hud.begin(1, None);
         assert!(at(&hud, 9.1).is_none(), "a new battle clears it");
+    }
+
+    /// A hud for formation 301 (scene 75) whose book names Cure (0), Fire (27), Phoenix Down (item 7)
+    /// and attack 272 of scene 75.
+    fn hud_with_names() -> BattleHud {
+        let mut spells = vec![String::new(); 28];
+        spells[0] = "Cure".to_string();
+        spells[27] = "Fire".to_string();
+        let mut items = vec![String::new(); 8];
+        items[7] = "Phoenix Down".to_string();
+        let book = NameBook::from_tables(&spells, &items).with_enemy_attack(75, 272, "Machine Gun");
+        let mut hud = BattleHud::new(Some(Arc::new(book)));
+        hud.begin(301, Some(ActorId(1)));
+        hud
+    }
+
+    fn action(actor: u8, what: ActionRef) -> BattleEvent {
+        BattleEvent::Action { actor: ActorId(actor), action: what }
+    }
+
+    fn banner_text(hud: &BattleHud, now: f64) -> Option<String> {
+        let mut v = view(false);
+        hud.decorate(&mut v, now);
+        v.banner.map(|b| b.text)
+    }
+
+    #[test]
+    fn an_action_shows_its_name_in_the_banner() {
+        for (what, want) in [
+            (ActionRef::Magic(27), "Fire"),
+            (ActionRef::Item(7), "Phoenix Down"),
+            (ActionRef::EnemyAttack(272), "Machine Gun"),
+            (ActionRef::Defend, "Defend"),
+            // An id the book does not name gets the plain label a menu would show.
+            (ActionRef::Magic(5), "Spell 5"),
+            (ActionRef::Item(99), "Item 99"),
+        ] {
+            let mut hud = hud_with_names();
+            hud.on_events(5.0, &[action(1, what)], false);
+            assert_eq!(banner_text(&hud, 5.1).as_deref(), Some(want), "{what:?}");
+            assert_eq!(banner_text(&hud, 5.0 + BANNER_S + 0.01), None, "{what:?} goes by itself");
+        }
+    }
+
+    #[test]
+    fn a_plain_attack_and_an_enemy_attack_without_a_name_make_no_banner() {
+        let mut hud = hud_with_names();
+        for what in [ActionRef::Attack, ActionRef::EnemyAttack(999)] {
+            hud.on_events(5.0, &[action(2, what)], false);
+            assert_eq!(banner_text(&hud, 5.1), None, "{what:?}");
+        }
+        // Nor does an enemy attack of ANOTHER scene's table: attack 272 is named by scene 75 only.
+        hud.begin(8, Some(ActorId(1)));
+        hud.on_events(5.0, &[action(2, ActionRef::EnemyAttack(272))], false);
+        assert_eq!(banner_text(&hud, 5.1), None);
+        // They do not wipe a banner that is still up, either.
+        let mut hud = hud_with_names();
+        hud.on_events(5.0, &[action(1, ActionRef::Magic(27))], false);
+        hud.on_events(5.2, &[action(2, ActionRef::Attack), action(2, ActionRef::EnemyAttack(999))], false);
+        assert_eq!(banner_text(&hud, 5.3).as_deref(), Some("Fire"));
+    }
+
+    #[test]
+    fn the_last_action_of_a_batch_wins_the_banner() {
+        let mut hud = hud_with_names();
+        hud.on_events(5.0, &[action(1, ActionRef::Magic(27)), action(2, ActionRef::EnemyAttack(272)), action(1, ActionRef::Item(7))], false);
+        assert_eq!(banner_text(&hud, 5.1).as_deref(), Some("Phoenix Down"));
+        // A later batch replaces it and restarts its time.
+        hud.on_events(6.0, &[action(2, ActionRef::EnemyAttack(272))], false);
+        let mut v = view(false);
+        hud.decorate(&mut v, 6.25);
+        assert_eq!(v.banner, Some(Banner { text: "Machine Gun".into(), age_ms: 250 }));
+        // Actions are not damage: they make no number over anybody.
+        assert!(v.popups.is_empty());
+    }
+
+    #[test]
+    fn without_a_book_the_banner_uses_plain_labels_and_enemy_attacks_stay_unnamed() {
+        let mut hud = BattleHud::new(None);
+        hud.begin(301, Some(ActorId(1)));
+        for (what, want) in [
+            (ActionRef::Magic(27), Some("Spell 27")),
+            (ActionRef::Item(7), Some("Item 7")),
+            (ActionRef::EnemyAttack(272), None),
+            (ActionRef::Defend, Some("Defend")),
+            (ActionRef::Attack, None),
+        ] {
+            let mut hud = hud.clone();
+            hud.on_events(5.0, &[action(1, what)], false);
+            assert_eq!(banner_text(&hud, 5.1).as_deref(), want, "{what:?}");
+        }
     }
 
     fn ended_hud() -> BattleHud {

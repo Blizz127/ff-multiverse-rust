@@ -9,7 +9,10 @@
 //! <root>/accounts/<account_id>.json             AccountRecord
 //! <root>/avatars/<avatar_id>.json               AvatarProfile
 //! <root>/progression/<account_id>/<Game>.json   Progression (the story blob, also the phase key)
-//! <root>/progression/<account_id>/<Game>.character.json   CharacterProgress (level, exp, ap, gil)
+//! <root>/progression/<account_id>/<Game>.character.json   CharacterProgress (level, exp, ap, gil
+//!                                                         and, once one was stored, the
+//!                                                         inventory: a missing `inventory` key
+//!                                                         means never stored, `[]` means empty)
 //! ```
 //!
 //! # Crash consistency
@@ -875,7 +878,14 @@ impl Store {
     /// [`PersistError::UnknownAccount`] for an account that does not exist, and with
     /// [`PersistError::Corrupt`] / [`PersistError::FutureSchema`] / [`PersistError::TooLarge`]
     /// for a file that is damaged, written by a newer build or oversized: such a file is never
-    /// replaced by a default behind the caller's back.
+    /// replaced by a default behind the caller's back. A damaged **inventory** (a list over
+    /// [`MAX_INVENTORY_STACKS`](fmv_core::MAX_INVENTORY_STACKS) stacks, a stack of zero, an item
+    /// twice, or numbers and types that are not an inventory) makes the whole record `Corrupt`.
+    ///
+    /// A record found without an inventory is not an empty one: its
+    /// [`inventory`](CharacterProgress::inventory) is `None` ("never stored", so the caller starts
+    /// from its game's starting stock), which is what every record written before inventories
+    /// existed looks like. `Some(vec![])` is a stored, empty inventory.
     ///
     /// Takes no writer lock: a write replaces the file atomically, so this sees the whole old
     /// record or the whole new one, and a login never waits for a battle result being saved.
@@ -920,9 +930,17 @@ impl Store {
 
     /// Store (replacing) the account's [`CharacterProgress`] for `record.game`, atomically (a
     /// crash leaves the old record or the new one). Other games and the story blob are
-    /// untouched. The record must pass the checks every game shares (`level` at least 1; the
-    /// game's own caps are its adapter's business) and the account must exist. Prefer
+    /// untouched. The record must pass the checks every game shares (`level` at least 1; an
+    /// inventory, if it has one, of at most [`MAX_INVENTORY_STACKS`](fmv_core::MAX_INVENTORY_STACKS)
+    /// stacks, none of them zero and no item twice, else [`PersistError::InvalidField`] with
+    /// `field: "inventory"`; the game's own caps are its adapter's business) and the account must
+    /// exist. A refused record leaves the old one in place. Prefer
     /// [`Store::update_character_progress`] when the new value depends on the old one.
+    ///
+    /// **The whole record is replaced, the inventory included.** A record whose `inventory` is
+    /// `None` (anything built with [`CharacterProgress::new`]) clears a stored inventory, back to
+    /// "never stored"; to change other fields and keep the items, start from the record that was
+    /// read.
     pub fn put_character_progress(&self, record: &CharacterProgress) -> Result<()> {
         record.validate()?;
         let path = self.character_path(record.account_id.0, record.game)?;
@@ -945,7 +963,11 @@ impl Store {
     /// `change` runs while the store's writer lock is held: it must be quick and must not call
     /// back into this store (the lock is not reentrant, so that would deadlock). What it returns
     /// must be for the same account and game and pass the checks of
-    /// [`Store::put_character_progress`]; otherwise nothing is written and the old record stays.
+    /// [`Store::put_character_progress`] (a bad inventory is one of them); otherwise nothing is
+    /// written and the old record stays. What it returns **replaces the whole record**, the
+    /// inventory included: build it from the record the closure was given, not from
+    /// [`CharacterProgress::new`], or a stored inventory is dropped. Adding to an item that the
+    /// inventory already lists means raising its count, not adding a second stack of it.
     pub fn update_character_progress<F>(
         &self,
         account: AccountId,

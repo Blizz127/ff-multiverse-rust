@@ -1,4 +1,4 @@
-//! Authoritative FF Multiverse server for protocol v5 (`fmv-protocol`).
+//! Authoritative FF Multiverse server for protocol v6 (`fmv-protocol`).
 //!
 //! The server hosts the areas of one `GameAdapter` (`Box<dyn GameAdapter>`, so wiring a real game
 //! later is a one-line change in the binary): the *entry* area named by the configuration, which
@@ -49,6 +49,15 @@
 //! `CharacterProgress` message (which it also gets on joining) and saved by the `saver` task, which
 //! `serve` stops, after saving everything queued, before it returns.
 //!
+//! # Inventory
+//!
+//! Every account also carries items (`inventory`), mirrored in the world and stored inside the same
+//! character record. The battle engine knows no inventory: the server checks the count before it submits
+//! an item command and takes the item only when the engine accepted it, drops items after a win (rolled
+//! from the battle's seed, logged, dealt to the living members) and tells the player what it carries
+//! (`Inventory`) when it joins and after each change. A new account, and one whose record predates the
+//! inventory, starts with the game's starting stock exactly once.
+//!
 //! # Limits and refusals
 //!
 //! The protocol is not encrypted and the server is for a network you trust, but one host must not be
@@ -89,6 +98,7 @@ mod accounts;
 mod config;
 mod conn;
 mod deferred;
+mod inventory;
 pub mod ff7;
 mod limits;
 mod progress;
@@ -288,7 +298,7 @@ impl Server {
             (None, false) => info!("battles unsupported on this server (no owned battle data); battle requests are refused"),
         }
         if !local_addr.ip().is_loopback() {
-            warn!(%local_addr, "listening on a non-loopback address; protocol v5 is not encrypted (account tokens and game traffic cross the network in the clear): use it only on a network you trust");
+            warn!(%local_addr, "listening on a non-loopback address; protocol v6 is not encrypted (account tokens and game traffic cross the network in the clear): use it only on a network you trust");
         }
 
         let build = config.build_string();

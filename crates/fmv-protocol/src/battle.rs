@@ -29,26 +29,53 @@
 //! that sees a difference has diverged and must say so loudly. `ServerMsg::BattleEnd` always
 //! follows the message that carried `Victory` or `Defeat`.
 //!
+//! # Commands (v6)
+//!
+//! A party member whose gauge is full gives one [`Command`]: `Attack`, `Magic { spell, target }` (a
+//! spell it knows, which costs MP), `Item { item, target }` or `Defend`. The server checks it with the
+//! engine (`BattleState::check_command`: gauge, target, MP, spell and item known) and, for an item, that
+//! the account owns one: the **engine knows no inventory**, so the server checks the count before it
+//! submits and takes the item only when the engine accepted the command. A client replays the very same
+//! commands from its own data and never needs a count (it learns its own from `ServerMsg::Inventory`).
+//! Every action is announced by a [`BattleEvent::Action`] before its effects.
+//!
 //! # Rewards
 //!
 //! [`split_rewards`] is a pure function of the engine's total reward and the ROSTER (every member
 //! of `EncounterStart::party`, with whether the engine says it is alive), never of who is still
 //! connected, so a client recomputes the very list the server sent.
+//!
+//! **Item drops are the exception.** The server rolls them AFTER the outcome ([`BattleRules::roll_drops`],
+//! from the battle's seed on a stream of its own, logged) and hands them to the living members
+//! ([`assign_drops`]); they travel in [`BattleReward::items`]. They are not part of the replayed event
+//! stream, so a client cannot recompute them and [`BattleReplay::check_end`] compares everything of a
+//! reward but its items.
 
 use std::fmt;
 use std::path::Path;
+use std::sync::Arc;
 
-use fmv_core::{AccountId, EntityId, Fingerprint};
-use fmv_ff7_battle::kernel::{CharacterId, Kernel, KernelError, MAX_AP, MAX_EXP, MAX_GIL, MAX_KERNEL_BYTES, MAX_LEVEL};
+use fmv_core::{AccountId, EntityId, Fingerprint, InventoryEntry};
+use fmv_ff7_battle::action::{ActionSpec, ItemData, ItemTable, Spell};
+use fmv_ff7_battle::kernel::{
+    CharacterId, Kernel, KernelError, ITEM_COUNT, MAX_AP, MAX_EXP, MAX_GIL, MAX_ITEM_STACK, MAX_KERNEL_BYTES, MAX_LEVEL,
+};
+use fmv_ff7_battle::rng::Rng;
 use fmv_ff7_battle::rules::{
-    enemies_for_formation, BattleConfig, BattleState, Combatant, Reward, StartMode, MAX_PER_SIDE,
+    element, enemies_for_formation, BattleConfig, BattleState, Combatant, Reward, StartMode, MAX_PER_SIDE,
 };
 use fmv_ff7_battle::scene::{BattleLayout, SceneBin, SceneError, MAX_SCENE_BIN_BYTES};
 use serde::{Deserialize, Serialize};
 
 /// The engine types that travel in battle messages, re-exported so a peer can match on them
 /// without a direct dependency.
-pub use fmv_ff7_battle::rules::{ActorId, BattleEvent, Command, Outcome};
+pub use fmv_ff7_battle::rules::{ActionRef, ActorId, BattleEvent, Command, Outcome};
+
+/// The random stream item drops are rolled on (the engine's own is [`fmv_ff7_battle::rng::DEFAULT_STREAM`]),
+/// so drops never depend on, or disturb, the replayed battle.
+const DROP_STREAM: u64 = 0x4452_4F50;
+/// A drop rate is out of this many (an enemy record's rate byte is `0..=63`).
+const DROP_DIE: u32 = 64;
 
 /// Most characters a battle party can have (a protocol bound; the server's party size is smaller).
 pub const MAX_BATTLE_PARTY: usize = 8;
@@ -87,13 +114,34 @@ impl BattleMember {
     }
 }
 
-/// What one account earned from a won battle (see [`split_rewards`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// What one account earned from a won battle (see [`split_rewards`] and [`assign_drops`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BattleReward {
     pub account: AccountId,
     pub exp: u32,
     pub gil: u32,
     pub ap: u32,
+    /// The items dropped to this account: rolled by the server after the battle (not replayable, see
+    /// the module docs), at most one entry per item, ascending by item. Absent from the JSON when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<InventoryEntry>,
+}
+
+impl BattleReward {
+    /// A reward of experience, gil and AP and no items.
+    pub fn new(account: AccountId, exp: u32, gil: u32, ap: u32) -> Self {
+        Self { account, exp, gil, ap, items: Vec::new() }
+    }
+
+    /// Nothing at all: no experience, gil, AP or items.
+    pub fn is_nothing(&self) -> bool {
+        self.exp == 0 && self.gil == 0 && self.ap == 0 && self.items.is_empty()
+    }
+
+    /// The same reward without its items: what a replay of the battle can reproduce.
+    pub fn without_items(&self) -> Self {
+        Self { items: Vec::new(), ..self.clone() }
+    }
 }
 
 /// A party command as the server applied it: who, and what.
@@ -123,12 +171,23 @@ pub enum BattleRejection {
     GaugeNotFull,
     /// The actor is dead.
     ActorDead,
-    /// The target does not exist or is not an enemy.
+    /// The target does not exist, or is on the wrong side for the action (damage goes to an enemy,
+    /// restoring to an ally).
     InvalidTarget,
     /// The target is already dead.
     TargetDead,
     /// The battle is over.
     BattleOver,
+    /// The target is alive, and the action (Life, Phoenix Down) only revives the dead.
+    TargetNotDead,
+    /// The actor does not know that spell.
+    UnknownSpell,
+    /// The actor has not the MP for that spell.
+    NotEnoughMp,
+    /// That is not an item that can be used in battle.
+    UnknownItem,
+    /// The account has none of that item.
+    OutOfItems,
 }
 
 impl fmt::Display for BattleRejection {
@@ -145,6 +204,11 @@ impl fmt::Display for BattleRejection {
             BattleRejection::InvalidTarget => "that is not a valid target",
             BattleRejection::TargetDead => "that target is already dead",
             BattleRejection::BattleOver => "the battle is over",
+            BattleRejection::TargetNotDead => "that target is alive (only the dead can be revived)",
+            BattleRejection::UnknownSpell => "that character does not know that spell",
+            BattleRejection::NotEnoughMp => "that character has not the MP for that spell",
+            BattleRejection::UnknownItem => "that item cannot be used in battle",
+            BattleRejection::OutOfItems => "you have none of that item",
         })
     }
 }
@@ -280,6 +344,26 @@ pub trait BattleRules: Send + Sync {
     /// The caps battle rewards saturate at (FF7's by default).
     fn progress_limits(&self) -> ProgressLimits {
         ProgressLimits::FF7
+    }
+
+    // ---- used by the server to keep each player's inventory (defaults: no items) ----
+
+    /// The items a new account starts with, ascending by item (FF7: the kernel's starting stock). An
+    /// account whose store holds no inventory yet starts from this, once.
+    fn starting_inventory(&self) -> Vec<InventoryEntry> {
+        Vec::new()
+    }
+
+    /// The most of one item a stack holds (FF7: 99). A drop or a starting stock never takes a stack past it.
+    fn max_item_stack(&self) -> u16 {
+        MAX_ITEM_STACK
+    }
+
+    /// The items a won battle against `formation_id` drops, rolled from the battle's `seed` AFTER the
+    /// outcome on a random stream of its own (never part of the replayed battle), ascending by item. The
+    /// server logs what it rolled and hands it out with [`assign_drops`].
+    fn roll_drops(&self, _formation_id: u16, _seed: u64) -> Vec<InventoryEntry> {
+        Vec::new()
     }
 
     // ---- used by the client to DRAW a battle (the default keeps older rule sets valid) ----
@@ -461,14 +545,16 @@ impl BattleReplay {
     }
 
     /// Check a `BattleEnd` against the engine: it must have ended the way the server says, and the
-    /// rewards must be the ones the engine's totals split into.
+    /// rewards must be the ones the engine's totals split into. The dropped items are not compared:
+    /// the server rolled them after the battle and a replay cannot reproduce them (see the module docs).
     pub fn check_end(&self, outcome: Outcome, rewards: &[BattleReward]) -> Result<(), Divergence> {
         let local = self.state.outcome();
         if local != Some(outcome) {
             return Err(Divergence::OutcomeDiffers { local, server: outcome });
         }
         let expected = self.expected_rewards();
-        if expected != rewards {
+        let announced: Vec<BattleReward> = rewards.iter().map(BattleReward::without_items).collect();
+        if expected != announced {
             return Err(Divergence::RewardsDiffer { local: expected, server: rewards.to_vec() });
         }
         Ok(())
@@ -508,12 +594,80 @@ pub fn split_rewards(total: Reward, roster: &[(AccountId, bool)]) -> Vec<BattleR
         .iter()
         .map(|&(account, is_alive)| {
             if is_alive {
-                BattleReward { account, exp: total.exp / alive, gil: total.gil / alive, ap: total.ap }
+                BattleReward::new(account, total.exp / alive, total.gil / alive, total.ap)
             } else {
-                BattleReward { account, exp: 0, gil: 0, ap: 0 }
+                BattleReward::new(account, 0, 0, 0)
             }
         })
         .collect()
+}
+
+/// Hand the dropped items to the living members of the roster: one unit at a time, in the order of
+/// `drops` (item by item, each as many times as its count), round-robin over the living members in
+/// roster order, starting with the first. `rewards` is the list [`split_rewards`] gave for the same
+/// `roster` and gets the items; each member's list ends up with one entry per item, ascending by item,
+/// and a stack never passes `max_stack`. The dead get nothing, and when nobody is alive nothing is
+/// handed out.
+///
+/// APPROXIMATION: FF7 pools the party's items; accounts here have separate inventories, so the drops
+/// are dealt out like cards.
+pub fn assign_drops(rewards: &mut [BattleReward], roster: &[(AccountId, bool)], drops: &[InventoryEntry], max_stack: u16) {
+    let alive: Vec<usize> = roster
+        .iter()
+        .enumerate()
+        .filter(|(i, (_, is_alive))| *is_alive && *i < rewards.len())
+        .map(|(i, _)| i)
+        .collect();
+    if alive.is_empty() {
+        return;
+    }
+    let mut unit = 0usize;
+    for drop in drops {
+        for _ in 0..drop.count {
+            let member = alive[unit % alive.len()];
+            unit += 1;
+            let items = &mut rewards[member].items;
+            match items.iter_mut().find(|e| e.item == drop.item) {
+                Some(entry) => entry.count = entry.count.saturating_add(1).min(max_stack),
+                None => items.push(InventoryEntry::new(drop.item, 1.min(max_stack))),
+            }
+        }
+    }
+    for &member in &alive {
+        rewards[member].items.retain(|e| e.count > 0);
+        rewards[member].items.sort_by_key(|e| e.item);
+    }
+}
+
+/// Roll the drops of enemies whose drop tables are `tables` (each an enemy record's four rate bytes and
+/// four item ids), in that order, from `seed` on the drop stream. An enemy drops at most one item: its
+/// slots are tried in order, a slot with a rate under `0x80` (rates from `0x80` are STEAL chances, not drops)
+/// and an item succeeds when `below(64) < rate`, and the first success ends the enemy's rolls. An item
+/// index outside the item table (a weapon, armor or accessory) is not kept. The result is ascending by item
+/// with each count capped at `max_stack`. One `below(64)` is drawn for every slot that is tried, so the
+/// stream a seed gives is a function of the tables alone.
+fn roll_enemy_drops(seed: u64, tables: &[([u8; 4], [u16; 4])], max_stack: u16) -> Vec<InventoryEntry> {
+    let mut rng = Rng::with_stream(seed, DROP_STREAM);
+    let mut drops: Vec<InventoryEntry> = Vec::new();
+    for (rates, items) in tables {
+        for (rate, item) in rates.iter().zip(items) {
+            if *item == 0xFFFF || *rate >= 0x80 {
+                continue;
+            }
+            if rng.below(DROP_DIE) < u32::from(*rate) {
+                if usize::from(*item) < ITEM_COUNT {
+                    match drops.iter_mut().find(|e| e.item == *item) {
+                        Some(entry) => entry.count = entry.count.saturating_add(1).min(max_stack),
+                        None => drops.push(InventoryEntry::new(*item, 1.min(max_stack))),
+                    }
+                }
+                break;
+            }
+        }
+    }
+    drops.retain(|e| e.count > 0);
+    drops.sort_by_key(|e| e.item);
+    drops
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -542,6 +696,8 @@ pub enum Ff7BattleDataError {
 pub struct Ff7BattleData {
     scenes: SceneBin,
     kernel: Kernel,
+    /// The items the engine can use in battle, from the kernel (shared by every battle built here).
+    items: Arc<ItemTable>,
     fingerprint: Fingerprint,
 }
 
@@ -578,9 +734,13 @@ fn read_capped(path: &Path, what: &'static str, max: u64) -> Result<Vec<u8>, Ff7
 impl Ff7BattleData {
     /// Decode `scene.bin` and `kernel.bin` from their bytes.
     pub fn from_bytes(scene: &[u8], kernel: &[u8]) -> Result<Self, Ff7BattleDataError> {
+        // scene.bin first: a caller that passes two bad files hears about the first one.
+        let scenes = SceneBin::parse(scene)?;
+        let kernel_data = Kernel::parse(kernel)?;
         Ok(Self {
-            scenes: SceneBin::parse(scene)?,
-            kernel: Kernel::parse(kernel)?,
+            scenes,
+            items: Arc::new(ItemTable::from_kernel(&kernel_data)),
+            kernel: kernel_data,
             fingerprint: battle_data_fingerprint(scene, kernel),
         })
     }
@@ -637,7 +797,7 @@ impl BattleRules for Ff7BattleData {
             return Err(BattleBuildError::NoEnemies(setup.formation_id));
         }
         let party = self.party(setup)?;
-        Ok(BattleState::with_config(setup.seed, party, enemies, setup.config()))
+        Ok(BattleState::with_config(setup.seed, party, enemies, setup.config()).with_items(Arc::clone(&self.items)))
     }
 
     fn data_fingerprint(&self) -> Fingerprint {
@@ -699,6 +859,23 @@ impl BattleRules for Ff7BattleData {
         CharacterId::from_index(usize::from(character)).and_then(|who| self.kernel.starting_exp(who, level)).unwrap_or(0)
     }
 
+    /// The kernel's starting item stock ([`Kernel::starting_inventory`]): Potion x3, Ether x1 and Phoenix Down
+    /// x1 on the Steam copy.
+    fn starting_inventory(&self) -> Vec<InventoryEntry> {
+        self.kernel.starting_inventory().into_iter().map(|s| InventoryEntry::new(s.item, s.count)).collect()
+    }
+
+    /// The drops of the formation's enemies: each enemy record's drop rates and items, in placement
+    /// order (see `roll_enemy_drops` for the rule).
+    fn roll_drops(&self, formation_id: u16, seed: u64) -> Vec<InventoryEntry> {
+        let Some(formation) = self.scenes.formation(usize::from(formation_id)) else {
+            return Vec::new();
+        };
+        let tables: Vec<([u8; 4], [u16; 4])> =
+            formation.enemies().iter().map(|e| (e.record.item_rates, e.record.item_ids)).collect();
+        roll_enemy_drops(seed, &tables, self.max_item_stack())
+    }
+
     /// The formation's enemy placements and idle camera from `scene.bin` (see
     /// [`FormationScene::of`]); `None` for a formation that does not exist or has no enemies.
     fn formation_scene(&self, id: u16) -> Option<FormationScene> {
@@ -721,22 +898,56 @@ pub const DEFAULT_LEVEL: u8 = 5;
 /// Formations: `0` one weak enemy, `1` two weak enemies, `2` one overwhelming enemy (the party
 /// loses), `3` like `0` but with a preemptive layout, `4` one brute that kills a hero per hit (the
 /// party usually wins, with losses). Any `character` below 9 is a fighter whose strength grows
-/// with its level.
+/// with its level, who knows Cure (spell 0, 5 MP), Life (spell 7, 34 MP) and Fire (spell 27, 4 MP), and
+/// whose battles accept Potion (item 0), Ether (item 3), Phoenix Down (item 7) and Grenade (item 20). A new account starts
+/// with 3 Potions, 1 Ether and 1 Phoenix Down; a won battle drops [`SyntheticRules::drop_item`], one per
+/// enemy, if it is set. The enemies only ever attack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SyntheticRules {
     /// Hit points of each weak enemy.
     pub enemy_hp: u32,
+    /// The item every enemy of a won battle drops (one each, for certain); `None` drops nothing.
+    pub drop_item: Option<u16>,
 }
 
 impl Default for SyntheticRules {
     fn default() -> Self {
-        Self { enemy_hp: 200 }
+        Self { enemy_hp: 200, drop_item: None }
     }
 }
 
 impl SyntheticRules {
     /// The fingerprint every synthetic rule set reports.
     pub const FINGERPRINT: Fingerprint = Fingerprint([0x5a; 32]);
+
+    /// The items of a synthetic battle: Potion (0), Ether (3), Phoenix Down (7) and Grenade (20, hurts an
+    /// enemy for about `512 * 10 / 32` = 160).
+    pub fn item_table() -> Arc<ItemTable> {
+        Arc::new(ItemTable::new([
+            (0, ItemData::new(ActionSpec::flat_restore_item(5, false))),
+            (3, ItemData::new(ActionSpec::flat_restore_item(5, true))),
+            (7, ItemData::new(ActionSpec::revive_spell(8, 0))),
+            (20, ItemData::new(ActionSpec::damage_item(10, element::SHOOT))),
+        ]))
+    }
+
+    /// The spells of a synthetic fighter: Cure (0), Life (7) and Fire (27).
+    pub fn spells() -> Vec<Spell> {
+        vec![
+            Spell::new(0, ActionSpec::cure_spell(5, 5)),
+            Spell::new(7, ActionSpec::revive_spell(8, 34)),
+            Spell::new(27, ActionSpec::damage_spell(8, 100, element::FIRE, 4)),
+        ]
+    }
+
+    /// How many enemies formation `id` places (0 for one that does not exist).
+    fn enemy_count(id: u16) -> u16 {
+        match id {
+            0 | 2 | 3 | 4 => 1,
+            1 => 2,
+            _ => 0,
+        }
+    }
 
     fn enemy(&self, name: &str, hp: u32, attack: u32) -> Combatant {
         let mut e = Combatant::new(name, 3, hp);
@@ -773,12 +984,17 @@ impl BattleRules for SyntheticRules {
                 let mut c = Combatant::new(who.name(), m.level.clamp(1, 99), 120 + 20 * level);
                 c.attack = 30 + 4 * level;
                 c.defense = 5;
+                c.magic = 10 + 2 * level;
+                c.magic_defense = 5;
+                c.mp = 60;
+                c.max_mp = 60;
                 c.dex = 40;
                 c.accuracy = 100;
+                c.spells = Self::spells();
                 Ok(c)
             })
             .collect::<Result<Vec<_>, BattleBuildError>>()?;
-        Ok(BattleState::with_config(setup.seed, party, enemies, setup.config()))
+        Ok(BattleState::with_config(setup.seed, party, enemies, setup.config()).with_items(Self::item_table()))
     }
 
     fn data_fingerprint(&self) -> Fingerprint {
@@ -812,6 +1028,19 @@ impl BattleRules for SyntheticRules {
             let level = u32::from(level.clamp(1, 99));
             2 * level * (level - 1)
         })
+    }
+
+    /// 3 Potions, 1 Ether and 1 Phoenix Down (what the real kernel starts a game with).
+    fn starting_inventory(&self) -> Vec<InventoryEntry> {
+        vec![InventoryEntry::new(0, 3), InventoryEntry::new(3, 1), InventoryEntry::new(7, 1)]
+    }
+
+    /// One of `drop_item` per enemy of the formation, for certain, when it is set.
+    fn roll_drops(&self, formation_id: u16, _seed: u64) -> Vec<InventoryEntry> {
+        match (self.drop_item, Self::enemy_count(formation_id)) {
+            (Some(item), count) if count > 0 => vec![InventoryEntry::new(item, count)],
+            _ => Vec::new(),
+        }
     }
 }
 
@@ -922,9 +1151,9 @@ mod tests {
         assert_eq!(
             split_rewards(total, &roster),
             vec![
-                BattleReward { account: AccountId(1), exp: 50, gil: 25, ap: 7 },
-                BattleReward { account: AccountId(2), exp: 0, gil: 0, ap: 0 },
-                BattleReward { account: AccountId(3), exp: 50, gil: 25, ap: 7 },
+                BattleReward::new(AccountId(1), 50, 25, 7),
+                BattleReward::new(AccountId(2), 0, 0, 0),
+                BattleReward::new(AccountId(3), 50, 25, 7),
             ]
         );
         // The remainder is dropped, never invented.
@@ -996,6 +1225,228 @@ mod tests {
             assert!(matches!(replay.check_end(Outcome::Victory, &greedy), Err(Divergence::RewardsDiffer { .. })));
             assert!(matches!(replay.check_end(Outcome::Defeat, &[]), Err(Divergence::OutcomeDiffers { .. })));
         }
+    }
+
+    /// Like `serve`, but every ready member gives a different kind of command in turn: attack, Fire, Cure
+    /// on itself, Defend, Potion, Ether, Phoenix Down or Life on a dead ally.
+    fn serve_mixed(state: &mut BattleState, slice: u64) -> Vec<Message> {
+        let mut log = Vec::new();
+        let mut turn = 0usize;
+        for _ in 0..100_000 {
+            if state.outcome().is_some() {
+                break;
+            }
+            let events = state.step_ticks(slice);
+            if !events.is_empty() {
+                log.push((state.tick(), events, None));
+            }
+            for id in state.ready_actors() {
+                if state.outcome().is_some() {
+                    break;
+                }
+                turn += 1;
+                let enemy = state.enemy_ids().into_iter().find(|e| state.actor(*e).is_some_and(|c| c.is_alive()));
+                let dead = state.party_ids().into_iter().find(|a| state.actor(*a).is_some_and(|c| !c.is_alive()));
+                let candidates = [
+                    enemy.map(|target| Command::Attack { target }),
+                    enemy.map(|target| Command::Magic { spell: 27, target }),
+                    Some(Command::Magic { spell: 0, target: id }),
+                    Some(Command::Defend),
+                    Some(Command::Item { item: 0, target: id }),
+                    Some(Command::Item { item: 3, target: id }),
+                    dead.map(|target| Command::Item { item: 7, target }),
+                    dead.map(|target| Command::Magic { spell: 7, target }),
+                ];
+                let attack = enemy.map(|target| Command::Attack { target });
+                let Some(command) = candidates[turn % candidates.len()].filter(|c| state.check_command(id, c).is_ok()).or(attack) else {
+                    break;
+                };
+                if let Ok(events) = state.submit_command(id, command) {
+                    log.push((state.tick(), events, Some(AppliedCommand { actor: id, command })));
+                }
+            }
+        }
+        log
+    }
+
+    #[test]
+    fn a_replay_of_a_battle_with_every_kind_of_command_reproduces_it() {
+        let rules = SyntheticRules::default();
+        let mut seen = std::collections::HashSet::new();
+        for (seed, slice) in (0..60u64).zip([1u64, 5, 17, 100].into_iter().cycle()) {
+            // The brute kills a hero per hit, so Life and Phoenix Down have somebody to bring back.
+            let setup = BattleSetup { seed, ..setup(4, 3) };
+            let mut server = rules.build(&setup).unwrap();
+            let log = serve_mixed(&mut server, slice);
+            assert!(server.outcome().is_some(), "seed {seed}");
+            let replay = replay_all(&rules, &setup, &log).unwrap_or_else(|d| panic!("seed {seed}: {d}"));
+            assert_eq!(replay.state(), &server, "seed {seed}: the replayed engine IS the server's engine");
+            let outcome = server.outcome().unwrap();
+            replay.check_end(outcome, &replay.expected_rewards()).expect("the end agrees");
+            for (_, events, _) in &log {
+                for e in events {
+                    seen.insert(std::mem::discriminant(e));
+                }
+            }
+        }
+        // Over the seeds: every kind of event but none of the engine's later ones went unplayed.
+        let every_kind = [
+            BattleEvent::Action { actor: ActorId(0), action: ActionRef::Defend },
+            BattleEvent::Heal { actor: ActorId(0), target: ActorId(0), amount: 1 },
+            BattleEvent::MpSpent { actor: ActorId(0), amount: 1 },
+            BattleEvent::MpRestored { actor: ActorId(0), target: ActorId(0), amount: 1 },
+            BattleEvent::Revive { actor: ActorId(0), target: ActorId(0), hp: 1 },
+            BattleEvent::Death { actor: ActorId(0) },
+            BattleEvent::Victory,
+        ];
+        for e in every_kind {
+            assert!(seen.contains(&std::mem::discriminant(&e)), "no {e:?} in 60 battles");
+        }
+    }
+
+    #[test]
+    fn a_tampered_spell_or_item_is_caught_like_any_other_event() {
+        let rules = SyntheticRules::default();
+        let setup = setup(1, 2);
+        let mut server = rules.build(&setup).unwrap();
+        let log = serve_mixed(&mut server, 5);
+        // A heal that heals one more point than the engine would.
+        let heal = log.iter().position(|(_, e, _)| e.iter().any(|ev| matches!(ev, BattleEvent::Heal { amount, .. } if *amount > 0)));
+        let heal = heal.expect("some healing");
+        let mut forged = log.clone();
+        for ev in &mut forged[heal].1 {
+            if let BattleEvent::Heal { amount, .. } = ev {
+                *amount += 1;
+                break;
+            }
+        }
+        assert!(matches!(replay_all(&rules, &setup, &forged), Err(Divergence::EventsDiffer { .. })));
+        // A command for a spell the character does not know is refused by the replay's engine.
+        let magic = log.iter().position(|(_, _, c)| matches!(c, Some(AppliedCommand { command: Command::Magic { .. }, .. }))).expect("a spell");
+        let mut unknown = log.clone();
+        if let Some(applied) = unknown[magic].2.as_mut() {
+            applied.command = Command::Magic { spell: 99, target: ActorId(2) };
+        }
+        assert!(matches!(replay_all(&rules, &setup, &unknown), Err(Divergence::CommandRefused(_))));
+    }
+
+    #[test]
+    fn the_synthetic_fighters_know_cure_life_and_fire_and_the_battle_has_potions() {
+        let state = SyntheticRules::default().build(&setup(0, 2)).unwrap();
+        let spells = state.spells_for(ActorId(0));
+        assert_eq!(spells.iter().map(|s| (s.spell, s.mp_cost, s.targets_allies)).collect::<Vec<_>>(), [(0, 5, true), (7, 34, true), (27, 4, false)]);
+        assert_eq!(state.actor(ActorId(1)).unwrap().max_mp, 60);
+        assert!(state.spells_for(ActorId(2)).is_empty());
+        for item in [0u16, 3, 7, 20] {
+            assert!(state.item_info(item).is_some(), "item {item}");
+        }
+        assert!(state.item_info(1).is_none());
+        let rules = SyntheticRules::default();
+        assert_eq!(rules.starting_inventory(), [InventoryEntry::new(0, 3), InventoryEntry::new(3, 1), InventoryEntry::new(7, 1)]);
+        assert_eq!(rules.max_item_stack(), 99);
+        // Drops: none unless asked; one per enemy of the formation, for certain, when asked.
+        assert!(rules.roll_drops(1, 5).is_empty());
+        let dropping = SyntheticRules { drop_item: Some(3), ..rules };
+        assert_eq!(dropping.roll_drops(0, 5), [InventoryEntry::new(3, 1)]);
+        assert_eq!(dropping.roll_drops(1, 5), [InventoryEntry::new(3, 2)]);
+        assert!(dropping.roll_drops(77, 5).is_empty(), "no such formation, no drops");
+    }
+
+    #[test]
+    fn the_end_check_ignores_the_items_a_server_rolled_but_not_the_numbers() {
+        let rules = SyntheticRules::default();
+        let setup = setup(1, 2);
+        let mut server = rules.build(&setup).unwrap();
+        let log = serve(&mut server, 7);
+        let replay = replay_all(&rules, &setup, &log).unwrap();
+        let mut rewards = replay.expected_rewards();
+        assert_eq!(rewards.len(), 2);
+        // A server that dropped items (which no replay can reproduce) is believed about them...
+        rewards[0].items = vec![InventoryEntry::new(0, 2), InventoryEntry::new(7, 1)];
+        rewards[1].items = vec![InventoryEntry::new(3, 1)];
+        replay.check_end(Outcome::Victory, &rewards).expect("items are not replayed, so they are not compared");
+        // ... but not about anything else.
+        let mut greedy = rewards.clone();
+        greedy[1].exp += 1;
+        assert!(matches!(replay.check_end(Outcome::Victory, &greedy), Err(Divergence::RewardsDiffer { .. })));
+        let mut lost = rewards.clone();
+        lost.pop();
+        assert!(matches!(replay.check_end(Outcome::Victory, &lost), Err(Divergence::RewardsDiffer { .. })));
+    }
+
+    #[test]
+    fn drops_are_dealt_one_unit_at_a_time_to_the_living_in_roster_order() {
+        let roster = [(AccountId(1), true), (AccountId(2), false), (AccountId(3), true)];
+        let total = Reward { exp: 100, gil: 50, ap: 7 };
+        let drops = [InventoryEntry::new(0, 3), InventoryEntry::new(7, 1)];
+        let mut rewards = split_rewards(total, &roster);
+        assign_drops(&mut rewards, &roster, &drops, 99);
+        // Units: Potion, Potion, Potion, Phoenix Down -> living #1, #2, #1, #2. The dead one gets nothing.
+        assert_eq!(rewards[0].items, [InventoryEntry::new(0, 2)]);
+        assert!(rewards[1].items.is_empty());
+        assert_eq!(rewards[2].items, [InventoryEntry::new(0, 1), InventoryEntry::new(7, 1)]);
+        // The numbers of the split are untouched.
+        assert_eq!(rewards[0].without_items(), BattleReward::new(AccountId(1), 50, 25, 7));
+        // A stack never passes the cap; a zero cap keeps nothing.
+        let mut capped = split_rewards(total, &roster[..1]);
+        assign_drops(&mut capped, &roster[..1], &[InventoryEntry::new(0, 5), InventoryEntry::new(1, 1)], 3);
+        assert_eq!(capped[0].items, [InventoryEntry::new(0, 3), InventoryEntry::new(1, 1)]);
+        let mut none = split_rewards(total, &roster[..1]);
+        assign_drops(&mut none, &roster[..1], &[InventoryEntry::new(0, 5)], 0);
+        assert!(none[0].items.is_empty());
+        // Items come out in ascending order whatever the order of the drops.
+        let mut sorted = split_rewards(total, &roster[..1]);
+        assign_drops(&mut sorted, &roster[..1], &[InventoryEntry::new(9, 1), InventoryEntry::new(2, 1)], 99);
+        assert_eq!(sorted[0].items, [InventoryEntry::new(2, 1), InventoryEntry::new(9, 1)]);
+        // Nobody alive (not a state a victory reaches), no drops, or a roster longer than the rewards: nothing, no panic.
+        let dead = [(AccountId(1), false)];
+        let mut nobody = split_rewards(total, &dead);
+        assign_drops(&mut nobody, &dead, &drops, 99);
+        assert!(nobody[0].items.is_empty());
+        let mut empty = split_rewards(total, &roster);
+        assign_drops(&mut empty, &roster, &[], 99);
+        assert!(empty.iter().all(|r| r.items.is_empty()));
+        let mut short = split_rewards(total, &roster[..1]);
+        assign_drops(&mut short, &roster, &drops, 99);
+        assert_eq!(short.len(), 1);
+    }
+
+    #[test]
+    fn an_enemy_drops_at_most_one_item_by_its_own_rates_and_never_steals() {
+        // MP of the first Midgar fights: a drop (Potion, 8 in 64) and a steal (rate 0x88 is a steal chance).
+        let mp = ([8u8, 0x88, 0xFF, 0xFF], [0u16, 20, 0xFFFF, 0xFFFF]);
+        let outcomes: Vec<Vec<InventoryEntry>> = (0..4000u64).map(|seed| roll_enemy_drops(seed, &[mp], 99)).collect();
+        // Never the stolen item (20), only ever one Potion, and about 8 in 64 of the seeds drop it.
+        assert!(outcomes.iter().all(|d| d.is_empty() || d == &[InventoryEntry::new(0, 1)]));
+        let dropped = outcomes.iter().filter(|d| !d.is_empty()).count();
+        assert!((350..650).contains(&dropped), "{dropped} of 4000 (expected about 500)");
+        // The same seed always rolls the same.
+        assert_eq!(roll_enemy_drops(77, &[mp, mp], 99), roll_enemy_drops(77, &[mp, mp], 99));
+        // Rate 0 never drops, but its slot still costs a roll; the next slot is tried when it fails.
+        let second_slot = ([0u8, 63, 0, 0], [5u16, 6, 7, 8]);
+        let rolls: Vec<_> = (0..500u64).map(|seed| roll_enemy_drops(seed, &[second_slot], 99)).collect();
+        assert!(rolls.iter().all(|d| d.is_empty() || d == &[InventoryEntry::new(6, 1)]), "the first slot has no chance");
+        assert!(rolls.iter().filter(|d| !d.is_empty()).count() > 450, "63 in 64");
+        // Two enemies with the same drop add up (one each), the result is ascending, and the cap holds.
+        let certain = ([63u8, 0xFF, 0xFF, 0xFF], [3u16, 0xFFFF, 0xFFFF, 0xFFFF]);
+        let other = ([63u8, 0xFF, 0xFF, 0xFF], [1u16, 0xFFFF, 0xFFFF, 0xFFFF]);
+        let many = roll_enemy_drops(1, &[certain, other, certain, certain, certain, certain, certain, certain], 99);
+        let total: u32 = many.iter().map(|e| u32::from(e.count)).sum();
+        assert!(many.windows(2).all(|w| w[0].item < w[1].item) && (4..=8).contains(&total), "{many:?}");
+        let capped = roll_enemy_drops(1, &[certain; 32], 2);
+        assert!(capped.iter().all(|e| e.count <= 2), "{capped:?}");
+        // An item outside the item table (a weapon, 128 and up) is not kept, and still ends the enemy's rolls.
+        let weapon = ([63u8, 63, 0xFF, 0xFF], [200u16, 4, 0xFFFF, 0xFFFF]);
+        let first_slot_succeeds = |seed: u64| Rng::with_stream(seed, DROP_STREAM).below(DROP_DIE) < 63;
+        let wins: Vec<u64> = (0..300u64).filter(|s| first_slot_succeeds(*s)).collect();
+        assert!(wins.len() > 250);
+        for seed in wins {
+            assert!(roll_enemy_drops(seed, &[weapon], 99).is_empty(), "seed {seed}: the weapon is lost and the enemy is done");
+        }
+        // Empty slots, no enemies and a zero cap drop nothing.
+        assert!(roll_enemy_drops(1, &[([63; 4], [0xFFFF; 4])], 99).is_empty());
+        assert!(roll_enemy_drops(1, &[], 99).is_empty());
+        assert!(roll_enemy_drops(1, &[certain], 0).is_empty());
     }
 
     #[test]
@@ -1086,7 +1537,7 @@ mod tests {
         assert!(matches!(huge, Divergence::TickMismatch { .. } | Divergence::EventsDiffer { .. }), "{huge}");
 
         // A peer with other game data builds another battle and disagrees at once.
-        let weaker = SyntheticRules { enemy_hp: 100 };
+        let weaker = SyntheticRules { enemy_hp: 100, ..SyntheticRules::default() };
         let divergence = replay_all(&weaker, &setup, &log).unwrap_err();
         assert!(!divergence.to_string().is_empty());
     }

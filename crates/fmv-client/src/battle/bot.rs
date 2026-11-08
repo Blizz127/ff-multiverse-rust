@@ -1,8 +1,10 @@
 //! The headless battle player behind `--battle-auto`.
 //!
-//! While a battle runs it attacks the first living enemy whenever our own gauge is full (one
-//! command at a time: the mirror's `pending` guard keeps it from repeating a command before the
-//! server answered). With `--debug-encounters` it also asks the server for a debug encounter,
+//! While a battle runs it acts whenever our own gauge is full (one command at a time: the mirror's
+//! `pending` guard keeps it from repeating a command before the server answered). Its rule is
+//! `BattleClient::bot_command`: when its character's HP is under 30% of the maximum and it knows a
+//! restoring spell it can pay for, it casts the cheapest one on itself; otherwise it attacks the first
+//! living enemy. With `--debug-encounters` it also asks the server for a debug encounter,
 //! ONCE: when the session has been up for a moment and, with `--battle-wait-party N`, only when
 //! our party has N members and we lead it (so one request starts one battle for everyone). A
 //! refusal (a server without battle data, or without `--debug-encounters`) is logged by the
@@ -19,7 +21,7 @@ pub const REQUEST_DELAY_S: f64 = 1.0;
 /// See the module docs.
 #[derive(Debug, Clone)]
 pub struct BattleBot {
-    /// Attack in battles.
+    /// Play battles (attack, and heal itself when its HP is low).
     auto: bool,
     /// Ask the server for a debug encounter (once).
     request: bool,
@@ -30,7 +32,7 @@ pub struct BattleBot {
 }
 
 impl BattleBot {
-    /// `auto`: attack in battles (`--battle-auto`). `request`: also ask for a debug encounter
+    /// `auto`: play battles (`--battle-auto`). `request`: also ask for a debug encounter
     /// (`--debug-encounters`). `wait_party`: see the module docs (`1`: do not wait).
     pub fn new(auto: bool, request: bool, wait_party: usize) -> Self {
         Self { auto, request: auto && request, wait_party: wait_party.max(1), requested: false, first_seen: None }
@@ -54,7 +56,7 @@ impl BattleBot {
         }
         let first = *self.first_seen.get_or_insert(now);
         if battles.in_battle() {
-            return battles.attack_command(now).into_iter().collect();
+            return battles.bot_command(now).into_iter().collect();
         }
         if !self.request || self.requested || now - first < REQUEST_DELAY_S {
             return Vec::new();

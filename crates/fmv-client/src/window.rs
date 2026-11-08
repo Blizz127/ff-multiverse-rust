@@ -1224,35 +1224,75 @@ mod tests {
         assert_eq!(level(&s), Some((Level::Commands, 0)));
         assert_eq!(battle_request(BattleKey::Down, &mut s, 1.0), BattleRequest::Menu);
         assert_eq!(level(&s).map(|l| l.1), Some(1), "the cursor is on Magic");
-        // This engine build has no spells yet: the Magic command is refused with its reason.
-        assert_eq!(battle_request(BattleKey::Confirm, &mut s, 1.0), BattleRequest::Nothing("No magic to cast"));
-        assert_eq!(battle_request(BattleKey::Up, &mut s, 1.0), BattleRequest::Menu);
+        // The battle's own engine gave the menu its spells when the battle started: Magic opens its list.
+        assert_eq!(battle_request(BattleKey::Confirm, &mut s, 1.0), BattleRequest::Menu);
+        assert_eq!(level(&s).map(|l| l.0), Some(Level::Magic));
+        assert_eq!(battle_request(BattleKey::Back, &mut s, 1.0), BattleRequest::Menu);
+        assert_eq!(level(&s).map(|l| l.0), Some(Level::Commands));
+        // No inventory has arrived (the server has told us of no items): Item is refused with its reason.
+        assert_eq!(battle_request(BattleKey::Down, &mut s, 1.0), BattleRequest::Menu);
+        assert_eq!(level(&s).map(|l| l.1), Some(2), "the cursor is on Item");
+        assert_eq!(battle_request(BattleKey::Confirm, &mut s, 1.0), BattleRequest::Nothing("No items to use"));
+        for _ in 0..2 {
+            assert_eq!(battle_request(BattleKey::Up, &mut s, 1.0), BattleRequest::Menu);
+        }
         assert_eq!(level(&s).map(|l| l.1), Some(0));
         // Back at the top level is nobody's: it falls through to the window.
         assert_eq!(battle_request(BattleKey::Back, &mut s, 1.0), BattleRequest::Nothing(""));
     }
 
-    /// Spells and items are in the menu once the model has them, and what they send is refused until
-    /// the engine's command can say it.
+    /// The inventory the server sends is what the Item list holds: before it Item is greyed out with its
+    /// reason, after it the items the engine can use are listed, and a Potion aimed at us goes out as the
+    /// engine's Item command.
     #[test]
-    fn magic_and_items_open_their_lists_and_refuse_to_send_what_the_engine_lacks() {
+    fn the_inventory_the_server_sends_fills_the_item_list() {
+        use fmv_protocol::InventoryEntry;
+        let mut s = state_in_a_preemptive_battle();
+        for _ in 0..2 {
+            assert_eq!(battle_request(BattleKey::Down, &mut s, 1.0), BattleRequest::Menu);
+        }
+        assert_eq!(battle_request(BattleKey::Confirm, &mut s, 1.0), BattleRequest::Nothing("No items to use"));
+        assert_eq!(s.apply(1.1, ServerMsg::Inventory { items: vec![InventoryEntry::new(0, 3), InventoryEntry::new(99, 1)] }), None);
+        assert_eq!(battle_request(BattleKey::Confirm, &mut s, 1.2), BattleRequest::Menu, "Item opens its list now");
+        let list = s.battle.view(1.2).and_then(|v| v.menu).and_then(|m| m.list).expect("the item list");
+        assert_eq!((list.title, list.total, list.rows[0].right.as_str()), ("Item", 1, "x3"), "the engine can use a Potion; item 99 is not listed");
+        // Pick it and aim at ourselves (the only one in the party).
+        assert_eq!(battle_request(BattleKey::Confirm, &mut s, 1.2), BattleRequest::Menu);
+        match battle_request(BattleKey::Confirm, &mut s, 1.2) {
+            BattleRequest::Send(BattleCmd::Command { actor, command: EngineCommand::Item { item, target }, .. }) => assert_eq!((actor.0, item, target.0), (0, 0, 0)),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Spells, items and Defend are in the menu once the model has them (the client fills it itself; this
+    /// test puts its own lists in), and what they send is the engine's own command of the same ids.
+    #[test]
+    fn magic_items_and_defend_send_the_engine_commands() {
         use crate::battle::{MenuItem, MenuSpell, TargetRule};
         let mut s = state_in_a_preemptive_battle();
         s.battle.menu_model_mut().spells = vec![MenuSpell::new(1, "Fire", 0, TargetRule::Enemies)];
         s.battle.menu_model_mut().items = vec![MenuItem::new(2, "Potion", 1, TargetRule::Allies)];
         s.battle.menu_model_mut().defend = true;
+        let sent = |s: &mut ClientState, key: BattleKey| match battle_request(key, s, 1.0) {
+            BattleRequest::Send(BattleCmd::Command { actor, command, .. }) => (actor.0, command),
+            other => panic!("{other:?}"),
+        };
         for key in [BattleKey::Down, BattleKey::Confirm] {
             assert_eq!(battle_request(key, &mut s, 1.0), BattleRequest::Menu);
         }
         assert_eq!(s.battle.view(1.0).and_then(|v| v.menu).and_then(|m| m.list).map(|l| l.title), Some("Magic"));
-        // Pick Fire, aim at the dummy, confirm: the menu has a Magic choice, the engine has no such command yet.
+        // Pick Fire, aim at the dummy (actor 1, after our own), confirm: the engine's Magic command.
         assert_eq!(battle_request(BattleKey::Confirm, &mut s, 1.0), BattleRequest::Menu);
-        assert_eq!(battle_request(BattleKey::Confirm, &mut s, 1.0), BattleRequest::Nothing("that command is not available yet"));
+        assert_eq!(sent(&mut s, BattleKey::Confirm), (0, EngineCommand::Magic { spell: 1, target: fmv_protocol::ActorId(1) }));
         assert_eq!(s.battle.view(1.0).and_then(|v| v.menu).map(|m| m.command_cursor), Some(1), "back at the top, on Magic");
-        // Defend sends at once when the model has it, and is refused the same way.
+        // A Potion: the item list, then the party to aim at (we are the only one), then the Item command.
+        for key in [BattleKey::Down, BattleKey::Confirm, BattleKey::Confirm] {
+            assert_eq!(battle_request(key, &mut s, 1.0), BattleRequest::Menu);
+        }
+        assert_eq!(sent(&mut s, BattleKey::Confirm), (0, EngineCommand::Item { item: 2, target: fmv_protocol::ActorId(0) }));
+        // Defend sends at once when the model has it.
         assert_eq!(battle_request(BattleKey::Down, &mut s, 1.0), BattleRequest::Menu);
-        assert_eq!(battle_request(BattleKey::Down, &mut s, 1.0), BattleRequest::Menu);
-        assert_eq!(battle_request(BattleKey::Confirm, &mut s, 1.0), BattleRequest::Nothing("that command is not available yet"));
+        assert_eq!(sent(&mut s, BattleKey::Confirm), (0, EngineCommand::Defend));
     }
 
     /// Esc backs out of the menu one level at a time, and at no level of a battle (nor after one, until
@@ -1298,7 +1338,7 @@ mod tests {
             ServerMsg::BattleEnd {
                 battle_id: BattleId(1),
                 outcome: fmv_protocol::battle::Outcome::Victory,
-                rewards: vec![BattleReward { account: AccountId(1), exp: 5, gil: 6, ap: 7 }],
+                rewards: vec![BattleReward::new(AccountId(1), 5, 6, 7)],
             },
         );
         assert!(!s.battle.in_battle(), "the server freed the player");

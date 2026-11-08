@@ -3,8 +3,10 @@
 //! Rule: this crate never depends on an adapter. Nothing here may hold game asset bytes;
 //! assets are referenced by id + [`Fingerprint`] only.
 
+mod inventory;
 mod names;
 
+pub use inventory::{InventoryEntry, MAX_INVENTORY_STACKS};
 pub use names::{is_invisible_format, name_key, NameError, MAX_MARKS};
 
 use serde::{Deserialize, Serialize};

@@ -20,10 +20,12 @@
 //!
 //! # What the menu knows
 //!
-//! Only what the owner's own data and the engine say, as plain numbers and strings the integrator
-//! hands over in a [`BattleMenuModel`]: the spells (id, name, MP cost, whom they aim at), the
-//! items (id, name, count, whom they aim at) and whether Defend exists. Until the engine can take
-//! more than Attack, the model is empty and Magic, Item and Defend show greyed out.
+//! Only what the owner's own data and the engine say, as plain numbers and strings the client
+//! hands over in a [`BattleMenuModel`] (it fills it from the replayed engine and the inventory the
+//! server sent, see `BattleClient::refresh_menu_model`): the spells (id, name, MP cost, whom they
+//! aim at), the items (id, name, count, whom they aim at) and whether Defend exists. What the model
+//! lacks is greyed out and cannot be opened: an empty model (this machine has no battle data, or we
+//! are not in the party) leaves only Attack working.
 //!
 //! # Targets
 //!
@@ -63,13 +65,11 @@ pub enum TargetRule {
     /// One living member of the party (Cure, Potion).
     Allies,
     /// One fallen member of the party (Phoenix Down).
-    #[allow(dead_code)] // the integrator gives a revive item this rule
     DeadAllies,
 }
 
 impl TargetRule {
     /// The rule of a spell that the engine describes with a plain "aims at allies" flag.
-    #[cfg_attr(not(test), allow(dead_code))] // the integrator maps the engine's spell list with it
     pub fn from_allies(allies: bool) -> Self {
         if allies {
             TargetRule::Allies
@@ -99,7 +99,6 @@ pub struct MenuSpell {
 }
 
 impl MenuSpell {
-    #[cfg_attr(not(test), allow(dead_code))] // the integrator builds the list from the engine's spells
     pub fn new(id: u16, name: impl Into<String>, mp_cost: u16, target: TargetRule) -> Self {
         Self { id, name: name.into(), mp_cost, enabled: true, target }
     }
@@ -117,7 +116,6 @@ pub struct MenuItem {
 }
 
 impl MenuItem {
-    #[cfg_attr(not(test), allow(dead_code))] // the integrator builds the list from the inventory
     pub fn new(id: u16, name: impl Into<String>, count: u16, target: TargetRule) -> Self {
         Self { id, name: name.into(), count, enabled: true, target }
     }
@@ -127,7 +125,8 @@ impl MenuItem {
     }
 }
 
-/// What the menu offers: filled from the engine and the inventory by the integrator, empty before.
+/// What the menu offers: filled from the engine and the inventory at every battle start and every
+/// inventory message, empty (only Attack) while there is nothing to fill it from.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct BattleMenuModel {
     pub spells: Vec<MenuSpell>,
@@ -188,14 +187,14 @@ pub enum Choice {
 }
 
 impl Choice {
-    /// The engine command this choice stands for, or `None` for a kind of command this engine
-    /// build does not have yet (the window then says so instead of sending something the server
-    /// cannot read). When the engine's `Command` gains `Magic`, `Item` and `Defend`, this becomes
-    /// a plain one-to-one mapping.
-    pub fn to_command(self) -> Option<Command> {
+    /// The engine command this choice stands for: a plain one-to-one mapping (the server and the
+    /// engine decide whether the spell, item and target are valid).
+    pub fn to_command(self) -> Command {
         match self {
-            Choice::Attack { target } => Some(Command::Attack { target }),
-            Choice::Magic { .. } | Choice::Item { .. } | Choice::Defend => None,
+            Choice::Attack { target } => Command::Attack { target },
+            Choice::Magic { spell, target } => Command::Magic { spell, target },
+            Choice::Item { item, target } => Command::Item { item, target },
+            Choice::Defend => Command::Defend,
         }
     }
 }
@@ -923,11 +922,27 @@ mod tests {
     }
 
     #[test]
-    fn choices_become_engine_commands_where_the_engine_has_them() {
-        assert_eq!(Choice::Attack { target: ActorId(4) }.to_command(), Some(Command::Attack { target: ActorId(4) }));
-        for other in [Choice::Magic { spell: 1, target: ActorId(0) }, Choice::Item { item: 1, target: ActorId(0) }, Choice::Defend] {
-            assert_eq!(other.to_command(), None, "{other:?} is not in this engine build yet");
-        }
+    fn choices_become_engine_commands_one_to_one() {
+        assert_eq!(Choice::Attack { target: ActorId(4) }.to_command(), Command::Attack { target: ActorId(4) });
+        assert_eq!(Choice::Magic { spell: 27, target: ActorId(3) }.to_command(), Command::Magic { spell: 27, target: ActorId(3) });
+        assert_eq!(Choice::Item { item: 7, target: ActorId(1) }.to_command(), Command::Item { item: 7, target: ActorId(1) });
+        assert_eq!(Choice::Defend.to_command(), Command::Defend);
+    }
+
+    /// What the menu sends is what the engine takes, spell for spell and item for item: a choice made
+    /// through the keys comes out as the command that names the same ids and the same target.
+    #[test]
+    fn a_choice_made_with_the_keys_is_the_engine_command_of_the_same_ids_and_target() {
+        let s = Scene::new();
+        let mut m = BattleMenu::default();
+        // Cure (spell 3 of this model) on the second ally, a Potion (the pointer starts on the ally
+        // chosen last), Defend.
+        let Reply::Send(cure) = press(&mut m, &s, &[Down, Confirm, Down, Down, Confirm, Right, Confirm]) else { panic!("a choice") };
+        assert_eq!(cure.to_command(), Command::Magic { spell: 3, target: ActorId(1) });
+        let Reply::Send(potion) = press(&mut m, &s, &[Down, Confirm, Confirm, Confirm]) else { panic!("a choice") };
+        assert_eq!(potion.to_command(), Command::Item { item: 10, target: ActorId(1) });
+        let Reply::Send(defend) = press(&mut m, &s, &[Down, Confirm]) else { panic!("a choice") };
+        assert_eq!(defend.to_command(), Command::Defend);
     }
 
     /// Whatever is pressed in whatever order, the menu never panics, never leaves a level that does

@@ -32,6 +32,14 @@ pub(crate) struct Line {
     text: String,
 }
 
+impl Line {
+    /// The text of the line (for the tests that check what the world says).
+    #[cfg(test)]
+    pub(crate) fn text(&self) -> &str {
+        &self.text
+    }
+}
+
 /// The lines recorded since they were last taken.
 #[derive(Debug, Default)]
 pub(crate) struct DeferredLogs {

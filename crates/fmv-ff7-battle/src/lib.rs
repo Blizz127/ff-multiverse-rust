@@ -8,8 +8,9 @@
 //! | module | purpose |
 //! |---|---|
 //! | [`scene`] | `scene.bin`: 256 scenes with formations, enemy stat records, attacks |
-//! | [`kernel`] | `kernel.bin` (commands, attacks, growth curves, starting data, weapons, armor) and `kernel2.bin` text |
-//! | [`rules`] | the deterministic battle engine: ATB gauges, Attack command, enemy AI |
+//! | [`kernel`] | `kernel.bin` (commands, attacks, growth curves, starting data and stock, items, materia, weapons, armor) and `kernel2.bin` text |
+//! | [`action`] | what an action is: the damage-calculation byte, formulas, spells, enemy attacks, elements, the item table |
+//! | [`rules`] | the deterministic battle engine: ATB gauges, the commands (Attack, Magic, Item, Defend), enemy AI |
 //! | [`rng`] | the seeded PCG32 generator behind every roll |
 //! | [`text`] | FF7 text encoding |
 //!
@@ -24,9 +25,12 @@
 //! Given the same files, seed, party, enemies, configuration and the same ordered inputs
 //! (`step` / `submit_command` calls), [`rules::BattleState`] produces identical events on every
 //! platform. Combatants are pure functions of the file data and a character level
-//! ([`rules::Combatant::from_enemy`], [`rules::Combatant::from_character`]), so server and
-//! clients that own the same edition derive the same numbers. The wire only needs the
-//! formation id, the seed, and (character, level, equipment) per party member.
+//! ([`rules::Combatant::from_enemy_in_scene`], [`rules::Combatant::from_character`]: stats, spells,
+//! the enemies' own attacks and affinities), and the item table of the kernel
+//! ([`action::ItemTable::from_kernel`]), so server and clients that own the same edition derive the same
+//! numbers. The wire only needs the formation id, the seed, and (character, level, equipment) per party
+//! member. **An inventory is not engine state**: the engine accepts any item of its table, and whether
+//! the account owns one is for the server to check.
 //!
 //! # Example: a battle with hand-made combatants
 //!
@@ -97,6 +101,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod action;
 mod bytes;
 pub mod kernel;
 pub mod rng;
