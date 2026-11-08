@@ -55,19 +55,34 @@ CONTENT:
 
 HEADLESS OUTPUT:
   stdout carries exactly one line:
-    SMOKE name=<n> area=<AreaId> fixture=<bool> peers_seen=<n> updates=<n> rejected=<n> rtt_ms=<n|-1> party=<n>
+    SMOKE name=<n> area=<AreaId> fixture=<bool> peers_seen=<n> updates=<n> rejected=<n> rtt_ms=<n|-1> party=<n> battles=<n> victories=<n>
   <n> in name= is the display name percent-encoded: letters, digits and - . _ ~ are kept, every
   other byte becomes %XX (\"Red XIII\" prints as Red%20XIII), so the line always splits on spaces.
   party=<n> is the LARGEST party this client was in at any moment of the run (0: never in one).
+  battles=<n> is how many shared battles this client entered, victories=<n> how many the server
+  ended in victory. A bot whose replay of a battle ever disagreed with the server exits 1.
   A server that goes silent for 10 s is treated as gone (exit code 1, the summary is still printed).
   Party events and refusals are logged on stderr, one `party:` line each.
   --party-invite-first-peer invites the visible player with the lowest entity id (a refused invite
   is retried, at most 5 times, 1 s apart); --party-accept accepts every invite sent to this player.
+  --battle-auto plays battles (attacks whenever its gauge is full); with --debug-encounters it also
+  asks the server for one battle (see BATTLES). Battle events and refusals are logged on stderr as
+  `battle:` lines.
+
+BATTLES:
+  A battle starts for a whole party (random encounters in a field that has a table, or on request
+  when the server runs with --debug-encounters). You are frozen in the field until it ends; the
+  client replays the battle from YOUR OWN scene.bin and kernel.bin (only ids and seeds are sent)
+  and shouts `BATTLE DIVERGENCE` if its replay ever disagrees with the server. Without battle data
+  in your library you can only wait the battle out.
 
 WINDOW CONTROLS:
   WASD / arrow keys move, Esc quits. P invites the nearest other player to your party, Y accepts
   the newest pending invite, L leaves your party. The window title shows your party size and a
-  pending invite; party members are drawn with a gold ring.";
+  pending invite; party members are drawn with a gold ring. B asks the server for a debug battle
+  (refused unless it runs with --debug-encounters). In a battle the window shows enemy and party
+  bars (HP, ATB gauge; a yellow border means that character can act) and Space or Enter attacks the
+  first living enemy with your character.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum BotKind {
@@ -173,6 +188,22 @@ pub struct Args {
     /// Revision label for --ff7-flevel (default `unknown`; part of the area fingerprint).
     #[arg(long, value_name = "TEXT", requires = "ff7_flevel", conflicts_with_all = ["ff7_library", "ff7_set"])]
     pub ff7_revision: Option<String>,
+
+    // ---- battles (protocol v3): one contiguous block ----
+    /// Play battles as a bot: attack the first living enemy whenever this player's ATB gauge is
+    /// full (headless only). Battles start from random encounters, or with --debug-encounters.
+    #[arg(long, requires = "headless")]
+    pub battle_auto: bool,
+
+    /// With --battle-auto: also ask the server for a debug encounter, once (the server must run
+    /// with --debug-encounters; a refusal is logged and not retried).
+    #[arg(long, requires = "battle_auto")]
+    pub debug_encounters: bool,
+
+    /// With --debug-encounters: wait until this player's party has at least N members, and only
+    /// then (as its leader) ask, so one request starts one battle for the whole party.
+    #[arg(long, value_name = "N", default_value_t = 1, requires = "debug_encounters")]
+    pub battle_wait_party: usize,
 }
 
 /// Default server for `--server`. Kept in sync with `DEFAULT_DEV_PORT` by a unit test.

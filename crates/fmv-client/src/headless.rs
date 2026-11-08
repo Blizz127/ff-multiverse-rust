@@ -3,6 +3,7 @@
 //! stdout carries exactly one line (the SMOKE summary); every notice and error goes to stderr,
 //! including the one-line `party:` notes about party events and refusals.
 
+use crate::battle::BattleBot;
 use crate::bot::{Bot, PartyBot};
 use crate::cli::{exit, Args};
 use crate::interp::render_time;
@@ -75,18 +76,23 @@ pub struct Smoke<'a> {
     /// and not the final size: two bots that finish a few milliseconds apart would otherwise race
     /// each other's departure.
     pub party: usize,
+    /// Shared battles this client entered (`EncounterStart` received).
+    pub battles: u64,
+    /// Battles the server ended in victory.
+    pub victories: u64,
 }
 
-/// `SMOKE name=<n> area=<AreaId> fixture=<bool> peers_seen=<n> updates=<n> rejected=<n> rtt_ms=<n|-1> party=<n>`
+/// `SMOKE name=<n> area=<AreaId> fixture=<bool> peers_seen=<n> updates=<n> rejected=<n> rtt_ms=<n|-1> party=<n> battles=<n> victories=<n>`
 ///
 /// `<n>` in `name=` is the display name percent-encoded by [`encode_name`]; the other fields
 /// never contain whitespace (the area comes from the local adapter's catalog, not from the
-/// network).
+/// network). `battles=` and `victories=` were appended in protocol v3; the fields before them are
+/// unchanged.
 pub fn smoke_line(smoke: &Smoke<'_>) -> String {
-    let Smoke { name, area, fixture, peers_seen, updates, rejected, rtt, party } = smoke;
+    let Smoke { name, area, fixture, peers_seen, updates, rejected, rtt, party, battles, victories } = smoke;
     let rtt_ms = rtt.map_or(-1, |d| (d.as_secs_f64() * 1000.0).round() as i64);
     let name = encode_name(name);
-    format!("SMOKE name={name} area={area} fixture={fixture} peers_seen={peers_seen} updates={updates} rejected={rejected} rtt_ms={rtt_ms} party={party}")
+    format!("SMOKE name={name} area={area} fixture={fixture} peers_seen={peers_seen} updates={updates} rejected={rejected} rtt_ms={rtt_ms} party={party} battles={battles} victories={victories}")
 }
 
 pub fn run(args: &Args, mut session: Session) -> u8 {
@@ -97,6 +103,7 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
         session.area.max_speed(),
     );
     let mut party_bot = PartyBot::new(args.party_invite_first_peer, args.party_accept);
+    let mut battle_bot = BattleBot::new(args.battle_auto, args.debug_encounters, args.battle_wait_party);
     eprintln!(
         "headless: joined {} as `{}` (entity {}), bot={:?} for {:.1} s",
         session.info.area_id,
@@ -111,12 +118,26 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
             args.party_invite_first_peer, args.party_accept
         );
     }
+    if battle_bot.is_active() {
+        eprintln!(
+            "headless: battle behaviour: attack when the gauge is full; ask for a debug encounter: {}{}",
+            args.debug_encounters,
+            if args.debug_encounters && args.battle_wait_party > 1 {
+                format!(" (once leading a party of {})", args.battle_wait_party)
+            } else {
+                String::new()
+            }
+        );
+    }
 
     let start = Instant::now();
     let mut last = start;
     let mut ended: Option<String> = None;
     let mut own_walk = Odometer::default();
     let mut peer_walks: BTreeMap<EntityId, Odometer> = BTreeMap::new();
+    // What the world looked like when the last battle ended, to show that play went on afterwards.
+    let mut after_battle: Option<(f32, u64)> = None;
+    let mut battles_ended = 0;
     while start.elapsed() < args.duration {
         let tick_start = Instant::now();
         if let Some(reason) = session.pump() {
@@ -124,6 +145,11 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
             break;
         }
         session.log_party_notes();
+        session.log_battle_notes();
+        if session.state.battle.ended() > battles_ended {
+            battles_ended = session.state.battle.ended();
+            after_battle = Some((own_walk.total, session.state.updates()));
+        }
         let now = session.now();
         let remotes = session.state.remote_views(render_time(now));
         for peer in &remotes {
@@ -135,16 +161,24 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
             session.send_party(cmd);
         }
         session.flush_party_sync();
+        // Battles: attack when our gauge is full, ask for a debug encounter (once) if told to.
+        for cmd in battle_bot.step(now, &session.state.battle, &session.state.party) {
+            session.send_battle(cmd);
+        }
         let dt = (tick_start - last).as_secs_f32().min(MAX_DT);
         last = tick_start;
-        if dt > 0.0 {
+        // A player in a battle is frozen in the field: it neither walks nor sends movement.
+        let frozen = session.state.battle.in_battle();
+        if dt > 0.0 && !frozen {
             let step = bot.step(session.area.as_ref(), session.state.own.pos(), dt);
             let facing = step.facing.unwrap_or_else(|| session.state.own.facing());
             let anim = if step.moved { AnimState::Walk } else { AnimState::Idle };
             session.state.own.set_motion(step.pos, facing, anim);
         }
         own_walk.feed(session.state.own.pos());
-        session.flush_intent();
+        if !frozen {
+            session.flush_intent();
+        }
         if let Some(rest) = TICK.checked_sub(tick_start.elapsed()) {
             std::thread::sleep(rest);
         }
@@ -164,7 +198,27 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
         ended = session.pump();
     }
     session.log_party_notes();
+    session.log_battle_notes();
     eprintln!("headless: {}", session.state.party.summary());
+    if battle_bot.is_active() || session.state.battle.entered() > 0 || session.state.battle.rejections() > 0 {
+        eprintln!("headless: battles: {}", session.state.battle.summary());
+        if let Some((walked, updates)) = after_battle {
+            // The proof that the field went on: the player walked (or the server told us where
+            // everyone stands, which it does at once when a battle ends) after the last battle.
+            eprintln!(
+                "headless: after the last battle: walked {:.0} units, {} entity update(s) seen",
+                own_walk.total - walked,
+                session.state.updates().saturating_sub(updates)
+            );
+        }
+    }
+    // A replay that disagreed with the server is a bug somewhere: the run fails loudly.
+    if ended.is_none() && session.state.battle.divergences() > 0 {
+        ended = Some(format!(
+            "the battle replay diverged from the server {} time(s) (see the BATTLE DIVERGENCE lines above)",
+            session.state.battle.divergences()
+        ));
+    }
 
     let line = smoke_line(&Smoke {
         name: &session.info.name,
@@ -175,6 +229,8 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
         rejected: session.state.rejected(),
         rtt: session.state.last_rtt(),
         party: session.state.party.peak_party_size(),
+        battles: session.state.battle.entered(),
+        victories: session.state.battle.victories(),
     });
     // Ignore write errors (e.g. a closed pipe): the exit code still tells the story.
     let _ = writeln!(std::io::stdout().lock(), "{line}");
@@ -205,7 +261,7 @@ mod tests {
     }
 
     fn smoke<'a>(name: &'a str, area: &'a AreaId, fixture: bool, rtt: Option<Duration>) -> Smoke<'a> {
-        Smoke { name, area, fixture, peers_seen: 2, updates: 31, rejected: 1, rtt, party: 3 }
+        Smoke { name, area, fixture, peers_seen: 2, updates: 31, rejected: 1, rtt, party: 3, battles: 1, victories: 1 }
     }
 
     #[test]
@@ -217,7 +273,7 @@ mod tests {
         let l = smoke_line(&smoke("botA", &area, true, Some(Duration::from_micros(2_600))));
         assert_eq!(
             l,
-            "SMOKE name=botA area=Fixture/plaza fixture=true peers_seen=2 updates=31 rejected=1 rtt_ms=3 party=3"
+            "SMOKE name=botA area=Fixture/plaza fixture=true peers_seen=2 updates=31 rejected=1 rtt_ms=3 party=3 battles=1 victories=1"
         );
         let l = smoke_line(&Smoke {
             name: "b",
@@ -228,27 +284,32 @@ mod tests {
             rejected: 0,
             rtt: None,
             party: 0,
+            battles: 0,
+            victories: 0,
         });
         assert_eq!(
             l,
-            "SMOKE name=b area=Fixture/plaza fixture=false peers_seen=0 updates=0 rejected=0 rtt_ms=-1 party=0"
+            "SMOKE name=b area=Fixture/plaza fixture=false peers_seen=0 updates=0 rejected=0 rtt_ms=-1 party=0 battles=0 victories=0"
         );
         assert!(!l.contains('\n'));
     }
 
     /// `scripts/smoke.sh` parses the line by key, and new fields are only ever appended: the
-    /// existing keys keep their names and their order, and `party` comes last.
+    /// protocol-v2 keys keep their names and their order, and `battles` and `victories` (v3) come
+    /// last.
     #[test]
-    fn the_smoke_keys_keep_their_order_and_party_is_last() {
+    fn the_smoke_keys_keep_their_order_and_the_battle_fields_are_last() {
         let area = AreaId { game: GameId::Fixture, key: "plaza".into() };
         let l = smoke_line(&smoke("x", &area, true, None));
         let keys: Vec<&str> = l.split_whitespace().skip(1).map(|f| f.split_once('=').unwrap().0).collect();
         assert_eq!(
             keys,
-            ["name", "area", "fixture", "peers_seen", "updates", "rejected", "rtt_ms", "party"]
+            ["name", "area", "fixture", "peers_seen", "updates", "rejected", "rtt_ms", "party", "battles", "victories"]
         );
         assert!(l.starts_with("SMOKE "), "{l}");
-        assert!(l.ends_with(" party=3"), "{l}");
+        assert!(l.ends_with(" party=3 battles=1 victories=1"), "{l}");
+        // A v2 parser that reads the first eight fields (and `party` among them) still works.
+        assert!(l.contains(" rtt_ms=-1 party=3 "), "{l}");
     }
 
     /// Decode what `encode_name` produced (the inverse a harness would apply).
@@ -298,9 +359,9 @@ mod tests {
             );
             assert_eq!(decode(&enc), name);
 
-            let line = smoke_line(&Smoke { name, area: &area, fixture: true, peers_seen: 1, updates: 2, rejected: 3, rtt: None, party: 1 });
+            let line = smoke_line(&Smoke { name, area: &area, fixture: true, peers_seen: 1, updates: 2, rejected: 3, rtt: None, party: 1, battles: 0, victories: 0 });
             assert_eq!(line.lines().count(), 1, "{line:?}");
-            assert_eq!(line.split_whitespace().count(), 9, "SMOKE + 8 fields: {line:?}");
+            assert_eq!(line.split_whitespace().count(), 11, "SMOKE + 10 fields: {line:?}");
             for field in line.split_whitespace().skip(1) {
                 assert!(field.split_once('=').is_some(), "{field:?} in {line:?}");
             }

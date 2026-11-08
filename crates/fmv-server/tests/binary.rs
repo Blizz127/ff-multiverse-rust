@@ -165,6 +165,41 @@ async fn ready_serve_and_stop_on(signal: &str) {
     assert!(!log.contains("fmvt_"), "no token may reach the log:\n{log}");
 }
 
+/// The FIXTURE server has no battle data: even with `--debug-encounters` it says so at startup, keeps
+/// the READY line exactly as it was, and refuses a battle request cleanly (the session goes on).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fixture_server_with_debug_encounters_warns_and_refuses_battle_requests_cleanly() {
+    let env_state = tempfile::tempdir().expect("tempdir");
+    let server = start(&["--ephemeral", "--debug-encounters"], env_state.path()).await;
+    // Battle support does not change the READY line: protocol, build, addr, area, fixture.
+    assert_eq!(server.ready.split(' ').count(), 6, "{}", server.ready);
+    assert!(server.ready.starts_with(&format!("READY protocol={PROTOCOL_VERSION} ")), "{}", server.ready);
+
+    let (mut client, welcome) = hello(server.addr, Auth::Register { display_name: "Probe".into() }).await;
+    assert!(matches!(welcome, ServerMsg::Welcome { .. }));
+    let info = FixtureAdapter::new().list_areas().remove(0);
+    let (area, fingerprint) = match read_msg::<_, ServerMsg>(&mut client).await.unwrap() {
+        ServerMsg::AreaManifest { area, fingerprint, .. } => (area, fingerprint),
+        other => panic!("expected AreaManifest, got {other:?}"),
+    };
+    write_msg(&mut client, &ClientMsg::JoinArea { area, fingerprint, provenance: info.provenance.summary() }).await.unwrap();
+    write_msg(&mut client, &ClientMsg::RequestEncounter { formation_id: None }).await.unwrap();
+    let rejected = loop {
+        match timeout(Duration::from_secs(10), read_msg::<_, ServerMsg>(&mut client)).await.expect("an answer in time") {
+            Ok(ServerMsg::BattleRejected { battle_id, reason }) => break (battle_id, reason),
+            Ok(ServerMsg::Reject { reason }) => panic!("the session was ended instead of the request refused: {reason}"),
+            Ok(_) => continue,
+            Err(e) => panic!("connection ended: {e}"),
+        }
+    };
+    assert_eq!(rejected, (None, fmv_protocol::BattleRejection::Unsupported));
+
+    let (status, log) = server.stop("TERM").await;
+    assert_eq!(status.code(), Some(0), "{log}");
+    assert!(log.contains("no effect"), "the operator is told that --debug-encounters does nothing here:\n{log}");
+    assert!(log.contains("battles unsupported") || log.contains("no battle data"), "{log}");
+}
+
 /// Accounts live in the state directory: a registration made against one process is honoured by the
 /// next process on the same `--state-dir`, the directory is held locked while a server runs, and
 /// a refused second server says so without printing a READY line.

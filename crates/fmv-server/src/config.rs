@@ -1,12 +1,15 @@
 //! Server configuration and its validation.
 
+use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
+use fmv_ff7_battle::rules::{DEFAULT_BATTLE_SPEED, DEFAULT_TICKS_PER_SECOND};
 use fmv_fixture::FIXTURE_AREA_KEY;
 use fmv_party::PartyConfig;
-use fmv_protocol::DEFAULT_DEV_PORT;
+use fmv_protocol::{BattleRules, DEFAULT_DEV_PORT};
 
 /// Highest accepted tick rate (`--tick-hz`).
 pub const MAX_TICK_HZ: u32 = 240;
@@ -38,6 +41,65 @@ pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Default for `ServerConfig::keepalive` (idle time before the first TCP keepalive probe).
 pub const DEFAULT_KEEPALIVE: Duration = Duration::from_secs(30);
+
+/// How a server that can run battles runs them. `None` in [`ServerConfig::battle`] (the FIXTURE
+/// server, or an FF7 server without owned battle data) means battles are unsupported and every
+/// request is refused with `BattleRejection::Unsupported`.
+#[derive(Clone)]
+pub struct BattleSettings {
+    /// The battle rules over THIS server's own game data (see `fmv_protocol::BattleRules`).
+    pub rules: Arc<dyn BattleRules>,
+    /// The level every battle member fights at; `None` is each character's starting level from
+    /// the game data.
+    pub level: Option<u8>,
+    /// FF7 "Battle Speed" (0 fastest, 255 slowest), announced to clients in `EncounterStart`.
+    pub battle_speed: u8,
+    /// Engine ticks per second of battle time (`1..=1000`), announced in `EncounterStart`.
+    pub ticks_per_second: u32,
+    /// Use this seed for every battle instead of a fresh one (reproducible smokes and tests).
+    pub fixed_seed: Option<u64>,
+    /// The formation a debug `RequestEncounter` uses when it names none and the area has no
+    /// encounter table; `None` is `rules.default_formation()`.
+    pub debug_formation: Option<u16>,
+    /// Random encounters: roll the area's encounter table as players walk (only does anything in
+    /// an area that has a table). Off with `--no-random-encounters`.
+    pub random_encounters: bool,
+    /// Horizontal distance a player walks between two random-encounter rolls. `None` is the
+    /// area's `max_speed`: one roll per second of walking at full speed.
+    pub encounter_step_units: Option<f32>,
+}
+
+impl BattleSettings {
+    /// Settings with the engine's own defaults (FF7 default battle speed, 60 ticks per second).
+    pub fn new(rules: Arc<dyn BattleRules>) -> Self {
+        Self {
+            rules,
+            level: None,
+            battle_speed: DEFAULT_BATTLE_SPEED,
+            ticks_per_second: DEFAULT_TICKS_PER_SECOND,
+            fixed_seed: None,
+            debug_formation: None,
+            random_encounters: true,
+            encounter_step_units: None,
+        }
+    }
+}
+
+impl fmt::Debug for BattleSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The rules hold the owner's game data: show only what identifies them.
+        f.debug_struct("BattleSettings")
+            .field("data_fingerprint", &self.rules.data_fingerprint())
+            .field("level", &self.level)
+            .field("battle_speed", &self.battle_speed)
+            .field("ticks_per_second", &self.ticks_per_second)
+            .field("fixed_seed", &self.fixed_seed)
+            .field("debug_formation", &self.debug_formation)
+            .field("random_encounters", &self.random_encounters)
+            .field("encounter_step_units", &self.encounter_step_units)
+            .finish()
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 #[error("invalid server configuration: {0}")]
@@ -101,6 +163,12 @@ pub struct ServerConfig {
     /// of being mistaken for two players with different media. One token: see
     /// [`ServerConfig::validate`]. `None` (the FIXTURE default) leaves the build string unchanged.
     pub build_suffix: Option<String>,
+    /// Battle support (see [`BattleSettings`]). `None`: every battle request is refused as
+    /// unsupported (the FIXTURE default).
+    pub battle: Option<BattleSettings>,
+    /// Let players start a battle on request (`ClientMsg::RequestEncounter`). Off by default: a
+    /// normal server only starts battles from random encounters. Needs [`ServerConfig::battle`].
+    pub debug_encounters: bool,
 }
 
 /// Longest accepted `ServerConfig::build_suffix` (bytes).
@@ -126,6 +194,8 @@ impl Default for ServerConfig {
             registrations_per_minute: DEFAULT_REGISTRATIONS_PER_MINUTE,
             party: PartyConfig::default(),
             build_suffix: None,
+            battle: None,
+            debug_encounters: false,
         }
     }
 }
@@ -176,6 +246,17 @@ impl ServerConfig {
                 self.registrations_per_minute
             ));
         }
+        if let Some(b) = &self.battle {
+            if !(1..=1000).contains(&b.ticks_per_second) {
+                return bad(format!("battle ticks_per_second must be 1..=1000 (got {})", b.ticks_per_second));
+            }
+            if b.level.is_some_and(|l| !(1..=99).contains(&l)) {
+                return bad(format!("battle level must be 1..=99 (got {:?})", b.level));
+            }
+            if b.encounter_step_units.is_some_and(|u| !(u.is_finite() && u > 0.0)) {
+                return bad(format!("encounter_step_units must be finite and positive (got {:?})", b.encounter_step_units));
+            }
+        }
         // The build string is one whitespace-free token on the line-based READY message.
         if let Some(suffix) = &self.build_suffix {
             let token = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'/' | b'+' | b'-');
@@ -223,6 +304,39 @@ mod tests {
         assert!(c.allow_registration);
         assert_eq!(c.registrations_per_minute, DEFAULT_REGISTRATIONS_PER_MINUTE);
         assert_eq!((c.party.max_size(), c.party.invite_ttl()), (3, 60_000));
+        // Battles: unsupported without battle data, and debug encounters are off.
+        assert!(c.battle.is_none());
+        assert!(!c.debug_encounters);
+    }
+
+    #[test]
+    fn battle_settings_are_validated_and_never_print_their_data() {
+        use fmv_protocol::SyntheticRules;
+        let with = |f: &dyn Fn(&mut BattleSettings)| {
+            let mut b = BattleSettings::new(Arc::new(SyntheticRules::default()));
+            f(&mut b);
+            ServerConfig { battle: Some(b), ..ServerConfig::default() }
+        };
+        with(&|_| {}).validate().unwrap();
+        with(&|b| b.ticks_per_second = 1000).validate().unwrap();
+        with(&|b| b.level = Some(99)).validate().unwrap();
+        with(&|b| b.encounter_step_units = Some(0.5)).validate().unwrap();
+        for bad in [
+            with(&|b| b.ticks_per_second = 0),
+            with(&|b| b.ticks_per_second = 1001),
+            with(&|b| b.level = Some(0)),
+            with(&|b| b.level = Some(100)),
+            with(&|b| b.encounter_step_units = Some(0.0)),
+            with(&|b| b.encounter_step_units = Some(-1.0)),
+            with(&|b| b.encounter_step_units = Some(f32::NAN)),
+            with(&|b| b.encounter_step_units = Some(f32::INFINITY)),
+        ] {
+            assert!(bad.validate().is_err(), "{:?}", bad.battle);
+        }
+        // Debug-printing a config shows the fingerprint of the battle data, nothing else of it.
+        let shown = format!("{:?}", with(&|_| {}));
+        assert!(shown.contains("data_fingerprint") && shown.contains("BattleSettings"), "{shown}");
+        assert!(!shown.contains("SyntheticRules"), "{shown}");
     }
 
     #[test]

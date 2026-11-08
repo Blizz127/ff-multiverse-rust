@@ -611,6 +611,7 @@ dependencies = [
  "fmv-adapter-api",
  "fmv-core",
  "fmv-ff7",
+ "fmv-ff7-battle",
  "fmv-fixture",
  "fmv-library",
  "fmv-protocol",
@@ -717,7 +718,9 @@ dependencies = [
 name = "fmv-protocol"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "fmv-core",
+ "fmv-ff7-battle",
  "fmv-party",
  "serde",
  "serde_json",
@@ -733,6 +736,7 @@ dependencies = [
  "fmv-adapter-api",
  "fmv-core",
  "fmv-ff7",
+ "fmv-ff7-battle",
  "fmv-fixture",
  "fmv-library",
  "fmv-party",

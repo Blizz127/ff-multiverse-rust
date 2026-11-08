@@ -16,6 +16,7 @@
 
 mod accounts;
 mod backdrop;
+mod battle;
 mod bot;
 mod cli;
 mod ff7;
@@ -65,6 +66,9 @@ struct LocalGame {
     client_build: String,
     /// FF7 only: the same adapter, shared so the window can read render data from it.
     ff7: Option<Arc<Ff7Adapter>>,
+    /// FF7 only: this machine's own battle data, if the library has it (the battle mirror replays
+    /// shared battles with it; without it a battle can only be waited out).
+    battle: Option<Arc<dyn fmv_protocol::BattleRules>>,
 }
 
 /// Open the content for `--game`. An `Err` is a message for the user and ends the run with
@@ -76,6 +80,7 @@ fn open_game(args: &Args) -> Result<LocalGame, String> {
             adapter: Box::new(FixtureAdapter::new()),
             client_build: format!("fmv-client/{version}"),
             ff7: None,
+            battle: None,
         }),
         GameChoice::Ff7 => {
             let opened = ff7::open_ff7(&args.ff7_source()).map_err(|e| format!("--game ff7: {e}"))?;
@@ -88,10 +93,21 @@ fn open_game(args: &Args) -> Result<LocalGame, String> {
                 "FF7: {} fields indexed in {:.2?} ({} archive entries are not fields)",
                 report.areas, report.elapsed, report.skipped
             );
+            let battle = match battle::open_rules(&args.ff7_source()) {
+                Ok((rules, origin)) => {
+                    eprintln!("FF7: battle data (scene.bin, kernel.bin) read from this machine's own copy ({origin}), read-only");
+                    Some(rules)
+                }
+                Err(e) => {
+                    eprintln!("note: no battle data on this machine ({e}); shared battles cannot be replayed or fought here");
+                    None
+                }
+            };
             Ok(LocalGame {
                 adapter: Box::new(ff7::SharedFf7(Arc::clone(&opened.adapter))),
                 client_build: format!("fmv-client/{version}+{}", ff7::build_tag()),
                 ff7: Some(opened.adapter),
+                battle,
             })
         }
     }
@@ -141,6 +157,7 @@ fn run(args: Args) -> u8 {
         adapter,
         client_build,
         ff7,
+        battle,
     } = match open_game(&args) {
         Ok(game) => game,
         Err(e) => {
@@ -215,7 +232,8 @@ fn run(args: Args) -> u8 {
         joined.account.0
     );
 
-    let session = Session::new(net, joined);
+    let mut session = Session::new(net, joined);
+    session.set_battle_rules(battle);
     match event_loop {
         None => headless::run(&args, session),
         Some(el) => {

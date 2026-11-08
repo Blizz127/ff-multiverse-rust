@@ -20,6 +20,9 @@ fmv-library.workspace = true
 # dependency entry.
 fmv-persist = { path = "../fmv-persist" }
 fmv-party = { path = "../fmv-party" }
+# The battle engine (server-authoritative; clients replay it) and the rules over the owner's own
+# scene.bin/kernel.bin (read-only; nothing from them is logged or sent).
+fmv-ff7-battle = { path = "../fmv-ff7-battle" }
 tokio.workspace = true
 clap.workspace = true
 tracing.workspace = true

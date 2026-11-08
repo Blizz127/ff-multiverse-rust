@@ -1,0 +1,998 @@
+//! Battle on the wire (protocol v3) and the deterministic setup both peers share.
+//!
+//! # What travels
+//!
+//! A shared battle is server-authoritative and client-replayed. The server starts a
+//! [`fmv_ff7_battle::rules::BattleState`] and announces it with `ServerMsg::EncounterStart`: the
+//! formation id (`scene * 4 + slot`), the RNG seed, who fights as which character at which level,
+//! the start flags, the engine pace and a [`Fingerprint`] of the battle data the server built it
+//! from. **No stat, enemy record or other game data is ever sent.** Every peer rebuilds the same
+//! combatants from its OWN `scene.bin` and `kernel.bin` through [`BattleRules::build`] (for FF7,
+//! [`Ff7BattleData`]); the engine is a pure function of those inputs, so a peer that owns the same
+//! edition computes the same numbers. The wire carries the engine's own serde types
+//! ([`BattleEvent`], [`Command`], [`Outcome`], [`ActorId`]), pinned by golden tests in this crate.
+//!
+//! # The input log
+//!
+//! The engine only changes through two operations: advance by whole ticks, and submit one party
+//! command. `ServerMsg::BattleEvent { tick, events, command }` is one such operation together with
+//! its result, and `tick` is the engine's tick counter AFTER it:
+//!
+//! * `command: None`: the engine advanced to `tick`; `events` is what that produced (the server
+//!   only sends such a message when it produced something, so ticks that were silent are folded
+//!   into the next message).
+//! * `command: Some(c)`: the engine first advanced (silently) to `tick`, then `c` was applied at
+//!   that tick; `events` is what the command produced (including any start events that had not
+//!   been delivered yet).
+//!
+//! Replaying that log against a fresh engine reproduces the server's events exactly; a client
+//! that sees a difference has diverged and must say so loudly. `ServerMsg::BattleEnd` always
+//! follows the message that carried `Victory` or `Defeat`.
+//!
+//! # Rewards
+//!
+//! [`split_rewards`] is a pure function of the engine's total reward and the ROSTER (every member
+//! of `EncounterStart::party`, with whether the engine says it is alive), never of who is still
+//! connected, so a client recomputes the very list the server sent.
+
+use std::fmt;
+use std::path::Path;
+
+use fmv_core::{AccountId, EntityId, Fingerprint};
+use fmv_ff7_battle::kernel::{CharacterId, Kernel, KernelError, MAX_KERNEL_BYTES};
+use fmv_ff7_battle::rules::{
+    enemies_for_formation, BattleConfig, BattleState, Combatant, Reward, StartMode, MAX_PER_SIDE,
+};
+use fmv_ff7_battle::scene::{BattleLayout, SceneBin, SceneError, MAX_SCENE_BIN_BYTES};
+use serde::{Deserialize, Serialize};
+
+/// The engine types that travel in battle messages, re-exported so a peer can match on them
+/// without a direct dependency.
+pub use fmv_ff7_battle::rules::{ActorId, BattleEvent, Command, Outcome};
+
+/// Most characters a battle party can have (a protocol bound; the server's party size is smaller).
+pub const MAX_BATTLE_PARTY: usize = 8;
+
+/// Identifies one battle on a server (never reused while the server runs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct BattleId(pub u64);
+
+impl fmt::Display for BattleId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "battle#{}", self.0)
+    }
+}
+
+/// One player's character in a battle. Ids and numbers only: the stats follow from the peer's own
+/// kernel data. `party[i]` of `EncounterStart` fights as `ActorId(i)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BattleMember {
+    /// The player's entity in the field (who is frozen while this battle runs).
+    pub entity: EntityId,
+    /// The account that controls this character (only its session may command it).
+    pub account: AccountId,
+    /// FF7 character id: Cloud 0, Barret 1, Tifa 2, Aerith 3, Red XIII 4, Yuffie 5, Cait Sith 6,
+    /// Vincent 7, Cid 8 (`fmv_ff7_battle::kernel::CharacterId::index`).
+    pub character: u8,
+    pub level: u8,
+    /// Equipment override ids; `None` is the character's starting equipment.
+    pub weapon: Option<u8>,
+    pub armor: Option<u8>,
+}
+
+impl BattleMember {
+    /// The FF7 character, if `character` names one.
+    pub fn character_id(&self) -> Option<CharacterId> {
+        CharacterId::from_index(usize::from(self.character))
+    }
+}
+
+/// What one account earned from a won battle (see [`split_rewards`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BattleReward {
+    pub account: AccountId,
+    pub exp: u32,
+    pub gil: u32,
+    pub ap: u32,
+}
+
+/// A party command as the server applied it: who, and what.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppliedCommand {
+    pub actor: ActorId,
+    pub command: Command,
+}
+
+/// Why the server refused a battle request or command (`ServerMsg::BattleRejected`). A refusal is
+/// routine (a stale command, a debug request on a normal server) and never ends the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BattleRejection {
+    /// This server cannot run battles: it has no owned battle data (the FIXTURE server never does).
+    Unsupported,
+    /// `RequestEncounter` while the server runs without `--debug-encounters`.
+    DebugDisabled,
+    /// You are already in a battle.
+    AlreadyInBattle,
+    /// The requested formation does not exist (or has no enemies).
+    UnknownFormation,
+    /// The battle named by a command is not one you are in (unknown, finished, or someone else's).
+    NotInBattle,
+    /// The actor of a command is not your character.
+    NotYourActor,
+    /// The actor's ATB gauge is not full.
+    GaugeNotFull,
+    /// The actor is dead.
+    ActorDead,
+    /// The target does not exist or is not an enemy.
+    InvalidTarget,
+    /// The target is already dead.
+    TargetDead,
+    /// The battle is over.
+    BattleOver,
+}
+
+impl fmt::Display for BattleRejection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            BattleRejection::Unsupported => "this server cannot run battles (it has no owned battle data)",
+            BattleRejection::DebugDisabled => "debug encounters are disabled on this server (start it with --debug-encounters)",
+            BattleRejection::AlreadyInBattle => "you are already in a battle",
+            BattleRejection::UnknownFormation => "no such enemy formation",
+            BattleRejection::NotInBattle => "you are not in that battle",
+            BattleRejection::NotYourActor => "that character is not yours",
+            BattleRejection::GaugeNotFull => "that character's ATB gauge is not full",
+            BattleRejection::ActorDead => "that character is dead",
+            BattleRejection::InvalidTarget => "that is not a valid target",
+            BattleRejection::TargetDead => "that target is already dead",
+            BattleRejection::BattleOver => "the battle is over",
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The shared setup
+// ---------------------------------------------------------------------------------------------
+
+/// Everything a peer needs to build the engine of a battle: the content of `EncounterStart`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BattleSetup {
+    /// Formation id, `scene * 4 + slot`.
+    pub formation_id: u16,
+    pub seed: u64,
+    pub party: Vec<BattleMember>,
+    /// The party gets the first move (full gauges); the enemies start empty.
+    pub preemptive: bool,
+    /// The enemies get the first move; the party starts empty.
+    pub back_attack: bool,
+    /// FF7 "Battle Speed" configuration (0 fastest, 255 slowest).
+    pub battle_speed: u8,
+    /// Engine ticks per second of simulated time (the engine clamps it to `1..=1000`).
+    pub ticks_per_second: u32,
+}
+
+impl BattleSetup {
+    /// The gauge start the flags ask for. Both flags set is contradictory and counts as a normal
+    /// start (the server never sends it).
+    pub fn start_mode(&self) -> StartMode {
+        match (self.preemptive, self.back_attack) {
+            (true, false) => StartMode::Preemptive,
+            (false, true) => StartMode::BackAttack,
+            _ => StartMode::Normal,
+        }
+    }
+
+    /// The engine configuration of this battle.
+    pub fn config(&self) -> BattleConfig {
+        BattleConfig {
+            battle_speed: self.battle_speed,
+            ticks_per_second: self.ticks_per_second,
+            start: self.start_mode(),
+        }
+    }
+}
+
+/// Why a [`BattleSetup`] cannot be built from the local game data.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum BattleBuildError {
+    #[error("no enemy formation {0}")]
+    UnknownFormation(u16),
+    #[error("enemy formation {0} has no enemies")]
+    NoEnemies(u16),
+    #[error("the battle party is empty")]
+    EmptyParty,
+    #[error("a battle party of {0} is too large (at most {MAX_BATTLE_PARTY})")]
+    PartyTooLarge(usize),
+    #[error("unknown character id {0}")]
+    UnknownCharacter(u8),
+    #[error("the local game data has no stats for character id {0}")]
+    NoCharacterData(u8),
+}
+
+/// What a formation looks like to the server (for choosing flags and for logs). Names and stats
+/// are deliberately not part of it: they stay in the peer's own files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FormationInfo {
+    /// The scene's arrival layout says the party gets the first move.
+    pub preemptive: bool,
+    /// The scene's arrival layout says the enemies get the first move.
+    pub back_attack: bool,
+    /// How many enemies the formation places.
+    pub enemies: usize,
+}
+
+/// The game's battle rules as one peer's own data provides them. The server and every client call
+/// [`BattleRules::build`] with the same [`BattleSetup`] and must get identical engines, which is
+/// why this is one trait with one implementation per game rather than code in each binary.
+pub trait BattleRules: Send + Sync {
+    /// Build the engine of `setup` from the local game data. Pure: the same setup and the same
+    /// data always give the same `BattleState`.
+    fn build(&self, setup: &BattleSetup) -> Result<BattleState, BattleBuildError>;
+
+    /// Fingerprint of the local battle data (compare with `EncounterStart::data_fingerprint`:
+    /// peers with different data cannot replay each other's battles).
+    fn data_fingerprint(&self) -> Fingerprint;
+
+    // ---- used by the server when it chooses a battle ----
+
+    /// The formation `id`, or `None` if it does not exist or has no enemies.
+    fn formation(&self, id: u16) -> Option<FormationInfo>;
+
+    /// The level `character` fights at when the server does not choose one.
+    fn starting_level(&self, character: u8) -> u8;
+
+    /// The formation a debug encounter uses when none is named and the area has no table.
+    fn default_formation(&self) -> Option<u16>;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Replay: the client side of the input log
+// ---------------------------------------------------------------------------------------------
+
+/// How a replayed battle disagrees with what the server announced. Any of these means the peer's
+/// engine is no longer the server's: its game data differs, the engines differ, or the server's
+/// log is not one a valid engine could have produced. A peer must say so loudly.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum Divergence {
+    #[error("the server's engine tick went backwards: ours is {local}, the message says {server}")]
+    TickBackwards { local: u64, server: u64 },
+    #[error("after advancing, our engine is at tick {local} but the server's message is for tick {server}")]
+    TickMismatch { local: u64, server: u64 },
+    #[error("ticks that the server reported as silent produced events here (first: {first:?})")]
+    SilentTicksNotSilent { first: BattleEvent },
+    #[error("the server applied a command that our engine refuses: {0}")]
+    CommandRefused(String),
+    #[error("events differ at tick {tick}, event {index}: ours {local:?}, the server's {server:?} ({local_len} vs {server_len} events)")]
+    EventsDiffer {
+        tick: u64,
+        index: usize,
+        local: Option<BattleEvent>,
+        server: Option<BattleEvent>,
+        local_len: usize,
+        server_len: usize,
+    },
+    #[error("the server ended the battle with {server:?} but our engine says {local:?}")]
+    OutcomeDiffers { local: Option<Outcome>, server: Outcome },
+    #[error("the rewards differ: ours {local:?}, the server's {server:?}")]
+    RewardsDiffer { local: Vec<BattleReward>, server: Vec<BattleReward> },
+}
+
+/// A peer's replay of a battle: the engine built from its own game data, advanced only by what the
+/// server announces (see the module docs, "The input log"). One definition of that rule, used by
+/// the client and by the server's own tests.
+#[derive(Debug, Clone)]
+pub struct BattleReplay {
+    state: BattleState,
+    party: Vec<BattleMember>,
+}
+
+impl BattleReplay {
+    /// Build the engine of `setup` from this peer's own data.
+    pub fn start(rules: &dyn BattleRules, setup: &BattleSetup) -> Result<Self, BattleBuildError> {
+        Ok(Self { state: rules.build(setup)?, party: setup.party.clone() })
+    }
+
+    /// The replayed engine (read-only: it only moves through [`BattleReplay::apply`]).
+    pub fn state(&self) -> &BattleState {
+        &self.state
+    }
+
+    /// The party, `party[i]` being `ActorId(i)`.
+    pub fn party(&self) -> &[BattleMember] {
+        &self.party
+    }
+
+    /// Apply one `BattleEvent` message and check that the engine reproduces its `events`.
+    pub fn apply(&mut self, tick: u64, events: &[BattleEvent], command: Option<&AppliedCommand>) -> Result<(), Divergence> {
+        let here = self.state.tick();
+        let ahead = tick.checked_sub(here).ok_or(Divergence::TickBackwards { local: here, server: tick })?;
+        match command {
+            None => {
+                let got = self.state.step_ticks(ahead);
+                self.check_tick(tick)?;
+                compare(tick, &got, events)
+            }
+            Some(applied) => {
+                if ahead > 0 {
+                    let silent = self.state.step_ticks(ahead);
+                    if let Some(first) = silent.first() {
+                        return Err(Divergence::SilentTicksNotSilent { first: *first });
+                    }
+                }
+                self.check_tick(tick)?;
+                let got = self
+                    .state
+                    .submit_command(applied.actor, applied.command)
+                    .map_err(|e| Divergence::CommandRefused(e.to_string()))?;
+                compare(tick, &got, events)
+            }
+        }
+    }
+
+    fn check_tick(&self, server: u64) -> Result<(), Divergence> {
+        let local = self.state.tick();
+        if local == server {
+            Ok(())
+        } else {
+            Err(Divergence::TickMismatch { local, server })
+        }
+    }
+
+    /// The roster the rewards are split over: every party member and whether the engine says it
+    /// is alive (see [`split_rewards`]).
+    pub fn roster(&self) -> Vec<(AccountId, bool)> {
+        self.party
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (m.account, u8::try_from(i).ok().and_then(|i| self.state.actor(ActorId(i))).is_some_and(Combatant::is_alive)))
+            .collect()
+    }
+
+    /// The rewards the engine says the battle earned (empty unless it was won).
+    pub fn expected_rewards(&self) -> Vec<BattleReward> {
+        match self.state.outcome() {
+            Some(Outcome::Victory) => split_rewards(self.state.rewards(), &self.roster()),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Check a `BattleEnd` against the engine: it must have ended the way the server says, and the
+    /// rewards must be the ones the engine's totals split into.
+    pub fn check_end(&self, outcome: Outcome, rewards: &[BattleReward]) -> Result<(), Divergence> {
+        let local = self.state.outcome();
+        if local != Some(outcome) {
+            return Err(Divergence::OutcomeDiffers { local, server: outcome });
+        }
+        let expected = self.expected_rewards();
+        if expected != rewards {
+            return Err(Divergence::RewardsDiffer { local: expected, server: rewards.to_vec() });
+        }
+        Ok(())
+    }
+}
+
+/// `Ok` when `local == server`, else the first difference.
+fn compare(tick: u64, local: &[BattleEvent], server: &[BattleEvent]) -> Result<(), Divergence> {
+    if local == server {
+        return Ok(());
+    }
+    let index = local.iter().zip(server).position(|(a, b)| a != b).unwrap_or(local.len().min(server.len()));
+    Err(Divergence::EventsDiffer {
+        tick,
+        index,
+        local: local.get(index).copied(),
+        server: server.get(index).copied(),
+        local_len: local.len(),
+        server_len: server.len(),
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Rewards
+// ---------------------------------------------------------------------------------------------
+
+/// Divide the reward of a won battle among the roster: every member alive at the end gets
+/// `exp / alive` and `gil / alive` (rounded down, the remainder is dropped) and the full `ap`;
+/// the dead get nothing. The list has one entry per roster member, in roster order, so it does not
+/// depend on who is still connected.
+///
+/// APPROXIMATION: FF7 pools gil for the whole party and splits experience among the living;
+/// accounts here have separate wallets, so gil is split like experience.
+pub fn split_rewards(total: Reward, roster: &[(AccountId, bool)]) -> Vec<BattleReward> {
+    let alive = roster.iter().filter(|(_, alive)| *alive).count().max(1) as u32;
+    roster
+        .iter()
+        .map(|&(account, is_alive)| {
+            if is_alive {
+                BattleReward { account, exp: total.exp / alive, gil: total.gil / alive, ap: total.ap }
+            } else {
+                BattleReward { account, exp: 0, gil: 0, ap: 0 }
+            }
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------------------------
+// FF7: scene.bin + kernel.bin
+// ---------------------------------------------------------------------------------------------
+
+/// Why the battle data files cannot be used.
+#[derive(Debug, thiserror::Error)]
+pub enum Ff7BattleDataError {
+    #[error("cannot read {what}: {source}")]
+    Io {
+        what: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("{what} is {len} bytes, over the {max} byte limit")]
+    TooLarge { what: &'static str, len: u64, max: u64 },
+    #[error("scene.bin: {0}")]
+    Scene(#[from] SceneError),
+    #[error("kernel.bin: {0}")]
+    Kernel(#[from] KernelError),
+}
+
+/// `scene.bin` and `kernel.bin` of the owner's own FF7 copy, decoded read-only. Nothing in here is
+/// ever serialized or logged: only [`Ff7BattleData::fingerprint`] leaves the process.
+pub struct Ff7BattleData {
+    scenes: SceneBin,
+    kernel: Kernel,
+    fingerprint: Fingerprint,
+}
+
+impl fmt::Debug for Ff7BattleData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Ff7BattleData")
+            .field("scenes", &self.scenes.scenes().len())
+            .field("fingerprint", &self.fingerprint)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Domain-separated blake3 of both files, each length-prefixed.
+fn battle_data_fingerprint(scene: &[u8], kernel: &[u8]) -> Fingerprint {
+    let mut h = blake3::Hasher::new();
+    h.update(b"fmv-ff7-battle-data/1");
+    h.update(&(scene.len() as u64).to_le_bytes());
+    h.update(scene);
+    h.update(&(kernel.len() as u64).to_le_bytes());
+    h.update(kernel);
+    Fingerprint(*h.finalize().as_bytes())
+}
+
+/// Read a whole file under a size cap (read-only).
+fn read_capped(path: &Path, what: &'static str, max: u64) -> Result<Vec<u8>, Ff7BattleDataError> {
+    let io = |source| Ff7BattleDataError::Io { what, source };
+    let len = std::fs::metadata(path).map_err(io)?.len();
+    if len > max {
+        return Err(Ff7BattleDataError::TooLarge { what, len, max });
+    }
+    std::fs::read(path).map_err(io)
+}
+
+impl Ff7BattleData {
+    /// Decode `scene.bin` and `kernel.bin` from their bytes.
+    pub fn from_bytes(scene: &[u8], kernel: &[u8]) -> Result<Self, Ff7BattleDataError> {
+        Ok(Self {
+            scenes: SceneBin::parse(scene)?,
+            kernel: Kernel::parse(kernel)?,
+            fingerprint: battle_data_fingerprint(scene, kernel),
+        })
+    }
+
+    /// Read and decode the two files (opened read-only, size-capped).
+    pub fn open(scene: &Path, kernel: &Path) -> Result<Self, Ff7BattleDataError> {
+        let scene = read_capped(scene, "scene.bin", MAX_SCENE_BIN_BYTES)?;
+        let kernel = read_capped(kernel, "kernel.bin", MAX_KERNEL_BYTES)?;
+        Self::from_bytes(&scene, &kernel)
+    }
+
+    /// The decoded `scene.bin`.
+    pub fn scenes(&self) -> &SceneBin {
+        &self.scenes
+    }
+
+    /// The decoded `kernel.bin`.
+    pub fn kernel(&self) -> &Kernel {
+        &self.kernel
+    }
+
+    /// Fingerprint of the two files (also [`BattleRules::data_fingerprint`]).
+    pub fn fingerprint(&self) -> Fingerprint {
+        self.fingerprint
+    }
+
+    fn party(&self, setup: &BattleSetup) -> Result<Vec<Combatant>, BattleBuildError> {
+        if setup.party.is_empty() {
+            return Err(BattleBuildError::EmptyParty);
+        }
+        if setup.party.len() > MAX_BATTLE_PARTY {
+            return Err(BattleBuildError::PartyTooLarge(setup.party.len()));
+        }
+        setup
+            .party
+            .iter()
+            .map(|m| {
+                let who = m.character_id().ok_or(BattleBuildError::UnknownCharacter(m.character))?;
+                Combatant::from_character(&self.kernel, who, m.level, m.weapon, m.armor)
+                    .ok_or(BattleBuildError::NoCharacterData(m.character))
+            })
+            .collect()
+    }
+}
+
+impl BattleRules for Ff7BattleData {
+    fn build(&self, setup: &BattleSetup) -> Result<BattleState, BattleBuildError> {
+        let formation = self
+            .scenes
+            .formation(usize::from(setup.formation_id))
+            .ok_or(BattleBuildError::UnknownFormation(setup.formation_id))?;
+        let enemies = enemies_for_formation(formation.scene, formation.slot);
+        if enemies.is_empty() {
+            return Err(BattleBuildError::NoEnemies(setup.formation_id));
+        }
+        let party = self.party(setup)?;
+        Ok(BattleState::with_config(setup.seed, party, enemies, setup.config()))
+    }
+
+    fn data_fingerprint(&self) -> Fingerprint {
+        self.fingerprint
+    }
+
+    fn formation(&self, id: u16) -> Option<FormationInfo> {
+        let formation = self.scenes.formation(usize::from(id))?;
+        let enemies = formation.enemies().len();
+        if enemies == 0 {
+            return None;
+        }
+        let layout = formation.setup().layout;
+        Some(FormationInfo {
+            preemptive: layout == BattleLayout::Preemptive,
+            back_attack: layout == BattleLayout::BackAttack,
+            enemies,
+        })
+    }
+
+    /// The level in the kernel's initial data. APPROXIMATION: a character that has not joined the
+    /// story yet carries the placeholder level 1 there (checked on the owner's Steam copy: only
+    /// Cloud, Cait Sith and Vincent start above 1), and joins at the leader's level, so it
+    /// fights at Cloud's level instead.
+    fn starting_level(&self, character: u8) -> u8 {
+        let level_of = |id: u8| self.kernel.init_character_by_id(id).map(|c| c.level.clamp(1, 99));
+        match level_of(character) {
+            Some(own) if own > 1 => own,
+            own => level_of(0).or(own).unwrap_or(DEFAULT_LEVEL),
+        }
+    }
+
+    /// The weakest formation: the one whose enemies have the least HP in total (the lowest id on a
+    /// tie). Data-derived, so it does not depend on one edition's numbering, and the likeliest to be
+    /// winnable by a starting party. A server that wants a particular fight names it
+    /// (`--debug-formation`); on a field with an encounter table the table is used first.
+    fn default_formation(&self) -> Option<u16> {
+        (0..self.scenes.formation_count())
+            .filter_map(|id| u16::try_from(id).ok())
+            .filter_map(|id| {
+                let enemies = self.scenes.formation(usize::from(id))?.enemies();
+                let total_hp: u64 = enemies.iter().map(|e| u64::from(e.record.hp)).sum();
+                (!enemies.is_empty() && total_hp > 0).then_some((total_hp, id))
+            })
+            .min()
+            .map(|(_, id)| id)
+    }
+}
+
+/// The level used when the data has no starting level for a character.
+pub const DEFAULT_LEVEL: u8 = 5;
+
+// ---------------------------------------------------------------------------------------------
+// Synthetic rules (test scaffolding)
+// ---------------------------------------------------------------------------------------------
+
+/// Hand-made rules for tests of the server and the client: no game files, a few fixed formations
+/// and simple characters. **Test scaffolding only.** The binaries never use it, and it is not
+/// FF7 support: nothing here resembles the real game's numbers.
+///
+/// Formations: `0` one weak enemy, `1` two weak enemies, `2` one overwhelming enemy (the party
+/// loses), `3` like `0` but with a preemptive layout, `4` one brute that kills a hero per hit (the
+/// party usually wins, with losses). Any `character` below 9 is a fighter whose strength grows
+/// with its level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyntheticRules {
+    /// Hit points of each weak enemy.
+    pub enemy_hp: u32,
+}
+
+impl Default for SyntheticRules {
+    fn default() -> Self {
+        Self { enemy_hp: 200 }
+    }
+}
+
+impl SyntheticRules {
+    /// The fingerprint every synthetic rule set reports.
+    pub const FINGERPRINT: Fingerprint = Fingerprint([0x5a; 32]);
+
+    fn enemy(&self, name: &str, hp: u32, attack: u32) -> Combatant {
+        let mut e = Combatant::new(name, 3, hp);
+        e.attack = attack;
+        e.defense = 0;
+        e.dex = 40;
+        e.accuracy = 100;
+        e.reward = Reward { exp: 12, gil: 20, ap: 2 };
+        e
+    }
+}
+
+impl BattleRules for SyntheticRules {
+    fn build(&self, setup: &BattleSetup) -> Result<BattleState, BattleBuildError> {
+        let enemies = match setup.formation_id {
+            0 | 3 => vec![self.enemy("Dummy A", self.enemy_hp, 10)],
+            1 => vec![self.enemy("Dummy A", self.enemy_hp, 10), self.enemy("Dummy B", self.enemy_hp, 10)],
+            2 => vec![self.enemy("Colossus", 5_000, 200)],
+            4 => vec![self.enemy("Brute", 600, 250)],
+            other => return Err(BattleBuildError::UnknownFormation(other)),
+        };
+        if setup.party.is_empty() {
+            return Err(BattleBuildError::EmptyParty);
+        }
+        if setup.party.len() > MAX_BATTLE_PARTY.min(MAX_PER_SIDE) {
+            return Err(BattleBuildError::PartyTooLarge(setup.party.len()));
+        }
+        let party = setup
+            .party
+            .iter()
+            .map(|m| {
+                let who = m.character_id().ok_or(BattleBuildError::UnknownCharacter(m.character))?;
+                let level = u32::from(m.level.clamp(1, 99));
+                let mut c = Combatant::new(who.name(), m.level.clamp(1, 99), 120 + 20 * level);
+                c.attack = 30 + 4 * level;
+                c.defense = 5;
+                c.dex = 40;
+                c.accuracy = 100;
+                Ok(c)
+            })
+            .collect::<Result<Vec<_>, BattleBuildError>>()?;
+        Ok(BattleState::with_config(setup.seed, party, enemies, setup.config()))
+    }
+
+    fn data_fingerprint(&self) -> Fingerprint {
+        Self::FINGERPRINT
+    }
+
+    fn formation(&self, id: u16) -> Option<FormationInfo> {
+        match id {
+            0 => Some(FormationInfo { preemptive: false, back_attack: false, enemies: 1 }),
+            1 => Some(FormationInfo { preemptive: false, back_attack: false, enemies: 2 }),
+            2 => Some(FormationInfo { preemptive: false, back_attack: false, enemies: 1 }),
+            3 => Some(FormationInfo { preemptive: true, back_attack: false, enemies: 1 }),
+            4 => Some(FormationInfo { preemptive: false, back_attack: false, enemies: 1 }),
+            _ => None,
+        }
+    }
+
+    fn starting_level(&self, _character: u8) -> u8 {
+        5
+    }
+
+    fn default_formation(&self) -> Option<u16> {
+        Some(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fmv_ff7_battle::rules::{BattleState, Command};
+
+    fn member(i: u64, character: u8) -> BattleMember {
+        BattleMember {
+            entity: EntityId(10 + i),
+            account: AccountId(20 + i),
+            character,
+            level: 6,
+            weapon: None,
+            armor: None,
+        }
+    }
+
+    pub(crate) fn setup(formation_id: u16, members: usize) -> BattleSetup {
+        BattleSetup {
+            formation_id,
+            seed: 0xBA77_1E,
+            party: (0..members as u64).map(|i| member(i, i as u8)).collect(),
+            preemptive: false,
+            back_attack: false,
+            battle_speed: 0,
+            ticks_per_second: 1000,
+        }
+    }
+
+    /// Drive a battle the way a server does: step a few ticks, let every ready party member attack
+    /// the first living enemy. Returns every event and the applied operations in order.
+    fn play(state: &mut BattleState) -> Vec<BattleEvent> {
+        let mut log = Vec::new();
+        for _ in 0..10_000 {
+            if state.outcome().is_some() {
+                break;
+            }
+            log.extend(state.step_ticks(5));
+            for id in state.ready_actors() {
+                let Some(target) = state.enemy_ids().into_iter().find(|e| state.actor(*e).is_some_and(|c| c.is_alive())) else {
+                    break;
+                };
+                if let Ok(events) = state.submit_command(id, Command::Attack { target }) {
+                    log.extend(events);
+                }
+            }
+        }
+        log
+    }
+
+    #[test]
+    fn the_same_setup_builds_the_same_battle_and_plays_the_same_way() {
+        let rules = SyntheticRules::default();
+        let setup = setup(1, 2);
+        let (mut a, mut b) = (rules.build(&setup).unwrap(), rules.build(&setup).unwrap());
+        assert_eq!(a, b, "two peers building from one setup must agree before anything happens");
+        assert_eq!((a.party_ids().len(), a.enemy_ids().len()), (2, 2));
+        let (log_a, log_b) = (play(&mut a), play(&mut b));
+        assert_eq!(log_a, log_b);
+        assert_eq!(a.outcome(), Some(Outcome::Victory));
+        assert!(log_a.contains(&BattleEvent::Victory));
+        // A different seed is a different battle (initial gauges are random).
+        let other = rules.build(&BattleSetup { seed: 7, ..setup.clone() }).unwrap();
+        assert_ne!(other, rules.build(&setup).unwrap());
+    }
+
+    #[test]
+    fn the_flags_choose_the_start_and_both_flags_mean_normal() {
+        let mut s = setup(0, 1);
+        assert_eq!(s.start_mode(), StartMode::Normal);
+        s.preemptive = true;
+        assert_eq!(s.start_mode(), StartMode::Preemptive);
+        s.back_attack = true;
+        assert_eq!(s.start_mode(), StartMode::Normal, "contradictory flags are a normal start");
+        s.preemptive = false;
+        assert_eq!(s.start_mode(), StartMode::BackAttack);
+        assert_eq!(s.config().battle_speed, 0);
+        assert_eq!(s.config().ticks_per_second, 1000);
+
+        // Preemptive: the party's gauges start full, the enemies' empty.
+        let rules = SyntheticRules::default();
+        let pre = rules.build(&BattleSetup { preemptive: true, ..setup(0, 2) }).unwrap();
+        assert_eq!(pre.ready_actors().len(), 2);
+        let back = rules.build(&BattleSetup { back_attack: true, ..setup(0, 2) }).unwrap();
+        assert!(back.ready_actors().is_empty());
+    }
+
+    #[test]
+    fn bad_setups_are_errors_not_panics() {
+        let rules = SyntheticRules::default();
+        assert_eq!(rules.build(&setup(99, 1)).unwrap_err(), BattleBuildError::UnknownFormation(99));
+        assert_eq!(rules.build(&setup(0, 0)).unwrap_err(), BattleBuildError::EmptyParty);
+        assert_eq!(rules.build(&setup(0, 9)).unwrap_err(), BattleBuildError::PartyTooLarge(9));
+        let mut s = setup(0, 1);
+        s.party[0].character = 77;
+        assert_eq!(rules.build(&s).unwrap_err(), BattleBuildError::UnknownCharacter(77));
+        for e in [BattleBuildError::NoEnemies(3), BattleBuildError::NoCharacterData(2), BattleBuildError::PartyTooLarge(9)] {
+            assert!(!e.to_string().is_empty());
+        }
+    }
+
+    #[test]
+    fn rewards_go_to_the_living_in_roster_order_and_ignore_connections() {
+        let total = Reward { exp: 100, gil: 50, ap: 7 };
+        let roster = [(AccountId(1), true), (AccountId(2), false), (AccountId(3), true)];
+        assert_eq!(
+            split_rewards(total, &roster),
+            vec![
+                BattleReward { account: AccountId(1), exp: 50, gil: 25, ap: 7 },
+                BattleReward { account: AccountId(2), exp: 0, gil: 0, ap: 0 },
+                BattleReward { account: AccountId(3), exp: 50, gil: 25, ap: 7 },
+            ]
+        );
+        // The remainder is dropped, never invented.
+        let odd = split_rewards(Reward { exp: 10, gil: 10, ap: 1 }, &[(AccountId(1), true), (AccountId(2), true), (AccountId(3), true)]);
+        assert!(odd.iter().all(|r| r.exp == 3 && r.gil == 3 && r.ap == 1));
+        // Nobody alive (not a state a victory reaches): nobody is paid, and nothing divides by zero.
+        assert!(split_rewards(total, &[(AccountId(1), false)]).iter().all(|r| r.exp == 0 && r.gil == 0 && r.ap == 0));
+        assert!(split_rewards(total, &[]).is_empty());
+    }
+
+    // ---- the input log: a server simulation and its replay ----
+
+    /// One message of the input log, as a server produces it.
+    type Message = (u64, Vec<BattleEvent>, Option<AppliedCommand>);
+
+    /// What a server does with a battle: advance it in slices (sending only non-empty batches) and
+    /// apply a command whenever a party member is ready.
+    fn serve(state: &mut BattleState, slice: u64) -> Vec<Message> {
+        let mut log = Vec::new();
+        for _ in 0..100_000 {
+            if state.outcome().is_some() {
+                break;
+            }
+            let events = state.step_ticks(slice);
+            if !events.is_empty() {
+                log.push((state.tick(), events, None));
+            }
+            for id in state.ready_actors() {
+                let Some(target) = state.enemy_ids().into_iter().find(|e| state.actor(*e).is_some_and(|c| c.is_alive())) else {
+                    break;
+                };
+                let command = Command::Attack { target };
+                if let Ok(events) = state.submit_command(id, command) {
+                    log.push((state.tick(), events, Some(AppliedCommand { actor: id, command })));
+                }
+            }
+        }
+        log
+    }
+
+    fn replay_all(rules: &SyntheticRules, setup: &BattleSetup, log: &[Message]) -> Result<BattleReplay, Divergence> {
+        let mut replay = BattleReplay::start(rules, setup).expect("builds");
+        for (tick, events, command) in log {
+            replay.apply(*tick, events, command.as_ref())?;
+        }
+        Ok(replay)
+    }
+
+    #[test]
+    fn a_replay_of_the_servers_log_reproduces_it_for_any_slicing_and_any_party() {
+        let rules = SyntheticRules::default();
+        for (formation, members, slice) in [(0, 1, 1), (1, 2, 5), (1, 3, 17), (3, 2, 3), (0, 2, 100)] {
+            let mut setup = setup(formation, members);
+            setup.preemptive = formation == 3;
+            let mut server = rules.build(&setup).unwrap();
+            let log = serve(&mut server, slice);
+            assert_eq!(server.outcome(), Some(Outcome::Victory), "formation {formation}, {members} members, slice {slice}");
+            assert!(log.iter().any(|(_, _, c)| c.is_some()) && log.iter().any(|(_, _, c)| c.is_none()));
+            // The message that carries the victory is the last one.
+            assert_eq!(log.last().unwrap().1.last(), Some(&BattleEvent::Victory));
+            let replay = replay_all(&rules, &setup, &log).unwrap_or_else(|d| panic!("{d}"));
+            assert_eq!(replay.state(), &server, "the replayed engine IS the server's engine");
+            let rewards = replay.expected_rewards();
+            assert_eq!(rewards.len(), members);
+            replay.check_end(Outcome::Victory, &rewards).expect("the end agrees");
+            // A server that announced other rewards, or another outcome, is caught.
+            let mut greedy = rewards.clone();
+            greedy[0].gil += 1;
+            assert!(matches!(replay.check_end(Outcome::Victory, &greedy), Err(Divergence::RewardsDiffer { .. })));
+            assert!(matches!(replay.check_end(Outcome::Defeat, &[]), Err(Divergence::OutcomeDiffers { .. })));
+        }
+    }
+
+    #[test]
+    fn a_lost_battle_replays_and_pays_nothing() {
+        let rules = SyntheticRules::default();
+        let setup = setup(2, 2);
+        let mut server = rules.build(&setup).unwrap();
+        let log = serve(&mut server, 7);
+        assert_eq!(server.outcome(), Some(Outcome::Defeat));
+        let replay = replay_all(&rules, &setup, &log).unwrap();
+        assert_eq!(replay.state(), &server);
+        assert!(replay.expected_rewards().is_empty());
+        replay.check_end(Outcome::Defeat, &[]).unwrap();
+    }
+
+    #[test]
+    fn a_dead_member_is_paid_nothing_whoever_is_connected() {
+        let rules = SyntheticRules::default();
+        // Find (deterministically) a won battle in which the brute killed someone.
+        let found = (0..400u64).find_map(|seed| {
+            let setup = BattleSetup { seed, ..setup(4, 3) };
+            let mut server = rules.build(&setup).unwrap();
+            let log = serve(&mut server, 5);
+            let replay = replay_all(&rules, &setup, &log).ok()?;
+            let roster = replay.roster();
+            (server.outcome() == Some(Outcome::Victory) && roster.iter().any(|r| !r.1)).then_some((replay, roster))
+        });
+        let (replay, roster) = found.expect("some seed wins with a loss");
+        let rewards = replay.expected_rewards();
+        // One entry per roster member, in roster order, whoever is connected; the dead earn nothing
+        // and the living share the experience.
+        assert_eq!(rewards.iter().map(|r| r.account).collect::<Vec<_>>(), roster.iter().map(|r| r.0).collect::<Vec<_>>());
+        let alive = roster.iter().filter(|r| r.1).count() as u32;
+        assert!(alive >= 1 && alive < 3);
+        for (reward, (_, is_alive)) in rewards.iter().zip(&roster) {
+            if *is_alive {
+                assert_eq!((reward.exp, reward.gil, reward.ap), (12 / alive, 20 / alive, 2));
+            } else {
+                assert_eq!((reward.exp, reward.gil, reward.ap), (0, 0, 0));
+            }
+        }
+        replay.check_end(Outcome::Victory, &rewards).unwrap();
+    }
+
+    #[test]
+    fn tampering_with_the_log_is_caught_where_it_happens() {
+        let rules = SyntheticRules::default();
+        let setup = setup(1, 2);
+        let mut server = rules.build(&setup).unwrap();
+        let log = serve(&mut server, 5);
+        let damage = log
+            .iter()
+            .position(|(_, e, _)| e.iter().any(|ev| matches!(ev, BattleEvent::Damage { .. })))
+            .expect("some damage");
+
+        // One damage number is different.
+        let mut forged = log.clone();
+        for ev in &mut forged[damage].1 {
+            if let BattleEvent::Damage { amount, .. } = ev {
+                *amount += 1;
+                break;
+            }
+        }
+        match replay_all(&rules, &setup, &forged) {
+            Err(Divergence::EventsDiffer { index, local: Some(_), server: Some(_), .. }) => assert!(index < forged[damage].1.len()),
+            other => panic!("{other:?}"),
+        }
+
+        // A message is missing: the next one is for a tick that does not follow.
+        let mut lost = log.clone();
+        lost.remove(0);
+        assert!(replay_all(&rules, &setup, &lost).is_err());
+
+        // A message arrives twice: time would run backwards.
+        let mut twice = log.clone();
+        twice.insert(1, log[0].clone());
+        assert!(matches!(replay_all(&rules, &setup, &twice), Err(Divergence::TickBackwards { .. } | Divergence::EventsDiffer { .. })));
+
+        // A command the engine would refuse (the actor is not ready at that tick).
+        let mut early = log.clone();
+        let first_command = early.iter().position(|(_, _, c)| c.is_some()).unwrap();
+        early[first_command].0 = 0;
+        assert!(replay_all(&rules, &setup, &early).is_err());
+
+        // A tick far in the future is a tick mismatch, not a hang or a panic.
+        let mut replay = BattleReplay::start(&rules, &setup).unwrap();
+        let huge = replay.apply(u64::MAX, &[], None).unwrap_err();
+        assert!(matches!(huge, Divergence::TickMismatch { .. } | Divergence::EventsDiffer { .. }), "{huge}");
+
+        // A peer with other game data builds another battle and disagrees at once.
+        let weaker = SyntheticRules { enemy_hp: 100 };
+        let divergence = replay_all(&weaker, &setup, &log).unwrap_err();
+        assert!(!divergence.to_string().is_empty());
+    }
+
+    #[test]
+    fn battle_data_that_is_not_game_data_is_an_error() {
+        assert!(matches!(Ff7BattleData::from_bytes(b"", b""), Err(Ff7BattleDataError::Scene(_))));
+        assert!(matches!(Ff7BattleData::from_bytes(&[0u8; 100], &[0u8; 10]), Err(Ff7BattleDataError::Scene(_))));
+        let missing = std::path::Path::new("/definitely/not/here/scene.bin");
+        let err = Ff7BattleData::open(missing, missing).unwrap_err();
+        assert!(matches!(err, Ff7BattleDataError::Io { what: "scene.bin", .. }), "{err}");
+    }
+
+    #[test]
+    fn the_data_fingerprint_binds_both_files_and_their_boundary() {
+        let a = battle_data_fingerprint(b"ab", b"c");
+        assert_eq!(a, battle_data_fingerprint(b"ab", b"c"));
+        assert_ne!(a, battle_data_fingerprint(b"a", b"bc"), "moving the boundary changes it");
+        assert_ne!(a, battle_data_fingerprint(b"ab", b"d"));
+        assert_ne!(a, battle_data_fingerprint(b"xb", b"c"));
+        assert_ne!(a, SyntheticRules::FINGERPRINT);
+    }
+
+    #[test]
+    fn rejections_say_what_to_do() {
+        for r in [
+            BattleRejection::Unsupported,
+            BattleRejection::DebugDisabled,
+            BattleRejection::AlreadyInBattle,
+            BattleRejection::UnknownFormation,
+            BattleRejection::NotInBattle,
+            BattleRejection::NotYourActor,
+            BattleRejection::GaugeNotFull,
+            BattleRejection::ActorDead,
+            BattleRejection::InvalidTarget,
+            BattleRejection::TargetDead,
+            BattleRejection::BattleOver,
+        ] {
+            assert!(!r.to_string().is_empty());
+        }
+        assert!(BattleRejection::DebugDisabled.to_string().contains("--debug-encounters"));
+        assert_eq!(BattleId(4).to_string(), "battle#4");
+    }
+}

@@ -48,6 +48,13 @@
 //! is milliseconds of the `Instant`s the caller passes in. Placement
 //! (`fmv_party::InstanceSelector`) is told to each player on join and whenever a party change
 //! alters it; it is informational: there is one hosted area, one instance.
+//!
+//! # Battles
+//!
+//! A server with battle support runs shared battles in the world (see the `battle` module): a
+//! player in a battle is frozen (its moves are ignored), the engine is stepped on the world tick
+//! and every member is told what happened. The area's random-encounter table, if it has one, is
+//! rolled as players walk.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -57,14 +64,16 @@ use std::time::{Duration, Instant};
 use fmv_adapter_api::{AreaRuntime, MoveResult};
 use fmv_core::{AccountId, AnimState, AreaId, AvatarAppearance, EntityId, EntitySnapshot, PhaseKey, Pos, SessionId};
 use fmv_party::{InstanceSelector, Invite, PartyConfig, PartyEvent, PartyManager, PhaseMap, Placement, Tick};
-use fmv_protocol::{PartyName, ServerMsg};
+use fmv_protocol::{BattleId, PartyName, ServerMsg};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, warn};
 
 use crate::ServerError;
 
+mod battle;
 mod party;
+pub use battle::BattleReply;
 pub use party::PartyOutcome;
 
 /// A message queued for one or more connections. Broadcasts share one allocation.
@@ -161,6 +170,10 @@ struct Player {
     invites: VecDeque<Instant>,
     /// What the last `InstancePlacement` sent to this player said.
     placement: Option<Placement>,
+    /// The battle this player is in, if any: it is frozen in the field until that battle ends.
+    battle: Option<BattleId>,
+    /// Horizontal distance walked since the last random-encounter roll.
+    walked: f64,
 }
 
 /// Everything the world needs to admit a player into the area.
@@ -198,6 +211,8 @@ pub enum MoveOutcome {
     Applied,
     /// The move was refused. `corrected` is the authoritative position to send back.
     Rejected { corrected: Pos, reason: Rejection },
+    /// The player is in a battle: the move is ignored (not applied, not answered).
+    Frozen,
     /// The entity is no longer in the world (dropped or disconnected).
     Gone,
 }
@@ -218,6 +233,8 @@ pub struct World {
     parties: PartyManager,
     /// Origin of the party clock: party `Tick`s are milliseconds since this instant.
     epoch: Instant,
+    /// Battle support (`None`: this server cannot run battles). See `battle`.
+    battle: Option<battle::BattleWorld>,
 }
 
 impl World {
@@ -250,6 +267,7 @@ impl World {
             by_account: BTreeMap::new(),
             parties: PartyManager::new(party),
             epoch: Instant::now(),
+            battle: None,
         })
     }
 
@@ -304,6 +322,8 @@ impl World {
                 party_seq: 0,
                 invites: VecDeque::new(),
                 placement: None,
+                battle: None,
+                walked: 0.0,
             },
         );
         self.by_account.insert(account, entity);
@@ -344,6 +364,9 @@ impl World {
     fn remove_player(&mut self, entity: EntityId, failed: &mut Vec<(EntityId, bool)>) -> Option<Player> {
         let player = self.players.remove(&entity)?;
         self.by_account.remove(&player.account);
+        if let Some(battle) = player.battle {
+            self.member_gone(battle, entity);
+        }
         self.leave_party_state(&player, failed);
         let left = Arc::new(ServerMsg::PlayerLeft { entity });
         for (id, other) in &self.players {
@@ -361,6 +384,9 @@ impl World {
         let Some(p) = self.players.get_mut(&entity) else {
             return MoveOutcome::Gone;
         };
+        if p.battle.is_some() {
+            return MoveOutcome::Frozen;
+        }
         let from = p.snapshot.pos;
         if !to.is_finite() || !facing.is_finite() {
             return MoveOutcome::Rejected { corrected: from, reason: Rejection::NonFinite };
@@ -381,6 +407,8 @@ impl World {
                 p.snapshot.anim = anim;
                 p.budget.tokens -= dist;
                 p.dirty |= changed;
+                // Walking is what rolls random encounters (a no-op without an encounter table).
+                self.roll_encounter(entity, dist, now);
                 MoveOutcome::Applied
             }
             Chord::Blocked { place } => {

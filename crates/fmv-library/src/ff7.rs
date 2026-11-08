@@ -85,6 +85,12 @@ pub enum Ff7ResolveError {
     UnusableSet { set: String, why: String },
     #[error("library set {0:?} has no flevel.lgp (the FF7 field archive): import it again from a complete install")]
     NoFlevel(String),
+    /// A set without `scene.bin` or `kernel.bin` (the FF7 battle data).
+    #[error("library set {set:?} has no {file} (FF7 battle data): import it again from a complete install")]
+    NoBattleFile { set: String, file: &'static str },
+    /// Battle data is only found through a library set, never through a bare `flevel.lgp`.
+    #[error("battle data (scene.bin, kernel.bin) is only read from an imported library set; a direct --ff7-flevel has none")]
+    BattleNeedsLibrary,
 }
 
 /// A `flevel.lgp` found on this machine and the provenance it is to be presented with.
@@ -222,6 +228,106 @@ pub fn resolve_flevel(source: &Ff7Source) -> Result<ResolvedFlevel, Ff7ResolveEr
                 origin: "direct flevel.lgp".to_string(),
             })
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Battle data (scene.bin, kernel.bin)
+// ---------------------------------------------------------------------------------------------
+
+/// The FF7 battle data files of a library set, and the provenance of that set. The server and
+/// every client resolve their own copy with [`resolve_battle_files`]; the files are decoded by
+/// `fmv-ff7-battle` (this crate does not depend on it) and are never sent over the network.
+#[derive(Debug, Clone)]
+pub struct ResolvedBattleFiles {
+    /// `scene.bin`: the enemy formations and stat records.
+    pub scene: PathBuf,
+    /// `kernel.bin`: character growth curves, starting data, weapons and armor.
+    pub kernel: PathBuf,
+    /// Unchanged from the library manifest (install path included): never put it on the wire.
+    pub provenance: EditionProvenance,
+    /// Path-free description for logs ("library set <id>").
+    pub origin: String,
+}
+
+/// The logical path of `file_name` in `m`: the preferred paths first (the Steam language
+/// directory, then the classic layout), then the only entry of that name anywhere else.
+fn battle_logical_path(m: &Manifest, preferred: &[String], file_name: &str) -> Option<String> {
+    if let Some(path) = preferred.iter().find(|p| m.find(p).is_some()) {
+        return Some(path.clone());
+    }
+    let mut any = m
+        .entries
+        .iter()
+        .filter(|e| e.logical_path.rsplit('/').next() == Some(file_name));
+    match (any.next(), any.next()) {
+        (Some(only), None) => Some(only.logical_path.clone()),
+        _ => None,
+    }
+}
+
+/// Find `scene.bin` and `kernel.bin` of an imported library set. `state_dir` of `None` is the
+/// default state directory; `set` of `None` is the only FF7 PC set (call it with the same
+/// arguments as [`resolve_library_flevel`] so both read the same set). Opens the library
+/// read-only (nothing is created or written).
+pub fn resolve_library_battle_files(
+    state_dir: Option<&Path>,
+    set: Option<&str>,
+) -> Result<ResolvedBattleFiles, Ff7ResolveError> {
+    let dir = resolve_state_dir(state_dir)?;
+    let lib = Library::open_existing(&dir).map_err(|e| match e {
+        LibraryError::NoLibrary(_) => Ff7ResolveError::NoLibrary {
+            dir: dir.display().to_string(),
+        },
+        other => Ff7ResolveError::Library(other),
+    })?;
+    let (set_id, manifest) = pick_set(&lib, set)?;
+    let language = manifest.provenance.language.to_ascii_lowercase();
+    let scene_logical = battle_logical_path(
+        &manifest,
+        &[
+            format!("data/lang-{language}/battle/scene.bin"),
+            "data/battle/scene.bin".to_string(),
+        ],
+        "scene.bin",
+    )
+    .ok_or_else(|| Ff7ResolveError::NoBattleFile {
+        set: set_id.clone(),
+        file: "scene.bin",
+    })?;
+    let kernel_logical = battle_logical_path(
+        &manifest,
+        &[
+            format!("data/lang-{language}/kernel/kernel.bin"),
+            "data/kernel/kernel.bin".to_string(),
+        ],
+        "kernel.bin",
+    )
+    .ok_or_else(|| Ff7ResolveError::NoBattleFile {
+        set: set_id.clone(),
+        file: "kernel.bin",
+    })?;
+    let blob = |logical: &str, file: &'static str| -> Result<PathBuf, Ff7ResolveError> {
+        lib.get(&set_id, logical)?
+            .ok_or_else(|| Ff7ResolveError::NoBattleFile {
+                set: set_id.clone(),
+                file,
+            })
+    };
+    Ok(ResolvedBattleFiles {
+        scene: blob(&scene_logical, "scene.bin")?,
+        kernel: blob(&kernel_logical, "kernel.bin")?,
+        provenance: manifest.provenance,
+        origin: format!("library set {set_id}"),
+    })
+}
+
+/// Find the battle data files for `source`: a library set has them, a bare `flevel.lgp` does
+/// not ([`Ff7ResolveError::BattleNeedsLibrary`]).
+pub fn resolve_battle_files(source: &Ff7Source) -> Result<ResolvedBattleFiles, Ff7ResolveError> {
+    match source {
+        Ff7Source::Library { state_dir, set } => resolve_library_battle_files(state_dir.as_deref(), set.as_deref()),
+        Ff7Source::Flevel { .. } => Err(Ff7ResolveError::BattleNeedsLibrary),
     }
 }
 
@@ -496,5 +602,96 @@ mod tests {
         })
         .unwrap();
         assert!(from_library.provenance.compatible_with(&direct.provenance));
+    }
+
+    #[test]
+    fn battle_files_follow_the_same_set_and_layout_rules_as_the_field_archive() {
+        let state = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let lib = Library::open(state.path()).unwrap();
+        let id = make_set(
+            &lib,
+            provenance("Steam", "en"),
+            &[
+                ("data/field/flevel.lgp", b"field"),
+                ("data/battle/scene.bin", b"classic-scene"),
+                ("data/lang-en/battle/scene.bin", b"steam-scene"),
+                ("data/lang-en/kernel/kernel.bin", b"steam-kernel"),
+                ("data/lang-en/kernel/kernel2.bin", b"text"),
+            ],
+            scratch.path(),
+        );
+        let r = resolve_battle_files(&lib_source(state.path(), None)).unwrap();
+        // The language directory wins over the classic layout, and kernel2.bin is not kernel.bin.
+        assert_eq!(fs::read(&r.scene).unwrap(), b"steam-scene");
+        assert_eq!(fs::read(&r.kernel).unwrap(), b"steam-kernel");
+        assert_eq!(r.origin, format!("library set {id}"));
+        assert_eq!(r.provenance.edition, "Steam");
+        // It is the very set the field archive comes from.
+        let field = resolve_flevel(&lib_source(state.path(), None)).unwrap();
+        assert_eq!(field.origin, r.origin);
+        assert!(!r.origin.contains("private"));
+    }
+
+    #[test]
+    fn battle_files_in_the_classic_layout_or_alone_elsewhere_are_found() {
+        let scratch = tempfile::tempdir().unwrap();
+        for (scene, kernel) in [
+            ("data/battle/scene.bin", "data/kernel/kernel.bin"),
+            ("data/odd/scene.bin", "data/else/where/kernel.bin"),
+        ] {
+            let state = tempfile::tempdir().unwrap();
+            let lib = Library::open(state.path()).unwrap();
+            make_set(
+                &lib,
+                provenance("PC 1998", "en"),
+                &[(scene, b"s"), (kernel, b"k"), ("data/field/flevel.lgp", b"f")],
+                scratch.path(),
+            );
+            let r = resolve_battle_files(&lib_source(state.path(), None)).unwrap();
+            assert_eq!((fs::read(&r.scene).unwrap(), fs::read(&r.kernel).unwrap()), (b"s".to_vec(), b"k".to_vec()), "{scene}");
+        }
+    }
+
+    #[test]
+    fn missing_or_ambiguous_battle_files_name_what_is_missing() {
+        let scratch = tempfile::tempdir().unwrap();
+        // No kernel.bin.
+        let state = tempfile::tempdir().unwrap();
+        let lib = Library::open(state.path()).unwrap();
+        let id = make_set(
+            &lib,
+            provenance("Steam", "en"),
+            &[("data/lang-en/battle/scene.bin", b"s"), ("data/field/flevel.lgp", b"f")],
+            scratch.path(),
+        );
+        let err = resolve_battle_files(&lib_source(state.path(), None)).unwrap_err();
+        assert!(matches!(err, Ff7ResolveError::NoBattleFile { ref set, file: "kernel.bin" } if *set == id), "{err}");
+        assert!(err.to_string().contains("kernel.bin"), "{err}");
+
+        // Two scene.bin files and none in a preferred place: never guessed.
+        let state = tempfile::tempdir().unwrap();
+        let lib = Library::open(state.path()).unwrap();
+        make_set(
+            &lib,
+            provenance("Steam", "en"),
+            &[("data/a/scene.bin", b"a"), ("data/b/scene.bin", b"b"), ("data/lang-en/kernel/kernel.bin", b"k")],
+            scratch.path(),
+        );
+        let err = resolve_battle_files(&lib_source(state.path(), None)).unwrap_err();
+        assert!(matches!(err, Ff7ResolveError::NoBattleFile { file: "scene.bin", .. }), "{err}");
+
+        // No library at all points at fmv-import, and nothing is created.
+        let empty = tempfile::tempdir().unwrap();
+        let err = resolve_battle_files(&lib_source(empty.path(), None)).unwrap_err();
+        assert!(matches!(err, Ff7ResolveError::NoLibrary { .. }), "{err}");
+        assert!(fs::read_dir(empty.path()).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn a_direct_flevel_has_no_battle_files() {
+        let err = resolve_battle_files(&Ff7Source::Flevel { path: "/x/flevel.lgp".into(), labels: Ff7Labels::default() }).unwrap_err();
+        assert!(matches!(err, Ff7ResolveError::BattleNeedsLibrary), "{err}");
+        assert!(err.to_string().contains("library"), "{err}");
     }
 }

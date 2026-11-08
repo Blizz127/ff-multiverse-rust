@@ -1,10 +1,13 @@
 //! A joined session: the local area, the replicated state and the network handle, shared by the
 //! headless bot loop and the window loop.
 
+use crate::battle::BattleCmd;
 use crate::net::{Joined, NetCommand, NetEvent, NetHandle, PartyCommand};
 use crate::state::ClientState;
 use fmv_adapter_api::AreaRuntime;
 use fmv_core::{AreaId, AvatarAppearance, EntityId, EntitySnapshot, Pos};
+use fmv_protocol::BattleRules;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// What we know about the joined area (for titles, banners and logs).
@@ -149,6 +152,27 @@ impl Session {
     pub fn log_party_notes(&mut self) {
         for line in self.state.party.drain_notes() {
             eprintln!("party: {line}");
+        }
+    }
+
+    /// Give the battle mirror this machine's own battle data (`None`: it cannot replay battles).
+    pub fn set_battle_rules(&mut self, rules: Option<Arc<dyn BattleRules>>) {
+        self.state.battle.set_rules(rules);
+    }
+
+    /// Send a battle request or command (the server decides and answers with battle messages or
+    /// `BattleRejected`). A command is remembered as in flight, so it is not sent twice.
+    pub fn send_battle(&mut self, cmd: BattleCmd) {
+        let now = self.now();
+        self.state.battle.note_sent(&cmd, now);
+        self.net.send(NetCommand::Battle(cmd));
+    }
+
+    /// Print what happened in battle since the last call, one `battle:` line each, on stderr
+    /// (never stdout: the headless bot's stdout carries exactly one line).
+    pub fn log_battle_notes(&mut self) {
+        for line in self.state.battle.drain_notes() {
+            eprintln!("battle: {line}");
         }
     }
 

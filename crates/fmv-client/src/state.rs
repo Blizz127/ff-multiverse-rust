@@ -25,6 +25,7 @@
 //!   for a while and the two diverge. It is remembered until then, because the server sends only
 //!   changes: an update that arrives while we are busy would otherwise be lost for good.
 
+use crate::battle::BattleClient;
 use crate::interp::{normalize_angle, Pose, Sample, SnapshotBuffer};
 use crate::party::{nearest_peer, PartyMirror};
 use fmv_adapter_api::{AreaRuntime, MoveResult};
@@ -267,6 +268,8 @@ pub struct ClientState {
     pub own: OwnPlayer,
     /// Our party and pending invites, as the server announced them.
     pub party: PartyMirror,
+    /// The battle we are in, replayed from the server's messages (see `crate::battle`).
+    pub battle: BattleClient,
     remotes: BTreeMap<EntityId, Remote>,
     peers_seen: BTreeSet<EntityId>,
     updates: u64,
@@ -283,6 +286,7 @@ impl ClientState {
             area,
             own: OwnPlayer::new(spawn),
             party: PartyMirror::new(account),
+            battle: BattleClient::new(account),
             remotes: BTreeMap::new(),
             peers_seen: BTreeSet::new(),
             updates: 0,
@@ -366,6 +370,12 @@ impl ClientState {
             ServerMsg::PartyEvent { seq, event, names } => self.party.on_event(seq, event, names),
             ServerMsg::PartyState { seq, party, invites, names } => self.party.on_state(seq, party, invites, names),
             ServerMsg::PartyRejected { error } => self.party.on_rejected(&error),
+            // Battle traffic never ends the session: the battle mirror judges it (and says so
+            // loudly when the replay diverges).
+            msg @ (ServerMsg::EncounterStart { .. }
+            | ServerMsg::BattleEvent { .. }
+            | ServerMsg::BattleEnd { .. }
+            | ServerMsg::BattleRejected { .. }) => self.battle.on_message(now, msg),
         }
         None
     }

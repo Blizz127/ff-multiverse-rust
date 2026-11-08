@@ -51,6 +51,51 @@ pub struct Bounds {
     pub max: Pos,
 }
 
+/// One possible random encounter of an area: which battle, and how likely relative to the
+/// other entries of the same table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncounterEntry {
+    /// The adapter's own battle id (FF7: the formation id, `scene * 4 + slot`).
+    pub formation: u16,
+    /// Relative likelihood within the table (FF7 stores it out of 64). `0` is never picked.
+    pub weight: u16,
+}
+
+/// An area's random-encounter table: how often walking triggers a roll, and what it can turn up.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EncounterTable {
+    /// How easily a step triggers an encounter, on the adapter's own `0..=255` scale. `0` means
+    /// the area has no random encounters.
+    pub rate: u8,
+    pub entries: Vec<EncounterEntry>,
+}
+
+impl EncounterTable {
+    /// Sum of the weights (the exclusive upper bound of [`EncounterTable::pick`]'s roll).
+    pub fn total_weight(&self) -> u32 {
+        self.entries.iter().map(|e| u32::from(e.weight)).sum()
+    }
+
+    /// True when walking can never trigger a battle here (rate 0, or nothing to pick).
+    pub fn is_empty(&self) -> bool {
+        self.rate == 0 || self.total_weight() == 0
+    }
+
+    /// The formation a `roll` in `0..total_weight()` selects, the weights laid end to end in
+    /// entry order. `None` if the table is empty or `roll` is out of range.
+    pub fn pick(&self, roll: u32) -> Option<u16> {
+        let mut rest = roll;
+        for e in &self.entries {
+            let w = u32::from(e.weight);
+            if rest < w {
+                return Some(e.formation);
+            }
+            rest -= w;
+        }
+        None
+    }
+}
+
 /// Loaded, server- or client-side runtime for one area. Holds decoded data from the local
 /// owned copy only; nothing here is ever serialized onto the network.
 pub trait AreaRuntime: Send + Sync {
@@ -63,6 +108,45 @@ pub trait AreaRuntime: Send + Sync {
     fn walk_triangles(&self) -> Vec<[Pos; 3]>;
     /// Maximum allowed movement speed in adapter units per second (server enforces).
     fn max_speed(&self) -> f32;
+    /// The area's random-encounter table, if it has one (the server rolls it as players walk).
+    /// Additive in protocol v3: adapters that do not know encounters keep the default `None`.
+    fn encounters(&self) -> Option<EncounterTable> {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn table(rate: u8, weights: &[(u16, u16)]) -> EncounterTable {
+        EncounterTable {
+            rate,
+            entries: weights.iter().map(|&(formation, weight)| EncounterEntry { formation, weight }).collect(),
+        }
+    }
+
+    #[test]
+    fn picking_lays_the_weights_end_to_end() {
+        let t = table(8, &[(10, 3), (20, 0), (30, 61)]);
+        assert_eq!(t.total_weight(), 64);
+        let picked: Vec<u16> = (0..64).map(|r| t.pick(r).unwrap()).collect();
+        assert_eq!(picked.iter().filter(|&&f| f == 10).count(), 3);
+        assert_eq!(picked.iter().filter(|&&f| f == 30).count(), 61);
+        assert!(!picked.contains(&20), "a weight of zero is never picked");
+        assert_eq!(&picked[..4], &[10, 10, 10, 30]);
+        assert_eq!(t.pick(64), None, "out of range");
+    }
+
+    #[test]
+    fn a_table_without_rate_or_weight_is_empty() {
+        assert!(table(0, &[(1, 64)]).is_empty());
+        assert!(table(9, &[]).is_empty());
+        assert!(table(9, &[(1, 0)]).is_empty());
+        assert!(!table(1, &[(1, 1)]).is_empty());
+        assert!(EncounterTable::default().is_empty());
+        assert_eq!(EncounterTable::default().pick(0), None);
+    }
 }
 
 /// A game adapter bound to one owned-content source (or the synthetic fixture).

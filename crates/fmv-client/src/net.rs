@@ -20,6 +20,7 @@
 //!   never logged, and appears in text only in [`NetError::TokenNotSaved`], the one case where
 //!   showing it is the user's only way to keep the account.
 
+use crate::battle::BattleCmd;
 use crate::cli::exit;
 use crate::state::Intent;
 use fmv_adapter_api::{AreaRuntime, GameAdapter};
@@ -205,6 +206,7 @@ impl PartyCommand {
 pub enum NetCommand {
     Intent(Intent),
     Party(PartyCommand),
+    Battle(BattleCmd),
     Leave,
 }
 
@@ -563,7 +565,11 @@ where
             other @ (ServerMsg::InstancePlacement { .. }
             | ServerMsg::PartyEvent { .. }
             | ServerMsg::PartyState { .. }
-            | ServerMsg::PartyRejected { .. }) => push_backlog(&mut backlog, other),
+            | ServerMsg::PartyRejected { .. }
+            | ServerMsg::EncounterStart { .. }
+            | ServerMsg::BattleEvent { .. }
+            | ServerMsg::BattleEnd { .. }
+            | ServerMsg::BattleRejected { .. }) => push_backlog(&mut backlog, other),
         }
         if let (Some(_), Some(_), Some(_)) = (&welcome, &offer, &snapshot) {
             let (Some(w), Some(o), Some(entities)) = (welcome, offer, snapshot) else {
@@ -662,6 +668,7 @@ async fn session_loop<R, W>(
             cmd = cmd_rx.recv() => match cmd {
                 Some(NetCommand::Intent(i)) => ClientMsg::MoveIntent { seq: i.seq, pos: i.pos, facing: i.facing, anim: i.anim },
                 Some(NetCommand::Party(p)) => p.to_msg(),
+                Some(NetCommand::Battle(b)) => b.to_msg(),
                 Some(NetCommand::Leave) | None => {
                     let _ = timeout(WRITE_TIMEOUT, write_msg(&mut wr, &ClientMsg::Leave)).await;
                     break;
