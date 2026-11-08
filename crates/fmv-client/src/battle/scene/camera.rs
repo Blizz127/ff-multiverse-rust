@@ -100,6 +100,12 @@ impl BattleCamera {
         self.position
     }
 
+    /// The camera's axes in battle space (unit vectors): right, down and forward, what the effects
+    /// that face the camera are turned by.
+    pub fn axes(&self) -> (V3, V3, V3) {
+        (self.right, self.down, self.forward)
+    }
+
     /// The direction the camera looks in.
     pub fn forward(&self) -> V3 {
         self.forward

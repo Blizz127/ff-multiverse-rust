@@ -73,6 +73,10 @@ pub fn open_ff7(source: &Ff7Source) -> Result<OpenedFf7, Ff7OpenError> {
         if battle_lgp.is_some() { "this machine's own battle.lgp found" } else { "no battle.lgp (battles are drawn with stand-ins)" }
     );
     crate::battle::scene::model::remember_battle_lgp(battle_lgp);
+    // The clips the enemies' attacks play are named by `scene.bin` (presentation only, read on this
+    // machine like the models; a direct `flevel.lgp` has none and the enemies then play no attack clip).
+    let scene_bin = fmv_library::ff7::resolve_battle_files(source).ok().map(|files| files.scene);
+    crate::battle::scene::model::remember_scene_bin(scene_bin);
     Ok(OpenedFf7 { adapter: Arc::new(adapter), origin: resolved.origin })
 }
 

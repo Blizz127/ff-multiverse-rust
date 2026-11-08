@@ -22,6 +22,16 @@
 //! its scene's name (no banner when the scene has none), `Defend`; a plain attack says nothing. When
 //! several actions arrive together the last one wins.
 //!
+//! # Numbers and the enemy list follow the blow
+//!
+//! The battle's state moves when a message arrives (bars, the menu, the command that is applied), but
+//! the SHOW lags a little by design, never by more than [`cue::MAX_IMPACT_DELAY`]: a number floats up
+//! when its blow lands ([`Popups`], scheduled with [`cue::delay_of`]), and an enemy that was beaten
+//! stays in the enemy list until its collapse begins on screen ([`BattleHud::decorate`] and
+//! [`BattleHud::linger_view`] keep it, at the most [`cue::MAX_DEATH_DELAY`] after the blow arrived).
+//! Everything else (gauges, HP, MP, the banner, the menu) follows the state at once. The scene plays
+//! its clips so that the impact frame lands at the same instants: see [`cue`].
+//!
 //! # The linger
 //!
 //! When the server ends the battle, the client drops its mirror at once (the player is free in the
@@ -33,6 +43,7 @@ use super::menu::{BattleMenu, BattleMenuModel, Ctx, Fighter, MenuKey, Reply};
 use super::names::{item_name, spell_name, NameBook};
 use super::panels::{Banner, Finale, RewardLine, BANNER_S, PANEL_DELAY_MS};
 use super::popups::Popups;
+use super::scene::cue;
 use super::view::{Bar, BattleView};
 use fmv_ff7_battle::rules::{ActionRef, ActorId, BattleEvent, Outcome};
 use std::sync::Arc;
@@ -66,6 +77,9 @@ pub struct BattleHud {
     formation: u16,
     names: Option<Arc<NameBook>>,
     ended: Option<Ended>,
+    /// Fighters whose death is on its way to the screen, and when their collapse begins there: a beaten
+    /// enemy stays in the enemy list until then.
+    dying: Vec<(ActorId, f64)>,
 }
 
 /// The party members and enemies of `bars` as the menu sees them.
@@ -95,6 +109,7 @@ impl BattleHud {
         self.popups.clear();
         self.banner = None;
         self.ended = None;
+        self.dying.clear();
         self.my_actor = my_actor;
         self.formation = formation;
     }
@@ -128,6 +143,9 @@ impl BattleHud {
 
     /// The words the banner shows for `action`, if it shows any (see the module docs).
     fn action_text(&self, action: ActionRef) -> Option<String> {
+        // TODO(v7): `ActionRef::Limit(id)` is named by `spell_name(self.names(), id)` (the kernel's "Names -
+        // magic" table: Braver 128, Big Shot 135, Healing Wind 142, Beat Rush 149) and `ActionRef::Escape`
+        // says nothing (its words belong to the panels).
         match action {
             ActionRef::Attack => None,
             ActionRef::Defend => Some("Defend".to_string()),
@@ -141,6 +159,16 @@ impl BattleHud {
     /// own character being applied.
     pub fn on_events(&mut self, now: f64, events: &[BattleEvent], my_command: bool) {
         self.popups.on_events(now, events);
+        self.dying.retain(|(_, due)| *due > now);
+        for cue in cue::cues(events) {
+            let action = cue.action.map(|(_, a)| a);
+            for event in cue.events {
+                if let BattleEvent::Death { actor } = *event {
+                    self.dying.retain(|(who, _)| *who != actor);
+                    self.dying.push((actor, now + cue::delay_of(action, event)));
+                }
+            }
+        }
         for event in events {
             if let BattleEvent::Action { action, .. } = event {
                 if let Some(text) = self.action_text(*action) {
@@ -168,6 +196,19 @@ impl BattleHud {
         if let Some(mp) = turn_mp(view) {
             let (allies, enemies) = (fighters(&view.party), fighters(&view.enemies));
             view.menu = Some(self.menu.view(&Ctx { model: &self.model, allies: &allies, enemies: &enemies, mp }));
+        }
+        // After the menu has taken its targets from the state: the list alone lingers on a corpse.
+        self.hold_dying(view, now);
+    }
+
+    /// Keep the enemies whose death has not begun on screen yet in the view's list (`alive` is what
+    /// the list shows; the menu has already chosen its targets). Party members are never held: their
+    /// panel is the state.
+    fn hold_dying(&self, view: &mut BattleView, now: f64) {
+        for bar in view.enemies.iter_mut().filter(|b| !b.alive) {
+            if self.dying.iter().any(|(who, due)| *who == bar.actor && now < *due) {
+                bar.alive = true;
+            }
         }
     }
 
@@ -199,6 +240,7 @@ impl BattleHud {
         view.popups = self.popups.views(now);
         view.menu = None;
         view.banner = None;
+        self.hold_dying(&mut view, now);
         view.finale = Some(Finale {
             outcome: ended.outcome,
             reward: ended.reward.clone(),
@@ -329,12 +371,89 @@ mod tests {
             hud.decorate(&mut v, now);
             v.popups
         };
-        assert_eq!(at(&hud, 10.0).len(), 2);
-        assert_eq!(at(&hud, 10.0)[0].kind, PopupKind::Damage { amount: 42, critical: false });
+        // They appear when the blow lands, not when the event arrives (these two came with no announced
+        // action: the short beat), and then rise and go with the clock.
+        assert!(at(&hud, 10.0).is_empty(), "the blow has not landed yet");
+        let landed = 10.0 + cue::impact_delay(None);
+        assert_eq!(at(&hud, landed).len(), 2);
+        assert_eq!(at(&hud, landed)[0].kind, PopupKind::Damage { amount: 42, critical: false });
         assert!(at(&hud, 12.0).is_empty(), "gone after their lifetime");
         // A new battle forgets them.
         hud.begin(1, None);
-        assert!(at(&hud, 10.0).is_empty());
+        assert!(at(&hud, landed).is_empty());
+    }
+
+    /// Us (actor 1) and a friend against two enemies, the second of them beaten.
+    fn view_with_dead_enemy() -> BattleView {
+        let mut v = view(false);
+        v.enemies[1].alive = false;
+        v.enemies[1].hp = 0;
+        v
+    }
+
+    fn listed(hud: &BattleHud, now: f64) -> Vec<u8> {
+        let mut v = view_with_dead_enemy();
+        hud.decorate(&mut v, now);
+        v.enemies.iter().filter(|b| b.alive).map(|b| b.actor.0).collect()
+    }
+
+    #[test]
+    fn a_beaten_enemy_stays_in_the_list_until_its_collapse_begins_and_never_longer_than_the_cap() {
+        let mut hud = hud();
+        let batch = [action(0, ActionRef::Attack), BattleEvent::Damage { actor: ActorId(0), target: ActorId(3), amount: 99, critical: false }, BattleEvent::Death { actor: ActorId(3) }];
+        hud.on_events(10.0, &batch, false);
+        // The state says it is dead the moment the message arrived, but the list keeps it until the
+        // blow has landed and it has flinched: that is when its collapse begins on the screen.
+        let collapse = 10.0 + cue::impact_delay(Some(ActionRef::Attack)) + cue::DEATH_BEAT;
+        assert_eq!(listed(&hud, 10.0), [2, 3], "still listed on arrival");
+        assert_eq!(listed(&hud, collapse - 0.01), [2, 3]);
+        assert_eq!(listed(&hud, collapse), [2], "gone when the collapse begins");
+        assert!(collapse - 10.0 <= cue::MAX_DEATH_DELAY);
+        // The state alone decides who else is listed: the living enemy always is, and nobody who is
+        // dead without a death on its way (a scene that started late) is held.
+        let other = {
+            let mut v = view(false);
+            v.enemies[0].alive = false;
+            hud.decorate(&mut v, 10.0);
+            v.enemies[0].alive
+        };
+        assert!(!other, "only the enemy whose death is coming is held");
+        // A new battle forgets what was dying.
+        hud.begin(2, None);
+        assert_eq!(listed(&hud, 10.0), [2]);
+    }
+
+    #[test]
+    fn holding_a_beaten_enemy_in_the_list_does_not_make_it_a_target_and_never_holds_the_party() {
+        let mut hud = hud();
+        hud.on_events(10.0, &[action(1, ActionRef::Attack), BattleEvent::Death { actor: ActorId(3) }, BattleEvent::Death { actor: ActorId(0) }], false);
+        // Our turn: Attack, then the target selection.
+        let ready = {
+            let mut v = view_with_dead_enemy();
+            v.party[1].ready = true;
+            v.party[0].alive = false;
+            v
+        };
+        hud.press(MenuKey::Confirm, &ready);
+        let mut dressed = ready.clone();
+        hud.decorate(&mut dressed, 10.1);
+        let aim = dressed.menu.expect("our menu").aim.expect("the pointer");
+        assert_eq!(aim.target, ActorId(2), "the pointer is on the living enemy, not on the one still listed");
+        assert!(dressed.enemies[1].alive, "though the list still shows it");
+        assert!(!dressed.party[0].alive, "a fallen party member is shown fallen at once: the panel is the state");
+    }
+
+    #[test]
+    fn the_last_enemy_is_still_listed_in_the_linger_view_until_its_collapse_begins() {
+        let mut hud = hud();
+        hud.on_events(20.0, &[action(1, ActionRef::Attack), BattleEvent::Damage { actor: ActorId(1), target: ActorId(2), amount: 9, critical: true }, BattleEvent::Death { actor: ActorId(2) }, BattleEvent::Victory], true);
+        let mut last = view(false);
+        last.enemies[0].alive = false;
+        last.enemies[1].alive = false;
+        hud.finish(20.0, last, Outcome::Victory, None);
+        let listed_at = |now: f64| hud.linger_view(now).expect("lingering").enemies.iter().filter(|b| b.alive).map(|b| b.actor.0).collect::<Vec<_>>();
+        assert_eq!(listed_at(20.1), [2], "the beaten one is still there");
+        assert!(listed_at(20.0 + cue::MAX_DEATH_DELAY + 0.01).is_empty(), "then the list is empty for the panel");
     }
 
     #[test]
@@ -461,7 +580,9 @@ mod tests {
         let f = first.finale.as_ref().expect("the finale");
         assert_eq!((f.outcome, f.age_ms, f.dismissible), (Outcome::Victory, 100, false));
         assert_eq!(f.reward, Some(RewardLine { exp: 5, gil: 6, ap: 7, items: vec![] }));
-        assert_eq!(first.popups.len(), 1, "the last blow's number is still floating");
+        assert!(first.popups.is_empty(), "the last blow has not landed yet");
+        let landed = hud.linger_view(20.0 + cue::impact_delay(None) + 0.05).expect("lingering");
+        assert_eq!(landed.popups.len(), 1, "the last blow's number floats up when it lands, in the linger too");
         assert!(first.menu.is_none() && first.banner.is_none());
         assert_eq!(first.party.len(), 2, "the last view of the fighters");
         assert!(hud.linger_view(20.0 + LINGER_S).is_none());

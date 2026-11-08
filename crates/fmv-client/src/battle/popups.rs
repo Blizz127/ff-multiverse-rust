@@ -22,12 +22,21 @@
 //! Everything else says nothing over a fighter: gauges filling, deaths and the end, an `Action` (its
 //! name goes to the banner, see `hud`) and `MpSpent` (the caster's own MP bar shows it).
 //!
+//! # When a number is born
+//!
+//! Not when its event arrives: when the blow LANDS. [`Popups::on_events`] groups the batch into
+//! performances ([`cue::cues`]) and schedules each number [`cue::impact_delay`] after the batch's
+//! arrival, the very instant the scene's impact frame is played at (see [`cue`] for why the two
+//! agree without talking), never more than [`cue::MAX_IMPACT_DELAY`] later. A popup that is not
+//! born yet is not in [`Popups::views`].
+//!
 //! Popups over one fighter that are on screen together (a second hit lands while the first number is
 //! still rising) are kept apart where they are drawn, newest lowest: see `panels::draw_popups`.
 //!
 //! Everything that arrives here comes from the server: a popup over a fighter that does not exist
 //! simply finds no place on screen, and the list is bounded.
 
+use super::scene::cue;
 use fmv_ff7_battle::rules::{ActorId, BattleEvent};
 
 /// How long a popup stays, in seconds.
@@ -89,12 +98,15 @@ pub fn popup_of(event: &BattleEvent) -> Option<(ActorId, PopupKind)> {
 struct Born {
     target: ActorId,
     kind: PopupKind,
+    /// When it appears (possibly still ahead: a blow that has not landed yet).
     at: f64,
 }
 
 /// The popups of one battle.
 #[derive(Debug, Clone, Default)]
 pub struct Popups {
+    /// Oldest birth first (a number scheduled for a later impact goes behind one born earlier even
+    /// if it was pushed first).
     live: Vec<Born>,
 }
 
@@ -103,31 +115,42 @@ impl Popups {
         self.live.clear();
     }
 
-    /// A popup over `target`, starting `now` (seconds on the client's clock).
-    pub fn push(&mut self, now: f64, target: ActorId, kind: PopupKind) {
-        self.live.retain(|p| now - p.at < LIFETIME_S);
+    /// A popup over `target` that appears at `at` (seconds on the client's clock).
+    pub fn push(&mut self, at: f64, target: ActorId, kind: PopupKind) {
+        self.live.retain(|p| at - p.at < LIFETIME_S);
         if self.live.len() >= MAX_POPUPS {
             self.live.remove(0);
         }
-        self.live.push(Born { target, kind, at: now });
+        let place = self.live.iter().rposition(|p| p.at <= at).map_or(0, |i| i + 1);
+        self.live.insert(place, Born { target, kind, at });
     }
 
-    /// The popups the events make.
+    /// The popups the events of a batch that arrived at `now` make: each when its blow lands
+    /// ([`cue::delay_of`]), not when it arrived.
     pub fn on_events(&mut self, now: f64, events: &[BattleEvent]) {
-        for event in events {
-            if let Some((target, kind)) = popup_of(event) {
-                self.push(now, target, kind);
+        for cue in cue::cues(events) {
+            let action = cue.action.map(|(_, a)| a);
+            for event in cue.events {
+                if let Some((target, kind)) = popup_of(event) {
+                    self.push(now + cue::delay_of(action, event), target, kind);
+                }
             }
         }
     }
 
-    /// The popups on screen at `now`, oldest first.
+    /// The popups on screen at `now`, oldest first: born (not ahead of `now`) and not yet gone.
     pub fn views(&self, now: f64) -> Vec<Popup> {
         self.live
             .iter()
-            .filter(|p| now - p.at < LIFETIME_S)
+            .filter(|p| p.at <= now && now - p.at < LIFETIME_S)
             .map(|p| Popup { target: p.target, kind: p.kind, age_ms: ((now - p.at).max(0.0) * 1000.0).round() as u32 })
             .collect()
+    }
+
+    /// When each popup that has not been dropped appears, oldest first (tests).
+    #[cfg(test)]
+    pub fn births(&self) -> Vec<(ActorId, f64)> {
+        self.live.iter().map(|p| (p.target, p.at)).collect()
     }
 }
 
@@ -166,16 +189,20 @@ mod tests {
                 BattleEvent::Action { actor: ActorId(3), action: ActionRef::EnemyAttack(272) },
             ],
         );
-        let kinds: Vec<(u8, PopupKind)> = p.views(1.0).iter().map(|v| (v.target.0, v.kind)).collect();
+        // Nothing is up the moment the batch arrives: every blow still has to land.
+        assert!(p.views(1.0).is_empty());
+        // By the cap they are all up, in the order they land: the effects no action announced first
+        // (the short beat), then the two items, then the spell (the longest cast).
+        let kinds: Vec<(u8, PopupKind)> = p.views(1.0 + cue::MAX_IMPACT_DELAY).iter().map(|v| (v.target.0, v.kind)).collect();
         assert_eq!(
             kinds,
             [
                 (3, PopupKind::Damage { amount: 120, critical: false }),
                 (4, PopupKind::Damage { amount: 999, critical: true }),
                 (5, PopupKind::Miss),
-                (1, PopupKind::Heal { amount: 271 }),
                 (2, PopupKind::Mp { amount: 100 }),
                 (0, PopupKind::Heal { amount: 88 }),
+                (1, PopupKind::Heal { amount: 271 }),
             ],
             "a revival floats the HP the fighter came back with, like a heal"
         );
@@ -203,8 +230,8 @@ mod tests {
         assert_eq!(p.views(10.5)[0].age_ms, 500);
         assert_eq!(p.views(10.0 + LIFETIME_S - 0.001).len(), 1);
         assert!(p.views(10.0 + LIFETIME_S + 0.001).is_empty(), "gone at the end of its life");
-        // A clock that went backwards does not make an age out of nothing.
-        assert_eq!(p.views(9.0)[0].age_ms, 0);
+        // A clock that went backwards finds a popup that is not born yet: nothing, not an age out of nothing.
+        assert!(p.views(9.0).is_empty());
         // Pushing prunes what has expired.
         p.push(20.0, ActorId(4), PopupKind::Miss);
         assert_eq!(p.live.len(), 1);
@@ -218,6 +245,65 @@ mod tests {
         }
         let ages: Vec<(u8, u32)> = p.views(1.3).iter().map(|v| (v.target.0, v.age_ms)).collect();
         assert_eq!(ages, [(3, 300), (3, 200), (4, 100), (3, 50)]);
+    }
+
+    #[test]
+    fn a_number_is_born_when_its_blow_lands_and_never_later_than_the_cap_after_the_batch_arrived() {
+        use fmv_ff7_battle::rules::ActionRef as A;
+        for (what, expected) in [
+            (A::Attack, 0.50),
+            (A::EnemyAttack(272), 0.55),
+            (A::Magic(27), 0.60),
+            (A::Item(3), 0.45),
+        ] {
+            let mut p = Popups::default();
+            p.on_events(
+                7.0,
+                &[BattleEvent::Action { actor: ActorId(0), action: what }, BattleEvent::Damage { actor: ActorId(0), target: ActorId(3), amount: 12, critical: false }],
+            );
+            assert!(p.views(7.0).is_empty() && p.views(7.0 + expected - 0.001).is_empty(), "{what:?}: not before the blow lands");
+            let up = p.views(7.0 + expected);
+            assert_eq!(up.len(), 1, "{what:?}");
+            assert_eq!(up[0].age_ms, 0, "{what:?}: it starts rising at the impact");
+            assert!(expected <= cue::MAX_IMPACT_DELAY);
+        }
+        // A guard has nothing to land: no number at all.
+        let mut p = Popups::default();
+        p.on_events(7.0, &[BattleEvent::Action { actor: ActorId(0), action: A::Defend }]);
+        assert!(p.views(8.0).is_empty());
+    }
+
+    #[test]
+    fn the_blows_of_one_action_land_together_and_a_later_batch_does_not_wait_for_an_earlier_one() {
+        use fmv_ff7_battle::rules::ActionRef as A;
+        let mut p = Popups::default();
+        // A spell on two targets: both numbers at the one impact. Then, a moment later, a quick item.
+        p.on_events(
+            2.0,
+            &[
+                BattleEvent::Action { actor: ActorId(0), action: A::Magic(27) },
+                damage(2, 40),
+                damage(3, 41),
+            ],
+        );
+        p.on_events(2.2, &[BattleEvent::Action { actor: ActorId(1), action: A::Item(3) }, BattleEvent::Heal { actor: ActorId(1), target: ActorId(1), amount: 9 }]);
+        let births = p.births();
+        // Oldest first: the item's heal (2.2 + 0.45) is born before the spell's numbers (2.0 + 0.6)? No:
+        // 2.65 against 2.6: the spell lands first, and the two of it are at the very same instant.
+        assert_eq!(births.iter().map(|(t, _)| t.0).collect::<Vec<_>>(), [2, 3, 1]);
+        assert!((births[0].1 - 2.6).abs() < 1e-12 && births[0].1 == births[1].1);
+        assert!((births[2].1 - 2.65).abs() < 1e-12);
+        // Each is born within the cap of the arrival of its own batch.
+        assert!(births[0].1 - 2.0 <= cue::MAX_IMPACT_DELAY + 1e-12 && births[2].1 - 2.2 <= cue::MAX_IMPACT_DELAY + 1e-12);
+    }
+
+    #[test]
+    fn a_number_scheduled_for_later_goes_behind_one_born_sooner_whatever_was_pushed_first() {
+        let mut p = Popups::default();
+        p.push(5.0, ActorId(3), PopupKind::Miss);
+        p.push(4.0, ActorId(4), PopupKind::Miss);
+        p.push(4.5, ActorId(5), PopupKind::Miss);
+        assert_eq!(p.births().iter().map(|(t, _)| t.0).collect::<Vec<_>>(), [4, 5, 3]);
     }
 
     #[test]
