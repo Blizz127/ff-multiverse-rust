@@ -16,6 +16,7 @@
 
 mod accounts;
 mod backdrop;
+mod battle;
 mod bot;
 mod cli;
 mod ff7;
@@ -90,6 +91,16 @@ fn open_game(args: &Args) -> Result<LocalGame, String> {
                 "FF7: {} fields indexed in {:.2?} ({} archive entries are not fields)",
                 report.areas, report.elapsed, report.skipped
             );
+            // This machine's own battle data (the shared-battle mirror replays with it; without
+            // it a battle can only be waited out). Installed once for the whole process, so the
+            // command-line path and the character-menu path both get it.
+            match battle::open_rules(&args.ff7_source()) {
+                Ok((rules, origin)) => {
+                    eprintln!("FF7: battle data (scene.bin, kernel.bin) read from this machine's own copy ({origin}), read-only");
+                    battle::install_local_rules(Some(rules));
+                }
+                Err(e) => eprintln!("note: no battle data on this machine ({e}); shared battles cannot be replayed or fought here"),
+            }
             Ok(LocalGame {
                 adapter: Box::new(ff7::SharedFf7(Arc::clone(&opened.adapter))),
                 client_build: format!("fmv-client/{version}+{}", ff7::build_tag()),

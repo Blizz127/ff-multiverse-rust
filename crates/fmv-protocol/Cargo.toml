@@ -11,6 +11,12 @@ fmv-core.workspace = true
 # The party messages carry fmv-party's own serde types (events, party, invites, placement) so a
 # client mirror replays exactly what the party state machine decided. Pinned by golden JSON tests.
 fmv-party = { path = "../fmv-party" }
+# The battle messages carry the engine's own serde types (events, commands, outcome, actor ids)
+# and both peers build their battle through this crate, so one definition of "how an
+# EncounterStart becomes a BattleState" exists. Path dependency like fmv-party.
+fmv-ff7-battle = { path = "../fmv-ff7-battle" }
+# Fingerprint of the battle data files (scene.bin + kernel.bin) a peer holds.
+blake3.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

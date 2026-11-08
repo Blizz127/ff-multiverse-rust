@@ -7,6 +7,11 @@
 //! imported library (`--ff7-library`, `--ff7-set`) or a `flevel.lgp` read directly
 //! (`--ff7-flevel`). Both are opened read-only, and no asset byte ever leaves this process.
 //!
+//! Battles (protocol v3): an FF7 server opened from a library also loads that set's `scene.bin`
+//! and `kernel.bin` and runs shared, server-authoritative battles (random encounters in a field
+//! that has an encounter table, and on request with `--debug-encounters`). The FIXTURE server and
+//! a server over a direct `--ff7-flevel` have no battle data and refuse every battle request.
+//!
 //! Players have accounts: the server keeps them (with avatar profiles and progression) in a state
 //! directory it holds locked while it runs (`--state-dir`, default `<state>/server`;
 //! `--ephemeral` keeps nothing).
@@ -19,11 +24,12 @@ use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
 use fmv_adapter_api::GameAdapter;
+use fmv_ff7_battle::rules::{DEFAULT_BATTLE_SPEED, DEFAULT_TICKS_PER_SECOND};
 use fmv_fixture::{FixtureAdapter, FIXTURE_AREA_KEY};
 use fmv_protocol::DEFAULT_DEV_PORT;
 use fmv_server::ff7::{self, Ff7Labels, Ff7Source, SharedFf7, DEFAULT_FF7_AREA};
-use fmv_server::{ServerConfig, DEFAULT_IDLE_TIMEOUT, MAX_CONNECTIONS_LIMIT, MAX_TICK_HZ};
-use tracing::info;
+use fmv_server::{BattleSettings, ServerConfig, DEFAULT_IDLE_TIMEOUT, MAX_CONNECTIONS_LIMIT, MAX_TICK_HZ};
+use tracing::{info, warn};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum GameKind {
@@ -46,10 +52,21 @@ ACCOUNTS:
   profiles and progression live in the state directory, which this server holds locked while it
   runs (a second server on the same directory is refused). Default: `server/` inside $FMV_STATE_DIR
   (else the user data directory's ff-multiverse); --state-dir DIR uses DIR itself. --ephemeral keeps
-  accounts only until the server stops. --no-registration refuses new accounts.";
+  accounts only until the server stops. --no-registration refuses new accounts.
+
+BATTLES:
+  With --game ff7 from a library, the server also reads that set's scene.bin and kernel.bin
+  (read-only) and runs shared battles on the deterministic engine: the server steps it, every
+  player in the battle is frozen in the field and replays it from their OWN game files (only ids,
+  seeds and levels are sent). A battle starts for the whole party from a random encounter in a
+  field that has an encounter table (md1stin has one), or when a player asks for one and the server
+  runs with --debug-encounters (off by default). Without battle data (--game fixture, a direct
+  --ff7-flevel) every battle request is refused. Rewards are logged and sent, not stored.
+  --battle-speed, --battle-tick-rate, --battle-level, --battle-seed and --debug-formation pin the
+  pace, level, seed and fight for reproducible runs; --no-random-encounters turns the rolls off.";
 
 #[derive(Parser, Debug)]
-#[command(name = "fmv-server", version, about = "Authoritative FF Multiverse server (protocol v2)", after_help = AFTER_HELP)]
+#[command(name = "fmv-server", version, about = "Authoritative FF Multiverse server (protocol v3)", after_help = AFTER_HELP)]
 struct Cli {
     /// Address to listen on. Port 0 picks a free port (reported on the READY line).
     #[arg(long, value_name = "ADDR", default_value_t = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), DEFAULT_DEV_PORT))]
@@ -119,6 +136,38 @@ struct Cli {
     /// inside this window. The default frees the slot and avatar of silent or vanished peers.
     #[arg(long, value_name = "SECS", default_value_t = DEFAULT_IDLE_TIMEOUT.as_secs())]
     idle_timeout_secs: u64,
+
+    /// Let players start a battle on request (the client's B key, `--battle-auto` bots). OFF by
+    /// default: a normal server only starts battles from random encounters. Needs battle data
+    /// (an FF7 library with scene.bin and kernel.bin).
+    #[arg(long)]
+    debug_encounters: bool,
+
+    /// Do not roll a field's random-encounter table as players walk.
+    #[arg(long)]
+    no_random_encounters: bool,
+
+    /// FF7 "Battle Speed" of every battle: 0 is fastest, 255 slowest.
+    #[arg(long, value_name = "N", default_value_t = DEFAULT_BATTLE_SPEED)]
+    battle_speed: u8,
+
+    /// Engine ticks per second of battle time (1-1000). More makes battles pass faster.
+    #[arg(long, value_name = "TPS", default_value_t = DEFAULT_TICKS_PER_SECOND, value_parser = clap::value_parser!(u32).range(1..=1000))]
+    battle_tick_rate: u32,
+
+    /// The level every battle member fights at (default: each character's starting level from the
+    /// game data).
+    #[arg(long, value_name = "LEVEL", value_parser = clap::value_parser!(u8).range(1..=99))]
+    battle_level: Option<u8>,
+
+    /// Use this seed for every battle instead of a fresh one (reproducible runs).
+    #[arg(long, value_name = "SEED")]
+    battle_seed: Option<u64>,
+
+    /// The enemy formation (`scene * 4 + slot`) a debug encounter uses when the request names none.
+    /// Default: a weighted pick from the field's encounter table, else the first formation.
+    #[arg(long, value_name = "ID")]
+    debug_formation: Option<u16>,
 }
 
 /// `--idle-timeout-secs`: 0 disables the timeout.
@@ -190,6 +239,23 @@ struct Hosted {
     area: String,
     /// Adapter identity for the build string (`None` for FIXTURE).
     build_suffix: Option<String>,
+    /// Battle support (`None`: this server cannot run battles: FIXTURE, or no owned battle data).
+    battle: Option<BattleSettings>,
+}
+
+impl Cli {
+    /// How battles run, over `rules` (the server's own battle data).
+    fn battle_settings(&self, rules: std::sync::Arc<dyn fmv_protocol::BattleRules>) -> BattleSettings {
+        BattleSettings {
+            level: self.battle_level,
+            battle_speed: self.battle_speed,
+            ticks_per_second: self.battle_tick_rate,
+            fixed_seed: self.battle_seed,
+            debug_formation: self.debug_formation,
+            random_encounters: !self.no_random_encounters,
+            ..BattleSettings::new(rules)
+        }
+    }
 }
 
 /// The single place where an adapter is chosen. For FF7 it also builds the area index on a
@@ -201,16 +267,35 @@ async fn build_adapter(cli: &Cli) -> Result<Hosted, SetupError> {
             adapter: Box::new(FixtureAdapter::new()),
             area: cli.area.clone().unwrap_or_else(|| FIXTURE_AREA_KEY.to_string()),
             build_suffix: None,
+            battle: None,
         }),
         GameKind::Ff7 => {
             let opened = ff7::open_ff7(&cli.ff7_source())?;
             info!(source = %opened.origin, "opened the owned FF7 field archive read-only");
             let report = ff7::prewarm(&opened.adapter).await?;
             info!(areas = report.areas, skipped = report.skipped, elapsed = ?report.elapsed, "indexed the FF7 field archive");
+            // The battle data comes from the same library set. A server that was asked for debug
+            // encounters must have it; any other server just runs without battles.
+            let battle = match ff7::open_battle_data(&cli.ff7_source()) {
+                Ok((data, origin)) => {
+                    info!(
+                        source = %origin,
+                        fingerprint = ?fmv_protocol::BattleRules::data_fingerprint(&*data),
+                        "opened the owned FF7 battle data (scene.bin, kernel.bin) read-only"
+                    );
+                    Some(cli.battle_settings(data))
+                }
+                Err(e) if cli.debug_encounters => return Err(format!("--debug-encounters needs owned battle data: {e}").into()),
+                Err(e) => {
+                    warn!("no battle data, so battles are unsupported on this server: {e}");
+                    None
+                }
+            };
             Ok(Hosted {
                 adapter: Box::new(SharedFf7(opened.adapter)),
                 area: cli.area.clone().unwrap_or_else(|| DEFAULT_FF7_AREA.to_string()),
                 build_suffix: Some(ff7::build_tag()),
+                battle,
             })
         }
     }
@@ -266,6 +351,8 @@ async fn real_main(cli: Cli) -> Result<(), String> {
         max_connections: cli.max_connections as usize,
         idle_timeout: idle_timeout(cli.idle_timeout_secs),
         build_suffix: hosted.build_suffix,
+        battle: hosted.battle,
+        debug_encounters: cli.debug_encounters,
         ..ServerConfig::default()
     };
     let shutdown = shutdown_signal().map_err(|e| format!("cannot install signal handlers: {e}"))?;
@@ -415,6 +502,54 @@ mod tests {
         assert_eq!(cli.game, GameKind::Ff7);
         assert!(parse(&["--tick-hz", "0"]).is_err());
         assert!(parse(&["--max-connections", "0"]).is_err());
+    }
+
+    #[test]
+    fn battle_flags_default_to_a_normal_server_and_map_into_the_settings() {
+        use fmv_protocol::SyntheticRules;
+        let cli = parse(&[]).unwrap();
+        assert!(!cli.debug_encounters, "debug encounters are OFF unless asked for");
+        assert!(!cli.no_random_encounters);
+        assert_eq!((cli.battle_speed, cli.battle_tick_rate), (DEFAULT_BATTLE_SPEED, DEFAULT_TICKS_PER_SECOND));
+        assert_eq!((cli.battle_level, cli.battle_seed, cli.debug_formation), (None, None, None));
+        let defaults = cli.battle_settings(std::sync::Arc::new(SyntheticRules::default()));
+        assert!(defaults.random_encounters && defaults.level.is_none() && defaults.fixed_seed.is_none());
+        assert_eq!((defaults.battle_speed, defaults.ticks_per_second), (DEFAULT_BATTLE_SPEED, DEFAULT_TICKS_PER_SECOND));
+
+        let cli = parse(&[
+            "--debug-encounters",
+            "--no-random-encounters",
+            "--battle-speed",
+            "0",
+            "--battle-tick-rate",
+            "240",
+            "--battle-level",
+            "7",
+            "--battle-seed",
+            "9",
+            "--debug-formation",
+            "301",
+        ])
+        .unwrap();
+        assert!(cli.debug_encounters);
+        let s = cli.battle_settings(std::sync::Arc::new(SyntheticRules::default()));
+        assert_eq!((s.battle_speed, s.ticks_per_second, s.level), (0, 240, Some(7)));
+        assert_eq!((s.fixed_seed, s.debug_formation, s.random_encounters), (Some(9), Some(301), false));
+        // The settings the flags make are ones the server accepts.
+        ServerConfig { battle: Some(s), debug_encounters: true, ..ServerConfig::default() }.validate().unwrap();
+
+        // Out-of-range values are usage errors, not panics later.
+        for bad in [
+            &["--battle-tick-rate", "0"][..],
+            &["--battle-tick-rate", "1001"],
+            &["--battle-level", "0"],
+            &["--battle-level", "100"],
+            &["--battle-speed", "256"],
+            &["--debug-formation", "70000"],
+            &["--battle-seed", "-1"],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

@@ -5,6 +5,7 @@
 //! error message and a non-zero exit code, never a panic.
 
 use crate::backdrop::FieldView;
+use crate::battle::{battle_vertices, draw_battle_text, BattleCmd};
 use crate::cli::exit;
 use crate::interp::render_time;
 use crate::net::PartyCommand;
@@ -162,6 +163,39 @@ pub fn party_request(key: PartyKey, state: &ClientState, render_t: f64) -> Optio
     }
 }
 
+/// The battle keys: `B` asks the server for a debug battle (refused unless it runs with
+/// `--debug-encounters`), `Space` or `Enter` attacks the first living enemy with your character.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BattleKey {
+    Request,
+    Attack,
+}
+
+impl BattleKey {
+    /// The battle action a keyboard event stands for. Only a fresh PRESS counts, like the party
+    /// keys: holding `B` must not flood the server with requests.
+    pub fn from_event(code: KeyCode, pressed: bool, repeat: bool) -> Option<Self> {
+        if !pressed || repeat {
+            return None;
+        }
+        match code {
+            KeyCode::KeyB => Some(BattleKey::Request),
+            KeyCode::Space | KeyCode::Enter | KeyCode::NumpadEnter => Some(BattleKey::Attack),
+            _ => None,
+        }
+    }
+}
+
+/// The request a battle key makes in the current situation, if any: `B` outside a battle asks for
+/// one, `Space`/`Enter` in a battle attacks when our gauge is full (see
+/// `BattleClient::attack_command`).
+pub fn battle_request(key: BattleKey, state: &ClientState, now: f64) -> Option<BattleCmd> {
+    match key {
+        BattleKey::Request => (!state.battle.in_battle()).then_some(BattleCmd::RequestEncounter { formation: None }),
+        BattleKey::Attack => state.battle.attack_command(now),
+    }
+}
+
 /// Held movement keys.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Input {
@@ -214,6 +248,8 @@ pub(crate) struct App {
     /// What the title last said about the party: its size and the pending invite. A change shows
     /// at once instead of waiting for the next refresh.
     last_title_party: (usize, Option<fmv_protocol::InviteId>),
+    /// What the title last said about the battle (empty outside one).
+    last_title_battle: String,
     left: bool,
     failure: Option<String>,
 }
@@ -232,6 +268,7 @@ impl App {
             last_tick: now,
             last_title: now.checked_sub(TITLE_REFRESH).unwrap_or(now),
             last_title_party: (0, None),
+            last_title_battle: String::new(),
             left: false,
             failure: None,
         }
@@ -285,23 +322,51 @@ impl App {
         let party = &self.session.state.party;
         let invite = party.newest_invite_to_me();
         let party_key = (party.party_size(), invite.as_ref().map(|i| i.id));
-        if self.last_title.elapsed() < TITLE_REFRESH && party_key == self.last_title_party {
+        let battle_text = self.session.state.battle.title_suffix(self.session.now());
+        if self.last_title.elapsed() < TITLE_REFRESH && party_key == self.last_title_party && battle_text == self.last_title_battle {
             return;
         }
         self.last_title = Instant::now();
         self.last_title_party = party_key;
+        self.last_title_battle = battle_text.clone();
         let rtt = self
             .session
             .state
             .last_rtt()
             .map_or_else(|| "-".to_string(), |d| format!("{} ms", d.as_millis()));
-        window.set_title(&live_title(
+        let title = live_title(
             &self.base_title,
             self.session.state.remote_count() + 1,
             &rtt,
             party_key.0,
             invite.as_ref().map(|i| i.from_name.as_str()),
-        ));
+        );
+        window.set_title(&format!("{title}{battle_text}"));
+    }
+
+    /// A battle key was pressed: send the request it stands for, and say what it did on stderr.
+    fn battle_key(&mut self, key: BattleKey) {
+        let now = self.session.now();
+        match battle_request(key, &self.session.state, now) {
+            Some(cmd) => {
+                eprintln!(
+                    "battle: {}",
+                    match cmd {
+                        BattleCmd::RequestEncounter { .. } => "asking the server for a debug battle".to_string(),
+                        BattleCmd::Command { actor, .. } => format!("attacking with actor {}", actor.0),
+                    }
+                );
+                self.session.send_battle(cmd);
+            }
+            None => eprintln!(
+                "battle: {}",
+                match key {
+                    BattleKey::Request => "you are already in a battle",
+                    BattleKey::Attack if self.session.state.battle.in_battle() => "your gauge is not full yet",
+                    BattleKey::Attack => "no battle to fight in (press B to ask for one)",
+                }
+            ),
+        }
     }
 
     /// A party key was pressed: send the request it stands for, and say what it did on stderr
@@ -333,7 +398,13 @@ impl App {
             return;
         }
         self.session.log_party_notes();
+        self.session.log_battle_notes();
         self.session.flush_party_sync();
+        // A player in a battle is frozen in the field: no walking, no movement intents.
+        if self.session.state.battle.in_battle() {
+            self.update_title();
+            return;
+        }
         let speed = WALK_SPEED_FACTOR * self.session.area.max_speed();
         // The keys mean directions on the SCREEN; the area is walked in its own axes.
         let keys = self.input.dir();
@@ -355,6 +426,21 @@ impl App {
     fn redraw(&mut self, el: &ActiveEventLoop) {
         let Some(renderer) = self.renderer.as_mut() else { return };
         let now = self.session.now();
+        // In a battle the whole window is the battle view: flat rectangles with the UI font's text
+        // (names, HP, whose turn) over them.
+        if let Some(battle) = self.session.state.battle.view(now) {
+            let (vw, vh) = renderer.size();
+            let mut overlay = DrawList::new();
+            draw_battle_text(&battle, vw, vh, &mut overlay);
+            let result = renderer.render_flat(|w, h, srgb| battle_vertices(&battle, w, h, srgb), Some(&overlay));
+            let gpu_error = renderer.first_gpu_error();
+            match (result, gpu_error) {
+                (FrameResult::Fatal(msg), _) => self.fail(el, msg),
+                (_, Some(e)) => self.fail(el, format!("GPU error: {e}")),
+                _ => {}
+            }
+            return;
+        }
         // Players are placed through the view; one that cannot be drawn (behind the camera) is
         // simply not shown this frame.
         let view = &self.view;
@@ -449,6 +535,8 @@ impl ApplicationHandler for App {
                     }
                 } else if let Some(key) = PartyKey::from_event(code, pressed, repeat) {
                     self.party_key(key);
+                } else if let Some(key) = BattleKey::from_event(code, pressed, repeat) {
+                    self.battle_key(key);
                 } else {
                     self.input.set(code, pressed);
                 }
@@ -584,6 +672,69 @@ mod tests {
         // And a party key is not a movement key.
         let mut input = Input::default();
         assert!(!input.set(KeyCode::KeyP, true) && !input.set(KeyCode::KeyY, true) && !input.set(KeyCode::KeyL, true));
+    }
+
+    #[test]
+    fn battle_keys_act_on_a_fresh_press_only_and_are_not_movement_or_party_keys() {
+        for (code, key) in [
+            (KeyCode::KeyB, BattleKey::Request),
+            (KeyCode::Space, BattleKey::Attack),
+            (KeyCode::Enter, BattleKey::Attack),
+            (KeyCode::NumpadEnter, BattleKey::Attack),
+        ] {
+            assert_eq!(BattleKey::from_event(code, true, false), Some(key), "{code:?} pressed");
+            assert_eq!(BattleKey::from_event(code, false, false), None, "{code:?} released");
+            assert_eq!(BattleKey::from_event(code, true, true), None, "{code:?} auto-repeat of a held key");
+            let mut input = Input::default();
+            assert!(!input.set(code, true), "{code:?} is not a movement key");
+            assert_eq!(PartyKey::from_event(code, true, false), None, "{code:?} is not a party key");
+        }
+        for code in [KeyCode::KeyW, KeyCode::KeyP, KeyCode::KeyY, KeyCode::KeyL, KeyCode::Escape, KeyCode::ArrowUp] {
+            assert_eq!(BattleKey::from_event(code, true, false), None, "{code:?}");
+        }
+    }
+
+    /// A state in a battle that starts preemptive (our character's gauge is full at once), with
+    /// synthetic rules standing in for the game's.
+    fn state_in_a_preemptive_battle() -> ClientState {
+        use fmv_protocol::{BattleId, BattleMember, SyntheticRules};
+        let area = AreaId { game: GameId::Fixture, key: "k".into() };
+        let mut s = ClientState::new(EntityId(1), AccountId(1), Pos::default(), area);
+        s.battle.set_rules(Some(Arc::new(SyntheticRules::default())));
+        s.apply(
+            0.0,
+            ServerMsg::EncounterStart {
+                battle_id: BattleId(1),
+                formation_id: 3,
+                seed: 5,
+                party: vec![BattleMember { entity: EntityId(1), account: AccountId(1), character: 0, level: 5, weapon: None, armor: None }],
+                preemptive: true,
+                back_attack: false,
+                battle_speed: 0,
+                ticks_per_second: 1000,
+                data_fingerprint: SyntheticRules::FINGERPRINT,
+            },
+        );
+        s
+    }
+
+    #[test]
+    fn b_asks_for_a_battle_outside_one_only_and_space_attacks_on_our_turn_only() {
+        // Outside a battle: B asks, Space has nothing to attack.
+        let outside = state_with_peers(&[]);
+        assert_eq!(battle_request(BattleKey::Request, &outside, 1.0), Some(BattleCmd::RequestEncounter { formation: None }));
+        assert_eq!(battle_request(BattleKey::Attack, &outside, 1.0), None);
+        // In one: B has nothing to ask (the server would refuse), Space attacks the first enemy.
+        let inside = state_in_a_preemptive_battle();
+        assert!(inside.battle.in_battle());
+        assert_eq!(battle_request(BattleKey::Request, &inside, 1.0), None);
+        match battle_request(BattleKey::Attack, &inside, 1.0) {
+            Some(BattleCmd::Command { actor, command: fmv_protocol::battle::Command::Attack { target }, .. }) => {
+                assert_eq!((actor.0, target.0), (0, 1), "our character hits the first enemy, which follows the party");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(inside.battle.view(1.0).map(|v| v.enemies.len()), Some(1));
     }
 
     fn state_with_peers(peers: &[(u64, f32)]) -> ClientState {

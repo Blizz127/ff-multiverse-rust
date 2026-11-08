@@ -35,7 +35,7 @@ use tracing::{debug, error, info, warn, Instrument};
 
 use crate::accounts::{self, Login};
 use crate::config::ServerConfig;
-use crate::world::{CloseFlag, JoinError, MoveOutcome, NewPlayer, Outbound, OutboundTx, PartyOutcome, World};
+use crate::world::{BattleReply, CloseFlag, JoinError, MoveOutcome, NewPlayer, Outbound, OutboundTx, PartyOutcome, World};
 
 /// Reported in `Welcome::server_build` and the READY line.
 pub const SERVER_BUILD: &str = env!("CARGO_PKG_VERSION");
@@ -419,7 +419,9 @@ impl Conn {
                 | ClientMsg::PartyLeave
                 | ClientMsg::PartyKick { .. }
                 | ClientMsg::PartyPromote { .. }
-                | ClientMsg::PartySync => {
+                | ClientMsg::PartySync
+                | ClientMsg::BattleCommand { .. }
+                | ClientMsg::RequestEncounter { .. } => {
                     return Err(Close::Reject("unexpected message before JoinArea".to_string()));
                 }
             }
@@ -461,6 +463,12 @@ impl Conn {
                 ClientMsg::PartyKick { target } => self.party(|w, _| w.party_kick(entity, target))?,
                 ClientMsg::PartyPromote { target } => self.party(|w, _| w.party_promote(entity, target))?,
                 ClientMsg::PartySync => self.party(|w, now| w.party_sync(entity, now))?,
+                ClientMsg::RequestEncounter { formation_id } => {
+                    self.battle(|w, now| w.request_encounter(entity, formation_id, now))?
+                }
+                ClientMsg::BattleCommand { battle_id, actor, command } => {
+                    self.battle(|w, now| w.battle_command(entity, battle_id, actor, command, now))?
+                }
                 ClientMsg::Hello { .. } | ClientMsg::JoinArea { .. } | ClientMsg::CannotJoin { .. } => {
                     return Err(Close::Reject("unexpected message after joining".to_string()));
                 }
@@ -503,6 +511,20 @@ impl Conn {
             PartyOutcome::Done => Ok(()),
             PartyOutcome::Refused(error) => self.send(ServerMsg::PartyRejected { error }),
             PartyOutcome::Gone => Err(Close::Dropped("removed from the world")),
+        }
+    }
+
+    /// Run one battle request or command against the world and answer a refusal to this client
+    /// alone (a refusal is routine: a stale command, a debug request on a normal server).
+    fn battle(&mut self, op: impl FnOnce(&mut World, Instant) -> BattleReply) -> Result<(), Close> {
+        let reply = op(&mut self.shared.world(), Instant::now());
+        match reply {
+            BattleReply::Done => Ok(()),
+            BattleReply::Refused { battle, reason } => {
+                debug!(?battle, ?reason, "battle request refused");
+                self.send(ServerMsg::BattleRejected { battle_id: battle, reason })
+            }
+            BattleReply::Gone => Err(Close::Dropped("removed from the world")),
         }
     }
 
@@ -588,6 +610,8 @@ impl Conn {
                 }
                 self.send(ServerMsg::MoveRejected { seq, corrected })
             }
+            // In a battle the player is frozen: its intents are ignored, not answered.
+            MoveOutcome::Frozen => Ok(()),
             MoveOutcome::Gone => Err(Close::Dropped("removed from the world")),
         }
     }

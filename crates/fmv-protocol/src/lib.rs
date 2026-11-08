@@ -1,4 +1,4 @@
-//! FF Multiverse wire protocol v2.
+//! FF Multiverse wire protocol v3.
 //!
 //! Framing: `u32` little-endian payload length, then the payload. The payload codec is JSON
 //! (serde_json; postcard is not in the local crate cache). The codec is isolated in
@@ -15,8 +15,30 @@
 //! S -> C  AreaManifest { area, fingerprint, provenance, fixture, .. }
 //! C -> S  JoinArea { area, fingerprint, provenance }  (or CannotJoin { reason })
 //! S -> C  AreaSnapshot, InstancePlacement             (always first after the handshake replies)
-//! ...     MoveIntent / EntityUpdate / MoveRejected / Ping / Pong / Party* ...
+//! ...     MoveIntent / EntityUpdate / MoveRejected / Ping / Pong / Party* / Battle* ...
 //! C -> S  Leave
+//! ```
+//!
+//! # Battles (v3)
+//!
+//! A battle is started by the server for a whole party (or a solo player), either from a random
+//! encounter roll in a field that has an encounter table, or on `RequestEncounter` when the
+//! server runs with `--debug-encounters`. Every member receives the same
+//! `EncounterStart { battle_id, formation_id, seed, party, .. }`, is FROZEN in the field (its
+//! `MoveIntent`s are ignored and nobody else sees it move) and rebuilds the battle from its OWN
+//! `scene.bin` and `kernel.bin`: only ids, seeds and levels travel (see [`battle`]). The server
+//! steps the engine and announces what happened as `BattleEvent { battle_id, tick, events,
+//! command }`; a client commands its own character with `BattleCommand` once its gauge is full
+//! and the server answers a refused one with `BattleRejected`. A won or lost battle ends with
+//! `BattleEnd { outcome, rewards }`, after which everyone is back in the field where they stood.
+//!
+//! ```text
+//! (C -> S  RequestEncounter { formation_id }            debug servers only)
+//! S -> C  EncounterStart { battle_id, formation_id, seed, party, .. }     every member
+//! S -> C  BattleEvent { battle_id, tick, events }                         the engine advanced
+//! C -> S  BattleCommand { battle_id, actor, command }                     gauge full
+//! S -> C  BattleEvent { battle_id, tick, events, command }                every member
+//! S -> C  BattleEvent { .., events: [.., Victory] }, then BattleEnd { battle_id, outcome, rewards }
 //! ```
 //!
 //! # Accounts
@@ -53,6 +75,15 @@ use fmv_core::{AccountId, AnimState, AreaId, EntityId, EntitySnapshot, Fingerpri
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+pub mod battle;
+
+/// The battle wire types (the engine's own `BattleEvent`, `Command` and `Outcome` stay under
+/// [`battle`], where their names say what they are).
+pub use battle::{
+    split_rewards, ActorId, AppliedCommand, BattleBuildError, BattleId, BattleMember, BattleRejection, BattleReplay, BattleReward,
+    BattleRules, BattleSetup, Divergence, Ff7BattleData, Ff7BattleDataError, FormationInfo, SyntheticRules, MAX_BATTLE_PARTY,
+};
+
 /// The party types carried on the wire, re-exported so a client needs no direct `fmv-party`
 /// dependency to match on them.
 pub use fmv_party::{
@@ -60,7 +91,7 @@ pub use fmv_party::{
     PartyEvent, PartyId, Placement,
 };
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 /// Hard cap on a single frame payload (bytes).
 pub const MAX_FRAME: u32 = 256 * 1024;
 /// Default TCP port for development. Deployment port is UNASSIGNED (see DEPLOYMENT-CONTRACT.md).
@@ -169,6 +200,13 @@ pub enum ClientMsg {
     PartyPromote { target: EntityId },
     /// Ask for the full party state (answered by `PartyState`).
     PartySync,
+    /// Command one of YOUR characters in a battle: `actor` must be the party member the server
+    /// assigned to this session, and its ATB gauge must be full. Refused with `BattleRejected`.
+    BattleCommand { battle_id: BattleId, actor: ActorId, command: battle::Command },
+    /// Debug only (the server must run with `--debug-encounters`; refused with `BattleRejected`
+    /// otherwise): start a battle for your party (or just you). `formation_id` names the enemy
+    /// formation (`scene * 4 + slot`); `None` lets the server choose.
+    RequestEncounter { formation_id: Option<u16> },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -213,6 +251,42 @@ pub enum ServerMsg {
     PartyState { seq: u64, party: Option<Party>, invites: Vec<Invite>, names: Vec<PartyName> },
     /// A party request of this client was refused.
     PartyRejected { error: PartyFailure },
+    /// A battle starts, for every member of `party` at once. Rebuild it from your OWN game files:
+    /// `party[i]` fights as `ActorId(i)` and the formation's enemies follow, `seed` seeds the
+    /// engine, `preemptive` / `back_attack` choose the gauge start (never both), `battle_speed` and
+    /// `ticks_per_second` set the engine's pace, and `data_fingerprint` is the fingerprint of the
+    /// server's battle data (a client whose own differs cannot replay this battle). Until
+    /// `BattleEnd` the receiving player is frozen in the field.
+    EncounterStart {
+        battle_id: BattleId,
+        /// `scene * 4 + slot` in `scene.bin`.
+        formation_id: u16,
+        seed: u64,
+        party: Vec<BattleMember>,
+        preemptive: bool,
+        back_attack: bool,
+        battle_speed: u8,
+        ticks_per_second: u32,
+        data_fingerprint: Fingerprint,
+    },
+    /// One operation on the battle engine and what it produced; `tick` is the engine's tick counter
+    /// after it. With `command` the engine first advanced silently to `tick` and then applied that
+    /// party command; without it the engine advanced to `tick`. See [`battle`] ("The input log").
+    /// `command` is left out of the JSON when absent.
+    BattleEvent {
+        battle_id: BattleId,
+        tick: u64,
+        events: Vec<battle::BattleEvent>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command: Option<AppliedCommand>,
+    },
+    /// The battle is over (the message before it carried `Victory` or `Defeat`). `rewards` has one
+    /// entry per member of the party when the outcome is `Victory` (see [`split_rewards`]) and is
+    /// empty on `Defeat`. The receiving player is back in the field.
+    BattleEnd { battle_id: BattleId, outcome: battle::Outcome, rewards: Vec<BattleReward> },
+    /// A battle request or command of this client was refused. `battle_id` is the battle it was
+    /// about, if any.
+    BattleRejected { battle_id: Option<BattleId>, reason: BattleRejection },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -323,8 +397,8 @@ mod tests {
     }
 
     #[test]
-    fn the_version_is_two() {
-        assert_eq!(PROTOCOL_VERSION, 2);
+    fn the_version_is_three() {
+        assert_eq!(PROTOCOL_VERSION, 3);
     }
 
     // -----------------------------------------------------------------------------------------
@@ -378,13 +452,13 @@ mod tests {
     fn golden_client_messages() {
         golden(
             ClientMsg::Hello {
-                protocol_version: 2,
+                protocol_version: 3,
                 client_build: "c/1".into(),
                 auth: Auth::Register { display_name: "Cloud".into() },
                 tint: [10, 20, 30],
                 appearance_ref: Some("cloud_model".into()),
             },
-            r#"{"Hello":{"protocol_version":2,"client_build":"c/1","auth":{"Register":{"display_name":"Cloud"}},"tint":[10,20,30],"appearance_ref":"cloud_model"}}"#,
+            r#"{"Hello":{"protocol_version":3,"client_build":"c/1","auth":{"Register":{"display_name":"Cloud"}},"tint":[10,20,30],"appearance_ref":"cloud_model"}}"#,
         );
         golden(
             ClientMsg::JoinArea {
@@ -415,13 +489,13 @@ mod tests {
         golden(ClientMsg::PartySync, r#""PartySync""#);
         golden(
             ClientMsg::Hello {
-                protocol_version: 2,
+                protocol_version: 3,
                 client_build: "c/1".into(),
                 auth: Auth::Token(Secret::new("fmvt_x")),
                 tint: [0, 0, 0],
                 appearance_ref: None,
             },
-            r#"{"Hello":{"protocol_version":2,"client_build":"c/1","auth":{"Token":"fmvt_x"},"tint":[0,0,0],"appearance_ref":null}}"#,
+            r#"{"Hello":{"protocol_version":3,"client_build":"c/1","auth":{"Token":"fmvt_x"},"tint":[0,0,0],"appearance_ref":null}}"#,
         );
     }
 
@@ -429,14 +503,14 @@ mod tests {
     fn golden_server_messages() {
         golden(
             ServerMsg::Welcome {
-                protocol_version: 2,
+                protocol_version: 3,
                 server_build: "s/1".into(),
                 session: SessionId(4),
                 entity: EntityId(5),
                 account: AccountId(6),
                 issued_token: None,
             },
-            r#"{"Welcome":{"protocol_version":2,"server_build":"s/1","session":4,"entity":5,"account":6,"issued_token":null}}"#,
+            r#"{"Welcome":{"protocol_version":3,"server_build":"s/1","session":4,"entity":5,"account":6,"issued_token":null}}"#,
         );
         golden(
             ServerMsg::PartyRejected { error: PartyFailure::Rules(PartyError::PartyFull { party: PartyId(2), max_size: 3 }) },
@@ -552,6 +626,206 @@ mod tests {
         for (error, expected) in cases {
             golden(error, expected);
         }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Battle (v3): every new message, and the engine types that travel inside them
+    // -----------------------------------------------------------------------------------------
+
+    fn members() -> Vec<BattleMember> {
+        vec![
+            BattleMember { entity: EntityId(10), account: AccountId(20), character: 0, level: 6, weapon: None, armor: None },
+            BattleMember { entity: EntityId(11), account: AccountId(21), character: 1, level: 7, weapon: Some(3), armor: Some(4) },
+        ]
+    }
+
+    #[test]
+    fn golden_battle_client_messages() {
+        golden(
+            ClientMsg::BattleCommand {
+                battle_id: BattleId(1),
+                actor: ActorId(0),
+                command: battle::Command::Attack { target: ActorId(2) },
+            },
+            r#"{"BattleCommand":{"battle_id":1,"actor":0,"command":{"Attack":{"target":2}}}}"#,
+        );
+        golden(ClientMsg::RequestEncounter { formation_id: None }, r#"{"RequestEncounter":{"formation_id":null}}"#);
+        golden(ClientMsg::RequestEncounter { formation_id: Some(517) }, r#"{"RequestEncounter":{"formation_id":517}}"#);
+    }
+
+    #[test]
+    fn golden_battle_server_messages() {
+        golden(
+            ServerMsg::EncounterStart {
+                battle_id: BattleId(1),
+                formation_id: 517,
+                seed: 12_345,
+                party: members(),
+                preemptive: false,
+                back_attack: true,
+                battle_speed: 128,
+                ticks_per_second: 60,
+                data_fingerprint: Fingerprint([0xcd; 32]),
+            },
+            concat!(
+                r#"{"EncounterStart":{"battle_id":1,"formation_id":517,"seed":12345,"party":["#,
+                r#"{"entity":10,"account":20,"character":0,"level":6,"weapon":null,"armor":null},"#,
+                r#"{"entity":11,"account":21,"character":1,"level":7,"weapon":3,"armor":4}],"#,
+                r#""preemptive":false,"back_attack":true,"battle_speed":128,"ticks_per_second":60,"data_fingerprint":""#,
+                "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+                r#""}}"#
+            ),
+        );
+        // An engine step: no command, and the JSON has no `command` key at all.
+        golden(
+            ServerMsg::BattleEvent {
+                battle_id: BattleId(1),
+                tick: 120,
+                events: vec![battle::BattleEvent::GaugeReady { actor: ActorId(0) }],
+                command: None,
+            },
+            r#"{"BattleEvent":{"battle_id":1,"tick":120,"events":[{"GaugeReady":{"actor":0}}]}}"#,
+        );
+        // A party command and what it did.
+        golden(
+            ServerMsg::BattleEvent {
+                battle_id: BattleId(1),
+                tick: 130,
+                events: vec![
+                    battle::BattleEvent::Damage { actor: ActorId(0), target: ActorId(2), amount: 42, critical: false },
+                    battle::BattleEvent::Death { actor: ActorId(2) },
+                    battle::BattleEvent::Victory,
+                ],
+                command: Some(AppliedCommand { actor: ActorId(0), command: battle::Command::Attack { target: ActorId(2) } }),
+            },
+            concat!(
+                r#"{"BattleEvent":{"battle_id":1,"tick":130,"events":["#,
+                r#"{"Damage":{"actor":0,"target":2,"amount":42,"critical":false}},{"Death":{"actor":2}},"Victory"],"#,
+                r#""command":{"actor":0,"command":{"Attack":{"target":2}}}}}"#
+            ),
+        );
+        // An absent `command` may also be spelled out (`null`) by a sender; it reads as absent.
+        let spelled: ServerMsg =
+            decode(br#"{"BattleEvent":{"battle_id":1,"tick":120,"events":[],"command":null}}"#).expect("null command");
+        assert_eq!(spelled, ServerMsg::BattleEvent { battle_id: BattleId(1), tick: 120, events: vec![], command: None });
+        golden(
+            ServerMsg::BattleEnd {
+                battle_id: BattleId(1),
+                outcome: battle::Outcome::Victory,
+                rewards: vec![
+                    BattleReward { account: AccountId(20), exp: 6, gil: 10, ap: 2 },
+                    BattleReward { account: AccountId(21), exp: 0, gil: 0, ap: 0 },
+                ],
+            },
+            concat!(
+                r#"{"BattleEnd":{"battle_id":1,"outcome":"Victory","rewards":["#,
+                r#"{"account":20,"exp":6,"gil":10,"ap":2},{"account":21,"exp":0,"gil":0,"ap":0}]}}"#
+            ),
+        );
+        golden(
+            ServerMsg::BattleEnd { battle_id: BattleId(2), outcome: battle::Outcome::Defeat, rewards: vec![] },
+            r#"{"BattleEnd":{"battle_id":2,"outcome":"Defeat","rewards":[]}}"#,
+        );
+        golden(
+            ServerMsg::BattleRejected { battle_id: Some(BattleId(1)), reason: BattleRejection::GaugeNotFull },
+            r#"{"BattleRejected":{"battle_id":1,"reason":"GaugeNotFull"}}"#,
+        );
+        golden(
+            ServerMsg::BattleRejected { battle_id: None, reason: BattleRejection::Unsupported },
+            r#"{"BattleRejected":{"battle_id":null,"reason":"Unsupported"}}"#,
+        );
+    }
+
+    /// The engine's own events, commands and outcomes are embedded in the messages, so their shape is
+    /// part of the wire: a change in `fmv-ff7-battle` fails here instead of changing the protocol.
+    #[test]
+    fn golden_engine_types_on_the_wire() {
+        let (a, t) = (ActorId(0), ActorId(3));
+        let events: Vec<(battle::BattleEvent, &str)> = vec![
+            (battle::BattleEvent::GaugeReady { actor: a }, r#"{"GaugeReady":{"actor":0}}"#),
+            (
+                battle::BattleEvent::Damage { actor: a, target: t, amount: 1234, critical: true },
+                r#"{"Damage":{"actor":0,"target":3,"amount":1234,"critical":true}}"#,
+            ),
+            (battle::BattleEvent::Miss { actor: t, target: a }, r#"{"Miss":{"actor":3,"target":0}}"#),
+            (battle::BattleEvent::Death { actor: t }, r#"{"Death":{"actor":3}}"#),
+            (battle::BattleEvent::Victory, r#""Victory""#),
+            (battle::BattleEvent::Defeat, r#""Defeat""#),
+        ];
+        for (event, expected) in events {
+            golden(event, expected);
+        }
+        golden(battle::Command::Attack { target: t }, r#"{"Attack":{"target":3}}"#);
+        golden(battle::Outcome::Victory, r#""Victory""#);
+        golden(battle::Outcome::Defeat, r#""Defeat""#);
+        golden(ActorId(7), "7");
+        golden(BattleId(9), "9");
+    }
+
+    /// Every refusal keeps its name (clients show them and bots match on them).
+    #[test]
+    fn golden_battle_rejections() {
+        let cases = [
+            (BattleRejection::Unsupported, r#""Unsupported""#),
+            (BattleRejection::DebugDisabled, r#""DebugDisabled""#),
+            (BattleRejection::AlreadyInBattle, r#""AlreadyInBattle""#),
+            (BattleRejection::UnknownFormation, r#""UnknownFormation""#),
+            (BattleRejection::NotInBattle, r#""NotInBattle""#),
+            (BattleRejection::NotYourActor, r#""NotYourActor""#),
+            (BattleRejection::GaugeNotFull, r#""GaugeNotFull""#),
+            (BattleRejection::ActorDead, r#""ActorDead""#),
+            (BattleRejection::InvalidTarget, r#""InvalidTarget""#),
+            (BattleRejection::TargetDead, r#""TargetDead""#),
+            (BattleRejection::BattleOver, r#""BattleOver""#),
+        ];
+        for (reason, expected) in cases {
+            golden(reason, expected);
+        }
+    }
+
+    /// No battle message can carry anything but ids, seeds, numbers and the engine's events: the
+    /// fields of the largest one are all fixed-size numbers, flags, ids and a fingerprint.
+    #[test]
+    fn a_battle_start_is_small_and_carries_no_game_data() {
+        let msg = ServerMsg::EncounterStart {
+            battle_id: BattleId(u64::MAX),
+            formation_id: u16::MAX,
+            seed: u64::MAX,
+            party: (0..MAX_BATTLE_PARTY as u64)
+                .map(|i| BattleMember {
+                    entity: EntityId(u64::MAX - i),
+                    account: AccountId(u64::MAX - i),
+                    character: u8::MAX,
+                    level: u8::MAX,
+                    weapon: Some(u8::MAX),
+                    armor: Some(u8::MAX),
+                })
+                .collect(),
+            preemptive: false,
+            back_attack: false,
+            battle_speed: u8::MAX,
+            ticks_per_second: u32::MAX,
+            data_fingerprint: Fingerprint([0xff; 32]),
+        };
+        let frame = encode(&msg).unwrap();
+        assert!(frame.len() < 2_048, "{} bytes", frame.len());
+        // A hundred events in one message still fits a frame with room to spare.
+        let busy = ServerMsg::BattleEvent {
+            battle_id: BattleId(u64::MAX),
+            tick: u64::MAX,
+            events: (0..100)
+                .map(|i| battle::BattleEvent::Damage { actor: ActorId(i), target: ActorId(255), amount: u32::MAX, critical: true })
+                .collect(),
+            command: Some(AppliedCommand { actor: ActorId(255), command: battle::Command::Attack { target: ActorId(255) } }),
+        };
+        assert!(encode(&busy).unwrap().len() < MAX_FRAME as usize / 8);
+    }
+
+    #[test]
+    fn a_v3_hello_reads_as_a_v3_hello_and_a_v2_one_is_still_readable_as_a_version() {
+        let v3 = br#"{"Hello":{"protocol_version":3,"client_build":"x","auth":{"Register":{"display_name":"n"}},"tint":[1,2,3],"appearance_ref":null}}"#;
+        assert!(decode::<ClientMsg>(v3).is_ok());
+        assert_eq!(probe_hello_version(v3), Some(3));
     }
 
     #[test]

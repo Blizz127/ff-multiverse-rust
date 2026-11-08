@@ -1,4 +1,4 @@
-//! Authoritative FF Multiverse server for protocol v2 (`fmv-protocol`).
+//! Authoritative FF Multiverse server for protocol v3 (`fmv-protocol`).
 //!
 //! The server hosts exactly one area, obtained from a `GameAdapter` (`Box<dyn GameAdapter>`, so
 //! wiring a real game later is a one-line change in the binary). It owns all positions: clients
@@ -24,6 +24,17 @@
 //! tint and appearance come from its stored avatar profile, never from the client after
 //! registration. Parties are one `fmv_party::PartyManager` inside the `World`; a player that
 //! disconnects leaves its party. The protocol is documented in `fmv_protocol`.
+//!
+//! # Battles
+//!
+//! A server given [`BattleSettings`] (`ServerConfig::battle`) runs shared, server-authoritative
+//! battles on the deterministic `fmv-ff7-battle` engine over its OWN `scene.bin` and `kernel.bin`:
+//! it starts one for a whole party from a random encounter roll in an area with an encounter table,
+//! or on `RequestEncounter` when `ServerConfig::debug_encounters` is on (off by default), freezes
+//! the players in it, steps the engine on the world tick, validates every command and tells the
+//! members what happened; clients replay it from their own files. A server without battle data
+//! (the FIXTURE one) refuses every request with `BattleRejection::Unsupported`. See the `world`
+//! module for the rules, and `fmv_protocol::battle` for the wire contract.
 //!
 //! # What the server trusts an adapter for
 //!
@@ -55,8 +66,7 @@ mod world;
 pub use accounts::MAX_APPEARANCE_REF;
 
 pub use config::{
-    ConfigError, ServerConfig, DEFAULT_IDLE_TIMEOUT, DEFAULT_KEEPALIVE, DEFAULT_REGISTRATIONS_PER_MINUTE, MAX_BUILD_SUFFIX,
-    MAX_CONNECTIONS_LIMIT, MAX_REGISTRATIONS_PER_MINUTE, MAX_TICK_HZ,
+    BattleSettings, ConfigError, ServerConfig, DEFAULT_IDLE_TIMEOUT, DEFAULT_KEEPALIVE, DEFAULT_REGISTRATIONS_PER_MINUTE, MAX_BUILD_SUFFIX, MAX_CONNECTIONS_LIMIT, MAX_REGISTRATIONS_PER_MINUTE, MAX_TICK_HZ,
 };
 pub use conn::{SERVER_BUILD, SHUTDOWN_REASON};
 
@@ -210,7 +220,8 @@ impl Server {
         });
         let display_name = label.display_name;
 
-        let world = World::with_party_config(area, config.party)?;
+        let mut world = World::with_party_config(area, config.party)?;
+        world.configure_battle(config.battle.clone(), config.debug_encounters);
         let (store, ephemeral_state) = open_store(&config).await?;
         let listener = TcpListener::bind(config.bind)
             .await
@@ -220,6 +231,17 @@ impl Server {
         info!(area = %area_id, name = %display_name, ?provenance, fixture, "hosting area");
         if fixture {
             warn!("hosting a FIXTURE area: synthetic test content, NOT FF7 support");
+        }
+        match (&config.battle, config.debug_encounters) {
+            (Some(b), debug_on) => info!(
+                debug_encounters = debug_on,
+                battle_speed = b.battle_speed,
+                ticks_per_second = b.ticks_per_second,
+                fixed_seed = b.fixed_seed.is_some(),
+                "battles supported (server-authoritative; clients replay them from their own battle data)"
+            ),
+            (None, true) => warn!("--debug-encounters has no effect: this server has no battle data, so battles are unsupported"),
+            (None, false) => info!("battles unsupported on this server (no owned battle data); battle requests are refused"),
         }
         if !local_addr.ip().is_loopback() {
             warn!(%local_addr, "listening on a non-loopback address; protocol v2 is not encrypted (account tokens and game traffic cross the network in the clear): use it only on a network you trust");
@@ -390,8 +412,8 @@ async fn open_store(config: &ServerConfig) -> Result<(Arc<Store>, Option<tempfil
     Ok((Arc::new(store), ephemeral))
 }
 
-/// Advance the world once per tick; each tick broadcasts the entities that changed (if any) and
-/// expires timed-out party invites.
+/// Advance the world once per tick; each tick broadcasts the entities that changed (if any),
+/// expires timed-out party invites and steps the running battles.
 async fn tick_loop(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) {
     // `validate()` guarantees tick_hz >= 1, so the period is never zero.
     let period = Duration::from_secs_f64(1.0 / f64::from(shared.cfg.tick_hz));
@@ -400,9 +422,11 @@ async fn tick_loop(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) {
     loop {
         tokio::select! {
             _ = interval.tick() => {
+                let now = Instant::now();
                 let mut world = shared.world();
                 world.advance_tick();
-                world.expire_parties(Instant::now());
+                world.expire_parties(now);
+                world.advance_battles(now);
             }
             () = wait_flag(&mut shutdown) => break,
         }

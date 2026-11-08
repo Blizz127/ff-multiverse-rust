@@ -47,7 +47,9 @@ their own copy, compare content fingerprints at the handshake and walk on the re
 (server-validated); the window draws the decoded background with the walkmesh projected through
 the field's own camera. **Milestone 2 is partly in the game:** accounts with persistent avatar
 profiles (M2-a) and parties of up to three with story-phase placement (M2-b) work end to end
-(protocol v2). Shared battles (M2-c/d) are next. The synthetic **FIXTURE** plaza still exists
+(protocol v2), and **shared battles (M2-c/d, protocol v3)** run on the deterministic
+`fmv-ff7-battle` engine: the server steps a battle for the whole party, each client replays it
+from its own `scene.bin` and `kernel.bin`. The synthetic **FIXTURE** plaza still exists
 as a labelled test area; it says nothing about FF7 support.
 
 | Milestone | Scope | State |
@@ -55,7 +57,7 @@ as a labelled test area; it says nothing about FF7 support.
 | M1 | One real FF7 field, two connected players, server-side walkmesh validation | done |
 | M2-a | Accounts, persistent avatar profile, per-game progression store | done |
 | M2-b | Parties (invite, accept, leave, kick, promote), phase-key instance placement | done (single phase) |
-| M2-c/d | Shared battle, battle return, per-player rewards | planned |
+| M2-c/d | Shared battle, battle return, per-player rewards | done (battle subset; rewards logged and sent, not stored yet) |
 | Later | FF8, FF9, FF10 and FF12 adapters on the same core | planned |
 
 Not done yet: choosing an FF7 character model for your avatar, NPCs, field scripts, music, and
@@ -151,14 +153,15 @@ one SMOKE line:
 ```
 target/release/fmv-client --server <addr> --name A --headless --duration 5
 target/release/fmv-client --server <addr> --name B --headless --duration 5
-SMOKE name=<n> area=<AreaId> fixture=<bool> peers_seen=<n> updates=<n> rejected=<n> rtt_ms=<n> party=<n>
+SMOKE name=<n> area=<AreaId> fixture=<bool> peers_seen=<n> updates=<n> rejected=<n> rtt_ms=<n> party=<n> battles=<n> victories=<n>
 ```
 
 `peers_seen` of at least 1 means that client saw the other player; `party` is the largest
 party this client was in during the run (0 if none). Bots can form a party: give one
-`--party-invite-first-peer` and the other `--party-accept`, and both lines end with `party=2`.
-These line formats are a contract: `scripts/smoke.sh` parses them (it ignores the trailing
-`party=` field).
+`--party-invite-first-peer` and the other `--party-accept`, and both lines show `party=2`.
+`battles` and `victories` (appended in protocol v3) count the shared battles the client
+entered and the server ended in victory. These line formats are a contract: `scripts/smoke.sh`
+parses them by key (it ignores the fields it does not know).
 
 **Window mode** (needs a display):
 
@@ -193,6 +196,17 @@ area name (`FF7 md1stin`), the connection status (players, round-trip time) and 
 a FIXTURE area wears the label `FIXTURE (synthetic, not FF7)`. The window title still shows your
 party size and a pending invite.
 
+*In a battle.* **B** asks the server for a debug battle (refused unless it runs with
+`--debug-encounters`; random encounters start battles by themselves in a field that has an
+encounter table). The window then shows the battle: enemy bars on top, your party below, one card
+per fighter with an HP bar and an ATB gauge; a yellow border and a yellow gauge mean that
+character can act, a white corner marks yours, and a band across the top is green while your
+client's replay agrees with the server (red if it ever diverges). **Space** or **Enter** attacks
+the first living enemy with your character. Each fighter's name and HP numbers and a line that
+says whose turn it is are drawn in the UI font over the cards (the window title repeats the
+headline). (The battle view has been checked by unit tests and an offscreen render only: this
+box has no display, so the window itself was not run.)
+
 **One command for the basics:** `scripts/smoke.sh` starts the server, runs two headless bots
 concurrently, checks both SMOKE lines and stops the server. It uses `target/release` by
 default; `--debug`, `--build` and `--bin-dir <dir>` are available, and `--help` lists the
@@ -220,9 +234,34 @@ members are placed: the instance follows the leader's story phase (`InstancePlac
 member whose own phase differs keeps their progression but is told they may not advance the
 story there. Today every player is in the single free-roam phase.
 
-**Protocol v2** (`fmv-protocol`) carries all of the above; its module docs describe the flow,
-and golden JSON tests pin the wire format. A client or server of another protocol version is
-refused with a clear message.
+**Shared battles (protocol v3).** A battle starts for the whole party (or a solo player): from a
+random encounter while walking in a field that has an encounter table (`md1stin` has one), or
+when a player asks for one and the server runs with `--debug-encounters` (off by default). The
+players in it are frozen in the field. The server owns the battle (`fmv-ff7-battle`'s seeded,
+deterministic engine over its own `scene.bin` and `kernel.bin`), steps it, checks that every
+command comes from the character's own player with a full gauge, and announces every step;
+`EncounterStart` carries only the formation id, a seed, who plays which character at which level
+and a fingerprint of the server's battle data, so each client rebuilds the very same battle
+from its own files and replays it, and shouts `BATTLE DIVERGENCE` if its engine ever disagrees
+with the server's. When it ends everyone is back in the field and `BattleEnd` carries the
+rewards (experience and gil shared among the living, AP to each): they are logged and sent, not
+stored, because an account's progression blob is also its story phase. A server without
+battle data (the FIXTURE one, or `--ff7-flevel`) refuses every battle request cleanly.
+`scripts/battle-smoke.sh` runs two bots through one real battle on `md1stin` and checks that both
+members attacked (the server logs the accepted commands per actor) and that each bot replayed the
+battle from its own game files and matched (`verified by replay`, not merely "no divergence").
+
+`md1stin`'s own encounter table (section 6 of the field file, Steam PC build): the first of its
+two 24-byte tables is the enabled one, with rate 128 (a roll succeeds with probability 128/1024)
+and three formations whose weights add up to 64: 301 (weight 24, two enemies), 302 (22, one enemy)
+and 303 (18, two enemies); the second table is disabled. The server reads every field's table the
+same way (checked over all 702 fields of that build: every enabled table's weights add up to 64
+and every formation exists in `scene.bin`). A starting party wins 301 and 303 every time (200 of
+200 seeded runs each, both members attacking), which is why the smoke script uses 301.
+
+**Protocol v3** (`fmv-protocol`) carries all of the above; its module docs describe the flow,
+and golden JSON tests pin the wire format (the engine's own event, command and outcome types
+included). A client or server of another protocol version is refused with a clear message.
 
 ## Importing your own FF7 data
 

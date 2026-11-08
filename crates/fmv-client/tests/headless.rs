@@ -504,8 +504,10 @@ fn smoke_fields(line: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// The contract of `scripts/smoke.sh`: these keys, in this order, and nothing else.
-const SMOKE_KEYS: [&str; 8] = ["name", "area", "fixture", "peers_seen", "updates", "rejected", "rtt_ms", "party"];
+/// The contract of `scripts/smoke.sh`: these keys, in this order, and nothing else. The first eight
+/// are protocol v2's; `battles` and `victories` were appended in v3 (fields are only ever appended).
+const SMOKE_KEYS: [&str; 10] =
+    ["name", "area", "fixture", "peers_seen", "updates", "rejected", "rtt_ms", "party", "battles", "victories"];
 
 /// stdout is exactly one SMOKE line with exactly the documented keys in the documented order.
 fn assert_smoke_contract(stdout: &str) -> HashMap<String, String> {
@@ -514,7 +516,8 @@ fn assert_smoke_contract(stdout: &str) -> HashMap<String, String> {
     let fields = smoke_fields(stdout.trim_end());
     let keys: Vec<&str> = fields.iter().map(|(k, _)| k.as_str()).collect();
     assert_eq!(keys, SMOKE_KEYS, "the SMOKE keys and their order are a contract: {stdout}");
-    assert_eq!(keys.last(), Some(&"party"), "party is the appended field: {stdout}");
+    assert_eq!(keys[..8], SMOKE_KEYS[..8], "the v2 keys come first, unchanged: {stdout}");
+    assert_eq!(keys.last(), Some(&"victories"), "the battle fields are the appended ones: {stdout}");
     fields.into_iter().collect()
 }
 

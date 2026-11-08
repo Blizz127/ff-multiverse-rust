@@ -914,6 +914,59 @@ impl Renderer {
     }
 }
 
+// A pure addition for the battle view (`crate::battle`): a frame made only of flat-coloured
+// vertices, with the same surface handling as `Renderer::render` above (kept as its own block so
+// that the existing function stays untouched).
+impl Renderer {
+    /// Draw one frame of flat-coloured vertices only (no backdrop, no walkmesh), then the UI
+    /// `overlay` (text) over it: `build` gets the surface size in pixels and whether the target is
+    /// sRGB (see [`color`]) and returns the vertices, in NDC, painter's order. The surface handling
+    /// (resize, minimised, outdated, lost) is `render_with`'s.
+    pub fn render_flat(
+        &mut self,
+        build: impl FnOnce(u32, u32, bool) -> Vec<Vertex>,
+        overlay: Option<&crate::ui::draw::DrawList>,
+    ) -> FrameResult {
+        let (w, h) = self.size;
+        if w == 0 || h == 0 {
+            return FrameResult::Skipped;
+        }
+        if self.needs_reconfigure {
+            self.reconfigure();
+        }
+        let frame = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(f) => f,
+            wgpu::CurrentSurfaceTexture::Suboptimal(f) => {
+                self.needs_reconfigure = true;
+                f
+            }
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                return FrameResult::Skipped
+            }
+            wgpu::CurrentSurfaceTexture::Outdated => {
+                self.needs_reconfigure = true;
+                return FrameResult::Skipped;
+            }
+            wgpu::CurrentSurfaceTexture::Lost => {
+                return match self.recreate_surface() {
+                    Ok(()) => FrameResult::Skipped,
+                    Err(e) => FrameResult::Fatal(e),
+                };
+            }
+            wgpu::CurrentSurfaceTexture::Validation => return FrameResult::Skipped,
+        };
+        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let vertices = build(w, h, self.srgb);
+        self.gpu.draw_scene(&view, &vertices, None, CLEAR_RGB, self.srgb);
+        if let Some(overlay) = overlay {
+            self.gpu.draw_overlay(&view, &overlay.vertices(w, h, self.srgb));
+        }
+        self.window.pre_present_notify();
+        self.gpu.queue.present(frame);
+        FrameResult::Presented
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
