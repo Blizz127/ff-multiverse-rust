@@ -29,7 +29,8 @@
 //!   the uniqueness key is derived from it with `fmv_core::name_key` when the log is read, so
 //!   an improved key rule takes effect on the next open without rewriting anything),
 //! * `{"op":"avatar","account":7,"avatar":3}`: an avatar attached to an existing account,
-//! * `{"op":"claim","account":7}`: the account's token was used to log in at least once,
+//! * `{"op":"claim","account":7}`: the account's token was used to log in at least once, or its
+//!   owner was recorded as holding it (`Store::mark_claimed`),
 //! * `{"op":"release","account":7}`: an orphaned account was removed,
 //! * `{"op":"next","account":8,"avatar":4}`: id high-water marks (written by compaction, so
 //!   that released ids are never handed out again).
@@ -102,8 +103,9 @@ pub(crate) struct AccountEntry {
     pub token: TokenHash,
     pub avatar: Option<u64>,
     pub created_at: u64,
-    /// Its token has been used to log in at least once. False only for an account nobody has
-    /// logged into yet, which is what makes it an orphan candidate (see `release_unclaimed`).
+    /// Its token has been used to log in at least once, or its owner was recorded as holding it
+    /// (`Store::mark_claimed`). False only for an account where neither happened, which is what
+    /// makes it an orphan candidate (see `release_unclaimed`).
     pub claimed: bool,
 }
 

@@ -124,7 +124,7 @@ fn row<'a>(bars: &'a [Bar], enemy: bool, region: Rect, out: &mut Vec<Card<'a>>) 
         return;
     }
     let slot = region.width() / n as f32;
-    let card_w = (slot - GAP).min(CARD_W_MAX).max(8.0);
+    let card_w = (slot - GAP).clamp(8.0, CARD_W_MAX);
     let card_h = CARD_H.min((region.y1 - region.y0).max(8.0));
     let y0 = region.y0 + ((region.y1 - region.y0) - card_h).max(0.0) * 0.5;
     for (i, bar) in bars.iter().enumerate() {

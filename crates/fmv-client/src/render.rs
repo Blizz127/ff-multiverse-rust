@@ -1239,7 +1239,7 @@ mod tests {
         let square = (PLAYER_HALF_PX + OUTLINE_PX) * std::f32::consts::SQRT_2;
         let diamond = (OWN_HALF_PX + OUTLINE_PX) * 1.25;
         assert!(RING_INNER_PX > square + 1.0 && RING_INNER_PX > diamond + 1.0, "{square} {diamond}");
-        assert!(RING_OUTER_PX - RING_INNER_PX <= 3.0 && RING_OUTER_PX > RING_INNER_PX);
+        const { assert!(RING_OUTER_PX - RING_INNER_PX <= 3.0 && RING_OUTER_PX > RING_INNER_PX) };
         assert_eq!(RING_SEGMENTS, 24);
     }
 

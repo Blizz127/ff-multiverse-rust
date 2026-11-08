@@ -115,6 +115,13 @@ pub trait AreaRuntime: Send + Sync {
     }
 }
 
+/// A game adapter bound to one owned-content source (or the synthetic fixture).
+pub trait GameAdapter: Send + Sync {
+    fn game(&self) -> GameId;
+    fn list_areas(&self) -> Vec<AreaInfo>;
+    fn load_area(&self, key: &str) -> Result<Box<dyn AreaRuntime>, AdapterError>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,11 +154,4 @@ mod tests {
         assert!(EncounterTable::default().is_empty());
         assert_eq!(EncounterTable::default().pick(0), None);
     }
-}
-
-/// A game adapter bound to one owned-content source (or the synthetic fixture).
-pub trait GameAdapter: Send + Sync {
-    fn game(&self) -> GameId;
-    fn list_areas(&self) -> Vec<AreaInfo>;
-    fn load_area(&self, key: &str) -> Result<Box<dyn AreaRuntime>, AdapterError>;
 }

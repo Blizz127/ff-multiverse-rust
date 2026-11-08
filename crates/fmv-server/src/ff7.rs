@@ -147,16 +147,18 @@ const ENCOUNTER_SLOTS: usize = 6;
 /// that are not decoded (APPROXIMATION: a battle is never a special one). The first table that is
 /// enabled and has an entry is the area's; `None` when neither is (no random battles there).
 pub fn decode_encounter_section(bytes: &[u8]) -> Option<EncounterTable> {
-    bytes.chunks_exact(ENCOUNTER_TABLE_LEN).find_map(|table| {
+    bytes.as_chunks::<ENCOUNTER_TABLE_LEN>().0.iter().find_map(|table| {
         let (enabled, rate) = (*table.first()?, *table.get(1)?);
         if enabled == 0 || rate == 0 {
             return None;
         }
         let entries: Vec<EncounterEntry> = table
             .get(2..2 + 2 * ENCOUNTER_SLOTS)?
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .filter_map(|pair| {
-                let raw = u16::from_le_bytes([*pair.first()?, *pair.get(1)?]);
+                let raw = u16::from_le_bytes(*pair);
                 let (formation, weight) = (raw & 0x03FF, raw >> 10);
                 (weight > 0).then_some(EncounterEntry { formation, weight })
             })

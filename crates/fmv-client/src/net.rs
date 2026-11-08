@@ -73,7 +73,10 @@ impl SessionTiming {
 /// A small cloneable wrapper so [`NetConfig`] stays `Clone + Debug`: the closure is shared, and
 /// its `Debug` shows nothing (it may capture paths, never the token).
 #[derive(Clone)]
-pub struct TokenSink(Arc<dyn Fn(&Secret) -> Result<(), String> + Send + Sync>);
+pub struct TokenSink(Arc<SaveToken>);
+
+/// What a [`TokenSink`] runs.
+type SaveToken = dyn Fn(&Secret) -> Result<(), String> + Send + Sync;
 
 impl TokenSink {
     /// A sink that runs `save`. Its error text is shown to the user, so it must not contain the
@@ -1744,7 +1747,7 @@ mod tests {
         let adapter = Relabeled(FixtureAdapter::new());
         let info = adapter.list_areas().remove(0);
         let offered = FixtureAdapter::new().list_areas().remove(0).provenance.summary();
-        let ok = check_local_content(&adapter, &info.id, &info.fingerprint, &offered).ok().expect("compatible");
+        let ok = check_local_content(&adapter, &info.id, &info.fingerprint, &offered).expect("compatible");
         assert_eq!(ok.provenance, info.provenance.summary());
         assert_eq!(ok.runtime.info().fingerprint, info.fingerprint);
     }
