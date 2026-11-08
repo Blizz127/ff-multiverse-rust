@@ -536,17 +536,30 @@ pub fn draw_popups(out: &mut DrawList, l: &Layout, view: &BattleView, anchors: &
     }
 }
 
-/// Where the end-of-battle panel goes: centred across the window and **hung from the top of the stage**, just
-/// under the banner. (It used to be centred in the stage, where it covered the leftmost party member's
-/// victory pose; the poses are played in the stage below it now.) On a window too small for it, as high as
-/// the room allows.
-fn finale_area(l: &Layout, w: i32, h: i32) -> Area {
+/// How far (canvas units) a fighter's body reaches to either side of the point over its head, for the end-of-battle
+/// panel to keep off it.
+const FINALE_REACH: i32 = 16;
+
+/// Where the end-of-battle panel goes: **hung from the top of the stage**, just under the banner (on a window too
+/// small for it, as high as the room allows), and across the window in the first of three spots (centred, at the
+/// left, at the right) that has the fewest of `heads` under it: the points over the heads (window pixels) of the
+/// fighters that must stay in view, which are the party's after a win, standing in their victory poses. (It used
+/// to be centred in the middle of the stage, where it covered the leftmost member's pose; the party stands on the
+/// right of most stages, so the usual place for it after a win is over the left, where the beaten enemies were.)
+/// Only the horizontal places count, so the panel does not hop when a fighter breathes under its edge.
+fn finale_area(l: &Layout, w: i32, h: i32, heads: &[(f32, f32)]) -> Area {
     let (top, bottom) = (l.banner_y + BANNER_H + 4, l.enemy.y - 4);
-    Area { x: (l.cw - w) / 2, y: top.min(bottom - h).max(0), w, h }
+    let spots = [(l.cw - w) / 2, MARGIN, l.cw - MARGIN - w];
+    let scale = l.s.max(1) as f32;
+    let covered = |x: i32| heads.iter().filter(|&&(hx, _)| hx.is_finite() && (x - FINALE_REACH) as f32 <= hx / scale && hx / scale <= (x + w + FINALE_REACH) as f32).count();
+    // `min_by_key` keeps the first of the best: the centre unless another spot is clearer.
+    let x = spots.iter().copied().min_by_key(|&x| covered(x)).unwrap_or(spots[0]);
+    Area { x, y: top.min(bottom - h).max(0), w, h }
 }
 
-/// The victory, defeat or escaped panel, once its moment has come.
-pub fn draw_finale(c: &mut Canvas<'_>, l: &Layout, finale: &Finale) {
+/// The victory, defeat or escaped panel, once its moment has come. `heads` are the points over the heads (window
+/// pixels) of the fighters it must not cover (see [`finale_area`]): the party's after a win, none otherwise.
+pub fn draw_finale(c: &mut Canvas<'_>, l: &Layout, finale: &Finale, heads: &[(f32, f32)]) {
     if finale.age_ms < PANEL_DELAY_MS {
         return;
     }
@@ -580,7 +593,7 @@ pub fn draw_finale(c: &mut Canvas<'_>, l: &Layout, finale: &Finale) {
     let body_rows = i32::try_from(rows.len().max(usize::from(note.is_some()))).unwrap_or(1);
     let w = 216.min((l.cw - 2 * MARGIN).max(40));
     let h = PAD + 16 + 6 + body_rows * ROW_H + 4 + if finale.dismissible { 12 } else { 0 } + PAD;
-    let a = finale_area(l, w, h);
+    let a = finale_area(l, w, h, heads);
     window(c, a);
     let inner = a.inner();
     let title_w = i32::try_from(cell_count(title)).unwrap_or(0) * 16;
@@ -958,7 +971,7 @@ mod tests {
         let reward = RewardLine { exp: 626, gil: 1_200, ap: 18, items: vec![RewardItem { name: "Potion".into(), count: 2 }] };
         let panel = |f: &Finale| {
             let mut list = DrawList::new();
-            draw_finale(&mut Canvas { out: &mut list, s: l.s }, &l, f);
+            draw_finale(&mut Canvas { out: &mut list, s: l.s }, &l, f, &[]);
             list
         };
         assert!(panel(&finale(Outcome::Victory, Some(reward.clone()), PANEL_DELAY_MS - 1, true)).is_empty(), "the killing blow gets its moment first");
@@ -980,7 +993,7 @@ mod tests {
         let l = layout(1100, 680, 3);
         let panel = |f: &Finale| {
             let mut list = DrawList::new();
-            draw_finale(&mut Canvas { out: &mut list, s: l.s }, &l, f);
+            draw_finale(&mut Canvas { out: &mut list, s: l.s }, &l, f, &[]);
             list
         };
         assert!(panel(&finale(Outcome::Escaped, None, PANEL_DELAY_MS - 1, true)).is_empty(), "it waits like the others");
@@ -1036,7 +1049,7 @@ mod tests {
     fn the_defeat_panel_says_so_in_red() {
         let l = layout(1100, 680, 3);
         let mut list = DrawList::new();
-        draw_finale(&mut Canvas { out: &mut list, s: l.s }, &l, &finale(Outcome::Defeat, None, 5000, true));
+        draw_finale(&mut Canvas { out: &mut list, s: l.s }, &l, &finale(Outcome::Defeat, None, 5000, true), &[]);
         assert!(list.says("DEFEAT") && list.says("fallen") && !list.says("VICTORY"));
         let title = list.texts().iter().find(|t| t.text == "DEFEAT" && t.color != SHADOW_COLOR).unwrap();
         assert_eq!(title.color, ERROR);
@@ -1048,7 +1061,7 @@ mod tests {
         for (w, h) in [(1100u32, 680u32), (1920, 1080), (800, 600), (640, 480), (320, 240)] {
             let l = layout(w, h, 3);
             let mut list = DrawList::new();
-            draw_finale(&mut Canvas { out: &mut list, s: l.s }, &l, &finale(Outcome::Victory, Some(reward.clone()), 9999, true));
+            draw_finale(&mut Canvas { out: &mut list, s: l.s }, &l, &finale(Outcome::Victory, Some(reward.clone()), 9999, true), &[]);
             assert!(!list.is_empty(), "{w}x{h}");
             for q in list.quads() {
                 assert!(q.x >= 0 && q.x + q.w <= w as i32, "{w}x{h}: {q:?} is outside the window horizontally");
@@ -1065,8 +1078,9 @@ mod tests {
             let l = layout(w, h, 3);
             let (x0, top, x1, bottom) = l.stage();
             for panel_h in [60, 100, 130] {
-                let a = finale_area(&l, 216, panel_h);
-                // Centred across the window, directly under the banner (the stage begins 4 units below it)...
+                let a = finale_area(&l, 216, panel_h, &[]);
+                // With nobody to keep clear of: centred across the window, directly under the banner (the stage
+                // begins 4 units below it)...
                 assert_eq!(a.x, (l.cw - 216) / 2, "{w}x{h}");
                 assert_eq!(a.y, l.banner_y + BANNER_H + 4, "{w}x{h}: under the banner");
                 // ... and well clear of the bottom of the stage, where the party stands: the panel ends in the
@@ -1078,8 +1092,44 @@ mod tests {
         }
         // A window with no room for it: as high as it can go, never above the window.
         let tiny = layout(320, 240, 3);
-        let a = finale_area(&tiny, 216, 400);
+        let a = finale_area(&tiny, 216, 400, &[]);
         assert!(a.y >= 0 && a.y <= tiny.banner_y + BANNER_H + 4);
+    }
+
+    #[test]
+    fn the_finale_panel_keeps_off_the_heads_of_the_victors_by_moving_to_the_side_that_is_clear() {
+        let l = layout(1100, 680, 3);
+        let at = |units: i32| ((units * l.s) as f32, 200.0f32);
+        let (w, h) = (216, 100);
+        let (centre, left, right) = ((l.cw - w) / 2, MARGIN, l.cw - MARGIN - w);
+        assert!(left < centre && centre < right, "three different places");
+        // Nobody under the centre: it stays there, whoever stands at the sides.
+        assert_eq!(finale_area(&l, w, h, &[at(left + 10), at(right + w - 10)]).x, centre);
+        // The party on the right (the usual stage): the centre's right half is theirs, so it goes left.
+        let on_the_right = [at(centre + w - 20), at(centre + w + 40), at(centre + w + 90)];
+        assert_eq!(finale_area(&l, w, h, &on_the_right).x, left);
+        // The party on the left: it goes right (the centre is covered too; the left is worse).
+        let on_the_left = [at(left + 30), at(left + 80), at(centre + 20)];
+        assert_eq!(finale_area(&l, w, h, &on_the_left).x, right);
+        // Somebody under every place: the one with the fewest, the centre when they tie.
+        let everywhere = [at(left + 10), at(centre + 100), at(right + 100)];
+        assert_eq!(finale_area(&l, w, h, &everywhere).x, centre);
+        // A body reaches a little way to the side: a head just past the edge still counts.
+        assert_eq!(finale_area(&l, w, h, &[at(centre + w + FINALE_REACH - 1)]).x, left);
+        assert_eq!(finale_area(&l, w, h, &[at(centre + w + FINALE_REACH + 40)]).x, centre);
+        // Heads that are not numbers are nobody's, and the height of a head does not matter (no hopping).
+        assert_eq!(finale_area(&l, w, h, &[(f32::NAN, 0.0), (f32::INFINITY, 1.0)]).x, centre);
+        let (a, b) = (finale_area(&l, w, h, &[(at(centre + 50).0, 150.0)]), finale_area(&l, w, h, &[(at(centre + 50).0, 600.0)]));
+        assert_eq!((a.x, a.y), (b.x, b.y));
+        // Whatever the places, the panel stays inside the window.
+        for (ww, hh) in [(1100u32, 680u32), (800, 600), (320, 240)] {
+            let l = layout(ww, hh, 3);
+            let w = 216.min((l.cw - 2 * MARGIN).max(40));
+            for x in [0, l.cw / 4, l.cw / 2, l.cw - 1] {
+                let a = finale_area(&l, w, 90, &[((x * l.s) as f32, 100.0)]);
+                assert!(a.x >= 0 && a.x + a.w <= l.cw.max(a.w), "{ww}x{hh}: {a:?} in a canvas of {}", l.cw);
+            }
+        }
     }
 
     #[test]
@@ -1151,7 +1201,8 @@ mod tests {
                 draw_banner(&mut c, &l, b);
             }
             if let Some(f) = &v.finale {
-                draw_finale(&mut c, &l, f);
+                let heads: Vec<(f32, f32)> = anchors.party.iter().flatten().copied().collect();
+                draw_finale(&mut c, &l, f, &heads);
             }
             draw_pointer(&mut list, &l, &v, &anchors, w);
             draw_popups(&mut list, &l, &v, &anchors, w, h);

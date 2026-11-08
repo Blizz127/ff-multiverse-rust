@@ -89,7 +89,14 @@ pub fn draw_battle_overlay(view: &BattleView, anchors: &Anchors, vw: u32, vh: u3
             draw_banner(&mut c, &l, banner);
         }
         if let Some(finale) = &view.finale {
-            draw_finale(&mut c, &l, finale);
+            // After a win the party stands in its victory poses: the panel keeps off their heads. (After a
+            // defeat or an escape nobody stands there to be kept in view.)
+            let heads: Vec<(f32, f32)> = if finale.outcome == Outcome::Victory {
+                view.party.iter().zip(&anchors.party).filter(|(b, _)| b.alive).filter_map(|(_, head)| *head).filter(|(x, y)| x.is_finite() && y.is_finite()).collect()
+            } else {
+                Vec::new()
+            };
+            draw_finale(&mut c, &l, finale, &heads);
         }
     }
     draw_pointer(out, &l, view, anchors, vw);
