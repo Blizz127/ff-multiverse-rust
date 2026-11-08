@@ -11,6 +11,8 @@ use crate::net::PartyCommand;
 use crate::render::{FrameResult, PlayerSprite, Renderer, Scene};
 use crate::session::{Session, SessionInfo};
 use crate::state::ClientState;
+use crate::ui::draw::DrawList;
+use crate::ui::hud;
 use fmv_core::GameId;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -68,25 +70,30 @@ fn friendly_os_error(text: &str) -> String {
         .map_or_else(|| text.to_string(), |(_location, message)| message.to_string())
 }
 
+/// How an event loop ended: `Err` if the windowing or GPU stack panicked.
+pub type LoopResult = std::thread::Result<Result<(), winit::error::EventLoopError>>;
+
+/// The attributes of the client's window (shared by the menu and the game, which use one window).
+pub fn window_attributes(title: String) -> winit::window::WindowAttributes {
+    Window::default_attributes()
+        .with_title(title)
+        .with_inner_size(LogicalSize::new(1100.0, 680.0))
+        .with_min_inner_size(LogicalSize::new(320.0, 240.0))
+}
+
 pub fn run(event_loop: EventLoop<()>, session: Session, view: FieldView) -> u8 {
     let mut app = App::new(session, view);
     // A panic inside the windowing or GPU stack must not skip the goodbye or end as a raw abort.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| event_loop.run_app(&mut app)));
-    app.leave(); // no-op when the loop already said goodbye
-    match (app.failure.take(), result) {
-        (Some(msg), _) => {
-            eprintln!("error: {msg}");
-            exit::FAILURE
-        }
-        (None, Err(payload)) => {
-            eprintln!("error: the window loop crashed: {}", panic_text(payload.as_ref()));
-            exit::FAILURE
-        }
-        (None, Ok(Err(e))) => {
-            eprintln!("error: the window event loop failed: {e}");
-            exit::FAILURE
-        }
-        (None, Ok(Ok(()))) => exit::OK,
+    app.finish(result)
+}
+
+/// The text of a panic or loop failure that is not a clean exit: what `run` prints.
+pub fn describe_loop_failure(result: &LoopResult) -> Option<String> {
+    match result {
+        Err(payload) => Some(format!("the window loop crashed: {}", panic_text(payload.as_ref()))),
+        Ok(Err(e)) => Some(format!("the window event loop failed: {e}")),
+        Ok(Ok(())) => None,
     }
 }
 
@@ -194,7 +201,7 @@ fn describe_request(cmd: PartyCommand) -> String {
     }
 }
 
-struct App {
+pub(crate) struct App {
     session: Session,
     /// How the area is drawn: walkmesh and bounds in view space, the mapping, the picture.
     view: FieldView,
@@ -212,7 +219,7 @@ struct App {
 }
 
 impl App {
-    fn new(session: Session, view: FieldView) -> Self {
+    pub(crate) fn new(session: Session, view: FieldView) -> Self {
         let base_title = base_title(&session.info);
         let now = Instant::now();
         Self {
@@ -227,6 +234,28 @@ impl App {
             last_title_party: (0, None),
             left: false,
             failure: None,
+        }
+    }
+
+    /// Take over a window and renderer that already exist (the character menu opens them first
+    /// and hands them over when the player joins). The window gets the game's title on the next
+    /// tick.
+    pub(crate) fn adopt_surface(&mut self, window: Arc<Window>, renderer: Renderer) {
+        self.window = Some(window);
+        self.renderer = Some(renderer);
+        self.last_tick = Instant::now();
+    }
+
+    /// The run's exit code once the event loop ended with `result`: says goodbye first (a no-op
+    /// when the loop already did) and reports a failure or a crash on stderr.
+    pub(crate) fn finish(&mut self, result: LoopResult) -> u8 {
+        self.leave();
+        match (self.failure.take(), describe_loop_failure(&result)) {
+            (Some(msg), _) | (None, Some(msg)) => {
+                eprintln!("error: {msg}");
+                exit::FAILURE
+            }
+            (None, None) => exit::OK,
         }
     }
 
@@ -360,7 +389,11 @@ impl App {
             fixture_banner: self.session.info.fixture,
             backdrop: view.backdrop.as_ref(),
         };
-        let result = renderer.render(&scene);
+        // Names, party, area, connection (and the FIXTURE label) over the scene.
+        let (vw, vh) = renderer.size();
+        let mut overlay = DrawList::new();
+        hud::draw_hud(&hud::gather(&self.session, view), vw, vh, &mut overlay);
+        let result = renderer.render_with(&scene, Some(&overlay));
         let gpu_error = renderer.first_gpu_error();
         match (result, gpu_error) {
             (FrameResult::Fatal(msg), _) => self.fail(el, msg),
@@ -375,10 +408,7 @@ impl ApplicationHandler for App {
         if self.window.is_some() {
             return;
         }
-        let attrs = Window::default_attributes()
-            .with_title(self.base_title.clone())
-            .with_inner_size(LogicalSize::new(1100.0, 680.0))
-            .with_min_inner_size(LogicalSize::new(320.0, 240.0));
+        let attrs = window_attributes(self.base_title.clone());
         let window = match el.create_window(attrs) {
             Ok(w) => Arc::new(w),
             Err(e) => return self.fail(el, format!("cannot create the window: {e}")),

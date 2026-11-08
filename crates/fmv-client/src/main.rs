@@ -27,6 +27,7 @@ mod party;
 mod render;
 mod session;
 mod state;
+mod ui;
 mod window;
 
 use accounts::{loose_mode_warning, TokenStore};
@@ -40,6 +41,7 @@ use fmv_ff7::Ff7Adapter;
 use login::LoginPlan;
 use net::{NetConfig, NetHandle};
 use session::Session;
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -113,6 +115,68 @@ fn field_view(ff7: Option<&Ff7Adapter>, session: &Session) -> FieldView {
     view
 }
 
+/// Say on stderr what was joined, and say it loudly when it is synthetic content.
+fn announce_joined(joined: &net::Joined) {
+    if joined.fixture {
+        banner(&[
+            &format!("FIXTURE AREA (synthetic, not FF7): {}", joined.area_id),
+            "This is generated test content, NOT FINAL FANTASY VII.",
+        ]);
+    }
+    let p = &joined.provenance;
+    eprintln!(
+        "joined {} `{}` [{} / {} / {}] on server {} (session {}, entity {}, account {})",
+        joined.area_id,
+        joined.area_name,
+        p.edition,
+        p.region,
+        p.revision,
+        joined.server_build,
+        joined.session.0,
+        joined.entity.0,
+        joined.account.0
+    );
+}
+
+/// Window mode without `--name`: open the window on the character menu (choose a saved character
+/// or create one), then play in the same window. Nothing is decided about the login yet; the
+/// content is opened first, as in every other mode, so the (slow) FF7 indexing never counts
+/// against a handshake deadline.
+fn run_menu(args: &Args, state_dir: &Path, store: TokenStore) -> u8 {
+    let LocalGame { client_build, ff7, .. } = match open_game(args) {
+        Ok(game) => game,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return exit::CONTENT;
+        }
+    };
+    // Without a display this fails fast with a clear message, before any traffic.
+    let event_loop = match window::create_event_loop() {
+        Ok(el) => el,
+        Err(e) => {
+            eprintln!("error: cannot open a window: {e}");
+            eprintln!("hint: use --headless to run without a window, or --name to log in from the command line");
+            return exit::FAILURE;
+        }
+    };
+    let game = match args.effective_game() {
+        GameChoice::Fixture => GameId::Fixture,
+        GameChoice::Ff7 => GameId::Ff7,
+    };
+    ui::shell::run(
+        event_loop,
+        ui::shell::Launch {
+            server: args.server.clone(),
+            store,
+            looks: ui::looks::LookCache::new(state_dir),
+            client_build,
+            game,
+            tint: args.tint,
+            ff7,
+        },
+    )
+}
+
 fn run(args: Args) -> u8 {
     // Accounts first: it is cheap and local, so a missing `--name` or a broken token file is
     // reported before the (slow) content indexing and before anything reaches a server.
@@ -124,6 +188,11 @@ fn run(args: Args) -> u8 {
         }
     };
     let store = TokenStore::new(&state_dir);
+    // A window without --name opens on the character menu; --name and --headless keep the
+    // command-line behaviour below.
+    if args.wants_menu() {
+        return run_menu(&args, &state_dir, store);
+    }
     let plan = match login::plan_login(&args.server, args.name.as_deref(), args.register, &store) {
         Ok(plan) => plan,
         Err(e) => {
@@ -195,25 +264,12 @@ fn run(args: Args) -> u8 {
         eprintln!("account: logged in with the saved token for \"{}\"", net::clean(&account.name));
     }
 
-    if joined.fixture {
-        banner(&[
-            &format!("FIXTURE AREA (synthetic, not FF7): {}", joined.area_id),
-            "This is generated test content, NOT FINAL FANTASY VII.",
-        ]);
+    announce_joined(&joined);
+    // The window (not a headless bot, whose accounts folder stays exactly as it was) remembers how
+    // the server shows this character, so the character menu can show it next time.
+    if !args.headless {
+        ui::looks::LookCache::new(&state_dir).remember_joined(&args.server, plan.name(), &joined.entities, joined.entity);
     }
-    let p = &joined.provenance;
-    eprintln!(
-        "joined {} `{}` [{} / {} / {}] on server {} (session {}, entity {}, account {})",
-        joined.area_id,
-        joined.area_name,
-        p.edition,
-        p.region,
-        p.revision,
-        joined.server_build,
-        joined.session.0,
-        joined.entity.0,
-        joined.account.0
-    );
 
     let session = Session::new(net, joined);
     match event_loop {

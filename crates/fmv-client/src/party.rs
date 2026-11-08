@@ -61,6 +61,16 @@ pub struct IncomingInvite {
     pub from_name: String,
 }
 
+/// One member of this account's party, as the in-game party list shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RosterEntry {
+    /// The cleaned display name (`account N` if the server never named the account).
+    pub name: String,
+    pub leader: bool,
+    /// This account itself.
+    pub you: bool,
+}
+
 /// What the table of names says about an account.
 #[derive(Debug, Clone)]
 struct KnownPlayer {
@@ -201,6 +211,18 @@ impl PartyMirror {
         self.names
             .iter()
             .any(|(account, known)| known.entity == Some(entity) && self.is_party_account(*account))
+    }
+
+    /// The members of this account's party in roster order, named from what the server said
+    /// (empty when this account is in none): what the in-game party list shows.
+    pub fn party_members(&self) -> Vec<RosterEntry> {
+        let Some(party) = &self.party else { return Vec::new() };
+        party
+            .members
+            .iter()
+            .take(16)
+            .map(|m| RosterEntry { name: self.name_of(*m), leader: party.is_leader(*m), you: *m == self.me })
+            .collect()
     }
 
     /// The newest (highest id) pending invite addressed to this account.
