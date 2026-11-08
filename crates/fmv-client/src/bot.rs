@@ -186,8 +186,10 @@ pub const PARTY_WAIT_S: f64 = 12.0;
 /// A bot that has arrived in an area it must leave again waits at least this long (the players
 /// there show up in the first updates)...
 pub const ARRIVAL_LINGER_S: f64 = 1.0;
-/// ...and until it has seen another player there, but at most this many seconds.
+/// ...and until it has seen another player there, but at most this many seconds...
 pub const PEER_WAIT_S: f64 = 8.0;
+/// ...and then this long after it first saw one, so that the other can see it too.
+pub const PEER_LINGER_S: f64 = 1.5;
 /// How far past the middle of an exit line the bot aims, so that a step that does not end exactly on
 /// the line ends beyond it.
 const OVERSHOOT: f32 = 30.0;
@@ -224,6 +226,8 @@ pub struct TravelBot {
     wait_for_party: bool,
     /// When the bot arrived in the area it is in now (`None`: it started here).
     arrived_at: Option<f64>,
+    /// When it first saw another player in the area it is in now.
+    peer_seen_at: Option<f64>,
     /// Steps in a row that made no headway.
     stuck: u32,
     /// Why the bot gave up, if it did.
@@ -262,6 +266,7 @@ impl TravelBot {
             route: route.into(),
             wait_for_party,
             arrived_at: None,
+            peer_seen_at: None,
             stuck: 0,
             gave_up: None,
             plan: None,
@@ -294,6 +299,7 @@ impl TravelBot {
         self.plan_cooldown = 0;
         self.failed_plans = 0;
         self.arrived_at = Some(now);
+        self.peer_seen_at = None;
         if self.route.front().is_some_and(|next| next.eq_ignore_ascii_case(area)) {
             self.route.pop_front();
             return true;
@@ -302,8 +308,10 @@ impl TravelBot {
     }
 
     /// May the bot walk right now? It does not while it waits for its party, nor while it lingers
-    /// in an area to be seen by the others before it leaves for the next one.
-    pub fn may_walk(&self, gate: TravelGate) -> bool {
+    /// in an area to be seen by the others before it leaves for the next one (see
+    /// [`ARRIVAL_LINGER_S`], [`PEER_WAIT_S`] and [`PEER_LINGER_S`]). Call it every tick: it notes
+    /// when the first peer shows up.
+    pub fn may_walk(&mut self, gate: TravelGate) -> bool {
         if !self.is_active() {
             return false;
         }
@@ -311,9 +319,17 @@ impl TravelBot {
             return false;
         }
         if let Some(at) = self.arrived_at {
+            if gate.peers_seen > 0 {
+                self.peer_seen_at.get_or_insert(gate.now);
+            }
             let waited = gate.now - at;
-            if waited < ARRIVAL_LINGER_S || (gate.peers_seen == 0 && waited < PEER_WAIT_S) {
+            if waited < ARRIVAL_LINGER_S {
                 return false;
+            }
+            match self.peer_seen_at {
+                Some(seen) if gate.now - seen < PEER_LINGER_S => return false,
+                None if waited < PEER_WAIT_S => return false,
+                _ => {}
             }
         }
         true
@@ -1019,7 +1035,7 @@ mod travel_tests {
     fn the_gate_holds_the_bot_for_its_party_and_lingers_after_an_arrival() {
         let gate = |now: f64, party_size: usize, peers_seen: usize| TravelGate { now, party_size, peers_seen };
         // Waiting for a party: not before it has two members, but never longer than PARTY_WAIT_S.
-        let bot = TravelBot::new(vec![YARD.into()], true);
+        let mut bot = TravelBot::new(vec![YARD.into()], true);
         assert!(!bot.may_walk(gate(0.0, 0, 0)));
         assert!(!bot.may_walk(gate(5.0, 1, 3)));
         assert!(bot.may_walk(gate(5.0, 2, 0)));
@@ -1031,12 +1047,19 @@ mod travel_tests {
         assert!(!TravelBot::new(vec![], false).may_walk(gate(100.0, 2, 2)));
 
         // After arriving with more route left: at least ARRIVAL_LINGER_S, and until another player
-        // was seen, but at most PEER_WAIT_S.
+        // was seen (and then PEER_LINGER_S longer), but at most PEER_WAIT_S.
         let mut bot = TravelBot::new(vec![YARD.into(), HALL.into()], false);
         assert!(bot.arrived(YARD, 100.0));
         assert!(!bot.may_walk(gate(100.5, 0, 5)), "too soon, whoever is there");
+        assert!(!bot.may_walk(gate(101.2, 0, 5)), "someone was there, but only just: it stays a moment so they see it");
+        assert!(bot.may_walk(gate(100.5 + PEER_LINGER_S + 0.1, 0, 5)), "and then it goes");
+        let mut bot = TravelBot::new(vec![YARD.into(), HALL.into()], false);
+        assert!(bot.arrived(YARD, 100.0));
         assert!(!bot.may_walk(gate(103.0, 0, 0)), "nobody seen yet");
-        assert!(bot.may_walk(gate(103.0, 0, 1)), "someone was seen");
+        assert!(!bot.may_walk(gate(103.0, 0, 1)), "someone shows up now: the clock of the linger starts");
+        assert!(bot.may_walk(gate(103.0 + PEER_LINGER_S + 0.1, 0, 1)));
+        let mut bot = TravelBot::new(vec![YARD.into(), HALL.into()], false);
+        assert!(bot.arrived(YARD, 100.0));
         assert!(!bot.may_walk(gate(100.0 + PEER_WAIT_S - 0.1, 0, 0)));
         assert!(bot.may_walk(gate(100.0 + PEER_WAIT_S + 0.1, 0, 0)), "it gives up waiting for company");
     }

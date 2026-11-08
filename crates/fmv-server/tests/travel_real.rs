@@ -7,18 +7,19 @@
 //! ```
 //!
 //! What it checks, in one process over real TCP: the server hosts `md1stin`, a raw client that holds
-//! the same archive locally walks (a step at a time, every step validated with the adapter's own
-//! `validate_move`, like the real client) from its spawn point to the middle of the gateway that
-//! leads to `md1_1` and across it; the server offers `md1_1` (`AreaChange`: the arrival the field's
+//! the same archive locally plans its way (a grid search whose every step the adapter's own
+//! `validate_move` accepts unchanged, as the real client's bots do) from its spawn point across the
+//! gateway that leads to `md1_1` and walks it; the server offers `md1_1` (`AreaChange`: the arrival the field's
 //! data names, settled on the target's walkmesh at the height of the named triangle), the client
 //! answers from its own copy, and the server sends the snapshot of `md1_1` with its NPCs, directly
 //! followed by the placement. Then the client walks to md1_1's own gateway back and ends in
 //! `md1stin` again. Nothing from the archive is printed but counts, names, positions and timings.
 
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use fmv_adapter_api::{AreaRuntime, GameAdapter, MoveResult};
+use fmv_adapter_api::{AreaRuntime, Exit, GameAdapter, MoveResult};
 use fmv_core::{AnimState, GameId, Pos};
 use fmv_protocol::{read_msg, write_msg, Auth, ClientMsg, ServerMsg, PROTOCOL_VERSION};
 use fmv_server::ff7::{build_tag, open_ff7, prewarm, Ff7Labels, Ff7Source, SharedFf7};
@@ -41,22 +42,77 @@ async fn until<T>(stream: &mut TcpStream, what: &str, mut pick: impl FnMut(&Serv
     }
 }
 
-/// One walking step of at most `len` units from `cur` toward `aim`: the accepted candidate (of a
-/// fan of headings around the straight line) that ends nearest the aim, as the headless bot does.
-fn step_toward(area: &dyn AreaRuntime, cur: Pos, aim: Pos, len: f32) -> Option<Pos> {
-    let heading = (aim.y - cur.y).atan2(aim.x - cur.x);
-    let mut best: Option<(f32, Pos)> = None;
-    for deg in [0.0_f32, 15.0, -15.0, 30.0, -30.0, 45.0, -45.0, 60.0, -60.0, 90.0, -90.0] {
-        let h = heading + deg.to_radians();
-        let want = Pos::new(cur.x + h.cos() * len, cur.y + h.sin() * len, cur.z);
-        if let MoveResult::Accepted(p) = area.validate_move(cur, want) {
-            let left = p.dist_xy(aim);
-            if best.is_none_or(|(b, _)| left < b - 1e-3) {
-                best = Some((left, p));
+/// The steps that take a walker from `from` across (a line of) `exit`: breadth-first over a grid
+/// of `CELL`-unit cells, one straight step to the centre of a neighbouring cell at a time, every
+/// step one the area accepts unchanged (not slid along a wall), until a step crosses a line that
+/// leads where `exit` leads. A step that would cross the line of another exit is not taken (it
+/// would take the walker elsewhere). The last position of the route is the crossing step.
+///
+/// The client's bots plan the same way (`nav::plan_path` in fmv-client, which also pulls the path
+/// straight); this is the small stand-in a server test can have without any client code. A walker
+/// that steers straight at the exit and slides along what blocks it gets stuck in concave places
+/// and makes chords the server refuses, which is why the real bots do not walk like that.
+fn route_across(area: &dyn AreaRuntime, from: Pos, exit: &Exit) -> Option<Vec<Pos>> {
+    const CELL: f32 = 30.0;
+    let exits = area.exits();
+    // `None`: the step crosses the line of an exit that leads elsewhere; `Some(true)`: it crosses
+    // one that leads where we want to go.
+    let crossing = |a: Pos, b: Pos| -> Option<bool> {
+        let mut crossed_any = false;
+        for e in exits.iter().filter(|e| e.is_crossed_by(a, b)) {
+            if e.target != exit.target {
+                return None;
             }
+            crossed_any = true;
+        }
+        Some(crossed_any)
+    };
+    let bounds = area.bounds();
+    let cell_of = |p: Pos| (((p.x - bounds.min.x) / CELL).round() as i64, ((p.y - bounds.min.y) / CELL).round() as i64);
+    // Every cell reached: the cell it was reached from, and where the walker stands in it.
+    type Cell = (i64, i64);
+    let mut seen: HashMap<Cell, (Option<Cell>, Pos)> = HashMap::new();
+    let start = cell_of(from);
+    seen.insert(start, (None, from));
+    let mut queue = VecDeque::from([start]);
+    while let Some(cell) = queue.pop_front() {
+        let cur = seen[&cell].1;
+        for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)] {
+            let next = (cell.0 + dx, cell.1 + dy);
+            if seen.contains_key(&next) {
+                continue;
+            }
+            let want = Pos::new(bounds.min.x + next.0 as f32 * CELL, bounds.min.y + next.1 as f32 * CELL, cur.z);
+            let MoveResult::Accepted(p) = area.validate_move(cur, want) else { continue };
+            if !p.is_finite() || p.dist_xy(want) > 0.75 {
+                continue;
+            }
+            let Some(crossed) = crossing(cur, p) else { continue };
+            seen.insert(next, (Some(cell), p));
+            if crossed {
+                let mut route = vec![p];
+                let mut at = cell;
+                while let Some(parent) = seen[&at].0 {
+                    route.push(seen[&at].1);
+                    at = parent;
+                }
+                route.reverse();
+                return Some(route);
+            }
+            queue.push_back(next);
         }
     }
-    best.filter(|(left, _)| *left < cur.dist_xy(aim) - 1e-3).map(|(_, p)| p)
+    None
+}
+
+/// Announce `route` a step at a time, every 100 ms (the server earns 90 units of budget per 100
+/// ms; a step is one grid cell, at most 43 units). `seq` counts for the whole connection.
+async fn announce(stream: &mut TcpStream, route: &[Pos], seq: &mut u32) {
+    for pos in route {
+        sleep(Duration::from_millis(100)).await;
+        *seq += 1;
+        write_msg(stream, &ClientMsg::MoveIntent { seq: *seq, pos: *pos, facing: 0.0, anim: AnimState::Walk }).await.unwrap();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -119,7 +175,7 @@ async fn walking_through_the_real_gateway_takes_a_client_from_md1stin_to_md1_1_a
     .await;
     assert_eq!(area.key, "md1stin");
     write_msg(&mut c, &ClientMsg::JoinArea { area, fingerprint, provenance }).await.unwrap();
-    let (mut pos, snapshot_npcs) = until(&mut c, "AreaSnapshot", |m| match m {
+    let (pos, snapshot_npcs) = until(&mut c, "AreaSnapshot", |m| match m {
         ServerMsg::AreaSnapshot { entities, npcs, .. } => Some((entities.first().expect("our entity").pos, npcs.clone())),
         _ => None,
     })
@@ -127,27 +183,11 @@ async fn walking_through_the_real_gateway_takes_a_client_from_md1stin_to_md1_1_a
     eprintln!("spawned at ({:.0}, {:.0}); the snapshot carries {} NPC(s)", pos.x, pos.y, snapshot_npcs.len());
     assert_eq!(snapshot_npcs.len(), npcs.len(), "the server announces the NPCs the adapter reports");
 
-    // Walk to the middle of the gateway line, aiming a little past it, a step every 100 ms (the
-    // server earns 90 units of budget per 100 ms; a step is 40).
-    let mid = exit.midpoint();
-    let (dx, dy) = (mid.x - pos.x, mid.y - pos.y);
-    let d = dx.hypot(dy).max(1.0);
-    let aim = Pos::new(mid.x + dx / d * 30.0, mid.y + dy / d * 30.0, mid.z);
+    // Walk to the gateway and across it: plan the steps on md1stin's own walkmesh, announce them.
     let mut seq = 0u32;
     let walk_started = Instant::now();
-    let mut crossed = false;
-    for _ in 0..600 {
-        let Some(next) = step_toward(&md1stin, pos, aim, 40.0) else { panic!("stuck at ({:.0}, {:.0}) on the way to the gateway", pos.x, pos.y) };
-        crossed = exit.is_crossed_by(pos, next);
-        pos = next;
-        seq += 1;
-        sleep(Duration::from_millis(100)).await;
-        write_msg(&mut c, &ClientMsg::MoveIntent { seq, pos, facing: 0.0, anim: AnimState::Walk }).await.unwrap();
-        if crossed {
-            break;
-        }
-    }
-    assert!(crossed, "the walk never crossed the gateway");
+    let route = route_across(&md1stin, pos, &exit).expect("md1stin's walkmesh has a way from the spawn point across the gateway");
+    announce(&mut c, &route, &mut seq).await;
     eprintln!("crossed the gateway after {seq} steps in {:?}", walk_started.elapsed());
 
     // The offer: md1_1, the arrival the data names, on the target's walkmesh.
@@ -181,26 +221,10 @@ async fn walking_through_the_real_gateway_takes_a_client_from_md1stin_to_md1_1_a
     }
     eprintln!("in md1_1 at ({:.0}, {:.0}, {:.0}); {} NPC(s) there", arrival.x, arrival.y, arrival.z, md1_1_npcs.len());
 
-    // And back: walk to md1_1's own gateway to md1stin.
-    let mut pos = arrival;
-    let mid = back.midpoint();
-    let (dx, dy) = (mid.x - pos.x, mid.y - pos.y);
-    let d = dx.hypot(dy).max(1.0);
-    let aim = Pos::new(mid.x + dx / d * 30.0, mid.y + dy / d * 30.0, mid.z);
-    seq = 0;
-    crossed = false;
-    for _ in 0..600 {
-        let Some(next) = step_toward(&md1_1, pos, aim, 80.0) else { panic!("stuck at ({:.0}, {:.0}) in md1_1", pos.x, pos.y) };
-        crossed = back.is_crossed_by(pos, next);
-        pos = next;
-        seq += 1;
-        sleep(Duration::from_millis(100)).await;
-        write_msg(&mut c, &ClientMsg::MoveIntent { seq, pos, facing: 0.0, anim: AnimState::Walk }).await.unwrap();
-        if crossed {
-            break;
-        }
-    }
-    assert!(crossed, "the walk in md1_1 never crossed the gateway back");
+    // And back: the same walk in md1_1, across its own gateway to md1stin.
+    let route = route_across(&md1_1, arrival, &back).expect("md1_1's walkmesh has a way from the arrival across the gateway back");
+    eprintln!("walking back: {} step(s) in md1_1", route.len());
+    announce(&mut c, &route, &mut seq).await;
     let (area, fingerprint, provenance) = until(&mut c, "AreaChange back", |m| match m {
         ServerMsg::AreaChange { area, fingerprint, provenance, .. } => Some((area.clone(), *fingerprint, provenance.clone())),
         _ => None,

@@ -233,8 +233,8 @@ pub struct Args {
     /// move this player, then go on to the next one. Several areas are separated by commas
     /// (`--travel md1_1,md1stin`: there and back). A bot with --party-invite-first-peer or
     /// --party-accept holds still until its party has two members (at most 12 s); in every area
-    /// but the last it also waits to see another player (at most 8 s) before it moves on. Bots
-    /// without --travel never cross an exit by accident.
+    /// but the last it also waits to see another player (at most 8 s) and a moment longer, so they
+    /// see it too, before it moves on. Bots without --travel never cross an exit by accident.
     #[arg(long, value_name = "AREA[,AREA...]", value_delimiter = ',', value_parser = parse_area_key, requires = "headless")]
     pub travel: Vec<String>,
 }

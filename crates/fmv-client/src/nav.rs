@@ -268,9 +268,7 @@ pub fn plan_path(area: &dyn AreaRuntime, from: Pos, to: Pos) -> Option<Vec<Pos>>
                 reach = j;
             } else if j == anchor + 1 {
                 // Not even the next node can be reached with that clearance: ask less of the leg.
-                if segment_walkable(area, a, b, 0.0).is_none() {
-                    return None;
-                }
+                segment_walkable(area, a, b, 0.0)?;
                 reach = j;
             } else {
                 break;
