@@ -19,13 +19,15 @@ use super::connect::{Connected, Connector, Outcome};
 use super::draw::DrawList;
 use super::flow::{self, Env, Saved};
 use super::hud::area_label;
-use super::input::{menu_input, MenuInput};
+use super::input::{menu_input, pad_menu_input, MenuInput};
 use super::looks::LookCache;
 use super::menu::{Menu, MenuAction, MenuConfig, Notice};
 use super::screens;
 use crate::accounts::{loose_mode_warning, TokenStore};
 use crate::cli::exit;
 use crate::ff7::SharedFf7;
+use crate::gamemode::{osk_transition, request_osk, DeviceMode};
+use crate::gamepad::{PadEvent, PadMode, Pads};
 use crate::login::LoginPlan;
 use crate::net::clean;
 use crate::render::{FrameResult, Renderer};
@@ -67,6 +69,9 @@ pub struct Launch {
     pub tint: Option<[u8; 3]>,
     /// FF7 only: this machine's opened adapter, shared with the network thread and the window.
     pub ff7: Option<Arc<Ff7Adapter>>,
+    /// What the device asks of the window (full screen) and of the text fields (Steam's keyboard):
+    /// decided once in `main` from the flags and the environment.
+    pub device: DeviceMode,
 }
 
 impl Launch {
@@ -117,6 +122,13 @@ pub struct Shell {
     command: bool,
     last_tick: Instant,
     failure: Option<String>,
+    /// The game controllers. Closed until the window exists; handed to the game with the window.
+    pads: Pads,
+    /// Was a text field in focus at the last check (see [`Shell::sync_keyboard`])?
+    text_focus: bool,
+    /// Has the window been shown (a frame was presented) or focused? Steam's keyboard is only asked
+    /// for after that, so that it has a window of ours to type into.
+    shown: bool,
 }
 
 impl Shell {
@@ -140,6 +152,9 @@ impl Shell {
             command: false,
             last_tick: now,
             failure: None,
+            pads: Pads::closed(),
+            text_focus: false,
+            shown: false,
         };
         shell.report_problems(&saved.problems);
         shell.saved = saved;
@@ -179,6 +194,39 @@ impl Shell {
             MenuInput::Text(text) => self.menu.text(&text),
         };
         action.map_or(Next::Stay, |a| self.run_action(a))
+    }
+
+    /// A controller button: turned into the menu input a key press would have been (see
+    /// [`pad_menu_input`]) and handled like it, so the menu has one way in.
+    fn handle_pad(&mut self, event: PadEvent) -> Next {
+        match pad_menu_input(event.key, event.pressed, event.repeat, self.menu.pad_screen()) {
+            Some(input) => self.handle_input(input),
+            None => Next::Stay,
+        }
+    }
+
+    /// Read the controllers (never blocks) and handle what they did.
+    fn poll_pads(&mut self, el: &ActiveEventLoop) {
+        for event in self.pads.poll(Instant::now(), PadMode::Menu) {
+            if self.handle_pad(event) == Next::Quit {
+                el.exit();
+            }
+        }
+    }
+
+    /// Ask Steam for its on-screen keyboard when a text field gains the focus and let it go when
+    /// the field loses it, but only on a device that has one to ask (see `crate::gamemode`) and only
+    /// once the window has been shown. A fresh install opens in the name field, so the first check
+    /// after the window is up is the field gaining focus.
+    fn sync_keyboard(&mut self) {
+        if !self.shown {
+            return;
+        }
+        let focused = self.menu.text_input_focused();
+        if let Some(request) = osk_transition(self.launch.device, self.text_focus, focused) {
+            request_osk(request);
+        }
+        self.text_focus = focused;
     }
 
     fn run_action(&mut self, action: MenuAction) -> Next {
@@ -301,6 +349,7 @@ impl Shell {
         };
         let mut app = self.begin_game(pending);
         app.adopt_surface(window, renderer);
+        app.adopt_pads(std::mem::take(&mut self.pads));
         self.game = Some(app);
     }
 
@@ -321,7 +370,7 @@ impl Shell {
             session = session.with_content(adapter.clone());
         }
         let view = crate::field_view(self.launch.ff7.as_deref(), &session);
-        App::new(session, view).with_ff7(self.launch.ff7.clone())
+        App::new(session, view).with_ff7(self.launch.ff7.clone()).with_device(self.launch.device)
     }
 
     fn tick(&mut self, el: &ActiveEventLoop) {
@@ -329,7 +378,9 @@ impl Shell {
         let dt = now.duration_since(self.last_tick).as_secs_f32();
         self.last_tick = now;
         self.menu.tick(dt);
+        self.poll_pads(el);
         self.poll_connector();
+        self.sync_keyboard();
         if let Some(pending) = self.pending.as_mut() {
             pending.frames += 1;
             if pending.frames > LOADING_FRAMES {
@@ -357,6 +408,10 @@ impl Shell {
         screens::draw_menu(&self.menu, w, h, &mut overlay);
         let result = renderer.render_with(&screens::menu_scene(), Some(&overlay));
         let gpu_error = renderer.first_gpu_error();
+        // The first frame on screen: from now on the window can be typed into.
+        if result == FrameResult::Presented {
+            self.shown = true;
+        }
         match (result, gpu_error) {
             (FrameResult::Fatal(msg), _) => self.fail(el, msg),
             (_, Some(e)) => self.fail(el, format!("GPU error: {e}")),
@@ -391,7 +446,7 @@ impl ApplicationHandler for Shell {
         if self.window.is_some() || self.game.is_some() {
             return;
         }
-        let window = match el.create_window(window::window_attributes(MENU_TITLE.to_string())) {
+        let window = match el.create_window(window::window_attributes(MENU_TITLE.to_string(), self.launch.device)) {
             Ok(w) => Arc::new(w),
             Err(e) => return self.fail(el, format!("cannot create the window: {e}")),
         };
@@ -403,6 +458,8 @@ impl ApplicationHandler for Shell {
             Err(e) => return self.fail(el, format!("cannot start the renderer: {e}")),
         }
         self.window = Some(window);
+        // Controllers are only read once there is a window to give them to.
+        self.pads = Pads::open();
         self.last_tick = Instant::now();
     }
 
@@ -431,10 +488,17 @@ impl ApplicationHandler for Shell {
                     }
                 }
             }
-            // Releases while unfocused are never delivered: forget held modifiers.
-            WindowEvent::Focused(false) => {
-                self.shift = false;
-                self.command = false;
+            WindowEvent::Focused(focused) => {
+                // Controllers are only heard while the window has the focus (see `crate::gamepad`),
+                // and a window with the focus is a window the keyboard can type into.
+                self.pads.set_focused(focused);
+                if focused {
+                    self.shown = true;
+                } else {
+                    // Releases while unfocused are never delivered: forget held modifiers.
+                    self.shift = false;
+                    self.command = false;
+                }
             }
             WindowEvent::RedrawRequested => self.redraw(el),
             _ => {}
@@ -473,11 +537,14 @@ pub fn run(event_loop: EventLoop<()>, launch: Launch) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gamemode::{take_asked, Osk};
+    use crate::gamepad::PadKey;
     use crate::ui::menu::{KeyPress, Look, NavKey, NoticeKind, Screen};
     use crate::ui::testkit::{serve_join, Reply};
     use fmv_protocol::{RejectCode, Secret};
     use std::net::TcpListener;
 
+    /// A launch on an ordinary desktop: windowed, and nothing is ever asked of Steam.
     fn launch(dir: &std::path::Path, server: &str) -> Launch {
         Launch {
             server: server.to_string(),
@@ -487,7 +554,18 @@ mod tests {
             game: GameId::Ff7,
             tint: None,
             ff7: None,
+            device: DeviceMode::DESKTOP,
         }
+    }
+
+    /// A launch inside a gamescope session: full screen, and Steam's keyboard for text fields.
+    fn game_mode_launch(dir: &std::path::Path, server: &str) -> Launch {
+        Launch { device: DeviceMode { fullscreen: true, steam_keyboard: true }, ..launch(dir, server) }
+    }
+
+    /// A press of a controller button, as the pad layer delivers it.
+    fn pad_press(key: PadKey) -> PadEvent {
+        PadEvent { key, pressed: true, repeat: false }
     }
 
     /// An address nothing listens on.
@@ -815,6 +893,102 @@ mod tests {
         // The other accounts' files are untouched and the new character has no login.
         assert!(store.find(&addr, Some("Tifa")).unwrap().is_none());
         drop(server);
+    }
+
+    // ---- the controller and the keyboard request --------------------------------------------------
+
+    /// A controller alone plays the menu through the shell: the stick chooses, A connects (and a
+    /// failure comes back with its reason), B cancels, X opens the form, Start leaves.
+    #[test]
+    fn a_controller_alone_plays_the_menu_through_the_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = closed_port();
+        let store = TokenStore::new(dir.path());
+        store.save_new(&server, "Cloud", &Secret::new("tok_cloud")).unwrap();
+        store.save_new(&server, "Tifa", &Secret::new("tok_tifa")).unwrap();
+        let mut shell = Shell::new(launch(dir.path(), &server));
+        assert_eq!(shell.handle_pad(pad_press(PadKey::Down)), Next::Stay);
+        assert_eq!(shell.menu.selected_name(), Some("Tifa"));
+        // A starts the attempt; with nothing listening it fails and the list comes back with the reason.
+        assert_eq!(shell.handle_pad(pad_press(PadKey::Confirm)), Next::Stay);
+        assert!(shell.menu.is_connecting() && shell.connector.is_some());
+        wait_until_idle(&mut shell);
+        assert!(matches!(shell.menu.screen(), Screen::Select(_)));
+        assert!(shell.menu.notice().is_some_and(|n| n.text.contains("cannot connect")));
+        // B cancels a running attempt and drops the connector.
+        shell.handle_pad(pad_press(PadKey::Confirm));
+        assert!(shell.connector.is_some());
+        assert_eq!(shell.handle_pad(pad_press(PadKey::Back)), Next::Stay);
+        assert!(shell.connector.is_none() && matches!(shell.menu.screen(), Screen::Select(_)));
+        // B on the list does nothing (it never quits); Start does.
+        assert_eq!(shell.handle_pad(pad_press(PadKey::Back)), Next::Stay);
+        assert_eq!(shell.handle_pad(PadEvent { key: PadKey::Escape, pressed: false, repeat: false }), Next::Stay, "a release is nothing");
+        assert_eq!(shell.handle_pad(pad_press(PadKey::Escape)), Next::Quit);
+        // X opens the create form.
+        assert_eq!(shell.handle_pad(pad_press(PadKey::Invite)), Next::Stay);
+        assert!(matches!(shell.menu.screen(), Screen::Create(_)));
+        // The party keys that mean nothing here change nothing.
+        for key in [PadKey::Leave, PadKey::Battle, PadKey::Walk, PadKey::Accept] {
+            assert_eq!(shell.handle_pad(pad_press(key)), Next::Stay, "{key:?}");
+        }
+        assert!(matches!(shell.menu.screen(), Screen::Create(_)));
+    }
+
+    /// On a gamescope device the first check after the window is shown, in the name field, asks for
+    /// Steam's keyboard; leaving the field (or registering) lets it go; coming back asks again.
+    #[test]
+    fn steams_keyboard_is_asked_for_when_the_name_field_gains_focus_and_dropped_when_it_loses_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = closed_port();
+        let _ = take_asked();
+        let mut shell = Shell::new(game_mode_launch(dir.path(), &server));
+        assert!(shell.menu.text_input_focused(), "a fresh install opens in the name field");
+        // Before the window has been shown nothing is asked (Steam would have no window to type into).
+        shell.sync_keyboard();
+        assert_eq!(take_asked(), []);
+        shell.shown = true;
+        shell.sync_keyboard();
+        assert_eq!(take_asked(), [Osk::Open]);
+        shell.sync_keyboard();
+        assert_eq!(take_asked(), [], "staying in the field asks for nothing more");
+        // Down to the Look row: out of the field.
+        shell.handle_pad(pad_press(PadKey::Down));
+        shell.sync_keyboard();
+        assert_eq!(take_asked(), [Osk::Close]);
+        // Back up: the field is entered again.
+        shell.handle_pad(pad_press(PadKey::Up));
+        shell.sync_keyboard();
+        assert_eq!(take_asked(), [Osk::Open]);
+        // Registering (a name, then A) leaves the field; the refusal puts the player back in it.
+        shell.handle_input(MenuInput::Text("Cloud".into()));
+        shell.handle_pad(pad_press(PadKey::Confirm));
+        shell.sync_keyboard();
+        assert_eq!(take_asked(), [Osk::Close], "the attempt runs: the keyboard goes away");
+        wait_until_idle(&mut shell);
+        shell.sync_keyboard();
+        assert_eq!(take_asked(), [Osk::Open], "back in the name field after the refusal");
+    }
+
+    /// On the desktop nothing is ever asked of Steam, whatever the focus does.
+    #[test]
+    fn on_the_desktop_no_text_field_ever_asks_for_a_keyboard() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = take_asked();
+        let mut shell = Shell::new(launch(dir.path(), "127.0.0.1:47770"));
+        shell.shown = true;
+        for key in [None, Some(PadKey::Down), Some(PadKey::Up), Some(PadKey::Down), Some(PadKey::Up)] {
+            if let Some(key) = key {
+                shell.handle_pad(pad_press(key));
+            }
+            shell.sync_keyboard();
+        }
+        assert!(shell.text_focus, "the focus was tracked all along");
+        assert_eq!(take_asked(), [], "but Steam was never asked");
+        // The same on a full-screen desktop (--fullscreen): full screen is not a reason for it.
+        let mut shell = Shell::new(Launch { device: DeviceMode { fullscreen: true, steam_keyboard: false }, ..launch(dir.path(), "127.0.0.1:47770") });
+        shell.shown = true;
+        shell.sync_keyboard();
+        assert_eq!(take_asked(), []);
     }
 
     #[test]

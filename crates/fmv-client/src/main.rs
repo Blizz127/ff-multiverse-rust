@@ -21,6 +21,8 @@ mod battle;
 mod bot;
 mod cli;
 mod ff7;
+mod gamemode;
+mod gamepad;
 mod headless;
 mod interp;
 mod login;
@@ -53,6 +55,16 @@ use std::sync::Arc;
 
 fn main() -> ExitCode {
     ExitCode::from(run(Args::parse()))
+}
+
+/// What the device asks of the window (full screen) and of text fields (Steam's keyboard), decided
+/// once from `--fullscreen` and the environment, which is read here and nowhere else (see
+/// `gamemode`). One line on stderr says what was seen and what it led to, for a device report.
+fn device_mode(args: &Args) -> gamemode::DeviceMode {
+    let signals = gamemode::Signals::from_env(|name| std::env::var(name).ok());
+    let mode = gamemode::DeviceMode::decide(args.fullscreen, &signals);
+    eprintln!("{}", gamemode::describe(args.fullscreen, &signals, mode));
+    mode
 }
 
 fn banner(lines: &[&str]) {
@@ -187,6 +199,7 @@ fn run_menu(args: &Args, state_dir: &Path, store: TokenStore) -> u8 {
             return exit::CONTENT;
         }
     };
+    let device = device_mode(args);
     // Without a display this fails fast with a clear message, before any traffic.
     let event_loop = match window::create_event_loop() {
         Ok(el) => el,
@@ -211,6 +224,7 @@ fn run_menu(args: &Args, state_dir: &Path, store: TokenStore) -> u8 {
             game,
             tint: args.tint,
             ff7,
+            device,
         },
     )
 }
@@ -258,7 +272,8 @@ fn run(args: Args) -> u8 {
     };
 
     // Window mode: open the event loop first. Without a display this fails fast with a clear
-    // message, before any traffic reaches the server.
+    // message, before any traffic reaches the server. (A headless run has no window to decide for.)
+    let device = if args.headless { gamemode::DeviceMode::DESKTOP } else { device_mode(&args) };
     let event_loop = if args.headless {
         None
     } else {
@@ -319,7 +334,7 @@ fn run(args: Args) -> u8 {
         None => headless::run(&args, session),
         Some(el) => {
             let view = field_view(ff7.as_deref(), &session);
-            window::run(el, session, view, ff7)
+            window::run(el, session, view, ff7, device)
         }
     }
 }

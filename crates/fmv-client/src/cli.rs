@@ -106,6 +106,30 @@ CHARACTER MENU:
   move between the fields and Enter registers. When the server refuses (name taken, registration
   closed, rate limited) the reason is shown on screen and you can try again.
 
+CONTROLLER:
+  A game controller works in the character menu and in the game (through the system's gamepad
+  support, so Steam Input's virtual controller counts like any other). With none connected nothing
+  changes; one can be plugged in or out at any time, and only the window with the focus is
+  listened to. A controller makes the same key events as the keyboard: left stick or D-pad = the
+  arrows (walk, move through the menus; a held direction repeats in menus and battles); A = Enter;
+  B = Backspace (back a level in a battle), and Esc in the character menu (back, cancel; it never
+  quits); X = P (invite the nearest player), and in the character menu a new character or, on the
+  create form, Backspace; Y = Y (accept an invite), and in the character menu forget a saved login
+  (it asks first); Select = L (leave the party); Start = Esc (in the field a second press quits; in
+  a battle it only backs out of the menu; in the character menu it backs out or quits); right
+  bumper (R1/RB) = B (ask for a debug battle); left trigger (L2/LT), held = Shift (walk instead of
+  run).
+
+FULL SCREEN AND THE ON-SCREEN KEYBOARD:
+  --fullscreen opens the window as borderless full screen. Steam's Game Mode does it by itself: the
+  window is full screen when GAMESCOPE_WAYLAND_DISPLAY is set, or XDG_CURRENT_DESKTOP lists
+  gamescope, or SteamGamepadUI is 1. An ordinary desktop session stays windowed. Inside a
+  gamescope session (the first two checks) a text field that gets the focus (the name of a new
+  character) asks Steam to show its on-screen keyboard (steam://open/keyboard, handed over with
+  xdg-open) and lets it go (steam://close/keyboard) when the field loses the focus; the keyboard
+  types ordinary key events. On a desktop nothing is ever asked of Steam. The `device:` line on
+  stderr at start-up says what was seen and what it led to.
+
 WINDOW CONTROLS:
   WASD / arrow keys move, Esc twice quits (never during a battle: close the window to quit
   there). P invites the nearest other player to your party, Y accepts
@@ -174,6 +198,12 @@ pub struct Args {
     /// after that the server takes it from the stored profile.
     #[arg(long, value_name = "RRGGBB", value_parser = parse_tint)]
     pub tint: Option<[u8; 3]>,
+
+    /// Open the window as borderless full screen (no title bar, no frame). Steam's Game Mode does
+    /// this by itself, see FULL SCREEN AND THE ON-SCREEN KEYBOARD below; this asks for it anywhere.
+    /// A headless run has no window.
+    #[arg(long, conflicts_with = "headless")]
+    pub fullscreen: bool,
 
     /// Run without a window as a scripted bot and print one SMOKE summary line.
     #[arg(long)]
@@ -716,6 +746,46 @@ mod tests {
             "FIXTURE (synthetic, not FF7)",
         ] {
             let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(flat.contains(needle), "--help must mention {needle:?}:\n{help}");
+        }
+    }
+
+    #[test]
+    fn fullscreen_is_off_by_default_and_has_no_meaning_for_a_headless_run() {
+        assert!(!Args::try_parse_from(["fmv-client"]).unwrap().fullscreen);
+        assert!(!Args::try_parse_from(["fmv-client", "--name", "x"]).unwrap().fullscreen);
+        assert!(Args::try_parse_from(["fmv-client", "--fullscreen"]).unwrap().fullscreen);
+        assert!(Args::try_parse_from(["fmv-client", "--fullscreen", "--name", "x", "--game", "ff7"]).unwrap().fullscreen);
+        assert!(Args::try_parse_from(["fmv-client", "--fullscreen", "--headless"]).is_err(), "a headless run has no window");
+        // It does not change whether a window opens on the character menu.
+        assert!(Args::try_parse_from(["fmv-client", "--fullscreen"]).unwrap().wants_menu());
+    }
+
+    #[test]
+    fn the_help_documents_the_controller_full_screen_and_the_keyboard() {
+        use clap::CommandFactory;
+        let help = Args::command().render_long_help().to_string();
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        for needle in [
+            "--fullscreen",
+            "CONTROLLER:",
+            "left stick or D-pad = the arrows",
+            "A = Enter",
+            "B = Backspace",
+            "X = P (invite",
+            "Y = Y (accept",
+            "Select = L (leave the party)",
+            "Start = Esc",
+            "right bumper (R1/RB) = B",
+            "left trigger (L2/LT), held = Shift",
+            "FULL SCREEN AND THE ON-SCREEN KEYBOARD:",
+            "GAMESCOPE_WAYLAND_DISPLAY",
+            "XDG_CURRENT_DESKTOP lists gamescope",
+            "SteamGamepadUI is 1",
+            "steam://open/keyboard",
+            "steam://close/keyboard",
+            "On a desktop nothing is ever asked of Steam",
+        ] {
             assert!(flat.contains(needle), "--help must mention {needle:?}:\n{help}");
         }
     }
