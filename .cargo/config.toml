@@ -1,0 +1,3 @@
+# Dependencies are resolved from the local registry cache by default; drop --offline when adding new crates.
+[net]
+offline = true

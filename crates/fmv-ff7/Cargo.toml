@@ -1,0 +1,10 @@
+[package]
+name = "fmv-ff7"
+description = "FF7 adapter: format decoders (LGP, LZSS, field) and FF7 area runtime. Reads owned data only."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+fmv-core.workspace = true

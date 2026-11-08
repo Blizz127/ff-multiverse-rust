@@ -1,0 +1,10 @@
+[package]
+name = "fmv-library"
+description = "Owned-content library: provenance manifest and content-addressed store. Never writes to original sources."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+fmv-core.workspace = true

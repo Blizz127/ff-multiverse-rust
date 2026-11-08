@@ -1,0 +1,18 @@
+/target
+# Owned game data and per-user state must never be committed.
+/library/
+/state/
+/fmv-state/
+*.lgp
+*.LGP
+*.bin.orig
+*.cue
+*.iso
+*.chd
+*.ff7
+*.mcr
+/.claude/settings.local.json
+# Infrastructure notes with tailnet/host identifiers stay local (not pushed to GitHub).
+/PROJECT-BRIEF.md
+/PROJECT-METADATA.json
+/DEPLOYMENT-CONTRACT.md

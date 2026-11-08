@@ -1,0 +1,12 @@
+[package]
+name = "fmv-fixture"
+description = "FIXTURE adapter: synthetic test area. NOT FF7 support."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+fmv-core.workspace = true
+fmv-adapter-api.workspace = true
+blake3.workspace = true
