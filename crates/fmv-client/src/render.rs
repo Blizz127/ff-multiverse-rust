@@ -212,6 +212,15 @@ impl Camera {
     pub fn scale(&self) -> f32 {
         self.scale
     }
+
+    /// A camera whose view space is the window in pixels (one unit a pixel, `+y` up), with its
+    /// origin `dx` pixels right of and `dy` pixels above the window's centre: the camera a
+    /// battle frame is drawn with (see [`crate::battle::scene`]), where the perspective is the
+    /// scene's own and this only places it in the window.
+    pub fn pixels(dx: f32, dy: f32) -> Self {
+        let finite = |v: f32| if v.is_finite() { v } else { 0.0 };
+        Self { cx: -finite(dx), cy: -finite(dy), scale: 1.0 }
+    }
 }
 
 fn srgb_to_linear(c: f32) -> f32 {
@@ -814,6 +823,20 @@ impl Gpu {
         }
         self.queue.submit(std::iter::once(encoder.finish()));
     }
+
+    /// Draw one frame of a battle ([`crate::battle::scene`]) into `target` (`size` pixels): clear it,
+    /// the stage (flat triangles in NDC, painter's order), the location's model if there is one, then
+    /// the models and the marks on the ground under them through the avatar renderer, depth-tested
+    /// with a fresh depth buffer. The UI overlay is the caller's to draw after.
+    pub fn draw_battle(&mut self, target: &wgpu::TextureView, size: (u32, u32), frame: &crate::battle::scene::BattleFrame, srgb: bool) {
+        self.draw_scene(target, &frame.stage, None, frame.clear_rgb, srgb);
+        // The location, when there is one, in a pass of its own: the actors' pass then starts with a
+        // fresh depth buffer, so the marks under the actors are not covered by the location's floor.
+        if let Some(location) = &frame.location {
+            self.avatars.draw_models(target, size, &frame.camera, location, false);
+        }
+        self.avatars.draw_models(target, size, &frame.camera, &frame.models, false);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1077,6 +1100,58 @@ impl Renderer {
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let vertices = build(w, h, self.srgb);
         self.gpu.draw_scene(&view, &vertices, None, CLEAR_RGB, self.srgb);
+        if let Some(overlay) = overlay {
+            self.gpu.draw_overlay(&view, &overlay.vertices(w, h, self.srgb));
+        }
+        self.window.pre_present_notify();
+        self.gpu.queue.present(frame);
+        FrameResult::Presented
+    }
+}
+
+// A pure addition for the 3D battle scene (`crate::battle::scene`): the same surface handling as
+// `Renderer::render_flat`, drawing a [`BattleFrame`](crate::battle::scene::BattleFrame) instead.
+impl Renderer {
+    /// Draw one frame of the battle scene: `build` gets the surface size in pixels and whether the
+    /// target is sRGB (see [`color`]) and returns the frame ([`Gpu::draw_battle`]); then the UI
+    /// `overlay` over it. The surface handling (resize, minimised, outdated, lost) is
+    /// `render_flat`'s.
+    pub fn render_battle(
+        &mut self,
+        build: impl FnOnce(u32, u32, bool) -> crate::battle::scene::BattleFrame,
+        overlay: Option<&crate::ui::draw::DrawList>,
+    ) -> FrameResult {
+        let (w, h) = self.size;
+        if w == 0 || h == 0 {
+            return FrameResult::Skipped;
+        }
+        if self.needs_reconfigure {
+            self.reconfigure();
+        }
+        let frame = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(f) => f,
+            wgpu::CurrentSurfaceTexture::Suboptimal(f) => {
+                self.needs_reconfigure = true;
+                f
+            }
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                return FrameResult::Skipped
+            }
+            wgpu::CurrentSurfaceTexture::Outdated => {
+                self.needs_reconfigure = true;
+                return FrameResult::Skipped;
+            }
+            wgpu::CurrentSurfaceTexture::Lost => {
+                return match self.recreate_surface() {
+                    Ok(()) => FrameResult::Skipped,
+                    Err(e) => FrameResult::Fatal(e),
+                };
+            }
+            wgpu::CurrentSurfaceTexture::Validation => return FrameResult::Skipped,
+        };
+        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let battle = build(w, h, self.srgb);
+        self.gpu.draw_battle(&view, (w, h), &battle, self.srgb);
         if let Some(overlay) = overlay {
             self.gpu.draw_overlay(&view, &overlay.vertices(w, h, self.srgb));
         }
