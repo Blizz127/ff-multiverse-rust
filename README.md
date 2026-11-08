@@ -60,7 +60,7 @@ as a labelled test area; it says nothing about FF7 support.
 | M2-c/d | Shared battle, battle return, per-player rewards | done (battle subset; rewards logged and sent, not stored yet) |
 | Later | FF8, FF9, FF10 and FF12 adapters on the same core | planned |
 
-**Walking between fields (additive in protocol v3).** The server hosts many fields: the entry field
+**Walking between fields (protocol v4).** The server hosts many fields: the entry field
 (`md1stin`) is always loaded and any field behind one of its gateways is loaded the first time a
 player walks through the gateway and unloaded a minute after the last player left it. Parties may
 span fields, and the fields' NPCs (the characters a field's own data places: Sector 1's guards,
@@ -327,11 +327,14 @@ synthetic FIXTURE rooms (`fmv-server --game fixture-rooms`, `fmv-client --game f
 --name X`: a hall and a yard joined by an exit each way, with one NPC in the yard; **not FF7**) and
 needs no owned data.
 
+Area travel is what **protocol v4** adds to v3: a v3 client does not know `AreaChange`, so the
+version was bumped and a server refuses a v3 client at the handshake with a clear
+`ProtocolMismatch` reject (instead of losing it at the first exit it crosses). Both sides must be
+built from this version or later.
+
 Not done: exits that scripts decide (FF7 `MAPJUMP`s and line triggers; they need the script VM
-and the game's story variables), conditional NPCs, NPC animation and talking, per-phase
-instances (an area is one instance whatever the story phases of the players in it), and a
-protocol version bump: a client built before this change does not know `AreaChange` and
-disconnects at the first exit it crosses.
+and the game's story variables), conditional NPCs, NPC animation and talking, and per-phase
+instances (an area is one instance whatever the story phases of the players in it).
 
 ## Accounts, avatars and parties
 
@@ -379,7 +382,7 @@ same way (checked over all 702 fields of that build: every enabled table's weigh
 and every formation exists in `scene.bin`). A starting party wins 301 and 303 every time (200 of
 200 seeded runs each, both members attacking), which is why the smoke script uses 301.
 
-**Protocol v3** (`fmv-protocol`) carries all of the above; its module docs describe the flow,
+**Protocol v4** (`fmv-protocol`) carries all of the above; its module docs describe the flow,
 and golden JSON tests pin the wire format (the engine's own event, command and outcome types
 included). A client or server of another protocol version is refused with a clear message.
 

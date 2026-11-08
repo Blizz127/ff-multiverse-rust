@@ -157,6 +157,20 @@ async fn two_players_move_get_corrected_and_leave() {
     .await;
     old.expect_reject_as(RejectCode::ProtocolMismatch, "protocol version").await;
 
+    // The release before area travel (protocol v3, with a Hello of today's shape) is refused at the
+    // handshake with a typed reject and the socket closes: it could not decode `AreaChange`, so
+    // letting it in would lose it at the first exit it crosses.
+    let mut v3 = Client::connect(server.addr).await;
+    v3.send(&ClientMsg::Hello {
+        protocol_version: 3,
+        client_build: "the release before area travel".into(),
+        auth: Auth::Register { display_name: "Carol".into() },
+        tint: [0; 3],
+        appearance_ref: None,
+    })
+    .await;
+    v3.expect_reject_as(RejectCode::ProtocolMismatch, &format!("server speaks v{PROTOCOL_VERSION}, client sent v3")).await;
+
     // A protocol v1 Hello has another shape (the name was at the top level). It is told the
     // versions differ, not that its message is malformed.
     let mut v1 = Client::connect(server.addr).await;

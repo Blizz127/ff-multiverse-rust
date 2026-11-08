@@ -1,4 +1,4 @@
-//! Authoritative FF Multiverse server for protocol v3 (`fmv-protocol`).
+//! Authoritative FF Multiverse server for protocol v4 (`fmv-protocol`).
 //!
 //! The server hosts the areas of one `GameAdapter` (`Box<dyn GameAdapter>`, so wiring a real game
 //! later is a one-line change in the binary): the *entry* area named by the configuration, which
@@ -271,7 +271,7 @@ impl Server {
             (None, false) => info!("battles unsupported on this server (no owned battle data); battle requests are refused"),
         }
         if !local_addr.ip().is_loopback() {
-            warn!(%local_addr, "listening on a non-loopback address; protocol v3 is not encrypted (account tokens and game traffic cross the network in the clear): use it only on a network you trust");
+            warn!(%local_addr, "listening on a non-loopback address; protocol v4 is not encrypted (account tokens and game traffic cross the network in the clear): use it only on a network you trust");
         }
 
         let build = config.build_string();

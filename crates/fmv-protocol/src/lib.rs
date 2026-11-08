@@ -1,4 +1,10 @@
-//! FF Multiverse wire protocol v3.
+//! FF Multiverse wire protocol v4.
+//!
+//! v4 is v3 (accounts, battles, rejection codes) plus area travel: [`ServerMsg::AreaChange`] and
+//! `AreaSnapshot::npcs` (see "Area travel"). A v3 peer cannot decode `AreaChange` (an unknown
+//! message is a decode error), so the version was bumped: a server answers a v3 `Hello` with
+//! `Reject { code: ProtocolMismatch }` at the handshake, a clean refusal instead of a dropped
+//! connection at the first exit a player crosses.
 //!
 //! Framing: `u32` little-endian payload length, then the payload. The payload codec is JSON
 //! (serde_json; postcard is not in the local crate cache). The codec is isolated in
@@ -41,7 +47,7 @@
 //! S -> C  BattleEvent { .., events: [.., Victory] }, then BattleEnd { battle_id, outcome, rewards }
 //! ```
 //!
-//! # Area travel (additive in v3)
+//! # Area travel (v4)
 //!
 //! A server hosts many areas. The one in the handshake is the entry area; a player leaves it by
 //! walking across one of its exit lines (`fmv_adapter_api::Exit`), which the SERVER detects on the
@@ -63,9 +69,9 @@
 //! surface) and `arrival_facing` its heading; the snapshot repeats both in the player's own entity.
 //! A client that cannot hold the area answers `CannotJoin`; the server then sends the player back
 //! where it was with a second `AreaChange` (for the area it came from), which is answered the same
-//! way. A player that does not answer within the join timeout is disconnected. An old v3 client
-//! does not know `AreaChange` and disconnects at the first exit it crosses (the protocol version
-//! was not bumped; bump it when builds are mixed in a deployment).
+//! way. A player that does not answer within the join timeout is disconnected. A v3 client never
+//! gets this far: it does not know `AreaChange`, so the version check at `Hello` refuses it with
+//! `RejectCode::ProtocolMismatch` (see the top of this page).
 //!
 //! `AreaSnapshot::npcs` lists the non-player characters the area's data places ([`NpcSnapshot`]):
 //! static, with no `EntityUpdate`s of their own, sent with every snapshot of the area. It is left
@@ -133,7 +139,7 @@ pub use fmv_party::{
     PartyEvent, PartyId, Placement,
 };
 
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 /// Hard cap on a single frame payload (bytes).
 pub const MAX_FRAME: u32 = 256 * 1024;
 /// Default TCP port for development. Deployment port is UNASSIGNED (see DEPLOYMENT-CONTRACT.md).
@@ -182,7 +188,7 @@ pub enum Auth {
 }
 
 // =============================================================================================
-// Area travel (additive in v3): non-player characters.
+// Area travel (v4): non-player characters.
 // =============================================================================================
 
 /// Most NPCs one `AreaSnapshot` carries. With 256 players (about 140 KB) a full snapshot must
@@ -514,8 +520,8 @@ mod tests {
     }
 
     #[test]
-    fn the_version_is_three() {
-        assert_eq!(PROTOCOL_VERSION, 3);
+    fn the_version_is_four() {
+        assert_eq!(PROTOCOL_VERSION, 4);
     }
 
     // -----------------------------------------------------------------------------------------
@@ -569,13 +575,13 @@ mod tests {
     fn golden_client_messages() {
         golden(
             ClientMsg::Hello {
-                protocol_version: 3,
+                protocol_version: 4,
                 client_build: "c/1".into(),
                 auth: Auth::Register { display_name: "Cloud".into() },
                 tint: [10, 20, 30],
                 appearance_ref: Some("cloud_model".into()),
             },
-            r#"{"Hello":{"protocol_version":3,"client_build":"c/1","auth":{"Register":{"display_name":"Cloud"}},"tint":[10,20,30],"appearance_ref":"cloud_model"}}"#,
+            r#"{"Hello":{"protocol_version":4,"client_build":"c/1","auth":{"Register":{"display_name":"Cloud"}},"tint":[10,20,30],"appearance_ref":"cloud_model"}}"#,
         );
         golden(
             ClientMsg::JoinArea {
@@ -606,13 +612,13 @@ mod tests {
         golden(ClientMsg::PartySync, r#""PartySync""#);
         golden(
             ClientMsg::Hello {
-                protocol_version: 3,
+                protocol_version: 4,
                 client_build: "c/1".into(),
                 auth: Auth::Token(Secret::new("fmvt_x")),
                 tint: [0, 0, 0],
                 appearance_ref: None,
             },
-            r#"{"Hello":{"protocol_version":3,"client_build":"c/1","auth":{"Token":"fmvt_x"},"tint":[0,0,0],"appearance_ref":null}}"#,
+            r#"{"Hello":{"protocol_version":4,"client_build":"c/1","auth":{"Token":"fmvt_x"},"tint":[0,0,0],"appearance_ref":null}}"#,
         );
     }
 
@@ -620,14 +626,14 @@ mod tests {
     fn golden_server_messages() {
         golden(
             ServerMsg::Welcome {
-                protocol_version: 3,
+                protocol_version: 4,
                 server_build: "s/1".into(),
                 session: SessionId(4),
                 entity: EntityId(5),
                 account: AccountId(6),
                 issued_token: None,
             },
-            r#"{"Welcome":{"protocol_version":3,"server_build":"s/1","session":4,"entity":5,"account":6,"issued_token":null}}"#,
+            r#"{"Welcome":{"protocol_version":4,"server_build":"s/1","session":4,"entity":5,"account":6,"issued_token":null}}"#,
         );
         golden(
             ServerMsg::PartyRejected { error: PartyFailure::Rules(PartyError::PartyFull { party: PartyId(2), max_size: 3 }) },
