@@ -252,7 +252,10 @@ Headless bots: `--travel md1_1,md1stin` walks through the exits to those fields 
 the field the bot ended in), a bot that has a party to form waits for it first, and bots
 without `--travel` never walk across an exit by accident. `scripts/travel-smoke.sh` runs two
 bots in a party from `md1stin` through its gateway to `md1_1` against your own library
-(read-only, throw-away state) and back.
+(read-only, throw-away state) and back; `scripts/travel-smoke.sh --fixture` does the same on the
+synthetic FIXTURE rooms (`fmv-server --game fixture-rooms`, `fmv-client --game fixture-rooms
+--name X`: a hall and a yard joined by an exit each way, with one NPC in the yard; **not FF7**) and
+needs no owned data.
 
 Not done: exits that scripts decide (FF7 `MAPJUMP`s and line triggers; they need the script VM
 and the game's story variables), conditional NPCs, NPC animation and talking, per-phase
