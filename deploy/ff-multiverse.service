@@ -1,0 +1,48 @@
+# FF Multiverse server - systemd USER unit TEMPLATE (no root, no system-level unit).
+#
+# Install it as ~/.config/systemd/user/ff-multiverse.service; deploy/README.md has the
+# whole procedure. %h expands to the home directory of the user running the unit.
+# Every path below is a PLACEHOLDER for the layout described in deploy/README.md:
+#
+#   %h/servers/ff-multiverse/current                    symlink -> releases/<package name>
+#   %h/servers/ff-multiverse/config/ff-multiverse.env   holds FMV_BIND (not in git)
+#   %h/servers/ff-multiverse/state                      persistent state, NEVER inside releases/
+#
+# HOST AND PORT ARE UNKNOWN: nothing is assigned yet. The bind address comes only from
+# FMV_BIND in the env file, which ships as a placeholder that is not a socket address,
+# so an unconfigured install refuses to start instead of listening somewhere by accident.
+#
+# systemd has no inline comments: keep every comment on a line of its own.
+
+[Unit]
+Description=FF Multiverse server (private; no game assets are bundled)
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Must exist and must not be optional (no leading "-"): a missing file has to fail closed.
+EnvironmentFile=%h/servers/ff-multiverse/config/ff-multiverse.env
+# The plan keeps all writable state under $XDG_DATA_HOME/ff-multiverse/, separate from the
+# release. That the server honours XDG_DATA_HOME is the plan's intended interface, not yet
+# verified: re-check this line once fmv-persist defines the real state-directory setting.
+Environment=XDG_DATA_HOME=%h/servers/ff-multiverse/state
+# Must exist before the first start (mkdir -p, see deploy/README.md) or the unit fails.
+WorkingDirectory=%h/servers/ff-multiverse/state
+ExecStart=%h/servers/ff-multiverse/current/fmv-server --bind ${FMV_BIND}
+Restart=on-failure
+RestartSec=3
+# clap exits with status 2 on usage errors such as an unset or malformed FMV_BIND. Do not
+# restart-loop on configuration errors; StartLimit* still bounds any other crash loop.
+RestartPreventExitStatus=2
+KillSignal=SIGTERM
+TimeoutStopSec=30
+# Sandboxing that works without root in a user manager. Heavier options (PrivateTmp,
+# ProtectSystem, ProtectHome, ...) are left out until they are validated on the real host,
+# because they can fail to start in a user manager on some systems.
+NoNewPrivileges=yes
+UMask=0077
+SyslogIdentifier=ff-multiverse
+
+[Install]
+WantedBy=default.target

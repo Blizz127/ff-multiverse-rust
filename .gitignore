@@ -22,3 +22,7 @@ library/
 import-sessions/
 /u.cli.*
 /.claude/
+# Release packaging output (scripts/package.sh). Built archives are never committed.
+/dist/
+# Local deployment env files can hold real host/port values; only placeholder templates are committed.
+/deploy/*.env
