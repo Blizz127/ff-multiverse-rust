@@ -228,11 +228,18 @@ async fn save_one(store: &Arc<Store>, game: GameId, rules: &Arc<dyn BattleRules>
         let result = tokio::task::spawn_blocking(move || persist(&store, game, rules.as_ref(), &attempt_job, unix_now())).await;
         let failure = match result {
             Ok(Ok(saved)) => {
-                // `key=value` layout: `scripts/battle-smoke.sh --progress` reads it (new keys at the end).
-                info!(
-                    "progress saved account={} character={} level={} exp={} gil={} ap={} items={}",
-                    job.account.0, saved.progress.character, saved.progress.level, saved.progress.exp, saved.progress.gil, saved.progress.ap, saved.items
-                );
+                // `key=value` layout: `scripts/battle-smoke.sh --progress` reads it (new keys at the end), and
+                // counts one `progress saved` line per member per won battle, so an item used (a change
+                // to the inventory alone) has a line of its own.
+                match &job.change {
+                    SavedChange::Reward(_) => info!(
+                        "progress saved account={} character={} level={} exp={} gil={} ap={} items={}",
+                        job.account.0, saved.progress.character, saved.progress.level, saved.progress.exp, saved.progress.gil, saved.progress.ap, saved.items
+                    ),
+                    SavedChange::UsedItem(item) => {
+                        info!("item use saved account={} character={} item={item} items={}", job.account.0, job.character, saved.items)
+                    }
+                }
                 return;
             }
             Ok(Err(failure)) => failure,
