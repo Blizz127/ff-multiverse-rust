@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# scripts/battle-smoke.sh - shared-battle smoke test for fmv-server + fmv-client (protocol v3).
+# scripts/battle-smoke.sh - shared-battle smoke test for fmv-server + fmv-client (protocol v5).
 #
-# Usage: scripts/battle-smoke.sh [--fixture|--random] [--release|--debug] [--bin-dir DIR] [--build]
+# Usage: scripts/battle-smoke.sh [--fixture|--random|--progress] [--release|--debug] [--bin-dir DIR] [--build]
 #                                [--library STATE_DIR] [--duration SECS] [--formation ID]
 #                                [--tick-rate TPS] [--battle-speed N] [--bot idle|circle]
 #                                [--keep-logs] [-h|--help]
@@ -35,7 +35,23 @@
 #
 # --fixture: the synthetic FIXTURE server (no battle data) with --debug-encounters and one
 # --battle-auto --debug-encounters bot. Expected: the request is refused cleanly ("this server
-# cannot run battles"), the bot exits 0 and prints battles=0 victories=0 (and area_changes=0, the last field of the line).
+# cannot run battles"), the bot exits 0 and prints battles=0 victories=0 area_changes=0 level=0
+# exp=0 (the FIXTURE server has no characters, so it reports no progress: 0 is "unknown").
+#
+# --progress (real data): character progress, protocol v5. ONE server stays up through three runs of
+# the same two bots, which keep their client state directories and so log in again with the tokens
+# the first run saved. Run 1: the party fights one shared battle; each bot's progress notes ("progress:
+# ... level=L exp=E exp_to_next=N ...", first on joining, then after the win) must show experience
+# gained and, if E reached the threshold (E0 + N0), a level gained and leveled_up=true; the SMOKE line
+# ends with that level and exp. Run 2 (a reconnect): each bot is told on joining exactly what run 1
+# ended with (the progress was SAVED and read back), the server's second "battle started" line carries
+# those levels (levels=[..]: the second battle's EncounterStart carries the level gained), and the
+# second win adds on. Run 3 (a reconnect, no fighting): the SMOKE line shows what run 2 ended with.
+# The server must also have logged one "progress saved" line per member per battle. Both bots are
+# Cloud (a headless bot registers without a look); on the Steam data he starts at level 6 with 610
+# experience, six short of level 7, so the first win levels him up. The server is not restarted here
+# (the client's token files are keyed by server address, and the server binds a free port): that the
+# saved progress survives a restart is tested by crates/fmv-server/tests/progress.rs.
 #
 # Isolation (the owner's state directory is never touched, only its LIBRARY is read): the server and
 # the clients run with XDG_DATA_HOME/XDG_STATE_HOME/XDG_CONFIG_HOME/XDG_CACHE_HOME and FMV_STATE_DIR
@@ -64,6 +80,10 @@ err() { printf 'battle-smoke.sh: error: %s\n' "$*" >&2; }
 MODE=real
 LIBRARY="${FMV_FF7_LIBRARY:-$HOME/.local/share/ff-multiverse}"
 BATTLE_DURATION=40
+# --progress runs the bots three times, so each battle run is shorter (a battle takes a few seconds);
+# an explicit --duration still wins.
+PROGRESS_DURATION=16
+DURATION_SET=0
 # md1stin's first random-encounter formation in the Steam build (two enemies): a starting party wins
 # it every time and both members attack in every fight (checked over 200 seeds by
 # crates/fmv-server/tests/battle_real.rs, `the_smoke_formations_are_won_every_time_...`).
@@ -75,7 +95,7 @@ PARTY_SIZE=2
 
 usage() {
   cat <<'EOF'
-Usage: scripts/battle-smoke.sh [--fixture|--random] [--release|--debug] [--bin-dir DIR] [--build]
+Usage: scripts/battle-smoke.sh [--fixture|--random|--progress] [--release|--debug] [--bin-dir DIR] [--build]
                                [--library STATE_DIR] [--duration SECS] [--formation ID]
                                [--tick-rate TPS] [--battle-speed N] [--bot idle|circle]
                                [--keep-logs] [-h|--help]
@@ -86,7 +106,10 @@ for the same battle, each replayed it from its own battle data ("verified by rep
 members attacked (the server's commands=[a, b] are both at least 1). --random: the same bots walk
 md1stin without --debug-encounters and the server rolls the field's own encounter table (battles
 start by themselves); every battle they enter must be verified by replay. --fixture: checks that
-a FIXTURE server refuses battles cleanly.
+a FIXTURE server refuses battles cleanly. --progress: the real-data bots fight, then reconnect with
+their saved tokens and fight again, then reconnect once more: each run's progress notes must be
+consistent (a win pays experience and a level where the threshold was crossed), the second battle
+must carry the level gained, and every reconnect must show what the run before ended with.
 
   --library DIR     state directory that contains library/ (default $FMV_FF7_LIBRARY, else
                      ~/.local/share/ff-multiverse); only the library is read, never written
@@ -299,6 +322,62 @@ check_mirror() {
   log_has "$log" "; verified: the server's " || problem "client $n never logged a 'verified:' end note"
 }
 
+# first_line_with <file> <needle>: print the first line containing needle; fail if none (pure bash,
+# like last_line_with).
+first_line_with() {
+  local file="$1" needle="$2" line
+  [[ -r $file ]] || return 1
+  while IFS= read -r line || [[ -n $line ]]; do
+    if [[ $line == *"$needle"* ]]; then
+      printf '%s\n' "$line"
+      return 0
+    fi
+  done <"$file"
+  return 1
+}
+
+# nth_line_with <file> <needle> <n>: print the n-th (1-based) line containing needle; fail if none.
+nth_line_with() {
+  local file="$1" needle="$2" want="$3" line seen=0
+  [[ -r $file ]] || return 1
+  while IFS= read -r line || [[ -n $line ]]; do
+    if [[ $line == *"$needle"* ]]; then
+      seen=$((seen + 1))
+      if ((seen == want)); then
+        printf '%s\n' "$line"
+        return 0
+      fi
+    fi
+  done <"$file"
+  return 1
+}
+
+# levels_of <server log line>: the levels the server logged for a battle's members (`levels=[6, 6]`),
+# sorted, as "6 6" (nothing if the line has none).
+levels_of() {
+  local line sorted
+  local -a levels
+  line=$(strip_ansi "$1")
+  if [[ $line =~ levels=\[([0-9,\ ]*)\] ]]; then
+    read -r -a levels <<<"${BASH_REMATCH[1]//,/ }"
+    sorted=$(printf '%s\n' "${levels[@]}" | sort -n | tr '\n' ' ')
+    printf '%s' "${sorted% }"
+  fi
+}
+
+# progress_note <first|last> <client log>: that `progress:` note of a client (the client's `progress`
+# module writes them: `progress: Cloud level=7 exp=626 exp_to_next=323 gil=20 ap=4 leveled_up=true (was
+# level 6)`), ANSI stripped; nothing if it has none.
+progress_note() {
+  local which="$1" log="$2" line
+  if [[ $which == first ]]; then
+    line=$(first_line_with "$log" "progress: ") || return 0
+  else
+    line=$(last_line_with "$log" "progress: ") || return 0
+  fi
+  strip_ansi "$line"
+}
+
 run_real() {
   local state_real="$LIBRARY"
   [[ -d $state_real/library/sets ]] || {
@@ -353,6 +432,12 @@ run_real() {
         [[ $smoke_line == *" $value"* ]] || problem "client $n: the SMOKE line lacks $value: $smoke_line"
       done
       [[ $(field "$smoke_line" fixture) == false ]] || problem "client $n: fixture is not false: $smoke_line"
+      # Character progress (protocol v5): the line ends with the level and experience the server last
+      # reported, which the won battle has just paid (see --progress for the full chain).
+      value=$(field "$smoke_line" level)
+      [[ $value =~ ^[0-9]+$ ]] && ((value >= 1)) || problem "client $n: the SMOKE line has no level of at least 1 (level=$value): $smoke_line"
+      value=$(field "$smoke_line" exp)
+      [[ $value =~ ^[0-9]+$ ]] && ((value >= 1)) || problem "client $n: the SMOKE line has no experience (exp=$value): $smoke_line"
     else
       problem "client $n printed no SMOKE line"
     fi
@@ -393,6 +478,8 @@ run_real() {
   (($(count_lines_with "$WORK/server.log" "battle started") <= 1)) || problem "the server started more than one battle"
 
   stop_server
+  # Stopping the server saved everything queued: both members' payments are in the store.
+  (($(count_lines_with "$WORK/server.log" "progress saved account=") >= 2)) || problem "the server did not save the progress of both members (progress saved lines: $(count_lines_with "$WORK/server.log" "progress saved account="))"
   after=$(ls -A -- "$state_real" | sort | tr '\n' ' ')
   [[ $before == "$after" ]] || problem "the library state directory changed: before [$before], after [$after]"
 
@@ -519,6 +606,212 @@ run_random() {
   say "PASS: random encounters from the real field's table started battles that the walking party won; $state_real unchanged ($after)"
 }
 
+# What each bot saw at the end of the previous run of --progress (the next run must be told exactly
+# this on joining), the level each was told on joining in each run, and a line per bot and run for the
+# PASS message.
+declare -A PREV_LEVEL=() PREV_EXP=() RUN_JOIN_LEVEL=()
+PROGRESS_SUMMARY=()
+
+# start_bots <run> <duration> <battle|idle>: run bots A and B against the server, which stays up, and
+# wait for both. Every run uses the same client state directories, so after the first one the bots
+# log in with the tokens it saved (a saved account is used when --name names it; registering again
+# needs --register).
+start_bots() {
+  local run="$1" duration="$2" kind="$3" n
+  CPID=()
+  CRC=()
+  local common=(--server "$CONNECT" --headless --duration "$duration" --bot "$BOT" --ff7-library "$WORK/lib-state")
+  if [[ $kind == battle ]]; then
+    "$CLIENT_BIN" "${common[@]}" --name A --state-dir "$WORK/client-A" \
+      --party-invite-first-peer --battle-auto --debug-encounters --battle-wait-party "$PARTY_SIZE" \
+      >"$WORK/client-A.$run.log" 2>&1 &
+    CPID[A]=$!
+    "$CLIENT_BIN" "${common[@]}" --name B --state-dir "$WORK/client-B" --party-accept --battle-auto \
+      >"$WORK/client-B.$run.log" 2>&1 &
+    CPID[B]=$!
+  else
+    for n in "${CLIENT_NAMES[@]}"; do
+      "$CLIENT_BIN" "${common[@]}" --name "$n" --state-dir "$WORK/client-$n" >"$WORK/client-$n.$run.log" 2>&1 &
+      CPID[$n]=$!
+    done
+  fi
+  wait_clients $((duration + CLIENT_GRACE))
+}
+
+# check_phase <run> <battle|idle>: the checks of one run of both bots (see the --progress paragraph of
+# the header): clean exit, a SMOKE line that ends with the last level and exp the server reported, a
+# progress note on joining that equals what the run before ended with, and for a battle run a win that
+# paid experience and a level exactly where the threshold (exp + exp_to_next on joining) was crossed.
+check_phase() {
+  local run="$1" kind="$2" n log smoke_line join_note end_note value
+  local l0 e0 x0 l1 e1 up
+  for n in "${CLIENT_NAMES[@]}"; do
+    log="$WORK/client-$n.$run.log"
+    if [[ ${CRC[$n]:-} == timeout ]]; then
+      problem "$run: client $n was still running ${CLIENT_GRACE}s after its duration and was killed"
+    elif [[ ${CRC[$n]:-} != 0 ]]; then
+      problem "$run: client $n exited with status ${CRC[$n]:-unknown}"
+    fi
+    if ! smoke_line=$(last_line_with "$log" "SMOKE name="); then
+      problem "$run: client $n printed no SMOKE line"
+      continue
+    fi
+    smoke_line=$(strip_ansi "$smoke_line")
+    SMOKE_LINES+=("$run client $n: $smoke_line")
+    [[ $(field "$smoke_line" fixture) == false ]] || problem "$run: client $n: fixture is not false: $smoke_line"
+    if log_has "$log" "DIVERGENCE"; then
+      problem "$run: client $n reported a BATTLE DIVERGENCE (its replay disagreed with the server)"
+    fi
+
+    # What the server said on joining.
+    join_note=$(progress_note first "$log")
+    end_note=$(progress_note last "$log")
+    if [[ $join_note != *"(on joining)"* ]]; then
+      problem "$run: client $n was not told its progress on joining (first note: '$join_note')"
+      continue
+    fi
+    l0=$(field "$join_note" level)
+    e0=$(field "$join_note" exp)
+    x0=$(field "$join_note" exp_to_next)
+    if [[ ! $l0 =~ ^[0-9]+$ || ! $e0 =~ ^[0-9]+$ || ! $x0 =~ ^[0-9]+$ ]] || ((l0 < 1)); then
+      problem "$run: client $n: the note on joining has no usable level/exp/exp_to_next: $join_note"
+      continue
+    fi
+    # A reconnect is told what the run before ended with: the progress was saved and read back.
+    if [[ -n ${PREV_LEVEL[$n]:-} ]] && [[ $l0 != "${PREV_LEVEL[$n]}" || $e0 != "${PREV_EXP[$n]}" ]]; then
+      problem "$run: client $n joined with level $l0 and $e0 exp, but the run before ended with level ${PREV_LEVEL[$n]} and ${PREV_EXP[$n]} exp: the progress was not kept"
+    fi
+    RUN_JOIN_LEVEL["$run.$n"]=$l0
+    l1=$l0
+    e1=$e0
+    if [[ $kind == battle ]]; then
+      for value in "party=2" "battles=1" "victories=1"; do
+        [[ $smoke_line == *" $value"* ]] || problem "$run: client $n: the SMOKE line lacks $value: $smoke_line"
+      done
+      # The mirror replayed the battle from the client's own data, with the levels the server sent.
+      check_mirror "$n" "$log" 1
+      l1=$(field "$end_note" level)
+      e1=$(field "$end_note" exp)
+      up=$(field "$end_note" leveled_up)
+      if [[ ! $l1 =~ ^[0-9]+$ || ! $e1 =~ ^[0-9]+$ ]]; then
+        problem "$run: client $n: no progress note after the battle (last note: '$end_note')"
+        continue
+      fi
+      ((e1 > e0)) || problem "$run: client $n: the won battle paid no experience ($e0 -> $e1)"
+      if ((x0 > 0 && e1 >= e0 + x0)); then
+        # The threshold of the next level was crossed: a level was gained, and the server said so.
+        if ! { ((l1 > l0)) && [[ $up == true ]]; }; then
+          problem "$run: client $n: experience went $e0 -> $e1, past the threshold at $((e0 + x0)), but the level went $l0 -> $l1 (leveled_up=$up)"
+        fi
+      elif ((l1 != l0)) || [[ $up != false ]]; then
+        problem "$run: client $n: experience went $e0 -> $e1, short of the threshold at $((e0 + x0)), but the level went $l0 -> $l1 (leveled_up=$up)"
+      fi
+    else
+      [[ $smoke_line == *" battles=0 "* ]] || problem "$run: client $n: a run that does not fight entered a battle: $smoke_line"
+      if [[ $end_note != "$join_note" ]]; then
+        problem "$run: client $n was told more than its progress on joining although it did not fight: $end_note"
+      fi
+    fi
+    # The SMOKE line ends with the last thing the server said.
+    if [[ $(field "$smoke_line" level) != "$l1" || $(field "$smoke_line" exp) != "$e1" ]]; then
+      problem "$run: client $n: the SMOKE line says level=$(field "$smoke_line" level) exp=$(field "$smoke_line" exp) but its last progress note says level $l1, exp $e1: $smoke_line"
+    fi
+    PREV_LEVEL[$n]=$l1
+    PREV_EXP[$n]=$e1
+    PROGRESS_SUMMARY+=("$run client $n: level $l0 -> $l1, exp $e0 -> $e1")
+  done
+}
+
+# joined_levels <run>: the levels both bots were told on joining in <run>, sorted, as "6 6".
+joined_levels() {
+  local sorted
+  sorted=$(printf '%s\n' "${RUN_JOIN_LEVEL[$1.A]:-}" "${RUN_JOIN_LEVEL[$1.B]:-}" | sort -n | tr '\n' ' ')
+  printf '%s' "${sorted% }"
+}
+
+run_progress() {
+  local state_real="$LIBRARY"
+  [[ -d $state_real/library/sets ]] || {
+    err "no library under $state_real (needs owned FF7 content imported with fmv-import); pass --library STATE_DIR"
+    exit 1
+  }
+  local before after
+  before=$(ls -A -- "$state_real" | sort | tr '\n' ' ')
+
+  mkdir -p -- "$WORK/lib-state" "$WORK/state-env" "$WORK/server-state" "$WORK/client-A" "$WORK/client-B"
+  ln -s -- "$(cd -- "$state_real" && pwd -P)/library" "$WORK/lib-state/library"
+  export FMV_STATE_DIR="$WORK/state-env"
+
+  local -a server_args=(--bind 127.0.0.1:0 --ff7-library "$WORK/lib-state" --state-dir "$WORK/server-state"
+    --debug-encounters --no-random-encounters --battle-speed "$BATTLE_SPEED" --battle-tick-rate "$TICK_RATE")
+  server_args+=(--debug-formation "$FORMATION")
+  say "starting server: $SERVER_BIN ${server_args[*]}"
+  "$SERVER_BIN" "${server_args[@]}" >"$WORK/server.log" 2>&1 &
+  SERVER_PID=$!
+  wait_ready "$WORK/server.log"
+  say "server READY: $READY_LINE"
+  [[ $(field "$READY_LINE" area) == Ff7/md1stin && $(field "$READY_LINE" fixture) == false ]] || fail "the server is not hosting the real FF7 field md1stin: $READY_LINE"
+
+  local duration=$BATTLE_DURATION
+  ((DURATION_SET)) || duration=$PROGRESS_DURATION
+  SMOKE_LINES=()
+  say "run 1 of 3: bots A and B form a party and fight one battle (${duration}s)"
+  start_bots run1 "$duration" battle
+  check_phase run1 battle
+  say "run 2 of 3: both log in again with their saved tokens and fight a second battle (${duration}s)"
+  start_bots run2 "$duration" battle
+  check_phase run2 battle
+  say "run 3 of 3: both log in once more and only look at what was kept (5s)"
+  start_bots run3 5 idle
+  check_phase run3 idle
+
+  # The server's side: two battles of the whole party, the second fought at the levels the first one's
+  # win left (the level gained is in the second EncounterStart), one saved payment per member and battle.
+  local started_1 started_2 got want value
+  (($(count_lines_with "$WORK/server.log" "battle started") == 2)) || problem "the server started $(count_lines_with "$WORK/server.log" "battle started") battle(s), expected 2"
+  started_1=$(nth_line_with "$WORK/server.log" "battle started" 1 || true)
+  started_2=$(nth_line_with "$WORK/server.log" "battle started" 2 || true)
+  if [[ -z $started_1 || -z $started_2 ]]; then
+    problem "the server did not log both battle starts"
+  else
+    [[ $started_1 == *"members=2"* && $started_2 == *"members=2"* ]] || problem "a battle did not have both members: [$started_1] [$started_2]"
+    got=$(levels_of "$started_1")
+    want=$(joined_levels run1)
+    [[ $got == "$want" ]] || problem "the first battle was fought at levels [$got], but the bots were told levels [$want] on joining"
+    got=$(levels_of "$started_2")
+    want=$(joined_levels run2)
+    [[ $got == "$want" ]] || problem "the second battle carries levels [$got], but the first win left the bots at levels [$want]: the level gained was not used"
+  fi
+  local ended
+  ended=$(last_line_with "$WORK/server.log" "battle ended" || true)
+  [[ $ended == *Victory* ]] || problem "the server's last battle did not end in Victory: $ended"
+
+  stop_server
+  # Stopping the server saved everything queued: one payment per member per battle, none lost.
+  value=$(count_lines_with "$WORK/server.log" "progress saved account=")
+  [[ $value == 4 ]] || problem "the server logged $value 'progress saved' line(s), expected 4 (two members, two battles)"
+  if log_has "$WORK/server.log" "NOT SAVED" || log_has "$WORK/server.log" "NOT QUEUED"; then
+    problem "the server lost a payment: $(last_line_with "$WORK/server.log" "NOT SAVED" || last_line_with "$WORK/server.log" "NOT QUEUED")"
+  fi
+  after=$(ls -A -- "$state_real" | sort | tr '\n' ' ')
+  [[ $before == "$after" ]] || problem "the library state directory changed: before [$before], after [$after]"
+
+  if ((${#PROBLEMS[@]})); then
+    finish_failed
+  fi
+  local l
+  for l in "${SMOKE_LINES[@]}"; do
+    say "$l"
+  done
+  for l in "${PROGRESS_SUMMARY[@]}"; do
+    say "progress, $l"
+  done
+  say "server: $started_1"
+  say "server: $started_2"
+  RESULT=pass
+  say "PASS: two bots fought two battles on the real field across three logins; each win paid experience (and a level where the threshold was crossed), the progress was saved and read back on every reconnect, and the second battle was fought at the level the first one left; $state_real unchanged ($after)"
+}
+
 run_fixture() {
   mkdir -p -- "$WORK/state-env" "$WORK/client-A"
   export FMV_STATE_DIR="$WORK/state-env"
@@ -537,7 +830,8 @@ run_fixture() {
   local smoke_line
   if smoke_line=$(last_line_with "$WORK/client-A.log" "SMOKE name="); then
     smoke_line=$(strip_ansi "$smoke_line")
-    [[ $smoke_line == *" battles=0 victories=0 area_changes=0" ]] || problem "the SMOKE line does not end in battles=0 victories=0 area_changes=0: $smoke_line"
+    # The FIXTURE server has no characters and reports no progress: level=0 exp=0 ("unknown"), last.
+    [[ $smoke_line == *" battles=0 victories=0 area_changes=0 level=0 exp=0" ]] || problem "the SMOKE line does not end in battles=0 victories=0 area_changes=0 level=0 exp=0: $smoke_line"
     SMOKE_LINES=("$smoke_line")
   else
     problem "the bot printed no SMOKE line"
@@ -559,6 +853,7 @@ main() {
     case "$1" in
       --fixture) MODE=fixture ;;
       --random) MODE=random ;;
+      --progress) MODE=progress ;;
       --release) PROFILE=release ;;
       --debug) PROFILE=debug ;;
       --bin-dir)
@@ -575,6 +870,7 @@ main() {
       --duration)
         (($# >= 2)) || usage_error "--duration needs a number of seconds"
         BATTLE_DURATION="$2"
+        DURATION_SET=1
         shift
         ;;
       --formation)
@@ -631,6 +927,7 @@ main() {
   case "$MODE" in
     fixture) run_fixture ;;
     random) run_random ;;
+    progress) run_progress ;;
     *) run_real ;;
   esac
 }

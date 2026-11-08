@@ -56,12 +56,16 @@ CONTENT:
 
 HEADLESS OUTPUT:
   stdout carries exactly one line:
-    SMOKE name=<n> area=<AreaId> fixture=<bool> peers_seen=<n> updates=<n> rejected=<n> rtt_ms=<n|-1> party=<n> battles=<n> victories=<n>
+    SMOKE name=<n> area=<AreaId> fixture=<bool> peers_seen=<n> updates=<n> rejected=<n> rtt_ms=<n|-1> party=<n> battles=<n> victories=<n> area_changes=<n> level=<n> exp=<n>
   <n> in name= is the display name percent-encoded: letters, digits and - . _ ~ are kept, every
   other byte becomes %XX (\"Red XIII\" prints as Red%20XIII), so the line always splits on spaces.
   party=<n> is the LARGEST party this client was in at any moment of the run (0: never in one).
   battles=<n> is how many shared battles this client entered, victories=<n> how many the server
   ended in victory. A bot whose replay of a battle ever disagreed with the server exits 1.
+  area_changes=<n> is how many times the server moved this client on to another area. level=<n> and
+  exp=<n> are the level and total experience of this player's character as the server last reported
+  them (0 and 0 when it reports none: a server without battle data, such as the FIXTURE one, has no
+  characters); every report is also logged on stderr as a `progress:` line.
   A server that goes silent for 10 s is treated as gone (exit code 1, the summary is still printed).
   Party events and refusals are logged on stderr, one `party:` line each.
   --party-invite-first-peer invites the visible player with the lowest entity id (a refused invite
@@ -79,6 +83,10 @@ BATTLES:
   client replays the battle from YOUR OWN scene.bin and kernel.bin (only ids and seeds are sent)
   and shouts `BATTLE DIVERGENCE` if its replay ever disagrees with the server. Without battle data
   in your library you can only wait the battle out.
+  Your character is your own: the server keeps its level, experience, AP and gil per account (the
+  character is the one your look names, Cloud unless you chose another), fights you as it at that
+  level, pays it when a battle is won and tells you (and when you join) what it has now; the window
+  shows it under the area name, for instance `Cloud Lv 7  EXP 626/949  Gil 20`.
 
 CHARACTER MENU:
   A window started without --name opens on a character menu instead of logging in at once; with

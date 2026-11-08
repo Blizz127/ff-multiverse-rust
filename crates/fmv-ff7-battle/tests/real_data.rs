@@ -289,6 +289,79 @@ fn real_kernel_bin_decodes() {
     );
 }
 
+/// The EXP curves of section 2 reproduce the thresholds the game is known for (this backs
+/// `GrowthData::exp_for_level`'s documentation): Cloud needs 6, 33, 94, 202, 372 and 616 EXP in
+/// total for levels 2 to 7, and Barret's first level costs 7 (his band 0 modifier is 70). The
+/// curves are strictly increasing for every character, level 99 is far below the EXP cap, and
+/// Cloud's own starting record (level 6, 610 EXP) is a level-6 value on his curve.
+#[test]
+#[ignore = "needs FMV_FF7_DATA pointing at the owner's FF7 data directory"]
+fn real_exp_curves_reproduce_the_known_thresholds() {
+    use fmv_ff7_battle::kernel::{MAX_EXP, MAX_LEVEL};
+    let Some(path) = kernel_path() else { return };
+    let kernel = Kernel::open(&path).expect("kernel.bin parses");
+    let g = &kernel.growth;
+
+    let cloud: Vec<u32> = (1..=7)
+        .map(|l| g.exp_for_level(CharacterId::Cloud, l).unwrap())
+        .collect();
+    assert_eq!(
+        cloud,
+        [0, 6, 33, 94, 202, 372, 616],
+        "Cloud's thresholds for levels 1 to 7"
+    );
+    assert_eq!(
+        g.exp_for_level(CharacterId::Barret, 2),
+        Some(7),
+        "Barret's first level"
+    );
+
+    for who in CharacterId::ALL {
+        // The base byte of an EXP curve is unused (zero): the modifier is the gradient byte.
+        let curve = g
+            .curve(g.characters[who.index()].exp_curve)
+            .expect("EXP curve");
+        assert!(
+            curve.bases.iter().all(|b| *b == 0),
+            "{who:?}: EXP curve bases {:?}",
+            curve.bases
+        );
+        assert!(
+            curve.gradients.iter().all(|m| (60..=90).contains(m)),
+            "{who:?}: {:?}",
+            curve.gradients
+        );
+        let mut prev = 0;
+        for level in 1..=MAX_LEVEL {
+            let t = g.exp_for_level(who, level).unwrap();
+            assert!(level == 1 || t > prev, "{who:?} level {level}");
+            assert_eq!(
+                g.level_for_exp(who, t),
+                Some(level),
+                "{who:?} level {level}"
+            );
+            prev = t;
+        }
+        assert!(prev < MAX_EXP, "{who:?}: level 99 needs {prev}");
+        assert_eq!(g.exp_to_next_level(who, MAX_LEVEL), Some(0));
+    }
+
+    // Cloud's initial record: level 6 with 610 EXP is a level-6 value (372 <= 610 < 616) on
+    // his curve, six short of level 7.
+    let rec = kernel.init_character_by_id(0).expect("Cloud's init record");
+    assert_eq!(
+        g.level_for_exp(CharacterId::Cloud, rec.exp),
+        Some(rec.level),
+        "level {} with {} EXP",
+        rec.level,
+        rec.exp
+    );
+    println!(
+        "Cloud: {cloud:?}; his start: level {} with {} EXP",
+        rec.level, rec.exp
+    );
+}
+
 /// Run a battle where ready party members attack the first living enemy, stepping 100 ms at
 /// a time. Returns the full event log.
 fn play_out(state: &mut BattleState, max_slices: usize) -> Vec<BattleEvent> {

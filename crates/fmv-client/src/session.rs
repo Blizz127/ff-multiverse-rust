@@ -275,6 +275,14 @@ impl Session {
         }
     }
 
+    /// Print what the server said about our character since the last call, one `progress:` line each,
+    /// on stderr (never stdout: the headless bot's stdout carries exactly one line).
+    pub fn log_progress_notes(&mut self) {
+        for line in self.state.progress.drain_notes() {
+            eprintln!("progress: {line}");
+        }
+    }
+
     /// Say goodbye and wait (bounded) for the network thread to flush `Leave`.
     pub fn leave(&mut self, wait: Duration) {
         self.net.leave_and_join(wait);

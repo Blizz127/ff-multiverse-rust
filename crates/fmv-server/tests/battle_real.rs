@@ -223,10 +223,15 @@ fn the_default_debug_formation_exists_and_every_formation_builds_for_every_chara
     }
 }
 
-/// The gate behind `scripts/battle-smoke.sh`: two auto-attackers (Cloud and Barret at their
-/// starting levels) must beat each of md1stin's two-enemy formations EVERY time, both of them must
-/// attack in every fight, and the fight must be short at the smoke's pace and still reasonable at
-/// the engine's default pace. 200 seeds each.
+/// The gate behind `scripts/battle-smoke.sh`: two auto-attackers must beat each of md1stin's
+/// two-enemy formations EVERY time, both of them must attack in every fight, and the fight must be
+/// short at the smoke's pace and still reasonable at the engine's default pace. 200 seeds each.
+///
+/// Who the two are: since accounts play their own character (M2-d) the smoke's headless bots both
+/// register without a look, so both are Cloud, at the level he starts at (6) in the first fight and
+/// at 7 in the second one (the first win levels him up on the real data: he starts six experience
+/// short of level 7). Both are checked, and Cloud with Barret (the pair this gate was first written
+/// for, still what two different looks field) at their starting levels.
 #[test]
 #[ignore = "needs the owner's library: set FMV_FF7_LIBRARY"]
 fn the_smoke_formations_are_won_every_time_by_both_members_and_quickly() {
@@ -244,15 +249,22 @@ fn the_smoke_formations_are_won_every_time_by_both_members_and_quickly() {
     for formation in two_enemy {
         // (speed, ticks per second, longest acceptable fight in seconds)
         for (speed, tps, limit_s) in [(0u8, 240u32, 10u64), (128, 60, 45)] {
-            let s = stats(&data, formation, &[0, 1], None, speed, tps, 200);
-            let longest_s = s.longest_ticks / u64::from(tps);
-            eprintln!(
-                "formation {formation} at speed {speed}, {tps} ticks/s: won {}/200, deaths in {} wins, longest {} ticks ({longest_s} s), mean {} ticks, fewest attacks by a member {}",
-                s.won, s.with_losses, s.longest_ticks, s.mean_ticks, s.fewest_attacks
-            );
-            assert_eq!((s.won, s.lost), (200, 0), "formation {formation}: every fight is won");
-            assert!(s.fewest_attacks >= 1, "formation {formation}: in every fight both members attack at least once");
-            assert!(longest_s <= limit_s, "formation {formation}: the longest fight takes {longest_s} s (limit {limit_s} s)");
+            // (who fights, at which level: `None` is each one's starting level)
+            for (characters, level, what) in [
+                (&[0u8, 1][..], None, "Cloud and Barret at their starting levels"),
+                (&[0, 0][..], Some(6), "Cloud and Cloud at level 6 (the smoke's first fight)"),
+                (&[0, 0][..], Some(7), "Cloud and Cloud at level 7 (after the first win's level-up)"),
+            ] {
+                let s = stats(&data, formation, characters, level, speed, tps, 200);
+                let longest_s = s.longest_ticks / u64::from(tps);
+                eprintln!(
+                    "formation {formation} at speed {speed}, {tps} ticks/s, {what}: won {}/200, deaths in {} wins, longest {} ticks ({longest_s} s), mean {} ticks, fewest attacks by a member {}",
+                    s.won, s.with_losses, s.longest_ticks, s.mean_ticks, s.fewest_attacks
+                );
+                assert_eq!((s.won, s.lost), (200, 0), "formation {formation}, {what}: every fight is won");
+                assert!(s.fewest_attacks >= 1, "formation {formation}, {what}: in every fight both members attack at least once");
+                assert!(longest_s <= limit_s, "formation {formation}, {what}: the longest fight takes {longest_s} s (limit {limit_s} s)");
+            }
         }
     }
 }

@@ -39,7 +39,7 @@ use std::fmt;
 use std::path::Path;
 
 use fmv_core::{AccountId, EntityId, Fingerprint};
-use fmv_ff7_battle::kernel::{CharacterId, Kernel, KernelError, MAX_KERNEL_BYTES};
+use fmv_ff7_battle::kernel::{CharacterId, Kernel, KernelError, MAX_AP, MAX_EXP, MAX_GIL, MAX_KERNEL_BYTES, MAX_LEVEL};
 use fmv_ff7_battle::rules::{
     enemies_for_formation, BattleConfig, BattleState, Combatant, Reward, StartMode, MAX_PER_SIDE,
 };
@@ -220,6 +220,26 @@ pub struct FormationInfo {
     pub enemies: usize,
 }
 
+/// The most a character's progress can hold in one game: the numbers battle rewards saturate at.
+/// The store checks none of them (it is game-agnostic); the server applies them when it adds a
+/// reward, so a character can never carry a number its game has no room for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProgressLimits {
+    /// The highest level.
+    pub max_level: u8,
+    /// Most total experience.
+    pub max_exp: u32,
+    /// Most gil.
+    pub max_gil: u32,
+    /// Most AP.
+    pub max_ap: u32,
+}
+
+impl ProgressLimits {
+    /// FF7's own caps (`fmv_ff7_battle::kernel::MAX_LEVEL`, `MAX_EXP`, `MAX_GIL`, `MAX_AP`).
+    pub const FF7: ProgressLimits = ProgressLimits { max_level: MAX_LEVEL, max_exp: MAX_EXP, max_gil: MAX_GIL, max_ap: MAX_AP };
+}
+
 /// The game's battle rules as one peer's own data provides them. The server and every client call
 /// [`BattleRules::build`] with the same [`BattleSetup`] and must get identical engines, which is
 /// why this is one trait with one implementation per game rather than code in each binary.
@@ -242,6 +262,25 @@ pub trait BattleRules: Send + Sync {
 
     /// The formation a debug encounter uses when none is named and the area has no table.
     fn default_formation(&self) -> Option<u16>;
+
+    // ---- used by the server to keep each player's progress (defaults keep older rule sets valid) ----
+
+    /// Total experience at which `character` reaches `level` (level 1 is 0), or `None` if this rule
+    /// set has no experience curve for it: such a character gains experience but never a level.
+    fn exp_for_level(&self, _character: u8, _level: u8) -> Option<u32> {
+        None
+    }
+
+    /// The experience a new account's `character` starts with when it starts at `level`: by default
+    /// the least that level takes ([`BattleRules::exp_for_level`]).
+    fn starting_exp(&self, character: u8, level: u8) -> u32 {
+        self.exp_for_level(character, level).unwrap_or(0)
+    }
+
+    /// The caps battle rewards saturate at (FF7's by default).
+    fn progress_limits(&self) -> ProgressLimits {
+        ProgressLimits::FF7
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -580,6 +619,19 @@ impl BattleRules for Ff7BattleData {
             .min()
             .map(|(_, id)| id)
     }
+
+    /// The kernel's EXP curve of the character ([`fmv_ff7_battle::kernel::GrowthData::exp_for_level`]).
+    fn exp_for_level(&self, character: u8, level: u8) -> Option<u32> {
+        self.kernel.growth.exp_for_level(CharacterId::from_index(usize::from(character))?, level)
+    }
+
+    /// The kernel's own starting record when it belongs to `level` on this character's curve (Cloud's
+    /// does: level 6 with 610 EXP, six short of level 7), else the least `level` takes; see
+    /// [`fmv_ff7_battle::kernel::Kernel::starting_exp`]. The other characters start at the leader's
+    /// level (see [`BattleRules::starting_level`]), which their own records do not describe.
+    fn starting_exp(&self, character: u8, level: u8) -> u32 {
+        CharacterId::from_index(usize::from(character)).and_then(|who| self.kernel.starting_exp(who, level)).unwrap_or(0)
+    }
 }
 
 /// The level used when the data has no starting level for a character.
@@ -677,6 +729,16 @@ impl BattleRules for SyntheticRules {
 
     fn default_formation(&self) -> Option<u16> {
         Some(0)
+    }
+
+    /// `2 * level * (level - 1)`: level 5 starts at 40, level 6 needs 60, level 7 needs 84 (a step of
+    /// `4 * level`), so a won two-dummy formation (24 experience for one player) levels a starting
+    /// character up. A made-up curve, like everything here.
+    fn exp_for_level(&self, character: u8, level: u8) -> Option<u32> {
+        (character < 9).then(|| {
+            let level = u32::from(level.clamp(1, 99));
+            2 * level * (level - 1)
+        })
     }
 }
 
@@ -994,5 +1056,50 @@ mod tests {
         }
         assert!(BattleRejection::DebugDisabled.to_string().contains("--debug-encounters"));
         assert_eq!(BattleId(4).to_string(), "battle#4");
+    }
+
+    #[test]
+    fn the_synthetic_rules_have_a_made_up_experience_curve_and_ff7s_limits() {
+        let rules = SyntheticRules::default();
+        assert_eq!(rules.exp_for_level(0, 1), Some(0));
+        // A step of `4 * level`: 20 from level 5 to 6, 24 from 6 to 7.
+        assert_eq!((5..=7).map(|l| rules.exp_for_level(0, l).unwrap()).collect::<Vec<_>>(), [40, 60, 84]);
+        assert_eq!(rules.exp_for_level(0, 0), Some(0), "levels are clamped to 1..=99");
+        assert_eq!(rules.exp_for_level(8, 200), rules.exp_for_level(8, 99));
+        assert_eq!(rules.exp_for_level(9, 5), None, "there is no tenth character");
+        assert_eq!(rules.starting_exp(0, 5), 40, "by default a character starts at the floor of its level");
+        assert_eq!(rules.starting_level(0), 5);
+        assert_eq!(
+            rules.progress_limits(),
+            ProgressLimits { max_level: 99, max_exp: 99_999_999, max_gil: 9_999_999, max_ap: 16_777_215 }
+        );
+    }
+
+    /// The new trait methods have defaults, so a rule set written before progress existed still
+    /// compiles and behaves: no curve (nobody levels), nothing to start with, FF7's caps.
+    #[test]
+    fn a_rule_set_without_experience_curves_never_levels_anyone() {
+        struct Bare;
+        impl BattleRules for Bare {
+            fn build(&self, _setup: &BattleSetup) -> Result<BattleState, BattleBuildError> {
+                Err(BattleBuildError::EmptyParty)
+            }
+            fn data_fingerprint(&self) -> Fingerprint {
+                Fingerprint([1; 32])
+            }
+            fn formation(&self, _id: u16) -> Option<FormationInfo> {
+                None
+            }
+            fn starting_level(&self, _character: u8) -> u8 {
+                3
+            }
+            fn default_formation(&self) -> Option<u16> {
+                None
+            }
+        }
+        let bare = Bare;
+        assert_eq!(bare.exp_for_level(0, 5), None);
+        assert_eq!(bare.starting_exp(0, 5), 0);
+        assert_eq!(bare.progress_limits(), ProgressLimits::FF7);
     }
 }

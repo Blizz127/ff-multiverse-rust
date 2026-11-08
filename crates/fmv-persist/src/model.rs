@@ -33,6 +33,9 @@ pub const MAX_INDEX_BYTES: u64 = 16 * 1024 * 1024;
 /// serialized as a list of numbers is several times its size), so a server must keep it in the
 /// store and put only a short key of it (an id, a hash) on the wire.
 pub const MAX_BLOB_BYTES: usize = 256 * 1024;
+/// Largest accepted [`CharacterProgress`] record file. A record is a few hundred bytes; this is
+/// the cap a corrupt or hostile file is held to, on read and on write.
+pub const MAX_CHARACTER_RECORD_BYTES: u64 = 4 * 1024;
 /// Longest accepted `base_archetype` (bytes).
 pub const MAX_ARCHETYPE_BYTES: usize = 64;
 /// Longest accepted per-game appearance reference, in **characters**: exactly the limit the
@@ -293,6 +296,76 @@ impl Progression {
     /// What `get_progression` returns when nothing was stored yet.
     pub fn empty(account_id: AccountId, game: GameId) -> Self {
         Self::new(account_id, game, Vec::new(), 0)
+    }
+}
+
+/// One account's character progress for one game: which of the game's characters it plays, and
+/// what that character has earned. **Not** [`Progression`]: that blob is the account's story
+/// state and also the key of its story phase (the server builds a `PhaseKey` from it), so
+/// battle results written into it would move the player to another instance. This record is
+/// separate, has its own file and API, and no adapter reads a phase from it.
+///
+/// The store is game-agnostic: `character` is the game's own character id (FF7: Cloud 0,
+/// Barret 1, ...), and the numbers mean whatever the game says. The caps and curves of a game
+/// (FF7's level 99, its EXP table, its gil limit) belong to its adapter, which applies them
+/// before it stores. The store only checks what is true in every game: the record belongs to
+/// the account and game it is filed under, `level` is at least 1, the schema is one it knows and
+/// the file is small.
+///
+/// A record that was never stored is absent (`Store::get_character_progress` returns `None`),
+/// not a default: the starting values come from the game's own data, which only the adapter
+/// has, so there is nothing to migrate when a game starts using this record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CharacterProgress {
+    /// Record format version. The store stamps [`SCHEMA_VERSION`] on every write.
+    pub schema_version: u32,
+    pub account_id: AccountId,
+    pub game: GameId,
+    /// The game's id of the character the account plays (opaque here).
+    pub character: u8,
+    /// At least 1.
+    pub level: u8,
+    /// Total experience.
+    pub exp: u32,
+    /// Ability points earned.
+    pub ap: u32,
+    /// Money.
+    pub gil: u32,
+    pub updated_at: u64,
+}
+
+impl CharacterProgress {
+    /// A fresh record: `character` at `level` with no experience, AP or gil (an adapter that
+    /// starts a character with experience sets `exp` itself).
+    pub fn new(
+        account_id: AccountId,
+        game: GameId,
+        character: u8,
+        level: u8,
+        updated_at: u64,
+    ) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            account_id,
+            game,
+            character,
+            level,
+            exp: 0,
+            ap: 0,
+            gil: 0,
+            updated_at,
+        }
+    }
+
+    /// What is true of every game's record (see the type's documentation).
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.level == 0 {
+            return Err(PersistError::InvalidField {
+                field: "level",
+                reason: "must be at least 1".into(),
+            });
+        }
+        Ok(())
     }
 }
 

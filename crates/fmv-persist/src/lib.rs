@@ -29,6 +29,15 @@
 //!   it for its lifetime. A second server on the same directory is refused, also one in
 //!   another PID namespace or container that cannot see the owner's pid; a lock left by a dead
 //!   process is taken over with a warning.
+//! * **Character progress is not story progress.** [`CharacterProgress`] (the character an account
+//!   plays, its level, experience, AP and gil, per game) is its own record in its own file
+//!   (`progression/<account>/<Game>.character.json`), written atomically like the others, with an
+//!   atomic read-modify-write ([`Store::update_character_progress`]) so that two results for one
+//!   account add up. It is separate from [`Progression`], the opaque story blob that also selects
+//!   an account's story phase: a battle result must never move a player to another instance. A
+//!   record that was never stored is absent, not a default (the game's own data supplies the start,
+//!   so there is nothing to migrate), and the game's caps and curves stay with its adapter: the
+//!   store checks only what is true of every game.
 //! * **Versioned records.** Every file carries `schema_version`. A newer version than
 //!   [`SCHEMA_VERSION`] (records) or [`INDEX_LOG_VERSION`] (index) is rejected with a clear
 //!   error instead of being misread. A version 1 `index.json` is migrated on open, keeping the
@@ -71,9 +80,10 @@ mod store;
 
 pub use error::{PersistError, Result};
 pub use model::{
-    game_key, parse_game_key, AccountInfo, AvatarId, AvatarProfile, Progression, Registered,
-    INDEX_LOG_VERSION, MAX_APPEARANCE_REF_BYTES, MAX_APPEARANCE_REF_CHARS, MAX_ARCHETYPE_BYTES,
-    MAX_BLOB_BYTES, MAX_INDEX_BYTES, MAX_RECORD_BYTES, MAX_TOKEN_BYTES, SCHEMA_VERSION,
+    game_key, parse_game_key, AccountInfo, AvatarId, AvatarProfile, CharacterProgress, Progression,
+    Registered, INDEX_LOG_VERSION, MAX_APPEARANCE_REF_BYTES, MAX_APPEARANCE_REF_CHARS,
+    MAX_ARCHETYPE_BYTES, MAX_BLOB_BYTES, MAX_CHARACTER_RECORD_BYTES, MAX_INDEX_BYTES,
+    MAX_RECORD_BYTES, MAX_TOKEN_BYTES, SCHEMA_VERSION,
 };
 pub use snapshot::{restore_snapshot, SnapshotInfo};
 pub use store::{Store, StoreOptions, DEFAULT_MAX_ACCOUNTS};

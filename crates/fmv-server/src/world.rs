@@ -69,6 +69,17 @@
 //! and every member is told what happened. The random-encounter table of the area a player walks
 //! in, if it has one, is rolled as it walks; a battle takes the party members that stand in the
 //! requester's area.
+//!
+//! # Character progress
+//!
+//! On such a server every player carries a mirror of its account's own character progress (the
+//! character its look names and its level, experience, AP and gil; see `crate::progress`), loaded at
+//! login and handed to [`World::join`] in [`NewPlayer::progress`], which also tells the player where
+//! it stands (the third message after the snapshot and the placement). A battle fights each member
+//! as its own character at its own level, and a victory pays it (see the `battle` module): the mirror
+//! is updated under the world lock, in memory, and the same payment is queued for the saver
+//! (`crate::saver`), which writes it to the store off the lock and off the async executor. Nothing in
+//! the world does disk I/O.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -83,6 +94,8 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, watch};
 
 use crate::deferred::{DeferredLogs, Line};
+use crate::progress::{self, Progress, ProgressSeed};
+use crate::saver::SaverHandle;
 use crate::ServerError;
 
 mod areas;
@@ -196,6 +209,9 @@ struct Player {
     placement: Option<Placement>,
     /// The battle this player is in, if any: it is frozen in the field until that battle ends.
     battle: Option<BattleId>,
+    /// What this player's character has earned (the mirror of its stored character progress; see
+    /// `progress`). `None` on a server that runs no battles.
+    progress: Option<Progress>,
     /// Horizontal distance walked since the last random-encounter roll.
     walked: f64,
     /// The area the player stands in (a key of `World::areas`). While the player is in transit it
@@ -215,6 +231,9 @@ pub struct NewPlayer {
     pub avatar: AvatarAppearance,
     /// The account's story phase for the hosted game.
     pub phase: PhaseKey,
+    /// The character its look names and what the store holds of its character progress (see
+    /// `progress`; unrelated to `phase`).
+    pub progress: ProgressSeed,
     pub tx: OutboundTx,
     pub close: CloseFlag,
 }
@@ -271,6 +290,9 @@ pub struct World {
     epoch: Instant,
     /// Battle support (`None`: this server cannot run battles). See `battle`.
     battle: Option<battle::BattleWorld>,
+    /// Where what battles pay is queued for saving (`None`: nothing is saved, as in the unit tests of
+    /// the world). See `saver`.
+    saver: Option<SaverHandle>,
     /// Log lines recorded under the world lock, written after it is released (see `take_logs`).
     logs: DeferredLogs,
 }
@@ -301,8 +323,15 @@ impl World {
             parties: PartyManager::new(party),
             epoch: Instant::now(),
             battle: None,
+            saver: None,
             logs: DeferredLogs::default(),
         })
+    }
+
+    /// Queue what battles pay into `saver` from now on (see `saver`). Without it payments still
+    /// reach the players' mirrors and messages, but nothing is stored.
+    pub(crate) fn set_progress_saver(&mut self, saver: SaverHandle) {
+        self.saver = Some(saver);
     }
 
     /// The log lines recorded while the world lock was held since the last call. Code in the
@@ -365,6 +394,8 @@ impl World {
         let pos = self.areas.get_mut(&home).map_or_else(Pos::default, areas::AreaState::next_spawn_point);
         let entity = new.entity;
         let account = new.account;
+        // Only a server that runs battles has characters to level (see `progress`).
+        let progress = self.battle.as_ref().map(|bw| progress::resolve(bw.rules(), new.progress));
         let snapshot = EntitySnapshot { id: entity, pos, facing: 0.0, anim: AnimState::Idle, avatar: new.avatar };
         self.players.insert(
             entity,
@@ -381,6 +412,7 @@ impl World {
                 invites: VecDeque::new(),
                 placement: None,
                 battle: None,
+                progress,
                 walked: 0.0,
                 area: home,
                 transit: None,
@@ -389,9 +421,11 @@ impl World {
         self.by_account.insert(account, entity);
 
         // The snapshot to the joiner, `PlayerJoined` to the others of the area, then the joiner's
-        // first placement (a solo player is placed by its own phase).
+        // first placement (a solo player is placed by its own phase) and, third, where its character
+        // stands.
         let mut failed = Vec::new();
         self.announce_entry(entity, &mut failed);
+        self.tell_progress(entity, false, &mut failed);
         self.drop_failed(failed);
         Ok(pos)
     }
@@ -803,7 +837,7 @@ mod tests {
         let close_rx = close.subscribe();
         let avatar = AvatarAppearance { display_name: name.into(), tint: [1, 2, 3], appearance_ref: None };
         let account = AccountId(entity.0);
-        w.join(NewPlayer { session, entity, account, avatar, phase: PhaseKey::default(), tx, close }, now)
+        w.join(NewPlayer { session, entity, account, avatar, phase: PhaseKey::default(), progress: Default::default(), tx, close }, now)
             .expect("a fresh account joins");
         Seat { entity, rx, close: close_rx }
     }
@@ -1293,7 +1327,16 @@ mod tests {
         let close = Arc::new(watch::channel(false).0);
         let close_rx = close.subscribe();
         let avatar = AvatarAppearance { display_name: name.into(), tint: [1, 2, 3], appearance_ref: None };
-        let new = NewPlayer { session, entity, account: AccountId(entity.0), avatar, phase: PhaseKey(phase.to_vec()), tx, close };
+        let new = NewPlayer {
+            session,
+            entity,
+            account: AccountId(entity.0),
+            avatar,
+            phase: PhaseKey(phase.to_vec()),
+            progress: Default::default(),
+            tx,
+            close,
+        };
         w.join(new, now).expect("join");
         Seat { entity, rx, close: close_rx }
     }
@@ -1358,7 +1401,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(16);
         let close = Arc::new(watch::channel(false).0);
         let avatar = AvatarAppearance { display_name: "A again".into(), tint: [0; 3], appearance_ref: None };
-        let dup = NewPlayer { session, entity, account: acct(&a), avatar, phase: PhaseKey::default(), tx, close };
+        let dup = NewPlayer { session, entity, account: acct(&a), avatar, phase: PhaseKey::default(), progress: Default::default(), tx, close };
         assert_eq!(w.join(dup, t0).unwrap_err(), JoinError::AlreadyOnline);
         assert_eq!(w.player_count(), 1);
         assert!(w.snapshot_of(entity).is_none());
@@ -1375,6 +1418,7 @@ mod tests {
             account: acct(&a),
             avatar: AvatarAppearance { display_name: "A".into(), tint: [0; 3], appearance_ref: None },
             phase: PhaseKey::default(),
+            progress: Default::default(),
             tx,
             close,
         };

@@ -15,19 +15,24 @@
 //!
 //! * A battle starts for the requester's whole party (the members that are in the requester's area,
 //!   not between two areas, and in no battle yet) or for the requester alone. A party member who is
-//!   in another area is not pulled in, and a player in a battle cannot travel. Member `i` (ascending entity id, the requester
-//!   included) fights as `ActorId(i)`, as the `i`-th character of the fixed order Cloud, Barret,
-//!   Tifa, Aerith, Red XIII, Yuffie, Cait Sith, Vincent, Cid: accounts have no character of their
-//!   own yet (that needs per-account progression), so this is the interim rule.
+//!   in another area is not pulled in, and a player in a battle cannot travel. Member `i` (ascending
+//!   entity id, the requester included) fights as `ActorId(i)`, as its own account's character at its
+//!   own account's level (the player's character progress, see `progress`; `--battle-level` pins the
+//!   level of the fight for everyone). Two accounts that play the same character fight as two of it.
 //! * A player in a battle is FROZEN: its `MoveIntent`s are ignored (not applied, not answered),
 //!   so nobody else sees it move, and it takes no random-encounter steps.
 //! * When the battle ends every member is back in the field where it stood. Its entity is marked
 //!   changed, so the next tick's `EntityUpdate` tells it (and everyone) where that is.
 //! * A member that disconnects stays in the engine as an uncontrolled character; a battle with no
 //!   connected member left is dropped.
-//! * Rewards are logged and sent in `BattleEnd`, but NOT stored: an account's progression blob is
-//!   also its story phase key (`accounts::login` builds `PhaseKey(progression.blob)`), so writing
-//!   battle results into it would move the player to another instance.
+//! * A victory pays the members that fought on (`BattleEnd::rewards`, split by
+//!   `fmv_protocol::split_rewards`). Each payment is added to the member's character progress with the
+//!   game's level-up rule (`progress::apply_reward`): the member that is online gets its mirror updated
+//!   and a `CharacterProgress` message right after `BattleEnd`, and every payment, online or not (a
+//!   member that left mid-battle fought on), is queued for the saver, which adds it to the stored
+//!   record. The stored record is a separate one from the account's progression blob, which is also its
+//!   story phase key (`accounts::login` builds `PhaseKey(progression.blob)`): battle results written
+//!   into that would move the player to another instance. A defeat pays nothing.
 //!
 //! # Time
 //!
@@ -47,7 +52,7 @@
 //! The server's own default field, `md1stin` (section 6 of the field file, Steam PC build): the
 //! first of its two 24-byte tables is the enabled one, rate 128, with formations 301 (weight 24,
 //! two enemies), 302 (22, one enemy) and 303 (18, two enemies), weights adding up to 64; the second
-//! table is disabled. A starting party (levels from the kernel's own initial values) wins 301 and
+//! table is disabled. A starting party (every account at the level its character starts at) wins 301 and
 //! 303 every time, which is why `scripts/battle-smoke.sh` fights 301.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -59,13 +64,16 @@ use fmv_adapter_api::{AreaRuntime, EncounterTable};
 use fmv_core::EntityId;
 use fmv_ff7_battle::rng::Rng;
 use fmv_ff7_battle::rules::{ActorId, BattleState, Command, CommandError, Outcome, MAX_STEP_MS};
-use fmv_protocol::{split_rewards, AppliedCommand, BattleId, BattleMember, BattleRejection, BattleSetup, ServerMsg, MAX_BATTLE_PARTY};
+use fmv_protocol::{
+    split_rewards, AppliedCommand, BattleId, BattleMember, BattleRejection, BattleReward, BattleRules, BattleSetup, ServerMsg,
+    MAX_BATTLE_PARTY,
+};
 
 use super::{is_full, Outbound, World};
 use crate::config::BattleSettings;
+use crate::progress;
+use crate::saver::SaveJob;
 
-/// The characters party members fight as, by their place in the battle (see the module docs).
-const CHARACTER_ORDER: [u8; 9] = [0, 1, 2, 3, 4, 5, 6, 7, 8];
 /// Most random-encounter rolls one move can make (a move is bounded by the speed budget anyway).
 const MAX_ROLLS_PER_MOVE: u32 = 8;
 
@@ -149,6 +157,11 @@ pub(super) struct AreaEncounters {
 }
 
 impl BattleWorld {
+    /// The rules over this server's own game data (the characters' experience curves are in them).
+    pub(super) fn rules(&self) -> &dyn BattleRules {
+        self.settings.rules.as_ref()
+    }
+
     pub(super) fn new(settings: BattleSettings, debug_encounters: bool) -> Self {
         let rng = Rng::new(settings.fixed_seed.unwrap_or_else(fresh_seed));
         Self { settings, debug_encounters, battles: BTreeMap::new(), next_id: 1, rng }
@@ -297,14 +310,15 @@ impl World {
         let mut entities: Vec<EntityId> = std::iter::once(requester).chain(others.into_iter().take(MAX_BATTLE_PARTY - 1)).collect();
         entities.sort();
 
+        // Each member fights as its own character at its own level (see `progress`); `--battle-level`
+        // pins the level of the fight, not what the account has earned.
         let party: Vec<BattleMember> = entities
             .iter()
-            .enumerate()
-            .filter_map(|(i, &entity)| {
-                let account = self.players.get(&entity)?.account;
-                let character = CHARACTER_ORDER[i % CHARACTER_ORDER.len()];
-                let level = bw.settings.level.unwrap_or_else(|| bw.settings.rules.starting_level(character));
-                Some(BattleMember { entity, account, character, level, weapon: None, armor: None })
+            .filter_map(|&entity| {
+                let p = self.players.get(&entity)?;
+                let own = p.progress.unwrap_or_else(|| progress::fresh(bw.rules(), progress::DEFAULT_CHARACTER));
+                let level = bw.settings.level.unwrap_or(own.level);
+                Some(BattleMember { entity, account: p.account, character: own.character, level, weapon: None, armor: None })
             })
             .collect();
 
@@ -352,14 +366,17 @@ impl World {
                 p.battle = Some(id);
             }
         }
-        // The `key=value` layout is read by `scripts/battle-smoke.sh` ("members=2"): keep it.
+        // The `key=value` layout is read by `scripts/battle-smoke.sh` ("members=2", and with --progress
+        // "levels=[6, 6]"): keep it, and add new keys at the end.
         self.logs.info(format!(
-            "battle started battle={} formation={formation} members={} enemies={} preemptive={} back_attack={} seed={seed}",
+            "battle started battle={} formation={formation} members={} enemies={} preemptive={} back_attack={} seed={seed} characters={:?} levels={:?}",
             id.0,
             entities.len(),
             info.enemies,
             info.preemptive,
             info.back_attack,
+            party.iter().map(|m| m.character).collect::<Vec<_>>(),
+            party.iter().map(|m| m.level).collect::<Vec<_>>(),
         ));
         self.fan_to(&entities, start);
         Ok(id)
@@ -458,14 +475,7 @@ impl World {
             battle.members.len(),
             battle.commands,
         ));
-        for r in &rewards {
-            let delivered = battle.members.iter().any(|m| m.info.account == r.account && m.connected);
-            self.logs.info(format!(
-                "battle reward (logged and sent only: progression is not written, it is also the story phase) \
-                 battle={} account={} exp={} gil={} ap={} delivered={delivered}",
-                id.0, r.account.0, r.exp, r.gil, r.ap,
-            ));
-        }
+        let told = self.pay_members(id, &battle.members, &rewards);
         let recipients = battle.connected();
         // Back in the field: free everyone first, and mark them changed so the next `EntityUpdate`
         // says where they stand.
@@ -479,6 +489,79 @@ impl World {
             }
         }
         self.fan_to(&recipients, Arc::new(ServerMsg::BattleEnd { battle_id: id, outcome, rewards }));
+        // Where each paid player's character stands now, right after the battle's end.
+        for (entity, msg) in told {
+            self.fan_to(&[entity], msg);
+        }
+    }
+
+    /// Pay what a won battle earned (`rewards`, one entry per member of the roster) into each
+    /// member's character progress (see the module docs). Every payment is queued for the saver,
+    /// whether or not the member is still connected; the member that is online (found by its account,
+    /// not by the entity it fought with: it may have logged in again) has its mirror updated, and the
+    /// message that tells it is returned, to go out after `BattleEnd`. A payment of nothing (a member
+    /// that was dead at the end) changes nothing: it is not queued and the mirror stays as it is, but
+    /// the member that is online is still told where it stands (`leveled_up: false`), so that after a
+    /// win every online member of the roster gets `BattleEnd` and then `CharacterProgress`.
+    fn pay_members(&mut self, id: BattleId, members: &[Member], rewards: &[BattleReward]) -> Vec<(EntityId, Outbound)> {
+        let mut told = Vec::new();
+        let Some(rules) = self.battle.as_ref().map(|bw| Arc::clone(&bw.settings.rules)) else { return told };
+        for r in rewards {
+            let Some(member) = members.iter().find(|m| m.info.account == r.account) else { continue };
+            let connected = member.connected;
+            if r.exp == 0 && r.gil == 0 && r.ap == 0 {
+                let online = self.by_account.get(&r.account).copied();
+                if let Some((entity, own)) = online.and_then(|entity| self.players.get(&entity).and_then(|p| p.progress.map(|own| (entity, own)))) {
+                    told.push((entity, Arc::new(progress::message(rules.as_ref(), &own, false))));
+                }
+                self.logs.info(format!(
+                    "battle reward battle={} account={} exp=0 gil=0 ap=0 delivered={connected}: nothing to pay (dead at the end), nothing saved",
+                    id.0, r.account.0
+                ));
+                continue;
+            }
+            // The store is first in line: it gets every payment, a player online or not.
+            let queued = self
+                .saver
+                .as_ref()
+                .map(|saver| saver.save(SaveJob { account: r.account, character: member.info.character, reward: *r }));
+            let mut effect = String::from("no mirror: the player is not online");
+            let online = self.by_account.get(&r.account).copied();
+            if let Some((entity, player)) = online.and_then(|entity| self.players.get_mut(&entity).map(|p| (entity, p))) {
+                if let Some(own) = player.progress.as_mut() {
+                    let before = *own;
+                    let leveled_up = progress::apply_reward(rules.as_ref(), own, r);
+                    effect = format!(
+                        "level {}->{} exp={} gil={} ap={} leveled_up={leveled_up}",
+                        before.level, own.level, own.exp, own.gil, own.ap
+                    );
+                    told.push((entity, Arc::new(progress::message(rules.as_ref(), own, leveled_up))));
+                }
+            }
+            let saving = match queued {
+                Some(true) => "queued",
+                Some(false) => "NOT QUEUED (the saver has stopped: the server is shutting down)",
+                None => "off (no saver)",
+            };
+            self.logs.info(format!(
+                "battle reward battle={} account={} exp={} gil={} ap={} delivered={connected} saving={saving}: {effect}",
+                id.0, r.account.0, r.exp, r.gil, r.ap,
+            ));
+        }
+        told
+    }
+
+    /// Tell `entity` where its character stands (`ServerMsg::CharacterProgress`); a player without
+    /// character progress (a server that runs no battles) is told nothing. Players whose queue fails
+    /// are appended to `failed` for the caller to drop.
+    pub(super) fn tell_progress(&mut self, entity: EntityId, leveled_up: bool, failed: &mut Vec<(EntityId, bool)>) {
+        let Some(bw) = self.battle.as_ref() else { return };
+        let Some(player) = self.players.get(&entity) else { return };
+        let Some(own) = player.progress.as_ref() else { return };
+        let msg: Outbound = Arc::new(progress::message(bw.rules(), own, leveled_up));
+        if let Err(e) = player.tx.try_send(msg) {
+            failed.push((entity, is_full(&e)));
+        }
     }
 
     /// A player that was in battle `id` left the world: its character stays in the engine,
@@ -553,6 +636,8 @@ mod tests {
     use fmv_core::{AccountId, AnimState, AvatarAppearance, PhaseKey, Pos};
     use fmv_fixture::{FixtureAdapter, FIXTURE_AREA_KEY};
     use fmv_adapter_api::{AreaInfo, Bounds, GameAdapter, MoveResult};
+    use crate::progress::{Progress, ProgressSeed};
+    use crate::saver::{Msg, SaverHandle};
     use fmv_protocol::battle::BattleEvent;
     use fmv_protocol::{BattleReplay, SyntheticRules};
     use tokio::sync::{mpsc, watch};
@@ -609,13 +694,62 @@ mod tests {
     }
 
     fn seat(w: &mut World, name: &str, now: Instant) -> Seat {
+        seat_as(w, name, now, ProgressSeed::default())
+    }
+
+    /// A player whose login found `progress` (who its look names and what the store held).
+    fn seat_as(w: &mut World, name: &str, now: Instant, progress: ProgressSeed) -> Seat {
         let (session, entity) = w.allocate_ids();
         let (tx, rx) = mpsc::channel(4096);
         let close = Arc::new(watch::channel(false).0);
         let avatar = AvatarAppearance { display_name: name.into(), tint: [1, 2, 3], appearance_ref: None };
         let account = AccountId(entity.0);
-        w.join(NewPlayer { session, entity, account, avatar, phase: PhaseKey::default(), tx, close }, now).expect("joins");
+        w.join(NewPlayer { session, entity, account, avatar, phase: PhaseKey::default(), progress, tx, close }, now).expect("joins");
         Seat { entity, account, rx, log: Vec::new() }
+    }
+
+    /// Two players in one party, the second one playing `character` (the first plays Cloud).
+    fn party_of_two_as(w: &mut World, now: Instant, a: ProgressSeed, b: ProgressSeed) -> (Seat, Seat) {
+        let (a, b) = (seat_as(w, "A", now, a), seat_as(w, "B", now, b));
+        assert_eq!(w.party_invite(a.entity, b.entity, now), crate::world::PartyOutcome::Done);
+        let invite = w.parties.invites().next().expect("an invite").id;
+        assert_eq!(w.party_accept(b.entity, invite, now), crate::world::PartyOutcome::Done);
+        (a, b)
+    }
+
+    /// A world that queues what battles pay where the test can read it.
+    fn world_with_saver(settings: BattleSettings) -> (World, mpsc::UnboundedReceiver<Msg>) {
+        let mut w = world_with(Some(settings), true);
+        let (handle, rx) = SaverHandle::channel();
+        w.set_progress_saver(handle);
+        (w, rx)
+    }
+
+    /// Everything queued for saving so far.
+    fn saved(rx: &mut mpsc::UnboundedReceiver<Msg>) -> Vec<crate::saver::SaveJob> {
+        let mut jobs = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                Msg::Save(job) => jobs.push(job),
+                Msg::Stop(_) => panic!("nobody asked the saver to stop"),
+            }
+        }
+        jobs
+    }
+
+    /// The `CharacterProgress` messages a seat has received so far (in order), as
+    /// `(level, exp, exp_to_next, gil, ap, leveled_up)` with the character first.
+    fn progress_msgs(seat: &mut Seat) -> Vec<(u8, u8, u32, u32, u32, u32, bool)> {
+        seat.drain();
+        seat.log
+            .iter()
+            .filter_map(|m| match m {
+                ServerMsg::CharacterProgress { character, level, exp, exp_to_next, gil, ap, leveled_up } => {
+                    Some((*character, *level, *exp, *exp_to_next, *gil, *ap, *leveled_up))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     /// Two players in one party.
@@ -778,7 +912,11 @@ mod tests {
     fn a_party_fights_one_shared_battle_ordered_by_entity() {
         let t0 = Instant::now();
         let mut w = world_with(Some(settings(SyntheticRules::default())), true);
-        let (mut a, mut b) = party_of_two(&mut w, t0);
+        // A plays Cloud, B plays Barret (their looks, as the login found out): the character is the
+        // account's own, no longer the member's place in the battle.
+        let barret = ProgressSeed { character: 1, stored: None };
+        let (mut a, mut b) = party_of_two_as(&mut w, t0, ProgressSeed::default(), barret);
+        assert_eq!(w.party_size_of(a.account), 2);
         let mut c = seat(&mut w, "C", t0); // not in the party
         // B (the invited one) asks: the whole party goes, the bystander does not.
         assert_eq!(w.request_encounter(b.entity, None, t0), BattleReply::Done);
@@ -790,7 +928,7 @@ mod tests {
             [ServerMsg::EncounterStart { formation_id, party, .. }] => {
                 assert_eq!(*formation_id, 0, "no formation named: the rules' default");
                 let who: Vec<(EntityId, u8)> = party.iter().map(|m| (m.entity, m.character)).collect();
-                assert_eq!(who, vec![(a.entity, 0), (b.entity, 1)], "ascending entity ids fight as Cloud, Barret");
+                assert_eq!(who, vec![(a.entity, 0), (b.entity, 1)], "ascending entity ids; each fights as its own account's character");
             }
             other => panic!("{other:?}"),
         }
@@ -870,6 +1008,255 @@ mod tests {
         // Only the accepted command was counted, for the actor that gave it (the end-of-battle log
         // line shows these totals; every refusal above left them alone).
         assert_eq!(w.battle.as_ref().unwrap().battles.get(&id).unwrap().commands, vec![1, 0]);
+    }
+
+    // ---- character progress (M2-d) -------------------------------------------------------------
+
+    /// A player that joins a battle-capable server is told where its character stands as the THIRD
+    /// message, after the snapshot and the placement (those two stay first, as documented).
+    #[test]
+    fn joining_tells_the_player_where_its_character_stands_after_the_snapshot_and_placement() {
+        let t0 = Instant::now();
+        let mut w = world_with(Some(settings(SyntheticRules::default())), true);
+        // Level 9 starts at 144 experience on the synthetic curve and level 10 at 180: 154 is ten in.
+        let stored = Progress { character: 2, level: 9, exp: 154, ap: 31, gil: 2500 };
+        let mut a = seat_as(&mut w, "A", t0, ProgressSeed { character: 2, stored: Some(stored) });
+        let msgs = a.drain();
+        assert!(matches!(msgs[0], ServerMsg::AreaSnapshot { .. }), "{msgs:?}");
+        assert!(matches!(msgs[1], ServerMsg::InstancePlacement { .. }), "{msgs:?}");
+        assert_eq!(
+            msgs[2],
+            ServerMsg::CharacterProgress { character: 2, level: 9, exp: 154, exp_to_next: 26, gil: 2500, ap: 31, leveled_up: false }
+        );
+        assert_eq!(msgs.len(), 3, "{msgs:?}");
+
+        // A new account starts where the rules say: level 5 with the experience of level 5 (40).
+        let mut b = seat(&mut w, "B", t0);
+        assert_eq!(progress_msgs(&mut b), vec![(0, 5, 40, 20, 0, 0, false)]);
+    }
+
+    #[test]
+    fn a_server_that_runs_no_battles_tells_nobody_anything_about_progress() {
+        let t0 = Instant::now();
+        let mut w = world_with(None, true);
+        let mut a = seat(&mut w, "A", t0);
+        assert!(progress_msgs(&mut a).is_empty());
+        assert!(w.players.values().all(|p| p.progress.is_none()));
+    }
+
+    #[test]
+    fn every_member_fights_as_its_own_character_at_its_own_level() {
+        let t0 = Instant::now();
+        let mut w = world_with(Some(settings(SyntheticRules::default())), true);
+        let veteran = Progress { character: 0, level: 12, exp: 270, ap: 0, gil: 0 }; // level 12 starts at 264
+        let (mut a, mut b) = party_of_two_as(
+            &mut w,
+            t0,
+            ProgressSeed { character: 0, stored: Some(veteran) },
+            ProgressSeed { character: 2, stored: None }, // Tifa, never earned anything: level 5
+        );
+        assert_eq!(w.request_encounter(a.entity, Some(0), t0), BattleReply::Done);
+        let start = a.battle_msgs();
+        assert_eq!(start, b.battle_msgs());
+        match &start[..] {
+            [ServerMsg::EncounterStart { party, .. }] => {
+                let who: Vec<(EntityId, u8, u8)> = party.iter().map(|m| (m.entity, m.character, m.level)).collect();
+                assert_eq!(who, vec![(a.entity, 0, 12), (b.entity, 2, 5)]);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// `--battle-level` pins the fight for everybody; what the accounts have earned is untouched.
+    #[test]
+    fn a_pinned_battle_level_pins_the_fight_but_not_the_account() {
+        let t0 = Instant::now();
+        let rules = SyntheticRules::default();
+        let mut s = settings(rules);
+        s.level = Some(3);
+        let (mut w, mut rx) = world_with_saver(s);
+        let veteran = Progress { character: 0, level: 12, exp: 270, ap: 0, gil: 0 }; // level 12 starts at 264, 13 at 312
+        let mut a = seat_as(&mut w, "A", t0, ProgressSeed { character: 0, stored: Some(veteran) });
+        assert_eq!(w.request_encounter(a.entity, Some(0), t0), BattleReply::Done);
+        match &a.battle_msgs()[..] {
+            [ServerMsg::EncounterStart { party, .. }] => assert_eq!((party[0].character, party[0].level), (0, 3)),
+            other => panic!("{other:?}"),
+        }
+        play_out(&mut w, &mut [&mut a], &rules, t0);
+        // Won at level 3, paid to the account that is level 12 (formation 0: one dummy, 12 experience,
+        // 20 gil, 2 AP): 270 + 12 = 282, 30 short of level 13.
+        assert_eq!(*progress_msgs(&mut a).last().unwrap(), (0, 12, 282, 30, 20, 2, false));
+        assert_eq!(saved(&mut rx).len(), 1);
+    }
+
+    #[test]
+    fn a_victory_pays_the_member_in_its_mirror_in_a_message_after_the_end_and_in_the_saver_queue() {
+        let rules = SyntheticRules::default();
+        let t0 = Instant::now();
+        let (mut w, mut rx) = world_with_saver(settings(rules));
+        let mut a = seat(&mut w, "A", t0); // Cloud, level 5, 40 experience: level 6 at 60, level 7 at 84
+        assert_eq!(progress_msgs(&mut a), vec![(0, 5, 40, 20, 0, 0, false)]);
+
+        // Formation 0 is one dummy: 12 experience, 20 gil, 2 AP. 40 + 12 = 52: no level yet.
+        assert_eq!(w.request_encounter(a.entity, Some(0), t0), BattleReply::Done);
+        play_out(&mut w, &mut [&mut a], &rules, t0);
+        let tail: Vec<&'static str> = a
+            .log
+            .iter()
+            .map(|m| match m {
+                ServerMsg::BattleEnd { .. } => "end",
+                ServerMsg::CharacterProgress { .. } => "progress",
+                _ => "",
+            })
+            .filter(|n| !n.is_empty())
+            .collect();
+        assert_eq!(tail, ["progress", "end", "progress"], "the join message, then the end, then what it paid: {:?}", a.log.len());
+        assert_eq!(progress_msgs(&mut a).last(), Some(&(0, 5, 52, 8, 20, 2, false)));
+        assert_eq!(
+            saved(&mut rx),
+            vec![crate::saver::SaveJob {
+                account: a.account,
+                character: 0,
+                reward: fmv_protocol::BattleReward { account: a.account, exp: 12, gil: 20, ap: 2 }
+            }]
+        );
+
+        // Formation 1 is two dummies: 24 experience, 40 gil, 4 AP. 52 + 24 = 76: level 6 (60), the
+        // message says so and `exp_to_next` counts towards level 7 (84).
+        let later = ms(t0, 60_000 * 10 + 1_000);
+        assert_eq!(w.request_encounter(a.entity, Some(1), later), BattleReply::Done);
+        // The mirror's level is on the wire of the next start: the progress is not only a message.
+        match a.battle_msgs().last() {
+            Some(ServerMsg::EncounterStart { party, .. }) => assert_eq!((party[0].character, party[0].level), (0, 5), "still level 5 before this win"),
+            other => panic!("{other:?}"),
+        }
+        play_out(&mut w, &mut [&mut a], &rules, later);
+        assert_eq!(progress_msgs(&mut a).last(), Some(&(0, 6, 76, 8, 60, 6, true)));
+        assert_eq!(saved(&mut rx).len(), 1);
+
+        // And the battle after that fights at level 6.
+        let much_later = ms(later, 60_000 * 10 + 1_000);
+        assert_eq!(w.request_encounter(a.entity, Some(0), much_later), BattleReply::Done);
+        match a.battle_msgs().last() {
+            Some(ServerMsg::EncounterStart { party, .. }) => assert_eq!(party[0].level, 6, "the level gained is the level fought at"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_member_that_fought_on_is_paid_its_own_share_into_its_own_progress() {
+        let rules = SyntheticRules::default();
+        let t0 = Instant::now();
+        let (mut w, mut rx) = world_with_saver(settings(rules));
+        // B has 8 experience to go to level 6, A has 20.
+        let (mut a, mut b) = party_of_two_as(
+            &mut w,
+            t0,
+            ProgressSeed { character: 0, stored: None },
+            ProgressSeed { character: 3, stored: Some(Progress { character: 3, level: 5, exp: 52, ap: 1, gil: 5 }) },
+        );
+        a.drain();
+        b.drain();
+        // Two dummies: 24 experience, 40 gil, 4 AP, split 12 / 20 / 4 over two living members.
+        assert_eq!(w.request_encounter(a.entity, Some(1), t0), BattleReply::Done);
+        play_out(&mut w, &mut [&mut a, &mut b], &rules, t0);
+        let (pa, pb) = (progress_msgs(&mut a), progress_msgs(&mut b));
+        // Whoever lived got a message; the numbers are the account's own plus a share.
+        let paid = |p: &[(u8, u8, u32, u32, u32, u32, bool)], start: (u32, u32, u32)| {
+            p.last().map(|&(_, _, exp, _, gil, ap, _)| (exp - start.0, gil - start.1, ap - start.2))
+        };
+        assert_eq!(paid(&pa, (40, 0, 0)), Some((12, 20, 4)), "{pa:?}");
+        assert_eq!(paid(&pb, (52, 5, 1)), Some((12, 20, 4)), "{pb:?}");
+        // B crossed level 6 (60) with 52 + 12 = 64, A did not (40 + 12 = 52).
+        assert_eq!(pb.last().map(|p| (p.1, p.6)), Some((6, true)));
+        assert_eq!(pa.last().map(|p| (p.1, p.6)), Some((5, false)));
+        // One queue entry per payment, in roster order, each for the character that fought.
+        let jobs = saved(&mut rx);
+        assert_eq!(jobs.iter().map(|j| (j.account, j.character, j.reward.exp)).collect::<Vec<_>>(), vec![(a.account, 0, 12), (b.account, 3, 12)]);
+    }
+
+    #[test]
+    fn a_defeat_pays_nothing_and_changes_nothing() {
+        let rules = SyntheticRules::default();
+        let t0 = Instant::now();
+        let (mut w, mut rx) = world_with_saver(settings(rules));
+        let (mut a, mut b) = party_of_two(&mut w, t0);
+        let before = (progress_msgs(&mut a), progress_msgs(&mut b));
+        assert_eq!(w.request_encounter(a.entity, Some(2), t0), BattleReply::Done);
+        play_out(&mut w, &mut [&mut a, &mut b], &rules, t0);
+        assert_eq!((progress_msgs(&mut a), progress_msgs(&mut b)), before, "no progress message after a defeat");
+        assert!(saved(&mut rx).is_empty(), "nothing to save");
+        let mirror: Vec<Progress> = w.players.values().filter_map(|p| p.progress).collect();
+        assert_eq!(mirror, vec![Progress { character: 0, level: 5, exp: 40, ap: 0, gil: 0 }; 2]);
+    }
+
+    /// A member that left mid-battle still fought: what it earned reaches the store (the saver is
+    /// the only thing that can reach an offline account) but nobody is told.
+    #[test]
+    fn a_member_who_left_is_paid_in_the_store_and_told_nothing() {
+        let rules = SyntheticRules::default();
+        let t0 = Instant::now();
+        let (mut w, mut rx) = world_with_saver(settings(rules));
+        let (mut a, b) = party_of_two(&mut w, t0);
+        assert_eq!(w.request_encounter(a.entity, Some(0), t0), BattleReply::Done);
+        let (b_account, b_entity) = (b.account, b.entity);
+        assert!(w.leave(b_entity));
+        drop(b);
+        play_out(&mut w, &mut [&mut a], &rules, t0);
+        let jobs = saved(&mut rx);
+        let accounts: Vec<AccountId> = jobs.iter().map(|j| j.account).collect();
+        assert!(accounts.contains(&b_account), "the account that left is still paid: {jobs:?}");
+        assert!(accounts.contains(&a.account), "{jobs:?}");
+        // The one that stayed was told about its own payment only.
+        assert_eq!(progress_msgs(&mut a).len(), 2, "the join message and its own payment");
+    }
+
+    /// A payment of nothing (a member that was dead when the others won) changes nothing and is not
+    /// queued, but the member that is online is still told where it stands.
+    #[test]
+    fn a_member_that_was_dead_at_the_end_is_not_paid_a_thing_but_is_still_told_where_it_stands() {
+        let t0 = Instant::now();
+        let (mut w, mut rx) = world_with_saver(settings(SyntheticRules::default()));
+        let (mut a, b) = party_of_two(&mut w, t0);
+        a.drain();
+        let members: Vec<Member> = [(&a, 0u8), (&b, 1u8)]
+            .iter()
+            .map(|(seat, character)| Member {
+                info: BattleMember { entity: seat.entity, account: seat.account, character: *character, level: 5, weapon: None, armor: None },
+                connected: true,
+            })
+            .collect();
+        let rewards = [
+            BattleReward { account: a.account, exp: 24, gil: 40, ap: 4 },
+            BattleReward { account: b.account, exp: 0, gil: 0, ap: 0 },
+        ];
+        let told = w.pay_members(BattleId(1), &members, &rewards);
+        assert_eq!(told.iter().map(|(entity, _)| *entity).collect::<Vec<_>>(), vec![a.entity, b.entity], "everybody online hears where it stands, in roster order");
+        let said = |i: usize| match &*told[i].1 {
+            ServerMsg::CharacterProgress { level, exp, gil, ap, leveled_up, .. } => (*level, *exp, *gil, *ap, *leveled_up),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(said(0), (6, 64, 40, 4, true), "the living member was paid 24 and crossed level 6 (60)");
+        assert_eq!(said(1), (5, 40, 0, 0, false), "the dead one is told what it has, unchanged");
+        // Only the payment that was made is queued for the store.
+        let jobs = saved(&mut rx);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].account, a.account);
+        // B's mirror is exactly what it was.
+        assert_eq!(w.players.get(&b.entity).unwrap().progress, Some(Progress { character: 0, level: 5, exp: 40, ap: 0, gil: 0 }));
+    }
+
+    /// Without a saver (the world's unit tests, a server that stores nothing) payments still reach
+    /// the mirror and the player.
+    #[test]
+    fn without_a_saver_the_player_is_still_paid_and_told() {
+        let rules = SyntheticRules::default();
+        let t0 = Instant::now();
+        let mut w = world_with(Some(settings(rules)), true);
+        let mut a = seat(&mut w, "A", t0);
+        assert_eq!(w.request_encounter(a.entity, Some(0), t0), BattleReply::Done);
+        play_out(&mut w, &mut [&mut a], &rules, t0);
+        assert_eq!(progress_msgs(&mut a).last(), Some(&(0, 5, 52, 8, 20, 2, false)));
     }
 
     #[test]

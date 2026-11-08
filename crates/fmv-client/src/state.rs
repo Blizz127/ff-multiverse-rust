@@ -28,6 +28,7 @@
 use crate::battle::BattleClient;
 use crate::interp::{normalize_angle, Pose, Sample, SnapshotBuffer};
 use crate::party::{nearest_peer, PartyMirror};
+use crate::progress::ProgressMirror;
 use fmv_adapter_api::{AreaRuntime, MoveResult};
 use fmv_core::{AccountId, AnimState, AreaId, AvatarAppearance, EntityId, EntitySnapshot, Pos};
 use fmv_protocol::{NpcSnapshot, ServerMsg, MAX_NPCS_PER_AREA, NPC_NAME_CHARS, NPC_REF_CHARS};
@@ -337,6 +338,9 @@ pub struct ClientState {
     pub party: PartyMirror,
     /// The battle we are in, replayed from the server's messages (see `crate::battle`).
     pub battle: BattleClient,
+    /// What the server says our character has earned (level, experience, AP, gil; see
+    /// `crate::progress`). Empty until it says (a server without battles never does).
+    pub progress: ProgressMirror,
     remotes: BTreeMap<EntityId, Remote>,
     /// The non-player characters of the current area (from its `AreaSnapshot`).
     npcs: Vec<NpcView>,
@@ -365,6 +369,7 @@ impl ClientState {
             own: OwnPlayer::new(spawn),
             party: PartyMirror::new(account),
             battle: BattleClient::new(account),
+            progress: ProgressMirror::default(),
             remotes: BTreeMap::new(),
             npcs: Vec::new(),
             npc_epoch: 0,
@@ -505,6 +510,9 @@ impl ClientState {
             | ServerMsg::BattleEvent { .. }
             | ServerMsg::BattleEnd { .. }
             | ServerMsg::BattleRejected { .. }) => self.battle.on_message(now, msg),
+            // Our own character's numbers (protocol v5). Like battle traffic it never ends the session:
+            // it is the server's word about us, shown and counted, and nothing here acts on it.
+            msg @ ServerMsg::CharacterProgress { .. } => self.progress.on_message(now, msg),
         }
         None
     }

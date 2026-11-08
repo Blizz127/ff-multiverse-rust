@@ -509,10 +509,12 @@ fn smoke_fields(line: &str) -> Vec<(String, String)> {
 }
 
 /// The contract of `scripts/smoke.sh`: these keys, in this order, and nothing else. The first eight
-/// are protocol v2's; `battles` and `victories` were appended in v3 and `area_changes` after them for
-/// area travel (fields are only ever appended).
-const SMOKE_KEYS: [&str; 11] =
-    ["name", "area", "fixture", "peers_seen", "updates", "rejected", "rtt_ms", "party", "battles", "victories", "area_changes"];
+/// are protocol v2's; `battles` and `victories` were appended in v3, `area_changes` after them for
+/// area travel and `level` and `exp` after that for character progress (fields are only ever
+/// appended).
+const SMOKE_KEYS: [&str; 13] = [
+    "name", "area", "fixture", "peers_seen", "updates", "rejected", "rtt_ms", "party", "battles", "victories", "area_changes", "level", "exp",
+];
 
 /// stdout is exactly one SMOKE line with exactly the documented keys in the documented order.
 fn assert_smoke_contract(stdout: &str) -> HashMap<String, String> {
@@ -523,7 +525,11 @@ fn assert_smoke_contract(stdout: &str) -> HashMap<String, String> {
     assert_eq!(keys, SMOKE_KEYS, "the SMOKE keys and their order are a contract: {stdout}");
     assert_eq!(keys[..8], SMOKE_KEYS[..8], "the v2 keys come first, unchanged: {stdout}");
     assert_eq!(keys[..10], SMOKE_KEYS[..10], "the v3 battle fields keep their place: {stdout}");
-    assert_eq!(keys.last(), Some(&"area_changes"), "the travel field is the last appended one: {stdout}");
+    assert_eq!(keys[..11], SMOKE_KEYS[..11], "the travel field keeps its place: {stdout}");
+    assert_eq!(keys.last(), Some(&"exp"), "the progress fields are the last appended ones: {stdout}");
+    // The FIXTURE server these tests talk to has no characters, so it reports no progress: 0 is "unknown".
+    let value_of = |key: &str| fields.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
+    assert_eq!((value_of("level"), value_of("exp")), (Some("0"), Some("0")), "{stdout}");
     fields.into_iter().collect()
 }
 

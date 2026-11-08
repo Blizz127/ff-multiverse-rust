@@ -49,7 +49,8 @@ the field's own camera. **Milestone 2 is partly in the game:** accounts with per
 profiles (M2-a) and parties of up to three with story-phase placement (M2-b) work end to end
 (protocol v2), and **shared battles (M2-c/d, protocol v3)** run on the deterministic
 `fmv-ff7-battle` engine: the server steps a battle for the whole party, each client replays it
-from its own `scene.bin` and `kernel.bin`. The synthetic **FIXTURE** plaza still exists
+from its own `scene.bin` and `kernel.bin`, and **every account keeps its own character progress
+(level, experience, AP, gil; protocol v5)**, paid by won battles and saved per account. The synthetic **FIXTURE** plaza still exists
 as a labelled test area; it says nothing about FF7 support.
 
 | Milestone | Scope | State |
@@ -57,7 +58,7 @@ as a labelled test area; it says nothing about FF7 support.
 | M1 | One real FF7 field, two connected players, server-side walkmesh validation | done |
 | M2-a | Accounts, persistent avatar profile, per-game progression store | done |
 | M2-b | Parties (invite, accept, leave, kick, promote), phase-key instance placement | done (single phase) |
-| M2-c/d | Shared battle, battle return, per-player rewards | done (battle subset; rewards logged and sent, not stored yet) |
+| M2-c/d | Shared battle, battle return, per-player rewards | done (battle subset; rewards paid into each account's own character progress and saved) |
 | Later | FF8, FF9, FF10 and FF12 adapters on the same core | planned |
 
 **Walking between fields (protocol v4).** The server hosts many fields: the entry field
@@ -213,15 +214,19 @@ one SMOKE line:
 ```
 target/release/fmv-client --server <addr> --name A --headless --duration 5
 target/release/fmv-client --server <addr> --name B --headless --duration 5
-SMOKE name=<n> area=<AreaId> fixture=<bool> peers_seen=<n> updates=<n> rejected=<n> rtt_ms=<n> party=<n> battles=<n> victories=<n>
+SMOKE name=<n> area=<AreaId> fixture=<bool> peers_seen=<n> updates=<n> rejected=<n> rtt_ms=<n> party=<n> battles=<n> victories=<n> area_changes=<n> level=<n> exp=<n>
 ```
 
 `peers_seen` of at least 1 means that client saw the other player; `party` is the largest
 party this client was in during the run (0 if none). Bots can form a party: give one
 `--party-invite-first-peer` and the other `--party-accept`, and both lines show `party=2`.
 `battles` and `victories` (appended in protocol v3) count the shared battles the client
-entered and the server ended in victory. These line formats are a contract: `scripts/smoke.sh`
-parses them by key (it ignores the fields it does not know).
+entered and the server ended in victory; `area_changes` (area travel) counts the times the server
+moved the client to another field; `level` and `exp` (appended in protocol v5) are the level and
+total experience of the player's character as the server last reported them (`0` and `0` from a
+server that reports none, such as the FIXTURE one). These line formats are a contract: new fields
+are only ever appended, and `scripts/smoke.sh` parses them by key (it ignores the fields it does
+not know).
 
 **Window mode** (needs a display):
 
@@ -382,12 +387,33 @@ command comes from the character's own player with a full gauge, and announces e
 and a fingerprint of the server's battle data, so each client rebuilds the very same battle
 from its own files and replays it, and shouts `BATTLE DIVERGENCE` if its engine ever disagrees
 with the server's. When it ends everyone is back in the field and `BattleEnd` carries the
-rewards (experience and gil shared among the living, AP to each): they are logged and sent, not
-stored, because an account's progression blob is also its story phase. A server without
+rewards (experience and gil shared among the living, AP to each), which the server pays into each
+member's own character progress (see below). A server without
 battle data (the FIXTURE one, or `--ff7-flevel`) refuses every battle request cleanly.
 `scripts/battle-smoke.sh` runs two bots through one real battle on `md1stin` and checks that both
 members attacked (the server logs the accepted commands per actor) and that each bot replayed the
 battle from its own game files and matched (`verified by replay`, not merely "no divergence").
+
+**Character progress (protocol v5).** Every account has its own progress in the game it plays: the
+character its look names (Cloud unless it chose another look) and that character's level, experience,
+AP and gil. A battle's members fight as their own character at their own level (the old rule that
+gave the `i`-th member of a battle the `i`-th character of the game is gone), a victory pays each
+member that fought on, and the server adds the payment to that member's progress with FF7's own
+level-up rule, tells the player (`CharacterProgress`, which it also gets when it joins) and saves it:
+a new account starts at its character's starting level and experience from the kernel (Cloud: level 6
+with 610 experience, six short of level 7), nothing is written until its first win, and it is kept in
+`<state>/server/progression/<account>/<Game>.character.json`, a record of its own beside, and
+never mixed with, the story blob that selects the account's story phase (so a battle can never move a
+player to another instance). The window shows it under the area name (`Cloud Lv 7  EXP 626/949
+Gil 20`) and the headless bot's SMOKE line ends with `level=` and `exp=`. The experience needed for
+each level comes from the character's EXP curve in `kernel.bin` (`needed = modifier * level^2 / 10`
+per level, the rule the community documents; checked against Cloud's known 6, 33, 94, 202 EXP for
+levels 2 to 5 and against the shipped starting record). The store is game-agnostic: the game's caps
+(level 99, 99,999,999 experience, 9,999,999 gil) are applied by the server. A payment for a player
+who left mid-battle (its character fought on) is saved too; it is told nothing. Stopping the server
+saves everything still queued first. `scripts/battle-smoke.sh --progress` runs the whole chain on
+your real data: two bots fight, reconnect with their saved tokens, fight again at the level the
+first win left them at, and reconnect once more to see what was kept.
 
 `md1stin`'s own encounter table (section 6 of the field file, Steam PC build): the first of its
 two 24-byte tables is the enabled one, with rate 128 (a roll succeeds with probability 128/1024)
@@ -397,9 +423,13 @@ same way (checked over all 702 fields of that build: every enabled table's weigh
 and every formation exists in `scene.bin`). A starting party wins 301 and 303 every time (200 of
 200 seeded runs each, both members attacking), which is why the smoke script uses 301.
 
-**Protocol v4** (`fmv-protocol`) carries all of the above; its module docs describe the flow,
+**Protocol v5** (`fmv-protocol`) carries all of the above; its module docs describe the flow,
 and golden JSON tests pin the wire format (the engine's own event, command and outcome types
-included). A client or server of another protocol version is refused with a clear message.
+included). A client or server of another protocol version is refused with a clear message:
+v5 added `CharacterProgress`, a message a v4 peer cannot decode (the server sends it right after
+every join), so the version was bumped like v4 was for `AreaChange`, and a v4 client is refused
+at the handshake instead of being cut off at its first join. Both sides must be built from this
+version or later.
 
 ## Importing your own FF7 data
 
@@ -449,7 +479,8 @@ UNKNOWN placeholders; see `deploy/README.md`.
 
 ```
 <state>/library/     owned-content library (fmv-import): blobs and one manifest per edition
-<state>/server/      the server's accounts, avatar profiles, progression (LOCK = single writer)
+<state>/server/      the server's accounts, avatar profiles, progression and character progress
+                     (LOCK = single writer)
 <state>/client/      a client's saved login tokens: accounts/<server>.token (mode 0600), and next to
                      each one a display-only note of how that character looked when last seen
                      (accounts/<server>.<name>.look: tint and look, no secret; safe to delete)
