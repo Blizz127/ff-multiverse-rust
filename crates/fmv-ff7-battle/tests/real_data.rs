@@ -614,7 +614,7 @@ fn real_kernel_has_spells_items_materia_and_a_starting_stock() {
     let life = Spell::from_attack(7, &kernel.attack(7).unwrap()).expect("Life is castable");
     assert!(life.spec.heals() && life.spec.hits_dead);
 
-    // Whole sides (protocol v8). Cure, Life and Fire can be aimed at one target or at everyone (their records
+    // Whole sides (protocol v10). Cure, Life and Fire can be aimed at one target or at everyone (their records
     // toggle between the two: "All Tar/1 Tar", which takes an All materia), and Ultima only ever hits every
     // enemy ("All Tar (NS)"): castable now, at full strength, with no All materia.
     assert_eq!([cure.spec.aim, life.spec.aim, fire.spec.aim], [Aim::OneOrSide; 3]);

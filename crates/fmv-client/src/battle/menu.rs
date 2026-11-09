@@ -42,7 +42,7 @@
 //! changing under the pointer: when the selected fighter dies, the pointer moves to the first valid
 //! one left, and when none is left at all the menu steps back a level.
 //!
-//! # Whole sides (protocol v8)
+//! # Whole sides (protocol v10)
 //!
 //! A spell, an item or a limit that can hit a whole side ([`Reach`]) has one more place for the pointer:
 //! **ALL**, which brackets every fighter of the side at once (the engine says who is on it: the living, or the
@@ -278,12 +278,12 @@ impl Ctx<'_> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Choice {
     Attack { target: ActorId },
-    /// A spell on one target or a whole side (protocol v8).
+    /// A spell on one target or a whole side (protocol v10).
     Magic { spell: u16, target: Target },
-    /// An item on one target or a whole side (protocol v8).
+    /// An item on one target or a whole side (protocol v10).
     Item { item: u16, target: Target },
     Defend,
-    /// Our character's limit break (protocol v7), on one target or the whole party (v8).
+    /// Our character's limit break (protocol v7), on one target or the whole party (v10).
     Limit { target: Target },
     /// Run (protocol v7).
     Escape,
@@ -941,7 +941,7 @@ mod tests {
         assert_eq!(m.level(), Level::Commands);
     }
 
-    // --- whole sides (protocol v8) ---
+    // --- whole sides (protocol v10) ---
 
     /// Fire and Cure can hit a whole side while the character has an All use, Ultima hits a whole side only.
     fn side_scene() -> Scene {

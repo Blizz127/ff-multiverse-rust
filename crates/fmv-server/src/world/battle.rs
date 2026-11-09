@@ -350,7 +350,7 @@ fn rejection_of(e: CommandError) -> BattleRejection {
         CommandError::UnknownActor(_) | CommandError::NotControllable(_) => BattleRejection::NotYourActor,
         CommandError::ActorDead(_) => BattleRejection::ActorDead,
         CommandError::GaugeNotFull(_) => BattleRejection::GaugeNotFull,
-        // A way of aiming the action does not allow (one target or a whole side, protocol v8) and a caster with
+        // A way of aiming the action does not allow (one target or a whole side, protocol v10) and a caster with
         // no All use left are both "not a valid target": the menu never offers either, so the one word is enough.
         CommandError::UnknownTarget(_)
         | CommandError::InvalidTarget(_)
@@ -1671,7 +1671,7 @@ mod tests {
         );
     }
 
-    /// Protocol v8: a command that hits a whole side is one command. A Megalixir restores the whole party and
+    /// Protocol v10: a command that hits a whole side is one command. A Megalixir restores the whole party and
     /// is one item taken; Fire on every enemy costs the MP once and the caster's one All use, and a second
     /// whole-side spell is refused without costing the turn; Shrapnel hits every enemy, one item taken.
     #[test]
@@ -2445,7 +2445,7 @@ mod tests {
         let (cloud, aerith, enemy) = (ActorId(0), ActorId(1), ActorId(2));
         let refuse = |reason| refused(Some(id), reason);
         // Cloud's strike needs one enemy (not an ally, not a whole side); Aerith's wind is the whole party and
-        // nothing smaller or other (Healing Wind's record says "All Al (NS)", protocol v8).
+        // nothing smaller or other (Healing Wind's record says "All Al (NS)", protocol v10).
         let strike = |target| Command::Limit { target };
         for target in [Target::One(aerith), Target::AllAllies, Target::AllEnemies] {
             assert_eq!(w.battle_command(a.entity, id, cloud, strike(target), t0), refuse(BattleRejection::InvalidTarget), "{target:?}");

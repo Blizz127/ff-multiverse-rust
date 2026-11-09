@@ -238,7 +238,7 @@ async fn refused_commands_say_why_and_cost_nothing() {
             2 => Command::Magic { spell: 99, target: Target::One(foe) },   // no such spell
             3 => Command::Magic { spell: 0, target: Target::One(foe) },    // Cure on an enemy
             4 => Command::Item { item: 20, target: Target::One(foe) },     // a Grenade: the account has none
-            // Whole sides (protocol v8): the party's item aimed at one ally is no way to aim it, and the engine
+            // Whole sides (protocol v10): the party's item aimed at one ally is no way to aim it, and the engine
             // says so before the inventory is asked; Cure on every enemy is the wrong side; Megalixir on the
             // party is a good command, which the account has no Megalixir for.
             5 => Command::Item { item: 6, target: Target::One(me) },

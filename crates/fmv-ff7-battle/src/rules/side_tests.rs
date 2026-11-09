@@ -1,4 +1,4 @@
-//! Tests of whole-side targeting in the battle engine (protocol v8): `Target`, the Aim of an action, the
+//! Tests of whole-side targeting in the battle engine (protocol v10): `Target`, the Aim of an action, the
 //! All materia rule, the split of damage and healing, and the order of what a whole side produces. The
 //! rules are in the module docs of [`crate::rules`] ("Whole-side targeting") and [`crate::action`] ("Hitting
 //! a whole side"). A child module of `rules`, so that it can read the generator of a battle and replay the
@@ -622,7 +622,7 @@ fn targets_have_the_words_the_wire_gives_them() {
     assert_eq!(Target::One(ActorId(2)).one(), Some(ActorId(2)));
     assert_eq!((Target::AllEnemies.one(), Target::AllAllies.one()), (None, None));
     assert!(!Target::One(A).is_side() && Target::AllEnemies.is_side() && Target::AllAllies.is_side());
-    // A bare number is the old (protocol v7) shape of a target: it is not one now.
+    // A bare number is the old (protocol v9) shape of a target: it is not one now.
     assert!(serde_json::from_str::<Target>("3").is_err());
     assert!(serde_json::from_str::<Command>(r#"{"Magic":{"spell":0,"target":3}}"#).is_err());
     assert!(serde_json::from_str::<Command>(r#"{"Magic":{"spell":0,"target":{"One":3}}}"#).is_ok());

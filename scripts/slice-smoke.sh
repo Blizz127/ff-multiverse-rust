@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/slice-smoke.sh - the foundations slice over REAL processes and REAL data (protocol v9).
+# scripts/slice-smoke.sh - the foundations slice over REAL processes and REAL data (protocol v10).
 #
 # Usage: scripts/slice-smoke.sh [--release|--debug] [--bin-dir DIR] [--build] [--library STATE_DIR]
 #                               [--duration SECS] [--formation ID] [--seed N] [--keep-logs] [-h|--help]
@@ -144,7 +144,7 @@ usage() {
 Usage: scripts/slice-smoke.sh [--release|--debug] [--bin-dir DIR] [--build] [--library STATE_DIR]
                               [--duration SECS] [--formation ID] [--seed N] [--keep-logs] [-h|--help]
 
-The foundations slice over real processes and the owner's real FF7 data (protocol v9): two headless
+The foundations slice over real processes and the owner's real FF7 data (protocol v10): two headless
 players with different identities and fighting styles register, party up, advance one story and fight one shared
 battle on md1stin beside the canon Cloud and Barret, whom the server commands (session 1's server runs with the DEBUG
 bonus --debug-bonus-exp, so that both new characters level up); the server is stopped and started again as a new

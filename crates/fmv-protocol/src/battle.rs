@@ -33,7 +33,7 @@
 //!
 //! A party member whose gauge is full gives one [`Command`]: `Attack`, `Magic { spell, target }` (a
 //! spell it knows, which costs MP), `Item { item, target }` or `Defend` (the `target` of a spell, an item or
-//! a limit is a [`Target`] since v8: one actor or a whole side, see "Whole-side targeting"). The server checks it with the
+//! a limit is a [`Target`] since v10: one actor or a whole side, see "Whole-side targeting"). The server checks it with the
 //! engine (`BattleState::check_command`: gauge, target, MP, spell and item known) and, for an item, that
 //! the account owns one: the **engine knows no inventory**, so the server checks the count before it
 //! submits and takes the item only when the engine accepted the command. A client replays the very same
@@ -79,20 +79,26 @@
 //! none, so `BattleState::limit_for` is `None` for it and a peer shows no limit bar. The companions keep theirs
 //! and the server's rule uses them.
 //!
-//! # Whole-side targeting (v8)
+//! # Whole-side targeting (v10)
 //!
 //! `Command::Magic`, `Command::Item` and `Command::Limit` carry a [`Target`] instead of an actor:
 //! `One(actor)`, `AllEnemies` or `AllAllies` (`Command::Attack` keeps its one `target`). The sides are named
 //! from the **commanding actor's** point of view, so a party member's `AllEnemies` is the enemy side and its
 //! `AllAllies` the party; an enemy's action (the AI of an enemy asks the same way) reads the other way round.
-//! On the wire it is `{"One":3}`, `"AllEnemies"` or `"AllAllies"`, and a bare number is the v7 shape, which a
-//! v8 peer does not read. What it takes to aim a command that way is the engine's, from the peer's own data
+//! On the wire it is `{"One":3}`, `"AllEnemies"` or `"AllAllies"`, and a bare number is the v9 shape, which a
+//! v10 peer does not read. What it takes to aim a command that way is the engine's, from the peer's own data
 //! (`fmv_ff7_battle::rules`, "Whole-side targeting"): the record's targeting bits say whether an action hits
 //! one target, a whole side or either (Cure, Fire: either; Ultima, Megalixir, Healing Wind: a whole side
 //! only), a spell that can do either needs an All materia use of its caster's (a count the engine keeps from
 //! the character's data, one per battle at level 1, so it is replayed and never sent), and an action that
 //! hits several targets splits its damage by 2/3.
 //!
+//! * **The party side is the whole roster.** With the canon party in front (see "The party" above) a party
+//!   member's `AllAllies` is every fighter of the roster, the canon companions and the players alike (`party[i]`
+//!   fights as `ActorId(i)`, so the effects come in roster order), and a player can aim a one-target spell or item at
+//!   a companion with `One`. The commands a companion gives (the server's rule: a limit that heals the whole party
+//!   is `AllAllies`, a damaging one at one enemy, or `AllEnemies` when that is the only way it is given) have the
+//!   same shapes and travel as ordinary `BattleEvent`s with the command attached.
 //! * **No new events.** A command on a whole side is one `Action` (and one `MpSpent`), followed by the
 //!   effects on each target in ascending actor order: one `Damage`, `Miss`, `Heal`, `MpRestored` or `Revive`
 //!   per target (and the `Death` and `LimitGauge` that follow its blow), then `Victory` or `Defeat` when the
@@ -349,7 +355,7 @@ pub enum BattleRejection {
     ActorDead,
     /// The target does not exist, or is on the wrong side for the action (damage goes to an enemy,
     /// restoring to an ally), or the action cannot be aimed that way (a whole side where it hits one target, one
-    /// target where it hits a whole side), or the actor has no All use left for a whole-side spell (protocol v8).
+    /// target where it hits a whole side), or the actor has no All use left for a whole-side spell (protocol v10).
     InvalidTarget,
     /// The target is already dead.
     TargetDead,
@@ -1124,7 +1130,7 @@ pub const DEFAULT_LEVEL: u8 = 5;
 /// with 3 Potions, 1 Ether and 1 Phoenix Down; a won battle drops [`SyntheticRules::drop_item`], one per
 /// enemy, if it is set. The enemies only ever attack.
 ///
-/// **Whole sides (v8).** Cure, Life and Fire are the kind a spell can be aimed at one target or a whole side
+/// **Whole sides (v10).** Cure, Life and Fire are the kind a spell can be aimed at one target or a whole side
 /// with (the real records' `0x0D` and `0x0F`), and every fighter has one use of the All materia per battle
 /// ([`SyntheticRules::ALL_USES`], what the real kernel's level 1 gives), so each can cast one of them on a
 /// whole side. The item table also holds Megalixir (6: the whole party, everything restored) and Shrapnel (21:
@@ -1752,7 +1758,7 @@ mod tests {
         log
     }
 
-    /// A replay of a battle in which whole sides are hit (protocol v8): the same engine from the same setup
+    /// A replay of a battle in which whole sides are hit (protocol v10): the same engine from the same setup
     /// reproduces every message, the All use that a whole-side spell spends included, and a forged log that
     /// asks for one more than a character has is refused.
     #[test]

@@ -1053,7 +1053,7 @@ mod tests {
         let a = parse(&["--battle-script", "defend,item:0,magic:0,limit,escape,attack"]).unwrap();
         assert_eq!(a.battle_script, [Defend, Item(0), Magic(0), Limit, Escape, Attack]);
         assert_eq!(parse(&["--battle-script", "Magic:27"]).unwrap().battle_script, [Magic(27)], "case does not matter");
-        // Whole sides (protocol v8): `:all` after the id of a spell or an item.
+        // Whole sides (protocol v10): `:all` after the id of a spell or an item.
         let a = parse(&["--battle-script", "magic:0:all,item:6:all,magic:27"]).unwrap();
         assert_eq!(a.battle_script, [crate::battle::ScriptStep::MagicAll(0), crate::battle::ScriptStep::ItemAll(6), Magic(27)]);
         assert!(parse(&["--battle-script", "magic:0:everyone"]).is_err() && parse(&["--battle-script", "limit:all"]).is_err());

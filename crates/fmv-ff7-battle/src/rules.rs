@@ -283,7 +283,7 @@ pub struct ActorId(pub u8);
 
 /// Whom an action is aimed at: one actor, or a whole side. The sides are named relative to the actor that
 /// acts, so the same words serve a party member and an enemy (see the module docs, "Whole-side
-/// targeting"). It travels in `Command::Magic`, `Command::Item` and `Command::Limit` (protocol v8).
+/// targeting"). It travels in `Command::Magic`, `Command::Item` and `Command::Limit` (protocol v10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Target {
     /// This one actor.
@@ -768,14 +768,14 @@ pub enum CommandError {
     UnknownItem(u16),
     /// The action cannot be aimed that way: a whole side where it hits one target, one target where it
     /// hits a whole side, or a whole side that is not the one it aims at (a damaging action on the
-    /// allies, a restoring one on the enemies). (Protocol v8.)
+    /// allies, a restoring one on the enemies). (Protocol v10.)
     #[error("{0:?} is not a way this action can be aimed (one target or a whole side, damage to the enemies, restoring to the allies)")]
     InvalidReach(Target),
-    /// Nobody on that side can be hit (a revival of a whole side with nobody fallen). (Protocol v8.)
+    /// Nobody on that side can be hit (a revival of a whole side with nobody fallen). (Protocol v10.)
     #[error("there is nobody on that side {0:?} the action can hit")]
     NoTargets(Target),
     /// The spell can hit a whole side only with an All materia use, and the actor has none left this
-    /// battle. (Protocol v8.)
+    /// battle. (Protocol v10.)
     #[error("actor {0:?} has no All left this battle")]
     NoAllLeft(ActorId),
     #[error("actor {0:?} has no limit break")]

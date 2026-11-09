@@ -311,7 +311,7 @@ fn offscreen_battle_target_selection() {
     }
 }
 
-/// Protocol v8: the pointer on ALL. The Magic list says how many whole-side casts are left, the status line says what
+/// Protocol v10: the pointer on ALL. The Magic list says how many whole-side casts are left, the status line says what
 /// ALL is, and a spell on every enemy (or the whole party) marks every one of them at once: an arrow over each head
 /// and each name in the list in the aimed colour.
 #[test]

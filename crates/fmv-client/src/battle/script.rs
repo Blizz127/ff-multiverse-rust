@@ -15,7 +15,7 @@
 //! then the lowest actor id); a reviving spell or item (Life, Phoenix Down) goes to the first fallen member,
 //! and is skipped when nobody has fallen.
 //!
-//! **Whole sides** (protocol v8): `magic:<id>:all` and `item:<id>:all` aim the spell or the item at the whole
+//! **Whole sides** (protocol v10): `magic:<id>:all` and `item:<id>:all` aim the spell or the item at the whole
 //! side instead (every enemy for an offensive one, the whole party for a healing one: `magic:0:all` is Cure on
 //! the party, `magic:27:all` Fire on every enemy), which costs the caster one use of its All materia for a spell
 //! of the Cure and Fire kind (and is skipped like any other refused entry when it has none left, or when the

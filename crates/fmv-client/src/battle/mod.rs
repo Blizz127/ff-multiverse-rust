@@ -52,7 +52,7 @@
 //!   character's limit gauge is full and has an `Escape` row; the party panel draws a limit bar per
 //!   member (`Bar::limit`); a battle the party got away from is `Outcome::Escaped` (counted by
 //!   [`BattleClient::escapes`], shown as "ESCAPED", nothing is paid).
-//! * Whole sides (protocol v8): a spell, an item or a limit that can hit a whole side has an **ALL** place for the
+//! * Whole sides (protocol v10): a spell, an item or a limit that can hit a whole side has an **ALL** place for the
 //!   target pointer (reached with the arrows, one step past the last target: see `menu`, "Whole sides"), the
 //!   Magic list says `ALL xN` for the All materia uses our character has left, Healing Wind and Megalixir start
 //!   on ALL, and the bot gives Healing Wind to the whole party. Everything it needs to know (what a spell can

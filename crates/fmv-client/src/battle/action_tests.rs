@@ -45,7 +45,7 @@ struct Scenario {
     limit: Option<LimitBreak>,
     /// How hard the battle is to run from (none: it cannot be).
     escape: Option<EscapeRule>,
-    /// How many whole-side casts of the Cure and Fire kind every member's All materia allows (protocol v8).
+    /// How many whole-side casts of the Cure and Fire kind every member's All materia allows (protocol v10).
     all: u8,
 }
 
@@ -1183,7 +1183,7 @@ fn the_bot_gives_a_full_limit_but_heals_first_when_hurt_aims_a_healing_limit_at_
     no_divergence(&mut c, "the whole battle");
 }
 
-// ----- whole sides (protocol v8) ---------------------------------------------------------------------------
+// ----- whole sides (protocol v10) ---------------------------------------------------------------------------
 
 /// Fire on every enemy chosen with the keys: the pointer walks to ALL, the command reaches the server and its replay
 /// (every event of both targets is checked), the numbers float over both enemies, and the All use the engine took

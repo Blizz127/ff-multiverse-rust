@@ -1,4 +1,14 @@
-//! FF Multiverse wire protocol v9.
+//! FF Multiverse wire protocol v10.
+//!
+//! v10 is v9 plus whole-side targeting: the `target` of [`battle::Command`]'s `Magic`, `Item` and `Limit` is a
+//! [`Target`] (`One(actor)`, `AllEnemies` or `AllAllies`) instead of an actor, so an action can hit a whole side (see
+//! [`battle`], "Whole-side targeting"). The sides are the commanding actor's own, so on the party side `AllAllies` is
+//! the whole roster of v9, the canon companions and the players alike; the commands a companion gives (the server's
+//! own, which travel as ordinary `BattleEvent`s with the command attached) have the same shapes. A v9 peer reads a
+//! bare number where a v10 one sends `{"One":3}` or a side, and a v10 peer does not read a bare number as a target, so
+//! the version was bumped: a v9 client or server is refused at the handshake instead of being cut off at the first
+//! spell, item or limit that is given. No event, message or stored record changed (`Hello` is the same message, so
+//! only its version refuses a v9 peer).
 //!
 //! v9 is v8 plus the battle party's CONTROLLERS (see [`battle`], "The party: canon companions, then the players"):
 //! a battle's roster ([`BattleMember`]) is now the story's canon party first, commanded by the server
@@ -86,7 +96,9 @@
 //!
 //! A character whose limit gauge is full gives `Limit { target }` instead of Attack; any character
 //! may give `Escape`, which ends the battle for the whole party when it succeeds (nothing is paid) and
-//! otherwise only costs the turn (`EscapeFailed`); see [`battle`], "Limit breaks and escape".
+//! otherwise only costs the turn (`EscapeFailed`); see [`battle`], "Limit breaks and escape". The `target` of a
+//! spell, an item or a limit is a [`Target`] since v10 (one actor or a whole side): see [`battle`], "Whole-side
+//! targeting".
 //!
 //! # Area travel (v4)
 //!
@@ -303,7 +315,7 @@ pub use fmv_party::{
     PartyEvent, PartyId, Placement,
 };
 
-pub const PROTOCOL_VERSION: u16 = 9;
+pub const PROTOCOL_VERSION: u16 = 10;
 /// Hard cap on a single frame payload (bytes).
 pub const MAX_FRAME: u32 = 256 * 1024;
 /// Default TCP port for development. Deployment port is UNASSIGNED (see DEPLOYMENT-CONTRACT.md).
@@ -718,8 +730,8 @@ mod tests {
     }
 
     #[test]
-    fn the_version_is_nine() {
-        assert_eq!(PROTOCOL_VERSION, 9);
+    fn the_version_is_ten() {
+        assert_eq!(PROTOCOL_VERSION, 10);
     }
 
     // -----------------------------------------------------------------------------------------
@@ -773,12 +785,12 @@ mod tests {
     fn golden_client_messages() {
         golden(
             ClientMsg::Hello {
-                protocol_version: 9,
+                protocol_version: 10,
                 client_build: "c/1".into(),
                 auth: Auth::Register { display_name: "Blizz".into() },
                 character: NewCharacter { tint: [10, 20, 30], body: Some("sturdy".into()), slot: Some(1) },
             },
-            r#"{"Hello":{"protocol_version":9,"client_build":"c/1","auth":{"Register":{"display_name":"Blizz"}},"character":{"tint":[10,20,30],"body":"sturdy","slot":1}}}"#,
+            r#"{"Hello":{"protocol_version":10,"client_build":"c/1","auth":{"Register":{"display_name":"Blizz"}},"character":{"tint":[10,20,30],"body":"sturdy","slot":1}}}"#,
         );
         golden(
             ClientMsg::JoinArea {
@@ -809,12 +821,12 @@ mod tests {
         golden(ClientMsg::PartySync, r#""PartySync""#);
         golden(
             ClientMsg::Hello {
-                protocol_version: 9,
+                protocol_version: 10,
                 client_build: "c/1".into(),
                 auth: Auth::Token(Secret::new("fmvt_x")),
                 character: NewCharacter::with_tint([0, 0, 0]),
             },
-            r#"{"Hello":{"protocol_version":9,"client_build":"c/1","auth":{"Token":"fmvt_x"},"character":{"tint":[0,0,0],"body":null,"slot":null}}}"#,
+            r#"{"Hello":{"protocol_version":10,"client_build":"c/1","auth":{"Token":"fmvt_x"},"character":{"tint":[0,0,0],"body":null,"slot":null}}}"#,
         );
     }
 
@@ -822,7 +834,7 @@ mod tests {
     fn golden_server_messages() {
         golden(
             ServerMsg::Welcome {
-                protocol_version: 9,
+                protocol_version: 10,
                 server_build: "s/1".into(),
                 session: SessionId(4),
                 entity: EntityId(5),
@@ -838,7 +850,7 @@ mod tests {
                 },
             },
             concat!(
-                r#"{"Welcome":{"protocol_version":9,"server_build":"s/1","session":4,"entity":5,"account":6,"issued_token":null,"#,
+                r#"{"Welcome":{"protocol_version":10,"server_build":"s/1","session":4,"entity":5,"account":6,"issued_token":null,"#,
                 r#""character":{"name":"Blizz","tint":[10,20,30],"body":"sturdy","binding":"ff7/body/sturdy","slot":1,"migrated":false}}}"#
             ),
         );
@@ -1225,6 +1237,40 @@ mod tests {
             ClientMsg::BattleCommand { battle_id: BattleId(1), actor: ActorId(2), command: battle::Command::Escape },
             r#"{"BattleCommand":{"battle_id":1,"actor":2,"command":"Escape"}}"#,
         );
+        // v10: the target is one actor or a whole side. A player behind the canon pair (actor 2) gives Cure to a companion
+        // (one actor), to the whole party, and Fire to every enemy; the side is named from the commanding actor's own.
+        golden(
+            ClientMsg::BattleCommand {
+                battle_id: BattleId(1),
+                actor: ActorId(2),
+                command: battle::Command::Magic { spell: 0, target: Target::One(ActorId(1)) },
+            },
+            r#"{"BattleCommand":{"battle_id":1,"actor":2,"command":{"Magic":{"spell":0,"target":{"One":1}}}}}"#,
+        );
+        golden(
+            ClientMsg::BattleCommand {
+                battle_id: BattleId(1),
+                actor: ActorId(2),
+                command: battle::Command::Magic { spell: 0, target: Target::AllAllies },
+            },
+            r#"{"BattleCommand":{"battle_id":1,"actor":2,"command":{"Magic":{"spell":0,"target":"AllAllies"}}}}"#,
+        );
+        golden(
+            ClientMsg::BattleCommand {
+                battle_id: BattleId(1),
+                actor: ActorId(2),
+                command: battle::Command::Magic { spell: 27, target: Target::AllEnemies },
+            },
+            r#"{"BattleCommand":{"battle_id":1,"actor":2,"command":{"Magic":{"spell":27,"target":"AllEnemies"}}}}"#,
+        );
+        golden(
+            ClientMsg::BattleCommand {
+                battle_id: BattleId(1),
+                actor: ActorId(2),
+                command: battle::Command::Item { item: 6, target: Target::AllAllies },
+            },
+            r#"{"BattleCommand":{"battle_id":1,"actor":2,"command":{"Item":{"item":6,"target":"AllAllies"}}}}"#,
+        );
         golden(ClientMsg::RequestEncounter { formation_id: None }, r#"{"RequestEncounter":{"formation_id":null}}"#);
         golden(ClientMsg::RequestEncounter { formation_id: Some(517) }, r#"{"RequestEncounter":{"formation_id":517}}"#);
     }
@@ -1345,6 +1391,49 @@ mod tests {
                 r#"{"BattleEvent":{"battle_id":1,"tick":200,"events":[{"Action":{"actor":0,"action":{"Limit":128}}},"#,
                 r#"{"LimitGauge":{"actor":0,"value":0}},{"Damage":{"actor":0,"target":3,"amount":321,"critical":false}}],"#,
                 r#""command":{"actor":0,"command":{"Limit":{"target":{"One":3}}}}}}"#
+            ),
+        );
+        // v10: a command on a whole side is one command (`"AllAllies"`) and one `Action`, then an effect per target in
+        // actor order, whoever gave it: a player (actor 2, behind the canon pair) casting Cure on the whole party of
+        // Cloud (0), Barret (1) and itself, the companions included.
+        golden(
+            ServerMsg::BattleEvent {
+                battle_id: BattleId(1),
+                tick: 300,
+                events: vec![
+                    battle::BattleEvent::Action { actor: ActorId(2), action: battle::ActionRef::Magic(0) },
+                    battle::BattleEvent::MpSpent { actor: ActorId(2), amount: 5 },
+                    battle::BattleEvent::Heal { actor: ActorId(2), target: ActorId(0), amount: 57 },
+                    battle::BattleEvent::Heal { actor: ActorId(2), target: ActorId(1), amount: 0 },
+                    battle::BattleEvent::Heal { actor: ActorId(2), target: ActorId(2), amount: 57 },
+                ],
+                command: Some(AppliedCommand { actor: ActorId(2), command: battle::Command::Magic { spell: 0, target: Target::AllAllies } }),
+            },
+            concat!(
+                r#"{"BattleEvent":{"battle_id":1,"tick":300,"events":[{"Action":{"actor":2,"action":{"Magic":0}}},"#,
+                r#"{"MpSpent":{"actor":2,"amount":5}},{"Heal":{"actor":2,"target":0,"amount":57}},"#,
+                r#"{"Heal":{"actor":2,"target":1,"amount":0}},{"Heal":{"actor":2,"target":2,"amount":57}}],"#,
+                r#""command":{"actor":2,"command":{"Magic":{"spell":0,"target":"AllAllies"}}}}}"#
+            ),
+        );
+        // ...and a canon companion's Healing Wind (its own limit, given by the server's rule) on the whole party.
+        golden(
+            ServerMsg::BattleEvent {
+                battle_id: BattleId(1),
+                tick: 310,
+                events: vec![
+                    battle::BattleEvent::Action { actor: ActorId(1), action: battle::ActionRef::Limit(142) },
+                    battle::BattleEvent::LimitGauge { actor: ActorId(1), value: 0 },
+                    battle::BattleEvent::Heal { actor: ActorId(1), target: ActorId(0), amount: 213 },
+                    battle::BattleEvent::Heal { actor: ActorId(1), target: ActorId(1), amount: 240 },
+                ],
+                command: Some(AppliedCommand { actor: ActorId(1), command: battle::Command::Limit { target: Target::AllAllies } }),
+            },
+            concat!(
+                r#"{"BattleEvent":{"battle_id":1,"tick":310,"events":[{"Action":{"actor":1,"action":{"Limit":142}}},"#,
+                r#"{"LimitGauge":{"actor":1,"value":0}},{"Heal":{"actor":1,"target":0,"amount":213}},"#,
+                r#"{"Heal":{"actor":1,"target":1,"amount":240}}],"#,
+                r#""command":{"actor":1,"command":{"Limit":{"target":"AllAllies"}}}}}"#
             ),
         );
         golden(
@@ -1487,7 +1576,7 @@ mod tests {
         golden(battle::Command::Item { item: 3, target: Target::One(a) }, r#"{"Item":{"item":3,"target":{"One":0}}}"#);
         golden(battle::Command::Defend, r#""Defend""#);
         golden(battle::Command::Limit { target: Target::One(t) }, r#"{"Limit":{"target":{"One":3}}}"#);
-        // v8: a target is one actor or a whole side (the sides are the commanding actor's: its enemies, its allies).
+        // v10: a target is one actor or a whole side (the sides are the commanding actor's: its enemies, its allies).
         golden(Target::One(t), r#"{"One":3}"#);
         golden(Target::AllEnemies, r#""AllEnemies""#);
         golden(Target::AllAllies, r#""AllAllies""#);
@@ -1623,14 +1712,17 @@ mod tests {
         assert_ne!(probe_hello_version(hello_v5), Some(PROTOCOL_VERSION));
     }
 
-    /// The reason for the v7 bump: a v6 peer cannot decode a limit, an escape, the new events, the new
-    /// outcome or the new refusals, and a v6 `BattleMember` has no limit gauge to start from. (The older
-    /// peer's enums are simulated by enums that lack the variants.) The handshake refuses it first.
+    /// The reason for the v10 bump: the target of a spell, an item and a limit is one actor or a whole side, which a v9
+    /// peer reads as no command (it has a bare actor there) and which a v10 peer does not read a v9 command as either, so
+    /// a v9 peer let in would be cut off at the first spell, item or limit that is given, by a player or by a canon
+    /// companion (the server's own commands travel in the same `BattleEvent`s). (The older peer's enums are simulated by
+    /// enums of its shape.) A v9 `Hello` is still a v10 `Hello` (nothing in it changed), so the version number is what
+    /// refuses it, and the version of any `Hello` is readable, so the refusal is clean.
     #[test]
-    fn a_v7_peer_cannot_read_the_v8_target_and_a_v8_peer_cannot_read_the_v7_one_so_the_version_had_to_change() {
-        // What a v7 peer's `Command` is: the target of a spell, an item and a limit is a bare actor.
+    fn a_v9_peer_cannot_read_the_v10_target_and_a_v10_peer_cannot_read_the_v9_one_so_the_version_had_to_change() {
+        // What a v9 peer's `Command` is: the target of a spell, an item and a limit is a bare actor.
         #[derive(Debug, Deserialize)]
-        enum CommandV7 {
+        enum CommandV9 {
             #[allow(dead_code)]
             Attack { target: ActorId },
             #[allow(dead_code)]
@@ -1644,35 +1736,52 @@ mod tests {
             #[allow(dead_code)]
             Escape,
         }
+        // ...and the command a v9 `BattleEvent` carries (the server applied it for a player or for a companion).
+        #[derive(Debug, Deserialize)]
+        struct AppliedV9 {
+            #[allow(dead_code)]
+            actor: ActorId,
+            #[allow(dead_code)]
+            command: CommandV9,
+        }
         let a = ActorId(1);
-        for command in [
-            battle::Command::Magic { spell: 0, target: Target::One(a) },
-            battle::Command::Item { item: 3, target: Target::One(a) },
-            battle::Command::Limit { target: Target::One(a) },
+        let whole_sides = [
             battle::Command::Magic { spell: 27, target: Target::AllEnemies },
             battle::Command::Item { item: 6, target: Target::AllAllies },
             battle::Command::Limit { target: Target::AllAllies },
-        ] {
-            assert!(decode::<CommandV7>(&encode(&command).unwrap()[4..]).is_err(), "{command:?}");
+        ];
+        for command in [battle::Command::Magic { spell: 0, target: Target::One(a) }, battle::Command::Item { item: 3, target: Target::One(a) }, battle::Command::Limit { target: Target::One(a) }]
+            .into_iter()
+            .chain(whole_sides)
+        {
+            assert!(decode::<CommandV9>(&encode(&command).unwrap()[4..]).is_err(), "{command:?}");
+            // The same command as a companion's turn travels: applied by an actor, in a battle message.
+            let applied = AppliedCommand { actor: ActorId(0), command };
+            assert!(decode::<AppliedV9>(&encode(&applied).unwrap()[4..]).is_err(), "{applied:?}");
         }
         // What does not change: Attack, Defend and Escape read the same in both.
         for command in [battle::Command::Attack { target: a }, battle::Command::Defend, battle::Command::Escape] {
-            assert!(decode::<CommandV7>(&encode(&command).unwrap()[4..]).is_ok(), "{command:?}");
+            assert!(decode::<CommandV9>(&encode(&command).unwrap()[4..]).is_ok(), "{command:?}");
+            let applied = AppliedCommand { actor: ActorId(0), command };
+            assert!(decode::<AppliedV9>(&encode(&applied).unwrap()[4..]).is_ok(), "{applied:?}");
         }
-        // And the other way round: a v7 spell, item or limit (a bare number) is no v8 command.
-        for old in [
-            r#"{"Magic":{"spell":0,"target":3}}"#,
-            r#"{"Item":{"item":3,"target":0}}"#,
-            r#"{"Limit":{"target":3}}"#,
-        ] {
+        // And the other way round: a v9 spell, item or limit (a bare number) is no v10 command, whoever gave it.
+        for old in [r#"{"Magic":{"spell":0,"target":3}}"#, r#"{"Item":{"item":3,"target":0}}"#, r#"{"Limit":{"target":3}}"#] {
             assert!(decode::<battle::Command>(old.as_bytes()).is_err(), "{old}");
+            let in_a_message = format!(r#"{{"BattleCommand":{{"battle_id":1,"actor":2,"command":{old}}}}}"#);
+            assert!(decode::<ClientMsg>(in_a_message.as_bytes()).is_err(), "{in_a_message}");
         }
-        assert!(decode::<battle::Command>(br#"{"Attack":{"target":3}}"#).is_ok(), "an attack is the same in v7");
-        let hello_v7 = br#"{"Hello":{"protocol_version":7,"client_build":"c","auth":{"Token":"x"},"tint":[0,0,0],"appearance_ref":null}}"#;
-        assert_eq!(probe_hello_version(hello_v7), Some(7));
-        assert_ne!(probe_hello_version(hello_v7), Some(PROTOCOL_VERSION));
+        assert!(decode::<battle::Command>(br#"{"Attack":{"target":3}}"#).is_ok(), "an attack is the same in v9");
+        // A v9 `Hello` reads as a v10 `Hello`; only its version says it is not for this server.
+        let hello_v9 = br#"{"Hello":{"protocol_version":9,"client_build":"c","auth":{"Token":"x"},"character":{"tint":[0,0,0],"body":null,"slot":null}}}"#;
+        assert!(decode::<ClientMsg>(hello_v9).is_ok());
+        assert_eq!(probe_hello_version(hello_v9), Some(9));
+        assert_ne!(probe_hello_version(hello_v9), Some(PROTOCOL_VERSION));
     }
 
+    /// The reason for the v7 bump: a v6 peer cannot decode a limit, an escape, the new events, the new
+    /// outcome or the new refusals, and a v6 `BattleMember` has no limit gauge to start from. (The older
+    /// peer's enums are simulated by enums that lack the variants.) The handshake refuses it first.
     #[test]
     fn a_v6_peer_cannot_decode_the_v7_messages_so_the_version_had_to_change() {
         #[derive(Debug, Deserialize)]
@@ -1755,7 +1864,7 @@ mod tests {
                 auth: Auth::Register { display_name: "Wedge".into() },
                 character: NewCharacter { tint: [200, 10, 10], body: Some("slight".into()), slot: Some(8) },
             },
-            r#"{"Hello":{"protocol_version":9,"client_build":"c/1","auth":{"Register":{"display_name":"Wedge"}},"character":{"tint":[200,10,10],"body":"slight","slot":8}}}"#,
+            r#"{"Hello":{"protocol_version":10,"client_build":"c/1","auth":{"Register":{"display_name":"Wedge"}},"character":{"tint":[200,10,10],"body":"slight","slot":8}}}"#,
         );
         golden(
             ClientMsg::Hello {
@@ -1764,7 +1873,7 @@ mod tests {
                 auth: Auth::Register { display_name: "Plain".into() },
                 character: NewCharacter::with_tint([1, 2, 3]),
             },
-            r#"{"Hello":{"protocol_version":9,"client_build":"c/1","auth":{"Register":{"display_name":"Plain"}},"character":{"tint":[1,2,3],"body":null,"slot":null}}}"#,
+            r#"{"Hello":{"protocol_version":10,"client_build":"c/1","auth":{"Register":{"display_name":"Plain"}},"character":{"tint":[1,2,3],"body":null,"slot":null}}}"#,
         );
         // What the server says about an account that predates v8: it never chose a body, it keeps the look it had
         // (the binding is a canon model) and the character it was fighting as (Cloud, slot 0, which only a migrated
@@ -1960,8 +2069,8 @@ mod tests {
         let v2 = br#"{"Hello":{"protocol_version":2,"client_build":"x","auth":{"Register":{"display_name":"n"}},"tint":[1,2,3],"appearance_ref":null}}"#;
         assert!(decode::<ClientMsg>(v2).is_err(), "no Hello before v8 is a v8 ClientMsg");
         assert_eq!(probe_hello_version(v2), Some(2));
-        let future = br#"{"Hello":{"protocol_version":9,"anything":{"at":"all"}}}"#;
-        assert_eq!(probe_hello_version(future), Some(9));
+        let future = br#"{"Hello":{"protocol_version":11,"anything":{"at":"all"}}}"#;
+        assert_eq!(probe_hello_version(future), Some(11));
         for not_hello in [&br#""Leave""#[..], br#"{"Ping":{"nonce":1}}"#, b"not json", b"{}", br#"{"Hello":{}}"#, br#"{"Hello":{"protocol_version":70000}}"#] {
             assert_eq!(probe_hello_version(not_hello), None, "{}", String::from_utf8_lossy(not_hello));
         }

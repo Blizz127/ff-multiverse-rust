@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/battle-smoke.sh - shared-battle smoke test for fmv-server + fmv-client (protocol v9).
+# scripts/battle-smoke.sh - shared-battle smoke test for fmv-server + fmv-client (protocol v10).
 #
 # Usage: scripts/battle-smoke.sh [--fixture|--random|--progress|--commands|--solo] [--release|--debug]
 #                                [--bin-dir DIR] [--build] [--library STATE_DIR] [--duration SECS]
@@ -122,8 +122,8 @@
 #                   (Potion is item 0, Cure is spell 0; `magic:0:all` is Cure on the WHOLE PARTY, the canon Cloud and
 #                   Barret and the players alike, which takes the once-per-battle use of the All materia every
 #                   character has (protocol v10: read from the owner's kernel) and is checked below as the server's own
-#                   `target=all-allies`; it goes FIRST because the canon pair can end this battle before a bot has had
-#                   its fourth turn, and the check needs the whole-party cast to have been applied; spell 9999 does not
+#                   `target=all-allies`; it goes FIRST so that it is applied in a fight that ends before a bot has had its
+#                   fourth turn (the whole-party cast is the one entry the mode checks the server for); spell 9999 does not
 #                   exist: the entry must be skipped, counted and not retried, and the next one tried in the same turn).
 #                   There is no `limit` entry: players have no limit break in v9 (the server would refuse it, NoLimit),
 #                   so the limit break is the canon companions': --debug-limit-full fills their gauge and the server's
@@ -204,8 +204,8 @@ COMMANDS_DURATION=12
 # Potion is item 0, Cure is spell 0 (checked against the owner's data by the --ignored real-data tests of
 # fmv-ff7-battle and fmv-client); spell 9999 does not exist, so script B has one entry that must be skipped. No `limit`
 # entry: players have no limit break in v9 (it would be refused NoLimit); the companions give the limit break.
-# `magic:0:all` is Cure on the whole party (an All materia use, protocol v10); it goes first so that a battle the canon
-# pair ends early still has it applied (the mode checks the server's `target=all-allies` line for it).
+# `magic:0:all` is Cure on the whole party (an All materia use, protocol v10); it goes first so that a fight that ends
+# before a bot's fourth turn still has it applied (the mode checks the server's `target=all-allies` line for it).
 SCRIPT_A="${FMV_SMOKE_SCRIPT_A:-magic:0:all,defend,item:0,magic:0}"
 SCRIPT_B="${FMV_SMOKE_SCRIPT_B:-magic:0,magic:9999,item:0,defend}"
 ESCAPE_SCRIPT="${FMV_SMOKE_ESCAPE_SCRIPT:-escape,escape,escape,escape,escape,escape}"
