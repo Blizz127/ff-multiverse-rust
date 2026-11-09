@@ -64,6 +64,36 @@ so that the body stays about decisions.
 
 ---
 
+## 0.1 The owner's vision and play model (2026-11-09, relayed by the Devbox coordinator)
+
+The owner's words (10:28 CST): "ff14 + pokemmo is the best way of doing it for myself, the best part is i can play solo
+and go through the games or select whatever game or with friends. cool part is connor playing pokemmo alone doing his
+stuff we can team up or go solo. being able to take a "stargate" to other ff worlds to play their game is great too."
+Earlier the same morning: "probably need a 3-4 max party", "do what pokemmo does" (co-op) and, for story scenes, "ff14
+aand ff11 is the best way of doing it" ("perfect ok lets do it"). The design targets that follow from them:
+
+* **Solo or co-op at any time.** Players share the world and see each other (as today, per story phase), and each keeps
+  their OWN progress per game. Battles are solo by default, fought beside the player's own canon companions; fighting
+  together is opt-in (PokeMMO's model: ordinary battles are solo even inside a party, co-op is group content such as
+  raids). A party is a social group the players form and leave freely, never a forced shared battle. **This changes
+  today's rule** (a party always battles together) and is planned for after the single-player early game.
+* **A battle holds at most 4:** the story's canon party first, then as many players' own characters as fit (two in the
+  first mission: Cloud, Barret and two originals). Nobody canon is displaced; a player who does not fit plays on solo.
+  Story bosses can be fought as a linked group, raid-style, each player's story moving only if they stand at that point.
+* **Story scenes like FF14 and FF11.** A player's Interact starts a per-player scene instance; the canon cast speak their
+  real lines from the owner's own files; the player's character is present as a witness, never in Cloud's place; party
+  members nearby can watch together. Scenes are data (a script reference plus a cast list), replayable with a custom
+  cast. The first proof is Cloud and Tifa at the bar in 7th Heaven (Game QA acceptance: the talk starts it, the lines
+  play in order, the witness is at the right scale with no clipping, camera and control come back cleanly, no replay or
+  soft-lock after a save and reload). This is the hosted-script-VM track of section 2.7.
+* **Pick any FF game, and travel between them.** One original character per player crosses every game (section 2),
+  each game keeping its own feel (section 1). The owner wants an in-world way to travel between the FF worlds (his
+  "stargate"): a portal hub that is ORIGINAL to FF Multiverse (no game's art), from which each game's world is entered
+  at that player's own progress in it. It needs the multi-game hosting of section 4 (today's server hosts one game) and
+  an identity that is already game-agnostic (it is: `PlayerCharacter`, per-game bindings and progress pointers).
+
+---
+
 ## 1. Principle: connected, but different
 
 | Concern | Connected: one implementation, shared | Different: one per game, never unified |
