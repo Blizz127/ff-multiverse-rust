@@ -169,6 +169,8 @@ pub struct TrashEntry {
     pub display_name: String,
     /// Unix seconds.
     pub deleted_at: u64,
+    /// `deleted_at` as UTC text (`2026-11-09T16:59:05Z`), as the manifest says it.
+    pub deleted_at_utc: String,
     /// How many record files the entry holds.
     pub files: usize,
     /// Why the manifest could not be read (then `display_name`, `deleted_at` and `files` are placeholders).
@@ -638,6 +640,17 @@ fn recover_restoring(
 
 // ---- the store's operations ------------------------------------------------------------------------------------------
 
+/// An entry that passed every check of a restore (see `check_restorable`).
+struct Checked {
+    /// `<stamp>-<account>`.
+    base: String,
+    dir: PathBuf,
+    manifest: Manifest,
+    records: EntryRecords,
+    name: String,
+    key: String,
+}
+
 /// A delete that has its plan on disk: the entry (still `.pending`) and what it lists.
 struct Prepared {
     base: String,
@@ -672,8 +685,9 @@ impl Store {
         Ok(self.finish_delete(prepared))
     }
 
-    /// Step 1: collect the account's files and write the plan.
-    fn prepare_delete(&self, account: AccountId, now: u64) -> Result<Prepared> {
+    /// The account's name, its avatar link and the record files it owns (the ones that exist, as paths relative to the
+    /// state directory): exactly what a delete moves.
+    fn collect_files(&self, account: AccountId) -> Result<(String, Option<u64>, Vec<String>)> {
         let (name, avatar) = {
             let index = self.index();
             let entry = index.account(account.0).ok_or(PersistError::UnknownAccount(account))?;
@@ -695,6 +709,18 @@ impl Store {
                 push_if_file(progression_rel(account.0, &file));
             }
         }
+        Ok((name, avatar, files))
+    }
+
+    /// The files [`Store::delete_account`] would move for `account`, as paths relative to the state directory: for a
+    /// dry run. Reads only.
+    pub fn deletion_plan(&self, account: AccountId) -> Result<Vec<String>> {
+        self.collect_files(account).map(|(_, _, files)| files)
+    }
+
+    /// Step 1: collect the account's files and write the plan.
+    fn prepare_delete(&self, account: AccountId, now: u64) -> Result<Prepared> {
+        let (name, avatar, files) = self.collect_files(account)?;
         let manifest = Manifest {
             schema_version: MANIFEST_VERSION,
             kind: MANIFEST_KIND.to_owned(),
@@ -768,6 +794,7 @@ impl Store {
                     account_id: AccountId(parsed.account),
                     display_name: manifest.display_name,
                     deleted_at: manifest.deleted_at,
+                    deleted_at_utc: manifest.deleted_at_utc,
                     files: manifest.files.len(),
                     problem: None,
                     name,
@@ -777,6 +804,7 @@ impl Store {
                     account_id: AccountId(parsed.account),
                     display_name: String::new(),
                     deleted_at: 0,
+                    deleted_at_utc: String::new(),
                     files: 0,
                     problem: Some(e.to_string()),
                     name,
@@ -787,26 +815,20 @@ impl Store {
         Ok(out)
     }
 
-    /// Bring a deleted account back, as a **new** account: see the module documentation for what that means and for
-    /// the crash argument. `entry` is a name from [`Store::trash_entries`] whose state is [`TrashState::Deleted`].
-    ///
-    /// Everything is read and checked before anything is written: the name must still be free
-    /// ([`PersistError::NameTaken`]; the character's name is not changed to make it fit), the store must have room
-    /// for another account ([`PersistError::AccountLimitReached`]) and every record in the entry must read cleanly
-    /// ([`PersistError::Corrupt`]). A refused restore changes nothing and the entry stays where it is.
-    /// [`PersistError::NoSuchTrashEntry`] if `entry` is not there or is not restorable (a delete or a restore in
-    /// flight, or one that was restored already).
-    pub fn restore_account(&self, entry: &str, now: u64) -> Result<Restored> {
-        let mut counters = self.writer();
+    /// Everything a restore of `entry` checks before it writes anything: the entry is a complete, restorable one
+    /// ([`PersistError::NoSuchTrashEntry`]), its manifest and every record in it read cleanly
+    /// ([`PersistError::Corrupt`]), the store has room for another account
+    /// ([`PersistError::AccountLimitReached`]) and the character's name is still free ([`PersistError::NameTaken`]).
+    /// The caller holds the writer lock (or only wants to know).
+    fn check_restorable(&self, entry: &str) -> Result<Checked> {
         let parsed = parse_name(entry)
             .filter(|parsed| parsed.state == TrashState::Deleted)
             .ok_or_else(|| PersistError::NoSuchTrashEntry(entry.to_owned()))?;
-        let trash = self.trash_dir();
-        let dir = trash.join(entry);
+        let dir = self.trash_dir().join(entry);
         if !dir.is_dir() {
             return Err(PersistError::NoSuchTrashEntry(entry.to_owned()));
         }
-        let mut manifest = read_manifest(&dir)?;
+        let manifest = read_manifest(&dir)?;
         if manifest.account_id != parsed.account {
             return Err(PersistError::corrupt(&dir, "the manifest is for another account than the entry's name says"));
         }
@@ -822,6 +844,39 @@ impl Store {
                 return Err(PersistError::NameTaken(name));
             }
         }
+        Ok(Checked { base: parsed.base.to_owned(), dir, manifest, records, name, key })
+    }
+
+    /// Would [`Store::restore_account`] restore `entry` now? Runs every check it runs, writes nothing, and returns the
+    /// entry as [`Store::trash_entries`] lists it: for a dry run.
+    pub fn restore_check(&self, entry: &str) -> Result<TrashEntry> {
+        let _counters = self.writer();
+        let checked = self.check_restorable(entry)?;
+        Ok(TrashEntry {
+            name: entry.to_owned(),
+            state: TrashState::Deleted,
+            account_id: AccountId(checked.manifest.account_id),
+            display_name: checked.name,
+            deleted_at: checked.manifest.deleted_at,
+            deleted_at_utc: checked.manifest.deleted_at_utc,
+            files: checked.manifest.files.len(),
+            problem: None,
+        })
+    }
+
+    /// Bring a deleted account back, as a **new** account: see the module documentation for what that means and for
+    /// the crash argument. `entry` is a name from [`Store::trash_entries`] whose state is [`TrashState::Deleted`].
+    ///
+    /// Everything is read and checked before anything is written: the name must still be free
+    /// ([`PersistError::NameTaken`]; the character's name is not changed to make it fit), the store must have room
+    /// for another account ([`PersistError::AccountLimitReached`]) and every record in the entry must read cleanly
+    /// ([`PersistError::Corrupt`]). A refused restore changes nothing and the entry stays where it is.
+    /// [`PersistError::NoSuchTrashEntry`] if `entry` is not there or is not restorable (a delete or a restore in
+    /// flight, or one that was restored already).
+    pub fn restore_account(&self, entry: &str, now: u64) -> Result<Restored> {
+        let mut counters = self.writer();
+        let Checked { base, dir, mut manifest, records, name, key } = self.check_restorable(entry)?;
+        let trash = self.trash_dir();
         let new_account = counters.next_account_id;
         let next_account = new_account.checked_add(1).ok_or(PersistError::IdExhausted)?;
         let new_avatar = records.avatar.as_ref().map(|_| counters.next_avatar_id);
@@ -837,7 +892,7 @@ impl Store {
         let plan = RestorePlan { account_id: new_account, avatar_id: new_avatar, at: now };
         manifest.restore = Some(plan);
         write_manifest(&dir, &manifest)?;
-        let restoring = trash.join(format!("{}{RESTORING}{new_account}", parsed.base));
+        let restoring = trash.join(format!("{base}{RESTORING}{new_account}"));
         rename_entry(&trash, &dir, &restoring)?;
 
         // 2. The records nothing references yet (what a registration writes before its one log entry).
@@ -896,9 +951,9 @@ impl Store {
         let mut unfinished = write_progress(&self.root, &restoring, &manifest, new_account);
         let mut final_name = restoring.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
         if unfinished.is_empty() {
-            let restored = trash.join(format!("{}{RESTORED}{new_account}", parsed.base));
+            let restored = trash.join(format!("{base}{RESTORED}{new_account}"));
             match rename_entry(&trash, &restoring, &restored) {
-                Ok(()) => final_name = format!("{}{RESTORED}{new_account}", parsed.base),
+                Ok(()) => final_name = format!("{base}{RESTORED}{new_account}"),
                 Err(e) => unfinished.push(e.to_string()),
             }
         }
