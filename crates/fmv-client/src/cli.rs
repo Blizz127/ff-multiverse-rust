@@ -270,8 +270,11 @@ MODS:
   <npc>: echo-s section|original section`), each window of a voiced one which clip the voice layer
   has for it (`mods: window <field>#<dialog> w<window> voice <field>/<clip>|none`), a voice that
   plays `audio: voice <field>/<clip>` (a clip's archive path, never its words), a track and a sound
-  the same way (`audio: music <name> from echo-s`, `audio: sound <id> from cosmo`). Voices need an
-  audio output: FMV_AUDIO=null runs them against a clock with none.
+  the same way (`audio: music <name> from echo-s`, `audio: sound <id> from cosmo`). Voices, music and
+  sounds play only through the soundtrack (see SOUND: it needs your original sound files in the
+  library, and `--mute`, FMV_AUDIO=off or a headless run without FMV_AUDIO turn it off); a run
+  without it says `mods: the voice, music and sound layers play nothing in this run (<why>)`.
+  FMV_AUDIO=null runs them against a clock with no output device.
 
 WINDOW CONTROLS:
   WASD / arrow keys move, Esc twice quits (never during a battle: close the window to quit

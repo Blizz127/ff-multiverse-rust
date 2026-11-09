@@ -1336,6 +1336,10 @@ then, as the game uses them, only archive paths and ids, never a line of text: `
 section (not in echo-s)`), for each window of such a conversation `mods: window md1stin#12 w0 voice md1stin/12a` (or `voice none`: the lookup, which a
 run without ears shows too), `audio: voice md1stin/12a (2.4 s)` when the clip plays, `audio: music aseri from echo-s`, `audio: sound 6 from cosmo`, and at the end
 `audio: voices played: N (asks without a clip: M)`. The audio lines need a run with sound (`FMV_AUDIO=null` runs it against a clock with no device).
+**The voice, music and sound layers play only through the soundtrack, which needs your original sound files in the library** (a library imported before
+the importer took the music and sound has none: run `import-pc` on the install again with the same labels, see "Importing your own FF7 data"). When the
+soundtrack is off (`--mute`, a headless run without `FMV_AUDIO`, `FMV_AUDIO=off`, or a library without sound files) the start-up line still says which
+layers are on, so the client adds `mods: the voice, music and sound layers play nothing in this run (<why>)`; only the text layer works without sound.
 
 ### How each layer works, and what was measured
 

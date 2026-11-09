@@ -246,6 +246,31 @@ pub fn setup(flags: &ModFlags, state_dir: Option<&Path>) -> Arc<Mods> {
     mods
 }
 
+/// What a run owes when its soundtrack is off while mod layers that need it are on: the `mods:` line at start-up says which layers are on
+/// and the owner reads it as what plays, but a voice, a track and a sound cannot play without the soundtrack. `None` when no audible layer
+/// has anything to play (the text layer needs no sound). `why` says why the soundtrack is off.
+pub fn silent_audio_note(mods: Option<&Mods>, why: &str) -> Option<String> {
+    let mods = mods?;
+    let layers = mods.layers();
+    let mut silent: Vec<&str> = Vec::new();
+    if layers.voice && mods.has_echo() {
+        silent.push("voice");
+    }
+    if layers.music && mods.has_echo() {
+        silent.push("music");
+    }
+    if layers.sound && (mods.has_echo() || mods.has_cosmo()) {
+        silent.push("sound");
+    }
+    let list = match silent.as_slice() {
+        [] => return None,
+        [one] => (*one).to_string(),
+        [init @ .., last] => format!("{} and {last}", init.join(", ")),
+    };
+    let (noun, verb) = if silent.len() == 1 { ("layer", "plays") } else { ("layers", "play") };
+    Some(format!("mods: the {list} {noun} {verb} nothing in this run ({why})"))
+}
+
 // ---- what the layers ask of the audio ----------------------------------------------------------------
 
 /// What a conversation asks of the voice layer, in the order it happens.
@@ -391,6 +416,28 @@ mod tests {
             assert_eq!(parse_switch(off), Ok(false), "{off:?}");
         }
         assert!(parse_switch("maybe").is_err() && parse_switch("").is_err());
+    }
+
+    #[test]
+    fn a_run_whose_soundtrack_is_off_says_which_layers_play_nothing() {
+        use fmv_mods::testkit::{echo_archive, EchoSpec};
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("echo.iro");
+        std::fs::write(&path, echo_archive(&EchoSpec::default())).unwrap();
+        let sources = ModSources { echo_s: Some(path), ..Default::default() };
+        let all = Mods::open(&sources, Layers::ALL);
+        assert_eq!(
+            silent_audio_note(Some(&all), "--mute").as_deref(),
+            Some("mods: the voice, music and sound layers play nothing in this run (--mute)")
+        );
+        // One audible layer left, or only the text: the sentence follows (the text layer needs no sound).
+        let only_music = all.with_layers(Layers { text: true, voice: false, music: true, sound: false });
+        assert_eq!(silent_audio_note(Some(&only_music), "x").as_deref(), Some("mods: the music layer plays nothing in this run (x)"));
+        let text_only = all.with_layers(Layers { text: true, voice: false, music: false, sound: false });
+        assert_eq!(silent_audio_note(Some(&text_only), "x"), None);
+        // Nothing to play from: no archive, and no mods at all.
+        assert_eq!(silent_audio_note(Some(&Mods::none()), "x"), None);
+        assert_eq!(silent_audio_note(None, "x"), None);
     }
 
     #[test]
