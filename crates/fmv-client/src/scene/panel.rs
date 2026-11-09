@@ -8,8 +8,9 @@
 //! * it does not pull the next message itself: the scene decides what comes after a window ([`Outcome::Pass`] says the
 //!   player is done with it and what it answered), and
 //! * it stands NEAR whoever speaks: above the speaker's head when there is room, else below the feet, else at the bottom
-//!   of the screen as the talk window does, and always inside the screen ([`place_window`]). A window with no speaker (a
-//!   narrator's note) or one whose speaker is not on screen is at the bottom.
+//!   of the screen as the talk window does, and always inside the screen ([`place_window`]), and where it can it does not
+//!   hide the other people of the scene (it is moved aside, or below the speaker, to cover the least of them). A window
+//!   with no speaker (a narrator's note) or one whose speaker is not on screen is at the bottom.
 //!
 //! Its text is never wider than [`MAX_CELLS`] cells so that it stays beside a character instead of across the screen; the
 //! layout (and so the pages a key turns) is the same whether the window is near its speaker or at the bottom.
@@ -54,11 +55,16 @@ pub enum PanelKey {
     Down,
 }
 
-/// Where the speaker stands on the screen, in window pixels from the top left: the top of its head and its feet.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// A rectangle on the screen in window pixels from the top left: left, top, right, bottom.
+pub type Rect = (f32, f32, f32, f32);
+
+/// Where the speaker stands on the screen, in window pixels from the top left: the top of its head and its feet, and where
+/// the other people of the scene are (what the window should not hide).
+#[derive(Debug, Clone, PartialEq)]
 pub struct SpeakerSpot {
     pub head: (f32, f32),
     pub feet: (f32, f32),
+    pub others: Vec<Rect>,
 }
 
 impl SpeakerSpot {
@@ -256,26 +262,50 @@ impl Panel {
     }
 }
 
-/// Where a window `w` x `h` canvas units goes on a screen of geometry `g`: above the head of its speaker when it fits
-/// there, else below the feet when it fits there, else at the bottom of the screen like the talk window; centred on the
-/// speaker as far as the screen allows. Always inside the screen (and above the HUD's lines at the bottom) where the window
-/// is small enough to be.
+/// Where a window `w` x `h` canvas units goes on a screen of geometry `g`: near its speaker, in the first of these places that
+/// hides the least of the other people of the scene (the first of equals wins): above the head, centred on it; above it and
+/// shifted to either side; below the feet, centred and shifted; and, last, at the bottom of the screen like the talk window.
+/// Always inside the screen (and above the HUD's lines at the bottom) where the window is small enough to be. With no speaker
+/// (or one that is not a place on the screen) it is at the bottom, centred.
 pub fn place_window(g: &Geometry, w: i32, h: i32, spot: Option<&SpeakerSpot>) -> (i32, i32) {
     let bottom = ((g.cw - w) / 2, (g.floor - h).max(MARGIN));
     let Some(spot) = spot.filter(|s| s.is_finite()) else { return bottom };
     let s = g.s.max(1) as f32;
     let units = |v: f32| (v / s).round().clamp(-1.0e6, 1.0e6) as i32;
     let (head_x, head_y, feet_y) = (units(spot.head.0), units(spot.head.1), units(spot.feet.1));
-    let x = (head_x - w / 2).clamp(MARGIN, (g.cw - w - MARGIN).max(MARGIN));
+    let x_max = (g.cw - w - MARGIN).max(MARGIN);
+    let xs = [head_x - w / 2, head_x - w + w / 4, head_x - w / 4].map(|x| x.clamp(MARGIN, x_max));
     let above = head_y - GAP - h;
-    let y = if above >= MARGIN {
-        above.min((g.floor - h).max(MARGIN))
-    } else if feet_y + GAP + h <= g.floor {
-        feet_y + GAP
-    } else {
-        return bottom;
+    let below = feet_y + GAP;
+    let mut candidates: Vec<(i32, i32)> = Vec::new();
+    if above >= MARGIN {
+        candidates.extend(xs.iter().map(|&x| (x, above.min((g.floor - h).max(MARGIN)))));
+    }
+    if below + h <= g.floor {
+        candidates.extend(xs.iter().map(|&x| (x, below)));
+    }
+    candidates.push(bottom);
+    // The people the window must not hide, in canvas units (rounded outwards).
+    let outwards = |v: f32, up: bool| -> i32 {
+        let u = v / s;
+        (if up { u.ceil() } else { u.floor() }).clamp(-1.0e6, 1.0e6) as i32
     };
-    (x, y)
+    let people: Vec<(i32, i32, i32, i32)> = spot
+        .others
+        .iter()
+        .filter(|r| [r.0, r.1, r.2, r.3].iter().all(|v| v.is_finite()))
+        .map(|r| (outwards(r.0, false), outwards(r.1, false), outwards(r.2, true), outwards(r.3, true)))
+        .collect();
+    let hidden = |(x, y): (i32, i32)| -> i64 {
+        people
+            .iter()
+            .map(|&(x0, y0, x1, y1)| {
+                let (dx, dy) = ((x + w).min(x1) - x.max(x0), (y + h).min(y1) - y.max(y0));
+                if dx > 0 && dy > 0 { i64::from(dx) * i64::from(dy) } else { 0 }
+            })
+            .sum()
+    };
+    candidates.into_iter().min_by_key(|&c| hidden(c)).unwrap_or(bottom)
 }
 
 /// What a text colour looks like on the window's blue (the talk window's own table).
@@ -428,7 +458,7 @@ mod tests {
         let g = geometry(1100, 680);
         let (w, h) = (200, 40);
         // The speaker's head is at the middle of the screen, in the lower half.
-        let spot = SpeakerSpot { head: (550.0, 400.0), feet: (550.0, 480.0) };
+        let spot = SpeakerSpot { head: (550.0, 400.0), feet: (550.0, 480.0), others: vec![] };
         let (x, y) = place_window(&g, w, h, Some(&spot));
         let s = g.s as f32;
         assert_eq!(x, (550.0 / s).round() as i32 - w / 2, "centred on the speaker");
@@ -449,17 +479,63 @@ mod tests {
         let (w, h) = (200, 40);
         let s = g.s as f32;
         // A head near the top of the screen: no room above, room below the feet.
-        let high = SpeakerSpot { head: (550.0, 20.0), feet: (550.0, 120.0) };
+        let high = SpeakerSpot { head: (550.0, 20.0), feet: (550.0, 120.0), others: vec![] };
         let (_, y) = place_window(&g, w, h, Some(&high));
         assert_eq!(y, (120.0 / s).round() as i32 + GAP, "below the feet");
         // No room above and none below: the bottom, like the talk window.
-        let tall = SpeakerSpot { head: (550.0, 20.0), feet: (550.0, 700.0) };
+        let tall = SpeakerSpot { head: (550.0, 20.0), feet: (550.0, 700.0), others: vec![] };
         assert_eq!(place_window(&g, w, h, Some(&tall)), place_window(&g, w, h, None));
         // Nobody speaks (or the spot is not a place): the bottom, centred.
         let (bx, by) = place_window(&g, w, h, None);
         assert_eq!((bx, by), ((g.cw - w) / 2, g.floor - h));
-        let nowhere = SpeakerSpot { head: (f32::NAN, 1.0), feet: (1.0, 1.0) };
+        let nowhere = SpeakerSpot { head: (f32::NAN, 1.0), feet: (1.0, 1.0), others: vec![] };
         assert_eq!(place_window(&g, w, h, Some(&nowhere)), (bx, by));
+    }
+
+    /// How many canvas units of area of `people` (window pixels) the window of `size` at `at` covers.
+    fn hidden_area(g: &Geometry, at: (i32, i32), size: (i32, i32), people: &[Rect]) -> f32 {
+        let (x0, y0, x1, y1) = (at.0, at.1, at.0 + size.0, at.1 + size.1);
+        let s = g.s as f32;
+        people
+            .iter()
+            .map(|r| {
+                let (dx, dy) = ((x1 as f32).min(r.2 / s) - (x0 as f32).max(r.0 / s), (y1 as f32).min(r.3 / s) - (y0 as f32).max(r.1 / s));
+                if dx > 0.0 && dy > 0.0 { dx * dy } else { 0.0 }
+            })
+            .sum()
+    }
+
+    #[test]
+    fn a_window_does_not_hide_the_other_people_of_the_scene_when_there_is_a_place_that_does_not() {
+        let g = geometry(1100, 680);
+        let (w, h) = (140, 36);
+        // The speaker's head is at (550, 440); somebody stands up and to the left of it (so the window above, centred, covers
+        // them) and somebody up and to the right (so the window shifted that way would).
+        let left = (330.0, 330.0, 500.0, 470.0);
+        let right = (600.0, 330.0, 770.0, 470.0);
+        let spot = |others: Vec<Rect>| SpeakerSpot { head: (550.0, 440.0), feet: (550.0, 540.0), others };
+        // Nobody else: above the head, centred, exactly as before.
+        let alone = place_window(&g, w, h, Some(&spot(vec![])));
+        assert_eq!(alone.1, (440.0 / g.s as f32).round() as i32 - GAP - h);
+        // With a person in the way of the centred window, it is moved aside or below, and covers less of them than the centred one.
+        let people = vec![left];
+        let moved = place_window(&g, w, h, Some(&spot(people.clone())));
+        assert!(hidden_area(&g, moved, (w, h), &people) < hidden_area(&g, alone, (w, h), &people), "{moved:?} vs {alone:?}");
+        assert_eq!(hidden_area(&g, moved, (w, h), &people), 0.0, "there is a place that hides nobody");
+        // With a person on each side, the window goes where it hides nobody: below the speaker's feet.
+        let both = vec![left, right];
+        let below = place_window(&g, w, h, Some(&spot(both.clone())));
+        assert_eq!(hidden_area(&g, below, (w, h), &both), 0.0, "{below:?}");
+        assert!(below.1 > (540.0 / g.s as f32).round() as i32, "below the feet: {below:?}");
+        // With nowhere clear, it covers the least it can (never the speaker's own head).
+        let everywhere = vec![(0.0, 0.0, 1100.0, 600.0)];
+        let least = place_window(&g, w, h, Some(&spot(everywhere.clone())));
+        let candidates = [alone, moved, below, place_window(&g, w, h, None)];
+        assert!(candidates.iter().all(|c| hidden_area(&g, least, (w, h), &everywhere) <= hidden_area(&g, *c, (w, h), &everywhere)), "{least:?}");
+        // Everything stays on the screen.
+        for at in [alone, moved, below, least] {
+            assert!(at.0 >= MARGIN && at.0 + w <= g.cw - MARGIN && at.1 >= MARGIN && at.1 + h <= g.ch, "{at:?}");
+        }
     }
 
     #[test]
@@ -468,7 +544,7 @@ mod tests {
             let g = geometry(size.0, size.1);
             for head_x in [-500.0, 0.0, 5.0, size.0 as f32 / 2.0, size.0 as f32 - 5.0, size.0 as f32 + 900.0] {
                 for head_y in [-50.0, 0.0, 120.0, size.1 as f32 / 2.0, size.1 as f32 * 0.9, size.1 as f32 * 2.0] {
-                    let spot = SpeakerSpot { head: (head_x, head_y), feet: (head_x, head_y + 80.0) };
+                    let spot = SpeakerSpot { head: (head_x, head_y), feet: (head_x, head_y + 80.0), others: vec![] };
                     let (w, h) = (150, 36);
                     let (x, y) = place_window(&g, w, h, Some(&spot));
                     assert!(x >= MARGIN && x + w <= g.cw - MARGIN, "{size:?} head ({head_x},{head_y}): x {x} w {w} of {}", g.cw);
