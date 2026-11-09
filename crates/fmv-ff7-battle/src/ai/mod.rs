@@ -155,6 +155,12 @@ pub enum Change {
     Defense { actor: ActorId, value: u32 },
     /// Set the magical defense rating of `actor`.
     MagicDefense { actor: ActorId, value: u32 },
+    /// Set the physical evasion of `actor`.
+    Evade { actor: ActorId, value: u32 },
+    /// Set the physical attack strength of `actor`.
+    Attack { actor: ActorId, value: u32 },
+    /// Set the magical attack strength of `actor`.
+    MagicAttack { actor: ActorId, value: u32 },
 }
 
 /// What an enemy's turn came to when a script ran it.
@@ -264,14 +270,12 @@ fn changes_of(effects: &[Effect], world: &BattleWorld<'_>) -> Option<Vec<Change>
     effects
         .iter()
         .map(|effect| {
-            let (slot, change): (u8, fn(ActorId, u32) -> Change) = match *effect {
-                Effect::Defense { slot, .. } => (slot, |actor, value| Change::Defense { actor, value }),
-                Effect::MagicDefense { slot, .. } => {
-                    (slot, |actor, value| Change::MagicDefense { actor, value })
-                }
-            };
-            let value = match *effect {
-                Effect::Defense { value, .. } | Effect::MagicDefense { value, .. } => value,
+            let (slot, value, change): (u8, u32, fn(ActorId, u32) -> Change) = match *effect {
+                Effect::Defense { slot, value } => (slot, value, |actor, value| Change::Defense { actor, value }),
+                Effect::MagicDefense { slot, value } => (slot, value, |actor, value| Change::MagicDefense { actor, value }),
+                Effect::Evade { slot, value } => (slot, value, |actor, value| Change::Evade { actor, value }),
+                Effect::Attack { slot, value } => (slot, value, |actor, value| Change::Attack { actor, value }),
+                Effect::MagicAttack { slot, value } => (slot, value, |actor, value| Change::MagicAttack { actor, value }),
             };
             let idx = world.slots().actor_of(slot)?;
             Some(change(ActorId(u8::try_from(idx).ok()?), value))

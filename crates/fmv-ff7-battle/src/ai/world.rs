@@ -32,6 +32,7 @@
 //! | `0x4040` | actor index | the slot |
 //! | `0x4048` | level | |
 //! | `0x4060` | character id + `0x10` for a party member (by its name), the instance for an enemy | a party member that is not one of the nine characters has none |
+//! | `0x4068`, `0x4070`, `0x4078` (byte) | physical attack strength, magical attack strength, physical evasion | the stats the actor was built with (an enemy's strength, magic and evade; a party member's Strength + weapon, Magic and armor evade, cut to a byte); a script can write them for its own actor ([`super::vm::Effect`]) |
 //! | `0x4120` (word) | "Index of actor": the enemy's id in `scene.bin` | see below |
 //! | `0x40A0`, `0x40A8` | Dexterity, Luck | |
 //! | `0x40D0`, `0x40E0`, `0x40F0` (word) | the slot mask of the last actor that acted on this one at all, physically, magically | an enemy's own record of who hit it ([`super::vm::Memory::note_hit`], set by the engine before the counters run); 0 for a party member and for nobody yet |
@@ -147,6 +148,10 @@ struct Fields {
     last_magical: u16,
     dex: u8,
     luck: u8,
+    /// Physical and magical attack strength and physical evasion (bytes, the stats the actor was built with).
+    attack: u8,
+    magic: u8,
+    evade: u8,
     defense: u16,
     magic_defense: u16,
     mp: u16,
@@ -181,6 +186,9 @@ impl Fields {
             last_magical: c.ai.as_ref().map_or(0, |ai| ai.memory().last_magical_attacker()),
             dex: clamp8(c.dex),
             luck: clamp8(c.luck),
+            attack: clamp8(c.attack),
+            magic: clamp8(c.magic),
+            evade: clamp8(c.evade),
             defense: clamp16(c.defense),
             magic_defense: clamp16(c.magic_defense),
             mp: clamp16(c.mp),
@@ -206,6 +214,9 @@ impl Fields {
         if let Some(id) = self.id {
             img.put_le(0x0C, 1, u32::from(id));
         }
+        img.put_le(0x0D, 1, u32::from(self.attack));
+        img.put_le(0x0E, 1, u32::from(self.magic));
+        img.put_le(0x0F, 1, u32::from(self.evade));
         img.put_le(0x14, 1, u32::from(self.dex));
         img.put_le(0x15, 1, u32::from(self.luck));
         img.put_le(0x1A, 2, u32::from(self.last_attacker));
@@ -415,6 +426,9 @@ mod tests {
             (0x4040, 1),
             (0x4048, 1),
             (0x4060, 1),
+            (0x4068, 1),
+            (0x4070, 1),
+            (0x4078, 1),
             (0x4120, 2),
             (0x40A0, 1),
             (0x40A8, 1),
@@ -430,7 +444,7 @@ mod tests {
         for (addr, size) in [
             (0x4021u16, 0u8), // "ally of current actor": not modelled
             (0x4020, 1),      // a whole flag byte: some of its bits are unknown
-            (0x4068, 1),
+            (0x4090, 1),
             (0x4999, 2),
             (0x2060, 2), // not an actor field
         ] {
@@ -448,6 +462,9 @@ mod tests {
         foe.mp = 12;
         foe.max_mp = 20;
         foe.magic_defense = 44;
+        foe.attack = 30;
+        foe.magic = 12;
+        foe.evade = 7;
         foe.enemy_id = Some(57);
         let mut hound = Combatant::new("Hound", 5, 60);
         hound.hp = 0;
@@ -547,6 +564,11 @@ mod tests {
         assert_eq!(w.actor_field(1, 0x4060, 1), None);
         assert_eq!(w.actor_field(4, 0x4060, 1), Some(0));
         assert_eq!(w.actor_field(5, 0x4060, 1), Some(1));
+        // Attack strength, magic and evasion are the stats the combatant has (cut to a byte).
+        assert_eq!(w.actor_field(4, 0x4068, 1), Some(30));
+        assert_eq!(w.actor_field(4, 0x4070, 1), Some(12));
+        assert_eq!(w.actor_field(4, 0x4078, 1), Some(7));
+        assert_eq!(w.actor_field(0, 0x4068, 1), Some(0));
         // "Index of actor" is the id of the enemy record; a party member and a combatant that was not made
         // from a scene have the id no enemy has. "Immune to Death" is clear for everyone the battle knows.
         assert_eq!(w.actor_field(4, 0x4120, 2), Some(57));

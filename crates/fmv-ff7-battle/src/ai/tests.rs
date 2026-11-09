@@ -72,7 +72,7 @@ fn a_script_that_cannot_be_followed_gives_no_turn() {
         ("divide by zero", Asm::default().k1(1).k1(0).op(op::DIV).op(op::END)),
         ("endless loop", Asm::default().jump(op::JUMP, 0)),
         ("runs off the end", Asm::default().k1(1)),
-        ("unmodelled field", Asm::act_on(|a| a.val(2, 0x20A0).val(2, 0x4068).op(op::MASK), ATTACK)),
+        ("unmodelled field", Asm::act_on(|a| a.val(2, 0x20A0).val(2, 0x4090).op(op::MASK), ATTACK)),
         ("too many actions", {
             let one = Asm::default().k1(0x20).k2(ATTACK).op(op::ACT);
             Asm([one.0.repeat(vm::MAX_ACTIONS + 1), vec![op::END]].concat())
@@ -331,6 +331,25 @@ fn initialize_called_directly_reports_what_it_would_do() {
             actor: ActorId(FOE as u8),
             value: 9
         }]
+    );
+}
+
+#[test]
+fn an_initialize_script_may_change_the_attack_magic_and_evasion_of_its_enemy() {
+    let set = |addr: u16, v: u8| Asm::default().addr(2, 0x2060).addr(1, addr).op(op::MASK).k1(v).op(op::STORE);
+    let init = set(0x4078, 90).then(&set(0x4068, 77)).then(&set(0x4070, 33)).op(op::END);
+    let state = battle_of(1, vec![scripted_foe(Some(&init), &weakest(ATTACK))]);
+    let foe = &state.actors()[FOE];
+    assert_eq!((foe.evade, foe.attack, foe.magic), (90, 77, 33), "the battle applies what Initialize wrote");
+    assert_eq!(memory_of(&state, FOE).phase, Phase::Ready);
+    let started = initialize(&state, FOE, &mut Rng::new(1)).unwrap();
+    assert_eq!(
+        started.changes,
+        vec![
+            Change::Evade { actor: ActorId(FOE as u8), value: 90 },
+            Change::Attack { actor: ActorId(FOE as u8), value: 77 },
+            Change::MagicAttack { actor: ActorId(FOE as u8), value: 33 },
+        ]
     );
 }
 

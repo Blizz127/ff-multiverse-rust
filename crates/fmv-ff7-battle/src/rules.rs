@@ -1665,6 +1665,21 @@ impl BattleState {
                         c.magic_defense = value;
                     }
                 }
+                crate::ai::Change::Evade { actor, value } => {
+                    if let Some(c) = self.actors.get_mut(usize::from(actor.0)) {
+                        c.evade = value;
+                    }
+                }
+                crate::ai::Change::Attack { actor, value } => {
+                    if let Some(c) = self.actors.get_mut(usize::from(actor.0)) {
+                        c.attack = value;
+                    }
+                }
+                crate::ai::Change::MagicAttack { actor, value } => {
+                    if let Some(c) = self.actors.get_mut(usize::from(actor.0)) {
+                        c.magic = value;
+                    }
+                }
             }
         }
     }

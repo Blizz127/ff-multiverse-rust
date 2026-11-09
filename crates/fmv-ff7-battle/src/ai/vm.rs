@@ -87,6 +87,12 @@ pub const ADDR_IMMUNE_DEATH: u16 = 0x402C;
 pub const ADDR_DEFENSE: u16 = 0x4100;
 /// Address of the magical defense rating.
 pub const ADDR_MAGIC_DEFENSE: u16 = 0x4110;
+/// Address of the physical attack strength (a byte).
+pub const ADDR_ATTACK: u16 = 0x4068;
+/// Address of the magical attack strength (a byte).
+pub const ADDR_MAGIC_ATTACK: u16 = 0x4070;
+/// Address of the physical evasion (a byte).
+pub const ADDR_EVADE: u16 = 0x4078;
 /// First actor-specific address.
 pub const FIRST_FIELD: u16 = 0x4000;
 /// The action command that performs an enemy attack.
@@ -380,6 +386,12 @@ pub enum Effect {
     Defense { slot: u8, value: u32 },
     /// Set the magical defense rating of the actor in `slot`.
     MagicDefense { slot: u8, value: u32 },
+    /// Set the physical evasion of the actor in `slot` (Zemzelett and Griffin raise it while they fly).
+    Evade { slot: u8, value: u32 },
+    /// Set the physical attack strength of the actor in `slot` (Golem raises it as it winds up).
+    Attack { slot: u8, value: u32 },
+    /// Set the magical attack strength of the actor in `slot`.
+    MagicAttack { slot: u8, value: u32 },
 }
 
 /// The attack a script queued.
@@ -559,6 +571,15 @@ impl Vm<'_> {
                 let v = trunc(v, size);
                 self.overrides.insert((slot, addr), v);
                 self.out.effects.push(Effect::MagicDefense { slot, value: v });
+            }
+            ADDR_EVADE | ADDR_ATTACK | ADDR_MAGIC_ATTACK => {
+                let v = trunc(v, size);
+                self.overrides.insert((slot, addr), v);
+                self.out.effects.push(match addr {
+                    ADDR_EVADE => Effect::Evade { slot, value: v },
+                    ADDR_ATTACK => Effect::Attack { slot, value: v },
+                    _ => Effect::MagicAttack { slot, value: v },
+                });
             }
             _ => return Err(AiError::Address(addr)),
         }
@@ -1014,6 +1035,9 @@ pub fn unsupported_address(insn: &Insn, field_known: impl Fn(u16, u8) -> bool) -
                         | ADDR_IMMUNE_DEATH
                         | ADDR_DEFENSE
                         | ADDR_MAGIC_DEFENSE
+                        | ADDR_EVADE
+                        | ADDR_ATTACK
+                        | ADDR_MAGIC_ATTACK
                 )
             }
         }
@@ -1083,6 +1107,9 @@ mod tests {
                 (0x4160, 3) => Some(hp),
                 (0x4026, 0) => Some(u32::from(self.back >> slot & 1)),
                 (0x4100, 2) => Some(30 + u32::from(slot)),
+                (0x4078, 1) => Some(25),
+                (0x4068, 1) => Some(40),
+                (0x4070, 1) => Some(9),
                 _ => None,
             }
         }
@@ -1425,6 +1452,55 @@ mod tests {
             .op(op::STORE)
             .op(op::END);
         assert_eq!(go(&unknown), Err(AiError::Address(0x4160)));
+    }
+
+    #[test]
+    fn an_actors_attack_magic_and_evasion_are_effects_its_script_can_write_and_read_back() {
+        // me.evade = me.evade + 10 (25 + 10); me.attack = 90; me.magic = 5; then targets = me.evade.
+        let asm = Asm::default()
+            .addr(2, 0x2060)
+            .addr(1, 0x4078)
+            .op(op::MASK)
+            .val(2, 0x2060)
+            .val(1, 0x4078)
+            .op(op::MASK)
+            .k1(10)
+            .op(op::ADD)
+            .op(op::STORE)
+            .addr(2, 0x2060)
+            .addr(1, 0x4068)
+            .op(op::MASK)
+            .k1(90)
+            .op(op::STORE)
+            .addr(2, 0x2060)
+            .addr(1, 0x4070)
+            .op(op::MASK)
+            .k1(5)
+            .op(op::STORE)
+            .addr(2, 0x2070)
+            .val(2, 0x2060)
+            .val(1, 0x4078)
+            .op(op::MASK)
+            .op(op::STORE)
+            .k1(0x20)
+            .k2(1)
+            .op(op::ACT)
+            .op(op::END);
+        let out = go(&asm).unwrap();
+        assert_eq!(
+            out.effects,
+            vec![
+                Effect::Evade { slot: 4, value: 35 },
+                Effect::Attack { slot: 4, value: 90 },
+                Effect::MagicAttack { slot: 4, value: 5 },
+            ]
+        );
+        assert_eq!(out.actions[0].targets, 35, "the value read back is the written one");
+        // Only the owner's own stats can be written.
+        for addr in [0x4078u16, 0x4068, 0x4070] {
+            let other = Asm::default().k1(1).addr(1, addr).op(op::MASK).k1(1).op(op::STORE).op(op::END);
+            assert_eq!(go(&other), Err(AiError::Address(addr)), "{addr:#06x}");
+        }
     }
 
     #[test]
