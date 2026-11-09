@@ -368,6 +368,20 @@ synthetic FIXTURE rooms (`fmv-server --game fixture-rooms`, `fmv-client --game f
 --name X`: a hall and a yard joined by an exit each way, with one NPC in the yard; **not FF7**) and
 needs no owned data.
 
+Story phasing: every account has one story progression per game (the opaque `Progression` blob; an
+account that never advanced has none, which is a new account) and the world keeps one instance of a
+field per story phase, so players only see the players of their own instance. Solo, a player is in
+the instance of its own phase; in a party, in its leader's, keeping its own progression. For FF7 the
+progression is the main story counter `Var[2][0]` (`crates/fmv-ff7/src/story.rs`): each field's
+phases are the intervals of the values its own scripts compare it against, every new account is the
+empty phase of every field, and the story advances where the field's own script says it does and the
+server can see it: in `md1stin` a player's character stepping onto walkmesh triangle 12 while the counter
+is 1 sets it to 6 (the server logs `story advanced account=<n> entity=<n> area=Ff7/md1stin point=0
+moment=1->6`; the script's battle after it is not run). A headless bot does it with `fmv-client
+--headless --story-advance`. `scripts/phase-smoke.sh` runs it against your own library (read-only,
+throw-away state): A advances and B does not, so they stop seeing each other; B joins A's party and is
+placed in A's instance; the server restarts, both log in again, and the phases persisted.
+
 Area travel is what **protocol v4** adds to v3: a v3 client does not know `AreaChange`, so the
 version was bumped and a server refuses a v3 client at the handshake with a clear
 `ProtocolMismatch` reject (instead of losing it at the first exit it crosses). Both sides must be
@@ -621,6 +635,7 @@ scripts/ff-multiverse.sh the launcher entry point shipped in the package (docs/L
 scripts/smoke.sh         two-bot local smoke test
 scripts/battle-smoke.sh  shared-battle smoke test (real data; modes --fixture --random --progress --commands)
 scripts/travel-smoke.sh  walking between fields: two bots, md1stin -> md1_1 and back (real data)
+scripts/phase-smoke.sh   story phasing: A advances md1stin's story and B does not, party, restart, persist (real data)
 deploy/                  systemd user unit template and deployment procedure
 docs/LAUNCHER.md         the package as an owner-only launcher port: layout, entry point, data dir
 IMPLEMENTATION-PLAN.md   first-milestone plan and design constraints

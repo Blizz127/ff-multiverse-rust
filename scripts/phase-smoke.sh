@@ -335,8 +335,10 @@ run_phase() {
   if ((${#PROBLEMS[@]})); then
     finish_failed
   fi
+  say "client A run 1: $smoke_a"
+  say "client B run 1: $smoke_b"
   for n in A B; do
-    say "client $n run 1: ${SMOKE[$n]:-}"
+    say "client $n run 2: ${SMOKE[$n]:-}"
   done
   say "A placements: ${pa[*]}"
   say "B placements: ${pb[*]}"
