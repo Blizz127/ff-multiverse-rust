@@ -52,7 +52,8 @@
 //! are `ff7/body/<archetype>`; [`resolve_model`] reads them next to the canon ids, while the canon
 //! table above stays exactly the eight cast members and [`resolve_appearance`] knows nothing of the
 //! bodies. At most four bodies are offered, because the client keeps at most 32 models in its GPU
-//! cache and 24 NPC models.
+//! cache: the eight canon characters and up to four bodies are the players' share, which leaves 20
+//! for the area's non-player characters.
 //!
 //! **Derived from the same owned copy on 2026-11-09 and verified by the ignored test
 //! `placeholder_bodies_match_the_field_loaders` in `tests/real_data.rs`.** The survey went over all

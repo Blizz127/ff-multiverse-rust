@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/battle-smoke.sh - shared-battle smoke test for fmv-server + fmv-client (protocol v7).
+# scripts/battle-smoke.sh - shared-battle smoke test for fmv-server + fmv-client (protocol v8).
 #
 # Usage: scripts/battle-smoke.sh [--fixture|--random|--progress|--commands] [--release|--debug]
 #                                [--bin-dir DIR] [--build] [--library STATE_DIR] [--duration SECS]
