@@ -519,21 +519,23 @@ async fn a_member_who_left_mid_battle_is_still_paid_in_the_store() {
     again.shutdown().await;
 }
 
-/// The reason for v5, v6, v7, v8, v9 and again for v10: a client of the version before is refused at the handshake,
+/// The reason for v5, v6, v7, v8, v9, v10 and again for v11: a client of the version before is refused at the handshake,
 /// with the version in the reason, instead of being sent a message it cannot decode (v5: the progress
 /// that follows every join; v6: the inventory that follows it, and the new battle events; v7: the limit
 /// and escape commands, events and outcome, and the limit gauge of every battle member; v8: its Hello has no character,
 /// so the server cannot even read it, and its roster members have no names; v9: its Hello is still a Hello, so only
 /// the version refuses it, and the roster of its first battle would have members it cannot read; v10: its Hello is
 /// still a Hello too, and the target of its first spell, item or limit would be a bare actor, which a v10 server does
-/// not read as a target, while a v9 client could not read the whole sides a v10 server announces).
+/// not read as a target, while a v9 client could not read the whole sides a v10 server announces; v11: nothing it would
+/// be sent is new, but its engine picks the enemies' moves without their AI scripts, so its replay of the first battle
+/// would diverge from the server's at the first enemy turn).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_client_of_the_previous_protocol_version_is_refused_at_the_handshake() {
-    assert_eq!(PROTOCOL_VERSION, 10);
+    assert_eq!(PROTOCOL_VERSION, 11);
     let server = TestServer::start(fast(None)).await;
-    for old_version in [9u16, 8, 7, 6, 5, 4] {
+    for old_version in [10u16, 9, 8, 7, 6, 5, 4] {
         let mut old = Client::connect(server.addr).await;
-        // A v8 or v9 Hello asks for a character (and reads as a v10 Hello); the older ones carried a colour and a look.
+        // A v8, v9 or v10 Hello asks for a character (and reads as a v11 Hello); the older ones carried a colour and a look.
         let hello = if old_version >= 8 {
             format!(
                 r#"{{"Hello":{{"protocol_version":{old_version},"client_build":"old","auth":{{"Register":{{"display_name":"Old{old_version}"}}}},"character":{{"tint":[1,2,3],"body":null,"slot":null}}}}}}"#

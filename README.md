@@ -556,8 +556,10 @@ is written when the server stops).
 next turn). The engine (`fmv-ff7-battle`) plays them with FF7's own formulas decoded from the
 owner's `kernel.bin` (spell, Cure, Life/Phoenix Down, potion and Grenade formulas; elemental
 weakness, resistance, nullify, absorb and full-heal from `scene.bin`), and the enemies use their own
-`scene.bin` attacks (a uniform pick among the damaging ones they have the MP for; the original's AI
-scripts are not decoded). Spells: the magic materia a character's starting record equips, plus a
+`scene.bin` attacks, chosen by their own AI scripts since protocol v11 (`fmv_ff7_battle::ai`: a bounded
+interpreter of the scripts, with counters after a blow, such as Guard Scorpion's tail-up Tail Laser; anything it
+cannot follow falls back, for that turn, to a uniform pick among the damaging attacks the enemy has the MP
+for). Spells: the magic materia a character's starting record equips, plus a
 starter grimoire every character is given (Restore, Fire, Ice and Lightning at level 1: Cure, Fire,
 Ice, Bolt), because on the Steam copy only Cloud and Red XIII start with magic materia. **The engine
 knows no inventory**: the server checks the account owns the item, submits the command and takes the
@@ -883,6 +885,12 @@ with a v10 reader and the other way round and fails on purpose, and a real socke
 older version). **Rolling back v10:** v10 writes nothing a v9 build cannot read: the All materia uses of a battle are
 engine state derived from the player's own data and nothing stores them, so roll the server back to a v9 build on the
 same state directory (and the clients with it: a v9 client is refused by a v10 server and the other way round).
+
+**Protocol v11** changes no message, event or stored record: it is the version of the ENGINE that every peer replays a
+battle with. Since v11 the enemies act by their own `scene.bin` AI scripts (see "Battle commands and items" above), and a
+v10 engine would pick different enemy moves from the same seed, so its replay would diverge at the first enemy turn: a
+v10 client or server is refused at the handshake instead (the real socket test refuses v10 and every older version).
+**Rolling back v11:** nothing it stores is new, so point the server and the clients back at a v10 build together.
 
 ## Importing your own FF7 data
 
