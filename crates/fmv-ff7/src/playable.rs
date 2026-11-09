@@ -646,29 +646,3 @@ mod tests {
         assert!(matches!(load_playable(&mut lgp, &missing), Err(ModelError::Missing { .. })));
     }
 }
-
-// ---- STUB-SW-PC: temporary stand-in for the helper's placeholder bodies (NOT to be committed) ----
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PlaceholderBody {
-    pub archetype: &'static str,
-    pub label: &'static str,
-    pub model: PlayableModel,
-    pub run_is_walk: bool,
-}
-pub const PLACEHOLDER_BODIES: &[PlaceholderBody] = &[
-    PlaceholderBody { archetype: "sturdy", label: "Sturdy", model: PlayableModel { appearance_ref: "ff7/body/sturdy", display_name: "Sturdy", hrc: "aagb", idle_anim: "abcd", walk_anim: "abce", run_anim: "abcf" }, run_is_walk: false },
-    PlaceholderBody { archetype: "slim", label: "Slim", model: PlayableModel { appearance_ref: "ff7/body/slim", display_name: "Slim", hrc: "acgd", idle_anim: "adcb", walk_anim: "adcc", run_anim: "adcd" }, run_is_walk: false },
-    PlaceholderBody { archetype: "tall", label: "Tall", model: PlayableModel { appearance_ref: "ff7/body/tall", display_name: "Tall", hrc: "aaaa", idle_anim: "acfe", walk_anim: "aaff", run_anim: "aaga" }, run_is_walk: false },
-];
-pub const DEFAULT_BODY: &str = "sturdy";
-pub fn resolve_body(archetype: &str) -> Option<PlaceholderBody> {
-    let wanted = archetype.trim();
-    PLACEHOLDER_BODIES.iter().find(|b| b.archetype.eq_ignore_ascii_case(wanted)).copied()
-}
-pub fn resolve_model(appearance_ref: &str) -> Option<PlayableModel> {
-    let wanted = appearance_ref.trim();
-    resolve_appearance(wanted).or_else(|| PLACEHOLDER_BODIES.iter().find(|b| b.model.appearance_ref.eq_ignore_ascii_case(wanted)).map(|b| b.model))
-}
-pub fn body_or_default(archetype: Option<&str>) -> PlaceholderBody {
-    archetype.and_then(resolve_body).or_else(|| resolve_body(DEFAULT_BODY)).unwrap_or(PLACEHOLDER_BODIES[0])
-}
