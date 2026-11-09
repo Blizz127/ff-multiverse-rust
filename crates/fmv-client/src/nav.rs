@@ -220,12 +220,34 @@ fn has_better(nodes: &HashMap<Key, Node>, c: (i64, i64), z: f32, g: f32, reach: 
 /// and the first node, and between the last node and the last waypoint, are held to a lower standard
 /// (no clearance): the endpoints may well stand next to a wall.
 pub fn plan_path_avoiding(area: &dyn AreaRuntime, from: Pos, to: Pos, forbidden: Forbidden<'_>) -> Option<Vec<Pos>> {
+    plan(area, from, to, None, forbidden)
+}
+
+/// How far (in height) the end of a plan made by [`plan_path_at`] may be from the goal's height: a level of the
+/// surface (the turns of a stair are hundreds of units apart, the surface under one spot of a level varies by a few
+/// tens at most).
+pub const GOAL_LEVEL_TOLERANCE: f32 = 60.0;
+
+/// [`plan_path_avoiding`] for a goal whose height matters: the walker must END on the level of `to` (its height, within
+/// [`GOAL_LEVEL_TOLERANCE`]), not just at its x and y. The foot of a ladder is a place on one level of a surface that
+/// has several over the same spot; a plan that got to the right x and y on the wrong level is no plan to it.
+pub fn plan_path_at(area: &dyn AreaRuntime, from: Pos, to: Pos, forbidden: Forbidden<'_>) -> Option<Vec<Pos>> {
+    plan(area, from, to, Some(GOAL_LEVEL_TOLERANCE), forbidden)
+}
+
+/// Does a walk that ended at `end` end where the goal `to` wants (`level`: the height tolerance, or `None` when only x
+/// and y count)?
+fn level_ok(level: Option<f32>, to: Pos, end: Pos) -> bool {
+    level.is_none_or(|tolerance| (end.z - to.z).abs() <= tolerance)
+}
+
+fn plan(area: &dyn AreaRuntime, from: Pos, to: Pos, level: Option<f32>, forbidden: Forbidden<'_>) -> Option<Vec<Pos>> {
     if !(from.is_finite() && to.is_finite()) {
         return None;
     }
     // Straight is best when it works (with clearance, so it is also what the server accepts).
     let clearance = TIERS.first().and_then(|t| Grid::new(area, *t)).map_or(0.0, |g| g.margin);
-    if segment_walkable(area, from, to, clearance, forbidden).is_some() {
+    if segment_walkable(area, from, to, clearance, forbidden).is_some_and(|end| level_ok(level, to, end)) {
         return Some(vec![from, to]);
     }
     // The coarsest grid that has a way. (A small area has the same grid for several tiers: it is searched once.)
@@ -236,7 +258,7 @@ pub fn plan_path_avoiding(area: &dyn AreaRuntime, from: Pos, to: Pos, forbidden:
             continue;
         }
         tried = Some((grid.cell, grid.margin));
-        if let Some(plan) = plan_on(&grid, from, to, forbidden) {
+        if let Some(plan) = plan_on(&grid, from, to, level, forbidden) {
             return Some(plan);
         }
     }
@@ -244,7 +266,7 @@ pub fn plan_path_avoiding(area: &dyn AreaRuntime, from: Pos, to: Pos, forbidden:
 }
 
 /// The search on one grid: A* over the nodes of every level, then string pulling.
-fn plan_on(grid: &Grid<'_>, from: Pos, to: Pos, forbidden: Forbidden<'_>) -> Option<Vec<Pos>> {
+fn plan_on(grid: &Grid<'_>, from: Pos, to: Pos, level: Option<f32>, forbidden: Forbidden<'_>) -> Option<Vec<Pos>> {
     let area = grid.area;
     let mut nodes: HashMap<Key, Node> = HashMap::new();
     let mut unclear: HashSet<Key> = HashSet::new();
@@ -287,7 +309,7 @@ fn plan_on(grid: &Grid<'_>, from: Pos, to: Pos, forbidden: Forbidden<'_>) -> Opt
             continue; // a way to this node that was beaten after it was queued
         }
         // Near the goal: the last leg is the weaker test (no clearance); a node it does not work from is just a node.
-        if node.pos.dist_xy(to) <= goal_reach && segment_walkable(area, node.pos, to, 0.0, forbidden).is_some() {
+        if node.pos.dist_xy(to) <= goal_reach && segment_walkable(area, node.pos, to, 0.0, forbidden).is_some_and(|end| level_ok(level, to, end)) {
             goal = Some(key);
             break;
         }
@@ -341,7 +363,7 @@ fn plan_on(grid: &Grid<'_>, from: Pos, to: Pos, forbidden: Forbidden<'_>) -> Opt
     let last = pts.len() - 1;
     let leg = |i: usize, j: usize, margin: f32| -> Option<bool> {
         let (a, b) = (*pts.get(i)?, *pts.get(j)?);
-        Some(segment_walkable(area, a, b, margin, forbidden).is_some_and(|end| j == last || (end.z - b.z).abs() <= SAME_LEVEL))
+        Some(segment_walkable(area, a, b, margin, forbidden).is_some_and(|end| if j == last { level_ok(level, to, end) } else { (end.z - b.z).abs() <= SAME_LEVEL }))
     };
     let mut waypoints = vec![from];
     let mut anchor = 0usize;

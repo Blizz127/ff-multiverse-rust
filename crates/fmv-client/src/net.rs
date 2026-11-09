@@ -245,6 +245,9 @@ impl AreaAnswer {
 #[derive(Debug, Clone)]
 pub enum NetCommand {
     Intent(Intent),
+    /// The player pressed OK (`ClientMsg::Interact`): the character it addressed, if any (the `id` of an
+    /// `NpcView`, which is the index in the area's NPC list the server gave).
+    Interact { npc: Option<u32> },
     Party(PartyCommand),
     Battle(BattleCmd),
     /// The answer to an `AreaChange`.
@@ -751,6 +754,7 @@ async fn session_loop<R, W>(
         let msg = tokio::select! {
             cmd = cmd_rx.recv() => match cmd {
                 Some(NetCommand::Intent(i)) => ClientMsg::MoveIntent { seq: i.seq, pos: i.pos, facing: i.facing, anim: i.anim },
+                Some(NetCommand::Interact { npc }) => ClientMsg::Interact { npc },
                 Some(NetCommand::Party(p)) => p.to_msg(),
                 Some(NetCommand::Battle(b)) => b.to_msg(),
                 Some(NetCommand::Area(a)) => a.into_msg(),

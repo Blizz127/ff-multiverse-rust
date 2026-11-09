@@ -561,3 +561,141 @@ fn closing_by_hand_closes() {
     talk.draw(1100, 680, 0.0, &mut list);
     assert!(list.is_empty(), "nothing is drawn while closed");
 }
+
+// ---- OK is a press the server hears of -----------------------------------------------------------
+
+#[test]
+fn a_fresh_ok_in_the_field_is_a_press_that_names_the_character_it_talked_to_and_nobody_else() {
+    let npcs = [npc(0, "gu0", 60.0, 0.0), npc(1, "mute", 20.0, 5.0)];
+    let (mut talk, _) = talk_with(vec![("gu0", vec![lines(1), lines(1)])]);
+    let a = around(&npcs, (0.0, 0.0), 0.0);
+    // facing the character that has something to say: the key opens its dialogue and the press names it
+    assert!(press(&mut talk, KeyCode::Enter, &a));
+    assert_eq!(talk.take_press(), Some(Some(0)));
+    assert_eq!(talk.take_press(), None, "a press is taken once");
+    // paging through the dialogue is not a press
+    assert!(press(&mut talk, KeyCode::Space, &a));
+    assert_eq!(talk.take_press(), None);
+    assert!(press(&mut talk, KeyCode::Enter, &a) && !talk.is_open());
+    assert_eq!(talk.take_press(), None, "the key that ended the conversation is not a press either");
+    // nobody in reach: the key is not the dialogue's, and it is a press where the player stands (a ladder, a panel)
+    let far = [npc(0, "gu0", 600.0, 0.0)];
+    assert!(!press(&mut talk, KeyCode::Enter, &around(&far, (0.0, 0.0), 0.0)));
+    assert_eq!(talk.take_press(), Some(None));
+    // a character that has nothing to say does not take the press away from the player's feet
+    let mute = [npc(1, "mute", 20.0, 5.0)];
+    assert!(!press(&mut talk, KeyCode::Enter, &around(&mute, (0.0, 0.0), 0.0)));
+    assert_eq!(talk.take_press(), Some(None));
+    // nothing else is a press: a key held (repeating), a release, another key, the battle's Enter
+    assert!(!talk.key(KeyCode::Enter, true, true, &a));
+    assert_eq!(talk.take_press(), None, "a repeat of a held key");
+    assert!(!talk.key(KeyCode::Enter, false, false, &a));
+    assert_eq!(talk.take_press(), None, "a release");
+    assert!(!talk.key(KeyCode::KeyW, true, false, &a));
+    assert_eq!(talk.take_press(), None);
+    let blocked = Around { blocked: true, ..a };
+    assert!(!talk.key(KeyCode::Enter, true, false, &blocked));
+    assert_eq!(talk.take_press(), None, "a battle owns Enter");
+}
+
+/// Conversations that remember the story each one was started with (the moment it read as `Var[2][0]`).
+struct Remembers {
+    started: Rc<RefCell<Vec<(String, u16)>>>,
+    story: ff7::StoryFactory,
+}
+
+fn moment_of(vars: &dyn fmv_ff7::script::dialogue::StoryVars) -> u16 {
+    u16::from_le_bytes([vars.byte(2, 0), vars.byte(2, 1)])
+}
+
+impl Conversations for Remembers {
+    fn talk_radius(&mut self, _area: &str, _npc: &NpcView) -> f32 {
+        80.0
+    }
+
+    fn start(&mut self, _area: &str, npc: &NpcView) -> Option<Box<dyn MessageSource>> {
+        let vars = (self.story)();
+        self.started.borrow_mut().push((npc.name.clone(), moment_of(vars.as_ref())));
+        Some(Box::new(Reads { vars, said: 0 }))
+    }
+
+    fn set_story(&mut self, story: ff7::StoryFactory) {
+        self.story = story;
+    }
+}
+
+/// A conversation of two windows, each saying the moment its story had when the conversation started.
+struct Reads {
+    vars: Box<dyn fmv_ff7::script::dialogue::StoryVars>,
+    said: u32,
+}
+
+impl MessageSource for Reads {
+    fn next(&mut self, _answer: Option<usize>) -> Beat {
+        self.said += 1;
+        if self.said > 2 {
+            return Beat::End(End::Finished);
+        }
+        Beat::Message(canon(vec![text(&format!("moment {}", moment_of(self.vars.as_ref())))]))
+    }
+}
+
+#[test]
+fn the_talk_a_press_opens_reads_the_story_before_the_step_the_press_makes_and_the_next_talk_the_story_after() {
+    use fmv_core::{AccountId, AreaId, EntityId, GameId};
+    use fmv_ff7::story::StoryState;
+    use fmv_protocol::{NpcSnapshot, ServerMsg, StoryAdvance};
+
+    let area = AreaId { game: GameId::Fixture, key: "nmkin_3".into() };
+    let started: Rc<RefCell<Vec<(String, u16)>>> = Rc::default();
+    let mut talk = Talk::new(Box::new(Remembers { started: Rc::clone(&started), story: ff7::story_of(None) }));
+    let mut state = ClientState::new(EntityId(1), AccountId(1), Pos::new(0.0, 0.0, 0.0), area.clone());
+    // the area's snapshot names the woman 60 units in front of us; the server has told us the story stands at 13
+    let woman = NpcSnapshot { id: 3, name: "woman".into(), model: "aaaa".into(), idle_animation: None, pos: Pos::new(60.0, 0.0, 0.0), facing: 0.0 };
+    state.apply(0.0, ServerMsg::AreaSnapshot { area, tick: 0, entities: vec![], npcs: vec![woman] });
+    state.story.on_update(StoryState::at(13).encode(), None);
+    let shown = |talk: &Talk| {
+        let mut list = DrawList::new();
+        talk.draw(1100, 680, 0.0, &mut list);
+        list
+    };
+
+    // The key builds the conversation NOW, from the story as the mirror has it (13), and reports the press that the
+    // window sends to the server afterwards.
+    let key = field_key(&mut talk, &state, "nmkin_3", 0.0, KeyCode::Enter, true, false);
+    assert_eq!(key, FieldKey { consumed: true, interact: Some(Some(3)) });
+    assert_eq!(*started.borrow(), [("woman".to_string(), 13)]);
+    assert!(shown(&talk).says("moment 13"));
+
+    // The server answers the press with the step, and the mirror moves on: the conversation that is open does not.
+    state.story.on_update(StoryState::at(14).encode(), Some(StoryAdvance { point: 0, summary: "moment=13->14".into() }));
+    assert_eq!(state.story.moment(), Some(14));
+    let key = field_key(&mut talk, &state, "nmkin_3", 0.1, KeyCode::Enter, true, false);
+    assert_eq!(key, FieldKey { consumed: true, interact: None }, "paging through is no press");
+    assert!(shown(&talk).says("moment 13"), "the next window of the same conversation still reads the story it started with");
+    let key = field_key(&mut talk, &state, "nmkin_3", 0.2, KeyCode::Enter, true, false);
+    assert!(key.consumed && !talk.is_open(), "the conversation ended");
+    assert_eq!(started.borrow().len(), 1, "no new conversation was started by the paging");
+
+    // The next talk reads the later story.
+    let key = field_key(&mut talk, &state, "nmkin_3", 0.3, KeyCode::Enter, true, false);
+    assert_eq!(key, FieldKey { consumed: true, interact: Some(Some(3)) });
+    assert_eq!(*started.borrow(), [("woman".to_string(), 13), ("woman".to_string(), 14)]);
+    assert!(shown(&talk).says("moment 14"));
+}
+
+#[test]
+fn an_ok_with_nobody_around_is_a_press_where_the_player_stands_and_another_key_is_nothing() {
+    use fmv_core::{AccountId, AreaId, EntityId, GameId};
+    let area = AreaId { game: GameId::Fixture, key: "md1stin".into() };
+    let started: Rc<RefCell<Vec<(String, u16)>>> = Rc::default();
+    let mut talk = Talk::new(Box::new(Remembers { started: Rc::clone(&started), story: ff7::story_of(None) }));
+    let state = ClientState::new(EntityId(1), AccountId(1), Pos::new(0.0, 0.0, 0.0), area);
+    // no NPCs: a fresh Space is a press where the player stands, and nobody is talked to
+    let key = field_key(&mut talk, &state, "md1stin", 0.0, KeyCode::Space, true, false);
+    assert_eq!(key, FieldKey { consumed: false, interact: Some(None) });
+    assert!(started.borrow().is_empty());
+    // a key that is not OK is nothing
+    let key = field_key(&mut talk, &state, "md1stin", 0.0, KeyCode::KeyW, true, false);
+    assert_eq!(key, FieldKey { consumed: false, interact: None });
+}

@@ -38,6 +38,7 @@ mod npc;
 mod party;
 mod progress;
 mod render;
+mod route;
 mod session;
 mod state;
 mod story;

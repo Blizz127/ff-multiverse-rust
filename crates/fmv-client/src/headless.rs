@@ -193,7 +193,7 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>, mut 
     let mut party_bot = PartyBot::new(args.party_invite_first_peer, args.party_accept).with_accept_after_split(args.party_accept_after_split);
     // `--story-advance`: walk to the story point that would advance this account and stand on it. With an
     // invite to send it holds still until the invite is out (the invite must go out while the others are in view).
-    let mut story_bot = StoryBot::new(args.story_advance, args.party_invite_first_peer);
+    let mut story_bot = StoryBot::new(args.story_advance, args.party_invite_first_peer).with_adapter(session.content());
     // `--travel`: walk through the exits to these areas; with a party to form first it waits for it.
     let mut travel_bot = TravelBot::new(args.travel.clone(), args.party_invite_first_peer || args.party_accept).following(args.travel_follow);
     let mut battle_bot = BattleBot::new(args.battle_auto, args.debug_encounters, args.battle_wait_party).with_script(args.battle_script.clone());
@@ -264,6 +264,10 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>, mut 
     let mut last_npcs: Vec<(u32, String, String)> = Vec::new();
     // How many other players were in view at the last look (`usize::MAX`: none yet).
     let mut last_in_view = usize::MAX;
+    // The version of the area's NPC list the story bot was last told (`u64::MAX`: none yet).
+    let mut last_npc_epoch = u64::MAX;
+    // OK presses sent (ladders, lift panels, talks), for the summary.
+    let mut presses_sent = 0_u32;
     while start.elapsed() < args.duration
         || finishing_a_battle(battle_bot.is_active(), session.state.battle.in_battle(), start.elapsed(), args.duration)
     {
@@ -285,6 +289,7 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>, mut 
             bot = Bot::new(args.bot, session.state.own.pos(), session.area.bounds(), session.area.max_speed());
             let reached = travel_bot.arrived(&change.area.key, session.now());
             story_bot.arrived();
+            last_npc_epoch = u64::MAX;
             eprintln!(
                 "headless: now in {} (area change {}){}",
                 change.area,
@@ -312,6 +317,11 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>, mut 
             }
             last_npcs = npcs;
         }
+        // The story bot goes to a character that a story point names once the area has announced it.
+        if session.state.npc_epoch() != last_npc_epoch {
+            last_npc_epoch = session.state.npc_epoch();
+            story_bot.see_npcs(session.state.npc_views());
+        }
         // Conversations: each wanted character is talked to once, when the area has announced it (and with the
         // story this player has reached by then).
         if !talk_bot.is_done() {
@@ -334,6 +344,8 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>, mut 
             eprintln!("headless: peers in view: {}", remotes.len());
             last_in_view = remotes.len();
         }
+        // A bot that leads a party waits for the others to be in view before it walks onto a battle of the story.
+        story_bot.see_party(session.state.party.party_size(), remotes.len());
         // Party requests: what the bot flags ask for, and a resync if events were lost.
         let visible: Vec<EntityId> = remotes.iter().map(|p| p.id).collect();
         for cmd in party_bot.step(now, &session.state.party, &visible) {
@@ -351,12 +363,23 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>, mut 
         last = tick_start;
         // A player in a battle is frozen in the field: it neither walks nor sends movement.
         let frozen = session.state.battle.in_battle();
+        // Whoever moved the player, the bots of an area with links keep the arming of its walk-on lines from what
+        // they see (a step is a step, a jump is the server putting the player somewhere).
+        if story_bot.is_requested() {
+            story_bot.observe(session.area.as_ref(), session.state.own.pos());
+        }
+        if travel_bot.is_active() {
+            travel_bot.observe(session.area.as_ref(), session.state.own.pos());
+        }
+        // Which of the two bots decides now (see below): the one whose press, if it wants one, goes out.
+        let mut story_decides = false;
         if dt > 0.0 && !frozen {
             // The story comes first: while there is a point in this area that would advance this player's story
             // the story bot walks to it (and stands still if it must wait for its invite); once there is none, a
             // bot that also travels goes on to the next exit. A bot that only advances its story stands still then.
             let story_walks = story_bot.wants_to_walk(session.area.as_ref(), session.state.story.progress(), session.state.own.pos());
-            let step = if story_bot.is_requested() && (story_walks || !travel_bot.is_active()) {
+            story_decides = story_bot.is_requested() && (story_walks || !travel_bot.is_active());
+            let step = if story_decides {
                 // The story bot decides every step (it stands still when there is nothing to advance).
                 if story_bot.may_walk(now, session.state.party.outgoing_invite_seen()) {
                     let speed = session.area.max_speed() * crate::bot::BOT_SPEED_FACTOR;
@@ -386,6 +409,20 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>, mut 
         own_walk.feed(session.state.own.pos());
         if !frozen {
             session.flush_intent();
+            // A press of OK (the elevator's panel, a ladder, a talk) is judged by the server where it holds the
+            // player: it goes out once the intent that tells it where the bot stands has.
+            let wants = if story_decides { story_bot.wants_press() } else { travel_bot.wants_press() };
+            if wants && !session.state.own.has_unsent() {
+                let press = if story_decides { story_bot.take_press() } else { travel_bot.take_press() };
+                if let Some(press) = press {
+                    presses_sent += 1;
+                    eprintln!("headless: interact area={} npc={}", session.info.area_id, press.npc.map_or_else(|| "-".to_string(), |id| id.to_string()));
+                    session.send_interact(press.npc);
+                }
+            }
+        }
+        for note in story_bot.drain_notes().into_iter().chain(travel_bot.drain_notes()) {
+            eprintln!("headless: route: {note}");
         }
         if let Some(rest) = TICK.checked_sub(tick_start.elapsed()) {
             std::thread::sleep(rest);
@@ -399,6 +436,9 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>, mut 
     }
     if story_bot.is_requested() || session.state.story.advances() > 0 {
         eprintln!("headless: story advances: {}", session.state.story.advances());
+    }
+    if presses_sent > 0 {
+        eprintln!("headless: OK presses sent: {presses_sent}");
     }
     if let Some(why) = travel_bot.gave_up() {
         eprintln!("headless: travel: gave up: {why}");
@@ -683,3 +723,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod interact_tests;
