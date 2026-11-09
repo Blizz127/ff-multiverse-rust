@@ -226,6 +226,44 @@ fn a_formation_camera_that_does_not_suit_the_cast_falls_back_to_the_default_view
 
 // ----- frames ---------------------------------------------------------------------------------
 
+/// Statuses reach the picture: a poisoned body is tinted, a sleeper is tinted and droops, a sleeper that holds a full gauge
+/// has no gold ring (it is not waiting for a command), and a body that has nothing is drawn as it was.
+#[test]
+fn a_status_tints_the_body_a_sleeper_droops_and_has_no_ring_while_it_cannot_act() {
+    use fmv_ff7_battle::status::{Status, StatusSet};
+    let set = |s: Status| StatusSet::EMPTY.with(s);
+    let build = |a: &[Status], b: &[Status], preemptive: bool| {
+        let mut setup = BattleSetup { preemptive, ..setup_for(1, 2) };
+        setup.party[0].status = a.iter().copied().collect();
+        setup.party[1].status = b.iter().copied().collect();
+        let engine = limit_rules().build(&setup).unwrap();
+        let mut scene = BattleScene::new(&start(2, Some(formation())), Some(&engine), &mut kit()).expect("a scene");
+        scene.update(1.0, &[], Some(&engine));
+        scene
+    };
+    let (plain, sick) = (build(&[], &[], false), build(&[Status::Poison], &[Status::Sleep], false));
+    let colours = |s: &BattleScene| -> Vec<[f32; 3]> {
+        let mut found: Vec<[f32; 3]> = s.frame(&s.view(W, H), false).tints.iter().map(|t| t.rgb).filter(|c| *c != [1.0; 3]).collect();
+        found.dedup();
+        found
+    };
+    assert!(colours(&plain).is_empty(), "no status, no tint");
+    assert_eq!(colours(&sick), vec![body::of(set(Status::Poison), 1.0, 0).rgb, body::of(set(Status::Sleep), 1.0, 1).rgb]);
+    // The sleeper's height is the usual one times its droop; the poisoned one's is as it was.
+    let height = |s: &BattleScene, i: usize| s.pose_of(i).unwrap().1[5];
+    assert!((height(&sick, 0) - height(&plain, 0)).abs() < 1e-6);
+    let ratio = height(&sick, 1) / height(&plain, 1);
+    assert!((0.88..0.93).contains(&ratio), "{ratio}");
+    // A preemptive start gives both a full gauge: the poisoned one is waiting (a gold ring), the sleeper is not.
+    let gold = |s: &BattleScene| s.frame(&s.view(W, H), false).models.ground.iter().filter(|g| g.rgb == [255, 214, 64]).count();
+    assert_eq!(gold(&build(&[], &[], true)), 2);
+    assert_eq!(gold(&build(&[Status::Poison], &[Status::Sleep], true)), 1, "only the one that can act");
+    // After the battle (no engine) there is nothing left on anybody.
+    let mut over = build(&[Status::Poison], &[Status::Sleep], false);
+    over.update(2.0, &[], None);
+    assert!(colours(&over).is_empty());
+}
+
 #[test]
 fn a_frame_has_a_stage_every_model_a_shadow_each_and_a_ring_for_the_ready_ones() {
     let (mut scene, _) = scene(2, true);

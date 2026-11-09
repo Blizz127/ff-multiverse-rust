@@ -22,6 +22,8 @@
 //!   verified on contact sheets; a slot that is missing or not the slot's own clip is never played.
 //! * [`plan`]: time-warps a performance's clips so that the impact frame lands on schedule: faster
 //!   when they are long, the start skipped when even that is not enough, so nothing lags.
+//! * [`body`]: what a fighter's statuses do to its body: a colour factor (Poison's purple pulse, a sleeper's dim blue,
+//!   the grey of a stop), the droop of a sleeper and the held idle of Stop and Paralysis.
 //! * [`motion`]: what the actors do with time: the clips that play, lunges, flinches, dodges, deaths
 //!   (a party member's clip, an enemy's fade), the victory pose; the procedural motion for an actor
 //!   without clips.
@@ -61,6 +63,7 @@
 //! `BattleRules::formation_scene` from this machine's own `scene.bin`, and the models through
 //! the [`ModelKit`]'s loader from this machine's own archives. Nothing is sent anywhere.
 
+pub mod body;
 pub mod camera;
 mod clip;
 pub mod clips;
@@ -94,6 +97,7 @@ use fmv_ff7::model::{mat4_mul, mat4_translate, transform_point};
 use clips::Kit;
 use effects::{EffectKit, Element, Look};
 use fmv_ff7_battle::rules::{ActionRef, ActorId, BattleEvent, BattleState, Combatant, Side};
+use fmv_ff7_battle::status::StatusSet;
 use fmv_protocol::battle::FormationScene;
 use fmv_protocol::{BattleId, BattleMember};
 use layout::Spot;
@@ -275,6 +279,8 @@ pub struct BattleScene {
     entities: Vec<Option<EntityId>>,
     /// The party members waiting for a command.
     ready: Vec<bool>,
+    /// The statuses each actor has (the replayed engine's, copied by [`BattleScene::update`]): what [`body`] draws.
+    statuses: Vec<StatusSet>,
     /// The scene clock: the time of the last [`BattleScene::update`], seconds.
     now: f64,
 }
@@ -285,7 +291,7 @@ pub struct BattleScene {
 fn look_in(engine: Option<&BattleState>, actor: ActorId, action: ActionRef) -> Look {
     use fmv_ff7_battle::rules::ActionKind;
     let Some(who) = engine.and_then(|e| e.actor(actor)) else { return Look::PLAIN };
-    let of = |spec: &fmv_ff7_battle::rules::ActionSpec| Look { melee: spec.kind == ActionKind::Physical, element: Element::from_mask(spec.element_mask, spec.heals()) };
+    let of = |spec: &fmv_ff7_battle::rules::ActionSpec| Look { melee: spec.kind == ActionKind::Physical, element: Element::from_mask(spec.element_mask, spec.aims_at_allies()) };
     match action {
         ActionRef::Attack => Look { melee: who.side == Side::Enemy || who.short_range, element: Element::Plain },
         ActionRef::EnemyAttack(id) => who.actions.iter().find(|a| a.id == id).map_or(Look::PLAIN, |a| of(&a.spec)),
@@ -394,6 +400,7 @@ impl BattleScene {
             my_actor: start.my_actor,
             entities: start.party.iter().map(BattleMember::entity).collect(),
             ready: vec![false; n],
+            statuses: vec![StatusSet::EMPTY; n],
             now: 0.0,
         })
     }
@@ -461,10 +468,17 @@ impl BattleScene {
                 let actors = engine.actors();
                 self.director.sync(self.now, |i| actors.get(i).map(Combatant::is_alive));
                 for (i, ready) in self.ready.iter_mut().enumerate() {
-                    *ready = self.actors[i].side == Side::Party && actors.get(i).is_some_and(|c| c.is_alive() && c.ready);
+                    // A sleeper, a stopped or a paralysed member holds a full gauge but is not waiting for a command.
+                    *ready = self.actors[i].side == Side::Party && actors.get(i).is_some_and(|c| c.ready && c.can_act());
+                }
+                for (i, set) in self.statuses.iter_mut().enumerate() {
+                    *set = actors.get(i).map_or(StatusSet::EMPTY, |c| c.status.set());
                 }
             }
-            None => self.ready.iter_mut().for_each(|r| *r = false),
+            None => {
+                self.ready.iter_mut().for_each(|r| *r = false);
+                self.statuses.iter_mut().for_each(|s| *s = StatusSet::EMPTY);
+            }
         }
         self.director.prune(self.now);
     }
@@ -493,7 +507,9 @@ impl BattleScene {
             actor.home.pos[1] + motion.offset[1] - idle.bob - lift,
             actor.home.pos[2] + motion.offset[2],
         ];
-        let height = actor.rig.scale * motion.squash * idle.breath;
+        // A sleeper droops.
+        let droop = body::of(self.statuses.get(i).copied().unwrap_or_default(), self.now, i).squash;
+        let height = actor.rig.scale * motion.squash * idle.breath * droop;
         let place = placement(pos, actor.home.yaw + idle.sway + motion.turn, [actor.rig.scale, height, actor.rig.scale], motion.fall);
         Some((pos.map(f64::from), place, motion, idle))
     }
@@ -513,6 +529,7 @@ impl BattleScene {
         };
         for (i, actor) in self.actors.iter().enumerate() {
             let Some((pos, place, motion, _)) = self.pose_of(i) else { continue };
+            let body = body::of(self.statuses.get(i).copied().unwrap_or_default(), self.now, i);
             let id = ActorId(i as u8);
             if motion.gone {
                 continue;
@@ -548,7 +565,8 @@ impl BattleScene {
             }
             // Each actor is at its own point of the idle loop, so that two of one kind (two MPs) do not
             // breathe in step.
-            let phase = self.now as f32 + i as f32 * IDLE_PHASE_STEP;
+            // (A stopped or paralysed body holds its idle on one frame.)
+            let phase = if body.frozen { i as f32 * IDLE_PHASE_STEP } else { self.now as f32 + i as f32 * IDLE_PHASE_STEP };
             // The clip the director says it plays now (in place), else its idle loop; a weapon moves with
             // its owner: the same placement, the same frame.
             let (pose, weapons) = match motion.clip.and_then(|c| actor.rig.clip_pose(c.slot, c.frame).map(|(pose, root)| (pose, c, root))) {
@@ -558,7 +576,7 @@ impl BattleScene {
                     (pose, actor.rig.attachment_poses(phase))
                 }
             };
-            let tint = Tint { alpha: motion.alpha, ..Tint::NONE };
+            let tint = Tint { rgb: body.rgb, alpha: motion.alpha };
             let mut positions = Vec::new();
             if skin(&actor.rig.asset, &pose, &place, &camera_matrix, &mut positions) {
                 models.push(SkinnedModel { asset: Arc::clone(&actor.rig.asset), positions });

@@ -58,6 +58,13 @@
 //! * [`Reach::All`]: Ultima, Megalixir and Healing Wind hit a whole side and nothing else, so the pointer starts
 //!   on ALL and stays there (the arrows do nothing) until Enter sends it or Backspace goes back;
 //! * [`Reach::One`]: everything else, as before.
+//!
+//! # Silence
+//!
+//! A silenced character cannot cast: the engine refuses the Magic command (`CommandError::Silenced`), so the menu
+//! does not offer it ([`BattleMenuModel::silenced`], filled from the replayed engine at every message): the Magic
+//! row is greyed out and says why under the cursor ([`Refusal::Silenced`]), Enter on it does nothing, and a Magic
+//! list (or a target selection for a spell) that is open when the voice goes closes back to the commands.
 
 use fmv_ff7_battle::rules::{ActorId, Command, Target};
 
@@ -225,11 +232,18 @@ pub struct BattleMenuModel {
     /// materia use (the list shows it; a spell that needs one has [`Reach::OneOrAll`] only while this is not 0,
     /// which the client sets when it fills the model).
     pub all_left: u8,
+    /// Our character is silenced (the engine refuses its Magic command): the Magic row is greyed out.
+    pub silenced: bool,
 }
 
 impl BattleMenuModel {
     fn has_magic(&self) -> bool {
         !self.spells.is_empty()
+    }
+
+    /// Magic can be opened: there is something to cast and the voice is there.
+    fn can_cast(&self) -> bool {
+        self.has_magic() && !self.silenced
     }
 
     fn has_items(&self) -> bool {
@@ -308,6 +322,8 @@ impl Choice {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
     NoMagic,
+    /// The character is silenced.
+    Silenced,
     NoItems,
     NoDefend,
     /// The battle cannot be run from (a boss, or no battle data here to say it can).
@@ -322,6 +338,7 @@ impl Refusal {
     pub fn text(self) -> &'static str {
         match self {
             Refusal::NoMagic => "No magic to cast",
+            Refusal::Silenced => "Silenced: cannot cast",
             Refusal::NoItems => "No items to use",
             Refusal::NoDefend => "Not available yet",
             Refusal::NoEscape => "Cannot escape from this battle",
@@ -479,6 +496,14 @@ impl BattleMenu {
     /// valid one left, and a selection with nobody left to aim at goes back a level. The whole side stays
     /// the whole side for as long as anybody is on it.
     fn resolved(&self, ctx: &Ctx<'_>) -> State {
+        // The voice is gone (Silence): no Magic list, and no target for a spell, goes on being open.
+        if ctx.model.silenced {
+            match self.state {
+                State::Magic => return State::Commands,
+                State::Aiming(Aiming { what: Aimed::Magic(_), .. }) => return State::Commands,
+                _ => {}
+            }
+        }
         let State::Aiming(aim) = self.state else { return self.state };
         let candidates = ctx.candidates(aim.rule);
         match aim.at {
@@ -520,10 +545,11 @@ impl BattleMenu {
                     Some(limit) => self.start_aim(Aimed::Limit, limit.target, limit.reach, Level::Commands, ctx),
                     None => self.start_aim(Aimed::Attack, TargetRule::Enemies, Reach::One, Level::Commands, ctx),
                 },
-                MAGIC if ctx.model.has_magic() => {
+                MAGIC if ctx.model.can_cast() => {
                     self.state = State::Magic;
                     Reply::Handled
                 }
+                MAGIC if ctx.model.silenced => Reply::Refused(Refusal::Silenced),
                 MAGIC => Reply::Refused(Refusal::NoMagic),
                 ITEM if ctx.model.has_items() => {
                     self.state = State::Items;
@@ -636,7 +662,7 @@ impl BattleMenu {
         let first = if ctx.model.ready_limit().is_some() { LIMIT_LABEL } else { COMMAND_LABELS[ATTACK] };
         let commands = [
             CommandRow { label: first, enabled: true },
-            CommandRow { label: COMMAND_LABELS[MAGIC], enabled: ctx.model.has_magic() },
+            CommandRow { label: COMMAND_LABELS[MAGIC], enabled: ctx.model.can_cast() },
             CommandRow { label: COMMAND_LABELS[ITEM], enabled: ctx.model.has_items() },
             CommandRow { label: COMMAND_LABELS[DEFEND], enabled: ctx.model.defend },
             CommandRow { label: COMMAND_LABELS[ESCAPE], enabled: ctx.model.escape },
@@ -652,6 +678,7 @@ impl BattleMenu {
         match state {
             State::Commands => {
                 view.hint = match view.command_cursor {
+                    MAGIC if ctx.model.silenced => Some(Refusal::Silenced.text()),
                     MAGIC if !ctx.model.has_magic() => Some(Refusal::NoMagic.text()),
                     ITEM if !ctx.model.has_items() => Some(Refusal::NoItems.text()),
                     DEFEND if !ctx.model.defend => Some(Refusal::NoDefend.text()),
@@ -847,6 +874,7 @@ mod tests {
             limit: None,
             escape: true,
             all_left: 0,
+            silenced: false,
         }
     }
 
@@ -1169,6 +1197,61 @@ mod tests {
         press(&mut m, &s, &[Back, Down, Down]);
         assert_eq!(m.view(&s.ctx()).hint, Some("None left"));
         assert_eq!(press(&mut m, &s, &[Confirm]), Reply::Refused(Refusal::OutOfItem));
+    }
+
+    // --- silence ---
+
+    #[test]
+    fn silence_greys_out_magic_and_nothing_else_and_says_why() {
+        let mut s = Scene::new();
+        s.model.silenced = true;
+        let mut m = BattleMenu::default();
+        let v = m.view(&s.ctx());
+        let flags: Vec<(&str, bool)> = v.commands.iter().map(|c| (c.label, c.enabled)).collect();
+        assert_eq!(flags, [("Attack", true), ("Magic", false), ("Item", true), ("Defend", true), ("Escape", true)]);
+        // On Magic the line under the status band says why, and Enter is refused with the same words.
+        assert_eq!(press(&mut m, &s, &[Down]), Reply::Handled);
+        assert_eq!(m.view(&s.ctx()).hint, Some("Silenced: cannot cast"));
+        assert_eq!(press(&mut m, &s, &[Confirm]), Reply::Refused(Refusal::Silenced));
+        assert_eq!(m.level(), Level::Commands);
+        // The others still work: Item opens, Attack aims.
+        assert_eq!(press(&mut m, &s, &[Down, Confirm]), Reply::Handled);
+        assert_eq!(m.level(), Level::Items);
+        press(&mut m, &s, &[Back, Up, Up]);
+        assert_eq!(press(&mut m, &s, &[Confirm]), Reply::Handled);
+        assert_eq!(m.level(), Level::Target);
+        // A voice that is there and an empty list are the old refusal (it says nothing of silence).
+        let mut quiet = Scene::new();
+        quiet.model.spells.clear();
+        let mut m = BattleMenu::default();
+        assert_eq!(press(&mut m, &quiet, &[Down, Confirm]), Reply::Refused(Refusal::NoMagic));
+    }
+
+    #[test]
+    fn a_voice_lost_with_the_magic_list_or_a_spells_target_open_closes_them() {
+        let mut s = Scene::new();
+        let mut m = BattleMenu::default();
+        // The Magic list is open on Ice...
+        press(&mut m, &s, &[Down, Confirm, Down]);
+        assert_eq!(m.level(), Level::Magic);
+        // ...and the voice goes: the next look at the menu is the command list, on Magic, greyed.
+        s.model.silenced = true;
+        let v = m.view(&s.ctx());
+        assert_eq!((v.level, v.command_cursor, v.hint), (Level::Commands, 1, Some("Silenced: cannot cast")));
+        assert_eq!(press(&mut m, &s, &[Confirm]), Reply::Refused(Refusal::Silenced));
+        // A spell's target selection closes too; an item's does not.
+        s.model.silenced = false;
+        let mut m = BattleMenu::default();
+        press(&mut m, &s, &[Down, Confirm, Confirm]);
+        assert_eq!(m.level(), Level::Target, "aiming Fire");
+        s.model.silenced = true;
+        assert_eq!(m.view(&s.ctx()).level, Level::Commands);
+        s.model.silenced = false;
+        let mut m = BattleMenu::default();
+        press(&mut m, &s, &[Down, Down, Confirm, Confirm]);
+        assert_eq!(m.level(), Level::Target, "aiming a Potion");
+        s.model.silenced = true;
+        assert_eq!(m.view(&s.ctx()).level, Level::Target);
     }
 
     #[test]

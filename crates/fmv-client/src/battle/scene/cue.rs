@@ -235,6 +235,26 @@ mod tests {
     }
 
     #[test]
+    fn a_status_lands_with_its_action_and_is_a_target_of_it_and_a_turn_of_poison_lands_at_once() {
+        use fmv_ff7_battle::status::Status;
+        let sleep = BattleEvent::StatusInflicted { target: T, status: Status::Sleep };
+        let cured = BattleEvent::StatusEnded { target: T, status: Status::Poison };
+        let tick = BattleEvent::StatusTick { target: T, status: Status::Poison, amount: 7 };
+        for e in [sleep, cured] {
+            assert_eq!(landing(&e), Some(Landing::Impact { target: T }), "{e:?}");
+            assert_eq!(delay_of(Some(ActionRef::Magic(11)), &e), impact_delay(Some(ActionRef::Magic(11))), "{e:?}");
+        }
+        assert_eq!((landing(&tick), delay_of(Some(ActionRef::Magic(11)), &tick)), (None, 0.0));
+        // A Sleep spell is one cue whose target is the one it put to sleep (it has no damage to say so), performed by its caster.
+        let spell = [action(0, ActionRef::Magic(11)), BattleEvent::MpSpent { actor: A, amount: 8 }, sleep];
+        let cue = &cues(&spell)[0];
+        assert_eq!((cue.targets(), cue.performer()), (vec![T], Some(A)));
+        // And a blow with a status on it (Bio) has its target once, not twice.
+        let bio = [action(0, ActionRef::Magic(39)), damage(0, 2), BattleEvent::StatusInflicted { target: T, status: Status::Poison }];
+        assert_eq!(cues(&bio)[0].targets(), vec![T]);
+    }
+
+    #[test]
     fn a_limit_is_one_cue_with_its_gauge_and_blow_and_an_escape_is_one_cue_with_no_target() {
         let limit = [action(0, ActionRef::Limit(128)), BattleEvent::LimitGauge { actor: A, value: 0 }, damage(0, 2)];
         let of_limit = cues(&limit);

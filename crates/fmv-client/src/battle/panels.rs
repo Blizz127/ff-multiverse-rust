@@ -14,6 +14,7 @@
 
 use super::menu::{AimAt, AimView, Level, ListView, MenuView};
 use super::popups::{Popup, PopupKind};
+use super::tags;
 use super::view::{gauge_fraction, limit_fraction, limit_full, Anchors, Bar, BattleView, ATB_READY_RGB, ATB_RGB, BAND_H, LIMIT_FULL_RGB, LIMIT_RGB};
 use crate::ui::draw::{DrawList, Rgba};
 use crate::ui::font::Special;
@@ -245,7 +246,18 @@ fn draw_enemies(c: &mut Canvas<'_>, l: &Layout, view: &BattleView, aim: Option<A
             row_band(c, inner, y, AIMED);
             c.pointer(inner.x, y);
         }
-        fitted(c, inner.x + POINTER_W, y, inner.w - POINTER_W, if hit { ACCENT } else { TEXT }, &bar.name);
+        // The statuses it has, as many codes as the row can spare at its right (the name keeps six cells at least).
+        let avail = inner.w - POINTER_W;
+        let spare = cells_in(avail).saturating_sub(MIN_NAME_CELLS + 1);
+        let codes = tags::listed(bar.status).len().min(ENEMY_TAGS).min(tags::room(spare));
+        let tag_cells = if codes == 0 { 0 } else { codes * 4 - 1 };
+        if tag_cells == 0 {
+            fitted(c, inner.x + POINTER_W, y, avail, if hit { ACCENT } else { TEXT }, &bar.name);
+        } else {
+            let tag_w = i32::try_from(tag_cells).unwrap_or(0) * 8;
+            fitted(c, inner.x + POINTER_W, y, avail - tag_w - COL_GAP, if hit { ACCENT } else { TEXT }, &bar.name);
+            draw_tags(c, inner.right() - tag_w, y, tag_cells, bar);
+        }
     }
     if first > 0 {
         c.special(inner.right() - 8, inner.y, DIM, Special::ArrowUp);
@@ -260,6 +272,8 @@ fn draw_enemies(c: &mut Canvas<'_>, l: &Layout, view: &BattleView, aim: Option<A
 struct Columns {
     name_x: i32,
     name_cells: usize,
+    /// The statuses: x and how many cells (3 hold one code, 7 two), between the name and the HP when the rest still fits.
+    tags: Option<(i32, usize)>,
     hp_x: Option<i32>,
     mp_x: Option<i32>,
     /// The ATB bar: x and width.
@@ -272,14 +286,32 @@ const MP_W: i32 = 56;
 const COL_GAP: i32 = 6;
 const BAR_MIN: i32 = 24;
 const BAR_MAX: i32 = 140;
+/// Most status codes the enemy list writes after a name, and the cells of a name it keeps whatever the statuses.
+const ENEMY_TAGS: usize = 3;
+const MIN_NAME_CELLS: usize = 6;
+/// Most status codes the party panel makes room for after a name.
+const MAX_PARTY_TAGS: usize = 3;
 
-/// Name first, then HP, then MP with the bar, or the bar alone when MP does not fit too.
-fn columns(inner_x: i32, inner_w: i32) -> Columns {
+/// Name first, then (when some row has statuses: `want_codes` is the most codes any row wants, at most three) the
+/// statuses, then HP, then MP with the bar, or the bar alone when MP does not fit too. The statuses take what they can
+/// from the bar (never below its shortest) and nothing from the HP and MP columns; without room they have no column.
+fn columns(inner_x: i32, inner_w: i32, want_codes: usize) -> Columns {
     let end = inner_x + inner_w;
     let name_x = inner_x + POINTER_W;
     let name_cells = cells_in(end - name_x).clamp(1, NAME_CELLS);
     let mut x = name_x + i32::try_from(name_cells).unwrap_or(1) * 8;
-    let mut cols = Columns { name_x, name_cells, hp_x: None, mp_x: None, bar: None };
+    let mut cols = Columns { name_x, name_cells, tags: None, hp_x: None, mp_x: None, bar: None };
+    // The statuses come right after the name, as many whole codes as are wanted and the rest allows (HP, MP and the
+    // shortest bar keep their places behind them).
+    if want_codes > 0 {
+        let tail = COL_GAP + HP_W + COL_GAP + MP_W + COL_GAP + BAR_MIN;
+        let codes = want_codes.min(MAX_PARTY_TAGS).min(tags::room(cells_in(end - x - tail - COL_GAP)));
+        if codes > 0 {
+            let cells = codes * 4 - 1;
+            cols.tags = Some((x + COL_GAP, cells));
+            x += COL_GAP + i32::try_from(cells).unwrap_or(0) * 8;
+        }
+    }
     if end - (x + COL_GAP) >= HP_W {
         cols.hp_x = Some(x + COL_GAP);
         x += COL_GAP + HP_W;
@@ -291,6 +323,12 @@ fn columns(inner_x: i32, inner_w: i32) -> Columns {
         } else if rest >= COL_GAP + BAR_MIN {
             let bx = x + COL_GAP;
             cols.bar = Some((bx, (end - bx).min(BAR_MAX)));
+        }
+    } else if want_codes > 0 && cols.tags.is_none() {
+        // No HP column to make room for: whatever is left after the name shows the statuses.
+        let codes = want_codes.min(MAX_PARTY_TAGS).min(tags::room(cells_in(end - (x + COL_GAP))));
+        if codes > 0 {
+            cols.tags = Some((x + COL_GAP, codes * 4 - 1));
         }
     }
     cols
@@ -307,7 +345,8 @@ fn fraction_text(now: u32, max: u32, cap: u32, width: usize) -> String {
 fn draw_party(c: &mut Canvas<'_>, l: &Layout, view: &BattleView, aim: Option<AimView>) {
     window(c, l.party);
     let inner = l.party.inner();
-    let cols = columns(inner.x, inner.w);
+    let want = view.party.iter().map(|b| tags::listed(b.status).len()).max().unwrap_or(0);
+    let cols = columns(inner.x, inner.w, want);
     let rows = usize::try_from((inner.h / ROW_H - 1).max(0)).unwrap_or(0);
     if let Some(x) = cols.hp_x {
         c.shadowed(x + 16, inner.y, DIM, "HP");
@@ -337,6 +376,9 @@ fn draw_party(c: &mut Canvas<'_>, l: &Layout, view: &BattleView, aim: Option<Aim
         };
         let name = ellipsize(&bar.name, cols.name_cells);
         c.shadowed(cols.name_x, y, name_color, &name);
+        if let Some((x, cells)) = cols.tags {
+            draw_tags(c, x, y, cells, bar);
+        }
         if let Some(x) = cols.hp_x {
             let color = if bar.hp == 0 { ERROR } else if bar.hp.saturating_mul(3) < bar.max_hp { HP_LOW } else { TEXT };
             c.shadowed(x, y, color, &fraction_text(bar.hp, bar.max_hp, 9999, 4));
@@ -355,6 +397,18 @@ fn draw_party(c: &mut Canvas<'_>, l: &Layout, view: &BattleView, aim: Option<Aim
     }
 }
 
+/// The status codes of `bar` in `cells` cells from `x`: the most important ones in their colours, then a `+N` for the ones
+/// that did not fit (see [`tags::fit`]).
+fn draw_tags(c: &mut Canvas<'_>, x: i32, y: i32, cells: usize, bar: &Bar) {
+    let (shown, left) = tags::fit(bar.status, cells);
+    for (k, status) in shown.iter().enumerate() {
+        c.shadowed(x + 8 * i32::try_from(tags::code_cell(k)).unwrap_or(0), y, tags::color(*status), tags::code(*status));
+    }
+    if left > 0 && tags::room(cells) >= 2 {
+        c.shadowed(x + 8 * i32::try_from(tags::code_cell(shown.len())).unwrap_or(0), y, DIM, &tags::more_text(left));
+    }
+}
+
 /// The ATB gauge: a dark track, the fill, and a bright edge when it is full.
 fn atb_bar(c: &mut Canvas<'_>, x: i32, y: i32, w: i32, bar: &Bar) {
     let h = 4;
@@ -362,7 +416,8 @@ fn atb_bar(c: &mut Canvas<'_>, x: i32, y: i32, w: i32, bar: &Bar) {
     c.fill(x, y, w, h, TRACK);
     let filled = (f64::from(w) * f64::from(gauge_fraction(bar))).round() as i32;
     if filled > 0 {
-        let rgb = if bar.ready && bar.alive { ATB_READY_RGB } else { ATB_RGB };
+        // Yellow when a command is due, else the colour of what changes its pace (Haste, Slow, a hold), else blue.
+        let rgb = if bar.ready && bar.alive { ATB_READY_RGB } else { tags::atb_rgb(bar.status).unwrap_or(ATB_RGB) };
         c.fill(x, y, filled.min(w), h, [rgb[0], rgb[1], rgb[2], 255]);
         c.fill(x, y, filled.min(w), 1, [255, 255, 255, 90]);
     }
@@ -643,11 +698,12 @@ mod tests {
     use super::*;
     use crate::battle::menu::{BattleMenu, BattleMenuModel, Ctx, Fighter, MenuItem, MenuKey, MenuSpell, Reach, TargetRule};
     use crate::battle::popups::LIFETIME_S;
+    use fmv_ff7_battle::status::StatusSet;
     use crate::ui::widgets::SHADOW as SHADOW_COLOR;
     use fmv_protocol::BattleId;
 
     fn bar(actor: u8, name: &str, hp: u32, max_hp: u32, mp: u32, max_mp: u32, mine: bool) -> Bar {
-        Bar { actor: ActorId(actor), name: name.into(), hp, max_hp, mp, max_mp, gauge: 30_000, ready: false, alive: hp > 0, mine, limit: 0 }
+        Bar { actor: ActorId(actor), name: name.into(), hp, max_hp, mp, max_mp, gauge: 30_000, ready: false, alive: hp > 0, status: StatusSet::EMPTY, mine, limit: 0 }
     }
 
     /// Three heroes (the second is ours) against three enemies.
@@ -760,6 +816,79 @@ mod tests {
         // HP: plain while healthy, yellow below a third, red at zero.
         let hp = |s: &str| list.texts().iter().find(|t| t.text.contains(s) && t.color != SHADOW_COLOR).map(|t| t.color);
         assert_eq!((hp("427/427"), hp("120/480"), hp("0/390")), (Some(TEXT), Some(HP_LOW), Some(ERROR)));
+    }
+
+    /// A status is a code in its own colour after the name (party panel) or at the right of it (enemy list), the ATB bar of a
+    /// fighter whose pace changes is not the usual blue, and what does not fit is a `+N`. A window as wide as 1920 x 1080
+    /// has room for three codes in the party panel, the default 1100 x 680 for one.
+    #[test]
+    fn statuses_are_written_in_their_colours_and_the_atb_bar_takes_the_colour_of_the_pace() {
+        use crate::battle::tags;
+        use fmv_ff7_battle::status::Status;
+        let set = |list: &[Status]| list.iter().copied().collect::<StatusSet>();
+        let mut v = battle();
+        v.party[0].status = set(&[Status::Poison, Status::Silence]);
+        v.party[1].status = set(&[Status::Haste]);
+        v.enemies[0].status = set(&[Status::Sleep]);
+        let s = layout(1920, 1080, 3).s;
+        let list = draw(&v, 1920, 1080);
+        let colour_of = |text: &str| list.texts().iter().find(|t| t.text == text && t.color != SHADOW_COLOR).map(|t| t.color);
+        assert_eq!(colour_of("Psn"), Some(tags::color(Status::Poison)));
+        assert_eq!(colour_of("Sil"), Some(tags::color(Status::Silence)));
+        assert_eq!(colour_of("Hst"), Some(tags::color(Status::Haste)));
+        assert_eq!(colour_of("Slp"), Some(tags::color(Status::Sleep)), "the enemy list has them too");
+        // Where: a party member's codes are on its own row, between the name and the HP; the enemy's at the right of its row.
+        let at = |text: &str| list.texts().iter().find(|t| t.text == text && t.color != SHADOW_COLOR).map(|t| (t.x, t.y)).unwrap();
+        let (name, psn, sil, hp) = (at("Cloud"), at("Psn"), at("Sil"), at(" 427/427 "));
+        assert!(name.1 == psn.1 && psn.1 == hp.1 && sil.1 == psn.1, "one row: {name:?} {psn:?} {hp:?}");
+        assert!(name.0 < psn.0 && psn.0 < sil.0 && sil.0 + 3 * 8 * s <= hp.0, "name, Psn, Sil, HP in that order: {name:?} {psn:?} {sil:?} {hp:?}");
+        let (hound, slp) = (at("Guard Hound"), at("Slp"));
+        assert!(hound.1 == slp.1 && slp.0 > hound.0 + 6 * 8 * s, "{hound:?} {slp:?}");
+        // The ATB bar: Haste is cyan, Slow violet, a hold grey, and with no status the usual blue.
+        let colours = |view: &BattleView| -> Vec<[u8; 4]> { draw(view, 1100, 680).quads().iter().map(|q| q.color).collect() };
+        let (haste, slow, held) = (tags::atb_rgb(set(&[Status::Haste])).unwrap(), tags::atb_rgb(set(&[Status::Slow])).unwrap(), tags::atb_rgb(set(&[Status::Stop])).unwrap());
+        let opaque = |c: [u8; 3]| [c[0], c[1], c[2], 255];
+        assert!(!colours(&battle()).contains(&opaque(haste)), "no Haste, no cyan bar");
+        assert!(colours(&v).contains(&opaque(haste)), "Barret's bar is Haste's");
+        v.party[1].status = set(&[Status::Slow]);
+        assert!(colours(&v).contains(&opaque(slow)) && !colours(&v).contains(&opaque(haste)));
+        v.party[1].status = set(&[Status::Stop, Status::Slow]);
+        assert!(colours(&v).contains(&opaque(held)) && !colours(&v).contains(&opaque(slow)), "a hold is all that shows");
+        // More than fit: the most important ones and a +N for the rest (two codes and the +3 in the room of three).
+        v.party[0].status = set(&[Status::Poison, Status::Silence, Status::Haste, Status::Regen, Status::Barrier]);
+        let said = drawn(&draw(&v, 1920, 1080));
+        assert!(said.contains(&"Psn".to_string()) && said.contains(&"Sil".to_string()) && said.contains(&"+3".to_string()), "{said:?}");
+        assert!(!said.contains(&"Rgn".to_string()) && !said.contains(&"Bar".to_string()), "{said:?}");
+        // At 1100 x 680 there is room for one: the one that matters most, and nothing else of Cloud's.
+        let said = drawn(&draw(&v, 1100, 680));
+        assert!(said.contains(&"Psn".to_string()) && !said.contains(&"Sil".to_string()) && !said.iter().any(|t| t.starts_with('+')), "{said:?}");
+    }
+
+    /// The statuses take what they need from the ATB bar and nothing from the HP and MP columns; a window with no status
+    /// anywhere is exactly what it was, and the narrowest layouts neither panic nor draw outside the window.
+    #[test]
+    fn the_status_column_takes_from_the_bar_only_and_a_fighter_without_any_changes_nothing() {
+        use fmv_ff7_battle::status::Status;
+        let plain = battle();
+        let mut sick = battle();
+        for bar in sick.party.iter_mut().chain(sick.enemies.iter_mut()) {
+            bar.status = [Status::Poison, Status::Sleep].into_iter().collect();
+        }
+        let fractions = |list: &DrawList| drawn(list).iter().filter(|t| t.contains('/')).count();
+        for (w, h) in [(1100u32, 680u32), (1920, 1080), (800, 600)] {
+            let (with, without) = (draw(&sick, w, h), draw(&plain, w, h));
+            assert!(with.texts().iter().any(|t| t.text == "Psn"), "{w}x{h}: it says Poison");
+            assert_eq!(fractions(&with), fractions(&without), "{w}x{h}: HP and MP columns are all still there");
+            assert!(!without.texts().iter().any(|t| matches!(t.text.as_str(), "Psn" | "Slp")), "{w}x{h}: nothing without a status");
+        }
+        // The layout of a panel that has nobody sick is the one it always had (the columns say it).
+        assert_eq!(columns(0, 300, 0).tags, None);
+        assert!(columns(0, 300, 1).tags.is_some() && columns(0, 100, 3).tags.is_none(), "room for one at 300 wide, none at 100");
+        // The narrowest window of the compact layout: nothing panics and nothing is written outside the window.
+        for (w, h) in [(320u32, 240u32), (400, 300), (480, 280)] {
+            let list = draw(&sick, w, h);
+            assert!(list.texts().iter().all(|t| t.x >= 0 && t.x < w as i32 && t.y >= 0 && t.y < h as i32), "{w}x{h}");
+        }
     }
 
     /// The most a battle has in protocol v9: the canon Cloud and Barret and the three players of a full party. The panel
@@ -1267,21 +1396,21 @@ mod tests {
     #[test]
     fn the_party_columns_drop_the_least_important_first() {
         // Plenty of room: everything.
-        let c = columns(0, 300);
+        let c = columns(0, 300, 0);
         assert!(c.hp_x.is_some() && c.mp_x.is_some() && c.bar.is_some());
         let (bx, bw) = c.bar.unwrap();
         assert!((BAR_MIN..=BAR_MAX).contains(&bw) && bx + bw <= 300);
         assert!(c.mp_x.unwrap() > c.hp_x.unwrap() && bx > c.mp_x.unwrap(), "name, HP, MP, bar from left to right");
         // Less: MP goes, the bar stays. Less still: the bar goes. Less: HP goes too.
-        let c = columns(0, 200);
+        let c = columns(0, 200, 0);
         assert!(c.hp_x.is_some() && c.mp_x.is_none() && c.bar.is_some());
-        let c = columns(0, 170);
+        let c = columns(0, 170, 0);
         assert!(c.hp_x.is_some() && c.mp_x.is_none() && c.bar.is_none());
-        let c = columns(0, 100);
+        let c = columns(0, 100, 0);
         assert!(c.hp_x.is_none() && c.name_cells >= 1);
         // However little room, nothing is negative or past the end.
         for w in 0..400 {
-            let c = columns(10, w);
+            let c = columns(10, w, 0);
             for x in [c.hp_x, c.mp_x].into_iter().flatten() {
                 assert!(x >= 10);
             }

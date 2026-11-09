@@ -13,6 +13,7 @@
 //! up (no game data is read).
 
 use super::hud::BattleHud;
+use fmv_ff7_battle::status::StatusSet;
 use super::menu::{MenuItem, MenuKey, MenuLimit, MenuSpell, Reach, TargetRule};
 use super::panels::{layout, Banner, Layout, RewardItem, RewardLine, DISABLED, PANEL_DELAY_MS};
 use super::popups::{Popup, PopupKind};
@@ -112,7 +113,7 @@ impl Shooter {
 
 #[allow(clippy::too_many_arguments)] // a test fixture: one line per fighter reads best
 fn bar(actor: u8, name: &str, hp: u32, max_hp: u32, mp: u32, max_mp: u32, gauge: u32, ready: bool, mine: bool) -> Bar {
-    Bar { actor: ActorId(actor), name: name.into(), hp, max_hp, mp, max_mp, gauge, ready: ready && hp > 0, alive: hp > 0, mine, limit: 0 }
+    Bar { actor: ActorId(actor), name: name.into(), hp, max_hp, mp, max_mp, gauge, ready: ready && hp > 0, alive: hp > 0, status: StatusSet::EMPTY, mine, limit: 0 }
 }
 
 /// Three heroes (Barret is ours and ready, Tifa is hurt) against three enemies.
