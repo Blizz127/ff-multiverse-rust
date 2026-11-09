@@ -614,6 +614,7 @@ async fn tick_loop(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) {
                     world.advance_tick();
                     world.expire_parties(now);
                     world.advance_battles(now);
+                    world.advance_countdowns(now);
                     world.manage_areas(now);
                 });
             }

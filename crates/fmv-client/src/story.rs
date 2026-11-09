@@ -847,4 +847,6 @@ mod tests {
 }
 
 #[cfg(test)]
+mod open_tests;
+#[cfg(test)]
 mod press_tests;

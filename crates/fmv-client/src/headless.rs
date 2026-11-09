@@ -280,6 +280,7 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>, mut 
         session.log_battle_notes();
         session.log_progress_notes();
         session.log_story_notes();
+        session.log_countdown_notes();
         for peer in session.state.drain_peer_sightings() {
             eprintln!("{}", peer_line(&peer));
         }
@@ -468,6 +469,7 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>, mut 
     session.log_battle_notes();
     session.log_progress_notes();
     session.log_story_notes();
+    session.log_countdown_notes();
     for peer in session.state.drain_peer_sightings() {
         eprintln!("{}", peer_line(&peer));
     }

@@ -655,7 +655,9 @@ where
             | ServerMsg::CharacterProgress { .. }
             | ServerMsg::Inventory { .. }
             // Where the player's story stands (said once on joining when it is not a new account's).
-            | ServerMsg::StoryUpdate { .. }) => push_backlog(&mut backlog, other),
+            | ServerMsg::StoryUpdate { .. }
+            // The countdown the server runs for the player's story (kept like the story: said once, not repeated).
+            | ServerMsg::Countdown { .. }) => push_backlog(&mut backlog, other),
         }
         if let (Some(_), Some(_), Some(_)) = (&welcome, &offer, &snapshot) {
             let (Some(w), Some(o), Some(entities)) = (welcome, offer, snapshot) else {

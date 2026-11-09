@@ -111,6 +111,7 @@ use crate::ServerError;
 
 mod areas;
 mod battle;
+mod countdown;
 mod instances;
 mod party;
 mod press;
@@ -245,6 +246,9 @@ struct Player {
     /// Set after a link moved the player: until the client has taken the new position (an intent that agrees with it)
     /// every intent is answered with that position (see the `press` module).
     fence: Option<press::Fence>,
+    /// The account whose countdown this player was last told is running (see the `countdown` module): `None` when it was
+    /// told of none, or that it is over.
+    countdown_told: Option<AccountId>,
 }
 
 /// Everything the world needs to admit a player into the area.
@@ -328,6 +332,10 @@ pub struct World {
     saver: Option<SaverHandle>,
     /// Log lines recorded under the world lock, written after it is released (see `take_logs`).
     logs: DeferredLogs,
+    /// The countdowns that story steps started, one per account (see `countdown`).
+    countdowns: BTreeMap<AccountId, countdown::Countdown>,
+    /// The `now` of the last [`World::advance_countdowns`]: what a countdown's time left is measured against.
+    clock: Instant,
 }
 
 impl World {
@@ -364,6 +372,8 @@ impl World {
             battle: None,
             saver: None,
             logs,
+            countdowns: BTreeMap::new(),
+            clock: Instant::now(),
         })
     }
 
@@ -460,6 +470,7 @@ impl World {
                 transit: None,
                 arming: LinkArming::default(),
                 fence: None,
+                countdown_told: None,
             },
         );
         self.by_account.insert(account, entity);
@@ -505,6 +516,8 @@ impl World {
         if let Some(instance) = left {
             self.tell_instance(instance, Arc::new(ServerMsg::PlayerLeft { entity }), failed);
         }
+        // Its countdown (a clock of the story it held) goes with it, and so does what its party was told of it.
+        self.countdown_account_left(player.account, failed);
         Some(player)
     }
 

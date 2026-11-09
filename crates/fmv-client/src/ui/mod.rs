@@ -23,6 +23,7 @@
 //! every screen and of the HUD to `~/.cache/claude-tmp/fmv-client-shots/`.
 
 pub mod connect;
+pub mod countdown;
 pub mod dialogue;
 pub mod draw;
 pub mod entry;
