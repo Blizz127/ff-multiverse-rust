@@ -234,6 +234,12 @@ SOUND:
   the data names no sound for (spells, items, limit breaks) is silent. FMV_BATTLE_SOUNDS=off plays
   none, `data` (the default) what the data names, `all` also an enemy's death and an escape (named
   only by a hand-made list of the sound bank, by ear). The log says `audio: battle sound <id> (hit)`.
+  A field has sounds of its own, read from your own field scripts (what they do not say is not
+  guessed): the ambient loops a field starts as you come in (a hum, machinery) follow the story, so
+  they change when it moves; the sounds of ladders, jumps, the reactor lift and of the doors that
+  the data time a sound for play as you pass them. A battle's sounds take over in a fight and the
+  loops come back after it. FMV_FIELD_SOUNDS=off plays none, `data` (the default) what the scripts
+  name. The log says `audio: field loop start ch1 42` and `audio: field sound ch1 62 (link)`.
 
 WINDOW CONTROLS:
   WASD / arrow keys move, Esc twice quits (never during a battle: close the window to quit
@@ -1238,7 +1244,7 @@ mod tests {
         assert!(!parse(&[]).unwrap().mute);
         assert!(parse(&["--mute"]).unwrap().mute);
         assert!(parse(&["--headless", "--mute"]).unwrap().mute);
-        for words in ["SOUND:", "--mute", "FMV_AUDIO=off", "FMV_AUDIO=null", "libasound.so.2", "FMV_AUDIO_FANFARE", "FMV_BATTLE_SOUNDS", "M mutes"] {
+        for words in ["SOUND:", "--mute", "FMV_AUDIO=off", "FMV_AUDIO=null", "libasound.so.2", "FMV_AUDIO_FANFARE", "FMV_BATTLE_SOUNDS", "FMV_FIELD_SOUNDS", "M mutes"] {
             assert!(AFTER_HELP.contains(words), "the help says {words}");
         }
     }

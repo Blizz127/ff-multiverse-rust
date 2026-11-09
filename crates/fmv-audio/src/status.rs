@@ -21,6 +21,7 @@ pub struct Shared {
     music: AtomicU64,
     music_ended: AtomicU64,
     sfx: AtomicU32,
+    loops: AtomicU32,
     frames: AtomicU64,
     callbacks: AtomicU64,
     underruns: AtomicU64,
@@ -42,6 +43,7 @@ impl Shared {
             music: AtomicU64::new(NO_TRACK),
             music_ended: AtomicU64::new(0),
             sfx: AtomicU32::new(0),
+            loops: AtomicU32::new(0),
             frames: AtomicU64::new(0),
             callbacks: AtomicU64::new(0),
             underruns: AtomicU64::new(0),
@@ -86,6 +88,10 @@ impl Shared {
 
     pub(crate) fn set_sfx(&self, playing: usize) {
         self.sfx.store(u32::try_from(playing).unwrap_or(u32::MAX), Relaxed);
+    }
+
+    pub(crate) fn set_loops(&self, playing: usize) {
+        self.loops.store(u32::try_from(playing).unwrap_or(u32::MAX), Relaxed);
     }
 
     pub(crate) fn count_frames(&self, frames: usize) {
@@ -150,6 +156,7 @@ impl Shared {
             music: u32::try_from(music).ok().map(TrackId),
             music_ended: self.music_ended.load(Relaxed),
             sfx_playing: self.sfx.load(Relaxed),
+            loops_playing: self.loops.load(Relaxed),
             volumes: self.volumes(),
             muted: self.muted(),
             frames_rendered: self.frames.load(Relaxed),

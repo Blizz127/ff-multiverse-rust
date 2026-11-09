@@ -16,10 +16,10 @@ use crate::host::{MixerHandle, RenderHost};
 use crate::mixer::{Command, Mixer, MusicVoice, SfxVoice};
 use crate::source::{MusicSource, SfxClip};
 use crate::status::Shared;
-use crate::types::{AudioStatus, Backend, PlayOptions, TrackId, Volumes};
+use crate::types::{AudioStatus, Backend, PlayOptions, SfxHandle, TrackId, Volumes};
 use std::fmt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -124,6 +124,8 @@ pub struct AudioEngine {
     manual: Option<MixerHandle>,
     stop: Arc<AtomicBool>,
     supervisor: Option<JoinHandle<()>>,
+    /// The id the next looping effect is given (see [`AudioEngine::play_sfx_loop`]).
+    next_loop: AtomicU64,
 }
 
 impl AudioEngine {
@@ -151,7 +153,7 @@ impl AudioEngine {
         };
         let mode = config.mode;
         match thread::Builder::new().name("fmv-audio".into()).spawn(move || supervisor.run(mode, opener)) {
-            Ok(thread) => Self { shared, commands: Some(commands), manual: None, stop, supervisor: Some(thread) },
+            Ok(thread) => Self { shared, commands: Some(commands), manual: None, stop, supervisor: Some(thread), next_loop: AtomicU64::new(1) },
             Err(error) => {
                 (config.logger)(&format!("could not start the audio thread ({error}); continuing silently"));
                 Self::off(&config)
@@ -166,7 +168,7 @@ impl AudioEngine {
             return Self::off(&config);
         }
         let (shared, commands, mixer) = Self::parts(&config, Backend::Null);
-        Self { shared, commands: Some(commands), manual: Some(mixer), stop: Arc::new(AtomicBool::new(false)), supervisor: None }
+        Self { shared, commands: Some(commands), manual: Some(mixer), stop: Arc::new(AtomicBool::new(false)), supervisor: None, next_loop: AtomicU64::new(1) }
     }
 
     fn parts(config: &AudioConfig, backend: Backend) -> (Arc<Shared>, Sender<Command>, MixerHandle) {
@@ -178,7 +180,7 @@ impl AudioEngine {
 
     fn off(config: &AudioConfig) -> Self {
         let shared = Shared::new(config.volumes, config.muted, config.sample_rate, Backend::Off);
-        Self { shared, commands: None, manual: None, stop: Arc::new(AtomicBool::new(false)), supervisor: None }
+        Self { shared, commands: None, manual: None, stop: Arc::new(AtomicBool::new(false)), supervisor: None, next_loop: AtomicU64::new(1) }
     }
 
     /// Start `source` as the music, crossfading from whatever plays (see [`PlayOptions`]). Asking
@@ -207,9 +209,34 @@ impl AudioEngine {
         }
     }
 
+    /// Stop every sound effect at once, **loops included** (a loop that has to be kept while the one-shots go has to be
+    /// stopped by its own handle instead, [`AudioEngine::stop_sfx_loop`]).
     pub fn stop_sfx(&self) {
         if let Some(commands) = &self.commands {
             let _ = commands.send(Command::StopSfx);
+        }
+    }
+
+    /// Play `clip` as a loop: its intro (the frames before its loop region, see [`SfxClip::with_loop`]), then its loop
+    /// region over and over, or the whole clip over and over when it has none, until [`AudioEngine::stop_sfx_loop`] (or
+    /// [`AudioEngine::stop_sfx`]). `gain` and `pan` are those of [`AudioEngine::play_sfx`]; the loop fades in over
+    /// `fade_in` (zero: it starts at full level). Eight loops can play at once, apart from the one-shots (which never cut
+    /// one); a ninth cuts the oldest loop short. Returns the handle that stops it; an engine that is off returns one too, and
+    /// nothing plays.
+    pub fn play_sfx_loop(&self, clip: &SfxClip, gain: f32, pan: f32, fade_in: Duration) -> SfxHandle {
+        let id = self.next_loop.fetch_add(1, Relaxed);
+        if let Some(commands) = &self.commands {
+            let _ = commands.send(Command::PlayLoop { voice: SfxVoice::looping(clip.clone(), gain, pan, id), fade_in });
+        }
+        SfxHandle(id)
+    }
+
+    /// Stop the loop `handle` names, fading it out over `fade` (zero: cut it). A handle that is stale (its loop was stopped,
+    /// cut by a ninth loop, or ended with [`AudioEngine::stop_sfx`]) or was never given is ignored, and so is a second stop of
+    /// a loop that is already fading out.
+    pub fn stop_sfx_loop(&self, handle: SfxHandle, fade: Duration) {
+        if let Some(commands) = &self.commands {
+            let _ = commands.send(Command::StopLoop { id: handle.0, fade });
         }
     }
 
@@ -804,6 +831,60 @@ mod tests {
         engine.stop_sfx();
         engine.pump(8);
         assert_eq!(engine.status().sfx_playing, 0);
+    }
+
+    #[test]
+    fn a_manual_engine_loops_an_effect_stops_it_by_its_handle_and_a_stale_handle_does_nothing() {
+        let full = Volumes { master: 1.0, music: 1.0, sfx: 1.0 };
+        let engine = AudioEngine::start_manual(AudioConfig { sample_rate: 1_000, volumes: full, ..AudioConfig::default() });
+        let steady = |v: f32, frames: usize| SfxClip::from_mono(1_000, &vec![v; frames]).expect("clip");
+        // a clip of 20 frames played for 500: it loops (an effect would have ended after the 20th frame)
+        let hum = engine.play_sfx_loop(&steady(0.3, 20), 1.0, 0.0, Duration::ZERO);
+        let alarm = engine.play_sfx_loop(&steady(0.1, 20).with_loop(5, 20), 1.0, 0.0, Duration::ZERO);
+        assert_ne!(hum, alarm, "every loop has a handle of its own");
+        engine.play_sfx(&steady(0.2, 100), 1.0, 0.0);
+        assert!(engine.pump(500).iter().skip(400).all(|&v| (v - 0.3 - 0.1).abs() < 1e-4), "the loops are heard after the one-shot is over");
+        let status = engine.status();
+        assert_eq!((status.loops_playing, status.sfx_playing), (2, 0));
+        engine.stop_sfx_loop(hum, Duration::ZERO);
+        assert!(engine.pump(100).iter().all(|&v| (v - 0.1).abs() < 1e-4), "one handle stopped, the other loop goes on");
+        assert_eq!(engine.status().loops_playing, 1);
+        // the same handle again, and one that was never given: nothing happens
+        engine.stop_sfx_loop(hum, Duration::ZERO);
+        engine.stop_sfx_loop(SfxHandle(9_999), Duration::from_millis(50));
+        assert!(engine.pump(100).iter().all(|&v| (v - 0.1).abs() < 1e-4));
+        // stop_sfx stops what is left, loops included; a handle from before it is stale
+        engine.stop_sfx();
+        engine.pump(8);
+        assert_eq!(engine.status().loops_playing, 0);
+        engine.stop_sfx_loop(alarm, Duration::ZERO);
+        assert!(engine.pump(100).iter().all(|&v| v == 0.0));
+        // a new loop is a new handle, not a recycled one
+        let again = engine.play_sfx_loop(&steady(0.3, 20), 1.0, 0.0, Duration::ZERO);
+        assert!(again != hum && again != alarm);
+    }
+
+    #[test]
+    fn a_loop_on_an_engine_that_is_off_returns_a_handle_and_plays_nothing_and_on_the_null_sink_it_keeps_time() {
+        // off: nothing is built, nothing is queued, the calls are harmless
+        let off = AudioEngine::start_manual(AudioConfig { mode: Mode::Off, ..AudioConfig::default() });
+        let clip = SfxClip::from_mono(8_000, &[0.5; 100]).expect("clip");
+        let handle = off.play_sfx_loop(&clip, 1.0, 0.0, Duration::from_millis(10));
+        off.stop_sfx_loop(handle, Duration::from_millis(10));
+        assert_eq!((off.status().backend, off.status().loops_playing), (Backend::Off, 0));
+        assert!(off.pump(100).is_empty());
+        // the null sink that keeps its own clock: a loop starts, keeps counting as a loop and stops, with no device
+        let (logger, seen) = lines();
+        let engine = AudioEngine::start_with(AudioConfig { mode: Mode::Null, ..config(logger) }, Some(Box::new(MustNotOpen)));
+        wait_for("the null sink", || engine.status().backend == Backend::Null);
+        let handle = engine.play_sfx_loop(&SfxClip::from_mono(8_000, &[0.5; 100]).expect("clip"), 1.0, 0.0, Duration::ZERO);
+        wait_for("the loop", || engine.status().loops_playing == 1);
+        let before = engine.status().frames_rendered;
+        wait_for("time to pass", || engine.status().frames_rendered > before + 2_000);
+        assert_eq!(engine.status().loops_playing, 1, "a clip of 100 frames has long run out as a one-shot: this one loops");
+        engine.stop_sfx_loop(handle, Duration::ZERO);
+        wait_for("the stop", || engine.status().loops_playing == 0);
+        assert!(seen.lock().expect("log").is_empty(), "and none of it wrote a line");
     }
 
     #[test]
