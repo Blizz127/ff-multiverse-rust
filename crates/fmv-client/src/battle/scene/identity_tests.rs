@@ -2,7 +2,7 @@
 //! members whose players' colours this client knows, and nothing else), how the colours reach the scene from what the
 //! client has been told, and, with the owner's own data, before and after pictures through the real renderer.
 
-use super::shots::{open_real, Server, ME};
+use super::shots::{drawn_at, open_real, Real, Server, ME};
 use super::*;
 use crate::avatar::identity::pics::{around, hstack, Img};
 use crate::avatar::library::tests::character;
@@ -40,7 +40,13 @@ fn member(i: u64, character: u8) -> BattleMember {
 }
 
 fn look(id: u64, name: &str, tint: [u8; 3]) -> EntitySnapshot {
-    EntitySnapshot { id: EntityId(id), pos: Pos::default(), facing: 0.0, anim: AnimState::Idle, avatar: AvatarAppearance::new(name, tint, Some("ff7/body/lean".to_string())) }
+    look_of(id, name, tint, "lean")
+}
+
+/// What the area's snapshot says about a player's entity: its name and colour, and the placeholder body (`ff7/body/<body>`)
+/// the game draws it as on the field.
+fn look_of(id: u64, name: &str, tint: [u8; 3], body: &str) -> EntitySnapshot {
+    EntitySnapshot { id: EntityId(id), pos: Pos::default(), facing: 0.0, anim: AnimState::Idle, avatar: AvatarAppearance::new(name, tint, Some(format!("ff7/body/{body}"))) }
 }
 
 /// A client in the synthetic battle of formation 1 (two dummies) between two party members (entities 1, ours, and 2), of
@@ -310,18 +316,22 @@ fn only_bodies(f: BattleFrame, bodies: &[Arc<AvatarAsset>]) -> BattleFrame {
     without_bodies(f, &others)
 }
 
-/// Blizz (Barret's combat slot, blue) and Wedge (Tifa's, orange) in the debug formation 301 against its two MPs, the
-/// way the window makes the picture: the server's `EncounterStart` and the area's snapshot go to the client state,
-/// `scene_for` builds the scene, the party's colours come from what the snapshot said about each member's entity.
-/// Before and after are ONE scene at ONE instant: the same frame with the colours shown and taken away, so the pair is
-/// pixel-aligned. Writes `battle_identity_*` in `$FMV_SHOT_DIR`, and checks that the party's bodies are the only thing
-/// that changes (the enemies, the stage and the weapons are bit for bit as they were).
+/// The canon Cloud and Barret (server-controlled companions: their own battle models, no colour) and two players, Blizz
+/// (Barret's stat curve, the lean body, blue) and Wedge (Tifa's curve, the slight body, orange) in the debug formation 301
+/// against its two MPs, the way the window makes the picture: the server's `EncounterStart` and the area's snapshot go to
+/// the client state, `scene_for` builds the scene, the players' colours come from what the snapshot said about each
+/// PLAYER's entity. Before and after are ONE scene at ONE instant: the same frame with the colours shown and taken
+/// away, so the pair is pixel-aligned. Writes `battle_identity_*` in `$FMV_SHOT_DIR`, and checks that the players'
+/// bodies are the only thing that changes (the companions, the enemies, the stage and the weapons are bit for bit as
+/// they were).
 #[test]
 #[ignore = "needs the owner's real FF7 data (FMV_FF7_DATA or FMV_FF7_LIBRARY) and a GPU or software Vulkan/GL driver"]
 fn offscreen_battle_identity_before_after() {
     let Some(real) = open_real() else { return };
     let Some(mut gpu) = Offscreen::new() else { return };
     let party = vec![
+        BattleMember::companion("Cloud", 0, 6, 0),
+        BattleMember::companion("Barret", 1, 6, 0),
         BattleMember::player(EntityId(1), ME, "Blizz", 1, 6, 0),
         BattleMember::player(EntityId(2), AccountId(2), "Wedge", 2, 6, 0),
     ];
@@ -330,7 +340,8 @@ fn offscreen_battle_identity_before_after() {
     let area = AreaId { game: GameId::Ff7, key: "md1stin".into() };
     let mut state = ClientState::new(EntityId(1), ME, Pos::default(), area.clone());
     state.battle.set_rules(Some(Arc::clone(&real.rules)));
-    state.apply(0.0, ServerMsg::AreaSnapshot { area, tick: 1, entities: vec![look(1, "Blizz", BLUE), look(2, "Wedge", ORANGE)], npcs: vec![] });
+    let looks = vec![look(1, "Blizz", BLUE), look_of(2, "Wedge", ORANGE, "slight")];
+    state.apply(0.0, ServerMsg::AreaSnapshot { area, tick: 1, entities: looks, npcs: vec![] });
     assert!(state.apply(0.0, server.start(&setup, real.rules.data_fingerprint())).is_none());
     let (mut slot, mut kit) = (None, Some(real.kit()));
     let battle = state.battle.view(1.0).expect("a view of the battle");
@@ -343,7 +354,8 @@ fn offscreen_battle_identity_before_after() {
     draw_battle_overlay(&battle, &scene.head_anchors(&view), w, h, &mut overlay);
     let nothing = DrawList::new();
     let anchors = scene.screen_anchors(&view);
-    let bodies: Vec<Arc<AvatarAsset>> = (0..2).map(|i| Arc::clone(&scene.actors[i].rig.asset)).collect();
+    // The players' bodies (actors 2 and 3, after the two companions).
+    let bodies: Vec<Arc<AvatarAsset>> = (2..4).map(|i| Arc::clone(&scene.actors[i].rig.asset)).collect();
 
     // After: the scene as `scene_for` left it.
     let after_frame = scene.frame(&view, false);
@@ -371,26 +383,40 @@ fn offscreen_battle_identity_before_after() {
     let inside = |b: (f32, f32, f32, f32), x: u32, y: u32| (x as f32) >= b.0 && (x as f32) <= b.2 && (y as f32) >= b.1 && (y as f32) <= b.3;
     let party_boxes: Vec<_> = anchors.iter().filter(|a| a.side == Side::Party).map(box_of).collect();
     let enemy_boxes: Vec<_> = anchors.iter().filter(|a| a.side == Side::Enemy).map(box_of).collect();
-    let (mut changed, mut outside_party, mut in_enemy, mut per_member) = (0usize, 0usize, 0usize, vec![0usize; party_boxes.len()]);
+    assert_eq!(party_boxes.len(), 4, "Cloud, Barret and the two players");
+    let (companion_boxes, player_boxes) = party_boxes.split_at(2);
+    let (mut changed, mut outside_party, mut in_enemy, mut only_in_companions) = (0usize, 0usize, 0usize, 0usize);
+    let mut per_player = vec![0usize; player_boxes.len()];
     for y in 0..h {
         for x in 0..w {
             let i = ((y * w + x) * 4) as usize;
             if before[i..i + 4] != after[i..i + 4] {
                 changed += 1;
-                match party_boxes.iter().position(|b| inside(*b, x, y)) {
-                    Some(m) => per_member[m] += 1,
-                    None => outside_party += 1,
+                let in_players: Vec<usize> = (0..player_boxes.len()).filter(|&m| inside(player_boxes[m], x, y)).collect();
+                for &m in &in_players {
+                    per_player[m] += 1;
+                }
+                if in_players.is_empty() {
+                    if companion_boxes.iter().any(|b| inside(*b, x, y)) {
+                        only_in_companions += 1;
+                    } else {
+                        outside_party += 1;
+                    }
                 }
                 in_enemy += enemy_boxes.iter().filter(|b| inside(**b, x, y)).count();
             }
         }
     }
-    eprintln!("{changed} pixels differ between before and after; per party member {per_member:?}; outside the party's boxes {outside_party}; inside an enemy's box {in_enemy}");
-    assert!(per_member.iter().all(|&n| n > 2500), "each party member's picture changes: {per_member:?}");
-    assert_eq!(outside_party, 0, "nothing but the party's bodies changes");
+    eprintln!(
+        "{changed} pixels differ between before and after; per player {per_player:?}; only inside a companion's box {only_in_companions}; outside the party's boxes {outside_party}; inside an enemy's box {in_enemy}"
+    );
+    assert!(per_player.iter().all(|&n| n > 1500), "each player's picture changes: {per_player:?}");
+    assert_eq!(only_in_companions, 0, "Cloud and Barret are bit for bit as they were: the colours are the players'");
+    assert_eq!(outside_party, 0, "nothing but the players' bodies changes");
     assert_eq!(in_enemy, 0, "the enemies are bit for bit as they were");
 
-    // The weapons are as they were: where the weapons alone are drawn and no body is, before and after agree.
+    // Everything but the players' bodies (the companions' bodies and weapons, the enemies' and theirs) is as it was:
+    // where those alone are drawn and no player's body is, before and after agree.
     let mut stage = scene.frame(&view, false);
     stage.models.models.clear();
     stage.models.ground.clear();
@@ -410,18 +436,199 @@ fn offscreen_battle_identity_before_after() {
             differing += usize::from(before_bare[i..i + 3] != after_bare[i..i + 3]);
         }
     }
-    eprintln!("{weapon_pixels} pixels show a weapon and no body (including the enemies' weapons): {differing} of them differ between before and after");
-    assert!(weapon_pixels > 500, "the weapons are on the screen ({weapon_pixels} px)");
-    assert_eq!(differing, 0, "the weapons keep their own colours");
+    eprintln!("{weapon_pixels} pixels show a companion, an enemy or a weapon and no player's body: {differing} of them differ between before and after");
+    assert!(weapon_pixels > 500, "the companions, the enemies and the weapons are on the screen ({weapon_pixels} px)");
+    assert_eq!(differing, 0, "the companions, the enemies and the weapons keep their own colours");
 
-    // The pictures to look at: each member, before | after, at 3x.
-    for (m, (name, colour)) in [("barret_blizz", "blue"), ("tifa_wedge", "orange")].into_iter().enumerate() {
-        let a = &anchors[m];
+    // The pictures to look at: each player, before | after, at 3x.
+    for (m, (name, colour)) in [("blizz_lean", "blue"), ("wedge_slight", "orange")].into_iter().enumerate() {
+        let a = &anchors[2 + m];
         let (feet, head) = (a.feet.unwrap(), a.head.unwrap());
         let tall = feet[1] - head[1];
         let bbox = (feet[0] - 0.55 * tall, head[1], feet[0] + 0.55 * tall, feet[1]);
         let panels: Vec<Img> = [&before_bare, &after_bare].iter().map(|img| around(img, w, h, bbox, 14.0, 3)).collect();
         let sheet = hstack(&panels);
         save(&format!("battle_identity_before_after_{name}_{colour}"), sheet.w, sheet.h, &sheet.px);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The owner's cases, as pictures (protocol v9)
+// ---------------------------------------------------------------------------------------------
+
+/// A battle of the debug formation 301 (the two MPs) the way the window makes it, over the owner's own data: the server's
+/// `EncounterStart` and the area's snapshot (`looks`: how the game draws each PLAYER's entity, in its colour) go to a client
+/// state, and `scene_for` builds the scene from them with `kit`. ONE kit serves every battle of a test, as the window's
+/// does: a kit of its own for each battle would make every model a new asset for the GPU, which keeps 32 at most and
+/// starts over (mid-frame) beyond that.
+struct RealBattle {
+    scene: BattleScene,
+    battle: BattleView,
+}
+
+fn real_battle(real: &Real, kit: &mut Option<ModelKit>, party: Vec<BattleMember>, looks: Vec<EntitySnapshot>, seed: u64) -> RealBattle {
+    let setup = BattleSetup { formation_id: 301, seed, party, preemptive: true, back_attack: false, battle_speed: 0, ticks_per_second: 1000 };
+    let server = Server { id: BattleId(1), state: real.rules.build(&setup).expect("the formation builds") };
+    let area = AreaId { game: GameId::Ff7, key: "md1stin".into() };
+    let mut state = ClientState::new(EntityId(1), ME, Pos::default(), area.clone());
+    state.battle.set_rules(Some(Arc::clone(&real.rules)));
+    state.apply(0.0, ServerMsg::AreaSnapshot { area, tick: 1, entities: looks, npcs: vec![] });
+    assert!(state.apply(0.0, server.start(&setup, real.rules.data_fingerprint())).is_none());
+    let mut slot = None;
+    let battle = state.battle.view(1.0).expect("a view of the battle");
+    let events = state.battle.take_events();
+    scene_for(&mut slot, kit, &state, &battle, 1.0, &events).expect("a scene");
+    RealBattle { scene: slot.expect("a scene"), battle }
+}
+
+/// One of the owner's cases: the players of a battle in party order, each with its name, its stat curve (internal: who it
+/// fights like), the placeholder body the field draws it as and its colour.
+struct Case {
+    name: &'static str,
+    players: &'static [(&'static str, u8, &'static str, [u8; 3])],
+}
+
+const GREEN: [u8; 3] = [60, 200, 90];
+
+const CASES: [Case; 4] = [
+    // The DoD picture: the canon pair and two players.
+    Case { name: "two_players", players: &[("Blizzy", 1, "lean", BLUE), ("Wedge", 2, "slight", ORANGE)] },
+    // Up to five in the party: the canon pair and the three players the party allows.
+    Case { name: "three_players", players: &[("Blizzy", 1, "lean", BLUE), ("Wedge", 2, "slight", ORANGE), ("Biggs", 4, "sturdy", GREEN)] },
+    // The owner's bug: a new character on Barret's curve (his "Blizzy"), alone, was drawn as Barret and fought alone.
+    Case { name: "solo_new_character_on_barrets_curve", players: &[("Blizzy", 1, "lean", BLUE)] },
+    // An account of before the creator, on Cloud's curve (his "Blizz"), alone: Cloud is the canon one only.
+    Case { name: "solo_migrated_account_on_clouds_curve", players: &[("Blizz", 0, "lean", ORANGE)] },
+];
+
+/// The canon characters of the first reactor mission, in the order the roster has them.
+const CANON: [(&str, u8); 2] = [("Cloud", 0), ("Barret", 1)];
+
+/// What `case`'s roster is: Cloud and Barret as companions, then the players (the first is ours, entity 1).
+fn roster_of_case(case: &Case) -> (Vec<BattleMember>, Vec<EntitySnapshot>) {
+    let mut party: Vec<BattleMember> = CANON.iter().map(|(name, character)| BattleMember::companion(*name, *character, 6, 0)).collect();
+    let mut looks = Vec::new();
+    for (i, (name, curve, body, colour)) in case.players.iter().enumerate() {
+        let account = if i == 0 { ME } else { AccountId(1 + i as u64) };
+        party.push(BattleMember::player(EntityId(1 + i as u64), account, *name, *curve, 6, 0));
+        looks.push(look_of(1 + i as u64, name, *colour, body));
+    }
+    (party, looks)
+}
+
+/// The models themselves: the canon members come first and each is the canon character's OWN battle model (battle units,
+/// its weapon, the very rig the kit makes for that character), and every player after them is its own FIELD body (the
+/// field's scale, no weapon, no battle clips of its own: it moves procedurally), no player's model is any canon
+/// member's and the players' differ among themselves. A canon battle model on a player is a bug.
+fn check_models(b: &RealBattle, kit: &mut ModelKit, case: &Case) {
+    let members: Vec<Arc<ActorRig>> = b.scene.actors.iter().filter(|a| a.side == Side::Party).map(|a| Arc::clone(&a.rig)).collect();
+    assert_eq!(members.len(), CANON.len() + case.players.len(), "{}: the canon pair, then every player", case.name);
+    for (i, (_, character)) in CANON.iter().enumerate() {
+        let rig = &members[i];
+        assert_eq!(rig.scale, 1.0, "{}: member {i} is a battle model, in battle units", case.name);
+        assert_eq!(rig.attachments.len(), 1, "{}: member {i} carries its weapon", case.name);
+        let model = kit.source.party_member(&PartyLook::companion(ActorId(i as u8), *character, false));
+        let canon = kit.rigs.resolve(&model, BoxSpec::for_party(0));
+        assert!(Arc::ptr_eq(&rig.asset, &canon.asset), "{}: member {i} is canon character {character}'s own battle model", case.name);
+    }
+    for (i, rig) in members.iter().enumerate().skip(CANON.len()) {
+        assert_eq!(rig.scale, model::FIELD_TO_BATTLE_SCALE, "{}: player {i} is a field body at the field's scale", case.name);
+        assert!(rig.attachments.is_empty(), "{}: a field body carries no weapon", case.name);
+        assert_eq!(rig.kit, Kit::none(), "{}: a field body has no battle clips of its own", case.name);
+        // Every case here gives each player a body of its own, so no two members share a model.
+        for (c, other) in members.iter().enumerate().filter(|(c, _)| *c != i) {
+            assert!(!Arc::ptr_eq(&rig.asset, &other.asset), "{}: member {i} and member {c} are not the same model", case.name);
+        }
+    }
+}
+
+/// The colours land on the players' bodies and nowhere else: the walk of a frame is each party member's body then its
+/// weapons, in party order, then the enemies'.
+fn check_colours(b: &RealBattle, case: &Case, frame: &BattleFrame) {
+    let mut expected = Vec::new();
+    for (i, actor) in b.scene.actors.iter().enumerate().filter(|(_, a)| a.side == Side::Party) {
+        let colour = i.checked_sub(CANON.len()).map(|p| case.players[p].3);
+        expected.push(colour.map_or(Identity::NONE, Identity::of));
+        expected.resize(expected.len() + actor.rig.attachments.len(), Identity::NONE);
+    }
+    assert_eq!(frame.identities[..expected.len()], expected[..], "{}: only the players' bodies carry a colour, each its own", case.name);
+    assert!(frame.identities[expected.len()..].iter().all(|i| *i == Identity::NONE), "{}: the enemies keep their own", case.name);
+}
+
+/// The owner's cases over his own data, as numbers and as pictures through the real renderer: the canon Cloud and Barret
+/// (companions: their own battle models) and then every player in its OWN body, in its colour, whatever stat curve it
+/// fights with. For each case it checks the models (no canon battle model on any player, the canon pair as themselves, no
+/// second Cloud and no second Barret), the colours (the players' bodies only) and the composition (everybody inside the
+/// window, nobody hidden behind another, the bottom free for the menus), and writes `battle_canon_<case>_1920x1080.png`
+/// (with the overlay, as the player sees it) and `battle_canon_<case>_closeups.png` (the party members at 2x, no overlay)
+/// in `$FMV_SHOT_DIR`. Needs `FMV_FF7_DATA` with the real `battle.lgp`: the canon pair are stand-ins without it.
+#[test]
+#[ignore = "needs the owner's real FF7 data (FMV_FF7_DATA or FMV_FF7_LIBRARY) and a GPU or software Vulkan/GL driver"]
+fn offscreen_battle_canon_party_with_every_player_in_its_own_body() {
+    let Some(real) = open_real() else { return };
+    if real.battle_lgp.is_none() {
+        eprintln!("skipped: this machine has no battle.lgp, so the canon pair would be stand-ins");
+        return;
+    }
+    let Some(mut gpu) = Offscreen::new() else { return };
+    let (w, h) = (1920u32, 1080u32);
+    let mut kit = Some(real.kit());
+    for case in &CASES {
+        let (party, looks) = roster_of_case(case);
+        let b = real_battle(&real, &mut kit, party, looks, 0xB11);
+        check_models(&b, kit.as_mut().expect("the kit"), case);
+
+        let view = b.scene.view(w, h);
+        let frame = b.scene.frame(&view, false);
+        check_colours(&b, case, &frame);
+
+        // The composition: everybody on the screen, inside the side margins, the bottom free; the party's members
+        // stand apart (no one hides another's body).
+        let anchors = b.scene.screen_anchors(&view);
+        let mut party_x = Vec::new();
+        for a in &anchors {
+            let (feet, head) = (a.feet.expect("feet"), a.head.expect("head"));
+            assert!(a.drawn, "{}: {a:?} is drawn", case.name);
+            assert!(feet[0] > w as f32 * 0.04 && feet[0] < w as f32 * 0.96, "{}: {a:?} is inside the side margins", case.name);
+            assert!(head[1] > 0.0 && feet[1] < h as f32 * 0.86, "{}: {a:?} is inside, and the bottom is free", case.name);
+            if a.side == Side::Party {
+                party_x.push((feet[0], feet[1] - head[1]));
+            }
+        }
+        eprintln!("{}: party feet x and height in pixels {:?}", case.name, party_x.iter().map(|(x, t)| (x.round() as i32, t.round() as i32)).collect::<Vec<_>>());
+        for (i, (xi, ti)) in party_x.iter().enumerate() {
+            for (xj, tj) in &party_x[i + 1..] {
+                assert!((xi - xj).abs() > 0.3 * ti.min(*tj), "{}: two party members stand on top of each other ({xi} and {xj})", case.name);
+            }
+        }
+
+        // The pictures, and in each of them everybody really is drawn where the scene says (a model the GPU did not
+        // have ready would be a hole in the picture): the pixels along each figure differ from the stage drawn the same
+        // way with nobody on it.
+        let mut overlay = DrawList::new();
+        draw_battle_overlay(&b.battle, &b.scene.head_anchors(&view), w, h, &mut overlay);
+        let with_overlay = gpu.render_battle(w, h, &frame, &overlay);
+        let bare = gpu.render_battle(w, h, &frame, &DrawList::new());
+        let mut empty_stage = b.scene.frame(&view, false);
+        empty_stage.models.models.clear();
+        empty_stage.models.ground.clear();
+        let stage_with_overlay = gpu.render_battle(w, h, &empty_stage, &overlay);
+        let stage_bare = gpu.render_battle(w, h, &empty_stage, &DrawList::new());
+        for a in &anchors {
+            assert!(drawn_at(&with_overlay, &stage_with_overlay, w, a), "{}: {a:?} is in the picture with the overlay", case.name);
+            assert!(drawn_at(&bare, &stage_bare, w, a), "{}: {a:?} is in the picture without it", case.name);
+        }
+        save(&format!("battle_canon_{}_1920x1080", case.name), w, h, &with_overlay);
+        let closeups: Vec<Img> = anchors
+            .iter()
+            .filter(|a| a.side == Side::Party)
+            .map(|a| {
+                let (feet, head) = (a.feet.unwrap(), a.head.unwrap());
+                let tall = feet[1] - head[1];
+                around(&bare, w, h, (feet[0] - 0.55 * tall, head[1], feet[0] + 0.55 * tall, feet[1]), 14.0, 2)
+            })
+            .collect();
+        let sheet = hstack(&closeups);
+        save(&format!("battle_canon_{}_closeups", case.name), sheet.w, sheet.h, &sheet.px);
     }
 }

@@ -70,7 +70,7 @@ fn changed_pixels(a: &[u8], b: &[u8], by: u8) -> usize {
 
 /// Is somebody drawn at `anchor`? Somewhere on the line from the feet to the head the picture is not
 /// what the stage alone shows (a thin figure seen edge-on is only a few pixels wide).
-fn drawn_at(shot: &[u8], bare: &[u8], w: u32, a: &ActorScreen) -> bool {
+pub(super) fn drawn_at(shot: &[u8], bare: &[u8], w: u32, a: &ActorScreen) -> bool {
     let (Some(feet), Some(head)) = (a.feet, a.head) else { return false };
     let h = (shot.len() / 4) as u32 / w;
     (1..20).any(|k| {
@@ -162,8 +162,18 @@ impl Server {
     }
 }
 
+/// A PLAYER of party index `i` fighting with the stat curve of FF7 character `character`, at level 12: drawn as its own
+/// body, never as a canon character (protocol v9).
 pub(super) fn member(i: u64, character: u8) -> BattleMember {
     BattleMember::player(EntityId(10 + i), if i == 0 { ME } else { AccountId(10 + i) }, format!("P{i}"), character, 12, 0)
+}
+
+/// The canon companion of FF7 character `character` at level 12 (its canon name, no limit gauge): the party member of
+/// the pictures and the sheets of the canon characters' own battle models, clips and blows. A canon battle model is a
+/// companion's, never a player's.
+pub(super) fn canon(character: u8) -> BattleMember {
+    let name = fmv_ff7_battle::kernel::CharacterId::from_index(usize::from(character)).map_or("?", |c| c.name());
+    BattleMember::companion(name, character, 12, 0)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -411,7 +421,9 @@ fn real_window_path_finds_the_battle_archive_through_open_ff7() {
 
 /// The debug formation (301: `md1stin`'s) from the owner's own data, as the window shows it: a real
 /// `BattleClient` replays a real engine, the scene is made from what the client hands it, and the
-/// frames go through the renderer. Writes the PNGs and checks the composition.
+/// frames go through the renderer. The party is the first mission's (protocol v9): the canon Cloud and Barret, whose
+/// models are the real battle models, and one player (ours, on Tifa's stat curve), its own field body. Writes the
+/// PNGs and checks the composition.
 #[test]
 #[ignore = "needs the owner's real FF7 data (FMV_FF7_DATA or FMV_FF7_LIBRARY) and a GPU or software Vulkan/GL driver"]
 fn offscreen_real_ff7_battle_formation() {
@@ -424,7 +436,7 @@ fn offscreen_real_ff7_battle_formation() {
     let setup = BattleSetup {
         formation_id,
         seed: 0x5CE7E,
-        party: vec![member(0, 0), member(1, 2), member(2, 1)],
+        party: vec![canon(0), canon(1), BattleMember::player(EntityId(1), ME, "Wedge", 2, 12, 0)],
         preemptive: true,
         back_attack: false,
         battle_speed: 0,
@@ -446,11 +458,13 @@ fn offscreen_real_ff7_battle_formation() {
     let mut scene = BattleScene::new(&start, client.engine(), &mut kit).expect("a scene");
     if real.battle_lgp.is_some() {
         // Who is a real battle model: scale 1 (battle units, which a field stand-in at scale 36 is not;
-        // a box is 1 too), the party carrying its weapons, the location. For the default formation
-        // (the MPs) every actor also stands at a person's height and plays the archive's own idle
-        // loop; other formations have bosses, one-frame idles and the like, which these do not hold for.
+        // a box is 1 too), the canon companions carrying their weapons, the location. The player (the third member of
+        // the party) is its own field body instead: the field's scale, no weapon, a procedural idle. For the default
+        // formation (the MPs) every actor also stands at a person's height and the battle models play the archive's
+        // own idle loop; other formations have bosses, one-frame idles and the like, which these do not hold for.
         for (i, actor) in scene.actors.iter().enumerate() {
             let r = &actor.rig;
+            let own_body = actor.side == Side::Party && i >= 2;
             eprintln!(
                 "actor {i} ({:?}): scale {}, height {:.0}, radius {:.0}, {} attachment(s), idle {}",
                 actor.side,
@@ -460,13 +474,18 @@ fn offscreen_real_ff7_battle_formation() {
                 r.attachments.len(),
                 if r.procedural_idle { "swayed (a still pose)" } else { "plays the clip" }
             );
-            assert_eq!(r.scale, 1.0, "actor {i} is in battle units, not a field stand-in");
-            if actor.side == Side::Party {
-                assert_eq!(r.attachments.len(), 1, "party member {i} carries its weapon");
+            if own_body {
+                assert_eq!(r.scale, model::FIELD_TO_BATTLE_SCALE, "the player {i} is its own field body, never a canon battle model");
+                assert!(r.attachments.is_empty(), "a field body carries no weapon");
+            } else {
+                assert_eq!(r.scale, 1.0, "actor {i} is in battle units, not a field stand-in");
+                if actor.side == Side::Party {
+                    assert_eq!(r.attachments.len(), 1, "canon member {i} carries its weapon");
+                }
             }
             if formation_id == 301 {
                 assert!(r.height > 600.0 && r.height < 1300.0, "actor {i}: {}", r.height);
-                assert!(!r.procedural_idle, "actor {i}'s idle loop is the archive's clip");
+                assert!(own_body || !r.procedural_idle, "actor {i}'s idle loop is the archive's clip");
             }
         }
         if formation_id == 301 {
@@ -570,13 +589,14 @@ fn offscreen_real_ff7_battle_formation() {
     assert_eq!(client.divergences(), 0);
 }
 
-/// A real battle of two players named for themselves: "Blizz", who holds Barret's combat slot, and "Wedge", who holds
-/// Tifa's. The overlay (the party panel, the HP list, the target list, the command menu) calls them by their own
-/// names and never by Barret's or Tifa's, which the engine's combat templates are called; their models in battle are
-/// their slots' (Barret's and Tifa's battle models, a stand-in for the slot's). Made the way the window makes it: the
-/// server's `EncounterStart` goes to the client state, `scene_for` builds the scene from it, and the overlay is drawn
-/// over it through the real renderer: `battle_names.png` in `$FMV_SHOT_DIR`. Needs the owner's own `scene.bin`,
-/// `kernel.bin`, `char.lgp` and, for the real battle models, `battle.lgp` (`FMV_FF7_DATA`).
+/// A real battle of two players named for themselves (a roster of players only, as the battle of an area with no canon
+/// party has it): "Blizz", who fights with Barret's stat curve, and "Wedge", with Tifa's. The overlay (the party panel,
+/// the HP list, the target list, the command menu) calls them by their own names and never by Barret's or Tifa's, which
+/// the engine's combat templates are called; their models in battle are their own bodies (the default placeholder
+/// body here: the snapshot says no other). Made the way the window makes it: the server's `EncounterStart` goes to the
+/// client state, `scene_for` builds the scene from it, and the overlay is drawn over it through the real renderer:
+/// `battle_names.png` in `$FMV_SHOT_DIR`. Needs the owner's own `scene.bin`, `kernel.bin` and `char.lgp`
+/// (`FMV_FF7_DATA`); `battle_canon_*.png` of `identity_tests` is the same battle beside the canon Cloud and Barret.
 #[test]
 #[ignore = "needs the owner's real FF7 data (FMV_FF7_DATA or FMV_FF7_LIBRARY) and a GPU or software Vulkan/GL driver"]
 fn offscreen_real_battle_names() {

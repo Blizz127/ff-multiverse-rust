@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/battle-smoke.sh - shared-battle smoke test for fmv-server + fmv-client (protocol v9).
 #
-# Usage: scripts/battle-smoke.sh [--fixture|--random|--progress|--commands] [--release|--debug]
+# Usage: scripts/battle-smoke.sh [--fixture|--random|--progress|--commands|--solo] [--release|--debug]
 #                                [--bin-dir DIR] [--build] [--library STATE_DIR] [--duration SECS]
 #                                [--formation ID] [--tick-rate TPS] [--battle-speed N] [--seed N]
 #                                [--bot idle|circle] [--keep-logs] [-h|--help]
@@ -35,7 +35,19 @@
 #     commands per actor, of any kind: Attack, Magic, Item, Defend, Limit or Escape; both at least 1)
 #     and each bot counts a command of its own applied;
 #   * each bot was told its inventory (protocol v6): its SMOKE line ends with items=N, the total
-#     of what it carries (a new account starts with the game's starting stock, so N is at least 1).
+#     of what it carries (a new account starts with the game's starting stock, so N is at least 1);
+#   * the roster is the canon party and then the two players: the server's "battle started" line says
+#     names=[Cloud,Barret,A,B] characters=[0, 1, 1, 1] companions=2, the canon Cloud and Barret acted through the server's own
+#     commands (`companion acted ... name=Cloud command=`, the same for Barret, and each at least once in commands=[..]) and
+#     the rewards are the two players' only (two "battle reward" lines; a companion has no account).
+#
+# --solo (real data): ONE new character alone, the owner's "Blizzy" case: the same server as the default mode (md1stin,
+# --debug-encounters, formation 12) and a single bot A (a new character on the default Barret stat curve) that asks for the
+# battle at once. Expected: the roster is [Cloud, Barret, A], nobody dropped or replaced: the server's "battle started" line
+# says members=1 names=[Cloud,Barret,A] characters=[0, 1, 1] companions=2, the bot is told it fights as actor 2 of a party of 3,
+# the canon pair act through server-applied commands (each at least once), the battle ends in Victory, the bot replayed every
+# command from its own battle data with 0 divergences, and the reward and the save are the one player's (one "battle reward"
+# line, one "progress saved" line).
 #
 # --random: the same two bots, but WITHOUT --debug-encounters and with random encounters on: the
 # bots (--bot circle, party formed, both --battle-auto) walk md1stin and the server rolls the
@@ -62,10 +74,11 @@
 # second "battle started" line carries those levels (levels=[..]: the second battle's EncounterStart
 # carries the level gained), and the second win adds on. Run 3 (a reconnect, no fighting): the SMOKE line
 # shows what run 2 ended with. The server must also have logged one "progress saved" line per member
-# per battle. Both bots are Barret (protocol v8: a headless bot registers asking for no combat slot, and a
-# new character that asks for none gets the server's default, Barret's; two players may hold one slot, and
-# Cloud's is never offered to a new character). On the Steam data Barret starts at level 6 with 385
-# experience, 252 short of level 7, and one win here pays 16: these two wins pay experience, the progress
+# per battle. Both bots fight with Barret's stat curve (protocol v8: a headless bot registers asking for no
+# fighting style, and a new character that asks for none gets the server's default, Barret's curve; two players may hold
+# one, and Cloud's is never offered to a new character; the canon Barret fights beside them as a companion, neither paid
+# nor saved). On the Steam data that character starts at level 6 with 385
+# experience, 252 short of level 7, and one win here pays 8 (393, then 401): these two wins pay experience, the progress
 # and the drops, and gain no level, so the level-up itself (leveled_up=true, the EncounterStart that
 # carries the level gained) is not reached over real processes here any more (the old Cloud bot started six
 # short of level 7); the server's progress tests cover it. The server is not restarted here (the client's token
@@ -86,30 +99,31 @@
 # often drop nothing under a random seed (a note says when neither battle did); --seed 5 pins one under
 # which formation 301 drops a Potion in every battle, so the whole drop chain runs.
 #
-# The same chain for the LIMIT GAUGE (protocol v7): a new account starts its first battle with an empty
-# gauge (the server's "battle started ... limits=[0, 0]"), the damage the party takes fills it, and the
-# gauges the first battle ended with (the server's "battle ended ... limits=[a, b]") are exactly what the
-# second battle starts with (the server keeps the gauge in its mirror of the character and queues it for
-# the saver: "limit kept ... saving=queued"). Stopping the server must have written every queued gauge:
-# one "limit saved account=" line per "saving=queued" (those are not "progress saved" lines, which stay one
-# per member per won battle). Every "battle started" line also says how hard the fight is to run from
-# (run_difficulty=N, or none), read from scene.bin's own flags and counters. The bots give their limit break
-# when the gauge is full and never escape, but these weak enemies rarely fill a gauge in one battle, so this
-# mode does not fire a limit or an escape: --commands (below) does, over real processes. The gauge a battle
-# ends with surviving a restart is tested by crates/fmv-server/tests/progress.rs; Braver and running with the
-# owner's own kernel and scenes by crates/fmv-ff7-battle/tests/real_data.rs.
+# The same chain for the LIMIT GAUGE (protocol v7; since v9 players have NO limit break, so no battle moves a player's
+# gauge and the check is "stored gauge preserved"): a new account starts its first battle with an empty gauge (the
+# server's "battle started ... limits=[0, 0, 0, 0]": the two canon companions' entries first, then the players'), the
+# gauges the first battle ended with (the server's "battle ended ... limits=[..]") are exactly what the second battle
+# starts with, and the script prints a note that says so (limit carry-over for players is moot until players have a limit
+# break; scripts/slice-smoke.sh checks a non-empty stored gauge over a real restart). Stopping the server must have
+# written every queued gauge: one "limit saved account=" line per "saving=queued" (none here; those are not "progress
+# saved" lines, which stay one per member per won battle). Every "battle started" line also says how hard the fight is to
+# run from (run_difficulty=N, or none), read from scene.bin's own flags and counters. The bots never escape: this mode
+# does not fire a limit or an escape, --commands (below) does, over real processes. The gauge a battle ends with
+# surviving a restart is tested by crates/fmv-server/tests/progress.rs; Braver and running with the owner's own kernel and
+# scenes by crates/fmv-ff7-battle/tests/real_data.rs.
 #
 # --commands (real data): EVERY battle command over real processes. The headless bots only attack (and
 # heal below 30% HP, which the first enemies never bring about), so the server runs with --debug-limit-full
 # (every battle member starts with a FULL limit gauge; it needs --debug-encounters, and what it leaves
 # alone is in `fmv-server --help`) and the bots follow a --battle-script. ONE server stays up through two
 # runs of the same two bots (they log in again with the tokens the first run saved; each run is one
-# battle of formation 301, whose run difficulty is 1, so it can be escaped):
-#   run 1 "cmds":   A: defend,item:0,magic:0,limit   B: magic:0,magic:9999,item:0,defend,limit
+# battle of formation 12, whose run difficulty is 1, so it can be escaped):
+#   run 1 "cmds":   A: defend,item:0,magic:0   B: magic:0,magic:9999,item:0,defend
 #                   (Potion is item 0, Cure is spell 0; spell 9999 does not exist: the entry must be skipped,
-#                   counted and not retried, and the next one tried in the same turn; the limit goes last, as
-#                   the enemies of this formation die in one blow, so nothing ends the battle before the
-#                   other entries are applied). Expected: both bots win it.
+#                   counted and not retried, and the next one tried in the same turn). There is no `limit` entry:
+#                   players have no limit break in v9 (the server would refuse it, NoLimit), so the limit break is
+#                   the canon companions': --debug-limit-full fills their gauge and the server's rule gives it.
+#                   Expected: both bots win it.
 #   run 2 "escape": A and B: escape x6 (a run check succeeds 68% of the time per attempt, so several attempts
 #                   are listed; the first success ends the battle). Expected: the battle ends in Escaped.
 # The scripts can be overridden to try the mode's failure paths: FMV_SMOKE_SCRIPT_A, FMV_SMOKE_SCRIPT_B
@@ -120,16 +134,17 @@
 #     divergences, run 1 ended in Victory and run 2 in Escaped;
 #   * the commands the server applied for the bots' own characters, read from each bot's closing
 #     `headless: battles:` breakdown "(N attack, N magic, N item, N defend, N limit, N escape)" and summed
-#     over both bots and both runs, include each of magic, item, defend, limit and escape at least once
+#     over both bots and both runs, include each of magic, item, defend and escape at least once and no limit
 #     (a missing or unparseable breakdown is a failure, never a zero);
-#   * the server's own key=value lines agree: one "magic used", "defend used", "item used", "limit used" and
-#     "escape tried" line per command the bots counted (and an "escape tried ... result=escaped" for run 2),
-#     with the item's stock going down (left=N) and every queued write saved when the server stops;
-#   * both "battle started" lines say limits=[255, 255] (the --debug-limit-full gauge), the second one says how
-#     hard the fight is to run from (run_difficulty=N, a number), and the server warned about the debug flag
-#     when it started;
-#   * the debug gauge is never stored: no "limit kept" line says limit=255, and the escape battle, in which
-#     nobody spent a gauge, kept none (unless a member was knocked out and kept 0);
+#   * the server's own key=value lines agree: one "magic used", "defend used", "item used" and "escape tried" line
+#     per command the bots counted (and an "escape tried ... result=escaped" for run 2), with the item's stock going
+#     down (left=N) and every queued write saved when the server stops; no "limit used" line (players have none)
+#     and at least one "companion acted ... command=limit attack=<limit id>" line, each by Cloud or Barret;
+#   * both "battle started" lines say the PLAYERS' limits=[255, 255] (the --debug-limit-full gauge, sent in the
+#     roster and ignored by the engine for players), the second one says how hard the fight is to run from
+#     (run_difficulty=N, a number), and the server warned about the debug flag when it started;
+#   * the debug gauge is never stored: no "limit kept" line at all, and one "limit not kept ...
+#     reason=debug-limit-full" line for every battle that ended;
 #   * each bot's script line "entries=N applied=N skipped=N refused=N lost=N unused=N" adds up, and the
 #     default script B skipped exactly its one impossible entry.
 #
@@ -188,7 +203,7 @@ ESCAPE_SCRIPT="${FMV_SMOKE_ESCAPE_SCRIPT:-escape,escape,escape,escape,escape,esc
 
 usage() {
   cat <<'EOF'
-Usage: scripts/battle-smoke.sh [--fixture|--random|--progress|--commands] [--release|--debug]
+Usage: scripts/battle-smoke.sh [--fixture|--random|--progress|--commands|--solo] [--release|--debug]
                                [--bin-dir DIR] [--build] [--library STATE_DIR] [--duration SECS]
                                [--formation ID] [--tick-rate TPS] [--battle-speed N] [--seed N]
                                [--bot idle|circle] [--keep-logs] [-h|--help]
@@ -204,10 +219,13 @@ a FIXTURE server refuses battles cleanly. --progress: the real-data bots fight, 
 their saved tokens and fight again, then reconnect once more: each run's progress notes must be
 consistent (a win pays experience and a level where the threshold was crossed), the second battle
 must carry the level gained and the limit gauges the first battle ended with (protocol v7), and every
-reconnect must show what the run before ended with. --commands: every battle command over real
+reconnect must show what the run before ended with. --solo: one new character alone, whose roster must be the
+canon Cloud and Barret and then itself (nobody dropped or replaced), the canon pair commanded by the server and
+every command replayed by the bot with 0 divergences. --commands: every battle command over real
 processes: the server runs with --debug-limit-full (every member starts with a full limit gauge) and
-the bots follow a --battle-script, once to use defend, item, magic and limit in a battle they win and
-once to escape; each command must be applied by the server at least once (the bots' own breakdown
+the bots follow a --battle-script, once to use defend, item and magic in a battle they win (the limit
+break is the canon companions': players have none in protocol v9) and once to escape; each command must
+be applied by the server at least once (the bots' own breakdown
 "(N attack, N magic, N item, N defend, N limit, N escape)" and the server's own log lines must agree)
 and every battle must be verified by replay with 0 divergences. The scripts can be overridden with
 FMV_SMOKE_SCRIPT_A, FMV_SMOKE_SCRIPT_B and FMV_SMOKE_ESCAPE_SCRIPT (see the header of this script).
@@ -725,6 +743,9 @@ run_real() {
     done
   fi
   (($(count_lines_with "$WORK/server.log" "battle started") <= 1)) || problem "the server started more than one battle"
+  # The roster is the canon party and then the two players, the canon pair acted through the server's commands and the
+  # rewards are the players' only.
+  check_canon_battle "$WORK/server.log" "A,B" "1, 1" 2
 
   stop_server
   # Stopping the server saved everything queued: both members' payments are in the store.
@@ -748,7 +769,139 @@ run_real() {
     say "client $n: $(last_line_with "$WORK/client-$n.log" "after the last battle:" || true)"
   done
   RESULT=pass
-  say "PASS: two bots fought one shared battle on the real field, both gave commands, each replayed it from its own battle data, won it and carries an inventory; $state_real unchanged ($after)"
+  say "PASS: two bots fought one shared battle on the real field beside the canon Cloud and Barret (roster Cloud, Barret, A, B; the server commanded the canon pair), both gave commands, each replayed it from its own battle data, won it and carries an inventory, and only the two players were paid; $state_real unchanged ($after)"
+}
+
+# check_canon_battle <server log> <players> <curves> <count>: the battle the server started has the story's canon party first
+# and then the players (protocol v9): `companions=2`, `names=[Cloud,Barret,<players>]` (the players' own names, comma
+# separated, in party order) and `characters=[0, 1, <curves>]` (Cloud's and Barret's stat curves, then each player's as
+# given, e.g. "1, 1" for two new characters of the default Barret curve); the two canon members acted through the server's
+# own commands (a `companion acted ... name=Cloud command=` line, the same for Barret, and each of their counts in the
+# "battle ended" line's commands=[..] is at least 1); and the rewards are the PLAYERS' only: <count> "battle reward" lines,
+# one per player, none for a companion (which has no account).
+check_canon_battle() {
+  local log="$1" players="$2" curves="$3" count="$4" started ended name counts c rewards
+  local -a companion_counts=()
+  started=$(strip_ansi "$(first_line_with "$log" "battle started" || true)")
+  ended=$(strip_ansi "$(last_line_with "$log" "battle ended" || true)")
+  [[ $(companions_of "$started") == 2 ]] || problem "the battle did not start with the two canon companions (companions=2): $started"
+  [[ $started == *" names=[Cloud,Barret,$players]"* ]] || problem "the roster is not Cloud, Barret, then $players (names=[Cloud,Barret,$players]): $started"
+  [[ $started == *" characters=[0, 1, $curves]"* ]] || problem "the stat curves are not Cloud's, Barret's, then [$curves] (characters=[0, 1, $curves]): $started"
+  for name in Cloud Barret; do
+    (($(count_lines_with "$log" " name=$name command=") >= 1)) || problem "the server logged no 'companion acted ... name=$name command=' line: the canon $name never acted through the server's commands"
+  done
+  counts=$(companion_commands_of "$ended")
+  read -r -a companion_counts <<<"$counts"
+  ((${#companion_counts[@]} == 2)) || problem "the battle-end line has no commands for the two companions: $ended"
+  for c in "${companion_counts[@]}"; do
+    ((c >= 1)) || problem "a canon companion never gave a command (commands of the companions [$counts]): $ended"
+  done
+  rewards=$(count_lines_with "$log" "battle reward battle=")
+  ((rewards == count)) || problem "the server logged $rewards 'battle reward' line(s), expected $count (one per player, none for a companion)"
+}
+
+# --solo: ONE new character alone beside the canon pair, over real processes (see the header).
+run_solo() {
+  local state_real="$LIBRARY"
+  [[ -d $state_real/library/sets ]] || {
+    err "no library under $state_real (needs owned FF7 content imported with fmv-import); pass --library STATE_DIR"
+    exit 1
+  }
+  local before after
+  before=$(ls -A -- "$state_real" | sort | tr '\n' ' ')
+
+  mkdir -p -- "$WORK/lib-state" "$WORK/state-env" "$WORK/server-state" "$WORK/client-A"
+  ln -s -- "$(cd -- "$state_real" && pwd -P)/library" "$WORK/lib-state/library"
+  export FMV_STATE_DIR="$WORK/state-env"
+
+  local -a server_args=(--bind 127.0.0.1:0 --ff7-library "$WORK/lib-state" --state-dir "$WORK/server-state"
+    --debug-encounters --no-random-encounters --battle-speed "$BATTLE_SPEED" --battle-tick-rate "$TICK_RATE")
+  server_args+=(--debug-formation "$FORMATION")
+  if [[ -n $SEED ]]; then
+    server_args+=(--battle-seed "$SEED")
+  fi
+  say "starting server: $SERVER_BIN ${server_args[*]}"
+  "$SERVER_BIN" "${server_args[@]}" >"$WORK/server.log" 2>&1 &
+  SERVER_PID=$!
+  wait_ready "$WORK/server.log"
+  say "server READY: $READY_LINE"
+  [[ $(field "$READY_LINE" area) == Ff7/md1stin && $(field "$READY_LINE" fixture) == false ]] || fail "the server is not hosting the real FF7 field md1stin: $READY_LINE"
+
+  CLIENT_NAMES=(A)
+  say "starting the one bot A for ${BATTLE_DURATION}s against $CONNECT (a new character alone, on the default Barret stat curve; bots: $BOT)"
+  "$CLIENT_BIN" --server "$CONNECT" --headless --duration "$BATTLE_DURATION" --bot "$BOT" --ff7-library "$WORK/lib-state" \
+    --name A --state-dir "$WORK/client-A" --battle-auto --debug-encounters >"$WORK/client-A.log" 2>&1 &
+  CPID[A]=$!
+  wait_clients $((BATTLE_DURATION + CLIENT_GRACE))
+
+  local log="$WORK/client-A.log" smoke_line value started ended
+  SMOKE_LINES=()
+  if [[ ${CRC[A]:-} == timeout ]]; then
+    problem "client A was still running ${CLIENT_GRACE}s after its ${BATTLE_DURATION}s duration and was killed"
+  elif [[ ${CRC[A]:-} != 0 ]]; then
+    problem "client A exited with status ${CRC[A]:-unknown}"
+  fi
+  if smoke_line=$(last_line_with "$log" "SMOKE name="); then
+    smoke_line=$(strip_ansi "$smoke_line")
+    SMOKE_LINES+=("$smoke_line")
+    for value in "battles=1" "victories=1"; do
+      [[ $smoke_line == *" $value"* ]] || problem "client A: the SMOKE line lacks $value: $smoke_line"
+    done
+    [[ $(field "$smoke_line" fixture) == false ]] || problem "client A: fixture is not false: $smoke_line"
+    value=$(field "$smoke_line" exp)
+    [[ $value =~ ^[0-9]+$ ]] && ((value >= 1)) || problem "client A: the SMOKE line has no experience (exp=$value): $smoke_line"
+    value=$(field "$smoke_line" items)
+    [[ $value =~ ^[0-9]+$ ]] && ((value >= 1)) || problem "client A: the SMOKE line has no items (items=$value): $smoke_line"
+  else
+    problem "client A printed no SMOKE line"
+  fi
+  log_has "$log" "ended in Victory" || problem "client A never saw the battle end in Victory"
+  log_has "$log" "back in the field" || problem "client A never reported being back in the field"
+  if log_has "$log" "DIVERGENCE"; then
+    problem "client A reported a BATTLE DIVERGENCE (its replay disagreed with the server)"
+  fi
+  # The bot replayed the battle from its OWN data, the companions' commands included, and its own character acted.
+  check_mirror A "$log" 1
+  value=$(summary_number "$log" 'command\(s\) of ours applied')
+  [[ $value =~ ^[0-9]+$ ]] && ((value >= 1)) || problem "client A: the server applied none of its commands (command(s) of ours applied: '${value}')"
+  started=$(strip_ansi "$(last_line_with "$log" "started: formation" || true)")
+  [[ $started == *"party of 3, you fight as actor 2"* ]] || problem "client A is not the third fighter of a party of three (the canon Cloud and Barret, then A): $started"
+
+  # The server's side: exactly one battle, the roster Cloud, Barret, A, the canon pair acting through the server's own
+  # commands, A acting, and the reward and the save the one player's.
+  started=$(strip_ansi "$(first_line_with "$WORK/server.log" "battle started" || true)")
+  [[ -n $started ]] || problem "the server never logged a battle start"
+  [[ $started == *" members=1 "* ]] || problem "the server's battle did not have exactly one player member (members=1): $started"
+  ended=$(strip_ansi "$(last_line_with "$WORK/server.log" "battle ended" || true)")
+  if [[ -z $ended ]]; then
+    problem "the server never logged the end of a battle"
+  else
+    [[ $ended == *Victory* ]] || problem "the server's battle did not end in Victory: $ended"
+    value=$(commands_of "$ended")
+    [[ $value =~ ^[0-9]+$ ]] && ((value >= 1)) || problem "the player never gave a command (the server's commands of the player: '$value'): $ended"
+  fi
+  check_canon_battle "$WORK/server.log" "A" "1" 1
+  (($(count_lines_with "$WORK/server.log" "battle started") == 1)) || problem "the server did not start exactly one battle"
+
+  stop_server
+  # Stopping the server saved everything queued: the one player's payment, and nobody else's.
+  value=$(count_lines_with "$WORK/server.log" "progress saved account=")
+  [[ $value == 1 ]] || problem "the server logged $value 'progress saved' line(s), expected 1 (one player; a companion is never saved)"
+  after=$(ls -A -- "$state_real" | sort | tr '\n' ' ')
+  [[ $before == "$after" ]] || problem "the library state directory changed: before [$before], after [$after]"
+
+  if ((${#PROBLEMS[@]})); then
+    finish_failed
+  fi
+  say "client: ${SMOKE_LINES[0]}"
+  say "server: $started"
+  say "server: $ended"
+  say "client A: $(last_line_with "$log" "started: formation" || true)"
+  say "client A: $(last_line_with "$log" "ended in Victory" || true)"
+  say "client A: $(last_line_with "$log" "headless: battles:" || true)"
+  say "server: $(count_lines_with "$WORK/server.log" "companion acted battle=") 'companion acted' line(s), e.g. $(last_line_with "$WORK/server.log" "companion acted battle=" || true)"
+  RESULT=pass
+  say "PASS: one new character alone fought beside the canon Cloud and Barret (roster Cloud, Barret, A), the server commanded the canon pair and the bot replayed every command from its own battle data with 0 divergences, the reward and the save were the one player's; $state_real unchanged ($after)"
 }
 
 # all_battle_ids_of <client log>: every distinct battle#N a client says it started, one per line.
@@ -1481,6 +1634,7 @@ main() {
       --random) MODE=random ;;
       --progress) MODE=progress ;;
       --commands) MODE=commands ;;
+      --solo) MODE=solo ;;
       --release) PROFILE=release ;;
       --debug) PROFILE=debug ;;
       --bin-dir)
@@ -1567,6 +1721,7 @@ main() {
     random) run_random ;;
     progress) run_progress ;;
     commands) run_commands ;;
+    solo) run_solo ;;
     *) run_real ;;
   esac
 }

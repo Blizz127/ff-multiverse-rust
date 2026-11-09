@@ -24,9 +24,10 @@
 #       B  "Brom"       colour 3c9be8  body $BODY_B  slot Tifa (2)     accepts only after A's advance split them
 #   A invites B while they still see each other, walks onto md1stin's story point and advances its story (the server
 #   validates it from A's moves), which puts A in another phase instance than B; B then accepts and the party puts it
-#   in A's instance; the party fights ONE shared battle (formation 301 of md1stin's own table, a debug request) that
+#   in A's instance; the party fights ONE shared battle (formation 12 of the game's own data, a debug request: md1stin's
+#   own 301-303 end before both players have had a turn beside the canon pair) that
 #   both win, each replaying it from its own scene.bin/kernel.bin ("verified by replay"). Both also talk to the
-#   field's guard and to the canon Barret through the client's own conversation code. The run checks:
+#   field's guard through the client's own conversation code. The run checks:
 #     * the Welcome card of each player says what was asked (name, colour, body, binding `ff7/body/<body>`, slot);
 #     * each player SEES the other's binding (the placeholder body) and nothing in it is a canon model;
 #     * the battle roster is the canon party first and then the players: the server's "battle started" line says
@@ -51,17 +52,22 @@
 #   advanced to while B is in the default one, so they do NOT see each other; and after stopping that server every
 #   persisted record (characters/, avatars/, accounts/, progression/) is byte for byte what it was after session 1:
 #   a login rewrites nothing. Session 2b: B catches up (its own story advance) and the two fight again on the
-#   restarted server: it fights them as their slots (characters=[1, 2]) with their own names, at the levels and
-#   limit gauges session 1 saved, and the identity, binding, slot and pointers of both records are unchanged.
+#   restarted server: it fights them beside the canon Cloud and Barret (characters=[0, 1, 1, 2], companions first) with
+#   their own names, at the levels and stored limit gauges session 1 left, and the identity, binding, slot and pointers of
+#   both records are unchanged.
 #
-#   LEVEL AND LIMIT GAUGE (the real-process carry-over check): a win pays about 16 of the ~250 experience a level costs and
-#   these weak enemies rarely hurt anybody, so over real processes nobody would level up or fill a gauge. Session 1's server
-#   therefore runs with its two DEBUG flags (--debug-bonus-exp 900 and --debug-bonus-limit 100: refused
-#   without --debug-encounters and on the default state directory, warned about at start-up, logged on every use; they pay
-#   and keep made-up numbers through the ordinary save path), and the run checks that BOTH NEW characters ended session 1 at a
-#   higher level than they joined at (told leveled_up=true, stored) with a non-empty limit gauge (stored, and the one the
-#   server logged keeping). The restarted servers have no bonus, so a level and a gauge that come back can only be the saved
-#   ones: the login tells the level, and the second battle starts with exactly the saved levels and gauges.
+#   LEVEL AND STORED LIMIT GAUGE (the real-process carry-over check): a win pays about 8 of the ~250 experience a level
+#   costs, so over real processes nobody would level up. Session 1's server therefore runs with its DEBUG flag
+#   --debug-bonus-exp 900 (refused without --debug-encounters and on the default state directory, warned about at start-up,
+#   logged on every use; it pays a made-up number through the ordinary save path), and the run checks that BOTH NEW
+#   characters ended session 1 at a higher level than they joined at (told leveled_up=true, stored). Players have NO limit
+#   break in protocol v9, so no battle fills or empties a player's limit gauge: what is proven instead is that a gauge an
+#   account of before v9 holds is PRESERVED (the real accounts' are: the preview bot's is about 200). With the server
+#   stopped the smoke writes a gauge into each stored record (200 and 120); the restarted server sends it in the roster (the
+#   engine ignores it for a player), the battle leaves it alone (keep_limits saves a gauge only for a member that has a limit
+#   break, so a stored one is never overwritten with the empty gauge the engine reports) and the stored numbers after the
+#   battle and the restart are the same. A note in the output says so; if player limits are enabled later, the real
+#   carry-over check returns. The restarted servers have no bonus, so a level that comes back can only be the saved one.
 #
 # EVERY PERSISTED FIELD that must survive the restart is checked in the stored files (read with jq) AND on the
 # wire: identity (name, colour, body), binding, slot, the pointers to the progress records, level, experience, AP,
@@ -138,13 +144,14 @@ usage() {
 Usage: scripts/slice-smoke.sh [--release|--debug] [--bin-dir DIR] [--build] [--library STATE_DIR]
                               [--duration SECS] [--formation ID] [--seed N] [--keep-logs] [-h|--help]
 
-The foundations slice over real processes and the owner's real FF7 data (protocol v8): two headless
-players with different identities and combat slots register, party up, advance one story and fight one shared
-battle on md1stin (session 1's server runs with the DEBUG bonuses --debug-bonus-exp and --debug-bonus-limit, so
-that both new characters level up and fill a limit gauge); the server is stopped and started again as a new
-process (without the bonuses) on the same state directory; the same two players log in and must be told exactly
+The foundations slice over real processes and the owner's real FF7 data (protocol v9): two headless
+players with different identities and fighting styles register, party up, advance one story and fight one shared
+battle on md1stin beside the canon Cloud and Barret, whom the server commands (session 1's server runs with the DEBUG
+bonus --debug-bonus-exp, so that both new characters level up); the server is stopped and started again as a new
+process (without the bonus) on the same state directory; the same two players log in and must be told exactly
 what they ended with, every persisted record must be byte for byte unchanged, and a second battle must use what
-was saved, levels and limit gauges included. See the header of this script for every check.
+was saved, levels and stored limit gauges included (players have no limit break in v9: a stored gauge must be
+preserved by the battle and the restart). See the header of this script for every check.
 
   --library DIR    state directory that contains library/ (default $FMV_FF7_LIBRARY, else
                    ~/.local/share/ff-multiverse); only the library is read, never written
