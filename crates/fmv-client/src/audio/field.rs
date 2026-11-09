@@ -526,7 +526,7 @@ impl FieldState {
             log(&format!("no clip for field sound {id} ({why}); going on without it"));
             self.unheard.insert(*id);
         }
-        // Keep what the plan needs, and drop the oldest of the rest.
+        // Keep what the plan needs, and drop clips it does not need (in no particular order) until the limit holds.
         if self.clips.len() > MAX_CLIPS {
             let keep = read.plan.ids();
             let drop: Vec<u16> = self.clips.keys().copied().filter(|id| !keep.contains(id)).take(self.clips.len() - MAX_CLIPS).collect();
