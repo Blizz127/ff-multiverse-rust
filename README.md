@@ -506,8 +506,8 @@ went, and the `headless: battles:` line counts what the server applied for the b
 `(<n> attack, <n> magic, <n> item, <n> defend, <n> limit, <n> escape)`.
 `fmv-server --debug-encounters --debug-limit-full` (the second flag is refused unless the first is given, and is
 logged as a warning when the server starts) makes every member of every battle start with a **full limit
-gauge**, whatever its account's is. It changes only the gauge a battle STARTS with (the `battle started ...
-limits=[255, 255]` line and every replay carry it), and under it no limit gauge is ever stored: a gauge that
+gauge**, whatever its account's is. It changes exactly two things: the gauge a battle STARTS with (the `battle started ...
+limits=[255, 255]` line and every replay carry it), and the end-of-battle gauge save, so no limit gauge is ever stored: a gauge that
 started from a faked full one is not the account's own, so the end-of-battle save is skipped (logged as
 `limit not kept ... reason=debug-limit-full`) and every account keeps the gauge it really has, even when a
 member spent its limit or was knocked out. A smoke run can never overwrite a real gauge. The server also logs
