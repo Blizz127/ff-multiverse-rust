@@ -434,6 +434,8 @@ struct Trip {
     tries: u32,
     /// The walk the current hop's walk was replaced by (a detour to arm a link again), if any.
     detour: Option<Vec<Pos>>,
+    /// The walker came to the goal ([`Nav::Here`]): nothing is left of the trip but to be told so again.
+    done: bool,
 }
 
 impl Trip {
@@ -592,7 +594,8 @@ impl Navigator {
         if moved > TELEPORT {
             // moved by somebody else: placed anew, and the route made from here
             self.arming = LinkArming::placed_at(&self.links, cur);
-            if self.trip.take().is_some() {
+            // (a trip that was over has nothing to be told about)
+            if self.trip.take().is_some_and(|t| !t.done) {
                 self.note(format!("moved to ({:.0}, {:.0}) by the server: the route is made again", cur.x, cur.y));
             }
             return;
@@ -629,7 +632,7 @@ impl Navigator {
                 Some(route) => {
                     let hops: String = route.hops.iter().map(|h| format!(" {}", h.link)).collect();
                     self.note(format!("plan: {} link(s){hops}", route.hops.len()));
-                    self.trip = Some(Trip { key, route, at: 0, next: 1, phase: Phase::Walk, tries: 0, detour: None });
+                    self.trip = Some(Trip { key, route, at: 0, next: 1, phase: Phase::Walk, tries: 0, detour: None, done: false });
                 }
                 None => {
                     self.cooldown = PLAN_COOLDOWN_STEPS;
@@ -707,6 +710,7 @@ impl Navigator {
                 // The last walk: at the goal, or pushed away from it (the route is made again).
                 if walk.last().is_none_or(|end| cur.dist_xy(*end) <= AT_GOAL) {
                     self.replans = 0;
+                    trip.done = true;
                     return Nav::Here;
                 }
                 self.trip = None;
@@ -770,3 +774,6 @@ impl Navigator {
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+mod real_tests;
