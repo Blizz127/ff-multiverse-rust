@@ -329,9 +329,13 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub mod battle;
 pub mod character;
 pub mod reject;
+pub mod scene;
 
 pub use character::{clip_character_name, CharacterCard, NewCharacter, MAX_CHARACTER_NAME_CHARS, MAX_CHARACTER_REF_CHARS};
 pub use reject::RejectCode;
+pub use scene::{
+    SceneOutcome, SceneParticipant, SceneRefusal, SceneRole, SceneRunId, MAX_SCENE_ID_CHARS, MAX_SCENE_STEPS, MAX_SCENE_WATCHERS, SCENE_NPC_ID_BASE,
+};
 
 /// The battle wire types (the engine's own `BattleEvent`, `Command` and `Outcome` stay under
 /// [`battle`], where their names say what they are).
@@ -514,6 +518,24 @@ pub enum ClientMsg {
     /// otherwise): start a battle for your party (or just you). `formation_id` names the enemy
     /// formation (`scene * 4 + slot`); `None` lets the server choose.
     RequestEncounter { formation_id: Option<u16> },
+    /// The scene OWNER moved past window number `step` (0 counts the first; in order, once each) of run `run`,
+    /// choosing line `answer` (absolute, as the game's script stores it) when that window asked. The server relays it to
+    /// the watchers. See [`scene`].
+    SceneStep {
+        run: SceneRunId,
+        step: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        answer: Option<u8>,
+    },
+    /// The scene OWNER's client played run `run` to its end (`skipped: false`) or skipped it. The server ends the run
+    /// and applies any story write the scene's script makes, once. See [`scene`].
+    SceneEnd { run: SceneRunId, skipped: bool },
+    /// A watcher stops watching run `run` (or the owner abandons it, which is a skip). See [`scene`].
+    SceneLeave { run: SceneRunId },
+    /// Debug only (the server must run with `--debug-scene-preview`; refused with `SceneRefused` otherwise): put this
+    /// player in the field of scene `scene` at the scene's own story moment, on a made-up story that is never saved.
+    /// See [`scene`].
+    SceneDebugPreview { scene: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -649,6 +671,32 @@ pub enum ServerMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         advance: Option<StoryAdvance>,
     },
+    /// A story scene starts for this player (see [`scene`]): play scene `scene` from your OWN copy of the game, against
+    /// the story `progress` (the blob of the account whose story the scene plays in), with `seed` for the script's
+    /// randomness. `owner` is the entity whose keys drive it, `participants` everyone who stands in it (each on the
+    /// witness spot it names), `you` what this player is. Until `SceneEnded` the player is held (moves, OK and
+    /// encounters are ignored).
+    SceneStart {
+        run: SceneRunId,
+        scene: String,
+        seed: u32,
+        progress: Vec<u8>,
+        owner: EntityId,
+        participants: Vec<SceneParticipant>,
+        you: SceneRole,
+    },
+    /// To the watchers of run `run`: the owner moved past window `step` choosing `answer` (see
+    /// [`ClientMsg::SceneStep`]). Window `step + 1` opens now.
+    SceneStep {
+        run: SceneRunId,
+        step: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        answer: Option<u8>,
+    },
+    /// Run `run` is over, as the server saw it: give control and camera back.
+    SceneEnded { run: SceneRunId, outcome: SceneOutcome },
+    /// A scene request of this client was refused (`SceneDebugPreview`, or an OK on a trigger that cannot start now).
+    SceneRefused { reason: SceneRefusal },
 }
 
 /// What moved a player's story (see [`ServerMsg::StoryUpdate`]): the story point the server saw it

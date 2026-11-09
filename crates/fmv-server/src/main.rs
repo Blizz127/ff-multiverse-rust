@@ -32,7 +32,7 @@ use fmv_fixture::{FixtureAdapter, FIXTURE_AREA_KEY};
 use fmv_protocol::DEFAULT_DEV_PORT;
 use fmv_server::ff7::{self, Ff7Labels, Ff7Source, SharedFf7, DEFAULT_FF7_AREA};
 use fmv_server::{
-    BattleSettings, ServerConfig, DEFAULT_HELLO_TIMEOUT, DEFAULT_IDLE_TIMEOUT, DEFAULT_INACTIVITY_TIMEOUT, DEFAULT_MAX_CONNECTIONS_PER_IP,
+    BattleSettings, SceneSettings, ServerConfig, DEFAULT_HELLO_TIMEOUT, DEFAULT_IDLE_TIMEOUT, DEFAULT_INACTIVITY_TIMEOUT, DEFAULT_MAX_CONNECTIONS_PER_IP,
     DEFAULT_REGISTRATIONS_PER_IP, DEFAULT_REGISTRATIONS_PER_MINUTE, MAX_CONNECTIONS_LIMIT, MAX_REGISTRATIONS_PER_MINUTE, MAX_TICK_HZ,
 };
 use tracing::{info, warn};
@@ -233,6 +233,12 @@ struct Cli {
     #[arg(long)]
     debug_encounters: bool,
 
+    /// Let players put themselves in a story scene's field at the scene's own story moment, on a made-up story that is never
+    /// saved (the client's `--scene-preview` bot flag and its F6 key). OFF by default: a normal server offers a scene only to a
+    /// player whose real story is at its moment. FF7 only.
+    #[arg(long)]
+    debug_scene_preview: bool,
+
     /// Do not roll a field's random-encounter table as players walk.
     #[arg(long)]
     no_random_encounters: bool,
@@ -396,6 +402,8 @@ struct Hosted {
     build_suffix: Option<String>,
     /// Battle support (`None`: this server cannot run battles: FIXTURE, or no owned battle data).
     battle: Option<BattleSettings>,
+    /// Story scenes (`None`: this game has none, FIXTURE).
+    scenes: Option<SceneSettings>,
 }
 
 impl Cli {
@@ -456,12 +464,14 @@ async fn build_adapter(cli: &Cli) -> Result<Hosted, SetupError> {
             area: cli.area.clone().unwrap_or_else(|| FIXTURE_AREA_KEY.to_string()),
             build_suffix: None,
             battle: None,
+            scenes: None,
         }),
         GameKind::FixtureRooms => Ok(Hosted {
             adapter: Box::new(fmv_fixture::rooms::RoomsAdapter::new()),
             area: cli.area.clone().unwrap_or_else(|| fmv_fixture::rooms::HALL.to_string()),
             build_suffix: None,
             battle: None,
+            scenes: None,
         }),
         GameKind::Ff7 => {
             let opened = ff7::open_ff7(&cli.ff7_source())?;
@@ -485,11 +495,17 @@ async fn build_adapter(cli: &Cli) -> Result<Hosted, SetupError> {
                     None
                 }
             };
+            // FF7's story scenes read the same field archive; the debug preview is off unless asked for.
+            let scenes = SceneSettings {
+                host: std::sync::Arc::new(fmv_server::scene_host::Ff7SceneHost::new(std::sync::Arc::clone(&opened.adapter))),
+                debug_preview: cli.debug_scene_preview,
+            };
             Ok(Hosted {
                 adapter: Box::new(SharedFf7(opened.adapter)),
                 area: cli.area.clone().unwrap_or_else(|| DEFAULT_FF7_AREA.to_string()),
                 build_suffix: Some(ff7::build_tag()),
                 battle,
+                scenes: Some(scenes),
             })
         }
     }
@@ -549,6 +565,15 @@ async fn real_main(cli: Cli) -> Result<(), String> {
     if (cli.debug_bonus_exp.is_some() || cli.debug_bonus_limit.is_some()) && hosted.battle.is_none() {
         warn!("--debug-bonus-exp / --debug-bonus-limit have no effect: this server has no battle data, so battles are unsupported");
     }
+    if cli.debug_scene_preview && hosted.scenes.is_none() {
+        warn!("--debug-scene-preview has no effect: this game has no story scenes");
+    }
+    if cli.debug_scene_preview && hosted.scenes.is_some() {
+        warn!(
+            "DEBUG: --debug-scene-preview is on: any player may put itself in a story scene's field at the scene's own story moment, on a made-up story. \
+             Nothing of that story is ever saved or touches the account's real one (a smoke-test and QA aid; leave it off on a server real players use)"
+        );
+    }
     let config = cli.with_limits(ServerConfig {
         bind: cli.bind,
         area_key: hosted.area,
@@ -559,6 +584,7 @@ async fn real_main(cli: Cli) -> Result<(), String> {
         build_suffix: hosted.build_suffix,
         battle: hosted.battle,
         debug_encounters: cli.debug_encounters,
+        scenes: hosted.scenes,
         ..ServerConfig::default()
     });
     let shutdown = shutdown_signal().map_err(|e| format!("cannot install signal handlers: {e}"))?;

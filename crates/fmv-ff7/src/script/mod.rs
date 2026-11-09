@@ -123,6 +123,7 @@ mod analysis;
 mod decode;
 pub mod dialogue;
 mod layout;
+pub mod scene;
 mod maplist;
 mod models;
 mod exits;

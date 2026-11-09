@@ -138,6 +138,11 @@ impl World {
     /// placements).
     fn apply_story_step(&mut self, entity: EntityId, point: u32, step: StoryStep) {
         let Some(player) = self.players.get_mut(&entity) else { return };
+        // A player in a debug scene preview plays on a made-up story: no step of it is ever kept, saved or told (this is
+        // the one place the world saves a story, so this is what keeps the preview from touching a real account).
+        if player.preview.is_some() {
+            return;
+        }
         let (account, area_id) = (player.account, player.area.clone());
         player.progression = step.progress.clone();
         let game_area = self.areas.get(&area_id).map(|a| a.id().to_string()).unwrap_or(area_id);

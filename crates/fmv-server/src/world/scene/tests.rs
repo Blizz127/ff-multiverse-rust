@@ -1,0 +1,587 @@
+//! Tests of the story scenes in the world, over the FIXTURE rooms and a fake [`SceneHost`] (no game data).
+
+use std::sync::Mutex;
+
+use fmv_adapter_api::GameAdapter;
+use fmv_core::{AccountId, AnimState, AvatarAppearance};
+use fmv_fixture::rooms::{RoomsAdapter, HALL, YARD};
+use fmv_party::PartyConfig;
+use fmv_protocol::SyntheticRules;
+use tokio::sync::{mpsc, watch};
+
+use super::super::{BattleReply, MoveOutcome, NewPlayer, Outbound, PartyOutcome};
+use super::*;
+use crate::config::BattleSettings;
+use crate::saver::{Msg, SaverHandle};
+
+/// The story a previewing player is given by the fake host.
+const MADE_UP: &[u8] = &[9];
+const SCENE: &str = "test/yard-scene";
+/// Where the fake trigger stands in the yard (its talk radius is 80).
+const TRIGGER_AT: (f32, f32) = (200.0, -100.0);
+
+/// One `finish` call: scene, story, seed, answers.
+type Finish = (String, Vec<u8>, u32, Vec<u8>);
+
+#[derive(Default)]
+struct FakeHost {
+    finished: Mutex<Vec<Finish>>,
+}
+
+impl SceneHost for FakeHost {
+    fn scenes(&self) -> Vec<SceneInfo> {
+        vec![SceneInfo { id: SCENE.to_string(), field: YARD.to_string(), arrival: Pos::new(150.0, -100.0, 0.0), arrival_facing: 0.0, arrival_hint: None }]
+    }
+    fn offered(&self, scene: &str, progress: &[u8]) -> bool {
+        scene == SCENE && (progress.is_empty() || progress == MADE_UP)
+    }
+    fn trigger(&self, scene: &str, _progress: &[u8]) -> Option<TriggerInfo> {
+        (scene == SCENE).then(|| TriggerInfo {
+            name: "giver".into(),
+            model: "aagb".into(),
+            idle: Some("abcd".into()),
+            pos: Pos::new(TRIGGER_AT.0, TRIGGER_AT.1, 0.0),
+            facing: 0.0,
+            talk_radius: 80.0,
+        })
+    }
+    fn preview_progress(&self, scene: &str) -> Option<Vec<u8>> {
+        (scene == SCENE).then(|| MADE_UP.to_vec())
+    }
+    fn finish(&self, scene: &str, progress: &[u8], seed: u32, answers: &[u8]) -> Option<SceneResult> {
+        self.finished.lock().unwrap().push((scene.to_string(), progress.to_vec(), seed, answers.to_vec()));
+        let after = if progress == MADE_UP { vec![9, 5] } else { vec![5] };
+        Some(SceneResult { progress: after, changed: true, summary: "moment=1->5".into() })
+    }
+}
+
+struct Seat {
+    entity: EntityId,
+    account: AccountId,
+    rx: mpsc::Receiver<Outbound>,
+}
+
+impl Seat {
+    fn drain(&mut self) -> Vec<ServerMsg> {
+        let mut out = Vec::new();
+        while let Ok(m) = self.rx.try_recv() {
+            out.push((*m).clone());
+        }
+        out
+    }
+}
+
+fn world_with(preview: bool, battles: bool) -> (World, mpsc::UnboundedReceiver<Msg>, Arc<FakeHost>) {
+    let adapter: Arc<dyn GameAdapter> = Arc::new(RoomsAdapter::new());
+    let mut w = World::with_party_config(adapter.load_area(HALL).unwrap(), PartyConfig::default()).unwrap();
+    w.set_area_source(adapter);
+    let (handle, rx) = SaverHandle::channel();
+    w.set_progress_saver(handle);
+    let host = Arc::new(FakeHost::default());
+    w.configure_scenes(Some(SceneSettings { host: host.clone(), debug_preview: preview }));
+    if battles {
+        let settings = BattleSettings { battle_speed: 0, ticks_per_second: 1000, fixed_seed: Some(7), ..BattleSettings::new(Arc::new(SyntheticRules::default())) };
+        w.configure_battle(Some(settings), true);
+    }
+    (w, rx, host)
+}
+
+fn world() -> (World, mpsc::UnboundedReceiver<Msg>, Arc<FakeHost>) {
+    world_with(false, false)
+}
+
+fn seat(w: &mut World, name: &str, progression: &[u8], now: Instant) -> Seat {
+    let (session, entity) = w.allocate_ids();
+    let (tx, rx) = mpsc::channel(256);
+    let close = Arc::new(watch::channel(false).0);
+    let avatar = AvatarAppearance { display_name: name.into(), tint: [1, 2, 3], appearance_ref: None };
+    let account = AccountId(entity.0);
+    w.join(NewPlayer { session, entity, account, avatar, progression: progression.to_vec(), progress: Default::default(), tx, close }, now).expect("joins");
+    Seat { entity, account, rx }
+}
+
+fn go(w: &mut World, s: &Seat, x: f32, y: f32, now: &mut Instant) -> MoveOutcome {
+    *now += Duration::from_millis(700);
+    w.apply_move(s.entity, Pos::new(x, y, 0.0), 0.0, AnimState::Walk, *now)
+}
+
+/// Walk `s` through the hall's exit into the yard and let it in; returns what it was told on arriving.
+fn into_the_yard(w: &mut World, s: &mut Seat, now: &mut Instant) -> Vec<ServerMsg> {
+    assert_eq!(go(w, s, 100.0, 150.0, now), MoveOutcome::Applied);
+    assert_eq!(go(w, s, 350.0, 150.0, now), MoveOutcome::Applied);
+    let offer = s.drain().into_iter().find(|m| matches!(m, ServerMsg::AreaChange { .. })).expect("an offer");
+    let ServerMsg::AreaChange { area, fingerprint, provenance, .. } = offer else { unreachable!() };
+    assert_eq!(w.join_area(s.entity, &area, &fingerprint, &provenance, *now), crate::world::TravelReply::Done);
+    s.drain()
+}
+
+/// The seat walked up to the trigger (within 50 units of it).
+fn up_to_the_trigger(w: &mut World, s: &mut Seat, now: &mut Instant) {
+    into_the_yard(w, s, now);
+    assert_eq!(go(w, s, 150.0, -100.0, now), MoveOutcome::Applied);
+    s.drain();
+}
+
+fn trigger_id() -> u32 {
+    SCENE_NPC_ID_BASE
+}
+
+type Started = (SceneRunId, SceneRole, Vec<(u64, u8)>);
+
+fn starts(msgs: &[ServerMsg]) -> Vec<Started> {
+    msgs.iter()
+        .filter_map(|m| match m {
+            ServerMsg::SceneStart { run, you, participants, .. } => Some((*run, *you, participants.iter().map(|p| (p.entity.0, p.spot)).collect())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn ends(msgs: &[ServerMsg]) -> Vec<SceneOutcome> {
+    msgs.iter().filter_map(|m| if let ServerMsg::SceneEnded { outcome, .. } = m { Some(*outcome) } else { None }).collect()
+}
+
+fn saved(rx: &mut mpsc::UnboundedReceiver<Msg>) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    while let Ok(msg) = rx.try_recv() {
+        if let Msg::Story(job) = msg {
+            out.push(job.progress);
+        }
+    }
+    out
+}
+
+fn party(w: &mut World, leader: &Seat, member: &Seat, now: Instant) {
+    assert!(matches!(w.party_invite(leader.entity, member.entity, now), PartyOutcome::Done));
+    let invite = w.parties.invites().next().map(|i| i.id).expect("an invite");
+    assert!(matches!(w.party_accept(member.entity, invite, now), PartyOutcome::Done));
+}
+
+fn log_text(w: &mut World) -> String {
+    w.take_logs().iter().map(|l| l.text().to_string()).collect::<Vec<_>>().join("\n")
+}
+
+// ---- the trigger -----------------------------------------------------------------------------------------
+
+#[test]
+fn the_scene_npc_joins_the_cast_where_the_scene_is_on_offer_and_nowhere_else() {
+    let t0 = Instant::now();
+    let (mut w, _saved, _) = world();
+    let mut a = seat(&mut w, "A", &[], t0);
+    let hall = a.drain();
+    assert!(hall.iter().all(|m| !matches!(m, ServerMsg::AreaSnapshot { npcs, .. } if !npcs.is_empty())), "no scene NPC in the hall");
+    let mut now = t0;
+    let arrived = into_the_yard(&mut w, &mut a, &mut now);
+    let npcs: Vec<NpcSnapshot> = arrived.into_iter().find_map(|m| if let ServerMsg::AreaSnapshot { npcs, .. } = m { Some(npcs) } else { None }).unwrap();
+    // the yard's own character (id 0) is still there, and the scene's trigger joins it under an id of its own range
+    assert_eq!(npcs.iter().filter(|n| n.id < SCENE_NPC_ID_BASE).count(), 1);
+    let scene_npcs: Vec<&NpcSnapshot> = npcs.iter().filter(|n| n.id >= SCENE_NPC_ID_BASE).collect();
+    assert_eq!(scene_npcs.len(), 1);
+    let n = scene_npcs[0];
+    assert_eq!((n.id, n.name.as_str(), n.model.as_str(), n.idle_animation.as_deref()), (trigger_id(), "giver", "aagb", Some("abcd")));
+    assert_eq!((n.pos.x, n.pos.y), TRIGGER_AT);
+
+    // an account whose story the scene is not on offer for is not shown it
+    let mut b = seat(&mut w, "B", &[7], t0);
+    let b_arrived = into_the_yard(&mut w, &mut b, &mut now);
+    let b_npcs: Vec<NpcSnapshot> = b_arrived.into_iter().find_map(|m| if let ServerMsg::AreaSnapshot { npcs, .. } = m { Some(npcs) } else { None }).unwrap();
+    assert!(b_npcs.iter().all(|n| n.id < SCENE_NPC_ID_BASE), "story [7] is not offered the scene");
+    assert_eq!(w.scene_npcs(a.entity, &YARD.to_string()).len(), 1);
+    assert!(w.scene_npcs(a.entity, &HALL.to_string()).is_empty(), "the scene plays in the yard only");
+}
+
+#[test]
+fn pressing_ok_next_to_the_trigger_starts_the_scene_for_that_player_alone_and_holds_it() {
+    let t0 = Instant::now();
+    let (mut w, _saved, _) = world();
+    let mut a = seat(&mut w, "A", &[], t0);
+    let mut other = seat(&mut w, "Other", &[], t0);
+    let mut now = t0;
+    into_the_yard(&mut w, &mut a, &mut now);
+    // far from the trigger (the yard arrival is 316 units from it): no scene
+    w.press(a.entity, Some(trigger_id()), now);
+    assert_eq!(w.scene_count(), 0);
+    assert_eq!(go(&mut w, &a, 150.0, -100.0, &mut now), MoveOutcome::Applied);
+    a.drain();
+    // a press naming nothing the area or the scenes have is no scene
+    w.press(a.entity, Some(trigger_id() + 5), now);
+    assert_eq!(w.scene_count(), 0);
+    // next to it, naming it
+    w.press(a.entity, Some(trigger_id()), now);
+    assert_eq!(w.scene_count(), 1);
+    let msgs = a.drain();
+    assert_eq!(starts(&msgs), [(SceneRunId(1), SceneRole::Owner, vec![(a.entity.0, 0)])]);
+    // the player the scene is for is held: it moves nowhere, presses nothing and starts no second scene
+    assert!(w.in_scene(a.entity));
+    assert_eq!(go(&mut w, &a, 140.0, 100.0, &mut now), MoveOutcome::Frozen);
+    w.press(a.entity, Some(trigger_id()), now);
+    assert_eq!(w.scene_count(), 1);
+    // nobody else was told anything
+    assert!(other.drain().iter().all(|m| !matches!(m, ServerMsg::SceneStart { .. } | ServerMsg::SceneEnded { .. })));
+    let log = log_text(&mut w);
+    assert!(log.contains(&format!("scene started run=1 scene={SCENE} owner={} watchers=[] preview=false", a.entity.0)), "{log}");
+}
+
+#[test]
+fn a_scene_that_is_not_on_offer_for_the_story_does_not_start() {
+    let t0 = Instant::now();
+    let (mut w, _saved, _) = world();
+    let mut b = seat(&mut w, "B", &[7], t0);
+    let mut now = t0;
+    up_to_the_trigger(&mut w, &mut b, &mut now);
+    w.press(b.entity, Some(trigger_id()), now);
+    assert_eq!((w.scene_count(), w.in_scene(b.entity)), (0, false));
+}
+
+// ---- party members watch ---------------------------------------------------------------------------------
+
+/// Two party members next to the trigger, A the leader.
+fn two_at_the_trigger() -> (World, mpsc::UnboundedReceiver<Msg>, Arc<FakeHost>, Seat, Seat, Instant) {
+    let t0 = Instant::now();
+    let (mut w, saved, host) = world();
+    let mut a = seat(&mut w, "A", &[], t0);
+    let mut b = seat(&mut w, "B", &[], t0);
+    party(&mut w, &a, &b, t0);
+    let mut now = t0;
+    up_to_the_trigger(&mut w, &mut a, &mut now);
+    up_to_the_trigger(&mut w, &mut b, &mut now);
+    (w, saved, host, a, b, now)
+}
+
+#[test]
+fn party_members_in_the_same_instance_and_in_range_watch_in_step_and_only_the_owner_drives() {
+    let (mut w, _saved, _, mut a, mut b, now) = two_at_the_trigger();
+    w.press(a.entity, Some(trigger_id()), now);
+    let run = SceneRunId(1);
+    assert_eq!(starts(&a.drain()), [(run, SceneRole::Owner, vec![(a.entity.0, 0), (b.entity.0, 1)])]);
+    assert_eq!(starts(&b.drain()), [(run, SceneRole::Watcher, vec![(a.entity.0, 0), (b.entity.0, 1)])]);
+    assert!(w.in_scene(b.entity), "a watcher is held too");
+    // the owner moves past window 0 (a question, answered 2): the watcher is told, the owner is not
+    w.scene_message(a.entity, ClientMsg::SceneStep { run, step: 0, answer: Some(2) }, now);
+    assert_eq!(b.drain(), [ServerMsg::SceneStep { run, step: 0, answer: Some(2) }]);
+    assert!(a.drain().is_empty());
+    // out of order, repeated, from a watcher, or for a run that does not exist: dropped
+    for (who, step) in [(a.entity, 0u32), (a.entity, 5), (b.entity, 1)] {
+        w.scene_message(who, ClientMsg::SceneStep { run, step, answer: None }, now);
+    }
+    w.scene_message(a.entity, ClientMsg::SceneStep { run: SceneRunId(99), step: 1, answer: None }, now);
+    assert!(b.drain().is_empty(), "nothing out of order is relayed");
+    w.scene_message(a.entity, ClientMsg::SceneStep { run, step: 1, answer: None }, now);
+    assert_eq!(b.drain(), [ServerMsg::SceneStep { run, step: 1, answer: None }]);
+    // a watcher may leave: it is released alone and the owner's scene goes on
+    w.scene_message(b.entity, ClientMsg::SceneLeave { run }, now);
+    assert_eq!(ends(&b.drain()), [SceneOutcome::Skipped]);
+    assert!(!w.in_scene(b.entity) && w.in_scene(a.entity) && w.scene_count() == 1);
+    // a watcher that is not the owner cannot end it
+    w.scene_message(b.entity, ClientMsg::SceneEnd { run, skipped: false }, now);
+    assert_eq!(w.scene_count(), 1);
+}
+
+#[test]
+fn a_party_member_out_of_range_or_not_there_does_not_watch() {
+    let t0 = Instant::now();
+    let (mut w, _saved, _) = world();
+    let mut a = seat(&mut w, "A", &[], t0);
+    let mut far = seat(&mut w, "Far", &[], t0);
+    let hall = seat(&mut w, "Hall", &[], t0);
+    party(&mut w, &a, &far, t0);
+    party(&mut w, &a, &hall, t0);
+    let mut now = t0;
+    up_to_the_trigger(&mut w, &mut a, &mut now);
+    into_the_yard(&mut w, &mut far, &mut now);
+    // `far` is out of range of `a`
+    w.players.get_mut(&far.entity).unwrap().snapshot.pos = Pos::new(-400.0, 0.0, 0.0);
+    w.press(a.entity, Some(trigger_id()), now);
+    assert_eq!(starts(&a.drain()), [(SceneRunId(1), SceneRole::Owner, vec![(a.entity.0, 0)])], "nobody watches");
+    assert!(!w.in_scene(far.entity) && !w.in_scene(hall.entity));
+    assert!(starts(&far.drain()).is_empty());
+}
+
+// ---- the end ---------------------------------------------------------------------------------------------
+
+#[test]
+fn when_the_owner_finishes_everyone_is_released_and_the_story_write_is_applied_once_and_saved() {
+    let (mut w, mut saved_rx, host, mut a, mut b, now) = two_at_the_trigger();
+    w.press(a.entity, Some(trigger_id()), now);
+    a.drain();
+    b.drain();
+    let run = SceneRunId(1);
+    w.scene_message(a.entity, ClientMsg::SceneStep { run, step: 0, answer: Some(2) }, now);
+    w.scene_message(a.entity, ClientMsg::SceneEnd { run, skipped: false }, now);
+    // released, told how it ended
+    assert_eq!(ends(&a.drain()), [SceneOutcome::Finished]);
+    assert_eq!(ends(&b.drain()), [SceneOutcome::Finished]);
+    assert!(!w.in_scene(a.entity) && !w.in_scene(b.entity) && w.scene_count() == 0);
+    // the owner's story moved once: the mirror, the saver, the log
+    assert_eq!(saved(&mut saved_rx), [vec![5u8]], "saved once, as the host said");
+    assert_eq!(w.players.get(&a.entity).unwrap().progression, [5]);
+    let calls = host.finished.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!((calls[0].0.as_str(), calls[0].1.as_slice(), calls[0].3.as_slice()), (SCENE, &[][..], &[2u8][..]), "the host ran it with the owner's answers");
+    let log = log_text(&mut w);
+    assert!(log.contains("story advanced") && log.contains(&format!("scene={SCENE} moment=1->5")), "{log}");
+    assert!(log.contains("scene ended run=1") && log.contains("outcome=Finished") && log.contains("story=applied"), "{log}");
+    // a second end, a late step and the passing of time change nothing
+    w.scene_message(a.entity, ClientMsg::SceneEnd { run, skipped: false }, now);
+    w.scene_message(a.entity, ClientMsg::SceneStep { run, step: 1, answer: None }, now);
+    w.advance_scenes(now + SCENE_MAX_TIME * 2);
+    assert!(saved(&mut saved_rx).is_empty(), "nothing is saved twice");
+    assert!(a.drain().iter().all(|m| !matches!(m, ServerMsg::StoryUpdate { .. } | ServerMsg::SceneEnded { .. })));
+    assert_eq!(host.finished.lock().unwrap().len(), 1);
+    // and the player moves again
+    let mut t = now;
+    assert!(matches!(go(&mut w, &a, 140.0, 100.0, &mut t), MoveOutcome::Applied));
+}
+
+#[test]
+fn the_owner_is_told_the_step_with_the_ordinary_story_update() {
+    let (mut w, _saved, _, mut a, _b, now) = two_at_the_trigger();
+    w.press(a.entity, Some(trigger_id()), now);
+    a.drain();
+    w.scene_message(a.entity, ClientMsg::SceneEnd { run: SceneRunId(1), skipped: false }, now);
+    let updates: Vec<(Vec<u8>, Option<u32>)> = a
+        .drain()
+        .into_iter()
+        .filter_map(|m| if let ServerMsg::StoryUpdate { progress, advance } = m { Some((progress, advance.map(|x| x.point))) } else { None })
+        .collect();
+    assert_eq!(updates, [(vec![5u8], Some(SCENE_STEP_POINT))]);
+}
+
+#[test]
+fn a_skip_ends_it_just_the_same() {
+    let (mut w, mut saved_rx, _, mut a, mut b, now) = two_at_the_trigger();
+    w.press(a.entity, Some(trigger_id()), now);
+    let run = SceneRunId(1);
+    w.scene_message(a.entity, ClientMsg::SceneEnd { run, skipped: true }, now);
+    assert_eq!(ends(&b.drain()), [SceneOutcome::Skipped]);
+    assert_eq!(saved(&mut saved_rx).len(), 1, "a skipped scene writes the story too (the script's own writes)");
+    a.drain();
+}
+
+#[test]
+fn a_timeout_ends_what_nobody_ended_and_a_step_starts_the_idle_clock_again() {
+    let t0 = Instant::now();
+    let (mut w, mut saved_rx, _) = world();
+    let mut c = seat(&mut w, "C", &[], t0);
+    let mut now = t0;
+    up_to_the_trigger(&mut w, &mut c, &mut now);
+    w.press(c.entity, Some(trigger_id()), t0);
+    c.drain();
+    // the owner moves past a window at 100 s: the idle clock starts again from there
+    w.scene_message(c.entity, ClientMsg::SceneStep { run: SceneRunId(1), step: 0, answer: None }, t0 + Duration::from_secs(100));
+    w.advance_scenes(t0 + Duration::from_secs(219));
+    assert_eq!(w.scene_count(), 1, "119 s after the last window is not yet too long");
+    w.advance_scenes(t0 + Duration::from_secs(221));
+    assert_eq!(w.scene_count(), 0);
+    assert_eq!(ends(&c.drain()), [SceneOutcome::TimedOut]);
+    assert_eq!(saved(&mut saved_rx).len(), 1, "a timed-out scene writes the story as a skip does, so a stuck client cannot hold the story back");
+    assert!(!w.in_scene(c.entity));
+}
+
+#[test]
+fn the_whole_run_has_a_limit_however_busy_the_owner_is() {
+    let t0 = Instant::now();
+    let (mut w, _saved, _) = world();
+    let mut d = seat(&mut w, "D", &[], t0);
+    let mut now = t0;
+    up_to_the_trigger(&mut w, &mut d, &mut now);
+    w.press(d.entity, Some(trigger_id()), t0);
+    for step in 0u32..19 {
+        w.scene_message(d.entity, ClientMsg::SceneStep { run: SceneRunId(1), step, answer: None }, t0 + Duration::from_secs(u64::from(step) * 60));
+    }
+    w.advance_scenes(t0 + Duration::from_secs(19 * 60 + 30));
+    assert_eq!(w.scene_count(), 1, "still within the twenty minutes");
+    w.advance_scenes(t0 + SCENE_MAX_TIME + Duration::from_secs(1));
+    assert_eq!(w.scene_count(), 0, "twenty minutes is the longest a scene lasts");
+}
+
+#[test]
+fn a_scene_whose_owner_disconnects_is_dropped_without_writing_and_its_watchers_go_free() {
+    let (mut w, mut saved_rx, host, a, mut b, now) = two_at_the_trigger();
+    w.press(a.entity, Some(trigger_id()), now);
+    b.drain();
+    assert!(w.leave(a.entity));
+    assert_eq!(ends(&b.drain()), [SceneOutcome::Aborted]);
+    assert!(!w.in_scene(b.entity) && w.scene_count() == 0);
+    assert!(saved(&mut saved_rx).is_empty() && host.finished.lock().unwrap().is_empty(), "an abandoned scene writes nothing");
+    assert!(log_text(&mut w).contains("outcome=Aborted"));
+}
+
+#[test]
+fn a_watcher_that_disconnects_leaves_the_scene_to_the_owner() {
+    let (mut w, mut saved_rx, _, mut a, b, now) = two_at_the_trigger();
+    w.press(a.entity, Some(trigger_id()), now);
+    a.drain();
+    assert!(w.leave(b.entity));
+    assert_eq!((w.scene_count(), w.in_scene(a.entity)), (1, true));
+    w.scene_message(a.entity, ClientMsg::SceneEnd { run: SceneRunId(1), skipped: false }, now);
+    assert_eq!(ends(&a.drain()), [SceneOutcome::Finished]);
+    assert_eq!(saved(&mut saved_rx).len(), 1);
+}
+
+#[test]
+fn a_watcher_that_leaves_the_party_stops_watching() {
+    let (mut w, _saved, _, mut a, mut b, now) = two_at_the_trigger();
+    w.press(a.entity, Some(trigger_id()), now);
+    a.drain();
+    b.drain();
+    assert!(matches!(w.party_leave(b.entity), PartyOutcome::Done));
+    assert_eq!(ends(&b.drain()), [SceneOutcome::Aborted]);
+    assert!(!w.in_scene(b.entity) && w.in_scene(a.entity));
+}
+
+#[test]
+fn a_member_in_its_leaders_phase_owns_a_scene_that_writes_nothing() {
+    let (mut w, mut saved_rx, host, mut a, mut b, now) = two_at_the_trigger();
+    // (as if its own phase were not the one that chose the instance)
+    w.players.get_mut(&b.entity).unwrap().placement.as_mut().unwrap().story_advance_allowed = false;
+    w.press(b.entity, Some(trigger_id()), now);
+    a.drain();
+    b.drain();
+    w.scene_message(b.entity, ClientMsg::SceneEnd { run: SceneRunId(1), skipped: false }, now);
+    assert!(saved(&mut saved_rx).is_empty() && host.finished.lock().unwrap().is_empty());
+    assert_eq!(ends(&b.drain()), [SceneOutcome::Finished]);
+}
+
+// ---- battles ---------------------------------------------------------------------------------------------
+
+#[test]
+fn a_player_in_a_scene_fights_nothing_and_is_not_seated_in_a_partys_battle() {
+    let t0 = Instant::now();
+    let (mut w, _saved, _) = world_with(false, true);
+    let mut a = seat(&mut w, "A", &[], t0);
+    let mut b = seat(&mut w, "B", &[], t0);
+    let c = seat(&mut w, "C", &[], t0);
+    party(&mut w, &a, &b, t0);
+    party(&mut w, &a, &c, t0);
+    let mut now = t0;
+    up_to_the_trigger(&mut w, &mut a, &mut now);
+    up_to_the_trigger(&mut w, &mut b, &mut now);
+    // C stays in the hall
+    w.press(a.entity, Some(trigger_id()), now);
+    a.drain();
+    b.drain();
+    assert!(w.in_scene(a.entity) && w.in_scene(b.entity));
+    assert!(matches!(w.request_encounter(a.entity, None, now), BattleReply::Refused { .. }), "the owner cannot start a battle");
+    // a battle C starts takes no member that is in a scene (they are in the yard anyway: the rule is the scene's, not the area's)
+    w.players.get_mut(&c.entity).unwrap().area = YARD.to_string();
+    assert!(matches!(w.request_encounter(c.entity, None, now), BattleReply::Done));
+    let seated: Vec<bool> = [&a, &b, &c].iter().map(|s| w.players.get(&s.entity).unwrap().battle.is_some()).collect();
+    assert_eq!(seated, [false, false, true], "only the player that was free fights");
+}
+
+// ---- the debug preview -----------------------------------------------------------------------------------
+
+#[test]
+fn a_preview_is_refused_when_the_server_does_not_run_them_and_for_a_scene_it_does_not_know() {
+    let t0 = Instant::now();
+    let (mut w, _saved, _) = world_with(false, false);
+    let a = seat(&mut w, "A", &[], t0);
+    assert_eq!(w.scene_message(a.entity, ClientMsg::SceneDebugPreview { scene: SCENE.into() }, t0), SceneReply::Refused(SceneRefusal::Unavailable), "off by default");
+    let (mut w, _saved, _) = world_with(true, false);
+    let a = seat(&mut w, "A", &[], t0);
+    assert_eq!(w.scene_message(a.entity, ClientMsg::SceneDebugPreview { scene: "nope".into() }, t0), SceneReply::Refused(SceneRefusal::UnknownScene));
+    assert_eq!(w.scene_message(a.entity, ClientMsg::SceneDebugPreview { scene: "x".repeat(200) }, t0), SceneReply::Refused(SceneRefusal::UnknownScene));
+    assert_eq!(w.scene_message(EntityId(404), ClientMsg::SceneDebugPreview { scene: SCENE.into() }, t0), SceneReply::Gone);
+    // no host at all: nothing is offered
+    let mut bare = World::new(RoomsAdapter::new().load_area(HALL).unwrap()).unwrap();
+    let b = seat(&mut bare, "B", &[], t0);
+    assert_eq!(bare.scene_message(b.entity, ClientMsg::SceneDebugPreview { scene: SCENE.into() }, t0), SceneReply::Refused(SceneRefusal::Unavailable));
+}
+
+/// Preview the scene for `s` and let it in; returns what it was told on arriving.
+fn preview(w: &mut World, s: &mut Seat, now: Instant) -> Vec<ServerMsg> {
+    assert_eq!(w.scene_message(s.entity, ClientMsg::SceneDebugPreview { scene: SCENE.into() }, now), SceneReply::Done);
+    let offer = s.drain().into_iter().find(|m| matches!(m, ServerMsg::AreaChange { .. })).expect("sent to the scene's field");
+    let ServerMsg::AreaChange { area, fingerprint, provenance, arrival, .. } = offer else { unreachable!() };
+    assert_eq!(area.key, YARD);
+    assert_eq!((arrival.x, arrival.y), (150.0, -100.0), "where the scene says");
+    assert_eq!(w.join_area(s.entity, &area, &fingerprint, &provenance, now), crate::world::TravelReply::Done);
+    s.drain()
+}
+
+#[test]
+fn a_preview_puts_the_player_in_the_scenes_field_on_a_made_up_story_and_never_saves_it() {
+    let t0 = Instant::now();
+    let (mut w, mut saved_rx, host) = world_with(true, false);
+    // an account with a real story of its own
+    let mut a = seat(&mut w, "A", &[1, 3, 0], t0);
+    a.drain();
+    let msgs = preview(&mut w, &mut a, t0);
+    let snapshot_npcs = msgs.iter().find_map(|m| if let ServerMsg::AreaSnapshot { npcs, .. } = m { Some(npcs.iter().filter(|n| n.id >= SCENE_NPC_ID_BASE).count()) } else { None });
+    assert_eq!(snapshot_npcs, Some(1), "the scene's trigger is there");
+    let told: Vec<&Vec<u8>> = msgs.iter().filter_map(|m| if let ServerMsg::StoryUpdate { progress, advance: None } = m { Some(progress) } else { None }).collect();
+    assert_eq!(told, [&MADE_UP.to_vec()], "the client is told the story the scene plays on");
+    assert_eq!(w.players.get(&a.entity).unwrap().progression, MADE_UP);
+    // the scene starts from the trigger and finishes: the made-up story moves, the store is not written
+    w.press(a.entity, Some(trigger_id()), t0);
+    assert_eq!(w.scene_count(), 1);
+    assert!(host.finished.lock().unwrap().is_empty());
+    w.scene_message(a.entity, ClientMsg::SceneEnd { run: SceneRunId(1), skipped: false }, t0);
+    assert_eq!(host.finished.lock().unwrap().len(), 1);
+    assert_eq!(host.finished.lock().unwrap()[0].1, MADE_UP, "it ran on the made-up story");
+    assert_eq!(w.players.get(&a.entity).unwrap().progression, [9, 5], "in memory the made-up story moved");
+    assert!(saved(&mut saved_rx).is_empty(), "NOTHING of a preview is saved, whatever the scene wrote");
+    let log = log_text(&mut w);
+    assert!(log.contains("preview=true") && log.contains("story=applied (preview: not saved)"), "{log}");
+}
+
+#[test]
+fn a_story_step_of_a_previewing_player_is_never_kept_saved_or_told() {
+    let t0 = Instant::now();
+    let adapter: Arc<dyn GameAdapter> = Arc::new(RoomsAdapter::with_story());
+    let mut w = World::with_party_config(adapter.load_area(HALL).unwrap(), PartyConfig::default()).unwrap();
+    w.set_area_source(adapter);
+    let (handle, mut saved_rx) = SaverHandle::channel();
+    w.set_progress_saver(handle);
+    let mut a = seat(&mut w, "A", &[], t0);
+    let mut b = seat(&mut w, "B", &[], t0);
+    a.drain();
+    b.drain();
+    // (as the preview leaves a player: its own phase, and a story that is made up)
+    w.players.get_mut(&a.entity).unwrap().preview = Some(Preview { phase: preview_phase(a.account, SCENE) });
+    // both walk into the story region: B's step is the story's, A's is a preview's
+    let mut now = t0;
+    for (x, y) in [(100.0, 0.0), (200.0, 0.0)] {
+        go(&mut w, &a, x, y, &mut now);
+        go(&mut w, &b, x, y, &mut now);
+    }
+    assert!(w.players.get(&a.entity).unwrap().progression.is_empty(), "the previewing player's story did not move");
+    assert_eq!(w.players.get(&b.entity).unwrap().progression, fmv_fixture::rooms::STORY_ADVANCED, "the ordinary player's did");
+    assert_eq!(saved(&mut saved_rx).len(), 1, "one save: B's");
+    assert!(a.drain().iter().all(|m| !matches!(m, ServerMsg::StoryUpdate { .. })));
+}
+
+#[test]
+fn two_previews_are_two_instances_and_a_party_member_follows_its_leader_into_the_leaders() {
+    let t0 = Instant::now();
+    let (mut w, _saved, _) = world_with(true, false);
+    let mut a = seat(&mut w, "A", &[], t0);
+    let mut b = seat(&mut w, "B", &[], t0);
+    a.drain();
+    b.drain();
+    preview(&mut w, &mut a, t0);
+    let b_msgs = preview(&mut w, &mut b, t0);
+    assert_ne!(w.instance_of(a.account), w.instance_of(b.account), "each preview is its own player's instance");
+    let seen_by_b: Vec<EntityId> = b_msgs
+        .into_iter()
+        .filter_map(|m| if let ServerMsg::AreaSnapshot { entities, .. } = m { Some(entities.iter().map(|e| e.id).collect::<Vec<_>>()) } else { None })
+        .next_back()
+        .unwrap();
+    assert_eq!(seen_by_b, [b.entity], "B's preview shows B alone");
+    // the phase keys are made-up ones, longer than every verbatim key and carrying their own tag
+    let key = preview_phase(a.account, SCENE);
+    assert_eq!((key.0.first().copied(), key.0.len()), (Some(PREVIEW_PHASE_TAG), 34));
+    assert_ne!(preview_phase(a.account, SCENE), preview_phase(b.account, SCENE));
+    // B joins A's party: it is placed in A's instance, which is how it can watch
+    party(&mut w, &a, &b, t0);
+    assert_eq!(w.instance_of(a.account), w.instance_of(b.account));
+    // and both are at the trigger: A's scene has B as its watcher
+    for s in [&a, &b] {
+        w.players.get_mut(&s.entity).unwrap().snapshot.pos = Pos::new(150.0, -100.0, 0.0);
+    }
+    a.drain();
+    b.drain();
+    w.press(a.entity, Some(trigger_id()), t0);
+    assert_eq!(starts(&b.drain()).first().map(|s| s.1), Some(SceneRole::Watcher));
+}

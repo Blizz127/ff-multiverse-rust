@@ -72,7 +72,7 @@ use crate::config::ServerConfig;
 use crate::deferred;
 use crate::limits::{throttle_notice, Limits, LogVerdict, PeerKey, RegistrationRefusal};
 use crate::world::{
-    BattleReply, CloseFlag, JoinError, MoveOutcome, NewPlayer, Outbound, OutboundTx, PartyOutcome, PressOutcome, TravelReply, World,
+    BattleReply, CloseFlag, JoinError, MoveOutcome, NewPlayer, Outbound, OutboundTx, PartyOutcome, PressOutcome, SceneReply, TravelReply, World,
 };
 
 /// Reported in `Welcome::server_build` and the READY line.
@@ -571,7 +571,11 @@ impl Conn {
                 | ClientMsg::PartyPromote { .. }
                 | ClientMsg::PartySync
                 | ClientMsg::BattleCommand { .. }
-                | ClientMsg::RequestEncounter { .. } => {
+                | ClientMsg::RequestEncounter { .. }
+                | ClientMsg::SceneStep { .. }
+                | ClientMsg::SceneEnd { .. }
+                | ClientMsg::SceneLeave { .. }
+                | ClientMsg::SceneDebugPreview { .. } => {
                     return Err(Close::reject(RejectCode::BadRequest, "unexpected message before JoinArea"));
                 }
             }
@@ -639,6 +643,10 @@ impl Conn {
                     self.travel(|w, now| w.join_area(entity, &area, &fingerprint, &provenance, now))?
                 }
                 ClientMsg::CannotJoin { area, .. } => self.travel(|w, now| w.cannot_join(entity, &area, now))?,
+                // Story scenes (see `world::scene`).
+                ClientMsg::SceneStep { .. } | ClientMsg::SceneEnd { .. } | ClientMsg::SceneLeave { .. } | ClientMsg::SceneDebugPreview { .. } => {
+                    self.on_scene(entity, msg)?
+                }
                 ClientMsg::Hello { .. } => {
                     return Err(Close::reject(RejectCode::BadRequest, "unexpected message after joining"));
                 }
@@ -836,6 +844,16 @@ impl Conn {
             PressOutcome::Nothing => Ok(()),
             PressOutcome::Relocated { corrected } => self.send(ServerMsg::MoveRejected { seq: self.last_move_seq, corrected }),
             PressOutcome::Gone => Err(Close::Dropped("removed from the world")),
+        }
+    }
+
+    /// A scene message (`SceneStep`, `SceneEnd`, `SceneLeave`, `SceneDebugPreview`): the world decides what it does
+    /// (`World::scene_message`); a refusal is told to the sender alone.
+    fn on_scene(&mut self, entity: EntityId, msg: ClientMsg) -> Result<(), Close> {
+        match self.shared.with_world(|world| world.scene_message(entity, msg, Instant::now())) {
+            SceneReply::Done => Ok(()),
+            SceneReply::Refused(reason) => self.send(ServerMsg::SceneRefused { reason }),
+            SceneReply::Gone => Err(Close::Dropped("removed from the world")),
         }
     }
 

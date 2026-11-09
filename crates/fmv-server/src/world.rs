@@ -114,11 +114,13 @@ mod battle;
 mod instances;
 mod party;
 mod press;
+mod scene;
 mod story;
 pub use areas::{TravelReply, AREA_UNLOAD_GRACE, TRAVEL_TIMEOUT};
 pub use battle::BattleReply;
 pub use party::PartyOutcome;
 pub use press::PressOutcome;
+pub use scene::{SceneHost, SceneInfo, SceneReply, SceneResult, SceneSettings, TriggerInfo};
 
 /// A message queued for one or more connections. Broadcasts share one allocation.
 pub type Outbound = Arc<ServerMsg>;
@@ -245,6 +247,10 @@ struct Player {
     /// Set after a link moved the player: until the client has taken the new position (an intent that agrees with it)
     /// every intent is answered with that position (see the `press` module).
     fence: Option<press::Fence>,
+    /// The story scene this player is held in (as owner or watcher), if any (see the `scene` module).
+    scene: Option<fmv_protocol::SceneRunId>,
+    /// Set while the player is in a debug scene preview: its `progression` is made up and nothing of it is ever saved.
+    preview: Option<scene::Preview>,
 }
 
 /// Everything the world needs to admit a player into the area.
@@ -328,6 +334,8 @@ pub struct World {
     saver: Option<SaverHandle>,
     /// Log lines recorded under the world lock, written after it is released (see `take_logs`).
     logs: DeferredLogs,
+    /// Story scenes: the game's scenes, the runs in progress and the debug preview switch (see `scene`).
+    scenes: scene::SceneWorld,
 }
 
 impl World {
@@ -364,6 +372,7 @@ impl World {
             battle: None,
             saver: None,
             logs,
+            scenes: scene::SceneWorld::default(),
         })
     }
 
@@ -460,6 +469,8 @@ impl World {
                 transit: None,
                 arming: LinkArming::default(),
                 fence: None,
+                scene: None,
+                preview: None,
             },
         );
         self.by_account.insert(account, entity);
@@ -496,6 +507,8 @@ impl World {
     fn remove_player(&mut self, entity: EntityId, failed: &mut Vec<(EntityId, bool)>) -> Option<Player> {
         let player = self.players.remove(&entity)?;
         self.by_account.remove(&player.account);
+        // A scene it owned is dropped (nothing it would have written is applied); one it watched goes on without it.
+        self.scene_player_gone(entity, player.scene);
         // A player in transit is in no instance: the one it left was told already.
         let left = self.leave_instance(player.account);
         if let Some(battle) = player.battle {
@@ -518,7 +531,7 @@ impl World {
                 return MoveOutcome::Gone;
             };
             // A player in a battle, or between two areas, is frozen: its moves are ignored.
-            if p.battle.is_some() || p.transit.is_some() {
+            if p.battle.is_some() || p.transit.is_some() || p.scene.is_some() {
                 return MoveOutcome::Frozen;
             }
             let Some(area) = self.areas.get(&p.area) else {
@@ -694,6 +707,8 @@ impl World {
             }
         }
         self.refresh_placements(&moved, failed);
+        // A watcher that is no longer in its owner's party stops watching.
+        self.scene_check_parties();
     }
 
     /// A player is leaving the world: leave its party (the others hear `LeaderChanged` /

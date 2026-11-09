@@ -1,0 +1,637 @@
+//! Tests of the scene interpreter on synthetic scripts (invented, never real game data).
+
+use super::*;
+use crate::field::FieldFile;
+use crate::script::dialogue::End;
+use crate::script::synth::{dialog, SynthScript};
+use crate::script::FieldScript;
+use crate::story::{StoryState, REACTOR_LIFT};
+use crate::testutil::{FieldSpec, LoaderModelSpec};
+
+// ---- a tiny assembler ------------------------------------------------------------------------
+
+const RET: u8 = 0x00;
+
+fn cat(parts: &[Vec<u8>]) -> Vec<u8> {
+    parts.concat()
+}
+
+fn message(window: u8, dialog: u8) -> Vec<u8> {
+    vec![0x40, window, dialog]
+}
+
+/// `ASK window dialog first last var` with the answer variable `Var[bank][addr]`.
+fn ask(dialog: u8, first: u8, last: u8, bank: u8, addr: u8) -> Vec<u8> {
+    vec![0x48, bank, 0, dialog, first, last, addr]
+}
+
+fn setbyte(bank: u8, addr: u8, value: u8) -> Vec<u8> {
+    vec![0x80, bank << 4, addr, value]
+}
+
+fn setword(bank: u8, addr: u8, value: u16) -> Vec<u8> {
+    let [lo, hi] = value.to_le_bytes();
+    vec![0x81, bank << 4, addr, lo, hi]
+}
+
+fn biton(bank: u8, addr: u8, bit: u8) -> Vec<u8> {
+    vec![0x82, bank << 4, addr, bit]
+}
+
+/// `IFUB Var[bank][addr] <op> right` guarding `body` (the jump skips exactly the body).
+fn if_ub(bank: u8, addr: u8, op: u8, right: u8, body: &[u8]) -> Vec<u8> {
+    let mut v = vec![0x14, bank << 4, addr, right, op, u8::try_from(body.len() + 1).unwrap()];
+    v.extend_from_slice(body);
+    v
+}
+
+fn req(op: u8, entity: u8, prio: u8, slot: u8) -> Vec<u8> {
+    vec![op, entity, (prio << 5) | slot]
+}
+
+fn reqew(entity: u8, slot: u8) -> Vec<u8> {
+    req(0x03, entity, 2, slot)
+}
+
+fn reqsw(entity: u8, slot: u8) -> Vec<u8> {
+    req(0x02, entity, 2, slot)
+}
+
+fn wait(frames: u16) -> Vec<u8> {
+    let [lo, hi] = frames.to_le_bytes();
+    vec![0x24, lo, hi]
+}
+
+fn words(values: &[i16]) -> Vec<u8> {
+    values.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+
+fn xyzi(x: i16, y: i16, z: i16, triangle: u16) -> Vec<u8> {
+    cat(&[vec![0xA5, 0x00, 0x00], words(&[x, y, z]), triangle.to_le_bytes().to_vec()])
+}
+
+fn mov(x: i16, y: i16) -> Vec<u8> {
+    cat(&[vec![0xA8, 0x00], words(&[x, y])])
+}
+
+fn dir(direction: u8) -> Vec<u8> {
+    vec![0xB3, 0x00, direction]
+}
+
+fn dira(entity: u8) -> Vec<u8> {
+    vec![0xB6, entity]
+}
+
+fn visi(v: u8) -> Vec<u8> {
+    vec![0xA4, v]
+}
+
+fn mapjump(field: u16) -> Vec<u8> {
+    cat(&[vec![0x60], field.to_le_bytes().to_vec(), words(&[0, 0, 0]), vec![0]])
+}
+
+/// A backward jump to its own first byte: the idle loop.
+fn idle() -> Vec<u8> {
+    vec![0x12, 0x00]
+}
+
+/// `RDMSD`: an opcode the VM does not know.
+fn unknown_op() -> Vec<u8> {
+    vec![0x7F, 0x00, 0x05]
+}
+
+/// One entity of a synthetic script: its name and, per slot, the instructions of that script.
+type Entity<'a> = (&'a str, Vec<(usize, Vec<Vec<u8>>)>);
+
+fn script(entities: Vec<Entity<'_>>, dialogs: Vec<Vec<u8>>) -> Vec<u8> {
+    let mut s = SynthScript { dialogs, ..Default::default() };
+    for (name, slots) in entities {
+        let slots = slots
+            .into_iter()
+            .map(|(slot, code)| {
+                let mut c = cat(&code);
+                c.push(RET);
+                (slot, c)
+            })
+            .collect();
+        s = s.entity(name, slots);
+    }
+    s.build()
+}
+
+fn field_of(section: Vec<u8>) -> FieldFile {
+    let spec = FieldSpec { overrides: vec![(0, section)], ..FieldSpec::default() };
+    FieldFile::parse(spec.build()).expect("a synthetic field parses")
+}
+
+// ---- running the VM --------------------------------------------------------------------------
+
+fn vm_for(story: StoryState, given: &[Given]) -> Vm {
+    Vm::new(SceneVars::new(story, given), 7, Limits::default())
+}
+
+/// Every beat of a scene that starts with `root`, answering each question from `answers`.
+fn run_root(section: &[u8], root: Vec<Step>, answers: &[usize]) -> (Vec<Beat>, Vm) {
+    run_with(section, root, answers, vm_for(StoryState::new_game(), &[]))
+}
+
+fn run_with(section: &[u8], root: Vec<Step>, answers: &[usize], mut vm: Vm) -> (Vec<Beat>, Vm) {
+    let script = FieldScript::parse(section).unwrap();
+    vm.begin(root);
+    let (mut out, mut answers, mut given) = (Vec::new(), answers.iter().copied(), None);
+    for _ in 0..200 {
+        let beat = vm.resume(&script, given.take());
+        let asked = matches!(&beat.then, Then::Window(w) if w.message.choice.is_some());
+        let done = matches!(beat.then, Then::End { .. });
+        out.push(beat);
+        if done {
+            return (out, vm);
+        }
+        if asked {
+            given = answers.next();
+        }
+    }
+    panic!("a scene never ended");
+}
+
+fn start(entity: u8, slot: u8) -> Vec<Step> {
+    vec![Step::Start(ScriptRef::new(entity, slot))]
+}
+
+fn windows(beats: &[Beat]) -> Vec<&Window> {
+    beats.iter().filter_map(|b| if let Then::Window(w) = &b.then { Some(w) } else { None }).collect()
+}
+
+fn dialogs_of(beats: &[Beat]) -> Vec<usize> {
+    windows(beats)
+        .iter()
+        .map(|w| match w.message.origin {
+            crate::script::dialogue::MessageOrigin::Canon { dialog, .. } => dialog,
+            crate::script::dialogue::MessageOrigin::Added { .. } => usize::MAX,
+        })
+        .collect()
+}
+
+fn end_of(beats: &[Beat]) -> End {
+    match beats.last().map(|b| &b.then) {
+        Some(Then::End { how, .. }) => *how,
+        other => panic!("the scene did not end: {other:?}"),
+    }
+}
+
+fn stage(beats: &[Beat]) -> Vec<(u32, Stage)> {
+    beats.iter().flat_map(|b| b.stage.iter().map(|t| (t.at, t.what.clone()))).collect()
+}
+
+fn texts(n: usize) -> Vec<Vec<u8>> {
+    (0..n).map(|i| dialog(&format!("Line {i}"))).collect()
+}
+
+// ---- windows and asks ------------------------------------------------------------------------
+
+#[test]
+fn a_script_hands_out_its_windows_in_order_and_the_scene_ends() {
+    let section = script(vec![("a", vec![(1, vec![message(0, 2), message(0, 0), message(3, 1)])])], texts(3));
+    let (beats, vm) = run_root(&section, start(0, 1), &[]);
+    assert_eq!(dialogs_of(&beats), [2, 0, 1]);
+    assert_eq!(end_of(&beats), End::Finished);
+    assert_eq!(windows(&beats).iter().map(|w| w.id).collect::<Vec<_>>(), [0, 0, 3]);
+    assert!(windows(&beats).iter().all(|w| w.opener == 0), "the opener is the script's entity");
+    assert_eq!(vm.stats().windows, 3);
+    assert!(vm.stats().unknown.is_empty() && vm.stats().handled.contains_key("MESSAGE"));
+}
+
+#[test]
+fn an_ask_waits_for_its_answer_and_the_script_branches_on_it() {
+    // dialog 0 asks (lines 1 and 2 are the choices), 1 and 2 are the replies.
+    let question = [dialog("Q").split_last().map(|(_, r)| r.to_vec()).unwrap(), vec![0xE7], vec![b'A' - 0x20], vec![0xE7], vec![b'B' - 0x20, 0xFF]].concat();
+    let questions = vec![question, dialog("Reply A"), dialog("Reply B")];
+    let body = vec![
+        setbyte(5, 13, 0),
+        ask(0, 1, 2, 5, 13),
+        if_ub(5, 13, 0, 1, &message(0, 1)),
+        if_ub(5, 13, 0, 2, &message(0, 2)),
+    ];
+    let section = script(vec![("a", vec![(1, body)])], questions);
+    let (beats, _) = run_root(&section, start(0, 1), &[2]);
+    assert_eq!(dialogs_of(&beats), [0, 2], "answering line 2 takes the second branch");
+    let Then::Window(w) = &beats[0].then else { panic!() };
+    let choice = w.message.choice.expect("a question");
+    assert_eq!((choice.first, choice.last, choice.cursor), (1, 2, 1));
+    let (beats, _) = run_root(&section, start(0, 1), &[1]);
+    assert_eq!(dialogs_of(&beats), [0, 1]);
+    // no answer at all takes the cursor's starting line
+    let (beats, _) = run_root(&section, start(0, 1), &[]);
+    assert_eq!(dialogs_of(&beats), [0, 1]);
+}
+
+// ---- threads, requests and time --------------------------------------------------------------
+
+#[test]
+fn reqew_runs_the_requested_script_to_its_end_before_the_requester_goes_on() {
+    let a = vec![message(0, 0), reqew(1, 1), message(0, 3)];
+    let b = vec![message(0, 1), wait(10), message(0, 2)];
+    let section = script(vec![("a", vec![(1, a)]), ("b", vec![(1, b)])], texts(4));
+    let (beats, _) = run_root(&section, start(0, 1), &[]);
+    assert_eq!(dialogs_of(&beats), [0, 1, 2, 3]);
+}
+
+#[test]
+fn concurrent_scripts_open_their_windows_in_the_order_of_their_virtual_time() {
+    // `a` waits 60 frames and speaks, `b` waits 20 and speaks: b first, though `a` started first.
+    let a = vec![wait(60), message(0, 0)];
+    let b = vec![wait(20), message(0, 1)];
+    let root = vec![Step::Start(ScriptRef::new(0, 1)), Step::Start(ScriptRef::new(1, 1))];
+    let section = script(vec![("a", vec![(1, a)]), ("b", vec![(1, b)])], texts(2));
+    let (beats, _) = run_root(&section, root, &[]);
+    assert_eq!(dialogs_of(&beats), [1, 0]);
+    let at: Vec<u32> = windows(&beats).iter().map(|w| w.at).collect();
+    assert_eq!(at[0], 20, "the first window opens 20 frames in");
+    assert_eq!(at[1], 40, "the second 40 frames after the first one opened (60 - 20)");
+}
+
+#[test]
+fn a_tail_a_script_requested_just_before_it_returned_still_runs() {
+    // a requests b with REQSW and returns at once; b's lines come after a's.
+    let a = vec![message(0, 0), reqsw(1, 1)];
+    let b = vec![message(0, 1)];
+    let section = script(vec![("a", vec![(1, a)]), ("b", vec![(1, b)])], texts(2));
+    let (beats, _) = run_root(&section, start(0, 1), &[]);
+    assert_eq!(dialogs_of(&beats), [0, 1], "the orphaned tail ran");
+    assert_eq!(end_of(&beats), End::Finished);
+}
+
+#[test]
+fn a_background_idle_loop_does_not_hold_the_scene_open() {
+    // `bg` loops for ever doing nothing; `a` speaks twice. The scene ends after a's second line.
+    let bg = vec![idle()];
+    let a = vec![message(0, 0), wait(5), message(0, 1)];
+    let root = vec![Step::Start(ScriptRef::new(1, 1)), Step::Start(ScriptRef::new(0, 1))];
+    let section = script(vec![("a", vec![(1, a)]), ("bg", vec![(1, bg)])], texts(2));
+    let (beats, vm) = run_root(&section, root, &[]);
+    assert_eq!(dialogs_of(&beats), [0, 1]);
+    assert_eq!(end_of(&beats), End::Finished);
+    assert!(vm.stats().parked >= 1, "the idle loop was parked, not run for ever");
+}
+
+#[test]
+fn a_polling_loop_is_woken_by_the_change_it_waits_for() {
+    // `poll` waits for Var[5][1] == 1 (a busy loop), then speaks; `setter` waits 30 frames and sets it.
+    // L: IFUB Var[5][1] == 1 (true: fall into JMPF, which skips the loop-back; false: land on the JMPB back to L)
+    let poll = vec![if_ub(5, 1, 0, 1, &[0x10, 3]), vec![0x12, 8], message(0, 0)];
+    let setter = vec![wait(30), setbyte(5, 1, 1)];
+    let root = vec![Step::Start(ScriptRef::new(0, 1)), Step::Start(ScriptRef::new(1, 1))];
+    let section = script(vec![("poll", vec![(1, poll)]), ("setter", vec![(1, setter)])], texts(1));
+    let (beats, vm) = run_root(&section, root, &[]);
+    assert_eq!(dialogs_of(&beats), [0], "the poller spoke once the variable was set");
+    assert_eq!(vm.writes().get(&(5, 1)), Some(&1));
+}
+
+#[test]
+fn a_request_for_a_taken_priority_slot_waits_for_it() {
+    // Two requests for the same entity at the same priority: the second starts when the first has ended.
+    let first = vec![message(0, 0), wait(10), message(0, 1)];
+    let second = vec![message(0, 2)];
+    let root = vec![Step::Start(ScriptRef::new(0, 1)), Step::Start(ScriptRef::new(0, 2))];
+    let section = script(vec![("a", vec![(1, first), (2, second)])], texts(3));
+    let (beats, vm) = run_root(&section, root, &[]);
+    assert_eq!(dialogs_of(&beats), [0, 1, 2], "slot 2 waited for slot 1's priority");
+    assert_eq!(vm.stats().queued, 1);
+}
+
+#[test]
+fn the_trigger_steps_run_in_order_the_bit_first_then_the_awaited_script_then_the_started_one() {
+    let first = vec![if_ub(3, 9, 9, 2, &message(0, 0)) /* only if bit 2 of Var[3][9] is on */];
+    let second = vec![message(0, 1)];
+    let section = script(vec![("a", vec![(1, first)]), ("b", vec![(1, second)])], texts(2));
+    let root = vec![Step::SetBit { bank: 3, address: 9, bit: 2 }, Step::Await(ScriptRef::new(0, 1)), Step::Start(ScriptRef::new(1, 1))];
+    let (beats, vm) = run_root(&section, root, &[]);
+    assert_eq!(dialogs_of(&beats), [0, 1], "the awaited script saw the bit the trigger set before it");
+    assert_eq!(vm.writes().get(&(3, 9)), Some(&0b100));
+}
+
+// ---- the stage -------------------------------------------------------------------------------
+
+#[test]
+fn places_walks_turns_and_visibility_come_out_as_stage_events_with_where_things_stood() {
+    let a = vec![xyzi(10, 20, 5, 1), dir(64), mov(40, 20), visi(0), message(0, 0), visi(1)];
+    let section = script(vec![("a", vec![(1, a)])], texts(1));
+    let (beats, vm) = run_root(&section, start(0, 1), &[]);
+    let events = stage(&beats);
+    assert!(matches!(events[0].1, Stage::Place { entity: 0, x: 10, y: 20, z: Some(5), triangle: Some(1) }));
+    assert!(matches!(events[1].1, Stage::Face { entity: 0, frames: 0, .. }));
+    let Stage::Move { from, x, y, frames, how, .. } = events[2].1 else { panic!("{events:?}") };
+    assert_eq!((from, x, y, how), (Some((10, 20)), 40, 20, MoveHow::Walk));
+    assert_eq!(frames, 15, "30 units at the default walk of 2 a frame");
+    assert!(matches!(events[3].1, Stage::Show { entity: 0, visible: false }));
+    assert_eq!(events[3].0, 15, "the script waited for the walk to end");
+    assert_eq!(vm.place_of(0).map(|w| (w.x, w.y)), Some((40, 20)));
+    assert_eq!(vm.visible_of(0), Some(true));
+}
+
+#[test]
+fn a_script_turns_towards_another_entity_it_knows_the_place_of() {
+    let a = vec![xyzi(0, 0, 0, 0), dira(1), message(0, 0)];
+    let b = vec![xyzi(0, 100, 0, 0)];
+    let root = vec![Step::Await(ScriptRef::new(1, 1)), Step::Start(ScriptRef::new(0, 1))];
+    let section = script(vec![("a", vec![(1, a)]), ("b", vec![(1, b)])], texts(1));
+    let (beats, _) = run_root(&section, root, &[]);
+    let faces: Vec<f32> = stage(&beats).into_iter().filter_map(|(_, s)| if let Stage::Face { entity: 0, heading, .. } = s { Some(heading) } else { None }).collect();
+    assert_eq!(faces.len(), 1);
+    assert!((faces[0] - std::f32::consts::FRAC_PI_2).abs() < 1e-5, "b is straight along +y: {faces:?}");
+}
+
+#[test]
+fn animations_come_out_with_how_they_play_and_the_script_waits_where_the_engine_does() {
+    // ANIM!1 (waits, holds) then ANIM!2 (does not wait), DFANM (loops).
+    let a = vec![vec![0xAF, 3, 1], vec![0xBA, 4, 1], vec![0xA2, 0, 1], message(0, 0)];
+    let section = script(vec![("a", vec![(1, a)])], texts(1));
+    let (beats, _) = run_root(&section, start(0, 1), &[]);
+    let anims: Vec<(u32, u8, AnimHow)> = stage(&beats).into_iter().filter_map(|(at, s)| if let Stage::Anim { animation, how, .. } = s { Some((at, animation, how)) } else { None }).collect();
+    assert_eq!(anims, [(0, 3, AnimHow::Hold), (15, 4, AnimHow::Hold), (15, 0, AnimHow::Loop)]);
+}
+
+#[test]
+fn camera_moves_are_recorded_and_the_script_can_wait_for_a_scroll() {
+    let a = vec![cat(&[vec![0x66, 0x00, 0x00], words(&[60, -20]), 30u16.to_le_bytes().to_vec()]), vec![0x67], message(0, 0), vec![0x65]];
+    let section = script(vec![("a", vec![(1, a)])], texts(1));
+    let (beats, _) = run_root(&section, start(0, 1), &[]);
+    let cam: Vec<(u32, CameraOp)> = stage(&beats).into_iter().filter_map(|(at, s)| if let Stage::Camera(c) = s { Some((at, c)) } else { None }).collect();
+    assert_eq!(cam[0], (0, CameraOp::Scroll { x: 60, y: -20, frames: 30 }));
+    assert_eq!(windows(&beats)[0].at, 30, "SCRLW waited for the scroll");
+    assert_eq!(cam[1].1, CameraOp::Reset);
+}
+
+// ---- what the VM does not do ------------------------------------------------------------------
+
+#[test]
+fn an_opcode_it_does_not_know_is_skipped_and_counted_never_guessed() {
+    let a = vec![unknown_op(), unknown_op(), vec![0xF0, 1] /* MUSIC: known to change nothing a scene shows */, message(0, 0)];
+    let section = script(vec![("a", vec![(1, a)])], texts(1));
+    let (beats, vm) = run_root(&section, start(0, 1), &[]);
+    assert_eq!(dialogs_of(&beats), [0], "the script went on past what it did not know");
+    assert_eq!(vm.stats().unknown.get("RDMSD"), Some(&2));
+    assert_eq!(vm.stats().ignored.get("MUSIC"), Some(&1));
+    assert!(!vm.stats().handled.contains_key("RDMSD"));
+}
+
+#[test]
+fn a_map_jump_ends_the_scene_at_once_and_nothing_is_moved() {
+    let a = vec![message(0, 0), mapjump(9), message(0, 1)];
+    let section = script(vec![("a", vec![(1, a)])], texts(2));
+    let (beats, _) = run_root(&section, start(0, 1), &[]);
+    assert_eq!(dialogs_of(&beats), [0]);
+    assert_eq!(end_of(&beats), End::MapJump { field: 9 });
+}
+
+#[test]
+fn a_loop_that_keeps_changing_things_ends_in_the_budget_not_never() {
+    // INC for ever: the variable changes every lap, so it is never "idle".
+    let a = vec![vec![0x95, 0x05, 0x01], vec![0x12, 3]];
+    let section = script(vec![("a", vec![(1, a)])], texts(1));
+    let limits = Limits { steps: 5_000, ..Limits::default() };
+    let (beats, _) = run_with(&section, start(0, 1), &[], Vm::new(SceneVars::new(StoryState::new_game(), &[]), 1, limits));
+    assert_eq!(end_of(&beats), End::Budget);
+}
+
+#[test]
+fn too_many_windows_end_the_scene_in_the_budget() {
+    let a = vec![message(0, 0), vec![0x12, 3]];
+    let section = script(vec![("a", vec![(1, a)])], texts(1));
+    let (beats, _) = run_with(&section, start(0, 1), &[], Vm::new(SceneVars::new(StoryState::new_game(), &[]), 1, Limits { windows: 5, ..Limits::default() }));
+    assert_eq!(windows(&beats).len(), 5);
+    assert_eq!(end_of(&beats), End::Budget);
+}
+
+#[test]
+fn damaged_bytes_never_panic_and_end_the_scene() {
+    // every opcode byte, then truncations: the VM ends the scene or skips, but never panics
+    for op in 0..=255u8 {
+        for tail in [vec![], vec![0xFF; 3], vec![0; 12], (0..30).collect::<Vec<u8>>()] {
+            let mut code = vec![op];
+            code.extend(tail);
+            code.push(RET);
+            let section = SynthScript { dialogs: texts(2), ..Default::default() }.entity("a", vec![(1, code)]).build();
+            let parsed = FieldScript::parse(&section).unwrap();
+            let mut vm = Vm::new(SceneVars::new(StoryState::new_game(), &[]), 1, Limits { steps: 2_000, windows: 8, threads: 8, frames: 600 });
+            vm.begin(start(0, 1));
+            for _ in 0..40 {
+                if matches!(vm.resume(&parsed, None).then, Then::End { .. }) {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn the_same_seed_gives_the_same_scene() {
+    let a = vec![vec![0x99, 0x05, 0x02] /* RANDOM Var[5][2] */, if_ub(5, 2, 2, 127, &message(0, 0)), message(0, 1)];
+    let section = script(vec![("a", vec![(1, a)])], texts(2));
+    let run = |seed: u32| {
+        let (beats, _) = run_with(&section, start(0, 1), &[], Vm::new(SceneVars::new(StoryState::new_game(), &[]), seed, Limits::default()));
+        dialogs_of(&beats)
+    };
+    assert_eq!(run(5), run(5));
+    assert!((1..200).any(|s| run(s) != run(1)), "the seed does feed RANDOM");
+}
+
+// ---- variables, the story and what it writes ----------------------------------------------------
+
+#[test]
+fn the_moment_comes_from_the_story_and_the_scene_from_what_it_was_found_with() {
+    let given = [Given { bank: 3, address: 5, value: 0b10 }];
+    let vars = SceneVars::new(StoryState::at(72), &given);
+    use crate::script::dialogue::StoryVars;
+    assert_eq!(vars.byte(2, 0), 72, "the moment is the player's story's");
+    assert_eq!(vars.byte(3, 5), 0b10, "a flag the story does not carry is the scene's");
+    assert_eq!(vars.byte(3, 6), 0);
+    // a given value never overrides the moment
+    let sneaky = SceneVars::new(StoryState::at(72), &[Given { bank: 2, address: 0, value: 9 }]);
+    assert_eq!(sneaky.byte(2, 0), 72);
+}
+
+#[test]
+fn a_branch_on_a_given_flag_is_taken_as_the_scene_was_found() {
+    let a = vec![if_ub(3, 5, 9, 1, &message(0, 0)), message(0, 1)];
+    let section = script(vec![("a", vec![(1, a)])], texts(2));
+    let with = vm_for(StoryState::new_game(), &[Given { bank: 3, address: 5, value: 0b10 }]);
+    let (beats, _) = run_with(&section, start(0, 1), &[], with);
+    assert_eq!(dialogs_of(&beats), [0, 1]);
+    let (beats, _) = run_root(&section, start(0, 1), &[]);
+    assert_eq!(dialogs_of(&beats), [1], "without the flag the first window is not opened");
+}
+
+// ---- the play layer: cast, ground, speakers, writes --------------------------------------------
+
+fn demo_def(cast: Vec<CastMember>, root: Vec<Step>) -> SceneDef {
+    SceneDef {
+        id: "test/demo".to_string(),
+        game: "ff7".to_string(),
+        field: "demo".to_string(),
+        trigger: Trigger { entity: 0, name: "a".to_string(), slot: 1, talk_radius: 80, moments: 3..=5 },
+        setup: Vec::new(),
+        given: Vec::new(),
+        root,
+        cast,
+        speakers: vec![("Aya".to_string(), 0), ("Bo".to_string(), 1)],
+        witness: vec![Spot { x: 50, y: 10, triangle: 0, direction: 64 }],
+        arrival: Spot { x: 50, y: 10, triangle: 0, direction: 64 },
+    }
+}
+
+fn member(entity: u8, name: &str) -> CastMember {
+    CastMember { entity, name: name.to_string(), look: Look::Appearance(format!("test/{name}")), start: None }
+}
+
+#[test]
+fn the_cast_decides_whose_events_are_kept_and_the_ground_gives_every_place_its_height() {
+    // entity 0 (cast) walks and speaks; entity 1 is not in the cast: its walk is dropped and counted.
+    let a = vec![xyzi(50, 10, 77, 0), mov(60, 20), message(0, 0)];
+    let b = vec![mov(1, 1)];
+    let section = script(vec![("a", vec![(1, a)]), ("b", vec![(1, b)])], vec![dialog("Aya"), dialog("Bo")]);
+    let field = field_of(section);
+    let def = demo_def(vec![member(0, "aya")], vec![Step::Start(ScriptRef::new(0, 1)), Step::Start(ScriptRef::new(1, 1))]);
+    let mut play = ScenePlay::new(&field, &def, &StoryState::at(4), 1).unwrap();
+    let beat = play.next(None);
+    let moves: Vec<_> = beat.stage.iter().filter(|t| matches!(t.what, Stage::Move { .. })).collect();
+    assert_eq!(moves.len(), 1, "{:?}", beat.stage);
+    let Stage::Move { z, .. } = moves[0].what else { unreachable!() };
+    assert!(z.is_some(), "the walk's end got the ground's height");
+    assert_eq!(play.off_cast(), 1);
+    let Stage::Place { z, .. } = beat.stage.iter().find(|t| matches!(t.what, Stage::Place { .. })).unwrap().what else { unreachable!() };
+    assert_eq!(z, Some(77), "the script's own height is kept");
+}
+
+#[test]
+fn the_first_line_of_a_window_names_who_speaks() {
+    let a = vec![message(0, 0), message(0, 1), message(0, 2)];
+    let dialogs = vec![
+        // a name, a newline (0xE7), then the quotation: the game's own convention
+        [dialog("Aya").split_last().map(|(_, rest)| rest.to_vec()).unwrap(), vec![0xE7], dialog("Hello.")].concat(),
+        [dialog("Bo").split_last().map(|(_, rest)| rest.to_vec()).unwrap(), vec![0xE7], dialog("Hi.")].concat(),
+        dialog("Nobody speaks here."),
+    ];
+    let field = field_of(script(vec![("a", vec![(1, a)])], dialogs));
+    let def = demo_def(vec![member(0, "aya"), member(1, "bo")], start(0, 1));
+    let mut play = ScenePlay::new(&field, &def, &StoryState::at(4), 1).unwrap();
+    let mut speakers = Vec::new();
+    while let Then::Window(w) = play.next(None).then {
+        speakers.push((w.opener, w.speaker));
+    }
+    assert_eq!(speakers, [(0, Some(0)), (0, Some(1)), (0, None)], "the opener is the script's entity, the speaker the name's");
+}
+
+#[test]
+fn the_stage_scripts_place_the_cast_and_their_loops_do_not_hold_the_scene() {
+    // `setup` puts entity 0 at (10, 20) and turns it; a loop after it would never end.
+    let setup = vec![xyzi(10, 20, 0, 0), dir(128), idle()];
+    let a = vec![message(0, 0)];
+    let section = script(vec![("a", vec![(1, a), (3, setup)])], vec![dialog("Hello.")]);
+    let field = field_of(section);
+    let mut def = demo_def(vec![member(0, "aya"), CastMember { start: Some(Spot { x: 90, y: 90, triangle: 0, direction: 0 }), ..member(1, "bo") }], start(0, 1));
+    def.setup = vec![ScriptRef::new(0, 3)];
+    let mut play = ScenePlay::new(&field, &def, &StoryState::at(4), 1).unwrap();
+    let initial: Vec<Stage> = play.initial_stage_events().to_vec();
+    assert!(initial.iter().any(|s| matches!(s, Stage::Place { entity: 0, x: 10, y: 20, .. })), "{initial:?}");
+    assert!(initial.iter().any(|s| matches!(s, Stage::Place { entity: 1, x: 90, y: 90, .. })), "an actor the stage scripts do not place starts where the cast says");
+    let beat = play.next(None);
+    assert!(matches!(beat.then, Then::Window(_)));
+    assert!(matches!(play.next(None).then, Then::End { how: End::Finished, .. }));
+}
+
+#[test]
+fn what_the_scene_writes_is_reported_by_kind_and_applied_forward_only() {
+    // the script sets the moment to 80, a tracked bit (the reactor lift) and a field flag of its own
+    let a = vec![setword(2, 0, 80), biton(1, 225, 0), biton(3, 212, 2), message(0, 0)];
+    let section = script(vec![("a", vec![(1, a)])], vec![dialog("Hello.")]);
+    let field = field_of(section);
+    let def = demo_def(vec![member(0, "aya")], start(0, 1));
+    let story = StoryState::at(72);
+    let outcome = run_to_end(&field, &def, &story, 1, &[]).unwrap();
+    assert_eq!(outcome.end, End::Finished);
+    assert_eq!(outcome.windows, 1);
+    assert_eq!(outcome.writes.moment, Some(80));
+    assert_eq!(outcome.writes.tracked, [((REACTOR_LIFT.bank, REACTOR_LIFT.address), 0b1)]);
+    assert_eq!(outcome.writes.untracked.get(&(3, 212)), Some(&0b100), "a field's own flag is not the story's, and is said so");
+    assert!(!outcome.writes.is_story_neutral());
+
+    let mut state = story.clone();
+    assert!(outcome.writes.apply_to(&mut state));
+    assert_eq!(state.moment, 80);
+    assert_eq!(state.var(REACTOR_LIFT.bank, REACTOR_LIFT.address), 1);
+    // applied again, it changes nothing (once)
+    assert!(!outcome.writes.apply_to(&mut state));
+    // and never takes a story back
+    let mut later = StoryState::at(90);
+    assert!(outcome.writes.apply_to(&mut later), "the tracked bit still goes on");
+    assert_eq!(later.moment, 90, "the moment does not go back to 80");
+}
+
+#[test]
+fn a_scene_that_writes_nothing_the_story_carries_is_story_neutral() {
+    let a = vec![biton(3, 212, 2), message(0, 0)];
+    let field = field_of(script(vec![("a", vec![(1, a)])], vec![dialog("Hello.")]));
+    let def = demo_def(vec![member(0, "aya")], start(0, 1));
+    let outcome = run_to_end(&field, &def, &StoryState::at(72), 1, &[]).unwrap();
+    assert!(outcome.writes.is_story_neutral());
+    assert_eq!(outcome.writes.untracked.len(), 1);
+    let mut s = StoryState::at(72);
+    assert!(!outcome.writes.apply_to(&mut s));
+    assert_eq!(s, StoryState::at(72));
+}
+
+#[test]
+fn the_answers_a_player_gave_decide_what_the_headless_run_writes() {
+    // answering line 2 sets the moment to 90, line 1 leaves it
+    let question = [dialog("Q").split_last().map(|(_, r)| r.to_vec()).unwrap(), vec![0xE7], vec![b'A' - 0x20], vec![0xE7], vec![b'B' - 0x20, 0xFF]].concat();
+    let body = vec![setbyte(5, 13, 0), ask(0, 1, 2, 5, 13), if_ub(5, 13, 0, 2, &setword(2, 0, 90))];
+    let field = field_of(script(vec![("a", vec![(1, body)])], vec![question]));
+    let def = demo_def(vec![member(0, "aya")], start(0, 1));
+    let story = StoryState::at(72);
+    assert_eq!(run_to_end(&field, &def, &story, 1, &[2]).unwrap().writes.moment, Some(90));
+    assert_eq!(run_to_end(&field, &def, &story, 1, &[1]).unwrap().writes.moment, None);
+    assert_eq!(run_to_end(&field, &def, &story, 1, &[]).unwrap().writes.moment, None, "no answer takes the cursor's line (the first)");
+}
+
+#[test]
+fn a_scene_is_data_and_can_be_played_with_another_cast() {
+    let def = proof_scene();
+    assert_eq!(def.id, PROOF_SCENE_ID);
+    assert!(def.applies_at(72) && !def.applies_at(71) && !def.applies_at(73));
+    assert_eq!(def.speaker_entity(" tifa "), Some(proof::TIFA), "a name matches whatever its case");
+    assert_eq!(def.speaker_entity("Marlene"), None);
+    assert_eq!(scene(PROOF_SCENE_ID).map(|s| s.id), Some(PROOF_SCENE_ID.to_string()));
+    assert_eq!(scenes_in_field("MDS7PB_1").len(), 1);
+    assert!(scenes_in_field("md1stin").is_empty());
+    // the witness has a spot for the owner and for each of two watchers, all different
+    assert_eq!(def.witness.len(), 3);
+    // another cast keeps the script's entities and changes the actors that play them
+    let cosplay = def.clone().with_cast(vec![
+        CastMember { entity: proof::CLOUD, name: "cloud".into(), look: Look::Appearance("ff7/barret".into()), start: def.member(proof::CLOUD).and_then(|m| m.start) },
+        CastMember { entity: proof::TIFA, name: "tifa".into(), look: Look::Model { hrc: "aaaa".into(), idle: "acfe".into() }, start: None },
+    ]);
+    assert_eq!(cosplay.trigger, def.trigger);
+    assert_eq!(cosplay.root, def.root);
+    assert_ne!(cosplay.cast, def.cast);
+    assert_eq!(cosplay.member(proof::TIFA).map(|m| m.look.clone()), Some(Look::Model { hrc: "aaaa".into(), idle: "acfe".into() }));
+}
+
+#[test]
+fn the_trigger_npc_is_found_from_the_stage_script_and_the_models_record() {
+    // entity 0's stage script places it; the loader record for its CHAR names the model and the first clip.
+    let init = vec![vec![0xA1, 0x00] /* CHAR 0 */, vec![RET]];
+    let stage_script = vec![xyzi(30, 40, 9, 0), dir(64)];
+    let section = SynthScript { dialogs: texts(1), model_count: 1, scale: 512, ..Default::default() }
+        .entity("npc", vec![(0, cat(&init)), (3, cat(&[cat(&stage_script), vec![RET]]))])
+        .build();
+    let spec = FieldSpec { overrides: vec![(0, section)], models: vec![LoaderModelSpec::new("npc.char", "ABCD.HRC", &["AAFE.aki", "BBBB.aki"])], ..FieldSpec::default() };
+    let field = FieldFile::parse(spec.build()).unwrap();
+    let mut def = demo_def(vec![member(0, "npc")], Vec::new());
+    def.setup = vec![ScriptRef::new(0, 3)];
+    let npc = trigger_npc(&field, &def, &StoryState::at(4)).expect("found");
+    assert_eq!((npc.entity, npc.name.as_str(), npc.model.as_str(), npc.idle.as_deref()), (0, "a", "abcd", Some("aafe")));
+    assert_eq!((npc.x, npc.y), (30, 40));
+    assert!((npc.talk_radius - 80.0).abs() < 1e-3, "TALKR 80 at scale 512");
+    assert!((npc.heading - 0.0).abs() < 1e-5, "DIR 64 faces +x");
+}
