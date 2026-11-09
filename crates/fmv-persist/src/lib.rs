@@ -66,6 +66,13 @@
 //!   (account, game). It is created together with the account ([`Store::register_with_character`]) or, for an
 //!   account that predates it, added at its first login ([`Store::ensure_player_character`]); in neither case
 //!   is a file of an older build edited, so a rolled-back server finds every record as it left it.
+//! * **A delete is soft, atomic and recoverable.** [`Store::delete_account`] moves everything of one account (its
+//!   account record, avatar profile, player-character record and progress) into a timestamped entry of
+//!   `<root>/trash/`, frees its name and removes it from every index, as one committed `index.log` entry between a
+//!   plan written first and the moves done after it; it never reads or writes another account's file. Opening the
+//!   store settles a delete a crash interrupted (finishes it if it was committed, abandons it if not).
+//!   [`Store::restore_account`] brings an entry back as a new account (new ids, a new token). The layout and the
+//!   crash argument are at the top of `store/trash.rs`.
 //! * **Versioned records.** Every file carries `schema_version`. A newer version than
 //!   [`SCHEMA_VERSION`] (records) or [`INDEX_LOG_VERSION`] (index) is rejected with a clear
 //!   error instead of being misread. A version 1 `index.json` is migrated on open, keeping the
@@ -77,7 +84,7 @@
 //!   `blake3(token)` is stored.
 //!
 //! The on-disk layout and the crash-consistency argument are documented at the top of
-//! `store.rs` and `index.rs`. State dirs hold token hashes, so files are created owner-only on
+//! `store.rs`, `index.rs` and `store/trash.rs`. State dirs hold token hashes, so files are created owner-only on
 //! unix.
 //!
 //! # Concurrency
@@ -120,4 +127,5 @@ pub use model::{
 };
 pub use snapshot::{restore_snapshot, SnapshotInfo};
 pub use store::restyle::{Restyle, RestyleAdded, RestyleError, RestyleReport};
+pub use store::trash::{Deleted, Restored, TrashEntry, TrashState};
 pub use store::{Store, StoreOptions, DEFAULT_MAX_ACCOUNTS};

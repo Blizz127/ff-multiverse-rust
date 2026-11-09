@@ -70,6 +70,7 @@ use tracing::{debug, error, info, warn, Instrument};
 use crate::accounts::{self, Login, Release};
 use crate::config::ServerConfig;
 use crate::deferred;
+use crate::deletion::{Begin, Tombstones, DELETE_BUSY, DELETE_ONLINE};
 use crate::limits::{throttle_notice, Limits, LogVerdict, PeerKey, RegistrationRefusal};
 use crate::world::{
     BattleReply, CloseFlag, JoinError, MoveOutcome, NewPlayer, Outbound, OutboundTx, PartyOutcome, PressOutcome, SceneReply, TravelReply, World,
@@ -81,6 +82,9 @@ pub const SERVER_BUILD: &str = env!("CARGO_PKG_VERSION");
 pub const SHUTDOWN_REASON: &str = "server shutting down";
 /// Text of the `Reject` for a second session of an account that is already in the world.
 const ALREADY_ONLINE: &str = "this account is already logged in";
+/// Text of the `Reject` (`InvalidToken`) for a token the server does not know, and for a login of an account that was
+/// deleted after its token was checked. It never says which: that is what a client reads as "this login is gone".
+const UNKNOWN_TOKEN: &str = "invalid or unknown token";
 /// Text of the `Reject` for a registration on a server that takes no new accounts.
 const REGISTRATION_CLOSED: &str = "registration is closed on this server; log in with a saved token";
 
@@ -126,6 +130,8 @@ pub(crate) struct Shared {
     pub saver: Option<crate::saver::Saver>,
     /// Per-address connection cap, registration rate limits and the log throttle.
     pub limits: Limits,
+    /// The accounts deleted (or being deleted) in this run. Used only inside the world lock: see `deletion`.
+    pub deleted: Tombstones,
     /// Keeps an ephemeral state directory alive. Declared after `store` so the store (and its
     /// lock file) is dropped before the directory is removed.
     pub _ephemeral_state: Option<tempfile::TempDir>,
@@ -193,6 +199,10 @@ enum Close {
     Shutdown,
     /// The world or the writer already dropped this connection (slow client, write failure).
     Dropped(&'static str),
+    /// The server answered a request that is not a session (a delete) and closes the connection. The answer is
+    /// already queued: it is flushed, and the socket is read for a moment like after a farewell, so that a reset
+    /// cannot destroy it in flight.
+    Answered,
 }
 
 impl Close {
@@ -204,8 +214,13 @@ impl Close {
         match self {
             Close::Reject(code, reason) => Some((*code, reason.clone())),
             Close::Shutdown => Some((RejectCode::ShuttingDown, SHUTDOWN_REASON.to_string())),
-            Close::PeerGone | Close::Left | Close::Dropped(_) => None,
+            Close::PeerGone | Close::Left | Close::Dropped(_) | Close::Answered => None,
         }
+    }
+
+    /// Does the connection keep reading (and discarding) for a moment after the last message is flushed?
+    fn lingers(&self) -> bool {
+        matches!(self, Close::Answered) || self.farewell().is_some()
     }
 }
 
@@ -487,10 +502,14 @@ impl Conn {
     async fn drive(&mut self) -> Result<Infallible, Close> {
         let shared = Arc::clone(&self.shared);
 
-        // 1. Hello
+        // 1. Hello (or a request to delete a character: that is its own short connection, see `delete_character`)
         let hello = self.recv(Some(shared.cfg.hello_timeout), HELLO_TIMEOUT).await?;
-        let ClientMsg::Hello { protocol_version, client_build, auth, character } = hello else {
-            return Err(Close::reject(RejectCode::BadRequest, "expected Hello as the first message"));
+        let (protocol_version, client_build, auth, character) = match hello {
+            ClientMsg::Hello { protocol_version, client_build, auth, character } => (protocol_version, client_build, auth, character),
+            ClientMsg::DeleteCharacter { protocol_version, client_build, token } => {
+                return self.delete_character(protocol_version, &client_build, token).await;
+            }
+            _ => return Err(Close::reject(RejectCode::BadRequest, "expected Hello as the first message")),
         };
         check_version(protocol_version).map_err(|why| Close::reject(RejectCode::ProtocolMismatch, why))?;
 
@@ -515,8 +534,16 @@ impl Conn {
         // re-checks it atomically because two handshakes can authenticate the same account at
         // once. A brand-new account cannot be online, and nothing stands between its commit and
         // its `Welcome`.
-        if !registered && shared.with_world(|w| w.is_online(account)) {
-            return Err(Close::reject(RejectCode::AlreadyOnline, ALREADY_ONLINE));
+        if !registered {
+            let (online, deleted) = shared.with_world(|w| (w.is_online(account), shared.deleted.contains(account)));
+            if deleted {
+                // Deleted since the token was checked (or being deleted right now): to this login it is a token the
+                // server does not know.
+                return Err(Close::reject(RejectCode::InvalidToken, UNKNOWN_TOKEN));
+            }
+            if online {
+                return Err(Close::reject(RejectCode::AlreadyOnline, ALREADY_ONLINE));
+            }
         }
 
         // 3. Welcome (the only message that ever carries a token) + the area on offer. The slot and the binding are kept
@@ -561,6 +588,7 @@ impl Conn {
                 ClientMsg::Leave => return Err(Close::Left),
                 ClientMsg::Ping { nonce } => self.pong(nonce)?,
                 ClientMsg::Hello { .. }
+                | ClientMsg::DeleteCharacter { .. }
                 | ClientMsg::MoveIntent { .. }
                 | ClientMsg::Interact { .. }
                 | ClientMsg::PartyInvite { .. }
@@ -586,12 +614,19 @@ impl Conn {
         let name = avatar.display_name.clone();
         let joined = {
             let new = NewPlayer { session, entity, account, avatar, progression, progress, tx: self.tx.clone(), close: Arc::clone(&self.close) };
-            shared.with_world(|world| world.join(new, Instant::now()).map(|spawn| (spawn, world.player_count())))
+            shared.with_world(|world| {
+                // Checked here, under the world lock, against a delete that began after this login was
+                // authenticated: one of the two comes first (see `deletion`).
+                if shared.deleted.contains(account) {
+                    return Err(Close::reject(RejectCode::InvalidToken, UNKNOWN_TOKEN));
+                }
+                world
+                    .join(new, Instant::now())
+                    .map(|spawn| (spawn, world.player_count()))
+                    .map_err(|JoinError::AlreadyOnline| Close::reject(RejectCode::AlreadyOnline, ALREADY_ONLINE))
+            })
         };
-        let (spawn, online) = match joined {
-            Ok(joined) => joined,
-            Err(JoinError::AlreadyOnline) => return Err(Close::reject(RejectCode::AlreadyOnline, ALREADY_ONLINE)),
-        };
+        let (spawn, online) = joined?;
         info!(
             entity = entity.0,
             session = session.0,
@@ -647,11 +682,75 @@ impl Conn {
                 ClientMsg::SceneStep { .. } | ClientMsg::SceneEnd { .. } | ClientMsg::SceneLeave { .. } | ClientMsg::SceneDebugPreview { .. } => {
                     self.on_scene(entity, msg)?
                 }
-                ClientMsg::Hello { .. } => {
+                ClientMsg::Hello { .. } | ClientMsg::DeleteCharacter { .. } => {
                     return Err(Close::reject(RejectCode::BadRequest, "unexpected message after joining"));
                 }
             }
         }
+    }
+
+    /// A request to delete a character (`ClientMsg::DeleteCharacter`, the first message of its own connection): see
+    /// `deletion` for the rule. Always ends the connection: with `CharacterDeleted` and [`Close::Answered`] when it was
+    /// done, with a `Reject` when it was not (`InvalidToken`: the server does not know the login, so there is nothing
+    /// to delete; `AlreadyOnline`: the character is in the world; `ProtocolMismatch`; `RateLimited`: a delete of the
+    /// same character is under way; `Internal`: the store failed and nothing was deleted).
+    async fn delete_character(&mut self, protocol_version: u16, client_build: &str, token: Secret) -> Result<Infallible, Close> {
+        let shared = Arc::clone(&self.shared);
+        check_version(protocol_version).map_err(|why| Close::reject(RejectCode::ProtocolMismatch, why))?;
+        let store = Arc::clone(&shared.store);
+        // 1. Whose character is it? The token says (and only the one who holds it can ask).
+        let account = match tokio::task::spawn_blocking(move || accounts::account_of_token(&store, &token)).await {
+            Ok(Ok(account)) => account,
+            Ok(Err(e)) => {
+                match &e {
+                    accounts::LoginError::Internal(cause) => error!(%cause, "account store failure while checking the token of a delete"),
+                    accounts::LoginError::Refused(code, why) => debug!(?code, %why, "delete refused: the login is not valid"),
+                }
+                return Err(Close::reject(e.code(), e.client_text()));
+            }
+            Err(e) => {
+                error!(error = %e, "delete task failed");
+                return Err(Close::reject(RejectCode::Internal, "internal error; try again later"));
+            }
+        };
+        // 2. Atomic with the joins: refuse while the character is in the world, and from here on nobody joins as it.
+        match shared.with_world(|world| shared.deleted.begin(account, world.is_online(account))) {
+            Begin::Started => {}
+            Begin::Online => return Err(Close::reject(RejectCode::AlreadyOnline, DELETE_ONLINE)),
+            Begin::Busy => return Err(Close::reject(RejectCode::RateLimited, DELETE_BUSY)),
+        }
+        // 3. The delete itself: blocking file work, soft and atomic (see `fmv_persist::Store::delete_account`).
+        let store = Arc::clone(&shared.store);
+        let now = unix_now();
+        let outcome = tokio::task::spawn_blocking(move || accounts::delete_character(&store, account, now)).await;
+        let deletion = match outcome {
+            Ok(Ok(deletion)) => deletion,
+            Ok(Err(e)) => {
+                // Nothing was deleted (or it was already gone): the account may join again.
+                shared.deleted.cancel(account);
+                match &e {
+                    accounts::LoginError::Internal(cause) => error!(account = account.0, %cause, "could not delete a character"),
+                    accounts::LoginError::Refused(code, why) => debug!(?code, %why, "delete refused"),
+                }
+                return Err(Close::reject(e.code(), e.client_text()));
+            }
+            Err(e) => {
+                shared.deleted.cancel(account);
+                error!(error = %e, "delete task failed");
+                return Err(Close::reject(RejectCode::Internal, "internal error; try again later"));
+            }
+        };
+        info!(
+            client_build = %clip_for_log(client_build),
+            account = account.0,
+            name = ?deletion.name,
+            trash_entry = %deletion.entry,
+            files = deletion.files,
+            unfinished = deletion.unfinished,
+            "character deleted: its records are in the trash and its name is free"
+        );
+        self.send(ServerMsg::CharacterDeleted { name: deletion.name })?;
+        Err(Close::Answered)
     }
 
     /// Run the answer to an `AreaChange` against the world. An answer that does not fit (no
@@ -890,6 +989,7 @@ impl Conn {
         match reason {
             Close::PeerGone => debug!("peer disconnected"),
             Close::Left => debug!("client left"),
+            Close::Answered => debug!("answered a request that is not a session; closing connection"),
             Close::Shutdown => debug!("closing connection for shutdown"),
             Close::Reject(code, why) => self.budgeted(
                 |suppressed| match suppressed {
@@ -946,7 +1046,7 @@ impl Conn {
         if let Some(account) = undelivered(registered, self.written.load(Ordering::Acquire)) {
             release_undelivered(&self.shared, self.peer, account).await;
         }
-        if farewell.is_some() {
+        if reason.lingers() {
             linger(&mut self.rd).await;
         }
     }

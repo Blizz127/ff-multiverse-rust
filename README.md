@@ -112,6 +112,7 @@ games plug in behind `fmv-adapter-api` without touching it.
 | `fmv-persist` | Accounts, avatar profiles, player characters (identity, per-game binding and slot, pointers to progress) and per-game progression in an atomic, single-writer file store. |
 | `fmv-party` | Party membership, leader and story-phase instance selection (pure state machines). |
 | `fmv-audio` | Audio engine: a music and effects mixer (crossfades, loop points, volumes, mute), a null sink for machines without a sound card, the cpal output device, and decoding of Ogg Vorbis, WAV and ADPCM music with its loop tags. Game-agnostic; the client plays it (see "Sound"); it holds no audio data. |
+| `fmv-mods` | The optional community-mod layers over your own FF7 content (see "Mods"): a bounded, read-only reader for 7th Heaven's `.iro` archives, the FFNx file conventions Echo-S (script, voices, music) and Cosmo Memory (sound effects) follow, and the lookups the client builds on. Reads your own mod files only; never extracts, copies or redistributes them. |
 
 ## Quickstart
 
@@ -262,9 +263,12 @@ target/release/fmv-client --server <addr> --name Me   # straight in as Me (regis
 
 *Character menu.* A window started without `--name` opens on a menu, in the same window the game
 then runs in. It lists the characters saved for that server (name, colour swatch, look):
-**Up/Down** choose, **Enter** plays, **N** creates a new one, **Del** forgets a saved login on
-this computer (it asks first, and the default answer keeps it: the character stays on the
-server, but its token, shown only once at registration, cannot be recovered), **Esc** quits.
+**Up/Down** choose, **Enter** plays, **N** creates a new one, **Del** deletes the character (it asks first, and
+the default answer keeps it: **Y** deletes it ON THE SERVER, with its own login token, which frees its name and
+removes it from the server; the server keeps a recoverable copy that only its operator can restore, see "Deleting a
+character"; **F** only forgets the saved login on this computer, for a server that is gone; **N** or **Esc** keeps
+it); the saved login is removed only after the server says it deleted the character or no longer knew it, and a
+character that is in the game right now is refused), **Esc** quits.
 With nothing saved yet it opens on the create screen: a **name** (up to 24 characters, cleaned
 exactly as the server cleans it), a **body** (a generic placeholder model of your own `char.lgp`,
 the field look of your character, see "In the game"), a **tint** (a palette grid plus red, green
@@ -279,6 +283,21 @@ token is saved before anything else can fail. `--name` skips the menu (the old b
 `--headless` never shows it. The colour and look the menu shows for a saved login are what this
 machine last saw (the server keeps the real profile and sends it on join), so a login that has
 not joined from this machine yet says "look unknown".
+
+*Deleting a character (menu and command line).* **Del** opens "Delete this character?" over the highlighted character,
+with the buttons **Keep** (the default), **Delete** and **Forget here**, and the keys **Y** (delete on the server), **F**
+(forget the saved login on this computer only: the character stays on the server and its name stays taken, for a
+server that is gone or on another protocol version) and **N** or **Esc** (keep); a controller reaches the same three
+buttons. While the server is asked the menu says "Deleting this character" and only **Esc** (stop waiting; the
+server may still delete it, and asking again says so) does anything. The saved login and the note of the character's
+look are removed ONLY when the server answered that it deleted the character or that it does not know the login
+(`InvalidToken`: already gone, which also settles a delete whose answer was lost); a character that is in the game
+(`AlreadyOnline`), an unreachable server and any other refusal keep the login and say that nothing was deleted.
+`fmv-client --delete NAME [--server HOST:PORT] [--state-dir DIR]` does the same without a window, game files or an FF7
+library (it conflicts with every other flag but `--mute`): stdout carries ONE line on success, `deleted character
+name=<n>` or `character already gone on the server name=<n>` (`<n>` percent-encoded like the smoke line's `name=`),
+exit 0; any failure keeps the login and prints the error on stderr, exit 1; no saved login for NAME is exit 2. The
+token is never printed.
 
 *In the game.* WASD or the arrow keys move (up goes up the screen, whatever the camera looks
 like); in an FF7 field you run, and walk while **Shift** is held (at the field's run and walk
@@ -320,27 +339,54 @@ skin was pulled to brown). It is carried per DRAW (an `Identity`, a second insta
 a model is never copied per player, because the client's GPU cache holds 32) and the fragment shader repaints
 the **cloth** in the colour's hue and saturation at the cloth's own value, lifted (`0.2 + 0.8 * v^0.6`) so that
 dark cloth shows it while the shading, belts and shoes stay told apart, and bright cloth stays a paler pastel;
-**skin-hued texels** (a smooth hue, saturation and value mask) and the **face decals** keep their own colours under
-a 5% tint; white, grey and black colours fall back to the old multiplicative look, and a model without an identity
+**skin-hued texels** (a smooth hue, saturation and value mask), the **face decals** and the **hair** keep their own
+colours under a 5% tint (hair is dark brown, very saturated and very dark, which the skin mask's gates exclude, so a
+blue player's `lean` used to have blue hair: the mesh now flags the head bone's vertices of a skin or hair hue, and its
+dark greys, as the model's own colours, `avatar::identity::head_colour_is_own`; the same colours on the shoes or the
+suit are still cloth, and a cap's white or a hood's blue is cloth too); white, grey and black colours fall back to the old multiplicative look, and a model without an identity
 is drawn bit for bit as it always was (enemies, canon models, non-player characters, effects and fades are
-untouched). A CPU mirror of the look is the test oracle and the shader agrees with it on 99.6% of 110 116 body
-pixels (the rest are face decals); an sRGB target and a plain one show one picture (99.89% of pixels within 4
+untouched). A CPU mirror of the look is the test oracle and the shader agrees with it on 91.8% of 110 116 body
+pixels (the rest are the face decals and the head's hair and skin, which keep their own colours; it was 99.6% before the
+hair was kept, when only the decals were exempt); an sRGB target and a plain one show one picture (99.79% of pixels within 4
 levels). With a blue player: the dark cloak `[57,66,109]` becomes `[54,91,164]`, dark suit grey `[48,48,52]`
 `[46,71,120]`; with an orange one `[157,86,43]` and `[118,68,34]`; skin `[230,180,150]` moves by 5 levels at most
 (the old tint moved it by 28 to 57). At 1x two players' bodies are told apart at a glance (mean colour distance
-of two bodies 25 of 441 before, 119 after). **In battle** the PLAYERS' bodies (not the canon companions Cloud and
+of two bodies 24 of 441 before, 112 after). **In battle** the PLAYERS' bodies (not the canon companions Cloud and
 Barret, who have no player and keep their own colours; not any sword, not the enemies, not the location) wear the
 colour of the player each member is, the same look: a blue player's placeholder body is blue clothes with its own
 skin, an orange player's is orange (a colour that is not known yet, for instance before that player's snapshot
 arrived, leaves the model as it was and is picked up as soon as it is). Limits: pure black cloth (all channels 0) only gets a very dark shade of the colour (near-black cloth,
 which is what the models contain, is lifted plainly); an orange or peach colour sits near skin hue, so those
-players' pastel clothes stay told apart from their skin by saturation and brightness only; and the `sturdy`
-body's covered face (red eyes and a brown visor are ordinary coloured polygons, not face decals) is repainted with
-the rest, so its eyes turn pale. The pictures come from the real-data tests (`cargo test -p fmv-client --
+players' pastel clothes stay told apart from their skin by saturation and brightness only; and a head's cap, hood or
+helmet that is grey, white or a cool colour is repainted with the clothes (the `sturdy` body's hood is; its visor and
+red marks are on the head bone, in warm and dark colours, and keep their own). The pictures come from the real-data tests (`cargo test -p fmv-client --
 --ignored offscreen_field_identity --test-threads=1`, `offscreen_battle_identity_before_after`, with
 `FMV_FF7_LIBRARY` and `FMV_SHOT_DIR`): each body in four colours as untinted | old | new from one frame, a 1920x1080
-overview, and the battle before and after from one scene at one instant (54 339 pixels differ, all of them on the
-two players' bodies: the canon pair, the enemies and every weapon are bit for bit as they were).
+overview, and the battle before and after from one scene at one instant (29 062 pixels differ, 12 945 and 17 876 of
+them on the two players' bodies and none anywhere else: the canon pair, the enemies and every weapon are bit for bit as
+they were).
+
+*Faces and scale of the field models (measured 2026-11-09).* Every character of `char.lgp`, the cast and the
+three placeholder bodies alike, gets its face from three decals on the head bone: two eye quads (the same eye
+twice) and a mouth. The data shifts a decal's texture coordinates by whole numbers (the right eye's `u` runs 1.00 to
+1.97, a mouth's `v` 5.00 to 5.94), which the game's wrap-around addressing ignores; this client's sampler
+clamps (so a decal at the edge of its texture does not blend with the opposite edge), and a clamped coordinate past
+1 reads the transparent edge, so **the right eye and the mouth of every model were not drawn: one eye, Cloud's included**. The
+mesh merge (`avatar::mesh`) now takes the whole number off a textured part whose coordinates lie in one cell (a part that
+really tiles is left as it was): every model has both eyes and its brows, in the field and in battle (the extras'
+mouth textures are blank in the data, as `lean`'s and `slight`'s are; Cloud's has a mouth and has one now). The
+`sturdy` body's face is covered by a visor by design. The bodies are the cast's size: the idle pose is 28.7
+(`lean`), 30.4 (`sturdy`) and 29.2 (`slight`) model units against Cloud's 33.2 (86%, 91%, 88%; Tifa is 86%, Yuffie 80%)
+and Jessie's 30.8, and every model is drawn at the field's one model scale, so at one place the bodies are 82 to 86% of
+Cloud and 92 to 97% of Jessie on the screen (in battle 0.86, 0.88 and 0.91 of Cloud's battle model for `lean`, `slight` and
+`sturdy`). The owner's `elevtr1` picture shows the player about a quarter taller than the character (read off a
+screenshot by eye): that is perspective, not scale; the spawn points lie nearer the camera than the character (depth 638
+to 799 against 808), where a `slight` body is 1.18 times the character's height on the screen at the nearest spawn point
+and 1.21 times at the nearest open place (depth 622), the rest being the models' own heights. `slight`'s orange skin (255,131,80) is the model's own
+colour (a tanned beach extra), kept by the colour look; it is not the tint. The pictures are
+`offscreen_field_lineup_bodies_beside_cloud_and_an_npc` (Cloud, the field's character and the three bodies at one
+spot, front and three-quarter, their own colours over the player look, orange and blue) and the numbers
+`real_looks_survey_heights_parts_and_faces`; `fmv_ff7::playable` has the table.
 
 The picture of an FF7 field is drawn **tile by tile with a depth
 per tile**, in the same depth-tested pass as the models, as the game does it: a layer-2 tile is
@@ -1067,6 +1113,56 @@ exact v7- and v8-shaped state directories before and after and require every fil
 (and the lock) byte for byte identical, a dry run that writes nothing, and the refusal while locked. The tool ships
 in the release package next to `fmv-server`.
 
+**Deleting a character, and getting it back.** A player deletes a character from the character menu (**Del**, then
+**Y**; see "Character menu"): the client asks the server with the character's own login token, so only the one who holds
+the token can, and the server never deletes a character that is in the world. The delete is **soft**:
+
+```
+<state-dir>/trash/<UTC time>-<account id>/      e.g. trash/20261109T165905Z-7/
+    manifest.json                               who, when (unix and UTC text), and the files the entry holds
+    accounts/7.json  avatars/3.json  characters/7.json
+    progression/7/Ff7.json  progression/7/Ff7.character.json     the records exactly as they were
+```
+
+The account's records are moved there, its name is free at once (anyone can register it, and gets a fresh character with
+nothing of the old one), its token is void and its account id is retired for good (ids only grow). Nothing of any other
+account is read, written or moved. The commit is one synced `release` entry of `index.log` (the entry an orphan's release
+writes), between a plan written first and the file moves done after it, so the index and the files agree at every instant
+a crash can stop at: opening the store finishes a delete whose entry was written and abandons one whose entry was not
+(`fmv-persist`'s `store/trash.rs` has the argument and `store/trash/tests.rs` builds every crash state). With the server
+STOPPED, an operator can do the same and undo it (the same state directory argument as `restyle`):
+
+```
+target/release/fmv-characters <state-dir> delete  <account-id|name> [--dry-run]
+target/release/fmv-characters <state-dir> trash
+target/release/fmv-characters <state-dir> restore <trash-entry|account-id|name> [--dry-run]
+```
+
+`delete` frees a name whose player has no token, or removes a character by hand; it hashes every file of the state
+directory before and after and fails the run if anything but the account's own records, `index.log` and the trash
+differs (`moved: accounts/7.json (sha256 ...) -> trash/.../accounts/7.json, the same bytes`, then `N other file(s) and M
+director(ies): byte for byte unchanged`). `trash` lists the entries (name, character, when, files, state). `restore` brings
+an entry back as a **new** account: the name must still be free (else it is refused and nothing changes), the character
+gets a new account id and avatar id (the old ones are retired and the index refuses to replay a smaller id), every record
+that carries an id is re-keyed, the account is marked claimed (it is nobody's orphan) and gets a **new token, printed once**
+(the client forgot the old one when it deleted); the player puts it in `accounts/<server>.<name>.token` of the client's state
+directory, two lines: the token, then `name=<display name>`. The entry is renamed `.restored-<new id>` and cannot be restored
+twice. `--dry-run` runs the same checks and writes nothing. Exit codes as `restyle`. Snapshots (`Store::snapshot`) are
+rollback images of the live records and do not copy the trash. `scripts/delete-smoke.sh` runs all of it over real
+processes on the FIXTURE server (no game data, temp state only): a character in the game is refused; one that left is
+deleted on the server with its own token (its records in the trash byte for byte, every other file unchanged but for
+`index.log`); its name registers again as a different account; its old token is refused, also after a server restart;
+and `fmv-characters restore` gives another deleted character back with a new token that logs in.
+
+**Wire (protocol v16).** `ClientMsg::DeleteCharacter { protocol_version, client_build,
+token }` is the first message of its own connection instead of `Hello`; the server answers `ServerMsg::CharacterDeleted
+{ name }` and closes, or `Reject`: `InvalidToken` (the server does not know the login: nothing to delete, the client forgets it
+locally, which also settles a delete whose answer was lost), `AlreadyOnline` (the character is in the world, from any computer:
+nothing deleted), `ProtocolMismatch`, `RateLimited` (a delete of the same character is under way) or `Internal`. A login that
+authenticated before a delete cannot join after it: the accounts a run deleted are tombstones checked under the world lock by
+every join. The server logs `character deleted: its records are in the trash and its name is free` with the account, the
+trash entry and the file count.
+
 **Protocol v8** (`fmv-protocol`) carries all of the above; its module docs describe the flow,
 and golden JSON tests pin the wire format (the engine's own event, command and outcome types
 included). v8 replaced `Hello`'s colour and look by the character to create (`Hello::character`:
@@ -1157,6 +1253,12 @@ stored (a countdown is a clock of the server process), and the story record keep
 is carried so that the finale's guard can be judged but this server never writes it, so a record is readable by a v14
 server, which just has no finale, no countdown and no `Countdown` message. **Rolling back:** point the server and the
 clients back at a v14 build together.
+
+**Protocol v16 (deleting a character)** adds `ClientMsg::DeleteCharacter` (asked with the character's own login token,
+as the first message instead of a Hello) and `ServerMsg::CharacterDeleted`: the server moves that account's records into
+its trash and frees the name (see "Deleting a character"). A v15 peer cannot decode either, so it is refused at the
+handshake. **Rolling back v16:** point the server and the clients back at a v15 build together; a deleted character
+stays deleted (its records are in the trash, and `fmv-characters restore` gives it back with a new login).
 
 ## Story scenes
 
@@ -1451,6 +1553,135 @@ for a link whose sound has no time to give it), `audio: field loop start ch3 38`
 was left)` (or `(the story moved)`, `(a battle)`), `audio: field sound ch1 62 (link)` (or `(lift)`, `(door)`) at the moment an
 event's sound plays, and, when the run ends, `audio: field sounds played: 4 sounds (21x1 42x1 62x2), 4 loops (38x4)`.
 
+## Mods (Echo-S and Cosmo Memory)
+
+Two free community mods (Tsunamods, for 7th Heaven) can be layered over your own FF7. **The accurate base game comes first and
+the mods are layers on top of it, each switched off on its own; all four layers are ON by default when their files are
+found.** Whatever a layer lacks, the original plays, so nothing is silent or blank because a layer is on.
+
+| Layer | What it is | It replaces | Switch |
+|---|---|---|---|
+| **text** | [Echo-S 7](https://www.tsunamods.com/echo-s-7/)'s retranslated script, the dialog text (required, always on unless you switch it back) | the field's script, per character | `--mods-text off` |
+| **voice** | Echo-S's voice acting, played when a dialog window opens | nothing: the original has no voices | `--mods-voice off` |
+| **music** | Echo-S's "Echoes of the Planet" | the original track of the same `music.idx` name | `--mods-music off` |
+| **sound** | [Cosmo Memory](https://www.tsunamods.com/cosmo-memory/) 1.22's sound effects (Echo-S's own set after it) | the original `audio.dat` clip of the same sound id | `--mods-sound off` |
+
+Cosmo Memory is a *sound* overhaul (its own `mod.xml`: "Complete sound overhaul"), not upscaled field backgrounds; there is no
+background layer.
+
+**The files** are yours to fetch, onto each machine separately; the client only ever reads them (nothing is extracted, copied,
+written or sent, and they are never committed or put in a library). The two in use are
+
+| File | Mod | Bytes | sha256 |
+|---|---|---|---|
+| `Echo-s.iro` | `[Tsunamods] Echo-S 7` 1.24 (2026-07-19), from the 7th Heaven catalog's link `https://gp-mc.net/tsunamods/echo-s-7/latest_full/Echo-s.iro` | 4 335 170 582 (4.04 GiB) | `bc5a4a5f30b50ac80a74613595c680b356eae6ef433b7c6f62672ddb645b3789` |
+| `[Tsunamods]_Cosmo_Memory.iro` | `[Tsunamods] Cosmo Memory` 1.22 (2026-11-07), `https://bonez.7thheaven.rocks/%5BTsunamods%5D_Cosmo_Memory.iro` | 333 643 683 (318.2 MiB) | `836024222598c4ff745a766fb471b4fd2bf254f1a44244fb6f935703b0535af2` |
+
+**Where they go.** Put them in `<state>/mods/` (`~/.local/share/ff-multiverse/mods/` by default, or `mods` inside the directory
+`--ff7-library` names; the launcher's data directory has one): the files themselves or a folder each, one level down. The client looks
+there and never creates it. `--mods-dir DIR` (`$FMV_MODS_DIR`) names another folder; `--echo-s FILE` (`$FMV_ECHO_S_IRO`) and
+`--cosmo-memory FILE` (`$FMV_COSMO_IRO`) name an archive each. An archive is told from the other by the ID in its own `mod.xml`, never
+by its file name (Cosmo's has brackets in it). A damaged, truncated or wrong archive is one `mods: note:` line and its layer plays
+the base game.
+
+**Where the switches are**, one order for each layer: a flag, else an environment variable, else the settings file, else on.
+`--mods on|off` (`$FMV_MODS`) switches every layer; `--mods-text`, `--mods-voice`, `--mods-music`, `--mods-sound` (`$FMV_MODS_TEXT`,
+`$FMV_MODS_VOICE`, `$FMV_MODS_MUSIC`, `$FMV_MODS_SOUND`) one each (`on`/`off`, also `true`/`false`, `yes`/`no`, `1`/`0`). The settings file is
+`settings.json` in the mods folder (`--mods-settings FILE` / `$FMV_MODS_SETTINGS` name another): a JSON object of booleans, for example
+
+```json
+{ "voice": false, "music": false }
+```
+
+and a key that is left out is on. The client only reads it. `fmv-client --help` has the same under MODS.
+
+**What the log says** (stderr): one line at start-up with the effective source of each layer,
+
+```
+mods: text=echo-s voice=echo-s music=echo-s sound=cosmo [echo-s 1.24, cosmo 1.22]
+mods: text=original (off) voice=original (off) music=original (no archive) sound=original (no archive) [echo-s 1.24]
+```
+
+then, as the game uses them, only archive paths and ids, never a line of text: `mods: talk md1stin gu0: echo-s section` (or `original
+section (not in echo-s)`), for each window of such a conversation `mods: window md1stin#12 w0 voice md1stin/12a` (or `voice none`: the lookup, which a
+run without ears shows too), `audio: voice md1stin/12a (2.4 s)` when the clip plays, `audio: music aseri from echo-s`, `audio: sound 6 from cosmo`, and at the end
+`audio: voices played: N (asks without a clip: M)`. The audio lines need a run with sound (`FMV_AUDIO=null` runs it against a clock with no device).
+**The voice, music and sound layers play only through the soundtrack, which needs your original sound files in the library** (a library imported before
+the importer took the music and sound has none: run `import-pc` on the install again with the same labels, see "Importing your own FF7 data"). When the
+soundtrack is off (`--mute`, a headless run without `FMV_AUDIO`, `FMV_AUDIO=off`, or a library without sound files) the start-up line still says which
+layers are on, so the client adds `mods: the voice, music and sound layers play nothing in this run (<why>)`; only the text layer works without sound.
+
+### How each layer works, and what was measured
+
+**The `.iro` format** is 7th Heaven's mod archive: a 16-byte header (`IROS`, a version `0x10000` to `0x10002`, flags, the directory's offset),
+a directory (a count, then per file a size, a UTF-16 name with `\` between folders, flags, an offset and a length) and the payloads. The
+reader (`fmv-mods`, `iro`) follows the layout of `AppWrapper/IrosArc.cs` in tsunamods-codes/7th-Heaven at commit
+`f0d7da92beac69e21c59995fa13ea1b2b0e3cf1f`
+([source](https://github.com/tsunamods-codes/7th-Heaven/blob/f0d7da92beac69e21c59995fa13ea1b2b0e3cf1f/AppWrapper/IrosArc.cs)) and is
+bounded (every offset is checked against the file's real length, so a truncated download is refused with the name of the first entry that
+runs past the end; counts, name lengths and forwarders are capped). Both archives are complete (the last entry ends exactly at the end of
+the file) and every entry of both is *stored*, so there is no decompressor in the tree: an LZS or LZMA entry would be a typed error.
+
+**Inventory** (counts only; `cargo run -p fmv-mods --example iro_inventory -- <archive>` prints it for your copy):
+
+* Echo-S 1.24, 23 178 entries: `Echo-S\flevel.lgp\<field>` 706 (all 702 fields and four stray files: replacement field entries, **where the
+  text lives**), `VO\Voice\<field>\...` 15 461 (field voices; plus 100 `.sfk` peak files), `EchoeS Of The Planet\vgmstream` 112 and
+  `Arranged\vgmstream` 10 (music), `Sound\sfx` 881 (its own sound effects), `V_Attacks`/`NV_Attacks` 155 each, `Battle VO` 1 221 and `Battle VO_S`
+  1 158 (battle lines), `NoCloud\cid`/`tifa` 115 each, `UI\Aavock`/`ESUI`/`FT`/`Retouch` 706 each (window-UI variants of `flevel.lgp`, switched by a
+  byte of the game's memory in 7th Heaven), `60fps\*`, models, textures, kernel and world-map text, hex patches and movie audio.
+* Cosmo Memory 1.22, 1 610 entries: `Base\sfx` 1 001 clips and its 3 507-section `config.toml`, `UI_Dissidia`/`UI_R`/`UI_VII\sfx` 16 each (the three menu
+  sound sets), `V_Attacks`/`NV_Attacks` 170/171, `Ambience\Ambient` 119 and the `FA`, `BA`, `FA+BA` ambience configs, `FMV\movies` 70
+  (movie sound effects), previews.
+
+**Text.** Echo-S's script is not the original with new strings: its field entries are different scripts. Measured on the Steam edition against 1.24
+(the examples `echo_script_compare` and `echo_talk_compare` of `fmv-mods` print it again for your copy): the dialog strings drop from 56 048 to 13 819
+(the original tables are mostly leftovers nothing opens, 114 strings in each of the first reactor fields against the 5 to 21 Echo-S keeps) while the
+lines the scripts open stay about as many (12 526 distinct window-and-dialog pairs, 12 613 in Echo-S's); 17.5% of the 328 675 scripts of the entities both
+have differ in what the dialogue walker can see; of the 12 475 dialog numbers the original's scripts open, 8 326 sit in a script that is the same in
+Echo-S's and 4 934 of those (59%) are another number there; and at the start of a new game 1 421 characters can be talked to in both, 101 of them with
+another number of windows (1 350 windows against 1 480). So a per-line replacement table would show wrong lines, and the unit is the field's whole script
+section: a character that Echo-S's section also has (found by the same name-and-place rule as the original's) talks from Echo-S's section (text, flow,
+dialog numbers, voice names), any other character and every character with the layer off talks from the original's. 2 302 of the 2 412 characters of
+the original are found in Echo-S's script; 84 of its 360 512 scripts do not decode (the original's 337 059 all do). How far you must stand to talk is
+gameplay and stays the original's; the server still judges the story from the original's scripts, so a conversation can show Echo-S's flow where the
+original's would have said something else, and no protocol carries either. `mods::script_source()` is the interface for the scene player (the section of
+Echo-S's replacement for a field, or none).
+
+**Voice.** FFNx plays a voice from the `MESSAGE`/`ASK` that opens a window, by the script's own window and dialog numbers:
+`<field>/w<window>_<dialog><page letter>`, then `<field>/<dialog><letter>`, then on the first page the plain `w<window>_<dialog>` and `<dialog>`
+(2 077 of the 10 909 voiced dialog numbers exist *only* as lettered clips); `<dialog>_<line>` is the clip of a question's line
+([FFNx `src/voice.cpp`](https://github.com/julianxhokaxhiu/FFNx/blob/4fc392ba5e1bfdd53d39aa6542464379a446083a/src/voice.cpp) at commit
+`4fc392ba5e1bfdd53d39aa6542464379a446083a`). FFNx counts a question's line absolutely, as the cursor does; in 1.24 it never matters which way one counts: 5 256
+of Echo-S's 5 680 questions start their choices at line 0 (10 498 of their 13 969 lines have a clip) and the other 424 have no option clip at all. The client
+plays the first page's clip when a window opens, the clip of each later page of the game's
+message when the player reaches it (the window's own cuts of a long page are not the game's pages), and the clip of a question's line as the
+pointer reaches it; each replaces the one before, and the last stops when the conversation ends. A voice is a loop with a silent tail that the
+engine's handle can stop (its one-shots cannot be stopped one by one), freed when its clip is over. A voice rides on the Echo-S text (its files are
+named by Echo-S's dialog numbers), so it plays only for a character that talks from Echo-S's section.
+
+**Music.** Echo-S has a track for 91 of the 98 names in `music.idx` (the other seven play the original); the three names its `config.toml` shuffles (`bat`,
+`bee`, `gun`) pick a variant at random each time. All 91 decode (about 3.7 hours of audio in all); 81 carry the `LOOPSTART`/`LOOPLENGTH` tags the engine
+reads and loop between them, the other 10 repeat whole.
+
+**Sound.** The game's sound id (`audio.fmt`'s id space, `1..=750`) is looked up in Cosmo's `config.toml` the way FFNx does
+([`src/audio.cpp`](https://github.com/julianxhokaxhiu/FFNx/blob/4fc392ba5e1bfdd53d39aa6542464379a446083a/src/audio.cpp) `playSFX`): the section named
+`<field>_<id>`, else `<id>`, lists the clip numbers that play (`[6] sequential = [ 6303 ]` is the file `6303.ogg`), the folders are searched Cosmo first
+(menu set 1, `Base`, the attack folders) then Echo-S's `Sound`, the way 7th Heaven's first-wins rule does it. 720 of the 750 ids have a clip (920
+clips in all); the other 30 play the original. A repeating id plays the first of its clips.
+
+**On the reactor fields** (md1stin, md1_1, md1_2, nrthmk, nmkin_1, elevtr1, nmkin_2..5, the route of `travel-smoke.sh --chain`), measured with the ignored tests
+of `crates/fmv-mods/tests/real_data.rs`: 10 of 10 have an Echo-S script; the dialog strings go 1 140 to 123; the message lines their scripts open are 73 in the
+original and 62 in Echo-S's (every one of them Echo-S text), 43 of the original's 73 sit in a script that is the same to the walker (all 43 under a new
+number); 28 of 32 characters are found in Echo-S's script by name and place (the 4 others, 3 in nmkin_1 and the one of elevtr1, talk from the original);
+of the 62 lines 50 have a voice on at least one page (56 of 68 pages). Most of those lines are cutscene text, which the scene player will show; the talk
+scripts of these fields are short.
+
+**Not done, and why.** Voiced attacks (`battle_char_<index>_<id>` sections of both configs) need to know which character performs a battle sound, which
+the client's battle sounds do not carry. A repeating sound id plays the first of its clips, not each in turn; Cosmo's footsteps
+(`<field>_<triangle>_<id>`), field ambience (`FA\Ambient`), movie sounds and menu sets 2 and 3 are not used; Echo-S's battle lines, `NoCloud` voices,
+models, textures and kernel text are not used either. Only characters that talk are voiced: a cutscene's windows will be voiced by the scene player
+through the same cues once it runs Echo-S's section (`mods::script_source()` and `VoiceCue`). A voice does not duck the music.
+
 ## Packaging and smoke test
 
 ```
@@ -1492,10 +1723,13 @@ UNKNOWN placeholders; see `deploy/README.md`.
 <state>/library/     owned-content library (fmv-import): blobs and one manifest per edition (the music and
                      sound files included)
 <state>/server/      the server's accounts, avatar profiles, player characters (characters/, v8),
-                     progression and character progress (LOCK = single writer)
+                     progression and character progress (LOCK = single writer); trash/ holds the
+                     records of deleted characters, one timestamped entry each (made by the first delete)
 <state>/client/      a client's saved login tokens: accounts/<server>.token (mode 0600), and next to
                      each one a display-only note of how that character looked when last seen
                      (accounts/<server>.<name>.look: tint and look, no secret; safe to delete)
+<state>/mods/        OPTIONAL, yours to fill: the mod archives (Echo-s.iro, [Tsunamods]_Cosmo_Memory.iro) and
+                     an optional settings.json. The client only reads it and never creates it; see "Mods"
 ```
 
 `<state>` is `$FMV_STATE_DIR`, else `~/.local/share/ff-multiverse`. Back up `server/` by

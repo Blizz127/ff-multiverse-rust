@@ -54,12 +54,14 @@ pub use field::{FieldFrame, FieldSounds, LinkSpot, FIELD_SOUNDS_ENV};
 
 use crate::battle::{BattleClient, BattleSound, Planned};
 use director::{Director, STANDARD_BATTLE_TRACK};
-use worker::{Done, Tasks, ThreadWorker, Worker};
+use worker::{Done, Tasks, ThreadWorker, VoiceRequest, Worker};
+use crate::mods::VoiceCue;
 use crate::session::Session;
-use fmv_audio::{AudioConfig, AudioEngine, DecodedMusic, Logger, Mode, PlayOptions, SfxClip, TrackId};
+use fmv_audio::{AudioConfig, AudioEngine, DecodedMusic, Logger, Mode, PlayOptions, SfxClip, SfxHandle, TrackId};
 use fmv_core::GameId;
+use fmv_mods::echo::short_voice_name;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Decoded tracks kept at once (the playing one, the next fight's, the fanfare, and a little slack): about
 /// 35 MB for a three-minute theme.
@@ -78,6 +80,25 @@ const BATTLE_GAIN: f32 = 0.8;
 const STALE_SOUND_S: f64 = 0.5;
 /// Clips of battle sounds kept at once (a fight needs a dozen or so; the oldest go first).
 const BATTLE_CLIPS: usize = 64;
+/// How loud a voice plays, `0.0..=1.0` (before the master volume, which it shares with everything else).
+const VOICE_GAIN: f32 = 1.0;
+/// A voice that is cut (the next window opens, the conversation ends) fades out over this.
+const VOICE_CUT: Duration = Duration::from_millis(60);
+/// A voice's loop handle is stopped this long after its clip ended (the clip's silent tail loops meanwhile).
+const VOICE_GRACE: Duration = Duration::from_millis(250);
+
+/// The voice layer's state: which ask is current, the voice that plays and what the run did.
+#[derive(Default)]
+struct VoiceState {
+    /// The ask in flight or playing: the answer to any other is thrown away (a newer window opened, or the conversation ended).
+    seq: u64,
+    /// The playing voice: the handle of the loop that carries it (the engine's one-shots cannot be stopped one by one) and when its
+    /// clip is over.
+    playing: Option<(SfxHandle, Instant)>,
+    /// Voices that started, and asks that found no clip.
+    played: u32,
+    silent: u32,
+}
 
 /// Which battle sounds are played (`FMV_BATTLE_SOUNDS`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -239,9 +260,52 @@ struct Live {
     field: field::FieldState,
     /// The area whose links the field state holds.
     links_for: Option<String>,
+    /// The voice layer (see [`VoiceState`]).
+    voice: VoiceState,
+    /// Whether this soundtrack takes the conversations' voice cues from the process's queue ([`crate::mods::take_voices`]): the one
+    /// [`GameAudio::start`] makes does, the ones the tests assemble do not (the queue is the process's, and tests run side by side).
+    takes_global_voices: bool,
 }
 
 impl Live {
+    /// Stop the voice that plays, if one does (fading out over [`VOICE_CUT`]).
+    fn stop_voice(&mut self) {
+        if let Some((handle, _)) = self.voice.playing.take() {
+            self.engine.stop_sfx_loop(handle, VOICE_CUT);
+        }
+    }
+
+    /// Let go of the loop of a voice whose clip is over (a one-shot cannot be stopped one by one, so a voice is a loop whose
+    /// last part is silence; the engine has eight of those at once, which a voice must not keep).
+    fn expire_voice(&mut self) {
+        if self.voice.playing.is_some_and(|(_, until)| Instant::now() >= until) {
+            if let Some((handle, _)) = self.voice.playing.take() {
+                self.engine.stop_sfx_loop(handle, Duration::ZERO);
+            }
+        }
+    }
+
+    /// A voice clip arrived for ask `seq`: play it if that is still the ask, else it is thrown away.
+    fn on_voice(&mut self, seq: u64, result: Result<Option<worker::VoiceClip>, String>) {
+        if seq != self.voice.seq {
+            return;
+        }
+        match result {
+            Ok(Some(found)) => {
+                self.stop_voice();
+                let handle = self.engine.play_sfx_loop(&found.clip, VOICE_GAIN, 0.0, Duration::ZERO);
+                self.voice.playing = Some((handle, Instant::now() + found.length + VOICE_GRACE));
+                self.voice.played += 1;
+                self.say(&format!("voice {} ({:.1} s)", short_voice_name(&found.name), found.length.as_secs_f64()));
+            }
+            Ok(None) => self.voice.silent += 1,
+            Err(why) => {
+                self.voice.silent += 1;
+                self.say(&format!("voice: {why}; going on without it"));
+            }
+        }
+    }
+
     fn track_id(&mut self, name: &str) -> TrackId {
         let at = match self.ids.iter().position(|n| n == name) {
             Some(at) => at,
@@ -332,6 +396,7 @@ impl Live {
                     self.say(&format!("battle sounds: {loaded} loaded in {} ms", took.as_millis()));
                 }
                 Done::Field { key, story, read, took } => self.field.on_read(&self.log, &key, &story, read, took),
+                Done::Voice { seq, result } => self.on_voice(seq, result),
             }
         }
     }
@@ -411,6 +476,9 @@ impl Drop for Live {
         if let Some(played) = self.field.summary() {
             self.say(&format!("field sounds played: {played}"));
         }
+        if self.voice.played + self.voice.silent > 0 {
+            self.say(&format!("voices played: {} (asks without a clip: {})", self.voice.played, self.voice.silent));
+        }
     }
 }
 
@@ -442,7 +510,12 @@ impl GameAudio {
         if let Some(note) = note {
             log(&note);
         }
-        Self::with_parts(engine, Box::new(ThreadWorker::start(tasks)), log).with_battle_sounds(battle_sounds).with_field_sounds(field_sounds)
+        let mut audio = Self::with_parts(engine, Box::new(ThreadWorker::start(tasks)), log).with_battle_sounds(battle_sounds).with_field_sounds(field_sounds);
+        // The soundtrack of the running game is the one that hears the conversations.
+        if let Some(live) = audio.live.as_mut() {
+            live.takes_global_voices = true;
+        }
+        audio
     }
 
     /// The sound over an engine and a worker the caller made (tests use a manual engine and a fake worker).
@@ -476,6 +549,8 @@ impl GameAudio {
                 unheard: HashSet::new(),
                 field: field::FieldState::new(FieldSounds::default()),
                 links_for: None,
+                voice: VoiceState::default(),
+                takes_global_voices: false,
             })),
         }
     }
@@ -516,8 +591,15 @@ impl GameAudio {
     /// Follow the game: the area the client is in (`None` outside FF7 fields, which have no music) and
     /// its battle counters. Cheap, never blocks; call it every frame, whatever is on screen.
     pub fn update(&mut self, area: Option<&str>, battle: BattleCounts) {
+        // What the conversations asked of the voice layer since the last frame.
+        if self.live.as_ref().is_some_and(|l| l.takes_global_voices) {
+            for cue in crate::mods::take_voices() {
+                self.voice(cue);
+            }
+        }
         let Some(live) = self.live.as_mut() else { return };
         live.pump_worker();
+        live.expire_voice();
         if let Some(key) = area {
             if live.area.as_deref() != Some(key) {
                 live.area = Some(key.to_string());
@@ -619,6 +701,18 @@ impl GameAudio {
         let from = live.polled_to.replace(now).unwrap_or(now);
         for (at, sound) in battle.sounds_due(from, now) {
             live.play_battle_sound(at, now, sound);
+        }
+    }
+
+    /// A conversation's voice cue (see [`VoiceCue`]): the voice that plays stops (a window moved on or closed), and a window that
+    /// opened asks the worker for its clip, which plays when it arrives unless something newer came first. A conversation without
+    /// a clip for the window is silent; a run without sound drops the cue.
+    pub fn voice(&mut self, cue: VoiceCue) {
+        let Some(live) = self.live.as_mut() else { return };
+        live.stop_voice();
+        live.voice.seq = live.voice.seq.wrapping_add(1);
+        if !matches!(cue, VoiceCue::Stop) {
+            live.worker.load_voice(VoiceRequest { seq: live.voice.seq, cue });
         }
     }
 
@@ -733,6 +827,8 @@ mod tests {
         loop_ids: Vec<u16>,
         /// Fields that cannot be read.
         broken: Vec<String>,
+        /// The voice clips the mod layer has, by `<field>/<dialog>` (or `<field>/<dialog>_<line>`), with their length in frames.
+        voices: HashMap<String, usize>,
     }
 
     /// A worker that answers on the spot (or when told to): no threads, no waiting.
@@ -804,6 +900,26 @@ mod tests {
                 Ok(field::FieldRead { plan, clips })
             };
             let done = Done::Field { key: key.to_string(), story, read, took: std::time::Duration::from_millis(4) };
+            if s.hold { s.held.push(done) } else { s.inbox.push(done) }
+        }
+
+        fn load_voice(&mut self, request: worker::VoiceRequest) {
+            let mut s = self.0.borrow_mut();
+            s.asked.push(format!("voice {:?}", request.cue));
+            let key = match &request.cue {
+                VoiceCue::Say { field, dialog, .. } => format!("{field}/{dialog}"),
+                VoiceCue::Choice { field, dialog, line } => format!("{field}/{dialog}_{line}"),
+                VoiceCue::Stop => String::new(),
+            };
+            let result = Ok(s.voices.get(&key).map(|&frames| {
+                // The voice, then a silent tail the loop handle holds on to (the way the real task builds it).
+                const TAIL: usize = 480;
+                let mut samples = vec![0.5f32; frames];
+                samples.extend(vec![0.0f32; TAIL]);
+                let clip = SfxClip::from_mono(RATE, &samples).expect("a clip").with_loop(frames as u64, (frames + TAIL) as u64);
+                worker::VoiceClip { name: format!("VO\\Voice\\{}.ogg", key.replace('/', "\\")), clip, length: Duration::from_secs_f64(frames as f64 / f64::from(RATE)) }
+            }));
+            let done = Done::Voice { seq: request.seq, result };
             if s.hold { s.held.push(done) } else { s.inbox.push(done) }
         }
 
@@ -1139,6 +1255,7 @@ mod tests {
             cues: Arc::new(|| panic!("a muted run must not read the sound files")),
             sounds: Arc::new(|_| panic!("a muted run must not read the sound files")),
             field: Arc::new(|_, _, _| panic!("a muted run must not read a field's sounds")),
+            voice: Arc::new(|_| panic!("a muted run must not read a voice")),
         };
         let muted = GameAudio::start(AudioConfig { mode: Mode::Off, ..AudioConfig::default() }, tasks);
         assert!(!muted.is_on());
@@ -1960,4 +2077,120 @@ mod tests {
         drop(quiet);
         assert!(!lines.lock().expect("log").iter().any(|l| l.contains("field sounds played")));
     }
+
+    // ---- the voice layer ----------------------------------------------------------------------------
+
+    fn say(field: &str, dialog: usize) -> VoiceCue {
+        VoiceCue::Say { field: field.to_string(), window: 0, dialog, page: 0 }
+    }
+
+    fn with_voices(voices: &[(&str, usize)]) -> Rig {
+        let rig = Rig::new(&[], &[]);
+        rig.state.borrow_mut().voices = voices.iter().map(|(k, f)| (k.to_string(), *f)).collect();
+        rig
+    }
+
+    /// The loops the engine is playing after it has applied what was asked of it.
+    fn loops(rig: &Rig) -> u32 {
+        rig.audio.pump(64);
+        rig.audio.status().expect("on").loops_playing
+    }
+
+    #[test]
+    fn a_window_that_opens_asks_for_its_voice_and_plays_it_when_it_arrives() {
+        let mut rig = with_voices(&[("md1stin/3", 24_000)]);
+        rig.audio.voice(say("md1stin", 3));
+        assert_eq!(loops(&rig), 0, "nothing plays until the clip has been read");
+        rig.frame(None, NONE);
+        assert_eq!(loops(&rig), 1, "the voice plays as a loop its handle can stop");
+        assert!(rig.lines().iter().any(|l| l == "voice md1stin/3 (0.5 s)"), "{:?}", rig.lines());
+        assert_eq!(rig.state.borrow().asked.last().map(String::as_str), Some("voice Say { field: \"md1stin\", window: 0, dialog: 3, page: 0 }"));
+    }
+
+    #[test]
+    fn the_next_window_replaces_the_voice_and_a_conversation_that_ends_stops_it() {
+        let mut rig = with_voices(&[("a/1", 24_000), ("a/2", 24_000)]);
+        rig.audio.voice(say("a", 1));
+        rig.frame(None, NONE);
+        assert_eq!(loops(&rig), 1);
+        // The next window: the first voice goes (it fades out), the second plays.
+        rig.audio.voice(say("a", 2));
+        rig.frame(None, NONE);
+        rig.audio.pump(4_800);
+        assert_eq!(loops(&rig), 1, "one voice at a time");
+        assert_eq!(rig.lines().iter().filter(|l| l.starts_with("voice a/")).count(), 2);
+        // The conversation ends.
+        rig.audio.voice(VoiceCue::Stop);
+        rig.frame(None, NONE);
+        rig.audio.pump(4_800);
+        assert_eq!(loops(&rig), 0);
+    }
+
+    #[test]
+    fn an_answer_for_a_window_that_has_moved_on_is_thrown_away() {
+        let mut rig = with_voices(&[("a/1", 24_000), ("a/2", 24_000)]);
+        rig.state.borrow_mut().hold = true;
+        rig.audio.voice(say("a", 1));
+        rig.audio.voice(say("a", 2));
+        // Both answers come back late, in order: only the newest ask is played.
+        let held = std::mem::take(&mut rig.state.borrow_mut().held);
+        {
+            let mut s = rig.state.borrow_mut();
+            s.hold = false;
+            s.inbox.extend(held);
+        }
+        rig.frame(None, NONE);
+        assert_eq!(loops(&rig), 1);
+        let said: Vec<String> = rig.lines().into_iter().filter(|l| l.starts_with("voice ")).collect();
+        assert_eq!(said, ["voice a/2 (0.5 s)"]);
+        // A conversation that ended while its clip was being read plays nothing at all.
+        rig.audio.voice(VoiceCue::Stop);
+        rig.state.borrow_mut().hold = true;
+        rig.audio.voice(say("a", 1));
+        rig.audio.voice(VoiceCue::Stop);
+        let held = std::mem::take(&mut rig.state.borrow_mut().held);
+        rig.state.borrow_mut().inbox.extend(held);
+        rig.frame(None, NONE);
+        rig.audio.pump(4_800);
+        assert_eq!(loops(&rig), 0);
+    }
+
+    #[test]
+    fn a_window_without_a_clip_is_silent_and_a_choice_has_its_own_clip() {
+        let mut rig = with_voices(&[("a/7_1", 12_000)]);
+        rig.audio.voice(say("a", 7));
+        rig.frame(None, NONE);
+        assert_eq!(loops(&rig), 0);
+        assert!(!rig.lines().iter().any(|l| l.starts_with("voice ")), "a window with no voice says nothing");
+        rig.audio.voice(VoiceCue::Choice { field: "a".to_string(), dialog: 7, line: 1 });
+        rig.frame(None, NONE);
+        assert_eq!(loops(&rig), 1);
+        assert!(rig.lines().iter().any(|l| l == "voice a/7_1 (0.2 s)"), "{:?}", rig.lines());
+        let lines = Arc::clone(&rig.lines);
+        drop(rig);
+        assert!(lines.lock().expect("log").iter().any(|l| l == "voices played: 1 (asks without a clip: 1)"));
+    }
+
+    #[test]
+    fn a_voice_whose_clip_is_over_lets_go_of_its_loop() {
+        let mut rig = with_voices(&[("a/1", 480)]);
+        rig.audio.voice(say("a", 1));
+        rig.frame(None, NONE);
+        assert_eq!(loops(&rig), 1);
+        // The clip is over (its end is the length plus a grace): the next frame after that frees the slot.
+        let live = rig.audio.live.as_mut().expect("on");
+        live.voice.playing = live.voice.playing.map(|(handle, _)| (handle, Instant::now()));
+        rig.frame(None, NONE);
+        rig.audio.pump(4_800);
+        assert_eq!(loops(&rig), 0);
+    }
+
+    #[test]
+    fn a_run_without_sound_drops_the_cues_it_is_given() {
+        let mut off = GameAudio::off();
+        off.voice(say("a", 1));
+        off.voice(VoiceCue::Stop);
+        assert!(!off.is_on());
+    }
+
 }

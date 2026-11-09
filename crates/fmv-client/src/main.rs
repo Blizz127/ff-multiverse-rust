@@ -18,6 +18,9 @@
 //! the server, or a registration) is decided first of all, before the content is opened or a
 //! connection made (see `login`); the token a registration issues is saved by the handshake the
 //! moment it arrives (see `net` and `accounts`).
+//!
+//! `--delete NAME` deletes a character on the server and exits (see `delete`): no window, no game
+//! files, no login; the same deleting is what `Del` then `Y` does in the character menu.
 
 mod accounts;
 mod audio;
@@ -26,12 +29,14 @@ mod backdrop;
 mod battle;
 mod bot;
 mod cli;
+mod delete;
 mod ff7;
 mod gamemode;
 mod gamepad;
 mod headless;
 mod interp;
 mod login;
+mod mods;
 mod nav;
 mod net;
 mod npc;
@@ -145,6 +150,9 @@ fn open_game(args: &Args) -> Result<LocalGame, String> {
                 }
                 Err(e) => eprintln!("note: no battle data on this machine ({e}); shared battles cannot be replayed or fought here"),
             }
+            // The optional mod layers over this copy (Echo-S, Cosmo Memory): one line says what each plays. Opened once for the
+            // whole process (the conversations and the soundtrack ask `mods::active`).
+            mods::setup(&args.mods, fmv_library::resolve_state_dir(args.ff7_library.as_deref()).ok().as_deref());
             Ok(LocalGame {
                 adapter: Box::new(ff7::SharedFf7(Arc::clone(&opened.adapter))),
                 client_build: format!("fmv-client/{version}+{}", ff7::build_tag()),
@@ -160,6 +168,14 @@ fn open_game(args: &Args) -> Result<LocalGame, String> {
 /// silent unless `FMV_AUDIO` was set on purpose (`null` runs the soundtrack against a clock and logs it).
 /// A library without sound files, or any trouble reading them, is one `audio:` line and no sound.
 fn start_audio(args: &Args, ff7: Option<&Arc<Ff7Adapter>>) -> GameAudio {
+    // The mod layers that need the soundtrack (Echo-S's voices and music, Cosmo's sounds) play nothing when it is off: say so, since
+    // the `mods:` line at start-up says which layers are on.
+    let silent = |why: &str| {
+        if let Some(note) = mods::silent_audio_note(mods::active().as_deref(), why) {
+            eprintln!("{note}");
+        }
+        GameAudio::off()
+    };
     let Some(adapter) = ff7 else { return GameAudio::off() };
     let env = std::env::var(fmv_audio::ENV_VAR).ok();
     let (mode, note) = audio::run_mode(args.mute, args.headless, env.as_deref());
@@ -168,9 +184,17 @@ fn start_audio(args: &Args, ff7: Option<&Arc<Ff7Adapter>>) -> GameAudio {
         (config.logger)(&note);
     }
     if mode == fmv_audio::Mode::Off {
-        return GameAudio::off();
+        return silent(if args.mute {
+            "--mute"
+        } else if args.headless && env.is_none() {
+            "a headless run without FMV_AUDIO set to null or auto"
+        } else {
+            "FMV_AUDIO=off"
+        });
     }
-    let Some(tasks) = audio::ff7::tasks(&args.ff7_source(), Arc::clone(adapter), &config.logger) else { return GameAudio::off() };
+    let Some(tasks) = audio::ff7::tasks(&args.ff7_source(), Arc::clone(adapter), &config.logger, mods::active()) else {
+        return silent("the soundtrack did not start: see the audio: line above");
+    };
     let sound = GameAudio::start(config, tasks);
     // The fanfare after a fight is chosen from the shape of the files (a one-shot of five seconds, not a
     // looping one), not from anything the game's data says; this is the way to another track if the
@@ -269,6 +293,22 @@ fn run_menu(args: &Args, state_dir: &Path, store: TokenStore) -> u8 {
     )
 }
 
+/// `--delete NAME`: ask the server to delete the character saved under NAME (see `delete`). Nothing else is started:
+/// no window, no game files, no login. One line on stdout on success; the exit code says how it went.
+fn run_delete(args: &Args, name: &str, state_dir: &Path, store: &TokenStore) -> u8 {
+    let looks = ui::looks::LookCache::new(state_dir);
+    let command = delete::Command { server: &args.server, name, store, looks: &looks };
+    // The content is never opened, so the build is the plain client's (what a fixture run says in its `Hello`).
+    let client_build = format!("fmv-client/{}", env!("CARGO_PKG_VERSION"));
+    let (stdout, stderr) = (std::io::stdout(), std::io::stderr());
+    delete::run_command(
+        &command,
+        |token| delete::delete_blocking(&args.server, token, &client_build),
+        &mut stdout.lock(),
+        &mut stderr.lock(),
+    )
+}
+
 fn run(args: Args) -> u8 {
     // Accounts first: it is cheap and local, so a missing `--name` or a broken token file is
     // reported before the (slow) content indexing and before anything reaches a server.
@@ -280,6 +320,10 @@ fn run(args: Args) -> u8 {
         }
     };
     let store = TokenStore::new(&state_dir);
+    // `--delete NAME` is a command of its own: it opens no window, opens no game files and makes no login.
+    if let Some(name) = &args.delete {
+        return run_delete(&args, name, &state_dir, &store);
+    }
     // A window without --name opens on the character menu; --name and --headless keep the
     // command-line behaviour below.
     if args.wants_menu() {

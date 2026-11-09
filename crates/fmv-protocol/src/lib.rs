@@ -1,4 +1,9 @@
-//! FF Multiverse wire protocol v15.
+//! FF Multiverse wire protocol v16.
+//!
+//! v16 is v15 plus [`ClientMsg::DeleteCharacter`] and [`ServerMsg::CharacterDeleted`]: a player deletes their own
+//! character on the server with that character's login token (sent as the first message instead of a Hello). The
+//! server soft-deletes it (its records move into the state directory's trash) and frees the name. A v15 peer cannot
+//! decode either message, so it is refused at the handshake. Nothing new is stored in a live account's records.
 //!
 //! v15 is v14 plus [`ServerMsg::Countdown`] (see "Countdown" below): the server-owned clock a story step can start (FF7:
 //! the first reactor's bomb, 10:00 from the Guard Scorpion's step). A v14 peer cannot decode it (an unknown message is a
@@ -324,6 +329,30 @@
 //! a version of its own, because only an account that has advanced a story is sent one; v8 is the first version
 //! every client of which knows it. A player's story is the account's, never the character's or the slot's.
 //!
+//! # Deleting a character
+//!
+//! A player can delete the character they made, for good as far as the game is concerned: its name is free again and
+//! its login token is void. The request is **the first message of its own connection, instead of `Hello`**
+//! ([`ClientMsg::DeleteCharacter`], asked with the character's own login token, so only the one who holds the token can
+//! ask): the connection never joins the world, it asks, is answered and is closed.
+//!
+//! ```text
+//! C -> S  DeleteCharacter { protocol_version, client_build, token }
+//! S -> C  CharacterDeleted { name }                       it is gone; the server closes the connection
+//! S -> C  Reject { code: InvalidToken, .. }               the server does not know this login: nothing to delete
+//! S -> C  Reject { code: AlreadyOnline, .. }              the character is connected right now: nothing was deleted
+//! S -> C  Reject { code: ProtocolMismatch | Internal | .. }     nothing was deleted
+//! ```
+//!
+//! The server never deletes a character while it is in the world (connected, in any session, joined or still
+//! joining): it answers `AlreadyOnline`. The delete is **soft**: the server moves the account's records into a
+//! timestamped folder of its trash (`fmv-persist`, "A delete is soft, atomic and recoverable") and an operator can
+//! restore them (`fmv-characters`). Nothing else of any other account is touched. **A client treats `InvalidToken` as
+//! "already gone"** and forgets its saved login: that is how a delete whose answer was lost (the server committed it
+//! and the connection died) is settled by asking again. Any other refusal, and a connection that fails, means nothing
+//! was deleted and the client keeps its saved login. The messages are new in v16: a peer that predates them cannot
+//! decode either, so a v15 peer is refused at the handshake.
+//!
 //! # Rejections
 //!
 //! A refusal (or the end of a session the server decides to close) is `Reject { reason, code }`:
@@ -380,7 +409,7 @@ pub use fmv_party::{
     PartyEvent, PartyId, Placement,
 };
 
-pub const PROTOCOL_VERSION: u16 = 15;
+pub const PROTOCOL_VERSION: u16 = 16;
 /// Hard cap on a single frame payload (bytes).
 pub const MAX_FRAME: u32 = 256 * 1024;
 /// Default TCP port for development. Deployment port is UNASSIGNED (see DEPLOYMENT-CONTRACT.md).
@@ -503,6 +532,12 @@ pub enum ClientMsg {
     /// error (the game's default body is used), a `slot` the game does not offer to a new character is
     /// refused with `RejectCode::BadRequest` (see [`NewCharacter`]).
     Hello { protocol_version: u16, client_build: String, auth: Auth, character: NewCharacter },
+    /// Delete the character whose login token this is (see the module docs, "Deleting a character"). **The first
+    /// message of a connection, instead of `Hello`**: that connection never joins the world. `protocol_version` and
+    /// `client_build` are `Hello`'s. The server answers `CharacterDeleted`, or a `Reject`: `InvalidToken` when it
+    /// does not know the login (the character is already gone), `AlreadyOnline` while the character is connected.
+    /// New in v16. The token is a [`Secret`]: it does not show in `{:?}`.
+    DeleteCharacter { protocol_version: u16, client_build: String, token: Secret },
     /// Sent after the client confirmed it holds the area with this exact fingerprint locally.
     /// `provenance` is the client's OWN path-free provenance: the server requires it to be
     /// `compatible_with` the area's, in addition to the fingerprint matching.
@@ -703,6 +738,10 @@ pub enum ServerMsg {
     /// governing story changes hands (it joined the party that has one, or left it), and when it is over. New in v15: a peer
     /// that does not know the message cannot decode it, so a v14 peer is refused at the handshake.
     Countdown { state: CountdownState },
+    /// The answer to a [`ClientMsg::DeleteCharacter`] that was carried out (see the module docs, "Deleting a
+    /// character"): the character is gone and `name`, its display name as the server held it, is free again. The
+    /// server closes the connection after it. New in v16.
+    CharacterDeleted { name: String },
     /// A story scene starts for this player (see [`scene`]): play scene `scene` from your OWN copy of the game, against
     /// the story `progress` (the blob of the account whose story the scene plays in), with `seed` for the script's
     /// randomness. `owner` is the entity whose keys drive it, `participants` everyone who stands in it (each on the
@@ -876,8 +915,8 @@ mod tests {
     }
 
     #[test]
-    fn the_version_is_fifteen() {
-        assert_eq!(PROTOCOL_VERSION, 15);
+    fn the_version_is_sixteen() {
+        assert_eq!(PROTOCOL_VERSION, 16);
     }
 
     // -----------------------------------------------------------------------------------------
@@ -963,6 +1002,16 @@ mod tests {
         golden(ClientMsg::Interact { npc: None }, r#"{"Interact":{}}"#);
         // a sender that writes the absent character as null is read the same
         assert_eq!(serde_json::from_str::<ClientMsg>(r#"{"Interact":{"npc":null}}"#).unwrap(), ClientMsg::Interact { npc: None });
+        // Deleting the character of a login (v16): the token travels, and never prints.
+        golden(
+            ClientMsg::DeleteCharacter { protocol_version: 15, client_build: "c/1".into(), token: Secret::new("fmvt_x") },
+            r#"{"DeleteCharacter":{"protocol_version":15,"client_build":"c/1","token":"fmvt_x"}}"#,
+        );
+        let asked = ClientMsg::DeleteCharacter { protocol_version: 15, client_build: "c/1".into(), token: Secret::new("fmvt_secret") };
+        assert!(!format!("{asked:?}").contains("fmvt_secret"), "{asked:?}");
+        // every field is required: a delete without its token is not a delete
+        assert!(serde_json::from_str::<ClientMsg>(r#"{"DeleteCharacter":{"protocol_version":15,"client_build":"c/1"}}"#).is_err());
+        assert!(serde_json::from_str::<ClientMsg>(r#"{"DeleteCharacter":{"client_build":"c/1","token":"x"}}"#).is_err());
         golden(ClientMsg::PartyInvite { target: EntityId(7) }, r#"{"PartyInvite":{"target":7}}"#);
         golden(ClientMsg::PartyAccept { invite: InviteId(3) }, r#"{"PartyAccept":{"invite":3}}"#);
         golden(ClientMsg::PartyDecline { invite: InviteId(3) }, r#"{"PartyDecline":{"invite":3}}"#);
@@ -1080,6 +1129,12 @@ mod tests {
         // Said at join: no `advance` key at all.
         golden(ServerMsg::StoryUpdate { progress: vec![1, 6, 0], advance: None }, r#"{"StoryUpdate":{"progress":[1,6,0]}}"#);
         golden(ServerMsg::StoryUpdate { progress: vec![], advance: None }, r#"{"StoryUpdate":{"progress":[]}}"#);
+    }
+
+    #[test]
+    fn golden_character_deleted() {
+        golden(ServerMsg::CharacterDeleted { name: "Aria Vale".into() }, r#"{"CharacterDeleted":{"name":"Aria Vale"}}"#);
+        assert!(serde_json::from_str::<ServerMsg>(r#"{"CharacterDeleted":{}}"#).is_err());
     }
 
     #[test]
@@ -2307,8 +2362,8 @@ mod tests {
         let v2 = br#"{"Hello":{"protocol_version":2,"client_build":"x","auth":{"Register":{"display_name":"n"}},"tint":[1,2,3],"appearance_ref":null}}"#;
         assert!(decode::<ClientMsg>(v2).is_err(), "no Hello before v8 is a v8 ClientMsg");
         assert_eq!(probe_hello_version(v2), Some(2));
-        let future = br#"{"Hello":{"protocol_version":16,"anything":{"at":"all"}}}"#;
-        assert_eq!(probe_hello_version(future), Some(16));
+        let future = br#"{"Hello":{"protocol_version":17,"anything":{"at":"all"}}}"#;
+        assert_eq!(probe_hello_version(future), Some(17));
         for not_hello in [&br#""Leave""#[..], br#"{"Ping":{"nonce":1}}"#, b"not json", b"{}", br#"{"Hello":{}}"#, br#"{"Hello":{"protocol_version":70000}}"#] {
             assert_eq!(probe_hello_version(not_hello), None, "{}", String::from_utf8_lossy(not_hello));
         }

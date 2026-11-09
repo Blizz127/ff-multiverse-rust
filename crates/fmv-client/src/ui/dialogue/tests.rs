@@ -699,3 +699,115 @@ fn an_ok_with_nobody_around_is_a_press_where_the_player_stands_and_another_key_i
     let key = field_key(&mut talk, &state, "md1stin", 0.0, KeyCode::KeyW, true, false);
     assert_eq!(key, FieldKey { consumed: false, interact: None });
 }
+
+// ---- the voice hook ----------------------------------------------------------------------------
+
+use crate::mods::{ModSink, VoiceCue};
+use std::sync::Mutex;
+
+/// A sink that keeps the cues it is given.
+#[derive(Default)]
+struct Cues(Mutex<Vec<VoiceCue>>);
+
+impl ModSink for Cues {
+    fn cue(&self, cue: VoiceCue) {
+        self.0.lock().expect("cues").push(cue);
+    }
+    fn note(&self, _line: &str) {}
+}
+
+impl Cues {
+    fn taken(&self) -> Vec<VoiceCue> {
+        std::mem::take(&mut *self.0.lock().expect("cues"))
+    }
+}
+
+/// `m` as the message of dialog number `dialog` (window 0).
+fn numbered(dialog: usize, mut m: Message) -> Message {
+    m.origin = MessageOrigin::Canon { entity: 0, dialog };
+    m
+}
+
+#[test]
+fn the_window_says_when_the_player_reaches_the_games_next_page_and_not_the_windows_own_cuts() {
+    // Two game pages. The first has 12 lines: a tiny window cuts it into several pages of its own.
+    let mut pieces: Vec<Piece> = (0..12).flat_map(|i| [Piece::NewLine, text(&format!("line {i}"))]).skip(1).collect();
+    pieces.push(Piece::NewPage);
+    pieces.push(text("the second page"));
+    let cues = Arc::new(Cues::default());
+    let (w, _) = open(vec![numbered(7, canon(pieces))]);
+    let mut w = w.with_voice("md1stin", cues.clone());
+    let mut cuts = 0;
+    while w.key(DialogueKey::Confirm, TINY) {
+        cuts += 1;
+        if cuts > 40 {
+            break;
+        }
+    }
+    // (Two presses that kept the window open: three pages of its own, two cut from the first game page and one for the second.)
+    assert!(cuts >= 2, "the first game page is cut into several pages of the window's own: {cuts}");
+    // Exactly one cue, when the second game page was reached: page 1 of dialog 7 as window 0.
+    assert_eq!(cues.taken(), vec![VoiceCue::Say { field: "md1stin".into(), window: 0, dialog: 7, page: 1 }]);
+}
+
+#[test]
+fn a_questions_pointer_says_the_absolute_line_it_reached_and_stays_quiet_when_it_does_not_move() {
+    let cues = Arc::new(Cues::default());
+    let (w, _) = open(vec![numbered(4, question(3, 0))]);
+    let mut w = w.with_voice("nmkin_3", cues.clone());
+    // The question's first choice is line 1; the pointer starts on it. Down: lines 2 and 3, then round to 1; Up: back to 3.
+    for key in [DialogueKey::Down, DialogueKey::Down, DialogueKey::Down, DialogueKey::Up] {
+        assert!(w.key(key, SIZE));
+    }
+    let line = |line| VoiceCue::Choice { field: "nmkin_3".into(), dialog: 4, line };
+    assert_eq!(cues.taken(), vec![line(2), line(3), line(1), line(3)]);
+    // A question with one choice has nowhere to move to.
+    let (w, _) = open(vec![numbered(5, question(1, 0))]);
+    let mut w = w.with_voice("a", cues.clone());
+    assert!(w.key(DialogueKey::Down, SIZE) && w.key(DialogueKey::Up, SIZE));
+    assert!(cues.taken().is_empty());
+}
+
+#[test]
+fn a_window_without_a_voice_says_nothing_and_a_message_that_is_not_the_games_has_no_voice() {
+    let cues = Arc::new(Cues::default());
+    let (mut plain, _) = open(vec![numbered(7, canon(vec![text("a"), Piece::NewPage, text("b")]))]);
+    assert!(plain.key(DialogueKey::Confirm, SIZE));
+    assert!(cues.taken().is_empty());
+    // A line this project added (not the game's) has no dialog number and no voice.
+    let added = Message::new(MessageOrigin::Added { layer: "test".into() }, vec![text("a"), Piece::NewPage, text("b")]);
+    let (w, _) = open(vec![added]);
+    let mut w = w.with_voice("md1stin", cues.clone());
+    assert!(w.key(DialogueKey::Confirm, SIZE));
+    assert!(cues.taken().is_empty());
+}
+
+/// A conversation of canned messages that says it is voiced, to the sink it was given.
+struct Voicey {
+    messages: Vec<Message>,
+    sink: Arc<Cues>,
+}
+
+impl Conversations for Voicey {
+    fn talk_radius(&mut self, _area: &str, _npc: &NpcView) -> f32 {
+        80.0
+    }
+    fn start(&mut self, _area: &str, _npc: &NpcView) -> Option<Box<dyn MessageSource>> {
+        Some(source(self.messages.clone()).0)
+    }
+    fn voice(&mut self) -> Option<Arc<dyn ModSink>> {
+        Some(self.sink.clone())
+    }
+}
+
+#[test]
+fn a_voiced_conversation_gives_its_window_the_area_that_names_its_voices() {
+    let sink = Arc::new(Cues::default());
+    let messages = vec![numbered(2, canon(vec![text("one"), Piece::NewPage, text("two")]))];
+    let mut talk = Talk::new(Box::new(Voicey { messages, sink: sink.clone() }));
+    let npcs = [npc(0, "gu0", 20.0, 0.0)];
+    assert!(press(&mut talk, KeyCode::Enter, &around(&npcs, (0.0, 0.0), 0.0)));
+    assert!(sink.taken().is_empty(), "the first page's voice is the source's, not the window's");
+    assert!(press(&mut talk, KeyCode::Enter, &around(&npcs, (0.0, 0.0), 0.0)));
+    assert_eq!(sink.taken(), vec![VoiceCue::Say { field: "md1stin".into(), window: 0, dialog: 2, page: 1 }]);
+}

@@ -619,6 +619,12 @@ impl ClientState {
             // The countdown the server runs for our story (the server's word, never ends the session): the HUD draws
             // what it says and counts down on this clock between messages (see `crate::ui::countdown`).
             ServerMsg::Countdown { state } => self.countdown.on_message(now, state),
+            // The answer to a `DeleteCharacter`, which is made on a connection of its own (see `crate::delete`) and never
+            // by a joined session: a server that says it here is broken, and a character it says is gone must not go on
+            // being played as if it were not. Like the area offer above it ends the session (no server text is echoed).
+            ServerMsg::CharacterDeleted { .. } => {
+                return Some("protocol error: the server announced a deleted character to a joined session".to_string());
+            }
         }
         None
     }
@@ -961,6 +967,16 @@ mod tests {
         assert_eq!(s.apply(71.0, over), None);
         assert!(s.countdown.view(71.0).is_none() && !s.countdown.is_running());
         assert_eq!(s.countdown.told(), 2);
+    }
+
+    /// `CharacterDeleted` answers a delete request, which is made on a connection of its own and never by a joined session:
+    /// a server that sends it to one is broken, so the session ends (and the reason holds no text of the server).
+    #[test]
+    fn a_character_deleted_message_in_a_joined_session_ends_it_without_echoing_the_server() {
+        let mut s = state(at(0.0));
+        let reason = s.apply(1.0, ServerMsg::CharacterDeleted { name: "PWNED\u{1b}[2J".into() }).expect("the session ends");
+        assert!(reason.starts_with("protocol error:") && reason.contains("deleted character"), "{reason}");
+        assert!(!reason.contains("PWNED") && !reason.chars().any(char::is_control), "{reason}");
     }
 
     #[test]

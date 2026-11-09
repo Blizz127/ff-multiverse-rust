@@ -238,7 +238,7 @@ takes it as the same menu input. With no controller nothing changes.
 | A (south) | Enter | - | select / confirm | play, create, answer, dismiss a notice |
 | B (east) | Backspace | - | back a level | back / cancel; never quits |
 | X (west) | P | invite the nearest player | (same) | new character on the list, Backspace on the form |
-| Y (north) | Y | accept the newest invite | (same) | forget a saved login (asks first) |
+| Y (north) | Y | accept the newest invite | (same) | ask to delete the highlighted character (Keep, Delete or Forget here: the stick moves, A answers) |
 | Select / View | L | leave the party | (same) | - |
 | Start / Menu | Esc | quit prompt: a second press quits | backs out of the menu, never quits | Esc: back, cancel, or quit |
 | right bumper (R1/RB) | B | ask for a debug battle | - | - |

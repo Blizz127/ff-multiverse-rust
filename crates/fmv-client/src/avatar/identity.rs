@@ -25,8 +25,11 @@
 //!   value (above the very dark, so a dark brown skin is kept too) picks skin-coloured texels, which take only a weak
 //!   multiplicative tint (`c * (0.95 + 0.05 * id)`: at most 5% of a channel). The face decals (eyes, brows, mouth: the
 //!   `overlay` flag of the merged mesh, which in the owned models is the textured opaque parts and nothing else,
-//!   under 1% of any model) take the same weak tint whatever their colour. Hair may be dyed; brown hair is skin-hued
-//!   enough to keep its colour.
+//!   under 1% of any model) take the same weak tint whatever their colour. **Hair keeps its colour too.** The mask cannot
+//!   tell dark brown hair from dark brown shoes (both are very saturated and very dark, outside its gates: a blue player's
+//!   `lean` had blue hair), so the mesh flags the hair itself: the vertices of the HEAD bone whose colour is a hair colour
+//!   ([`head_colour_is_own`]: the skin and hair hues, black and dark grey; not the white of a cap or the blue of a hood)
+//!   are marked `own`, and the shader gives them the same weak tint as a decal. The shoes, belts and suits stay cloth.
 //! * **Grey identities** (white, grey, black: the colour sliders allow them) have no hue to paint with: the cloth
 //!   falls back to the old multiplicative look, over a smooth gate on the identity's chroma (a white identity leaves
 //!   the model as it is, as it always did).
@@ -64,6 +67,53 @@ impl Default for Identity {
     fn default() -> Self {
         Self::NONE
     }
+}
+
+/// (hue in degrees from -180 to 180 with 0 = red, saturation, value) of an sRGB colour given as floats in 0..1: the one
+/// arithmetic the shader's `id_hsv` and the CPU mirror use.
+pub(crate) fn hsv(c: [f32; 3]) -> [f32; 3] {
+    let mx = c[0].max(c[1].max(c[2]));
+    let mn = c[0].min(c[1].min(c[2]));
+    let d = mx - mn;
+    let mut h = 0.0;
+    if d > 0.00001 {
+        h = if mx == c[0] {
+            (c[1] - c[2]) / d
+        } else if mx == c[1] {
+            2.0 + (c[2] - c[0]) / d
+        } else {
+            4.0 + (c[0] - c[1]) / d
+        };
+        h *= 60.0;
+        if h > 180.0 {
+            h -= 360.0;
+        }
+        if h <= -180.0 {
+            h += 360.0;
+        }
+    }
+    [h, if mx > 0.00001 { d / mx } else { 0.0 }, mx]
+}
+
+/// Hues of skin and of every hair a person has (brown, red, blond), in degrees: the skin mask's own range.
+const HEAD_OWN_HUE: std::ops::RangeInclusive<f32> = -20.0..=56.0;
+/// A colour needs this much saturation to count as a hue (below it the head's colour is a grey).
+const HEAD_OWN_SATURATION: f32 = 0.1;
+/// A grey is hair (black, dark grey) or a visor, not cloth, only when it is this dark and this grey.
+const HEAD_DARK_VALUE: f32 = 0.4;
+const HEAD_DARK_SATURATION: f32 = 0.25;
+
+/// Does a vertex of the HEAD keep its own colour under a player's identity colour although it is no face decal?
+///
+/// Hair is the case. It is not cloth, but the skin mask of the shader cannot say so: a dark brown is both very saturated and
+/// very dark, which the mask's gates exclude (a blue player's `lean` had BLUE HAIR, and a brown bob went orange). Only the
+/// vertices of the head bone ask (`mesh::MergedMesh::build`), so the shoes, the belts and the suits that are the same dark
+/// brown or black elsewhere in the model stay cloth. On the head these keep their colour: every colour of the skin and hair
+/// hues (brown, red, blond, skin itself) and the dark greys (black hair, a visor). A cap or a hood keeps being cloth: white and
+/// light grey (a cap) and the cool hues (blue, green, violet: a hood, a helmet).
+pub(crate) fn head_colour_is_own(rgb: [u8; 3]) -> bool {
+    let [h, s, v] = hsv(rgb.map(|c| f32::from(c) / 255.0));
+    (s >= HEAD_OWN_SATURATION && HEAD_OWN_HUE.contains(&h)) || (s < HEAD_DARK_SATURATION && v < HEAD_DARK_VALUE)
 }
 
 /// The identity look in WGSL (`identity_look`), for the model shader. A macro so that it is spelled once, in a
@@ -228,30 +278,9 @@ pub(crate) mod look {
         x - m * (x / m).floor()
     }
 
-    /// (hue in degrees from -180 to 180, 0 = red; saturation; value)
-    pub fn hsv(c: [f32; 3]) -> [f32; 3] {
-        let mx = c[0].max(c[1].max(c[2]));
-        let mn = c[0].min(c[1].min(c[2]));
-        let d = mx - mn;
-        let mut h = 0.0;
-        if d > 0.00001 {
-            h = if mx == c[0] {
-                (c[1] - c[2]) / d
-            } else if mx == c[1] {
-                2.0 + (c[2] - c[0]) / d
-            } else {
-                4.0 + (c[0] - c[1]) / d
-            };
-            h *= 60.0;
-            if h > 180.0 {
-                h -= 360.0;
-            }
-            if h <= -180.0 {
-                h += 360.0;
-            }
-        }
-        [h, if mx > 0.00001 { d / mx } else { 0.0 }, mx]
-    }
+    /// (hue in degrees from -180 to 180, 0 = red; saturation; value): the arithmetic the shader's `id_hsv` has, shared with
+    /// the mesh's head-colour rule.
+    pub(crate) use super::hsv;
 
     pub fn from_hsv(h: f32, s: f32, v: f32) -> [f32; 3] {
         let h6 = modulo(h, 360.0) / 60.0;
@@ -605,6 +634,57 @@ mod tests {
             assert_eq!(tint.alpha, 1.0);
         }
     }
+
+    /// Hair keeps its colour and a cap or a hood does not: the colours of the owned bodies' heads (to the unit; the
+    /// numbers are the vertex colours measured by `real_looks_survey`), and the ones a person's head can have.
+    #[test]
+    fn hair_keeps_its_colour_on_the_head_and_a_cap_or_a_hood_does_not() {
+        for (name, rgb) in [
+            ("lean's dark brown hair (very saturated, very dark: outside the skin mask)", [46u8, 23, 0]),
+            ("slight's brown bob", [104, 41, 20]),
+            ("black hair", [10, 10, 10]),
+            ("dark grey hair or a visor", [48, 48, 52]),
+            ("blond hair", [255, 200, 60]),
+            ("red hair", [180, 40, 20]),
+            ("skin", [255, 131, 80]),
+            ("peach skin", [255, 204, 153]),
+            ("a red headband", [255, 0, 0]),
+        ] {
+            assert!(head_colour_is_own(rgb), "{name} {rgb:?} keeps its colour");
+        }
+        for (name, rgb) in [
+            ("slight's cap", [205u8, 211, 211]),
+            ("a white cap", [255, 255, 255]),
+            ("a light grey cap", [180, 180, 180]),
+            ("a mid grey hood", [128, 128, 128]),
+            ("sturdy's blue hood", [27, 62, 159]),
+            ("a dark navy hood", [20, 20, 70]),
+            ("a green hood", [20, 160, 60]),
+            ("a violet helmet", [140, 60, 200]),
+        ] {
+            assert!(!head_colour_is_own(rgb), "{name} {rgb:?} is cloth: the player's colour goes on it");
+        }
+        // What the rule keeps is kept by the shader's weak tint (a decal's), whoever the player is: it moves a channel by
+        // at most 5%.
+        for player in PLAYERS {
+            for rgb in [[46u8, 23, 0], [104, 41, 20], [10, 10, 10], [255, 200, 60]] {
+                let (c, id) = (f(rgb), f(player));
+                assert!(mean_levels(c, look(c, id, 1.0, 1.0)) < 7.0, "{rgb:?} under {player:?}");
+            }
+        }
+    }
+
+    /// The shared HSV is the arithmetic the CPU mirror always had (a few colours worked out by hand).
+    #[test]
+    fn the_shared_hsv_is_the_mirrors() {
+        let close = |a: [f32; 3], b: [f32; 3]| (0..3).all(|k| (a[k] - b[k]).abs() < 1e-4);
+        assert!(close(hsv([1.0, 0.0, 0.0]), [0.0, 1.0, 1.0]));
+        assert!(close(hsv([0.0, 1.0, 0.0]), [120.0, 1.0, 1.0]));
+        assert!(close(hsv([0.0, 0.0, 1.0]), [-120.0, 1.0, 1.0]));
+        assert!(close(hsv([0.5, 0.5, 0.5]), [0.0, 0.0, 0.5]));
+        assert!(close(hsv([0.0; 3]), [0.0, 0.0, 0.0]));
+        assert!(close(hsv([1.0, 0.5, 0.0]), [30.0, 1.0, 1.0]));
+    }
 }
 
 #[cfg(test)]
@@ -693,6 +773,8 @@ pub(crate) mod measure {
     pub struct Shares {
         pub triangles: usize,
         pub overlay: f32,
+        /// The share of the head's hair and skin: triangles whose first vertex is flagged `own` (see `MergedMesh::own`).
+        pub own: f32,
         pub textured: f32,
         pub skin: f32,
         /// Colours whose brightest channel is under 8 (of 255): the black the look cannot lift plainly.
@@ -733,6 +815,7 @@ pub(crate) mod measure {
                 out.triangles += 1;
                 total += area;
                 out.overlay += area * mesh.overlay[tri[0] as usize];
+                out.own += area * mesh.own[tri[0] as usize];
                 out.textured += area * f32::from(u8::from(batch.texture.is_some()));
                 out.skin += area * look::skin_mask(c);
                 out.black += area * f32::from(u8::from(c[0].max(c[1]).max(c[2]) < 8.0 / 255.0));
@@ -740,6 +823,7 @@ pub(crate) mod measure {
         }
         if total > 0.0 {
             out.overlay /= total;
+            out.own /= total;
             out.textured /= total;
             out.skin /= total;
             out.black /= total;
