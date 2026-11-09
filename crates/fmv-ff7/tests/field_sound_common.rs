@@ -315,6 +315,33 @@ pub fn all_plans(archive: &Archive, bank: &SfxBank, moment: u16) -> Plans {
     out
 }
 
+/// The walk-on script exits of the archive (a line's script that runs a `MAPJUMP` when walked onto), and how many of them play a
+/// sound (id not 0) before the jump in the script that holds it (a static count, nothing run), in how many fields.
+#[derive(Debug, Default)]
+pub struct ExitCensus {
+    pub walk_on: usize,
+    pub with_a_sound: usize,
+    pub fields: BTreeSet<String>,
+}
+
+pub fn exit_census(archive: &Archive) -> ExitCensus {
+    let mut out = ExitCensus::default();
+    for (name, field) in &archive.fields {
+        let Ok(script) = FieldScript::from_field(field) else { continue };
+        for exit in script.script_exits(&archive.maplist).into_iter().filter(|e| e.trigger.is_walk_on()) {
+            out.walk_on += 1;
+            let Some(holder) = exit.path.last() else { continue };
+            let Ok(d) = script.disassemble_partial(holder.entity, usize::from(holder.slot)) else { continue };
+            let plays = d.instructions.iter().filter(|i| i.offset < exit.offset).any(|i| matches!(Call::of(i), Ok(Some(call)) if call.id != 0));
+            if plays {
+                out.with_a_sound += 1;
+                out.fields.insert(name.clone());
+            }
+        }
+    }
+    out
+}
+
 /// The text the survey and the test print about the census.
 pub fn census_report(census: &Census, bank: Option<&SfxBank>) -> String {
     let mut out = String::new();

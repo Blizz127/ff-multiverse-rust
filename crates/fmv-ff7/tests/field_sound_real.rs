@@ -230,6 +230,24 @@ fn real_the_reviewed_fields_play_what_their_scripts_say_and_every_clip_exists() 
 
 #[test]
 #[ignore = "needs the owner's FF7 data (FMV_FF7_DATA) and sound files (FMV_FF7_AUDIO_DATA)"]
+fn real_the_doors_that_play_before_their_jump_in_numbers() {
+    let Some(d) = data() else { return };
+    let exits = exit_census(&d.archive);
+    println!("walk-on script exits {}; with a sound before the jump {} in {} fields", exits.walk_on, exits.with_a_sound, exits.fields.len());
+    assert_eq!(exits.walk_on, 1114);
+    assert_eq!((exits.with_a_sound, exits.fields.len()), (EXITS_WITH_A_SOUND, EXIT_FIELDS));
+    // the reviewed fields have no door with a sound: the server's script exits are theirs only
+    for name in REVIEWED_FIELDS {
+        assert!(!exits.fields.contains(name), "{name}");
+    }
+}
+
+/// What the static count of walk-on exits with a sound before their jump came to (see the test above).
+const EXITS_WITH_A_SOUND: usize = 150;
+const EXIT_FIELDS: usize = 63;
+
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA) and sound files (FMV_FF7_AUDIO_DATA)"]
 fn real_every_id_any_plan_of_any_field_plays_is_a_clip() {
     let Some(d) = data() else { return };
     for moment in [1u16, 15, 27] {

@@ -90,6 +90,8 @@ fn main() {
         }
     }
     if wants("--plans", &args) {
+        let exits = common::exit_census(&archive);
+        println!("== script exits: {} walk-on; {} play a sound before the jump in the script that holds it, in {} fields (a static count)", exits.walk_on, exits.with_a_sound, exits.fields.len());
         for &moment in &moments {
             let plans = common::all_plans(&archive, &bank, moment);
             println!(

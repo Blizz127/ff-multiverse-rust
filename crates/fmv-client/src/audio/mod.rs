@@ -26,20 +26,31 @@
 //!   them with the effects' volume path: they share the master volume, the mute key and `--mute`/`FMV_AUDIO` with the rest.
 //!   `FMV_BATTLE_SOUNDS` says which ones are played: `off` none, `data` (the default) what the data names, `all` also
 //!   the two that only a hand-made list of the sound bank names (an enemy's death, an escape; see [`BattleSounds`]).
+//! * **Field sounds.** What the field's own scripts play for the player's story ([`field`]): ambient loops (the hum of
+//!   the reactor before the boss, its alarm after it), and the sounds of the ladders, jumps, lift and doors the player uses.
+//!   When the player is in an FF7 field [`GameAudio::follow_field`] (every frame, from [`GameAudio::update_from`]) asks the
+//!   [`Worker`] for the field's plan (what plays for the story the client holds, and only the clips that names), starts the
+//!   loops on their channels, asks again when a `StoryUpdate` changes the story, pauses the loops for a battle and plays the
+//!   event sounds when it sees their evidence. `FMV_FIELD_SOUNDS=off|data` ([`FieldSounds`]): `off` asks for nothing and
+//!   plays nothing.
 //!
 //! What the log says (it is the evidence of a headless run, which has no ears): one `audio: field
 //! <area>:` line per area with the tracks its script names, `audio: decoded <track>` as each
 //! finishes, `audio: playing <track> (<why>)` at the moment a track really starts, `audio: battle sounds: N loaded`
 //! when a fight's clips were read, `audio: battle sound <id> (<hit|critical|miss|impact|...>)` at the moment each one
-//! plays and, when the run ends, `audio: battle sounds played: N (<id>x<times> ...)`.
+//! plays and, when the run ends, `audio: battle sounds played: N (<id>x<times> ...)`. For the field's sounds: `audio: field
+//! <area> sounds at moment <m>: ambient ch3:38; ...` when a plan is read, `audio: field loop start ch3 38` and `... stop ...
+//! (<why>)`, `audio: field sound ch1 62 (link)` and, at the end, `audio: field sounds played: ...`.
 
 mod cues;
 mod director;
 pub mod ff7;
+pub mod field;
 mod worker;
 
 pub use cues::{battle_cue, menu_cue, Cue};
 pub use director::BattleCounts;
+pub use field::{FieldFrame, FieldSounds, LinkSpot, FIELD_SOUNDS_ENV};
 
 use crate::battle::{BattleClient, BattleSound, Planned};
 use director::{Director, STANDARD_BATTLE_TRACK};
@@ -224,6 +235,10 @@ struct Live {
     battle_played: BTreeMap<u16, u32>,
     /// Ids that came due with no clip to play, said once each.
     unheard: HashSet<u16>,
+    /// What the field plays (see [`field`]).
+    field: field::FieldState,
+    /// The area whose links the field state holds.
+    links_for: Option<String>,
 }
 
 impl Live {
@@ -316,6 +331,7 @@ impl Live {
                     }
                     self.say(&format!("battle sounds: {loaded} loaded in {} ms", took.as_millis()));
                 }
+                Done::Field { key, story, read, took } => self.field.on_read(&self.log, &key, &story, read, took),
             }
         }
     }
@@ -386,10 +402,14 @@ impl Live {
 }
 
 impl Drop for Live {
-    /// The end of a run: what its battles sounded like, in one line (the evidence of a headless run, which has no ears).
+    /// The end of a run: what its battles and its fields sounded like, in a line each (the evidence of a headless run, which has
+    /// no ears).
     fn drop(&mut self) {
         if let Some(played) = self.battle_sounds_played() {
             self.say(&format!("battle sounds played: {played}"));
+        }
+        if let Some(played) = self.field.summary() {
+            self.say(&format!("field sounds played: {played}"));
         }
     }
 }
@@ -418,7 +438,11 @@ impl GameAudio {
         if let Some(note) = note {
             log(&note);
         }
-        Self::with_parts(engine, Box::new(ThreadWorker::start(tasks)), log).with_battle_sounds(battle_sounds)
+        let (field_sounds, note) = FieldSounds::from_env(std::env::var(FIELD_SOUNDS_ENV).ok().as_deref());
+        if let Some(note) = note {
+            log(&note);
+        }
+        Self::with_parts(engine, Box::new(ThreadWorker::start(tasks)), log).with_battle_sounds(battle_sounds).with_field_sounds(field_sounds)
     }
 
     /// The sound over an engine and a worker the caller made (tests use a manual engine and a fake worker).
@@ -450,8 +474,19 @@ impl GameAudio {
                 polled_to: None,
                 battle_played: BTreeMap::new(),
                 unheard: HashSet::new(),
+                field: field::FieldState::new(FieldSounds::default()),
+                links_for: None,
             })),
         }
+    }
+
+    /// Play `which` field sounds (the default is what the data names, see [`FieldSounds`]); no effect on a soundtrack that is
+    /// off.
+    pub fn with_field_sounds(mut self, which: FieldSounds) -> Self {
+        if let Some(live) = self.live.as_mut() {
+            live.field = field::FieldState::new(which);
+        }
+        self
     }
 
     /// Play `which` battle sounds (the default is what the data names, see [`BattleSounds`]); no effect on a soundtrack that
@@ -510,6 +545,57 @@ impl GameAudio {
         let key = (area.game == GameId::Ff7).then_some(area.key.as_str());
         self.update(key, BattleCounts::of(&session.state.battle));
         self.follow_battle(&session.state.battle, session.now());
+        self.follow_session_field(session);
+    }
+
+    /// [`GameAudio::follow_field`] for a joined session: the field the player is in, the story the client holds, where the
+    /// player stands and how many `MoveRejected` it has had. The links of a new area (and the place the server puts a player at when
+    /// each fires) are taken from the session's area when it changes.
+    fn follow_session_field(&mut self, session: &Session) {
+        let Some(live) = self.live.as_mut() else { return };
+        if live.field.mode() == FieldSounds::Off {
+            return;
+        }
+        let area = &session.info.area_id;
+        let key = (area.game == GameId::Ff7).then_some(area.key.as_str());
+        if live.links_for.as_deref() != key {
+            live.links_for = key.map(str::to_string);
+            let areas = session.area.as_ref();
+            let spots = areas
+                .links()
+                .into_iter()
+                .map(|link| LinkSpot { spot: areas.place_arrival(link.to, link.to_hint), line: link.line, to: link.to, needs_ok: link.needs_ok })
+                .collect();
+            live.field.set_links(spots);
+        }
+        let frame = FieldFrame {
+            now: session.now(),
+            key,
+            story: session.state.story.progress(),
+            pos: Some(session.state.own.pos()),
+            rejected: session.state.rejected(),
+            in_battle: session.state.battle.in_battle(),
+        };
+        self.follow_field(&frame);
+    }
+
+    /// Follow the field's own sounds for one frame (see [`field`]): leave and enter fields, ask for plans, start, change and stop
+    /// ambient loops as the story moves, pause them for a battle, and play the sounds of the ladders, jumps, lift and doors the player
+    /// uses. Cheap, never blocks; with `FMV_FIELD_SOUNDS=off` it returns at once.
+    pub fn follow_field(&mut self, frame: &FieldFrame<'_>) {
+        let Some(live) = self.live.as_mut() else { return };
+        if live.field.mode() == FieldSounds::Off {
+            return;
+        }
+        live.pump_worker();
+        let Live { engine, worker, log, field, .. } = &mut **live;
+        field.follow(engine, worker.as_mut(), log, frame);
+    }
+
+    /// The loops the field has playing, as `(channel, sound id)` (tests).
+    #[cfg(test)]
+    pub fn field_loops(&self) -> Vec<(u8, u16)> {
+        self.live.as_ref().map_or_else(Vec::new, |l| l.field.playing())
     }
 
     /// Follow a battle's sounds at `now` (seconds on the clock its messages were stamped with, [`Session::now`]): a battle
@@ -604,7 +690,9 @@ impl GameAudio {
 #[cfg(test)]
 mod tests {
     use super::director::AreaMusic;
+    use super::field::{AmbientLoop, ExitPlan, FlipPlan, LinkPlan, PlannedCall};
     use super::*;
+    use fmv_ff7::story::StoryState;
     use std::cell::RefCell;
     use std::rc::Rc;
     use std::sync::{Arc, Mutex};
@@ -632,6 +720,12 @@ mod tests {
         cues: bool,
         /// The sound ids the library has no clip for (an empty slot, say); every other id has one.
         no_clip: Vec<u16>,
+        /// What each field plays, as a function of the story blob it is asked for; a field not listed plays nothing.
+        fields: HashMap<String, Rc<dyn Fn(&[u8]) -> field::FieldPlan>>,
+        /// The ids whose clips loop (their loop region is the whole clip).
+        loop_ids: Vec<u16>,
+        /// Fields that cannot be read.
+        broken: Vec<String>,
     }
 
     /// A worker that answers on the spot (or when told to): no threads, no waiting.
@@ -678,6 +772,31 @@ mod tests {
                 }
             }
             let done = Done::Sounds { read, took: std::time::Duration::from_millis(3) };
+            if s.hold { s.held.push(done) } else { s.inbox.push(done) }
+        }
+
+        fn scan_field(&mut self, key: &str, story: Vec<u8>, have: Vec<u16>) {
+            let mut s = self.0.borrow_mut();
+            let moment = StoryState::decode(&story).map_or_else(|| "?".to_string(), |st| st.moment.to_string());
+            s.asked.push(format!("field {key} moment {moment} have {have:?}"));
+            let read = if s.broken.iter().any(|b| b == key) {
+                Err("the field cannot be read".to_string())
+            } else {
+                let mut plan = s.fields.get(key).map(|f| f(&story)).unwrap_or_default();
+                plan.key = key.to_string();
+                plan.story = story.clone();
+                let mut clips = worker::SoundsRead::default();
+                for id in plan.ids().into_iter().filter(|id| !have.contains(id)) {
+                    if s.no_clip.contains(&id) {
+                        clips.missing.push((id, "an empty slot".to_string()));
+                    } else {
+                        let clip = SfxClip::from_mono(RATE, &vec![0.5; 4_800]).expect("a clip");
+                        clips.clips.push((id, if s.loop_ids.contains(&id) { clip.with_loop(0, 4_800) } else { clip }));
+                    }
+                }
+                Ok(field::FieldRead { plan, clips })
+            };
+            let done = Done::Field { key: key.to_string(), story, read, took: std::time::Duration::from_millis(4) };
             if s.hold { s.held.push(done) } else { s.inbox.push(done) }
         }
 
@@ -1012,6 +1131,7 @@ mod tests {
             decode: Arc::new(|_| panic!("a muted run must not decode")),
             cues: Arc::new(|| panic!("a muted run must not read the sound files")),
             sounds: Arc::new(|_| panic!("a muted run must not read the sound files")),
+            field: Arc::new(|_, _, _| panic!("a muted run must not read a field's sounds")),
         };
         let muted = GameAudio::start(AudioConfig { mode: Mode::Off, ..AudioConfig::default() }, tasks);
         assert!(!muted.is_on());
@@ -1380,5 +1500,424 @@ mod tests {
         // The same id again is one clip, not two.
         assert!(clips.insert(10, clip()).is_empty());
         assert_eq!(clips.clips.len(), BATTLE_CLIPS);
+    }
+
+    // ---------- field sounds ----------
+
+    use fmv_core::Pos;
+
+    /// The progression blob of a story at `moment`.
+    fn blob(moment: u16) -> Vec<u8> {
+        StoryState::at(moment).encode()
+    }
+
+    fn plan_of(ambient: Vec<AmbientLoop>) -> field::FieldPlan {
+        field::FieldPlan { ambient, ..field::FieldPlan::default() }
+    }
+
+    fn ambient(channel: u8, id: u16) -> AmbientLoop {
+        AmbientLoop { channel, id, pan: 64, at: 0 }
+    }
+
+    fn call(at: u32, channel: u8, id: u16) -> PlannedCall {
+        PlannedCall { at, channel, id, pan: 64 }
+    }
+
+    /// A frame in field `key` at `now` seconds with the player at `pos`, `rejected` rejections so far, not in a battle.
+    fn frame<'a>(key: &'a str, story: &'a [u8], now: f64) -> FieldFrame<'a> {
+        FieldFrame { now, key: Some(key), story, pos: Some(Pos::new(0.0, 0.0, 5.0)), rejected: 0, in_battle: false }
+    }
+
+    /// One frame of the field's sounds, then a little time on the engine so that it applies what was asked.
+    fn follow(rig: &mut Rig, f: &FieldFrame<'_>) {
+        rig.audio.follow_field(f);
+        rig.audio.pump(64);
+    }
+
+    /// The `field` lines of the log.
+    fn field_lines(rig: &Rig) -> Vec<String> {
+        rig.lines().into_iter().filter(|l| l.starts_with("field ")).collect()
+    }
+
+    fn field_asks(rig: &Rig) -> Vec<String> {
+        rig.state.borrow().asked.iter().filter(|a| a.starts_with("field ")).cloned().collect()
+    }
+
+    /// A rig whose field `key` plays `plan` whatever the story, with the clips of `loops` looping.
+    fn field_rig(key: &str, plan: field::FieldPlan, loops: &[u16]) -> Rig {
+        let rig = Rig::new(&[], &[]);
+        {
+            let mut s = rig.state.borrow_mut();
+            s.loop_ids = loops.to_vec();
+            s.fields.insert(key.to_string(), Rc::new(move |_| plan.clone()));
+        }
+        rig
+    }
+
+    #[test]
+    fn a_field_starts_its_ambient_loop_when_its_plan_and_clip_have_arrived_and_stops_it_when_the_player_leaves() {
+        let mut rig = field_rig("nmkin_2", plan_of(vec![ambient(3, 38)]), &[38]);
+        let story = blob(15);
+        // the plan is asked for when the field is entered, with the story the client holds; nothing plays before it arrives
+        follow(&mut rig, &frame("nmkin_2", &story, 0.0));
+        assert_eq!(field_asks(&rig), ["field nmkin_2 moment 15 have []"]);
+        assert!(rig.audio.field_loops().is_empty());
+        follow(&mut rig, &frame("nmkin_2", &story, 0.05));
+        assert_eq!(rig.audio.field_loops(), [(3, 38)]);
+        assert_eq!(rig.audio.status().expect("on").loops_playing, 1);
+        let lines = field_lines(&rig);
+        assert!(lines.iter().any(|l| l.starts_with("field nmkin_2 sounds at moment 15: ambient ch3:38; 0 link(s), 0 lift flip(s), 0 door(s) with a sound; 0 condition(s) not judged")), "{lines:?}");
+        assert!(lines.contains(&"field loop start ch3 38".to_string()), "{lines:?}");
+        // a clip of a tenth of a second is still playing a second later: it is a loop
+        rig.audio.pump(48_000);
+        assert_eq!(rig.audio.status().expect("on").loops_playing, 1);
+        assert_eq!(field_asks(&rig).len(), 1, "asked once, however long the player stays");
+        // the next field has none: the loop fades out and is gone
+        follow(&mut rig, &frame("nmkin_3", &story, 2.0));
+        assert!(rig.audio.field_loops().is_empty());
+        rig.audio.pump(48_000);
+        assert_eq!(rig.audio.status().expect("on").loops_playing, 0);
+        assert!(field_lines(&rig).contains(&"field loop stop ch3 38 (the field was left)".to_string()));
+        // out of the FF7 fields altogether nothing is asked for
+        let asked = field_asks(&rig).len();
+        rig.audio.follow_field(&FieldFrame { key: None, ..frame("x", &story, 3.0) });
+        assert_eq!(field_asks(&rig).len(), asked);
+    }
+
+    #[test]
+    fn the_story_moving_from_15_to_27_while_the_player_stands_in_nmkin_4_turns_the_reactor_hum_into_the_alarm() {
+        let mut rig = Rig::new(&[], &[]);
+        {
+            let mut s = rig.state.borrow_mut();
+            s.loop_ids = vec![38, 60];
+            // nmkin_4 as its script says: the hum on channel 3 until the moment is 27, then the alarm on channel 2
+            s.fields.insert(
+                "nmkin_4".to_string(),
+                Rc::new(|story: &[u8]| plan_of(if StoryState::decode(story).is_some_and(|s| s.moment == 27) { vec![ambient(2, 60)] } else { vec![ambient(3, 38)] })),
+            );
+        }
+        let (before, after) = (blob(15), blob(27));
+        follow(&mut rig, &frame("nmkin_4", &before, 0.0));
+        follow(&mut rig, &frame("nmkin_4", &before, 0.05));
+        assert_eq!(rig.audio.field_loops(), [(3, 38)], "the hum before the boss");
+        rig.audio.pump(48_000);
+        assert_eq!(rig.audio.status().expect("on").loops_playing, 1);
+        // the boss falls: the server moves the story to 27 and the client is told. The old hum goes on until the plan for 27 is read...
+        follow(&mut rig, &frame("nmkin_4", &after, 2.0));
+        assert_eq!(field_asks(&rig).last().map(String::as_str), Some("field nmkin_4 moment 27 have [38]"), "a new plan for the new story, asking only for the clips it does not hold");
+        // ...and then the set changes to it, channel by channel
+        follow(&mut rig, &frame("nmkin_4", &after, 2.05));
+        assert_eq!(rig.audio.field_loops(), [(2, 60)], "the alarm is on and the hum is off");
+        assert_eq!(rig.audio.status().expect("on").loops_playing, 2, "the hum is still fading out (a second, not a cut)");
+        rig.audio.pump(48_000);
+        assert_eq!(rig.audio.status().expect("on").loops_playing, 1, "and then only the alarm plays");
+        let lines = field_lines(&rig);
+        let at = |needle: &str| lines.iter().position(|l| l == needle).unwrap_or_else(|| panic!("{needle}: {lines:?}"));
+        // (the plan for 27 is read first; the two channels are then changed in the same look, in channel order)
+        let plan_27 = lines.iter().position(|l| l.starts_with("field nmkin_4 sounds at moment 27: ambient ch2:60;")).unwrap_or_else(|| panic!("{lines:?}"));
+        assert!(at("field loop start ch3 38") < plan_27 && plan_27 < at("field loop start ch2 60") && plan_27 < at("field loop stop ch3 38 (the story moved)"), "{lines:?}");
+        // a story that moves again without changing what the field plays leaves the alarm alone
+        follow(&mut rig, &frame("nmkin_4", &blob(28), 3.0));
+        follow(&mut rig, &frame("nmkin_4", &blob(28), 3.05));
+        assert_eq!(rig.audio.field_loops(), [(3, 38)], "(the plan for 28 is the hum again: this fake field's own condition is == 27)");
+    }
+
+    #[test]
+    fn a_new_plan_that_wants_the_same_loops_leaves_them_playing_untouched() {
+        let mut rig = field_rig("a", plan_of(vec![ambient(3, 38)]), &[38]);
+        follow(&mut rig, &frame("a", &blob(15), 0.0));
+        follow(&mut rig, &frame("a", &blob(15), 0.05));
+        // the story moves, the plan comes back the same
+        follow(&mut rig, &frame("a", &blob(16), 1.0));
+        follow(&mut rig, &frame("a", &blob(16), 1.05));
+        assert_eq!(field_asks(&rig), ["field a moment 15 have []", "field a moment 16 have [38]"]);
+        assert_eq!(rig.audio.field_loops(), [(3, 38)]);
+        let starts = field_lines(&rig).iter().filter(|l| l.starts_with("field loop start")).count();
+        let stops = field_lines(&rig).iter().filter(|l| l.starts_with("field loop stop")).count();
+        assert_eq!((starts, stops), (1, 0), "{:?}", field_lines(&rig));
+        assert_eq!(rig.audio.status().expect("on").loops_playing, 1);
+    }
+
+    #[test]
+    fn a_plan_for_a_story_the_client_has_left_is_dropped_and_another_is_asked_for() {
+        let mut rig = field_rig("a", plan_of(vec![ambient(3, 38)]), &[38]);
+        let (old, new) = (blob(15), blob(27));
+        rig.state.borrow_mut().hold = true;
+        follow(&mut rig, &frame("a", &old, 0.0));
+        // the story moves before the answer comes
+        follow(&mut rig, &frame("a", &new, 0.05));
+        assert_eq!(field_asks(&rig).len(), 1, "one request in flight at a time");
+        let held = std::mem::take(&mut rig.state.borrow_mut().held);
+        {
+            let mut s = rig.state.borrow_mut();
+            s.hold = false;
+            s.inbox.extend(held);
+        }
+        follow(&mut rig, &frame("a", &new, 0.1));
+        assert!(rig.audio.field_loops().is_empty(), "the plan for the old story is not applied");
+        assert_eq!(field_asks(&rig), ["field a moment 15 have []", "field a moment 27 have [38]"], "the clips it brought are kept, and the new request knows it");
+        follow(&mut rig, &frame("a", &new, 0.15));
+        assert_eq!(rig.audio.field_loops(), [(3, 38)]);
+    }
+
+    #[test]
+    fn a_battle_takes_the_loops_over_and_gives_them_back_without_asking_again() {
+        let mut rig = field_rig("a", plan_of(vec![ambient(3, 38), ambient(2, 60)]), &[38, 60]);
+        let story = blob(15);
+        follow(&mut rig, &frame("a", &story, 0.0));
+        follow(&mut rig, &frame("a", &story, 0.05));
+        assert_eq!(rig.audio.field_loops(), [(2, 60), (3, 38)]);
+        let fight = |now| FieldFrame { in_battle: true, ..frame("a", &story, now) };
+        follow(&mut rig, &fight(1.0));
+        assert!(rig.audio.field_loops().is_empty(), "the field's loops stop for the fight");
+        follow(&mut rig, &fight(1.5));
+        assert!(rig.audio.field_loops().is_empty(), "and stay stopped for as long as it lasts");
+        rig.audio.pump(48_000);
+        assert_eq!(rig.audio.status().expect("on").loops_playing, 0);
+        follow(&mut rig, &frame("a", &story, 5.0));
+        assert_eq!(rig.audio.field_loops(), [(2, 60), (3, 38)], "back after it, from their start");
+        assert_eq!(field_asks(&rig).len(), 1, "the plan did not have to be read again");
+        let lines = field_lines(&rig);
+        assert_eq!(lines.iter().filter(|l| l.starts_with("field loop start")).count(), 4);
+        assert!(lines.contains(&"field loop stop ch3 38 (a battle)".to_string()), "{lines:?}");
+    }
+
+    #[test]
+    fn with_field_sounds_off_nothing_is_asked_for_and_nothing_plays() {
+        let mut rig = field_rig("a", plan_of(vec![ambient(3, 38)]), &[38]);
+        rig.audio = std::mem::take(&mut rig.audio).with_field_sounds(FieldSounds::Off);
+        let story = blob(15);
+        for step in 0..6 {
+            follow(&mut rig, &frame("a", &story, f64::from(step) * 0.05));
+        }
+        follow(&mut rig, &frame("b", &blob(27), 1.0));
+        assert!(field_asks(&rig).is_empty(), "no field scan is requested: {:?}", rig.state.borrow().asked);
+        assert!(rig.audio.field_loops().is_empty() && field_lines(&rig).is_empty());
+        assert_eq!(rig.audio.status().expect("on").loops_playing, 0);
+        // the rest of the soundtrack does not care: the field's music is still decided
+        let mut rig = Rig::new(&[("a", area(Some("ob"), None, None))], &[("ob", 4_800), ("bat", 4_800), ("fanfare", 2_400)]);
+        rig.audio = std::mem::take(&mut rig.audio).with_field_sounds(FieldSounds::Off);
+        for _ in 0..3 {
+            rig.frame(Some("a"), NONE);
+        }
+        assert_eq!(rig.playing().as_deref(), Some("ob"));
+    }
+
+    #[test]
+    fn the_flag_is_read_from_the_environment_like_the_battle_one() {
+        assert_eq!(FieldSounds::from_env(None), (FieldSounds::Data, None));
+        assert_eq!(FieldSounds::from_env(Some("  ")), (FieldSounds::Data, None));
+        for off in ["off", "OFF", " 0 ", "no", "false", "none"] {
+            assert_eq!(FieldSounds::from_env(Some(off)), (FieldSounds::Off, None), "{off:?}");
+        }
+        for data in ["data", "Data", "on", "1", "yes", "true"] {
+            assert_eq!(FieldSounds::from_env(Some(data)), (FieldSounds::Data, None), "{data:?}");
+        }
+        let (which, note) = FieldSounds::from_env(Some("loud"));
+        assert_eq!(which, FieldSounds::Data);
+        assert!(note.is_some_and(|n| n.contains("FMV_FIELD_SOUNDS") && n.contains("loud")));
+        assert_eq!(FieldSounds::default(), FieldSounds::Data);
+    }
+
+    /// The link `line`/`to` of the tests: a jump from the left of the field to a place 110 units on.
+    fn jump_link() -> (LinkSpot, LinkPlan) {
+        let line = (Pos::new(-10.0, 0.0, 7.0), Pos::new(-10.0, 50.0, 7.0));
+        let to = Pos::new(110.0, 10.0, 0.0);
+        (LinkSpot { line, to, needs_ok: false, spot: Pos::new(110.0, 10.0, 5.0) }, LinkPlan { line, to, needs_ok: false, calls: vec![call(15, 1, 62)] })
+    }
+
+    #[test]
+    fn a_link_the_server_put_the_player_through_plays_its_sound_when_the_script_says() {
+        let (spot, plan) = jump_link();
+        let mut rig = field_rig("nmkin_3", field::FieldPlan { links: vec![plan], ..field::FieldPlan::default() }, &[]);
+        rig.audio.live.as_mut().expect("on").field.set_links(vec![spot.clone()]);
+        let story = blob(13);
+        let at = |now: f64, x: f32, rejected: u64| FieldFrame { pos: Some(Pos::new(x, 10.0, 5.0)), rejected, ..frame("nmkin_3", &story, now) };
+        follow(&mut rig, &at(0.0, -20.0, 0));
+        follow(&mut rig, &at(0.05, -20.0, 0));
+        // walking about, even with a rejection against a wall, plays nothing
+        follow(&mut rig, &at(0.5, -15.0, 1));
+        assert_eq!(rig.audio.status().expect("on").sfx_playing, 0);
+        // the server tells the client it moved it to where the link leads: the jump's sound is due half a second after
+        follow(&mut rig, &at(1.0, 110.0, 2));
+        assert_eq!(rig.audio.status().expect("on").sfx_playing, 0, "the script waits 15 frames before the take-off");
+        follow(&mut rig, &at(1.3, 110.0, 3));
+        assert_eq!(rig.audio.status().expect("on").sfx_playing, 0, "not yet");
+        follow(&mut rig, &at(1.5, 110.0, 3));
+        assert_eq!(rig.audio.status().expect("on").sfx_playing, 1);
+        assert!(field_lines(&rig).contains(&"field sound ch1 62 (link)".to_string()), "{:?}", field_lines(&rig));
+        // standing there, even with more rejections (the fence answers every old intent), does not play it again
+        follow(&mut rig, &at(2.0, 110.0, 6));
+        follow(&mut rig, &at(2.5, 110.0, 7));
+        rig.audio.pump(48_000);
+        follow(&mut rig, &at(3.0, 110.0, 8));
+        assert_eq!(rig.audio.status().expect("on").sfx_playing, 0);
+        assert_eq!(field_lines(&rig).iter().filter(|l| l.starts_with("field sound")).count(), 1);
+        // a place that is not where a link leads is no link, whatever the rejections say
+        follow(&mut rig, &at(4.0, 300.0, 9));
+        follow(&mut rig, &at(6.0, 300.0, 9));
+        assert_eq!(field_lines(&rig).iter().filter(|l| l.starts_with("field sound")).count(), 1);
+    }
+
+    #[test]
+    fn a_story_bit_that_flips_plays_what_the_script_plays_after_it_and_one_that_does_not_move_plays_nothing() {
+        let flips = vec![
+            FlipPlan { bank: 1, address: 225, bit: 0, on: true, calls: vec![call(0, 1, 42)] },
+            FlipPlan { bank: 1, address: 225, bit: 0, on: false, calls: vec![call(0, 1, 43)] },
+        ];
+        let mut rig = field_rig("elevtr1", field::FieldPlan { flips, ..field::FieldPlan::default() }, &[42]);
+        let state = |moment: u16, lift: bool| {
+            let mut s = StoryState::at(moment);
+            s.set_bit(1, 225, 0, lift);
+            s.encode()
+        };
+        let (up, down) = (state(11, false), state(12, true));
+        follow(&mut rig, &frame("elevtr1", &up, 0.0));
+        follow(&mut rig, &frame("elevtr1", &up, 0.05));
+        // the party rides down: the bit goes on and the story moves to 12
+        follow(&mut rig, &frame("elevtr1", &down, 1.0));
+        assert_eq!(rig.audio.status().expect("on").sfx_playing, 1, "the lift's sound, once through (a loop clip is not looped by an event)");
+        assert_eq!(rig.audio.status().expect("on").loops_playing, 0);
+        assert!(field_lines(&rig).contains(&"field sound ch1 42 (lift)".to_string()), "{:?}", field_lines(&rig));
+        // the story moves again with the bit as it was: nothing
+        follow(&mut rig, &frame("elevtr1", &state(13, true), 2.0));
+        assert_eq!(field_lines(&rig).iter().filter(|l| l.starts_with("field sound")).count(), 1);
+        // and the ride back plays the other flip's sound
+        follow(&mut rig, &frame("elevtr1", &state(13, false), 3.0));
+        assert!(field_lines(&rig).contains(&"field sound ch1 43 (lift)".to_string()), "{:?}", field_lines(&rig));
+        // a field entered with the bit already on is no flip
+        let mut rig = field_rig("nmkin_2", field::FieldPlan { flips: vec![FlipPlan { bank: 1, address: 225, bit: 0, on: true, calls: vec![call(0, 1, 42)] }], ..field::FieldPlan::default() }, &[]);
+        follow(&mut rig, &frame("nmkin_2", &down, 0.0));
+        follow(&mut rig, &frame("nmkin_2", &down, 0.05));
+        assert!(field_lines(&rig).iter().all(|l| !l.starts_with("field sound")));
+    }
+
+    #[test]
+    fn a_door_whose_script_plays_before_its_jump_plays_in_the_field_it_leads_to() {
+        let exit = ExitPlan { target: "nmkin_2".to_string(), arrival: (-682, 308), line: Some(((-185, -68), (-185, 56))), calls: vec![call(0, 1, 55)] };
+        let mut rig = field_rig("elevtr1", field::FieldPlan { exits: vec![exit], ..field::FieldPlan::default() }, &[]);
+        let story = blob(12);
+        let near_the_door = |now: f64| FieldFrame { pos: Some(Pos::new(-170.0, 0.0, 0.0)), ..frame("elevtr1", &story, now) };
+        follow(&mut rig, &near_the_door(0.0));
+        follow(&mut rig, &near_the_door(0.05));
+        follow(&mut rig, &near_the_door(0.1));
+        // the server moves the player to nmkin_2, to the place the door's jump says
+        let arrived = |key: &'static str, x: f32, y: f32, now: f64| FieldFrame { pos: Some(Pos::new(x, y, 0.0)), ..frame(key, &story, now) };
+        follow(&mut rig, &arrived("nmkin_2", -680.0, 300.0, 0.15));
+        assert_eq!(rig.audio.status().expect("on").sfx_playing, 1);
+        assert!(field_lines(&rig).contains(&"field sound ch1 55 (door)".to_string()), "{:?}", field_lines(&rig));
+        // another field, or a place that is not where that door puts a player, is not that door
+        let mut rig = field_rig("elevtr1", field::FieldPlan { exits: vec![ExitPlan { target: "nmkin_2".to_string(), arrival: (-682, 308), line: None, calls: vec![call(0, 1, 55)] }], ..field::FieldPlan::default() }, &[]);
+        for now in [0.0, 0.05, 0.1] {
+            follow(&mut rig, &near_the_door(now));
+        }
+        follow(&mut rig, &arrived("nmkin_2", 500.0, 300.0, 0.15));
+        assert_eq!(rig.audio.status().expect("on").sfx_playing, 0, "the arrival is not where the door leads");
+        let mut rig = field_rig("elevtr1", field::FieldPlan { exits: vec![ExitPlan { target: "nmkin_2".to_string(), arrival: (-682, 308), line: None, calls: vec![call(0, 1, 55)] }], ..field::FieldPlan::default() }, &[]);
+        for now in [0.0, 0.05, 0.1] {
+            follow(&mut rig, &near_the_door(now));
+        }
+        follow(&mut rig, &arrived("nmkin_3", -680.0, 300.0, 0.15));
+        assert_eq!(rig.audio.status().expect("on").sfx_playing, 0, "it does not lead to nmkin_3");
+    }
+
+    #[test]
+    fn a_sound_an_event_plays_replaces_the_loop_of_its_channel_and_leaves_the_others_alone() {
+        let (spot, mut plan) = jump_link();
+        plan.calls = vec![call(0, 1, 62), call(0, 3, 21)];
+        let field_plan = field::FieldPlan { ambient: vec![ambient(1, 95), ambient(2, 60)], links: vec![plan], ..field::FieldPlan::default() };
+        let mut rig = field_rig("a", field_plan, &[95, 60]);
+        rig.audio.live.as_mut().expect("on").field.set_links(vec![spot]);
+        let story = blob(13);
+        let at = |now: f64, x: f32, rejected: u64| FieldFrame { pos: Some(Pos::new(x, 10.0, 5.0)), rejected, ..frame("a", &story, now) };
+        follow(&mut rig, &at(0.0, -20.0, 0));
+        follow(&mut rig, &at(0.05, -20.0, 0));
+        assert_eq!(rig.audio.field_loops(), [(1, 95), (2, 60)]);
+        follow(&mut rig, &at(1.0, 110.0, 1));
+        assert_eq!(rig.audio.field_loops(), [(2, 60)], "the sound on channel 1 replaced channel 1's loop; channel 2's goes on");
+        assert!(field_lines(&rig).contains(&"field loop stop ch1 95 (a link sound replaces it)".to_string()), "{:?}", field_lines(&rig));
+        // and it does not come back by itself while the player stays in the field
+        follow(&mut rig, &at(2.0, 110.0, 1));
+        follow(&mut rig, &at(3.0, 110.0, 1));
+        assert_eq!(rig.audio.field_loops(), [(2, 60)]);
+    }
+
+    #[test]
+    fn what_cannot_be_judged_is_counted_and_said_and_a_plan_that_cannot_be_read_is_said_once() {
+        let plan = field::FieldPlan { ambient: vec![ambient(3, 38)], unjudged: 3, left_open: 1, ..field::FieldPlan::default() };
+        let mut rig = field_rig("a", plan, &[38]);
+        let story = blob(15);
+        follow(&mut rig, &frame("a", &story, 0.0));
+        follow(&mut rig, &frame("a", &story, 0.05));
+        assert!(
+            field_lines(&rig).iter().any(|l| l.contains("3 condition(s) not judged (skipped), 1 loop(s) left out (channel still open)")),
+            "{:?}",
+            field_lines(&rig)
+        );
+        // a field that cannot be read: one line, silence, and it is not asked for again for that story
+        let mut rig = Rig::new(&[], &[]);
+        rig.state.borrow_mut().broken = vec!["x".to_string()];
+        for step in 0..6 {
+            follow(&mut rig, &frame("x", &story, f64::from(step) * 0.05));
+        }
+        let cannot: Vec<String> = field_lines(&rig).into_iter().filter(|l| l.contains("cannot read its sounds")).collect();
+        assert_eq!(cannot, ["field x: cannot read its sounds (the field cannot be read); going on without them"]);
+        assert_eq!(field_asks(&rig).len(), 1);
+        assert!(rig.audio.field_loops().is_empty());
+    }
+
+    #[test]
+    fn an_id_without_a_clip_is_said_once_and_the_rest_of_the_field_still_plays() {
+        let mut rig = field_rig("a", plan_of(vec![ambient(3, 38), ambient(2, 60)]), &[38, 60]);
+        rig.state.borrow_mut().no_clip = vec![38];
+        let story = blob(15);
+        for step in 0..8 {
+            follow(&mut rig, &frame("a", &story, f64::from(step) * 0.05));
+        }
+        assert_eq!(rig.audio.field_loops(), [(2, 60)]);
+        let lines = rig.lines();
+        let about_38 = lines.iter().filter(|l| l.contains("38") && l.contains("clip") && !l.contains("sounds at moment")).collect::<Vec<_>>();
+        assert_eq!(about_38.len(), 1, "said once, however many frames follow: {lines:?}");
+        assert!(about_38[0].starts_with("no clip for field sound 38 (an empty slot)"), "{about_38:?}");
+    }
+
+    #[test]
+    fn a_loop_that_starts_after_a_wait_waits_for_its_time_in_the_field() {
+        let late = AmbientLoop { channel: 1, id: 95, pan: 64, at: 30 };
+        let mut rig = field_rig("a", plan_of(vec![late]), &[95]);
+        let story = blob(15);
+        follow(&mut rig, &frame("a", &story, 10.0));
+        follow(&mut rig, &frame("a", &story, 10.1));
+        assert!(rig.audio.field_loops().is_empty(), "a second after the field was entered: not yet");
+        follow(&mut rig, &frame("a", &story, 10.9));
+        assert!(rig.audio.field_loops().is_empty());
+        follow(&mut rig, &frame("a", &story, 11.05));
+        assert_eq!(rig.audio.field_loops(), [(1, 95)], "30 frames = a second after the entry");
+    }
+
+    #[test]
+    fn a_plan_names_the_ids_it_needs_and_a_run_that_heard_field_sounds_says_so_when_it_ends() {
+        let plan = field::FieldPlan {
+            ambient: vec![ambient(3, 38)],
+            links: vec![LinkPlan { line: (Pos::default(), Pos::default()), to: Pos::default(), needs_ok: true, calls: vec![call(0, 1, 21), call(30, 1, 0)] }],
+            flips: vec![FlipPlan { bank: 1, address: 225, bit: 0, on: true, calls: vec![call(0, 1, 42)] }],
+            exits: vec![ExitPlan { target: "x".to_string(), arrival: (0, 0), line: None, calls: vec![call(0, 2, 55)] }],
+            ..field::FieldPlan::default()
+        };
+        assert_eq!(plan.ids().into_iter().collect::<Vec<_>>(), [21, 38, 42, 55], "the stop (id 0) names no clip");
+        assert!(!plan.is_empty() && field::FieldPlan::default().is_empty());
+        let mut rig = field_rig("a", plan_of(vec![ambient(3, 38)]), &[38]);
+        let story = blob(15);
+        follow(&mut rig, &frame("a", &story, 0.0));
+        follow(&mut rig, &frame("a", &story, 0.05));
+        let lines = Arc::clone(&rig.lines);
+        drop(rig);
+        let said = lines.lock().expect("log").clone();
+        assert!(said.iter().any(|l| l == "field sounds played: 0 sounds (), 1 loops (38x1)"), "{said:?}");
+        // a run that heard none says nothing about them
+        let quiet = Rig::new(&[], &[]);
+        let lines = Arc::clone(&quiet.lines);
+        drop(quiet);
+        assert!(!lines.lock().expect("log").iter().any(|l| l.contains("field sounds played")));
     }
 }

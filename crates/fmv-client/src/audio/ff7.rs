@@ -12,32 +12,62 @@
 //! * **The menu sounds**: [`fmv_ff7::sound`] reads the four effects out of `audio.dat`.
 //! * **The sounds of a battle**: the clips of the sound ids a fight can need (its weapons, its enemies' attacks), read
 //!   the same way, by id, when the fight starts (see `crate::battle::sounds` for which ids and why).
+//! * **The sounds of a field**: what the field's own scripts play for the player's story ([`fmv_ff7::field_sound`]:
+//!   the ambient loops, the sounds of its ladders and jumps, the lift and the doors), and the clips that names, read by
+//!   id with the loop region `audio.fmt` gives them (a loop clip loops where the file says).
 
 use super::cues::Cue;
 use super::director::AreaMusic;
-use super::worker::{AnalyzeTask, SoundsRead, Tasks};
-use crate::ff7::{Ff7ResolveError, Ff7Source};
+use super::field::{AmbientLoop, ExitPlan, FieldPlan, FieldRead, FlipPlan, LinkPlan, PlannedCall};
+use super::worker::{AnalyzeTask, FieldTask, SoundsRead, Tasks};
+use crate::ff7::{resolve_flevel, Ff7ResolveError, Ff7Source};
 use fmv_audio::{decode_music_file, Logger, SfxClip};
+use fmv_ff7::field_sound::{self, Timed};
+use fmv_ff7::lgp::LgpArchive;
 use fmv_ff7::music::{field_music_of, FieldMusic, MusicList, MusicUse};
-use fmv_ff7::script::INIT_SCRIPT;
+use fmv_ff7::script::{FieldScript, Maplist, INIT_SCRIPT};
 use fmv_ff7::sound::{self, PcmClip, SfxBank, SoundError};
+use fmv_ff7::story::{StoryState, TRACKED_VARS};
 use fmv_ff7::Ff7Adapter;
 use fmv_library::ff7::{resolve_audio, ResolvedAudio};
-use std::sync::Arc;
+use std::collections::BTreeSet;
+use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 
 /// The tasks of the FF7 soundtrack over this machine's copy, or `None` (after one line saying why)
 /// when there is nothing to play.
 pub fn tasks(source: &Ff7Source, adapter: Arc<Ff7Adapter>, log: &Logger) -> Option<Tasks> {
-    tasks_from(resolve_audio(source), log, move |list| Arc::new(move |key| area_music(&adapter, &list, key)))
+    // The archive's name list (the doors' targets) is read when the first field is, on the worker's thread.
+    let flevel = resolve_flevel(source).ok().map(|found| found.path);
+    let for_music = Arc::clone(&adapter);
+    tasks_from(
+        resolve_audio(source),
+        log,
+        move |list| Arc::new(move |key| area_music(&for_music, &list, key)),
+        move |files| {
+            let maplist: OnceLock<Option<Maplist>> = OnceLock::new();
+            Arc::new(move |key, story, have| {
+                let maplist = maplist.get_or_init(|| flevel.as_ref().and_then(|path| read_maplist(path)));
+                read_field(&adapter, &files, maplist.as_ref(), key, story, have)
+            })
+        },
+    )
+}
+
+/// The archive's `maplist` (read-only), if it can be read.
+fn read_maplist(path: &PathBuf) -> Option<Maplist> {
+    let mut archive = LgpArchive::open_path(path).ok()?;
+    Maplist::from_archive(&mut archive).ok()
 }
 
 /// [`tasks`] over what [`resolve_audio`] said, with `analyze` building the task that reads a field's script
-/// from the track list (the one part that needs the adapter, so that everything else is testable without
-/// one).
+/// from the track list and `field` the one that reads what a field's scripts play from the sound files (the two
+/// parts that need the adapter, so that everything else is testable without one).
 fn tasks_from(
     resolved: Result<ResolvedAudio, Ff7ResolveError>,
     log: &Logger,
     analyze: impl FnOnce(Arc<MusicList>) -> AnalyzeTask,
+    field: impl FnOnce(Arc<ResolvedAudio>) -> FieldTask,
 ) -> Option<Tasks> {
     let files = match resolved {
         Ok(files) => files,
@@ -73,6 +103,7 @@ fn tasks_from(
     let list = Arc::new(list);
     Some(Tasks {
         analyze: analyze(Arc::clone(&list)),
+        field: field(Arc::clone(&files)),
         decode: {
             let files = Arc::clone(&files);
             Arc::new(move |name| {
@@ -127,14 +158,20 @@ fn sound_id(cue: Cue) -> u16 {
     }
 }
 
-/// A decoded effect as a mixer clip (`None` for more than two channels, which the game's files never have).
+/// A decoded effect as a mixer clip, with the loop region `audio.fmt` gives it (a clip that loops plays its intro and
+/// then that region over and over when it is played as a loop; as a one-shot it plays through once). `None` for more than
+/// two channels, which the game's files never have.
 fn clip_of(pcm: &PcmClip) -> Option<SfxClip> {
     let samples: Vec<f32> = pcm.samples.iter().map(|&s| f32::from(s) / 32_768.0).collect();
-    match pcm.channels {
+    let clip = match pcm.channels {
         1 => SfxClip::from_mono(pcm.rate, &samples),
         2 => SfxClip::from_stereo(pcm.rate, samples),
         _ => None,
-    }
+    }?;
+    Some(match pcm.loop_region {
+        Some(region) => clip.with_loop(region.start, region.end),
+        None => clip,
+    })
 }
 
 /// The four menu sounds out of `audio.dat` (only their bytes are read, not the whole 70 MB file).
@@ -176,6 +213,65 @@ fn load_sounds(files: &ResolvedAudio, ids: &[u16]) -> SoundsRead {
         }
     }
     read
+}
+
+/// `story` with every bit the story model tracks turned on (or off): the story a script sees right after it sets (or clears) a
+/// tracked bit, whatever else the story says.
+fn with_tracked_bits(story: &StoryState, on: bool) -> StoryState {
+    let mut state = story.clone();
+    for var in TRACKED_VARS {
+        for bit in (0..8u8).filter(|bit| 1u8.checked_shl(u32::from(*bit)).is_some_and(|mask| var.bits & mask != 0)) {
+            state.set_bit(var.bank, var.address, bit, on);
+        }
+    }
+    state
+}
+
+/// The calls of a run's events, as the plan keeps them.
+fn calls_of(events: &[Timed]) -> Vec<PlannedCall> {
+    events.iter().map(|e| PlannedCall { at: e.at, channel: e.call.channel, id: e.call.id, pan: e.call.pan }).collect()
+}
+
+/// What the scripts of the field `key` play for the progression `blob`, and the clips that names whose ids are not in `have`.
+/// Everything the plan says comes from the field's own scripts ([`fmv_ff7::field_sound`]); the clips are read by id out of
+/// `audio.dat` (only those). An error says why there is no plan (and so no sound): the progression is not one this
+/// adapter reads, the library has no sound files, the field cannot be read.
+fn read_field(adapter: &Ff7Adapter, files: &ResolvedAudio, maplist: Option<&Maplist>, key: &str, blob: &[u8], have: &[u16]) -> Result<FieldRead, String> {
+    let story = StoryState::decode(blob).ok_or_else(|| "the progression is not one this adapter reads".to_string())?;
+    let (Some(fmt), Some(dat)) = (&files.sfx_fmt, &files.sfx_dat) else { return Err("the library has no audio.fmt and audio.dat".to_string()) };
+    let bank = SfxBank::open(fmt, dat).map_err(|e| e.to_string())?;
+    let is_loop = |id: u16| bank.info_for_sound_id(id).is_some_and(|i| i.loop_region.is_some());
+    let area = adapter.load_field(key).map_err(|e| e.to_string())?;
+    let script = FieldScript::from_field(area.field_file()).map_err(|e| e.to_string())?;
+    // What the field plays by itself for this story.
+    let start = field_sound::start_up(&script, &story);
+    let ambient: Vec<AmbientLoop> = start.ambient(is_loop).into_iter().map(|a| AmbientLoop { channel: a.channel, id: a.id, pan: a.pan, at: a.at }).collect();
+    let mut unjudged = start.runs.iter().filter(|r| matches!(r.stop, field_sound::Stop::Unjudged { .. })).count();
+    let unjudged_in = |runs: &[field_sound::RunInfo]| runs.iter().filter(|r| matches!(r.stop, field_sound::Stop::Unjudged { .. })).count();
+    // What its ladders, jumps, lift and doors play (the lift's sounds are those that follow the story bit the lift sets or clears,
+    // judged for the story right after that).
+    let mut links = Vec::new();
+    for link in field_sound::link_events(&script, area.walkmesh(), &story) {
+        unjudged += unjudged_in(&link.runs);
+        links.push(LinkPlan { line: link.line, to: link.to, needs_ok: link.needs_ok, calls: calls_of(&link.events) });
+    }
+    let mut flips = Vec::new();
+    for on in [true, false] {
+        for flip in field_sound::flip_events(&script, &with_tracked_bits(&story, on)).into_iter().filter(|f| f.on == on) {
+            unjudged += unjudged_in(&flip.runs);
+            flips.push(FlipPlan { bank: flip.bank, address: flip.address, bit: flip.bit, on, calls: calls_of(&flip.events) });
+        }
+    }
+    let mut exits = Vec::new();
+    for exit in maplist.map(|m| field_sound::exit_events(&script, m, &story)).unwrap_or_default() {
+        unjudged += unjudged_in(&exit.runs);
+        exits.push(ExitPlan { target: exit.target, arrival: exit.arrival, line: exit.line, calls: calls_of(&exit.events) });
+    }
+    let plan = FieldPlan { key: key.to_string(), story: blob.to_vec(), ambient, links, flips, exits, unjudged, left_open: start.ambient_left_open(is_loop) };
+    // The clips the plan names, minus the ones the caller holds.
+    let wanted: Vec<u16> = plan.ids().into_iter().filter(|id| !have.contains(id)).collect::<BTreeSet<_>>().into_iter().collect();
+    let clips = load_sounds(files, &wanted);
+    Ok(FieldRead { plan, clips })
 }
 
 #[cfg(test)]
@@ -235,6 +331,35 @@ mod tests {
     }
 
     #[test]
+    fn a_clip_that_the_file_says_loops_keeps_its_loop_region_and_one_that_does_not_has_none() {
+        // (a loop region in frames, as `fmv_ff7::sound` gives it: the game's byte offsets divided by channels * 2)
+        let looping = PcmClip { rate: 44_100, channels: 1, samples: vec![0; 100], loop_region: Some(fmv_ff7::sound::LoopRegion { start: 20, end: 90 }) };
+        assert_eq!(clip_of(&looping).and_then(|c| c.loop_region()), Some((20, 90)));
+        let stereo = PcmClip { rate: 44_100, channels: 2, samples: vec![0; 200], loop_region: Some(fmv_ff7::sound::LoopRegion { start: 0, end: 100 }) };
+        assert_eq!(clip_of(&stereo).and_then(|c| c.loop_region()), Some((0, 100)));
+        let once = PcmClip { rate: 44_100, channels: 1, samples: vec![0; 100], loop_region: None };
+        assert_eq!(clip_of(&once).and_then(|c| c.loop_region()), None);
+    }
+
+    #[test]
+    fn the_story_a_script_sees_after_it_sets_or_clears_a_tracked_bit_has_every_tracked_bit_so() {
+        let before = StoryState::at(11);
+        let on = with_tracked_bits(&before, true);
+        assert_eq!((on.moment, on.known_bit(1, 225, 0)), (11, Some(true)), "the lift bit on, the moment as it was");
+        assert_eq!(with_tracked_bits(&on, false), before, "and off again is the story it was");
+        assert_eq!(before.known_bit(1, 225, 0), Some(false));
+    }
+
+    #[test]
+    fn the_calls_of_a_run_keep_their_frame_channel_id_and_pan() {
+        use fmv_ff7::field_sound::{Call, Source};
+        use fmv_ff7::script::ScriptRef;
+        let event = |at, channel, id, pan| Timed { at, call: Call { channel, id, pan, source: Source::Akao }, by: ScriptRef { entity: 0, slot: 0 }, offset: 0, run: 0 };
+        let calls = calls_of(&[event(0, 3, 38, 64), event(15, 1, 62, 0)]);
+        assert_eq!(calls, [PlannedCall { at: 0, channel: 3, id: 38, pan: 64 }, PlannedCall { at: 15, channel: 1, id: 62, pan: 0 }]);
+    }
+
+    #[test]
     fn every_cue_has_a_distinct_sound_id_except_confirm_which_is_the_cursors_click() {
         assert_eq!(sound_id(Cue::Cursor), 1);
         assert_eq!(sound_id(Cue::Confirm), sound_id(Cue::Cursor));
@@ -253,6 +378,10 @@ mod tests {
 
     fn no_script(_: Arc<MusicList>) -> AnalyzeTask {
         Arc::new(|_| AreaMusic::default())
+    }
+
+    fn no_field(_: Arc<ResolvedAudio>) -> FieldTask {
+        Arc::new(|key, _, _| Err(format!("no field {key}")))
     }
 
     /// A 16-bit mono PCM WAV file of `frames` frames (an invented one, no game data).
@@ -275,7 +404,7 @@ mod tests {
     #[test]
     fn a_library_without_sound_is_no_tasks_and_exactly_one_line() {
         let (log, seen) = lines();
-        assert!(tasks_from(Ok(ResolvedAudio::default()), &log, no_script).is_none());
+        assert!(tasks_from(Ok(ResolvedAudio::default()), &log, no_script, no_field).is_none());
         let seen = seen.lock().expect("log");
         assert_eq!(seen.len(), 1, "{seen:?}");
         assert!(seen[0].contains("no sound files") && seen[0].contains("FMV_FF7_REIMPORT=1"), "{}", seen[0]);
@@ -285,7 +414,7 @@ mod tests {
     fn a_library_that_cannot_be_read_is_no_tasks_and_exactly_one_line() {
         let (log, seen) = lines();
         let error = Ff7ResolveError::NoLibrary { dir: "/nowhere".into() };
-        assert!(tasks_from(Err(error), &log, no_script).is_none());
+        assert!(tasks_from(Err(error), &log, no_script, no_field).is_none());
         let seen = seen.lock().expect("log");
         assert_eq!(seen.len(), 1, "{seen:?}");
         assert!(seen[0].starts_with("cannot look for the sound files"), "{}", seen[0]);
@@ -297,8 +426,9 @@ mod tests {
         std::fs::write(dir.path().join("bat.wav"), wav(500)).expect("a track");
         let files = ResolvedAudio { music_wav: [("bat".to_string(), dir.path().join("bat.wav"))].into(), ..ResolvedAudio::default() };
         let (log, seen) = lines();
-        let tasks = tasks_from(Ok(files), &log, no_script).expect("a track is something to play");
+        let tasks = tasks_from(Ok(files), &log, no_script, no_field).expect("a track is something to play");
         assert_eq!((tasks.analyze)("md1stin"), AreaMusic::default());
+        assert_eq!((tasks.field)("md1stin", &[], &[]).err().as_deref(), Some("no field md1stin"), "the field task is the one that was given");
         // The track decodes through its file (a blob has no extension: the content says what it is).
         assert_eq!((tasks.decode)("bat").expect("bat decodes").frames(), 500);
         assert!((tasks.decode)("Bat").is_ok(), "names match without regard to case");
@@ -321,10 +451,15 @@ mod tests {
         let (log, seen) = lines();
         let names = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let kept = Arc::clone(&names);
-        let tasks = tasks_from(Ok(files), &log, move |list| {
-            *kept.lock().expect("names") = list.names().to_vec();
-            Arc::new(|_| AreaMusic::default())
-        })
+        let tasks = tasks_from(
+            Ok(files),
+            &log,
+            move |list| {
+                *kept.lock().expect("names") = list.names().to_vec();
+                Arc::new(|_| AreaMusic::default())
+            },
+            no_field,
+        )
         .expect("a list alone is something");
         assert_eq!(*names.lock().expect("names"), ["oa", "ob", "dun2"]);
         assert!((tasks.decode)("oa").is_err(), "a name in the list without a file is a missing track");

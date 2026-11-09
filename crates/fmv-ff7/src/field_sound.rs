@@ -32,8 +32,8 @@
 //! very file pair, decides it from that flag. The forum also says an effect "will loop if placed in a 'main' part of
 //! script, otherwise it will play once": that is consistent with it (a sound in a script that runs over and over
 //! plays over and over, and a loop clip repeats by itself), and this module uses the flag, which the data hold,
-//! not the placement. Measured: **every one of the 120 plays in an init part is a stop or a loop clip** (a field's
-//! init part sets up what stays on, never a one-shot), which is what an ambience is.
+//! not the placement. Measured: **every one of the 208 plays in an init part (183 `AKAO`, 25 `SOUND`) is a stop (136) or a
+//! loop clip (72)**: a field's init part sets up what stays on, never a one-shot, which is what an ambience is.
 //!
 //! # What a field plays by itself ([`start_up`])
 //!
@@ -49,6 +49,16 @@
 //!   sound opcode of that channel lies in the part of the script the run did not reach ([`RunInfo::open`]).
 //! * A one-shot in the start-up timeline (a cut-scene's sound in a director's main part) is **not played**: the
 //!   picture it goes with is not shown. It still replaces a loop on its channel.
+//!
+//! Measured over the 702 fields (the story at the moment 1, 15 and 27; `tests/field_sound_real.rs`): **48, 48 and 50
+//! fields have ambient loops (55, 55 and 57 loops)**; of the 21 000 runs about 17 120 return, 1 400 end at an idle loop,
+//! 7 leave the field, 2 182 (2 197 at 27) stop at a condition nothing here can judge (in 542 fields: the field's own
+//! temporary variables `Var[5][0]` and `Var[5][1]`, flags of bank 3 and 13 and 15, the party) and about 775 at an opcode with
+//! no known duration (the commonest: `CANM!2`, `MOVE`, `ANIM!2`, a `REQEW` of such a script, `FADEW`, `TURA`, `MESSAGE`); 10
+//! loops are left out because their channel stays open. In the reviewed fields (the first reactor mission): `nmkin_2` to
+//! `nmkin_5` hum (sound 38, channel 3, a 3.92 s clip that loops from 2.04 s) before the boss, `nmkin_2` to `nmkin_4`,
+//! `nrthmk`, `nmkin_1` and `elevtr1` sound the alarm (sound 60, channel 2, a stereo 1.02 s loop) at the moment 27 and
+//! `nmkin_5` is silent then; `md1stin`, `md1_1` and `md1_2` play nothing by themselves.
 //!
 //! # What a link plays ([`link_events`])
 //!
