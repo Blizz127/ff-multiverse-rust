@@ -92,7 +92,7 @@ async fn fight_with(
     };
     let setup = BattleSetup { formation_id, seed, party: party.clone(), preemptive, back_attack, battle_speed, ticks_per_second };
     let mut replay = BattleReplay::start(rules, &setup).expect("the client builds the battle from its own data");
-    let mine = ActorId(party.iter().position(|m| m.entity == j.entity).expect("we are in the party") as u8);
+    let mine = ActorId(party.iter().position(|m| m.entity() == Some(j.entity)).expect("we are in the party") as u8);
     let (mut pending, mut turn) = (false, 0u32);
     let (mut inventories, mut refused, mut applied) = (Vec::new(), Vec::new(), Vec::new());
     loop {

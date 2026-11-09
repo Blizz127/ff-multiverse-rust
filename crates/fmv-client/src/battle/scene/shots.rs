@@ -163,7 +163,7 @@ impl Server {
 }
 
 pub(super) fn member(i: u64, character: u8) -> BattleMember {
-    BattleMember { entity: EntityId(10 + i), account: if i == 0 { ME } else { AccountId(10 + i) }, name: format!("P{i}"), character, level: 12, weapon: None, armor: None, limit: 0 }
+    BattleMember::player(EntityId(10 + i), if i == 0 { ME } else { AccountId(10 + i) }, format!("P{i}"), character, 12, 0)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -582,16 +582,7 @@ fn offscreen_real_battle_names() {
     let Some(real) = open_real() else { return };
     let Some(mut gpu) = Offscreen::new() else { return };
 
-    let member = |entity: u64, account: AccountId, name: &str, character: u8| BattleMember {
-        entity: EntityId(entity),
-        account,
-        name: name.into(),
-        character,
-        level: 6,
-        weapon: None,
-        armor: None,
-        limit: 0,
-    };
+    let member = |entity: u64, account: AccountId, name: &str, character: u8| BattleMember::player(EntityId(entity), account, name, character, 6, 0);
     let party = vec![member(1, ME, "Blizz", 1), member(2, AccountId(2), "Wedge", 2)];
     let setup = BattleSetup { formation_id: 301, seed: 0xB11, party, preemptive: true, back_attack: false, battle_speed: 0, ticks_per_second: 1000 };
     let server = Server { id: BattleId(1), state: real.rules.build(&setup).expect("the formation builds") };

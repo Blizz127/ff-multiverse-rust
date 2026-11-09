@@ -94,8 +94,8 @@ use fmv_core::{AccountId, EntityId};
 use fmv_ff7_battle::rng::Rng;
 use fmv_ff7_battle::rules::{ActorId, BattleState, Command, CommandError, Outcome, MAX_STEP_MS};
 use fmv_protocol::{
-    assign_drops, clip_character_name, split_rewards, AppliedCommand, BattleId, BattleMember, BattleRejection, BattleReward, BattleRules,
-    BattleSetup, ServerMsg, MAX_BATTLE_PARTY,
+    assign_drops, clip_character_name, reward_roster, split_rewards, AppliedCommand, BattleId, BattleMember, BattleRejection, BattleReward,
+    BattleRules, BattleSetup, ServerMsg, MAX_BATTLE_PARTY,
 };
 
 use super::{is_full, Outbound, World};
@@ -162,11 +162,11 @@ impl Battle {
     }
 
     fn connected(&self) -> Vec<EntityId> {
-        self.members.iter().filter(|m| m.connected).map(|m| m.info.entity).collect()
+        self.members.iter().filter(|m| m.connected).filter_map(|m| m.info.entity()).collect()
     }
 
     fn actor_of(&self, entity: EntityId) -> Option<ActorId> {
-        let i = self.members.iter().position(|m| m.info.entity == entity)?;
+        let i = self.members.iter().position(|m| m.info.entity() == Some(entity))?;
         u8::try_from(i).ok().map(ActorId)
     }
 }
@@ -372,7 +372,7 @@ impl World {
                 // The roster carries the PLAYER'S OWN name (v8): every peer's panel, list and banners show it, while
                 // `character` (the combat slot) alone decides which combat template the engine uses.
                 let name = clip_character_name(&p.snapshot.avatar.display_name);
-                Some(BattleMember { entity, account: p.account, name, character: own.character, level, weapon: None, armor: None, limit })
+                Some(BattleMember::player(entity, p.account, name, own.character, level, limit))
             })
             .collect();
 
@@ -480,7 +480,7 @@ impl World {
                 return refused(Some(battle_id), BattleRejection::OutOfItems);
             }
         }
-        let who = battle.members.get(usize::from(actor.0)).map(|m| (m.info.account, m.info.character));
+        let who = battle.members.get(usize::from(actor.0)).and_then(|m| Some((m.info.account()?, m.info.character)));
         // The player's own name, for the log lines below (`name=`, last: the lines are read by key).
         let name = battle.members.get(usize::from(actor.0)).map(|m| log_token(&m.info.name)).unwrap_or_default();
         // A limit says which one it is, before it empties the gauge (for the log).
@@ -604,12 +604,8 @@ impl World {
         let Some(outcome) = bw.battles.get(&id).and_then(|b| b.state.outcome()) else { return };
         let rules = Arc::clone(&bw.settings.rules);
         let Some(battle) = bw.battles.remove(&id) else { return };
-        let roster: Vec<(fmv_core::AccountId, bool)> = battle
-            .members
-            .iter()
-            .enumerate()
-            .map(|(i, m)| (m.info.account, u8::try_from(i).ok().and_then(|i| battle.state.actor(ActorId(i))).is_some_and(|c| c.is_alive())))
-            .collect();
+        // The same players-only roster every peer's replay splits the rewards over (`reward_roster`).
+        let roster = reward_roster(battle.members.iter().map(|m| &m.info), &battle.state);
         let mut rewards = if outcome == Outcome::Victory { split_rewards(battle.state.rewards(), &roster) } else { Vec::new() };
         if outcome == Outcome::Victory {
             // The drops are rolled now, after the outcome, from the battle's seed on a stream of its own: they
@@ -638,8 +634,8 @@ impl World {
         let recipients = battle.connected();
         // Back in the field: free everyone first, and mark them changed so the next `EntityUpdate`
         // says where they stand.
-        for m in &battle.members {
-            if let Some(p) = self.players.get_mut(&m.info.entity) {
+        for entity in battle.members.iter().filter_map(|m| m.info.entity()) {
+            if let Some(p) = self.players.get_mut(&entity) {
                 if p.battle == Some(id) {
                     p.battle = None;
                     p.dirty = true;
@@ -669,11 +665,16 @@ impl World {
             return;
         }
         for (i, member) in battle.members.iter().enumerate() {
-            let Some(end) = u8::try_from(i).ok().map(|i| battle.state.limit_gauge(ActorId(i))) else { continue };
+            let Some(actor) = u8::try_from(i).ok().map(ActorId) else { continue };
+            // Only a member the engine gave a limit break has a gauge of its own to keep: a player has none (protocol
+            // v9), so the gauge its account holds is left exactly as it is and is never overwritten by the 0 the
+            // engine reports for a character without one.
+            let Some(account) = member.info.account().filter(|_| battle.state.limit_for(actor).is_some()) else { continue };
+            let end = battle.state.limit_gauge(actor);
             if end == member.info.limit {
                 continue;
             }
-            let (account, character) = (member.info.account, member.info.character);
+            let character = member.info.character;
             let queued = self.saver.as_ref().map(|saver| saver.save(SaveJob::limit(account, character, end)));
             let online = self.by_account.get(&account).copied();
             let mirrored = online.and_then(|entity| self.players.get_mut(&entity)).and_then(|p| p.progress.as_mut()).map(|own| own.limit = end).is_some();
@@ -701,7 +702,7 @@ impl World {
         let mut told = Vec::new();
         let Some(rules) = self.battle.as_ref().map(|bw| Arc::clone(&bw.settings.rules)) else { return told };
         for r in rewards {
-            let Some(member) = members.iter().find(|m| m.info.account == r.account) else { continue };
+            let Some(member) = members.iter().find(|m| m.info.account() == Some(r.account)) else { continue };
             let connected = member.connected;
             if r.is_nothing() {
                 let online = self.by_account.get(&r.account).copied();
@@ -787,7 +788,7 @@ impl World {
         let Some(bw) = self.battle.as_mut() else { return };
         let Some(battle) = bw.battles.get_mut(&id) else { return };
         for m in &mut battle.members {
-            if m.info.entity == entity {
+            if m.info.entity() == Some(entity) {
                 m.connected = false;
             }
         }
@@ -902,6 +903,13 @@ mod tests {
             fixed_seed: Some(7),
             ..BattleSettings::new(Arc::new(rules))
         }
+    }
+
+    /// The synthetic rules with a limit break for the PLAYERS' fighters too: the real rules give them none (protocol v9,
+    /// `fmv_protocol::PLAYER_LIMIT_BREAKS`), and these tests are about what the server does with a limit gauge, a
+    /// command and an end-of-battle save, which no real player reaches while that stays so.
+    fn player_limit_rules() -> SyntheticRules {
+        SyntheticRules { player_limits: true, ..SyntheticRules::default() }
     }
 
     fn world_with(settings: Option<BattleSettings>, debug: bool) -> World {
@@ -1055,7 +1063,7 @@ mod tests {
                 }
                 if let Some(replay) = &replays[i] {
                     let state = replay.state();
-                    let mine = ActorId(replay.party().iter().position(|m| m.entity == seat.entity).unwrap() as u8);
+                    let mine = ActorId(replay.party().iter().position(|m| m.entity() == Some(seat.entity)).unwrap() as u8);
                     if state.outcome().is_none() && state.ready_actors().contains(&mine) {
                         let command = policy(state, mine);
                         let id = seat_battle_id(&seat.log);
@@ -1121,7 +1129,7 @@ mod tests {
             [ServerMsg::EncounterStart { battle_id, formation_id, seed, party, preemptive, back_attack, battle_speed, ticks_per_second, data_fingerprint }] => {
                 assert_eq!((*battle_id, *formation_id, *seed), (BattleId(1), 1, 7), "the fixed seed of the settings");
                 assert_eq!(party.len(), 1);
-                assert_eq!((party[0].entity, party[0].account, party[0].character, party[0].level), (a.entity, a.account, 0, 5));
+                assert_eq!((party[0].entity(), party[0].account(), party[0].character, party[0].level), (Some(a.entity), Some(a.account), 0, 5));
                 assert_eq!((party[0].weapon, party[0].armor), (None, None));
                 assert!(!preemptive && !back_attack);
                 assert_eq!((*battle_speed, *ticks_per_second), (0, 1000));
@@ -1177,8 +1185,8 @@ mod tests {
         match &ma[..] {
             [ServerMsg::EncounterStart { formation_id, party, .. }] => {
                 assert_eq!(*formation_id, 0, "no formation named: the rules' default");
-                let who: Vec<(EntityId, u8)> = party.iter().map(|m| (m.entity, m.character)).collect();
-                assert_eq!(who, vec![(a.entity, 0), (b.entity, 1)], "ascending entity ids; each fights as its own account's character");
+                let who: Vec<(Option<EntityId>, u8)> = party.iter().map(|m| (m.entity(), m.character)).collect();
+                assert_eq!(who, vec![(Some(a.entity), 0), (Some(b.entity), 1)], "ascending entity ids; each fights as its own account's character");
             }
             other => panic!("{other:?}"),
         }
@@ -1546,7 +1554,7 @@ mod tests {
         let members: Vec<Member> = [(&a, 0u8), (&b, 1u8)]
             .iter()
             .map(|(seat, character)| Member {
-                info: BattleMember { entity: seat.entity, account: seat.account, name: String::from("Tester"), character: *character, level: 5, weapon: None, armor: None, limit: 0 },
+                info: BattleMember::player(seat.entity, seat.account, "Tester", *character, 5, 0),
                 connected: true,
             })
             .collect();
@@ -1629,8 +1637,8 @@ mod tests {
         assert_eq!(start, b.battle_msgs());
         match &start[..] {
             [ServerMsg::EncounterStart { party, .. }] => {
-                let who: Vec<(EntityId, u8, u8)> = party.iter().map(|m| (m.entity, m.character, m.level)).collect();
-                assert_eq!(who, vec![(a.entity, 0, 12), (b.entity, 2, 5)]);
+                let who: Vec<(Option<EntityId>, u8, u8)> = party.iter().map(|m| (m.entity(), m.character, m.level)).collect();
+                assert_eq!(who, vec![(Some(a.entity), 0, 12), (Some(b.entity), 2, 5)]);
             }
             other => panic!("{other:?}"),
         }
@@ -1811,7 +1819,7 @@ mod tests {
 
     #[test]
     fn a_member_starts_with_its_accounts_gauge_uses_its_limit_and_the_end_gauge_is_kept() {
-        let rules = SyntheticRules::default();
+        let rules = player_limit_rules();
         let t0 = Instant::now();
         let (mut w, mut rx) = world_with_saver(settings(rules));
         let stored = Progress { character: 0, level: 5, exp: 40, ap: 0, gil: 0, limit: 255 };
@@ -1873,7 +1881,7 @@ mod tests {
     /// it is not the account's own). The accounts keep what they really have.
     #[test]
     fn debug_limit_full_only_changes_the_gauge_a_battle_starts_with_and_never_stores_a_gauge() {
-        let rules = SyntheticRules::default();
+        let rules = player_limit_rules();
         let t0 = Instant::now();
         let mut s = settings(rules);
         s.debug_limit_full = true;
@@ -1930,7 +1938,7 @@ mod tests {
     /// `limit used` and `escape tried`); a command that is refused is not.
     #[test]
     fn magic_defend_and_item_are_logged_as_they_are_applied_and_a_refused_command_is_not() {
-        let rules = SyntheticRules::default();
+        let rules = player_limit_rules();
         let t0 = Instant::now();
         let mut w = world_with(Some(settings(rules)), true);
         let mut a = seat(&mut w, "A", t0);
@@ -1964,7 +1972,7 @@ mod tests {
 
     #[test]
     fn a_gauge_that_did_not_move_is_not_saved_and_a_stored_one_above_the_cap_is_brought_inside() {
-        let rules = SyntheticRules::default();
+        let rules = player_limit_rules();
         let t0 = Instant::now();
         let (mut w, mut rx) = world_with_saver(settings(rules));
         // A hostile or hand-edited record: the join brings it inside the cap, and so does the battle.
@@ -1984,9 +1992,51 @@ mod tests {
         assert!(!logs_of(&mut w).iter().any(|l| l.starts_with("limit kept")));
     }
 
+    /// Players have no limit break (protocol v9), so the engine reports an empty gauge for them whatever the account
+    /// holds: the server must never write that 0 over a stored gauge ("a number moved"). Played to the end under the
+    /// real rule (the synthetic default), through a win and an escape, the stored gauge, level, experience and the
+    /// character's slot are exactly what they were, no limit is queued for the saver and nothing says it kept one.
+    #[test]
+    fn a_players_stored_gauge_is_never_overwritten_by_the_empty_one_a_limitless_character_has() {
+        let rules = SyntheticRules::default();
+        let t0 = Instant::now();
+        let (mut w, mut rx) = world_with_saver(settings(rules));
+        // A v8-written record: level 5, 40 experience (the synthetic start), a gauge of 120.
+        let stored = Progress { character: 2, level: 5, exp: 40, ap: 0, gil: 0, limit: 120 };
+        let mut a = seat_as(&mut w, "A", t0, ProgressSeed::of(2, Some(stored)));
+        assert_eq!(mirrored_limit(&w, &a), 120);
+        // Formation 3 is the preemptive one (a sure escape): the first battle is an escape at once.
+        assert_eq!(w.request_encounter(a.entity, Some(3), t0), BattleReply::Done);
+        match &a.battle_msgs()[..] {
+            [ServerMsg::EncounterStart { party, .. }] => {
+                assert_eq!((party[0].character, party[0].level), (2, 5));
+                assert_eq!(party[0].limit, 120, "the account's gauge is what the roster carries; the engine ignores it");
+            }
+            other => panic!("{other:?}"),
+        }
+        let id = seat_battle_id(&a.log);
+        assert!(w.battle.as_ref().unwrap().battles.get(&id).unwrap().state.limit_for(ActorId(0)).is_none(), "a player has no limit break");
+        assert_eq!(w.battle_command(a.entity, id, ActorId(0), Command::Limit { target: ActorId(1) }, t0), refused(Some(id), BattleRejection::NoLimit));
+        assert_eq!(w.battle_command(a.entity, id, ActorId(0), Command::Escape, t0), BattleReply::Done);
+        assert_eq!(w.battle_count(), 0);
+        // A second battle, a win this time (the synthetic two-dummy formation pays experience).
+        let later = ms(t0, 700_000);
+        assert_eq!(w.request_encounter(a.entity, Some(1), later), BattleReply::Done);
+        play_out(&mut w, &mut [&mut a], &rules, later);
+        let jobs = saved_all(&mut rx);
+        assert!(limits_of(&jobs).is_empty(), "no limit gauge is queued for a character that has none: {jobs:?}");
+        assert!(jobs.iter().any(|j| j.paid().is_some()), "the win itself was paid and saved");
+        assert_eq!(mirrored_limit(&w, &a), 120, "the mirror keeps the gauge too");
+        let progress = w.players.get(&a.entity).and_then(|p| p.progress).expect("a mirror");
+        assert_eq!(progress.character, 2, "the slot did not move");
+        assert!(progress.exp > 40, "the win was paid on top of what the account had");
+        let logs = logs_of(&mut w);
+        assert!(!logs.iter().any(|l| l.starts_with("limit kept") || l.starts_with("limit used")), "{logs:?}");
+    }
+
     #[test]
     fn an_escape_ends_the_battle_for_the_whole_party_pays_nothing_and_keeps_the_gauges_the_blows_filled() {
-        let rules = SyntheticRules::default();
+        let rules = player_limit_rules();
         let t0 = Instant::now();
         let (mut w, mut rx) = world_with_saver(settings(rules));
         let (mut a, mut b) = party_of_two(&mut w, t0);
@@ -2034,7 +2084,7 @@ mod tests {
 
     #[test]
     fn a_limit_or_an_escape_the_engine_refuses_is_refused_with_its_own_reason_and_changes_nothing() {
-        let rules = SyntheticRules::default();
+        let rules = player_limit_rules();
         let t0 = Instant::now();
         let (mut w, mut rx) = world_with_saver(settings(rules));
         // Formation 2 (the overwhelming enemy) cannot be run from; the stored gauge is half full.
@@ -2070,7 +2120,7 @@ mod tests {
 
     #[test]
     fn a_healing_limit_aims_at_the_party_and_a_damaging_one_at_the_enemies() {
-        let rules = SyntheticRules::default();
+        let rules = player_limit_rules();
         let t0 = Instant::now();
         let (mut w, _rx) = world_with_saver(settings(rules));
         // Character 3 (Aerith) heals; Cloud strikes. Both start with a full gauge in a preemptive battle.
@@ -2093,7 +2143,7 @@ mod tests {
 
     #[test]
     fn a_defeat_pays_nothing_and_changes_nothing() {
-        let rules = SyntheticRules::default();
+        let rules = player_limit_rules();
         let t0 = Instant::now();
         let (mut w, mut rx) = world_with_saver(settings(rules));
         let (mut a, mut b) = party_of_two(&mut w, t0);
@@ -2110,7 +2160,7 @@ mod tests {
     /// the only thing that can reach an offline account) but nobody is told.
     #[test]
     fn a_member_who_left_is_paid_in_the_store_and_told_nothing() {
-        let rules = SyntheticRules::default();
+        let rules = player_limit_rules();
         let t0 = Instant::now();
         let (mut w, mut rx) = world_with_saver(settings(rules));
         let (mut a, b) = party_of_two(&mut w, t0);
@@ -2138,7 +2188,7 @@ mod tests {
         let members: Vec<Member> = [(&a, 0u8), (&b, 1u8)]
             .iter()
             .map(|(seat, character)| Member {
-                info: BattleMember { entity: seat.entity, account: seat.account, name: String::from("Tester"), character: *character, level: 5, weapon: None, armor: None, limit: 0 },
+                info: BattleMember::player(seat.entity, seat.account, "Tester", *character, 5, 0),
                 connected: true,
             })
             .collect();

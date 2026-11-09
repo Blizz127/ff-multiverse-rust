@@ -48,15 +48,15 @@ fn simulate(data: &Ff7BattleData, formation: u16, characters: &[u8], level: Opti
     let party = characters
         .iter()
         .enumerate()
-        .map(|(i, &character)| fmv_protocol::BattleMember {
-            entity: fmv_core::EntityId(i as u64 + 1),
-            account: fmv_core::AccountId(i as u64 + 1),
-            name: format!("P{i}"),
-            character,
-            level: level.unwrap_or_else(|| data.starting_level(character)),
-            weapon: None,
-            armor: None,
-            limit: 0,
+        .map(|(i, &character)| {
+            fmv_protocol::BattleMember::player(
+                fmv_core::EntityId(i as u64 + 1),
+                fmv_core::AccountId(i as u64 + 1),
+                format!("P{i}"),
+                character,
+                level.unwrap_or_else(|| data.starting_level(character)),
+                0,
+            )
         })
         .collect();
     let info = data.formation(formation).expect("a real formation");
@@ -202,16 +202,14 @@ fn the_default_debug_formation_exists_and_every_formation_builds_for_every_chara
             let setup = BattleSetup {
                 formation_id: id,
                 seed: 1,
-                party: vec![fmv_protocol::BattleMember {
-                    entity: fmv_core::EntityId(1),
-                    account: fmv_core::AccountId(1),
-                    name: "Solo".into(),
+                party: vec![fmv_protocol::BattleMember::player(
+                    fmv_core::EntityId(1),
+                    fmv_core::AccountId(1),
+                    "Solo",
                     character,
-                    level: data.starting_level(character),
-                    weapon: None,
-                    armor: None,
-                    limit: 0,
-                }],
+                    data.starting_level(character),
+                    0,
+                )],
                 preemptive: info.preemptive,
                 back_attack: info.back_attack,
                 battle_speed: 128,

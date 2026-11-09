@@ -40,3 +40,7 @@ tempfile.workspace = true
 socket2 = { version = "0.6", features = ["all"] }
 
 
+
+[dev-dependencies]
+# The save-compatibility test writes a record in the exact shape an older server stored it.
+serde_json.workspace = true

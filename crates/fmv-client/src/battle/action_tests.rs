@@ -170,16 +170,7 @@ impl Sim {
         let party = accounts
             .iter()
             .enumerate()
-            .map(|(i, &account)| BattleMember {
-                entity: EntityId(100 + i as u64),
-                account,
-                name: format!("P{i}"),
-                character: i as u8,
-                level: 6,
-                weapon: None,
-                armor: None,
-                limit: limits.get(i).copied().unwrap_or(0),
-            })
+            .map(|(i, &account)| BattleMember::player(EntityId(100 + i as u64), account, format!("P{i}"), i as u8, 6, limits.get(i).copied().unwrap_or(0)))
             .collect();
         let setup = BattleSetup { formation_id: formation, seed: 7, party, preemptive, back_attack: false, battle_speed: 0, ticks_per_second: 1000 };
         let state = rules.build(&setup).expect("a battle");
@@ -229,8 +220,7 @@ impl Sim {
     /// The end of the won battle: the split rewards, and `drops` for our account (the first member).
     fn end(&self, drops: &[InventoryEntry]) -> ServerMsg {
         let outcome = self.state.outcome().expect("over");
-        let roster: Vec<(AccountId, bool)> =
-            self.setup.party.iter().enumerate().map(|(i, m)| (m.account, self.state.actor(ActorId(i as u8)).is_some_and(Combatant::is_alive))).collect();
+        let roster = fmv_protocol::reward_roster(&self.setup.party, &self.state);
         let mut rewards = if outcome == Outcome::Victory { split_rewards(self.state.rewards(), &roster) } else { vec![] };
         if let Some(ours) = rewards.first_mut() {
             ours.items = drops.to_vec();

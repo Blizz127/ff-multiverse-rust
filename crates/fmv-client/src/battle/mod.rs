@@ -634,7 +634,7 @@ impl BattleClient {
         let my_actor = setup
             .party
             .iter()
-            .position(|m| m.account == self.me)
+            .position(|m| m.account() == Some(self.me))
             .and_then(|i| u8::try_from(i).ok())
             .map(ActorId);
         self.hud.begin(setup.formation_id, my_actor);

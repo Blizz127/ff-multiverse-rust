@@ -22,7 +22,7 @@ fn kit() -> ModelKit {
 }
 
 fn member(i: u64, character: u8) -> BattleMember {
-    BattleMember { entity: EntityId(1 + i), account: AccountId(1 + i), name: format!("P{i}"), character, level: 5, weapon: None, armor: None, limit: 0 }
+    BattleMember::player(EntityId(1 + i), AccountId(1 + i), format!("P{i}"), character, 5, 0)
 }
 
 fn setup_for(formation: u16, party: usize) -> BattleSetup {
@@ -37,9 +37,15 @@ fn setup_for(formation: u16, party: usize) -> BattleSetup {
     }
 }
 
+/// The synthetic rules with a limit break for the players' fighters too (the real rules give them none, protocol v9):
+/// the scene's look of a limit is read from the performer's own engine record.
+fn limit_rules() -> SyntheticRules {
+    SyntheticRules { player_limits: true, ..SyntheticRules::default() }
+}
+
 /// The engine of `formation` (1: two dummies) for `party` members.
 fn engine(formation: u16, party: usize) -> BattleState {
-    SyntheticRules::default().build(&setup_for(formation, party)).unwrap()
+    limit_rules().build(&setup_for(formation, party)).unwrap()
 }
 
 /// A formation of two enemies seen from a camera on the positive-x side (made-up numbers).
@@ -433,7 +439,7 @@ fn command_of_the_first_hero(limit: u16, command: impl Fn(&BattleState) -> Comma
     let mut setup = setup_for(3, 2);
     setup.preemptive = true;
     setup.party[0].limit = limit;
-    let before = SyntheticRules::default().build(&setup).unwrap();
+    let before = limit_rules().build(&setup).unwrap();
     let mut engine = before.clone();
     let mut events = engine.step_ticks(1);
     let command = command(&engine);
