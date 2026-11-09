@@ -15,6 +15,13 @@
 //! then the lowest actor id); a reviving spell or item (Life, Phoenix Down) goes to the first fallen member,
 //! and is skipped when nobody has fallen.
 //!
+//! **Whole sides** (protocol v10): `magic:<id>:all` and `item:<id>:all` aim the spell or the item at the whole
+//! side instead (every enemy for an offensive one, the whole party for a healing one: `magic:0:all` is Cure on
+//! the party, `magic:27:all` Fire on every enemy), which costs the caster one use of its All materia for a spell
+//! of the Cure and Fire kind (and is skipped like any other refused entry when it has none left, or when the
+//! spell can only hit one target). What can only hit a whole side needs no `:all`: `item:6` is Megalixir on the
+//! party, `magic:52` Ultima on every enemy, and `limit` is Healing Wind on the party for Aerith.
+//!
 //! # How an entry is used
 //!
 //! * One entry per full gauge, in order, before the bot's normal rule takes over for good. The script goes on
@@ -33,7 +40,7 @@
 //!   `headless: battle script:` line, next to how many were applied, skipped, refused by the server and lost.
 
 use super::{BattleClient, BattleCmd};
-use fmv_ff7_battle::rules::{BattleState, CommandError, Combatant};
+use fmv_ff7_battle::rules::{Aim, BattleState, CommandError, Combatant, Target};
 use fmv_protocol::battle::Command;
 use fmv_protocol::ActorId;
 use std::fmt;
@@ -48,14 +55,19 @@ pub enum ScriptStep {
     Escape,
     /// The character's limit break (its gauge must be full).
     Limit,
-    /// A spell by the game's own id.
+    /// A spell by the game's own id, on one target (a spell that only hits a whole side hits it).
     Magic(u16),
-    /// An item by the game's own id (the account must carry one).
+    /// A spell on the whole side (`magic:<id>:all`).
+    MagicAll(u16),
+    /// An item by the game's own id (the account must carry one), on one target (an item that only hits a whole
+    /// side hits it).
     Item(u16),
+    /// An item on the whole side (`item:<id>:all`).
+    ItemAll(u16),
 }
 
 /// What a script is made of, for messages.
-pub const SYNTAX: &str = "attack, defend, escape, limit, magic:<spell id> or item:<item id>";
+pub const SYNTAX: &str = "attack, defend, escape, limit, magic:<spell id>[:all] or item:<item id>[:all]";
 
 /// Text from the command line made safe to put into a message.
 fn shown(s: &str) -> String {
@@ -67,10 +79,20 @@ impl FromStr for ScriptStep {
 
     fn from_str(s: &str) -> Result<Self, String> {
         let word = s.trim().to_ascii_lowercase();
-        let (name, id) = match word.split_once(':') {
-            Some((name, id)) => (name.trim(), Some(id.trim())),
+        let (name, rest) = match word.split_once(':') {
+            Some((name, rest)) => (name.trim(), Some(rest.trim())),
             None => (word.as_str(), None),
         };
+        // `<id>` or `<id>:all` (only a spell and an item have the second form).
+        let (id, all) = match rest.and_then(|rest| rest.split_once(':')) {
+            Some((id, flag)) if matches!(name, "magic" | "item") => (Some(id.trim()), Some(flag.trim())),
+            _ => (rest, None),
+        };
+        if let Some(flag) = all {
+            if flag != "all" {
+                return Err(format!("`{}`: after the id only `:all` can follow, not `{}`", shown(s), shown(flag)));
+            }
+        }
         let id_of = || -> Result<u16, String> {
             match id {
                 None | Some("") => Err(format!("`{}` needs an id: {name}:<id>", shown(s))),
@@ -81,6 +103,8 @@ impl FromStr for ScriptStep {
             }
         };
         match name {
+            "magic" if all.is_some() => id_of().map(ScriptStep::MagicAll),
+            "item" if all.is_some() => id_of().map(ScriptStep::ItemAll),
             "magic" => id_of().map(ScriptStep::Magic),
             "item" => id_of().map(ScriptStep::Item),
             "attack" | "defend" | "escape" | "limit" if id.is_some() => Err(format!("`{}`: {name} takes no id", shown(s))),
@@ -102,7 +126,9 @@ impl fmt::Display for ScriptStep {
             ScriptStep::Escape => f.write_str("escape"),
             ScriptStep::Limit => f.write_str("limit"),
             ScriptStep::Magic(id) => write!(f, "magic:{id}"),
+            ScriptStep::MagicAll(id) => write!(f, "magic:{id}:all"),
             ScriptStep::Item(id) => write!(f, "item:{id}"),
+            ScriptStep::ItemAll(id) => write!(f, "item:{id}:all"),
         }
     }
 }
@@ -139,6 +165,15 @@ fn first_fallen_ally(state: &BattleState) -> Option<ActorId> {
     state.party_ids().into_iter().find(|id| state.actor(*id).is_some_and(|c| !c.is_alive()))
 }
 
+/// The whole side an action aims at: the party for a restoring one, every enemy for a damaging one.
+fn side_of(allies: bool) -> Target {
+    if allies {
+        Target::AllAllies
+    } else {
+        Target::AllEnemies
+    }
+}
+
 /// What the engine's refusal says, in this script's words.
 fn refusal_text(error: CommandError) -> String {
     match error {
@@ -148,6 +183,9 @@ fn refusal_text(error: CommandError) -> String {
         CommandError::NoLimit(_) => "this character has no limit break".to_string(),
         CommandError::LimitNotReady(_) => "the limit gauge is not full".to_string(),
         CommandError::CannotEscape => "this battle cannot be escaped".to_string(),
+        CommandError::InvalidReach(_) => "it cannot be aimed that way (one target, or a whole side)".to_string(),
+        CommandError::NoAllLeft(_) => "no All materia use is left this battle".to_string(),
+        CommandError::NoTargets(_) => "there is nobody to aim at".to_string(),
         CommandError::InvalidTarget(_) | CommandError::UnknownTarget(_) | CommandError::TargetDead(_) | CommandError::TargetNotDead(_) => {
             "there is no valid target".to_string()
         }
@@ -184,29 +222,40 @@ impl BattleClient {
             ScriptStep::Escape => Ok(Command::Escape),
             ScriptStep::Limit => {
                 let info = state.limit_for(mine).ok_or_else(|| "this character has no limit break".to_string())?;
-                Ok(Command::Limit { target: if info.targets_allies { hurt()? } else { enemy()? } })
+                let target = match (info.aim, info.targets_allies) {
+                    // Healing Wind: the whole party, and nothing smaller.
+                    (Aim::Side, allies) => side_of(allies),
+                    (_, true) => Target::One(hurt()?),
+                    (_, false) => Target::One(enemy()?),
+                };
+                Ok(Command::Limit { target })
             }
-            ScriptStep::Magic(spell) => {
+            ScriptStep::Magic(spell) | ScriptStep::MagicAll(spell) => {
                 let known = state
                     .actor(mine)
                     .and_then(|me| me.spells.iter().find(|s| s.index == spell))
                     .ok_or_else(|| format!("this character does not know spell {spell}"))?;
+                // What can only hit a whole side hits it; the rest does only when `:all` says so.
+                let whole = matches!(step, ScriptStep::MagicAll(_)) || known.spec.aim == Aim::Side;
                 let target = match (known.spec.heals(), known.spec.hits_dead) {
-                    (true, true) => fallen()?,
-                    (true, false) => hurt()?,
-                    (false, _) => enemy()?,
+                    _ if whole => side_of(known.spec.heals()),
+                    (true, true) => Target::One(fallen()?),
+                    (true, false) => Target::One(hurt()?),
+                    (false, _) => Target::One(enemy()?),
                 };
                 Ok(Command::Magic { spell, target })
             }
-            ScriptStep::Item(item) => {
+            ScriptStep::Item(item) | ScriptStep::ItemAll(item) => {
                 let info = state.item_info(item).ok_or_else(|| format!("item {item} cannot be used in battle"))?;
                 if !self.inventory.iter().any(|stack| stack.item == item && stack.count > 0) {
                     return Err(format!("none of item {item} is left"));
                 }
+                let whole = matches!(step, ScriptStep::ItemAll(_)) || info.aim == Aim::Side;
                 let target = match (info.revives, info.targets_allies) {
-                    (true, _) => fallen()?,
-                    (false, true) => hurt()?,
-                    (false, false) => enemy()?,
+                    _ if whole => side_of(info.targets_allies),
+                    (true, _) => Target::One(fallen()?),
+                    (false, true) => Target::One(hurt()?),
+                    (false, false) => Target::One(enemy()?),
                 };
                 Ok(Command::Item { item, target })
             }
@@ -343,9 +392,12 @@ impl BattleScript {
                         });
                     }
                     let aim = match cmd {
-                        BattleCmd::Command { command: Command::Attack { target } | Command::Magic { target, .. } | Command::Item { target, .. } | Command::Limit { target }, .. } => {
-                            format!(", aimed at actor {}", target.0)
-                        }
+                        BattleCmd::Command { command: Command::Attack { target }, .. } => format!(", aimed at actor {}", target.0),
+                        BattleCmd::Command { command: Command::Magic { target, .. } | Command::Item { target, .. } | Command::Limit { target }, .. } => match target {
+                            Target::One(target) => format!(", aimed at actor {}", target.0),
+                            Target::AllEnemies => ", aimed at every enemy".to_string(),
+                            Target::AllAllies => ", aimed at the whole party".to_string(),
+                        },
                         _ => String::new(),
                     };
                     self.notes.push(format!("{}: {}{aim}", self.describe(self.next), if resent { "sent again (no answer yet)" } else { "sent" }));
@@ -375,8 +427,10 @@ mod tests {
             ("limit", ScriptStep::Limit),
             ("magic:0", ScriptStep::Magic(0)),
             ("magic:27", ScriptStep::Magic(27)),
+            ("magic:0:all", ScriptStep::MagicAll(0)),
             ("item:0", ScriptStep::Item(0)),
             ("item:65535", ScriptStep::Item(65535)),
+            ("item:6:all", ScriptStep::ItemAll(6)),
         ] {
             assert_eq!(text.parse::<ScriptStep>(), Ok(step), "{text}");
             assert_eq!(step.to_string(), text);
@@ -384,11 +438,12 @@ mod tests {
         // Case and blanks do not matter.
         assert_eq!("  Magic : 7 ".parse::<ScriptStep>(), Ok(ScriptStep::Magic(7)));
         assert_eq!("ESCAPE".parse::<ScriptStep>(), Ok(ScriptStep::Escape));
+        assert_eq!(" Magic : 27 : ALL ".parse::<ScriptStep>(), Ok(ScriptStep::MagicAll(27)));
     }
 
     #[test]
     fn a_word_that_is_not_a_command_is_refused_with_what_was_expected_and_nothing_unprintable() {
-        for bad in ["", "run", "fire", "magic", "magic:", "item:", "magic:x", "magic:-1", "magic:+1", "item:65536", "item:1.5", "attack:1", "limit:128", "magic:1:2", "defend:", "item: 3 4"] {
+        for bad in ["", "run", "fire", "magic", "magic:", "item:", "magic:x", "magic:-1", "magic:+1", "item:65536", "item:1.5", "attack:1", "limit:128", "magic:1:2", "magic:1:all:all", "magic:1:", "magic::all", "item:2:every", "attack:all", "limit:1:all", "defend:", "item: 3 4"] {
             let err = bad.parse::<ScriptStep>().expect_err(bad);
             assert!(!err.is_empty() && !err.contains('\n'), "{bad:?}: {err}");
         }

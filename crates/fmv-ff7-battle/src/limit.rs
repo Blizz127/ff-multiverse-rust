@@ -53,18 +53,18 @@
 //!
 //! # Damage of the first limits (APPROXIMATION from community documentation)
 //!
-//! Every limit break here is one action on one target that never misses, cannot be a critical hit and
-//! ignores the rows; the damage ones use the standard physical formula (`Power * (512 - Def) * Base /
-//! (16 * 512)`, with the random variance) at a Power of `16 * the multiplier of a normal attack` that
-//! the community gives (GideonD's *Limit Break Mechanics* guide, and the Final Fantasy Wiki and
-//! Jegged's per-limit pages):
+//! Every limit break here is one action that never misses, cannot be a critical hit and ignores the
+//! rows, on one enemy (Healing Wind: on the whole party); the damage ones use the standard physical
+//! formula (`Power * (512 - Def) * Base / (16 * 512)`, with the random variance) at a Power of `16 * the
+//! multiplier of a normal attack` that the community gives (GideonD's *Limit Break Mechanics* guide, and
+//! the Final Fantasy Wiki and Jegged's per-limit pages):
 //!
 //! | character | limit (id) | here |
 //! |---|---|---|
 //! | Cloud | Braver (128) | one hit, 3.00x (Power 48) |
 //! | Barret | Big Shot (135) | one hit, 3.25x (Power 52) |
 //! | Tifa | Beat Rush (149) | three Hits of 1.25x (the kernel's record 98: Power 20) as one hit, 3.75x (Power 60); the slot reels (Miss, Hit, Yeah!) are not modelled |
-//! | Aerith | Healing Wind (142) | heals **one** ally for half of its max HP (FF7: the whole party; whole-side effects are not modelled) |
+//! | Aerith | Healing Wind (142) | heals **every** ally, each for half of its own max HP, at full strength: the community's "Formula: Max HP%, Pwr: [Target's Max HP / 2], Tar: All Al (NS)" (Terence Fergusson's *FF7 Party Mechanics Guide*, Aerith's limit breaks). It hits the whole party only ([`Aim::Side`]: `Target::AllAllies`), and a fraction of max HP is never split |
 //! | Red XIII | Sled Fang (163) | one hit, 3.00x (Power 48) |
 //! | Yuffie | Greased Lightning (177) | one hit, 3.00x (Power 48) |
 //! | Cid | Boost Jump (156) | one hit, 3.25x (Power 52) |
@@ -76,10 +76,10 @@
 //! # Not modelled
 //!
 //! Limit levels 2 to 4 and the kills and uses that earn them, Fury and Sadness, the second limit of
-//! a level, Tifa's slot reels, Vincent's transformations, Cait Sith's dice, whole-side limits (Healing
-//! Wind on the whole party, Grenade Bomb, ...) and limit-break animations.
+//! a level, Tifa's slot reels, Vincent's transformations, Cait Sith's dice, the whole-side limits of the
+//! higher levels (Breath of the Earth, Grenade Bomb, ...) and limit-break animations.
 
-use crate::action::{element, ActionSpec};
+use crate::action::{element, ActionSpec, Aim};
 use crate::kernel::{CharacterId, Kernel};
 
 /// The full limit gauge.
@@ -108,6 +108,9 @@ pub struct LimitInfo {
     pub attack: u16,
     /// Aimed at the party (a healing limit: Healing Wind) instead of the enemies.
     pub targets_allies: bool,
+    /// How many it hits: one target, or the whole party only (Healing Wind is [`Aim::Side`]: it is given
+    /// with `Target::AllAllies`).
+    pub aim: Aim,
 }
 
 /// A character's limit break as the battle plays it.
@@ -129,7 +132,7 @@ impl LimitBreak {
 
     /// What a menu needs to know.
     pub fn info(&self) -> LimitInfo {
-        LimitInfo { attack: self.attack, targets_allies: self.spec.heals() }
+        LimitInfo { attack: self.attack, targets_allies: self.spec.heals(), aim: self.spec.aim }
     }
 
     /// The first limit of `who` (limit level 1, slot 1) from the kernel's growth record: its id and the
@@ -202,8 +205,10 @@ mod tests {
                 None => assert_eq!(who, CharacterId::CaitSith),
                 Some(spec) => {
                     assert_eq!(spec.mp_cost, 0, "{who:?}: a limit costs no MP");
-                    assert!(!spec.unaimable && !spec.rolls_accuracy && !spec.can_crit, "{who:?}");
+                    assert!(spec.aim.allows_one() != spec.aim.allows_side() && !spec.rolls_accuracy && !spec.can_crit, "{who:?}");
                     assert_eq!(spec.heals(), who == CharacterId::Aeris, "only Healing Wind heals");
+                    // Healing Wind is the one that hits a whole side, the whole party, and only that.
+                    assert_eq!(spec.aim, if who == CharacterId::Aeris { Aim::Side } else { Aim::One }, "{who:?}");
                 }
             }
         }
@@ -220,8 +225,9 @@ mod tests {
     fn a_hand_made_limit_never_has_a_zero_divisor() {
         let limit = LimitBreak::new(128, ActionSpec::limit_strike(48), 0);
         assert_eq!(limit.divisor, 1);
-        assert_eq!(limit.info(), LimitInfo { attack: 128, targets_allies: false });
+        assert_eq!(limit.info(), LimitInfo { attack: 128, targets_allies: false, aim: Aim::One });
         let heal = LimitBreak::new(142, ActionSpec::limit_heal(16), 200);
         assert!(heal.info().targets_allies);
+        assert_eq!(heal.info().aim, Aim::Side, "Healing Wind heals the whole party");
     }
 }

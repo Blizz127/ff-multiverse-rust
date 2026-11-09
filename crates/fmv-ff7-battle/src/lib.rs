@@ -11,7 +11,7 @@
 //! | [`kernel`] | `kernel.bin` (commands, attacks, growth curves, starting data and stock, items, materia, weapons, armor) and `kernel2.bin` text |
 //! | [`action`] | what an action is: the damage-calculation byte, formulas, spells, enemy attacks, elements, the item table |
 //! | [`limit`] | the limit gauge and each character's first limit break (Braver, Big Shot, ...) |
-//! | [`rules`] | the deterministic battle engine: ATB gauges, the commands (Attack, Magic, Item, Defend, Limit, Escape), enemy AI |
+//! | [`rules`] | the deterministic battle engine: ATB gauges, the commands (Attack, Magic, Item, Defend, Limit, Escape) on one target or a whole side, enemy AI |
 //! | [`rng`] | the seeded PCG32 generator behind every roll |
 //! | [`text`] | FF7 text encoding |
 //!

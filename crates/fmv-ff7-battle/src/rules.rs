@@ -17,15 +17,15 @@
 //! * [`Command::Attack`]: the physical weapon attack on one living enemy;
 //! * [`Command::Magic`]: a spell the character knows ([`Combatant::spells`], see
 //!   [`BattleState::spells_for`]), which costs MP, on one ally (a restoring spell) or one enemy (a
-//!   damaging one);
+//!   damaging one), or on a whole side (see "Whole-side targeting" below);
 //! * [`Command::Item`]: one item of the engine's [`ItemTable`] on one ally (a potion, an Ether, a
-//!   Phoenix Down on a dead one) or one enemy (a damage item). **The engine knows nothing of an
-//!   inventory**: whether the account owns the item is the server's business (it checks the count,
-//!   submits, and takes the item only when the engine accepts), so a client replaying the battle never
-//!   needs to know a count;
+//!   Phoenix Down on a dead one) or one enemy (a damage item), or on a whole side (Megalixir, Shrapnel).
+//!   **The engine knows nothing of an inventory**: whether the account owns the item is the server's
+//!   business (it checks the count, submits, and takes the item only when the engine accepts), so a
+//!   client replaying the battle never needs to know a count;
 //! * [`Command::Defend`]: physical damage taken is halved until the actor's gauge is full again;
 //! * [`Command::Limit`]: the character's limit break (see "Limit breaks" below), once its limit gauge
-//!   is full;
+//!   is full, on one enemy or the whole party (Healing Wind);
 //! * [`Command::Escape`]: the actor spends its turn running (see "Escape" below).
 //!
 //! An enemy whose gauge fills picks one random living party member and one of its own `scene.bin`
@@ -33,8 +33,44 @@
 //! none. Every action, party or enemy, is announced by a [`BattleEvent::Action`] before its effects
 //! ([`BattleEvent::MpSpent`], [`BattleEvent::Damage`], [`BattleEvent::Heal`], ...). Not modelled:
 //! statuses (Berserk, Sadness, Fury, Poison, ...), summons, back-attack damage
-//! bonus, covering, enemy rows, AI scripts, spells and items that hit a whole side, AP/EXP growth, party
+//! bonus, covering, enemy rows, AI scripts, AP/EXP growth, party
 //! elemental resistances, limit levels above 1 (see [`crate::limit`]).
+//!
+//! # Whole-side targeting
+//!
+//! A command that aims at more than one target gives a [`Target`]: [`Target::One`] (the one actor, as
+//! before), [`Target::AllEnemies`] or [`Target::AllAllies`]. The two sides are named **relative to the
+//! actor** (an enemy's "allies" are the other enemies), so the same words serve a party member's
+//! command and an enemy's action; for a party member the enemies are the enemy side and the allies the
+//! party. A whole-side target means every combatant of that side the action can hit: the living ones,
+//! or the fallen for a revival.
+//!
+//! *Which way an action may be aimed* is its [`Aim`], decoded from the record's targeting bits
+//! (<https://wiki.ffrtt.ru/index.php/FF7/Battle/Targeting_Data>): [`Aim::One`] allows [`Target::One`]
+//! only, [`Aim::Side`] ("All Tar (NS)": Ultima, Megalixir, Healing Wind) a whole side only, and
+//! [`Aim::OneOrSide`] ("All Tar/1 Tar": Cure, Fire) either. The side must be the one the action aims at:
+//! a restoring action at the allies, a damaging one at the enemies, as for one target. A way the
+//! action does not allow is [`CommandError::InvalidReach`].
+//!
+//! *The All materia.* In FF7 a **spell** of the [`Aim::OneOrSide`] kind needs an All materia paired with
+//! its magic materia to be cast on a whole side, and an All materia of level `n` allows that `n` times per
+//! battle (Terence Fergusson's *FF7 Party Mechanics Guide*, "All": "Use paired Magic against all once per
+//! battle" at level 1 up to five times at level 5; the abilities that need no All materia are the ones
+//! that are not toggles, and every item and limit break). Here [`Combatant::all_left`] counts what the
+//! caster has left: [`BattleState`] takes one off when a [`Target::AllEnemies`] or [`Target::AllAllies`]
+//! spell of that kind is accepted (also when only one target was left to hit: the choice spent it), a
+//! caster with none left gets [`CommandError::NoAllLeft`], and the number a battle starts with is an
+//! input of the combatant ([`Combatant::from_character`] reads it from the kernel's All materia, see
+//! [`STARTER_ALL_MATERIA`]). It is battle state only: it never travels and nothing keeps it.
+//!
+//! *Damage.* Every target is resolved like a one-target action would be (its own rolls, elements,
+//! affinities, row and Defend), in ascending [`ActorId`] order, and an action that
+//! [splits](ActionSpec::splits) deals 2/3 of what it would to each of several targets (Fergusson's
+//! *Battle Mechanics* FAQ; see [`crate::action`], "Hitting a whole side"). The announcement, and the MP,
+//! come once; then each target has its own [`BattleEvent::Damage`], [`BattleEvent::Miss`],
+//! [`BattleEvent::Heal`], [`BattleEvent::Revive`] (and the [`BattleEvent::Death`] and
+//! [`BattleEvent::LimitGauge`] that follow its blow). A blow that ends the battle is followed by
+//! [`BattleEvent::Victory`] or [`BattleEvent::Defeat`] at once, and no target is resolved after it.
 //!
 //! # Formula sources and provenance
 //!
@@ -88,6 +124,10 @@
 //!   has one (Cure's does; potions' and Life's do not).
 //! * Draws never depend on the target's elemental affinity (a nullified or absorbed hit draws what a
 //!   normal hit draws), on defense, on rows or on statuses.
+//! * An action on **several targets** draws, for each target in ascending [`ActorId`] order, what the same
+//!   action on that one target would draw (the rolls above, one set per target); the split of its damage
+//!   and the spending of an All use are arithmetic and draw nothing, so an action on one target draws
+//!   exactly what it did before whole-side targets existed.
 //! * [`Command::Defend`] and every validation failure draw nothing.
 //! * [`Command::Limit`] draws what the limit's action draws: a damaging limit never misses and cannot
 //!   be a critical hit, so only its `variance = range_inclusive(0, 255)` (the standard formula has
@@ -175,6 +215,9 @@
 //!   is the Magic stat, magic defense Spirit + armor magic defense; the weapon's hit/crit rates and
 //!   the armor's evade percentages come from the kernel. Cait Sith and Vincent have no starting
 //!   equipment record, so they fight unarmed unless equipment ids are passed explicitly.
+//! * **All materia** ([`Combatant::from_character`]): one All materia at level 1 (so once per battle) is
+//!   counted for the whole grimoire, whichever magic materia a spell comes from, because the engine has no
+//!   materia loadout to pair them in (see [`STARTER_ALL_MATERIA`]).
 //! * **Spells** ([`Combatant::from_character`]): the spells of the magic materia equipped in the
 //!   character's kernel starting record at the AP it starts with, plus a documented STARTER grimoire
 //!   every character is given: the level-1 spells of Restore, Fire, Ice and Lightning
@@ -193,10 +236,10 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 pub use crate::action::{
-    affinity_response, element, ActionKind, ActionSpec, ElementAffinity, Elemental, EnemyAction,
+    affinity_response, element, ActionKind, ActionSpec, Aim, ElementAffinity, Elemental, EnemyAction,
     Formula, ItemData, ItemInfo, ItemKind, ItemTable, Spell, SpellInfo,
 };
-use crate::kernel::{CharacterId, Kernel};
+use crate::kernel::{CharacterId, Kernel, MateriaRecord};
 pub use crate::limit::{limit_gain, LimitBreak, LimitInfo, LIMIT_MAX};
 use crate::rng::Rng;
 use crate::scene::{AffinityRate, AttackRecord, BattleLayout, EnemyRecord, Scene};
@@ -226,11 +269,45 @@ pub const RUN_CHECK_ODDS: u32 = 4;
 /// The materia every character's grimoire is built from on top of its own starting equipment (their ids
 /// in the kernel's materia table): Restore (Cure), Fire, Ice and Lightning (Bolt), at level 1.
 pub const STARTER_MATERIA: [u8; 4] = [53, 49, 50, 52];
+/// The id of the All materia in the kernel's materia table (checked on the owner's Steam copy by its
+/// real-data test): the support materia that lets the magic it is paired with hit a whole side, once per
+/// battle at level 1 (see the module docs, "Whole-side targeting"). Every character is given one at level 1
+/// for its whole grimoire, like the [`STARTER_MATERIA`], so [`Combatant::from_character`] starts with
+/// [`MateriaRecord::all_uses`] of its level 1 in [`Combatant::all_left`].
+pub const STARTER_ALL_MATERIA: u8 = 23;
 
 /// Identifier of a combatant inside one battle: party members take ids `0..party`, enemies
 /// follow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ActorId(pub u8);
+
+/// Whom an action is aimed at: one actor, or a whole side. The sides are named relative to the actor that
+/// acts, so the same words serve a party member and an enemy (see the module docs, "Whole-side
+/// targeting"). It travels in `Command::Magic`, `Command::Item` and `Command::Limit` (protocol v10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Target {
+    /// This one actor.
+    One(ActorId),
+    /// Everyone on the other side from the actor (for a party member: the enemies).
+    AllEnemies,
+    /// Everyone on the actor's own side (for a party member: the party), itself included.
+    AllAllies,
+}
+
+impl Target {
+    /// The actor, when this is [`Target::One`].
+    pub fn one(self) -> Option<ActorId> {
+        match self {
+            Target::One(id) => Some(id),
+            Target::AllEnemies | Target::AllAllies => None,
+        }
+    }
+
+    /// Whether this is a whole side.
+    pub fn is_side(self) -> bool {
+        !matches!(self, Target::One(_))
+    }
+}
 
 /// Which side a combatant fights on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -310,6 +387,11 @@ pub struct Combatant {
     /// The limit break this combatant can give once its limit gauge is full (`None`: it has none, and
     /// no gauge).
     pub limit_break: Option<LimitBreak>,
+    /// How many more times in this battle the combatant may cast a spell of the [`Aim::OneOrSide`] kind on a
+    /// whole side: the uses of its All materia (the starting value is an input like the level, then
+    /// [`BattleState`] takes one off for each such cast, see the module docs). 0 for everyone who has no All
+    /// materia and for every enemy. Battle state only: it is never sent or kept.
+    pub all_left: u8,
 }
 
 impl Combatant {
@@ -346,6 +428,7 @@ impl Combatant {
             defending: false,
             limit: 0,
             limit_break: None,
+            all_left: 0,
         }
     }
 
@@ -466,6 +549,7 @@ impl Combatant {
         };
         c.spells = party_spells(kernel, who);
         c.limit_break = LimitBreak::for_character(kernel, who);
+        c.all_left = kernel.materia(STARTER_ALL_MATERIA).map_or(0, |m: MateriaRecord| m.all_uses(m.level_for_ap(0)));
         Some(c)
     }
 }
@@ -551,19 +635,23 @@ pub enum Command {
     Attack { target: ActorId },
     /// Cast a spell the actor knows. `spell` is the kernel's attack index (Cure 0, Fire 27, Ice 30,
     /// Bolt 33, ...); `target` is an ally for a restoring spell (a dead one for Life) and a living enemy
-    /// for a damaging one. Costs the spell's MP.
-    Magic { spell: u16, target: ActorId },
+    /// for a damaging one, or a whole side of them (`AllAllies` for a restoring spell, `AllEnemies` for a
+    /// damaging one) when the spell can hit one (see the module docs, "Whole-side targeting"). Costs the
+    /// spell's MP, once, however many it hits.
+    Magic { spell: u16, target: Target },
     /// Use an item of the engine's item table. `item` is the kernel item index (Potion 0, Hi-Potion 1,
-    /// Ether 3, Phoenix Down 7, ...); `target` is an ally (a dead one for Phoenix Down) for a restoring
-    /// item and a living enemy for a damage item. Whether the account owns one is not the engine's
-    /// business (see the module docs).
-    Item { item: u16, target: ActorId },
+    /// Ether 3, Megalixir 6, Phoenix Down 7, ...); `target` is an ally (a dead one for Phoenix Down) for a
+    /// restoring item and a living enemy for a damage item, or the whole side for an item that hits one
+    /// (Megalixir restores the whole party). Whether the account owns one is not the engine's business
+    /// (see the module docs); one item is used however many it hits.
+    Item { item: u16, target: Target },
     /// Guard: physical damage taken is halved until the actor's gauge is full again.
     Defend,
     /// The actor's limit break (protocol v7), on `target`: a living enemy for a damaging limit, a living
-    /// ally for a healing one ([`BattleState::limit_for`] says which). Only when the actor's limit gauge
-    /// is full; it empties the gauge.
-    Limit { target: ActorId },
+    /// ally for a healing one, or the whole party for the one that heals it all (Healing Wind)
+    /// ([`BattleState::limit_for`] says which). Only when the actor's limit gauge is full; it empties the
+    /// gauge.
+    Limit { target: Target },
     /// Try to run (protocol v7): the actor spends its turn on [`RUN_CHECKS_PER_TURN`] Run Checks. When the
     /// party gets away the battle ends with [`Outcome::Escaped`] for everyone, and when not the turn is
     /// over. Refused when the formation cannot be escaped.
@@ -678,6 +766,18 @@ pub enum CommandError {
     NotEnoughMp(ActorId),
     #[error("item {0} cannot be used in battle")]
     UnknownItem(u16),
+    /// The action cannot be aimed that way: a whole side where it hits one target, one target where it
+    /// hits a whole side, or a whole side that is not the one it aims at (a damaging action on the
+    /// allies, a restoring one on the enemies). (Protocol v10.)
+    #[error("{0:?} is not a way this action can be aimed (one target or a whole side, damage to the enemies, restoring to the allies)")]
+    InvalidReach(Target),
+    /// Nobody on that side can be hit (a revival of a whole side with nobody fallen). (Protocol v10.)
+    #[error("there is nobody on that side {0:?} the action can hit")]
+    NoTargets(Target),
+    /// The spell can hit a whole side only with an All materia use, and the actor has none left this
+    /// battle. (Protocol v10.)
+    #[error("actor {0:?} has no All left this battle")]
+    NoAllLeft(ActorId),
     #[error("actor {0:?} has no limit break")]
     NoLimit(ActorId),
     #[error("actor {0:?} has no full limit gauge")]
@@ -719,33 +819,40 @@ pub struct DamageInput {
 /// element (x2 or /2), then variance `(3841 + roll) / 4096` with a minimum of 1, capped at
 /// [`MAX_DAMAGE`].
 pub fn physical_damage(input: &DamageInput) -> u32 {
-    // Real stats are tiny (attack <= ~510, level <= 255, power <= 255); the clamps only keep
-    // absurd hand-made inputs from overflowing the 64-bit arithmetic.
-    let att = u64::from(input.attack.min(0xFFFF));
-    let lvl = u64::from(input.level.min(255));
-    let power = u64::from(input.power.min(0xFFFF));
-    let x = (lvl * att) / 32;
-    let y = (lvl + att) / 32;
-    let base = att + x * y;
-    let defense = u64::from(input.defense).min(511);
-    let dmg = (base * (512 - defense) * power) >> 13;
     finish_damage(
-        dmg,
+        physical_base(input.attack, input.level, input.power, input.defense),
         input.critical,
         input.halve_for_row,
         input.defending,
+        false,
         input.elemental,
         Some(input.variance_roll),
     )
 }
 
-/// The common tail of every damage formula: critical x2, row penalty /2, Defend /2, the element, the
-/// variance (when the formula has one), a minimum of 1 and the cap.
+/// `Power * (512 - Def) * Base / (16 * 512)` of the physical formula, before any modifier.
+fn physical_base(attack: u32, level: u32, power: u32, defense: u32) -> u64 {
+    // Real stats are tiny (attack <= ~510, level <= 255, power <= 255); the clamps only keep
+    // absurd hand-made inputs from overflowing the 64-bit arithmetic.
+    let att = u64::from(attack.min(0xFFFF));
+    let lvl = u64::from(level.min(255));
+    let power = u64::from(power.min(0xFFFF));
+    let x = (lvl * att) / 32;
+    let y = (lvl + att) / 32;
+    let base = att + x * y;
+    let defense = u64::from(defense).min(511);
+    (base * (512 - defense) * power) >> 13
+}
+
+/// The common tail of every damage formula: critical x2, row penalty /2, Defend /2, the split of an
+/// action that hits several targets x2/3, the element, the variance (when the formula has one), a minimum
+/// of 1 and the cap.
 fn finish_damage(
     mut dmg: u64,
     critical: bool,
     halve_for_row: bool,
     defending: bool,
+    split: bool,
     elemental: Elemental,
     variance_roll: Option<u32>,
 ) -> u32 {
@@ -757,6 +864,9 @@ fn finish_damage(
     }
     if defending {
         dmg /= 2;
+    }
+    if split {
+        dmg = dmg * 2 / 3;
     }
     match elemental {
         Elemental::Normal => {}
@@ -781,6 +891,22 @@ pub fn action_damage(
     elemental: Elemental,
     rolls: Rolls,
 ) -> u32 {
+    action_damage_among(spec, actor, target, elemental, rolls, 1)
+}
+
+/// [`action_damage`] for an action that hits `targets` combatants at once: when that is more than one and
+/// the action [splits](ActionSpec::splits), the damage to each of them is 2/3 of what it would be to one
+/// (after the row penalty and Defend, before the element and the variance: Fergusson's order, see the
+/// module docs).
+pub fn action_damage_among(
+    spec: &ActionSpec,
+    actor: &Combatant,
+    target: &Combatant,
+    elemental: Elemental,
+    rolls: Rolls,
+    targets: usize,
+) -> u32 {
+    let split = targets > 1 && spec.splits();
     let (stat, defense) = match spec.kind {
         ActionKind::Physical => (actor.attack, target.defense),
         ActionKind::Magical => (actor.magic, target.magic_defense),
@@ -798,19 +924,17 @@ pub fn action_damage(
     let stat64 = u64::from(stat.min(0xFFFF));
     let power = u64::from(spec.power.min(0xFFFF));
     let defense64 = u64::from(defense).min(511);
-    let finish = |dmg: u64| finish_damage(dmg, false, false, defending, elemental, variance);
+    let finish = |dmg: u64| finish_damage(dmg, false, false, defending, split, elemental, variance);
     match spec.formula {
-        Formula::Standard => physical_damage(&DamageInput {
-            attack: stat,
-            level: u32::from(actor.level),
-            power: spec.power,
-            defense,
-            critical: rolls.critical && spec.can_crit,
+        Formula::Standard => finish_damage(
+            physical_base(stat, u32::from(actor.level), spec.power, defense),
+            rolls.critical && spec.can_crit,
             halve_for_row,
             defending,
+            split,
             elemental,
-            variance_roll: rolls.variance,
-        }),
+            Some(rolls.variance),
+        ),
         Formula::Spell => finish((((level + stat64) * 6) * (512 - defense64) * power) >> 13),
         Formula::CurrentHp => finish(u64::from(target.hp) * power / 32),
         Formula::MaxHp => finish(u64::from(target.max_hp) * power / 32),
@@ -832,6 +956,20 @@ pub fn restore_amount(
     target: &Combatant,
     variance: u32,
 ) -> u32 {
+    restore_amount_among(spec, actor, target, variance, 1)
+}
+
+/// [`restore_amount`] for an action that restores `targets` combatants at once: Cure's formula, when that
+/// is more than one, is split like damage is (2/3 of the base, before the variance); the formulas of a
+/// fraction of max HP, a flat amount and "everything" never are.
+pub fn restore_amount_among(
+    spec: &ActionSpec,
+    actor: &Combatant,
+    target: &Combatant,
+    variance: u32,
+    targets: usize,
+) -> u32 {
+    let split = targets > 1 && spec.splits();
     let pool = if spec.hits_mp {
         target.max_mp
     } else {
@@ -843,6 +981,7 @@ pub fn restore_amount(
         Formula::Restore => {
             let base =
                 22 * power + 6 * (u64::from(actor.level) + u64::from(actor.magic.min(0xFFFF)));
+            let base = if split { base * 2 / 3 } else { base };
             (base * (3841 + u64::from(variance.min(255)))) >> 12
         }
         Formula::Flat => 20 * power,
@@ -954,24 +1093,27 @@ pub struct EscapeRule {
     pub sure: bool,
 }
 
-/// A validated command, ready to resolve (indexes are positions in the actor list).
+/// A validated command, ready to resolve (indexes are positions in the actor list; a `targets` list is
+/// ascending and never empty).
 enum Plan {
     Attack {
         target: usize,
     },
     Magic {
         spell: Spell,
-        target: usize,
+        targets: Vec<usize>,
+        /// A whole side with a spell that needs an All use: one is spent.
+        spends_all: bool,
     },
     Item {
         item: u16,
         data: ItemData,
-        target: usize,
+        targets: Vec<usize>,
     },
     Defend,
     Limit {
         limit: LimitBreak,
-        target: usize,
+        targets: Vec<usize>,
     },
     Escape(EscapeRule),
 }
@@ -1174,6 +1316,16 @@ impl BattleState {
         self.actor(id).map_or(0, |c| c.limit)
     }
 
+    /// How many more times `id` may hit a whole side with a spell that needs an All materia use
+    /// ([`Combatant::all_left`]); 0 for an enemy, an unknown actor and a party member with no All.
+    pub fn all_left(&self, id: ActorId) -> u8 {
+        if usize::from(id.0) < self.party_len {
+            self.actor(id).map_or(0, |c| c.all_left)
+        } else {
+            0
+        }
+    }
+
     /// Whether `id` is alive, has a limit break and a full limit gauge (it may give [`Command::Limit`]
     /// when its ATB gauge is full too).
     pub fn limit_ready(&self, id: ActorId) -> bool {
@@ -1295,23 +1447,28 @@ impl BattleState {
                 });
                 let spec = self.actors.get(idx).map(Combatant::attack_spec);
                 if let Some(spec) = spec {
-                    self.resolve_action(idx, target, &spec, &mut events);
+                    self.resolve_action(idx, &[target], &spec, &mut events);
                 }
             }
-            Plan::Magic { spell, target } => {
+            Plan::Magic { spell, targets, spends_all } => {
                 events.push(BattleEvent::Action {
                     actor,
                     action: ActionRef::Magic(spell.index),
                 });
                 self.spend_mp(idx, spell.spec.mp_cost, &mut events);
-                self.resolve_action(idx, target, &spell.spec, &mut events);
+                if spends_all {
+                    if let Some(c) = self.actors.get_mut(idx) {
+                        c.all_left = c.all_left.saturating_sub(1);
+                    }
+                }
+                self.resolve_action(idx, &targets, &spell.spec, &mut events);
             }
-            Plan::Item { item, data, target } => {
+            Plan::Item { item, data, targets } => {
                 events.push(BattleEvent::Action {
                     actor,
                     action: ActionRef::Item(item),
                 });
-                self.resolve_action(idx, target, &data.spec, &mut events);
+                self.resolve_action(idx, &targets, &data.spec, &mut events);
             }
             Plan::Defend => {
                 events.push(BattleEvent::Action {
@@ -1322,7 +1479,7 @@ impl BattleState {
                     c.defending = true;
                 }
             }
-            Plan::Limit { limit, target } => {
+            Plan::Limit { limit, targets } => {
                 events.push(BattleEvent::Action {
                     actor,
                     action: ActionRef::Limit(limit.attack),
@@ -1333,7 +1490,7 @@ impl BattleState {
                     c.limit = 0;
                 }
                 events.push(BattleEvent::LimitGauge { actor, value: 0 });
-                self.resolve_action(idx, target, &limit.spec, &mut events);
+                self.resolve_action(idx, &targets, &limit.spec, &mut events);
             }
             Plan::Escape(rule) => {
                 events.push(BattleEvent::Action {
@@ -1408,10 +1565,17 @@ impl BattleState {
                 if me.mp < u32::from(known.spec.mp_cost) {
                     return Err(CommandError::NotEnoughMp(actor));
                 }
-                let target = self.check_target(target, known.spec.heals(), known.spec.hits_dead)?;
+                let targets = self.aim_at(idx, &known.spec, target)?;
+                // A spell that can be toggled to a whole side needs an All use for it (a forced whole side,
+                // Ultima, needs none).
+                let spends_all = known.spec.aim == Aim::OneOrSide && target.is_side();
+                if spends_all && me.all_left == 0 {
+                    return Err(CommandError::NoAllLeft(actor));
+                }
                 Plan::Magic {
                     spell: known,
-                    target,
+                    targets,
+                    spends_all,
                 }
             }
             Command::Item { item, target } => {
@@ -1420,8 +1584,8 @@ impl BattleState {
                     .get(item)
                     .copied()
                     .ok_or(CommandError::UnknownItem(item))?;
-                let target = self.check_target(target, data.spec.heals(), data.spec.hits_dead)?;
-                Plan::Item { item, data, target }
+                let targets = self.aim_at(idx, &data.spec, target)?;
+                Plan::Item { item, data, targets }
             }
             Command::Defend => Plan::Defend,
             Command::Limit { target } => {
@@ -1429,23 +1593,57 @@ impl BattleState {
                 if me.limit < LIMIT_MAX {
                     return Err(CommandError::LimitNotReady(actor));
                 }
-                let target = self.check_target(target, limit.spec.heals(), limit.spec.hits_dead)?;
-                Plan::Limit { limit, target }
+                let targets = self.aim_at(idx, &limit.spec, target)?;
+                Plan::Limit { limit, targets }
             }
             Command::Escape => Plan::Escape(self.escape.ok_or(CommandError::CannotEscape)?),
         };
         Ok((idx, plan))
     }
 
-    /// The position of `target` if it is a valid target: on the party's side when `ally`, else on the
+    /// The positions `target` stands for when the actor at `actor` (a party member for a command, an enemy for
+    /// an action of its AI: the sides of a [`Target`] are the actor's own) aims `spec` at it, checked against
+    /// the action's [`Aim`], the side it aims at (a restoring action at the actor's allies, a damaging one at its
+    /// enemies) and who can be hit (the living, or the fallen for a revival). One target is
+    /// [`BattleState::check_target`]'s answer; a whole side is every combatant of it that can be hit, in
+    /// ascending order, and [`CommandError::NoTargets`] when that is nobody.
+    pub(crate) fn aim_at(&self, actor: usize, spec: &ActionSpec, target: Target) -> Result<Vec<usize>, CommandError> {
+        let (ally, dead) = (spec.heals(), spec.hits_dead);
+        // Whether the action aims at the party's side of the battle: its own side for a restoring action when the
+        // actor is a party member (and the other one for an enemy), the opposite for a damaging one.
+        let in_party = ally == (actor < self.party_len);
+        match target {
+            Target::One(id) => {
+                if !spec.aim.allows_one() {
+                    return Err(CommandError::InvalidReach(target));
+                }
+                self.check_target(id, in_party, dead).map(|t| vec![t])
+            }
+            Target::AllAllies | Target::AllEnemies => {
+                if !spec.aim.allows_side() || (target == Target::AllAllies) != ally {
+                    return Err(CommandError::InvalidReach(target));
+                }
+                let side = if in_party { 0..self.party_len } else { self.party_len..self.actors.len() };
+                let hit: Vec<usize> =
+                    side.filter(|&i| self.actors.get(i).is_some_and(|c| c.is_alive() != dead)).collect();
+                if hit.is_empty() {
+                    Err(CommandError::NoTargets(target))
+                } else {
+                    Ok(hit)
+                }
+            }
+        }
+    }
+
+    /// The position of `target` if it is a valid target: on the party's side when `in_party`, else on the
     /// enemies'; dead when `dead` (a revival), else alive.
-    fn check_target(&self, target: ActorId, ally: bool, dead: bool) -> Result<usize, CommandError> {
+    fn check_target(&self, target: ActorId, in_party: bool, dead: bool) -> Result<usize, CommandError> {
         let t_idx = usize::from(target.0);
         let victim = self
             .actors
             .get(t_idx)
             .ok_or(CommandError::UnknownTarget(target))?;
-        if (t_idx < self.party_len) != ally {
+        if (t_idx < self.party_len) != in_party {
             return Err(CommandError::InvalidTarget(target));
         }
         if dead {
@@ -1517,7 +1715,7 @@ impl BattleState {
                         action: ActionRef::EnemyAttack(action.id),
                     });
                     self.spend_mp(idx, action.spec.mp_cost, events);
-                    self.resolve_action(idx, target, &action.spec, events);
+                    self.resolve_action(idx, &[target], &action.spec, events);
                 }
                 None => {
                     events.push(BattleEvent::Action {
@@ -1525,7 +1723,7 @@ impl BattleState {
                         action: ActionRef::Attack,
                     });
                     let spec = self.actors[idx].attack_spec();
-                    self.resolve_action(idx, target, &spec, events);
+                    self.resolve_action(idx, &[target], &spec, events);
                 }
             }
         }
@@ -1553,18 +1751,26 @@ impl BattleState {
         }
     }
 
-    /// Play one action on one target: restoring (an ally) or offensive (an enemy).
-    fn resolve_action(
+    /// Play one action on its targets, one after the other in the order given: restoring (allies) or
+    /// offensive (enemies). Each target is resolved as a one-target action would be, and an action that
+    /// [splits](ActionSpec::splits) deals 2/3 of that to each of several. Nothing is resolved after the
+    /// battle has an outcome.
+    pub(crate) fn resolve_action(
         &mut self,
         actor: usize,
-        target: usize,
+        targets: &[usize],
         spec: &ActionSpec,
         events: &mut Vec<BattleEvent>,
     ) {
-        if spec.heals() {
-            self.resolve_restore(actor, target, spec, events);
-        } else {
-            self.resolve_offense(actor, target, spec, events);
+        for &target in targets {
+            if self.outcome.is_some() {
+                break;
+            }
+            if spec.heals() {
+                self.resolve_restore(actor, target, spec, targets.len(), events);
+            } else {
+                self.resolve_offense(actor, target, spec, targets.len(), events);
+            }
         }
     }
 
@@ -1574,6 +1780,7 @@ impl BattleState {
         attacker: usize,
         target: usize,
         spec: &ActionSpec,
+        among: usize,
         events: &mut Vec<BattleEvent>,
     ) {
         let actor_id = ActorId(attacker as u8);
@@ -1636,7 +1843,7 @@ impl BattleState {
         };
         let damage_of = |elemental: Elemental, critical: bool| {
             self.actors.get(attacker).map_or(0, |a| {
-                action_damage(spec, a, victim, elemental, Rolls { critical, variance })
+                action_damage_among(spec, a, victim, elemental, Rolls { critical, variance }, among)
             })
         };
         let outcome = match response {
@@ -1721,6 +1928,7 @@ impl BattleState {
         user: usize,
         target: usize,
         spec: &ActionSpec,
+        among: usize,
         events: &mut Vec<BattleEvent>,
     ) {
         let actor_id = ActorId(user as u8);
@@ -1734,7 +1942,7 @@ impl BattleState {
             let (Some(u), Some(t)) = (self.actors.get(user), self.actors.get(target)) else {
                 return;
             };
-            restore_amount(spec, u, t, variance)
+            restore_amount_among(spec, u, t, variance, among)
         };
         let Some(t) = self.actors.get_mut(target) else {
             return;
@@ -3080,7 +3288,7 @@ mod tests {
                 hero(),
                 Command::Magic {
                     spell: 27,
-                    target: foe(),
+                    target: Target::One(foe()),
                 },
             )
             .unwrap();
@@ -3145,7 +3353,7 @@ mod tests {
                 hero(),
                 Command::Magic {
                     spell: 42,
-                    target: foe(),
+                    target: Target::One(foe()),
                 },
             )
             .unwrap();
@@ -3184,7 +3392,7 @@ mod tests {
                 hero(),
                 Command::Magic {
                     spell: 42,
-                    target: foe(),
+                    target: Target::One(foe()),
                 },
             )
             .unwrap();
@@ -3221,7 +3429,7 @@ mod tests {
                 hero(),
                 Command::Magic {
                     spell: 27,
-                    target: foe(),
+                    target: Target::One(foe()),
                 },
             )
             .unwrap();
@@ -3257,7 +3465,7 @@ mod tests {
                 hero(),
                 Command::Magic {
                     spell: 0,
-                    target: hero(),
+                    target: Target::One(hero()),
                 },
             )
             .unwrap();
@@ -3298,7 +3506,7 @@ mod tests {
                 hero(),
                 Command::Magic {
                     spell: 0,
-                    target: hero(),
+                    target: Target::One(hero()),
                 },
             )
             .unwrap();
@@ -3319,7 +3527,7 @@ mod tests {
                     hero(),
                     Command::Magic {
                         spell: 0,
-                        target: hero(),
+                        target: Target::One(hero()),
                     },
                 )
                 .unwrap()
@@ -3343,7 +3551,7 @@ mod tests {
         let mut state = battle(party, vec![dummy(), dead_enemy], 9);
         let magic = |spell, target: u8| Command::Magic {
             spell,
-            target: ActorId(target),
+            target: Target::One(ActorId(target)),
         };
         // The gauge comes first, then everything about the command itself.
         assert_eq!(
@@ -3424,7 +3632,7 @@ mod tests {
                 hero(),
                 Command::Magic {
                     spell: 7,
-                    target: ActorId(1),
+                    target: Target::One(ActorId(1)),
                 },
             )
             .unwrap();
@@ -3458,7 +3666,7 @@ mod tests {
                 hero(),
                 &Command::Item {
                     item: 7,
-                    target: ActorId(1)
+                    target: Target::One(ActorId(1))
                 }
             ),
             Err(CommandError::TargetNotDead(ActorId(1)))
@@ -3470,7 +3678,7 @@ mod tests {
                 hero(),
                 Command::Item {
                     item: 7,
-                    target: ActorId(2),
+                    target: Target::One(ActorId(2)),
                 },
             )
             .unwrap();
@@ -3502,7 +3710,7 @@ mod tests {
         let mut state = battle(vec![me], vec![dummy()], seed);
         let item = |item: u16| Command::Item {
             item,
-            target: hero(),
+            target: Target::One(hero()),
         };
         let cases: [(u16, Vec<BattleEvent>); 5] = [
             // Potion: 20 * 5 = 100.
@@ -3592,7 +3800,7 @@ mod tests {
                 hero(),
                 Command::Item {
                     item: 20,
-                    target: foe(),
+                    target: Target::One(foe()),
                 },
             )
             .unwrap();
@@ -3624,11 +3832,11 @@ mod tests {
         wait_ready(&mut state, hero());
         let item = |item, target: u8| Command::Item {
             item,
-            target: ActorId(target),
+            target: Target::One(ActorId(target)),
         };
+        let side = |item, target| Command::Item { item, target };
         let cases: Vec<(Command, Result<(), CommandError>)> = vec![
-            // Not in the table: Megalixir hits everyone at once, Antidote is a status, 100 forbids battle use.
-            (item(6, 0), Err(CommandError::UnknownItem(6))),
+            // Not in the table: Antidote is a status, 100 forbids battle use.
             (item(8, 0), Err(CommandError::UnknownItem(8))),
             (item(100, 0), Err(CommandError::UnknownItem(100))),
             (item(127, 0), Err(CommandError::UnknownItem(127))),
@@ -3643,6 +3851,15 @@ mod tests {
             (item(3, 0), Ok(())),
             (item(7, 1), Ok(())),
             (item(20, 2), Ok(())),
+            // Megalixir hits the whole party and nothing else: no one target, not the enemies.
+            (item(6, 0), Err(CommandError::InvalidReach(Target::One(hero())))),
+            (side(6, Target::AllEnemies), Err(CommandError::InvalidReach(Target::AllEnemies))),
+            (side(6, Target::AllAllies), Ok(())),
+            // A potion, a revival and a grenade hit one target: a whole side is no way to aim them.
+            (side(0, Target::AllAllies), Err(CommandError::InvalidReach(Target::AllAllies))),
+            (side(7, Target::AllAllies), Err(CommandError::InvalidReach(Target::AllAllies))),
+            (side(20, Target::AllEnemies), Err(CommandError::InvalidReach(Target::AllEnemies))),
+            (side(20, Target::AllAllies), Err(CommandError::InvalidReach(Target::AllAllies))),
         ];
         let before = state.clone();
         for (command, expected) in &cases {
@@ -3677,7 +3894,8 @@ mod tests {
             state.item_info(20).map(|i| (i.kind, i.targets_allies)),
             Some((ItemKind::Damage, false))
         );
-        assert!(state.item_info(6).is_none() && state.items().len() == 8);
+        assert_eq!(state.item_info(6).map(|i| (i.kind, i.aim)), Some((ItemKind::RestoreAll, Aim::Side)));
+        assert!(state.item_info(8).is_none() && state.items().len() == 9);
         // A battle without an item table refuses every item.
         let mut bare = BattleState::with_config(4, vec![mage()], vec![dummy()], zero_start());
         wait_ready(&mut bare, hero());
@@ -3819,7 +4037,7 @@ mod tests {
                     hero(),
                     Command::Magic {
                         spell,
-                        target: foe(),
+                        target: Target::One(foe()),
                     },
                 )
                 .unwrap();
@@ -4151,12 +4369,13 @@ mod tests {
             assert_eq!(ids(who), [0, 27, 30, 33], "{who:?}");
         }
         // A Restore materia at 2500 AP is level 2 (Cure2 too); Master Magic teaches everything the rules
-        // can cast: the Cure family, Life, the Fire, Ice and Bolt spells that exist, and Demi. Not the
-        // record that is not magic, not Ultima (it hits a whole side), not what has no record.
+        // can cast: the Cure family, Life, the Fire, Ice and Bolt spells that exist, Demi and Ultima (it hits
+        // a whole side, which a command can ask for now). Not the record that is not magic, not what has no
+        // record.
         assert_eq!(ids(CharacterId::Yuffie), [0, 1, 27, 30, 33]);
         assert_eq!(
             ids(CharacterId::Cid),
-            [0, 1, 2, 7, 27, 28, 29, 30, 31, 32, 33, 34, 42]
+            [0, 1, 2, 7, 27, 28, 29, 30, 31, 32, 33, 34, 42, 52]
         );
         // What a menu is told: the cost, and the side.
         let cloud = Combatant::from_character(&kernel, CharacterId::Cloud, 6, None, None).unwrap();
@@ -4167,22 +4386,26 @@ mod tests {
                 SpellInfo {
                     spell: 0,
                     mp_cost: 5,
-                    targets_allies: true
+                    targets_allies: true,
+                    aim: Aim::OneOrSide
                 },
                 SpellInfo {
                     spell: 27,
                     mp_cost: 4,
-                    targets_allies: false
+                    targets_allies: false,
+                    aim: Aim::OneOrSide
                 },
                 SpellInfo {
                     spell: 30,
                     mp_cost: 4,
-                    targets_allies: false
+                    targets_allies: false,
+                    aim: Aim::OneOrSide
                 },
                 SpellInfo {
                     spell: 33,
                     mp_cost: 4,
-                    targets_allies: false
+                    targets_allies: false,
+                    aim: Aim::OneOrSide
                 },
             ]
         );
@@ -4209,17 +4432,20 @@ mod tests {
                 SpellInfo {
                     spell: 0,
                     mp_cost: 5,
-                    targets_allies: true
+                    targets_allies: true,
+                    aim: Aim::OneOrSide
                 },
                 SpellInfo {
                     spell: 27,
                     mp_cost: 4,
-                    targets_allies: false
+                    targets_allies: false,
+                    aim: Aim::OneOrSide
                 },
                 SpellInfo {
                     spell: 7,
                     mp_cost: 34,
-                    targets_allies: true
+                    targets_allies: true,
+                    aim: Aim::OneOrSide
                 },
             ]
         );
@@ -4240,7 +4466,7 @@ mod tests {
                 hero(),
                 Command::Magic {
                     spell: 7,
-                    target: ActorId(1),
+                    target: Target::One(ActorId(1)),
                 },
             )
             .unwrap();
@@ -4270,21 +4496,21 @@ mod tests {
         let attack = enemy.map(|target| Command::Attack { target });
         let candidates = [
             attack,
-            enemy.map(|target| Command::Magic { spell: 27, target }),
+            enemy.map(|target| Command::Magic { spell: 27, target: Target::One(target) }),
             Some(Command::Magic {
                 spell: 0,
-                target: actor,
+                target: Target::One(actor),
             }),
             Some(Command::Defend),
             Some(Command::Item {
                 item: 0,
-                target: actor,
+                target: Target::One(actor),
             }),
-            dead.map(|target| Command::Item { item: 7, target }),
-            dead.map(|target| Command::Magic { spell: 7, target }),
+            dead.map(|target| Command::Item { item: 7, target: Target::One(target) }),
+            dead.map(|target| Command::Magic { spell: 7, target: Target::One(target) }),
             Some(Command::Item {
                 item: 3,
-                target: actor,
+                target: Target::One(actor),
             }),
         ];
         let pick = (state.tick() / 13 + u64::from(actor.0)) as usize % candidates.len();
@@ -4353,9 +4579,14 @@ mod tests {
             ];
             c
         };
+        // Casters that have an All materia, so that the fuzz below also reaches the whole-side paths.
+        let mut mage = mage();
+        mage.all_left = 3;
+        let mut knight = knight();
+        knight.all_left = 1;
         BattleState::with_config(
             seed,
-            vec![mage(), knight(), corpse()],
+            vec![mage, knight, corpse()],
             vec![goblin("Goblin A"), goblin("Goblin B")],
             zero_start(),
         )
@@ -4513,7 +4744,7 @@ mod tests {
     #[test]
     fn random_commands_never_panic_and_check_command_always_agrees_with_submit() {
         let mut rnd = Xorshift(0x2545_F491_4F6C_DD1D);
-        let mut accepted = 0;
+        let (mut accepted, mut whole_sides) = (0, 0);
         for seed in 0..40u64 {
             let mut state = mixed_battle(seed);
             for _ in 0..600 {
@@ -4524,15 +4755,26 @@ mod tests {
                 for _ in 0..4 {
                     let actor = ActorId(rnd.next(8) as u8);
                     let target = ActorId(rnd.next(9) as u8);
+                    // One actor, or either whole side (a third of the time: the paths a whole side takes
+                    // must agree between check and submit like the others).
+                    let aim = match rnd.next(6) {
+                        0 | 1 => Target::AllEnemies,
+                        2 => Target::AllAllies,
+                        _ => Target::One(target),
+                    };
+                    // Mostly spells and items the heroes have (Cure, Life, Fire; Potion, Ether, Megalixir, Phoenix
+                    // Down, Grenade), now and then anything at all.
+                    let known_spell = [0u16, 7, 27][rnd.next(3) as usize];
+                    let known_item = [0u16, 3, 6, 7, 20][rnd.next(5) as usize];
                     let command = match rnd.next(4) {
                         0 => Command::Attack { target },
                         1 => Command::Magic {
-                            spell: rnd.next(60) as u16,
-                            target,
+                            spell: if rnd.next(4) == 0 { rnd.next(60) as u16 } else { known_spell },
+                            target: aim,
                         },
                         2 => Command::Item {
-                            item: rnd.next(140) as u16,
-                            target,
+                            item: if rnd.next(4) == 0 { rnd.next(140) as u16 } else { known_item },
+                            target: aim,
                         },
                         _ => Command::Defend,
                     };
@@ -4551,12 +4793,16 @@ mod tests {
                         );
                     } else {
                         accepted += 1;
+                        if matches!(command, Command::Magic { target, .. } | Command::Item { target, .. } if target.is_side()) {
+                            whole_sides += 1;
+                        }
                     }
                     assert_sane(&state);
                 }
             }
         }
         assert!(accepted > 200, "only {accepted} random commands were valid");
+        assert!(whole_sides > 20, "only {whole_sides} whole-side commands were valid");
     }
 
     // --- serde ---
@@ -4626,12 +4872,15 @@ mod tests {
             Command::Attack { target: ActorId(4) },
             Command::Magic {
                 spell: 33,
-                target: ActorId(2),
+                target: Target::One(ActorId(2)),
             },
             Command::Item {
                 item: 3,
-                target: ActorId(1),
+                target: Target::One(ActorId(1)),
             },
+            Command::Magic { spell: 27, target: Target::AllEnemies },
+            Command::Item { item: 6, target: Target::AllAllies },
+            Command::Limit { target: Target::AllAllies },
             Command::Defend,
         ] {
             let back: Command =
@@ -4643,3 +4892,6 @@ mod tests {
         assert_eq!(out, Outcome::Victory);
     }
 }
+
+#[cfg(test)]
+mod side_tests;

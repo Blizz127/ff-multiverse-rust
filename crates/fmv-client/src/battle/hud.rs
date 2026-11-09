@@ -278,6 +278,7 @@ mod tests {
     use crate::battle::menu::{Choice, Level, MenuItem, MenuSpell, TargetRule};
     use crate::battle::popups::PopupKind;
     use crate::battle::view::Status;
+    use fmv_ff7_battle::rules::Target;
     use fmv_protocol::BattleId;
 
     fn bar(actor: u8, mine: bool, ready: bool, alive: bool) -> Bar {
@@ -342,7 +343,7 @@ mod tests {
         for k in [MenuKey::Down, MenuKey::Confirm, MenuKey::Confirm, MenuKey::Right] {
             hud.press(k, &v);
         }
-        assert_eq!(hud.press(MenuKey::Confirm, &v), Reply::Send(Choice::Magic { spell: 5, target: ActorId(3) }));
+        assert_eq!(hud.press(MenuKey::Confirm, &v), Reply::Send(Choice::Magic { spell: 5, target: Target::One(ActorId(3)) }));
     }
 
     #[test]
@@ -444,7 +445,7 @@ mod tests {
         let mut dressed = ready.clone();
         hud.decorate(&mut dressed, 10.1);
         let aim = dressed.menu.expect("our menu").aim.expect("the pointer");
-        assert_eq!(aim.target, ActorId(2), "the pointer is on the living enemy, not on the one still listed");
+        assert_eq!(aim.one(), Some(ActorId(2)), "the pointer is on the living enemy, not on the one still listed");
         assert!(dressed.enemies[1].alive, "though the list still shows it");
         assert!(!dressed.party[0].alive, "a fallen party member is shown fallen at once: the panel is the state");
     }
