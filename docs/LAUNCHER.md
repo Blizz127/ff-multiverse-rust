@@ -23,6 +23,7 @@ three times while packaging):
 | `fmv-client` | the launcher's `binary`: the game window (and the headless bot) |
 | `fmv-server` | this machine's own local server, started by `ff-multiverse.sh` |
 | `fmv-import` | reads the owner's own FF7 install into the library, started by `ff-multiverse.sh` |
+| `fmv-characters` | the operator's offline tool for a STOPPED server's player characters (`show`, `restyle`: see the README); the launcher never runs it |
 | `README.md`, `LICENSE-NOTICE.txt` | documentation and the licence notice |
 | `manifest.json` | name, version, `revision`, `build_id`, git commit, toolchain, sha256 of every file |
 
