@@ -2,8 +2,8 @@
 
 Status: DESIGN NOTES ONLY. Written 2026-11-09 by teammate `sw-ffdesign` (swarm wave 4). The code audit was
 read at `main` `2fea4b5` and re-checked after the talk-dialogue merge `aa3462a` and its follow-up `094681e`. Docs only: nothing here is
-implemented, built or tested. Scope: FF8 and FF9. Later titles (FF10, FF12) wait for an owner clarification and
-are not covered; nothing below should make them harder.
+implemented, built or tested. Scope: FF8 and FF9. Later titles (FF10, then FF12; FF13 maybe later: the owner's order of 2026-11-09, section 0.1) are
+not covered yet; nothing below should make them harder.
 
 **No owned FF8 or FF9 files exist on this box.** Every claim about how an FF8 or FF9 file or
 archive is laid out carries a tag, in one of three tiers:
@@ -91,6 +91,13 @@ aand ff11 is the best way of doing it" ("perfect ok lets do it"). The design tar
   "stargate"): a portal hub that is ORIGINAL to FF Multiverse (no game's art), from which each game's world is entered
   at that player's own progress in it. It needs the multi-game hosting of section 4 (today's server hosts one game) and
   an identity that is already game-agnostic (it is: `PlayerCharacter`, per-game bindings and progress pointers).
+* **The roadmap of games (the owner, 10:29 CST):** "well we can go downt he order ff7,8,9,10,12 and loo kat 13 later if
+  all goes well otherwise": **FF7, then FF8, FF9, FF10 and FF12; FF13 is a maybe-later.** This settles the earlier
+  FF11-or-FF12 question (two relays had disagreed) in favour of FF12. FF7 stays the current priority.
+* **One renderer and asset loader per world, behind a shared adventurer and save layer.** Each game keeps its own look:
+  its own field and battle presentation read from the owner's own files for that game, while the account, the one
+  original character, parties, phasing and saves are shared. The original character gets a per-world restyled model (its
+  identity drawn in that game's art style, section 2.6), never another game's assets.
 
 ---
 
