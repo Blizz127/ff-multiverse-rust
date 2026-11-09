@@ -12,11 +12,16 @@
 //!   cargo test -p fmv-client --bin fmv-client -- --ignored battle::scene::sheets --test-threads=1 --nocapture
 //! ```
 //!
-//! * `party_slot_evidence_sheets` draws, for each of the nine playable characters, the slots of the shared
-//!   table of [`super::clips`] frame by frame (`party-clips-<name>.png`: one row per slot, the slot and the
-//!   frame written on each picture), and `enemy_slot_evidence_sheets` the MP and the Guard Hound.
-//! * `party_clips_agree_across_the_characters` and `enemy_book_is_the_same_in_every_scene` check the
-//!   numbers behind the table without a GPU.
+//! * `party_every_slot_sheets` draws EVERY slot of each of the nine playable characters frame by frame
+//!   (`slots-<name>-<n>.png`: one row per slot, the slot, the frame and the animation scripts of the character's
+//!   own `ab` entry that play it written on each picture), `party_attack_chain_sheets` the clips of each
+//!   character's two blows in the order they play (`attack-chain-<name>-<short|long>.png`),
+//!   `party_roles_overview_sheets` one picture per role for all nine, and `enemy_slot_evidence_sheets` the MP and
+//!   the Guard Hound: the evidence for the tables of [`super::clips`].
+//! * `fight_party_attack_strips` plays each character's blow in a real fight (`attack-strip-<name>.png`).
+//! * `party_clips_agree_across_the_characters`, `party_blows_are_the_scripts_clips`,
+//!   `party_attack_range_by_starting_weapon` and `enemy_book_is_the_same_in_every_scene` check the numbers behind
+//!   the tables without a GPU.
 //! * `fight_*` run real fights (a real engine, the client's own replay, the scene, the overlay) and write
 //!   the sheets of the presentation: an MP's attack chain, a party attack with the number at its impact, a
 //!   cast with its effect, the elements, a beaten enemy's fade and the victory pose.
@@ -26,7 +31,7 @@
 #![allow(clippy::chunks_exact_to_as_chunks)]
 
 use super::camera::{BattleCamera, View};
-use super::clips::{ClipSet, Kit};
+use super::clips::{Chain, ClipSet, Kit};
 use super::effects::Element;
 use super::shots::{contact_sheet, member, open_real, Real, Server, ME, H, W};
 use super::*;
@@ -36,6 +41,7 @@ use crate::avatar::source::NON_PLAYABLE;
 use crate::battle::{draw_battle_overlay, BattleClient};
 use crate::ui::draw::DrawList;
 use crate::ui::testkit::{pixel, save, Offscreen};
+use fmv_ff7::battle_model::script::AnimationScripts;
 use fmv_ff7::battle_model::{BattleCharacter, BattleModel, BattleModels};
 use fmv_ff7::model::mat4_translate;
 use fmv_ff7::playable::Character;
@@ -71,8 +77,14 @@ fn clip_set(model: &BattleModel) -> ClipSet {
 // The numbers behind the table (no GPU)
 // ---------------------------------------------------------------------------------------------
 
-/// All nine characters' packs give the shared table every role, and each death clip ends in the pose of the
-/// dead slot: the numbers behind "slot 18 ends where slot 6 is" of [`super::clips`].
+/// The slots of a chain in the order they play: the approach, the strike, the way back.
+fn chain_slots(chain: &Chain) -> Vec<usize> {
+    chain.approach.iter().chain(&chain.strike).chain(&chain.back).map(|&s| usize::from(s)).collect()
+}
+
+/// All nine characters' packs give the shared slots every role, the scripts they all share say what those slots are,
+/// and each death clip ends in the pose of the dead slot: the numbers behind "slot 18 ends where slot 6 is" of
+/// [`super::clips`].
 #[test]
 #[ignore = "needs the owner's real FF7 data (FMV_FF7_DATA)"]
 fn party_clips_agree_across_the_characters() {
@@ -80,14 +92,17 @@ fn party_clips_agree_across_the_characters() {
     let mut models = BattleModels::open(path).expect("battle.lgp");
     for which in BattleCharacter::ALL {
         let model = models.load_character(which).expect("the character loads");
-        let kit = Kit::party(clip_set(&model));
+        let kit = Kit::party(clip_set(&model), &model.scripts);
         let name = which.display_name();
         eprintln!(
-            "{name:20} slots {:2}, weapon tracks {:2}: attack {:?} item {:?} cast {:?} hurt {:?} death {:?} dead {:?} victory {:?} defend {:?} run {:?} back {:?}",
+            "{name:20} slots {:2}, weapon tracks {:2}, scripts {:2}: attack {:?} shoot {:?} item {:?} {:?} cast {:?} hurt {:?} death {:?} dead {:?} victory {:?} defend {:?} run {:?} back {:?}",
             model.animations.len(),
             model.weapon_tracks.len(),
-            kit.attack,
+            model.scripts.len(),
+            kit.attack.as_ref().map(chain_slots),
+            kit.shoot.as_ref().map(chain_slots),
             kit.item,
+            kit.item_at_enemy,
             kit.cast,
             kit.hurt,
             kit.death,
@@ -101,11 +116,23 @@ fn party_clips_agree_across_the_characters() {
         if which == BattleCharacter::Sephiroth {
             continue;
         }
-        assert!(kit.attack.is_some() && kit.hurt.is_some() && kit.death.is_some() && kit.dead.is_some(), "{name}");
-        assert!(kit.victory.is_some() && kit.defend.is_some() && kit.item.is_some() && kit.cast.iter().all(Option::is_some), "{name}");
-        // The weapon rides on a track of its own for each slot played: every slot the kit uses has a real one (a
-        // slot with a stand-in track would draw the weapon at some other slot's place).
-        for slot in [0usize, 2, 4, 6, 7, 8, 9, 10, 12, 13, 14, 15, 18] {
+        assert!(kit.attack.is_some() && kit.shoot.is_some() && kit.hurt.is_some() && kit.death.is_some() && kit.dead.is_some(), "{name}");
+        assert!(kit.victory.is_some() && kit.defend.is_some() && kit.item.is_some() && kit.item_at_enemy.is_some() && kit.cast.iter().all(Option::is_some), "{name}");
+        // The scripts all nine share, with the clips of the shared table: hop forward, hop back, hurt, death, run, a
+        // spell (the hop, begin, hold, end, the hop back) and the item thrown to an ally (9) and an enemy (10); the
+        // victory script starts with the victory pose.
+        let clips_of = |index: usize| model.scripts.get(index).map(|s| s.clips());
+        for (index, expected) in [(0usize, vec![0u8]), (1, vec![1]), (3, vec![3]), (4, vec![4]), (5, vec![15]), (7, vec![18]), (13, vec![7]), (17, vec![3, 12, 13, 14, 4]), (32, vec![3, 9, 4]), (33, vec![3, 10, 4])] {
+            assert_eq!(clips_of(index), Some(expected), "{name}: script {index}");
+        }
+        assert_eq!(clips_of(12).and_then(|c| c.first().copied()), Some(2), "{name}: the victory script");
+        // The weapon rides on a track of its own for each slot played: every slot the kit uses, the clips of the blows
+        // included, has a real one (a slot with a stand-in track would draw the weapon at some other slot's place).
+        let mut played = vec![0usize, 2, 3, 4, 6, 7, 8, 9, 10, 12, 13, 14, 15, 18];
+        for chain in [kit.attack.as_ref(), kit.shoot.as_ref()].into_iter().flatten() {
+            played.extend(chain_slots(chain));
+        }
+        for slot in played {
             assert!(model.weapon_track_ok.get(slot).copied().unwrap_or(false), "{name}: the weapon's track for slot {slot} is a stand-in or missing");
         }
         // The death clip lands lying down, in the pose the dead slot holds: the same height (±40 units) and the
@@ -123,6 +150,48 @@ fn party_clips_agree_across_the_characters() {
         // The root's height at the end of the death clip is the dead pose's.
         let root_y = |slot: u16, frame: usize| model.animations[usize::from(slot)].frame(frame).map_or(0.0, |f| f.root_translation[1]);
         assert!((root_y(death, last) - root_y(dead, 0)).abs() < 1.0, "{name}");
+    }
+}
+
+/// A blow of the table of [`super::clips`]: the approach, the strike, the tick the blow lands at (at most the strike's
+/// length), the way back, and the index of the approach clip the actor travels from (`None`: the script does not move).
+type Blow = (&'static [u16], &'static [u16], u16, &'static [u16], Option<usize>);
+
+/// **The table of the playable characters' blows of [`super::clips`], held to the owner's own animation scripts**: what
+/// each of the nine plays for a blow with a short-range weapon (script 20) and a long-range one (script 21), and
+/// when it lands. The first version of the table took slot 10 for the attack of everyone and the owner saw an
+/// uppercut: slot 10 is the item thrown at an enemy.
+#[test]
+#[ignore = "needs the owner's real FF7 data (FMV_FF7_DATA)"]
+fn party_blows_are_the_scripts_clips() {
+    let Some(path) = battle_lgp() else { return };
+    let mut models = BattleModels::open(path).expect("battle.lgp");
+    use BattleCharacter::*;
+    let table: [(BattleCharacter, Blow, Blow); 9] = [
+        (Cloud, (&[26, 27], &[30, 28], 1, &[29], Some(1)), (&[3], &[31], 16, &[4], None)),
+        (Barret, (&[26, 27], &[30, 28], 3, &[29], Some(1)), (&[3], &[34], 14, &[4], None)),
+        (Tifa, (&[26, 27], &[30, 28], 8, &[29], Some(1)), (&[3], &[34], 18, &[4], None)),
+        (Aerith, (&[25, 26], &[29, 27], 2, &[28], Some(1)), (&[3], &[34], 25, &[4], None)),
+        (RedXiii, (&[26, 27], &[30, 28], 6, &[29], Some(1)), (&[3], &[33], 16, &[4], None)),
+        (Yuffie, (&[3], &[30], 6, &[4], None), (&[3], &[34], 14, &[4], None)),
+        (CaitSith, (&[26, 27], &[30, 28], 4, &[29], Some(1)), (&[3], &[31], 23, &[4], None)),
+        (Vincent, (&[3], &[30, 31, 32], 6, &[4], None), (&[3], &[30, 31, 32], 6, &[4], None)),
+        (Cid, (&[25, 26], &[29, 27], 1, &[28], Some(1)), (&[3], &[33], 20, &[4], None)),
+    ];
+    for (which, short, long) in table {
+        let model = models.load_character(which).expect("the character loads");
+        let clips = clip_set(&model);
+        let kit = Kit::party(clips.clone(), &model.scripts);
+        let name = which.display_name();
+        for (what, blow, chain) in [("short range (script 20)", short, &kit.attack), ("long range (script 21)", long, &kit.shoot)] {
+            let chain = chain.as_ref().unwrap_or_else(|| panic!("{name}: no chain for {what}"));
+            let (approach, strike, impact, back, travel) = blow;
+            let strike_ticks: u16 = strike.iter().map(|&s| clips.frames_of(s)).sum();
+            eprintln!("{name:20} {what}: approach {:?} strike {:?} lands at tick {} of {strike_ticks} back {:?} travels from {:?}", chain.approach, chain.strike, chain.impact, chain.back, chain.closes_in.then_some(chain.travel_from));
+            assert_eq!((chain.approach.as_slice(), chain.strike.as_slice(), chain.back.as_slice()), (approach, strike, back), "{name}: {what}");
+            assert_eq!(chain.impact, impact.min(strike_ticks), "{name}: {what}: the blow lands at tick {impact} of the strike");
+            assert_eq!(chain.closes_in.then_some(chain.travel_from), travel, "{name}: {what}");
+        }
     }
 }
 
@@ -263,6 +332,31 @@ impl Rig {
     }
 }
 
+impl Rig {
+    /// Every slot of the model in `slots`, one row each, up to `per_row` frames spread over the clip (a clip of
+    /// fewer frames gets one tile per frame, the rest of the row stays dark), each labelled with the slot, the
+    /// frame, the clip's length and `note(slot)`.
+    fn every_slot(&self, gpu: &mut Offscreen, slots: &[usize], per_row: usize, note: &dyn Fn(usize) -> String) -> (u32, u32, Vec<u8>) {
+        let (sw, sh) = (TILE_W * per_row as u32, TILE_H * slots.len() as u32);
+        let mut sheet = vec![0u8; (sw * sh * 4) as usize];
+        for (row, &slot) in slots.iter().enumerate() {
+            let n = self.model.animations[slot].frame_count();
+            let tiles = n.min(per_row);
+            for col in 0..tiles {
+                let frame = if tiles == 1 { 0 } else { col * (n - 1) / (tiles - 1) };
+                let label = format!("s{slot} f{frame}/{n}\n{}", note(slot));
+                let tile = self.tile(gpu, slot, frame, &label);
+                for y in 0..TILE_H {
+                    let src = &tile[(y * TILE_W * 4) as usize..((y + 1) * TILE_W * 4) as usize];
+                    let dst = (((row as u32 * TILE_H + y) * sw + col as u32 * TILE_W) * 4) as usize;
+                    sheet[dst..dst + src.len()].copy_from_slice(src);
+                }
+            }
+        }
+        (sw, sh, sheet)
+    }
+}
+
 /// Equal tiles laid out `per_row` to a row.
 fn grid(tiles: &[Vec<u8>], per_row: usize) -> (u32, u32, Vec<u8>) {
     let rows = tiles.len().div_ceil(per_row);
@@ -280,8 +374,9 @@ fn grid(tiles: &[Vec<u8>], per_row: usize) -> (u32, u32, Vec<u8>) {
 }
 
 /// What the scene plays for each role, for all nine characters at once: one row per character, one picture per
-/// role (the attack at its impact frame, the cast's hold, the item gesture, a hurt flinch, a fall, the end of the
-/// victory): the one picture that says the shared table of [`super::clips`] holds for everybody.
+/// role (the blow with a short-range weapon and with a long-range one each at the frame it lands in, the item thrown
+/// up to an ally and forward to an enemy, the cast's hold, a hurt flinch, a fall, the end of the victory): the one
+/// picture that says the shared slots and the character's own blows of [`super::clips`] hold for everybody.
 #[test]
 #[ignore = "needs the owner's real FF7 data (FMV_FF7_DATA) and a GPU or a software Vulkan/GL driver"]
 fn party_roles_overview_sheets() {
@@ -290,56 +385,132 @@ fn party_roles_overview_sheets() {
     let mut rows: Vec<Vec<Vec<u8>>> = Vec::new();
     for which in BattleCharacter::ALL.into_iter().filter(|c| *c != BattleCharacter::Sephiroth) {
         let model = models.load_character(which).expect("the character loads");
-        let kit = Kit::party(clip_set(&model));
+        let clips = clip_set(&model);
+        let kit = Kit::party(clips.clone(), &model.scripts);
         let standing = model.pose(0, 0).and_then(|p| model.model.posed_bounds(&p, &fmv_ff7::model::mat4_identity())).map_or(900.0, |(lo, _)| f64::from(-lo[1]));
         let rig = Rig::new(model, standing);
         let name = which.display_name().to_string();
+        let landing = |chain: &Option<Chain>| chain.as_ref().map(|c| c.landing(&clips)).map(|(slot, frame)| (slot, usize::from(frame)));
+        let at = |slot: Option<u16>, fraction: f32| slot.map(|slot| (slot, (fraction * (clips.frames_of(slot) - 1) as f32).round() as usize));
         let roles = [
-            ("attack", kit.attack, party_impact()),
-            ("cast hold", kit.cast[1], 0.5),
-            ("item", kit.item, 0.5),
-            ("hurt", kit.hurt, 0.4),
-            ("death", kit.death, 0.35),
-            ("victory", kit.victory, 1.0),
+            ("blow, short range", landing(&kit.attack)),
+            ("blow, long range", landing(&kit.shoot)),
+            ("item to an ally", at(kit.item, 0.5)),
+            ("item to an enemy", at(kit.item_at_enemy, 0.5)),
+            ("cast hold", at(kit.cast[1], 0.5)),
+            ("hurt", at(kit.hurt, 0.4)),
+            ("death", at(kit.death, 0.35)),
+            ("victory", at(kit.victory, 1.0)),
         ];
         let tiles = roles
             .iter()
-            .map(|&(role, slot, at)| {
-                let slot = usize::from(slot.expect("the role has a slot"));
-                let frames = rig.model.animations[slot].frame_count();
-                let frame = (at * (frames - 1) as f32).round() as usize;
-                rig.tile(&mut gpu, slot, frame, &format!("{role} s{slot} f{frame}/{frames}\n{name}"))
+            .map(|&(role, picked)| {
+                let (slot, frame) = picked.expect("the role has a slot");
+                let slot = usize::from(slot);
+                rig.tile(&mut gpu, slot, frame, &format!("{role} s{slot} f{frame}/{}\n{name}", clips.frames_of(slot as u16)))
             })
             .collect();
         rows.push(tiles);
     }
     for (half, chunk) in rows.chunks(5).enumerate() {
         let tiles: Vec<Vec<u8>> = chunk.iter().flatten().cloned().collect();
-        let (w, h, sheet) = grid(&tiles, 6);
+        let (w, h, sheet) = grid(&tiles, 8);
         save(&format!("party-roles-overview-{half}"), w, h, &sheet);
     }
 }
 
-fn party_impact() -> f32 {
-    super::clips::party::ATTACK_IMPACT
-}
-
-/// The slots the choreography plays, as rows, for every one of the nine characters: the evidence for the
-/// table of [`super::clips`]. One PNG per character.
+/// The clips of each character's two blows, in the order they play, eight frames spread over each clip, each labelled
+/// with its part of the blow (approach, strike with the tick the blow lands at, way back):
+/// `attack-chain-<name>-<short|long>.png`, the evidence of the per-character table of [`super::clips`] drawn.
+/// `FMV_SHEET_CHARACTERS` (prefixes, comma separated) picks characters (all nine without it).
 #[test]
 #[ignore = "needs the owner's real FF7 data (FMV_FF7_DATA) and a GPU or a software Vulkan/GL driver"]
-fn party_slot_evidence_sheets() {
+fn party_attack_chain_sheets() {
     let (Some(path), Some(mut gpu)) = (battle_lgp(), Offscreen::new()) else { return };
     let mut models = BattleModels::open(path).expect("battle.lgp");
-    // idle, victory, run, defend, item, attack, cast (begin, hold, end), hurt, death, dead.
-    let rows = [0usize, 2, 7, 8, 9, 10, 12, 13, 14, 15, 18, 6];
-    for which in BattleCharacter::ALL {
+    let wanted: Option<Vec<String>> = std::env::var("FMV_SHEET_CHARACTERS").ok().map(|s| s.split(',').map(|p| p.trim().to_ascii_lowercase()).collect());
+    for which in BattleCharacter::ALL.into_iter().filter(|c| *c != BattleCharacter::Sephiroth) {
+        if wanted.as_ref().is_some_and(|w| !w.iter().any(|p| p == which.prefix())) {
+            continue;
+        }
         let model = models.load_character(which).expect("the character loads");
-        let used: Vec<usize> = rows.iter().copied().filter(|&s| s < model.animations.len() && model.slot_ok[s]).collect();
+        let kit = Kit::party(clip_set(&model), &model.scripts);
         let rig = Rig::new(model, 900.0);
-        for (half, chunk) in used.chunks(6).enumerate() {
-            let (w, h, sheet) = rig.sheet(&mut gpu, chunk, 6);
-            save(&format!("party-clips-{}-{half}", which.display_name().split(' ').next().unwrap_or("x").to_ascii_lowercase()), w, h, &sheet);
+        let name = which.display_name().split(' ').next().unwrap_or("x").to_ascii_lowercase();
+        for (range, chain) in [("short", &kit.attack), ("long", &kit.shoot)] {
+            let chain = chain.as_ref().expect("the character has the blow");
+            let slots = chain_slots(chain);
+            let note = |slot: usize| {
+                let slot = slot as u16;
+                if chain.approach.contains(&slot) {
+                    let travels = chain.closes_in && chain.approach.get(chain.travel_from) == Some(&slot);
+                    if travels || (!chain.closes_in && chain.approach.first() == Some(&slot)) { "approach, travels" } else { "approach" }.to_string()
+                } else if chain.strike.contains(&slot) {
+                    format!("strike, lands @{}", chain.impact)
+                } else {
+                    "way back".to_string()
+                }
+            };
+            let (w, h, sheet) = rig.every_slot(&mut gpu, &slots, 8, &note);
+            save(&format!("attack-chain-{name}-{range}"), w, h, &sheet);
+        }
+    }
+}
+
+/// For each slot of the pack: the indices of the animation scripts of the model's own `ab` entry that play it
+/// (a script that shares its offset with an earlier one is that one). The evidence the sheets are labelled with.
+fn slots_played_by(prefix: &str, slots: usize) -> Vec<Vec<usize>> {
+    let mut by_slot = vec![Vec::new(); slots];
+    let Some(path) = battle_lgp() else { return by_slot };
+    let Ok(mut lgp) = fmv_ff7::lgp::LgpArchive::open_path(path) else { return by_slot };
+    let Ok(bytes) = lgp.read(&format!("{prefix}ab")) else { return by_slot };
+    let Ok(scripts) = AnimationScripts::parse(&bytes) else { return by_slot };
+    let mut seen = Vec::new();
+    for i in 0..scripts.len() {
+        let offset = scripts.offset(i);
+        if seen.contains(&offset) {
+            continue;
+        }
+        seen.push(offset);
+        let Some(Ok(script)) = scripts.script(i) else { continue };
+        for clip in script.clips() {
+            if let Some(list) = by_slot.get_mut(usize::from(clip)) {
+                if !list.contains(&i) {
+                    list.push(i);
+                }
+            }
+        }
+    }
+    by_slot
+}
+
+/// EVERY slot of each playable character, eight frames spread over each clip, the scripts that play it written
+/// on each picture: `slots-<name>-<n>.png`, seven slots to a picture. The evidence for the per-character table
+/// of [`super::clips`]. `FMV_SHEET_CHARACTERS` (prefixes, comma separated: `rt,sb`) picks characters (all nine
+/// without it).
+#[test]
+#[ignore = "needs the owner's real FF7 data (FMV_FF7_DATA) and a GPU or a software Vulkan/GL driver"]
+fn party_every_slot_sheets() {
+    let (Some(path), Some(mut gpu)) = (battle_lgp(), Offscreen::new()) else { return };
+    let mut models = BattleModels::open(path).expect("battle.lgp");
+    let wanted: Option<Vec<String>> = std::env::var("FMV_SHEET_CHARACTERS").ok().map(|s| s.split(',').map(|p| p.trim().to_ascii_lowercase()).collect());
+    for which in BattleCharacter::ALL.into_iter().filter(|c| *c != BattleCharacter::Sephiroth) {
+        if wanted.as_ref().is_some_and(|w| !w.iter().any(|p| p == which.prefix())) {
+            continue;
+        }
+        let model = models.load_character(which).expect("the character loads");
+        let played = slots_played_by(which.prefix(), model.animations.len());
+        let all: Vec<usize> = (0..model.animations.len()).filter(|&s| model.slot_ok[s]).collect();
+        let rig = Rig::new(model, 900.0);
+        let name = which.display_name().split(' ').next().unwrap_or("x").to_ascii_lowercase();
+        for (n, chunk) in all.chunks(7).enumerate() {
+            let note = |slot: usize| {
+                let by = &played[slot];
+                let tracked = if rig.model.weapon_track_ok.get(slot).copied().unwrap_or(false) { "" } else { " no weapon track" };
+                if by.is_empty() { format!("no script plays it{tracked}") } else { format!("scripts {by:?}{tracked}") }
+            };
+            let (w, h, sheet) = rig.every_slot(&mut gpu, chunk, 8, &note);
+            save(&format!("slots-{name}-{n}"), w, h, &sheet);
         }
     }
 }
@@ -386,12 +557,18 @@ impl Fight {
     /// The same fight with the party starting with the limit gauges `limits` (Cloud, Tifa, Barret; 255 is
     /// full: protocol v7).
     fn with_limits(real: &Real, formation: u16, seed: u64, limits: [u16; 3]) -> Option<Self> {
+        Self::with_party(real, formation, seed, [0, 2, 1], limits)
+    }
+
+    /// The same fight with a party of the combat slots `characters` (FF7's ids: Cloud 0, Barret 1, Tifa 2, Aerith 3, Red
+    /// XIII 4, Yuffie 5, Cait Sith 6, Vincent 7, Cid 8), the first one ours.
+    fn with_party(real: &Real, formation: u16, seed: u64, characters: [u8; 3], limits: [u16; 3]) -> Option<Self> {
         let gpu = Offscreen::new()?;
         let limited = |i: u64, character: u8| BattleMember { limit: limits[i as usize], ..member(i, character) };
         let setup = BattleSetup {
             formation_id: formation,
             seed,
-            party: vec![limited(0, 0), limited(1, 2), limited(2, 1)],
+            party: characters.iter().enumerate().map(|(i, &c)| limited(i as u64, c)).collect(),
             preemptive: true,
             back_attack: false,
             battle_speed: 0,
@@ -429,6 +606,25 @@ impl Fight {
         draw_battle_overlay(&view, &self.scene.head_anchors(&scene_view), W, H, &mut overlay);
         overlay.draw_text_shadowed(8, 24, 2, [255, 255, 255, 255], [0, 0, 0, 255], label);
         self.gpu.render_battle(W, H, &self.scene.frame(&scene_view, false), &overlay)
+    }
+
+    /// A close-up of actor `i` at time `t`: the fight drawn `w` x `h` (without the overlay) and the `cw` x `ch` of it around
+    /// the actor, `label` written in the corner of the crop.
+    fn close_up(&mut self, t: f64, i: usize, label: &str, (w, h): (u32, u32), (cw, ch): (u32, u32)) -> Vec<u8> {
+        self.scene.update(t, &[], self.client.engine());
+        let view = self.scene.view(w, h);
+        let at = self.scene.pose_of(i).and_then(|(pos, ..)| view.to_pixels([pos[0], pos[1] - 380.0, pos[2]])).unwrap_or([w as f32 / 2.0, h as f32 / 2.0]);
+        let x0 = (at[0] as i32 - cw as i32 / 2).clamp(0, (w - cw) as i32) as u32;
+        let y0 = (at[1] as i32 - ch as i32 / 2).clamp(0, (h - ch) as i32) as u32;
+        let mut overlay = DrawList::new();
+        overlay.draw_text_shadowed(x0 as i32 + 6, y0 as i32 + 6, 2, [255, 255, 120, 255], [0, 0, 0, 255], label);
+        let full = self.gpu.render_battle(w, h, &self.scene.frame(&view, false), &overlay);
+        let mut out = vec![0u8; (cw * ch * 4) as usize];
+        for y in 0..ch {
+            let from = (((y0 + y) * w + x0) * 4) as usize;
+            out[(y * cw * 4) as usize..((y + 1) * cw * 4) as usize].copy_from_slice(&full[from..from + (cw * 4) as usize]);
+        }
+        out
     }
 
     /// Frames at `arrival + offset` for each offset, written as a contact sheet named `name`.
@@ -524,6 +720,92 @@ fn fight_mp_attack_chain() {
     fight.sheet("mp-attack-chain-machine-gun-and-tonfa", arrival, &[0.05, 0.2, 0.35, 0.55, 0.7, 0.9, 1.2, 1.7], 2);
 }
 
+/// Whether each of the nine characters' starting weapon is short range, as the real rules say (what decides if the
+/// character runs up to its target or stands and shoots: [`super::super::look_in`]). Printed, and held to what the
+/// game's own weapons are: swords, gloves, staves, spears and claws are short range, guns and shuriken are not.
+#[test]
+#[ignore = "needs the owner's real FF7 data (FMV_FF7_DATA or FMV_FF7_LIBRARY)"]
+fn party_attack_range_by_starting_weapon() {
+    let Some(real) = open_real() else { return };
+    let mut ranges = Vec::new();
+    for ids in [[0u8, 1, 2], [3, 4, 5], [6, 7, 8]] {
+        let setup = BattleSetup {
+            formation_id: 301,
+            seed: SEED,
+            party: ids.iter().enumerate().map(|(i, &c)| member(i as u64, c)).collect(),
+            preemptive: true,
+            back_attack: false,
+            battle_speed: 0,
+            ticks_per_second: 1000,
+        };
+        let state = real.rules.build(&setup).expect("the formation builds");
+        for (i, &c) in ids.iter().enumerate() {
+            let short = state.actor(ActorId(i as u8)).expect("the actor").short_range;
+            eprintln!("character {c}: starting weapon short range: {short}");
+            ranges.push((c, short));
+        }
+    }
+    let of = |c: u8| ranges.iter().find(|r| r.0 == c).map(|r| r.1);
+    assert_eq!((of(0), of(2), of(3)), (Some(true), Some(true), Some(true)), "Cloud, Tifa and Aerith strike in melee");
+    assert_eq!(of(1), Some(false), "Barret's gun arm is long range");
+}
+
+/// One party member's attack at the first MP in a real fight, ten frames over the whole performance (the approach,
+/// the blow, the follow-through, the way back): `attack-strip-<name>.png`, to look at. `FMV_STRIP_CHARACTERS` (FF7
+/// combat slot ids, comma separated) picks the characters (Cloud, Barret, Tifa and Aerith without it).
+#[test]
+#[ignore = "needs the owner's real FF7 data (FMV_FF7_DATA or FMV_FF7_LIBRARY) and a GPU or a software Vulkan/GL driver"]
+fn fight_party_attack_strips() {
+    let Some(real) = open_real() else { return };
+    let wanted: Vec<u8> = std::env::var("FMV_STRIP_CHARACTERS").ok().map(|s| s.split(',').filter_map(|p| p.trim().parse().ok()).collect()).unwrap_or_else(|| vec![0, 1, 2, 3]);
+    for character in wanted {
+        let others: Vec<u8> = [0u8, 2, 1].into_iter().filter(|&c| c != character).collect();
+        let Some(mut fight) = Fight::with_party(&real, 301, SEED, [character, others[0], others[1]], [0; 3]) else { return };
+        fight.now = 2.0;
+        let first = fight.server.step(1);
+        fight.say(first);
+        let arrival = fight.now;
+        let blow = fight.server.attack(ActorId(0));
+        fight.say(blow);
+        let name = ["cloud", "barret", "tifa", "aerith", "red", "yuffie", "cait", "vincent", "cid"].get(usize::from(character)).copied().unwrap_or("x");
+        let offsets = [0.05, 0.15, 0.25, 0.35, 0.45, 0.55, 0.7, 0.9, 1.2, 1.6];
+        // What the director has the performer play at each instant: the clip and the frame (the evidence of the pictures).
+        let played: Vec<String> = offsets.iter().map(|&o| fight.scene.director.motion(0, arrival + o).clip.map_or("idle".to_string(), |c| format!("s{} f{:.1}", c.slot, c.frame))).collect();
+        eprintln!("{name}: {}", played.join(", "));
+        // Each instant twice, in one pass (the scene's clock never goes back): the whole fight, and a close-up at twice the
+        // resolution with the performer in the middle of the picture.
+        let (mut wide, mut close) = (Vec::new(), Vec::new());
+        for &o in &offsets {
+            wide.push(fight.frame(arrival + o, &format!("+{o:.2} s")));
+            close.push(fight.close_up(arrival + o, 0, &format!("+{o:.2} s"), (2 * W, 2 * H), (CLOSE_W, CLOSE_H)));
+        }
+        let (sw, sh, sheet) = contact_sheet(&wide, W, H, 2);
+        save(&format!("attack-strip-{name}"), sw, sh, &sheet);
+        let (zw, zh, zoom) = tile_sheet(&close, CLOSE_W, CLOSE_H, 5);
+        save(&format!("attack-close-{name}"), zw, zh, &zoom);
+    }
+}
+
+/// The size of a close-up of a fight (see [`Fight::close_up`]).
+const CLOSE_W: u32 = 400;
+const CLOSE_H: u32 = 330;
+
+/// Equal `tw` x `th` tiles laid out `per_row` to a row.
+fn tile_sheet(tiles: &[Vec<u8>], tw: u32, th: u32, per_row: usize) -> (u32, u32, Vec<u8>) {
+    let rows = tiles.len().div_ceil(per_row);
+    let (sw, sh) = (tw * per_row as u32, th * rows as u32);
+    let mut sheet = vec![0u8; (sw * sh * 4) as usize];
+    for (n, tile) in tiles.iter().enumerate() {
+        let (ox, oy) = ((n % per_row) as u32 * tw, (n / per_row) as u32 * th);
+        for y in 0..th {
+            let src = &tile[(y * tw * 4) as usize..((y + 1) * tw * 4) as usize];
+            let dst = (((oy + y) * sw + ox) * 4) as usize;
+            sheet[dst..dst + src.len()].copy_from_slice(src);
+        }
+    }
+    (sw, sh, sheet)
+}
+
 /// A party member's blow: Cloud runs up, swings to the impact frame, the MP flinches with its hurt clip, sparks
 /// fly and the number floats up at the very frame of the impact and not before.
 #[test]
@@ -542,9 +824,12 @@ fn fight_party_attack_with_the_number_at_the_impact() {
     assert!(fight.client.view(impact - 0.02).expect("a view").popups.is_empty(), "no number before the impact");
     let numbers = fight.client.view(impact).expect("a view").popups;
     assert!(numbers.iter().any(|p| p.target.0 >= 3 && p.age_ms == 0), "a number is born over the MP at the impact: {numbers:?}");
-    // The scene: Cloud swings (slot 10) up to its impact frame at the impact; the MP's hurt clip (slot 1) starts then.
+    // The scene: Cloud's own blow (his script 20: a crouch, a run, the chop of slot 30 that lands one tick in); at the
+    // impact he is in the chop. The MP's hurt clip (slot 1) starts then. Slot 10 (an item thrown at an enemy) is never his blow.
     let swing = fight.scene.director.motion(0, impact - 0.001).clip.expect("Cloud swings");
-    assert_eq!(swing.slot, 10, "{swing:?}");
+    assert_eq!(swing.slot, 30, "{swing:?}");
+    assert!((swing.frame - 1.0).abs() < 0.1, "the blow lands one tick into the chop: {swing:?}");
+    assert!(fight.scene.director.segments_of(0).iter().all(|s| s.slot != 10));
     let target = numbers.iter().find(|p| p.target.0 >= 3).map(|p| usize::from(p.target.0)).expect("a target");
     assert_eq!(fight.scene.director.motion(target, impact - 0.01).clip, None);
     assert_eq!(fight.scene.director.motion(target, impact + 0.05).clip.map(|c| c.slot), Some(1));

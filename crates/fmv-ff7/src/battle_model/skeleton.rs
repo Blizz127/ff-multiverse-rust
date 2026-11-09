@@ -278,6 +278,11 @@ pub fn animation_pack_name(prefix: &str) -> String {
     format!("{prefix}da")
 }
 
+/// `<prefix>ab`: the animation scripts ([`super::script`]).
+pub fn script_name(prefix: &str) -> String {
+    format!("{prefix}ab")
+}
+
 /// The part file of bone (or piece) `index`: letters run `am`, `an`, .. `az`, `ba`, .. (the third
 /// and fourth letters are the number `12 + index` in base 26), so bone 0 is `<prefix>am` and bone
 /// 49 is `<prefix>cj`. `None` past `zz`.
