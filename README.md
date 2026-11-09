@@ -60,7 +60,9 @@ canon party member, separate from the canon story roles) and pointers to its pro
 **the story's own party fights beside the players (protocol v9)**: the canon Cloud and Barret of the first
 reactor mission are in every battle as companions the server commands, and each player's character is ADDED
 after them, in its own body, replacing nobody, and **a spell, an item or a limit can hit a whole side (protocol
-v10)**: an ALL place for the target pointer, FF7's All materia rule and the 2/3 split. The
+v10)**: an ALL place for the target pointer, FF7's All materia rule and the 2/3 split, and **battles have status
+effects (the version after 11)**: Poison, Regen, Sleep, Stop, Paralysis, Silence, Haste, Slow, Barrier, MBarrier,
+Sadness, Fury and Darkness, inflicted and cured by the game's own spells, items and enemy attacks. The
 synthetic **FIXTURE** plaza still exists
 as a labelled test area; it says nothing about FF7 support.
 
@@ -73,6 +75,7 @@ as a labelled test area; it says nothing about FF7 support.
 | M2-e | Player characters: identity, per-game binding, fighting style (a stat curve) separate from canon roles, pointers to progress (protocol v8) | done for the slice (FF7: generic placeholder bodies, fixed styles; `scripts/slice-smoke.sh`) |
 | M2-f | The story's canon party fights beside the players as server-controlled companions; players are added after them (protocol v9) | done for the first reactor mission (FF7: Cloud and Barret; `scripts/battle-smoke.sh`, `scripts/slice-smoke.sh`) |
 | M2-g | Whole-side targeting: spells, items and limits can hit one target or a whole side, the party side being the canon companions and the players (protocol v10) | done for spells, items and limits (FF7: the All materia rule, the 2/3 split; the enemies' own AI still picks one party member; `scripts/battle-smoke.sh --commands`) |
+| M2-h | Status effects: the statuses of the game's own spells, items and enemy attacks, their clocks, what they do to turns, damage and hit rate, cures, panels and body cues (the version after 11) | done for 13 statuses (the engine's `status` module lists what is left out: Confusion, Berserk, Reflect, Petrify, Frog, ...; `scripts/battle-smoke.sh --status`) |
 | Later | FF8, FF9, FF10 and FF12 adapters on the same core | planned |
 
 **Walking between fields (protocol v4).** The server hosts many fields: the entry field
@@ -652,6 +655,56 @@ whole party.
 `FMV_SMOKE_SCRIPT_A`, `FMV_SMOKE_SCRIPT_B` and
 `FMV_SMOKE_ESCAPE_SCRIPT` override the scripts (to try its failure paths).
 
+**Status effects (the version after 11).** `fmv_ff7_battle::status` is the model and its module docs hold the
+sources and every number: the 32 status bits of the game, what an attack, item or `scene.bin` record's status fields
+mean (a mask and a byte, the low six bits of which are the chance out of 63 and the high bits say inflict, cure or
+toggle; the data's own "no status" marker), and the clocks. The sources are Terence Fergusson's *FF7 Battle
+Mechanics* FAQ (section 2, which could only be read as the Fandom wiki and the search results quote it), the
+ff7-flat-wiki's status and attack-data pages and ff7.info; where they give no figure the module says so (APPROXIMATIONS).
+A **Global Timer** goes up by the Speed Value every tick and a **unit of time** is 8192 of it (31, 91 or 152 ticks at the
+fastest, default and slowest Battle Speed, which the FAQ's own figures check); every fighter also has a **V-Timer**, twice
+as fast, which Haste doubles, Slow halves and Stop freezes. **Poison** takes max HP / 32 every 2.5 units (ignoring Defense
+and Barrier, and it can kill); **Regen** gives the same every unit, 32 times; **Stop** lasts 15 units and **Paralysis** 8
+(on the Global Timer: they freeze the V-Timer); **Barrier** and **MBarrier** last 30 units and halve physical and magical
+damage; **Sleep** (30 units: the sources only say it outlasts Stop) holds the turn until a physical blow wakes it;
+**Silence** closes the Magic command; **Haste** and **Slow** double and halve the ATB gauge and every clock (and cancel
+each other, like **Sadness** and **Fury**: Sadness takes 30% off damage and half off what a hit adds to the limit gauge,
+Fury takes 30% off the hit rate and doubles the limit gauge); **Darkness** halves a party member's Attack command's hit
+rate (and an enemy's attack not at all, as in the game). A sleeper, a stopped or a paralysed fighter **holds** its turn:
+its ATB gauge stays full (a sleeper's keeps filling, the other two freeze) and it is not offered a command
+(`BattleState::ready_actors()` leaves it out, `CommandError::CannotAct`), an enemy waits with its full gauge and acts
+the tick it can, and a blow that leaves it asleep, stopped or paralysed gets no counter. Death is HP 0 (and a knockout
+removes every status) and Near-death is the display of 25% HP or less.
+
+*From the data:* of the Steam copy's 2272 scene attacks 317 carry a status the rules play (145 of them nothing else), 17 items only change statuses (Antidote, Echo Screen, Eye drop,
+Remedy, Speed Drink, Hyper, Tranquilizer, the curtains, the Hourglass, Dream Powder, Mute Mask, Dazers, ...), and the
+kernel's Regen, Poisona, Esuna, Sleepel, Silence, Barrier, MBarrier, Wall, Haste, Slow, Stop, DeBarrier, DeSpell, Bio
+(1 to 3), Freeze and the rest decode as actions: a **status-only** action (`Formula::None`) rolls to hit like a spell
+unless it aims at allies or is an item, a damaging one keeps its damage and then tries its status on every target that
+still stands. Which side a status-only action aims at is the record's own targeting bit; an enemy record's immunity mask
+says which statuses AFFECT it (a set bit), so all ones is "immune to nothing" (209 of 625 enemies) and a clear bit is an
+immunity (Haste and Slow share one). The starting party's grimoire has none of them, and the first mission's enemies
+inflict none, which is why a smoke run needs the debug aid below. Draws: an action without a status effect draws exactly
+what it did; one with a status draws one `below(63)` per target that still stands after its effects (`rules`, "RNG draw
+order"); Poison, Regen and the timers draw nothing.
+
+*On the wire:* three events (`StatusInflicted`, `StatusEnded`, `StatusTick`), two refusals (`CannotAct`, `Silenced`) and
+one input, `BattleMember::status`: the statuses a member STARTS with (absent from the JSON when empty; a set the engine
+does not play, or Haste with Slow, or Sadness with Fury, is refused when the battle is built). *In the client:* the party panel
+and the enemy list tag each fighter with the statuses it has (`Psn`, `Slp`, `Sil`, ... in their colours, as many as the
+window has room for, then a `+N`), the ATB bar is cyan under Haste, violet under Slow and grey while held, the Magic row of
+the menu is greyed out while the character is silenced (with the reason under the cursor), the line under the status band
+says "You are asleep", the popups float a status's name and the turns of Poison, and in the 3D scene a poisoned body is
+tinted and pulses, a sleeper droops and is dim, and a stopped or paralysed one is grey and holds its idle frame.
+The enemies' AI scripts read the status word `0x4000` of every actor from the engine, so a scripted enemy can branch on a status.
+`--debug-status LIST` on `fmv-server` (refused without `--debug-encounters`, warned about at start-up) makes every member
+of every battle start with those statuses; `scripts/battle-smoke.sh --status --build` runs the real server and two bots on the
+real field with it and FAILS unless the server announced every status, both bots' rosters and status notes agree and their
+counts of the status events are EXACTLY the server's, and both bots replayed the battle from their own data with 0
+divergences. *Not played:* Confusion, Berserk, Frog, Small, Petrify, Slow-numb, Reflect, Manipulate, Death Sentence and
+the rest (they decode and are ignored), armor protections, weapon status attacks, Sadness and Fury across battles, and a
+scripted enemy's status-only attack (still announced and nothing: only its damaging attacks inflict).
+
 `md1stin`'s own encounter table (section 6 of the field file, Steam PC build): the first of its
 two 24-byte tables is the enabled one, with rate 128 (a roll succeeds with probability 128/1024)
 and three formations whose weights add up to 64: 301 (weight 24, two enemies), 302 (22, one enemy)
@@ -863,6 +916,11 @@ v10 engine would pick different enemy moves from the same seed, so its replay wo
 v10 client or server is refused at the handshake instead (the real socket test refuses v10 and every older version).
 **Rolling back v11:** nothing it stores is new, so point the server and the clients back at a v10 build together.
 
+**The version after 11 (statuses)** adds three battle events, two refusals and one optional field of the roster (see "Status
+effects" above), so a v11 peer cannot decode them and the version has to move with them: the server and the clients change
+together. It stores nothing new (a status is battle state; the starting statuses are a debug input), so rolling back is
+pointing the server and the clients back at a v11 build together.
+
 ## Importing your own FF7 data
 
 Point the importer at an installed PC copy of FF7 that you own. Your install is only ever
@@ -987,7 +1045,7 @@ crates/                  the Cargo workspace (see the table above)
 scripts/package.sh       build and package a release tarball (and dist/SHA256SUMS)
 scripts/ff-multiverse.sh the launcher entry point shipped in the package (docs/LAUNCHER.md)
 scripts/smoke.sh         two-bot local smoke test
-scripts/battle-smoke.sh  shared-battle smoke test (real data; modes --fixture --random --progress --commands)
+scripts/battle-smoke.sh  shared-battle smoke test (real data; modes --fixture --random --progress --commands --solo --status)
 scripts/travel-smoke.sh  walking between fields: two bots, md1stin -> md1_1 and back (real data)
 scripts/phase-smoke.sh   story phasing: A advances md1stin's story and B does not, party, restart, persist (real data)
 scripts/slice-smoke.sh   the foundations slice: two original characters, a story, a talk, a shared battle, a real server restart
