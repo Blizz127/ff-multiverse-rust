@@ -103,6 +103,16 @@ pub const LOSING_FORMATION: u16 = 2;
 /// talk to it: pressing OK next to it takes a new account to [`STORY_ADVANCED`] (point 0 of the yard).
 pub const TALK_RADIUS: f32 = 80.0;
 
+/// With [`RoomsAdapter::with_a_countdown`], the progression of an account whose countdown story has moved on: the
+/// step of the hall's clear region ([`COUNTDOWN_CLEAR_REGION`]), which makes the countdown the first step started moot.
+pub const STORY_CLEARED: &[u8] = &[2];
+/// With [`RoomsAdapter::with_a_countdown`], how long the countdown is that the hall's story region starts (seconds).
+pub const COUNTDOWN_SECS: u32 = 90;
+/// With [`RoomsAdapter::with_a_countdown`], the corners of the hall's clear region (point 1): coming to it takes an
+/// account that has advanced from [`STORY_ADVANCED`] to [`STORY_CLEARED`], and that ends the countdown the story region
+/// started (`AreaRuntime::countdown_live` is `false` for any story but the one the countdown started in).
+pub const COUNTDOWN_CLEAR_REGION: [(f32, f32); 4] = [(-300.0, 100.0), (-200.0, 100.0), (-200.0, 200.0), (-300.0, 200.0)];
+
 /// The label of the yard's entry point (the point of a scripted yard that fires on entry).
 const YARD_ENTRY_LABEL: &str = "yard entry: progress 0 -> 1";
 
@@ -173,6 +183,7 @@ pub struct RoomsAdapter {
     gates: bool,
     unreviewed_yard: bool,
     interactive: bool,
+    countdown: Option<u32>,
 }
 
 impl RoomsAdapter {
@@ -202,6 +213,20 @@ impl RoomsAdapter {
     /// [`STORY_ADVANCED`].
     pub fn with_interactions() -> Self {
         Self { story: true, interactive: true, ..Self::default() }
+    }
+
+    /// The synthetic story with a COUNTDOWN: the hall's story region ([`STORY_REGION`]) starts one of [`COUNTDOWN_SECS`]
+    /// seconds with its step (`StoryStep::countdown`), and the hall's clear region ([`COUNTDOWN_CLEAR_REGION`]) takes an
+    /// advanced account on to [`STORY_CLEARED`], which makes the countdown moot (`AreaRuntime::countdown_live` is only
+    /// true while the account's story is still [`STORY_ADVANCED`], the one the step left).
+    pub fn with_a_countdown() -> Self {
+        Self::with_a_countdown_of(COUNTDOWN_SECS)
+    }
+
+    /// [`RoomsAdapter::with_a_countdown`] with a countdown of `seconds` (a test that runs the server's own clock through
+    /// one uses a short one).
+    pub fn with_a_countdown_of(seconds: u32) -> Self {
+        Self { story: true, countdown: Some(seconds), ..Self::default() }
     }
 
     /// As [`RoomsAdapter::with_gates`], but the yard is a room the adapter has not reviewed: its entry point is not
@@ -239,6 +264,7 @@ impl GameAdapter for RoomsAdapter {
                 scripted: self.gates,
                 withheld: self.unreviewed_yard && key == YARD,
                 interactive: self.interactive,
+                countdown: self.countdown.filter(|_| key == HALL),
             })),
             GHOST if self.ghost => Err(AdapterError::Decode("the ghost area cannot be loaded (by design)".into())),
             other => Err(AdapterError::AreaNotFound(other.to_string())),
@@ -248,6 +274,10 @@ impl GameAdapter for RoomsAdapter {
     /// The synthetic story keeps the longer of two progressions (the advanced one over a new
     /// account's); without a story the newest write wins, as the trait's default says.
     fn merge_progression(&self, stored: &[u8], advanced: &[u8]) -> Vec<u8> {
+        if self.countdown.is_some() {
+            // the story with the countdown has a third state of the same length: the later byte wins
+            return if (stored.len(), stored) >= (advanced.len(), advanced) { stored.to_vec() } else { advanced.to_vec() };
+        }
         if self.story && stored.len() >= advanced.len() {
             stored.to_vec()
         } else {
@@ -272,6 +302,8 @@ struct Room {
     withheld: bool,
     /// The adapter was built with [`RoomsAdapter::with_interactions`].
     interactive: bool,
+    /// The adapter was built with [`RoomsAdapter::with_a_countdown`] and this is the hall.
+    countdown: Option<u32>,
 }
 
 impl Room {
@@ -411,6 +443,10 @@ impl AreaRuntime for Room {
                 label: "hall story line: progress 0 -> 1".into(),
             });
         }
+        if self.countdown.is_some() {
+            let clear = COUNTDOWN_CLEAR_REGION.iter().map(|&(x, y)| Pos::new(x, y, 0.0)).collect();
+            points.push(StoryPoint { id: 1, trigger: StoryTrigger::Region(clear), label: "hall clear region: progress 1 -> 2".into() });
+        }
         if self.interactive {
             let corners = |c: [(f32, f32); 4]| c.iter().map(|&(x, y)| Pos::new(x, y, 0.0)).collect::<Vec<_>>();
             points.push(StoryPoint { id: 1, trigger: StoryTrigger::Press(corners(PRESS_REGION)), label: "hall press region: progress 0 -> 1".into() });
@@ -453,10 +489,22 @@ impl AreaRuntime for Room {
         }
     }
 
+    /// With the countdown: the story region starts it with its step, the clear region ends it with its own.
+    fn countdown_live(&self, started: &[u8], now: &[u8]) -> bool {
+        self.countdown.is_none() || started == now
+    }
+
     fn story_advance(&self, progress: &[u8], point: u32) -> Option<StoryStep> {
+        if let Some(seconds) = self.countdown {
+            return match point {
+                0 => progress.is_empty().then(|| StoryStep { progress: STORY_ADVANCED.to_vec(), summary: "moment=0->1".into(), countdown: Some(seconds) }),
+                1 => (progress == STORY_ADVANCED).then(|| StoryStep { progress: STORY_CLEARED.to_vec(), summary: "moment=1->2".into(), countdown: None }),
+                _ => None,
+            };
+        }
         // The toggle region: a step that is not forward, from the advanced story back to a new account's.
         if self.interactive && !self.is_yard() && point == 4 {
-            return (progress == STORY_ADVANCED).then(|| StoryStep { progress: Vec::new(), summary: "moment=1->0".into() });
+            return (progress == STORY_ADVANCED).then(|| StoryStep { progress: Vec::new(), summary: "moment=1->0".into(), countdown: None });
         }
         let exists = self.story
             && if self.is_yard() {
@@ -464,7 +512,7 @@ impl AreaRuntime for Room {
             } else {
                 point == 0 || (self.scripted && point == 1) || (self.interactive && point <= 3)
             };
-        (exists && progress.is_empty()).then(|| StoryStep { progress: STORY_ADVANCED.to_vec(), summary: "moment=0->1".into() })
+        (exists && progress.is_empty()).then(|| StoryStep { progress: STORY_ADVANCED.to_vec(), summary: "moment=0->1".into(), countdown: None })
     }
 
     /// The unreviewed yard's entry point and the exit it would have had, left off.
@@ -611,6 +659,39 @@ mod tests {
             assert!([HALL, YARD].iter().all(|k| plain.load_area(k).unwrap().story_withheld().is_none()));
         }
         assert_eq!(RoomsAdapter::with_gates().load_area(YARD).unwrap().story_points().len(), 1);
+    }
+
+    #[test]
+    fn the_countdown_story_starts_a_timer_with_its_first_step_and_ends_it_with_the_second() {
+        let a = RoomsAdapter::with_a_countdown();
+        let (hall, yard) = (a.load_area(HALL).unwrap(), a.load_area(YARD).unwrap());
+        assert_eq!(hall.story_points().iter().map(|p| p.id).collect::<Vec<_>>(), [0, 1]);
+        assert!(yard.story_points().is_empty());
+        // the story region's step starts the countdown, the clear region's does not
+        let first = hall.story_advance(&[], 0).expect("the first step");
+        assert_eq!((first.progress.as_slice(), first.countdown), (STORY_ADVANCED, Some(COUNTDOWN_SECS)));
+        assert_eq!(hall.story_advance(STORY_ADVANCED, 0), None, "once");
+        let second = hall.story_advance(STORY_ADVANCED, 1).expect("the second step");
+        assert_eq!((second.progress.as_slice(), second.countdown), (STORY_CLEARED, None));
+        assert_eq!((hall.story_advance(&[], 1), hall.story_advance(STORY_CLEARED, 1)), (None, None));
+        // the countdown matters while the story is still where the first step left it
+        assert!(hall.countdown_live(STORY_ADVANCED, STORY_ADVANCED));
+        assert!(!hall.countdown_live(STORY_ADVANCED, STORY_CLEARED));
+        assert!(!hall.countdown_live(STORY_ADVANCED, &[]));
+        // the region is in the hall, away from the others, and walking into it is a hit
+        let clear = &hall.story_points()[1];
+        assert!(clear.is_hit_by(Pos::new(-150.0, 150.0, 0.0), Pos::new(-250.0, 150.0, 0.0)));
+        assert!(!clear.is_hit_by(Pos::new(100.0, 0.0, 0.0), Pos::new(200.0, 0.0, 0.0)));
+        // the later byte wins a merge, whichever order the saves arrive in
+        assert_eq!(a.merge_progression(STORY_ADVANCED, STORY_CLEARED), STORY_CLEARED);
+        assert_eq!(a.merge_progression(STORY_CLEARED, STORY_ADVANCED), STORY_CLEARED);
+        assert_eq!(a.merge_progression(&[], STORY_ADVANCED), STORY_ADVANCED);
+        // the other variants have no countdown: a step starts none and every story is live
+        for plain in [RoomsAdapter::with_story(), RoomsAdapter::with_gates(), RoomsAdapter::with_interactions()] {
+            let hall = plain.load_area(HALL).unwrap();
+            assert_eq!(hall.story_advance(&[], 0).map(|s| s.countdown), Some(None));
+            assert!(hall.countdown_live(STORY_ADVANCED, STORY_CLEARED));
+        }
     }
 
     #[test]

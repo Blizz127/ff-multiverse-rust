@@ -132,6 +132,14 @@ impl World {
     /// refresh after something changed (a party, the story): nothing is sent unless the instance or the
     /// placement differs.
     pub(super) fn settle(&mut self, entity: EntityId, entering: bool, failed: &mut Vec<(EntityId, bool)>) {
+        self.settle_placement(entity, entering, failed);
+        // Whoever governs the player's story now may have a countdown the player has not been told of (or none, after
+        // one it was told of): the placement is what says who governs (see the `countdown` module).
+        self.sync_countdown(entity, failed);
+    }
+
+    /// The placement half of [`World::settle`].
+    fn settle_placement(&mut self, entity: EntityId, entering: bool, failed: &mut Vec<(EntityId, bool)>) {
         let placement = match self.placement_of(entity) {
             Ok(Some(placement)) => placement,
             Ok(None) => return,

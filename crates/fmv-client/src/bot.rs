@@ -256,6 +256,9 @@ pub struct TravelBot {
     failed_plans: u32,
     /// How the bot gets about in an area with links (ladders, jumps): see [`crate::route`]. Unused in any other.
     nav: Navigator,
+    /// Times the navigator aimed again in this area because the walker stood at its aim short of the exit's line (see
+    /// [`TravelBot::step_linked`]).
+    reaims: u32,
 }
 
 /// The planned way to an exit.
@@ -273,6 +276,8 @@ struct Plan {
 const PLAN_COOLDOWN_STEPS: u32 = 100;
 /// Plans that may fail in one area before the bot stops planning there.
 const MAX_FAILED_PLANS: u32 = 4;
+/// Times a bot in an area with links aims again from where it stands when it has come to its aim short of the exit's line.
+const MAX_REAIMS: u32 = 3;
 
 /// Steps without headway after which a [`TravelBot`] gives up (at 100 steps per second: 5 s).
 pub const STUCK_LIMIT: u32 = 500;
@@ -292,6 +297,7 @@ impl TravelBot {
             plan_cooldown: 0,
             failed_plans: 0,
             nav: Navigator::new(),
+            reaims: 0,
         }
     }
 
@@ -330,6 +336,7 @@ impl TravelBot {
         self.plan = None;
         self.plan_cooldown = 0;
         self.failed_plans = 0;
+        self.reaims = 0;
         self.nav.arrived();
         self.arrived_at = Some(now);
         self.peer_seen_at = None;
@@ -466,7 +473,7 @@ impl TravelBot {
         };
         // Other exits are not for us; the wanted one (and any on its line) is crossed on purpose.
         let others = |a: Pos, b: Pos| exits.iter().any(|e| !e.same_line_as(goal_exit) && e.is_crossed_by(a, b));
-        let key = goal_key(&[&area.info().id.key, next]);
+        let key = goal_key(&[&area.info().id.key, next, &self.reaims.to_string()]);
         match self.nav.step(area, cur, key, &aim, false, &others, dt, speed) {
             Nav::Step(step) => {
                 if step.moved {
@@ -475,6 +482,15 @@ impl TravelBot {
                 step
             }
             Nav::Press => still,
+            // The walker stands at its aim and the exit has not been crossed. The aim is a little past the line along the
+            // way from where the walk STARTED (a landing of a ladder, far away), which is the wrong side of the line when
+            // the way round comes to it from the other side (the stair up from the reactor's core, `nmkin_4`): aim again
+            // from here, which puts the aim past the line from where the walker stands. A few times; after that it is
+            // stuck like any other walker that cannot get out.
+            Nav::Here if self.reaims < MAX_REAIMS => {
+                self.reaims += 1;
+                still
+            }
             // At the goal and still here (the exit is not open for us), or no way at all: wait, and give up if it lasts.
             Nav::Here | Nav::NoWay => {
                 self.stuck += 1;

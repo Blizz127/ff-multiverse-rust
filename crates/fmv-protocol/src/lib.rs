@@ -251,6 +251,27 @@
 //!
 //! An account that has never advanced gets exactly the messages it always got.
 //!
+//! # Countdown
+//!
+//! A story step can start a countdown (FF7: the first reactor's bomb, which the Guard Scorpion step starts at 10:00 and
+//! which the story's later moment makes moot). The SERVER owns the clock: it starts it when the step is applied, tells the
+//! players, and ends it; a client only draws what it was told (`fmv-client`'s `ui::countdown`). A countdown belongs to
+//! the account whose story it is (the one that took the step) and is shown to the players that story governs: the
+//! account itself and the members of its party (the same rule that decides which exits are open for a member).
+//!
+//! ```text
+//! S -> C  Countdown { Running { remaining_ms, total_ms } }   a step started one; you joined the party that has one
+//! S -> C  Countdown { Over { Cleared } }                     the story moved past it; you left it (the party, or the world)
+//! S -> C  Countdown { Over { TimeUp } }                      it ran out
+//! ```
+//!
+//! **A countdown that runs out does nothing to anybody's story**: the server logs one line
+//! (`countdown over account=<n> reason=time-up ...`), sends `Over { TimeUp }` and goes on; no progress is saved, wiped or
+//! reset, nobody is moved. (The game's own timer ends in a game over; a persistent multiplayer account is not punished for
+//! a late party.) A countdown is not stored: a server that restarts, or an account that logs in again, has none, and a
+//! client that was never sent one shows none. The message was added after v14; a peer that predates it cannot decode it,
+//! so the integrator bumps the version.
+//!
 //! # Accounts
 //!
 //! `Hello::auth` is [`Auth::Register`] (create an account with that display name) or
@@ -649,6 +670,31 @@ pub enum ServerMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         advance: Option<StoryAdvance>,
     },
+    /// The countdown that governs this player's story, as the server runs it (see the module docs, "Countdown"): sent when
+    /// a story step starts one (to the account that took the step and to the members of its party), to a player whose
+    /// governing story changes hands (it joined the party that has one, or left it), and when it is over. Added after v14
+    /// (the integrator bumps the version): a peer that does not know the message cannot decode it.
+    Countdown { state: CountdownState },
+}
+
+/// What a [`ServerMsg::Countdown`] says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CountdownState {
+    /// A countdown is running: `remaining_ms` are left as the server writes this (the client counts down on its own clock
+    /// from the moment it reads it, and a later `Running` replaces what it counts), `total_ms` is how long it was at the
+    /// start (a bar or a colour may use the ratio).
+    Running { remaining_ms: u32, total_ms: u32 },
+    /// It is over for this player: no countdown governs its story any more.
+    Over { reason: CountdownEnd },
+}
+
+/// Why a countdown is over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CountdownEnd {
+    /// It ran out. **Nothing else happens** (the story and the saved progress are untouched): the server says it and goes on.
+    TimeUp,
+    /// The story moved past what it was for (the party got out), or the one it belonged to left the party or the world.
+    Cleared,
 }
 
 /// What moved a player's story (see [`ServerMsg::StoryUpdate`]): the story point the server saw it
@@ -980,6 +1026,26 @@ mod tests {
         // Said at join: no `advance` key at all.
         golden(ServerMsg::StoryUpdate { progress: vec![1, 6, 0], advance: None }, r#"{"StoryUpdate":{"progress":[1,6,0]}}"#);
         golden(ServerMsg::StoryUpdate { progress: vec![], advance: None }, r#"{"StoryUpdate":{"progress":[]}}"#);
+    }
+
+    #[test]
+    fn golden_countdown() {
+        // Running: how long is left as the server wrote it, and how long it was.
+        golden(
+            ServerMsg::Countdown { state: CountdownState::Running { remaining_ms: 599_950, total_ms: 600_000 } },
+            r#"{"Countdown":{"state":{"Running":{"remaining_ms":599950,"total_ms":600000}}}}"#,
+        );
+        // Over: it ran out (nothing else happens), or the story moved past it.
+        golden(
+            ServerMsg::Countdown { state: CountdownState::Over { reason: CountdownEnd::TimeUp } },
+            r#"{"Countdown":{"state":{"Over":{"reason":"TimeUp"}}}}"#,
+        );
+        golden(
+            ServerMsg::Countdown { state: CountdownState::Over { reason: CountdownEnd::Cleared } },
+            r#"{"Countdown":{"state":{"Over":{"reason":"Cleared"}}}}"#,
+        );
+        // a message a peer that predates it cannot read is a decode error, which is why the integrator bumps the version
+        assert!(serde_json::from_str::<ServerMsg>(r#"{"Countdown":{"state":{"Over":{"reason":"Whatever"}}}}"#).is_err());
     }
 
     // -----------------------------------------------------------------------------------------

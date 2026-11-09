@@ -163,7 +163,19 @@ fn the_story_points_of_the_chain_are_the_ones_the_scripts_make() {
     );
     assert_eq!(points("md1_1"), one("region(3)", "triangle 62: moment <7 -> 7"));
     assert_eq!(points("md1_2"), one("entry", "entry: moment <8 -> 8"));
-    assert_eq!(points("nrthmk"), one("entry", "entry: moment <10 -> 10"));
+    // nrthmk: the way in (8 -> 10) and the finale of the mission (the explosion's cutscene, which a party that walks out of
+    // the reactor at 27 or later is moved to 33 by); the loop that plays the late party's game over wants the timeout flag
+    // SET, which nothing in the model sets, and is not a point
+    assert_eq!(
+        points("nrthmk"),
+        [
+            ("entry".to_string(), "entry: moment <10 -> 10".to_string()),
+            (
+                "entry".to_string(),
+                "entry: moment >=27 and Var[1][225] bit 7 clear -> 33; moment >=27 and Var[1][225] bit 7 clear -> Var[1][225] bit 0 on".to_string()
+            )
+        ]
+    );
     assert_eq!(points("nmkin_1"), one("line", "line: moment <11 -> 11"));
     // the lift's panel waits for the OK button: presses, not regions walked into: the ride down, and the ride back that
     // the panel's own script makes
@@ -188,7 +200,11 @@ fn the_story_points_of_the_chain_are_the_ones_the_scripts_make() {
         points("nmkin_5"),
         [
             // the guard scorpion: the triangle of the core starts battle 324 first and the step waits for the win
-            ("region(3)".to_string(), "triangle 2: moment <27 -> 27 (starts battle 324 first, the step is paid when it is won)".to_string()),
+            // ... and the ten minutes of the bomb that its block sets
+            (
+                "region(3)".to_string(),
+                "triangle 2: moment <27 -> 27 (starts battle 324 first, the step is paid when it is won) (starts a countdown of 600 s)".to_string()
+            ),
             // the two points of the escape (moments 120 and 123: no account of the first mission is there)
             ("region(3)".to_string(), "triangle 2: moment ==123 -> 127".to_string()),
             ("entry".to_string(), "entry: moment ==120 -> 123".to_string()),
@@ -298,9 +314,9 @@ fn script_exits_and_story_points_of_the_archive_in_numbers() {
     // two points start a fight first, and the ladders and jumps are 141 walk-on lines and 49 that wait for OK)
     assert_eq!(
         (points.get("region").copied(), points.get("press").copied(), points.get("talk").copied(), points.get("line").copied(), points.get("entry").copied()),
-        (Some(6), Some(2), Some(49), Some(20), Some(56))
+        (Some(6), Some(2), Some(49), Some(20), Some(74))
     );
-    assert_eq!((fields_with_points, ok_points, battle_first), (81, 2, 2), "the lift's two presses want OK");
+    assert_eq!((fields_with_points, ok_points, battle_first), (95, 2, 2), "the lift's two presses want OK");
     assert_eq!((walk_on_links, ok_links, fields_with_links), (141, 49, 33));
 }
 
@@ -318,10 +334,11 @@ fn gateways(area: &dyn AreaRuntime) -> Vec<Exit> {
 /// story points and links; every other field offers its gateways exactly as ever and leaves the rest off, saying what it
 /// left off and why. Over the whole archive: gateways are the same everywhere, a field that is not reviewed has no script
 /// exit, no point, no link and no step a point could take for any story, its phases are what they were, and what it says
-/// it left off is exactly what its data holds. The data holds 917 script exits, 133 points and 190 links; the ten
-/// fields offer 4, 14 and 11 of them (the lift's four exits, the mission's fourteen points, and the ladders and jumps of
-/// `nmkin_2`, `nmkin_3` and `nmkin_4`), the other fields that have any leave off the rest (see the numbers asserted at the
-/// end).
+/// it left off is exactly what its data holds. The data holds 917 script exits, 151 points and 190 links (133 points
+/// before the writes of a requested script were read: 18 more entry points, one of them the mission's finale in `nrthmk`
+/// and the other seventeen in fields that are left off); the ten fields offer 4, 15 and 11 of them (the lift's four
+/// exits, the mission's fifteen points, and the ladders and jumps of `nmkin_2`, `nmkin_3` and `nmkin_4`), the other fields
+/// that have any leave off the rest (see the numbers asserted at the end).
 #[test]
 #[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
 fn the_fields_that_are_not_reviewed_offer_their_gateways_and_nothing_else_of_the_story() {
@@ -370,8 +387,8 @@ fn the_fields_that_are_not_reviewed_offer_their_gateways_and_nothing_else_of_the
         }
     }
     println!("offered by the reviewed fields: {offered:?} (script exits, points, links); left off in {fields_left_off} other fields: {left_off:?}");
-    assert_eq!(offered, (4, 14, 11));
-    assert_eq!((left_off, fields_left_off), ((913, 119, 179), 299));
+    assert_eq!(offered, (4, 15, 11));
+    assert_eq!((left_off, fields_left_off), ((913, 136, 179), 310));
 }
 
 /// The cases that matter, named: the entry point of a Sector 8 field that raises a story from 33 to 36 the moment a
@@ -666,7 +683,7 @@ fn the_woman_and_the_materia_are_talk_points_and_the_talk_scripts_decide_their_s
     assert_eq!(radius, 80.0, "the radius a character without its own has");
     let npcs = nmkin_3.npcs();
     assert_eq!(npcs.iter().filter(|n| n.pos == center).count(), 1, "one NPC stands at the point's centre: the woman");
-    for (moment, want) in [(1, Some("moment=1->14")), (13, Some("moment=13->14")), (14, None), (15, None), (27, None), (40, None)] {
+    for (moment, want) in [(1, Some("moment=1->14")), (13, Some("moment=13->14")), (14, None), (15, None), (27, Some("var1.225=0->32")), (40, Some("var1.225=0->32"))] {
         assert_eq!(step(nmkin_3.as_ref(), 0, moment).as_deref(), want, "nmkin_3's woman at moment {moment}");
     }
     assert_eq!(nmkin_3.story_battle(0), None);
@@ -846,4 +863,246 @@ fn the_links_trap_nobody_and_the_walk_that_worked_before_does_not_touch_them() {
         println!("nmkin_2 walk-on link #{i}: touches {touched:?}; the shortest way is {} triangles", path.len());
         assert!(touched.is_disjoint(&path), "the shortest way on foot passes over walk-on link #{i} of nmkin_2");
     }
+}
+
+/// **The bomb's countdown.** The Guard Scorpion's block sets a timer of ten minutes (`STTIM 0:10:00`, just before the
+/// moment is written), which the point carries as the step's countdown. It is live while the story's moment is still 27
+/// (every reactor field's timer window and timeout test `Var[2][0] == 27`): the lift going up or down does not end it
+/// and the finale's step to 33 does, and a story nobody can read has none.
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn the_guard_scorpion_starts_a_ten_minute_countdown_that_the_finale_makes_moot() {
+    let Some(adapter) = adapter() else { return };
+    let core = adapter.load_area("nmkin_5").unwrap();
+    for moment in [13, 14, 15, 26] {
+        let step = core.story_advance(&state(moment, true), 0).unwrap_or_else(|| panic!("the core at {moment}"));
+        assert_eq!(step.countdown, Some(600), "ten minutes at moment {moment}");
+    }
+    let won = core.story_advance(&state(15, true), 0).unwrap();
+    assert_eq!((won.summary.as_str(), won.progress.as_slice()), ("moment=15->27", &[2, 27, 0, 1, 1, 225, 1][..]), "the blob the smoke pins: 021b000101e101");
+    // nothing else of the mission starts a countdown (the other points of this field and of every reviewed field)
+    for field in fmv_ff7::REVIEWED_FIELDS {
+        let area = adapter.load_area(field).unwrap();
+        for point in area.story_points() {
+            for blob in [vec![], state(10, false), state(15, true), state(27, true), state(27, false), state(33, false), state(120, true), state(123, true)] {
+                if let Some(step) = area.story_advance(&blob, point.id) {
+                    assert_eq!(step.countdown.is_some(), field == "nmkin_5" && point.id == 0, "{field}#{}: {step:?}", point.id);
+                }
+            }
+        }
+    }
+    // what the countdown is for, judged by the adapter
+    let at_27 = state(27, true);
+    assert!(core.countdown_live(&at_27, &at_27));
+    assert!(core.countdown_live(&at_27, &state(27, false)), "the lift riding up does not end it");
+    assert!(core.countdown_live(&state(27, false), &at_27), "nor does it riding down");
+    assert!(!core.countdown_live(&at_27, &state(33, true)), "the finale ends it");
+    assert!(!core.countdown_live(&at_27, &state(28, true)));
+    assert!(!core.countdown_live(&at_27, &state(15, true)));
+    assert!(!core.countdown_live(&at_27, &[9, 9]), "a story nobody can read has none");
+    assert!(!core.countdown_live(&[9, 9], &at_27));
+    // it is the same for every reviewed field (the world asks the area the account stood in)
+    for field in fmv_ff7::REVIEWED_FIELDS {
+        let area = adapter.load_area(field).unwrap();
+        assert!(area.countdown_live(&at_27, &at_27) && !area.countdown_live(&at_27, &state(33, false)), "{field}");
+    }
+}
+
+/// **The finale of the mission.** The party that walks out of the reactor at moment 27 or later is moved to 33 by the
+/// loop of a nameless entity of `nrthmk`, which runs the director's cutscene script (the explosion's movie, the moment
+/// written, the lift's bit turned on, then a jump to `md8_4`, a field with no player-controlled character whose own
+/// scripts jump on to `md8_1`: the end of what a server can judge). The point is the second of `nrthmk` (after the way in,
+/// `entry <10`), fires when a player comes to stand there, and applies only while the story is not past it:
+///
+/// * 27 to 33, whichever way the lift's bit stands (the finale turns it on: `var1.225=0->1` when it was up), and any
+///   moment between (28 to 32) goes to 33 too;
+/// * 26 and before: not yet (the party has not set the bomb), and 33 is only a step where it turns the lift's bit on;
+/// * the late party's game over (the loop that wants the timeout flag set) is not a point at all: nothing sets the flag.
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn the_finale_moves_a_party_that_walks_out_at_27_to_33_and_applies_to_a_late_party_too() {
+    let Some(adapter) = adapter() else { return };
+    let area = adapter.load_area("nrthmk").unwrap();
+    let points = area.story_points();
+    assert_eq!(points.len(), 2, "the way in, and the finale: {points:?}");
+    assert!(points[1].is_on_entry(), "the finale fires on coming to stand in nrthmk");
+    assert_eq!(area.story_battle(1), None);
+    let step = |blob: &[u8]| area.story_advance(blob, 1);
+    // 27 to 33 with the lift down (what the descent left): the moment, and nothing else changed (the bit is on)
+    let done = step(&state(27, true)).expect("the finale at 27, lift down");
+    assert_eq!((done.summary.as_str(), done.progress.as_slice(), done.countdown), ("moment=27->33", &[2, 33, 0, 1, 1, 225, 1][..], None));
+    // with the lift up (the party rode back up first): the bit is turned on again by the cutscene
+    let done = step(&state(27, false)).expect("the finale at 27, lift up");
+    assert_eq!((done.summary.as_str(), done.progress.as_slice()), ("moment=27->33 var1.225=0->1", &[2, 33, 0, 1, 1, 225, 1][..]));
+    for moment in [28u16, 30, 32] {
+        assert_eq!(step(&state(moment, true)).map(|s| s.summary), Some(format!("moment={moment}->33")), "{moment}");
+    }
+    // not before the bomb is set
+    for moment in [0u16, 1, 11, 15, 26] {
+        assert_eq!(step(&state(moment, true)), None, "moment {moment}");
+        assert_eq!(step(&state(moment, false)), None, "moment {moment}");
+    }
+    assert_eq!(step(&[]), None, "a new account");
+    // at 33 and later it is a step only where it turns the lift's bit on, and never moves the moment back
+    assert_eq!(step(&state(33, true)), None);
+    assert_eq!(step(&state(33, false)).map(|s| s.summary).as_deref(), Some("var1.225=0->1"));
+    assert_eq!(step(&state(40, true)), None);
+    // the step is once: after it the story is at 33 with the bit on
+    assert_eq!(step(&done.progress), None);
+    // nobody can have the timeout flag set, so the late party's loop is not a point and a story that does has none
+    let mut timed_out = StoryState::at(27);
+    assert!(!timed_out.set_bit(1, 225, 7, true), "the model refuses to turn the flag on");
+    let blob = vec![2, 27, 0, 1, 1, 225, 0x80];
+    assert_eq!(step(&blob), None, "a story with the flag set (nobody makes one) is not moved by the finale");
+    // the other reviewed fields have no finale
+    for field in fmv_ff7::REVIEWED_FIELDS.iter().filter(|f| **f != "nrthmk") {
+        let other = adapter.load_area(field).unwrap();
+        for id in 0..8 {
+            if let Some(s) = other.story_advance(&state(27, true), id) {
+                assert_ne!(StoryState::decode(&s.progress).map(|st| st.moment), Some(33), "{field}#{id}: {s:?}");
+            }
+        }
+    }
+}
+
+/// The arrival points of `field`: the arrival of every exit of every field of the archive that leads to it (the hint
+/// triangle the server puts the player on), and, for `home`, the triangles under the spawn points.
+fn arrivals_of(adapter: &Ff7Adapter, field: &str, home: &str) -> std::collections::BTreeSet<usize> {
+    let area = adapter.load_field(field).unwrap();
+    let mesh = area.walkmesh();
+    let mut found = std::collections::BTreeSet::new();
+    if field == home {
+        for spawn in area.spawn_points() {
+            let at = |x: f32, y: f32| mesh.triangles.iter().position(|t| fmv_ff7::script::triangle_contains_xy(t, x.round() as i32, y.round() as i32));
+            found.extend(at(spawn.x, spawn.y));
+        }
+    }
+    for info in adapter.list_areas() {
+        let from = adapter.load_field(&info.id.key).unwrap();
+        for exit in from.exits().iter().filter(|e| e.target == field) {
+            let placed = area.place_arrival(exit.arrival, exit.arrival_hint);
+            if let Some(t) = mesh.triangles.iter().enumerate().find(|(_, t)| fmv_ff7::script::triangle_contains_xy(t, placed.x.round() as i32, placed.y.round() as i32)) {
+                found.insert(exit.arrival_hint.map_or(t.0, |h| h as usize));
+            }
+        }
+    }
+    found
+}
+
+/// **Nobody is stranded at the new moments.** A re-login always joins `md1stin`, and a party at 27 or 33 walks the
+/// mission's fields in the order its story lets it. In every reviewed field, from every place a player arrives (the
+/// arrival of every exit of the archive that leads there, `md1stin`'s spawn points), walking and the ladders and
+/// jumps reach a line of an exit that is OPEN for the story, at 27 with the lift up and down and at 33 with the lift up
+/// and down. (Open exits exist in every state: what is pinned is that one of them can be WALKED to.) The cast does not
+/// change with the moment (the server keeps every field's characters as the data places them: a known gap), and
+/// the phases of the fields are the intervals their scripts compare the moment with.
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn nobody_is_stranded_at_27_or_33_in_any_reviewed_field() {
+    let Some(adapter) = adapter() else { return };
+    let stories = [("27, lift up", state(27, false)), ("27, lift down", state(27, true)), ("33, lift up", state(33, false)), ("33, lift down", state(33, true))];
+    for field in fmv_ff7::REVIEWED_FIELDS {
+        let area = adapter.load_field(field).unwrap();
+        let mesh = area.walkmesh();
+        let arrivals = arrivals_of(&adapter, field, "md1stin");
+        assert!(!arrivals.is_empty(), "{field} is arrived at from somewhere");
+        for (name, story) in &stories {
+            let open: Vec<Exit> = area.exits().into_iter().filter(|e| area.exit_state(e, story) == ExitState::Open).collect();
+            assert!(!open.is_empty(), "{field} at {name}: some exit is open");
+            let open_triangles: std::collections::BTreeSet<usize> = open.iter().flat_map(|e| triangles_at(mesh, e)).collect();
+            for &start in &arrivals {
+                let reach = reach_with_links(&area, start);
+                assert!(reach.iter().any(|t| open_triangles.contains(t)), "{field} at {name}: from the arrival on triangle {start} no open exit ({:?}) can be walked to", open.iter().map(|e| e.target.as_str()).collect::<Vec<_>>());
+            }
+        }
+        // the cast is not decided by the moment (the phase of the field for a story does not change who stands there)
+        for (name, story) in &stories {
+            let phase = area.phase_key(story).expect("a story the adapter reads");
+            assert_eq!(area.npcs_in_phase(&phase), area.npcs(), "{field} at {name}: the cast is the one the data places");
+        }
+    }
+    // nothing of the mission re-fires at 33: the points of the reviewed fields apply to the story before them only, except the
+    // lift's panel (it rides back up as often as it is pressed) and the woman of nmkin_3 (her talk frees her once, from moment
+    // 27 on, and moves no moment)
+    for field in fmv_ff7::REVIEWED_FIELDS {
+        let area = adapter.load_area(field).unwrap();
+        for point in area.story_points() {
+            let step = area.story_advance(&state(33, true), point.id);
+            assert_eq!(step.is_some(), (field == "elevtr1" && point.id == 1) || (field == "nmkin_3" && point.id == 0), "{field}#{}: {step:?}", point.id);
+        }
+    }
+}
+
+/// **What each field is at 27 and after: its phase.** The phase of a field for a story is the interval of the moment that its
+/// own scripts compare the counter with, so two accounts in the same interval share one instance and see each other. The
+/// first three fields only compare the moment against numbers of the way in (7 and 8 at the most): they are one phase for every
+/// story from 8 on, the escape's and the later ones. The six reactor fields and `nrthmk` compare it with 27: moment 27 (the
+/// bomb is set and the countdown runs) is a phase of its own in each, 28 on (the party has got out) another (the lift's own
+/// field has one more edge, at 33, where its way leads to the second reactor), and the finale's step from 27 to 33 moves
+/// the party from the first to the second.
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn each_reviewed_field_is_one_phase_at_27_of_its_own_and_one_from_28_on() {
+    let Some(adapter) = adapter() else { return };
+    let phase = |area: &dyn AreaRuntime, moment: u16| area.phase_key(&state(moment, false)).expect("a story the adapter reads");
+    for field in ["md1stin", "md1_1", "md1_2"] {
+        let area = adapter.load_area(field).unwrap();
+        assert!([8, 26, 27, 28, 33, 120].iter().all(|&m| phase(area.as_ref(), m) == phase(area.as_ref(), 8)), "{field}: one phase from 8 on");
+    }
+    for field in ["nrthmk", "elevtr1", "nmkin_1", "nmkin_2", "nmkin_3", "nmkin_4", "nmkin_5"] {
+        let area = adapter.load_area(field).unwrap();
+        let (before, bomb, out) = (phase(area.as_ref(), 26), phase(area.as_ref(), 27), phase(area.as_ref(), 28));
+        assert_ne!(before, bomb, "{field}: 27 is not 26");
+        assert_ne!(bomb, out, "{field}: 27 is not 28");
+        assert!([28, 30, 32].iter().all(|&m| phase(area.as_ref(), m) == out), "{field}: 28 on is one phase (up to the next comparison: the lift's own, at 33)");
+        // the phase does not depend on the lift's bit or on the woman's, which are not part of the phases
+        let mut variant = StoryState::at(27);
+        assert!(variant.set_bit(1, 225, 0, true) && variant.set_bit(1, 225, 5, true));
+        assert_eq!(area.phase_key(&variant.encode()), Some(bomb.clone()), "{field}");
+    }
+}
+
+/// **The woman who is stuck on the way out.** The talk point of `nmkin_3` (entity 4) was the way down's step 13 to 14; at
+/// moment 27 or later its own script takes the other branch: with bit 5 of the reactor byte clear it turns the bit on (she
+/// is freed and walks off), and with it set she is gone (her set-up hides her), so the talk is a step once. It moves no
+/// moment and no exit or point waits for the bit; it is a story step the party takes, saved with the story (the lift's bit
+/// and hers are both in the byte, whichever order the party does them in), and it never gets in the way of the lift's ride
+/// back or the finale.
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn the_woman_of_nmkin_3_is_freed_on_the_way_out_once_and_it_changes_nothing_else() {
+    let Some(adapter) = adapter() else { return };
+    let woman = adapter.load_area("nmkin_3").unwrap();
+    let step = |blob: &[u8]| woman.story_advance(blob, 0);
+    // the way out: at 27 with the lift down (what the descent left), the first talk frees her
+    let freed = step(&state(27, true)).expect("a talk at 27");
+    assert_eq!((freed.summary.as_str(), freed.progress.as_slice(), freed.countdown), ("var1.225=1->33", &[2, 27, 0, 1, 1, 225, 0x21][..], None));
+    assert_eq!(step(&freed.progress), None, "she is gone: the talk is a step once");
+    // any moment from 27 on (the escape's own, and later ones), with the lift either way
+    for moment in [27u16, 28, 33, 40] {
+        assert!(step(&state(moment, true)).is_some() && step(&state(moment, false)).is_some(), "moment {moment}");
+    }
+    // not before the bomb is set: the way down's talk stops at 14, and between 14 and 27 there is nothing to say that moves anything
+    for moment in [14u16, 15, 20, 26] {
+        assert_eq!(step(&state(moment, true)), None, "moment {moment}");
+    }
+    // the saved story keeps both bits, in whichever order the party takes the lift's ride back and the talk
+    let mut s = StoryState::at(27);
+    assert!(s.set_bit(1, 225, 0, true));
+    let stored = s.encode();
+    let mut later = StoryState::at(27);
+    assert!(later.set_bit(1, 225, 5, true)); // the talk after the lift's ride back up: bit 0 off, bit 5 on
+    assert_eq!(adapter.merge_progression(&stored, &later.encode()), vec![2, 27, 0, 1, 1, 225, 0x21]);
+    assert_eq!(adapter.merge_progression(&later.encode(), &stored), vec![2, 27, 0, 1, 1, 225, 0x21]);
+    // her bit changes nothing about the lift or the finale
+    let lift = adapter.load_area("elevtr1").unwrap();
+    let freed_and_down = freed.progress.clone();
+    assert_eq!(open_target(lift.as_ref(), &freed_and_down), ["nmkin_2"], "the lift's exit follows its own bit only");
+    let back = lift.story_advance(&freed_and_down, 1).expect("the ride back with her bit set");
+    assert_eq!((back.summary.as_str(), back.progress.as_slice()), ("var1.225=33->32", &[2, 27, 0, 1, 1, 225, 0x20][..]));
+    assert_eq!(open_target(lift.as_ref(), &back.progress), ["nmkin_1"]);
+    let finale = adapter.load_area("nrthmk").unwrap().story_advance(&back.progress, 1).expect("the finale with her bit set");
+    assert_eq!((finale.summary.as_str(), finale.progress.as_slice()), ("moment=27->33 var1.225=32->33", &[2, 33, 0, 1, 1, 225, 0x21][..]));
+    // and the story the smoke ends with
+    assert_eq!(adapter.merge_progression(&[2, 27, 0, 1, 1, 225, 0x21], &finale.progress), finale.progress);
 }

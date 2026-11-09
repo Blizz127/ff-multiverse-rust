@@ -280,6 +280,7 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>, mut 
         session.log_battle_notes();
         session.log_progress_notes();
         session.log_story_notes();
+        session.log_countdown_notes();
         for peer in session.state.drain_peer_sightings() {
             eprintln!("{}", peer_line(&peer));
         }
@@ -377,6 +378,9 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>, mut 
             // The story comes first: while there is a point in this area that would advance this player's story
             // the story bot walks to it (and stands still if it must wait for its invite); once there is none, a
             // bot that also travels goes on to the next exit. A bot that only advances its story stands still then.
+            // (a bot that travels too tells the story bot where its route goes next: the lift's ride back is pursued when
+            // it opens that way and the ride down is not when it would close it)
+            story_bot.set_wanted_exit(if travel_bot.is_active() { travel_bot.next_area() } else { None });
             let story_walks = story_bot.wants_to_walk(session.area.as_ref(), session.state.story.progress(), session.state.own.pos());
             story_decides = story_bot.is_requested() && (story_walks || !travel_bot.is_active());
             let step = if story_decides {
@@ -437,6 +441,13 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>, mut 
     if story_bot.is_requested() || session.state.story.advances() > 0 {
         eprintln!("headless: story advances: {}", session.state.story.advances());
     }
+    if session.state.countdown.told() > 0 {
+        eprintln!(
+            "headless: countdown: told {} time(s), {} at the end",
+            session.state.countdown.told(),
+            if session.state.countdown.is_running() { "still running" } else { "over" }
+        );
+    }
     if presses_sent > 0 {
         eprintln!("headless: OK presses sent: {presses_sent}");
     }
@@ -465,6 +476,7 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>, mut 
     session.log_battle_notes();
     session.log_progress_notes();
     session.log_story_notes();
+    session.log_countdown_notes();
     for peer in session.state.drain_peer_sightings() {
         eprintln!("{}", peer_line(&peer));
     }

@@ -1015,6 +1015,12 @@ impl AreaRuntime for Ff7FieldArea {
         self.story.battle_of(point)
     }
 
+    /// The first reactor's countdown matters while the story counter is where the step that started it left it
+    /// ([`crate::story::countdown_live`]).
+    fn countdown_live(&self, started: &[u8], now: &[u8]) -> bool {
+        story::countdown_live(started, now)
+    }
+
     /// The ladders and jumps of the field (only in a reviewed field, see [`crate::links`]).
     fn links(&self) -> Vec<Link> {
         self.links.clone()

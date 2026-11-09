@@ -938,6 +938,7 @@ impl App {
         let anchor = |subject: Subject, at: Pos| label_anchor(built.as_ref(), view, draw.own_who, subject, at);
         let hud_input = hud::gather_anchored(state, &self.session.info, view, render_t, &anchor);
         hud::draw_hud_with(&hud_input, hud::progress_line(state, render_t).as_ref(), vw, vh, &mut overlay);
+        crate::ui::countdown::draw(&state.countdown, vw, vh, self.session.info.fixture, now, &mut overlay);
         self.talk.draw(vw, vh, now, &mut overlay);
         if let Some(text) = notice {
             draw_notice(text, vw, vh, &mut overlay);

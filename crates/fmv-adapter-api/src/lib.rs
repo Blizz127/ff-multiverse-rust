@@ -531,6 +531,11 @@ pub struct StoryStep {
     /// What changed, as `key=value` words of the adapter's own without spaces, for logs and the
     /// client's log (FF7: `moment=1->6`). Never text of the game.
     pub summary: String,
+    /// A countdown this step starts, in seconds (FF7: the bomb of the first reactor, a timer its script sets in the very
+    /// block that moves the story). The SERVER owns the clock and tells the players (`ServerMsg::Countdown`); the
+    /// adapter says how long and, with [`AreaRuntime::countdown_live`], for how long it matters. `None`: the step
+    /// starts nothing.
+    pub countdown: Option<u32>,
 }
 
 /// What an area's data holds of the story (exits its scripts decide, points that move the story) that its adapter
@@ -671,6 +676,17 @@ pub trait AreaRuntime: Send + Sync {
     /// Additive: the default is none.
     fn links(&self) -> Vec<Link> {
         Vec::new()
+    }
+
+    /// Whether the countdown that a story step started (its [`StoryStep::progress`] is `started`) still matters to an
+    /// account whose progression is `now`. The server asks it whenever the account's progression changes and ends the
+    /// countdown (`Over { Cleared }`: it did not run out) when the answer is `false`. FF7: while the main story counter is
+    /// still where the step left it (the timer of the first reactor is shown, and runs out, only at that moment: a
+    /// step further on makes it moot, a lift that goes up or down does not). The default is `true`: a countdown
+    /// matters until it runs out. A blob the adapter cannot read is never live.
+    fn countdown_live(&self, started: &[u8], now: &[u8]) -> bool {
+        let _ = (started, now);
+        true
     }
 
     /// The battle that reaching story point `point` starts first, if it starts one (an FF7 script that runs a

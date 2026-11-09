@@ -470,7 +470,9 @@ synthetic FIXTURE rooms (`fmv-server --game fixture-rooms`, `fmv-client --game f
 --name X`: a hall and a yard joined by an exit each way, with one NPC in the yard; **not FF7**) and
 needs no owned data. `scripts/travel-smoke.sh --chain` walks the whole first reactor mission, from the first field
 to the reactor's core and the Guard Scorpion (`md1stin`, `md1_1`, `md1_2`, `nrthmk`, `nmkin_1`, `elevtr1`, `nmkin_2`,
-`nmkin_3`, `nmkin_4`, `nmkin_5`), with the real story: see below.
+`nmkin_3`, `nmkin_4`, `nmkin_5`), with the real story: see below. `scripts/travel-smoke.sh --escape` goes on past the
+boss: the party turns round and climbs back out of the reactor with the bomb's countdown running, rides the lift back up
+and takes the finale in `nrthmk` (see "After the Guard Scorpion").
 
 The bots find their way with `crates/fmv-client/src/nav.rs`: a grid over the field, A* over its cells, string pulling
 into a few straight legs that the server's own `validate_move` accepts, and never across the line of an exit they do
@@ -515,7 +517,9 @@ OK on the lift's panel, a talk, or a scripted battle won (`crates/fmv-ff7/src/st
 (`md1stin`), 6->7 (`md1_1`), 7->8 (`md1_2`), 8->10 (`nrthmk`), 10->11 (`nmkin_1`, a line), 11->12 together with the lift
 bit (`elevtr1`: press OK on the panel's triangle), 12->13 (`nmkin_2`), 13->14 (`nmkin_3`: talk to the woman), 14->15
 (`nmkin_5`: talk to the materia on the floor), 15->27 (`nmkin_5`: the core's triangle starts the Guard Scorpion, formation
-324, and the step is paid when the party WINS). A **talk** point is a character whose own talk script (or one it requests)
+324, and the step is paid when the party WINS); and the way out, after it: the second talk to the woman of `nmkin_3` (a tracked bit turned on, the moment stays 27), the
+lift's ride back up (`elevtr1`, a tracked bit turned off, the moment stays 27) and 27->33 (`nrthmk`: the finale, see "After
+the Guard Scorpion"). A **talk** point is a character whose own talk script (or one it requests)
 writes the story: what the talk does is not read off the text, the character's script is run (the dialogue walker) for the
 story the player has when it presses OK, after the character's own set-up has decided whether it can be talked to at all
 (the materia switches itself off once the story has moved to 15). The client's conversation shows the lines for the story
@@ -531,8 +535,10 @@ fields of the first mission only**: `md1stin`, `md1_1`, `md1_2`, `nrthmk`, `nmki
 `nmkin_4` and `nmkin_5` (`fmv_ff7::REVIEWED_FIELDS`, in `crates/fmv-ff7/src/area.rs`), each read against its own script
 case by case. Every other field offers what it always did, its gateways (data, always open, so a party can still walk out
 of the mission) and its phases, and leaves its script exits, story points and links off: a point raises a story for good, a
-story only moves forward, a link teleports a player, and nobody has read the others (the data holds 917 script exits, 133
-points and 190 links; the ten fields offer 4, 14 and 11, and the other 299 fields that have any leave 913, 119 and 179 off).
+story only moves forward, a link teleports a player, and nobody has read the others (the data holds 917 script exits, 151
+points and 190 links; the ten fields offer 4, 15 and 11, and the other 310 fields that have any leave 913, 136 and 179 off.
+The points were 133, 14 and 119 in 299 fields until the writes of a script that a main loop requests were read, which
+found 18 more entry points: `nrthmk`'s finale and seventeen in fields that are left off).
 The server says what a field left off once per area when it loads it (`story left off (said once for this area)
 area=Ff7/md8_1 why=unreviewed field script_exits=0 story_points=1 ... links=0 link_list=[])`). A field joins the list by review, not by a casual
 edit: `cargo run -p fmv-ff7 --example world_survey -- <field>` shows what it would offer (the survey loads fields with
@@ -545,6 +551,64 @@ bit on, and the story to 12 the first time) and the ride back, which the panel's
 a press is one ride and nothing flaps; the lift's exits follow the bit (`nmkin_1` up, `nmkin_2` down) and the moment stays.
 The model only carries a story FORWARD (merging two stories is a join), so the saved story keeps the lift down while the
 story the player holds in the world has it up until the player rides down again.
+
+**After the Guard Scorpion: the bomb, the way out and the countdown.** What the game does after moment 27, read from
+the owned field scripts (`--example script_dump` and `--example world_survey`; ids, offsets and moments only), and what a
+party can do of it. Everything below is pinned against the real data in `crates/fmv-ff7/tests/chain_real.rs` and
+`crates/fmv-client/src/route/real_tests.rs`.
+
+* **The bomb.** There is no separate "set the bomb" step after 27, and it is not Barret's: the cutscene that comes before the
+  fight does it (`nmkin_5`: Barret's talk script runs Cloud's scripts, the last of which walks Cloud to the reactor, plays
+  the placing animation and the machine sounds, and starts battle 324), and the block of the director's loop that writes
+  moment 27 when that is over also **starts a timer of ten minutes** (`STTIM 0:10:00`, just before the write) and flips bits of
+  the reactor byte `Var[1][225]` that are not carried (bit 6 on, bits 3 and 4 off: the bomb and the doors). The other points of `nmkin_5` are for moments 120 to 127, a much later visit nobody on the first mission reaches.
+  **There is no menu:** none of the ten fields has an `ASK`, so the countdown is not a choice. It is 10:00, always.
+* **The countdown.** The `time` entity of every reactor field (`nmkin_1` to `nmkin_5`, `elevtr1`) opens the game's timer window
+  only at moment 27, and the `timeo` entity of each sets bit 7 of the reactor byte and jumps to `nrthmk` when the timer reads
+  zero at moment 27; `nrthmk`'s finale then ends in a game over for that case. The server runs the timer: the step that wins the
+  fight carries its length (`StoryStep::countdown`, read from the `STTIM` of the step's own block: 600 s), the world keeps one
+  countdown per account whose story it is (the leader's, in a party) and tells the account and the members of its party
+  (`ServerMsg::Countdown`: `Running { remaining_ms, total_ms }` at the start, to a member that joins the party and to one that
+  returns, `Over { Cleared }` when the story moves past 27 or the account or the party is gone, `Over { TimeUp }` when it
+  runs out), and the window draws it at the top centre (`crates/fmv-client/src/ui/countdown.rs`: `M:SS`, the last minute in the
+  warning colour, "TIME IS UP" for eight seconds; the headless client says it in `countdown:` lines).
+  **A countdown that runs out does nothing:** the server logs one line (`countdown over account=<n> reason=time-up`), sends
+  `Over { TimeUp }` and goes on. No story step, nothing saved, wiped or reset, nobody moved; the finale below still applies to
+  a party that was late (the game's own late party gets a game over; a persistent multiplayer account never loses what it
+  saved to a clock). A countdown is not stored: a server that restarts, and an account that logs in again at 27, have none.
+* **The way out.** Every gateway stays open both ways, the ladders and jumps of `nmkin_3` and `nmkin_4` have their way up
+  (the same lines, other links: the bots take 3 in `nmkin_3` and 1 in `nmkin_4`), and the lift is ridden back up by pressing OK on
+  the panel again. In `nmkin_3` the woman who is stuck on the way out is freed by a talk (her talk script, from moment 27 on,
+  turns bit 5 of the reactor byte on, which is carried for it: a talk that moves the story, once, `var1.225=1->33` with the
+  lift down; no exit or point waits for the bit, which only decides where she and her namesake of `nmkin_1` stand and
+  whether the second door of `nmkin_1` opens, neither of which a server models: the walkmesh has no locks and the cast does
+  not change with the moment, so she stays on the field after she is freed). A bot that also travels (`--story-advance --travel`) pursues a story step that OPENS the exit its route
+  goes to (the ride back, which is not a step forward) and never one that would CLOSE it (the ride down, forward again once
+  the lift is up), so the lift is ridden once each way and never flaps (`StoryBot::set_wanted_exit`). The way out of the reactor is the
+  gateway from `nmkin_1` to `nrthmk`.
+* **The finale (27 to 33).** In `nrthmk` the loop of a nameless entity runs, whenever the moment is 27 or more and bit 7 of the
+  reactor byte is clear, the cutscene scripts of the field's director: the explosion's movie, moment 33, the lift bit on, and
+  a jump to `md8_4`. The adapter reads it the way it reads any script a main loop requests (the unguarded writes of the
+  requested script, under guards the model can judge) as an entry point of `nrthmk`, id 1, that fires when a player comes to
+  stand there, so a party's leader goes 27 to 33 by walking out of the reactor. Bit 7 is carried only so that the step's own
+  guard can be judged, and **this server never sets it** (the loop that plays the late party's game over wants it set, and
+  is not a point at all). The jump to `md8_4` is NOT performed (a director's jump is not a walk-on exit): the party stays in
+  `nrthmk`, whose gateway to `md8_4` is data and always open.
+* **Where the evidence ends: `md8_4`.** That field has no player-controlled character. It is a cutscene (the AVALANCHE members
+  and Cloud as characters at moment 33, a director that plays their talk and jumps on to `md8_1`), which the server cannot
+  play, judge or leave by a walk: a party gets there by `nrthmk`'s gateway and walks about on its walkmesh, and this slice stops
+  there.
+* **What a re-login at 27 does.** A re-login always joins `md1stin`, and the walk from there to the reactor goes through
+  `nrthmk`, where the finale moves the story on to 33 before the party is back inside: so the escape through the reactor is
+  one continuous run, never a restart. `scripts/travel-smoke.sh --escape` walks down, wins the fight, climbs back out and
+  takes the finale in one run (the story steps and the saved blob `0221000101e121` asserted exactly, one countdown started and
+  cleared, never time-up, 0 battle divergences), then restarts the server, logs the leader in again at the saved 33 and
+  walks `md1stin` to `md8_4` by the gateways with nothing firing again. Nobody is stranded at the new moments
+  (`chain_real.rs`: from every place a player arrives in a reviewed field, walking and the links reach an open exit at
+  27 and 33 with the lift up and down).
+* **Not done:** the places the reactor's characters stand and the doors they open by the other bits of the reactor byte at 27
+  (the characters on the way out in `nmkin_3` and `nmkin_1`: the server's walkmesh has no locks and its cast does not change
+  with the moment), the movie, and `md8_4` and `md8_1`.
 
 Story phasing: every account has one story progression per game (the opaque `Progression` blob; an
 account that never advanced has none, which is a new account) and the world keeps one instance of a
@@ -566,8 +630,9 @@ version was bumped and a server refuses a v3 client at the handshake with a clea
 `ProtocolMismatch` reject (instead of losing it at the first exit it crosses). Both sides must be
 built from this version or later.
 
-Not done: exits a talk or a director decides, the script exits, story points and links of every field but the first
-mission's ten (they are left off until reviewed), conditional NPCs, NPC animation, cutscenes.
+Not done: exits a talk or a director decides (the finale's jump from `nrthmk` to `md8_4` among them), the script exits, story
+points and links of every field but the first mission's ten (they are left off until reviewed), conditional NPCs (the cast
+does not change with the moment), NPC animation, cutscenes (`md8_4`, where the first mission's evidence ends, is one).
 
 ## Accounts, avatars and parties
 
@@ -1057,6 +1122,18 @@ the story record that v2 already stores). **Rolling back v14:** point the server
 together. The story record keeps its v2 shape, so a v13 server can read what v14 wrote, but it has none of v14's talks,
 links or scripted battle, and how its exits judge a moment past 13 was never tested: once a player has gone past moment
 13, prefer rolling forward to rolling back.
+
+**The countdown message (added after v14; the version is bumped at integration)** adds one server message,
+`ServerMsg::Countdown { state }`, with `CountdownState::Running { remaining_ms, total_ms }` and
+`CountdownState::Over { reason: CountdownEnd::TimeUp | Cleared }` (see "After the Guard Scorpion"): sent when the step that
+won the Guard Scorpion starts the bomb's countdown, to a player that joins or leaves the party that has one, and when it
+is over. A peer that does not know it cannot decode it (an unknown message is a decode error), so a v14 client would be
+cut off at the first countdown a v15 server starts: the version has to move with it and a v14 peer be refused at the
+handshake. `StoryStep` gained a `countdown` and `AreaRuntime` a `countdown_live` (library API, not wire). Nothing new is
+stored (a countdown is a clock of the server process), and the story record keeps its v2 shape: the reactor byte's bit 7
+is carried so that the finale's guard can be judged but this server never writes it, so a record is readable by a v14
+server, which just has no finale, no countdown and no `Countdown` message. **Rolling back:** point the server and the
+clients back at a v14 build together.
 
 ## Importing your own FF7 data
 
