@@ -356,6 +356,10 @@ fn escape_attempts_draw_in_the_documented_order() {
     for seed in 0..50u64 {
         let (_, battle) = attempt(seed, EscapeRule { difficulty: 2, sure: false });
         let mut rng = crate::rng::Rng::new(seed);
+        // The battle's start (a pre-emptive one here) dealt each of its two combatants a starting timer first.
+        for _ in 0..2 {
+            rng.range_inclusive(0, INITIAL_GAUGE_MAX);
+        }
         let mut left = 2u8;
         for _ in 0..RUN_CHECKS_PER_TURN {
             if left == 0 {

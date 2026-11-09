@@ -154,9 +154,14 @@
 //!   `Dex * v_timer_increase / normal_speed`; a combatant can act when the timer reaches 65535.
 //!   A pastebin note, "FF7 Battle Timer" (<https://pastebin.com/nVBvNNfP>), restates the
 //!   timer definitions (tick, global timer, V-timer, turn timer normalised by the party's
-//!   average *base* Dexterity, C-timer). Secondary sources, therefore treat the ATB rates as
+//!   average *base* Dexterity, C-timer). A Qhimm forum thread that read the PSX executable
+//!   ("[FF7 PSX] ATB Recommended/Wait Pause Logic", <https://forums.qhimm.com/index.php?topic=28474.0>) finds the same
+//!   speed value in the game's code (65536 / (2 * (120 + 480 * Battle Speed / 256)): 273, 91 and 54 at the fastest, default
+//!   and slowest speed) and a 60 Hz loop. Secondary sources otherwise, therefore treat the ATB rates as
 //!   *documented but not independently verified*; this crate uses base Dexterity only
 //!   (no Speed Plus / Choco Feather style modifiers).
+//! * **The turn timers at the start of a battle** (see "Starting turn timers" below): the same FAQ, section "Starting Turn
+//!   Timers", as the excerpts quoted by search results give it (the page itself answers our fetcher with HTTP 403).
 //! * **Physical damage ("X1" formula), hit chance and critical chance.** From the
 //!   disassembly-derived pseudocode at <https://wiki.ffrtt.ru/index.php/FF7/DamageFormula>
 //!   and the formula table at <https://wiki.ffrtt.ru/index.php/FF7/Battle/Damage_Calculation>
@@ -164,7 +169,12 @@
 //!   `Base = Att + ((Att + Lvl) / 32) * ((Att * Lvl) / 32)`,
 //!   `Damage = Power * (512 - Def) * Base / (16 * 512)`:
 //!   critical x2, short-range row penalty /2, then random variance `[3841..=4096] / 4096`
-//!   with a minimum of 1.
+//!   with a minimum of 1. The hit routine is `HitChance = (Dex >> 2) + hit rate + Actor's evade - Target's evade` (a
+//!   party member's evade being `(Dex >> 2) + armor evade`, an enemy's its stat), a hit when `HitChance >= MissChance`
+//!   (`1..=100`), with the lucky-hit and lucky-dodge lines before it; a critical hit when the chance, `((Luck + Level) -
+//!   target's level) >> 2` plus the weapon's, is STRICTLY greater than its own `1..=100` roll ([`is_critical`]). The real-data
+//!   test `tests/md1_real.rs` holds the engine to a reference implementation of these lines for every blow between the
+//!   canon pair and the first reactor's enemies.
 //! * **Magic, healing, items.** The other formulas of the damage-calculation byte (`(Power/16) *
 //!   ((Lvl+Mag) * 6)` for spells, `22 * Power + 6 * (Lvl+Mag)` for Cure, `20 * Power` for potions, a
 //!   fraction of the target's max or current HP for Life, Full Cure, X-Potion and Demi, ...) are decoded
@@ -174,10 +184,45 @@
 //! * **Row rule**: <https://wiki.ffrtt.ru/index.php/FF7/Battle/Targeting_Data> (bit `0x20`,
 //!   "short range"). Only the standard physical formula is row-sensitive.
 //!
+//! # Starting turn timers
+//!
+//! Terence Fergusson's *FF7 Battle Mechanics* FAQ (v1.10, <https://gamefaqs.gamespot.com/ps/197341-final-fantasy-vii/faqs/22395>,
+//! section "Starting Turn Timers"; **read through the excerpts that search results quote, because the page itself refuses
+//! our fetcher with HTTP 403**) says how a battle's gauges begin. Every combatant, the party and the enemies alike, is dealt a
+//! random timer in `0..=0x7FFF` (half the bar), and then four cases adjust them:
+//!
+//! | arrival | what happens | [`StartMode`] |
+//! |---|---|---|
+//! | a normal battle | all timers are raised by the same amount until the highest is **57344** (87.5% of the bar): everybody starts between **37.5% and 87.5%** full, and the luckiest is an eighth of a bar from its first turn | `Normal` |
+//! | a pre-emptive strike, a side attack | the enemies' timers are divided by **8** (at most 6.25% of the bar) and the party's raised to 65534, so each member takes its first turn at once | `Preemptive` |
+//! | a back attack, an ambush | as a normal battle but to **61440** (93.75%, everybody between 43.75% and 93.75%), and then every party member's is emptied: the enemies all but certainly strike first | `BackAttack` |
+//! | the final duel of the story | the party's 65534, the enemy's 0 | not played here |
+//!
+//! At the default speed a member at the average Dexterity fills the bar in about 6 s, so in a normal battle the first
+//! turn of somebody comes within 0.75 s, the party's own within 0.75 to 3.75 s, and an enemy's within a few seconds of
+//! its own (slower or faster by its Dexterity): the first reactor's fights begin at once, not after a quiet half-minute,
+//! and nobody is ever dealt the whole of a gauge for free.
+//!
+//! *Notes on the reading.* (1) The excerpts name the 61440 case only as the one that empties the party; its heading ("Back
+//! Attacks / Ambushes") is **inferred** from Fergusson's *Enemy Mechanics* FAQ (faqs/31903), which says of the ambush that
+//! "you begin an ambush with your time bars fully depleted, while your enemies gain a slight increase to their own time
+//! bar values" and of a side attack that the party starts with all its bars filled and the enemies' "delayed
+//! significantly". (2) The excerpts say "the character with the highest Turn Timer" without saying whether the dead or
+//! absent count: the highest of the LIVING combatants is used. (3) The original fills the party to 65534, one short of the
+//! bar, which the first tick completes; here the bar is full and the members are ready at construction (a difference of one
+//! tick, 1/60 s). (4) A GameFAQs walkthrough (faqs/71240) says the enemies' gauges start FULL in a back attack and an
+//! ambush; Fergusson's figures, which say the opposite for the ambush, are the ones used. (5) The layouts that the wire
+//! carries are the two flags of `BattleSetup` (`preemptive`, `back_attack`); [`StartMode::from_layout`] maps the side
+//! attacks to the first and the attacks from both sides to the second, which only a server that sends them that way
+//! (the protocol's `FormationInfo`) gets. A random encounter table's special entries are not decoded, so the fields of
+//! the first reactor only ever send normal starts.
+//!
 //! # RNG draw order (part of the determinism contract)
 //!
-//! * Construction, [`StartMode::Normal`] only: one `range_inclusive(0, 0x7FFF)` per combatant
-//!   in [`ActorId`] order (party first, then enemies) for the initial gauge.
+//! * Construction, every [`StartMode`] but `Zero` and `EnemiesFirst`: one `range_inclusive(0, 0x7FFF)` per combatant in
+//!   [`ActorId`] order (party first, then enemies, the dead included so that a fighter's HP never moves the draws of the
+//!   others): that combatant's starting turn timer before the shift of "Starting turn timers" (the shift, the division of a
+//!   pre-emptive strike and the emptying of a back attack are arithmetic and draw nothing).
 //! * Construction, after those gauge draws: the Initialize scripts of the enemies that have one
 //!   ([`crate::ai`]), in actor order, each with exactly the draws of its script (one `next_u16()` per
 //!   `RANDOM`, one `below(n)` per `RANDOM_BIT` of a mask of `n >= 2` bits: about a third of the owner's
@@ -295,15 +340,23 @@
 //! * **Tick duration**: the documents give per-tick increments but not how long a tick is.
 //!   [`DEFAULT_TICKS_PER_SECOND`] = 60 (a default-speed, average-Dex combatant then needs a
 //!   little over six seconds to fill). Configurable through [`BattleConfig`].
-//! * **Initial gauges**: not documented; [`StartMode::Normal`] draws a random fill in
-//!   `0..=0x7FFF` (at most half full). Preemptive starts with a full party gauge and an
-//!   empty enemy gauge, back attack the reverse (APPROXIMATION from the layout names).
-//!   Layouts other than preemptive / back attack are treated as normal.
-//! * **Critical test**: `chance >= roll` as in the FAQ (an exact `chance`% rate); the
-//!   disassembly pseudocode uses a strict `>`, a difference of one roll value.
-//! * **Magic hit chance**: the documents give none; a spell hits when its accuracy minus the target's
-//!   magic evade percent (a party member's armor; enemies have none) is at least the roll. Nothing about
-//!   level or luck.
+//! * **Initial gauges**: Fergusson's figures (see "Starting turn timers"), with the one-tick difference of a
+//!   pre-emptive party that is full instead of 65534 and the inferred heading of the back-attack case.
+//!   The single-flag layouts of the wire only carry a pre-emptive strike and a back attack.
+//! * **Critical test**: strict `chance > roll`, as in the disassembly pseudocode ([`is_critical`]); before
+//!   this version the engine used `>=`, the FAQ's "an exact `chance`% rate", one roll value more.
+//! * **Magic hit chance**: the pseudocode's routine (`0x5DDE5E`) draws TWO rolls of `0..=99`, misses when the target's
+//!   magic evade is above the first or when `accuracy + (actor's level - level / 2)` is below the second (the page does not
+//!   say whose level is halved: the target's is the only reading that is about a target), and does not run at all for an
+//!   accuracy of 255, a target with a death, nullify or absorb affinity to the attack, or an attack with certain statuses.
+//!   NOT implemented: a spell hits here when its accuracy minus the target's magic evade percent (a party member's armor;
+//!   enemies have none) is at least ONE roll of `1..=100`, nothing about level. Over the first reactor the two readings
+//!   agree because no spell there can miss under either (every spell has a hit rate of 100, which the caster's level less
+//!   half the target's keeps at 99 or more, 99 being the highest roll of the pseudocode, and nobody has a magic evade:
+//!   `tests/md1_real.rs` checks it), so the draw order was left alone; a later field with armors that evade magic, or a
+//!   boss far above the party's level, would show the difference.
+//! * **Not played**: a target that is asleep, stopped or paralysed is always hit in the game (its `HitChance` is forced to
+//!   255 before the rolls) and here it is rolled for like any other; the first reactor's enemies are never put to sleep.
 //! * **Damage cap** [`MAX_DAMAGE`] = 9999 (community-documented, not in the cited pages).
 //!   Arithmetic is exact 64-bit; the original's 32-bit overflow glitch is not reproduced.
 //! * **Enemy attacks**: the original picks them with AI scripts, which [`crate::ai`] runs when it can
@@ -364,8 +417,19 @@ pub const MAX_PER_SIDE: usize = 32;
 pub const ATTACK_COMMAND_POWER: u32 = 16;
 /// Largest damage one hit can deal.
 pub const MAX_DAMAGE: u32 = 9_999;
-/// APPROXIMATION: upper bound of the random initial gauge of a normal start.
+/// The largest random turn timer a combatant is dealt at the start of a battle (half the bar: 32767 of 65535; the
+/// 6.25% a pre-emptive strike leaves an enemy is this over 8). See the module docs, "Starting turn timers".
 pub const INITIAL_GAUGE_MAX: u32 = 0x7FFF;
+/// What the combatant with the highest starting turn timer of a normal battle is brought up to, and everyone else
+/// with it by the same amount: 57344, 87.5% of the bar (Fergusson's *Battle Mechanics* FAQ), so that the party and the
+/// enemies all start between 37.5% and 87.5% full and the luckiest is an eighth of a bar from its first turn.
+pub const NORMAL_START_PEAK: u32 = 57_344;
+/// The same for a back attack or an ambush, 61440, 93.75% of the bar: everybody starts between 43.75% and 93.75%
+/// full, and then the party's timers are emptied (the enemies "almost always" get the first attack).
+pub const BACK_ATTACK_START_PEAK: u32 = 61_440;
+/// A pre-emptive strike (or a side attack) divides every enemy's starting turn timer by this (so it starts with at most
+/// 6.25% of the bar) and fills the party's.
+pub const PREEMPTIVE_ENEMY_DIVISOR: u32 = 8;
 /// Run Checks one [`Command::Escape`] makes (see the module docs, "Escape").
 pub const RUN_CHECKS_PER_TURN: u32 = 4;
 /// A Run Check of a battle that is not [`EscapeRule::sure`] succeeds with a chance of 1 in this many.
@@ -753,27 +817,36 @@ pub fn enemies_for_formation(scene: &Scene, formation_slot: usize) -> Vec<Combat
         .collect()
 }
 
-/// How the gauges are initialised.
+/// How the gauges are initialised (module docs, "Starting turn timers").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StartMode {
-    /// Every gauge starts at a random fill in `0..=`[`INITIAL_GAUGE_MAX`] (APPROXIMATION).
+    /// A normal battle: every combatant is dealt a random timer in `0..=`[`INITIAL_GAUGE_MAX`], and all of them are
+    /// brought up together until the highest is [`NORMAL_START_PEAK`] (everybody starts 37.5% to 87.5% full).
     #[default]
     Normal,
-    /// Party gauges full, enemy gauges empty.
+    /// A pre-emptive strike (and a side attack): the party's gauges are full (the original sets 65534, which fills
+    /// on the first tick), every enemy's is its random timer divided by [`PREEMPTIVE_ENEMY_DIVISOR`].
     Preemptive,
-    /// Enemy gauges full, party gauges empty.
+    /// A back attack (and an ambush, "attacked from both sides"): the timers of a normal battle, brought up to
+    /// [`BACK_ATTACK_START_PEAK`] instead, and then the party's emptied, so the enemies all but certainly strike first.
     BackAttack,
-    /// All gauges start empty (deterministic pace; used by tests).
+    /// All gauges start empty (deterministic pace; used by tests). Draws nothing.
     Zero,
+    /// SCAFFOLDING, not a rule of the game: every enemy's gauge starts full and the party's empty, so the enemies strike on
+    /// the very first tick. Draws nothing. For tests and scripted scenes that need a deterministic strike-first (what
+    /// [`StartMode::BackAttack`] was before it followed the game's timers).
+    EnemiesFirst,
 }
 
 impl StartMode {
-    /// Map a scene battle layout to a start mode (see the module docs).
+    /// Map a scene battle layout to a start mode: the pre-emptive strike and the three side attacks start the
+    /// party full ([`StartMode::Preemptive`]), the back attack and the two attacks from both sides ("pincer",
+    /// Fergusson's "ambush") start it empty ([`StartMode::BackAttack`]), everything else is a normal start.
     pub fn from_layout(layout: BattleLayout) -> Self {
         match layout {
-            BattleLayout::Preemptive => StartMode::Preemptive,
-            BattleLayout::BackAttack => StartMode::BackAttack,
-            _ => StartMode::Normal,
+            BattleLayout::Preemptive | BattleLayout::SideAttack | BattleLayout::SideAttack2 | BattleLayout::SideAttack3 => StartMode::Preemptive,
+            BattleLayout::BackAttack | BattleLayout::Pincer | BattleLayout::Pincer2 => StartMode::BackAttack,
+            BattleLayout::Normal | BattleLayout::NormalFrontRowLocked | BattleLayout::Unknown(_) => StartMode::Normal,
         }
     }
 }
@@ -1234,8 +1307,15 @@ pub fn resolve_hit(
     chance >= i64::from(miss_roll)
 }
 
+/// Whether a hit is a critical one: the chance beats the `1..=100` roll STRICTLY (`if critical_chance >
+/// critical_random` in the disassembly-derived pseudocode of <https://wiki.ffrtt.ru/index.php/FF7/DamageFormula>,
+/// "Critical (0x5DDF8E)"), so a chance of `n` percent crits on `n - 1` of the 100 rolls and a chance of 1 never does.
+pub fn is_critical(chance: u32, roll: u32) -> bool {
+    chance > roll
+}
+
 /// Critical chance in percent: `((Luck + Lvl) - target Lvl) >> 2`, plus the weapon crit
-/// bonus for party attackers; never negative.
+/// bonus for party attackers; never negative. A hit is critical when this beats the roll ([`is_critical`]).
 pub fn critical_chance(actor: &Combatant, target: &Combatant) -> u32 {
     let base = (i64::from(actor.luck) + i64::from(actor.level) - i64::from(target.level)) >> 2;
     let bonus = match actor.side {
@@ -1389,16 +1469,31 @@ impl BattleState {
             c.defending = false;
             // A limit gauge is a living party member's, and one that has a limit.
             c.limit = if c.side == Side::Party && c.limit_break.is_some() && c.is_alive() { c.limit.min(LIMIT_MAX) } else { 0 };
-            c.gauge = match (config.start, c.side) {
-                (StartMode::Normal, _) => rng.range_inclusive(0, INITIAL_GAUGE_MAX),
-                (StartMode::Preemptive, Side::Party) | (StartMode::BackAttack, Side::Enemy) => {
-                    GAUGE_MAX
-                }
-                _ => 0,
-            };
             c.ready = false;
             // The statuses passed in are the starting ones: the modelled ones of a living combatant, timers full.
             c.status = if c.is_alive() { StatusState::starting(c.status.set()) } else { StatusState::none() };
+        }
+        // The starting turn timers (module docs, "Starting turn timers"): one draw per combatant in actor order for every
+        // start but `Zero`, the dead included (so a fighter's HP never moves the draws of the others), then the shift.
+        let drawn: Vec<u32> = actors
+            .iter()
+            .map(|_| if matches!(config.start, StartMode::Zero | StartMode::EnemiesFirst) { 0 } else { rng.range_inclusive(0, INITIAL_GAUGE_MAX) })
+            .collect();
+        let highest = actors.iter().zip(&drawn).filter(|(c, _)| c.is_alive()).map(|(_, &d)| d).max().unwrap_or(0);
+        let shift = match config.start {
+            StartMode::Normal => NORMAL_START_PEAK.saturating_sub(highest),
+            StartMode::BackAttack => BACK_ATTACK_START_PEAK.saturating_sub(highest),
+            StartMode::Preemptive | StartMode::Zero | StartMode::EnemiesFirst => 0,
+        };
+        for (c, &draw) in actors.iter_mut().zip(&drawn) {
+            c.gauge = match (config.start, c.side) {
+                _ if !c.is_alive() => 0,
+                (StartMode::Zero, _) | (StartMode::BackAttack | StartMode::EnemiesFirst, Side::Party) => 0,
+                (StartMode::Normal, _) | (StartMode::BackAttack, Side::Enemy) => draw + shift,
+                (StartMode::Preemptive, Side::Party) => GAUGE_MAX,
+                (StartMode::Preemptive, Side::Enemy) => draw / PREEMPTIVE_ENEMY_DIVISOR,
+                (StartMode::EnemiesFirst, Side::Enemy) => GAUGE_MAX,
+            };
         }
 
         let mut state = Self {
@@ -2435,7 +2530,7 @@ impl BattleState {
             return;
         }
 
-        let critical = spec.can_crit && critical_chance_pct >= percent_roll(self.rng.next_u16());
+        let critical = spec.can_crit && is_critical(critical_chance_pct, percent_roll(self.rng.next_u16()));
         let variance = if spec.formula.has_variance() {
             self.rng.range_inclusive(0, 255)
         } else {
@@ -3437,14 +3532,14 @@ mod tests {
 
     #[test]
     fn start_modes_set_initial_gauges() {
-        let mk = |start: StartMode| {
+        let mk_seeded = |seed: u64, start: StartMode| {
             let party = vec![
                 fighter("A", 5, 50, 10, 5, 30),
                 fighter("B", 5, 50, 10, 5, 30),
             ];
             let enemies = vec![fighter("E", 5, 50, 10, 5, 30)];
             BattleState::with_config(
-                77,
+                seed,
                 party,
                 enemies,
                 BattleConfig {
@@ -3453,22 +3548,33 @@ mod tests {
                 },
             )
         };
+        let mk = |start: StartMode| mk_seeded(77, start);
         // Zero: everything empty.
         let s = mk(StartMode::Zero);
         assert!(s.actors().iter().all(|c| c.gauge == 0 && !c.ready));
-        // Normal: partial fills only, never full.
-        let s = mk(StartMode::Normal);
-        assert!(s
-            .actors()
-            .iter()
-            .all(|c| c.gauge <= INITIAL_GAUGE_MAX && !c.ready));
-        assert!(s.actors().iter().any(|c| c.gauge > 0));
+        // Normal (Fergusson's "Starting Turn Timers"): everybody is dealt `0..=0x7FFF` and all are brought up together
+        // until the highest is 57344, so nobody is full, the luckiest is exactly at 87.5% and nobody is under 37.5%.
+        for seed in 0..50u64 {
+            let s = mk_seeded(seed, StartMode::Normal);
+            let gauges: Vec<u32> = s.actors().iter().map(|c| c.gauge).collect();
+            assert_eq!(gauges.iter().copied().max(), Some(NORMAL_START_PEAK), "seed {seed}: {gauges:?}");
+            assert!(gauges.iter().all(|&g| g >= NORMAL_START_PEAK - INITIAL_GAUGE_MAX), "seed {seed}: nobody under 37.5%: {gauges:?}");
+            assert!(s.actors().iter().all(|c| !c.ready), "seed {seed}: nobody is ready at the start of a normal battle");
+            // The draws are one per combatant in actor order from the battle's own stream, and the shift draws nothing.
+            let mut replay = crate::rng::Rng::new(seed);
+            let drawn: Vec<u32> = (0..3).map(|_| replay.range_inclusive(0, INITIAL_GAUGE_MAX)).collect();
+            let shift = NORMAL_START_PEAK - drawn.iter().copied().max().unwrap();
+            assert_eq!(gauges, drawn.iter().map(|d| d + shift).collect::<Vec<_>>(), "seed {seed}");
+        }
+        // The spread is real: different seeds start differently.
+        let spread: std::collections::BTreeSet<u32> = (0..50u64).map(|seed| mk_seeded(seed, StartMode::Normal).actors()[0].gauge).collect();
+        assert!(spread.len() > 20, "{spread:?}");
 
-        // Preemptive: party full and waiting, enemies empty; events delivered with the first
-        // step (or command).
+        // Preemptive: party full and waiting; every enemy has its draw divided by 8, at most 6.25% of a bar; events
+        // delivered with the first step (or command).
         let mut s = mk(StartMode::Preemptive);
         assert_eq!(s.ready_actors(), vec![ActorId(0), ActorId(1)]);
-        assert_eq!(s.actor(ActorId(2)).unwrap().gauge, 0);
+        assert!(s.actor(ActorId(2)).unwrap().gauge <= INITIAL_GAUGE_MAX / PREEMPTIVE_ENEMY_DIVISOR);
         let first = s.step(0);
         assert_eq!(
             first,
@@ -3479,8 +3585,18 @@ mod tests {
         );
         assert!(s.step(0).is_empty());
 
-        // Back attack: the enemy is full, so it strikes on the very first tick.
-        let mut s = mk(StartMode::BackAttack);
+        // Back attack: everybody is dealt a timer and brought up to 93.75% for the highest (between 43.75% and 93.75%),
+        // then the party's are emptied: nobody is ready, the party starts from scratch and the enemy is far along.
+        for seed in 0..50u64 {
+            let s = mk_seeded(seed, StartMode::BackAttack);
+            assert!(s.ready_actors().is_empty());
+            assert_eq!((s.actor(ActorId(0)).unwrap().gauge, s.actor(ActorId(1)).unwrap().gauge), (0, 0), "seed {seed}");
+            let enemy = s.actor(ActorId(2)).unwrap().gauge;
+            assert!((BACK_ATTACK_START_PEAK - INITIAL_GAUGE_MAX..=BACK_ATTACK_START_PEAK).contains(&enemy), "seed {seed}: {enemy}");
+        }
+
+        // The scaffolding mode: the enemy is full, so it strikes on the very first tick.
+        let mut s = mk(StartMode::EnemiesFirst);
         assert!(s.ready_actors().is_empty());
         let ev = s.step_ticks(1);
         assert_eq!(ev[0], BattleEvent::GaugeReady { actor: ActorId(2) });
@@ -3502,18 +3618,17 @@ mod tests {
             .unwrap();
         assert_eq!(ev[0], BattleEvent::GaugeReady { actor: ActorId(0) });
 
-        assert_eq!(
-            StartMode::from_layout(BattleLayout::Preemptive),
-            StartMode::Preemptive
-        );
-        assert_eq!(
-            StartMode::from_layout(BattleLayout::BackAttack),
-            StartMode::BackAttack
-        );
-        assert_eq!(
-            StartMode::from_layout(BattleLayout::Pincer),
-            StartMode::Normal
-        );
+        // The layouts: the pre-emptive strike and the side attacks fill the party, the back attack and the attacks
+        // from both sides empty it, the rest are normal fights.
+        for layout in [BattleLayout::Preemptive, BattleLayout::SideAttack, BattleLayout::SideAttack2, BattleLayout::SideAttack3] {
+            assert_eq!(StartMode::from_layout(layout), StartMode::Preemptive, "{layout:?}");
+        }
+        for layout in [BattleLayout::BackAttack, BattleLayout::Pincer, BattleLayout::Pincer2] {
+            assert_eq!(StartMode::from_layout(layout), StartMode::BackAttack, "{layout:?}");
+        }
+        for layout in [BattleLayout::Normal, BattleLayout::NormalFrontRowLocked, BattleLayout::Unknown(9)] {
+            assert_eq!(StartMode::from_layout(layout), StartMode::Normal, "{layout:?}");
+        }
     }
 
     #[test]
@@ -5411,6 +5526,10 @@ mod tests {
             // Both are ready at the same time only if no command is pending: give both the same commands
             // at the end of the second.
             for id in coarse.ready_actors() {
+                // A command that ended the battle leaves nobody to command.
+                if coarse.outcome().is_some() {
+                    break;
+                }
                 let command = mixed_policy(&coarse, id);
                 log_coarse.extend(coarse.submit_command(id, command).unwrap());
                 log_fine.extend(fine.submit_command(id, command).unwrap());
