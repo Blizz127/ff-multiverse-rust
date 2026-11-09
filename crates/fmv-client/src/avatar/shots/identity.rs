@@ -362,30 +362,28 @@ fn offscreen_field_identity_white_grey_and_black_colours_keep_the_old_look() {
             let plain = render(&mut gpu, &fx, &dressed(&flat, Look::Plain), false);
             let new = render(&mut gpu, &fx, &dressed(&flat, Look::New), false);
             let model_px: Vec<usize> = (0..plain.len()).step_by(4).filter(|&i| plain[i..i + 3] != empty[i..i + 3]).collect();
-            // The mirror is the look of the CLOTH. The pixels the model keeps as its own colours (the face decals, and
-            // the head's skin, hair and dark greys, `avatar::identity::head_colour_is_own`: a small part of a body) are
-            // not what the mirror says, they are what the untinted model shows, so a pixel is right when it is the
-            // mirror's (the bulk: the cloth) or the model's own (kept within 2 levels).
-            let as_mirror = |i: usize| {
-                let want = look::look(to_f(&plain[i..]), id, 1.0, 0.0).map(|c| (c.clamp(0.0, 1.0) * 255.0).round());
+            // The mirror has two outcomes for a pixel: the look of CLOTH (`face` 0) and the look of what the model keeps
+            // as its own colours (`face` 1: the face decals and the head's skin, hair and dark greys, flagged by
+            // `avatar::identity::head_colour_is_own`, under a weak 5% tint). A pixel is right when it is the one or the
+            // other, and the bulk of a body, its cloth, is the first.
+            let mirror = |i: usize, face: f32| {
+                let want = look::look(to_f(&plain[i..]), id, 1.0, face).map(|c| (c.clamp(0.0, 1.0) * 255.0).round());
                 (0..3).all(|k| (want[k] - f32::from(new[i + k])).abs() <= 2.0)
             };
-            let kept = |i: usize| (0..3).all(|k| plain[i + k].abs_diff(new[i + k]) <= 2);
-            let agree = model_px.iter().filter(|&&i| as_mirror(i)).count();
-            let agree_or_kept = model_px.iter().filter(|&&i| as_mirror(i) || kept(i)).count();
+            let agree = model_px.iter().filter(|&&i| mirror(i, 0.0)).count();
+            let agree_or_own = model_px.iter().filter(|&&i| mirror(i, 0.0) || mirror(i, 1.0)).count();
             let largest = model_px.iter().map(|&i| (0..3).map(|k| plain[i + k].abs_diff(new[i + k])).max().unwrap_or(0)).max().unwrap_or(0);
             let grey_stays_grey = model_px.iter().filter(|&&i| plain[i] == plain[i + 1] && plain[i + 1] == plain[i + 2]).all(|&i| new[i].abs_diff(new[i + 1]) <= 1 && new[i + 1].abs_diff(new[i + 2]) <= 1);
             let share = |n: usize| 100.0 * n as f32 / model_px.len() as f32;
             eprintln!(
-                "{:7} {name:5}: {:.1}% of {} pixels match the mirror, {:.1}% match it or keep the model's own colour; largest change from the untinted picture {largest}; grey stays grey: {grey_stays_grey}",
+                "{:7} {name:5}: {:.1}% of {} pixels match the mirror's cloth, {:.1}% match its cloth or its own colours; largest change from the untinted picture {largest}; grey stays grey: {grey_stays_grey}",
                 body.archetype,
                 share(agree),
                 model_px.len(),
-                share(agree_or_kept)
+                share(agree_or_own)
             );
-            // The cloth is the bulk of a body (a head's hair and skin are the rest), and every pixel is the one or the other.
             assert!(agree as f32 > 0.85 * model_px.len() as f32, "{} {name}: the shader is the mirror on the cloth", body.archetype);
-            assert!(agree_or_kept as f32 > 0.97 * model_px.len() as f32, "{} {name}: every pixel is the mirror's or the model's own", body.archetype);
+            assert!(agree_or_own as f32 > 0.97 * model_px.len() as f32, "{} {name}: every pixel is the mirror's cloth or its own colours", body.archetype);
             assert!(grey_stays_grey, "{} {name}: no hue is added to grey", body.archetype);
             if name == "white" {
                 assert!(largest <= 2, "{}: a white identity colour leaves the model as it is (largest change {largest})", body.archetype);

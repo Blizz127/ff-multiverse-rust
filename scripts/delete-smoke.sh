@@ -7,9 +7,9 @@
 #   (1) a character that is in the game is NOT deleted (`fmv-client --delete` is refused, the character is untouched);
 #   (2) once it has left, `fmv-client --delete NAME` deletes it ON THE SERVER with its own login token: the client prints
 #       `deleted character name=<NAME>`, forgets the saved login, the server logs `character deleted`, and the account's
-#       records (account, avatar, character, progress) are in a timestamped entry of <state>/trash/, byte for byte what they
-#       were, while every other file of the state directory (the other characters') is byte for byte unchanged but for
-#       index.log, which grew;
+#       records (account, avatar, character; a real game's progress files too, the fixture has none) are in a timestamped
+#       entry of <state>/trash/, byte for byte what they were, while every other file of the state directory (the other
+#       characters') is byte for byte unchanged but for index.log, which grew;
 #   (3) the name is free: registering it again works and is a different account with a different token;
 #   (4) the old login is dead: its token is refused ("invalid or unknown token"), before and after a server restart;
 #   (5) a server restart brings nothing back: the characters that were not deleted log in again, the trash is still there;
