@@ -229,6 +229,11 @@ SOUND:
   The victory fanfare is the track `fanfare` (a five-second jingle without a loop; the game's data
   do not say which track it is). FMV_AUDIO_FANFARE=<track> plays another track of music.idx instead
   (`fan2`, say), if your ears disagree.
+  A battle's blows have sounds too, at the moment each one lands: a party member's weapon hit,
+  critical hit and miss, an enemy attack's impact, read from your own kernel.bin and scene.bin; what
+  the data names no sound for (spells, items, limit breaks) is silent. FMV_BATTLE_SOUNDS=off plays
+  none, `data` (the default) what the data names, `all` also an enemy's death and an escape (named
+  only by a hand-made list of the sound bank, by ear). The log says `audio: battle sound <id> (hit)`.
 
 WINDOW CONTROLS:
   WASD / arrow keys move, Esc twice quits (never during a battle: close the window to quit
@@ -1233,7 +1238,7 @@ mod tests {
         assert!(!parse(&[]).unwrap().mute);
         assert!(parse(&["--mute"]).unwrap().mute);
         assert!(parse(&["--headless", "--mute"]).unwrap().mute);
-        for words in ["SOUND:", "--mute", "FMV_AUDIO=off", "FMV_AUDIO=null", "libasound.so.2", "FMV_AUDIO_FANFARE", "M mutes"] {
+        for words in ["SOUND:", "--mute", "FMV_AUDIO=off", "FMV_AUDIO=null", "libasound.so.2", "FMV_AUDIO_FANFARE", "FMV_BATTLE_SOUNDS", "M mutes"] {
             assert!(AFTER_HELP.contains(words), "the help says {words}");
         }
     }

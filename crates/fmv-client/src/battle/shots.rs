@@ -688,21 +688,27 @@ fn offscreen_battle_more_statuses_than_fit_on_the_party_panel() {
     }
 }
 
-/// A blow of Barret's and the enemy's counter to it arrive in ONE batch; they are played one after the other, not over each other. Three
+/// A blow of Barret's and the enemy's counter to it arrive in ONE batch; they are played one after the other, not over each other. Four
 /// moments of it: the blow has landed (its number over the enemy, no banner: a plain attack has none), the counter has begun (its
-/// name in the banner, the blow's number still fading) and the counter has landed (its numbers over the three of the party).
+/// name in the banner, the blow's number still fading), the counter has landed (its numbers over the three of the party) and the collapse
+/// of the member it felled has begun.
 ///
-/// The party panel in these pictures is what the client really shows: the state AFTER the whole batch (the panel follows the state at
-/// once, the show follows the blow), so Cloud's and Barret's HP are already down and Tifa already fallen in the first picture, where the
-/// counter has not even begun. That skew is a known gap (sequencing made it up to a second and a half; it was at most 0.6 s).
+/// The party panel in these pictures is what the client really shows. The engine has the state after the whole batch from the moment the
+/// message arrives, and the panel holds every value back until the performance that changes it lands (`lag`): in the first two pictures
+/// Cloud, Barret and Tifa still have the HP they had (the counter has not landed), the third has the counter's three numbers in the panel
+/// (Tifa at 0, her name still standing), the fourth her name gone dead.
 #[test]
 #[ignore = "needs a GPU or software Vulkan/GL driver"]
 fn offscreen_battle_a_counter_plays_after_the_blow_that_provoked_it() {
+    use super::lag::Vitals;
     use super::names::NameBook;
-    use super::scene::cue::{impact_delay, length_of};
+    use super::scene::cue::{impact_delay, length_of, DEATH_BEAT};
     use fmv_protocol::ActionRef;
     use std::sync::Arc;
     let Some(mut gpu) = Shooter::new() else { return };
+    let vitals = |v: &BattleView| -> Vec<(ActorId, Vitals)> {
+        v.party.iter().chain(&v.enemies).map(|b| (b.actor, Vitals { hp: b.hp, max_hp: b.max_hp, mp: b.mp, max_mp: b.max_mp, alive: b.alive })).collect()
+    };
     for (w, h) in SIZES {
         let l = layout(w, h, 3);
         // An invented name for an invented attack of scene 75 (formation 301): no game text is used here.
@@ -710,24 +716,17 @@ fn offscreen_battle_a_counter_plays_after_the_blow_that_provoked_it() {
         let mut hud = BattleHud::new(Some(Arc::new(book)));
         hud.begin(301, Some(ActorId(1)));
         let hit = |actor: u8, target: u8, amount: u32| BattleEvent::Damage { actor: ActorId(actor), target: ActorId(target), amount, critical: false };
-        hud.on_events(
-            NOW,
-            &[
-                BattleEvent::Action { actor: ActorId(1), action: ActionRef::Attack },
-                hit(1, 3, 25),
-                BattleEvent::Action { actor: ActorId(3), action: ActionRef::EnemyAttack(286) },
-                hit(3, 0, 120),
-                hit(3, 1, 96),
-                hit(3, 2, 130),
-                BattleEvent::Death { actor: ActorId(2) },
-            ],
-            true,
-        );
-        let blow_lands = NOW + impact_delay(Some(ActionRef::Attack));
-        let counter_begins = NOW + length_of(Some(ActionRef::Attack));
-        let counter_lands = counter_begins + impact_delay(Some(ActionRef::EnemyAttack(286)));
-        let shot = |gpu: &mut Shooter, name: &str, at: f64| {
-            // The state after the batch, as the client has it from the moment the message arrived (see above).
+        let events = [
+            BattleEvent::Action { actor: ActorId(1), action: ActionRef::Attack },
+            hit(1, 3, 25),
+            BattleEvent::Action { actor: ActorId(3), action: ActionRef::EnemyAttack(286) },
+            hit(3, 0, 120),
+            hit(3, 1, 96),
+            hit(3, 2, 130),
+            BattleEvent::Death { actor: ActorId(2) },
+        ];
+        // The state after the batch, as the replayed engine has it from the moment the message arrives.
+        let after = {
             let mut view = battle();
             view.party[1].ready = false;
             view.party[1].gauge = 30_000;
@@ -737,12 +736,22 @@ fn offscreen_battle_a_counter_plays_after_the_blow_that_provoked_it() {
             view.party[2].hp = 0;
             view.party[2].alive = false;
             view.party[2].ready = false;
+            view
+        };
+        hud.on_events(NOW, &events, true);
+        hud.on_vitals(NOW, &events, &vitals(&battle()), &vitals(&after));
+        let blow_lands = NOW + impact_delay(Some(ActionRef::Attack));
+        let counter_begins = NOW + length_of(Some(ActionRef::Attack));
+        let counter_lands = counter_begins + impact_delay(Some(ActionRef::EnemyAttack(286)));
+        let shot = |gpu: &mut Shooter, name: &str, at: f64| {
+            let mut view = after.clone();
             hud.decorate(&mut view, at);
             (gpu.shoot(name, &view, w, h), view)
         };
         let (blow, blow_view) = shot(&mut gpu, "19-the-blow-has-landed", blow_lands + 0.15);
         let (begun, begun_view) = shot(&mut gpu, "20-the-counter-has-begun", counter_begins + 0.15);
         let (landed, landed_view) = shot(&mut gpu, "21-the-counter-has-landed", counter_lands + 0.15);
+        let (collapsed, collapsed_view) = shot(&mut gpu, "22-the-collapse-has-begun", counter_lands + DEATH_BEAT + 0.1);
         // What each moment says on the screen, from the view and from its pixels.
         assert_eq!(blow_view.popups.iter().map(|p| p.target.0).collect::<Vec<_>>(), [3], "the blow's number, and nobody else's");
         assert!(blow_view.banner.is_none(), "a plain attack has no banner, and the counter's name waits for its turn");
@@ -769,5 +778,27 @@ fn offscreen_battle_a_counter_plays_after_the_blow_that_provoked_it() {
         let text = [TEXT[0], TEXT[1], TEXT[2], 255];
         assert!(count_near(&begun, w, h, banner_row, text, 6) > 10 * (l.s * l.s) as usize, "{w}x{h}: the banner names the counter");
         assert!(count_near(&blow, w, h, banner_row, text, 6) < count_near(&begun, w, h, banner_row, text, 6) / 4, "{w}x{h}: and not before");
+
+        // HP in time: the numbers of the party panel. The data of the views first...
+        let hp = |v: &BattleView| v.party.iter().map(|b| (b.hp, b.alive)).collect::<Vec<_>>();
+        assert_eq!(hp(&blow_view), [(427, true), (312, true), (98, true)], "the blow has landed and nothing of the counter has");
+        assert_eq!(hp(&begun_view), hp(&blow_view), "the counter has begun, it has not landed");
+        assert_eq!(hp(&landed_view), [(307, true), (216, true), (0, true)], "the counter's three numbers; Tifa is down to 0 and still standing");
+        assert_eq!(hp(&collapsed_view), [(307, true), (216, true), (0, false)], "and then her name goes dead");
+        assert_eq!(blow_view.enemies[0].hp, 30, "the enemy's HP went down with the blow that did it");
+        // ...and the pixels: the party window does not change between the first two pictures, changes when the counter lands, and in
+        // red (a 0) and in the greyed-out colour of a name that is dead only when they should.
+        let party_area = pixels(&l, l.party);
+        let region = |img: &[u8]| -> Vec<u8> {
+            let (x0, y0, x1, y1) = party_area;
+            (y0..y1).flat_map(|y| (x0..x1).flat_map(move |x| px(img, w, x as u32, y as u32))).collect()
+        };
+        assert_eq!(region(&blow), region(&begun), "{w}x{h}: the party panel is the same until the counter lands");
+        assert_ne!(region(&begun), region(&landed), "{w}x{h}: and it changes when the counter lands");
+        let (red, grey) = ([ERROR[0], ERROR[1], ERROR[2], 255], DISABLED);
+        let counted = |img: &[u8], colour: [u8; 4]| count_near(img, w, h, party_area, colour, 6);
+        assert_eq!((counted(&blow, red), counted(&begun, red)), (0, 0), "{w}x{h}: nobody is at 0 HP before the counter lands");
+        assert!(counted(&landed, red) > 0, "{w}x{h}: Tifa's 0 is in red when it lands");
+        assert!(counted(&collapsed, grey) > counted(&landed, grey), "{w}x{h}: her name goes grey only when her collapse begins ({} then {})", counted(&landed, grey), counted(&collapsed, grey));
     }
 }

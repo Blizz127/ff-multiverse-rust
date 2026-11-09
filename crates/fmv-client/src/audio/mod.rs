@@ -1,5 +1,5 @@
-//! The client's sound: the field's music, the battle music, the victory fanfare and the menu sound
-//! effects, played through [`fmv_audio`] and decided from what the game is doing.
+//! The client's sound: the field's music, the battle music, the victory fanfare, the menu sound
+//! effects and the sounds of a battle's blows, played through [`fmv_audio`] and decided from what the game is doing.
 //!
 //! ```text
 //!   window / headless loop ──update(area, battle counters)──▶ GameAudio ──play_music / play_sfx──▶ AudioEngine
@@ -19,9 +19,19 @@
 //!   no sound card and a thread that cannot start are each one line on stderr (starting `audio:`) and
 //!   silence; `--mute`, `FMV_AUDIO=off` and headless runs build nothing at all.
 //!
+//! * **Battle sounds.** Each performance of a battle plays the sound the game's own data names for it, at the
+//!   instant it lands (`crate::battle::sounds`: a weapon's hit, critical hit and miss, an enemy attack's impact). When a
+//!   battle starts [`GameAudio::follow_battle`] asks the [`Worker`] for the clips this battle can need (only those, by
+//!   the game's sound id, in the urgent lane), and every frame it asks the battle for the sounds that came due and plays
+//!   them with the effects' volume path: they share the master volume, the mute key and `--mute`/`FMV_AUDIO` with the rest.
+//!   `FMV_BATTLE_SOUNDS` says which ones are played: `off` none, `data` (the default) what the data names, `all` also
+//!   the two that only a hand-made list of the sound bank names (an enemy's death, an escape; see [`BattleSounds`]).
+//!
 //! What the log says (it is the evidence of a headless run, which has no ears): one `audio: field
 //! <area>:` line per area with the tracks its script names, `audio: decoded <track>` as each
-//! finishes, and `audio: playing <track> (<why>)` at the moment a track really starts.
+//! finishes, `audio: playing <track> (<why>)` at the moment a track really starts, `audio: battle sounds: N loaded`
+//! when a fight's clips were read, `audio: battle sound <id> (<hit|critical|miss|impact|...>)` at the moment each one
+//! plays and, when the run ends, `audio: battle sounds played: N (<id>x<times> ...)`.
 
 mod cues;
 mod director;
@@ -31,13 +41,13 @@ mod worker;
 pub use cues::{battle_cue, menu_cue, Cue};
 pub use director::BattleCounts;
 
-use crate::battle::BattleClient;
+use crate::battle::{BattleClient, BattleSound, Planned};
 use director::{Director, STANDARD_BATTLE_TRACK};
 use worker::{Done, Tasks, ThreadWorker, Worker};
 use crate::session::Session;
 use fmv_audio::{AudioConfig, AudioEngine, DecodedMusic, Logger, Mode, PlayOptions, SfxClip, TrackId};
 use fmv_core::GameId;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
 /// Decoded tracks kept at once (the playing one, the next fight's, the fanfare, and a little slack): about
@@ -49,6 +59,79 @@ const VOLUME_STEPS: u8 = 10;
 const SLOW_START: std::time::Duration = std::time::Duration::from_millis(100);
 /// The environment variable that names another track for the victory fanfare (see `main::start_audio`).
 pub const FANFARE_ENV: &str = "FMV_AUDIO_FANFARE";
+/// The environment variable that says which battle sounds play (see [`BattleSounds`]).
+pub const BATTLE_SOUNDS_ENV: &str = "FMV_BATTLE_SOUNDS";
+/// How loud a battle sound plays, `0.0..=1.0` (before the master volume, which it shares with everything else).
+const BATTLE_GAIN: f32 = 0.8;
+/// A battle sound that came due this long ago or more is not played: a window that stalled does not play a burst.
+const STALE_SOUND_S: f64 = 0.5;
+/// Clips of battle sounds kept at once (a fight needs a dozen or so; the oldest go first).
+const BATTLE_CLIPS: usize = 64;
+
+/// Which battle sounds are played (`FMV_BATTLE_SOUNDS`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BattleSounds {
+    /// None.
+    Off,
+    /// What the game's data names: a weapon's hit, critical hit and miss, an enemy attack's impact (the default).
+    #[default]
+    Data,
+    /// Also the two sounds only a hand-made list of the sound bank names, an enemy's death and an escape (identified by
+    /// ear, and nothing says when the game plays them: a boss has a death clip of its own).
+    All,
+}
+
+impl BattleSounds {
+    /// The choice `FMV_BATTLE_SOUNDS` (`value`) makes: `off` (or `0`, `no`, `false`, `none`), `data` (or `on`, `1`, `yes`,
+    /// `true`; also what an unset or empty one is) or `all` (or `more`). The second value is a note about one that makes no
+    /// sense (which is `data`).
+    pub fn from_env(value: Option<&str>) -> (Self, Option<String>) {
+        let Some(raw) = value.map(str::trim).filter(|v| !v.is_empty()) else { return (Self::Data, None) };
+        match raw.to_ascii_lowercase().as_str() {
+            "off" | "0" | "no" | "false" | "none" => (Self::Off, None),
+            "data" | "on" | "1" | "yes" | "true" => (Self::Data, None),
+            "all" | "more" => (Self::All, None),
+            _ => (Self::Data, Some(format!("{BATTLE_SOUNDS_ENV}={raw:?} is not off, data or all: playing what the game's data names"))),
+        }
+    }
+
+    /// Whether a sound plays (`by_ear`: named only by the hand-made list, see [`crate::battle::sounds::Why::by_ear`]).
+    fn plays(self, by_ear: bool) -> bool {
+        match self {
+            Self::Off => false,
+            Self::Data => !by_ear,
+            Self::All => true,
+        }
+    }
+}
+
+/// The clips of the battle sounds read so far, by the game's sound id; the oldest are let go past [`BATTLE_CLIPS`].
+#[derive(Default)]
+struct Clips {
+    order: VecDeque<u16>,
+    clips: HashMap<u16, SfxClip>,
+}
+
+impl Clips {
+    fn get(&self, id: u16) -> Option<&SfxClip> {
+        self.clips.get(&id)
+    }
+
+    /// Keep `clip`; the ids of the clips that had to go to make room.
+    fn insert(&mut self, id: u16, clip: SfxClip) -> Vec<u16> {
+        if self.clips.insert(id, clip).is_none() {
+            self.order.push_back(id);
+        }
+        let mut gone = Vec::new();
+        while self.order.len() > BATTLE_CLIPS {
+            if let Some(old) = self.order.pop_front() {
+                self.clips.remove(&old);
+                gone.push(old);
+            }
+        }
+        gone
+    }
+}
 
 /// What this run does with sound: `--mute` is always off; a headless bot, which is a test tool, is silent
 /// unless `FMV_AUDIO` (`env`) was set on purpose; otherwise `FMV_AUDIO` decides, and an unset one is
@@ -127,6 +210,20 @@ struct Live {
     history: Vec<String>,
     volume_step: u8,
     muted: bool,
+    /// Which battle sounds play.
+    battle_sounds: BattleSounds,
+    /// The clips of the battle sounds that were read.
+    battle_clips: Clips,
+    /// The sound ids asked of the worker (read, being read, or without a clip): never asked for again, until the clip is let go.
+    sounds_asked: HashSet<u16>,
+    /// Battles seen start (the battle counter at the last look): a new one asks for its clips.
+    battles_seen: u64,
+    /// The time the battle's due sounds were last asked for up to (the next look asks from here).
+    polled_to: Option<f64>,
+    /// How many times each battle sound id was played (the closing line of the run, and tests).
+    battle_played: BTreeMap<u16, u32>,
+    /// Ids that came due with no clip to play, said once each.
+    unheard: HashSet<u16>,
 }
 
 impl Live {
@@ -206,8 +303,61 @@ impl Live {
                     self.cues = clips.into_iter().collect();
                 }
                 Done::Cues(Err(why)) => self.say(&format!("no menu sounds ({why})")),
+                Done::Sounds { read, took } => {
+                    let loaded = read.clips.len();
+                    for (id, clip) in read.clips {
+                        // A clip let go to make room may be asked for again by a later battle.
+                        for gone in self.battle_clips.insert(id, clip) {
+                            self.sounds_asked.remove(&gone);
+                        }
+                    }
+                    for (id, why) in &read.missing {
+                        self.say(&format!("no clip for battle sound {id} ({why}); going on without it"));
+                    }
+                    self.say(&format!("battle sounds: {loaded} loaded in {} ms", took.as_millis()));
+                }
             }
         }
+    }
+
+    /// What the battle sounds of this run came to, `None` when there were none: `86 (16x39 18x12 46x1 227x34)`, each sound id
+    /// and how many times it played (the closing line of a run that heard any).
+    fn battle_sounds_played(&self) -> Option<String> {
+        let total: u32 = self.battle_played.values().sum();
+        let ids = self.battle_played.iter().map(|(id, n)| format!("{id}x{n}")).collect::<Vec<_>>().join(" ");
+        (total > 0).then(|| format!("{total} ({ids})"))
+    }
+
+    /// Ask the worker for the clips of the sounds in `plan` that this run plays and has not asked for yet.
+    fn request_battle_sounds(&mut self, plan: &[Planned]) {
+        let wanted: Vec<u16> = plan
+            .iter()
+            .filter(|p| self.battle_sounds.plays(p.by_ear))
+            .map(|p| p.id)
+            .filter(|id| !self.sounds_asked.contains(id))
+            .collect();
+        if wanted.is_empty() {
+            return;
+        }
+        self.sounds_asked.extend(wanted.iter().copied());
+        self.worker.load_sounds(wanted);
+    }
+
+    /// Play a battle sound that came due at `at` (it is `now`), unless this run does not play that kind, it is long over or
+    /// there is no clip for it (said once).
+    fn play_battle_sound(&mut self, at: f64, now: f64, sound: BattleSound) {
+        if !self.battle_sounds.plays(sound.why.by_ear()) || now - at > STALE_SOUND_S {
+            return;
+        }
+        let Some(clip) = self.battle_clips.get(sound.id) else {
+            if self.unheard.insert(sound.id) {
+                self.say(&format!("battle sound {} ({}) has no clip to play", sound.id, sound.why.name()));
+            }
+            return;
+        };
+        self.engine.play_sfx(clip, BATTLE_GAIN, 0.0);
+        *self.battle_played.entry(sound.id).or_default() += 1;
+        self.say(&format!("battle sound {} ({})", sound.id, sound.why.name()));
     }
 
     fn apply_want(&mut self) {
@@ -235,6 +385,15 @@ impl Live {
     }
 }
 
+impl Drop for Live {
+    /// The end of a run: what its battles sounded like, in one line (the evidence of a headless run, which has no ears).
+    fn drop(&mut self) {
+        if let Some(played) = self.battle_sounds_played() {
+            self.say(&format!("battle sounds played: {played}"));
+        }
+    }
+}
+
 /// The soundtrack of one run. [`GameAudio::off`] (also the default) plays nothing and costs nothing.
 #[derive(Default)]
 pub struct GameAudio {
@@ -255,7 +414,11 @@ impl GameAudio {
         }
         let log = config.logger.clone();
         let engine = AudioEngine::start(config);
-        Self::with_parts(engine, Box::new(ThreadWorker::start(tasks)), log)
+        let (battle_sounds, note) = BattleSounds::from_env(std::env::var(BATTLE_SOUNDS_ENV).ok().as_deref());
+        if let Some(note) = note {
+            log(&note);
+        }
+        Self::with_parts(engine, Box::new(ThreadWorker::start(tasks)), log).with_battle_sounds(battle_sounds)
     }
 
     /// The sound over an engine and a worker the caller made (tests use a manual engine and a fake worker).
@@ -280,8 +443,24 @@ impl GameAudio {
                 history: Vec::new(),
                 volume_step: (master.clamp(0.0, 1.0) * f32::from(VOLUME_STEPS)).round() as u8,
                 muted: false,
+                battle_sounds: BattleSounds::default(),
+                battle_clips: Clips::default(),
+                sounds_asked: HashSet::new(),
+                battles_seen: 0,
+                polled_to: None,
+                battle_played: BTreeMap::new(),
+                unheard: HashSet::new(),
             })),
         }
+    }
+
+    /// Play `which` battle sounds (the default is what the data names, see [`BattleSounds`]); no effect on a soundtrack that
+    /// is off.
+    pub fn with_battle_sounds(mut self, which: BattleSounds) -> Self {
+        if let Some(live) = self.live.as_mut() {
+            live.battle_sounds = which;
+        }
+        self
     }
 
     /// Play `track` as the victory fanfare instead of the standard one (see
@@ -330,6 +509,27 @@ impl GameAudio {
         let area = &session.info.area_id;
         let key = (area.game == GameId::Ff7).then_some(area.key.as_str());
         self.update(key, BattleCounts::of(&session.state.battle));
+        self.follow_battle(&session.state.battle, session.now());
+    }
+
+    /// Follow a battle's sounds at `now` (seconds on the clock its messages were stamped with, [`Session::now`]): a battle
+    /// that has started asks the worker for the clips it can need (once), and the sounds that came due since the last look
+    /// are played, each at the moment its performance lands. Cheap, never blocks; call it every frame. A sound due after the
+    /// battle ended (the killing blow) is still played: only the clips being loaded gate it.
+    pub fn follow_battle(&mut self, battle: &BattleClient, now: f64) {
+        let Some(live) = self.live.as_mut() else { return };
+        if live.battle_sounds == BattleSounds::Off {
+            return;
+        }
+        live.pump_worker();
+        if battle.entered() > live.battles_seen {
+            live.battles_seen = battle.entered();
+            live.request_battle_sounds(&battle.sound_plan());
+        }
+        let from = live.polled_to.replace(now).unwrap_or(now);
+        for (at, sound) in battle.sounds_due(from, now) {
+            live.play_battle_sound(at, now, sound);
+        }
     }
 
     /// Play a menu sound effect (silently nothing while the effects are not loaded, or when there are none).
@@ -430,6 +630,8 @@ mod tests {
         hold: bool,
         held: Vec<Done>,
         cues: bool,
+        /// The sound ids the library has no clip for (an empty slot, say); every other id has one.
+        no_clip: Vec<u16>,
     }
 
     /// A worker that answers on the spot (or when told to): no threads, no waiting.
@@ -461,6 +663,22 @@ mod tests {
             };
             let done = Done::Cues(if s.cues { Ok(clips) } else { Err("no sound files".to_string()) });
             s.inbox.push(done);
+        }
+
+        fn load_sounds(&mut self, ids: Vec<u16>) {
+            let mut s = self.0.borrow_mut();
+            s.asked.push(format!("sounds {ids:?}"));
+            let mut read = worker::SoundsRead::default();
+            for id in ids {
+                if s.no_clip.contains(&id) {
+                    read.missing.push((id, "an empty slot".to_string()));
+                } else {
+                    // A clip of a tenth of a second at the rate of the engine, never silent.
+                    read.clips.push((id, SfxClip::from_mono(RATE, &vec![0.5; 4_800]).expect("a clip")));
+                }
+            }
+            let done = Done::Sounds { read, took: std::time::Duration::from_millis(3) };
+            if s.hold { s.held.push(done) } else { s.inbox.push(done) }
         }
 
         fn poll(&mut self) -> Vec<Done> {
@@ -793,6 +1011,7 @@ mod tests {
             analyze: Arc::new(|_| panic!("a muted run must not read a script")),
             decode: Arc::new(|_| panic!("a muted run must not decode")),
             cues: Arc::new(|| panic!("a muted run must not read the sound files")),
+            sounds: Arc::new(|_| panic!("a muted run must not read the sound files")),
         };
         let muted = GameAudio::start(AudioConfig { mode: Mode::Off, ..AudioConfig::default() }, tasks);
         assert!(!muted.is_on());
@@ -860,5 +1079,306 @@ mod tests {
         assert_eq!(rig.audio.id_of("ob"), Some(TrackId(1)));
         assert_eq!(rig.audio.id_of("bat"), Some(TrackId(2)));
         assert_eq!(rig.audio.id_of("nobody"), None);
+    }
+
+    // ---------- battle sounds ----------
+
+    use crate::battle::sounds::{SoundBook, ENEMY_DEATH_SOUND, ESCAPE_SOUND};
+    use crate::battle::{BattleClient, NameBook};
+    use fmv_core::{AccountId, EntityId};
+    use fmv_ff7_battle::rules::{ActionRef, ActorId, BattleEvent};
+    use fmv_protocol::{BattleId, BattleMember, ServerMsg, SyntheticRules};
+
+    const ME: AccountId = AccountId(11);
+
+    /// A battle of formation 301 (scene 75) with two players (characters 0 and 3: invented weapons 0 and 5) whose machine has a
+    /// sound book of invented ids: weapon 0 is hit 18, critical 27, miss 5; scene 75's attack 272 has the impact 15. No rules, so
+    /// nothing is replayed and the sounds are scheduled from the events alone.
+    fn battle() -> BattleClient {
+        let book = SoundBook::for_tests()
+            .with_weapon(0, 18, 27, 5)
+            .with_weapon(5, 292, 350, 5)
+            .with_starting_weapon(0, 0)
+            .with_starting_weapon(3, 5)
+            .with_scene_attack(75, 272, 15)
+            .with_scene_attack(76, 272, 99);
+        let mut client = BattleClient::new(ME);
+        client.set_rules(None);
+        client.set_names(Some(Arc::new(NameBook::from_tables(&[], &[]).with_sounds(book))));
+        client.on_message(0.0, start(1, 301));
+        client
+    }
+
+    /// The message that starts battle `id` of formation `formation` with the two players.
+    fn start(id: u64, formation: u16) -> ServerMsg {
+        let party = vec![
+            BattleMember::player(EntityId(1), ME, "A", 0, 6, 0),
+            BattleMember::player(EntityId(2), AccountId(12), "B", 3, 6, 0),
+        ];
+        ServerMsg::EncounterStart {
+            battle_id: BattleId(id),
+            formation_id: formation,
+            seed: 1,
+            party,
+            preemptive: false,
+            back_attack: false,
+            battle_speed: 0,
+            ticks_per_second: 1000,
+            data_fingerprint: SyntheticRules::FINGERPRINT,
+        }
+    }
+
+    fn send(client: &mut BattleClient, now: f64, events: Vec<BattleEvent>) {
+        client.on_message(now, ServerMsg::BattleEvent { battle_id: BattleId(1), tick: 1, events, command: None });
+    }
+
+    fn blow(actor: u8, target: u8, critical: bool) -> Vec<BattleEvent> {
+        vec![
+            BattleEvent::Action { actor: ActorId(actor), action: ActionRef::Attack },
+            BattleEvent::Damage { actor: ActorId(actor), target: ActorId(target), amount: 9, critical },
+        ]
+    }
+
+    /// One frame of the audio at `now`: the worker's answers, the due sounds and a little time on the engine.
+    fn look(rig: &mut Rig, client: &BattleClient, now: f64) {
+        rig.audio.update(None, BattleCounts::of(client));
+        rig.audio.follow_battle(client, now);
+        rig.audio.pump(64);
+    }
+
+    fn played(rig: &Rig) -> Vec<String> {
+        rig.lines().into_iter().filter(|l| l.starts_with("battle sound ") && !l.contains("loaded") && !l.contains("no clip")).collect()
+    }
+
+    #[test]
+    fn a_battle_asks_for_its_clips_once_when_it_starts_and_plays_each_sound_when_its_blow_lands() {
+        let mut rig = Rig::new(&[], &[]);
+        let mut client = battle();
+        look(&mut rig, &client, 0.0);
+        // The clips this fight can need, once: the weapons (5, 18, 27, 292, 350) and the scene's impact (15) (never the two
+        // by-ear sounds: they are not played by default).
+        let asked: Vec<String> = rig.state.borrow().asked.iter().filter(|a| a.starts_with("sounds")).cloned().collect();
+        assert_eq!(asked, ["sounds [5, 15, 18, 27, 292, 350]"], "{asked:?}");
+        look(&mut rig, &client, 0.1);
+        assert_eq!(rig.state.borrow().asked.iter().filter(|a| a.starts_with("sounds")).count(), 1, "not asked for again");
+        assert!(rig.lines().iter().any(|l| l == "battle sounds: 6 loaded in 3 ms"), "{:?}", rig.lines());
+        // A blow of player A's arrives at 10.0; it lands half a second later and not before.
+        send(&mut client, 10.0, blow(0, 2, false));
+        look(&mut rig, &client, 10.0);
+        look(&mut rig, &client, 10.2);
+        look(&mut rig, &client, 10.49);
+        assert!(played(&rig).is_empty(), "nothing at the arrival of the batch: the blow has not landed");
+        assert_eq!(rig.audio.status().expect("on").sfx_playing, 0);
+        look(&mut rig, &client, 10.51);
+        assert_eq!(played(&rig), ["battle sound 18 (hit)"]);
+        assert_eq!(rig.audio.status().expect("on").sfx_playing, 1, "and the engine has it");
+        // Looking again does not play it again.
+        look(&mut rig, &client, 10.6);
+        look(&mut rig, &client, 11.0);
+        assert_eq!(played(&rig), ["battle sound 18 (hit)"]);
+        // A critical hit and a miss of the second player, and an enemy's attack: each its own sound.
+        send(&mut client, 20.0, blow(1, 2, true));
+        send(&mut client, 21.0, vec![BattleEvent::Action { actor: ActorId(0), action: ActionRef::Attack }, BattleEvent::Miss { actor: ActorId(0), target: ActorId(2) }]);
+        send(&mut client, 22.0, vec![BattleEvent::Action { actor: ActorId(2), action: ActionRef::EnemyAttack(272) }, BattleEvent::Damage { actor: ActorId(2), target: ActorId(0), amount: 4, critical: false }]);
+        for step in 0..=300 {
+            look(&mut rig, &client, 20.0 + f64::from(step) * 0.01);
+        }
+        assert_eq!(played(&rig), ["battle sound 18 (hit)", "battle sound 350 (critical)", "battle sound 5 (miss)", "battle sound 15 (impact)"]);
+        // The summary of the tracks is what it was; the end of the run says what the battles sounded like.
+        assert!(rig.audio.summary().expect("on").ends_with("tracks started: -"), "{:?}", rig.audio.summary());
+        let lines = Arc::clone(&rig.lines);
+        drop(rig);
+        let said = lines.lock().expect("log").clone();
+        assert!(said.iter().any(|l| l == "battle sounds played: 4 (5x1 15x1 18x1 350x1)"), "{said:?}");
+    }
+
+    #[test]
+    fn a_run_that_heard_no_battle_sound_says_nothing_about_them_when_it_ends() {
+        let rig = Rig::new(&[], &[]);
+        let lines = Arc::clone(&rig.lines);
+        drop(rig);
+        assert!(!lines.lock().expect("log").iter().any(|l| l.contains("battle sounds played")));
+    }
+
+    #[test]
+    fn a_counter_is_heard_after_the_blow_it_answers_and_the_killing_blow_is_heard_after_the_battle_ended() {
+        let mut rig = Rig::new(&[], &[]);
+        let mut client = battle();
+        look(&mut rig, &client, 0.0);
+        // One batch: A's blow and the enemy's counter on A; the batch also ends the battle with a message of its own.
+        let mut batch = blow(0, 2, false);
+        batch.extend([BattleEvent::Action { actor: ActorId(2), action: ActionRef::EnemyAttack(272) }, BattleEvent::Damage { actor: ActorId(2), target: ActorId(0), amount: 99, critical: false }]);
+        send(&mut client, 30.0, batch);
+        client.on_message(30.0, ServerMsg::BattleEnd { battle_id: BattleId(1), outcome: fmv_protocol::battle::Outcome::Defeat, rewards: Vec::new() });
+        assert!(!client.in_battle(), "the battle is over for the mirror");
+        let blow_at = 30.0 + crate::battle::scene::cue::impact_delay(Some(ActionRef::Attack));
+        let counter_at = 30.0 + crate::battle::scene::cue::length_of(Some(ActionRef::Attack)) + crate::battle::scene::cue::impact_delay(Some(ActionRef::EnemyAttack(272)));
+        assert!(blow_at < counter_at);
+        let heard_at = |rig: &mut Rig, until: f64| {
+            let mut now = (30.0f64).max(until - 0.05);
+            while now <= until {
+                look(rig, &client, now);
+                now += 0.01;
+            }
+            played(rig)
+        };
+        look(&mut rig, &client, 30.0);
+        assert!(heard_at(&mut rig, blow_at - 0.02).is_empty(), "nothing before the blow lands");
+        assert_eq!(heard_at(&mut rig, blow_at + 0.1), ["battle sound 18 (hit)"], "the blow");
+        assert_eq!(heard_at(&mut rig, counter_at - 0.05), ["battle sound 18 (hit)"], "the counter has not landed yet");
+        assert_eq!(heard_at(&mut rig, counter_at + 0.1), ["battle sound 18 (hit)", "battle sound 15 (impact)"], "the counter comes after the blow, after the end message too");
+    }
+
+    #[test]
+    fn a_window_that_stalled_does_not_play_a_burst_of_old_sounds() {
+        let mut rig = Rig::new(&[], &[]);
+        let mut client = battle();
+        look(&mut rig, &client, 0.0);
+        send(&mut client, 10.0, blow(0, 2, false));
+        look(&mut rig, &client, 10.1);
+        // The next look is two seconds later: the blow came due 1.5 s ago, which is too late to be heard.
+        look(&mut rig, &client, 12.0);
+        assert!(played(&rig).is_empty());
+        // A fresh one still plays.
+        send(&mut client, 12.0, blow(0, 2, false));
+        look(&mut rig, &client, 12.6);
+        assert_eq!(played(&rig).len(), 1);
+    }
+
+    #[test]
+    fn the_flag_decides_which_battle_sounds_are_heard_and_asked_for() {
+        let events = |client: &mut BattleClient| {
+            // A blow that beats an enemy, then an escape: two by-ear sounds (the enemy's death, the escape) and one from the data.
+            let mut batch = blow(0, 2, false);
+            batch.extend([BattleEvent::Death { actor: ActorId(2) }, BattleEvent::Action { actor: ActorId(1), action: ActionRef::Escape }]);
+            send(client, 10.0, batch);
+        };
+        let run = |which: BattleSounds| {
+            let mut rig = Rig::new(&[], &[]);
+            rig.audio = std::mem::take(&mut rig.audio).with_battle_sounds(which);
+            let mut client = battle();
+            look(&mut rig, &client, 0.0);
+            events(&mut client);
+            for step in 0..=400 {
+                look(&mut rig, &client, 10.0 + f64::from(step) * 0.01);
+            }
+            let asked: Vec<String> = rig.state.borrow().asked.iter().filter(|a| a.starts_with("sounds")).cloned().collect();
+            (played(&rig), asked)
+        };
+        let (heard, asked) = run(BattleSounds::Data);
+        assert_eq!(heard, ["battle sound 18 (hit)"], "by default only what the data names");
+        assert!(!asked[0].contains(&ESCAPE_SOUND.to_string()) && !asked[0].contains(&ENEMY_DEATH_SOUND.to_string()), "{asked:?}");
+        let (heard, asked) = run(BattleSounds::All);
+        assert_eq!(heard, ["battle sound 18 (hit)", "battle sound 22 (death)", "battle sound 26 (escape)"], "all: the by-ear ones too, in the order they land");
+        assert!(asked[0].contains("22") && asked[0].contains("26"), "{asked:?}");
+        let (heard, asked) = run(BattleSounds::Off);
+        assert!(heard.is_empty() && asked.is_empty(), "off asks for nothing and plays nothing: {heard:?} {asked:?}");
+    }
+
+    #[test]
+    fn an_id_without_a_clip_is_said_once_and_the_battle_goes_on_without_it() {
+        let mut rig = Rig::new(&[], &[]);
+        rig.state.borrow_mut().no_clip = vec![18];
+        let mut client = battle();
+        look(&mut rig, &client, 0.0);
+        look(&mut rig, &client, 0.1);
+        assert!(rig.lines().iter().any(|l| l.starts_with("no clip for battle sound 18 (an empty slot)")), "{:?}", rig.lines());
+        for round in 0..3 {
+            send(&mut client, 10.0 + f64::from(round) * 3.0, blow(0, 2, false));
+            for step in 0..=100 {
+                look(&mut rig, &client, 10.0 + f64::from(round) * 3.0 + f64::from(step) * 0.01);
+            }
+        }
+        assert!(played(&rig).is_empty());
+        assert_eq!(rig.lines().iter().filter(|l| l.starts_with("battle sound 18 (hit) has no clip")).count(), 1, "said once");
+        // Another weapon's sounds are untouched.
+        send(&mut client, 30.0, blow(1, 2, false));
+        for step in 0..=100 {
+            look(&mut rig, &client, 30.0 + f64::from(step) * 0.01);
+        }
+        assert_eq!(played(&rig), ["battle sound 292 (hit)"]);
+    }
+
+    #[test]
+    fn a_second_battle_asks_only_for_the_clips_it_does_not_have_and_a_machine_without_sound_files_plays_nothing() {
+        let mut rig = Rig::new(&[], &[]);
+        let mut client = battle();
+        look(&mut rig, &client, 0.0);
+        let requests = |rig: &Rig| rig.state.borrow().asked.iter().filter(|a| a.starts_with("sounds")).cloned().collect::<Vec<_>>();
+        assert_eq!(requests(&rig), ["sounds [5, 15, 18, 27, 292, 350]"]);
+        // The same party and formation again: nothing new to read. Another formation (scene 76, whose attack 272 has another
+        // impact): only that clip.
+        client.on_message(5.0, ServerMsg::BattleEnd { battle_id: BattleId(1), outcome: fmv_protocol::battle::Outcome::Victory, rewards: Vec::new() });
+        client.on_message(6.0, start(2, 301));
+        look(&mut rig, &client, 6.0);
+        assert_eq!(requests(&rig).len(), 1, "{:?}", requests(&rig));
+        client.on_message(7.0, ServerMsg::BattleEnd { battle_id: BattleId(2), outcome: fmv_protocol::battle::Outcome::Victory, rewards: Vec::new() });
+        client.on_message(8.0, start(3, 304));
+        look(&mut rig, &client, 8.0);
+        assert_eq!(requests(&rig), ["sounds [5, 15, 18, 27, 292, 350]", "sounds [99]"]);
+        // No audio on this run at all: every call is a no-op.
+        let mut off = GameAudio::off();
+        off.follow_battle(&client, 1.0);
+        assert_eq!(off.summary(), None);
+    }
+
+    #[test]
+    fn battle_sounds_share_the_master_volume_and_the_mute_key() {
+        let peak = |steps_down: usize, mute: bool| {
+            let mut rig = Rig::new(&[], &[]);
+            for _ in 0..steps_down {
+                rig.audio.change_volume(false);
+            }
+            let mut client = battle();
+            look(&mut rig, &client, 0.0);
+            send(&mut client, 10.0, blow(0, 2, false));
+            look(&mut rig, &client, 10.0);
+            if mute {
+                rig.audio.toggle_mute();
+            }
+            // Let the mixer's ramps (volume, mute) finish before the sound starts.
+            rig.audio.pump(24_000);
+            look(&mut rig, &client, 10.51);
+            assert_eq!(played(&rig), ["battle sound 18 (hit)"]);
+            rig.audio.pump(2_000).iter().fold(0.0f32, |m, s| m.max(s.abs()))
+        };
+        let (loud, quiet, muted) = (peak(0, false), peak(4, false), peak(0, true));
+        assert!(loud > 0.1, "the sound is in the mix ({loud})");
+        assert!((quiet / loud - 0.5).abs() < 0.05, "master volume 0.4 against 0.8 halves it: {quiet} against {loud}");
+        assert!(muted < 1e-6, "the M key silences it ({muted})");
+    }
+
+    #[test]
+    fn the_flag_is_read_from_the_environment_the_way_the_other_flags_are() {
+        assert_eq!(BattleSounds::from_env(None), (BattleSounds::Data, None));
+        assert_eq!(BattleSounds::from_env(Some("")), (BattleSounds::Data, None));
+        for off in ["off", "OFF", " 0 ", "no", "false", "none"] {
+            assert_eq!(BattleSounds::from_env(Some(off)), (BattleSounds::Off, None), "{off:?}");
+        }
+        for data in ["data", "on", "1", "yes", "true", "Data"] {
+            assert_eq!(BattleSounds::from_env(Some(data)), (BattleSounds::Data, None), "{data:?}");
+        }
+        for all in ["all", "ALL", "more"] {
+            assert_eq!(BattleSounds::from_env(Some(all)), (BattleSounds::All, None), "{all:?}");
+        }
+        let (which, note) = BattleSounds::from_env(Some("loud"));
+        assert_eq!(which, BattleSounds::Data);
+        assert!(note.is_some_and(|n| n.contains("FMV_BATTLE_SOUNDS") && n.contains("loud")));
+        assert!(!BattleSounds::Off.plays(false) && BattleSounds::Data.plays(false) && !BattleSounds::Data.plays(true) && BattleSounds::All.plays(true));
+    }
+
+    #[test]
+    fn the_clip_store_lets_the_oldest_go_and_says_which() {
+        let clip = || SfxClip::from_mono(RATE, &[0.5; 8]).expect("a clip");
+        let mut clips = Clips::default();
+        let mut gone = Vec::new();
+        for id in 1..=(BATTLE_CLIPS as u16 + 3) {
+            gone.extend(clips.insert(id, clip()));
+        }
+        assert_eq!(gone, [1, 2, 3]);
+        assert!(clips.get(1).is_none() && clips.get(4).is_some() && clips.get(BATTLE_CLIPS as u16 + 3).is_some());
+        // The same id again is one clip, not two.
+        assert!(clips.insert(10, clip()).is_empty());
+        assert_eq!(clips.clips.len(), BATTLE_CLIPS);
     }
 }

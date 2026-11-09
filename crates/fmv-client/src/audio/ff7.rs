@@ -10,15 +10,17 @@
 //! * **Which track a field plays**: [`fmv_ff7::music`] reads the field's script for `MUSIC`, `BMUSC`
 //!   and `FMUSC` and maps the AKAO frame ids they name to track names through `music.idx`.
 //! * **The menu sounds**: [`fmv_ff7::sound`] reads the four effects out of `audio.dat`.
+//! * **The sounds of a battle**: the clips of the sound ids a fight can need (its weapons, its enemies' attacks), read
+//!   the same way, by id, when the fight starts (see `crate::battle::sounds` for which ids and why).
 
 use super::cues::Cue;
 use super::director::AreaMusic;
-use super::worker::{AnalyzeTask, Tasks};
+use super::worker::{AnalyzeTask, SoundsRead, Tasks};
 use crate::ff7::{Ff7ResolveError, Ff7Source};
 use fmv_audio::{decode_music_file, Logger, SfxClip};
 use fmv_ff7::music::{field_music_of, FieldMusic, MusicList, MusicUse};
 use fmv_ff7::script::INIT_SCRIPT;
-use fmv_ff7::sound::{self, PcmClip, SfxBank};
+use fmv_ff7::sound::{self, PcmClip, SfxBank, SoundError};
 use fmv_ff7::Ff7Adapter;
 use fmv_library::ff7::{resolve_audio, ResolvedAudio};
 use std::sync::Arc;
@@ -82,6 +84,10 @@ fn tasks_from(
             let files = Arc::clone(&files);
             Arc::new(move || load_cues(&files))
         },
+        sounds: {
+            let files = Arc::clone(&files);
+            Arc::new(move |ids| load_sounds(&files, ids))
+        },
     })
 }
 
@@ -144,6 +150,32 @@ fn load_cues(files: &ResolvedAudio) -> Result<Vec<(Cue, SfxClip)>, String> {
         clips.push((cue, clip_of(&pcm).ok_or_else(|| format!("the {} sound has an unusable format", cue.name()))?));
     }
     Ok(clips)
+}
+
+/// The clips of the sound ids `ids` out of `audio.dat` (only their bytes are read, not the whole 70 MB file): each id that
+/// names a clip comes back as a mixer clip, each that does not (an empty slot, an id past the bank, a clip that does not
+/// decode) with a short reason. Never an error for the whole list: a battle plays what it can.
+fn load_sounds(files: &ResolvedAudio, ids: &[u16]) -> SoundsRead {
+    let missing_all = |why: String| SoundsRead { clips: Vec::new(), missing: ids.iter().map(|id| (*id, why.clone())).collect() };
+    let (Some(fmt), Some(dat)) = (&files.sfx_fmt, &files.sfx_dat) else {
+        return missing_all("the library has no audio.fmt and audio.dat".to_string());
+    };
+    let bank = match SfxBank::open(fmt, dat) {
+        Ok(bank) => bank,
+        Err(e) => return missing_all(e.to_string()),
+    };
+    let mut read = SoundsRead::default();
+    for &id in ids {
+        match bank.decode_sound_id(id) {
+            Ok(pcm) => match clip_of(&pcm) {
+                Some(clip) => read.clips.push((id, clip)),
+                None => read.missing.push((id, "an unusable format".to_string())),
+            },
+            Err(SoundError::EmptyEntry(_)) => read.missing.push((id, "an empty slot".to_string())),
+            Err(e) => read.missing.push((id, e.to_string())),
+        }
+    }
+    read
 }
 
 #[cfg(test)]
@@ -271,8 +303,9 @@ mod tests {
         assert_eq!((tasks.decode)("bat").expect("bat decodes").frames(), 500);
         assert!((tasks.decode)("Bat").is_ok(), "names match without regard to case");
         assert!((tasks.decode)("fanfare").unwrap_err().contains("no file"));
-        // No effect files: no menu sounds, with a reason.
+        // No effect files: no menu sounds, with a reason, and none of a battle either.
         assert!((tasks.cues)().unwrap_err().contains("no audio.fmt"));
+        assert_eq!((tasks.sounds)(&[18]).missing.len(), 1);
         // One line about the missing track list and one that says what was found: nothing else.
         let seen = seen.lock().expect("log");
         assert_eq!(seen.len(), 2, "{seen:?}");
@@ -309,5 +342,60 @@ mod tests {
             ..ResolvedAudio::default()
         };
         assert!(load_cues(&missing).is_err());
+    }
+
+    /// A tiny `audio.fmt`/`audio.dat` pair (invented): id 1 is a clip of 3 frames of 16-bit PCM, id 2 an empty slot, id 3 a clip of
+    /// 2 frames. No game data.
+    fn tiny_bank(dir: &std::path::Path) -> ResolvedAudio {
+        let record = |length: u32, offset: u32| {
+            let mut v = Vec::new();
+            for word in [length, offset, 0, 0, 0, 0] {
+                v.extend_from_slice(&word.to_le_bytes());
+            }
+            v.extend_from_slice(&1u16.to_le_bytes()); // PCM
+            v.extend_from_slice(&1u16.to_le_bytes()); // mono
+            v.extend_from_slice(&22_050u32.to_le_bytes());
+            v.extend_from_slice(&44_100u32.to_le_bytes());
+            v.extend_from_slice(&[2, 0, 16, 0, 0, 0]); // block align, bits, cbSize
+            v
+        };
+        let mut empty = vec![0u8; 24];
+        empty[4..8].copy_from_slice(&6u32.to_le_bytes());
+        empty.extend_from_slice(&[0xCD; 18]);
+        let fmt: Vec<u8> = [record(6, 0), empty, record(4, 6)].concat();
+        let dat: Vec<u8> = [1i16, -2, 3, 100, -100].iter().flat_map(|s| s.to_le_bytes()).collect();
+        std::fs::write(dir.join("audio.fmt"), fmt).expect("a fmt");
+        std::fs::write(dir.join("audio.dat"), dat).expect("a dat");
+        ResolvedAudio { sfx_fmt: Some(dir.join("audio.fmt")), sfx_dat: Some(dir.join("audio.dat")), ..ResolvedAudio::default() }
+    }
+
+    #[test]
+    fn the_clips_of_some_sound_ids_are_read_by_id_and_what_has_none_says_why() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let files = tiny_bank(dir.path());
+        let read = load_sounds(&files, &[3, 1, 2, 0, 4]);
+        let ids: Vec<(u16, usize)> = read.clips.iter().map(|(id, clip)| (*id, clip.frames())).collect();
+        assert_eq!(ids, [(3, 2), (1, 3)], "id 3 is the second clip and id 1 the first: ids are 1-based");
+        assert!(read.clips.iter().all(|(_, clip)| clip.rate() == 22_050));
+        let missing: Vec<(u16, &str)> = read.missing.iter().map(|(id, why)| (*id, why.as_str())).collect();
+        assert_eq!(missing, [(2, "an empty slot"), (0, "sound id 0 is no sound (ids are 1-based)"), (4, "there is no sound-effect entry 3")]);
+        // Nothing asked for, nothing read.
+        let none = load_sounds(&files, &[]);
+        assert!(none.clips.is_empty() && none.missing.is_empty());
+    }
+
+    #[test]
+    fn without_effect_files_every_id_is_missing_with_the_same_reason_and_a_bad_pair_is_one_reason_too() {
+        let none = load_sounds(&ResolvedAudio::default(), &[5, 18]);
+        assert!(none.clips.is_empty());
+        assert_eq!(none.missing.iter().map(|(id, _)| *id).collect::<Vec<_>>(), [5, 18]);
+        assert!(none.missing.iter().all(|(_, why)| why.contains("no audio.fmt")));
+        let gone = ResolvedAudio {
+            sfx_fmt: Some(std::path::PathBuf::from("/definitely/not/here/audio.fmt")),
+            sfx_dat: Some(std::path::PathBuf::from("/definitely/not/here/audio.dat")),
+            ..ResolvedAudio::default()
+        };
+        let read = load_sounds(&gone, &[1]);
+        assert!(read.clips.is_empty() && read.missing.len() == 1 && !read.missing[0].1.contains("/definitely"), "{:?}", read.missing);
     }
 }

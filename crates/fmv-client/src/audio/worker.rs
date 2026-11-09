@@ -1,10 +1,12 @@
 //! The slow work of the soundtrack, off the game's thread: reading a field's script for its music,
-//! decoding a music file into memory, and reading the menu sounds out of `audio.dat`.
+//! decoding a music file into memory, and reading the menu sounds and the sounds of a battle out of `audio.dat` (only
+//! the clips asked for: the file is 70 MB).
 //!
 //! [`Worker`] is what the soundtrack asks of it and [`ThreadWorker`] is the real one: a couple of
 //! threads over a queue with two lanes. A track the soundtrack is waiting for right now goes in the
 //! **urgent** lane and is taken before anything that was only asked for in advance, so a victory
-//! fanfare never waits behind the prefetch of a three-minute theme. Results come back as [`Done`]
+//! fanfare never waits behind the prefetch of a three-minute theme (the sounds of a battle that is starting go in
+//! it too: the first blow lands half a second after the fight begins). Results come back as [`Done`]
 //! messages that [`Worker::poll`] hands out without blocking.
 //!
 //! The work itself is passed in as closures ([`Tasks`]): this module knows nothing of FF7's files,
@@ -31,6 +33,16 @@ pub enum Done {
     Track { name: String, result: Result<DecodedMusic, String>, took: Duration },
     /// The menu sounds (all four, or why there are none).
     Cues(Result<Vec<(Cue, SfxClip)>, String>),
+    /// The sounds of a battle that were asked for (by the game's sound id), and how long reading them took.
+    Sounds { read: SoundsRead, took: Duration },
+}
+
+/// What reading a list of sound ids gave: the clips that exist and, for each id that has none, why not (an empty slot, a
+/// clip that does not decode, no sound files at all).
+#[derive(Default)]
+pub struct SoundsRead {
+    pub clips: Vec<(u16, SfxClip)>,
+    pub missing: Vec<(u16, String)>,
 }
 
 /// What the soundtrack asks of the slow side. Every call returns at once.
@@ -41,6 +53,8 @@ pub trait Worker {
     fn decode(&mut self, name: &str, urgent: bool);
     /// Read the menu sounds.
     fn load_cues(&mut self);
+    /// Read the clips of these sound ids (a battle that starts: what its fights can need), before anything in advance.
+    fn load_sounds(&mut self, ids: Vec<u16>);
     /// What finished since the last call.
     fn poll(&mut self) -> Vec<Done>;
 }
@@ -52,18 +66,23 @@ pub type DecodeTask = Arc<dyn Fn(&str) -> Result<DecodedMusic, String> + Send + 
 /// Reads the menu sounds, or says why it cannot.
 pub type CuesTask = Arc<dyn Fn() -> Result<Vec<(Cue, SfxClip)>, String> + Send + Sync>;
 
+/// Reads the clips of some of the game's sound ids.
+pub type SoundsTask = Arc<dyn Fn(&[u16]) -> SoundsRead + Send + Sync>;
+
 /// The work, as closures that run on the worker threads.
 #[derive(Clone)]
 pub struct Tasks {
     pub analyze: AnalyzeTask,
     pub decode: DecodeTask,
     pub cues: CuesTask,
+    pub sounds: SoundsTask,
 }
 
 enum Job {
     Analyze(String),
     Decode(String),
     Cues,
+    Sounds(Vec<u16>),
 }
 
 #[derive(Default)]
@@ -160,6 +179,10 @@ impl Worker for ThreadWorker {
         self.push(Job::Cues, false);
     }
 
+    fn load_sounds(&mut self, ids: Vec<u16>) {
+        self.push(Job::Sounds(ids), true);
+    }
+
     fn poll(&mut self) -> Vec<Done> {
         self.results.try_iter().collect()
     }
@@ -201,6 +224,12 @@ fn run(shared: &Shared, tasks: &Tasks, send: &Sender<Done>) {
                 Done::Track { name, result, took: started.elapsed() }
             }
             Job::Cues => Done::Cues(catch_unwind(AssertUnwindSafe(|| (tasks.cues)())).unwrap_or_else(|_| Err("the sound file reader panicked".into()))),
+            Job::Sounds(ids) => {
+                let started = Instant::now();
+                let read = catch_unwind(AssertUnwindSafe(|| (tasks.sounds)(&ids)))
+                    .unwrap_or_else(|_| SoundsRead { clips: Vec::new(), missing: ids.iter().map(|id| (*id, "the sound file reader panicked".to_string())).collect() });
+                Done::Sounds { read, took: started.elapsed() }
+            }
         };
         if send.send(done).is_err() {
             return;
@@ -241,6 +270,10 @@ mod tests {
             }),
             decode: Arc::new(|name| if name == "bad" { Err("no file".into()) } else { Ok(tracks(100)) }),
             cues: Arc::new(|| Ok(vec![(Cue::Cursor, SfxClip::from_mono(22_050, &[0.1, 0.2]).expect("a clip"))])),
+            sounds: Arc::new(|ids| SoundsRead {
+                clips: ids.iter().filter(|id| **id != 99).map(|id| (*id, SfxClip::from_mono(22_050, &[0.1, 0.2]).expect("a clip"))).collect(),
+                missing: ids.iter().filter(|id| **id == 99).map(|id| (*id, "an empty slot".to_string())).collect(),
+            }),
         };
         let mut worker = ThreadWorker::start(tasks);
         let mut backlog = Vec::new();
@@ -248,6 +281,7 @@ mod tests {
         worker.decode("ob", true);
         worker.decode("bad", false);
         worker.load_cues();
+        worker.load_sounds(vec![5, 99, 18]);
         let area = wait_for(&mut worker, &mut backlog, |d| matches!(d, Done::Area { .. }), "the analysis");
         assert!(matches!(&area, Done::Area { key, music } if key == "md1stin" && music.arrival.as_deref() == Some("music-of-md1stin")));
         let good = wait_for(&mut worker, &mut backlog, |d| matches!(d, Done::Track { name, .. } if name == "ob"), "a decode");
@@ -256,6 +290,10 @@ mod tests {
         assert!(matches!(&bad, Done::Track { result: Err(why), .. } if why == "no file"));
         let cues = wait_for(&mut worker, &mut backlog, |d| matches!(d, Done::Cues(_)), "the cues");
         assert!(matches!(&cues, Done::Cues(Ok(clips)) if clips.len() == 1));
+        let sounds = wait_for(&mut worker, &mut backlog, |d| matches!(d, Done::Sounds { .. }), "the battle sounds");
+        let Done::Sounds { read, .. } = sounds else { unreachable!("waited for it") };
+        assert_eq!(read.clips.iter().map(|(id, _)| *id).collect::<Vec<_>>(), [5, 18]);
+        assert_eq!(read.missing, [(99, "an empty slot".to_string())]);
         assert!(worker.poll().is_empty(), "nothing is delivered twice");
     }
 
@@ -279,6 +317,7 @@ mod tests {
                 Ok(tracks(10))
             }),
             cues: Arc::new(|| Err("none".into())),
+            sounds: Arc::new(|_| SoundsRead::default()),
         };
         let mut worker = ThreadWorker::start(tasks);
         let mut backlog = Vec::new();
@@ -319,6 +358,7 @@ mod tests {
                 Ok(tracks(10))
             }),
             cues: Arc::new(|| Err("none".into())),
+            sounds: Arc::new(|_| SoundsRead::default()),
         };
         let mut worker = ThreadWorker::start(tasks);
         let mut backlog = Vec::new();
@@ -350,11 +390,55 @@ mod tests {
     }
 
     #[test]
+    fn the_sounds_of_a_battle_that_starts_are_read_before_music_that_was_only_asked_for_in_advance() {
+        let started = Arc::new(Mutex::new(Vec::<String>::new()));
+        let gate = Arc::new(AtomicUsize::new(0));
+        let (log, hold) = (Arc::clone(&started), Arc::clone(&gate));
+        let sounds_log = Arc::clone(&started);
+        let tasks = Tasks {
+            analyze: Arc::new(|_| AreaMusic::default()),
+            decode: Arc::new(move |name| {
+                log.lock().expect("log").push(name.to_string());
+                if name.starts_with("block") {
+                    while hold.load(SeqCst) == 0 {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                Ok(tracks(10))
+            }),
+            cues: Arc::new(|| Err("none".into())),
+            sounds: Arc::new(move |ids| {
+                sounds_log.lock().expect("log").push(format!("sounds {ids:?}"));
+                SoundsRead::default()
+            }),
+        };
+        let mut worker = ThreadWorker::start(tasks);
+        let mut backlog = Vec::new();
+        for n in 0..THREADS {
+            worker.decode(&format!("block{n}"), true);
+        }
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while started.lock().expect("log").len() < THREADS {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Every thread is stuck; the music asked for in advance is queued first, the sounds after it.
+        worker.decode("later", false);
+        worker.load_sounds(vec![18, 27]);
+        gate.store(1, SeqCst);
+        wait_for(&mut worker, &mut backlog, |d| matches!(d, Done::Track { name, .. } if name == "later"), "the music asked for in advance");
+        let order = started.lock().expect("log").clone();
+        let at = |n: &str| order.iter().position(|x| x == n).expect("it ran");
+        assert!(at("sounds [18, 27]") < at("later"), "{order:?}");
+    }
+
+    #[test]
     fn a_panicking_task_is_an_error_for_that_job_and_the_threads_carry_on() {
         let tasks = Tasks {
             analyze: Arc::new(|_| panic!("a broken script")),
             decode: Arc::new(|name| if name == "boom" { panic!("a broken decoder") } else { Ok(tracks(5)) }),
             cues: Arc::new(|| panic!("a broken sound file")),
+            sounds: Arc::new(|_| panic!("a broken sound file")),
         };
         let mut worker = ThreadWorker::start(tasks);
         let mut backlog = Vec::new();
@@ -367,6 +451,9 @@ mod tests {
         worker.load_cues();
         let cues = wait_for(&mut worker, &mut backlog, |d| matches!(d, Done::Cues(_)), "the cues");
         assert!(matches!(cues, Done::Cues(Err(_))));
+        worker.load_sounds(vec![7, 8]);
+        let sounds = wait_for(&mut worker, &mut backlog, |d| matches!(d, Done::Sounds { .. }), "the battle sounds");
+        assert!(matches!(sounds, Done::Sounds { read, .. } if read.clips.is_empty() && read.missing.iter().map(|(id, _)| *id).eq([7, 8])));
         worker.decode("fine", true);
         let fine = wait_for(&mut worker, &mut backlog, |d| matches!(d, Done::Track { name, .. } if name == "fine"), "a decode after the panics");
         assert!(matches!(fine, Done::Track { result: Ok(_), .. }));
@@ -383,6 +470,7 @@ mod tests {
             }),
             decode: Arc::new(|_| Ok(tracks(1))),
             cues: Arc::new(|| Err("none".into())),
+            sounds: Arc::new(|_| SoundsRead::default()),
         };
         let worker = ThreadWorker::start(tasks);
         drop(worker);
