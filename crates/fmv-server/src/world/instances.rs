@@ -57,11 +57,12 @@ impl World {
         let Some(area) = self.areas.get(&player.area) else { return Ok(None) };
         let party = self.parties.party_of(player.account).cloned();
         let mut phases = PhaseMap::new();
-        phases.insert(player.account, Self::phase_in(area, &player.progression));
+        // (a previewing player's phase is made up and its own: see `scene`)
+        phases.insert(player.account, Self::player_phase(area, player));
         if let Some(party) = &party {
             // The leader's phase for THIS area, wherever the leader stands.
             if let Some(leader) = self.by_account.get(&party.leader).and_then(|e| self.players.get(e)) {
-                phases.insert(party.leader, Self::phase_in(area, &leader.progression));
+                phases.insert(party.leader, Self::player_phase(area, leader));
             }
         }
         InstanceSelector::select(area.id(), player.account, party.as_ref(), &phases).map(Some)
@@ -179,13 +180,12 @@ impl World {
             ));
         }
 
+        // The triggers of the story scenes on offer here join the cast (see `scene`).
+        let scene_npcs = self.scene_npcs(entity, &placement.key.area.key);
         let Some(area) = self.areas.get(&placement.key.area.key) else { return };
-        let snapshot = Arc::new(ServerMsg::AreaSnapshot {
-            area: area.id().clone(),
-            tick: self.tick,
-            entities: self.instance_entities(new),
-            npcs: area.cast(&placement.key.phase),
-        });
+        let mut npcs = area.cast(&placement.key.phase);
+        npcs.extend(scene_npcs);
+        let snapshot = Arc::new(ServerMsg::AreaSnapshot { area: area.id().clone(), tick: self.tick, entities: self.instance_entities(new), npcs });
         let Some(me) = self.players.get(&entity) else { return };
         let joined = Arc::new(ServerMsg::PlayerJoined { snapshot: me.snapshot.clone() });
         if let Some(instance) = self.instances.get(new) {

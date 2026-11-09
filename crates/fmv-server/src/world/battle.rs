@@ -536,7 +536,8 @@ impl World {
         if player.battle.is_some() {
             return Err(BattleRejection::AlreadyInBattle);
         }
-        if player.transit.is_some() {
+        // (a player held in a story scene fights nothing until it is over)
+        if player.transit.is_some() || player.scene.is_some() {
             return Err(BattleRejection::Unsupported);
         }
         let info = bw.settings.rules.formation(formation).ok_or(BattleRejection::UnknownFormation)?;
@@ -551,7 +552,7 @@ impl World {
             .filter_map(|member| self.by_account.get(member).copied())
             .filter(|&entity| {
                 entity == requester
-                    || self.players.get(&entity).is_some_and(|p| p.battle.is_none() && p.transit.is_none() && p.area == player.area)
+                    || self.players.get(&entity).is_some_and(|p| p.battle.is_none() && p.transit.is_none() && p.scene.is_none() && p.area == player.area)
             })
             .collect();
         if !entities.contains(&requester) {

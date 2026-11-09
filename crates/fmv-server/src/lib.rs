@@ -128,7 +128,10 @@ pub mod ff7;
 mod limits;
 mod progress;
 mod saver;
+pub mod scene_host;
 mod world;
+
+pub use world::{SceneHost, SceneInfo, SceneReply, SceneResult, SceneSettings, TriggerInfo};
 
 pub use accounts::MAX_APPEARANCE_REF;
 
@@ -298,6 +301,7 @@ impl Server {
         world.set_area_source(adapter);
         world.set_travel_timeout(config.join_timeout);
         world.configure_battle(config.battle.clone(), config.debug_encounters);
+        world.configure_scenes(config.scenes.clone());
         let (store, ephemeral_state) = open_store(&config).await?;
         // Every server saves, off the world lock (see `saver`): what battles pay (a server that runs
         // them) and the story steps players make (any server whose adapter has a story).
@@ -614,6 +618,7 @@ async fn tick_loop(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) {
                     world.advance_tick();
                     world.expire_parties(now);
                     world.advance_battles(now);
+                    world.advance_scenes(now);
                     world.manage_areas(now);
                 });
             }

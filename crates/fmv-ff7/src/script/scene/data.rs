@@ -124,6 +124,8 @@ pub struct SceneDef {
     pub speakers: Vec<(String, u8)>,
     /// Where the witness stands: the player's own character first, then the watchers.
     pub witness: Vec<Spot>,
+    /// Where a player that is put in the scene's field (the debug preview) arrives: on the floor, within the trigger's reach.
+    pub arrival: Spot,
 }
 
 impl SceneDef {
@@ -219,6 +221,8 @@ pub fn proof_scene() -> SceneDef {
             Spot { x: -100, y: -216, triangle: 40, direction: 128 },
             Spot { x: -30, y: -72, triangle: 25, direction: 226 },
         ],
+        // At the counter's edge, facing Tifa across it (she stands at (-268, -105); her talk radius is 150).
+        arrival: Spot { x: -125, y: -100, triangle: 27, direction: 192 },
     }
 }
 

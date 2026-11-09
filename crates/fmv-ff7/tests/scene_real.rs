@@ -284,6 +284,14 @@ fn the_witness_stands_on_the_floor_clear_of_everyone_the_scene_ever_places() {
         .flat_map(|c| c.places.iter().map(|&(x, y)| (f32::from(x), f32::from(y))))
         .collect();
 
+    // Where the debug preview puts a player: on the floor (the triangle the data names holds it) and within the trigger's reach
+    // of Tifa, who stands where her stage script puts her.
+    let a = def.arrival;
+    assert_eq!(ground.triangle_at(a.x, a.y), Some(a.triangle), "the arrival is on triangle {:?}", ground.triangle_at(a.x, a.y));
+    let npc = trigger_npc(&f, &def, &StoryState::at(72)).unwrap();
+    let reach = (f32::from(a.x) - f32::from(npc.x)).hypot(f32::from(a.y) - f32::from(npc.y));
+    assert!(reach <= npc.talk_radius, "the arrival is {reach:.0} from Tifa (her reach is {})", npc.talk_radius);
+
     assert_eq!(def.witness.len(), 3, "the owner and two watchers");
     for (i, spot) in def.witness.iter().enumerate() {
         // on the floor: inside the triangle the data names, at that triangle's height
@@ -386,6 +394,7 @@ fn the_proof_scene_writes_nothing_the_story_carries_and_a_scene_that_does_report
         ],
         speakers: vec![("Cloud".into(), CLOUD), ("Tifa".into(), TIFA)],
         witness: Vec::new(),
+        arrival: fmv_ff7::script::scene::Spot { x: 0, y: 0, triangle: 0, direction: 0 },
     };
     let out = run_to_end(&f, &leaving, &StoryState::at(81), 1, &[]).unwrap();
     assert_eq!(out.end, End::MapJump { field: 294 }, "the scene ends where the script leaves the field");

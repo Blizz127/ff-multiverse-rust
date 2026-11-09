@@ -128,11 +128,17 @@ impl World {
     pub fn press(&mut self, entity: EntityId, npc: Option<u32>, now: Instant) -> PressOutcome {
         let (pos, area_key) = {
             let Some(p) = self.players.get(&entity) else { return PressOutcome::Gone };
-            if p.battle.is_some() || p.transit.is_some() || p.fence.is_some_and(|f| now < f.until) {
+            // (a player held in a story scene presses nothing: see `scene`)
+            if p.battle.is_some() || p.transit.is_some() || p.scene.is_some() || p.fence.is_some_and(|f| now < f.until) {
                 return PressOutcome::Nothing;
             }
             (p.snapshot.pos, p.area.clone())
         };
+        // OK next to a scene's trigger starts the scene (see `scene`): the trigger is no character of the area's own.
+        if let Some(npc) = npc.filter(|n| super::scene::scene_index(*n).is_some()) {
+            self.press_scene(entity, npc, now);
+            return PressOutcome::Nothing;
+        }
         let (points, link) = {
             let Some(area) = self.areas.get(&area_key) else { return PressOutcome::Gone };
             // A character the area does not have is no character addressed: the press is where the player stands.

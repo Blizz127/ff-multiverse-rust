@@ -476,6 +476,7 @@ fn demo_def(cast: Vec<CastMember>, root: Vec<Step>) -> SceneDef {
         cast,
         speakers: vec![("Aya".to_string(), 0), ("Bo".to_string(), 1)],
         witness: vec![Spot { x: 50, y: 10, triangle: 0, direction: 64 }],
+        arrival: Spot { x: 50, y: 10, triangle: 0, direction: 64 },
     }
 }
 

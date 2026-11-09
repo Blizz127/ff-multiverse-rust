@@ -265,6 +265,9 @@ pub struct ServerConfig {
     /// Let players start a battle on request (`ClientMsg::RequestEncounter`). Off by default: a
     /// normal server only starts battles from random encounters. Needs [`ServerConfig::battle`].
     pub debug_encounters: bool,
+    /// Story scenes (see `world::scene`): the game's scenes and the debug preview switch. `None` (the FIXTURE default): no scene
+    /// is offered and every scene message is refused.
+    pub scenes: Option<crate::world::SceneSettings>,
 }
 
 /// Longest accepted `ServerConfig::build_suffix` (bytes).
@@ -296,6 +299,7 @@ impl Default for ServerConfig {
             build_suffix: None,
             battle: None,
             debug_encounters: false,
+            scenes: None,
         }
     }
 }

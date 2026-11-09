@@ -395,6 +395,8 @@ impl World {
         // Placed here, wherever it came from: every link within reach of the player starts disarmed.
         self.place_links(entity);
         self.settle(entity, true, failed);
+        // (a player in a debug scene preview is told the made-up story its talks read from)
+        self.scene_entered(entity, failed);
         // What the area's own scripts do by themselves from the first frame on moves the story of whoever stands
         // there (the points that fire on entry; a no-op in an area without any).
         self.enter_story(entity);
