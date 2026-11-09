@@ -377,3 +377,28 @@ fn offscreen_hud_over_the_real_ff7_field() {
         assert!(bright(&img) > 300, "text is on screen");
     }
 }
+
+/// The bomb's countdown (protocol v15) as the window draws it over the field: the start (calm), the last minute
+/// (urgent) and time up, at the window's default size and at 1920x1080. Nothing else is drawn, so the HUD is judged
+/// on its own: the clock reads, it sits at the top centre, the bar shrinks with the time left.
+#[test]
+#[ignore = "needs a GPU or software Vulkan/GL driver"]
+fn offscreen_countdown() {
+    use super::countdown::{draw_view, Tone, View};
+    let Some(mut gpu) = Offscreen::new() else { return };
+    let views = [
+        ("start", View { clock: "10:00".into(), tone: Tone::Calm, fraction: 1.0, time_up: false }),
+        ("last-minute", View { clock: "0:42".into(), tone: Tone::Urgent, fraction: 0.07, time_up: false }),
+        ("time-up", View { clock: "0:00".into(), tone: Tone::Urgent, fraction: 0.0, time_up: true }),
+    ];
+    for (w, h) in [(W, H), (1920, 1080)] {
+        for (name, view) in &views {
+            let mut list = DrawList::new();
+            draw_view(view, w, h, false, &mut list);
+            let img = gpu.render(w, h, &empty_scene(), &list);
+            save(&format!("countdown-{name}-{w}x{h}"), w, h, &img);
+            let lit = img.chunks(4).filter(|p| p[0] > 120 || p[1] > 120 || p[2] > 120).count();
+            assert!(lit > 200, "{name} at {w}x{h}: the countdown is on the screen ({lit} lit pixels)");
+        }
+    }
+}
