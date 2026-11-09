@@ -3,8 +3,9 @@
 //! that stops moving (Stop, Paralysis: its idle loop is held on one frame).
 //!
 //! Presentation only, like the rest of the scene: the engine's state says which statuses a fighter has
-//! ([`super::BattleScene::update`] copies them from the replayed engine every frame) and this module turns them into
-//! numbers for [`super::BattleScene::frame`]. Pure: the statuses, the scene clock and the fighter's place in the cast
+//! ([`super::BattleScene::update`] copies them from the replayed engine every frame, and the window then replaces them with the
+//! panels' own, which change when the performance that changes them lands: [`super::BattleScene::show_statuses`]) and this
+//! module turns them into numbers for [`super::BattleScene::frame`]. Pure: the statuses, the scene clock and the fighter's place in the cast
 //! in, a [`Body`] out; no GPU, no random.
 //!
 //! The factors multiply (a poisoned sleeper is dim, blue and purple at once) and are held between [`MIN_RGB`] and

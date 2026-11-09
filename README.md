@@ -363,16 +363,18 @@ facing them (the story's canon party first, then each player: up to five), on th
 and the canon companions are the real battle models of your own `battle.lgp` (stand-ins when it has none) and each
 player is its OWN body, the placeholder body and colour it has on the field, moving procedurally (a lunge, a hop back,
 a flinch, a fall; a canon battle model on a player would be a bug). The real models play the game's own clips: a
-party member runs up, swings, and hops back (attack), gathers a spell with its cast clips (a glow, then a burst in the
-colour of the spell's element: fire, ice, bolt, cure), holds its guard, flinches when it is hit and
+party member runs up, swings, and hops back (attack), gathers a spell with its cast clips (a glow that grows at its hands, then the spell's effect breaks over each of
+its targets: see "Battle effects" below), holds its guard, flinches when it is hit and
 falls when it is beaten, and rejoices when the battle is won; an enemy runs up and plays the clip
 `scene.bin` names for the attack it uses, flinches with its hurt clip and, when beaten, fades away.
 The presentation is only that: **nothing waits on an animation.** The gauges, the menu and the
 command that is applied follow the battle at once; the numbers float up when the blow lands (never
 more than 0.6 s after the server said it) and **so do the HP and MP in the party panel, the HP of the enemies' bars and
 tokens and the names of the fallen** (each value changes at the instant of the performance that changes it, so a counter's
-damage is on the panel when the counter lands, not when the message that carried it arrived; statuses and the gauges
-still follow the engine at once), and so does the blow's sound (see "Sound"); the clips are sped up (or their start skipped) so that
+damage is on the panel when the counter lands, not when the message that carried it arrived; **so are the status tags** (a
+Sleep's tag comes up when its spell breaks, a cure takes its tag off when it lands, a status that runs out goes with the short
+beat of the numbers, a knockout takes the tags with the collapse) **and the 3D bodies' colours, droop and held pose take their
+statuses from those very tags**; the gauges still follow the engine at once), and so does the blow's sound (see "Sound"); the clips are sped up (or their start skipped) so that
 the blow's impact frame lands then, and a beaten enemy leaves the enemy list as it starts to fade.
 An actor without real clips moves procedurally (a lunge, a blink, a collapse). A gold ring under a
 character means it can act, a white ring marks yours. The
@@ -388,6 +390,33 @@ A machine without battle data to replay the battle (or one started with
 `FMV_BATTLE_FLAT=1`) shows the flat view instead: one token per fighter with a thin HP bar. (The
 battle scene has been checked by unit tests and offscreen renders only: this box has no display,
 so the window itself was not run.)
+
+**Battle effects.** Every performance has a picture in the 3D scene, made of procedural glows that our renderer draws (seven small
+additive meshes shared by all of them; none of the game's own spell animations is used or recreated and no game texture is). What
+it is comes from the action's own data in the replayed engine. A blow's attack record decides how it strikes (`CUT` slashes, `HIT`
+thumps, `PUNCH` bursts; a critical hit is bigger and gold; a miss is a small whiff beside the target). A record with the `SHOOT`
+bit (a gun, a laser, a thrown rock: the MPs' Machine Gun, the Guard Scorpion's Tail Laser) flies a bolt from the shooter to each
+target it was aimed at and leaves a line that fades (a party member whose weapon is long-range shoots too). A spell breaks by its
+element mask: fire, ice, bolt, earth, wind, water, poison, gravity, holy and none each have their own colours and shapes; a Cure,
+an Ether and a Phoenix Down have theirs. Every status the rules play has a sign when it is inflicted (Zs for Sleep, bubbles for
+Poison, a clock for Slow, a shell for Barrier and another for MBarrier, speed lines for Haste, a spiral for Regen, ...) and a
+wipe when it is cured or runs out. An item is tossed to its target on an arc and takes effect there; a limit break gathers
+longer, breaks bigger and flashes over the whole picture; a guard shimmers; a spell or an item that found nobody to land on
+fizzles at its performer. A spell or an item on a whole side shows on every target. Each effect begins with its performance (a
+counter's with the counter, never with the batch), peaks at the landing, the very instant the number is born, and fades out over
+about a second. Each particle is a pure function of the clock and a seed, so nothing is stored or allocated per particle; an
+effect is at most 28 pieces and a frame at most 240 (the newest effects win), which costs about 0.3 ms of CPU with nothing on the
+screen and 0.8 ms with the cap drawn (`a_frame_with_every_effect_at_its_peak...`, measured on a busy machine). Known gaps: a ring
+is drawn standing up, not on the floor; a bolt leaves the middle of its shooter's chest, not the muzzle; effects are hidden by
+bodies nearer the camera but not by the location's walls; the gold ring of a party member that has just been put to sleep drops at
+once while its droop waits for the landing (the gauges and the menu follow the engine); every party weapon's blow slashes (the
+weapons' own elements are not modelled); an enemy that shoots (the `SHOOT` bit) no longer runs up to its target when it has no
+clips to say how it moves (it stands and fires). The pictures: `cargo test -p fmv-client --bin fmv-client -- --ignored
+offscreen_battle_effects --test-threads=1` draws every effect on a stage with no game data (`fx-blows`, `fx-elements`,
+`fx-restoring`, `fx-statuses-curses`, `fx-statuses-buffs`, `fx-staging`), and with `FMV_FF7_LIBRARY` and `FMV_SHOT_DIR` it plays the
+real fights and writes `fx-fire-landing`, `fx-ice-landing`, `fx-fire-all-enemies`, `fx-cure-party`, `fx-limit-gathering`,
+`fx-limit-break`, `fx-enemy-laser-flight`, `fx-enemy-laser-hit`, `fx-status-before-landing`, `fx-status-landing` and
+`fx-statuses-haste-and-fury`, each at 1100x680 and 1920x1080.
 
 **One command for the basics:** `scripts/smoke.sh` starts the server, runs two headless bots
 concurrently, checks both SMOKE lines and stops the server. It uses `target/release` by
