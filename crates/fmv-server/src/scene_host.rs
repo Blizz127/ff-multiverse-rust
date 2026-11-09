@@ -57,7 +57,7 @@ impl SceneHost for Ff7SceneHost {
 
     fn offered(&self, scene: &str, progress: &[u8]) -> bool {
         let (Some(def), Some(story)) = (self.def(scene), StoryState::decode(progress)) else { return false };
-        def.applies_at(story.moment)
+        def.offered_to(&story)
     }
 
     fn trigger(&self, scene: &str, progress: &[u8]) -> Option<TriggerInfo> {

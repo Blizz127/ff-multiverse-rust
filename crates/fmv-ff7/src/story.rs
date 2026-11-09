@@ -227,9 +227,21 @@ pub const REACTOR_STATE: TrackedVar = TrackedVar {
     never_set: 1 << TIMEOUT_BIT,
 };
 
-/// Every variable beyond the moment the model carries. Adding one is adding a row here, and a story point
-/// that writes it.
-pub const TRACKED_VARS: &[TrackedVar] = &[REACTOR_STATE];
+/// Bit 2 of `Var[3][212]`, the mark that the conversation at the bar of 7th Heaven has begun (see [`BAR_CONVERSATION`]).
+pub const BAR_CONVERSATION_BIT: u8 = 2;
+
+/// **The conversation at the bar of 7th Heaven has begun (`Var[3][212]`, bit 2).** The field's own director (`mds7pb_1`, the
+/// `ID` entity) turns it on the moment it starts the conversation between Cloud and Tifa at the counter, and waits for it
+/// to be clear before it starts that conversation, so the game itself never plays it twice. It is carried so that the
+/// story scene built on that conversation (`crate::script::scene`, the proof scene) is offered once per story: the scene's
+/// own writes reach the saved story (`fmv-server`'s `world::scene`) and [`crate::script::scene::SceneDef::begun_in`] reads
+/// the mark back. No exit and no story point waits for it. The byte's other bits are flags of that field's own progress that
+/// nothing here carries.
+pub const BAR_CONVERSATION: TrackedVar = TrackedVar { bank: 3, address: 212, bits: 1 << BAR_CONVERSATION_BIT, never_set: 0 };
+
+/// Every variable beyond the moment the model carries. Adding one is adding a row here, and a story point (or a story
+/// scene, [`crate::script::scene`]) that writes it.
+pub const TRACKED_VARS: &[TrackedVar] = &[REACTOR_STATE, BAR_CONVERSATION];
 
 /// The tracked variable at `bank`/`address`, if there is one.
 pub fn tracked_var(bank: u8, address: u8) -> Option<TrackedVar> {

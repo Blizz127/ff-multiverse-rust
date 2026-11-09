@@ -48,7 +48,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use fmv_adapter_api::{AreaKey, Exit, ExitKind};
+use fmv_adapter_api::{AreaKey, Exit, ExitKind, StoryStep};
 use fmv_core::{AccountId, EntityId, PhaseKey, Pos};
 use fmv_protocol::{
     ClientMsg, NpcSnapshot, SceneOutcome, SceneParticipant, SceneRefusal, SceneRole, SceneRunId, ServerMsg, StoryAdvance, MAX_SCENE_ID_CHARS,
@@ -491,28 +491,28 @@ impl World {
         if !result.changed {
             return "unchanged";
         }
+        let summary = format!("scene={} {}", clip(&record.scene, MAX_SCENE_ID_CHARS), result.summary);
         let Some(p) = self.players.get_mut(&record.owner) else { return "none (the owner is gone)" };
-        let (account, preview) = (p.account, p.preview.is_some());
-        p.progression = result.progress.clone();
-        // A previewing player's story is made up: it is told the step and keeps it in memory only.
-        if !preview && !self.saver.as_ref().is_none_or(|saver| saver.save_story(account, result.progress.clone())) {
-            self.logs.warn(format!("story progress NOT SAVED (the saver has stopped; the player has it, the store does not) account={}", account.0));
+        if p.preview.is_none() {
+            // A real story: a scene's write is a story step like any other (the mirror, the log line, a countdown it ends, the
+            // save, the player told and the placements refreshed: `story::apply_story_step`).
+            self.apply_story_step(record.owner, SCENE_STEP_POINT, StoryStep { progress: result.progress, summary, countdown: None });
+            return "applied";
         }
-        self.logs.info(format!("story advanced account={} entity={} scene={} {}", account.0, record.owner.0, record.scene, result.summary));
+        // A previewing player's story is made up: it is told the step and keeps it in memory only, and nothing is saved
+        // (`apply_story_step` would not apply it either).
+        let account = p.account;
+        p.progression = result.progress;
+        self.logs.info(format!("story advanced (preview: made up, not saved) account={} entity={} {summary}", account.0, record.owner.0));
         let mut failed = Vec::new();
-        let advance = StoryAdvance { point: SCENE_STEP_POINT, summary: format!("scene={} {}", clip(&record.scene, MAX_SCENE_ID_CHARS), result.summary) };
-        self.tell_story(record.owner, Some(advance), &mut failed);
+        self.tell_story(record.owner, Some(StoryAdvance { point: SCENE_STEP_POINT, summary }), &mut failed);
         let mut accounts = std::collections::BTreeSet::from([account]);
         if let Some(party) = self.parties.party_of(account) {
             accounts.extend(party.members.iter().copied());
         }
         self.refresh_placements(&accounts, &mut failed);
         self.drop_failed(failed);
-        if preview {
-            "applied (preview: not saved)"
-        } else {
-            "applied"
-        }
+        "applied (preview: not saved)"
     }
 
     /// Housekeeping, once per tick: end the runs that have gone quiet or lasted too long.

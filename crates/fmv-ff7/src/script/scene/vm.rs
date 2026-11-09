@@ -52,7 +52,7 @@ use super::data::{Given, ScriptRef, Step};
 use crate::field_direction_to_facing;
 use crate::script::dialogue::{parse_message, Choice, End, Message, MessageOrigin, Piece, StoryVars, EFFECT_NOTE_LAYER};
 use crate::script::{decode_at, FieldScript, Instruction};
-use crate::story::{StoryState, MOMENT_ADDRESS, MOMENT_BANK};
+use crate::story::{tracked_var, StoryState, MOMENT_ADDRESS, MOMENT_BANK};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Field frames per second (the clock of [`Timed::at`]).
@@ -248,7 +248,11 @@ impl StoryVars for SceneVars {
         let moment = bank == MOMENT_BANK && address <= MOMENT_ADDRESS.wrapping_add(1);
         if !moment {
             if let Some(g) = self.given.iter().find(|g| g.bank == bank && g.address == address) {
-                return g.value;
+                // The bits the story model carries are the player's story's own; the rest are what the scene was found with.
+                return match tracked_var(bank, address) {
+                    Some(t) => (g.value & !t.bits) | (self.story.byte(bank, address) & t.bits),
+                    None => g.value,
+                };
             }
         }
         self.story.byte(bank, address)

@@ -73,9 +73,16 @@ async fn the_proof_scene_starts_from_its_trigger_on_the_real_field_holds_the_pla
     let trigger = host.trigger(PROOF_SCENE_ID, &moment_72).expect("Tifa is found where her stage script puts her");
     assert_eq!((trigger.name.as_str(), trigger.model.as_str()), ("tifa", "aagb"));
     assert_eq!((trigger.pos.x, trigger.pos.y), (-268.0, -105.0));
-    // The server's own headless run, with the answers the owner would report, finishes and writes nothing the story carries.
+    // The server's own headless run, with the answers the owner would report, finishes and writes exactly the bar's mark
+    // (`Var[3][212]` bit 2: the story model carries it so that the conversation is had once per story): the moment stays 72, the
+    // story now holds the mark, applying the run to the story that holds it changes nothing (once), and the scene is no longer
+    // offered to it (acceptance 5: nothing replays after the story is saved and read back).
     let finished = host.finish(PROOF_SCENE_ID, &moment_72, 1, &[2]).expect("the scene runs");
-    assert!(!finished.changed && finished.progress == moment_72, "the proof scene writes nothing the story model carries: {finished:?}");
+    assert!(finished.changed, "the proof scene writes the bar's mark: {finished:?}");
+    assert_eq!(finished.progress, [2, 72, 0, 1, 3, 212, 4], "moment 72 and the mark (var 3/212 = 0b100), the one way to write it");
+    assert!(!host.offered(PROOF_SCENE_ID, &finished.progress), "a story that has had the conversation is not offered it again");
+    let again = host.finish(PROOF_SCENE_ID, &finished.progress, 1, &[2]).expect("the scene runs again for a story that has it");
+    assert!(!again.changed && again.progress == finished.progress, "its write is applied once: {again:?}");
 
     // A real server over the same archive, entry field md1stin, previews on, a private state directory.
     let state = tempfile::tempdir().unwrap();

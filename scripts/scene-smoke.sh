@@ -12,9 +12,13 @@
 #   * a second player, a member of the first one's party, watches the same scene in step: it prints the same lines in the same
 #     order and finishes with the owner;
 #   * the player is held while it runs and CONTROL RETURNS when it ends (each bot sends one move afterwards and the server applies it);
-#   * the server restarts on the same state directory; the same player logs in again: no scene replays, nothing is stuck,
-#     and NOTHING of the preview was ever stored (no story record exists for either account, and the state directory is byte
-#     for byte what the first session left after the second one).
+#   * the story write the scene makes (the bar's mark) is applied ONCE, in memory only: a preview is a made-up story and NOTHING of
+#     it is ever stored (no story record exists for either account);
+#   * the server restarts on the same state directory; the same player logs in again: no scene is held or started, nothing is
+#     stuck (its moves are applied) and the state directory is byte for byte what the first session left. (A preview never
+#     saves, so "nothing replays after save and reload" is proved by the store-backed test
+#     crates/fmv-server/tests/scene_preview.rs: it plays a scene for a REAL account, restarts the server on the same store
+#     and finds no scene on offer; this script shows the real processes and real data around it.)
 #
 # WHAT IT DOES:
 #   Session 1, one server (--debug-scene-preview, a persistent --state-dir inside the throw-away work dir):
@@ -374,9 +378,11 @@ run_scene() {
   ended=$(strip_ansi "$ended")
   expect_equal "the server's outcome" "$(field "$ended" outcome)" "Finished"
   expect_equal "the owner's answer reached the server (one answer)" "$(field "$ended" answers)" "1"
-  [[ $ended == *"story=unchanged"* ]] || problem "the proof scene writes nothing the story carries, but the server says: $ended"
-  if log_has "$sl" "story advanced"; then
-    problem "the server logged a story step during the preview: $(last_line_with "$sl" "story advanced" || true)"
+  # the proof scene writes one thing the story carries (the bar's mark, applied ONCE); a preview keeps it in memory, never in the store
+  [[ $ended == *"story=applied (preview: not saved)"* ]] || problem "the proof scene's one write should be applied once, in memory only (a preview), but the server says: $ended"
+  expect_equal "the story write is applied once (preview: made up, not saved)" "$(count_lines_with "$sl" "story advanced (preview: made up, not saved)")" "1"
+  if log_has "$sl" "story advanced account="; then
+    problem "the server applied a REAL story step during the preview: $(last_line_with "$sl" "story advanced account=" || true)"
   fi
   if log_has "$sl" "NOT SAVED"; then
     problem "the server could not save: $(last_line_with "$sl" "NOT SAVED" || true)"
@@ -424,7 +430,7 @@ run_scene() {
     finish_failed
   fi
   RESULT=pass
-  say "SCENE-SMOKE scene=$SCENE_ID answer=$ANSWER lines=$(wc -w <<<"$want_dialogs") dialogs=[$(scene_field "$la" dialog)] speakers=[$(scene_field "$la" speaker)] owner=A watcher=B outcome=Finished control_restored=true restart_replays=0 stored_story_records=0"
+  say "SCENE-SMOKE scene=$SCENE_ID answer=$ANSWER lines=$(wc -w <<<"$want_dialogs") dialogs=[$(scene_field "$la" dialog)] speakers=[$(scene_field "$la" speaker)] owner=A watcher=B outcome=Finished control_restored=true story_write_applied=1 stored_story_records=0 restart_scene_started=0 restart_moves_rejected=0 state_dir_unchanged=true"
   say "PASS"
 }
 

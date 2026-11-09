@@ -1191,7 +1191,7 @@ files when the scene runs.
 | `root` | what the field's own trigger does to start it, in order: `SetBit`, `Await(script)`, `Start(script)` |
 | `cast` | script entity to actor: Cloud (18) `Appearance("ff7/cloud")` starting at the stool (-95, -144), Tifa (20) `Appearance("ff7/tifa")`; `Look::Model` names any `char.lgp` model, so a scene can be replayed with another cast (`SceneDef::with_cast`) |
 | `speakers` | a window's first line names who speaks (the game's own convention); `Tifa` is 20, `Cloud` is 18 |
-| `witness` | where the player's own character stands (spot 0, the owner) and where two watchers stand: on the walkmesh, 90 or more units from every place the cast ever takes (Cloud's stool among them), 65 or more from each other and 40 or more from the nearest wall, stool or table (a body's ring is 22); `tests/scene_real.rs` measures all of it |
+| `witness` | where the player's own character stands (spot 0, the owner) and where two watchers stand: on the walkmesh, 78 or more units from every place the cast ever takes (Cloud's stool among them), 90 or more from each other and 34 or more from the nearest wall, stool or table (a body's ring is 22); `tests/scene_real.rs` measures that and the client's real-data test (`scene::shots`) measures what the camera shows (no person's picture covered more than 10% by another's, over every frame of both ways through the scene) |
 | `arrival` | where the debug preview puts a player: at the counter's edge, within Tifa's reach |
 
 ### The interpreter (`fmv_ff7::script::scene`)
@@ -1231,12 +1231,16 @@ for the long way, no unknown opcode (`tests/scene_real.rs`).
   itself, headless, with the answers the owner reported, and applies what that wrote ONCE: the mirror, the saver (which
   merges, forward only), a `StoryUpdate` and a placement refresh. The run is removed first, so a second `SceneEnd`, a late
   step or a repeated timeout changes nothing. A run that is aborted (owner gone) applies nothing: the scene can be played
-  again. A party member in its leader's phase owns a run that writes nothing. The proof scene's script writes only the
-  field's own flags (and Tifa's affection points), none of which the story model carries, so it is story-neutral and
-  **repeatable**; `Writes` says so plainly, and a scene that does write the moment (Tifa's script 15, the goodbye at the
-  door, 81 to 84 and then a jump to another field that is not performed) is reported by the same code (a real-data test).
-  Adding `Var[3][212]` bit 2 to `fmv_ff7::story::TRACKED_VARS` would make the conversation remembered across logins;
-  that row belongs to the story model.
+  again. A party member in its leader's phase owns a run that writes nothing. A real account's write is a story step like any
+  other (`story::apply_story_step`: the mirror, the log, a countdown it ends, the save, the player told, the placements); a
+  previewing player's is kept in memory only. **A scene is offered once per story:** the proof scene turns on the bar's mark
+  first (`Var[3][212]` bit 2, the field's own "this conversation has begun" flag that its director waits to be clear), the story
+  model carries that one bit (`fmv_ff7::story::BAR_CONVERSATION`, one row added to its `TRACKED_VARS`), the server saves it
+  with the step, and `SceneDef::offered_to` (the moment, and the mark not yet on) keeps the scene from being offered again after
+  the story is saved and read back. That row is the one hook into the story model this work makes (a tiny addition, revertable on
+  its own: without it the mark cannot be read back and the scene is offered each time). A scene that moves the moment (Tifa's
+  script 15, the goodbye at the door, 81 to 84 and then a jump to another field that is not performed) is reported by the same
+  code (a real-data test).
 
 ### What the client does (`fmv-client`, `src/scene/`)
 
@@ -1291,11 +1295,15 @@ scripts/scene-smoke.sh --debug --build                 # two real headless playe
 
 ### Known gaps of the proof
 
-* **The proof scene is story-neutral, so it is repeatable.** Its script writes only the field's own flags (`Var[3][212]` and
-  neighbours) and Tifa's affection points (`Var[1][4]`), none of which the story model carries; talking to her again plays it
-  again. A scene that writes the moment is handled (the server applies it once, saved, and the real-data test shows it on Tifa's
-  script 15, 81 to 84); making this one remembered is one row in `fmv_ff7::story::TRACKED_VARS` (`Var[3][212]` bit 2), which
-  belongs to the story model.
+* **The proof scene is had once per story, and only a debug preview can reach it today.** The world ends at the first reactor, so
+  no real account is ever at moment 72 in the bar: the save-and-reload path is proved with a stand-in scene on a real account and
+  store (`crates/fmv-server/tests/scene_preview.rs`: the scene's write is saved once, the server restarts on the same store, the
+  account is told its saved story and no scene is on offer, an OK starts nothing, nothing holds the player) and, on the real
+  field and data, by `fmv-ff7`'s and `fmv-server`'s `scene_real` tests (the proof scene writes only the bar's mark, applied
+  once, and the story that holds it is not offered the scene). A debug preview applies the same write in memory and never
+  stores it, so a previewing player can press F6 to start again. The story model's `TRACKED_VARS` row for the mark is the one
+  hook into it (see "What the server does"); the rest of the byte (`Var[3][212]`'s other bits) and Tifa's affection points
+  (`Var[1][4]`) are the field's own and are not carried.
 * **A window pauses the whole scene** (the engine pauses only the script that opened it), durations are estimates (a walk's
   length from the move speed, a clip's from its range), camera scrolls and scripted animation clips are not shown, and the cast
   is Cloud and Tifa: the bar's other characters (Marlene, the patrons) are not drawn.

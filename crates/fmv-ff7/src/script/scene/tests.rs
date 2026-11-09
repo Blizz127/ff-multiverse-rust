@@ -556,7 +556,7 @@ fn the_stage_scripts_place_the_cast_and_their_loops_do_not_hold_the_scene() {
 #[test]
 fn what_the_scene_writes_is_reported_by_kind_and_applied_forward_only() {
     // the script sets the moment to 80, a tracked bit (the reactor lift) and a field flag of its own
-    let a = vec![setword(2, 0, 80), biton(1, 225, 0), biton(3, 212, 2), message(0, 0)];
+    let a = vec![setword(2, 0, 80), biton(1, 225, 0), biton(3, 213, 2), message(0, 0)];
     let section = script(vec![("a", vec![(1, a)])], vec![dialog("Hello.")]);
     let field = field_of(section);
     let def = demo_def(vec![member(0, "aya")], start(0, 1));
@@ -566,7 +566,7 @@ fn what_the_scene_writes_is_reported_by_kind_and_applied_forward_only() {
     assert_eq!(outcome.windows, 1);
     assert_eq!(outcome.writes.moment, Some(80));
     assert_eq!(outcome.writes.tracked, [((REACTOR_STATE.bank, REACTOR_STATE.address), 0b1)]);
-    assert_eq!(outcome.writes.untracked.get(&(3, 212)), Some(&0b100), "a field's own flag is not the story's, and is said so");
+    assert_eq!(outcome.writes.untracked.get(&(3, 213)), Some(&0b100), "a field's own flag is not the story's, and is said so");
     assert!(!outcome.writes.is_story_neutral());
 
     let mut state = story.clone();
@@ -583,7 +583,7 @@ fn what_the_scene_writes_is_reported_by_kind_and_applied_forward_only() {
 
 #[test]
 fn a_scene_that_writes_nothing_the_story_carries_is_story_neutral() {
-    let a = vec![biton(3, 212, 2), message(0, 0)];
+    let a = vec![biton(3, 213, 2), message(0, 0)];
     let field = field_of(script(vec![("a", vec![(1, a)])], vec![dialog("Hello.")]));
     let def = demo_def(vec![member(0, "aya")], start(0, 1));
     let outcome = run_to_end(&field, &def, &StoryState::at(72), 1, &[]).unwrap();
@@ -647,4 +647,57 @@ fn the_trigger_npc_is_found_from_the_stage_script_and_the_models_record() {
     assert_eq!((npc.x, npc.y), (30, 40));
     assert!((npc.talk_radius - 80.0).abs() < 1e-3, "TALKR 80 at scale 512");
     assert!((npc.heading - 0.0).abs() < 1e-5, "DIR 64 faces +x");
+}
+
+// ---- a scene plays once per story, as far as the story carries its mark ------------------------------
+
+#[test]
+fn the_proof_scene_is_offered_at_its_moment_until_the_story_carries_its_mark() {
+    let def = proof_scene();
+    let fresh = StoryState::at(72);
+    assert!(def.offered_to(&fresh));
+    assert!(!def.offered_to(&StoryState::at(71)) && !def.offered_to(&StoryState::at(73)), "only at its moment");
+    // the scene's own first act is to turn on the bar's mark; once the story carries it the scene is begun and not offered
+    let mut begun = fresh.clone();
+    assert!(begun.set_bit(3, 212, 2, true), "the story model carries the bar's mark");
+    assert!(def.begun_in(&begun) && !def.offered_to(&begun));
+    // it survives the blob the server stores
+    let stored = StoryState::decode(&begun.encode()).unwrap();
+    assert!(!def.offered_to(&stored));
+    // another bit of the same byte is not the mark
+    let mut other_bit = fresh.clone();
+    assert!(!other_bit.set_bit(3, 212, 1, true), "the model carries only the one bit");
+    assert!(def.offered_to(&other_bit));
+}
+
+#[test]
+fn a_scene_that_marks_nothing_or_marks_what_the_story_does_not_carry_is_always_offered() {
+    let mut begun = StoryState::at(72);
+    assert!(begun.set_bit(3, 212, 2, true));
+    let mut unmarked = proof_scene();
+    unmarked.root = vec![Step::Await(ScriptRef::new(18, 9))];
+    assert!(!unmarked.begun_in(&begun) && unmarked.offered_to(&begun));
+    let mut not_carried = proof_scene();
+    not_carried.root = vec![Step::SetBit { bank: 3, address: 213, bit: 1 }];
+    assert!(!not_carried.begun_in(&begun) && not_carried.offered_to(&begun));
+    // every mark must be on, not one of them
+    let mut two = proof_scene();
+    two.root = vec![Step::SetBit { bank: 3, address: 212, bit: 2 }, Step::SetBit { bank: 1, address: 225, bit: 0 }];
+    assert!(!two.begun_in(&begun));
+    assert!(begun.set_bit(1, 225, 0, true));
+    assert!(two.begun_in(&begun));
+}
+
+#[test]
+fn a_scene_reads_the_bits_the_story_carries_from_the_story_and_the_rest_from_what_it_was_found_with() {
+    use crate::script::dialogue::StoryVars;
+    let given = [Given { bank: 3, address: 212, value: 0b0000_0010 }, Given { bank: 3, address: 213, value: 0b0000_0001 }];
+    let fresh = SceneVars::new(StoryState::at(72), &given);
+    assert_eq!(fresh.byte(3, 212), 0b010, "found with bit 1; the story has not marked bit 2");
+    let mut story = StoryState::at(72);
+    assert!(story.set_bit(3, 212, 2, true));
+    let begun = SceneVars::new(story, &given);
+    assert_eq!(begun.byte(3, 212), 0b110, "the story's own bit joins what the scene was found with");
+    assert_eq!(begun.byte(3, 213), 0b1, "a flag the story does not carry is what the scene was found with");
+    assert_eq!(begun.byte(3, 214), 0, "and one it knows nothing of is 0");
 }

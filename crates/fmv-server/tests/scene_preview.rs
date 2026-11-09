@@ -9,6 +9,9 @@
 //! session registers the account and leaves; the second logs in with the token, previews the scene, plays it to its end (the
 //! scene's story write is told to the player), walks and disconnects; the third logs in again. After the second and the
 //! third the state directory is exactly what the first left, and the third session is told no story at all.
+//! The third then plays the scene for REAL (an account whose story is on offer): its write is saved once. A fourth session
+//! restarts the server on the same store (the save and the reload): the account is told the story it saved, no scene is on
+//! offer to it, an OK where the trigger stood starts nothing and nothing holds the player.
 
 mod common;
 
@@ -222,6 +225,33 @@ async fn a_scene_preview_never_touches_a_stored_story_whatever_the_scene_writes_
     let store = fmv_persist::Store::open(&state).expect("the state directory opens once the server is gone");
     let account = store.authenticate(&token).expect("the account");
     assert_eq!(store.get_progression(account, GameId::Fixture).expect("a record").blob, [5], "saved once, as the scene wrote it");
+    drop(store);
+
+    // ---- session 4 (acceptance 5, save and reload): the server restarts on the same store; the account logs in again, is told the
+    // story it saved, walks to the yard and finds no scene on offer; an OK where the trigger stood starts nothing and nothing
+    // holds the player: the scene neither replays nor leaves anyone stuck ----
+    let server = TestServer::start_over(config(&state, true), Box::new(RoomsAdapter::new())).await;
+    let mut a = join_hall(server.addr, "", Some(&token)).await;
+    let told = a.client.drain_for(Duration::from_millis(300)).await;
+    assert_eq!(story_updates(&told), [(vec![5], false)], "told the saved story at login, as no step");
+    assert!(scene_run(&told).is_none(), "no scene replays on its own");
+    assert!(a.moved_freely((-90.0, 0.0)).await, "nothing is stuck");
+    a.walk(100.0, 150.0).await;
+    a.walk(350.0, 150.0).await;
+    let arrived = a.arrive().await;
+    let npcs = arrived.iter().find_map(|m| if let ServerMsg::AreaSnapshot { npcs, .. } = m { Some(npcs.clone()) } else { None }).expect("the yard's snapshot");
+    assert!(!npcs.iter().any(|n| n.id >= SCENE_NPC_ID_BASE), "the scene is not on offer to a story that has had it: {npcs:?}");
+    a.walk(150.0, -100.0).await;
+    a.client.drain_for(Duration::from_millis(300)).await;
+    a.client.send(&ClientMsg::Interact { npc: Some(SCENE_NPC_ID_BASE) }).await;
+    let pressed = a.client.drain_for(Duration::from_millis(400)).await;
+    assert!(scene_run(&pressed).is_none(), "an OK where the trigger stood starts nothing: {pressed:?}");
+    assert!(a.moved_freely((140.0, -100.0)).await, "and nothing holds the player");
+    drop(a);
+    server.shutdown().await;
+    let store = fmv_persist::Store::open(&state).expect("the state directory opens once the server is gone");
+    let account = store.authenticate(&token).expect("the account");
+    assert_eq!(store.get_progression(account, GameId::Fixture).expect("a record").blob, [5], "a login and a walk changed nothing");
     drop(store);
 }
 

@@ -25,6 +25,7 @@
 //! * **Witness** ([`Spot`]s): where the player's own character stands (the first spot) and where party members
 //!   that watch stand (the others).
 
+use crate::story::StoryState;
 use std::ops::RangeInclusive;
 
 /// A script of a field: its entity (index in the field's script) and slot (0..32).
@@ -134,6 +135,25 @@ impl SceneDef {
         self.trigger.moments.contains(&moment)
     }
 
+    /// Whether the scene has already begun for `story`: every mark its own root turns on first (the field's way of saying that
+    /// this conversation has started, which the field's own trigger waits to be clear before it starts it) is on in the story.
+    /// A mark the story model does not carry ([`crate::story::TRACKED_VARS`]) cannot be read back, so a scene whose marks are
+    /// not carried is never begun (it is offered each time), and neither is one that marks nothing.
+    pub fn begun_in(&self, story: &StoryState) -> bool {
+        let mut marks = self.root.iter().filter_map(|step| match step {
+            Step::SetBit { bank, address, bit } => Some((*bank, *address, *bit)),
+            _ => None,
+        });
+        let Some(first) = marks.next() else { return false };
+        std::iter::once(first).chain(marks).all(|(bank, address, bit)| story.known_bit(bank, address, bit) == Some(true))
+    }
+
+    /// Whether the scene is on offer for `story`: at its moment and not begun yet (module docs: a story scene plays once per
+    /// story, as far as the story carries its mark).
+    pub fn offered_to(&self, story: &StoryState) -> bool {
+        self.applies_at(story.moment) && !self.begun_in(story)
+    }
+
     /// The same scene with another cast (the entities the script drives stay; the actors that play them change).
     #[must_use]
     pub fn with_cast(mut self, cast: Vec<CastMember>) -> Self {
@@ -214,13 +234,17 @@ pub fn proof_scene() -> SceneDef {
         speakers: vec![("Cloud".to_string(), proof::CLOUD), ("Tifa".to_string(), proof::TIFA)],
         // The open floor in front of the counter, on the customers' side (Cloud's stool is at (-95, -144) on triangle 62;
         // Tifa's lane is across the counter, 170 units to the left, and the floor between them is not walkable). The three
-        // stand 65 or more units apart, each facing Cloud's stool, on the walkmesh, 90 or more units from every place the
-        // cast takes in the scene and 40 or more from the nearest wall, stool or table (a body's ring is 22):
-        // `tests/scene_real.rs` measures all of it, and `examples/scene_map.rs` draws it over the field's picture.
+        // stand 90 or more units apart, each facing Cloud's stool, on the walkmesh, 78 or more units from every place the
+        // cast takes in the scene and 34 or more from the nearest wall, stool or table (a body's ring is 22):
+        // `tests/scene_real.rs` measures that, and `examples/scene_map.rs` draws it over the field's picture. What the
+        // CAMERA shows is measured by the client's real-data test (`fmv-client`, `scene::shots`): over every frame of both
+        // ways through the scene no person's picture is covered more than 10% by another's, whichever of the three
+        // placeholder bodies stands on a spot (the first spots tried here, 72 units from Cloud's stool, were not enough:
+        // seen along the camera the stool is almost in line with them).
         witness: vec![
-            Spot { x: -85, y: -55, triangle: 24, direction: 251 },
-            Spot { x: -20, y: -45, triangle: 26, direction: 230 },
-            Spot { x: -100, y: 10, triangle: 21, direction: 1 },
+            Spot { x: -70, y: -70, triangle: 24, direction: 243 },
+            Spot { x: 20, y: -70, triangle: 49, direction: 215 },
+            Spot { x: -100, y: 60, triangle: 68, direction: 1 },
         ],
         // At the counter's edge, facing Tifa across it (she stands at (-268, -105); her talk radius is 150).
         arrival: Spot { x: -124, y: -112, triangle: 27, direction: 192 },

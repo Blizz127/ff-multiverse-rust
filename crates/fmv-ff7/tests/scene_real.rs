@@ -17,7 +17,7 @@
 //! 3. the witness stands on the floor, clear of everyone: [`the_witness_stands_on_the_floor_clear_of_everyone_the_scene_ever_places`];
 //! 4. the interpreter finishes within budget and every op it meets is handled:
 //!    [`the_scene_finishes_within_budget_and_every_op_it_meets_is_handled_or_known_to_change_nothing`];
-//! 5. what the story carries: [`the_proof_scene_writes_nothing_the_story_carries_and_a_scene_that_does_reports_it`].
+//! 5. what the story carries: [`the_proof_scene_writes_only_its_mark_once_and_a_scene_that_moves_the_moment_reports_it`].
 
 mod script_common;
 
@@ -392,20 +392,32 @@ fn the_scene_finishes_within_budget_and_every_op_it_meets_is_handled_or_known_to
 
 #[test]
 #[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
-fn the_proof_scene_writes_nothing_the_story_carries_and_a_scene_that_does_reports_it() {
+fn the_proof_scene_writes_only_its_mark_once_and_a_scene_that_moves_the_moment_reports_it() {
     let Some(f) = field(PROOF_FIELD) else { return };
     let def = proof_scene();
-    // The proof scene's script writes the field's own flags (and Tifa's affection points), none of which the story model
-    // carries: nothing to apply, said plainly. (Adding `Var[3][212]` bit 2 to the model's tracked variables would make the
-    // conversation remembered; that row belongs to the story model, not here.)
-    let out = run_to_end(&f, &def, &StoryState::at(72), 1, &[2]).unwrap();
-    assert_eq!(out.end, End::Finished);
-    assert!(out.writes.is_story_neutral(), "{:?}", out.writes);
-    assert_eq!(out.writes.untracked.get(&(3, 212)), Some(&0b0001_0110), "bits 1 (given), 2 (the trigger's) and 4 (this answer)");
-    assert_eq!(out.writes.untracked.get(&(1, 4)), Some(&5));
-    let mut state = StoryState::at(72);
-    assert!(!out.writes.apply_to(&mut state));
-    assert_eq!(state, StoryState::at(72));
+    // The proof scene's script writes the field's own flags (and Tifa's affection points). Of those the story model carries
+    // exactly one, the bar's mark (`Var[3][212]` bit 2, `story::BAR_CONVERSATION`): the scene turns it on first, and with it
+    // on the story has had the conversation, so the scene is not offered again (acceptance 5). The conversation does not
+    // move the story's moment, and the rest is the field's own, said so and not carried.
+    let story = StoryState::at(72);
+    for answers in [&[2usize][..], &[1][..]] {
+        let out = run_to_end(&f, &def, &story, 1, answers).unwrap();
+        assert_eq!(out.end, End::Finished);
+        assert!(!out.writes.is_story_neutral(), "{:?}", out.writes);
+        assert_eq!(out.writes.moment, None, "the conversation does not move the moment");
+        let [((3, 212), byte)] = out.writes.tracked[..] else { panic!("exactly the bar's byte is carried: {:?}", out.writes) };
+        assert!(byte & 0b100 != 0, "the mark is on: {byte:#b}");
+        assert_eq!(out.writes.untracked.get(&(1, 4)), Some(&5), "Tifa's affection points are the field's own");
+        assert!(!out.writes.untracked.contains_key(&(3, 212)), "the bar's byte is carried now");
+        // applied once: the story keeps the mark (and only the mark) and the scene is no longer offered to it
+        let mut state = story.clone();
+        assert!(def.offered_to(&state));
+        assert!(out.writes.apply_to(&mut state));
+        assert_eq!(state.var(3, 212), 0b100, "only the mark is kept");
+        assert!(!out.writes.apply_to(&mut state), "applied twice it changes nothing");
+        assert!(def.begun_in(&state) && !def.offered_to(&state), "a story that has had the conversation is not offered it");
+        assert_eq!(StoryState::decode(&state.encode()), Some(state), "and the mark is what the stored blob says");
+    }
 
     // A scene whose script DOES write the moment: Tifa's script 15 (Cloud walks out of the bar, Tifa stops him), which
     // sets the moment 81 -> 84 and then jumps to another field (not performed: the scene ends there).
