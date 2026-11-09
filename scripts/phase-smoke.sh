@@ -11,10 +11,14 @@
 # crates/fmv-ff7/src/story.rs). The server validates it from the player's accepted moves.
 #
 # HOW A HEADLESS BOT TRIGGERS IT (what a caller such as a slice smoke runs):
-#   fmv-client --server HOST:PORT --headless --name NAME --state-dir DIR --ff7-library LIBSTATE \
-#              --duration 40 --story-advance
+#   server: fmv-server --bind 127.0.0.1:0 --ff7-library LIBSTATE --state-dir TEMP --no-random-encounters
+#   bot:    fmv-client --server HOST:PORT --headless --name NAME --state-dir DIR --ff7-library LIBSTATE \
+#                      --duration 40 --story-advance
 # (A new account's story is at the counter the point needs. The bot walks from its spawn to triangle 12 of
-# md1stin, never crosses an exit, and stands there until the server moves the story.)
+# md1stin, never crosses an exit, and stands there until the server moves the story. The server runs with
+# --no-random-encounters because md1stin has an encounter table and a bot without --battle-auto that is
+# caught in a battle stands frozen until its run ends; a caller that wants battles on the same server drops
+# that flag and gives the bot --battle-auto.)
 # The line the SERVER prints once, when it happens (key=value, one per advance):
 #   story advanced account=<n> entity=<n> area=Ff7/md1stin point=0 moment=1->6
 # followed, when the write reached the store, by

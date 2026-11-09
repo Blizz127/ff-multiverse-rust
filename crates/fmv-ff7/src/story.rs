@@ -28,16 +28,18 @@
 //! # The one kind of story point: step onto a walkmesh triangle
 //!
 //! FF7 fields advance the story from small loops in an entity's script 0 (its "main" part, after
-//! the first `RET`). The first fields of the first mission do it like this (offsets are in the
-//! owned Steam copy; `md1stin`'s director entity, `md1_1`'s the same shape with `<` for `==`):
+//! the first `RET`). The first fields of the first mission do it like this (measured on the owned
+//! Steam copy: the director entity of the first field, and the same shape with another comparison
+//! in the next field; `T`, `N`, `M` and `E` are literals and an entity of the field, whose values are
+//! pinned by the ignored real-data tests in `tests/story_real.rs` and not repeated here):
 //!
 //! ```text
-//! init:   SETWORD Var[6][9] = 12              ; the triangle that matters
+//! init:   SETWORD Var[b][a] = T                ; the walkmesh triangle that matters
 //!         RET
-//! main:   GETAI entity=1 Var[6][4]            ; which triangle is the (controlled) player on
-//!         IFSW Var[6][4] == Var[6][9]         ; ...is it triangle 12?
-//!         IFSW Var[2][0] == 1                 ; ...and has the story not moved on
-//!         SETWORD Var[2][0] = 6               ; story advances (then a cutscene and BATTLE 300)
+//! main:   GETAI entity=E Var[b2][a2]           ; which triangle is the (controlled) player on
+//!         IFSW Var[b2][a2] == Var[b][a]        ; ...is it triangle T?
+//!         IFSW Var[2][0] <cmp> N               ; ...and is the story where this step applies
+//!         SETWORD Var[2][0] = M                ; story advances (then a cutscene, often a battle)
 //!         JMPB main
 //! ```
 //!

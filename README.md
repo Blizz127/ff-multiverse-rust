@@ -378,7 +378,8 @@ empty phase of every field, and the story advances where the field's own script 
 server can see it: in `md1stin` a player's character stepping onto walkmesh triangle 12 while the counter
 is 1 sets it to 6 (the server logs `story advanced account=<n> entity=<n> area=Ff7/md1stin point=0
 moment=1->6`; the script's battle after it is not run). A headless bot does it with `fmv-client
---headless --story-advance`. `scripts/phase-smoke.sh` runs it against your own library (read-only,
+--headless --story-advance` (against a server run with `--no-random-encounters`, or give the bot
+`--battle-auto`: a bot caught in a battle stands frozen). `scripts/phase-smoke.sh` runs it against your own library (read-only,
 throw-away state): A advances and B does not, so they stop seeing each other; B joins A's party and is
 placed in A's instance; the server restarts, both log in again, and the phases persisted.
 
