@@ -43,6 +43,8 @@ mod list;
 mod pc;
 mod remove;
 #[cfg(test)]
+mod audio_tests;
+#[cfg(test)]
 mod hardening;
 #[cfg(test)]
 mod tests;

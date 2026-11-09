@@ -25,6 +25,17 @@
 //!   and nothing that says which one is meant (the Steam Edition has no per-language
 //!   executables) is imported as `en` when `en` is among them, with a warning in the report and
 //!   a caveat in the manifest; the language is still never mixed.
+//! - **Audio is imported with the game data and never speaks for the set.** A PC install's music
+//!   and sound files (`data/music_ogg/*.ogg`, `data/music/*.wav` and `music.idx`,
+//!   `data/sound/audio.dat` and `audio.fmt`) are language-neutral files, kept under lower-case
+//!   logical paths of exactly that form, and imported by the same machinery and checks as the
+//!   field archive. Only regular, non-empty files with plain names (`A-Z a-z 0-9 _ . -`, at most
+//!   64 bytes, no leading dot) count, at most 512 of them in all (the three index files first);
+//!   the rest is left out and reported in a warning that starts with `audio: `. Such warnings and
+//!   the audio files themselves never enter the set's identification record, so importing the
+//!   same install again with the same labels ADDS the audio to the set that exists (same set id,
+//!   every other entry untouched, the manifest's identification unchanged); other labels make a
+//!   second set. Audio alone is not an import: `import-pc` still needs a `flevel.lgp`.
 //! - **Labels that fix compatibility never drift.** Edition, region and revision are part of the
 //!   set id and of the area fingerprint that decides which players share an instance. The
 //!   Steam Edition is labelled `Steam Edition (appid 3837340)` / `unknown` / `build <id>`

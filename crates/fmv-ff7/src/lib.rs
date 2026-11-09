@@ -99,10 +99,12 @@ pub mod hrc;
 pub mod lgp;
 pub mod lzss;
 pub mod model;
+pub mod music;
 pub mod playable;
 pub mod pmodel;
 pub mod rsd;
 pub mod script;
+pub mod sound;
 pub mod story;
 pub mod tex;
 
