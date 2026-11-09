@@ -112,8 +112,7 @@ async fn the_real_field_is_hosted_and_the_walkmesh_is_the_authority() {
             protocol_version: PROTOCOL_VERSION,
             client_build: "ff7-real-test".into(),
             auth: Auth::Register { display_name: "Probe".into() },
-            tint: [9, 9, 9],
-            appearance_ref: None,
+            character: fmv_protocol::NewCharacter::with_tint([9, 9, 9]),
         },
     )
     .await

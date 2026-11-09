@@ -162,8 +162,7 @@ async fn walking_through_the_real_gateway_takes_a_client_from_md1stin_to_md1_1_a
             protocol_version: PROTOCOL_VERSION,
             client_build: "travel-real-test".into(),
             auth: Auth::Register { display_name: "Walker".into() },
-            tint: [9, 9, 9],
-            appearance_ref: None,
+            character: fmv_protocol::NewCharacter::with_tint([9, 9, 9]),
         },
     )
     .await

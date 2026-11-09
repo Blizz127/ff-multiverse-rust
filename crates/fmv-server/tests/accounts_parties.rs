@@ -52,8 +52,8 @@ async fn registration_issues_the_token_once_and_a_token_login_uses_the_stored_pr
     let me = own(&first);
     assert_eq!(me.avatar.display_name, name);
     assert_eq!(me.avatar.tint, [10, 20, 30]);
-    // The test client asks for "test-model", which the FIXTURE game does not offer: the avatar keeps
-    // the default look (the registration is not refused for it).
+    // The test client asks for a body and a slot, which the FIXTURE game does not offer: the avatar keeps
+    // no binding at all (the registration is not refused for it).
     assert_eq!(me.avatar.appearance_ref, None);
     assert!(first.token.starts_with("fmvt_"), "tokens look like tokens: {}", first.token.len());
     // The placement of a joiner is its own: solo, by its own (default) phase, free to advance.
@@ -67,7 +67,7 @@ async fn registration_issues_the_token_once_and_a_token_login_uses_the_stored_pr
     dup.expect_reject_as(RejectCode::AlreadyOnline, "already logged in").await;
 
     // After the first session ends the token logs the same account in again. The look sent with a
-    // token login (tint 99/98/97, "ignored-model") is ignored: the stored profile decides.
+    // token login (tint 99/98/97, another body and slot) is ignored: the stored character decides.
     drop(first.client);
     let again = relogin(server.addr, &first.token).await;
     assert_eq!(again.account, first.account);

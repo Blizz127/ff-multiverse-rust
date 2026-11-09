@@ -56,8 +56,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use fmv_core::{AccountId, AnimState, AreaId, EntityId, Fingerprint, Pos, ProvenanceSummary, SessionId};
 use fmv_persist::Store;
 use fmv_protocol::{
-    decode, probe_hello_version, read_frame, write_msg, Auth, ClientMsg, ProtoError, RejectCode, Secret, ServerMsg, MAX_FRAME,
-    PROTOCOL_VERSION,
+    decode, probe_hello_version, read_frame, write_msg, Auth, ClientMsg, NewCharacter, ProtoError, RejectCode, Secret, ServerMsg,
+    MAX_FRAME, PROTOCOL_VERSION,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::tcp::OwnedReadHalf;
@@ -486,13 +486,13 @@ impl Conn {
 
         // 1. Hello
         let hello = self.recv(Some(shared.cfg.hello_timeout), HELLO_TIMEOUT).await?;
-        let ClientMsg::Hello { protocol_version, client_build, auth, tint, appearance_ref } = hello else {
+        let ClientMsg::Hello { protocol_version, client_build, auth, character } = hello else {
             return Err(Close::reject(RejectCode::BadRequest, "expected Hello as the first message"));
         };
         check_version(protocol_version).map_err(|why| Close::reject(RejectCode::ProtocolMismatch, why))?;
 
         // 2. Who is this? Registration or token login, against the persistent store.
-        let Login { account, avatar, phase, issued_token, progress } = self.authenticate(auth, tint, appearance_ref).await?;
+        let Login { account, avatar, phase, issued_token, progress, card } = self.authenticate(auth, character).await?;
         let registered = issued_token.is_some();
         if registered {
             // Until the Welcome with its token is known to be written, this account is released
@@ -504,6 +504,8 @@ impl Conn {
             account = account.0,
             name = ?avatar.display_name,
             registered,
+            slot = ?card.slot,
+            migrated = card.migrated,
             "hello accepted"
         );
         // A token login that is refused early (before `Welcome`) gets a quick answer; `World::join`
@@ -514,7 +516,10 @@ impl Conn {
             return Err(Close::reject(RejectCode::AlreadyOnline, ALREADY_ONLINE));
         }
 
-        // 3. Welcome (the only message that ever carries a token) + the area on offer
+        // 3. Welcome (the only message that ever carries a token) + the area on offer. The slot and the binding are kept
+        // for the "player joined" line (a `key=value` line the smoke tests read).
+        let (slot, migrated) = (card.slot.map_or_else(|| "-".to_string(), |s| s.to_string()), card.migrated);
+        let binding = card.binding.clone().unwrap_or_else(|| "-".to_string());
         let (session, entity) = shared.with_world(World::allocate_ids);
         self.send(ServerMsg::Welcome {
             protocol_version: PROTOCOL_VERSION,
@@ -523,6 +528,7 @@ impl Conn {
             entity,
             account,
             issued_token: issued_token.map(Secret::from),
+            character: card,
         })?;
         self.send_shared(Arc::clone(&shared.manifest))?;
 
@@ -586,6 +592,9 @@ impl Conn {
             spawn_x = spawn.x,
             spawn_y = spawn.y,
             online,
+            slot = %slot,
+            binding = %binding,
+            migrated,
             "player joined"
         );
 
@@ -652,18 +661,19 @@ impl Conn {
     /// A registration goes in this order, so that a refused or failed one costs nothing: registration
     /// open? name and look valid? a place in the rate limits (per address, then server-wide)? peer
     /// still there? and only then the commit, which uses the place up (see `limits`).
-    async fn authenticate(&mut self, auth: Auth, tint: [u8; 3], appearance_ref: Option<String>) -> Result<Login, Close> {
+    async fn authenticate(&mut self, auth: Auth, character: NewCharacter) -> Result<Login, Close> {
         let shared = Arc::clone(&self.shared);
         let store = Arc::clone(&shared.store);
         let game = shared.area_id.game;
         let now = unix_now();
+        let tint = character.tint;
         let task = match auth {
             Auth::Token(token) => tokio::task::spawn_blocking(move || accounts::login_with_token(&store, game, &token, tint, now)),
             Auth::Register { display_name } => {
                 if !shared.cfg.allow_registration {
                     return Err(Close::reject(RejectCode::RegistrationClosed, REGISTRATION_CLOSED));
                 }
-                let registration = accounts::validate_registration(game, &display_name, appearance_ref.as_deref()).map_err(|e| {
+                let registration = accounts::validate_registration(game, &display_name, &character).map_err(|e| {
                     debug!(code = ?e.code(), why = e.client_text(), "registration refused");
                     Close::reject(e.code(), e.client_text())
                 })?;
@@ -683,7 +693,7 @@ impl Conn {
                     return Err(Close::PeerGone);
                 }
                 tokio::task::spawn_blocking(move || {
-                    accounts::register(&store, game, registration, tint, now, move || permit.commit(Instant::now()))
+                    accounts::register(&store, game, registration, now, move || permit.commit(Instant::now()))
                 })
             }
         };

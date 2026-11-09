@@ -95,6 +95,7 @@
 //!   walkable points, as long as those are wider than one step.
 
 mod accounts;
+mod character;
 mod config;
 mod conn;
 mod deferred;

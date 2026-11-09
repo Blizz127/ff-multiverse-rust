@@ -27,7 +27,7 @@ async fn two_players_move_get_corrected_and_leave() {
     assert_eq!(a.snapshot[0].pos, Pos::new(-100.0, 0.0, 0.0));
     assert_eq!(a.snapshot[0].avatar.display_name, "Alice");
     assert_eq!(a.snapshot[0].avatar.tint, [10, 20, 30]);
-    assert_eq!(a.snapshot[0].avatar.appearance_ref, None, "the FIXTURE game offers no looks: \"test-model\" is dropped, not refused");
+    assert_eq!(a.snapshot[0].avatar.appearance_ref, None, "the FIXTURE game offers no bodies: the one the test client asks for is dropped, not refused");
 
     let mut b = join(server.addr, "Bob").await;
     assert_ne!(a.entity, b.entity);
@@ -151,8 +151,7 @@ async fn two_players_move_get_corrected_and_leave() {
         protocol_version: PROTOCOL_VERSION + 1,
         client_build: "from the future".into(),
         auth: Auth::Register { display_name: "Eve".into() },
-        tint: [0; 3],
-        appearance_ref: None,
+        character: fmv_protocol::NewCharacter::with_tint([0; 3]),
     })
     .await;
     old.expect_reject_as(RejectCode::ProtocolMismatch, "protocol version").await;
@@ -165,8 +164,7 @@ async fn two_players_move_get_corrected_and_leave() {
         protocol_version: 3,
         client_build: "the release before area travel".into(),
         auth: Auth::Register { display_name: "Carol".into() },
-        tint: [0; 3],
-        appearance_ref: None,
+        character: fmv_protocol::NewCharacter::with_tint([0; 3]),
     })
     .await;
     v3.expect_reject_as(RejectCode::ProtocolMismatch, &format!("server speaks v{PROTOCOL_VERSION}, client sent v3")).await;
