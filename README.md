@@ -911,7 +911,9 @@ own clock, a second or so from the last), but the rule that keeps a player's fir
 that player, and the pair has usually taken all the others by then, so "I attacked once and it was over" happens in 12 of
 the 18 formations (the Sweeper alone, 140 HP and three or four hits, included: the companions have worn it down and the
 player's is the blow that ends it) and in 68% (a bot) to 79% (a person) of all these fights, against 55% under the first
-pacing. Whether that is the feel the owner wants is his to say; the knobs are
+pacing. (The "first pacing" figures are that rule replayed on THIS engine, by a throw-away measurement over the same 18
+formations with a solo player on Barret's curve, 200 seeds each, at the default pace; they are not numbers of the old
+engine and no test keeps them.) Whether that is the feel the owner wants is his to say; the knobs are
 the rule's (`--companion-max-wait-ms 0` turns the whole pacing off, and the last blow goes to whoever's gauge fills first) and the balance (enemy HP
 or gauge speed scaled with the party's size, which FF7's party of two never needed); no balance change is made here.
 
