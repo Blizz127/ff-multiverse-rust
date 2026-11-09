@@ -1618,6 +1618,9 @@ run_commands() {
   for needle in "magic used battle=" "defend used battle=" "item used battle=" "escape tried battle=" "companion acted battle="; do
     say "server: $(count_lines_with "$WORK/server.log" "$needle") line(s) '$needle', e.g. $(last_line_with "$WORK/server.log" "$needle" || true)"
   done
+  if [[ -z ${FMV_SMOKE_SCRIPT_A:-} ]]; then
+    say "server: the whole-party Cure (protocol v10), $(count_lines_with_both "$WORK/server.log" "magic used battle=" " spell=0 target=all-allies ") line(s): $(last_line_with "$WORK/server.log" "target=all-allies" || true)"
+  fi
   say "server: the canon companions' limit breaks: $(count_lines_with "$WORK/server.log" "command=limit attack=") 'companion acted ... command=limit' line(s) (players have none: $(count_lines_with "$WORK/server.log" "limit used battle=") 'limit used' lines)"
   say "commands applied by the server for the bots, both runs: ${CMD_TOTAL[attack]} attack, ${CMD_TOTAL[magic]} magic, ${CMD_TOTAL[item]} item, ${CMD_TOTAL[defend]} defend, ${CMD_TOTAL[limit]} limit, ${CMD_TOTAL[escape]} escape"
   RESULT=pass
