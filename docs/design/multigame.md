@@ -1,7 +1,7 @@
 # Multi-game design: FF8 and FF9 next to FF7
 
 Status: DESIGN NOTES ONLY. Written 2026-11-09 by teammate `sw-ffdesign` (swarm wave 4). The code audit was
-read at `main` `2fea4b5` and re-checked after the talk-dialogue merge `aa3462a`. Docs only: nothing here is
+read at `main` `2fea4b5` and re-checked after the talk-dialogue merge `aa3462a` and its follow-up `094681e`. Docs only: nothing here is
 implemented, built or tested. Scope: FF8 and FF9. Later titles (FF10, FF12) wait for an owner clarification and
 are not covered; nothing below should make them harder.
 
@@ -242,10 +242,12 @@ the protagonist stays unique, and the role of the story's lead is never a player
   (`TalkSession`) and "an added content layer can be another". On the client, `ui::dialogue::Conversations`
   hands the window its source for an NPC, and `StoryVars` is the hook through which "a server-fed
   implementation that mirrors a real player's progress" reads story variables (today `StartOfGame`). The README
-  already promises that whoever you play is never written into a line about Cloud or the cast. What is missing:
-  the `Added` sources themselves, and moving `Message`, `MessageOrigin`, `Beat`, `MessageSource` out of `fmv-ff7`
-  (and `StoryVars` out of FF7's savemap shape: bank and address) into a game-neutral crate, with a talk walker
-  per game (FF8 `.jsm`, FF9 `.eb`).
+  already promises that whoever you play is never written into a line about Cloud or the cast. **One `Added` source
+  exists already** (`094681e`): after a canon "Received ..." line whose gift opcode (`STITM`, `SMTRA`, `GOLDu`) the
+  walk does not perform, the walker queues an added note that nothing was given (`EFFECT_NOTE_LAYER`, "not-performed"),
+  so the canon line never misleads. What is missing: the player-facing layer sources, and moving `Message`,
+  `MessageOrigin`, `Beat`, `MessageSource` out of `fmv-ff7` (and `StoryVars` out of FF7's savemap shape: bank and
+  address) into a game-neutral crate, with a talk walker per game (FF8 `.jsm`, FF9 `.eb`).
 * **Original text only.** Layer lines are written for this project, stored in the repository as data, per
   language, and **ship with the client** (no dialogue goes over the network; each client reads canon text from
   its own copy and layer text from the package). They never copy or edit text from the game's files. Canon
@@ -277,7 +279,7 @@ and the slot's Trance set. Details per game are in sections 5 and 6.
 
 ### 2.10 The FF7 retrofit (today's code to the model)
 
-Concrete facts from the code at `aa3462a`:
+Concrete facts from the code at `094681e`:
 
 * `fmv_ff7::playable::DEFAULT_APPEARANCE` is `ff7/cloud`: today's default really is "everyone is Cloud".
 * The look picker offers Cloud, Tifa, Barret and Aerith in the character menu (README; `fmv-client/src/ui/*`),
@@ -304,7 +306,7 @@ proper and waits for the VM track.
 
 | Needs | Status |
 |---|---|
-| per-game script VM hosted by the server (FF7 field script, FF8 `.jsm`, FF9 `.eb`), with party-affecting opcodes intercepted | **does not exist for any game.** FF7 has script analysis and, since `aa3462a`, a read-only talk walker (`script::dialogue`: message, branch and variable opcodes only; MAPJUMP, BATTLE, MINIGAME and GAMEOVER just end the walk); the README still lists world-changing field scripts as not done |
+| per-game script VM hosted by the server (FF7 field script, FF8 `.jsm`, FF9 `.eb`), with party-affecting opcodes intercepted | **does not exist for any game.** FF7 has script analysis and, since `aa3462a`, a read-only talk walker (`script::dialogue`: message, branch and variable opcodes only; MAPJUMP, BATTLE, MINIGAME and GAMEOVER just end the walk, gift opcodes are not performed); the README still lists world-changing field scripts as not done. The effects the walker declines to perform are the first draft of the intercept list for a hosted VM, where the server owns the inventory, the party and the battle |
 | a game-neutral message and story-variable layer (`Message`, `MessageSource`, a `StoryVars` that is not FF7's savemap) | the types exist, in `fmv-ff7`; promotion is part of R9 |
 | segment data (`SegmentCast` per phase) | curated per game; source is the VM's story variables |
 | canon sheets per phase | pure functions of owned data; per game |
@@ -314,7 +316,7 @@ proper and waits for the VM track.
 
 ## 3. What is shared and what is per game today
 
-Audit of `main` at `2fea4b5`, re-checked at `aa3462a` (read, not run).
+Audit of `main` at `2fea4b5`, re-checked at `094681e` (read, not run).
 
 | Layer | Crate | Verdict | Evidence |
 |---|---|---|---|
