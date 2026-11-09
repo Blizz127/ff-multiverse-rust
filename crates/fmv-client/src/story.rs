@@ -37,8 +37,9 @@
 //! takes the links it needs to get to the point and keeps off the others.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
-use fmv_adapter_api::{AreaKey, AreaRuntime, Exit, Link, MoveResult, StoryPoint, StoryTrigger, SAME_SPOT};
+use fmv_adapter_api::{AreaKey, AreaRuntime, Exit, GameAdapter, Link, MoveResult, StoryPoint, StoryTrigger, SAME_SPOT};
 use fmv_core::Pos;
 use fmv_protocol::StoryAdvance;
 
@@ -142,10 +143,11 @@ const PLAN_COOLDOWN_STEPS: u32 = 100;
 /// A bot that leads a party holds still before a point that starts a battle until the rest of the party is in view, but
 /// at most this long (seconds).
 pub const BATTLE_PARTY_WAIT_S: f32 = 20.0;
-/// A press whose step has not come after this long (seconds) is made again...
-const PRESS_WAIT_S: f32 = 2.0;
-/// ...at most this many times in all, and then the bot gives up.
-const MAX_PRESSES: u32 = 5;
+/// A press is made ONCE: a bot that has pressed OK waits for the server's step (the `StoryUpdate` that changes the
+/// progress it was pressed on) and presses nothing else before it comes. A press that brings no step in this long
+/// (seconds) is a failure the bot reports and stops on, not one it repeats: a second press on a story the server
+/// has already moved (the lift's panel, which rides back up) would be a different step.
+const PRESS_PATIENCE_S: f32 = 10.0;
 /// A bot presses OK next to a character standing within this part of the point's talk radius of it (the server's own
 /// judgement is made on where it last heard the player was).
 const TALK_STAND: f32 = 0.7;
@@ -178,8 +180,22 @@ enum Pressing {
     No,
     /// At the spot, still: the press is wanted ([`StoryBot::take_press`]).
     Wanted,
-    /// Pressed at this time (the session clock of the bot's own steps): waiting for the server's step.
+    /// Pressed at this time (the session clock of the bot's own steps): waiting for the server's step, which is the
+    /// progress changing from [`StoryBot::sent_progress`]. Nothing is pressed again until then.
     Sent { since: f32 },
+}
+
+/// How the bot tells a step that goes FORWARD from one that does not: the game's own join of two progressions
+/// (`GameAdapter::merge_progression`). A step is forward when the join of the story the player has and the step's is
+/// something new (a further moment, bits turned on); a step the join adds nothing to (the lift's ride back, which turns
+/// a bit off) is not, and the bot never pursues it.
+#[derive(Clone)]
+struct Judge(Arc<dyn GameAdapter>);
+
+impl std::fmt::Debug for Judge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Judge").finish_non_exhaustive()
+    }
 }
 
 /// The planned way to a story point.
@@ -220,9 +236,12 @@ pub struct StoryBot {
     pressing: Pressing,
     /// The character the press wanted now addresses.
     press_npc: Option<u32>,
-    /// The point the press state is about, and how many presses it has had.
+    /// The point the press state is about.
     press_point: Option<u32>,
-    presses: u32,
+    /// The progress the press was wanted on: the press has its step when the progress is another.
+    sent_progress: Vec<u8>,
+    /// Tells forward steps from the others (none: every step the area offers is pursued).
+    judge: Option<Judge>,
 }
 
 impl StoryBot {
@@ -243,8 +262,22 @@ impl StoryBot {
             pressing: Pressing::No,
             press_npc: None,
             press_point: None,
-            presses: 0,
+            sent_progress: Vec::new(),
+            judge: None,
         }
+    }
+
+    /// The game's own content, to tell a step that goes forward from one that does not: the bot pursues and presses
+    /// only the points whose step is forward of the story it was told (`merge_progression` of the story and the step
+    /// is something new). Without it every step the area offers is pursued.
+    pub fn with_adapter(mut self, adapter: Option<Arc<dyn GameAdapter>>) -> Self {
+        self.judge = adapter.map(Judge);
+        self
+    }
+
+    /// Is `step` (the progression a point would give) forward of `current` (the one the player has)?
+    fn is_forward(&self, current: &[u8], step: &[u8]) -> bool {
+        self.judge.as_ref().is_none_or(|judge| judge.0.merge_progression(current, step) != current)
     }
 
     /// `--story-advance` was given: the bot decides every step, even when there is nothing to do
@@ -267,7 +300,6 @@ impl StoryBot {
         self.pressing = Pressing::No;
         self.press_npc = None;
         self.press_point = None;
-        self.presses = 0;
         self.party_wait = 0.0;
     }
 
@@ -318,7 +350,11 @@ impl StoryBot {
                     // what fires when the player comes to stand in the area needs no walking
                     _ => return None,
                 };
-                area.story_advance(progress, point.id)?;
+                // only a step that goes forward (the lift's ride back would take the story backwards)
+                let step = area.story_advance(progress, point.id)?;
+                if !self.is_forward(progress, &step.progress) {
+                    return None;
+                }
                 let battle = area.story_battle(point.id).is_some();
                 Some(Target { point, kind, battle })
             })
@@ -368,16 +404,24 @@ impl StoryBot {
             return still;
         }
         self.clock += dt;
+        // The press had its step (the progress is another now): what is pressed next is pressed on the new story.
+        if matches!(self.pressing, Pressing::Sent { .. }) && progress != self.sent_progress.as_slice() {
+            self.pressing = Pressing::No;
+        }
         // Nothing here would advance this story (it already did, or the area has no point for it).
         let Some(target) = self.target(area, progress, cur) else {
-            self.pressing = Pressing::No;
+            if !matches!(self.pressing, Pressing::Sent { .. }) {
+                self.pressing = Pressing::No;
+            }
             self.press_point = None;
             return still;
         };
         if self.press_point != Some(target.point.id) {
             self.press_point = Some(target.point.id);
-            self.pressing = Pressing::No;
-            self.presses = 0;
+            // (a press that is waiting for its step is not forgotten by looking at another point)
+            if !matches!(self.pressing, Pressing::Sent { .. }) {
+                self.pressing = Pressing::No;
+            }
             self.party_wait = 0.0;
         }
         let exits = area.exits();
@@ -390,7 +434,7 @@ impl StoryBot {
 
         // At the spot where OK is pressed: stand there, press, and wait for the server's step.
         if Self::at_spot(&target, cur) {
-            return self.press_here(&target, still);
+            return self.press_here(&target, progress, still);
         }
         // Standing in the region and the server has not advanced the story yet: touch it again by
         // stepping a little way and back (it judges every accepted move).
@@ -402,27 +446,36 @@ impl StoryBot {
             let step = self.step_toward(area, &exits, cur, want, len).unwrap_or(still);
             return self.gate(&target, cur, step, dt, still);
         }
-        let step = self.walk_to(area, &exits, &target, cur, centre, (dt, speed));
+        let avoid = Self::battles_to_avoid(area, &target);
+        let step = self.walk_to(area, (&exits, &avoid), &target, cur, centre, (dt, speed));
         self.gate(&target, cur, step, dt, still)
     }
 
-    /// At the spot of a press point: want the press, and make it again if the step does not come.
-    fn press_here(&mut self, target: &Target, still: BotStep) -> BotStep {
+    /// The regions of the points that start a battle, other than the one the bot goes for: stepping on one on the way
+    /// brings the battle on before the party is ready and before the story ahead of it is done (the first reactor's
+    /// last field has the talk of the materia to do before the battle's triangle, which lies near the way).
+    fn battles_to_avoid(area: &dyn AreaRuntime, target: &Target) -> Vec<StoryPoint> {
+        area.story_points()
+            .into_iter()
+            .filter(|p| p.id != target.point.id && matches!(p.trigger, StoryTrigger::Region(_) | StoryTrigger::Line(..)) && area.story_battle(p.id).is_some())
+            .collect()
+    }
+
+    /// At the spot of a press point: want the press, once, and wait for the step (a press that brings none in
+    /// [`PRESS_PATIENCE_S`] is reported, never repeated).
+    fn press_here(&mut self, target: &Target, progress: &[u8], still: BotStep) -> BotStep {
         match self.pressing {
             Pressing::No => {
                 self.press_npc = match target.kind {
                     Kind::Talk { npc, .. } => Some(npc),
                     _ => None,
                 };
+                self.sent_progress = progress.to_vec();
                 self.pressing = Pressing::Wanted;
             }
             Pressing::Wanted => {}
-            Pressing::Sent { since } if self.clock - since > PRESS_WAIT_S => {
-                if self.presses >= MAX_PRESSES {
-                    self.gave_up = Some(format!("pressed OK {} times at story point {} and the story did not move", self.presses, target.point.id));
-                } else {
-                    self.pressing = Pressing::Wanted;
-                }
+            Pressing::Sent { since } if self.clock - since > PRESS_PATIENCE_S => {
+                self.gave_up = Some(format!("pressed OK at story point {} and the story did not move in {PRESS_PATIENCE_S} s", target.point.id));
             }
             Pressing::Sent { .. } => {}
         }
@@ -444,7 +497,6 @@ impl StoryBot {
         }
         if self.pressing == Pressing::Wanted {
             self.pressing = Pressing::Sent { since: self.clock };
-            self.presses += 1;
             return Some(Press { npc: self.press_npc });
         }
         None
@@ -471,12 +523,13 @@ impl StoryBot {
 
     /// One step toward `centre`, for `target`: with the navigator in an area with links, else along the planned legs
     /// or greedily.
-    fn walk_to(&mut self, area: &dyn AreaRuntime, exits: &[Exit], target: &Target, cur: Pos, centre: Pos, (dt, speed): (f32, f32)) -> BotStep {
+    fn walk_to(&mut self, area: &dyn AreaRuntime, (exits, avoid): (&[Exit], &[StoryPoint]), target: &Target, cur: Pos, centre: Pos, (dt, speed): (f32, f32)) -> BotStep {
         let still = BotStep { pos: cur, facing: None, moved: false };
         let len = speed * dt;
         if self.nav.has_links(area) {
-            // This bot never crosses an exit (it would leave the area before the story was told).
-            let any_exit = |a: Pos, b: Pos| exits.iter().any(|e| e.is_crossed_by(a, b));
+            // This bot never crosses an exit (it would leave the area before the story was told), and does not step
+            // on the region of a battle it is not going for.
+            let any_exit = |a: Pos, b: Pos| exits.iter().any(|e| e.is_crossed_by(a, b)) || avoid.iter().any(|p| p.is_hit_by(a, b));
             let aim = |from: Pos| {
                 let goal = match target.kind {
                     Kind::Walk => Self::goal(area, &target.point, from),
@@ -504,7 +557,7 @@ impl StoryBot {
                 Nav::Here => {}
             }
         }
-        if let Some(step) = self.follow_plan(area, exits, &target.point, cur, centre, len) {
+        if let Some(step) = self.follow_plan(area, (exits, avoid), &target.point, cur, centre, len) {
             return step;
         }
         // Greedy: the heading nearest the goal's that is walkable and gets closer.
@@ -559,7 +612,7 @@ impl StoryBot {
 
     /// One step along the planned legs (planning them first). `None`: no plan, or the next leg is
     /// blocked; the caller takes a greedy step instead and the plan is made again after a pause.
-    fn follow_plan(&mut self, area: &dyn AreaRuntime, exits: &[Exit], point: &StoryPoint, cur: Pos, centre: Pos, len: f32) -> Option<BotStep> {
+    fn follow_plan(&mut self, area: &dyn AreaRuntime, (exits, avoid): (&[Exit], &[StoryPoint]), point: &StoryPoint, cur: Pos, centre: Pos, len: f32) -> Option<BotStep> {
         let key = area.info().id.key.clone();
         if self.plan.as_ref().is_none_or(|p| p.area != key || p.point != point.id) {
             self.plan = None;
@@ -569,7 +622,10 @@ impl StoryBot {
             }
             // This bot never crosses an exit (it would leave the area before the story was told): the planner is told so.
             let any_exit = |a: Pos, b: Pos| exits.iter().any(|e| e.is_crossed_by(a, b));
-            match plan_path_avoiding(area, cur, centre, &any_exit) {
+            // ...and it keeps off the region of a battle it is not going for, where there is a way that does (else it goes
+            // over it: the point's own conditions then decide whether anything happens).
+            let careful = |a: Pos, b: Pos| any_exit(a, b) || avoid.iter().any(|p| p.is_hit_by(a, b));
+            match plan_path_avoiding(area, cur, centre, &careful).or_else(|| plan_path_avoiding(area, cur, centre, &any_exit)) {
                 Some(waypoints) => self.plan = Some(Plan { area: key, point: point.id, waypoints, next: 1 }),
                 None => {
                     self.plan_cooldown = PLAN_COOLDOWN_STEPS;

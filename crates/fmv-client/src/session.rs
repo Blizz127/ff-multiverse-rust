@@ -144,6 +144,12 @@ impl Session {
         self
     }
 
+    /// This machine's own game content, when the session holds it (see [`Session::with_content`]): what a bot asks
+    /// the game's own questions of (is this story step forward of the story the player has?).
+    pub fn content(&self) -> Option<Arc<dyn GameAdapter>> {
+        self.content.clone()
+    }
+
     /// The area change that happened since the last call, if any: the window rebuilds its view and
     /// the headless bot its walking pattern for the new area. Several changes between two calls
     /// are reported as the last one.

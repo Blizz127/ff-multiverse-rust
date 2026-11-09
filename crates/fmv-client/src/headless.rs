@@ -193,7 +193,7 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>, mut 
     let mut party_bot = PartyBot::new(args.party_invite_first_peer, args.party_accept).with_accept_after_split(args.party_accept_after_split);
     // `--story-advance`: walk to the story point that would advance this account and stand on it. With an
     // invite to send it holds still until the invite is out (the invite must go out while the others are in view).
-    let mut story_bot = StoryBot::new(args.story_advance, args.party_invite_first_peer);
+    let mut story_bot = StoryBot::new(args.story_advance, args.party_invite_first_peer).with_adapter(session.content());
     // `--travel`: walk through the exits to these areas; with a party to form first it waits for it.
     let mut travel_bot = TravelBot::new(args.travel.clone(), args.party_invite_first_peer || args.party_accept).following(args.travel_follow);
     let mut battle_bot = BattleBot::new(args.battle_auto, args.debug_encounters, args.battle_wait_party).with_script(args.battle_script.clone());

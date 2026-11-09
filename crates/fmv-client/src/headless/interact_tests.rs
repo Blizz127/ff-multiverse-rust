@@ -197,8 +197,8 @@ impl GameAdapter for FloorsContent {
 }
 
 /// Run the headless client with `flags` for `secs` seconds against `mini`, which serves the area `info`; the content
-/// of the client is `content`.
-async fn run_client(flags: &[&str], secs: f64, content: Box<dyn GameAdapter>, info: AreaInfo, mini: Mini) -> (u8, Seen) {
+/// of the client is what `content` makes (twice: the handshake takes one, the session keeps the other).
+async fn run_client(flags: &[&str], secs: f64, content: impl Fn() -> Box<dyn GameAdapter> + Send + 'static, info: AreaInfo, mini: Mini) -> (u8, Seen) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(serve(listener, info, mini));
@@ -207,9 +207,9 @@ async fn run_client(flags: &[&str], secs: f64, content: Box<dyn GameAdapter>, in
     let mut args = crate::cli::Args::try_parse_from(argv).expect("arguments");
     args.duration = Duration::from_secs_f64(secs);
     let client = tokio::task::spawn_blocking(move || {
-        let mut net = NetHandle::spawn(config(addr), content).expect("net thread");
+        let mut net = NetHandle::spawn(config(addr), content()).expect("net thread");
         let joined = net.wait_joined().expect("joined");
-        let session = Session::new(net, joined);
+        let session = Session::new(net, joined).with_content(Arc::from(content()));
         run(&args, session, None, GameAudio::off())
     });
     let code = client.await.expect("the client thread");
@@ -235,7 +235,7 @@ async fn a_story_bot_walks_into_the_press_region_and_presses_ok_once_the_server_
     let hall = RoomsAdapter::with_interactions().load_area(HALL).unwrap();
     let spawn = Pos::new(100.0, 130.0, 0.0);
     let mini = Mini::new(RoomsAdapter::with_interactions().load_area(HALL).unwrap(), Vec::new(), spawn);
-    let (code, seen) = run_client(&["--story-advance"], 3.0, Box::new(RoomsAdapter::with_interactions()), info_of(HALL), mini).await;
+    let (code, seen) = run_client(&["--story-advance"], 3.0, || Box::new(RoomsAdapter::with_interactions()), info_of(HALL), mini).await;
     assert_eq!(code, 0);
     // One press, from where the press region is: the server answered it with the step, which ends the bot's business.
     assert_eq!(presses(&seen), [None], "{:?}", seen.messages);
@@ -260,7 +260,7 @@ async fn a_story_bot_walks_up_to_the_guard_and_presses_ok_addressing_it() {
     };
     let yard_spawn = Pos::new(-200.0, 0.0, 0.0);
     let mini = Mini::new(RoomsAdapter::with_interactions().load_area(YARD).unwrap(), vec![guard], yard_spawn);
-    let (code, seen) = run_client(&["--story-advance"], 4.0, Box::new(RoomsAdapter::with_interactions()), info_of(YARD), mini).await;
+    let (code, seen) = run_client(&["--story-advance"], 4.0, || Box::new(RoomsAdapter::with_interactions()), info_of(YARD), mini).await;
     assert_eq!(code, 0);
     assert_eq!(presses(&seen), [Some(4)], "{:?}", seen.messages);
     assert_eq!(seen.progress, STORY_ADVANCED, "the talk moved the story");
@@ -271,7 +271,8 @@ async fn a_travel_and_story_bot_goes_by_a_jump_and_a_ladder_to_the_panel_and_on_
     let info = info_of(HALL);
     let spawn = Pos::new(-200.0, 0.0, 0.0);
     let mini = Mini::new(Box::new(Floors::new(true).with_story()), Vec::new(), spawn);
-    let (code, seen) = run_client(&["--story-advance", "--travel", "next"], 9.0, Box::new(FloorsContent(info.clone())), info, mini).await;
+    let content_info = info.clone();
+    let (code, seen) = run_client(&["--story-advance", "--travel", "next"], 9.0, move || Box::new(FloorsContent(content_info.clone())), info, mini).await;
     assert_eq!(code, 0);
     // the jump (link 0) fired by walking, the ladder (link 1) by a press at its foot, the panel by a press in its region
     assert_eq!(seen.fired, [0, 1], "{:?}", seen.messages);
@@ -280,4 +281,18 @@ async fn a_travel_and_story_bot_goes_by_a_jump_and_a_ladder_to_the_panel_and_on_
     assert_eq!(seen.ignored_while_fenced, 0, "no press was sent before the server had been told where the bot stood");
     // and on to the exit's line (x = 300) in the loft
     assert!(seen.pos.x > 250.0 && (seen.pos.z - 500.0).abs() < 1.0, "it walked on in the loft: {:?}", seen.pos);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_story_bot_does_not_press_the_toggle_region_after_the_press_region_has_paid() {
+    // A bot that stands in the press region, with the toggle region (OK there takes an advanced story back to a new
+    // account's) a few steps away: after the press region's step it must leave the toggle alone, so the story ends
+    // where the press left it. (The server applies a press as the point says, forward or not.)
+    let spawn = Pos::new(200.0, 130.0, 0.0);
+    let mini = Mini::new(RoomsAdapter::with_interactions().load_area(HALL).unwrap(), Vec::new(), spawn);
+    let (code, seen) = run_client(&["--story-advance"], 5.0, || Box::new(RoomsAdapter::with_interactions()), info_of(HALL), mini).await;
+    assert_eq!(code, 0);
+    assert_eq!(presses(&seen), [None], "one press, the press region's: {:?}", seen.messages);
+    assert_eq!(seen.progress, STORY_ADVANCED, "the story stayed where the press region put it");
+    assert_eq!(seen.fired, Vec::<usize>::new());
 }
