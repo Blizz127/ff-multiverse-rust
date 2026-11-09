@@ -16,9 +16,11 @@
 //! handful of entries; [`NameBook::from_tables`] takes the decoded strings from whichever file
 //! the caller read them from.
 
+use super::sounds::SoundBook;
 use fmv_ff7_battle::kernel::Kernel;
 use fmv_ff7_battle::scene::SceneBin;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// `kernel.bin` section of the magic names.
 pub const SECTION_MAGIC_NAMES: usize = 18;
@@ -36,13 +38,16 @@ pub fn clean_name(raw: &str) -> String {
     ascii.trim().chars().take(MAX_NAME_CELLS).collect()
 }
 
-/// Spell, item and enemy attack names. Cheap to share: built once per process and read-only.
+/// Spell, item and enemy attack names, and (so that no second thing has to be installed next to it) the sounds the same
+/// data names ([`SoundBook`]). Cheap to share: built once per process and read-only.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NameBook {
     spells: Vec<String>,
     items: Vec<String>,
     /// `(scene index, attack id)` to the name in that scene's attack table.
     attacks: HashMap<(u16, u16), String>,
+    /// What this machine's data says a battle sounds like (`None` for a book made from tables).
+    sounds: Option<Arc<SoundBook>>,
 }
 
 impl NameBook {
@@ -50,7 +55,7 @@ impl NameBook {
     /// attacks.
     pub fn from_tables(spells: &[String], items: &[String]) -> Self {
         let clean = |names: &[String]| names.iter().take(MAX_ENTRIES).map(|n| clean_name(n)).collect();
-        Self { spells: clean(spells), items: clean(items), attacks: HashMap::new() }
+        Self { spells: clean(spells), items: clean(items), attacks: HashMap::new(), sounds: None }
     }
 
     /// The book of this machine's own battle data.
@@ -59,6 +64,7 @@ impl NameBook {
             (0..MAX_ENTRIES).map_while(|i| kernel.text_entry(section, i)).collect()
         };
         let mut book = Self::from_tables(&table(SECTION_MAGIC_NAMES), &table(SECTION_ITEM_NAMES));
+        book.sounds = Some(Arc::new(SoundBook::from_data(kernel, scenes)));
         for scene in scenes.scenes() {
             let Ok(index) = u16::try_from(scene.index) else { continue };
             for attack in &scene.attacks {
@@ -69,6 +75,11 @@ impl NameBook {
             }
         }
         book
+    }
+
+    /// The sounds this machine's own data names for a battle (`None` when the book was not made from the data).
+    pub fn sounds(&self) -> Option<&Arc<SoundBook>> {
+        self.sounds.as_ref()
     }
 
     fn entry(table: &[String], id: u16) -> Option<&str> {
@@ -102,6 +113,13 @@ impl NameBook {
     #[cfg(test)]
     pub fn with_enemy_attack(mut self, scene: u16, id: u16, name: &str) -> Self {
         self.attacks.insert((scene, id), clean_name(name));
+        self
+    }
+
+    /// This book with `sounds` (tests: a book made from tables has none).
+    #[cfg(test)]
+    pub fn with_sounds(mut self, sounds: SoundBook) -> Self {
+        self.sounds = Some(Arc::new(sounds));
         self
     }
 }

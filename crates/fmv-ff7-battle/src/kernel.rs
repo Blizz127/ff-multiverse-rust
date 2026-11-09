@@ -34,7 +34,7 @@
 //! | 2 | battle and growth data | parsed ([`GrowthData`]) |
 //! | 3 | initialization data (9 savemap character records, then the party, then the item stock) | parsed ([`InitCharacter`], [`Kernel::starting_inventory`]) |
 //! | 4 | 128 item records of 28 bytes | on demand ([`Kernel::item`]) |
-//! | 5, 6 | weapons (44 bytes), armor (36 bytes) | on demand ([`WeaponRecord`], [`ArmorRecord`]) |
+//! | 5, 6 | weapons (44 bytes), armor (36 bytes) | on demand ([`WeaponRecord`], [`WeaponSounds`], [`ArmorRecord`]) |
 //! | 8 | 96 materia records of 20 bytes | on demand ([`Kernel::materia`]) |
 //! | 7 | accessories | raw bytes only |
 //! | 9..27 | FF text tables | raw bytes; name lookup via [`Kernel::text_entry`] |
@@ -861,6 +861,42 @@ impl WeaponRecord {
     }
 }
 
+/// Offset of the weapon record's "mask for access high sound id (0x100+)" byte.
+const WEAPON_OFF_SOUND_MASK: usize = 0x0B;
+/// Offsets of the weapon record's three sound bytes: "Sound Effect Id for normal hit", "for critical hit" and "for
+/// missed attack".
+const WEAPON_OFF_HIT_SOUND: usize = 0x24;
+const WEAPON_OFF_CRITICAL_SOUND: usize = 0x25;
+const WEAPON_OFF_MISS_SOUND: usize = 0x26;
+
+/// The sounds of a weapon's blows, as the game's sound ids (the same id space as the field scripts' `SOUND`: 1-based,
+/// entry `id - 1` of `audio.fmt`; `fmv_ff7::sound` has the evidence). Read from the weapon record (section 5):
+///
+/// * three bytes, at `0x24` (a blow that hits), `0x25` (a critical hit) and `0x26` (a miss), source
+///   <https://ff7-mods.github.io/ff7-flat-wiki/FF7/Weapon_data.html> (and the same page of the FFRTT wiki);
+/// * a mask byte at `0x0B` ("mask for access high sound id (0x100+)"): a sound byte only reaches 255, and the sound
+///   bank has 750 entries, so the bits of the mask add `0x100` to an id. **Bit 0 is for the hit sound, bit 1 for
+///   the critical one, bit 2 for the miss** (the order of the three bytes). Checked on the owner's Steam copy
+///   (`tests/real_data.rs`, `real_weapon_sounds_...`): the mask is `0xF8` (no bit) for Cloud, Barret's guns, Red XIII
+///   and Aerith, `0xFB` (bits 0 and 1) for Tifa, Cid, Yuffie, Cait Sith, Sephiroth and Barret's other weapons, and
+///   `0xF9` (bit 0) for Vincent, so every id is at most 485 and **bit 2 is never set** (no miss sound is a high id).
+///   The proof that bit 0 is the hit and bit 1 the critical hit is in the clips the ids then name: Tifa's hit
+///   (36 + 0x100) and critical (94 + 0x100), Yuffie's hit (89 + 0x100) and Vincent's hit (18 + 0x100) land on the
+///   clips a hand-made list of the sound bank calls "Tifa Hit", "Tifa Critical Hit", "Yuffie Shuriken Slicing" and a gun
+///   (see `fmv_ff7::sound`, "Battle sound ids"), and Vincent's hit id is the very id an enemy's `Shotgun` attack
+///   names as its impact sound (274) in `scene.bin`.
+///
+/// An id of 0 would be "no sound" (`fmv_ff7::sound::entry_for_sound_id`); no real weapon has one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WeaponSounds {
+    /// Played when a blow hits.
+    pub hit: u16,
+    /// Played when a blow is a critical hit.
+    pub critical: u16,
+    /// Played when a blow misses.
+    pub miss: u16,
+}
+
 /// Armor record (section 6, 36 bytes): only the fields the battle rules use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArmorRecord {
@@ -1027,6 +1063,24 @@ impl Kernel {
             crit_rate: u8_at(rec, 0x07),
             accuracy: u8_at(rec, 0x08),
             equip_mask: u16_at(rec, 0x0E),
+        })
+    }
+
+    /// The sounds of weapon `id`'s blows (see [`WeaponSounds`]); `None` past the end of the weapon table. Read-only:
+    /// nothing in the rules depends on it.
+    pub fn weapon_sounds(&self, id: u8) -> Option<WeaponSounds> {
+        let data = self.section(SECTION_WEAPONS)?;
+        let rec = data.get(usize::from(id) * WEAPON_RECORD_SIZE..)?;
+        if rec.len() < WEAPON_RECORD_SIZE {
+            return None;
+        }
+        let mask = u8_at(rec, WEAPON_OFF_SOUND_MASK);
+        // A sound byte plus 0x100 when its bit of the mask is set.
+        let sound = |offset: usize, bit: u8| u16::from(u8_at(rec, offset)) | if mask & bit != 0 { 0x100 } else { 0 };
+        Some(WeaponSounds {
+            hit: sound(WEAPON_OFF_HIT_SOUND, 0x01),
+            critical: sound(WEAPON_OFF_CRITICAL_SOUND, 0x02),
+            miss: sound(WEAPON_OFF_MISS_SOUND, 0x04),
         })
     }
 
@@ -2048,6 +2102,7 @@ mod tests {
         let k = Kernel::parse(&good).unwrap();
         for id in 0..=255u8 {
             let _ = k.weapon(id);
+            let _ = k.weapon_sounds(id);
             let _ = k.armor(id);
             let _ = k.weapon_name(id);
             let _ = k.init_character_by_id(id);
@@ -2072,5 +2127,45 @@ mod tests {
                 let _ = k.growth.stat_block(who, level);
             }
         }
+    }
+
+    /// A kernel whose weapon table has invented sound bytes (no game data): ids as the module docs describe them.
+    fn kernel_with_weapon_sounds(records: &[(u8, [u8; 3])]) -> Kernel {
+        let mut sections = synthetic_kernel_sections();
+        let weapons = &mut sections[SECTION_WEAPONS].1;
+        for (id, (mask, [hit, critical, miss])) in records.iter().enumerate() {
+            let o = id * WEAPON_RECORD_SIZE;
+            weapons[o + WEAPON_OFF_SOUND_MASK] = *mask;
+            weapons[o + WEAPON_OFF_HIT_SOUND] = *hit;
+            weapons[o + WEAPON_OFF_CRITICAL_SOUND] = *critical;
+            weapons[o + WEAPON_OFF_MISS_SOUND] = *miss;
+        }
+        Kernel::parse(&pack_kernel(&sections, &[0, 0])).unwrap()
+    }
+
+    #[test]
+    fn a_weapons_sounds_are_its_three_bytes_with_0x100_added_where_the_mask_says() {
+        let k = kernel_with_weapon_sounds(&[
+            // The mask of the real file has its five high bits set and only bits 0 to 2 mean anything.
+            (0xF8, [18, 27, 5]),  // no bit: the bytes are the ids
+            (0xFB, [36, 94, 5]),  // bits 0 and 1: the hit and the critical hit are high ids
+            (0xF9, [18, 123, 47]), // bit 0 only
+            (0xFC, [1, 2, 3]),    // bit 2: the miss (the owner's file never sets it)
+            (0xF8, [255, 255, 255]),
+            (0xFF, [255, 0, 7]),
+        ]);
+        let ids = |w: u8| k.weapon_sounds(w).map(|s| (s.hit, s.critical, s.miss));
+        assert_eq!(ids(0), Some((18, 27, 5)));
+        assert_eq!(ids(1), Some((0x100 + 36, 0x100 + 94, 5)));
+        assert_eq!(ids(2), Some((0x100 + 18, 123, 47)));
+        assert_eq!(ids(3), Some((1, 2, 0x100 + 3)));
+        assert_eq!(ids(4), Some((255, 255, 255)), "a sound byte alone reaches 255");
+        assert_eq!(ids(5), Some((0x1FF, 0x100, 0x107)), "every bit: all three are high ids");
+        // The table has 128 records; past it there is nothing, and a record that is cut short is nothing too.
+        assert!(k.weapon_sounds(127).is_some());
+        assert_eq!(k.weapon_sounds(128), None);
+        assert_eq!(k.weapon_sounds(255), None);
+        // Reading the sounds changes nothing the rules read.
+        assert_eq!(k.weapon(0), Kernel::parse(&synthetic_kernel_bytes()).unwrap().weapon(0));
     }
 }

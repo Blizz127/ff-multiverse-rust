@@ -86,7 +86,8 @@ for example) are announced with every snapshot. See "Walking between fields" bel
 
 Not done yet: field scripts as a whole (what is carried out is the exits a line's walk-on script decides
 and the story steps the scripts make where the server can see them, see "Walking between fields"; no cutscenes,
-no talk-driven story, no ladders), NPC animation and talking, music, and the window's scrolling camera (it shows
+no talk-driven story, no ladders), NPC animation and talking, field sounds (what a field's scripts and footsteps play;
+the music and a battle's sounds are done, see "Sound"), and the window's scrolling camera (it shows
 the whole background). The increment-by-increment plan is in `IMPLEMENTATION-PLAN.md`.
 
 ## Workspace
@@ -365,9 +366,12 @@ party member runs up, swings, and hops back (attack), gathers a spell with its c
 colour of the spell's element: fire, ice, bolt, cure), holds its guard, flinches when it is hit and
 falls when it is beaten, and rejoices when the battle is won; an enemy runs up and plays the clip
 `scene.bin` names for the attack it uses, flinches with its hurt clip and, when beaten, fades away.
-The presentation is only that: **nothing waits on an animation.** The bars, the menu and the
+The presentation is only that: **nothing waits on an animation.** The gauges, the menu and the
 command that is applied follow the battle at once; the numbers float up when the blow lands (never
-more than 0.6 s after the server said it), the clips are sped up (or their start skipped) so that
+more than 0.6 s after the server said it) and **so do the HP and MP in the party panel, the HP of the enemies' bars and
+tokens and the names of the fallen** (each value changes at the instant of the performance that changes it, so a counter's
+damage is on the panel when the counter lands, not when the message that carried it arrived; statuses and the gauges
+still follow the engine at once), and so does the blow's sound (see "Sound"); the clips are sped up (or their start skipped) so that
 the blow's impact frame lands then, and a beaten enemy leaves the enemy list as it starts to fade.
 An actor without real clips moves procedurally (a lunge, a blink, a collapse). A gold ring under a
 character means it can act, a white ring marks yours. The
@@ -1013,7 +1017,7 @@ fine: the game runs without sound and says so in one line (see "Sound").
 
 ## Sound
 
-The window plays your own FF7's music and menu sounds, read from the same library as the game's data (the
+The window plays your own FF7's music, menu sounds and the sounds of a battle's blows, read from the same library as the game's data (the
 importer takes the music and sound files along with the rest, see above). The client never receives audio
 from a server and keeps none anywhere but the library.
 
@@ -1026,6 +1030,20 @@ from a server and keeps none anywhere but the library.
   back to the field's music. The next fight's music and the fanfare are decoded in the background as soon as
   you enter a field, so that a fight does not wait for them.
 - **Menus.** The battle menu and the character menu click, confirm, cancel and buzz with the game's own sounds.
+- **A battle's sounds.** Each blow plays the sound your own game data names for it, **at the moment it lands** (the
+  instant its number floats up over the target, not when the server's message arrived): a party member's attack plays
+  its weapon's hit sound, critical-hit sound or miss sound (read from the weapon record of your `kernel.bin`), and an
+  enemy's attack plays the impact sound of its attack record in your `scene.bin`; a counter is heard after the blow that
+  provoked it, and the killing blow of a fight is heard even though the fight is already over. The sound ids are the
+  game's own (1-based, entry `id - 1` of `audio.fmt`: `crates/fmv-ff7/src/sound.rs`, "Battle sound ids", has the evidence,
+  27 of 27 checked ids name the clips the community calls by those roles). **What the data does not name is silent,
+  not guessed:** a spell's effect makes its own sound in code that is not in your files (every spell's attack record says
+  "no sound"), an item has no sound field, the limit breaks have no attack record, and Cait Sith and Vincent fight unarmed in
+  this engine. The clips a fight can need (its party's weapons and its scene's attacks) are read from `audio.dat` when
+  the fight starts, off the game's thread, and nothing else of the 70 MB file. They share the master volume, **M** and
+  `--mute`/`FMV_AUDIO` with the rest. **`FMV_BATTLE_SOUNDS`** picks which are played: `off` none, `data` (the default)
+  what the data names, `all` also an enemy's death and an escape, which only a hand-made list of the sound bank names (by
+  ear, and nothing says when the game plays them: a boss has a death clip of its own).
 - **Keys and flags.** In the game **M** mutes and unmutes (the music keeps moving while muted); **-** and **=**
   change the volume (the character menu has no sound keys: its name field would take them as letters). `--mute` or `FMV_AUDIO=off` builds no sound at all (no device is opened, nothing is decoded);
   `FMV_AUDIO=null` runs the whole soundtrack against a clock with no device; `FMV_AUDIO=auto`, the default of
@@ -1045,8 +1063,11 @@ from a server and keeps none anywhere but the library.
 
 The log is the evidence of a headless run, which has no ears: `audio: field md1stin: music ob, battle bat (the
 standard theme), after the fight ob` when the area's script has been read, `audio: decoded bat: 167 s of music
-in 842 ms` as each track finishes, `audio: playing bat (battle)` at the moment a track really starts, and a
-closing `headless: audio: sound Null, tracks started: ob > bat > fanfare > ob`.
+in 842 ms` as each track finishes, `audio: playing bat (battle)` at the moment a track really starts, `audio: battle
+sounds: 6 loaded in 4 ms` when a fight's clips were read, `audio: battle sound 18 (hit)` (or `critical`, `miss`, `impact`)
+at the moment each blow's sound plays, a closing `headless: audio: sound Null, tracks started: ob > bat > fanfare > ob`,
+and, when the run ends, `audio: battle sounds played: 87 (16x38 18x13 46x3 227x33)` (each sound id and how many times it
+played).
 
 ## Packaging and smoke test
 

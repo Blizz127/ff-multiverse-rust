@@ -24,16 +24,20 @@
 //! the other (a counter after the blow that provoked it), and the banner names the one that is being played, the
 //! last one begun winning.
 //!
-//! # Numbers and the enemy list follow the blow
+//! # Numbers, HP and the enemy list follow the blow; so do the sounds
 //!
 //! The battle's state moves when a message arrives (bars, the menu, the command that is applied), but
 //! the SHOW lags a little by design, by [`cue::MAX_IMPACT_DELAY`] at the most for the first blow of a batch
 //! (and for a counter, or any later action of it, until the one before has played, see [`cue`]): a number floats up
-//! when its blow lands ([`Popups`], scheduled with [`cue::Cue::delay_of`]), and an enemy that was beaten
-//! stays in the enemy list until its collapse begins on screen ([`BattleHud::decorate`] and
-//! [`BattleHud::linger_view`] keep it, at the most [`cue::MAX_BATCH_SPAN`] after the batch arrived).
-//! Everything else (gauges, HP, MP, the banner, the menu) follows the state at once. The scene plays
-//! its clips so that the impact frame lands at the same instants: see [`cue`].
+//! when its blow lands ([`Popups`], scheduled with [`cue::Cue::delay_of`]), the HP and MP of the panels and the names of
+//! the fallen change at that same instant ([`Lag`]: the view is the engine's numbers minus the changes that have not
+//! landed), and an enemy that was beaten stays in the enemy list until its collapse begins on screen
+//! ([`BattleHud::decorate`] and [`BattleHud::linger_view`] keep it, at the most [`cue::MAX_BATCH_SPAN`] after the batch
+//! arrived). The sounds of the performances ([`Sounds`]: a weapon's hit, critical hit and miss, an enemy attack's
+//! impact) are scheduled at the very same instants, and [`BattleHud::sounds_due`] hands the audio the ones that came due.
+//! The menu reads the engine's own numbers (it is made before the lag is applied), and everything else (gauges, the
+//! banner) follows the state at once. The scene plays its clips so that the impact frame lands at the same instants: see
+//! [`cue`].
 //!
 //! # The linger
 //!
@@ -44,11 +48,13 @@
 //! battle): the blow's number is seen before the panel comes. A key press closes it (after a moment, so a key
 //! still held from the battle does not skip it) and so does time ([`LINGER_S`]).
 
+use super::lag::{Lag, Vitals};
 use super::menu::{BattleMenu, BattleMenuModel, Ctx, Fighter, MenuKey, Reply};
 use super::names::{item_name, limit_name, spell_name, NameBook};
 use super::panels::{Banner, Finale, RewardLine, BANNER_S, PANEL_DELAY_MS};
 use super::popups::Popups;
 use super::scene::cue;
+use super::sounds::{BattleSound, Palette, Planned, Sounds};
 use super::view::{Bar, BattleView};
 use fmv_ff7_battle::rules::{ActionRef, ActorId, BattleEvent, Outcome};
 use std::sync::Arc;
@@ -89,6 +95,13 @@ pub struct BattleHud {
     /// When the last performance of everything that arrived begins on screen (the clock of [`BattleHud::on_events`] plus
     /// [`cue::Cue::start`]): the battle's end counts from here when it comes later than the message that ended it.
     last_start: f64,
+    /// The HP, MP and standing that have not landed yet (see [`Lag`]). Not cleared by the end of the battle: the last
+    /// blow lands after the message that ended it.
+    lag: Lag,
+    /// What this battle sounds like (its party's weapons, its formation's attacks) and the sounds waiting for their
+    /// moment. Also kept past the end of the battle, for the same reason.
+    palette: Palette,
+    sounds: Sounds,
 }
 
 /// The party members and enemies of `bars` as the menu sees them.
@@ -119,9 +132,29 @@ impl BattleHud {
         self.banners.clear();
         self.ended = None;
         self.dying.clear();
+        self.lag.clear();
+        self.sounds.clear();
+        self.palette = Palette::default();
         self.last_start = f64::NEG_INFINITY;
         self.my_actor = my_actor;
         self.formation = formation;
+    }
+
+    /// What the battle that just began sounds like (see [`Palette::new`]).
+    pub fn set_palette(&mut self, palette: Palette) {
+        self.palette = palette;
+    }
+
+    /// The sounds this battle can need, to have them read before they are due (`spells`: the kernel attack indexes of the
+    /// spells in reach).
+    pub fn sound_plan(&self, spells: &[u16]) -> Vec<Planned> {
+        self.palette.plan(spells)
+    }
+
+    /// The sounds of this battle that are due in `from <= at < to` (seconds on the client's clock), with the time each was due.
+    /// Asking for consecutive windows gives each once; it answers also after the battle has ended.
+    pub fn sounds_due(&self, from: f64, to: f64) -> Vec<(f64, BattleSound)> {
+        self.sounds.due(from, to)
     }
 
     /// The names this machine knows (spells, items, enemy attacks).
@@ -174,6 +207,7 @@ impl BattleHud {
     /// own character being applied.
     pub fn on_events(&mut self, now: f64, events: &[BattleEvent], my_command: bool) {
         self.popups.on_events(now, events);
+        self.sounds.on_events(now, events, &self.palette);
         self.dying.retain(|(_, due)| *due > now);
         for cue in cue::cues(events) {
             // Each performance has its banner when it begins (one after the other: a counter's name does not hide the
@@ -207,6 +241,12 @@ impl BattleHud {
         }
     }
 
+    /// The batch whose events [`BattleHud::on_events`] was told of arrived at `now`, and the engine applied it: `before` and
+    /// `after` are everybody's numbers around that (see [`Lag::on_batch`]), so that the panels show them when the blows land.
+    pub fn on_vitals(&mut self, now: f64, events: &[BattleEvent], before: &[(ActorId, Vitals)], after: &[(ActorId, Vitals)]) {
+        self.lag.on_batch(now, events, before, after);
+    }
+
     /// Dress `view`, the state of a battle that runs, with the live parts of the UI at `now`.
     pub fn decorate(&self, view: &mut BattleView, now: f64) {
         view.popups = self.popups.views(now);
@@ -225,8 +265,10 @@ impl BattleHud {
             let (allies, enemies) = (fighters(&view.party), fighters(&view.enemies));
             view.menu = Some(self.menu.view(&Ctx { model: &self.model, allies: &allies, enemies: &enemies, mp }));
         }
-        // After the menu has taken its targets from the state: the list alone lingers on a corpse.
+        // After the menu has taken its targets and its MP from the state: the list alone lingers on a corpse, and the
+        // panels show the numbers of the blows that have landed.
         self.hold_dying(view, now);
+        self.lag.apply(view, now);
     }
 
     /// Keep the enemies whose death has not begun on screen yet in the view's list (`alive` is what
@@ -272,6 +314,7 @@ impl BattleHud {
         view.menu = None;
         view.banner = None;
         self.hold_dying(&mut view, now);
+        self.lag.apply(&mut view, now);
         view.finale = Some(Finale {
             outcome: ended.outcome,
             reward: ended.reward.clone(),
@@ -302,9 +345,11 @@ mod tests {
     use super::*;
     use crate::battle::menu::{Choice, Level, MenuItem, MenuSpell, TargetRule};
     use crate::battle::popups::PopupKind;
+    use crate::battle::sounds::{SoundBook, Why};
     use crate::battle::view::Status;
+    use fmv_core::{AccountId, EntityId};
     use fmv_ff7_battle::rules::Target;
-    use fmv_protocol::BattleId;
+    use fmv_protocol::{BattleId, BattleMember};
 
     fn bar(actor: u8, mine: bool, ready: bool, alive: bool) -> Bar {
         Bar { actor: ActorId(actor), name: format!("F{actor}"), hp: if alive { 10 } else { 0 }, max_hp: 10, mp: 12, max_mp: 20, ready, alive, mine, ..Bar::default() }
@@ -455,15 +500,24 @@ mod tests {
         assert_eq!(listed(&hud, 10.0), [2]);
     }
 
+    /// Everybody's numbers for [`view`]'s four fighters (party 0 and 1, enemies 2 and 3): `hp` each, out of 10.
+    fn everyone(hp: [u32; 4]) -> Vec<(ActorId, Vitals)> {
+        hp.iter().enumerate().map(|(i, hp)| (ActorId(i as u8), Vitals { hp: *hp, max_hp: 10, mp: 12, max_mp: 20, alive: *hp > 0 })).collect()
+    }
+
     #[test]
-    fn holding_a_beaten_enemy_in_the_list_does_not_make_it_a_target_and_never_holds_the_party() {
+    fn holding_a_beaten_enemy_in_the_list_does_not_make_it_a_target_and_a_fallen_party_member_stands_on_the_panel_until_its_blow_lands() {
         let mut hud = hud();
-        hud.on_events(10.0, &[action(1, ActionRef::Attack), BattleEvent::Death { actor: ActorId(3) }, BattleEvent::Death { actor: ActorId(0) }], false);
+        let batch = [action(1, ActionRef::Attack), BattleEvent::Death { actor: ActorId(3) }, BattleEvent::Death { actor: ActorId(0) }];
+        hud.on_events(10.0, &batch, false);
+        // The engine's numbers around the batch (what the client takes from the replay): the enemy and party member 0 fall.
+        hud.on_vitals(10.0, &batch, &everyone([10, 10, 10, 10]), &everyone([0, 10, 10, 0]));
         // Our turn: Attack, then the target selection.
         let ready = {
             let mut v = view_with_dead_enemy();
             v.party[1].ready = true;
             v.party[0].alive = false;
+            v.party[0].hp = 0;
             v
         };
         hud.press(MenuKey::Confirm, &ready);
@@ -472,7 +526,123 @@ mod tests {
         let aim = dressed.menu.expect("our menu").aim.expect("the pointer");
         assert_eq!(aim.one(), Some(ActorId(2)), "the pointer is on the living enemy, not on the one still listed");
         assert!(dressed.enemies[1].alive, "though the list still shows it");
-        assert!(!dressed.party[0].alive, "a fallen party member is shown fallen at once: the panel is the state");
+        // The party's panel is the engine's state only once the blow that felled the member has landed and its collapse has begun:
+        // until then the name is not dead (the menu above was made from the engine's state, which is why it knows better).
+        assert!(dressed.party[0].alive, "a fallen party member's name is not dead before its collapse begins");
+        let collapse = 10.0 + cue::impact_delay(Some(ActionRef::Attack)) + cue::DEATH_BEAT;
+        let mut later = ready.clone();
+        hud.decorate(&mut later, collapse - 0.01);
+        assert!(later.party[0].alive && later.enemies[1].alive);
+        let mut later = ready.clone();
+        hud.decorate(&mut later, collapse + 0.01);
+        assert!(!later.party[0].alive && !later.enemies[1].alive, "both are down when the collapse begins");
+        // With no vitals told (a client with no replay has no numbers to hold back) the panel is the state, at once.
+        let mut bare = self::hud();
+        bare.on_events(10.0, &batch, false);
+        let mut at_once = ready.clone();
+        bare.decorate(&mut at_once, 10.1);
+        assert!(!at_once.party[0].alive, "without the numbers of a replay there is nothing to wait for");
+    }
+
+    #[test]
+    fn the_panels_hold_hp_back_until_the_blow_lands_and_the_menu_is_made_from_the_engines_numbers() {
+        // Our character (actor 1, ready) drank an Ether in the batch that just arrived: 4 MP became 12 when the item lands. A
+        // spell of 8 MP is castable on the engine's 12, and the panel still says 4.
+        let mut hud = hud();
+        hud.model_mut().spells = vec![MenuSpell::new(5, "Fire", 8, TargetRule::Enemies)];
+        let batch = [action(1, ActionRef::Item(3)), BattleEvent::MpRestored { actor: ActorId(1), target: ActorId(1), amount: 8 }];
+        hud.on_events(10.0, &batch, true);
+        let mut before = everyone([10, 10, 10, 10]);
+        before[1].1.mp = 4;
+        hud.on_vitals(10.0, &batch, &before, &everyone([10, 10, 10, 10]));
+        let lands = 10.0 + cue::impact_delay(Some(ActionRef::Item(3)));
+        let ours = view(true);
+        hud.press(MenuKey::Down, &ours);
+        hud.press(MenuKey::Confirm, &ours);
+        let mut dressed = ours.clone();
+        hud.decorate(&mut dressed, lands - 0.1);
+        assert_eq!(dressed.party[1].mp, 4, "the panel waits for the Ether to land");
+        let rows = dressed.menu.expect("our menu").list.expect("the Magic list").rows;
+        assert!(rows[0].enabled, "Fire (8 MP) is castable: the menu is made from the engine's 12 MP, not the panel's 4");
+        let mut landed = ours.clone();
+        hud.decorate(&mut landed, lands + 0.01);
+        assert_eq!(landed.party[1].mp, 12);
+        // Nobody else's numbers moved.
+        assert_eq!((dressed.party[0].hp, dressed.enemies[0].hp, dressed.party[0].mp), (10, 10, 12));
+    }
+
+    #[test]
+    fn a_counters_damage_is_on_the_panel_when_the_counter_lands_and_the_end_of_the_battle_does_not_cut_it_short() {
+        use crate::battle::scene::cue::{impact_delay, length_of};
+        let mut hud = hud();
+        // A blow on enemy 2 and the counter that answers it, which beats party member 0: the battle ends in one batch.
+        let hit = |actor: u8, target: u8, amount: u32| BattleEvent::Damage { actor: ActorId(actor), target: ActorId(target), amount, critical: false };
+        let batch = [action(1, ActionRef::Attack), hit(1, 2, 4), action(2, ActionRef::EnemyAttack(272)), hit(2, 0, 10), BattleEvent::Death { actor: ActorId(0) }, BattleEvent::Defeat];
+        hud.on_events(20.0, &batch, true);
+        let after = everyone([0, 0, 6, 10]);
+        hud.on_vitals(20.0, &batch, &everyone([10, 0, 10, 10]), &after);
+        let mut last = view(false);
+        last.party[0].hp = 0;
+        last.party[0].alive = false;
+        last.party[1].hp = 0;
+        last.party[1].alive = false;
+        last.enemies[0].hp = 6;
+        hud.finish(20.0, last, Outcome::Defeat, None);
+        let counter = 20.0 + length_of(Some(ActionRef::Attack)) + impact_delay(Some(ActionRef::EnemyAttack(272)));
+        // The message that ended the battle has long been handled; the panel behind the end panel still has the numbers of
+        // the blow, and Cloud's HP only goes when the counter lands.
+        let seen = |at: f64| hud.linger_view(at).expect("lingering");
+        assert_eq!(seen(20.6).enemies[0].hp, 6, "the blow has landed");
+        assert_eq!((seen(20.6).party[0].hp, seen(20.6).party[0].alive), (10, true), "the counter has not");
+        assert_eq!((seen(counter + 0.01).party[0].hp, seen(counter + 0.01).party[0].alive), (0, true), "its number is up and the name has not gone dead");
+        assert_eq!((seen(counter + 0.4).party[0].hp, seen(counter + 0.4).party[0].alive), (0, false));
+    }
+
+    #[test]
+    fn a_new_battle_forgets_what_had_not_landed() {
+        let mut hud = hud();
+        let batch = [action(1, ActionRef::Attack), BattleEvent::Damage { actor: ActorId(1), target: ActorId(2), amount: 4, critical: false }];
+        hud.on_events(10.0, &batch, false);
+        hud.on_vitals(10.0, &batch, &everyone([10, 10, 10, 10]), &everyone([10, 10, 6, 10]));
+        let mut v = view(false);
+        v.enemies[0].hp = 6;
+        hud.decorate(&mut v, 10.1);
+        assert_eq!(v.enemies[0].hp, 10, "held back");
+        hud.begin(2, Some(ActorId(1)));
+        let mut v = view(false);
+        v.enemies[0].hp = 6;
+        hud.decorate(&mut v, 10.1);
+        assert_eq!(v.enemies[0].hp, 6, "a new battle has nothing in flight");
+    }
+
+    /// The party of two players (characters 0 and 3) on a machine whose book knows invented weapons and one attack of scene 75.
+    fn sounding_hud() -> BattleHud {
+        let book = SoundBook::for_tests().with_weapon(0, 18, 27, 5).with_starting_weapon(0, 0).with_starting_weapon(3, 0).with_scene_attack(75, 272, 15);
+        let party = [BattleMember::player(EntityId(1), AccountId(1), "A", 0, 6, 0), BattleMember::player(EntityId(2), AccountId(2), "B", 3, 6, 0)];
+        let mut hud = BattleHud::new(None);
+        hud.begin(301, Some(ActorId(1)));
+        hud.set_palette(crate::battle::sounds::Palette::new(Some(std::sync::Arc::new(book)), 301, &party));
+        hud
+    }
+
+    #[test]
+    fn the_sounds_of_a_batch_are_due_when_its_blows_land_and_stay_due_after_the_battle_ends() {
+        let mut hud = sounding_hud();
+        let batch = [action(0, ActionRef::Attack), BattleEvent::Damage { actor: ActorId(0), target: ActorId(2), amount: 4, critical: true }];
+        hud.on_events(10.0, &batch, false);
+        let lands = 10.0 + cue::impact_delay(Some(ActionRef::Attack));
+        assert!(hud.sounds_due(0.0, lands - 0.001).is_empty(), "not when the batch arrives");
+        let due = hud.sounds_due(lands - 0.001, lands + 0.001);
+        assert_eq!(due.iter().map(|(_, s)| (s.id, s.why)).collect::<Vec<_>>(), [(27, Why::Critical)]);
+        // The battle ends with that very batch: the sound is still there for the audio to ask for.
+        hud.finish(10.0, view(false), Outcome::Victory, None);
+        assert_eq!(hud.sounds_due(lands - 0.001, lands + 0.001).len(), 1);
+        // The plan the battle can need: the weapon (5, 18, 27), the scene's impact (15) and the two by ear.
+        let plan: Vec<(u16, bool)> = hud.sound_plan(&[]).iter().map(|p| (p.id, p.by_ear)).collect();
+        assert_eq!(plan, [(5, false), (15, false), (18, false), (27, false), (26, true), (22, true)]);
+        // A new battle has none of it.
+        hud.begin(1, None);
+        assert!(hud.sounds_due(0.0, 100.0).is_empty() && hud.sound_plan(&[]).is_empty());
     }
 
     #[test]

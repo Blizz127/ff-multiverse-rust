@@ -131,6 +131,105 @@
 //! 198, 209, 475, 487, 523, 574, 579, 617, 730 and 743): that disagreement set is what the field-script
 //! check above can tell apart.
 //!
+//! # Battle sound ids
+//!
+//! The battle names its sounds in the data files, and **in the same id space as the field and the menus: 1-based,
+//! entry `id - 1`, with 0 and 0xFFFF meaning "no sound"**. Where the ids are:
+//!
+//! * the weapon records of `kernel.bin` (section 5, 44 bytes): the sound bytes at `0x24` (a hit), `0x25` (a critical hit)
+//!   and `0x26` (a miss) and, at `0x0B`, a mask whose bits 0, 1 and 2 add `0x100` to the three of them (a byte only reaches
+//!   255 and the bank has 750 entries); read by `fmv_ff7_battle::kernel::Kernel::weapon_sounds`, which says which mask was
+//!   found on the owner's copy. Source: the "Weapon data" pages of the flat wiki
+//!   <https://ff7-mods.github.io/ff7-flat-wiki/FF7/Weapon_data.html> and of the FFRTT wiki
+//!   <https://wiki.ffrtt.ru/index.php/FF7/Weapon_data> (the same table; neither says which bit is for which sound: that
+//!   is derived below);
+//! * the attack records (28 bytes, `kernel.bin` section 1 and the 32 of each scene of `scene.bin`): "Impact Sound", a `u16`
+//!   at `0x06`, <https://ff7-mods.github.io/ff7-flat-wiki/FF7/Attack_data.html>. The battle's animation scripts play it
+//!   with the opcodes that "play sound effect, queue reaction, and display damage" (`F7`, `BE`; the page of the flat wiki
+//!   <https://ff7-mods.github.io/ff7-flat-wiki/FF7/Battle/Battle_Animation/Animation_Script.html> does not say which sound).
+//!
+//! What was measured on the owner's FF7 Steam Edition (en), 2026-11-09 (ids, counts and lengths only):
+//!
+//! * **The attack records.** 124 of the kernel's 128 records and 1295 of the 2272 attacks of the 256 scenes have 0xFFFF; no
+//!   record has 0. Every spell has 0xFFFF: its sound is made by its effect, and "all effects are hardcoded" (the same
+//!   animation-script page, opcode `EC`), not named by any file the library holds. The four kernel records with a sound are
+//!   112, 114, 116 and 118 (the physical moves of Vincent's forms). The scenes use 20 different impact ids, 5 to 424,
+//!   and none of the 20 is an empty slot or a looping clip. The limit breaks (ids 128 and up) have no attack record and an
+//!   item record has no sound field at all.
+//! * **The weapon records.** The mask is `0xF8` (no bit) for Cloud, Red XIII, Aerith and most of Barret's weapons, `0xFB`
+//!   (bits 0 and 1) for Tifa, Cid, Yuffie, Cait Sith, Sephiroth and the rest of Barret's, `0xF9` (bit 0) for Vincent; bit 2
+//!   is never set, so a miss is never a high id. Every swing shares the miss sound 5 and the guns (Barret's, Vincent's) the
+//!   miss sound 47.
+//!
+//! **Why the ids are 1-based in battle too.** Four independent pieces of evidence:
+//!
+//! 1. *FFNx has one id space for every mode.* Pinned to commit `4fc392ba5e1bfdd53d39aa6542464379a446083a`:
+//!    [`src/sfx.cpp`](https://github.com/julianxhokaxhiu/FFNx/blob/4fc392ba5e1bfdd53d39aa6542464379a446083a/src/sfx.cpp)
+//!    `ff7_sfx_play_layered` (lines 274 to 329) takes ONE `id` in the field, the menus, the world map and battles, and in
+//!    `MODE_BATTLE` (lines 293 to 301) names the replacement files `battle_char_%02X_%d` and `battle_enemy_%04X_%d` with that
+//!    same id; the loop flag of the played id is `sfx_fmt_header[id - 1]` (`ff7_should_sfx_loop`, lines 129 to 132) and
+//!    `sfx_load_original` rejects ids outside `1..=750` (lines 73 to 78). The battle code's own hooks give ids in that range
+//!    to the same functions: `sfx_fix_omnislash_sound_loading` loads 0x188 and 0x285 (lines 774 to 781) and
+//!    `sfx_fix_cait_sith_roulette` plays an id on channel 4 (lines 783 to 786).
+//! 2. *The weapon byte and the animation's id are one number.*
+//!    [`src/ff7/battle/animations.cpp`](https://github.com/julianxhokaxhiu/FFNx/blob/4fc392ba5e1bfdd53d39aa6542464379a446083a/src/ff7/battle/animations.cpp)
+//!    `battle_play_sfx_delayed_427737` (lines 673 to 697) plays a sound id out of an animation script and carries
+//!    `cloud_sfx_attack_id = 18` with the note "disable bugged battle SFX when Cid is attacking, but SFX ID is cloud's
+//!    one": Cloud's attack animation names sound 18, and 18 is the hit byte of all sixteen of Cloud's weapon records.
+//! 3. *The clips the ids name are the ones the community calls by those roles.* The Qhimm forum's hand-made list of the
+//!    sound bank, <https://forums.qhimm.com/index.php?topic=15786.0> (a post by White Wind, 2014; "from memory", with
+//!    "probably mistakes", see above), numbers the files from 0 **counting only the 724 clips, not the 26 empty slots**: a
+//!    list number is the entry minus the empty slots before it, so the two agree up to entry 197 and the list is 2 below the
+//!    entry from 210 to 474 (the slots 198 and 209 are empty). Read like that, **27 of the 27 ids the data names for
+//!    something with a name in the list are the list's clip for it** (entry = `id - 1`; the same ids read as entry = `id`
+//!    would each be one clip away, a miss on "Cure Spell / Potion", Cloud's sword hit on a clip nobody named):
+//!
+//!    | what names the id | id | entry | list no. | the list's name for that clip |
+//!    |---|---|---|---|---|
+//!    | every swing's miss | 5 | 4 | 4 | missed hit |
+//!    | Cloud's hit, critical (0xF8) | 18, 27 | 17, 26 | 17, 26 | Cloud's sword hit, critical sword hit |
+//!    | Barret's gun: hit, critical, miss | 16, 46, 47 | 15, 45, 46 | 15, 45, 46 | chain gun, critical gun hit, missed gun hit |
+//!    | Aerith's staff: hit, critical | 50, 23 | 49, 22 | 49, 22 | staff hit, critical staff hit |
+//!    | Red XIII's hit | 109 | 108 | 108 | Red XIII hit |
+//!    | Tifa: hit 36, critical 94, each + 0x100 | 292, 350 | 291, 349 | 289, 347 | Tifa hit, Tifa critical hit |
+//!    | Yuffie: hit 89 + 0x100 | 345 | 344 | 342 | Yuffie shuriken slicing |
+//!    | Vincent: hit 18 + 0x100, critical 123 | 274, 123 | 273, 122 | 271, 122 | two gun hits (see below) |
+//!    | enemy `Machine Gun` and other guns | 15 | 14 | 14 | gun hit |
+//!    | enemy `Bite`, `Fang` | 25 | 24 | 24 | enemy biting-type attack |
+//!    | enemy `Hit`, `Combo` | 28 | 27 | 27 | punch |
+//!    | enemy `Bodyblow`, `Punch`, `Bird Kick` | 35 | 34 | 34 | enemy punch-type attack |
+//!    | enemy `Hand Grenade`, `Normal Shell` | 20 | 19 | 19 | grenade explosion |
+//!    | enemy `Slap` | 118 | 117 | 117 | slapping |
+//!    | enemy `Electro-mag Rod` | 144 | 143 | 143 | electricity |
+//!    | enemy `Tentacle`, `Whip` | 221 | 220 | 218 | enemy tentacle hit |
+//!    | enemy `Claw`, `Sickle` | 226 | 225 | 223 | enemy claw-type attack |
+//!    | enemy `Beak` | 227 | 226 | 224 | enemy horn-type attack |
+//!    | enemy `Needle`, `Blood Suck` | 228 | 227 | 225 | enemy sting-type attack |
+//!    | enemy `Rage Bomber` | 250 | 249 | 247 | big bomber attack |
+//!    | enemy `Short Staff`, `Flutilizer` | 348 | 347 | 345 | rod hit |
+//!
+//!    This also settles the mask: Tifa's, Yuffie's and Vincent's high ids land exactly on the clips the list names for them
+//!    (in those rows the list's number is two below the entry, because of the two empty slots before them), so **bit 0 is
+//!    the hit and bit 1 the critical hit**; and Vincent's hit id (274) is the id an enemy's `Shotgun` attack names as its impact
+//!    sound in `scene.bin`. The one place the list and the data disagree is Vincent: the list calls its number 122 "Vincent
+//!    gun hit" and 271 "Vincent critical gun hit", the record has the critical byte 123 (entry 122) and the hit byte 18
+//!    (entry 273, list number 271). The client follows the record, which is the data (and 274 is a plain impact for the
+//!    enemy that uses it); the list is from memory.
+//! 4. *The lengths fit.* The critical clip is longer than the hit clip for ten of the twelve distinct weapon sets (Cloud's
+//!    921 ms against 475 ms; Vincent's 976 ms against 857 ms, which is also a small point for following his record rather
+//!    than the list's labels; the exceptions are Barret's guns, a burst against a single shot, and Cid's). Every miss is a
+//!    short swish (307 ms) and the guns' miss a little longer (389 ms). Explosions (a grenade 902 ms, a bomber 1489 ms) are
+//!    longer than a punch (432 ms), a bite (499 ms) or a whip (274 ms).
+//!
+//! **Confidence.** Very high that a weapon's three bytes and an attack's impact id are entries `id - 1` of this bank, and
+//! that bit 0 of the mask is the hit and bit 1 the critical hit (27 of 27 clips are the named ones). **What the data does
+//! NOT hold, so what is not played from it:** the sound of a spell, an item or a limit break (made by the effect code, not
+//! named in any file the library has), of an enemy's or a boss's death, of a dodge, of a summon. Two sounds the client may
+//! play beyond the data are named only by that list: entry 21 (id 22), "Enemy Death", and entry 25 (id 26), "Escaping from
+//! a Battle" (the list's number for entries below 198 is the entry). They are identifications by ear, not data, and
+//! nothing says when the game plays them (a boss has a clip of its own, "Boss Death"): the client plays them only when asked
+//! (`FMV_BATTLE_SOUNDS=all`).
+//!
 //! # The menu sounds
 //!
 //! The first four entries of the file are the menu's (ids 1 to 4). Documented sources first: FFNx's toml
@@ -202,8 +301,9 @@
 //! * The `count` word and the average byte rate are ignored.
 //! * Clip bytes above [`MAX_CLIP_BYTES`] are refused at decode time (the largest real one is
 //!   3 159 379 bytes).
-//! * Which sound the game plays for which action beyond the four menu sounds is not mapped here, and
-//!   [`MENU_CONFIRM`] being the cursor click is an inference, not a proof (see "The menu sounds").
+//! * Which sound the game plays for which action is not mapped here: the four menu sounds are named below, the battle's
+//!   weapon and attack ids are in the data and documented in "Battle sound ids" (loading one is [`SfxBank::decode_sound_id`]),
+//!   and [`MENU_CONFIRM`] being the cursor click is an inference, not a proof (see "The menu sounds").
 
 use crate::util::{slice_at, u16_at, u32_at, u8_at};
 use std::fs::File;
@@ -278,6 +378,8 @@ pub enum SoundError {
     TooManyEntries,
     #[error("audio.fmt is too large")]
     FmtTooLarge,
+    #[error("sound id 0 is no sound (ids are 1-based)")]
+    NoSoundId,
     #[error("there is no sound-effect entry {0}")]
     NoSuchEntry(usize),
     #[error("sound-effect entry {0} is an empty slot")]
@@ -535,6 +637,19 @@ impl SfxBank {
             bytes: entry.bytes,
             loop_region: entry.loop_region(format, frames),
         })
+    }
+
+    /// What the index says about the sound the game calls `id` (1-based, see "Sound ids"); `None` for id 0, an id past the
+    /// end and an empty slot.
+    pub fn info_for_sound_id(&self, id: u16) -> Option<SfxInfo> {
+        self.info(entry_for_sound_id(id)?)
+    }
+
+    /// Decode the sound the game calls `id` ([`entry_for_sound_id`]) from the `audio.dat` this bank was opened with: what
+    /// the battle's weapon and attack records name (see "Battle sound ids"). Id 0 is [`SoundError::NoSoundId`] and an
+    /// empty slot is [`SoundError::EmptyEntry`], which a caller should treat as "silent".
+    pub fn decode_sound_id(&self, id: u16) -> Result<PcmClip, SoundError> {
+        self.decode(entry_for_sound_id(id).ok_or(SoundError::NoSoundId)?)
     }
 
     /// Decode entry `index` from the `audio.dat` this bank was opened with.
@@ -1592,6 +1707,37 @@ mod tests {
         assert_eq!(entry_for_sound_id(2), Some(1));
         assert_eq!(entry_for_sound_id(750), Some(749));
         assert_eq!(entry_for_sound_id(u16::MAX), Some(usize::from(u16::MAX) - 1));
+    }
+
+    #[test]
+    fn a_sound_is_found_and_decoded_by_its_id_through_the_one_based_entry() {
+        // Ids 1, 2 and 3: a clip, an empty slot and a clip. Each clip is one 7-byte block header, which decodes to the
+        // two frames it stores (sample 2 first, then sample 1).
+        let mut fmt = Rec::adpcm(7, 0).bytes();
+        fmt.extend(empty_slot(7));
+        fmt.extend(Rec::adpcm(7, 7).bytes());
+        let dat: Vec<u8> = [[0u8, 16, 0, 5, 0, 7, 0], [0u8, 16, 0, 9, 0, 11, 0]].concat();
+        let dir = std::env::temp_dir().join(format!("fmv-ff7-sound-by-id-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (fmt_path, dat_path) = (dir.join("audio.fmt"), dir.join("audio.dat"));
+        std::fs::write(&fmt_path, &fmt).unwrap();
+        std::fs::write(&dat_path, &dat).unwrap();
+        let bank = SfxBank::open(&fmt_path, &dat_path).unwrap();
+
+        assert_eq!(bank.info_for_sound_id(1).map(|i| (i.index, i.frames)), Some((0, 2)));
+        assert_eq!(bank.info_for_sound_id(2), None, "id 2 is the empty slot");
+        assert_eq!(bank.info_for_sound_id(3).map(|i| i.index), Some(2));
+        assert_eq!(bank.info_for_sound_id(0), None, "id 0 is no sound");
+        assert_eq!(bank.info_for_sound_id(4), None, "past the end");
+        // Decoding by id is decoding the entry before it: id 1 is the first clip, id 3 the second.
+        assert_eq!(bank.decode_sound_id(1).map(|c| c.samples), Ok(vec![7, 5]));
+        assert_eq!(bank.decode_sound_id(3).map(|c| c.samples), Ok(vec![11, 9]));
+        // The bad ids are told apart.
+        assert_eq!(bank.decode_sound_id(0), Err(SoundError::NoSoundId));
+        assert_eq!(bank.decode_sound_id(2), Err(SoundError::EmptyEntry(1)), "an empty slot is silent, not a failure of the file");
+        assert_eq!(bank.decode_sound_id(4), Err(SoundError::NoSuchEntry(3)));
+        assert!(SoundError::NoSoundId.to_string().contains("1-based"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

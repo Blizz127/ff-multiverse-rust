@@ -1298,3 +1298,75 @@ fn real_cloud_uses_braver_and_the_party_can_run() {
     assert!(running.outcome() == Some(Outcome::Escaped));
     assert!(running.rewards() == Reward::default());
 }
+
+/// The weapons' sound ids (`Kernel::weapon_sounds`) and the impact sounds of the attack records, on the owner's copy.
+/// Plain `assert!`s on ids and counts: a failure names an id, never what the file holds. The clips the ids name are
+/// checked against `audio.fmt` by `fmv-client` (`battle::sounds`), which has the sound bank.
+#[test]
+#[ignore = "needs FMV_FF7_DATA pointing at the owner's FF7 data directory"]
+fn real_weapon_sounds_and_attack_impact_sounds_have_the_ids_the_docs_give() {
+    let Some(path) = kernel_path() else { return };
+    let kernel = Kernel::open(&path).expect("kernel.bin parses");
+    let sounds = |id: u8| kernel.weapon_sounds(id).map(|s| (s.hit, s.critical, s.miss));
+    // The 128 weapons are all there, every id is a real one (the bank has 750 entries; 0 is "no sound") and no miss
+    // is a high id (bit 2 of the mask is never set).
+    let mut ids = std::collections::BTreeSet::new();
+    for id in 0..128u8 {
+        let s = kernel.weapon_sounds(id).expect("a weapon");
+        for sound in [s.hit, s.critical, s.miss] {
+            assert!((1..=750).contains(&sound), "weapon {id} has the sound id {sound}");
+            ids.insert(sound);
+        }
+        assert!(s.miss < 0x100, "weapon {id}: a miss is never a high id");
+    }
+    assert!(kernel.weapon_sounds(128).is_none());
+    eprintln!("weapon sounds: {} distinct ids over 128 weapons", ids.len());
+    // The first weapon of each fighter (the kernel's own order: Cloud 0 to 15, Tifa 16 to 31, Barret 32 to 47, Red XIII 48 to
+    // 61, Aerith 62 to 72, Cid 73 to 86, Yuffie 87 to 100, Cait Sith 101 to 113, Vincent 114 to 126, Sephiroth 127), by the
+    // (hit, critical, miss) ids the module docs derive. Tifa's and Vincent's include the 0x100 of the mask.
+    assert_eq!(sounds(0), Some((18, 27, 5)), "Cloud");
+    assert_eq!(sounds(16), Some((0x100 + 36, 0x100 + 94, 5)), "Tifa");
+    assert_eq!(sounds(32), Some((16, 46, 47)), "Barret's gun");
+    assert_eq!(sounds(48), Some((109, 141, 5)), "Red XIII");
+    assert_eq!(sounds(62), Some((50, 23, 5)), "Aerith");
+    assert_eq!(sounds(87), Some((0x100 + 89, 0x100 + 85, 5)), "Yuffie");
+    assert_eq!(sounds(114), Some((0x100 + 18, 123, 47)), "Vincent");
+    assert_eq!(sounds(127), Some((0x100 + 122, 0x100 + 120, 5)), "Sephiroth");
+    // Two miss sounds in all: the one every swing shares (5) and the one Barret's and Vincent's guns share (47).
+    let misses: std::collections::BTreeSet<u16> = (0..128u8).filter_map(|w| kernel.weapon_sounds(w)).map(|s| s.miss).collect();
+    assert_eq!(misses.into_iter().collect::<Vec<_>>(), [5, 47], "two miss sounds: a swing and a gun");
+
+    // The attack records of the kernel: 128 of them, and an impact sound only where the record has one. Every spell has none
+    // (its sound is made by its effect, which is not in the data), the limit breaks (ids 128 and up) have no record at all.
+    let impacts: Vec<u16> = (0..128).map(|i| kernel.attack(i).expect("a record").impact_sound).collect();
+    let with_sound = impacts.iter().filter(|s| **s != 0xFFFF).count();
+    assert!(impacts.iter().all(|s| *s != 0), "no record has 0 as its impact sound");
+    let which: Vec<usize> = impacts.iter().enumerate().filter(|(_, s)| **s != 0xFFFF).map(|(i, _)| i).collect();
+    assert_eq!(which, [112, 114, 116, 118], "the four records that have an impact sound (the physical moves of Vincent's forms)");
+    assert_eq!(with_sound, 4);
+    for spell in [0, 1, 2, 7, 27, 30, 33] {
+        assert_eq!(impacts[spell], 0xFFFF, "spell {spell} has no impact sound of its own");
+    }
+    assert!(kernel.attack(128).is_none(), "no record for Braver (128)");
+
+    // The scenes: how many of their attack records have an impact sound, and which ids they use (the clips are checked in
+    // `fmv-client`).
+    let Some(scene) = scene_path() else { return };
+    let bin = SceneBin::open(&scene).expect("scene.bin parses");
+    let mut used = std::collections::BTreeSet::new();
+    let (mut attacks, mut silent) = (0usize, 0usize);
+    for scene in bin.scenes() {
+        for attack in &scene.attacks {
+            attacks += 1;
+            match attack.record.impact_sound {
+                0xFFFF => silent += 1,
+                sound => {
+                    assert!((1..=750).contains(&sound), "attack {} of scene {} has the impact sound {sound}", attack.id, scene.index);
+                    used.insert(sound);
+                }
+            }
+        }
+    }
+    eprintln!("scene attacks: {attacks}, without an impact sound {silent}, {} distinct impact ids", used.len());
+    assert!(attacks > 2000 && silent > 0 && silent < attacks && used.len() == 20);
+}

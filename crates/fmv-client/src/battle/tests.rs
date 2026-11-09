@@ -561,3 +561,44 @@ fn commands_become_the_messages_the_protocol_defines() {
     assert_eq!(BattleCmd::RequestEncounter { formation: Some(7) }.to_msg(), ClientMsg::RequestEncounter { formation_id: Some(7) });
     assert_eq!(BattleCmd::RequestEncounter { formation: None }.to_msg(), ClientMsg::RequestEncounter { formation_id: None });
 }
+
+/// The panels' HP follows the LANDING of a blow and not the arrival of the message that carried it (see `lag`), over a whole battle of
+/// the simulated server: whenever a batch hurt somebody of the party, the view shows more HP than the replayed engine has (the blow has
+/// not landed yet), and once everything of the batch has landed (`MAX_BATCH_SPAN` later) it shows exactly the engine's, to the digit.
+#[test]
+fn the_panels_hp_changes_when_the_blow_lands_and_not_when_the_message_arrives() {
+    use scene::cue::MAX_BATCH_SPAN;
+    let mut sim = Sim::new(1, &[ME, PEER]);
+    let mut c = client(true);
+    c.on_message(0.0, sim.start());
+    let (mut t, mut hurt, mut held) = (0.0, 0usize, 0usize);
+    for _ in 0..100_000 {
+        if sim.state.outcome().is_some() {
+            break;
+        }
+        t += 0.005;
+        let mut batch: Vec<ServerMsg> = sim.step(5).into_iter().collect();
+        for id in sim.state.ready_actors() {
+            batch.extend(sim.attack(id));
+        }
+        for msg in batch {
+            let party_hurt = matches!(&msg, ServerMsg::BattleEvent { events, .. } if events.iter().any(|e| matches!(e, BattleEvent::Damage { target, .. } if target.0 < 2)));
+            c.on_message(t, msg);
+            let Some(state) = c.engine() else { continue };
+            let (arrival, settled) = (c.view(t).expect("a view"), c.view(t + MAX_BATCH_SPAN + 0.5).expect("a view"));
+            // Settled: the panel IS the engine, for everybody.
+            for bar in settled.party.iter().chain(&settled.enemies) {
+                let fighter = state.actor(bar.actor).expect("an actor");
+                assert_eq!((bar.hp, bar.mp, bar.alive), (fighter.hp, fighter.mp, fighter.is_alive()), "actor {} settled", bar.actor.0);
+            }
+            // When a blow on the party arrived, the panel still shows more HP than the engine has for somebody: the blow has not landed.
+            if party_hurt {
+                hurt += 1;
+                held += usize::from(arrival.party.iter().zip(&settled.party).any(|(a, s)| a.hp > s.hp));
+            }
+        }
+    }
+    assert!(sim.state.outcome().is_some(), "the battle was played out");
+    assert!(hurt >= 2, "the simulated enemies hurt the party ({hurt} batches)");
+    assert_eq!(held, hurt, "every blow on the party was on the panel only after it landed ({held} of {hurt} batches)");
+}

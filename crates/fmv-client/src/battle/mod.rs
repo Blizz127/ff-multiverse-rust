@@ -63,8 +63,17 @@
 //!   character is silenced, the 3D scene tints and poses the bodies (`scene::body`), and every status the server
 //!   announces is one `status:` note (`inflicted`/`ended` with the actor and the status) and, with the turns of
 //!   Poison and Regen, one count per battle (`status: battle#N inflicted=A ended=B ticks=C`, before the end note).
+//! * Sounds (`sounds`): each performance plays its sound from the game's own data at the instant it lands (the moment its
+//!   number floats up): a party member's weapon hit, critical hit or miss from the kernel's weapon record, an enemy attack's
+//!   impact from `scene.bin`'s attack record; what the data names no sound for (spells, items, limit breaks) is silent. The
+//!   hud schedules them like the numbers ([`BattleClient::sounds_due`]), the audio asks for the ones that came due and
+//!   reads only the clips this battle can need, when it starts ([`BattleClient::sound_plan`]).
+//! * HP in time (`lag`): the panels show the HP and MP of a fighter and whether it stands when the performance that changes
+//!   them lands (a counter's damage is seen when the counter lands, not when the message that carried it arrived); the
+//!   gauges, the menu and the 3D bodies follow the engine at once, and the lag is gone `MAX_BATCH_SPAN` after a batch.
 //! * [`open_rules`] reads this machine's battle data (the same library set as the field archive);
-//!   [`open_names`] reads the spell, item and enemy attack names the windows show from the same files.
+//!   [`open_names`] reads the spell, item and enemy attack names the windows show from the same files (and the sounds
+//!   the same data names, which travel in the [`NameBook`]).
 //!
 //! While a battle runs the player is frozen in the field: loops neither walk nor send movement.
 //! The mirror advances ONLY with server messages (so it can never run ahead of the server); the
@@ -77,12 +86,14 @@ mod action_tests;
 mod bot;
 mod data;
 mod hud;
+mod lag;
 mod menu;
 mod names;
 mod panels;
 mod popups;
 pub mod scene;
 mod script;
+pub(crate) mod sounds;
 mod tags;
 #[cfg(test)]
 mod glue_tests;
@@ -96,6 +107,7 @@ pub use data::open_rules;
 pub use menu::MenuKey;
 use scene::SceneStart;
 pub use script::ScriptStep;
+pub use sounds::{BattleSound, Planned};
 pub use text::draw_battle_text;
 pub use view::{battle_vertices, Bar, BattleView, Status};
 
@@ -608,6 +620,23 @@ impl BattleClient {
         self.events.drain(..).collect()
     }
 
+    /// The sounds this battle can need, to have them read when it starts: its party's weapons, the impact sounds of its
+    /// scene's attacks and of the spells in reach (see `sounds`); empty without this machine's data.
+    pub fn sound_plan(&self) -> Vec<Planned> {
+        let spells: Vec<u16> = self
+            .engine()
+            .map(|state| state.party_ids().into_iter().filter_map(|id| state.actor(id)).flat_map(|c| c.spells.iter().map(|s| s.index)).collect())
+            .unwrap_or_default();
+        self.hud.sound_plan(&spells)
+    }
+
+    /// The sounds of the battle that came due in `from <= at < to` (seconds on the client's clock, the one [`BattleClient::on_message`]
+    /// is given), with the time each was due: the audio asks for consecutive windows and plays what they hold. Also after the
+    /// battle has ended: the killing blow is heard after the message that ended the battle.
+    pub fn sounds_due(&self, from: f64, to: f64) -> Vec<(f64, BattleSound)> {
+        self.hud.sounds_due(from, to)
+    }
+
     /// The replayed engine of the battle we are in, if this client could build it: who fights,
     /// their names, hit points and gauges. Read-only (it moves only with the server's messages).
     pub fn engine(&self) -> Option<&BattleState> {
@@ -674,6 +703,9 @@ impl BattleClient {
             .and_then(|i| u8::try_from(i).ok())
             .map(ActorId);
         self.hud.begin(setup.formation_id, my_actor);
+        // What this battle sounds like: its party's weapons and its formation's attacks (silent without this machine's book).
+        let book = self.hud.names().and_then(|names| names.sounds()).cloned();
+        self.hud.set_palette(sounds::Palette::new(book, setup.formation_id, &setup.party));
         let mut failure = None;
         let rules = self.rules.clone();
         let replay = match &rules {
@@ -788,7 +820,11 @@ impl BattleClient {
             }
             return;
         };
-        if let Err(d) = replay.apply(tick, events, command.as_ref()) {
+        // Everybody's numbers around the batch: the panels show what it changes when the blows land (see `lag`).
+        let before = lag::vitals_of(replay.state());
+        let applied = replay.apply(tick, events, command.as_ref());
+        self.hud.on_vitals(now, events, &before, &lag::vitals_of(replay.state()));
+        if let Err(d) = applied {
             self.diverged(format!("{battle_id} at tick {tick}: {d}"));
         }
         for line in event_notes {
