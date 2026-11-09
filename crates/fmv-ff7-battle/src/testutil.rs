@@ -547,8 +547,8 @@ pub fn item_section() -> Vec<u8> {
 
 /// Materia: every record starts as a plain independent materia that never levels; then 49 Fire,
 /// 50 Ice, 52 Lightning (three spells each, levels at 2000, 18000 and 35000 AP), 53 Restore (Cure,
-/// Cure2, Regen, Cure3 at 2500, 17000, 25000 and 40000 AP), 73 Master Magic and 36 Steal (a command
-/// materia).
+/// Cure2, Regen, Cure3 at 2500, 17000, 25000 and 40000 AP), 73 Master Magic, 36 Steal (a command
+/// materia) and 23 All (a support materia: once per battle at level 1, up to five times at level 5).
 pub fn materia_section() -> Vec<u8> {
     let mut s = vec![0u8; MATERIA_COUNT * MATERIA_RECORD_SIZE];
     for id in 0..MATERIA_COUNT {
@@ -577,6 +577,13 @@ pub fn materia_section() -> Vec<u8> {
     let o = 36 * MATERIA_RECORD_SIZE;
     s[o + 0x0D] = 0x16;
     s[o + 0x0E..o + 0x14].copy_from_slice(&[5, 17, 0xFF, 0xFF, 0xFF, 0xFF]);
+    // 23 All (a support materia: its attribute bytes 1 to 5 are the uses per battle at levels 1 to 5).
+    let o = 23 * MATERIA_RECORD_SIZE;
+    for (k, v) in [15u16, 60, 180, 350].iter().enumerate() {
+        s[o + k * 2..o + k * 2 + 2].copy_from_slice(&v.to_le_bytes());
+    }
+    s[o + 0x0D] = 0x35;
+    s[o + 0x0E..o + 0x14].copy_from_slice(&[0x51, 1, 2, 3, 4, 5]);
     s
 }
 

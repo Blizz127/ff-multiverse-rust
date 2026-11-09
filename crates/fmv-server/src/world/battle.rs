@@ -124,7 +124,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use fmv_adapter_api::{AreaRuntime, EncounterTable};
 use fmv_core::{AccountId, EntityId};
 use fmv_ff7_battle::rng::Rng;
-use fmv_ff7_battle::rules::{ActorId, BattleState, Command, CommandError, Outcome, MAX_STEP_MS};
+use fmv_ff7_battle::rules::{ActorId, BattleState, Command, CommandError, Outcome, Target, MAX_STEP_MS};
 use fmv_protocol::{
     assign_drops, clip_character_name, reward_roster, split_rewards, AppliedCommand, BattleId, BattleMember, BattleRejection, BattleReward,
     BattleRules, BattleSetup, ServerMsg, MAX_BATTLE_PARTY,
@@ -318,16 +318,28 @@ fn splitmix64(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
-/// A command as one or two `key=value` words of a log line: `attack target=2`, `magic spell=0 target=1`, `limit attack=128
-/// target=2` (`limit_id` is the limit's id when it is known), `defend`.
+/// A command as one or two `key=value` words of a log line: `attack target=2`, `magic spell=0 target=1`, `magic spell=0
+/// target=all-allies`, `limit attack=128 target=2` (`limit_id` is the limit's id when it is known), `defend`.
 fn describe_command(command: &Command, limit_id: Option<u16>) -> String {
     match command {
         Command::Attack { target } => format!("attack target={}", target.0),
-        Command::Magic { spell, target } => format!("magic spell={spell} target={}", target.0),
-        Command::Item { item, target } => format!("item item={item} target={}", target.0),
+        Command::Magic { spell, target } => format!("magic spell={spell} target={}", target_word(*target)),
+        Command::Item { item, target } => format!("item item={item} target={}", target_word(*target)),
         Command::Defend => "defend".to_string(),
-        Command::Limit { target } => format!("limit attack={} target={}", limit_id.map_or_else(|| "?".to_string(), |id| id.to_string()), target.0),
+        Command::Limit { target } => {
+            format!("limit attack={} target={}", limit_id.map_or_else(|| "?".to_string(), |id| id.to_string()), target_word(*target))
+        }
         Command::Escape => "escape".to_string(),
+    }
+}
+
+/// How a target reads in a log line: the actor's number for one actor (the layout the smoke scripts have always
+/// read), `all-enemies` or `all-allies` for a whole side (the sides are the commanding actor's own).
+fn target_word(target: Target) -> String {
+    match target {
+        Target::One(id) => id.0.to_string(),
+        Target::AllEnemies => "all-enemies".to_string(),
+        Target::AllAllies => "all-allies".to_string(),
     }
 }
 
@@ -338,9 +350,15 @@ fn rejection_of(e: CommandError) -> BattleRejection {
         CommandError::UnknownActor(_) | CommandError::NotControllable(_) => BattleRejection::NotYourActor,
         CommandError::ActorDead(_) => BattleRejection::ActorDead,
         CommandError::GaugeNotFull(_) => BattleRejection::GaugeNotFull,
-        CommandError::UnknownTarget(_) | CommandError::InvalidTarget(_) => BattleRejection::InvalidTarget,
+        // A way of aiming the action does not allow (one target or a whole side, protocol v10) and a caster with
+        // no All use left are both "not a valid target": the menu never offers either, so the one word is enough.
+        CommandError::UnknownTarget(_)
+        | CommandError::InvalidTarget(_)
+        | CommandError::InvalidReach(_)
+        | CommandError::NoAllLeft(_) => BattleRejection::InvalidTarget,
         CommandError::TargetDead(_) => BattleRejection::TargetDead,
-        CommandError::TargetNotDead(_) => BattleRejection::TargetNotDead,
+        // A revival of a whole side with nobody fallen: the action only revives the dead.
+        CommandError::TargetNotDead(_) | CommandError::NoTargets(_) => BattleRejection::TargetNotDead,
         CommandError::UnknownSpell(_) => BattleRejection::UnknownSpell,
         CommandError::NotEnoughMp(_) => BattleRejection::NotEnoughMp,
         CommandError::UnknownItem(_) => BattleRejection::UnknownItem,
@@ -608,7 +626,10 @@ impl World {
                 let note = match (command, who) {
                     (Command::Magic { spell, target }, Some((account, character))) => Some(format!(
                         "magic used battle={} actor={} account={} character={character} spell={spell} target={} name={name}",
-                        battle_id.0, actor.0, account.0, target.0
+                        battle_id.0,
+                        actor.0,
+                        account.0,
+                        target_word(target)
                     )),
                     (Command::Defend, Some((account, character))) => Some(format!(
                         "defend used battle={} actor={} account={} character={character} name={name}",
@@ -620,7 +641,7 @@ impl World {
                         actor.0,
                         account.0,
                         limit_id.map_or_else(|| "?".to_string(), |id| id.to_string()),
-                        target.0
+                        target_word(target)
                     )),
                     (Command::Escape, Some((account, character))) => Some(format!(
                         "escape tried battle={} actor={} account={} character={character} result={} difficulty_left={} name={name}",
@@ -1603,18 +1624,18 @@ mod tests {
     fn an_item_is_spent_told_and_saved_only_when_the_engine_accepts_the_command() {
         let t0 = Instant::now();
         let (mut w, mut rx) = world_with_saver(settings(SyntheticRules::default()));
-        // 3 Potions, an Ether, a Phoenix Down, and 5 of an item (6) that the engine cannot use in battle.
-        let mut a = seat_as(&mut w, "A", t0, seeded_with(&[(0, 3), (3, 1), (6, 5), (7, 1)]));
+        // 3 Potions, an Ether, a Phoenix Down, and 5 of an item (8) that the engine cannot use in battle.
+        let mut a = seat_as(&mut w, "A", t0, seeded_with(&[(0, 3), (3, 1), (7, 1), (8, 5)]));
         assert_eq!(w.request_encounter(a.entity, Some(0), t0), BattleReply::Done);
         a.drain();
         let id = BattleId(1);
         let t = until_ready(&mut w, id, ActorId(0), t0);
-        let item = |item, target: u8| Command::Item { item, target: ActorId(target) };
+        let item = |item, target: u8| Command::Item { item, target: Target::One(ActorId(target)) };
         let before = mirror_of(&w, &a);
 
         // What the engine refuses is refused as the engine says, whatever the account owns, and costs nothing.
         for (command, reason) in [
-            (item(6, 0), BattleRejection::UnknownItem),
+            (item(8, 0), BattleRejection::UnknownItem),
             (item(99, 0), BattleRejection::UnknownItem),
             (item(0, 1), BattleRejection::InvalidTarget),
             (item(0, 9), BattleRejection::InvalidTarget),
@@ -1637,7 +1658,7 @@ mod tests {
             .iter()
             .position(|m| matches!(m, ServerMsg::BattleEvent { command: Some(AppliedCommand { command: Command::Item { item: 0, .. }, .. }), .. }))
             .expect("the command is announced");
-        let want = vec![(0, 2), (3, 1), (6, 5), (7, 1)];
+        let want = vec![(0, 2), (3, 1), (7, 1), (8, 5)];
         assert_eq!(msgs[applied + 1], ServerMsg::Inventory { items: want.iter().map(|&(i, c)| InventoryEntry::new(i, c)).collect() });
         assert_eq!(msgs.len(), applied + 2, "{msgs:?}");
         assert_eq!(mirror_of(&w, &a), want);
@@ -1650,6 +1671,70 @@ mod tests {
         );
     }
 
+    /// Protocol v10: a command that hits a whole side is one command. A Megalixir restores the whole party and
+    /// is one item taken; Fire on every enemy costs the MP once and the caster's one All use, and a second
+    /// whole-side spell is refused without costing the turn; Shrapnel hits every enemy, one item taken.
+    #[test]
+    fn a_whole_side_command_is_one_command_one_item_and_one_all_use() {
+        let t0 = Instant::now();
+        let (mut w, mut rx) = world_with_saver(settings(SyntheticRules::default()));
+        let mut a = seat_as(&mut w, "A", t0, seeded_with(&[(6, 2), (21, 1)]));
+        // Formation 1: two weak enemies (200 HP each).
+        assert_eq!(w.request_encounter(a.entity, Some(1), t0), BattleReply::Done);
+        a.drain();
+        let id = BattleId(1);
+        let mut t = until_ready(&mut w, id, ActorId(0), t0);
+        let me = ActorId(0);
+        let damaged = |msgs: &[ServerMsg]| -> Vec<ActorId> {
+            msgs.iter()
+                .filter_map(|m| match m {
+                    ServerMsg::BattleEvent { events, .. } => Some(events),
+                    _ => None,
+                })
+                .flatten()
+                .filter_map(|e| if let BattleEvent::Damage { actor, target, .. } = e { (*actor == me).then_some(*target) } else { None })
+                .collect()
+        };
+
+        // Megalixir on the whole party: one command, one Megalixir.
+        let wind = Command::Item { item: 6, target: Target::AllAllies };
+        assert_eq!(w.battle_command(a.entity, id, me, wind, t), BattleReply::Done);
+        let msgs = a.drain();
+        let healed: Vec<ActorId> = msgs
+            .iter()
+            .filter_map(|m| if let ServerMsg::BattleEvent { events, .. } = m { Some(events) } else { None })
+            .flatten()
+            .filter_map(|e| if let BattleEvent::Heal { target, .. } = e { Some(*target) } else { None })
+            .collect();
+        assert_eq!(healed, [me], "a party of one: the one ally");
+        assert_eq!(mirror_of(&w, &a), vec![(6, 1), (21, 1)]);
+        assert_eq!(saved(&mut rx), vec![crate::saver::SaveJob::used_item(a.account, 0, 6)]);
+        let lines = logs_of(&mut w);
+        assert!(lines.iter().any(|l| l.starts_with("item used") && l.contains("item=6 left=1 saving=queued")), "{lines:?}");
+
+        // Fire on every enemy: both hit, once the MP and the one All use.
+        t = until_ready(&mut w, id, me, t);
+        let fire = |target| Command::Magic { spell: 27, target };
+        assert_eq!(w.battle_command(a.entity, id, me, fire(Target::AllEnemies), t), BattleReply::Done);
+        assert_eq!(damaged(&a.drain()), [ActorId(1), ActorId(2)], "every enemy, in actor order");
+        let lines = logs_of(&mut w);
+        assert!(lines.iter().any(|l| l.starts_with("magic used") && logged(l, "spell") == Some("27") && logged(l, "target") == Some("all-enemies")), "{lines:?}");
+        // The All use is spent: a second whole-side spell is refused and the turn is not, one target is fine.
+        t = until_ready(&mut w, id, me, t);
+        assert_eq!(w.battle_command(a.entity, id, me, fire(Target::AllEnemies), t), refused(Some(id), BattleRejection::InvalidTarget));
+        assert!(w.battle.as_ref().unwrap().battles.get(&id).unwrap().state.ready_actors().contains(&me), "a refusal spends no turn");
+        assert!(a.drain().iter().all(|m| !matches!(m, ServerMsg::BattleEvent { command: Some(_), .. })));
+
+        // Shrapnel on every enemy: one item, and the two enemies (155 + the fire) are finished with it.
+        let shrapnel = Command::Item { item: 21, target: Target::AllEnemies };
+        assert_eq!(w.battle_command(a.entity, id, me, shrapnel, t), BattleReply::Done);
+        let msgs = a.drain();
+        assert_eq!(damaged(&msgs), [ActorId(1), ActorId(2)]);
+        assert!(msgs.iter().any(|m| matches!(m, ServerMsg::BattleEnd { outcome: Outcome::Victory, .. })), "{msgs:?}");
+        assert_eq!(mirror_of(&w, &a), vec![(6, 1)]);
+        assert!(saved(&mut rx).iter().any(|j| *j == crate::saver::SaveJob::used_item(a.account, 0, 21)));
+    }
+
     #[test]
     fn an_account_without_the_item_is_refused_even_when_the_engine_would_accept_it() {
         let t0 = Instant::now();
@@ -1660,7 +1745,7 @@ mod tests {
         a.drain();
         let id = BattleId(1);
         let mut t = until_ready(&mut w, id, ActorId(0), t0);
-        let item = |item| Command::Item { item, target: ActorId(0) };
+        let item = |item| Command::Item { item, target: Target::One(ActorId(0)) };
         let still_ready = |w: &World| w.battle.as_ref().unwrap().battles.get(&id).unwrap().state.ready_actors().contains(&ActorId(0));
         // A Potion is something the engine accepts, and the account has none: refused, the turn is not spent.
         assert_eq!(w.battle_command(a.entity, id, ActorId(0), item(0), t), refused(Some(id), BattleRejection::OutOfItems));
@@ -1675,16 +1760,16 @@ mod tests {
         assert_eq!(w.battle_command(a.entity, id, ActorId(0), item(3), t), refused(Some(id), BattleRejection::OutOfItems));
         assert_eq!(saved(&mut rx).len(), 1, "one Ether, one saved change");
         // Spells and Defend need no item and touch no inventory.
-        assert_eq!(w.battle_command(a.entity, id, ActorId(0), Command::Magic { spell: 27, target: ActorId(1) }, t), BattleReply::Done);
+        assert_eq!(w.battle_command(a.entity, id, ActorId(0), Command::Magic { spell: 27, target: Target::One(ActorId(1)) }, t), BattleReply::Done);
         t = until_ready(&mut w, id, ActorId(0), t);
         assert_eq!(w.battle_command(a.entity, id, ActorId(0), Command::Defend, t), BattleReply::Done);
         assert!(saved(&mut rx).is_empty());
         // The refusals of spells are the engine's too.
         t = until_ready(&mut w, id, ActorId(0), t);
         for (command, reason) in [
-            (Command::Magic { spell: 99, target: ActorId(1) }, BattleRejection::UnknownSpell),
-            (Command::Magic { spell: 27, target: ActorId(0) }, BattleRejection::InvalidTarget),
-            (Command::Magic { spell: 7, target: ActorId(0) }, BattleRejection::TargetNotDead),
+            (Command::Magic { spell: 99, target: Target::One(ActorId(1)) }, BattleRejection::UnknownSpell),
+            (Command::Magic { spell: 27, target: Target::One(ActorId(0)) }, BattleRejection::InvalidTarget),
+            (Command::Magic { spell: 7, target: Target::One(ActorId(0)) }, BattleRejection::TargetNotDead),
         ] {
             assert_eq!(w.battle_command(a.entity, id, ActorId(0), command, t), refused(Some(id), reason), "{command:?}");
         }
@@ -1702,7 +1787,7 @@ mod tests {
         let id = BattleId(1);
         let t = until_ready(&mut w, id, ActorId(0), t0);
         a.drain(); // the gauge-ready event of the wait
-        assert_eq!(w.battle_command(a.entity, id, ActorId(0), Command::Item { item: 20, target: ActorId(1) }, t), BattleReply::Done);
+        assert_eq!(w.battle_command(a.entity, id, ActorId(0), Command::Item { item: 20, target: Target::One(ActorId(1)) }, t), BattleReply::Done);
         let kinds: Vec<&str> = a
             .drain()
             .iter()
@@ -1836,7 +1921,7 @@ mod tests {
         let id = BattleId(1);
         let t = until_ready(&mut w, id, ActorId(0), t0);
         let (account, entity) = (a.account, a.entity);
-        assert_eq!(w.battle_command(entity, id, ActorId(0), Command::Item { item: 0, target: ActorId(0) }, t), BattleReply::Done);
+        assert_eq!(w.battle_command(entity, id, ActorId(0), Command::Item { item: 0, target: Target::One(ActorId(0)) }, t), BattleReply::Done);
         assert_eq!(saved(&mut rx), vec![crate::saver::SaveJob::used_item(account, 0, 0)]);
         // `spend_item` for an entity that is no longer there still queues the change and says nothing to anyone.
         w.spend_item(id, EntityId(999), account, 0, 0);
@@ -2034,6 +2119,11 @@ mod tests {
         w.take_logs().iter().map(|l| l.text().to_string()).collect()
     }
 
+    /// The value of `key` in a `key=value` log line (the lines end in `name=..`, so nothing is read from the end of one).
+    fn logged<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+        line.split(' ').find_map(|word| word.strip_prefix(key)?.strip_prefix('='))
+    }
+
     /// The limit gauge of `seat`'s mirror.
     fn mirrored_limit(w: &World, seat: &Seat) -> u16 {
         w.players.get(&seat.entity).and_then(|p| p.progress).expect("a mirror").limit
@@ -2054,7 +2144,7 @@ mod tests {
             other => panic!("{other:?}"),
         }
         let id = seat_battle_id(&a.log);
-        assert_eq!(w.battle_command(a.entity, id, ActorId(0), Command::Limit { target: ActorId(1) }, t0), BattleReply::Done);
+        assert_eq!(w.battle_command(a.entity, id, ActorId(0), Command::Limit { target: Target::One(ActorId(1)) }, t0), BattleReply::Done);
         // The message that carried it: the action, the gauge emptied before the blow, then the blow.
         let applied = a.battle_msgs().into_iter().find_map(|m| match m {
             ServerMsg::BattleEvent { events, command: Some(AppliedCommand { command: Command::Limit { .. }, .. }), .. } => Some(events),
@@ -2066,7 +2156,7 @@ mod tests {
         assert!(events.contains(&BattleEvent::LimitGauge { actor: ActorId(0), value: 0 }));
         // The same gauge a second time: the turn is over (and the gauge is empty).
         assert_eq!(
-            w.battle_command(a.entity, id, ActorId(0), Command::Limit { target: ActorId(1) }, t0),
+            w.battle_command(a.entity, id, ActorId(0), Command::Limit { target: Target::One(ActorId(1)) }, t0),
             refused(Some(id), BattleRejection::GaugeNotFull)
         );
 
@@ -2137,7 +2227,7 @@ mod tests {
         assert_eq!(w.request_encounter(a.entity, Some(3), t0), BattleReply::Done);
         assert_eq!(started_with(&mut a), vec![255, 255], "every battle starts them full again");
         let second = seat_battle_id(&a.log);
-        assert_eq!(w.battle_command(a.entity, second, ActorId(0), Command::Limit { target: ActorId(2) }, t0), BattleReply::Done);
+        assert_eq!(w.battle_command(a.entity, second, ActorId(0), Command::Limit { target: Target::One(ActorId(2)) }, t0), BattleReply::Done);
         play_out(&mut w, &mut [&mut a], &rules, t0);
         let gauges = replayed_gauges(&mut a, &rules);
         assert_ne!(gauges[0], 255, "A's limit emptied its gauge");
@@ -2169,7 +2259,7 @@ mod tests {
         let id = seat_battle_id(&a.log);
         // A spell the character does not know is refused, and says nothing in the log.
         assert_eq!(
-            w.battle_command(a.entity, id, ActorId(0), Command::Magic { spell: 99, target: ActorId(0) }, t0),
+            w.battle_command(a.entity, id, ActorId(0), Command::Magic { spell: 99, target: Target::One(ActorId(0)) }, t0),
             refused(Some(id), BattleRejection::UnknownSpell)
         );
         let mut turn = 0;
@@ -2177,8 +2267,8 @@ mod tests {
             turn += 1;
             match turn {
                 1 => Command::Defend,
-                2 => Command::Magic { spell: 0, target: me },
-                3 => Command::Item { item: 0, target: me },
+                2 => Command::Magic { spell: 0, target: Target::One(me) },
+                3 => Command::Item { item: 0, target: Target::One(me) },
                 _ => Command::Attack { target: state.enemy_ids().into_iter().find(|e| state.actor(*e).is_some_and(|c| c.is_alive())).unwrap() },
             }
         });
@@ -2238,7 +2328,7 @@ mod tests {
         }
         let id = seat_battle_id(&a.log);
         assert!(w.battle.as_ref().unwrap().battles.get(&id).unwrap().state.limit_for(ActorId(0)).is_none(), "a player has no limit break");
-        assert_eq!(w.battle_command(a.entity, id, ActorId(0), Command::Limit { target: ActorId(1) }, t0), refused(Some(id), BattleRejection::NoLimit));
+        assert_eq!(w.battle_command(a.entity, id, ActorId(0), Command::Limit { target: Target::One(ActorId(1)) }, t0), refused(Some(id), BattleRejection::NoLimit));
         assert_eq!(w.battle_command(a.entity, id, ActorId(0), Command::Escape, t0), BattleReply::Done);
         assert_eq!(w.battle_count(), 0);
         // A second battle, a win this time (the synthetic two-dummy formation pays experience).
@@ -2331,7 +2421,7 @@ mod tests {
         let (r, now) = reason.expect("the character's turn comes");
         assert_eq!(r, BattleRejection::CannotEscape);
         assert_eq!(
-            w.battle_command(a.entity, id, ActorId(0), Command::Limit { target: ActorId(1) }, now),
+            w.battle_command(a.entity, id, ActorId(0), Command::Limit { target: Target::One(ActorId(1)) }, now),
             refused(Some(id), BattleRejection::LimitNotReady),
             "a gauge of 100 is not a full one"
         );
@@ -2341,7 +2431,7 @@ mod tests {
     }
 
     #[test]
-    fn a_healing_limit_aims_at_the_party_and_a_damaging_one_at_the_enemies() {
+    fn a_healing_limit_aims_at_the_whole_party_and_a_damaging_one_at_one_enemy() {
         let rules = player_limit_rules();
         let t0 = Instant::now();
         let (mut w, _rx) = world_with_saver(settings(rules));
@@ -2354,13 +2444,98 @@ mod tests {
         let id = seat_battle_id(&a.log);
         let (cloud, aerith, enemy) = (ActorId(0), ActorId(1), ActorId(2));
         let refuse = |reason| refused(Some(id), reason);
-        // Cloud's strike needs an enemy; Aerith's heal an ally (herself counts).
-        assert_eq!(w.battle_command(a.entity, id, cloud, Command::Limit { target: aerith }, t0), refuse(BattleRejection::InvalidTarget));
-        assert_eq!(w.battle_command(b.entity, id, aerith, Command::Limit { target: enemy }, t0), refuse(BattleRejection::InvalidTarget));
-        assert_eq!(w.battle_command(b.entity, id, aerith, Command::Limit { target: cloud }, t0), BattleReply::Done);
-        assert_eq!(w.battle_command(a.entity, id, cloud, Command::Limit { target: enemy }, t0), BattleReply::Done);
+        // Cloud's strike needs one enemy (not an ally, not a whole side); Aerith's wind is the whole party and
+        // nothing smaller or other (Healing Wind's record says "All Al (NS)", protocol v10).
+        let strike = |target| Command::Limit { target };
+        for target in [Target::One(aerith), Target::AllAllies, Target::AllEnemies] {
+            assert_eq!(w.battle_command(a.entity, id, cloud, strike(target), t0), refuse(BattleRejection::InvalidTarget), "{target:?}");
+        }
+        for target in [Target::One(enemy), Target::One(cloud), Target::One(aerith), Target::AllEnemies] {
+            assert_eq!(w.battle_command(b.entity, id, aerith, strike(target), t0), refuse(BattleRejection::InvalidTarget), "{target:?}");
+        }
+        assert_eq!(w.battle_command(b.entity, id, aerith, strike(Target::AllAllies), t0), BattleReply::Done);
+        assert_eq!(w.battle_command(a.entity, id, cloud, strike(Target::One(enemy)), t0), BattleReply::Done);
+        // The server's own record of what it applied says whom: a number for one actor, a side for a whole one.
+        let lines = logs_of(&mut w);
+        assert!(lines.iter().any(|l| l.starts_with("limit used") && logged(l, "character") == Some("3") && logged(l, "target") == Some("all-allies")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.starts_with("limit used") && logged(l, "character") == Some("0") && logged(l, "target") == Some("2")), "{lines:?}");
         // A member cannot give another member's limit.
         assert_eq!(w.battle_command(a.entity, id, aerith, Command::Escape, t0), refuse(BattleRejection::NotYourActor));
+    }
+
+    /// With the canon pair in front the party side of the engine is [Cloud, Barret, players..] (protocol v9): a player can
+    /// aim a Cure or a Potion at a companion (one target), and a cast on the whole party reaches the companions and the
+    /// players alike (whole-side targeting, protocol v10: `AllAllies` is the commanding actor's own side, all of it). A
+    /// player still commands only its own actor, and the server's record says whom.
+    #[test]
+    fn a_player_can_heal_a_companion_and_a_whole_party_cast_reaches_the_companions_and_the_players() {
+        let t0 = Instant::now();
+        // A dummy that outlasts the test, so that the canon pair's attacks do not end the battle. (The companions' pacing
+        // is off: this is about whom a command can aim at, not about when a companion acts.)
+        let rules = SyntheticRules { enemy_hp: 100_000, ..SyntheticRules::default() };
+        let mut w = world_with_party(settings_unpaced(rules), cloud_and_barret);
+        let (mut a, mut b) = (seat(&mut w, "Aria", t0), seat(&mut w, "Brom", t0));
+        party_up(&mut w, &a, &b, t0);
+        a.drain();
+        b.drain();
+        // Formation 3 starts with every gauge full: Cloud (0), Barret (1), Aria (2), Brom (3), the dummy (4).
+        assert_eq!(w.request_encounter(a.entity, Some(3), t0), BattleReply::Done);
+        let id = BattleId(1);
+        let (cloud, barret, aria, brom) = (ActorId(0), ActorId(1), ActorId(2), ActorId(3));
+        // One target each: Aria cures the canon Cloud, Brom gives Barret a Potion (a new account carries three).
+        assert_eq!(w.battle_command(a.entity, id, aria, Command::Magic { spell: 0, target: Target::One(cloud) }, t0), BattleReply::Done);
+        assert_eq!(w.battle_command(b.entity, id, brom, Command::Item { item: 0, target: Target::One(barret) }, t0), BattleReply::Done);
+        // A player commands its own actor only, whoever its spell is aimed at.
+        assert_eq!(w.battle_command(a.entity, id, brom, Command::Defend, t0), refused(Some(id), BattleRejection::NotYourActor));
+        assert_eq!(w.battle_command(a.entity, id, cloud, Command::Magic { spell: 0, target: Target::AllAllies }, t0), refused(Some(id), BattleRejection::NotYourActor));
+        // The whole party, on Aria's next turn (her gauge has to fill again): one Cure, one All use, everybody healed.
+        let whole = Command::Magic { spell: 0, target: Target::AllAllies };
+        let mut applied = false;
+        for step in 1..=400u64 {
+            let now = ms(t0, step * 10);
+            w.advance_battles(now);
+            match w.battle_command(a.entity, id, aria, whole, now) {
+                BattleReply::Refused { reason: BattleRejection::GaugeNotFull, .. } => continue,
+                other => {
+                    assert_eq!(other, BattleReply::Done);
+                    applied = true;
+                    break;
+                }
+            }
+        }
+        assert!(applied, "Aria's turn came");
+        // Brom (who has not used his All) sees it as one command from Aria and a heal for each of the four members.
+        let healed: Vec<ActorId> = b
+            .battle_msgs()
+            .iter()
+            .filter_map(|m| match m {
+                ServerMsg::BattleEvent { events, command: Some(AppliedCommand { actor, command }), .. } if *actor == aria && *command == whole => Some(events.clone()),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|e| if let BattleEvent::Heal { target, .. } = e { Some(target) } else { None })
+            .collect();
+        assert_eq!(healed, [cloud, barret, aria, brom], "both companions and both players, in actor order, from one Cure");
+        // The server's own record says whom: an actor's number for one target, the side for the whole party.
+        let lines = logs_of(&mut w);
+        let casts: Vec<(Option<&str>, Option<&str>)> =
+            lines.iter().filter(|l| l.starts_with("magic used")).map(|l| (logged(l, "actor"), logged(l, "target"))).collect();
+        assert_eq!(casts, [(Some("2"), Some("0")), (Some("2"), Some("all-allies"))], "{lines:?}");
+        assert!(lines.iter().any(|l| l.starts_with("item used") && logged(l, "item") == Some("0")), "{lines:?}");
+        // The whole-party cast spent Aria's one All use: another is refused, and a one-target cast is not.
+        let mut refused_again = None;
+        for step in 1..=400u64 {
+            let now = ms(t0, 4_000 + step * 10);
+            w.advance_battles(now);
+            match w.battle_command(a.entity, id, aria, whole, now) {
+                BattleReply::Refused { reason: BattleRejection::GaugeNotFull, .. } => continue,
+                other => {
+                    refused_again = Some(other);
+                    break;
+                }
+            }
+        }
+        assert_eq!(refused_again, Some(refused(Some(id), BattleRejection::InvalidTarget)), "no All use left");
     }
 
     #[test]

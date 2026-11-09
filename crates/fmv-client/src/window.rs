@@ -1453,7 +1453,7 @@ mod tests {
         // Pick it and aim at ourselves (the only one in the party).
         assert_eq!(battle_request(BattleKey::Confirm, &mut s, 1.2), BattleRequest::Menu);
         match battle_request(BattleKey::Confirm, &mut s, 1.2) {
-            BattleRequest::Send(BattleCmd::Command { actor, command: EngineCommand::Item { item, target }, .. }) => assert_eq!((actor.0, item, target.0), (0, 0, 0)),
+            BattleRequest::Send(BattleCmd::Command { actor, command: EngineCommand::Item { item, target }, .. }) => assert_eq!((actor.0, item, target), (0, 0, fmv_protocol::Target::One(fmv_protocol::ActorId(0)))),
             other => panic!("{other:?}"),
         }
     }
@@ -1477,13 +1477,13 @@ mod tests {
         assert_eq!(s.battle.view(1.0).and_then(|v| v.menu).and_then(|m| m.list).map(|l| l.title), Some("Magic"));
         // Pick Fire, aim at the dummy (actor 1, after our own), confirm: the engine's Magic command.
         assert_eq!(battle_request(BattleKey::Confirm, &mut s, 1.0), BattleRequest::Menu);
-        assert_eq!(sent(&mut s, BattleKey::Confirm), (0, EngineCommand::Magic { spell: 1, target: fmv_protocol::ActorId(1) }));
+        assert_eq!(sent(&mut s, BattleKey::Confirm), (0, EngineCommand::Magic { spell: 1, target: fmv_protocol::Target::One(fmv_protocol::ActorId(1)) }));
         assert_eq!(s.battle.view(1.0).and_then(|v| v.menu).map(|m| m.command_cursor), Some(1), "back at the top, on Magic");
         // A Potion: the item list, then the party to aim at (we are the only one), then the Item command.
         for key in [BattleKey::Down, BattleKey::Confirm, BattleKey::Confirm] {
             assert_eq!(battle_request(key, &mut s, 1.0), BattleRequest::Menu);
         }
-        assert_eq!(sent(&mut s, BattleKey::Confirm), (0, EngineCommand::Item { item: 2, target: fmv_protocol::ActorId(0) }));
+        assert_eq!(sent(&mut s, BattleKey::Confirm), (0, EngineCommand::Item { item: 2, target: fmv_protocol::Target::One(fmv_protocol::ActorId(0)) }));
         // Defend sends at once when the model has it.
         assert_eq!(battle_request(BattleKey::Down, &mut s, 1.0), BattleRequest::Menu);
         assert_eq!(sent(&mut s, BattleKey::Confirm), (0, EngineCommand::Defend));

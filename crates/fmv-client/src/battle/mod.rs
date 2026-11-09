@@ -52,6 +52,11 @@
 //!   character's limit gauge is full and has an `Escape` row; the party panel draws a limit bar per
 //!   member (`Bar::limit`); a battle the party got away from is `Outcome::Escaped` (counted by
 //!   [`BattleClient::escapes`], shown as "ESCAPED", nothing is paid).
+//! * Whole sides (protocol v10): a spell, an item or a limit that can hit a whole side has an **ALL** place for the
+//!   target pointer (reached with the arrows, one step past the last target: see `menu`, "Whole sides"), the
+//!   Magic list says `ALL xN` for the All materia uses our character has left, Healing Wind and Megalixir start
+//!   on ALL, and the bot gives Healing Wind to the whole party. Everything it needs to know (what a spell can
+//!   aim at, how many uses are left) comes from the replayed engine, so the menu is always the engine's word.
 //! * [`open_rules`] reads this machine's battle data (the same library set as the field archive);
 //!   [`open_names`] reads the spell, item and enemy attack names the windows show from the same files.
 //!
@@ -90,7 +95,7 @@ pub use view::{battle_vertices, Bar, BattleView, Status};
 // The rest of the overlay's API, for the code that wires the names (`main`), the menu's data and the
 // 3D scene (the redraw): not all of it is used by this crate's own window yet.
 #[allow(unused_imports)]
-pub use menu::{BattleMenuModel, Level, MenuItem, MenuLimit, MenuSpell, TargetRule};
+pub use menu::{BattleMenuModel, Level, MenuItem, MenuLimit, MenuSpell, Reach, TargetRule};
 #[allow(unused_imports)]
 pub use data::open_names;
 #[allow(unused_imports)]
@@ -103,7 +108,7 @@ pub use view::{flat_anchors, Anchors};
 use crate::headless::encode_name;
 use crate::progress::slot_name;
 use fmv_core::{AccountId, Fingerprint};
-use fmv_ff7_battle::rules::{BattleState, Combatant, GAUGE_MAX};
+use fmv_ff7_battle::rules::{Aim, BattleState, Combatant, Target, GAUGE_MAX};
 use fmv_protocol::battle::{BattleEvent, Command, Outcome};
 use fmv_protocol::{
     ActorId, AppliedCommand, BattleId, BattleMember, BattleRejection, BattleReplay, BattleReward, BattleRules, BattleSetup, ClientMsg,
@@ -843,10 +848,22 @@ impl BattleClient {
         let (Some(replay), Some(mine)) = (active.replay.as_ref(), active.my_actor) else { return BattleMenuModel::default() };
         let state = replay.state();
         let book = self.hud.names();
+        // How many a thing can be aimed at: a spell that can hit one target or a whole side may hit the whole side
+        // only while our character has an All materia use left (FF7's rule, kept by the engine), an item or a limit of
+        // that kind always may, and what only hits a whole side always does.
+        let all_left = state.all_left(mine);
+        let reach_of = |aim: Aim, needs_all: bool| match aim {
+            Aim::OneOrSide if !needs_all || all_left > 0 => Reach::OneOrAll,
+            Aim::Side => Reach::All,
+            Aim::One | Aim::OneOrSide | Aim::Random => Reach::One,
+        };
         let spells = state
             .spells_for(mine)
             .into_iter()
-            .map(|s| MenuSpell::new(s.spell, spell_name(book, s.spell), s.mp_cost, TargetRule::from_allies(s.targets_allies)))
+            .map(|s| {
+                MenuSpell::new(s.spell, spell_name(book, s.spell), s.mp_cost, TargetRule::from_allies(s.targets_allies))
+                    .with_reach(reach_of(s.aim, true))
+            })
             .collect();
         let items = self
             .inventory
@@ -858,14 +875,15 @@ impl BattleClient {
                     (false, true) => TargetRule::Allies,
                     (false, false) => TargetRule::Enemies,
                 };
-                Some(MenuItem::new(stack.item, item_name(book, stack.item), stack.count, target))
+                Some(MenuItem::new(stack.item, item_name(book, stack.item), stack.count, target).with_reach(reach_of(info.aim, false)))
             })
             .collect();
         // Our limit break, if the character has one: whom it aims at and whether its gauge is full now.
         let limit = state.limit_for(mine).map(|info| {
             MenuLimit::new(info.attack, limit_name(book, info.attack), TargetRule::from_allies(info.targets_allies), state.limit_ready(mine))
+                .with_reach(reach_of(info.aim, false))
         });
-        BattleMenuModel { spells, items, defend: true, limit, escape: state.can_escape() }
+        BattleMenuModel { spells, items, defend: true, limit, escape: state.can_escape(), all_left }
     }
 
     fn on_rejected(&mut self, battle_id: Option<BattleId>, reason: BattleRejection) {
@@ -943,28 +961,34 @@ impl BattleClient {
             .spells_for(mine)
             .into_iter()
             .filter(|s| s.targets_allies)
-            .filter(|s| state.check_command(mine, &Command::Magic { spell: s.spell, target: mine }).is_ok())
+            .filter(|s| state.check_command(mine, &Command::Magic { spell: s.spell, target: Target::One(mine) }).is_ok())
             .min_by_key(|s| (s.mp_cost, s.spell))?;
-        Some(BattleCmd::Command { battle_id: active.id, actor: mine, command: Command::Magic { spell: spell.spell, target: mine } })
+        Some(BattleCmd::Command { battle_id: active.id, actor: mine, command: Command::Magic { spell: spell.spell, target: Target::One(mine) } })
     }
 
     /// Our character's limit break, if it is our turn and the limit should be given: its gauge is full and
     /// there is a worthwhile target. A damaging limit goes to the first living enemy; a healing one (Healing
-    /// Wind) only when somebody in the party is under half of its max HP, and then to the one with the
-    /// least HP left (by fraction, the lowest actor id on a tie): it is not wasted on a party that is fine.
-    /// The engine says whether the command is legal ([`BattleState::check_command`]).
+    /// Wind, which heals the whole party) only when somebody in the party is under half of its max HP: it is
+    /// not wasted on a party that is fine, and one that can only be aimed at one ally goes to the one with the
+    /// least HP left (by fraction, the lowest actor id on a tie). The engine says whether the command is legal
+    /// ([`BattleState::check_command`]).
     fn limit_command(&self, now: f64) -> Option<BattleCmd> {
         let (active, state, mine) = self.my_turn(now)?;
         let info = state.limit_for(mine).filter(|_| state.limit_ready(mine))?;
         let target = if info.targets_allies {
-            state
+            let worst = state
                 .party_ids()
                 .into_iter()
                 .filter_map(|id| state.actor(id).filter(|c| c.is_alive() && u64::from(c.hp) * 2 < u64::from(c.max_hp)).map(|c| (id, c)))
                 .min_by_key(|(id, c)| (u64::from(c.hp) * 1000 / u64::from(c.max_hp.max(1)), id.0))
-                .map(|(id, _)| id)?
+                .map(|(id, _)| id)?;
+            if info.aim == Aim::Side {
+                Target::AllAllies
+            } else {
+                Target::One(worst)
+            }
         } else {
-            state.enemy_ids().into_iter().find(|e| state.actor(*e).is_some_and(Combatant::is_alive))?
+            Target::One(state.enemy_ids().into_iter().find(|e| state.actor(*e).is_some_and(Combatant::is_alive))?)
         };
         let command = Command::Limit { target };
         state.check_command(mine, &command).ok()?;
