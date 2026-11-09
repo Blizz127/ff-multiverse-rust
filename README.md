@@ -1333,7 +1333,8 @@ mods: text=original (off) voice=original (off) music=original (no archive) sound
 ```
 
 then, as the game uses them, only archive paths and ids, never a line of text: `mods: talk md1stin gu0: echo-s section` (or `original
-section (not in echo-s)`), `audio: voice md1stin/12a (2.4 s)`, `audio: music aseri from echo-s`, `audio: sound 6 from cosmo`, and at the end
+section (not in echo-s)`), for each window of such a conversation `mods: window md1stin#12 w0 voice md1stin/12a` (or `voice none`: the lookup, which a
+run without ears shows too), `audio: voice md1stin/12a (2.4 s)` when the clip plays, `audio: music aseri from echo-s`, `audio: sound 6 from cosmo`, and at the end
 `audio: voices played: N (asks without a clip: M)`. The audio lines need a run with sound (`FMV_AUDIO=null` runs it against a clock with no device).
 
 ### How each layer works, and what was measured

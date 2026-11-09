@@ -413,6 +413,61 @@ mod tests {
         assert!(sink.cues().is_empty());
     }
 
+    /// The real conversations of the first reactor fields on the owner's data, through the client's own conversation code: which
+    /// characters talk from Echo-S's section and which window finds which voice clip. Read-only; only counts and ids are printed.
+    #[test]
+    #[ignore = "needs the owner's FF7 data and Echo-S (FMV_FF7_DATA, FMV_ECHO_S_IRO)"]
+    fn the_real_conversations_of_the_reactor_fields_run_on_echo_s_and_find_their_voices() {
+        use fmv_ff7::field::FieldFile;
+        use fmv_ff7::lgp::LgpArchive;
+        let var = |name: &str| std::env::var_os(name).map(std::path::PathBuf::from);
+        let (Some(data), Some(echo)) = (var("FMV_FF7_DATA"), var("FMV_ECHO_S_IRO")) else {
+            eprintln!("FMV_FF7_DATA and FMV_ECHO_S_IRO are needed; skipping");
+            return;
+        };
+        let lgp = Arc::new(Mutex::new(LgpArchive::open_path(data.join("field").join("flevel.lgp")).expect("flevel.lgp")));
+        let section_of = move |area: &str| -> Option<Vec<u8>> {
+            let stored = lgp.lock().unwrap().read(area).ok()?;
+            let file = FieldFile::parse(fmv_ff7::lzss::decompress(&stored).ok()?).ok()?;
+            Some(FieldScript::from_field(&file).ok()?.bytes().to_vec())
+        };
+        let mods = Arc::new(Mods::open(&ModSources { echo_s: Some(echo), ..Default::default() }, Layers::ALL));
+        assert!(mods.notes().is_empty(), "{:?}", mods.notes());
+        let sink = Arc::new(Collect::default());
+        let loader = {
+            let section_of = section_of.clone();
+            Box::new(move |area: &str| section_of(area)) as SectionLoader
+        };
+        let mut conversations = Ff7Conversations::with_parts(Some(loader), Some(Arc::clone(&mods)), sink.clone());
+        let (mut npcs, mut from_echo, mut from_original, mut windows) = (0usize, 0usize, 0usize, 0usize);
+        for field in ["md1stin", "md1_1", "md1_2", "nrthmk", "nmkin_1", "elevtr1", "nmkin_2", "nmkin_3", "nmkin_4", "nmkin_5"] {
+            let Some(bytes) = section_of(field) else { continue };
+            let script = FieldScript::parse(&bytes).expect("script");
+            for c in characters(&script) {
+                npcs += 1;
+                let place = c.places.first().map_or((0.0, 0.0), |&(x, y)| (f32::from(x), f32::from(y)));
+                let view = NpcView { id: 0, name: c.name.clone(), model: String::new(), idle_animation: None, pos: Pos::new(place.0, place.1, 0.0), facing: 0.0 };
+                let before = sink.notes().len();
+                let Some(source) = conversations.start(field, &view) else { continue };
+                let (shown, _) = texts(source);
+                windows += shown.len();
+                let said = sink.notes();
+                match said.get(before).map(String::as_str) {
+                    Some(l) if l.contains("echo-s section") => from_echo += 1,
+                    _ => from_original += 1,
+                }
+            }
+        }
+        let notes = sink.notes();
+        let voiced = notes.iter().filter(|l| l.starts_with("mods: window") && !l.ends_with("voice none")).count();
+        let silent = notes.iter().filter(|l| l.starts_with("mods: window") && l.ends_with("voice none")).count();
+        for line in notes.iter().filter(|l| l.starts_with("mods: window")).take(24) {
+            println!("{line}");
+        }
+        println!("reactor fields: {npcs} characters; {from_echo} talk from Echo-S's section, {from_original} from the original's; {windows} windows shown; windows of Echo-S's text: {voiced} voiced, {silent} without a clip");
+        assert!(from_echo > 0 && voiced > 0, "some real conversation is voiced");
+    }
+
     #[test]
     fn the_talk_radius_is_always_the_originals() {
         let (_t, mods) = mods_with(&spec(), Layers::ALL);

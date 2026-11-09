@@ -267,10 +267,11 @@ MODS:
   sound=cosmo [echo-s 1.24, cosmo 1.22]` (`original (off)` for a switched-off layer, `original (no
   archive)` for one with nothing to play), and a `mods: note:` line for an archive that is damaged,
   truncated or the wrong mod. A conversation says where its text came from (`mods: talk <field>
-  <npc>: echo-s section|original section`), a voice that plays `audio: voice <field>/<clip>` (a
-  clip's archive path, never its words), a track and a sound the same way (`audio: music <name>
-  from echo-s`, `audio: sound <id> from cosmo`). Voices need an audio output: FMV_AUDIO=null runs
-  them against a clock with none.
+  <npc>: echo-s section|original section`), each window of a voiced one which clip the voice layer
+  has for it (`mods: window <field>#<dialog> w<window> voice <field>/<clip>|none`), a voice that
+  plays `audio: voice <field>/<clip>` (a clip's archive path, never its words), a track and a sound
+  the same way (`audio: music <name> from echo-s`, `audio: sound <id> from cosmo`). Voices need an
+  audio output: FMV_AUDIO=null runs them against a clock with none.
 
 WINDOW CONTROLS:
   WASD / arrow keys move, Esc twice quits (never during a battle: close the window to quit
