@@ -365,7 +365,7 @@ impl World {
                 let own = p.progress.unwrap_or_else(|| progress::fresh(bw.rules(), progress::DEFAULT_CHARACTER));
                 let level = bw.settings.level.unwrap_or(own.level);
                 // The limit gauge is the account's own, inside the game's cap (the engine would refuse more);
-                // `--debug-limit-full` starts everybody at the cap (see the module docs: only the start changes).
+                // `--debug-limit-full` starts everybody at the cap and `keep_limits` then saves no gauge (module docs).
                 let max_limit = bw.rules().progress_limits().max_limit;
                 let limit = if bw.settings.debug_limit_full { max_limit } else { own.limit.min(max_limit) };
                 Some(BattleMember { entity, account: p.account, character: own.character, level, weapon: None, armor: None, limit })
@@ -645,7 +645,9 @@ impl World {
     }
 
     /// Keep the limit gauge every member of a finished battle ended with, whatever the outcome (an
-    /// escape pays nothing, but its gauges are kept): a member whose gauge is not the one it started with
+    /// escape pays nothing, but its gauges are kept), EXCEPT under `--debug-limit-full`, where every
+    /// starting gauge was faked and nothing is kept (logged as `limit not kept ... reason=debug-limit-full`).
+    /// Otherwise a member whose gauge is not the one it started with
     /// has the new one queued for the saver (whether or not it is still connected: its character fought
     /// on) and put in its mirror (found by its account, which may have logged in again). A gauge that did
     /// not move writes nothing. A knocked-out character ended with an empty one, which is what is kept.
@@ -1844,8 +1846,8 @@ mod tests {
         };
 
         // Formation 3 is the preemptive one: a sure escape, with every party gauge full at once. Both start
-        // with a full limit gauge, and nobody spends it: it ends where it started, so NOTHING is written and the
-        // accounts keep what they really have.
+        // with a full limit gauge (the flag fakes it) and, under the flag, NO gauge is ever written: the
+        // accounts keep what they really have, and the server says why.
         assert_eq!(w.request_encounter(a.entity, Some(3), t0), BattleReply::Done);
         assert_eq!(started_with(&mut a), vec![255, 255], "full, whatever the accounts have");
         let first = seat_battle_id(&a.log);
@@ -1855,10 +1857,11 @@ mod tests {
         assert_eq!((mirrored_limit(&w, &a), mirrored_limit(&w, &b)), (0, 100), "the accounts keep their own gauges");
         let logs = logs_of(&mut w);
         assert!(logs.iter().any(|l| l.starts_with("battle started battle=1") && l.contains("limits=[255, 255]")), "{logs:?}");
+        assert!(logs.iter().any(|l| l == "limit not kept battle=1 reason=debug-limit-full"), "the early return ran: {logs:?}");
         assert!(!logs.iter().any(|l| l.starts_with("limit kept")), "{logs:?}");
 
-        // Next battle: A gives its limit (B does nothing). What each member ENDS with is stored, as after any
-        // battle, unless it is the gauge the battle started with; and the fake full one is never written.
+        // Next battle: A gives its limit (B does nothing), so A ENDS below the faked start. Even that moved
+        // gauge is not written: it started from the faked full one, so it is not A's own.
         assert_eq!(w.request_encounter(a.entity, Some(3), t0), BattleReply::Done);
         assert_eq!(started_with(&mut a), vec![255, 255], "every battle starts them full again");
         let second = seat_battle_id(&a.log);

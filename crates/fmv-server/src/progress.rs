@@ -90,7 +90,8 @@ pub struct Progress {
     pub gil: u32,
     /// The character's limit gauge between battles (protocol v7; FF7: `0..=255`, 255 is full): what its
     /// next battle starts with ([`fmv_protocol::BattleMember::limit`]). Set at the end of every battle
-    /// (see `saver::SavedChange::Limit`), and carried by the record like the numbers above, so that a
+    /// (see `saver::SavedChange::Limit`; never under the debug flag `--debug-limit-full`, which fakes the
+    /// starting gauge), and carried by the record like the numbers above, so that a
     /// payment never resets it.
     pub limit: u16,
 }
