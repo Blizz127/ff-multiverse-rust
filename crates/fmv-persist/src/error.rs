@@ -146,6 +146,11 @@ pub enum PersistError {
 
     #[error("snapshot: {0}")]
     Snapshot(String),
+
+    /// `restore_account` was given a trash entry that is not there, or is not one that can be restored (a
+    /// delete or a restore still in flight, or an entry that was restored already).
+    #[error("no restorable trash entry {0:?}")]
+    NoSuchTrashEntry(String),
 }
 
 impl PersistError {

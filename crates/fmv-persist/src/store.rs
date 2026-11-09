@@ -15,6 +15,8 @@
 //!                                                         and, once one was stored, the
 //!                                                         inventory: a missing `inventory` key
 //!                                                         means never stored, `[]` means empty)
+//! <root>/trash/<stamp>-<account_id>/            a deleted account's records, moved here whole by
+//!                                               `delete_account` (made by the first delete; see `store/trash.rs`)
 //! ```
 //!
 //! # Crash consistency
@@ -73,6 +75,7 @@ use crate::snapshot::{self, SnapshotInfo};
 
 mod player_character;
 pub mod restyle;
+pub mod trash;
 
 pub(crate) const ACCOUNTS_DIR: &str = "accounts";
 pub(crate) const AVATARS_DIR: &str = "avatars";
@@ -217,6 +220,10 @@ impl Store {
         let presized =
             usize::try_from(options.max_accounts.min(MAX_PRESIZED_ACCOUNTS)).unwrap_or(0);
         opened.index.reserve_for(presized);
+
+        // Settle a delete or a restore a crash interrupted, so that the report below does not mistake its leftovers
+        // for strays (and so that a committed delete is finished before anything reads the records).
+        trash::recover(&root, &opened.index, opened.next_account_id, &mut warnings)?;
 
         for message in find_unreferenced_records(&root, &opened.index)? {
             tracing::warn!("{message}");
@@ -1193,6 +1200,11 @@ fn sweep_all_temp_files(root: &Path) -> Result<Vec<PathBuf>> {
     removed.extend(fsio::sweep_temp_files(&progression)?);
     for dir in fsio::list_subdirs(&progression)? {
         removed.extend(fsio::sweep_temp_files(&progression.join(dir))?);
+    }
+    // An interrupted manifest write inside a trash entry.
+    let trash = root.join(trash::TRASH_DIR);
+    for dir in fsio::list_subdirs(&trash)? {
+        removed.extend(fsio::sweep_temp_files(&trash.join(dir))?);
     }
     Ok(removed)
 }
