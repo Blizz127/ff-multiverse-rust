@@ -32,13 +32,22 @@ struct Fixture {
 }
 
 fn fixture(real: &Real, avatars: &mut Avatars) -> Fixture {
-    let key = "md1stin";
+    fixture_of(real, avatars, "md1stin")
+}
+
+fn fixture_of(real: &Real, avatars: &mut Avatars, key: &str) -> Fixture {
     let view = FieldView::ff7_with(&real.adapter, key, true).expect("field view");
     let stage = view.stage.clone().expect("an FF7 field has a stage");
     let area = real.adapter.load_field(key).expect("field");
     let flat = flat_front(&area);
     let candidates = spots(avatars, &view, &stage, &area, flat.as_ref(), (450.0, 1300.0));
-    let open_places: Vec<Spot> = candidates.iter().copied().filter(|s| s.covered == 0.0).collect();
+    let mut open_places: Vec<Spot> = candidates.iter().copied().filter(|s| s.covered == 0.0).collect();
+    if open_places.is_empty() {
+        // A field whose camera is far or near: any depth will do for a picture of one character.
+        let wide = spots(avatars, &view, &stage, &area, flat.as_ref(), (150.0, 6000.0));
+        let least = wide.iter().map(|s| s.covered).fold(f32::MAX, f32::min);
+        open_places = wide.into_iter().filter(|s| s.covered <= least + 0.02).collect();
+    }
     let toward = {
         let cams = area.cameras().expect("cameras");
         let axes = cams[0].axes_f32();
@@ -186,7 +195,8 @@ fn offscreen_field_identity_before_after() {
             assert!(model_px.len() > 3000, "{} in {cname}: the body is on the screen ({} pixels)", body.archetype, model_px.len());
             // The oracle: the CPU mirror of the look, applied to the untinted pixel, is the new pixel (the vertex
             // colours of these bodies are flat, so the untinted pixel is the lit colour). The pixels it does not
-            // reach are the face decals (the face flag), which keep their own colours.
+            // reach are the ones the keep flag acts on (the face decals, and the hair and skin of the head bone),
+            // which keep their own colours.
             let id = tint.map(|c| f32::from(c) / 255.0);
             let (mut agree, mut face_px) = (0usize, Vec::new());
             for &i in &model_px {
@@ -220,7 +230,9 @@ fn offscreen_field_identity_before_after() {
         }
     }
     eprintln!("worst mean per-channel change over the skin region: new {worst_skin_new:.1} levels, old {worst_skin_old:.1}; the shader agrees with the mirror at {:.2}% of {} body pixels", 100.0 * oracle_total.0 as f32 / oracle_total.1 as f32, oracle_total.1);
-    assert!(oracle_total.0 as f32 > 0.93 * oracle_total.1 as f32, "the shader is the mirror (but for the face decals)");
+    // (The pixels that do not match are those the keep flag acts on: the decals and the head's hair and skin, which keep
+    // their own colours; each case above asserts how little they change. They are a head's worth of a body: under 12% here.)
+    assert!(oracle_total.0 as f32 > 0.85 * oracle_total.1 as f32, "the shader is the mirror (but for the decals and the head's hair, which keep their colours)");
 }
 
 /// All three bodies at once on the real field, a player each in a different colour: the old look and the new at 1920x1080
@@ -331,7 +343,8 @@ fn bare_dressed(frame: &AvatarFrame, look: Look) -> AvatarFrame {
 
 /// A white, grey or black identity colour has no hue to paint with (the colour sliders allow them): through the real
 /// renderer a white one leaves every body as it is, and grey and black darken it as the old tint did, without colouring
-/// it (the pixels that were grey stay grey). The shader agrees with the mirror there too.
+/// it (the pixels that were grey stay grey). The shader agrees with the mirror there too, on the cloth: what the model keeps
+/// as its own colours (the head's skin and hair, the face decals) is its own.
 #[test]
 #[ignore = "needs the owner's real FF7 data (FMV_FF7_LIBRARY or FMV_FF7_DATA) and a GPU or software Vulkan/GL driver"]
 fn offscreen_field_identity_white_grey_and_black_colours_keep_the_old_look() {
@@ -349,17 +362,28 @@ fn offscreen_field_identity_white_grey_and_black_colours_keep_the_old_look() {
             let plain = render(&mut gpu, &fx, &dressed(&flat, Look::Plain), false);
             let new = render(&mut gpu, &fx, &dressed(&flat, Look::New), false);
             let model_px: Vec<usize> = (0..plain.len()).step_by(4).filter(|&i| plain[i..i + 3] != empty[i..i + 3]).collect();
-            let agree = model_px
-                .iter()
-                .filter(|&&i| {
-                    let want = look::look(to_f(&plain[i..]), id, 1.0, 0.0).map(|c| (c.clamp(0.0, 1.0) * 255.0).round());
-                    (0..3).all(|k| (want[k] - f32::from(new[i + k])).abs() <= 2.0)
-                })
-                .count();
+            // The mirror has two outcomes for a pixel: the look of CLOTH (`face` 0) and the look of what the model keeps
+            // as its own colours (`face` 1: the face decals and the head's skin, hair and dark greys, flagged by
+            // `avatar::identity::head_colour_is_own`, under a weak 5% tint). A pixel is right when it is the one or the
+            // other, and the bulk of a body, its cloth, is the first.
+            let mirror = |i: usize, face: f32| {
+                let want = look::look(to_f(&plain[i..]), id, 1.0, face).map(|c| (c.clamp(0.0, 1.0) * 255.0).round());
+                (0..3).all(|k| (want[k] - f32::from(new[i + k])).abs() <= 2.0)
+            };
+            let agree = model_px.iter().filter(|&&i| mirror(i, 0.0)).count();
+            let agree_or_own = model_px.iter().filter(|&&i| mirror(i, 0.0) || mirror(i, 1.0)).count();
             let largest = model_px.iter().map(|&i| (0..3).map(|k| plain[i + k].abs_diff(new[i + k])).max().unwrap_or(0)).max().unwrap_or(0);
             let grey_stays_grey = model_px.iter().filter(|&&i| plain[i] == plain[i + 1] && plain[i + 1] == plain[i + 2]).all(|&i| new[i].abs_diff(new[i + 1]) <= 1 && new[i + 1].abs_diff(new[i + 2]) <= 1);
-            eprintln!("{:7} {name:5}: {:.1}% of {} pixels match the mirror; largest change from the untinted picture {largest}; grey stays grey: {grey_stays_grey}", body.archetype, 100.0 * agree as f32 / model_px.len() as f32, model_px.len());
-            assert!(agree as f32 > 0.97 * model_px.len() as f32, "{} {name}: the shader is the mirror", body.archetype);
+            let share = |n: usize| 100.0 * n as f32 / model_px.len() as f32;
+            eprintln!(
+                "{:7} {name:5}: {:.1}% of {} pixels match the mirror's cloth, {:.1}% match its cloth or its own colours; largest change from the untinted picture {largest}; grey stays grey: {grey_stays_grey}",
+                body.archetype,
+                share(agree),
+                model_px.len(),
+                share(agree_or_own)
+            );
+            assert!(agree as f32 > 0.85 * model_px.len() as f32, "{} {name}: the shader is the mirror on the cloth", body.archetype);
+            assert!(agree_or_own as f32 > 0.97 * model_px.len() as f32, "{} {name}: every pixel is the mirror's cloth or its own colours", body.archetype);
             assert!(grey_stays_grey, "{} {name}: no hue is added to grey", body.archetype);
             if name == "white" {
                 assert!(largest <= 2, "{}: a white identity colour leaves the model as it is (largest change {largest})", body.archetype);
@@ -425,14 +449,225 @@ fn real_identity_field_models_are_vertex_coloured_with_face_decals_only() {
         let asset = AvatarAsset::new(loader.load(&model).expect("loads")).expect("merges");
         let s = measure::shares(&asset.mesh);
         eprintln!(
-            "{:18} {} triangles: overlay {:.1}% textured {:.1}% skin-coloured {:.1}% pure black (under 8 of 255) {:.1}%",
+            "{:18} {} triangles: overlay {:.1}% hair (own colours) {:.1}% textured {:.1}% skin-coloured {:.1}% pure black (under 8 of 255) {:.1}%",
             model.appearance_ref,
             s.triangles,
             s.overlay * 100.0,
+            s.own * 100.0,
             s.textured * 100.0,
             s.skin * 100.0,
             s.black * 100.0
         );
+        // Only the three placeholder bodies are drawn in a player's colour, so only they must have a head's hair (and the
+        // head's skin, which is flagged with it) kept, and nothing but the head: a sixth of the model at most, never the body.
+        if PLACEHOLDER_BODIES.iter().any(|b| b.model.appearance_ref == model.appearance_ref) {
+            assert!(s.own < 0.25, "{}: the head's hair and skin are a fraction of a model, not {:.1}%", model.appearance_ref, s.own * 100.0);
+            let bone_of = |vertex: usize| asset.mesh.bone_runs.iter().find(|r| vertex >= r.start && vertex < r.start + r.len).map(|r| r.bone);
+            let flagged_off_head = (0..asset.mesh.own.len()).filter(|&i| asset.mesh.own[i] > 0.5).filter(|&i| asset.character.model.bones.get(bone_of(i).unwrap_or(usize::MAX)).map(|b| b.name.as_str()) != Some("head")).count();
+            assert_eq!(flagged_off_head, 0, "{}: nothing off the head keeps its colours as hair", model.appearance_ref);
+        }
         assert!(s.overlay < 0.02 && (s.overlay - s.textured).abs() < 1e-6, "{}: the overlay flag is the face decals", model.appearance_ref);
+    }
+}
+
+/// The owner's scene as the field has it: the field's non-player character at its own place and a body at each spawn point
+/// of the field, with the camera depth and the height on the screen of each. The owner's screenshot (`elevtr1`) has the
+/// player a quarter taller than `av_j`; this says how much of that is where they stand.
+#[test]
+#[ignore = "needs the owner's real FF7 data (FMV_FF7_LIBRARY or FMV_FF7_DATA) and a GPU or software Vulkan/GL driver"]
+fn offscreen_field_the_owners_scene_depths_and_heights() {
+    use crate::avatar::frame::NpcRef;
+    use fmv_adapter_api::AreaRuntime;
+    let Some(real) = open() else { return };
+    let Some(mut gpu) = Offscreen::new() else { return };
+    let key = std::env::var("FMV_FF7_AREA").unwrap_or_else(|_| "elevtr1".to_string());
+    let mut avatars = real::avatars(&real);
+    let fx = fixture_of(&real, &mut avatars, &key);
+    let area = real.adapter.load_field(&key).expect("field");
+    let none = bounds_scene(&fx);
+    let depth = |p: Pos| fx.stage.camera.project([f64::from(p.x), f64::from(p.y), f64::from(p.z)]).map_or(f64::NAN, |s| s[2]);
+    let spawns = area.spawn_points();
+    eprintln!("{key}: {} spawn point(s), field scale {}, model scale {}", spawns.len(), area.field_scale(), fx.stage.model_scale);
+    let npcs = area.npcs();
+    let mut all = Vec::new();
+    for n in &npcs {
+        let idle = n.appearance.idle_animation.clone().unwrap_or_default();
+        let player = AvatarPlayer {
+            who: Who(1),
+            pos: n.pos,
+            facing: n.facing,
+            anim: AnimState::Idle,
+            appearance: None,
+            npc: Some(NpcRef { model: &n.appearance.model, idle: Some(&idle) }),
+            tint: [0; 3],
+            own: false,
+            party: false,
+        };
+        let frame = frame_of(&mut avatars, &fx, std::slice::from_ref(&player));
+        let Some(_) = frame.models.first() else { continue };
+        let b = model_bbox(&frame, 0, &none, W1, H1);
+        eprintln!(
+            "npc {:6} {:5} at ({:.0}, {:.0}, {:.0}) camera depth {:.0}: {:.1} px tall, feet at y {:.0}, unconditional {}",
+            n.entity_name,
+            n.appearance.model,
+            n.pos.x,
+            n.pos.y,
+            n.pos.z,
+            depth(n.pos),
+            b.3 - b.1,
+            b.3,
+            n.unconditional
+        );
+        all.push((n.entity_name.clone(), b.3 - b.1, depth(n.pos), b.3));
+    }
+    for (i, s) in spawns.iter().enumerate() {
+        for (b, body) in PLACEHOLDER_BODIES.iter().enumerate() {
+            let player = body_player(2, b, *s, fx.toward, [240, 120, 40]);
+            let frame = frame_of(&mut avatars, &fx, &[player]);
+            let bb = model_bbox(&frame, 0, &none, W1, H1);
+            eprintln!(
+                "spawn {i} body {:7} at ({:.0}, {:.0}, {:.0}) camera depth {:.0}: {:.1} px tall, feet at y {:.0}",
+                body.archetype, s.x, s.y, s.z, depth(*s), bb.3 - bb.1, bb.3
+            );
+        }
+    }
+    // One picture of the scene: the character and a body at the first spawn point, drawn as the window does.
+    if let (Some(npc), Some(spawn)) = (npcs.first(), spawns.first()) {
+        let idle = npc.appearance.idle_animation.clone().unwrap_or_default();
+        let npc_player = AvatarPlayer {
+            who: Who(1),
+            pos: npc.pos,
+            facing: npc.facing,
+            anim: AnimState::Idle,
+            appearance: None,
+            npc: Some(NpcRef { model: &npc.appearance.model, idle: Some(&idle) }),
+            tint: [0; 3],
+            own: false,
+            party: false,
+        };
+        let players = [npc_player, body_player(2, 2, *spawn, fx.toward + 0.45, [240, 120, 40])];
+        let frame = frame_of(&mut avatars, &fx, &players);
+        let img = render(&mut gpu, &fx, &frame, true);
+        save_png(&format!("field_scene_{key}_npc_and_slight_at_spawn"), W1, H1, &img);
+    }
+    let _ = all;
+}
+
+/// The characters of a field standing at ONE place under the same camera, one picture each, side by side: the canon Cloud,
+/// the field's own non-player character (`av_j`, Jessie, in `elevtr1`; `FMV_FF7_AREA` and `FMV_FF7_NPC` pick others) and the
+/// placeholder bodies, so that scale, proportions and faces compare directly. Two sheets (the front and a three-quarter view),
+/// each with two rows: the models' own colours over the look the window draws a player in (the orange of the owner's
+/// character). Numbers: each model's height on the screen against Cloud's and the character's.
+#[test]
+#[ignore = "needs the owner's real FF7 data (FMV_FF7_LIBRARY or FMV_FF7_DATA) and a GPU or software Vulkan/GL driver"]
+fn offscreen_field_lineup_bodies_beside_cloud_and_an_npc() {
+    use crate::avatar::frame::NpcRef;
+    use fmv_adapter_api::AreaRuntime;
+    let Some(real) = open() else { return };
+    let Some(mut gpu) = Offscreen::new() else { return };
+    let key = std::env::var("FMV_FF7_AREA").unwrap_or_else(|_| "elevtr1".to_string());
+    let want = std::env::var("FMV_FF7_NPC").unwrap_or_else(|_| "av_j".to_string());
+    let mut avatars = real::avatars(&real);
+    let fx = fixture_of(&real, &mut avatars, &key);
+    let nearest = fx.open_places.iter().copied().min_by(|a, b| a.depth.total_cmp(&b.depth)).expect("an open place");
+    eprintln!("{key}: the characters stand at camera depth {:.0}", nearest.depth);
+    let area = real.adapter.load_field(&key).expect("field");
+    let spawns = area.npcs();
+    let npc = spawns.iter().find(|n| n.entity_name == want).or_else(|| spawns.first()).expect("the field has a character");
+    let (npc_model, npc_idle) = (npc.appearance.model.clone(), npc.appearance.idle_animation.clone().unwrap_or_default());
+    eprintln!("the character: {} ({npc_model}, standing clip {npc_idle})", npc.entity_name);
+
+    let none = bounds_scene(&fx);
+    // (label, a player that stands for it)
+    let lineup = |facing: f32, tint: [u8; 3]| -> Vec<(String, AvatarPlayer<'_>)> {
+        let canon = AvatarPlayer {
+            who: Who(1),
+            pos: nearest.pos,
+            facing,
+            anim: AnimState::Idle,
+            appearance: Some("ff7/cloud"),
+            npc: None,
+            tint,
+            own: false,
+            party: false,
+        };
+        let npc_player = AvatarPlayer { who: Who(2), appearance: None, npc: Some(NpcRef { model: &npc_model, idle: Some(&npc_idle) }), ..canon };
+        let mut out = vec![("cloud".to_string(), canon), (format!("npc {}", npc.entity_name), npc_player)];
+        out.extend(PLACEHOLDER_BODIES.iter().enumerate().map(|(b, body)| (body.archetype.to_string(), body_player(3 + b as u64, b, nearest.pos, facing, tint))));
+        out
+    };
+
+    let mut heights: Vec<(String, f32)> = Vec::new();
+    for ((view_name, facing), (colour, tint)) in [("front", fx.toward), ("three_quarter", fx.toward + 0.45)].into_iter().flat_map(|v| COLOURS.into_iter().take(2).map(move |c| (v, c))) {
+        let players = lineup(facing, tint);
+        let frames: Vec<AvatarFrame> = players.iter().map(|(_, p)| frame_of(&mut avatars, &fx, std::slice::from_ref(p))).collect();
+        let boxes: Vec<(f32, f32, f32, f32)> = frames.iter().map(|f| model_bbox(f, 0, &none, W1, H1)).collect();
+        let union = boxes.iter().fold((f32::MAX, f32::MAX, f32::MIN, f32::MIN), |u, b| (u.0.min(b.0), u.1.min(b.1), u.2.max(b.2), u.3.max(b.3)));
+        let (x0, y0) = (((union.0 - 14.0).max(0.0)) as u32, ((union.1 - 14.0).max(0.0)) as u32);
+        let (cw, ch) = ((((union.2 + 14.0) as u32).min(W1) - x0), (((union.3 + 14.0) as u32).min(H1) - y0));
+        if view_name == "front" {
+            heights = players.iter().zip(&boxes).map(|((label, _), b)| (label.clone(), b.3 - b.1)).collect();
+        }
+        // BOTH EYES: seen from the front, the model's own colours, the two eye quads each show their dark texels (pupil,
+        // lashes, brow), about as many on each side. One of them used to show none (the second eye of every model was not
+        // drawn: its texture coordinates are shifted by a whole number, see `mesh::whole_cell_offsets`).
+        if view_name == "front" && colour == "blue" {
+            let cam = Camera::fit(&none.bounds, W1 as f32, H1 as f32, MARGIN_PX);
+            for ((label, _), frame) in players.iter().zip(&frames) {
+                let model = &frame.models[0];
+                let img = render(&mut gpu, &fx, &dressed(frame, Look::Plain), false);
+                // The textured parts in file order: the right eye, the left eye and the mouth (the covered face of `sturdy` has only a mouth).
+                let (mut base, mut eyes) = (0usize, Vec::new());
+                for part in &model.asset.character.model.parts {
+                    let vertices = model.positions.get(base..base + part.positions.len()).unwrap_or(&[]);
+                    if part.texture.is_some() && eyes.len() < 2 && !vertices.is_empty() {
+                        let projected: Vec<(f32, f32)> = vertices.iter().map(|p| project_pixel(&cam, frame.zoom, W1, H1, *p)).collect();
+                        let lo = projected.iter().fold((f32::MAX, f32::MAX), |a, p| (a.0.min(p.0), a.1.min(p.1)));
+                        let hi = projected.iter().fold((f32::MIN, f32::MIN), |a, p| (a.0.max(p.0), a.1.max(p.1)));
+                        eyes.push((lo, hi));
+                    }
+                    base += part.positions.len();
+                }
+                if eyes.len() < 2 {
+                    eprintln!("{label}: no pair of eyes in the data (a covered face)");
+                    continue;
+                }
+                let dark_in = |(lo, hi): ((f32, f32), (f32, f32))| -> usize {
+                    (lo.1.floor().max(0.0) as u32..hi.1.ceil().min(H1 as f32) as u32)
+                        .flat_map(|y| (lo.0.floor().max(0.0) as u32..hi.0.ceil().min(W1 as f32) as u32).map(move |x| (x, y)))
+                        .filter(|&(x, y)| {
+                            let at = ((y * W1 + x) * 4) as usize;
+                            img.get(at..at + 3).is_some_and(|p| u32::from(p[0]) + u32::from(p[1]) + u32::from(p[2]) < 230)
+                        })
+                        .count()
+                };
+                let (a, b) = (dark_in(eyes[0]), dark_in(eyes[1]));
+                eprintln!("{label}: dark pixels in the two eye quads: {a} and {b}");
+                assert!(a >= 15 && b >= 15, "{label}: both eyes are drawn ({a} and {b} dark pixels)");
+                assert!(a.min(b) as f32 >= 0.4 * a.max(b) as f32, "{label}: the two eyes are about as visible as each other ({a} and {b})");
+            }
+        }
+        let mut rows = Vec::new();
+        for look in [Look::Plain, Look::New] {
+            let panels: Vec<Img> = frames
+                .iter()
+                .map(|frame| {
+                    // Nothing in front of them and no ring on the ground: the models alone, over the field's picture.
+                    let mut dressed = dressed(frame, look);
+                    dressed.ground.clear();
+                    dressed.scenery = None;
+                    crop(&render(&mut gpu, &fx, &dressed, true), W1, (x0, y0), (cw, ch), 3)
+                })
+                .collect();
+            rows.push(hstack(&panels));
+        }
+        let sheet = vstack(&rows);
+        eprintln!("{view_name} {colour}: {} characters, {}x{} px each at 3x; top row the models' own colours, bottom row the player look", players.len(), cw * 3, ch * 3);
+        save_png(&format!("field_lineup_{key}_{view_name}_{colour}"), sheet.w, sheet.h, &sheet.px);
+    }
+    let cloud_h = heights.iter().find(|(l, _)| l == "cloud").map_or(1.0, |h| h.1);
+    let npc_h = heights.iter().find(|(l, _)| l.starts_with("npc")).map_or(1.0, |h| h.1);
+    for (label, h) in &heights {
+        eprintln!("{label:12} {h:6.1} px tall at this spot: {:3.0}% of Cloud, {:3.0}% of the character", 100.0 * h / cloud_h, 100.0 * h / npc_h);
     }
 }

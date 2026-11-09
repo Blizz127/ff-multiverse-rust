@@ -20,7 +20,9 @@ pub mod exit {
     /// window or GPU start-up failed, or there is no usable account (nothing saved for the server
     /// and no `--name` to register one, several saved and none chosen, an unusable token file).
     pub const FAILURE: u8 = 1;
-    // Exit code 2 is reserved by clap for command-line usage errors.
+    /// A command-line usage error: clap's own code for a bad flag, and also the code of `--delete NAME` when no login is
+    /// saved for NAME on the server (a name that is not one of the saved characters is a wrong argument).
+    pub const USAGE: u8 = 2;
     /// Local content is missing or does not match the server's area (CannotJoin was sent), or the
     /// requested game's content cannot be opened locally (no library, no usable set, no archive).
     pub const CONTENT: u8 = 3;
@@ -31,7 +33,7 @@ EXIT CODES:
   0  success
   1  runtime failure (connect/handshake/server reject/connection lost/window or GPU start-up, or no
      usable account: nothing saved for the server and no --name to register one)
-  2  command-line usage error
+  2  command-line usage error (also --delete NAME when no login is saved for NAME)
   3  local content missing or not matching the server's area, or the game's content cannot be opened
 
 ACCOUNTS:
@@ -45,6 +47,19 @@ ACCOUNTS:
   --register creates a NEW account with --name and replaces the token saved for that name: use it
   when the server's accounts were reset (\"invalid or unknown token\"). The token is a password: it
   is never printed, except in the error shown when it could not be saved (so it is not lost).
+  --delete NAME deletes the character NAME on the server and exits, without a window and without game
+  files: it needs the login saved for NAME on --server (the saved logins the character menu lists, found the way
+  --name finds them) and asks the server to delete the character with it. The server moves the character's
+  records into a trash that only its operator can restore from, and the name is free again; a character
+  that is in the game right now (from this or another computer) is refused. The saved login is removed only when
+  the server says the character is gone, or that it never knew this login (its accounts were reset, or an earlier
+  delete whose answer was lost had worked); any other result keeps it. stdout carries exactly one line on success,
+  `deleted character name=<n>` or `character already gone on the server name=<n>` (<n> is the saved login's name
+  percent-encoded like the name= of the smoke line below), with exit code 0. On a failure (the server cannot be reached,
+  it refuses, the saved login cannot be removed) the error is on stderr, the saved login is kept and the exit code is
+  1; when no login is saved for NAME the exit code is 2 and nothing is sent. It cannot be combined with --name,
+  --register, --headless, --fullscreen, --game, the --ff7-* flags, --tint, --body, --slot or the flags of a
+  headless bot; only --server, --state-dir and --mute go with it.
   Your account has ONE original character that travels across games: a name, a colour and a body
   (its identity), how the game draws it and, in FF7, a fighting style: the stat curve (stats, spells and
   level curve) of one of the game's characters other than Cloud, the gunner's, say. Your character is
@@ -176,9 +191,13 @@ CHARACTER MENU:
   A window started without --name opens on a character menu instead of logging in at once; with
   --name the menu is skipped and the run behaves as before, and --headless never shows it. The
   menu lists the characters saved for the server (name, colour, body and `style: <name>`). Up/Down choose, Enter
-  plays, N creates a new one, Del forgets a saved login on THIS computer (it asks first; the
-  character stays on the server, but you can only log in as it again if you still have its
-  token), Esc quits. The create screen takes a name (up to 24 characters), a body (FF7: a generic
+  plays, N creates a new one, Del asks to delete the highlighted character: Y (or Enter on Delete) deletes it ON
+  THE SERVER with its saved login, so its name is free again (the server keeps a recoverable copy that only its
+  operator can restore, and a character that is in the game right now cannot be deleted), F forgets the saved
+  login on THIS computer only (the character stays on the server and its name stays taken: for a server that is
+  gone or on another protocol version), N or Esc keeps it, and the question starts on Keep. The saved login is
+  removed only once the server said the character is gone; if the server cannot be reached or refuses, the login
+  stays and the screen says why. Esc quits. The create screen takes a name (up to 24 characters), a body (FF7: a generic
   placeholder model: how you look on the field, nothing else), a colour (a palette plus red, green
   and blue sliders: the model is tinted with it) and a fighting style (FF7: Gunner, Martial artist, Mage,
   Guardian, Ninja, Gambler, Marksman or Lancer; the Gunner is the default): how you fight, its stats,
@@ -196,8 +215,8 @@ CONTROLLER:
   B = Backspace (back a level in a battle), and Esc in the character menu (back, cancel; it never
   quits); X = P (invite the nearest player), and in the character menu a new character or, on the
   create form, Backspace; Y = Y (accept an invite; in a battle it switches the menu to the next ready
-  member of your party), and in the character menu forget a saved login
-  (it asks first); Select = L (leave the party); Start = Esc (in the field a second press quits; in
+  member of your party), and in the character menu delete a saved character
+  (it asks first, and A then picks Keep, Delete or Forget here); Select = L (leave the party); Start = Esc (in the field a second press quits; in
   a battle it only backs out of the menu; in the character menu it backs out or quits); right
   bumper (R1/RB) = B (ask for a debug battle); left trigger (L2/LT), held = Shift (walk instead of
   run).
@@ -245,6 +264,41 @@ SOUND:
   the data time a sound for play as you pass them. A battle's sounds take over in a fight and the
   loops come back after it. FMV_FIELD_SOUNDS=off plays none, `data` (the default) what the scripts
   name. The log says `audio: field loop start ch1 42` and `audio: field sound ch1 62 (link)`.
+
+MODS:
+  Optional community mods are LAYERS over the accurate base game, each switched off on its own, and
+  all ON by default when their archives are found. They are YOUR OWN files, fetched onto this
+  machine (the tsunamods.com downloads), only ever read: nothing is extracted, copied or sent.
+    text   Echo-S 7's retranslated script as the dialog text (its own script section for the field,
+           per character; the original 1997 text is the switch back, and what plays where Echo-S has
+           nothing, for example a character it does not have)
+    voice  Echo-S's voice acting, played when a dialog window opens (it goes with Echo-S's text,
+           which its files are named for) and stopped when the window moves on or closes
+    music  Echo-S's \"Echoes of the Planet\" in place of the original track of the same name
+    sound  Cosmo Memory's sound effects in place of the original clip of the same sound id
+  Where the archives are: --echo-s FILE ($FMV_ECHO_S_IRO) and --cosmo-memory FILE ($FMV_COSMO_IRO),
+  or --mods-dir DIR ($FMV_MODS_DIR) for a folder that holds them (files, or folders that do); the
+  default folder is `mods` in the library's state directory (--ff7-library, else $FMV_STATE_DIR, else
+  ~/.local/share/ff-multiverse), looked in and never created. An archive is told by the ID in its own
+  mod.xml, not by its name. The same files are fetched separately onto each machine.
+  Where the switches are, one order for each layer: a flag, else an environment variable, else the
+  settings file, else on. --mods on|off (FMV_MODS) switches every layer; --mods-text, --mods-voice,
+  --mods-music and --mods-sound (FMV_MODS_TEXT, FMV_MODS_VOICE, FMV_MODS_MUSIC, FMV_MODS_SOUND) one
+  each; the settings file is `settings.json` in the mods folder (--mods-settings FILE or
+  FMV_MODS_SETTINGS names another): a JSON object of booleans, for example {\"voice\": false}, read
+  and never written. With nothing found every layer plays the base game.
+  A line on stderr says each layer's effective source: `mods: text=echo-s voice=echo-s music=echo-s
+  sound=cosmo [echo-s 1.24, cosmo 1.22]` (`original (off)` for a switched-off layer, `original (no
+  archive)` for one with nothing to play), and a `mods: note:` line for an archive that is damaged,
+  truncated or the wrong mod. A conversation says where its text came from (`mods: talk <field>
+  <npc>: echo-s section|original section`), each window of a voiced one which clip the voice layer
+  has for it (`mods: window <field>#<dialog> w<window> voice <field>/<clip>|none`), a voice that
+  plays `audio: voice <field>/<clip>` (a clip's archive path, never its words), a track and a sound
+  the same way (`audio: music <name> from echo-s`, `audio: sound <id> from cosmo`). Voices, music and
+  sounds play only through the soundtrack (see SOUND: it needs your original sound files in the
+  library, and `--mute`, FMV_AUDIO=off or a headless run without FMV_AUDIO turn it off); a run
+  without it says `mods: the voice, music and sound layers play nothing in this run (<why>)`.
+  FMV_AUDIO=null runs them against a clock with no output device.
 
 WINDOW CONTROLS:
   WASD / arrow keys move, Esc twice quits (never during a battle: close the window to quit
@@ -309,6 +363,14 @@ pub struct Args {
     /// server's accounts were reset and the saved token is no longer known).
     #[arg(long, requires = "name")]
     pub register: bool,
+
+    /// Delete the character NAME on the server and exit: no window, no game files. It needs the login saved for
+    /// NAME on --server and asks the server to delete the character with it; the saved login is removed only when
+    /// the server says the character is gone (or never knew the login). One line on stdout on success
+    /// (`deleted character name=<n>` or `character already gone on the server name=<n>`), exit code 1 on a failure
+    /// (the login is kept) and 2 when no login is saved for NAME. See ACCOUNTS below.
+    #[arg(long, value_name = "NAME", value_parser = parse_name, conflicts_with_all = DELETE_CONFLICTS)]
+    pub delete: Option<String>,
 
     /// Where this client keeps its state, the saved account tokens (in `accounts/`). Default:
     /// $FMV_STATE_DIR/client, else the user data directory's ff-multiverse/client.
@@ -483,10 +545,64 @@ pub struct Args {
     /// canon Barret of md1stin, who is no script entity) has `nothing to say`. Without FF7 data nobody has.
     #[arg(long, value_name = "NAME[,NAME...]", value_delimiter = ',', value_parser = parse_npc_name, requires = "headless")]
     pub talk: Vec<String>,
+
+    /// The optional community-mod layers (Echo-S, Cosmo Memory): where their archives are and which layers are on. See MODS.
+    #[command(flatten)]
+    pub mods: crate::mods::ModFlags,
 }
 
 /// Default server for `--server`. Kept in sync with `DEFAULT_DEV_PORT` by a unit test.
 const DEFAULT_SERVER: &str = "127.0.0.1:47770";
+
+/// What `--delete NAME` cannot be combined with: every flag but `--server`, `--state-dir` (where the saved logins are)
+/// and `--mute` (which a script may pass to every run). A delete names its character itself, opens no window, reads no
+/// game files and runs no bot; the bot's flags need `--headless`, a requirement clap waives next to an argument that
+/// conflicts with it, so they have to be named here or they would be accepted and ignored. A unit test checks that every
+/// flag of [`Args`] is either here or one of those three, so a flag added later has to be decided about.
+const DELETE_CONFLICTS: [&str; 37] = [
+    // who it is
+    "name",
+    "register",
+    "tint",
+    "body",
+    "slot",
+    // a window
+    "headless",
+    "fullscreen",
+    // game files
+    "game",
+    "ff7_library",
+    "ff7_set",
+    "ff7_flevel",
+    "ff7_edition",
+    "ff7_region",
+    "ff7_language",
+    "ff7_revision",
+    // a bot
+    "bot",
+    "duration",
+    "party_invite_first_peer",
+    "party_accept",
+    "battle_auto",
+    "battle_script",
+    "debug_encounters",
+    "battle_wait_party",
+    "travel",
+    "travel_follow",
+    "story_advance",
+    "party_accept_after_split",
+    "talk",
+    // the mod layers (a delete shows no text and plays no sound; the ids are the fields of `mods::ModFlags`)
+    "dir",
+    "echo_s",
+    "cosmo",
+    "all",
+    "text",
+    "voice",
+    "music",
+    "sound",
+    "settings",
+];
 
 impl Args {
     /// The tint to send in `Hello`: the explicit `--tint`, or one derived from `name`. (Only a
@@ -509,9 +625,10 @@ impl Args {
 
     /// Does this run open on the character menu? A window without `--name` does: the player
     /// chooses or creates a character there. `--name` (log in as, or register, that name) keeps
-    /// the command-line behaviour, and `--headless` never shows a menu.
+    /// the command-line behaviour, `--headless` never shows a menu, and `--delete` is a command that
+    /// opens no window at all.
     pub fn wants_menu(&self) -> bool {
-        !self.headless && self.name.is_none()
+        !self.headless && self.name.is_none() && self.delete.is_none()
     }
 
     /// The game whose content to use. Any `--ff7-*` source flag asks for FF7, even next to
@@ -900,6 +1017,109 @@ mod tests {
         assert_eq!(a.effective_tint("anything"), [1, 2, 3]);
     }
 
+    /// `--delete NAME` is a command of its own: it takes a name (cleaned like `--name`'s), the `--server` (which has a default,
+    /// as for `--name`) and the state directory, and it cannot go with what logs in, registers, opens a window or reads game
+    /// files.
+    #[test]
+    fn delete_takes_a_name_a_server_and_a_state_dir_and_is_a_command_of_its_own() {
+        let a = Args::try_parse_from(["fmv-client", "--delete", "Cloud"]).unwrap();
+        assert_eq!(a.delete.as_deref(), Some("Cloud"));
+        assert_eq!(a.server, DEFAULT_SERVER, "the server is --server's, with the default every mode has");
+        assert!(!a.wants_menu() && !a.headless && !a.register && a.name.is_none());
+        // The name is cleaned like the server cleans it, as --name's is.
+        let a = Args::try_parse_from(["fmv-client", "--delete", "  Cl\u{200b}oud\n "]).unwrap();
+        assert_eq!(a.delete.as_deref(), Some("Cloud"));
+        // The server and the state directory are the ones --name would use.
+        let a = Args::try_parse_from(["fmv-client", "--delete", "Cloud", "--server", "10.0.0.9:47771", "--state-dir", "/tmp/s"]).unwrap();
+        assert_eq!((a.server.as_str(), a.client_state_dir()), ("10.0.0.9:47771", Ok(PathBuf::from("/tmp/s"))));
+        // Without it nothing is deleted.
+        assert_eq!(Args::try_parse_from(["fmv-client", "--name", "x"]).unwrap().delete, None);
+        assert_eq!(Args::try_parse_from(["fmv-client"]).unwrap().delete, None);
+        // It needs a name, and a name that is nothing once cleaned is refused.
+        assert!(Args::try_parse_from(["fmv-client", "--delete"]).is_err());
+        assert!(Args::try_parse_from(["fmv-client", "--delete", "\u{7}\u{7}"]).is_err());
+        // Not with what logs in, registers, opens a window or reads game files (an explicit --game counts, the default does not).
+        let conflicts: [&[&str]; 13] = [
+            &["--name", "x"],
+            &["--register", "--name", "x"],
+            &["--register"],
+            &["--headless"],
+            &["--fullscreen"],
+            &["--game", "ff7"],
+            &["--game", "fixture"],
+            &["--ff7-library", "/x"],
+            &["--ff7-set", "s"],
+            &["--ff7-flevel", "/y"],
+            &["--tint", "ff8800"],
+            &["--body", "slim"],
+            &["--slot", "tifa"],
+        ];
+        for extra in conflicts {
+            let args = ["fmv-client", "--delete", "Cloud"].into_iter().chain(extra.iter().copied());
+            assert!(Args::try_parse_from(args).is_err(), "--delete cannot go with {extra:?}");
+        }
+        // The flags of the bot need a headless run, which a delete is not: clap waives that requirement next to a conflicting
+        // argument, so they are named in the conflicts of --delete too (or they would be accepted and ignored).
+        for extra in [
+            &["--bot", "idle"][..],
+            &["--duration", "3"],
+            &["--party-invite-first-peer"],
+            &["--party-accept"],
+            &["--battle-auto"],
+            &["--battle-script", "attack"],
+            &["--debug-encounters"],
+            &["--travel", "md1_1"],
+            &["--story-advance"],
+            &["--talk", "gu0"],
+            &["--ff7-edition", "x"],
+        ] {
+            let args = ["fmv-client", "--delete", "Cloud"].into_iter().chain(extra.iter().copied());
+            assert!(Args::try_parse_from(args).is_err(), "--delete cannot go with {extra:?}");
+        }
+        // Sound has nothing to do with it either way: it is accepted (and ignored), so a script can pass its usual flags.
+        assert!(Args::try_parse_from(["fmv-client", "--delete", "Cloud", "--mute"]).is_ok());
+    }
+
+    /// Every flag of the client has been decided about for `--delete`: it conflicts with it, or it is one of the three that
+    /// a delete uses or ignores. A flag added later without a decision fails here instead of being silently ignored.
+    #[test]
+    fn every_flag_is_either_a_conflict_of_delete_or_one_a_delete_uses() {
+        use clap::CommandFactory;
+        let command = Args::command();
+        let ids: Vec<&str> = command.get_arguments().map(|a| a.get_id().as_str()).collect();
+        let allowed = ["server", "state_dir", "mute", "delete", "help", "version"];
+        for id in &ids {
+            assert!(allowed.contains(id) || DELETE_CONFLICTS.contains(id), "--{id} has no decision for --delete: add it to DELETE_CONFLICTS (or to this test's allowed list)");
+        }
+        for id in DELETE_CONFLICTS {
+            assert!(ids.contains(&id), "DELETE_CONFLICTS names `{id}`, which is not an argument");
+        }
+        // The three a delete uses (or ignores) really are accepted next to it.
+        for extra in [["--server", "10.0.0.9:1"].as_slice(), &["--state-dir", "/tmp/s"], &["--mute"]] {
+            let args = ["fmv-client", "--delete", "Cloud"].into_iter().chain(extra.iter().copied());
+            assert!(Args::try_parse_from(args).is_ok(), "--delete can go with {extra:?}");
+        }
+    }
+
+    #[test]
+    fn the_help_documents_delete_its_line_and_its_exit_codes() {
+        use clap::CommandFactory;
+        let help = Args::command().render_long_help().to_string();
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        for needle in [
+            "--delete <NAME>",
+            "--delete NAME deletes the character NAME on the server and exits, without a window and without game files",
+            "a character that is in the game right now (from this or another computer) is refused",
+            "The saved login is removed only when the server says the character is gone, or that it never knew this login",
+            "`deleted character name=<n>` or `character already gone on the server name=<n>`",
+            "percent-encoded like the name= of the smoke line below",
+            "the saved login is kept and the exit code is 1; when no login is saved for NAME the exit code is 2 and nothing is sent",
+            "2 command-line usage error (also --delete NAME when no login is saved for NAME)",
+        ] {
+            assert!(flat.contains(needle), "--help must mention {needle:?}:\n{help}");
+        }
+    }
+
     #[test]
     fn a_new_character_asks_for_the_tint_the_body_and_the_slot_given_and_nothing_else() {
         let a = Args::try_parse_from(["fmv-client", "--name", "Wedge"]).unwrap();
@@ -1177,6 +1397,8 @@ mod tests {
         assert!(wants(&["--server", "10.0.0.1:1"]));
         assert!(wants(&["--game", "ff7"]));
         assert!(wants(&["--tint", "ff8800"]), "a tint alone does not name a character");
+        // --delete is a command that opens no window at all, so no menu.
+        assert!(!wants(&["--delete", "Cloud"]));
         // --name keeps the command-line behaviour (log in as, or register, that name).
         assert!(!wants(&["--name", "Cloud"]));
         assert!(!wants(&["--name", "Cloud", "--register"]));
@@ -1192,7 +1414,10 @@ mod tests {
         for needle in [
             "CHARACTER MENU:",
             "N creates a new one",
-            "Del forgets a saved login on THIS computer",
+            "Del asks to delete the highlighted character",
+            "Y (or Enter on Delete) deletes it ON THE SERVER",
+            "F forgets the saved login on THIS computer only",
+            "N or Esc keeps it",
             "the menu is skipped",
             "--headless never shows it",
             "name taken, registration closed, rate limited",

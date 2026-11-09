@@ -1,0 +1,23 @@
+[package]
+name = "fmv-mods"
+description = "Optional community-mod layers over the owner's own FF7 content: a bounded, read-only reader for 7th Heaven's .iro archives, the FFNx file conventions the Echo-S (script, voices, music) and Cosmo Memory (sound effects) layers follow, and the lookups the client builds on. Reads the owner's own mod files only; never extracts, copies or redistributes them."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[features]
+# The synthetic `.iro` writer of `iro::testkit`, for the tests of the crates that build on this one (test code
+# only; nothing in a release build uses it).
+testkit = []
+
+[dependencies]
+# The FF7 field decoders: Echo-S ships replacement `flevel.lgp` entries, whose dialog text is read with the
+# same LZSS, field and script decoders the game's own fields are (read-only; nothing here writes anywhere).
+fmv-ff7.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+# This crate's own test kit, for its integration tests.
+fmv-mods = { path = ".", features = ["testkit"] }

@@ -5,8 +5,11 @@
 //! # Screens
 //!
 //! * **Select**: the characters saved for this server (arrows, Enter plays, `N` creates, `Del`
-//!   asks to forget a saved login on THIS machine, `Esc` quits). Forgetting is confirmed first
-//!   and never touches the server.
+//!   asks to delete the highlighted character, `Esc` quits). The question has three answers, `Keep`
+//!   (the default, and `N` or `Esc`), `Delete` (`Y`: the character is deleted ON THE SERVER, [`MenuAction::Delete`])
+//!   and `Forget` (`F`: only the saved login on THIS machine goes, [`MenuAction::Forget`]; the server keeps the
+//!   character, which is what clears a login of a server that is gone or on another protocol version).
+//!   Nothing is deleted or forgotten without an answer, and a held key never answers.
 //! * **Create**: name, body, tint (a palette grid and three sliders), combat slot, then Create or Back,
 //!   in that order (the body and the slot only when the game offers them: the synthetic FIXTURE offers
 //!   neither). Left, Right and Space change a choice, Enter registers (wherever the focus is, except
@@ -16,7 +19,8 @@
 //!   feet and its swatch in the list), and the **slot** is who it fights as (FF7: the combat moves and
 //!   level curve of a canon party member other than Cloud, fixed once created). The slot says nothing
 //!   about how the character looks.
-//! * **Connecting**: an attempt is running; Esc abandons it.
+//! * **Connecting**: an attempt is running (a login, a registration or the deleting of a character); Esc
+//!   abandons it (for a delete: stops waiting, the server may still carry it out) and nothing else does anything.
 //! * **Loading**: the area is being prepared after the join.
 //!
 //! Whatever the server answers to an attempt comes back through [`Menu::connect_failed`] as a
@@ -222,9 +226,14 @@ pub enum MenuAction {
     /// Create a character: register `name` with this tint, body and combat slot (`None` for a game that
     /// offers none: the FIXTURE).
     Register { name: String, tint: [u8; 3], body: Option<String>, slot: Option<u8> },
-    /// Forget the saved login of the character at this index (locally; never on the server).
+    /// Delete the character at this index of [`Menu::accounts`] ON THE SERVER: the host asks the server, and takes the
+    /// saved login out only when the server says the character is gone (a failure keeps it). The menu is already
+    /// waiting ([`Screen::Connecting`] with [`Target::Delete`]).
+    Delete { index: usize },
+    /// Forget the saved login of the character at this index on THIS computer only (the server is not asked and keeps
+    /// the character).
     Forget { index: usize },
-    /// Abandon the running connection attempt.
+    /// Abandon the running connection attempt (or stop waiting for a delete).
     CancelConnect,
 }
 
@@ -305,18 +314,43 @@ impl MenuConfig {
     }
 }
 
+/// The answers to the "delete this character?" question, in the order of the buttons (and of the focus).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfirmChoice {
+    /// Keep the character and its saved login (the default).
     Keep,
+    /// Delete the character on the server (`Y`).
+    Delete,
+    /// Forget the saved login on this computer only (`F`).
     Forget,
 }
 
-/// The "forget this saved login?" question.
+impl ConfirmChoice {
+    /// The button to the right (the last one wraps to the first).
+    fn next(self) -> Self {
+        match self {
+            ConfirmChoice::Keep => ConfirmChoice::Delete,
+            ConfirmChoice::Delete => ConfirmChoice::Forget,
+            ConfirmChoice::Forget => ConfirmChoice::Keep,
+        }
+    }
+
+    /// The button to the left (the first wraps to the last).
+    fn prev(self) -> Self {
+        match self {
+            ConfirmChoice::Keep => ConfirmChoice::Forget,
+            ConfirmChoice::Delete => ConfirmChoice::Keep,
+            ConfirmChoice::Forget => ConfirmChoice::Delete,
+        }
+    }
+}
+
+/// The "delete this character?" question.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Confirm {
     /// Index into [`Menu::accounts`].
     pub index: usize,
-    /// Starts on `Keep`: forgetting needs a deliberate move or the `Y` key.
+    /// Starts on `Keep`: deleting or forgetting needs a deliberate move (or the `Y` or `F` key).
     pub focus: ConfirmChoice,
 }
 
@@ -486,6 +520,8 @@ impl CreateForm {
 pub enum Target {
     Login { name: String },
     Register { name: String },
+    /// Deleting this saved character on the server (the host runs the request; the menu only waits).
+    Delete { name: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -513,7 +549,7 @@ pub enum Screen {
 pub enum PadScreen {
     /// The list of saved characters.
     List,
-    /// The "forget this saved login?" question over the list.
+    /// The "delete this character?" question over the list.
     Question,
     /// The create form; `can_go_back`: there is a list to go back to.
     Form { can_go_back: bool },
@@ -698,7 +734,7 @@ impl Menu {
             let previous = std::mem::replace(c.previous.as_mut(), Screen::Loading(String::new()));
             let registered = match &c.target {
                 Target::Register { name } => self.accounts.iter().position(|a| a.name.to_lowercase() == name.to_lowercase()),
-                Target::Login { .. } => None,
+                Target::Login { .. } | Target::Delete { .. } => None,
             };
             let screen = match (registered, previous) {
                 (Some(cursor), _) => Screen::Select(SelectState { cursor, confirm: None }),
@@ -712,6 +748,15 @@ impl Menu {
             self.screen = self.restored(screen);
         }
         self.notice = Some(notice);
+    }
+
+    /// A delete the menu was waiting for is over, whatever came of it (the server deleted the character, or it did
+    /// not): show `notice` and give the player back the list it started from, made valid for the saved characters as
+    /// they are now (a login that was forgotten has to be out of [`refresh_accounts`](Self::refresh_accounts) first;
+    /// the last one leaves the create form). It is [`connect_failed`](Self::connect_failed) under the name that says what
+    /// it is for: coming back from a delete is the same thing as coming back from an attempt that failed.
+    pub fn delete_over(&mut self, notice: Notice) {
+        self.connect_failed(notice);
     }
 
     /// A key was pressed. Returns what the host has to do, if anything.
@@ -764,17 +809,22 @@ impl Menu {
         let Screen::Select(s) = &mut self.screen else { return None };
         if let Some(confirm) = &mut s.confirm {
             return match press.key {
-                NavKey::Left | NavKey::Right | NavKey::Up | NavKey::Down | NavKey::Tab => {
-                    confirm.focus = match confirm.focus {
-                        ConfirmChoice::Keep => ConfirmChoice::Forget,
-                        ConfirmChoice::Forget => ConfirmChoice::Keep,
-                    };
+                NavKey::Left | NavKey::Up => {
+                    confirm.focus = confirm.focus.prev();
+                    None
+                }
+                NavKey::Right | NavKey::Down => {
+                    confirm.focus = confirm.focus.next();
+                    None
+                }
+                NavKey::Tab => {
+                    confirm.focus = if press.shift { confirm.focus.prev() } else { confirm.focus.next() };
                     None
                 }
                 NavKey::Enter => {
                     let c = *confirm;
                     s.confirm = None;
-                    (c.focus == ConfirmChoice::Forget).then_some(MenuAction::Forget { index: c.index })
+                    self.answer(c.index, c.focus)
                 }
                 NavKey::Escape => {
                     s.confirm = None;
@@ -809,7 +859,11 @@ impl Menu {
             return match c.to_ascii_lowercase() {
                 'y' => {
                     s.confirm = None;
-                    Some(MenuAction::Forget { index: confirm.index })
+                    self.answer(confirm.index, ConfirmChoice::Delete)
+                }
+                'f' => {
+                    s.confirm = None;
+                    self.answer(confirm.index, ConfirmChoice::Forget)
                 }
                 'n' => {
                     s.confirm = None;
@@ -823,6 +877,20 @@ impl Menu {
             self.notice = None;
         }
         None
+    }
+
+    /// The player answered the question about the character at `index` with `choice`: what that does. Keeping does
+    /// nothing; forgetting is the host's, at once, and local; deleting makes the menu wait for the server (the screen
+    /// the question was on is where it comes back to), while the host asks.
+    fn answer(&mut self, index: usize, choice: ConfirmChoice) -> Option<MenuAction> {
+        match choice {
+            ConfirmChoice::Keep => None,
+            ConfirmChoice::Forget => Some(MenuAction::Forget { index }),
+            ConfirmChoice::Delete => {
+                let name = self.accounts.get(index)?.name.clone();
+                Some(self.begin(Target::Delete { name }, MenuAction::Delete { index }))
+            }
+        }
     }
 
     // ----- create -------------------------------------------------------------------------
@@ -980,12 +1048,18 @@ impl Menu {
         action
     }
 
-    /// Escape while connecting: back to where the attempt started.
+    /// Escape while connecting: back to where the attempt started. Giving up on a delete says that the server may
+    /// still carry it out (the request was sent; only the wait is over), and how to find out.
     fn abandon(&mut self) -> Option<MenuAction> {
         if let Screen::Connecting(c) = &mut self.screen {
             let previous = std::mem::replace(c.previous.as_mut(), Screen::Loading(String::new()));
+            let notice = match &c.target {
+                Target::Delete { name } => Notice::info(format!("Stopped waiting for the server. {name} may still be deleted there."))
+                    .with_hint("Press Del, then Y to ask again: the server says whether it is gone."),
+                Target::Login { .. } | Target::Register { .. } => Notice::info("Cancelled."),
+            };
             self.screen = self.restored(previous);
-            self.notice = Some(Notice::info("Cancelled."));
+            self.notice = Some(notice);
         }
         Some(MenuAction::CancelConnect)
     }
@@ -1160,10 +1234,22 @@ mod tests {
         assert!(matches!(m.screen(), Screen::Select(s) if s.confirm.is_none()));
     }
 
-    // ---- forgetting a saved login --------------------------------------------------------------
+    // ---- deleting a character, or forgetting its saved login ------------------------------------
+
+    /// The question that is open on the list (panics when there is none).
+    fn question(m: &Menu) -> Confirm {
+        match m.screen() {
+            Screen::Select(s) => s.confirm.expect("the question is open"),
+            other => panic!("not the list: {other:?}"),
+        }
+    }
+
+    fn asking(m: &Menu) -> bool {
+        matches!(m.screen(), Screen::Select(s) if s.confirm.is_some())
+    }
 
     #[test]
-    fn delete_asks_first_and_the_default_answer_keeps_the_login() {
+    fn del_asks_first_and_the_default_answer_keeps_the_character() {
         let mut m = menu_with(&["Cloud", "Tifa"]);
         press(&mut m, NavKey::Down);
         assert_eq!(press(&mut m, NavKey::Delete), None);
@@ -1173,47 +1259,204 @@ mod tests {
         assert_eq!(press(&mut m, NavKey::Enter), None);
         assert!(matches!(m.screen(), Screen::Select(s) if s.confirm.is_none()));
         assert_eq!(m.accounts().len(), 2);
+        assert!(!m.is_connecting());
     }
 
     #[test]
-    fn forgetting_needs_a_deliberate_choice() {
+    fn the_answers_are_keep_delete_forget_in_that_order_and_the_focus_goes_round() {
+        use ConfirmChoice::{Delete, Forget, Keep};
+        let focus_after = |keys: &[NavKey]| {
+            let mut m = menu_with(&["Cloud", "Tifa"]);
+            press(&mut m, NavKey::Delete);
+            keys.iter()
+                .map(|key| {
+                    press(&mut m, *key);
+                    question(&m).focus
+                })
+                .collect::<Vec<_>>()
+        };
+        for key in [NavKey::Right, NavKey::Down, NavKey::Tab] {
+            assert_eq!(focus_after(&[key, key, key, key]), [Delete, Forget, Keep, Delete], "{key:?}");
+        }
+        for key in [NavKey::Left, NavKey::Up] {
+            assert_eq!(focus_after(&[key, key, key, key]), [Forget, Delete, Keep, Forget], "{key:?}");
+        }
+        // Shift+Tab goes back like Left.
+        let mut m = menu_with(&["Cloud"]);
+        press(&mut m, NavKey::Delete);
+        m.key(KeyPress::shifted(NavKey::Tab));
+        assert_eq!(question(&m).focus, Forget);
+        m.key(KeyPress::shifted(NavKey::Tab));
+        assert_eq!(question(&m).focus, Delete);
+    }
+
+    #[test]
+    fn deleting_needs_a_deliberate_choice_and_then_the_menu_waits_for_the_server() {
         let mut m = menu_with(&["Cloud", "Tifa"]);
-        // Move to the other answer, then Enter.
+        // One move to the Delete button, then Enter.
         press(&mut m, NavKey::Delete);
         press(&mut m, NavKey::Right);
-        assert!(matches!(m.screen(), Screen::Select(s) if s.confirm.map(|c| c.focus) == Some(ConfirmChoice::Forget)));
-        assert_eq!(press(&mut m, NavKey::Enter), Some(MenuAction::Forget { index: 0 }));
-        assert!(matches!(m.screen(), Screen::Select(s) if s.confirm.is_none()));
-        // The Y key says yes at once; N and Escape say no.
+        assert_eq!(question(&m).focus, ConfirmChoice::Delete);
+        assert_eq!(press(&mut m, NavKey::Enter), Some(MenuAction::Delete { index: 0 }));
+        // The menu waits on its waiting screen, which remembers the list it started from.
+        match m.screen() {
+            Screen::Connecting(c) => {
+                assert_eq!(c.target, Target::Delete { name: "Cloud".into() });
+                assert!(matches!(c.previous.as_ref(), Screen::Select(s) if s.cursor == 0 && s.confirm.is_none()));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(m.is_connecting());
+        assert_eq!(m.accounts().len(), 2, "nothing leaves the list until the host says so");
+        // The Y key answers at once, for the character under the cursor, in either case.
+        let mut m = menu_with(&["Cloud", "Tifa"]);
+        press(&mut m, NavKey::Down);
         press(&mut m, NavKey::Delete);
-        assert_eq!(m.text("y"), Some(MenuAction::Forget { index: 0 }));
+        assert_eq!(m.text("y"), Some(MenuAction::Delete { index: 1 }));
+        assert!(matches!(m.screen(), Screen::Connecting(c) if c.target == Target::Delete { name: "Tifa".into() }));
+        let mut m = menu_with(&["Cloud"]);
         press(&mut m, NavKey::Delete);
-        assert_eq!(m.text("n"), None);
-        assert!(matches!(m.screen(), Screen::Select(s) if s.confirm.is_none()));
-        press(&mut m, NavKey::Delete);
-        assert_eq!(press(&mut m, NavKey::Escape), None, "Escape answers no instead of quitting");
-        assert!(matches!(m.screen(), Screen::Select(s) if s.confirm.is_none()));
-        // Any other letter is not an answer.
-        press(&mut m, NavKey::Delete);
-        assert_eq!(m.text("qxz"), None);
-        assert!(matches!(m.screen(), Screen::Select(s) if s.confirm.is_some()));
+        assert_eq!(m.text("Y"), Some(MenuAction::Delete { index: 0 }));
     }
 
     #[test]
-    fn a_held_delete_does_not_confirm_anything_and_other_keys_are_ignored_while_asking() {
+    fn forgetting_here_is_f_or_the_last_button_and_waits_for_nothing() {
+        let mut m = menu_with(&["Cloud", "Tifa"]);
+        press(&mut m, NavKey::Delete);
+        assert_eq!(m.text("f"), Some(MenuAction::Forget { index: 0 }));
+        assert!(matches!(m.screen(), Screen::Select(s) if s.confirm.is_none()), "the question is closed and the list is as it was");
+        press(&mut m, NavKey::Delete);
+        assert_eq!(m.text("F"), Some(MenuAction::Forget { index: 0 }));
+        // Two moves to the Forget button (or one the other way round), then Enter.
+        press(&mut m, NavKey::Delete);
+        press(&mut m, NavKey::Right);
+        press(&mut m, NavKey::Right);
+        assert_eq!(question(&m).focus, ConfirmChoice::Forget);
+        assert_eq!(press(&mut m, NavKey::Enter), Some(MenuAction::Forget { index: 0 }));
+        press(&mut m, NavKey::Delete);
+        press(&mut m, NavKey::Left);
+        assert_eq!(press(&mut m, NavKey::Enter), Some(MenuAction::Forget { index: 0 }));
+        assert!(!m.is_connecting(), "forgetting is local and at once: the menu never waits for it");
+    }
+
+    #[test]
+    fn n_and_escape_keep_everything_and_no_other_letter_is_an_answer() {
+        let mut m = menu_with(&["Cloud", "Tifa"]);
+        press(&mut m, NavKey::Delete);
+        assert_eq!(m.text("n"), None);
+        assert!(!asking(&m));
+        press(&mut m, NavKey::Delete);
+        assert_eq!(m.text("N"), None);
+        assert!(!asking(&m));
+        press(&mut m, NavKey::Delete);
+        assert_eq!(press(&mut m, NavKey::Escape), None, "Escape answers no instead of quitting");
+        assert!(!asking(&m));
+        // Any other letter is not an answer: not the d of delete, not a digit, not a space.
+        press(&mut m, NavKey::Delete);
+        for letters in ["qxz", "d", "D", "k", " ", "1"] {
+            assert_eq!(m.text(letters), None, "{letters:?}");
+            assert!(asking(&m), "{letters:?} did not answer");
+        }
+        assert!(!m.is_connecting());
+        assert_eq!(m.accounts().len(), 2);
+    }
+
+    #[test]
+    fn a_held_key_never_answers_and_other_keys_are_ignored_while_asking() {
         let mut m = menu_with(&["Cloud"]);
         press(&mut m, NavKey::Delete);
         assert_eq!(m.key(KeyPress::repeating(NavKey::Delete)), None);
-        let Screen::Select(s) = m.screen() else { panic!() };
-        assert_eq!(s.confirm.map(|c| c.focus), Some(ConfirmChoice::Keep));
-        // Down does not move the list underneath the question.
+        assert_eq!(question(&m).focus, ConfirmChoice::Keep);
+        // A held Enter on the Delete button, or on the Forget button, is not a press: nothing is answered.
+        press(&mut m, NavKey::Right);
+        assert_eq!(m.key(KeyPress::repeating(NavKey::Enter)), None);
+        assert!(asking(&m) && !m.is_connecting());
+        press(&mut m, NavKey::Right);
+        assert_eq!(m.key(KeyPress::repeating(NavKey::Enter)), None);
+        assert!(asking(&m) && !m.is_connecting());
+        // Nor does a held Escape close the question, or a held Tab move its focus.
+        assert_eq!(m.key(KeyPress::repeating(NavKey::Escape)), None);
+        assert_eq!(m.key(KeyPress::repeating(NavKey::Tab)), None);
+        assert_eq!(question(&m).focus, ConfirmChoice::Forget);
+        // Down moves the focus of the question, and the other list keys do not move the list underneath it.
         let mut m = menu_with(&["Cloud", "Tifa"]);
         press(&mut m, NavKey::Delete);
         press(&mut m, NavKey::PageDown);
+        press(&mut m, NavKey::End);
         assert_eq!(cursor(&m), 0);
         // N does not open the create form while asking (it answers "no").
         m.text("n");
         assert!(matches!(m.screen(), Screen::Select(_)));
+        // A held Y (the key repeating as typed text) is one answer: the first deletes, the rest find the waiting screen.
+        let mut m = menu_with(&["Cloud", "Tifa"]);
+        press(&mut m, NavKey::Delete);
+        assert_eq!(m.text("yyyy"), Some(MenuAction::Delete { index: 0 }));
+        assert!(m.is_connecting());
+        assert_eq!((m.text("y"), m.text("f")), (None, None));
+    }
+
+    #[test]
+    fn while_a_delete_waits_only_escape_does_anything_and_it_ends_the_wait() {
+        let mut m = menu_with(&["Cloud", "Tifa"]);
+        press(&mut m, NavKey::Delete);
+        m.text("y");
+        for key in [NavKey::Enter, NavKey::Down, NavKey::Up, NavKey::Left, NavKey::Right, NavKey::Delete, NavKey::Tab, NavKey::Backspace, NavKey::Home, NavKey::PageDown] {
+            assert_eq!(press(&mut m, key), None, "{key:?}");
+        }
+        for text in ["y", "Y", "f", "n", "x", " "] {
+            assert_eq!(m.text(text), None, "{text:?}");
+        }
+        assert!(matches!(m.screen(), Screen::Connecting(c) if c.target == Target::Delete { name: "Cloud".into() }), "still waiting");
+        // A held Escape is not a press.
+        assert_eq!(m.key(KeyPress::repeating(NavKey::Escape)), None);
+        assert!(m.is_connecting());
+        // Escape stops the wait: back on the list, with a message that says the server may still delete it.
+        assert_eq!(press(&mut m, NavKey::Escape), Some(MenuAction::CancelConnect));
+        assert!(matches!(m.screen(), Screen::Select(s) if s.cursor == 0 && s.confirm.is_none()));
+        let notice = m.notice().expect("a message");
+        assert_eq!(notice.kind, NoticeKind::Info);
+        assert!(notice.text.contains("Stopped waiting") && notice.text.contains("Cloud") && notice.text.contains("may still be deleted"), "{notice:?}");
+        assert!(notice.hint.as_deref().is_some_and(|h| h.contains("Del") && h.contains('Y')), "{notice:?}");
+        assert_eq!(m.accounts().len(), 2, "nothing left the list");
+        // Abandoning a login is still just "Cancelled.".
+        let mut m = menu_with(&["Cloud"]);
+        press(&mut m, NavKey::Enter);
+        press(&mut m, NavKey::Escape);
+        assert_eq!(m.notice().map(|n| n.text.as_str()), Some("Cancelled."));
+    }
+
+    #[test]
+    fn a_delete_that_ends_gives_the_list_back_with_its_message() {
+        // The server deleted Tifa: the host took her login out of the list first, then the menu comes back to the rest.
+        let mut m = menu_with(&["Cloud", "Tifa", "Barret"]);
+        press(&mut m, NavKey::Down);
+        press(&mut m, NavKey::Delete);
+        m.text("y");
+        m.refresh_accounts(vec![entry("Cloud"), entry("Barret")]);
+        assert!(m.is_connecting(), "refreshing the list does not end the wait");
+        m.delete_over(Notice::info("Deleted Tifa. Its name is free again."));
+        assert!(!m.is_connecting());
+        assert_eq!(m.selected_name(), Some("Barret"), "the cursor stays where it was: on the one after");
+        assert!(m.notice().is_some_and(|n| n.text.contains("Deleted Tifa")));
+        // The last character: the create form.
+        let mut m = menu_with(&["Cloud"]);
+        press(&mut m, NavKey::Delete);
+        m.text("y");
+        m.refresh_accounts(vec![]);
+        m.delete_over(Notice::info("Deleted Cloud. Its name is free again."));
+        assert!(matches!(m.screen(), Screen::Create(_)));
+        // A failure: the list as it was, the same character highlighted, and it can be asked again at once.
+        let mut m = menu_with(&["Cloud", "Tifa"]);
+        press(&mut m, NavKey::Down);
+        press(&mut m, NavKey::Delete);
+        m.text("y");
+        m.delete_over(Notice::error("Tifa was NOT deleted"));
+        assert_eq!(m.selected_name(), Some("Tifa"));
+        assert_eq!(m.notice().map(|n| n.kind), Some(NoticeKind::Error));
+        assert_eq!(m.accounts().len(), 2);
+        press(&mut m, NavKey::Delete);
+        assert_eq!(m.text("y"), Some(MenuAction::Delete { index: 1 }));
+        assert!(m.notice().is_none(), "a new wait clears the old message");
     }
 
     #[test]

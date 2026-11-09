@@ -312,6 +312,43 @@ pub fn register(store: &Store, game: GameId, registration: Registration, now: u6
     })
 }
 
+/// Whose character a login token is, for a request that is not a login (a delete: `ClientMsg::DeleteCharacter`). The
+/// refusal is what a login with a token the server does not know gets (`InvalidToken`), which a client reads as "this
+/// login is not on the server (any more)".
+pub fn account_of_token(store: &Store, token: &Secret) -> Result<AccountId, LoginError> {
+    store.authenticate(token.expose()).map_err(map_store_error)
+}
+
+/// What deleting a character did, for the reply and the log line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Deletion {
+    /// The character's display name, free again.
+    pub name: String,
+    /// The trash entry that holds its records (a directory name under the store's `trash/`).
+    pub entry: String,
+    /// How many record files it holds.
+    pub files: usize,
+    /// How many of them the move could not finish (0 normally; the store finishes them the next time it opens).
+    pub unfinished: usize,
+}
+
+/// Delete the character of `account`: the store moves its records into a timestamped entry of its trash, frees its name
+/// and removes it from every index (`Store::delete_account`; nothing of any other account is touched). The caller has
+/// checked that the account is not in the world (see `deletion`). An account that is not there (a second delete, a
+/// delete that raced one) is `InvalidToken`, like any login with a token the server does not know.
+pub fn delete_character(store: &Store, account: AccountId, now: u64) -> Result<Deletion, LoginError> {
+    match store.delete_account(account, now) {
+        Ok(deleted) => Ok(Deletion {
+            name: deleted.display_name,
+            entry: deleted.entry,
+            files: deleted.files.len(),
+            unfinished: deleted.unfinished.len(),
+        }),
+        Err(PersistError::UnknownAccount(_)) => Err(LoginError::Refused(RejectCode::InvalidToken, "invalid or unknown token")),
+        Err(e) => Err(LoginError::Internal(e.to_string())),
+    }
+}
+
 /// Record that the client of a registration answered the `Welcome` that carried its new token (its
 /// first message after it): the token has been delivered as far as the server can tell, so the
 /// account is not an orphan and [`release_unclaimed`], `Store::unclaimed_accounts` and the

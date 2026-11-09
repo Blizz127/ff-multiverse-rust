@@ -59,19 +59,23 @@ pub fn menu_input(logical: &Key, text: Option<&str>, pressed: bool, repeat: bool
 /// so the menu has one way in. `screen` is where the button is heading ([`PadScreen`]), because a
 /// few buttons mean different things on different screens and some must never act by accident:
 ///
-/// | Button | List | Forget question | Create form | Connecting | Loading | Alert |
+/// | Button | List | Delete question | Create form | Connecting | Loading | Alert |
 /// |---|---|---|---|---|---|---|
 /// | stick, D-pad | Up, Down | switch answer | move, change a value | - | - | - |
 /// | A | Enter: play | Enter: the chosen answer | Enter: create (or Back) | - | - | Enter: dismiss |
-/// | B | - | Esc: keep | Esc: back (only if there is a list) | Esc: cancel | - | - |
-/// | Start | Esc: quit | Esc: keep | Esc: back, or quit | Esc: cancel | Esc: quit | - |
+/// | B | - | Esc: keep | Esc: back (only if there is a list) | Esc: cancel (a delete: stop waiting) | - | - |
+/// | Start | Esc: quit | Esc: keep | Esc: back, or quit | Esc: cancel (a delete: stop waiting) | Esc: quit | - |
 /// | X | `n`: new character | `n`: keep | Backspace | - | - | - |
-/// | Y | Del: asks to forget | - | - | - | - | - |
+/// | Y | Del: asks to delete | - | - | - | - | - |
+///
+/// The question has three answers, Keep, Delete (the character on the server) and Forget here (the saved login on this
+/// computer only), side by side; the stick or D-pad moves between them and A gives the one in focus, so a controller
+/// reaches all of them (it has no `Y` or `F` key to type).
 ///
 /// B never quits the client (it is "back": where there is nothing to go back to it does nothing),
 /// Start is the Esc key and the only way out, a notice that holds a secret is dismissed by A alone,
-/// and no controller button ever types a letter into the name field. Y does not answer "yes" to the
-/// forget question, so pressing it twice cannot forget a login. Releases mean nothing.
+/// and no controller button ever types a letter into the name field. Y does not answer the
+/// question, so pressing it twice cannot delete or forget anything. Releases mean nothing.
 pub fn pad_menu_input(key: PadKey, pressed: bool, repeat: bool, screen: PadScreen) -> Option<MenuInput> {
     if !pressed {
         return None;
@@ -348,26 +352,49 @@ mod tests {
     }
 
     #[test]
-    fn y_asks_to_forget_and_pressing_it_again_cannot_forget() {
+    fn y_asks_to_delete_and_pressing_it_again_cannot_delete_or_forget() {
         let mut m = menu_with(&["Cloud", "Tifa"]);
         assert_eq!(pad(&mut m, PadKey::Accept), None);
         assert_eq!(m.pad_screen(), PadScreen::Question);
-        // A second Y (a double press) does nothing: the question stays, nothing is forgotten.
+        // A second Y (a double press) does nothing: the question stays, nothing is deleted or forgotten.
         assert_eq!(pad(&mut m, PadKey::Accept), None);
         assert_eq!(m.pad_screen(), PadScreen::Question);
-        // A on the default answer keeps the login...
+        // A on the default answer keeps the character...
         assert_eq!(pad(&mut m, PadKey::Confirm), None);
         assert_eq!(m.pad_screen(), PadScreen::List);
         // ...B and X also say no...
         for key in [PadKey::Back, PadKey::Invite] {
             pad(&mut m, PadKey::Accept);
             assert_eq!(pad(&mut m, key), None, "{key:?}");
-            assert_eq!(m.pad_screen(), PadScreen::List, "{key:?} keeps the login");
+            assert_eq!(m.pad_screen(), PadScreen::List, "{key:?} keeps the character");
         }
-        // ...and forgetting takes a deliberate move to the other answer and A.
+        // ...and deleting takes a deliberate move to the Delete answer and A; B then stops the wait.
         pad(&mut m, PadKey::Accept);
         assert_eq!(pad(&mut m, PadKey::Right), None);
+        assert_eq!(pad(&mut m, PadKey::Confirm), Some(MenuAction::Delete { index: 0 }));
+        assert_eq!(m.pad_screen(), PadScreen::Connecting);
+        assert_eq!(pad(&mut m, PadKey::Back), Some(MenuAction::CancelConnect), "B stops waiting for the delete");
+        assert_eq!(m.pad_screen(), PadScreen::List);
+    }
+
+    /// A controller has no F key: the answer that forgets the saved login on this computer only is a button of its own,
+    /// two moves to the right (or one to the left) of Keep.
+    #[test]
+    fn a_controller_can_forget_a_saved_login_here_by_moving_to_the_last_answer() {
+        let mut m = menu_with(&["Cloud", "Tifa"]);
+        pad(&mut m, PadKey::Accept);
+        assert_eq!(pad(&mut m, PadKey::Right), None);
+        assert_eq!(pad(&mut m, PadKey::Right), None);
         assert_eq!(pad(&mut m, PadKey::Confirm), Some(MenuAction::Forget { index: 0 }));
+        assert!(!m.is_connecting(), "forgetting waits for nothing");
+        pad(&mut m, PadKey::Down);
+        pad(&mut m, PadKey::Accept);
+        assert_eq!(pad(&mut m, PadKey::Left), None);
+        assert_eq!(pad(&mut m, PadKey::Confirm), Some(MenuAction::Forget { index: 1 }));
+        // Round the other way it is the Delete answer again, one move from Keep.
+        pad(&mut m, PadKey::Accept);
+        pad(&mut m, PadKey::Right);
+        assert_eq!(pad(&mut m, PadKey::Confirm), Some(MenuAction::Delete { index: 1 }));
     }
 
     /// No controller button types a letter into the name field, and none of them but Start leaves.
