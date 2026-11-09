@@ -1209,3 +1209,76 @@ fn offscreen_field_two_originals() {
         save_png(&format!("field_two_originals_closeup_{m}_untinted"), cw, ch, &plain_crop);
     }
 }
+
+/// The owner's report of 2026-11-09 ("cant talk to any npcs yet"): the WINDOW's way to a conversation, on the owner's own
+/// data. In `md1stin`, at the start of the game, only the two guards have anything to say (one item message each: the
+/// real-data test `md1stin_only_the_guards_have_anything_to_say_and_it_is_an_item_message` of `fmv-ff7`). Here a player
+/// stands where the area lets one stand, in front of each guard and inside its own talk radius (its script's), presses
+/// Enter through the very controller the window uses (`Talk::key`), and a conversation opens and names that guard as the
+/// press's character; from outside the radius the same press opens nothing.
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_LIBRARY or FMV_FF7_DATA)"]
+fn real_ff7_the_guards_of_md1stin_can_be_talked_to_where_a_player_can_stand() {
+    use crate::state::NpcView;
+    use crate::ui::dialogue::ff7::Ff7Conversations;
+    use crate::ui::dialogue::{Around, Conversations, Talk};
+    use fmv_adapter_api::AreaRuntime;
+    use fmv_protocol::{NPC_NAME_CHARS, NPC_REF_CHARS};
+    use real::*;
+    use std::sync::Arc;
+    use winit::keyboard::KeyCode;
+
+    let Some(real) = open() else { return };
+    let area = real.adapter.load_field("md1stin").expect("md1stin");
+    let clip = |text: &str, max: usize| -> String { text.chars().filter(|c| !c.is_control()).take(max).collect() };
+    // What the server announces (the unconditional characters), as the client holds it.
+    let npcs: Vec<NpcView> = area
+        .npcs()
+        .iter()
+        .filter(|n| n.unconditional && n.pos.is_finite() && n.facing.is_finite())
+        .enumerate()
+        .map(|(i, n)| NpcView {
+            id: i as u32,
+            name: clip(&n.entity_name, NPC_NAME_CHARS),
+            model: clip(&n.appearance.model, NPC_REF_CHARS),
+            idle_animation: n.appearance.idle_animation.as_deref().map(|a| clip(a, NPC_REF_CHARS)),
+            pos: n.pos,
+            facing: n.facing,
+        })
+        .collect();
+    let adapter = Arc::new(real.adapter);
+    let mut radii = Ff7Conversations::new(Some(Arc::clone(&adapter)));
+    let guards: Vec<&NpcView> = npcs.iter().filter(|n| n.name == "gu0" || n.name == "gu1").collect();
+    assert_eq!(guards.len(), 2, "both guards are announced: {:?}", npcs.iter().map(|n| n.name.as_str()).collect::<Vec<_>>());
+    for guard in guards {
+        let radius = radii.talk_radius("md1stin", guard);
+        assert!(radius > 0.0, "{}: a talk radius from its script", guard.name);
+        // A place in front of the guard, inside its radius, that the area accepts as it is (a player can stand there).
+        let spot = (0..16)
+            .map(|k| f32::from(k as u8) * std::f32::consts::TAU / 16.0)
+            .flat_map(|angle| [0.5, 0.75, 0.3].map(|f| (angle, f)))
+            .find_map(|(angle, f)| {
+                let want = Pos::new(guard.pos.x + angle.cos() * radius * f, guard.pos.y + angle.sin() * radius * f, guard.pos.z);
+                let placed = area.place_arrival(want, None);
+                (placed.is_finite() && placed.dist_xy(want) < 1.0 && placed.dist_xy(guard.pos) < radius).then_some(placed)
+            })
+            .unwrap_or_else(|| panic!("{}: no place inside its talk radius {radius} where a player can stand", guard.name));
+        let facing = (guard.pos.y - spot.y).atan2(guard.pos.x - spot.x);
+        eprintln!("{}: talk radius {radius:.0}; the player stands {:.0} away, facing it", guard.name, spot.dist_xy(guard.pos));
+        let mut talk = Talk::new(Box::new(Ff7Conversations::new(Some(Arc::clone(&adapter)))));
+        let around = Around { area: "md1stin", own: spot, facing, npcs: &npcs, blocked: false };
+        assert!(talk.key(KeyCode::Enter, true, false, &around), "{}: Enter in front of it opens a conversation", guard.name);
+        assert!(talk.is_open());
+        assert_eq!(talk.take_press(), Some(Some(guard.id)), "{}: the press names the guard it opened", guard.name);
+        // From well outside its radius (and facing it), nothing opens, and the press names nobody.
+        let far = Pos::new(guard.pos.x - facing.cos() * radius * 3.0, guard.pos.y - facing.sin() * radius * 3.0, guard.pos.z);
+        let mut away = Talk::new(Box::new(Ff7Conversations::new(Some(Arc::clone(&adapter)))));
+        let around = Around { area: "md1stin", own: far, facing, npcs: &npcs, blocked: false };
+        let opened = away.key(KeyCode::Enter, true, false, &around);
+        let near_other = npcs.iter().any(|n| n.id != guard.id && n.pos.dist_xy(far) < radii.talk_radius("md1stin", n));
+        if !near_other {
+            assert!(!opened && !away.is_open(), "{}: nothing opens from {:.0} away", guard.name, far.dist_xy(guard.pos));
+            assert_eq!(away.take_press(), Some(None), "{}: the press goes out as OK where the player stands", guard.name);
+        }
+    }
+}
