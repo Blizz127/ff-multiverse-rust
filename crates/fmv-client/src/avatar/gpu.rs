@@ -108,7 +108,7 @@ struct VsOut {
     // the value reaches the fragment as it is, bit for bit (a white tint changes nothing).
     @location(2) @interpolate(flat) tint: vec4<f32>,
     // The draw's identity colour and its strength (per instance too; a strength of 0 is no identity colour), and
-    // whether this triangle is a face decal (its part's `overlay` flag), which keeps its own colours.
+    // whether this triangle keeps its own colours (a face decal, or hair: bit 1 of the overlay attribute).
     @location(3) @interpolate(flat) identity: vec4<f32>,
     @location(4) @interpolate(flat) face: f32,
 };
@@ -124,8 +124,11 @@ fn vs_model(
 ) -> VsOut {
     var out: VsOut;
     let w = cam.z;
-    // Overlays (faces) are pulled a hair towards the camera so they win over the skin below them.
-    let depth = buffer_depth(cam.z - overlay * g.depth.z);
+    // The attribute packs two flags (see `overlay_flags`): bit 1 keeps the vertex's own colours under an identity colour
+    // (a face decal, hair), bit 0 pulls it a hair towards the camera so a face wins over the skin below it.
+    let keep = step(1.5, overlay);
+    let pull = overlay - 2.0 * keep;
+    let depth = buffer_depth(cam.z - pull * g.depth.z);
     out.position = vec4<f32>(
         g.proj.x * cam.x + g.proj.y * cam.z,
         g.proj.z * cam.y + g.proj.w * cam.z,
@@ -136,7 +139,7 @@ fn vs_model(
     out.color = color;
     out.tint = tint;
     out.identity = identity;
-    out.face = overlay;
+    out.face = keep;
     return out;
 }
 
@@ -206,8 +209,18 @@ pub struct StaticVertex {
     pub uv: [f32; 2],
     /// Vertex colour in sRGB bytes; alpha is a semi-transparent part's constant alpha.
     pub color: [u8; 4],
-    /// 1.0 for the vertices of overlay parts (see `MergedMesh::overlay`).
+    /// Two flags in one float, [`overlay_flags`]: 3.0 on the vertices of overlay parts (see `MergedMesh::overlay`: a
+    /// face decal is pulled towards the camera and keeps its colours), 2.0 on hair (`MergedMesh::own`: keeps its
+    /// colours), 0.0 elsewhere.
     pub overlay: f32,
+}
+
+/// The value of the static `overlay` attribute for a vertex with these mesh flags: bit 0 (+1) pulls it a hair towards the
+/// camera, bit 1 (+2) keeps its own colours under a player's identity colour. A decal does both (3.0), hair only the second
+/// (2.0). The vertex shader takes it apart again, so the vertex stays 16 bytes.
+pub fn overlay_flags(overlay: f32, own: f32) -> f32 {
+    let decal = overlay > 0.5;
+    f32::from(u8::from(decal)) + if decal || own > 0.5 { 2.0 } else { 0.0 }
 }
 
 const STATIC_ATTRIBUTES: [wgpu::VertexAttribute; 3] =
@@ -532,7 +545,9 @@ impl AvatarGpu {
         let model_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("fmv-avatar-sampler"),
             // Clamped, not repeated: a decal (an eye, a mouth) at the edge of its texture must not
-            // blend with the texels of the opposite edge when filtered.
+            // blend with the texels of the opposite edge when filtered. (The models shift a decal's
+            // coordinates by whole numbers, which the game's wrap-around addressing ignores: the mesh
+            // merge takes those off, `mesh::whole_cell_offsets`, so that nothing is read past the edge.)
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
@@ -613,7 +628,7 @@ impl AvatarGpu {
             .map(|i| StaticVertex {
                 uv: mesh.uvs.get(i).copied().unwrap_or([0.0; 2]),
                 color: mesh.colors.get(i).copied().unwrap_or([255; 4]),
-                overlay: mesh.overlay.get(i).copied().unwrap_or(0.0),
+                overlay: overlay_flags(mesh.overlay.get(i).copied().unwrap_or(0.0), mesh.own.get(i).copied().unwrap_or(0.0)),
             })
             .collect();
         let static_buf = create_buffer_with(device, queue, "fmv-avatar-static", wgpu::BufferUsages::VERTEX, bytemuck::cast_slice(&statics));
@@ -978,9 +993,29 @@ mod tests {
         let i = identity_layout();
         assert_eq!((i.array_stride, i.step_mode, i.attributes[0].shader_location, i.attributes[0].offset), (16, wgpu::VertexStepMode::Instance, 5, 0));
         assert_eq!(i.attributes[0].format, wgpu::VertexFormat::Float32x4);
-        for text in ["@location(5) identity: vec4<f32>", "@location(3) @interpolate(flat) identity: vec4<f32>", "@location(4) @interpolate(flat) face: f32", "out.face = overlay;", "out.identity = identity;"] {
+        for text in [
+            "@location(5) identity: vec4<f32>",
+            "@location(3) @interpolate(flat) identity: vec4<f32>",
+            "@location(4) @interpolate(flat) face: f32",
+            "let keep = step(1.5, overlay);",
+            "let pull = overlay - 2.0 * keep;",
+            "buffer_depth(cam.z - pull * g.depth.z)",
+            "out.face = keep;",
+            "out.identity = identity;",
+        ] {
             assert!(MODEL_SHADER_WGSL.contains(text), "{text}");
         }
+        // The two flags of the overlay attribute, as the vertex shader takes them apart: bit 1 (2.0) keeps the colours,
+        // bit 0 (1.0) pulls the vertex towards the camera. A decal does both, hair only the first, anything else neither.
+        let apart = |flags: f32| {
+            let keep = if flags >= 1.5 { 1.0f32 } else { 0.0 };
+            (keep, flags - 2.0 * keep)
+        };
+        assert_eq!(apart(overlay_flags(0.0, 0.0)), (0.0, 0.0), "cloth and skin: neither");
+        assert_eq!(apart(overlay_flags(0.0, 1.0)), (1.0, 0.0), "hair keeps its colours and is not pulled towards the camera");
+        assert_eq!(apart(overlay_flags(1.0, 0.0)), (1.0, 1.0), "a decal keeps its colours and is pulled");
+        assert_eq!(apart(overlay_flags(1.0, 1.0)), (1.0, 1.0));
+        assert_eq!((overlay_flags(0.0, 0.0), overlay_flags(0.0, 1.0), overlay_flags(1.0, 0.0)), (0.0, 2.0, 3.0));
         // Strength 0 skips the look entirely: the colour path is the old product, `rgb * texel.rgb`, then the tint.
         assert!(MODEL_SHADER_WGSL.contains("if (in.identity.w > 0.0) {") && MODEL_SHADER_WGSL.contains("vec4<f32>(lit * in.tint.rgb, in.color.a * in.tint.a)"));
         assert!(MODEL_SHADER_WGSL.contains("var lit = rgb * texel.rgb;"));

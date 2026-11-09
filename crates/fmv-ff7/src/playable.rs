@@ -93,8 +93,38 @@
 //! about as many fields (11) and plays the generic walk second in 9 of her 11 records, because its
 //! outline differs more from the two men's (judged by eye and by a one-off comparison of rendered
 //! front and side outlines that is not part of the tests) and `bsfc`'s long rigid skirt flares
-//! out in the generic run. What stays **unverified** is how the bodies look in the field under a
-//! player tint, and the slot order of these records (the same loader-order convention as above).
+//! out in the generic run.
+//!
+//! **Looks, measured on 2026-11-09 on the same owned copy** (the client's `avatar::shots` tests
+//! `real_looks_survey_heights_parts_and_faces`, `real_looks_face_decals_vertex_by_vertex` and
+//! `offscreen_field_lineup_bodies_beside_cloud_and_an_npc`, which draw the cast, the bodies and the first mission's `av_j` (Jessie,
+//! skeleton `axdc`) at one spot under one camera):
+//!
+//! * **Scale.** The idle pose is 33.2 model units tall for Cloud (the reference), 28.6 Tifa, 35.0 Barret, 28.9 Aerith,
+//!   22.9 Red XIII, 32.2 Cid, 26.6 Yuffie, 32.8 Vincent and 30.8 Jessie; the bodies are 28.7 (`lean`, 86% of Cloud), 30.4
+//!   (`sturdy`, 91%) and 29.2 (`slight`, 88%): the cast's own range (Tifa 86%, Yuffie 80%). Every model, a player's or a
+//!   character's, is drawn at the field's one model scale, so at one spot the bodies are 82 to 86% of Cloud and 92 to 97% of
+//!   Jessie on the screen. A player who looks a quarter taller than a character in a picture stands nearer to the camera:
+//!   in `elevtr1` the character stands at camera depth 808 and the spawn points lie at 638 to 799, where a `slight` body
+//!   is 388 px tall at depth 638 against the character's 328 (1.18 times) and 313 at depth 799.
+//! * **Faces.** Every field model in `char.lgp` (the cast and the bodies alike) puts a face on the head with three decals on
+//!   the head bone: two eye quads (each its own 32x32 texture, the same eye twice) and a mouth. The data shifts a decal's
+//!   texture coordinates by whole numbers (the right eye's `u` runs from 1.00 to 1.97, a mouth's `v` from 5.00 to 5.94), which the
+//!   game's wrap-around addressing ignores. The client's sampler clamps, so for a long time **the right eye and the mouth of
+//!   every model were not drawn** (Cloud included: one eye); `avatar::mesh` now takes the whole number off. The extras'
+//!   mouth textures are blank in the data (0% of the texels drawn), as Cloud's is 2%: an extra has no mouth. `sturdy`'s
+//!   face is covered by its visor by design; `lean` and `slight` have faces.
+//! * **Colours.** The three bodies' own colours: `lean` a grey suit, white shirt, brown shoes, dark brown hair and peach skin
+//!   (247,168,135); `sturdy` a blue hood and coat, black boots, dark visor; `slight` a mint blouse, navy shorts, white socks and
+//!   cap, a brown bob and **orange skin (255,131,80)**: the model's own colour (a tanned beach extra; the owner's flat orange
+//!   skin is this colour, not the player's tint, which moves it by at most 3 levels). The identity look keeps skin and
+//!   decals (at most 5 levels of change on average; the old multiplicative tint moved the same skin by up to 57), and
+//!   keeps the hair now too (`avatar::identity::head_colour_is_own`: the head bone's skin and hair hues and its dark
+//!   greys; before, `lean`'s dark brown hair, outside the skin mask, turned blue on a blue player).
+//!
+//! No body was swapped: none lacks a face, the scale matches the cast, and an archetype id stays one skeleton for good (a
+//! stored character names it). What stays **unverified** is the slot order of these records (the same loader-order
+//! convention as above).
 
 use crate::anim::FieldAnimation;
 use crate::lgp::LgpArchive;
