@@ -25,7 +25,22 @@
 //!   canon party and nobody is put in a canon member's place: a solo player fights as [Cloud, Barret, player], two
 //!   players as [Cloud, Barret, P1, P2]. Member `i` fights as `ActorId(i)`. Two accounts that play the same curve fight
 //!   as two of it, and a player on Cloud's curve fights beside the canon Cloud.
-//! * **Companions.** After every step of the engine (`step_one`) each canon companion whose ATB gauge is full gets one
+//! * **Who commands the canon companions (`--companions-player-commanded`, on by default in the server binary).** As in FF7,
+//!   where the player commands every member of the party, a PLAYER commands them: `BattleMember::commander` names the account
+//!   (`begin_battle`: the party's LEADER when it fights, else the first player that does, the only player of a solo battle) and
+//!   `Battle::may_command` is the one authority rule, `BattleMember::is_commanded_by` (the rule every client builds its menu
+//!   from): a player commands its own character, always, and the companions when it is their commander, and every other
+//!   player only its own character (anything else is `NotYourActor`). A solo player therefore commands Cloud, Barret and its
+//!   own character, each when that member's gauge is full; **a companion whose gauge is full WAITS for its command and the
+//!   server gives it none** (`Battle::server_commands`), exactly as the player's own character waits. The command is the same
+//!   `ClientMsg::BattleCommand` with the companion's actor, applied and announced like any other (and logged as `companion
+//!   acted battle=.. actor=.. name=.. command=.. character=.. commander=<account>`; an item it uses is taken from the
+//!   COMMANDER's account, which pays, like a player's own). The server takes a companion back when its commander has left the
+//!   battle (it is then commanded as below, so a gauge never waits for a session that is gone). With the switch off
+//!   (`--companions-player-commanded=false`, `BattleSettings::new`'s default) no roster names a commander and the companions are
+//!   the server's, as below.
+//! * **Companions the server commands.** After every step of the engine (`step_one`) each canon companion whose ATB gauge is
+//!   full, and which no player commands, gets one
 //!   ordinary command from [`crate::companion::command`] (heal a hurt member, else the limit break, else attack the
 //!   first living enemy: a pure function of the engine's own state), applied through the same engine call as a
 //!   player's and announced to every member in a `BattleEvent` with the command attached, so every client replays and
@@ -41,8 +56,8 @@
 //!   mode, `companion`, "Active, Recommended and Wait").
 //!   Pacing only moves the tick at which the server submits the command, so it is invisible to a replay. It is logged as
 //!   `companion acted battle=.. actor=.. name=.. command=.. character=.. held_ms=..` and counted in the battle's
-//!   `commands`. A companion has no account and no entity: it is never paid or saved, no player may
-//!   command it (`NotYourActor`), it does not keep a battle alive (a battle with no connected PLAYER left is dropped)
+//!   `commands`. A companion has no account and no entity: it is never paid or saved, only its commander may
+//!   command it (nobody, with the switch off: `NotYourActor`), it does not keep a battle alive (a battle with no connected PLAYER left is dropped)
 //!   and the rewards (`reward_roster`) are split among the living PLAYERS only, exactly as before. Players have no limit
 //!   break in v9, so only a companion's gauge moves, and it is never stored.
 //! * A player in a battle is FROZEN: its `MoveIntent`s are ignored (not applied, not answered),
@@ -181,6 +196,14 @@ pub enum BattleReply {
 
 fn refused(battle: Option<BattleId>, reason: BattleRejection) -> BattleReply {
     BattleReply::Refused { battle, reason }
+}
+
+/// The player that commands the canon companions of a battle (`BattleMember::commander`): the party's LEADER when it
+/// fights, else the first player that does (the only player of a solo battle, and whoever leads the roster when the
+/// leader is elsewhere: in another area, or in a battle of its own); nobody when no player fights. `fighting` is the
+/// accounts of the battle's players in roster order.
+fn companion_commander(leader: Option<AccountId>, fighting: &[AccountId]) -> Option<AccountId> {
+    leader.filter(|leader| fighting.contains(leader)).or_else(|| fighting.first().copied())
 }
 
 /// A member of a running battle: a player's character or a canon companion.
@@ -329,6 +352,27 @@ impl Battle {
     fn actor_of(&self, entity: EntityId) -> Option<ActorId> {
         let i = self.members.iter().position(|m| m.info.entity() == Some(entity))?;
         u8::try_from(i).ok().map(ActorId)
+    }
+
+    /// Whether the player whose own character is `own` may give `actor`'s commands: its own character's, and the commands of a
+    /// canon companion that names it as its commander ([`BattleMember::is_commanded_by`], the one rule every client builds
+    /// its menu from). Nobody else's: another player's character, a companion that names no commander (the server's), or an
+    /// actor that is not in the roster at all (an enemy's number).
+    fn may_command(&self, own: ActorId, actor: ActorId) -> bool {
+        let Some(account) = self.members.get(usize::from(own.0)).and_then(|m| m.info.account()) else { return false };
+        self.members.get(usize::from(actor.0)).is_some_and(|m| m.info.is_commanded_by(account))
+    }
+
+    /// Whether the SERVER gives member `index`'s commands now: it is a canon companion and no player commands it, either
+    /// because the roster names no commander (`--companions-player-commanded=false`, the earlier behaviour) or because its
+    /// commander has left the battle (the server takes the companion back, so that a full gauge never waits for a session that
+    /// is gone).
+    fn server_commands(&self, index: usize) -> bool {
+        let Some(member) = self.members.get(index).filter(|m| m.info.is_companion()) else { return false };
+        match member.info.commander {
+            None => true,
+            Some(account) => !self.members.iter().any(|m| m.connected && m.info.account() == Some(account)),
+        }
     }
 }
 
@@ -591,11 +635,24 @@ impl World {
         let companion_level = bw.settings.level.unwrap_or_else(|| leader.progress.unwrap_or_else(|| progress::fresh(bw.rules(), progress::DEFAULT_CHARACTER)).level);
         let companion_limit = if bw.settings.debug_limit_full { max_limit } else { 0 };
         let canon: Vec<u8> = self.areas.get(&player.area).map_or_else(Vec::new, |area| area.runtime().story_party(&leader.progression));
+        // Who commands them (`--companions-player-commanded`, `BattleMember::commander`): the party's LEADER when it fights, else
+        // the first player that does (a solo battle's only player), as FF7's player commands the whole party. Nobody when the
+        // switch is off: the server commands them. Every other player commands only their own character.
+        let commander: Option<AccountId> = if bw.settings.companions_player_commanded {
+            let fighting: Vec<AccountId> = entities.iter().filter_map(|entity| self.players.get(entity)).map(|p| p.account).collect();
+            companion_commander(party_of.map(|party| party.leader), &fighting)
+        } else {
+            None
+        };
         let companions: Vec<BattleMember> = canon
             .iter()
             .filter_map(|&character| {
                 let name = clip_character_name(&bw.rules().character_name(character)?);
-                Some(BattleMember { status: bw.settings.debug_status, ..BattleMember::companion(name, character, companion_level, companion_limit) })
+                let member = BattleMember { status: bw.settings.debug_status, ..BattleMember::companion(name, character, companion_level, companion_limit) };
+                Some(match commander {
+                    Some(account) => member.commanded_by(account),
+                    None => member,
+                })
             })
             .take(MAX_BATTLE_PARTY.saturating_sub(entities.len()))
             .collect();
@@ -682,7 +739,7 @@ impl World {
         // (`character::log_token`) so that a name with a space never splits the line; `characters` are their
         // stat curves (a companion's own character), in the same order.
         self.logs.info(format!(
-            "battle started battle={} formation={formation} members={} enemies={} preemptive={} back_attack={} seed={seed} characters={:?} levels={:?} limits={:?} run_difficulty={escape} names=[{}] companions={} statuses=[{}]",
+            "battle started battle={} formation={formation} members={} enemies={} preemptive={} back_attack={} seed={seed} characters={:?} levels={:?} limits={:?} run_difficulty={escape} names=[{}] companions={} statuses=[{}] commander={}",
             id.0,
             entities.len(),
             info.enemies,
@@ -694,6 +751,8 @@ impl World {
             party.iter().map(|m| log_token(&m.name)).collect::<Vec<_>>().join(","),
             companions.len(),
             party.iter().map(|m| status_word(m.status)).collect::<Vec<_>>().join(","),
+            // The account that commands the canon companions, `-` when the server does (the account's id, like the lines below).
+            commander.map_or_else(|| "-".to_string(), |account| account.0.to_string()),
         ));
         self.fan_to(&entities, start);
         Ok(id)
@@ -720,7 +779,9 @@ impl World {
         let Some(own) = battle.actor_of(entity) else {
             return refused(Some(battle_id), BattleRejection::NotInBattle);
         };
-        if actor != own {
+        // A player commands its own character and, when the roster names it as their commander, the canon companions
+        // (`Battle::may_command`); nobody commands another player's character, or a companion the server commands.
+        if !battle.may_command(own, actor) {
             return refused(Some(battle_id), BattleRejection::NotYourActor);
         }
         // The engine's own checks come first (gauge, target, MP, spell and item known): what it would refuse is
@@ -736,6 +797,9 @@ impl World {
             }
         }
         let who = battle.members.get(usize::from(actor.0)).and_then(|m| Some((m.info.account()?, m.info.character)));
+        // Who PAYS for an item: the sender's own account and character, whichever member of its party uses it (a companion has
+        // no bag, and the engine knows no inventory).
+        let payer = battle.members.get(usize::from(own.0)).and_then(|m| Some((m.info.account()?, m.info.character)));
         // The player's own name, for the log lines below (`name=`, last: the lines are read by key).
         let name = battle.members.get(usize::from(actor.0)).map(|m| log_token(&m.info.name)).unwrap_or_default();
         // A limit says which one it is, before it empties the gauge (for the log).
@@ -778,6 +842,19 @@ impl World {
                     )),
                     _ => None,
                 };
+                // A canon companion's turn that a player commanded is logged like one the server took, `companion acted ...`, with
+                // the commander's account where the server's says how long it held the gauge (`held_ms=`).
+                let note = note.or_else(|| {
+                    let member = battle.members.get(usize::from(actor.0)).filter(|m| m.info.is_companion())?;
+                    Some(format!(
+                        "companion acted battle={} actor={} name={name} command={} character={} commander={}",
+                        battle_id.0,
+                        actor.0,
+                        describe_command(&command, limit_id),
+                        member.info.character,
+                        payer.map_or(0, |(account, _)| account.0)
+                    ))
+                });
                 // What the engine announced about statuses, and the counters that answered this command.
                 let mut event_notes = battle.note_statuses(battle_id, &events);
                 event_notes.extend(battle.note_counters(battle_id, &events));
@@ -798,7 +875,7 @@ impl World {
                 }
                 self.fan_to(&recipients, Arc::new(msg));
                 // The engine took the command, so the item is spent (even if the player dropped meanwhile).
-                if let (Command::Item { item, .. }, Some((account, character))) = (command, who) {
+                if let (Command::Item { item, .. }, Some((account, character))) = (command, payer) {
                     self.spend_item(battle_id, entity, account, character, item);
                 }
                 if ended {
@@ -899,7 +976,7 @@ impl World {
                     .state
                     .ready_actors()
                     .into_iter()
-                    .filter(|actor| battle.members.get(usize::from(actor.0)).is_some_and(|m| m.info.is_companion()))
+                    .filter(|actor| battle.server_commands(usize::from(actor.0)))
                     .map(|actor| companion::Ready { actor, since: battle.ready_since.get(usize::from(actor.0)).copied().flatten().unwrap_or(now) })
                     .collect();
                 let next = companion::next_move(&battle.state, pacing, battle.last_action, &players, &ready);
@@ -1461,17 +1538,24 @@ mod tests {
                 }
                 if let Some(replay) = &replays[i] {
                     let state = replay.state();
-                    let mine = ActorId(replay.party().iter().position(|m| m.entity() == Some(seat.entity)).unwrap() as u8);
-                    if state.outcome().is_none() && state.ready_actors().contains(&mine) {
-                        let command = policy(state, mine);
-                        let id = seat_battle_id(&seat.log);
-                        match w.battle_command(seat.entity, id, mine, command, now) {
-                            BattleReply::Done => {}
-                            BattleReply::Refused { reason, .. } => panic!("a ready actor's {command:?} was refused: {reason}"),
-                            BattleReply::Gone => panic!("gone"),
+                    // Every member this seat commands (`BattleMember::is_commanded_by`): its own character and, when the roster
+                    // names it their commander, the canon companions.
+                    let commanded: Vec<ActorId> =
+                        replay.party().iter().enumerate().filter(|(_, m)| m.is_commanded_by(seat.account)).map(|(k, _)| ActorId(k as u8)).collect();
+                    for mine in commanded {
+                        if state.outcome().is_none() && state.ready_actors().contains(&mine) {
+                            let command = policy(state, mine);
+                            let id = seat_battle_id(&seat.log);
+                            match w.battle_command(seat.entity, id, mine, command, now) {
+                                BattleReply::Done => {}
+                                // An earlier command of this very round ended the battle.
+                                BattleReply::Refused { reason: BattleRejection::BattleOver | BattleRejection::NotInBattle, .. } => break,
+                                BattleReply::Refused { reason, .. } => panic!("a ready actor's {command:?} was refused: {reason}"),
+                                BattleReply::Gone => panic!("gone"),
+                            }
+                            seat.drain();
+                            // The command's own message is applied by the loop above next round.
                         }
-                        seat.drain();
-                        // The command's own message is applied by the loop above next round.
                     }
                 }
             }
@@ -2393,7 +2477,7 @@ mod tests {
         assert_eq!(w.request_encounter(a.entity, Some(1), t0), BattleReply::Done);
         assert_eq!(roster_of(&mut a).iter().map(|m| m.status).collect::<Vec<_>>(), vec![given]);
         let started = logs_of(&mut w).into_iter().find(|l| l.starts_with("battle started")).expect("a start line");
-        assert!(started.ends_with(" statuses=[Silence+Haste+Regen]"), "{started}");
+        assert!(started.contains(" statuses=[Silence+Haste+Regen] commander="), "{started}");
         play_out(&mut w, &mut [&mut a], &rules, t0);
         // The first message of events announces them, in bit order, for the one member.
         let first = a
@@ -2425,7 +2509,7 @@ mod tests {
         let mut a = seat(&mut w, "A", t0);
         assert_eq!(w.request_encounter(a.entity, Some(1), t0), BattleReply::Done);
         assert_eq!(roster_of(&mut a).iter().map(|m| m.status).collect::<Vec<_>>(), vec![StatusSet::EMPTY]);
-        assert!(logs_of(&mut w).iter().any(|l| l.starts_with("battle started") && l.ends_with(" statuses=[-]")));
+        assert!(logs_of(&mut w).iter().any(|l| l.starts_with("battle started") && l.contains(" statuses=[-] commander=")));
     }
 
     /// The engine's refusals reach the player under their own names: a silenced member cannot cast (and its turn is still
@@ -3978,6 +4062,276 @@ mod tests {
         assert_eq!(w.battle_count(), 1, "A is still there");
         play_out(&mut w, &mut [&mut a], &SyntheticRules::default(), t0);
         assert_eq!(w.battle_count(), 0);
+    }
+
+    // ---- who commands the canon companions (`--companions-player-commanded`, `BattleMember::commander`) ----
+
+    /// `settings` with the companions handed to the players: the roster names their commander and the server commands none of
+    /// them while that player is in the battle.
+    fn commanded(rules: SyntheticRules) -> BattleSettings {
+        BattleSettings { companions_player_commanded: true, ..settings(rules) }
+    }
+
+    /// The commander is the party's leader when it fights, else the first player that does.
+    #[test]
+    fn the_commander_is_the_leader_when_it_fights_else_the_first_player_that_does() {
+        let (a, b, c) = (AccountId(1), AccountId(2), AccountId(3));
+        assert_eq!(companion_commander(None, &[a]), Some(a), "a solo player commands them");
+        assert_eq!(companion_commander(Some(a), &[a]), Some(a));
+        assert_eq!(companion_commander(Some(a), &[a, b, c]), Some(a));
+        assert_eq!(companion_commander(Some(b), &[a, b, c]), Some(b), "the leader, whoever comes first in the roster");
+        assert_eq!(companion_commander(Some(c), &[a, b]), Some(a), "a leader that is elsewhere hands them to the first player that fights");
+        assert_eq!(companion_commander(Some(a), &[]), None);
+        assert_eq!(companion_commander(None, &[]), None);
+    }
+
+    /// A solo player commands Cloud, Barret and its own character, each when that member's gauge is full: the roster names it
+    /// their commander, the server gives the companions no command of its own (a full gauge waits, however long), and every
+    /// command is an ordinary one, applied, announced, counted and logged like the player's.
+    #[test]
+    fn a_solo_player_commands_cloud_barret_and_itself_and_the_server_commands_none_of_them() {
+        let t0 = Instant::now();
+        let rules = SyntheticRules { enemy_hp: 100_000, ..SyntheticRules::default() };
+        let mut w = world_with_party(commanded(rules), cloud_and_barret);
+        let mut a = seat(&mut w, "Aria", t0);
+        a.drain();
+        // Formation 3 starts preemptive: every gauge is full at once.
+        assert_eq!(w.request_encounter(a.entity, Some(3), t0), BattleReply::Done);
+        let (id, enemy) = (BattleId(1), ActorId(3));
+        // The roster names the player the commander of the canon pair, and of nobody else's character.
+        let roster = roster_of(&mut a);
+        assert_eq!(roster.iter().map(|m| m.commander).collect::<Vec<_>>(), [Some(a.account), Some(a.account), None]);
+        assert!(roster.iter().all(|m| m.is_commanded_by(a.account)), "all three are the player's to command");
+        // Nothing acts for the companions, however long their gauges have been full (the earlier mode would have fought by now).
+        run(&mut w, t0, 0, 3_000);
+        assert!(applied(&mut a).is_empty(), "a full gauge waits for its command");
+        // The player gives each member's command, the companions' first.
+        let now = ms(t0, 3_000);
+        assert_eq!(w.battle_command(a.entity, id, ActorId(0), Command::Attack { target: enemy }, now), BattleReply::Done);
+        assert_eq!(w.battle_command(a.entity, id, ActorId(1), Command::Defend, now), BattleReply::Done);
+        assert_eq!(w.battle_command(a.entity, id, ActorId(2), Command::Attack { target: enemy }, now), BattleReply::Done);
+        assert_eq!(
+            applied(&mut a),
+            vec![(ActorId(0), Command::Attack { target: enemy }), (ActorId(1), Command::Defend), (ActorId(2), Command::Attack { target: enemy })]
+        );
+        // Each spent its own gauge, so a second command is refused until it fills again...
+        assert_eq!(w.battle_command(a.entity, id, ActorId(0), Command::Attack { target: enemy }, now), refused(Some(id), BattleRejection::GaugeNotFull));
+        assert_eq!(w.battle_command(a.entity, id, ActorId(1), Command::Defend, now), refused(Some(id), BattleRejection::GaugeNotFull));
+        // ...and each is counted for the actor that acted.
+        assert_eq!(w.battle.as_ref().unwrap().battles.get(&id).unwrap().commands, vec![1, 1, 1]);
+        // An actor that is nobody's (the enemy's number, one past the roster) is nobody's to command.
+        assert_eq!(w.battle_command(a.entity, id, enemy, Command::Defend, now), refused(Some(id), BattleRejection::NotYourActor));
+        assert_eq!(w.battle_command(a.entity, id, ActorId(9), Command::Defend, now), refused(Some(id), BattleRejection::NotYourActor));
+        // The log: the companions' turns say who commanded them (and hold nothing: the server commanded nobody).
+        let logs = logs_of(&mut w);
+        let started = logs.iter().find(|l| l.starts_with("battle started")).expect("a start line");
+        assert!(started.ends_with(&format!(" commander={}", a.account.0)), "{started}");
+        let acted: Vec<&String> = logs.iter().filter(|l| l.starts_with("companion acted")).collect();
+        let me = a.account.0;
+        assert_eq!(
+            acted,
+            [
+                &format!("companion acted battle=1 actor=0 name=Cloud command=attack target=3 character=0 commander={me}"),
+                &format!("companion acted battle=1 actor=1 name=Barret command=defend character=1 commander={me}"),
+            ],
+            "{logs:?}"
+        );
+        assert!(logs.iter().all(|l| !l.contains("held_ms=")), "nothing was held: {logs:?}");
+    }
+
+    /// In a party the party LEADER commands the canon pair and every other player only its own character: the leader's commands
+    /// for the companions are applied and every other player's are refused `NotYourActor`, and so is the leader's for another
+    /// player's character (as it always was).
+    #[test]
+    fn in_a_party_the_leader_commands_the_canon_pair_and_every_other_player_only_its_own_character() {
+        let t0 = Instant::now();
+        let rules = SyntheticRules { enemy_hp: 100_000, ..SyntheticRules::default() };
+        let mut w = world_with_party(commanded(rules), cloud_and_barret);
+        let (mut a, mut b) = (seat(&mut w, "A", t0), seat(&mut w, "B", t0));
+        party_up(&mut w, &a, &b, t0);
+        a.drain();
+        b.drain();
+        assert_eq!(w.request_encounter(a.entity, Some(3), t0), BattleReply::Done);
+        // The roster is the canon pair, A, B: the pair names the leader, whoever else is in the battle.
+        let (id, enemy) = (BattleId(1), ActorId(4));
+        let leader = a.account;
+        for seat in [&mut a, &mut b] {
+            let roster = roster_of(seat);
+            assert_eq!(roster.iter().map(|m| m.commander).collect::<Vec<_>>(), [Some(leader), Some(leader), None, None]);
+        }
+        run(&mut w, t0, 0, 100);
+        let now = ms(t0, 100);
+        // B commands only its own character (actor 3): not the pair, and not the leader's character.
+        for other in [0, 1, 2] {
+            assert_eq!(
+                w.battle_command(b.entity, id, ActorId(other), Command::Attack { target: enemy }, now),
+                refused(Some(id), BattleRejection::NotYourActor),
+                "actor {other}"
+            );
+        }
+        assert_eq!(w.battle_command(b.entity, id, ActorId(3), Command::Attack { target: enemy }, now), BattleReply::Done);
+        // The leader commands the pair and its own character, and not B's.
+        assert_eq!(w.battle_command(a.entity, id, ActorId(3), Command::Defend, now), refused(Some(id), BattleRejection::NotYourActor));
+        for own in [0, 1, 2] {
+            assert_eq!(w.battle_command(a.entity, id, ActorId(own), Command::Attack { target: enemy }, now), BattleReply::Done, "actor {own}");
+        }
+        // Everybody is told every command, in the order the server applied them, and nothing else acted.
+        assert_eq!(who_acted(&applied(&mut a)), [3, 0, 1, 2]);
+        assert_eq!(who_acted(&applied(&mut b)), [3, 0, 1, 2]);
+        assert_eq!(w.battle.as_ref().unwrap().battles.get(&id).unwrap().commands, vec![1, 1, 1, 1]);
+    }
+
+    /// The commander is the party's LEADER, not the first player of the roster: after A promotes B, B commands the canon pair
+    /// although A still comes first in the party's own order (and so in the roster).
+    #[test]
+    fn the_leader_commands_the_canon_pair_even_when_it_is_not_the_first_player_of_the_roster() {
+        let t0 = Instant::now();
+        let rules = SyntheticRules { enemy_hp: 100_000, ..SyntheticRules::default() };
+        let mut w = world_with_party(commanded(rules), cloud_and_barret);
+        let (mut a, mut b) = (seat(&mut w, "A", t0), seat(&mut w, "B", t0));
+        party_up(&mut w, &a, &b, t0);
+        assert_eq!(w.party_promote(a.entity, b.entity), crate::world::PartyOutcome::Done);
+        a.drain();
+        b.drain();
+        // B leads now, and B starts the fight.
+        assert_eq!(w.request_encounter(b.entity, Some(3), t0), BattleReply::Done);
+        let (id, enemy) = (BattleId(1), ActorId(4));
+        let roster = roster_of(&mut a);
+        assert_eq!(roster[2].account(), Some(a.account), "A is still the first player of the roster");
+        assert_eq!(roster.iter().map(|m| m.commander).collect::<Vec<_>>(), [Some(b.account), Some(b.account), None, None]);
+        run(&mut w, t0, 0, 100);
+        let now = ms(t0, 100);
+        assert_eq!(w.battle_command(a.entity, id, ActorId(0), Command::Attack { target: enemy }, now), refused(Some(id), BattleRejection::NotYourActor));
+        assert_eq!(w.battle_command(b.entity, id, ActorId(0), Command::Attack { target: enemy }, now), BattleReply::Done);
+        assert_eq!(w.battle_command(b.entity, id, ActorId(1), Command::Attack { target: enemy }, now), BattleReply::Done);
+        let logs = logs_of(&mut w);
+        let started = logs.iter().find(|l| l.starts_with("battle started")).expect("a start line");
+        assert!(started.ends_with(&format!(" commander={}", b.account.0)), "{started}");
+    }
+
+    /// The server takes a companion back when its commander has left the battle, so a full gauge never waits for a session that
+    /// is gone. Another player that stays does not inherit them (only the roster names a commander), and still commands its own
+    /// character.
+    #[test]
+    fn the_server_takes_the_companions_back_when_their_commander_leaves_the_battle() {
+        let t0 = Instant::now();
+        let rules = SyntheticRules { enemy_hp: 100_000, ..SyntheticRules::default() };
+        let mut w = world_with_party(BattleSettings { companion_pacing: companion::Pacing::OFF, ..commanded(rules) }, cloud_and_barret);
+        let (a, mut b) = (seat(&mut w, "A", t0), seat(&mut w, "B", t0));
+        party_up(&mut w, &a, &b, t0);
+        b.drain();
+        assert_eq!(w.request_encounter(a.entity, Some(3), t0), BattleReply::Done);
+        let (id, enemy) = (BattleId(1), ActorId(4));
+        // While the commander is in the battle nothing acts for the companions.
+        run(&mut w, t0, 0, 1_000);
+        assert!(applied(&mut b).is_empty());
+        // The commander leaves: the server commands the pair again, on their own gauges.
+        let a_entity = a.entity;
+        drop(a);
+        assert!(w.leave(a_entity));
+        run(&mut w, t0, 1_000, 1_100);
+        let commands = who_acted(&applied(&mut b));
+        assert!(commands.contains(&0) && commands.contains(&1), "the server commands the pair again: {commands:?}");
+        let logs = logs_of(&mut w);
+        assert!(logs.iter().any(|l| l.starts_with("companion acted") && l.contains("held_ms=")), "{logs:?}");
+        // B did not inherit them: a companion is its roster's commander's or the server's.
+        let now = ms(t0, 1_100);
+        assert_eq!(w.battle_command(b.entity, id, ActorId(0), Command::Defend, now), refused(Some(id), BattleRejection::NotYourActor));
+        assert_eq!(w.battle_command(b.entity, id, ActorId(3), Command::Attack { target: enemy }, now), BattleReply::Done);
+    }
+
+    /// The switch off is the earlier behaviour: the roster names no commander (the key is absent on the wire), the server
+    /// commands the companions, nobody else may, and the start line says `commander=-`.
+    #[test]
+    fn with_the_switch_off_no_roster_names_a_commander_and_the_server_commands_the_pair() {
+        let t0 = Instant::now();
+        let mut w = world_with_party(settings_unpaced(SyntheticRules::default()), cloud_and_barret);
+        let mut a = seat(&mut w, "Aria", t0);
+        a.drain();
+        assert_eq!(w.request_encounter(a.entity, Some(3), t0), BattleReply::Done);
+        let id = BattleId(1);
+        let roster = roster_of(&mut a);
+        assert!(roster.iter().all(|m| m.commander.is_none()));
+        assert!(!roster[0].is_commanded_by(a.account) && roster[2].is_commanded_by(a.account));
+        let wire = serde_json::to_string(&roster).unwrap();
+        assert!(!wire.contains("commander"), "the roster is what a v16 server sent: {wire}");
+        w.advance_battles(ms(t0, 10));
+        assert_eq!(who_acted(&applied(&mut a)), [0, 1], "the server commands the pair");
+        assert_eq!(w.battle_command(a.entity, id, ActorId(0), Command::Defend, ms(t0, 10)), refused(Some(id), BattleRejection::NotYourActor));
+        let logs = logs_of(&mut w);
+        let started = logs.iter().find(|l| l.starts_with("battle started")).expect("a start line");
+        assert!(started.ends_with(" commander=-"), "{started}");
+        assert!(logs.iter().filter(|l| l.starts_with("companion acted")).all(|l| l.contains("held_ms=") && !l.contains("commander=")), "{logs:?}");
+    }
+
+    /// An item a commanded companion uses is paid by its COMMANDER: the engine applies it for the companion, the commander's
+    /// mirror loses one, the saver is queued the commander's own account and character, and the commander is told what it
+    /// carries now. A commander with none is refused `OutOfItems`, whatever the engine would say, and nothing is spent.
+    #[test]
+    fn an_item_a_commanded_companion_uses_is_paid_by_its_commander() {
+        let t0 = Instant::now();
+        let mut w = world_with_party(commanded(SyntheticRules::default()), cloud_and_barret);
+        let (handle, mut rx) = SaverHandle::channel();
+        w.set_progress_saver(handle);
+        // One Potion and nothing else.
+        let mut a = seat_as(&mut w, "A", t0, seeded_with(&[(0, 1)]));
+        assert_eq!(w.request_encounter(a.entity, Some(3), t0), BattleReply::Done);
+        a.drain();
+        let id = BattleId(1);
+        let potion_on = |target: u8| Command::Item { item: 0, target: Target::One(ActorId(target)) };
+        let now = ms(t0, 10);
+        // Barret (actor 1) uses it on himself: A's Potion is spent, saved under A and told to A.
+        assert_eq!(w.battle_command(a.entity, id, ActorId(1), potion_on(1), now), BattleReply::Done);
+        let msgs = a.drain();
+        let applied_at = msgs
+            .iter()
+            .position(|m| matches!(m, ServerMsg::BattleEvent { command: Some(AppliedCommand { actor: ActorId(1), command: Command::Item { item: 0, .. } }), .. }))
+            .expect("the command is announced for Barret");
+        assert_eq!(msgs[applied_at + 1], ServerMsg::Inventory { items: vec![] }, "A is told its bag is empty now: {msgs:?}");
+        assert_eq!(mirror_of(&w, &a), Vec::<(u16, u16)>::new());
+        assert_eq!(saved(&mut rx), vec![crate::saver::SaveJob::used_item(a.account, 0, 0)]);
+        let logs = logs_of(&mut w);
+        let line = logs.iter().find(|l| l.starts_with("item used")).expect("the log says it");
+        assert!(line.contains(&format!("battle=1 account={} character=0 item=0 left=0 saving=queued", a.account.0)), "{line}");
+        // Cloud (actor 0) is ready too, and the bag is empty: refused by the server, nothing changes.
+        assert_eq!(w.battle_command(a.entity, id, ActorId(0), potion_on(0), now), refused(Some(id), BattleRejection::OutOfItems));
+        assert!(saved(&mut rx).is_empty());
+        assert_eq!(who_acted(&applied(&mut a)), [1], "only Barret's Potion was applied");
+    }
+
+    /// A whole battle whose companions a player commanded replays exactly on every member's own engine and ends as the server
+    /// said, with the rewards split among the players alone: the commands of the companions are ordinary commands of the log.
+    #[test]
+    fn a_battle_whose_companions_a_player_commanded_replays_exactly_for_every_member() {
+        let rules = SyntheticRules::default();
+        let t0 = Instant::now();
+        let mut w = world_with_party(commanded(rules.clone()), cloud_and_barret);
+        let (mut a, mut b) = (seat(&mut w, "Aria", t0), seat(&mut w, "Brom", t0));
+        party_up(&mut w, &a, &b, t0);
+        a.drain();
+        b.drain();
+        assert_eq!(w.request_encounter(a.entity, Some(1), t0), BattleReply::Done);
+        // `play_out` commands every member a seat commands (A: the pair and itself; B: itself) and replays every message of
+        // both seats on engines built from their own rosters; a divergence of any command panics.
+        play_out(&mut w, &mut [&mut a, &mut b], &rules, t0);
+        let outcome = a.log.iter().find_map(|m| match m {
+            ServerMsg::BattleEnd { outcome, rewards, .. } => Some((*outcome, rewards.iter().map(|r| r.account).collect::<Vec<_>>())),
+            _ => None,
+        });
+        assert_eq!(outcome, Some((Outcome::Victory, vec![a.account, b.account])), "won, and the two players alone are paid");
+        let logs = logs_of(&mut w);
+        let ended = logs.iter().find(|l| l.starts_with("battle ended")).expect("an end line");
+        let commands: Vec<u32> = ended
+            .split("commands=[")
+            .nth(1)
+            .and_then(|rest| rest.split(']').next())
+            .expect("commands")
+            .split(", ")
+            .map(|n| n.parse().expect("a count"))
+            .collect();
+        assert_eq!(commands.len(), 4, "{ended}");
+        assert!(commands[2] >= 1 || commands[3] >= 1, "the players fought: {ended}");
+        assert!(logs.iter().filter(|l| l.starts_with("companion acted")).all(|l| l.contains(&format!("commander={}", a.account.0))), "{logs:?}");
     }
 
     // ---- pacing: each companion on its own clock, the players' first turn kept (`companion::may_act`) ----

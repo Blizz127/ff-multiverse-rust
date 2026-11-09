@@ -96,6 +96,9 @@ struct Sim {
     first_enemy_action: Option<u64>,
     /// Every command the party gave, in order: the engine tick it was applied at and whether it was a companion's.
     party_commands: Vec<(u64, bool)>,
+    /// The commands the PERSON behind the first player gave, accepted by the engine: its own character's, and with
+    /// `simulate_commanded` the canon pair's too (the player commands them). What a fight asks of a person at the menu.
+    person_commands: usize,
 }
 
 /// One simulated battle (see [`Sim`]) with the server's companion pacing (`companion::may_act`: each companion on its own clock, a player's first turn kept) and players who take
@@ -221,6 +224,145 @@ fn simulate_paced(
         enemy_actions,
         first_enemy_action,
         party_commands,
+        person_commands: commands.get(companion_count).map_or(0, |&n| n as usize),
+    }
+}
+
+/// One simulated battle where a PLAYER commands the canon pair (the server's `--companions-player-commanded`, protocol v17), the
+/// way FF7 has it: the first player is their commander and gives the commands of Cloud, Barret and its own character, each when that
+/// member's gauge is full; every other player commands only its own character; the server commands nobody, so a full gauge waits.
+/// The first player is a PERSON at the menu, who works through it one member at a time: once free it starts on the member that has
+/// waited longest and its command lands `player_delay_ms` of battle time later (the time to choose), so its commands come one after
+/// another; with 0 it is a headless bot that answers every member at once. The canon pair's commands are the server's own rule
+/// (`companion::command`: heal a hurt member, else the limit break, else attack), as a person who plays them by the book would give,
+/// the player's own character attacks. The other players choose each `player_delay_ms` after their own gauge filled. The enemies
+/// act on their own gauges meanwhile (FF7's Active mode). The order within a slice is the server's: the engine steps, then the
+/// commands arrive.
+#[allow(clippy::too_many_arguments)]
+fn simulate_commanded(data: &Ff7BattleData, formation: u16, characters: &[u8], level: Option<u8>, seed: u64, speed: u8, tps: u32, player_delay_ms: u32) -> Sim {
+    use fmv_ff7_battle::rules::ActorId;
+    let leader = fmv_core::AccountId(1);
+    let players: Vec<fmv_protocol::BattleMember> = characters
+        .iter()
+        .enumerate()
+        .map(|(i, &character)| {
+            fmv_protocol::BattleMember::player(
+                fmv_core::EntityId(i as u64 + 1),
+                fmv_core::AccountId(i as u64 + 1),
+                format!("P{i}"),
+                character,
+                level.unwrap_or_else(|| data.starting_level(character)),
+                0,
+            )
+        })
+        .collect();
+    let leader_level = players.first().map_or_else(|| data.starting_level(0), |p| p.level);
+    let companions: Vec<fmv_protocol::BattleMember> = [0u8, 1]
+        .iter()
+        .map(|&c| fmv_protocol::BattleMember::companion(data.character_name(c).expect("a canon name"), c, leader_level, 0).commanded_by(leader))
+        .collect();
+    let companion_count = companions.len();
+    let party: Vec<fmv_protocol::BattleMember> = companions.into_iter().chain(players).collect();
+    let info = data.formation(formation).expect("a real formation");
+    let setup = BattleSetup {
+        formation_id: formation,
+        seed,
+        party,
+        preemptive: info.preemptive,
+        back_attack: info.back_attack,
+        battle_speed: speed,
+        ticks_per_second: tps,
+    };
+    let mut state = data.build(&setup).expect("builds");
+    let fighters = companion_count + characters.len();
+    let mut acted = vec![0usize; fighters];
+    let (mut enemy_actions, mut first_enemy_action) = (0usize, None::<u64>);
+    let mut party_commands: Vec<(u64, bool)> = Vec::new();
+    let mut commands = vec![0u32; fighters];
+    let mut ready_since: Vec<Option<u64>> = vec![None; fighters];
+    let delay = (u64::from(player_delay_ms) * u64::from(tps)).div_ceil(1000);
+    let slice = u64::from((tps / 20).max(1));
+    // The tick from which the person is free to start on the next member.
+    let mut person_free_at = 0u64;
+    let mut count = |events: &[BattleEvent], tick: u64| {
+        for e in events {
+            match e {
+                BattleEvent::Damage { actor, .. } | BattleEvent::Miss { actor, .. } if usize::from(actor.0) < fighters => acted[usize::from(actor.0)] += 1,
+                BattleEvent::Action { actor, .. } if usize::from(actor.0) >= fighters => {
+                    enemy_actions += 1;
+                    first_enemy_action.get_or_insert(tick);
+                }
+                _ => {}
+            }
+        }
+    };
+    for _ in 0..2_000_000u32 {
+        if state.outcome().is_some() {
+            break;
+        }
+        let events = state.step_ticks(slice);
+        count(&events, state.tick());
+        let now = state.tick();
+        let ready = state.ready_actors();
+        for (i, since) in ready_since.iter_mut().enumerate() {
+            *since = if ready.contains(&ActorId(i as u8)) { Some(since.unwrap_or(now)) } else { None };
+        }
+        // The person, one member at a time: the one that has waited longest, once the person is free and has chosen.
+        loop {
+            if state.outcome().is_some() {
+                break;
+            }
+            // The members the person commands: the canon pair and the first player (the last of the commanded indexes).
+            let Some((i, since)) = (0..=companion_count).filter_map(|i| ready_since[i].map(|since| (i, since))).min_by_key(|&(i, since)| (since, i)) else {
+                break;
+            };
+            if now < person_free_at.max(since) + delay {
+                break;
+            }
+            let actor = ActorId(i as u8);
+            let command = if i < companion_count {
+                let Some(command) = companion::command(&state, actor) else { break };
+                command
+            } else {
+                let Some(target) = state.enemy_ids().into_iter().find(|e| state.actor(*e).is_some_and(|c| c.is_alive())) else { break };
+                Command::Attack { target }
+            };
+            let Ok(events) = state.submit_command(actor, command) else { break };
+            count(&events, now);
+            commands[i] += 1;
+            ready_since[i] = None;
+            person_free_at = now;
+            party_commands.push((state.tick(), i < companion_count));
+        }
+        // Every other player commands only its own character, each when it has chosen.
+        for id in state.ready_actors().into_iter().filter(|id| usize::from(id.0) > companion_count) {
+            let i = usize::from(id.0);
+            if now.saturating_sub(ready_since[i].unwrap_or(now)) < delay {
+                continue;
+            }
+            let Some(target) = state.enemy_ids().into_iter().find(|e| state.actor(*e).is_some_and(|c| c.is_alive())) else { break };
+            if let Ok(events) = state.submit_command(id, Command::Attack { target }) {
+                count(&events, now);
+                commands[i] += 1;
+                ready_since[i] = None;
+                party_commands.push((state.tick(), false));
+            }
+        }
+    }
+    let dead = state.party_ids().into_iter().filter(|id| !state.actor(*id).is_some_and(|c| c.is_alive())).count();
+    let person_commands = commands[..=companion_count.min(fighters.saturating_sub(1))].iter().map(|&n| n as usize).sum();
+    let players = acted.split_off(companion_count);
+    Sim {
+        outcome: state.outcome(),
+        ticks: state.tick(),
+        companion_attacks: acted.iter().sum(),
+        acted: players,
+        dead,
+        ended_before_a_players_turn: false,
+        enemy_actions,
+        first_enemy_action,
+        party_commands,
+        person_commands,
     }
 }
 
@@ -251,6 +393,13 @@ struct Stats {
     party_attacks: u64,
     /// Attacks the PLAYERS made in all the fights (a person's commands, what the fight asks of them).
     player_attacks: u64,
+    /// The commands the first player's PERSON gave in all the fights (`Sim::person_commands`: its own character's, and the canon
+    /// pair's when a player commands them), and in how many WON fights it gave one at the most: the fights a person can win with
+    /// "I attacked once and it was over".
+    person_commands: u64,
+    person_one_or_none: u64,
+    /// Fights lost, the first reading of how hard a fight is for a person who commands three.
+    deaths: u64,
 }
 
 fn stats(data: &Ff7BattleData, formation: u16, characters: &[u8], level: Option<u8>, speed: u8, tps: u32, seeds: u64) -> Stats {
@@ -275,6 +424,16 @@ fn stats_paced(
     pacing: Pacing,
     player_delay_ms: u32,
 ) -> Stats {
+    stats_of(formation, seeds, speed_label(speed, tps), |seed| simulate_paced(data, formation, characters, level, canon, seed, speed, tps, pacing, player_delay_ms))
+}
+
+/// A label for a pace, for the messages of a batch that fails.
+fn speed_label(speed: u8, tps: u32) -> String {
+    format!("{speed}/{tps}")
+}
+
+/// The batch of `seeds` fights of `formation` that `run` plays, one per seed, summed up (see [`Stats`]).
+fn stats_of(formation: u16, seeds: u64, pace: String, run: impl Fn(u64) -> Sim) -> Stats {
     let mut out = Stats {
         won: 0,
         lost: 0,
@@ -290,21 +449,27 @@ fn stats_paced(
         mean_first_party_tick: 0,
         party_attacks: 0,
         player_attacks: 0,
+        person_commands: 0,
+        person_one_or_none: 0,
+        deaths: 0,
     };
     let (mut total, mut first_enemy_total, mut first_party_total) = (0u64, 0u64, 0u64);
     for seed in 0..seeds {
-        let s = simulate_paced(data, formation, characters, level, canon, seed, speed, tps, pacing, player_delay_ms);
+        let s = run(seed);
+        out.person_commands += s.person_commands as u64;
+        out.deaths += s.dead as u64;
         match s.outcome {
             Some(Outcome::Victory) => {
                 out.won += 1;
+                out.person_one_or_none += u64::from(s.person_commands <= 1);
                 out.with_losses += u64::from(s.dead > 0);
                 out.fewest_attacks = out.fewest_attacks.min(s.acted.iter().copied().min().unwrap_or(0));
                 out.every_player_acted += u64::from(s.acted.iter().all(|&n| n >= 1));
                 out.companions_ended_it_before_a_turn += u64::from(s.ended_before_a_players_turn);
             }
             Some(Outcome::Defeat) => out.lost += 1,
-            Some(Outcome::Escaped) => panic!("formation {formation} seed {seed}: nobody gave Escape"),
-            None => panic!("formation {formation} seed {seed}: the battle never ended"),
+            Some(Outcome::Escaped) => panic!("formation {formation} seed {seed} at {pace}: nobody gave Escape"),
+            None => panic!("formation {formation} seed {seed} at {pace}: the battle never ended"),
         }
         out.longest_ticks = out.longest_ticks.max(s.ticks);
         total += s.ticks;
@@ -322,6 +487,12 @@ fn stats_paced(
         out.fewest_attacks = 0;
     }
     out
+}
+
+/// [`stats_of`] for fights where a player commands the canon pair (`simulate_commanded`).
+#[allow(clippy::too_many_arguments)]
+fn stats_commanded(data: &Ff7BattleData, formation: u16, characters: &[u8], level: Option<u8>, speed: u8, tps: u32, seeds: u64, player_delay_ms: u32) -> Stats {
+    stats_of(formation, seeds, speed_label(speed, tps), |seed| simulate_commanded(data, formation, characters, level, seed, speed, tps, player_delay_ms))
 }
 
 #[test]
@@ -739,6 +910,67 @@ fn how_the_first_reactors_fights_flow_for_the_canon_pair_alone_and_with_a_player
             fights as f64 / 200.0 / n * 100.0
         );
     }
+}
+
+/// What a PLAYER who commands the canon pair asks of a person, against the server's pair (protocol v17, `--companions-player-commanded`):
+/// "I attacked once and it was over" came from the server's Cloud and Barret finishing the fight beside a player who gave one
+/// command. In FF7 the player commands every member of the party, and that is what this prints, solo, for every formation the first
+/// reactor's fields send, at the engine's own pace (Battle Speed 128, 60 ticks a second, 200 fights each): the server's pair (the
+/// earlier behaviour: Cloud and Barret on their own gauges, the person choosing in 1.5 s), the person commanding Cloud, Barret and its
+/// own character one member at a time in 1.5 s each (the new default), and a headless bot doing the same without any delay. Per
+/// row: fights won and the members that fell, the mean length, the person's own commands a fight, in how many won fights it gave
+/// ONE command or none, and the turns the enemies took. The gates are the ones that hold whatever the balance: the bot wins every
+/// fight (the smokes' bots must finish), the person wins nearly all of them, and commanding the pair multiplies what the person
+/// does: more than twice the commands a fight over the whole reactor, and never "once and it was over" in most fights of a formation.
+#[test]
+#[ignore = "needs the owner's library: set FMV_FF7_LIBRARY"]
+fn a_player_who_commands_the_canon_pair_gives_the_commands_ff7_asks_for() {
+    let Some(source) = source() else { return };
+    let data = battle_data(&source);
+    let (speed, tps) = (128u8, 60u32);
+    let secs = |ticks: u64| ticks as f64 / f64::from(tps);
+    let formations = first_reactor_formations(&source);
+    eprintln!("formation | enemies | who commands the pair | won/200 | members fallen | mean secs | the person's commands | won with at most one | enemy turns");
+    // Per mode, summed over the formations: won, lost, ticks, commands, fights won with at most one, enemy turns, members fallen.
+    let mut totals = [[0u64; 7]; 3];
+    for &formation in &formations {
+        let enemies = data.formation(formation).map_or(0, |f| f.enemies);
+        let server = stats_paced(&data, formation, &[1], None, true, speed, tps, 200, Pacing::default(), 1_500);
+        let person = stats_commanded(&data, formation, &[1], None, speed, tps, 200, 1_500);
+        let bot = stats_commanded(&data, formation, &[1], None, speed, tps, 200, 0);
+        for (i, (label, s)) in [("the server (1.5 s)", server), ("the person (1.5 s)", person), ("a bot", bot)].into_iter().enumerate() {
+            eprintln!(
+                "{formation:>9} | {enemies:>7} | {label:>21} | {:>7} | {:>14.2} | {:>9.1} | {:>21.2} | {:>20} | {:>11.2}",
+                s.won,
+                s.deaths as f64 / 200.0,
+                secs(s.mean_ticks),
+                s.person_commands as f64 / 200.0,
+                s.person_one_or_none,
+                s.enemy_turns as f64 / 200.0
+            );
+            for (total, v) in totals[i].iter_mut().zip([s.won, s.lost, s.mean_ticks, s.person_commands, s.person_one_or_none, s.enemy_turns, s.deaths]) {
+                *total += v;
+            }
+        }
+        assert_eq!((bot.won, bot.lost), (200, 0), "formation {formation}: a bot that commands all three wins every fight");
+    }
+    let n = formations.len() as f64;
+    let fights = formations.len() as f64 * 200.0;
+    for (label, [won, lost, ticks, commands, one_or_none, turns, fallen]) in ["the server's pair, a person (1.5 s)", "the person commands the pair (1.5 s each)", "a bot commands the pair"].into_iter().zip(totals) {
+        eprintln!(
+            "{label}, over the {} formations: won {won} of {fights} (lost {lost}), {:.1} s a fight, {:.2} commands of the person a fight, {:.0}% of the won fights with one command or none, {:.2} enemy turns and {:.2} members fallen a fight",
+            formations.len(),
+            secs(ticks) / n,
+            commands as f64 / fights,
+            one_or_none as f64 / won.max(1) as f64 * 100.0,
+            turns as f64 / fights,
+            fallen as f64 / fights
+        );
+    }
+    let [server, person, _bot] = totals;
+    assert!(person[0] as f64 >= fights * 0.97, "a person who commands all three wins nearly every fight of the first reactor: won {} of {fights}", person[0]);
+    assert!(person[3] > 2 * server[3], "commanding the pair multiplies the person's commands: {} against the server pair's {}", person[3], server[3]);
+    assert!((person[4] as f64) < 0.2 * person[0] as f64, "the person gives one command or none in under a fifth of the fights it wins: {} of {}", person[4], person[0]);
 }
 
 /// MEASUREMENT (protocol v9), not a gate: which formations of the game keep a fight going long enough that EVERY player

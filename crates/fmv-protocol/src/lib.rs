@@ -110,7 +110,8 @@
 //! `MoveIntent`s are ignored and nobody else sees it move) and rebuilds the battle from its OWN
 //! `scene.bin` and `kernel.bin`: only ids, seeds and levels travel (see [`battle`]). The server
 //! steps the engine and announces what happened as `BattleEvent { battle_id, tick, events,
-//! command }`; a client commands its own character with `BattleCommand` once its gauge is full
+//! command }`; a client commands its own character, and the canon companions its roster entry names it the commander of
+//! ([`BattleMember::commander`]), with `BattleCommand` once that member's gauge is full
 //! and the server answers a refused one with `BattleRejected`. A won or lost battle ends with
 //! `BattleEnd { outcome, rewards }`, after which everyone is back in the field where they stood.
 //!
@@ -2218,6 +2219,8 @@ mod tests {
                     limit: u16::MAX,
                     // Every bit of a status set: ten digits.
                     status: StatusSet::from_bits(u32::MAX),
+                    // The widest commander (a companion's; the type allows it on any member, so the bound holds).
+                    commander: Some(AccountId(u64::MAX - i)),
                 })
                 .collect(),
             preemptive: false,

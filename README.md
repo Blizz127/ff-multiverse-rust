@@ -58,7 +58,8 @@ full one turns Attack into the character's limit break, and any character may tr
 per-game appearance binding (a generic placeholder body in FF7), a fighting style (the stat curve of a
 canon party member, separate from the canon story roles) and pointers to its progress, and
 **the story's own party fights beside the players (protocol v9)**: the canon Cloud and Barret of the first
-reactor mission are in every battle as companions the server commands, and each player's character is ADDED
+reactor mission are in every battle as companions that a PLAYER commands, as in FF7 (the party's leader; the server
+commands them only with `--companions-player-commanded=false`), and each player's character is ADDED
 after them, in its own body, replacing nobody, and **a spell, an item or a limit can hit a whole side (protocol
 v10)**: an ALL place for the target pointer, FF7's All materia rule and the 2/3 split, and **battles have status
 effects (protocol v12)**: Poison, Regen, Sleep, Stop, Paralysis, Silence, Haste, Slow, Barrier, MBarrier,
@@ -73,7 +74,7 @@ as a labelled test area; it says nothing about FF7 support.
 | M2-b | Parties (invite, accept, leave, kick, promote), phase-key instance placement | done (single phase) |
 | M2-c/d | Shared battle, battle return, per-player rewards | done (battle subset; rewards paid into each account's own character progress and saved) |
 | M2-e | Player characters: identity, per-game binding, fighting style (a stat curve) separate from canon roles, pointers to progress (protocol v8) | done for the slice (FF7: generic placeholder bodies, fixed styles; `scripts/slice-smoke.sh`) |
-| M2-f | The story's canon party fights beside the players as server-controlled companions; players are added after them (protocol v9) | done for the first reactor mission (FF7: Cloud and Barret; `scripts/battle-smoke.sh`, `scripts/slice-smoke.sh`) |
+| M2-f | The story's canon party fights beside the players as companions that the party's leader commands (the server's `--companions-player-commanded`, on by default; the server commands them with it off); players are added after them (protocol v9, the commander v17) | done for the first reactor mission (FF7: Cloud and Barret; `scripts/battle-smoke.sh`, `scripts/slice-smoke.sh`) |
 | M2-g | Whole-side targeting: spells, items and limits can hit one target or a whole side, the party side being the canon companions and the players (protocol v10) | done for spells, items and limits (FF7: the All materia rule, the 2/3 split; the enemies' own AI still picks one party member; `scripts/battle-smoke.sh --commands`) |
 | M2-h | Status effects: the statuses of the game's own spells, items and enemy attacks, their clocks, what they do to turns, damage and hit rate, cures, panels and body cues (protocol v12) | done for 13 statuses (the engine's `status` module lists what is left out: Confusion, Berserk, Reflect, Petrify, Frog, ...; `scripts/battle-smoke.sh --status`) |
 | Later | FF8, FF9, FF10 and FF12 adapters on the same core, in that order (the owner's roadmap; FF13 maybe later) | planned |
@@ -383,7 +384,10 @@ battle's own overlay is drawn over the scene (the enemy list, the party's HP, MP
 command menu on your turn, the floating numbers and the pointer over the models' heads, and a
 band across the top that is green while your client's replay agrees with the server and red if it
 ever diverges); the arrow keys (or WASD) move in the menu, **Space** or **Enter** confirm and
-**Backspace** goes back. The menu has Attack (which says **Limit** while your limit gauge is full),
+**Backspace** goes back. As in FF7 you command the whole party: the menu belongs to whichever of Cloud, Barret and your own
+character has been ready longest (the party panel marks that member and the window title says whose turn it is), moves on to the
+next ready member when you give a command, and **Tab** (a controller's **Y**, FF7's Triangle) switches to the next ready one at the
+command list; another member's gauge filling never takes the menu away from a choice you are making. The menu has Attack (which says **Limit** while your limit gauge is full),
 Magic, Item, Defend and **Escape** (greyed out in a battle that cannot be run from). A spell, item or
 limit that can hit a whole side has one more place for the target pointer, **ALL** (one step past the
 last target, with the same arrow keys: there is no extra key; Healing Wind and Megalixir start on it).
@@ -1045,8 +1049,8 @@ processes: two players with different identities and fighting styles register, p
 story (the server-validated story point of `md1stin`), talk to the field's guard (`fmv-client --headless --talk gu0`
 prints what a character says as `talk:` lines, read from your own copy of the field script with the player's own
 story: the guard says the game's own words, the same to both players) and win a shared battle whose roster is the
-canon Cloud and Barret (server-controlled companions: `companion acted` lines, every command replayed by both bots with
-0 divergences) followed by both players under their own names with their styles' stat curves, the rewards going to
+canon Cloud and Barret (commanded by the leader's bot, or by the server with `--companions-player-commanded=false`:
+`companion acted` lines, every command replayed by both bots with 0 divergences) followed by both players under their own names with their styles' stat curves, the rewards going to
 the two players only; the server process is stopped and started again, the same players log in again and are told
 exactly what they ended with (a login changes no record byte), and a second battle on the restarted server pays on
 top of what was saved, to the point. The stored limit gauge of an account (the smoke writes 200 and 120, as an account
@@ -1062,15 +1066,27 @@ itself] and is drawn in its own body, never as a second Barret, and an account t
 curve gets [Cloud, Barret, itself] with no second Cloud. (The canon Barret is therefore no longer a stand-in NPC of the
 field: he is in the party.)
 
-* **The server commands the companions.** A canon member has no account and no connection: when its gauge is full the
+* **A player commands the companions (`--companions-player-commanded`, on by default; protocol v17).** As in FF7, where the
+  player commands every member of the party, a PLAYER gives Cloud's and Barret's commands: a solo player commands Cloud,
+  Barret and its own character, each when that member's gauge is full; in a party the LEADER commands the canon pair (the
+  first player that fights, when the leader is elsewhere) and every other player commands only their own character
+  (anything else is `NotYourActor`). **A full gauge waits for its command and the server gives it none**, exactly as the
+  player's own character waits; the server takes a companion back only when its commander has left the battle, so that a gauge
+  never waits for a session that is gone. The roster says who commands them (`BattleMember::commander`, the one wire change; the
+  `BattleCommand` already named the actor), so the client opens the menu for the right member and the bot (`--battle-auto`)
+  commands every member it is given. A companion's command is an ordinary one (applied, announced, replayed, counted, logged as
+  `companion acted ... commander=<account>`), an item it uses is paid by the commander's account, and the rewards, saves and
+  limit gauges are what they were. `--companions-player-commanded=false` is the earlier behaviour, below.
+* **When the server commands the companions (the switch off, or their commander left).** A canon member has no account and no connection: when its gauge is full the
   server issues its command as an ORDINARY command (heal the most hurt member below half HP with the cheapest healing
   spell it can pay for; else its limit break when its gauge is full and there is something worth aiming at; else Attack
   the first living enemy), announces it like a player's (`AppliedCommand`) and logs `companion acted battle=.. actor=..
   name=Cloud command=..`, so every client replays and verifies it with no change to the engine. `fmv_server::companion`
   is the whole rule, a pure function of the engine's state (deterministic, never refused by it). A companion fights at
-  the party leader's level (`--battle-level` pins everybody's), is never paid and never saved, cannot be commanded by a
-  client (`NotYourActor`), and does not keep a battle alive: a battle with no connected player left is dropped.
-* **Each acts on its own clock, and a player always gets a first turn.** A companion acts when its OWN gauge is full
+  the party leader's level (`--battle-level` pins everybody's), is never paid and never saved, can be commanded by its
+  commander alone (nobody, with the switch off: `NotYourActor`), and does not keep a battle alive: a battle with no connected
+  player left is dropped.
+* **Each acts on its own clock, and a player always gets a first turn (companions the server commands).** A companion acts when its OWN gauge is full
   (`fmv_server::companion::may_act`), like every fighter of the battle, and is held in only two ways. It never delivers
   the blow that ENDS the battle while a living, connected player has not had a first turn (the engine is asked on a
   copy): a player who is choosing holds that blow for at most `--companion-turn-wait-ms` (default 5000) after its own
@@ -1227,6 +1243,18 @@ stored (a countdown is a clock of the server process), and the story record keep
 is carried so that the finale's guard can be judged but this server never writes it, so a record is readable by a v14
 server, which just has no finale, no countdown and no `Countdown` message. **Rolling back:** point the server and the
 clients back at a v14 build together.
+
+**Protocol v17 (the commander of the canon pair)** adds one optional field to the battle roster, `BattleMember::commander`
+(an account, for a canon companion only; absent from the JSON when the server commands the companion, so that a roster
+without it is byte for byte what v16 sent and reads as "the server's"), and changes who may send a `BattleCommand`:
+`ClientMsg::BattleCommand { battle_id, actor, command }` already named the actor and is unchanged, and the server now also
+accepts one for a companion from the account its roster entry names (`BattleMember::is_commanded_by` is the rule both sides
+use), refusing anything else with `NotYourActor` as before. What the server DOES differs too: with
+`--companions-player-commanded` (on by default) it gives the commander's companions no command of its own, so a v16 client
+would leave them waiting for a command it never sends: the version has to move with it and a v16 peer be refused at the
+handshake (a v17 client on a server that names no commander commands only its own character, as ever). No message, event or
+stored record changed, and the replay does not depend on the commander (the engine never reads it). **Rolling back:** point
+the server and the clients back at a v16 build together; nothing it stores is new.
 
 ## Importing your own FF7 data
 

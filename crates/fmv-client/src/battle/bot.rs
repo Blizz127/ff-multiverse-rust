@@ -1,15 +1,18 @@
 //! The headless battle player behind `--battle-auto`.
 //!
-//! While a battle runs it acts whenever our own gauge is full (one command at a time: the mirror's
-//! `pending` guard keeps it from repeating a command before the server answered). Its rule is
-//! `BattleClient::bot_command`: when its character's HP is under 30% of the maximum and it knows a
+//! While a battle runs it acts whenever the gauge of a member it commands is full (one command at a time: the mirror's
+//! `pending` guard keeps it from repeating a command before the server answered). It commands every member it is given:
+//! its own character and, when the roster names it the commander of the canon companions (protocol v17: the party's leader,
+//! or the only player of a solo battle), those too, the one whose gauge filled first going first. Its rule is
+//! `BattleClient::bot_command`: when the member's HP is under 30% of the maximum and it knows a
 //! restoring spell it can pay for, it casts the cheapest one on itself; otherwise, when its limit gauge is
 //! full (protocol v7), it gives its limit break (a damaging one on the first living enemy, a healing one,
 //! which heals the whole party since protocol v10, when somebody is wounded); otherwise it attacks the first
 //! living enemy. It never escapes, unless a script
-//! tells it to: with `--battle-script` (see `script`) it first gives the commands of that script, in
+//! tells it to: with `--battle-script` (see `script`) it first gives the commands of that script to its OWN character, in
 //! order, one per full gauge (Defend, Magic, Item, Limit and Escape included), and only when the script is
-//! used up does the rule above take over. With
+//! used up does the rule above take over for it; the canon companions it commands get the rule above all along
+//! (`BattleClient::crew_command`), so a script never keeps them waiting. With
 //! `--debug-encounters` it also asks the server for a debug encounter,
 //! ONCE: when the session has been up for a moment and, with `--battle-wait-party N`, only when
 //! our party has N members and we lead it (so one request starts one battle for everyone). A
@@ -97,7 +100,9 @@ impl BattleBot {
             if let Some(script) = self.script.as_mut() {
                 match script.next_command(now, battles) {
                     Next::Send(cmd) => return vec![cmd],
-                    Next::Wait => return Vec::new(),
+                    // Not our own character's turn (or its last command is unanswered, which holds everything): the canon
+                    // companions we command are not the script's, so they play by the rule meanwhile.
+                    Next::Wait => return battles.crew_command(now).into_iter().collect(),
                     Next::Done => {}
                 }
             }

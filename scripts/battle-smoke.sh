@@ -2,19 +2,28 @@
 # scripts/battle-smoke.sh - shared-battle smoke test for fmv-server + fmv-client (protocol v10).
 #
 # Usage: scripts/battle-smoke.sh [--fixture|--random|--progress|--commands|--solo|--status|--boss] [--release|--debug]
-#                                [--bin-dir DIR] [--build] [--library STATE_DIR] [--duration SECS]
+#                                [--server-commanded] [--bin-dir DIR] [--build] [--library STATE_DIR] [--duration SECS]
 #                                [--formation ID] [--tick-rate TPS] [--battle-speed N] [--seed N]
 #                                [--bot idle|circle] [--keep-logs] [-h|--help]
 #
-# PROTOCOL v9: every battle's party is the story's canon party first (Cloud and Barret in the first mission: the SERVER
-# commands them with ordinary commands every client replays, logged `companion acted battle=.. actor=.. name=.. command=..`)
+# PROTOCOL v17 (who commands the canon pair): by default (`--companions-player-commanded`, on) the PLAYER commands Cloud and
+# Barret, as in FF7: the party's leader (bot A; the only bot of --solo) commands Cloud, Barret and itself, each when that
+# member's gauge is full, bot B only itself, and the server commands none of them (a full gauge waits for its command). The
+# server's `battle started` line ends with `commander=<account>`, and a canon companion's turn is logged `companion acted
+# battle=.. actor=.. name=.. command=.. character=.. commander=<account>`. `--server-commanded` runs the server with
+# `--companions-player-commanded=false`, the behaviour of v9 to v16: the roster names no commander (`commander=-`) and the
+# server commands the pair on their own gauges (`companion acted ... held_ms=..`). The checks that follow hold in both.
+#
+# PROTOCOL v9: every battle's party is the story's canon party first (Cloud and Barret in the first mission, commanded as above
+# with ordinary commands every client replays, logged `companion acted battle=.. actor=.. name=.. command=..`)
 # and then the players, whose characters are ADDED to it. So the server's per-fighter lists (`levels=`, `limits=`, `names=`,
 # `commands=`) carry `companions=2` and list the two companions first; this script's helpers read the PLAYERS' part
 # (everything after the companions) of `commands=`, `levels=` and `limits=`, so "members=2" and "both members acted" still
 # mean the two bots. Players have no limit break in v9: the `limit` command is exercised by the companions here.
 # The canon party kills the weak first-field formations (301-303) in about a hundred ticks, before every bot has had a
-# turn (measured: crates/fmv-server/tests/battle_real.rs; the companions act on their own clocks and only keep a player's
-# FIRST turn, `fmv_server::companion`, so a bot acts at least once in every fight but not several times), so the modes that
+# turn (measured: crates/fmv-server/tests/battle_real.rs; with the server's commands the companions act on their own clocks and
+# only keep a player's FIRST turn, `fmv_server::companion`, so a bot acts at least once in every fight but not several times;
+# with the players' commands every blow is a player's), so the modes that
 # need the bots to ACT, again and again (--commands, --status, --boss), fight FORMATION 12 (one of the game's test
 # formations: two enemies of 1000 HP that act four times as often as a party member, escapable, won every time with every
 # player acting in 200 of 200 seeds at one, two and three players). The smokes run the engine fast (--battle-speed 0
@@ -241,6 +250,8 @@ TICK_RATE=240
 # Empty: every battle gets a fresh seed. --seed N pins it (the server's --battle-seed).
 SEED=
 BATTLE_SPEED=0
+# Who commands the canon pair (the server's --companions-player-commanded): the player, unless --server-commanded.
+COMPANIONS_PLAYER_COMMANDED=true
 BOT=idle
 PARTY_SIZE=2
 # --commands runs the bots twice and a battle with a script takes a few seconds, so each run is short (an explicit
@@ -282,7 +293,7 @@ usage() {
 Usage: scripts/battle-smoke.sh [--fixture|--random|--progress|--commands|--solo|--status|--boss] [--release|--debug]
                                [--bin-dir DIR] [--build] [--library STATE_DIR] [--duration SECS]
                                [--formation ID] [--tick-rate TPS] [--battle-speed N] [--seed N]
-                               [--bot idle|circle] [--keep-logs] [-h|--help]
+                               [--bot idle|circle] [--server-commanded] [--keep-logs] [-h|--help]
 
 Real-data mode (default): two headless bots form a party on the real FF7 field md1stin and fight
 one shared battle started with --debug-encounters; passes when both report battles=1 victories=1
@@ -296,8 +307,8 @@ their saved tokens and fight again, then reconnect once more: each run's progres
 consistent (a win pays experience and a level where the threshold was crossed), the second battle
 must carry the level gained and the limit gauges the first battle ended with (protocol v7), and every
 reconnect must show what the run before ended with. --solo: one new character alone, whose roster must be the
-canon Cloud and Barret and then itself (nobody dropped or replaced), the canon pair commanded by the server and
-every command replayed by the bot with 0 divergences. --commands: every battle command over real
+canon Cloud and Barret and then itself (nobody dropped or replaced), the canon pair commanded by the bot (the
+player: protocol v17; the server with --server-commanded) and every command replayed by the bot with 0 divergences. --commands: every battle command over real
 processes: the server runs with --debug-limit-full (every member starts with a full limit gauge) and
 the bots follow a --battle-script, once to use defend, item and magic in a battle they win (Cure on the whole
 party among them, which the server must log as target=all-allies exactly once; the limit break is the
@@ -331,6 +342,8 @@ lost does not matter.
                      real-data test the_formations_of_the_first_field_drop_items_for_some_seeds in
                      crates/fmv-server/tests/battle_real.rs), which runs the drop chain of --progress
   --battle-speed N   FF7 battle speed, 0 fastest (default 0)
+  --server-commanded run the server with --companions-player-commanded=false (protocol v9 to v16): it commands Cloud and
+                     Barret itself instead of the party leader's bot, and the checks that name who commanded them follow
   --bot KIND         idle (default) or circle: how the bots move while not in battle
 EOF
 }
@@ -762,6 +775,7 @@ run_real() {
   if [[ -n $SEED ]]; then
     server_args+=(--battle-seed "$SEED")
   fi
+  server_args+=(--companions-player-commanded="$COMPANIONS_PLAYER_COMMANDED")
   say "starting server: $SERVER_BIN ${server_args[*]}"
   "$SERVER_BIN" "${server_args[@]}" >"$WORK/server.log" 2>&1 &
   SERVER_PID=$!
@@ -823,6 +837,8 @@ run_real() {
     check_mirror "$n" "$log" 1
     value=$(summary_number "$log" 'command\(s\) of ours applied')
     [[ $value =~ ^[0-9]+$ ]] && ((value >= 1)) || problem "client $n: the server applied none of its commands (command(s) of ours applied: '${value}')"
+    # Neither bot commanded a member that was not its to command: the leader's the canon pair too, the other's its own only.
+    check_no_foreign_commands "client $n" "$log"
     ids+=("$(battle_id_of "$log" || true)")
   done
   if [[ -z ${ids[0]} || ${ids[0]} != "${ids[1]}" ]]; then
@@ -848,7 +864,8 @@ run_real() {
     done
   fi
   (($(count_lines_with "$WORK/server.log" "battle started") <= 1)) || problem "the server started more than one battle"
-  # The roster is the canon party and then the two players, the canon pair acted through the server's commands and the
+  # The roster is the canon party and then the two players, the canon pair acted (commanded by the leader's bot, or by the
+  # server with --server-commanded) and the
   # rewards are the players' only.
   check_canon_battle "$WORK/server.log" "A,B" "1, 1" 2
 
@@ -874,7 +891,7 @@ run_real() {
     say "client $n: $(last_line_with "$WORK/client-$n.log" "after the last battle:" || true)"
   done
   RESULT=pass
-  say "PASS: two bots fought one shared battle on the real field beside the canon Cloud and Barret (roster Cloud, Barret, A, B; the server commanded the canon pair), both gave commands, each replayed it from its own battle data, won it and carries an inventory, and only the two players were paid; $state_real unchanged ($after)"
+  say "PASS: two bots fought one shared battle on the real field beside the canon Cloud and Barret (roster Cloud, Barret, A, B; $(who_commands_text)), both gave commands, each replayed it from its own battle data, won it and carries an inventory, and only the two players were paid; $state_real unchanged ($after)"
 }
 
 # check_canon_battle <server log> <players> <curves> <count>: the battle the server started has the story's canon party first
@@ -903,6 +920,48 @@ check_canon_battle() {
   done
   rewards=$(count_lines_with "$log" "battle reward battle=")
   ((rewards == count)) || problem "the server logged $rewards 'battle reward' line(s), expected $count (one per player, none for a companion)"
+  check_who_commanded "$log" "$started"
+}
+
+# check_who_commanded <server log> <battle started line>: who gave the canon pair's commands, from the server's own lines.
+# With the players commanding them (the default) the battle starts with `commander=<account>` (the party's leader), every
+# `companion acted` line carries that account and none says `held_ms=` (the server held, so commanded, nothing); with
+# --server-commanded the start says `commander=-` and every `companion acted` line says `held_ms=` and none a commander.
+check_who_commanded() {
+  local log="$1" started="$2" commander acted by_player by_server
+  acted=$(count_lines_with "$log" "companion acted battle=")
+  by_server=$(count_lines_with "$log" " held_ms=")
+  if [[ $COMPANIONS_PLAYER_COMMANDED == true ]]; then
+    if [[ $started =~ commander=([0-9]+)($|[^0-9]) ]]; then
+      commander=${BASH_REMATCH[1]}
+      by_player=$(count_lines_with_both "$log" "companion acted battle=" " commander=$commander")
+      ((acted >= 2 && by_player == acted)) || problem "not every canon companion turn was commanded by the party leader (commander=$commander): $acted turn(s), $by_player with its commander"
+    else
+      problem "the battle did not start with a player commanding the canon pair (commander=<account>): $started"
+    fi
+    ((by_server == 0)) || problem "the server commanded a canon companion itself ($by_server 'companion acted ... held_ms=' line(s)) with the players commanding them"
+  else
+    [[ $started == *" commander=-"* ]] || problem "--server-commanded: the battle start names a commander (commander=-): $started"
+    ((acted >= 2 && by_server == acted)) || problem "--server-commanded: not every canon companion turn was the server's ($acted turn(s), $by_server held_ms=)"
+    (($(count_lines_with_both "$log" "companion acted battle=" " commander=") == 0)) || problem "--server-commanded: a canon companion turn names a commander"
+  fi
+}
+
+# check_no_foreign_commands <label> <client log>: the bot never gave a command that the server found was not its to give
+# (`NotYourActor`: a player commanding another player's character, or a companion it is not the commander of).
+check_no_foreign_commands() {
+  if log_has "$2" "request refused: that character is not yours"; then
+    problem "$1: the server refused a command as not its character's to give (a bot must command only its own and, as the leader, the canon pair)"
+  fi
+}
+
+# who_commands_text: the PASS lines' words for who commanded the canon pair.
+who_commands_text() {
+  if [[ $COMPANIONS_PLAYER_COMMANDED == true ]]; then
+    printf "the party leader's bot commanded the canon pair, the server none of them"
+  else
+    printf 'the server commanded the canon pair (--server-commanded)'
+  fi
 }
 
 # --solo: ONE new character alone beside the canon pair, over real processes (see the header).
@@ -925,6 +984,7 @@ run_solo() {
   if [[ -n $SEED ]]; then
     server_args+=(--battle-seed "$SEED")
   fi
+  server_args+=(--companions-player-commanded="$COMPANIONS_PLAYER_COMMANDED")
   say "starting server: $SERVER_BIN ${server_args[*]}"
   "$SERVER_BIN" "${server_args[@]}" >"$WORK/server.log" 2>&1 &
   SERVER_PID=$!
@@ -969,6 +1029,7 @@ run_solo() {
   check_mirror A "$log" 1
   value=$(summary_number "$log" 'command\(s\) of ours applied')
   [[ $value =~ ^[0-9]+$ ]] && ((value >= 1)) || problem "client A: the server applied none of its commands (command(s) of ours applied: '${value}')"
+  check_no_foreign_commands "client A" "$log"
   started=$(strip_ansi "$(last_line_with "$log" "started: formation" || true)")
   [[ $started == *"party of 3, you fight as actor 2"* ]] || problem "client A is not the third fighter of a party of three (the canon Cloud and Barret, then A): $started"
 
@@ -1006,7 +1067,7 @@ run_solo() {
   say "client A: $(last_line_with "$log" "headless: battles:" || true)"
   say "server: $(count_lines_with "$WORK/server.log" "companion acted battle=") 'companion acted' line(s), e.g. $(last_line_with "$WORK/server.log" "companion acted battle=" || true)"
   RESULT=pass
-  say "PASS: one new character alone fought beside the canon Cloud and Barret (roster Cloud, Barret, A), the server commanded the canon pair and the bot replayed every command from its own battle data with 0 divergences, the reward and the save were the one player's; $state_real unchanged ($after)"
+  say "PASS: one new character alone fought beside the canon Cloud and Barret (roster Cloud, Barret, A), $(who_commands_text) and the bot replayed every command from its own battle data with 0 divergences, the reward and the save were the one player's; $state_real unchanged ($after)"
 }
 
 # all_battle_ids_of <client log>: every distinct battle#N a client says it started, one per line.
@@ -1040,6 +1101,7 @@ run_random() {
   if [[ -n $SEED ]]; then
     server_args+=(--battle-seed "$SEED")
   fi
+  server_args+=(--companions-player-commanded="$COMPANIONS_PLAYER_COMMANDED")
   say "starting server: $SERVER_BIN ${server_args[*]}"
   "$SERVER_BIN" "${server_args[@]}" >"$WORK/server.log" 2>&1 &
   SERVER_PID=$!
@@ -1332,6 +1394,7 @@ run_progress() {
   if [[ -n $SEED ]]; then
     server_args+=(--battle-seed "$SEED")
   fi
+  server_args+=(--companions-player-commanded="$COMPANIONS_PLAYER_COMMANDED")
   say "starting server: $SERVER_BIN ${server_args[*]}"
   "$SERVER_BIN" "${server_args[@]}" >"$WORK/server.log" 2>&1 &
   SERVER_PID=$!
@@ -1555,6 +1618,7 @@ run_commands() {
   if [[ -n $SEED ]]; then
     server_args+=(--battle-seed "$SEED")
   fi
+  server_args+=(--companions-player-commanded="$COMPANIONS_PLAYER_COMMANDED")
   say "starting server: $SERVER_BIN ${server_args[*]}"
   "$SERVER_BIN" "${server_args[@]}" >"$WORK/server.log" 2>&1 &
   SERVER_PID=$!
@@ -1704,7 +1768,7 @@ run_commands() {
   say "server: the canon companions' limit breaks: $(count_lines_with "$WORK/server.log" "command=limit attack=") 'companion acted ... command=limit' line(s) (players have none: $(count_lines_with "$WORK/server.log" "limit used battle=") 'limit used' lines)"
   say "commands applied by the server for the bots, both runs: ${CMD_TOTAL[attack]} attack, ${CMD_TOTAL[magic]} magic, ${CMD_TOTAL[item]} item, ${CMD_TOTAL[defend]} defend, ${CMD_TOTAL[limit]} limit, ${CMD_TOTAL[escape]} escape"
   RESULT=pass
-  say "PASS: every battle command was applied by the real server for the real-data bots (${CMD_TOTAL[magic]} magic, ${CMD_TOTAL[item]} item, ${CMD_TOTAL[defend]} defend, ${CMD_TOTAL[escape]} escape; the server's own log lines match; players have no limit break, the canon companions gave $(count_lines_with "$WORK/server.log" "command=limit attack=") limit break(s) through the server's rule), the first battle was won and the second escaped from, and every battle, the companions' commands included, was replayed by each bot from its own battle data with 0 divergences; $state_real unchanged ($after)"
+  say "PASS: every battle command was applied by the real server for the real-data bots (${CMD_TOTAL[magic]} magic, ${CMD_TOTAL[item]} item, ${CMD_TOTAL[defend]} defend, ${CMD_TOTAL[escape]} escape; the server's own log lines match; players have no limit break, the canon companions gave $(count_lines_with "$WORK/server.log" "command=limit attack=") limit break(s), $(who_commands_text)), the first battle was won and the second escaped from, and every battle, the companions' commands included, was replayed by each bot from its own battle data with 0 divergences; $state_real unchanged ($after)"
 }
 
 # statuses_of <server log line>: the entries of `statuses=[..]` of a "battle started" line (one per fighter in actor
@@ -1854,6 +1918,7 @@ run_status() {
   if [[ -n $SEED ]]; then
     server_args+=(--battle-seed "$SEED")
   fi
+  server_args+=(--companions-player-commanded="$COMPANIONS_PLAYER_COMMANDED")
   say "starting server: $SERVER_BIN ${server_args[*]}"
   "$SERVER_BIN" "${server_args[@]}" >"$WORK/server.log" 2>&1 &
   SERVER_PID=$!
@@ -2046,6 +2111,7 @@ run_boss() {
   if [[ -n $SEED ]]; then
     server_args+=(--battle-seed "$SEED")
   fi
+  server_args+=(--companions-player-commanded="$COMPANIONS_PLAYER_COMMANDED")
   say "starting server: $SERVER_BIN ${server_args[*]}"
   "$SERVER_BIN" "${server_args[@]}" >"$WORK/server.log" 2>&1 &
   SERVER_PID=$!
@@ -2225,6 +2291,7 @@ main() {
         shift
         ;;
       --keep-logs) KEEP_LOGS=1 ;;
+      --server-commanded) COMPANIONS_PLAYER_COMMANDED=false ;;
       -h | --help)
         usage
         return 0

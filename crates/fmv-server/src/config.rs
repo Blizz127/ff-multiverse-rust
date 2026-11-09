@@ -117,11 +117,25 @@ pub struct BattleSettings {
     /// none). It changes exactly one thing, the statuses a battle starts with (`BattleMember::status`: `EncounterStart`,
     /// the `battle started` log line and every client's replay carry it); nothing is stored. Empty (off) by default.
     pub debug_status: StatusSet,
-    /// When the canon companions act (protocol v9 companions, see `crate::companion`, "Pacing"): a companion with a full
-    /// gauge waits for every living, connected player that still owes a turn, at most `turn_wait_ms` after that
-    /// player's own gauge filled and at most `max_wait_ms` in all. `--companion-turn-wait-ms` / `--companion-max-wait-ms`;
-    /// `Pacing::OFF` (a max wait of 0) makes them act the instant their gauge fills.
+    /// When the canon companions the SERVER commands act (see `crate::companion`, "Pacing"): each acts on its own gauge, at the
+    /// pace its Dexterity gives it, like every fighter of the battle. A companion never delivers the blow that ends the
+    /// battle while a living, connected player has not had a first turn, for at most `turn_wait_ms` of battle time counted
+    /// from that player's own full gauge (the time a player whose gauge is full may take to choose) and at most `max_wait_ms`
+    /// in all (the longest a canon companion holds a full gauge, for a player's first turn or for another party member's
+    /// performance); and a companion does not start while another party command is on the stage. `--companion-turn-wait-ms` /
+    /// `--companion-max-wait-ms`; `Pacing::OFF` (a max wait of 0) turns the pacing off. It matters only for the companions
+    /// the server commands: with `companions_player_commanded` they wait for their player instead, and the pacing comes
+    /// back only for a companion whose commander has left the battle.
     pub companion_pacing: crate::companion::Pacing,
+    /// Who commands the canon companions (FF7's own rule is that the PLAYER commands every member of the party):
+    /// `true` lets a player give their commands, the party LEADER when it fights (else the first player that does; the only
+    /// player of a solo battle), and the server then commands none of them while that player is in the battle, so a gauge
+    /// that is full waits for its command; every other player commands only their own character. `false` is the
+    /// behaviour of protocol v9 to v16: the server commands the companions with its own rule (`crate::companion`) and nobody
+    /// may. `--companions-player-commanded[=BOOL]`; **the server binary defaults to `true`, while `BattleSettings::new`
+    /// is `false`** (so that code which builds its own settings, tests included, keeps the old behaviour until it asks).
+    /// The choice travels in the roster (`BattleMember::commander`).
+    pub companions_player_commanded: bool,
 }
 
 impl BattleSettings {
@@ -141,6 +155,7 @@ impl BattleSettings {
             debug_bonus_limit: 0,
             debug_status: StatusSet::EMPTY,
             companion_pacing: crate::companion::Pacing::default(),
+            companions_player_commanded: false,
         }
     }
 }
@@ -162,6 +177,7 @@ impl fmt::Debug for BattleSettings {
             .field("debug_bonus_limit", &self.debug_bonus_limit)
             .field("debug_status", &self.debug_status)
             .field("companion_pacing", &self.companion_pacing)
+            .field("companions_player_commanded", &self.companions_player_commanded)
             .finish()
     }
 }

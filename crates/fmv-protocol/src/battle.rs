@@ -68,12 +68,22 @@
 //! `EncounterStart::party` lists every fighter of the player side, `party[i]` fighting as `ActorId(i)`: first
 //! the story's CANON party ([`Controller::Companion`]: Cloud and Barret in the first reactor mission), then
 //! every player's own character ([`Controller::Player`]) in party order. A player's character is ADDED to the
-//! canon party; nobody is put in a canon member's place. A player commands only its own actor. A companion is
-//! commanded by the SERVER: when its ATB gauge is full the server picks one ordinary [`Command`] with a fixed
-//! rule over the engine's own state and applies it exactly like a player's, so it travels as a `BattleEvent`
-//! with the command attached and every client replays and checks it like any other; the engine has no AI for
-//! it and a client needs no rule of the server's. The commands a companion gave are therefore part of the log
-//! (`BattleEvent::command`), and the two kinds of member can be told apart only by the roster.
+//! canon party; nobody is put in a canon member's place. Whoever gives a companion's command, it is one ordinary
+//! [`Command`] applied exactly like a player's, so it travels as a `BattleEvent` with the command attached and every
+//! client replays and checks it like any other; the engine has no AI for it and a client needs no rule of the
+//! server's. The commands a companion gave are therefore part of the log (`BattleEvent::command`), and the two kinds
+//! of member can be told apart only by the roster.
+//!
+//! **Who commands whom (the companions' `commander`).** A player commands its own actor, always. A companion is
+//! commanded by ONE PLAYER, as in FF7, where the player commands every member of the party, when the roster says so:
+//! [`BattleMember::commander`] names the account whose session may give that companion's commands (the party's
+//! LEADER when it fights, else the first player that does; the only player of a solo battle). The command is the same
+//! `ClientMsg::BattleCommand { battle_id, actor, command }`, which already names the actor; the server answers one from
+//! anybody else, or for a companion that names no commander, with `NotYourActor`. A companion with NO commander
+//! (`None`, and the key absent from the JSON, as on every v16 and older roster) is commanded by the SERVER: when its ATB
+//! gauge is full the server picks one command with a fixed rule over the engine's own state and applies it (the pacing
+//! of `fmv_server::companion`). The server also takes a companion back when its commander has left the battle, so a
+//! gauge never waits for a session that is gone. [`BattleMember::is_commanded_by`] is the one rule both sides use.
 //!
 //! **Players have no limit break** ([`PLAYER_LIMIT_BREAKS`]): [`BattleRules::build`] gives a player's combatant
 //! none, so `BattleState::limit_for` is `None` for it and a peer shows no limit bar. The companions keep theirs
@@ -188,19 +198,21 @@ impl fmt::Display for BattleId {
     }
 }
 
-/// Who gives a battle member's commands (protocol v9). A battle's party is the story's CANON party, commanded
-/// by the server, followed by the players' own characters, each commanded by its player: nobody takes a canon
-/// member's place.
+/// Who gives a battle member's commands (protocol v9). A battle's party is the story's CANON party, followed by the
+/// players' own characters, each commanded by its player: nobody takes a canon member's place. A canon member is
+/// commanded by the SERVER, or by one player the roster names ([`BattleMember::commander`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Controller {
     /// A player's own original character: only that account's session may command it, and its entity is frozen
     /// in the field while the battle runs. The entity is what a peer finds the player's look by (the snapshot of
     /// the area says how every entity looks).
     Player { entity: EntityId, account: AccountId },
-    /// A member of the story's canon party, commanded by the SERVER: when its gauge is full the server chooses
-    /// the command with a fixed rule over the engine's own state and applies it like a player's, announcing it in
-    /// a `BattleEvent` with the command attached, so every peer replays and checks it (the engine has no AI for
-    /// it). It has no account and no entity: it is never paid, never saved and nobody may command it.
+    /// A member of the story's canon party. It has no account and no entity: it is never paid and never saved.
+    /// Its commands come from the player [`BattleMember::commander`] names (FF7's own rule: the player commands the
+    /// whole party), and from the SERVER when that is `None` (or its commander has left the battle): when its gauge
+    /// is full the server chooses the command with a fixed rule over the engine's own state and applies it like a
+    /// player's. Either way it is announced in a `BattleEvent` with the command attached, so every peer replays and
+    /// checks it (the engine has no AI for it). Nobody else may command it.
     Companion,
 }
 
@@ -266,6 +278,13 @@ pub struct BattleMember {
     /// cancel each other ([`BattleBuildError::InvalidStatus`]). Absent from the JSON when empty.
     #[serde(default, skip_serializing_if = "no_status")]
     pub status: StatusSet,
+    /// The player that commands this member, for a canon COMPANION (see the module docs, "Who commands whom"): the
+    /// account whose session may send `BattleCommand`s that name its actor. `None` (the key is absent from the JSON, as
+    /// on every roster before v17) means the SERVER commands it; it is `None` for a player's character, which only its
+    /// own account commands. Not an input of the engine, so it is no part of what a replay depends on: it only tells
+    /// every peer whose menu this member's turn is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commander: Option<AccountId>,
 }
 
 /// `skip_serializing_if` of [`BattleMember::status`] (serde passes a reference).
@@ -285,12 +304,44 @@ impl BattleMember {
             armor: None,
             limit,
             status: StatusSet::EMPTY,
+            commander: None,
         }
     }
 
-    /// A canon companion of the story's party in a battle (see [`Controller::Companion`]).
+    /// A canon companion of the story's party in a battle (see [`Controller::Companion`]), commanded by the server
+    /// until [`BattleMember::commanded_by`] names a player.
     pub fn companion(name: impl Into<String>, character: u8, level: u8, limit: u16) -> Self {
-        Self { controller: Controller::Companion, name: name.into(), character, level, weapon: None, armor: None, limit, status: StatusSet::EMPTY }
+        Self {
+            controller: Controller::Companion,
+            name: name.into(),
+            character,
+            level,
+            weapon: None,
+            armor: None,
+            limit,
+            status: StatusSet::EMPTY,
+            commander: None,
+        }
+    }
+
+    /// This member, commanded by `account`'s session: a canon companion's `commander` (a player's character keeps `None`:
+    /// only its own account commands it).
+    #[must_use]
+    pub fn commanded_by(mut self, account: AccountId) -> Self {
+        if self.is_companion() {
+            self.commander = Some(account);
+        }
+        self
+    }
+
+    /// Whether `account`'s session gives this member's commands: a player's character is commanded by its own account
+    /// and nobody else's, a canon companion by the account its `commander` names (by nobody's when it names none: the
+    /// server commands it). The one rule the server checks a `BattleCommand` with and the client builds its menu from.
+    pub fn is_commanded_by(&self, account: AccountId) -> bool {
+        match self.controller {
+            Controller::Player { account: own, .. } => own == account,
+            Controller::Companion => self.commander == Some(account),
+        }
     }
 
     /// The FF7 character, if `character` names one.
@@ -1537,6 +1588,85 @@ mod tests {
         assert_eq!((cloud.account(), cloud.entity()), (None, None));
         assert_eq!(cloud.controller, Controller::Companion);
         assert_eq!((cloud.character_id(), cloud.name.as_str()), (Some(CharacterId::Cloud), "Cloud"));
+    }
+
+    /// Who may command whom, in the one rule both sides use: a player commands its own character and nobody else's, a
+    /// companion is commanded by the account its roster entry names, and by nobody when it names none.
+    #[test]
+    fn a_player_commands_its_own_character_and_a_companion_only_its_named_commander() {
+        let (leader, other, stranger) = (AccountId(20), AccountId(21), AccountId(99));
+        let (first, second) = (member(0, 0), member(1, 2));
+        assert_eq!((first.account(), second.account()), (Some(leader), Some(other)));
+        for (who, commands_first, commands_second) in [(leader, true, false), (other, false, true), (stranger, false, false)] {
+            assert_eq!((first.is_commanded_by(who), second.is_commanded_by(who)), (commands_first, commands_second), "{who:?}");
+        }
+        // A companion the server commands is nobody's, whoever asks.
+        let barret = companion("Barret", 1);
+        assert_eq!(barret.commander, None);
+        for who in [leader, other, stranger] {
+            assert!(!barret.is_commanded_by(who), "{who:?}: a companion with no commander is the server's");
+        }
+        // ...and one with a commander is that account's and nobody else's (the leader's, not the first player's).
+        let barret = barret.commanded_by(other);
+        assert_eq!(barret.commander, Some(other));
+        assert_eq!((barret.is_commanded_by(leader), barret.is_commanded_by(other), barret.is_commanded_by(stranger)), (false, true, false));
+        // A player's character never takes a commander: it is its own account's, whatever is asked.
+        let player = second.clone().commanded_by(stranger);
+        assert_eq!(player.commander, None);
+        assert_eq!(player, second);
+        let forged = BattleMember { commander: Some(stranger), ..second.clone() };
+        assert!(!forged.is_commanded_by(stranger) && forged.is_commanded_by(other), "a stray commander on a player means nothing");
+    }
+
+    /// The commander travels in the roster as one optional key, absent when the server commands the companion: a v16 roster
+    /// reads as before and the same roster from a server that does not hand the companions over is byte for byte what
+    /// it was.
+    #[test]
+    fn the_commander_is_one_optional_key_that_a_roster_without_it_reads_as_the_servers() {
+        let cloud = companion("Cloud", 0);
+        let plain = serde_json::to_string(&cloud).unwrap();
+        assert_eq!(plain, r#"{"controller":"Companion","name":"Cloud","character":0,"level":6,"weapon":null,"armor":null,"limit":0}"#);
+        assert!(!plain.contains("commander"), "the server's companion carries no key");
+        let commanded = cloud.clone().commanded_by(AccountId(7));
+        let json = serde_json::to_string(&commanded).unwrap();
+        assert_eq!(json, r#"{"controller":"Companion","name":"Cloud","character":0,"level":6,"weapon":null,"armor":null,"limit":0,"commander":7}"#);
+        assert_eq!(serde_json::from_str::<BattleMember>(&json).unwrap(), commanded);
+        // What a v16 server sent (no key) is a companion the server commands.
+        assert_eq!(serde_json::from_str::<BattleMember>(&plain).unwrap().commander, None);
+        // A v16 reader skips the key it does not know, so the member it reads is the same member.
+        #[derive(Deserialize)]
+        struct V16Member {
+            controller: Controller,
+            name: String,
+            limit: u16,
+        }
+        let old: V16Member = serde_json::from_str(&json).unwrap();
+        assert_eq!((old.controller, old.name.as_str(), old.limit), (Controller::Companion, "Cloud", 0));
+        // The key is a number or nothing at all.
+        for bad in [r#""commander":"7""#, r#""commander":-1"#, r#""commander":{"account":7}"#, r#""commander":[7]"#] {
+            let text = json.replace(r#""commander":7"#, bad);
+            assert!(serde_json::from_str::<BattleMember>(&text).is_err(), "{bad}");
+        }
+        assert_eq!(serde_json::from_str::<BattleMember>(&json.replace(r#""commander":7"#, r#""commander":null"#)).unwrap().commander, None);
+    }
+
+    /// The commander is not an input of the engine: the same battle, whoever commands the companions, is the same fight
+    /// (so no peer's replay can depend on it, and a roster that names one replays against a server that does not).
+    #[test]
+    fn the_commander_changes_nothing_the_engine_replays() {
+        let rules = SyntheticRules::default();
+        let plain = BattleSetup { party: canon_then_players(), ..setup(0, 1) };
+        let mut commanded = plain.clone();
+        for m in &mut commanded.party {
+            *m = m.clone().commanded_by(AccountId(20));
+        }
+        assert_eq!(commanded.party.iter().filter(|m| m.commander == Some(AccountId(20))).count(), 2, "both companions name their commander");
+        let (a, b) = (rules.build(&plain).unwrap(), rules.build(&commanded).unwrap());
+        assert_eq!((a.tick(), a.party_ids(), a.enemy_ids()), (b.tick(), b.party_ids(), b.enemy_ids()));
+        for id in a.party_ids().into_iter().chain(a.enemy_ids()) {
+            let (x, y) = (a.actor(id).unwrap(), b.actor(id).unwrap());
+            assert_eq!((x.gauge, x.hp, x.max_hp, x.ready), (y.gauge, y.hp, y.max_hp, y.ready), "{id:?}");
+        }
     }
 
     #[test]

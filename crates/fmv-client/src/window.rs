@@ -289,7 +289,8 @@ pub fn party_request(key: PartyKey, state: &ClientState, render_t: f64) -> Optio
 /// The battle keys. `B` asks the server for a debug battle (refused unless it runs with
 /// `--debug-encounters`). In a battle the arrows (and W, A, S, D) move the menu's cursor, `Space` and
 /// `Enter` confirm (they open a level, pick an entry or a target), `Backspace` goes back a level
-/// (so does `Esc`, see [`escape_route`]).
+/// (so does `Esc`, see [`escape_route`]). `Tab` and `Y` swap the menu to the next ready member of the party when the
+/// player commands more than one ([`KeyRoute::Swap`], not a `BattleKey`: it asks the client for no request).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BattleKey {
     Request,
@@ -414,6 +415,10 @@ enum KeyRoute {
     Party(PartyKey),
     Audio(AudioKey),
     Battle(BattleKey),
+    /// `Tab` or `Y` in a battle (a controller's Y is FF7's Triangle): the menu goes to the next member of the party that is
+    /// ready, when the player commands more than one (see `BattleClient::swap_turn`). Outside a battle `Y` accepts an invite
+    /// and `Tab` is not a key of the game.
+    Swap,
     /// Everything else is for the held-key state of walking (a release always is).
     Movement,
     /// A repeat or a release of a key that acts only on a fresh press.
@@ -428,6 +433,12 @@ fn route_key(code: KeyCode, pressed: bool, repeat: bool, in_battle: bool) -> Key
     }
     if code == KeyCode::F1 {
         return if pressed && !repeat { KeyRoute::WalkMesh } else { KeyRoute::Ignored };
+    }
+    // In a battle a fresh press of Tab, or of Y (a controller's Y is FF7's Triangle), swaps the menu to the next ready member of
+    // the party the player commands: FF7's own "switch". Outside a battle Y accepts an invite as ever and Tab is no key of the
+    // game; a release or a repeat is not a swap and goes where it always went.
+    if in_battle && pressed && !repeat && matches!(code, KeyCode::Tab | KeyCode::KeyY) {
+        return KeyRoute::Swap;
     }
     if let Some(key) = PartyKey::from_event(code, pressed, repeat) {
         return KeyRoute::Party(key);
@@ -634,6 +645,7 @@ impl App {
             KeyRoute::Party(key) => self.party_key(key),
             KeyRoute::Audio(key) => self.audio_key(key),
             KeyRoute::Battle(key) => self.battle_key(key),
+            KeyRoute::Swap => self.swap_key(),
             KeyRoute::Movement => {
                 self.input.set(code, pressed);
             }
@@ -802,6 +814,14 @@ impl App {
             }
             BattleRequest::Menu | BattleRequest::Nothing("") => {}
             BattleRequest::Nothing(why) => eprintln!("battle: {why}"),
+        }
+    }
+
+    /// `Tab` was pressed in a battle: the menu goes to the next ready member of the party the player commands, with the
+    /// cursor sound (nothing happens, silently, when only one is waiting or the menu is not at its command list).
+    fn swap_key(&mut self) {
+        if self.session.state.battle.swap_turn() == MenuReply::Handled {
+            self.audio.cue(Cue::Cursor);
         }
     }
 
@@ -1314,6 +1334,21 @@ mod tests {
         }
     }
 
+    /// Tab and Y swap the menu to the next ready member, in a battle and on a fresh press only: outside one Y accepts an invite
+    /// as ever and Tab is no key of the game, and a release or a repeat is never a swap.
+    #[test]
+    fn tab_and_y_swap_the_menu_in_a_battle_and_only_on_a_fresh_press() {
+        for code in [KeyCode::Tab, KeyCode::KeyY] {
+            assert_eq!(route_key(code, true, false, true), KeyRoute::Swap, "{code:?} pressed in a battle");
+            assert_ne!(route_key(code, true, true, true), KeyRoute::Swap, "{code:?} held in a battle");
+            assert_ne!(route_key(code, false, false, true), KeyRoute::Swap, "{code:?} released in a battle");
+        }
+        assert_eq!(route_key(KeyCode::KeyY, true, false, false), KeyRoute::Party(PartyKey::Accept), "in the field Y accepts an invite");
+        assert_eq!(route_key(KeyCode::Tab, true, false, false), KeyRoute::Movement, "in the field Tab is no key of the game");
+        // A release in a battle still reaches the held-key state, as every release does.
+        assert_eq!(route_key(KeyCode::KeyY, false, false, true), KeyRoute::Movement);
+    }
+
     #[test]
     fn the_directions_are_battle_keys_only_in_a_battle_and_they_repeat_there() {
         for (codes, key) in [
@@ -1571,7 +1606,8 @@ mod tests {
             (PadKey::Confirm, KeyRoute::Battle(BattleKey::Confirm), KeyRoute::Battle(BattleKey::Confirm)),
             (PadKey::Back, KeyRoute::Battle(BattleKey::Back), KeyRoute::Battle(BattleKey::Back)),
             (PadKey::Invite, KeyRoute::Party(PartyKey::Invite), KeyRoute::Party(PartyKey::Invite)),
-            (PadKey::Accept, KeyRoute::Party(PartyKey::Accept), KeyRoute::Party(PartyKey::Accept)),
+            // Y accepts an invite in the field; in a battle it is FF7's Triangle, which swaps the menu to the next ready member.
+            (PadKey::Accept, KeyRoute::Party(PartyKey::Accept), KeyRoute::Swap),
             (PadKey::Leave, KeyRoute::Party(PartyKey::Leave), KeyRoute::Party(PartyKey::Leave)),
             (PadKey::Battle, KeyRoute::Battle(BattleKey::Request), KeyRoute::Battle(BattleKey::Request)),
             (PadKey::Escape, KeyRoute::Escape, KeyRoute::Escape),

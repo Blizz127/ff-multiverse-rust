@@ -123,18 +123,22 @@ HEADLESS OUTPUT:
   Party events and refusals are logged on stderr, one `party:` line each.
   --party-invite-first-peer invites the visible player with the lowest entity id (a refused invite
   is retried, at most 5 times, 1 s apart); --party-accept accepts every invite sent to this player.
-  --battle-auto plays battles: whenever its gauge is full it casts its cheapest healing spell on
-  itself if its HP is under 30% and it has the MP, otherwise gives its limit break if the limit
-  gauge is full, and otherwise attacks the first living enemy; it never runs unless a script says
-  so. With --debug-encounters it also asks the server for one battle (see BATTLES). Battle events
+  --battle-auto plays battles: whenever a gauge of a member it commands is full it casts that
+  member's cheapest healing spell on itself if its HP is under 30% and it has the MP, otherwise
+  gives its limit break if the limit gauge is full, and otherwise attacks the first living enemy;
+  it never runs unless a script says so. It commands its own character and, when the server names
+  it the commander of the canon companions Cloud and Barret (the party's leader, or the only
+  player of a solo battle: the server's --companions-player-commanded, on by default), them too,
+  the member whose gauge filled first going first. With --debug-encounters it also asks the server for one battle (see BATTLES). Battle events
   and refusals are logged on stderr as `battle:` lines; when a battle ends the line says whether
   this machine replayed it from its own battle data and matched (`verified: ...`) or could not
   (`NOT verified: ...`), and the closing `headless: battles:` line counts the verified ones and
   the commands of this player the server applied, by kind:
   `(<n> attack, <n> magic, <n> item, <n> defend, <n> limit, <n> escape)`. A --battle-auto bot that
   is in a battle when --duration runs out plays it to the end (at most 12 s longer).
-  --battle-script LIST (with --battle-auto) makes the bot give these commands first, in order, one
-  per full ATB gauge, and only then play as above. Entries, separated by commas: attack, defend,
+  --battle-script LIST (with --battle-auto) makes the bot give these commands to its own character
+  first, in order, one per full ATB gauge, and only then play as above (the canon companions it
+  commands play as above all along). Entries, separated by commas: attack, defend,
   escape, limit, magic:<spell id> and item:<item id> (the game's own ids: Cure is spell 0, Potion
   is item 0, Phoenix Down is item 7), for example --battle-script defend,item:0,magic:0,limit.
   An offensive spell, item or limit, and attack, aim at the first living enemy; a healing spell,
@@ -191,7 +195,8 @@ CONTROLLER:
   arrows (walk, move through the menus; a held direction repeats in menus and battles); A = Enter;
   B = Backspace (back a level in a battle), and Esc in the character menu (back, cancel; it never
   quits); X = P (invite the nearest player), and in the character menu a new character or, on the
-  create form, Backspace; Y = Y (accept an invite), and in the character menu forget a saved login
+  create form, Backspace; Y = Y (accept an invite; in a battle it switches the menu to the next ready
+  member of your party), and in the character menu forget a saved login
   (it asks first); Select = L (leave the party); Start = Esc (in the field a second press quits; in
   a battle it only backs out of the menu; in the character menu it backs out or quits); right
   bumper (R1/RB) = B (ask for a debug battle); left trigger (L2/LT), held = Shift (walk instead of
@@ -253,7 +258,11 @@ WINDOW CONTROLS:
   windows: the enemy list, your party's HP, MP and ATB gauges, and on your turn a command menu
   (Attack, Magic, Item, Defend; the Magic list holds the spells your character knows and the Item
   list the items your account carries). In a battle the arrows (or WASD) move the menu and the target
-  pointer, Space or Enter selects, Backspace or Esc goes back (Esc never quits in a battle).
+  pointer, Space or Enter selects, Backspace or Esc goes back (Esc never quits in a battle). As in
+  FF7 you command the whole party: when the server names you the commander of the canon companions
+  (a solo player, or the leader of a party) the menu belongs to whichever of Cloud, Barret and your
+  own character has been ready longest, moves on to the next ready one when you give its command,
+  and Tab (or Y, FF7's Triangle) switches to the next ready one at the command list.
   FMV_BATTLE_FLAT=1 draws the battle without the 3D scene.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

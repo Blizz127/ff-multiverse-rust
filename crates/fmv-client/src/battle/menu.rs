@@ -482,7 +482,6 @@ impl BattleMenu {
     }
 
     /// The level the menu is at.
-    #[cfg(test)]
     pub fn level(&self) -> Level {
         match self.state {
             State::Commands => Level::Commands,

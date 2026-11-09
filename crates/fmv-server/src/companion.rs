@@ -1,11 +1,15 @@
 //! What a canon companion does with its turn (protocol v9).
 //!
-//! A battle's party is the story's canon party followed by the players ([`fmv_protocol::Controller`]); the canon members
-//! are commanded by the SERVER. When one's ATB gauge is full the server asks [`command`] for its move and applies it
-//! like a player's, as an ordinary [`Command`]: checked by the engine (`BattleState::check_command`), submitted, and
-//! announced in a `BattleEvent` with the command attached, so every client replays and verifies it with the very
-//! engine code it already has. The engine has no AI for the party, and nothing here is part of what a replay depends
-//! on: only the commands that come out of it are.
+//! A battle's party is the story's canon party followed by the players ([`fmv_protocol::Controller`]). **Who commands the
+//! canon members** is the server's `--companions-player-commanded` switch (`BattleSettings::companions_player_commanded`; on
+//! in the server binary): with it ON, as in FF7, a PLAYER commands them (`BattleMember::commander`: the party's leader, or the
+//! only player of a solo battle), a full gauge waits for that player's command and nothing in this module runs for them. This
+//! module is what the SERVER does with the canon members it commands: with the switch OFF (the behaviour of protocol v9 to
+//! v16), and for a companion whose commander has left the battle. When such a one's ATB gauge is full the server asks
+//! [`command`] for its move and applies it like a player's, as an ordinary [`Command`]: checked by the engine
+//! (`BattleState::check_command`), submitted, and announced in a `BattleEvent` with the command attached, so every client
+//! replays and verifies it with the very engine code it already has. The engine has no AI for the party, and nothing here
+//! is part of what a replay depends on: only the commands that come out of it are.
 //!
 //! # The rule
 //!
