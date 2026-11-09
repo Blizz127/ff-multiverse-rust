@@ -105,6 +105,11 @@ aand ff11 is the best way of doing it" ("perfect ok lets do it"). The design tar
   and save. The record already has the shape: one game-agnostic identity plus a per-game binding (`PlayerCharacter`,
   section 2), so a new world adds a binding (and its creator step) without touching the identity or any other game's.
   A character entering a world it has no look for yet is asked for one there (or given that world's default body).
+  **Two ways to design it (the owner, 10:31 CST):** "the player can design the charater around one of the games and then
+  it deisngs it for all or they can do each game". Either the player designs the character ONCE, in any one game's style,
+  and the other worlds' looks are generated from that design, or the player designs each world by hand (and may still
+  touch up a generated one). Both rest on one shared, game-agnostic design record (body type, colours, hair, outfit
+  traits) that each world's creator step translates into its own style; the first pass has only FF7's look.
 
 ---
 
