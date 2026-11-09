@@ -8,7 +8,7 @@
 //! there, exactly as the server will place it.
 
 use crate::cli::BotKind;
-use crate::nav::plan_path;
+use crate::nav::plan_path_avoiding;
 use crate::net::PartyCommand;
 use crate::party::PartyMirror;
 use fmv_adapter_api::{AreaKey, AreaRuntime, Bounds, Exit, MoveResult};
@@ -216,9 +216,10 @@ pub struct TravelGate {
 /// over the area's own exits and `validate_move`; nothing here touches the network or the clock.
 ///
 /// It plans a way to the middle of the exit that leads to the next area (aiming a little past it, so
-/// the crossing really happens) with [`plan_path`]: a few long straight legs that keep clear of the
-/// walls, which is what the server's chord check agrees to (a bot that slid along walls step by step
-/// made chords it refused, over and over). Should the planner find no way, or a leg turn out blocked,
+/// the crossing really happens) with [`plan_path_avoiding`]: a few long straight legs that keep clear of the
+/// walls (and never cross another exit's line), over every level the surface has (a stair of several turns
+/// is planned as the stair it is), which is what the server's chord check agrees to (a bot that slid along
+/// walls step by step made chords it refused, over and over). Should the planner find no way, or a leg turn out blocked,
 /// it falls back to the greedy fan: each step takes the heading nearest the goal's that is walkable
 /// and gets closer. It never crosses an exit other than the one it wants. The bot gives up (and says
 /// so) when no exit of the current area leads to the next area, or when it makes no headway for
@@ -456,7 +457,10 @@ impl TravelBot {
                 self.plan_cooldown -= 1;
                 return None;
             }
-            match plan_path(area, cur, aim).or_else(|| plan_path(area, cur, mid)) {
+            // The planner is told the lines it must not walk over: those of the exits that are not the wanted one's
+            // (its own line, and any that share it, are crossed on purpose).
+            let others = |a: Pos, b: Pos| exits.iter().any(|e| !e.same_line_as(goal_exit) && e.is_crossed_by(a, b));
+            match plan_path_avoiding(area, cur, aim, &others).or_else(|| plan_path_avoiding(area, cur, mid, &others)) {
                 Some(waypoints) => self.plan = Some(Plan { area: key, target: next.to_string(), waypoints, next: 1 }),
                 None => {
                     self.failed_plans += 1;
@@ -1364,6 +1368,49 @@ mod travel_tests {
         // positions a few steps apart must be a chord the server walks.
         for window in positions.windows(4) {
             assert!(server_accepts_chord(&area, window[0], window[3]), "the chord {:?} -> {:?} would be refused", window[0], window[3]);
+        }
+    }
+
+    /// The first reactor mission on the owner's REAL fields (read-only; `#[ignore]`, `FMV_FF7_DATA` is the game's
+    /// `data/` directory): the travel bot, from where each arrival puts it, walks to and across the line to the next
+    /// field of the route within a bounded time, and every position it announces is one the server walks to from the
+    /// last. That includes the spiral stair of `nmkin_2` (four levels, ramps about 50 units wide), where a bot that
+    /// plans over a flat grid gets stuck and gives up (the first measured `travel-smoke.sh --chain` did).
+    #[test]
+    #[ignore = "needs the owner's real FF7 data (FMV_FF7_DATA)"]
+    fn the_travel_bot_walks_every_hop_of_the_first_reactor_mission_on_the_real_fields() {
+        let Some(adapter) = crate::nav::real::adapter() else { return };
+        // (field, the field it is entered from ("": the account's spawn), the field it walks to)
+        let hops = [
+            ("md1stin", "", "md1_1"),
+            ("md1_1", "md1stin", "md1_2"),
+            ("md1_2", "md1_1", "nrthmk"),
+            ("nrthmk", "md1_2", "nmkin_1"),
+            ("nmkin_1", "nrthmk", "elevtr1"),
+            ("elevtr1", "nmkin_1", "nmkin_2"),
+            ("nmkin_2", "elevtr1", "nmkin_3"),
+        ];
+        for (field, from, to) in hops {
+            let (area, start) = crate::nav::real::arrival(&adapter, field, from);
+            let goal = area.exits().into_iter().find(|e| e.target == to).unwrap();
+            let mut bot = TravelBot::new(vec![field.into(), to.into()], false);
+            assert!(bot.arrived(field, 0.0));
+            let speed = area.max_speed() * BOT_SPEED_FACTOR;
+            let (mut cur, mut crossed_at) = (start, None);
+            for i in 0..2000 {
+                let step = bot.step(&area, cur, DT, speed);
+                assert!(server_accepts_chord(&area, cur, step.pos), "{field}: the announced step {cur:?} -> {:?} would be refused", step.pos);
+                if goal.is_crossed_by(cur, step.pos) {
+                    crossed_at = Some(i + 1);
+                    break;
+                }
+                cur = step.pos;
+                if bot.gave_up().is_some() {
+                    break;
+                }
+            }
+            println!("{field} -> {to}: crossed after {crossed_at:?} steps of {DT} s");
+            assert!(crossed_at.is_some(), "{field}: the bot crosses the line to {to} (gave up: {:?}, at {cur:?})", bot.gave_up());
         }
     }
 }

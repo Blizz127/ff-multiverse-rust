@@ -433,6 +433,13 @@ needs no owned data. `scripts/travel-smoke.sh --chain` walks the whole first rea
 walkmesh goes (`md1stin`, `md1_1`, `md1_2`, `nrthmk`, `nmkin_1`, `elevtr1`, `nmkin_2`, `nmkin_3`) with the real story:
 see below.
 
+The bots find their way with `crates/fmv-client/src/nav.rs`: a grid over the field, A* over its cells, string pulling
+into a few straight legs that the server's own `validate_move` accepts, and never across the line of an exit they do
+not want. The nodes keep the **height** a walker has at them, so a surface with several levels over one spot is
+planned level by level (`nmkin_2`, the way down from the lift, is a stair of four levels joined by ramps about 50
+units wide: a coarse grid first, finer ones where the surface is narrow). The bots plan on what `validate_move`
+says and nothing else, so what they can walk is exactly what the server lets them walk.
+
 **Exits that scripts decide, and the story along the way.** Besides its gateways a field has the exits its
 scripts run when a player walks onto a line (a `MAPJUMP` in a line entity's trigger script, with the conditions
 it sits under); the adapter reports them after the gateways (`ExitKind::Script`) and answers, for an account's

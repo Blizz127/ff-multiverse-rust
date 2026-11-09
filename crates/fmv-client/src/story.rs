@@ -26,7 +26,7 @@ use fmv_core::Pos;
 use fmv_protocol::StoryAdvance;
 
 use crate::bot::BotStep;
-use crate::nav::plan_path;
+use crate::nav::plan_path_avoiding;
 
 /// Notes kept until the loop prints them; beyond this the oldest are dropped.
 const MAX_NOTES: usize = 32;
@@ -299,7 +299,9 @@ impl StoryBot {
                 self.plan_cooldown -= 1;
                 return None;
             }
-            match plan_path(area, cur, centre) {
+            // This bot never crosses an exit (it would leave the area before the story was told): the planner is told so.
+            let any_exit = |a: Pos, b: Pos| exits.iter().any(|e| e.is_crossed_by(a, b));
+            match plan_path_avoiding(area, cur, centre, &any_exit) {
                 Some(waypoints) => self.plan = Some(Plan { area: key, point: point.id, waypoints, next: 1 }),
                 None => {
                     self.plan_cooldown = PLAN_COOLDOWN_STEPS;

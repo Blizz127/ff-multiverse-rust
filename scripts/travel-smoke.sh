@@ -50,8 +50,8 @@
 # A's entity and from A's client, is exactly
 #   md1stin 1->6, md1_1 6->7, md1_2 7->8, nrthmk 8->10, nmkin_1 10->11, elevtr1 11->12 with var1.225 0->1, nmkin_2 12->13
 # ending in the blob 020d000101e101 (moment 13, bit 0 of Var[1][225] set), which the server saved. Random encounters are
-# off (this is about walking). The default duration is 330 s (the bots run for the whole of it; the walk takes about
-# 180 s on a debug build; --duration changes it).
+# off (this is about walking). The default duration is 200 s (the bots run for the whole of it; the walk takes about
+# 100 s on a debug build, measured; --duration changes it).
 #
 # Isolation (the owner's state directory is never touched, only its LIBRARY is read): the server and the
 # clients run with XDG_DATA_HOME/XDG_STATE_HOME/XDG_CONFIG_HOME/XDG_CACHE_HOME and FMV_STATE_DIR
@@ -81,7 +81,7 @@ err() { printf 'travel-smoke.sh: error: %s\n' "$*" >&2; }
 LIBRARY="${FMV_FF7_LIBRARY:-$HOME/.local/share/ff-multiverse}"
 TRAVEL_DURATION=45
 DURATION_GIVEN=0
-CHAIN_DURATION=330
+CHAIN_DURATION=200
 # The route of --chain: the fields after md1stin, in order (see the header).
 CHAIN_ROUTE=(md1_1 md1_2 nrthmk nmkin_1 elevtr1 nmkin_2 nmkin_3)
 # The story A makes on the way, as `area|point|what the server logged`, in the order of the route.
@@ -116,7 +116,7 @@ synthetic FIXTURE rooms (hall and yard) and needs no owned data.
                       walkmesh goes): the leader advances the story on the way and rides the lift, the member follows
   --library DIR      state directory that contains library/ (default $FMV_FF7_LIBRARY, else
                       ~/.local/share/ff-multiverse); only the library is read, never written
-  --duration SECS    how long each bot runs (default 45; 330 with --chain)
+  --duration SECS    how long each bot runs (default 45; 200 with --chain)
 EOF
 }
 
@@ -454,7 +454,9 @@ run_chain() {
   # The saver writes what it still holds when the server stops: the story A ended with.
   if [[ -n $a_entity ]]; then
     local last_step re_account='story advanced account=([0-9]+) entity='"$a_entity"' '
-    last_step=$(last_line_with "$WORK/server.log" "entity=$a_entity area=Ff7/nmkin_2 " || true)
+    # (the story line of nmkin_2 is not the last line that names the entity and the area: the move to the phase's
+    # instance follows it, and that line has no account)
+    last_step=$(last_line_with "$WORK/server.log" "entity=$a_entity area=Ff7/nmkin_2 point=" || true)
     [[ $last_step =~ $re_account ]] && a_account=${BASH_REMATCH[1]}
     if [[ -z $a_account ]]; then
       problem "could not read A's account from the server log"

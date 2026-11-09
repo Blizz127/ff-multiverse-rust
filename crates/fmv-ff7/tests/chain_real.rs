@@ -306,8 +306,10 @@ fn triangles_at(mesh: &fmv_ff7::field::Walkmesh, exit: &Exit) -> Vec<usize> {
 /// scripts, which the walkmesh does not link). `nmkin_4`'s arrival is a pocket too (22 of its 40 triangles; the
 /// field has a ladder of its own, a `LADER` between two levels, and its gateway to `nmkin_5` is not among the
 /// triangles walkable from the arrival). So the first mission's walkable part of the world ends at `nmkin_3` and the
-/// ladders are the next gap. (The client's grid planner `plan_path` says it can plan `nmkin_4` to `nmkin_5`: it puts
-/// its grid nodes at height 0, so on a stacked mesh it can plan over the wrong level; the access words are the truth.)
+/// ladders are the next gap. (The access words are the truth. The client's grid planner (`nav.rs`) used to put its
+/// nodes at height 0 and so planned over the wrong level of a stacked mesh: it found no way down `nmkin_2`'s stair
+/// and claimed one from `nmkin_4` to `nmkin_5`. It now keeps the level with every node and agrees with this test:
+/// a plan down the stair, none past `nmkin_3`.)
 #[test]
 #[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
 fn the_walkmesh_carries_the_party_down_to_nmkin_3_and_no_further() {
