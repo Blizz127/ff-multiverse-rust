@@ -73,7 +73,7 @@ CONTENT:
   region and revision: the server and every client must hold the same copy.
 
 HEADLESS OUTPUT:
-  stdout carries exactly one line:
+  stdout carries exactly one line (a run with a --scene-* flag also prints `scene ...` lines before it, see STORY SCENES):
     SMOKE name=<n> area=<AreaId> fixture=<bool> peers_seen=<n> updates=<n> rejected=<n> rtt_ms=<n|-1> party=<n> battles=<n> victories=<n> area_changes=<n> level=<n> exp=<n> items=<n>
   <n> in name= is the display name percent-encoded: letters, digits and - . _ ~ are kept, every
   other byte becomes %XX (\"Red XIII\" prints as Red%20XIII), so the line always splits on spaces.
@@ -150,6 +150,33 @@ HEADLESS OUTPUT:
   it; an escape can fail, so list it more than once. The script goes on across battles, and the
   closing `headless: battle script: entries=<n> applied=<n> skipped=<n> refused=<n> lost=<n>
   unused=<n>` line says how it went.
+
+STORY SCENES:
+  A scene is a stretch of the game's own story played like in FF14: OK (Enter, Space) next to the character that
+  offers it starts it for you; the game's own characters speak their real lines, in the order the game's script
+  runs them, in windows beside whoever speaks, while your own character stands in the scene as a witness. It is
+  played here, from YOUR copy of the game (a machine without the field's data skips it: the server then ends it for
+  you). Enter or Space turns a page and moves past a window, the arrows or W and S move a question's pointer,
+  Backspace or Esc skips the whole scene. Party members that are near watch it in step. F6 asks the server for a
+  preview of the first scene (the server must run with --debug-scene-preview).
+  --scene-preview ID asks for that scene's preview (when the party the bot is in allows: a bot that invites waits
+  for a party of two, one that accepts waits to be in a party), then presses OK next to the scene's trigger.
+  --scene-watch presses nothing and waits to watch a scene (with --scene-preview it previews first). --scene-answer
+  LINE answers a scene's questions with that line of the message (the question's pointer otherwise).
+  --scene-wait-secs N is how long to wait for the scene to start, and to end (default 60). --scene-watchers N makes
+  the owner wait until N other players are in view before it presses. The bot stands still, plays the scene without
+  waiting, and prints one line per event on STDOUT (flushed, before the SMOKE line; ids and counts only, never a
+  word of the game):
+  `scene preview requested scene=<id>`
+  `scene started run=<n> scene=<id> role=<Owner|Watcher> participants=<n>`
+  `scene line index=<i> opener=<entity> speaker=<entity|none> dialog=<n|-> asks=<true|false> answer=<line|none>`
+  (printed when a window is moved past: the owner and a watcher print the same lines)
+  `scene ended run=<n> outcome=<Finished|Skipped|TimedOut|Aborted> lines=<n>`
+  `scene control restored moved=<true|false>` (after the end the bot sends one move and says whether the server took it)
+  `scene refused reason=<Unavailable|UnknownScene|Busy|NotHere>`
+  `scene unavailable (cannot read this machine's field data)`
+  A bot that was asked to play a scene and did not see it finish exits 1. With a --scene-* flag the run ends when the
+  scene bot is done (--scene-wait-secs bounds it), whatever --duration says.
 
 BATTLES:
   A battle starts for a whole party (random encounters in a field that has a table, or on request
@@ -468,6 +495,33 @@ pub struct Args {
     /// canon Barret of md1stin, who is no script entity) has `nothing to say`. Without FF7 data nobody has.
     #[arg(long, value_name = "NAME[,NAME...]", value_delimiter = ',', value_parser = parse_npc_name, requires = "headless")]
     pub talk: Vec<String>,
+
+    // ---- story scenes: one contiguous block ----
+    /// Ask the server for a debug preview of this story scene (headless only; the server must run with
+    /// `--debug-scene-preview`) and then press OK next to the scene's trigger, as a bot: it plays the scene without waiting
+    /// and prints one `scene ...` line per event on stdout (see STORY SCENES). A bot that invites waits for a party of
+    /// two, one that accepts waits to be in a party, any other asks at once.
+    #[arg(long, value_name = "SCENE_ID", value_parser = parse_scene_id, requires = "headless")]
+    pub scene_preview: Option<String>,
+
+    /// Watch a story scene as a bot (headless only): press nothing, wait for a scene to start for this player as a watcher.
+    /// With `--scene-preview` it asks for the preview first (that is how a party member ends up in its leader's preview).
+    #[arg(long, requires = "headless")]
+    pub scene_watch: bool,
+
+    /// The line (absolute, as the game's script counts the lines of a message) to answer a scene's questions with
+    /// (headless only); the question's own pointer line when not given.
+    #[arg(long, value_name = "LINE", requires = "headless")]
+    pub scene_answer: Option<u8>,
+
+    /// How long a scene bot waits for the scene to start, and then for it to end, in seconds (headless only).
+    #[arg(long, value_name = "SECS", default_value = "60", value_parser = parse_duration_secs, requires = "headless")]
+    pub scene_wait_secs: Duration,
+
+    /// With `--scene-preview`: do not press OK on the trigger until this many other players are in view of this bot (its
+    /// party members have arrived in its instance), or `--scene-wait-secs` has passed.
+    #[arg(long, value_name = "N", default_value_t = 0, requires = "scene_preview")]
+    pub scene_watchers: usize,
 }
 
 /// Default server for `--server`. Kept in sync with `DEFAULT_DEV_PORT` by a unit test.
@@ -627,6 +681,17 @@ pub fn parse_npc_name(s: &str) -> Result<String, String> {
         return Err(format!("`{}` is not a character's name (1 to 24 printable ASCII characters, as the `headless: npc` lines print them)", clean_for_error(s)));
     }
     Ok(name.to_string())
+}
+
+/// A scene's id for `--scene-preview`: `<game>/<field>/<name>`, 1 to 64 ASCII letters, digits and `_ - . /` (what the server
+/// accepts: `fmv_protocol::MAX_SCENE_ID_CHARS`), so it can be sent and printed as it is. Which ids exist is the server's
+/// business: an unknown one is refused by it, not here.
+pub fn parse_scene_id(s: &str) -> Result<String, String> {
+    let id = s.trim();
+    if id.is_empty() || id.len() > fmv_protocol::MAX_SCENE_ID_CHARS || !id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/')) {
+        return Err(format!("`{}` is not a scene id (1 to 64 ASCII letters, digits, `_`, `-`, `.` and `/`, like ff7/mds7pb_1/tifa-bar)", clean_for_error(s)));
+    }
+    Ok(id.to_string())
 }
 
 /// Deterministic, random-looking, bright tint derived from a name hash (FNV-1a -> hue).
@@ -1024,6 +1089,48 @@ mod tests {
             "talk: npc=<enc> story=<moment|-> nothing to say",
             "talk: npc=<enc> was never in the area",
             "the canon Barret of md1stin, who is no script entity",
+        ] {
+            assert!(flat.contains(needle), "--help must mention {needle:?}:\n{help}");
+        }
+    }
+
+    #[test]
+    fn the_scene_flags_are_headless_only_and_say_what_they_print() {
+        let base = ["fmv-client", "--name", "x"];
+        let with = |extra: &[&str]| Args::try_parse_from(base.iter().chain(extra.iter()));
+        for flag in [&["--scene-preview", "ff7/mds7pb_1/tifa-bar"][..], &["--scene-watch"], &["--scene-answer", "2"], &["--scene-wait-secs", "9"]] {
+            assert!(with(flag).is_err(), "{flag:?} needs --headless");
+        }
+        assert!(with(&["--headless", "--scene-watchers", "1"]).is_err(), "--scene-watchers needs --scene-preview");
+        assert!(with(&["--scene-watchers", "1", "--scene-preview", "ff7/mds7pb_1/tifa-bar"]).is_err(), "and --headless");
+        let a = with(&["--headless", "--scene-preview", "ff7/mds7pb_1/tifa-bar", "--scene-watchers", "2", "--scene-answer", "3", "--scene-wait-secs", "12.5"]).unwrap();
+        assert_eq!(a.scene_preview.as_deref(), Some("ff7/mds7pb_1/tifa-bar"));
+        assert_eq!((a.scene_watchers, a.scene_answer, a.scene_wait_secs, a.scene_watch), (2, Some(3), Duration::from_secs_f64(12.5), false));
+        let d = with(&["--headless"]).unwrap();
+        assert_eq!((d.scene_preview, d.scene_watch, d.scene_answer, d.scene_watchers, d.scene_wait_secs), (None, false, None, 0, Duration::from_secs(60)));
+        assert!(with(&["--headless", "--scene-watch", "--scene-preview", "ff7/mds7pb_1/tifa-bar"]).is_ok(), "a watcher that previews first");
+        for bad in ["", "a b", "x".repeat(65).as_str(), "caf\u{e9}", "line\nbreak", "\u{1b}[31m"] {
+            assert!(with(&["--headless", "--scene-preview", bad]).is_err(), "{bad:?} is not a scene id");
+        }
+        assert!(with(&["--headless", "--scene-answer", "256"]).is_err(), "a line is a byte on the wire");
+        use clap::CommandFactory;
+        let help = Args::command().render_long_help().to_string();
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        for needle in [
+            "--scene-preview <SCENE_ID>",
+            "--scene-watch",
+            "--scene-answer <LINE>",
+            "--scene-wait-secs <SECS>",
+            "--scene-watchers <N>",
+            "STORY SCENES:",
+            "scene preview requested scene=<id>",
+            "scene started run=<n> scene=<id> role=<Owner|Watcher> participants=<n>",
+            "scene line index=<i> opener=<entity> speaker=<entity|none> dialog=<n|-> asks=<true|false> answer=<line|none>",
+            "scene ended run=<n> outcome=<Finished|Skipped|TimedOut|Aborted> lines=<n>",
+            "scene control restored moved=<true|false>",
+            "scene refused reason=<Unavailable|UnknownScene|Busy|NotHere>",
+            "scene unavailable (cannot read this machine's field data)",
+            "a run with a --scene-* flag also prints `scene ...` lines before it",
         ] {
             assert!(flat.contains(needle), "--help must mention {needle:?}:\n{help}");
         }

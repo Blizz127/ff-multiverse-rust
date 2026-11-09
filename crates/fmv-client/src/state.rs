@@ -29,6 +29,7 @@ use crate::battle::BattleClient;
 use crate::interp::{normalize_angle, Pose, Sample, SnapshotBuffer};
 use crate::party::{nearest_peer, PartyMirror};
 use crate::progress::ProgressMirror;
+use crate::scene::SceneClient;
 use crate::story::StoryMirror;
 use fmv_adapter_api::{AreaRuntime, MoveResult};
 use fmv_core::{AccountId, AnimState, AreaId, AvatarAppearance, EntityId, EntitySnapshot, Pos};
@@ -372,6 +373,8 @@ pub struct ClientState {
     pub progress: ProgressMirror,
     /// Where the server says our story stands (see `crate::story`). Empty until it says: a new account.
     pub story: StoryMirror,
+    /// The story scene we are in, if any, and what is owed the server about it (see `crate::scene`).
+    pub scene: SceneClient,
     remotes: BTreeMap<EntityId, Remote>,
     /// The non-player characters of the current area (from its `AreaSnapshot`).
     npcs: Vec<NpcView>,
@@ -386,6 +389,10 @@ pub struct ClientState {
     /// to where we were do not count).
     area_changes: u64,
     last_rtt: Option<Duration>,
+    /// How many updates of our own entity arrived (every accepted move that changed something is echoed to the mover), and the
+    /// place the last one gave: what a bot reads to tell that the server took a move (see `crate::scene::bot`).
+    own_echoes: u64,
+    own_echo_at: Option<Pos>,
     /// The look the server shows for our own entity (from its snapshots).
     own_appearance: Option<String>,
     /// The identity colour the server shows for our own entity (from its snapshots).
@@ -409,6 +416,7 @@ impl ClientState {
             battle: BattleClient::new(account),
             progress: ProgressMirror::default(),
             story: StoryMirror::default(),
+            scene: SceneClient::new(),
             remotes: BTreeMap::new(),
             npcs: Vec::new(),
             npc_epoch: 0,
@@ -417,6 +425,8 @@ impl ClientState {
             rejected: 0,
             area_changes: 0,
             last_rtt: None,
+            own_echoes: 0,
+            own_echo_at: None,
             own_appearance: None,
             own_tint: None,
             peer_looks: BTreeMap::new(),
@@ -459,6 +469,8 @@ impl ClientState {
         self.peers_seen.clear();
         self.peer_looks.clear();
         self.own = OwnPlayer::at(arrival, facing);
+        // A scene is played in one field: the area changing under it ends it here (the server never moves a held player).
+        self.scene.end_local();
         if forward {
             self.area_changes += 1;
         }
@@ -484,6 +496,12 @@ impl ClientState {
     pub fn set_rtt(&mut self, rtt: Duration) {
         self.last_rtt = Some(rtt);
     }
+    /// How many updates of our own entity arrived, and the place the last one gave. The server echoes an accepted move that
+    /// changed something to the mover too and answers one it ignores (a player held in a scene) with nothing.
+    pub fn own_echo(&self) -> (u64, Option<Pos>) {
+        (self.own_echoes, self.own_echo_at)
+    }
+
     /// The look the server shows for our own entity (`appearance_ref`), if it said.
     pub fn own_appearance(&self) -> Option<&str> {
         self.own_appearance.as_deref()
@@ -589,6 +607,11 @@ impl ClientState {
             // Where our story stands (the server's word, never ends the session): the mirror keeps the
             // blob for whatever reads story variables on this side (see `crate::story`).
             ServerMsg::StoryUpdate { progress, advance } => self.story.on_update(progress, advance),
+            // A story scene (the server's word; it never ends the session): the scene client plays it from this machine's own
+            // game and says what is owed back (see `crate::scene`).
+            msg @ (ServerMsg::SceneStart { .. } | ServerMsg::SceneStep { .. } | ServerMsg::SceneEnded { .. } | ServerMsg::SceneRefused { .. }) => {
+                self.scene.on_message(&self.area.key, msg);
+            }
         }
         None
     }
@@ -598,6 +621,8 @@ impl ClientState {
             return;
         }
         if snap.id == self.self_entity {
+            self.own_echoes = self.own_echoes.saturating_add(1);
+            self.own_echo_at = Some(snap.pos);
             self.own.note_server_pos(now, snap.pos);
             self.own_appearance = kept_appearance(&snap.avatar);
             self.own_tint = Some(snap.avatar.tint);

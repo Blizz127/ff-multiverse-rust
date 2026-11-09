@@ -1,7 +1,9 @@
 //! Headless bot mode: no window, scripted movement, one SMOKE summary line on stdout.
 //!
 //! stdout carries exactly one line (the SMOKE summary); every notice and error goes to stderr,
-//! including the one-line `party:` notes about party events and refusals.
+//! including the one-line `party:` notes about party events and refusals. The one exception is a run with a `--scene-*`
+//! flag: its `scene ...` lines (see `crate::scene::bot`) are printed on stdout, flushed, BEFORE the SMOKE line, which is
+//! still the last one.
 //!
 //! What a run says about who its players are goes to stderr too, one `key=value` line each (see the
 //! help's HEADLESS OUTPUT section): `character:` once after joining (what the server holds of this
@@ -16,6 +18,7 @@ use crate::bot::{Bot, PartyBot, TravelBot, TravelGate};
 use crate::cli::{exit, Args};
 use crate::interp::render_time;
 use crate::progress::slot_name;
+use crate::scene::{Act, SceneBot, SceneBotConfig, Senses};
 use crate::session::Session;
 use crate::state::PeerSighting;
 use crate::story::StoryBot;
@@ -181,6 +184,46 @@ pub fn smoke_line(smoke: &Smoke<'_>) -> String {
     format!("SMOKE name={name} area={area} fixture={fixture} peers_seen={peers_seen} updates={updates} rejected={rejected} rtt_ms={rtt_ms} party={party} battles={battles} victories={victories} area_changes={area_changes} level={level} exp={exp} items={items}")
 }
 
+/// What the scene bot looks at, at session time `now` with `peers` other players in view.
+fn scene_senses(session: &Session, now: f64, peers: usize) -> Senses<'_> {
+    let (echoes, echo_at) = session.state.own_echo();
+    Senses {
+        now,
+        npcs: session.state.npc_views(),
+        npc_epoch: session.state.npc_epoch(),
+        party_size: session.state.party.party_size(),
+        peers_in_view: peers,
+        unsent: session.state.own.has_unsent(),
+        echoes,
+        echo_at,
+        rejected: session.state.rejected(),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The scene lines `print_scene_lines` printed on this thread: a test reads them here (a real run has them on stdout).
+    static SCENE_LINES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The scene lines printed on this thread since the last call (tests only).
+#[cfg(test)]
+fn take_scene_lines() -> Vec<String> {
+    SCENE_LINES.with(|lines| std::mem::take(&mut *lines.borrow_mut()))
+}
+
+/// Print the scene bot's lines on stdout, one per event, flushed (a smoke test reads them as they come).
+fn print_scene_lines(lines: Vec<String>) {
+    #[cfg(test)]
+    SCENE_LINES.with(|sink| sink.borrow_mut().extend(lines.iter().cloned()));
+    for line in lines {
+        let mut out = std::io::stdout().lock();
+        // Ignore write errors (e.g. a closed pipe): the exit code still tells the story.
+        let _ = writeln!(out, "{line}");
+        let _ = out.flush();
+    }
+}
+
 /// `audio` is the run's sound (off for a bot unless `FMV_AUDIO` was set, see `main::start_audio`): it
 /// follows the area and the battle each tick and logs what it plays.
 pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>, mut audio: GameAudio) -> u8 {
@@ -199,7 +242,24 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>, mut 
     let mut battle_bot = BattleBot::new(args.battle_auto, args.debug_encounters, args.battle_wait_party).with_script(args.battle_script.clone());
     // `--talk`: talk to these characters of the area through the window's own conversation code (this machine's
     // own copy of the field's scripts; without FF7 data nobody has anything to say).
-    let mut talk_bot = TalkBot::new(&args.talk, Box::new(Ff7Conversations::new(ff7)));
+    let mut talk_bot = TalkBot::new(&args.talk, Box::new(Ff7Conversations::new(ff7.clone())));
+    // Story scenes are built from this machine's own FF7 data (a client that was given a builder already, a test's, keeps it).
+    // `--scene-*`: play one without waiting for a picture and say what happened on stdout, one line per event.
+    if ff7.is_some() {
+        session.state.scene.set_builder(Box::new(crate::scene::Ff7Scenes::new(ff7)));
+    }
+    let mut scene_bot = SceneBot::new(SceneBotConfig {
+        preview: args.scene_preview.clone(),
+        watch: args.scene_watch,
+        answer: args.scene_answer.map(usize::from),
+        wait: args.scene_wait_secs,
+        watchers: args.scene_watchers,
+        invite_first_peer: args.party_invite_first_peer,
+        accept: args.party_accept,
+    });
+    if scene_bot.is_active() {
+        session.state.scene.set_instant(true);
+    }
     eprintln!(
         "headless: joined {} as `{}` (entity {}), bot={:?} for {:.1} s",
         session.info.area_id,
@@ -227,6 +287,17 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>, mut 
     }
     if args.party_accept_after_split {
         eprintln!("headless: party behaviour: accept an invite only once a player seen before is out of view");
+    }
+    if scene_bot.is_active() {
+        eprintln!(
+            "headless: scene behaviour: {}; the run ends when the scene is over and control has been checked, or after {:.0} s without progress (--duration does not apply)",
+            match (&args.scene_preview, args.scene_watch) {
+                (Some(id), false) => format!("ask for a preview of {}, press OK next to its trigger{}, play it and check control afterwards", crate::scene::clean_id(id), if args.scene_watchers > 0 { format!(" once {} other player(s) are in view", args.scene_watchers) } else { String::new() }),
+                (Some(id), true) => format!("ask for a preview of {}, then watch the scene that starts for this player", crate::scene::clean_id(id)),
+                (None, _) => "watch the scene that starts for this player".to_string(),
+            },
+            args.scene_wait_secs.as_secs_f64()
+        );
     }
     if talk_bot.is_active() {
         eprintln!("headless: talk behaviour: talk once to {}, as soon as the area announces them, read with this player's own story", args.talk.join(", "));
@@ -268,7 +339,7 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>, mut 
     let mut last_npc_epoch = u64::MAX;
     // OK presses sent (ladders, lift panels, talks), for the summary.
     let mut presses_sent = 0_u32;
-    while start.elapsed() < args.duration
+    while (if scene_bot.is_active() { !scene_bot.is_done() } else { start.elapsed() < args.duration })
         || finishing_a_battle(battle_bot.is_active(), session.state.battle.in_battle(), start.elapsed(), args.duration)
     {
         let tick_start = Instant::now();
@@ -352,6 +423,40 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>, mut 
             session.send_party(cmd);
         }
         session.flush_party_sync();
+        // Story scenes: a bot plays one through without waiting (it moves past every window at once), and the bot's script
+        // around it (the preview, the press, the control check) is stepped here. What it printed goes to stdout, flushed.
+        if scene_bot.is_active() {
+            session.state.scene.autoplay(scene_bot.answer());
+        }
+        for event in session.state.scene.take_events() {
+            if scene_bot.is_active() {
+                scene_bot.on_event(&event, now);
+            }
+        }
+        if scene_bot.is_active() {
+            let acts = scene_bot.step(&scene_senses(&session, now, remotes.len()));
+            for act in acts {
+                match act {
+                    Act::Preview(id) => session.state.scene.request_preview(&id),
+                    Act::Press(npc) => {
+                        eprintln!("headless: interact area={} npc={npc} (a scene's trigger)", session.info.area_id);
+                        presses_sent += 1;
+                        session.send_interact(Some(npc));
+                    }
+                    Act::Probe => {
+                        let target = crate::scene::pick_probe(session.area.as_ref(), session.state.own.pos());
+                        scene_bot.probe_target(target, &scene_senses(&session, now, remotes.len()));
+                        if let Some(to) = target {
+                            let from = session.state.own.pos();
+                            session.state.own.set_motion(to, (to.y - from.y).atan2(to.x - from.x), AnimState::Walk);
+                        }
+                    }
+                }
+            }
+            print_scene_lines(scene_bot.take_lines());
+        }
+        session.flush_scene();
+        session.log_scene_notes();
         // Battles: attack when our gauge is full, ask for a debug encounter (once) if told to.
         for cmd in battle_bot.step(now, &session.state.battle, &session.state.party) {
             session.send_battle(cmd);
@@ -361,8 +466,10 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>, mut 
         }
         let dt = (tick_start - last).as_secs_f32().min(MAX_DT);
         last = tick_start;
-        // A player in a battle is frozen in the field: it neither walks nor sends movement.
-        let frozen = session.state.battle.in_battle();
+        // A player in a battle is frozen in the field: it neither walks nor sends movement. So is one held in a story scene,
+        // and one that plays a scene stands still from the moment it asks for its preview (it must stand where its press is
+        // judged, and its probe of control afterwards must be the only move it makes).
+        let frozen = session.state.battle.in_battle() || session.state.scene.is_active() || scene_bot.holds_still();
         // Whoever moved the player, the bots of an area with links keep the arming of its walk-on lines from what
         // they see (a step is a step, a jump is the server putting the player somewhere).
         if story_bot.is_requested() {
@@ -407,8 +514,10 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>, mut 
             session.state.own.set_motion(step.pos, facing, anim);
         }
         own_walk.feed(session.state.own.pos());
-        if !frozen {
+        if !frozen || scene_bot.probing() {
             session.flush_intent();
+        }
+        if !frozen {
             // A press of OK (the elevator's panel, a ladder, a talk) is judged by the server where it holds the
             // player: it goes out once the intent that tells it where the bot stands has.
             let wants = if story_decides { story_bot.wants_press() } else { travel_bot.wants_press() };
@@ -430,6 +539,16 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>, mut 
     }
     for line in talk_bot.finish() {
         eprintln!("{line}");
+    }
+    // A bot that was asked to play a scene and did not see it finish fails the run (the loop above only ends when the scene
+    // bot is done, or the session did).
+    print_scene_lines(scene_bot.take_lines());
+    if scene_bot.is_active() && ended.is_none() {
+        if let Some(why) = scene_bot.failure() {
+            ended = Some(format!("scene: {why}"));
+        } else if !scene_bot.is_done() {
+            ended = Some("scene: the run ended before the scene did".to_string());
+        }
     }
     if let Some(why) = story_bot.gave_up() {
         eprintln!("headless: story: gave up: {why}");
@@ -726,3 +845,5 @@ mod tests {
 
 #[cfg(test)]
 mod interact_tests;
+#[cfg(test)]
+mod scene_tests;
