@@ -41,6 +41,8 @@ fn trigger_name(t: &StoryTrigger) -> &'static str {
         StoryTrigger::Region(_) => "region",
         StoryTrigger::Line(..) => "line",
         StoryTrigger::Enter => "entry",
+        StoryTrigger::Press(_) => "press",
+        StoryTrigger::Talk { .. } => "talk",
         _ => "other",
     }
 }
@@ -85,7 +87,8 @@ fn main() {
     let mut by_trigger: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut fields_with_points = 0usize;
     let mut most_points = (0usize, String::new());
-    let (mut ok_points, mut battle_points) = (0usize, 0usize);
+    let (mut ok_points, mut battle_points, mut first_battles) = (0usize, 0usize, 0usize);
+    let (mut link_totals, mut dropped_totals, mut fields_with_links) = ((0usize, 0usize), 0usize, 0usize);
     let (mut active_totals, mut off_totals) = ((0usize, 0usize, 0usize), (0usize, 0usize, 0usize));
     for name in &names {
         if !all && !points && !wanted.iter().any(|w| w.as_str() == name) {
@@ -129,7 +132,14 @@ fn main() {
             *by_trigger.entry(trigger_name(&p.trigger)).or_default() += 1;
             ok_points += usize::from(p.label.contains("(OK)"));
             battle_points += usize::from(p.label.contains("battle"));
+            first_battles += usize::from(area.story_battle(p.id).is_some());
         }
+        let links = area.links();
+        let scanned = fmv_ff7::script::FieldScript::from_field(area.field_file()).map(|script| fmv_ff7::links::scan_links(&script, area.walkmesh())).unwrap_or_default();
+        link_totals.0 += links.iter().filter(|l| !l.needs_ok).count();
+        link_totals.1 += links.iter().filter(|l| l.needs_ok).count();
+        dropped_totals += scanned.dropped.len();
+        fields_with_links += usize::from(!links.is_empty());
         if wanted.iter().any(|w| w.as_str() == name) {
             println!(
                 "== {name} ({}): {} gateways, {} script exits, {} story points",
@@ -159,14 +169,37 @@ fn main() {
         }
         if points || wanted.iter().any(|w| w.as_str() == name) {
             for p in &story_points {
-                println!("   point {name}#{} [{}] {}", p.id, trigger_name(&p.trigger), p.label);
+                let first = area.story_battle(p.id).map_or(String::new(), |b| format!(" | starts battle {b} first"));
+                println!("   point {name}#{} [{}] {}{first}", p.id, trigger_name(&p.trigger), p.label);
+            }
+        }
+        if wanted.iter().any(|w| w.as_str() == name) {
+            for (i, l) in links.iter().enumerate() {
+                println!(
+                    "   link {name}#{i} ({}, {}) line ({:.0},{:.0},{:.0})-({:.0},{:.0},{:.0}) -> ({:.0},{:.0}) hint {:?}",
+                    l.label,
+                    if l.needs_ok { "OK" } else { "walk-on" },
+                    l.line.0.x,
+                    l.line.0.y,
+                    l.line.0.z,
+                    l.line.1.x,
+                    l.line.1.y,
+                    l.line.1.z,
+                    l.to.x,
+                    l.to.y,
+                    l.to_hint
+                );
+            }
+            for (entity, slot, why) in &scanned.dropped {
+                println!("   link dropped: line entity {entity} script {slot}: {why}");
             }
         }
     }
     if all {
         println!("{fields} fields: {with_exits} have exits; {script_exits} script exits (at most {max_script}, in {max_field}); for a new account {verdicts:?}");
         println!("fields whose script exits a new account may take: {}", open_new.len());
-        println!("story points by trigger {by_trigger:?} in {fields_with_points} fields (most: {} in {}); {ok_points} want OK, {battle_points} name a battle", most_points.0, most_points.1);
+        println!("story points by trigger {by_trigger:?} in {fields_with_points} fields (most: {} in {}); {ok_points} want OK, {battle_points} name a battle, {first_battles} start one first", most_points.0, most_points.1);
+        println!("links: {} walk-on and {} on OK in {fields_with_links} fields; {dropped_totals} trigger scripts were dropped (not judgeable)", link_totals.0, link_totals.1);
         println!(
             "offered by a server (the {} reviewed fields): {} script exits, {} story points, in {} fields; left off ({} other fields have some): {} script exits, {} story points",
             fmv_ff7::REVIEWED_FIELDS.len(),

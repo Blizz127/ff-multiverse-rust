@@ -716,11 +716,14 @@ fn story_section() -> Vec<u8> {
     let guarded = [vec![0x16, 0x20, 0x00, 0x00, 5, 0, 3, 6], setword].concat();
     let walker = [guarded, vec![0x00]].concat();
     let hero = vec![0xA1, 0x00, 0xA0, 0x00, 0x00];
+    // the hero's script 3: a jump to (80, 30) on triangle 0, which the line `lk0` (script 2) asks for when walked on
+    let hop = [vec![0xC0, 0, 0, 80, 0, 30, 0, 0, 0, 17, 0], vec![0x00]].concat();
     let jump = [mapjump(1, 50, 40, 1, 64), vec![0x00]].concat();
     SynthScript { model_count: 1, scale: 512, ..Default::default() }
-        .entity("hero", vec![(0, hero)])
+        .entity("hero", vec![(0, hero), (3, hop)])
         .entity("walker", vec![(0, walker)])
         .entity("jp0", vec![(0, [line_at(-185), vec![0x00]].concat()), (3, jump)])
+        .entity("lk0", vec![(0, [line_at(20), vec![0x00]].concat()), (2, vec![0x03, 0, 3, 0x00])])
         .build()
 }
 
@@ -743,10 +746,10 @@ fn story_archive() -> Ff7Adapter {
 #[test]
 fn the_reviewed_list_is_the_first_reactor_mission_and_nothing_else() {
     // (a change here is a review: see the list's docs and the real-data pin that lists what is left off)
-    assert_eq!(REVIEWED_FIELDS, ["md1stin", "md1_1", "md1_2", "nrthmk", "nmkin_1", "elevtr1", "nmkin_2", "nmkin_3"]);
+    assert_eq!(REVIEWED_FIELDS, ["md1stin", "md1_1", "md1_2", "nrthmk", "nmkin_1", "elevtr1", "nmkin_2", "nmkin_3", "nmkin_4", "nmkin_5"]);
     assert!(REVIEWED_FIELDS.iter().all(|f| is_reviewed_field(f)));
-    assert!(is_reviewed_field("MD1STIN") && is_reviewed_field("Nmkin_3"), "the archive's spelling decides nothing");
-    for other in ["nmkin_4", "nmkin_5", "md8_1", "md8_4", "md1stin2", "md1stin ", "", "smkin_1"] {
+    assert!(is_reviewed_field("MD1STIN") && is_reviewed_field("Nmkin_3") && is_reviewed_field("NMKIN_5"), "the archive's spelling decides nothing");
+    for other in ["nmkin_6", "md8_1", "md8_4", "md1stin2", "md1stin ", "", "smkin_1"] {
         assert!(!is_reviewed_field(other), "{other:?}");
     }
 }
@@ -764,6 +767,12 @@ fn script_exits_and_story_points_are_offered_in_a_reviewed_field_only() {
     assert_eq!(reviewed.story_points()[0].label, "entry: moment <5 -> 5");
     assert_eq!(reviewed.story_advance(&[], 0).expect("a new account takes the step").summary, "moment=1->5");
     assert_eq!(reviewed.story_withheld(), None);
+    // ... and the jump its line `lk0` makes the hero take, as a link that fires when walked up to
+    let links = reviewed.links();
+    assert_eq!(links.len(), 1, "{links:?}");
+    assert_eq!((links[0].needs_ok, links[0].label.as_str(), links[0].to_hint), (false, "jump", Some(0)));
+    assert_eq!((links[0].to.x, links[0].to.y), (80.0, 30.0));
+    assert_eq!((links[0].line.0.x, links[0].line.1.x), (20.0, 20.0));
 
     // the same field under a name nobody reviewed: the gateway exactly as before, nothing else of the story
     let exits = other.exits();
@@ -776,6 +785,8 @@ fn script_exits_and_story_points_are_offered_in_a_reviewed_field_only() {
     assert_eq!(left_off.reason, "unreviewed field");
     assert_eq!(left_off.points, ["entry: moment <5 -> 5"]);
     assert_eq!(left_off.exits, ["to dest when no conditions"]);
+    assert_eq!(left_off.links, ["jump of line entity 3 (script 2), on walking up to triangle 0"]);
+    assert!(other.links().is_empty(), "a link teleports a player: not for a field nobody reviewed");
 
     // its phases are untouched: the same intervals, the same keys
     let blobs = [Vec::new(), StoryState::at(1).encode(), StoryState::at(5).encode(), StoryState::at(9).encode()];
@@ -787,10 +798,12 @@ fn script_exits_and_story_points_are_offered_in_a_reviewed_field_only() {
     // as the server loads it: through the trait object
     let served = a.load_area("othrfld").unwrap();
     assert!(served.story_points().is_empty() && served.story_withheld().is_some() && served.exits().len() == 1);
+    assert!(served.links().is_empty() && served.story_battle(0).is_none());
     // the survey loads everything the data holds, whatever the field is called
     let surveyed = a.survey_field("othrfld").unwrap();
     assert_eq!(surveyed.exits().len(), 2);
     assert_eq!(surveyed.story_points().len(), 1);
+    assert_eq!(surveyed.links().len(), 1, "the survey sees what the data holds");
     assert_eq!(surveyed.story_withheld(), None);
     assert_eq!(surveyed.story_advance(&[], 0).map(|s| s.summary), Some("moment=1->5".to_string()));
 }

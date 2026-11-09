@@ -24,7 +24,7 @@
 
 use crate::headless::encode_name;
 use crate::state::NpcView;
-use crate::ui::dialogue::ff7::StoryFactory;
+use crate::ui::dialogue::ff7::story_of;
 use crate::ui::dialogue::Conversations;
 use fmv_ff7::script::dialogue::{Beat, End, Message, MessageOrigin};
 use fmv_ff7::story::StoryState;
@@ -92,12 +92,6 @@ impl TalkBot {
             .map(|(name, _)| format!("talk: npc={} was never in the area", encode_name(name)))
             .collect()
     }
-}
-
-/// The story hook for a conversation: the player's own story state, or a new game's.
-fn story_of(state: Option<StoryState>) -> StoryFactory {
-    let state = state.unwrap_or_else(StoryState::new_game);
-    Box::new(move || Box::new(state.clone()))
 }
 
 /// What the story column of a line says.

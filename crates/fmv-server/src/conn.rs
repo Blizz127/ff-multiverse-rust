@@ -72,7 +72,7 @@ use crate::config::ServerConfig;
 use crate::deferred;
 use crate::limits::{throttle_notice, Limits, LogVerdict, PeerKey, RegistrationRefusal};
 use crate::world::{
-    BattleReply, CloseFlag, JoinError, MoveOutcome, NewPlayer, Outbound, OutboundTx, PartyOutcome, TravelReply, World,
+    BattleReply, CloseFlag, JoinError, MoveOutcome, NewPlayer, Outbound, OutboundTx, PartyOutcome, PressOutcome, TravelReply, World,
 };
 
 /// Reported in `Welcome::server_build` and the READY line.
@@ -436,6 +436,8 @@ struct Conn {
     limiter: RateLimiter,
     guard: Option<JoinGuard>,
     rejected_moves: u64,
+    /// The `seq` of the newest `MoveIntent` this connection has received (what a relocation by a press is answered with).
+    last_move_seq: u32,
     /// Nothing has been read yet (the first message is where a protocol mismatch is diagnosed).
     first_message: bool,
     /// Frames the writer has completely written to the socket.
@@ -469,6 +471,7 @@ pub(crate) async fn serve_connection(shared: Arc<Shared>, stream: TcpStream, pee
         limiter,
         guard: None,
         rejected_moves: 0,
+        last_move_seq: 0,
         first_message: true,
         written,
         registered: None,
@@ -559,6 +562,7 @@ impl Conn {
                 ClientMsg::Ping { nonce } => self.pong(nonce)?,
                 ClientMsg::Hello { .. }
                 | ClientMsg::MoveIntent { .. }
+                | ClientMsg::Interact { .. }
                 | ClientMsg::PartyInvite { .. }
                 | ClientMsg::PartyAccept { .. }
                 | ClientMsg::PartyDecline { .. }
@@ -614,6 +618,7 @@ impl Conn {
             }
             match msg {
                 ClientMsg::MoveIntent { seq, pos, facing, anim } => self.on_move(entity, seq, pos, facing, anim)?,
+                ClientMsg::Interact { npc } => self.on_interact(entity, npc)?,
                 ClientMsg::Ping { nonce } => self.pong(nonce)?,
                 ClientMsg::Leave => return Err(Close::Left),
                 ClientMsg::PartyInvite { target } => self.party(|w, now| w.party_invite(entity, target, now))?,
@@ -824,10 +829,24 @@ impl Conn {
         self.send(ServerMsg::Pong { nonce, tick })
     }
 
+    /// The player pressed OK (`ClientMsg::Interact`). What it does is the world's (`World::press`); when a ladder moved
+    /// the player the client is told where it stands now, with the message that already does that.
+    fn on_interact(&mut self, entity: EntityId, npc: Option<u32>) -> Result<(), Close> {
+        match self.shared.with_world(|world| world.press(entity, npc, Instant::now())) {
+            PressOutcome::Nothing => Ok(()),
+            PressOutcome::Relocated { corrected } => self.send(ServerMsg::MoveRejected { seq: self.last_move_seq, corrected }),
+            PressOutcome::Gone => Err(Close::Dropped("removed from the world")),
+        }
+    }
+
     fn on_move(&mut self, entity: EntityId, seq: u32, pos: Pos, facing: f32, anim: AnimState) -> Result<(), Close> {
+        self.last_move_seq = seq;
         let outcome = self.shared.with_world(|world| world.apply_move(entity, pos, facing, anim, Instant::now()));
         match outcome {
             MoveOutcome::Applied => Ok(()),
+            // Moved by a link (or its client has not taken that yet): the position the client is to take, which is
+            // no refusal and is not counted or logged as one.
+            MoveOutcome::Relocated { corrected } => self.send(ServerMsg::MoveRejected { seq, corrected }),
             MoveOutcome::Rejected { corrected, reason } => {
                 self.rejected_moves += 1;
                 if self.rejected_moves == 1 {

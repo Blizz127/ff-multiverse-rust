@@ -19,7 +19,7 @@ use crate::npc::{npc_models, npc_players, npc_who};
 use crate::render::{FrameResult, PlayerSprite, Renderer, Scene};
 use crate::session::{Session, SessionInfo};
 use crate::state::ClientState;
-use crate::ui::dialogue::{Around, Talk};
+use crate::ui::dialogue::{field_key, Talk};
 use crate::ui::draw::DrawList;
 use crate::ui::hud::{self, Subject};
 use fmv_core::{AnimState, GameId, Pos};
@@ -614,11 +614,14 @@ impl App {
     /// make the same key events (`PadKey::key_code`) and so go through this one dispatch.
     fn key_event(&mut self, el: &ActiveEventLoop, code: KeyCode, pressed: bool, repeat: bool, source: InputSource) {
         // A dialogue takes its keys first; a fresh Enter or Space outside a battle talks to the
-        // character in front of us.
-        let state = &self.session.state;
-        let blocked = state.battle.in_battle() || state.battle.lingering(self.session.now());
-        let around = Around { area: &self.session.info.area_id.key, own: state.own.pos(), facing: state.own.facing(), npcs: state.npc_views(), blocked };
-        if self.talk.key(code, pressed, repeat, &around) {
+        // character in front of us. It is also a press of OK, which the server must hear of (a character's talk can
+        // move the story; a ladder or a lift panel is used by it): the conversation it opens is built first, from the
+        // story as it is now, and the press goes out after it (see `field_key`).
+        let key = field_key(&mut self.talk, &self.session.state, &self.session.info.area_id.key, self.session.now(), code, pressed, repeat);
+        if let Some(npc) = key.interact {
+            self.session.send_interact(npc);
+        }
+        if key.consumed {
             return;
         }
         let route = route_key(code, pressed, repeat, self.session.state.battle.in_battle());

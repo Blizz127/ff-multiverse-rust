@@ -260,6 +260,149 @@ pub struct NpcSpawn {
     pub unconditional: bool,
 }
 
+/// A line that puts a player somewhere else in the SAME area when the player reaches it: a ladder, a jump over a
+/// gap (FF7: a line entity whose script moves the player's character with `JUMP` or `LADER`). The server does the
+/// move itself and tells the client with `MoveRejected { corrected }`, the message that already puts a player
+/// where the server says it is, so the protocol needs nothing for it.
+///
+/// A link fires in one of two ways. A link that **needs OK** ([`Link::needs_ok`]: the script waits for the OK
+/// button on the line) fires when the player presses OK (`ClientMsg::Interact`) while touching the line
+/// ([`Link::is_touched_at`]). Any other link is a **walk-on** link, which the script fires with no key: it fires
+/// when the player walks up to the line, but only while it is *armed*: see [`LinkArming`] (a player that arrives
+/// next to a line must not bounce straight back over it).
+///
+/// Lines have a height: the line of a ladder at the bottom of a stair is not under the feet of a player walking
+/// over it on the level above, whatever x and y say ([`Link::on_level`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Link {
+    /// End points of the line in THIS area's coordinates; z is the height of the level the line is on.
+    pub line: (Pos, Pos),
+    /// Where the player stands afterwards. `x` and `y` are the data's, `z` a placeholder: the area puts the
+    /// player on its own surface ([`AreaRuntime::place_arrival`] with [`Link::to_hint`]).
+    pub to: Pos,
+    /// Hint for placing the destination on the right level where several overlap (see [`Exit::arrival_hint`]).
+    pub to_hint: Option<u32>,
+    /// Whether the line waits for the OK button.
+    pub needs_ok: bool,
+    /// A short word for logs (`jump`, `ladder`), never text of the game.
+    pub label: String,
+}
+
+impl Link {
+    /// How near (x and y) a player has to be to the line to touch it.
+    pub const TOUCH: f32 = 12.0;
+    /// How far from the line a player has to be to have left it (and arm a walk-on link again).
+    pub const REACH: f32 = 30.0;
+    /// How far a player's height may be from the line's for the line to be on the player's level.
+    pub const LEVEL: f32 = 80.0;
+
+    /// The distance on x and y from `p` to the line (a segment).
+    pub fn distance_xy(&self, p: Pos) -> f32 {
+        point_segment_distance(p, self.line.0, self.line.1)
+    }
+
+    /// The height of the line at the point nearest to `p`.
+    fn height_near(&self, p: Pos) -> f32 {
+        let (a, b) = self.line;
+        let (dx, dy) = (f64::from(b.x - a.x), f64::from(b.y - a.y));
+        let len2 = dx * dx + dy * dy;
+        let t = if len2 > 0.0 { ((f64::from(p.x - a.x) * dx + f64::from(p.y - a.y) * dy) / len2).clamp(0.0, 1.0) } else { 0.0 };
+        a.z + (b.z - a.z) * t as f32
+    }
+
+    /// Whether a player at `p` is on the level of the line.
+    pub fn on_level(&self, p: Pos) -> bool {
+        p.is_finite() && (p.z - self.height_near(p)).abs() <= Self::LEVEL
+    }
+
+    /// Whether a player standing at `p` touches the line: within [`Link::TOUCH`] of it on x and y, and on its level.
+    pub fn is_touched_at(&self, p: Pos) -> bool {
+        p.is_finite() && self.line.0.is_finite() && self.line.1.is_finite() && self.distance_xy(p) <= Self::TOUCH && self.on_level(p)
+    }
+
+    /// Whether a move `from -> to` touches the line: its chord comes within [`Link::TOUCH`] of it on x and y (a fast
+    /// mover does not step over a line between two ticks), and the player ends on the line's level.
+    pub fn is_touched_by(&self, from: Pos, to: Pos) -> bool {
+        from.is_finite()
+            && to.is_finite()
+            && self.line.0.is_finite()
+            && self.line.1.is_finite()
+            && segment_distance((from, to), self.line) <= Self::TOUCH
+            && self.on_level(to)
+    }
+
+    /// The middle of the line (z the mean of the end points'): a point to steer toward to touch it.
+    pub fn touch_point(&self) -> Pos {
+        let (a, b) = self.line;
+        Pos::new((a.x + b.x) / 2.0, (a.y + b.y) / 2.0, (a.z + b.z) / 2.0)
+    }
+}
+
+/// Which walk-on links a player can fire: the edge trigger of a line that no key fires. A link is **armed** while
+/// the player is farther than [`Link::REACH`] from its line, and fires when the player's move touches it
+/// ([`Link::is_touched_by`]) while it is armed. A player placed anywhere (it joined, arrived through an exit, or was
+/// moved by a link) starts with every link within reach DISARMED, and a disarmed link arms again only when the player
+/// has been farther than [`Link::REACH`] from its line. So a ladder that puts a player down on the very line of the
+/// ladder back up (the stair of `nmkin_4` does, within a unit) does not send it straight back, and a player must
+/// leave a line before it fires again. The server and a bot keep the same state from the same positions.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LinkArming {
+    disarmed: Vec<bool>,
+}
+
+impl LinkArming {
+    /// The state of a player just placed at `at`: every link within reach disarmed.
+    pub fn placed_at(links: &[Link], at: Pos) -> Self {
+        Self { disarmed: links.iter().map(|l| !at.is_finite() || l.distance_xy(at) <= Link::REACH).collect() }
+    }
+
+    /// Whether link `index` is armed (an index the state does not know is not).
+    pub fn is_armed(&self, index: usize) -> bool {
+        self.disarmed.get(index).is_some_and(|disarmed| !disarmed)
+    }
+
+    /// Account for the player's move `from -> to`: the index of the walk-on link (not one that needs OK) the move
+    /// fires, if one is armed and touched (the first in the list when several are), and the links the player is now
+    /// farther than [`Link::REACH`] from armed again. A player that fires a link is placed anew by the caller
+    /// ([`LinkArming::placed_at`]).
+    pub fn step(&mut self, links: &[Link], from: Pos, to: Pos) -> Option<usize> {
+        if self.disarmed.len() != links.len() {
+            *self = Self::placed_at(links, from);
+        }
+        let fired = links.iter().enumerate().find(|(i, l)| !l.needs_ok && self.is_armed(*i) && l.is_touched_by(from, to)).map(|(i, _)| i);
+        for (disarmed, link) in self.disarmed.iter_mut().zip(links) {
+            if *disarmed && to.is_finite() && link.distance_xy(to) > Link::REACH {
+                *disarmed = false;
+            }
+        }
+        fired
+    }
+}
+
+/// The distance on x and y from point `p` to the segment `a`-`b`.
+fn point_segment_distance(p: Pos, a: Pos, b: Pos) -> f32 {
+    let (px, py, ax, ay, bx, by) = (f64::from(p.x), f64::from(p.y), f64::from(a.x), f64::from(a.y), f64::from(b.x), f64::from(b.y));
+    let (dx, dy) = (bx - ax, by - ay);
+    let len2 = dx * dx + dy * dy;
+    let t = if len2 > 0.0 { (((px - ax) * dx + (py - ay) * dy) / len2).clamp(0.0, 1.0) } else { 0.0 };
+    (px - (ax + t * dx)).hypot(py - (ay + t * dy)) as f32
+}
+
+/// The least distance on x and y between the segments `p` and `q` (0 when they cross or touch).
+fn segment_distance(p: (Pos, Pos), q: (Pos, Pos)) -> f32 {
+    let cross = |o: Pos, a: Pos, b: Pos| {
+        (f64::from(a.x) - f64::from(o.x)) * (f64::from(b.y) - f64::from(o.y)) - (f64::from(a.y) - f64::from(o.y)) * (f64::from(b.x) - f64::from(o.x))
+    };
+    let (d1, d2) = (cross(q.0, q.1, p.0), cross(q.0, q.1, p.1));
+    let (d3, d4) = (cross(p.0, p.1, q.0), cross(p.0, p.1, q.1));
+    if d1 * d2 < 0.0 && d3 * d4 < 0.0 {
+        return 0.0;
+    }
+    [point_segment_distance(p.0, q.0, q.1), point_segment_distance(p.1, q.0, q.1), point_segment_distance(q.0, p.0, p.1), point_segment_distance(q.1, p.0, p.1)]
+        .into_iter()
+        .fold(f32::INFINITY, f32::min)
+}
+
 /// What makes the story move in an area, in terms the server can verify for itself.
 ///
 /// The things the server can see are where a player walks ([`StoryTrigger::Region`], [`StoryTrigger::Line`])
@@ -279,6 +422,14 @@ pub enum StoryTrigger {
     /// own scripts do by themselves from the first frame on (an FF7 field's characters walking about and
     /// moving the story along). Never touched by a move.
     Enter,
+    /// The player PRESSES OK (the protocol's `ClientMsg::Interact`) while its character stands in this convex
+    /// polygon (x and y only, in THIS area's coordinates): what a script that waits for the OK button on a spot
+    /// does (FF7: the elevator's panel). Never touched by a move.
+    Press(Vec<Pos>),
+    /// The player presses OK next to the character that stands at `center`, within `radius` of it (x and y, and
+    /// the character's own level): what a character's talk script does (FF7: a character whose talk moves the
+    /// story). Never touched by a move.
+    Talk { center: Pos, radius: f32 },
 }
 
 /// One place where an area's story can advance a player, as its own data defines it. The point says
@@ -311,7 +462,33 @@ impl StoryPoint {
         match &self.trigger {
             StoryTrigger::Region(corners) => chord_touches_polygon(corners, from, to),
             StoryTrigger::Line(a, b) => line_crossing((*a, *b), from, to).is_some(),
-            StoryTrigger::Enter => false,
+            StoryTrigger::Enter | StoryTrigger::Press(_) | StoryTrigger::Talk { .. } => false,
+        }
+    }
+
+    /// Whether the point fires on an OK press ([`StoryTrigger::Press`], [`StoryTrigger::Talk`]).
+    pub fn is_on_press(&self) -> bool {
+        matches!(self.trigger, StoryTrigger::Press(_) | StoryTrigger::Talk { .. })
+    }
+
+    /// Whether a player that stands at `at` and presses OK reaches the point: inside a [`StoryTrigger::Press`]
+    /// region, or within a [`StoryTrigger::Talk`]'s radius of its character on the character's level.
+    /// `addressed` is where the character the client says it addressed stands, when it names one: it has to be
+    /// the character of the point (within [`SAME_SPOT`] of its centre), or the press is not for this point.
+    /// Other triggers are never pressed.
+    pub fn is_pressed_at(&self, at: Pos, addressed: Option<Pos>) -> bool {
+        if !at.is_finite() {
+            return false;
+        }
+        match &self.trigger {
+            StoryTrigger::Press(corners) => chord_touches_polygon(corners, at, at),
+            StoryTrigger::Talk { center, radius } => {
+                center.is_finite()
+                    && at.dist_xy(*center) <= *radius
+                    && (at.z - center.z).abs() <= Link::LEVEL
+                    && addressed.is_none_or(|spot| spot.is_finite() && spot.dist_xy(*center) <= SAME_SPOT)
+            }
+            _ => false,
         }
     }
 
@@ -330,10 +507,20 @@ impl StoryPoint {
                 Pos::new(sum.0 / n, sum.1 / n, sum.2 / n)
             }
             StoryTrigger::Line(a, b) => Pos::new((a.x + b.x) / 2.0, (a.y + b.y) / 2.0, (a.z + b.z) / 2.0),
+            StoryTrigger::Press(corners) => {
+                let n = corners.len().max(1) as f32;
+                let sum = corners.iter().fold((0.0, 0.0, 0.0), |s, p| (s.0 + p.x, s.1 + p.y, s.2 + p.z));
+                Pos::new(sum.0 / n, sum.1 / n, sum.2 / n)
+            }
+            StoryTrigger::Talk { center, .. } => *center,
             StoryTrigger::Enter => Pos::default(),
         }
     }
 }
+
+/// How near (x and y) the character a client says it addressed has to stand to the centre of a
+/// [`StoryTrigger::Talk`] for the press to be for that point: the same spot, to the unit.
+pub const SAME_SPOT: f32 = 2.0;
 
 /// The result of a [`AreaRuntime::story_advance`]: the progression the player has now.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -355,6 +542,8 @@ pub struct StoryWithheld {
     pub reason: String,
     /// The exits left off, one description each (FF7: the field they lead to and the conditions they sit under).
     pub exits: Vec<String>,
+    /// The links left off ([`Link`]: ladders and jumps inside the area), one description each.
+    pub links: Vec<String>,
     /// The story points left off, one label each (the labels [`StoryPoint::label`] would have had).
     pub points: Vec<String>,
 }
@@ -475,6 +664,22 @@ pub trait AreaRuntime: Send + Sync {
     /// A story only moves forward: a step never lowers what the progression already records.
     fn story_advance(&self, progress: &[u8], point: u32) -> Option<StoryStep> {
         let _ = (progress, point);
+        None
+    }
+
+    /// The ways inside this area that put a player somewhere else in it (see [`Link`]): ladders, jumps over gaps.
+    /// Additive: the default is none.
+    fn links(&self) -> Vec<Link> {
+        Vec::new()
+    }
+
+    /// The battle that reaching story point `point` starts first, if it starts one (an FF7 script that runs a
+    /// `BATTLE` before it moves the story): the formation id (what `EncounterStart::formation_id` names). The
+    /// server starts that battle for the player's party instead of applying the step, and applies
+    /// [`AreaRuntime::story_advance`]'s step when the battle is WON (judged again on the story the player has
+    /// then); a lost or fled battle leaves the story where it was. `None` (the default): the step applies at once.
+    fn story_battle(&self, point: u32) -> Option<u16> {
+        let _ = point;
         None
     }
 
@@ -671,6 +876,7 @@ mod tests {
         let area = Flat(info);
         assert!(area.exits().is_empty() && area.npcs().is_empty() && area.encounters().is_none());
         assert_eq!(area.story_withheld(), None, "by default nothing is left off");
+        assert!(area.links().is_empty() && area.story_battle(0).is_none(), "no links and no battles by default");
         assert_eq!(area.place_arrival(Pos::new(3.0, 4.0, 0.0), Some(12)), Pos::new(3.0, 4.0, 9.0), "snapped to the floor");
         assert_eq!(area.place_arrival(Pos::new(-3.0, 4.0, 0.0), None), Pos::new(1.0, 1.0, 9.0), "off the floor: the area's own choice");
     }
@@ -859,6 +1065,109 @@ mod tests {
         assert_eq!(area.story_advance(&[], 0), None);
         assert!(area.npcs_in_phase(&PhaseKey(vec![9])).is_empty());
         assert!(area.story_party(&[1, 2, 3]).is_empty(), "no canon party: the players fight alone");
+    }
+
+    /// A link along x = `x` from y = -50 to 50 at height `z`.
+    fn link_at(x: f32, z: f32, needs_ok: bool) -> Link {
+        Link { line: (Pos::new(x, -50.0, z), Pos::new(x, 50.0, z)), to: Pos::new(500.0, 0.0, 0.0), to_hint: Some(3), needs_ok, label: "jump".into() }
+    }
+
+    #[test]
+    fn a_link_is_touched_within_a_few_units_of_its_line_and_on_its_level_only() {
+        let link = link_at(0.0, 100.0, false);
+        assert_eq!(link.distance_xy(Pos::new(8.0, 0.0, 100.0)), 8.0);
+        assert_eq!(link.distance_xy(Pos::new(0.0, 80.0, 100.0)), 30.0, "past the end of the segment: the distance to the end point");
+        assert!(link.is_touched_at(Pos::new(Link::TOUCH, 10.0, 100.0)));
+        assert!(!link.is_touched_at(Pos::new(Link::TOUCH + 0.5, 10.0, 100.0)));
+        assert!(!link.is_touched_at(Pos::new(0.0, 70.0, 100.0)), "beyond the end of the line");
+        // the level: x and y say it is under the player's feet, the height says it is another floor
+        assert!(link.is_touched_at(Pos::new(0.0, 0.0, 100.0 + Link::LEVEL)));
+        assert!(!link.is_touched_at(Pos::new(0.0, 0.0, 100.0 + Link::LEVEL + 1.0)));
+        assert!(!link.is_touched_at(Pos::new(0.0, 0.0, -360.0)), "the level below: 460 units down");
+        // a line that slopes: its height at the nearest point
+        let ramp = Link { line: (Pos::new(0.0, -50.0, 0.0), Pos::new(0.0, 50.0, 400.0)), ..link.clone() };
+        assert!(ramp.is_touched_at(Pos::new(0.0, -50.0, 40.0)) && !ramp.is_touched_at(Pos::new(0.0, -50.0, 200.0)));
+        assert!(ramp.is_touched_at(Pos::new(0.0, 50.0, 380.0)) && !ramp.is_touched_at(Pos::new(0.0, 50.0, 0.0)));
+        // non-finite positions touch nothing
+        assert!(!link.is_touched_at(Pos::new(f32::NAN, 0.0, 100.0)) && !link.is_touched_by(Pos::new(0.0, 0.0, 100.0), Pos::new(f32::INFINITY, 0.0, 100.0)));
+        assert_eq!(link.touch_point(), Pos::new(0.0, 0.0, 100.0));
+    }
+
+    #[test]
+    fn a_move_touches_a_link_when_its_chord_comes_near_the_line_even_if_it_ends_far_beyond_it() {
+        let link = link_at(0.0, 0.0, false);
+        let p = |x: f32, y: f32| Pos::new(x, y, 0.0);
+        assert!(link.is_touched_by(p(-40.0, 0.0), p(40.0, 0.0)), "across the line: a fast mover does not step over it");
+        assert!(link.is_touched_by(p(-40.0, 0.0), p(-5.0, 0.0)), "up to it");
+        assert!(!link.is_touched_by(p(-40.0, 0.0), p(-20.0, 0.0)), "short of it");
+        assert!(!link.is_touched_by(p(-40.0, 70.0), p(40.0, 70.0)), "across the line's extension, 20 units beyond the end of the segment");
+        assert!(link.is_touched_by(p(-40.0, 55.0), p(40.0, 55.0)), "5 units beyond the end of the segment is still touching it");
+        // the level counts at the end of the move
+        assert!(!link.is_touched_by(p(-40.0, 0.0), Pos::new(40.0, 0.0, 500.0)));
+    }
+
+    #[test]
+    fn a_walk_on_link_fires_once_and_arms_again_only_after_the_player_has_left_its_line() {
+        let links = [link_at(0.0, 0.0, false)];
+        let p = |x: f32| Pos::new(x, 0.0, 0.0);
+        // a player that walks up to the line from afar fires it
+        let mut arming = LinkArming::placed_at(&links, p(-200.0));
+        assert!(arming.is_armed(0));
+        assert_eq!(arming.step(&links, p(-200.0), p(-100.0)), None);
+        assert_eq!(arming.step(&links, p(-100.0), p(-3.0)), Some(0));
+        // placed on the other side of the area it is placed anew, with everything near it disarmed
+        let mut arming = LinkArming::placed_at(&links, p(15.0));
+        assert!(!arming.is_armed(0), "arrived 15 units from the line: not armed");
+        assert_eq!(arming.step(&links, p(15.0), p(-5.0)), None, "walking back over the line does not fire it");
+        assert!(!arming.is_armed(0), "and it is still not armed: the player is on it");
+        // out of reach arms it again, and then it fires
+        assert_eq!(arming.step(&links, p(-5.0), p(-35.0)), None);
+        assert!(arming.is_armed(0));
+        assert_eq!(arming.step(&links, p(-35.0), p(5.0)), Some(0));
+        // standing ON the line and walking off it (the arrival of the stair of nmkin_4) fires nothing
+        let mut arming = LinkArming::placed_at(&links, p(0.5));
+        assert_eq!(arming.step(&links, p(0.5), p(-6.0)), None);
+        assert_eq!(arming.step(&links, p(-6.0), p(-20.0)), None);
+        assert!(!arming.is_armed(0), "20 units out is still within reach");
+        assert_eq!(arming.step(&links, p(-20.0), p(-40.0)), None);
+        assert!(arming.is_armed(0));
+    }
+
+    #[test]
+    fn a_link_that_needs_ok_never_fires_by_walking_and_state_that_does_not_fit_is_made_anew() {
+        let links = [link_at(0.0, 0.0, true), link_at(100.0, 0.0, false)];
+        let p = |x: f32| Pos::new(x, 0.0, 0.0);
+        let mut arming = LinkArming::placed_at(&links, p(-200.0));
+        assert_eq!(arming.step(&links, p(-200.0), p(5.0)), None, "walking over an OK line is not pressing OK");
+        assert_eq!(arming.step(&links, p(5.0), p(98.0)), Some(1));
+        // a state made for another list of links is made again, from where the move started
+        let mut stale = LinkArming::default();
+        assert_eq!(stale.step(&links, p(-200.0), p(98.0)), Some(1));
+        assert!(!stale.is_armed(7), "an index nobody knows is not armed");
+    }
+
+    #[test]
+    fn a_press_point_is_pressed_in_its_region_and_a_talk_point_next_to_its_character_only() {
+        let press = StoryPoint {
+            id: 1,
+            trigger: StoryTrigger::Press(vec![Pos::new(0.0, 0.0, 5.0), Pos::new(10.0, 0.0, 5.0), Pos::new(0.0, 10.0, 5.0)]),
+            label: "panel".into(),
+        };
+        assert!(press.is_on_press() && !press.is_on_entry());
+        assert!(press.is_pressed_at(Pos::new(2.0, 2.0, 5.0), None) && !press.is_pressed_at(Pos::new(9.0, 9.0, 5.0), None));
+        assert!(!press.is_hit_by(Pos::new(-5.0, 2.0, 0.0), Pos::new(5.0, 2.0, 0.0)), "walking through it is not pressing");
+        assert_eq!(press.center(), Pos::new(10.0 / 3.0, 10.0 / 3.0, 5.0));
+        let talk = StoryPoint { id: 2, trigger: StoryTrigger::Talk { center: Pos::new(100.0, 100.0, 50.0), radius: 80.0 }, label: "talk".into() };
+        assert!(talk.is_on_press());
+        assert!(talk.is_pressed_at(Pos::new(100.0, 170.0, 50.0), None), "within its radius");
+        assert!(!talk.is_pressed_at(Pos::new(100.0, 190.0, 50.0), None), "out of reach");
+        assert!(!talk.is_pressed_at(Pos::new(100.0, 150.0, 50.0 + Link::LEVEL + 1.0), None), "another floor");
+        assert!(talk.is_pressed_at(Pos::new(100.0, 150.0, 50.0), Some(Pos::new(101.0, 100.5, 50.0))), "the character the player addressed is the point's");
+        assert!(!talk.is_pressed_at(Pos::new(100.0, 150.0, 50.0), Some(Pos::new(130.0, 100.0, 50.0))), "another character stands there");
+        assert!(!talk.is_hit_by(Pos::new(0.0, 100.0, 50.0), Pos::new(100.0, 100.0, 50.0)), "walking up to a character is not talking to it");
+        assert_eq!(talk.center(), Pos::new(100.0, 100.0, 50.0));
+        // the other kinds are never pressed
+        assert!(!region(&[(0.0, 0.0), (10.0, 0.0), (0.0, 10.0)]).is_pressed_at(Pos::new(2.0, 2.0, 0.0), None));
     }
 
     #[test]

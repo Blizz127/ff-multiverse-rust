@@ -50,7 +50,7 @@ mod tests;
 
 pub use layout::{lay_out, Laid, Page, POINTER_CELLS};
 
-use crate::state::NpcView;
+use crate::state::{ClientState, NpcView};
 use crate::ui::draw::{DrawList, Rgba};
 use crate::ui::font::Special;
 use crate::ui::hud::hud_scale;
@@ -433,6 +433,11 @@ pub struct Talk {
     /// character goes on repeating when the window opens, and those repeats are the walk's, not
     /// a pointer that spins through the answers.
     armed: Vec<KeyCode>,
+    /// The OK press the last [`Talk::key`] call was, if it was one: a fresh `Enter` or `Space` in the field (no
+    /// dialogue open, no battle) is a press whether or not anybody was there to hear it. `Some(Some(id))` when the
+    /// player faced a character in reach (the [`NpcView::id`] of the one it picked, whether or not it had anything to
+    /// say), `Some(None)` when it found nobody. Taken by [`Talk::take_press`].
+    press: Option<Option<u32>>,
 }
 
 impl std::fmt::Debug for Talk {
@@ -443,13 +448,19 @@ impl std::fmt::Debug for Talk {
 
 impl Talk {
     pub fn new(conversations: Box<dyn Conversations>) -> Self {
-        Self { conversations, window: None, size: Cell::new((960, 540)), armed: Vec::new() }
+        Self { conversations, window: None, size: Cell::new((960, 540)), armed: Vec::new(), press: None }
+    }
+
+    /// The OK press the last [`Talk::key`] call was (see the `press` field), once: the window sends it to the server as
+    /// `ClientMsg::Interact` right after the key was handled, so that the conversation the key opened has already been
+    /// built from the story as it was before whatever the press does.
+    pub fn take_press(&mut self) -> Option<Option<u32>> {
+        self.press.take()
     }
 
     /// Where the story comes from: THE hook for story progress (`fmv_ff7::script::dialogue::StoryVars`
     /// through a factory called for every conversation). Until something is plugged in here every
     /// branch of every talk script is read as at the start of a new game.
-    #[allow(dead_code)] // the story layer plugs in here; nothing in the window does yet
     pub fn set_story(&mut self, story: ff7::StoryFactory) {
         self.conversations.set_story(story);
     }
@@ -483,6 +494,7 @@ impl Talk {
 
     /// A key event. Returns whether the dialogue took it (the window then does nothing else with it).
     pub fn key(&mut self, code: KeyCode, pressed: bool, repeat: bool, around: &Around<'_>) -> bool {
+        self.press = None;
         if around.blocked {
             self.set_window(None);
         }
@@ -514,10 +526,20 @@ impl Talk {
         }
         let spots: Vec<Spot> =
             around.npcs.iter().map(|n| Spot { pos: n.pos, radius: self.conversations.talk_radius(around.area, n) }).collect();
-        let Some(npc) = pick_target(around.own, around.facing, &spots).and_then(|i| around.npcs.get(i)) else { return false };
-        let Some(source) = self.conversations.start(around.area, npc) else { return false };
-        match DialogueWindow::open(source) {
-            Some(window) => {
+        let target = pick_target(around.own, around.facing, &spots).and_then(|i| around.npcs.get(i));
+        // The conversation is built now, from the story as the caller's hook tells it NOW (see `field_key`): whatever
+        // this press does to the story is the server's, comes back later, and never reaches a window that is open.
+        let opened = target.and_then(|npc| {
+            let source = self.conversations.start(around.area, npc)?;
+            DialogueWindow::open(source).map(|window| (npc.id, window))
+        });
+        // A fresh OK in the field is a press, and the server decides what it does (a character's talk can move the
+        // story, a ladder or a lift panel under the player's feet is used). It names the character only when the
+        // press became a conversation with it: a character this machine has nothing to say for (hidden, silenced, a
+        // stand-in that stands on a ladder) must not take the press away from the ladder.
+        self.press = Some(opened.as_ref().map(|(id, _)| *id));
+        match opened {
+            Some((_, window)) => {
                 self.set_window(Some(window));
                 true
             }
@@ -532,4 +554,32 @@ impl Talk {
             window.draw(vw, vh, t, out);
         }
     }
+}
+
+/// What a key event did in the field (see [`field_key`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FieldKey {
+    /// The dialogue took the key (the window does nothing else with it).
+    pub consumed: bool,
+    /// The key was an OK press in the field, and what it addressed: send `ClientMsg::Interact { npc }` with it
+    /// (`Some(None)`: the press found nobody to talk to, and is where the player stands, for a ladder or a panel).
+    pub interact: Option<Option<u32>>,
+}
+
+/// A key event in the field, as the window handles it: the part that is not a window.
+///
+/// **Order.** A fresh OK press that opens a conversation builds it HERE, at the moment of the key, from the story the
+/// session has mirrored by then (the hook is refreshed from the mirror just before the key is given to the dialogue,
+/// so a conversation reads a copy: [`ff7::story_of`]). The press that the caller sends to the server afterwards
+/// (`interact`) is what may move that story, and the `StoryUpdate` that comes back moves the mirror only: a
+/// conversation that is open goes on reading the story it started with, and the next one reads the later story.
+/// (The first talk of a story step shows the lines of the story as it was before the step, like the game.)
+pub fn field_key(talk: &mut Talk, state: &ClientState, area: &str, now: f64, code: KeyCode, pressed: bool, repeat: bool) -> FieldKey {
+    let blocked = state.battle.in_battle() || state.battle.lingering(now);
+    if dialogue_key(code, pressed, repeat) == Some(DialogueKey::Confirm) && !talk.is_open() && !blocked {
+        talk.set_story(ff7::story_of(state.story.state()));
+    }
+    let around = Around { area, own: state.own.pos(), facing: state.own.facing(), npcs: state.npc_views(), blocked };
+    let consumed = talk.key(code, pressed, repeat, &around);
+    FieldKey { consumed, interact: talk.take_press() }
 }

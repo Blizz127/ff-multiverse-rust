@@ -28,30 +28,38 @@
 # travels yard, starting in the hall. The yard has one NPC (`guard`). Expected: A ends in Fixture/hall
 # with area_changes=2, B in Fixture/yard with area_changes=1 and a peer seen, the yard's NPC announced.
 #
-# --chain (real data): the first reactor mission, from the first field down toward the reactor, with the REAL story
-# deciding which exits are open and the story advancing along the way the field scripts advance it. Both bots form a
-# party (A invites, B accepts) and walk the route
-#   md1stin -> md1_1 -> md1_2 -> nrthmk -> nmkin_1 -> elevtr1 -> (the lift) -> nmkin_2 -> nmkin_3
-# (seven area changes). Six of them are field gateways. The way out of elevtr1 is not: the elevator has no gateway,
-# only one line whose four exits the story picks from (crates/fmv-ff7/src/exit_gate.rs), so the party has to RIDE the
-# lift first (stand on the panel's triangle: the server turns the lift bit on and moves the story to 12) before the
-# exit to nmkin_2 is the open one. The route stops at nmkin_3 because that is as far as the walkmesh goes: its way
-# down to nmkin_4 is a scripted ladder (crates/fmv-ff7/tests/chain_real.rs, the_walkmesh_carries_the_party_down_to_nmkin_3).
-#   A (the leader):  --story-advance --party-invite-first-peer --travel ...   walks to the story point of each field
-#                    that moves ITS story (a triangle, a line it crosses; the fields that move it by themselves do it
-#                    when it comes to stand there), then on to the next exit
-#   B (the member):  --party-accept --travel ... --travel-follow             crosses an exit only after A has left the
-#                    field (the exits are judged by the story of the PARTY LEADER, so B must not get to the lift's line
-#                    before A has ridden)
-# Expected, every bot exits 0 and prints SMOKE ... area=Ff7/nmkin_3 ... party=2 ... area_changes=7, its `headless: now
-# in` lines name the seven fields in that order and the route was walked to the end; the server loaded the eight
-# fields, moved both players through an exit seven times each (A and B both left elevtr1 for nmkin_2, never for
-# nmkin_1) and said nothing about an exit it could not judge. And the STORY, read from the server's own log lines for
-# A's entity and from A's client, is exactly
-#   md1stin 1->6, md1_1 6->7, md1_2 7->8, nrthmk 8->10, nmkin_1 10->11, elevtr1 11->12 with var1.225 0->1, nmkin_2 12->13
-# ending in the blob 020d000101e101 (moment 13, bit 0 of Var[1][225] set), which the server saved. Random encounters are
-# off (this is about walking). The default duration is 200 s (the bots run for the whole of it; the walk takes about
-# 100 s on a debug build, measured; --duration changes it).
+# --chain (real data): the first reactor mission, from the first field down to the reactor's core and the Guard Scorpion, with
+# the REAL story deciding which exits are open and the story advancing along the way the field scripts advance it. Both bots
+# form a party (A invites, B accepts) and walk the route
+#   md1stin -> md1_1 -> md1_2 -> nrthmk -> nmkin_1 -> elevtr1 -> (the lift) -> nmkin_2 -> nmkin_3 -> nmkin_4 -> nmkin_5
+# (nine area changes). Six of them are field gateways and two more are walks the walkmesh alone cannot make: the way out of
+# elevtr1 is the lift (no gateway, one line whose four exits the story picks from, crates/fmv-ff7/src/exit_gate.rs: the party
+# has to RIDE it first, by pressing OK on the panel's triangle, so that the server turns the lift bit on and moves the story to
+# 12), and the way down nmkin_3 and nmkin_4 is scripted (a jump over a gap and two ladders in nmkin_3, a ladder in nmkin_4:
+# crates/fmv-ff7/src/links.rs reads them from the lines' scripts, the server puts a player where a link leads and tells it with
+# MoveRejected, the bots plan over the links: crates/fmv-client/src/route.rs). In nmkin_3 the leader talks to the woman (13->14),
+# in nmkin_5 to the materia on the floor (14->15), and the triangle of the core starts the scripted fight (the Guard Scorpion,
+# formation 324, 15->27 when it is WON).
+#   A (the leader):  --story-advance --party-invite-first-peer --travel ... --battle-auto   walks to the story point of each
+#                    field that moves ITS story (a triangle, a line it crosses, a press of OK, a character it talks to, a battle;
+#                    the fields that move it by themselves do it when it comes to stand there), then on to the next exit
+#   B (the member):  --party-accept --travel ... --travel-follow --battle-auto   crosses an exit only after A has left the field
+#                    (the exits are judged by the story of the PARTY LEADER, so B must not get to the lift's line before A has
+#                    ridden)
+# Expected, every bot exits 0 and prints SMOKE ... area=Ff7/nmkin_5 ... party=2 battles=1 victories=1 ... area_changes=9, its
+# `headless: now in` lines name the nine fields in that order and the route was walked to the end; the server loaded the ten
+# fields, moved both players through an exit nine times each (A and B both left elevtr1 for nmkin_2, never for nmkin_1), put
+# each of them through at least three links (it logs each one) and said nothing about an exit it could not judge; it started
+# exactly one battle, asked for by a story point (`story battle started`), formation 324 with one enemy, the canon pair and both
+# bots at the pinned level (--battle-level 30: this smoke is about the walk and the fight starting where the script says, not
+# about the boss, which battle-smoke.sh --boss fights), and it ended in Victory; both bots entered that same battle, replayed it
+# from their own data and matched with 0 divergences. And the STORY, read from the server's own log lines for A's entity and
+# from A's client, is exactly
+#   md1stin 1->6, md1_1 6->7, md1_2 7->8, nrthmk 8->10, nmkin_1 10->11, elevtr1 11->12 with var1.225 0->1, nmkin_2 12->13,
+#   nmkin_3 13->14, nmkin_5 14->15 (point 3, the materia), nmkin_5 15->27 (point 0, the fight won)
+# ending in the blob 021b000101e101 (moment 27, bit 0 of Var[1][225] set), which the server saved. Random encounters are off
+# (this is about walking). The default duration is 300 s (the bots run for the whole of it; the walk takes about 130 s on a
+# debug build, measured; --duration changes it).
 #
 # Isolation (the owner's state directory is never touched, only its LIBRARY is read): the server and the
 # clients run with XDG_DATA_HOME/XDG_STATE_HOME/XDG_CONFIG_HOME/XDG_CACHE_HOME and FMV_STATE_DIR
@@ -81,9 +89,9 @@ err() { printf 'travel-smoke.sh: error: %s\n' "$*" >&2; }
 LIBRARY="${FMV_FF7_LIBRARY:-$HOME/.local/share/ff-multiverse}"
 TRAVEL_DURATION=45
 DURATION_GIVEN=0
-CHAIN_DURATION=200
+CHAIN_DURATION=300
 # The route of --chain: the fields after md1stin, in order (see the header).
-CHAIN_ROUTE=(md1_1 md1_2 nrthmk nmkin_1 elevtr1 nmkin_2 nmkin_3)
+CHAIN_ROUTE=(md1_1 md1_2 nrthmk nmkin_1 elevtr1 nmkin_2 nmkin_3 nmkin_4 nmkin_5)
 # The story A makes on the way, as `area|point|what the server logged`, in the order of the route.
 CHAIN_STORY=(
   "Ff7/md1stin|0|moment=1->6"
@@ -93,9 +101,19 @@ CHAIN_STORY=(
   "Ff7/nmkin_1|0|moment=10->11"
   "Ff7/elevtr1|0|moment=11->12 var1.225=0->1"
   "Ff7/nmkin_2|0|moment=12->13"
+  "Ff7/nmkin_3|0|moment=13->14"
+  "Ff7/nmkin_5|3|moment=14->15"
+  "Ff7/nmkin_5|0|moment=15->27"
 )
-# What A's story blob is at the end (moment 13, the lift bit on).
-CHAIN_FINAL_BLOB=020d000101e101
+# What A's story blob is at the end (moment 27, the lift bit on).
+CHAIN_FINAL_BLOB=021b000101e101
+# The scripted fight of nmkin_5 (the Guard Scorpion, formation 324), fought at this level at the engine's own speed limit
+# (--battle-speed 0) by bots that play as --battle-auto does. The level is high on purpose: this smoke is about the walk, the
+# ladders, the talks and the fight starting where the script starts it and paying its step on the win, not about the
+# difficulty of the boss (the starting level 6 loses about one fight in six, level 8 with defending bots wins nearly all;
+# `battle-smoke.sh --boss` is where the boss itself is fought and checked).
+CHAIN_BATTLE_FORMATION=324
+CHAIN_BATTLE_LEVEL=30
 MODE=real
 
 usage() {
@@ -112,11 +130,13 @@ synthetic FIXTURE rooms (hall and yard) and needs no owned data.
 
   --fixture          use the synthetic FIXTURE rooms instead of the real FF7 fields
   --chain            both bots walk md1stin -> md1_1 -> md1_2 -> nrthmk -> nmkin_1 -> elevtr1 -> (the lift) ->
-                      nmkin_2 -> nmkin_3 (real data; the first reactor mission with its real story, as far as the
-                      walkmesh goes): the leader advances the story on the way and rides the lift, the member follows
+                      nmkin_2 -> nmkin_3 -> nmkin_4 -> nmkin_5 (real data; the first reactor mission with its real story,
+                      down to the Guard Scorpion): the leader advances the story on the way (rides the lift, talks to the
+                      woman and the materia, wins the scripted fight), both climb the ladders and jump the gap, the member
+                      follows
   --library DIR      state directory that contains library/ (default $FMV_FF7_LIBRARY, else
                       ~/.local/share/ff-multiverse); only the library is read, never written
-  --duration SECS    how long each bot runs (default 45; 200 with --chain)
+  --duration SECS    how long each bot runs (default 45; 300 with --chain)
 EOF
 }
 
@@ -321,7 +341,8 @@ run_chain() {
   mkdir -p -- "$WORK/lib-state" "$WORK/state-env" "$WORK/server-state" "$WORK/client-A" "$WORK/client-B"
   ln -s -- "$(cd -- "$state_real" && pwd -P)/library" "$WORK/lib-state/library"
   export FMV_STATE_DIR="$WORK/state-env"
-  server_args=(--bind 127.0.0.1:0 --ff7-library "$WORK/lib-state" --state-dir "$WORK/server-state" --no-random-encounters)
+  server_args=(--bind 127.0.0.1:0 --ff7-library "$WORK/lib-state" --state-dir "$WORK/server-state" --no-random-encounters
+    --battle-speed 0 --battle-tick-rate 240 --battle-level "$CHAIN_BATTLE_LEVEL")
   client_args=(--ff7-library "$WORK/lib-state")
 
   say "starting server: $SERVER_BIN ${server_args[*]}"
@@ -333,7 +354,7 @@ run_chain() {
     fail "the server is not hosting Ff7/md1stin: $READY_LINE"
 
   say "starting bots A (the leader, advances the story) and B (follows it) for ${TRAVEL_DURATION}s against $CONNECT; route md1stin,$route_csv"
-  local common=(--server "$CONNECT" --headless --duration "$TRAVEL_DURATION" --bot circle "${client_args[@]}")
+  local common=(--server "$CONNECT" --headless --duration "$TRAVEL_DURATION" --bot circle --battle-auto "${client_args[@]}")
   "$CLIENT_BIN" "${common[@]}" --name A --state-dir "$WORK/client-A" --party-invite-first-peer --story-advance --travel "$route_csv" \
     >"$WORK/client-A.log" 2>&1 &
   CPID[A]=$!
@@ -384,7 +405,7 @@ run_chain() {
   for key in "${CHAIN_ROUTE[@]}"; do
     if loaded=$(last_line_with "$WORK/server.log" "area loaded area=Ff7/$key "); then
       case $key in
-        nmkin_2 | nmkin_3) ;; # their characters are hidden by their own scripts or placed only in some stories
+        nmkin_2 | nmkin_3 | nmkin_4 | nmkin_5) ;; # their characters are hidden by their own scripts or placed only in some stories
         *)
           # every other field of the route has characters of its own: the server loaded its NPCs with it
           value=$(field "$loaded" npcs)
@@ -403,6 +424,41 @@ run_chain() {
   [[ $value == 2 ]] || problem "both players should have left elevtr1 for nmkin_2 (the server logged $value such moves)"
   value=$(count_lines_with "$WORK/server.log" "from=elevtr1 to=nmkin_1")
   [[ $value == 0 ]] || problem "a player left elevtr1 for nmkin_1 ($value moves): it crossed the lift's line before the leader had ridden"
+  # The Guard Scorpion: nmkin_5's triangle started the scripted fight (formation 324, one enemy) for the party, the canon pair
+  # and both bots at the pinned level, and the story step came after the win. Every bot played the whole battle from its own
+  # data and matched the server (0 divergences, every battle verified by replay).
+  local started ended outcome="" battle_ids=()
+  # ("world: battle started battle=" is the battle's own start line; the story's "story battle started battle=" says who asked for it)
+  value=$(count_lines_with "$WORK/server.log" "world: battle started battle=")
+  [[ $value == 1 ]] || problem "the server should have started exactly one battle (the scripted one), it logged $value"
+  value=$(count_lines_with "$WORK/server.log" "story battle started battle=")
+  [[ $value == 1 ]] || problem "the one battle should have been started by a story point (the server logged $value 'story battle started' lines)"
+  started=$(strip_ansi "$(first_line_with "$WORK/server.log" "world: battle started battle=" || true)")
+  ended=$(strip_ansi "$(last_line_with "$WORK/server.log" "battle ended battle=" || true)")
+  if [[ -z $started ]]; then
+    problem "the server never started the scripted battle"
+  else
+    [[ $(field "$started" formation) == "$CHAIN_BATTLE_FORMATION" ]] || problem "the scripted battle was not formation $CHAIN_BATTLE_FORMATION: $started"
+    [[ $(field "$started" enemies) == 1 ]] || problem "the Guard Scorpion's formation has one enemy: $started"
+    [[ $started == *"members=2"* && $(companions_of "$started") == 2 ]] || problem "the scripted battle did not have the canon pair and both bots: $started"
+    [[ $started == *"levels=[$CHAIN_BATTLE_LEVEL, $CHAIN_BATTLE_LEVEL, $CHAIN_BATTLE_LEVEL, $CHAIN_BATTLE_LEVEL]"* ]] ||
+      problem "the fight was not pinned to level $CHAIN_BATTLE_LEVEL (--battle-level): $started"
+  fi
+  if [[ -z $ended ]]; then
+    problem "the server never logged the end of the scripted battle"
+  else
+    outcome=$(field "$ended" outcome)
+    [[ $outcome == Victory ]] || problem "the scripted battle was not won (outcome '$outcome'): the story step after it cannot have been paid: $ended"
+  fi
+  for n in "${CLIENT_NAMES[@]}"; do
+    check_mirror "$n" "$WORK/client-$n.log" 1
+    battle_ids+=("$(battle_id_of "$WORK/client-$n.log" || true)")
+    log_has "$WORK/client-$n.log" "started: formation $CHAIN_BATTLE_FORMATION," || problem "client $n did not start a battle of formation $CHAIN_BATTLE_FORMATION"
+  done
+  [[ -n ${battle_ids[0]:-} && ${battle_ids[0]} == "${battle_ids[1]:-}" ]] || problem "the bots did not enter the same battle (A: '${battle_ids[0]:-}', B: '${battle_ids[1]:-}')"
+  # Ladders and jumps: the server moved each player inside nmkin_3 and nmkin_4 by their lines (it logs each one).
+  value=$(count_lines_with "$WORK/server.log" "player used a link entity=")
+  ((value >= 6)) || problem "the server logged only $value link use(s): the party cannot have climbed down nmkin_3 and nmkin_4 (two players, at least three links each)"
   # Nothing on the route has an exit the server cannot judge.
   value=$(count_lines_with "$WORK/server.log" "exit closed: its conditions cannot be judged")
   [[ $value == 0 ]] || problem "the server reported an exit it could not judge on the route ($value time(s)): $(last_line_with "$WORK/server.log" 'exit closed: its conditions' || true)"
@@ -454,9 +510,9 @@ run_chain() {
   # The saver writes what it still holds when the server stops: the story A ended with.
   if [[ -n $a_entity ]]; then
     local last_step re_account='story advanced account=([0-9]+) entity='"$a_entity"' '
-    # (the story line of nmkin_2 is not the last line that names the entity and the area: the move to the phase's
-    # instance follows it, and that line has no account)
-    last_step=$(last_line_with "$WORK/server.log" "entity=$a_entity area=Ff7/nmkin_2 point=" || true)
+    # (the story line of the last step is not the last line that names the entity and the area: a move may follow it,
+    # and that line has no account)
+    last_step=$(last_line_with "$WORK/server.log" "entity=$a_entity area=Ff7/nmkin_5 point=" || true)
     [[ $last_step =~ $re_account ]] && a_account=${BASH_REMATCH[1]}
     if [[ -z $a_account ]]; then
       problem "could not read A's account from the server log"
@@ -486,7 +542,7 @@ run_chain() {
   say "server: $(last_line_with "$WORK/server.log" "area loaded area=Ff7/${CHAIN_ROUTE[${#CHAIN_ROUTE[@]} - 1]} " || true)"
   say "server: $(last_line_with "$WORK/server.log" "story saved account=$a_account" || true)"
   RESULT=pass
-  say "PASS: two bots in a party walked md1stin -> ${route_csv//,/ -> } with the real story: the leader moved it 1 -> 13 and rode the lift, the exit to nmkin_2 was the one the story opened, the member followed; $state_real unchanged ($after)"
+  say "PASS: two bots in a party walked md1stin -> ${route_csv//,/ -> } with the real story: the leader moved it 1 -> 27 (the lift ridden with OK, the woman and the materia talked to, the Guard Scorpion fought and won), the ladders and jumps of nmkin_3 and nmkin_4 were climbed, the exit to nmkin_2 was the one the story opened, the member followed; $state_real unchanged ($after)"
 }
 
 main() {

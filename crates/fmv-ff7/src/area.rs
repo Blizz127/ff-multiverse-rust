@@ -165,13 +165,20 @@
 //!   progression records (`crate::exit_gate` has the rules: what is kept, what a guard may read, and that an
 //!   exit with a guard the model cannot judge stays closed). A `MAPJUMP` a talk or a director runs is not
 //!   a walk-on exit and is not offered. **Only in the [`REVIEWED_FIELDS`]**: any other field offers its gateways and
-//!   leaves its script exits (and its story points) off, and [`AreaRuntime::story_withheld`] says which.
+//!   leaves its script exits (and its story points and links) off, and [`AreaRuntime::story_withheld`] says which.
 //! * [`AreaRuntime::place_arrival`]: an exit's `arrival_hint` is the index of the target walkmesh
 //!   triangle that holds the arrival point; where that triangle holds the point, the arrival
 //!   stands at the triangle's height there (the right floor of a layered field), otherwise the
 //!   default rule (`validate_move` from the point to itself) applies.
 //! * [`AreaRuntime::npcs`]: the characters whose init script places them unconditionally (the
 //!   scripts are read, never run; see [`crate::field_direction_to_facing`] for the heading).
+//! * [`AreaRuntime::links`]: the **ladders and jumps**, the lines whose scripts put the player's character somewhere
+//!   else in the same field (`crate::links`: the lines' trigger scripts are walked, once as walking up to the line and
+//!   once as a press of OK, and what they do to the player's entity is the link; a script the model cannot judge is
+//!   dropped, not guessed). Only in the [`REVIEWED_FIELDS`].
+//! * [`AreaRuntime::story_points`] with the talks and the lift's panel (`crate::story`: a character whose talk moves
+//!   the story is a talk point, the panel that waits for OK a press point) and [`AreaRuntime::story_battle`] (the
+//!   scripted fight a point starts before its step: the guard scorpion).
 //! * [`AreaRuntime::encounters`]: the table decoded from section 6
 //!   ([`crate::decode_encounter_section`]).
 
@@ -180,12 +187,13 @@ use crate::encounter::decode_encounter_section;
 use crate::exit_gate::{self, ScriptGate};
 use crate::field::{section, Background, Camera, FieldError, FieldFile, Palette, Triggers, Vertex, Walkmesh, FIELD_SCALE_ONE};
 use crate::lgp::{LgpArchive, LgpError};
+use crate::links::{self, LinkDef};
 use crate::lzss;
 use crate::script::{triangle_contains_xy, triangle_height_at, FieldScript, Maplist};
 use crate::story::{self, AreaStory};
 use crate::walk::{LinkReport, Route, Surface};
 use fmv_adapter_api::{
-    AdapterError, AreaInfo, AreaRuntime, Bounds, EncounterTable, Exit, ExitKind, ExitState, GameAdapter, MoveResult, NpcSpawn, StoryPoint,
+    AdapterError, AreaInfo, AreaRuntime, Bounds, EncounterTable, Exit, ExitKind, ExitState, GameAdapter, Link, MoveResult, NpcSpawn, StoryPoint,
     StoryStep, StoryWithheld,
 };
 use fmv_core::{AreaId, EditionProvenance, Fingerprint, GameId, PhaseKey, Platform, Pos, ProvenanceSummary, SourceRef};
@@ -204,24 +212,26 @@ pub const MAX_FIELD_BYTES: usize = 16 * 1024 * 1024;
 /// entries all point at the same large body cannot make `list_areas` run for long.
 pub const MAX_INDEX_READ_BYTES: u64 = 512 * 1024 * 1024;
 
-/// The fields whose **script exits and story points are active**: the eight of the first reactor mission, from the
-/// station down to the stair after the lift, each reviewed case by case (every point's trigger, guards and effect
-/// read against the field's own script, and the conditions of every exit against what the story model can judge).
-/// Everywhere else the adapter offers what it always has: the field's gateways (data, always open) and its phases;
-/// its script exits and story points are left off ([`AreaRuntime::story_withheld`] names them, and the server logs
-/// them once per area, `unreviewed field`). A point raises an account's story for good (a story only moves forward)
-/// and an exit sends a party somewhere, so neither is switched on for a field nobody has looked at: the gateways
+/// The fields whose **script exits, story points and links are active**: the ten of the first reactor mission, from
+/// the station down to the reactor's core, each reviewed case by case (every point's trigger, guards and effect
+/// read against the field's own script, the conditions of every exit against what the story model can judge, and every
+/// ladder and jump against the lines' scripts). Everywhere else the adapter offers what it always has: the field's
+/// gateways (data, always open) and its phases; its script exits, story points and links are left off
+/// ([`AreaRuntime::story_withheld`] names them, and the server logs them once per area, `unreviewed field`). A point
+/// raises an account's story for good (a story only moves forward), an exit sends a party somewhere and a link puts a
+/// player somewhere else in the field, so none of them is switched on for a field nobody has looked at: the gateways
 /// already let a party walk out of the mission into other parts of the game.
 ///
 /// **A field joins this list by review, not by a casual edit.** Read what it would offer with
 /// `cargo run -p fmv-ff7 --example world_survey -- <field>` (it loads fields with [`Ff7Adapter::survey_field`], which
-/// has everything on) and check each point and exit against the field's script
+/// has everything on) and check each point, exit and link against the field's script
 /// (`--example script_dump`, `--example exits_dump`) and the part of the story it belongs to; pin the result with a
 /// real-data test beside `tests/chain_real.rs`; then add the name here. Two tests pin the list on purpose and are
 /// updated with it: `the_reviewed_list_is_the_first_reactor_mission_and_nothing_else` (the names) and, in
 /// `tests/chain_real.rs`, `the_fields_that_are_not_reviewed_offer_their_gateways_and_nothing_else_of_the_story` (how
-/// many script exits and story points the reviewed fields offer and the others leave off).
-pub const REVIEWED_FIELDS: [&str; 8] = ["md1stin", "md1_1", "md1_2", "nrthmk", "nmkin_1", "elevtr1", "nmkin_2", "nmkin_3"];
+/// many script exits, story points and links the reviewed fields offer and the others leave off).
+pub const REVIEWED_FIELDS: [&str; 10] =
+    ["md1stin", "md1_1", "md1_2", "nrthmk", "nmkin_1", "elevtr1", "nmkin_2", "nmkin_3", "nmkin_4", "nmkin_5"];
 
 /// Why a field's script exits and story points are left off (the `reason` of [`fmv_adapter_api::StoryWithheld`]).
 pub const UNREVIEWED_FIELD: &str = "unreviewed field";
@@ -736,6 +746,9 @@ pub struct Ff7FieldArea {
     gates: Vec<ScriptGate>,
     /// NPCs the field's scripts place unconditionally, worked out at load time.
     npcs: Vec<NpcSpawn>,
+    /// The ladders and jumps of the field (`crate::links`): lines whose scripts put the player somewhere else in the
+    /// field. Empty in a field that is not one of the [`REVIEWED_FIELDS`].
+    links: Vec<Link>,
     /// The random-encounter table of the field's own section 6, decoded at load time.
     encounters: Option<EncounterTable>,
     /// What the field's scripts say about the story: its phases and story points, read at load time
@@ -791,14 +804,29 @@ impl Ff7FieldArea {
         };
         let encounters = field.section(section::ENCOUNTER).ok().and_then(decode_encounter_section);
         // A field whose script section cannot be parsed has no story of its own: one phase, no points.
-        let mut story = FieldScript::from_field(&field).map(|script| AreaStory::scan(&script, &walkmesh)).unwrap_or_default();
-        let withheld = exits_left_off.and_then(|exits| {
-            let points = story.withhold_points();
-            (!exits.is_empty() || !points.is_empty()).then(|| StoryWithheld { reason: UNREVIEWED_FIELD.to_string(), exits, points })
-        });
-        let mut area = Self { info, field, walkmesh, surface, bounds, spawns, field_scale, exits, gates, npcs: Vec::new(), encounters, story, withheld };
+        let story = FieldScript::from_field(&field).map(|script| AreaStory::scan(&script, &walkmesh)).unwrap_or_default();
+        let mut area =
+            Self { info, field, walkmesh, surface, bounds, spawns, field_scale, exits, gates, npcs: Vec::new(), links: Vec::new(), encounters, story, withheld: None };
         // NPCs without a literal height stand on this area's own surface, so they are worked out last.
         area.npcs = area_content::npc_spawns(&area.field, &area.walkmesh, |x, y| area.height_at(x, y, None));
+        // What the scripts do beyond walking: the characters whose talk moves the story (points that need the NPCs, so
+        // they come after them) and the lines that put the player somewhere else in the field.
+        let mut found = Vec::new();
+        if let Ok(script) = FieldScript::from_field(&area.field) {
+            area.story.add_talk_points(&script, &area.npcs);
+            found = links::scan_links(&script, &area.walkmesh).found;
+        }
+        match exits_left_off {
+            None => area.links = found.iter().map(LinkDef::link).collect(),
+            // A field that is not reviewed keeps its phases and takes nothing else of the story: no point, no exit,
+            // no link, and it says which.
+            Some(exits) => {
+                let points = area.story.withhold_points();
+                let links: Vec<String> = found.iter().map(LinkDef::describe).collect();
+                area.withheld = (!exits.is_empty() || !points.is_empty() || !links.is_empty())
+                    .then(|| StoryWithheld { reason: UNREVIEWED_FIELD.to_string(), exits, links, points });
+            }
+        }
         area
     }
 
@@ -973,8 +1001,23 @@ impl AreaRuntime for Ff7FieldArea {
         self.story.points()
     }
 
+    /// What reaching a story point does (a talk point runs its character's talk script, which needs the field's own
+    /// script: parsed here, it is only a table of offsets over the field's bytes).
     fn story_advance(&self, progress: &[u8], point: u32) -> Option<StoryStep> {
-        self.story.advance(progress, point)
+        match FieldScript::from_field(&self.field) {
+            Ok(script) => self.story.advance_with(&script, progress, point),
+            Err(_) => self.story.advance(progress, point),
+        }
+    }
+
+    /// The battle a story point starts before its step is paid (a scripted fight: the guard scorpion).
+    fn story_battle(&self, point: u32) -> Option<u16> {
+        self.story.battle_of(point)
+    }
+
+    /// The ladders and jumps of the field (only in a reviewed field, see [`crate::links`]).
+    fn links(&self) -> Vec<Link> {
+        self.links.clone()
     }
 
     /// The script exits and story points of a field that is not one of the [`REVIEWED_FIELDS`] (`None` for a reviewed

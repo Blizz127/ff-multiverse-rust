@@ -62,7 +62,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use fmv_adapter_api::{AreaKey, AreaRuntime, Exit, ExitState, GameAdapter, NpcSpawn, StoryPoint};
+use fmv_adapter_api::{AreaKey, AreaRuntime, Exit, ExitState, GameAdapter, Link, NpcSpawn, StoryPoint};
 use fmv_core::{AnimState, AreaId, EntityId, Fingerprint, PhaseKey, Pos, ProvenanceSummary};
 use fmv_protocol::{NpcSnapshot, RejectCode, ServerMsg, MAX_NPCS_PER_AREA, NPC_NAME_CHARS, NPC_REF_CHARS};
 
@@ -81,6 +81,8 @@ const MAX_LOADED_AREAS: usize = 128;
 const MAX_EXITS_PER_AREA: usize = 128;
 /// Most story points kept per area (a real field has at most a few).
 const MAX_STORY_POINTS_PER_AREA: usize = 64;
+/// Most links (ladders, jumps) kept per area (a real field has at most a handful).
+const MAX_LINKS_PER_AREA: usize = 64;
 /// Most of the exits and points an adapter left off that the log line about them lists (it counts them all).
 const MAX_WITHHELD_LISTED: usize = 8;
 
@@ -113,6 +115,8 @@ pub(super) struct AreaState {
     npcs: Vec<NpcSnapshot>,
     /// The places where this area's story can advance a player, decoded once at load.
     story_points: Vec<StoryPoint>,
+    /// The lines that put a player somewhere else in the area (ladders, jumps), decoded once at load.
+    links: Vec<Link>,
     /// The area's random encounters, when battles are on and it has a table.
     encounters: Option<AreaEncounters>,
     /// Since when no player is in or heading for the area (`None` while there is one).
@@ -170,6 +174,12 @@ impl AreaState {
             .collect();
         let npcs = npc_snapshots(runtime.npcs());
         let story_points: Vec<StoryPoint> = runtime.story_points().into_iter().take(MAX_STORY_POINTS_PER_AREA).collect();
+        let links: Vec<Link> = runtime
+            .links()
+            .into_iter()
+            .filter(|l| l.line.0.is_finite() && l.line.1.is_finite() && l.to.is_finite())
+            .take(MAX_LINKS_PER_AREA)
+            .collect();
         let encounters = battle.and_then(|b| b.area_encounters(runtime.as_ref()));
         Ok(Self {
             offer: AreaOffer {
@@ -188,6 +198,7 @@ impl AreaState {
             unjudged_exit_noted: false,
             npcs,
             story_points,
+            links,
             encounters,
             empty_since: None,
         })
@@ -197,7 +208,7 @@ impl AreaState {
         &self.id.key
     }
 
-    /// The one log line about the exits and story points the adapter left off this area (`AreaRuntime::story_withheld`),
+    /// The one log line about the exits, story points and links the adapter left off this area (`AreaRuntime::story_withheld`),
     /// said when the area is loaded: how many, which (the first few) and why. `None` when nothing was left off.
     pub(super) fn withheld_line(&self) -> Option<String> {
         let withheld = self.runtime.story_withheld()?;
@@ -209,13 +220,15 @@ impl AreaState {
             shown.join("; ")
         };
         Some(format!(
-            "story left off (said once for this area) area={} why={} script_exits={} story_points={} exits=[{}] points=[{}]",
+            "story left off (said once for this area) area={} why={} script_exits={} story_points={} exits=[{}] points=[{}] links={} link_list=[{}]",
             self.id,
             clip(&withheld.reason, 60),
             withheld.exits.len(),
             withheld.points.len(),
             listed(&withheld.exits),
-            listed(&withheld.points)
+            listed(&withheld.points),
+            withheld.links.len(),
+            listed(&withheld.links)
         ))
     }
 
@@ -241,6 +254,16 @@ impl AreaState {
     /// The places where this area's story can advance a player.
     pub(super) fn story_points(&self) -> &[StoryPoint] {
         &self.story_points
+    }
+
+    /// The lines that put a player somewhere else in this area.
+    pub(super) fn links(&self) -> &[Link] {
+        &self.links
+    }
+
+    /// Where the non-player character `id` of this area's own list (`AreaSnapshot::npcs`) stands.
+    pub(super) fn npc_position(&self, id: u32) -> Option<Pos> {
+        self.npcs.iter().find(|n| n.id == id).map(|n| n.pos)
     }
 
     pub(super) fn encounters(&self) -> Option<&AreaEncounters> {
@@ -369,6 +392,8 @@ impl World {
     /// is always sent, even when it equals the last one told (a player sent back to the area it came
     /// from), so that every entry looks the same to a client.
     pub(super) fn announce_entry(&mut self, entity: EntityId, failed: &mut Vec<(EntityId, bool)>) {
+        // Placed here, wherever it came from: every link within reach of the player starts disarmed.
+        self.place_links(entity);
         self.settle(entity, true, failed);
         // What the area's own scripts do by themselves from the first frame on moves the story of whoever stands
         // there (the points that fire on entry; a no-op in an area without any).

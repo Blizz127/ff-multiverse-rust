@@ -22,7 +22,7 @@
 //! * `MESSAGE` and `ASK` (windows [`Message`], the dialog text from the field's own table). `ASK`
 //!   waits for an answer and stores it in its variable.
 //! * Control flow: `JMPF`/`JMPFL`/`JMPB`/`JMPBL`, the conditionals `IFUB`/`IFSW`/`IFUW` (and their
-//!   long forms) with all eleven operators, `IFPRTYQ`/`IFMEMBQ`, `IFKEY*` (no key is ever held),
+//!   long forms) with all eleven operators, `IFPRTYQ`/`IFMEMBQ`, `IFKEY*` (no key is held, unless the walk was made to press OK: [`Walk::pressing`]),
 //!   `RET`, `RETTO`, and the requests of other entities' scripts. The engine runs scripts side by
 //!   side; this walker runs one at a time, so `REQEW` (request and wait for the end) runs the
 //!   requested script **to its end** before the requester goes on, and `REQ` and `REQSW` (which
@@ -36,8 +36,13 @@
 //!   forms, `RANDOM`, `LBYTE`/`HBYTE`/`2BYTE` and `GETPC`. Reads come from the writes the walk made
 //!   itself, else from the [`StoryVars`] hook.
 //! * `TLKON` and `VISI` only in the one-pass prelude of [`availability`].
+//! * **Where characters end up** (for the lines and ladders of a field, `crate::links`): `XYZI`, `XYI`, `XYZ`, `MOVE`,
+//!   `JUMP` and `LADER` leave a character at a place the walk remembers ([`Spot`], [`Walk::spot`], [`Walk::moves`]), and
+//!   `GETAI` and `AXYZI` read it back into variables (the height after a movement that leaves it to the engine comes
+//!   from [`StoryVars::height`]). Nothing is animated or timed: a movement is its end.
 //! * The script **ends** at `RET` (the last frame), `MAPJUMP`, `BATTLE`, `MINIGAME` and `GAMEOVER`
-//!   ([`End`]): the walker never changes the world, so a conversation that leads somewhere just stops.
+//!   ([`End`]): the walker never changes the world, so a conversation that leads somewhere just stops
+//!   ([`Walk::battle`] says which battle a `BATTLE` started).
 //!
 //! **Bounded:** at most [`Limits::steps`] instructions, [`Limits::beats`] windows and
 //! [`Limits::depth`] nested requests per walk, so a loop (`JMPB 0` waiting for an event that never
@@ -90,7 +95,7 @@ mod walk;
 mod tests;
 
 pub use pieces::{parse_message, Piece, TextColour, CHARACTER_NAMES};
-pub use walk::{availability, Availability, Limits, TalkError, TalkSession, Walk, EFFECT_NOTE_LAYER};
+pub use walk::{availability, run_talk, Availability, Limits, Spot, TalkError, TalkRun, TalkSession, Walk, EFFECT_NOTE_LAYER, KEY_OK};
 
 use super::FieldScript;
 
@@ -113,6 +118,13 @@ pub trait StoryVars {
     /// Whether character `id` can be called a member of the team at all (`IFMEMBQ`).
     fn is_member(&self, id: u8) -> bool {
         self.in_party(id)
+    }
+
+    /// The height of the walkmesh at `(x, y)` on triangle `triangle` (or wherever the point is, without one), for
+    /// the opcodes that read a character's place back (`AXYZI`) after a movement that leaves the height to the
+    /// engine (`MOVE`, `JUMP`). `None`: not known, and the read-back then leaves its height variable alone.
+    fn height(&self, _x: i32, _y: i32, _triangle: Option<u16>) -> Option<i32> {
+        None
     }
 }
 

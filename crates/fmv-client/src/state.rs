@@ -238,6 +238,15 @@ impl OwnPlayer {
         })
     }
 
+    /// Whether the server does not yet know how we stand: an intent is owed (our place, facing or animation differ from
+    /// what it was last told, or a correction asked for a resync). A press of OK is judged by the server where it holds
+    /// the player, so whoever presses on purpose (a bot at the foot of a ladder) waits until this is `false`; the
+    /// rate limit of [`OwnPlayer::next_intent`] may keep it `true` for up to 50 ms after a step.
+    pub fn has_unsent(&self) -> bool {
+        let (p, f, a) = self.last_sent;
+        self.resync || self.pos.dist_xy(p) > POS_EPS || (self.pos.z - p.z).abs() > POS_EPS || (self.facing - f).abs() > FACING_EPS || self.anim != a
+    }
+
     /// The server's view of our entity (from an update). Prediction wins while we are moving;
     /// once we have been quiet for a while a diverged server position is adopted. Until then it
     /// is remembered, since the server will not repeat it.
@@ -1257,6 +1266,31 @@ mod tests {
             assert!(o.pos().y <= 300.0 + 1e-3);
         }
         assert!(moved_x > 50.0, "still slides after a height correction, moved {moved_x}");
+    }
+
+    /// A press of OK is judged where the server holds the player: whoever presses on purpose waits until the intent
+    /// that says where it stands has gone out, and after a correction until the resync that follows it has too.
+    #[test]
+    fn the_player_has_something_unsent_until_the_intent_that_tells_where_it_stands_has_gone_out() {
+        let mut p = OwnPlayer::new(Pos::new(0.0, 0.0, 0.0));
+        assert!(!p.has_unsent(), "a player that stands where the server put it owes nothing");
+        p.set_motion(Pos::new(5.0, 0.0, 0.0), 0.0, AnimState::Walk);
+        assert!(p.has_unsent(), "a step the server does not know of");
+        assert!(p.next_intent(1.0).is_some());
+        assert!(!p.has_unsent());
+        // standing still after the walk changes the animation: that is owed too
+        p.set_motion(Pos::new(5.0, 0.0, 0.0), 0.0, AnimState::Idle);
+        assert!(p.has_unsent());
+        assert!(p.next_intent(1.1).is_some());
+        assert!(!p.has_unsent());
+        // a correction (a ladder moved the player) asks for a resync, which lifts the server's fence: owed until sent
+        assert!(p.on_rejected(2, Pos::new(50.0, 0.0, 0.0)));
+        assert!(p.has_unsent());
+        assert!(p.next_intent(1.2).is_some_and(|i| i.pos.x == 50.0));
+        assert!(!p.has_unsent());
+        // the rate limit can keep an owed intent waiting (up to 50 ms), and the press with it
+        p.set_motion(Pos::new(60.0, 0.0, 0.0), 0.0, AnimState::Walk);
+        assert!(p.next_intent(1.21).is_none() && p.has_unsent());
     }
 
     #[test]

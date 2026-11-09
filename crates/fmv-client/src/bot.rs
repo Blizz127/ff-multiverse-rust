@@ -11,6 +11,7 @@ use crate::cli::BotKind;
 use crate::nav::plan_path_avoiding;
 use crate::net::PartyCommand;
 use crate::party::PartyMirror;
+use crate::route::{goal_key, Nav, Navigator, Press};
 use fmv_adapter_api::{AreaKey, AreaRuntime, Bounds, Exit, MoveResult};
 use fmv_core::{EntityId, Pos};
 use fmv_protocol::InviteId;
@@ -224,6 +225,13 @@ pub struct TravelGate {
 /// and gets closer. It never crosses an exit other than the one it wants. The bot gives up (and says
 /// so) when no exit of the current area leads to the next area, or when it makes no headway for
 /// [`STUCK_LIMIT`] steps.
+///
+/// **Ladders and jumps.** In an area with links (`AreaRuntime::links`: FF7's first reactor, whose walkmesh is cut into
+/// pieces that only ladders and jumps join) the bot walks with a [`Navigator`] instead (see [`crate::route`]): it plans
+/// the way to the exit over the links it needs (a walk-on link by walking up to its line, one that waits for OK by
+/// standing at its foot and pressing, which is [`TravelBot::take_press`]), and keeps off every walk-on link it does not
+/// need, because walking over one by accident puts the bot where it was. In an area without links nothing of this
+/// applies and the bot walks as it always did.
 #[derive(Debug)]
 pub struct TravelBot {
     /// The areas still to go to; the front one is next.
@@ -246,6 +254,8 @@ pub struct TravelBot {
     plan_cooldown: u32,
     /// Plans that came to nothing in this area (the greedy fan takes over for good after a few).
     failed_plans: u32,
+    /// How the bot gets about in an area with links (ladders, jumps): see [`crate::route`]. Unused in any other.
+    nav: Navigator,
 }
 
 /// The planned way to an exit.
@@ -281,6 +291,7 @@ impl TravelBot {
             plan: None,
             plan_cooldown: 0,
             failed_plans: 0,
+            nav: Navigator::new(),
         }
     }
 
@@ -319,6 +330,7 @@ impl TravelBot {
         self.plan = None;
         self.plan_cooldown = 0;
         self.failed_plans = 0;
+        self.nav.arrived();
         self.arrived_at = Some(now);
         self.peer_seen_at = None;
         if self.route.front().is_some_and(|next| next.eq_ignore_ascii_case(area)) {
@@ -381,6 +393,11 @@ impl TravelBot {
             self.gave_up = Some(format!("no exit of {} leads to {next}", area.info().id));
             return still;
         };
+        // An area with links (ladders, jumps over gaps) is walked with the navigator: by the links it takes, and
+        // round the walk-on ones it does not (a line that is walked over by accident puts the bot back where it was).
+        if self.nav.has_links(area) {
+            return self.step_linked(area, &exits, goal_exit, cur, (dt, speed), &next);
+        }
         let mid = goal_exit.midpoint();
         let (gx, gy) = (mid.x - cur.x, mid.y - cur.y);
         let dist = gx.hypot(gy);
@@ -431,6 +448,70 @@ impl TravelBot {
                 still
             }
         }
+    }
+
+    /// The step toward the exit of an area with links: the navigator plans the way (by links where the surface does not
+    /// join, never over a walk-on link by accident) to a point a little past the middle of the exit's line, on the side
+    /// the last walk comes from. At the foot of a ladder that needs OK it stands still and wants the press
+    /// ([`TravelBot::take_press`]); with no way it waits, and gives up after [`STUCK_LIMIT`] steps like the plain walk.
+    fn step_linked(&mut self, area: &dyn AreaRuntime, exits: &[Exit], goal_exit: &Exit, cur: Pos, (dt, speed): (f32, f32), next: &str) -> BotStep {
+        let still = BotStep { pos: cur, facing: None, moved: false };
+        let mid = goal_exit.midpoint();
+        // (a little past the middle, or, where the surface ends at the line, the middle itself)
+        let aim = |from: Pos| {
+            let (gx, gy) = (mid.x - from.x, mid.y - from.y);
+            let dist = gx.hypot(gy);
+            let (ux, uy) = if dist > 1e-3 { (gx / dist, gy / dist) } else { (1.0, 0.0) };
+            (Pos::new(mid.x + ux * OVERSHOOT, mid.y + uy * OVERSHOOT, mid.z), mid)
+        };
+        // Other exits are not for us; the wanted one (and any on its line) is crossed on purpose.
+        let others = |a: Pos, b: Pos| exits.iter().any(|e| !e.same_line_as(goal_exit) && e.is_crossed_by(a, b));
+        let key = goal_key(&[&area.info().id.key, next]);
+        match self.nav.step(area, cur, key, &aim, false, &others, dt, speed) {
+            Nav::Step(step) => {
+                if step.moved {
+                    self.stuck = 0;
+                }
+                step
+            }
+            Nav::Press => still,
+            // At the goal and still here (the exit is not open for us), or no way at all: wait, and give up if it lasts.
+            Nav::Here | Nav::NoWay => {
+                self.stuck += 1;
+                if self.stuck >= STUCK_LIMIT {
+                    self.gave_up = Some(format!("stuck on the way to the exit to {next} at ({:.0}, {:.0})", cur.x, cur.y));
+                }
+                still
+            }
+        }
+    }
+
+    /// Look at where the walker is (every tick, whoever moved it): an area with links keeps the arming of its walk-on
+    /// links from what it sees (see [`crate::route::Navigator::observe`]).
+    pub fn observe(&mut self, area: &dyn AreaRuntime, cur: Pos) {
+        if self.nav.has_links(area) {
+            self.nav.observe(cur);
+        }
+    }
+
+    /// Whether the bot stands at the foot of a ladder that waits for OK and wants the press sent.
+    pub fn wants_press(&self) -> bool {
+        self.nav.wants_press()
+    }
+
+    /// The press the bot wants, once: the caller sends it (`ClientMsg::Interact`) when the server knows where the
+    /// bot stands ([`crate::state::OwnPlayer::has_unsent`] is false).
+    pub fn take_press(&mut self) -> Option<Press> {
+        if self.nav.wants_press() {
+            self.nav.pressed();
+            return Some(Press { npc: None });
+        }
+        None
+    }
+
+    /// What the navigator wants said on stderr since the last call (the links it took, the routes it made).
+    pub fn drain_notes(&mut self) -> Vec<String> {
+        self.nav.drain_notes()
     }
 
     /// One step along the planned legs to the exit (planning them first when there is no plan for

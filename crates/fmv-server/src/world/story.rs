@@ -27,27 +27,44 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Instant;
 
+use fmv_adapter_api::{AreaKey, StoryStep};
 use fmv_core::{EntityId, Pos};
 use fmv_protocol::{ServerMsg, StoryAdvance};
 
 use super::{is_full, World};
 
+/// What a battle that a story point started does when it is WON: the step of the point, for the player that reached
+/// it, judged again on the story the player has then (see [`World::story_after_battle`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct StoryThen {
+    pub entity: EntityId,
+    pub area: AreaKey,
+    pub point: u32,
+}
+
 impl World {
     /// The accepted move `from -> to` of `entity`: reach every story point of its area that it touches
     /// and advance its story where that applies (module docs). Does nothing for a player that is in a
-    /// battle or in transit, or whose placement does not let it advance the story.
-    pub(super) fn check_story(&mut self, entity: EntityId, from: Pos, to: Pos) {
+    /// battle or in transit, or whose placement does not let it advance the story. A point that starts a battle is
+    /// reached by coming to it from outside only: a player that stands in its region after losing the fight does
+    /// not start it again with every step.
+    pub(super) fn check_story(&mut self, entity: EntityId, from: Pos, to: Pos, now: Instant) {
         let touched: Vec<u32> = {
             let Some(player) = self.players.get(&entity).filter(|p| p.battle.is_none() && p.transit.is_none()) else { return };
             if player.placement.as_ref().is_some_and(|p| !p.story_advance_allowed) {
                 return;
             }
             let Some(area) = self.areas.get(&player.area) else { return };
-            area.story_points().iter().filter(|point| point.is_hit_by(from, to)).map(|point| point.id).collect()
+            area.story_points()
+                .iter()
+                .filter(|point| point.is_hit_by(from, to) && !(area.runtime().story_battle(point.id).is_some() && point.is_hit_by(from, from)))
+                .map(|point| point.id)
+                .collect()
         };
         for point in touched {
-            self.reach_story_point(entity, point);
+            self.reach_story_point(entity, point, Some(now));
         }
     }
 
@@ -65,7 +82,8 @@ impl World {
             area.story_points().iter().filter(|point| point.is_on_entry()).map(|point| point.id).collect()
         };
         for point in entering {
-            self.reach_story_point(entity, point);
+            // (no clock here: a point that needs a battle is not one that fires by coming to stand somewhere)
+            self.reach_story_point(entity, point, None);
         }
     }
 
@@ -79,14 +97,46 @@ impl World {
         self.by_account.get(&owner).and_then(|e| self.players.get(e)).map_or_else(|| player.progression.clone(), |p| p.progression.clone())
     }
 
-    /// `entity` reached story point `point` of its area: advance its story if the point applies to it.
-    fn reach_story_point(&mut self, entity: EntityId, point: u32) {
-        let step = {
-            let Some(player) = self.players.get(&entity) else { return };
-            let Some(area) = self.areas.get(&player.area) else { return };
-            area.runtime().story_advance(&player.progression, point)
+    /// `entity` reached story point `point` of its area: advance its story if the point applies to it, or start the
+    /// battle the point starts first (`AreaRuntime::story_battle`: the step then waits for the win; `now` is the
+    /// clock of that battle, and without one such a point does nothing). Returns whether anything was done.
+    pub(super) fn reach_story_point(&mut self, entity: EntityId, point: u32, now: Option<Instant>) -> bool {
+        let (step, battle) = {
+            let Some(player) = self.players.get(&entity) else { return false };
+            let Some(area) = self.areas.get(&player.area) else { return false };
+            (area.runtime().story_advance(&player.progression, point), area.runtime().story_battle(point))
         };
-        let Some(step) = step else { return };
+        let Some(step) = step else { return false };
+        if let Some(formation) = battle {
+            let Some(now) = now else { return false };
+            return self.start_story_battle(entity, point, formation, now);
+        }
+        self.apply_story_step(entity, point, step);
+        true
+    }
+
+    /// The battle that a story point started has been WON: the player's step, if it still applies (the player is where
+    /// the point is and its placement still lets it advance the story).
+    pub(super) fn story_after_battle(&mut self, then: StoryThen) {
+        let step = {
+            let Some(player) = self.players.get(&then.entity) else { return };
+            if player.area != then.area || player.battle.is_some() || player.transit.is_some() {
+                return;
+            }
+            if player.placement.as_ref().is_some_and(|p| !p.story_advance_allowed) {
+                return;
+            }
+            let Some(area) = self.areas.get(&player.area) else { return };
+            area.runtime().story_advance(&player.progression, then.point)
+        };
+        if let Some(step) = step {
+            self.apply_story_step(then.entity, then.point, step);
+        }
+    }
+
+    /// Apply `step` of point `point` to `entity` (module docs: the mirror, the log line, the save, the message, the
+    /// placements).
+    fn apply_story_step(&mut self, entity: EntityId, point: u32, step: StoryStep) {
         let Some(player) = self.players.get_mut(&entity) else { return };
         let (account, area_id) = (player.account, player.area.clone());
         player.progression = step.progress.clone();
