@@ -99,6 +99,7 @@ games plug in behind `fmv-adapter-api` without touching it.
 | `fmv-ff7-battle` *(coming)* | FF7 battle subset for the shared-battle milestone. |
 | `fmv-persist` | Accounts, avatar profiles, player characters (identity, per-game binding and slot, pointers to progress) and per-game progression in an atomic, single-writer file store. |
 | `fmv-party` | Party membership, leader and story-phase instance selection (pure state machines). |
+| `fmv-audio` | Audio engine: a music and effects mixer (crossfades, loop points, volumes, mute), a null sink for machines without a sound card, and the cpal output device. Game-agnostic and not wired into the client yet; it holds no audio data. |
 
 ## Quickstart
 
