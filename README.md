@@ -1137,6 +1137,29 @@ for the long way, no unknown opcode (`tests/scene_real.rs`).
   Adding `Var[3][212]` bit 2 to `fmv_ff7::story::TRACKED_VARS` would make the conversation remembered across logins;
   that row belongs to the story model.
 
+### What the client does (`fmv-client`, `src/scene/`)
+
+The client builds the scene from its OWN copy of the field when `SceneStart` arrives (`ScenePlay`, the same code and the same
+seed and story as everybody else's) and plays it on local copies of the cast: Cloud and Tifa are drawn as the playable canon
+models (idle, and walking while a move is on), the trigger NPC (Tifa as the field's NPC) is hidden while her cast actor stands in
+for her, and every participant's own body is drawn at its **witness spot** at the field's model scale, like every other avatar
+(the player's real position never moves: the scene draws the body somewhere else for as long as it lasts). Each window opens
+over its speaker (the name on its first line), a question shows its choices with the pointer like the talk window, **OK pages and
+answers, Up/Down move the cursor, Esc or Backspace skip the whole scene** (the owner reports it; a watcher just leaves), and
+every other key is swallowed while it runs: no walking, no talking, no battle key. When it ends (its own end, a skip, or the
+server's `SceneEnded`) the cast and the camera state are gone, the hidden NPC is back and the field's keys are the field's again.
+A watcher opens window 0 itself and every later one only when the owner's `SceneStep` for the one before arrives, so the two screens
+show the same line at the same time. A client that cannot build the scene (no field data) tells the server at once (`SceneEnd`
+skipped, or `SceneLeave`), so a player is never left held.
+
+QA entry points: **F6** (the window sends `SceneDebugPreview` for the first scene; a server without `--debug-scene-preview` answers
+with a refusal), and the headless bot flags `--scene-preview <ID>` (preview, then press OK next to the trigger; with a party flag it
+waits until its party is formed), `--scene-watchers <N>` (the owner waits until N party members are in its field), `--scene-watch` (a
+watcher: never presses OK), `--scene-answer <LINE>` and `--scene-wait-secs <N>`. A scene bot prints one `scene line index=.. opener=..
+speaker=.. dialog=.. asks=.. answer=..` per window moved past, `scene started`, `scene ended` and `scene control restored moved=<bool>`:
+ids and counts only, never text. Camera scrolls and scripted animation clips are carried by the interpreter and **not shown** (the
+view stays on the whole field picture, actors stand idle or walk): see the gaps below.
+
 ### The debug preview (`--debug-scene-preview`, OFF by default)
 
 7th Heaven is far beyond today's world, which ends at the first reactor, so a QA player reaches the proof field this way.
@@ -1164,6 +1187,25 @@ FMV_FF7_DATA=<.../data> cargo test --offline -p fmv-ff7 --test scene_real -- --i
 FMV_FF7_FLEVEL=<.../flevel.lgp> cargo test --offline -p fmv-server --test scene_real -- --ignored   # a real server and socket
 scripts/scene-smoke.sh --debug --build                 # two real headless players, the scene, a server restart (real data)
 ```
+
+### Known gaps of the proof
+
+* **The proof scene is story-neutral, so it is repeatable.** Its script writes only the field's own flags (`Var[3][212]` and
+  neighbours) and Tifa's affection points (`Var[1][4]`), none of which the story model carries; talking to her again plays it
+  again. A scene that writes the moment is handled (the server applies it once, saved, and the real-data test shows it on Tifa's
+  script 15, 81 to 84); making this one remembered is one row in `fmv_ff7::story::TRACKED_VARS` (`Var[3][212]` bit 2), which
+  belongs to the story model.
+* **A window pauses the whole scene** (the engine pauses only the script that opened it), durations are estimates (a walk's
+  length from the move speed, a clip's from its range), camera scrolls and scripted animation clips are not shown, and the cast
+  is Cloud and Tifa: the bar's other characters (Marlene, the patrons) are not drawn.
+* **The interpreter does not know** (counted, never guessed, over every script slot of the game): `AXYZI`, `GETAI`, `GETAXY`,
+  `GETDIR` (read-backs of a place or a direction), `PDIRA`, `PTURA`, `PXYZI` (the party's own), `CHAR`, `PC`, `DSKCG`, `RDMSD`;
+  326,525 slots of 702 fields run as scene roots in 6 s with no panic and every one ending (`tests/scene_real.rs`).
+* **Scene data is keyed by the original field's entity numbers.** A replacement script section (a text or voice mod's) has other
+  numbers in about 700 fields; entity names are kept, so resolving by name is the way when such a layer is wired in.
+* **After a scene that changes the story the area's NPC list is not re-sent** unless the player changes instance, so a trigger
+  that should be gone can still be drawn; the server refuses the press.
+* Scenes are Rust data (one today), not files.
 
 ## Importing your own FF7 data
 
