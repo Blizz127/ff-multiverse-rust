@@ -5,8 +5,9 @@
 
 use super::*;
 use fmv_core::EntityId;
-use fmv_ff7_battle::rules::{element, ActionSpec, EnemyAction, EscapeRule, Formula, ItemData, ItemTable, LimitBreak, Reward, Spell};
+use fmv_ff7_battle::rules::{element, ActionSpec, Aim, EnemyAction, EscapeRule, Formula, ItemData, ItemTable, LimitBreak, Reward, Spell, Target};
 use fmv_protocol::{split_rewards, BattleBuildError, BattleMember, FormationInfo, SyntheticRules};
+use super::menu::{AimAt, Reach};
 use super::popups::PopupKind;
 
 const ME: AccountId = AccountId(11);
@@ -29,6 +30,9 @@ struct Scenario {
     /// Our character's HP and MP at the start (the most are 200 and 60).
     hp: u32,
     mp: u32,
+    /// The roster member `hp` and `mp` are about: 0 (the first member, ours in a battle of players only), or our own
+    /// place behind the canon companions of protocol v9.
+    ours: usize,
     /// What every party member knows.
     spells: Vec<Spell>,
     /// The second member starts dead.
@@ -41,6 +45,8 @@ struct Scenario {
     limit: Option<LimitBreak>,
     /// How hard the battle is to run from (none: it cannot be).
     escape: Option<EscapeRule>,
+    /// How many whole-side casts of the Cure and Fire kind every member's All materia allows (protocol v8).
+    all: u8,
 }
 
 impl Scenario {
@@ -48,12 +54,14 @@ impl Scenario {
         Self {
             hp: MAX_HP,
             mp: MAX_MP,
+            ours: 0,
             spells: Self::spells(),
             ally_dead: false,
             enemy_hp: 1_200,
             enemy_attacks: Vec::new(),
             limit: None,
             escape: Some(EscapeRule { difficulty: 1, sure: true }),
+            all: 0,
         }
     }
 
@@ -84,13 +92,14 @@ impl Scenario {
         ]
     }
 
-    /// Potion (0), Ether (3), Phoenix Down (7) and Grenade (9, damages an enemy).
+    /// Potion (0), Ether (3), Megalixir (6, the whole party), Phoenix Down (7) and Grenade (9, damages an enemy).
     fn items() -> Arc<ItemTable> {
         Arc::new(ItemTable::new([
             (0, ItemData::new(ActionSpec::flat_restore_item(5, false))),
             (3, ItemData::new(ActionSpec::flat_restore_item(5, true))),
-            (7, ItemData::new(ActionSpec::revive_spell(8, 0))),
-            (9, ItemData::new(ActionSpec::damage_spell(8, 255, 0, 0))),
+            (6, ItemData::new(ActionSpec::full_restore_item().with_aim(Aim::Side))),
+            (7, ItemData::new(ActionSpec::revive_spell(8, 0).with_aim(Aim::One))),
+            (9, ItemData::new(ActionSpec::damage_spell(8, 255, 0, 0).with_aim(Aim::One))),
         ]))
     }
 }
@@ -114,7 +123,8 @@ impl BattleRules for Scenario {
                 c.spells = self.spells.clone();
                 c.limit_break = self.limit;
                 c.limit = setup.party[i].limit;
-                if i == 0 {
+                c.all_left = self.all;
+                if i == self.ours {
                     c.hp = self.hp;
                     c.mp = self.mp;
                 }
@@ -286,7 +296,7 @@ fn confirm_row(c: &mut BattleClient, row: usize, t: f64) -> MenuReply {
 /// With the target pointer open: move it to `target` and press Confirm.
 fn confirm_target(c: &mut BattleClient, target: ActorId, t: f64) -> MenuReply {
     for _ in 0..8 {
-        if menu(c, t).aim.expect("the pointer is open").target == target {
+        if menu(c, t).aim.expect("the pointer is open").one() == Some(target) {
             break;
         }
         c.menu_key(MenuKey::Right, t);
@@ -382,11 +392,13 @@ fn the_menu_model_is_filled_from_the_engine_at_the_start_and_from_the_inventory_
     assert_eq!(
         c.menu_model_mut().spells,
         [
-            MenuSpell::new(0, "Spell 0", 5, TargetRule::Allies),
-            MenuSpell::new(7, "Spell 7", 34, TargetRule::Allies),
-            MenuSpell::new(27, "Spell 27", 4, TargetRule::Enemies),
-        ]
+            MenuSpell::new(0, "Spell 0", 5, TargetRule::Allies).with_reach(Reach::OneOrAll),
+            MenuSpell::new(7, "Spell 7", 34, TargetRule::Allies).with_reach(Reach::OneOrAll),
+            MenuSpell::new(27, "Spell 27", 4, TargetRule::Enemies).with_reach(Reach::OneOrAll),
+        ],
+        "Cure, Life and Fire can hit a whole side, and the fighter has one All use to do it with"
     );
+    assert_eq!(c.menu_model_mut().all_left, 1);
     assert!(c.menu_model_mut().spells.iter().all(|s| s.enabled), "the live MP is the menu's business, not baked in at the start");
     assert!(c.menu_model_mut().defend);
     assert!(c.menu_model_mut().items.is_empty(), "no inventory message yet");
@@ -501,7 +513,7 @@ fn spells_items_and_defend_chosen_with_the_keys_reach_the_server_as_engine_comma
     // Fire at the dummy: a Magic command with the spell's id, costing its MP, named in the banner.
     let row = row_of_spell(&mut c, 27);
     let fire = choose(&mut c, t, MAGIC, Some(row), Some(foe));
-    assert_eq!(fire, cmd(Command::Magic { spell: 27, target: foe }));
+    assert_eq!(fire, cmd(Command::Magic { spell: 27, target: Target::One(foe) }));
     let msg = send(&mut sim, &mut c, fire, t);
     no_divergence(&mut c, "Fire");
     assert!(events_of(&msg).contains(&BattleEvent::Action { actor: me, action: fmv_protocol::ActionRef::Magic(27) }));
@@ -516,7 +528,7 @@ fn spells_items_and_defend_chosen_with_the_keys_reach_the_server_as_engine_comma
     t += 2.0;
     let row = row_of_spell(&mut c, 0);
     let cure = choose(&mut c, t, MAGIC, Some(row), Some(me));
-    assert_eq!(cure, cmd(Command::Magic { spell: 0, target: me }), "Cure aims at the living party");
+    assert_eq!(cure, cmd(Command::Magic { spell: 0, target: Target::One(me) }), "Cure aims at the living party");
     let msg = send(&mut sim, &mut c, cure, t);
     no_divergence(&mut c, "Cure");
     let healed = events_of(&msg).iter().find_map(|e| if let BattleEvent::Heal { target, amount, .. } = e { Some((*target, *amount)) } else { None });
@@ -532,7 +544,7 @@ fn spells_items_and_defend_chosen_with_the_keys_reach_the_server_as_engine_comma
     t += 2.0;
     let row = row_of_item(&mut c, 3);
     let ether = choose(&mut c, t, ITEM, Some(row), Some(me));
-    assert_eq!(ether, cmd(Command::Item { item: 3, target: me }));
+    assert_eq!(ether, cmd(Command::Item { item: 3, target: Target::One(me) }));
     let msg = send(&mut sim, &mut c, ether, t);
     no_divergence(&mut c, "Ether");
     let restored = events_of(&msg).iter().find_map(|e| if let BattleEvent::MpRestored { amount, .. } = e { Some(*amount) } else { None });
@@ -551,11 +563,11 @@ fn spells_items_and_defend_chosen_with_the_keys_reach_the_server_as_engine_comma
     let row = row_of_item(&mut c, 7);
     assert_eq!(confirm_command(&mut c, ITEM, t), MenuReply::Handled);
     assert_eq!(confirm_row(&mut c, row, t), MenuReply::Handled);
-    assert_eq!(menu(&c, t).aim.expect("the pointer").target, peer, "the pointer starts on the one who fell");
+    assert_eq!(menu(&c, t).aim.expect("the pointer").one(), Some(peer), "the pointer starts on the one who fell");
     c.menu_key(MenuKey::Right, t);
-    assert_eq!(menu(&c, t).aim.expect("the pointer").target, peer, "and has nobody else to go to");
+    assert_eq!(menu(&c, t).aim.expect("the pointer").one(), Some(peer), "and has nobody else to go to");
     let MenuReply::Send(phoenix) = c.menu_key(MenuKey::Confirm, t) else { panic!("a command") };
-    assert_eq!(phoenix, cmd(Command::Item { item: 7, target: peer }));
+    assert_eq!(phoenix, cmd(Command::Item { item: 7, target: Target::One(peer) }));
     let msg = send(&mut sim, &mut c, phoenix, t);
     no_divergence(&mut c, "Phoenix Down");
     let hp = events_of(&msg).iter().find_map(|e| if let BattleEvent::Revive { target, hp, .. } = e { Some((*target, *hp)) } else { None });
@@ -573,7 +585,7 @@ fn spells_items_and_defend_chosen_with_the_keys_reach_the_server_as_engine_comma
     t += 2.0;
     let row = row_of_item(&mut c, 9);
     let grenade = choose(&mut c, t, ITEM, Some(row), Some(foe));
-    assert_eq!(grenade, cmd(Command::Item { item: 9, target: foe }));
+    assert_eq!(grenade, cmd(Command::Item { item: 9, target: Target::One(foe) }));
     send(&mut sim, &mut c, grenade, t);
     no_divergence(&mut c, "Grenade");
     assert_eq!(banner(&c, t).as_deref(), Some("Grenade"));
@@ -754,8 +766,8 @@ fn a_hostile_inventory_is_bounded_tidy_and_never_panics() {
     assert_eq!(c.inventory().first(), Some(&InventoryEntry::new(0, 1)));
     assert_eq!(c.inventory().last(), Some(&InventoryEntry::new(MAX_INVENTORY_STACKS as u16 - 1, 1)));
     assert_eq!(c.inventory_total(), MAX_INVENTORY_STACKS as u32);
-    // The engine can use four of them: only those are in the menu.
-    assert_eq!(c.menu_model_mut().items.iter().map(|i| i.id).collect::<Vec<_>>(), [0, 3, 7, 9]);
+    // The engine can use five of them (Potion, Ether, Megalixir, Phoenix Down, Grenade): only those are in the menu.
+    assert_eq!(c.menu_model_mut().items.iter().map(|i| i.id).collect::<Vec<_>>(), [0, 3, 6, 7, 9]);
     let n = notes(&mut c);
     assert_eq!(n.lines().count(), 1, "one note per message, however much it holds: {n}");
     assert!(n.starts_with("inventory: stacks=320 total=320 items=0:1,1:1,2:1,"), "{n}");
@@ -829,16 +841,16 @@ fn a_hurt_bot_that_can_pay_heals_itself_with_the_cheapest_healing_spell() {
     // 50 of 200 HP is a quarter. Cure2 (24 MP, listed first), Cure (5 MP) and Life (34 MP, a revival) are
     // all payable with 40 MP: the cheapest healer is Cure, on itself.
     let (_sim, c) = bot_battle(Scenario { hp: 50, mp: 40, ..Scenario::new() });
-    assert_eq!(command(&c, 1.0), Some(Command::Magic { spell: 0, target: ME_AT_0 }));
+    assert_eq!(command(&c, 1.0), Some(Command::Magic { spell: 0, target: Target::One(ME_AT_0) }));
     // With 24 MP Cure2 is payable too, and Cure is still the cheapest; with 5, only Cure is payable.
     for mp in [24, 5] {
         let (_sim, c) = bot_battle(Scenario { hp: 50, mp, ..Scenario::new() });
-        assert_eq!(command(&c, 1.0), Some(Command::Magic { spell: 0, target: ME_AT_0 }), "{mp} MP");
+        assert_eq!(command(&c, 1.0), Some(Command::Magic { spell: 0, target: Target::One(ME_AT_0) }), "{mp} MP");
     }
     // Among equals the lowest spell id wins, whatever the order of the list.
     let twins = vec![Spell::new(9, ActionSpec::cure_spell(5, 5)), Spell::new(4, ActionSpec::cure_spell(5, 5))];
     let (_sim, c) = bot_battle(Scenario { hp: 50, spells: twins, ..Scenario::new() });
-    assert_eq!(command(&c, 1.0), Some(Command::Magic { spell: 4, target: ME_AT_0 }));
+    assert_eq!(command(&c, 1.0), Some(Command::Magic { spell: 4, target: Target::One(ME_AT_0) }));
 }
 
 #[test]
@@ -857,7 +869,7 @@ fn a_hurt_bot_without_the_mp_attacks_and_so_does_one_that_is_well() {
     let (_sim, c) = bot_battle(Scenario { hp: 60, ..Scenario::new() });
     assert_eq!(command(&c, 1.0), Some(Command::Attack { target: THE_DUMMY }), "exactly 30%");
     let (_sim, c) = bot_battle(Scenario { hp: 59, ..Scenario::new() });
-    assert_eq!(command(&c, 1.0), Some(Command::Magic { spell: 0, target: ME_AT_0 }), "just under 30%");
+    assert_eq!(command(&c, 1.0), Some(Command::Magic { spell: 0, target: Target::One(ME_AT_0) }), "just under 30%");
 }
 
 #[test]
@@ -935,9 +947,9 @@ fn the_headless_bot_sends_its_heal_and_then_attacks_once_it_is_well_or_out_of_mp
         }
         sim.until_our_turn(&mut c, &mut t);
     }
-    assert_eq!(sent.first(), Some(&Command::Magic { spell: 0, target: ME_AT_0 }), "{sent:?}");
+    assert_eq!(sent.first(), Some(&Command::Magic { spell: 0, target: Target::One(ME_AT_0) }), "{sent:?}");
     let attack_at = sent.iter().position(|c| matches!(c, Command::Attack { .. })).expect("it attacks once it is no longer in need and able to heal");
-    assert!(sent[..attack_at].iter().all(|c| *c == Command::Magic { spell: 0, target: ME_AT_0 }), "only Cure on itself until then: {sent:?}");
+    assert!(sent[..attack_at].iter().all(|c| *c == Command::Magic { spell: 0, target: Target::One(ME_AT_0) }), "only Cure on itself until then: {sent:?}");
     // Why it stopped healing: it is above the line, or it cannot pay for another Cure.
     let me = c.active().and_then(ActiveBattle::replay).expect("the replay").state().actor(ME_AT_0).expect("us").clone();
     assert!(u64::from(me.hp) * 10 >= u64::from(me.max_hp) * 3 || me.mp < 5, "hp {} mp {}", me.hp, me.mp);
@@ -997,7 +1009,7 @@ fn a_full_gauge_turns_attack_into_limit_the_server_applies_it_and_attack_comes_b
     assert_eq!(menu(&c, t).commands[0].label, "Limit");
     let enemy = ActorId(1);
     let cmd = choose(&mut c, t, 0, None, Some(enemy));
-    assert_eq!(cmd, BattleCmd::Command { battle_id: BattleId(1), actor: ME_AT_0, command: Command::Limit { target: enemy } });
+    assert_eq!(cmd, BattleCmd::Command { battle_id: BattleId(1), actor: ME_AT_0, command: Command::Limit { target: Target::One(enemy) } });
     let msg = send(&mut sim, &mut c, cmd, t);
     no_divergence(&mut c, "the limit");
     let events = of_the_command(&msg);
@@ -1027,22 +1039,33 @@ fn a_limit_that_wins_the_battle_ends_it_on_the_victory_and_is_counted_in_the_sum
 }
 
 #[test]
-fn a_healing_limit_aims_at_the_party_through_the_real_menu() {
+fn a_healing_limit_aims_at_the_whole_party_through_the_real_menu() {
     let (mut sim, mut c) = limit_battle(Scenario { limit: Some(Scenario::healing_wind()), hp: 60, ..Scenario::new() }, &[ME, PEER], &[255, 0], true);
     let t = 1.0;
     assert_eq!(menu(&c, t).commands[0].label, "Limit");
     assert_eq!(c.menu_key(MenuKey::Confirm, t), MenuReply::Handled);
+    // Healing Wind hits the whole party and nothing smaller: the pointer starts on ALL and the arrows have
+    // nowhere else to take it.
     let aim = menu(&c, t).aim.expect("the pointer");
-    assert_eq!((aim.target, aim.enemy), (ActorId(0), false), "Healing Wind aims at the party, starting on ourselves");
-    let cmd = match confirm_target(&mut c, ME_AT_0, t) {
+    assert_eq!((aim.at, aim.enemy, aim.reach), (AimAt::All, false, Reach::All));
+    for key in [MenuKey::Right, MenuKey::Down, MenuKey::Left, MenuKey::Up] {
+        assert_eq!(c.menu_key(key, t), MenuReply::Handled);
+        assert_eq!(menu(&c, t).aim.expect("the pointer").at, AimAt::All, "{key:?}");
+    }
+    let cmd = match c.menu_key(MenuKey::Confirm, t) {
         MenuReply::Send(cmd) => cmd,
         other => panic!("{other:?}"),
     };
-    assert_eq!(cmd, BattleCmd::Command { battle_id: BattleId(1), actor: ME_AT_0, command: Command::Limit { target: ME_AT_0 } });
+    assert_eq!(cmd, BattleCmd::Command { battle_id: BattleId(1), actor: ME_AT_0, command: Command::Limit { target: Target::AllAllies } });
     let msg = send(&mut sim, &mut c, cmd, t);
     no_divergence(&mut c, "Healing Wind");
-    // Half of 200 max HP on a character at 60: 100.
-    assert!(events_of(&msg).contains(&BattleEvent::Heal { actor: ME_AT_0, target: ME_AT_0, amount: 100 }), "{:?}", events_of(&msg));
+    // Half of 200 max HP on a character at 60: 100; the other member is not hurt, so there is nothing to give it,
+    // but the wind reaches it all the same (one event per member, in order; the replay checked both).
+    let healed: Vec<(ActorId, u32)> = events_of(&msg)
+        .iter()
+        .filter_map(|e| if let BattleEvent::Heal { target, amount, .. } = e { Some((*target, *amount)) } else { None })
+        .collect();
+    assert_eq!(healed, [(ME_AT_0, 100), (ActorId(1), 0)], "{:?}", events_of(&msg));
 }
 
 #[test]
@@ -1101,7 +1124,7 @@ fn a_failed_escape_costs_the_turn_only_and_a_boss_that_cannot_be_escaped_greys_t
 #[test]
 fn the_servers_refusals_of_a_limit_or_an_escape_are_counted_and_noted_and_free_the_command() {
     let (_sim, mut c) = limit_battle(Scenario::new(), &[ME], &[], true);
-    let cmd = BattleCmd::Command { battle_id: BattleId(1), actor: ME_AT_0, command: Command::Limit { target: ActorId(1) } };
+    let cmd = BattleCmd::Command { battle_id: BattleId(1), actor: ME_AT_0, command: Command::Limit { target: Target::One(ActorId(1)) } };
     for (n, reason) in [BattleRejection::LimitNotReady, BattleRejection::NoLimit, BattleRejection::CannotEscape].into_iter().enumerate() {
         c.note_sent(&cmd, 1.0);
         assert_eq!(c.menu_key(MenuKey::Confirm, 1.1), MenuReply::Ignored, "the menu is closed while a command is in flight");
@@ -1119,23 +1142,23 @@ fn the_servers_refusals_of_a_limit_or_an_escape_are_counted_and_noted_and_free_t
 fn the_bot_gives_a_full_limit_but_heals_first_when_hurt_aims_a_healing_limit_at_the_wounded_and_never_runs() {
     // Full gauge, healthy: the limit goes to the first living enemy.
     let (_sim, c) = limit_battle(Scenario { limit: Some(Scenario::braver()), ..Scenario::new() }, &[ME], &[255], true);
-    assert_eq!(command(&c, 1.0), Some(Command::Limit { target: THE_DUMMY }));
+    assert_eq!(command(&c, 1.0), Some(Command::Limit { target: Target::One(THE_DUMMY) }));
     // Not full: a plain attack.
     let (_sim, c) = limit_battle(Scenario { limit: Some(Scenario::braver()), ..Scenario::new() }, &[ME], &[254], true);
     assert_eq!(command(&c, 1.0), Some(Command::Attack { target: THE_DUMMY }));
     // Full gauge but hurt (40 of 200 is under 30%) and able to pay for a Cure: it heals first.
     let (_sim, c) = limit_battle(Scenario { limit: Some(Scenario::braver()), hp: 40, ..Scenario::new() }, &[ME], &[255], true);
-    assert_eq!(command(&c, 1.0), Some(Command::Magic { spell: 0, target: ME_AT_0 }));
+    assert_eq!(command(&c, 1.0), Some(Command::Magic { spell: 0, target: Target::One(ME_AT_0) }));
     // Hurt and out of MP: no heal to give, so the limit.
     let (_sim, c) = limit_battle(Scenario { limit: Some(Scenario::braver()), hp: 40, mp: 0, ..Scenario::new() }, &[ME], &[255], true);
-    assert_eq!(command(&c, 1.0), Some(Command::Limit { target: THE_DUMMY }));
+    assert_eq!(command(&c, 1.0), Some(Command::Limit { target: Target::One(THE_DUMMY) }));
 
     // A healing limit is not wasted on a party that is fine ...
     let (_sim, c) = limit_battle(Scenario { limit: Some(Scenario::healing_wind()), ..Scenario::new() }, &[ME, PEER], &[255, 0], true);
     assert_eq!(command(&c, 1.0), Some(Command::Attack { target: ActorId(2) }));
     // ... but goes to the one under half of its HP (here ourselves, at 90 of 200: not under 30%, so no spell).
     let (_sim, c) = limit_battle(Scenario { limit: Some(Scenario::healing_wind()), hp: 90, ..Scenario::new() }, &[ME, PEER], &[255, 0], true);
-    assert_eq!(command(&c, 1.0), Some(Command::Limit { target: ME_AT_0 }));
+    assert_eq!(command(&c, 1.0), Some(Command::Limit { target: Target::AllAllies }), "Healing Wind hits the whole party at once");
 
     // Whatever happens, a bot with a limit never runs: play a whole battle with it.
     let (mut sim, mut c) = limit_battle(Scenario { limit: Some(Scenario::braver()), enemy_hp: 400, ..Scenario::new() }, &[ME], &[255], true);
@@ -1160,10 +1183,114 @@ fn the_bot_gives_a_full_limit_but_heals_first_when_hurt_aims_a_healing_limit_at_
     no_divergence(&mut c, "the whole battle");
 }
 
+// ----- whole sides (protocol v8) ---------------------------------------------------------------------------
+
+/// Fire on every enemy chosen with the keys: the pointer walks to ALL, the command reaches the server and its replay
+/// (every event of both targets is checked), the numbers float over both enemies, and the All use the engine took
+/// is gone from the menu (no ALL place any more, the list does not mention it).
+#[test]
+fn a_spell_on_every_enemy_chosen_with_the_keys_costs_the_all_use_and_the_replay_takes_it() {
+    let rules: Arc<dyn BattleRules> = Arc::new(SyntheticRules::default());
+    // Formation 1: two weak enemies (actors 1 and 2) against our one character.
+    let mut sim = Sim::new(&*rules, 1, &[ME], true);
+    let mut c = client(rules);
+    c.set_names(Some(names()));
+    c.on_message(0.0, sim.start());
+    let me = ActorId(0);
+    let mut t = 1.0;
+    // The model says what the engine says: the spells of the Cure and Fire kind can hit a whole side, once.
+    assert_eq!(c.menu_model_mut().all_left, 1);
+    assert!(c.menu_model_mut().spells.iter().all(|s| s.reach == Reach::OneOrAll));
+
+    let row = row_of_spell(&mut c, 27);
+    assert_eq!(confirm_command(&mut c, MAGIC, t), MenuReply::Handled);
+    assert_eq!(menu(&c, t).list.expect("the Magic list").all, Some(1), "the list says how many whole-side casts are left");
+    assert_eq!(confirm_row(&mut c, row, t), MenuReply::Handled);
+    assert_eq!(menu(&c, t).aim.expect("the pointer").one(), Some(ActorId(1)), "the pointer starts on the first enemy");
+    c.menu_key(MenuKey::Right, t);
+    assert_eq!(menu(&c, t).aim.expect("the pointer").one(), Some(ActorId(2)));
+    c.menu_key(MenuKey::Right, t);
+    assert_eq!(menu(&c, t).aim.expect("the pointer").at, AimAt::All, "one step past the last enemy is ALL");
+    let MenuReply::Send(fire) = c.menu_key(MenuKey::Confirm, t) else { panic!("a command") };
+    assert_eq!(fire, BattleCmd::Command { battle_id: BattleId(1), actor: me, command: Command::Magic { spell: 27, target: Target::AllEnemies } });
+    let msg = send(&mut sim, &mut c, fire, t);
+    let n = notes(&mut c);
+    assert!(c.divergences() == 0 && !n.contains("DIVERGENCE") && !c.active().expect("a battle").diverged(), "{n}");
+    let hit: Vec<ActorId> = events_of(&msg).iter().filter_map(|e| if let BattleEvent::Damage { target, .. } = e { Some(*target) } else { None }).collect();
+    assert_eq!(hit, [ActorId(1), ActorId(2)], "every enemy, in order, from one announcement");
+    assert_eq!(events_of(&msg).iter().filter(|e| matches!(e, BattleEvent::Action { .. })).count(), 1);
+    let numbers: Vec<u8> = popups_over(&c, t).iter().map(|(who, _)| *who).collect();
+    assert!(numbers.contains(&1) && numbers.contains(&2), "a number over each enemy: {numbers:?}");
+    assert_eq!(banner(&c, t).as_deref(), Some("Fire"));
+
+    // The use is spent: the model follows the replay, Fire has no ALL place any more and the pointer only walks
+    // the two enemies (the engine would refuse the whole side now).
+    t += 2.0;
+    sim.until_our_turn(&mut c, &mut t);
+    t += 2.0;
+    assert_eq!(c.menu_model_mut().all_left, 0);
+    assert!(c.menu_model_mut().spells.iter().all(|s| s.reach == Reach::One));
+    assert!(sim.state.check_command(me, &Command::Magic { spell: 27, target: Target::AllEnemies }).is_err());
+    assert_eq!(confirm_command(&mut c, MAGIC, t), MenuReply::Handled);
+    assert_eq!(menu(&c, t).list.expect("the Magic list").all, None);
+    assert_eq!(confirm_row(&mut c, row, t), MenuReply::Handled);
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        seen.push(menu(&c, t).aim.expect("the pointer").at);
+        c.menu_key(MenuKey::Right, t);
+    }
+    assert_eq!(seen, [AimAt::One(ActorId(1)), AimAt::One(ActorId(2)), AimAt::One(ActorId(1))]);
+}
+
+/// Cure on the whole party (two members): one Cure, the heal on each, and Healing Wind and Megalixir only ever
+/// aim at the whole party (the pointer starts on ALL and the item needs no All use).
+#[test]
+fn cure_on_the_whole_party_and_a_megalixir_reach_every_member() {
+    let rules: Arc<dyn BattleRules> = Arc::new(Scenario { hp: 100, all: 1, ..Scenario::new() });
+    let mut sim = Sim::new(&*rules, 0, &[ME, PEER], true);
+    let mut c = client(rules);
+    c.on_inventory(0.0, vec![InventoryEntry::new(0, 3), InventoryEntry::new(6, 2)]);
+    c.on_message(0.0, sim.start());
+    let me = ActorId(0);
+    let mut t = 1.0;
+    let row = row_of_spell(&mut c, 0);
+    assert_eq!(confirm_command(&mut c, MAGIC, t), MenuReply::Handled);
+    assert_eq!(confirm_row(&mut c, row, t), MenuReply::Handled);
+    // Two members: ourselves, then the friend, then ALL.
+    c.menu_key(MenuKey::Left, t);
+    let aim = menu(&c, t).aim.expect("the pointer");
+    assert_eq!((aim.at, aim.enemy, aim.revive), (AimAt::All, false, false));
+    let MenuReply::Send(cure) = c.menu_key(MenuKey::Confirm, t) else { panic!("a command") };
+    assert_eq!(cure, BattleCmd::Command { battle_id: BattleId(1), actor: me, command: Command::Magic { spell: 0, target: Target::AllAllies } });
+    let msg = send(&mut sim, &mut c, cure, t);
+    assert!(c.divergences() == 0, "{}", notes(&mut c));
+    let healed: Vec<ActorId> = events_of(&msg).iter().filter_map(|e| if let BattleEvent::Heal { target, .. } = e { Some(*target) } else { None }).collect();
+    assert_eq!(healed, [ActorId(0), ActorId(1)]);
+
+    // Megalixir: the item is only ever the whole party, so its pointer starts on ALL and the arrows stay.
+    t += 2.0;
+    sim.until_our_turn(&mut c, &mut t);
+    t += 2.0;
+    let row = row_of_item(&mut c, 6);
+    assert_eq!(c.menu_model_mut().items[row].reach, Reach::All);
+    assert_eq!(confirm_command(&mut c, ITEM, t), MenuReply::Handled);
+    assert_eq!(confirm_row(&mut c, row, t), MenuReply::Handled);
+    for key in [MenuKey::Right, MenuKey::Left] {
+        c.menu_key(key, t);
+        assert_eq!(menu(&c, t).aim.expect("the pointer").at, AimAt::All);
+    }
+    let MenuReply::Send(megalixir) = c.menu_key(MenuKey::Confirm, t) else { panic!("a command") };
+    assert_eq!(megalixir, BattleCmd::Command { battle_id: BattleId(1), actor: me, command: Command::Item { item: 6, target: Target::AllAllies } });
+    let msg = send(&mut sim, &mut c, megalixir, t);
+    assert!(c.divergences() == 0, "{}", notes(&mut c));
+    let healed: Vec<ActorId> = events_of(&msg).iter().filter_map(|e| if let BattleEvent::Heal { target, .. } = e { Some(*target) } else { None }).collect();
+    assert_eq!(healed, [ActorId(0), ActorId(1)]);
+}
+
 // ----- the script (`--battle-script`) --------------------------------------------------------------------
 
 use super::script::{BattleScript, Next, Scripted};
-use super::ScriptStep::{Attack, Defend, Escape, Item, Limit, Magic};
+use super::ScriptStep::{Attack, Defend, Escape, Item, ItemAll, Limit, Magic, MagicAll};
 
 /// A preemptive battle for the script tests (everybody's gauge is full at once) for `accounts` (member `i` is
 /// `ActorId(i)`, the dummy follows them), starting with the limit gauges `limits`, whose account carries a
@@ -1200,16 +1327,44 @@ fn applied(sim: &mut Sim, c: &mut BattleClient, cmd: BattleCmd, t: f64) {
 }
 
 #[test]
+fn a_script_entry_with_all_aims_at_the_whole_side_and_what_only_hits_a_side_needs_no_all() {
+    let dummy = ActorId(2);
+    let (_sim, mut c) = script_battle(Scenario { all: 1, limit: Some(Scenario::healing_wind()), ..Scenario::new() }, &[ME, PEER], &[255, 0]);
+    c.on_inventory(0.0, vec![InventoryEntry::new(0, 3), InventoryEntry::new(6, 1), InventoryEntry::new(7, 1)]);
+    // `:all` is the whole side (every enemy for an offensive spell, the party for a healing one); the plain
+    // form is still one target.
+    assert_eq!(sends(&c, 1.0, MagicAll(27)), Command::Magic { spell: 27, target: Target::AllEnemies });
+    assert_eq!(sends(&c, 1.0, MagicAll(0)), Command::Magic { spell: 0, target: Target::AllAllies });
+    assert_eq!(sends(&c, 1.0, Magic(27)), Command::Magic { spell: 27, target: Target::One(dummy) });
+    // Megalixir hits the party and nothing else, so `item:6` is already that; a Potion cannot be aimed at a whole
+    // side, which the engine says and the script reports.
+    assert_eq!(sends(&c, 1.0, Item(6)), Command::Item { item: 6, target: Target::AllAllies });
+    assert_eq!(sends(&c, 1.0, ItemAll(6)), Command::Item { item: 6, target: Target::AllAllies });
+    assert!(skips(&c, 1.0, ItemAll(0)).contains("cannot be aimed that way"));
+    // Healing Wind is the whole party.
+    assert_eq!(sends(&c, 1.0, Limit), Command::Limit { target: Target::AllAllies });
+    // Life on the whole party with nobody fallen: nobody to aim at.
+    assert!(skips(&c, 1.0, MagicAll(7)).contains("nobody to aim at"));
+    // Without an All materia use the spell on a whole side is refused for that, and one target is not.
+    let (_sim, none) = script_battle(Scenario { all: 0, ..Scenario::new() }, &[ME, PEER], &[]);
+    assert!(skips(&none, 1.0, MagicAll(27)).contains("no All materia use is left"));
+    assert_eq!(sends(&none, 1.0, Magic(27)), Command::Magic { spell: 27, target: Target::One(dummy) });
+    // The words round trip through the text of `--battle-script`.
+    assert_eq!(MagicAll(27).to_string(), "magic:27:all");
+    assert_eq!("item:6:all".parse::<ScriptStep>(), Ok(ItemAll(6)));
+}
+
+#[test]
 fn a_script_entry_aims_offence_at_the_first_living_enemy_healing_at_the_most_hurt_member_and_revival_at_a_fallen_one() {
     let dummy = ActorId(2);
     // Everybody at full HP: healing goes to ourselves (the tie goes to us), offence to the dummy.
     let (_sim, c) = script_battle(Scenario { limit: Some(Scenario::braver()), ..Scenario::new() }, &[ME, PEER], &[255, 0]);
     assert_eq!(sends(&c, 1.0, Attack), Command::Attack { target: dummy });
-    assert_eq!(sends(&c, 1.0, Limit), Command::Limit { target: dummy });
-    assert_eq!(sends(&c, 1.0, Magic(27)), Command::Magic { spell: 27, target: dummy }, "Fire is offence");
-    assert_eq!(sends(&c, 1.0, Item(9)), Command::Item { item: 9, target: dummy }, "a Grenade is offence");
-    assert_eq!(sends(&c, 1.0, Magic(0)), Command::Magic { spell: 0, target: ME_AT_0 }, "Cure on a party that is fine: ourselves");
-    assert_eq!(sends(&c, 1.0, Item(0)), Command::Item { item: 0, target: ME_AT_0 });
+    assert_eq!(sends(&c, 1.0, Limit), Command::Limit { target: Target::One(dummy) });
+    assert_eq!(sends(&c, 1.0, Magic(27)), Command::Magic { spell: 27, target: Target::One(dummy) }, "Fire is offence");
+    assert_eq!(sends(&c, 1.0, Item(9)), Command::Item { item: 9, target: Target::One(dummy) }, "a Grenade is offence");
+    assert_eq!(sends(&c, 1.0, Magic(0)), Command::Magic { spell: 0, target: Target::One(ME_AT_0) }, "Cure on a party that is fine: ourselves");
+    assert_eq!(sends(&c, 1.0, Item(0)), Command::Item { item: 0, target: Target::One(ME_AT_0) });
     assert_eq!(sends(&c, 1.0, Defend), Command::Defend);
     assert_eq!(sends(&c, 1.0, Escape), Command::Escape);
 
@@ -1217,18 +1372,18 @@ fn a_script_entry_aims_offence_at_the_first_living_enemy_healing_at_the_most_hur
     // the Potion and Healing Wind go to it. When we are the one at 50 of 200, they go to us.
     let (_sim, c) = script_battle(Scenario { hp: 50, limit: Some(Scenario::healing_wind()), ..Scenario::new() }, &[PEER, ME], &[0, 255]);
     let peer = ActorId(0);
-    assert_eq!(sends(&c, 1.0, Magic(0)), Command::Magic { spell: 0, target: peer });
-    assert_eq!(sends(&c, 1.0, Item(0)), Command::Item { item: 0, target: peer });
-    assert_eq!(sends(&c, 1.0, Limit), Command::Limit { target: peer }, "Healing Wind aims at the party, scripted or not");
+    assert_eq!(sends(&c, 1.0, Magic(0)), Command::Magic { spell: 0, target: Target::One(peer) });
+    assert_eq!(sends(&c, 1.0, Item(0)), Command::Item { item: 0, target: Target::One(peer) });
+    assert_eq!(sends(&c, 1.0, Limit), Command::Limit { target: Target::AllAllies }, "Healing Wind hits the whole party, scripted or not");
     let (_sim, c) = script_battle(Scenario { hp: 50, ..Scenario::new() }, &[ME, PEER], &[]);
-    assert_eq!(sends(&c, 1.0, Magic(0)), Command::Magic { spell: 0, target: ME_AT_0 }, "we are the one at 50 of 200");
+    assert_eq!(sends(&c, 1.0, Magic(0)), Command::Magic { spell: 0, target: Target::One(ME_AT_0) }, "we are the one at 50 of 200");
 
     // A fallen member: Phoenix Down and Life go to it; with nobody fallen they are skipped. A fallen member is never
     // "the most hurt": the Potion goes to one that stands.
     let (_sim, c) = script_battle(Scenario { ally_dead: true, ..Scenario::new() }, &[ME, PEER], &[]);
-    assert_eq!(sends(&c, 1.0, Item(7)), Command::Item { item: 7, target: ActorId(1) });
-    assert_eq!(sends(&c, 1.0, Magic(7)), Command::Magic { spell: 7, target: ActorId(1) });
-    assert_eq!(sends(&c, 1.0, Item(0)), Command::Item { item: 0, target: ME_AT_0 });
+    assert_eq!(sends(&c, 1.0, Item(7)), Command::Item { item: 7, target: Target::One(ActorId(1)) });
+    assert_eq!(sends(&c, 1.0, Magic(7)), Command::Magic { spell: 7, target: Target::One(ActorId(1)) });
+    assert_eq!(sends(&c, 1.0, Item(0)), Command::Item { item: 0, target: Target::One(ME_AT_0) });
     let (_sim, c) = script_battle(Scenario::new(), &[ME, PEER], &[]);
     assert!(skips(&c, 1.0, Item(7)).contains("nobody has fallen"));
     assert!(skips(&c, 1.0, Magic(7)).contains("nobody has fallen"));
@@ -1243,14 +1398,14 @@ fn what_the_engine_or_the_bag_refuses_is_skipped_with_its_reason_and_it_is_only_
     assert!(skips(&c, 1.0, Magic(99)).contains("does not know spell 99"));
     let c = one(Scenario { mp: 4, ..Scenario::new() }, &[]);
     assert!(skips(&c, 1.0, Magic(0)).contains("not enough MP"), "Cure costs 5");
-    assert_eq!(sends(&c, 1.0, Magic(27)), Command::Magic { spell: 27, target: THE_DUMMY }, "Fire costs 4");
+    assert_eq!(sends(&c, 1.0, Magic(27)), Command::Magic { spell: 27, target: Target::One(THE_DUMMY) }, "Fire costs 4");
     // The bag: none left (the inventory the server told, zero stacks are no stacks) and not an item of the game at all.
     let (_sim, mut c) = script_battle(Scenario::new(), &[ME], &[]);
     c.on_inventory(0.5, vec![InventoryEntry::new(0, 0), InventoryEntry::new(9, 1)]);
     assert!(skips(&c, 1.0, Item(0)).contains("none of item 0 is left"));
     assert!(skips(&c, 1.0, Item(7)).contains("none of item 7 is left"), "a Phoenix Down it does not carry");
     assert!(skips(&c, 1.0, Item(42)).contains("item 42 cannot be used in battle"));
-    assert_eq!(sends(&c, 1.0, Item(9)), Command::Item { item: 9, target: THE_DUMMY });
+    assert_eq!(sends(&c, 1.0, Item(9)), Command::Item { item: 9, target: Target::One(THE_DUMMY) });
     // The limit: not full, and none at all.
     let c = one(Scenario { limit: Some(Scenario::braver()), ..Scenario::new() }, &[254]);
     assert!(skips(&c, 1.0, Limit).contains("the limit gauge is not full"));
@@ -1451,7 +1606,7 @@ fn the_headless_bot_gives_its_script_in_order_then_plays_as_usual() {
     let me = ME_AT_0;
     assert_eq!(
         sent[..4],
-        [Command::Defend, Command::Magic { spell: 0, target: me }, Command::Item { item: 0, target: me }, Command::Limit { target: THE_DUMMY }],
+        [Command::Defend, Command::Magic { spell: 0, target: Target::One(me) }, Command::Item { item: 0, target: Target::One(me) }, Command::Limit { target: Target::One(THE_DUMMY) }],
         "{sent:?}"
     );
     assert!(sent[4..].iter().all(|c| matches!(c, Command::Attack { .. })), "then the usual rule: the limit gauge is empty, so it attacks: {sent:?}");
@@ -1464,4 +1619,185 @@ fn the_headless_bot_gives_its_script_in_order_then_plays_as_usual() {
     // Without a script, or with an empty one, nothing changes: no steps, no summary.
     let mut plain = BattleBot::new(true, false, 1).with_script(Vec::new());
     assert!(plain.script_steps().is_empty() && plain.script_summary(&c).is_none() && plain.drain_script_notes().is_empty());
+}
+
+// ----- the roster of protocol v9: the canon pair first, then the players ---------------------------------------------
+//
+// Cloud and Barret are actors 0 and 1 (companions: the server commands them), every player's own character follows in
+// party order, so OUR actor is our place in the roster and never assumed to be 0. The party side of the pointer is then
+// up to five rows, in actor order, and ALL on it is every one of them.
+
+impl Sim {
+    /// A preemptive battle whose roster is the canon pair and then one player per account, in party order: member `i` is
+    /// `ActorId(i)`, so the first player is actor 2. (No server commands the companions here: they stand ready and wait.)
+    fn canon_then(rules: &dyn BattleRules, formation: u16, accounts: &[AccountId]) -> Self {
+        let mut party = vec![BattleMember::companion("Cloud", 0, 6, 0), BattleMember::companion("Barret", 1, 6, 0)];
+        party.extend(
+            accounts
+                .iter()
+                .enumerate()
+                .map(|(i, &account)| BattleMember::player(EntityId(200 + i as u64), account, format!("P{i}"), 1 + i as u8, 6, 0)),
+        );
+        let setup = BattleSetup { formation_id: formation, seed: 7, party, preemptive: true, back_attack: false, battle_speed: 0, ticks_per_second: 1000 };
+        let state = rules.build(&setup).expect("a battle");
+        Sim { id: BattleId(1), setup, state }
+    }
+
+    /// Until `who`, wherever it stands in the roster, can act again.
+    fn until_ready(&mut self, c: &mut BattleClient, t: &mut f64, who: ActorId) {
+        self.run_until(c, t, |s| s.ready_actors().contains(&who));
+    }
+}
+
+/// A battle with the canon pair and `players` players (1 to 3; ours is the first of them, so actor 2) whose account carries
+/// a Potion x3, a Megalixir and a Phoenix Down.
+fn canon_battle(scenario: Scenario, players: usize) -> (Sim, BattleClient) {
+    let rules: Arc<dyn BattleRules> = Arc::new(scenario);
+    let accounts: Vec<AccountId> = [ME, PEER, AccountId(13)].into_iter().take(players).collect();
+    let sim = Sim::canon_then(&*rules, 0, &accounts);
+    let mut c = client(rules);
+    c.set_names(Some(names()));
+    c.on_message(0.0, sim.start());
+    c.on_inventory(0.0, vec![InventoryEntry::new(0, 3), InventoryEntry::new(6, 1), InventoryEntry::new(7, 1)]);
+    (sim, c)
+}
+
+/// The targets of the heals in a server message, in order.
+fn healed(msg: &ServerMsg) -> Vec<u8> {
+    events_of(msg).iter().filter_map(|e| if let BattleEvent::Heal { target, .. } = e { Some(target.0) } else { None }).collect()
+}
+
+#[test]
+fn a_player_behind_the_canon_pair_aims_at_a_companion_and_all_is_the_whole_five_row_party() {
+    let (mut sim, mut c) = canon_battle(Scenario { all: 1, ..Scenario::new() }, 3);
+    let (cloud, barret, me) = (ActorId(0), ActorId(1), ActorId(2));
+    assert_eq!(c.active().and_then(ActiveBattle::my_actor), Some(me), "our actor is our place in the roster, not actor 0");
+    let mut t = 1.0;
+    // Cure: the pointer walks the roster in order, Cloud and Barret first, then the three players, then ALL, and round.
+    let row = row_of_spell(&mut c, 0);
+    assert_eq!(confirm_command(&mut c, MAGIC, t), MenuReply::Handled);
+    assert_eq!(confirm_row(&mut c, row, t), MenuReply::Handled);
+    let mut seen = Vec::new();
+    for _ in 0..7 {
+        seen.push(menu(&c, t).aim.expect("the pointer").at);
+        c.menu_key(MenuKey::Right, t);
+    }
+    let one = |i: u8| AimAt::One(ActorId(i));
+    assert_eq!(seen, [one(0), one(1), one(2), one(3), one(4), AimAt::All, one(0)], "the roster in order, ALL one step past the last row");
+    // The panel lists the same five fighters in the same order, so its rows and the pointer agree.
+    let rows = |c: &BattleClient, t: f64| c.view(t).expect("a battle").party.iter().map(|b| (b.actor.0, b.mine)).collect::<Vec<_>>();
+    assert_eq!(rows(&c, t), [(0, false), (1, false), (2, true), (3, false), (4, false)]);
+
+    // A Cure on Barret, a companion: one target, our actor, and the server's engine takes it.
+    let MenuReply::Send(cure) = confirm_target(&mut c, barret, t) else { panic!("a command") };
+    assert_eq!(cure, BattleCmd::Command { battle_id: BattleId(1), actor: me, command: Command::Magic { spell: 0, target: Target::One(barret) } });
+    let msg = send(&mut sim, &mut c, cure, t);
+    no_divergence(&mut c, "Cure on a companion");
+    assert_eq!(healed(&msg), [1], "Barret and nobody else");
+
+    // Our next turn: a Potion on the canon Cloud.
+    t += 2.0;
+    sim.until_ready(&mut c, &mut t, me);
+    t += 2.0;
+    let row = row_of_item(&mut c, 0);
+    assert_eq!(confirm_command(&mut c, ITEM, t), MenuReply::Handled);
+    assert_eq!(confirm_row(&mut c, row, t), MenuReply::Handled);
+    let MenuReply::Send(potion) = confirm_target(&mut c, cloud, t) else { panic!("a command") };
+    assert_eq!(potion, BattleCmd::Command { battle_id: BattleId(1), actor: me, command: Command::Item { item: 0, target: Target::One(cloud) } });
+    let msg = send(&mut sim, &mut c, potion, t);
+    no_divergence(&mut c, "a Potion on a companion");
+    assert_eq!(healed(&msg), [0]);
+
+    // Our next turn: Cure on the whole party. On ALL the pointer marks every one of the five rows, and one Cure heals them all.
+    t += 2.0;
+    sim.until_ready(&mut c, &mut t, me);
+    t += 2.0;
+    let row = row_of_spell(&mut c, 0);
+    assert_eq!(confirm_command(&mut c, MAGIC, t), MenuReply::Handled);
+    assert_eq!(confirm_row(&mut c, row, t), MenuReply::Handled);
+    for _ in 0..8 {
+        if menu(&c, t).aim.expect("the pointer").at == AimAt::All {
+            break;
+        }
+        c.menu_key(MenuKey::Right, t);
+    }
+    let view = c.view(t).expect("a battle");
+    let aim = view.menu.as_ref().and_then(|m| m.aim).expect("the pointer");
+    assert_eq!((aim.at, aim.enemy), (AimAt::All, false));
+    assert_eq!(view.party.iter().filter(|b| aim.covers(b.actor, b.alive)).count(), 5, "every row of the party panel is aimed at");
+    let MenuReply::Send(whole) = c.menu_key(MenuKey::Confirm, t) else { panic!("a command") };
+    assert_eq!(whole, BattleCmd::Command { battle_id: BattleId(1), actor: me, command: Command::Magic { spell: 0, target: Target::AllAllies } });
+    let msg = send(&mut sim, &mut c, whole, t);
+    no_divergence(&mut c, "Cure on the whole party");
+    assert_eq!(healed(&msg), [0, 1, 2, 3, 4], "the two companions and the three players, in actor order, from one Cure");
+    assert_eq!(events_of(&msg).iter().filter(|e| matches!(e, BattleEvent::Action { .. })).count(), 1);
+}
+
+#[test]
+fn a_fallen_companion_is_a_target_for_a_revival_and_not_for_a_cure_and_all_leaves_it_out() {
+    // Barret (actor 1, a companion) starts down.
+    let (mut sim, mut c) = canon_battle(Scenario { ally_dead: true, all: 1, ..Scenario::new() }, 1);
+    let (barret, me) = (ActorId(1), ActorId(2));
+    let t = 1.0;
+    // Cure's pointer walks the living only: Cloud, us, then ALL (which is the two who stand).
+    let row = row_of_spell(&mut c, 0);
+    assert_eq!(confirm_command(&mut c, MAGIC, t), MenuReply::Handled);
+    assert_eq!(confirm_row(&mut c, row, t), MenuReply::Handled);
+    let mut seen = Vec::new();
+    for _ in 0..4 {
+        seen.push(menu(&c, t).aim.expect("the pointer").at);
+        c.menu_key(MenuKey::Right, t);
+    }
+    assert_eq!(seen, [AimAt::One(ActorId(0)), AimAt::One(me), AimAt::All, AimAt::One(ActorId(0))]);
+    // Four steps from Cloud on a ring of three places ends on us; one more is ALL.
+    c.menu_key(MenuKey::Right, t);
+    let view = c.view(t).expect("a battle");
+    let aim = view.menu.as_ref().and_then(|m| m.aim).expect("the pointer");
+    assert_eq!(aim.at, AimAt::All);
+    assert_eq!(view.party.iter().filter(|b| aim.covers(b.actor, b.alive)).map(|b| b.actor.0).collect::<Vec<_>>(), [0, 2], "Barret is down: not aimed at");
+    assert_eq!(c.menu_key(MenuKey::Back, t), MenuReply::Handled);
+    assert_eq!(c.menu_key(MenuKey::Back, t), MenuReply::Handled);
+
+    // The Phoenix Down's pointer is on the fallen companion, and the revival is taken.
+    let row = row_of_item(&mut c, 7);
+    assert_eq!(confirm_command(&mut c, ITEM, t), MenuReply::Handled);
+    assert_eq!(confirm_row(&mut c, row, t), MenuReply::Handled);
+    assert_eq!(menu(&c, t).aim.expect("the pointer").one(), Some(barret), "the only fallen one");
+    let MenuReply::Send(revive) = c.menu_key(MenuKey::Confirm, t) else { panic!("a command") };
+    assert_eq!(revive, BattleCmd::Command { battle_id: BattleId(1), actor: me, command: Command::Item { item: 7, target: Target::One(barret) } });
+    let msg = send(&mut sim, &mut c, revive, t);
+    no_divergence(&mut c, "a Phoenix Down on a companion");
+    assert!(events_of(&msg).iter().any(|e| matches!(e, BattleEvent::Revive { target, .. } if *target == barret)), "{:?}", events_of(&msg));
+}
+
+#[test]
+fn the_bot_and_its_script_act_from_our_own_place_in_a_roster_that_starts_with_the_canon_pair() {
+    let (cloud, me, dummy) = (ActorId(0), ActorId(2), ActorId(3));
+    let act = |c: &BattleClient, step: ScriptStep| match c.scripted_command(1.0, step) {
+        Scripted::Send(BattleCmd::Command { battle_id, actor, command }) => {
+            assert_eq!((battle_id, actor), (BattleId(1), ActorId(2)), "{step}: ours, not actor 0");
+            command
+        }
+        other => panic!("{step}: {other:?}"),
+    };
+    // The canon Cloud starts hurt (60 of 200). The bot's own rule is about ITSELF, so it just attacks the first living enemy,
+    // as actor 2; the script's healing entries aim at the most hurt member of the party, whoever it is, and `:all` is the
+    // whole party, the companions included.
+    let (_sim, c) = canon_battle(Scenario { hp: 60, all: 1, ..Scenario::new() }, 1);
+    assert_eq!(c.bot_command(1.0), Some(BattleCmd::Command { battle_id: BattleId(1), actor: me, command: Command::Attack { target: dummy } }));
+    assert_eq!(act(&c, Magic(0)), Command::Magic { spell: 0, target: Target::One(cloud) });
+    assert_eq!(act(&c, Item(0)), Command::Item { item: 0, target: Target::One(cloud) });
+    assert_eq!(act(&c, MagicAll(0)), Command::Magic { spell: 0, target: Target::AllAllies });
+    assert_eq!(act(&c, ItemAll(6)), Command::Item { item: 6, target: Target::AllAllies });
+    assert_eq!(act(&c, Attack), Command::Attack { target: dummy });
+    assert_eq!(act(&c, Defend), Command::Defend);
+
+    // OUR character hurt, at actor 2: the bot heals itself, with its own actor and as the target.
+    let (_sim, c) = canon_battle(Scenario { hp: 50, ours: 2, ..Scenario::new() }, 1);
+    assert_eq!(
+        c.bot_command(1.0),
+        Some(BattleCmd::Command { battle_id: BattleId(1), actor: me, command: Command::Magic { spell: 0, target: Target::One(me) } })
+    );
+    // And the script's healing entry aims at the most hurt member, which is now ourselves.
+    assert_eq!(act(&c, Magic(0)), Command::Magic { spell: 0, target: Target::One(me) });
 }

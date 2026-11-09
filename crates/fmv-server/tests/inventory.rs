@@ -23,7 +23,7 @@ use common::*;
 use fmv_ff7_battle::rules::{BattleState, Command, Outcome};
 use fmv_protocol::{
     ActorId, BattleRejection, BattleReplay, BattleReward, BattleRules, BattleSetup, ClientMsg, InventoryEntry, PartyEvent, ServerMsg,
-    SyntheticRules,
+    SyntheticRules, Target,
 };
 use fmv_server::ff7::{open_battle_data, Ff7Source};
 use fmv_server::{BattleSettings, ServerConfig};
@@ -195,10 +195,10 @@ async fn spells_guards_and_items_replay_and_only_the_item_is_spent() {
     let fought = fight_with(&mut a, &rules, |state, me, turn| {
         let foe = first_enemy(state);
         match turn {
-            0 => Command::Magic { spell: 27, target: foe },
+            0 => Command::Magic { spell: 27, target: Target::One(foe) },
             1 => Command::Defend,
-            2 => Command::Item { item: 3, target: me },
-            3 => Command::Magic { spell: 0, target: me },
+            2 => Command::Item { item: 3, target: Target::One(me) },
+            3 => Command::Magic { spell: 0, target: Target::One(me) },
             _ => Command::Attack { target: foe },
         }
     })
@@ -208,10 +208,10 @@ async fn spells_guards_and_items_replay_and_only_the_item_is_spent() {
     assert_eq!(
         &fought.applied[..4],
         [
-            Command::Magic { spell: 27, target: ActorId(1) },
+            Command::Magic { spell: 27, target: Target::One(ActorId(1)) },
             Command::Defend,
-            Command::Item { item: 3, target: ActorId(0) },
-            Command::Magic { spell: 0, target: ActorId(0) },
+            Command::Item { item: 3, target: Target::One(ActorId(0)) },
+            Command::Magic { spell: 0, target: Target::One(ActorId(0)) },
         ]
     );
     // One Ether used: one inventory message, the Ether gone from the stack list.
@@ -233,21 +233,30 @@ async fn refused_commands_say_why_and_cost_nothing() {
     let fought = fight_with(&mut a, &rules, |state, me, turn| {
         let foe = first_enemy(state);
         match turn {
-            0 => Command::Item { item: 6, target: me },       // not usable in battle
-            1 => Command::Item { item: 7, target: me },       // Phoenix Down on a living one
-            2 => Command::Magic { spell: 99, target: foe },   // no such spell
-            3 => Command::Magic { spell: 0, target: foe },    // Cure on an enemy
-            4 => Command::Item { item: 20, target: foe },     // a Grenade: the account has none
+            0 => Command::Item { item: 8, target: Target::One(me) },       // not usable in battle
+            1 => Command::Item { item: 7, target: Target::One(me) },       // Phoenix Down on a living one
+            2 => Command::Magic { spell: 99, target: Target::One(foe) },   // no such spell
+            3 => Command::Magic { spell: 0, target: Target::One(foe) },    // Cure on an enemy
+            4 => Command::Item { item: 20, target: Target::One(foe) },     // a Grenade: the account has none
+            // Whole sides (protocol v8): the party's item aimed at one ally is no way to aim it, and the engine
+            // says so before the inventory is asked; Cure on every enemy is the wrong side; Megalixir on the
+            // party is a good command, which the account has no Megalixir for.
+            5 => Command::Item { item: 6, target: Target::One(me) },
+            6 => Command::Magic { spell: 0, target: Target::AllEnemies },
+            7 => Command::Item { item: 6, target: Target::AllAllies },
             _ => Command::Attack { target: foe },
         }
     })
     .await;
     assert_eq!(
-        &fought.refused[..5],
+        &fought.refused[..8],
         [
             BattleRejection::UnknownItem,
             BattleRejection::TargetNotDead,
             BattleRejection::UnknownSpell,
+            BattleRejection::InvalidTarget,
+            BattleRejection::OutOfItems,
+            BattleRejection::InvalidTarget,
             BattleRejection::InvalidTarget,
             BattleRejection::OutOfItems,
         ]
@@ -278,7 +287,7 @@ async fn a_used_item_is_gone_after_a_restart_and_the_starting_stock_is_not_given
     request(&mut a, 0).await;
     let fought = fight_with(&mut a, &rules, |state, me, turn| {
         if turn == 0 {
-            Command::Item { item: 0, target: me }
+            Command::Item { item: 0, target: Target::One(me) }
         } else {
             attack(state, me, turn)
         }
@@ -293,7 +302,7 @@ async fn a_used_item_is_gone_after_a_restart_and_the_starting_stock_is_not_given
     assert_eq!(joined_with(&mut a2).await, vec![(0, 2), (3, 1), (7, 1)], "what was saved, not the stock again");
     // And it goes on from there: the last Phoenix Down can be used... on nobody alive. Use two Potions.
     request(&mut a2, 0).await;
-    let second = fight_with(&mut a2, &rules, |state, me, turn| if turn < 2 { Command::Item { item: 0, target: me } } else { attack(state, me, turn) }).await;
+    let second = fight_with(&mut a2, &rules, |state, me, turn| if turn < 2 { Command::Item { item: 0, target: Target::One(me) } } else { attack(state, me, turn) }).await;
     assert_eq!(second.inventories, vec![vec![(0, 1), (3, 1), (7, 1)], vec![(3, 1), (7, 1)]]);
     drop(a2);
     again.shutdown().await;
@@ -399,7 +408,7 @@ async fn an_account_of_the_previous_version_gets_the_starting_stock_once() {
     let mut a = join_with_token(server.addr, &token).await;
     assert_eq!(joined_with(&mut a).await, STOCK.to_vec(), "the same stock again: nothing was written yet");
     request(&mut a, 0).await;
-    let used = fight_with(&mut a, &rules, |state, me, turn| if turn == 0 { Command::Item { item: 0, target: me } } else { attack(state, me, turn) }).await;
+    let used = fight_with(&mut a, &rules, |state, me, turn| if turn == 0 { Command::Item { item: 0, target: Target::One(me) } } else { attack(state, me, turn) }).await;
     assert_eq!(used.inventories, vec![vec![(0, 2), (3, 1), (7, 1)]]);
     drop(a);
     server.shutdown().await;
@@ -447,14 +456,14 @@ async fn real_data_spells_guards_and_items_replay_without_a_divergence_and_only_
     let fought = fight_with(&mut a, rules.as_ref(), |state, me, turn| {
         let foe = first_enemy(state);
         let spells = state.spells_for(me);
-        let heal = spells.iter().find(|s| s.targets_allies && state.check_command(me, &Command::Magic { spell: s.spell, target: me }).is_ok());
+        let heal = spells.iter().find(|s| s.targets_allies && state.check_command(me, &Command::Magic { spell: s.spell, target: Target::One(me) }).is_ok());
         let harm = spells.iter().find(|s| !s.targets_allies);
         assert!(state.item_info(potion).is_some(), "the engine knows the item the stock starts with");
         match (turn, heal, harm) {
             (0, ..) => Command::Defend,
-            (1, ..) => Command::Item { item: potion, target: me },
-            (2, Some(s), _) => Command::Magic { spell: s.spell, target: me },
-            (3, _, Some(s)) => Command::Magic { spell: s.spell, target: foe },
+            (1, ..) => Command::Item { item: potion, target: Target::One(me) },
+            (2, Some(s), _) => Command::Magic { spell: s.spell, target: Target::One(me) },
+            (3, _, Some(s)) => Command::Magic { spell: s.spell, target: Target::One(foe) },
             _ => Command::Attack { target: foe },
         }
     })
@@ -463,9 +472,9 @@ async fn real_data_spells_guards_and_items_replay_without_a_divergence_and_only_
     assert!(fought.refused.is_empty(), "every command was one the real engine accepts: {:?}", fought.refused);
     assert!(fought.applied.len() >= 4, "the four commands before the first attack were all applied: {:?}", fought.applied);
     assert_eq!(fought.applied[0], Command::Defend);
-    assert!(matches!(fought.applied[1], Command::Item { item, target } if item == potion && target == ActorId(0)), "{:?}", fought.applied[1]);
-    assert!(matches!(fought.applied[2], Command::Magic { target, .. } if target == ActorId(0)), "a healing spell on ourselves: {:?}", fought.applied[2]);
-    assert!(matches!(fought.applied[3], Command::Magic { target, .. } if target != ActorId(0)), "a damaging spell at an enemy: {:?}", fought.applied[3]);
+    assert!(matches!(fought.applied[1], Command::Item { item, target: Target::One(target) } if item == potion && target == ActorId(0)), "{:?}", fought.applied[1]);
+    assert!(matches!(fought.applied[2], Command::Magic { target, .. } if target == Target::One(ActorId(0))), "a healing spell on ourselves: {:?}", fought.applied[2]);
+    assert!(matches!(fought.applied[3], Command::Magic { target, .. } if target != Target::One(ActorId(0))), "a damaging spell at an enemy: {:?}", fought.applied[3]);
     let mut left = stock.clone();
     left[0].1 -= 1;
     if left[0].1 == 0 {

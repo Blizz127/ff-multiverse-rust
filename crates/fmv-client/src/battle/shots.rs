@@ -13,7 +13,7 @@
 //! up (no game data is read).
 
 use super::hud::BattleHud;
-use super::menu::{MenuItem, MenuKey, MenuLimit, MenuSpell, TargetRule};
+use super::menu::{MenuItem, MenuKey, MenuLimit, MenuSpell, Reach, TargetRule};
 use super::panels::{layout, Banner, Layout, RewardItem, RewardLine, DISABLED, PANEL_DELAY_MS};
 use super::popups::{Popup, PopupKind};
 use super::text::draw_battle_text;
@@ -308,6 +308,126 @@ fn offscreen_battle_target_selection() {
         let around = (ax as i32 - cell, ay as i32 - cell, ax as i32 + cell, ay as i32 + 4);
         assert!(count_near(&img, w, h, around, [ACCENT[0], ACCENT[1], ACCENT[2], 255], 6) > 20 * (l.s * l.s) as usize, "{w}x{h}: the pointer is over Barret");
         assert!(text_pixels(&img, w, h, &l, l.party, [ACCENT[0], ACCENT[1], ACCENT[2], 255]) > 15 * (l.s * l.s) as usize, "{w}x{h}: and his row in the party panel is marked");
+    }
+}
+
+/// Protocol v8: the pointer on ALL. The Magic list says how many whole-side casts are left, the status line says what
+/// ALL is, and a spell on every enemy (or the whole party) marks every one of them at once: an arrow over each head
+/// and each name in the list in the aimed colour.
+#[test]
+#[ignore = "needs a GPU or software Vulkan/GL driver"]
+fn offscreen_battle_target_all() {
+    let Some(mut gpu) = Shooter::new() else { return };
+    // Fire and Cure can hit a whole side (Barret has one All use); Meteor is the kind that only hits one.
+    let all_hud = || {
+        let mut hud = hud();
+        let model = hud.model_mut();
+        model.all_left = 1;
+        model.spells[0].reach = Reach::OneOrAll;
+        model.spells[3].reach = Reach::OneOrAll;
+        hud
+    };
+    let yellow = [ACCENT[0], ACCENT[1], ACCENT[2], 255];
+    for (w, h) in SIZES {
+        let l = layout(w, h, 3);
+        let one_cell = (l.s * l.s) as usize;
+        let cell = 8 * (l.s + 1);
+        let arrow_over = |img: &[u8], view: &BattleView, who: u8| {
+            let (ax, ay) = flat_anchors(view, w, h).of(view, ActorId(who)).expect("an anchor");
+            count_near(img, w, h, (ax as i32 - cell, ay as i32 - cell, ax as i32 + cell, ay as i32 + 4), yellow, 6)
+        };
+        // The Magic list: ALL x1 in the info colour, on the title row.
+        let mut hud = all_hud();
+        let view = pressed(&mut hud, &battle(), &[MenuKey::Down, MenuKey::Confirm]);
+        let img = gpu.shoot("07-magic-list-all", &view, w, h);
+        assert_windows(&img, w, h, &l, &[l.left, l.party]);
+        assert!(text_pixels(&img, w, h, &l, l.left, [INFO[0], INFO[1], INFO[2], 255]) > 5 * one_cell, "{w}x{h}: ALL x1 on the list's title row");
+
+        // Fire at the first enemy, then one step back: ALL. All three enemies are marked, the party is not.
+        let mut hud = all_hud();
+        let view = pressed(&mut hud, &battle(), &[MenuKey::Down, MenuKey::Confirm, MenuKey::Confirm, MenuKey::Left]);
+        let img = gpu.shoot("08-target-all-enemies", &view, w, h);
+        for who in [3, 4, 5] {
+            assert!(arrow_over(&img, &view, who) > 20 * one_cell, "{w}x{h}: a yellow arrow over enemy {who}");
+        }
+        assert_eq!(arrow_over(&img, &view, 0), 0, "{w}x{h}: and none over the party");
+        assert!(text_pixels(&img, w, h, &l, l.enemy, yellow) > 3 * 15 * one_cell, "{w}x{h}: every name in the enemy list is in the aimed colour");
+        assert!(count_near(&img, w, h, (0, 14, w as i32, 14 + 12 * l.s), yellow, 6) > 100, "{w}x{h}: the status line says what ALL is");
+
+        // Cure on the whole party: three arrows over the three members, their rows marked.
+        let mut hud = all_hud();
+        let view = pressed(&mut hud, &battle(), &[MenuKey::Down, MenuKey::Confirm, MenuKey::Down, MenuKey::Down, MenuKey::Down, MenuKey::Confirm, MenuKey::Left]);
+        let img = gpu.shoot("09-target-all-allies", &view, w, h);
+        for who in [0, 1, 2] {
+            assert!(arrow_over(&img, &view, who) > 20 * one_cell, "{w}x{h}: a yellow arrow over party member {who}");
+        }
+        assert!(text_pixels(&img, w, h, &l, l.party, yellow) > 3 * 8 * one_cell, "{w}x{h}: every member's row in the party panel is marked");
+    }
+}
+
+/// Protocol v9 and v10: the party side of the pointer is up to five rows. The canon Cloud and Barret, then three players (ours
+/// the third, so not actor 0), against two enemies: a Cure on Barret (a companion) marks one body and one row, and on ALL it
+/// marks all five of each, the companions and the players alike.
+#[test]
+#[ignore = "needs a GPU or software Vulkan/GL driver"]
+fn offscreen_battle_target_all_in_the_five_row_party() {
+    let Some(mut gpu) = Shooter::new() else { return };
+    let five = BattleView {
+        id: BattleId(1),
+        party: vec![
+            bar(0, "Cloud", 427, 427, 59, 59, 41_000, false, false),
+            bar(1, "Barret", 112, 480, 22, 40, 30_000, false, false),
+            bar(2, "Aria", 300, 390, 40, 50, 65_535, true, true),
+            bar(3, "Brom", 250, 300, 20, 30, 20_000, false, false),
+            bar(4, "Cato", 180, 340, 10, 30, 52_000, false, false),
+        ],
+        enemies: vec![bar(5, "Guard Hound", 55, 55, 0, 0, 0, false, false), bar(6, "Mono Drive", 140, 140, 0, 0, 0, false, false)],
+        status: Status::Verified,
+        ..BattleView::default()
+    };
+    // Ours is actor 2. Cure can hit one target or the whole party (one All use left).
+    let cure_hud = || {
+        let mut hud = BattleHud::new(None);
+        hud.begin(0, Some(ActorId(2)));
+        let model = hud.model_mut();
+        model.all_left = 1;
+        model.spells = vec![
+            MenuSpell::new(1, "Fire", 4, TargetRule::Enemies).with_reach(Reach::OneOrAll),
+            MenuSpell::new(4, "Cure", 5, TargetRule::Allies).with_reach(Reach::OneOrAll),
+        ];
+        hud
+    };
+    let yellow = [ACCENT[0], ACCENT[1], ACCENT[2], 255];
+    for (w, h) in SIZES {
+        let l = layout(w, h, 5);
+        let one_cell = (l.s * l.s) as usize;
+        let cell = 8 * (l.s + 1);
+        let arrow_over = |img: &[u8], view: &BattleView, who: u8| {
+            let (ax, ay) = flat_anchors(view, w, h).of(view, ActorId(who)).expect("an anchor");
+            count_near(img, w, h, (ax as i32 - cell, ay as i32 - cell, ax as i32 + cell, ay as i32 + 4), yellow, 6)
+        };
+        // Magic, Cure, and one step right of the first ally: Barret, a companion. One arrow, over him.
+        let mut hud = cure_hud();
+        let view = pressed(&mut hud, &five, &[MenuKey::Down, MenuKey::Confirm, MenuKey::Down, MenuKey::Confirm, MenuKey::Right]);
+        assert_eq!(view.menu.as_ref().and_then(|m| m.aim).and_then(|a| a.one()), Some(ActorId(1)), "the pointer is on Barret");
+        let img = gpu.shoot("10-five-row-cure-on-a-companion", &view, w, h);
+        assert!(arrow_over(&img, &view, 1) > 20 * one_cell, "{w}x{h}: a yellow arrow over Barret");
+        for who in [0, 2, 3, 4] {
+            assert_eq!(arrow_over(&img, &view, who), 0, "{w}x{h}: and none over party member {who}");
+        }
+        assert!(text_pixels(&img, w, h, &l, l.party, yellow) > 15 * one_cell, "{w}x{h}: and his row in the party panel is marked");
+
+        // One step left of the first ally is ALL: five arrows, five rows.
+        let mut hud = cure_hud();
+        let view = pressed(&mut hud, &five, &[MenuKey::Down, MenuKey::Confirm, MenuKey::Down, MenuKey::Confirm, MenuKey::Left]);
+        let img = gpu.shoot("11-five-row-cure-on-all", &view, w, h);
+        for who in 0..5 {
+            assert!(arrow_over(&img, &view, who) > 20 * one_cell, "{w}x{h}: a yellow arrow over party member {who}");
+        }
+        assert!(text_pixels(&img, w, h, &l, l.party, yellow) > 5 * 8 * one_cell, "{w}x{h}: every one of the five rows in the party panel is marked");
+        for who in [5, 6] {
+            assert_eq!(arrow_over(&img, &view, who), 0, "{w}x{h}: and none over enemy {who}");
+        }
     }
 }
 

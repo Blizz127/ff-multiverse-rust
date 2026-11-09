@@ -13,19 +13,27 @@
 //! always gives the same companion moves, and a bot-style one:
 //!
 //! 1. **Heal.** If a living member of the party (a player or another companion) is HURT, under half of its maximum
-//!    HP, the companion casts the cheapest restoring spell it knows and can pay for on the most hurt one (the lowest
-//!    fraction of its HP, the lowest actor id on a tie). A spell that raises the dead never qualifies (the engine
-//!    refuses it on someone who stands).
-//! 2. **Limit.** Else, if it has a limit break and the gauge is full, it gives it: a damaging one at the first living
-//!    enemy; a healing one (Healing Wind) only when somebody is hurt, so it is not wasted on a party that is fine.
+//!    HP, the companion casts the cheapest restoring spell it knows and can pay for on the most hurt one
+//!    ([`Target::One`]: the lowest fraction of its HP, the lowest actor id on a tie). A spell that raises the dead never
+//!    qualifies (the engine refuses it on someone who stands), and neither does one that can only be given to a whole
+//!    side (the engine refuses it on one actor: the companions do not cast on a whole side).
+//! 2. **Limit.** Else, if it has a limit break and the gauge is full, it gives it, aimed the way the limit's own
+//!    [`Aim`] says (whole-side targeting, protocol v10): a damaging one at the first living enemy ([`Target::One`]), or
+//!    at the whole enemy side ([`Target::AllEnemies`]) when that is the only way it is given; a healing one that takes
+//!    one ally at the most hurt one, and one that heals the whole party (Healing Wind) at the party
+//!    ([`Target::AllAllies`], companions and players alike), both only when somebody is hurt, so it is not wasted on a
+//!    party that is fine.
 //! 3. **Attack** the first living enemy.
 //!
 //! Every candidate is checked with `check_command` before it is chosen, so the command that comes out is one the
 //! engine accepts right now (MP, targets and all); `None` only when there is nothing to do at all (no living enemy).
 //! Defend, items and Escape are never chosen: the companions fight, and a companion that ran would end the
-//! players' battle for them.
+//! players' battle for them. A spell is never cast on a whole side (that costs an All materia use, and the rule
+//! has no use for the choice); only a limit that can be given no other way is.
 
-use fmv_ff7_battle::rules::{ActorId, BattleState, Combatant, Command};
+use fmv_ff7_battle::action::Aim;
+use fmv_ff7_battle::limit::LimitInfo;
+use fmv_ff7_battle::rules::{ActorId, BattleState, Combatant, Command, Target};
 
 /// Whether `c` is hurt enough to be healed: under half of its maximum HP.
 fn is_hurt(c: &Combatant) -> bool {
@@ -48,9 +56,10 @@ fn first_enemy(state: &BattleState) -> Option<ActorId> {
     state.enemy_ids().into_iter().find(|id| state.actor(*id).is_some_and(Combatant::is_alive))
 }
 
-/// Cast the cheapest restoring spell the actor can pay for on the most hurt member of the party.
+/// Cast the cheapest restoring spell the actor can pay for on the most hurt member of the party (one target: a spell
+/// that only ever hits a whole side fails the engine's check and is left out).
 fn heal(state: &BattleState, actor: ActorId) -> Option<Command> {
-    let target = most_hurt(state)?;
+    let target = Target::One(most_hurt(state)?);
     state
         .spells_for(actor)
         .into_iter()
@@ -60,11 +69,24 @@ fn heal(state: &BattleState, actor: ActorId) -> Option<Command> {
         .map(|s| Command::Magic { spell: s.spell, target })
 }
 
+/// Whom the limit break `info` is aimed at (what its [`Aim`] allows), or `None` when there is nobody worth it: a healing
+/// one only while somebody is hurt (the party at once for one that can only be given that way, else the most hurt
+/// one), a damaging one at the first living enemy (the whole enemy side only for one that can be given no other way).
+/// A limit of [`Aim::Random`] is never aimed: neither a command nor a menu can ask for it.
+fn limit_target(state: &BattleState, info: LimitInfo) -> Option<Target> {
+    match (info.targets_allies, info.aim) {
+        (_, Aim::Random) => None,
+        (true, Aim::Side) => most_hurt(state).map(|_| Target::AllAllies),
+        (true, Aim::One | Aim::OneOrSide) => most_hurt(state).map(Target::One),
+        (false, Aim::Side) => first_enemy(state).map(|_| Target::AllEnemies),
+        (false, Aim::One | Aim::OneOrSide) => first_enemy(state).map(Target::One),
+    }
+}
+
 /// Give the limit break when the gauge is full and there is something worth aiming it at.
 fn limit(state: &BattleState, actor: ActorId) -> Option<Command> {
     let info = state.limit_for(actor).filter(|_| state.limit_ready(actor))?;
-    let target = if info.targets_allies { most_hurt(state)? } else { first_enemy(state)? };
-    let command = Command::Limit { target };
+    let command = Command::Limit { target: limit_target(state, info)? };
     state.check_command(actor, &command).ok()?;
     Some(command)
 }
@@ -135,11 +157,11 @@ mod tests {
     fn it_heals_the_most_hurt_member_with_the_cheapest_restoring_spell_it_can_pay_for() {
         // Cloud (0) is fine, Barret (1) is at 30% and the player (2) at 40%: Barret is the most hurt.
         let state = battle(vec![fighter("Cloud", 200, 60), fighter("Barret", 60, 60), fighter("Player", 80, 60)], vec![foe(100)]);
-        assert_eq!(command(&state, ActorId(0)), Some(Command::Magic { spell: 0, target: ActorId(1) }), "Cure, on Barret");
+        assert_eq!(command(&state, ActorId(0)), Some(Command::Magic { spell: 0, target: Target::One(ActorId(1)) }), "Cure, on Barret");
         // Barret heals himself too when he is the one who is hurt.
-        assert_eq!(command(&state, ActorId(1)), Some(Command::Magic { spell: 0, target: ActorId(1) }));
+        assert_eq!(command(&state, ActorId(1)), Some(Command::Magic { spell: 0, target: Target::One(ActorId(1)) }));
         // Life (7) is never chosen: the engine refuses it on someone who stands.
-        assert!(state.check_command(ActorId(0), &Command::Magic { spell: 7, target: ActorId(1) }).is_err());
+        assert!(state.check_command(ActorId(0), &Command::Magic { spell: 7, target: Target::One(ActorId(1)) }).is_err());
         // Without the 5 MP Cure costs the companion attacks instead (Fire is no healing).
         let broke = battle(vec![fighter("Cloud", 200, 4), fighter("Barret", 60, 60)], vec![foe(100)]);
         assert_eq!(command(&broke, ActorId(0)), Some(Command::Attack { target: ActorId(2) }));
@@ -147,7 +169,7 @@ mod tests {
         let half = battle(vec![fighter("Cloud", 200, 60), fighter("Barret", 100, 60)], vec![foe(100)]);
         assert_eq!(command(&half, ActorId(0)), Some(Command::Attack { target: ActorId(2) }));
         let under = battle(vec![fighter("Cloud", 200, 60), fighter("Barret", 99, 60)], vec![foe(100)]);
-        assert_eq!(command(&under, ActorId(0)), Some(Command::Magic { spell: 0, target: ActorId(1) }));
+        assert_eq!(command(&under, ActorId(0)), Some(Command::Magic { spell: 0, target: Target::One(ActorId(1)) }));
         // A dead member is nobody's patient (a healing spell cannot help it).
         let dead = battle(vec![fighter("Cloud", 200, 60), fighter("Barret", 0, 60)], vec![foe(100)]);
         assert_eq!(command(&dead, ActorId(0)), Some(Command::Attack { target: ActorId(2) }));
@@ -156,7 +178,7 @@ mod tests {
     #[test]
     fn a_tie_between_the_hurt_goes_to_the_lowest_actor_id() {
         let state = battle(vec![fighter("Cloud", 200, 60), fighter("Barret", 50, 60), fighter("Player", 50, 60)], vec![foe(100)]);
-        assert_eq!(command(&state, ActorId(0)), Some(Command::Magic { spell: 0, target: ActorId(1) }));
+        assert_eq!(command(&state, ActorId(0)), Some(Command::Magic { spell: 0, target: Target::One(ActorId(1)) }));
     }
 
     #[test]
@@ -165,7 +187,7 @@ mod tests {
         cloud.limit = 255;
         let state = battle(vec![cloud.clone()], vec![foe(100), foe(100)]);
         assert!(state.limit_ready(ActorId(0)));
-        assert_eq!(command(&state, ActorId(0)), Some(Command::Limit { target: ActorId(1) }), "a damaging limit goes at the first living enemy");
+        assert_eq!(command(&state, ActorId(0)), Some(Command::Limit { target: Target::One(ActorId(1)) }), "a damaging limit goes at the first living enemy");
         // A gauge that is not full is an attack.
         cloud.limit = 254;
         let state = battle(vec![cloud], vec![foe(100)]);
@@ -174,7 +196,7 @@ mod tests {
         let mut cloud = fighter("Cloud", 200, 60);
         cloud.limit = 255;
         let state = battle(vec![cloud, fighter("Barret", 10, 60)], vec![foe(100)]);
-        assert_eq!(command(&state, ActorId(0)), Some(Command::Magic { spell: 0, target: ActorId(1) }));
+        assert_eq!(command(&state, ActorId(0)), Some(Command::Magic { spell: 0, target: Target::One(ActorId(1)) }));
     }
 
     #[test]
@@ -185,9 +207,91 @@ mod tests {
         // Nobody is hurt: a healing limit is not wasted, she attacks.
         let state = battle(vec![aerith.clone(), fighter("Cloud", 200, 0)], vec![foe(100)]);
         assert_eq!(command(&state, ActorId(0)), Some(Command::Attack { target: ActorId(2) }));
-        // Somebody is hurt and she has no MP to cast with: the limit heals.
+        // Somebody is hurt and she has no MP to cast with: the limit heals (Healing Wind is the whole party).
         let state = battle(vec![aerith, fighter("Cloud", 20, 0)], vec![foe(100)]);
-        assert_eq!(command(&state, ActorId(0)), Some(Command::Limit { target: ActorId(1) }));
+        assert_eq!(command(&state, ActorId(0)), Some(Command::Limit { target: Target::AllAllies }));
+    }
+
+    /// A fighter whose limit gauge is full and whose limit is `spec` (the one the test is about); it has no MP, so a
+    /// hurt member is the limit's business and not a Cure's.
+    fn with_limit(name: &str, hp: u32, spec: ActionSpec) -> Combatant {
+        let mut c = fighter(name, hp, 0);
+        c.limit = 255;
+        c.limit_break = Some(LimitBreak::new(128, spec, 40));
+        c
+    }
+
+    /// The limit's own [`Aim`] says how it is given (protocol v10): one target at the first living enemy, the whole
+    /// enemy side only for a limit that can be given no other way (one that may be either is given to one).
+    #[test]
+    fn a_damaging_limit_is_aimed_the_way_its_aim_says() {
+        let enemies = || vec![foe(100), foe(100)];
+        let aimed = |aim: Aim, foes: Vec<Combatant>| {
+            let state = battle(vec![with_limit("Cloud", 200, ActionSpec::limit_strike(48).with_aim(aim))], foes);
+            command(&state, ActorId(0))
+        };
+        let (first, second) = (ActorId(1), ActorId(2));
+        assert_eq!(aimed(Aim::One, enemies()), Some(Command::Limit { target: Target::One(first) }));
+        assert_eq!(aimed(Aim::One, vec![foe(0), foe(100)]), Some(Command::Limit { target: Target::One(second) }), "the first one is down");
+        assert_eq!(aimed(Aim::OneOrSide, enemies()), Some(Command::Limit { target: Target::One(first) }), "one target is the choice");
+        assert_eq!(aimed(Aim::Side, enemies()), Some(Command::Limit { target: Target::AllEnemies }));
+        assert_eq!(aimed(Aim::Side, vec![foe(0), foe(100)]), Some(Command::Limit { target: Target::AllEnemies }));
+        // A random aim cannot be asked for: the companion attacks instead of giving a command the engine refuses.
+        assert_eq!(aimed(Aim::Random, enemies()), Some(Command::Attack { target: first }));
+        // With every enemy down there is nobody to aim at, whatever the aim.
+        for aim in [Aim::One, Aim::OneOrSide, Aim::Side] {
+            assert_eq!(aimed(aim, vec![foe(0), foe(0)]), None, "{aim:?}");
+        }
+    }
+
+    /// A healing limit takes the most hurt one when it hits one ally and the whole party when that is the only way it is
+    /// given, and in both cases only while somebody is hurt (under half).
+    #[test]
+    fn a_healing_limit_is_aimed_the_way_its_aim_says_and_only_while_somebody_is_hurt() {
+        let party = |aim: Aim, hurt: u32| {
+            vec![with_limit("Aerith", 200, ActionSpec::limit_heal(16).with_aim(aim)), fighter("Cloud", 200, 0), fighter("Player", hurt, 0)]
+        };
+        let given = |aim: Aim, hurt: u32| command(&battle(party(aim, hurt), vec![foe(100)]), ActorId(0));
+        let (player, enemy) = (ActorId(2), ActorId(3));
+        assert_eq!(given(Aim::Side, 60), Some(Command::Limit { target: Target::AllAllies }));
+        assert_eq!(given(Aim::One, 60), Some(Command::Limit { target: Target::One(player) }), "the hurt player");
+        assert_eq!(given(Aim::OneOrSide, 60), Some(Command::Limit { target: Target::One(player) }));
+        // Exactly half is not hurt, so the limit waits and she attacks, whatever the aim.
+        for aim in [Aim::Side, Aim::One, Aim::OneOrSide] {
+            assert_eq!(given(aim, 100), Some(Command::Attack { target: enemy }), "{aim:?}");
+        }
+        // A random aim is never given.
+        assert_eq!(given(Aim::Random, 60), Some(Command::Attack { target: enemy }));
+    }
+
+    /// The party side of a whole-party limit is the whole roster: companions and players alike are healed (v9 puts up to
+    /// five fighters there), and a whole-enemy-side limit hits every living enemy and nobody of the party.
+    #[test]
+    fn a_whole_side_limit_hits_everybody_on_the_side_companions_and_players_alike() {
+        use fmv_ff7_battle::rules::BattleEvent;
+        // Aerith and Cloud are the companions here, two players follow; the last player is the one who is hurt.
+        let party = vec![
+            with_limit("Aerith", 200, ActionSpec::limit_heal(16)),
+            fighter("Cloud", 40, 0),
+            fighter("Player 1", 200, 0),
+            fighter("Player 2", 30, 0),
+        ];
+        let mut state = battle(party, vec![foe(100)]);
+        let given = command(&state, ActorId(0)).expect("somebody is hurt");
+        assert_eq!(given, Command::Limit { target: Target::AllAllies });
+        let events = state.submit_command(ActorId(0), given).expect("accepted");
+        let mut healed: Vec<u8> = events.iter().filter_map(|e| if let BattleEvent::Heal { target, .. } = e { Some(target.0) } else { None }).collect();
+        healed.sort_unstable();
+        assert_eq!(healed, [0, 1, 2, 3], "every member of the party side, the players too: {events:?}");
+
+        let party = vec![with_limit("Cloud", 200, ActionSpec::limit_strike(48).with_aim(Aim::Side)), fighter("Player", 200, 0)];
+        let mut state = battle(party, vec![foe(900), foe(900), foe(0)]);
+        let given = command(&state, ActorId(0)).expect("two enemies stand");
+        assert_eq!(given, Command::Limit { target: Target::AllEnemies });
+        let events = state.submit_command(ActorId(0), given).expect("accepted");
+        let mut hit: Vec<u8> = events.iter().filter_map(|e| if let BattleEvent::Damage { target, .. } = e { Some(target.0) } else { None }).collect();
+        hit.sort_unstable();
+        assert_eq!(hit, [2, 3], "the two living enemies and nobody else (not the fallen third, not the party): {events:?}");
     }
 
     #[test]
@@ -234,6 +338,55 @@ mod tests {
             let (outcome, log) = play(seed);
             assert!(outcome.is_some(), "seed {seed}: the battle ends");
             assert_eq!((outcome, log), play(seed), "seed {seed}: the same battle twice");
+        }
+    }
+
+    /// The same, for every way a limit can be aimed: whatever the limit's aim and kind, every command the rule gives in
+    /// every state of a played battle is one the engine accepts, and the limit really is given (so the whole-side
+    /// shapes are exercised, not only the attack the rule falls back to).
+    #[test]
+    fn every_limit_it_gives_is_accepted_by_the_engine_whatever_the_limit_aims_at() {
+        // (what it is, its spec, whether the rule aims it at a whole side)
+        let limits = [
+            ("strike", ActionSpec::limit_strike(48), false),
+            ("strike on either", ActionSpec::limit_strike(48).with_aim(Aim::OneOrSide), false),
+            ("strike on every enemy", ActionSpec::limit_strike(48).with_aim(Aim::Side), true),
+            ("heal one", ActionSpec::limit_heal(16).with_aim(Aim::One), false),
+            ("heal the party", ActionSpec::limit_heal(16), true),
+        ];
+        for (name, spec, whole) in limits {
+            let (mut given, mut whole_side) = (0, 0);
+            for seed in 0..12u64 {
+                // Two companions with the limit and a player behind them, against two enemies that hit often and hard
+                // enough to leave somebody under half of its HP long before the fight is over (a healing limit waits
+                // for that).
+                let party = vec![with_limit("Cloud", 200, spec), with_limit("Barret", 200, spec), fighter("Player", 200, 0)];
+                let mut brutes = vec![foe(500), foe(500)];
+                for brute in &mut brutes {
+                    brute.attack = 70;
+                    brute.dex = 90;
+                }
+                let config = BattleConfig { ticks_per_second: 1000, battle_speed: 0, ..BattleConfig::default() };
+                let mut state = BattleState::with_config(seed, party, brutes, config);
+                for _ in 0..20_000 {
+                    if state.outcome().is_some() {
+                        break;
+                    }
+                    state.step_ticks(7);
+                    // Only the two companions are driven by the rule, as in a battle.
+                    for actor in state.ready_actors().into_iter().filter(|a| a.0 < 2) {
+                        let Some(c) = command(&state, actor) else { continue };
+                        assert_eq!(state.check_command(actor, &c), Ok(()), "{name}, seed {seed}: {c:?} for {actor:?}");
+                        if let Command::Limit { target } = c {
+                            given += 1;
+                            whole_side += usize::from(target.is_side());
+                        }
+                        state.submit_command(actor, c).expect("accepted");
+                    }
+                }
+            }
+            assert!(given > 0, "{name}: the limit was given at least once in 12 battles");
+            assert_eq!(whole_side > 0, whole, "{name}: {whole_side} of {given} limits were aimed at a whole side");
         }
     }
 }

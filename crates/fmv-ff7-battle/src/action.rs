@@ -45,9 +45,26 @@
 //! The 16-bit special flags are **active low** (<https://wiki.ffrtt.ru/index.php/FF7/Battle/Special_Attack_Flags>):
 //! a cleared `0x0001` means the action hits MP instead of HP (Ether), a cleared `0x0100` that it only
 //! hits the dead (Life, Phoenix Down), a cleared `0x0400` that it ignores defense. Targeting bits
-//! (<https://wiki.ffrtt.ru/index.php/FF7/Battle/Targeting_Data>): `0x04` without `0x08` means the action
-//! can only hit a whole side at once, which a one-target command cannot ask for, so such a spell or item
-//! (Ultima, Megalixir) is left out; `0x20` is "short range" (halved against the back row).
+//! (<https://wiki.ffrtt.ru/index.php/FF7/Battle/Targeting_Data>): `0x04` is "multiple targets by default"
+//! and `0x08` "toggle multiple/single", which give an action's [`Aim`]: neither is one target, both is
+//! one target or a whole side (Cure, Fire: "All Tar/1 Tar", which needs the All materia when it is a
+//! spell), `0x04` alone is a whole side only ("All Tar (NS)": Ultima, Megalixir, Healing Wind) and `0x80`
+//! is a random target (not offered). `0x20` is "short range" (halved against the back row).
+//!
+//! # Hitting a whole side
+//!
+//! An action that hits more than one target is **split**: its damage (or healing) is multiplied by 2/3
+//! for every target ([`ActionSpec::splits`] says when). The rule is Terence Fergusson's *FF7 Battle
+//! Mechanics* FAQ (v1.10, "Formula Modifiers", Split Damage), and the disassembly-derived pseudocode at
+//! <https://wiki.ffrtt.ru/index.php/FF7/DamageFormula> ("SplitDamage") has the same structure: the
+//! physical formula (`1`) and Cure's (`5`) always split when they hit several targets, the spell formula
+//! (`2`) only when the spell can be toggled between one target and all of them (a forced whole side, "NS"
+//! for "No Split", has full strength), and the formulas of a fraction of HP (`3`, `4`), flat amounts (`6`,
+//! `7`) and "everything" (`8`) never split. A hit that has only one target is never split, even when it
+//! was aimed at "all" and one enemy was left. APPROXIMATION to note: the pseudocode page writes the
+//! split as `Damage * 3 / 2`, which is read as a transcription slip (the FAQ, the Final Fantasy Wiki and
+//! the community all say 2/3), and the same FAQ says the chance of a status that comes with a split
+//! attack is cut to 2/3 too, which matters only once statuses are modelled.
 //!
 //! # Elements
 //!
@@ -97,6 +114,50 @@ const TARGET_RANDOM: u8 = 0x80;
 pub enum ActionKind {
     Physical,
     Magical,
+}
+
+/// How many an action can be aimed at: the targeting bits `0x04`, `0x08` and `0x80` of its record (see the
+/// module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Aim {
+    /// One selected target (bit `0x04` clear): Potion, Comet, the Attack command.
+    One,
+    /// One target, or the whole side (`0x04` and `0x08`: FF7's "All Tar/1 Tar"): Cure, Fire. A party member
+    /// aims a spell of this kind at a whole side only while it has an All materia use left
+    /// ([`crate::rules::Combatant::all_left`]); an item or a limit of this kind needs nothing.
+    OneOrSide,
+    /// Only ever the whole side (`0x04` without `0x08`: "All Tar (NS)", No Split): Ultima, Megalixir,
+    /// Healing Wind. It needs no All materia and cannot be aimed at one target.
+    Side,
+    /// A random target (`0x80`): neither a command nor a menu can ask for it, so a spell or an item of this
+    /// kind is left out (an enemy's own attack of this kind is played as it always was, on one random
+    /// party member).
+    Random,
+}
+
+impl Aim {
+    /// The aim a record's targeting bits give.
+    pub fn from_target_flags(flags: u8) -> Self {
+        if flags & TARGET_RANDOM != 0 {
+            Aim::Random
+        } else if flags & TARGET_MULTI_DEFAULT == 0 {
+            Aim::One
+        } else if flags & TARGET_TOGGLE_MULTI != 0 {
+            Aim::OneOrSide
+        } else {
+            Aim::Side
+        }
+    }
+
+    /// Whether a command may aim an action of this kind at one target.
+    pub fn allows_one(self) -> bool {
+        matches!(self, Aim::One | Aim::OneOrSide)
+    }
+
+    /// Whether a command may aim an action of this kind at a whole side.
+    pub fn allows_side(self) -> bool {
+        matches!(self, Aim::OneOrSide | Aim::Side)
+    }
 }
 
 /// How an action's amount is computed (the low nybble of the damage-calculation byte, see the module
@@ -170,8 +231,8 @@ pub struct ActionSpec {
     pub short_range: bool,
     /// MP the action costs.
     pub mp_cost: u16,
-    /// Can only hit a whole side at once (or a random target), which one-target commands cannot ask for.
-    pub unaimable: bool,
+    /// How many it can be aimed at (see [`Aim`]).
+    pub aim: Aim,
 }
 
 impl ActionSpec {
@@ -190,12 +251,30 @@ impl ActionSpec {
             ignores_defense: false,
             short_range,
             mp_cost: 0,
-            unaimable: false,
+            aim: Aim::One,
         }
     }
 
-    /// A hand-made magical damage spell (Fire's kind: formula 2, an accuracy roll, one target): for rule
-    /// sets that have no game files (`SyntheticRules`) and for tests.
+    /// The same action aimed another way (`ActionSpec::cure_spell(..).with_aim(Aim::Side)`).
+    pub fn with_aim(self, aim: Aim) -> Self {
+        Self { aim, ..self }
+    }
+
+    /// Whether the action's damage or healing is multiplied by 2/3 when it hits more than one target (see
+    /// the module docs, "Hitting a whole side"): the physical formula and Cure's always, the spell formula
+    /// only for a spell that can be toggled between one target and all of them ([`Aim::OneOrSide`]), and
+    /// no other formula. A caller that hits one target never splits, whatever this says.
+    pub fn splits(&self) -> bool {
+        match self.formula {
+            Formula::Standard | Formula::Restore => true,
+            Formula::Spell => self.aim == Aim::OneOrSide,
+            Formula::CurrentHp | Formula::MaxHp | Formula::Flat | Formula::Fixed | Formula::Full => false,
+        }
+    }
+
+    /// A hand-made magical damage spell (Fire's kind: formula 2, an accuracy roll, one target or a whole
+    /// side, like the record's `0x0F`): for rule sets that have no game files (`SyntheticRules`) and for
+    /// tests.
     pub fn damage_spell(power: u32, accuracy: u32, element_mask: u16, mp_cost: u16) -> Self {
         Self {
             kind: ActionKind::Magical,
@@ -210,11 +289,12 @@ impl ActionSpec {
             ignores_defense: false,
             short_range: false,
             mp_cost,
-            unaimable: false,
+            aim: Aim::OneOrSide,
         }
     }
 
-    /// A hand-made restoring spell (Cure's kind: formula 5, restorative, aimed at an ally).
+    /// A hand-made restoring spell (Cure's kind: formula 5, restorative, aimed at an ally or the whole
+    /// party, like the record's `0x0D`).
     pub fn cure_spell(power: u32, mp_cost: u16) -> Self {
         Self {
             formula: Formula::Restore,
@@ -233,24 +313,39 @@ impl ActionSpec {
     }
 
     /// A hand-made damage item (Grenade's kind: `(512 - Defense) * power / 32` with variance, never misses,
-    /// no critical hit).
+    /// no critical hit, one enemy; [`ActionSpec::with_aim`] makes it Shrapnel's, which hits every enemy).
     pub fn damage_item(power: u32, element_mask: u16) -> Self {
         Self {
             kind: ActionKind::Physical,
             formula: Formula::Fixed,
             rolls_accuracy: false,
             can_crit: false,
+            aim: Aim::One,
             ..Self::damage_spell(power, 255, element_mask, 0)
         }
     }
 
-    /// A hand-made flat restoring item (Potion's kind: `20 * power` HP, or MP when `mp` is set).
+    /// A hand-made flat restoring item (Potion's kind: `20 * power` HP, or MP when `mp` is set; one ally).
     pub fn flat_restore_item(power: u32, mp: bool) -> Self {
         Self {
             formula: Formula::Flat,
             hits_mp: mp,
             rolls_accuracy: false,
+            aim: Aim::One,
             ..Self::cure_spell(power, 0)
+        }
+    }
+
+    /// A hand-made item that restores everything, HP and MP (Elixir's kind, one ally;
+    /// [`ActionSpec::with_aim`]`(`[`Aim::Side`]`)` makes it Megalixir's, which restores the whole party).
+    pub fn full_restore_item() -> Self {
+        Self {
+            kind: ActionKind::Physical,
+            formula: Formula::Full,
+            power: 32,
+            rolls_accuracy: false,
+            aim: Aim::One,
+            ..Self::cure_spell(32, 0)
         }
     }
 
@@ -271,7 +366,7 @@ impl ActionSpec {
             ignores_defense: false,
             short_range: false,
             mp_cost: 0,
-            unaimable: false,
+            aim: Aim::One,
         }
     }
 
@@ -281,9 +376,16 @@ impl ActionSpec {
         Self { kind: ActionKind::Magical, formula: Formula::Spell, element_mask, ..Self::limit_strike(power) }
     }
 
-    /// A limit break that heals one ally for `power / 32` of its max HP (16 is half; Healing Wind).
+    /// A limit break that heals the whole party, each ally for `power / 32` of its max HP (16 is half;
+    /// Healing Wind, whose record says "All Al (NS)": every ally at once, at full strength).
     pub fn limit_heal(power: u32) -> Self {
-        Self { kind: ActionKind::Magical, formula: Formula::MaxHp, element_mask: element::RESTORATIVE, ..Self::limit_strike(power) }
+        Self {
+            kind: ActionKind::Magical,
+            formula: Formula::MaxHp,
+            element_mask: element::RESTORATIVE,
+            aim: Aim::Side,
+            ..Self::limit_strike(power)
+        }
     }
 
     /// Decode an attack record (a spell of the kernel's attack table or an enemy's attack of
@@ -345,8 +447,6 @@ impl ActionSpec {
         if formula == Formula::Full && element_mask & element::RESTORATIVE == 0 {
             return None;
         }
-        let aimable =
-            target_flags & TARGET_MULTI_DEFAULT == 0 || target_flags & TARGET_TOGGLE_MULTI != 0;
         Some(Self {
             kind,
             formula,
@@ -360,7 +460,7 @@ impl ActionSpec {
             ignores_defense: special_flags & FLAG_IGNORES_DEFENSE == 0,
             short_range: target_flags & TARGET_SHORT_RANGE != 0,
             mp_cost,
-            unaimable: !aimable || target_flags & TARGET_RANDOM != 0,
+            aim: Aim::from_target_flags(target_flags),
         })
     }
 
@@ -392,11 +492,12 @@ impl Spell {
     }
 
     /// The spell for attack record `index`, or `None` if it is not one the rules can cast: it must be
-    /// magical, have a Power, hit one target (not a whole side), and have no extra effect.
+    /// magical, have a Power, not aim at a random target, and have no extra effect. A spell that hits a
+    /// whole side (Ultima) is one.
     pub fn from_attack(index: u16, rec: &AttackRecord) -> Option<Self> {
         let spec = ActionSpec::from_attack(rec)?;
         let castable =
-            spec.kind == ActionKind::Magical && !spec.unaimable && rec.extra_effect == 0xFF;
+            spec.kind == ActionKind::Magical && spec.aim != Aim::Random && rec.extra_effect == 0xFF;
         castable.then_some(Self { index, spec })
     }
 
@@ -406,6 +507,7 @@ impl Spell {
             spell: self.index,
             mp_cost: self.spec.mp_cost,
             targets_allies: self.spec.heals(),
+            aim: self.spec.aim,
         }
     }
 }
@@ -418,6 +520,9 @@ pub struct SpellInfo {
     pub mp_cost: u16,
     /// Aimed at the party (a restoring spell) instead of the enemies.
     pub targets_allies: bool,
+    /// One target, or a whole side too, or a whole side only (see [`Aim`]; a spell of
+    /// [`Aim::OneOrSide`] hits a whole side only while its caster has an All use left).
+    pub aim: Aim,
 }
 
 /// One of the attacks an enemy picks from: a damaging attack of its scene.
@@ -431,14 +536,14 @@ pub struct EnemyAction {
 impl EnemyAction {
     /// The enemy action for a scene attack, or `None` if it does not damage in a way the rules model
     /// (status-only, scripted, healing). The enemy attack command is always row-sensitive, and an enemy
-    /// aims by its own rules (one random party member here), so the record's targeting is ignored.
+    /// aims by its own rules (one random party member here), so the record's targeting does not choose
+    /// the target (it stays in [`ActionSpec::aim`] for the rules that decide whom an attack hits).
     pub fn from_scene(attack: &SceneAttack) -> Option<Self> {
         let mut spec = ActionSpec::from_attack(&attack.record)?;
         if spec.heals() {
             return None;
         }
         spec.short_range = spec.kind == ActionKind::Physical;
-        spec.unaimable = false;
         Some(Self {
             id: attack.id,
             spec,
@@ -520,13 +625,14 @@ impl ItemData {
     }
 
     /// The item for a kernel record, or `None` if it cannot be used in battle or is not modelled
-    /// (status cures, stat boosts, escape items, whole-party items).
+    /// (status cures, stat boosts, escape items, items that aim at a random target). An item that hits a
+    /// whole side (Megalixir, Shrapnel) is one.
     pub fn from_record(rec: &ItemRecord) -> Option<Self> {
         if !rec.usable_in_battle() {
             return None;
         }
         let spec = ActionSpec::from_item(rec)?;
-        (!spec.unaimable).then_some(Self { spec })
+        (spec.aim != Aim::Random).then_some(Self { spec })
     }
 
     pub fn kind(&self) -> ItemKind {
@@ -552,6 +658,7 @@ impl ItemData {
             kind,
             targets_allies: kind != ItemKind::Damage,
             revives: kind == ItemKind::Revive,
+            aim: self.spec.aim,
         }
     }
 }
@@ -568,6 +675,9 @@ pub struct ItemInfo {
     pub targets_allies: bool,
     /// Only a dead ally is a valid target (Phoenix Down).
     pub revives: bool,
+    /// One target, a whole side too (free to choose: an item needs no All materia), or a whole side only
+    /// (Megalixir, Shrapnel).
+    pub aim: Aim,
 }
 
 /// The items the rules can use in battle, by item index. Built once from the kernel and shared by
@@ -708,9 +818,9 @@ mod tests {
     }
 
     #[test]
-    fn the_flags_are_active_low_and_the_targeting_bits_decide_whether_it_can_be_aimed() {
-        // Cure (0x25, Power 5): restorative, hits HP, the living, aimable (0x0D: selection, whole side
-        // by default, toggle to one).
+    fn the_flags_are_active_low_and_the_targeting_bits_decide_how_it_can_be_aimed() {
+        // Cure (0x25, Power 5): restorative, hits HP, the living, one target or the whole side (0x0D:
+        // selection, whole side by default, toggle to one).
         let cure =
             ActionSpec::from_attack(&attack(0x25, 5, 255, 0x0D, element::RESTORATIVE, 0xFDFF))
                 .unwrap();
@@ -718,7 +828,7 @@ mod tests {
             cure.heals()
                 && !cure.hits_mp
                 && !cure.hits_dead
-                && !cure.unaimable
+                && cure.aim == Aim::OneOrSide
                 && !cure.ignores_defense
         );
         // Life: the dead only (bit 0x0100 cleared).
@@ -737,28 +847,20 @@ mod tests {
                 .unwrap()
                 .ignores_defense
         );
-        // Ultima (0x07): a whole side with no toggle; random targets (0x80) cannot be aimed either.
-        assert!(
-            ActionSpec::from_attack(&attack(0x22, 5, 100, 0x07, 0, 0xFFFF))
-                .unwrap()
-                .unaimable
-        );
-        assert!(
-            ActionSpec::from_attack(&attack(0x22, 5, 100, 0x81, 0, 0xFFFF))
-                .unwrap()
-                .unaimable
-        );
+        // Ultima (0x07): a whole side with no toggle ("All Tar (NS)"); random targets (0x80) are a kind of
+        // their own, whatever else the bits say.
+        let aim_of = |flags| ActionSpec::from_attack(&attack(0x22, 5, 100, flags, 0, 0xFFFF)).unwrap().aim;
+        assert_eq!(aim_of(0x07), Aim::Side);
+        assert_eq!(aim_of(0x05), Aim::Side, "Megalixir's bits");
+        assert_eq!(aim_of(0x81), Aim::Random);
+        assert_eq!(aim_of(0x87), Aim::Random, "multiple and random is still random");
         // Fire (0x0F: toggle) and Comet (0x03: one target) can be aimed; 0x20 is short range.
-        assert!(
-            !ActionSpec::from_attack(&attack(0x22, 5, 100, 0x0F, 0, 0xFFFF))
-                .unwrap()
-                .unaimable
-        );
-        assert!(
-            !ActionSpec::from_attack(&attack(0x22, 5, 100, 0x03, 0, 0xFFFF))
-                .unwrap()
-                .unaimable
-        );
+        assert_eq!(aim_of(0x0F), Aim::OneOrSide);
+        assert_eq!(aim_of(0x0D), Aim::OneOrSide);
+        assert_eq!(aim_of(0x03), Aim::One);
+        assert_eq!(aim_of(0x01), Aim::One);
+        assert_eq!(aim_of(0x08), Aim::One, "a toggle without the default is no way to hit everyone");
+        assert_eq!(aim_of(0x17), Aim::Side, "a summon's bits: the one-row bit does not matter here");
         assert!(
             ActionSpec::from_attack(&attack(0x11, 5, 100, 0x23, 0, 0xFFFF))
                 .unwrap()
@@ -791,15 +893,19 @@ mod tests {
             SpellInfo {
                 spell: 27,
                 mp_cost: 7,
-                targets_allies: false
+                targets_allies: false,
+                aim: Aim::OneOrSide
             }
         );
         let cure = Spell::from_attack(0, &attack(0x25, 5, 255, 0x0D, element::RESTORATIVE, 0xFDFF))
             .unwrap();
         assert!(cure.info().targets_allies);
-        // A physical record, a whole-side spell, a status and a spell with an extra effect are not spells.
+        // A whole-side spell (Ultima) is one, aimed at a whole side only.
+        let ultima = Spell::from_attack(52, &attack(0x22, 105, 100, 0x07, 0, 0xFFFD)).unwrap();
+        assert_eq!(ultima.info().aim, Aim::Side);
+        // A physical record, a random one, a status and a spell with an extra effect are not spells.
         assert!(Spell::from_attack(3, &attack(0x11, 24, 90, 0x03, 0, 0xFFFF)).is_none());
-        assert!(Spell::from_attack(52, &attack(0x22, 105, 100, 0x07, 0, 0xFFFD)).is_none());
+        assert!(Spell::from_attack(46, &attack(0x22, 30, 100, 0x87, 0, 0xFFFF)).is_none());
         assert!(Spell::from_attack(3, &attack(0x22, 0, 255, 0x0D, 0, 0xFDFF)).is_none());
         let mut odd = fire;
         odd.extra_effect = 3;
@@ -823,8 +929,8 @@ mod tests {
             EnemyAction::from_scene(&scene_attack(9, attack(0x22, 105, 100, 0x07, 0, 0xFFFF)))
                 .unwrap();
         assert!(
-            !ultima.spec.unaimable && !ultima.spec.short_range,
-            "an enemy picks its own target; magic ignores rows"
+            ultima.spec.aim == Aim::Side && !ultima.spec.short_range,
+            "an enemy picks its own target (the record's aim is kept); magic ignores rows"
         );
         // Healing and status attacks are not something an enemy is modelled to do.
         assert!(EnemyAction::from_scene(&scene_attack(
@@ -967,6 +1073,14 @@ mod tests {
             table.get(20).unwrap().spec,
             "Grenade"
         );
+        assert_eq!(ActionSpec::full_restore_item(), table.get(5).unwrap().spec, "Elixir");
+        // Megalixir is Elixir aimed at the whole party (its record also clears the hits-MP bit, which the
+        // "everything" formula does not look at).
+        assert_eq!(
+            ActionSpec { hits_mp: true, ..ActionSpec::full_restore_item().with_aim(Aim::Side) },
+            table.get(6).unwrap().spec,
+            "Megalixir"
+        );
         let hand = ItemTable::new([(0, ItemData::new(ActionSpec::flat_restore_item(5, false)))]);
         assert_eq!(hand.info(0).map(|i| i.kind), Some(ItemKind::RestoreHp));
         assert_eq!(
@@ -977,17 +1091,45 @@ mod tests {
         );
     }
 
+    /// Terence Fergusson's rule: the physical formula and Cure's split when they hit several targets, the
+    /// spell formula only when the spell can be toggled between one target and all of them ("NS", a forced
+    /// whole side, does not), and no other formula ever does.
+    #[test]
+    fn only_the_formulas_that_split_in_ff7_split_and_a_forced_whole_side_does_not() {
+        let spec = |formula, aim| ActionSpec { formula, aim, ..ActionSpec::damage_spell(8, 100, 0, 0) };
+        for aim in [Aim::One, Aim::OneOrSide, Aim::Side] {
+            assert!(spec(Formula::Standard, aim).splits(), "physical, {aim:?}");
+            assert!(spec(Formula::Restore, aim).splits(), "Cure, {aim:?}");
+            for never in [Formula::CurrentHp, Formula::MaxHp, Formula::Flat, Formula::Fixed, Formula::Full] {
+                assert!(!spec(never, aim).splits(), "{never:?}, {aim:?}");
+            }
+        }
+        assert!(spec(Formula::Spell, Aim::OneOrSide).splits(), "Fire on all");
+        assert!(!spec(Formula::Spell, Aim::Side).splits(), "Ultima is No Split");
+        assert!(!spec(Formula::Spell, Aim::One).splits());
+        // The kinds of record the tests name: Cure and Fire split, Ultima, Healing Wind and Megalixir do not.
+        assert!(ActionSpec::cure_spell(5, 5).splits() && ActionSpec::damage_spell(8, 100, element::FIRE, 4).splits());
+        assert!(!ActionSpec::limit_heal(16).splits());
+        assert!(!ActionSpec::full_restore_item().with_aim(Aim::Side).splits());
+        assert!(!ActionSpec::damage_spell(105, 100, 0, 130).with_aim(Aim::Side).splits());
+        // What may be aimed how.
+        assert!(Aim::One.allows_one() && !Aim::One.allows_side());
+        assert!(Aim::OneOrSide.allows_one() && Aim::OneOrSide.allows_side());
+        assert!(!Aim::Side.allows_one() && Aim::Side.allows_side());
+        assert!(!Aim::Random.allows_one() && !Aim::Random.allows_side());
+    }
+
     #[test]
     fn the_item_table_keeps_what_battle_can_use_and_says_what_each_does() {
         let kernel = Kernel::parse(&synthetic_kernel_bytes()).unwrap();
         let table = ItemTable::from_kernel(&kernel);
-        // Potion, Hi-Potion, X-Potion, Ether, Turbo Ether, Elixir, Phoenix Down, Grenade. Not: Megalixir
-        // (every ally at once), Antidote (a status), the item that forbids battle use, unused records.
+        // Potion, Hi-Potion, X-Potion, Ether, Turbo Ether, Elixir, Megalixir (every ally at once), Phoenix
+        // Down, Grenade. Not: Antidote (a status), the item that forbids battle use, unused records.
         assert_eq!(
             table.indexes().collect::<Vec<_>>(),
-            [0, 1, 2, 3, 4, 5, 7, 20]
+            [0, 1, 2, 3, 4, 5, 6, 7, 20]
         );
-        assert_eq!(table.len(), 8);
+        assert_eq!(table.len(), 9);
         assert!(!table.is_empty() && ItemTable::default().is_empty());
         let info = |i| table.info(i).unwrap();
         assert_eq!(
@@ -996,20 +1138,34 @@ mod tests {
                 item: 0,
                 kind: ItemKind::RestoreHp,
                 targets_allies: true,
-                revives: false
+                revives: false,
+                aim: Aim::One
             }
         );
         assert_eq!(info(2).kind, ItemKind::RestoreHp);
         assert_eq!(info(3).kind, ItemKind::RestoreMp);
         assert_eq!(info(4).kind, ItemKind::RestoreMp);
         assert_eq!(info(5).kind, ItemKind::RestoreAll);
+        // Megalixir is Elixir for the whole party: restores everything, aimed at a whole side only.
+        assert_eq!(
+            info(6),
+            ItemInfo {
+                item: 6,
+                kind: ItemKind::RestoreAll,
+                targets_allies: true,
+                revives: false,
+                aim: Aim::Side
+            }
+        );
+        assert_eq!(info(5).aim, Aim::One);
         assert_eq!(
             info(7),
             ItemInfo {
                 item: 7,
                 kind: ItemKind::Revive,
                 targets_allies: true,
-                revives: true
+                revives: true,
+                aim: Aim::One
             }
         );
         assert_eq!(
@@ -1018,10 +1174,11 @@ mod tests {
                 item: 20,
                 kind: ItemKind::Damage,
                 targets_allies: false,
-                revives: false
+                revives: false,
+                aim: Aim::One
             }
         );
-        for gone in [6u16, 8, 100, 127, 128, 9999] {
+        for gone in [8u16, 100, 127, 128, 9999] {
             assert!(table.info(gone).is_none(), "item {gone}");
         }
         // Potion: a flat heal that cannot miss; Ether hits MP; Phoenix Down hits the dead only.

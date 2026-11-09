@@ -823,7 +823,22 @@ impl MateriaRecord {
             _ => Vec::new(),
         }
     }
+
+    /// For the All materia ([`crate::rules::STARTER_ALL_MATERIA`]): how many times per battle it lets the
+    /// magic it is paired with hit a whole side at `level` (1 to 5). The record's attribute bytes 1 to 5
+    /// are those numbers (1, 2, 3, 4 and 5 on the Steam copy, matching the community's "once per battle at
+    /// level 1 ... five times at level 5"); `0xFF` is "none" like in a spell slot, and nothing is more
+    /// than [`MAX_ALL_USES`]. 0 for a level outside 1 to 5.
+    pub fn all_uses(&self, level: u8) -> u8 {
+        match self.attributes.get(usize::from(level)) {
+            Some(&uses) if (1..=5).contains(&level) && uses != 0xFF => uses.min(MAX_ALL_USES),
+            _ => 0,
+        }
+    }
 }
+
+/// The most times per battle any All materia lets a spell hit a whole side (its level 5).
+pub const MAX_ALL_USES: u8 = 5;
 
 /// Weapon record (section 5, 44 bytes): only the fields the battle rules use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1427,6 +1442,22 @@ mod tests {
         assert_eq!(k.magic_name(27).as_deref(), Some("Fire"));
         assert_eq!(k.materia_name(53).as_deref(), Some("Restore"));
         assert_eq!(k.magic_name(500), None);
+    }
+
+    #[test]
+    fn an_all_materia_gives_one_use_per_level_and_nothing_outside_one_to_five() {
+        let k = Kernel::parse(&synthetic_kernel_bytes()).unwrap();
+        let all = k.materia(23).unwrap();
+        assert_eq!(all.ap_levels, [15, 60, 180, 350], "1500, 6000, 18000 and 35000 AP");
+        assert_eq!((0..=6).map(|level| all.all_uses(level)).collect::<Vec<_>>(), [0, 1, 2, 3, 4, 5, 0]);
+        assert_eq!(all.level_for_ap(0), 1);
+        assert_eq!(all.level_for_ap(35_000), 5);
+        // A record that is not an All materia (every attribute byte is "none") gives none, and a corrupt one
+        // never gives more than the five of its top level.
+        assert_eq!(k.materia(22).unwrap().all_uses(1), 0);
+        let mut odd = all;
+        odd.attributes = [0x51, 9, 200, 0xFF, 5, 0];
+        assert_eq!((odd.all_uses(1), odd.all_uses(2), odd.all_uses(3), odd.all_uses(4), odd.all_uses(5)), (5, 5, 0, 5, 0));
     }
 
     #[test]

@@ -9,7 +9,7 @@
 //! * [`draw_battle_text`] is the same for the flat tokens: it takes their anchors from
 //!   [`flat_anchors`] and adds the names under them.
 
-use super::menu::{Level, MenuView};
+use super::menu::{AimAt, AimView, Level, MenuView, Reach};
 use super::panels::{draw_banner, draw_finale, draw_pointer, draw_popups, draw_windows, layout, DISABLED};
 use super::view::{cards, flat_anchors, Anchors, BattleView, Status, BAND_H};
 use crate::ui::draw::{DrawList, Rgba};
@@ -26,7 +26,14 @@ fn menu_line(menu: &MenuView) -> (&'static str, Rgba) {
     let line = match menu.level {
         Level::Commands => "YOUR TURN   Arrows: move   Enter: select",
         Level::Magic | Level::Items => "Enter: choose   Backspace: back",
-        Level::Target => "Arrows: pick a target   Enter: confirm   Backspace: back",
+        Level::Target => match menu.aim {
+            // A whole side, with no choice (Ultima, Megalixir, Healing Wind), or the pointer on ALL, or one step
+            // from it (see `menu`, "Whole sides").
+            Some(AimView { at: AimAt::All, reach: Reach::All, .. }) => "ALL targets   Enter: confirm   Backspace: back",
+            Some(AimView { at: AimAt::All, .. }) => "ALL targets   Arrows: back to one   Enter: confirm",
+            Some(AimView { reach: Reach::OneOrAll, .. }) => "Arrows: pick, past the last: ALL   Enter: confirm",
+            _ => "Arrows: pick a target   Enter: confirm   Backspace: back",
+        },
     };
     (line, ACCENT)
 }
@@ -113,7 +120,7 @@ pub fn draw_battle_text(view: &BattleView, vw: u32, vh: u32, out: &mut DrawList)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::battle::menu::{BattleMenu, BattleMenuModel, Ctx, Fighter, MenuKey, MenuSpell, TargetRule};
+    use crate::battle::menu::{BattleMenu, BattleMenuModel, Ctx, Fighter, MenuKey, MenuSpell, Reach, TargetRule};
     use crate::battle::panels::{Finale, RewardLine};
     use crate::battle::popups::{Popup, PopupKind};
     use crate::battle::view::Bar;
@@ -202,6 +209,39 @@ mod tests {
         v.menu = None;
         v.waiting_for_answer = true;
         assert_eq!(status_line(&v).0, "Waiting for the server...");
+    }
+
+    /// The line says how the arrows reach ALL when a spell can hit a whole side, and what ALL is once the pointer is
+    /// on it (nothing to move there when the action hits a whole side only).
+    #[test]
+    fn the_status_line_explains_the_all_place_of_the_pointer() {
+        let model = |reach| BattleMenuModel {
+            spells: vec![MenuSpell::new(1, "Fire", 4, TargetRule::Enemies).with_reach(reach)],
+            defend: true,
+            all_left: 1,
+            ..BattleMenuModel::default()
+        };
+        let line_after = |reach, keys: &[MenuKey]| {
+            let mut v = view(vec![bar(0, "Me", 10, 10, true, true, true)], vec![bar(1, "Foe", 5, 5, false, true, false), bar(2, "Foe", 5, 5, false, true, false)], Status::Verified);
+            let (a, e) = (vec![Fighter { id: ActorId(0), alive: true }], vec![Fighter { id: ActorId(1), alive: true }, Fighter { id: ActorId(2), alive: true }]);
+            let model = model(reach);
+            let ctx = Ctx { model: &model, allies: &a, enemies: &e, mp: 10 };
+            let mut menu = BattleMenu::default();
+            for k in [MenuKey::Down, MenuKey::Confirm, MenuKey::Confirm].iter().chain(keys) {
+                menu.press(*k, &ctx);
+            }
+            v.menu = Some(menu.view(&ctx));
+            status_line(&v).0
+        };
+        assert!(line_after(Reach::One, &[]).contains("pick a target"), "a spell of one target is as it was");
+        assert!(line_after(Reach::OneOrAll, &[]).contains("past the last: ALL"));
+        assert!(line_after(Reach::OneOrAll, &[MenuKey::Left]).starts_with("ALL targets") && line_after(Reach::OneOrAll, &[MenuKey::Left]).contains("back to one"));
+        let forced = line_after(Reach::All, &[]);
+        assert!(forced.starts_with("ALL targets") && !forced.contains("back to one") && forced.contains("Backspace"), "{forced}");
+        // None of them is longer than the line that was there (the window is at least 480 units wide, or 320 compact).
+        for line in [line_after(Reach::OneOrAll, &[]), line_after(Reach::OneOrAll, &[MenuKey::Left]), forced] {
+            assert!(line.len() <= 54, "{line}");
+        }
     }
 
     #[test]

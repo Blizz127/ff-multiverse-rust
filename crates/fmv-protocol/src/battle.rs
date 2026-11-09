@@ -32,7 +32,8 @@
 //! # Commands (v6)
 //!
 //! A party member whose gauge is full gives one [`Command`]: `Attack`, `Magic { spell, target }` (a
-//! spell it knows, which costs MP), `Item { item, target }` or `Defend`. The server checks it with the
+//! spell it knows, which costs MP), `Item { item, target }` or `Defend` (the `target` of a spell, an item or
+//! a limit is a [`Target`] since v8: one actor or a whole side, see "Whole-side targeting"). The server checks it with the
 //! engine (`BattleState::check_command`: gauge, target, MP, spell and item known) and, for an item, that
 //! the account owns one: the **engine knows no inventory**, so the server checks the count before it
 //! submits and takes the item only when the engine accepted the command. A client replays the very same
@@ -78,6 +79,32 @@
 //! none, so `BattleState::limit_for` is `None` for it and a peer shows no limit bar. The companions keep theirs
 //! and the server's rule uses them.
 //!
+//! # Whole-side targeting (v8)
+//!
+//! `Command::Magic`, `Command::Item` and `Command::Limit` carry a [`Target`] instead of an actor:
+//! `One(actor)`, `AllEnemies` or `AllAllies` (`Command::Attack` keeps its one `target`). The sides are named
+//! from the **commanding actor's** point of view, so a party member's `AllEnemies` is the enemy side and its
+//! `AllAllies` the party; an enemy's action (the AI of an enemy asks the same way) reads the other way round.
+//! On the wire it is `{"One":3}`, `"AllEnemies"` or `"AllAllies"`, and a bare number is the v7 shape, which a
+//! v8 peer does not read. What it takes to aim a command that way is the engine's, from the peer's own data
+//! (`fmv_ff7_battle::rules`, "Whole-side targeting"): the record's targeting bits say whether an action hits
+//! one target, a whole side or either (Cure, Fire: either; Ultima, Megalixir, Healing Wind: a whole side
+//! only), a spell that can do either needs an All materia use of its caster's (a count the engine keeps from
+//! the character's data, one per battle at level 1, so it is replayed and never sent), and an action that
+//! hits several targets splits its damage by 2/3.
+//!
+//! * **No new events.** A command on a whole side is one `Action` (and one `MpSpent`), followed by the
+//!   effects on each target in ascending actor order: one `Damage`, `Miss`, `Heal`, `MpRestored` or `Revive`
+//!   per target (and the `Death` and `LimitGauge` that follow its blow), then `Victory` or `Defeat` when the
+//!   last of them ended the battle. The replay checks every one of them like any other event, whole sides
+//!   included.
+//! * **Refusals.** A way of aiming the action does not allow, a side that is not the one it aims at and a
+//!   caster with no All use left are all `InvalidTarget`; a revival of a whole side with nobody fallen is
+//!   `TargetNotDead`. The menu offers none of them (it asks the engine), so they only answer a stale or a
+//!   hostile command.
+//! * An item command still spends one item, however many targets it hits (the server checks the count as it
+//!   always did).
+//!
 //! # Rewards
 //!
 //! [`split_rewards`] is a pure function of the engine's total reward and the ROSTER ([`reward_roster`]: every
@@ -95,7 +122,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use fmv_core::{AccountId, EntityId, Fingerprint, InventoryEntry};
-use fmv_ff7_battle::action::{ActionSpec, ItemData, ItemTable, Spell};
+use fmv_ff7_battle::action::{ActionSpec, Aim, ItemData, ItemTable, Spell};
 use fmv_ff7_battle::kernel::{
     CharacterId, Kernel, KernelError, ITEM_COUNT, MAX_AP, MAX_EXP, MAX_GIL, MAX_ITEM_STACK, MAX_KERNEL_BYTES, MAX_LEVEL,
 };
@@ -109,7 +136,7 @@ use serde::{Deserialize, Serialize};
 
 /// The engine types that travel in battle messages, re-exported so a peer can match on them
 /// without a direct dependency.
-pub use fmv_ff7_battle::rules::{ActionRef, ActorId, BattleEvent, Command, Outcome};
+pub use fmv_ff7_battle::rules::{ActionRef, ActorId, BattleEvent, Command, Outcome, Target};
 
 /// The random stream item drops are rolled on (the engine's own is [`fmv_ff7_battle::rng::DEFAULT_STREAM`]),
 /// so drops never depend on, or disturb, the replayed battle.
@@ -321,7 +348,8 @@ pub enum BattleRejection {
     /// The actor is dead.
     ActorDead,
     /// The target does not exist, or is on the wrong side for the action (damage goes to an enemy,
-    /// restoring to an ally).
+    /// restoring to an ally), or the action cannot be aimed that way (a whole side where it hits one target, one
+    /// target where it hits a whole side), or the actor has no All use left for a whole-side spell (protocol v8).
     InvalidTarget,
     /// The target is already dead.
     TargetDead,
@@ -1091,9 +1119,16 @@ pub const DEFAULT_LEVEL: u8 = 5;
 /// loses), `3` like `0` but with a preemptive layout, `4` one brute that kills a hero per hit (the
 /// party usually wins, with losses). Any `character` below 9 is a fighter whose strength grows
 /// with its level, who knows Cure (spell 0, 5 MP), Life (spell 7, 34 MP) and Fire (spell 27, 4 MP), and
-/// whose battles accept Potion (item 0), Ether (item 3), Phoenix Down (item 7) and Grenade (item 20). A new account starts
+/// whose battles accept Potion (item 0), Ether (item 3), Phoenix Down (item 7) and Grenade (item 20) (and see
+/// below for the whole-side items). A new account starts
 /// with 3 Potions, 1 Ether and 1 Phoenix Down; a won battle drops [`SyntheticRules::drop_item`], one per
 /// enemy, if it is set. The enemies only ever attack.
+///
+/// **Whole sides (v8).** Cure, Life and Fire are the kind a spell can be aimed at one target or a whole side
+/// with (the real records' `0x0D` and `0x0F`), and every fighter has one use of the All materia per battle
+/// ([`SyntheticRules::ALL_USES`], what the real kernel's level 1 gives), so each can cast one of them on a
+/// whole side. The item table also holds Megalixir (6: the whole party, everything restored) and Shrapnel (21:
+/// every enemy), which a test hands an account itself.
 ///
 /// **Limits and escape (v7).** Every companion (and, with [`SyntheticRules::player_limits`], every player's fighter:
 /// the real rules give players none, v9) has a limit that fills quickly (HP divisor 40): id 128, a
@@ -1124,14 +1159,21 @@ impl SyntheticRules {
     /// The fingerprint every synthetic rule set reports.
     pub const FINGERPRINT: Fingerprint = Fingerprint([0x5a; 32]);
 
-    /// The items of a synthetic battle: Potion (0), Ether (3), Phoenix Down (7) and Grenade (20, hurts an
-    /// enemy for about `512 * 10 / 32` = 160).
+    /// How many times a synthetic fighter may cast a spell on a whole side in a battle: the one use of an All
+    /// materia at level 1, like the real kernel's.
+    pub const ALL_USES: u8 = 1;
+
+    /// The items of a synthetic battle: Potion (0), Ether (3), Megalixir (6, the whole party), Phoenix Down
+    /// (7), Grenade (20, hurts an enemy for about `512 * 10 / 32` = 160) and Shrapnel (21, the same for every
+    /// enemy at once).
     pub fn item_table() -> Arc<ItemTable> {
         Arc::new(ItemTable::new([
             (0, ItemData::new(ActionSpec::flat_restore_item(5, false))),
             (3, ItemData::new(ActionSpec::flat_restore_item(5, true))),
-            (7, ItemData::new(ActionSpec::revive_spell(8, 0))),
+            (6, ItemData::new(ActionSpec::full_restore_item().with_aim(Aim::Side))),
+            (7, ItemData::new(ActionSpec::revive_spell(8, 0).with_aim(Aim::One))),
             (20, ItemData::new(ActionSpec::damage_item(10, element::SHOOT))),
+            (21, ItemData::new(ActionSpec::damage_item(10, element::SHOOT).with_aim(Aim::Side))),
         ]))
     }
 
@@ -1208,6 +1250,7 @@ impl BattleRules for SyntheticRules {
                 c.dex = 40;
                 c.accuracy = 100;
                 c.spells = Self::spells();
+                c.all_left = Self::ALL_USES;
                 c.limit = m.limit;
                 c.limit_break = (m.is_companion() || self.player_limits).then(|| match who {
                     CharacterId::Aeris => LimitBreak::new(142, ActionSpec::limit_heal(16), 40),
@@ -1440,14 +1483,14 @@ mod tests {
             assert!(state.limit_for(companion).is_some(), "{companion:?}: a canon companion has its limit break");
             assert_eq!(state.limit_gauge(companion), 255);
             assert!(state.limit_ready(companion));
-            assert_eq!(state.check_command(companion, &Command::Limit { target: enemy }), Ok(()));
+            assert_eq!(state.check_command(companion, &Command::Limit { target: Target::One(enemy) }), Ok(()));
         }
         for player in [ActorId(2), ActorId(3)] {
             assert!(state.ready_actors().contains(&player), "the player's turn is here");
             assert!(state.limit_for(player).is_none(), "{player:?}: a player has no limit break");
             assert_eq!(state.limit_gauge(player), 0, "a gauge a player was sent with is no gauge");
             assert!(!state.limit_ready(player));
-            assert_eq!(state.check_command(player, &Command::Limit { target: enemy }), Err(fmv_ff7_battle::rules::CommandError::NoLimit(player)));
+            assert_eq!(state.check_command(player, &Command::Limit { target: Target::One(enemy) }), Err(fmv_ff7_battle::rules::CommandError::NoLimit(player)));
         }
         // The synthetic switch gives the players one too, and the companions are the same either way.
         let with = SyntheticRules { player_limits: true, ..rules }.build(&setup).unwrap();
@@ -1614,13 +1657,13 @@ mod tests {
                 let dead = state.party_ids().into_iter().find(|a| state.actor(*a).is_some_and(|c| !c.is_alive()));
                 let candidates = [
                     enemy.map(|target| Command::Attack { target }),
-                    enemy.map(|target| Command::Magic { spell: 27, target }),
-                    Some(Command::Magic { spell: 0, target: id }),
+                    enemy.map(|target| Command::Magic { spell: 27, target: Target::One(target) }),
+                    Some(Command::Magic { spell: 0, target: Target::One(id) }),
                     Some(Command::Defend),
-                    Some(Command::Item { item: 0, target: id }),
-                    Some(Command::Item { item: 3, target: id }),
-                    dead.map(|target| Command::Item { item: 7, target }),
-                    dead.map(|target| Command::Magic { spell: 7, target }),
+                    Some(Command::Item { item: 0, target: Target::One(id) }),
+                    Some(Command::Item { item: 3, target: Target::One(id) }),
+                    dead.map(|target| Command::Item { item: 7, target: Target::One(target) }),
+                    dead.map(|target| Command::Magic { spell: 7, target: Target::One(target) }),
                 ];
                 let attack = enemy.map(|target| Command::Attack { target });
                 let Some(command) = candidates[turn % candidates.len()].filter(|c| state.check_command(id, c).is_ok()).or(attack) else {
@@ -1669,8 +1712,116 @@ mod tests {
         }
     }
 
+    /// Like `serve`, but every ready member gives a command that hits a whole side when it can: Fire on every
+    /// enemy, Cure or Megalixir on the whole party, Life on every fallen ally, Shrapnel on every enemy, and
+    /// otherwise one of the single-target commands.
+    fn serve_sides(state: &mut BattleState, slice: u64) -> Vec<Message> {
+        let mut log = Vec::new();
+        let mut turn = 0usize;
+        for _ in 0..100_000 {
+            if state.outcome().is_some() {
+                break;
+            }
+            let events = state.step_ticks(slice);
+            if !events.is_empty() {
+                log.push((state.tick(), events, None));
+            }
+            for id in state.ready_actors() {
+                if state.outcome().is_some() {
+                    break;
+                }
+                turn += 1;
+                let enemy = state.enemy_ids().into_iter().find(|e| state.actor(*e).is_some_and(|c| c.is_alive()));
+                let candidates = [
+                    Some(Command::Magic { spell: 27, target: Target::AllEnemies }),
+                    Some(Command::Magic { spell: 0, target: Target::AllAllies }),
+                    Some(Command::Item { item: 6, target: Target::AllAllies }),
+                    Some(Command::Magic { spell: 7, target: Target::AllAllies }),
+                    Some(Command::Item { item: 21, target: Target::AllEnemies }),
+                    enemy.map(|target| Command::Magic { spell: 27, target: Target::One(target) }),
+                ];
+                let attack = enemy.map(|target| Command::Attack { target });
+                let Some(command) = candidates[turn % candidates.len()].filter(|c| state.check_command(id, c).is_ok()).or(attack) else {
+                    break;
+                };
+                if let Ok(events) = state.submit_command(id, command) {
+                    log.push((state.tick(), events, Some(AppliedCommand { actor: id, command })));
+                }
+            }
+        }
+        log
+    }
+
+    /// A replay of a battle in which whole sides are hit (protocol v8): the same engine from the same setup
+    /// reproduces every message, the All use that a whole-side spell spends included, and a forged log that
+    /// asks for one more than a character has is refused.
+    #[test]
+    fn a_replay_of_a_battle_with_whole_side_commands_reproduces_it() {
+        let rules = SyntheticRules::default();
+        let (mut sides, mut spells_on_sides) = (0, 0);
+        for (seed, slice) in (0..40u64).zip([1u64, 5, 17, 100].into_iter().cycle()) {
+            let setup = BattleSetup { seed, ..setup(1, 3) };
+            let mut server = rules.build(&setup).unwrap();
+            let log = serve_sides(&mut server, slice);
+            assert!(server.outcome().is_some(), "seed {seed}");
+            let replay = replay_all(&rules, &setup, &log).unwrap_or_else(|d| panic!("seed {seed}: {d}"));
+            assert_eq!(replay.state(), &server, "seed {seed}: the replayed engine IS the server's engine");
+            replay.check_end(server.outcome().unwrap(), &replay.expected_rewards()).expect("the end agrees");
+            for (_, _, command) in &log {
+                if let Some(AppliedCommand { command: Command::Magic { target, .. } | Command::Item { target, .. }, .. }) = command {
+                    if target.is_side() {
+                        sides += 1;
+                    }
+                }
+                if matches!(command, Some(AppliedCommand { command: Command::Magic { target, .. }, .. }) if target.is_side()) {
+                    spells_on_sides += 1;
+                }
+            }
+        }
+        assert!(sides > 20 && spells_on_sides > 10, "{sides} whole-side commands, {spells_on_sides} of them spells");
+
+        // The forged log: a second whole-side spell from a character that had one use. The replay says the
+        // server applied something its own engine refuses.
+        let setup = setup(1, 1);
+        let mut server = rules.build(&setup).unwrap();
+        let mut log = Vec::new();
+        for _ in 0..2 {
+            for _ in 0..2000 {
+                if server.ready_actors().contains(&ActorId(0)) {
+                    break;
+                }
+                let events = server.step_ticks(10);
+                if !events.is_empty() {
+                    log.push((server.tick(), events, None));
+                }
+            }
+            let fire = Command::Magic { spell: 27, target: Target::AllEnemies };
+            if let Ok(events) = server.submit_command(ActorId(0), fire) {
+                log.push((server.tick(), events, Some(AppliedCommand { actor: ActorId(0), command: fire })));
+            }
+        }
+        // The server refused the second one, so the log has one; a forger adds the second to a replay.
+        let applied = log.iter().filter(|(_, _, c)| c.is_some()).count();
+        assert_eq!(applied, 1, "one use, one whole-side spell");
+        let mut forged = BattleReplay::start(&rules, &setup).unwrap();
+        for (tick, events, command) in &log {
+            forged.apply(*tick, events, command.as_ref()).expect("the honest part replays");
+        }
+        let again = AppliedCommand { actor: ActorId(0), command: Command::Magic { spell: 27, target: Target::AllEnemies } };
+        let mut ahead = forged.state().clone();
+        for _ in 0..2000 {
+            if ahead.ready_actors().contains(&ActorId(0)) {
+                break;
+            }
+            ahead.step_ticks(10);
+        }
+        let tick = ahead.tick();
+        let refused = forged.apply(tick, &[], Some(&again));
+        assert!(matches!(refused, Err(Divergence::CommandRefused(_)) | Err(Divergence::SilentTicksNotSilent { .. })), "{refused:?}");
+    }
+
     /// Like `serve`, but a ready member uses its limit when the engine says it is ready (a healing one on
-    /// the most wounded ally, a damaging one on the first living enemy), tries to escape on every
+    /// the whole party, a damaging one on the first living enemy), tries to escape on every
     /// `escape_every`-th turn and attacks otherwise.
     fn serve_limits(state: &mut BattleState, slice: u64, escape_every: usize) -> Vec<Message> {
         let mut log = Vec::new();
@@ -1689,12 +1840,7 @@ mod tests {
                 }
                 turn += 1;
                 let Some(enemy) = state.enemy_ids().into_iter().find(|e| state.actor(*e).is_some_and(|c| c.is_alive())) else { break };
-                let wounded = state
-                    .party_ids()
-                    .into_iter()
-                    .filter(|a| state.actor(*a).is_some_and(|c| c.is_alive()))
-                    .min_by_key(|a| state.actor(*a).map_or(0, |c| u64::from(c.hp) * 1000 / u64::from(c.max_hp.max(1))));
-                let limit = state.limit_for(id).filter(|_| state.limit_ready(id)).and_then(|l| if l.targets_allies { wounded } else { Some(enemy) });
+                let limit = state.limit_for(id).filter(|_| state.limit_ready(id)).map(|l| if l.targets_allies { Target::AllAllies } else { Target::One(enemy) });
                 let command = if turn.is_multiple_of(escape_every) {
                     Command::Escape
                 } else {
@@ -1781,14 +1927,14 @@ mod tests {
         // The server "applied" an escape at tick 0, when nobody can act: the engine refuses it.
         let refused = forged.apply(0, &[], Some(&AppliedCommand { actor: ActorId(0), command: Command::Escape }));
         assert!(matches!(refused, Err(Divergence::CommandRefused(_))), "{refused:?}");
-        let refused = forged.apply(0, &[], Some(&AppliedCommand { actor: ActorId(0), command: Command::Limit { target: ActorId(1) } }));
+        let refused = forged.apply(0, &[], Some(&AppliedCommand { actor: ActorId(0), command: Command::Limit { target: Target::One(ActorId(1)) } }));
         assert!(matches!(refused, Err(Divergence::CommandRefused(_))), "{refused:?}");
         // Make the actor ready, then run: the formation forbids it.
         while cannot.ready_actors().is_empty() {
             cannot.step_ticks(10);
         }
         assert_eq!(cannot.check_command(ActorId(0), &Command::Escape), Err(fmv_ff7_battle::rules::CommandError::CannotEscape));
-        assert_eq!(cannot.check_command(ActorId(0), &Command::Limit { target: ActorId(1) }), Err(fmv_ff7_battle::rules::CommandError::LimitNotReady(ActorId(0))));
+        assert_eq!(cannot.check_command(ActorId(0), &Command::Limit { target: Target::One(ActorId(1)) }), Err(fmv_ff7_battle::rules::CommandError::LimitNotReady(ActorId(0))));
     }
 
     #[test]
@@ -1812,7 +1958,7 @@ mod tests {
         let magic = log.iter().position(|(_, _, c)| matches!(c, Some(AppliedCommand { command: Command::Magic { .. }, .. }))).expect("a spell");
         let mut unknown = log.clone();
         if let Some(applied) = unknown[magic].2.as_mut() {
-            applied.command = Command::Magic { spell: 99, target: ActorId(2) };
+            applied.command = Command::Magic { spell: 99, target: Target::One(ActorId(2)) };
         }
         assert!(matches!(replay_all(&rules, &setup, &unknown), Err(Divergence::CommandRefused(_))));
     }
