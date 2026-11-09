@@ -66,6 +66,7 @@ use super::clips::{ClipSet, Kit, Slot};
 use super::effects::EffectKit;
 use crate::avatar::library::{AvatarAsset, AvatarLibrary};
 use crate::avatar::source::{CharacterLoader, LgpLoader, NON_PLAYABLE};
+use fmv_ff7::battle_model::script::Script;
 use fmv_ff7::battle_model::{BattleCharacter, BattleModel, BattleModelError, BattleModels};
 use fmv_ff7::model::{mat4_mul, mat4_translate, ModelBone};
 use fmv_ff7::playable::Character;
@@ -107,7 +108,7 @@ pub enum ModelRole {
     /// Nothing is known of its slots: it plays its idle loop and moves procedurally.
     #[default]
     Plain,
-    /// A playable character's model: the shared table of the nine characters.
+    /// A playable character's model: the shared slots of the nine characters and the blows of its own scripts.
     Character,
     /// An enemy's model: slot 1 is the hurt clip, its attacks are the ones [`BattleModelData::attacks`] names.
     Enemy,
@@ -134,6 +135,9 @@ pub struct BattleModelData {
     pub slot_ok: Arc<Vec<bool>>,
     /// An enemy's attacks: `scene.bin` attack id and the slot it plays ([`EnemyBook`]).
     pub attacks: Arc<Vec<(u16, u8)>>,
+    /// The model's animation scripts (`BattleModel::scripts`): what a character's blows are made of
+    /// ([`super::clips::Chain`]); none: they are procedural.
+    pub scripts: Arc<Vec<Script>>,
 }
 
 impl BattleModelData {
@@ -149,6 +153,7 @@ impl BattleModelData {
             role: ModelRole::Plain,
             slot_ok: Arc::new(Vec::new()),
             attacks: Arc::new(Vec::new()),
+            scripts: Arc::new(Vec::new()),
         }
     }
 
@@ -432,6 +437,7 @@ impl ArchiveModels {
         let key = loaded.prefix.clone();
         let mut data = BattleModelData::new(key.clone(), loaded.model, loaded.animations).with_role(role);
         data.slot_ok = Arc::new(loaded.slot_ok);
+        data.scripts = Arc::new(loaded.scripts);
         if let Some(weapon) = loaded.weapons.into_iter().next() {
             if !loaded.weapon_tracks.is_empty() {
                 data = data.with_attachment(Attachment::new(format!("{key}ck"), weapon, loaded.weapon_tracks));
@@ -839,7 +845,7 @@ impl Rigs {
         let fps = if battle.fps.is_finite() && battle.fps > 0.0 { battle.fps } else { BATTLE_CLIP_FPS };
         // A model whose idle is a still pose has no motion of its own to dress: it stays procedural.
         let kit = match (battle.role, procedural_idle) {
-            (ModelRole::Character, false) => Kit::party(clip_set(&battle.clips, &battle.slot_ok, fps)),
+            (ModelRole::Character, false) => Kit::party(clip_set(&battle.clips, &battle.slot_ok, fps), &battle.scripts),
             (ModelRole::Enemy, false) => Kit::enemy(clip_set(&battle.clips, &battle.slot_ok, fps), &battle.attacks),
             _ => Kit::none(),
         };

@@ -3,6 +3,8 @@
 
 use super::animation::tests::{build_pack, encode_clip};
 use super::animation::RawFrame;
+use super::script::tests::build_ab;
+use super::script::Script;
 use super::skeleton::tests::SkeletonSpec;
 use super::*;
 use crate::model::{mat4_identity, transform_point};
@@ -87,6 +89,11 @@ fn entries() -> Vec<(String, Vec<u8>)> {
             (1, 1, encode_clip(&[frame([-4, -280, 1], &[[0, 512, 0]])], 4, 1)),
         ]),
     );
+
+    // its animation scripts (invented): idle, a hurt that ends in the idle launch, a blow with a move (a made-up
+    // distance) and a damage marker, and a script that never ends
+    let attack: &[u8] = &[0x0A, 0xD1, 0x2C, 0x01, 0x00, 0x00, 0x05, 0x0B, 0xF7, 0x02, 0x0C, 0xFA, 0x0D, 0xEE];
+    add("rtab", build_ab(4, &[&[0x00, 0xFE, 0xC0], &[0x09, 0xEA, 0xEE], attack, &[0x01, 0x02]]));
 
     // locations 26 ("ba", code 0) and 27 ("bb", code 1): pieces, no animations
     let loc = |pieces: u32| SkeletonSpec { kind: 1, declared_bones: 0, pieces, textures: 2, animations: 0, weapons: 0, weapon_animations: 0, bones: vec![] };
@@ -218,6 +225,29 @@ fn a_single_bone_enemy_takes_one_angle_triple_whatever_the_clip_header_says() {
     assert_eq!(a.frame(1).unwrap().root_rotation, [90.0, 0.0, 0.0]);
     assert_eq!(a.frame(1).unwrap().rotations, vec![[0.0; 3]]);
     assert!(enemy.pose(0, 1).is_some());
+}
+
+#[test]
+fn a_models_animation_scripts_are_decoded_and_a_damaged_table_costs_only_the_scripts() {
+    let mut m = models();
+    let cloud = m.load_character(BattleCharacter::Cloud).unwrap();
+    assert_eq!(cloud.scripts.len(), 4);
+    assert_eq!(cloud.scripts[0].clips(), [0]);
+    assert_eq!(cloud.scripts[1].clips(), [0x09]);
+    // The blow: the clips in order, with the move and the damage marker between them.
+    assert_eq!(cloud.scripts[2].clips(), [0x0A, 0x0B, 0x0C, 0x0D]);
+    assert!(cloud.scripts[2].uses(0xD1) && cloud.scripts[2].uses(0xF7) && cloud.scripts[2].uses(0xFA));
+    assert!(cloud.scripts[2].terminated);
+    assert_eq!(cloud.scripts[3], Script::default(), "a script that does not end is not one");
+    // The MP's `ab` is eight zero bytes: no table, no scripts, and the model loads all the same.
+    let mp = m.load_enemy(16).unwrap();
+    assert!(mp.scripts.is_empty());
+    assert_eq!(mp.animations.len(), 3);
+    // A character without an `ab` entry loads too, and a location has none.
+    let bare = models_from(&without("rtab")).load_character(BattleCharacter::Cloud).unwrap();
+    assert!(bare.scripts.is_empty());
+    assert_eq!(bare.animations.len(), 3);
+    assert!(m.load_location(0).unwrap().scripts.is_empty());
 }
 
 #[test]
