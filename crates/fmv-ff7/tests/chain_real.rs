@@ -139,12 +139,14 @@ fn the_story_points_of_the_chain_are_the_ones_the_scripts_make() {
     let Some(adapter) = adapter() else { return };
     let kind = |t: &StoryTrigger| match t {
         StoryTrigger::Region(c) => format!("region({})", c.len()),
+        StoryTrigger::Press(c) => format!("press({})", c.len()),
+        StoryTrigger::Talk { .. } => "talk".to_string(),
         StoryTrigger::Line(..) => "line".to_string(),
         StoryTrigger::Enter => "entry".to_string(),
         _ => "other".to_string(),
     };
-    // what the field's scripts say (every field is loaded with the survey's loader, so that nmkin_5, which is not one
-    // of the reviewed fields, shows what its data holds; what a server offers of it is the next test's)
+    // what the field's scripts say (every field is loaded with the survey's loader; what a server offers of a field that
+    // is not reviewed is the next test's)
     let points = |field: &str| -> Vec<(String, String)> {
         let area = adapter.survey_field(field).unwrap();
         let served = adapter.load_area(field).unwrap().story_points();
@@ -163,19 +165,25 @@ fn the_story_points_of_the_chain_are_the_ones_the_scripts_make() {
     assert_eq!(points("md1_2"), one("entry", "entry: moment <8 -> 8"));
     assert_eq!(points("nrthmk"), one("entry", "entry: moment <10 -> 10"));
     assert_eq!(points("nmkin_1"), one("line", "line: moment <11 -> 11"));
+    // the lift's panel waits for the OK button: a press, not a region walked into
     assert_eq!(
         points("elevtr1"),
-        one("region(3)", "triangle 8 (OK): Var[1][225] bit 0 clear -> Var[1][225] bit 0 on; Var[1][225] bit 0 clear and moment <12 -> 12")
+        one("press(3)", "triangle 8 (OK): Var[1][225] bit 0 clear -> Var[1][225] bit 0 on; Var[1][225] bit 0 clear and moment <12 -> 12")
     );
     assert_eq!(points("nmkin_2"), one("entry", "entry: moment <13 -> 13"));
-    assert!(points("nmkin_3").is_empty(), "the woman who moves the story to 14 is talked to: nothing the server can see");
+    // the woman who moves the story to 14 is talked to (entity 4 of the field)
+    assert_eq!(points("nmkin_3"), one("talk", "talk to entity 4: the talk script moves the story"));
     assert!(points("nmkin_4").is_empty());
     assert_eq!(
         points("nmkin_5"),
         [
-            ("region(3)".to_string(), "triangle 2: moment <27 -> 27".to_string()),
+            // the guard scorpion: the triangle of the core starts battle 324 first and the step waits for the win
+            ("region(3)".to_string(), "triangle 2: moment <27 -> 27 (starts battle 324 first, the step is paid when it is won)".to_string()),
+            // the two points of the escape (moments 120 and 123: no account of the first mission is there)
             ("region(3)".to_string(), "triangle 2: moment ==123 -> 127".to_string()),
-            ("entry".to_string(), "entry: moment ==120 -> 123".to_string())
+            ("entry".to_string(), "entry: moment ==120 -> 123".to_string()),
+            // the materia on the floor (entity 6), taken by talking to it
+            ("talk".to_string(), "talk to entity 6: the talk script moves the story".to_string())
         ]
     );
 }
@@ -235,6 +243,7 @@ fn script_exits_and_story_points_of_the_archive_in_numbers() {
     let (mut open, mut closed, mut unjudged) = (0usize, 0usize, 0usize);
     let mut points: BTreeMap<String, usize> = BTreeMap::new();
     let (mut ok_points, mut fields_with_points) = (0usize, 0usize);
+    let (mut battle_first, mut walk_on_links, mut ok_links, mut fields_with_links) = (0usize, 0usize, 0usize, 0usize);
     for info in &areas {
         let area = adapter.survey_field(&info.id.key).unwrap();
         let exits = area.exits();
@@ -253,9 +262,16 @@ fn script_exits_and_story_points_of_the_archive_in_numbers() {
         }
         let p = area.story_points();
         fields_with_points += usize::from(!p.is_empty());
+        let links = area.links();
+        walk_on_links += links.iter().filter(|l| !l.needs_ok).count();
+        ok_links += links.iter().filter(|l| l.needs_ok).count();
+        fields_with_links += usize::from(!links.is_empty());
+        battle_first += p.iter().filter(|point| area.story_battle(point.id).is_some()).count();
         for point in &p {
             *points.entry(match point.trigger {
                 StoryTrigger::Region(_) => "region",
+                StoryTrigger::Press(_) => "press",
+                StoryTrigger::Talk { .. } => "talk",
                 StoryTrigger::Line(..) => "line",
                 StoryTrigger::Enter => "entry",
                 _ => "other",
@@ -265,10 +281,17 @@ fn script_exits_and_story_points_of_the_archive_in_numbers() {
             ok_points += usize::from(point.label.contains("(OK)"));
         }
     }
-    println!("{with_exits} fields with exits, {script} script exits (most {max_script} in {max_field}): new account open {open}, closed {closed}, unjudged {unjudged}; points {points:?} in {fields_with_points} fields, {ok_points} wanting OK");
+    println!("{with_exits} fields with exits, {script} script exits (most {max_script} in {max_field}): new account open {open}, closed {closed}, unjudged {unjudged}; points {points:?} in {fields_with_points} fields, {ok_points} wanting OK, {battle_first} starting a battle first; links {walk_on_links} walk-on and {ok_links} on OK in {fields_with_links} fields");
     assert_eq!((with_exits, script, max_script, max_field.as_str()), (558, 917, 88, "move_f"));
     assert_eq!((open, closed, unjudged), (324, 56, 537));
-    assert_eq!((points.get("region").copied(), points.get("line").copied(), points.get("entry").copied(), fields_with_points, ok_points), (Some(7), Some(20), Some(56), 66, 1));
+    // (a lift's panel is a press and a talk that moves the story is a talk point: 49 characters in the archive have one;
+    // two points start a fight first, and the ladders and jumps are 141 walk-on lines and 49 that wait for OK)
+    assert_eq!(
+        (points.get("region").copied(), points.get("press").copied(), points.get("talk").copied(), points.get("line").copied(), points.get("entry").copied()),
+        (Some(6), Some(1), Some(49), Some(20), Some(56))
+    );
+    assert_eq!((fields_with_points, ok_points, battle_first), (81, 1, 2));
+    assert_eq!((walk_on_links, ok_links, fields_with_links), (141, 49, 33));
 }
 
 /// The script exits of an area (the gateways are data and not counted).
@@ -281,19 +304,22 @@ fn gateways(area: &dyn AreaRuntime) -> Vec<Exit> {
     area.exits().into_iter().filter(|e| e.kind == ExitKind::Gateway).collect()
 }
 
-/// **The reviewed list** (`fmv_ff7::REVIEWED_FIELDS`). Only the eight fields of the mission offer their script exits and
-/// story points; every other field offers its gateways exactly as ever and leaves the rest off, saying what it left off
-/// and why. Over the whole archive: gateways are the same everywhere, a field that is not reviewed has no script exit
-/// and no point and no step a point could take for any story, its phases are what they were, and what it says it left
-/// off is exactly what its data holds. The data holds 917 script exits and 83 points; the eight fields offer 4 and 8
-/// of them (the lift's four exits and the mission's eight points), the other 274 fields that have any leave off 913 and 75.
+/// **The reviewed list** (`fmv_ff7::REVIEWED_FIELDS`). Only the ten fields of the mission offer their script exits,
+/// story points and links; every other field offers its gateways exactly as ever and leaves the rest off, saying what it
+/// left off and why. Over the whole archive: gateways are the same everywhere, a field that is not reviewed has no script
+/// exit, no point, no link and no step a point could take for any story, its phases are what they were, and what it says
+/// it left off is exactly what its data holds. The data holds 917 script exits, 132 points and 190 links; the ten
+/// fields offer 4, 13 and 11 of them (the lift's four exits, the mission's thirteen points, and the ladders and jumps of
+/// `nmkin_2`, `nmkin_3` and `nmkin_4`), the other fields that have any leave off the rest (see the numbers asserted at the
+/// end).
 #[test]
 #[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
 fn the_fields_that_are_not_reviewed_offer_their_gateways_and_nothing_else_of_the_story() {
     let Some(adapter) = adapter() else { return };
     // (the list itself is pinned by `the_reviewed_list_is_the_first_reactor_mission_and_nothing_else` in the crate's own
     // tests; a field that joins it changes the numbers asserted at the end, which is the review's last step)
-    let (mut offered, mut left_off, mut fields_left_off) = ((0usize, 0usize), (0usize, 0usize), 0usize);
+    // (script exits, points, links)
+    let (mut offered, mut left_off, mut fields_left_off) = ((0usize, 0usize, 0usize), (0usize, 0usize, 0usize), 0usize);
     let blobs = [Vec::new(), StoryState::at(13).encode(), StoryState::at(33).encode(), StoryState::at(120).encode()];
     for info in adapter.list_areas() {
         let key = info.id.key.as_str();
@@ -305,15 +331,18 @@ fn the_fields_that_are_not_reviewed_offer_their_gateways_and_nothing_else_of_the
         for blob in &blobs {
             assert_eq!(served.phase_key(blob), surveyed.phase_key(blob), "{key}: phases");
         }
-        let (exits, points) = (script_exit_count(&surveyed), surveyed.story_points().len());
+        let (exits, points, links) = (script_exit_count(&surveyed), surveyed.story_points().len(), surveyed.links().len());
         if fmv_ff7::is_reviewed_field(key) {
             assert_eq!(served.exits(), surveyed.exits(), "{key}");
             assert_eq!(served.story_points(), surveyed.story_points(), "{key}");
+            assert_eq!(served.links(), surveyed.links(), "{key}");
             assert_eq!(served.story_withheld(), None, "{key}: a reviewed field leaves nothing off");
-            offered = (offered.0 + exits, offered.1 + points);
+            offered = (offered.0 + exits, offered.1 + points, offered.2 + links);
         } else {
             assert_eq!(script_exit_count(served.as_ref()), 0, "{key}: no script exit is offered");
             assert!(served.story_points().is_empty(), "{key}: no story point is offered");
+            assert!(served.links().is_empty(), "{key}: no link is offered");
+            assert!((0..8).all(|id| served.story_battle(id).is_none()), "{key}: no scripted battle is offered");
             // no step either, whichever point and whichever story (a server only asks about the points it was told of)
             for blob in &blobs {
                 for id in 0..8 {
@@ -322,17 +351,17 @@ fn the_fields_that_are_not_reviewed_offer_their_gateways_and_nothing_else_of_the
             }
             match served.story_withheld() {
                 Some(w) => {
-                    assert_eq!((w.reason.as_str(), w.exits.len(), w.points.len()), ("unreviewed field", exits, points), "{key}");
-                    left_off = (left_off.0 + exits, left_off.1 + points);
+                    assert_eq!((w.reason.as_str(), w.exits.len(), w.points.len(), w.links.len()), ("unreviewed field", exits, points, links), "{key}");
+                    left_off = (left_off.0 + exits, left_off.1 + points, left_off.2 + links);
                     fields_left_off += 1;
                 }
-                None => assert_eq!((exits, points), (0, 0), "{key}: it says nothing only when there was nothing to leave off"),
+                None => assert_eq!((exits, points, links), (0, 0, 0), "{key}: it says nothing only when there was nothing to leave off"),
             }
         }
     }
-    println!("offered by the reviewed fields: {offered:?} (script exits, points); left off in {fields_left_off} other fields: {left_off:?}");
-    assert_eq!(offered, (4, 8));
-    assert_eq!((left_off, fields_left_off), ((913, 75), 274));
+    println!("offered by the reviewed fields: {offered:?} (script exits, points, links); left off in {fields_left_off} other fields: {left_off:?}");
+    assert_eq!(offered, (4, 13, 11));
+    assert_eq!((left_off, fields_left_off), ((913, 119, 179), 299));
 }
 
 /// The cases that matter, named: the entry point of a Sector 8 field that raises a story from 33 to 36 the moment a
@@ -359,12 +388,21 @@ fn an_unreviewed_entry_point_does_not_fire_and_the_fields_beyond_the_mission_say
     assert_eq!(md8_4.story_withheld(), None);
     assert_eq!(md8_4.exits().iter().map(|e| e.target.as_str()).collect::<Vec<_>>(), ["nrthmk"]);
 
-    // nmkin_5 (the reactor's core): three points, none offered; nmkin_4 has none to leave
-    let nmkin_5 = adapter.load_area("nmkin_5").unwrap();
-    assert!(nmkin_5.story_points().is_empty());
-    let w = nmkin_5.story_withheld().expect("nmkin_5 leaves its points off");
-    assert_eq!(w.points, ["triangle 2: moment <27 -> 27", "triangle 2: moment ==123 -> 127", "entry: moment ==120 -> 123"]);
-    assert_eq!(adapter.load_area("nmkin_4").unwrap().story_withheld(), None);
+    // ujunon2: one entry point that starts a scripted fight first (battle 480, the step paid on the win). The survey
+    // sees it, with its battle; the server's field has neither the point nor the fight
+    let surveyed = adapter.survey_field("ujunon2").unwrap();
+    assert_eq!(surveyed.story_points().len(), 1);
+    assert_eq!(surveyed.story_battle(0), Some(480), "the data holds the fight");
+    let served = adapter.load_area("ujunon2").unwrap();
+    assert!(served.story_points().is_empty());
+    assert_eq!(served.story_battle(0), None, "a fight nobody reviewed is not started");
+    let w = served.story_withheld().expect("ujunon2 leaves its point off");
+    assert_eq!(w.points, ["entry: moment <388 -> 388 (starts battle 480 first, the step is paid when it is won)"]);
+
+    // the reactor's core and the stair before it are reviewed: nothing of them is left off
+    for field in ["nmkin_4", "nmkin_5"] {
+        assert_eq!(adapter.load_area(field).unwrap().story_withheld(), None, "{field}");
+    }
 
     // move_f: 88 script exits, none offered, all named (the log lists the first few and counts the rest)
     let move_f = adapter.load_area("move_f").unwrap();
@@ -407,26 +445,58 @@ fn triangles_at(mesh: &fmv_ff7::field::Walkmesh, exit: &Exit) -> Vec<usize> {
     found.into_iter().collect()
 }
 
-/// **How far the walkmesh carries the party.** From the triangle each hop of the chain puts it on, the triangles of
-/// the next hop's line are walkable (through the access words, which is the rule every move the server accepts
-/// follows), down to `nmkin_3`: the panel and the lift's line in `elevtr1`, the way on from `nmkin_2`. And no further.
-/// `nmkin_3`'s arrival is on its upper level and only 6 of the field's 46 triangles can be walked to from it: the way
-/// down to `nmkin_4` is scripted (a jump over a gap, then two ladders: `JUMP` and `LADER` instructions on the lines'
-/// scripts, which the walkmesh does not link). `nmkin_4`'s arrival is a pocket too (22 of its 40 triangles; the
-/// field has a ladder of its own, a `LADER` between two levels, and its gateway to `nmkin_5` is not among the
-/// triangles walkable from the arrival). So the first mission's walkable part of the world ends at `nmkin_3` and the
-/// ladders are the next gap. (The access words are the truth. The client's grid planner (`nav.rs`) used to put its
-/// nodes at height 0 and so planned over the wrong level of a stacked mesh: it found no way down `nmkin_2`'s stair
-/// and claimed one from `nmkin_4` to `nmkin_5`. It now keeps the level with every node and agrees with this test:
-/// a plan down the stair, none past `nmkin_3`.)
+
+/// The triangles of `mesh` that a walker can get to from the triangles of `start`, over the access words and over the
+/// links (ladders and jumps) of `area` whose line the walker can touch: a sample along the line lies in a triangle it
+/// can stand on, at the line's level (the height of the triangle there within `Link::LEVEL` of the line's). A link puts
+/// the walker on the triangle its destination names, from which it walks on. (OK links count: a press is a key, not a
+/// place.)
+fn reach_with_links(area: &fmv_ff7::Ff7FieldArea, start: usize) -> std::collections::BTreeSet<usize> {
+    use fmv_adapter_api::Link;
+    let mesh = area.walkmesh();
+    let mut reach = walkable_from(mesh, start);
+    let links = area.links();
+    loop {
+        let before = reach.len();
+        for link in &links {
+            let (a, b) = link.line;
+            let touched = (0..=24).any(|k| {
+                let t = k as f32 / 24.0;
+                let (x, y, z) = (a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t);
+                reach.iter().any(|&tri| {
+                    let vertices = &mesh.triangles[tri];
+                    let (px, py) = (x.round() as i32, y.round() as i32);
+                    fmv_ff7::script::triangle_contains_xy(vertices, px, py)
+                        && fmv_ff7::script::triangle_height_at(vertices, px, py).is_some_and(|h| (h as f32 - z).abs() <= Link::LEVEL)
+                })
+            });
+            if touched {
+                let to = usize::try_from(link.to_hint.expect("a link names the triangle it leads to")).unwrap();
+                reach.extend(walkable_from(mesh, to));
+            }
+        }
+        if reach.len() == before {
+            return reach;
+        }
+    }
+}
+
+/// **How far the walkmesh and the links carry the party.** From the triangle each hop of the chain puts it on, the
+/// triangles of the next hop's line are reachable on foot through the access words (which is the rule every move the
+/// server accepts follows), along the whole first mission: the panel and the lift's line in `elevtr1`, the way on from
+/// `nmkin_2`, and, once the ladders and jumps are counted, the way down from `nmkin_3` (`JUMP`s over a gap and two
+/// ladders) and from `nmkin_4` (a ladder) to the reactor's core. WITHOUT the links the walkmesh alone ends at `nmkin_3`:
+/// its arrival is on the upper level and only 6 of the field's 46 triangles can be walked to from it, and `nmkin_4`'s
+/// arrival is a pocket too (22 of its 40 triangles; the gateway to `nmkin_5` is not among them). (The access words are
+/// the truth for walking. The client's grid planner (`nav.rs`) keeps the level with every node and agrees with this.)
 #[test]
 #[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
-fn the_walkmesh_carries_the_party_down_to_nmkin_3_and_no_further() {
+fn the_walkmesh_and_the_links_carry_the_party_down_to_the_reactors_core() {
     let Some(adapter) = adapter() else { return };
     let load = |field: &str| adapter.load_field(field).unwrap();
     let exit_to = |area: &fmv_ff7::Ff7FieldArea, target: &str| area.exits().into_iter().find(|e| e.target == target).unwrap_or_else(|| panic!("no exit to {target}"));
-    // (field the party stands in, the field it came from, the exit it walks to, whether it can)
-    let hops: [(&str, &str, &str, bool); 8] = [
+    // (field the party stands in, the field it came from, the exit it walks to, whether it can on foot alone)
+    let hops: [(&str, &str, &str, bool); 9] = [
         ("md1stin", "", "md1_1", true),
         ("md1_1", "md1stin", "md1_2", true),
         ("md1_2", "md1_1", "nrthmk", true),
@@ -435,8 +505,10 @@ fn the_walkmesh_carries_the_party_down_to_nmkin_3_and_no_further() {
         ("nmkin_2", "elevtr1", "nmkin_3", true),
         ("nmkin_3", "nmkin_2", "nmkin_4", false),
         ("nmkin_4", "nmkin_3", "nmkin_5", false),
+        // (the core has no onward gateway: it is walked to the way back, nmkin_4, which is where the party arrived)
+        ("nmkin_5", "nmkin_4", "nmkin_4", true),
     ];
-    for (field, from, to, can) in hops {
+    for (field, from, to, on_foot) in hops {
         let area = load(field);
         let mesh = area.walkmesh();
         // the triangle the party starts on: the arrival's own (the hint), or under the spawn in the first field
@@ -452,9 +524,12 @@ fn the_walkmesh_carries_the_party_down_to_nmkin_3_and_no_further() {
         let wanted = triangles_at(mesh, &goal);
         assert!(!wanted.is_empty(), "{field}: the line to {to} is on the mesh");
         let reach = walkable_from(mesh, start);
-        let reached = wanted.iter().any(|t| reach.contains(t));
-        println!("{field}: from triangle {start} ({} walkable) to the line to {to} (triangles {wanted:?}): {reached}", reach.len());
-        assert_eq!(reached, can, "{field}: from where the party arrives to the exit to {to}");
+        let reached_on_foot = wanted.iter().any(|t| reach.contains(t));
+        let with_links = reach_with_links(&area, start);
+        let reached = wanted.iter().any(|t| with_links.contains(t));
+        println!("{field}: from triangle {start} ({} on foot, {} with the links) to the line to {to} (triangles {wanted:?}): on foot {reached_on_foot}, with links {reached}", reach.len(), with_links.len());
+        assert_eq!(reached_on_foot, on_foot, "{field}: from where the party arrives to the exit to {to}, walking only");
+        assert!(reached, "{field}: with the ladders and jumps the party gets to the exit to {to}");
     }
     // elevtr1: from the arrival to the panel's triangle (the ride) and to the lift's line
     let area = load("elevtr1");
@@ -465,5 +540,182 @@ fn the_walkmesh_carries_the_party_down_to_nmkin_3_and_no_further() {
     assert!(triangles_at(mesh, &lift).iter().any(|t| reach.contains(t)), "the lift's line is walkable from the arrival");
     assert!(reach.contains(&8), "the panel's triangle (8) is walkable from the arrival");
     let panel = area.story_points().into_iter().find(|p| p.label.starts_with("triangle 8")).expect("the ride");
-    assert!(matches!(&panel.trigger, StoryTrigger::Region(c) if c.len() == 3));
+    assert!(matches!(&panel.trigger, StoryTrigger::Press(c) if c.len() == 3), "the panel waits for OK");
+    // nmkin_3: the woman is on the upper level the jumps lead to; nmkin_5: the chest and the core's triangle are walked to
+    // from the arrival without leaving the one component
+    let nmkin_3 = load("nmkin_3");
+    let arrival = exit_to(&load("nmkin_2"), "nmkin_3").arrival_hint.unwrap() as usize;
+    assert!(!walkable_from(nmkin_3.walkmesh(), arrival).contains(&26), "the woman's triangle (26) is not on foot from the arrival");
+    assert!(reach_with_links(&nmkin_3, arrival).contains(&26), "... but it is once the first jump is made");
+    let nmkin_5 = load("nmkin_5");
+    let arrival = exit_to(&load("nmkin_4"), "nmkin_5").arrival_hint.unwrap() as usize;
+    let walkable = walkable_from(nmkin_5.walkmesh(), arrival);
+    assert!(walkable.contains(&1) && walkable.contains(&2), "the chest (triangle 1) and the core's triangle (2) are on foot from the arrival");
+    // and the chest is reached without crossing the core's triangle (which would start the fight before the materia is taken)
+    let mut without_core = std::collections::BTreeSet::from([arrival]);
+    let mut queue = std::collections::VecDeque::from([arrival]);
+    while let Some(t) = queue.pop_front() {
+        for &next in nmkin_5.walkmesh().access.get(t).into_iter().flatten() {
+            let next = usize::from(next);
+            if next != 0xFFFF && next != 2 && next < nmkin_5.walkmesh().triangles.len() && without_core.insert(next) {
+                queue.push_back(next);
+            }
+        }
+    }
+    assert!(without_core.contains(&1), "the chest can be reached without standing on the core's triangle");
+}
+
+/// The ladders and jumps of the first mission, as the scripts of the lines make them (`fmv_ff7::links`): which lines
+/// move the player's character, which of them wait for OK, and the triangle each leads to. The fields before `nmkin_2`
+/// and `nmkin_5` have none a server can judge. Every destination is on the triangle its script names, and the arming rule
+/// (a player put within reach of a walk-on line does not fire it until it has left) is what keeps a landing next to a line
+/// from sending the player back.
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn the_ladders_and_jumps_of_the_mission_are_the_ones_the_lines_scripts_make() {
+    use fmv_adapter_api::Link;
+    let Some(adapter) = adapter() else { return };
+    // (what the character does, whether the line waits for OK, the triangle it leads to)
+    let links = |field: &str| -> Vec<(String, bool, Option<u32>)> {
+        let surveyed = adapter.survey_field(field).unwrap();
+        let served = adapter.load_area(field).unwrap().links();
+        assert_eq!(served.is_empty(), !fmv_ff7::is_reviewed_field(field) || surveyed.links().is_empty(), "{field}: a server offers the links of the reviewed fields only");
+        surveyed.links().iter().map(|l| (l.label.clone(), l.needs_ok, l.to_hint)).collect()
+    };
+    let l = |label: &str, ok: bool, to: u32| (label.to_string(), ok, Some(to));
+    for field in ["md1stin", "md1_1", "md1_2", "nrthmk", "nmkin_1", "elevtr1", "nmkin_5"] {
+        assert!(links(field).is_empty(), "{field}");
+    }
+    assert_eq!(links("nmkin_2"), [l("ladder", true, 102), l("ladder", true, 79), l("jump", false, 34)]);
+    assert_eq!(
+        links("nmkin_3"),
+        [l("jump", false, 42), l("jump", false, 40), l("ladder", true, 28), l("ladder", true, 7), l("ladder", true, 2), l("ladder", true, 44)]
+    );
+    assert_eq!(links("nmkin_4"), [l("ladder", false, 27), l("ladder", true, 18)]);
+
+    for field in ["nmkin_2", "nmkin_3", "nmkin_4"] {
+        let area = adapter.load_field(field).unwrap();
+        let all = area.links();
+        let mesh = area.walkmesh();
+        let mut near: Vec<(usize, usize, i32)> = Vec::new();
+        for (i, link) in all.iter().enumerate() {
+            let hint = usize::try_from(link.to_hint.unwrap()).unwrap();
+            // the destination is on the triangle the script names, and the area puts the player on that floor
+            let (x, y) = (link.to.x.round() as i32, link.to.y.round() as i32);
+            assert!(fmv_ff7::script::triangle_contains_xy(&mesh.triangles[hint], x, y), "{field}#{i}: the destination is in its triangle");
+            let placed = area.place_arrival(link.to, link.to_hint);
+            let floor = fmv_ff7::script::triangle_height_at(&mesh.triangles[hint], x, y).unwrap() as f32;
+            assert!((placed.z - floor).abs() < 1.0, "{field}#{i}: placed at {} on a floor of {floor}", placed.z);
+            assert!(matches!(area.validate_move(placed, placed), fmv_adapter_api::MoveResult::Accepted(p) if p.dist_xy(placed) < 1.0), "{field}#{i}: the destination can be stood on");
+            // the lines this landing is within reach of: the walk-on ones are the ones the arming rule is for
+            for (j, other) in all.iter().enumerate().filter(|(j, _)| *j != i) {
+                let d = other.distance_xy(placed);
+                if d <= Link::REACH {
+                    near.push((i, j, d.round() as i32));
+                }
+            }
+        }
+        println!("{field}: landings within reach of another link's line (from, line, units): {near:?}");
+        let expected: &[(usize, usize, i32)] = match field {
+            "nmkin_2" => &[(0, 1, 24), (1, 0, 3)],
+            "nmkin_3" => &[(0, 1, 23), (2, 3, 12), (3, 2, 13), (4, 5, 15), (5, 4, 10)],
+            _ => &[(0, 1, 1)],
+        };
+        assert_eq!(near, expected, "{field}");
+        // a landing next to a line that waits for OK is harmless; the one next to a walk-on line (the first jump of
+        // nmkin_3 lands 23 units from the second) is what the arming rule is for: that line starts disarmed
+        let walk_on: Vec<_> = near.iter().filter(|(i, j, _)| !all[*i].needs_ok && !all[*j].needs_ok).collect();
+        assert_eq!(walk_on.len(), usize::from(field == "nmkin_3"), "{field}: {walk_on:?}");
+    }
+}
+
+/// The two characters of the first mission whose talk moves the story, as talk points: the woman of `nmkin_3` (14) and
+/// the materia on the floor of `nmkin_5` (15). What a talk does is what the character's own script writes for the story
+/// the player has (the dialogue walker runs it), so the step is judged on that story: once it has moved nothing is left,
+/// and a character that switches itself off when the story has moved is gone.
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn the_woman_and_the_materia_are_talk_points_and_the_talk_scripts_decide_their_steps() {
+    let Some(adapter) = adapter() else { return };
+    let at = |m: u16| StoryState::at(m).encode();
+    let step = |area: &dyn AreaRuntime, id: u32, m: u16| area.story_advance(&at(m), id).map(|s| s.summary);
+
+    // the woman: a point whose centre is where one of the field's NPCs stands, in her talk radius
+    let nmkin_3 = adapter.load_area("nmkin_3").unwrap();
+    let points = nmkin_3.story_points();
+    assert_eq!(points.len(), 1);
+    let StoryTrigger::Talk { center, radius } = points[0].trigger else { panic!("{:?}", points[0]) };
+    assert_eq!(radius, 80.0, "the radius a character without its own has");
+    let npcs = nmkin_3.npcs();
+    assert_eq!(npcs.iter().filter(|n| n.pos == center).count(), 1, "one NPC stands at the point's centre: the woman");
+    for (moment, want) in [(1, Some("moment=1->14")), (13, Some("moment=13->14")), (14, None), (15, None), (27, None), (40, None)] {
+        assert_eq!(step(nmkin_3.as_ref(), 0, moment).as_deref(), want, "nmkin_3's woman at moment {moment}");
+    }
+    assert_eq!(nmkin_3.story_battle(0), None);
+
+    // the materia: talkable until the story is at 15, and what the talk does is take it (the story is 15)
+    let nmkin_5 = adapter.load_area("nmkin_5").unwrap();
+    let points = nmkin_5.story_points();
+    let materia = points.iter().find(|p| matches!(p.trigger, StoryTrigger::Talk { .. })).expect("the materia's point");
+    assert_eq!(materia.id, 3);
+    let StoryTrigger::Talk { center, radius } = materia.trigger else { unreachable!() };
+    assert_eq!(radius, 80.0);
+    assert_eq!(nmkin_5.npcs().iter().filter(|n| n.pos == center).count(), 1, "one NPC stands at the point's centre: the materia");
+    for (moment, want) in [(13, Some("moment=13->15")), (14, Some("moment=14->15")), (15, None), (27, None), (40, None)] {
+        assert_eq!(step(nmkin_5.as_ref(), 3, moment).as_deref(), want, "nmkin_5's materia at moment {moment}");
+    }
+}
+
+/// The guard scorpion: the core of the reactor starts battle 324 when the party comes to its triangle, and the story
+/// steps to 27 when it is WON (the point's step is judged on the story the party has then: 14 or 15 both go to 27).
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn the_guard_scorpion_is_the_battle_the_core_starts_before_its_step() {
+    let Some(adapter) = adapter() else { return };
+    let area = adapter.load_area("nmkin_5").unwrap();
+    let points = area.story_points();
+    assert_eq!(points.len(), 4);
+    assert_eq!(area.story_battle(0), Some(324), "the triangle of the core");
+    for id in 1..4 {
+        assert_eq!(area.story_battle(id), None, "point {id} starts no fight");
+    }
+    let at = |m: u16| StoryState::at(m).encode();
+    for (moment, want) in [(13, Some("moment=13->27")), (14, Some("moment=14->27")), (15, Some("moment=15->27")), (26, Some("moment=26->27")), (27, None), (40, None)] {
+        assert_eq!(area.story_advance(&at(moment), 0).map(|s| s.summary).as_deref(), want, "the core at moment {moment}");
+    }
+    // no other reviewed field starts a fight first
+    for field in fmv_ff7::REVIEWED_FIELDS.iter().filter(|f| **f != "nmkin_5") {
+        let area = adapter.load_area(field).unwrap();
+        assert!(area.story_points().iter().all(|p| area.story_battle(p.id).is_none()), "{field}");
+    }
+}
+
+/// The whole first mission as a story, now to the end of the reactor: a new account takes the steps the real scripts make
+/// and ends at moment 27 with the lift down: the woman (14), the materia (15) and the guard scorpion (27) after the
+/// seven steps of the first chain.
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn walking_the_whole_mission_moves_a_new_account_from_1_to_27() {
+    let Some(adapter) = adapter() else { return };
+    let steps = [
+        ("md1stin", 0, "moment=1->6"),
+        ("md1_1", 0, "moment=6->7"),
+        ("md1_2", 0, "moment=7->8"),
+        ("nrthmk", 0, "moment=8->10"),
+        ("nmkin_1", 0, "moment=10->11"),
+        ("elevtr1", 0, "moment=11->12 var1.225=0->1"),
+        ("nmkin_2", 0, "moment=12->13"),
+        ("nmkin_3", 0, "moment=13->14"),
+        ("nmkin_5", 3, "moment=14->15"),
+        ("nmkin_5", 0, "moment=15->27"),
+    ];
+    let mut blob: Vec<u8> = Vec::new();
+    for (field, point, summary) in steps {
+        let area = adapter.load_area(field).unwrap();
+        let step = area.story_advance(&blob, point).unwrap_or_else(|| panic!("{field}#{point} does not apply to {blob:02x?}"));
+        assert_eq!(step.summary, summary, "{field}");
+        blob = step.progress;
+        assert_eq!(area.story_advance(&blob, point), None, "{field}#{point} a second time");
+    }
+    assert_eq!(blob, vec![2, 27, 0, 1, 1, 225, 1], "moment 27, the lift bit on");
 }

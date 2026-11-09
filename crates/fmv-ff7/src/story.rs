@@ -48,8 +48,9 @@
 //! # Story points
 //!
 //! A story point is a place or a moment where a field's own scripts advance the story, found by reading
-//! them ([`AreaStory::scan`]; the server never invents one and carries out no write it could not read).
-//! There are three triggers, all of them things the server can see:
+//! them ([`AreaStory::scan`], and for talks [`AreaStory::add_talk_points`]; the server never invents one and carries
+//! out no write it could not read). There are five triggers, all of them things the server can see (where a player
+//! walks, that it came to stand in the area, and, since `ClientMsg::Interact`, that it pressed OK):
 //!
 //! * **A walkmesh triangle** ([`StoryTrigger::Region`]). FF7 fields advance the story from small loops in an
 //!   entity's script 0 (its "main" part, after the first `RET`). The first fields of the first mission do it
@@ -70,6 +71,10 @@
 //!   The test of the triangle may also compare the variable that `GETAI` fills (anywhere in the field: the
 //!   elevator's panel reads the one the director's loop keeps) with a literal. E is **bound to a playable
 //!   character** (has a `PC`): any of them, never one in particular, so the rule is "the player's character".
+//! * **A press on a triangle** ([`StoryTrigger::Press`]): the same loop with the OK button in the test (`IFKEYON`
+//!   with OK in its mask under the triangle test): the elevator's panel, "stand on triangle 8 and press OK". The
+//!   server takes the step when the player PRESSES OK (`ClientMsg::Interact`) while standing in the triangle, never
+//!   when it walks across it.
 //! * **A line** ([`StoryTrigger::Line`]): the trigger script of a `LINE` entity that the player walks onto
 //!   (slots 2 to 6, the ones [`crate::script::ExitTrigger::is_walk_on`] counts; `[OK]` needs the button) and
 //!   that starts enabled. The first mission's way into the reactor is one (`nmkin_1`).
@@ -78,6 +83,13 @@
 //!   to a spot and the story moves on: `md1_2`, `nrthmk`, `nmkin_2`). The server does it when the player
 //!   comes to stand in the area. A script that loops or asks the player before the write is not one (it waits
 //!   for something the server cannot see).
+//! * **A talk** ([`StoryTrigger::Talk`]): a character the field places (an NPC) whose talk script (slot 1), or a
+//!   script it requests, writes the moment or a tracked bit: `nmkin_3`'s woman (14) and `nmkin_5`'s materia (15). The
+//!   server takes the step when the player presses OK next to the character (`ClientMsg::Interact` naming it) within its
+//!   talk radius. What the talk does is not read off the text: the character's talk script is RUN (the dialogue walker,
+//!   [`dialogue::run_talk`]) for the story the player has when it presses OK, after the character's own set-up has
+//!   decided whether it can be talked to at all (a character that switches itself off when the story has moved is
+//!   gone), and the step is what that run wrote that moves the story forward.
 //!
 //! What a point does is the list of writes the script makes there ([`Effect`]): the moment, or a bit of a
 //! tracked variable, each under the conditions the script puts around it (comparisons of the moment, tests
@@ -87,26 +99,26 @@
 //! goes on (a write that only clears a bit is no point). **Everything a point cannot do is named, not
 //! guessed:** a guard on anything the model does not carry (a variable, a party, a key) makes the write no
 //! part of a point; a write in an `else` branch, after an early `RET`, `MAPJUMP` or `GAMEOVER`, or in the
-//! middle of a `REQ`'d script is not read at all. The script's `BATTLE` after a write is not run (the server
-//! has no scripted battles yet); it is named in the point's label so a log says so, and nothing else of a
-//! cutscene happens either: the story simply moves. What the server cannot see: **a talk** (nmkin_3's
-//! woman, nmkin_5's chest: the protocol has no interaction message), and **a key press** (below).
+//! middle of a `REQ`'d script is not read at all (a talk is the exception: its scripts are run). A `BATTLE` the script
+//! starts right AFTER a write is not run: it is named in the point's label so a log says so, and nothing else of a
+//! cutscene happens either: the story simply moves. A `BATTLE` the block starts BEFORE the write (inline, or in a
+//! script the block requests, to four requests deep: the guard scorpion, which a director's loop asks a character's
+//! script to fight before it sets the moment) is a **scripted battle** ([`AreaStory::battle_of`]): the server starts it
+//! for the party and pays the step when it is WON. Only what runs on every path to the write counts.
 //!
-//! **The one approximation: the OK button.** The elevator's panel is "stand on triangle 8 and press OK"
-//! (`IFKEYON` with OK in its mask under the triangle test). Protocol version 9 carries moves only, so the
-//! server cannot see the press: **a point whose triangle test also wants OK is reached by standing on the
-//! triangle** (the point's label says `OK`). It is the only place a key guard is tolerated; everywhere else
-//! (a line, entering, an exit) a key guard keeps the write or the exit out. And only the elevator going
-//! DOWN is carried out: the trip back up clears the bit (`BITOFF`), which is not forward, and a region fires
-//! on every move inside it, so a toggle would flap.
+//! **The OK button.** Since `ClientMsg::Interact` the server sees the press: a point whose triangle test also
+//! wants OK (the elevator's panel) is a [`StoryTrigger::Press`], reached by pressing OK while standing in the
+//! triangle (the point's label says `OK`). It is the only place a key guard is tolerated; everywhere else (a line,
+//! entering, an exit) a key guard keeps the write or the exit out. And only the elevator going DOWN is a point: the
+//! trip back up clears the bit (`BITOFF`), which is not forward (see [`merge_progression`]).
 //!
 //! Advancing is monotone: a point applies only when its conditions hold for the player's current story **and**
 //! the story moves forward by it.
 //!
 //! **Only in the reviewed fields.** The scan reads every field, but the adapter offers a field's points (and its
-//! script exits) only if the field is one of [`crate::REVIEWED_FIELDS`], the eight of the first mission, each read
-//! case by case: a point raises a story for good, so an unreviewed script must not do it for a live account. In any
-//! other field [`AreaStory::withhold_points`] takes the points out (the phases stay) and
+//! script exits and links) only if the field is one of [`crate::REVIEWED_FIELDS`], the ten of the first mission, each
+//! read case by case: a point raises a story for good, so an unreviewed script must not do it for a live account. In
+//! any other field [`AreaStory::withhold_points`] takes the points out (the phases stay) and
 //! [`fmv_adapter_api::AreaRuntime::story_withheld`] names them; the survey (`Ff7Adapter::survey_field`) still sees them
 //! all, which is how a field is reviewed before it is added to the list.
 //!
@@ -131,14 +143,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use fmv_adapter_api::{StoryPoint, StoryStep, StoryTrigger};
+use fmv_adapter_api::{NpcSpawn, StoryPoint, StoryStep, StoryTrigger};
 use fmv_core::{PhaseKey, Pos};
 
 use crate::field::Walkmesh;
-use crate::script::dialogue::StoryVars;
+use crate::script::dialogue::{self, StoryVars};
 use crate::script::{FieldScript, Instruction, Operand, SCRIPTS_PER_ENTITY};
 
-mod scan;
+pub(crate) mod scan;
 
 /// The bank of the main progress counter (`Var[2][0]`).
 pub const MOMENT_BANK: u8 = 2;
@@ -530,7 +542,7 @@ fn moment_compare(ins: &Instruction) -> Option<(Cmp, i32)> {
 
 /// The jumps before `list[k]` that skip over it when taken: the forward jumps whose target lies
 /// beyond it. Instruction `k` runs only if every one of them did NOT jump.
-fn guards_of(list: &[Instruction], k: usize) -> Vec<&Instruction> {
+pub(crate) fn guards_of(list: &[Instruction], k: usize) -> Vec<&Instruction> {
     let Some(at) = list.get(k).map(|i| i.offset) else { return Vec::new() };
     list.get(..k)
         .unwrap_or(&[])
@@ -606,18 +618,25 @@ enum Trigger {
     Line { a: Pos, b: Pos },
     /// The player comes to stand in the area.
     Enter,
+    /// The player presses OK next to a character whose talk script moves the story. What the talk does is not read
+    /// off the script here: the talk script is run (the dialogue walker) for the story the player has when it presses
+    /// OK, so it sees the conditions the character's own set-up and its talk put on the story, however it spells them.
+    Talk { entity: usize, center: Pos, radius: f32 },
 }
 
 /// One story point as the script defines it (see the module docs).
 #[derive(Debug, Clone, PartialEq)]
 struct PointDef {
     trigger: Trigger,
-    /// The conditions every one of the writes needs.
+    /// The conditions every one of the writes needs (none for a talk: the talk script is run).
     requires: Vec<Cond>,
-    /// The writes, in the order the script makes them.
+    /// The writes, in the order the script makes them (none for a talk).
     effects: Vec<Effect>,
-    /// A `BATTLE` the script starts right after (not run by the server).
+    /// A `BATTLE` the script starts right after the write (not run by the server: only named in the label).
     battle: Option<u16>,
+    /// A `BATTLE` the script starts BEFORE the write, in the block the write is in (a scripted fight whose win is what
+    /// moves the story: the server starts it and pays the step when it is won).
+    battle_first: Option<u16>,
 }
 
 impl PointDef {
@@ -648,7 +667,9 @@ impl PointDef {
             Trigger::Triangle { triangle, wants_ok, .. } => format!("triangle {triangle}{}", if *wants_ok { " (OK)" } else { "" }),
             Trigger::Line { .. } => "line".to_string(),
             Trigger::Enter => "entry".to_string(),
+            Trigger::Talk { entity, .. } => return format!("talk to entity {entity}: the talk script moves the story"),
         };
+        let first = self.battle_first.map_or(String::new(), |b| format!(" (starts battle {b} first, the step is paid when it is won)"));
         let battle = self.battle.map_or(String::new(), |b| format!(" (the script then starts battle {b}, which the server does not run)"));
         let effects: Vec<String> = self
             .effects
@@ -663,16 +684,48 @@ impl PointDef {
                 format!("{when} -> {}", e.op.text())
             })
             .collect();
-        format!("{place}: {}{battle}", effects.join("; "))
+        format!("{place}: {}{first}{battle}", effects.join("; "))
     }
 
     fn story_trigger(&self) -> StoryTrigger {
         match &self.trigger {
+            // A triangle whose test also wants the OK button is a press (the elevator's panel), not a region.
+            Trigger::Triangle { corners, wants_ok: true, .. } => StoryTrigger::Press(corners.to_vec()),
             Trigger::Triangle { corners, .. } => StoryTrigger::Region(corners.to_vec()),
             Trigger::Line { a, b } => StoryTrigger::Line(*a, *b),
             Trigger::Enter => StoryTrigger::Enter,
+            Trigger::Talk { center, radius, .. } => StoryTrigger::Talk { center: *center, radius: *radius },
         }
     }
+}
+
+/// The story after pressing OK next to character `entity` when the story is `state`: its talk script is run (the
+/// dialogue walker, with `state` as the story it reads) and what it wrote that moves the story forward is applied. `None`
+/// when the character cannot be talked to in this story, or the talk moves nothing forward.
+fn talk_step(script: &FieldScript<'_>, entity: usize, state: &StoryState) -> Option<StoryState> {
+    let run = dialogue::run_talk(script, entity, state, 1).ok()?;
+    let mut next = state.clone();
+    let mut forward = false;
+    // the moment: both bytes of the word, or the one a SETBYTE wrote
+    let (lo, hi) = (run.writes.get(&(MOMENT_BANK, MOMENT_ADDRESS)), run.writes.get(&(MOMENT_BANK, MOMENT_ADDRESS.wrapping_add(1))));
+    if lo.is_some() || hi.is_some() {
+        let [now_lo, now_hi] = state.moment.to_le_bytes();
+        let moment = u16::from_le_bytes([lo.copied().unwrap_or(now_lo), hi.copied().unwrap_or(now_hi)]);
+        if moment > next.moment {
+            next.moment = moment;
+            forward = true;
+        }
+    }
+    for tracked in TRACKED_VARS {
+        let Some(&written) = run.writes.get(&(tracked.bank, tracked.address)) else { continue };
+        for bit in 0..8u8 {
+            let mask = 1u8 << bit;
+            if tracked.bits & mask != 0 && written & mask != 0 {
+                forward |= next.set_bit(tracked.bank, tracked.address, bit, true);
+            }
+        }
+    }
+    forward.then_some(next)
 }
 
 /// What changed between two states, as `key=value` words without spaces (`moment=1->6`, `var1.225=0->1`).
@@ -751,12 +804,60 @@ impl AreaStory {
             .collect()
     }
 
-    /// What reaching point `id` does for `blob` (see `AreaRuntime::story_advance`).
+    /// What reaching point `id` does for `blob` (see `AreaRuntime::story_advance`), for the points the script's text
+    /// decides by itself. A talk point has no script here to run and is never reached by this; the adapter asks
+    /// [`AreaStory::advance_with`].
     pub fn advance(&self, blob: &[u8], id: u32) -> Option<StoryStep> {
         let state = StoryState::decode(blob)?;
         let point = self.points.get(usize::try_from(id).ok()?)?;
         let next = point.apply(&state)?;
         Some(StoryStep { summary: summary(&state, &next), progress: next.encode() })
+    }
+
+    /// [`AreaStory::advance`] for every kind of point: a talk point runs its character's talk script (in `script`, the
+    /// field's own) for the story `blob` records, and the step is what that talk wrote that moves the story forward
+    /// (the moment up, a tracked bit on). A character that is hidden or not to be talked to in that story gives nothing.
+    pub fn advance_with(&self, script: &FieldScript<'_>, blob: &[u8], id: u32) -> Option<StoryStep> {
+        let state = StoryState::decode(blob)?;
+        let point = self.points.get(usize::try_from(id).ok()?)?;
+        let next = match &point.trigger {
+            Trigger::Talk { entity, .. } => talk_step(script, *entity, &state)?,
+            _ => point.apply(&state)?,
+        };
+        Some(StoryStep { summary: summary(&state, &next), progress: next.encode() })
+    }
+
+    /// The battle that point `id` starts before its step is paid (`AreaRuntime::story_battle`): a scripted fight
+    /// whose win is what moves the story.
+    pub fn battle_of(&self, id: u32) -> Option<u16> {
+        self.points.get(usize::try_from(id).ok()?)?.battle_first
+    }
+
+    /// Add the talk points of a field: one for each character (of the NPCs the field places, `npcs`) whose talk script
+    /// can write the story (the script, or one it requests, sets the moment or a tracked bit). Appended after the
+    /// points the scan found, so the ids of those do not move. `script` is the field's own.
+    pub fn add_talk_points(&mut self, script: &FieldScript<'_>, npcs: &[NpcSpawn]) {
+        let characters = dialogue::characters(script);
+        for npc in npcs {
+            if self.points.len() >= MAX_STORY_POINTS {
+                break;
+            }
+            let Some(character) = dialogue::find_character(&characters, &npc.entity_name, npc.pos.x, npc.pos.y) else { continue };
+            let entity = character.entity;
+            if !scan::talk_can_write_the_story(script, entity) {
+                continue;
+            }
+            if self.points.iter().any(|p| matches!(p.trigger, Trigger::Talk { entity: e, center, .. } if e == entity && center == npc.pos)) {
+                continue;
+            }
+            self.points.push(PointDef {
+                trigger: Trigger::Talk { entity, center: npc.pos, radius: character.talk_radius },
+                requires: Vec::new(),
+                effects: Vec::new(),
+                battle: None,
+                battle_first: None,
+            });
+        }
     }
 
     /// Take the story points away, keeping the phases (a field that is not on the adapter's list of reviewed
