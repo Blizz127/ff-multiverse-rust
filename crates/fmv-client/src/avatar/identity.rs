@@ -387,16 +387,17 @@ mod tests {
         assert_eq!(Identity::of([255, 0, 128]).to_array(), [1.0, 0.0, 128.0 / 255.0, 1.0]);
     }
 
-    /// The point of it: black and the dark blue cloak the owner measured turn plainly into each player's colour (the
-    /// hue is the identity's, the colour is a colour and not a grey, and it is lighter than the black it came from),
-    /// where the old tint left the cloak a dark grey of its own hue.
+    /// The point of it: near-black cloth, dark grey and the dark blue cloak the owner measured turn plainly into each
+    /// player's colour (the hue is the identity's, the colour is a colour and not a grey, and it is lighter than the
+    /// cloth it came from), where the old tint left the cloak a dark grey of its own hue. (Pure black is the one
+    /// exception to "plainly": see `pure_black_takes_the_hue_but_stays_a_very_dark_shade`.)
     #[test]
     fn dark_cloth_turns_plainly_into_the_players_colour() {
         let cloak = f([57, 66, 109]);
         for rgb in PLAYERS {
             let id = f(rgb);
             let hue = hsv(id)[0];
-            for (name, cloth) in [("black", [0.0f32; 3]), ("dark suit grey", f([48, 48, 52])), ("dark cloak", cloak), ("dark brown-less navy", f([20, 20, 70]))] {
+            for (name, cloth) in [("near black", f([13, 13, 13])), ("dark suit grey", f([48, 48, 52])), ("dark cloak", cloak), ("dark navy", f([20, 20, 70]))] {
                 let new = look(cloth, id, 1.0, 0.0);
                 let [h, s, v] = hsv(new);
                 assert!(hue_distance(h, hue) < 15.0, "{name} in {rgb:?}: hue {h} against {hue}");
@@ -414,8 +415,25 @@ mod tests {
         assert_eq!(bytes(old(cloak, f(PLAYERS[1]))), [55, 47, 58], "(and the old tint, for reference: the owner measured [55,46,58])");
     }
 
+    /// Pure black (all three channels 0) has no value to lift from: it takes the identity's hue and saturation but
+    /// only the floor of the lift (0.2 of a full channel, less the tenth of its own black that is kept), so it is a
+    /// very dark shade of the colour and not a plain one. The black of these models is near-black (a vertex colour
+    /// of 10 to 30), which is lifted plainly: the test above.
+    #[test]
+    fn pure_black_takes_the_hue_but_stays_a_very_dark_shade() {
+        for rgb in PLAYERS {
+            let id = f(rgb);
+            let new = look([0.0; 3], id, 1.0, 0.0);
+            let [h, s, v] = hsv(new);
+            assert!(hue_distance(h, hsv(id)[0]) < 10.0 && s > 0.5, "{rgb:?}: a dark shade of the colour: {new:?}");
+            assert!((0.12..0.30).contains(&v), "{rgb:?}: value {v}");
+            eprintln!("pure black under {rgb:?}: {:?} (value {v:.2})", bytes(new));
+        }
+    }
+
     /// Skin and the face decals stay readable: skin-hued colours (peach, tan, dark brown) change by under 7 levels on
-    /// average, a face decal of any colour by under 8, whoever the player is.
+    /// average, a face decal of any colour by under 7 as well, whoever the player is (the weak tint moves a channel
+    /// by at most 5%).
     #[test]
     fn skin_and_the_face_decals_change_by_little() {
         let skins = [[230u8, 180, 150], [255, 140, 100], [200, 150, 100], [90, 55, 40], [250, 215, 190]];
@@ -434,7 +452,7 @@ mod tests {
                 let c = f(decal);
                 let change = mean_levels(c, look(c, id, 1.0, 1.0));
                 worst.1 = worst.1.max(change);
-                assert!(change < 8.0, "face decal {decal:?} under {rgb:?} changes by {change:.1} levels");
+                assert!(change < 7.0, "face decal {decal:?} under {rgb:?} changes by {change:.1} levels");
                 // (and the flag is what keeps it: the same colour as cloth is repainted)
                 if skin_mask(c) < 0.5 && decal[0] > 100 {
                     assert!(mean_levels(c, look(c, id, 1.0, 0.0)) > 3.0 * change.max(1.0), "{decal:?}");
@@ -479,8 +497,8 @@ mod tests {
             let shades: Vec<f32> = [0.05f32, 0.2, 0.4, 0.7, 0.95].iter().map(|g| hsv(look([*g; 3], id, 1.0, 0.0))[2]).collect();
             assert!(shades.windows(2).all(|w| w[1] > w[0] + 0.04), "{rgb:?}: {shades:?}");
         }
-        // (Black stays nearly black, tinted: its four colours are the closest; the rest are plainly four colours.)
-        for (cloth, least) in [(f([57, 66, 109]), 75.0f32), (f([48, 48, 52]), 60.0), (f([30, 70, 190]), 75.0), ([0.0; 3], 25.0)] {
+        // (Black stays a very dark shade, so its four colours are the closest of all; the rest are plainly four colours.)
+        for (cloth, least) in [(f([57, 66, 109]), 75.0f32), (f([48, 48, 52]), 60.0), (f([30, 70, 190]), 75.0), (f([13, 13, 13]), 40.0), ([0.0; 3], 25.0)] {
             let mut closest = f32::MAX;
             for (i, a) in PLAYERS.iter().enumerate() {
                 for b in &PLAYERS[i + 1..] {
@@ -677,6 +695,8 @@ pub(crate) mod measure {
         pub overlay: f32,
         pub textured: f32,
         pub skin: f32,
+        /// Colours whose brightest channel is under 8 (of 255): the black the look cannot lift plainly.
+        pub black: f32,
     }
 
     /// Area-weighted shares (a triangle's area does not change under the rigid bone transforms).
@@ -715,12 +735,14 @@ pub(crate) mod measure {
                 out.overlay += area * mesh.overlay[tri[0] as usize];
                 out.textured += area * f32::from(u8::from(batch.texture.is_some()));
                 out.skin += area * look::skin_mask(c);
+                out.black += area * f32::from(u8::from(c[0].max(c[1]).max(c[2]) < 8.0 / 255.0));
             }
         }
         if total > 0.0 {
             out.overlay /= total;
             out.textured /= total;
             out.skin /= total;
+            out.black /= total;
         }
         out
     }

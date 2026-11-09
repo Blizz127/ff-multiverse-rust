@@ -163,6 +163,33 @@ fn the_scene_asks_for_the_colour_of_each_members_own_entity_and_never_of_an_enem
 // The owner's own game data
 // ---------------------------------------------------------------------------------------------
 
+/// The assumption the face rule rests on, measured on the battle models too: the `overlay` flag (textured opaque parts:
+/// the face decals) covers well under 1% of the model of every combat slot (the battle models, like the field ones, are
+/// vertex-coloured), so "face" is the decals in battle as in the field and does not take the bodies out of the look.
+/// Aggregates only.
+#[test]
+#[ignore = "needs the owner's real FF7 data (FMV_FF7_DATA or FMV_FF7_LIBRARY)"]
+fn real_identity_battle_models_are_vertex_coloured_with_face_decals_only() {
+    use crate::avatar::identity::measure::shares;
+    let Some(real) = open_real() else { return };
+    let mut kit = real.kit();
+    for character in [0u8, 1, 2, 3, 4, 5, 6, 7, 8] {
+        let model = kit.source.party_member(&PartyLook { actor: ActorId(0), character, mine: true });
+        let rig = kit.rigs.resolve(&model, BoxSpec::for_party(0));
+        let s = shares(&rig.asset.mesh);
+        eprintln!(
+            "battle slot {character}: {} triangles: overlay {:.1}% textured {:.1}% skin-coloured {:.1}% pure black (under 8 of 255) {:.1}%",
+            s.triangles,
+            s.overlay * 100.0,
+            s.textured * 100.0,
+            s.skin * 100.0,
+            s.black * 100.0
+        );
+        assert!(!rig.attachments.is_empty(), "slot {character} carries its weapon, which is never given the colour");
+        assert!(s.overlay < 0.02 && (s.overlay - s.textured).abs() < 1e-6, "slot {character}: the overlay flag is the face decals");
+    }
+}
+
 /// `f` without the models of `bodies` (the colours and tints kept in step: they run in step with the models up to the
 /// effects, which come last).
 fn without_bodies(mut f: BattleFrame, bodies: &[Arc<AvatarAsset>]) -> BattleFrame {

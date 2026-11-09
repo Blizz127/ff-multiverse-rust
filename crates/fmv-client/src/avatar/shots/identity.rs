@@ -125,6 +125,11 @@ fn mean_change(a: &[u8], b: &[u8], pixels: &[usize]) -> f32 {
 
 /// The cloth colours of the numeric table: the dark blue cloak the owner measured, a dark suit grey, a skin tone, a
 /// white shirt and a saturated red.
+/// The mean per-channel change (levels of 255) accepted over skin and face pixels: the weak tint moves a channel by at
+/// most 5% (13 levels on the brightest), which is at most 7 on average over the channels of the lightest skin tones; the
+/// measured worst on the rendered bodies is 5.0, the old tint's 28 to 57.
+const SKIN_ACCEPTED: f32 = 7.0;
+
 const SAMPLES: [(&str, [u8; 3]); 5] = [("dark cloak", [57, 66, 109]), ("dark suit grey", [48, 48, 52]), ("skin", [230, 180, 150]), ("white shirt", [235, 235, 235]), ("saturated red", [200, 30, 30])];
 
 #[test]
@@ -199,7 +204,7 @@ fn offscreen_field_identity_before_after() {
             let (face_new, face_old) = (mean_change(&plain, &new, &face_px), mean_change(&plain, &old, &face_px));
             let changed = |img: &[u8]| model_px.iter().filter(|&&i| mean_abs(&plain[i..i + 3], &img[i..i + 3]) > 6.0).count();
             eprintln!(
-                "{:7} {cname:8}: {} px; {:.1}% match the mirror; skin ({} px) mean |change| new {skin_new:.1} old {skin_old:.1}; decal pixels ({}) new {face_new:.1} old {face_old:.1}; changed by >6: new {} old {}",
+                "{:7} {cname:8}: {} px; {:.1}% match the mirror; skin ({} px) mean |change| new {skin_new:.1} old {skin_old:.1}; pixels the face flag acted on ({}, a part of the face region) new {face_new:.1} old {face_old:.1}; changed by >6: new {} old {}",
                 body.archetype,
                 model_px.len(),
                 100.0 * agree as f32 / model_px.len() as f32,
@@ -210,7 +215,8 @@ fn offscreen_field_identity_before_after() {
             );
             worst_skin_new = worst_skin_new.max(skin_new);
             worst_skin_old = worst_skin_old.max(skin_old);
-            assert!(skin_px.is_empty() || skin_new <= 8.0, "{} in {cname}: skin changes by {skin_new:.1} levels on average", body.archetype);
+            assert!(skin_px.is_empty() || skin_new <= SKIN_ACCEPTED, "{} in {cname}: skin changes by {skin_new:.1} levels on average", body.archetype);
+            assert!(face_px.is_empty() || face_new <= SKIN_ACCEPTED, "{} in {cname}: face decals change by {face_new:.1} levels on average", body.archetype);
         }
     }
     eprintln!("worst mean per-channel change over the skin region: new {worst_skin_new:.1} levels, old {worst_skin_old:.1}; the shader agrees with the mirror at {:.2}% of {} body pixels", 100.0 * oracle_total.0 as f32 / oracle_total.1 as f32, oracle_total.1);
@@ -227,39 +233,62 @@ fn offscreen_field_identity_overview() {
     let Some(mut gpu) = Offscreen::new() else { return };
     let mut avatars = real::avatars(&real);
     let fx = fixture(&real, &mut avatars);
-    // Side by side: the leftmost and the rightmost of the places a good size, and the one nearest the middle between.
-    let cx = |s: &Spot| (s.view_rect.0 + s.view_rect.2) / 2.0;
-    let sized: Vec<Spot> = fx.open_places.iter().copied().filter(|s| s.depth < 1000.0).collect();
-    let left = sized.iter().copied().min_by(|a, b| cx(a).total_cmp(&cx(b))).expect("a place");
-    let right = sized.iter().copied().max_by(|a, b| cx(a).total_cmp(&cx(b))).expect("a place");
-    let mid = (cx(&left) + cx(&right)) / 2.0;
-    let middle = sized.iter().copied().min_by(|a, b| (cx(a) - mid).abs().total_cmp(&(cx(b) - mid).abs())).expect("a place");
-    let places = [left, middle, right];
-    for p in &places {
-        eprintln!("overview place: depth {:.0}, view x {:.0}", p.depth, cx(p));
-    }
-    let players: Vec<AvatarPlayer<'static>> = [(0usize, COLOURS[0].1), (1, COLOURS[1].1), (2, COLOURS[2].1)]
-        .iter()
-        .zip(&places)
-        .enumerate()
-        .map(|(i, ((body, tint), place))| body_player(i as u64 + 1, *body, place.pos, fx.toward + 0.3 - 0.3 * i as f32, *tint))
-        .collect();
-    let frame = frame_of(&mut avatars, &fx, &players);
-    assert_eq!(frame.models.len(), 3);
+    // Side by side: the places of the walkmesh (a good size, nothing in front) whose characters stand furthest apart on
+    // the screen, by the gap between the nearest two of their rectangles. Three players if the corridor lets them stand
+    // without one covering another (by the projected boxes of their models), else two.
+    let sized: Vec<Spot> = fx.open_places.iter().copied().filter(|s| s.depth < 1100.0).collect();
+    let gap = |a: &Spot, b: &Spot| (b.view_rect.0 - a.view_rect.2).max(a.view_rect.0 - b.view_rect.2);
+    let combos = |k: usize| -> Vec<Vec<usize>> {
+        let mut out = vec![Vec::new()];
+        for _ in 0..k {
+            out = out.into_iter().flat_map(|c: Vec<usize>| (c.last().map_or(0, |l| l + 1)..sized.len()).map(move |i| [c.clone(), vec![i]].concat())).collect();
+        }
+        out
+    };
+    let cast = [(0usize, COLOURS[0].1), (1, COLOURS[1].1), (2, COLOURS[2].1)];
     let none = bounds_scene(&fx);
+    let mut shown = None;
+    for n in [3usize, 2] {
+        let best = combos(n)
+            .into_iter()
+            .max_by(|a, b| {
+                let widest = |c: &Vec<usize>| c.iter().enumerate().flat_map(|(x, &i)| c[x + 1..].iter().map(move |&j| (i, j))).map(|(i, j)| gap(&sized[i], &sized[j])).fold(f32::MAX, f32::min);
+                widest(a).total_cmp(&widest(b))
+            })
+            .expect("places");
+        let mut places: Vec<Spot> = best.iter().map(|&i| sized[i]).collect();
+        places.sort_by(|a, b| a.view_rect.0.total_cmp(&b.view_rect.0));
+        let players: Vec<AvatarPlayer<'static>> = cast
+            .iter()
+            .zip(&places)
+            .enumerate()
+            .map(|(i, ((body, tint), place))| body_player(i as u64 + 1, *body, place.pos, fx.toward + 0.3 - 0.3 * i as f32, *tint))
+            .collect();
+        let frame = frame_of(&mut avatars, &fx, &players);
+        assert_eq!(frame.models.len(), n);
+        let mut boxes: Vec<(f32, f32, f32, f32)> = (0..n).map(|m| model_bbox(&frame, m, &none, W1, H1)).collect();
+        boxes.sort_by(|a, b| a.0.total_cmp(&b.0));
+        eprintln!("{n} players at camera depths {:?}: pixel boxes left to right {boxes:?}", places.iter().map(|p| p.depth.round()).collect::<Vec<_>>());
+        if boxes.windows(2).all(|w| w[0].2 < w[1].0) {
+            shown = Some((frame, n));
+            break;
+        }
+        eprintln!("{n} players do not stand side by side in this corridor (one covers another)");
+    }
+    let (frame, n) = shown.expect("two players stand side by side");
     let (old, new) = (render(&mut gpu, &fx, &dressed(&frame, Look::Old), true), render(&mut gpu, &fx, &dressed(&frame, Look::New), true));
     save_png("field_tint_overview_old_1920x1080", W1, H1, &old);
     save_png("field_tint_overview_new_1920x1080", W1, H1, &new);
     // The strip: the part of the screen all three stand in, at 1x.
     let mut bbox = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
-    for m in 0..3 {
+    for m in 0..n {
         let b = model_bbox(&frame, m, &none, W1, H1);
         bbox = (bbox.0.min(b.0), bbox.1.min(b.1), bbox.2.max(b.2), bbox.3.max(b.3));
     }
     let (x0, y0) = (((bbox.0 - 30.0).max(0.0)) as u32, ((bbox.1 - 20.0).max(0.0)) as u32);
     let (cw, ch) = ((((bbox.2 + 30.0) as u32).min(W1) - x0), (((bbox.3 + 20.0) as u32).min(H1) - y0));
     let strip = vstack(&[crop(&old, W1, (x0, y0), (cw, ch), 1), crop(&new, W1, (x0, y0), (cw, ch), 1)]);
-    eprintln!("1x strip {}x{} at ({x0},{y0}); players blue lean, orange sturdy, green slight", strip.w, strip.h);
+    eprintln!("1x strip {}x{} at ({x0},{y0}); {n} players: blue lean, orange sturdy, green slight", strip.w, strip.h);
     save_png("field_tint_overview_strip_1x_old_over_new", strip.w, strip.h, &strip.px);
     // Told apart at a glance: the mean colour of each body's pixels (what the player sees at 1x) differs between the
     // three players by a good margin in the new look, where in the old one dark and saturated cloth hardly moved.
@@ -284,9 +313,9 @@ fn offscreen_field_identity_overview() {
     };
     let dist = |a: [f32; 3], b: [f32; 3]| ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt();
     let (mut old_min, mut new_min) = (f32::MAX, f32::MAX);
-    for (m, n) in [(0usize, 1usize), (0, 2), (1, 2)] {
-        let (od, nd) = (dist(mean_of(&flat_old, m), mean_of(&flat_old, n)), dist(mean_of(&flat_new, m), mean_of(&flat_new, n)));
-        eprintln!("mean colour distance between models {m} and {n}: old {od:.0}, new {nd:.0} (of 441)");
+    for (m, k) in (0..n).flat_map(|m| (m + 1..n).map(move |k| (m, k))) {
+        let (od, nd) = (dist(mean_of(&flat_old, m), mean_of(&flat_old, k)), dist(mean_of(&flat_new, m), mean_of(&flat_new, k)));
+        eprintln!("mean colour distance between models {m} and {k}: old {od:.0}, new {nd:.0} (of 441)");
         old_min = old_min.min(od);
         new_min = new_min.min(nd);
     }
@@ -395,7 +424,15 @@ fn real_identity_field_models_are_vertex_coloured_with_face_decals_only() {
     for model in models {
         let asset = AvatarAsset::new(loader.load(&model).expect("loads")).expect("merges");
         let s = measure::shares(&asset.mesh);
-        eprintln!("{:18} {} triangles: overlay {:.1}% textured {:.1}% skin-coloured {:.1}%", model.appearance_ref, s.triangles, s.overlay * 100.0, s.textured * 100.0, s.skin * 100.0);
+        eprintln!(
+            "{:18} {} triangles: overlay {:.1}% textured {:.1}% skin-coloured {:.1}% pure black (under 8 of 255) {:.1}%",
+            model.appearance_ref,
+            s.triangles,
+            s.overlay * 100.0,
+            s.textured * 100.0,
+            s.skin * 100.0,
+            s.black * 100.0
+        );
         assert!(s.overlay < 0.02 && (s.overlay - s.textured).abs() < 1e-6, "{}: the overlay flag is the face decals", model.appearance_ref);
     }
 }
