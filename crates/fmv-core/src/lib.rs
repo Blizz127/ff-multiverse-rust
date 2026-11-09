@@ -248,7 +248,9 @@ pub struct PhaseKey(pub Vec<u8>);
 pub struct AvatarAppearance {
     pub display_name: String,
     pub tint: [u8; 3],
-    /// Adapter-defined appearance id for the current game (e.g. an FF7 field model name).
+    /// Adapter-defined appearance id for the current game (e.g. an FF7 field model name): the character's
+    /// **binding** in this game, stored per game and independent of the combat slot the character fills (protocol
+    /// v8; before it, the id also named the character a player fought as).
     pub appearance_ref: Option<String>,
 }
 

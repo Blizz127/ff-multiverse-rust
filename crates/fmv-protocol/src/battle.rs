@@ -114,16 +114,24 @@ impl fmt::Display for BattleId {
     }
 }
 
-/// One player's character in a battle. Ids and numbers only: the stats follow from the peer's own
-/// kernel data. `party[i]` of `EncounterStart` fights as `ActorId(i)`.
+/// One player's character in a battle. Ids, numbers and the player's own name: the stats follow from the
+/// peer's own kernel data. `party[i]` of `EncounterStart` fights as `ActorId(i)`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BattleMember {
     /// The player's entity in the field (who is frozen while this battle runs).
     pub entity: EntityId,
     /// The account that controls this character (only its session may command it).
     pub account: AccountId,
-    /// FF7 character id: Cloud 0, Barret 1, Tifa 2, Aerith 3, Red XIII 4, Yuffie 5, Cait Sith 6,
-    /// Vincent 7, Cid 8 (`fmv_ff7_battle::kernel::CharacterId::index`).
+    /// The PLAYER'S OWN name (protocol v8): what the party panel, the HP list, the banners and the log of
+    /// every peer call this fighter, instead of the name of the canon character whose combat template it
+    /// uses. Display only: the engine never reads it, so it is not part of what a replay depends on. Clipped
+    /// by the sender to [`crate::MAX_CHARACTER_NAME_CHARS`] characters, without control characters.
+    pub name: String,
+    /// The combat slot (protocol v8: the player's own, fixed at creation; before v8, the character of the
+    /// player's look): the FF7 character id whose combat template, experience curve and abilities this
+    /// fighter uses: Cloud 0, Barret 1, Tifa 2, Aerith 3, Red XIII 4, Yuffie 5, Cait Sith 6, Vincent 7, Cid 8
+    /// (`fmv_ff7_battle::kernel::CharacterId::index`). Not the player's identity: two players may hold the
+    /// same slot, and their [`BattleMember::name`]s tell them apart.
     pub character: u8,
     pub level: u8,
     /// Equipment override ids; `None` is the character's starting equipment.
@@ -1138,6 +1146,7 @@ mod tests {
         BattleMember {
             entity: EntityId(10 + i),
             account: AccountId(20 + i),
+            name: format!("Player {i}"),
             character,
             level: 6,
             weapon: None,

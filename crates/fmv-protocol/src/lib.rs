@@ -1,4 +1,13 @@
-//! FF Multiverse wire protocol v7.
+//! FF Multiverse wire protocol v8.
+//!
+//! v8 is v7 plus the player's own original character (see [`character`] and "Characters" below): `Hello` asks
+//! for a character to create ([`NewCharacter`]: colour, body, combat slot) instead of a colour and a look,
+//! `Welcome` tells the player what the server holds ([`CharacterCard`]) and a battle's [`BattleMember`] carries
+//! the player's own name. The meaning of `AvatarAppearance::appearance_ref` changed with it: it is the
+//! game's per-player binding, no longer the look that also named the battle character, and `BattleMember::character`
+//! is the player's combat slot. A v7 peer cannot decode a `Hello` without `tint`, a `Welcome` with a card or a
+//! member with a name, so the version was bumped: a v7 client or server is refused at the handshake
+//! (`probe_hello_version` reads the version of any `Hello`, so the refusal is a clean `ProtocolMismatch`).
 //!
 //! v7 is v6 plus limit breaks and escape: [`battle::Command`] gains `Limit { target }` and `Escape`,
 //! [`battle::ActionRef`] gains `Limit(id)` and `Escape`, [`battle::Outcome`] gains `Escaped`, battle
@@ -31,8 +40,8 @@
 //! # Connection flow
 //!
 //! ```text
-//! C -> S  Hello { protocol_version, client_build, auth, tint, appearance_ref }
-//! S -> C  Welcome { .., account, issued_token }      (or Reject { reason, code }, then the server closes)
+//! C -> S  Hello { protocol_version, client_build, auth, character }
+//! S -> C  Welcome { .., account, issued_token, character }   (or Reject { reason, code }, then the server closes)
 //! S -> C  AreaManifest { area, fingerprint, provenance, fixture, .. }
 //! C -> S  JoinArea { area, fingerprint, provenance }  (or CannotJoin { reason })
 //! S -> C  AreaSnapshot, InstancePlacement             (always first after the handshake replies)
@@ -162,9 +171,34 @@
 //! connection that dies at that moment does not leave a name taken without a token.
 //!
 //! After registration the server never trusts client-supplied names: the display name, tint and
-//! per-game appearance of an entity come from the stored avatar profile. `Hello::tint` and
-//! `Hello::appearance_ref` are only the look requested for a NEW avatar (ignored when logging in
-//! with a token).
+//! per-game appearance of an entity come from the stored player character. `Hello::character` is only
+//! the character requested for a NEW account (ignored when logging in with a token).
+//!
+//! # Characters (v8)
+//!
+//! Every player has ONE original character that travels across games. In FF7 it takes a canon party
+//! member's COMBAT slot (Barret's, say) while that canon character stays in the story as a non-player
+//! character; dialogue is never name-swapped; identity and appearance persist across games and each game
+//! draws them its own way. Three things are separate on the wire:
+//!
+//! * the **identity**: name, colour and a game-agnostic body choice, asked for in `Hello::character` and
+//!   told back in `Welcome::character` ([`CharacterCard`]);
+//! * the **binding**: how the hosted game draws the character. It is the entity's `appearance_ref` in
+//!   every snapshot (FF7: a generic placeholder body of the owner's own `char.lgp`, tinted with the colour;
+//!   an account that predates v8 keeps the canon look it had) and has nothing to do with the slot;
+//! * the **slot**: the canon party member whose combat template and experience curve the character fights with
+//!   (`BattleMember::character`, `CharacterProgress::character`). Chosen once at creation, never changed, and
+//!   not Cloud's for a new character; two players may hold the same slot.
+//!
+//! ```text
+//! C -> S  Hello { .., auth: Register { display_name }, character: { tint, body, slot } }
+//! S -> C  Welcome { .., character: { name, tint, body, binding, slot, migrated } }
+//! S -> C  EncounterStart { .., party: [{ entity, account, name, character, level, .. }] }
+//! ```
+//!
+//! The battle roster carries the player's own `name`: the party panel, the HP list and the banners show it
+//! instead of the canon character's, while the engine uses the slot's combat template. Nothing here is game
+//! data (ids, a colour, a name), and nothing about the canon NPCs of a field changes.
 //!
 //! # Rejections
 //!
@@ -196,8 +230,10 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub mod battle;
+pub mod character;
 pub mod reject;
 
+pub use character::{clip_character_name, CharacterCard, NewCharacter, MAX_CHARACTER_NAME_CHARS, MAX_CHARACTER_REF_CHARS};
 pub use reject::RejectCode;
 
 /// The battle wire types (the engine's own `BattleEvent`, `Command` and `Outcome` stay under
@@ -215,7 +251,7 @@ pub use fmv_party::{
     PartyEvent, PartyId, Placement,
 };
 
-pub const PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = 8;
 /// Hard cap on a single frame payload (bytes).
 pub const MAX_FRAME: u32 = 256 * 1024;
 /// Default TCP port for development. Deployment port is UNASSIGNED (see DEPLOYMENT-CONTRACT.md).
@@ -332,17 +368,12 @@ impl fmt::Display for PartyFailure {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ClientMsg {
-    /// First message of a connection. `tint` and `appearance_ref` are used only to create a NEW
-    /// avatar (when `auth` is `Register`). The server keeps `appearance_ref` only if it is one of the
-    /// look ids the hosted game offers (for FF7 the `ff7/<character>` ids); any other value is not an
-    /// error, the avatar just keeps the default look.
-    Hello {
-        protocol_version: u16,
-        client_build: String,
-        auth: Auth,
-        tint: [u8; 3],
-        appearance_ref: Option<String>,
-    },
+    /// First message of a connection. `character` is used only to create a NEW character (when `auth` is
+    /// `Register`; a token login ignores it, except that its `tint` colours an account that has no avatar
+    /// yet). The server checks every choice against what the hosted game offers: an unknown `body` is not an
+    /// error (the game's default body is used), a `slot` the game does not offer to a new character is
+    /// refused with `RejectCode::BadRequest` (see [`NewCharacter`]).
+    Hello { protocol_version: u16, client_build: String, auth: Auth, character: NewCharacter },
     /// Sent after the client confirmed it holds the area with this exact fingerprint locally.
     /// `provenance` is the client's OWN path-free provenance: the server requires it to be
     /// `compatible_with` the area's, in addition to the fingerprint matching.
@@ -389,6 +420,9 @@ pub enum ServerMsg {
         /// `Some` only in the answer to `Auth::Register`: the new account's token, **shown
         /// once**. Never log this message with `{:?}` without redaction (`Secret` redacts).
         issued_token: Option<Secret>,
+        /// What the server holds of this player's own character (v8): its identity, how the hosted game draws
+        /// it, which combat slot it fills.
+        character: CharacterCard,
     },
     /// The server refuses or ends the connection and closes it. `reason` is for people, `code` for
     /// programs (`Unspecified`, and then absent from the JSON, from a server that sends none).
@@ -612,8 +646,8 @@ mod tests {
     }
 
     #[test]
-    fn the_version_is_seven() {
-        assert_eq!(PROTOCOL_VERSION, 7);
+    fn the_version_is_eight() {
+        assert_eq!(PROTOCOL_VERSION, 8);
     }
 
     // -----------------------------------------------------------------------------------------
@@ -626,8 +660,7 @@ mod tests {
             protocol_version: PROTOCOL_VERSION,
             client_build: "t".into(),
             auth: Auth::Token(Secret::new("fmvt_supersecret")),
-            tint: [1, 2, 3],
-            appearance_ref: None,
+            character: NewCharacter::with_tint([1, 2, 3]),
         };
         let json = String::from_utf8(encode(&hello).unwrap()[4..].to_vec()).unwrap();
         assert!(json.contains(r#""Token":"fmvt_supersecret""#), "{json}");
@@ -640,6 +673,7 @@ mod tests {
             entity: EntityId(2),
             account: AccountId(3),
             issued_token: Some(Secret::new("fmvt_issuedsecret")),
+            character: CharacterCard::plain("Cloud", [1, 2, 3]),
         };
         let json = String::from_utf8(encode(&welcome).unwrap()[4..].to_vec()).unwrap();
         assert!(json.contains(r#""issued_token":"fmvt_issuedsecret""#), "{json}");
@@ -667,13 +701,12 @@ mod tests {
     fn golden_client_messages() {
         golden(
             ClientMsg::Hello {
-                protocol_version: 6,
+                protocol_version: 8,
                 client_build: "c/1".into(),
-                auth: Auth::Register { display_name: "Cloud".into() },
-                tint: [10, 20, 30],
-                appearance_ref: Some("cloud_model".into()),
+                auth: Auth::Register { display_name: "Blizz".into() },
+                character: NewCharacter { tint: [10, 20, 30], body: Some("sturdy".into()), slot: Some(1) },
             },
-            r#"{"Hello":{"protocol_version":6,"client_build":"c/1","auth":{"Register":{"display_name":"Cloud"}},"tint":[10,20,30],"appearance_ref":"cloud_model"}}"#,
+            r#"{"Hello":{"protocol_version":8,"client_build":"c/1","auth":{"Register":{"display_name":"Blizz"}},"character":{"tint":[10,20,30],"body":"sturdy","slot":1}}}"#,
         );
         golden(
             ClientMsg::JoinArea {
@@ -704,13 +737,12 @@ mod tests {
         golden(ClientMsg::PartySync, r#""PartySync""#);
         golden(
             ClientMsg::Hello {
-                protocol_version: 6,
+                protocol_version: 8,
                 client_build: "c/1".into(),
                 auth: Auth::Token(Secret::new("fmvt_x")),
-                tint: [0, 0, 0],
-                appearance_ref: None,
+                character: NewCharacter::with_tint([0, 0, 0]),
             },
-            r#"{"Hello":{"protocol_version":6,"client_build":"c/1","auth":{"Token":"fmvt_x"},"tint":[0,0,0],"appearance_ref":null}}"#,
+            r#"{"Hello":{"protocol_version":8,"client_build":"c/1","auth":{"Token":"fmvt_x"},"character":{"tint":[0,0,0],"body":null,"slot":null}}}"#,
         );
     }
 
@@ -718,14 +750,25 @@ mod tests {
     fn golden_server_messages() {
         golden(
             ServerMsg::Welcome {
-                protocol_version: 6,
+                protocol_version: 8,
                 server_build: "s/1".into(),
                 session: SessionId(4),
                 entity: EntityId(5),
                 account: AccountId(6),
                 issued_token: None,
+                character: CharacterCard {
+                    name: "Blizz".into(),
+                    tint: [10, 20, 30],
+                    body: Some("sturdy".into()),
+                    binding: Some("ff7/body/sturdy".into()),
+                    slot: Some(1),
+                    migrated: false,
+                },
             },
-            r#"{"Welcome":{"protocol_version":6,"server_build":"s/1","session":4,"entity":5,"account":6,"issued_token":null}}"#,
+            concat!(
+                r#"{"Welcome":{"protocol_version":8,"server_build":"s/1","session":4,"entity":5,"account":6,"issued_token":null,"#,
+                r#""character":{"name":"Blizz","tint":[10,20,30],"body":"sturdy","binding":"ff7/body/sturdy","slot":1,"migrated":false}}}"#
+            ),
         );
         golden(
             ServerMsg::PartyRejected { error: PartyFailure::Rules(PartyError::PartyFull { party: PartyId(2), max_size: 3 }) },
@@ -1025,8 +1068,17 @@ mod tests {
 
     fn members() -> Vec<BattleMember> {
         vec![
-            BattleMember { entity: EntityId(10), account: AccountId(20), character: 0, level: 6, weapon: None, armor: None, limit: 0 },
-            BattleMember { entity: EntityId(11), account: AccountId(21), character: 1, level: 7, weapon: Some(3), armor: Some(4), limit: 137 },
+            BattleMember { entity: EntityId(10), account: AccountId(20), name: "Blizz".into(), character: 0, level: 6, weapon: None, armor: None, limit: 0 },
+            BattleMember {
+                entity: EntityId(11),
+                account: AccountId(21),
+                name: "Red XIII".into(),
+                character: 1,
+                level: 7,
+                weapon: Some(3),
+                armor: Some(4),
+                limit: 137,
+            },
         ]
     }
 
@@ -1090,8 +1142,8 @@ mod tests {
             },
             concat!(
                 r#"{"EncounterStart":{"battle_id":1,"formation_id":517,"seed":12345,"party":["#,
-                r#"{"entity":10,"account":20,"character":0,"level":6,"weapon":null,"armor":null,"limit":0},"#,
-                r#"{"entity":11,"account":21,"character":1,"level":7,"weapon":3,"armor":4,"limit":137}],"#,
+                r#"{"entity":10,"account":20,"name":"Blizz","character":0,"level":6,"weapon":null,"armor":null,"limit":0},"#,
+                r#"{"entity":11,"account":21,"name":"Red XIII","character":1,"level":7,"weapon":3,"armor":4,"limit":137}],"#,
                 r#""preemptive":false,"back_attack":true,"battle_speed":128,"ticks_per_second":60,"data_fingerprint":""#,
                 "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
                 r#""}}"#
@@ -1505,6 +1557,113 @@ mod tests {
         assert_ne!(probe_hello_version(hello_v6), Some(PROTOCOL_VERSION));
     }
 
+    /// The player's own character (v8): what a registration asks for, what the welcome says, how another player
+    /// reaches the others (the binding is the entity's `appearance_ref`, and has nothing to do with the slot).
+    #[test]
+    fn golden_character_messages() {
+        // A registration that chose a body and a slot, one that chose nothing, and a token login (which ignores it).
+        golden(
+            ClientMsg::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                client_build: "c/1".into(),
+                auth: Auth::Register { display_name: "Wedge".into() },
+                character: NewCharacter { tint: [200, 10, 10], body: Some("slim".into()), slot: Some(8) },
+            },
+            r#"{"Hello":{"protocol_version":8,"client_build":"c/1","auth":{"Register":{"display_name":"Wedge"}},"character":{"tint":[200,10,10],"body":"slim","slot":8}}}"#,
+        );
+        golden(
+            ClientMsg::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                client_build: "c/1".into(),
+                auth: Auth::Register { display_name: "Plain".into() },
+                character: NewCharacter::with_tint([1, 2, 3]),
+            },
+            r#"{"Hello":{"protocol_version":8,"client_build":"c/1","auth":{"Register":{"display_name":"Plain"}},"character":{"tint":[1,2,3],"body":null,"slot":null}}}"#,
+        );
+        // What the server says about an account that predates v8: it never chose a body, it keeps the look it had
+        // (the binding is a canon model) and the character it was fighting as (Cloud, slot 0, which only a migrated
+        // account may hold).
+        golden(
+            CharacterCard {
+                name: "Blizz".into(),
+                tint: [90, 125, 245],
+                body: None,
+                binding: Some("ff7/cloud".into()),
+                slot: Some(0),
+                migrated: true,
+            },
+            r#"{"name":"Blizz","tint":[90,125,245],"body":null,"binding":"ff7/cloud","slot":0,"migrated":true}"#,
+        );
+        // A game without combat slots (the FIXTURE server) tells an identity only.
+        golden(
+            CharacterCard::plain("Fixy", [4, 5, 6]),
+            r#"{"name":"Fixy","tint":[4,5,6],"body":null,"binding":null,"slot":null,"migrated":false}"#,
+        );
+        // Another player's entity: its look is the binding, a generic body; nothing in it names a slot.
+        golden(
+            ServerMsg::PlayerJoined {
+                snapshot: fmv_core::EntitySnapshot {
+                    id: EntityId(12),
+                    pos: Pos::new(1.0, 2.0, 3.0),
+                    facing: 0.5,
+                    anim: AnimState::Idle,
+                    avatar: fmv_core::AvatarAppearance::new("Wedge", [200, 10, 10], Some("ff7/body/slim".into())),
+                },
+            },
+            concat!(
+                r#"{"PlayerJoined":{"snapshot":{"id":12,"pos":{"x":1.0,"y":2.0,"z":3.0},"facing":0.5,"anim":"Idle","#,
+                r#""avatar":{"display_name":"Wedge","tint":[200,10,10],"appearance_ref":"ff7/body/slim"}}}}"#
+            ),
+        );
+        // What a message cannot do without is refused, not guessed: the colour of a request; the name, the colour
+        // and the migration flag of a card. A choice that is `None` may be left out (it reads as `None`, which is
+        // what it would have said).
+        let mut request = serde_json::json!({"tint":[0,0,0],"body":null,"slot":null});
+        request.as_object_mut().unwrap().remove("tint");
+        assert!(serde_json::from_value::<NewCharacter>(request).is_err(), "decoded without a colour");
+        for missing in ["name", "tint", "migrated"] {
+            let mut v = serde_json::json!({"name":"A","tint":[0,0,0],"body":null,"binding":null,"slot":null,"migrated":false});
+            v.as_object_mut().unwrap().remove(missing);
+            assert!(serde_json::from_value::<CharacterCard>(v).is_err(), "decoded without {missing}");
+        }
+        let bare: NewCharacter = serde_json::from_value(serde_json::json!({"tint":[1,2,3]})).unwrap();
+        assert_eq!(bare, NewCharacter::with_tint([1, 2, 3]));
+    }
+
+    /// The reason for the v8 bump: neither side can read the other's `Hello`, and a roster member without a name
+    /// is not one. (The older peer's messages are simulated by types of their shape.) Both directions end in the
+    /// clean refusal, because the version of any `Hello` is readable.
+    #[test]
+    fn a_v7_peer_and_a_v8_peer_cannot_read_each_others_hello_so_the_version_had_to_change() {
+        #[derive(Debug, Deserialize)]
+        enum ClientMsgV7 {
+            #[allow(dead_code)]
+            Hello { protocol_version: u16, client_build: String, auth: serde_json::Value, tint: [u8; 3], appearance_ref: Option<String> },
+        }
+        // A v8 Hello is no v7 Hello (a v7 server cannot decode it and reads its version instead)...
+        let v8 = encode(&ClientMsg::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            client_build: "c".into(),
+            auth: Auth::Token(Secret::new("x")),
+            character: NewCharacter::with_tint([0, 0, 0]),
+        })
+        .unwrap();
+        assert!(decode::<ClientMsgV7>(&v8[4..]).is_err());
+        assert_eq!(probe_hello_version(&v8[4..]), Some(8));
+        // ...and a v7 Hello is no v8 Hello (a v8 server reads its version and answers `ProtocolMismatch`).
+        let v7 = br#"{"Hello":{"protocol_version":7,"client_build":"c","auth":{"Token":"x"},"tint":[0,0,0],"appearance_ref":null}}"#;
+        assert!(decode::<ClientMsgV7>(v7).is_ok(), "the stand-in decodes what it knows");
+        assert!(decode::<ClientMsg>(v7).is_err());
+        assert_eq!(probe_hello_version(v7), Some(7));
+        assert_ne!(probe_hello_version(v7), Some(PROTOCOL_VERSION));
+        // A v7 server's roster member has no name: a v8 client refuses it instead of inventing one.
+        let v7_member = br#"{"entity":10,"account":20,"character":0,"level":6,"weapon":null,"armor":null,"limit":0}"#;
+        assert!(decode::<BattleMember>(v7_member).is_err());
+        // A v7 server's Welcome has no card.
+        let v7_welcome = br#"{"Welcome":{"protocol_version":7,"server_build":"s","session":1,"entity":2,"account":3,"issued_token":null}}"#;
+        assert!(decode::<ServerMsg>(v7_welcome).is_err());
+    }
+
     /// No battle message can carry anything but ids, seeds, numbers and the engine's events: the
     /// fields of the largest one are all fixed-size numbers, flags, ids and a fingerprint.
     #[test]
@@ -1517,6 +1676,8 @@ mod tests {
                 .map(|i| BattleMember {
                     entity: EntityId(u64::MAX - i),
                     account: AccountId(u64::MAX - i),
+                    // The widest name a sender may put there: 24 four-byte characters.
+                    name: "\u{10FFFF}".repeat(MAX_CHARACTER_NAME_CHARS),
                     character: u8::MAX,
                     level: u8::MAX,
                     weapon: Some(u8::MAX),
@@ -1531,7 +1692,9 @@ mod tests {
             data_fingerprint: Fingerprint([0xff; 32]),
         };
         let frame = encode(&msg).unwrap();
-        assert!(frame.len() < 2_048, "{} bytes", frame.len());
+        // Eight members with the widest names, ids and numbers: the names are most of it, and it is still a
+        // few KiB of a 256 KiB frame.
+        assert!(frame.len() < 4_096, "{} bytes", frame.len());
         // A hundred events in one message still fits a frame with room to spare.
         let busy = ServerMsg::BattleEvent {
             battle_id: BattleId(u64::MAX),
@@ -1545,9 +1708,10 @@ mod tests {
     }
 
     #[test]
-    fn a_v3_hello_reads_as_a_v3_hello_and_a_v2_one_is_still_readable_as_a_version() {
+    fn a_hello_of_an_older_version_is_no_longer_a_message_but_its_version_is_still_readable() {
+        // Every Hello of v3 to v7 spelled the colour and the look at the top level: v8 asks for a character.
         let v3 = br#"{"Hello":{"protocol_version":3,"client_build":"x","auth":{"Register":{"display_name":"n"}},"tint":[1,2,3],"appearance_ref":null}}"#;
-        assert!(decode::<ClientMsg>(v3).is_ok());
+        assert!(decode::<ClientMsg>(v3).is_err());
         assert_eq!(probe_hello_version(v3), Some(3));
     }
 
@@ -1558,7 +1722,7 @@ mod tests {
         assert!(decode::<ClientMsg>(v1).is_err());
         assert_eq!(probe_hello_version(v1), Some(1));
         let v2 = br#"{"Hello":{"protocol_version":2,"client_build":"x","auth":{"Register":{"display_name":"n"}},"tint":[1,2,3],"appearance_ref":null}}"#;
-        assert!(decode::<ClientMsg>(v2).is_ok());
+        assert!(decode::<ClientMsg>(v2).is_err(), "no Hello before v8 is a v8 ClientMsg");
         assert_eq!(probe_hello_version(v2), Some(2));
         let future = br#"{"Hello":{"protocol_version":9,"anything":{"at":"all"}}}"#;
         assert_eq!(probe_hello_version(future), Some(9));

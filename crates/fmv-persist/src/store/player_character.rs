@@ -143,13 +143,23 @@ impl Store {
     /// know pointers reads the same file. The pointer's character and the record's own can differ (see
     /// [`LinkedProgress::in_sync`]); that is for the caller to decide, the store never rewrites either.
     pub fn linked_character_progress(&self, account: AccountId, game: GameId) -> Result<Option<LinkedProgress>> {
-        let Some(character) = self.get_player_character(account)? else {
-            return Ok(None);
-        };
+        match self.get_player_character(account)? {
+            Some(character) => self.follow_character_progress(&character, game),
+            None => Ok(None),
+        }
+    }
+
+    /// [`Store::linked_character_progress`] for a record the caller already holds (a login that has just read or
+    /// migrated it): follow its pointer for `game`.
+    pub fn follow_character_progress(&self, character: &PlayerCharacter, game: GameId) -> Result<Option<LinkedProgress>> {
         let Some(ProgressRef::Character { character: expected_character, .. }) = character.game(game).and_then(GameCharacter::character_ref) else {
             return Ok(None);
         };
         let expected_character = *expected_character;
+        let account = character.account_id;
+        if !self.index().contains_account(account.0) {
+            return Err(PersistError::UnknownAccount(account));
+        }
         Ok(self.read_character_progress(account, game)?.map(|record| LinkedProgress { record, expected_character }))
     }
 }
