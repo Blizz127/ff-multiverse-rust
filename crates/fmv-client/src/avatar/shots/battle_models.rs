@@ -426,7 +426,7 @@ fn front_view(lo: [f32; 3], hi: [f32; 3], w: u32, h: u32) -> View {
 const OVERLAY_BIAS: f32 = 3.0;
 
 fn frame_of(models: Vec<SkinnedModel>, view: &View) -> AvatarFrame {
-    AvatarFrame { models, tints: Vec::new(), zoom: view.zoom, overlay_bias: OVERLAY_BIAS, ground: vec![], scenery: None }
+    AvatarFrame { models, tints: Vec::new(), identities: Vec::new(), zoom: view.zoom, overlay_bias: OVERLAY_BIAS, ground: vec![], scenery: None }
 }
 
 /// Draw `frame` in a `view.w` x `view.h` window whose pixels are the camera's: the fitted camera

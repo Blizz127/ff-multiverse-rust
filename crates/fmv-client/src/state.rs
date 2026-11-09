@@ -379,6 +379,8 @@ pub struct ClientState {
     last_rtt: Option<Duration>,
     /// The look the server shows for our own entity (from its snapshots).
     own_appearance: Option<String>,
+    /// The identity colour the server shows for our own entity (from its snapshots).
+    own_tint: Option<[u8; 3]>,
     /// What was last reported of each other player's colour and binding in the CURRENT area (a full snapshot
     /// of the area does not forget it: an unchanged player is not reported again; a change of area does).
     peer_looks: BTreeMap<EntityId, ([u8; 3], Option<String>)>,
@@ -407,6 +409,7 @@ impl ClientState {
             area_changes: 0,
             last_rtt: None,
             own_appearance: None,
+            own_tint: None,
             peer_looks: BTreeMap::new(),
             peer_sightings: VecDeque::new(),
         }
@@ -475,6 +478,16 @@ impl ClientState {
     /// The look the server shows for our own entity (`appearance_ref`), if it said.
     pub fn own_appearance(&self) -> Option<&str> {
         self.own_appearance.as_deref()
+    }
+
+    /// The identity colour the server shows for `entity`, ours or another player's in this area, from its snapshots
+    /// (`None` for one it has not told us of): what the battle scene draws a party member's body in.
+    pub fn tint_of(&self, entity: EntityId) -> Option<[u8; 3]> {
+        if entity == self.self_entity {
+            self.own_tint
+        } else {
+            self.remotes.get(&entity).map(|r| r.tint)
+        }
     }
 
     /// The other players first seen (or whose colour or binding changed) since the last call, oldest first.
@@ -567,6 +580,7 @@ impl ClientState {
         if snap.id == self.self_entity {
             self.own.note_server_pos(now, snap.pos);
             self.own_appearance = kept_appearance(&snap.avatar);
+            self.own_tint = Some(snap.avatar.tint);
             return;
         }
         if self.peers_seen.len() < MAX_PEERS_SEEN {
@@ -1127,6 +1141,28 @@ mod tests {
         // Players that leave take their look with them.
         s.apply(0.2, ServerMsg::PlayerLeft { entity: EntityId(2) });
         assert!(looks(&s).iter().all(|(id, _)| *id != 2));
+    }
+
+    /// The identity colour of a player is what the server's snapshots say about its entity: ours from our own, a
+    /// peer's from its own, nothing for one that has not been mentioned or has left; it follows an update.
+    #[test]
+    fn the_colour_of_a_player_is_what_the_snapshots_say_about_its_entity() {
+        let tinted = |id: u64, tint: [u8; 3]| {
+            let mut e = snap(id, 0.0, 0.0);
+            e.avatar.tint = tint;
+            e
+        };
+        let mut s = state(Pos::new(0.0, 0.0, 0.0));
+        assert_eq!((s.tint_of(EntityId(1)), s.tint_of(EntityId(2))), (None, None), "nothing is known before the first snapshot");
+        s.apply(0.0, ServerMsg::AreaSnapshot { area: plaza(), tick: 1, entities: vec![tinted(1, [70, 130, 245]), tinted(2, [240, 120, 40])], npcs: Vec::new() });
+        assert_eq!(s.tint_of(EntityId(1)), Some([70, 130, 245]), "ours, from our own entity");
+        assert_eq!(s.tint_of(EntityId(2)), Some([240, 120, 40]), "a peer's, from its");
+        assert_eq!(s.tint_of(EntityId(3)), None, "one the server has not mentioned");
+        s.apply(0.1, update(vec![tinted(2, [10, 200, 30])]));
+        assert_eq!(s.tint_of(EntityId(2)), Some([10, 200, 30]));
+        s.apply(0.2, ServerMsg::PlayerLeft { entity: EntityId(2) });
+        assert_eq!(s.tint_of(EntityId(2)), None);
+        assert_eq!(s.tint_of(EntityId(1)), Some([70, 130, 245]));
     }
 
     #[test]

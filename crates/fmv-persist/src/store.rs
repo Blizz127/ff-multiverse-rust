@@ -72,6 +72,7 @@ use crate::model::{
 use crate::snapshot::{self, SnapshotInfo};
 
 mod player_character;
+pub mod restyle;
 
 pub(crate) const ACCOUNTS_DIR: &str = "accounts";
 pub(crate) const AVATARS_DIR: &str = "avatars";

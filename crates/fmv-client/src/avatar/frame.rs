@@ -21,6 +21,7 @@
 use super::anim::{Animator, Who};
 use super::gpu::Tint;
 use super::ground::{self, GroundShape, GroundVertex};
+use super::identity::Identity;
 use super::library::{is_placeholder_body, AvatarAsset, AvatarLibrary};
 use super::scenery::Scenery;
 use super::stage::Stage;
@@ -45,29 +46,31 @@ pub const RING_RADIUS_UNITS: f32 = 5.5;
 const WHITE: [u8; 3] = [255, 255, 255];
 const GOLD: [u8; 3] = crate::render::RING_RGB;
 
-/// The least of each colour channel a placeholder body keeps whatever its player's colour: a channel of the
-/// identity colour at 0 scales the model's own colour by this, at 255 leaves it as it is (see [`body_tint`]).
-/// High enough that the texture detail of the model (a face, clothes, the shading of its vertex colours) stays
-/// readable under any colour, low enough that the colour is plainly the player's.
+/// The least of each colour channel a placeholder body kept under its player's colour in the OLD look: a channel of
+/// the identity colour at 0 scaled the model's own colour by this, at 255 left it as it was (see [`body_tint`]). The
+/// look is now [`super::identity`]'s; this stays as the reference the tests compare it with.
+#[cfg(test)]
 pub const BODY_TINT_FLOOR: f32 = 0.45;
 
-/// The colour factor a placeholder body is drawn with: its player's identity colour `c` gives each channel
-/// `BODY_TINT_FLOOR + (1 - BODY_TINT_FLOOR) * c / 255`, so a white identity leaves the model as it is and
-/// a saturated one pulls it towards that colour (the model's own texture is multiplied by it, never replaced).
-/// Opaque: the tint only colours.
+/// The colour factor a placeholder body was drawn with in the OLD look: its player's identity colour `c` gave each
+/// channel `BODY_TINT_FLOOR + (1 - BODY_TINT_FLOOR) * c / 255`, so a white identity left the model as it was and a
+/// saturated one pulled it towards that colour (the model's own colour multiplied by it, never replaced; which is why
+/// it hardly showed on dark or saturated cloth). Opaque. Kept for the tests that draw the old look beside the new.
+#[cfg(test)]
 pub fn body_tint(identity: [u8; 3]) -> Tint {
     let channel = |c: u8| BODY_TINT_FLOOR + (1.0 - BODY_TINT_FLOOR) * f32::from(c) / 255.0;
     Tint { rgb: identity.map(channel), alpha: 1.0 }
 }
 
-/// What colours the model of `player`: a placeholder body takes its player's identity colour ([`body_tint`]);
-/// everything else keeps its own colours and is marked on the ground only (a canon model, which a legacy
-/// binding names, the default character that stands in for an unknown look, and a non-player character).
-fn model_tint(player: &AvatarPlayer<'_>, asset: &AvatarAsset) -> Tint {
+/// What colours the model of `player`: a placeholder body takes its player's identity colour
+/// ([`super::identity`]); everything else keeps its own colours and is marked on the ground only (a canon model,
+/// which a legacy binding names, the default character that stands in for an unknown look, and a non-player
+/// character).
+fn model_identity(player: &AvatarPlayer<'_>, asset: &AvatarAsset) -> Identity {
     if player.npc.is_none() && is_placeholder_body(&asset.appearance) {
-        body_tint(player.tint)
+        Identity::of(player.tint)
     } else {
-        Tint::NONE
+        Identity::NONE
     }
 }
 
@@ -112,9 +115,13 @@ pub struct SkinnedModel {
 /// Everything the renderer needs to draw the avatars of one frame.
 pub struct AvatarFrame {
     pub models: Vec<SkinnedModel>,
-    /// The colour factor of each of `models`, in the same order (a model past the end of this list, or every model
-    /// when it is empty, is drawn as it is): a placeholder body in its player's colour, nothing for the rest.
+    /// The colour factor and opacity of each of `models`, in the same order (a model past the end of this list, or
+    /// every model when it is empty, is drawn as it is). The field leaves it empty: its players' colours are
+    /// [`AvatarFrame::identities`]; the battle's (a fading enemy, an effect's glow) are `BattleFrame::tints`.
     pub tints: Vec<Tint>,
+    /// The identity colour of each of `models`, in the same order (a model past the end of this list, or every model
+    /// when it is empty, has none): a placeholder body in its player's colour, nothing for the rest.
+    pub identities: Vec<Identity>,
     /// The camera's focal length ([`super::stage::StageCamera::zoom`]).
     pub zoom: f32,
     /// Depth bias of the face overlays, in camera-space units.
@@ -298,7 +305,7 @@ impl Avatars {
         order.sort_by(|a, b| is_npc(a.0).cmp(&is_npc(b.0)).then(a.1.total_cmp(&b.1)).then(a.0.cmp(&b.0)));
 
         let mut models: Vec<SkinnedModel> = Vec::new();
-        let mut tints: Vec<Tint> = Vec::new();
+        let mut identities: Vec<Identity> = Vec::new();
         let mut ground_marks_by_player: Vec<(usize, Vec<GroundShape>)> = Vec::new();
         let mut markers: Vec<usize> = Vec::new();
         let mut anchors = HashMap::new();
@@ -338,7 +345,7 @@ impl Avatars {
                 anchors.insert(p.who, anchor);
             }
             ground_marks_by_player.push((i, ground_marks(view, p, stand_in, scale, feet_depth as f32)));
-            tints.push(model_tint(p, &asset));
+            identities.push(model_identity(p, &asset));
             models.push(SkinnedModel { asset, positions });
         }
 
@@ -350,7 +357,8 @@ impl Avatars {
         Built {
             frame: AvatarFrame {
                 models,
-                tints,
+                tints: Vec::new(),
+                identities,
                 zoom: stage.camera.zoom as f32,
                 overlay_bias: OVERLAY_BIAS_MODEL_UNITS * scale,
                 ground,
@@ -446,10 +454,11 @@ pub(crate) mod tests {
         assert!((a[2] - b[2]).abs() > 0.2 && (a[0] - b[0]).abs() > 0.2, "{a:?} {b:?}");
     }
 
-    /// What is tinted: a placeholder body takes its own player's colour; a canon model (a legacy binding), the
-    /// default character standing in for an unknown look and a non-player character keep their own colours.
+    /// What carries an identity colour: a placeholder body takes its own player's colour; a canon model (a legacy
+    /// binding), the default character standing in for an unknown look and a non-player character keep their own
+    /// colours. The frame's tints stay empty (they are for opacity and glow), and so does the old body tint.
     #[test]
-    fn a_placeholder_body_is_tinted_with_its_players_colour_and_nothing_else_is() {
+    fn a_placeholder_body_carries_its_players_identity_colour_and_nothing_else_does() {
         use fmv_ff7::playable::PLACEHOLDER_BODIES;
         let (mut avatars, _) = avatars(vec![]);
         let (view, stage) = (view(), stage());
@@ -475,29 +484,32 @@ pub(crate) mod tests {
         ];
         let built = avatars.frame(&view, &stage, &players, 0.0).frame;
         assert_eq!(built.models.len(), players.len());
-        assert_eq!(built.tints.len(), built.models.len(), "one tint per model, in the models' order");
-        // Which model is whose: the frame lists the players nearest first, so find each by the tint it was given
-        // (a body) or by what it is (the others).
+        assert_eq!(built.identities.len(), built.models.len(), "one identity per model, in the models' order");
+        assert!(built.tints.is_empty(), "the field's colours are identities: nothing is scaled or faded");
+        // Which model is whose: the frame lists the players nearest first, so find each by what it is.
         let by_asset = |name: &str| built.models.iter().position(|m| m.asset.appearance.appearance_ref == name);
-        let tints: Vec<(&str, Tint)> = built.models.iter().zip(&built.tints).map(|(m, t)| (m.asset.appearance.appearance_ref, *t)).collect();
+        let all: Vec<(&str, Identity)> = built.models.iter().zip(&built.identities).map(|(m, i)| (m.asset.appearance.appearance_ref, *i)).collect();
         // The canon model, the stand-in (Cloud) and the non-player character are untouched.
         for plain in ["ff7/barret", "ff7/cloud", "npc"] {
-            let i = by_asset(plain).unwrap_or_else(|| panic!("{plain} was drawn: {tints:?}"));
-            assert_eq!(built.tints[i], Tint::NONE, "{plain} keeps its own colours");
+            let i = by_asset(plain).unwrap_or_else(|| panic!("{plain} was drawn: {all:?}"));
+            assert_eq!(built.identities[i], Identity::NONE, "{plain} keeps its own colours");
         }
-        // The two bodies carry their own players' colours: the colour a body player has, not another's.
-        let coloured: Vec<Tint> = built.tints.iter().copied().filter(|t| *t != Tint::NONE).collect();
-        assert_eq!(coloured.len(), 2, "{tints:?}");
-        assert!(coloured.contains(&body_tint([200, 40, 40])) && coloured.contains(&body_tint([40, 40, 200])), "{tints:?}");
-        // The same body worn by two players is tinted for each of them.
+        // The two bodies carry their own players' colours at full strength: the colour a body player has, not
+        // another's.
+        let coloured: Vec<Identity> = built.identities.iter().copied().filter(|i| *i != Identity::NONE).collect();
+        assert_eq!(coloured.len(), 2, "{all:?}");
+        assert!(coloured.contains(&Identity::of([200, 40, 40])) && coloured.contains(&Identity::of([40, 40, 200])), "{all:?}");
+        assert!(coloured.iter().all(|i| i.strength == 1.0));
+        // The same body worn by two players carries the colour of each of them (one asset, two draws).
         let twins = [make(1, -60.0, Some(body_a), [200, 40, 40]), make(2, 60.0, Some(body_a), [40, 40, 200])];
         let built = avatars.frame(&view, &stage, &twins, 0.0).frame;
         assert_eq!(built.models.len(), 2);
         assert_eq!(built.models[0].asset.id, built.models[1].asset.id, "one asset on the GPU");
-        assert_ne!(built.tints[0], built.tints[1], "two tints for it");
-        // A player that is only a marker has no model and so no tint.
+        assert_ne!(built.identities[0], built.identities[1], "two colours for it");
+        // A player that is only a marker has no model and so no identity.
         let (mut broken, _) = avatars_failing(body_a);
-        assert!(broken.frame(&view, &stage, &twins[..1], 0.0).frame.tints.is_empty());
+        let marker = broken.frame(&view, &stage, &twins[..1], 0.0).frame;
+        assert!(marker.identities.is_empty() && marker.models.is_empty());
     }
 
     fn avatars_failing(appearance: &'static str) -> (Avatars, Rc<RefCell<Vec<&'static str>>>) {

@@ -5,6 +5,9 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 license.workspace = true
+# `src/bin/` holds more than one binary (the operator tool `fmv-characters`): `cargo run -p fmv-server` still
+# runs the server.
+default-run = "fmv-server"
 
 [dependencies]
 fmv-core.workspace = true

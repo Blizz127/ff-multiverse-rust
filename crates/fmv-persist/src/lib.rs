@@ -119,4 +119,5 @@ pub use model::{
     MAX_RECORD_BYTES, MAX_TOKEN_BYTES, SCHEMA_VERSION,
 };
 pub use snapshot::{restore_snapshot, SnapshotInfo};
+pub use store::restyle::{Restyle, RestyleAdded, RestyleError, RestyleReport};
 pub use store::{Store, StoreOptions, DEFAULT_MAX_ACCOUNTS};

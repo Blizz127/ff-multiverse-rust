@@ -297,7 +297,37 @@ library set, or next to a `--ff7-flevel` file) and are never sent over the netwo
 carries only the binding's id. A binding the tables do not know is drawn as Cloud; every player gets
 a ring on the ground in their tint (yours has a white outline, a party member's a gold ring
 around it). Without a `char.lgp`, in a FIXTURE area, or for a character that fails to load, the
-plain markers are drawn as before. The picture of an FF7 field is drawn **tile by tile with a depth
+plain markers are drawn as before.
+
+*The player's colour on a model (field and battle).* The colour is not multiplied into the model any more (that
+left a dark blue cloak under an orange player a darker, greyer blue: `[57,66,109]` came out `[55,47,58]`, and
+skin was pulled to brown). It is carried per DRAW (an `Identity`, a second instance-rate vec4 next to the tint:
+a model is never copied per player, because the client's GPU cache holds 32) and the fragment shader repaints
+the **cloth** in the colour's hue and saturation at the cloth's own value, lifted (`0.2 + 0.8 * v^0.6`) so that
+dark cloth shows it while the shading, belts and shoes stay told apart, and bright cloth stays a paler pastel;
+**skin-hued texels** (a smooth hue, saturation and value mask) and the **face decals** keep their own colours under
+a 5% tint; white, grey and black colours fall back to the old multiplicative look, and a model without an identity
+is drawn bit for bit as it always was (enemies, canon models, non-player characters, effects and fades are
+untouched). A CPU mirror of the look is the test oracle and the shader agrees with it on 99.6% of 110 116 body
+pixels (the rest are face decals); an sRGB target and a plain one show one picture (99.89% of pixels within 4
+levels). With a blue player: the dark cloak `[57,66,109]` becomes `[54,91,164]`, dark suit grey `[48,48,52]`
+`[46,71,120]`; with an orange one `[157,86,43]` and `[118,68,34]`; skin `[230,180,150]` moves by 5 levels at most
+(the old tint moved it by 28 to 57). At 1x two players' bodies are told apart at a glance (mean colour distance
+of two bodies 25 of 441 before, 119 after). **In battle** the party members' BODIES (not their swords, not the
+enemies, not the location) wear the colour of the player each member is, the same look: Barret's slot in a blue
+player's colour is blue clothes with his own skin, a Tifa in an orange player's is orange (a colour that is not
+known yet, for instance before that player's snapshot arrived, leaves the model as it was and is picked up as soon
+as it is). Limits: pure black cloth (all channels 0) only gets a very dark shade of the colour (near-black cloth,
+which is what the models contain, is lifted plainly); an orange or peach colour sits near skin hue, so those
+players' pastel clothes stay told apart from their skin by saturation and brightness only; and the `sturdy`
+body's covered face (red eyes and a brown visor are ordinary coloured polygons, not face decals) is repainted with
+the rest, so its eyes turn pale. The pictures come from the real-data tests (`cargo test -p fmv-client --
+--ignored offscreen_field_identity --test-threads=1`, `offscreen_battle_identity_before_after`, with
+`FMV_FF7_LIBRARY` and `FMV_SHOT_DIR`): each body in four colours as untinted | old | new from one frame, a 1920x1080
+overview, and the battle before and after from one scene at one instant (42 421 pixels differ, all of them on the
+party's bodies).
+
+The picture of an FF7 field is drawn **tile by tile with a depth
 per tile**, in the same depth-tested pass as the models, as the game does it: a layer-2 tile is
 `4 * id` units from the camera (the rule is derived from the game's own stored values and checked
 on all 702 owned fields in `fmv-ff7`), layer 4 is in front of everything, layers 1 and 3 behind it,
@@ -549,6 +579,24 @@ started from a faked full one is not the account's own, so the end-of-battle sav
 member spent its limit or was knocked out. A smoke run can never overwrite a real gauge. The server also logs
 every Magic, Defend and Item it applies (`magic used`, `defend used`, `item used`) next to `limit used` and
 `escape tried`.
+
+**The opposite aid: made-up numbers that ARE stored (`--debug-bonus-exp`, `--debug-bonus-limit`).** A win pays
+about 16 of the ~250 experience a level costs and these weak enemies rarely hurt anybody, so over real processes a
+new character never levelled up or filled a gauge, and "a level and a limit gauge survive a real server restart"
+went unproven (the slice smoke used to say so in a note). `fmv-server --debug-encounters --debug-bonus-exp N
+--debug-bonus-limit M` closes it: every won battle pays each member that fought on `N` experience MORE than the
+battle gave it, and every member's end-of-battle limit gauge is kept `M` higher than the battle left it (up to the
+cap), both through the ordinary save path (the mirror, the saver, the game's own level-up rule), so what is stored
+afterwards is indistinguishable from earned numbers. That is why they are guarded: each is refused unless
+`--debug-encounters` is given too, **both are refused on the default state directory** (name a throw-away one with
+`--state-dir`, or use `--ephemeral`), `--debug-bonus-limit` is refused together with `--debug-limit-full` (whose
+early return would make it do nothing), the server warns about them loudly when it starts, and every use is logged
+(`battle reward ... exp=<paid> ... debug_bonus_exp=N`, `limit kept ... debug_bonus_limit=M`). The `BattleEnd` that
+clients verify by replay still carries what the battle itself earned (only the payment is bigger), so replays never
+diverge. Nothing is written that says a number was made up: only ever run it on a throw-away state directory.
+`scripts/slice-smoke.sh` runs its FIRST server with both (900 and 100) and proves that both new characters ended
+session 1 at a higher level than they joined at (told `leveled_up=true`, stored) with a non-empty gauge, and that the
+servers it then restarts WITHOUT the flags tell and fight them at exactly those levels and gauges.
 `scripts/battle-smoke.sh --commands --build` uses all of it on the real field `md1stin` and owned data: one
 server (with both debug flags) stays up through two runs of the same two bots; in the first they follow
 `defend,item:0,magic:0,limit` and `magic:0,magic:9999,item:0,defend,limit` (spell 9999 does not exist: that entry
@@ -585,7 +633,8 @@ protocol and in the store:
   members other than Cloud, who stays the canon protagonist; two players may hold the same slot; a
   registration that names none gets Barret's. In battle the party panel, the HP list, the banners and the
   logs show the player's own name; the engine uses the slot's template, and the battle model is the
-  slot's own battle model (a placeholder until players have battle models of their own).
+  slot's own battle model (a placeholder until players have battle models of their own), drawn in the
+  player's identity colour like the field body ("The player's colour on a model").
 
 The server keeps it in `<state>/server/characters/<account>.json` (`fmv-persist`'s `PlayerCharacter`):
 the identity and, per game, the binding, the slot and **pointers** to where the progress lives.
@@ -609,6 +658,35 @@ shared battle whose roster shows their own names with their slots' templates whi
 stays an NPC of the field; the server process is stopped and started again, the same players log in
 again and are told exactly what they ended with (a login changes no record byte), and a second battle on
 the restarted server pays on top of what was saved, to the point.
+
+**Converting an existing account to an original look (`fmv-characters`).** An account made before protocol v8
+(the preview's Blizz is one) is a canon look and the character that look named; to turn it into a character with
+a placeholder body of its own, with the server STOPPED:
+
+```
+target/release/fmv-characters <state-dir> show <account-id|name>
+target/release/fmv-characters <state-dir> restyle <account-id|name> --body <lean|sturdy|slight> [--tint rrggbb] [--dry-run]
+```
+
+`<state-dir>` is the SERVER's state directory (the one with `index.log`, `accounts/`, `avatars/`, `characters/` and
+`progression/`; there is no default, and a path that is not one is refused before anything is created). The tool
+opens the store like a server does, so while a server holds the directory it is refused (`locked by pid ...`, exit
+1) and nothing is touched; copy the directory first anyway. `restyle` changes exactly `identity.body`, the
+`identity.tint` (only with `--tint`) and the game's binding (`ff7/body/<body>`) in `characters/<id>.json`, and never
+the slot (so the level curve stays what it was), the pointers, the name, the origin or any other file: the avatar
+profile (what a rolled-back v7 reads, so a rollback shows the account exactly as before), the account record,
+the index and every `progression/<id>/*.json` (level, experience, gil, AP, items, limit gauge, story) stay byte for
+byte what they were. An account that has no record yet (every v6/v7 account until its first v8 login) first gets
+the record its first login would have made, built by the server's own migration rule (`fmv_server::admin`), and
+then the look change, in ONE atomic write. It prints a before/after summary (`slot (unchanged): 0`, `body: (none)
+-> sturdy`, `binding: ff7/cloud -> ff7/body/sturdy`, the tint) and a verification block that re-reads every file it
+did not write and prints its sha256 before and after (`-> same`); `--dry-run` shows the same plan and writes
+nothing; asking for a body the game does not offer (`cloud`, a typo) is refused with the list. Exit codes: 0 done
+(a dry run, or a restyle that had nothing to change), 1 refused, 2 usage. Tests (`fmv-persist`'s
+`restyle_character` and `fmv-server`'s `character_admin`, over temp directories only) snapshot the whole tree of
+exact v7- and v8-shaped state directories before and after and require every file but `characters/<id>.json`
+(and the lock) byte for byte identical, a dry run that writes nothing, and the refusal while locked. The tool ships
+in the release package next to `fmv-server`.
 
 **Protocol v8** (`fmv-protocol`) carries all of the above; its module docs describe the flow,
 and golden JSON tests pin the wire format (the engine's own event, command and outcome types

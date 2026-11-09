@@ -51,6 +51,18 @@
 //!   reason=debug-limit-full`) and every account keeps the gauge it really has, even when a member spent
 //!   its limit or was knocked out. A test run with this flag can therefore never overwrite a real account's
 //!   gauge. The server logs the flag loudly when it starts.
+//! * **`--debug-bonus-exp N` and `--debug-bonus-limit N`** (`BattleSettings::debug_bonus_exp` /
+//!   `debug_bonus_limit`, debug flags that need `--debug-encounters` and which `main` refuses to run on the default
+//!   state directory, or together with `--debug-limit-full`): they exist so that a smoke run over real processes can
+//!   make a NEW character level up and fill a limit gauge in one short session, and then prove both survive a real
+//!   server restart (a win here pays about 16 of the ~250 experience a level costs, and these weak enemies rarely hurt
+//!   anybody). Unlike `--debug-limit-full` they DO store what they make up: the experience bonus is added to each
+//!   member that fought on at PAY time (`pay_members`: the mirror, the saver, the game's own level-up rule and the
+//!   `battle reward` line, whose `exp=` is what was really paid and which says `debug_bonus_exp=N`), and the gauge
+//!   kept at the end (`keep_limits`) is the one the battle left plus `N`, up to the cap (`limit kept ... debug_bonus_limit=N`).
+//!   The `BattleEnd` that clients verify by replay is built before, so it carries only what the battle itself earned.
+//!   Nothing else is written anywhere: no file, no field, no record says that a number was made up, which is why
+//!   they only ever run against a throw-away state directory.
 //! * A victory pays the members that fought on (`BattleEnd::rewards`, split by
 //!   `fmv_protocol::split_rewards`) and drops items: the server rolls them after the outcome from the
 //!   battle's seed (`BattleRules::roll_drops`, logged) and deals them to the living members
@@ -664,13 +676,18 @@ impl World {
             self.logs.info(format!("limit not kept battle={} reason=debug-limit-full", id.0));
             return;
         }
+        // `--debug-bonus-limit`: the gauge kept is the one the battle left plus the bonus, up to the game's cap. It goes
+        // down the same road as any other (the saver, the mirror, the `limit kept` line, which says so).
+        let bonus = self.battle.as_ref().map_or(0, |bw| u16::from(bw.settings.debug_bonus_limit));
+        let cap = self.battle.as_ref().map_or(u16::MAX, |bw| bw.rules().progress_limits().max_limit);
         for (i, member) in battle.members.iter().enumerate() {
             let Some(actor) = u8::try_from(i).ok().map(ActorId) else { continue };
             // Only a member the engine gave a limit break has a gauge of its own to keep: a player has none (protocol
             // v9), so the gauge its account holds is left exactly as it is and is never overwritten by the 0 the
-            // engine reports for a character without one.
+            // engine reports for a character without one (and the debug bonus has no gauge to add to either).
             let Some(account) = member.info.account().filter(|_| battle.state.limit_for(actor).is_some()) else { continue };
             let end = battle.state.limit_gauge(actor);
+            let end = if bonus > 0 { end.saturating_add(bonus).min(cap) } else { end };
             if end == member.info.limit {
                 continue;
             }
@@ -683,8 +700,9 @@ impl World {
                 Some(false) => "NOT QUEUED (the saver has stopped: the server is shutting down)",
                 None => "off (no saver)",
             };
+            let debug = if bonus > 0 { format!(" debug_bonus_limit={bonus}") } else { String::new() };
             self.logs.info(format!(
-                "limit kept battle={} account={} character={character} limit={end} was={} mirrored={mirrored} saving={saving}",
+                "limit kept battle={} account={} character={character} limit={end} was={} mirrored={mirrored} saving={saving}{debug}",
                 id.0, account.0, member.info.limit
             ));
         }
@@ -701,6 +719,7 @@ impl World {
     fn pay_members(&mut self, id: BattleId, members: &[Member], rewards: &[BattleReward]) -> Vec<(EntityId, Outbound)> {
         let mut told = Vec::new();
         let Some(rules) = self.battle.as_ref().map(|bw| Arc::clone(&bw.settings.rules)) else { return told };
+        let bonus_exp = self.battle.as_ref().map_or(0, |bw| bw.settings.debug_bonus_exp);
         for r in rewards {
             let Some(member) = members.iter().find(|m| m.info.account() == Some(r.account)) else { continue };
             let connected = member.connected;
@@ -715,6 +734,16 @@ impl World {
                 ));
                 continue;
             }
+            // `--debug-bonus-exp`: a member that fought on is paid the bonus on top of what the battle gave it. This is what
+            // is paid, saved, applied to the mirror and logged; the `BattleEnd` the clients verify by replay was built
+            // before and says what the battle itself earned.
+            let boosted;
+            let r = if bonus_exp > 0 {
+                boosted = BattleReward { exp: r.exp.saturating_add(bonus_exp), ..r.clone() };
+                &boosted
+            } else {
+                r
+            };
             // The store is first in line: it gets every payment, a player online or not.
             let queued = self.saver.as_ref().map(|saver| saver.save(SaveJob::reward(r.account, member.info.character, r.clone())));
             let mut effect = String::from("no mirror: the player is not online");
@@ -744,8 +773,9 @@ impl World {
                 None => "off (no saver)",
             };
             // New keys go at the end of the `key=value` part (scripts read it by key).
+            let debug = if bonus_exp > 0 { format!(" debug_bonus_exp={bonus_exp}") } else { String::new() };
             self.logs.info(format!(
-                "battle reward battle={} account={} exp={} gil={} ap={} delivered={connected} saving={saving} dropped={:?}: {effect}",
+                "battle reward battle={} account={} exp={} gil={} ap={} delivered={connected} saving={saving} dropped={:?}{debug}: {effect}",
                 id.0,
                 r.account.0,
                 r.exp,
@@ -2210,6 +2240,161 @@ mod tests {
         assert_eq!(jobs[0].account, a.account);
         // B's mirror is exactly what it was.
         assert_eq!(w.players.get(&b.entity).unwrap().progress, Some(Progress { character: 0, level: 5, exp: 40, ap: 0, gil: 0, limit: 0 }));
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // --debug-bonus-exp / --debug-bonus-limit: made-up numbers through the ordinary road
+    // ---------------------------------------------------------------------------------------------
+
+    /// The experience bonus is paid to a member that fought on and only to it, on top of what the battle gave it, and it
+    /// goes down the ordinary road: the mirror (the game's own level-up rule), the saver and the log line, which says what
+    /// was really paid and that it was a debug bonus. A member with nothing to be paid gets no bonus either.
+    #[test]
+    fn the_debug_experience_bonus_is_paid_on_top_to_the_members_that_fought_on_through_the_ordinary_road() {
+        let t0 = Instant::now();
+        let mut s = settings(SyntheticRules::default());
+        s.debug_bonus_exp = 300;
+        let (mut w, mut rx) = world_with_saver(s);
+        let (mut a, b) = party_of_two(&mut w, t0);
+        a.drain();
+        let members: Vec<Member> = [(&a, 0u8), (&b, 1u8)]
+            .iter()
+            .map(|(seat, character)| Member {
+                info: BattleMember::player(seat.entity, seat.account, "Tester", *character, 5, 0),
+                connected: true,
+            })
+            .collect();
+        let rewards = [BattleReward::new(a.account, 24, 40, 4), BattleReward::new(b.account, 0, 0, 0)];
+        let told = w.pay_members(BattleId(1), &members, &rewards);
+        let said = |i: usize| match &*told[i].1 {
+            ServerMsg::CharacterProgress { level, exp, gil, ap, leveled_up, .. } => (*level, *exp, *gil, *ap, *leveled_up),
+            other => panic!("{other:?}"),
+        };
+        // 40 + 24 + 300 = 364 is exactly level 14's threshold (2 * 14 * 13): many levels, by the game's own rule.
+        assert_eq!(said(0), (14, 364, 40, 4, true), "paid 24 and the 300 bonus; gil and AP are not touched");
+        assert_eq!(said(1), (5, 40, 0, 0, false), "nothing earned, so no bonus either");
+        let jobs = saved(&mut rx);
+        assert_eq!(jobs, vec![crate::saver::SaveJob::reward(a.account, 0, BattleReward::new(a.account, 324, 40, 4))], "what is saved is what was paid");
+        let logs = logs_of(&mut w);
+        assert!(
+            logs.iter().any(|l| l.starts_with(&format!("battle reward battle=1 account={} exp=324 gil=40 ap=4 ", a.account.0)) && l.contains(" debug_bonus_exp=300")),
+            "{logs:?}"
+        );
+        assert_eq!(
+            logs.iter().filter(|l| l.starts_with("battle reward") && l.contains("debug_bonus")).count(),
+            1,
+            "only the paid member's line says so, the unpaid member's does not: {logs:?}"
+        );
+    }
+
+    /// Through a real won battle: the `BattleEnd` the clients verify by replay (the harness replays it and checks the
+    /// rewards) still carries what the battle itself earned, and what the player is told and what is saved is what was paid.
+    #[test]
+    fn the_debug_experience_bonus_leaves_the_battle_end_the_clients_verify_as_it_was() {
+        let rules = SyntheticRules::default();
+        let t0 = Instant::now();
+        let mut s = settings(rules);
+        s.debug_bonus_exp = 300;
+        let (mut w, mut rx) = world_with_saver(s);
+        let mut a = seat(&mut w, "A", t0); // Cloud, level 5, 40 experience
+        // Formation 0 is one dummy: 12 experience, 20 gil, 2 AP.
+        assert_eq!(w.request_encounter(a.entity, Some(0), t0), BattleReply::Done);
+        play_out(&mut w, &mut [&mut a], &rules, t0); // (it replays the battle and checks the BattleEnd against it)
+        let ends: Vec<Vec<BattleReward>> = a
+            .log
+            .iter()
+            .filter_map(|m| match m {
+                ServerMsg::BattleEnd { rewards, .. } => Some(rewards.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ends, vec![vec![BattleReward::new(a.account, 12, 20, 2)]], "the clients verify what the battle earned");
+        // 40 + 12 + 300 = 352: level 13 (312), the next one at 364.
+        assert_eq!(*progress_msgs(&mut a).last().unwrap(), (0, 13, 352, 12, 20, 2, true));
+        assert_eq!(saved(&mut rx), vec![crate::saver::SaveJob::reward(a.account, 0, BattleReward::new(a.account, 312, 20, 2))]);
+    }
+
+    /// The limit bonus: the gauge kept is the one the battle left plus the bonus, up to the game's cap, saved and mirrored
+    /// like any other, logged with the bonus, and the next battle starts with it.
+    #[test]
+    fn the_debug_limit_bonus_is_kept_saved_mirrored_capped_and_carried_into_the_next_battle() {
+        let rules = player_limit_rules();
+        let t0 = Instant::now();
+        let mut s = settings(rules);
+        s.debug_bonus_limit = 100;
+        let (mut w, mut rx) = world_with_saver(s);
+        let mut a = seat(&mut w, "A", t0); // an empty gauge
+        let started_with = |seat: &mut Seat| match seat.battle_msgs().last() {
+            Some(ServerMsg::EncounterStart { party, .. }) => party[0].limit,
+            other => panic!("{other:?}"),
+        };
+        // Three battles in a row. What a battle leaves is read from a replay of what the player was told (the oracle the
+        // other limit tests use), so the arithmetic is the engine's, not a number copied here: the kept gauge is that plus
+        // 100, up to the cap; it is what is saved and mirrored, and what the next battle starts with.
+        let mut start = 0u16;
+        let mut kept_gauges = Vec::new();
+        for battle in 1..=3u64 {
+            assert_eq!(w.request_encounter(a.entity, Some(0), t0), BattleReply::Done);
+            assert_eq!(started_with(&mut a), start, "battle {battle} starts with the gauge the last one kept");
+            play_out(&mut w, &mut [&mut a], &rules, t0);
+            let left = replayed_gauges(&mut a, &rules)[0];
+            let kept = (left + 100).min(255);
+            let jobs = limits_of(&saved_all(&mut rx));
+            if kept == start {
+                assert!(jobs.is_empty(), "a gauge that did not move writes nothing: {jobs:?}");
+            } else {
+                assert_eq!(jobs, vec![(a.account, 0, kept)], "battle {battle}: left {left}, kept {kept}");
+            }
+            assert_eq!(mirrored_limit(&w, &a), kept);
+            let logs = logs_of(&mut w);
+            if kept != start {
+                let line = format!("limit kept battle={battle} account={} character=0 limit={kept} was={start} mirrored=true saving=queued debug_bonus_limit=100", a.account.0);
+                assert!(logs.contains(&line), "{line}\n{logs:?}");
+            }
+            kept_gauges.push(kept);
+            start = kept;
+        }
+        assert!(kept_gauges[0] > 100, "the first battle kept the bonus on top of what it left: {kept_gauges:?}");
+        assert!(kept_gauges.contains(&255) && kept_gauges.iter().all(|g| *g <= 255), "the cap is reached and holds: {kept_gauges:?}");
+    }
+
+    /// Under the real rule (players have no limit break, protocol v9) there is no gauge for the debug bonus to be added
+    /// to: a player's stored gauge is left exactly as it is, bonus or not, and nothing is queued, mirrored or logged as
+    /// kept. (A debug run can therefore never turn a player's gauge into a made-up number either.)
+    #[test]
+    fn the_debug_limit_bonus_never_touches_the_stored_gauge_of_a_player_who_has_no_limit_break() {
+        let rules = SyntheticRules::default();
+        let t0 = Instant::now();
+        let mut s = settings(rules);
+        s.debug_bonus_limit = 100;
+        let (mut w, mut rx) = world_with_saver(s);
+        let stored = Progress { character: 0, level: 5, exp: 40, ap: 0, gil: 0, limit: 200 };
+        let mut a = seat_as(&mut w, "A", t0, ProgressSeed::of(0, Some(stored)));
+        assert_eq!(w.request_encounter(a.entity, Some(0), t0), BattleReply::Done);
+        play_out(&mut w, &mut [&mut a], &rules, t0);
+        let jobs = saved_all(&mut rx);
+        assert!(limits_of(&jobs).is_empty(), "no gauge is queued for a character that has none: {jobs:?}");
+        assert_eq!(mirrored_limit(&w, &a), 200, "the mirror keeps the stored gauge too");
+        let logs = logs_of(&mut w);
+        assert!(!logs.iter().any(|l| l.starts_with("limit kept")), "{logs:?}");
+    }
+
+    /// With the flags off (the default) nothing is added anywhere: the lines do not mention them either.
+    #[test]
+    fn without_the_debug_bonus_flags_nothing_is_added_and_the_lines_do_not_mention_them() {
+        let rules = player_limit_rules();
+        let t0 = Instant::now();
+        let (mut w, mut rx) = world_with_saver(settings(rules));
+        let mut a = seat(&mut w, "A", t0);
+        assert_eq!(w.request_encounter(a.entity, Some(0), t0), BattleReply::Done);
+        play_out(&mut w, &mut [&mut a], &rules, t0);
+        let left = replayed_gauges(&mut a, &rules)[0];
+        let jobs = saved_all(&mut rx);
+        assert!(jobs.iter().any(|j| *j == crate::saver::SaveJob::reward(a.account, 0, BattleReward::new(a.account, 12, 20, 2))), "{jobs:?}");
+        assert_eq!(limits_of(&jobs), if left == 0 { vec![] } else { vec![(a.account, 0, left)] }, "the gauge the battle left, nothing added");
+        assert_eq!(mirrored_limit(&w, &a), left);
+        let logs = logs_of(&mut w);
+        assert!(!logs.iter().any(|l| l.contains("debug_bonus")), "{logs:?}");
     }
 
     /// Without a saver (the world's unit tests, a server that stores nothing) payments still reach

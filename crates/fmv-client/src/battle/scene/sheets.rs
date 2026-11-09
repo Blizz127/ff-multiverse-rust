@@ -298,8 +298,9 @@ impl Rig {
             clear_rgb: [70, 78, 92],
             stage: Vec::new(),
             location: None,
-            models: AvatarFrame { models, tints: Vec::new(), zoom: view.zoom as f32, overlay_bias: 3.0, ground, scenery: None },
+            models: AvatarFrame { models, tints: Vec::new(), identities: Vec::new(), zoom: view.zoom as f32, overlay_bias: 3.0, ground, scenery: None },
             tints: Vec::new(),
+            identities: Vec::new(),
             camera: view.gpu_camera(),
         };
         let mut overlay = DrawList::new();
