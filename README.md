@@ -79,10 +79,10 @@ player walks through the gateway and unloaded a minute after the last player lef
 span fields, and the fields' NPCs (the characters a field's own data places: Sector 1's guards,
 for example) are announced with every snapshot. See "Walking between fields" below.
 
-Not done yet: field scripts (exits that scripts decide, such as the `MAPJUMP`s of story scenes,
-are not followed; only a field's own gateways are), NPC animation and talking, music, and the
-window's scrolling camera (it shows the whole background). The increment-by-increment plan is in
-`IMPLEMENTATION-PLAN.md`.
+Not done yet: field scripts as a whole (what is carried out is the exits a line's walk-on script decides
+and the story steps the scripts make where the server can see them, see "Walking between fields"; no cutscenes,
+no talk-driven story, no ladders), NPC animation and talking, music, and the window's scrolling camera (it shows
+the whole background). The increment-by-increment plan is in `IMPLEMENTATION-PLAN.md`.
 
 ## Workspace
 
@@ -424,7 +424,31 @@ bots in a party from `md1stin` through its gateway to `md1_1` against your own l
 (read-only, throw-away state) and back; `scripts/travel-smoke.sh --fixture` does the same on the
 synthetic FIXTURE rooms (`fmv-server --game fixture-rooms`, `fmv-client --game fixture-rooms
 --name X`: a hall and a yard joined by an exit each way, with one NPC in the yard; **not FF7**) and
-needs no owned data.
+needs no owned data. `scripts/travel-smoke.sh --chain` walks the whole first reactor mission as far as the
+walkmesh goes (`md1stin`, `md1_1`, `md1_2`, `nrthmk`, `nmkin_1`, `elevtr1`, `nmkin_2`, `nmkin_3`) with the real story:
+see below.
+
+**Exits that scripts decide, and the story along the way.** Besides its gateways a field has the exits its
+scripts run when a player walks onto a line (a `MAPJUMP` in a line entity's trigger script, with the conditions
+it sits under); the adapter reports them after the gateways (`ExitKind::Script`) and answers, for an account's
+story, which of them is open (`AreaRuntime::exit_state`). Several can share one line: the lift of the first
+reactor (`elevtr1`) has no gateway and four exits on one line, picked by a bit of `Var[1][225]` and by
+`Var[2][0] < 33`, so the way down to `nmkin_2` is open only after the ride and the later story's `smkin_*` stay
+closed because their conditions say so. The server judges them against **the story of the account that governs
+the crossing player's instance** (its own, solo; the leader's, for a party member), takes the first exit that
+is open, and walks a player over a line whose exits are all closed. An exit whose condition the model cannot judge
+(a variable the progression does not carry, a key to press, the party) stays closed and the server says so once per
+area (`exit closed: its conditions cannot be judged ...`). Rules and numbers: `crates/fmv-ff7/src/exit_gate.rs`.
+
+The story advances along the way where the scripts advance it and the server can see it: a walkmesh triangle, a line
+the player walks across, or the player coming to stand in a field whose own scripts move the story by themselves
+(`crates/fmv-ff7/src/story.rs`). The first mission's steps: 1->6 (`md1stin`), 6->7 (`md1_1`), 7->8 (`md1_2`), 8->10 (`nrthmk`),
+10->11 (`nmkin_1`, a line), 11->12 together with the lift bit (`elevtr1`: stand on the panel's triangle; the script
+wants OK pressed, which protocol v9 cannot carry, so standing there stands for it), 12->13 (`nmkin_2`). Not carried out:
+steps a talk makes (`nmkin_3`'s woman, `nmkin_5`'s chest), the ride back up, and the ladder from `nmkin_3` down to
+`nmkin_4` (scripted jumps and climbs the walkmesh does not link). The progression blob is `[1, lo, hi]` until a step sets
+a variable beyond the moment, then `[2, lo, hi, n, (bank, address, value)*n]` (an old blob loads exactly as before;
+a build that predates version 2 reads a version 2 blob as unreadable and leaves it alone).
 
 Story phasing: every account has one story progression per game (the opaque `Progression` blob; an
 account that never advanced has none, which is a new account) and the world keeps one instance of a
@@ -446,9 +470,8 @@ version was bumped and a server refuses a v3 client at the handshake with a clea
 `ProtocolMismatch` reject (instead of losing it at the first exit it crosses). Both sides must be
 built from this version or later.
 
-Not done: exits that scripts decide (FF7 `MAPJUMP`s and line triggers; they need the script VM
-and the game's story variables), conditional NPCs, NPC animation and talking, and per-phase
-instances (an area is one instance whatever the story phases of the players in it).
+Not done: exits a talk or a director decides, scripted ladders and jumps, conditional NPCs, NPC animation
+and talking.
 
 ## Accounts, avatars and parties
 
@@ -881,7 +904,8 @@ scripts/package.sh       build and package a release tarball (and dist/SHA256SUM
 scripts/ff-multiverse.sh the launcher entry point shipped in the package (docs/LAUNCHER.md)
 scripts/smoke.sh         two-bot local smoke test
 scripts/battle-smoke.sh  shared-battle smoke test (real data; modes --fixture --random --progress --commands)
-scripts/travel-smoke.sh  walking between fields: two bots, md1stin -> md1_1 and back (real data)
+scripts/travel-smoke.sh  walking between fields: two bots, md1stin -> md1_1 and back (real data); --chain: the first reactor mission
+                         down to nmkin_3 with its real story, the lift ridden, the member following the leader
 scripts/phase-smoke.sh   story phasing: A advances md1stin's story and B does not, party, restart, persist (real data)
 scripts/slice-smoke.sh   the foundations slice: two original characters, a story, a talk, a shared battle, a real server restart
 deploy/                  systemd user unit template and deployment procedure
