@@ -2294,6 +2294,8 @@ impl BattleState {
                 self.resolve_status_only(actor, target, spec, targets.len(), events);
             } else if spec.heals() {
                 self.resolve_restore(actor, target, spec, targets.len(), events);
+                // A recovery with a status of its own (Angel Whisper heals and cures) tries it on the one it restored.
+                self.apply_status_effect(target, spec, targets.len(), events);
             } else {
                 self.resolve_offense(actor, target, spec, targets.len(), events);
             }

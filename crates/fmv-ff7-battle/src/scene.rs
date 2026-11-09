@@ -413,7 +413,9 @@ pub struct EnemyRecord {
     pub hp: u32,
     pub exp: u32,
     pub gil: u32,
-    /// Raw status-immunity bit mask.
+    /// Status mask at `0xB0`, whose polarity the data settles: a SET bit means the enemy can be affected by that status and a
+    /// CLEAR bit means it is immune (209 of the 625 enemies of the Steam copy have every bit set; no early enemy has a clear
+    /// one). [`crate::rules::Combatant::from_enemy`] turns the clear bits into its `status_immune` set.
     pub status_immunities: u32,
 }
 

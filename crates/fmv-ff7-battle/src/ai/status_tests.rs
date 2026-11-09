@@ -125,3 +125,115 @@ fn what_a_script_reads_follows_the_battle_as_statuses_come_and_go() {
     let (after, acted) = foe_victims(&mut state, 400);
     assert!(!acted && after.is_empty(), "cured: nothing to go for ({after:?})");
 }
+
+// --- an enemy that cannot act does not counter ---------------------------------------------------------------------
+
+/// Where the counters leave their trace: the number of times each ran, in a byte of the enemy's memory.
+const GENERAL_RAN: u16 = 0x00;
+const DEATH_RAN: u16 = 0x08;
+
+/// Cloud (Fire, a magical blow that never misses) and Barret, with HP to spare so that nothing a counter does ends the
+/// battle.
+fn counter_party() -> Vec<crate::rules::Combatant> {
+    let mut people = party();
+    people[0].spells = vec![crate::action::Spell::new(27, ActionSpec::damage_spell(20, 255, 0, 4))];
+    people[0].mp = 50;
+    people[0].max_mp = 50;
+    for member in &mut people {
+        member.hp = 5000;
+        member.max_hp = 5000;
+    }
+    people
+}
+
+/// A foe with a General counter that strikes back at whoever hit it and a Death counter, starting with `statuses`
+/// (and a second, plain foe so that the battle goes on when it falls).
+fn counter_battle(statuses: &[Status], hp: u32) -> BattleState {
+    use super::asm::{count_in, foe_with, plain_foe, ATTACK};
+    use super::script::slot;
+    let pass = Asm::default().op(op::END);
+    let strike_back = Asm::default()
+        .addr(2, 0x2070)
+        .val(2, 0x2060)
+        .val(2, 0x40D0)
+        .op(op::MASK)
+        .op(op::STORE)
+        .k1(0x20)
+        .k2(ATTACK)
+        .op(op::ACT);
+    let general = count_in(GENERAL_RAN).then(&strike_back).op(op::END);
+    let death = count_in(DEATH_RAN).op(op::END);
+    let mut foe = foe_with(&[(slot::MAIN, &pass), (slot::GENERAL_COUNTER, &general), (slot::DEATH_COUNTER, &death)]);
+    foe.status = StatusState::starting(statuses.iter().copied().collect());
+    foe.hp = hp;
+    battle_with(3, counter_party(), vec![foe, plain_foe()])
+}
+
+fn ran(state: &BattleState, trace: u16) -> u32 {
+    state.actors()[usize::from(FOE.0)].ai.as_ref().unwrap().memory().local(trace, 1).expect("a byte of memory")
+}
+
+/// `who` gives `command` as soon as it can: the events of that command.
+fn give(state: &mut BattleState, who: ActorId, command: crate::rules::Command) -> Vec<BattleEvent> {
+    for _ in 0..5000 {
+        if state.ready_actors().contains(&who) {
+            return state.submit_command(who, command).expect("the engine accepts it");
+        }
+        state.step_ticks(1);
+    }
+    panic!("{who:?} never got its turn");
+}
+
+fn answered(events: &[BattleEvent]) -> bool {
+    events.iter().any(|e| matches!(e, BattleEvent::Action { actor, .. } if *actor == FOE))
+}
+
+#[test]
+fn a_foe_that_is_asleep_does_not_answer_a_spell_but_one_that_a_blow_wakes_does() {
+    use crate::rules::Command;
+    let (cloud, barret) = (ActorId(0), ActorId(1));
+    // A sleeper hit by magic stays asleep and says nothing, but it notes who hit it.
+    let mut state = counter_battle(&[Status::Sleep], 400);
+    let events = give(&mut state, cloud, Command::Magic { spell: 27, target: crate::rules::Target::One(FOE) });
+    assert!(events.iter().any(|e| matches!(e, BattleEvent::Damage { target, .. } if *target == FOE)), "{events:?}");
+    assert!(!answered(&events), "an asleep foe does not counter: {events:?}");
+    assert_eq!(ran(&state, GENERAL_RAN), 0);
+    assert!(state.has_status(FOE, Status::Sleep));
+    let memory = state.actors()[usize::from(FOE.0)].ai.as_ref().unwrap().memory();
+    assert_eq!(memory.last_attacker(), 1 << 0, "it noted who hit it all the same");
+    // A blow wakes it first, and the one that woke answers.
+    let mut state = counter_battle(&[Status::Sleep], 400);
+    let events = give(&mut state, barret, Command::Attack { target: FOE });
+    assert!(events.contains(&BattleEvent::StatusEnded { target: FOE, status: Status::Sleep }), "{events:?}");
+    assert!(answered(&events), "the blow woke it and it struck back: {events:?}");
+    assert_eq!(ran(&state, GENERAL_RAN), 1);
+    assert!(!state.has_status(FOE, Status::Sleep));
+}
+
+#[test]
+fn a_foe_that_is_stopped_or_paralysed_answers_nothing_even_to_a_blow() {
+    use crate::rules::Command;
+    for held in [Status::Stop, Status::Paralysis] {
+        let mut state = counter_battle(&[held], 400);
+        let events = give(&mut state, ActorId(1), Command::Attack { target: FOE });
+        assert!(events.iter().any(|e| matches!(e, BattleEvent::Damage { target, .. } if *target == FOE)), "{held}: {events:?}");
+        assert!(!answered(&events), "{held}: {events:?}");
+        assert_eq!(ran(&state, GENERAL_RAN), 0, "{held}");
+        assert!(state.has_status(FOE, held), "a blow does not end it");
+    }
+    // The same foe, well, answers (the control: the arm is about the status and nothing else).
+    let mut state = counter_battle(&[], 400);
+    let events = give(&mut state, ActorId(1), Command::Attack { target: FOE });
+    assert!(answered(&events), "{events:?}");
+}
+
+#[test]
+fn a_foe_killed_in_its_sleep_still_runs_its_death_counter() {
+    use crate::rules::Command;
+    let mut state = counter_battle(&[Status::Sleep], 1);
+    let events = give(&mut state, ActorId(1), Command::Attack { target: FOE });
+    assert!(events.contains(&BattleEvent::Death { actor: FOE }), "{events:?}");
+    assert_eq!(ran(&state, DEATH_RAN), 1, "the Death counter ran");
+    assert_eq!(ran(&state, GENERAL_RAN), 0, "and the General one did not");
+    assert!(state.actors()[usize::from(FOE.0)].status.is_empty(), "a knockout removes every status");
+}

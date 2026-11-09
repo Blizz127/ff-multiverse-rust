@@ -1224,3 +1224,21 @@ fn a_battle_of_statuses_is_the_same_battle_however_time_is_sliced() {
         assert_eq!((&other, &other_log), (&state, &log), "slices of {slice} ms");
     }
 }
+
+#[test]
+fn a_recovery_with_a_status_of_its_own_heals_and_then_tries_it() {
+    // Angel Whisper's kind: a fraction of the maximum HP and a cure of Poison, on one ally.
+    let whisper = ActionSpec { hits_dead: false, ..ActionSpec::revive_spell(16, 0).with_aim(Aim::One) }.with_status(StatusEffect::cure(Status::Poison, 63));
+    let mut hurt = with_status(hero(), &[Status::Poison]);
+    hurt.hp = 100;
+    let seed = 5;
+    let mut state = battle(vec![hero(), hurt], vec![brute(5000)], seed);
+    let mut events = Vec::new();
+    state.resolve_action(0, &[1], &whisper, &mut events);
+    assert!(matches!(events[..], [BattleEvent::Heal { target: B, .. }, BattleEvent::StatusEnded { target: B, status: Status::Poison }]), "{events:?}");
+    assert!(!state.has_status(B, Status::Poison));
+    // A fraction of the maximum has no variance: the one draw is the status roll.
+    let mut replay = Rng::new(seed);
+    replay.below(63);
+    assert_eq!(state.rng, replay);
+}

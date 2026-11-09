@@ -784,7 +784,7 @@ pub struct ItemInfo {
     /// The kernel item index; its name is in the machine's own text.
     pub item: u16,
     pub kind: ItemKind,
-    /// Aimed at the party (everything but a damage item).
+    /// Aimed at the party: everything but a damage item and a curse (a Dazers, a Hourglass: [`ActionSpec::aims_at_allies`]).
     pub targets_allies: bool,
     /// Only a dead ally is a valid target (Phoenix Down).
     pub revives: bool,
