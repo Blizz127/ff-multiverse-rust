@@ -312,7 +312,10 @@ command menu on your turn, the floating numbers and the pointer over the models'
 band across the top that is green while your client's replay agrees with the server and red if it
 ever diverges); the arrow keys (or WASD) move in the menu, **Space** or **Enter** confirm and
 **Backspace** goes back. The menu has Attack (which says **Limit** while your limit gauge is full),
-Magic, Item, Defend and **Escape** (greyed out in a battle that cannot be run from). A machine without battle data to replay the battle (or one started with
+Magic, Item, Defend and **Escape** (greyed out in a battle that cannot be run from). A spell, item or
+limit that can hit a whole side has one more place for the target pointer, **ALL** (one step past the
+last target, with the same arrow keys: there is no extra key; Healing Wind and Megalixir start on it).
+A machine without battle data to replay the battle (or one started with
 `FMV_BATTLE_FLAT=1`) shows the flat view instead: one token per fighter with a thin HP bar. (The
 battle scene has been checked by unit tests and offscreen renders only: this box has no display,
 so the window itself was not run.)
@@ -458,8 +461,8 @@ inventory is saved inside the account's character record (older records without 
 are not rewritten until an item is used or found), and the server tells the player what it carries
 when it joins, after every item used and after drops. A won battle drops items rolled by the server
 from the enemies' own drop rates (`scene.bin`), dealt to the living members, logged and not part of
-the replay. Known gaps: no statuses, no spells or items that hit a whole side, no summons, party
-elemental resistances are not modelled (limit breaks and escape are in protocol v7, below).
+the replay. Known gaps: no statuses, no summons, party elemental resistances are not modelled (limit
+breaks and escape are in protocol v7, whole sides in v8, below).
 
 **Limit breaks and escape (protocol v7).** Every character has a **limit gauge** (0 to 255) that enemy
 blows fill (`damage * 76800 / (max HP * HP divisor)`; the divisor is the character's own, read from
@@ -471,9 +474,9 @@ each character is its first (limit level 1: Braver, Big Shot, Beat Rush, Healing
 Lightning, Galian Beast, Boost Jump); its id, name and gauge divisor are the owner's own data, while the
 **damage of a limit is not in the owner's files** (the kernel's attack data stops before the limit ids),
 so it is the community's multiplier (Braver 3x a normal attack, Big Shot and Boost Jump 3.25x, ...), and
-Healing Wind heals one chosen ally for half of its max HP (FF7: the whole party). Not modelled: limit
-levels above 1 and the kills and uses that earn them, Cait Sith's Dice, Tifa's slot reels, Vincent's
-transformation, whole-side limits. **Escape** is the last row of the menu (FF7 runs by holding L1+R1,
+Healing Wind heals the whole party, each member for half of its own max HP (protocol v8: its record is
+"All Al (NS)"). Not modelled: limit levels above 1 and the kills and uses that earn them, Cait Sith's
+Dice, Tifa's slot reels, Vincent's transformation, the whole-side limits of the higher levels. **Escape** is the last row of the menu (FF7 runs by holding L1+R1,
 which this window cannot do cleanly): FF7's escape does not depend on levels but on the formation's *Run
 Difficulty* (`scene.bin`'s escape counter, 1 for most fights) and a Run Check that succeeds one time in
 four (always, after a preemptive strike or on a side attack); the actor spends its turn on four checks,
@@ -483,8 +486,28 @@ the battle for the whole party with `Escaped`: nothing is paid. The **gauge is s
 battle**, whatever the outcome (escapes included), in the account's character record (a record of its own
 is made for an account that has never won, so "nothing is written until its first win" now reads "until
 its first win or the first battle that ends with a gauge worth keeping"); records written before v7 load
-with an empty gauge. The headless bot gives its limit when the gauge is full (a healing one only to a
-wounded ally) and never runs, unless a `--battle-script` tells it to (next paragraph).
+with an empty gauge. The headless bot gives its limit when the gauge is full (a healing one, which heals the whole
+party, only when somebody is wounded) and never runs, unless a `--battle-script` tells it to (see below).
+
+**Whole sides (protocol v8).** `Command::Magic`, `Item` and `Limit` carry a `Target`: one actor, or
+`AllEnemies` / `AllAllies` (named from the commanding actor's point of view, so an enemy's AI will ask the
+same way). What can be aimed how is the record's own targeting bits, read from the owner's `kernel.bin`:
+Cure, Life, Fire, Ice and Bolt can hit one target or a whole side ("All Tar/1 Tar"), Ultima, Megalixir and
+Healing Wind only a whole side ("All Tar (NS)"), and no item has a toggle. FF7's rule for the first kind of
+spell is that it needs an **All materia** paired with its magic materia, which allows it as many times per
+battle as the materia's level (Terence Fergusson's *FF7 Party Mechanics Guide*): the engine keeps that count
+per character (`Combatant::all_left`, read from the kernel's All materia, id 23, at level 1: once per battle,
+the one All being counted for the whole starter grimoire), a whole-side cast spends one, and the Magic list
+says `ALL x1`. An action that hits several targets **splits** its damage: 2/3 for each target (Fergusson's
+*Battle Mechanics* FAQ), for the physical formula and Cure's, and for a spell only when it could have been
+one target; a fraction of HP, a flat amount or "everything" (Life, potions, Megalixir) never splits, and
+neither does a lone target. The pseudocode page on the FFRTT wiki writes the factor as 3/2; the FAQ, the Final
+Fantasy Wiki and the community say 2/3, which is used (labelled in `crates/fmv-ff7-battle/src/action.rs`).
+A whole side is one `Action` followed by one `Damage`, `Heal`, `Miss` or `Revive` per target in actor order
+(no new events), every roll drawn per target, so the replay checks it like anything else. The enemies still
+pick one random party member each turn (their own AI, which can ask for a whole side through the same
+`Target`, is another change). `--battle-script` takes `magic:<id>:all` and `item:<id>:all`, and
+`scripts/battle-smoke.sh --commands` casts Cure on the whole party over real processes.
 
 **Every command over real processes (`--battle-script`, `--debug-limit-full`).** The headless bots only attack
 (and heal below 30% HP, which the first enemies never bring about) and a limit gauge fills by only a few points

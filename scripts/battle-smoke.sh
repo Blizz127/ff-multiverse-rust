@@ -90,11 +90,13 @@
 # alone is in `fmv-server --help`) and the bots follow a --battle-script. ONE server stays up through two
 # runs of the same two bots (they log in again with the tokens the first run saved; each run is one
 # battle of formation 301, whose run difficulty is 1, so it can be escaped):
-#   run 1 "cmds":   A: defend,item:0,magic:0,limit   B: magic:0,magic:9999,item:0,defend,limit
-#                   (Potion is item 0, Cure is spell 0; spell 9999 does not exist: the entry must be skipped,
-#                   counted and not retried, and the next one tried in the same turn; the limit goes last, as
-#                   the enemies of this formation die in one blow, so nothing ends the battle before the
-#                   other entries are applied). Expected: both bots win it.
+#   run 1 "cmds":   A: defend,item:0,magic:0,magic:0:all,limit   B: magic:0,magic:9999,item:0,defend,limit
+#                   (Potion is item 0, Cure is spell 0; `magic:0:all` is Cure on the WHOLE PARTY, which takes the
+#                   once-per-battle use of the All materia (protocol v8: Cloud's grimoire has one, read from the
+#                   owner's kernel) and is checked below as the server's `target=all-allies`; spell 9999 does not
+#                   exist: the entry must be skipped, counted and not retried, and the next one tried in the same
+#                   turn; the limit goes last, as the enemies of this formation die in one blow, so nothing ends
+#                   the battle before the other entries are applied). Expected: both bots win it.
 #   run 2 "escape": A and B: escape x6 (a run check succeeds 68% of the time per attempt, so several attempts
 #                   are listed; the first success ends the battle). Expected: the battle ends in Escaped.
 # The scripts can be overridden to try the mode's failure paths: FMV_SMOKE_SCRIPT_A, FMV_SMOKE_SCRIPT_B
@@ -165,7 +167,7 @@ COMMANDS_DURATION=12
 # The scripts of --commands (see the header; fmv-client --battle-script syntax). Overridable to try its failure paths.
 # Potion is item 0, Cure is spell 0 (checked against the owner's data by the --ignored real-data tests of
 # fmv-ff7-battle and fmv-client); spell 9999 does not exist, so script B has one entry that must be skipped.
-SCRIPT_A="${FMV_SMOKE_SCRIPT_A:-defend,item:0,magic:0,limit}"
+SCRIPT_A="${FMV_SMOKE_SCRIPT_A:-defend,item:0,magic:0,magic:0:all,limit}"
 SCRIPT_B="${FMV_SMOKE_SCRIPT_B:-magic:0,magic:9999,item:0,defend,limit}"
 ESCAPE_SCRIPT="${FMV_SMOKE_ESCAPE_SCRIPT:-escape,escape,escape,escape,escape,escape}"
 
@@ -1304,6 +1306,13 @@ run_commands() {
     ((value == CMD_TOTAL[$kind])) || problem "the server logged $value '$needle' line(s), but the bots counted ${CMD_TOTAL[$kind]} $kind command(s) applied"
   done
   log_has "$WORK/server.log" "magic used battle=" && { log_has "$WORK/server.log" " spell=0 " || problem "the server's 'magic used' lines name no spell=0 (Cure)"; }
+  # Whole sides (protocol v8): the default script A casts Cure on the whole party once (its All materia use), and the
+  # server's record of it says so; a one-target cast says the actor's number as it always did.
+  if [[ -z ${FMV_SMOKE_SCRIPT_A:-} ]]; then
+    log_has "$WORK/server.log" " spell=0 " && log_has "$WORK/server.log" "target=all-allies" || problem "the server's 'magic used' lines show no Cure on the whole party (target=all-allies), which the default script A gives"
+    value=$(count_lines_with "$WORK/server.log" "target=all-allies")
+    [[ $value == 1 ]] || problem "the server logged $value whole-party cast(s) (target=all-allies), expected exactly 1 (only bot A's script has one)"
+  fi
   log_has "$WORK/server.log" "item used battle=" && { log_has "$WORK/server.log" " item=0 left=" || problem "the server's 'item used' lines name no item=0 (Potion)"; }
   while IFS= read -r line || [[ -n $line ]]; do
     if [[ $line == *"item used battle="* ]]; then
