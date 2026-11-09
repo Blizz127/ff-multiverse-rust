@@ -917,6 +917,27 @@ mod tests {
         assert_eq!(s.own.next_intent(61.0).unwrap().seq, 4, "movement is announced as usual");
     }
 
+    /// The server's countdown (its bomb timer) reaches the mirror the HUD draws from, never ends the session and is not
+    /// forgotten by walking into another area (it follows the player's story, not the area).
+    #[test]
+    fn the_servers_countdown_reaches_the_mirror_and_survives_a_change_of_area() {
+        use fmv_protocol::{CountdownEnd, CountdownState};
+        let mut s = state(at(0.0));
+        assert!(s.countdown.view(0.0).is_none());
+        let running = ServerMsg::Countdown { state: CountdownState::Running { remaining_ms: 600_000, total_ms: 600_000 } };
+        assert_eq!(s.apply(10.0, running), None, "the server's word never ends the session");
+        assert_eq!(s.countdown.view(10.0).map(|v| v.clock), Some("10:00".to_string()));
+        assert_eq!(s.countdown.view(70.0).map(|v| v.clock), Some("9:00".to_string()), "it counts down on the client's clock");
+        // an area change keeps it
+        s.change_area(AreaId { game: GameId::Fixture, key: "yard".into() }, at(5.0), 0.0, true);
+        assert_eq!(s.countdown.view(70.0).map(|v| v.clock), Some("9:00".to_string()));
+        // and the end of it ends it
+        let over = ServerMsg::Countdown { state: CountdownState::Over { reason: CountdownEnd::Cleared } };
+        assert_eq!(s.apply(71.0, over), None);
+        assert!(s.countdown.view(71.0).is_none() && !s.countdown.is_running());
+        assert_eq!(s.countdown.told(), 2);
+    }
+
     #[test]
     fn untrusted_snapshots_are_filtered_and_bounded() {
         let mut s = ClientState::new(EntityId(1), AccountId(1), Pos::default(), plaza());
