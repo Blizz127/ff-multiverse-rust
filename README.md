@@ -1090,7 +1090,7 @@ files when the scene runs.
 | `root` | what the field's own trigger does to start it, in order: `SetBit`, `Await(script)`, `Start(script)` |
 | `cast` | script entity to actor: Cloud (18) `Appearance("ff7/cloud")` starting at the stool (-95, -144), Tifa (20) `Appearance("ff7/tifa")`; `Look::Model` names any `char.lgp` model, so a scene can be replayed with another cast (`SceneDef::with_cast`) |
 | `speakers` | a window's first line names who speaks (the game's own convention); `Tifa` is 20, `Cloud` is 18 |
-| `witness` | where the player's own character stands (spot 0, the owner) and where two watchers stand: on the walkmesh, 70 or more units from Cloud's stool, from every place the cast ever takes and from each other |
+| `witness` | where the player's own character stands (spot 0, the owner) and where two watchers stand: on the walkmesh, 90 or more units from every place the cast ever takes (Cloud's stool among them), 65 or more from each other and 40 or more from the nearest wall, stool or table (a body's ring is 22); `tests/scene_real.rs` measures all of it |
 | `arrival` | where the debug preview puts a player: at the counter's edge, within Tifa's reach |
 
 ### The interpreter (`fmv_ff7::script::scene`)

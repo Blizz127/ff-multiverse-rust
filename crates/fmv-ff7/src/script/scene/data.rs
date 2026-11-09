@@ -212,17 +212,18 @@ pub fn proof_scene() -> SceneDef {
             CastMember { entity: proof::TIFA, name: "tifa".to_string(), look: Look::Appearance("ff7/tifa".to_string()), start: None },
         ],
         speakers: vec![("Cloud".to_string(), proof::CLOUD), ("Tifa".to_string(), proof::TIFA)],
-        // The customers' side of the counter, in the lane the stools stand in (Cloud's stool is at (-95, -144) on
-        // triangle 62; Tifa's lane is across the counter, 170 units to the left, and the floor between them is not
-        // walkable). Each spot is on the walkmesh, 70 or more units from Cloud's stool and from every other spot, and
-        // faces the stool; `tests/scene_real.rs` measures all of it, over every place the cast takes in the scene.
+        // The open floor in front of the counter, on the customers' side (Cloud's stool is at (-95, -144) on triangle 62;
+        // Tifa's lane is across the counter, 170 units to the left, and the floor between them is not walkable). The three
+        // stand 65 or more units apart, each facing Cloud's stool, on the walkmesh, 90 or more units from every place the
+        // cast takes in the scene and 40 or more from the nearest wall, stool or table (a body's ring is 22):
+        // `tests/scene_real.rs` measures all of it, and `examples/scene_map.rs` draws it over the field's picture.
         witness: vec![
-            Spot { x: -100, y: -72, triangle: 24, direction: 0 },
-            Spot { x: -100, y: -216, triangle: 40, direction: 128 },
-            Spot { x: -30, y: -72, triangle: 25, direction: 226 },
+            Spot { x: -85, y: -55, triangle: 24, direction: 251 },
+            Spot { x: -20, y: -45, triangle: 26, direction: 230 },
+            Spot { x: -100, y: 10, triangle: 21, direction: 1 },
         ],
         // At the counter's edge, facing Tifa across it (she stands at (-268, -105); her talk radius is 150).
-        arrival: Spot { x: -125, y: -100, triangle: 27, direction: 192 },
+        arrival: Spot { x: -124, y: -112, triangle: 27, direction: 192 },
     }
 }
 

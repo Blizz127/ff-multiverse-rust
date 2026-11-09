@@ -291,6 +291,9 @@ fn the_witness_stands_on_the_floor_clear_of_everyone_the_scene_ever_places() {
     let npc = trigger_npc(&f, &def, &StoryState::at(72)).unwrap();
     let reach = (f32::from(a.x) - f32::from(npc.x)).hypot(f32::from(a.y) - f32::from(npc.y));
     assert!(reach <= npc.talk_radius, "the arrival is {reach:.0} from Tifa (her reach is {})", npc.talk_radius);
+    // (the band of floor within Tifa's reach is narrow: at the counter's edge a body's ring, 22, just touches the stools)
+    let arrival_gap = scenery_gap(ground.mesh(), f32::from(a.x), f32::from(a.y));
+    assert!(arrival_gap >= 5.5 * scale - 2.0, "the arrival is {arrival_gap:.1} from the nearest wall, stool or table");
 
     assert_eq!(def.witness.len(), 3, "the owner and two watchers");
     for (i, spot) in def.witness.iter().enumerate() {
@@ -311,8 +314,35 @@ fn the_witness_stands_on_the_floor_clear_of_everyone_the_scene_ever_places() {
             let d = (f32::from(other.x) - f32::from(spot.x)).hypot(f32::from(other.y) - f32::from(spot.y));
             assert!(d >= required, "witnesses {i} and {j} are {d:.0} apart");
         }
-        eprintln!("witness {i}: ({}, {}) triangle {} clear of every actor by {nearest:.0} (needs {required:.0})", spot.x, spot.y, spot.triangle);
+        // clear of the scenery the walkmesh knows: the stools and tables are holes in it, so the body's ring (5.5 model units) must not
+        // reach a boundary edge (an edge with no neighbour)
+        let edge_gap = scenery_gap(ground.mesh(), f32::from(spot.x), f32::from(spot.y));
+        assert!(edge_gap >= 5.5 * scale * 1.5, "witness {i} stands {edge_gap:.0} from the nearest wall, stool or table (its ring is {:.0})", 5.5 * scale);
+        eprintln!(
+            "witness {i}: ({}, {}) triangle {} clear of every actor by {nearest:.0} (needs {required:.0}), {edge_gap:.0} from the nearest wall, stool or table",
+            spot.x, spot.y, spot.triangle
+        );
     }
+}
+
+/// The distance in x and y from `(x, y)` to the nearest boundary edge of the walkmesh (an edge with no neighbour: a wall, or the
+/// edge of a hole such as a stool or a table).
+fn scenery_gap(mesh: &fmv_ff7::field::Walkmesh, x: f32, y: f32) -> f32 {
+    let mut best = f32::INFINITY;
+    for (i, tri) in mesh.triangles.iter().enumerate() {
+        for e in 0..3 {
+            if mesh.neighbor(i, e).is_some() {
+                continue;
+            }
+            let (a, b) = (tri[e], tri[(e + 1) % 3]);
+            let (ax, ay, bx, by) = (f32::from(a.x), f32::from(a.y), f32::from(b.x), f32::from(b.y));
+            let (dx, dy) = (bx - ax, by - ay);
+            let len2 = dx * dx + dy * dy;
+            let t = if len2 > 0.0 { (((x - ax) * dx + (y - ay) * dy) / len2).clamp(0.0, 1.0) } else { 0.0 };
+            best = best.min((x - (ax + dx * t)).hypot(y - (ay + dy * t)));
+        }
+    }
+    best
 }
 
 // ---- 4. within budget, every op handled --------------------------------------------------------
