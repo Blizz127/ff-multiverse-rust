@@ -501,7 +501,7 @@ main() {
   # character has; a real game's progress files move with them (the persist tests delete accounts with progress).
   ((moved >= 3)) && say "ok: $moved record file(s) moved into the trash entry, byte for byte" || problem "only $moved record file(s) moved into the trash (expected at least the account, avatar and character records)"
   for kind in accounts avatars characters; do
-    expect "the trash entry holds the character's $kind record" test -n "$(ls -A -- "$entry_dir/$kind" 2>/dev/null)"
+    expect "the trash entry holds a record under $kind/" test -n "$(ls -A -- "$entry_dir/$kind" 2>/dev/null)"
   done
   # The other two characters' records did not move or change: every record that stayed is listed as unchanged above; count them.
   local stayed=0
