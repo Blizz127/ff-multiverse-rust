@@ -273,6 +273,16 @@ struct Cli {
     /// cap, through the ordinary save path, so that a smoke run can show a non-empty gauge surviving a restart.
     #[arg(long, value_name = "GAUGE", requires = "debug_encounters", conflicts_with = "debug_limit_full", value_parser = clap::value_parser!(u8).range(1..=255))]
     debug_bonus_limit: Option<u8>,
+
+    /// How long the canon companions (Cloud and Barret) wait for a player whose turn has come and who is still choosing,
+    /// in milliseconds of battle time, before they act anyway. The players lead every round; the companions follow.
+    #[arg(long, value_name = "MS", default_value_t = fmv_server::companion::DEFAULT_TURN_WAIT_MS)]
+    companion_turn_wait_ms: u32,
+
+    /// The longest a canon companion holds its full gauge for the players, in milliseconds of battle time. 0 makes the
+    /// companions act the instant their gauge fills.
+    #[arg(long, value_name = "MS", default_value_t = fmv_server::companion::DEFAULT_MAX_WAIT_MS)]
+    companion_max_wait_ms: u32,
 }
 
 /// `--idle-timeout-secs` and `--inactivity-timeout-secs`: 0 disables the timeout.
@@ -380,6 +390,7 @@ impl Cli {
             debug_limit_full: self.debug_limit_full,
             debug_bonus_exp: self.debug_bonus_exp.unwrap_or(0),
             debug_bonus_limit: self.debug_bonus_limit.unwrap_or(0),
+            companion_pacing: fmv_server::companion::Pacing { turn_wait_ms: self.companion_turn_wait_ms, max_wait_ms: self.companion_max_wait_ms },
             ..BattleSettings::new(rules)
         }
     }
@@ -686,6 +697,12 @@ mod tests {
         let defaults = cli.battle_settings(std::sync::Arc::new(SyntheticRules::default()));
         assert!(defaults.random_encounters && defaults.level.is_none() && defaults.fixed_seed.is_none());
         assert_eq!((defaults.battle_speed, defaults.ticks_per_second), (DEFAULT_BATTLE_SPEED, DEFAULT_TICKS_PER_SECOND));
+        // The companions let the players go first unless told otherwise; 0 turns that off.
+        assert_eq!(defaults.companion_pacing, fmv_server::companion::Pacing::default());
+        assert_eq!(fmv_server::companion::Pacing::default(), fmv_server::companion::Pacing { turn_wait_ms: 5_000, max_wait_ms: 10_000 });
+        let paced = parse(&["--companion-turn-wait-ms", "2500", "--companion-max-wait-ms", "0"]).unwrap();
+        let paced = paced.battle_settings(std::sync::Arc::new(SyntheticRules::default())).companion_pacing;
+        assert_eq!(paced, fmv_server::companion::Pacing { turn_wait_ms: 2_500, max_wait_ms: 0 });
 
         let cli = parse(&[
             "--debug-encounters",
