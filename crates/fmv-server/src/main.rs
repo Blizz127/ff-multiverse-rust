@@ -650,7 +650,7 @@ mod tests {
         let err = ok("frog").err().unwrap().to_string();
         assert!(err.contains("Poison") && err.contains("Haste"), "{err}");
         // A debug aid never runs on its own.
-        let err = parse(&["--debug-status", "poison"]).err().expect("needs --debug-encounters").to_string();
+        let err = parse(&["--debug-status", "poison"]).expect_err("needs --debug-encounters").to_string();
         assert!(err.contains("--debug-encounters"), "{err}");
         // It reaches the battle settings as the set.
         let cli = parse(&["--debug-encounters", "--debug-status", "regen,haste"]).unwrap();
