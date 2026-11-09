@@ -35,9 +35,10 @@
 //!   asked on a copy, `companion::ends_in_victory`) while a living, connected player has not had a first turn, for at
 //!   most `turn_wait_ms` after that player's own gauge filled and `max_wait_ms` in all (so a player always gets to act,
 //!   and an idle one never stalls the fight); and it does not start while another performance is on the stage
-//!   (`Battle::last_action`: the last action of ANY fighter, `companion::ACTION_GAP_MS` ago at the latest), which
-//!   spaces the companions' blows instead of releasing them together. The enemies are not held: they act the tick their
-//!   gauge fills even while a player is in a menu (FF7's Active mode, `companion`, "Active, Recommended and Wait").
+//!   (`Battle::last_action`: the last command of ANY party member, a player's included, `companion::ACTION_GAP_MS` of
+//!   battle time ago at the latest), which spaces the companions' blows instead of releasing them together. The enemies are
+//!   not held, nor counted on the stage: they act the tick their gauge fills even while a player is in a menu (FF7's Active
+//!   mode, `companion`, "Active, Recommended and Wait").
 //!   Pacing only moves the tick at which the server submits the command, so it is invisible to a replay. It is logged as
 //!   `companion acted battle=.. actor=.. name=.. command=.. character=.. held_ms=..` and counted in the battle's
 //!   `commands`. A companion has no account and no entity: it is never paid or saved, no player may
@@ -203,8 +204,9 @@ struct Battle {
     ready_since: Vec<Option<u64>>,
     /// The engine tick of the last command a PARTY member's was applied at (a player's or a companion's), `None` before the
     /// first: what the companions' pacing keeps the stage clear for (`companion::may_act`, "one performance at a time").
-    /// An enemy's turn does not count: the engine plays it inside the step that fills its gauge, the server cannot hold it,
-    /// and a stage that every enemy turn made busy would starve the companions at a fast battle pace.
+    /// An enemy's turn does not count: the engine plays it inside the step that fills its gauge, so the server can neither hold
+    /// nor space it, and what a companion does while an enemy's performance is on the client's screen is drawn over it (a
+    /// known gap, `companion`'s module docs).
     last_action: Option<u64>,
     /// The engine has consumed time up to here.
     clock: Instant,

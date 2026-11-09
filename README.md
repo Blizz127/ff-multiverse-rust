@@ -900,11 +900,20 @@ see "The canon party fights beside the players" below.) `--companion-max-wait-ms
 200 seeds a formation over the 18 formations the reactor's fields send, one person taking 1.5 s over each command): with FF7's
 own party of TWO (Cloud and Barret, both at that person's menu) a fight takes 12.2 s on average, 3.9 party attacks and 3.5
 enemy turns, and an enemy takes a turn in 93% of them; with the pair as companions and ONE player a fight takes 6.6 s, the
-same 3.9 party attacks (the enemies' HP is the game's), 1.9 enemy turns, an enemy turn in 87%, and the player gives about
-one command. Cloud's blow takes 41 to 44 off an MP, a Grunt or a Mono Drive, Barret's 35 to 38, so the weak enemies die to
-one hit each: a third fighter makes the reactor's fights about half as long and halves the enemy's turns, and "one attack
-wins" is what three fighters against two or three one-hit enemies come to; a balance change is a choice of the owner's
-(enemy HP or gauge speed scaled with the party's size), and none is made here.
+same 3.9 party attacks (the enemies' HP is the game's), 1.9 enemy turns, an enemy turn in 87%, and the player gives 1.2
+commands, 1.00 in 12 of the 18 formations (the first party command comes 1.2 to 1.4 s in, not 6.1 s as before). Cloud's blow
+takes 41 to 44 off an MP, a Grunt or a Mono Drive, Barret's 35 to 38, so most of these enemies die to one hit each and a
+third fighter makes the reactor's fights about half as long and halves the enemy's turns. **That a player's one command
+ends a fight is, in most of the reactor's fights, how it is built, not lockstep:** the lockstep is gone (the first pacing
+put two party commands in ONE server step in 59% of these fights for a person at the menu, 27% for a bot; now 1.2% and 2.9%,
+all of them a player's own command landing in the step after a companion's), the companions' blows come apart (each on its
+own clock, a second or so from the last), but the rule that keeps a player's first turn leaves the LAST enemy standing for
+that player, and the pair has usually taken all the others by then, so "I attacked once and it was over" happens in 12 of
+the 18 formations (the Sweeper alone, 140 HP and three or four hits, included: the companions have worn it down and the
+player's is the blow that ends it) and in 68% (a bot) to 79% (a person) of all these fights, against 55% under the first
+pacing. Whether that is the feel the owner wants is his to say; the knobs are
+the rule's (`--companion-max-wait-ms 0` turns the whole pacing off, and the last blow goes to whoever's gauge fills first) and the balance (enemy HP
+or gauge speed scaled with the party's size, which FF7's party of two never needed); no balance change is made here.
 
 **Status effects (protocol v12).** `fmv_ff7_battle::status` is the model and its module docs hold the
 sources and every number: the 32 status bits of the game, what an attack, item or `scene.bin` record's status fields

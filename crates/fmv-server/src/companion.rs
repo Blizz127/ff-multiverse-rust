@@ -64,8 +64,10 @@
 //!   gap a sixth of a gauge, as at the default, instead of making it longer than a gauge and halving what the companions do.
 //!   Where two companions are ready the one whose gauge has been full longest goes first (FF7's own order: the order the
 //!   gauges filled). The enemies are not on this account and are not held for a performance: the engine plays an enemy's turn
-//!   inside the step that fills its gauge (FF7's Active mode, see below), and a stage that every enemy turn made busy would
-//!   starve the companions at a fast battle pace; a player's command is never delayed.
+//!   inside the step that fills its gauge (FF7's Active mode, see below), so the server cannot hold or space it, and a
+//!   companion's blow that comes while an enemy's performance is still on the client's screen is drawn over it (a KNOWN GAP;
+//!   the gap could count enemy turns too, which was not measured and would hold the companions back after every enemy turn);
+//!   a player's command is never delayed.
 //!
 //! # Active, Recommended and Wait
 //!
