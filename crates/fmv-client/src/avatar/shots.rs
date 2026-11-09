@@ -17,6 +17,7 @@
 
 mod battle_models;
 mod depth;
+mod identity;
 
 use super::anim::Who;
 use super::frame::tests::{stage, view};
@@ -1019,20 +1020,19 @@ fn real_idle_clips_measured() {
 /// Two players of the owner's own FF7 `md1stin`, each a character of its own: different placeholder bodies in different
 /// colours, standing apart and named by their players (Blizz and Wedge). One holds Barret's combat slot and the other
 /// Tifa's, and nothing in the picture says either: how a player looks on the field (its binding, a placeholder body
-/// tinted with its colour) is a different thing from who it fights as. Drawn through the window's own `field_draw` and
+/// repainted in its colour) is a different thing from who it fights as. Drawn through the window's own `field_draw` and
 /// label anchors from the snapshot a server would send, through the real renderer: `field_two_originals.png` in
 /// `$FMV_SHOT_DIR`, a 1920x1080 one and a 3x close-up of each player (`field_two_originals_*`), and the same session's
 /// HUD line (`field_hud_line.png`: it names the slot, so it is a picture of its own). Besides the pictures it checks
-/// that both bodies are tinted for their own players (and that the tint changes pixels towards the player's colour),
-/// and that no drawn text names a canon character.
+/// that both bodies carry their own players' identity colours (and that the colour changes pixels towards the player's
+/// colour), and that no drawn text names a canon character.
 ///
 /// NOTE: while the table of placeholder bodies is a stand-in (rows built on canon skeletons) the models look like
 /// tinted canon characters.
 #[test]
 #[ignore = "needs the owner's real FF7 data (FMV_FF7_LIBRARY, FMV_FF7_DATA or FMV_FF7_FLEVEL) and a GPU or software Vulkan/GL driver"]
 fn offscreen_field_two_originals() {
-    use crate::avatar::frame::body_tint;
-    use crate::avatar::gpu::Tint;
+    use crate::avatar::identity::Identity;
     use crate::backdrop::FieldView;
     use crate::session::SessionInfo;
     use crate::state::ClientState;
@@ -1115,16 +1115,17 @@ fn offscreen_field_two_originals() {
     {
         let built = draw.built.as_ref().expect("the models were built");
         assert_eq!(built.frame.models.len(), 2, "both players are models");
-        assert_eq!(built.frame.tints.len(), 2, "one tint per model");
-        // Each body is tinted with ITS player's colour, and the two colours are not the same.
-        let tint_of = |body: &fmv_ff7::playable::PlaceholderBody| {
+        assert_eq!(built.frame.identities.len(), 2, "one identity colour per model");
+        assert!(built.frame.tints.is_empty(), "the field's colours are identities, nothing is scaled or faded");
+        // Each body carries ITS player's colour, and the two colours are not the same.
+        let identity_of = |body: &fmv_ff7::playable::PlaceholderBody| {
             let i = built.frame.models.iter().position(|m| m.asset.appearance.appearance_ref == body.model.appearance_ref).expect("the body was drawn");
-            built.frame.tints[i]
+            built.frame.identities[i]
         };
-        assert_eq!(tint_of(&blizz_body), body_tint(blizz_tint));
-        assert_eq!(tint_of(&wedge_body), body_tint(wedge_tint));
-        assert_ne!(tint_of(&blizz_body), Tint::NONE);
-        assert_ne!(tint_of(&blizz_body), tint_of(&wedge_body));
+        assert_eq!(identity_of(&blizz_body), Identity::of(blizz_tint));
+        assert_eq!(identity_of(&wedge_body), Identity::of(wedge_tint));
+        assert_ne!(identity_of(&blizz_body), Identity::NONE);
+        assert_ne!(identity_of(&blizz_body), identity_of(&wedge_body));
     }
 
     let info = SessionInfo {
@@ -1169,9 +1170,9 @@ fn offscreen_field_two_originals() {
         results.push((w, h, img));
     }
 
-    // The tint changes the pixels of each model, and towards its player's colour: the same frame without tints is
-    // the same silhouette in the model's own colours, and in each model's box the tinted picture is bluer for the
-    // blue player and redder for the orange one than the plain one.
+    // The identity colour changes the pixels of each model, and towards its player's colour: the same frame without
+    // identity colours is the same silhouette in the model's own colours, and in each model's box the tinted
+    // picture is bluer for the blue player and redder for the orange one than the plain one.
     let (w, h) = (1920u32, 1080u32);
     let tinted = &results[1].2;
     let boxes: Vec<(f32, f32, f32, f32)> = (0..2).map(|m| model_bbox(&draw.built.as_ref().expect("built").frame, m, &scene, w, h)).collect();
@@ -1181,7 +1182,7 @@ fn offscreen_field_two_originals() {
             if id == blizz_body.model.appearance_ref { blizz_tint } else { wedge_tint }
         })
         .collect();
-    draw.built.as_mut().expect("built").frame.tints.clear();
+    draw.built.as_mut().expect("built").frame.identities.clear();
     let mut overlay = DrawList::new();
     hud::draw_hud(&hud_input, w, h, &mut overlay);
     let plain = gpu.render_field(w, h, &scene, Some(&draw.built.as_ref().expect("built").frame), &overlay);

@@ -4,10 +4,11 @@
 //! entity's `appearance_ref` names: its BINDING (protocol v8), how the game draws the character, which is a
 //! different thing from the combat slot it fights in (a player who holds Barret's slot is not drawn as Barret).
 //! For a new character the binding is one of the generic placeholder bodies of the owner's own `char.lgp`
-//! (`ff7/body/<archetype>`, [`fmv_ff7::playable::PLACEHOLDER_BODIES`]), which is **tinted with the player's
-//! identity colour** ([`frame::body_tint`], applied through the per-model [`gpu::Tint`]: the model's own
-//! texture scaled per channel by `0.45 + 0.55 * c / 255`, so the colour is plainly the player's and the
-//! texture stays readable); for an account that predates v8 it is the canon model of the look it chose
+//! (`ff7/body/<archetype>`, [`fmv_ff7::playable::PLACEHOLDER_BODIES`]), which is **repainted in the player's
+//! identity colour** ([`identity`]: a per-draw [`identity::Identity`] the fragment shader turns the cloth into, in
+//! the colour's hue and saturation at the cloth's own lightness, while skin and the face decals keep their own
+//! colours, so the colour is plainly the player's on dark and saturated cloth and faces stay readable); for an
+//! account that predates v8 it is the canon model of the look it chose
 //! (`ff7/tifa`), which keeps its own colours like every canon model (the colour is the ring under its feet). The
 //! ref is looked up in both tables ([`fmv_ff7::playable::resolve_model`]); an unknown or missing one stands in as
 //! Cloud with the player's tint shown as a ring under the feet, so such players can still be told
@@ -37,6 +38,8 @@
 //! * [`ground`]: the shadow and rings under the players.
 //! * [`scenery`]: the field's picture as depth-tested tiles (atlas, quads, blend runs, the depth
 //!   mapping every depth test of a frame shares), built once per field.
+//! * [`identity`]: the player's colour on a model: the per-draw [`identity::Identity`], the shader's look and the
+//!   CPU mirror the tests hold it to.
 //! * [`gpu`]: upload once per character, depth-tested drawing through the field camera, the marks on
 //!   the ground, and the passes of a frame; [`scenery_gpu`]: the tile pipelines.
 //!
@@ -119,6 +122,7 @@ pub mod anim;
 pub mod frame;
 pub mod gpu;
 pub mod ground;
+pub mod identity;
 pub mod library;
 pub mod mesh;
 pub mod scenery;

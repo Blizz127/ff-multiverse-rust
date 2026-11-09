@@ -18,7 +18,10 @@
 //! Without a scenery (a field with nothing in front of the characters, or a device that cannot hold
 //! the atlas) pass 3 alone draws over the flat picture with a fresh depth buffer. Models are uploaded
 //! once per character: static vertex data (texture coordinates, vertex colours, the overlay flag),
-//! indices and textures stay on the GPU; only the skinned positions are written per frame.
+//! indices and textures stay on the GPU; only the skinned positions are written per frame, with what
+//! belongs to the DRAW and not to the character: a [`Tint`] (a colour factor and an opacity) and an
+//! [`Identity`] (the colour of the player the model shows, see [`super::identity`]) per model, each one
+//! 16-byte instance-rate slice of a buffer of its own. A character is never copied per player.
 //!
 //! # The projection
 //!
@@ -51,6 +54,7 @@
 
 use super::frame::AvatarFrame;
 use super::ground::GroundVertex;
+use super::identity::{identity_wgsl, Identity};
 use super::library::AvatarAsset;
 use super::mesh::BatchKind;
 use super::scenery::depth_terms;
@@ -91,6 +95,7 @@ pub(super) use globals_wgsl;
 /// WGSL of the models: skinned camera-space positions in, the field camera's projection applied.
 pub const MODEL_SHADER_WGSL: &str = concat!(
     globals_wgsl!(),
+    identity_wgsl!(),
     r#"
 @group(1) @binding(0) var model_tex: texture_2d<f32>;
 @group(1) @binding(1) var model_samp: sampler;
@@ -102,6 +107,10 @@ struct VsOut {
     // The draw's own colour factor and opacity (per instance, one instance per model): `flat` so that
     // the value reaches the fragment as it is, bit for bit (a white tint changes nothing).
     @location(2) @interpolate(flat) tint: vec4<f32>,
+    // The draw's identity colour and its strength (per instance too; a strength of 0 is no identity colour), and
+    // whether this triangle is a face decal (its part's `overlay` flag), which keeps its own colours.
+    @location(3) @interpolate(flat) identity: vec4<f32>,
+    @location(4) @interpolate(flat) face: f32,
 };
 
 @vertex
@@ -111,6 +120,7 @@ fn vs_model(
     @location(2) color: vec4<f32>,
     @location(3) overlay: f32,
     @location(4) tint: vec4<f32>,
+    @location(5) identity: vec4<f32>,
 ) -> VsOut {
     var out: VsOut;
     let w = cam.z;
@@ -125,11 +135,17 @@ fn vs_model(
     out.uv = uv;
     out.color = color;
     out.tint = tint;
+    out.identity = identity;
+    out.face = overlay;
     return out;
 }
 
 fn to_linear(c: vec3<f32>) -> vec3<f32> {
     return select(pow((c + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4)), c / 12.92, c <= vec3<f32>(0.04045));
+}
+
+fn to_srgb(c: vec3<f32>) -> vec3<f32> {
+    return select(1.055 * pow(c, vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055), c * 12.92, c <= vec3<f32>(0.0031308));
 }
 
 @fragment
@@ -139,11 +155,22 @@ fn fs_model(in: VsOut) -> @location(0) vec4<f32> {
         discard;
     }
     var rgb = in.color.rgb;
-    if (g.depth.w > 0.5) {
+    let srgb = g.depth.w > 0.5;
+    if (srgb) {
         rgb = to_linear(rgb);
     }
+    var lit = rgb * texel.rgb;
+    // The player's identity colour repaints the cloth (a strength of 0 leaves the product exactly as it is). It is
+    // worked out on the authored (sRGB-encoded) colours, so an sRGB target shows the picture a plain one does.
+    if (in.identity.w > 0.0) {
+        if (srgb) {
+            lit = to_linear(identity_look(to_srgb(lit), in.identity.rgb, in.identity.w, in.face));
+        } else {
+            lit = identity_look(lit, in.identity.rgb, in.identity.w, in.face);
+        }
+    }
     // The draw's tint scales the colours (above 1 it brightens) and its alpha the part's own.
-    return vec4<f32>(rgb * texel.rgb * in.tint.rgb, in.color.a * in.tint.a);
+    return vec4<f32>(lit * in.tint.rgb, in.color.a * in.tint.a);
 }
 "#
 );
@@ -187,6 +214,7 @@ const STATIC_ATTRIBUTES: [wgpu::VertexAttribute; 3] =
     wgpu::vertex_attr_array![1 => Float32x2, 2 => Unorm8x4, 3 => Float32];
 const POSITION_ATTRIBUTES: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![0 => Float32x3];
 const TINT_ATTRIBUTES: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![4 => Float32x4];
+const IDENTITY_ATTRIBUTES: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![5 => Float32x4];
 
 /// The per-draw tint of one model: a colour factor (`rgb`, above 1 it brightens) and an opacity
 /// (`alpha`). A model whose alpha is under 1 is drawn blended (all its batches, the opaque ones
@@ -239,6 +267,16 @@ fn tint_layout() -> wgpu::VertexBufferLayout<'static> {
     }
 }
 
+/// The identity colour ([`Identity`]): the same, one `[f32; 4]` per INSTANCE in a buffer of its own, a model drawn
+/// as the one instance of its 16-byte slice.
+fn identity_layout() -> wgpu::VertexBufferLayout<'static> {
+    wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<[f32; 4]>() as wgpu::BufferAddress,
+        step_mode: wgpu::VertexStepMode::Instance,
+        attributes: &IDENTITY_ATTRIBUTES,
+    }
+}
+
 /// The uniform block the avatar shaders share (see `globals_wgsl`).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
@@ -281,7 +319,7 @@ impl Globals {
 /// beyond it the cache starts over.
 pub(crate) const MAX_GPU_MODELS: usize = 32;
 const MIN_POSITION_BYTES: u64 = 64 * 1024;
-/// Room for 256 tints to start with (a battle draws a few dozen models).
+/// Room for 256 tints (and as many identity colours) to start with (a battle draws a few dozen models).
 const MIN_TINT_BYTES: u64 = 256 * 16;
 pub(super) const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
@@ -330,6 +368,9 @@ pub struct AvatarGpu {
     /// One tint per model of a frame (see [`tint_layout`]).
     tint_buf: wgpu::Buffer,
     tint_cap: u64,
+    /// One identity colour per model of a frame (see [`identity_layout`]).
+    identity_buf: wgpu::Buffer,
+    identity_cap: u64,
     ground_buf: wgpu::Buffer,
     ground_cap: u64,
     depth: Option<DepthTarget>,
@@ -409,7 +450,7 @@ impl AvatarGpu {
                     module: &shader,
                     entry_point: Some("vs_model"),
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    buffers: &[Some(position_layout()), Some(static_layout()), Some(tint_layout())],
+                    buffers: &[Some(position_layout()), Some(static_layout()), Some(tint_layout()), Some(identity_layout())],
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
@@ -514,6 +555,7 @@ impl AvatarGpu {
         let white = texture_bind_group(device, &texture_layout, &white_texture, &model_sampler);
         let position_buf = create_position_buffer(device, MIN_POSITION_BYTES);
         let tint_buf = create_vertex_buffer(device, "fmv-avatar-tints", MIN_TINT_BYTES);
+        let identity_buf = create_vertex_buffer(device, "fmv-avatar-identities", MIN_TINT_BYTES);
         let ground_buf = create_vertex_buffer(device, "fmv-avatar-ground-vertices", MIN_POSITION_BYTES);
         Self {
             device: device.clone(),
@@ -536,6 +578,8 @@ impl AvatarGpu {
             position_cap: MIN_POSITION_BYTES,
             tint_buf,
             tint_cap: MIN_TINT_BYTES,
+            identity_buf,
+            identity_cap: MIN_TINT_BYTES,
             ground_buf,
             ground_cap: MIN_POSITION_BYTES,
             depth: None,
@@ -688,14 +732,25 @@ impl AvatarGpu {
     /// With `with_scenery` the depth is the one [`AvatarGpu::draw_scenery`] left (the marks, the
     /// models and the blended tiles are tested against it); without, it starts empty.
     pub fn draw_models(&mut self, target: &wgpu::TextureView, size: (u32, u32), cam: &Camera, frame: &AvatarFrame, with_scenery: bool) {
-        self.draw_models_tinted(target, size, cam, frame, &frame.tints, with_scenery);
+        self.draw_models_tinted(target, size, cam, frame, &frame.tints, &frame.identities, with_scenery);
     }
 
-    /// [`AvatarGpu::draw_models`] with a [`Tint`] for each model: `tints[i]` is the colour factor and
-    /// the opacity of `frame.models[i]` (a model without one, or every model when `tints` is empty,
-    /// is drawn as it is, which is bit for bit what `draw_models` always drew). A model that is not
-    /// fully opaque is drawn blended with everything of it, in the pass of the semi-transparent ones.
-    pub fn draw_models_tinted(&mut self, target: &wgpu::TextureView, size: (u32, u32), cam: &Camera, frame: &AvatarFrame, tints: &[Tint], with_scenery: bool) {
+    /// [`AvatarGpu::draw_models`] with a [`Tint`] and an [`Identity`] for each model: `tints[i]` is the colour factor
+    /// and the opacity of `frame.models[i]`, `identities[i]` the colour of the player it shows (a model without one,
+    /// or every model when the list is empty, is drawn as it is, which is bit for bit what `draw_models` always
+    /// drew). A model that is not fully opaque is drawn blended with everything of it, in the pass of the
+    /// semi-transparent ones.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_models_tinted(
+        &mut self,
+        target: &wgpu::TextureView,
+        size: (u32, u32),
+        cam: &Camera,
+        frame: &AvatarFrame,
+        tints: &[Tint],
+        identities: &[Identity],
+        with_scenery: bool,
+    ) {
         // Nothing to draw, so nothing to put the scenery in front of either.
         if size.0 == 0 || size.1 == 0 || frame.models.is_empty() {
             return;
@@ -714,6 +769,15 @@ impl AvatarGpu {
             self.tint_cap = cap;
         }
         self.queue.write_buffer(&self.tint_buf, 0, bytemuck::cast_slice(&tint_data));
+        // And one identity colour per model, the same way.
+        let identity_data: Vec<[f32; 4]> = (0..frame.models.len()).map(|i| identities.get(i).copied().unwrap_or(Identity::NONE).to_array()).collect();
+        let identity_need = (identity_data.len() * std::mem::size_of::<[f32; 4]>()) as u64;
+        if identity_need > self.identity_cap {
+            let cap = identity_need.next_power_of_two().max(MIN_TINT_BYTES);
+            self.identity_buf = create_vertex_buffer(&self.device, "fmv-avatar-identities", cap);
+            self.identity_cap = cap;
+        }
+        self.queue.write_buffer(&self.identity_buf, 0, bytemuck::cast_slice(&identity_data));
 
         // One buffer holds every player's skinned positions, one after the other.
         let total_vertices: usize = frame.models.iter().map(|m| m.positions.len()).sum();
@@ -796,6 +860,7 @@ impl AvatarGpu {
                     pass.set_vertex_buffer(0, self.position_buf.slice(from..to));
                     pass.set_vertex_buffer(1, gpu.static_buf.slice(..));
                     pass.set_vertex_buffer(2, self.tint_buf.slice(tint_at..tint_at + std::mem::size_of::<[f32; 4]>() as u64));
+                    pass.set_vertex_buffer(3, self.identity_buf.slice(tint_at..tint_at + std::mem::size_of::<[f32; 4]>() as u64));
                     pass.set_index_buffer(gpu.index_buf.slice(..), wgpu::IndexFormat::Uint32);
                     for batch in gpu.batches.iter().filter(|b| drawn_now(b)) {
                         pass.set_bind_group(1, &batch.bind_group, &[]);
@@ -907,6 +972,20 @@ mod tests {
         let t = tint_layout();
         assert_eq!((t.array_stride, t.step_mode, t.attributes[0].shader_location, t.attributes[0].offset), (16, wgpu::VertexStepMode::Instance, 4, 0));
         assert!(MODEL_SHADER_WGSL.contains("@location(4) tint: vec4<f32>") && MODEL_SHADER_WGSL.contains("@interpolate(flat) tint"));
+        // The identity colour: a second vec4 per INSTANCE at location 5, in a buffer of its own (a second slice of 16
+        // bytes per model), passed on flat with the face flag (the overlay attribute at location 3, which the
+        // fragment stage now needs too).
+        let i = identity_layout();
+        assert_eq!((i.array_stride, i.step_mode, i.attributes[0].shader_location, i.attributes[0].offset), (16, wgpu::VertexStepMode::Instance, 5, 0));
+        assert_eq!(i.attributes[0].format, wgpu::VertexFormat::Float32x4);
+        for text in ["@location(5) identity: vec4<f32>", "@location(3) @interpolate(flat) identity: vec4<f32>", "@location(4) @interpolate(flat) face: f32", "out.face = overlay;", "out.identity = identity;"] {
+            assert!(MODEL_SHADER_WGSL.contains(text), "{text}");
+        }
+        // Strength 0 skips the look entirely: the colour path is the old product, `rgb * texel.rgb`, then the tint.
+        assert!(MODEL_SHADER_WGSL.contains("if (in.identity.w > 0.0) {") && MODEL_SHADER_WGSL.contains("vec4<f32>(lit * in.tint.rgb, in.color.a * in.tint.a)"));
+        assert!(MODEL_SHADER_WGSL.contains("var lit = rgb * texel.rgb;"));
+        // All of them, in the order the pipelines list the buffers (position, static, tint, identity).
+        assert_eq!(Identity::NONE.to_array(), [1.0, 1.0, 1.0, 0.0]);
         assert_eq!(Tint::default().to_array(), [1.0; 4]);
         assert_eq!(Tint { rgb: [0.5, 1.0, 2.0], alpha: 0.25 }.to_array(), [0.5, 1.0, 2.0, 0.25]);
         assert_eq!(std::mem::size_of::<Globals>(), 48, "three vec4s, as the shaders' uniform block");

@@ -82,6 +82,7 @@ use super::view::{Anchors, BattleView, Status};
 use crate::avatar::frame::{skin, AvatarFrame, SkinnedModel, OVERLAY_BIAS_MODEL_UNITS};
 use crate::avatar::gpu::Tint;
 use crate::avatar::ground::{circle, GroundShape};
+use crate::avatar::identity::Identity;
 use crate::avatar::library::AvatarAsset;
 use crate::render::{Camera, Vertex};
 use crate::state::ClientState;
@@ -230,6 +231,9 @@ pub struct BattleFrame {
     /// The tint of each of `models.models` (a model past the end of this list is drawn as it is): the
     /// opacity of an enemy that is fading away, the glow of an effect.
     pub tints: Vec<Tint>,
+    /// The identity colour of each of `models.models` (a model past the end of this list has none): the body of a
+    /// party member whose player's colour is known, in that colour. Not its weapon, the enemies, the effects.
+    pub identities: Vec<Identity>,
     /// The window camera the models and marks are placed with ([`View::gpu_camera`]).
     pub camera: Camera,
 }
@@ -529,9 +533,10 @@ impl BattleScene {
             let cut = location.cuts.get(k)?.get_or_init(|| LocationCut::make(&location.rig, &view.camera)).as_ref()?;
             Some(AvatarFrame {
                 models: vec![SkinnedModel { asset: Arc::clone(&cut.asset), positions: cut.positions.clone() }],
-                // The battle's tints are `BattleFrame::tints` (an actor's opacity, an effect's glow): the frames
-                // themselves carry none.
+                // The battle's tints and identity colours are `BattleFrame::tints` and `identities` (an actor's
+                // opacity, an effect's glow, a player's colour): the frames themselves carry none.
                 tints: Vec::new(),
+                identities: Vec::new(),
                 zoom: view.zoom as f32,
                 overlay_bias: 0.0,
                 ground: Vec::new(),
@@ -545,12 +550,14 @@ impl BattleScene {
             models: AvatarFrame {
                 models,
                 tints: Vec::new(),
+                identities: Vec::new(),
                 zoom: view.zoom as f32,
                 overlay_bias: OVERLAY_BIAS_MODEL_UNITS * model::FIELD_TO_BATTLE_SCALE * 2.0,
                 ground: marks.into_iter().flat_map(|(_, shapes)| shapes).collect(),
                 scenery: None,
             },
             tints,
+            identities: Vec::new(),
             camera: view.gpu_camera(),
         }
     }
