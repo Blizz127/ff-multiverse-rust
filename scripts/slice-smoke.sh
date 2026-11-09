@@ -50,6 +50,15 @@
 #   restarted server: it fights them as their slots (characters=[1, 2]) with their own names, at the levels and
 #   limit gauges session 1 saved, and the identity, binding, slot and pointers of both records are unchanged.
 #
+#   LEVEL AND LIMIT GAUGE (the real-process carry-over check): a win pays about 16 of the ~250 experience a level costs and
+#   these weak enemies rarely hurt anybody, so over real processes nobody would level up or fill a gauge. Session 1's server
+#   therefore runs with its two DEBUG flags (--debug-bonus-exp 900 and --debug-bonus-limit 100: refused
+#   without --debug-encounters and on the default state directory, warned about at start-up, logged on every use; they pay
+#   and keep made-up numbers through the ordinary save path), and the run checks that BOTH NEW characters ended session 1 at a
+#   higher level than they joined at (told leveled_up=true, stored) with a non-empty limit gauge (stored, and the one the
+#   server logged keeping). The restarted servers have no bonus, so a level and a gauge that come back can only be the saved
+#   ones: the login tells the level, and the second battle starts with exactly the saved levels and gauges.
+#
 # EVERY PERSISTED FIELD that must survive the restart is checked in the stored files (read with jq) AND on the
 # wire: identity (name, colour, body), binding, slot, the pointers to the progress records, level, experience, AP,
 # gil, the limit gauge, the inventory, and the story blob.
@@ -105,6 +114,13 @@ SLOT_NAME_B=Tifa
 OTHER_TINT=101010
 OTHER_BODY=lean
 OTHER_SLOT=cid
+# The made-up numbers of session 1 (the server's DEBUG flags --debug-bonus-exp and --debug-bonus-limit, which it only
+# accepts with --debug-encounters and a state directory of its own): a win pays about 16 of the ~250 experience a level
+# costs and these weak enemies rarely hurt anybody, so without them nobody levels up or fills a gauge over real
+# processes and the carry-over of a LEVEL and of a LIMIT GAUGE across the restart would go unproven. Only session 1's
+# server has them: the restarted servers do not, so what survives is what the first one SAVED.
+BONUS_EXP=900
+BONUS_LIMIT=100
 
 usage() {
   cat <<'EOF'
@@ -113,9 +129,11 @@ Usage: scripts/slice-smoke.sh [--release|--debug] [--bin-dir DIR] [--build] [--l
 
 The foundations slice over real processes and the owner's real FF7 data (protocol v8): two headless
 players with different identities and combat slots register, party up, advance one story and fight one shared
-battle on md1stin; the server is stopped and started again as a new process on the same state directory; the
-same two players log in and must be told exactly what they ended with, every persisted record must be byte for
-byte unchanged, and a second battle must use what was saved. See the header of this script for every check.
+battle on md1stin (session 1's server runs with the DEBUG bonuses --debug-bonus-exp and --debug-bonus-limit, so
+that both new characters level up and fill a limit gauge); the server is stopped and started again as a new
+process (without the bonuses) on the same state directory; the same two players log in and must be told exactly
+what they ended with, every persisted record must be byte for byte unchanged, and a second battle must use what
+was saved, levels and limit gauges included. See the header of this script for every check.
 
   --library DIR    state directory that contains library/ (default $FMV_FF7_LIBRARY, else
                    ~/.local/share/ff-multiverse); only the library is read, never written
@@ -213,13 +231,15 @@ first_field() {
   field "$(strip_ansi "$line")" "$3"
 }
 
-# start_slice_server <port> <log>: start the server on 127.0.0.1:<port> (0: any) with the persistent state directory
-# and wait for READY (ADDR, CONNECT and SERVER_PID are set).
+# start_slice_server <port> <log> [extra server args...]: start the server on 127.0.0.1:<port> (0: any) with the
+# persistent state directory and wait for READY (ADDR, CONNECT and SERVER_PID are set). The extra arguments are
+# session 1's debug bonuses.
 start_slice_server() {
   local port="$1" log="$2"
+  shift 2
   local -a args=(--bind "127.0.0.1:$port" --ff7-library "$WORK/lib-state" --state-dir "$WORK/server-state"
     --debug-encounters --no-random-encounters --battle-speed "$BATTLE_SPEED" --battle-tick-rate "$TICK_RATE"
-    --debug-formation "$FORMATION" --battle-seed "$SEED")
+    --debug-formation "$FORMATION" --battle-seed "$SEED" "$@")
   say "starting server: $SERVER_BIN ${args[*]}"
   "$SERVER_BIN" "${args[@]}" >"$log" 2>&1 &
   SERVER_PID=$!
@@ -541,16 +561,17 @@ run_slice() {
   need_flag "$client_help" "--talk" "the headless talk of the slice"
   need_flag "$client_help" "--party-accept-after-split" "sw-story"
 
-  local enc_a enc_b n
+  local enc_a enc_b n CARRIED=""
+  local -A LEVEL_UPS=()
   enc_a=$(percent_encode "$NAME_A")
   enc_b=$(percent_encode "$NAME_B")
 
   # ------------------------------------------------------------------------------------------------------------
   # Session 1: register, party up, advance one story, talk, fight one shared battle.
   # ------------------------------------------------------------------------------------------------------------
-  start_slice_server 0 "$WORK/s1-server.log"
+  start_slice_server 0 "$WORK/s1-server.log" --debug-bonus-exp "$BONUS_EXP" --debug-bonus-limit "$BONUS_LIMIT"
   local port="${ADDR##*:}"
-  say "session 1: players A ($NAME_A, body $BODY_A, slot $SLOT_NAME_A) and B ($NAME_B, body $BODY_B, slot $SLOT_NAME_B) register, party up, advance a story and fight (${SLICE_DURATION}s)"
+  say "session 1 (the server has the DEBUG bonuses: +$BONUS_EXP experience per win, +$BONUS_LIMIT limit gauge per battle): players A ($NAME_A, body $BODY_A, slot $SLOT_NAME_A) and B ($NAME_B, body $BODY_B, slot $SLOT_NAME_B) register, party up, advance a story and fight (${SLICE_DURATION}s)"
   start_player A r1 "$SLICE_DURATION" --tint "$TINT_A" --body "$BODY_A" --slot "$SLOT_A" --talk gu0,Barret \
     --story-advance --party-invite-first-peer --battle-auto --debug-encounters --battle-wait-party 2
   start_player B r1 "$SLICE_DURATION" --tint "$TINT_B" --body "$BODY_B" --slot "$SLOT_B" --talk gu0,Barret \
@@ -685,6 +706,12 @@ run_slice() {
   [[ $npcs_a == *"name=gu0 "* && $npcs_a == *"name=gu1 "* ]] || problem "the guards of md1stin are not in the NPC list any more: $npcs_a"
 
   stop_server
+  # The DEBUG bonuses were loud (a warning at start-up, and every payment and every kept gauge says so), and only this
+  # server had them.
+  log_has "$sl" "DEBUG: --debug-bonus-exp $BONUS_EXP is on" || problem "session 1's server never warned about --debug-bonus-exp"
+  log_has "$sl" "DEBUG: --debug-bonus-limit $BONUS_LIMIT is on" || problem "session 1's server never warned about --debug-bonus-limit"
+  (($(count_lines_with "$sl" "debug_bonus_exp=$BONUS_EXP") >= 2)) || problem "the server's 'battle reward' lines do not all say debug_bonus_exp=$BONUS_EXP (one per paid member)"
+  (($(count_lines_with "$sl" "debug_bonus_limit=$BONUS_LIMIT") >= 2)) || problem "the server's 'limit kept' lines do not all say debug_bonus_limit=$BONUS_LIMIT (one per member)"
   # Stopping the server saved everything queued: both payments and A's story are in the store.
   (($(count_lines_with "$sl" "progress saved account=") >= 2)) || problem "the server did not save the progress of both members"
   if log_has "$sl" "progress saved account="; then
@@ -708,6 +735,20 @@ run_slice() {
     expect_equal "session 1 $n: what the server last told it (level exp gil ap) is what is stored" "$told" "${stored% *}"
     # And it is exactly what the player started with (told on joining) plus what the battle paid.
     check_paid "session 1 $n" "$sl" "$(account_of "$name")" "$(progress_numbers "$WORK/r1-client-$n.log" first)" "$stored"
+    # The DEBUG bonuses made this NEW character level up and fill a gauge in this one session: it joined at the level its
+    # slot starts at with an empty gauge, and what is stored now is higher and non-empty (the carry-over of both across
+    # the restart is checked below, against exactly these stored numbers).
+    local join_numbers join_level stored_level stored_limit kept
+    join_numbers=$(progress_numbers "$WORK/r1-client-$n.log" first)
+    join_level=${join_numbers%% *}
+    stored_level=${stored%% *}
+    ((stored_level > join_level)) || problem "session 1 $n: no level up (told level $join_level on joining, stored level $stored_level): the DEBUG experience bonus did not reach the record"
+    log_has "$WORK/r1-client-$n.log" "leveled_up=true" || problem "session 1 $n: the server never told it leveled_up=true"
+    stored_limit=${stored##* }
+    ((stored_limit > 0)) || problem "session 1 $n: the stored limit gauge is $stored_limit, expected a non-empty one (the DEBUG limit bonus did not reach the record)"
+    kept=$(line_field "$sl" "limit kept battle=1 account=$(account_of "$name") " limit)
+    expect_equal "session 1 $n: the stored limit gauge is the one the server logged keeping (the battle's own plus the bonus)" "$stored_limit" "$kept"
+    LEVEL_UPS[$n]="level $join_level -> $stored_level, limit gauge $stored_limit"
     # The inventory the server told is what is stored when the record holds one (a drop or an item used wrote it);
     # a record without the key means nothing changed it, so the player still carries the starting stock it was told
     # at its first join.
@@ -812,19 +853,22 @@ run_slice() {
   read -r -a sb <<<"$stored_b"
   expect_equal "the restarted server fights them at the levels session 1 saved" "$(levels_of "$started2")" "$(sorted_words "${sa[0]}" "${sb[0]}")"
   expect_equal "the restarted server starts them with the limit gauges session 1 saved" "$(limits_of "$started2")" "$(sorted_words "${sa[4]}" "${sb[4]}")"
-  # What that proves: a restarted server that ignored a saved LEVEL or LIMIT GAUGE would still pass when the saved values
-  # are the starting ones, which is what these weak battles leave (a win pays 16 experience of the ~250 a level costs, and
-  # nobody is hurt enough to fill a gauge). Say so, as battle-smoke does for the gauge; the experience, gil and AP carry-over
-  # is checked to the point by check_paid.
+  # What that proves, this time: session 1's server (with the DEBUG bonuses) made both characters LEVEL UP and fill a LIMIT
+  # GAUGE, checked above against the stored record, and the restarted servers have no bonus: they cannot invent either. So a
+  # restarted server that ignored a saved level or gauge would fight them at their slot's starting level with an empty gauge
+  # and fail the two checks above, and these ones say that the values that survived are not the starting ones.
   local join_level_a join_level_b
   join_level_a=$(progress_numbers "$WORK/r1-client-A.log" first)
   join_level_b=$(progress_numbers "$WORK/r1-client-B.log" first)
-  if [[ ${sa[0]} == "${join_level_a%% *}" && ${sb[0]} == "${join_level_b%% *}" ]]; then
-    say "note: both players ended session 1 at the level they started at (a win pays 16 experience of the ~250 a level costs), so the carry-over of a LEVEL into the restarted server is not exercised over real processes here"
-  fi
-  if [[ ${sa[4]} == 0 && ${sb[4]} == 0 ]]; then
-    say "note: nobody's limit gauge was above 0 after session 1, so the carry-over of a non-empty gauge into the restarted server is not exercised here (crates/fmv-server/tests/progress.rs covers the level, the gauge and the restart); the experience, gil and AP carry-over is checked to the point"
-  fi
+  ((${sa[0]} > ${join_level_a%% *} && ${sb[0]} > ${join_level_b%% *})) ||
+    problem "session 1 raised no level for both players (A ${join_level_a%% *} -> ${sa[0]}, B ${join_level_b%% *} -> ${sb[0]}): a restarted server that forgot the level could not be told apart"
+  ((${sa[4]} > 0 && ${sb[4]} > 0)) || problem "session 1 filled no gauge for both players (A ${sa[4]}, B ${sb[4]}): a restarted server that forgot the gauge could not be told apart"
+  local server_log
+  for server_log in "$WORK/s2-server.log" "$s3"; do
+    ! log_has "$server_log" "DEBUG: --debug-bonus" || problem "a restarted server ran with a DEBUG bonus ($server_log): what survived the restart would not be proven"
+  done
+  CARRIED="A level ${join_level_a%% *} -> ${sa[0]} and limit gauge ${sa[4]}, B level ${join_level_b%% *} -> ${sb[0]} and limit gauge ${sb[4]}"
+  say "carried over a REAL server restart (told and fought again by servers without the bonuses): $CARRIED"
   stop_server
   # What the second battle changed is progress (and B's story); identity, binding, slot and pointers are unchanged.
   check_stored_character A "$NAME_A" "$TINT_A" "$BODY_A" "$SLOT_A"
@@ -868,8 +912,11 @@ run_slice() {
   say "session 1 NPCs of md1stin (the Barret-slot player's list; the Tifa-slot player's is identical): $npcs_a"
   say "session 1 guard talk: $windows_a window(s), origin=canon, the same text for both players ($(text_digest "$text_a"))"
   say "session 2b server: $started2"
+  for n in A B; do
+    say "session 1 -> restart, player $n: ${LEVEL_UPS[$n]}"
+  done
   RESULT=pass
-  say "PASS: two original characters (distinct identities, bodies and slots) partied up, advanced a story and won a shared battle; the roster named them, not their slot's canon characters; the canon Barret NPC was in the field for both and the dialogue was the game's own; after a REAL server restart every card, record, experience, gil, AP, inventory and story was exactly what it was (and the level and limit gauge, which these weak battles leave at their starting values: see the notes above), the records were byte for byte unchanged by a login, a second battle paid on top of what was saved to the point, and the restarted server fought them as their slots; $state_real unchanged ($after)."
+  say "PASS: two original characters (distinct identities, bodies and slots) partied up, advanced a story and won a shared battle; the roster named them, not their slot's canon characters; the canon Barret NPC was in the field for both and the dialogue was the game's own; session 1's server (with the DEBUG bonuses) made both LEVEL UP and fill a LIMIT GAUGE and after a REAL server restart every card, record, level, experience, gil, AP, limit gauge, inventory and story was exactly what it was ($CARRIED), the records were byte for byte unchanged by a login, a second battle (on servers without the bonuses) paid on top of what was saved to the point and started with the saved levels and gauges, and the restarted server fought them as their slots; $state_real unchanged ($after)."
 }
 
 main() {
