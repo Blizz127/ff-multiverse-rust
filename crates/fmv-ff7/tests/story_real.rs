@@ -143,6 +143,9 @@ fn every_field_scans_and_a_new_account_is_in_the_empty_phase_of_all_of_them() {
         assert_eq!(story.phase_key(&at(NEW_GAME_MOMENT)), Some(PhaseKey::default()), "{name}");
         if story.point_count() > 0 {
             with_points.insert(name.clone(), story.point_count());
+            for p in story.points() {
+                println!("  story point {name}#{}: {}", p.id, p.label);
+            }
         }
         if !story.edges().is_empty() {
             with_edges += 1;

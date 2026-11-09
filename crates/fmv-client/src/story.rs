@@ -67,6 +67,15 @@ impl StoryMirror {
         &self.progress
     }
 
+    /// The FF7 story counter (`Var[2][0]`, the "game moment") for whatever reads script variables on this
+    /// side: a new account's is [`fmv_ff7::story::NEW_GAME_MOMENT`]. `None` when the blob is not FF7's
+    /// (a progression of another build or game is never guessed at). The hook the dialogue lane feeds its
+    /// script variables from; it changes only when the server sends a `StoryUpdate`.
+    #[allow(dead_code)] // read by the dialogue lane, not by this crate yet
+    pub fn moment(&self) -> Option<u16> {
+        fmv_ff7::story::StoryState::decode(&self.progress).map(|s| s.moment)
+    }
+
     /// Whether the server ever sent a `StoryUpdate` (a new account's session never gets one until it advances).
     #[cfg(test)]
     pub fn told(&self) -> bool {
@@ -173,7 +182,8 @@ impl StoryBot {
         // stepping a little way and back (it judges every accepted move).
         if point.is_hit_by(cur, cur) && cur.dist_xy(centre) < NUDGE * 2.0 {
             self.nudges += 1;
-            let sign = if (self.nudges / 40) % 2 == 0 { 1.0 } else { -1.0 };
+            // Forty steps one way, forty the other, and so on (the lowest bit of the count of forties).
+            let sign = if (self.nudges / 40) & 1 == 0 { 1.0 } else { -1.0 };
             let want = Pos::new(centre.x + sign * NUDGE, centre.y, cur.z);
             return self.step_toward(area, &exits, cur, want, len).unwrap_or(still);
         }
@@ -290,8 +300,14 @@ mod tests {
     fn the_mirror_remembers_the_last_blob_counts_steps_and_says_what_changed() {
         let mut m = StoryMirror::default();
         assert!(m.progress().is_empty() && !m.told() && m.advances() == 0);
+        assert_eq!(m.moment(), Some(fmv_ff7::story::NEW_GAME_MOMENT), "never told: a new account's moment");
         m.on_update(vec![1, 6, 0], Some(StoryAdvance { point: 0, summary: "moment=1->6\u{1b}[31m".into() }));
         assert_eq!((m.progress(), m.advances(), m.told()), (&[1u8, 6, 0][..], 1, true));
+        assert_eq!(m.moment(), Some(6), "the story variable the dialogue lane reads");
+        // A blob that is not FF7's is kept but never read as a moment.
+        let mut other = StoryMirror::default();
+        other.on_update(vec![7, 7], None);
+        assert_eq!((other.progress(), other.moment()), (&[7u8, 7][..], None));
         m.on_update(vec![1, 6, 0], None);
         let notes = m.drain_notes();
         assert_eq!(notes.len(), 2);
