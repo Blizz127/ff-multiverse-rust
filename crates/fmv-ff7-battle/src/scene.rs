@@ -21,7 +21,7 @@
 //! | `0x04C0` | 32 x 28 | attack records |
 //! | `0x0840` | 32 x u16 | attack ids (`0xFFFF` = unused slot) |
 //! | `0x0880` | 32 x 32 | attack names (FF text) |
-//! | `0x0C80` | rest | formation / enemy AI scripts (NOT parsed here) |
+//! | `0x0C80` | rest | formation / enemy AI scripts (the enemies' are kept as [`Scene::ai`], see [`crate::ai`]) |
 //!
 //! A battle ("formation") number is `scene_index * 4 + formation_slot`; see
 //! [`global_formation_index`] and [`split_formation_index`].
@@ -35,12 +35,13 @@
 //!
 //! # Not parsed
 //!
-//! AI scripts, status bit meanings, and elemental/status application are out of scope for
-//! the M2-c battle subset (see `rules`). The Japanese `scene.bin` (16-byte names) is not
+//! The formations' own AI scripts, status bit meanings, and elemental/status application are out of
+//! scope for the M2-c battle subset (see `rules`). The Japanese `scene.bin` (16-byte names) is not
 //! supported and is rejected by the size check.
 
 use std::path::Path;
 
+use crate::ai::SceneAi;
 use crate::bytes::{array_at, gunzip_capped, i16_at, u16_array_at, u16_at, u32_at, u8_at};
 use crate::text;
 
@@ -558,6 +559,8 @@ pub struct Scene {
     pub enemies: [Option<EnemyRecord>; ENEMIES_PER_SCENE],
     /// Attacks defined by this scene (unused slots omitted).
     pub attacks: Vec<SceneAttack>,
+    /// The enemies' AI scripts (see [`crate::ai`]).
+    pub ai: SceneAi,
 }
 
 impl Scene {
@@ -611,6 +614,7 @@ impl Scene {
             formations,
             enemies,
             attacks,
+            ai: SceneAi::parse(raw),
         })
     }
 
@@ -644,7 +648,8 @@ impl Scene {
     }
 
     /// The first plain physical attack of an enemy, used as its "basic attack" by the
-    /// M2-c rules (real FF7 picks attacks with AI scripts, which are not decoded here).
+    /// M2-c rules (real FF7 picks attacks with AI scripts, see [`crate::ai`]; this is what an enemy
+    /// whose script cannot be followed falls back on).
     pub fn basic_attack(&self, enemy_slot: usize) -> Option<&SceneAttack> {
         self.enemy_attacks(enemy_slot)
             .into_iter()
