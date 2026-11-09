@@ -117,6 +117,31 @@ fn a_talk_script_hands_out_its_dialog_and_then_ends() {
     assert!(first.origin.is_canon() && first.choice.is_none());
 }
 
+/// A script that gives an item (`STITM`) and then announces it: the canon announcement is shown as
+/// written, followed by an added note that nothing was given (the walk performs no effects).
+#[test]
+fn a_gift_the_walk_does_not_give_is_followed_by_an_added_note() {
+    let stitm = vec![0x58, 0x00, 0x00, 0x00, 0x01]; // STITM item 0 x1 (literal banks)
+    let section = one(&[stitm, message(0, 0), message(0, 1)], vec![dialog("Received Potion!"), dialog("Take care.")]);
+    let beats = run(&section, &[]);
+    assert_eq!(beats.len(), 4, "{beats:?}");
+    assert_eq!(lines(&beats[0]), ["Received Potion!"], "the canon line comes first, as written");
+    let Beat::Message(note) = &beats[1] else { panic!("{beats:?}") };
+    assert_eq!(note.origin, MessageOrigin::Added { layer: EFFECT_NOTE_LAYER.to_string() });
+    assert!(note.page_lines().concat().join(" ").contains("Nothing was given"), "{note:?}");
+    assert_eq!(lines(&beats[2]), ["Take care."], "the note only follows the announcement");
+    assert_eq!(beats[3], Beat::End(End::Finished));
+}
+
+/// Without a gift opcode no note is ever added.
+#[test]
+fn no_gift_means_no_note() {
+    let section = one(&[message(0, 0)], vec![dialog("Hello.")]);
+    let beats = run(&section, &[]);
+    assert_eq!(beats.len(), 2, "{beats:?}");
+    assert!(beats.iter().all(|b| !matches!(b, Beat::Message(m) if !m.origin.is_canon())));
+}
+
 #[test]
 fn a_finished_walk_stays_finished() {
     let section = one(&[], vec![]);
