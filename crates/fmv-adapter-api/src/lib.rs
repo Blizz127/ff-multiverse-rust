@@ -1,7 +1,7 @@
 //! Adapter trait boundary. Server and client link adapters only through these traits,
 //! so new games (FF8/9/10/12) never require core changes.
 
-use fmv_core::{AreaId, EditionProvenance, Fingerprint, GameId, Pos};
+use fmv_core::{AreaId, EditionProvenance, Fingerprint, GameId, PhaseKey, Pos};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AdapterError {
@@ -225,6 +225,105 @@ pub struct NpcSpawn {
     pub unconditional: bool,
 }
 
+/// What makes the story move in an area, in terms the server can verify for itself.
+///
+/// Only [`StoryTrigger::Region`] exists. The other things that move an FF7 story (a talk script, a
+/// cutscene that runs by itself, a battle that has to be won) need the script VM or the dialogue
+/// lane; adding them later means adding a kind.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum StoryTrigger {
+    /// The player's character stands in this convex polygon (judged on x and y only, like exits). The
+    /// corners are in THIS area's coordinates, in either winding order.
+    Region(Vec<Pos>),
+}
+
+/// One place where an area's story can advance a player, as its own data defines it. The point says
+/// WHERE (the trigger); WHETHER it applies to a player, and what it does to their progression, is
+/// [`AreaRuntime::story_advance`]: it depends on the progression, which only the adapter reads.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoryPoint {
+    /// Identifies the point within its area; stable while the area is hosted. What
+    /// [`AreaRuntime::story_advance`] takes.
+    pub id: u32,
+    pub trigger: StoryTrigger,
+    /// A short line for logs: numbers and names of the adapter's own, never text of the game.
+    pub label: String,
+}
+
+impl StoryPoint {
+    /// Whether a move `from -> to` (both in this area's coordinates) touches the trigger: the chord
+    /// crosses or ends inside a [`StoryTrigger::Region`]. A move that starts inside it counts too,
+    /// so a player that is standing in the region when the point becomes available (its story moved
+    /// on while it stood there) is caught by its next step. Non-finite positions never hit.
+    ///
+    /// The whole chord is tested and not only where it ends, so a fast mover cannot step over a thin
+    /// region between two ticks.
+    pub fn is_hit_by(&self, from: Pos, to: Pos) -> bool {
+        if !(from.is_finite() && to.is_finite()) {
+            return false;
+        }
+        match &self.trigger {
+            StoryTrigger::Region(corners) => chord_touches_polygon(corners, from, to),
+        }
+    }
+
+    /// The middle of the trigger, in x, y and z: a point to steer toward.
+    pub fn center(&self) -> Pos {
+        match &self.trigger {
+            StoryTrigger::Region(corners) => {
+                let n = corners.len().max(1) as f32;
+                let sum = corners.iter().fold((0.0, 0.0, 0.0), |s, p| (s.0 + p.x, s.1 + p.y, s.2 + p.z));
+                Pos::new(sum.0 / n, sum.1 / n, sum.2 / n)
+            }
+        }
+    }
+}
+
+/// The result of a [`AreaRuntime::story_advance`]: the progression the player has now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoryStep {
+    /// The new progression blob, in the adapter's own encoding (what the server stores for the
+    /// account and game).
+    pub progress: Vec<u8>,
+    /// What changed, as numbers and names of the adapter's own, for logs and the client's log
+    /// (FF7: `moment 1 -> 6`). Never text of the game.
+    pub summary: String,
+}
+
+/// Whether the segment `a -> b` meets the convex polygon `corners` (x and y only). An endpoint
+/// inside counts, and so does a crossing of any edge. A polygon with fewer than three corners, or
+/// with a non-finite corner, is never touched.
+fn chord_touches_polygon(corners: &[Pos], a: Pos, b: Pos) -> bool {
+    if corners.len() < 3 || corners.iter().any(|p| !p.is_finite()) {
+        return false;
+    }
+    let (ax, ay, bx, by) = (f64::from(a.x), f64::from(a.y), f64::from(b.x), f64::from(b.y));
+    // Inside: the point is on the same side (or on) of every edge, whichever way the polygon winds.
+    let inside = |x: f64, y: f64| {
+        let (mut pos, mut neg) = (false, false);
+        for (i, p) in corners.iter().enumerate() {
+            let q = corners.get((i + 1) % corners.len()).copied().unwrap_or(*p);
+            let cross = (f64::from(q.x) - f64::from(p.x)) * (y - f64::from(p.y)) - (f64::from(q.y) - f64::from(p.y)) * (x - f64::from(p.x));
+            pos |= cross > 0.0;
+            neg |= cross < 0.0;
+        }
+        !(pos && neg)
+    };
+    if inside(ax, ay) || inside(bx, by) {
+        return true;
+    }
+    // Both ends outside: the chord still touches the polygon if it crosses an edge.
+    let orient = |px: f64, py: f64, qx: f64, qy: f64, rx: f64, ry: f64| (qx - px) * (ry - py) - (qy - py) * (rx - px);
+    corners.iter().enumerate().any(|(i, p)| {
+        let q = corners.get((i + 1) % corners.len()).copied().unwrap_or(*p);
+        let (px, py, qx, qy) = (f64::from(p.x), f64::from(p.y), f64::from(q.x), f64::from(q.y));
+        let (d1, d2) = (orient(ax, ay, bx, by, px, py), orient(ax, ay, bx, by, qx, qy));
+        let (d3, d4) = (orient(px, py, qx, qy, ax, ay), orient(px, py, qx, qy, bx, by));
+        d1 * d2 <= 0.0 && d3 * d4 <= 0.0 && !(d1 == 0.0 && d2 == 0.0)
+    })
+}
+
 /// Loaded, server- or client-side runtime for one area. Holds decoded data from the local
 /// owned copy only; nothing here is ever serialized onto the network.
 pub trait AreaRuntime: Send + Sync {
@@ -261,6 +360,53 @@ pub trait AreaRuntime: Send + Sync {
         let _ = hint;
         self.validate_move(arrival, arrival).pos()
     }
+
+    // ---- story: per-account progression, phases and the points that advance it (all additive) ----
+    //
+    // An account's progression is ONE opaque blob per game (`fmv_persist::Progression`): only the
+    // adapter reads it, and an empty blob is a new account (the game's own starting point). The
+    // methods below are how the server, which never looks inside the blob, still gets phases and
+    // advancement from it. None of them knows who the player is or which character they play: the
+    // story belongs to the account, not to the player's look or combat slot.
+
+    /// The story phase of THIS area for an account whose progression is `progress`: the opaque key
+    /// that selects which instance of the area it is in (accounts with equal keys share one; party
+    /// members are placed by their leader's). `None`: this area does not read the progression (the
+    /// default), and the server uses one phase per distinct blob, for every area alike.
+    ///
+    /// The key for the game's starting progression (the empty blob) must be `PhaseKey::default()`
+    /// in every area, so that every existing account starts in one and the same phase and only
+    /// advancing the story separates players. Must be cheap: it runs for every placement.
+    fn phase_key(&self, progress: &[u8]) -> Option<PhaseKey> {
+        let _ = progress;
+        None
+    }
+
+    /// The places where this area's story can advance a player (see [`StoryPoint`]). The server
+    /// watches every accepted move against them. The default is none.
+    fn story_points(&self) -> Vec<StoryPoint> {
+        Vec::new()
+    }
+
+    /// What reaching story point `point` does to an account whose progression is `progress`: the
+    /// new progression, or `None` when it does nothing (the point does not apply to that story state,
+    /// the point is unknown, or `progress` cannot be read: an unreadable blob is never replaced).
+    /// Pure: the server applies the step, saves it and tells the player.
+    ///
+    /// A story only moves forward: a step never lowers what the progression already records.
+    fn story_advance(&self, progress: &[u8], point: u32) -> Option<StoryStep> {
+        let _ = (progress, point);
+        None
+    }
+
+    /// The non-player characters that exist in the instance of this area that runs `phase`. This is
+    /// where a phase decides which of the game's cast (and so which events) a player's instance holds.
+    /// The default is every NPC the area places ([`AreaRuntime::npcs`]) whatever the phase; the
+    /// server shows only those with `unconditional` set, as it always has.
+    fn npcs_in_phase(&self, phase: &PhaseKey) -> Vec<NpcSpawn> {
+        let _ = phase;
+        self.npcs()
+    }
 }
 
 /// A game adapter bound to one owned-content source (or the synthetic fixture).
@@ -268,6 +414,17 @@ pub trait GameAdapter: Send + Sync {
     fn game(&self) -> GameId;
     fn list_areas(&self) -> Vec<AreaInfo>;
     fn load_area(&self, key: &str) -> Result<Box<dyn AreaRuntime>, AdapterError>;
+
+    /// Combine the progression an account already has stored with one that was just advanced, into
+    /// the progression to store: a story only moves forward, so this keeps whatever either records
+    /// (FF7: the further moment). Also what lets a save that arrives late (a player that logged out and
+    /// in again before it was written) never take a stored story back. A blob the adapter cannot read
+    /// must come back unchanged if it is `stored` (an unreadable record is never overwritten). The
+    /// default is `advanced`: the newest write wins.
+    fn merge_progression(&self, stored: &[u8], advanced: &[u8]) -> Vec<u8> {
+        let _ = stored;
+        advanced.to_vec()
+    }
 }
 
 #[cfg(test)]
@@ -413,6 +570,98 @@ mod tests {
         assert!(area.exits().is_empty() && area.npcs().is_empty() && area.encounters().is_none());
         assert_eq!(area.place_arrival(Pos::new(3.0, 4.0, 0.0), Some(12)), Pos::new(3.0, 4.0, 9.0), "snapped to the floor");
         assert_eq!(area.place_arrival(Pos::new(-3.0, 4.0, 0.0), None), Pos::new(1.0, 1.0, 9.0), "off the floor: the area's own choice");
+    }
+
+    fn region(corners: &[(f32, f32)]) -> StoryPoint {
+        StoryPoint {
+            id: 7,
+            trigger: StoryTrigger::Region(corners.iter().map(|&(x, y)| Pos::new(x, y, 3.0)).collect()),
+            label: "test".into(),
+        }
+    }
+
+    #[test]
+    fn a_chord_that_touches_the_region_hits_it_however_it_gets_there() {
+        // a right triangle, once wound each way
+        for corners in [[(0.0, 0.0), (10.0, 0.0), (0.0, 10.0)], [(0.0, 0.0), (0.0, 10.0), (10.0, 0.0)]] {
+            let p = region(&corners);
+            // ends inside, starts inside, stays inside
+            assert!(p.is_hit_by(at(20.0, 20.0), at(2.0, 2.0)));
+            assert!(p.is_hit_by(at(2.0, 2.0), at(20.0, 20.0)));
+            assert!(p.is_hit_by(at(1.0, 1.0), at(2.0, 2.0)));
+            // both ends outside, the chord goes through it (a fast mover between two ticks)
+            assert!(p.is_hit_by(at(-5.0, 3.0), at(15.0, 3.0)));
+            assert!(p.is_hit_by(at(3.0, -5.0), at(3.0, 15.0)));
+            // both ends outside and it only clips a corner
+            assert!(p.is_hit_by(at(-1.0, 2.0), at(2.0, -1.0)));
+            // misses: beside it, short of it, past the hypotenuse
+            assert!(!p.is_hit_by(at(-5.0, -5.0), at(-1.0, 20.0)));
+            assert!(!p.is_hit_by(at(11.0, -5.0), at(11.0, 5.0)));
+            assert!(!p.is_hit_by(at(-5.0, 5.0), at(-1.0, 5.0)));
+            assert!(!p.is_hit_by(at(8.0, 8.0), at(20.0, 20.0)), "(8, 8) is past the hypotenuse x + y = 10");
+            // heights play no part, and a corner or an edge counts as inside
+            assert!(p.is_hit_by(Pos::new(2.0, 2.0, -999.0), Pos::new(2.0, 2.0, 999.0)));
+            assert!(p.is_hit_by(at(5.0, 5.0), at(5.0, 5.0)), "on the hypotenuse");
+            assert!(p.is_hit_by(at(0.0, 0.0), at(0.0, 0.0)), "on a corner");
+        }
+    }
+
+    #[test]
+    fn a_region_is_never_hit_by_garbage_or_by_a_degenerate_polygon() {
+        let p = region(&[(0.0, 0.0), (10.0, 0.0), (0.0, 10.0)]);
+        for bad in [f32::NAN, f32::INFINITY] {
+            assert!(!p.is_hit_by(at(bad, 2.0), at(2.0, 2.0)));
+            assert!(!p.is_hit_by(at(2.0, 2.0), at(2.0, bad)));
+        }
+        assert!(!region(&[(0.0, 0.0), (10.0, 0.0)]).is_hit_by(at(1.0, 0.0), at(2.0, 0.0)), "two corners are no region");
+        assert!(!region(&[(0.0, 0.0), (f32::NAN, 0.0), (0.0, 10.0)]).is_hit_by(at(1.0, 1.0), at(2.0, 2.0)));
+        assert_eq!(p.center(), Pos::new(10.0 / 3.0, 10.0 / 3.0, 3.0));
+    }
+
+    #[test]
+    fn the_story_hooks_default_to_a_story_that_does_nothing() {
+        struct Plain(AreaInfo);
+        impl AreaRuntime for Plain {
+            fn info(&self) -> &AreaInfo {
+                &self.0
+            }
+            fn spawn_points(&self) -> Vec<Pos> {
+                Vec::new()
+            }
+            fn validate_move(&self, from: Pos, _to: Pos) -> MoveResult {
+                MoveResult::Corrected(from)
+            }
+            fn bounds(&self) -> Bounds {
+                Bounds { min: Pos::default(), max: Pos::default() }
+            }
+            fn walk_triangles(&self) -> Vec<[Pos; 3]> {
+                Vec::new()
+            }
+            fn max_speed(&self) -> f32 {
+                1.0
+            }
+        }
+        let info = AreaInfo {
+            id: fmv_core::AreaId { game: GameId::Fixture, key: "plain".into() },
+            display_name: "plain".into(),
+            fingerprint: Fingerprint([0; 32]),
+            provenance: EditionProvenance {
+                game: GameId::Fixture,
+                platform: fmv_core::Platform::Synthetic,
+                edition: "t".into(),
+                region: "t".into(),
+                language: "t".into(),
+                revision: "t".into(),
+                sources: vec![],
+                modded: false,
+            },
+            fixture: true,
+        };
+        let area = Plain(info);
+        assert_eq!(area.phase_key(&[1, 2, 3]), None, "no opinion: the server uses one phase per distinct blob");
+        assert!(area.story_points().is_empty());
+        assert_eq!(area.story_advance(&[], 0), None);
+        assert!(area.npcs_in_phase(&PhaseKey(vec![9])).is_empty());
     }
 
     #[test]
