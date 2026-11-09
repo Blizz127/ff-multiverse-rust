@@ -28,13 +28,17 @@
 //!   is full, on one enemy or the whole party (Healing Wind);
 //! * [`Command::Escape`]: the actor spends its turn running (see "Escape" below).
 //!
+//! An enemy that has an AI script the engine can follow ([`crate::ai`]) does what the script says: it picks
+//! its attacks and targets, or lets the turn pass (see "Enemy turns"). Any other enemy (no script, one the
+//! interpreter does not follow, an answer the rules cannot carry out) uses the plain behaviour below.
+//!
 //! An enemy whose gauge fills picks one random living party member and one of its own `scene.bin`
 //! attacks ([`Combatant::actions`]: the damaging ones the rules model), or a plain attack when it has
 //! none. Every action, party or enemy, is announced by a [`BattleEvent::Action`] before its effects
 //! ([`BattleEvent::MpSpent`], [`BattleEvent::Damage`], [`BattleEvent::Heal`], ...). Not modelled:
-//! summons, back-attack damage bonus, covering, enemy rows, AI scripts, AP/EXP growth, party
-//! elemental resistances, limit levels above 1 (see [`crate::limit`]) and the statuses [`crate::status`] lists as
-//! left out.
+//! the statuses [`crate::status`] lists as left out (Confusion, Berserk, Frog, ...), summons, back-attack
+//! damage bonus, covering, enemy rows, AI scripts other than Initialize, Main and the counters, AP/EXP growth,
+//! party elemental resistances, limit levels above 1 (see [`crate::limit`]).
 //!
 //! # Statuses
 //!
@@ -50,7 +54,9 @@
 //! * **Who acts.** Sleep, Stop and Paralysis hold a turn: the gauge of a sleeper keeps filling, the one of a
 //!   stopped or paralysed combatant is frozen (Haste doubles the gauge and Slow halves it, Stop and Paralysis
 //!   freeze it: [`crate::status::Pace`]), and [`BattleState::ready_actors`] leaves out whoever cannot take its turn.
-//!   An enemy that cannot act waits with its full gauge and acts the tick it can; a party member's command is
+//!   An enemy that cannot act waits with its full gauge and acts the tick it can, and a blow that leaves it asleep,
+//!   stopped or paralysed gets no counter (it still notes who hit it; a physical blow wakes a sleeper first, so that
+//!   one answers: an engine choice, not checked against the original); a party member's command is
 //!   refused with [`CommandError::CannotAct`]. Silence refuses the Magic command with [`CommandError::Silenced`].
 //! * **Damage and hit rate.** After the formulas: Barrier halves a physical blow and MBarrier a magical one,
 //!   Sadness takes 30% off either ([`crate::status::damage_after_statuses`]); Fury takes 30% off the hit rate of the
@@ -58,6 +64,41 @@
 //!   ([`crate::status::hit_chance_after_statuses`]); Sadness halves the limit gauge a blow fills, Fury doubles it and
 //!   Paralysis stops it. A physical blow that does damage wakes a sleeper; a magical one does not. A knockout
 //!   removes every status.
+//!
+//! # Enemy turns
+//!
+//! An enemy with scripts it can follow ([`crate::ai::choose`]) plays what its Main script queued:
+//!
+//! * **Queued attacks** are played one after the other in the order queued (the original's action queue is
+//!   first in, first out, see [`crate::ai::vm`]), each announced by its own [`BattleEvent::Action`], paid for
+//!   with its own MP ([`BattleEvent::MpSpent`]) and played with its own rolls. Together they are one turn:
+//!   the enemy's gauge empties once. Their MP must be affordable in all, or the turn falls back.
+//! * **Whom** an attack reaches is the script's target mask, as a [`Target`] named from the enemy's own side
+//!   ([`Target::One`]: a party member; [`Target::AllEnemies`]: the whole party; [`Target::AllAllies`] is not
+//!   played for a damaging attack and the turn falls back). A whole-party attack is one announcement and one
+//!   payment, then `resolve_action` plays it on every living member in ascending order with its
+//!   own rolls each, and the 2/3 split of "Whole-side targeting" below. This engine treats the script's mask
+//!   as authoritative (an engine choice, NOT checked against the original): the attack record's own
+//!   targeting ([`Aim`], which is read as the rule of the player's menu and which `aim_at` checks a command
+//!   against) is not consulted, so a one-target attack aimed at the whole party and a whole-side one aimed
+//!   at one member are played as the script says (refusing them would make five more of the owner's enemies
+//!   fall back to the plain behaviour). An attack whose
+//!   record aims at a random target ([`Aim::Random`], which `aim_at` refuses) is played on ONE party member:
+//!   the single member the script named, or, for a whole-party mask, one of the living members drawn with
+//!   `below(n)`.
+//! * **One target that has fallen** by the time its attack comes up (the script chose it earlier, perhaps
+//!   turns ago, and kept the mask in its memory) makes the attack **fizzle**: nothing is announced, spent or
+//!   drawn, and the script's memory (stored before the first attack) is kept, so that its cycle goes on.
+//! * An attack of the scene that the rules cannot play (no damage, healing, a status) is announced and does
+//!   nothing, whomever it is aimed at.
+//! * **Counters.** When a party member's action ([`Command::Attack`], [`Command::Magic`], [`Command::Item`] or
+//!   [`Command::Limit`]) has been played on its targets, every enemy among them that has scripts notes who
+//!   hit it and answers with its counter scripts ([`crate::ai`], "Counters": the Death counter if the blow
+//!   killed it, else the General counter and the Physical or Magical one by the [`ActionKind`] of the
+//!   action). What a counter queues is played like an enemy turn (without touching the enemy's gauge), as
+//!   events right after the action's own, in the same batch ([`BattleState::submit_command`] returns them),
+//!   so a client that replays the command gets them from its own engine. Nothing answers a healing
+//!   action, and nothing once the battle has an outcome.
 //!
 //! # Whole-side targeting
 //!
@@ -132,6 +173,25 @@
 //!
 //! * Construction, [`StartMode::Normal`] only: one `range_inclusive(0, 0x7FFF)` per combatant
 //!   in [`ActorId`] order (party first, then enemies) for the initial gauge.
+//! * Construction, after those gauge draws: the Initialize scripts of the enemies that have one
+//!   ([`crate::ai`]), in actor order, each with exactly the draws of its script (one `next_u16()` per
+//!   `RANDOM`, one `below(n)` per `RANDOM_BIT` of a mask of `n >= 2` bits: about a third of the owner's
+//!   enemies draw something here, to start a counter at a random value). An Initialize script that cannot be
+//!   followed draws nothing, and its enemy gives its scripts up for good.
+//! * Enemy turn with an AI script that can be followed ([`crate::ai`]): exactly the draws of the script (one
+//!   `next_u16()` per `RANDOM`, one `below(n)` per `RANDOM_BIT` of a mask of `n >= 2` bits), then, for each
+//!   attack it queued in order, first (only for an attack whose record aims at a random target, a whole-party
+//!   mask, and `n >= 2` living members) `below(n)` to pick its one member, then the action's own draws below
+//!   (on each living party member in ascending order for a whole-party attack; none for an attack that
+//!   fizzles or that the rules cannot play). A turn the script cannot be followed on
+//!   ([`crate::ai::choose`] gives `None`) draws nothing for it and takes the next bullet.
+//! * [`Command::Attack`], [`Command::Magic`], [`Command::Item`] and [`Command::Limit`] on an enemy that has
+//!   scripts: after the action's own draws below, the draws of its counters, enemy by enemy in ascending
+//!   position when the action has several targets: the Death counter alone if the blow killed it, else the
+//!   General counter and then the Physical or the Magical one, each with exactly the draws of its script and
+//!   then of the attacks it queued, as an enemy turn draws them. A counter that cannot be followed or carried
+//!   out draws nothing. Nothing is drawn for an enemy with no scripts, for a healing action, or once the
+//!   battle has an outcome.
 //! * Enemy turn: first `below(living_party_count)` to pick the target (living party members
 //!   in id order); then, **only if the enemy has two or more usable attacks** (those it has the MP
 //!   for), `below(usable_count)` to pick one (so an enemy with one attack, or with none, draws exactly
@@ -238,7 +298,8 @@
 //!   level or luck.
 //! * **Damage cap** [`MAX_DAMAGE`] = 9999 (community-documented, not in the cited pages).
 //!   Arithmetic is exact 64-bit; the original's 32-bit overflow glitch is not reproduced.
-//! * **Enemy attacks**: the original picks them with AI scripts, which are not decoded. Here an enemy
+//! * **Enemy attacks**: the original picks them with AI scripts, which [`crate::ai`] runs when it can
+//!   (the plain behaviour here is its fallback). Here an enemy
 //!   picks uniformly among its damaging scene attacks (see [`crate::action::EnemyAction`]) it can pay
 //!   for, hitting one random living party member whatever the attack's own targeting says; a plain
 //!   physical attack of the enemy's first such attack ([`Combatant::from_enemy`]) is the fallback. The
@@ -434,6 +495,12 @@ pub struct Combatant {
     /// The statuses the combatant cannot be given: an enemy's own immunities (its record's status mask says which
     /// statuses affect it; see [`crate::status`]). Empty for a party member.
     pub status_immune: StatusSet,
+    /// The enemy's own AI scripts and the memory they keep ([`Combatant::from_enemy_in_scene`] gives it
+    /// the scene's); `None`: the enemy uses the plain behaviour.
+    pub ai: Option<crate::ai::EnemyAi>,
+    /// The id of the `scene.bin` enemy record this enemy was made from ([`Combatant::from_enemy_in_scene`]);
+    /// what an AI script reads as "Index of actor" ([`crate::ai::world`]). `None`: not made from a scene.
+    pub enemy_id: Option<u16>,
 }
 
 impl Combatant {
@@ -473,6 +540,8 @@ impl Combatant {
             all_left: 0,
             status: StatusState::none(),
             status_immune: StatusSet::EMPTY,
+            ai: None,
+            enemy_id: None,
         }
     }
 
@@ -560,12 +629,24 @@ impl Combatant {
     pub fn from_enemy_in_scene(scene: &Scene, enemy_slot: usize, record: &EnemyRecord) -> Self {
         let basic = scene.basic_attack(enemy_slot).map(|a| &a.record);
         let mut c = Self::from_enemy(record, basic);
+        c.enemy_id = scene.enemy_ids.get(enemy_slot).copied().flatten();
         for attack in scene.enemy_attacks(enemy_slot) {
             if let Some(action) = EnemyAction::from_scene(attack) {
                 if !c.actions.iter().any(|known| known.id == action.id) {
                     c.actions.push(action);
                 }
             }
+        }
+        if let Some(scripts) = scene.ai.enemy(enemy_slot) {
+            let known: Vec<crate::ai::AiAttack> = scene
+                .attacks
+                .iter()
+                .map(|a| crate::ai::AiAttack {
+                    id: a.id,
+                    mp_cost: a.record.mp_cost,
+                })
+                .collect();
+            c.ai = Some(crate::ai::EnemyAi::new(Arc::clone(scripts), Arc::from(known)));
         }
         c
     }
@@ -1206,6 +1287,17 @@ enum Plan {
     Escape(EscapeRule),
 }
 
+/// One attack an enemy's script queued, ready to be played ([`BattleState::play_choices`]).
+#[derive(Debug, Clone, Copy)]
+struct Planned {
+    /// The attack id the scene gives it (what [`ActionRef::EnemyAttack`] announces).
+    id: u16,
+    /// What of it the rules can play and whom the script aimed it at (the whom is resolved when it comes
+    /// up, see [`BattleState::enemy_targets`]); `None`: an attack of the scene the rules cannot play, which
+    /// is announced and does nothing.
+    play: Option<(EnemyAction, Target)>,
+}
+
 /// A running battle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BattleState {
@@ -1306,6 +1398,7 @@ impl BattleState {
             escape_left: 0,
         }
         .with_escape(Some(EscapeRule { difficulty: 1, sure: config.start == StartMode::Preemptive }));
+        state.start_enemy_scripts();
         for i in 0..state.actors.len() {
             let c = &mut state.actors[i];
             if c.is_alive() && c.gauge >= GAUGE_MAX {
@@ -1562,6 +1655,7 @@ impl BattleState {
                 let spec = self.actors.get(idx).map(Combatant::attack_spec);
                 if let Some(spec) = spec {
                     self.resolve_action(idx, &[target], &spec, &mut events);
+                    self.run_counters(idx, &[target], &spec, &mut events);
                 }
             }
             Plan::Magic { spell, targets, spends_all } => {
@@ -1576,6 +1670,7 @@ impl BattleState {
                     }
                 }
                 self.resolve_action(idx, &targets, &spell.spec, &mut events);
+                self.run_counters(idx, &targets, &spell.spec, &mut events);
             }
             Plan::Item { item, data, targets } => {
                 events.push(BattleEvent::Action {
@@ -1583,6 +1678,7 @@ impl BattleState {
                     action: ActionRef::Item(item),
                 });
                 self.resolve_action(idx, &targets, &data.spec, &mut events);
+                self.run_counters(idx, &targets, &data.spec, &mut events);
             }
             Plan::Defend => {
                 events.push(BattleEvent::Action {
@@ -1605,6 +1701,7 @@ impl BattleState {
                 }
                 events.push(BattleEvent::LimitGauge { actor, value: 0 });
                 self.resolve_action(idx, &targets, &limit.spec, &mut events);
+                self.run_counters(idx, &targets, &limit.spec, &mut events);
             }
             Plan::Escape(rule) => {
                 events.push(BattleEvent::Action {
@@ -1859,8 +1956,13 @@ impl BattleState {
 
     /// Enemy AI: attack a uniformly random living party member with one of the attacks it can pay for
     /// (a uniform pick among them), or with a plain attack when it has none (see the module docs for the
-    /// draw order).
+    /// draw order). An enemy whose AI script can be followed does what the script says instead
+    /// ([`BattleState::enemy_act_by_script`]).
     fn enemy_act(&mut self, idx: usize, events: &mut Vec<BattleEvent>) {
+        if self.enemy_act_by_script(idx, events) {
+            self.finish_turn(idx);
+            return;
+        }
         let actor = ActorId(idx as u8);
         let living: Vec<usize> = (0..self.party_len)
             .filter(|&p| self.actors[p].is_alive())
@@ -1899,6 +2001,257 @@ impl BattleState {
             }
         }
         self.finish_turn(idx);
+    }
+
+    /// Run the Initialize scripts of the enemies that have AI ([`crate::ai::initialize`]); an enemy whose
+    /// script cannot be followed keeps the plain behaviour for good.
+    fn start_enemy_scripts(&mut self) {
+        for i in self.party_len..self.actors.len() {
+            if self.actors[i].ai.is_none() {
+                continue;
+            }
+            let mut rng = self.rng.clone();
+            if let Some(started) = crate::ai::initialize(self, i, &mut rng) {
+                self.rng = rng;
+                self.apply_ai(i, started.memory, &started.changes);
+            } else if let Some(ai) = self.actors[i].ai.as_mut() {
+                ai.disable();
+            }
+        }
+    }
+
+    /// Keep the memory a script left in enemy `idx` and make the changes it made to the battle.
+    fn apply_ai(&mut self, idx: usize, memory: crate::ai::Memory, changes: &[crate::ai::Change]) {
+        if let Some(ai) = self.actors.get_mut(idx).and_then(|c| c.ai.as_mut()) {
+            ai.set_memory(memory);
+        }
+        for change in changes {
+            match *change {
+                crate::ai::Change::Defense { actor, value } => {
+                    if let Some(c) = self.actors.get_mut(usize::from(actor.0)) {
+                        c.defense = value;
+                    }
+                }
+                crate::ai::Change::MagicDefense { actor, value } => {
+                    if let Some(c) = self.actors.get_mut(usize::from(actor.0)) {
+                        c.magic_defense = value;
+                    }
+                }
+                crate::ai::Change::Evade { actor, value } => {
+                    if let Some(c) = self.actors.get_mut(usize::from(actor.0)) {
+                        c.evade = value;
+                    }
+                }
+                crate::ai::Change::Attack { actor, value } => {
+                    if let Some(c) = self.actors.get_mut(usize::from(actor.0)) {
+                        c.attack = value;
+                    }
+                }
+                crate::ai::Change::MagicAttack { actor, value } => {
+                    if let Some(c) = self.actors.get_mut(usize::from(actor.0)) {
+                        c.magic = value;
+                    }
+                }
+            }
+        }
+    }
+
+    /// The enemy at `idx` acts as its AI script says ([`crate::ai::choose`]): the attacks it queued, one
+    /// after the other in that order (see [`BattleState::play_choices`]), or nothing (the script lets the
+    /// turn pass). `false` when it has no script or the turn cannot be followed (nothing was drawn or
+    /// changed: the caller uses the plain behaviour).
+    fn enemy_act_by_script(&mut self, idx: usize, events: &mut Vec<BattleEvent>) -> bool {
+        let scripted = self.actors[idx].ai.as_ref().is_some_and(|ai| ai.memory().phase == crate::ai::Phase::Ready);
+        let mut rng = self.rng.clone();
+        let planned = crate::ai::choose(self, idx, &mut rng)
+            .and_then(|turn| Some((self.plan_choices(idx, &turn.actions)?, turn)));
+        let Some((planned, turn)) = planned else {
+            if let (true, Some(ai)) = (scripted, self.actors[idx].ai.as_mut()) {
+                ai.note_fallback();
+            }
+            return false;
+        };
+        self.rng = rng;
+        self.apply_ai(idx, turn.memory, &turn.changes);
+        if let Some(ai) = self.actors[idx].ai.as_mut() {
+            ai.note_turn();
+        }
+        self.play_choices(idx, &planned, events);
+        true
+    }
+
+    /// What the rules can carry out of the attacks an enemy's script queued, checked before anything is
+    /// drawn or changed: `None` when one of them cannot be carried out (the whole answer is then not followed).
+    ///
+    /// * An attack the rules play ([`Combatant::actions`]) must be one the enemy can pay for, in all, and be
+    ///   aimed at a party member or the whole party ([`BattleState::can_aim`]; a target that has fallen or an
+    ///   empty side is no reason to refuse, the attack then fizzles when it comes up).
+    /// * An attack of the scene the rules cannot play (no damage, healing, a status) is announced and has no
+    ///   effect, whomever it is aimed at (a Death counter's own animation has its dead owner as target).
+    fn plan_choices(&self, idx: usize, choices: &[crate::ai::EnemyChoice]) -> Option<Vec<Planned>> {
+        let me = self.actors.get(idx)?;
+        let mut mp_left = me.mp;
+        let mut planned = Vec::with_capacity(choices.len());
+        for choice in choices {
+            let play = match me.actions.iter().find(|a| a.id == choice.attack).copied() {
+                None => None,
+                Some(action) => {
+                    let cost = u32::from(action.spec.mp_cost);
+                    if cost > mp_left || !self.can_aim(choice.target) {
+                        return None;
+                    }
+                    mp_left -= cost;
+                    Some((action, choice.target))
+                }
+            };
+            planned.push(Planned { id: choice.attack, play });
+        }
+        Some(planned)
+    }
+
+    /// Whether the rules can aim an attack of an enemy as its script says: at a party member or at the whole
+    /// party. (A damaging attack on the enemy's own side, [`Target::AllAllies`], is not played.) The attack's
+    /// [`Aim`] is NOT consulted (an engine choice, not checked against the original): it is read as the rule
+    /// of the player's target menu ([`BattleState::aim_at`] checks a command against it), while an enemy's
+    /// script names its target mask itself, so a script that aims a one-target attack at the whole party, or a
+    /// whole-side one at a single member, is followed (measured on the owner's data: refusing what a command
+    /// could not do makes five more enemies fall back to the plain behaviour). A fallen target or an empty
+    /// side does not count against it either: that attack fizzles when it comes up.
+    fn can_aim(&self, target: Target) -> bool {
+        match target {
+            Target::One(who) => usize::from(who.0) < self.party_len,
+            Target::AllEnemies => true,
+            Target::AllAllies => false,
+        }
+    }
+
+    /// The party members an attack of an enemy plays on right now, in ascending order: the one member the
+    /// script named if it is alive, or every living member for the whole party; none if it fizzles. The
+    /// whole-side rules take it from there ([`BattleState::resolve_action`]: the 2/3 split when the action
+    /// splits and several are hit, each target with its own rolls). An attack whose record aims at a random
+    /// target ([`Aim::Random`], which `aim_at` refuses for one target and for a side alike) hits ONE member:
+    /// the single one the script named, or one of the living members drawn with `below(n)` (no draw for one
+    /// candidate) when the script named the whole party.
+    fn enemy_targets(&mut self, spec: &ActionSpec, target: Target) -> Vec<usize> {
+        let living: Vec<usize> = match target {
+            Target::One(who) => {
+                let who = usize::from(who.0);
+                if who < self.party_len && self.actors[who].is_alive() { vec![who] } else { Vec::new() }
+            }
+            Target::AllEnemies => (0..self.party_len).filter(|&i| self.actors[i].is_alive()).collect(),
+            Target::AllAllies => Vec::new(),
+        };
+        match (spec.aim, living.len()) {
+            (Aim::Random, n) if n > 1 => vec![living[self.rng.below(n as u32) as usize]],
+            _ => living,
+        }
+    }
+
+    /// Carry out the attacks of `planned` for the enemy at `idx`, one after the other in the order its script
+    /// queued them (the original's action queue is first in, first out, see [`crate::ai::vm`]). Each is announced
+    /// ([`BattleEvent::Action`]), paid for and played on the party members it reaches *at that moment*
+    /// ([`BattleState::enemy_targets`], then [`BattleState::resolve_action`]: every living member of a whole
+    /// party in ascending order, the 2/3 split of "Whole-side targeting" included): a one-target attack whose
+    /// target has fallen since the script chose it (the script may keep a mask for turns, as Guard Scorpion
+    /// keeps its scope target) **fizzles**: nothing is announced and nothing is spent, while the script's own
+    /// memory (already stored) goes on. Nothing is played once the battle has an outcome.
+    fn play_choices(&mut self, idx: usize, planned: &[Planned], events: &mut Vec<BattleEvent>) {
+        for p in planned {
+            if self.outcome.is_some() {
+                break;
+            }
+            let Some((action, target)) = p.play else {
+                events.push(BattleEvent::Action {
+                    actor: ActorId(idx as u8),
+                    action: ActionRef::EnemyAttack(p.id),
+                });
+                continue;
+            };
+            let targets = self.enemy_targets(&action.spec, target);
+            if targets.is_empty() {
+                continue;
+            }
+            events.push(BattleEvent::Action {
+                actor: ActorId(idx as u8),
+                action: ActionRef::EnemyAttack(p.id),
+            });
+            self.spend_mp(idx, action.spec.mp_cost, events);
+            self.resolve_action(idx, &targets, &action.spec, events);
+        }
+    }
+
+    /// The party member `attacker` has played `spec` on `targets` (ascending positions): every enemy among
+    /// them that has scripts takes note of who acted on it, then runs its counter scripts in the order of
+    /// the original's ([`crate::ai`], "Counters"): the Death counter if the blow killed it (and no other),
+    /// else the General counter and then the Physical or the Magical one by the [kind](ActionKind) of the
+    /// action. It is called once the WHOLE action has been played, so that an action on several targets has hit
+    /// every one of them before any of them answers; a healing action starts no counter, and none is run
+    /// once the battle has an outcome. A counter plays like an enemy's turn but is not one (the enemy's gauge
+    /// is untouched): its attacks come as events right after the action, in the same batch.
+    fn run_counters(&mut self, attacker: usize, targets: &[usize], spec: &ActionSpec, events: &mut Vec<BattleEvent>) {
+        use crate::ai::script::slot;
+        if attacker >= self.party_len || spec.heals() {
+            return;
+        }
+        let Some(hit_by) = crate::ai::world::slot_mask(self, attacker) else {
+            return;
+        };
+        let physical = spec.kind == ActionKind::Physical;
+        for &target in targets {
+            if target < self.party_len {
+                continue;
+            }
+            let Some(ai) = self.actors.get_mut(target).and_then(|c| c.ai.as_mut()) else {
+                continue;
+            };
+            if ai.memory().phase != crate::ai::Phase::Ready {
+                continue;
+            }
+            // Whoever it is that hit the enemy, it remembers it, whether or not it has a counter to answer with.
+            ai.note_hit(hit_by, physical);
+            let scripts: &[usize] = if !self.actors[target].is_alive() {
+                &[slot::DEATH_COUNTER]
+            } else if !self.actors[target].can_act() {
+                // Asleep, stopped or paralysed (a physical blow has already woken a sleeper): it notes the hit and
+                // does not answer it (see "Statuses"; an engine choice, not checked against the original).
+                &[]
+            } else if physical {
+                &[slot::GENERAL_COUNTER, slot::PHYSICAL_COUNTER]
+            } else {
+                &[slot::GENERAL_COUNTER, slot::MAGICAL_COUNTER]
+            };
+            for &script in scripts {
+                if self.outcome.is_some() {
+                    break;
+                }
+                self.run_counter(target, script, events);
+            }
+        }
+    }
+
+    /// Run the counter script `script` of the enemy at `idx` and play what it queued, as a Main turn is played:
+    /// on a copy of the random stream, kept only if the counter can be followed and carried out (otherwise
+    /// nothing at all is drawn or changed: no counter).
+    fn run_counter(&mut self, idx: usize, script: usize, events: &mut Vec<BattleEvent>) {
+        let has_script = self.actors[idx].ai.as_ref().is_some_and(|ai| ai.scripts().entry(script).is_some());
+        if !has_script {
+            return;
+        }
+        let mut rng = self.rng.clone();
+        let planned = crate::ai::react(self, idx, script, &mut rng)
+            .and_then(|turn| Some((self.plan_choices(idx, &turn.actions)?, turn)));
+        let Some((planned, turn)) = planned else {
+            if let Some(ai) = self.actors[idx].ai.as_mut() {
+                ai.note_counter_skipped();
+            }
+            return;
+        };
+        self.rng = rng;
+        self.apply_ai(idx, turn.memory, &turn.changes);
+        if let Some(ai) = self.actors[idx].ai.as_mut() {
+            ai.note_counter();
+        }
+        self.play_choices(idx, &planned, events);
     }
 
     fn finish_turn(&mut self, idx: usize) {
