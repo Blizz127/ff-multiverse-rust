@@ -652,3 +652,122 @@ fn offscreen_battle_escaped_panel() {
         assert_windows(&img, w, h, &l, &[l.party]);
     }
 }
+
+/// More statuses than fit: the party panel says how many are not shown (`+N`) where the room is short, at the default window too
+/// (it has room for two places: a code and the `+N`, or both codes of a member with two). Cloud has four statuses, Barret two, Tifa three.
+#[test]
+#[ignore = "needs a GPU or software Vulkan/GL driver"]
+fn offscreen_battle_more_statuses_than_fit_on_the_party_panel() {
+    use super::tags;
+    use crate::ui::widgets::DIM;
+    use fmv_ff7_battle::status::Status;
+    let Some(mut gpu) = Shooter::new() else { return };
+    let set = |list: &[Status]| list.iter().copied().collect::<StatusSet>();
+    for (w, h) in SIZES {
+        let l = layout(w, h, 3);
+        let mut view = battle();
+        view.party[0].status = set(&[Status::Poison, Status::Silence, Status::Haste, Status::Regen]);
+        view.party[1].status = set(&[Status::Slow, Status::Barrier]);
+        view.party[2].status = set(&[Status::Poison, Status::Sleep, Status::Stop]);
+        view.enemies[1].status = set(&[Status::Sleep]);
+        let img = gpu.shoot("18-more-statuses-than-fit", &view, w, h);
+        // The same fighters with no more than two statuses each: nothing is left out, so there is no +N to write.
+        let mut fits = view.clone();
+        fits.party[0].status = set(&[Status::Poison, Status::Silence]);
+        fits.party[2].status = set(&[Status::Poison, Status::Sleep]);
+        let img_fits = gpu.shoot("18b-statuses-that-fit", &fits, w, h);
+        // The codes are in the party window in their colours, and the +N is dim text that only the first has.
+        let party = pixels(&l, l.party);
+        let colour = |s: Status| [tags::color(s)[0], tags::color(s)[1], tags::color(s)[2], 255];
+        assert!(count_near(&img, w, h, party, colour(Status::Poison), 6) > 20, "{w}x{h}: Poison's code is purple in the party window");
+        assert!(count_near(&img, w, h, party, colour(Status::Slow), 6) > 20, "{w}x{h}: Barret's two codes both fit");
+        assert!(count_near(&img, w, h, party, colour(Status::Barrier), 6) > 20, "{w}x{h}: Barret's two codes both fit");
+        let dim = |img: &[u8]| count_near(img, w, h, party, [DIM[0], DIM[1], DIM[2], 255], 0);
+        assert!(dim(&img) > dim(&img_fits) + 10, "{w}x{h}: the +N is dim text over the party panel ({} against {})", dim(&img), dim(&img_fits));
+        assert_windows(&img, w, h, &l, &[l.enemy, l.party]);
+    }
+}
+
+/// A blow of Barret's and the enemy's counter to it arrive in ONE batch; they are played one after the other, not over each other. Three
+/// moments of it: the blow has landed (its number over the enemy, no banner: a plain attack has none), the counter has begun (its
+/// name in the banner, the blow's number still fading) and the counter has landed (its numbers over the three of the party).
+///
+/// The party panel in these pictures is what the client really shows: the state AFTER the whole batch (the panel follows the state at
+/// once, the show follows the blow), so Cloud's and Barret's HP are already down and Tifa already fallen in the first picture, where the
+/// counter has not even begun. That skew is a known gap (sequencing made it up to a second and a half; it was at most 0.6 s).
+#[test]
+#[ignore = "needs a GPU or software Vulkan/GL driver"]
+fn offscreen_battle_a_counter_plays_after_the_blow_that_provoked_it() {
+    use super::names::NameBook;
+    use super::scene::cue::{impact_delay, length_of};
+    use fmv_protocol::ActionRef;
+    use std::sync::Arc;
+    let Some(mut gpu) = Shooter::new() else { return };
+    for (w, h) in SIZES {
+        let l = layout(w, h, 3);
+        // An invented name for an invented attack of scene 75 (formation 301): no game text is used here.
+        let book = NameBook::from_tables(&[], &[]).with_enemy_attack(75, 286, "Sweep Laser");
+        let mut hud = BattleHud::new(Some(Arc::new(book)));
+        hud.begin(301, Some(ActorId(1)));
+        let hit = |actor: u8, target: u8, amount: u32| BattleEvent::Damage { actor: ActorId(actor), target: ActorId(target), amount, critical: false };
+        hud.on_events(
+            NOW,
+            &[
+                BattleEvent::Action { actor: ActorId(1), action: ActionRef::Attack },
+                hit(1, 3, 25),
+                BattleEvent::Action { actor: ActorId(3), action: ActionRef::EnemyAttack(286) },
+                hit(3, 0, 120),
+                hit(3, 1, 96),
+                hit(3, 2, 130),
+                BattleEvent::Death { actor: ActorId(2) },
+            ],
+            true,
+        );
+        let blow_lands = NOW + impact_delay(Some(ActionRef::Attack));
+        let counter_begins = NOW + length_of(Some(ActionRef::Attack));
+        let counter_lands = counter_begins + impact_delay(Some(ActionRef::EnemyAttack(286)));
+        let shot = |gpu: &mut Shooter, name: &str, at: f64| {
+            // The state after the batch, as the client has it from the moment the message arrived (see above).
+            let mut view = battle();
+            view.party[1].ready = false;
+            view.party[1].gauge = 30_000;
+            view.enemies[0].hp = 30;
+            view.party[0].hp -= 120;
+            view.party[1].hp -= 96;
+            view.party[2].hp = 0;
+            view.party[2].alive = false;
+            view.party[2].ready = false;
+            hud.decorate(&mut view, at);
+            (gpu.shoot(name, &view, w, h), view)
+        };
+        let (blow, blow_view) = shot(&mut gpu, "19-the-blow-has-landed", blow_lands + 0.15);
+        let (begun, begun_view) = shot(&mut gpu, "20-the-counter-has-begun", counter_begins + 0.15);
+        let (landed, landed_view) = shot(&mut gpu, "21-the-counter-has-landed", counter_lands + 0.15);
+        // What each moment says on the screen, from the view and from its pixels.
+        assert_eq!(blow_view.popups.iter().map(|p| p.target.0).collect::<Vec<_>>(), [3], "the blow's number, and nobody else's");
+        assert!(blow_view.banner.is_none(), "a plain attack has no banner, and the counter's name waits for its turn");
+        assert_eq!(begun_view.banner.as_ref().map(|b| b.text.as_str()), Some("Sweep Laser"), "the counter is named when it begins");
+        assert_eq!(begun_view.popups.iter().map(|p| p.target.0).collect::<Vec<_>>(), [3], "its numbers have not landed yet");
+        let mut over_the_party: Vec<u8> = landed_view.popups.iter().map(|p| p.target.0).filter(|t| *t < 3).collect();
+        over_the_party.sort_unstable();
+        assert_eq!(over_the_party, [0, 1, 2], "the counter's three numbers are up over the party");
+        let anchors = flat_anchors(&blow_view, w, h);
+        let cell = 8 * (l.s + 1);
+        let over = |actor: u8| {
+            let (ax, ay) = anchors.of(&blow_view, ActorId(actor)).expect("an anchor");
+            (ax as i32 - 6 * cell, ay as i32 - 8 * cell, ax as i32 + 6 * cell, ay as i32)
+        };
+        let white = [255, 255, 255, 255];
+        let numbers = |img: &[u8], actor: u8| count_near(img, w, h, over(actor), white, 0);
+        assert!(numbers(&blow, 3) > 20 && numbers(&begun, 3) > 20, "{w}x{h}: 25 over the enemy while the counter begins");
+        for who in 0..3 {
+            assert!(numbers(&blow, who) < 10 && numbers(&begun, who) < 10, "{w}x{h}: nothing over party member {who} yet ({} {})", numbers(&blow, who), numbers(&begun, who));
+            assert!(numbers(&landed, who) > 20, "{w}x{h}: the counter's number over party member {who} ({})", numbers(&landed, who));
+        }
+        // The banner row has the counter's name when it begins and not before.
+        let banner_row = (0, l.banner_y * l.s, w as i32, (l.banner_y + 16) * l.s);
+        let text = [TEXT[0], TEXT[1], TEXT[2], 255];
+        assert!(count_near(&begun, w, h, banner_row, text, 6) > 10 * (l.s * l.s) as usize, "{w}x{h}: the banner names the counter");
+        assert!(count_near(&blow, w, h, banner_row, text, 6) < count_near(&begun, w, h, banner_row, text, 6) / 4, "{w}x{h}: and not before");
+    }
+}

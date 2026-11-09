@@ -93,7 +93,7 @@ fn the_overlays_numbers_and_the_scenes_impacts_are_the_same_instants_for_the_sam
     let cure = |_: ActorId, _: ActionRef| Look { melee: false, element: Element::Cure };
     // Every kind of action that has something land, with the effects it can have.
     type LookFn<'a> = &'a dyn Fn(ActorId, ActionRef) -> Look;
-    let batches: [(Vec<BattleEvent>, LookFn); 6] = [
+    let batches: [(Vec<BattleEvent>, LookFn); 7] = [
         (blow(0, 2), PLAIN),
         (vec![action(2, ActionRef::EnemyAttack(272)), damage(2, 0, false), damage(2, 1, true)], PLAIN),
         (vec![action(0, ActionRef::Magic(27)), BattleEvent::MpSpent { actor: ActorId(0), amount: 4 }, damage(0, 2, false), damage(0, 3, false)], PLAIN),
@@ -101,6 +101,8 @@ fn the_overlays_numbers_and_the_scenes_impacts_are_the_same_instants_for_the_sam
         (vec![action(0, ActionRef::Item(3)), BattleEvent::MpRestored { actor: ActorId(0), target: ActorId(1), amount: 30 }], PLAIN),
         // No announcement at all: the short beat of an older server.
         (vec![damage(0, 2, false)], PLAIN),
+        // A blow and the enemy's counter to it, in one batch: one after the other, the numbers and the impacts alike.
+        (vec![action(0, ActionRef::Attack), damage(0, 2, false), action(2, ActionRef::EnemyAttack(272)), damage(2, 0, false), damage(2, 1, true)], PLAIN),
     ];
     for now in [3.0, 77.123456, 1.0e6] {
         for (events, look) in &batches {
@@ -114,7 +116,9 @@ fn the_overlays_numbers_and_the_scenes_impacts_are_the_same_instants_for_the_sam
             born.sort_by(f64::total_cmp);
             landed.sort_by(f64::total_cmp);
             assert!(!born.is_empty() && born == landed, "{events:?} at {now}: numbers {born:?}, impacts {landed:?}");
-            assert!(born.iter().all(|&at| at - now <= MAX_IMPACT_DELAY + 1e-6));
+            // The first performance of a batch lands within the cap; a counter or any later one within the span of a batch.
+            assert!(born[0] - now <= MAX_IMPACT_DELAY + 1e-6, "{events:?}: {born:?}");
+            assert!(born.iter().all(|&at| at - now <= cue::MAX_BATCH_SPAN + 1e-6));
         }
     }
     // A death too: an enemy leaves the list at the instant the director begins its collapse.
@@ -134,6 +138,44 @@ fn the_overlays_numbers_and_the_scenes_impacts_are_the_same_instants_for_the_sam
         view.enemies[0].alive
     };
     assert!(listed(begins - 0.001) && !listed(begins + 0.001), "the list drops the enemy at the instant its collapse begins ({begins})");
+}
+
+/// An enemy's counter plays after the blow that provoked it, not over it: its performance begins when the blow's is over, it lands
+/// after the blow has landed and its follow-through has played, and the battle's victory pose waits for it.
+#[test]
+fn a_counter_in_the_batch_of_the_blow_plays_after_it_and_not_at_the_same_time() {
+    let melee: &dyn Fn(ActorId, ActionRef) -> Look = &|_, _| Look { melee: true, element: Element::Plain };
+    let batch = [action(0, ActionRef::Attack), damage(0, 2, false), action(2, ActionRef::EnemyAttack(272)), damage(2, 0, false), damage(2, 1, false)];
+    let counter_begins = 10.0 + cue::length_of(Some(ActionRef::Attack));
+    // With clips: the blow lands at 10.5, the counter's blows (one announcement, a burst on each of the two) land together
+    // after the blow's performance is over; the performer of the counter has nothing of the counter before it begins.
+    let mut d = with_clips();
+    d.on_batch(10.0, &batch, melee);
+    let landed = impacts(&d);
+    assert_eq!(landed.len(), 3, "{landed:?}");
+    assert!((landed[0] - (10.0 + cue::impact_delay(Some(ActionRef::Attack)))).abs() < 1e-9, "{landed:?}");
+    let counter_lands = counter_begins + cue::impact_delay(Some(ActionRef::EnemyAttack(272)));
+    assert!(landed[1..].iter().all(|&at| (at - counter_lands).abs() < 1e-9), "{landed:?} against {counter_lands}");
+    assert!(counter_lands >= landed[0] + cue::follow_through(Some(ActionRef::Attack)), "after the follow-through, not at once");
+    assert!((d.last_impact() - counter_lands).abs() < 1e-9);
+    // The enemy flinches from the blow (its hurt clip, from the impact) and only then begins its own performance.
+    let started: Vec<f64> = d.segments_of(2).iter().map(|s| s.start).collect();
+    assert!(started.iter().filter(|&&at| at < counter_begins - 1e-9).count() == 1, "only the hurt clip before the counter begins: {started:?}");
+    assert!(started.iter().any(|&at| at >= counter_begins - 1e-9), "its own performance begins with the counter: {started:?}");
+    // Without clips (a lunge): the enemy stands where it is until the counter begins, then runs up.
+    let mut d = procedural();
+    d.on_batch(10.0, &batch, melee);
+    assert_eq!(d.motion(2, counter_begins - 0.05).offset[0], 0.0);
+    assert_eq!(d.motion(2, counter_begins - 0.05).offset[2], 0.0, "it stands where it is while the blow plays");
+    let moved = (1..40).map(|k| d.motion(2, counter_begins + k as f64 * 0.01).offset).any(|o| o.iter().any(|&c| c.abs() > 1.0));
+    assert!(moved, "it runs up once its turn comes");
+    // A victory in the same batch rejoices after the LAST blow has landed (the counter's), not the first.
+    let mut won = with_clips();
+    let mut events = batch.to_vec();
+    events.push(BattleEvent::Victory);
+    won.on_batch(10.0, &events, melee);
+    let first_pose = (0..2).filter_map(|i| won.victories[i]).fold(f64::INFINITY, f64::min);
+    assert!(first_pose >= counter_lands, "the party rejoices after the counter: {first_pose} against {counter_lands}");
 }
 
 #[test]

@@ -21,9 +21,11 @@
 //!
 //! [`super::cue`] groups a batch of events into performances and says when each lands; [`super::plan`]
 //! time-warps the performer's clips so that the impact frame lands then, and **nothing waits on an
-//! animation**: the impact is never later than [`super::cue::MAX_IMPACT_DELAY`] after the batch
-//! arrived, whatever the clips' lengths or what the actor was doing (a later performance of an actor
-//! takes over from its start). An actor without real clips ([`Kit::none`]: a stand-in, a box) gets
+//! animation**: the impact is never later than [`super::cue::MAX_IMPACT_DELAY`] after the performance
+//! begins, whatever the clips' lengths or what the actor was doing (a later performance of an actor
+//! takes over from its start). A performance begins with its batch, or, when it comes after another in
+//! the same batch (an enemy's counter after the blow that provoked it), when that one is over
+//! ([`super::cue::Cue::start`]): the two are never played over each other. An actor without real clips ([`Kit::none`]: a stand-in, a box) gets
 //! the procedural motion that stood here first: the lunge with its hop, the blink and shake, the
 //! collapse; so does an attack whose script cannot be played (it never borrows another attack's clips).
 //! A beaten enemy whose death script plays a clip plays it and fades once the fall has been seen; the
@@ -289,9 +291,9 @@ impl Director {
         Some((direction(a.ground, b.ground), dist))
     }
 
-    /// A batch of events that arrived at `arrival`: every performance in it is scheduled, each so that
-    /// its blow lands [`cue::impact_delay`] later. `look_of` says what an action looks like (from
-    /// the engine: does it run up to its target, which element is it).
+    /// A batch of events that arrived at `arrival`: every performance in it is scheduled, each beginning when the one
+    /// before it is over ([`Cue::start`]) and so that its blow lands [`cue::impact_delay`] after that. `look_of` says what
+    /// an action looks like (from the engine: does it run up to its target, which element is it).
     pub fn on_batch(&mut self, arrival: f64, events: &[BattleEvent], look_of: &dyn Fn(ActorId, ActionRef) -> Look) {
         for cue in cue::cues(events) {
             self.perform(arrival, &cue, look_of);
@@ -301,8 +303,11 @@ impl Director {
         }
     }
 
-    /// One performance: the performer's clips and run, what lands on whom, the effects.
-    fn perform(&mut self, arrival: f64, cue: &Cue<'_>, look_of: &dyn Fn(ActorId, ActionRef) -> Look) {
+    /// One performance: the performer's clips and run, what lands on whom, the effects. It begins `cue.start` after the
+    /// batch arrived at `batch`: a counter plays after the blow that provoked it, not over it.
+    fn perform(&mut self, batch: f64, cue: &Cue<'_>, look_of: &dyn Fn(ActorId, ActionRef) -> Look) {
+        // When THIS performance begins: everything below is scheduled from it.
+        let arrival = batch + cue.start;
         let impact = arrival + cue.impact();
         let targets = cue.targets();
         let action = cue.action.map(|(_, a)| a);

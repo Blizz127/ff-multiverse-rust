@@ -231,6 +231,51 @@ fn a_lost_battle_lingers_with_a_defeat_and_no_reward() {
     assert_eq!((f.outcome, f.reward), (Outcome::Defeat, None));
 }
 
+/// The whole chain on the client: a blow of ours and the enemy's counter that wipes the party come in ONE batch. The numbers come up one
+/// after the other (the counter's over us after the blow's over the enemy), the banner names the counter when it begins and not before,
+/// and the defeat panel is not due until the counter has landed.
+#[test]
+fn a_counter_in_the_blows_batch_floats_its_number_after_the_blows_and_the_defeat_panel_waits_for_it() {
+    use scene::cue::{impact_delay, length_of};
+    let server = Server::new();
+    // No battle data here: nothing is replayed, the screen follows what the server said.
+    let mut c = BattleClient::new(ME);
+    c.on_message(1.0, server.start());
+    let (foe, me) = (ActorId(1), ActorId(0));
+    let ours = Command::Attack { target: foe };
+    let counter = ActionRef::EnemyAttack(286);
+    let batch = vec![
+        BattleEvent::Action { actor: me, action: ActionRef::Attack },
+        BattleEvent::Damage { actor: me, target: foe, amount: 40, critical: false },
+        BattleEvent::Action { actor: foe, action: counter },
+        BattleEvent::Damage { actor: foe, target: me, amount: 999, critical: false },
+        BattleEvent::Death { actor: me },
+        BattleEvent::Defeat,
+    ];
+    c.on_message(2.0, ServerMsg::BattleEvent { battle_id: BattleId(1), tick: 10, command: Some(AppliedCommand { actor: me, command: ours }), events: batch });
+    c.on_message(2.0, ServerMsg::BattleEnd { battle_id: BattleId(1), outcome: Outcome::Defeat, rewards: vec![] });
+    let blow_lands = 2.0 + impact_delay(Some(ActionRef::Attack));
+    let counter_begins = 2.0 + length_of(Some(ActionRef::Attack));
+    let counter_lands = counter_begins + impact_delay(Some(counter));
+    let numbers = |t: f64| -> Vec<(u8, u32)> {
+        c.view(t)
+            .map(|v| v.popups.iter().filter_map(|p| if let popups::PopupKind::Damage { amount, .. } = p.kind { Some((p.target.0, amount)) } else { None }).collect())
+            .unwrap_or_default()
+    };
+    assert!(numbers(2.0).is_empty(), "nothing has landed when the batch arrives");
+    assert_eq!(numbers(blow_lands + 0.01), [(1, 40)], "our blow lands first, and only it");
+    assert_eq!(numbers(counter_begins - 0.01), [(1, 40)], "the counter has not begun");
+    assert!(counter_lands > blow_lands + 0.5, "the counter lands well after the blow: {counter_lands} against {blow_lands}");
+    // Two numbers are up together only when the first is still alive; the counter's is the one over us.
+    let at_counter = numbers(counter_lands + 0.01);
+    assert!(at_counter.contains(&(0, 999)), "the counter's number over us: {at_counter:?}");
+    // The panel of the defeat counts from the moment the counter begins, so it is not due until the counter has landed.
+    let finale = |t: f64| c.view(t).and_then(|v| v.finale);
+    assert_eq!(finale(counter_begins).map(|f| f.age_ms), Some(0));
+    assert!(finale(counter_lands + 0.01).is_some_and(|f| f.age_ms < panels::PANEL_DELAY_MS), "the counter is seen before the panel is due");
+    assert!(finale(counter_begins + 2.0).is_some_and(|f| f.age_ms >= panels::PANEL_DELAY_MS && f.dismissible), "and the panel comes");
+}
+
 #[test]
 fn a_new_battle_wipes_the_lingering_one_and_its_numbers() {
     let mut server = Server::new();
@@ -335,8 +380,35 @@ fn the_end_of_a_battle_says_how_many_statuses_it_had() {
     let counts = notes.iter().find(|n| n.starts_with("status: battle#1 ")).unwrap_or_else(|| panic!("no count: {notes:?}"));
     assert!(counts.contains("inflicted=2") && counts.contains("ended="), "{counts}");
     assert!(counts.split("ticks=").nth(1).and_then(|s| s.trim().parse::<u64>().ok()).is_some(), "a number of turns: {counts}");
-    // The count line comes right before the end note.
+    // The count line comes right before the counters' count and the end note.
     let at = notes.iter().position(|n| n == counts).expect("it is there");
-    assert!(notes[at + 1].contains("ended in"), "{notes:?}");
+    assert_eq!(notes[at + 1], "counter: battle#1 counters=0", "{notes:?}");
+    assert!(notes[at + 2].contains("ended in"), "{notes:?}");
     assert_eq!(c.divergences(), 0, "{notes:?}");
+}
+
+/// An enemy that acts in the events of a COMMAND is answering it (its counter scripts run inside the command: nothing
+/// advances the clock there), and only that is counted and noted; the enemy's own turns come with a step.
+#[test]
+fn an_enemy_attack_inside_a_commands_events_is_a_counter_and_only_that_is_counted() {
+    let server = Server::new();
+    // No battle data here: nothing is replayed (and so nothing can diverge), the notes are what the server said.
+    let mut c = BattleClient::new(ME);
+    c.on_message(1.0, server.start());
+    c.drain_notes();
+    let foe = ActorId(1);
+    let ours = Command::Attack { target: foe };
+    let act = |actor: ActorId, action| BattleEvent::Action { actor, action };
+    let hit = |actor: ActorId, target: ActorId| BattleEvent::Damage { actor, target, amount: 1, critical: false };
+    // A command's batch: our blow, then the enemy's answer to it.
+    let batch = vec![act(ActorId(0), ActionRef::Attack), hit(ActorId(0), foe), act(foe, ActionRef::EnemyAttack(286)), hit(foe, ActorId(0))];
+    c.on_message(1.1, ServerMsg::BattleEvent { battle_id: BattleId(1), tick: 10, command: Some(AppliedCommand { actor: ActorId(0), command: ours }), events: batch });
+    // The enemy's own turn comes with a step, not with a command: it is not a counter.
+    c.on_message(1.2, ServerMsg::BattleEvent { battle_id: BattleId(1), tick: 20, command: None, events: vec![act(foe, ActionRef::EnemyAttack(282))] });
+    let notes = c.drain_notes();
+    let counters: Vec<&String> = notes.iter().filter(|n| n.starts_with("counter: actor=")).collect();
+    assert_eq!(counters, ["counter: actor=1 attack=286"], "{notes:?}");
+    c.on_message(1.3, ServerMsg::BattleEnd { battle_id: BattleId(1), outcome: Outcome::Defeat, rewards: vec![] });
+    let notes = c.drain_notes();
+    assert!(notes.contains(&"counter: battle#1 counters=1".to_string()), "{notes:?}");
 }
