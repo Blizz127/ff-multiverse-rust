@@ -5,7 +5,7 @@ use super::*;
 use crate::field::Vertex;
 use crate::script::synth::SynthScript;
 use crate::script::Instruction;
-use crate::story::REACTOR_LIFT;
+use crate::story::REACTOR_STATE;
 
 // ---- a tiny assembler ---------------------------------------------------------------------------
 
@@ -282,10 +282,10 @@ fn an_if_on_the_moment_picks_the_branch_for_the_story_the_player_has() {
 #[test]
 fn a_test_of_a_tracked_bit_reads_that_bit_and_one_of_an_untracked_variable_stops_the_run_and_is_counted() {
     // IFUB Var[1][225] bit-off 0 (op 10): true while the lift is up
-    let lift_up = cat(&[when_byte(REACTOR_LIFT.bank, REACTOR_LIFT.address, 10, 0, &play(1, 42)), ret()]);
+    let lift_up = cat(&[when_byte(REACTOR_STATE.bank, REACTOR_STATE.address, 10, 0, &play(1, 42)), ret()]);
     let bytes = section(vec![("a", vec![(3, lift_up)])]);
     let mut down = story(12);
-    assert!(down.set_bit(REACTOR_LIFT.bank, REACTOR_LIFT.address, 0, true));
+    assert!(down.set_bit(REACTOR_STATE.bank, REACTOR_STATE.address, 0, true));
     assert_eq!(plays(&run_slot(&bytes, 0, 3, &story(12), 0).0), [(0, 1, 42)], "the bit is clear: the test holds");
     assert!(run_slot(&bytes, 0, 3, &down, 0).0.is_empty(), "the bit is set: it does not");
     // Var[5][1] is nobody's story: the run stops there, the sound after it is not played, and the test is counted

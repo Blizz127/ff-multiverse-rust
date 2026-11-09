@@ -73,7 +73,7 @@
 //! # What a flipped story bit plays ([`flip_events`])
 //!
 //! The lift of `elevtr1` is not a link: the panel's script sets a bit of the story (`BITON Var[1][225] bit 0`, the
-//! tracked [`crate::story::REACTOR_LIFT`]) and its next opcode is `SOUND 42`, a loop clip, stopped by a `SOUND 0` after
+//! tracked [`crate::story::REACTOR_STATE`], its lift bit) and its next opcode is `SOUND 42`, a loop clip, stopped by a `SOUND 0` after
 //! the ride's scrolls. [`flip_events`] finds the scripts that set or clear a tracked bit and runs what they do
 //! right after it, so that a client that sees the bit change plays that. The stop is behind waits the data do not
 //! give, so **the caller plays such a loop once through, not for a time nobody knows**.
