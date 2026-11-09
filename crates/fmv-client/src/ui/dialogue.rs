@@ -1,0 +1,494 @@
+//! Talking to the characters of a field: the dialogue window, and the keys that open and drive it.
+//! The text is the game's own, read from this machine's copy of it, and shown exactly as written.
+//!
+//! * [`Talk`] is what the window (`crate::window`) holds. A fresh `Enter` or `Space` (a
+//!   controller's A is `Enter`) while no battle is on starts a conversation with the character the
+//!   player stands near and faces ([`pick_target`]); while a dialogue window is open the same keys
+//!   page through it. The player is frozen while it is open ([`Talk::is_open`]).
+//! * [`DialogueWindow`] is the window's own state: a source of messages ([`MessageSource`]), the
+//!   message on show, its page, and the cursor of a question. A pure state machine: keys in
+//!   ([`DialogueKey`]), pictures out ([`DialogueWindow::draw`]).
+//! * [`layout`] turns a message into pages and rows that fit the window (the font has the
+//!   printable ASCII only, so the game's typographic marks and accents are folded).
+//! * [`ff7`] is where the conversations come from in the game: the character's talk script, run
+//!   by `fmv_ff7::script::dialogue` over this machine's own field data. Anything else that can give
+//!   [`Message`]s can stand in for it ([`Conversations`]): the window never asks where a line came
+//!   from, except to draw an added line (not the game's) with a different border.
+//!
+//! # Keys
+//!
+//! | Key | Closed | Open |
+//! |---|---|---|
+//! | `Enter`, `Space`, `NumpadEnter` (pad A) | talk to the character in front of us | next page, next window, or answer the question |
+//! | `Backspace` (pad B), `Esc` | (not ours) | close the whole conversation |
+//! | `Up`/`W`, `Down`/`S` (stick, D-pad) | (not ours) | move the cursor of a question (wraps) |
+//!
+//! Only a fresh press of `Enter`, `Space`, `Backspace` and `Esc` counts (a held key must not page
+//! through a whole conversation); the arrows repeat. Releases are never ours: a movement key let go
+//! of during a dialogue still reaches the walk. A battle owns `Enter` while it is on and while its
+//! panel lingers, so no conversation starts then, and one that is open when a battle begins is
+//! closed.
+//!
+//! # Who can be talked to
+//!
+//! [`pick_target`]: someone whose talk radius (the script's `TALKR`, scaled by the field scale)
+//! reaches the player, nearest first, and who is within 70 degrees of where the player faces, or
+//! so near (under 40% of the radius) that facing does not matter. A character with nothing to say
+//! at the story's point (hidden, silenced, a bare `RET`) is not a target's conversation: nothing
+//! happens, as in the game.
+
+mod layout;
+
+pub mod ff7;
+
+#[cfg(test)]
+mod shots;
+#[cfg(test)]
+mod tests;
+
+pub use layout::{lay_out, Laid, Page, POINTER_CELLS};
+
+use crate::state::NpcView;
+use crate::ui::draw::{DrawList, Rgba};
+use crate::ui::font::Special;
+use crate::ui::hud::hud_scale;
+use crate::ui::widgets::{Canvas, ACCENT, BORDER, DIM, PANEL_BOTTOM, PANEL_TOP, TEXT};
+use fmv_core::Pos;
+use fmv_ff7::script::dialogue::{Beat, Message, MessageSource, TextColour};
+use std::cell::Cell;
+use winit::keyboard::KeyCode;
+
+// ---- geometry ----------------------------------------------------------------------------------
+
+/// Canvas units from the edge of the screen to a window.
+const MARGIN: i32 = 4;
+/// Canvas units between a window's border and its text.
+const PAD: i32 = 6;
+/// Canvas units from one row of text to the next.
+const ROW_H: i32 = 12;
+/// The canvas the layout is made for, as the battle's windows have it: one canvas unit is
+/// `min(width / 480, height / 280)` pixels.
+const FULL_W: i32 = 480;
+const FULL_H: i32 = 280;
+const MAX_SCALE: i32 = 8;
+/// The fewest cells inside a window (a window of one short line is still a window).
+const MIN_CELLS: usize = 16;
+/// Pixels, at HUD scale 1, kept clear under the window for the HUD's lines at the bottom.
+const HUD_CLEARANCE_PX: i32 = 36;
+/// How much of the screen's height a window may take (percent).
+const MAX_HEIGHT_PERCENT: i32 = 45;
+
+/// Where a window of a screen size goes, in canvas units.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Geometry {
+    /// Window pixels per canvas unit.
+    pub s: i32,
+    /// The canvas, in units.
+    pub cw: i32,
+    pub ch: i32,
+    /// The most cells inside a window and the most rows it shows.
+    pub max_cells: usize,
+    pub max_rows: usize,
+    /// The row of the canvas that the window's bottom edge may reach (above the HUD's lines).
+    pub floor: i32,
+}
+
+/// The geometry for a `vw` x `vh` screen.
+pub fn geometry(vw: u32, vh: u32) -> Geometry {
+    let (w, h) = (i32::try_from(vw.max(1)).unwrap_or(i32::MAX), i32::try_from(vh.max(1)).unwrap_or(i32::MAX));
+    let s = (w / FULL_W).min(h / FULL_H).clamp(1, MAX_SCALE);
+    let (cw, ch) = ((w / s).max(1), (h / s).max(1));
+    let clearance = (HUD_CLEARANCE_PX * i32::try_from(hud_scale(vw, vh)).unwrap_or(1) + s - 1) / s;
+    let max_cells = usize::try_from(((cw - 2 * MARGIN - 2 * PAD) / 8).max(0)).unwrap_or(0).max(POINTER_CELLS + 4);
+    let rows = (ch * MAX_HEIGHT_PERCENT / 100 - 2 * PAD + (ROW_H - 8)) / ROW_H;
+    let max_rows = usize::try_from(rows.clamp(2, 12)).unwrap_or(2);
+    Geometry { s, cw, ch, max_cells, max_rows, floor: (ch - clearance).max(MARGIN + 2 * PAD + ROW_H) }
+}
+
+// ---- keys --------------------------------------------------------------------------------------
+
+/// What a key means to a dialogue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialogueKey {
+    Confirm,
+    Back,
+    Up,
+    Down,
+}
+
+/// The dialogue key a keyboard event stands for (see the module docs for the table). Only a fresh
+/// press of the confirming and closing keys counts; the arrows repeat; a release is nothing.
+pub fn dialogue_key(code: KeyCode, pressed: bool, repeat: bool) -> Option<DialogueKey> {
+    if !pressed {
+        return None;
+    }
+    match code {
+        KeyCode::Space | KeyCode::Enter | KeyCode::NumpadEnter if !repeat => Some(DialogueKey::Confirm),
+        KeyCode::Backspace | KeyCode::Escape if !repeat => Some(DialogueKey::Back),
+        KeyCode::ArrowUp | KeyCode::KeyW => Some(DialogueKey::Up),
+        KeyCode::ArrowDown | KeyCode::KeyS => Some(DialogueKey::Down),
+        _ => None,
+    }
+}
+
+// ---- the window --------------------------------------------------------------------------------
+
+/// The message on show.
+#[derive(Debug, Clone)]
+struct Shown {
+    message: Message,
+    page: usize,
+    /// Which of the page's choices the pointer is on (0 = the first).
+    cursor: usize,
+    /// First row of the page that is on show (a long list scrolls).
+    scroll: usize,
+}
+
+impl Shown {
+    fn new(message: Message) -> Self {
+        // The cursor starts on the line the source says, if that is one of the choices.
+        let cursor = message.choice.map_or(0, |c| c.cursor.saturating_sub(c.first).min(c.last.saturating_sub(c.first)));
+        Self { message, page: 0, cursor, scroll: 0 }
+    }
+}
+
+/// How many blank messages in a row a window skips before it gives up (a script of nothing but
+/// codes, or a damaged one, must not make it spin).
+const MAX_BLANKS: usize = 8;
+
+/// A dialogue window: a source of messages and the one on show.
+pub struct DialogueWindow {
+    source: Box<dyn MessageSource>,
+    shown: Shown,
+}
+
+impl std::fmt::Debug for DialogueWindow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DialogueWindow").field("shown", &self.shown).finish_non_exhaustive()
+    }
+}
+
+impl DialogueWindow {
+    /// A window on `source`, showing its first message; `None` when it has nothing to say.
+    pub fn open(source: Box<dyn MessageSource>) -> Option<Self> {
+        let mut source = source;
+        let message = pull(&mut *source, None)?;
+        Some(Self { source, shown: Shown::new(message) })
+    }
+
+    /// The message on show.
+    #[cfg(test)]
+    pub fn message(&self) -> &Message {
+        &self.shown.message
+    }
+
+    /// The page on show (0 is the first) and the cursor's choice (0 is the first).
+    #[cfg(test)]
+    pub fn position(&self) -> (usize, usize) {
+        (self.shown.page, self.shown.cursor)
+    }
+
+    /// Whether the page on show (for a screen of `size`) holds the choices of a question, that is,
+    /// whether the pointer is on screen and the arrows move it.
+    #[cfg(test)]
+    pub fn on_choices(&self, size: (u32, u32)) -> bool {
+        let (laid, _) = self.laid(size);
+        laid.pages.get(self.shown.page.min(laid.pages.len().saturating_sub(1))).is_some_and(|p| p.choices.is_some())
+    }
+
+    fn laid(&self, size: (u32, u32)) -> (Laid, Geometry) {
+        let g = geometry(size.0, size.1);
+        (lay_out(&self.shown.message, g.max_cells, g.max_rows), g)
+    }
+
+    /// The first row on show of `page`, so that the pointer's row is on screen (and a page with
+    /// fewer rows than the window has no scroll).
+    fn scroll_of(&self, laid: &Laid, page: &Page) -> usize {
+        let max_scroll = page.rows.len().saturating_sub(laid.rows);
+        let mut scroll = self.shown.scroll.min(max_scroll);
+        if let Some(choices) = &page.choices {
+            let focus = choices.start + self.shown.cursor.min(choices.len().saturating_sub(1));
+            if focus < scroll {
+                scroll = focus;
+            } else if focus >= scroll + laid.rows {
+                scroll = focus + 1 - laid.rows;
+            }
+        }
+        scroll.min(max_scroll)
+    }
+
+    /// Give the window a key on a screen of `size`. Returns whether the window is still open.
+    pub fn key(&mut self, key: DialogueKey, size: (u32, u32)) -> bool {
+        let (laid, _) = self.laid(size);
+        let last_page = laid.pages.len().saturating_sub(1);
+        self.shown.page = self.shown.page.min(last_page);
+        let Some(page) = laid.pages.get(self.shown.page) else { return false };
+        match key {
+            DialogueKey::Back => return false,
+            DialogueKey::Up | DialogueKey::Down => {
+                if let Some(choices) = &page.choices {
+                    let n = choices.len().max(1);
+                    let cursor = self.shown.cursor.min(n - 1);
+                    self.shown.cursor = if key == DialogueKey::Up { (cursor + n - 1) % n } else { (cursor + 1) % n };
+                    self.shown.scroll = self.scroll_of(&laid, page);
+                }
+            }
+            DialogueKey::Confirm => {
+                if let Some(choices) = &page.choices {
+                    let choice = self.shown.message.choice;
+                    let line = choice.map_or(0, |c| c.first) + self.shown.cursor.min(choices.len().saturating_sub(1));
+                    return self.advance(Some(line));
+                }
+                if self.shown.page < last_page {
+                    self.shown.page += 1;
+                    self.shown.scroll = 0;
+                    if let Some(next) = laid.pages.get(self.shown.page) {
+                        self.shown.scroll = self.scroll_of(&laid, next);
+                    }
+                } else {
+                    return self.advance(None);
+                }
+            }
+        }
+        true
+    }
+
+    /// Ask the source for what comes next. `false` when there is nothing more.
+    fn advance(&mut self, answer: Option<usize>) -> bool {
+        match pull(&mut *self.source, answer) {
+            Some(message) => {
+                self.shown = Shown::new(message);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Draw the window for a `vw` x `vh` screen at time `t` (seconds; the arrow blinks and the
+    /// flashing colours flash).
+    pub fn draw(&self, vw: u32, vh: u32, t: f64, out: &mut DrawList) {
+        let (laid, g) = self.laid((vw, vh));
+        let page_index = self.shown.page.min(laid.pages.len().saturating_sub(1));
+        let Some(page) = laid.pages.get(page_index) else { return };
+        let scroll = self.scroll_of(&laid, page);
+        let rows = laid.rows;
+        // (Not `clamp`: on a screen too narrow for the minimum, the screen wins.)
+        let cells = laid.cells.max(MIN_CELLS).min(g.max_cells);
+        let cells_i = i32::try_from(cells).unwrap_or(i32::MAX / 16);
+        let (w, h) = (cells_i * 8 + 2 * PAD, i32::try_from(rows).unwrap_or(1) * ROW_H - (ROW_H - 8) + 2 * PAD);
+        let (x, y) = ((g.cw - w) / 2, (g.floor - h).max(MARGIN));
+        let mut c = Canvas { out, s: g.s };
+
+        // The game's windows have the usual light border; a line this project added is bordered in
+        // the accent colour, so that it never passes for the game's.
+        let border = if self.shown.message.origin.is_canon() { BORDER } else { ACCENT };
+        c.fill(x, y, w, h, border);
+        c.gradient(x + 1, y + 1, w - 2, h - 2, PANEL_TOP, PANEL_BOTTOM);
+
+        let blink = ((t * 2.5).floor() as i64).rem_euclid(2) == 0;
+        for (i, row) in page.rows.iter().skip(scroll).take(rows).enumerate() {
+            let index = scroll + i;
+            let ry = y + PAD + i32::try_from(i).unwrap_or(0) * ROW_H;
+            let is_choice = page.choices.as_ref().is_some_and(|r| r.contains(&index));
+            let mut tx = x + PAD;
+            if is_choice {
+                let focus = page.choices.as_ref().map_or(0, |r| r.start + self.shown.cursor.min(r.len().saturating_sub(1)));
+                if index == focus {
+                    c.pointer(tx, ry);
+                }
+                tx += i32::try_from(POINTER_CELLS).unwrap_or(2) * 8;
+            }
+            for run in &row.runs {
+                tx += c.shadowed(tx, ry, colour(run.colour, t), &run.text);
+            }
+        }
+        // More to scroll, and more to read.
+        let right = x + w - PAD - 8;
+        if scroll > 0 {
+            c.special(right, y + 1, ACCENT, Special::ArrowUp);
+        }
+        if scroll + rows < page.rows.len() {
+            c.special(right, y + h - 9, ACCENT, Special::ArrowDown);
+        } else if page_index + 1 < laid.pages.len() && blink {
+            c.special(right, y + h - 6, ACCENT, Special::ArrowDown);
+        }
+    }
+}
+
+/// The next non-blank message of `source` (blank ones are skipped), `None` at the end.
+fn pull(source: &mut dyn MessageSource, answer: Option<usize>) -> Option<Message> {
+    let mut answer = answer;
+    for _ in 0..MAX_BLANKS {
+        match source.next(answer.take()) {
+            Beat::Message(m) if layout::is_blank(&m) => {}
+            Beat::Message(m) => return Some(m),
+            Beat::End(_) => return None,
+        }
+    }
+    None
+}
+
+/// What a text colour looks like on the window's blue.
+fn colour(c: TextColour, t: f64) -> Rgba {
+    let phase = (t * 3.0).floor() as i64;
+    match c {
+        TextColour::White => TEXT,
+        TextColour::Gray => [150, 156, 190, 255],
+        TextColour::Blue => [120, 150, 255, 255],
+        TextColour::Red => [255, 110, 110, 255],
+        TextColour::Purple => [214, 140, 255, 255],
+        TextColour::Green => [130, 235, 140, 255],
+        TextColour::Cyan => [120, 230, 255, 255],
+        TextColour::Yellow => [255, 226, 96, 255],
+        TextColour::Flash => {
+            if phase.rem_euclid(2) == 0 {
+                TEXT
+            } else {
+                DIM
+            }
+        }
+        TextColour::Rainbow => {
+            [[255, 110, 110, 255], [255, 226, 96, 255], [130, 235, 140, 255], [120, 230, 255, 255], [214, 140, 255, 255]]
+                [usize::try_from(phase.rem_euclid(5)).unwrap_or(0)]
+        }
+    }
+}
+
+// ---- who is in front of us ---------------------------------------------------------------------
+
+/// Where a character stands and how near one has to be to talk to it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Spot {
+    pub pos: Pos,
+    pub radius: f32,
+}
+
+/// How far (in cosine of the angle) the player's heading may be from the character: 70 degrees.
+const FACING_COSINE: f32 = 0.342;
+/// Within this part of its radius a character is talked to whichever way the player faces.
+const CLOSE_FRACTION: f32 = 0.4;
+
+/// The index of the spot the player at `own`, heading `facing` (radians, counter-clockwise from the
+/// area's +x), talks to: the nearest whose radius reaches the player and that is in front of them
+/// (or very near). Heights are ignored; a spot that is not finite is never chosen.
+pub fn pick_target(own: Pos, facing: f32, spots: &[Spot]) -> Option<usize> {
+    if !(own.x.is_finite() && own.y.is_finite() && facing.is_finite()) {
+        return None;
+    }
+    let (fx, fy) = (facing.cos(), facing.sin());
+    spots
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| {
+            let (dx, dy) = (s.pos.x - own.x, s.pos.y - own.y);
+            let d = dx.hypot(dy);
+            if !(d.is_finite() && s.radius.is_finite()) || d > s.radius {
+                return None;
+            }
+            let in_front = d < 1e-3 || (dx * fx + dy * fy) / d >= FACING_COSINE;
+            (in_front || d <= s.radius * CLOSE_FRACTION).then_some((i, d))
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(i, _)| i)
+}
+
+// ---- the controller ----------------------------------------------------------------------------
+
+/// Where conversations come from: the game's own scripts in the game, canned ones in tests.
+pub trait Conversations {
+    /// How near one has to stand to talk to `npc` of `area` (in the area's units; 0 if it cannot
+    /// be talked to at all).
+    fn talk_radius(&mut self, area: &str, npc: &NpcView) -> f32;
+
+    /// The conversation with `npc`, or `None` when it has nothing to say.
+    fn start(&mut self, area: &str, npc: &NpcView) -> Option<Box<dyn MessageSource>>;
+}
+
+/// What the player's surroundings are, for a key press.
+#[derive(Debug, Clone, Copy)]
+pub struct Around<'a> {
+    /// The area's key (what the conversations are looked up by).
+    pub area: &'a str,
+    pub own: Pos,
+    pub facing: f32,
+    pub npcs: &'a [NpcView],
+    /// A battle is on, or its panel still lingers: `Enter` belongs to the battle.
+    pub blocked: bool,
+}
+
+/// The talk controller the window holds: the conversations, and the dialogue window when one is open.
+pub struct Talk {
+    conversations: Box<dyn Conversations>,
+    window: Option<DialogueWindow>,
+    /// The screen the window was last drawn for (keys lay the text out for the same one).
+    size: Cell<(u32, u32)>,
+}
+
+impl std::fmt::Debug for Talk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Talk").field("window", &self.window).finish_non_exhaustive()
+    }
+}
+
+impl Talk {
+    pub fn new(conversations: Box<dyn Conversations>) -> Self {
+        Self { conversations, window: None, size: Cell::new((960, 540)) }
+    }
+
+    /// A talk controller over this machine's own FF7 field data (`None`: nobody has anything to say).
+    pub fn ff7(adapter: Option<std::sync::Arc<fmv_ff7::Ff7Adapter>>) -> Self {
+        Self::new(Box::new(ff7::Ff7Conversations::new(adapter)))
+    }
+
+    /// Whether a dialogue window is open (the player stands still then).
+    pub fn is_open(&self) -> bool {
+        self.window.is_some()
+    }
+
+    /// Close the dialogue (a battle began, the area changed).
+    pub fn close(&mut self) {
+        self.window = None;
+    }
+
+    /// The message on show.
+    #[cfg(test)]
+    pub fn message(&self) -> Option<&Message> {
+        self.window.as_ref().map(DialogueWindow::message)
+    }
+
+    /// A key event. Returns whether the dialogue took it (the window then does nothing else with it).
+    pub fn key(&mut self, code: KeyCode, pressed: bool, repeat: bool, around: &Around<'_>) -> bool {
+        if around.blocked {
+            self.window = None;
+        }
+        let Some(key) = dialogue_key(code, pressed, repeat) else { return false };
+        if let Some(window) = self.window.as_mut() {
+            if !window.key(key, self.size.get()) {
+                self.window = None;
+            }
+            return true;
+        }
+        if key != DialogueKey::Confirm || around.blocked {
+            return false;
+        }
+        let spots: Vec<Spot> =
+            around.npcs.iter().map(|n| Spot { pos: n.pos, radius: self.conversations.talk_radius(around.area, n) }).collect();
+        let Some(npc) = pick_target(around.own, around.facing, &spots).and_then(|i| around.npcs.get(i)) else { return false };
+        let Some(source) = self.conversations.start(around.area, npc) else { return false };
+        match DialogueWindow::open(source) {
+            Some(window) => {
+                self.window = Some(window);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Draw the window, when one is open.
+    pub fn draw(&self, vw: u32, vh: u32, t: f64, out: &mut DrawList) {
+        self.size.set((vw, vh));
+        if let Some(window) = &self.window {
+            window.draw(vw, vh, t, out);
+        }
+    }
+}

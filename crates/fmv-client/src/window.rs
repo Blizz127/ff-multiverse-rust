@@ -18,6 +18,7 @@ use crate::npc::{npc_models, npc_players, npc_who};
 use crate::render::{FrameResult, PlayerSprite, Renderer, Scene};
 use crate::session::{Session, SessionInfo};
 use crate::state::ClientState;
+use crate::ui::dialogue::{Around, Talk};
 use crate::ui::draw::DrawList;
 use crate::ui::hud::{self, Subject};
 use fmv_core::{AnimState, GameId, Pos};
@@ -509,6 +510,9 @@ pub(crate) struct App {
     device: DeviceMode,
     /// The game controllers. Closed until a window exists; the menu hands over the ones it opened.
     pads: Pads,
+    /// Talking to the area's characters (`Enter` or `Space` next to one opens its dialogue window,
+    /// which freezes the player while it is open).
+    talk: Talk,
 }
 
 impl App {
@@ -545,6 +549,7 @@ impl App {
             notice: None,
             device: DeviceMode::DESKTOP,
             pads: Pads::closed(),
+            talk: Talk::ff7(None),
         }
     }
 
@@ -563,7 +568,19 @@ impl App {
     /// A key went down, came up or repeated: from the keyboard or from a game controller, which
     /// make the same key events (`PadKey::key_code`) and so go through this one dispatch.
     fn key_event(&mut self, el: &ActiveEventLoop, code: KeyCode, pressed: bool, repeat: bool, source: InputSource) {
-        match route_key(code, pressed, repeat, self.session.state.battle.in_battle()) {
+        // A dialogue takes its keys first; a fresh Enter or Space outside a battle talks to the
+        // character in front of us.
+        let state = &self.session.state;
+        let blocked = state.battle.in_battle() || state.battle.lingering(self.session.now());
+        let around = Around { area: &self.session.info.area_id.key, own: state.own.pos(), facing: state.own.facing(), npcs: state.npc_views(), blocked };
+        if self.talk.key(code, pressed, repeat, &around) {
+            return;
+        }
+        let route = route_key(code, pressed, repeat, self.session.state.battle.in_battle());
+        if self.talk.is_open() && route != KeyRoute::Movement {
+            return; // under a dialogue only the walking keys count (a release must never be lost)
+        }
+        match route {
             KeyRoute::Escape => self.escape(el, source),
             KeyRoute::WalkMesh => self.show_walkmesh = !self.show_walkmesh,
             KeyRoute::Party(key) => self.party_key(key),
@@ -580,7 +597,8 @@ impl App {
     /// reads in eight and a held direction is a held key.
     fn poll_pads(&mut self, el: &ActiveEventLoop, now: Instant) {
         let battle = &self.session.state.battle;
-        let mode = if battle.in_battle() || battle.lingering(self.session.now()) { PadMode::Menu } else { PadMode::Field };
+        let menu = battle.in_battle() || battle.lingering(self.session.now()) || self.talk.is_open();
+        let mode = if menu { PadMode::Menu } else { PadMode::Field };
         for event in self.pads.poll(now, mode) {
             self.key_event(el, event.key.key_code(), event.pressed, event.repeat, InputSource::Pad);
         }
@@ -616,12 +634,14 @@ impl App {
     /// Where the views of later areas come from: when the server moves the player to another
     /// area, its view (camera, background, walkmesh) is built from this machine's own FF7 data.
     pub(crate) fn with_ff7(mut self, ff7: Option<Arc<Ff7Adapter>>) -> Self {
+        self.talk = Talk::ff7(ff7.clone());
         self.ff7 = ff7;
         self
     }
 
     /// The session entered another area: draw it (a new view, a new title).
     fn rebuild_view(&mut self) {
+        self.talk.close();
         self.view = crate::field_view(self.ff7.as_deref(), &self.session);
         self.base_title = base_title(&self.session.info);
         // The next `update_title` must not wait for its refresh interval.
@@ -762,12 +782,14 @@ impl App {
         // A player in a battle is frozen in the field: no walking, no movement intents. So is one whose
         // battle just ended, while the window still shows its victory or defeat panel.
         if self.session.state.battle.in_battle() || self.session.state.battle.lingering(self.session.now()) {
+            self.talk.close();
             self.update_title();
             return;
         }
         let (speed, moving) = movement_pace(self.view.stage.as_ref(), self.input.walking(), self.session.area.max_speed());
-        // The keys mean directions on the SCREEN; the area is walked in its own axes.
-        let keys = self.input.dir();
+        // The keys mean directions on the SCREEN; the area is walked in its own axes. Under a dialogue
+        // window the player stands still (no keys: idle, and the intent is sent as usual).
+        let keys = if self.talk.is_open() { (0.0, 0.0) } else { self.input.dir() };
         let dir = if keys == (0.0, 0.0) {
             keys
         } else {
@@ -846,6 +868,7 @@ impl App {
         let anchor = |subject: Subject, at: Pos| label_anchor(built.as_ref(), view, draw.own_who, subject, at);
         let hud_input = hud::gather_anchored(state, &self.session.info, view, render_t, &anchor);
         hud::draw_hud_with(&hud_input, hud::progress_line(state, render_t).as_ref(), vw, vh, &mut overlay);
+        self.talk.draw(vw, vh, now, &mut overlay);
         if let Some(text) = notice {
             draw_notice(text, vw, vh, &mut overlay);
         }
