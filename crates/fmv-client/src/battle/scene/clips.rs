@@ -29,10 +29,11 @@
 //! | 3, 4 | hop forward, hop back | 3, 4: the root travels about 510 forward / 515 back |
 //! | 5, 6 | hurt, hurt hard | 15; 16 and 17 |
 //! | 7 | death | 18, which ends in the pose of slot 6 |
+//! | 8 | **the Defend command**: a one-shot guard that returns to the stance | 5 alone (10 to 12 frames) |
 //! | 9 | cover: step in front of an ally and hold the guard | 8, a held guard (1 frame) |
 //! | 12 | victory | 2 (25 to 55 frames, ends in a held pose) |
 //! | 13 | run (the party running away) | 7 (6 frames, a loop, in place) |
-//! | 17 | cast a spell | 3, then 12 (begin), 13 (hold), 14 (end), then 4; the spell's effect starts after 13 |
+//! | 17 | cast a spell | 3, then 12 (begin), 13 (hold), the effect (`EC`), 14 (end), then 4 |
 //! | 20 | **a blow with a short-range weapon**: run up, strike, run back | per character, below |
 //! | 21 | **a blow with a long-range weapon**: hop forward, shoot or throw, hop back | per character, below |
 //! | 32, 33 | use an item on an ally, on an enemy | 3, **9**, 4; 3, **10**, 4 |
@@ -81,45 +82,87 @@
 //! | 3, 4 | hop forward, hop back (8 to 14 frames) | scripts 3 and 4 |
 //! | 6 | dead, lying down (one frame) | the last frame of slot 18 for every character |
 //! | 7 | run (6 frames, a loop) | script 13; in place: the root does not travel |
-//! | 8 | guard (1 or 2 frames, a held pose) | script 9 (cover): Cloud raises an arm, Tifa boxes. **Played for Defend since the first version.** |
+//! | 5 | guard: raises the guard and returns to the stance (10 to 12 frames) | script 8, the Defend command: Cloud brings his sword across, Tifa covers her face, Barret crosses his arms. **Played for Defend.** |
+//! | 8 | cover pose (1 or 2 frames, a held pose) | script 9 (cover, the support materia: a move to the ally, this pose, a wait, the return): Cloud crouches behind the sword, Tifa boxes. Not played: Defend is no cover |
 //! | 9 | a gesture with an arm raised (12 to 16 frames) | script 32: the item thrown up to an ally |
 //! | 10 | the item thrown forward to an enemy (12 to 17 frames) | script 33: **not the attack** |
 //! | 12, 13, 14 | cast: begin (28 to 33 frames), hold (4 to 8), end (4 to 11) | script 17: Cloud stows the sword and holds out a hand; Tifa raises an arm |
 //! | 15 | hurt: flinch and straighten up (8 to 10 frames) | script 5: Cloud arches back, Barret doubles over |
 //! | 18 | death: thrown back, lands, ends lying (8 to 14 frames) | script 7; ends in slot 6's pose for every character |
 //!
-//! **Not settled: the Defend command.** Script 8 plays slot 5 alone, a one-shot guard of 10 to 12 frames that
-//! returns to the stance (Cloud holds his sword across, Tifa covers her face, Barret crosses his arms), and the
-//! scripts around it are the reactions (hurt, death) and the cover: it may be what Defend plays. Slot 8, which
-//! Defend holds here, is script 9's cover pose; for Tifa it is her boxing stance. Looked at, not changed.
+//! **The Defend command is script 8's guard.** The first version held slot 8 for a second and a half and snapped to
+//! the stance; slot 8 is script 9's COVER pose (a move to an ally, this pose, a wait, the return: the support
+//! materia, which this client does not play). Script 8, which sits among the reactions (5 hurt, 7 death) and the
+//! cover (9), plays slot 5 alone for all nine, a guard that goes up and comes back to the stance in 10 to 12 frames:
+//! looked at on the pictures of every character (`slots-<name>-0.png`: Cloud brings the Buster Sword across his
+//! body, Tifa crouches with her fists at her face) and played once at its own speed. Every character's weapon has a
+//! real track for slot 5 (held by `party_clips_agree_across_the_characters`). In the scene: `defend-close-<n>.png`
+//! of `sheets::fight_defend_sheets`, before and after.
+//!
+//! **The hops around a cast are not played.** Script 17 hops forward (3: 8 to 14 frames, the root carries the actor
+//! hundreds of units), gathers (12, 13), runs the effect (`EC`), ends (14) and hops back (4). The plan can only cover
+//! [`super::plan::MAX_SPEEDUP`] x [`super::cue::MAX_IMPACT_DELAY`] of natural time before the impact (27 ticks), and the
+//! gathering alone (36 ticks for Cloud, never fewer than 32) is longer: [`super::plan::fit`] drops the START of a plan that is
+//! too long, so a hop forward put before the gathering would be the part cut, every time; and a hop back with no hop
+//! forward is a jump in place. The arithmetic is held to the owner's files by `party_clips_agree_across_the_characters`;
+//! the cast stays the gathering clips (begin to the impact, hold, end).
 //!
 //! The root's x and z translation is removed from every clip played here (the figure plays IN PLACE, see
 //! [`super::model`]): the game's clips carry travel of 500 to 1 400 units that the engine's own movement, which
 //! this client does not have, composes with, and the choreography moves the actor itself (the lunge).
 //!
-//! # Enemies
+//! # Enemies: the numbers of `scene.bin` are scripts
 //!
-//! Slot 0 is the idle loop and slot 1 the hurt clip in every enemy model of the archive that has a
-//! hurt clip at all (8 or 9 frames in the models looked at: the MP, Guard Hound, Sweeper, Kalm Fang,
-//! Prowler, Mono Drive...). The attacks are the ones `scene.bin` names: attack `i` of an enemy record
-//! has the id `attack_ids[i]` and plays slot `animation_indices[i]` ([`super::model::EnemyMotions`]);
-//! `scene.bin`'s other slots are the enemy's own scripts, which are not decoded. **An enemy has no
-//! death clip in the table**, so a beaten enemy plays its hurt clip and fades out (the engine of
-//! the original fades it too).
+//! **An enemy model plays what its own scripts say, like a character.** Attack `i` of an enemy record has the id
+//! `attack_ids[i]` and `animation_indices[i]` is the index of a SCRIPT of the enemy's `ab` entry, not a slot of its pack
+//! ([`super::model::EnemyBook`]): the MP's Machine Gun (index 3) is its script 3, which plays slots 2, 3, 4 and 5 in turn, and
+//! its Tonfa (index 4) is script 4: slots 6, 7, 8 and 9. The first version played slot 3 and slot 4 for them (slot 4,
+//! one frame of the machine gun's aim, for the baton) and never the swing (slot 8), and guessed a run-up and a way back
+//! from the root's travel; the Guard Hound's bite ran with a spell's first clip. Every enemy model has 32 scripts and the
+//! first ones are the same for all:
 //!
-//! **Open finding, not fixed here: the numbers of `scene.bin`'s `animation_indices` are SCRIPT indices (of the
-//! enemy's `ab` entry), not slots.** The MP's Machine Gun (index 3) is its script 3, which plays slots 2, 3, 4 and 5
-//! in turn (the run-up, the two aiming poses held where it fires, the way back: the chain [`find_run`] and
-//! [`find_back`] guess from the root's travel) and its Tonfa (index 4) is script 4: slots 6, 7, 8 and 9. What is
-//! played for those attacks today is slot 3 and slot 4 alone, between that run-up and way back; the Tonfa's
-//! swing (slot 8) is never played. The scripts are decoded now (`BattleModel::scripts`), so the same
-//! [`Chain::from_script`] can give the enemies' blows the clips the game plays.
+//! | script | what it is | |
+//! |---|---|---|
+//! | 0 | idle | `A9 C9 00 C1`: slot 0, over and over |
+//! | 1 | hurt | slot 1 in 326 of the 329 enemies that have a name (two of them play another clip after it), then `F6` (the engine's death effect, if it died); the other three play nothing of their own |
+//! | 2 | death | a clip in 45 of the 329 (slot 10 in 23 of them, slot 14 in 12, the Guard Hound's among them: a fall), none in the rest (`HOME IDLE`: the engine takes them apart) |
+//! | 3 and up | the attacks `scene.bin` names | below |
 //!
-//! The clips of an enemy's attack are mostly poses held where the attack happens (the MP's Machine
-//! Gun is 2 frames, its Tonfa 1); the run-up and the way back are clips of their own that no table
-//! names (the MP's slot 2 carries it 1 140 units forward, slot 5 brings it back, which is what
-//! [`find_run`] and [`find_back`] look for: a slot whose root travels far one way, a slot whose root
-//! travels the same distance back).
+//! So the hurt clip is script 1's ([`Kit::hurt`]; an enemy whose script plays none flinches procedurally) and a death clip, when
+//! there is one, script 2's ([`Kit::death`]): an enemy that has one plays it from the start of its death and fades when the fall
+//! has been seen; the others flinch and fade as before ([`super::motion::DEATH_FALL_MAX`]). Held by
+//! `sheets::enemy_attack_chains_are_the_scripts_clips`.
+//!
+//! ## An attack
+//!
+//! An attack is read by [`Chain::from_script`] the way a character's blow is: the clips before the **mark** are the approach, the
+//! clips from it on the strike up to the return (`FA`), the clips after the return the way back. The mark is the damage (`F7`, or
+//! `C2` for the number alone, a number of ticks after the op: the same 15 ticks to the second as a character's) or the effect (`EC`:
+//! a spell, an enemy's special; it lands at once, at the first clip after it). Of the 819 attacks of the named enemies that the
+//! engine can use (it models the damaging ones) 795 have such a script and play it; the other 24 (13 never mark where they land, 11
+//! play nothing after the mark: bosses' and the like) are the procedural motion, and **never borrow another attack's clips**. The tally and the chains of the
+//! MP, the Guard Hound and the Mono Drive are held to the owner's files by `sheets::enemy_attack_chains_are_the_scripts_clips`.
+//!
+//! | shape | the 795 attacks that play | example |
+//! |---|---|---|
+//! | `approach / strike @n / way back`: a damage mark, a return | 362 | the MP's Tonfa: 6, 7 / 8 @4 / 9; the Guard Hound's Bite: 2, 3 / 4 @15 / 5; its Tentacle: 6, 7 / 8 @5 / 9 |
+//! | `approach / strike @n`: a damage mark, no return, the last clip carries the actor home | 79 | the MP's Machine Gun: 2 / 3, 4, 5 @8: the run-up (slot 2 carries it 970 units), two poses and a long clip that keeps the aim for ten frames and runs home |
+//! | `approach / strike @0`: an effect | 354 | the Mono Drive's Fire: 6, 7, 8 / 9 @0: it gathers, the effect, the end clip (the tentacles open into a star and close) |
+//!
+//! The script does not move the actor on its own, but it says how: a **move to the target** before the mark (`D1`, `D0`,
+//! `CF`: `FB` only places the actor, and does not count) sends the actor all the way to its target; a script without one
+//! only carries it as far as its clips do ([`Chain::carries`]: the forward travel of the root of the approach clips, 970 units for
+//! the MP's Machine Gun, which is fired from where the run-up stopped; none for a spell, which is cast where it stands). The actor
+//! travels with the first clip that carries it forward or the one after the move, whichever comes first ([`Chain::travel_from`]: the
+//! MP's leap, whose root jumps forward 581 units, then the move that puts it next to the target). A script with no return whose last
+//! clip carries the actor home holds its pose (the MP's aim, for the first ten frames of the clip) and goes
+//! when the root does: [`Chain::home_run`] is the frame ([`ClipSet::lead`]). Every clip plays once; the idle clip (slot 0: the engine lets the
+//! idle loop finish before an action and settles after it) is not played. **Nothing here changes what the presentation rules say**
+//! ([`super::plan`]): the impact is at `arrival` + 0.55 s whatever the clips, the follow-through and the way back are bounded.
+//!
+//! Pictures: `enemy-chain-<name>.png` (the clips of each in order, labelled), `enemy-attack-<name>-wide.png` and
+//! `-close-0.png` (what the scene plays), `enemy-death-<name>-close-0.png`, written by `sheets` (the ignored data-gated tests), before
+//! and after.
 
 use fmv_ff7::battle_model::script::{code, Op, Script};
 
@@ -136,6 +179,9 @@ pub struct ClipSet {
     /// How far the root travels along the clip's `z`, last frame minus first, in battle units
     /// (negative is forward: models face `-z`).
     pub travel: Vec<f32>,
+    /// How many frames of each clip go by before its root has covered a tenth of its travel (0 for a clip that does
+    /// not travel, or one that sets off at once): where a clip that carries the actor home begins to.
+    pub lead: Vec<u16>,
     /// Frames per second the clips play at.
     pub fps: f32,
 }
@@ -150,6 +196,16 @@ impl ClipSet {
     pub fn frames_of(&self, slot: Slot) -> u16 {
         self.frames.get(usize::from(slot)).copied().unwrap_or(0)
     }
+
+    /// How far the root of `slot` travels along `z` (0 for a slot the pack does not have): negative is forward.
+    pub fn travel_of(&self, slot: Slot) -> f32 {
+        self.travel.get(usize::from(slot)).copied().unwrap_or(0.0)
+    }
+
+    /// The frames of `slot` before its root has covered a tenth of its travel (0 for a slot the pack does not have).
+    pub fn lead_of(&self, slot: Slot) -> u16 {
+        self.lead.get(usize::from(slot)).copied().unwrap_or(0)
+    }
 }
 
 /// The slots the nine playable characters' packs share, and the indices of the animation scripts they all
@@ -160,7 +216,6 @@ pub mod party {
     pub const VICTORY: Slot = 2;
     pub const DEAD: Slot = 6;
     pub const RUN: Slot = 7;
-    pub const DEFEND: Slot = 8;
     /// An item used on an ally: the gesture with the arm raised.
     pub const ITEM: Slot = 9;
     /// An item thrown at an enemy: the throw forward. (This is slot 10, which was taken for the attack.)
@@ -175,6 +230,8 @@ pub mod party {
 
     /// The indices of the animation scripts of the nine models (`ab` entries) that the choreography reads.
     pub mod script {
+        /// The Defend command: a one-shot guard that returns to the stance.
+        pub const DEFEND: usize = 8;
         /// A blow with a short-range weapon: run up, strike, run back.
         pub const ATTACK: usize = 20;
         /// A blow with a long-range weapon: hop forward, shoot or throw, hop back.
@@ -182,32 +239,65 @@ pub mod party {
     }
 }
 
-/// A blow as the game's own animation script plays it, split where the choreography has to know: what the actor
-/// plays while it closes in, what it strikes with and when the blow lands, how it comes back. Made from a
-/// character's script ([`Chain::from_script`]), so Cloud's leap and chop, Tifa's dash and combo, Aerith's wind-up
-/// and Vincent's hop and three-clip shot are each the character's own.
+/// The indices of the animation scripts every enemy model has (its `ab` entry, `scene.bin`'s `animation_indices` name the
+/// others: an attack's script).
+pub mod enemy_script {
+    /// What the enemy plays when it is hit: its hurt clip.
+    pub const HURT: usize = 1;
+    /// What it plays when it dies, if it plays anything (an enemy without a death clip is taken apart by the engine's own
+    /// effect, which this client draws as a fade).
+    pub const DEATH: usize = 2;
+}
+
+/// A blow, a spell, any attack as the game's own animation script plays it, split where the choreography has to know:
+/// what the actor plays while it closes in, what it strikes with and when the blow lands, how it comes back. Made from the
+/// script of a character or of an enemy ([`Chain::from_script`]), so Cloud's leap and chop, Tifa's dash and combo, Aerith's
+/// wind-up, the MP's baton swing and the Guard Hound's bite are each the model's own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chain {
-    /// The clips before the blow: a leap, a dash, a hop forward, a wind-up, each played once, in order.
+    /// The clips before the blow: a leap, a dash, a hop forward, a wind-up, a spell's gathering, each played once, in order.
     pub approach: Vec<Slot>,
     /// The clips the blow is struck with. The blow lands [`Chain::impact`] ticks after the first starts.
     pub strike: Vec<Slot>,
     /// Ticks (a clip of `n` frames lasts `n` ticks, 15 to the second) from the start of `strike[0]` to the damage
-    /// marker of the script: the blow lands then.
+    /// marker of the script (an effect, `EC`, lands at once: 0): the blow lands then.
     pub impact: u16,
     /// The clips that bring the actor back: a run back, a hop back.
     pub back: Vec<Slot>,
-    /// Does the script send the actor to its target (a move to the target comes between its clips)? A hop only
-    /// has the clips' own travel ([`party::HOP`]).
+    /// Does the script send the actor to its target (a move to the target comes before the blow)? One that does
+    /// not only has the clips' own travel ([`Chain::carries`]; for a character that hops, [`party::HOP`]).
     pub closes_in: bool,
-    /// The index of the clip of `approach` the actor starts to travel with: the one after the script's move to the
-    /// target (a runner crouches or winds up in place first), 0 for a script that does not move.
+    /// The index of the clip of `approach` the actor starts to travel with: the first that carries it forward or the one
+    /// after the script's move to the target, whichever comes first (a runner crouches or winds up in place first), 0 for a
+    /// script that does not move.
     pub travel_from: usize,
+    /// How far the clips of `approach` carry the actor forward by themselves, in battle units (the root's travel of those
+    /// that go forward): all that a script that does not move it to the target covers.
+    pub carries: u32,
+    /// The last clip of `strike` carries the actor home (nothing in the script sends it back): from this frame of it on, where
+    /// its root has begun to travel. `None` for a script that sends the actor back or whose clips do not.
+    pub home_run: Option<u16>,
 }
 
-/// Is `op` a move to the target (or to a place the script names) that the actor makes while it closes in?
+/// How far forward a clip's root has to travel to count as carrying the actor (a run, a leap, a hop), and how far back for
+/// the clip that brings it home, in battle units.
+pub const CARRY_TRAVEL: f32 = 250.0;
+
+/// Whose script a [`Chain`] is read from: the two are read by different rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// A playable character's: the clip that brings it back from a hop is slot 4 ([`party::HOP_BACK`]), and it travels from the
+    /// clip that follows the script's move to the target (the table of the module docs, held by a real-data test).
+    Character,
+    /// An enemy's: its clips are its own (slot 4 is nothing special), it travels with the first clip that carries it forward
+    /// or the one after its move to the target, whichever comes first, and its last clip may carry it home.
+    Enemy,
+}
+
+/// Is `op` a move to the target (or to a place the script names) that the actor makes while it closes in? (`FB` places
+/// the actor next to the target or far from it without a run: it is not a way to close in.)
 fn is_move_to_target(op: u8) -> bool {
-    matches!(op, code::MOVE_TARGET_X | code::MOVE_TARGET_XZ | code::MOVE_TARGET_XYZ | code::MOVE_TO | code::MOVE_TO_TARGET | code::PLACE_AT_TARGET)
+    matches!(op, code::MOVE_TARGET_X | code::MOVE_TARGET_XZ | code::MOVE_TARGET_XYZ | code::MOVE_TO | code::MOVE_TO_TARGET)
 }
 
 impl Chain {
@@ -226,18 +316,24 @@ impl Chain {
         (last, clips.frames_of(last).saturating_sub(1))
     }
 
-    /// The blow `script` plays, or `None` when it is not one (it never marks the damage, plays nothing after the
-    /// mark) or plays a clip `clips` cannot give (the slot is past the pack or not the slot's own clip): the
+    /// The attack `script` plays, or `None` when it is not one (it never marks where the damage lands, plays nothing after
+    /// the mark) or plays a clip `clips` cannot give (the slot is past the pack or not the slot's own clip): the
     /// choreography is then procedural, it never borrows another clip.
     ///
-    /// The script's clips fall in three runs: up to the damage marker (`F7` or `C2`, whichever comes first) is the
-    /// approach, from it up to the return (`FA`) is the strike, after it the way back. A script of the hop kind brings
-    /// the actor back with the hop-back clip BEFORE its return, which is then the way back, not part of the strike.
-    pub fn from_script(script: &Script, clips: &ClipSet) -> Option<Self> {
+    /// The script's clips fall in three runs: up to the mark is the approach, from it up to the return (`FA`) is the
+    /// strike, after the return the way back. The mark is the damage (`F7` or `C2`, a number of ticks after it) or the
+    /// effect (`EC`: a spell or an effect of the enemy's, which lands at once), whichever comes first. The idle clip (slot 0)
+    /// is not played: it is the engine letting the idle loop finish before the action, or settling after it.
+    ///
+    /// A character's script hops back with slot 4 BEFORE its return: that clip is the way back, not part of the strike (an
+    /// enemy's clips are its own: see [`Role`]).
+    pub fn from_script(script: &Script, clips: &ClipSet, role: Role) -> Option<Self> {
+        let hop_back = (role == Role::Character).then_some(party::HOP_BACK);
         let (mut approach, mut strike, mut back) = (Vec::new(), Vec::new(), Vec::new());
         let (mut impact, mut moved_at, mut returned) = (None, None, false);
         for op in &script.ops {
             match op {
+                Op::Play(0) => {}
                 Op::Play(n) => {
                     let slot = Slot::from(*n);
                     if returned {
@@ -250,13 +346,14 @@ impl Chain {
                 }
                 Op::Code { code, args } => match *code {
                     code::DAMAGE | code::DAMAGE_QUIET if impact.is_none() => impact = args.first().map(|&ticks| u16::from(ticks)),
+                    code::EFFECT if impact.is_none() => impact = Some(0),
                     code::RETURN => returned = true,
                     c if is_move_to_target(c) && impact.is_none() && moved_at.is_none() => moved_at = Some(approach.len()),
                     _ => {}
                 },
             }
         }
-        if back.is_empty() && strike.len() > 1 && strike.last() == Some(&party::HOP_BACK) {
+        if hop_back.is_some() && back.is_empty() && strike.len() > 1 && strike.last() == hop_back.as_ref() {
             back.extend(strike.pop());
         }
         let playable = |slots: &[Slot]| slots.iter().all(|&s| clips.usable(usize::from(s)).is_some());
@@ -264,7 +361,22 @@ impl Chain {
             return None;
         }
         let strike_ticks: u16 = strike.iter().map(|&s| clips.frames_of(s)).fold(0u16, u16::saturating_add);
-        Some(Self { approach, strike, impact: impact?.min(strike_ticks), back, closes_in: moved_at.is_some(), travel_from: moved_at.unwrap_or(0) })
+        let carries = approach.iter().map(|&s| (-clips.travel_of(s)).max(0.0)).sum::<f32>().round() as u32;
+        let (travel_from, home_run) = match role {
+            Role::Character => (moved_at.unwrap_or(0), None),
+            Role::Enemy => {
+                // Where the actor travels from: the first clip that carries it forward, or the one after the script's move.
+                let first_forward = approach.iter().position(|&s| -clips.travel_of(s) >= CARRY_TRAVEL);
+                let travel_from = match (moved_at, first_forward) {
+                    (Some(moved), Some(forward)) => moved.min(forward),
+                    (moved, forward) => moved.or(forward).unwrap_or(0),
+                };
+                // A script that never sends the actor back, whose last clip does: that clip is the way home.
+                let home_run = (!returned && back.is_empty()).then(|| strike.last().copied()).flatten().filter(|&s| clips.travel_of(s) >= CARRY_TRAVEL).map(|s| clips.lead_of(s));
+                (travel_from, home_run)
+            }
+        };
+        Some(Self { approach, strike, impact: impact?.min(strike_ticks), back, closes_in: moved_at.is_some(), travel_from, carries, home_run })
     }
 }
 
@@ -290,25 +402,15 @@ pub struct Kit {
     pub item_at_enemy: Option<Slot>,
     /// Cast: begin, hold, end (each may be missing).
     pub cast: [Option<Slot>; 3],
-    /// What the actor plays while it runs up to its target, and on the way back.
+    /// What a party member plays while it runs up to its target without a script to say, and on the way back.
     pub run: Option<Slot>,
     pub back: Option<Slot>,
-    /// An enemy's attacks: `scene.bin` attack id and its slot.
-    pub attacks: Vec<(u16, Slot)>,
-    /// The attacks `scene.bin` names whose slot cannot be played (it is past the model's pack, or not the
-    /// slot's own clip): they move procedurally, they do NOT borrow another attack's clip.
+    /// An enemy's attacks: `scene.bin`'s attack id and the chain of the script it names (its `animation_indices`).
+    pub attacks: Vec<(u16, Chain)>,
+    /// The attacks `scene.bin` names whose script cannot be played (it is not there, never marks where it lands, or plays
+    /// a slot that is past the model's pack or not the slot's own clip): they move procedurally, they do NOT borrow
+    /// another attack's clips.
     pub unplayable: Vec<u16>,
-    /// The slot of an enemy's first attack: what a plain attack plays.
-    pub plain: Option<Slot>,
-}
-
-/// What an enemy plays for an attack.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AttackClip {
-    /// The clip `scene.bin` names for it.
-    Slot(Slot),
-    /// `scene.bin` names it but the clip cannot be played: the procedural motion.
-    Procedural,
 }
 
 impl Kit {
@@ -317,17 +419,18 @@ impl Kit {
         Self::default()
     }
 
-    /// The kit of a playable character's battle model: the slots the nine share, and the character's own blows read
-    /// from `scripts` (its animation scripts, indexed as the game's table: none, and the blows are procedural).
+    /// The kit of a playable character's battle model: the slots the nine share, and the character's own blows and guard
+    /// read from `scripts` (its animation scripts, indexed as the game's table: none, and the blows are procedural and
+    /// nothing guards).
     pub fn party(clips: ClipSet, scripts: &[Script]) -> Self {
         let slot = |s: Slot| clips.usable(usize::from(s));
-        let chain = |index: usize| scripts.get(index).and_then(|script| Chain::from_script(script, &clips));
+        let chain = |index: usize| scripts.get(index).and_then(|script| Chain::from_script(script, &clips, Role::Character));
         Self {
             hurt: slot(party::HURT),
             death: slot(party::DEATH),
             dead: slot(party::DEAD),
             victory: slot(party::VICTORY),
-            defend: slot(party::DEFEND),
+            defend: first_clip(scripts.get(party::script::DEFEND), &clips),
             attack: chain(party::script::ATTACK),
             shoot: chain(party::script::SHOOT),
             item: slot(party::ITEM),
@@ -350,32 +453,38 @@ impl Kit {
         }
     }
 
-    /// The kit of an enemy's battle model, with the attacks `scene.bin` names for it (`attacks`: attack
-    /// id and slot; one that points at a slot the model cannot play is left out).
-    pub fn enemy(clips: ClipSet, attacks: &[(u16, u8)]) -> Self {
-        let unplayable: Vec<u16> = attacks.iter().filter(|&&(_, slot)| clips.usable(usize::from(slot)).is_none()).map(|&(id, _)| id).collect();
-        let attacks: Vec<(u16, Slot)> = attacks.iter().filter_map(|&(id, slot)| clips.usable(usize::from(slot)).map(|s| (id, s))).collect();
-        let run = find_run(&clips, &attacks);
+    /// The kit of an enemy's battle model, read from its own animation `scripts` (its `ab` entry; none, and everything is
+    /// procedural): the clip its hurt script (1) plays and the one its death script (2) plays, if it plays one, and the
+    /// chains of the scripts `scene.bin` names for its attacks (`attacks`: the attack id and the SCRIPT index, not a slot).
+    /// An attack whose script cannot be played is `unplayable`.
+    pub fn enemy(clips: ClipSet, scripts: &[Script], attacks: &[(u16, u8)]) -> Self {
+        let mut chains: Vec<(u16, Chain)> = Vec::new();
+        let mut unplayable: Vec<u16> = Vec::new();
+        for &(id, index) in attacks {
+            match scripts.get(usize::from(index)).and_then(|script| Chain::from_script(script, &clips, Role::Enemy)) {
+                Some(chain) => chains.push((id, chain)),
+                None => unplayable.push(id),
+            }
+        }
         Self {
-            hurt: clips.usable(1),
-            back: run.and_then(|r| find_back(&clips, r, &attacks)),
-            run,
-            plain: attacks.first().map(|&(_, s)| s),
-            attacks,
+            hurt: first_clip(scripts.get(enemy_script::HURT), &clips),
+            death: first_clip(scripts.get(enemy_script::DEATH), &clips),
+            attacks: chains,
             unplayable,
             clips,
             ..Self::default()
         }
     }
 
-    /// What the enemy attack `id` plays: its own clip, or `Procedural` when `scene.bin` names the attack
-    /// with a slot that cannot be played. `None` for an id `scene.bin` does not name for this enemy at all
-    /// (a plain attack's clip is [`Kit::plain`]).
-    pub fn attack_clip(&self, id: u16) -> Option<AttackClip> {
-        if self.unplayable.contains(&id) {
-            return Some(AttackClip::Procedural);
+    /// The chain an enemy's attack `id` plays: its own script's; the first attack's for a plain attack (`None`) or an
+    /// attack `scene.bin` does not name for this enemy at all; `None` (procedural) for an attack it names whose script
+    /// cannot be played, which does NOT borrow another attack's clips.
+    pub fn enemy_chain(&self, id: Option<u16>) -> Option<&Chain> {
+        match id {
+            Some(id) if self.unplayable.contains(&id) => None,
+            Some(id) => self.attacks.iter().find(|(a, _)| *a == id).or(self.attacks.first()).map(|(_, chain)| chain),
+            None => self.attacks.first().map(|(_, chain)| chain),
         }
-        self.attacks.iter().find(|&&(a, _)| a == id).map(|&(_, s)| AttackClip::Slot(s))
     }
 
     /// Does this kit play any real clip at all? (tests)
@@ -385,34 +494,14 @@ impl Kit {
     }
 }
 
-/// How far a slot's root has to travel to count as a run-up or a way back, in battle units.
-pub const RUN_TRAVEL: f32 = 500.0;
-/// Fewest frames of a run-up or way back (the 1 and 2 frame clips are held poses).
-const MIN_RUN_FRAMES: u16 = 4;
-
-/// The slot an enemy runs up to its target with: the one (from slot 2 on, so neither the idle nor
-/// the hurt clip, and none of the attacks) whose root travels the farthest forward, at least
-/// [`RUN_TRAVEL`]. The MP's slot 2 (-1 139 units). `None` for an enemy that has no such clip: it
-/// slides to its target in its idle pose.
-pub fn find_run(set: &ClipSet, attacks: &[(u16, Slot)]) -> Option<Slot> {
-    (2..set.frames.len())
-        .filter(|&s| set.usable(s).is_some() && set.frames[s] >= MIN_RUN_FRAMES && !attacks.iter().any(|&(_, a)| usize::from(a) == s))
-        .filter(|&s| set.travel.get(s).is_some_and(|&t| t <= -RUN_TRAVEL))
-        .min_by(|&a, &b| set.travel[a].total_cmp(&set.travel[b]))
-        .map(|s| s as Slot)
-}
-
-/// The slot an enemy comes back with after a run-up `run`: the first one after it whose root travels
-/// back, at least [`RUN_TRAVEL`] and within a fifth of what the run-up covered. The MP's slot 5.
-pub fn find_back(set: &ClipSet, run: Slot, attacks: &[(u16, Slot)]) -> Option<Slot> {
-    let out = -set.travel.get(usize::from(run)).copied()?;
-    if out < RUN_TRAVEL {
-        return None;
-    }
-    ((usize::from(run) + 1)..set.frames.len())
-        .filter(|&s| set.usable(s).is_some() && set.frames[s] >= MIN_RUN_FRAMES && !attacks.iter().any(|&(_, a)| usize::from(a) == s))
-        .find(|&s| set.travel.get(s).is_some_and(|&t| t >= RUN_TRAVEL && (t - out).abs() <= out * 0.2))
-        .map(|s| s as Slot)
+/// The first clip `script` plays (the idle clip does not count: see [`Chain::from_script`]), if the pack can give it: what a
+/// one-clip script (a hurt reaction, a death, a guard) plays.
+fn first_clip(script: Option<&Script>, clips: &ClipSet) -> Option<Slot> {
+    let slot = script?.ops.iter().find_map(|op| match op {
+        Op::Play(n) if *n != 0 => Some(usize::from(*n)),
+        _ => None,
+    })?;
+    clips.usable(slot)
 }
 
 /// Invented packs and scripts shaped like Cloud's, for the tests of the choreography: the slot numbers and clip
@@ -424,13 +513,13 @@ pub mod testing {
     use fmv_ff7::battle_model::script::decode;
 
     /// A 52-slot pack whose clips have the lengths of Cloud's chain (26: 2 frames, 27: 5, 30: 6, 28: 3, 29: 4, the hops
-    /// 12 to 14, the long-range swing 31) and 15 frames everywhere else, at 15 frames a second.
+    /// 12 to 14, the long-range swing 31, the guard 10) and 15 frames everywhere else, at 15 frames a second.
     pub fn cloud_like_pack() -> ClipSet {
         let mut frames = vec![15u16; 52];
-        for (slot, n) in [(26, 2), (27, 5), (30, 6), (28, 3), (29, 4), (3, 14), (4, 12), (31, 31)] {
+        for (slot, n) in [(26, 2), (27, 5), (30, 6), (28, 3), (29, 4), (3, 14), (4, 12), (31, 31), (5, 10)] {
             frames[slot] = n;
         }
-        ClipSet { frames, ok: vec![true; 52], travel: vec![0.0; 52], fps: 15.0 }
+        ClipSet { frames, ok: vec![true; 52], travel: vec![0.0; 52], lead: vec![0; 52], fps: 15.0 }
     }
 
     /// The decoded script of invented `bytes`.
@@ -438,25 +527,61 @@ pub mod testing {
         decode(bytes, 0).expect("the script decodes")
     }
 
-    /// Invented scripts of Cloud's shape: 20 runs up (26, a move to the target of a made-up distance, 27), strikes (a
-    /// damage marker 2 ticks into 30, then 28) and runs back (a return, then 29); 21 hops forward (3), shoots (a marker
-    /// 12 ticks into 31) and hops back (4).
+    /// Invented scripts of Cloud's shape: 8 guards (5); 20 runs up (26, a move to the target of a made-up distance, 27),
+    /// strikes (a damage marker 2 ticks into 30, then 28) and runs back (a return, then 29); 21 hops forward (3), shoots (a
+    /// marker 12 ticks into 31) and hops back (4).
     pub fn cloud_like_scripts() -> Vec<Script> {
         let mut scripts = vec![Script::default(); 22];
+        scripts[8] = script(&[5, 0xE5, 0xEE]);
         scripts[20] = script(&[26, 0xD1, 0x58, 0x02, 0x00, 0x00, 0x03, 27, 0xF7, 2, 30, 28, 0xFA, 29, 0xEE]);
         scripts[21] = script(&[3, 0xF7, 12, 31, 4, 0xFA, 0xEE]);
+        scripts
+    }
+
+    /// An invented 16-slot pack shaped like a small enemy's: the idle loop (0), the hurt clip (1), a run-up that carries the
+    /// root far forward (2), two short poses (3, 4), a long clip that holds its pose and then carries the root all the way
+    /// back (5), a leap that carries it forward in its last frame (6), a wind-up (7), a swing (8) and a recovery (9), a
+    /// death (10), the gathering of a spell (11: long; 12 and 13 short) and its end (14), and a clip that is a stand-in
+    /// (15). The travels, the lengths and the leads are made up; only the shape is a real enemy's.
+    pub fn enemy_like_pack() -> ClipSet {
+        let frames = vec![14u16, 8, 11, 2, 1, 20, 12, 4, 11, 2, 16, 13, 3, 2, 10, 1];
+        let mut travel = vec![0.0f32; 16];
+        let mut lead = vec![0u16; 16];
+        for (slot, z) in [(2, -900.0), (5, 1000.0), (6, -500.0), (8, -600.0)] {
+            travel[slot] = z;
+        }
+        lead[5] = 9;
+        let mut ok = vec![true; 16];
+        ok[15] = false;
+        ClipSet { frames, ok, travel, lead, fps: 15.0 }
+    }
+
+    /// Invented scripts of an enemy's shape for [`enemy_like_pack`]: 1 is hurt (the clip, the death effect, home), 2 dies
+    /// (the clip); 3 runs up, fires (a damage marker 7 ticks after the run-up, no return) with two short poses and the long
+    /// clip that holds and runs back; 4 leaps (6), moves to the target, winds up (7), swings (a marker 3 ticks into 8),
+    /// returns and recovers (9); 5 casts (the idle clip, 11, 12, 13, the effect, 14); 6 points at the stand-in (15); 7
+    /// plays a clip and marks nothing.
+    pub fn enemy_like_scripts() -> Vec<Script> {
+        let mut scripts = vec![Script::default(); 8];
+        scripts[1] = script(&[1, 0xF6, 0xE5, 0xEE]);
+        scripts[2] = script(&[10, 0xE5, 0xEE]);
+        scripts[3] = script(&[0xFC, 0xEA, 2, 0xF7, 7, 3, 4, 5, 0xE5, 0xEE]);
+        scripts[4] = script(&[0xFC, 6, 0xD1, 0x5E, 0x01, 0x00, 0x00, 0x06, 7, 0xF7, 3, 8, 0xFA, 9, 0xE5, 0xEE]);
+        scripts[5] = script(&[0xE8, 0, 0xFC, 0xEA, 11, 0xC9, 12, 0xCA, 13, 0xEC, 14, 0xE5, 0xEE]);
+        scripts[6] = script(&[0xF7, 3, 15, 0xE5, 0xEE]);
+        scripts[7] = script(&[3, 4, 0xE5, 0xEE]);
         scripts
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::testing::{cloud_like_pack, cloud_like_scripts, script};
+    use super::testing::{cloud_like_pack, cloud_like_scripts, enemy_like_pack, enemy_like_scripts, script};
     use super::*;
 
     /// A pack of `n` slots with `frames` frames each, all of them real, none travelling.
     fn pack(n: usize, frames: u16) -> ClipSet {
-        ClipSet { frames: vec![frames; n], ok: vec![true; n], travel: vec![0.0; n], fps: 15.0 }
+        ClipSet { frames: vec![frames; n], ok: vec![true; n], travel: vec![0.0; n], lead: vec![0; n], fps: 15.0 }
     }
 
     #[test]
@@ -470,13 +595,19 @@ mod tests {
         // An empty clip is not one.
         set.frames[0] = 0;
         assert_eq!(set.usable(0), None);
+        // What a slot the pack does not have travels and leads: nothing (and a pack without the numbers does not panic).
+        set.travel[1] = -700.0;
+        set.lead[1] = 3;
+        assert_eq!((set.travel_of(1), set.lead_of(1), set.travel_of(77), set.lead_of(77)), (-700.0, 3, 0.0, 0));
+        assert_eq!((ClipSet::default().travel_of(0), ClipSet::default().lead_of(0)), (0.0, 0));
     }
 
     #[test]
     fn a_party_member_has_the_shared_slots_and_its_blows_from_its_scripts_and_loses_what_its_pack_cannot_play() {
         let scripts = cloud_like_scripts();
         let kit = Kit::party(cloud_like_pack(), &scripts);
-        assert_eq!((kit.hurt, kit.death, kit.dead, kit.victory, kit.defend), (Some(15), Some(18), Some(6), Some(2), Some(8)));
+        // The guard is script 8's clip (5), not the held pose of the cover script (8).
+        assert_eq!((kit.hurt, kit.death, kit.dead, kit.victory, kit.defend), (Some(15), Some(18), Some(6), Some(2), Some(5)));
         assert_eq!((kit.item, kit.item_at_enemy, kit.run, kit.back), (Some(9), Some(10), Some(7), Some(4)));
         assert_eq!(kit.cast, [Some(12), Some(13), Some(14)]);
         assert!(kit.is_real() && kit.attacks.is_empty());
@@ -494,9 +625,10 @@ mod tests {
         // A character that has only one of them uses it for both.
         let only_short = Kit { shoot: None, ..kit.clone() };
         assert_eq!(only_short.blow(false), only_short.attack.as_ref());
-        // No scripts, no blows: the choreography is procedural, and slot 10 (an item thrown at an enemy) is never one.
+        // No scripts, no blows and no guard: the choreography is procedural, and slot 10 (an item thrown at an enemy) is
+        // never a blow, nor slot 8 (the cover pose) a guard.
         let bare = Kit::party(cloud_like_pack(), &[]);
-        assert!(bare.attack.is_none() && bare.shoot.is_none() && bare.blow(true).is_none());
+        assert!(bare.attack.is_none() && bare.shoot.is_none() && bare.blow(true).is_none() && bare.defend.is_none());
         // A pack that ends at slot 12, whose slot 12 is a stand-in: what is missing or not real is None, and a script
         // that plays clips past the pack is no blow.
         let mut set = pack(13, 10);
@@ -515,95 +647,155 @@ mod tests {
     #[test]
     fn a_chain_is_read_from_the_script_whatever_its_shape() {
         let set = cloud_like_pack();
+        let party = |bytes: &[u8]| Chain::from_script(&script(bytes), &set, Role::Character);
+        let enemy = |bytes: &[u8]| Chain::from_script(&script(bytes), &set, Role::Enemy);
         // A dash (26), a run cycle (27) after the move, two hits scheduled (`BE`) and the damage readout 7 ticks on (`C2`:
         // the number), the punches (30), the recovery (28), the way back (29): the readout is the impact.
-        let dash = script(&[26, 0xD1, 0x20, 0x01, 0x00, 0x00, 0x04, 27, 0xBE, 3, 0xBE, 7, 0xC2, 7, 30, 28, 0xFA, 29, 0xEE]);
-        let chain = Chain::from_script(&dash, &set).expect("a blow");
+        let chain = party(&[26, 0xD1, 0x20, 0x01, 0x00, 0x00, 0x04, 27, 0xBE, 3, 0xBE, 7, 0xC2, 7, 30, 28, 0xFA, 29, 0xEE]).expect("a blow");
         assert_eq!((chain.approach.clone(), chain.strike.clone(), chain.impact, chain.back.clone()), (vec![26, 27], vec![30, 28], 7, vec![29]), "the readout is 7 ticks in: inside the second strike clip (30 has 6 frames, 28 has 3)");
         // A wind-up in place (25), the move comes after it, then the leap (26): the actor travels from 26.
-        let leap = script(&[25, 0xD0, 0x20, 0x01, 0x05, 26, 0xF7, 3, 29, 27, 0xFA, 28, 0xEE]);
-        let chain = Chain::from_script(&leap, &set).expect("a blow");
+        let chain = party(&[25, 0xD0, 0x20, 0x01, 0x05, 26, 0xF7, 3, 29, 27, 0xFA, 28, 0xEE]).expect("a blow");
         assert_eq!((chain.approach.clone(), chain.strike.clone(), chain.back.clone()), (vec![25, 26], vec![29, 27], vec![28]));
         assert!(chain.closes_in && chain.travel_from == 1, "it winds up in place first");
-        // A hop, a three-clip shot that lands 5 ticks in, and the hop back before the return op: the hop back is the way back,
-        // not part of the strike. No move: the clips' own travel.
-        let shot = script(&[3, 0xF7, 5, 30, 31, 32, 4, 0xFA, 0xEE]);
-        let chain = Chain::from_script(&shot, &set).expect("a blow");
+        // A hop, a three-clip shot that lands 5 ticks in, and the hop back before the return op: for a character the hop back
+        // is the way back, not part of the strike. No move: the clips' own travel.
+        let shot = [3, 0xF7, 5, 30, 31, 32, 4, 0xFA, 0xEE];
+        let chain = party(&shot).expect("a blow");
         assert_eq!((chain.approach.clone(), chain.strike.clone(), chain.impact, chain.back.clone()), (vec![3], vec![30, 31, 32], 5, vec![4]));
         assert!(!chain.closes_in && chain.travel_from == 0);
+        // An enemy's clip 4 is an ordinary clip: the same bytes are a strike of four clips and no way back but the return.
+        let chain = enemy(&shot).expect("an attack");
+        assert_eq!((chain.strike.clone(), chain.back.clone(), chain.impact), (vec![30, 31, 32, 4], vec![], 5), "slot 4 is nobody's hop back but a character's");
         // The marker can sit past what the strike clips hold: it lands on their last frame.
-        let late = script(&[3, 0xF7, 200, 31, 4, 0xFA, 0xEE]);
-        assert_eq!(Chain::from_script(&late, &set).expect("a blow").impact, 31);
+        assert_eq!(party(&[3, 0xF7, 200, 31, 4, 0xFA, 0xEE]).expect("a blow").impact, 31);
         // Not blows: no damage marker anywhere, nothing played after the marker, and a clip the pack cannot give.
-        assert_eq!(Chain::from_script(&script(&[3, 4, 0xFA, 0xEE]), &set), None, "nothing says when it lands");
-        assert_eq!(Chain::from_script(&script(&[3, 0xF7, 4, 0xFA, 0xEE]), &set), None, "nothing is struck with");
-        assert_eq!(Chain::from_script(&Script::default(), &set), None);
+        assert_eq!(party(&[3, 4, 0xFA, 0xEE]), None, "nothing says when it lands");
+        assert_eq!(party(&[3, 0xF7, 4, 0xFA, 0xEE]), None, "nothing is struck with");
+        assert_eq!(Chain::from_script(&Script::default(), &set, Role::Enemy), None);
         let mut broken = cloud_like_pack();
         broken.ok[31] = false;
-        assert_eq!(Chain::from_script(&script(&[3, 0xF7, 4, 31, 4, 0xFA, 0xEE]), &broken), None, "slot 31 is not the slot's own clip");
-        assert_eq!(Chain::from_script(&script(&[3, 0xF7, 4, 60, 4, 0xFA, 0xEE]), &set), None, "slot 60 is past the pack");
+        assert_eq!(Chain::from_script(&script(&[3, 0xF7, 4, 31, 4, 0xFA, 0xEE]), &broken, Role::Character), None, "slot 31 is not the slot's own clip");
+        assert_eq!(party(&[3, 0xF7, 4, 60, 4, 0xFA, 0xEE]), None, "slot 60 is past the pack");
     }
 
-    /// The MP: idle, hurt, a run-up of 1 139 units (slot 2), two attack poses held there (3 and 4), a way
-    /// back (5), and clips of its own tonfa sequence that no attack names.
-    fn the_mp() -> ClipSet {
-        let frames = [15u16, 9, 12, 2, 1, 21, 12, 4, 12, 2];
-        let mut travel = vec![0.0; frames.len()];
-        travel[2] = -1139.0;
-        travel[5] = 1145.0;
-        travel[8] = -300.0;
-        ClipSet { frames: frames.to_vec(), ok: vec![true; frames.len()], travel, fps: 15.0 }
+    /// An effect (`EC`: a spell, an enemy's special) lands at once; the idle clip is never part of a chain; a placement next
+    /// to the target (`FB`) is not a run; whichever mark comes first is the one.
+    #[test]
+    fn an_effect_is_the_mark_of_a_spell_and_the_idle_clip_is_no_part_of_a_chain() {
+        let set = cloud_like_pack();
+        let enemy = |bytes: &[u8]| Chain::from_script(&script(bytes), &set, Role::Enemy);
+        // The engine's idle clip (0) first, then the gathering (26, 27), the effect, the end (28): the effect lands at the
+        // first tick of the end clip.
+        let cast = enemy(&[0xE8, 0, 0xFC, 26, 0xC9, 27, 0xCA, 0xEC, 28, 0xE5, 0xEE]).expect("a spell");
+        assert_eq!((cast.approach.clone(), cast.strike.clone(), cast.impact, cast.back.clone()), (vec![26, 27], vec![28], 0, vec![]));
+        assert!(!cast.closes_in && cast.carries == 0 && cast.home_run.is_none(), "a spell cast in place stays in place");
+        // The first mark wins: a damage mark after the effect is not the impact; an effect after the damage is not either.
+        assert_eq!(enemy(&[26, 0xEC, 27, 0xF7, 3, 28, 0xEE]).expect("a spell").impact, 0);
+        assert_eq!(enemy(&[26, 0xF7, 5, 27, 0xEC, 28, 0xEE]).expect("a blow").impact, 5);
+        // Idle clips between and after the clips of the blow are not played, and do not count in its ticks.
+        let chain = enemy(&[0, 26, 0xF7, 4, 27, 0, 28, 0, 0xEE]).expect("a blow");
+        assert_eq!((chain.approach.clone(), chain.strike.clone(), chain.impact), (vec![26], vec![27, 28], 4));
+        // A script that only plays the idle clip marks nothing and strikes with nothing.
+        assert_eq!(enemy(&[0, 0xEC, 0, 0xEE]), None);
+        // A placement (`FB`) is not a run; a move to the target (`D1`) is, and so is `D0`.
+        let placed = enemy(&[26, 0xFB, 0xB8, 0x0B, 0x00, 0x00, 0xF7, 2, 27, 0xFA, 0xEE]).expect("a blow");
+        assert!(!placed.closes_in, "FB places the actor, it does not close in");
+        let moved = enemy(&[26, 0xD0, 0x20, 0x01, 0x05, 0xF7, 2, 27, 0xFA, 0xEE]).expect("a blow");
+        assert!(moved.closes_in && moved.travel_from == 1);
+        // A move that comes after the mark is not how the actor got there.
+        assert!(!enemy(&[26, 0xF7, 2, 0xD1, 0x58, 0x02, 0x00, 0x00, 0x04, 27, 0xFA, 0xEE]).expect("a blow").closes_in);
+    }
+
+    /// The clips' own travel (the root's `z` from the first frame to the last, negative is forward) decides where an actor
+    /// travels from and how far it gets by itself; a last clip that travels back is the way home when nothing sends the actor back.
+    #[test]
+    fn the_clips_own_travel_says_where_the_actor_travels_from_how_far_it_gets_and_what_brings_it_home() {
+        let mut set = cloud_like_pack();
+        set.travel[26] = -600.0; // a leap
+        set.travel[27] = 90.0; // a wind-up that drifts back a little
+        set.travel[28] = 700.0; // a recovery that carries the actor home
+        set.lead[28] = 2;
+        let enemy = |set: &ClipSet, bytes: &[u8]| Chain::from_script(&script(bytes), set, Role::Enemy).expect("a chain");
+        // A leap that travels before the move to the target: the actor travels with the leap, from the first clip.
+        let leap = [26, 0xD1, 0x58, 0x02, 0x00, 0x00, 0x04, 27, 0xF7, 2, 30, 0xFA, 29, 0xEE];
+        let chain = enemy(&set, &leap);
+        assert!(chain.closes_in && chain.travel_from == 0 && chain.carries == 600, "{chain:?}");
+        // A character's script is read by the move alone: it travels from the clip after the move, whatever its clips carry
+        // (the table of the characters' blows is held to the owner's files), and no clip of its brings it home.
+        let chain = Chain::from_script(&script(&leap), &set, Role::Character).expect("a chain");
+        assert!(chain.closes_in && chain.travel_from == 1 && chain.home_run.is_none(), "{chain:?}");
+        let no_return = [27, 26, 0xF7, 2, 30, 28, 0xEE];
+        assert!(Chain::from_script(&script(&no_return), &set, Role::Character).expect("a chain").home_run.is_none());
+        // No move at all: it only gets as far as its clips carry it, and it starts with them.
+        let chain = enemy(&set, &[27, 26, 0xF7, 2, 30, 28, 0xEE]);
+        assert!(!chain.closes_in && chain.travel_from == 1 && chain.carries == 600, "{chain:?}");
+        // Nothing sends the actor back and the last clip travels back: that clip is the way home, from its frame 2 on.
+        assert_eq!((chain.strike.clone(), chain.back.clone(), chain.home_run), (vec![30, 28], vec![], Some(2)));
+        // A return op sends it back: no home run. A last clip that does not travel back is no way home either.
+        assert_eq!(enemy(&set, &[26, 0xF7, 2, 30, 28, 0xFA, 0xEE]).home_run, None);
+        assert_eq!(enemy(&set, &[26, 0xF7, 2, 28, 30, 0xEE]).home_run, None);
+        // A clip that travels a little (a drift) is no carrying.
+        set.travel[26] = -100.0;
+        let chain = enemy(&set, &[26, 0xF7, 2, 30, 0xEE]);
+        assert!(chain.carries == 100 && chain.travel_from == 0 && !chain.closes_in);
+        // A pack that does not know its travel (no numbers) never panics: nothing travels.
+        let bare = ClipSet { travel: Vec::new(), lead: Vec::new(), ..cloud_like_pack() };
+        let chain = enemy(&bare, &[26, 0xF7, 2, 28, 0xEE]);
+        assert!(chain.carries == 0 && chain.home_run.is_none());
     }
 
     #[test]
-    fn the_mps_chain_is_found_run_up_attacks_and_way_back() {
-        // Attack 272 (Machine Gun) plays slot 3, 273 (Tonfa) slot 4: scene.bin's words.
-        let kit = Kit::enemy(the_mp(), &[(272, 3), (273, 4)]);
-        assert_eq!(kit.hurt, Some(1));
-        assert_eq!((kit.run, kit.back), (Some(2), Some(5)), "the run-up carries it forward, the way back returns it");
-        assert_eq!((kit.attack_clip(272), kit.attack_clip(273), kit.attack_clip(999)), (Some(AttackClip::Slot(3)), Some(AttackClip::Slot(4)), None));
-        assert_eq!(kit.plain, Some(3), "a plain attack plays the first of its attacks");
-        assert_eq!((kit.death, kit.victory, kit.attack), (None, None, None), "an enemy has no death clip: it fades");
+    fn an_enemys_kit_is_read_from_its_scripts_hurt_death_and_the_chain_of_each_attack() {
+        let kit = Kit::enemy(enemy_like_pack(), &enemy_like_scripts(), &[(272, 3), (273, 4), (274, 5)]);
+        // Script 1 plays the hurt clip (1), script 2 the death clip (10).
+        assert_eq!((kit.hurt, kit.death), (Some(1), Some(10)));
+        assert!(kit.unplayable.is_empty() && kit.attacks.len() == 3);
+        // Attack 272 plays script 3: it runs up with clip 2, holds its poses (3, 4) and the long clip (5) that carries it home;
+        // nothing moves it to the target, so it only gets as far as the run-up carried it; it lands 7 ticks after the run-up
+        // ends: 4 ticks into the long clip. The long clip is the way home from its frame 9 on.
+        let gun = kit.enemy_chain(Some(272)).expect("a chain");
+        assert_eq!((gun.approach.as_slice(), gun.strike.as_slice(), gun.impact, gun.back.as_slice()), (&[2][..], &[3, 4, 5][..], 7, &[][..]));
+        assert!(!gun.closes_in && gun.travel_from == 0 && gun.carries == 900 && gun.home_run == Some(9), "{gun:?}");
+        // 273 plays script 4: a leap (6, it travels), the move to the target, a wind-up (7), the swing (8) that lands 3 ticks in,
+        // the return and the recovery (9).
+        let tonfa = kit.enemy_chain(Some(273)).expect("a chain");
+        assert_eq!((tonfa.approach.as_slice(), tonfa.strike.as_slice(), tonfa.impact, tonfa.back.as_slice()), (&[6, 7][..], &[8][..], 3, &[9][..]));
+        assert!(tonfa.closes_in && tonfa.travel_from == 0 && tonfa.home_run.is_none(), "the leap carries the actor, the move comes after it: {tonfa:?}");
+        // 274 plays script 5: the gathering (11, 12, 13) up to the effect, its end (14); it stays where it is.
+        let cast = kit.enemy_chain(Some(274)).expect("a chain");
+        assert_eq!((cast.approach.as_slice(), cast.strike.as_slice(), cast.impact), (&[11, 12, 13][..], &[14][..], 0));
+        assert!(!cast.closes_in && cast.carries == 0);
+        // A plain attack, or an attack the scene does not name for this enemy, plays its first attack's.
+        assert_eq!((kit.enemy_chain(None), kit.enemy_chain(Some(999))), (Some(gun), Some(gun)));
+        // No clip of an enemy's is a party member's: it has no blows, no guard and no slots of the party's table.
+        assert_eq!((kit.attack.as_ref(), kit.defend, kit.victory, kit.run, kit.back), (None, None, None, None, None));
     }
 
     #[test]
-    fn an_attack_that_points_past_the_pack_or_at_a_stand_in_is_left_out() {
-        let mut set = the_mp();
-        set.ok[4] = false;
-        let kit = Kit::enemy(set, &[(272, 3), (273, 4), (274, 40), (275, 255)]);
-        assert_eq!(kit.attacks, [(272, 3)], "slot 4 is not the slot's own clip, 40 and 255 are not in the pack");
-        // What the record names but cannot be played is kept apart: procedural, never another attack's clip.
-        assert_eq!(kit.unplayable, [273, 274, 275]);
-        assert_eq!((kit.attack_clip(273), kit.attack_clip(275), kit.attack_clip(272), kit.attack_clip(9999)), (Some(AttackClip::Procedural), Some(AttackClip::Procedural), Some(AttackClip::Slot(3)), None));
-    }
-
-    #[test]
-    fn no_travelling_clip_means_no_run_up_and_the_run_up_is_never_an_attack() {
-        // A hound that leaps in place: no slot travels, so it slides in its idle pose.
-        let kit = Kit::enemy(pack(8, 8), &[(274, 3), (275, 4)]);
-        assert_eq!((kit.run, kit.back), (None, None));
-        // The run-up must not be the idle or the hurt clip, and must not be an attack's own slot.
-        let mut set = pack(8, 8);
-        set.travel[0] = -900.0;
-        set.travel[1] = -900.0;
-        set.travel[3] = -900.0;
-        assert_eq!(find_run(&set, &[(1, 3)]), None);
-        set.travel[5] = -700.0;
-        assert_eq!(find_run(&set, &[(1, 3)]), Some(5));
-        // Short clips are held poses, not runs.
-        set.frames[5] = 2;
-        assert_eq!(find_run(&set, &[(1, 3)]), None);
-    }
-
-    #[test]
-    fn the_way_back_is_the_slot_after_the_run_up_that_covers_the_same_ground_the_other_way() {
-        let mut set = pack(9, 8);
-        set.travel[2] = -1000.0;
-        set.travel[4] = 600.0; // too short a way back
-        set.travel[6] = 1050.0;
-        set.travel[7] = 1000.0;
-        assert_eq!(find_back(&set, 2, &[]), Some(6));
-        assert_eq!(find_back(&set, 2, &[(1, 6)]), Some(7), "an attack's own slot is not a way back");
-        assert_eq!(find_back(&set, 6, &[]), None, "nothing after slot 6 returns what slot 6 covered (it covered none)");
+    fn an_attack_whose_script_cannot_be_played_is_procedural_and_never_borrows_anothers_clips() {
+        let scripts = enemy_like_scripts();
+        // 275 names script 6, which strikes with a stand-in clip; 276 names script 7, which marks nothing; 277 and 278 name
+        // scripts that are not there; 273 plays.
+        let kit = Kit::enemy(enemy_like_pack(), &scripts, &[(273, 4), (275, 6), (276, 7), (277, 40), (278, 255)]);
+        assert_eq!(kit.attacks.iter().map(|(id, _)| *id).collect::<Vec<_>>(), [273]);
+        assert_eq!(kit.unplayable, [275, 276, 277, 278]);
+        for bad in [275u16, 276, 277, 278] {
+            assert_eq!(kit.enemy_chain(Some(bad)), None, "attack {bad} is procedural: it does not play the tonfa's clips");
+        }
+        assert!(kit.enemy_chain(Some(273)).is_some());
+        // An enemy whose pack ends early loses what is past it.
+        let mut short = enemy_like_pack();
+        short.ok[8] = false;
+        let kit = Kit::enemy(short, &scripts, &[(273, 4)]);
+        assert_eq!(kit.unplayable, [273], "slot 8 is not the slot's own clip");
+        // A model without scripts (or a hurt script that plays a stand-in) is procedural throughout.
+        let bare = Kit::enemy(enemy_like_pack(), &[], &[(273, 4)]);
+        assert_eq!((bare.hurt, bare.death, bare.unplayable.clone(), bare.enemy_chain(None)), (None, None, vec![273], None));
+        let mut stand_in = enemy_like_scripts();
+        stand_in[1] = script(&[15, 0xE5, 0xEE]);
+        assert_eq!(Kit::enemy(enemy_like_pack(), &stand_in, &[]).hurt, None, "slot 15 is not the slot's own clip");
+        // The idle clip is not a hurt reaction: a script that begins with it plays the clip after.
+        stand_in[1] = script(&[0, 1, 0xEE]);
+        assert_eq!(Kit::enemy(enemy_like_pack(), &stand_in, &[]).hurt, Some(1));
     }
 }
