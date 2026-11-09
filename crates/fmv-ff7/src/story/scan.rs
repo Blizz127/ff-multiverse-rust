@@ -50,14 +50,48 @@ enum Part {
 
 /// The line a `LINE` entity watches and whether it starts enabled.
 #[derive(Debug, Clone, Copy)]
-struct LineOf {
-    a: Pos,
-    b: Pos,
-    enabled: Option<bool>,
+pub(crate) struct LineOf {
+    pub(crate) a: Pos,
+    pub(crate) b: Pos,
+    pub(crate) enabled: Option<bool>,
+}
+
+/// The init part of a script 0 (everything up to its first `RET`; all of it when it has none).
+pub(crate) fn init_part(code: &[Instruction]) -> &[Instruction] {
+    match code.iter().position(|i| i.opcode == OP_RET) {
+        Some(first_ret) => code.get(..first_ret).unwrap_or(&[]),
+        None => code,
+    }
+}
+
+/// The bytes an init part sets to a literal on every path (a `SETBYTE`, or both bytes of a `SETWORD`): the
+/// variables other scripts of the field compare things with (the triangle a loop waits for, the height a ladder
+/// tests), as bank/address to byte.
+pub(crate) fn init_bytes(init: &[Instruction]) -> BTreeMap<(u8, u8), u8> {
+    let mut bytes = BTreeMap::new();
+    for (k, ins) in init.iter().enumerate() {
+        if !matches!(ins.mnemonic, "SETBYTE" | "SETWORD") || !guards_of(init, k).is_empty() {
+            continue;
+        }
+        let (Some(var), Some(value)) = (ins.operand("var"), ins.operand("value")) else { continue };
+        if var.bank == 0 || value.bank != 0 {
+            continue;
+        }
+        let (bank, address) = var_of(var);
+        if ins.mnemonic == "SETBYTE" {
+            bytes.insert((bank, address), u8::try_from(value.value & 0xFF).unwrap_or(0));
+        } else if let Some(next) = address.checked_add(1) {
+            let [lo, hi] = i16::try_from(value.value).unwrap_or(0).to_le_bytes();
+            bytes.insert((bank, address), lo);
+            bytes.insert((bank, next), hi);
+        }
+    }
+    bytes
 }
 
 /// What the scan of one entity's parts needs to know about the field.
 struct Ctx<'a> {
+    script: &'a FieldScript<'a>,
     mesh: &'a Walkmesh,
     /// Variables that a `GETAI` fills with the triangle of a playable character's entity (and nothing else
     /// fills with one of another entity).
@@ -77,14 +111,17 @@ struct Write {
     /// trigger itself, the test of the triangle or of the OK button).
     chain: Vec<usize>,
     conds: Vec<Option<Cond>>,
+    /// A `BATTLE` the script starts right after the write (not run by the server).
     battle: Option<u16>,
+    /// A `BATTLE` the script starts before the write, in the block the write is in.
+    battle_first: Option<u16>,
 }
 
 /// The story points of a field: triangles first, then lines, then entry points, each in entity order.
 pub(super) fn scan_points(script: &FieldScript, mesh: &Walkmesh) -> Vec<PointDef> {
     let players: BTreeSet<usize> = script.player_entities().into_iter().map(|(entity, _)| entity).collect();
     let triangle_vars = player_triangle_vars(script, &players);
-    let (mut triangles, mut lines, mut enters) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut triangles, mut lines, mut enters, mut panels) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for entity in 0..script.entity_count() {
         let Ok(listing) = script.disassemble_partial(entity, INIT_SCRIPT) else { continue };
         let code = listing.instructions.as_slice();
@@ -92,7 +129,7 @@ pub(super) fn scan_points(script: &FieldScript, mesh: &Walkmesh) -> Vec<PointDef
             Some(first_ret) => (code.get(..first_ret).unwrap_or(&[]), code.get(first_ret + 1..).unwrap_or(&[])),
             None => (code, &[][..]),
         };
-        let ctx = Ctx { mesh, triangle_vars: &triangle_vars, constants: init_constants(init), line: line_of(init) };
+        let ctx = Ctx { script, mesh, triangle_vars: &triangle_vars, constants: init_constants(init), line: line_of(init) };
         let mut found = points_of(&events(init, Part::Init, &ctx));
         found.extend(points_of(&events(main, Part::Main, &ctx)));
         // A line entity's walk-on slots (not `[OK]`), when the line starts enabled; slots that share an entry
@@ -110,15 +147,30 @@ pub(super) fn scan_points(script: &FieldScript, mesh: &Walkmesh) -> Vec<PointDef
             }
         }
         for point in found {
+            // A panel that waits for OK also has the way back, which is not a step forward and which the text does not
+            // show: a sibling point that runs the panel's own script (appended after every other kind, so no id moves).
+            if let Trigger::Triangle { triangle, corners, wants_ok: true } = point.trigger {
+                let vars = triangle_vars.iter().copied().collect();
+                panels.push(PointDef {
+                    trigger: Trigger::Panel { entity, triangle, corners, vars },
+                    requires: Vec::new(),
+                    effects: Vec::new(),
+                    battle: None,
+                    battle_first: None,
+                });
+            }
             match point.trigger {
                 Trigger::Triangle { .. } => triangles.push(point),
                 Trigger::Line { .. } => lines.push(point),
                 Trigger::Enter => enters.push(point),
+                // (talk points are added by `AreaStory::add_talk_points`, panels above: not found by the scan)
+                Trigger::Talk { .. } | Trigger::Panel { .. } => {}
             }
         }
     }
     triangles.extend(lines);
     triangles.extend(enters);
+    triangles.extend(panels);
     triangles
 }
 
@@ -168,7 +220,7 @@ fn init_constants(init: &[Instruction]) -> BTreeMap<(u8, u8), i32> {
 
 /// The line of a line entity: the first `LINE` of its init part with literal operands, and whether the last
 /// unconditional `LINON` of the init part switches it on (`None`: the init part never says).
-fn line_of(init: &[Instruction]) -> Option<LineOf> {
+pub(crate) fn line_of(init: &[Instruction]) -> Option<LineOf> {
     let line = init.iter().find(|i| i.opcode == OP_LINE)?;
     let coordinate = |name: &str| line.literal(name).and_then(|v| i16::try_from(v).ok()).map(f32::from);
     let a = Pos::new(coordinate("x1")?, coordinate("y1")?, coordinate("z1")?);
@@ -242,6 +294,7 @@ fn write_at(code: &[Instruction], k: usize, part: Part, ctx: &Ctx) -> Option<Wri
         Trigger::Triangle { .. } => false,
         Trigger::Line { .. } => asks,
         Trigger::Enter => asks || loops,
+        Trigger::Talk { .. } | Trigger::Panel { .. } => false,
     };
     if by_itself {
         return None;
@@ -255,7 +308,86 @@ fn write_at(code: &[Instruction], k: usize, part: Part, ctx: &Ctx) -> Option<Wri
         .find(|i| i.mnemonic == "BATTLE")
         .and_then(|i| i.literal("battle"))
         .and_then(|b| u16::try_from(b).ok());
-    Some(Write { k, op, trigger, chain, conds, battle })
+    let battle_first = battle_first(code, k, &guards, ctx);
+    Some(Write { k, op, trigger, chain, conds, battle, battle_first })
+}
+
+/// How deep a request chain is followed for a battle or a write (a script requests a script requests a script ...).
+const REQUEST_DEPTH: u8 = 4;
+
+/// The scripts a request instruction (`REQ`, `REQSW`, `REQEW`) names with literal operands, as `(entity, slot)`.
+fn requested(ins: &Instruction) -> Option<(usize, usize)> {
+    if !matches!(ins.opcode, 0x01..=0x03) {
+        return None;
+    }
+    Some((usize::try_from(ins.literal("entity")?).ok()?, usize::try_from(ins.literal("script")?).ok()?))
+}
+
+/// What `wanted` finds first in script `slot` of `entity` or in a script it requests (to `depth`). A script already
+/// looked at is not looked at again.
+fn find_in_requests<T>(
+    script: &FieldScript,
+    (entity, slot): (usize, usize),
+    depth: u8,
+    seen: &mut BTreeSet<usize>,
+    wanted: &dyn Fn(&Instruction) -> Option<T>,
+) -> Option<T> {
+    let span = script.span(entity, slot)?;
+    if depth == 0 || !seen.insert(span.start) {
+        return None;
+    }
+    let listing = script.disassemble_partial(entity, slot).ok()?;
+    for ins in &listing.instructions {
+        if let Some(found) = wanted(ins) {
+            return Some(found);
+        }
+        if let Some(target) = requested(ins) {
+            if let Some(found) = find_in_requests(script, target, depth.saturating_sub(1), seen, wanted) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// The literal battle a `BATTLE` instruction starts.
+fn battle_of(ins: &Instruction) -> Option<u16> {
+    if ins.mnemonic != "BATTLE" {
+        return None;
+    }
+    u16::try_from(ins.literal("battle")?).ok()
+}
+
+/// A `BATTLE` the script starts before the write at `code[k]`, in the block the write is in, directly or in a script that
+/// block requests: the fight whose win the story step comes after (the guard scorpion: a director's loop asks the
+/// characters' scripts to run the cutscene, which fights, and the moment is set when they return). Only what runs on
+/// every path to the write counts: an instruction under a condition the write is not under may not run.
+fn battle_first(code: &[Instruction], k: usize, guards: &[&Instruction], ctx: &Ctx) -> Option<u16> {
+    // The block starts after the innermost jump that skips the write.
+    let from = guards.iter().map(|g| g.end()).max().unwrap_or(0);
+    let mut seen = BTreeSet::new();
+    for (j, ins) in code.iter().enumerate().take(k).filter(|(_, i)| i.offset >= from) {
+        if !guards_of(code, j).iter().all(|g| guards.iter().any(|w| w.offset == g.offset)) {
+            continue;
+        }
+        if let Some(battle) = battle_of(ins) {
+            return Some(battle);
+        }
+        if let Some(target) = requested(ins) {
+            if let Some(battle) = find_in_requests(ctx.script, target, REQUEST_DEPTH, &mut seen, &battle_of) {
+                return Some(battle);
+            }
+        }
+    }
+    None
+}
+
+/// Whether the talk script of character `entity` (slot 1), or a script it requests, writes the story: the moment, or a
+/// bit of a tracked variable. Such a character gets a talk point (what the talk does is then run, not read: see
+/// [`super::Trigger::Talk`]).
+pub(super) fn talk_can_write_the_story(script: &FieldScript, entity: usize) -> bool {
+    let writes = |ins: &Instruction| write_op(ins).map(|_| ());
+    find_in_requests(script, (entity, crate::script::TALK_SCRIPT), REQUEST_DEPTH, &mut BTreeSet::new(), &writes).is_some()
 }
 
 /// What the instruction writes that the model carries: the moment (a literal into `Var[2][0]`), or a tracked bit.
@@ -346,7 +478,7 @@ fn points_of(writes: &[Write]) -> Vec<PointDef> {
         members.sort_by_key(|w| w.k);
         let requires: Vec<Cond> = base.conds.iter().flatten().copied().collect();
         let mut effects = Vec::new();
-        let mut battle = None;
+        let (mut battle, mut battle_first) = (None, None);
         for member in members {
             let extra: Vec<Cond> = member.conds.get(base.conds.len()..).unwrap_or(&[]).iter().flatten().copied().collect();
             // A write nothing conditions would set the story on every visit: a script that does not state when
@@ -355,11 +487,12 @@ fn points_of(writes: &[Write]) -> Vec<PointDef> {
                 continue;
             }
             battle = battle.or(member.battle);
+            battle_first = battle_first.or(member.battle_first);
             effects.push(Effect { requires: extra, op: member.op });
         }
         // A point that could only clear bits moves nothing forward.
         if effects.iter().any(|e| matches!(e.op, Op::Moment(_) | Op::Bit { on: true, .. })) {
-            points.push(PointDef { trigger: base.trigger.clone(), requires, effects, battle });
+            points.push(PointDef { trigger: base.trigger.clone(), requires, effects, battle, battle_first });
         }
     }
     points

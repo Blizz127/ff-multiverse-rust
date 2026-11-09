@@ -481,9 +481,9 @@ fn the_ride() -> Vec<u8> {
 fn the_ride_is_one_point_whose_writes_are_judged_together_on_the_story_as_it_was() {
     let sec = field_with_player(|s| s.entity("ele", vec![(0, the_ride())]));
     let story = scan(&sec, &mesh(9));
-    assert_eq!(story.point_count(), 1, "the bit and the moment are one ride");
+    assert_eq!(story.point_count(), 2, "the bit and the moment are one ride; the other point is the ride back (the panel run)");
     let point = story.points().remove(0);
-    let StoryTrigger::Region(corners) = &point.trigger else { panic!("{point:?}") };
+    let StoryTrigger::Press(corners) = &point.trigger else { panic!("a panel that waits for OK is a press, not a region: {point:?}") };
     assert_eq!(corners.len(), 3);
     assert_eq!(
         point.label,
@@ -503,6 +503,56 @@ fn the_ride_is_one_point_whose_writes_are_judged_together_on_the_story_as_it_was
     let step = story.advance(&at(20), 0).expect("the bit");
     assert_eq!(StoryState::decode(&step.progress), Some(lifted(20)));
     assert_eq!(step.summary, "var1.225=0->1");
+}
+
+/// The panel with both of its rides, as the real one has them: pressing OK on the triangle with the lift up rides down (the
+/// bit on, the moment to 12 the first time), with the lift down it asks another entity's script (the director's, which
+/// clears the bit) to ride up.
+fn the_panel_with_both_rides() -> Vec<u8> {
+    let down = concat(&[biton(1, 225, 0), when_moment(3, 12, &setword(2, 0, 12))]);
+    let up = reqew(3, 3);
+    let pressed = concat(&[ifub_lit(1, 225, 0, 10, skip(down.len() + 2)), down, vec![0x10, skip(up.len())], up]);
+    entity_script(&[], &looping(&when_on_triangle(8, &when_ok_pressed(&pressed))))
+}
+
+#[test]
+fn the_ride_back_up_is_the_panels_own_script_run_and_a_press_is_one_ride() {
+    // entities: the director (0) and the hero (1) of `field_with_player`, the panel (2) and the one whose script 3 lifts
+    let sec = field_with_player(|s| s.entity("ele", vec![(0, the_panel_with_both_rides())]).entity("lift", vec![(3, concat(&[bitoff(1, 225, 0), ret()]))]));
+    let script = FieldScript::parse(&sec).unwrap();
+    let story = AreaStory::scan(&script, &mesh(9));
+    let points = story.points();
+    assert_eq!(points.len(), 2, "the ride down and the ride back: {points:?}");
+    for p in &points {
+        assert!(matches!(&p.trigger, StoryTrigger::Press(c) if c.len() == 3), "both are presses of the same triangle: {p:?}");
+    }
+    assert!(points[0].label.starts_with("triangle 8 (OK): Var[1][225] bit 0 clear -> "), "{}", points[0].label);
+    assert!(points[1].label.starts_with("triangle 8 (OK): the panel's own script runs"), "{}", points[1].label);
+
+    // with the lift UP a press rides down (point 0) and the second point has nothing to do
+    for blob in [Vec::new(), at(5), at(11), at(12), at(40)] {
+        assert!(story.advance_with(&script, &blob, 0).is_some(), "{blob:?}: the ride down");
+        assert_eq!(story.advance_with(&script, &blob, 1), None, "{blob:?}: the ride back is not there with the lift up");
+    }
+    // with the lift DOWN the ride down has nothing to do and a press rides back up: the bit off, the moment left alone
+    for moment in [1u16, 12, 13, 40] {
+        let down = lifted(moment).encode();
+        assert_eq!(story.advance_with(&script, &down, 0), None, "moment {moment}");
+        let step = story.advance_with(&script, &down, 1).expect("the ride back");
+        assert_eq!(step.summary, "var1.225=1->0", "moment {moment}");
+        assert_eq!(step.progress, at(moment), "the story's moment stays, and a state without variables is a version 1 blob");
+    }
+    // and a ride down, a ride up and a ride down again are three presses, none of which flaps
+    let mut blob: Vec<u8> = at(11);
+    for (point, want) in [(0, "moment=11->12 var1.225=0->1"), (1, "var1.225=1->0"), (0, "var1.225=0->1")] {
+        let step = story.advance_with(&script, &blob, point).unwrap_or_else(|| panic!("point {point} at {blob:?}"));
+        assert_eq!(step.summary, want);
+        blob = step.progress;
+    }
+    // the way back is not offered by a story the model cannot read
+    assert_eq!(story.advance_with(&script, &[7, 7], 1), None);
+    // without the field's script (the plain `advance`) there is no ride back to run
+    assert_eq!(story.advance(&lifted(12).encode(), 1), None);
 }
 
 #[test]
@@ -701,6 +751,142 @@ fn a_battle_the_script_starts_is_named_in_the_label_and_not_run() {
     let story = scan(&field_with_player(|s| s.entity("panel", vec![(0, panel)])), &mesh(5));
     let label = story.points().remove(0).label;
     assert!(label.starts_with("triangle 3: moment ==1 -> 6 (the script then starts battle 300"), "{label}");
+}
+
+/// `REQEW entity script`.
+fn reqew(entity: u8, slot: u8) -> Vec<u8> {
+    vec![0x03, entity, slot]
+}
+
+/// `BATTLE n`.
+fn battle(n: u16) -> Vec<u8> {
+    let b = n.to_le_bytes();
+    vec![0x70, 0, b[0], b[1]]
+}
+
+#[test]
+fn a_fight_the_block_runs_before_its_write_is_the_points_battle_and_one_it_may_not_run_is_not() {
+    // The scorpion's shape: the director's loop asks `cut` (entity 2) to run its script 3, which asks `ba` (entity 3) to
+    // run its script 4, which fights; the loop sets the moment when they return.
+    let director = |block: Vec<u8>| entity_script(&[], &looping(&when_on_triangle(2, &when_moment(3, 27, &block))));
+    let cast = |block: Vec<u8>, cut3: Vec<u8>, ba4: Vec<u8>| {
+        field_with_player(|s| s.entity("dir", vec![(0, director(block))]).entity("cut", vec![(3, concat(&[cut3, ret()]))]).entity("ba", vec![(4, concat(&[ba4, ret()]))]))
+    };
+    let write = setword(2, 0, 27);
+    let nested = scan(&cast(concat(&[reqew(3, 3), write.clone()]), reqew(4, 4), battle(324)), &mesh(5));
+    assert_eq!(nested.point_count(), 1);
+    assert_eq!(nested.battle_of(0), Some(324), "two requests deep");
+    let label = nested.points().remove(0).label;
+    assert!(label.contains("starts battle 324 first, the step is paid when it is won"), "{label}");
+    // inline in the block, before the write
+    let inline = scan(&cast(concat(&[battle(7), write.clone()]), Vec::new(), Vec::new()), &mesh(5));
+    assert_eq!(inline.battle_of(0), Some(7));
+    // after the write it is the old kind (named in the label, not run)
+    let after = scan(&cast(concat(&[write.clone(), battle(7)]), Vec::new(), Vec::new()), &mesh(5));
+    assert_eq!(after.battle_of(0), None);
+    assert!(after.points().remove(0).label.contains("the script then starts battle 7, which the server does not run"));
+    // under a condition the write is not under, it may not run: not the point's
+    let conditional = concat(&[when_moment(0, 99, &battle(7)), write.clone()]);
+    assert_eq!(scan(&cast(conditional, Vec::new(), Vec::new()), &mesh(5)).battle_of(0), None);
+    // and no battle at all is none
+    assert_eq!(scan(&cast(write, Vec::new(), Vec::new()), &mesh(5)).battle_of(0), None);
+    assert_eq!(nested.battle_of(9), None, "a point that is not there");
+}
+
+/// The main part of a character that does nothing by itself: `JMPB 0`, the idle loop the data ends such scripts with.
+fn idle() -> Vec<u8> {
+    vec![0x12, 0]
+}
+
+/// `XYZI x y z triangle` with literal operands.
+fn xyzi(x: i16, y: i16, z: i16, triangle: u16) -> Vec<u8> {
+    let mut v = vec![0xA5, 0, 0];
+    for c in [x, y, z] {
+        v.extend_from_slice(&c.to_le_bytes());
+    }
+    v.extend_from_slice(&triangle.to_le_bytes());
+    v
+}
+
+/// A field with a player, a woman whose talk (at a moment below 14) sets the moment to 14, a bystander who only talks,
+/// and a chest that is talkable until the moment is 15 and whose talk asks the player's entity (script 3) to set it.
+fn field_with_talks() -> (Vec<u8>, Vec<NpcSpawn>) {
+    let woman = concat(&[vec![0xA1, 1], xyzi(30, 40, 0, 0), ret(), idle()]);
+    let woman_talk = concat(&[when_moment(3, 14, &setword(2, 0, 14)), ret()]);
+    let bystander = concat(&[vec![0xA1, 2], xyzi(60, 40, 0, 0), ret(), idle()]);
+    let chest = concat(&[vec![0xA1, 3], xyzi(90, 40, 0, 0), when_moment(4, 15, &[0x7E, 1]), ret(), idle()]);
+    let chest_talk = concat(&[reqew(0, 3), ret()]);
+    let section = field_with_player(|s| {
+        s.entity("woman", vec![(0, woman), (1, woman_talk)])
+            .entity("bystander", vec![(0, bystander), (1, vec![0x00])])
+            .entity("chest", vec![(0, chest), (1, chest_talk)])
+    });
+    // (the chest asks entity 0, the director, for a script 3 it does not have)
+    let spawn = |name: &str, x: f32| NpcSpawn {
+        entity_name: name.to_string(),
+        appearance: fmv_adapter_api::NpcAppearance { model: "m".into(), idle_animation: None, label: name.into() },
+        pos: Pos::new(x, 40.0, 0.0),
+        facing: 0.0,
+        unconditional: true,
+    };
+    (section, vec![spawn("woman", 30.0), spawn("bystander", 60.0), spawn("chest", 90.0)])
+}
+
+#[test]
+fn a_character_whose_talk_can_move_the_story_gets_a_talk_point_and_its_step_is_what_the_talk_writes() {
+    let (section, npcs) = field_with_talks();
+    let script = FieldScript::parse(&section).unwrap();
+    let mut story = AreaStory::scan(&script, &mesh(5));
+    assert_eq!(story.point_count(), 0);
+    story.add_talk_points(&script, &npcs);
+    // the woman writes the moment herself; the bystander writes nothing; the chest's talk only asks another script (and
+    // the director has no script 3, so nothing there writes: no point)
+    let points = story.points();
+    assert_eq!(points.len(), 1, "{points:?}");
+    let StoryTrigger::Talk { center, radius } = points[0].trigger else { panic!("{:?}", points[0]) };
+    assert_eq!((center.x, center.y), (30.0, 40.0));
+    assert_eq!(radius, 80.0, "the default radius at scale 512");
+    assert!(points[0].label.starts_with("talk to entity "), "{}", points[0].label);
+    // the step: below 14 the talk sets it, at 14 and after it nothing moves, and without the field's script there is no step
+    assert_eq!(story.advance_with(&script, &at(13), 0).unwrap().summary, "moment=13->14");
+    assert_eq!(story.advance_with(&script, &at(1), 0).unwrap().progress, at(14));
+    assert_eq!(story.advance_with(&script, &at(14), 0), None);
+    assert_eq!(story.advance_with(&script, &at(30), 0), None);
+    assert_eq!(story.advance(&at(13), 0), None, "a talk point is judged by its talk, which needs the script");
+    assert_eq!(story.advance_with(&script, &[7, 7], 0), None, "an unreadable blob is never advanced");
+    assert_eq!(story.battle_of(0), None);
+    // adding them again adds nothing
+    story.add_talk_points(&script, &npcs);
+    assert_eq!(story.point_count(), 1);
+}
+
+#[test]
+fn a_talk_that_asks_another_script_to_write_the_story_is_judged_with_that_script_and_the_characters_own_set_up() {
+    // as above, but the player entity has the script 3 the chest asks for (it sets the moment to 15), and the chest
+    // switches its own talk off from moment 15 on
+    let chest = concat(&[vec![0xA1, 3], xyzi(90, 40, 0, 0), when_moment(4, 15, &[0x7E, 1]), ret(), idle()]);
+    let chest_talk = concat(&[reqew(1, 3), ret()]);
+    let hero = concat(&[vec![0xA1, 0x00], vec![0xA0, 0], ret()]);
+    let director = concat(&[ret(), looping(&getai(1, 6, 0))]);
+    let section = SynthScript { model_count: 1, scale: 512, ..Default::default() }
+        .entity("dir", vec![(0, director)])
+        .entity("hero", vec![(0, hero), (3, concat(&[setword(2, 0, 15), ret()]))])
+        .entity("chest", vec![(0, chest), (1, chest_talk)])
+        .build();
+    let npc = NpcSpawn {
+        entity_name: "chest".into(),
+        appearance: fmv_adapter_api::NpcAppearance { model: "m".into(), idle_animation: None, label: "chest".into() },
+        pos: Pos::new(90.0, 40.0, 0.0),
+        facing: 0.0,
+        unconditional: true,
+    };
+    let script = FieldScript::parse(&section).unwrap();
+    let mut story = AreaStory::scan(&script, &mesh(5));
+    story.add_talk_points(&script, &[npc]);
+    assert_eq!(story.point_count(), 1);
+    assert_eq!(story.advance_with(&script, &at(14), 0).unwrap().summary, "moment=14->15");
+    assert_eq!(story.advance_with(&script, &at(15), 0), None, "the chest switched its talk off by itself: it is gone");
+    assert_eq!(story.advance_with(&script, &at(20), 0), None);
 }
 
 #[test]

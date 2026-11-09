@@ -39,7 +39,7 @@
 //! second phase (the cast is decided by the phase).
 
 use fmv_adapter_api::{
-    AdapterError, AreaInfo, AreaKey, AreaRuntime, Bounds, Exit, ExitKind, ExitState, GameAdapter, MoveResult, NpcAppearance, NpcSpawn,
+    AdapterError, AreaInfo, AreaKey, AreaRuntime, Bounds, Exit, ExitKind, ExitState, GameAdapter, Link, MoveResult, NpcAppearance, NpcSpawn,
     StoryPoint, StoryStep, StoryTrigger, StoryWithheld,
 };
 use fmv_core::{AreaId, EditionProvenance, Fingerprint, GameId, PhaseKey, Platform, Pos, SourceRef};
@@ -69,6 +69,39 @@ pub const GATE_WALL_X: f32 = -300.0;
 /// With [`RoomsAdapter::with_gates`], y of the hall's story line (it runs from x = -100 to 100): walking across it
 /// takes a new account to [`STORY_ADVANCED`], like the story region.
 pub const STORY_LINE_Y: f32 = 200.0;
+
+/// With [`RoomsAdapter::with_interactions`], x of the hall's walk-on link A (a line from y = -50 to 50; it fires when
+/// a player walks up to it) and where it leads: 20 units from the line of link B, so a player put there has B disarmed.
+pub const LINK_A_X: f32 = -150.0;
+pub const LINK_A_TO: (f32, f32) = (150.0, 0.0);
+/// With [`RoomsAdapter::with_interactions`], x of the hall's walk-on link B (a line from y = -50 to 50) and where it
+/// leads: 20 units from the line of link A.
+pub const LINK_B_X: f32 = 130.0;
+pub const LINK_B_TO: (f32, f32) = (-170.0, 0.0);
+/// With [`RoomsAdapter::with_interactions`], y of the hall's OK link C (a line from x = -100 to 100: a player
+/// that touches it and presses OK is put at [`LINK_C_TO`]).
+pub const LINK_C_Y: f32 = 100.0;
+pub const LINK_C_TO: (f32, f32) = (0.0, -150.0);
+/// With [`RoomsAdapter::with_interactions`], the corners of the hall's press region: OK pressed inside it takes a new
+/// account to [`STORY_ADVANCED`] (point 1; walking through it does nothing).
+pub const PRESS_REGION: [(f32, f32); 4] = [(150.0, 100.0), (250.0, 100.0), (250.0, 160.0), (150.0, 160.0)];
+/// With [`RoomsAdapter::with_interactions`], the corners of the hall's toggle region (point 4): OK pressed inside it takes an
+/// account that has advanced back to a new account's story, a step that is NOT forward (the lift's ride back), and does
+/// nothing for a new account.
+pub const TOGGLE_REGION: [(f32, f32); 4] = [(150.0, 170.0), (250.0, 170.0), (250.0, 230.0), (150.0, 230.0)];
+/// With [`RoomsAdapter::with_interactions`], the corners of the hall's battle region (point 2): coming to it starts
+/// the battle [`BATTLE_FORMATION`], and a WON battle takes a new account to [`STORY_ADVANCED`].
+pub const BATTLE_REGION: [(f32, f32); 4] = [(-300.0, 200.0), (-250.0, 200.0), (-250.0, 250.0), (-300.0, 250.0)];
+/// With [`RoomsAdapter::with_interactions`], the formation the battle region starts.
+pub const BATTLE_FORMATION: u16 = 0;
+/// With [`RoomsAdapter::with_interactions`], the corners of the hall's other battle region (point 3), which starts
+/// [`LOSING_FORMATION`]: an enemy the synthetic rules make too strong to beat, so that a test can lose the fight.
+pub const LOSING_REGION: [(f32, f32); 4] = [(250.0, -250.0), (300.0, -250.0), (300.0, -200.0), (250.0, -200.0)];
+/// With [`RoomsAdapter::with_interactions`], the formation of the battle region the party cannot win.
+pub const LOSING_FORMATION: u16 = 2;
+/// With [`RoomsAdapter::with_interactions`], how far from the yard's guard (at [`YARD_NPC_POS`]) a player has to be to
+/// talk to it: pressing OK next to it takes a new account to [`STORY_ADVANCED`] (point 0 of the yard).
+pub const TALK_RADIUS: f32 = 80.0;
 
 /// The label of the yard's entry point (the point of a scripted yard that fires on entry).
 const YARD_ENTRY_LABEL: &str = "yard entry: progress 0 -> 1";
@@ -139,6 +172,7 @@ pub struct RoomsAdapter {
     story: bool,
     gates: bool,
     unreviewed_yard: bool,
+    interactive: bool,
 }
 
 impl RoomsAdapter {
@@ -159,6 +193,15 @@ impl RoomsAdapter {
     /// Give the hall the exits its "scripts" decide (see the module docs), with the synthetic story.
     pub fn with_gates() -> Self {
         Self { story: true, gates: true, ..Self::default() }
+    }
+
+    /// The synthetic story (as [`RoomsAdapter::with_story`]) with the things that wait for the OK button and the
+    /// lines that move a player inside an area: the hall has two walk-on links ([`LINK_A_X`], [`LINK_B_X`]), one that
+    /// needs OK ([`LINK_C_Y`]), a press region ([`PRESS_REGION`]) and a battle region ([`BATTLE_REGION`]); the yard's
+    /// guard can be talked to ([`TALK_RADIUS`]). Every one of the story points takes a new account to
+    /// [`STORY_ADVANCED`].
+    pub fn with_interactions() -> Self {
+        Self { story: true, interactive: true, ..Self::default() }
     }
 
     /// As [`RoomsAdapter::with_gates`], but the yard is a room the adapter has not reviewed: its entry point is not
@@ -195,6 +238,7 @@ impl GameAdapter for RoomsAdapter {
                 gates: self.gates && key == HALL,
                 scripted: self.gates,
                 withheld: self.unreviewed_yard && key == YARD,
+                interactive: self.interactive,
             })),
             GHOST if self.ghost => Err(AdapterError::Decode("the ghost area cannot be loaded (by design)".into())),
             other => Err(AdapterError::AreaNotFound(other.to_string())),
@@ -226,6 +270,8 @@ struct Room {
     scripted: bool,
     /// The adapter was built with [`RoomsAdapter::with_an_unreviewed_yard`] and this is the yard: its story is left off.
     withheld: bool,
+    /// The adapter was built with [`RoomsAdapter::with_interactions`].
+    interactive: bool,
 }
 
 impl Room {
@@ -339,6 +385,13 @@ impl AreaRuntime for Room {
             return Vec::new();
         }
         if self.is_yard() {
+            if self.interactive {
+                return vec![StoryPoint {
+                    id: 0,
+                    trigger: StoryTrigger::Talk { center: Pos::new(YARD_NPC_POS.0, YARD_NPC_POS.1, 0.0), radius: TALK_RADIUS },
+                    label: "yard guard talk: progress 0 -> 1".into(),
+                }];
+            }
             // coming to stand in the yard moves a new account's story, when the rooms are scripted
             return if self.scripted && !self.withheld {
                 vec![StoryPoint { id: 0, trigger: StoryTrigger::Enter, label: YARD_ENTRY_LABEL.into() }]
@@ -358,11 +411,59 @@ impl AreaRuntime for Room {
                 label: "hall story line: progress 0 -> 1".into(),
             });
         }
+        if self.interactive {
+            let corners = |c: [(f32, f32); 4]| c.iter().map(|&(x, y)| Pos::new(x, y, 0.0)).collect::<Vec<_>>();
+            points.push(StoryPoint { id: 1, trigger: StoryTrigger::Press(corners(PRESS_REGION)), label: "hall press region: progress 0 -> 1".into() });
+            points.push(StoryPoint { id: 4, trigger: StoryTrigger::Press(corners(TOGGLE_REGION)), label: "hall toggle region: progress 1 -> 0".into() });
+            points.push(StoryPoint { id: 2, trigger: StoryTrigger::Region(corners(BATTLE_REGION)), label: "hall battle region: progress 0 -> 1".into() });
+            points.push(StoryPoint { id: 3, trigger: StoryTrigger::Region(corners(LOSING_REGION)), label: "hall losing battle region: progress 0 -> 1".into() });
+        }
         points
     }
 
+    /// The hall's ladders and jumps, with the synthetic interactions: A and B are walk-on links that lead to each other's
+    /// side of the hall (each puts a player 20 units from the other's line), C waits for OK.
+    fn links(&self) -> Vec<Link> {
+        if !self.interactive || self.is_yard() {
+            return Vec::new();
+        }
+        let link = |line: ((f32, f32), (f32, f32)), to: (f32, f32), needs_ok: bool, label: &str| Link {
+            line: (Pos::new(line.0 .0, line.0 .1, 0.0), Pos::new(line.1 .0, line.1 .1, 0.0)),
+            to: Pos::new(to.0, to.1, 0.0),
+            to_hint: None,
+            needs_ok,
+            label: label.into(),
+        };
+        vec![
+            link(((LINK_A_X, -50.0), (LINK_A_X, 50.0)), LINK_A_TO, false, "jump"),
+            link(((LINK_B_X, -50.0), (LINK_B_X, 50.0)), LINK_B_TO, false, "jump"),
+            link(((-100.0, LINK_C_Y), (100.0, LINK_C_Y)), LINK_C_TO, true, "ladder"),
+        ]
+    }
+
+    /// The battle the hall's battle region starts first (the step waits for the win).
+    fn story_battle(&self, point: u32) -> Option<u16> {
+        if !self.interactive || self.is_yard() {
+            return None;
+        }
+        match point {
+            2 => Some(BATTLE_FORMATION),
+            3 => Some(LOSING_FORMATION),
+            _ => None,
+        }
+    }
+
     fn story_advance(&self, progress: &[u8], point: u32) -> Option<StoryStep> {
-        let exists = self.story && if self.is_yard() { self.scripted && !self.withheld && point == 0 } else { point == 0 || (self.scripted && point == 1) };
+        // The toggle region: a step that is not forward, from the advanced story back to a new account's.
+        if self.interactive && !self.is_yard() && point == 4 {
+            return (progress == STORY_ADVANCED).then(|| StoryStep { progress: Vec::new(), summary: "moment=1->0".into() });
+        }
+        let exists = self.story
+            && if self.is_yard() {
+                (self.scripted && !self.withheld && point == 0) || (self.interactive && point == 0)
+            } else {
+                point == 0 || (self.scripted && point == 1) || (self.interactive && point <= 3)
+            };
         (exists && progress.is_empty()).then(|| StoryStep { progress: STORY_ADVANCED.to_vec(), summary: "moment=0->1".into() })
     }
 
@@ -371,6 +472,7 @@ impl AreaRuntime for Room {
         self.withheld.then(|| StoryWithheld {
             reason: "unreviewed field".into(),
             exits: vec!["to hall when a key is pressed".into()],
+            links: Vec::new(),
             points: vec![YARD_ENTRY_LABEL.into()],
         })
     }
