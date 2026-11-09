@@ -244,6 +244,65 @@ fn voice_clips_are_found_per_line_of_the_reactor_fields() {
     assert!(lines > 0 && voiced > 0);
 }
 
+/// Is the clip of a question's line named by the line's ABSOLUTE number (what `first..=last` of the `ASK` counts, which the cursor reaches) or by
+/// its number from the first choice? Scans every `ASK` with literal operands in all of Echo-S's scripts and counts the files each reading finds.
+#[test]
+#[ignore = "needs the owner's Echo-S archive (FMV_ECHO_S_IRO)"]
+fn option_clips_are_named_by_the_absolute_line_of_the_question() {
+    let (Some(m), Some(path)) = (mods(), path_of("FMV_ECHO_S_IRO")) else { return };
+    let archive = IroArchive::open_path(&path).expect("Echo-S");
+    let fields: Vec<String> = archive
+        .entries()
+        .iter()
+        .filter(|e| e.folder().eq_ignore_ascii_case("Echo-S\\flevel.lgp") && !e.file_name().contains('.'))
+        .map(|e| e.file_name().to_ascii_lowercase())
+        .collect();
+    let (mut asks, mut asks_from_zero) = (0usize, 0usize);
+    // For a question whose first choice is line 0 the two numberings are the same; for the others they differ.
+    let (mut zero_lines, mut zero_hits) = (0usize, 0usize);
+    let (mut lines, mut absolute, mut relative, mut both, mut neither) = (0usize, 0usize, 0usize, 0usize, 0usize);
+    for field in &fields {
+        let Some(section) = m.script_section(field) else { continue };
+        let script = FieldScript::parse(&section).expect("script");
+        for entity in 0..script.entity_count() {
+            for slot in 0..fmv_ff7::script::SCRIPTS_PER_ENTITY {
+                let Ok(d) = script.disassemble_partial(entity, slot) else { continue };
+                for ins in d.instructions.iter().filter(|i| i.opcode == 0x48) {
+                    let (Some(dialog), Some(first), Some(last)) = (ins.literal("dialog"), ins.literal("first"), ins.literal("last")) else { continue };
+                    let (Ok(dialog), Ok(first), Ok(last)) = (usize::try_from(dialog), usize::try_from(first), usize::try_from(last)) else { continue };
+                    asks += 1;
+                    asks_from_zero += usize::from(first == 0);
+                    for k in first..=last.max(first) {
+                        let (abs, rel) = (m.option_voice(field, dialog, k).is_some(), m.option_voice(field, dialog, k - first).is_some());
+                        if first == 0 {
+                            zero_lines += 1;
+                            zero_hits += usize::from(abs);
+                            continue;
+                        }
+                        lines += 1;
+                        match (abs, rel) {
+                            (true, true) => both += 1,
+                            (true, false) => absolute += 1,
+                            (false, true) => relative += 1,
+                            (false, false) => neither += 1,
+                        }
+                    }
+                }
+            }
+        }
+    }
+    println!(
+        "{asks} questions in {} fields ({asks_from_zero} start at line 0: {zero_lines} lines, {zero_hits} with a clip); \
+         for the {lines} lines of the others: a clip by the absolute number only {absolute}, by the number from the first choice only {relative}, either {both}, none {neither}",
+        fields.len()
+    );
+    assert!(asks > 0);
+    // Measured on 1.24: nearly every question starts its choices at line 0 (where the two numberings are one), three quarters of those lines have
+    // a clip, and no line of the others has one under either numbering: nothing contradicts FFNx's reading (the absolute line).
+    assert!(asks_from_zero * 10 >= asks * 9 && zero_hits * 2 > zero_lines);
+    assert_eq!((absolute, relative), (0, 0), "a clip named by one numbering only would say the other is the real one");
+}
+
 #[test]
 #[ignore = "needs the owner's mod archives and audio data (FMV_ECHO_S_IRO, FMV_COSMO_IRO, FMV_FF7_AUDIO_DATA)"]
 fn music_and_sound_layers_cover_these_names_and_ids() {

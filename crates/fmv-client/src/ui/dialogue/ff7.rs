@@ -37,6 +37,7 @@ use fmv_ff7::script::dialogue::{characters, find_character, Beat, Character, Mes
 use fmv_ff7::script::FieldScript;
 use fmv_ff7::story::StoryState;
 use fmv_ff7::Ff7Adapter;
+use fmv_mods::echo::short_voice_name;
 use fmv_mods::Mods;
 use std::sync::Arc;
 
@@ -141,11 +142,13 @@ impl Ff7Conversations {
 }
 
 /// A talk session whose windows send their voice cues: one [`VoiceCue::Say`] for each window that opens and a [`VoiceCue::Stop`]
-/// when it is dropped.
+/// when it is dropped. Each window also says, in one line of ids (never of words), which clip the voice layer has for it:
+/// `mods: window md1stin#12 w0 voice md1stin/12a` (or `voice none`), so that a run without ears (a headless one) shows it.
 struct Voiced {
     inner: TalkSession,
     field: String,
     sink: Arc<dyn ModSink>,
+    mods: Arc<Mods>,
 }
 
 impl MessageSource for Voiced {
@@ -155,6 +158,8 @@ impl MessageSource for Voiced {
             // A window of nothing but codes is skipped by the dialogue window: no voice for what is never shown.
             if let (MessageOrigin::Canon { dialog, .. }, false) = (&m.origin, is_blank(m)) {
                 self.sink.cue(VoiceCue::Say { field: self.field.clone(), window: m.window, dialog: *dialog, page: 0 });
+                let heard = self.mods.voice_path(&self.field, m.window, *dialog, 0).map_or_else(|| "none".to_string(), |path| short_voice_name(&path));
+                self.sink.note(&format!("mods: window {}#{dialog} w{} voice {heard}", self.field, m.window));
             }
         }
         beat
@@ -179,16 +184,15 @@ impl Conversations for Ff7Conversations {
         let (section, character) = self.character(area, npc)?;
         self.started = self.started.wrapping_add(1);
         let seed = self.started;
-        let layers = self.mods.as_ref().map(|m| m.layers());
         // Echo-S's section first, for a character it has (by name and place) and can talk at this point of the story.
         let echo = self.area.as_ref().and_then(|l| l.echo.as_ref());
         let echo_entity = echo.and_then(|e| find_character(&e.characters, &npc.name, npc.pos.x, npc.pos.y).map(|c| (Arc::clone(&e.bytes), c.entity)));
         if let Some((bytes, entity)) = echo_entity {
             if let Ok(session) = TalkSession::talk(bytes.as_ref().clone(), entity, (self.story)(), seed) {
                 self.note(format!("mods: talk {area} {}: echo-s section", npc.name));
-                if layers.is_some_and(|l| l.voice) {
+                if let Some(mods) = self.mods.as_ref().filter(|m| m.layers().voice) {
                     self.voiced = true;
-                    return Some(Box::new(Voiced { inner: session, field: area.to_string(), sink: Arc::clone(&self.sink) }));
+                    return Some(Box::new(Voiced { inner: session, field: area.to_string(), sink: Arc::clone(&self.sink), mods: Arc::clone(mods) }));
                 }
                 return Some(Box::new(session));
             }
@@ -308,6 +312,32 @@ mod tests {
         let (windows, _) = texts(c.start("md1stin", &npc("npc")).unwrap());
         // Echo-S's flow: three windows, its own words, not the original's two.
         assert_eq!(windows, ["A mod line", "Another mod line", "A third mod line"]);
+        assert_eq!(sink.notes().first().map(String::as_str), Some("mods: talk md1stin npc: echo-s section"));
+    }
+
+    #[test]
+    fn each_window_says_which_voice_it_looked_up_by_ids_only() {
+        let mut s = spec();
+        s.voices.push("VO\\Voice\\md1stin\\0a.ogg");
+        s.voices.push("VO\\Voice\\md1stin\\2.ogg");
+        let (_t, mods) = mods_with(&s, Layers::ALL);
+        let sink = Arc::new(Collect::default());
+        let mut c = Ff7Conversations::with_parts(originals(), Some(mods), sink.clone());
+        texts(c.start("md1stin", &npc("npc")).unwrap());
+        assert_eq!(
+            sink.notes(),
+            [
+                "mods: talk md1stin npc: echo-s section",
+                "mods: window md1stin#0 w0 voice md1stin/0a",
+                "mods: window md1stin#1 w0 voice none",
+                "mods: window md1stin#2 w0 voice md1stin/2",
+            ]
+        );
+        // With the voice layer off no window says anything (no cues, no lookups).
+        let (_t, mods) = mods_with(&s, Layers { voice: false, ..Layers::ALL });
+        let sink = Arc::new(Collect::default());
+        let mut c = Ff7Conversations::with_parts(originals(), Some(mods), sink.clone());
+        texts(c.start("md1stin", &npc("npc")).unwrap());
         assert_eq!(sink.notes(), ["mods: talk md1stin npc: echo-s section"]);
     }
 

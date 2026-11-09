@@ -59,6 +59,7 @@ use crate::mods::VoiceCue;
 use crate::session::Session;
 use fmv_audio::{AudioConfig, AudioEngine, DecodedMusic, Logger, Mode, PlayOptions, SfxClip, SfxHandle, TrackId};
 use fmv_core::GameId;
+use fmv_mods::echo::short_voice_name;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
@@ -97,13 +98,6 @@ struct VoiceState {
     /// Voices that started, and asks that found no clip.
     played: u32,
     silent: u32,
-}
-
-/// `VO\Voice\md1stin\12a.ogg` as the log says it: `md1stin/12a`.
-fn short_voice_name(path: &str) -> String {
-    let rest = path.get(..9).filter(|p| p.eq_ignore_ascii_case("VO\\Voice\\")).and_then(|_| path.get(9..)).unwrap_or(path);
-    let stem = rest.rsplit_once('.').map_or(rest, |(stem, _)| stem);
-    stem.replace('\\', "/")
 }
 
 /// Which battle sounds are played (`FMV_BATTLE_SOUNDS`).
@@ -268,6 +262,9 @@ struct Live {
     links_for: Option<String>,
     /// The voice layer (see [`VoiceState`]).
     voice: VoiceState,
+    /// Whether this soundtrack takes the conversations' voice cues from the process's queue ([`crate::mods::take_voices`]): the one
+    /// [`GameAudio::start`] makes does, the ones the tests assemble do not (the queue is the process's, and tests run side by side).
+    takes_global_voices: bool,
 }
 
 impl Live {
@@ -513,7 +510,12 @@ impl GameAudio {
         if let Some(note) = note {
             log(&note);
         }
-        Self::with_parts(engine, Box::new(ThreadWorker::start(tasks)), log).with_battle_sounds(battle_sounds).with_field_sounds(field_sounds)
+        let mut audio = Self::with_parts(engine, Box::new(ThreadWorker::start(tasks)), log).with_battle_sounds(battle_sounds).with_field_sounds(field_sounds);
+        // The soundtrack of the running game is the one that hears the conversations.
+        if let Some(live) = audio.live.as_mut() {
+            live.takes_global_voices = true;
+        }
+        audio
     }
 
     /// The sound over an engine and a worker the caller made (tests use a manual engine and a fake worker).
@@ -548,6 +550,7 @@ impl GameAudio {
                 field: field::FieldState::new(FieldSounds::default()),
                 links_for: None,
                 voice: VoiceState::default(),
+                takes_global_voices: false,
             })),
         }
     }
@@ -588,9 +591,11 @@ impl GameAudio {
     /// Follow the game: the area the client is in (`None` outside FF7 fields, which have no music) and
     /// its battle counters. Cheap, never blocks; call it every frame, whatever is on screen.
     pub fn update(&mut self, area: Option<&str>, battle: BattleCounts) {
-        // What the conversations asked of the voice layer since the last frame (a run without sound drops them).
-        for cue in crate::mods::take_voices() {
-            self.voice(cue);
+        // What the conversations asked of the voice layer since the last frame.
+        if self.live.as_ref().is_some_and(|l| l.takes_global_voices) {
+            for cue in crate::mods::take_voices() {
+                self.voice(cue);
+            }
         }
         let Some(live) = self.live.as_mut() else { return };
         live.pump_worker();
@@ -2188,10 +2193,4 @@ mod tests {
         assert!(!off.is_on());
     }
 
-    #[test]
-    fn voice_names_are_short_in_the_log() {
-        assert_eq!(short_voice_name("VO\\Voice\\md1stin\\12a.ogg"), "md1stin/12a");
-        assert_eq!(short_voice_name("vo\\voice\\nmkin_5\\w1_3.OGG"), "nmkin_5/w1_3");
-        assert_eq!(short_voice_name("elsewhere\\x.ogg"), "elsewhere/x");
-    }
 }

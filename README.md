@@ -1335,21 +1335,27 @@ the file) and every entry of both is *stored*, so there is no decompressor in th
   sound sets), `V_Attacks`/`NV_Attacks` 170/171, `Ambience\Ambient` 119 and the `FA`, `BA`, `FA+BA` ambience configs, `FMV\movies` 70
   (movie sound effects), previews.
 
-**Text.** Echo-S's script is not the original with new strings: its field entries are different scripts. Measured on the Steam edition
-against 1.24: the dialog strings drop from 56 048 to 13 819 (the original tables are mostly unused leftovers, 114 strings in each of the first
-reactor fields against the 5 to 21 Echo-S keeps), 59% of the dialog numbers that scripts open are renumbered, 17.5% of the 328 675 scripts
-differ in what the dialogue walker can see, and Echo-S inserts about 16 000 `MESSAGE` windows (one per recorded line) and removes about 6 000.
-So a per-line replacement table would show wrong lines, and the unit is the field's whole script section: a character that Echo-S's section also
-has (found by the same name-and-place rule as the original's) talks from Echo-S's section (text, flow, dialog numbers, voice names), any other
-character and every character with the layer off talks from the original's. 2 302 of the 2 412 characters of the original are found in Echo-S's script;
-84 of its 360 512 scripts do not decode (the original's all do). How far you must stand to talk is gameplay and stays the original's.
-`mods::script_source()` is the interface for the scene player (the section of Echo-S's replacement for a field, or none).
+**Text.** Echo-S's script is not the original with new strings: its field entries are different scripts. Measured on the Steam edition against 1.24
+(the examples `echo_script_compare` and `echo_talk_compare` of `fmv-mods` print it again for your copy): the dialog strings drop from 56 048 to 13 819
+(the original tables are mostly leftovers nothing opens, 114 strings in each of the first reactor fields against the 5 to 21 Echo-S keeps) while the
+lines the scripts open stay about as many (12 526 distinct window-and-dialog pairs, 12 613 in Echo-S's); 17.5% of the 328 675 scripts of the entities both
+have differ in what the dialogue walker can see; of the 12 475 dialog numbers the original's scripts open, 8 326 sit in a script that is the same in
+Echo-S's and 4 934 of those (59%) are another number there; and at the start of a new game 1 421 characters can be talked to in both, 101 of them with
+another number of windows (1 350 windows against 1 480). So a per-line replacement table would show wrong lines, and the unit is the field's whole script
+section: a character that Echo-S's section also has (found by the same name-and-place rule as the original's) talks from Echo-S's section (text, flow,
+dialog numbers, voice names), any other character and every character with the layer off talks from the original's. 2 302 of the 2 412 characters of
+the original are found in Echo-S's script; 84 of its 360 512 scripts do not decode (the original's 337 059 all do). How far you must stand to talk is
+gameplay and stays the original's; the server still judges the story from the original's scripts, so a conversation can show Echo-S's flow where the
+original's would have said something else, and no protocol carries either. `mods::script_source()` is the interface for the scene player (the section of
+Echo-S's replacement for a field, or none).
 
 **Voice.** FFNx plays a voice from the `MESSAGE`/`ASK` that opens a window, by the script's own window and dialog numbers:
 `<field>/w<window>_<dialog><page letter>`, then `<field>/<dialog><letter>`, then on the first page the plain `w<window>_<dialog>` and `<dialog>`
 (2 077 of the 10 909 voiced dialog numbers exist *only* as lettered clips); `<dialog>_<line>` is the clip of a question's line
 ([FFNx `src/voice.cpp`](https://github.com/julianxhokaxhiu/FFNx/blob/4fc392ba5e1bfdd53d39aa6542464379a446083a/src/voice.cpp) at commit
-`4fc392ba5e1bfdd53d39aa6542464379a446083a`). The client plays the first page's clip when a window opens, the clip of each later page of the game's
+`4fc392ba5e1bfdd53d39aa6542464379a446083a`). FFNx counts a question's line absolutely, as the cursor does; in 1.24 it never matters which way one counts: 5 256
+of Echo-S's 5 680 questions start their choices at line 0 (10 498 of their 13 969 lines have a clip) and the other 424 have no option clip at all. The client
+plays the first page's clip when a window opens, the clip of each later page of the game's
 message when the player reaches it (the window's own cuts of a long page are not the game's pages), and the clip of a question's line as the
 pointer reaches it; each replaces the one before, and the last stops when the conversation ends. A voice is a loop with a silent tail that the
 engine's handle can stop (its one-shots cannot be stopped one by one), freed when its clip is over. A voice rides on the Echo-S text (its files are

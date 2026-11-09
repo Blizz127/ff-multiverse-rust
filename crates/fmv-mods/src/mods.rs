@@ -28,16 +28,22 @@
 //!
 //! # Why the text layer swaps the script section, not a line table
 //!
-//! Measured on the owner's FF7 Steam Edition against Echo-S 1.24's `Echo-S\flevel.lgp` (counts only): Echo-S has an entry
-//! for all 702 fields, and its script section is a **different script**, not the original with new strings:
+//! Measured on the owner's FF7 Steam Edition against Echo-S 1.24's `Echo-S\flevel.lgp` (counts only; the examples
+//! `echo_script_compare` and `echo_talk_compare` of this crate print them again for any copy): Echo-S has an entry for all 702
+//! fields, and its script section is a **different script**, not the original with new strings:
 //!
-//! * 55 729 of the 56 048 dialog strings differ, and the dialog **numbering** differs: two thirds of the `MESSAGE`/`ASK`
-//!   operands in scripts that are otherwise identical name another number, and the dialog counts differ in 541 fields (by
-//!   up to 256);
-//! * 82.5% of the 328 675 scripts of the matched entities are identical in what the dialogue walker interprets, 17.5% are
-//!   not; in the message-bearing scripts that differ Echo-S inserts about 16 000 `MESSAGE` ops (a window per recorded
-//!   voice line) and removes about 6 000, and the number of messages differs in 8 431 of them;
-//! * 543 fields gain one entity, a few more or fewer; the original entities' names are a prefix of Echo-S's in 635 fields.
+//! * the dialog strings go from 56 048 to 13 819 (the original tables are mostly leftovers that nothing opens: 114 strings in each
+//!   of the first reactor fields against the 5 to 21 Echo-S keeps), while the lines the scripts do open are about as many
+//!   (12 526 distinct window-and-dialog pairs in the original's, 12 613 in Echo-S's);
+//! * 271 161 of the 328 675 scripts of the entities both have (82.5%) are the same to the dialogue walker, the rest are not;
+//! * the dialog **numbers** change: of the 12 475 numbers the original's scripts open, 8 326 sit in a script that is the same in
+//!   Echo-S's and 4 934 of those (59%) are another number there (the tables were compacted); the other 4 149 sit in scripts
+//!   that differ;
+//! * the conversations differ: at the start of a new game 1 421 characters can be talked to in both, 1 320 of them with the same
+//!   number of windows and 101 with another (1 350 windows in the original, 1 480 in Echo-S's);
+//! * Echo-S's section has 10 272 of the original's 10 534 entities by name (usually one more, appended), 2 302 of the 2 412
+//!   characters of the original are found in it by the client's name-and-place rule, and 84 of its 360 512 scripts do not
+//!   decode (the original's 337 059 all do).
 //!
 //! So `(field, original dialog number) -> text` cannot be built, and the voice files are named by Echo-S's *own* numbers.
 //! The unit that is coherent is the section: text, flow and voice names all belong to Echo-S's section, which is also what

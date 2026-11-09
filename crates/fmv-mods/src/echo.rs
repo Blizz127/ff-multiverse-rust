@@ -94,6 +94,13 @@ pub fn flevel_path(field: &str) -> String {
     format!("{FLEVEL_DIR}{}", field.to_ascii_lowercase())
 }
 
+/// A voice clip's archive path as a log says it: `VO\Voice\md1stin\12a.ogg` is `md1stin/12a` (an id of a clip, never its words).
+pub fn short_voice_name(path: &str) -> String {
+    let rest = path.get(..VOICE_DIR.len()).filter(|p| p.eq_ignore_ascii_case(VOICE_DIR)).and_then(|_| path.get(VOICE_DIR.len()..)).unwrap_or(path);
+    let stem = rest.rsplit_once('.').map_or(rest, |(stem, _)| stem);
+    stem.replace('\\', "/")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,6 +124,14 @@ mod tests {
         assert_eq!(page_letter(26), 'z');
         assert_eq!(page_letter(usize::MAX), 'z');
         assert_eq!(voice_names(0, 1, 100), ["w0_1z", "1z"]);
+    }
+
+    #[test]
+    fn voice_names_are_short_in_a_log() {
+        assert_eq!(short_voice_name("VO\\Voice\\md1stin\\12a.ogg"), "md1stin/12a");
+        assert_eq!(short_voice_name("vo\\voice\\nmkin_5\\w1_3.OGG"), "nmkin_5/w1_3");
+        assert_eq!(short_voice_name("elsewhere\\x.ogg"), "elsewhere/x");
+        assert_eq!(short_voice_name(""), "");
     }
 
     #[test]
