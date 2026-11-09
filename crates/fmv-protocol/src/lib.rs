@@ -1567,9 +1567,9 @@ mod tests {
                 protocol_version: PROTOCOL_VERSION,
                 client_build: "c/1".into(),
                 auth: Auth::Register { display_name: "Wedge".into() },
-                character: NewCharacter { tint: [200, 10, 10], body: Some("slim".into()), slot: Some(8) },
+                character: NewCharacter { tint: [200, 10, 10], body: Some("slight".into()), slot: Some(8) },
             },
-            r#"{"Hello":{"protocol_version":8,"client_build":"c/1","auth":{"Register":{"display_name":"Wedge"}},"character":{"tint":[200,10,10],"body":"slim","slot":8}}}"#,
+            r#"{"Hello":{"protocol_version":8,"client_build":"c/1","auth":{"Register":{"display_name":"Wedge"}},"character":{"tint":[200,10,10],"body":"slight","slot":8}}}"#,
         );
         golden(
             ClientMsg::Hello {
@@ -1607,12 +1607,12 @@ mod tests {
                     pos: Pos::new(1.0, 2.0, 3.0),
                     facing: 0.5,
                     anim: AnimState::Idle,
-                    avatar: fmv_core::AvatarAppearance::new("Wedge", [200, 10, 10], Some("ff7/body/slim".into())),
+                    avatar: fmv_core::AvatarAppearance::new("Wedge", [200, 10, 10], Some("ff7/body/slight".into())),
                 },
             },
             concat!(
                 r#"{"PlayerJoined":{"snapshot":{"id":12,"pos":{"x":1.0,"y":2.0,"z":3.0},"facing":0.5,"anim":"Idle","#,
-                r#""avatar":{"display_name":"Wedge","tint":[200,10,10],"appearance_ref":"ff7/body/slim"}}}}"#
+                r#""avatar":{"display_name":"Wedge","tint":[200,10,10],"appearance_ref":"ff7/body/slight"}}}}"#
             ),
         );
         // What a message cannot do without is refused, not guessed: the colour of a request; the name, the colour

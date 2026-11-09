@@ -46,7 +46,7 @@ fn plain_ff7(store: &Store, name: &str) -> Result<Login, LoginError> {
 }
 
 fn with_token(store: &Store, token: &str) -> Result<Login, LoginError> {
-    login(store, GameId::Ff7, Auth::Token(Secret::new(token)), request([9, 9, 9], Some("slim"), Some(7)), NOW + 5)
+    login(store, GameId::Ff7, Auth::Token(Secret::new(token)), request([9, 9, 9], Some("slight"), Some(7)), NOW + 5)
 }
 
 fn character_file(dir: &tempfile::TempDir, account: AccountId) -> std::path::PathBuf {
@@ -62,17 +62,17 @@ fn progress_file(dir: &tempfile::TempDir, account: AccountId) -> std::path::Path
 #[test]
 fn registering_creates_the_account_avatar_and_character_and_issues_the_token_once() {
     let (_dir, store) = store();
-    let reg = register_ff7(&store, "  Cloud\n", [10, 20, 30], Some("slim"), Some(2)).unwrap();
+    let reg = register_ff7(&store, "  Cloud\n", [10, 20, 30], Some("slight"), Some(2)).unwrap();
     assert_eq!(reg.avatar.display_name, "Cloud", "the name is cleaned like everywhere else");
     assert_eq!(reg.avatar.tint, [10, 20, 30]);
-    assert_eq!(reg.avatar.appearance_ref.as_deref(), Some("ff7/body/slim"), "the look is the binding: a generic body");
+    assert_eq!(reg.avatar.appearance_ref.as_deref(), Some("ff7/body/slight"), "the look is the binding: a generic body");
     assert_eq!(reg.phase, PhaseKey::default());
     let token = reg.issued_token.clone().expect("a registration issues a token");
     assert!(!token.is_empty());
     // What the player is told about its own character.
     let card = &reg.card;
-    assert_eq!((card.name.as_str(), card.tint, card.body.as_deref()), ("Cloud", [10, 20, 30], Some("slim")));
-    assert_eq!((card.binding.as_deref(), card.slot, card.migrated), (Some("ff7/body/slim"), Some(2), false));
+    assert_eq!((card.name.as_str(), card.tint, card.body.as_deref()), ("Cloud", [10, 20, 30], Some("slight")));
+    assert_eq!((card.binding.as_deref(), card.slot, card.migrated), (Some("ff7/body/slight"), Some(2), false));
     assert_eq!(reg.progress, ProgressSeed::of(2, None), "it fights as the slot it chose");
 
     // The token logs the same account in again, and issues nothing the second time.
@@ -101,7 +101,7 @@ fn after_registration_the_client_cannot_choose_its_character() {
 #[test]
 fn the_binding_and_the_slot_are_per_game() {
     let (_dir, store) = store();
-    let reg = register_ff7(&store, "Aerith", [4, 5, 6], Some("slim"), Some(3)).unwrap();
+    let reg = register_ff7(&store, "Aerith", [4, 5, 6], Some("slight"), Some(3)).unwrap();
     let token = reg.issued_token.unwrap();
     // The same account hosted by a different game has no entry there: no look, no slot, and (a game
     // that has no combat slots) the default character for its progress. Entering it adds the game's
@@ -112,7 +112,7 @@ fn the_binding_and_the_slot_are_per_game() {
     assert_eq!((other.card.slot, other.card.binding), (None, None));
     assert_eq!(other.progress.character, progress::DEFAULT_CHARACTER);
     let back = with_token(&store, &token).unwrap();
-    assert_eq!((back.card.slot, back.card.binding.as_deref()), (Some(3), Some("ff7/body/slim")));
+    assert_eq!((back.card.slot, back.card.binding.as_deref()), (Some(3), Some("ff7/body/slight")));
     let record = store.get_player_character(reg.account).unwrap().unwrap();
     assert_eq!(record.games.len(), 2);
 }
@@ -273,7 +273,7 @@ fn cloud_is_refused_to_a_new_character_and_a_refusal_creates_nothing() {
 #[test]
 fn a_game_without_combat_slots_keeps_no_slot_and_ignores_what_the_client_asked() {
     let (_dir, store) = store();
-    let fixture = register_for(GameId::Fixture, &store, "Fixy", request([0; 3], Some("slim"), Some(0))).unwrap();
+    let fixture = register_for(GameId::Fixture, &store, "Fixy", request([0; 3], Some("slight"), Some(0))).unwrap();
     assert_eq!((fixture.card.slot, fixture.card.binding.clone(), fixture.card.body.clone()), (None, None, None));
     assert_eq!(fixture.progress, ProgressSeed::default());
     assert_eq!(fixture.avatar.appearance_ref, None);
@@ -292,7 +292,7 @@ fn an_unusable_body_never_burns_a_name() {
     assert_eq!(emoji.chars().count(), 64);
     let (_dir, store) = store();
     let default = fmv_ff7::playable::body_or_default(None);
-    for body in [emoji.as_str(), "", "nobody", "../../etc/passwd", &"x".repeat(10_000), "\u{1b}[31mslim"] {
+    for body in [emoji.as_str(), "", "nobody", "../../etc/passwd", &"x".repeat(10_000), "\u{1b}[31mslight"] {
         let name = format!("V{}", store.account_count());
         let reg = register_ff7(&store, &name, [0; 3], Some(body), None).unwrap_or_else(|e| panic!("{body:?}: {e:?}"));
         assert_eq!(reg.card.body.as_deref(), Some(default.archetype), "{body:?}");
@@ -311,10 +311,10 @@ fn an_unusable_body_never_burns_a_name() {
 
 #[test]
 fn validation_cleans_the_name_and_checks_the_choices_without_touching_the_store() {
-    let reg = validate_registration(GameId::Ff7, "  Cloud\n", &request([4, 5, 6], Some("SLIM"), Some(4))).unwrap();
+    let reg = validate_registration(GameId::Ff7, "  Cloud\n", &request([4, 5, 6], Some("SLIGHT"), Some(4))).unwrap();
     assert_eq!((reg.name(), reg.tint()), ("Cloud", [4, 5, 6]));
-    assert_eq!((reg.creation().body.as_str(), reg.creation().entry.slot), ("slim", Some(4)));
-    assert_eq!(reg.creation().entry.binding.as_deref(), Some("ff7/body/slim"));
+    assert_eq!((reg.creation().body.as_str(), reg.creation().entry.slot), ("slight", Some(4)));
+    assert_eq!(reg.creation().entry.binding.as_deref(), Some("ff7/body/slight"));
     assert_eq!(validate_registration(GameId::Ff7, " ", &request([0; 3], None, None)).unwrap_err().code(), RejectCode::InvalidName);
     assert_eq!(validate_registration(GameId::Ff7, "Ok", &request([0; 3], None, Some(0))).unwrap_err().code(), RejectCode::BadRequest);
 }
@@ -354,7 +354,7 @@ fn a_full_store_refuses_registrations_but_not_logins() {
 #[test]
 fn an_undelivered_registration_is_released_with_its_character_and_its_name_is_free_again() {
     let (dir, store) = store();
-    let ghost = register_ff7(&store, "Ghost", [0; 3], Some("slim"), Some(2)).unwrap();
+    let ghost = register_ff7(&store, "Ghost", [0; 3], Some("slight"), Some(2)).unwrap();
     let token = ghost.issued_token.clone().unwrap();
     assert!(character_file(&dir, ghost.account).is_file());
     assert_eq!(release_unclaimed(&store, ghost.account), Release::Released);
@@ -474,11 +474,11 @@ fn store_failures_are_internal_and_their_text_stays_local() {
 #[test]
 fn stored_junk_never_reaches_other_players() {
     let (dir, store) = store();
-    let reg = register_ff7(&store, "Legacy", [1, 2, 3], Some("slim"), Some(3)).unwrap();
+    let reg = register_ff7(&store, "Legacy", [1, 2, 3], Some("slight"), Some(3)).unwrap();
     let token = reg.issued_token.unwrap();
     // A hand-edited record: a path where a binding belongs.
     let file = character_file(&dir, reg.account);
-    let text = std::fs::read_to_string(&file).unwrap().replace("ff7/body/slim", "../../etc/passwd");
+    let text = std::fs::read_to_string(&file).unwrap().replace("ff7/body/slight", "../../etc/passwd");
     std::fs::write(&file, text).unwrap();
     let again = with_token(&store, &token).unwrap();
     assert_eq!(again.avatar.appearance_ref, None);

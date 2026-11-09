@@ -169,12 +169,12 @@ mod tests {
     #[test]
     fn a_new_ff7_character_takes_a_slot_from_one_to_eight_and_a_body_from_the_table() {
         for slot in 1..=FF7_LAST_SLOT {
-            let creation = plan_creation(GameId::Ff7, &request(Some("slim"), Some(slot))).unwrap();
+            let creation = plan_creation(GameId::Ff7, &request(Some("slight"), Some(slot))).unwrap();
             assert_eq!(creation.entry.slot, Some(slot));
             assert_eq!(creation.entry.character_ref(), Some(&fmv_persist::ProgressRef::Character { game: GameId::Ff7, character: slot }));
             assert!(creation.entry.has_story_ref());
-            assert_eq!(creation.body, "slim");
-            assert_eq!(creation.entry.binding.as_deref(), Some("ff7/body/slim"));
+            assert_eq!(creation.body, "slight");
+            assert_eq!(creation.entry.binding.as_deref(), Some("ff7/body/slight"));
             // The mirror lets a rolled-back v7 fight it as its slot (Cait Sith, 6, has no look).
             assert_eq!(creation.v7_look.map(|look| progress::character_for_look(GameId::Ff7, Some(look))), (slot != 6).then_some(slot));
         }
@@ -201,15 +201,15 @@ mod tests {
             assert_eq!(creation.entry.binding.as_deref(), Some(default.model.appearance_ref));
         }
         // Spelling does not matter to the table.
-        let slim = fmv_ff7::playable::body_or_default(Some("slim"));
-        assert_eq!(plan_creation(GameId::Ff7, &request(Some(" SLIM "), Some(2))).unwrap().body, slim.archetype);
+        let slight = fmv_ff7::playable::body_or_default(Some("slight"));
+        assert_eq!(plan_creation(GameId::Ff7, &request(Some(" SLIGHT "), Some(2))).unwrap().body, slight.archetype);
     }
 
     #[test]
     fn the_binding_is_independent_of_the_slot() {
         // The same body with every slot: the same look, whoever it fights as.
         let looks: Vec<_> = (1..=FF7_LAST_SLOT)
-            .map(|slot| plan_creation(GameId::Ff7, &request(Some("slim"), Some(slot))).unwrap().entry.binding)
+            .map(|slot| plan_creation(GameId::Ff7, &request(Some("slight"), Some(slot))).unwrap().entry.binding)
             .collect();
         assert!(looks.windows(2).all(|w| w[0] == w[1]), "{looks:?}");
         // And no slot's binding is a canon character's model: nobody is drawn as the canon character it fights as.
@@ -224,7 +224,7 @@ mod tests {
 
     #[test]
     fn a_game_without_slots_keeps_no_choice_and_ignores_what_the_client_sent() {
-        let creation = plan_creation(GameId::Fixture, &request(Some("slim"), Some(0))).unwrap();
+        let creation = plan_creation(GameId::Fixture, &request(Some("slight"), Some(0))).unwrap();
         assert_eq!(creation.body, "");
         assert_eq!((creation.entry.binding, creation.entry.slot, creation.v7_look), (None, None, None));
         assert_eq!(creation.entry.progress, vec![fmv_persist::ProgressRef::Story { game: GameId::Fixture }]);
@@ -264,7 +264,7 @@ mod tests {
     #[test]
     fn an_account_without_a_usable_look_is_cloud_and_bound_to_the_default_body() {
         let default_body = fmv_ff7::playable::body_or_default(None).model.appearance_ref;
-        for look in [None, Some("nobody"), Some("../../etc/passwd"), Some("ff7/body/slim"), Some("")] {
+        for look in [None, Some("nobody"), Some("../../etc/passwd"), Some("ff7/body/slight"), Some("")] {
             let entry = migrated(look);
             assert_eq!(entry.slot, Some(0), "{look:?}: what v7 fought it as, and slot 0 is allowed here");
             assert_eq!(entry.binding.as_deref(), Some(default_body), "{look:?}: it never chose Cloud, so it is not drawn as Cloud");
@@ -282,16 +282,16 @@ mod tests {
         let mut record = PlayerCharacter {
             schema_version: 1,
             account_id: fmv_core::AccountId(1),
-            identity: fmv_persist::Identity { name: "Wedge".into(), tint: [1, 2, 3], body: "slim".into() },
-            games: BTreeMap::from([("Ff7".to_owned(), plan_creation(GameId::Ff7, &request(Some("slim"), Some(3))).unwrap().entry)]),
+            identity: fmv_persist::Identity { name: "Wedge".into(), tint: [1, 2, 3], body: "slight".into() },
+            games: BTreeMap::from([("Ff7".to_owned(), plan_creation(GameId::Ff7, &request(Some("slight"), Some(3))).unwrap().entry)]),
             origin: CharacterOrigin::Created,
             created_at: 0,
             updated_at: 0,
         };
         let shown_look = shown(GameId::Ff7, &record);
-        assert_eq!((shown_look.display_name.as_str(), shown_look.tint, shown_look.appearance_ref.as_deref()), ("Wedge", [1, 2, 3], Some("ff7/body/slim")));
+        assert_eq!((shown_look.display_name.as_str(), shown_look.tint, shown_look.appearance_ref.as_deref()), ("Wedge", [1, 2, 3], Some("ff7/body/slight")));
         let card_now = card(GameId::Ff7, &record);
-        assert_eq!((card_now.body.as_deref(), card_now.binding.as_deref(), card_now.slot, card_now.migrated), (Some("slim"), Some("ff7/body/slim"), Some(3), false));
+        assert_eq!((card_now.body.as_deref(), card_now.binding.as_deref(), card_now.slot, card_now.migrated), (Some("slight"), Some("ff7/body/slight"), Some(3), false));
         // A binding the game does not know (a hand edit) is shown as none, in the card as in the snapshot.
         record.games.get_mut("Ff7").unwrap().binding = Some("../../etc/passwd".into());
         assert_eq!(shown(GameId::Ff7, &record).appearance_ref, None);

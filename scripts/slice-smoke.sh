@@ -89,14 +89,14 @@ NAME_B="Brom"
 TINT_A=e8743c
 TINT_B=3c9be8
 BODY_A="${FMV_SMOKE_BODY_A:-sturdy}"
-BODY_B="${FMV_SMOKE_BODY_B:-slim}"
+BODY_B="${FMV_SMOKE_BODY_B:-slight}"
 SLOT_A=1
 SLOT_B=2
 SLOT_NAME_A=Barret
 SLOT_NAME_B=Tifa
 # What session 2 asks for instead (ignored by a token login, which is the point).
 OTHER_TINT=101010
-OTHER_BODY=tall
+OTHER_BODY=lean
 OTHER_SLOT=cid
 
 usage() {
