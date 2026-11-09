@@ -83,7 +83,22 @@ fn choose(device: &cpal::Device) -> Result<cpal::SupportedStreamConfig, DeviceEr
         .ok_or_else(|| DeviceError::Unsupported(format!("sample format {:?}", default.sample_format())))
 }
 
+/// Keep libasound's own complaints off the terminal. By default it writes them to stderr itself, and
+/// on a machine without a sound card it prints eight lines (`cannot find card '0'`, `Unknown PCM
+/// default`, ...) before cpal reports that there is no device, which would bury the engine's one note
+/// about going silent. The handler is per thread: it covers the thread that opens the device (the
+/// calls that fail without a card all run there) and goes away with it. What it catches is dropped:
+/// the note says what went wrong, and a real device that fails says so through cpal's own error.
+#[cfg(target_os = "linux")]
+fn quiet_alsa() {
+    let _ = alsa::Output::local_error_handler();
+}
+
+#[cfg(not(target_os = "linux"))]
+fn quiet_alsa() {}
+
 fn open_default(link: &DeviceLink, timeout: Duration) -> Result<OpenedDevice, DeviceError> {
+    quiet_alsa();
     let host = cpal::default_host();
     let device = host.default_output_device().ok_or(DeviceError::NoDevice)?;
     let supported = choose(&device)?;

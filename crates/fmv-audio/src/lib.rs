@@ -90,6 +90,7 @@ pub mod device;
 mod engine;
 mod host;
 mod mixer;
+mod music;
 mod source;
 mod status;
 mod types;
@@ -98,5 +99,6 @@ pub use config::{resolve_mode, stderr_logger, AudioConfig, Logger, Mode, ENV_VAR
 pub use convert::{fill_device, write_frames, DeviceSample};
 pub use engine::{AudioEngine, DeviceError, DeviceLink, DeviceOpener, LostReporter, OpenedDevice};
 pub use host::MixerHandle;
+pub use music::{decode_music_bytes, decode_music_file, loop_points_from_tags, DecodeError, DecodedMusic, MAX_FRAMES};
 pub use source::{LoopPoints, MusicSource, Pull, SfxClip, ToneSource};
 pub use types::{AudioStatus, Backend, PlayOptions, TrackId, Volumes};
