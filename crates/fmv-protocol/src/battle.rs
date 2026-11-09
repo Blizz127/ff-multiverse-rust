@@ -45,7 +45,8 @@
 //!   empties (`fmv_ff7_battle::limit` has the rule). It is engine state, a pure function of the damage
 //!   dealt, so every peer's replay has the same gauge; its **starting value is an input** like the level:
 //!   [`BattleMember::limit`] carries the account's own, which the server keeps (in `fmv-persist`'s
-//!   `CharacterProgress`) and saves at the end of every battle, whatever the outcome. A value above 255
+//!   `CharacterProgress`) and saves at the end of every battle, whatever the outcome (a server run with
+//!   the debug flag `--debug-limit-full` instead starts everyone full and saves no gauge). A value above 255
 //!   is refused when the battle is built ([`BattleBuildError::InvalidLimit`]). With the gauge and the
 //!   ATB gauge full a character gives [`Command::Limit`]: the engine announces
 //!   `Action { Limit(id) }`, `LimitGauge { actor, value: 0 }` and then the effects of one action on
@@ -57,7 +58,7 @@
 //!   [`Outcome::Escaped`]: the message that carries the command has `Action { Escape }` and no
 //!   terminal event, and `BattleEnd` follows it with no rewards; a failed attempt adds
 //!   `EscapeFailed { actor }` and the battle goes on. The server saves the limit gauges of an escaped
-//!   battle like any other, and pays nothing.
+//!   battle like any other (none under `--debug-limit-full`), and pays nothing.
 //! * **Refusals.** `NoLimit` (the character has none), `LimitNotReady` (its gauge is not full) and
 //!   `CannotEscape` (the formation cannot be run from) join the v6 reasons.
 //!
@@ -130,7 +131,8 @@ pub struct BattleMember {
     pub armor: Option<u8>,
     /// The character's limit gauge when the battle starts (protocol v7), `0..=LIMIT_MAX` (255; a
     /// larger number is refused by [`BattleRules::build`]): the account's own, which the server keeps
-    /// and saves at the end of every battle. An input of the engine like the level, so every peer
+    /// and saves at the end of every battle (under the debug flag `--debug-limit-full`: the cap, and no
+    /// gauge is saved). An input of the engine like the level, so every peer
     /// replays the gauge the server had.
     pub limit: u16,
 }

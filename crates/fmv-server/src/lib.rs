@@ -1,4 +1,4 @@
-//! Authoritative FF Multiverse server for protocol v6 (`fmv-protocol`).
+//! Authoritative FF Multiverse server for the protocol of `fmv-protocol` (`fmv_protocol::PROTOCOL_VERSION`).
 //!
 //! The server hosts the areas of one `GameAdapter` (`Box<dyn GameAdapter>`, so wiring a real game
 //! later is a one-line change in the binary): the *entry* area named by the configuration, which
@@ -299,7 +299,7 @@ impl Server {
                 if b.debug_limit_full {
                     warn!(
                         "DEBUG: --debug-limit-full is on: every member of every battle starts with a FULL limit gauge instead of its account's own (a smoke-test aid; leave it off on a server real players use). \
-                         Only the starting gauge changes: the end-of-battle gauge save is the normal one, so a full gauge that nobody spends is never stored and a spent or emptied one is stored as the gauge the member ended with"
+                         No limit gauge is ever stored under it: the end-of-battle gauge save is skipped (logged as `limit not kept ... reason=debug-limit-full`), so a debug run can never overwrite a real account's gauge"
                     );
                 }
             }
@@ -307,7 +307,11 @@ impl Server {
             (None, false) => info!("battles unsupported on this server (no owned battle data); battle requests are refused"),
         }
         if !local_addr.ip().is_loopback() {
-            warn!(%local_addr, "listening on a non-loopback address; protocol v6 is not encrypted (account tokens and game traffic cross the network in the clear): use it only on a network you trust");
+            warn!(
+                %local_addr,
+                "listening on a non-loopback address; protocol v{} is not encrypted (account tokens and game traffic cross the network in the clear): use it only on a network you trust",
+                fmv_protocol::PROTOCOL_VERSION
+            );
         }
 
         let build = config.build_string();
