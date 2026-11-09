@@ -242,11 +242,7 @@ fn every_npc_the_server_announces_is_matched_to_its_script_entity() {
         let Ok(script) = FieldScript::from_field(area.field_file()) else { continue };
         fields += 1;
         let chars = characters(&script);
-        // The canon-cast stand-ins (`CANON_STAND_INS`) come after the NPCs the data places and are no script
-        // character (they stand for a player entity): they have no talk script, so they are not counted here.
-        let all = area.npcs();
-        let stand_ins = fmv_ff7::CANON_STAND_INS.iter().filter(|s| s.field.eq_ignore_ascii_case(&info.id.key)).count();
-        for npc in all.iter().take(all.len().saturating_sub(stand_ins)).filter(|n| n.unconditional) {
+        for npc in area.npcs().iter().filter(|n| n.unconditional) {
             announced += 1;
             empty_names += usize::from(npc.entity_name.is_empty());
             let found = find_character(&chars, &npc.entity_name, npc.pos.x, npc.pos.y);
