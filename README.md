@@ -1028,6 +1028,114 @@ together. The story record keeps its v2 shape, so a v13 server can read what v14
 links or scripted battle, and how its exits judge a moment past 13 was never tested: once a player has gone past moment
 13, prefer rolling forward to rolling back.
 
+## Story scenes
+
+A story scene is the game's own scripted conversation or cutscene, played from the owner's files for a player who stands
+in it as a **witness**. It works like the cutscenes of FF14 and FF11: a player presses OK next to the character that
+starts it, the canon cast speak their real script lines in the order the game's own field script runs them, the
+player's own original character is there (never in Cloud's place; Cloud's lines stay Cloud's), and party members that
+are near can watch in step. Nothing is ever name-swapped.
+
+**The proof scene: Cloud and Tifa at the bar of 7th Heaven** (field `mds7pb_1`, story moment 72, id
+`ff7/mds7pb_1/tifa-bar`). It is read from the owner's data, not invented: at moment 72 Tifa (entity 20, a party member's
+entity that the field parks behind the counter with a talk radius of 150) says her talk script's invitation, and the
+conversation itself is started by the field's `ID` entity (script 0: when Cloud stands on triangle 62 with flag 1 of
+`Var[3][212]` set and flag 2 clear it sets flag 2, runs Cloud's script 9 to its end and starts Tifa's script 12, "what
+will you drink"). The scene is that chain: `SetBit Var[3][212] bit 2`, `Await (Cloud, 9)`, `Start (Tifa, 12)`; the tail
+carries on through Cloud 9, Tifa 13 and Cloud 13 into the lines after the drink. The lines are the owner's own text
+(never stored or printed by the tests: they pin dialog indexes, speakers and counts). Answering the question with line 2
+("something hard") gives **eleven windows**, `28 29(ask) 31 32 33 34 35 36 37 38 39`, spoken by Tifa (20) eight times and
+Cloud (18) three times (33, 36 and 38); answering line 1, or nothing, gives six, `28 29(ask) 30 37 38 39`.
+
+### Scene data (`fmv_ff7::script::scene::SceneDef`)
+
+A scene is DATA: ids, names and numbers, never game text or bytes. The script and the lines are read from the owner's
+files when the scene runs.
+
+| Part | What it says |
+|---|---|
+| `id`, `game`, `field` | `ff7/mds7pb_1/tifa-bar`, `ff7`, `mds7pb_1` |
+| `trigger` | the script entity talked to (20, `tifa`), its talk script slot (1), the talk radius (150, `TALKR` at scale 512) and the story moments it is offered at (72..=72) |
+| `setup` | the field's own stage scripts that put the cast where it stands when the scene begins (Tifa's script 7), run once, quietly |
+| `given` | the field variables the scene assumes (`Var[3][211]` bit 2, `Var[3][212]` bit 1: flags of the field's own progress that the story model does not carry); the moment is the player's own story's |
+| `root` | what the field's own trigger does to start it, in order: `SetBit`, `Await(script)`, `Start(script)` |
+| `cast` | script entity to actor: Cloud (18) `Appearance("ff7/cloud")` starting at the stool (-95, -144), Tifa (20) `Appearance("ff7/tifa")`; `Look::Model` names any `char.lgp` model, so a scene can be replayed with another cast (`SceneDef::with_cast`) |
+| `speakers` | a window's first line names who speaks (the game's own convention); `Tifa` is 20, `Cloud` is 18 |
+| `witness` | where the player's own character stands (spot 0, the owner) and where two watchers stand: on the walkmesh, 70 or more units from Cloud's stool, from every place the cast ever takes and from each other |
+| `arrival` | where the debug preview puts a player: at the counter's edge, within Tifa's reach |
+
+### The interpreter (`fmv_ff7::script::scene`)
+
+A bounded, read-only VM that runs a field's own scripts as the game does, side by side: every script a script requests
+(`REQ`, `REQSW`, `REQEW`) is a **thread** on its own virtual clock (30 frames a second), and the earliest thread always
+runs, so windows and stage events come out in the engine's order whatever `WAIT`, a walk's length or an animation says.
+It produces **beats**: the stage events up to the next window (places, walks, turns, animations, visibility, camera
+moves, each stamped with its frame) and then the window (`MESSAGE` or `ASK`, the field's own text exactly as written, who
+speaks) or the end. A scene ends when no thread can run: all have ended, or the rest sit in an idle loop (the same
+instruction again with nothing changed anywhere: *parked*, so a bartender's idle walk never holds a scene open), and a tail
+a script requested just before it returned still runs. It is deterministic (the same story and seed give the same scene,
+which is how every client and the server agree), it has limits on instructions, windows, threads and virtual time, and
+an **unknown opcode is skipped and counted by mnemonic, never guessed**. Handled: windows and questions, requests with
+priority slots (a taken slot waits for it), waits, places, walks, turns toward a heading or an entity, animations (kind
+and wait), visibility, camera scrolls, the variable and branch opcodes the walker has. Skipped because they change nothing
+a scene shows (counted apart): sound and music, fades, palettes, background layers, controls, menus, party and field logic.
+`MAPJUMP`, `BATTLE`, `MINIGAME` and `GAMEOVER` end the scene and are never performed. On the proof scene: 147 instructions
+for the long way, no unknown opcode (`tests/scene_real.rs`).
+
+### What the server does (`fmv-server`, `world/scene.rs`)
+
+* **A scene run is held state, like a battle.** OK next to the trigger (a *scene NPC*: the server adds the trigger to the
+  area's cast under an id from 1,000,000 while the scene is on offer; Tifa is a party member's entity, which the server
+  never announces as an NPC) starts it for that player: the scene has to be on offer for the story of the account whose phase
+  chose the instance, in this area, and the player within the trigger's reach. Party members of the owner in the same
+  instance and in range (500 units) that are free watch (at most two). Every participant is **held**: its moves are
+  ignored (so no encounter rolls), its OK reaches nothing, a battle does not seat it and none can be requested. Players that
+  are not part of the run are told nothing.
+* **The owner drives.** Its client reports each window it moves past (`SceneStep`, in order, once each, with the answer it
+  chose when the window asked); the server records the answers and relays the step to the watchers, who open each window
+  when the owner moves past the one before. A step out of order, from a watcher or for another run is dropped.
+* **A scene always ends.** The owner's `SceneEnd` (finished or skipped), 120 seconds without a window, and 20 minutes in all
+  end it; an owner that disconnects (or a watcher that leaves the party) drops it. Every participant is told with
+  `SceneEnded` and released.
+* **The story is the server's.** When a run ends as finished, skipped or timed out, the server runs the scene's script
+  itself, headless, with the answers the owner reported, and applies what that wrote ONCE: the mirror, the saver (which
+  merges, forward only), a `StoryUpdate` and a placement refresh. The run is removed first, so a second `SceneEnd`, a late
+  step or a repeated timeout changes nothing. A run that is aborted (owner gone) applies nothing: the scene can be played
+  again. A party member in its leader's phase owns a run that writes nothing. The proof scene's script writes only the
+  field's own flags (and Tifa's affection points), none of which the story model carries, so it is story-neutral and
+  **repeatable**; `Writes` says so plainly, and a scene that does write the moment (Tifa's script 15, the goodbye at the
+  door, 81 to 84 and then a jump to another field that is not performed) is reported by the same code (a real-data test).
+  Adding `Var[3][212]` bit 2 to `fmv_ff7::story::TRACKED_VARS` would make the conversation remembered across logins;
+  that row belongs to the story model.
+
+### The debug preview (`--debug-scene-preview`, OFF by default)
+
+7th Heaven is far beyond today's world, which ends at the first reactor, so a QA player reaches the proof field this way.
+`ClientMsg::SceneDebugPreview { scene }` (refused with `SceneRefused` unless the server runs with the flag) sends the
+player to the scene's field through the ordinary exit travel (`AreaChange`, answered with `JoinArea`), arriving where the
+scene says, on a **made-up story** (the scene's own moment) and a phase of its own (account-bound, so two previews never
+share a field; party members follow their leader's phase, which is how a member watches). **Nothing of a preview is ever
+saved:** the one place the world saves a story (`apply_story_step`) returns early for a previewing player and so does the
+scene's own write; a reconnect gets the stored story back because it was never touched. `tests/scene_preview.rs` proves it
+on a real store (the whole state directory is byte for byte what it was before the preview, over three sessions) and
+`scripts/scene-smoke.sh` over real processes. `mds7pb_1` is not one of `REVIEWED_FIELDS` either, so its story points are
+withheld anyway: that is a second layer, not the first.
+
+### The wire (protocol version NOT bumped; the integrator bumps it)
+
+New in `fmv_protocol::scene`: `ClientMsg::{SceneStep, SceneEnd, SceneLeave, SceneDebugPreview}`,
+`ServerMsg::{SceneStart, SceneStep, SceneEnded, SceneRefused}`, `SceneRunId`, `SceneRole`, `SceneParticipant`,
+`SceneOutcome`, `SceneRefusal`, `SCENE_NPC_ID_BASE`. Only ids, a seed, the story blob and choices cross the wire; every client
+builds the scene from its own files. A peer that predates them cannot decode them, which is the bump to make.
+
+### Checking it
+
+```
+FMV_FF7_DATA=<.../data> cargo test --offline -p fmv-ff7 --test scene_real -- --ignored       # the interpreter on the real field
+FMV_FF7_FLEVEL=<.../flevel.lgp> cargo test --offline -p fmv-server --test scene_real -- --ignored   # a real server and socket
+scripts/scene-smoke.sh --debug --build                 # two real headless players, the scene, a server restart (real data)
+```
+
 ## Importing your own FF7 data
 
 Point the importer at an installed PC copy of FF7 that you own. Your install is only ever
@@ -1175,6 +1283,7 @@ scripts/travel-smoke.sh  walking between fields: two bots, md1stin -> md1_1 and 
                          climbed, the woman and the materia talked to, the fight won, the member following the leader
 scripts/phase-smoke.sh   story phasing: A advances md1stin's story and B does not, party, restart, persist (real data)
 scripts/slice-smoke.sh   the foundations slice: two original characters, a story, a talk, a shared battle, a real server restart
+scripts/scene-smoke.sh   a story scene (Cloud and Tifa at the bar of 7th Heaven): owner and watcher over real processes, restart, nothing stored
 deploy/                  systemd user unit template and deployment procedure
 docs/LAUNCHER.md         the package as an owner-only launcher port: layout, entry point, data dir
 IMPLEMENTATION-PLAN.md   first-milestone plan and design constraints
