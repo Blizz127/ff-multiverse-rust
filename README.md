@@ -1016,6 +1016,14 @@ stored record changed shape, but a v12 engine would skip those attacks and count
 client or server is refused at the handshake. **Rolling back v13:** nothing it stores is new, so point the server and
 the clients back at a v12 build together.
 
+**Protocol v14** adds one client message, `Interact` (the OK button; see "The OK button, ladders and jumps" above).
+The lift, the two talks that move the story and the ladders that wait for OK work only through it, so a v13 client could
+not ride the lift down: it is refused at the handshake instead. Nothing new is stored (the steps it makes are moments of
+the story record that v2 already stores). **Rolling back v14:** point the server and the clients back at a v13 build
+together. The story record keeps its v2 shape, so a v13 server can read what v14 wrote, but it has none of v14's talks,
+links or scripted battle, and how its exits judge a moment past 13 was never tested: once a player has gone past moment
+13, prefer rolling forward to rolling back.
+
 ## Importing your own FF7 data
 
 Point the importer at an installed PC copy of FF7 that you own. Your install is only ever

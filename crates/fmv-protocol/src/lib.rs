@@ -1,12 +1,12 @@
-//! FF Multiverse wire protocol v13 (and the `Interact` message that v14 will carry).
+//! FF Multiverse wire protocol v14.
 //!
-//! Pending v14: [`ClientMsg::Interact`], the OK button. Until now nothing told the server that a player pressed OK, so
+//! v14 is v13 plus [`ClientMsg::Interact`], the OK button. Until v13 nothing told the server that a player pressed OK, so
 //! a talk, a ladder that waits for the button and the elevator's panel could only be approximated by where a player
 //! walks. A client now sends one `Interact` per press (with the character it addressed, if any) and the server decides
-//! what the press does. Nothing else changed shape; [`PROTOCOL_VERSION`] stays 13 until the integrator bumps it with
-//! the other changes of v14. A client that never sends it (v13 and before) cannot ride the lift down, talk to the woman
-//! or the materia or climb a ladder that waits for OK, which is why the version has to be bumped when this ships: a
-//! v13 client must be refused at the handshake, not left stuck at the first panel.
+//! what the press does. Nothing else changed shape. A client that never sends it (v13 and before) cannot ride the lift
+//! down, talk to the woman or the materia or climb a ladder that waits for OK, so a v13 client is refused at the
+//! handshake instead of being left stuck at the first panel. Nothing new is stored: the steps it makes are the story's
+//! own moments, in the story record v2 already stores.
 //!
 //! v13 is v12 with a changed ENGINE again: a scripted enemy's status-only attacks are now played (they used to be
 //! skipped), and an enemy that a turn of Poison kills runs its Death counter in the same step. No message, event or
@@ -349,7 +349,7 @@ pub use fmv_party::{
     PartyEvent, PartyId, Placement,
 };
 
-pub const PROTOCOL_VERSION: u16 = 13;
+pub const PROTOCOL_VERSION: u16 = 14;
 /// Hard cap on a single frame payload (bytes).
 pub const MAX_FRAME: u32 = 256 * 1024;
 /// Default TCP port for development. Deployment port is UNASSIGNED (see DEPLOYMENT-CONTRACT.md).
@@ -485,8 +485,8 @@ pub enum ClientMsg {
     /// [`NpcSnapshot`] of the area, the one it opened a conversation with), `None` when the client found nobody in
     /// reach; the server checks the claim against where the player stands and where that character stands, and a
     /// press that reaches nothing does nothing and is not answered. One message per press (not per frame the key is
-    /// held). Added on top of v13: the version is bumped to v14 when it ships, because a client that never sends it
-    /// cannot ride the lift, talk to the characters that move the story or use a ladder that waits for OK.
+    /// held). New in v14: a client that never sends it cannot ride the lift, talk to the characters that move the
+    /// story or use a ladder that waits for OK, which is why a v13 client is refused at the handshake.
     Interact {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         npc: Option<u32>,
@@ -776,8 +776,8 @@ mod tests {
     }
 
     #[test]
-    fn the_version_is_thirteen() {
-        assert_eq!(PROTOCOL_VERSION, 13);
+    fn the_version_is_fourteen() {
+        assert_eq!(PROTOCOL_VERSION, 14);
     }
 
     // -----------------------------------------------------------------------------------------
@@ -858,7 +858,7 @@ mod tests {
                 r#"","provenance":{"game":"Ff7","platform":"Pc","edition":"Steam","region":"unknown","language":"en","revision":"r1","modded":false}}}"#
             ),
         );
-        // The OK button (pending v14, see `ClientMsg::Interact`): the character addressed, or nobody.
+        // The OK button (v14, see `ClientMsg::Interact`): the character addressed, or nobody.
         golden(ClientMsg::Interact { npc: Some(3) }, r#"{"Interact":{"npc":3}}"#);
         golden(ClientMsg::Interact { npc: None }, r#"{"Interact":{}}"#);
         // a sender that writes the absent character as null is read the same
@@ -2187,8 +2187,8 @@ mod tests {
         let v2 = br#"{"Hello":{"protocol_version":2,"client_build":"x","auth":{"Register":{"display_name":"n"}},"tint":[1,2,3],"appearance_ref":null}}"#;
         assert!(decode::<ClientMsg>(v2).is_err(), "no Hello before v8 is a v8 ClientMsg");
         assert_eq!(probe_hello_version(v2), Some(2));
-        let future = br#"{"Hello":{"protocol_version":14,"anything":{"at":"all"}}}"#;
-        assert_eq!(probe_hello_version(future), Some(14));
+        let future = br#"{"Hello":{"protocol_version":15,"anything":{"at":"all"}}}"#;
+        assert_eq!(probe_hello_version(future), Some(15));
         for not_hello in [&br#""Leave""#[..], br#"{"Ping":{"nonce":1}}"#, b"not json", b"{}", br#"{"Hello":{}}"#, br#"{"Hello":{"protocol_version":70000}}"#] {
             assert_eq!(probe_hello_version(not_hello), None, "{}", String::from_utf8_lossy(not_hello));
         }
