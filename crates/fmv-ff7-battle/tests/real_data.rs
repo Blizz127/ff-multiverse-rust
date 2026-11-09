@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use fmv_ff7_battle::kernel::{decode_kernel2, CharacterId, Kernel, COMMAND_ATTACK};
 use fmv_ff7_battle::rules::{
     enemies_for_formation, BattleConfig, BattleEvent, BattleState, Combatant, Command, Outcome,
-    Side, StartMode,
+    Side, StartMode, Target,
 };
 use fmv_ff7_battle::scene::{SceneBin, FORMATIONS_PER_SCENE, MAX_SCENES, SCENE_SIZE};
 use fmv_ff7_battle::text;
@@ -531,9 +531,9 @@ fn real_kernel2_decodes() {
 #[test]
 #[ignore = "needs FMV_FF7_DATA pointing at the owner's FF7 data directory"]
 fn real_kernel_has_spells_items_materia_and_a_starting_stock() {
-    use fmv_ff7_battle::action::{element, ActionKind, Formula, ItemKind, ItemTable, Spell};
+    use fmv_ff7_battle::action::{element, ActionKind, Aim, Formula, ItemKind, ItemTable, Spell};
     use fmv_ff7_battle::kernel::ItemStack;
-    use fmv_ff7_battle::rules::{party_spells, restore_amount, STARTER_MATERIA};
+    use fmv_ff7_battle::rules::{party_spells, restore_amount, STARTER_ALL_MATERIA, STARTER_MATERIA};
 
     let Some(path) = kernel_path() else { return };
     let kernel = Kernel::open(&path).expect("kernel.bin parses");
@@ -614,6 +614,27 @@ fn real_kernel_has_spells_items_materia_and_a_starting_stock() {
     let life = Spell::from_attack(7, &kernel.attack(7).unwrap()).expect("Life is castable");
     assert!(life.spec.heals() && life.spec.hits_dead);
 
+    // Whole sides (protocol v8). Cure, Life and Fire can be aimed at one target or at everyone (their records
+    // toggle between the two: "All Tar/1 Tar", which takes an All materia), and Ultima only ever hits every
+    // enemy ("All Tar (NS)"): castable now, at full strength, with no All materia.
+    assert_eq!([cure.spec.aim, life.spec.aim, fire.spec.aim], [Aim::OneOrSide; 3]);
+    assert!(cure.spec.splits() && fire.spec.splits(), "Cure and Fire split on a whole side");
+    assert!(!life.spec.splits(), "a fraction of max HP never splits");
+    assert_eq!(kernel.magic_name(52).as_deref(), Some("Ultima"));
+    let ultima = Spell::from_attack(52, &kernel.attack(52).unwrap()).expect("Ultima is castable");
+    assert_eq!(ultima.spec.aim, Aim::Side);
+    assert!(!ultima.spec.splits() && !ultima.spec.heals());
+    // The All materia: its name, and one use per level up to five, which is where a character's count comes from.
+    assert_eq!(kernel.materia_name(STARTER_ALL_MATERIA).as_deref(), Some("All"));
+    let all = kernel.materia(STARTER_ALL_MATERIA).unwrap();
+    assert_eq!(all.level_for_ap(0), 1);
+    assert_eq!((1..=5).map(|level| all.all_uses(level)).collect::<Vec<_>>(), [1, 2, 3, 4, 5]);
+    assert_eq!((all.all_uses(0), all.all_uses(6)), (0, 0));
+    for who in CharacterId::ALL {
+        let c = Combatant::from_character(&kernel, who, 10, None, None).unwrap();
+        assert_eq!(c.all_left, 1, "{who:?}: one All materia at level 1");
+    }
+
     // Items: a Potion restores 100 HP, a Hi-Potion 500, an Ether 100 MP, a Phoenix Down revives.
     let table = ItemTable::from_kernel(&kernel);
     let info = |i: u16| {
@@ -630,8 +651,12 @@ fn real_kernel_has_spells_items_materia_and_a_starting_stock() {
     let amount = |i: u16| restore_amount(&table.get(i).unwrap().spec, &healthy, &healthy, 0);
     assert_eq!((amount(0), amount(1), amount(3)), (100, 500, 100));
     assert_eq!(amount(7), healthy.max_hp * 8 / 32);
-    // Megalixir (every ally) is left out, and so are the status cures.
-    assert!(table.info(6).is_none() && table.info(8).is_none());
+    // Megalixir restores the whole party and only that (it is Elixir for every ally); a potion, an Elixir and a
+    // Phoenix Down hit one; the status cures are left out.
+    assert_eq!(kernel.item_name(6).as_deref(), Some("Megalixir"));
+    assert_eq!((info(6).kind, info(6).aim, info(6).targets_allies), (ItemKind::RestoreAll, Aim::Side, true));
+    assert!([0, 1, 2, 3, 4, 5, 7].iter().all(|i| info(*i).aim == Aim::One));
+    assert!(table.info(8).is_none());
     assert!(
         table.len() >= 8 && table.len() < 60,
         "{} usable items",
@@ -800,7 +825,8 @@ fn real_battles_with_every_kind_of_command_are_deterministic_and_sane() {
         .with_items(Arc::clone(&items))
     };
     // A policy that uses everything: attack, Fire (Cloud and Aerith both know it), Cure on the weakest
-    // ally, a Potion, Defend, Phoenix Down on the dead.
+    // ally, a Potion, Defend, Phoenix Down on the dead, and (each has an All use) Fire on every enemy and
+    // Cure on the whole party.
     let policy = |state: &BattleState, actor: ActorId, round: u64| -> Command {
         let enemy = state
             .enemy_ids()
@@ -821,21 +847,23 @@ fn real_battles_with_every_kind_of_command_are_deterministic_and_sane() {
             Command::Attack { target: enemy },
             Command::Magic {
                 spell: 27,
-                target: enemy,
+                target: Target::One(enemy),
             },
             Command::Magic {
                 spell: 0,
-                target: weakest,
+                target: Target::One(weakest),
             },
             Command::Item {
                 item: 0,
-                target: weakest,
+                target: Target::One(weakest),
             },
             Command::Defend,
             dead.map_or(Command::Attack { target: enemy }, |target| Command::Item {
                 item: 7,
-                target,
+                target: Target::One(target),
             }),
+            Command::Magic { spell: 27, target: Target::AllEnemies },
+            Command::Magic { spell: 0, target: Target::AllAllies },
         ];
         let pick = options[(round + u64::from(actor.0)) as usize % options.len()];
         if state.check_command(actor, &pick).is_ok() {
@@ -1031,7 +1059,7 @@ fn real_cloud_uses_braver_and_the_party_can_run() {
     let enemy = battle.enemy_ids()[0];
     let info = battle.limit_for(ActorId(0)).expect("Cloud has a limit");
     assert!(info.attack == 128 && !info.targets_allies);
-    let events = battle.submit_command(ActorId(0), Command::Limit { target: enemy }).expect("Braver");
+    let events = battle.submit_command(ActorId(0), Command::Limit { target: Target::One(enemy) }).expect("Braver");
     assert!(events.contains(&BattleEvent::Action { actor: ActorId(0), action: ActionRef::Limit(128) }));
     assert!(battle.limit_gauge(ActorId(0)) == 0);
     let hp_start = formation.enemies()[0].record.hp;
@@ -1040,6 +1068,27 @@ fn real_cloud_uses_braver_and_the_party_can_run() {
     let mut plain = build(0);
     plain.submit_command(ActorId(0), Command::Attack { target: enemy }).expect("attack");
     assert!(battle.actor(enemy).unwrap().hp <= plain.actor(enemy).unwrap().hp);
+
+    // Aerith's Healing Wind is the whole party (its record is "All Al (NS)"), and nothing smaller: the one
+    // limit that cannot be aimed at one target.
+    {
+        use fmv_ff7_battle::action::Aim;
+        let mut aerith = Combatant::from_character(&kernel, CharacterId::Aeris, 6, None, None).expect("Aerith");
+        aerith.limit = LIMIT_MAX;
+        let mut hurt = Combatant::from_character(&kernel, CharacterId::Cloud, 6, None, None).expect("Cloud");
+        hurt.hp = hurt.max_hp / 4;
+        let config = BattleConfig { start: StartMode::Preemptive, ..BattleConfig::default() };
+        let enemies = enemies_for_formation(formation.scene, formation.slot);
+        let mut party = BattleState::with_config(7, vec![aerith, hurt], enemies, config);
+        let wind = party.limit_for(ActorId(0)).expect("Aerith has a limit");
+        assert_eq!((wind.attack, wind.targets_allies, wind.aim), (142, true, Aim::Side));
+        assert!(party.check_command(ActorId(0), &Command::Limit { target: Target::One(ActorId(1)) }).is_err());
+        let hp_before = party.actor(ActorId(1)).unwrap().hp;
+        let events = party.submit_command(ActorId(0), Command::Limit { target: Target::AllAllies }).expect("Healing Wind");
+        let healed: Vec<ActorId> = events.iter().filter_map(|e| if let BattleEvent::Heal { target, .. } = e { Some(*target) } else { None }).collect();
+        assert_eq!(healed, [ActorId(0), ActorId(1)], "every ally, in order");
+        assert!(party.actor(ActorId(1)).unwrap().hp > hp_before);
+    }
 
     // Escape: the formation can be run from at difficulty 1, and with the party's first strike every check
     // succeeds; the battle ends with nothing paid.

@@ -21,7 +21,7 @@ use common::*;
 use fmv_ff7_battle::rules::{BattleEvent, Command, Outcome};
 use fmv_protocol::{
     ActionRef, ActorId, BattleMember, BattleReplay, BattleReward, BattleSetup, ClientMsg, PartyEvent, RejectCode, ServerMsg,
-    SyntheticRules, PROTOCOL_VERSION,
+    SyntheticRules, Target, PROTOCOL_VERSION,
 };
 use fmv_server::{BattleSettings, ServerConfig};
 use tempfile::TempDir;
@@ -269,7 +269,7 @@ async fn limit_then_run(j: &mut Joined, rules: &SyntheticRules) -> Ran {
         if !pending && state.outcome().is_none() && state.ready_actors().contains(&mine) {
             let target = state.enemy_ids().into_iter().find(|e| state.actor(*e).is_some_and(|c| c.is_alive())).expect("a living enemy");
             let command = match (limits_used, state.limit_ready(mine), state.limit_gauge(mine)) {
-                (0, true, _) => Command::Limit { target },
+                (0, true, _) => Command::Limit { target: Target::One(target) },
                 (0, false, _) => Command::Attack { target },
                 (_, _, 0) => Command::Attack { target },
                 _ => Command::Escape,

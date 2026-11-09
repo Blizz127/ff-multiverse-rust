@@ -12,7 +12,7 @@
 //! enemy list when it is not, and says where the strip above the windows is (where fighters stand,
 //! see [`Layout::stage`]). Drawing is pure: a view and a layout in, rectangles and text out.
 
-use super::menu::{AimView, Level, ListView, MenuView};
+use super::menu::{AimAt, AimView, Level, ListView, MenuView};
 use super::popups::{Popup, PopupKind};
 use super::view::{gauge_fraction, limit_fraction, limit_full, Anchors, Bar, BattleView, ATB_READY_RGB, ATB_RGB, BAND_H, LIMIT_FULL_RGB, LIMIT_RGB};
 use crate::ui::draw::{DrawList, Rgba};
@@ -223,8 +223,9 @@ fn fitted(c: &mut Canvas<'_>, x: i32, y: i32, width: i32, color: Rgba, text: &st
     c.shadowed(x, y, color, &text);
 }
 
-/// The enemy list: the living enemies' names, the one aimed at highlighted.
-fn draw_enemies(c: &mut Canvas<'_>, l: &Layout, view: &BattleView, aim: Option<ActorId>) {
+/// The enemy list: the living enemies' names, the one aimed at highlighted (or every one, when the pointer is
+/// on ALL). `aim` is the pointer when it is on this side.
+fn draw_enemies(c: &mut Canvas<'_>, l: &Layout, view: &BattleView, aim: Option<AimView>) {
     let living: Vec<&Bar> = view.enemies.iter().filter(|b| b.alive).collect();
     if living.is_empty() {
         return;
@@ -232,12 +233,12 @@ fn draw_enemies(c: &mut Canvas<'_>, l: &Layout, view: &BattleView, aim: Option<A
     window(c, l.enemy);
     let inner = l.enemy.inner();
     let capacity = usize::try_from((inner.h / ROW_H).max(1)).unwrap_or(1);
-    let aimed = aim.and_then(|a| living.iter().position(|b| b.actor == a));
+    let aimed = aim.and_then(|a| a.one()).and_then(|a| living.iter().position(|b| b.actor == a));
     // Scroll so the aimed-at name is on screen.
     let first = aimed.map_or(0, |i| (i + 1).saturating_sub(capacity));
     for (row, bar) in living.iter().enumerate().skip(first).take(capacity) {
         let y = inner.y + ROW_H * i32::try_from(row - first).unwrap_or(0);
-        let hit = aim == Some(bar.actor);
+        let hit = aim.is_some_and(|a| a.covers(bar.actor, bar.alive));
         if hit {
             row_band(c, inner, y, AIMED);
             c.pointer(inner.x, y);
@@ -299,8 +300,9 @@ fn fraction_text(now: u32, max: u32, cap: u32, width: usize) -> String {
     format!("{:>w$}/{:<w$}", now.min(cap), max.min(cap), w = width)
 }
 
-/// The party panel.
-fn draw_party(c: &mut Canvas<'_>, l: &Layout, view: &BattleView, aim: Option<ActorId>) {
+/// The party panel. `aim` is the pointer when it is on this side: on one member, or on ALL (every member the
+/// action hits: the living, or the fallen for a revival).
+fn draw_party(c: &mut Canvas<'_>, l: &Layout, view: &BattleView, aim: Option<AimView>) {
     window(c, l.party);
     let inner = l.party.inner();
     let cols = columns(inner.x, inner.w);
@@ -313,7 +315,8 @@ fn draw_party(c: &mut Canvas<'_>, l: &Layout, view: &BattleView, aim: Option<Act
     }
     for (i, bar) in view.party.iter().enumerate().take(rows) {
         let y = inner.y + ROW_H * (1 + i32::try_from(i).unwrap_or(0));
-        if aim == Some(bar.actor) {
+        let aimed = aim.is_some_and(|a| a.covers(bar.actor, bar.alive));
+        if aimed {
             row_band(c, inner, y, AIMED);
             c.pointer(inner.x, y);
         } else if bar.mine {
@@ -323,7 +326,7 @@ fn draw_party(c: &mut Canvas<'_>, l: &Layout, view: &BattleView, aim: Option<Act
         if commanding && aim.is_none() {
             c.pointer(inner.x, y);
         }
-        let name_color = if aim == Some(bar.actor) || (bar.mine && bar.alive) {
+        let name_color = if aimed || (bar.mine && bar.alive) {
             ACCENT
         } else if !bar.alive {
             DISABLED
@@ -402,6 +405,12 @@ fn draw_list(c: &mut Canvas<'_>, l: &Layout, list: &ListView) {
     window(c, l.left);
     let inner = l.left.inner();
     c.shadowed(inner.x + POINTER_W, inner.y, ACCENT, list.title);
+    // How many whole-side casts the All materia still allows (a spell of the list that can use one).
+    if let Some(left) = list.all {
+        let text = format!("ALL x{left}");
+        let x = inner.right() - 14 - i32::try_from(cell_count(&text)).unwrap_or(0) * 8;
+        c.shadowed(x, inner.y, if left > 0 { INFO } else { DISABLED }, &text);
+    }
     let right_w = list.rows.iter().map(|r| i32::try_from(cell_count(&r.right)).unwrap_or(0) * 8).max().unwrap_or(0);
     for (i, row) in list.rows.iter().enumerate() {
         let y = inner.y + ROW_H * (1 + i32::try_from(i).unwrap_or(0));
@@ -435,8 +444,8 @@ pub fn draw_windows(c: &mut Canvas<'_>, l: &Layout, view: &BattleView) {
         return;
     }
     let aim: Option<AimView> = view.menu.as_ref().and_then(|m| m.aim);
-    draw_enemies(c, l, view, aim.filter(|a| a.enemy).map(|a| a.target));
-    draw_party(c, l, view, aim.filter(|a| !a.enemy).map(|a| a.target));
+    draw_enemies(c, l, view, aim.filter(|a| a.enemy));
+    draw_party(c, l, view, aim.filter(|a| !a.enemy));
     if let Some(menu) = &view.menu {
         match (menu.level, &menu.list) {
             (Level::Commands, _) => draw_commands(c, l, menu),
@@ -455,18 +464,28 @@ pub fn draw_banner(c: &mut Canvas<'_>, l: &Layout, banner: &Banner) {
     c.centered(a.x, a.w, a.y + (BANNER_H - 8) / 2, TEXT, &banner.text);
 }
 
-/// The target pointer: a yellow arrow over the head of whoever the menu aims at.
+/// The target pointer: a yellow arrow over the head of whoever the menu aims at, or over every one of them
+/// when it is on ALL (the whole side the action hits).
 pub fn draw_pointer(out: &mut DrawList, l: &Layout, view: &BattleView, anchors: &Anchors, vw: u32) {
     let Some(aim) = view.menu.as_ref().and_then(|m| m.aim) else { return };
-    let Some((ax, ay)) = anchors.of(view, aim.target) else { return };
+    let aimed: Vec<ActorId> = match aim.at {
+        AimAt::One(target) => vec![target],
+        AimAt::All => {
+            let side = if aim.enemy { &view.enemies } else { &view.party };
+            side.iter().filter(|b| aim.covers(b.actor, b.alive)).map(|b| b.actor).collect()
+        }
+    };
     let scale = u32::try_from(l.s + 2).unwrap_or(3);
     let cell = i32::try_from(8 * scale).unwrap_or(24);
-    // The arrow is drawn in the lower rows of its cell: its tip is 7/8 of the way down.
     let shadow = l.s.max(1);
-    let x = (ax as i32 - cell / 2).clamp(0, (i32::try_from(vw).unwrap_or(i32::MAX) - cell - shadow).max(0));
-    let y = (ay as i32 - cell * 7 / 8).max(0);
-    out.draw_special(x + shadow, y + shadow, scale, SHADOW, Special::ArrowDown);
-    out.draw_special(x, y, scale, ACCENT, Special::ArrowDown);
+    for target in aimed {
+        let Some((ax, ay)) = anchors.of(view, target) else { continue };
+        // The arrow is drawn in the lower rows of its cell: its tip is 7/8 of the way down.
+        let x = (ax as i32 - cell / 2).clamp(0, (i32::try_from(vw).unwrap_or(i32::MAX) - cell - shadow).max(0));
+        let y = (ay as i32 - cell * 7 / 8).max(0);
+        out.draw_special(x + shadow, y + shadow, scale, SHADOW, Special::ArrowDown);
+        out.draw_special(x, y, scale, ACCENT, Special::ArrowDown);
+    }
 }
 
 /// The colour and the text of a popup at `age_ms` of its life: it rises quickly and slows, then
@@ -617,7 +636,7 @@ pub fn draw_finale(c: &mut Canvas<'_>, l: &Layout, finale: &Finale, heads: &[(f3
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::battle::menu::{BattleMenu, BattleMenuModel, Ctx, Fighter, MenuItem, MenuKey, MenuSpell, TargetRule};
+    use crate::battle::menu::{BattleMenu, BattleMenuModel, Ctx, Fighter, MenuItem, MenuKey, MenuSpell, Reach, TargetRule};
     use crate::battle::popups::LIFETIME_S;
     use crate::ui::widgets::SHADOW as SHADOW_COLOR;
     use fmv_protocol::BattleId;
@@ -648,8 +667,27 @@ mod tests {
             defend: true,
             ..BattleMenuModel::default()
         };
+        menu_after_model(&model, view, keys)
+    }
+
+    /// Like [`menu_after`], with Fire, Cure and Phoenix Down of the kind that can hit a whole side and one All use.
+    fn side_menu_after(view: &BattleView, keys: &[MenuKey]) -> MenuView {
+        let model = BattleMenuModel {
+            spells: vec![
+                MenuSpell::new(1, "Fire", 4, TargetRule::Enemies).with_reach(Reach::OneOrAll),
+                MenuSpell::new(2, "Cure", 5, TargetRule::from_allies(true)).with_reach(Reach::OneOrAll),
+            ],
+            items: vec![MenuItem::new(11, "Phoenix Down", 2, TargetRule::DeadAllies).with_reach(Reach::OneOrAll)],
+            defend: true,
+            all_left: 1,
+            ..BattleMenuModel::default()
+        };
+        menu_after_model(&model, view, keys)
+    }
+
+    fn menu_after_model(model: &BattleMenuModel, view: &BattleView, keys: &[MenuKey]) -> MenuView {
         let (allies, enemies) = (fighters(&view.party), fighters(&view.enemies));
-        let ctx = Ctx { model: &model, allies: &allies, enemies: &enemies, mp: 8 };
+        let ctx = Ctx { model, allies: &allies, enemies: &enemies, mp: 8 };
         let mut menu = BattleMenu::default();
         for k in keys {
             menu.press(*k, &ctx);
@@ -782,7 +820,73 @@ mod tests {
         v.menu = Some(menu_after(&v, &[MenuKey::Down, MenuKey::Down, MenuKey::Confirm, MenuKey::Down, MenuKey::Confirm]));
         let aim = v.menu.as_ref().and_then(|m| m.aim).expect("aiming");
         assert!(!aim.enemy, "Phoenix Down aims at the party");
-        assert_eq!(aim.target, ActorId(2));
+        assert_eq!(aim.one(), Some(ActorId(2)));
+    }
+
+    /// With the pointer on ALL every fighter the action hits is highlighted at once: the living enemies for Fire, the
+    /// living party for Cure, the fallen for a revival (the dead one only).
+    #[test]
+    fn the_pointer_on_all_highlights_every_fighter_the_action_hits() {
+        let mut v = battle();
+        v.party[1].ready = true;
+        let colours = |list: &DrawList, names: &[&str]| -> Vec<Option<Rgba>> {
+            names.iter().map(|name| list.texts().iter().find(|t| t.text == *name && t.color != SHADOW_COLOR).map(|t| t.color)).collect()
+        };
+        // Fire on every enemy: both living enemies (the dead Mono Drive is not listed), nobody of the party.
+        v.menu = Some(side_menu_after(&v, &[MenuKey::Down, MenuKey::Confirm, MenuKey::Confirm, MenuKey::Left]));
+        assert_eq!(v.menu.as_ref().and_then(|m| m.aim).map(|a| a.at), Some(AimAt::All));
+        let list = draw(&v, 1100, 680);
+        assert_eq!(colours(&list, &["Guard Hound", "Soldier"]), [Some(ACCENT), Some(ACCENT)]);
+        assert_eq!(colours(&list, &["Cloud", "Tifa"]), [Some(TEXT), Some(DISABLED)], "the party is not aimed at");
+        // One enemy is as before: only the one.
+        v.menu = Some(side_menu_after(&v, &[MenuKey::Down, MenuKey::Confirm, MenuKey::Confirm]));
+        assert_eq!(colours(&draw(&v, 1100, 680), &["Guard Hound", "Soldier"]), [Some(ACCENT), Some(TEXT)]);
+        // Cure on the whole party: every living member (our own row is highlighted anyway), not the dead one.
+        v.menu = Some(side_menu_after(&v, &[MenuKey::Down, MenuKey::Confirm, MenuKey::Down, MenuKey::Confirm, MenuKey::Left]));
+        let aim = v.menu.as_ref().and_then(|m| m.aim).expect("aiming");
+        assert_eq!((aim.at, aim.enemy, aim.revive), (AimAt::All, false, false));
+        let list = draw(&v, 1100, 680);
+        assert_eq!(colours(&list, &["Cloud", "Barret", "Tifa"]), [Some(ACCENT), Some(ACCENT), Some(DISABLED)]);
+        assert_eq!(colours(&list, &["Guard Hound"]), [Some(TEXT)]);
+        // A revival of the whole party is the fallen: Tifa is lit, Cloud is not.
+        v.menu = Some(side_menu_after(&v, &[MenuKey::Down, MenuKey::Down, MenuKey::Confirm, MenuKey::Confirm, MenuKey::Right]));
+        let aim = v.menu.as_ref().and_then(|m| m.aim).expect("aiming");
+        assert_eq!((aim.at, aim.revive), (AimAt::All, true));
+        assert_eq!(colours(&draw(&v, 1100, 680), &["Cloud", "Tifa"]), [Some(TEXT), Some(ACCENT)]);
+    }
+
+    #[test]
+    fn the_pointer_on_all_is_an_arrow_over_each_fighter_it_hits() {
+        let mut v = battle();
+        v.party[1].ready = true;
+        let anchors = crate::battle::view::flat_anchors(&v, 1100, 680);
+        let l = layout(1100, 680, 3);
+        let arrows = |v: &BattleView| {
+            let mut list = DrawList::new();
+            draw_pointer(&mut list, &l, v, &anchors, 1100);
+            list.quads().iter().filter(|q| q.color == ACCENT).count()
+        };
+        v.menu = Some(side_menu_after(&v, &[MenuKey::Down, MenuKey::Confirm, MenuKey::Confirm]));
+        assert_eq!(arrows(&v), 1, "one enemy: one arrow");
+        v.menu = Some(side_menu_after(&v, &[MenuKey::Down, MenuKey::Confirm, MenuKey::Confirm, MenuKey::Left]));
+        assert_eq!(arrows(&v), 2, "the two living enemies");
+        v.menu = Some(side_menu_after(&v, &[MenuKey::Down, MenuKey::Confirm, MenuKey::Down, MenuKey::Confirm, MenuKey::Left]));
+        assert_eq!(arrows(&v), 2, "the two living members of the party");
+        v.menu = Some(side_menu_after(&v, &[MenuKey::Down, MenuKey::Down, MenuKey::Confirm, MenuKey::Confirm, MenuKey::Right]));
+        assert_eq!(arrows(&v), 1, "the one who fell");
+    }
+
+    #[test]
+    fn the_magic_list_says_how_many_all_uses_are_left() {
+        let mut v = battle();
+        v.party[1].ready = true;
+        v.menu = Some(side_menu_after(&v, &[MenuKey::Down, MenuKey::Confirm]));
+        assert!(draw(&v, 1100, 680).says("ALL x1"));
+        // A list with nothing that can use one does not mention it, and the Item list never does.
+        v.menu = Some(menu_after(&v, &[MenuKey::Down, MenuKey::Confirm]));
+        assert!(!draw(&v, 1100, 680).texts().iter().any(|t| t.text.starts_with("ALL")));
+        v.menu = Some(side_menu_after(&v, &[MenuKey::Down, MenuKey::Down, MenuKey::Confirm]));
+        assert!(!draw(&v, 1100, 680).texts().iter().any(|t| t.text.starts_with("ALL")));
     }
 
     #[test]

@@ -8,7 +8,7 @@ use crate::avatar::library::tests::{character, Counting};
 use crate::battle::scene::model::{BattleActorModel, BattleModelSource, StandInModels};
 use fmv_core::{AccountId, AnimState, AreaId, AvatarAppearance, EntityId, EntitySnapshot, GameId};
 use fmv_ff7::model::transform_point;
-use fmv_ff7_battle::rules::{BattleConfig, Command, StartMode};
+use fmv_ff7_battle::rules::{BattleConfig, Command, StartMode, Target};
 use fmv_protocol::battle::{CameraPose, EnemyPlacement};
 use fmv_protocol::{BattleRules, BattleSetup, ServerMsg, SyntheticRules};
 use std::cell::RefCell;
@@ -445,7 +445,7 @@ fn command_of_the_first_hero(limit: u16, command: impl Fn(&BattleState) -> Comma
 
 #[test]
 fn a_limit_break_from_the_engine_gathers_at_the_performer_and_breaks_over_the_target_late_in_one_burst_pair() {
-    let (before, engine, events) = command_of_the_first_hero(255, |e| Command::Limit { target: e.enemy_ids()[0] });
+    let (before, engine, events) = command_of_the_first_hero(255, |e| Command::Limit { target: Target::One(e.enemy_ids()[0]) });
     let target = engine.enemy_ids()[0];
     assert!(events.contains(&BattleEvent::Action { actor: ActorId(0), action: ActionRef::Limit(128) }), "{events:?}");
     assert!(events.contains(&BattleEvent::LimitGauge { actor: ActorId(0), value: 0 }), "the gauge is emptied");

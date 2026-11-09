@@ -205,7 +205,7 @@ pub use reject::RejectCode;
 pub use battle::{
     assign_drops, split_rewards, ActionRef, ActorId, AppliedCommand, BattleBuildError, BattleId, BattleMember, BattleRejection,
     BattleReplay, BattleReward, BattleRules, BattleSetup, Divergence, Ff7BattleData, Ff7BattleDataError, FormationInfo,
-    ProgressLimits, SyntheticRules, MAX_BATTLE_PARTY,
+    ProgressLimits, SyntheticRules, Target, MAX_BATTLE_PARTY,
 };
 
 /// The party types carried on the wire, re-exported so a client needs no direct `fmv-party`
@@ -1045,17 +1045,17 @@ mod tests {
             ClientMsg::BattleCommand {
                 battle_id: BattleId(1),
                 actor: ActorId(1),
-                command: battle::Command::Magic { spell: 27, target: ActorId(3) },
+                command: battle::Command::Magic { spell: 27, target: Target::One(ActorId(3)) },
             },
-            r#"{"BattleCommand":{"battle_id":1,"actor":1,"command":{"Magic":{"spell":27,"target":3}}}}"#,
+            r#"{"BattleCommand":{"battle_id":1,"actor":1,"command":{"Magic":{"spell":27,"target":{"One":3}}}}}"#,
         );
         golden(
             ClientMsg::BattleCommand {
                 battle_id: BattleId(1),
                 actor: ActorId(0),
-                command: battle::Command::Item { item: 7, target: ActorId(1) },
+                command: battle::Command::Item { item: 7, target: Target::One(ActorId(1)) },
             },
-            r#"{"BattleCommand":{"battle_id":1,"actor":0,"command":{"Item":{"item":7,"target":1}}}}"#,
+            r#"{"BattleCommand":{"battle_id":1,"actor":0,"command":{"Item":{"item":7,"target":{"One":1}}}}}"#,
         );
         golden(
             ClientMsg::BattleCommand { battle_id: BattleId(1), actor: ActorId(0), command: battle::Command::Defend },
@@ -1063,8 +1063,8 @@ mod tests {
         );
         // v7: the limit break and the escape.
         golden(
-            ClientMsg::BattleCommand { battle_id: BattleId(1), actor: ActorId(0), command: battle::Command::Limit { target: ActorId(3) } },
-            r#"{"BattleCommand":{"battle_id":1,"actor":0,"command":{"Limit":{"target":3}}}}"#,
+            ClientMsg::BattleCommand { battle_id: BattleId(1), actor: ActorId(0), command: battle::Command::Limit { target: Target::One(ActorId(3)) } },
+            r#"{"BattleCommand":{"battle_id":1,"actor":0,"command":{"Limit":{"target":{"One":3}}}}}"#,
         );
         golden(
             ClientMsg::BattleCommand { battle_id: BattleId(1), actor: ActorId(2), command: battle::Command::Escape },
@@ -1157,12 +1157,12 @@ mod tests {
                     battle::BattleEvent::LimitGauge { actor: ActorId(0), value: 0 },
                     battle::BattleEvent::Damage { actor: ActorId(0), target: ActorId(3), amount: 321, critical: false },
                 ],
-                command: Some(AppliedCommand { actor: ActorId(0), command: battle::Command::Limit { target: ActorId(3) } }),
+                command: Some(AppliedCommand { actor: ActorId(0), command: battle::Command::Limit { target: Target::One(ActorId(3)) } }),
             },
             concat!(
                 r#"{"BattleEvent":{"battle_id":1,"tick":200,"events":[{"Action":{"actor":0,"action":{"Limit":128}}},"#,
                 r#"{"LimitGauge":{"actor":0,"value":0}},{"Damage":{"actor":0,"target":3,"amount":321,"critical":false}}],"#,
-                r#""command":{"actor":0,"command":{"Limit":{"target":3}}}}}"#
+                r#""command":{"actor":0,"command":{"Limit":{"target":{"One":3}}}}}}"#
             ),
         );
         golden(
@@ -1301,10 +1301,19 @@ mod tests {
             golden(event, expected);
         }
         golden(battle::Command::Attack { target: t }, r#"{"Attack":{"target":3}}"#);
-        golden(battle::Command::Magic { spell: 0, target: t }, r#"{"Magic":{"spell":0,"target":3}}"#);
-        golden(battle::Command::Item { item: 3, target: a }, r#"{"Item":{"item":3,"target":0}}"#);
+        golden(battle::Command::Magic { spell: 0, target: Target::One(t) }, r#"{"Magic":{"spell":0,"target":{"One":3}}}"#);
+        golden(battle::Command::Item { item: 3, target: Target::One(a) }, r#"{"Item":{"item":3,"target":{"One":0}}}"#);
         golden(battle::Command::Defend, r#""Defend""#);
-        golden(battle::Command::Limit { target: t }, r#"{"Limit":{"target":3}}"#);
+        golden(battle::Command::Limit { target: Target::One(t) }, r#"{"Limit":{"target":{"One":3}}}"#);
+        // v8: a target is one actor or a whole side (the sides are the commanding actor's: its enemies, its allies).
+        golden(Target::One(t), r#"{"One":3}"#);
+        golden(Target::AllEnemies, r#""AllEnemies""#);
+        golden(Target::AllAllies, r#""AllAllies""#);
+        golden(battle::Command::Magic { spell: 27, target: Target::AllEnemies }, r#"{"Magic":{"spell":27,"target":"AllEnemies"}}"#);
+        golden(battle::Command::Magic { spell: 0, target: Target::AllAllies }, r#"{"Magic":{"spell":0,"target":"AllAllies"}}"#);
+        golden(battle::Command::Item { item: 6, target: Target::AllAllies }, r#"{"Item":{"item":6,"target":"AllAllies"}}"#);
+        golden(battle::Command::Item { item: 21, target: Target::AllEnemies }, r#"{"Item":{"item":21,"target":"AllEnemies"}}"#);
+        golden(battle::Command::Limit { target: Target::AllAllies }, r#"{"Limit":{"target":"AllAllies"}}"#);
         golden(battle::Command::Escape, r#""Escape""#);
         golden(battle::Outcome::Victory, r#""Victory""#);
         golden(battle::Outcome::Defeat, r#""Defeat""#);
@@ -1423,7 +1432,7 @@ mod tests {
         let heal = encode(&battle::BattleEvent::Heal { actor: ActorId(0), target: ActorId(1), amount: 3 }).unwrap();
         assert!(decode::<EventV5>(&heal[4..]).is_err());
         assert!(decode::<EventV5>(br#"{"GaugeReady":{"actor":1}}"#).is_ok());
-        for command in [battle::Command::Magic { spell: 0, target: ActorId(1) }, battle::Command::Defend] {
+        for command in [battle::Command::Magic { spell: 0, target: Target::One(ActorId(1)) }, battle::Command::Defend] {
             assert!(decode::<CommandV5>(&encode(&command).unwrap()[4..]).is_err(), "{command:?}");
         }
         assert!(decode::<CommandV5>(br#"{"Attack":{"target":1}}"#).is_ok());
@@ -1477,7 +1486,7 @@ mod tests {
             #[allow(dead_code)]
             armor: Option<u8>,
         }
-        for command in [battle::Command::Limit { target: ActorId(1) }, battle::Command::Escape] {
+        for command in [battle::Command::Limit { target: Target::One(ActorId(1)) }, battle::Command::Escape] {
             assert!(decode::<CommandV6>(&encode(&command).unwrap()[4..]).is_err(), "{command:?}");
         }
         assert!(decode::<CommandV6>(br#"{"Attack":{"target":1}}"#).is_ok(), "the stand-in decodes what it knows");

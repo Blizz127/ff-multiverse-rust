@@ -39,7 +39,7 @@ use crate::ui::testkit::{pixel, save, Offscreen};
 use fmv_ff7::battle_model::{BattleCharacter, BattleModel, BattleModels};
 use fmv_ff7::model::mat4_translate;
 use fmv_ff7::playable::Character;
-use fmv_ff7_battle::rules::Command;
+use fmv_ff7_battle::rules::{Command, Target};
 use fmv_protocol::{BattleSetup, ServerMsg};
 use std::path::PathBuf;
 
@@ -575,7 +575,7 @@ fn fight_cast_with_an_effect() {
     let target = fight.server.first_enemy().expect("an enemy");
     let spell = fight.server.state.actor(ActorId(0)).and_then(|c| c.spells.iter().find(|s| s.index == 27)).copied().expect("Cloud knows Fire");
     assert_eq!(Element::from_mask(spell.spec.element_mask, spell.spec.heals()), Element::Fire);
-    let msg = fight.server.command(ActorId(0), Command::Magic { spell: 27, target });
+    let msg = fight.server.command(ActorId(0), Command::Magic { spell: 27, target: Target::One(target) });
     assert!(msg.is_some(), "the engine takes the spell");
     fight.say(msg);
     let impact = arrival + cue::impact_delay(Some(ActionRef::Magic(27)));
@@ -610,7 +610,7 @@ fn fight_the_elements() {
         fight.say(first);
         let arrival = fight.now;
         let target = if ally { ActorId(1) } else { fight.server.first_enemy().expect("an enemy") };
-        let Some(msg) = fight.server.command(ActorId(0), Command::Magic { spell, target }) else {
+        let Some(msg) = fight.server.command(ActorId(0), Command::Magic { spell, target: Target::One(target) }) else {
             eprintln!("the engine does not take spell {spell}: skipped");
             continue;
         };
@@ -636,7 +636,7 @@ fn fight_item_and_defend() {
     let first = fight.server.step(1);
     fight.say(first);
     let arrival = fight.now;
-    let potion = fight.server.command(ActorId(0), Command::Item { item: 0, target: ActorId(1) });
+    let potion = fight.server.command(ActorId(0), Command::Item { item: 0, target: Target::One(ActorId(1)) });
     assert!(potion.is_some(), "the engine takes a Potion");
     fight.say(potion);
     let guard = fight.server.command(ActorId(2), Command::Defend);
@@ -742,7 +742,7 @@ fn fight_a_limit_break() {
     let arrival = fight.now;
     let target = fight.server.first_enemy().expect("an enemy");
     assert!(fight.server.state.limit_ready(ActorId(0)), "Cloud starts with a full gauge");
-    let blow = fight.server.command(ActorId(0), Command::Limit { target });
+    let blow = fight.server.command(ActorId(0), Command::Limit { target: Target::One(target) });
     assert!(blow.is_some(), "a full gauge gives the limit");
     fight.say(blow);
     assert!(fight.server.state.limit_gauge(ActorId(0)) < 255, "the limit spent the gauge");
