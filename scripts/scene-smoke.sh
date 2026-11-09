@@ -235,10 +235,10 @@ stop_server() {
   fi
 }
 
-# start_server <log>: the real server over the owner's library, the debug scene preview on.
+# start_server <log> [port]: the real server over the owner's library, the debug scene preview on (a restart reuses the first port: the clients' saved tokens are keyed by the address).
 start_server() {
-  local log="$1"
-  local -a args=(--bind 127.0.0.1:0 --ff7-library "$WORK/lib-state" --state-dir "$WORK/server-state" --no-random-encounters --debug-scene-preview)
+  local log="$1" port="${2:-0}"
+  local -a args=(--bind "127.0.0.1:$port" --ff7-library "$WORK/lib-state" --state-dir "$WORK/server-state" --no-random-encounters --debug-scene-preview)
   say "starting server: $SERVER_BIN ${args[*]}"
   "$SERVER_BIN" "${args[@]}" >"$log" 2>&1 &
   SERVER_PID=$!
@@ -252,7 +252,7 @@ start_server() {
 start_player() {
   local label="$1" run="$2" duration="$3" name="$4"
   shift 4
-  "$CLIENT_BIN" --server "$CONNECT" --headless --duration "$duration" --bot idle --ff7-library "$WORK/lib-state" \
+  "$CLIENT_BIN" --server "$CONNECT" --headless --duration "$duration" --ff7-library "$WORK/lib-state" \
     --name "$name" --state-dir "$WORK/client-$label" "$@" >"$WORK/$run-client-$label.log" 2>&1 &
   CPID[$label]=$!
 }
@@ -344,9 +344,10 @@ run_scene() {
 
   # ---- session 1: the owner and its watcher play the scene ----
   start_server "$WORK/s1-server.log"
+  local port="${ADDR##*:}"
   log_has "$WORK/s1-server.log" "--debug-scene-preview is on" || problem "the server did not warn that the debug scene preview is on"
-  start_player A r1 "$SCENE_DURATION" "$NAME_A" --party-invite-first-peer --scene-preview "$SCENE_ID" --scene-watchers 1 --scene-answer "$ANSWER" --scene-wait-secs 60
-  start_player B r1 "$SCENE_DURATION" "$NAME_B" --party-accept --scene-preview "$SCENE_ID" --scene-watch --scene-wait-secs 60
+  start_player A r1 "$SCENE_DURATION" "$NAME_A" --bot idle --party-invite-first-peer --scene-preview "$SCENE_ID" --scene-watchers 1 --scene-answer "$ANSWER" --scene-wait-secs 60
+  start_player B r1 "$SCENE_DURATION" "$NAME_B" --bot idle --party-accept --scene-preview "$SCENE_ID" --scene-watch --scene-wait-secs 60
   wait_clients $((SCENE_DURATION + CLIENT_GRACE))
   local la="$WORK/r1-client-A.log" lb="$WORK/r1-client-B.log" sl="$WORK/s1-server.log" n
   for n in A B; do
@@ -392,7 +393,8 @@ run_scene() {
   [[ -n $digest_after_1 ]] || problem "the server stored nothing at all (not even the accounts)"
 
   # ---- session 2: the server restarts; A logs in again ----
-  start_server "$WORK/s2-server.log"
+  start_server "$WORK/s2-server.log" "$port"
+  [[ ${ADDR##*:} == "$port" ]] || fail "the restarted server is not on port $port (the clients' saved tokens are keyed by the address): $READY_LINE"
   CLIENT_NAMES=(A)
   start_player A r2 10 "$NAME_A" --bot circle
   wait_clients $((10 + CLIENT_GRACE))
