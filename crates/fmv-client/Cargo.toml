@@ -18,6 +18,8 @@ fmv-library.workspace = true
 # The battle engine this client replays (from its OWN scene.bin and kernel.bin; path dependency like
 # fmv-protocol's, it is not a workspace dependency entry).
 fmv-ff7-battle = { path = "../fmv-ff7-battle" }
+# Music and effects: the mixer, the null sink and the cpal output device (path dependency).
+fmv-audio = { path = "../fmv-audio" }
 tokio.workspace = true
 clap.workspace = true
 thiserror.workspace = true

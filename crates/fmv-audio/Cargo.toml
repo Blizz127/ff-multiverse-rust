@@ -1,0 +1,25 @@
+[package]
+name = "fmv-audio"
+description = "FF Multiverse audio engine: music/SFX mixer, null sink and cpal output."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[features]
+default = ["device"]
+# The real output device through cpal (ALSA; PipeWire serves it via pipewire-alsa). Without this
+# feature only the null sink exists, so a machine without the ALSA headers can still build.
+device = ["dep:cpal", "dep:alsa"]
+
+[dependencies]
+cpal = { version = "0.18", optional = true }
+# Decoders for the owner's own sound files, read-only. Ogg/Vorbis for music; WAV/PCM/ADPCM for effects.
+symphonia = { version = "0.5.5", default-features = false, features = ["ogg", "vorbis", "wav", "pcm", "adpcm"] }
+
+# libasound prints its own complaints on stderr ("cannot find card '0'" and seven more lines) whenever it
+# finds no sound card. The safe `alsa::Output::local_error_handler` (the crate version cpal itself uses, so
+# the lock file only gains an edge) catches them for the thread that opens the device instead, so that the
+# engine's one note about going silent is the only line a machine without a card prints.
+[target.'cfg(target_os = "linux")'.dependencies]
+alsa = { version = "0.11", optional = true }

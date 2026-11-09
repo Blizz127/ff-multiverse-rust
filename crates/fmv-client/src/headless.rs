@@ -10,6 +10,7 @@
 //! area (what a smoke test checks the canon characters are still in the field with). Every value that came
 //! from the network is percent-encoded by [`encode_name`], so a line always splits on spaces.
 
+use crate::audio::GameAudio;
 use crate::battle::BattleBot;
 use crate::bot::{Bot, PartyBot, TravelBot, TravelGate};
 use crate::cli::{exit, Args};
@@ -180,7 +181,9 @@ pub fn smoke_line(smoke: &Smoke<'_>) -> String {
     format!("SMOKE name={name} area={area} fixture={fixture} peers_seen={peers_seen} updates={updates} rejected={rejected} rtt_ms={rtt_ms} party={party} battles={battles} victories={victories} area_changes={area_changes} level={level} exp={exp} items={items}")
 }
 
-pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>) -> u8 {
+/// `audio` is the run's sound (off for a bot unless `FMV_AUDIO` was set, see `main::start_audio`): it
+/// follows the area and the battle each tick and logs what it plays.
+pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>, mut audio: GameAudio) -> u8 {
     let mut bot = Bot::new(
         args.bot,
         session.state.own.pos(),
@@ -295,6 +298,8 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>) -> u
             // walk start again in the new one.
             peer_walks.clear();
         }
+        // The music follows the area and the battle (a no-op for a silent bot).
+        audio.update_from(&session);
         let npcs: Vec<(u32, String, String)> = session.state.npc_views().iter().map(|n| (n.id, n.name.clone(), n.model.clone())).collect();
         if npcs != last_npcs {
             if !npcs.is_empty() {
@@ -414,6 +419,9 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>) -> u
         eprintln!("{}", peer_line(&peer));
     }
     eprintln!("headless: {}", session.state.party.summary());
+    if let Some(summary) = audio.summary() {
+        eprintln!("headless: audio: {summary}");
+    }
     if battle_bot.is_active() || session.state.battle.entered() > 0 || session.state.battle.rejections() > 0 {
         eprintln!("headless: battles: {}", session.state.battle.summary());
         // How the script went (every entry is exactly one of applied, skipped, refused, lost or unused).

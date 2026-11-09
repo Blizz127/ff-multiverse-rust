@@ -29,6 +29,10 @@
 //! [`ScanReport::select`] picks "the neutral files plus exactly one language": an install that
 //! holds several languages must say which one it means, so files of different languages are
 //! never mixed under one language label.
+//!
+//! Audio (`data/music_ogg`, `data/music`, `data/sound`) is found too, as language-neutral files
+//! of role `audio` that every import takes: see [`audio`] for the rules, and
+//! [`ScanReport::audio`] for the summary at the end of the report.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -37,6 +41,14 @@ use std::path::{Path, PathBuf};
 use fmv_core::Platform;
 use fmv_library::normalize_logical_path;
 use serde::Serialize;
+
+pub mod audio;
+
+pub use audio::{
+    discover_audio, AudioDiscovery, AudioFile, AudioKind, AudioSummary, AUDIO_WARNING_PREFIX,
+    MAX_AUDIO_FILES, MAX_AUDIO_NAME, MAX_DIR_ENTRIES,
+};
+use audio::discover_audio_in;
 
 use crate::steam::{
     build_revision, find_app_manifest, ManifestLookup, SteamAppMatch, STEAM_2013_APPID,
@@ -253,6 +265,10 @@ pub struct RefusedLink {
     /// Relative to the scanned directory.
     pub relative_path: String,
     pub reason: &'static str,
+    /// An audio file (see [`audio`]): optional data, never a reason to name the link in the error
+    /// of an install that has no `flevel.lgp`. Not part of the report.
+    #[serde(skip)]
+    pub(crate) audio: bool,
 }
 
 const LINK_REFUSED: &str = "symbolic link that leads outside the scanned directory (not followed)";
@@ -268,7 +284,8 @@ pub struct WouldImport {
     pub logical_path: String,
     pub source_relative_path: String,
     pub size: u64,
-    /// `m1`, `m2` or `identify` (executables, kept so the edition can be checked by hash later).
+    /// `m1`, `m2`, `identify` (executables, kept so the edition can be checked by hash later) or
+    /// `audio` (music and sound files: language-neutral, see [`audio`]).
     pub role: &'static str,
     /// The language this file belongs to: `Some("en")` for `data/lang-en/...` and `ff7_en.exe`,
     /// `None` for language-neutral files (the classic `data/...` layout and `ff7.exe`).
@@ -375,6 +392,10 @@ pub struct ScanReport {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub refused_links: Vec<RefusedLink>,
     pub notes: Vec<&'static str>,
+    /// What the scan found of the install's audio (music and sound files, see [`audio`]) and an
+    /// import takes: counts, which index files are there, and the total size. All zero and false
+    /// for an install without audio.
+    pub audio: AudioSummary,
     /// The canonical install root of the Steam Edition the scanned directory belongs to, when it
     /// was identified (it can sit above the scanned directory). `import-pc` keeps its state
     /// directory out of it too. Not part of the report: it is a local path.
@@ -503,6 +524,7 @@ fn candidate_size(
             refused.push(RefusedLink {
                 relative_path: shown.to_string(),
                 reason: LINK_REFUSED,
+                audio: false,
             });
             None
         }
@@ -900,6 +922,13 @@ pub fn scan_pc(root: &Path) -> Result<ScanReport, ScanError> {
     }
     lang_dirs.sort();
 
+    // Audio below data/: its refused links and warnings are kept apart from the ones for the game
+    // files, so that nothing about audio can reach the identification of a set (see `audio`).
+    let audio = data
+        .as_ref()
+        .map(|(name, path)| discover_audio_in(path, &game.join(name), &canon_root))
+        .unwrap_or_default();
+
     // required files: classic location, every language directory, and the language variants
     let mut required_files = Vec::new();
     for w in WANTED {
@@ -1203,6 +1232,12 @@ pub fn scan_pc(root: &Path) -> Result<ScanReport, ScanError> {
                 .join(", ")
         ));
     }
+    // Audio: its warnings come last, and its refused links are listed with the others (the
+    // warning about links above is for the game files only: the audio's own is among its warnings)
+    warnings.extend(audio.warnings.iter().cloned());
+    refused_links.extend(audio.refused_links.iter().cloned());
+    refused_links.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    refused_links.dedup();
 
     // what an import would take
     let mut would_import = Vec::new();
@@ -1237,6 +1272,21 @@ pub fn scan_pc(root: &Path) -> Result<ScanReport, ScanError> {
             });
         }
     }
+    // audio is language-neutral: every import takes it (`select` keeps files without a language)
+    for f in &audio.files {
+        if let Ok(logical) = normalize_logical_path(&f.logical_path, Platform::Pc) {
+            would_import.push(WouldImport {
+                logical_path: logical,
+                source_relative_path: f.relative_path.clone(),
+                size: f.size,
+                role: "audio",
+                language: None,
+                language_inferred: false,
+                variant_of: None,
+                in_default_import: false,
+            });
+        }
+    }
     would_import.sort_by(|a, b| a.logical_path.cmp(&b.logical_path));
     would_import.dedup_by(|a, b| a.logical_path == b.logical_path);
     let would_import_bytes = would_import
@@ -1246,6 +1296,10 @@ pub fn scan_pc(root: &Path) -> Result<ScanReport, ScanError> {
     if languages.len() > 1 {
         notes.push("This install holds several languages. A library set holds exactly one: an import takes the language-neutral files plus ONE language (pass --language <code>; run again for another). Files of different languages are never mixed.");
     }
+    if !audio.files.is_empty() {
+        notes.push("Music and sound files (data/music_ogg, data/music, data/sound) are language-neutral and part of every import: see audio for what was found. To add them to a library that already holds this install, run import-pc again with the same labels.");
+    }
+    let audio_summary = audio.summary();
     let mut report = ScanReport {
         tool: "fmv-import scan-pc",
         report_version: REPORT_VERSION,
@@ -1270,6 +1324,7 @@ pub fn scan_pc(root: &Path) -> Result<ScanReport, ScanError> {
         warnings,
         refused_links,
         notes,
+        audio: audio_summary,
         steam_install_root: steam_edition.map(|s| s.install),
     };
     // mark what `import-pc` without --language would take, using the very rule it applies

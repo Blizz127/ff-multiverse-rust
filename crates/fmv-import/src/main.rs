@@ -42,6 +42,13 @@ use serde::Serialize;
 /// one that leads out of it is refused (scan-pc lists it under refused_links). A disc image, cue
 /// sheet or .bin may be a link: the file it leads to is what is read and guarded.
 ///
+/// Audio: a PC install's music and sound files (data/music_ogg/*.ogg, data/music/*.wav and
+/// music.idx, data/sound/audio.dat and audio.fmt) are imported too when it has them (scan-pc
+/// summarises them under audio); plain file names only, at most 512 files. To add audio to a
+/// library that already holds the install, run import-pc again on the same install with the same
+/// --edition/--region/--language/--revision labels: that adds the audio to the set that exists,
+/// while other labels make a second set, which the client then refuses as ambiguous.
+///
 /// Limits: a disc image may not list files that share sectors, more than 20000 files, or more
 /// than 1 GiB of files (a CD holds less); a library manifest is capped at 64 MiB, in both
 /// directions (an import that would exceed it is refused; nothing is written).
@@ -63,12 +70,22 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Read-only scan of an FF7 PC install; prints a JSON report. Writes nothing and never touches the state directory
+    ///
+    /// The report lists what an import would take, including the install's music and sound files
+    /// (data/music_ogg, data/music, data/sound) when it has them; the audio key at the end
+    /// summarises them.
     ScanPc {
         /// FF7 PC install: the folder that holds data/ (for the Steam Edition: ff7/workingdir), or
         /// the Steam Edition's install root, which is searched for ff7/workingdir/data
         dir: PathBuf,
     },
     /// Import the needed files of an FF7 PC install into a library set (refuses without flevel.lgp)
+    ///
+    /// The install's music and sound files (data/music_ogg, data/music, data/sound) are imported
+    /// too when it has them. To add audio to a library that already holds the install, run
+    /// import-pc again on the same install with the same --edition/--region/--language/--revision
+    /// labels: that adds the audio to the existing set and changes nothing else in it. Other
+    /// labels make a second set, which the client then refuses as ambiguous.
     ImportPc {
         /// FF7 PC install (opened read-only): the folder that holds data/ (for the Steam Edition:
         /// ff7/workingdir), or the Steam Edition's install root, which is searched for

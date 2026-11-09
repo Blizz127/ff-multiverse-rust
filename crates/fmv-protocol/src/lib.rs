@@ -1888,10 +1888,12 @@ mod tests {
     /// reaches the others (the binding is the entity's `appearance_ref`, and has nothing to do with the slot).
     #[test]
     fn golden_character_messages() {
-        // A registration that chose a body and a slot, one that chose nothing, and a token login (which ignores it).
+        // A registration that chose a body and a slot, one that chose nothing, and a token login (which ignores it). The
+        // version number is a literal, as in `golden_client_messages`: these pin the SHAPE, and `the_version_is_eleven`
+        // pins the version, so a bump does not have to rewrite them.
         golden(
             ClientMsg::Hello {
-                protocol_version: PROTOCOL_VERSION,
+                protocol_version: 10,
                 client_build: "c/1".into(),
                 auth: Auth::Register { display_name: "Wedge".into() },
                 character: NewCharacter { tint: [200, 10, 10], body: Some("slight".into()), slot: Some(8) },
@@ -1900,7 +1902,7 @@ mod tests {
         );
         golden(
             ClientMsg::Hello {
-                protocol_version: PROTOCOL_VERSION,
+                protocol_version: 10,
                 client_build: "c/1".into(),
                 auth: Auth::Register { display_name: "Plain".into() },
                 character: NewCharacter::with_tint([1, 2, 3]),
