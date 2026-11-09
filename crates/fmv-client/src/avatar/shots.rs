@@ -890,7 +890,18 @@ fn offscreen_real_ff7_npcs_in_two_fields() {
                 );
                 // (A humanoid's soles are within a few pixels; a door or the like has its origin
                 // elsewhere. A wrong height would be off by far more than this.)
-                assert!(near < 20.0, "{key}: the feet of {} are on the floor where it stands ({near:.1} px off)", npc.name);
+                // The canon cast stand-in (a slice rule: `CANON_STAND_INS`) is a big model, Barret's, which md1_1's steep
+                // camera sees from above, so its boots are in front of its origin on the screen (22 px at 99 px tall
+                // there, against 6 px at 213 px tall in md1stin). Its height is checked directly instead: the walkmesh
+                // surface under it is where the script puts it, and the pixels only have to be near in proportion.
+                let stand_in = fmv_ff7::CANON_STAND_INS.iter().any(|s| s.field.eq_ignore_ascii_case(key) && s.name == npc.name);
+                if stand_in {
+                    let floor = area.height_at(npc.pos.x, npc.pos.y, Some(npc.pos.z)).expect("the stand-in stands on the walkmesh");
+                    assert!((floor - npc.pos.z).abs() < 1.0, "{key}: the stand-in {} stands {:.1} units off the floor", npc.name, floor - npc.pos.z);
+                    assert!(near < 0.3 * (y1 - y0), "{key}: the feet of {} are far from where it stands ({near:.1} px of {:.0})", npc.name, y1 - y0);
+                } else {
+                    assert!(near < 20.0, "{key}: the feet of {} are on the floor where it stands ({near:.1} px off)", npc.name);
+                }
                 assert!(anchor_y.is_some_and(|y| y > view.to_view(npc.pos).map_or(0.0, |p| p.y) + 10.0), "{key}: the name of {} is over its head", npc.name);
                 // A 3x close-up around it.
                 let (cx, cy) = (((x0 + x1) / 2.0) as i64, ((y0 + y1) / 2.0) as i64);

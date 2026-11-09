@@ -812,6 +812,19 @@ run_slice() {
   read -r -a sb <<<"$stored_b"
   expect_equal "the restarted server fights them at the levels session 1 saved" "$(levels_of "$started2")" "$(sorted_words "${sa[0]}" "${sb[0]}")"
   expect_equal "the restarted server starts them with the limit gauges session 1 saved" "$(limits_of "$started2")" "$(sorted_words "${sa[4]}" "${sb[4]}")"
+  # What that proves: a restarted server that ignored a saved LEVEL or LIMIT GAUGE would still pass when the saved values
+  # are the starting ones, which is what these weak battles leave (a win pays 16 experience of the ~250 a level costs, and
+  # nobody is hurt enough to fill a gauge). Say so, as battle-smoke does for the gauge; the experience, gil and AP carry-over
+  # is checked to the point by check_paid.
+  local join_level_a join_level_b
+  join_level_a=$(progress_numbers "$WORK/r1-client-A.log" first)
+  join_level_b=$(progress_numbers "$WORK/r1-client-B.log" first)
+  if [[ ${sa[0]} == "${join_level_a%% *}" && ${sb[0]} == "${join_level_b%% *}" ]]; then
+    say "note: both players ended session 1 at the level they started at (a win pays 16 experience of the ~250 a level costs), so the carry-over of a LEVEL into the restarted server is not exercised over real processes here"
+  fi
+  if [[ ${sa[4]} == 0 && ${sb[4]} == 0 ]]; then
+    say "note: nobody's limit gauge was above 0 after session 1, so the carry-over of a non-empty gauge into the restarted server is not exercised here (crates/fmv-server/tests/progress.rs covers the level, the gauge and the restart); the experience, gil and AP carry-over is checked to the point"
+  fi
   stop_server
   # What the second battle changed is progress (and B's story); identity, binding, slot and pointers are unchanged.
   check_stored_character A "$NAME_A" "$TINT_A" "$BODY_A" "$SLOT_A"
@@ -856,7 +869,7 @@ run_slice() {
   say "session 1 guard talk: $windows_a window(s), origin=canon, the same text for both players ($(text_digest "$text_a"))"
   say "session 2b server: $started2"
   RESULT=pass
-  say "PASS: two original characters (distinct identities, bodies and slots) partied up, advanced a story and won a shared battle; the roster named them, not their slot's canon characters; the canon Barret NPC was in the field for both and the dialogue was the game's own; after a REAL server restart every card, record, level, experience, gil, AP, inventory, limit gauge and story was exactly what it was, the records were byte for byte unchanged by a login, and the restarted server fought them as their slots; $state_real unchanged ($after)."
+  say "PASS: two original characters (distinct identities, bodies and slots) partied up, advanced a story and won a shared battle; the roster named them, not their slot's canon characters; the canon Barret NPC was in the field for both and the dialogue was the game's own; after a REAL server restart every card, record, experience, gil, AP, inventory and story was exactly what it was (and the level and limit gauge, which these weak battles leave at their starting values: see the notes above), the records were byte for byte unchanged by a login, a second battle paid on top of what was saved to the point, and the restarted server fought them as their slots; $state_real unchanged ($after)."
 }
 
 main() {
