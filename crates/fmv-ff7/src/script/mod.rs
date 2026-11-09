@@ -124,6 +124,7 @@ mod decode;
 mod layout;
 mod maplist;
 mod models;
+mod exits;
 mod opcodes;
 mod text;
 
@@ -141,6 +142,10 @@ pub use decode::*;
 pub use layout::*;
 pub use maplist::*;
 pub use models::*;
+pub use exits::{
+    CompareOp, CompareWidth, ExitGuard, ExitLine, ExitTrigger, GuardTest, GuardValue, KeyTest, ScriptExit, ScriptRef, LINE_SLOTS,
+    MAX_CALL_DEPTH, MAX_SCRIPT_EXITS,
+};
 pub use opcodes::{is_jump, ends_flow, mnemonic, opcode_name_table};
 pub use text::*;
 

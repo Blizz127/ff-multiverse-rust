@@ -160,7 +160,9 @@
 //!   archive spells it (so it is also what `list_areas` reports). `MAPJUMP`s and line-trigger
 //!   scripts are script-driven and out of scope: which `REQ` chain turns a crossing into a jump
 //!   depends on the script VM and the story variables. A field whose only way out is a `MAPJUMP`
-//!   has no exits.
+//!   has no exits (the elevator `elevtr1` is one: it is a dead end today).
+//!   [`crate::script::FieldScript::script_exits`] describes those jumps (the root script that runs
+//!   them, the line, the conditions) without wiring them in; its docs list the open questions.
 //! * [`AreaRuntime::place_arrival`]: an exit's `arrival_hint` is the index of the target walkmesh
 //!   triangle that holds the arrival point; where that triangle holds the point, the arrival
 //!   stands at the triangle's height there (the right floor of a layered field), otherwise the

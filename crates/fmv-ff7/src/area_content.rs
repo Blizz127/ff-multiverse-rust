@@ -30,6 +30,8 @@
 //! `REQ` chain turns a crossing into a jump depends on story variables), so they need the script
 //! VM and are out of scope here. 1 036 of the owned data's gateways are line gateways and 1 801
 //! literal `MAPJUMP`s exist besides; a field whose only way out is a `MAPJUMP` has no exits.
+//! [`crate::script::FieldScript::script_exits`] describes the jumps (root, line, conditions) but
+//! nothing here uses it yet; see its docs for why.
 //!
 //! **Measured on the owned FF7 Steam Edition (en), 2026-11-08** (`tests/area_real.rs`): of the 1 036
 //! used gateways all 1 036 ids are in the maplist, 978 name an area the archive offers (the other 58
