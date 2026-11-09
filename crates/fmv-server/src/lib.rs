@@ -119,6 +119,7 @@
 pub mod admin;
 mod accounts;
 mod character;
+pub mod companion;
 mod config;
 mod conn;
 mod deferred;

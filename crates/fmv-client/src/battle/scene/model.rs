@@ -42,14 +42,17 @@
 //!
 //! # Whose model a party member gets
 //!
-//! **Battle placeholder: the slot's own battle model.** A player's character has one combat SLOT (protocol
-//! v8: `BattleMember::character`, a canon party member's id) and the engine fights it with that character's
-//! combat template. The model drawn for it is that character's battle model, as a placeholder for the slot: a
-//! player who holds Barret's slot is drawn as Barret in battle (with the player's own name over its head, the
-//! roster's `BattleMember::name`, see [`crate::battle::BattleClient`]). How the player looks on the field (its
-//! binding: a generic placeholder body, or the canon look of an account that predates v8) plays no part here:
-//! the field look and the slot are two different things, and in battle the model is the slot's, never the
-//! field look's ([`party_appearance`], [`battle_character`]).
+//! A battle's party is the story's canon party first and the players after it (protocol v9,
+//! `BattleMember::controller`):
+//!
+//! * **A canon companion** (Cloud, Barret) is drawn as that canon character's own battle model
+//!   ([`battle_character`]), with its own clips and weapon: it IS that character.
+//! * **A player is drawn as its own body**: the placeholder FIELD body its binding names (the look every other
+//!   player sees on the field, `ff7/body/<archetype>`, or for an account that predates v8 the canon look it kept),
+//!   in the player's colour, and it moves procedurally (it runs up and lunges: a field body has no battle clips). What
+//!   the engine fights it with, its stat curve (`BattleMember::character`), plays no part in its model: **a canon battle
+//!   model on a player is a bug**, and a player whose binding this client does not know gets the default placeholder
+//!   body, never a canon model ([`player_appearance`]).
 //!
 //! # Which clip plays what
 //!
@@ -237,15 +240,33 @@ impl BattleActorModel {
     }
 }
 
-/// Who a party member is, for choosing its model. Only its combat SLOT counts (see the module docs, "Whose
-/// model a party member gets"): how its player looks on the field is not asked.
+/// Who a party member is, for choosing its model (see the module docs, "Whose model a party member gets").
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartyLook {
     pub actor: ActorId,
-    /// The combat slot: the FF7 character id the engine fights as (`BattleMember::character`).
+    /// The FF7 character id the engine fights as (`BattleMember::character`): who a companion IS, and for a player only
+    /// its stat curve, which no model comes from.
     pub character: u8,
     /// Our own character.
     pub mine: bool,
+    /// A canon companion of the story's party (`Controller::Companion`): drawn as the canon character's own battle
+    /// model. `false` for a player, which is drawn as its own body.
+    pub companion: bool,
+    /// How the game draws the PLAYER on the field (its binding: the `appearance_ref` of its entity in this client's
+    /// snapshots), `None` when this client does not know it and for a companion (never read for one).
+    pub binding: Option<String>,
+}
+
+impl PartyLook {
+    /// A canon companion of the story's party.
+    pub fn companion(actor: ActorId, character: u8, mine: bool) -> Self {
+        Self { actor, character, mine, companion: true, binding: None }
+    }
+
+    /// A player, whose field look is `binding` (when this client knows it).
+    pub fn player(actor: ActorId, character: u8, mine: bool, binding: Option<String>) -> Self {
+        Self { actor, character, mine, companion: false, binding }
+    }
 }
 
 /// What an enemy is, for choosing its model.
@@ -289,11 +310,21 @@ fn character_appearance(character: u8) -> Option<&'static str> {
     })
 }
 
-/// The appearance a party member's stand-in model has: the field model of the character in whose combat slot
-/// it fights, else the default (Cloud) for a slot with no field model (Cait Sith's, or an id that is nobody's).
-/// A battle placeholder: the slot's own model, never the player's field look.
+/// The appearance a canon companion's stand-in model has (when this machine has no battle archive): the field model
+/// of the canon character it is, else the default (Cloud) for one with no field model (Cait Sith, or an id that is
+/// nobody's). Only ever for a companion: a player is drawn as its own body ([`player_appearance`]).
 pub fn party_appearance(character: u8) -> &'static str {
     character_appearance(character).unwrap_or(fmv_ff7::playable::DEFAULT_APPEARANCE)
+}
+
+/// The field model a PLAYER is drawn as in battle: the look its binding names when it is one the game has (a
+/// placeholder body, or, for an account that predates v8, the canon look it kept: what every player sees of it in the
+/// field), else the default placeholder body ([`fmv_ff7::playable::DEFAULT_BODY`]). Never a canon character on account of
+/// the player's stat curve, and never the game's default canon look.
+pub fn player_appearance(binding: Option<&str>) -> &'static str {
+    binding
+        .and_then(fmv_ff7::playable::resolve_model)
+        .map_or_else(|| fmv_ff7::playable::body_or_default(None).model.appearance_ref, |model| model.appearance_ref)
 }
 
 /// A number that is the same for the same enemy: its id, else a hash of its name (so enemies the
@@ -305,13 +336,15 @@ fn kind_of(enemy: &EnemyLook) -> u64 {
     }
 }
 
-/// The stand-ins: the party's field models, boxes for the enemies.
+/// The stand-ins: the party's field models (a companion's is the canon character's, a player's its own body), boxes
+/// for the enemies.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct StandInModels;
 
 impl BattleModelSource for StandInModels {
     fn party_member(&mut self, who: &PartyLook) -> BattleActorModel {
-        BattleActorModel::Field(Some(party_appearance(who.character).to_string()))
+        let look = if who.companion { party_appearance(who.character) } else { player_appearance(who.binding.as_deref()) };
+        BattleActorModel::Field(Some(look.to_string()))
     }
 
     fn enemy(&mut self, who: &EnemyLook) -> BattleActorModel {
@@ -392,10 +425,10 @@ impl EnemyBook {
 
 }
 
-/// The playable character whose battle model a party member gets: the one in whose combat slot it fights
-/// (FF7's ids: Cloud 0, Barret 1, Tifa 2, Aerith 3, Red XIII 4, Yuffie 5, Cait Sith 6, Vincent 7, Cid 8),
-/// else Cloud for an id that is nobody's. A battle placeholder: the slot's own battle model, whatever the
-/// player looks like on the field. Cait Sith, who has no field model, has a battle model.
+/// The playable character whose battle model a canon companion gets: the one it is (FF7's ids: Cloud 0, Barret 1,
+/// Tifa 2, Aerith 3, Red XIII 4, Yuffie 5, Cait Sith 6, Vincent 7, Cid 8), else Cloud for an id that is nobody's.
+/// Cait Sith, who has no field model, has a battle model. (A player has no battle model of its own yet: it is drawn
+/// as its own field body.)
 pub fn battle_character(character: u8) -> BattleCharacter {
     match character {
         0 => BattleCharacter::Cloud,
@@ -472,7 +505,12 @@ impl ArchiveModels {
 }
 
 impl BattleModelSource for ArchiveModels {
+    /// A canon companion is the canon character's battle model; a PLAYER is its own field body (the stand-in's answer:
+    /// a canon battle model on a player is a bug), which the archive has no say in.
     fn party_member(&mut self, who: &PartyLook) -> BattleActorModel {
+        if !who.companion {
+            return StandInModels.party_member(who);
+        }
         let which = battle_character(who.character);
         match self.made(which.prefix().to_string(), ModelRole::Character, || which.display_name().to_string(), |m| m.load_character(which)) {
             Some(data) => BattleActorModel::Battle(data),
@@ -972,11 +1010,42 @@ mod tests {
         for character in 0..=255u8 {
             assert!(fmv_ff7::playable::resolve_appearance(party_appearance(character)).is_some());
         }
-        // The stand-in source says Field with that model for the party and a box for an enemy.
+        // The stand-in source says Field with the canon character's model for a companion, the player's own body for a
+        // player, and a box for an enemy.
         let mut source = StandInModels;
-        let who = PartyLook { actor: ActorId(0), character: 2, mine: true };
+        let who = PartyLook::companion(ActorId(0), 2, true);
         assert!(matches!(source.party_member(&who), BattleActorModel::Field(Some(ref r)) if r == "ff7/tifa"));
         assert!(matches!(source.enemy(&enemy(Some(4), "Guard", 120)), BattleActorModel::Box(_)));
+    }
+
+    /// A PLAYER is drawn as its own body, whatever stat curve it fights with: the field look its binding names (a
+    /// placeholder body, or the canon look a migrated account kept: what everybody sees of it in the field), the default
+    /// placeholder body for a binding this machine does not have, and never a canon character on account of the curve.
+    #[test]
+    fn a_player_is_drawn_as_its_own_body_and_never_as_the_canon_character_of_its_curve() {
+        let default_body = fmv_ff7::playable::body_or_default(None).model.appearance_ref;
+        assert!(fmv_ff7::playable::resolve_appearance(default_body).is_none(), "the default is a placeholder body, not a canon model");
+        for body in fmv_ff7::playable::PLACEHOLDER_BODIES {
+            assert_eq!(player_appearance(Some(body.model.appearance_ref)), body.model.appearance_ref);
+        }
+        // An account that predates v8 keeps the canon look it chose (its binding), whatever curve it has.
+        assert_eq!(player_appearance(Some("ff7/tifa")), "ff7/tifa");
+        assert_eq!(player_appearance(Some(" FF7/Cloud ")), "ff7/cloud");
+        // A binding this machine does not know, or none: the default body, never the game's default canon look.
+        for unknown in [None, Some(""), Some("ff7/nobody"), Some("../../etc/passwd"), Some("ff8/squall")] {
+            assert_eq!(player_appearance(unknown), default_body, "{unknown:?}");
+        }
+        // Every curve of the nine, with a placeholder body: the model asked for is the body, never the curve's canon model.
+        let mut source = StandInModels;
+        for curve in 0..=8u8 {
+            let who = PartyLook::player(ActorId(2), curve, true, Some("ff7/body/sturdy".to_string()));
+            assert!(matches!(source.party_member(&who), BattleActorModel::Field(Some(ref r)) if r == "ff7/body/sturdy"), "curve {curve}");
+            let unknown = PartyLook::player(ActorId(2), curve, false, None);
+            assert!(matches!(source.party_member(&unknown), BattleActorModel::Field(Some(ref r)) if r == default_body), "curve {curve} without a look");
+        }
+        // A companion is still the canon character, whatever look a snapshot names.
+        let cloud = PartyLook { binding: Some("ff7/body/sturdy".to_string()), ..PartyLook::companion(ActorId(0), 0, false) };
+        assert!(matches!(source.party_member(&cloud), BattleActorModel::Field(Some(ref r)) if r == "ff7/cloud"));
     }
 
     #[test]

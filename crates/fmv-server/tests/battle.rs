@@ -95,7 +95,7 @@ async fn play(j: &mut Joined, rules: &SyntheticRules) -> Played {
     assert_eq!(data_fingerprint, rules.data_fingerprint());
     let setup = BattleSetup { formation_id, seed, party: party.clone(), preemptive, back_attack, battle_speed, ticks_per_second };
     let mut replay = BattleReplay::start(rules, &setup).expect("the client builds the battle from its own data");
-    let mine = ActorId(party.iter().position(|m| m.entity == j.entity).expect("we are in the party") as u8);
+    let mine = ActorId(party.iter().position(|m| m.entity() == Some(j.entity)).expect("we are in the party") as u8);
     let (mut pending, mut events, mut commands_sent, mut updates_during_battle) = (false, 0, 0, 0);
     let mut rejections = Vec::new();
     let mut saw_the_outcome = false;
@@ -219,8 +219,8 @@ async fn commands_are_refused_for_other_peoples_characters_unready_gauges_and_un
     assert_eq!(start[0], start[1], "both members receive the very same start");
     let ServerMsg::EncounterStart { battle_id, party, formation_id, .. } = &start[0] else { unreachable!() };
     assert_eq!((*formation_id, party.len()), (0, 2));
-    assert_eq!((party[0].entity, party[1].entity), (a.entity, b.entity));
-    assert_eq!((party[0].account, party[1].account), (a.account, b.account));
+    assert_eq!((party[0].entity(), party[1].entity()), (Some(a.entity), Some(b.entity)));
+    assert_eq!((party[0].account(), party[1].account()), (Some(a.account), Some(b.account)));
     let attack = |actor: u8| ClientMsg::BattleCommand { battle_id: *battle_id, actor: ActorId(actor), command: Command::Attack { target: ActorId(2) } };
 
     async fn refusal(j: &mut Joined, msg: ClientMsg) -> (Option<BattleId>, BattleRejection) {

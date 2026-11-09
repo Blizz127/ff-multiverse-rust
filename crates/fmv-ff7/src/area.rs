@@ -709,11 +709,6 @@ impl Ff7FieldArea {
         let mut area = Self { info, field, walkmesh, surface, bounds, spawns, field_scale, exits, npcs: Vec::new(), encounters, story };
         // NPCs without a literal height stand on this area's own surface, so they are worked out last.
         area.npcs = area_content::npc_spawns(&area.field, &area.walkmesh, |x, y| area.height_at(x, y, None));
-        // The canon cast the slice keeps in a few fields (a stand-in rule, see `area_content::CANON_STAND_INS`) comes
-        // AFTER the NPCs of the data, so that their indexes (which the protocol keeps stable) do not move.
-        let stand_ins = area_content::canon_stand_in_spawns(&area.info.id.key, &area.field, &area.walkmesh, |x, y| area.height_at(x, y, None));
-        let room = area_content::MAX_NPCS_PER_AREA.saturating_sub(area.npcs.len());
-        area.npcs.extend(stand_ins.into_iter().take(room));
         area
     }
 
@@ -879,8 +874,14 @@ impl AreaRuntime for Ff7FieldArea {
         self.story.advance(progress, point)
     }
 
-    // `npcs_in_phase` keeps its default: every account sees the NPCs it has always seen. The phase
-    // key is where a later lane hangs the canon cast (see `crate::story`, "What this does not do").
+    /// The story's canon party at this story state ([`crate::story::CANON_PARTIES`]): Cloud and Barret for the
+    /// first reactor mission. The same in every field: the party follows the story, not the place.
+    fn story_party(&self, progress: &[u8]) -> Vec<u8> {
+        crate::story::canon_party_of(progress)
+    }
+
+    // `npcs_in_phase` keeps its default: every account sees the NPCs it has always seen. The canon party is
+    // in the battle, not in the field (see `crate::story`, "What this does not do").
 
     /// The hint is the index of a triangle of this walkmesh (an exit's `arrival_hint`): when it
     /// names one that holds the arrival point, the point stands on that triangle, at its height

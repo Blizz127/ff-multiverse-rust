@@ -1305,8 +1305,8 @@ fn a_bad_body_or_slot_is_a_usage_error_before_anything_runs() {
         (&["--body", "../etc"][..], "body id"),
         (&["--body", ""][..], "body id"),
         (&["--slot", "9999"][..], "out of range"),
-        (&["--slot", "1.5"][..], "not a combat slot"),
-        (&["--slot", "sephiroth"][..], "not a combat slot"),
+        (&["--slot", "1.5"][..], "not a fighting style"),
+        (&["--slot", "sephiroth"][..], "not a fighting style"),
         (&["--slot", "cloud"][..], "never offered"),
     ] {
         let mut full = vec!["--server", "127.0.0.1:1", "--name", "x", "--headless"];

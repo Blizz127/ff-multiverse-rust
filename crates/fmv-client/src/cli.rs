@@ -46,19 +46,22 @@ ACCOUNTS:
   when the server's accounts were reset (\"invalid or unknown token\"). The token is a password: it
   is never printed, except in the error shown when it could not be saved (so it is not lost).
   Your account has ONE original character that travels across games: a name, a colour and a body
-  (its identity), how the game draws it and, in FF7, the combat slot of a canon party member other
-  than Cloud that it fights with (Barret's combat moves and level curve, say; Barret himself stays
-  in the story as a non-player character and no dialogue is ever renamed). A registration asks for
-  it with --tint, --body and --slot; after that the server decides from the character it stores and
+  (its identity), how the game draws it and, in FF7, a fighting style: the stat curve (stats, spells and
+  level curve) of one of the game's characters other than Cloud, the gunner's, say. Your character is
+  ADDED to the story's own party, which stays in it and fights beside you commanded by the server (Cloud
+  and Barret in the first mission), and no dialogue is ever renamed. A registration asks for it with
+  --tint, --body and --slot; after that the server decides from the character it stores and
   tells you what it holds (the `character:` line on stderr, see HEADLESS OUTPUT). In FF7 a new
   character's field model is a generic placeholder body tinted with your colour: NOT the model of
-  any party member, whatever your slot. The slot is chosen once and stays fixed, and a slot the
+  any party member, whatever your style. The style is chosen once and stays fixed, and a curve the
   game does not offer to a new character (Cloud's, 0, or an id that is nobody's) is refused by the
   server: the run exits with code 1 and the server's sentence, and no account is made.
   --body ID names one of the game's placeholder bodies (1 to 32 letters, digits, `_` and `-`; the
-  server uses its default body for an id it does not know); --slot is a name (barret, tifa, aerith,
-  redxiii, yuffie, caitsith, vincent or cid; case and spaces do not matter) or an id from 0 to 255.
-  Left out, the server's defaults apply (the default body, and Barret's slot).
+  server uses its default body for an id it does not know); --slot is a fighting style by its name
+  (gunner, martial artist, mage, guardian, ninja, gambler, marksman or lancer), or the curve it stands for by the
+  name of the canon character whose stats it uses (barret, tifa, aerith, redxiii, yuffie, caitsith, vincent or
+  cid), or an id from 0 to 255; case and spaces do not matter.
+  Left out, the server's defaults apply (the default body, and the Gunner's style).
 
 CONTENT:
   --game fixture (default) uses the synthetic FIXTURE area, NOT FF7.
@@ -82,7 +85,7 @@ HEADLESS OUTPUT:
   them (0 and 0 when it reports none: a server without battle data, such as the FIXTURE one, has no
   characters); every report is also logged on stderr as a `progress: name=<enc> slot=<enc> level=<n>
   exp=<n> exp_to_next=<n> gil=<n> ap=<n> leveled_up=<bool>` line (the player's own name and the name of
-  the combat slot it fights in). items=<n> is how many
+  the stat curve it fights with, an internal one). items=<n> is how many
   items this player's account carries as the server last reported it (the counts of all stacks
   added up, 0 when it reports none); every report is also logged on stderr as a
   `battle: inventory: stacks=<n> total=<n> items=<item>:<count>,...` line (item ids, never names).
@@ -93,14 +96,14 @@ HEADLESS OUTPUT:
   `character: name=<enc> tint=rrggbb body=<enc|-> binding=<enc|-> slot=<n|-> slot_name=<enc|->
   migrated=<bool>` once, after joining: what the server holds of this player's own character: its name,
   colour, the body it was created with, how the game draws it (the binding, which is what other
-  players see on the entity), the combat slot it fights with (FF7: the canon character's id) and that
-  slot's own name, and whether it was made from an account that predates player characters.
+  players see on the entity), the stat curve it fights with (FF7: the canon character's id) and that
+  curve's own name (both internal), and whether it was made from an account that predates player characters.
   `headless: peer entity=<n> name=<enc> tint=rrggbb binding=<enc|-> area=<AreaId>` when another player
   first appears in the area and again whenever its colour or binding changes (never every frame): each
-  player's binding, which is the placeholder body, never the slot's canon character.
+  player's binding, which is the placeholder body, never a canon character's.
   `headless: <n> NPC(s) in <AreaId>: <names>` and, for each of them, `headless: npc area=<AreaId>
   id=<n> name=<enc> model=<enc>` whenever the area's non-player characters change: the canon characters
-  of a field stay in it whoever holds their slot.
+  of a field stay in it whoever plays.
   --talk NAME[,NAME...] talks to those characters once each, as soon as the area announces them, through
   the window's own conversation code (their own talk scripts in your copy of the field, read with the story
   this player has reached): `talk: npc=<enc> story=<moment|-> window=<n> origin=<canon|added> [ask=<first>-<last>]
@@ -144,26 +147,27 @@ BATTLES:
   and shouts `BATTLE DIVERGENCE` if its replay ever disagrees with the server. Without battle data
   in your library you can only wait the battle out.
   Your character is your own: the server keeps its level, experience, AP and gil per account, fights
-  you with the combat template of your slot (the canon party member you chose when you created it)
-  at that level, pays it when a battle is won and tells you (and when you join) what it has now; the
-  window shows it under the area name, for instance `Wedge (Barret)  Lv 7  EXP 626/949  Gil 20`: your
-  own name, then your slot's. Every party member is called by its player's own name in the battle
-  windows and the log (never by the canon character's whose slot it holds), and its model in battle is
-  that slot's own battle model, a stand-in for it: how you look on the field plays no part. Each battle
-  starts with one `battle: roster actor=<i> name=<enc> slot=<n> slot_name=<enc> level=<n>` line per
-  member on stderr.
+  you with the stat curve of your fighting style at that level, pays it when a battle is won and tells
+  you (and when you join) what it has now; the window shows it under the area name, for instance
+  `Wedge (Gunner)  Lv 7  EXP 626/949  Gil 20`: your own name, then your fighting style. A battle's party
+  is the story's canon party first (Cloud and Barret in the first mission: the server commands them, every
+  client replays their commands like yours) and then the players, each called by its own name in the battle
+  windows and the log; your character in battle is drawn as ITS OWN body (the placeholder body you see in the
+  field, in your colour), never as a canon character. Players have no limit break for now. Each battle
+  starts with one `battle: roster actor=<i> name=<enc> slot=<n> slot_name=<enc> level=<n> controller=<companion|player>`
+  line per member on stderr.
 
 CHARACTER MENU:
   A window started without --name opens on a character menu instead of logging in at once; with
   --name the menu is skipped and the run behaves as before, and --headless never shows it. The
-  menu lists the characters saved for the server (name, colour, body and `slot: <name>`). Up/Down choose, Enter
+  menu lists the characters saved for the server (name, colour, body and `style: <name>`). Up/Down choose, Enter
   plays, N creates a new one, Del forgets a saved login on THIS computer (it asks first; the
   character stays on the server, but you can only log in as it again if you still have its
   token), Esc quits. The create screen takes a name (up to 24 characters), a body (FF7: a generic
   placeholder model: how you look on the field, nothing else), a colour (a palette plus red, green
-  and blue sliders: the model is tinted with it) and a combat slot (FF7: Barret, Tifa, Aerith,
-  Red XIII, Yuffie, Cait Sith, Vincent or Cid, never Cloud; Barret is the default): who you fight
-  as, its combat moves and level curve, fixed once created and not how you look. A line under each
+  and blue sliders: the model is tinted with it) and a fighting style (FF7: Gunner, Martial artist, Mage,
+  Guardian, Ninja, Gambler, Marksman or Lancer; the Gunner is the default): how you fight, its stats,
+  spells and level curve, fixed once created and not how you look. A line under each
   of the two rows says so. Tab or Up/Down move between the fields, Left/Right/Space change a
   choice and Enter registers. When the server refuses (name taken, registration closed, rate
   limited) the reason is shown on screen and you can try again.
@@ -269,11 +273,12 @@ pub struct Args {
     #[arg(long, value_name = "ID", value_parser = parse_body)]
     pub body: Option<String>,
 
-    /// The combat slot of a NEW character: the canon FF7 party member whose combat moves and level
-    /// curve it fights with, by name (barret, tifa, aerith, redxiii, yuffie, caitsith, vincent, cid;
-    /// case and spaces do not matter, `aeris` and `red13` work too) or by id (0 to 255: Barret 1 ...
-    /// Cid 8). Cloud, 0, is never offered to a new character: the server refuses it. Default: the
-    /// server's (Barret). The slot stays fixed once created. Only used when registering.
+    /// The fighting style of a NEW character (its stat curve, the combat slot of the protocol): by the style's name
+    /// (gunner, martial artist, mage, guardian, ninja, gambler, marksman, lancer), by the name of the canon
+    /// character whose stats the style uses (barret, tifa, aerith, redxiii, yuffie, caitsith, vincent, cid; `aeris`
+    /// and `red13` work too) or by id (0 to 255: Barret 1 ... Cid 8). Case and spaces do not matter. Cloud's curve,
+    /// 0, is never offered to a new character: the server refuses it. Default: the server's (the Gunner's). The
+    /// style stays fixed once created. Only used when registering.
     #[arg(long, value_name = "NAME|ID", value_parser = parse_slot)]
     pub slot: Option<u8>,
 
@@ -523,27 +528,32 @@ fn slot_key(text: &str) -> String {
     text.chars().filter(|c| !c.is_whitespace()).flat_map(char::to_lowercase).collect()
 }
 
-/// A combat slot for `--slot`: a canon party member by name (`barret`, `tifa`, `aerith` or `aeris`,
-/// `redxiii` or `red13`, `yuffie`, `caitsith`, `vincent`, `cid`; case and spaces do not matter), or any
-/// number 0 to 255, which is sent as it is (so that the server's refusal of Cloud's slot, 0, and of the ids
-/// that are nobody's, can be tried on purpose). Cloud by name is an error that says why.
+/// A fighting style (a stat curve) for `--slot`: a style by its name (`gunner`, `martialartist`, `mage`, `guardian`,
+/// `ninja`, `gambler`, `marksman`, `lancer`), or the canon character whose stats it uses by name (`barret`, `tifa`,
+/// `aerith` or `aeris`, `redxiii` or `red13`, `yuffie`, `caitsith`, `vincent`, `cid`); case and spaces do not
+/// matter. Or any number 0 to 255, which is sent as it is (so that the server's refusal of Cloud's curve, 0, and of the
+/// ids that are nobody's, can be tried on purpose). Cloud's curve by name (`cloud`, `swordsman`) is an error that says why.
 pub fn parse_slot(s: &str) -> Result<u8, String> {
     let key = slot_key(s);
     if key.is_empty() {
-        return Err("the combat slot is empty: give a name (barret, tifa, aerith, redxiii, yuffie, caitsith, vincent, cid) or an id from 0 to 255".to_string());
+        return Err("the fighting style is empty: give a style (gunner, martial artist, mage, guardian, ninja, gambler, marksman, lancer), a canon character's name for its curve (barret, tifa, aerith, redxiii, yuffie, caitsith, vincent, cid) or an id from 0 to 255".to_string());
     }
     if key.bytes().all(|b| b.is_ascii_digit()) {
-        return key.parse::<u8>().map_err(|_| format!("`{}` is out of range: a combat slot id is 0 to 255", clean_for_error(s)));
+        return key.parse::<u8>().map_err(|_| format!("`{}` is out of range: a fighting style's id is 0 to 255", clean_for_error(s)));
     }
-    if key == "cloud" {
-        return Err("Cloud's combat slot is never offered to a new character (he stays the story's protagonist); choose another party member, or pass 0 to see the server refuse it".to_string());
+    if key == "cloud" || key == "swordsman" {
+        return Err("Cloud's curve (the Swordsman's style) is never offered to a new character (he stays the story's protagonist); choose another style, or pass 0 to see the server refuse it".to_string());
     }
+    let styled = crate::progress::FF7_FIGHTING_STYLES.iter().filter(|style| style.curve != 0).find(|style| slot_key(style.label) == key).map(|style| style.curve);
     let named = CharacterId::ALL.iter().copied().filter(|id| *id != CharacterId::Cloud).find(|id| slot_key(id.name()) == key);
     let aliased = SLOT_ALIASES.iter().find(|(alias, _)| *alias == key).map(|(_, id)| *id);
+    if let Some(curve) = styled {
+        return Ok(curve);
+    }
     match named.or(aliased) {
-        Some(id) => u8::try_from(id.index()).map_err(|_| "that combat slot has no id".to_string()),
+        Some(id) => u8::try_from(id.index()).map_err(|_| "that fighting style has no id".to_string()),
         None => Err(format!(
-            "`{}` is not a combat slot: use barret, tifa, aerith, redxiii, yuffie, caitsith, vincent or cid, or an id from 0 to 255",
+            "`{}` is not a fighting style: use gunner, martial artist, mage, guardian, ninja, gambler, marksman or lancer (or barret, tifa, aerith, redxiii, yuffie, caitsith, vincent or cid for the curve it stands for), or an id from 0 to 255",
             clean_for_error(s)
         )),
     }
@@ -894,19 +904,20 @@ mod tests {
             "--body <ID>",
             "--slot <NAME|ID>",
             "ONE original character that travels across games",
-            "combat slot of a canon party member other than Cloud",
+            "a fighting style: the stat curve (stats, spells and level curve) of one of the game's characters other than Cloud",
+            "ADDED to the story's own party",
             "a generic placeholder body tinted with your colour: NOT the model of any party member",
-            "The slot is chosen once and stays fixed",
+            "The style is chosen once and stays fixed",
             "the run exits with code 1 and the server's sentence",
             "barret, tifa, aerith, redxiii, yuffie, caitsith, vincent or cid",
             "a body (FF7: a generic placeholder model: how you look on the field, nothing else)",
-            "who you fight as, its combat moves and level curve, fixed once created and not how you look",
+            "how you fight, its stats, spells and level curve, fixed once created and not how you look",
             "Left/Right/Space change a choice",
-            "(name, colour, body and `slot: <name>`)",
+            "(name, colour, body and `style: <name>`)",
             // (the help is read with its whitespace collapsed, so the two spaces before Lv are one here)
-            "`Wedge (Barret) Lv 7 EXP 626/949 Gil 20`",
-            "that slot's own battle model, a stand-in for it: how you look on the field plays no part",
-            "`battle: roster actor=<i> name=<enc> slot=<n> slot_name=<enc> level=<n>`",
+            "`Wedge (Gunner) Lv 7 EXP 626/949 Gil 20`",
+            "drawn as ITS OWN body (the placeholder body you see in the field, in your colour), never as a canon character",
+            "`battle: roster actor=<i> name=<enc> slot=<n> slot_name=<enc> level=<n> controller=<companion|player>`",
             "progress: name=<enc> slot=<enc> level=<n> exp=<n> exp_to_next=<n> gil=<n> ap=<n> leveled_up=<bool>",
             "`character: name=<enc> tint=rrggbb body=<enc|-> binding=<enc|-> slot=<n|-> slot_name=<enc|-> migrated=<bool>`",
             "`headless: peer entity=<n> name=<enc> tint=rrggbb binding=<enc|-> area=<AreaId>`",

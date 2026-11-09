@@ -66,11 +66,18 @@
 //! Advancing is monotone: a point sets the moment only if the guards hold for the player's current
 //! moment **and** the new value is higher.
 //!
+//! # The canon party
+//!
+//! The moment also says who the STORY's party is ([`CANON_PARTIES`], [`canon_party`]): Cloud and Barret
+//! in the first reactor mission. A battle starts with that party (server-controlled companions) and the players'
+//! own characters join it as extra members; nobody is replaced and the canon characters are never field NPCs. The
+//! table has one row today and says, in its own docs, how a later row is established.
+//!
 //! # What this does not do
 //!
 //! * No cast per phase for FF7 yet: [`AreaRuntime::npcs_in_phase`] keeps the server's existing
 //!   behaviour (the NPCs the data places unconditionally), so every account sees exactly the NPCs it
-//!   always saw. The phase key is what a later lane keys the canon cast on.
+//!   always saw. The phase key is what a later lane keys the field's cast on.
 //! * Only `Var[2][0]` is modelled. Other story variables (the bits NPCs and items hang off) are not
 //!   part of the progression yet; the blob is versioned so they can be added.
 //!
@@ -84,7 +91,7 @@ use fmv_adapter_api::{StoryPoint, StoryStep, StoryTrigger};
 use fmv_core::{PhaseKey, Pos};
 
 use crate::field::Walkmesh;
-use crate::script::dialogue::{StartOfGame, StoryVars};
+use crate::script::dialogue::StoryVars;
 use crate::script::{FieldScript, Instruction, Operand, INIT_SCRIPT, SCRIPTS_PER_ENTITY};
 
 /// The bank of the main progress counter (`Var[2][0]`).
@@ -131,9 +138,66 @@ impl StoryState {
     }
 }
 
+/// FF7's character ids as the savemap and a field script's `PC` operand number them (the ids that
+/// `fmv_ff7_battle::kernel::CharacterId::index` and a battle's `BattleMember::character` use too). Only the
+/// ones the canon party table below names.
+pub const CLOUD: u8 = 0;
+/// Barret's character id (see [`CLOUD`]).
+pub const BARRET: u8 = 1;
+
+/// One row of [`CANON_PARTIES`]: who stands in the story's own party from `from_moment` on, until the next row's
+/// moment, in party order (slot 0 first).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CanonParty {
+    /// The first main-progress moment (`Var[2][0]`) this party holds for.
+    pub from_moment: u16,
+    /// The characters, at most three (FF7's party has three slots), no repeats.
+    pub members: &'static [u8],
+}
+
+/// **The canon party by story moment** (a small table, extended row by row): the characters of the game's own story
+/// that fight BESIDE the players as server-controlled companions. A player's original character is added to this
+/// party, never put in a member's place, so these stay in the story whoever plays.
+///
+/// What is established, and from where: the first reactor mission (the Bombing Mission: the moments of `md1stin`
+/// and `md1_1`, and every moment after them until a row below says otherwise) is fought by **Cloud and Barret**.
+/// That is the game's story (the opening mission's party), what
+/// [`StartOfGame`](crate::script::dialogue::StartOfGame) has always answered to a dialogue script's `IFPRTYQ`, and
+/// what the first mission's own fields are built for: `md1stin` and `md1_1` each bind one party entity to character
+/// 0 and one to character 1 (a `PC` operand; the second wears Barret's skeleton: measured by
+/// `tests/area_real.rs`, `barret_is_a_party_member_in_the_data_...`). The table does NOT read `kernel.bin`'s initial
+/// party bytes (they read Barret, Tifa, Cloud on the owned copy: a savemap default the game's first script
+/// replaces) nor the party-setting instructions of those fields (the only one, in `md1stin`'s opening scene, is
+/// `PRTYE 0, 254, 254`, whose last two operands are not character ids: a cutscene's party, measured with
+/// `examples/script_dump`).
+///
+/// **A later row is added when someone has established, from the field scripts' `PRTYP`, `PRTYM` and `PRTYE`
+/// instructions and the moment they run at, who joins or leaves and when** (Aerith and Tifa join after the
+/// reactor; none of that is in a field this slice offers yet). Until then a story that has moved past the first
+/// mission keeps the Bombing Mission's party rather than an invented one. Rows ascend by moment and the first is
+/// moment 0, so every moment has a party (a test holds the table to that).
+pub const CANON_PARTIES: &[CanonParty] = &[CanonParty { from_moment: 0, members: &[CLOUD, BARRET] }];
+
+/// The canon party of a story state ([`CANON_PARTIES`]): the row with the greatest `from_moment` that is not past
+/// the moment. Cloud and Barret in every row there is today.
+pub fn canon_party(state: StoryState) -> Vec<u8> {
+    CANON_PARTIES
+        .iter()
+        .rev()
+        .find(|row| row.from_moment <= state.moment)
+        .map_or_else(Vec::new, |row| row.members.to_vec())
+}
+
+/// The canon party for an account whose progression blob is `progress` (what `AreaRuntime::story_party` answers):
+/// the party of the state it records, and, for a blob that cannot be read (never interpreted or advanced), the
+/// new game's own party.
+pub fn canon_party_of(progress: &[u8]) -> Vec<u8> {
+    canon_party(StoryState::decode(progress).unwrap_or_else(StoryState::new_game))
+}
+
 /// The dialogue lane's source of story variables (`StoryVars`) for an account: `Var[2][0]` is its moment
 /// (the word at bank 2, address 0: low byte first), every other variable is 0 as in a new game, and the
-/// party is a new game's (the Bombing Mission's) until the combat-slot lane decides who stands in it. So
+/// party is the story's canon party ([`canon_party`]) whatever the player's own character is. So
 /// a conversation reads the player's OWN story, whichever character the player looks like:
 /// `talk.set_story(Box::new(move || Box::new(state)))` with `state` decoded from the progression the
 /// server told this client (`fmv-client`'s `StoryMirror::progress`).
@@ -148,7 +212,7 @@ impl StoryVars for StoryState {
     }
 
     fn party_member(&self, slot: u8) -> Option<u8> {
-        StartOfGame.party_member(slot)
+        canon_party(*self).get(usize::from(slot)).copied()
     }
 }
 
@@ -508,6 +572,7 @@ fn triangle_guard(
 mod tests {
     use super::*;
     use crate::field::Vertex;
+    use crate::script::dialogue::StartOfGame;
     use crate::script::synth::SynthScript;
 
     // ---- a tiny assembler for the opcodes the story reads ----
@@ -605,6 +670,45 @@ mod tests {
         let state = StoryState::new_game();
         assert_eq!((0..3).map(|s| state.party_member(s)).collect::<Vec<_>>(), (0..3).map(|s| StartOfGame.party_member(s)).collect::<Vec<_>>());
         assert_eq!(StoryState::decode(&[]).map(|s| s.byte(2, 0)), Some(1), "a new account reads moment 1");
+    }
+
+    /// The canon party table is a small contract: it covers every moment, ascends, and names at most three
+    /// distinct characters of the nine.
+    #[test]
+    fn the_canon_party_table_covers_every_moment_in_order() {
+        assert_eq!(CANON_PARTIES.first().map(|row| row.from_moment), Some(0), "every moment has a party");
+        assert!(CANON_PARTIES.windows(2).all(|w| w[0].from_moment < w[1].from_moment), "rows ascend by moment");
+        for row in CANON_PARTIES {
+            assert!(!row.members.is_empty() && row.members.len() <= 3, "{row:?}: FF7's party has three slots");
+            assert!(row.members.iter().all(|&c| c <= 8), "{row:?}: a character id");
+            let mut seen = row.members.to_vec();
+            seen.sort_unstable();
+            seen.dedup();
+            assert_eq!(seen.len(), row.members.len(), "{row:?}: nobody twice");
+        }
+        for moment in [0u16, 1, 6, 7, 255, 1600, u16::MAX] {
+            assert_eq!(canon_party(StoryState { moment }), vec![CLOUD, BARRET], "moment {moment}");
+        }
+    }
+
+    /// The first reactor mission is fought by Cloud and Barret, from the very start: the party the story has
+    /// always answered to a dialogue script's `IFPRTYQ`, for a new account (the empty blob), a stored moment and a
+    /// blob nobody can read.
+    #[test]
+    fn the_first_missions_canon_party_is_cloud_and_barret_for_every_blob() {
+        let stored = StoryState { moment: 6 }.encode();
+        let blobs: [&[u8]; 5] = [&[], &stored, &[9, 9], &[BLOB_VERSION, 1], &[2, 1, 0]];
+        for blob in blobs {
+            assert_eq!(canon_party_of(blob), vec![CLOUD, BARRET], "{blob:?}");
+        }
+        assert_eq!(
+            canon_party(StoryState::new_game()).iter().map(|&c| Some(c)).collect::<Vec<_>>(),
+            (0..2).map(|slot| StartOfGame.party_member(slot)).collect::<Vec<_>>(),
+            "the table agrees with the new game's party the dialogue lane has always used"
+        );
+        // A table row is what a later moment reads: the lookup takes the last row that has begun.
+        let state = StoryState { moment: 40 };
+        assert_eq!(canon_party(state), CANON_PARTIES.iter().rev().find(|r| r.from_moment <= 40).unwrap().members.to_vec());
     }
 
     #[test]
