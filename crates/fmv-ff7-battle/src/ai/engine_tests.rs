@@ -131,8 +131,6 @@ fn what_cannot_be_followed_falls_back_to_exactly_the_plain_behaviour() {
         ("unsupported opcode", Asm::default().op(op::LINK).op(op::END)),
         ("endless loop", Asm::default().jump(op::JUMP, 0)),
         ("an attack the scene does not define", weakest(0x0999)),
-        // The whole party at once: the rules cannot carry that out yet.
-        ("a whole side", Asm::act_on(|a| a.k1(0b11), ATTACK)),
         // Nobody to aim at.
         ("an empty target", Asm::act_on(|a| a.k1(0), ATTACK)),
     ] {
@@ -256,4 +254,152 @@ fn a_roster_of_four_or_more_acts_by_its_scripts_not_by_the_plain_fallback() {
         let mut plain = battle_with(3, party_of(fighters), vec![plain_foe()]);
         assert_ne!(all(&per_tick(&mut plain, 500)), log, "{fighters} fighters: not the plain behaviour");
     }
+}
+
+/// The events of the first tick in which `foe` acted, and the state after it.
+fn first_turn_of(state: &mut BattleState, foe: ActorId) -> Vec<BattleEvent> {
+    for _ in 0..2000 {
+        let batch = state.step_ticks(1);
+        if acted(&batch, foe) {
+            return batch;
+        }
+    }
+    panic!("the foe never acted");
+}
+
+/// `targets = <mask>; act(0x20, attack)`, without the `end`.
+fn aim_and_act(asm: Asm, mask: u8, attack: u16) -> Asm {
+    asm.addr(2, 0x2070).k1(mask).op(op::STORE).k1(0x20).k2(attack).op(op::ACT)
+}
+
+fn announced(events: &[BattleEvent], foe: ActorId) -> Vec<u16> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            BattleEvent::Action { actor, action: ActionRef::EnemyAttack(id) } if *actor == foe => Some(*id),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn the_attacks_a_script_queued_are_played_one_after_the_other_in_order() {
+    // The double attack: one on Cloud, then one on Barret.
+    let main = aim_and_act(aim_and_act(Asm::default(), 0b01, ATTACK), 0b10, ATTACK).op(op::END);
+    let mut state = battle_of(5, vec![scripted_foe(None, &main)]);
+    let turn = first_turn_of(&mut state, FOE);
+    // Announced, played, announced, played: each attack is its own performance, in the order queued.
+    let shape: Vec<String> = turn
+        .iter()
+        .map(|e| match e {
+            BattleEvent::Action { .. } => "action".to_string(),
+            BattleEvent::Damage { target, .. } | BattleEvent::Miss { target, .. } => format!("on {}", target.0),
+            BattleEvent::GaugeReady { .. } => "ready".to_string(),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    let shape: Vec<&str> = shape.iter().map(String::as_str).filter(|s| *s != "ready").collect();
+    assert_eq!(shape, vec!["action", "on 0", "action", "on 1"], "{turn:?}");
+}
+
+#[test]
+fn a_queued_attack_on_a_target_that_has_fallen_fizzles_and_the_script_goes_on() {
+    // Both attacks are aimed at Barret, who has 1 HP: the first kills him (when it hits), so the second has
+    // nobody to hit and is not played, not even announced. The script's memory (a counter at LV0000) goes on.
+    let main = aim_and_act(aim_and_act(Asm::default(), 0b10, ATTACK), 0b10, ATTACK)
+        .addr(1, 0x00)
+        .val(1, 0x00)
+        .k1(1)
+        .op(op::ADD)
+        .op(op::STORE)
+        .op(op::END);
+    let (mut killed, mut survived) = (0, 0);
+    for seed in 0..40 {
+        let mut party = party_of(2);
+        party[1].hp = 1;
+        party[1].evade = 120; // about two attacks in five hit him
+        let mut state = battle_with(seed, party, vec![scripted_foe(None, &main)]);
+        let turn = first_turn_of(&mut state, FOE);
+        let memory = state.actors()[usize::from(FOE.0)].ai.as_ref().unwrap().memory();
+        assert_eq!(memory.local(0x00, 1), Some(1), "seed {seed}: the script ran to its end");
+        let first_result = turn.iter().find(|e| matches!(e, BattleEvent::Damage { .. } | BattleEvent::Miss { .. }));
+        if matches!(first_result, Some(BattleEvent::Damage { .. })) {
+            killed += 1;
+            assert!(turn.contains(&BattleEvent::Death { actor: ActorId(1) }), "seed {seed}");
+            assert_eq!(announced(&turn, FOE).len(), 1, "seed {seed}: the second attack fizzled: {turn:?}");
+        } else {
+            survived += 1;
+            assert_eq!(announced(&turn, FOE).len(), 2, "seed {seed}: the first missed, so both were played: {turn:?}");
+        }
+    }
+    assert!(killed > 0 && survived > 0, "both cases occurred: killed {killed}, missed {survived}");
+}
+
+#[test]
+fn an_attack_on_the_whole_party_hits_each_living_member_in_ascending_order() {
+    // targets = every enemy of the foe (the whole party); a member who has fallen is not hit.
+    let main = Asm::act_on(|a| a.val(2, 0x20A0), ATTACK);
+    let mut party = party_of(4);
+    party[2].hp = 0;
+    let foe = ActorId(4);
+    let mut state = battle_with(7, party, vec![scripted_foe(None, &main)]);
+    let turn = first_turn_of(&mut state, foe);
+    let hits: Vec<u8> = turn
+        .iter()
+        .filter_map(|e| match e {
+            BattleEvent::Damage { target, .. } | BattleEvent::Miss { target, .. } => Some(target.0),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(hits, vec![0, 1, 3], "{turn:?}");
+    assert_eq!(announced(&turn, foe), vec![ATTACK], "announced once, however many it reaches");
+}
+
+#[test]
+fn a_whole_party_attack_pays_its_mp_once_and_queued_attacks_each_pay_theirs() {
+    let paying = |mp: u32, main: &Asm| {
+        let mut foe = scripted_foe(None, main);
+        foe.actions[0].spec.mp_cost = 4;
+        foe.mp = mp;
+        foe.max_mp = mp;
+        foe
+    };
+    let spent = |turn: &[BattleEvent]| -> Vec<u32> {
+        turn.iter().filter_map(|e| if let BattleEvent::MpSpent { amount, .. } = e { Some(*amount) } else { None }).collect()
+    };
+    // The whole party in one attack: 4 MP, once.
+    let whole = Asm::act_on(|a| a.val(2, 0x20A0), ATTACK);
+    let mut state = battle_of(3, vec![paying(10, &whole)]);
+    let turn = first_turn_of(&mut state, FOE);
+    assert_eq!(spent(&turn), vec![4]);
+    assert_eq!(state.actors()[usize::from(FOE.0)].mp, 6);
+    // Two queued attacks: 4 MP each when the foe has 8; with 7 the answer cannot be carried out (the second
+    // attack is unaffordable) and the plain behaviour plays the turn: one attack, one payment.
+    let double = aim_and_act(aim_and_act(Asm::default(), 0b01, ATTACK), 0b10, ATTACK).op(op::END);
+    let mut state = battle_of(3, vec![paying(8, &double)]);
+    let turn = first_turn_of(&mut state, FOE);
+    assert_eq!((spent(&turn), announced(&turn, FOE).len()), (vec![4, 4], 2));
+    assert_eq!(state.actors()[usize::from(FOE.0)].mp, 0);
+    let mut state = battle_of(3, vec![paying(7, &double)]);
+    let turn = first_turn_of(&mut state, FOE);
+    assert_eq!((spent(&turn), announced(&turn, FOE).len()), (vec![4], 1), "{turn:?}");
+}
+
+#[test]
+fn queued_and_whole_party_attacks_replay_exactly() {
+    // The same battle built twice plays alike, in one go or tick by tick, and another seed differs.
+    let double = aim_and_act(aim_and_act(Asm::default(), 0b01, ATTACK), 0b10, ATTACK).op(op::END);
+    let whole = Asm::act_on(|a| a.val(2, 0x20A0), ATTACK);
+    let build = |seed: u64| battle_with(seed, party_of(3), vec![scripted_foe(None, &double), scripted_foe(None, &whole)]);
+    let run = |seed: u64| {
+        let mut state = build(seed);
+        let log = all(&per_tick(&mut state, 900));
+        (log, format!("{state:?}"))
+    };
+    let (a, a_state) = run(4);
+    let (b, b_state) = run(4);
+    assert_eq!((&a, &a_state), (&b, &b_state));
+    assert!(a.iter().filter(|e| matches!(e, BattleEvent::Action { .. })).count() >= 4, "the foes attacked");
+    assert_eq!(build(4).step_ticks(900), a, "in one go it is the same battle");
+    assert_ne!(run(5).0, a);
 }

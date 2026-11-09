@@ -42,11 +42,11 @@ fn a_ready_enemy_attacks_where_its_main_script_says() {
     let got = turn(&state).unwrap();
     // The weakest of Cloud (300) and Barret (120) is Barret, position 1.
     assert_eq!(
-        got.choice,
-        Some(EnemyChoice {
+        got.actions,
+        vec![EnemyChoice {
             attack: ATTACK,
             target: Target::One(ActorId(1))
-        })
+        }]
     );
     assert!(got.changes.is_empty());
 }
@@ -60,7 +60,7 @@ fn a_random_target_depends_on_the_rng_passed_in_alone() {
         let a = choose(&state, FOE, &mut Rng::new(seed)).unwrap();
         let b = choose(&state, FOE, &mut Rng::new(seed)).unwrap();
         assert_eq!(a, b);
-        seen.insert(a.choice.unwrap().target == Target::One(ActorId(0)));
+        seen.insert(a.actions[0].target == Target::One(ActorId(0)));
     }
     assert_eq!(seen.len(), 2, "both party members are picked sometimes");
 }
@@ -73,9 +73,9 @@ fn a_script_that_cannot_be_followed_gives_no_turn() {
         ("endless loop", Asm::default().jump(op::JUMP, 0)),
         ("runs off the end", Asm::default().k1(1)),
         ("unmodelled field", Asm::act_on(|a| a.val(2, 0x20A0).val(2, 0x4068).op(op::MASK), ATTACK)),
-        ("second action", {
+        ("too many actions", {
             let one = Asm::default().k1(0x20).k2(ATTACK).op(op::ACT);
-            Asm([one.0.clone(), one.0, vec![op::END]].concat())
+            Asm([one.0.repeat(vm::MAX_ACTIONS + 1), vec![op::END]].concat())
         }),
     ] {
         let state = battle_of(1, vec![scripted_foe(None, &main)]);
@@ -113,11 +113,11 @@ fn a_party_of_four_or_more_no_longer_costs_the_enemies_their_scripts() {
         let weakest_hp = state.actors()[..fighters].iter().map(|c| c.hp).min().unwrap();
         let weakest_at = state.actors()[..fighters].iter().position(|c| c.hp == weakest_hp).unwrap();
         assert_eq!(
-            got.choice,
-            Some(EnemyChoice {
+            got.actions,
+            vec![EnemyChoice {
                 attack: ATTACK,
                 target: Target::One(ActorId(weakest_at as u8))
-            }),
+            }],
             "{fighters} fighters"
         );
     }
@@ -130,7 +130,7 @@ fn a_script_aims_at_party_members_three_and_four_through_the_remapped_slots() {
     assert_eq!((party[3].hp, party[4].hp), (90, 400));
     let lowest = battle_with(1, party.clone(), vec![scripted_foe(None, &weakest(ATTACK))]);
     assert_eq!(
-        choose(&lowest, 5, &mut Rng::new(1)).unwrap().choice.unwrap().target,
+        choose(&lowest, 5, &mut Rng::new(1)).unwrap().actions[0].target,
         Target::One(ActorId(3)),
         "the lowest HP is party member 3, slot 10"
     );
@@ -140,7 +140,7 @@ fn a_script_aims_at_party_members_three_and_four_through_the_remapped_slots() {
     party[2].max_hp = 500;
     let lowest = battle_with(1, party, vec![scripted_foe(None, &weakest(ATTACK))]);
     assert_eq!(
-        choose(&lowest, 5, &mut Rng::new(1)).unwrap().choice.unwrap().target,
+        choose(&lowest, 5, &mut Rng::new(1)).unwrap().actions[0].target,
         Target::One(ActorId(2)),
         "party member 2 (slot 2) is lower than 4 now"
     );
@@ -150,14 +150,14 @@ fn a_script_aims_at_party_members_three_and_four_through_the_remapped_slots() {
     let mut seen = std::collections::BTreeSet::new();
     for seed in 0..200 {
         let got = choose(&state, 5, &mut Rng::new(seed)).unwrap();
-        let Target::One(who) = got.choice.unwrap().target else { panic!("one target") };
+        let Target::One(who) = got.actions[0].target else { panic!("one target") };
         seen.insert(who.0);
     }
     assert_eq!(seen.into_iter().collect::<Vec<_>>(), vec![0, 1, 2, 3, 4]);
     // The whole party at once is "everyone on the other side", extra members included.
     let all = Asm::act_on(|a| a.val(2, 0x20A0), ATTACK);
     let state = battle_with(1, party_of(5), vec![scripted_foe(None, &all)]);
-    assert_eq!(choose(&state, 5, &mut Rng::new(1)).unwrap().choice.unwrap().target, Target::AllEnemies);
+    assert_eq!(choose(&state, 5, &mut Rng::new(1)).unwrap().actions[0].target, Target::AllEnemies);
 }
 
 #[test]
@@ -166,18 +166,75 @@ fn the_attack_must_be_one_the_scene_defines() {
     assert!(turn(&state).is_none(), "an attack the scene does not define");
     // One the scene defines is a choice even if the rules cannot play it (the engine announces it).
     let state = battle_of(1, vec![scripted_foe(None, &weakest(OTHER))]);
-    assert_eq!(turn(&state).unwrap().choice.unwrap().attack, OTHER);
+    assert_eq!(turn(&state).unwrap().actions[0].attack, OTHER);
 }
 
 #[test]
 fn a_script_that_ends_without_an_action_passes_the_turn() {
     let state = battle_of(1, vec![scripted_foe(None, &Asm::default().op(op::END))]);
     let got = turn(&state).unwrap();
-    assert_eq!(got.choice, None);
+    assert_eq!(got.actions, vec![]);
 }
 
 #[test]
-fn targets_must_be_living_actors_the_engine_can_name() {
+fn every_attack_a_script_queues_is_a_choice_in_the_order_queued() {
+    // The real "double attack": the first attack on Cloud, then (the mask is stored again) one on Barret.
+    let main = Asm::default()
+        .addr(2, 0x2070)
+        .k1(0b01)
+        .op(op::STORE)
+        .k1(0x20)
+        .k2(ATTACK)
+        .op(op::ACT)
+        .addr(2, 0x2070)
+        .k1(0b10)
+        .op(op::STORE)
+        .k1(0x20)
+        .k2(OTHER)
+        .op(op::ACT)
+        .op(op::END);
+    let state = battle_of(1, vec![scripted_foe(None, &main)]);
+    assert_eq!(
+        turn(&state).unwrap().actions,
+        vec![
+            EnemyChoice { attack: ATTACK, target: Target::One(ActorId(0)) },
+            EnemyChoice { attack: OTHER, target: Target::One(ActorId(1)) },
+        ]
+    );
+    // One of them that cannot be followed makes the whole turn unfollowable (nothing is half played).
+    let bad_second = Asm::default()
+        .addr(2, 0x2070)
+        .k1(0b01)
+        .op(op::STORE)
+        .k1(0x20)
+        .k2(ATTACK)
+        .op(op::ACT)
+        .k1(0x20)
+        .k2(0x0999)
+        .op(op::ACT)
+        .op(op::END);
+    let state = battle_of(1, vec![scripted_foe(None, &bad_second)]);
+    assert!(turn(&state).is_none(), "the second attack is not one of the scene's");
+    let bad_target = Asm::default()
+        .addr(2, 0x2070)
+        .k1(0b01)
+        .op(op::STORE)
+        .k1(0x20)
+        .k2(ATTACK)
+        .op(op::ACT)
+        .addr(2, 0x2070)
+        .k1(0b100)
+        .op(op::STORE)
+        .k1(0x20)
+        .k2(ATTACK)
+        .op(op::ACT)
+        .op(op::END);
+    let state = battle_of(1, vec![scripted_foe(None, &bad_target)]);
+    assert!(turn(&state).is_none(), "the second names a slot with no actor");
+}
+
+#[test]
+fn targets_must_be_actors_the_engine_can_name() {
     let aim = |mask: u8| Asm::act_on(move |a| a.k1(mask), ATTACK);
     let two_foes = |main: &Asm| vec![scripted_foe(None, main), plain_foe()];
     for (what, mask) in [
@@ -189,20 +246,24 @@ fn targets_must_be_living_actors_the_engine_can_name() {
         let state = battle_of(1, two_foes(&aim(mask)));
         assert!(turn(&state).is_none(), "{what}");
     }
-    // A dead party member (Barret) cannot be aimed at, alone or in a side.
+    // A dead party member (Barret) alone is still the one target the script named: whether an attack can be
+    // played on a dead actor is the engine's business (the attack may do nothing at all). In a side it is
+    // not "the living side" any more.
     let mut with_dead_barret = party();
     with_dead_barret[1].hp = 0;
-    let dead = battle_with(1, with_dead_barret, two_foes(&aim(0b10)));
-    assert!(turn(&dead).is_none());
+    let dead = battle_with(1, with_dead_barret.clone(), two_foes(&aim(0b10)));
+    assert_eq!(turn(&dead).unwrap().actions[0].target, Target::One(ActorId(1)));
+    let dead_in_a_side = battle_with(1, with_dead_barret, two_foes(&aim(0b11)));
+    assert!(turn(&dead_in_a_side).is_none());
     // One living actor is a single target; the whole living side is "all"; from either side.
     let state = battle_of(1, two_foes(&aim(0b01)));
-    assert_eq!(turn(&state).unwrap().choice.unwrap().target, Target::One(ActorId(0)));
+    assert_eq!(turn(&state).unwrap().actions[0].target, Target::One(ActorId(0)));
     let state = battle_of(1, two_foes(&aim(0b11)));
-    assert_eq!(turn(&state).unwrap().choice.unwrap().target, Target::AllEnemies);
+    assert_eq!(turn(&state).unwrap().actions[0].target, Target::AllEnemies);
     let state = battle_of(1, two_foes(&aim(0b11_0000)));
-    assert_eq!(turn(&state).unwrap().choice.unwrap().target, Target::AllAllies);
+    assert_eq!(turn(&state).unwrap().actions[0].target, Target::AllAllies);
     let state = battle_of(1, two_foes(&aim(0b10_0000)));
-    assert_eq!(turn(&state).unwrap().choice.unwrap().target, Target::One(ActorId(3)));
+    assert_eq!(turn(&state).unwrap().actions[0].target, Target::One(ActorId(3)));
 }
 
 #[test]
@@ -232,7 +293,7 @@ fn initialize_runs_when_the_battle_is_built_and_the_battle_keeps_what_it_did() {
     assert_eq!(memory.phase, Phase::Ready);
     assert_eq!(memory.local(0x40, 2), Some(1), "what Init stored is what Main reads");
     assert_eq!(
-        turn(&state).unwrap().choice.unwrap().target,
+        turn(&state).unwrap().actions[0].target,
         Target::One(ActorId(0)),
         "Main read LV0040 = 1, Cloud"
     );
@@ -306,7 +367,7 @@ fn an_initialize_script_finds_a_sibling_by_enemy_id_and_may_make_itself_immune_t
     assert_eq!(memory.local(0x40, 2), Some(1 << 5), "the sibling is the enemy in slot 5");
     // The script's Main then reads what Initialize found: an attack aimed at the sibling's slot.
     assert_eq!(
-        turn(&state).unwrap().choice.unwrap().target,
+        turn(&state).unwrap().actions[0].target,
         Target::One(ActorId(3)),
         "the sibling is position 3 of the battle"
     );

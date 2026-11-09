@@ -34,13 +34,29 @@
 //! `RANDOM` is one `next_u16()` draw; `RANDOM_BIT` draws `below(n)` when the mask has `n >= 2` bits (none
 //! for 0 or 1). Both use the battle's [`Rng`], the only source, so a replay agrees.
 //!
+//! # The action queue
+//!
+//! `ACT` with command `0x20` ("enemy attacks") queues one attack with the target mask (`0x2070`) of that
+//! moment, and a script may do it several times (a "double attack" is two `ACT`s). The original keeps one
+//! priority queue for players and enemies alike: "When a command is selected either by a player character or an
+//! enemy the action is inserted into a priority queue. Up to 64 actions can be queued. On each update loop,
+//! the main Queue function will pop off the next action with the lowest priority" and executes "in FIFO order
+//! within priority bands" (<https://wiki.ffrtt.ru/index.php/FF7/Battle/Battle_Mechanics>, "Action queue"), each
+//! entry with its own "Action target mask". So the actions of one run are carried out one after the other, in
+//! the order queued, each on the mask it was queued with ([`Outcome::actions`]; the engine's side of it is in
+//! [`crate::ai`]). `0x24` (pause for a text) does nothing here; anything else (`0x22`, run another script) is
+//! unsupported.
+//!
 //! # Known approximations
 //!
-//! * A division or remainder by zero ends the run with an error (the original's behaviour is unknown).
+//! * A division or remainder by zero ends the run with an error. Nothing documents it (the Qhimm wiki's
+//!   Battle Script page, the source of the opcodes, never mentions it) and no script of the owner's data needs
+//!   it: every divisor is a constant or a local that the enemy's Initialize script sets; the cases that did
+//!   reach it ran Main on the zeroed memory of an Initialize that had failed, which the engine never does.
 //! * Results are cut to the larger of their operands' sizes ("the highest pop's size is used").
 //! * Storing a number to a bit address stores whether it is non-zero.
-//! * `ACT` with command `0x20` queues one enemy attack (a second one ends the run with an error), `0x24`
-//!   (pause for a text) does nothing, anything else (`0x22`, run another script) is unsupported.
+//! * A set with no value in it (a mask of no actor applied to a field) has no first value to test: popping it
+//!   where a number is wanted ends the run with an error.
 
 use std::collections::BTreeMap;
 
@@ -50,6 +66,9 @@ use super::script::{self, op, DecodeError, EnemyScripts, Insn};
 
 /// Instructions one run may execute.
 pub const MAX_STEPS: usize = 4096;
+/// Enemy attacks one run may queue (the original's action queue holds 64 for the whole battle; measured on
+/// the owner's `scene.bin`, no Main run of any enemy queues more than four).
+pub const MAX_ACTIONS: usize = 16;
 /// Entries the stack may hold.
 pub const MAX_STACK: usize = 48;
 /// Bytes of an actor's own variables (addresses `0x0000..=0x03FF` count bits).
@@ -100,8 +119,8 @@ pub enum AiError {
     DivideByZero,
     #[error("opcode {0:#04x} popped an empty set")]
     EmptySet(u8),
-    #[error("the script queues a second action")]
-    TwoActions,
+    #[error("the script queues more than {MAX_ACTIONS} actions")]
+    TooManyActions,
     #[error("attack {0:#06x} is not known to the battle")]
     Attack(u16),
 }
@@ -341,8 +360,9 @@ pub struct Action {
 /// What one run did.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Outcome {
-    /// The enemy attack the script queued (`None`: it ended without one: the enemy lets its turn pass).
-    pub action: Option<Action>,
+    /// The enemy attacks the script queued, in the order it queued them, each with the target mask at the
+    /// moment of its `ACT` (empty: it ended without one: the enemy lets its turn pass).
+    pub actions: Vec<Action>,
     pub effects: Vec<Effect>,
     pub steps: usize,
 }
@@ -680,11 +700,11 @@ impl Vm<'_> {
                 let command = self.pop_scalar(opcode)?;
                 match command {
                     COMMAND_ENEMY_ATTACK => {
-                        if self.out.action.is_some() {
-                            return Err(AiError::TwoActions);
+                        if self.out.actions.len() >= MAX_ACTIONS {
+                            return Err(AiError::TooManyActions);
                         }
                         let attack = u16::try_from(attack).map_err(|_| AiError::Attack(0xFFFF))?;
-                        self.out.action = Some(Action {
+                        self.out.actions.push(Action {
                             attack,
                             targets: self.targets,
                         });
@@ -1051,13 +1071,13 @@ mod tests {
     }
 
     fn targets_of(asm: &Asm) -> u16 {
-        go(asm).unwrap().action.unwrap().targets
+        go(asm).unwrap().actions[0].targets
     }
 
     #[test]
     fn a_script_that_ends_at_once_passes_its_turn() {
         let out = go(&Asm::default().op(op::END)).unwrap();
-        assert_eq!(out.action, None);
+        assert_eq!(out.actions, vec![]);
         assert_eq!(out.steps, 1);
     }
 
@@ -1065,30 +1085,80 @@ mod tests {
     fn act_queues_an_attack_with_the_target_mask_at_that_moment() {
         let out = go(&Asm::act_on(|a| a.k1(0b10), 0x0110)).unwrap();
         assert_eq!(
-            out.action,
-            Some(Action {
+            out.actions,
+            vec![Action {
                 attack: 0x0110,
                 targets: 0b10
-            })
+            }]
         );
     }
 
     #[test]
-    fn a_second_action_and_unknown_commands_are_refused() {
-        let two = Asm::default()
+    fn every_act_is_queued_in_order_each_with_the_mask_of_its_moment() {
+        // The double attack of the real scripts: act on one target, then on another (the mask is stored
+        // again between them), then a third time on the first mask without storing it again.
+        let asm = Asm::default()
+            .addr(2, 0x2070)
+            .k1(0b001)
+            .op(op::STORE)
             .k1(0x20)
-            .k2(1)
+            .k2(0x0110)
+            .op(op::ACT)
+            .addr(2, 0x2070)
+            .k1(0b100)
+            .op(op::STORE)
+            .k1(0x20)
+            .k2(0x0111)
             .op(op::ACT)
             .k1(0x20)
-            .k2(2)
+            .k2(0x0112)
             .op(op::ACT)
             .op(op::END);
-        assert_eq!(go(&two), Err(AiError::TwoActions));
+        let out = go(&asm).unwrap();
+        assert_eq!(
+            out.actions,
+            vec![
+                Action { attack: 0x0110, targets: 0b001 },
+                Action { attack: 0x0111, targets: 0b100 },
+                Action { attack: 0x0112, targets: 0b100 },
+            ]
+        );
+        // The text pause between two attacks is no action; the order is the order of the `ACT`s.
+        let with_text = Asm::default()
+            .k1(0x20)
+            .k2(7)
+            .op(op::ACT)
+            .k1(0x24)
+            .k1(0)
+            .op(op::ACT)
+            .k1(0x20)
+            .k2(8)
+            .op(op::ACT)
+            .op(op::END);
+        let attacks: Vec<u16> = go(&with_text).unwrap().actions.iter().map(|a| a.attack).collect();
+        assert_eq!(attacks, vec![7, 8]);
+    }
+
+    #[test]
+    fn a_script_may_queue_a_bounded_number_of_actions() {
+        let queue = |n: usize| {
+            let mut asm = Asm::default();
+            for i in 0..n {
+                asm = asm.k1(0x20).k2(i as u16).op(op::ACT);
+            }
+            asm.op(op::END)
+        };
+        assert_eq!(go(&queue(MAX_ACTIONS)).unwrap().actions.len(), MAX_ACTIONS);
+        assert_eq!(go(&queue(MAX_ACTIONS + 1)), Err(AiError::TooManyActions));
+    }
+
+    #[test]
+    fn unknown_action_commands_are_refused_and_the_text_pause_is_nothing() {
         let run_script = Asm::default().k1(0x22).k1(8).op(op::ACT).op(op::END);
         assert_eq!(go(&run_script), Err(AiError::Unsupported(op::ACT)));
         // The text pause is a no-op.
         let pause = Asm::default().k1(0x24).k1(0).op(op::ACT).op(op::END);
-        assert_eq!(go(&pause).unwrap().action, None);
+        assert_eq!(go(&pause).unwrap().actions, vec![]);
     }
 
     #[test]
@@ -1117,7 +1187,7 @@ mod tests {
         // A second run starts from what the first left.
         let read_back = Asm::act_on(|a| a.val(2, 0x40), 9);
         let out = run_asm(&read_back, &Fixed::new(4), &mut mem, &mut Rng::new(1)).unwrap();
-        assert_eq!(out.action.unwrap().targets, 305);
+        assert_eq!(out.actions[0].targets, 305);
     }
 
     #[test]
@@ -1254,7 +1324,7 @@ mod tests {
             let a = run_asm(&asm, &Fixed::new(4), &mut Memory::new(), &mut Rng::new(seed)).unwrap();
             let b = run_asm(&asm, &Fixed::new(4), &mut Memory::new(), &mut Rng::new(seed)).unwrap();
             assert_eq!(a, b, "same seed, same pick");
-            let t = a.action.unwrap().targets;
+            let t = a.actions[0].targets;
             assert_eq!(t.count_ones(), 1);
             assert!(t & 0b111 == t, "only an enemy of slot 4");
             seen.insert(t);
@@ -1267,7 +1337,7 @@ mod tests {
         assert_eq!(rng, Rng::new(9));
         let none = Asm::act_on(|a| a.k1(0).op(op::RANDOM_BIT), 1);
         let out = run_asm(&none, &Fixed::new(4), &mut Memory::new(), &mut Rng::new(9)).unwrap();
-        assert_eq!(out.action.unwrap().targets, 0);
+        assert_eq!(out.actions[0].targets, 0);
     }
 
     #[test]
@@ -1303,7 +1373,7 @@ mod tests {
             .op(op::END);
         let out = go(&asm).unwrap();
         assert_eq!(out.effects, vec![Effect::Defense { slot: 4, value: 200 }]);
-        assert_eq!(out.action.unwrap().targets, 200, "read back the written value");
+        assert_eq!(out.actions[0].targets, 200, "read back the written value");
         // Another actor's field cannot be written, nor a field that is not modelled.
         let other = Asm::default()
             .k1(1)
@@ -1336,7 +1406,7 @@ mod tests {
         run_asm(&set, &Fixed::new(4), &mut mem, &mut Rng::new(1)).unwrap();
         let read = Asm::act_on(|a| a.val(2, 0x2060).val(1, 0x4080).op(op::MASK), 1);
         let out = run_asm(&read, &Fixed::new(4), &mut mem, &mut Rng::new(1)).unwrap();
-        assert_eq!(out.action.unwrap().targets, 7);
+        assert_eq!(out.actions[0].targets, 7);
         assert!(out.effects.is_empty());
     }
 
@@ -1403,7 +1473,7 @@ mod tests {
         // It reads back (the world is not asked for the owner's), and survives to the next run.
         let read = Asm::act_on(|a| a.val(2, 0x2060).val(0, 0x402C).op(op::MASK), 1);
         let out = run_asm(&read, &Fixed::new(4), &mut mem, &mut Rng::new(1)).unwrap();
-        assert_eq!(out.action.unwrap().targets, 1);
+        assert_eq!(out.actions[0].targets, 1);
         // Storing 0 clears it.
         let clear = Asm::default().addr(2, 0x2060).addr(0, 0x402C).op(op::MASK).k1(0).op(op::STORE).op(op::END);
         run_asm(&clear, &Fixed::new(4), &mut mem, &mut Rng::new(1)).unwrap();

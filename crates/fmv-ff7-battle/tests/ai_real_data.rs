@@ -137,6 +137,8 @@ fn opcode_coverage_over_every_enemy_of_the_scene_bin() {
     let mut init_errors: BTreeMap<String, usize> = BTreeMap::new();
     let mut main_errors: BTreeMap<String, usize> = BTreeMap::new();
     let mut dyn_outcomes = (0usize, 0usize); // (acts, passes) over the Main runs that finished
+    // The most attacks one Main run queued, and how many runs queued more than one.
+    let (mut max_queue, mut multi_runs) = (0usize, 0usize);
     for (&id, &(scene_index, slot)) in &enemies {
         let scene = bin.scene(scene_index).unwrap();
         let Some(scripts) = scene.ai.enemy(slot) else { continue };
@@ -189,11 +191,13 @@ fn opcode_coverage_over_every_enemy_of_the_scene_bin() {
                 for _turn in 0..TURNS {
                     match vm::run(scripts, script::slot::MAIN, &world, &mut memory, &mut rng) {
                         Ok(out) => {
-                            if out.action.is_some() {
+                            if !out.actions.is_empty() {
                                 dyn_outcomes.0 += 1;
                             } else {
                                 dyn_outcomes.1 += 1;
                             }
+                            max_queue = max_queue.max(out.actions.len());
+                            multi_runs += usize::from(out.actions.len() > 1);
                         }
                         Err(e) => {
                             main_failed = Some(class_of(&e));
@@ -235,6 +239,11 @@ fn opcode_coverage_over_every_enemy_of_the_scene_bin() {
          {main_enemies} enemies keep their scripts, and {both_ok} of them never fall back in any of those turns \
          ({} acts, {} passes over the Main turns that finished)",
         dyn_outcomes.0, dyn_outcomes.1
+    );
+    eprintln!(
+        "action queue: no Main run queued more than {max_queue} attacks ({multi_runs} runs queued two or more, \
+         the limit is {})",
+        vm::MAX_ACTIONS
     );
     for (why, n) in &init_errors {
         eprintln!("  Initialize failure x{n}: {why}");

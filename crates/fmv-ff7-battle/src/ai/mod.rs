@@ -18,26 +18,28 @@
 //!   Initialize script runs, if it has one: it sets up the enemy's variables and may change its
 //!   defense ratings (Guard Scorpion does).
 //! * When its gauge is full ([`choose`]) its Main script runs against the battle as it is. The script may
-//!   queue one attack (`ACT`) on a mask of targets, or end without one: then the enemy **passes its turn**
-//!   (1st Ray attacks every other turn this way). The variables the script wrote stay in the enemy
-//!   ([`EnemyAi`]) for its next turn.
+//!   queue attacks (`ACT`, each on the mask of targets of that moment: a "double attack" is two of them),
+//!   which the engine carries out one after the other in the order queued, or end without one: then the
+//!   enemy **passes its turn** (1st Ray attacks every other turn this way). The variables the script wrote
+//!   stay in the enemy ([`EnemyAi`]) for its next turn.
 //! * **Anything the machine does not understand, and any answer the engine cannot carry out, makes the
 //!   turn use today's behaviour** (a random living party member, one of the enemy's attacks): an unknown
 //!   opcode, an address or an actor field that is not modelled, a budget overrun ([`vm::MAX_STEPS`]), an
-//!   attack the scene does not define, a target mask that is empty or names the dead, a battle that does
-//!   not fit the script slots. [`choose`] then returns `None` and changes nothing, and an enemy whose
-//!   Initialize script fails stays on the plain behaviour for good. Nothing here panics or loops.
+//!   attack the scene does not define, a target mask that is empty or names no actor, queued attacks the
+//!   enemy cannot pay for, a battle that does not fit the script slots. [`choose`] then returns `None`
+//!   and changes nothing, and an enemy whose Initialize script fails stays on the plain behaviour for good.
+//!   Nothing here panics or loops. (A one-target attack whose target has fallen by the time it comes up is
+//!   not such a case: it fizzles, see [`crate::rules`] "Enemy turns".)
 //!
 //! # Opcodes and addresses implemented
 //!
-//! Exactly the set the first reactor's enemies (MP, Guard Hound, Mono Drive, Grunt, 1st Ray, Sweeper, Guard
-//! Scorpion) use, plus the arithmetic that is trivially the same: push value / address / constant,
-//! add, subtract, multiply, divide, remainder, AND, OR, the six comparisons, logical AND / OR / NOT, the three
-//! jumps and `END`, `MASK`, random word, random bit, greatest, least, MP cost, store, drop, act (command
-//! `0x20`, and the text pause `0x24`), and the text instruction. Not implemented (the run fails, see
-//! [`vm::implements`]): bitwise NOT, bit count, one-bit, the character-AI commands (`LINK`, copy,
-//! memory bank, elemental defense), the debug print, and `ACT` with command `0x22` (run another script).
-//! The addresses are listed in [`vm`] and [`world`]; all other globals and fields end the run.
+//! Push value / address / constant, add, subtract, multiply, divide, remainder, AND, OR, bitwise NOT,
+//! the six comparisons, logical AND / OR / NOT, the three jumps and `END`, `MASK`, random word, random
+//! bit, bit count, greatest, least, MP cost, one-bit, store, drop, act (command `0x20`, and the text
+//! pause `0x24`), and the text instruction. Not implemented (the run fails, see [`vm::implements`]): the
+//! character-AI commands (`LINK`, copy, memory bank, elemental defense), the debug print, and `ACT` with
+//! command `0x22` (run another script). The addresses are listed in [`vm`] and [`world`]; all other
+//! globals and fields end the run.
 //!
 //! # Determinism
 //!
@@ -49,8 +51,10 @@
 //! # Approximations
 //!
 //! * The Initialize script runs when the battle is built, after the starting gauges are drawn, in enemy
-//!   order; the original runs it "before combat". Scripts that draw random numbers there would consume the
-//!   battle's stream at that point (the supported ones do not).
+//!   order; the original runs it "before combat" ("Players first, then enemies, then formation",
+//!   <https://wiki.ffrtt.ru/index.php/FF7/Battle/Battle_Scenes#AI_Data>). Many scripts draw random numbers
+//!   there (to start a counter at a random value): they consume the battle's stream at that point, which is
+//!   part of the draw order ([`crate::rules`], "RNG draw order").
 //! * Only the Main and Initialize scripts run. The counters (General, Death, Physical, Magical), Pre-action,
 //!   Battle-end and the formation's own scripts are not run, so an enemy that reacts to being hit does not.
 //! * Statuses other than Death are not modelled by the engine, so the scripts read them as clear.
@@ -59,7 +63,9 @@
 //!   turn. An attack the scene defines but the rules cannot play (no damage, healing) is announced and has no
 //!   effect.
 //! * A target mask of several actors is [`Target::AllEnemies`] / [`Target::AllAllies`] only when it is
-//!   exactly the living side; any other mix falls back.
+//!   exactly the living side; any other mix falls back. The engine plays [`Target::AllEnemies`] (the whole
+//!   party) as one attack announced once and played on each living member in turn; [`Target::AllAllies`] is
+//!   not played (it falls back, unless the attack is one the rules cannot play anyway).
 
 pub mod script;
 pub mod vm;
@@ -89,7 +95,7 @@ pub struct AiAttack {
 
 /// Whom an enemy's attack is aimed at, from the point of view of the actor that uses it (an enemy's
 /// "enemies" are the party members). This mirrors the whole-side targeting type of the engine's protocol
-/// v8; until that lands on this branch it is a local copy and the engine only carries out `One`.
+/// v10 (`rules::Target`); until that is on this branch it is a local copy, to be swapped for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Target {
     One(ActorId),
@@ -117,8 +123,10 @@ pub enum Change {
 /// What an enemy's turn came to when a script ran it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AiTurn {
-    /// The attack and target; `None`: the script ended without one and the enemy passes its turn.
-    pub choice: Option<EnemyChoice>,
+    /// The attacks the script queued and their targets, in the order it queued them (the engine carries them
+    /// out one after the other, see [`vm`], "The action queue"); empty: the script ended without one and the
+    /// enemy passes its turn.
+    pub actions: Vec<EnemyChoice>,
     /// The enemy's memory after the run, to be stored back ([`EnemyAi::set_memory`]).
     pub memory: Memory,
     /// What the script changed in the battle.
@@ -203,7 +211,7 @@ pub fn initialize(state: &BattleState, idx: usize, rng: &mut Rng) -> Option<Star
     let mut changes = Vec::new();
     if ai.scripts().entry(script::slot::INITIALIZE).is_some() {
         let out = vm::run(ai.scripts(), script::slot::INITIALIZE, &world, &mut memory, rng).ok()?;
-        if out.action.is_some() {
+        if !out.actions.is_empty() {
             return None;
         }
         changes = changes_of(&out.effects, &world)?;
@@ -226,19 +234,25 @@ pub fn choose(state: &BattleState, idx: usize, rng: &mut Rng) -> Option<AiTurn> 
     let world = BattleWorld::new(state, idx, ai.attacks())?;
     let mut memory = ai.memory().clone();
     let out = vm::run(ai.scripts(), script::slot::MAIN, &world, &mut memory, rng).ok()?;
-    let choice = match out.action {
-        None => None,
-        Some(action) => Some(resolve(state, &world, ai, action)?),
-    };
+    let actions = out
+        .actions
+        .iter()
+        .map(|&action| resolve(state, &world, ai, action))
+        .collect::<Option<Vec<_>>>()?;
     let changes = changes_of(&out.effects, &world)?;
     Some(AiTurn {
-        choice,
+        actions,
         memory,
         changes,
     })
 }
 
-/// Turn a queued action into an attack and a target the engine can carry out.
+/// Turn a queued action into an attack and a target. `None` (the turn falls back) for an attack the scene
+/// does not define, a mask that names no actor, a slot that holds none, or several actors that are not exactly
+/// the living side of one team. **One actor is a [`Target::One`] whether it is alive or not**: whether the
+/// attack can be played on it is the engine's business, which knows what the attack is (a script may keep a
+/// mask in its memory from a turn ago, and the actor in it may have fallen since; an attack with no effect,
+/// such as the Death counter's own animation, has the dead owner as its target).
 fn resolve(
     state: &BattleState,
     world: &BattleWorld<'_>,
@@ -252,11 +266,7 @@ fn resolve(
     let mut chosen: Vec<usize> = Vec::new();
     for slot in 0..16u8 {
         if action.targets >> slot & 1 == 1 {
-            let idx = slots.actor_of(slot)?;
-            if !state.actors().get(idx)?.is_alive() {
-                return None;
-            }
-            chosen.push(idx);
+            chosen.push(slots.actor_of(slot)?);
         }
     }
     let target = match chosen.as_slice() {
