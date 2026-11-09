@@ -9,16 +9,19 @@
 //!   little slower (down to [`MIN_SPEED`]) or later when it is shorter, and when even the fastest
 //!   is not fast enough it **skips the start of the plan** (the run-up, the first part of a cast)
 //!   instead of lagging. Whatever happens, the impact is at `arrival + budget`.
-//! * [`plan`] turns a [`Shape`] (run up and strike; stand and strike; a party member's blow as its own
-//!   scripts play it; cast; use an item; guard) and the actor's [`Kit`] into the [`Segment`]s of clips
-//!   it plays and the [`Lunge`] it runs. After the impact the clips play at their own speed; a later
-//!   performance of the same actor simply takes over from its start ([`super::motion`] plays the
-//!   segment that started last), which is what keeps a fast actor from lagging behind its own commands.
+//! * [`plan`] turns a [`Shape`] (run up and strike; stand and strike; a party member's blow or an enemy's
+//!   attack as the model's own script plays it; cast; use an item; guard) and the actor's [`Kit`] into the
+//!   [`Segment`]s of clips it plays and the [`Lunge`] it runs. After the impact the clips play at their own
+//!   speed; a later performance of the same actor simply takes over from its start ([`super::motion`] plays
+//!   the segment that started last), which is what keeps a fast actor from lagging behind its own commands.
 //!
-//! A party member's blow ([`Shape::Blow`]) is the clips of its own animation script ([`Chain`]): the
-//! approach (a crouch and a leap, a dash, a hop), the strike with the blow landing on the tick the script
-//! marks the damage at, the way back. Each clip plays once; everything before the impact is fitted to the
-//! schedule like any other plan.
+//! A party member's blow ([`Shape::Blow`]) and an enemy's attack ([`Shape::Script`]) are the clips of the model's own
+//! animation script ([`Chain`]): the approach (a crouch and a leap, a dash, a hop, a spell's gathering), the strike
+//! with the blow landing on the tick the script marks the damage at (or at the effect), the way back. Each clip
+//! plays once; everything before the impact is fitted to the schedule like any other plan. A script whose last clip
+//! carries the actor home by itself (the MP's machine gun) is cut where the clip's root begins to travel: the actor
+//! holds its aim for the follow-through and runs home with the rest. The guard ([`Shape::Guard`]) is the guard
+//! clip of the model's script, played once.
 //!
 //! The tail of a performance (the follow-through, the way back) is the only part that is not
 //! time-warped, and it never delays anything: nothing waits for it.
@@ -40,8 +43,7 @@ const MAX_FOLLOW: f64 = 0.90;
 /// The way back is at least and at most this long when a clip plays it, in seconds.
 const MIN_BACK: f64 = 0.25;
 const MAX_BACK: f64 = 0.70;
-/// How long a guard is held, a spell's pose after the impact before its end clip, in seconds.
-pub const GUARD_HOLD: f64 = 1.4;
+/// How long a spell's pose is held after the impact before its end clip, in seconds.
 const CAST_HOLD: f64 = 0.35;
 /// A clip of this many frames or fewer is a held pose, not a motion.
 pub const HELD_POSE_FRAMES: u16 = 3;
@@ -172,9 +174,14 @@ pub enum Shape {
     /// way back. `reach` is how far the target is (units); a character whose script hops instead of running only
     /// covers [`party::HOP`] of it. Without a chain in the kit it is the procedural lunge of a blow with no clip.
     Blow { reach: f32, melee: bool },
+    /// An enemy's attack as the script `scene.bin` names for it plays it ([`Kit::enemy_chain`]: `attack` is its id, `None` a
+    /// plain attack): the same chain as a party member's blow. `reach` is how far the target is (units); a script that sends
+    /// the actor to its target covers all of it, one that does not only what its clips carry the actor ([`Chain::carries`]):
+    /// a machine gun fired after a run-up stays where the run-up took it, a spell cast in place stays in place.
+    Script { reach: f32, attack: Option<u16> },
     /// A party member's spell: begin, hold, end.
     Cast,
-    /// Guard: hold the pose.
+    /// Guard: the guard clip of the model's own script, once, back to the stance.
     Guard,
 }
 
@@ -240,6 +247,14 @@ pub fn plan(kit: &Kit, shape: Shape, arrival: f64, budget: f64) -> Performance {
             // No script to play: the lunge of an actor with no clip (a long-range blow stays where it is).
             None => strike_plan(kit, if melee { reach } else { 0.0 }, None, melee, arrival, budget, fps),
         },
+        Shape::Script { reach, attack } => match kit.enemy_chain(attack) {
+            Some(chain) => {
+                let reach = if chain.closes_in { reach } else { reach.min(chain.carries as f32) };
+                chain_plan(kit, chain, reach, arrival, budget, fps)
+            }
+            // The script cannot be played: the lunge of an actor with no clip, which does not borrow another attack's.
+            None => strike_plan(kit, reach, None, true, arrival, budget, fps),
+        },
         Shape::Cast => {
             let [begin, hold, end] = kit.cast;
             let Some(begin) = begin else {
@@ -271,9 +286,10 @@ pub fn plan(kit: &Kit, shape: Shape, arrival: f64, budget: f64) -> Performance {
             Performance { impact: timing.impact, segments, lunge: None, reach: 0.0, end: at }
         }
         Shape::Guard => {
-            let at = arrival;
-            let segments = kit.defend.map(|slot| Segment { start: at, len: GUARD_HOLD, slot, from: 0.0, rate: fps, looping: true }).into_iter().collect();
-            Performance { impact: arrival, segments, lunge: None, reach: 0.0, end: at + GUARD_HOLD }
+            // The guard clip once, at its own speed: it raises the guard and returns to the stance (the last tick is held).
+            let len = kit.defend.map_or(0.0, |slot| f64::from(frames_in(kit, slot).max(1)) / fps64);
+            let segments = kit.defend.map(|slot| Segment { start: arrival, len, slot, from: 0.0, rate: fps, looping: false }).into_iter().collect();
+            Performance { impact: arrival, segments, lunge: None, reach: 0.0, end: arrival + len }
         }
     }
 }
@@ -339,11 +355,14 @@ fn strike_plan(kit: &Kit, reach: f32, strike: Option<Strike>, melee: bool, arriv
     Performance { impact: timing.impact, segments, lunge, reach: if lunge.is_some() { reach } else { 0.0 }, end: at }
 }
 
-/// A party member's blow as its script plays it ([`Shape::Blow`]): the approach clips (the actor travels from the one
-/// the script moves at), the strike clips up to the tick the blow lands at, then the rest of them and the way back.
-/// **Every clip plays once whatever its length**: a two-frame leap or a three-frame recovery is a motion, not a held
-/// aim (the 1-to-3 frame rule of [`HELD_POSE_FRAMES`] is for an enemy's poses). Before the impact it is all fitted to
-/// the schedule by [`fit`]; the follow-through and the way back are the only part that is not, as for every blow.
+/// A blow as its script plays it ([`Shape::Blow`] for a party member, [`Shape::Script`] for an enemy): the approach clips
+/// (the actor travels from the one the chain says), the strike clips up to the tick the blow lands at, then the rest of
+/// them and the way back. A script whose last strike clip carries the actor home by itself ([`Chain::home_run`]) has that
+/// clip split where its root begins to travel: before it is the follow-through (the actor holds its aim), from it on the
+/// way back (it runs home). **Every clip plays once whatever its length**: a two-frame leap or a three-frame recovery is a
+/// motion, not a held aim (the 1-to-3 frame rule of [`HELD_POSE_FRAMES`] is for the poses of the procedural plan). Before
+/// the impact it is all fitted to the schedule by [`fit`]; the follow-through and the way back are the only part that is
+/// not, as for every blow, and each is bounded.
 fn chain_plan(kit: &Kit, chain: &Chain, reach: f32, arrival: f64, budget: f64, fps: f32) -> Performance {
     let fps64 = f64::from(fps);
     let ticks = |slot: Slot| f64::from(kit.clips.frames_of(slot).max(1));
@@ -368,12 +387,34 @@ fn chain_plan(kit: &Kit, chain: &Chain, reach: f32, arrival: f64, budget: f64, f
     }
     let timing = fit(arrival, budget, parts.iter().map(|p| p.len).sum());
     let (mut segments, lens) = warp(&parts, timing, fps);
-    // After the impact: the rest of the strike, over its natural length (within the follow-through's bounds), then
-    // the way back.
-    let remaining: f64 = after.iter().map(|&(_, a, b)| b - a).sum();
-    let follow = if remaining > 0.0 { (remaining / fps64).clamp(MIN_FOLLOW, MAX_FOLLOW) } else { MIN_FOLLOW };
+    // After the impact: the rest of the strike (the follow-through), over its natural length within the bounds, then the way
+    // back. When the last strike clip carries the actor home, it is cut where its root begins to travel: the part of it
+    // from there on is the way back, the part before it is still the follow-through.
+    let mut rest = after.clone();
+    let mut home: Vec<(Slot, f64, f64)> = Vec::new();
+    if let (Some(lead), Some(&(slot, a, b))) = (chain.home_run, after.last()) {
+        let split = f64::from(lead).clamp(a, b);
+        if split < b {
+            if split <= a {
+                rest.pop();
+            } else if let Some(last) = rest.last_mut() {
+                last.2 = split;
+            }
+            home.push((slot, split, b));
+        }
+    }
+    home.extend(chain.back.iter().map(|&slot| (slot, 0.0, ticks(slot))));
+    let remaining: f64 = rest.iter().map(|&(_, a, b)| b - a).sum();
+    let follow = if remaining > 0.0 {
+        (remaining / fps64).clamp(MIN_FOLLOW, MAX_FOLLOW)
+    } else if after.is_empty() {
+        MIN_FOLLOW
+    } else {
+        // The whole of what is left of the strike is the way home: the actor leaves at once.
+        0.0
+    };
     let mut at = timing.impact;
-    for &(slot, a, b) in &after {
+    for &(slot, a, b) in &rest {
         let len = (b - a) / remaining * follow;
         segments.push(Segment { start: at, len, slot, from: a as f32, rate: ((b - a) / len) as f32, looping: false });
         at += len;
@@ -385,13 +426,12 @@ fn chain_plan(kit: &Kit, chain: &Chain, reach: f32, arrival: f64, budget: f64, f
         }
         at += follow;
     }
-    let back_ticks: f64 = chain.back.iter().map(|&slot| ticks(slot)).sum();
+    let back_ticks: f64 = home.iter().map(|&(_, a, b)| b - a).sum();
     let back = if back_ticks > 0.0 { (back_ticks / fps64).clamp(MIN_BACK, MAX_BACK) } else { MIN_BACK };
     let way_back = at;
-    for &slot in &chain.back {
-        let n = ticks(slot);
-        let len = n / back_ticks * back;
-        segments.push(Segment { start: at, len, slot, from: 0.0, rate: (n / len) as f32, looping: false });
+    for &(slot, a, b) in &home {
+        let len = (b - a) / back_ticks * back;
+        segments.push(Segment { start: at, len, slot, from: a as f32, rate: ((b - a) / len) as f32, looping: false });
         at += len;
     }
     at = at.max(way_back + back);
@@ -416,7 +456,7 @@ pub fn item_strike(kit: &Kit, at_enemy: bool) -> Option<Strike> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::clips::testing::{cloud_like_pack, cloud_like_scripts};
+    use super::super::clips::testing::{cloud_like_pack, cloud_like_scripts, enemy_like_pack, enemy_like_scripts};
     use super::super::clips::ClipSet;
     use super::*;
 
@@ -478,7 +518,7 @@ mod tests {
         frames[8] = 6;
         frames[9] = 8;
         Kit {
-            clips: ClipSet { travel: vec![0.0; 16], ok: vec![true; 16], frames, fps: 15.0 },
+            clips: ClipSet { travel: vec![0.0; 16], lead: vec![0; 16], ok: vec![true; 16], frames, fps: 15.0 },
             run: Some(2),
             back: Some(4),
             cast: [Some(7), Some(8), Some(9)],
@@ -716,12 +756,144 @@ mod tests {
     }
 
     #[test]
-    fn a_guard_holds_its_pose_for_a_while_and_without_a_clip_nothing_plays() {
+    fn a_guard_plays_its_clip_once_at_its_own_speed_and_without_a_clip_nothing_plays() {
         let kit = kit();
         let p = plan(&kit, Shape::Guard, 1.0, 0.0);
         assert_eq!(p.segments.len(), 1);
-        assert!(near(p.segments[0].len, GUARD_HOLD) && near(p.end, 1.0 + GUARD_HOLD));
+        // The guard clip (6: 10 frames, 15 a second) plays once, not over and over: it ends in the stance.
+        let guard = p.segments[0];
+        assert!(near(guard.len, 10.0 / 15.0) && near(p.end, 1.0 + 10.0 / 15.0) && !guard.looping && guard.slot == 6);
+        assert_eq!(guard.frame_at(guard.len, 10), 9.0, "and holds its last frame to the end");
         assert!(plan(&Kit::none(), Shape::Guard, 1.0, 0.0).segments.is_empty());
+        // A guard of a single frame lasts that frame's tick.
+        let mut one = kit.clone();
+        one.clips.frames[6] = 1;
+        assert!(near(plan(&one, Shape::Guard, 1.0, 0.0).segments[0].len, 1.0 / 15.0));
+    }
+
+    /// The invented enemy of the clips' tests (an MP's shapes): attack 272 is the gun-shaped script, 273 the tonfa-shaped, 274
+    /// the spell-shaped one, 275 names a script that cannot be played.
+    fn enemy() -> Kit {
+        Kit::enemy(enemy_like_pack(), &enemy_like_scripts(), &[(272, 3), (273, 4), (274, 5), (275, 6)])
+    }
+
+    #[test]
+    fn an_enemys_swing_plays_its_scripts_clips_in_order_closes_in_and_lands_on_the_schedules_tick() {
+        let p = plan(&enemy(), Shape::Script { reach: 2500.0, attack: Some(273) }, 10.0, 0.55);
+        assert!(near(p.impact, 10.55), "{p:?}");
+        // The leap (6), the wind-up (7), the swing (8) up to the tick it lands at, the rest of the swing, the recovery (9).
+        let slots: Vec<Slot> = p.segments.iter().map(|s| s.slot).collect();
+        assert_eq!(slots, [6, 7, 8, 8, 9]);
+        assert!(p.segments.iter().all(|s| !s.looping && s.rate > 0.0), "{:?}", p.segments);
+        let (leap, wind, swing, rest, recover) = (p.segments[0], p.segments[1], p.segments[2], p.segments[3], p.segments[4]);
+        assert!(near(leap.start, 10.0) && near(leap.end(), wind.start) && near(wind.end(), swing.start) && near(swing.end(), 10.55), "{:?}", p.segments);
+        assert!((swing.frame_at(swing.len, 11) - 3.0).abs() < 1e-3 && rest.from == 3.0, "the swing lands three ticks in");
+        assert!(near(rest.end(), recover.start));
+        // The script moves the actor to its target: the whole way, travelling from the leap (which carries it), holding there
+        // through the follow-through and coming home over the recovery.
+        let l = p.lunge.expect("it runs up");
+        assert_eq!(p.reach, 2500.0);
+        assert!(near(l.start, leap.start) && near(l.out, leap.len + wind.len), "{l:?}");
+        assert!(near(l.hold, swing.len + rest.len) && near(l.back, recover.len) && l.hop == 0.0, "{l:?}");
+        assert!(near(l.end(), p.end) && near(p.end, recover.end()));
+    }
+
+    #[test]
+    fn an_enemys_shot_holds_its_aim_and_runs_home_with_the_end_of_its_last_clip_and_stops_where_its_run_up_took_it() {
+        // The gun-shaped script: a run-up (2) that carries the actor 900 units, two poses (3, 4) and a long clip (5) that holds
+        // the aim for nine ticks and then carries it home. The shot lands 7 ticks after the run-up: 4 ticks into the long clip.
+        let p = plan(&enemy(), Shape::Script { reach: 4000.0, attack: Some(272) }, 5.0, 0.55);
+        assert!(near(p.impact, 5.55), "{p:?}");
+        let slots: Vec<Slot> = p.segments.iter().map(|s| s.slot).collect();
+        assert_eq!(slots, [2, 3, 4, 5, 5, 5], "run-up, poses, the long clip to the impact, its aim held on, its run home");
+        let (aim, follow, home) = (p.segments[3], p.segments[4], p.segments[5]);
+        assert!(near(aim.end(), 5.55) && (aim.frame_at(aim.len, 20) - 4.0).abs() < 1e-3, "the shot lands 4 ticks into the long clip");
+        assert!(follow.from == 4.0 && near(follow.start, 5.55), "the aim goes on from there: {follow:?}");
+        assert!(home.from == 9.0 && near(follow.end(), home.start), "and the clip carries the actor home from its frame 9: {home:?}");
+        assert!((home.frame_at(home.len, 20) - 19.0).abs() < 1e-3, "to its last frame");
+        assert!(near(p.segments[2].end(), aim.start), "the poses lead into the long clip");
+        // It goes no farther than its run-up carried it, though the target is 4 000 units away, and runs back over the clip's end.
+        let l = p.lunge.expect("it ran up");
+        assert_eq!(p.reach, 900.0);
+        let first = p.segments[0];
+        assert!(near(l.start, first.start) && near(l.out, first.len), "it travels with the run-up: {l:?}");
+        assert!(near(l.back, home.len), "{l:?} {home:?}");
+        assert!(near(l.hold, (5.55 - l.start - l.out) + follow.len), "it holds its aim, the poses and the shot, then goes: {l:?}");
+        assert!(near(l.end(), p.end) && near(p.end, home.end()));
+        // A target nearer than that is not run past.
+        assert_eq!(plan(&enemy(), Shape::Script { reach: 300.0, attack: Some(272) }, 5.0, 0.55).reach, 300.0);
+        // A clip that carries the actor home from the very frame the blow lands has no follow-through: it leaves at once.
+        let mut kit = enemy();
+        kit.attacks[0].1.home_run = Some(0);
+        let p = plan(&kit, Shape::Script { reach: 4000.0, attack: Some(272) }, 5.0, 0.55);
+        let last = p.segments.last().copied().expect("segments");
+        assert!(near(last.start, 5.55) && last.from == 4.0, "the rest of the long clip is the way home from the impact on: {last:?}");
+        let l = p.lunge.expect("it ran up");
+        assert!(near(l.hold, 5.55 - l.start - l.out) && near(l.back, last.len), "{l:?}");
+    }
+
+    #[test]
+    fn an_enemys_spell_gathers_to_the_effect_stays_where_it_is_and_ends_after_it() {
+        // The spell-shaped script: the gathering (11, 12, 13), the effect, the end (14). It lands at the first tick of the end.
+        let p = plan(&enemy(), Shape::Script { reach: 4000.0, attack: Some(274) }, 20.0, 0.55);
+        assert!(near(p.impact, 20.55));
+        let slots: Vec<Slot> = p.segments.iter().map(|s| s.slot).collect();
+        assert_eq!(slots, [11, 12, 13, 14]);
+        let (gather, end) = (p.segments[0], p.segments[3]);
+        assert!(near(gather.start, 20.0) && near(p.segments[2].end(), 20.55), "the gathering ends at the impact: {:?}", p.segments);
+        assert!(near(end.start, 20.55) && end.from == 0.0, "the end clip plays from its first frame at the effect");
+        // Nothing carries it and nothing moves it: it casts where it stands, whatever the distance.
+        assert!(p.lunge.is_none() && p.reach == 0.0);
+    }
+
+    #[test]
+    fn an_attack_with_no_playable_script_is_the_lunge_of_an_actor_with_no_clip_and_still_lands_on_schedule() {
+        let p = plan(&enemy(), Shape::Script { reach: 2500.0, attack: Some(275) }, 7.0, 0.55);
+        assert!(p.segments.is_empty() && near(p.impact, 7.55));
+        assert_eq!(p.lunge.expect("it runs").hop, PROCEDURAL_HOP, "the procedural hop, not another attack's clips");
+    }
+
+    #[test]
+    fn no_enemy_chain_lands_late_or_runs_longer_than_the_bounds_whatever_its_shape_or_its_clips() {
+        // All the shapes, with their own clips and with very long ones (200 frames: 13 seconds each), every budget, at several distances.
+        for long in [false, true] {
+            let mut kit = enemy();
+            if long {
+                for frames in kit.clips.frames.iter_mut().skip(2) {
+                    *frames = 200;
+                }
+                kit.clips.lead = vec![30; 16];
+            }
+            for attack in [272u16, 273, 274] {
+                let Some(chain) = kit.enemy_chain(Some(attack)).cloned() else { panic!("attack {attack} plays a script") };
+                // `long` makes the clips long without moving the marker: the impact stays where the script put it, or at the end.
+                let chain = Chain { impact: chain.impact.min(kit.clips.frames_of(chain.strike[0])), ..chain };
+                for budget in [0.0, 0.3, 0.55, 0.6] {
+                    for reach in [0.0f32, 300.0, 4000.0] {
+                        let mut kit = kit.clone();
+                        kit.attacks = vec![(attack, chain.clone())];
+                        let p = plan(&kit, Shape::Script { reach, attack: Some(attack) }, 9.0, budget);
+                        let what = format!("{attack} long {long} budget {budget} reach {reach}: {p:?}");
+                        assert!(near(p.impact, 9.0 + budget), "{what}");
+                        let before: Vec<&Segment> = p.segments.iter().filter(|s| s.start < p.impact - 1e-9).collect();
+                        for pair in before.windows(2) {
+                            assert!(pair[0].end() <= pair[1].start + 1e-9, "{what}");
+                        }
+                        assert!(before.iter().all(|s| s.end() <= p.impact + 1e-9 && s.start >= 9.0 - 1e-9), "{what}");
+                        assert!(p.end - p.impact <= MAX_FOLLOW + MAX_BACK + 1e-9 && p.end >= p.impact, "{what}");
+                        for s in &p.segments {
+                            assert!(s.len.is_finite() && s.len >= 0.0 && s.rate.is_finite() && s.from.is_finite() && s.rate >= 0.0, "{what}: {s:?}");
+                        }
+                        if let Some(l) = p.lunge {
+                            assert!(l.start >= 9.0 - 1e-9 && l.out > 0.0 && l.hold >= 0.0 && l.back > 0.0 && l.end().is_finite(), "{what}: {l:?}");
+                            // It is home again when the performance is over, give or take the moment a cut-short approach is given.
+                            assert!(l.end() >= p.end - 1e-9 && l.end() <= p.end + MIN_TRAVEL + 1e-9, "{what}: {l:?}");
+                            assert!(p.reach > 1.0 && p.reach <= reach, "{what}");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -2,10 +2,11 @@
 //! blow lands on schedule whatever the clips, and that nothing a server sends can grow the schedule
 //! without bound or break it.
 
-use super::super::clips::testing::{cloud_like_pack, cloud_like_scripts};
+use super::super::clips::testing::{cloud_like_pack, cloud_like_scripts, enemy_like_pack, enemy_like_scripts};
 use super::super::clips::{party, ClipSet};
 use super::super::cue::{self, DEATH_BEAT, MAX_IMPACT_DELAY};
 use super::*;
+use fmv_ff7::battle_model::script::Script;
 
 const PLAIN: &dyn Fn(ActorId, ActionRef) -> Look = &|_, _| Look::PLAIN;
 
@@ -22,19 +23,27 @@ fn anchors() -> Vec<Anchor> {
 
 /// A pack of `n` slots of `frames` frames each, all real, none travelling, at 15 frames per second.
 fn pack(n: usize, frames: u16) -> ClipSet {
-    ClipSet { frames: vec![frames; n], ok: vec![true; n], travel: vec![0.0; n], fps: 15.0 }
+    ClipSet { frames: vec![frames; n], ok: vec![true; n], travel: vec![0.0; n], lead: vec![0; n], fps: 15.0 }
+}
+
+/// The invented enemy (an MP's shapes, see `clips::testing`): attack 272 plays the gun-shaped script (a run-up that
+/// carries it 900 units, poses, a long clip that holds the aim and runs home), 273 the swing-shaped one (a leap, the move
+/// to the target, a swing, the recovery), 274 the spell-shaped one; its hurt clip is slot 1, and with `death_clip` its death
+/// plays slot 10 (without, like most of the real ones, its death script plays nothing: it fades).
+fn enemy_kit(death_clip: bool) -> Kit {
+    let mut scripts = enemy_like_scripts();
+    if !death_clip {
+        scripts[2] = Script::default();
+    }
+    Kit::enemy(enemy_like_pack(), &scripts, &[(272, 3), (273, 4), (274, 5)])
 }
 
 /// The same four with real clips: the party's shared slots and blows of Cloud's shape (52 slots, `cloud_like_pack`)
-/// and enemies that attack with attack 272 (slot 3, 15 frames) and run up with slot 2 (1 000 units forward) and back
-/// with slot 5.
+/// and enemies of the shapes of `enemy_kit` (no death clip).
 fn with_clips() -> Director {
     let sides = vec![Side::Party, Side::Party, Side::Enemy, Side::Enemy];
     let party = Kit::party(cloud_like_pack(), &cloud_like_scripts());
-    let mut set = pack(8, 15);
-    set.travel[2] = -1000.0;
-    set.travel[5] = 1000.0;
-    let enemy = Kit::enemy(set, &[(272, 3)]);
+    let enemy = enemy_kit(false);
     Director::with_kits(sides, anchors(), vec![party.clone(), party, enemy.clone(), enemy])
 }
 
@@ -133,7 +142,9 @@ fn no_blow_lands_later_than_the_cap_whatever_its_clips_its_reach_or_what_its_act
     // actor busy with an earlier performance that is still running.
     let sides = vec![Side::Party, Side::Party, Side::Enemy, Side::Enemy];
     let party = Kit::party(pack(52, 200), &cloud_like_scripts());
-    let enemy = Kit::enemy(pack(8, 200), &[(272, 3)]);
+    let mut long = enemy_like_pack();
+    long.frames = vec![200; long.frames.len()];
+    let enemy = Kit::enemy(long, &enemy_like_scripts(), &[(272, 3), (273, 4), (274, 5)]);
     for far in [0.0f32, 500.0, 3000.0, 20_000.0] {
         let anchors = vec![Anchor { ground: [0.0, 0.0], radius: 150.0 }, Anchor { ground: [10.0, 0.0], radius: 150.0 }, Anchor { ground: [0.0, -far], radius: 150.0 }, Anchor { ground: [0.0, -far], radius: 150.0 }];
         let mut d = Director::with_kits(sides.clone(), anchors, vec![party.clone(), party.clone(), enemy.clone(), enemy.clone()]);
@@ -142,7 +153,9 @@ fn no_blow_lands_later_than_the_cap_whatever_its_clips_its_reach_or_what_its_act
             let before = d.bursts().len();
             // The same actor again before the last one is over: its performance takes over.
             d.on_batch(now, &[action(0, what), damage(0, 2, i % 2 == 0)], PLAIN);
-            d.on_batch(now + 0.01, &[action(2, ActionRef::EnemyAttack(272)), damage(2, 1, false)], PLAIN);
+            // Every shape of the enemy's scripts (the gun, the swing, the spell) in turn.
+            let attack = [272, 273, 274][i % 3];
+            d.on_batch(now + 0.01, &[action(2, ActionRef::EnemyAttack(attack)), damage(2, 1, false)], PLAIN);
             for burst in &d.bursts()[before..] {
                 assert!(burst.at <= now + 0.01 + MAX_IMPACT_DELAY + 1e-9, "{what:?} at {far}: the blow lands at {} after arrival {now}", burst.at);
                 assert!(burst.at >= now, "never before the batch arrived");
@@ -251,48 +264,76 @@ fn a_long_range_blow_hops_forward_and_no_further_and_an_item_at_an_enemy_is_the_
 }
 
 #[test]
-fn an_enemys_attack_plays_the_clip_scene_bin_names_and_runs_up_with_its_run_clip() {
+fn an_enemys_attack_plays_the_clips_of_the_script_scene_bin_names_and_goes_as_far_as_the_script_says() {
     let mut d = with_clips();
+    // Attack 272 plays the gun-shaped script: the run-up (2), two poses (3, 4), the long clip (5) that holds the aim and
+    // then runs home. The shot lands 4 ticks into the long clip, at the impact.
     d.on_batch(5.0, &[action(2, ActionRef::EnemyAttack(272)), damage(2, 1, false)], PLAIN);
-    // The run-up is the clip with the big forward travel (slot 2), the attack slot 3, the way back slot 5.
-    assert_eq!(d.motion(2, 5.01).clip.map(|c| c.slot), Some(2));
-    assert_eq!(d.motion(2, 5.55 - 0.001).clip.map(|c| c.slot), Some(3));
     let slots: Vec<Slot> = d.segments[2].iter().map(|s| s.slot).collect();
-    assert_eq!(slots, [2, 3, 3, 5]);
+    assert_eq!(slots, [2, 3, 4, 5, 5, 5]);
+    assert_eq!(d.motion(2, 5.01).clip.map(|c| c.slot), Some(2));
+    let firing = d.motion(2, 5.55 - 0.001).clip.expect("firing");
+    assert_eq!(firing.slot, 5);
+    assert!(near(firing.frame, 4.0, 0.1), "the shot lands 4 ticks into the long clip: {firing:?}");
+    // Nothing sends it to its target: it stops where the run-up took it (900 units) though the target is 3 600 away.
+    let o = d.motion(2, 5.55).offset;
+    assert!(near(o[0].hypot(o[2]), 900.0, 1.0), "{o:?}");
     // A hit on a party member plays its hurt clip (slot 15).
     assert_eq!(d.motion(1, 5.6).clip.map(|c| c.slot), Some(15));
-    // An attack the table does not know plays the enemy's first attack's clip.
+    // Attack 273 plays the swing-shaped script (a leap, a wind-up, the swing, the recovery) and it does go to its target.
+    let mut d = with_clips();
+    d.on_batch(5.0, &[action(2, ActionRef::EnemyAttack(273)), damage(2, 1, false)], PLAIN);
+    let slots: Vec<Slot> = d.segments[2].iter().map(|s| s.slot).collect();
+    assert_eq!(slots, [6, 7, 8, 8, 9]);
+    let o = d.motion(2, 5.55).offset;
+    assert!(o[0].hypot(o[2]) > 3000.0, "the move to the target took it there: {o:?}");
+    // An attack the table does not know plays the enemy's first attack's script.
     let mut d = with_clips();
     d.on_batch(5.0, &[action(2, ActionRef::EnemyAttack(9999)), damage(2, 1, false)], PLAIN);
-    assert!(d.segments[2].iter().any(|s| s.slot == 3));
+    assert_eq!(d.segments[2].iter().map(|s| s.slot).collect::<Vec<_>>(), [2, 3, 4, 5, 5, 5]);
+    // So does a plain attack (an announcement of `Attack` by an enemy).
+    let mut d = with_clips();
+    d.on_batch(5.0, &blow(2, 1), PLAIN);
+    assert!(d.segments[2].iter().any(|s| s.slot == 5));
 }
 
 #[test]
-fn an_attack_whose_clip_cannot_be_played_moves_procedurally_and_does_not_borrow_anothers() {
+fn an_enemys_spell_is_cast_where_it_stands_and_lands_at_the_effect() {
+    let mut d = with_clips();
+    let fire = |_: ActorId, _: ActionRef| Look { melee: false, element: Element::Fire };
+    d.on_batch(5.0, &[action(2, ActionRef::EnemyAttack(274)), damage(2, 1, false)], &fire);
+    // The gathering (11, 12, 13) up to the effect at the impact, then the end (14).
+    let slots: Vec<Slot> = d.segments[2].iter().map(|s| s.slot).collect();
+    assert_eq!(slots, [11, 12, 13, 14]);
+    assert_eq!(d.motion(2, 5.55 - 0.001).clip.map(|c| c.slot), Some(13));
+    assert_eq!(d.motion(2, 5.55 + 0.05).clip.map(|c| c.slot), Some(14));
+    assert_eq!(d.pending(), 0, "it does not run anywhere");
+    // The burst is at the target at the impact.
+    assert!(impacts(&d).iter().all(|&at| (at - 5.55).abs() < 1e-9));
+}
+
+#[test]
+fn an_attack_whose_script_cannot_be_played_moves_procedurally_and_does_not_borrow_anothers() {
     let sides = vec![Side::Party, Side::Party, Side::Enemy, Side::Enemy];
-    let mut set = pack(8, 15);
-    set.travel[2] = -1000.0;
-    set.travel[5] = 1000.0;
-    // Attack 272 plays slot 3 (real); attack 273 names slot 4, which is not the slot's own clip; 274 names slot 40,
-    // past the pack.
-    set.ok[4] = false;
-    let enemy = Kit::enemy(set, &[(272, 3), (273, 4), (274, 40)]);
+    // Attack 272 plays script 3; 275 names script 6 (it strikes with a stand-in clip), 276 script 7 (it marks nothing) and
+    // 277 a script that is not there.
+    let enemy = Kit::enemy(enemy_like_pack(), &enemy_like_scripts(), &[(272, 3), (275, 6), (276, 7), (277, 40)]);
     let mut d = Director::with_kits(sides, anchors(), vec![Kit::none(), Kit::none(), enemy.clone(), enemy]);
     d.on_batch(5.0, &[action(2, ActionRef::EnemyAttack(272)), damage(2, 1, false)], PLAIN);
-    assert!(d.segments_of(2).iter().any(|s| s.slot == 3), "the playable attack plays its clip");
-    for bad in [273u16, 274] {
+    assert!(d.segments_of(2).iter().any(|s| s.slot == 5), "the playable attack plays its script's clips");
+    for bad in [275u16, 276, 277] {
         let mut d = d.clone();
         d.on_batch(9.0, &[action(3, ActionRef::EnemyAttack(bad)), damage(3, 1, false)], PLAIN);
-        assert!(d.segments_of(3).iter().all(|s| s.slot != 3), "attack {bad} does not play attack 272's clip: {:?}", d.segments_of(3));
+        assert!(d.segments_of(3).is_empty(), "attack {bad} plays none of attack 272's clips: {:?}", d.segments_of(3));
         let run = d.effects.iter().filter(|e| matches!(e, Effect::Lunge { actor: 3, .. })).count();
         assert_eq!(run, 1, "it runs up to its target like an actor without clips");
         // It lands on schedule all the same.
         assert!(d.bursts().iter().any(|b| (b.at - (9.0 + cue::impact_delay(Some(ActionRef::EnemyAttack(bad))))).abs() < 1e-9));
     }
-    // An attack the scene does not name for it at all (or a plain attack) plays the first attack's clip.
+    // An attack the scene does not name for it at all (or a plain attack) plays the first attack's script.
     let mut named_nowhere = d.clone();
     named_nowhere.on_batch(20.0, &[action(3, ActionRef::EnemyAttack(999)), damage(3, 1, false)], PLAIN);
-    assert!(named_nowhere.segments_of(3).iter().any(|s| s.slot == 3));
+    assert!(named_nowhere.segments_of(3).iter().any(|s| s.slot == 5));
 }
 
 #[test]
@@ -324,7 +365,7 @@ fn a_cast_gathers_a_glow_begins_to_the_impact_and_breaks_in_the_elements_colour(
 }
 
 #[test]
-fn a_heal_bursts_green_and_an_items_effect_is_an_items_and_a_guard_holds_its_pose() {
+fn a_heal_bursts_green_and_an_items_effect_is_an_items_and_a_guard_is_the_guard_clip_once() {
     let mut d = with_clips();
     let cure = |_: ActorId, _: ActionRef| Look { melee: false, element: Element::Cure };
     d.on_batch(1.0, &[action(0, ActionRef::Magic(0)), BattleEvent::Heal { actor: ActorId(0), target: ActorId(1), amount: 80 }], &cure);
@@ -336,9 +377,48 @@ fn a_heal_bursts_green_and_an_items_effect_is_an_items_and_a_guard_holds_its_pos
     assert_eq!(d.motion(0, 1.2).clip.map(|c| c.slot), Some(9), "the item gesture");
     let mut d = with_clips();
     d.on_batch(1.0, &[action(1, ActionRef::Defend)], PLAIN);
-    assert_eq!(d.motion(1, 1.3).clip.map(|c| c.slot), Some(8));
+    // The guard is script 8's clip (5: 10 frames), played once at its own speed (0.4 s in it is on its 6th frame), never the
+    // cover script's held pose (8).
+    let guarding = d.motion(1, 1.4).clip.expect("guarding");
+    assert_eq!(guarding.slot, 5);
+    assert!(near(guarding.frame, 6.0, 0.1), "{guarding:?}");
+    assert!(d.segments_of(1).iter().all(|s| s.slot != 8 && !s.looping));
     assert!(d.bursts().is_empty() && d.charges().is_empty());
-    assert_eq!(d.motion(1, 1.0 + plan::GUARD_HOLD + 0.2).clip, None, "and lets go of it");
+    assert_eq!(d.motion(1, 1.0 + 10.0 / 15.0 + 0.05).clip, None, "and it is over with the clip: back to the stance");
+}
+
+#[test]
+fn an_enemy_with_a_death_clip_plays_it_from_the_start_of_its_death_and_fades_when_the_fall_has_been_seen() {
+    let sides = vec![Side::Party, Side::Party, Side::Enemy, Side::Enemy];
+    let party = Kit::party(cloud_like_pack(), &cloud_like_scripts());
+    let enemy = enemy_kit(true);
+    let mut d = Director::with_kits(sides, anchors(), vec![party.clone(), party, enemy.clone(), enemy]);
+    d.on_batch(1.0, &[action(0, ActionRef::Attack), damage(0, 2, false), BattleEvent::Death { actor: ActorId(2) }], PLAIN);
+    let begins = 1.0 + 0.5 + DEATH_BEAT;
+    // Until its death begins it flinches (its hurt clip from the blow) and is whole.
+    assert_eq!(d.motion(2, begins - 0.01).clip.map(|c| c.slot), Some(1));
+    assert_eq!(d.motion(2, begins - 0.01).alpha, 1.0);
+    // From the start of the death: the death clip (slot 10: 16 frames) at its own speed, whole while the fall is seen
+    // (half the clip: 0.5 s), then the alpha falls steadily and the enemy is gone when the fade is over.
+    let m = d.motion(2, begins + 0.2);
+    assert_eq!(m.clip.map(|c| c.slot), Some(10));
+    assert!(near(m.clip.map_or(0.0, |c| c.frame), 3.0, 0.1) && m.alpha == 1.0 && m.squash == 1.0, "{m:?}");
+    let fade_from = 0.5;
+    let mut last = 1.0;
+    for step in 1..=11 {
+        let m = d.motion(2, begins + fade_from + f64::from(FADE) * f64::from(step) / 12.0);
+        assert!(m.alpha < last && m.alpha > 0.0 && !m.gone && m.visible, "fading at step {step}: {m:?}");
+        last = m.alpha;
+    }
+    let m = d.motion(2, begins + fade_from + f64::from(FADE) + 0.01);
+    assert!(m.gone && m.alpha < 0.01, "{m:?}");
+    // The clip ends on its last frame (a second in) and stays there while the fade goes on.
+    assert_eq!(d.motion(2, begins + 1.05).clip.map(|c| c.frame), Some(15.0));
+    // The enemy that fell has no death clip of its own here (its death script plays nothing) fades as before: the hurt clip.
+    let mut plain = with_clips();
+    plain.on_batch(1.0, &[action(0, ActionRef::Attack), damage(0, 2, false), BattleEvent::Death { actor: ActorId(2) }], PLAIN);
+    assert_eq!(plain.motion(2, begins + 0.2).clip.map(|c| c.slot), Some(1));
+    assert!(plain.motion(2, begins + 0.2).alpha < 1.0);
 }
 
 // ----- deaths, fades, victory -------------------------------------------------------------------
