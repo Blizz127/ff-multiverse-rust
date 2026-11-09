@@ -30,6 +30,12 @@
 //!   scripts of a table (a limit break of Tifa's: they enter the same string at different places) run to the end
 //!   of the file instead, which is not an end this decoder calls one ([`Script::terminated`]).
 //! * A **played clip** is the number of a slot of the pack (`animations[i]` of [`super::BattleModel`]).
+//! * An **enemy's** scripts (32 of them) follow one convention, **verified on the owned files on 2026-11-09** over the 329 enemies
+//!   that have a name: script 0 is the idle loop (`A9 C9 00 C1`), script 1 the hurt reaction (the slot it plays, then `F6`, the
+//!   engine's death effect), script 2 the death (a clip in 45 of them, `HOME IDLE` in the rest), and the attacks follow:
+//!   `scene.bin`'s `animation_indices` are indices of these scripts, NOT slots of the pack. An attack marks where it lands with
+//!   `F7` (damage, after `b` ticks), `C2` (the number) or `EC` (the effect: a spell or a special), moves the actor with `D1`/`D0`
+//!   and sends it back with `FA` (`fmv-client`'s `battle::scene::clips` reads them).
 //!
 //! # Sources
 //!

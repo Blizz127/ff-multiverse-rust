@@ -53,12 +53,13 @@
 //!
 //! # Which clip plays what
 //!
-//! A real battle model comes with its [`ModelRole`] (a playable character's, an enemy's) and the
-//! slots its pack really has ([`BattleModelData::slot_ok`]); an enemy also with the attacks `scene.bin`
-//! names for it ([`EnemyBook`], read from the `scene.bin` that [`remember_scene_bin`] was told of, keyed
-//! by the enemy's id). [`Rigs`] makes a [`Kit`] of them ([`super::clips`] says which slot is which,
-//! verified on contact sheets) that the scene's choreography reads; a stand-in or a box has none and
-//! moves procedurally. A clip is posed IN PLACE ([`ActorRig::clip_pose`]): the root's travel along the
+//! A real battle model comes with its [`ModelRole`] (a playable character's, an enemy's), the
+//! slots its pack really has ([`BattleModelData::slot_ok`]) and its own animation scripts
+//! ([`BattleModelData::scripts`]: what the game plays for an action); an enemy also with the attacks
+//! `scene.bin` names for it ([`EnemyBook`], read from the `scene.bin` that [`remember_scene_bin`] was told
+//! of, keyed by the enemy's id: each names the SCRIPT it plays). [`Rigs`] makes a [`Kit`] of them
+//! ([`super::clips`] says which clip is which, verified on contact sheets) that the scene's choreography
+//! reads; a stand-in or a box has none and moves procedurally. A clip is posed IN PLACE ([`ActorRig::clip_pose`]): the root's travel along the
 //! ground is taken out (the weapon's track too, which is in the character's space) and the scene moves
 //! the actor itself.
 
@@ -110,7 +111,8 @@ pub enum ModelRole {
     Plain,
     /// A playable character's model: the shared slots of the nine characters and the blows of its own scripts.
     Character,
-    /// An enemy's model: slot 1 is the hurt clip, its attacks are the ones [`BattleModelData::attacks`] names.
+    /// An enemy's model: its hurt and death clips and what it plays for each attack are read from its own animation scripts
+    /// ([`BattleModelData::scripts`]; the attacks are the ones [`BattleModelData::attacks`] names).
     Enemy,
 }
 
@@ -133,7 +135,7 @@ pub struct BattleModelData {
     /// Whether each slot holds the slot's own clip (`false`: a stand-in the loader made); empty says
     /// nothing is known (every slot is taken as real).
     pub slot_ok: Arc<Vec<bool>>,
-    /// An enemy's attacks: `scene.bin` attack id and the slot it plays ([`EnemyBook`]).
+    /// An enemy's attacks: `scene.bin` attack id and the index of the animation script it plays ([`EnemyBook`]).
     pub attacks: Arc<Vec<(u16, u8)>>,
     /// The model's animation scripts (`BattleModel::scripts`): what a character's blows are made of
     /// ([`super::clips::Chain`]); none: they are procedural.
@@ -353,8 +355,9 @@ fn remembered_scene_bin() -> Option<PathBuf> {
     REMEMBERED_SCENE_BIN.lock().ok().and_then(|slot| slot.clone())
 }
 
-/// What `scene.bin` says about the clips of each enemy: which slot each attack plays. Attack `i` of an
-/// enemy record has the id `attack_ids[i]` and plays the slot `animation_indices[i]`.
+/// What `scene.bin` says about the animation of each enemy: which script each attack plays. Attack `i` of an
+/// enemy record has the id `attack_ids[i]` and plays the SCRIPT `animation_indices[i]` of the enemy model's own `ab` entry
+/// (script 3 is the MP's Machine Gun, which plays slots 2 to 5 of its pack in turn: the number is not a slot).
 ///
 /// Keyed by the enemy's id, which is also its model's id, because the scene's start does not say which
 /// formation it is: the ignored real-data test `book_is_the_same_in_every_scene` holds that every scene
@@ -382,7 +385,7 @@ impl EnemyBook {
         record.attack_ids.iter().zip(record.animation_indices.iter()).filter(|&(&id, &slot)| id != 0xFFFF && slot != 0xFF).map(|(&id, &slot)| (id, slot)).collect()
     }
 
-    /// The attacks of enemy `enemy_id`: attack id and slot (none for an enemy the book does not have).
+    /// The attacks of enemy `enemy_id`: attack id and script index (none for an enemy the book does not have).
     pub fn attacks_of(&self, enemy_id: u16) -> Vec<(u16, u8)> {
         self.by_enemy.get(&enemy_id).cloned().unwrap_or_default()
     }
@@ -729,7 +732,7 @@ fn body_radius_of(asset: &AvatarAsset, scale: f32) -> f32 {
 }
 
 /// The pack of `clips` as the choreography sees it (`ok` empty: every slot is real).
-fn clip_set(clips: &[FieldAnimation], ok: &[bool], fps: f32) -> ClipSet {
+pub(super) fn clip_set(clips: &[FieldAnimation], ok: &[bool], fps: f32) -> ClipSet {
     let frames = clips.iter().map(|c| u16::try_from(c.frame_count()).unwrap_or(u16::MAX)).collect();
     let travel = clips
         .iter()
@@ -738,7 +741,20 @@ fn clip_set(clips: &[FieldAnimation], ok: &[bool], fps: f32) -> ClipSet {
             _ => 0.0,
         })
         .collect();
-    ClipSet { frames, ok: (0..clips.len()).map(|i| ok.get(i).copied().unwrap_or(true)).collect(), travel, fps }
+    // How many frames go by before the root has covered a tenth of its travel (a clip that carries the actor home holds
+    // its pose first: the way home begins there).
+    let lead = clips
+        .iter()
+        .map(|c| {
+            let (Some(first), Some(last)) = (c.frames().first(), c.frames().last()) else { return 0 };
+            let total = last.root_translation[2] - first.root_translation[2];
+            if !total.is_finite() || total.abs() < 1.0 {
+                return 0;
+            }
+            c.frames().iter().position(|f| (f.root_translation[2] - first.root_translation[2]) / total >= 0.1).map_or(0, |at| u16::try_from(at).unwrap_or(u16::MAX))
+        })
+        .collect();
+    ClipSet { frames, ok: (0..clips.len()).map(|i| ok.get(i).copied().unwrap_or(true)).collect(), travel, lead, fps }
 }
 
 /// The drawable asset of a model and its clips, if every clip fits its skeleton. The asset's
@@ -846,7 +862,7 @@ impl Rigs {
         // A model whose idle is a still pose has no motion of its own to dress: it stays procedural.
         let kit = match (battle.role, procedural_idle) {
             (ModelRole::Character, false) => Kit::party(clip_set(&battle.clips, &battle.slot_ok, fps), &battle.scripts),
-            (ModelRole::Enemy, false) => Kit::enemy(clip_set(&battle.clips, &battle.slot_ok, fps), &battle.attacks),
+            (ModelRole::Enemy, false) => Kit::enemy(clip_set(&battle.clips, &battle.slot_ok, fps), &battle.scripts, &battle.attacks),
             _ => Kit::none(),
         };
         let rig = Arc::new(ActorRig {

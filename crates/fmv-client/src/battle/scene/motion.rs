@@ -25,7 +25,9 @@
 //! arrived, whatever the clips' lengths or what the actor was doing (a later performance of an actor
 //! takes over from its start). An actor without real clips ([`Kit::none`]: a stand-in, a box) gets
 //! the procedural motion that stood here first: the lunge with its hop, the blink and shake, the
-//! collapse.
+//! collapse; so does an attack whose script cannot be played (it never borrows another attack's clips).
+//! A beaten enemy whose death script plays a clip plays it and fades once the fall has been seen; the
+//! others flinch and fade.
 //!
 //! The matches on actions and events here and in [`cue`] are exhaustive on purpose. Protocol v7: a limit
 //! break ([`ActionRef::Limit`]) is a spell-like show (the performer gathers with the cast clips and a
@@ -34,7 +36,7 @@
 //! [`ActionRef::Escape`] with no failure after it, and no victory pose: a battle that was escaped has no
 //! `Victory`) makes the whole party turn and run off the screen with the run clip ([`Director::on_escape`]).
 
-use super::clips::{AttackClip, Kit, Slot};
+use super::clips::{Kit, Slot};
 use super::cue::{self, Cue, Landing};
 use super::effects::{Burst, BurstKind, Charge, Element, Look};
 use super::plan::{self, Lunge, Segment, Shape};
@@ -58,8 +60,10 @@ const FLINCH_SHAKE: f32 = 0.30;
 /// How long an enemy without a death clip takes to collapse, and a party member without one to fall over.
 pub const COLLAPSE: f32 = 0.85;
 pub const FALL: f32 = 0.55;
-/// How long a beaten enemy with real clips takes to fade out, in seconds.
+/// How long a beaten enemy with real clips takes to fade out, in seconds, and how late into its death clip the fade begins
+/// at the latest (an enemy that has a death clip plays it, and fades when the fall has been seen).
 pub const FADE: f32 = 0.6;
+pub const DEATH_FALL_MAX: f32 = 0.6;
 /// A death that was not seen coming (the engine says dead, no event was played) is already over
 /// by this long.
 const LONG_AGO: f64 = 1000.0;
@@ -328,7 +332,11 @@ impl Director {
                 // spell: the performer gathers its power with the cast clips and a glow, and it breaks over the
                 // target with a strong effect (see `land`).
                 Some(ActionRef::Magic(_) | ActionRef::Limit(_)) if self.sides[pi] == Side::Party => Shape::Cast,
-                Some(ActionRef::Magic(_) | ActionRef::Limit(_)) => Shape::Stand { strike: kit.plain.map(|slot| plan::Strike { slot, impact: 0.5 }) },
+                // An enemy's spell is its first attack's script, where it stands (nothing to run up to).
+                Some(ActionRef::Magic(_) | ActionRef::Limit(_)) => match kit.enemy_chain(None) {
+                    Some(_) => Shape::Script { reach: 0.0, attack: None },
+                    None => Shape::Stand { strike: None },
+                },
                 // Thrown at an enemy it is the throw forward, used on an ally the gesture with the arm raised.
                 Some(ActionRef::Item(_)) => {
                     let at_enemy = targets.iter().any(|&t| self.anchor(t).is_some_and(|(i, _)| self.sides[i] == Side::Enemy));
@@ -390,25 +398,17 @@ impl Director {
         self.effects.drain(..over);
     }
 
-    /// The shape of a blow: runs up to its target when `melee` and there is ground to cover, plays the
-    /// clip its attack names (for an enemy: `attack`'s slot, else its first attack's), or a party
-    /// member's own blow, the clips of its animation script ([`Shape::Blow`]: its short-range script when `melee`,
-    /// its long-range one otherwise).
+    /// The shape of a blow: a party member's own blow, the clips of its animation script ([`Shape::Blow`]: its short-range
+    /// script when `melee`, its long-range one otherwise); an enemy's, the clips of the script `scene.bin` names for the
+    /// attack ([`Shape::Script`]: the script says whether it runs up to its target, a plain attack or an attack the scene
+    /// does not name plays the first attack's). An attack whose script cannot be played is the procedural motion (it
+    /// does not borrow another attack's): it runs up to its target when `melee` and there is ground to cover, else stands.
     fn strike_shape(&self, kit: &Kit, attack: Option<u16>, melee: bool, reach: f32, actor: usize) -> Shape {
-        let strike = match self.sides[actor] {
-            Side::Party => return Shape::Blow { reach, melee },
-            // The clip its attack names; an attack whose clip cannot be played moves procedurally (it does not
-            // borrow another attack's); a plain attack, or an id the scene does not name, plays its first.
-            Side::Enemy => match attack.and_then(|id| kit.attack_clip(id)) {
-                Some(AttackClip::Slot(slot)) => Some(plan::Strike { slot, impact: 0.5 }),
-                Some(AttackClip::Procedural) => None,
-                None => kit.plain.map(|slot| plan::Strike { slot, impact: 0.5 }),
-            },
-        };
-        if melee {
-            Shape::Melee { reach, strike }
-        } else {
-            Shape::Stand { strike }
+        match self.sides[actor] {
+            Side::Party => Shape::Blow { reach, melee },
+            Side::Enemy if kit.enemy_chain(attack).is_some() => Shape::Script { reach, attack },
+            Side::Enemy if melee => Shape::Melee { reach, strike: None },
+            Side::Enemy => Shape::Stand { strike: None },
         }
     }
 
@@ -639,6 +639,19 @@ impl Director {
                         _ => ClipPose { slot, frame: frame.min(last) },
                     });
                     m.offset = [m.offset[0], 0.0, m.offset[2]];
+                }
+                // An enemy whose death script plays a clip plays it, from the start of its death, and fades out once the fall
+                // has been seen: half way through the clip, at the latest [`DEATH_FALL_MAX`] seconds in.
+                (Some(Side::Enemy), Some(kit)) if kit.death.is_some() => {
+                    let slot = kit.death.unwrap_or(0);
+                    let fps = kit.clips.fps.max(1.0);
+                    let last = f32::from(kit.clips.frames_of(slot).saturating_sub(1));
+                    m.clip = Some(ClipPose { slot, frame: (u * fps).min(last) });
+                    let fade_from = (last / fps * 0.5).min(DEATH_FALL_MAX);
+                    m.alpha = 1.0 - ease_in(((u - fade_from) / FADE).max(0.0));
+                    if u >= fade_from + FADE {
+                        m.gone = true;
+                    }
                 }
                 // An enemy with clips flinches (its hurt clip, played from the blow) and fades out.
                 (Some(Side::Enemy), Some(kit)) if kit.hurt.is_some() => {

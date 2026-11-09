@@ -19,9 +19,14 @@
 //!   `party_roles_overview_sheets` one picture per role for all nine, and `enemy_slot_evidence_sheets` the MP and
 //!   the Guard Hound: the evidence for the tables of [`super::clips`].
 //! * `fight_party_attack_strips` plays each character's blow in a real fight (`attack-strip-<name>.png`).
+//! * `enemy_attack_chain_sheets` draws the clips of the enemy attacks of the evidence set (the MP's Machine Gun and Tonfa, the
+//!   Guard Hound's Bite and Tentacle, the Mono Drive's Drilldrive and Fire) in the order their scripts play them
+//!   (`enemy-chain-<name>.png`); `fight_enemy_attack_sheets` and `fight_enemy_death_sheets` perform them and a beaten enemy in a
+//!   real formation (`enemy-attack-<name>-wide.png` and `-close-0.png`, `enemy-death-<name>-close-0.png`); `fight_defend_sheets`
+//!   the guard (`defend-close-<n>.png`).
 //! * `party_clips_agree_across_the_characters`, `party_blows_are_the_scripts_clips`,
-//!   `party_attack_range_by_starting_weapon` and `enemy_book_is_the_same_in_every_scene` check the numbers behind
-//!   the tables without a GPU.
+//!   `party_attack_range_by_starting_weapon`, `enemy_book_is_the_same_in_every_scene` and
+//!   `enemy_attack_chains_are_the_scripts_clips` check the numbers behind the tables without a GPU.
 //! * `fight_*` run real fights (a real engine, the client's own replay, the scene, the overlay) and write
 //!   the sheets of the presentation: an MP's attack chain, a party attack with the number at its impact, a
 //!   cast with its effect, the elements, a beaten enemy's fade and the victory pose.
@@ -31,7 +36,7 @@
 #![allow(clippy::chunks_exact_to_as_chunks)]
 
 use super::camera::{BattleCamera, View};
-use super::clips::{Chain, ClipSet, Kit};
+use super::clips::{Chain, ClipSet, Kit, Role};
 use super::effects::Element;
 use super::shots::{contact_sheet, member, open_real, Real, Server, ME, H, W};
 use super::*;
@@ -41,7 +46,7 @@ use crate::avatar::source::NON_PLAYABLE;
 use crate::battle::{draw_battle_overlay, BattleClient};
 use crate::ui::draw::DrawList;
 use crate::ui::testkit::{pixel, save, Offscreen};
-use fmv_ff7::battle_model::script::AnimationScripts;
+use fmv_ff7::battle_model::script::{code, AnimationScripts};
 use fmv_ff7::battle_model::{BattleCharacter, BattleModel, BattleModels};
 use fmv_ff7::model::mat4_translate;
 use fmv_ff7::playable::Character;
@@ -64,13 +69,9 @@ fn scene_bin() -> Option<fmv_ff7_battle::scene::SceneBin> {
     fmv_ff7_battle::scene::SceneBin::open(path).ok()
 }
 
+/// The pack of `model` as the scene sees it (the very function the scene's own rigs use).
 fn clip_set(model: &BattleModel) -> ClipSet {
-    ClipSet {
-        frames: model.animations.iter().map(|c| c.frame_count() as u16).collect(),
-        ok: model.slot_ok.clone(),
-        travel: model.animations.iter().map(|c| c.frames().last().map_or(0.0, |l| l.root_translation[2]) - c.frames().first().map_or(0.0, |f| f.root_translation[2])).collect(),
-        fps: 15.0,
-    }
+    model::clip_set(&model.animations, &model.slot_ok, 15.0)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -122,13 +123,26 @@ fn party_clips_agree_across_the_characters() {
         // spell (the hop, begin, hold, end, the hop back) and the item thrown to an ally (9) and an enemy (10); the
         // victory script starts with the victory pose.
         let clips_of = |index: usize| model.scripts.get(index).map(|s| s.clips());
-        for (index, expected) in [(0usize, vec![0u8]), (1, vec![1]), (3, vec![3]), (4, vec![4]), (5, vec![15]), (7, vec![18]), (13, vec![7]), (17, vec![3, 12, 13, 14, 4]), (32, vec![3, 9, 4]), (33, vec![3, 10, 4])] {
+        for (index, expected) in [(0usize, vec![0u8]), (1, vec![1]), (3, vec![3]), (4, vec![4]), (5, vec![15]), (7, vec![18]), (8, vec![5]), (13, vec![7]), (17, vec![3, 12, 13, 14, 4]), (32, vec![3, 9, 4]), (33, vec![3, 10, 4])] {
             assert_eq!(clips_of(index), Some(expected), "{name}: script {index}");
         }
         assert_eq!(clips_of(12).and_then(|c| c.first().copied()), Some(2), "{name}: the victory script");
+        // The guard is script 8's one clip (slot 5), not the held pose of the cover script (9: a move to the ally, slot 8, a
+        // wait, the return).
+        assert_eq!(kit.defend, Some(5), "{name}: the Defend command plays script 8's clip");
+        assert_eq!(model.scripts[9].clips(), [8], "{name}: slot 8 is the cover script's pose");
+        // The cast script hops forward (3) before the gathering (12, 13) and back (4) after its end (14). The plan can cover at
+        // most MAX_SPEEDUP x MAX_IMPACT_DELAY of natural time before the impact; the gathering alone is longer, so `fit` would
+        // always cut the hop forward whole (and a hop back with no hop forward is a jump in place): the hops are not played.
+        let cap = plan::MAX_SPEEDUP * cue::MAX_IMPACT_DELAY * f64::from(kit.clips.fps);
+        let gathering: f64 = [12u16, 13].iter().map(|&s| f64::from(kit.clips.frames_of(s))).sum();
+        let hop = f64::from(kit.clips.frames_of(3));
+        eprintln!("{name}: cast hop forward {hop} ticks, gathering {gathering} ticks, the plan covers {cap:.0} ticks before the impact");
+        assert!(gathering > cap, "{name}: the gathering ({gathering} ticks) is longer than what the cap lets the plan cover ({cap:.0}) without the hop ({hop})");
         // The weapon rides on a track of its own for each slot played: every slot the kit uses, the clips of the blows
         // included, has a real one (a slot with a stand-in track would draw the weapon at some other slot's place).
-        let mut played = vec![0usize, 2, 3, 4, 6, 7, 8, 9, 10, 12, 13, 14, 15, 18];
+        let mut played = vec![0usize, 2, 3, 4, 6, 7, 9, 10, 12, 13, 14, 15, 18];
+        played.extend(kit.defend.map(usize::from));
         for chain in [kit.attack.as_ref(), kit.shoot.as_ref()].into_iter().flatten() {
             played.extend(chain_slots(chain));
         }
@@ -219,21 +233,156 @@ fn enemy_book_is_the_same_in_every_scene() {
     eprintln!("{} distinct enemies; {} scene records that differ from the first: {:?}", seen.len(), disagreements.len(), disagreements);
     assert!(disagreements.is_empty(), "the book is keyed by enemy id: {disagreements:?}");
     let book = model::EnemyBook::from_scenes(&scenes);
-    assert_eq!(book.attacks_of(16), [(272, 3), (273, 4)], "the MP: Machine Gun plays slot 3, Tonfa slot 4");
+    // The numbers are SCRIPT indices (3 is the MP's Machine Gun, which plays slots 2 to 5; see `enemy_attack_chains_are_the_scripts_clips`).
+    assert_eq!(book.attacks_of(16), [(272, 3), (273, 4)], "the MP: Machine Gun is script 3, Tonfa script 4");
     assert_eq!(book.attacks_of(17), [(274, 3), (275, 4)], "the Guard Hound: Bite and Tentacle");
+    assert_eq!(book.attacks_of(18), [(276, 3), (27, 4)], "the Mono Drive: Drilldrive and Fire");
     assert!(book.attacks_of(9999).is_empty());
-    // The kits that come of it: the MP runs up with slot 2 and comes back with slot 5.
-    let Some(path) = battle_lgp() else { return };
+}
+
+/// **What an enemy plays, held to the owner's own files**: the numbers of `scene.bin`'s `animation_indices` are SCRIPT indices
+/// of the enemy model's own `ab` entry, not slots (the MP's Machine Gun is script 3, which plays slots 2, 3, 4 and 5 of
+/// its pack in turn; its Tonfa is script 4: 6, 7, 8 and 9, and slot 8 is the baton's swing, which the first version never
+/// played). So the chain of an attack is read from its script ([`Chain::from_script`]), the hurt clip from script 1 and the
+/// death clip, when the enemy has one, from script 2. Pins the chains of the MP, the Guard Hound and the Mono Drive, and
+/// tallies every attack the engine can use of every enemy of the archive (the rest are procedural).
+#[test]
+#[ignore = "needs the owner's real FF7 data (FMV_FF7_DATA)"]
+fn enemy_attack_chains_are_the_scripts_clips() {
+    let (Some(scenes), Some(path)) = (scene_bin(), battle_lgp()) else { return };
+    let book = model::EnemyBook::from_scenes(&scenes);
     let mut models = BattleModels::open(path).expect("battle.lgp");
-    let mp = models.load_enemy(16).expect("the MP");
+    // An enemy's model and its kit (`None`: the archive has no model for it: the scene has more enemy records than it has models).
+    let mut load = |id: u16| -> Option<(BattleModel, Kit)> {
+        let m = models.load_enemy(id).ok()?;
+        let kit = Kit::enemy(clip_set(&m), &m.scripts, &book.attacks_of(id));
+        Some((m, kit))
+    };
+    // The shape of a chain: approach, strike, the tick the blow lands at, way back, whether the script moves the actor to its
+    // target, the clip it travels from, how far its clips carry it (battle units), the frame the strike's last clip runs home from.
+    type ChainShape = (Vec<u16>, Vec<u16>, u16, Vec<u16>, bool, usize, u32, Option<u16>);
+    let shape = |c: &Chain| -> ChainShape { (c.approach.clone(), c.strike.clone(), c.impact, c.back.clone(), c.closes_in, c.travel_from, c.carries, c.home_run) };
+
+    // The MP: the Machine Gun runs up (slot 2, which carries it 970 units: the script does not move it to the target), holds
+    // two poses (3, 4) and a long clip (5) that keeps the aim for ten frames and then runs home; the shot lands 8 ticks after
+    // the run-up, 5 ticks into the long clip. The Tonfa leaps (6: its root carries it 581 units), moves to the target, winds up
+    // (7), swings (8: it lands 4 ticks in), returns and recovers (9).
+    let (mp, kit) = load(16).expect("the MP");
+    eprintln!("the MP: hurt {:?} death {:?}, {:?}", kit.hurt, kit.death, kit.attacks.iter().map(|(id, c)| (*id, shape(c))).collect::<Vec<_>>());
+    assert_eq!((kit.hurt, kit.death, kit.unplayable.len()), (Some(1), None, 0));
+    assert_eq!(shape(kit.enemy_chain(Some(272)).expect("the Machine Gun")), (vec![2], vec![3, 4, 5], 8, vec![], false, 0, 970, Some(10)));
+    assert_eq!(shape(kit.enemy_chain(Some(273)).expect("the Tonfa")), (vec![6, 7], vec![8], 4, vec![9], true, 0, 581, None));
     // The baton rides on a real track of its own in every slot the MP plays.
-    for slot in 0..=5usize {
+    for slot in 0..=9usize {
         assert!(mp.weapon_track_ok.get(slot).copied().unwrap_or(false), "the MP's baton track for slot {slot}");
     }
-    let kit = Kit::enemy(clip_set(&mp), &book.attacks_of(16));
-    eprintln!("the MP: hurt {:?}, run {:?}, back {:?}, attacks {:?}", kit.hurt, kit.run, kit.back, kit.attacks);
-    assert_eq!((kit.hurt, kit.run, kit.back), (Some(1), Some(2), Some(5)));
-    assert_eq!(kit.attacks, [(272, 3), (273, 4)]);
+    // The Guard Hound: the Bite (script 3) crouches (2), moves to the target, leaps (3), bites (4: it lands 15 ticks in) and
+    // settles (5); the Tentacle (script 4) winds up (6), moves, strikes (7, 8: 5 ticks in) and recovers (9); it dies with slot 14.
+    let (_, kit) = load(17).expect("the Guard Hound");
+    assert_eq!((kit.hurt, kit.death, kit.unplayable.len()), (Some(1), Some(14), 0));
+    let bite = shape(kit.enemy_chain(Some(274)).expect("the Bite"));
+    assert_eq!((bite.0, bite.1, bite.2, bite.3, bite.4, bite.5), (vec![2, 3], vec![4], 15, vec![5], true, 1));
+    let tentacle = shape(kit.enemy_chain(Some(275)).expect("the Tentacle"));
+    assert_eq!((tentacle.0, tentacle.1, tentacle.2, tentacle.3, tentacle.4, tentacle.5), (vec![6, 7], vec![8], 5, vec![9], true, 1));
+    // The Mono Drive: the Drilldrive (script 3) crouches (2), moves to the target, drills (3, 4: the blow lands 2 ticks in) and
+    // recovers (5); its Fire (script 4, the spell Fire) gathers (6, 7, 8), runs the effect and ends (9), where it hovers: it
+    // casts where it is (the script places it far from the target, which is no run).
+    let (_, kit) = load(18).expect("the Mono Drive");
+    assert_eq!((kit.hurt, kit.death, kit.unplayable.len()), (Some(1), None, 0));
+    let drill = shape(kit.enemy_chain(Some(276)).expect("the Drilldrive"));
+    assert_eq!((drill.0, drill.1, drill.2, drill.3, drill.4, drill.5), (vec![2], vec![3, 4], 2, vec![5], true, 1));
+    assert_eq!(shape(kit.enemy_chain(Some(27)).expect("the Fire")), (vec![6, 7, 8], vec![9], 0, vec![], false, 0, 0, None));
+
+    // Every attack the engine can use of every enemy (it models the damaging ones): how many have a script that plays, and why
+    // the others do not. The scene has records for unused test enemies whose names are not text: those are counted apart.
+    let all_slots = ClipSet { frames: vec![1; 256], ok: vec![true; 256], travel: vec![0.0; 256], lead: vec![0; 256], fps: 15.0 };
+    let why_not = |m: &BattleModel, script: u8| -> &'static str {
+        let Some(s) = m.scripts.get(usize::from(script)) else { return "no such script" };
+        let marks = s.uses(code::DAMAGE) || s.uses(code::DAMAGE_QUIET) || s.uses(code::EFFECT);
+        match (Chain::from_script(s, &all_slots, Role::Enemy), marks) {
+            (Some(_), _) => "a clip that is not the pack's own",
+            (None, true) => "nothing is struck with after the mark",
+            (None, false) => "no mark of where it lands",
+        }
+    };
+    let mut reasons: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    let (mut hurts, mut deaths): (std::collections::BTreeMap<Option<u16>, usize>, std::collections::BTreeMap<Option<u16>, usize>) = Default::default();
+    // The attacks of the named enemies that play, by shape: a damage mark and a return, a damage mark and no return, an effect.
+    let mut shapes = [0usize; 3];
+    let mut seen = std::collections::BTreeSet::new();
+    let (mut total, mut playable, mut at_once, mut closing, mut homing, mut idles) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+    let (mut named_total, mut named_playable) = (0usize, 0usize);
+    let (mut weapon_clips, mut weaponless_clips) = (0usize, 0usize);
+    for scene in scenes.scenes() {
+        for (id, record) in scene.enemy_ids.iter().zip(scene.enemies.iter()) {
+            let (Some(id), Some(record)) = (id, record) else { continue };
+            if !seen.insert(*id) {
+                continue;
+            }
+            let Some((m, kit)) = load(*id) else { continue };
+            let named = !record.name.contains('\u{FFFD}');
+            if named {
+                *hurts.entry(kit.hurt).or_default() += 1;
+                *deaths.entry(kit.death).or_default() += 1;
+            }
+            for (&attack, &script) in record.attack_ids.iter().zip(record.animation_indices.iter()) {
+                if attack == 0xFFFF || script == 0xFF || scene.attack_by_id(attack).and_then(fmv_ff7_battle::action::EnemyAction::from_scene).is_none() {
+                    continue;
+                }
+                total += 1;
+                named_total += usize::from(named);
+                let Some(chain) = kit.enemy_chain(Some(attack)).filter(|_| !kit.unplayable.contains(&attack)) else {
+                    if named {
+                        *reasons.entry(why_not(&m, script)).or_default() += 1;
+                    }
+                    continue;
+                };
+                playable += 1;
+                named_playable += usize::from(named);
+                // Whatever plays is whole: every slot is the pack's own clip, the blow lands inside the strike, the strike is not empty.
+                let slots: Vec<u16> = chain.approach.iter().chain(&chain.strike).chain(&chain.back).copied().collect();
+                assert!(slots.iter().all(|&s| kit.clips.usable(usize::from(s)).is_some() && s != 0), "enemy {id} attack {attack}: {chain:?}");
+                let strike_ticks: u16 = chain.strike.iter().map(|&s| kit.clips.frames_of(s)).sum();
+                assert!(!chain.strike.is_empty() && chain.impact <= strike_ticks, "enemy {id} attack {attack}: {chain:?}");
+                assert!(chain.travel_from <= chain.approach.len(), "enemy {id} attack {attack}: {chain:?}");
+                if named {
+                    let script = m.scripts.get(usize::from(script));
+                    let first_mark = script.and_then(|s| s.ops.iter().find_map(|op| op.code().filter(|c| matches!(*c, code::DAMAGE | code::DAMAGE_QUIET | code::EFFECT))));
+                    let returns = script.is_some_and(|s| s.uses(code::RETURN));
+                    shapes[match (first_mark, returns) {
+                        (Some(code::EFFECT), _) => 2,
+                        (_, true) => 0,
+                        _ => 1,
+                    }] += 1;
+                }
+                // An enemy that carries a weapon draws it on a track of its own for each slot it plays: how many of the clips played lack one.
+                if !m.weapons.is_empty() {
+                    weapon_clips += slots.len();
+                    weaponless_clips += slots.iter().filter(|&&s| !m.weapon_track_ok.get(usize::from(s)).copied().unwrap_or(false)).count();
+                }
+                at_once += usize::from(chain.impact == 0);
+                closing += usize::from(chain.closes_in);
+                homing += usize::from(chain.home_run.is_some());
+                idles += usize::from(m.scripts.get(usize::from(script)).is_some_and(|s| s.clips().contains(&0)));
+            }
+        }
+    }
+    eprintln!(
+        "{} enemies, {total} attacks the engine can use: {playable} play their script ({at_once} land at once, at an effect or a damage mark of 0; {closing} close in; {homing} run home with their last clip; {idles} scripts play the idle clip, which is dropped); the other {} are procedural",
+        seen.len(),
+        total - playable
+    );
+    eprintln!("of the enemies with names: {named_playable} of {named_total} play their script ({} with a damage mark and a return, {} with a damage mark and no return, {} with an effect); those that do not: {reasons:?}", shapes[0], shapes[1], shapes[2]);
+    eprintln!("their hurt clips: {hurts:?}; their death clips: {deaths:?}");
+    eprintln!("the enemies that carry a weapon play {weapon_clips} clips in their chains, {weaponless_clips} of them without a track for the weapon");
+    assert!(named_playable * 100 >= named_total * 97, "{named_playable} of {named_total} play their script: {reasons:?}");
+    // Every enemy that has a name is hurt by script 1's clip, slot 1, but three (their hurt script plays nothing: no reaction
+    // of their own); some (not most) have a death clip of their own.
+    assert_eq!((hurts.get(&Some(1)).copied(), hurts.get(&None).copied(), hurts.len()), (Some(326), Some(3), 2), "{hurts:?}");
+    let with_death: usize = deaths.iter().filter(|(slot, _)| slot.is_some()).map(|(_, n)| n).sum();
+    assert_eq!((with_death, deaths.get(&None).copied()), (45, Some(284)), "{deaths:?}");
+    assert_eq!((deaths.get(&Some(10)).copied(), deaths.get(&Some(14)).copied()), (Some(23), Some(12)), "{deaths:?}");
+    assert_eq!(shapes, [362, 79, 354]);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -454,6 +603,41 @@ fn party_attack_chain_sheets() {
             let (w, h, sheet) = rig.every_slot(&mut gpu, &slots, 8, &note);
             save(&format!("attack-chain-{name}-{range}"), w, h, &sheet);
         }
+    }
+}
+
+/// The clips of the evidence set's enemy attacks (the MP's Machine Gun and Tonfa, the Guard Hound's Bite and Tentacle, the Mono Drive's
+/// Drilldrive and Fire), in the order their scripts play them, eight frames spread over each clip, each labelled with its part of the
+/// attack (approach, strike with the tick the blow lands at, way back, and where a clip carries the actor home):
+/// `enemy-chain-<name>.png`, the evidence of the rule of [`super::clips`] drawn.
+#[test]
+#[ignore = "needs the owner's real FF7 data (FMV_FF7_DATA) and a GPU or a software Vulkan/GL driver"]
+fn enemy_attack_chain_sheets() {
+    let (Some(path), Some(scenes), Some(mut gpu)) = (battle_lgp(), scene_bin(), Offscreen::new()) else { return };
+    let book = model::EnemyBook::from_scenes(&scenes);
+    let mut models = BattleModels::open(path).expect("battle.lgp");
+    for (name, enemy, attack) in [("mp-machine-gun", 16u16, 272u16), ("mp-tonfa", 16, 273), ("guard-hound-bite", 17, 274), ("guard-hound-tentacle", 17, 275), ("mono-drive-drilldrive", 18, 276), ("mono-drive-fire", 18, 27)] {
+        let model = models.load_enemy(enemy).expect("the enemy loads");
+        let kit = Kit::enemy(clip_set(&model), &model.scripts, &book.attacks_of(enemy));
+        let chain = kit.enemy_chain(Some(attack)).expect("the attack plays its script").clone();
+        let slots = chain_slots(&chain);
+        let rig = Rig::new(model, 800.0);
+        let note = |slot: usize| {
+            let slot = slot as u16;
+            if let Some(at) = chain.approach.iter().position(|&s| s == slot) {
+                if at == chain.travel_from && (chain.closes_in || chain.carries > 0) { "approach, travels" } else { "approach" }.to_string()
+            } else if chain.strike.contains(&slot) {
+                // (The tile is 18 characters wide.)
+                match (chain.home_run, chain.strike.last() == Some(&slot)) {
+                    (Some(from), true) => format!("strike @{} home f{from}", chain.impact),
+                    _ => format!("strike, lands @{}", chain.impact),
+                }
+            } else {
+                "way back".to_string()
+            }
+        };
+        let (w, h, sheet) = rig.every_slot(&mut gpu, &slots, 8, &note);
+        save(&format!("enemy-chain-{name}"), w, h, &sheet);
     }
 }
 
@@ -679,8 +863,8 @@ fn bright_near(shot: &[u8], x: f32, y: f32, r: i32, level: u8) -> usize {
 
 const SEED: u64 = 0x5CE7E;
 
-/// The MP's attack chain: the run-up (slot 2), the attack it names (Machine Gun, slot 3; Tonfa, slot 4), the
-/// way back (slot 5), with the hurt clip of whoever it hits and the number at the impact.
+/// The MP's attack chain: the clips of the script `scene.bin` names for each attack (Machine Gun, script 3: slots 2, 3, 4, 5;
+/// Tonfa, script 4: 6, 7, 8, 9), with the hurt clip of whoever it hits and the number at the impact.
 #[test]
 #[ignore = "needs the owner's real FF7 data (FMV_FF7_DATA or FMV_FF7_LIBRARY) and a GPU or a software Vulkan/GL driver"]
 fn fight_mp_attack_chain() {
@@ -713,9 +897,11 @@ fn fight_mp_attack_chain() {
     for (mp, attack) in used {
         let slots: Vec<u16> = fight.scene.director.segments_of(mp).iter().map(|s| s.slot).collect();
         eprintln!("MP {mp}: attack {attack} plays slots {slots:?}");
-        assert_eq!(slots.first(), Some(&2), "it runs up with slot 2");
-        assert_eq!(slots.get(1), Some(&if attack == 272 { 3 } else { 4 }), "and plays the clip scene.bin names for the attack");
-        assert_eq!(slots.last(), Some(&5), "and comes back with slot 5");
+        // The Machine Gun is script 3: the run-up (2), two poses (3, 4), the long clip (5) that holds the aim for ten frames
+        // and runs home; the Tonfa script 4: the leap (6), the wind-up (7), the swing (8) that lands four ticks in, the
+        // recovery (9). The numbers scene.bin names (3, 4) are the scripts, not slots.
+        let expected: &[u16] = if attack == 272 { &[2, 3, 4, 5, 5, 5] } else { &[6, 7, 8, 8, 9] };
+        assert_eq!(slots, expected, "attack {attack} plays the clips of its script");
     }
     fight.sheet("mp-attack-chain-machine-gun-and-tonfa", arrival, &[0.05, 0.2, 0.35, 0.55, 0.7, 0.9, 1.2, 1.7], 2);
 }
@@ -912,7 +1098,7 @@ fn fight_the_elements() {
 }
 
 /// An item and a guard: Cloud uses a Potion on Tifa (the item gesture, slot 9, and a sparkle on her at the
-/// impact) while Barret holds his guard (slot 8).
+/// impact) while Barret guards (script 8's clip, slot 5).
 #[test]
 #[ignore = "needs the owner's real FF7 data (FMV_FF7_DATA or FMV_FF7_LIBRARY) and a GPU or a software Vulkan/GL driver"]
 fn fight_item_and_defend() {
@@ -929,7 +1115,7 @@ fn fight_item_and_defend() {
     assert!(guard.is_some(), "and Barret's guard");
     fight.say(guard);
     assert_eq!(fight.scene.director.motion(0, arrival + 0.2).clip.map(|c| c.slot), Some(9), "Cloud's item gesture");
-    assert_eq!(fight.scene.director.motion(2, arrival + 0.3).clip.map(|c| c.slot), Some(8), "Barret guards");
+    assert_eq!(fight.scene.director.motion(2, arrival + 0.3).clip.map(|c| c.slot), Some(5), "Barret guards with the clip of script 8");
     assert!(fight.scene.director.bursts().iter().any(|b| b.kind == effects::BurstKind::Item && b.target == 1), "a sparkle on Tifa");
     fight.sheet("item-and-defend", arrival, &[0.1, 0.3, 0.46, 0.6, 0.8, 1.1], 2);
 }
@@ -1085,4 +1271,126 @@ fn fight_a_failed_escape_and_a_successful_one() {
         assert!(!fight.scene.director.motion(foe, arrival + 3.0).gone, "the enemies stay");
     }
     fight.sheet("escape-run-off", arrival, &[0.0, 0.3, 0.6, 0.9, 1.2, 1.6, 2.0, 3.0], 2);
+}
+
+// ----- enemy attacks and the guard, performed on cue ----------------------------------------------------------
+
+/// Performs `events` in a fresh fight at its clock and draws the `performers` over `offsets` seconds: for each instant, the
+/// whole fight (`<name>-wide.png`, at the instants of `wide`) and a close-up of each performer (`<name>-close-<n>.png`, four
+/// to a row, labelled with the instant and the clip and frame the director plays), and returns what each performer played
+/// at each instant (printed too: the evidence of the pictures).
+fn perform_and_draw(fight: &mut Fight, name: &str, events: &[BattleEvent], performers: &[usize], offsets: &[f64], wide: &[f64]) -> Vec<Vec<String>> {
+    let arrival = fight.now;
+    fight.scene.update(arrival, events, fight.client.engine());
+    let mut played: Vec<Vec<String>> = vec![Vec::new(); performers.len()];
+    let mut closes: Vec<Vec<Vec<u8>>> = vec![Vec::new(); performers.len()];
+    let mut wides: Vec<Vec<u8>> = Vec::new();
+    for &o in offsets {
+        let t = arrival + o;
+        for (k, &i) in performers.iter().enumerate() {
+            let what = fight.scene.director.motion(i, t).clip.map_or("idle".to_string(), |c| format!("s{} f{:.1}", c.slot, c.frame));
+            played[k].push(format!("+{o:.2} {what}"));
+            closes[k].push(fight.close_up(t, i, &format!("+{o:.2}s {what}"), (2 * W, 2 * H), (CLOSE_W, CLOSE_H)));
+        }
+        if wide.iter().any(|w| (w - o).abs() < 1e-9) {
+            wides.push(fight.frame(t, &format!("+{o:.2} s")));
+        }
+    }
+    for (k, tiles) in closes.iter().enumerate() {
+        let (zw, zh, sheet) = tile_sheet(tiles, CLOSE_W, CLOSE_H, 4);
+        save(&format!("{name}-close-{k}"), zw, zh, &sheet);
+        eprintln!("{name} performer {}: {}", performers[k], played[k].join(", "));
+    }
+    let (sw, sh, sheet) = contact_sheet(&wides, W, H, 2);
+    save(&format!("{name}-wide"), sw, sh, &sheet);
+    played
+}
+
+/// The enemy attacks of the evidence set (the MP's Machine Gun and Tonfa, the Guard Hound's Bite and Tentacle, the Mono
+/// Drive's Drilldrive and its Fire), each performed on cue in a real formation at the party member Cloud: pictures of what
+/// the scene plays for them, the whole fight and a close-up: `enemy-attack-<name>-wide.png` and `-close-0.png`.
+/// `FMV_SHEET_ATTACKS` (picture names, comma separated) picks some of them.
+#[test]
+#[ignore = "needs the owner's real FF7 data (FMV_FF7_DATA or FMV_FF7_LIBRARY) and a GPU or a software Vulkan/GL driver"]
+fn fight_enemy_attack_sheets() {
+    let Some(real) = open_real() else { return };
+    // (picture name, formation, enemy id, attack id): formation 301 is two MPs, 302 a Guard Hound, 305 two Mono Drives.
+    let cases: [(&str, u16, u16, u16); 6] = [
+        ("mp-machine-gun", 301, 16, 272),
+        ("mp-tonfa", 301, 16, 273),
+        ("guard-hound-bite", 302, 17, 274),
+        ("guard-hound-tentacle", 302, 17, 275),
+        ("mono-drive-drilldrive", 305, 18, 276),
+        ("mono-drive-fire", 305, 18, 27),
+    ];
+    let wanted: Option<Vec<String>> = std::env::var("FMV_SHEET_ATTACKS").ok().map(|s| s.split(',').map(|p| p.trim().to_string()).collect());
+    for (name, formation, enemy, attack) in cases {
+        if wanted.as_ref().is_some_and(|w| !w.iter().any(|p| p == name)) {
+            continue;
+        }
+        let Some(mut fight) = Fight::new(&real, formation, SEED) else { return };
+        let placement = real.rules.formation_scene(formation).expect("the formation has placement data");
+        let at = placement.enemies.iter().position(|e| e.enemy_id == enemy).expect("the enemy is in the formation");
+        let performer = 3 + at;
+        fight.now = 2.0;
+        let events = [
+            BattleEvent::Action { actor: ActorId(performer as u8), action: ActionRef::EnemyAttack(attack) },
+            BattleEvent::Damage { actor: ActorId(performer as u8), target: ActorId(0), amount: 25, critical: false },
+        ];
+        let offsets: Vec<f64> = (0..16).map(|k| f64::from(k) * 0.12).collect();
+        perform_and_draw(&mut fight, &format!("enemy-attack-{name}"), &events, &[performer], &offsets, &[0.0, 0.12, 0.24, 0.36, 0.48, 0.6, 0.96, 1.44]);
+    }
+}
+
+/// An enemy that is beaten: the Guard Hound's death script plays a clip (slot 14: it falls), which it plays from the start of its
+/// death before it fades; the MP's plays none (it flinches, then fades). The party attacks (real engine) until the first enemy
+/// is down (`enemy-death-<name>-close-0.png`, `-wide.png`, from the batch that brings the death).
+#[test]
+#[ignore = "needs the owner's real FF7 data (FMV_FF7_DATA or FMV_FF7_LIBRARY) and a GPU or a software Vulkan/GL driver"]
+fn fight_enemy_death_sheets() {
+    let Some(real) = open_real() else { return };
+    // (picture name, formation, enemy id, the clip its death plays)
+    for (name, formation, enemy, death) in [("guard-hound", 302u16, 17u16, Some(14u16)), ("mp", 301, 16, None)] {
+        let Some(mut fight) = Fight::new(&real, formation, SEED) else { return };
+        let placement = real.rules.formation_scene(formation).expect("the formation has placement data");
+        let victim = 3 + placement.enemies.iter().position(|e| e.enemy_id == enemy).expect("the enemy is in the formation");
+        fight.now = 2.0;
+        let first = fight.server.step(1);
+        fight.say(first);
+        for _ in 0..4000 {
+            if !fight.server.state.actor(ActorId(victim as u8)).is_some_and(|c| c.is_alive()) {
+                break;
+            }
+            fight.now += 0.03;
+            for id in fight.server.state.ready_actors() {
+                let msg = fight.server.attack(id);
+                fight.say(msg);
+            }
+            let step = fight.server.step(30);
+            fight.say(step);
+        }
+        assert!(!fight.server.state.actor(ActorId(victim as u8)).is_some_and(|c| c.is_alive()), "{name} is beaten");
+        // `perform_and_draw` draws from the instant of the batch that brought the death (the clock now).
+        let offsets: Vec<f64> = (0..16).map(|k| 0.4 + f64::from(k) * 0.12).collect();
+        let played = perform_and_draw(&mut fight, &format!("enemy-death-{name}"), &[], &[victim], &offsets, &[0.4, 0.64, 0.88, 1.12, 1.36, 1.6, 1.84, 2.2]);
+        let slots: std::collections::BTreeSet<u16> = played[0].iter().filter_map(|s| s.split(" s").nth(1)).filter_map(|s| s.split(' ').next()?.parse().ok()).collect();
+        eprintln!("{name}: the clips played: {slots:?}");
+        assert_eq!(slots.contains(&14), death == Some(14), "{name}: {played:?}");
+        assert!(slots.contains(&1), "{name} flinches first (its hurt clip): {played:?}");
+        // Gone in the end, whatever it played.
+        assert!(fight.scene.director.motion(victim, fight.now + 3.0).gone, "{name}");
+    }
+}
+
+/// Defend, as the scene plays it: Cloud, Tifa and Barret guard at the same instant (`defend-close-<n>.png`, one picture
+/// each, and the whole fight in `defend-wide.png`).
+#[test]
+#[ignore = "needs the owner's real FF7 data (FMV_FF7_DATA or FMV_FF7_LIBRARY) and a GPU or a software Vulkan/GL driver"]
+fn fight_defend_sheets() {
+    let Some(real) = open_real() else { return };
+    let Some(mut fight) = Fight::new(&real, 301, SEED) else { return };
+    fight.now = 2.0;
+    let events: Vec<BattleEvent> = (0..3u8).map(|i| BattleEvent::Action { actor: ActorId(i), action: ActionRef::Defend }).collect();
+    let offsets: Vec<f64> = (0..16).map(|k| f64::from(k) * 0.1).collect();
+    perform_and_draw(&mut fight, "defend", &events, &[0, 1, 2], &offsets, &[0.0, 0.2, 0.4, 0.6, 0.8, 1.2, 1.6, 2.0]);
 }
