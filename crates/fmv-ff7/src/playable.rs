@@ -43,6 +43,57 @@
 //!
 //! Alternative skeletons exist for the same characters (Cloud in other clothes, Tifa as a
 //! child, ...); they are not playable appearances here.
+//!
+//! # Placeholder bodies (generic, non-canon)
+//!
+//! A player's own character is not a cast member, so FF7 draws it with a generic human extra from
+//! the same `char.lgp`: one of [`PLACEHOLDER_BODIES`], picked by the game-agnostic archetype id that
+//! travels in the player's identity ([`resolve_body`], [`body_or_default`]). Their appearance refs
+//! are `ff7/body/<archetype>`; [`resolve_model`] reads them next to the canon ids, while the canon
+//! table above stays exactly the eight cast members and [`resolve_appearance`] knows nothing of the
+//! bodies. At most four bodies are offered, because the client keeps at most 32 models in its GPU
+//! cache and 24 NPC models.
+//!
+//! **Derived from the same owned copy on 2026-11-09 and verified by the ignored test
+//! `placeholder_bodies_match_the_field_loaders` in `tests/real_data.rs`.** The survey went over all
+//! 5 454 loader records (385 distinct skeletons). Candidates were the skeletons of human extras
+//! (not the cast above, not named story characters, not children, animals or props) that many
+//! fields use; each was drawn from the idle pose (front, side and back) and with four frames of its
+//! walk and three of its run, using a throwaway copy of the rasterizer of `examples/model_dump.rs`
+//! (the example itself only takes cast ids), and the three below were kept for reading as plain
+//! adults with clearly different outlines. The look column is a description by eye.
+//!
+//! | archetype | `appearance_ref` | skeleton | idle | walk | run | records with this skeleton (fields), of them opening idle, walk, run | second clip is `aaff` | scale = field scale | frames idle / walk / run | looks like |
+//! |---|---|---|---|---|---|---|---|---|---|---|
+//! | `lean` | `ff7/body/lean` | `awcb` | `acfe` | `aaff` | `aaga` | 29 (15), 21 | 27 | 29 | 1 / 30 / 15 | a man in a dark grey two-piece suit with white shirt and red tie, short brown hair, white shoe tips; a narrow, upright outline |
+//! | `sturdy` | `ff7/body/sturdy` | `bwab` | `acfe` | `aaff` | `aaga` | 130 (63), 87 | 109 | 127 | 1 / 30 / 15 | a soldier in a blue hooded helmet with a dark visor and grey shoulder plates, a long blue coat with a dark belt and black boots; the face is covered; the widest outline, the coat flares |
+//! | `slight` | `ff7/body/slight` | `cwed` | `acfe` | `aaff` | `aaga` | 10 (10), 2 | 2 | 10 | 1 / 30 / 15 | a young woman with a brown bob under a white head covering, a mint blouse with puffed sleeves, a navy skirt, bare legs and white shoes; the narrowest outline |
+//!
+//! The "records" column counts loader records that use the skeleton (and the fields they are in)
+//! and, of those, the ones whose first three animations are exactly the row's idle, walk and run,
+//! as in the canon table; "second clip is `aaff`" counts the records whose second animation is the
+//! row's walk; "scale = field scale" counts the records whose own scale equals the field's (the
+//! canon test checks the same for the main four). All three rows share one clip set, the one
+//! Cloud's skeleton plays too: the generic clips of the 21-bone human rig. `acfe`, `aaff`, `aaga`
+//! in this order open 1 186 loader records in 594 fields on 110 skeletons, 108 of them with 21 bones
+//! like the three bodies (175 more records open with `aafe`, a second standing clip, instead of
+//! `acfe`). The bodies' own records agree less than the canon ones do, because scripted extras
+//! often bring a clip of their own in the second or third slot, `slight` most of all (2 of its 10
+//! records open with the generic clips). So the table gives the rig-wide counts as well, and what
+//! vouches for the clips on every body is that all three fit its skeleton and play plausibly in
+//! the renders. The run is a distinct 15-frame clip for all three bodies, so
+//! [`PlaceholderBody::run_is_walk`] is false for every one of them.
+//!
+//! **Left out on purpose:** the three extras of the first mission's reactor fields (`bwfd`, `axdc`
+//! and `bxbe`, in 20, 23 and 16 fields; they stand in `md1stin`, `md1_1` and `md1_2`) are the
+//! named story characters Biggs, Jessie and Wedge; the cast's own skeletons and those of the other
+//! named story characters; every child, animal and prop model; and the armed guard `azhe` (a sword
+//! at the hip, 57 records in 35 fields). Of the women, `slight` was kept over `bsfc`, who is in
+//! about as many fields (11) and plays the generic walk second in 9 of her 11 records, because its
+//! outline differs more from the two men's (judged by eye and by a one-off comparison of rendered
+//! front and side outlines that is not part of the tests) and `bsfc`'s long rigid skirt flares
+//! out in the generic run. What stays **unverified** is how the bodies look in the field under a
+//! player tint, and the slot order of these records (the same loader-order convention as above).
 
 use crate::anim::FieldAnimation;
 use crate::lgp::LgpArchive;
@@ -188,6 +239,86 @@ pub fn resolve_appearance_or_default(appearance_ref: Option<&str>) -> PlayableMo
     )
 }
 
+// ---------------------------------------------------------------------------------------
+// Placeholder bodies for original characters
+// ---------------------------------------------------------------------------------------
+
+/// One generic (non-canon) human body offered to new characters as a placeholder.
+///
+/// See the module docs for where each body comes from and what it looks like.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlaceholderBody {
+    /// Game-agnostic identity choice, stable, lower case ASCII, for example `"sturdy"`. This id is
+    /// stored in the player's identity and travels across games, so it is a short neutral word and
+    /// never an FF7 name; an id is never renamed or reused for another body.
+    pub archetype: &'static str,
+    /// UI label, for example `"Sturdy"`.
+    pub label: &'static str,
+    /// The FF7 model: `appearance_ref` is `ff7/body/<archetype>` (at most 64 characters), and
+    /// `hrc`, `idle_anim`, `walk_anim` and `run_anim` are `char.lgp` stems like the canon rows'.
+    pub model: PlayableModel,
+    /// True if `model.run_anim` is the same clip as `model.walk_anim` (a body without a run clip of
+    /// its own). False for every body of [`PLACEHOLDER_BODIES`] today.
+    pub run_is_walk: bool,
+}
+
+/// A [`PlaceholderBody`] row: the appearance ref and the display name are derived from the
+/// archetype and the label, so the three cannot drift apart.
+macro_rules! body {
+    ($archetype:literal, $label:literal, $hrc:literal, $idle:literal, $walk:literal, $run:literal, $run_is_walk:literal) => {
+        PlaceholderBody {
+            archetype: $archetype,
+            label: $label,
+            model: PlayableModel {
+                appearance_ref: concat!("ff7/body/", $archetype),
+                display_name: $label,
+                hrc: $hrc,
+                idle_anim: $idle,
+                walk_anim: $walk,
+                run_anim: $run,
+            },
+            run_is_walk: $run_is_walk,
+        }
+    };
+}
+
+/// The default body: the plain man in a suit, the one that reads as the most ordinary person (a
+/// visible face, no uniform). It is [`DEFAULT_BODY`] and first in [`PLACEHOLDER_BODIES`]; the
+/// fallback of [`body_or_default`] is this const itself, so it works without any table lookup.
+const LEAN: PlaceholderBody = body!("lean", "Lean", "awcb", "acfe", "aaff", "aaga", false);
+const STURDY: PlaceholderBody = body!("sturdy", "Sturdy", "bwab", "acfe", "aaff", "aaga", false);
+const SLIGHT: PlaceholderBody = body!("slight", "Slight", "cwed", "acfe", "aaff", "aaga", false);
+
+/// Every placeholder body, in presentation order (the default first). At most four, see the
+/// module docs. The rows are described, measured and verified in the module docs.
+pub const PLACEHOLDER_BODIES: &[PlaceholderBody] = &[LEAN, STURDY, SLIGHT];
+
+/// The archetype used when a character has none, or one this table does not know: the first row
+/// of [`PLACEHOLDER_BODIES`].
+pub const DEFAULT_BODY: &str = "lean";
+
+/// The body whose archetype is `archetype` (ASCII case-insensitive, surrounding whitespace
+/// ignored), or `None` if there is no such body; callers fall back to [`DEFAULT_BODY`] (see
+/// [`body_or_default`]).
+pub fn resolve_body(archetype: &str) -> Option<PlaceholderBody> {
+    let wanted = archetype.trim();
+    PLACEHOLDER_BODIES.iter().find(|b| b.archetype.eq_ignore_ascii_case(wanted)).copied()
+}
+
+/// The model a stored or wired appearance ref names: a canon row of [`PLAYABLE_FIELD_MODELS`]
+/// first, then a [`PLACEHOLDER_BODIES`] row by its model's `appearance_ref` (ASCII
+/// case-insensitive, surrounding whitespace ignored in both cases). `None` for anything else.
+pub fn resolve_model(appearance_ref: &str) -> Option<PlayableModel> {
+    let wanted = appearance_ref.trim();
+    resolve_appearance(wanted)
+        .or_else(|| PLACEHOLDER_BODIES.iter().map(|b| b.model).find(|m| m.appearance_ref.eq_ignore_ascii_case(wanted)))
+}
+
+/// The body to use for an archetype choice: [`resolve_body`], or the default body (always a body).
+pub fn body_or_default(archetype: Option<&str>) -> PlaceholderBody {
+    archetype.and_then(resolve_body).or_else(|| resolve_body(DEFAULT_BODY)).unwrap_or(LEAN)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,5 +419,230 @@ mod tests {
         assert_eq!(resolve_appearance_or_default(Some("nope")).appearance_ref, DEFAULT_APPEARANCE);
         assert_eq!(resolve_appearance_or_default(Some("ff7/aerith")).hrc, "auff");
         assert!(resolve_appearance(DEFAULT_APPEARANCE).is_some(), "the default must exist in the table");
+    }
+
+    // ---- placeholder bodies
+
+    #[test]
+    fn placeholder_bodies_are_a_small_well_formed_table() {
+        // three to four bodies: the client's GPU cache holds 32 models and its NPC cache 24
+        assert!((3..=4).contains(&PLACEHOLDER_BODIES.len()), "{} bodies", PLACEHOLDER_BODIES.len());
+        let mut archetypes = HashSet::new();
+        let mut refs = HashSet::new();
+        let mut skeletons = HashSet::new();
+        let mut labels = HashSet::new();
+        for b in PLACEHOLDER_BODIES {
+            // the archetype is a short neutral word: lower case ASCII letters only
+            assert!(archetypes.insert(b.archetype), "duplicate archetype {}", b.archetype);
+            assert!(
+                (1..=16).contains(&b.archetype.len()) && b.archetype.bytes().all(|c| c.is_ascii_lowercase()),
+                "{:?}",
+                b.archetype
+            );
+            // the appearance ref is derived from it, under the namespace of the game, and fits the wire limit
+            assert_eq!(b.model.appearance_ref, format!("ff7/body/{}", b.archetype));
+            assert!(b.model.appearance_ref.len() <= 64, "must fit the server's appearance_ref limit");
+            assert!(refs.insert(b.model.appearance_ref), "duplicate ref {}", b.model.appearance_ref);
+            // the label is for people: non-empty, starts with a capital, and is also the display name
+            assert!(b.label.chars().next().is_some_and(|c| c.is_ascii_uppercase()), "{:?}", b.label);
+            assert!(labels.insert(b.label), "duplicate label {}", b.label);
+            assert_eq!(b.model.display_name, b.label);
+            // char.lgp stems like the canon rows': four lower case letters, no extension
+            assert!(skeletons.insert(b.model.hrc), "two bodies share skeleton {}", b.model.hrc);
+            for stem in [b.model.hrc, b.model.idle_anim, b.model.walk_anim, b.model.run_anim] {
+                assert_eq!(stem.len(), 4, "{stem}");
+                assert!(stem.bytes().all(|c| c.is_ascii_lowercase()), "{stem}: archive stems here are lower case, no extension");
+            }
+            // the standing clip is its own clip; the run is the walk exactly when the flag says so
+            assert!(b.model.idle_anim != b.model.walk_anim && b.model.idle_anim != b.model.run_anim, "{}", b.archetype);
+            assert_eq!(b.run_is_walk, b.model.walk_anim == b.model.run_anim, "{}: run_is_walk must say whether the clips are the same", b.archetype);
+            // the three animation states map to the three clips
+            assert_eq!(b.model.animation_for(AnimState::Idle), b.model.idle_anim);
+            assert_eq!(b.model.animation_for(AnimState::Walk), b.model.walk_anim);
+            assert_eq!(b.model.animation_for(AnimState::Run), b.model.run_anim);
+        }
+    }
+
+    #[test]
+    fn placeholder_bodies_never_collide_with_the_canon_table() {
+        // the id fragments of the canon rows: `cloud`, `red_xiii` and its pieces `red` and `xiii`, ...
+        let mut canon_words = HashSet::new();
+        for m in PLAYABLE_FIELD_MODELS {
+            let fragment = m.appearance_ref.strip_prefix("ff7/").unwrap();
+            canon_words.insert(fragment);
+            canon_words.extend(fragment.split('_'));
+        }
+        assert!(canon_words.contains("cloud") && canon_words.contains("red_xiii") && canon_words.contains("xiii"));
+        for b in PLACEHOLDER_BODIES {
+            assert!(!canon_words.contains(b.archetype), "{} is a canon id fragment", b.archetype);
+            for m in PLAYABLE_FIELD_MODELS {
+                assert_ne!(b.model.hrc, m.hrc, "{} shares the skeleton of {}", b.archetype, m.appearance_ref);
+                assert!(!b.model.appearance_ref.eq_ignore_ascii_case(m.appearance_ref), "{}", b.archetype);
+                assert_ne!(b.label, m.display_name);
+            }
+            // the canon resolver does not know the bodies: the canon table stays the cast
+            assert_eq!(resolve_appearance(b.model.appearance_ref), None, "{}", b.archetype);
+        }
+    }
+
+    #[test]
+    fn the_default_body_is_the_first_row_and_exists() {
+        assert_eq!(PLACEHOLDER_BODIES.first().map(|b| b.archetype), Some(DEFAULT_BODY));
+        let default = resolve_body(DEFAULT_BODY).expect("the default must exist in the table");
+        assert_eq!(Some(&default), PLACEHOLDER_BODIES.first());
+        assert_eq!(body_or_default(None), default);
+        // The three rows measured in the module docs. The archetypes are persisted in player
+        // identities: an id is never renamed or reused for another body, and the skeleton and
+        // clips behind it never change. The order only decides the presentation and the default
+        // (together with `DEFAULT_BODY` and the fallback of `body_or_default`).
+        let rows: Vec<_> = PLACEHOLDER_BODIES
+            .iter()
+            .map(|b| (b.archetype, b.model.hrc, b.model.idle_anim, b.model.walk_anim, b.model.run_anim))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("lean", "awcb", "acfe", "aaff", "aaga"),
+                ("sturdy", "bwab", "acfe", "aaff", "aaga"),
+                ("slight", "cwed", "acfe", "aaff", "aaga"),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolving_a_body_ignores_case_and_surrounding_whitespace_only() {
+        for b in PLACEHOLDER_BODIES {
+            assert_eq!(resolve_body(b.archetype), Some(*b));
+            assert_eq!(resolve_body(&b.archetype.to_ascii_uppercase()), Some(*b));
+            assert_eq!(resolve_body(&format!("  {}\t\n", b.archetype)), Some(*b));
+            // a mixed-case spelling
+            let mixed: String = b.archetype.chars().enumerate().map(|(i, c)| if i % 2 == 0 { c.to_ascii_uppercase() } else { c }).collect();
+            assert_eq!(resolve_body(&mixed), Some(*b), "{mixed}");
+        }
+        assert_eq!(resolve_body("Sturdy").map(|b| b.model.hrc), Some("bwab"));
+        // everything else is None: empty, near misses, the wire form, other namespaces, canon ids
+        let long = "sturdy".repeat(20_000);
+        for unknown in [
+            "",
+            " ",
+            "nobody",
+            "stur",
+            "sturdy2",
+            "sturdy sturdy",
+            "stur dy",
+            "ff7/body/sturdy",
+            "body/sturdy",
+            "ff7/cloud",
+            "cloud",
+            "ff7/",
+            "sturdy\0",
+            "\0sturdy",
+            "sturdy\u{301}",
+            "ſturdy",      // long s: no Unicode case folding, only ASCII
+            "ｓｔｕｒｄｙ", // full-width letters
+            "STURDY\u{1F600}",
+            "../sturdy",
+            "sturdy/../lean",
+            "%73turdy",
+            "'; DROP TABLE bodies; --",
+            long.as_str(),
+        ] {
+            assert_eq!(resolve_body(unknown), None, "{:?}", unknown.chars().take(40).collect::<String>());
+        }
+    }
+
+    #[test]
+    fn resolving_a_model_reads_canon_rows_first_then_bodies() {
+        // canon rows: the same answer as resolve_appearance
+        for m in PLAYABLE_FIELD_MODELS {
+            assert_eq!(resolve_model(m.appearance_ref), Some(*m));
+            assert_eq!(resolve_model(m.appearance_ref), resolve_appearance(m.appearance_ref));
+        }
+        assert_eq!(resolve_model(" FF7/Tifa ").map(|m| m.hrc), Some("aagb"));
+        // bodies, by appearance ref
+        for b in PLACEHOLDER_BODIES {
+            assert_eq!(resolve_model(b.model.appearance_ref), Some(b.model));
+            assert_eq!(resolve_model(&b.model.appearance_ref.to_ascii_uppercase()), Some(b.model));
+            assert_eq!(resolve_model(&format!(" \t{}\n ", b.model.appearance_ref)), Some(b.model));
+        }
+        assert_eq!(resolve_model("FF7/BODY/Sturdy ").map(|m| m.hrc), Some("bwab"));
+        // a body's archetype alone is not an appearance ref, and nothing else resolves
+        let long = format!("ff7/body/{}", "x".repeat(100_000));
+        for unknown in [
+            "",
+            "ff7",
+            "ff7/",
+            "ff7/body",
+            "ff7/body/",
+            "ff7/body/nobody",
+            "ff7/body/sturdy/",
+            "ff7/body/sturdy/2",
+            "ff7/body//sturdy",
+            "ff7/body/ sturdy",
+            "ff7//body/sturdy",
+            "ff7\\body\\sturdy",
+            "sturdy",
+            "body/sturdy",
+            "ff8/body/sturdy",
+            "ff7/body/sturdy\0",
+            "ff7/body/ſturdy",
+            "ff7/body/sturdy\u{301}",
+            "ff7/cloud\0",
+            "ff7/cloud/2",
+            "test/model",
+            long.as_str(),
+        ] {
+            assert_eq!(resolve_model(unknown), None, "{:?}", unknown.chars().take(40).collect::<String>());
+        }
+    }
+
+    #[test]
+    fn body_or_default_always_gives_a_body() {
+        let default = resolve_body(DEFAULT_BODY).unwrap();
+        assert_eq!(body_or_default(None), default);
+        for unknown in ["", "nobody", "ff7/body/sturdy", "ff7/cloud", "sturdy\0", "ſturdy"] {
+            assert_eq!(body_or_default(Some(unknown)), default, "{unknown:?}");
+        }
+        for b in PLACEHOLDER_BODIES {
+            assert_eq!(body_or_default(Some(b.archetype)), *b);
+            assert_eq!(body_or_default(Some(&format!(" {} ", b.archetype.to_ascii_uppercase()))), *b);
+        }
+        // the body it returns is always a table row
+        assert!(PLACEHOLDER_BODIES.contains(&body_or_default(Some("whatever"))));
+    }
+
+    #[test]
+    fn a_placeholder_body_loads_like_a_canon_character_and_may_run_as_it_walks() {
+        use crate::model::tests::synthetic_char_lgp;
+        use std::io::Cursor;
+        // the synthetic archive has one skeleton (`test`, 2 bones) and one 2-bone clip (`walk`): a
+        // body without a run clip of its own, so its run is its walk
+        let body = PlaceholderBody {
+            archetype: "test",
+            label: "Test",
+            model: PlayableModel {
+                appearance_ref: "ff7/body/test",
+                display_name: "Test",
+                hrc: "test",
+                idle_anim: "walk",
+                walk_anim: "walk",
+                run_anim: "walk",
+            },
+            run_is_walk: true,
+        };
+        assert_eq!(body.run_is_walk, body.model.walk_anim == body.model.run_anim);
+        let mut lgp = LgpArchive::open(Cursor::new(synthetic_char_lgp())).unwrap();
+        let character = load_playable(&mut lgp, &body.model).unwrap();
+        assert_eq!((character.model.bones.len(), character.appearance), (2, body.model));
+        for state in [AnimState::Idle, AnimState::Walk, AnimState::Run] {
+            assert!(character.pose(state, 0).is_some(), "{state:?}");
+        }
+        assert_eq!(character.run.frame_count(), character.walk.frame_count());
+        // a body whose clip has the wrong bone count is refused like a canon one
+        let odd = PlaceholderBody { model: PlayableModel { run_anim: "odd", ..body.model }, run_is_walk: false, ..body };
+        assert!(matches!(load_playable(&mut lgp, &odd.model), Err(ModelError::Invalid { .. })));
+        // a body naming a skeleton that does not exist is refused, not a panic
+        let missing = PlayableModel { hrc: "zzzz", ..body.model };
+        assert!(matches!(load_playable(&mut lgp, &missing), Err(ModelError::Missing { .. })));
     }
 }

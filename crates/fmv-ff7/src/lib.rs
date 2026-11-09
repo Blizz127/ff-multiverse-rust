@@ -46,7 +46,9 @@
 //!   documentation does not state) and how they were established are in its docs.
 //! * [`hrc`], [`rsd`], [`pmodel`], [`tex`] - the skeleton, resource, mesh and texture formats.
 //! * [`playable`] - the stable appearance ids (`ff7/cloud`, ...) and which skeleton and
-//!   animations each means ([`resolve_appearance`]).
+//!   animations each means ([`resolve_appearance`]), and the generic non-canon placeholder bodies
+//!   for players' own characters (`ff7/body/<archetype>`, [`PLACEHOLDER_BODIES`],
+//!   [`resolve_body`], [`resolve_model`]).
 //!
 //! Battle models (from `battle/battle.lgp`, verified on the same owned edition):
 //!
@@ -129,7 +131,10 @@ pub use model::{
     default_model_scale, load_field_animation, load_field_model, model_to_field, FieldModel, MeshPart, ModelBone, ModelError,
     PartBlend,
 };
-pub use playable::{load_playable, playable_field_models, resolve_appearance, Character, PlayableModel, DEFAULT_APPEARANCE};
+pub use playable::{
+    body_or_default, load_playable, playable_field_models, resolve_appearance, resolve_body, resolve_model, Character,
+    PlaceholderBody, PlayableModel, DEFAULT_APPEARANCE, DEFAULT_BODY, PLACEHOLDER_BODIES,
+};
 pub use tex::RgbaImage;
 
 /// Status string a surface that presents FF7 data from this crate can show. The decoders have

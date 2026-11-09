@@ -26,7 +26,7 @@ use fmv_ff7::model::{load_field_animation, load_field_model, mat4_identity, mode
 use fmv_ff7::pmodel::PModel;
 use fmv_ff7::rsd::Rsd;
 use fmv_ff7::tex::parse_tex;
-use fmv_ff7::{lzss, resolve_appearance, Ff7Adapter};
+use fmv_ff7::{lzss, resolve_appearance, resolve_body, resolve_model, Ff7Adapter};
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
@@ -777,6 +777,143 @@ fn playable_models_match_the_field_loaders() {
         assert!(idle <= 4, "{}: idle has {idle} frames", m.appearance_ref);
         assert!(walk >= 8 && run >= 8, "{}: walk {walk} run {run}", m.appearance_ref);
     }
+}
+
+/// The generic placeholder bodies of `playable::PLACEHOLDER_BODIES` against the field loaders and
+/// `char.lgp`: each skeleton and its three clips exist and fit (equal bone counts), the idle clip is
+/// a pose and walk and run are loops, and every count the `playable` module docs quote for them
+/// is right. Prints counts and stems only.
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn placeholder_bodies_match_the_field_loaders() {
+    let Some(dir) = data_dir() else { return };
+    let mut flevel_lgp = LgpArchive::open_path(flevel(&dir)).unwrap();
+    let mut char_archive = char_lgp(&dir);
+    let char_names: HashSet<String> = char_archive.list().iter().map(|e| e.name.to_ascii_lowercase()).collect();
+    let field_names: Vec<String> = flevel_lgp.list().iter().filter(|e| is_field_name(&e.name)).map(|e| e.name.clone()).collect();
+    assert_eq!(field_names.len(), 702);
+
+    // skeleton stem -> first three animations -> records, skeleton stem -> the fields using it,
+    // skeleton stem -> records whose own scale is the field's
+    let mut by_hrc: BTreeMap<String, BTreeMap<Vec<String>, usize>> = BTreeMap::new();
+    let mut fields_of: BTreeMap<String, HashSet<String>> = BTreeMap::new();
+    let mut scale_equal: BTreeMap<String, usize> = BTreeMap::new();
+    let generic: Vec<String> = ["acfe", "aaff", "aaga"].map(String::from).to_vec();
+    let mut generic_fields: HashSet<String> = HashSet::new();
+    let mut records = 0usize;
+    for name in &field_names {
+        let loader = load_field_file(&mut flevel_lgp, name).model_loader().unwrap_or_else(|e| panic!("{name}: {e}"));
+        for m in &loader.models {
+            records += 1;
+            let hrc = m.hrc_stem();
+            let first_three: Vec<String> = m.animations.iter().take(3).map(|a| a.stem()).collect();
+            if first_three == generic {
+                generic_fields.insert(name.clone());
+            }
+            *by_hrc.entry(hrc.clone()).or_default().entry(first_three).or_default() += 1;
+            fields_of.entry(hrc.clone()).or_default().insert(name.clone());
+            *scale_equal.entry(hrc).or_default() += usize::from(m.scale == Some(loader.field_scale));
+        }
+    }
+    eprintln!("loader records {records} over {} distinct skeletons", by_hrc.len());
+    assert_eq!((records, by_hrc.len()), (5_454, 385), "the survey the module docs describe");
+
+    // The generic clip set of the 21-bone human rig (Cloud's own standing, walk and run): how many
+    // records open with it, in how many fields, on how many skeletons, and the bone counts of those
+    // skeletons; and the records that open with the second standing clip `aafe` instead.
+    let skeletons_opening = |triple: [&str; 3]| -> BTreeMap<String, usize> {
+        let want: Vec<String> = triple.map(String::from).to_vec();
+        by_hrc.iter().filter_map(|(hrc, triples)| triples.get(&want).map(|n| (hrc.clone(), *n))).collect()
+    };
+    let generic_skeletons = skeletons_opening(["acfe", "aaff", "aaga"]);
+    let generic_records: usize = generic_skeletons.values().sum();
+    let mut bone_counts: BTreeMap<usize, usize> = BTreeMap::new();
+    for hrc in generic_skeletons.keys() {
+        let bytes = char_archive.read(&format!("{hrc}.hrc")).unwrap();
+        *bone_counts.entry(Hrc::parse(&bytes).unwrap().bones.len()).or_default() += 1;
+    }
+    let aafe_records: usize = skeletons_opening(["aafe", "aaff", "aaga"]).values().sum();
+    eprintln!(
+        "acfe,aaff,aaga open {generic_records} records in {} fields on {} skeletons (bone counts {bone_counts:?}); aafe,aaff,aaga open {aafe_records}",
+        generic_fields.len(),
+        generic_skeletons.len()
+    );
+    assert_eq!((generic_records, generic_fields.len(), generic_skeletons.len()), (1_186, 594, 110));
+    assert_eq!(bone_counts, BTreeMap::from([(21, 108), (23, 1), (25, 1)]));
+    assert_eq!(aafe_records, 175);
+
+    // (records using the skeleton, fields they are in, of the records those opening with the body's
+    // idle, walk and run, those whose second animation is the walk, those whose own scale is the
+    // field's) as quoted in the `playable` module docs
+    let expected: BTreeMap<&str, (usize, usize, usize, usize, usize)> =
+        BTreeMap::from([("lean", (29, 15, 21, 27, 29)), ("sturdy", (130, 63, 87, 109, 127)), ("slight", (10, 10, 2, 2, 10))]);
+    assert_eq!(expected.len(), fmv_ff7::playable::PLACEHOLDER_BODIES.len());
+    let frames = |l: &mut LgpArchive<std::fs::File>, stem: &str| load_field_animation(l, stem).unwrap().frame_count();
+    for b in fmv_ff7::playable::PLACEHOLDER_BODIES {
+        let m = &b.model;
+        let wanted: Vec<String> = [m.idle_anim, m.walk_anim, m.run_anim].iter().map(|s| s.to_string()).collect();
+        let triples = by_hrc.get(m.hrc).unwrap_or_else(|| panic!("{}: no loader record uses skeleton {}", b.archetype, m.hrc));
+        let all_for: usize = triples.values().sum();
+        let opening = triples.get(&wanted).copied().unwrap_or(0);
+        let walk_second: usize =
+            triples.iter().filter(|(t, _)| t.get(1).map(String::as_str) == Some(m.walk_anim)).map(|(_, n)| *n).sum();
+        let (fields, at_field_scale) = (fields_of[m.hrc].len(), scale_equal[m.hrc]);
+        eprintln!(
+            "{}: skeleton {} used by {all_for} loader records in {fields} fields, {opening} of them open with {wanted:?}, {walk_second} have {} second, {at_field_scale} are at the field's scale",
+            b.archetype, m.hrc, m.walk_anim
+        );
+        assert_eq!(Some(&(all_for, fields, opening, walk_second, at_field_scale)), expected.get(b.archetype), "{}", b.archetype);
+        assert!(fields >= 10, "{}: only {fields} fields use the skeleton, the choice must not be an accident of a few", b.archetype);
+
+        // the resolvers agree with the table, and the canon-only resolver does not know the body
+        assert_eq!(resolve_body(b.archetype), Some(*b));
+        assert_eq!(resolve_model(m.appearance_ref), Some(*m));
+        assert_eq!(resolve_appearance(m.appearance_ref), None, "{}", b.archetype);
+        assert!(fmv_ff7::playable::PLAYABLE_FIELD_MODELS.iter().all(|c| c.hrc != m.hrc), "{}: a canon skeleton", b.archetype);
+
+        // the skeleton and all three clips exist in char.lgp ...
+        assert!(char_names.contains(&format!("{}.hrc", m.hrc)), "{}: skeleton {} is not in char.lgp", b.archetype, m.hrc);
+        for stem in [m.idle_anim, m.walk_anim, m.run_anim] {
+            assert!(char_names.contains(&format!("{stem}.a")), "{}: clip {stem} is not in char.lgp", b.archetype);
+        }
+        // ... the whole body loads in one call, and the skeleton and all three clips fit
+        let character = fmv_ff7::load_playable(&mut char_archive, m).unwrap();
+        assert_eq!(character.appearance, *m);
+        assert!(character.pose(fmv_core::AnimState::Run, 5).is_some());
+        let model = load_field_model(&mut char_archive, m.hrc).unwrap();
+        assert_eq!((model.bones.len(), model.dropped_triangles, model.missing_textures.len()), (21, 0, 0), "{}", b.archetype);
+        for stem in [m.idle_anim, m.walk_anim, m.run_anim] {
+            let a = load_field_animation(&mut char_archive, stem).unwrap();
+            assert!(model.fits(&a), "{}: {stem} has {} bones, the skeleton {}", b.archetype, a.bone_count(), model.bones.len());
+        }
+        // the idle clip is a pose or a very short loop; walk and run are loops
+        let (idle, walk, run) = (frames(&mut char_archive, m.idle_anim), frames(&mut char_archive, m.walk_anim), frames(&mut char_archive, m.run_anim));
+        eprintln!("{}: frames idle {idle}, walk {walk}, run {run}", b.archetype);
+        assert!(idle <= 4, "{}: idle has {idle} frames", b.archetype);
+        assert!(walk >= 8, "{}: walk has {walk} frames", b.archetype);
+        if b.run_is_walk {
+            assert_eq!((m.run_anim, run), (m.walk_anim, walk), "{}", b.archetype);
+        } else {
+            assert!(run >= 8 && m.run_anim != m.walk_anim, "{}: run has {run} frames", b.archetype);
+        }
+        assert_eq!((idle, walk, run), (1, 30, 15), "{}", b.archetype);
+    }
+
+    // The skeletons the module docs leave out on purpose: the three extras of the first mission
+    // stand in the three reactor fields, and the armed guard is used widely.
+    for (hrc, fields) in [("bwfd", 20usize), ("axdc", 23), ("bxbe", 16)] {
+        assert_eq!(fields_of[hrc].len(), fields, "{hrc}");
+        for field in ["md1stin", "md1_1", "md1_2"] {
+            assert!(fields_of[hrc].contains(field), "{hrc} is not used in {field}");
+        }
+    }
+    assert_eq!((by_hrc["azhe"].values().sum::<usize>(), fields_of["azhe"].len()), (57, 35));
+    // the other adult woman the docs compare `slight` with: about as many fields, and more of her
+    // records play the generic walk second
+    assert_eq!((by_hrc["bsfc"].values().sum::<usize>(), fields_of["bsfc"].len()), (11, 11));
+    let bsfc_walk_second: usize =
+        by_hrc["bsfc"].iter().filter(|(t, _)| t.get(1).map(String::as_str) == Some("aaff")).map(|(_, n)| *n).sum();
+    assert_eq!(bsfc_walk_second, 9);
 }
 
 /// The posing conventions of `anim`'s docs, asserted on Cloud: upright, standing on the ground,
