@@ -53,7 +53,10 @@ from its own `scene.bin` and `kernel.bin`, and **every account keeps its own cha
 (level, experience, AP, gil; protocol v5)**, paid by won battles and saved per account, and
 **battles have real commands (protocol v6)**: Attack, Magic, Item and Defend, with an inventory per
 account, and **limit breaks and escape (protocol v7)**: a limit gauge that enemy blows fill and a
-full one turns Attack into the character's limit break, and any character may try to run. The
+full one turns Attack into the character's limit break, and any character may try to run, and
+**every player has one original character of their own (protocol v8)**: a saved identity, a
+per-game appearance binding (a generic placeholder body in FF7), a combat slot of a canon party
+member that is separate from the canon story roles, and pointers to its progress. The
 synthetic **FIXTURE** plaza still exists
 as a labelled test area; it says nothing about FF7 support.
 
@@ -63,6 +66,7 @@ as a labelled test area; it says nothing about FF7 support.
 | M2-a | Accounts, persistent avatar profile, per-game progression store | done |
 | M2-b | Parties (invite, accept, leave, kick, promote), phase-key instance placement | done (single phase) |
 | M2-c/d | Shared battle, battle return, per-player rewards | done (battle subset; rewards paid into each account's own character progress and saved) |
+| M2-e | Player characters: identity, per-game binding, combat slot separate from canon roles, pointers to progress (protocol v8) | done for the slice (FF7: generic placeholder bodies, fixed slots; `scripts/slice-smoke.sh`) |
 | Later | FF8, FF9, FF10 and FF12 adapters on the same core | planned |
 
 **Walking between fields (protocol v4).** The server hosts many fields: the entry field
@@ -93,7 +97,7 @@ games plug in behind `fmv-adapter-api` without touching it.
 | `fmv-import` | Owned-content import CLI: PC install scan now, sequential disc import planned. |
 | `fmv-ff7` | FF7 adapter: format decoders (LGP, LZSS, field, background) and the FF7 area runtime. Reads owned data only. |
 | `fmv-ff7-battle` *(coming)* | FF7 battle subset for the shared-battle milestone. |
-| `fmv-persist` | Accounts, avatar profiles and per-game progression in an atomic, single-writer file store. |
+| `fmv-persist` | Accounts, avatar profiles, player characters (identity, per-game binding and slot, pointers to progress) and per-game progression in an atomic, single-writer file store. |
 | `fmv-party` | Party membership, leader and story-phase instance selection (pure state machines). |
 
 ## Quickstart
@@ -196,9 +200,10 @@ client answers it (its first message after the `Welcome`, whatever it asks for) 
 as claimed: `fmv-accounts release-older-than` then only ever frees a registration whose client never
 answered, never a player who registered, played and has not logged in again. (A store written by an
 earlier server has no such records: until each player logs in once with the saved token they look
-unclaimed to `fmv-accounts`, so check `list` and release by id there instead of `release-older-than`.) A look
-(`appearance_ref`) is only ever one of the ids the hosted game offers (`ff7/cloud`, ...); anything
-else keeps the default look instead of failing the registration.
+unclaimed to `fmv-accounts`, so check `list` and release by id there instead of `release-older-than`.) A body
+(`Hello::character.body`) is only ever one of the ids the hosted game offers; anything else is the default
+body instead of failing the registration, while a combat slot the game does not offer to a new character
+(FF7: Cloud's, or none that exists) is refused, because it would fix how the character fights for good.
 
 *Refusals are typed.* `Reject { reason, code }`: the `reason` is a sentence for the screen, the `code`
 (`NameTaken`, `InvalidName`, `InvalidToken`, `RegistrationClosed`, `RateLimited`, `AlreadyOnline`,
@@ -247,11 +252,12 @@ then runs in. It lists the characters saved for that server (name, colour swatch
 this computer (it asks first, and the default answer keeps it: the character stays on the
 server, but its token, shown only once at registration, cannot be recovered), **Esc** quits.
 With nothing saved yet it opens on the create screen: a **name** (up to 24 characters, cleaned
-exactly as the server cleans it), a **look** (FF7: Cloud, Tifa, Barret or Aerith; the ids
-`ff7/cloud`, `ff7/tifa`, `ff7/barret`, `ff7/aerith` are stored in the avatar profile and the game
-draws the matching field model from your own copy, see "In the game"), and a **tint** (a palette grid plus red, green
+exactly as the server cleans it), a **body** (a generic placeholder model of your own `char.lgp`,
+the field look of your character, see "In the game"), a **tint** (a palette grid plus red, green
 and blue sliders; until you pick one it is the colour the command line would derive from the
-name). **Tab** or **Up/Down** move between the fields, **Left/Right** change a value, **Enter**
+name) and a **combat slot** (FF7: Barret, Tifa, Aerith, Red XIII, Yuffie, Cait Sith, Vincent or Cid:
+the canon party member whose combat moves and level curve you fight with, fixed once the character is
+created; Cloud stays the canon protagonist and is not offered; see "Your own character"). **Tab** or **Up/Down** move between the fields, **Left/Right** change a value, **Enter**
 registers. If the server refuses (name taken, registration closed, rate limited) the reason is
 shown on screen and you can edit and try again; the first time a registration succeeds its
 token is saved before anything else can fail. `--name` skips the menu (the old behaviour) and
@@ -269,8 +275,10 @@ right, the area name (`FF7 md1stin`), the connection status (players, round-trip
 pending invite; a FIXTURE area wears the label `FIXTURE (synthetic, not FF7)`. The window title
 still shows your party size and a pending invite.
 
-*Characters.* In an FF7 field every player, you included, is drawn as the field model of the
-look they chose (`ff7/cloud`, `ff7/tifa`, ... `ff7/vincent`), standing on the walkmesh at their
+*Characters.* In an FF7 field every player, you included, is drawn as the binding the server holds for
+them: a generic placeholder body (`ff7/body/lean`, `ff7/body/sturdy`, `ff7/body/slight`) tinted with their
+colour, never the model of the canon character whose combat slot they hold (an account that predates
+protocol v8 keeps the canon look it chose: `ff7/cloud`, `ff7/tifa`, ... `ff7/vincent`), standing on the walkmesh at their
 position and facing the way they face, with the idle, walk or run animation of what they are
 doing. The models are read from **your own copy** of the game's `char.lgp` (found in the same
 library set, or next to a `--ff7-flevel` file) and are never sent over the network: the wire
@@ -383,8 +391,8 @@ instances (an area is one instance whatever the story phases of the players in i
 the account and its avatar profile on the server and hands the client its token **once**; the
 client saves it under its state directory (`--state-dir`, default `client/` next to the
 library) in `accounts/<server>.token`, owner-only, and uses it from then on. After
-registration the server never trusts a client's name, tint or appearance: they come from the
-stored profile, and `--name` is only needed to register. Names are unique (case-insensitive,
+registration the server never trusts a client's name, tint, body or combat slot: they come from the
+stored player character, and `--name` is only needed to register. Names are unique (case-insensitive,
 invisible formatting characters are stripped). `--register` forces a new account for `--name`.
 A second account on the same server and machine gets its own file (the first file records
 which name it belongs to). A token that stops working (the server's accounts were reset) is
@@ -417,7 +425,8 @@ battle from its own game files and matched (`verified by replay`, not merely "no
 mode fires every command over real processes (see "Every command over real processes", below).
 
 **Character progress (protocol v5).** Every account has its own progress in the game it plays: the
-character its look names (Cloud unless it chose another look) and that character's level, experience,
+character it fights as (its combat slot since protocol v8, see "Your own character" below; before that
+the character its look named, Cloud unless it chose another look) and that character's level, experience,
 AP and gil. A battle's members fight as their own character at their own level (the old rule that
 gave the `i`-th member of a battle the `i`-th character of the game is gone), a victory pays each
 member that fought on, and the server adds the payment to that member's progress with FF7's own
@@ -531,9 +540,56 @@ same way (checked over all 702 fields of that build: every enabled table's weigh
 and every formation exists in `scene.bin`). A starting party wins 301 and 303 every time (200 of
 200 seeded runs each, both members attacking), which is why the smoke script uses 301.
 
-**Protocol v7** (`fmv-protocol`) carries all of the above; its module docs describe the flow,
+**Your own character (protocol v8).** Every player has ONE original character that travels across
+games. In FF7 it takes a canon party member's **combat slot** (Barret's, say) while that canon
+character stays in the story as a non-player character (the canon Barret is an NPC of `md1stin` and
+`md1_1` whichever slot anybody holds; dialogue is never name-swapped); the character's identity and
+appearance persist and each game draws them its own way. Three things are therefore separate, in the
+protocol and in the store:
+
+* the **identity**: name, colour and a game-agnostic body choice (the creator's Body row);
+* the **binding**: how the hosted game draws the character, stored per game. In FF7 it is a generic
+  placeholder body, a non-canon human model of your own `char.lgp` (`lean`, `sturdy` or `slight`: see
+  the `playable` module of `fmv-ff7` for which models and why), tinted with the identity colour, and
+  never the slot's canon character. Every player sees every other player's binding;
+* the **slot**: the canon party member whose combat template, abilities and experience curve the
+  character fights with. It is chosen once, at creation, and fixed (FF7's experience curves differ per
+  character, so a slot change would change a player's level). New characters pick among the canon party
+  members other than Cloud, who stays the canon protagonist; two players may hold the same slot; a
+  registration that names none gets Barret's. In battle the party panel, the HP list, the banners and the
+  logs show the player's own name; the engine uses the slot's template, and the battle model is the
+  slot's own battle model (a placeholder until players have battle models of their own).
+
+The server keeps it in `<state>/server/characters/<account>.json` (`fmv-persist`'s `PlayerCharacter`):
+the identity and, per game, the binding, the slot and **pointers** to where the progress lives.
+Pointers, never copies: the level, experience, AP, gil, limit gauge and inventory stay in the
+character-progress record under `progression/<account>/<Game>.character.json` and the story in the
+story blob beside it, exactly where they always were (that record's `character` field is the slot's id;
+if a rolled-back build saved another one the slot wins and the next save writes it back). An account that
+predates the record (every account of a v6 or v7 server) gets one at its first login, **added next to
+its files, which are not touched**: a test loads the exact v6 and v7 file shapes and requires every file
+byte for byte unchanged and every number the same. Its slot is the character v7 fought it as (the one
+its look named, Cloud without a look; a migrated account may hold Cloud's slot) and its look is kept as
+its binding (an account that never chose one gets the default placeholder body). The window's character
+creator takes a name, a body, a colour and a combat slot; headless players take `--body` and `--slot`
+(`fmv-client --help`). `scripts/slice-smoke.sh` proves the whole slice on your real data over real
+processes: two players with different identities and slots register, party up and win a shared battle
+whose roster shows their own names with their slots' templates while the canon Barret stays an NPC of the
+field, the server process is stopped and started again, and every card, number and record is exactly what
+it was.
+
+**Protocol v8** (`fmv-protocol`) carries all of the above; its module docs describe the flow,
 and golden JSON tests pin the wire format (the engine's own event, command and outcome types
-included). A client or server of another protocol version is refused with a clear message:
+included). v8 replaced `Hello`'s colour and look by the character to create (`Hello::character`:
+colour, body, slot), added the character card to `Welcome` and the player's own name to every battle
+roster member (`BattleMember::name`, required); neither side can read the other's `Hello`, so a v7
+client (or server) is refused at the handshake, cleanly, because the version of any `Hello` is readable.
+**Rolling back v8:** a v7 server never reads or writes `characters/`, so every record of v7 shape comes
+back exactly as it was (the migrated accounts included); a character created by v8 comes back as the
+canon character of its slot (its avatar profile carries that look as a compatibility mirror, which v8
+never reads) and fights as that slot, except slot Cait Sith, who has no canon look and fights as Cloud.
+Its `characters/` record waits for v8. A client or server of another protocol version is refused with a
+clear message:
 v5 added `CharacterProgress`, a message a v4 peer cannot decode (the server sends it right after
 every join), so the version was bumped like v4 was for `AreaChange`, and a v4 client is refused
 at the handshake instead of being cut off at its first join; v6 added `Inventory` (also sent
@@ -601,8 +657,8 @@ UNKNOWN placeholders; see `deploy/README.md`.
 
 ```
 <state>/library/     owned-content library (fmv-import): blobs and one manifest per edition
-<state>/server/      the server's accounts, avatar profiles, progression and character progress
-                     (LOCK = single writer)
+<state>/server/      the server's accounts, avatar profiles, player characters (characters/, v8),
+                     progression and character progress (LOCK = single writer)
 <state>/client/      a client's saved login tokens: accounts/<server>.token (mode 0600), and next to
                      each one a display-only note of how that character looked when last seen
                      (accounts/<server>.<name>.look: tint and look, no secret; safe to delete)
@@ -621,6 +677,7 @@ scripts/ff-multiverse.sh the launcher entry point shipped in the package (docs/L
 scripts/smoke.sh         two-bot local smoke test
 scripts/battle-smoke.sh  shared-battle smoke test (real data; modes --fixture --random --progress --commands)
 scripts/travel-smoke.sh  walking between fields: two bots, md1stin -> md1_1 and back (real data)
+scripts/slice-smoke.sh   the foundations slice: two original characters, a shared battle, a real server restart
 deploy/                  systemd user unit template and deployment procedure
 docs/LAUNCHER.md         the package as an owner-only launcher port: layout, entry point, data dir
 IMPLEMENTATION-PLAN.md   first-milestone plan and design constraints

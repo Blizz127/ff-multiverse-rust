@@ -85,8 +85,10 @@ BATTLES:
 
 CHARACTER PROGRESS:
   Every account has its own progress in the game, kept in the state directory beside (and apart
-  from) its story state: the character its look names (Cloud unless it chose another) and that
-  character's level, experience, AP and gil. A battle's members fight as their own character at their
+  from) its story state: the character it fights as (the combat slot of its player character, chosen
+  once when the character is created: a canon party member other than Cloud; an account that predates
+  player characters keeps the character its look named, Cloud without one) and that character's
+  level, experience, AP and gil. A battle's members fight as their own character at their
   own level; a victory pays each member that fought on and the server applies it with the game's own
   level-up rule (the experience curve of the character's kernel data), tells the player
   (`CharacterProgress`, which it also gets when it joins) and saves it. An account that has earned
