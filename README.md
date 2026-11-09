@@ -581,7 +581,7 @@ same way (checked over all 702 fields of that build: every enabled table's weigh
 and every formation exists in `scene.bin`). A starting party wins 301 and 303 every time (200 of
 200 seeded runs each, both members attacking), which is why the smoke script uses 301.
 
-**Protocol v7** (`fmv-protocol`) carries all of the above; its module docs describe the flow,
+**Protocol v8** (`fmv-protocol`) carries all of the above; its module docs describe the flow,
 and golden JSON tests pin the wire format (the engine's own event, command and outcome types
 included). A client or server of another protocol version is refused with a clear message:
 v5 added `CharacterProgress`, a message a v4 peer cannot decode (the server sends it right after
@@ -591,11 +591,15 @@ right after every join), the new battle commands and events and the items in `Ba
 v5 client is refused the same way; v7 added the `Limit` and `Escape` commands, the `LimitGauge` and
 `EscapeFailed` events, `Outcome::Escaped`, three refusals and the starting limit gauge of every
 battle member (`BattleMember::limit`, a required field: a v6 `EncounterStart` has none), so a v6
-client is refused at the handshake. Both sides must be built from this version or later. **Rolling
-back:** a server rolled back to a v6 build ignores the `limit` key of a record written by this
+client is refused at the handshake; v8 made the `target` of a spell, an item or a limit a `Target` (one
+actor, or a whole side: `{"One":3}`, `"AllEnemies"`, `"AllAllies"` instead of a bare number), which a v7
+peer cannot read, so a v7 client is refused too (nothing else changed: no event, message or record).
+Both sides must be built from this version or later. **Rolling back:** a server rolled back to a v6 build ignores the `limit` key of a record written by this
 version and drops it the next time it saves that account (the character comes back with an empty
 gauge, nothing else lost; a record whose gauge is empty is byte for byte what v6 writes); a v7 server
-reads every v6 record (no `limit` key reads as an empty gauge). The inventory caveat of v6 still
+reads every v6 record (no `limit` key reads as an empty gauge); nothing v8 adds is ever stored (the All
+materia uses are battle state derived from the player's own data), so a v7 server reads every record this
+version writes. The inventory caveat of v6 still
 applies: a server rolled back to a v5 build ignores (and drops) the inventory of a record and
 refuses a record with more than about 70 stacks as too large, so roll back past v6 only from a
 snapshot taken before any inventory was stored.

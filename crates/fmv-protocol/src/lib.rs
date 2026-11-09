@@ -1,4 +1,11 @@
-//! FF Multiverse wire protocol v7.
+//! FF Multiverse wire protocol v8.
+//!
+//! v8 is v7 plus whole-side targeting: the `target` of [`battle::Command`]'s `Magic`, `Item` and `Limit` is a
+//! [`Target`] (`One(actor)`, `AllEnemies` or `AllAllies`) instead of an actor, so an action can hit a whole side
+//! (see [`battle`], "Whole-side targeting"). A v7 peer reads a bare number where a v8 one sends `{"One":3}` or a
+//! side, and a v8 peer does not read a bare number as a target, so the version was bumped: a v7 client or server
+//! is refused at the handshake instead of being cut off at the first spell, item or limit a player gives. No
+//! event, message or record changed.
 //!
 //! v7 is v6 plus limit breaks and escape: [`battle::Command`] gains `Limit { target }` and `Escape`,
 //! [`battle::ActionRef`] gains `Limit(id)` and `Escape`, [`battle::Outcome`] gains `Escaped`, battle
@@ -249,7 +256,7 @@ pub use fmv_party::{
     PartyEvent, PartyId, Placement,
 };
 
-pub const PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = 8;
 /// Hard cap on a single frame payload (bytes).
 pub const MAX_FRAME: u32 = 256 * 1024;
 /// Default TCP port for development. Deployment port is UNASSIGNED (see DEPLOYMENT-CONTRACT.md).
@@ -666,8 +673,8 @@ mod tests {
     }
 
     #[test]
-    fn the_version_is_seven() {
-        assert_eq!(PROTOCOL_VERSION, 7);
+    fn the_version_is_eight() {
+        assert_eq!(PROTOCOL_VERSION, 8);
     }
 
     // -----------------------------------------------------------------------------------------
@@ -1526,6 +1533,53 @@ mod tests {
     /// The reason for the v7 bump: a v6 peer cannot decode a limit, an escape, the new events, the new
     /// outcome or the new refusals, and a v6 `BattleMember` has no limit gauge to start from. (The older
     /// peer's enums are simulated by enums that lack the variants.) The handshake refuses it first.
+    #[test]
+    fn a_v7_peer_cannot_read_the_v8_target_and_a_v8_peer_cannot_read_the_v7_one_so_the_version_had_to_change() {
+        // What a v7 peer's `Command` is: the target of a spell, an item and a limit is a bare actor.
+        #[derive(Debug, Deserialize)]
+        enum CommandV7 {
+            #[allow(dead_code)]
+            Attack { target: ActorId },
+            #[allow(dead_code)]
+            Magic { spell: u16, target: ActorId },
+            #[allow(dead_code)]
+            Item { item: u16, target: ActorId },
+            #[allow(dead_code)]
+            Defend,
+            #[allow(dead_code)]
+            Limit { target: ActorId },
+            #[allow(dead_code)]
+            Escape,
+        }
+        let a = ActorId(1);
+        for command in [
+            battle::Command::Magic { spell: 0, target: Target::One(a) },
+            battle::Command::Item { item: 3, target: Target::One(a) },
+            battle::Command::Limit { target: Target::One(a) },
+            battle::Command::Magic { spell: 27, target: Target::AllEnemies },
+            battle::Command::Item { item: 6, target: Target::AllAllies },
+            battle::Command::Limit { target: Target::AllAllies },
+        ] {
+            assert!(decode::<CommandV7>(&encode(&command).unwrap()[4..]).is_err(), "{command:?}");
+        }
+        // What does not change: Attack, Defend and Escape read the same in both.
+        for command in [battle::Command::Attack { target: a }, battle::Command::Defend, battle::Command::Escape] {
+            assert!(decode::<CommandV7>(&encode(&command).unwrap()[4..]).is_ok(), "{command:?}");
+        }
+        // And the other way round: a v7 spell, item or limit (a bare number) is no v8 command.
+        for old in [
+            r#"{"Magic":{"spell":0,"target":3}}"#,
+            r#"{"Item":{"item":3,"target":0}}"#,
+            r#"{"Limit":{"target":3}}"#,
+        ] {
+            assert!(decode::<battle::Command>(old.as_bytes()).is_err(), "{old}");
+        }
+        assert!(decode::<battle::Command>(br#"{"Attack":{"target":3}}"#).is_ok(), "an attack is the same in v7");
+        let hello_v7 = br#"{"Hello":{"protocol_version":7,"client_build":"c","auth":{"Token":"x"},"tint":[0,0,0],"appearance_ref":null}}"#;
+        assert_eq!(probe_hello_version(hello_v7), Some(7));
+        assert_ne!(probe_hello_version(hello_v7), Some(PROTOCOL_VERSION));
+    }
+
     #[test]
     fn a_v6_peer_cannot_decode_the_v7_messages_so_the_version_had_to_change() {
         #[derive(Debug, Deserialize)]
