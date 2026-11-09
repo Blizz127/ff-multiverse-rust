@@ -49,6 +49,25 @@
 //! `CharacterProgress` message (which it also gets on joining) and saved by the `saver` task, which
 //! `serve` stops, after saving everything queued, before it returns.
 //!
+//! # Story, phases and instances
+//!
+//! Every account has one story progression per game (`fmv_persist::Progression`, an opaque blob that
+//! only the game's adapter reads; an account that never advanced has none, which is a new account).
+//! The adapter turns it into a story PHASE for each area (`fmv_adapter_api::AreaRuntime::phase_key`), and
+//! the world keeps one INSTANCE of an area per phase somebody is in (`world::instances`): players see and
+//! fight with only the players of their own instance. Solo, a player is in the instance of its own phase;
+//! in a party, in the one of its leader's phase, keeping its own progression. The empty progression is the
+//! empty phase in every area, so every account that exists today shares one instance of each area until
+//! one of them advances the story.
+//!
+//! The story advances only by something the server verifies from the player's accepted moves: reaching a
+//! story point of the area (`AreaRuntime::story_points`; for FF7, a field script's own "step on this
+//! walkmesh triangle while the story counter is N" loop, see `fmv_ff7::story`). A step is logged as
+//! `story advanced account=<n> entity=<n> area=<AreaId> point=<id> moment=<from>-><to>`, saved off the
+//! world lock by the `saver` with the adapter's merge (so a stale save never takes a story back), and
+//! told to the player with `ServerMsg::StoryUpdate`; a changed phase moves the player (and its party's
+//! members) to another instance of the same area. See `world::story`.
+//!
 //! # Inventory
 //!
 //! Every account also carries items (`inventory`), mirrored in the world and stored inside the same
@@ -250,6 +269,7 @@ impl Server {
         // sent or logged; never format the full `AreaInfo` or `EditionProvenance`.
         let info = area.info().clone();
         let (exit_count, npc_count) = (area.exits().len(), area.npcs().len());
+        let story_points: Vec<String> = area.story_points().iter().map(|p| format!("point={} {}", p.id, p.label)).collect();
         let label = label_area(&info)?;
         let fixture = label.fixture;
         if fixture && !info.fixture {
@@ -288,7 +308,11 @@ impl Server {
             .map_err(|source| ServerError::Bind { addr: config.bind, source })?;
         let local_addr = listener.local_addr()?;
 
-        info!(area = %area_id, name = %display_name, ?provenance, fixture, exits = exit_count, npcs = npc_count, "hosting area (the entry area; the areas its exits lead to are loaded when a player walks there)");
+        info!(area = %area_id, name = %display_name, ?provenance, fixture, exits = exit_count, npcs = npc_count, story_points = story_points.len(), "hosting area (the entry area; the areas its exits lead to are loaded when a player walks there)");
+        for point in &story_points {
+            // One line per point the server watches in this area (see `world::story`).
+            info!(area = %area_id, "story point {point}");
+        }
         if fixture {
             warn!("hosting a FIXTURE area: synthetic test content, NOT FF7 support");
         }

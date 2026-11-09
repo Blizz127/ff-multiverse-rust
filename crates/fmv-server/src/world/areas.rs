@@ -352,14 +352,19 @@ impl World {
             // The adapter spelled the key differently from the one asked for.
             return Ok(stored);
         }
-        // The `key=value` layout is read by `scripts/travel-smoke.sh` ("area loaded area=..."): keep it.
+        // The `key=value` layout is read by `scripts/travel-smoke.sh` ("area loaded area=..."): keep it
+        // (new keys go at the end).
         self.logs.info(format!(
-            "area loaded area={} name={} exits={} npcs={}",
+            "area loaded area={} name={} exits={} npcs={} story_points={}",
             state.id(),
             state.offer.display_name,
             state.exits.len(),
-            state.npcs.len()
+            state.npcs.len(),
+            state.story_points.len()
         ));
+        for point in &state.story_points {
+            self.logs.info(format!("story point area={} point={} {}", state.id(), point.id, clip(&point.label, 160)));
+        }
         self.areas.insert(stored.clone(), state);
         Ok(stored)
     }

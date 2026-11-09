@@ -487,9 +487,15 @@ pub struct PartyBot {
     accept_after_split: bool,
     /// Every remote player seen so far (bounded), for [`PartyBot::with_accept_after_split`].
     seen: BTreeSet<EntityId>,
+    /// When a player this bot had seen was first missing from its view (session seconds).
+    split_at: Option<f64>,
     invite: InviteDriver,
     accepted: BTreeSet<InviteId>,
 }
+
+/// A bot that accepts after a split ([`PartyBot::with_accept_after_split`]) waits this long (seconds) after
+/// the other player left its view, so that the other side has been seen to be apart too.
+pub const SPLIT_SETTLE_S: f64 = 1.5;
 
 /// The state of "invite the first peer".
 #[derive(Debug, Default)]
@@ -513,13 +519,15 @@ impl PartyBot {
             accept,
             accept_after_split: false,
             seen: BTreeSet::new(),
+            split_at: None,
             invite: InviteDriver::default(),
             accepted: BTreeSet::new(),
         }
     }
 
     /// Accept invites only once a player this bot had seen is no longer in view (the other player left
-    /// its instance: it advanced its story, or went away). Until then an invite stays pending (it
+    /// its instance: it advanced its story, or went away), and then only after [`SPLIT_SETTLE_S`] more
+    /// seconds, so that the other side has seen the split too. Until then an invite stays pending (it
     /// lives for the party's invite lifetime, 60 s by default).
     pub fn with_accept_after_split(mut self, on: bool) -> Self {
         self.accept_after_split = on;
@@ -545,7 +553,10 @@ impl PartyBot {
         if self.seen.len() < MAX_ACCEPTED {
             self.seen.extend(visible.iter().copied());
         }
-        let split = self.seen.iter().any(|id| !visible.contains(id));
+        if self.split_at.is_none() && self.seen.iter().any(|id| !visible.contains(id)) {
+            self.split_at = Some(now);
+        }
+        let split = self.split_at.is_some_and(|at| now - at >= SPLIT_SETTLE_S);
         if self.accept && (!self.accept_after_split || split) {
             for invite in mirror.invites_to_me() {
                 if self.accepted.len() < MAX_ACCEPTED && self.accepted.insert(invite.id) {
@@ -939,6 +950,30 @@ mod tests {
                 vec![PartyCommand::Accept(InviteId(8)), PartyCommand::Accept(InviteId(9))]
             );
             assert!(bot.step(8.0, &s.mirror, &[]).is_empty());
+        }
+
+        #[test]
+        fn a_bot_that_accepts_after_the_split_holds_the_invite_until_somebody_it_saw_is_gone() {
+            let mut bot = PartyBot::new(false, true).with_accept_after_split(true);
+            let mut s = Server::new();
+            s.invite_sent(5, PEER, ME);
+            // Nobody has been seen yet, so nobody can be gone: the invite waits.
+            assert!(bot.step(0.0, &s.mirror, &[]).is_empty());
+            // The inviter is in view: still together, still waiting (however long it takes).
+            for t in [0.1, 1.0, 30.0] {
+                assert!(bot.step(t, &s.mirror, &ids(&[2])).is_empty(), "t {t}");
+            }
+            // It leaves the view (it advanced its story and its instance changed): the bot lets the split
+            // settle (so the other side has seen it too), then accepts, once.
+            assert!(bot.step(31.0, &s.mirror, &[]).is_empty(), "it has just gone");
+            assert!(bot.step(31.0 + SPLIT_SETTLE_S - 0.1, &s.mirror, &[]).is_empty());
+            assert_eq!(bot.step(31.0 + SPLIT_SETTLE_S, &s.mirror, &[]), vec![PartyCommand::Accept(InviteId(5))]);
+            assert!(bot.step(34.0, &s.mirror, &[]).is_empty());
+            // Seeing the peer again (in the party's instance now) does not undo that, and another bot that
+            // is not asked to wait accepts at once.
+            assert!(bot.step(35.0, &s.mirror, &ids(&[2])).is_empty());
+            let mut eager = PartyBot::new(false, true);
+            assert_eq!(eager.step(0.0, &s.mirror, &[]), vec![PartyCommand::Accept(InviteId(5))]);
         }
 
         #[test]

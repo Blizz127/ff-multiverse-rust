@@ -836,6 +836,25 @@ mod tests {
     }
 
     #[test]
+    fn a_placement_line_names_the_phase_and_the_default_phase_is_the_empty_key() {
+        let placement = |phase: &[u8], party: Option<u64>, allowed: bool| Placement {
+            account: AccountId(1),
+            key: fmv_protocol::InstanceKey::new(fmv_core::AreaId { game: fmv_core::GameId::Ff7, key: "md1stin".into() }, fmv_core::PhaseKey(phase.to_vec())),
+            party: party.map(PartyId),
+            phase_owner: AccountId(1),
+            story_advance_allowed: allowed,
+        };
+        assert_eq!(describe_placement(&placement(&[], None, true)), "Ff7/md1stin (solo, story advance allowed, phase default)");
+        assert_eq!(describe_placement(&placement(&[0x4D, 2, 0], None, true)), "Ff7/md1stin (solo, story advance allowed, phase 4d0200)");
+        assert_eq!(
+            describe_placement(&placement(&[0x4D, 2, 0], Some(1), false)),
+            "Ff7/md1stin (party#1, story advance not allowed, phase 4d0200)"
+        );
+        // Whatever the server sends, the line stays short.
+        assert!(describe_placement(&placement(&[0xAB; 200], None, true)).len() < 100);
+    }
+
+    #[test]
     fn the_last_placement_is_remembered() {
         let mut m = PartyMirror::new(ME);
         assert!(m.last_placement().is_none());
