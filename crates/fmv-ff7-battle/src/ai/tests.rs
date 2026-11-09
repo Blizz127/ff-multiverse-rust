@@ -1,7 +1,7 @@
 //! `choose` and `initialize` on invented battles and scripts.
 
 use super::asm::{
-    attacks, battle_of, battle_with, block, party, plain_foe, scripted_foe, Asm, ATTACK, OTHER,
+    attacks, battle_of, battle_with, block, party, party_of, plain_foe, scripted_foe, Asm, ATTACK, OTHER,
 };
 use super::script::op;
 use super::*;
@@ -92,11 +92,72 @@ fn an_enemy_with_no_main_script_or_scripts_the_battle_cannot_hold_has_no_turn() 
     ));
     let state = battle_of(1, vec![foe]);
     assert!(turn(&state).is_none());
-    // Four party members do not fit the script slots: the enemy is disabled when the battle starts.
-    let party: Vec<Combatant> = (0..4).map(|i| Combatant::new(format!("P{i}"), 5, 100)).collect();
+    // More party members than the script slots have room for: the enemy is disabled when the battle starts.
+    let too_many = world::MAX_PARTY + 1;
+    let party: Vec<Combatant> = (0..too_many).map(|i| Combatant::new(format!("P{i}"), 5, 100)).collect();
     let state = BattleState::new(1, party, vec![scripted_foe(None, &weakest(ATTACK))]);
-    assert!(choose(&state, 4, &mut Rng::new(1)).is_none());
-    assert_eq!(memory_of(&state, 4).phase, Phase::Disabled);
+    assert!(choose(&state, too_many, &mut Rng::new(1)).is_none());
+    assert_eq!(memory_of(&state, too_many).phase, Phase::Disabled);
+}
+
+#[test]
+fn a_party_of_four_or_more_no_longer_costs_the_enemies_their_scripts() {
+    // Protocol v9: two canon companions and the players' own characters, so four and five fighters are
+    // ordinary. The script slots hold up to eight of them.
+    for fighters in 3..=world::MAX_PARTY {
+        let state = battle_with(1, party_of(fighters), vec![scripted_foe(None, &weakest(ATTACK))]);
+        let foe = fighters;
+        assert_eq!(memory_of(&state, foe).phase, Phase::Ready, "{fighters} fighters: the battle initialized it");
+        let got = choose(&state, foe, &mut Rng::new(1)).unwrap_or_else(|| panic!("{fighters} fighters: no turn"));
+        // The weakest of the party is the one the script names, wherever its slot is: Aerith (90 HP) is fourth.
+        let weakest_hp = state.actors()[..fighters].iter().map(|c| c.hp).min().unwrap();
+        let weakest_at = state.actors()[..fighters].iter().position(|c| c.hp == weakest_hp).unwrap();
+        assert_eq!(
+            got.choice,
+            Some(EnemyChoice {
+                attack: ATTACK,
+                target: Target::One(ActorId(weakest_at as u8))
+            }),
+            "{fighters} fighters"
+        );
+    }
+}
+
+#[test]
+fn a_script_aims_at_party_members_three_and_four_through_the_remapped_slots() {
+    // Five fighters: members 3 (slot 10) and 4 (slot 11) are the lowest HP and the highest in turn.
+    let mut party = party_of(5);
+    assert_eq!((party[3].hp, party[4].hp), (90, 400));
+    let lowest = battle_with(1, party.clone(), vec![scripted_foe(None, &weakest(ATTACK))]);
+    assert_eq!(
+        choose(&lowest, 5, &mut Rng::new(1)).unwrap().choice.unwrap().target,
+        Target::One(ActorId(3)),
+        "the lowest HP is party member 3, slot 10"
+    );
+    party[2].hp = 1;
+    party[3].hp = 500;
+    party[4].hp = 40;
+    party[2].max_hp = 500;
+    let lowest = battle_with(1, party, vec![scripted_foe(None, &weakest(ATTACK))]);
+    assert_eq!(
+        choose(&lowest, 5, &mut Rng::new(1)).unwrap().choice.unwrap().target,
+        Target::One(ActorId(2)),
+        "party member 2 (slot 2) is lower than 4 now"
+    );
+    // A random pick among the enemies reaches all five, the extra ones included.
+    let main = Asm::act_on(|a| a.val(2, 0x20A0).op(op::RANDOM_BIT), ATTACK);
+    let state = battle_with(1, party_of(5), vec![scripted_foe(None, &main)]);
+    let mut seen = std::collections::BTreeSet::new();
+    for seed in 0..200 {
+        let got = choose(&state, 5, &mut Rng::new(seed)).unwrap();
+        let Target::One(who) = got.choice.unwrap().target else { panic!("one target") };
+        seen.insert(who.0);
+    }
+    assert_eq!(seen.into_iter().collect::<Vec<_>>(), vec![0, 1, 2, 3, 4]);
+    // The whole party at once is "everyone on the other side", extra members included.
+    let all = Asm::act_on(|a| a.val(2, 0x20A0), ATTACK);
+    let state = battle_with(1, party_of(5), vec![scripted_foe(None, &all)]);
+    assert_eq!(choose(&state, 5, &mut Rng::new(1)).unwrap().choice.unwrap().target, Target::AllEnemies);
 }
 
 #[test]

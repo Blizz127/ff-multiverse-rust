@@ -4,9 +4,15 @@
 //!
 //! A script addresses actors by slot: the player characters take slots 0..=2, slot 3 is the formation's
 //! own actor (not modelled here) and the enemies take slots 4..=9
-//! (<https://wiki.ffrtt.ru/index.php/FF7/Battle/Battle_Scenes/Battle_AI_Addresses>). A battle of the
-//! engine maps onto them only when it fits: at most [`MAX_PARTY`] party members and [`MAX_ENEMIES`]
-//! enemies ([`Slots::new`]); a bigger battle has no AI, its enemies keep the plain behaviour.
+//! (<https://wiki.ffrtt.ru/index.php/FF7/Battle/Battle_Scenes/Battle_AI_Addresses>). The original has three
+//! player characters; a battle of this engine (protocol v9: the canon companions, then every player's own
+//! character) has up to [`MAX_PARTY`] of them. **The first three party members take slots 0..=2 as in the
+//! game, the others take the unused slots from [`FIRST_EXTRA_PARTY_SLOT`] (10, 11, ...)**, which are free bits
+//! of the 16-bit masks, so that a script's "enemies", "players" and "everyone" masks, and a random pick
+//! among them, see the whole party. (The original never has more than three, so no script names slots 10 and
+//! up on purpose; a script that spells out the slots 0..=2 by number does not reach the extra ones.) A battle
+//! of the engine maps onto the slots only when it fits: at most [`MAX_PARTY`] party members and
+//! [`MAX_ENEMIES`] enemies ([`Slots::new`]); a bigger battle has no AI, its enemies keep the plain behaviour.
 //!
 //! # Masks (APPROXIMATIONs to verify against the original engine)
 //!
@@ -35,12 +41,18 @@ use crate::rules::{BattleState, Combatant, Row};
 use super::vm::{Image, Masks, World, FIRST_FIELD};
 use super::AiAttack;
 
-/// Most party members a battle can have for its enemies to run scripts.
-pub const MAX_PARTY: usize = 3;
+/// Most party members a battle can have for its enemies to run scripts: the protocol's largest party
+/// (`MAX_BATTLE_PARTY`, 8). The three the original has take slots 0..=2, the rest [`FIRST_EXTRA_PARTY_SLOT`]
+/// and up (bits 10 to 14 of a mask).
+pub const MAX_PARTY: usize = 8;
+/// Party members that have the slots the original gives its player characters (0..=2).
+pub const CLASSIC_PARTY: usize = 3;
 /// Most enemies a battle can have for them to run scripts.
 pub const MAX_ENEMIES: usize = 6;
 /// Slot of the first enemy.
 pub const FIRST_ENEMY_SLOT: u8 = 4;
+/// Slot of the fourth party member (the first the original has no slot for; the slots after it follow).
+pub const FIRST_EXTRA_PARTY_SLOT: u8 = 10;
 
 /// How the actors of a battle map to script slots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,10 +67,15 @@ impl Slots {
         (party <= MAX_PARTY && enemies <= MAX_ENEMIES).then_some(Self { party, enemies })
     }
 
-    /// The slot of the actor at position `idx` of the battle (party first, then enemies).
+    /// The slot of the actor at position `idx` of the battle (party first, then enemies): party members
+    /// 0..=2 are slots 0..=2, further ones are slots 10, 11, ..., and enemy `j` is slot `4 + j`.
     pub fn slot_of(&self, idx: usize) -> Option<u8> {
         if idx < self.party {
-            u8::try_from(idx).ok()
+            if idx < CLASSIC_PARTY {
+                u8::try_from(idx).ok()
+            } else {
+                u8::try_from(idx - CLASSIC_PARTY).ok().map(|j| FIRST_EXTRA_PARTY_SLOT + j)
+            }
         } else if idx - self.party < self.enemies {
             u8::try_from(idx - self.party).ok().map(|j| FIRST_ENEMY_SLOT + j)
         } else {
@@ -70,10 +87,13 @@ impl Slots {
     pub fn actor_of(&self, slot: u8) -> Option<usize> {
         let slot = usize::from(slot);
         let first = usize::from(FIRST_ENEMY_SLOT);
-        if slot < self.party {
+        let extra = usize::from(FIRST_EXTRA_PARTY_SLOT);
+        if slot < self.party.min(CLASSIC_PARTY) {
             Some(slot)
         } else if (first..first + self.enemies).contains(&slot) {
             Some(self.party + slot - first)
+        } else if self.party > CLASSIC_PARTY && (extra..extra + self.party - CLASSIC_PARTY).contains(&slot) {
+            Some(CLASSIC_PARTY + slot - extra)
         } else {
             None
         }
@@ -296,10 +316,40 @@ mod tests {
             assert_eq!(s.actor_of(gap), None, "slot {gap}");
         }
         assert!(Slots::new(3, 6).is_some());
-        assert!(Slots::new(4, 1).is_none());
         assert!(Slots::new(1, 7).is_none());
         // slot 3 (the formation's actor) is never a party member or an enemy
         assert_eq!(Slots::new(3, 6).unwrap().actor_of(3), None);
+    }
+
+    #[test]
+    fn party_members_after_the_third_take_the_slots_from_ten_up() {
+        // A v9 battle: two canon companions and three players, against two enemies.
+        let s = Slots::new(5, 2).unwrap();
+        let got: Vec<Option<u8>> = (0..8).map(|i| s.slot_of(i)).collect();
+        assert_eq!(got, vec![Some(0), Some(1), Some(2), Some(10), Some(11), Some(4), Some(5), None]);
+        for (idx, slot) in [(0usize, 0u8), (1, 1), (2, 2), (3, 10), (4, 11), (5, 4), (6, 5)] {
+            assert_eq!(s.actor_of(slot), Some(idx), "slot {slot}");
+        }
+        for gap in [3u8, 6, 7, 9, 12, 13, 14, 15, 200] {
+            assert_eq!(s.actor_of(gap), None, "slot {gap}");
+        }
+        // The largest party the protocol allows still fits (slots 0..=2 and 10..=14), with the most enemies.
+        let big = Slots::new(MAX_PARTY, MAX_ENEMIES).unwrap();
+        assert_eq!(big.slot_of(MAX_PARTY - 1), Some(14));
+        assert_eq!(big.actor_of(14), Some(MAX_PARTY - 1));
+        assert_eq!(big.actor_of(15), None);
+        assert!(Slots::new(MAX_PARTY + 1, 1).is_none());
+        // Slot and position are each other's inverse for every actor of every shape of battle.
+        for party in 0..=MAX_PARTY {
+            for enemies in 0..=MAX_ENEMIES {
+                let s = Slots::new(party, enemies).unwrap();
+                for idx in 0..party + enemies {
+                    let slot = s.slot_of(idx).expect("every actor has a slot");
+                    assert_eq!(s.actor_of(slot), Some(idx), "party {party}, enemies {enemies}, actor {idx}");
+                    assert!(slot < 16, "a slot is a bit of a 16-bit mask");
+                }
+            }
+        }
     }
 
     #[test]
@@ -394,6 +444,42 @@ mod tests {
     }
 
     #[test]
+    fn the_masks_of_a_five_fighter_party_hold_the_extra_members_at_bits_ten_and_eleven() {
+        let party: Vec<Combatant> = (0..5).map(|i| Combatant::new(format!("P{i}"), 5, 100 + i as u32)).collect();
+        let mut dead = Combatant::new("Gone", 5, 50);
+        dead.hp = 0;
+        let state = BattleState::with_config(
+            1,
+            party,
+            vec![Combatant::new("Foe", 5, 80), dead],
+            BattleConfig {
+                start: StartMode::Zero,
+                ..BattleConfig::default()
+            },
+        );
+        // The foe is position 5, slot 4.
+        let w = BattleWorld::new(&state, 5, &[]).unwrap();
+        assert_eq!(w.me(), 4);
+        let m = w.masks();
+        assert_eq!(m.enemies, 0b1100_0000_0111, "party members 0..=2 and 3, 4 at bits 10, 11");
+        assert_eq!(m.players, m.enemies);
+        assert_eq!(m.allies, 1 << 4, "the dead one is nobody's ally");
+        assert_eq!(m.all, m.enemies | 0b11_0000, "every actor, the dead included");
+        assert_eq!(m.active, m.enemies | 1 << 4);
+        // Their fields are read through the same slots.
+        assert_eq!(w.actor_field(10, 0x4160, 3), Some(103));
+        assert_eq!(w.actor_field(11, 0x4160, 3), Some(104));
+        assert_eq!(w.actor_field(10, 0x4040, 1), Some(10), "the actor index is the slot");
+        assert_eq!(w.actor_field(3, 0x4160, 3), None, "slot 3 is the formation's actor");
+        assert_eq!(w.actor_field(12, 0x4160, 3), None, "no sixth party member");
+        // From a party member's point of view the sides swap, extra members are allies.
+        let w = BattleWorld::new(&state, 4, &[]).unwrap();
+        assert_eq!(w.me(), 11);
+        assert_eq!(w.masks().allies, 0b1100_0000_0111);
+        assert_eq!(w.masks().enemies, 1 << 4);
+    }
+
+    #[test]
     fn fields_come_from_the_combatants() {
         let state = battle();
         let w = BattleWorld::new(&state, 2, &[]).unwrap();
@@ -425,10 +511,10 @@ mod tests {
 
     #[test]
     fn a_battle_too_big_for_the_slots_has_no_view() {
-        let party: Vec<Combatant> = (0..4).map(|i| Combatant::new(format!("P{i}"), 1, 10)).collect();
+        let party: Vec<Combatant> = (0..=MAX_PARTY).map(|i| Combatant::new(format!("P{i}"), 1, 10)).collect();
         let foes = vec![Combatant::new("F", 1, 10)];
         let state = BattleState::new(1, party, foes);
-        assert!(BattleWorld::new(&state, 4, &[]).is_none());
+        assert!(BattleWorld::new(&state, MAX_PARTY + 1, &[]).is_none());
         let party = vec![Combatant::new("P", 1, 10)];
         let foes: Vec<Combatant> = (0..7).map(|i| Combatant::new(format!("F{i}"), 1, 10)).collect();
         let state = BattleState::new(1, party, foes);

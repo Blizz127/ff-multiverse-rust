@@ -131,15 +131,25 @@ pub fn plain_foe() -> Combatant {
     foe
 }
 
+/// A party of `n` (at most 8) fighters with distinct HP, named after the canon characters as the combatants
+/// of a protocol v9 party are (whoever plays them): Cloud 300 HP, Barret 120, Tifa 500, Aerith 90, Red XIII
+/// 400, Yuffie 250, Cait Sith 350, Vincent 200.
+pub fn party_of(n: usize) -> Vec<Combatant> {
+    const NAMES: [&str; 8] = ["Cloud", "Barret", "Tifa", "Aerith", "Red XIII", "Yuffie", "Cait Sith", "Vincent"];
+    const HP: [u32; 8] = [300, 120, 500, 90, 400, 250, 350, 200];
+    (0..n.min(8))
+        .map(|i| {
+            let mut c = Combatant::new(NAMES[i], 7, HP[i]);
+            c.dex = 10;
+            c.defense = 20;
+            c
+        })
+        .collect()
+}
+
 /// Cloud (300 HP) and Barret (120 HP): the party of the invented battles.
 pub fn party() -> Vec<Combatant> {
-    let mut cloud = Combatant::new("Cloud", 7, 300);
-    cloud.dex = 10;
-    cloud.defense = 20;
-    let mut barret = Combatant::new("Barret", 7, 120);
-    barret.dex = 10;
-    barret.defense = 20;
-    vec![cloud, barret]
+    party_of(2)
 }
 
 /// `party` against `foes`, every gauge empty at the start.

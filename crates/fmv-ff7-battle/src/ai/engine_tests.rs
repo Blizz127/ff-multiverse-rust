@@ -1,6 +1,6 @@
 //! Scripted enemies inside a running battle: the engine hook, the fallback, determinism.
 
-use super::asm::{battle_of, plain_foe, scripted_foe, Asm, ATTACK, OTHER};
+use super::asm::{battle_of, battle_with, party_of, plain_foe, scripted_foe, Asm, ATTACK, OTHER};
 use super::script::op;
 use crate::rules::{ActionRef, ActorId, BattleEvent, BattleState};
 
@@ -198,4 +198,62 @@ fn a_defense_the_initialize_script_set_changes_the_damage_taken() {
     assert_eq!(state.actors()[FOE.0 as usize].defense, 200);
     let plain = battle_of(5, vec![scripted_foe(None, &weakest(ATTACK))]);
     assert_eq!(plain.actors()[FOE.0 as usize].defense, 0);
+}
+
+/// The ids of the party members the foe `foe` hurt or missed, in order.
+fn victims_of(log: &[BattleEvent], foe: ActorId) -> Vec<ActorId> {
+    log.iter()
+        .filter_map(|e| match e {
+            BattleEvent::Damage { actor, target, .. } | BattleEvent::Miss { actor, target } if *actor == foe => Some(*target),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_v9_roster_of_five_is_fought_by_the_scripts_with_every_member_in_reach() {
+    // Two canon companions and three players: five fighters, which used to leave every enemy without its
+    // script (the slots held three). Party member 3 is the weakest (90 HP): the script's lowest-HP pick,
+    // which reads the HP of slot 10, names her, and the engine hurts ActorId(3).
+    let foe = ActorId(5);
+    let mut state = battle_with(5, party_of(5), vec![scripted_foe(None, &weakest(ATTACK))]);
+    let ai = state.actors()[usize::from(foe.0)].ai.as_ref().unwrap();
+    assert_eq!(ai.memory().phase, super::vm::Phase::Ready, "the scripts were not given up at the start");
+    let log = all(&per_tick(&mut state, 900));
+    let victims = victims_of(&log, foe);
+    assert!(victims.len() >= 4, "the foe attacked several times: {victims:?}");
+    assert_eq!(victims[0], ActorId(3), "the weakest, party member 3 (slot 10): {victims:?}");
+    let fall = log.iter().position(|e| *e == BattleEvent::Death { actor: ActorId(3) }).expect("she fell");
+    assert!(
+        log[..fall].iter().filter(|e| matches!(e, BattleEvent::Damage { target, .. } if *target != ActorId(3))).count() == 0,
+        "nobody else was hurt while she lived"
+    );
+    // Once she has fallen the weakest is Barret (120 HP, party member 1).
+    let next = victims_of(&log[fall..], foe);
+    assert_eq!(next.first(), Some(&ActorId(1)), "{next:?}");
+
+    // The fifth member (slot 11) is aimed at the same way.
+    let mut party = party_of(5);
+    party[4].hp = 40;
+    let mut state = battle_with(5, party, vec![scripted_foe(None, &weakest(ATTACK))]);
+    let log = all(&per_tick(&mut state, 400));
+    assert_eq!(victims_of(&log, foe).first(), Some(&ActorId(4)), "party member 4 (slot 11) is the weakest now");
+}
+
+#[test]
+fn a_roster_of_four_or_more_acts_by_its_scripts_not_by_the_plain_fallback() {
+    // The scripted foe's every choice is the lowest-HP party member, which the plain behaviour (a random
+    // living member) would not repeat: with four or more fighters the scripted battle differs from the
+    // plain one and hurts the weakest first.
+    for fighters in [4usize, 6, 8] {
+        let foe = ActorId(fighters as u8);
+        let mut scripted = battle_with(3, party_of(fighters), vec![scripted_foe(None, &weakest(ATTACK))]);
+        let log = all(&per_tick(&mut scripted, 500));
+        let victims = victims_of(&log, foe);
+        assert!(!victims.is_empty(), "{fighters} fighters: the foe attacked");
+        let weakest = (0..fighters).min_by_key(|&i| party_of(fighters)[i].hp).unwrap();
+        assert_eq!(victims[0], ActorId(weakest as u8), "{fighters} fighters");
+        let mut plain = battle_with(3, party_of(fighters), vec![plain_foe()]);
+        assert_ne!(all(&per_tick(&mut plain, 500)), log, "{fighters} fighters: not the plain behaviour");
+    }
 }
