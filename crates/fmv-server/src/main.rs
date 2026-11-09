@@ -1,4 +1,4 @@
-//! `fmv-server`: authoritative FF Multiverse server (protocol v7).
+//! `fmv-server`: authoritative FF Multiverse server (its protocol is `fmv_protocol::PROTOCOL_VERSION`).
 //!
 //! Thin wrapper over the `fmv_server` library: parse flags, pick the game adapter, install
 //! signal handlers, run. Logs go to stderr; stdout carries exactly one line, the READY line.
@@ -98,13 +98,13 @@ DEBUG FLAGS (smoke-test aids; leave them off on a server real players use):
   --debug-encounters lets a player start a battle on request. --debug-limit-full (refused unless
   --debug-encounters is given too, and warned about at start-up) makes every member of every battle
   start with a FULL limit gauge instead of its account's own, so that a smoke run can force a Limit
-  command. It changes only the gauge a battle starts with (the `battle started ... limits=[..]` log
-  line shows it), and under it a limit gauge is never stored: the end-of-battle gauge save is skipped
-  (`limit not kept ... reason=debug-limit-full`), so every account keeps the gauge it really has, even
-  after a member spent its limit or was knocked out.";
+  command. It changes exactly two things: the gauge a battle starts with (the `battle started ...
+  limits=[..]` log line shows it), and the end-of-battle gauge save, which is skipped (`limit not
+  kept ... reason=debug-limit-full`): a limit gauge is never stored under it, so every account keeps
+  the gauge it really has, even after a member spent its limit or was knocked out.";
 
 #[derive(Parser, Debug)]
-#[command(name = "fmv-server", version, about = "Authoritative FF Multiverse server (protocol v7)", after_help = AFTER_HELP)]
+#[command(name = "fmv-server", version, about = "Authoritative FF Multiverse server", after_help = AFTER_HELP)]
 struct Cli {
     /// Address to listen on. Port 0 picks a free port (reported on the READY line).
     #[arg(long, value_name = "ADDR", default_value_t = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), DEFAULT_DEV_PORT))]
@@ -241,10 +241,9 @@ struct Cli {
     debug_formation: Option<u16>,
 
     /// DEBUG, needs --debug-encounters: every member of every battle starts with a FULL limit gauge
-    /// instead of its account's own, so that a smoke run can force a Limit command. Only the gauge a
-    /// battle STARTS with changes; the end-of-battle save is the normal one (a gauge is stored only when
-    /// it is not the one the battle started with: a full gauge nobody spends is never stored, a spent or
-    /// emptied one is stored as the gauge the member ended with). Logged as a warning at start-up.
+    /// instead of its account's own, so that a smoke run can force a Limit command, and no limit gauge
+    /// is ever stored under it (the end-of-battle gauge save is skipped), so a debug run can never
+    /// overwrite a real account's gauge. Logged as a warning at start-up.
     #[arg(long, requires = "debug_encounters")]
     debug_limit_full: bool,
 }
@@ -700,6 +699,10 @@ mod tests {
         let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
         for needle in ["--debug-limit-full", "FULL limit gauge", "refused unless --debug-encounters is given too", "never stored"] {
             assert!(flat.contains(needle), "--help must mention {needle:?}:\n{help}");
+        }
+        // And never the old rule (a spent gauge stored), which the flag no longer follows.
+        for stale in ["stored as the gauge the member ended with", "save is the normal one", "Only the gauge a battle STARTS with changes"] {
+            assert!(!flat.contains(stale), "--help must not describe the old save rule ({stale:?}):\n{help}");
         }
     }
 
