@@ -414,12 +414,21 @@ pub struct Args {
     #[arg(long, value_name = "AREA[,AREA...]", value_delimiter = ',', value_parser = parse_area_key, requires = "headless")]
     pub travel: Vec<String>,
 
+    /// With --travel: follow the others. This bot crosses an exit only when no other player is in view,
+    /// so it goes after whoever it travels with has left the area (it does not wait to see anybody first).
+    /// A party whose way on depends on its LEADER's story (the elevator of FF7's first reactor leads where the
+    /// leader's story says) needs its members to cross after the leader, not alongside it. Together with
+    /// --story-advance on the leader this is how a smoke walks a whole party down a story chain.
+    #[arg(long, requires = "travel")]
+    pub travel_follow: bool,
+
     // ---- story (phasing): one contiguous block ----
     /// Advance this player's story as a bot (headless only): walk to the story point of the area it
     /// stands in that would advance THIS account's story (the same points and rule the server uses; in
-    /// FF7's first field `md1stin` it is walkmesh triangle 12), stay there until the server has moved the
-    /// story, then stand still. The server decides: the bot only goes where the data says the story
-    /// happens. With --party-invite-first-peer it first waits (at most 15 s) until its invite is out.
+    /// FF7's first field `md1stin` it is walkmesh triangle 12, in `nmkin_1` a line to walk across), stay
+    /// there until the server has moved the story, then stand still (or, with --travel, go on to the next
+    /// exit). The server decides: the bot only goes where the data says the story happens. With
+    /// --party-invite-first-peer it first waits (at most 15 s) until its invite is out.
     /// Never crosses an exit. Run the server with --no-random-encounters (or give the bot --battle-auto):
     /// a bot caught in a battle without it stands frozen until the run ends.
     #[arg(long, requires = "headless")]
@@ -1011,6 +1020,10 @@ mod tests {
         assert_eq!(a.travel, ["md1_1"]);
         let a = Args::try_parse_from(["fmv-client", "--name", "x", "--headless"]).unwrap();
         assert!(a.travel.is_empty(), "no route unless asked for");
+        // following is a way of travelling: it needs a route
+        assert!(Args::try_parse_from(["fmv-client", "--name", "x", "--headless", "--travel-follow"]).is_err());
+        let a = Args::try_parse_from(["fmv-client", "--name", "x", "--headless", "--travel", "md1_1", "--travel-follow"]).unwrap();
+        assert!(a.travel_follow && !Args::try_parse_from(["fmv-client", "--name", "x", "--headless", "--travel", "md1_1"]).unwrap().travel_follow);
         // Keys are what adapters use: a bad one is refused before anything runs.
         for bad in ["", "md1 1", "../x", "a,,b", "x".repeat(33).as_str(), "caf\u{e9}", "line\nbreak"] {
             assert!(

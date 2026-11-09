@@ -110,6 +110,7 @@ pub mod tex;
 
 mod area_content;
 mod encounter;
+mod exit_gate;
 mod util;
 mod walk;
 
@@ -122,10 +123,10 @@ pub use area_content::{field_direction_to_facing, MAX_NPCS_PER_AREA, MAX_NPC_LAB
 pub use encounter::decode_encounter_section;
 
 pub use area::{
-    adapter_version, area_fingerprint, Ff7Adapter, Ff7FieldArea, SkippedEntry, FF7_FIELD_FRAMES_PER_SECOND,
+    adapter_version, area_fingerprint, is_reviewed_field, Ff7Adapter, Ff7FieldArea, SkippedEntry, FF7_FIELD_FRAMES_PER_SECOND,
     FF7_FIELD_MAX_SPEED_PLACEHOLDER, FF7_FIELD_RUN_SPEED_BASE, FF7_FIELD_RUN_UNITS_PER_FRAME,
     FF7_FIELD_WALK_SPEED_BASE, FF7_FIELD_WALK_UNITS_PER_FRAME, FF7_RUN_WALK_SPEED_RATIO, FINGERPRINT_RULE_VERSION,
-    MAX_FIELD_BYTES, MAX_INDEX_READ_BYTES,
+    MAX_FIELD_BYTES, MAX_INDEX_READ_BYTES, REVIEWED_FIELDS, UNREVIEWED_FIELD,
 };
 pub use walk::LinkReport;
 

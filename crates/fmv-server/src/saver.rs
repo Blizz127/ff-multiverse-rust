@@ -713,7 +713,7 @@ mod tests {
     }
 
     fn moment(m: u16) -> Vec<u8> {
-        fmv_ff7::story::StoryState { moment: m }.encode()
+        fmv_ff7::story::StoryState::at(m).encode()
     }
 
     fn stored_story(store: &Store, account: AccountId) -> Vec<u8> {
@@ -775,6 +775,60 @@ mod tests {
         assert_eq!((older.blob, older.updated_at), (moment(6), NOW));
         let newer = persist_story(&store, GameId::Ff7, rules.as_ref(), &StoryJob { account, progress: moment(8) }, NOW + 70).unwrap();
         assert_eq!((newer.blob, newer.updated_at), (moment(8), NOW + 70));
+    }
+
+    /// **The migration of the story blob (version 1 to version 2).** A progression record in exactly the shape a v9 build
+    /// wrote (its five fields, the blob `[1, lo, hi]`) loads as it always did (the moment, no variable); the elevator's ride
+    /// adds the lift bit to it, as a version 2 blob in the very same record shape; a late save from before the ride (an older
+    /// moment, version 1) changes nothing, and what is stored reads back as the state the ride made.
+    #[test]
+    fn a_v9_story_record_loads_as_before_gains_the_lift_bit_and_a_late_older_save_cannot_take_it_back() {
+        use fmv_ff7::story::StoryState;
+        use fmv_ff7::script::dialogue::StoryVars;
+        let (dir, store, account) = store();
+        let adapter = adapter();
+        let record = dir.path().join("state").join("progression").join(account.0.to_string()).join("Ff7.json");
+        std::fs::create_dir_all(record.parent().unwrap()).unwrap();
+        let keys = |path: &std::path::Path| -> (Vec<String>, String) {
+            let v: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            let mut names: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+            names.sort();
+            (names, v["blob"].as_str().unwrap().to_string())
+        };
+
+        // What a v9 build wrote for an account at moment 6, by its field names.
+        let v9 = serde_json::json!({ "schema_version": fmv_persist::SCHEMA_VERSION, "account_id": account.0, "game": "Ff7", "blob": "010600", "updated_at": 7 });
+        std::fs::write(&record, serde_json::to_vec_pretty(&v9).unwrap()).unwrap();
+        let loaded = store.get_progression(account, GameId::Ff7).unwrap();
+        assert_eq!((loaded.blob.clone(), loaded.updated_at), (vec![1, 6, 0], 7), "the record is read exactly as before");
+        let story = StoryState::decode(&loaded.blob).expect("a version 1 blob is read");
+        assert_eq!((story.moment, story.vars().count()), (6, 0), "no progress reset: the moment is what was stored, and no variable");
+        assert_eq!(story.byte(1, 225), 0, "the dialogue hook reads the lift as up");
+        let shape = keys(&record).0;
+        assert_eq!(shape, ["account_id", "blob", "game", "schema_version", "updated_at"]);
+
+        // The ride (moment 6 on to 12, the lift bit on) is saved over it.
+        let mut rode = StoryState::at(12);
+        assert!(rode.set_bit(1, 225, 0, true));
+        let saved = persist_story(&store, GameId::Ff7, adapter.as_ref(), &StoryJob { account, progress: rode.encode() }, NOW + 10).unwrap();
+        assert_eq!((saved.blob.clone(), saved.updated_at), (vec![2, 12, 0, 1, 1, 225, 1], NOW + 10));
+        assert_eq!(keys(&record), (shape.clone(), "020c000101e101".to_string()), "the same record shape, a longer blob");
+        assert_eq!(StoryState::decode(&store.get_progression(account, GameId::Ff7).unwrap().blob), Some(rode.clone()), "it reads back as the state the ride made");
+
+        // A late save from before the ride, in either version, takes nothing back and does not even rewrite the record.
+        for late in [StoryState::at(7).encode(), StoryState::at(12).encode(), Vec::new()] {
+            let again = persist_story(&store, GameId::Ff7, adapter.as_ref(), &StoryJob { account, progress: late }, NOW + 99).unwrap();
+            assert_eq!((again.blob, again.updated_at), (vec![2, 12, 0, 1, 1, 225, 1], NOW + 10));
+        }
+        // ...while a further moment from a client that never heard of the variable keeps the bit it was never told of.
+        let further = persist_story(&store, GameId::Ff7, adapter.as_ref(), &StoryJob { account, progress: StoryState::at(13).encode() }, NOW + 20).unwrap();
+        let mut expected = StoryState::at(13);
+        expected.set_bit(1, 225, 0, true);
+        assert_eq!((further.blob, further.updated_at), (expected.encode(), NOW + 20));
+        // A v9-shaped record of a new account (an empty blob) is a new account to version 2 as well.
+        let (_dir2, store2, fresh) = self::store();
+        let created = store2.get_progression(fresh, GameId::Ff7).unwrap();
+        assert!(created.blob.is_empty() && StoryState::decode(&created.blob) == Some(StoryState::new_game()));
     }
 
     #[test]

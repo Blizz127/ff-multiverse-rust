@@ -57,8 +57,17 @@ impl TalkBot {
 
     /// Talk to every wanted character that `npcs` (the area `area` announces) now contains and that has not
     /// been talked to yet; the lines to print. `moment` is the player's story counter (`None`: the
-    /// progression is not FF7's: the conversation is read as at the start of a new game).
+    /// progression is not FF7's: the conversation is read as at the start of a new game). (The tests' form of
+    /// [`TalkBot::step_with`], which the headless loop calls with the whole story state.)
+    #[cfg(test)]
     pub fn step(&mut self, area: &str, npcs: &[NpcView], moment: Option<u16>) -> Vec<String> {
+        self.step_with(area, npcs, moment.map(StoryState::at))
+    }
+
+    /// [`TalkBot::step`] with the player's whole story state: the moment and the variables beyond it that the story
+    /// model carries (what the elevator's ride set), which a conversation's branches read through the same hook.
+    pub fn step_with(&mut self, area: &str, npcs: &[NpcView], story: Option<StoryState>) -> Vec<String> {
+        let moment = story.as_ref().map(|s| s.moment);
         let mut lines = Vec::new();
         for (index, name) in self.wanted.iter().enumerate() {
             if self.done.get(index).copied().unwrap_or(true) {
@@ -68,7 +77,7 @@ impl TalkBot {
             if let Some(done) = self.done.get_mut(index) {
                 *done = true;
             }
-            self.conversations.set_story(story_of(moment));
+            self.conversations.set_story(story_of(story.clone()));
             lines.extend(converse(self.conversations.as_mut(), area, npc, moment));
         }
         lines
@@ -85,10 +94,10 @@ impl TalkBot {
     }
 }
 
-/// The story hook for a conversation: the player's own moment, or a new game's.
-fn story_of(moment: Option<u16>) -> StoryFactory {
-    let state = moment.map_or(StoryState::new_game(), |moment| StoryState { moment });
-    Box::new(move || Box::new(state))
+/// The story hook for a conversation: the player's own story state, or a new game's.
+fn story_of(state: Option<StoryState>) -> StoryFactory {
+    let state = state.unwrap_or_else(StoryState::new_game);
+    Box::new(move || Box::new(state.clone()))
 }
 
 /// What the story column of a line says.
@@ -289,9 +298,26 @@ mod tests {
         let mut talk = bot(vec![("gu0", vec![say("x")])], &["gu0"]);
         talk.step("md1stin", &[npc("gu0")], Some(6));
         // The factory is the player's moment, not the start of a new game.
-        let vars = (story_of(Some(6)))();
+        let vars = (story_of(Some(StoryState::at(6))))();
         assert_eq!(vars.byte(2, 0), 6);
         let vars = (story_of(None))();
         assert_eq!(vars.byte(2, 0), 1);
+    }
+
+    #[test]
+    fn what_the_story_set_beyond_the_moment_reaches_a_conversation_too() {
+        // After the elevator's ride the lift bit is on in the account's story, and a conversation's branches read it.
+        let mut ridden = StoryState::at(12);
+        assert!(ridden.set_bit(1, 225, 0, true));
+        let vars = (story_of(Some(ridden.clone())))();
+        assert_eq!((vars.byte(2, 0), vars.byte(1, 225), vars.byte(1, 224)), (12, 1, 0));
+        // the walker asks the factory for a fresh state every time, so one conversation cannot change the next
+        assert_eq!((story_of(Some(ridden))().byte(1, 225), story_of(None)().byte(1, 225)), (1, 0));
+        // a bot given the whole state talks as at the moment in it, and prints that moment
+        let mut talk = bot(vec![("gu0", vec![say("x")])], &["gu0"]);
+        let mut state = StoryState::at(12);
+        state.set_bit(1, 225, 0, true);
+        let lines = talk.step_with("md1stin", &[npc("gu0")], Some(state));
+        assert!(lines.iter().all(|l| l.contains("story=12")), "{lines:?}");
     }
 }

@@ -48,7 +48,7 @@ async fn until<T>(stream: &mut TcpStream, what: &str, mut pick: impl FnMut(&Serv
 /// leads where `exit` leads. A step that would cross the line of another exit is not taken (it
 /// would take the walker elsewhere). The last position of the route is the crossing step.
 ///
-/// The client's bots plan the same way (`nav::plan_path` in fmv-client, which also pulls the path
+/// The client's bots plan the same way (`nav::plan_path_avoiding` in fmv-client, which also pulls the path
 /// straight); this is the small stand-in a server test can have without any client code. A walker
 /// that steers straight at the exit and slides along what blocks it gets stuck in concave places
 /// and makes chords the server refuses, which is why the real bots do not walk like that.

@@ -7,7 +7,7 @@
 //! on game variables (a conditional one, or one whose operands name variables) is left out. The
 //! script VM and the story variables are what a fuller version would need.
 //!
-//! # Exits: line gateways only
+//! # Exits: line gateways
 //!
 //! The twelve gateway slots of the trigger section ([`crate::field::Triggers::gateways`]) are
 //! joined with the archive's `maplist` entry ([`crate::script::resolve_gateways`]): a used slot
@@ -26,10 +26,10 @@
 //! without building the whole index (which reads every entry) is the index's work budget and
 //! entries that failed to read.
 //!
-//! **Not exits:** `MAPJUMP` opcodes and line triggers are decided by the field's scripts (which
-//! `REQ` chain turns a crossing into a jump depends on story variables), so they need the script
-//! VM and are out of scope here. 1 036 of the owned data's gateways are line gateways and 1 801
-//! literal `MAPJUMP`s exist besides; a field whose only way out is a `MAPJUMP` has no exits.
+//! **Not here:** the exits that scripts decide (the `MAPJUMP`s of a line's walk-on trigger script, with the
+//! conditions on the story they sit under) are built by `crate::exit_gate` from
+//! [`crate::script::FieldScript::script_exits`] and follow the gateways in `exits()`; this module is the data
+//! gateways only. 1 036 of the owned data's gateways are line gateways and 1 801 literal `MAPJUMP`s exist besides.
 //!
 //! **Measured on the owned FF7 Steam Edition (en), 2026-11-08** (`tests/area_real.rs`): of the 1 036
 //! used gateways all 1 036 ids are in the maplist, 978 name an area the archive offers (the other 58

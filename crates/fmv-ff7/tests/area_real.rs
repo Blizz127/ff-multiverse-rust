@@ -13,7 +13,7 @@
 //! files are only ever opened read-only, and what the tests print are counts, field names, entity
 //! names, model stems and numbers: no game bytes and no dialog text.
 
-use fmv_adapter_api::{AreaRuntime, GameAdapter, MoveResult};
+use fmv_adapter_api::{AreaRuntime, ExitKind, GameAdapter, MoveResult};
 use fmv_core::{EditionProvenance, GameId, Platform, Pos};
 use fmv_ff7::background::Projection;
 use fmv_ff7::field::{FieldFile, Walkmesh};
@@ -482,7 +482,8 @@ fn exits_of_every_field_arrive_on_the_hinted_target_triangle() {
             }
             expected.push((spelling.clone(), g.clone()));
         }
-        let exits = area.exits();
+        // (the gateways: the exits the field's scripts decide follow them and are `tests/chain_real.rs`'s)
+        let exits: Vec<_> = area.exits().into_iter().filter(|e| e.kind == ExitKind::Gateway).collect();
         assert_eq!(exits.len(), expected.len(), "{key}: exits");
         exits_total += exits.len();
         max_exits = max_exits.max(exits.len());
