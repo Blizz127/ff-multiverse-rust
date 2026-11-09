@@ -30,8 +30,8 @@
 //! [`BattleModelSource::enemy`] with `load_enemy(who.enemy_id?)` as a [`BattleActorModel::Battle`] (the
 //! loader's `model` and `animations`, slot 0 being the idle loop; scale 1, native `y` down, facing
 //! `-z`, as the archive's models are), [`BattleModelSource::party_member`] with `load_character(..)`
-//! the same way (the character the player's look names, else the one the engine fights as, else
-//! Cloud: see [`battle_character`]), both with weapon 0 as an [`Attachment`] whose clips are the
+//! the same way (the character whose combat slot the member fights in, else Cloud: see
+//! [`battle_character`]), both with weapon 0 as an [`Attachment`] whose clips are the
 //! weapon's tracks (track `i` goes with clip `i` of its owner; enemies carry weapons too: the MP's
 //! baton), and [`BattleModelSource::location`] with `load_location(..)`. Each distinct model is read
 //! once, however many actors share it.
@@ -39,6 +39,17 @@
 //! [`Rigs`] turns a model into an [`ActorRig`] (its [`AvatarAsset`] for the GPU, its idle clip, its
 //! size) once and shares it between actors that look alike, so each distinct model is uploaded
 //! once however many stand in the battle, and never per frame.
+//!
+//! # Whose model a party member gets
+//!
+//! **Battle placeholder: the slot's own battle model.** A player's character has one combat SLOT (protocol
+//! v8: `BattleMember::character`, a canon party member's id) and the engine fights it with that character's
+//! combat template. The model drawn for it is that character's battle model, as a placeholder for the slot: a
+//! player who holds Barret's slot is drawn as Barret in battle (with the player's own name over its head, the
+//! roster's `BattleMember::name`, see [`crate::battle::BattleClient`]). How the player looks on the field (its
+//! binding: a generic placeholder body, or the canon look of an account that predates v8) plays no part here:
+//! the field look and the slot are two different things, and in battle the model is the slot's, never the
+//! field look's ([`party_appearance`], [`battle_character`]).
 //!
 //! # Which clip plays what
 //!
@@ -219,14 +230,13 @@ impl BattleActorModel {
     }
 }
 
-/// Who a party member is, for choosing its model.
+/// Who a party member is, for choosing its model. Only its combat SLOT counts (see the module docs, "Whose
+/// model a party member gets"): how its player looks on the field is not asked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartyLook {
     pub actor: ActorId,
-    /// The FF7 character id the engine fights as.
+    /// The combat slot: the FF7 character id the engine fights as (`BattleMember::character`).
     pub character: u8,
-    /// The look the player's avatar names (`appearance_ref`), if the client knows it.
-    pub look: Option<String>,
     /// Our own character.
     pub mine: bool,
 }
@@ -272,13 +282,10 @@ fn character_appearance(character: u8) -> Option<&'static str> {
     })
 }
 
-/// The appearance a party member's stand-in model has: the player's own look when the table knows
-/// it, else the character the engine fights as, else the default (Cloud).
-pub fn party_appearance(look: Option<&str>, character: u8) -> &'static str {
-    let (model, stand_in) = AvatarLibrary::resolve(look);
-    if look.is_some() && !stand_in {
-        return model.appearance_ref;
-    }
+/// The appearance a party member's stand-in model has: the field model of the character in whose combat slot
+/// it fights, else the default (Cloud) for a slot with no field model (Cait Sith's, or an id that is nobody's).
+/// A battle placeholder: the slot's own model, never the player's field look.
+pub fn party_appearance(character: u8) -> &'static str {
     character_appearance(character).unwrap_or(fmv_ff7::playable::DEFAULT_APPEARANCE)
 }
 
@@ -297,7 +304,7 @@ pub struct StandInModels;
 
 impl BattleModelSource for StandInModels {
     fn party_member(&mut self, who: &PartyLook) -> BattleActorModel {
-        BattleActorModel::Field(Some(party_appearance(who.look.as_deref(), who.character).to_string()))
+        BattleActorModel::Field(Some(party_appearance(who.character).to_string()))
     }
 
     fn enemy(&mut self, who: &EnemyLook) -> BattleActorModel {
@@ -377,18 +384,11 @@ impl EnemyBook {
 
 }
 
-/// The playable character whose battle model a party member gets: the player's own look when the
-/// table of playable characters knows it, else the character the engine fights as (FF7's ids:
-/// Cloud 0, Barret 1, Tifa 2, Aerith 3, Red XIII 4, Yuffie 5, Cait Sith 6, Vincent 7, Cid 8), else
-/// Cloud. The same order as [`party_appearance`] (a look is only taken from the table, never as
-/// free text), except that Cait Sith, who has no field model, has a battle model.
-pub fn battle_character(look: Option<&str>, character: u8) -> BattleCharacter {
-    let (known, stand_in) = AvatarLibrary::resolve(look);
-    if look.is_some() && !stand_in {
-        if let Some(chosen) = BattleCharacter::from_appearance_ref(known.appearance_ref) {
-            return chosen;
-        }
-    }
+/// The playable character whose battle model a party member gets: the one in whose combat slot it fights
+/// (FF7's ids: Cloud 0, Barret 1, Tifa 2, Aerith 3, Red XIII 4, Yuffie 5, Cait Sith 6, Vincent 7, Cid 8),
+/// else Cloud for an id that is nobody's. A battle placeholder: the slot's own battle model, whatever the
+/// player looks like on the field. Cait Sith, who has no field model, has a battle model.
+pub fn battle_character(character: u8) -> BattleCharacter {
     match character {
         0 => BattleCharacter::Cloud,
         1 => BattleCharacter::Barret,
@@ -464,7 +464,7 @@ impl ArchiveModels {
 
 impl BattleModelSource for ArchiveModels {
     fn party_member(&mut self, who: &PartyLook) -> BattleActorModel {
-        let which = battle_character(who.look.as_deref(), who.character);
+        let which = battle_character(who.character);
         match self.made(which.prefix().to_string(), ModelRole::Character, || which.display_name().to_string(), |m| m.load_character(which)) {
             Some(data) => BattleActorModel::Battle(data),
             None => StandInModels.party_member(who),
@@ -935,27 +935,24 @@ mod tests {
     }
 
     #[test]
-    fn a_party_member_looks_like_the_players_look_then_the_character_then_cloud() {
-        // The player's own look wins when the table knows it.
-        assert_eq!(party_appearance(Some("ff7/tifa"), 0), "ff7/tifa");
-        assert_eq!(party_appearance(Some("  FF7/Barret "), 2), "ff7/barret", "spelling does not matter to the table");
-        // Otherwise the character the engine fights as.
-        assert_eq!(party_appearance(None, 2), "ff7/tifa");
-        assert_eq!(party_appearance(Some("ff7/nobody"), 1), "ff7/barret");
-        assert_eq!(party_appearance(Some("<script>"), 7), "ff7/vincent");
+    fn a_party_member_looks_like_the_character_of_its_slot_then_cloud() {
+        // Battle placeholder: the slot's own model, one per slot.
+        assert_eq!(party_appearance(2), "ff7/tifa");
+        assert_eq!(party_appearance(1), "ff7/barret");
+        assert_eq!(party_appearance(7), "ff7/vincent");
         for (character, want) in [(0u8, "ff7/cloud"), (3, "ff7/aerith"), (4, "ff7/red_xiii"), (5, "ff7/yuffie"), (8, "ff7/cid")] {
-            assert_eq!(party_appearance(None, character), want);
+            assert_eq!(party_appearance(character), want);
         }
-        // Cait Sith has no field model, and an unknown character no look: Cloud.
-        assert_eq!(party_appearance(None, 6), "ff7/cloud");
-        assert_eq!(party_appearance(None, 200), "ff7/cloud");
-        // Every answer is a real table entry.
+        // Cait Sith has no field model, and an unknown slot no character: Cloud.
+        assert_eq!(party_appearance(6), "ff7/cloud");
+        assert_eq!(party_appearance(200), "ff7/cloud");
+        // Every answer is a real canon table entry (never a placeholder body: a body is how a player looks in the field).
         for character in 0..=255u8 {
-            assert!(fmv_ff7::playable::resolve_appearance(party_appearance(None, character)).is_some());
+            assert!(fmv_ff7::playable::resolve_appearance(party_appearance(character)).is_some());
         }
-        // The stand-in source says Field with that look for the party and a box for an enemy.
+        // The stand-in source says Field with that model for the party and a box for an enemy.
         let mut source = StandInModels;
-        let who = PartyLook { actor: ActorId(0), character: 2, look: None, mine: true };
+        let who = PartyLook { actor: ActorId(0), character: 2, mine: true };
         assert!(matches!(source.party_member(&who), BattleActorModel::Field(Some(ref r)) if r == "ff7/tifa"));
         assert!(matches!(source.enemy(&enemy(Some(4), "Guard", 120)), BattleActorModel::Box(_)));
     }

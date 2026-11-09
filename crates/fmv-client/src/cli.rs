@@ -5,8 +5,9 @@ use crate::battle::ScriptStep;
 use crate::ff7::{Ff7Labels, Ff7Source};
 use clap::{Parser, ValueEnum};
 use fmv_core::AvatarAppearance;
+use fmv_ff7_battle::kernel::CharacterId;
 use fmv_library::LibraryError;
-use fmv_protocol::DEFAULT_DEV_PORT;
+use fmv_protocol::{NewCharacter, DEFAULT_DEV_PORT};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -44,7 +45,20 @@ ACCOUNTS:
   --register creates a NEW account with --name and replaces the token saved for that name: use it
   when the server's accounts were reset (\"invalid or unknown token\"). The token is a password: it
   is never printed, except in the error shown when it could not be saved (so it is not lost).
-  After registering, the server decides your name, tint and look from your stored profile.
+  Your account has ONE original character that travels across games: a name, a colour and a body
+  (its identity), how the game draws it and, in FF7, the combat slot of a canon party member other
+  than Cloud that it fights with (Barret's combat moves and level curve, say; Barret himself stays
+  in the story as a non-player character and no dialogue is ever renamed). A registration asks for
+  it with --tint, --body and --slot; after that the server decides from the character it stores and
+  tells you what it holds (the `character:` line on stderr, see HEADLESS OUTPUT). In FF7 a new
+  character's field model is a generic placeholder body tinted with your colour: NOT the model of
+  any party member, whatever your slot. The slot is chosen once and stays fixed, and a slot the
+  game does not offer to a new character (Cloud's, 0, or an id that is nobody's) is refused by the
+  server: the run exits with code 1 and the server's sentence, and no account is made.
+  --body ID names one of the game's placeholder bodies (1 to 32 letters, digits, `_` and `-`; the
+  server uses its default body for an id it does not know); --slot is a name (barret, tifa, aerith,
+  redxiii, yuffie, caitsith, vincent or cid; case and spaces do not matter) or an id from 0 to 255.
+  Left out, the server's defaults apply (the default body, and Barret's slot).
 
 CONTENT:
   --game fixture (default) uses the synthetic FIXTURE area, NOT FF7.
@@ -66,11 +80,35 @@ HEADLESS OUTPUT:
   area_changes=<n> is how many times the server moved this client on to another area. level=<n> and
   exp=<n> are the level and total experience of this player's character as the server last reported
   them (0 and 0 when it reports none: a server without battle data, such as the FIXTURE one, has no
-  characters); every report is also logged on stderr as a `progress:` line. items=<n> is how many
+  characters); every report is also logged on stderr as a `progress: name=<enc> slot=<enc> level=<n>
+  exp=<n> exp_to_next=<n> gil=<n> ap=<n> leveled_up=<bool>` line (the player's own name and the name of
+  the combat slot it fights in). items=<n> is how many
   items this player's account carries as the server last reported it (the counts of all stacks
   added up, 0 when it reports none); every report is also logged on stderr as a
   `battle: inventory: stacks=<n> total=<n> items=<item>:<count>,...` line (item ids, never names).
   New keys are only ever added at the end of the line.
+  Who the players are is said on stderr, one `key=value` line each, never on stdout. Every value that
+  came from the network is percent-encoded like name= above (so `ff7/body/sturdy` prints as
+  ff7%2Fbody%2Fsturdy); `-` stands for none.
+  `character: name=<enc> tint=rrggbb body=<enc|-> binding=<enc|-> slot=<n|-> slot_name=<enc|->
+  migrated=<bool>` once, after joining: what the server holds of this player's own character: its name,
+  colour, the body it was created with, how the game draws it (the binding, which is what other
+  players see on the entity), the combat slot it fights with (FF7: the canon character's id) and that
+  slot's own name, and whether it was made from an account that predates player characters.
+  `headless: peer entity=<n> name=<enc> tint=rrggbb binding=<enc|-> area=<AreaId>` when another player
+  first appears in the area and again whenever its colour or binding changes (never every frame): each
+  player's binding, which is the placeholder body, never the slot's canon character.
+  `headless: <n> NPC(s) in <AreaId>: <names>` and, for each of them, `headless: npc area=<AreaId>
+  id=<n> name=<enc> model=<enc>` whenever the area's non-player characters change: the canon characters
+  of a field stay in it whoever holds their slot.
+  --talk NAME[,NAME...] talks to those characters once each, as soon as the area announces them, through
+  the window's own conversation code (their own talk scripts in your copy of the field, read with the story
+  this player has reached): `talk: npc=<enc> story=<moment|-> window=<n> origin=<canon|added> [ask=<first>-<last>]
+  text=<enc>` for each message window (a question is answered with the cursor's starting line),
+  `talk: npc=<enc> story=<moment|-> ended=<Finished|Budget|Broken|MapJump|Battle|MiniGame|GameOver|Limit>
+  windows=<n>` when it is over, `talk: npc=<enc> story=<moment|-> nothing to say` for a character without a
+  talk script, and `talk: npc=<enc> was never in the area` at the end for one the area never announced. The
+  text is the game's own, never renamed for the player.
   A server that goes silent for 10 s is treated as gone (exit code 1, the summary is still printed).
   Party events and refusals are logged on stderr, one `party:` line each.
   --party-invite-first-peer invites the visible player with the lowest entity id (a refused invite
@@ -105,21 +143,30 @@ BATTLES:
   client replays the battle from YOUR OWN scene.bin and kernel.bin (only ids and seeds are sent)
   and shouts `BATTLE DIVERGENCE` if its replay ever disagrees with the server. Without battle data
   in your library you can only wait the battle out.
-  Your character is your own: the server keeps its level, experience, AP and gil per account (the
-  character is the one your look names, Cloud unless you chose another), fights you as it at that
-  level, pays it when a battle is won and tells you (and when you join) what it has now; the window
-  shows it under the area name, for instance `Cloud Lv 7  EXP 626/949  Gil 20`.
+  Your character is your own: the server keeps its level, experience, AP and gil per account, fights
+  you with the combat template of your slot (the canon party member you chose when you created it)
+  at that level, pays it when a battle is won and tells you (and when you join) what it has now; the
+  window shows it under the area name, for instance `Wedge (Barret)  Lv 7  EXP 626/949  Gil 20`: your
+  own name, then your slot's. Every party member is called by its player's own name in the battle
+  windows and the log (never by the canon character's whose slot it holds), and its model in battle is
+  that slot's own battle model, a stand-in for it: how you look on the field plays no part. Each battle
+  starts with one `battle: roster actor=<i> name=<enc> slot=<n> slot_name=<enc> level=<n>` line per
+  member on stderr.
 
 CHARACTER MENU:
   A window started without --name opens on a character menu instead of logging in at once; with
   --name the menu is skipped and the run behaves as before, and --headless never shows it. The
-  menu lists the characters saved for the server (name, colour, look). Up/Down choose, Enter
+  menu lists the characters saved for the server (name, colour, body and `slot: <name>`). Up/Down choose, Enter
   plays, N creates a new one, Del forgets a saved login on THIS computer (it asks first; the
   character stays on the server, but you can only log in as it again if you still have its
-  token), Esc quits. The create screen takes a name (up to 24 characters), a look (FF7: Cloud,
-  Tifa, Barret or Aerith) and a tint (a palette plus red, green and blue sliders); Tab or Up/Down
-  move between the fields and Enter registers. When the server refuses (name taken, registration
-  closed, rate limited) the reason is shown on screen and you can try again.
+  token), Esc quits. The create screen takes a name (up to 24 characters), a body (FF7: a generic
+  placeholder model: how you look on the field, nothing else), a colour (a palette plus red, green
+  and blue sliders: the model is tinted with it) and a combat slot (FF7: Barret, Tifa, Aerith,
+  Red XIII, Yuffie, Cait Sith, Vincent or Cid, never Cloud; Barret is the default): who you fight
+  as, its combat moves and level curve, fixed once created and not how you look. A line under each
+  of the two rows says so. Tab or Up/Down move between the fields, Left/Right/Space change a
+  choice and Enter registers. When the server refuses (name taken, registration closed, rate
+  limited) the reason is shown on screen and you can try again.
 
 CONTROLLER:
   A game controller works in the character menu and in the game (through the system's gamepad
@@ -210,9 +257,25 @@ pub struct Args {
     pub state_dir: Option<PathBuf>,
 
     /// Player tint as rrggbb hex (default: derived from the name). Only used when registering:
-    /// after that the server takes it from the stored profile.
+    /// after that the server takes it from the stored character. In FF7 your character's field
+    /// model is a generic placeholder body tinted with this colour.
     #[arg(long, value_name = "RRGGBB", value_parser = parse_tint)]
     pub tint: Option<[u8; 3]>,
+
+    /// The body of a NEW character: the id of one of the game's generic placeholder bodies (1 to 32
+    /// letters, digits, `_` and `-`; the server decides which exist and uses its default body for one
+    /// it does not know). It is how you look on the field and nothing else: it says nothing about
+    /// who you fight as. Only used when registering.
+    #[arg(long, value_name = "ID", value_parser = parse_body)]
+    pub body: Option<String>,
+
+    /// The combat slot of a NEW character: the canon FF7 party member whose combat moves and level
+    /// curve it fights with, by name (barret, tifa, aerith, redxiii, yuffie, caitsith, vincent, cid;
+    /// case and spaces do not matter, `aeris` and `red13` work too) or by id (0 to 255: Barret 1 ...
+    /// Cid 8). Cloud, 0, is never offered to a new character: the server refuses it. Default: the
+    /// server's (Barret). The slot stays fixed once created. Only used when registering.
+    #[arg(long, value_name = "NAME|ID", value_parser = parse_slot)]
+    pub slot: Option<u8>,
 
     /// Open the window as borderless full screen (no title bar, no frame). Steam's Game Mode does
     /// this by itself, see FULL SCREEN AND THE ON-SCREEN KEYBOARD below; this asks for it anywhere.
@@ -329,6 +392,17 @@ pub struct Args {
     /// This is how a smoke test joins a party across a phase split.
     #[arg(long, requires = "party_accept")]
     pub party_accept_after_split: bool,
+
+    // ---- dialogue: one contiguous block ----
+    /// Talk to these non-player characters of the area as a bot (headless only), through the same conversation
+    /// code the window uses: the character's own talk script, read from YOUR copy of the field's script with the
+    /// story this player has reached, shown exactly as the game wrote it. Each name is the one the area announces
+    /// the character under (the `headless: npc` lines: `gu0` in md1stin), several are separated by commas, and
+    /// each is talked to once, as soon as the area has announced it; the bot does not walk up to them. What they
+    /// say is printed as `talk:` lines on stderr (see HEADLESS OUTPUT); a character without a talk script (the
+    /// canon Barret of md1stin, who is no script entity) has `nothing to say`. Without FF7 data nobody has.
+    #[arg(long, value_name = "NAME[,NAME...]", value_delimiter = ',', value_parser = parse_npc_name, requires = "headless")]
+    pub talk: Vec<String>,
 }
 
 /// Default server for `--server`. Kept in sync with `DEFAULT_DEV_PORT` by a unit test.
@@ -339,6 +413,13 @@ impl Args {
     /// registration uses it; the server ignores it when logging in with a token.)
     pub fn effective_tint(&self, name: &str) -> [u8; 3] {
         self.tint.unwrap_or_else(|| tint_from_name(name))
+    }
+
+    /// The character to ask for in `Hello` when registering `name`: the colour of [`Args::effective_tint`],
+    /// and the `--body` and `--slot` given (the server's defaults for the ones not given). A token login
+    /// sends it too, but the server only reads the colour of it, and only for an account without an avatar.
+    pub fn new_character(&self, name: &str) -> NewCharacter {
+        NewCharacter { tint: self.effective_tint(name), body: self.body.clone(), slot: self.slot }
     }
 
     /// This client's state directory (see [`client_state_dir`]).
@@ -419,6 +500,63 @@ pub fn parse_tint(s: &str) -> Result<[u8; 3], String> {
     // All six bytes are ASCII hex digits, so slicing on byte offsets is on char boundaries.
     let byte = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).map_err(|e| e.to_string());
     Ok([byte(0)?, byte(2)?, byte(4)?])
+}
+
+/// The id of a placeholder body for `--body`: what the server's bodies are named (ASCII letters, digits,
+/// `_` and `-`, 1 to 32 characters), so it can be sent and printed as it is. Which ids exist is the
+/// server's business: an unknown one is not an error here.
+pub fn parse_body(s: &str) -> Result<String, String> {
+    let id = s.trim();
+    if id.is_empty() || id.len() > 32 || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
+        return Err(format!("`{}` is not a body id (1 to 32 ASCII letters, digits, `_` and `-`)", clean_for_error(s)));
+    }
+    Ok(id.to_string())
+}
+
+/// What `--slot` takes by name: the canon FF7 party members a new character may fight as, in the order of
+/// the kernel's character records, under their own spelling (see [`CharacterId::name`]) and the others the
+/// game's players use. Matched ignoring case and spaces.
+const SLOT_ALIASES: [(&str, CharacterId); 2] = [("aeris", CharacterId::Aeris), ("red13", CharacterId::RedXiii)];
+
+/// `text` as `--slot` matches names: lower case, no whitespace.
+fn slot_key(text: &str) -> String {
+    text.chars().filter(|c| !c.is_whitespace()).flat_map(char::to_lowercase).collect()
+}
+
+/// A combat slot for `--slot`: a canon party member by name (`barret`, `tifa`, `aerith` or `aeris`,
+/// `redxiii` or `red13`, `yuffie`, `caitsith`, `vincent`, `cid`; case and spaces do not matter), or any
+/// number 0 to 255, which is sent as it is (so that the server's refusal of Cloud's slot, 0, and of the ids
+/// that are nobody's, can be tried on purpose). Cloud by name is an error that says why.
+pub fn parse_slot(s: &str) -> Result<u8, String> {
+    let key = slot_key(s);
+    if key.is_empty() {
+        return Err("the combat slot is empty: give a name (barret, tifa, aerith, redxiii, yuffie, caitsith, vincent, cid) or an id from 0 to 255".to_string());
+    }
+    if key.bytes().all(|b| b.is_ascii_digit()) {
+        return key.parse::<u8>().map_err(|_| format!("`{}` is out of range: a combat slot id is 0 to 255", clean_for_error(s)));
+    }
+    if key == "cloud" {
+        return Err("Cloud's combat slot is never offered to a new character (he stays the story's protagonist); choose another party member, or pass 0 to see the server refuse it".to_string());
+    }
+    let named = CharacterId::ALL.iter().copied().filter(|id| *id != CharacterId::Cloud).find(|id| slot_key(id.name()) == key);
+    let aliased = SLOT_ALIASES.iter().find(|(alias, _)| *alias == key).map(|(_, id)| *id);
+    match named.or(aliased) {
+        Some(id) => u8::try_from(id.index()).map_err(|_| "that combat slot has no id".to_string()),
+        None => Err(format!(
+            "`{}` is not a combat slot: use barret, tifa, aerith, redxiii, yuffie, caitsith, vincent or cid, or an id from 0 to 255",
+            clean_for_error(s)
+        )),
+    }
+}
+
+/// A character's name for `--talk`: the label the area announces it under (a script entity's name: `gu0`,
+/// `Barret`), 1 to 24 printable ASCII characters other than the comma that separates the names.
+pub fn parse_npc_name(s: &str) -> Result<String, String> {
+    let name = s.trim();
+    if name.is_empty() || name.chars().count() > 24 || !name.chars().all(|c| c.is_ascii_graphic() || c == ' ') {
+        return Err(format!("`{}` is not a character's name (1 to 24 printable ASCII characters, as the `headless: npc` lines print them)", clean_for_error(s)));
+    }
+    Ok(name.to_string())
 }
 
 /// Deterministic, random-looking, bright tint derived from a name hash (FNV-1a -> hue).
@@ -678,6 +816,109 @@ mod tests {
     }
 
     #[test]
+    fn a_new_character_asks_for_the_tint_the_body_and_the_slot_given_and_nothing_else() {
+        let a = Args::try_parse_from(["fmv-client", "--name", "Wedge"]).unwrap();
+        assert_eq!(a.new_character("Wedge"), NewCharacter { tint: tint_from_name("Wedge"), body: None, slot: None });
+        let a = Args::try_parse_from(["fmv-client", "--name", "Wedge", "--tint", "#102030", "--body", "slim", "--slot", "tifa"]).unwrap();
+        assert_eq!(a.new_character("Wedge"), NewCharacter { tint: [0x10, 0x20, 0x30], body: Some("slim".into()), slot: Some(2) });
+        // The choices are for a registration, but they are accepted next to any other flag (a login ignores them).
+        assert!(Args::try_parse_from(["fmv-client", "--headless", "--body", "tall"]).is_ok());
+        assert!(Args::try_parse_from(["fmv-client", "--headless", "--slot", "cid", "--battle-auto"]).is_ok());
+    }
+
+    #[test]
+    fn a_body_is_an_id_of_one_to_thirty_two_safe_characters() {
+        for good in ["sturdy", "Slim", "a", "tall_2", "wide-body", "x".repeat(32).as_str(), "  padded  "] {
+            assert_eq!(parse_body(good), Ok(good.trim().to_string()), "{good:?}");
+        }
+        for bad in ["", "   ", "has space", "a/b", "../x", "a.b", "caf\u{e9}", "line\nbreak", "\u{1b}[31m", "x".repeat(33).as_str()] {
+            let err = parse_body(bad).expect_err(bad);
+            assert!(err.contains("body id") && !err.chars().any(char::is_control), "{bad:?}: {err:?}");
+        }
+        assert_eq!(Args::try_parse_from(["fmv-client", "--name", "x", "--body", "slim"]).unwrap().body.as_deref(), Some("slim"));
+    }
+
+    /// `--slot` takes a canon party member by name (case and spaces do not matter, `aeris` and `red13` too) or any
+    /// number from 0 to 255 as it is (so that the server's refusal of Cloud, 0, can be tried on purpose).
+    #[test]
+    fn a_slot_is_a_party_member_by_name_or_any_number() {
+        for (text, id) in [
+            ("barret", 1),
+            ("Barret", 1),
+            ("TIFA", 2),
+            ("aerith", 3),
+            ("Aeris", 3),
+            ("redxiii", 4),
+            ("Red XIII", 4),
+            ("red13", 4),
+            ("RED 13", 4),
+            ("yuffie", 5),
+            ("caitsith", 6),
+            ("Cait Sith", 6),
+            ("vincent", 7),
+            ("cid", 8),
+            ("  cid  ", 8),
+            ("0", 0),
+            ("1", 1),
+            ("8", 8),
+            ("9", 9),
+            ("007", 7),
+            (" 255 ", 255),
+        ] {
+            assert_eq!(parse_slot(text), Ok(id), "{text:?}");
+        }
+        // The names are the kernel's own: every canon character but Cloud is found by his or her table name.
+        for id in CharacterId::ALL.into_iter().filter(|id| *id != CharacterId::Cloud) {
+            assert_eq!(parse_slot(id.name()), Ok(id.index() as u8), "{}", id.name());
+        }
+        for bad in ["", "  ", "256", "99999", "-1", "+1", "1.5", "sephiroth", "bar ret x", "\u{1b}", "0x1"] {
+            assert!(parse_slot(bad).is_err(), "{bad:?}");
+        }
+        // Cloud by name is explained, not just refused: his slot stays the protagonist's.
+        let err = parse_slot("Cloud").expect_err("cloud");
+        assert!(err.contains("never offered") && err.contains("pass 0"), "{err}");
+        let err = parse_slot("sephiroth").expect_err("sephiroth");
+        assert!(err.contains("barret") && err.contains("cid") && err.contains("0 to 255"), "{err}");
+        assert!(parse_slot("999").unwrap_err().contains("out of range"));
+        assert_eq!(Args::try_parse_from(["fmv-client", "--name", "x", "--slot", "Red XIII"]).unwrap().slot, Some(4));
+        assert_eq!(Args::try_parse_from(["fmv-client", "--name", "x"]).unwrap().slot, None, "no slot unless asked for");
+        assert!(Args::try_parse_from(["fmv-client", "--name", "x", "--slot", "cloud"]).is_err());
+    }
+
+    #[test]
+    fn the_help_says_what_the_character_is_and_what_the_new_lines_mean() {
+        use clap::CommandFactory;
+        let help = Args::command().render_long_help().to_string();
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        for needle in [
+            "--body <ID>",
+            "--slot <NAME|ID>",
+            "ONE original character that travels across games",
+            "combat slot of a canon party member other than Cloud",
+            "a generic placeholder body tinted with your colour: NOT the model of any party member",
+            "The slot is chosen once and stays fixed",
+            "the run exits with code 1 and the server's sentence",
+            "barret, tifa, aerith, redxiii, yuffie, caitsith, vincent or cid",
+            "a body (FF7: a generic placeholder model: how you look on the field, nothing else)",
+            "who you fight as, its combat moves and level curve, fixed once created and not how you look",
+            "Left/Right/Space change a choice",
+            "(name, colour, body and `slot: <name>`)",
+            // (the help is read with its whitespace collapsed, so the two spaces before Lv are one here)
+            "`Wedge (Barret) Lv 7 EXP 626/949 Gil 20`",
+            "that slot's own battle model, a stand-in for it: how you look on the field plays no part",
+            "`battle: roster actor=<i> name=<enc> slot=<n> slot_name=<enc> level=<n>`",
+            "progress: name=<enc> slot=<enc> level=<n> exp=<n> exp_to_next=<n> gil=<n> ap=<n> leveled_up=<bool>",
+            "`character: name=<enc> tint=rrggbb body=<enc|-> binding=<enc|-> slot=<n|-> slot_name=<enc|-> migrated=<bool>`",
+            "`headless: peer entity=<n> name=<enc> tint=rrggbb binding=<enc|-> area=<AreaId>`",
+            "`headless: npc area=<AreaId> id=<n> name=<enc> model=<enc>`",
+            "ff7%2Fbody%2Fsturdy",
+        ] {
+            assert!(flat.contains(needle), "--help must mention {needle:?}:\n{help}");
+        }
+        assert!(!flat.contains("a look (FF7: Cloud"), "the old look row is gone from the help");
+    }
+
+    #[test]
     fn party_bot_flags_are_headless_only() {
         for flag in ["--party-invite-first-peer", "--party-accept"] {
             assert!(Args::try_parse_from(["fmv-client", "--name", "x", flag]).is_err(), "{flag} needs --headless");
@@ -686,6 +927,35 @@ mod tests {
         }
         let a = Args::try_parse_from(["fmv-client", "--headless", "--party-invite-first-peer", "--party-accept"]).unwrap();
         assert!(a.party_invite_first_peer && a.party_accept);
+    }
+
+    #[test]
+    fn talk_takes_comma_separated_character_names_and_is_headless_only() {
+        assert!(Args::try_parse_from(["fmv-client", "--name", "x", "--talk", "gu0"]).is_err(), "--talk needs --headless");
+        let a = Args::try_parse_from(["fmv-client", "--name", "x", "--headless", "--talk", "gu0,Barret"]).unwrap();
+        assert_eq!(a.talk, ["gu0", "Barret"]);
+        let a = Args::try_parse_from(["fmv-client", "--name", "x", "--headless", "--talk", " gu 1 "]).unwrap();
+        assert_eq!(a.talk, ["gu 1"], "a name keeps its inner space and loses the outer ones");
+        let a = Args::try_parse_from(["fmv-client", "--name", "x", "--headless"]).unwrap();
+        assert!(a.talk.is_empty(), "nobody is talked to unless asked for");
+        // A name is what the area prints a character under: printable ASCII, bounded.
+        for bad in ["", "   ", "a,,b", "x".repeat(25).as_str(), "caf\u{e9}", "line\nbreak", "\u{1b}[31m"] {
+            assert!(Args::try_parse_from(["fmv-client", "--name", "x", "--headless", "--talk", bad]).is_err(), "{bad:?} must be refused");
+        }
+        assert_eq!(parse_npc_name("x".repeat(24).as_str()), Ok("x".repeat(24)));
+        // The help says what the lines mean.
+        use clap::CommandFactory;
+        let help = Args::command().render_long_help().to_string();
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        for needle in [
+            "--talk <NAME[,NAME...]>",
+            "talk: npc=<enc> story=<moment|-> window=<n> origin=<canon|added> [ask=<first>-<last>] text=<enc>",
+            "talk: npc=<enc> story=<moment|-> nothing to say",
+            "talk: npc=<enc> was never in the area",
+            "the canon Barret of md1stin, who is no script entity",
+        ] {
+            assert!(flat.contains(needle), "--help must mention {needle:?}:\n{help}");
+        }
     }
 
     #[test]

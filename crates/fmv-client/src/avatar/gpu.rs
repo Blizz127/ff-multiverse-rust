@@ -276,8 +276,10 @@ impl Globals {
     }
 }
 
-/// Most characters kept on the GPU (the table has eight); beyond it the cache starts over.
-const MAX_GPU_MODELS: usize = 32;
+/// Most models kept on the GPU, whoever they are: the players' (the 8 canon characters and up to 4 placeholder
+/// bodies) and the area's non-player characters (`library::MAX_NPC_MODELS`, which is what this leaves them);
+/// beyond it the cache starts over.
+pub(crate) const MAX_GPU_MODELS: usize = 32;
 const MIN_POSITION_BYTES: u64 = 64 * 1024;
 /// Room for 256 tints to start with (a battle draws a few dozen models).
 const MIN_TINT_BYTES: u64 = 256 * 16;
@@ -686,7 +688,7 @@ impl AvatarGpu {
     /// With `with_scenery` the depth is the one [`AvatarGpu::draw_scenery`] left (the marks, the
     /// models and the blended tiles are tested against it); without, it starts empty.
     pub fn draw_models(&mut self, target: &wgpu::TextureView, size: (u32, u32), cam: &Camera, frame: &AvatarFrame, with_scenery: bool) {
-        self.draw_models_tinted(target, size, cam, frame, &[], with_scenery);
+        self.draw_models_tinted(target, size, cam, frame, &frame.tints, with_scenery);
     }
 
     /// [`AvatarGpu::draw_models`] with a [`Tint`] for each model: `tints[i]` is the colour factor and

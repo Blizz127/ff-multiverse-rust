@@ -4,7 +4,7 @@
 //!
 //! [`draw_hud`] is a pure function of a [`HudInput`] (names, view-space positions, counts) and the
 //! window size; [`gather`] reads the live session into one. [`draw_hud_with`] adds the one line about
-//! the local player's character (`Cloud Lv 7  EXP 626/949  Gil 20`, see [`progress_line`]) under the
+//! the local player's character (`Wedge (Barret)  Lv 7  EXP 626/949  Gil 20`, see [`progress_line`]) under the
 //! area name; it is a separate argument, not a field of [`HudInput`], so that everything that builds
 //! or draws a plain `HudInput` is unchanged. Text is drawn at an integer scale on translucent plates
 //! so it stays readable over any background picture.
@@ -203,7 +203,7 @@ fn block(out: &mut DrawList, x: i32, y: i32, s: i32, lines: &[(Rgba, String)]) -
 /// What the HUD says about the local player's character (see `crate::progress`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProgressLine {
-    /// `Cloud Lv 7  EXP 626/949  Gil 20`.
+    /// `Wedge (Barret)  Lv 7  EXP 626/949  Gil 20`.
     pub text: String,
     /// The server reported a level gained a few seconds ago: say so on a line of its own.
     pub level_up: bool,
@@ -212,8 +212,7 @@ pub struct ProgressLine {
 /// The line about the local player's character as of local time `now`, or `None` while the server has
 /// not said anything about it (a server without battles never does).
 pub fn progress_line(state: &ClientState, now: f64) -> Option<ProgressLine> {
-    let view = state.progress.current()?;
-    Some(ProgressLine { text: view.hud_text(), level_up: state.progress.level_up_shown(now) })
+    Some(ProgressLine { text: state.progress.hud_text()?, level_up: state.progress.level_up_shown(now) })
 }
 
 /// Draw the HUD for a `w` x `h` window, without a line about the local player's character.
@@ -525,29 +524,29 @@ mod tests {
         assert_eq!(draw_with(&i, None, 1100, 680).texts(), plain.texts(), "no line, the same HUD as before");
         assert!(!plain.says(" Lv "));
 
-        let list = draw_with(&i, Some(&line("Cloud Lv 7  EXP 626/949  Gil 20", false)), 1100, 680);
-        assert!(list.says("Cloud Lv 7  EXP 626/949  Gil 20") && list.says("FF7 md1stin"));
+        let list = draw_with(&i, Some(&line("Wedge (Barret)  Lv 7  EXP 626/949  Gil 20", false)), 1100, 680);
+        assert!(list.says("Wedge (Barret)  Lv 7  EXP 626/949  Gil 20") && list.says("FF7 md1stin"));
         let area = list.texts().iter().find(|t| t.text == "FF7 md1stin").unwrap();
-        let mine = list.texts().iter().find(|t| t.text.starts_with("Cloud Lv 7")).unwrap();
+        let mine = list.texts().iter().find(|t| t.text.starts_with("Wedge (Barret)  Lv 7")).unwrap();
         assert!(mine.y > area.y, "below the area name ({} vs {})", mine.y, area.y);
         assert_eq!(mine.x, area.x, "on the same plate, at the same indent");
         assert!(!list.says("LEVEL UP"), "only when a level was just gained");
         for (w, h) in SIZES {
-            assert_inside(&draw_with(&i, Some(&line("Cloud Lv 7  EXP 626/949  Gil 20", true)), w, h), w, h, "character line");
+            assert_inside(&draw_with(&i, Some(&line("Wedge (Barret)  Lv 7  EXP 626/949  Gil 20", true)), w, h), w, h, "character line");
         }
     }
 
     #[test]
     fn a_level_just_gained_is_announced_on_its_own_line() {
-        let list = draw_with(&input(), Some(&line("Cloud Lv 7  EXP 626/949  Gil 20", true)), 1100, 680);
-        let mine = list.texts().iter().find(|t| t.text.starts_with("Cloud Lv 7")).unwrap();
+        let list = draw_with(&input(), Some(&line("Wedge (Barret)  Lv 7  EXP 626/949  Gil 20", true)), 1100, 680);
+        let mine = list.texts().iter().find(|t| t.text.starts_with("Wedge (Barret)  Lv 7")).unwrap();
         let up = list.texts().iter().find(|t| t.text == "LEVEL UP!" && t.color == PARTY_RING).expect("a gold line");
         assert!(up.y > mine.y);
     }
 
     #[test]
     fn a_long_character_line_is_cut_to_the_window_and_the_fixture_label_clears_the_plate() {
-        let long = "Cloud Lv 99  EXP 99999999/99999999  Gil 9999999  and then some more words that cannot fit";
+        let long = "Wedge (Barret)  Lv 99  EXP 99999999/99999999  Gil 9999999  and then some more words that cannot fit";
         for (w, h) in SIZES {
             assert_inside(&draw_with(&input(), Some(&line(long, true)), w, h), w, h, "long character line");
         }
@@ -556,9 +555,9 @@ mod tests {
         i.fixture = true;
         i.area = "FIXTURE a_long_area_name".into();
         for (w, h) in SIZES {
-            let list = draw_with(&i, Some(&line("Cloud Lv 7  EXP 6/33  Gil 0", true)), w, h);
+            let list = draw_with(&i, Some(&line("Wedge (Barret)  Lv 7  EXP 6/33  Gil 0", true)), w, h);
             let label = list.texts().iter().find(|t| t.text == FIXTURE_LABEL && t.color == FIXTURE_INK).unwrap();
-            for t in list.texts().iter().filter(|t| t.text.starts_with("Cloud Lv") || t.text == "LEVEL UP!" || t.text.starts_with("FIXTURE a_long")) {
+            for t in list.texts().iter().filter(|t| t.text.starts_with("Wedge (Barret)  Lv") || t.text == "LEVEL UP!" || t.text.starts_with("FIXTURE a_long")) {
                 assert!(!overlaps(rect_of(t), rect_of(label)), "{w}x{h}: {:?} vs the fixture label", t.text);
             }
         }
@@ -567,11 +566,12 @@ mod tests {
     #[test]
     fn the_session_gives_the_line_once_the_server_has_spoken() {
         let mut s = state_with(&[]);
+        s.progress.set_player("Wedge");
         assert_eq!(progress_line(&s, 5.0), None, "nothing said: no line");
-        s.apply(5.0, ServerMsg::CharacterProgress { character: 0, level: 6, exp: 610, exp_to_next: 6, gil: 0, ap: 0, leveled_up: false });
-        assert_eq!(progress_line(&s, 5.1), Some(ProgressLine { text: "Cloud Lv 6  EXP 610/616  Gil 0".into(), level_up: false }));
-        s.apply(9.0, ServerMsg::CharacterProgress { character: 0, level: 7, exp: 626, exp_to_next: 323, gil: 20, ap: 4, leveled_up: true });
-        assert_eq!(progress_line(&s, 9.5), Some(ProgressLine { text: "Cloud Lv 7  EXP 626/949  Gil 20".into(), level_up: true }));
+        s.apply(5.0, ServerMsg::CharacterProgress { character: 1, level: 6, exp: 82, exp_to_next: 2, gil: 25, ap: 0, leveled_up: false });
+        assert_eq!(progress_line(&s, 5.1), Some(ProgressLine { text: "Wedge (Barret)  Lv 6  EXP 82/84  Gil 25".into(), level_up: false }));
+        s.apply(9.0, ServerMsg::CharacterProgress { character: 1, level: 7, exp: 626, exp_to_next: 323, gil: 20, ap: 4, leveled_up: true });
+        assert_eq!(progress_line(&s, 9.5), Some(ProgressLine { text: "Wedge (Barret)  Lv 7  EXP 626/949  Gil 20".into(), level_up: true }));
         assert!(!progress_line(&s, 20.0).unwrap().level_up, "the announcement ends");
     }
 
@@ -738,6 +738,7 @@ mod tests {
             tint: [9, 9, 9],
             area_id: AreaId { game: if fixture { GameId::Fixture } else { GameId::Ff7 }, key: "plaza".into() },
             fixture,
+            card: fmv_protocol::CharacterCard::plain("Cloud", [9, 9, 9]),
         }
     }
 

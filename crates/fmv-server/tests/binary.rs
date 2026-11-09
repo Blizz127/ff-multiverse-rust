@@ -88,8 +88,7 @@ async fn hello(addr: SocketAddr, auth: Auth) -> (TcpStream, ServerMsg) {
             protocol_version: PROTOCOL_VERSION,
             client_build: "binary-test".into(),
             auth,
-            tint: [1, 2, 3],
-            appearance_ref: None,
+            character: fmv_protocol::NewCharacter::with_tint([1, 2, 3]),
         },
     )
     .await

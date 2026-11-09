@@ -4,16 +4,20 @@
 //!
 //! # Whose numbers these are
 //!
-//! * **The character** an account plays follows its avatar's look ([`character_for_look`]: for FF7
-//!   the `ff7/<name>` appearance id, default Cloud). It replaces the interim rule that gave the
-//!   `i`-th member of a battle the `i`-th character of the game, which made a player a different
-//!   character in every battle.
+//! * **The character** an account fights as is its player character's **combat slot** (protocol v8: stored in
+//!   the account's `fmv_persist::PlayerCharacter`, chosen at creation and fixed: FF7's experience curves differ
+//!   per character, so a slot change would change a player's level). It is NOT the account's look: the field
+//!   look is the character's binding, a generic body for a new character. Only an account that predates the
+//!   record is given its slot by the look it had ([`character_for_look`]: for FF7 the `ff7/<name>` appearance
+//!   id, default Cloud: exactly what the builds before fought it as, so its numbers do not move). Two players
+//!   may hold the same slot. The slot also decides what the SAVER writes (`SaveJob::character` is the slot of the
+//!   member that fought), so a new Barret-slot character's record says Barret, never the look's character.
 //! * **The level** is the account's own. A battle's `EncounterStart` names each member's character
 //!   and level, so every peer builds the same combatants from its own game files.
-//! * **A look changes who the account plays, not what it has earned.** The level, experience, AP and
-//!   gil carry over to the other character; its curve decides the next level from there (a character
-//!   whose curve asks for less than the account already has levels up at its next win). Nothing is
-//!   ever taken away.
+//! * **A slot is the account's character, and what it has earned is the account's.** The level, experience, AP and
+//!   gil are in the progress record the player character points at; if a record holds another character than the
+//!   slot (a rolled-back v7 saved it by look), the slot wins and the next save writes it back: the numbers are
+//!   never taken away or recomputed.
 //! * **Not the story.** This is separate from the account's `Progression` blob, which is also its
 //!   story phase key (see `accounts::phase_key`): nothing here can move a player to another instance.
 //!
@@ -45,7 +49,7 @@ use fmv_core::{GameId, InventoryEntry};
 use fmv_persist::CharacterProgress;
 use fmv_protocol::{BattleReward, BattleRules, ProgressLimits, ServerMsg};
 
-/// The character of an account whose look names none (FF7: Cloud).
+/// The character of an account that has no slot (a game without combat slots, or an account that names none): FF7: Cloud.
 pub const DEFAULT_CHARACTER: u8 = 0;
 
 /// FF7's character ids (`fmv_ff7_battle::kernel::CharacterId::index`) of the looks the game offers
@@ -62,9 +66,19 @@ const FF7_LOOKS: [(&str, u8); 8] = [
     ("ff7/cid", 8),
 ];
 
-/// The character an avatar with this look plays in `game`. `look` is what the server shows for the
-/// avatar (`AvatarAppearance::appearance_ref`); a look the game does not know, none, or a game with
-/// no characters of its own gives [`DEFAULT_CHARACTER`].
+/// The canon look (an `ff7/<character>` appearance id) of FF7 character `character`, if the game has a field
+/// model for it (Cait Sith has none). The inverse of [`character_for_look`]: what a build before protocol v8
+/// would have to be told for it to fight an account as that character (see `character::plan_creation`).
+pub fn look_of_character(character: u8) -> Option<&'static str> {
+    FF7_LOOKS.iter().find(|&&(_, c)| c == character).map(|&(look, _)| look)
+}
+
+/// The character an avatar with this look plays in `game`, **by the rule of the builds before protocol v8**: a
+/// player's slot is now its own (stored in its player-character record, chosen at creation), and this survives
+/// only as the migration rule for an account that predates the record (`character::legacy_entry`: what v7
+/// fought the account as is its slot) and as that mirror of a new character's slot. `look` is the canon look the
+/// account had (`AvatarAppearance::appearance_ref`); a look the game does not know, none, or a game with no
+/// characters of its own gives [`DEFAULT_CHARACTER`].
 pub fn character_for_look(game: GameId, look: Option<&str>) -> u8 {
     match (game, look) {
         (GameId::Ff7, Some(look)) => {
@@ -127,7 +141,7 @@ impl Progress {
 /// [`crate::inventory::Inventory`] with the game's starting stock where the store had none.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProgressSeed {
-    /// The character its look names ([`character_for_look`]).
+    /// The character the account fights as: its player character's combat slot (see the module docs).
     pub character: u8,
     /// The stored record, `None` if the account has never earned anything.
     pub stored: Option<Progress>,
@@ -169,7 +183,7 @@ pub fn clamp(limits: ProgressLimits, progress: &mut Progress) {
     progress.limit = progress.limit.min(limits.max_limit);
 }
 
-/// The mirror of a player that joins: its stored progress (or a fresh start) as the character its look
+/// The mirror of a player that joins: its stored progress (or a fresh start) as the character of its slot
 /// names, inside the game's caps.
 pub fn resolve(rules: &dyn BattleRules, seed: &ProgressSeed) -> Progress {
     match seed.stored {

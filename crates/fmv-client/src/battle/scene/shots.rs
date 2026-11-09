@@ -163,7 +163,7 @@ impl Server {
 }
 
 pub(super) fn member(i: u64, character: u8) -> BattleMember {
-    BattleMember { entity: EntityId(10 + i), account: if i == 0 { ME } else { AccountId(10 + i) }, character, level: 12, weapon: None, armor: None, limit: 0 }
+    BattleMember { entity: EntityId(10 + i), account: if i == 0 { ME } else { AccountId(10 + i) }, name: format!("P{i}"), character, level: 12, weapon: None, armor: None, limit: 0 }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -193,7 +193,7 @@ fn synthetic_scene(kit: &mut ModelKit, location: u16) -> BattleScene {
         ],
     };
     let start = SceneStart { id: BattleId(1), party: setup.party.clone(), my_actor: Some(ActorId(0)), formation: Some(formation) };
-    let mut scene = BattleScene::new(&start, Some(&engine), &[], kit).expect("a scene");
+    let mut scene = BattleScene::new(&start, Some(&engine), kit).expect("a scene");
     scene.update(1.0, &[], Some(&engine));
     scene
 }
@@ -387,12 +387,12 @@ fn real_window_path_finds_the_battle_archive_through_open_ff7() {
         assert!(rig.kit.attacks.is_empty(), "without a library there is no scene.bin to name the attacks");
     }
     // A party member's kit is the shared table.
-    let cloud = kit.source.party_member(&PartyLook { actor: ActorId(0), character: 0, look: None, mine: true });
+    let cloud = kit.source.party_member(&PartyLook { actor: ActorId(0), character: 0, mine: true });
     let cloud = resolve(&mut kit, cloud);
     assert_eq!((cloud.kit.attack, cloud.kit.hurt, cloud.kit.death, cloud.kit.victory), (Some(10), Some(15), Some(18), Some(2)));
-    // a party member by the engine's character id, and by the player's look over it
-    for (character, look, height) in [(0u8, None, 862.0), (2, None, 837.0), (1, None, 919.0), (5, Some("ff7/tifa"), 837.0)] {
-        let model = kit.source.party_member(&PartyLook { actor: ActorId(0), character, look: look.map(str::to_string), mine: true });
+    // a party member by the combat slot it fights in
+    for (character, height) in [(0u8, 862.0), (2, 837.0), (1, 919.0)] {
+        let model = kit.source.party_member(&PartyLook { actor: ActorId(0), character, mine: true });
         let rig = resolve(&mut kit, model);
         assert!(rig.scale == 1.0 && rig.attachments.len() == 1, "character {character} is a real battle model with its weapon");
         assert!((rig.height - height).abs() < 5.0, "character {character}: {}", rig.height);
@@ -437,8 +437,7 @@ fn offscreen_real_ff7_battle_formation() {
     // The real battle models of the owner's own battle.lgp when it is there (as the window has them,
     // with the clips scene.bin names for the enemies' attacks), the stand-ins otherwise.
     let mut kit = real.kit();
-    let looks = [None, None, None];
-    let mut scene = BattleScene::new(&start, client.engine(), &looks, &mut kit).expect("a scene");
+    let mut scene = BattleScene::new(&start, client.engine(), &mut kit).expect("a scene");
     if real.battle_lgp.is_some() {
         // Who is a real battle model: scale 1 (battle units, which a field stand-in at scale 36 is not;
         // a box is 1 too), the party carrying its weapons, the location. For the default formation
@@ -563,4 +562,72 @@ fn offscreen_real_ff7_battle_formation() {
     let gone = after.iter().filter(|a| a.side == Side::Enemy && !a.drawn).count();
     assert!(gone >= 1, "the enemy that died is no longer drawn");
     assert_eq!(client.divergences(), 0);
+}
+
+/// A real battle of two players named for themselves: "Blizz", who holds Barret's combat slot, and "Wedge", who holds
+/// Tifa's. The overlay (the party panel, the HP list, the target list, the command menu) calls them by their own
+/// names and never by Barret's or Tifa's, which the engine's combat templates are called; their models in battle are
+/// their slots' (Barret's and Tifa's battle models, a stand-in for the slot's). Made the way the window makes it: the
+/// server's `EncounterStart` goes to the client state, `scene_for` builds the scene from it, and the overlay is drawn
+/// over it through the real renderer: `battle_names.png` in `$FMV_SHOT_DIR`. Needs the owner's own `scene.bin`,
+/// `kernel.bin`, `char.lgp` and, for the real battle models, `battle.lgp` (`FMV_FF7_DATA`).
+#[test]
+#[ignore = "needs the owner's real FF7 data (FMV_FF7_DATA or FMV_FF7_LIBRARY) and a GPU or software Vulkan/GL driver"]
+fn offscreen_real_battle_names() {
+    use crate::state::ClientState;
+    use fmv_core::{AreaId, GameId};
+    let Some(real) = open_real() else { return };
+    let Some(mut gpu) = Offscreen::new() else { return };
+
+    let member = |entity: u64, account: AccountId, name: &str, character: u8| BattleMember {
+        entity: EntityId(entity),
+        account,
+        name: name.into(),
+        character,
+        level: 6,
+        weapon: None,
+        armor: None,
+        limit: 0,
+    };
+    let party = vec![member(1, ME, "Blizz", 1), member(2, AccountId(2), "Wedge", 2)];
+    let setup = BattleSetup { formation_id: 301, seed: 0xB11, party, preemptive: true, back_attack: false, battle_speed: 0, ticks_per_second: 1000 };
+    let server = Server { id: BattleId(1), state: real.rules.build(&setup).expect("the formation builds") };
+    // The engine fights them as the canon characters of their slots: those are the names the engine knows.
+    let engine_names: Vec<String> = server.state.party_ids().iter().filter_map(|id| server.state.actor(*id)).map(|c| c.name.clone()).collect();
+    assert_eq!(engine_names, ["Barret", "Tifa"], "the slots' combat templates");
+
+    // The window's own path: the client state takes the server's message, the battle is viewed, the scene is built.
+    let area = AreaId { game: GameId::Ff7, key: "md1stin".into() };
+    let mut state = ClientState::new(EntityId(1), ME, Pos::default(), area);
+    state.battle.set_rules(Some(Arc::clone(&real.rules)));
+    assert!(state.apply(0.0, server.start(&setup, real.rules.data_fingerprint())).is_none());
+    let notes = state.battle.drain_notes();
+    for line in ["roster actor=0 name=Blizz slot=1 slot_name=Barret level=6", "roster actor=1 name=Wedge slot=2 slot_name=Tifa level=6"] {
+        assert!(notes.iter().any(|n| n == line), "{line:?} in {notes:?}");
+    }
+    let (mut slot, mut kit) = (None, Some(real.kit()));
+    let view = state.battle.view(1.0).expect("a view of the battle");
+    let events = state.battle.take_events();
+    let scene = scene_for(&mut slot, &mut kit, &state, &view, 1.0, &events).expect("a scene");
+
+    // The party in the view: the players' own names, our own marked.
+    let party_names: Vec<&str> = view.party.iter().map(|b| b.name.as_str()).collect();
+    assert_eq!(party_names, ["Blizz", "Wedge"]);
+    assert!(view.party[0].mine && !view.party[1].mine);
+    assert!(!view.enemies.iter().any(|b| ["Barret", "Tifa", "Blizz", "Wedge"].contains(&b.name.as_str())), "the enemies keep the engine's names");
+    assert!(!state.battle.title_suffix(1.0).contains("Barret") && !state.battle.title_suffix(1.0).contains("Tifa"));
+
+    // The picture: the scene, then the overlay over the fighters' heads, as the window draws a frame.
+    for (w, h, name) in [(W, H, "battle_names"), (1920, 1080, "battle_names_1920x1080")] {
+        let scene_view = scene.view(w, h);
+        let mut overlay = DrawList::new();
+        draw_battle_overlay(&view, &scene.head_anchors(&scene_view), w, h, &mut overlay);
+        let said: Vec<&str> = overlay.texts().iter().map(|t| t.text.as_str()).collect();
+        assert!(said.iter().any(|t| t.contains("Blizz")) && said.iter().any(|t| t.contains("Wedge")), "the party panel names them: {said:?}");
+        for canon in ["Barret", "Tifa"] {
+            assert!(!said.iter().any(|t| t.contains(canon)), "the overlay names {canon}: {said:?}");
+        }
+        let img = gpu.render_battle(w, h, &scene.frame(&scene_view, false), &overlay);
+        save(name, w, h, &img);
+    }
 }

@@ -81,7 +81,7 @@
 //! # Character progress
 //!
 //! On such a server every player carries a mirror of its account's own character progress (the
-//! character its look names and its level, experience, AP and gil; see `crate::progress`), loaded at
+//! character it fights as (its combat slot) and its level, experience, AP and gil; see `crate::progress`), loaded at
 //! login and handed to [`World::join`] in [`NewPlayer::progress`], which also tells the player where
 //! it stands (the third message after the snapshot and the placement). A battle fights each member
 //! as its own character at its own level, and a victory pays it (see the `battle` module): the mirror
@@ -249,7 +249,7 @@ pub struct NewPlayer {
     /// The account's story progression for the hosted game (`accounts::Login::progression`): empty for a
     /// new account. Whatever the area's adapter does not read keeps one phase per distinct blob.
     pub progression: Vec<u8>,
-    /// The character its look names and what the store holds of its character progress (see
+    /// The character it fights as (its combat slot) and what the store holds of its character progress (see
     /// `progress`; unrelated to `progression`).
     pub progress: ProgressSeed,
     pub tx: OutboundTx,

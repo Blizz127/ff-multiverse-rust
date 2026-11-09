@@ -2,16 +2,31 @@
 //!
 //! stdout carries exactly one line (the SMOKE summary); every notice and error goes to stderr,
 //! including the one-line `party:` notes about party events and refusals.
+//!
+//! What a run says about who its players are goes to stderr too, one `key=value` line each (see the
+//! help's HEADLESS OUTPUT section): `character:` once after joining (what the server holds of this
+//! player's own character: name, colour, body, binding, combat slot), `headless: peer` when another player
+//! appears or changes (its name, colour and binding), `headless: npc` for each non-player character of the
+//! area (what a smoke test checks the canon characters are still in the field with). Every value that came
+//! from the network is percent-encoded by [`encode_name`], so a line always splits on spaces.
 
 use crate::battle::BattleBot;
 use crate::bot::{Bot, PartyBot, TravelBot, TravelGate};
 use crate::cli::{exit, Args};
 use crate::interp::render_time;
+use crate::progress::slot_name;
 use crate::session::Session;
+use crate::state::PeerSighting;
 use crate::story::StoryBot;
+use crate::talkbot::TalkBot;
+use crate::ui::dialogue::ff7::Ff7Conversations;
+use crate::ui::palette;
 use fmv_core::{AnimState, AreaId, EntityId, Pos};
+use fmv_ff7::Ff7Adapter;
+use fmv_protocol::CharacterCard;
 use std::collections::BTreeMap;
 use std::io::Write;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Simulation tick. Intents still go out at most every 50 ms (20 Hz); the finer tick keeps the
@@ -71,6 +86,52 @@ pub fn encode_name(name: &str) -> String {
     out
 }
 
+/// `text` as one `key=value` token, `-` for none or nothing: [`encode_name`] of it.
+fn token(text: Option<&str>) -> String {
+    text.filter(|t| !t.is_empty()).map_or_else(|| "-".to_string(), encode_name)
+}
+
+/// The line that says what the server holds of our own character, printed once after joining:
+/// `character: name=<enc> tint=rrggbb body=<enc|-> binding=<enc|-> slot=<n|-> slot_name=<enc|-> migrated=<bool>`.
+/// `body` is the identity's body choice, `binding` how the game draws the character (the `appearance_ref` of its
+/// entity), `slot` the combat slot it fights in with the slot's own name from this client's table of
+/// characters; each is `-` when the server says none. Everything that came from the network is percent-encoded
+/// ([`encode_name`]: `ff7/body/sturdy` prints as `ff7%2Fbody%2Fsturdy`).
+pub fn character_line(card: &CharacterCard) -> String {
+    format!(
+        "character: name={} tint={} body={} binding={} slot={} slot_name={} migrated={}",
+        token(Some(&card.name)),
+        palette::hex(card.tint),
+        token(card.body.as_deref()),
+        token(card.binding.as_deref()),
+        card.slot.map_or_else(|| "-".to_string(), |slot| slot.to_string()),
+        token(card.slot.and_then(slot_name)),
+        card.migrated
+    )
+}
+
+/// The line that says another player appeared in the area or changed its colour or binding:
+/// `headless: peer entity=<n> name=<enc> tint=rrggbb binding=<enc|-> area=<area id>`. Printed when the player is
+/// first seen in an area and again whenever its colour or binding changes, never every frame: a smoke test reads
+/// each player's binding (the placeholder body) from it.
+pub fn peer_line(peer: &PeerSighting) -> String {
+    format!(
+        "headless: peer entity={} name={} tint={} binding={} area={}",
+        peer.entity.0,
+        token(Some(&peer.name)),
+        palette::hex(peer.tint),
+        token(peer.binding.as_deref()),
+        peer.area
+    )
+}
+
+/// The line that says one non-player character of the area: `headless: npc area=<area id> id=<n> name=<enc>
+/// model=<enc>` (the model is the skeleton stem the area's data names, `-` for none). Printed for every character
+/// whenever the area's set of characters changes.
+pub fn npc_line(area: &AreaId, id: u32, name: &str, model: &str) -> String {
+    format!("headless: npc area={area} id={id} name={} model={}", token(Some(name)), token(Some(model)))
+}
+
 /// The fields of the SMOKE line, in the order they are printed (`scripts/smoke.sh` parses the
 /// line, so names and order are a contract: new fields are only ever appended).
 #[derive(Debug, Clone)]
@@ -119,7 +180,7 @@ pub fn smoke_line(smoke: &Smoke<'_>) -> String {
     format!("SMOKE name={name} area={area} fixture={fixture} peers_seen={peers_seen} updates={updates} rejected={rejected} rtt_ms={rtt_ms} party={party} battles={battles} victories={victories} area_changes={area_changes} level={level} exp={exp} items={items}")
 }
 
-pub fn run(args: &Args, mut session: Session) -> u8 {
+pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>) -> u8 {
     let mut bot = Bot::new(
         args.bot,
         session.state.own.pos(),
@@ -133,6 +194,9 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
     // `--travel`: walk through the exits to these areas; with a party to form first it waits for it.
     let mut travel_bot = TravelBot::new(args.travel.clone(), args.party_invite_first_peer || args.party_accept);
     let mut battle_bot = BattleBot::new(args.battle_auto, args.debug_encounters, args.battle_wait_party).with_script(args.battle_script.clone());
+    // `--talk`: talk to these characters of the area through the window's own conversation code (this machine's
+    // own copy of the field's scripts; without FF7 data nobody has anything to say).
+    let mut talk_bot = TalkBot::new(&args.talk, Box::new(Ff7Conversations::new(ff7)));
     eprintln!(
         "headless: joined {} as `{}` (entity {}), bot={:?} for {:.1} s",
         session.info.area_id,
@@ -141,6 +205,8 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
         args.bot,
         args.duration.as_secs_f64()
     );
+    // Once, after joining: what the server holds of this player's own character.
+    eprintln!("{}", character_line(&session.info.card));
     if args.party_invite_first_peer || args.party_accept {
         eprintln!(
             "headless: party behaviour: invite the first peer: {}, accept invites: {}",
@@ -158,6 +224,9 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
     }
     if args.party_accept_after_split {
         eprintln!("headless: party behaviour: accept an invite only once a player seen before is out of view");
+    }
+    if talk_bot.is_active() {
+        eprintln!("headless: talk behaviour: talk once to {}, as soon as the area announces them, read with this player's own story", args.talk.join(", "));
     }
     if battle_bot.is_active() {
         let script = battle_bot.script_steps();
@@ -188,8 +257,8 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
     // What the world looked like when the last battle ended, to show that play went on afterwards.
     let mut after_battle: Option<(f32, u64)> = None;
     let mut battles_ended = 0;
-    // The names of the area's NPCs as last reported (the snapshot of an area says who they are).
-    let mut last_npcs: Vec<String> = Vec::new();
+    // The area's NPCs as last reported: id, name and model (the snapshot of an area says who they are).
+    let mut last_npcs: Vec<(u32, String, String)> = Vec::new();
     // How many other players were in view at the last look (`usize::MAX`: none yet).
     let mut last_in_view = usize::MAX;
     while start.elapsed() < args.duration
@@ -204,6 +273,9 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
         session.log_battle_notes();
         session.log_progress_notes();
         session.log_story_notes();
+        for peer in session.state.drain_peer_sightings() {
+            eprintln!("{}", peer_line(&peer));
+        }
         // The server moved us to another area: walk the pattern of the new one, and cross it off
         // the route if that is where the bot meant to go.
         if let Some(change) = session.take_area_change() {
@@ -223,12 +295,23 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
             // walk start again in the new one.
             peer_walks.clear();
         }
-        let npc_names: Vec<String> = session.state.npc_views().iter().map(|n| n.name.clone()).collect();
-        if npc_names != last_npcs {
-            if !npc_names.is_empty() {
-                eprintln!("headless: {} NPC(s) in {}: {}", npc_names.len(), session.info.area_id, npc_names.join(", "));
+        let npcs: Vec<(u32, String, String)> = session.state.npc_views().iter().map(|n| (n.id, n.name.clone(), n.model.clone())).collect();
+        if npcs != last_npcs {
+            if !npcs.is_empty() {
+                let names: Vec<&str> = npcs.iter().map(|(_, name, _)| name.as_str()).collect();
+                eprintln!("headless: {} NPC(s) in {}: {}", npcs.len(), session.info.area_id, names.join(", "));
+                for (id, name, model) in &npcs {
+                    eprintln!("{}", npc_line(&session.info.area_id, *id, name, model));
+                }
             }
-            last_npcs = npc_names;
+            last_npcs = npcs;
+        }
+        // Conversations: each wanted character is talked to once, when the area has announced it (and with the
+        // story this player has reached by then).
+        if !talk_bot.is_done() {
+            for line in talk_bot.step(&session.info.area_id.key, session.state.npc_views(), session.state.story.moment()) {
+                eprintln!("{line}");
+            }
         }
         if session.state.battle.ended() > battles_ended {
             battles_ended = session.state.battle.ended();
@@ -293,6 +376,9 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
             std::thread::sleep(rest);
         }
     }
+    for line in talk_bot.finish() {
+        eprintln!("{line}");
+    }
     if let Some(why) = story_bot.gave_up() {
         eprintln!("headless: story: gave up: {why}");
     }
@@ -324,6 +410,9 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
     session.log_battle_notes();
     session.log_progress_notes();
     session.log_story_notes();
+    for peer in session.state.drain_peer_sightings() {
+        eprintln!("{}", peer_line(&peer));
+    }
     eprintln!("headless: {}", session.state.party.summary());
     if battle_bot.is_active() || session.state.battle.entered() > 0 || session.state.battle.rejections() > 0 {
         eprintln!("headless: battles: {}", session.state.battle.summary());
@@ -386,6 +475,56 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
 mod tests {
     use super::*;
     use fmv_core::GameId;
+
+    #[test]
+    fn the_character_line_says_what_the_server_holds_in_percent_encoded_key_value_tokens() {
+        let card = CharacterCard {
+            name: "Red XIII".into(),
+            tint: [0x5a, 0x7d, 0xf5],
+            body: Some("sturdy".into()),
+            binding: Some("ff7/body/sturdy".into()),
+            slot: Some(4),
+            migrated: false,
+        };
+        assert_eq!(
+            character_line(&card),
+            "character: name=Red%20XIII tint=5a7df5 body=sturdy binding=ff7%2Fbody%2Fsturdy slot=4 slot_name=Red%20XIII migrated=false"
+        );
+        // An account that predates the character creator: a canon look as its binding, no body, a slot that was its own.
+        let migrated = CharacterCard { name: "Old".into(), tint: [1, 2, 3], body: None, binding: Some("ff7/cloud".into()), slot: Some(0), migrated: true };
+        assert_eq!(character_line(&migrated), "character: name=Old tint=010203 body=- binding=ff7%2Fcloud slot=0 slot_name=Cloud migrated=true");
+        // A game with no bodies and no slots (the FIXTURE), and a slot this client has no name for.
+        assert_eq!(
+            character_line(&CharacterCard::plain("bot", [255, 0, 16])),
+            "character: name=bot tint=ff0010 body=- binding=- slot=- slot_name=- migrated=false"
+        );
+        let nobody = CharacterCard { slot: Some(200), ..CharacterCard::plain("x", [0, 0, 0]) };
+        assert!(character_line(&nobody).ends_with(" slot=200 slot_name=- migrated=false"));
+        // Whatever the server put in the card, the line stays one line of tokens that split on spaces.
+        let hostile = CharacterCard {
+            name: "a b=c\u{2028}d".into(),
+            body: Some("x y".into()),
+            binding: Some("p=q r".into()),
+            ..CharacterCard::plain("", [0, 0, 0])
+        };
+        let line = character_line(&hostile);
+        assert_eq!(line.lines().count(), 1, "{line:?}");
+        let fields: Vec<&str> = line.split_whitespace().skip(1).collect();
+        assert_eq!(fields.len(), 7, "{line:?}");
+        assert!(fields.iter().all(|f| f.split_once('=').is_some_and(|(k, v)| !k.is_empty() && !v.is_empty())), "{line:?}");
+        assert!(line.starts_with("character: name=a%20b%3Dc%E2%80%A8d tint=000000 body=x%20y binding=p%3Dq%20r "), "{line}");
+    }
+
+    #[test]
+    fn the_peer_and_npc_lines_carry_ids_names_colours_and_bindings_as_tokens() {
+        let area = AreaId { game: GameId::Ff7, key: "md1stin".into() };
+        let peer = PeerSighting { entity: EntityId(8), name: "Wedge".into(), tint: [200, 10, 10], binding: Some("ff7/body/slim".into()), area: area.clone() };
+        assert_eq!(peer_line(&peer), "headless: peer entity=8 name=Wedge tint=c80a0a binding=ff7%2Fbody%2Fslim area=Ff7/md1stin");
+        let plain = PeerSighting { binding: None, name: "Red XIII".into(), ..peer };
+        assert_eq!(peer_line(&plain), "headless: peer entity=8 name=Red%20XIII tint=c80a0a binding=- area=Ff7/md1stin");
+        assert_eq!(npc_line(&area, 2, "Barret", "acgd"), "headless: npc area=Ff7/md1stin id=2 name=Barret model=acgd");
+        assert_eq!(npc_line(&area, 0, "gu 0", ""), "headless: npc area=Ff7/md1stin id=0 name=gu%200 model=-");
+    }
 
     #[test]
     fn the_odometer_sums_horizontal_steps_and_ignores_garbage() {

@@ -8,6 +8,8 @@
 //!                                               see `legacy.rs`)
 //! <root>/accounts/<account_id>.json             AccountRecord
 //! <root>/avatars/<avatar_id>.json               AvatarProfile
+//! <root>/characters/<account_id>.json           PlayerCharacter (identity, per-game binding and slot,
+//!                                               pointers to the progress records below; see `character.rs`)
 //! <root>/progression/<account_id>/<Game>.json   Progression (the story blob, also the phase key)
 //! <root>/progression/<account_id>/<Game>.character.json   CharacterProgress (level, exp, ap, gil
 //!                                                         and, once one was stored, the
@@ -18,11 +20,13 @@
 //! # Crash consistency
 //!
 //! `index.log` is the single commit point for everything that allocates an id or must stay
-//! unique. Creating an account (with its avatar) writes the record files first (nothing
-//! references them yet) and appends **one** log entry last: the name, the token and the ids
-//! become real together, or not at all. A crash in between leaves unreferenced record files
-//! that the next creation overwrites, never a dangling reference or a reused id. Updates to
-//! an existing avatar or progression are one atomic file write each.
+//! unique. Creating an account (with its avatar and its player-character record) writes the record
+//! files first (nothing references them yet) and appends **one** log entry last: the name, the token
+//! and the ids become real together, or not at all. A crash in between leaves unreferenced record
+//! files that the next creation overwrites, never a dangling reference or a reused id. Updates to
+//! an existing avatar or progression are one atomic file write each. So is the one record that is
+//! created later: the player-character record of an account that predates them
+//! ([`Store::ensure_player_character`]), which only ever *adds* a file.
 //!
 //! # Locks
 //!
@@ -40,8 +44,11 @@
 //!
 //! Everything a login needs ([`Store::authenticate`] and the lookups after it) only reads the
 //! index, so **a login never waits for a registration** or any other disk write, however long
-//! it takes. The one exception is the very first login of an account, which has to append its
-//! `claim` entry and so waits for the log lock, that is, for at most one other entry's sync.
+//! it takes. The exceptions are the very first login of an account, which has to append its
+//! `claim` entry and so waits for the log lock, that is, for at most one other entry's sync, and
+//! the first login of an account that has no player-character record yet (or none for the game it
+//! enters): [`Store::ensure_player_character`] reads lock-free first and takes the writer lock
+//! only to add that record, once per account and game.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -52,6 +59,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockW
 
 use fmv_core::{name_key, AccountId, AvatarAppearance, GameId};
 
+use crate::character::{NewPlayerCharacter, PlayerCharacter, MAX_PLAYER_CHARACTER_BYTES};
 use crate::error::{PersistError, Result};
 use crate::fsio;
 use crate::index::{self, AccountEntry, Index, LogWriter, Op, TokenHash, INDEX_LOG_FILE};
@@ -63,9 +71,12 @@ use crate::model::{
 };
 use crate::snapshot::{self, SnapshotInfo};
 
+mod player_character;
+
 pub(crate) const ACCOUNTS_DIR: &str = "accounts";
 pub(crate) const AVATARS_DIR: &str = "avatars";
 pub(crate) const PROGRESSION_DIR: &str = "progression";
+pub(crate) const CHARACTERS_DIR: &str = "characters";
 const TOKEN_PREFIX: &str = "fmvt_";
 
 /// The lookup tables are sized for the account limit when the store opens, up to this many
@@ -186,7 +197,7 @@ impl Store {
         // From here on, every early return drops `lock`, which releases the LOCK file.
         let lock = LockGuard::acquire(&root, &mut warnings)?;
 
-        for sub in [ACCOUNTS_DIR, AVATARS_DIR, PROGRESSION_DIR] {
+        for sub in [ACCOUNTS_DIR, AVATARS_DIR, PROGRESSION_DIR, CHARACTERS_DIR] {
             fsio::ensure_dir(&root.join(sub))?;
         }
 
@@ -258,6 +269,10 @@ impl Store {
 
     fn avatar_path(&self, id: u64) -> PathBuf {
         self.root.join(AVATARS_DIR).join(format!("{id}.json"))
+    }
+
+    fn character_record_path(&self, account: u64) -> PathBuf {
+        self.root.join(CHARACTERS_DIR).join(format!("{account}.json"))
     }
 
     fn progression_dir(&self, account: u64) -> PathBuf {
@@ -378,12 +393,34 @@ impl Store {
     /// The account limit is checked first and costs nothing, then the token is minted and the
     /// writer lock taken. The disk work is the two record files and one synced log entry,
     /// whatever the number of accounts. `now` is the caller's unix time in seconds.
+    ///
+    /// This registers an account without a player-character record (what every build before protocol v8
+    /// did); a v8 server calls [`Store::register_with_character`].
     pub fn register(
         &self,
         display_name: &str,
         tint: [u8; 3],
         base_archetype: &str,
         appearance_ref: Option<(GameId, &str)>,
+        now: u64,
+    ) -> Result<Registered> {
+        self.register_with_character(display_name, tint, base_archetype, appearance_ref, None, now)
+    }
+
+    /// [`Store::register`], and with `character` the player-character record of the new account too, in
+    /// the same atomic step: the record is written with the avatar, before the one log entry that makes
+    /// the account real, so there is no state in which a name is taken and its character is missing (a
+    /// crash in between leaves an unreferenced file that the next registration overwrites). Its identity
+    /// is the registration's name and `tint`, plus `character.body`; its origin is
+    /// [`CharacterOrigin::Created`]. The record is checked with every other input, before anything is
+    /// written (see [`PlayerCharacter`]).
+    pub fn register_with_character(
+        &self,
+        display_name: &str,
+        tint: [u8; 3],
+        base_archetype: &str,
+        appearance_ref: Option<(GameId, &str)>,
+        character: Option<NewPlayerCharacter>,
         now: u64,
     ) -> Result<Registered> {
         let name = AvatarAppearance::validate_new_name(display_name)
@@ -401,11 +438,14 @@ impl Store {
         // The same field checks `create_avatar` and `put_avatar` apply, run on the real values
         // now so that nothing after this point depends on the caller's data.
         avatar_profile(AccountId(0), AvatarId(0), &name, &avatar, now).validate_fields()?;
+        if let Some(new) = &character {
+            player_character::new_record(AccountId(0), &name, tint, new, now).validate()?;
+        }
 
         self.check_capacity()?;
         let token = new_token()?;
-        let (account_id, profile) =
-            self.insert_account(name, token_hash(&token), now, Some(avatar))?;
+        let (account_id, profile, record) =
+            self.insert_account(name, token_hash(&token), now, Some(avatar), character)?;
         let avatar = profile.ok_or_else(|| {
             PersistError::corrupt(&self.log_path(), "a registration produced no avatar")
         })?;
@@ -413,6 +453,7 @@ impl Store {
             account_id,
             token,
             avatar,
+            character: record,
         })
     }
 
@@ -428,7 +469,7 @@ impl Store {
             .map_err(|_| PersistError::InvalidName)?;
         self.check_capacity()?;
         let token = new_token()?;
-        let (account, _) = self.insert_account(name, token_hash(&token), now, None)?;
+        let (account, _, _) = self.insert_account(name, token_hash(&token), now, None, None)?;
         Ok((account, token))
     }
 
@@ -440,7 +481,8 @@ impl Store {
         hash: TokenHash,
         now: u64,
         avatar: Option<NewAvatar>,
-    ) -> Result<(AccountId, Option<AvatarProfile>)> {
+        character: Option<NewPlayerCharacter>,
+    ) -> Result<(AccountId, Option<AvatarProfile>, Option<PlayerCharacter>)> {
         let key = name_key(&name);
         let mut counters = self.writer();
         {
@@ -481,6 +523,22 @@ impl Store {
             }
             None => None,
         };
+        // The player-character record goes down with the avatar: nothing references it before the log
+        // entry below, and a crash before it leaves a file the next creation with this id overwrites.
+        let character_record = match (&avatar, &character) {
+            (Some(new), Some(wanted)) => {
+                let record = player_character::new_record(AccountId(id), &name, new.tint, wanted, now);
+                fsio::write_json(&self.character_record_path(id), &record, MAX_PLAYER_CHARACTER_BYTES)?;
+                Some(record)
+            }
+            (None, Some(_)) => {
+                return Err(PersistError::InvalidField {
+                    field: "character",
+                    reason: "a player-character record needs the avatar it is created with".into(),
+                })
+            }
+            (_, None) => None,
+        };
 
         // 2. The commit point: one synced log entry. Memory changes only after it is durable.
         let linked_avatar = profile.as_ref().map(|_| avatar_id);
@@ -508,7 +566,7 @@ impl Store {
         if linked_avatar.is_some() {
             counters.next_avatar_id = next_avatar;
         }
-        Ok((AccountId(id), profile))
+        Ok((AccountId(id), profile, character_record))
     }
 
     /// Resolve a token to its account. Unknown, malformed and oversized tokens all fail with
@@ -676,7 +734,7 @@ impl Store {
         }
 
         // The account is gone; only tidying is left.
-        let mut leftovers = vec![self.account_path(account.0)];
+        let mut leftovers = vec![self.account_path(account.0), self.character_record_path(account.0)];
         leftovers.extend(avatar.map(|id| self.avatar_path(id)));
         for path in leftovers {
             if let Err(e) = std::fs::remove_file(&path) {
@@ -1129,6 +1187,7 @@ fn sweep_all_temp_files(root: &Path) -> Result<Vec<PathBuf>> {
     let mut removed = fsio::sweep_temp_files(root)?;
     removed.extend(fsio::sweep_temp_files(&root.join(ACCOUNTS_DIR))?);
     removed.extend(fsio::sweep_temp_files(&root.join(AVATARS_DIR))?);
+    removed.extend(fsio::sweep_temp_files(&root.join(CHARACTERS_DIR))?);
     let progression = root.join(PROGRESSION_DIR);
     removed.extend(fsio::sweep_temp_files(&progression)?);
     for dir in fsio::list_subdirs(&progression)? {
@@ -1139,7 +1198,7 @@ fn sweep_all_temp_files(root: &Path) -> Result<Vec<PathBuf>> {
 
 /// True if any record file exists (used to refuse opening records without an index).
 fn has_any_records(root: &Path) -> Result<bool> {
-    for sub in [ACCOUNTS_DIR, AVATARS_DIR] {
+    for sub in [ACCOUNTS_DIR, AVATARS_DIR, CHARACTERS_DIR] {
         if !fsio::list_json_files(&root.join(sub))?.is_empty() {
             return Ok(true);
         }
@@ -1180,6 +1239,7 @@ fn find_unreferenced_records(root: &Path, index: &Index) -> Result<Vec<String>> 
     };
     check(ACCOUNTS_DIR, &|id| index.contains_account(id), "account")?;
     check(AVATARS_DIR, &|id| index.contains_avatar(id), "avatar")?;
+    check(CHARACTERS_DIR, &|id| index.contains_account(id), "player-character")?;
 
     let unknown: Vec<String> = fsio::list_subdirs(&root.join(PROGRESSION_DIR))?
         .into_iter()

@@ -24,7 +24,7 @@ impl Server {
         let setup = BattleSetup {
             formation_id: FOE,
             seed: 5,
-            party: vec![BattleMember { entity: EntityId(100), account: ME, character: 0, level: 6, weapon: None, armor: None, limit: 0 }],
+            party: vec![BattleMember { entity: EntityId(100), account: ME, name: "P0".into(), character: 0, level: 6, weapon: None, armor: None, limit: 0 }],
             preemptive: true,
             back_attack: false,
             battle_speed: 0,
@@ -100,7 +100,12 @@ fn the_view_names_fighters_by_actor_and_carries_their_mp() {
     assert_eq!(v.party.iter().map(|b| b.actor).collect::<Vec<_>>(), [ActorId(0)]);
     assert_eq!(v.enemies.iter().map(|b| b.actor).collect::<Vec<_>>(), [ActorId(1)], "the enemies' ids follow the party's");
     assert!(v.party[0].mine && !v.enemies[0].mine);
+    // A party member is its player's own name (the roster's), not the canon character's whose combat template it
+    // uses (slot 0 is Cloud's); an enemy keeps the name of the engine.
     let engine = server.state.actor(ActorId(0)).expect("us");
+    assert_eq!(engine.name, "Cloud", "the engine knows the slot's character");
+    assert_eq!(v.party[0].name, "P0");
+    assert_eq!(v.enemies[0].name, server.state.actor(ActorId(1)).expect("the dummy").name);
     assert_eq!((v.party[0].mp, v.party[0].max_mp), (engine.mp, engine.max_mp));
     assert!(v.menu.is_some() && v.popups.is_empty() && v.banner.is_none() && v.finale.is_none());
 }

@@ -44,6 +44,56 @@ fn own(joined: &Joined) -> &fmv_core::EntitySnapshot {
 // Accounts
 // ---------------------------------------------------------------------------------------------
 
+/// The player's own character (protocol v8) over a real socket: the `Welcome` of a registration carries the card
+/// of what the server holds (here a FIXTURE game, which offers no body and no slot, so it keeps neither: an
+/// identity only), a token login of the same account is told the very same card whatever its own `Hello` asks
+/// for, and the character record is in the store beside the account.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_welcome_carries_the_players_own_character_card_and_a_login_is_told_the_same_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let server = TestServer::start(ServerConfig { state_dir: Some(state.clone()), ..ServerConfig::default() }).await;
+    let name = uniq("Card");
+    let mut client = Client::connect(server.addr).await;
+    client.hello(&name).await; // colour [10, 20, 30]; a body and a slot the FIXTURE game does not offer
+    let (token, card) = match client.next().await {
+        ServerMsg::Welcome { issued_token, character, .. } => (issued_token.expect("a registration is answered with a token").expose().to_string(), character),
+        other => panic!("expected Welcome, got {other:?}"),
+    };
+    assert_eq!(card, fmv_protocol::CharacterCard::plain(&name, [10, 20, 30]), "an identity only: the FIXTURE game has no bodies and no slots");
+    let (_snapshot, _placement) = finish_join(&mut client).await;
+    drop(client);
+
+    // A token login whose Hello asks for another colour, body and slot is told the same card (retrying while the
+    // first session is still being torn down on the server).
+    let mut seen = None;
+    let mut probe = Client::connect(server.addr).await;
+    for _ in 0..50 {
+        probe.hello_token(&token).await;
+        match probe.next().await {
+            ServerMsg::Welcome { character, .. } => {
+                seen = Some(character);
+                break;
+            }
+            ServerMsg::Reject { code: RejectCode::AlreadyOnline, .. } => {
+                sleep(Duration::from_millis(100)).await;
+                probe = Client::connect(server.addr).await;
+            }
+            other => panic!("expected Welcome, got {other:?}"),
+        }
+    }
+    assert_eq!(seen, Some(card), "a login is told what the registration was told, whatever its own Hello asked for");
+    server.shutdown().await;
+
+    // The record is in the store, with the pointers and no slot (nothing for a game without slots).
+    let store = Store::open(&state).unwrap();
+    let account = store.find_account_by_name(&name).expect("the account");
+    let record = store.get_player_character(account).unwrap().expect("a registration creates the player-character record");
+    assert_eq!((record.identity.name.as_str(), record.identity.tint, record.identity.body.as_str()), (name.as_str(), [10, 20, 30], ""));
+    assert_eq!(record.slot(fmv_core::GameId::Fixture), None);
+    assert!(record.game(fmv_core::GameId::Fixture).is_some_and(|g| g.has_story_ref()));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn registration_issues_the_token_once_and_a_token_login_uses_the_stored_profile() {
     let server = TestServer::start(ServerConfig::default()).await;
@@ -52,8 +102,8 @@ async fn registration_issues_the_token_once_and_a_token_login_uses_the_stored_pr
     let me = own(&first);
     assert_eq!(me.avatar.display_name, name);
     assert_eq!(me.avatar.tint, [10, 20, 30]);
-    // The test client asks for "test-model", which the FIXTURE game does not offer: the avatar keeps
-    // the default look (the registration is not refused for it).
+    // The test client asks for a body and a slot, which the FIXTURE game does not offer: the avatar keeps
+    // no binding at all (the registration is not refused for it).
     assert_eq!(me.avatar.appearance_ref, None);
     assert!(first.token.starts_with("fmvt_"), "tokens look like tokens: {}", first.token.len());
     // The placement of a joiner is its own: solo, by its own (default) phase, free to advance.
@@ -67,7 +117,7 @@ async fn registration_issues_the_token_once_and_a_token_login_uses_the_stored_pr
     dup.expect_reject_as(RejectCode::AlreadyOnline, "already logged in").await;
 
     // After the first session ends the token logs the same account in again. The look sent with a
-    // token login (tint 99/98/97, "ignored-model") is ignored: the stored profile decides.
+    // token login (tint 99/98/97, another body and slot) is ignored: the stored character decides.
     drop(first.client);
     let again = relogin(server.addr, &first.token).await;
     assert_eq!(again.account, first.account);

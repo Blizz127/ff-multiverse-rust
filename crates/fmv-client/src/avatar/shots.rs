@@ -828,7 +828,7 @@ fn offscreen_real_ff7_npcs_in_two_fields() {
 
         // Pixels.
         let scene = Scene { bounds: view.bounds, triangles: &[], players: &draw.markers, fixture_banner: false, backdrop: view.backdrop.as_ref() };
-        let info = SessionInfo { name: "Cloud".into(), tint: own_tint, area_id: area_id.clone(), fixture: false };
+        let info = SessionInfo { name: "Cloud".into(), tint: own_tint, area_id: area_id.clone(), fixture: false, card: fmv_protocol::CharacterCard::plain("Cloud", own_tint) };
         let anchor = |subject: Subject, at: Pos| label_anchor(draw.built.as_ref(), &view, draw.own_who, subject, at);
         let hud_input = hud::gather_anchored(&state, &info, &view, render_t, &anchor);
         for npc in &npcs {
@@ -890,7 +890,18 @@ fn offscreen_real_ff7_npcs_in_two_fields() {
                 );
                 // (A humanoid's soles are within a few pixels; a door or the like has its origin
                 // elsewhere. A wrong height would be off by far more than this.)
-                assert!(near < 20.0, "{key}: the feet of {} are on the floor where it stands ({near:.1} px off)", npc.name);
+                // The canon cast stand-in (a slice rule: `CANON_STAND_INS`) is a big model, Barret's, which md1_1's steep
+                // camera sees from above, so its boots are in front of its origin on the screen (22 px at 99 px tall
+                // there, against 6 px at 213 px tall in md1stin). Its height is checked directly instead: the walkmesh
+                // surface under it is where the script puts it, and the pixels only have to be near in proportion.
+                let stand_in = fmv_ff7::CANON_STAND_INS.iter().any(|s| s.field.eq_ignore_ascii_case(key) && s.name == npc.name);
+                if stand_in {
+                    let floor = area.height_at(npc.pos.x, npc.pos.y, Some(npc.pos.z)).expect("the stand-in stands on the walkmesh");
+                    assert!((floor - npc.pos.z).abs() < 1.0, "{key}: the stand-in {} stands {:.1} units off the floor", npc.name, floor - npc.pos.z);
+                    assert!(near < 0.3 * (y1 - y0), "{key}: the feet of {} are far from where it stands ({near:.1} px of {:.0})", npc.name, y1 - y0);
+                } else {
+                    assert!(near < 20.0, "{key}: the feet of {} are on the floor where it stands ({near:.1} px off)", npc.name);
+                }
                 assert!(anchor_y.is_some_and(|y| y > view.to_view(npc.pos).map_or(0.0, |p| p.y) + 10.0), "{key}: the name of {} is over its head", npc.name);
                 // A 3x close-up around it.
                 let (cx, cy) = (((x0 + x1) / 2.0) as i64, ((y0 + y1) / 2.0) as i64);
@@ -1002,5 +1013,209 @@ fn real_idle_clips_measured() {
             character.run.frame_count()
         );
         assert!(angle < 0.01 && root < 0.001, "{}: the idle clip moves, so `anim` must play it", model.appearance_ref);
+    }
+}
+
+/// Two players of the owner's own FF7 `md1stin`, each a character of its own: different placeholder bodies in different
+/// colours, standing apart and named by their players (Blizz and Wedge). One holds Barret's combat slot and the other
+/// Tifa's, and nothing in the picture says either: how a player looks on the field (its binding, a placeholder body
+/// tinted with its colour) is a different thing from who it fights as. Drawn through the window's own `field_draw` and
+/// label anchors from the snapshot a server would send, through the real renderer: `field_two_originals.png` in
+/// `$FMV_SHOT_DIR`, a 1920x1080 one and a 3x close-up of each player (`field_two_originals_*`), and the same session's
+/// HUD line (`field_hud_line.png`: it names the slot, so it is a picture of its own). Besides the pictures it checks
+/// that both bodies are tinted for their own players (and that the tint changes pixels towards the player's colour),
+/// and that no drawn text names a canon character.
+///
+/// NOTE: while the table of placeholder bodies is a stand-in (rows built on canon skeletons) the models look like
+/// tinted canon characters.
+#[test]
+#[ignore = "needs the owner's real FF7 data (FMV_FF7_LIBRARY, FMV_FF7_DATA or FMV_FF7_FLEVEL) and a GPU or software Vulkan/GL driver"]
+fn offscreen_field_two_originals() {
+    use crate::avatar::frame::body_tint;
+    use crate::avatar::gpu::Tint;
+    use crate::backdrop::FieldView;
+    use crate::session::SessionInfo;
+    use crate::state::ClientState;
+    use crate::ui::hud::{self, Subject};
+    use crate::window::{field_draw, label_anchor};
+    use fmv_core::{AccountId, AreaId, AvatarAppearance, EntityId, EntitySnapshot, GameId};
+    use fmv_ff7::playable::PLACEHOLDER_BODIES;
+    use fmv_protocol::{CharacterCard, ServerMsg};
+    use real::*;
+
+    let Some(real) = open() else { return };
+    let Some(mut gpu) = Offscreen::new() else { return };
+    let n = PLACEHOLDER_BODIES.len();
+    if n < 2 {
+        eprintln!("skipped: two different placeholder bodies are needed, the table has {n}");
+        return;
+    }
+    // Two different bodies, picked by position and never by name; neither is made of the skeleton of the canon
+    // character whose slot its player holds, whatever the table is (see the note above).
+    let (blizz_body, wedge_body) = (PLACEHOLDER_BODIES[n - 1], PLACEHOLDER_BODIES[(n - 1) / 2]);
+    assert_ne!(blizz_body.model.appearance_ref, wedge_body.model.appearance_ref);
+    let (blizz_tint, wedge_tint) = ([70, 130, 245], [240, 120, 40]);
+
+    let key = "md1stin";
+    let view = timed("field view with the depth-tested scenery", || FieldView::ff7_with(&real.adapter, key, true)).expect("field view");
+    let stage = view.stage.clone().expect("an FF7 field has a stage");
+    let area = real.adapter.load_field(key).expect("field");
+    // Two places a good way apart on the screen, the second 1.3 to 1.8 times as far from the camera as the first (the
+    // platform is a corridor seen end on: players side by side would stand on each other), where a character is a good
+    // size and nothing in front covers it.
+    let mut avatars = avatars(&real);
+    let flat = flat_front(&area);
+    let candidates = spots(&mut avatars, &view, &stage, &area, flat.as_ref(), (450.0, 1300.0));
+    let open_places: Vec<Spot> = candidates.iter().copied().filter(|s| s.covered == 0.0).collect();
+    let first = open_places.iter().copied().min_by(|a, b| a.depth.total_cmp(&b.depth)).expect("an uncovered place on the walkmesh");
+    let centre = |s: &Spot| ((s.view_rect.0 + s.view_rect.2) / 2.0, (s.view_rect.1 + s.view_rect.3) / 2.0);
+    let apart = |s: &Spot| (centre(s).0 - centre(&first).0).hypot(centre(s).1 - centre(&first).1);
+    let second = open_places
+        .iter()
+        .copied()
+        .filter(|s| s.depth > first.depth * 1.3 && s.depth < first.depth * 1.8)
+        .max_by(|a, b| apart(a).total_cmp(&apart(b)))
+        .expect("a second uncovered place a little farther from the camera");
+    let clear = [first, second];
+    eprintln!("places: depth {:.0} and {:.0}, {:.0} view units apart", first.depth, second.depth, apart(&second));
+    assert!(apart(&second) > 60.0, "the two players do not stand on each other: {:.0} view units apart", apart(&second));
+    let toward = {
+        let cams = area.cameras().expect("cameras");
+        let axes = cams[0].axes_f32();
+        toward_camera([f64::from(axes[2][0]), f64::from(axes[2][1]), f64::from(axes[2][2])])
+    };
+
+    // What a server would say: two entities whose binding is a placeholder body each, and no characters of the area.
+    let area_id = AreaId { game: GameId::Ff7, key: key.to_string() };
+    let (own_pos, peer_pos) = (clear[0].pos, clear[1].pos);
+    let mut state = ClientState::new(EntityId(1), AccountId(1), own_pos, area_id.clone());
+    state.change_area(area_id.clone(), own_pos, toward + 0.45, false);
+    let entity = |id: u64, pos: Pos, facing: f32, name: &str, body: &fmv_ff7::playable::PlaceholderBody, tint: [u8; 3]| EntitySnapshot {
+        id: EntityId(id),
+        pos,
+        facing,
+        anim: AnimState::Idle,
+        avatar: AvatarAppearance::new(name, tint, Some(body.model.appearance_ref.to_string())),
+    };
+    let snapshot = ServerMsg::AreaSnapshot {
+        area: area_id.clone(),
+        tick: 1,
+        entities: vec![
+            entity(1, own_pos, toward + 0.45, "Blizz", &blizz_body, blizz_tint),
+            entity(2, peer_pos, toward - 0.45, "Wedge", &wedge_body, wedge_tint),
+        ],
+        npcs: vec![],
+    };
+    assert!(state.apply(0.0, snapshot).is_none());
+
+    // The window's own composition of the frame (the first call loads the models).
+    let (mut epoch, render_t) = (0, 1.0);
+    field_draw(Some(&mut avatars), &mut epoch, &view, &state, blizz_tint, render_t, 0.0);
+    let mut draw = field_draw(Some(&mut avatars), &mut epoch, &view, &state, blizz_tint, render_t, 0.0);
+    {
+        let built = draw.built.as_ref().expect("the models were built");
+        assert_eq!(built.frame.models.len(), 2, "both players are models");
+        assert_eq!(built.frame.tints.len(), 2, "one tint per model");
+        // Each body is tinted with ITS player's colour, and the two colours are not the same.
+        let tint_of = |body: &fmv_ff7::playable::PlaceholderBody| {
+            let i = built.frame.models.iter().position(|m| m.asset.appearance.appearance_ref == body.model.appearance_ref).expect("the body was drawn");
+            built.frame.tints[i]
+        };
+        assert_eq!(tint_of(&blizz_body), body_tint(blizz_tint));
+        assert_eq!(tint_of(&wedge_body), body_tint(wedge_tint));
+        assert_ne!(tint_of(&blizz_body), Tint::NONE);
+        assert_ne!(tint_of(&blizz_body), tint_of(&wedge_body));
+    }
+
+    let info = SessionInfo {
+        name: "Blizz".into(),
+        tint: blizz_tint,
+        area_id: area_id.clone(),
+        fixture: false,
+        card: CharacterCard { name: "Blizz".into(), tint: blizz_tint, body: Some(blizz_body.archetype.into()), binding: Some(blizz_body.model.appearance_ref.into()), slot: Some(1), migrated: false },
+    };
+    let scene = Scene { bounds: view.bounds, triangles: &[], players: &draw.markers, fixture_banner: false, backdrop: view.backdrop.as_ref() };
+    let anchor = |subject: Subject, at: Pos| label_anchor(draw.built.as_ref(), &view, draw.own_who, subject, at);
+    let hud_input = hud::gather_anchored(&state, &info, &view, render_t, &anchor);
+    let labels: Vec<&str> = hud_input.labels.iter().map(|l| l.text.as_str()).collect();
+    assert!(labels.contains(&"Blizz") && labels.contains(&"Wedge"), "both are named: {labels:?}");
+
+    // The HUD line of the same session, which says who the player is and the slot it fights in: a picture of its own
+    // (the one picture of the three that names the slot), drawn first, from the frame as built.
+    state.progress.set_player("Blizz");
+    state.apply(0.0, ServerMsg::CharacterProgress { character: 1, level: 6, exp: 82, exp_to_next: 2, gil: 25, ap: 0, leveled_up: false });
+    let line = hud::progress_line(&state, render_t).expect("the server said something about the character");
+    assert_eq!(line.text, "Blizz (Barret)  Lv 6  EXP 82/84  Gil 25");
+    {
+        let mut overlay = DrawList::new();
+        hud::draw_hud_with(&hud_input, Some(&line), 1100, 680, &mut overlay);
+        assert!(overlay.says("Blizz (Barret)  Lv 6  EXP 82/84  Gil 25"));
+        let img = gpu.render_field(1100, 680, &scene, Some(&draw.built.as_ref().expect("built").frame), &overlay);
+        save("field_hud_line", 1100, 680, &img);
+    }
+
+    // The picture, and what is drawn in it: no text says a canon character (the slots are not the looks).
+    let mut results: Vec<(u32, u32, Vec<u8>)> = Vec::new();
+    for (w, h, name) in [(1100u32, 680u32, "field_two_originals"), (1920, 1080, "field_two_originals_1920x1080")] {
+        let mut overlay = DrawList::new();
+        hud::draw_hud(&hud_input, w, h, &mut overlay);
+        let said: Vec<&str> = overlay.texts().iter().map(|t| t.text.as_str()).collect();
+        for canon in ["Barret", "Tifa", "Cloud", "Aerith", "Aeris", "Red XIII", "Yuffie", "Cait", "Vincent", "Cid"] {
+            assert!(!said.iter().any(|t| t.contains(canon)), "the picture names {canon}: {said:?}");
+        }
+        assert!(said.contains(&"Blizz") && said.contains(&"Wedge"), "{said:?}");
+        let img = timed(&format!("render {w}x{h}"), || gpu.render_field(w, h, &scene, Some(&draw.built.as_ref().expect("built").frame), &overlay));
+        save(name, w, h, &img);
+        results.push((w, h, img));
+    }
+
+    // The tint changes the pixels of each model, and towards its player's colour: the same frame without tints is
+    // the same silhouette in the model's own colours, and in each model's box the tinted picture is bluer for the
+    // blue player and redder for the orange one than the plain one.
+    let (w, h) = (1920u32, 1080u32);
+    let tinted = &results[1].2;
+    let boxes: Vec<(f32, f32, f32, f32)> = (0..2).map(|m| model_bbox(&draw.built.as_ref().expect("built").frame, m, &scene, w, h)).collect();
+    let owners: Vec<[u8; 3]> = (0..2)
+        .map(|m| {
+            let id = draw.built.as_ref().expect("built").frame.models[m].asset.appearance.appearance_ref;
+            if id == blizz_body.model.appearance_ref { blizz_tint } else { wedge_tint }
+        })
+        .collect();
+    draw.built.as_mut().expect("built").frame.tints.clear();
+    let mut overlay = DrawList::new();
+    hud::draw_hud(&hud_input, w, h, &mut overlay);
+    let plain = gpu.render_field(w, h, &scene, Some(&draw.built.as_ref().expect("built").frame), &overlay);
+    for (m, (x0, y0, x1, y1)) in boxes.iter().enumerate() {
+        // The pixels of the box that differ between the tinted and the plain picture, and what they add up to.
+        let (mut changed, mut tinted_sum, mut plain_sum) = (0u32, [0u64; 3], [0u64; 3]);
+        for y in (*y0 as u32)..(*y1 as u32).min(h) {
+            for x in (*x0 as u32)..(*x1 as u32).min(w) {
+                let i = ((y * w + x) * 4) as usize;
+                if tinted[i..i + 3].iter().zip(&plain[i..i + 3]).any(|(a, b)| a.abs_diff(*b) > 10) {
+                    changed += 1;
+                    for k in 0..3 {
+                        tinted_sum[k] += u64::from(tinted[i + k]);
+                        plain_sum[k] += u64::from(plain[i + k]);
+                    }
+                }
+            }
+        }
+        eprintln!("model {m}: {changed} pixels changed by the tint; tinted mean {:?}, plain mean {:?}", tinted_sum.map(|s| s / u64::from(changed.max(1))), plain_sum.map(|s| s / u64::from(changed.max(1))));
+        assert!(changed > 300, "model {m}: the tint reaches the pixels ({changed})");
+        // Towards the player's colour: the share of its dominant channel grows.
+        let share = |sum: [u64; 3], k: usize| sum[k] as f64 / sum.iter().sum::<u64>().max(1) as f64;
+        let dominant = (0..3).max_by_key(|k| owners[m][*k]).expect("a channel");
+        assert!(share(tinted_sum, dominant) > share(plain_sum, dominant), "model {m}: the picture moved towards its player's colour {:?}", owners[m]);
+    }
+
+    // A 3x close-up of each player at 1920x1080, to look at the tint, the face and the layering.
+    for (m, (x0, y0, x1, y1)) in boxes.iter().enumerate() {
+        let (cx, cy) = (((x0 + x1) / 2.0) as i64, ((y0 + y1) / 2.0) as i64);
+        let half = (((x1 - x0).max(y1 - y0) / 2.0) as i64 + 24).clamp(40, 300);
+        let (ox, oy) = ((cx - half).clamp(0, i64::from(w) - 2 * half) as u32, (cy - half).clamp(0, i64::from(h) - 2 * half) as u32);
+        let (cw, ch, crop) = zoom_crop(tinted, w, ox, oy, 2 * half as u32, 2 * half as u32, 3);
+        save_png(&format!("field_two_originals_closeup_{m}"), cw, ch, &crop);
+        let (_, _, plain_crop) = zoom_crop(&plain, w, ox, oy, 2 * half as u32, 2 * half as u32, 3);
+        save_png(&format!("field_two_originals_closeup_{m}_untinted"), cw, ch, &plain_crop);
     }
 }

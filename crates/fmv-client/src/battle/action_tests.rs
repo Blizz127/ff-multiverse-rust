@@ -173,6 +173,7 @@ impl Sim {
             .map(|(i, &account)| BattleMember {
                 entity: EntityId(100 + i as u64),
                 account,
+                name: format!("P{i}"),
                 character: i as u8,
                 level: 6,
                 weapon: None,

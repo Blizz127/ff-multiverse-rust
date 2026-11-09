@@ -19,8 +19,9 @@
 //! walkmesh are projected with.
 
 use super::anim::{Animator, Who};
+use super::gpu::Tint;
 use super::ground::{self, GroundShape, GroundVertex};
-use super::library::{AvatarAsset, AvatarLibrary};
+use super::library::{is_placeholder_body, AvatarAsset, AvatarLibrary};
 use super::scenery::Scenery;
 use super::stage::Stage;
 use crate::backdrop::FieldView;
@@ -43,6 +44,32 @@ pub const RING_RADIUS_UNITS: f32 = 5.5;
 
 const WHITE: [u8; 3] = [255, 255, 255];
 const GOLD: [u8; 3] = crate::render::RING_RGB;
+
+/// The least of each colour channel a placeholder body keeps whatever its player's colour: a channel of the
+/// identity colour at 0 scales the model's own colour by this, at 255 leaves it as it is (see [`body_tint`]).
+/// High enough that the texture detail of the model (a face, clothes, the shading of its vertex colours) stays
+/// readable under any colour, low enough that the colour is plainly the player's.
+pub const BODY_TINT_FLOOR: f32 = 0.45;
+
+/// The colour factor a placeholder body is drawn with: its player's identity colour `c` gives each channel
+/// `BODY_TINT_FLOOR + (1 - BODY_TINT_FLOOR) * c / 255`, so a white identity leaves the model as it is and
+/// a saturated one pulls it towards that colour (the model's own texture is multiplied by it, never replaced).
+/// Opaque: the tint only colours.
+pub fn body_tint(identity: [u8; 3]) -> Tint {
+    let channel = |c: u8| BODY_TINT_FLOOR + (1.0 - BODY_TINT_FLOOR) * f32::from(c) / 255.0;
+    Tint { rgb: identity.map(channel), alpha: 1.0 }
+}
+
+/// What colours the model of `player`: a placeholder body takes its player's identity colour ([`body_tint`]);
+/// everything else keeps its own colours and is marked on the ground only (a canon model, which a legacy
+/// binding names, the default character that stands in for an unknown look, and a non-player character).
+fn model_tint(player: &AvatarPlayer<'_>, asset: &AvatarAsset) -> Tint {
+    if player.npc.is_none() && is_placeholder_body(&asset.appearance) {
+        body_tint(player.tint)
+    } else {
+        Tint::NONE
+    }
+}
 
 /// The model of a non-player character, as an area's data names it: untrusted text from the
 /// server's snapshot, only ever looked up as `char.lgp` entry stems
@@ -85,6 +112,9 @@ pub struct SkinnedModel {
 /// Everything the renderer needs to draw the avatars of one frame.
 pub struct AvatarFrame {
     pub models: Vec<SkinnedModel>,
+    /// The colour factor of each of `models`, in the same order (a model past the end of this list, or every model
+    /// when it is empty, is drawn as it is): a placeholder body in its player's colour, nothing for the rest.
+    pub tints: Vec<Tint>,
     /// The camera's focal length ([`super::stage::StageCamera::zoom`]).
     pub zoom: f32,
     /// Depth bias of the face overlays, in camera-space units.
@@ -268,6 +298,7 @@ impl Avatars {
         order.sort_by(|a, b| is_npc(a.0).cmp(&is_npc(b.0)).then(a.1.total_cmp(&b.1)).then(a.0.cmp(&b.0)));
 
         let mut models: Vec<SkinnedModel> = Vec::new();
+        let mut tints: Vec<Tint> = Vec::new();
         let mut ground_marks_by_player: Vec<(usize, Vec<GroundShape>)> = Vec::new();
         let mut markers: Vec<usize> = Vec::new();
         let mut anchors = HashMap::new();
@@ -307,6 +338,7 @@ impl Avatars {
                 anchors.insert(p.who, anchor);
             }
             ground_marks_by_player.push((i, ground_marks(view, p, stand_in, scale, feet_depth as f32)));
+            tints.push(model_tint(p, &asset));
             models.push(SkinnedModel { asset, positions });
         }
 
@@ -318,6 +350,7 @@ impl Avatars {
         Built {
             frame: AvatarFrame {
                 models,
+                tints,
                 zoom: stage.camera.zoom as f32,
                 overlay_bias: OVERLAY_BIAS_MODEL_UNITS * scale,
                 ground,
@@ -387,6 +420,88 @@ pub(crate) mod tests {
     fn cloud_asset() -> Arc<AvatarAsset> {
         let (mut a, _) = avatars(vec![]);
         a.library.get(Some("ff7/cloud")).asset.unwrap()
+    }
+
+    /// The colour factor: each channel of the identity colour `c` gives `0.45 + 0.55 * c / 255`.
+    #[test]
+    fn the_body_tint_is_the_players_colour_over_a_floor_that_keeps_the_texture_readable() {
+        assert_eq!(BODY_TINT_FLOOR, 0.45);
+        assert_eq!(body_tint([255, 255, 255]), Tint::NONE, "a white identity leaves the model as it is");
+        assert_eq!(body_tint([0, 0, 0]), Tint { rgb: [0.45; 3], alpha: 1.0 }, "black does not black the model out");
+        let red = body_tint([255, 0, 0]);
+        assert_eq!(red.rgb, [1.0, 0.45, 0.45]);
+        assert_eq!(red.alpha, 1.0, "a tint only colours: the model stays opaque");
+        let mid = body_tint([0, 128, 255]);
+        assert!((mid.rgb[1] - (0.45 + 0.55 * 128.0 / 255.0)).abs() < 1e-6 && mid.rgb[2] == 1.0, "{mid:?}");
+        // Monotone in each channel, and always between the floor and 1: a colour never darkens below the floor nor brightens.
+        for c in 0..=255u8 {
+            let t = body_tint([c, c, c]).rgb;
+            assert!(t[0] == t[1] && t[1] == t[2] && (BODY_TINT_FLOOR..=1.0).contains(&t[0]), "{c}: {t:?}");
+            if c > 0 {
+                assert!(t[0] >= body_tint([c - 1, c - 1, c - 1]).rgb[0], "{c}");
+            }
+        }
+        // Different colours are plainly different tints (the whole point of the tint).
+        let (a, b) = (body_tint([70, 130, 245]).rgb, body_tint([240, 120, 40]).rgb);
+        assert!((a[2] - b[2]).abs() > 0.2 && (a[0] - b[0]).abs() > 0.2, "{a:?} {b:?}");
+    }
+
+    /// What is tinted: a placeholder body takes its own player's colour; a canon model (a legacy binding), the
+    /// default character standing in for an unknown look and a non-player character keep their own colours.
+    #[test]
+    fn a_placeholder_body_is_tinted_with_its_players_colour_and_nothing_else_is() {
+        use fmv_ff7::playable::PLACEHOLDER_BODIES;
+        let (mut avatars, _) = avatars(vec![]);
+        let (view, stage) = (view(), stage());
+        let body_a = PLACEHOLDER_BODIES[0].model.appearance_ref;
+        let body_b = PLACEHOLDER_BODIES[PLACEHOLDER_BODIES.len() - 1].model.appearance_ref;
+        let make = |id: u64, x: f32, appearance: Option<&'static str>, tint: [u8; 3]| {
+            let mut p = player(id, Pos::new(x, 0.0, 0.0), 0.0, AnimState::Idle);
+            p.appearance = appearance;
+            p.tint = tint;
+            p
+        };
+        let npc = {
+            let mut p = make(6, 120.0, Some(body_a), [90, 90, 250]);
+            p.npc = Some(NpcRef { model: "agyb", idle: Some("acfe") });
+            p
+        };
+        let players = [
+            make(1, -120.0, Some(body_a), [200, 40, 40]),
+            make(2, -60.0, Some(body_b), [40, 40, 200]),
+            make(3, 0.0, Some("ff7/barret"), [10, 250, 10]),
+            make(4, 60.0, None, [250, 250, 10]),
+            npc,
+        ];
+        let built = avatars.frame(&view, &stage, &players, 0.0).frame;
+        assert_eq!(built.models.len(), players.len());
+        assert_eq!(built.tints.len(), built.models.len(), "one tint per model, in the models' order");
+        // Which model is whose: the frame lists the players nearest first, so find each by the tint it was given
+        // (a body) or by what it is (the others).
+        let by_asset = |name: &str| built.models.iter().position(|m| m.asset.appearance.appearance_ref == name);
+        let tints: Vec<(&str, Tint)> = built.models.iter().zip(&built.tints).map(|(m, t)| (m.asset.appearance.appearance_ref, *t)).collect();
+        // The canon model, the stand-in (Cloud) and the non-player character are untouched.
+        for plain in ["ff7/barret", "ff7/cloud", "npc"] {
+            let i = by_asset(plain).unwrap_or_else(|| panic!("{plain} was drawn: {tints:?}"));
+            assert_eq!(built.tints[i], Tint::NONE, "{plain} keeps its own colours");
+        }
+        // The two bodies carry their own players' colours: the colour a body player has, not another's.
+        let coloured: Vec<Tint> = built.tints.iter().copied().filter(|t| *t != Tint::NONE).collect();
+        assert_eq!(coloured.len(), 2, "{tints:?}");
+        assert!(coloured.contains(&body_tint([200, 40, 40])) && coloured.contains(&body_tint([40, 40, 200])), "{tints:?}");
+        // The same body worn by two players is tinted for each of them.
+        let twins = [make(1, -60.0, Some(body_a), [200, 40, 40]), make(2, 60.0, Some(body_a), [40, 40, 200])];
+        let built = avatars.frame(&view, &stage, &twins, 0.0).frame;
+        assert_eq!(built.models.len(), 2);
+        assert_eq!(built.models[0].asset.id, built.models[1].asset.id, "one asset on the GPU");
+        assert_ne!(built.tints[0], built.tints[1], "two tints for it");
+        // A player that is only a marker has no model and so no tint.
+        let (mut broken, _) = avatars_failing(body_a);
+        assert!(broken.frame(&view, &stage, &twins[..1], 0.0).frame.tints.is_empty());
+    }
+
+    fn avatars_failing(appearance: &'static str) -> (Avatars, Rc<RefCell<Vec<&'static str>>>) {
+        avatars(vec![appearance])
     }
 
     #[test]

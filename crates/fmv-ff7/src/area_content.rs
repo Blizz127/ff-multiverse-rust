@@ -62,8 +62,15 @@
 //!   shown or hidden by a conditional `VISI` is judged by its unconditional ones.
 //!
 //! Placements in the main part (after the first `RET`) and conditional ones are left out
-//! (`NpcSpawn::unconditional` is therefore always `true` for now; the flag stays so a later version
-//! can report story-dependent placements). What the NPC looks like comes from the model-loader
+//! (`NpcSpawn::unconditional` is therefore `true` for every NPC the data places; the flag stays so a later
+//! version can report story-dependent placements). The canon-cast stand-in below is flagged `true` too, although
+//! its placement is the script's conditional one: the server announces only the NPCs flagged so, and the
+//! allowlist is the decision that these characters stand there.
+//!
+//! **The canon cast** is the exception to "`PC` entities are the players": in a few fields the canon party
+//! member's own `PC` entity is reported as an NPC under his canon name, at the one conditional placement the
+//! script gives it ([`CANON_STAND_INS`]: Barret in `md1stin` and `md1_1`). It is a slice rule, an allowlist,
+//! not a statement about the field data (see [`CanonStandIn`]); those NPCs come after the ones the data places. What the NPC looks like comes from the model-loader
 //! record: the skeleton stem, the first animation (by the loader's own ordering convention the
 //! character's standing clip) and the record's name (cut to [`MAX_NPC_LABEL_CHARS`] characters).
 //! The facing is [`field_direction_to_facing`] of the last literal `DIR`, byte 0 without one. At most
@@ -268,8 +275,22 @@ fn npc_of(
     if !init.is_character() || init.is_player() || hidden_by_script(init) {
         return None;
     }
-    let model = init.model_ref.as_ref()?;
     let placement = init_placement(init)?;
+    spawn_of(init, &init.name, placement, true, loader, walkmesh, height_at)
+}
+
+/// The [`NpcSpawn`] of `init` standing where `placement` puts it, called `name`: its model, standing clip,
+/// height and facing as the module docs say. The one piece [`npc_of`] and the canon-cast stand-ins share.
+fn spawn_of(
+    init: &EntityInit,
+    name: &str,
+    placement: &Placement,
+    unconditional: bool,
+    loader: Option<&ModelLoader>,
+    walkmesh: &Walkmesh,
+    height_at: &impl Fn(f32, f32) -> Option<f32>,
+) -> Option<NpcSpawn> {
+    let model = init.model_ref.as_ref()?;
     let (x, y) = placement.xy()?;
     let z = match placement.z.literal() {
         Some(z) => f32::from(z),
@@ -291,12 +312,84 @@ fn npc_of(
         .filter(|s| !s.is_empty());
     let direction = init.direction.and_then(|d| d.value.literal()).unwrap_or(0);
     Some(NpcSpawn {
-        entity_name: init.name.clone(),
+        entity_name: name.to_string(),
         appearance: NpcAppearance { model: stem, idle_animation, label: model.name.chars().take(MAX_NPC_LABEL_CHARS).collect() },
         pos,
         facing: field_direction_to_facing(direction),
-        unconditional: true,
+        unconditional,
     })
+}
+
+// ---------------------------------------------------------------------------------------
+// Canon-cast stand-ins (a slice rule)
+// ---------------------------------------------------------------------------------------
+
+/// A canon party member that the story keeps in a field as a non-player character: **a rule of the multiplayer
+/// slice, not something the field data says**. In the data the character is a `PC` entity (the party member
+/// the single-player game's party leader controls), which the NPC rules above leave out ("those are the
+/// players"), and its only placement is a conditional one. Now that every player is an original character who
+/// merely takes a canon party member's combat slot, the canon character stays in the story: each player sees the
+/// same canon cast, whoever holds which slot, and nobody is drawn with the canon model of the slot they fight as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CanonStandIn {
+    /// The field's key in the archive.
+    pub field: &'static str,
+    /// The `PC` operand of the entity that stands for the character: FF7's character id (Barret 1).
+    pub character: u8,
+    /// The canon name the NPC carries (instead of the script entity name, `ba`).
+    pub name: &'static str,
+}
+
+/// The canon cast shown as NPCs, by field. **A slice stand-in until the story lane places canon characters by
+/// script and phase state**: it is an allowlist, not a rule about every `PC` entity of the 702 fields, because
+/// a story-correct answer needs the script's own conditions (which this adapter does not evaluate). Barret is
+/// in the opening Mako reactor mission, in `md1stin` and `md1_1`, and is reported there at the one (conditional)
+/// placement of his entity: `md1stin` (3921, 27489, 323) and `md1_1` (2264, 1236, 1298). Measured on the
+/// owned Steam copy (`tests/area_real.rs`, `barret_is_a_party_member_in_the_data_and_a_stand_in_npc_in_the_first_reactor_fields`); `md1_2` has
+/// no Barret record, so it has none.
+pub const CANON_STAND_INS: &[CanonStandIn] = &[
+    CanonStandIn { field: "md1stin", character: 1, name: "Barret" },
+    CanonStandIn { field: "md1_1", character: 1, name: "Barret" },
+];
+
+/// The canon-cast stand-ins of `field_name`, after the NPCs the data places (so that the index of an NPC of the
+/// data, which the protocol keeps stable, never moves). Each is flagged `unconditional: true` although its placement
+/// is the script's conditional one, taken as it is: the server announces only the NPCs flagged so (a stand-in
+/// flagged `false` would never reach a client), and the allowlist is what says it stands there. Nothing for a field
+/// that is not in [`CANON_STAND_INS`], or whose script or model-loader section is too big or damaged (the same
+/// guards as the NPCs).
+pub(crate) fn canon_stand_in_spawns(
+    field_name: &str,
+    field: &FieldFile,
+    walkmesh: &Walkmesh,
+    height_at: impl Fn(f32, f32) -> Option<f32>,
+) -> Vec<NpcSpawn> {
+    let wanted: Vec<&CanonStandIn> = CANON_STAND_INS.iter().filter(|s| s.field.eq_ignore_ascii_case(field_name)).collect();
+    if wanted.is_empty() {
+        return Vec::new();
+    }
+    let small = |index: usize| field.section(index).is_ok_and(|s| s.len() <= MAX_NPC_SECTION_BYTES);
+    if !(small(section::SCRIPT) && small(section::MODEL_LOADER)) {
+        return Vec::new();
+    }
+    let Ok(script) = FieldScript::from_field(field) else { return Vec::new() };
+    let Some(models) = field.section(section::MODEL_LOADER).ok().and_then(|s| parse_model_list(s).ok()) else {
+        return Vec::new();
+    };
+    let loader = field.model_loader().ok();
+    script
+        .entity_inits(Some(&models))
+        .iter()
+        .filter_map(|init| {
+            if !init.is_character() || hidden_by_script(init) {
+                return None;
+            }
+            let character = init.player.and_then(|p| p.value.literal())?;
+            let stand_in = wanted.iter().find(|s| s.character == character)?;
+            let placement = init.placement()?;
+            spawn_of(init, stand_in.name, placement, true, loader.as_ref(), walkmesh, &height_at)
+        })
+        .collect()
 }
 
 /// Height of the walkmesh triangle a placement names, at `(x, y)`, when that triangle holds the

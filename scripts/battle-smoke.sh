@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/battle-smoke.sh - shared-battle smoke test for fmv-server + fmv-client (protocol v7).
+# scripts/battle-smoke.sh - shared-battle smoke test for fmv-server + fmv-client (protocol v8).
 #
 # Usage: scripts/battle-smoke.sh [--fixture|--random|--progress|--commands] [--release|--debug]
 #                                [--bin-dir DIR] [--build] [--library STATE_DIR] [--duration SECS]
@@ -52,11 +52,16 @@
 # second "battle started" line carries those levels (levels=[..]: the second battle's EncounterStart
 # carries the level gained), and the second win adds on. Run 3 (a reconnect, no fighting): the SMOKE line
 # shows what run 2 ended with. The server must also have logged one "progress saved" line per member
-# per battle. Both bots are Cloud (a headless bot registers without a look); on the Steam data he
-# starts at level 6 with 610 experience, six short of level 7, so the first win levels him up. The
-# server is not restarted here (the client's token files are keyed by server address, and the server
-# binds a free port): that the saved progress survives a restart is tested by
-# crates/fmv-server/tests/progress.rs.
+# per battle. Both bots are Barret (protocol v8: a headless bot registers asking for no combat slot, and a
+# new character that asks for none gets the server's default, Barret's; two players may hold one slot, and
+# Cloud's is never offered to a new character). On the Steam data Barret starts at level 6 with 385
+# experience, 252 short of level 7, and one win here pays 16: these two wins pay experience, the progress
+# and the drops, and gain no level, so the level-up itself (leveled_up=true, the EncounterStart that
+# carries the level gained) is not reached over real processes here any more (the old Cloud bot started six
+# short of level 7); the server's progress tests cover it. The server is not restarted here (the client's token
+# files are keyed by server address, and the server binds a free port): that the saved progress survives a
+# restart is tested by crates/fmv-server/tests/progress.rs and, over real processes with a real restart, by
+# scripts/slice-smoke.sh.
 #
 # The same chain for ITEMS: each bot's "inventory: stacks=S total=T items=item:count,.." notes (one per
 # Inventory message of the server, the whole inventory) must show, on joining in run 1, the game's
@@ -519,8 +524,9 @@ script_has() {
 }
 
 # progress_note <first|last> <client log>: that `progress:` note of a client (the client's `progress`
-# module writes them: `progress: Cloud level=7 exp=626 exp_to_next=323 gil=20 ap=4 leveled_up=true (was
-# level 6)`), ANSI stripped; nothing if it has none.
+# module writes them: `progress: name=A slot=Barret level=7 exp=626 exp_to_next=323 gil=20 ap=4 leveled_up=true
+# (was level 6)`, the player's own name and the name of its combat slot first; the keys are what is read),
+# ANSI stripped; nothing if it has none.
 progress_note() {
   local which="$1" log="$2" line
   if [[ $which == first ]]; then

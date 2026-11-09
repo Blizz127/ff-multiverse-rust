@@ -17,7 +17,7 @@ use fmv_adapter_api::{AreaInfo, GameAdapter};
 use fmv_core::{AccountId, EntityId, EntitySnapshot, Pos};
 use fmv_fixture::FixtureAdapter;
 use fmv_protocol::{
-    read_msg, write_msg, Auth, ClientMsg, Placement, ProtoError, RejectCode, Secret, ServerMsg, PROTOCOL_VERSION,
+    read_msg, write_msg, Auth, ClientMsg, NewCharacter, Placement, ProtoError, RejectCode, Secret, ServerMsg, PROTOCOL_VERSION,
 };
 use fmv_server::{Server, ServerConfig, ServerError};
 use tokio::io::AsyncWriteExt;
@@ -202,25 +202,21 @@ impl Client {
         self.expect_closed().await;
     }
 
-    /// Hello that REGISTERS `name` (a new account), with a fixed look.
+    /// Hello that REGISTERS `name` (a new account), with a fixed colour and a body and slot the FIXTURE game
+    /// does not offer (it keeps neither).
     pub async fn hello(&mut self, name: &str) {
-        self.hello_with(Auth::Register { display_name: name.into() }, [10, 20, 30], Some("test-model".into())).await;
+        let character = NewCharacter { tint: [10, 20, 30], body: Some("test-body".into()), slot: Some(3) };
+        self.hello_with(Auth::Register { display_name: name.into() }, character).await;
     }
 
-    /// Hello that logs in with a saved token. The look sent with it must be ignored.
+    /// Hello that logs in with a saved token. The character sent with it must be ignored.
     pub async fn hello_token(&mut self, token: &str) {
-        self.hello_with(Auth::Token(Secret::new(token)), [99, 98, 97], Some("ignored-model".into())).await;
+        let character = NewCharacter { tint: [99, 98, 97], body: Some("ignored-body".into()), slot: Some(5) };
+        self.hello_with(Auth::Token(Secret::new(token)), character).await;
     }
 
-    pub async fn hello_with(&mut self, auth: Auth, tint: [u8; 3], appearance_ref: Option<String>) {
-        self.send(&ClientMsg::Hello {
-            protocol_version: PROTOCOL_VERSION,
-            client_build: "integration-test".into(),
-            auth,
-            tint,
-            appearance_ref,
-        })
-        .await;
+    pub async fn hello_with(&mut self, auth: Auth, character: NewCharacter) {
+        self.send(&ClientMsg::Hello { protocol_version: PROTOCOL_VERSION, client_build: "integration-test".into(), auth, character }).await;
     }
 }
 

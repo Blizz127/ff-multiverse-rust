@@ -280,22 +280,18 @@ fn look_in(engine: Option<&BattleState>, actor: ActorId, action: ActionRef) -> L
 }
 
 impl BattleScene {
-    /// The scene of the battle `start` describes and `engine` (the replayed engine) has built.
-    /// `looks[i]` is the look the player of party member `i` has chosen, if known. `None` without
-    /// an engine (nothing is known of who fights): the flat view is used then.
-    pub fn new(start: &SceneStart, engine: Option<&BattleState>, looks: &[Option<String>], kit: &mut ModelKit) -> Option<Self> {
+    /// The scene of the battle `start` describes and `engine` (the replayed engine) has built. A party
+    /// member's model is its combat SLOT's (`BattleMember::character`, see [`model::party_appearance`]):
+    /// nothing about how its player looks on the field is asked. `None` without an engine (nothing is
+    /// known of who fights): the flat view is used then.
+    pub fn new(start: &SceneStart, engine: Option<&BattleState>, kit: &mut ModelKit) -> Option<Self> {
         let engine = engine?;
         let (party_ids, enemy_ids) = (engine.party_ids(), engine.enemy_ids());
         let spots = layout::arrange(start.formation.as_ref(), enemy_ids.len(), party_ids.len());
 
         let mut actors: Vec<Actor> = Vec::with_capacity(party_ids.len() + enemy_ids.len());
         for (i, &id) in party_ids.iter().enumerate() {
-            let who = PartyLook {
-                actor: id,
-                character: start.party.get(i).map_or(0, |m| m.character),
-                look: looks.get(i).cloned().flatten(),
-                mine: Some(id) == start.my_actor,
-            };
+            let who = PartyLook { actor: id, character: start.party.get(i).map_or(0, |m| m.character), mine: Some(id) == start.my_actor };
             let model = kit.source.party_member(&who);
             let rig = kit.rigs.resolve(&model, BoxSpec::for_party(i));
             actors.push(Actor { side: Side::Party, rig, home: spots.party[i] });
@@ -533,6 +529,9 @@ impl BattleScene {
             let cut = location.cuts.get(k)?.get_or_init(|| LocationCut::make(&location.rig, &view.camera)).as_ref()?;
             Some(AvatarFrame {
                 models: vec![SkinnedModel { asset: Arc::clone(&cut.asset), positions: cut.positions.clone() }],
+                // The battle's tints are `BattleFrame::tints` (an actor's opacity, an effect's glow): the frames
+                // themselves carry none.
+                tints: Vec::new(),
                 zoom: view.zoom as f32,
                 overlay_bias: 0.0,
                 ground: Vec::new(),
@@ -545,6 +544,7 @@ impl BattleScene {
             location,
             models: AvatarFrame {
                 models,
+                tints: Vec::new(),
                 zoom: view.zoom as f32,
                 overlay_bias: OVERLAY_BIAS_MODEL_UNITS * model::FIELD_TO_BATTLE_SCALE * 2.0,
                 ground: marks.into_iter().flat_map(|(_, shapes)| shapes).collect(),
@@ -652,22 +652,6 @@ fn placement(pos: [f32; 3], yaw: f32, scale: [f32; 3], fall: f32) -> [f32; 16] {
     mat4_mul(&mat4_translate(pos), &mat4_mul(&basis, &mat4_mul(&tip, &size)))
 }
 
-/// The looks of the players of `party` as this client knows them (ours from our own snapshot, the
-/// others' from the area's remote players), aligned with `party`.
-fn party_looks(state: &ClientState, party: &[BattleMember]) -> Vec<Option<String>> {
-    let remotes = state.remote_views(0.0);
-    party
-        .iter()
-        .map(|m| {
-            if m.entity == state.self_entity() {
-                state.own_appearance().map(str::to_string)
-            } else {
-                remotes.iter().find(|r| r.id == m.entity).and_then(|r| r.appearance.clone())
-            }
-        })
-        .collect()
-}
-
 /// Whether the flat view is forced (`FMV_BATTLE_FLAT` set): an escape hatch for a machine whose
 /// GPU does not like the scene.
 fn flat_forced() -> bool {
@@ -697,9 +681,8 @@ pub fn scene_for<'a>(
     if slot.as_ref().map(BattleScene::id) != Some(view.id) {
         *slot = None;
         let start = state.battle.scene_start().filter(|s| s.id == view.id)?;
-        let looks = party_looks(state, &start.party);
         let kit = kit.get_or_insert_with(ModelKit::from_local_content);
-        *slot = BattleScene::new(&start, state.battle.engine(), &looks, kit);
+        *slot = BattleScene::new(&start, state.battle.engine(), kit);
     }
     let scene = slot.as_mut()?;
     scene.update(now, events, state.battle.engine());

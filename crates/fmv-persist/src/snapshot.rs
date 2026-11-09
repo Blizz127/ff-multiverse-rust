@@ -1,7 +1,7 @@
 //! Consistent copies of a state directory, for rollback before server upgrades.
 //!
 //! A snapshot is a valid state directory in its own right: it holds `index.log` (and the small
-//! `index.json` marker), `accounts/`, `avatars/` and `progression/` but never `LOCK`, temp files
+//! `index.json` marker), `accounts/`, `avatars/`, `characters/` and `progression/` but never `LOCK`, temp files
 //! or the `index.json.v1.bak` backup of a migration. `index.log` is written last and acts as the
 //! completeness marker: opening a half-written snapshot is refused because it has records but
 //! no index. (A snapshot taken by a build that still had the version 1 `index.json` is restored
@@ -19,7 +19,7 @@ use crate::index::{self, LogWriter, INDEX_LOG_FILE};
 use crate::legacy::{self, LegacyState, LEGACY_INDEX_FILE};
 use crate::lock::LOCK_FILE;
 use crate::model::MAX_RECORD_BYTES;
-use crate::store::{ACCOUNTS_DIR, AVATARS_DIR, PROGRESSION_DIR};
+use crate::store::{ACCOUNTS_DIR, AVATARS_DIR, CHARACTERS_DIR, PROGRESSION_DIR};
 
 /// What a snapshot or restore copied.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -82,7 +82,7 @@ fn copy_tree(src: &Path, dest: &Path, live_log: Option<&Mutex<LogWriter>>) -> Re
     let mut info = SnapshotInfo::default();
     fsio::ensure_dir(dest)?;
 
-    for sub in [ACCOUNTS_DIR, AVATARS_DIR] {
+    for sub in [ACCOUNTS_DIR, AVATARS_DIR, CHARACTERS_DIR] {
         let (src_dir, dest_dir) = (src.join(sub), dest.join(sub));
         fsio::ensure_dir(&dest_dir)?;
         copy_dir_files(&src_dir, &dest_dir, &mut info)?;

@@ -94,11 +94,12 @@ use fmv_core::{AccountId, EntityId};
 use fmv_ff7_battle::rng::Rng;
 use fmv_ff7_battle::rules::{ActorId, BattleState, Command, CommandError, Outcome, MAX_STEP_MS};
 use fmv_protocol::{
-    assign_drops, split_rewards, AppliedCommand, BattleId, BattleMember, BattleRejection, BattleReward, BattleRules, BattleSetup,
-    ServerMsg, MAX_BATTLE_PARTY,
+    assign_drops, clip_character_name, split_rewards, AppliedCommand, BattleId, BattleMember, BattleRejection, BattleReward, BattleRules,
+    BattleSetup, ServerMsg, MAX_BATTLE_PARTY,
 };
 
 use super::{is_full, Outbound, World};
+use crate::character::log_token;
 use crate::config::BattleSettings;
 use crate::inventory::Change;
 use crate::progress;
@@ -368,7 +369,10 @@ impl World {
                 // `--debug-limit-full` starts everybody at the cap and `keep_limits` then saves no gauge (module docs).
                 let max_limit = bw.rules().progress_limits().max_limit;
                 let limit = if bw.settings.debug_limit_full { max_limit } else { own.limit.min(max_limit) };
-                Some(BattleMember { entity, account: p.account, character: own.character, level, weapon: None, armor: None, limit })
+                // The roster carries the PLAYER'S OWN name (v8): every peer's panel, list and banners show it, while
+                // `character` (the combat slot) alone decides which combat template the engine uses.
+                let name = clip_character_name(&p.snapshot.avatar.display_name);
+                Some(BattleMember { entity, account: p.account, name, character: own.character, level, weapon: None, armor: None, limit })
             })
             .collect();
 
@@ -422,8 +426,10 @@ impl World {
         }
         // The `key=value` layout is read by `scripts/battle-smoke.sh` ("members=2", and with --progress
         // "levels=[6, 6]"): keep it, and add new keys at the end.
+        // `names=[Blizz,Red%20XIII]`: the players' own names, percent-encoded (`character::log_token`) so that
+        // a name with a space never splits the line; `characters` are their combat slots, in the same order.
         self.logs.info(format!(
-            "battle started battle={} formation={formation} members={} enemies={} preemptive={} back_attack={} seed={seed} characters={:?} levels={:?} limits={:?} run_difficulty={escape}",
+            "battle started battle={} formation={formation} members={} enemies={} preemptive={} back_attack={} seed={seed} characters={:?} levels={:?} limits={:?} run_difficulty={escape} names=[{}]",
             id.0,
             entities.len(),
             info.enemies,
@@ -432,6 +438,7 @@ impl World {
             party.iter().map(|m| m.character).collect::<Vec<_>>(),
             party.iter().map(|m| m.level).collect::<Vec<_>>(),
             party.iter().map(|m| m.limit).collect::<Vec<_>>(),
+            party.iter().map(|m| log_token(&m.name)).collect::<Vec<_>>().join(","),
         ));
         self.fan_to(&entities, start);
         Ok(id)
@@ -474,6 +481,8 @@ impl World {
             }
         }
         let who = battle.members.get(usize::from(actor.0)).map(|m| (m.info.account, m.info.character));
+        // The player's own name, for the log lines below (`name=`, last: the lines are read by key).
+        let name = battle.members.get(usize::from(actor.0)).map(|m| log_token(&m.info.name)).unwrap_or_default();
         // A limit says which one it is, before it empties the gauge (for the log).
         let limit_id = battle.state.limit_for(actor).map(|l| l.attack);
         match battle.state.submit_command(actor, command) {
@@ -486,14 +495,15 @@ impl World {
                 // logged by `spend_item`, after the engine took it; a plain attack is not logged.)
                 let note = match (command, who) {
                     (Command::Magic { spell, target }, Some((account, character))) => Some(format!(
-                        "magic used battle={} actor={} account={} character={character} spell={spell} target={}",
+                        "magic used battle={} actor={} account={} character={character} spell={spell} target={} name={name}",
                         battle_id.0, actor.0, account.0, target.0
                     )),
-                    (Command::Defend, Some((account, character))) => {
-                        Some(format!("defend used battle={} actor={} account={} character={character}", battle_id.0, actor.0, account.0))
-                    }
+                    (Command::Defend, Some((account, character))) => Some(format!(
+                        "defend used battle={} actor={} account={} character={character} name={name}",
+                        battle_id.0, actor.0, account.0
+                    )),
                     (Command::Limit { target }, Some((account, character))) => Some(format!(
-                        "limit used battle={} actor={} account={} character={character} attack={} target={}",
+                        "limit used battle={} actor={} account={} character={character} attack={} target={} name={name}",
                         battle_id.0,
                         actor.0,
                         account.0,
@@ -501,7 +511,7 @@ impl World {
                         target.0
                     )),
                     (Command::Escape, Some((account, character))) => Some(format!(
-                        "escape tried battle={} actor={} account={} character={character} result={} difficulty_left={}",
+                        "escape tried battle={} actor={} account={} character={character} result={} difficulty_left={} name={name}",
                         battle_id.0,
                         actor.0,
                         account.0,
@@ -1536,7 +1546,7 @@ mod tests {
         let members: Vec<Member> = [(&a, 0u8), (&b, 1u8)]
             .iter()
             .map(|(seat, character)| Member {
-                info: BattleMember { entity: seat.entity, account: seat.account, character: *character, level: 5, weapon: None, armor: None, limit: 0 },
+                info: BattleMember { entity: seat.entity, account: seat.account, name: String::from("Tester"), character: *character, level: 5, weapon: None, armor: None, limit: 0 },
                 connected: true,
             })
             .collect();
@@ -1624,6 +1634,36 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// The roster carries the PLAYERS' OWN names (v8), whatever combat template they fight with: two players may hold
+    /// the same slot, and the log says which player and which template, with a name that cannot split a line.
+    #[test]
+    fn the_roster_carries_the_players_own_names_and_the_slot_only_picks_the_template() {
+        let t0 = Instant::now();
+        let mut w = world_with(Some(settings(SyntheticRules::default())), true);
+        // Both hold Barret's slot (1), as two new characters may; one is "A", the other has a space in its name.
+        let a = seat_as(&mut w, "A", t0, ProgressSeed::of(1, None));
+        let b = seat_as(&mut w, "Red XIII", t0, ProgressSeed::of(1, None));
+        assert_eq!(w.party_invite(a.entity, b.entity, t0), crate::world::PartyOutcome::Done);
+        let invite = w.parties.invites().next().expect("an invite").id;
+        assert_eq!(w.party_accept(b.entity, invite, t0), crate::world::PartyOutcome::Done);
+        let (mut a, mut b) = (a, b);
+        assert_eq!(w.request_encounter(a.entity, Some(0), t0), BattleReply::Done);
+        let start = a.battle_msgs();
+        assert_eq!(start, b.battle_msgs());
+        match &start[..] {
+            [ServerMsg::EncounterStart { party, .. }] => {
+                let who: Vec<(&str, u8)> = party.iter().map(|m| (m.name.as_str(), m.character)).collect();
+                assert_eq!(who, vec![("A", 1), ("Red XIII", 1)], "their own names, the same template");
+            }
+            other => panic!("{other:?}"),
+        }
+        let logs = logs_of(&mut w);
+        assert!(
+            logs.iter().any(|l| l.starts_with("battle started battle=1") && l.contains("characters=[1, 1]") && l.ends_with("names=[A,Red%20XIII]")),
+            "{logs:?}"
+        );
     }
 
     /// `--battle-level` pins the fight for everybody; what the accounts have earned is untouched.
@@ -1810,14 +1850,14 @@ mod tests {
         assert_eq!(mirrored_limit(&w, &a), end);
         let logs = logs_of(&mut w);
         assert!(
-            logs.iter().any(|l| l.starts_with("limit used battle=1 actor=0") && l.ends_with("attack=128 target=1")),
+            logs.iter().any(|l| l.starts_with("limit used battle=1 actor=0") && l.ends_with("attack=128 target=1 name=A")),
             "{logs:?}"
         );
         assert!(
             logs.iter().any(|l| l.starts_with("limit kept battle=1") && l.contains(&format!("limit={end} was=255")) && l.contains("mirrored=true saving=queued")),
             "{logs:?}"
         );
-        assert!(logs.iter().any(|l| l.starts_with("battle started battle=1") && l.contains("limits=[255]") && l.ends_with("run_difficulty=1")), "{logs:?}");
+        assert!(logs.iter().any(|l| l.starts_with("battle started battle=1") && l.contains("limits=[255]") && l.ends_with("run_difficulty=1 names=[A]")), "{logs:?}");
         assert!(logs.iter().any(|l| l.starts_with("battle ended battle=1 outcome=Victory") && l.ends_with(&format!("limits=[{end}]"))), "{logs:?}");
         // A win pays as before: the payment is its own job, and the next battle starts from the gauge kept.
         assert_eq!(jobs.iter().filter(|j| j.paid().is_some()).count(), 1);
@@ -1915,8 +1955,8 @@ mod tests {
         let logs = logs_of(&mut w);
         let account = a.account.0;
         let has = |line: String| logs.contains(&line);
-        assert!(has(format!("defend used battle=1 actor=0 account={account} character=0")), "{logs:?}");
-        assert!(has(format!("magic used battle=1 actor=0 account={account} character=0 spell=0 target=0")), "{logs:?}");
+        assert!(has(format!("defend used battle=1 actor=0 account={account} character=0 name=A")), "{logs:?}");
+        assert!(has(format!("magic used battle=1 actor=0 account={account} character=0 spell=0 target=0 name=A")), "{logs:?}");
         assert!(logs.iter().any(|l| l.starts_with("item used battle=1 ") && l.contains("item=0 left=2")), "a Potion of three: {logs:?}");
         assert_eq!(logs.iter().filter(|l| l.starts_with("magic used")).count(), 1, "the refused spell is not logged: {logs:?}");
         assert!(!logs.iter().any(|l| l.contains("spell=99")), "{logs:?}");
@@ -2098,7 +2138,7 @@ mod tests {
         let members: Vec<Member> = [(&a, 0u8), (&b, 1u8)]
             .iter()
             .map(|(seat, character)| Member {
-                info: BattleMember { entity: seat.entity, account: seat.account, character: *character, level: 5, weapon: None, armor: None, limit: 0 },
+                info: BattleMember { entity: seat.entity, account: seat.account, name: String::from("Tester"), character: *character, level: 5, weapon: None, armor: None, limit: 0 },
                 connected: true,
             })
             .collect();

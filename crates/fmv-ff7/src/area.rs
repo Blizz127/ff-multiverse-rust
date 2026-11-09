@@ -709,6 +709,11 @@ impl Ff7FieldArea {
         let mut area = Self { info, field, walkmesh, surface, bounds, spawns, field_scale, exits, npcs: Vec::new(), encounters, story };
         // NPCs without a literal height stand on this area's own surface, so they are worked out last.
         area.npcs = area_content::npc_spawns(&area.field, &area.walkmesh, |x, y| area.height_at(x, y, None));
+        // The canon cast the slice keeps in a few fields (a stand-in rule, see `area_content::CANON_STAND_INS`) comes
+        // AFTER the NPCs of the data, so that their indexes (which the protocol keeps stable) do not move.
+        let stand_ins = area_content::canon_stand_in_spawns(&area.info.id.key, &area.field, &area.walkmesh, |x, y| area.height_at(x, y, None));
+        let room = area_content::MAX_NPCS_PER_AREA.saturating_sub(area.npcs.len());
+        area.npcs.extend(stand_ins.into_iter().take(room));
         area
     }
 

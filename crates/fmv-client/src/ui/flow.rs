@@ -10,7 +10,7 @@ use crate::accounts::{SavedAccount, TokenStore};
 use crate::cli::tint_from_name;
 use crate::login::{plan_login, LoginPlan};
 use crate::net::{clean, NetConfig, NetError, SessionTiming, TokenSink};
-use fmv_protocol::RejectCode;
+use fmv_protocol::{NewCharacter, RejectCode};
 
 /// What a connection attempt needs to know about this client.
 pub struct Env<'a> {
@@ -50,8 +50,9 @@ pub struct Attempt {
     pub cfg: NetConfig,
 }
 
-/// Wrap the sink that saves a registration's token so that it also notes the look the character
-/// was registered with (display only; a failure to write the note is never the player's problem).
+/// Wrap the sink that saves a registration's token so that it also notes the character as it was
+/// registered (its colour, body and slot: display only; a failure to write the note is never the player's
+/// problem). How the game draws it (the binding) is the server's to say: the note has none until the join.
 fn noting_sink(inner: TokenSink, looks: LookCache, server: String, name: String, look: Look) -> TokenSink {
     TokenSink::new(move |token| {
         inner.save(token)?;
@@ -64,11 +65,10 @@ fn noting_sink(inner: TokenSink, looks: LookCache, server: String, name: String,
 /// network configuration for it. `accounts` are the saved accounts the menu's indices refer to.
 /// The `Err` is a message for the screen; nothing has been sent or written yet.
 pub fn prepare(env: &Env<'_>, accounts: &[SavedAccount], action: &MenuAction) -> Result<Attempt, Notice> {
-    let config = |plan: &LoginPlan, tint: [u8; 3], appearance_ref: Option<String>, token_sink: TokenSink| NetConfig {
+    let config = |plan: &LoginPlan, character: NewCharacter, token_sink: TokenSink| NetConfig {
         server: env.server.to_string(),
         auth: plan.auth(),
-        tint,
-        appearance_ref,
+        character,
         client_build: env.client_build.to_string(),
         timing: SessionTiming::DEFAULT,
         token_sink,
@@ -79,11 +79,11 @@ pub fn prepare(env: &Env<'_>, accounts: &[SavedAccount], action: &MenuAction) ->
                 return Err(Notice::error("That saved character is gone.").with_hint("Pick another one from the list."));
             };
             let plan = LoginPlan::Token(account.clone());
-            // A token login ignores the tint and the look: the server uses the stored profile.
-            let cfg = config(&plan, tint_from_name(plan.name()), None, plan.token_sink(env.store, env.server));
+            // A token login ignores the character asked for: the server uses the stored one.
+            let cfg = config(&plan, NewCharacter::with_tint(tint_from_name(plan.name())), plan.token_sink(env.store, env.server));
             Ok(Attempt { plan, cfg })
         }
-        MenuAction::Register { name, tint, appearance } => {
+        MenuAction::Register { name, tint, body, slot } => {
             // `plan_login` also checks that the token can be kept (the directory is writable, a
             // file name is free) BEFORE an account exists whose token would be lost.
             let plan = match plan_login(env.server, Some(name), false, env.store) {
@@ -94,7 +94,7 @@ pub fn prepare(env: &Env<'_>, accounts: &[SavedAccount], action: &MenuAction) ->
                 }
                 Err(text) => return Err(Notice::error(text)),
             };
-            let look = Look { tint: *tint, appearance: appearance.clone() };
+            let look = Look { tint: *tint, appearance: None, body: body.clone(), slot: *slot };
             let sink = noting_sink(
                 plan.token_sink(env.store, env.server),
                 env.looks.clone(),
@@ -102,7 +102,7 @@ pub fn prepare(env: &Env<'_>, accounts: &[SavedAccount], action: &MenuAction) ->
                 name.clone(),
                 look,
             );
-            let cfg = config(&plan, *tint, appearance.clone(), sink);
+            let cfg = config(&plan, NewCharacter { tint: *tint, body: body.clone(), slot: *slot }, sink);
             Ok(Attempt { plan, cfg })
         }
         MenuAction::Quit | MenuAction::Forget { .. } | MenuAction::CancelConnect => {
@@ -179,7 +179,7 @@ mod tests {
     use fmv_adapter_api::GameAdapter;
     use fmv_core::{AccountId, AnimState, AvatarAppearance, EntityId, EntitySnapshot, GameId, Pos, SessionId};
     use fmv_fixture::FixtureAdapter;
-    use fmv_protocol::{read_msg, write_msg, Auth, ClientMsg, Secret, ServerMsg, PROTOCOL_VERSION};
+    use fmv_protocol::{read_msg, write_msg, Auth, CharacterCard, ClientMsg, Secret, ServerMsg, PROTOCOL_VERSION};
     use std::fs;
     use std::time::Duration;
     use tokio::io::{duplex, split};
@@ -212,12 +212,13 @@ mod tests {
         let f = fixture();
         f.store.save_new(SERVER, "Cloud", &Secret::new("tok_cloud")).unwrap();
         f.store.save_new(SERVER, "Tifa", &Secret::new("tok_tifa")).unwrap();
-        f.looks.store(SERVER, "Cloud", &Look { tint: [1, 2, 3], appearance: Some("ff7/cloud".into()) }).unwrap();
+        let seen = Look { tint: [1, 2, 3], appearance: Some("ff7/body/sturdy".into()), body: Some("sturdy".into()), slot: Some(1) };
+        f.looks.store(SERVER, "Cloud", &seen).unwrap();
         let saved = saved_characters(&f.env());
         assert_eq!(saved.accounts.len(), 2);
         assert_eq!(saved.entries.len(), 2);
         assert_eq!(saved.entries[0].name, "Cloud");
-        assert_eq!(saved.entries[0].look, Some(Look { tint: [1, 2, 3], appearance: Some("ff7/cloud".into()) }));
+        assert_eq!(saved.entries[0].look, Some(seen));
         assert_eq!(saved.entries[1].name, "Tifa");
         assert_eq!(saved.entries[1].look, None, "never seen: look unknown");
         assert!(saved.problems.is_empty());
@@ -252,7 +253,7 @@ mod tests {
         assert_eq!(attempt.cfg.auth, Auth::Token(Secret::new("tok_cloud")));
         assert_eq!(attempt.cfg.server, SERVER);
         assert_eq!(attempt.cfg.client_build, "test-build");
-        assert_eq!(attempt.cfg.appearance_ref, None);
+        assert_eq!(attempt.cfg.character, NewCharacter::with_tint(tint_from_name("Cloud")), "only a colour: the server holds the character");
         // The sink of a login ignores a token that arrives anyway (it never overwrites).
         attempt.cfg.token_sink.save(&Secret::new("tok_rogue")).unwrap();
         assert_eq!(f.store.find(SERVER, None).unwrap().unwrap().token.expose(), "tok_cloud");
@@ -271,19 +272,19 @@ mod tests {
     }
 
     #[test]
-    fn registering_sends_the_cleaned_name_the_tint_and_the_look_and_saves_the_token_where_planned() {
+    fn registering_sends_the_cleaned_name_the_tint_the_body_and_the_slot_and_saves_the_token_where_planned() {
         let f = fixture();
-        let action = MenuAction::Register { name: "Cloud".into(), tint: [10, 20, 30], appearance: Some("ff7/tifa".into()) };
+        let action = MenuAction::Register { name: "Cloud".into(), tint: [10, 20, 30], body: Some("slim".into()), slot: Some(2) };
         let attempt = prepare(&f.env(), &[], &action).unwrap();
         assert!(matches!(attempt.plan, LoginPlan::Register { ref name, replace: false } if name == "Cloud"));
         assert_eq!(attempt.cfg.auth, Auth::Register { display_name: "Cloud".into() });
-        assert_eq!(attempt.cfg.tint, [10, 20, 30]);
-        assert_eq!(attempt.cfg.appearance_ref.as_deref(), Some("ff7/tifa"));
-        // When the server's Welcome arrives the sink saves the token and notes the look.
+        assert_eq!(attempt.cfg.character, NewCharacter { tint: [10, 20, 30], body: Some("slim".into()), slot: Some(2) });
+        // When the server's Welcome arrives the sink saves the token and notes the character: the colour, the
+        // body and the slot that were asked for (the binding is the server's to say, after the join).
         attempt.cfg.token_sink.save(&Secret::new("fmvt_new")).unwrap();
         let saved = f.store.find(SERVER, Some("Cloud")).unwrap().unwrap();
         assert_eq!(saved.token.expose(), "fmvt_new");
-        assert_eq!(f.looks.load(SERVER, "Cloud"), Some(Look { tint: [10, 20, 30], appearance: Some("ff7/tifa".into()) }));
+        assert_eq!(f.looks.load(SERVER, "Cloud"), Some(Look { tint: [10, 20, 30], appearance: None, body: Some("slim".into()), slot: Some(2) }));
         // The list now shows the new character with its look.
         let list = saved_characters(&f.env());
         assert_eq!(list.entries[0].name, "Cloud");
@@ -295,7 +296,7 @@ mod tests {
         let f = fixture();
         // The accounts directory is a file: no token could be saved, so no account may be created.
         fs::write(f._dir.path().join(crate::accounts::ACCOUNTS_DIR), "in the way").unwrap();
-        let action = MenuAction::Register { name: "Cloud".into(), tint: [1, 2, 3], appearance: None };
+        let action = MenuAction::Register { name: "Cloud".into(), tint: [1, 2, 3], body: None, slot: None };
         let err = prepare(&f.env(), &[], &action).err().expect("refused");
         assert_eq!(err.kind, NoticeKind::Error);
         assert!(err.text.contains("accounts"), "it says what is wrong: {}", err.text);
@@ -305,7 +306,7 @@ mod tests {
     fn a_name_that_became_a_saved_login_meanwhile_is_not_registered_again() {
         let f = fixture();
         f.store.save_new(SERVER, "Cloud", &Secret::new("tok_cloud")).unwrap();
-        let action = MenuAction::Register { name: "cloud".into(), tint: [1, 2, 3], appearance: None };
+        let action = MenuAction::Register { name: "cloud".into(), tint: [1, 2, 3], body: None, slot: None };
         let err = prepare(&f.env(), &[], &action).err().expect("refused");
         assert!(err.text.contains("already have a saved character"), "{}", err.text);
         assert_eq!(f.store.find(SERVER, None).unwrap().unwrap().token.expose(), "tok_cloud", "untouched");
@@ -317,20 +318,25 @@ mod tests {
         ServerMsg::AreaSnapshot { area: adapter.list_areas().remove(0).id, tick: 1, entities, npcs: vec![] }
     }
 
-    /// Press the keys of a new player (type the name, move to the look, pick the second one, Enter)
-    /// and run the resulting registration through the real handshake against a scripted server.
-    /// The server checks the `Hello` it receives: this is what "Enter = register" means on the wire.
+    /// Press the keys of a new player (type the name, move to the body and pick the second one, choose a
+    /// colour, move to the slot and pick the second one, Enter) and run the resulting registration through
+    /// the real handshake against a scripted server. The server checks the `Hello` it receives: this is what
+    /// "Enter = register" means on the wire.
     #[tokio::test]
     async fn enter_on_the_create_form_registers_on_the_wire() {
         let f = fixture();
         let mut menu = Menu::new(MenuConfig::new(SERVER, GameId::Ff7), vec![]);
         menu.text("  Tifa ");
-        menu.key(KeyPress::new(NavKey::Tab)); // look
-        menu.key(KeyPress::new(NavKey::Right)); // ff7/tifa
+        menu.key(KeyPress::new(NavKey::Tab)); // body
+        menu.key(KeyPress::new(NavKey::Right)); // the next body
         menu.key(KeyPress::new(NavKey::Tab)); // palette
         menu.key(KeyPress::new(NavKey::Right));
-        let chosen = match menu.screen() {
-            Screen::Create(form) => form.tint,
+        for _ in 0..4 {
+            menu.key(KeyPress::new(NavKey::Tab)); // red, green, blue, slot
+        }
+        menu.key(KeyPress::new(NavKey::Right)); // Tifa's slot
+        let (chosen, body) = match menu.screen() {
+            Screen::Create(form) => (form.tint, menu.bodies()[form.body].id),
             other => panic!("{other:?}"),
         };
         let action = menu.key(KeyPress::new(NavKey::Enter)).expect("Enter registers");
@@ -343,16 +349,13 @@ mod tests {
         let server_adapter = FixtureAdapter::new();
         let expected_tint = chosen;
         let script = tokio::spawn(async move {
-            let ClientMsg::Hello { protocol_version, client_build, auth, tint, appearance_ref } =
-                read_msg(&mut srd).await.expect("a Hello")
-            else {
+            let ClientMsg::Hello { protocol_version, client_build, auth, character } = read_msg(&mut srd).await.expect("a Hello") else {
                 panic!("the first message must be Hello")
             };
             assert_eq!(protocol_version, PROTOCOL_VERSION);
             assert_eq!(client_build, "test-build");
             assert_eq!(auth, Auth::Register { display_name: "Tifa".into() }, "the sanitised name");
-            assert_eq!(tint, expected_tint, "the chosen tint");
-            assert_eq!(appearance_ref.as_deref(), Some("ff7/tifa"), "the chosen look");
+            assert_eq!(character, NewCharacter { tint: expected_tint, body: Some(body.to_string()), slot: Some(2) }, "the chosen colour, body and slot");
             let info = server_adapter.list_areas().remove(0);
             write_msg(
                 &mut swr,
@@ -363,6 +366,14 @@ mod tests {
                     entity: EntityId(7),
                     account: AccountId(42),
                     issued_token: Some(Secret::new("fmvt_issued_by_the_server")),
+                    character: CharacterCard {
+                        name: "Tifa".into(),
+                        tint: expected_tint,
+                        body: Some(body.to_string()),
+                        binding: Some(format!("ff7/body/{body}")),
+                        slot: Some(2),
+                        migrated: false,
+                    },
                 },
             )
             .await
@@ -386,7 +397,7 @@ mod tests {
                 pos: Pos::new(0.0, 0.0, 0.0),
                 facing: 0.0,
                 anim: AnimState::Idle,
-                avatar: AvatarAppearance::new("Tifa", expected_tint, Some("ff7/tifa".into())),
+                avatar: AvatarAppearance::new("Tifa", expected_tint, Some(format!("ff7/body/{body}"))),
             };
             write_msg(&mut swr, &snapshot_of(&server_adapter, vec![me])).await.unwrap();
         });
@@ -397,7 +408,11 @@ mod tests {
         let saved = f.store.find(SERVER, Some("Tifa")).unwrap().expect("the token was saved");
         assert_eq!(saved.token.expose(), "fmvt_issued_by_the_server");
         let look = f.looks.load(SERVER, "Tifa").expect("the look was noted");
-        assert_eq!((look.tint, look.appearance.as_deref()), (chosen, Some("ff7/tifa")));
+        assert_eq!((look.tint, look.body.as_deref(), look.slot), (chosen, Some(body), Some(2)));
+        // The server's own card is what the join then remembers (the binding too).
+        f.looks.remember_card(SERVER, "Tifa", &joined.character);
+        let look = f.looks.load(SERVER, "Tifa").expect("the card was remembered");
+        assert_eq!((look.appearance, look.body.as_deref(), look.slot), (Some(format!("ff7/body/{body}")), Some(body), Some(2)));
     }
 
     /// A refused registration comes back as a message and the form is ready for another try.

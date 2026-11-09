@@ -140,17 +140,15 @@ fn enemy(id: Option<u16>) -> EnemyLook {
     EnemyLook { actor: ActorId(3), enemy_id: id, name: "MP".into(), max_hp: 30, level: 2 }
 }
 
-fn party(character: u8, look: Option<&str>) -> PartyLook {
-    PartyLook { actor: ActorId(0), character, look: look.map(str::to_string), mine: true }
+fn party(character: u8) -> PartyLook {
+    PartyLook { actor: ActorId(0), character, mine: true }
 }
 
+/// Battle placeholder: the slot's own battle model. The model of a party member is the character in whose
+/// combat slot it fights (FF7's ids), Cait Sith included (she has a battle model although no field one), and
+/// Cloud for an id that is nobody's.
 #[test]
-fn a_party_member_is_the_character_of_the_look_then_of_the_engine_then_cloud() {
-    // The player's own look, when the table of playable characters knows it, wins.
-    assert_eq!(battle_character(Some("ff7/tifa"), 0), BattleCharacter::Tifa);
-    assert_eq!(battle_character(Some("  FF7/Barret "), 2), BattleCharacter::Barret);
-    // Otherwise the character the engine fights as (FF7's ids), Cait Sith included: she has a
-    // battle model although no field one.
+fn a_party_member_is_the_character_of_its_slot_then_cloud() {
     for (id, want) in [
         (0u8, BattleCharacter::Cloud),
         (1, BattleCharacter::Barret),
@@ -162,19 +160,15 @@ fn a_party_member_is_the_character_of_the_look_then_of_the_engine_then_cloud() {
         (7, BattleCharacter::Vincent),
         (8, BattleCharacter::Cid),
     ] {
-        assert_eq!(battle_character(None, id), want, "character {id}");
-        assert_eq!(battle_character(Some("ff7/nobody"), id), want, "an unknown look falls back to the engine's character");
+        assert_eq!(battle_character(id), want, "slot {id}");
     }
-    // An id the engine does not have: Cloud. A look is never free text: only the table's eight
-    // playable characters can be asked for (not Sephiroth, not a string that merely resembles one).
-    assert_eq!(battle_character(None, 9), BattleCharacter::Cloud);
-    assert_eq!(battle_character(None, 255), BattleCharacter::Cloud);
-    assert_eq!(battle_character(Some("ff7/sephiroth"), 3), BattleCharacter::Aerith);
-    assert_eq!(battle_character(Some("<script>"), 7), BattleCharacter::Vincent);
+    // An id the engine does not have: Cloud.
+    assert_eq!(battle_character(9), BattleCharacter::Cloud);
+    assert_eq!(battle_character(255), BattleCharacter::Cloud);
     // It agrees with the field stand-in's choice wherever a field model exists.
     for id in [0u8, 1, 2, 3, 4, 5, 7, 8] {
-        let field = party_appearance(None, id);
-        assert_eq!(BattleCharacter::from_appearance_ref(field), Some(battle_character(None, id)), "{field}");
+        let field = party_appearance(id);
+        assert_eq!(BattleCharacter::from_appearance_ref(field), Some(battle_character(id)), "{field}");
     }
 }
 
@@ -189,11 +183,11 @@ fn the_archive_source_gives_real_battle_models_with_their_weapons_and_the_locati
     assert_eq!(mp.attachments.len(), 1);
     assert_eq!((mp.attachments[0].key.as_str(), mp.attachments[0].clips.len(), mp.attachments[0].model.bones.len()), ("aqck", 1, 1));
     assert_eq!(mp.model.bones.len(), 1);
-    // A character by the engine's id, and by the player's look over it.
-    let BattleActorModel::Battle(cloud) = source.party_member(&party(0, None)) else { panic!("Cloud is a battle model") };
+    // A character by the slot it fights in (the archive has only Cloud's model: a slot that is not his is not
+    // drawn as him, whatever its player looks like in the field).
+    let BattleActorModel::Battle(cloud) = source.party_member(&party(0)) else { panic!("Cloud is a battle model") };
     assert_eq!((cloud.key.as_str(), cloud.attachments.len()), ("rt", 1));
-    let BattleActorModel::Battle(again) = source.party_member(&party(5, Some("ff7/cloud"))) else { panic!("the look wins") };
-    assert_eq!(again.key, "rt");
+    assert!(matches!(source.party_member(&party(5)), BattleActorModel::Field(Some(ref r)) if r == "ff7/yuffie"), "slot 5 is Yuffie's, not Cloud's");
     // The location of a battle setup.
     let Some(BattleActorModel::Battle(arena)) = source.location(0) else { panic!("location 0 is a battle model") };
     assert_eq!((arena.key.as_str(), arena.model.bones.len(), arena.clips.len(), arena.attachments.len()), ("ba", 1, 1, 0));
@@ -234,8 +228,8 @@ fn an_actor_whose_model_is_not_in_the_archive_gets_the_stand_in() {
         assert!(matches!(source.enemy(&enemy(id)), BattleActorModel::Box(_)), "{id:?}");
     }
     // A character the archive lacks (it has only Cloud) is the field model, as before.
-    assert!(matches!(source.party_member(&party(2, None)), BattleActorModel::Field(Some(ref r)) if r == "ff7/tifa"));
-    assert!(matches!(source.party_member(&party(6, None)), BattleActorModel::Field(Some(ref r)) if r == "ff7/cloud"), "Cait Sith has no field model either");
+    assert!(matches!(source.party_member(&party(2)), BattleActorModel::Field(Some(ref r)) if r == "ff7/tifa"));
+    assert!(matches!(source.party_member(&party(6)), BattleActorModel::Field(Some(ref r)) if r == "ff7/cloud"), "Cait Sith has no field model either");
     // No location: the scene's own floor (none for the 'no location' code, nor for one that is not there).
     assert!(source.location(0xFFFF).is_none());
     assert!(source.location(1).is_none());

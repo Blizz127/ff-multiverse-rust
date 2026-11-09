@@ -1,8 +1,15 @@
-//! Players drawn as their FF7 field character models.
+//! Players drawn as the models their binding names.
 //!
-//! In window mode on an FF7 field, every player (the local one included) is drawn as the model of
-//! the character they chose: the avatar's `appearance_ref` (`ff7/tifa`) is looked up in the table of
-//! playable characters ([`fmv_ff7::resolve_appearance`]); an unknown or missing one stands in as
+//! In window mode on an FF7 field, every player (the local one included) is drawn as the model its
+//! entity's `appearance_ref` names: its BINDING (protocol v8), how the game draws the character, which is a
+//! different thing from the combat slot it fights in (a player who holds Barret's slot is not drawn as Barret).
+//! For a new character the binding is one of the generic placeholder bodies of the owner's own `char.lgp`
+//! (`ff7/body/<archetype>`, [`fmv_ff7::playable::PLACEHOLDER_BODIES`]), which is **tinted with the player's
+//! identity colour** ([`frame::body_tint`], applied through the per-model [`gpu::Tint`]: the model's own
+//! texture scaled per channel by `0.45 + 0.55 * c / 255`, so the colour is plainly the player's and the
+//! texture stays readable); for an account that predates v8 it is the canon model of the look it chose
+//! (`ff7/tifa`), which keeps its own colours like every canon model (the colour is the ring under its feet). The
+//! ref is looked up in both tables ([`fmv_ff7::playable::resolve_model`]); an unknown or missing one stands in as
 //! Cloud with the player's tint shown as a ring under the feet, so such players can still be told
 //! apart. The models are read from **this machine's own** `char.lgp` (found through
 //! `fmv_library::ff7::resolve_char_lgp`, from the same library set as the field archive) and never
@@ -15,7 +22,8 @@
 //! standing in that clip with a shadow under it and no rings, and a marker when its model is not
 //! to be had (never the default character). The players come before them when the number of
 //! models drawn is capped, and the models are cached under the names the area gave, bounded
-//! ([`library::MAX_NPC_MODELS`]) because a server can name new ones in every area.
+//! ([`library::MAX_NPC_MODELS`]: what is left of the GPU's 32 models once the players have their 8 canon characters and
+//! up to 4 placeholder bodies) because a server can name new ones in every area.
 //!
 //! The pieces:
 //!

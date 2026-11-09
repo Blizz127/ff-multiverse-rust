@@ -11,8 +11,7 @@
 use super::draw::{DrawList, Rgba};
 use super::font::Special;
 use super::menu::{
-    appearance_label, list_window, Confirm, ConfirmChoice, CreateForm, Field, Menu, Notice, NoticeKind, Screen, SelectState,
-    Target,
+    list_window, look_label, Confirm, ConfirmChoice, CreateForm, Field, Menu, Notice, NoticeKind, Screen, SelectState, Target,
 };
 use super::palette;
 use super::text::{cell_count, ellipsize, unsupported, wrap};
@@ -236,7 +235,7 @@ fn draw_select(c: &mut Canvas<'_>, menu: &Menu, state: &SelectState, cw: i32, ch
         let right = px + pw - 8 - if account.loose_permissions { 12 } else { 0 };
         let avail = ((right - name_x) / 8).max(4) as usize;
         let look_text = match &account.look {
-            Some(look) => appearance_label(look.appearance.as_deref()),
+            Some(look) => look_label(look),
             None => "look unknown".to_string(),
         };
         let name_cells = cell_count(&account.name).min(avail);
@@ -310,6 +309,48 @@ fn draw_confirm(c: &mut Canvas<'_>, menu: &Menu, confirm: Confirm, cw: i32, ch: 
 
 const LABEL_W: i32 = 60;
 
+/// The widest the create form gets, in canvas units: wide enough for the help line of the Body row on one
+/// line (at the design width of 400 it is the width of the canvas less a margin).
+const CREATE_W: i32 = 440;
+/// What the Body row means, in one short line.
+pub const BODY_HELP: &str = "how you look on the field (a placeholder model)";
+/// What the Slot row means, in one short line (wrapped where the form is narrower than it is long).
+pub const SLOT_HELP: &str = "who you fight as: its combat moves and level curve (fixed once created)";
+/// Height of one line of help text, in canvas units, and the space left under a block of them.
+const HELP_LINE_H: i32 = 10;
+const HELP_PAD: i32 = 2;
+
+/// The height of a block of `lines` help lines.
+fn help_block_h(lines: usize) -> i32 {
+    lines as i32 * HELP_LINE_H + HELP_PAD
+}
+
+/// A help text wrapped to `cells`: on one line when it fits; otherwise the part before its parenthesis and the
+/// parenthesis, each on lines of their own, so that what is in brackets ("(fixed once created)") is not torn apart
+/// when it fits a line by itself. Read back with a space between the lines, it is the text.
+fn wrap_help(text: &str, cells: usize) -> Vec<String> {
+    if cell_count(text) <= cells {
+        return vec![text.to_string()];
+    }
+    match text.split_once(" (") {
+        Some((head, tail)) => {
+            let mut lines = wrap(head, cells);
+            lines.extend(wrap(&format!("({tail}"), cells));
+            lines
+        }
+        None => wrap(text, cells),
+    }
+}
+
+/// The help text of a row, when it has one.
+pub fn field_help(field: Field) -> Option<&'static str> {
+    match field {
+        Field::Body => Some(BODY_HELP),
+        Field::Slot => Some(SLOT_HELP),
+        _ => None,
+    }
+}
+
 /// Where the rows of the create form sit.
 struct FormRows {
     px: i32,
@@ -326,13 +367,67 @@ impl FormRows {
         }
         c.shadowed(self.label_x, ry + (h - 8) / 2, if focused { ACCENT } else { TEXT }, label);
     }
+
+    /// The help lines under a row (the band of a focused row goes on under them), `lines` of them, `ry` is
+    /// where they start. Returns the y after them.
+    fn help(&self, c: &mut Canvas<'_>, focused: bool, ry: i32, lines: &[String]) -> i32 {
+        let h = help_block_h(lines.len());
+        if focused {
+            c.fill(self.px + 3, ry, self.pw - 6, h, HILITE);
+        }
+        for (i, line) in lines.iter().enumerate() {
+            c.shadowed(self.label_x, ry + 1 + i as i32 * HELP_LINE_H, DIM, line);
+        }
+        ry + h
+    }
+}
+
+/// A row that picks one of a few: an arrow each side of the choice, which is centred between them
+/// (19 cells wide: the longest full name, Aerith Gainsborough). The arrows are yellow on the focused row.
+fn picker(c: &mut Canvas<'_>, x: i32, ty: i32, focused: bool, label: &str) {
+    let arrow = if focused { ACCENT } else { BORDER_DIM };
+    c.special(x, ty, arrow, Special::ArrowLeft);
+    c.centered(x + 12, 19 * 8, ty, TEXT, label);
+    c.special(x + 12 + 19 * 8 + 4, ty, arrow, Special::ArrowRight);
 }
 
 fn draw_create(c: &mut Canvas<'_>, menu: &Menu, form: &CreateForm, cw: i32, ch: i32) {
-    let pw = (cw - 16).min(380);
+    let pw = (cw - 8).min(CREATE_W);
     let px = (cw - pw) / 2;
     let compact = ch < DESIGN_H as i32;
-    let mut y = if compact { 4 } else { 8 } + spare_height(ch);
+    let row_h = if compact { 14 } else { 18 };
+    let slider_h = if compact { 10 } else { 12 };
+    let grid_cell = if compact { 11 } else { 12 };
+    let grid_h = 2 * (grid_cell + 3) + 2;
+    let label_x = px + 14;
+    let ctl_x = label_x + LABEL_W + 4;
+    let (bodies, slots) = (form.has_bodies(), form.has_slots());
+
+    // What each row means, wrapped to the room under its label. Where the window has the room for all of it
+    // the lines sit under their rows; where it has not, the focused row's help takes the place of the
+    // key hints under the buttons, so the meaning of a row is never lost to a small window.
+    let help_cells = ((px + pw - 8 - label_x) / 8).max(8) as usize;
+    let body_help = if bodies { wrap_help(BODY_HELP, help_cells) } else { Vec::new() };
+    let slot_help = if slots { wrap_help(SLOT_HELP, help_cells) } else { Vec::new() };
+    let rows_h = 8
+        + row_h
+        + if bodies { row_h } else { 0 }
+        + grid_h
+        + 3 * slider_h
+        + if slots { row_h } else { 0 }
+        + if compact { 0 } else { row_h }
+        + 4;
+    let helps_h = if bodies { help_block_h(body_help.len()) } else { 0 } + if slots { help_block_h(slot_help.len()) } else { 0 };
+    let top = if compact { 4 } else { 8 };
+    // Title, server line, the panel, buttons, key hints, a message if there is one (a few lines) and the game
+    // line: what a window must hold for the help lines to sit under their rows.
+    let notice_h = menu.notice().map_or(0, |n| notice_lines(n, pw).0.len().min(3) as i32 * 10);
+    let chrome = top + 20 + if compact { 0 } else { 14 } + 6 + 20 + 12 + notice_h + 14;
+    let helps = !compact && ch >= chrome + rows_h + helps_h;
+    let panel_h = rows_h + if helps { helps_h } else { 0 };
+    // A third of the spare height goes above the content (never more than there is).
+    let lift = spare_height(ch).min((ch - chrome - panel_h).max(0) / 3);
+    let mut y = top + lift;
     title(c, cw, y, "NEW CHARACTER");
     y += 20;
     if !compact {
@@ -340,21 +435,8 @@ fn draw_create(c: &mut Canvas<'_>, menu: &Menu, form: &CreateForm, cw: i32, ch: 
         y += 14;
     }
 
-    let row_h = if compact { 14 } else { 18 };
-    let slider_h = if compact { 10 } else { 12 };
-    let grid_cell = if compact { 11 } else { 12 };
-    let looks = form.has_looks();
-    let panel_h = 8
-        + row_h
-        + if looks { row_h } else { 0 }
-        + (2 * (grid_cell + 3) + 2)
-        + 3 * slider_h
-        + if compact { 0 } else { row_h }
-        + 4;
     c.panel(px, y, pw, panel_h);
     let mut ry = y + 4;
-    let label_x = px + 14;
-    let ctl_x = label_x + LABEL_W + 4;
 
     let rows = FormRows { px, pw, label_x };
     let row = |c: &mut Canvas<'_>, field: Field, ry: i32, h: i32, label: &str| {
@@ -380,25 +462,19 @@ fn draw_create(c: &mut Canvas<'_>, menu: &Menu, form: &CreateForm, cw: i32, ch: 
     c.text(ctl_x + box_w + 6, ry + (row_h - 8) / 2, DIM, &count);
     ry += row_h;
 
-    // Look.
-    if looks {
-        row(c, Field::Look, ry, row_h, "Look");
-        let options = menu.appearances();
-        let label = options.get(form.appearance).map_or("?", |o| o.label);
-        let focused = form.focus == Field::Look;
-        let arrow = if focused { ACCENT } else { BORDER_DIM };
-        let ty = ry + (row_h - 8) / 2;
-        c.special(ctl_x, ty, arrow, Special::ArrowLeft);
-        c.centered(ctl_x + 12, 19 * 8, ty, TEXT, label);
-        c.special(ctl_x + 12 + 19 * 8 + 4, ty, arrow, Special::ArrowRight);
-        if !compact && px + pw - 8 - (ctl_x + 12 + 19 * 8 + 24) >= 15 * 8 {
-            c.text(ctl_x + 12 + 19 * 8 + 24, ty, DIM, "(preview later)");
-        }
+    // Body: how the character looks on the field.
+    if bodies {
+        row(c, Field::Body, ry, row_h, "Body");
+        let options = menu.bodies();
+        let label = options.get(form.body).map_or("?", |o| o.label);
+        picker(c, ctl_x, ry + (row_h - 8) / 2, form.focus == Field::Body, label);
         ry += row_h;
+        if helps {
+            ry = rows.help(c, form.focus == Field::Body, ry, &body_help);
+        }
     }
 
     // Colour: the palette grid.
-    let grid_h = 2 * (grid_cell + 3) + 2;
     row(c, Field::Palette, ry, grid_h, "Color");
     for index in 0..palette::PALETTE.len() {
         let (col, grow) = palette::cell(index);
@@ -433,6 +509,18 @@ fn draw_create(c: &mut Canvas<'_>, menu: &Menu, form: &CreateForm, cw: i32, ch: 
         ry += slider_h;
     }
 
+    // Slot: who the character fights as.
+    if slots {
+        row(c, Field::Slot, ry, row_h, "Slot");
+        let options = menu.slots();
+        let label = options.get(form.slot).map_or("?", |o| o.label);
+        picker(c, ctl_x, ry + (row_h - 8) / 2, form.focus == Field::Slot, label);
+        ry += row_h;
+        if helps {
+            ry = rows.help(c, form.focus == Field::Slot, ry, &slot_help);
+        }
+    }
+
     // Preview: how the others will see the character.
     if !compact {
         c.fill(px + 8, ry + 1, pw - 16, 1, BORDER_DIM);
@@ -456,9 +544,20 @@ fn draw_create(c: &mut Canvas<'_>, menu: &Menu, form: &CreateForm, cw: i32, ch: 
     c.button(cw / 2 - bw - 6, y, bw, "Create", form.focus == Field::Create);
     c.button(cw / 2 + 6, y, bw, quit_label, form.focus == Field::Back);
     y += 20;
-    if !compact {
-        c.centered(0, cw, y, DIM, "Tab: next   Arrows: change   Enter: create");
-        y += 12;
+    // Under the buttons: the meaning of the focused row when the window had no room to say it under the rows,
+    // else the key hints (which the compact layout leaves out).
+    match field_help(form.focus).filter(|_| !helps && (bodies || slots)) {
+        Some(help) => {
+            for line in wrap_help(help, (cw / 8 - 2).max(8) as usize) {
+                c.centered(0, cw, y, DIM, &line);
+                y += HELP_LINE_H;
+            }
+        }
+        None if !compact => {
+            c.centered(0, cw, y, DIM, "Tab: next   Arrows: change   Enter: create");
+            y += 12;
+        }
+        None => {}
     }
     if unsupported(&form.name.text()) > 0 && !compact {
         c.centered(0, cw, y, DIM, "Characters the font lacks show as boxes.");
@@ -553,6 +652,7 @@ fn draw_alert(c: &mut Canvas<'_>, cw: i32, ch: i32, notice: &Notice) {
 mod tests {
     use super::*;
     use crate::ui::draw::DrawnText;
+    use crate::ui::widgets::SHADOW;
     use crate::ui::menu::{CharacterEntry, KeyPress, Look, MenuConfig, NavKey};
 
     const SIZES: [(u32, u32); 9] =
@@ -565,7 +665,7 @@ mod tests {
     fn entry(name: &str, tint: Option<[u8; 3]>, look: Option<&str>) -> CharacterEntry {
         CharacterEntry {
             name: name.into(),
-            look: tint.map(|t| Look { tint: t, appearance: look.map(str::to_string) }),
+            look: tint.map(|t| Look::plain(t, look)),
             loose_permissions: false,
         }
     }
@@ -587,6 +687,24 @@ mod tests {
     fn rect_of(t: &DrawnText) -> (i32, i32, i32, i32) {
         let w = cell_count(&t.text) as i32 * 8 * t.scale as i32;
         (t.x, t.y, t.x + w, t.y + 8 * t.scale as i32)
+    }
+
+    /// What the screen says, as one string: the drawn texts in drawing order (drop shadows left out, they are
+    /// the same words again), so that a sentence the layout wrapped over several lines reads as one.
+    fn said(list: &DrawList) -> String {
+        list.texts().iter().filter(|t| t.color != SHADOW).map(|t| t.text.as_str()).collect::<Vec<_>>().join(" ")
+    }
+
+    /// No two strings of the screen share a pixel (a drop shadow is the same words again and is left out).
+    fn assert_no_text_overlap(list: &DrawList, what: &str) {
+        let texts: Vec<&DrawnText> = list.texts().iter().filter(|t| t.color != SHADOW).collect();
+        for (i, a) in texts.iter().enumerate() {
+            for b in &texts[i + 1..] {
+                let (ra, rb) = (rect_of(a), rect_of(b));
+                let apart = ra.2 <= rb.0 || rb.2 <= ra.0 || ra.3 <= rb.1 || rb.3 <= ra.1;
+                assert!(apart, "{what}: {:?} {ra:?} overlaps {:?} {rb:?}", a.text, b.text);
+            }
+        }
     }
 
     /// No drawn string sticks out of the window, whatever the window size.
@@ -731,13 +849,15 @@ mod tests {
     }
 
     #[test]
-    fn the_create_screen_shows_the_form_and_the_looks() {
+    fn the_create_screen_shows_the_form_the_body_and_the_slot() {
         let mut menu = Menu::new(cfg(GameId::Ff7), vec![]);
         menu.text("Cloud");
         let list = draw(&menu, 1100, 680);
-        for needle in ["NEW CHARACTER", "Name", "Look", "Cloud Strife", "Color", "Red", "Green", "Blue", "Preview", "Create", "Quit", "5/24"] {
+        let default_body = crate::ui::menu::body_options(GameId::Ff7)[0].label;
+        for needle in ["NEW CHARACTER", "Name", "Body", default_body, "Color", "Red", "Green", "Blue", "Slot", "Barret Wallace", "Preview", "Create", "Quit", "5/24"] {
             assert!(list.says(needle), "missing {needle:?}");
         }
+        assert!(!list.says("Look"), "the old row is gone");
         assert!(list.texts().iter().any(|t| t.text == "Cloud"), "the typed name is in the field");
         assert!(list.says("#"), "the preview shows the colour as hex");
         assert_text_inside(&list, 1100, 680, "create");
@@ -749,20 +869,87 @@ mod tests {
     }
 
     #[test]
-    fn the_fixture_create_form_has_no_look_row() {
+    fn the_fixture_create_form_has_neither_a_body_nor_a_slot_row() {
         let menu = Menu::new(cfg(GameId::Fixture), vec![]);
         let list = draw(&menu, 1100, 680);
         assert!(list.says("Name") && list.says("Color"));
-        assert!(!list.texts().iter().any(|t| t.text == "Look"));
-        assert!(!list.says("Cloud Strife"));
+        assert!(!list.texts().iter().any(|t| t.text == "Body" || t.text == "Slot" || t.text == "Look"));
+        assert!(!list.says("Barret") && !list.says("how you look") && !list.says("who you fight as"));
         assert_text_inside(&list, 1100, 680, "fixture create");
+        assert_no_text_overlap(&list, "fixture create");
+    }
+
+    /// The create screen says what each choice means, in one short line under its row (wrapped where the
+    /// window is narrow): the body is how you look on the field, the slot is who you fight as.
+    #[test]
+    fn each_row_says_what_it_means_under_it_where_the_window_has_room() {
+        let menu = Menu::new(cfg(GameId::Ff7), vec![]);
+        let list = draw(&menu, 1100, 680);
+        let said = said(&list);
+        assert!(said.contains("how you look on the field (a placeholder model)"), "{said}");
+        assert!(said.contains("who you fight as: its combat moves and level curve (fixed once created)"), "{said}");
+        // The help is DIM text under the row it is about: the body's between the Body and Color rows, the slot's
+        // between the Slot row and the Preview line.
+        let y_of = |text: &str| list.texts().iter().find(|t| t.text == text && t.color != SHADOW).map(|t| t.y).unwrap_or_else(|| panic!("{text:?} is drawn"));
+        let (body_row, color_row, slot_row, preview) = (y_of("Body"), y_of("Color"), y_of("Slot"), y_of("Preview"));
+        let body_help = list.texts().iter().find(|t| t.text.starts_with("how you look") && t.color == DIM).expect("the body's help").y;
+        let slot_help = list.texts().iter().find(|t| t.text.starts_with("who you fight") && t.color == DIM).expect("the slot's help").y;
+        assert!(body_row < body_help && body_help < color_row, "{body_row} < {body_help} < {color_row}");
+        assert!(slot_row < slot_help && slot_help < preview, "{slot_row} < {slot_help} < {preview}");
+        // The Body row's help is one line here, the Slot row's wraps over two (it is longer than the window is wide).
+        let helps: Vec<&DrawnText> = list.texts().iter().filter(|t| t.color == DIM && (t.text.starts_with("how you look") || t.text.starts_with("who you fight") || t.text.starts_with("curve") || t.text.starts_with("(fixed"))).collect();
+        assert!(helps.len() >= 3, "{helps:?}");
+    }
+
+    /// In every window size the meaning of the focused choice is on screen: under its row where there is room
+    /// for all the help lines, else in the place of the key hints under the buttons.
+    #[test]
+    fn the_focused_choice_is_explained_at_every_window_size_and_nothing_overlaps() {
+        for (w, h) in SIZES {
+            for (presses, want) in [(1, "how you look on the field (a placeholder model)"), (6, "who you fight as: its combat moves and level curve (fixed once created)")] {
+                let mut menu = Menu::new(cfg(GameId::Ff7), vec![]);
+                for _ in 0..presses {
+                    menu.key(KeyPress::new(NavKey::Tab));
+                }
+                let list = draw(&menu, w, h);
+                assert!(said(&list).contains(want), "{w}x{h}: {want:?} is not on screen: {}", said(&list));
+                assert_text_inside(&list, w, h, "create");
+                assert_no_text_overlap(&list, &format!("create at {w}x{h}"));
+            }
+            // With a name that is long, a refusal on screen and a list to go back to: still no overlap.
+            let mut menu = Menu::new(cfg(GameId::Ff7), sample_accounts());
+            menu.text("n");
+            menu.text(&"W".repeat(24));
+            menu.set_notice(Notice::error("The server refused: that display name is already taken.").with_hint("Change the name and press Enter again."));
+            let list = draw(&menu, w, h);
+            assert_text_inside(&list, w, h, "create with a notice");
+            assert_no_text_overlap(&list, &format!("create with a notice at {w}x{h}"));
+        }
+    }
+
+    /// The list line of a character says its body and its slot where the row has the room.
+    #[test]
+    fn the_select_screen_says_each_characters_body_and_slot() {
+        use crate::ui::menu::Look;
+        let body = fmv_ff7::playable::PLACEHOLDER_BODIES[0];
+        let created = Look { tint: [200, 40, 40], appearance: Some(body.model.appearance_ref.into()), body: Some(body.archetype.into()), slot: Some(1) };
+        let migrated = Look { tint: [40, 40, 200], appearance: Some("ff7/tifa".into()), body: None, slot: Some(2) };
+        let accounts = vec![
+            CharacterEntry { name: "Wedge".into(), look: Some(created), loose_permissions: false },
+            CharacterEntry { name: "Old".into(), look: Some(migrated), loose_permissions: false },
+        ];
+        let list = draw(&Menu::new(cfg(GameId::Ff7), accounts), 1100, 680);
+        let said = said(&list);
+        assert!(said.contains(&format!("{}  slot: Barret", body.label)), "{said}");
+        assert!(said.contains("Tifa Lockhart  slot: Tifa"), "{said}");
+        assert_text_inside(&list, 1100, 680, "select with slots");
     }
 
     #[test]
     fn the_focused_row_is_marked_and_the_mark_follows_tab() {
         let mut menu = Menu::new(cfg(GameId::Ff7), vec![]);
         let pointer = crate::ui::font::cell_uv(crate::ui::font::special_cell(Special::ArrowRight));
-        // The pointer is in the form's left margin; the look row's right arrow is further right.
+        // The pointer is in the form's left margin; the body row's right arrow is further right.
         let ys = |menu: &Menu| -> Vec<i32> {
             draw(menu, 1100, 680).quads().iter().filter(|q| q.uv == pointer && q.x < 550).map(|q| q.y).collect()
         };
@@ -777,7 +964,7 @@ mod tests {
         }
         // The focused field's label is yellow.
         let list = draw(&menu, 1100, 680);
-        let colours: Vec<(&str, Rgba)> = list.texts().iter().filter(|t| ["Name", "Look", "Color", "Red"].contains(&t.text.as_str())).map(|t| (t.text.as_str(), t.color)).collect();
+        let colours: Vec<(&str, Rgba)> = list.texts().iter().filter(|t| ["Name", "Body", "Color", "Red"].contains(&t.text.as_str())).map(|t| (t.text.as_str(), t.color)).collect();
         assert!(colours.iter().any(|(n, c)| *n == "Red" && *c == ACCENT), "{colours:?}");
         assert!(colours.iter().any(|(n, c)| *n == "Name" && *c == TEXT), "{colours:?}");
     }

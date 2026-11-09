@@ -202,6 +202,7 @@ impl Stage {
             tint: self.own_tint,
             area_id: AreaId { game: GameId::Ff7, key: self.key.clone() },
             fixture: false,
+            card: fmv_protocol::CharacterCard::plain("Cloud", self.own_tint),
         };
         let anchor = |subject: Subject, at: Pos| label_anchor(draw.built.as_ref(), &self.view, draw.own_who, subject, at);
         let hud_input = hud::gather_anchored(&self.state, &info, &self.view, render_t, &anchor);

@@ -191,8 +191,7 @@ async fn a_client_that_hangs_up_right_after_its_hello_does_not_burn_its_name() {
             protocol_version: PROTOCOL_VERSION,
             client_build: "ghost".into(),
             auth: Auth::Register { display_name: name.into() },
-            tint: [1, 2, 3],
-            appearance_ref: None,
+            character: fmv_protocol::NewCharacter::with_tint([1, 2, 3]),
         })
         .expect("a Hello encodes")
     };
@@ -242,8 +241,7 @@ fn a_registration_whose_welcome_cannot_be_written_is_released() {
             protocol_version: PROTOCOL_VERSION,
             client_build: "ghost".into(),
             auth: Auth::Register { display_name: "Ghost".into() },
-            tint: [1, 2, 3],
-            appearance_ref: None,
+            character: fmv_protocol::NewCharacter::with_tint([1, 2, 3]),
         })
         .expect("a Hello encodes");
         let mut ghost = std::net::TcpStream::connect(server.addr).expect("connect");

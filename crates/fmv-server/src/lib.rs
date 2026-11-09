@@ -23,9 +23,11 @@
 //! # Accounts and parties
 //!
 //! Every connection authenticates with a token or registers an account (`fmv_persist::Store`,
-//! opened for the server's whole life; see `ServerConfig::state_dir`). A player's display name,
-//! tint and appearance come from its stored avatar profile, never from the client after
-//! registration. Parties are one `fmv_party::PartyManager` inside the `World`; a player that
+//! opened for the server's whole life; see `ServerConfig::state_dir`). A player's name, colour,
+//! appearance binding and combat slot come from its stored player character
+//! (`fmv_persist::PlayerCharacter`, see `character`), never from the client after registration; an
+//! account that predates the record gets one at its first login without anything it has being changed.
+//! Parties are one `fmv_party::PartyManager` inside the `World`; a player that
 //! disconnects leaves its party. The protocol is documented in `fmv_protocol`.
 //!
 //! # Battles
@@ -41,8 +43,9 @@
 //!
 //! # Character progress
 //!
-//! Every account has its own character progress in the game (`progress`): the character its look
-//! names and that character's level, experience, AP and gil, kept in the store as a record of its own,
+//! Every account has its own character progress in the game (`progress`): the character it fights as
+//! (its player character's combat slot) and that character's level, experience, AP and gil, kept in the store
+//! as a record of its own,
 //! separate from the story state that selects its phase. A battle's `EncounterStart` carries each
 //! member's own character and level, a victory pays each member that fought on, and the payment is
 //! applied to the member's progress (with the game's level-up rule), told to it as a
@@ -114,6 +117,7 @@
 //!   walkable points, as long as those are wider than one step.
 
 mod accounts;
+mod character;
 mod config;
 mod conn;
 mod deferred;

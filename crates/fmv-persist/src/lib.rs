@@ -58,6 +58,14 @@
 //!   rewrites the record, and fails the login of an account whose record has grown past that
 //!   build's 4 KiB limit (see [`MAX_CHARACTER_RECORD_BYTES`]): roll back only from a snapshot
 //!   taken before any inventory was stored.
+//! * **A player's original character is its own record, and it points at progress instead of holding it.**
+//!   [`PlayerCharacter`] (`characters/<account>.json`, protocol v8) holds the character's identity (name,
+//!   colour, body choice) and, per game, how that game draws it (the **binding**), which canon combat **slot**
+//!   it fills (fixed at creation) and **pointers** to where its progress lives ([`ProgressRef`]): the
+//!   character-progress record and the story blob stay exactly where the store has always filed them, under
+//!   (account, game). It is created together with the account ([`Store::register_with_character`]) or, for an
+//!   account that predates it, added at its first login ([`Store::ensure_player_character`]); in neither case
+//!   is a file of an older build edited, so a rolled-back server finds every record as it left it.
 //! * **Versioned records.** Every file carries `schema_version`. A newer version than
 //!   [`SCHEMA_VERSION`] (records) or [`INDEX_LOG_VERSION`] (index) is rejected with a clear
 //!   error instead of being misread. A version 1 `index.json` is migrated on open, keeping the
@@ -89,6 +97,7 @@
     )
 )]
 
+mod character;
 mod error;
 mod fsio;
 mod index;
@@ -98,6 +107,10 @@ mod model;
 mod snapshot;
 mod store;
 
+pub use character::{
+    CharacterOrigin, GameCharacter, Identity, LegacyView, LinkedProgress, NewPlayerCharacter, PlayerCharacter, ProgressRef,
+    MAX_PLAYER_CHARACTER_BYTES,
+};
 pub use error::{PersistError, Result};
 pub use model::{
     game_key, parse_game_key, AccountInfo, AvatarId, AvatarProfile, CharacterProgress, Progression,
