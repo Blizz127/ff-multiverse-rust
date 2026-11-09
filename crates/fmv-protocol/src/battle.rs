@@ -492,6 +492,13 @@ pub trait BattleRules: Send + Sync {
     /// The formation a debug encounter uses when none is named and the area has no table.
     fn default_formation(&self) -> Option<u16>;
 
+    /// The canon name of character `character` (FF7: Cloud, Barret, ...): what a battle's roster calls a canon
+    /// companion (protocol v9), which has no player to name it. `None` for an id that is nobody's, and the default for
+    /// a rule set that names nobody: the story's canon party then has no member to put in the battle.
+    fn character_name(&self, _character: u8) -> Option<String> {
+        None
+    }
+
     // ---- used by the server to keep each player's progress (defaults keep older rule sets valid) ----
 
     /// Total experience at which `character` reaches `level` (level 1 is 0), or `None` if this rule
@@ -1009,6 +1016,12 @@ impl BattleRules for Ff7BattleData {
         }
     }
 
+    /// The canon characters' own names (`CharacterId::name`: Cloud, Barret, Tifa, Aerith, Red XIII, Yuffie, Cait Sith,
+    /// Vincent, Cid).
+    fn character_name(&self, character: u8) -> Option<String> {
+        CharacterId::from_index(usize::from(character)).map(|who| who.name().to_string())
+    }
+
     /// The weakest formation: the one whose enemies have the least HP in total (the lowest id on a
     /// tie). Data-derived, so it does not depend on one edition's numbering, and the likeliest to be
     /// winnable by a starting party. A server that wants a particular fight names it
@@ -1229,6 +1242,11 @@ impl BattleRules for SyntheticRules {
 
     fn default_formation(&self) -> Option<u16> {
         Some(0)
+    }
+
+    /// The nine canon names, like the real rules.
+    fn character_name(&self, character: u8) -> Option<String> {
+        CharacterId::from_index(usize::from(character)).map(|who| who.name().to_string())
     }
 
     /// `2 * level * (level - 1)`: level 5 starts at 40, level 6 needs 60, level 7 needs 84 (a step of
