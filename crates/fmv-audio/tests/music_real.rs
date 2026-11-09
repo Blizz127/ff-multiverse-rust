@@ -96,17 +96,20 @@ fn every_ogg_decodes_with_its_loop_tags_and_the_length_the_container_declares() 
 #[ignore = "needs the owner's FF7 audio (FMV_FF7_AUDIO_DATA)"]
 fn the_battle_theme_and_the_fanfare_have_the_tags_and_lengths_ffprobe_reads() {
     let Some(data) = data_dir() else { return };
-    // ffprobe on the same files says: bat has LOOPSTART=192767 LOOPLENGTH=3087428 and lasts 166.68 s;
-    // fanfare has no loop tags and lasts 5.20 s; fan2 has loop tags (182255, 811877) and lasts 54.54 s.
+    // ffprobe on the same files says: bat has LOOPSTART=192767 LOOPLENGTH=3087428 and lasts 7,350,665
+    // frames (166.68 s); fanfare has no loop tags and lasts 5.20 s; fan2 has loop tags (182255,
+    // 811877) and lasts 54.54 s. ffmpeg cuts the last block of an Ogg stream where its final granule
+    // position says; this decoder keeps the whole block (bat: 439 frames, 10 ms, more), which only
+    // ever lengthens a track's very end and never moves a sample or a loop point.
     let bat = decode_music_file(&data.join("music_ogg/bat.ogg")).expect("bat");
     assert_eq!(bat.loop_points(), Some(LoopPoints { start: 192_767, end: Some(192_767 + 3_087_428) }));
-    assert!((bat.duration().as_secs_f64() - 166.68).abs() < 0.01, "{:?}", bat.duration());
+    assert!((7_350_665..7_350_665 + 2_048).contains(&bat.frames()), "{}", bat.frames());
     let fanfare = decode_music_file(&data.join("music_ogg/fanfare.ogg")).expect("fanfare");
     assert_eq!(fanfare.loop_points(), None, "the victory jingle is a one-shot");
-    assert!((fanfare.duration().as_secs_f64() - 5.20).abs() < 0.01, "{:?}", fanfare.duration());
+    assert!((fanfare.duration().as_secs_f64() - 5.1978).abs() < 0.05, "{:?}", fanfare.duration());
     let fan2 = decode_music_file(&data.join("music_ogg/fan2.ogg")).expect("fan2");
     assert_eq!(fan2.loop_points(), Some(LoopPoints { start: 182_255, end: Some(182_255 + 811_877) }));
-    assert!((fan2.duration().as_secs_f64() - 54.54).abs() < 0.01, "{:?}", fan2.duration());
+    assert!((fan2.duration().as_secs_f64() - 54.5377).abs() < 0.05, "{:?}", fan2.duration());
 }
 
 #[test]
@@ -120,15 +123,16 @@ fn the_four_wav_files_decode_as_adpcm_stereo() {
         assert_eq!(music.rate(), 44_100, "{}", name(path));
         assert!(music.loop_points().is_none(), "a WAV has no tags: {}", name(path));
         println!("{}: {} frames, container declares {:?}", name(path), music.frames(), music.declared_frames());
-        // ffprobe: heart 1.38 s, sato 11.36 s, sensui 1.13 s, wind 30.70 s.
+        // ffprobe's sample counts, which come from each file's `fact` chunk: the ADPCM decoder returns
+        // whole blocks (up to 924 frames more), and the music ends where the chunk says.
         let expected = match name(path).as_str() {
-            "heart" => 1.38,
-            "sato" => 11.36,
-            "sensui" => 1.13,
-            "wind" => 30.70,
+            "heart" => 60_847,
+            "sato" => 500_765,
+            "sensui" => 49_976,
+            "wind" => 1_353_760,
             other => panic!("an unexpected wav: {other}"),
         };
-        assert!((music.duration().as_secs_f64() - expected).abs() < 0.02, "{}: {:?}", name(path), music.duration());
+        assert_eq!(music.frames(), expected, "{}", name(path));
     }
 }
 

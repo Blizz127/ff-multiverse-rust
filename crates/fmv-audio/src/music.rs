@@ -427,6 +427,48 @@ mod tests {
         (0..frames).flat_map(|i| [i as i16, -(i as i16)]).collect()
     }
 
+    /// [`wav`] with a `fact` chunk (as ADPCM files have) between `fmt ` and `data`.
+    fn wav_with_fact(rate: u32, channels: u16, interleaved: &[i16], fact: u32) -> Vec<u8> {
+        let plain = wav(rate, channels, interleaved);
+        // 12 bytes of RIFF header and the 24-byte `fmt ` chunk, then the new chunk, then `data`.
+        let mut out = plain[..36].to_vec();
+        out.extend_from_slice(b"fact");
+        out.extend_from_slice(&4u32.to_le_bytes());
+        out.extend_from_slice(&fact.to_le_bytes());
+        out.extend_from_slice(&plain[36..]);
+        let riff_len = (out.len() - 8) as u32;
+        out[4..8].copy_from_slice(&riff_len.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn a_fact_chunk_trims_the_padding_of_the_last_block() {
+        let samples = ramp(1_000);
+        // The audio is 1000 frames long but the file says the music is 700: the rest is padding.
+        let trimmed = decode_music_bytes(wav_with_fact(22_050, 2, &samples, 700), Some("wav")).expect("a wav with a fact chunk");
+        assert_eq!(trimmed.frames(), 700);
+        let mut out = vec![0.0f32; 2_000];
+        assert_eq!(trimmed.source().read(&mut out), Pull::Frames(700));
+        assert_eq!(out[2 * 699], 699.0 / 32_768.0);
+        // A fact count past the audio, or zero, changes nothing.
+        assert_eq!(decode_music_bytes(wav_with_fact(22_050, 2, &samples, 5_000), Some("wav")).expect("wav").frames(), 1_000);
+        assert_eq!(decode_music_bytes(wav_with_fact(22_050, 2, &samples, 0), Some("wav")).expect("wav").frames(), 1_000);
+        // The chunk is found only in a well-formed header, and a lying one never panics.
+        let good = wav_with_fact(22_050, 2, &samples, 700);
+        assert_eq!(wav_fact_frames(&good), Some(700));
+        assert_eq!(wav_fact_frames(&wav(22_050, 2, &samples)), None, "a plain wav has none");
+        assert_eq!(wav_fact_frames(&[]), None);
+        assert_eq!(wav_fact_frames(b"RIFF\0\0\0\0WAVE"), None);
+        assert_eq!(wav_fact_frames(b"RIFX\0\0\0\0WAVEfact\x04\0\0\0\x05\0\0\0"), None, "not RIFF");
+        assert_eq!(wav_fact_frames(b"RIFF\0\0\0\0WAVEfact\x04\0\0\0\x05\0"), None, "cut off in the count");
+        let mut lying = good.clone();
+        lying[16..20].copy_from_slice(&u32::MAX.to_le_bytes()); // the fmt chunk claims to be 4 GB long
+        assert_eq!(wav_fact_frames(&lying), None);
+        for len in 0..good.len() {
+            let _ = wav_fact_frames(&good[..len]);
+        }
+    }
+
     #[test]
     fn a_stereo_wav_decodes_exactly() {
         let samples = ramp(1_000);
