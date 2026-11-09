@@ -34,6 +34,7 @@ mod progress;
 mod render;
 mod session;
 mod state;
+mod story;
 mod ui;
 mod window;
 

@@ -430,8 +430,11 @@ impl PartyMirror {
 /// One line about an instance placement (for the log).
 pub fn describe_placement(p: &Placement) -> String {
     let party = p.party.map_or_else(|| "solo".to_string(), |id| id.to_string());
+    // The phase is opaque: the empty key is the one every new account has, anything else is shown as hex
+    // (it is a few bytes: the server keeps keys small).
+    let phase = if p.key.phase.0.is_empty() { "default".to_string() } else { p.key.phase.0.iter().take(16).map(|b| format!("{b:02x}")).collect() };
     format!(
-        "{} ({party}, story advance {})",
+        "{} ({party}, story advance {}, phase {phase})",
         clean(&p.key.area.to_string()),
         if p.story_advance_allowed { "allowed" } else { "not allowed" }
     )
@@ -830,6 +833,25 @@ mod tests {
         let notes = m.drain_notes();
         assert_eq!(notes.len(), 4);
         assert!(notes.iter().all(|n| n.starts_with("request refused: ") && !n.contains('\n')), "{notes:?}");
+    }
+
+    #[test]
+    fn a_placement_line_names_the_phase_and_the_default_phase_is_the_empty_key() {
+        let placement = |phase: &[u8], party: Option<u64>, allowed: bool| Placement {
+            account: AccountId(1),
+            key: fmv_protocol::InstanceKey::new(fmv_core::AreaId { game: fmv_core::GameId::Ff7, key: "md1stin".into() }, fmv_core::PhaseKey(phase.to_vec())),
+            party: party.map(PartyId),
+            phase_owner: AccountId(1),
+            story_advance_allowed: allowed,
+        };
+        assert_eq!(describe_placement(&placement(&[], None, true)), "Ff7/md1stin (solo, story advance allowed, phase default)");
+        assert_eq!(describe_placement(&placement(&[0x4D, 2, 0], None, true)), "Ff7/md1stin (solo, story advance allowed, phase 4d0200)");
+        assert_eq!(
+            describe_placement(&placement(&[0x4D, 2, 0], Some(1), false)),
+            "Ff7/md1stin (party#1, story advance not allowed, phase 4d0200)"
+        );
+        // Whatever the server sends, the line stays short.
+        assert!(describe_placement(&placement(&[0xAB; 200], None, true)).len() < 100);
     }
 
     #[test]

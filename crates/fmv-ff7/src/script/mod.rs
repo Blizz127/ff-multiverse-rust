@@ -129,7 +129,7 @@ mod opcodes;
 mod text;
 
 #[cfg(test)]
-mod synth;
+pub(crate) mod synth;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

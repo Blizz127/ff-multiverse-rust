@@ -42,6 +42,7 @@
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use fmv_adapter_api::GameAdapter;
 use fmv_core::{AccountId, GameId};
 use fmv_persist::{PersistError, Store};
 use fmv_protocol::{BattleReward, BattleRules};
@@ -102,9 +103,21 @@ impl SaveJob {
     }
 }
 
+/// One story save: the progression blob an account has now (the world's mirror, after a story point
+/// advanced it). Unlike a payment it is a value, not a delta; what keeps it safe is that the write is a
+/// read-modify-write with the adapter's own merge (`GameAdapter::merge_progression`: a story only moves
+/// forward), so two saves arriving in any order, or one arriving after a later login saved more, leave
+/// the furthest story stored, and a record the adapter cannot read is never overwritten.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StoryJob {
+    pub account: AccountId,
+    pub progress: Vec<u8>,
+}
+
 /// What the saver's queue carries.
 pub(crate) enum Msg {
     Save(SaveJob),
+    Story(StoryJob),
     /// Everything before this has been saved; answer and stop.
     Stop(oneshot::Sender<()>),
 }
@@ -127,6 +140,11 @@ impl SaverHandle {
     pub(crate) fn save(&self, job: SaveJob) -> bool {
         self.tx.send(Msg::Save(job)).is_ok()
     }
+
+    /// Queue the story progression `account` has now. `false` if the saver has stopped.
+    pub(crate) fn save_story(&self, account: AccountId, progress: Vec<u8>) -> bool {
+        self.tx.send(Msg::Story(StoryJob { account, progress })).is_ok()
+    }
 }
 
 /// The saver task and the way to stop it.
@@ -136,10 +154,12 @@ pub(crate) struct Saver {
 }
 
 impl Saver {
-    /// Start draining a new queue into `store` for `game`. Needs a running tokio runtime.
-    pub(crate) fn spawn(store: Arc<Store>, game: GameId, rules: Arc<dyn BattleRules>) -> Self {
+    /// Start draining a new queue into `store` for `game`. `rules` are the battle rules of a server
+    /// that runs battles (payments need them; a server without any never queues one), `adapter` is
+    /// what merges a story save into the stored progression. Needs a running tokio runtime.
+    pub(crate) fn spawn(store: Arc<Store>, game: GameId, rules: Option<Arc<dyn BattleRules>>, adapter: Arc<dyn GameAdapter>) -> Self {
         let (handle, rx) = SaverHandle::channel();
-        let task = tokio::spawn(run(rx, store, game, rules));
+        let task = tokio::spawn(run(rx, store, game, rules, adapter));
         Self { handle, task: Mutex::new(Some(task)) }
     }
 
@@ -223,16 +243,88 @@ fn is_transient(error: &PersistError) -> bool {
     matches!(error, PersistError::Io { .. })
 }
 
-async fn run(mut rx: mpsc::UnboundedReceiver<Msg>, store: Arc<Store>, game: GameId, rules: Arc<dyn BattleRules>) {
+/// Merge `job.progress` into the stored progression of `job.account` with the adapter's own rule, as
+/// one atomic read-modify-write, and return the progression that is stored now. The blob is only
+/// rewritten (and `updated_at` moved) when the merge changes it. Blocking: run it off the executor.
+pub(crate) fn persist_story(
+    store: &Store,
+    game: GameId,
+    adapter: &dyn GameAdapter,
+    job: &StoryJob,
+    now: u64,
+) -> Result<fmv_persist::Progression, PersistError> {
+    store.update_progression(job.account, game, |mut current| {
+        let merged = adapter.merge_progression(&current.blob, &job.progress);
+        if merged != current.blob {
+            current.blob = merged;
+            current.updated_at = now;
+        }
+        current
+    })
+}
+
+async fn run(
+    mut rx: mpsc::UnboundedReceiver<Msg>,
+    store: Arc<Store>,
+    game: GameId,
+    rules: Option<Arc<dyn BattleRules>>,
+    adapter: Arc<dyn GameAdapter>,
+) {
     while let Some(msg) = rx.recv().await {
         match msg {
-            Msg::Save(job) => save_one(&store, game, &rules, job).await,
+            Msg::Save(job) => match &rules {
+                Some(rules) => save_one(&store, game, rules, job).await,
+                // A server without battle rules never queues a payment; if one arrives it cannot be applied.
+                None => error!(?job, "a battle payment reached a saver that has no battle rules; it is lost"),
+            },
+            Msg::Story(job) => save_story(&store, game, &adapter, job).await,
             Msg::Stop(done) => {
                 let _ = done.send(());
                 break;
             }
         }
     }
+}
+
+async fn save_story(store: &Arc<Store>, game: GameId, adapter: &Arc<dyn GameAdapter>, job: StoryJob) {
+    let mut waits = RETRY_WAITS.into_iter();
+    let mut attempt = 1u32;
+    loop {
+        let (store, adapter, attempt_job) = (Arc::clone(store), Arc::clone(adapter), job.clone());
+        let result = tokio::task::spawn_blocking(move || persist_story(&store, game, adapter.as_ref(), &attempt_job, unix_now())).await;
+        let failure = match result {
+            Ok(Ok(saved)) => {
+                // `key=value` layout, new keys at the end: `scripts/phase-smoke.sh` counts these lines.
+                info!("story saved account={} bytes={} progress={}", job.account.0, saved.blob.len(), hex_of(&saved.blob));
+                return;
+            }
+            Ok(Err(failure)) => failure,
+            Err(e) => {
+                error!(error = %e, ?job, "the story write task failed; the story step is lost");
+                return;
+            }
+        };
+        match waits.next() {
+            Some(wait) if is_transient(&failure) => {
+                warn!(account = job.account.0, attempt, error = %failure, "could not save story progress; trying again");
+                tokio::time::sleep(wait).await;
+                attempt += 1;
+            }
+            _ => {
+                error!(
+                    "story progress NOT SAVED (the player has it, the store does not): account={} progress={} error={failure}",
+                    job.account.0,
+                    hex_of(&job.progress)
+                );
+                return;
+            }
+        }
+    }
+}
+
+/// Lower-case hex of `bytes`, at most 32 of them (a story blob is a few bytes).
+fn hex_of(bytes: &[u8]) -> String {
+    bytes.iter().take(32).map(|b| format!("{b:02x}")).collect()
 }
 
 async fn save_one(store: &Arc<Store>, game: GameId, rules: &Arc<dyn BattleRules>, job: SaveJob) {
@@ -561,7 +653,7 @@ mod tests {
     async fn shutdown_saves_everything_queued_in_order_and_lets_go_of_the_store() {
         let (dir, store, account) = store();
         let root = dir.path().join("state");
-        let saver = Saver::spawn(Arc::clone(&store), GameId::Ff7, rules());
+        let saver = Saver::spawn(Arc::clone(&store), GameId::Ff7, Some(rules()), adapter());
         let handle = saver.handle();
         for i in 1..=20u32 {
             assert!(handle.save(job(account, 0, i, 1, 1)));
@@ -585,7 +677,7 @@ mod tests {
     #[tokio::test]
     async fn a_payment_that_cannot_be_saved_does_not_hold_up_the_ones_behind_it() {
         let (_dir, store, account) = store();
-        let saver = Saver::spawn(Arc::clone(&store), GameId::Ff7, rules());
+        let saver = Saver::spawn(Arc::clone(&store), GameId::Ff7, Some(rules()), adapter());
         let handle = saver.handle();
         assert!(handle.save(job(AccountId(404), 0, 9, 9, 9))); // no such account: refused, not retried
         assert!(handle.save(job(account, 0, 5, 6, 7)));
@@ -594,6 +686,95 @@ mod tests {
         assert_eq!((p.exp, p.gil, p.ap), (45, 6, 7));
         let ghost = store.get_character_progress(AccountId(404), GameId::Ff7);
         assert!(matches!(ghost, Err(PersistError::UnknownAccount(_))), "nothing was made for the ghost: {ghost:?}");
+    }
+
+    // ---- story saves ----
+
+    /// An adapter that merges progressions like FF7's does (the further moment wins, an unreadable
+    /// record stays); nothing else of it is used by the saver.
+    struct Ff7Merge;
+    impl GameAdapter for Ff7Merge {
+        fn game(&self) -> GameId {
+            GameId::Ff7
+        }
+        fn list_areas(&self) -> Vec<fmv_adapter_api::AreaInfo> {
+            Vec::new()
+        }
+        fn load_area(&self, key: &str) -> Result<Box<dyn fmv_adapter_api::AreaRuntime>, fmv_adapter_api::AdapterError> {
+            Err(fmv_adapter_api::AdapterError::AreaNotFound(key.to_string()))
+        }
+        fn merge_progression(&self, stored: &[u8], advanced: &[u8]) -> Vec<u8> {
+            fmv_ff7::story::merge_progression(stored, advanced)
+        }
+    }
+
+    fn adapter() -> Arc<dyn GameAdapter> {
+        Arc::new(Ff7Merge)
+    }
+
+    fn moment(m: u16) -> Vec<u8> {
+        fmv_ff7::story::StoryState { moment: m }.encode()
+    }
+
+    fn stored_story(store: &Store, account: AccountId) -> Vec<u8> {
+        store.get_progression(account, GameId::Ff7).unwrap().blob
+    }
+
+    #[tokio::test]
+    async fn story_saves_merge_forward_whatever_order_they_arrive_in_and_keep_the_character_record_alone() {
+        let (_dir, store, account) = store();
+        let saver = Saver::spawn(Arc::clone(&store), GameId::Ff7, Some(rules()), adapter());
+        let handle = saver.handle();
+        // A payment and story saves share one queue and do not touch each other's record.
+        assert!(handle.save(job(account, 0, 12, 20, 2)));
+        assert!(handle.save_story(account, moment(7)));
+        assert!(handle.save_story(account, moment(6)), "a late, older save...");
+        assert!(handle.save_story(account, Vec::new()), "...and a new account's blob...");
+        saver.shutdown(Duration::from_secs(20)).await;
+        assert_eq!(stored_story(&store, account), moment(7), "...cannot take the story back");
+        let p = stored(&store, account).expect("the payment was saved too");
+        assert_eq!((p.exp, p.gil, p.ap), (52, 20, 2));
+        // Nothing but the story blob changed in the story record, and it is a plain v7-shaped one.
+        let record = store.get_progression(account, GameId::Ff7).unwrap();
+        assert_eq!((record.schema_version, record.account_id, record.game), (fmv_persist::SCHEMA_VERSION, account, GameId::Ff7));
+    }
+
+    #[tokio::test]
+    async fn a_story_record_the_adapter_cannot_read_is_never_overwritten_by_a_save() {
+        let (_dir, store, account) = store();
+        store.put_progression(&fmv_persist::Progression::new(account, GameId::Ff7, vec![7, 7], NOW)).unwrap();
+        let saver = Saver::spawn(Arc::clone(&store), GameId::Ff7, None, adapter());
+        assert!(saver.handle().save_story(account, moment(9)));
+        saver.shutdown(Duration::from_secs(20)).await;
+        assert_eq!(stored_story(&store, account), vec![7, 7], "the opaque blob is still there");
+    }
+
+    #[tokio::test]
+    async fn a_story_save_that_cannot_be_written_does_not_hold_up_the_ones_behind_it_and_a_server_without_battles_saves_stories() {
+        let (_dir, store, account) = store();
+        // No battle rules at all (a server without battle data), and a save for an account that does not exist.
+        let saver = Saver::spawn(Arc::clone(&store), GameId::Ff7, None, adapter());
+        let handle = saver.handle();
+        assert!(handle.save_story(AccountId(404), moment(6)));
+        assert!(handle.save_story(account, moment(6)));
+        saver.shutdown(Duration::from_secs(20)).await;
+        assert_eq!(stored_story(&store, account), moment(6));
+        assert!(matches!(store.get_progression(AccountId(404), GameId::Ff7), Err(PersistError::UnknownAccount(_))));
+    }
+
+    #[test]
+    fn persisting_a_story_rewrites_the_record_only_when_the_merge_changes_it() {
+        let (_dir, store, account) = store();
+        let rules = adapter();
+        let saved = persist_story(&store, GameId::Ff7, rules.as_ref(), &StoryJob { account, progress: moment(6) }, NOW).unwrap();
+        assert_eq!((saved.blob.clone(), saved.updated_at), (moment(6), NOW));
+        // An equal or older story leaves the blob, and the time of the write that made it, as they are.
+        let again = persist_story(&store, GameId::Ff7, rules.as_ref(), &StoryJob { account, progress: moment(6) }, NOW + 50).unwrap();
+        assert_eq!((again.blob, again.updated_at), (moment(6), NOW));
+        let older = persist_story(&store, GameId::Ff7, rules.as_ref(), &StoryJob { account, progress: moment(2) }, NOW + 60).unwrap();
+        assert_eq!((older.blob, older.updated_at), (moment(6), NOW));
+        let newer = persist_story(&store, GameId::Ff7, rules.as_ref(), &StoryJob { account, progress: moment(8) }, NOW + 70).unwrap();
+        assert_eq!((newer.blob, newer.updated_at), (moment(8), NOW + 70));
     }
 
     #[test]

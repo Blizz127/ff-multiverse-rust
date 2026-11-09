@@ -54,9 +54,17 @@
 //! in the same step, so no ghost member or ghost invite can outlive a connection. The party clock
 //! is milliseconds of the `Instant`s the caller passes in. Placement
 //! (`fmv_party::InstanceSelector`) is told to each player on join, whenever a party change
-//! alters it and whenever the player enters an area (it names the player's own area and the
-//! phase of its leader); it is informational: an area is one instance, whatever the phases of the
-//! players in it.
+//! or the story alters it and whenever the player enters an area (it names the player's own
+//! area and the phase that chose its instance: its own when solo, its leader's in a party).
+//!
+//! # Instances and the story
+//!
+//! A placement is not informational: the world keeps one INSTANCE of an area per story phase that
+//! somebody is in, and every broadcast about an area reaches only the players of one instance. See
+//! the `instances` module (who is where, and how a player changes instance) and the `story` module (what
+//! reaching a story point does to a player's progression). Every account that exists today has the
+//! empty progression, which is the empty phase in every area, so they all share one instance of each
+//! area until one of them advances the story.
 //!
 //! # Areas and travel
 //!
@@ -89,8 +97,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use fmv_adapter_api::{AreaKey, AreaRuntime, GameAdapter, MoveResult};
-use fmv_core::{AccountId, AnimState, AvatarAppearance, EntityId, EntitySnapshot, PhaseKey, Pos, SessionId};
-use fmv_party::{InstanceSelector, Invite, PartyConfig, PartyEvent, PartyManager, PhaseMap, Placement, Tick};
+use fmv_core::{AccountId, AnimState, AvatarAppearance, EntityId, EntitySnapshot, Pos, SessionId};
+use fmv_party::{InstanceRegistry, Invite, PartyConfig, PartyEvent, PartyManager, Placement, Tick};
 use fmv_protocol::{BattleId, PartyName, ServerMsg};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, watch};
@@ -103,7 +111,9 @@ use crate::ServerError;
 
 mod areas;
 mod battle;
+mod instances;
 mod party;
+mod story;
 pub use areas::{TravelReply, AREA_UNLOAD_GRACE, TRAVEL_TIMEOUT};
 pub use battle::BattleReply;
 pub use party::PartyOutcome;
@@ -195,8 +205,9 @@ struct Player {
     session: SessionId,
     /// The authenticated account of this session (never taken from a message).
     account: AccountId,
-    /// The account's story phase for the hosted game (opaque to everything but equality).
-    phase: PhaseKey,
+    /// The account's story progression for the hosted game: the blob only the adapter reads (empty
+    /// for a new account), mirrored here and changed by `story`. The phase of each area comes from it.
+    progression: Vec<u8>,
     snapshot: EntitySnapshot,
     /// Travel budget for the speed rule.
     budget: MoveBudget,
@@ -235,10 +246,11 @@ pub struct NewPlayer {
     /// The authenticated account. At most one session per account may be in the world.
     pub account: AccountId,
     pub avatar: AvatarAppearance,
-    /// The account's story phase for the hosted game.
-    pub phase: PhaseKey,
+    /// The account's story progression for the hosted game (`accounts::Login::progression`): empty for a
+    /// new account. Whatever the area's adapter does not read keeps one phase per distinct blob.
+    pub progression: Vec<u8>,
     /// The character its look names and what the store holds of its character progress (see
-    /// `progress`; unrelated to `phase`).
+    /// `progress`; unrelated to `progression`).
     pub progress: ProgressSeed,
     pub tx: OutboundTx,
     pub close: CloseFlag,
@@ -292,6 +304,9 @@ pub struct World {
     /// The entity of each account's session.
     by_account: BTreeMap<AccountId, EntityId>,
     parties: PartyManager,
+    /// Who stands in which instance of which area (area + story phase): the unit of visibility. See
+    /// `instances`.
+    instances: InstanceRegistry,
     /// Origin of the party clock: party `Tick`s are milliseconds since this instant.
     epoch: Instant,
     /// Battle support (`None`: this server cannot run battles). See `battle`.
@@ -327,6 +342,7 @@ impl World {
             players: BTreeMap::new(),
             by_account: BTreeMap::new(),
             parties: PartyManager::new(party),
+            instances: InstanceRegistry::new(),
             epoch: Instant::now(),
             battle: None,
             saver: None,
@@ -410,7 +426,7 @@ impl World {
             Player {
                 session: new.session,
                 account,
-                phase: new.phase,
+                progression: new.progression,
                 snapshot,
                 budget: MoveBudget::new(now),
                 dirty: false,
@@ -429,13 +445,18 @@ impl World {
         );
         self.by_account.insert(account, entity);
 
-        // The snapshot to the joiner, `PlayerJoined` to the others of the area, then the joiner's
-        // first placement (a solo player is placed by its own phase), third, where its character
-        // stands and, fourth, what it carries.
+        // The snapshot to the joiner (its instance's entities), `PlayerJoined` to the others of that
+        // instance, then the joiner's first placement (a solo player is placed by its own phase),
+        // third, where its character stands and, fourth, what it carries. An account whose story is not a
+        // new account's (it advanced it before) is then told where its story stands; a new account gets
+        // exactly the messages it always got.
         let mut failed = Vec::new();
         self.announce_entry(entity, &mut failed);
         self.tell_progress(entity, false, &mut failed);
         self.tell_inventory(entity, &mut failed);
+        if self.players.get(&entity).is_some_and(|p| !p.progression.is_empty()) {
+            self.tell_story(entity, None, &mut failed);
+        }
         self.drop_failed(failed);
         Ok(pos)
     }
@@ -456,13 +477,14 @@ impl World {
     fn remove_player(&mut self, entity: EntityId, failed: &mut Vec<(EntityId, bool)>) -> Option<Player> {
         let player = self.players.remove(&entity)?;
         self.by_account.remove(&player.account);
+        // A player in transit is in no instance: the one it left was told already.
+        let left = self.leave_instance(player.account);
         if let Some(battle) = player.battle {
             self.member_gone(battle, entity);
         }
         self.leave_party_state(&player, failed);
-        // A player in transit is in no area: the area it left was told already.
-        if player.transit.is_none() {
-            self.tell_area(&player.area, Arc::new(ServerMsg::PlayerLeft { entity }), failed);
+        if let Some(instance) = left {
+            self.tell_instance(instance, Arc::new(ServerMsg::PlayerLeft { entity }), failed);
         }
         Some(player)
     }
@@ -524,6 +546,8 @@ impl World {
                 p.snapshot.anim = anim;
                 p.budget.tokens -= dist;
                 p.dirty |= changed;
+                // Reaching a story point is what advances the story (a no-op in an area without any).
+                self.check_story(entity, from, accepted);
                 // Walking is what rolls random encounters (a no-op without an encounter table).
                 self.roll_encounter(entity, dist, now);
                 MoveOutcome::Applied
@@ -543,22 +567,24 @@ impl World {
         }
     }
 
-    /// Advance the tick counter and broadcast, per area, one `EntityUpdate` with every entity of
-    /// that area that changed since the previous tick (nothing is sent to an area where nothing
+    /// Advance the tick counter and broadcast, per instance, one `EntityUpdate` with every entity of
+    /// that instance that changed since the previous tick (nothing is sent to an instance where nothing
     /// changed). Returns the new tick.
     pub fn advance_tick(&mut self) -> u64 {
         self.tick += 1;
-        let mut changed: BTreeMap<AreaKey, Vec<EntitySnapshot>> = BTreeMap::new();
+        let mut changed: BTreeMap<fmv_party::InstanceId, Vec<EntitySnapshot>> = BTreeMap::new();
         for p in self.players.values_mut().filter(|p| p.dirty) {
             p.dirty = false;
-            // A player in transit is in no area: nobody is told about it moving.
+            // A player in transit is in no instance: nobody is told about it moving.
             if p.transit.is_none() {
-                changed.entry(p.area.clone()).or_default().push(p.snapshot.clone());
+                if let Some(instance) = self.instances.instance_of(p.account) {
+                    changed.entry(instance).or_default().push(p.snapshot.clone());
+                }
             }
         }
-        for (area, entities) in changed {
+        for (instance, entities) in changed {
             let mut failed = Vec::new();
-            self.tell_area(&area, Arc::new(ServerMsg::EntityUpdate { tick: self.tick, entities }), &mut failed);
+            self.tell_instance(instance, Arc::new(ServerMsg::EntityUpdate { tick: self.tick, entities }), &mut failed);
             self.drop_failed(failed);
         }
         self.tick
@@ -639,46 +665,6 @@ impl World {
             }
         }
         self.refresh_placements(&moved, failed);
-    }
-
-    /// Compute the placement of each online account in `accounts` (`InstanceSelector`: solo by its
-    /// own phase, in a party by the leader's) and tell the ones whose placement differs from what
-    /// they were last told.
-    fn refresh_placements(&mut self, accounts: &BTreeSet<AccountId>, failed: &mut Vec<(EntityId, bool)>) {
-        if accounts.is_empty() {
-            return;
-        }
-        let phases: PhaseMap = self.players.values().map(|p| (p.account, p.phase.clone())).collect();
-        for &account in accounts {
-            let Some(&entity) = self.by_account.get(&account) else { continue };
-            // Placement is per area: the player's own, with its party leader's phase. A player in
-            // transit has none until it has entered the next area.
-            let Some(area_id) = self
-                .players
-                .get(&entity)
-                .filter(|p| p.transit.is_none())
-                .and_then(|p| self.areas.get(&p.area))
-                .map(|a| a.id().clone())
-            else {
-                continue;
-            };
-            let party = self.parties.party_of(account).cloned();
-            let placement = match InstanceSelector::select(&area_id, account, party.as_ref(), &phases) {
-                Ok(placement) => placement,
-                Err(e) => {
-                    self.logs.warn(format!("cannot compute a placement account={} error={e}", account.0));
-                    continue;
-                }
-            };
-            let Some(player) = self.players.get_mut(&entity) else { continue };
-            if player.placement.as_ref() == Some(&placement) {
-                continue;
-            }
-            player.placement = Some(placement.clone());
-            if let Err(e) = player.tx.try_send(Arc::new(ServerMsg::InstancePlacement { placement })) {
-                failed.push((entity, is_full(&e)));
-            }
-        }
     }
 
     /// A player is leaving the world: leave its party (the others hear `LeaderChanged` /
@@ -816,6 +802,7 @@ fn dist_xy(a: Pos, b: Pos) -> f64 {
 mod tests {
     use super::*;
     use fmv_adapter_api::{AreaInfo, Bounds, GameAdapter};
+    use fmv_core::PhaseKey;
     use fmv_fixture::{FixtureAdapter, FIXTURE_AREA_KEY};
     use std::sync::Mutex;
 
@@ -847,7 +834,7 @@ mod tests {
         let close_rx = close.subscribe();
         let avatar = AvatarAppearance { display_name: name.into(), tint: [1, 2, 3], appearance_ref: None };
         let account = AccountId(entity.0);
-        w.join(NewPlayer { session, entity, account, avatar, phase: PhaseKey::default(), progress: Default::default(), tx, close }, now)
+        w.join(NewPlayer { session, entity, account, avatar, progression: Vec::new(), progress: Default::default(), tx, close }, now)
             .expect("a fresh account joins");
         Seat { entity, rx, close: close_rx }
     }
@@ -1342,7 +1329,7 @@ mod tests {
             entity,
             account: AccountId(entity.0),
             avatar,
-            phase: PhaseKey(phase.to_vec()),
+            progression: phase.to_vec(),
             progress: Default::default(),
             tx,
             close,
@@ -1411,7 +1398,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(16);
         let close = Arc::new(watch::channel(false).0);
         let avatar = AvatarAppearance { display_name: "A again".into(), tint: [0; 3], appearance_ref: None };
-        let dup = NewPlayer { session, entity, account: acct(&a), avatar, phase: PhaseKey::default(), progress: Default::default(), tx, close };
+        let dup = NewPlayer { session, entity, account: acct(&a), avatar, progression: Vec::new(), progress: Default::default(), tx, close };
         assert_eq!(w.join(dup, t0).unwrap_err(), JoinError::AlreadyOnline);
         assert_eq!(w.player_count(), 1);
         assert!(w.snapshot_of(entity).is_none());
@@ -1427,7 +1414,7 @@ mod tests {
             entity,
             account: acct(&a),
             avatar: AvatarAppearance { display_name: "A".into(), tint: [0; 3], appearance_ref: None },
-            phase: PhaseKey::default(),
+            progression: Vec::new(),
             progress: Default::default(),
             tx,
             close,
