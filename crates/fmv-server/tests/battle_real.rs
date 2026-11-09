@@ -18,6 +18,7 @@ use std::sync::Arc;
 use fmv_ff7::field::section;
 use fmv_ff7_battle::rules::{BattleEvent, Command, Outcome};
 use fmv_protocol::{BattleRules, BattleSetup, Ff7BattleData};
+use fmv_server::companion::{self, Pacing, PlayerTurn};
 use fmv_server::ff7::{decode_encounter_section, open_battle_data, open_ff7, prewarm, Ff7Source};
 
 fn source() -> Option<Ff7Source> {
@@ -44,10 +45,29 @@ struct Sim {
     acted: Vec<usize>,
     /// Party members dead at the end (companions included).
     dead: usize,
+    /// Attacks made by the canon companions, all together.
+    companion_attacks: usize,
+    /// Whether each PLAYER is alive at the end.
+    players_alive: Vec<bool>,
 }
 
+/// One simulated battle (see [`Sim`]) with the server's companion pacing (`companion::may_act`: the players go first) and players who take
+/// `player_delay_ms` of battle time to choose once their gauge is full (0: a headless bot, which answers at once). The
+/// order within a slice is the server's: the engine steps, the companions that may act do (`companions_act` runs after
+/// every step), then the players' commands arrive.
 #[allow(clippy::too_many_arguments)]
-fn simulate_with(data: &Ff7BattleData, formation: u16, characters: &[u8], level: Option<u8>, canon: bool, seed: u64, speed: u8, tps: u32) -> Sim {
+fn simulate_paced(
+    data: &Ff7BattleData,
+    formation: u16,
+    characters: &[u8],
+    level: Option<u8>,
+    canon: bool,
+    seed: u64,
+    speed: u8,
+    tps: u32,
+    pacing: Pacing,
+    player_delay_ms: u32,
+) -> Sim {
     let players: Vec<fmv_protocol::BattleMember> = characters
         .iter()
         .enumerate()
@@ -82,6 +102,10 @@ fn simulate_with(data: &Ff7BattleData, formation: u16, characters: &[u8], level:
     };
     let mut state = data.build(&setup).expect("builds");
     let mut acted = vec![0usize; companion_count + characters.len()];
+    let fighters = companion_count + characters.len();
+    let mut commands = vec![0u32; fighters];
+    let mut ready_since: Vec<Option<u64>> = vec![None; fighters];
+    let player_delay = (u64::from(player_delay_ms) * u64::from(tps)).div_ceil(1000);
     let slice = u64::from((tps / 20).max(1));
     let count = |events: &[BattleEvent], acted: &mut Vec<usize>| {
         for e in events {
@@ -98,22 +122,51 @@ fn simulate_with(data: &Ff7BattleData, formation: u16, characters: &[u8], level:
         }
         let events = state.step_ticks(slice);
         count(&events, &mut acted);
-        for id in state.ready_actors() {
-            let command = if usize::from(id.0) < companion_count {
-                // The server's rule for a canon companion (heal, limit, attack), as the server applies it.
-                let Some(command) = fmv_server::companion::command(&state, id) else { continue };
-                command
-            } else {
-                let Some(target) = state.enemy_ids().into_iter().find(|e| state.actor(*e).is_some_and(|c| c.is_alive())) else { break };
-                Command::Attack { target }
-            };
+        // When each gauge filled (what the pacing measures from), as the server notes it after every step.
+        let now = state.tick();
+        let ready = state.ready_actors();
+        for (i, since) in ready_since.iter_mut().enumerate() {
+            *since = if ready.contains(&fmv_ff7_battle::rules::ActorId(i as u8)) { Some(since.unwrap_or(now)) } else { None };
+        }
+        // The companions first (the server's `companions_act` runs right after the step), each when the pacing lets it.
+        for id in state.ready_actors().into_iter().filter(|id| usize::from(id.0) < companion_count) {
+            if state.outcome().is_some() {
+                break;
+            }
+            let players: Vec<PlayerTurn> = (companion_count..fighters)
+                .filter(|&i| state.actor(fmv_ff7_battle::rules::ActorId(i as u8)).is_some_and(|c| c.is_alive()))
+                .map(|i| PlayerTurn { commands: commands[i], ready_since: ready_since[i] })
+                .collect();
+            let i = usize::from(id.0);
+            if !companion::may_act(pacing, tps, now, commands[i], ready_since[i].unwrap_or(now), &players) {
+                continue;
+            }
+            // The server's rule for a canon companion (heal, limit, attack), as the server applies it.
+            let Some(command) = companion::command(&state, id) else { continue };
             if let Ok(events) = state.submit_command(id, command) {
                 count(&events, &mut acted);
+                commands[i] += 1;
+                ready_since[i] = None;
+            }
+        }
+        // Then the players' commands arrive, each once its player has chosen.
+        for id in state.ready_actors().into_iter().filter(|id| usize::from(id.0) >= companion_count) {
+            let i = usize::from(id.0);
+            if now.saturating_sub(ready_since[i].unwrap_or(now)) < player_delay {
+                continue;
+            }
+            let Some(target) = state.enemy_ids().into_iter().find(|e| state.actor(*e).is_some_and(|c| c.is_alive())) else { break };
+            if let Ok(events) = state.submit_command(id, Command::Attack { target }) {
+                count(&events, &mut acted);
+                commands[i] += 1;
+                ready_since[i] = None;
             }
         }
     }
     let dead = state.party_ids().into_iter().filter(|id| !state.actor(*id).is_some_and(|c| c.is_alive())).count();
-    Sim { outcome: state.outcome(), ticks: state.tick(), acted: acted.split_off(companion_count), dead }
+    let players_alive = (companion_count..fighters).map(|i| state.actor(fmv_ff7_battle::rules::ActorId(i as u8)).is_some_and(|c| c.is_alive())).collect();
+    let players = acted.split_off(companion_count);
+    Sim { outcome: state.outcome(), ticks: state.tick(), companion_attacks: acted.iter().sum(), acted: players, dead, players_alive }
 }
 
 /// What a batch of simulated fights of one formation came to.
@@ -129,6 +182,9 @@ struct Stats {
     fewest_attacks: usize,
     /// Won fights in which every player attacked at least once.
     every_player_acted: u64,
+    /// Won fights in which a companion attacked while a player who lived to the end never did: a turn the companions
+    /// took from a player. What the companions' pacing is there to prevent.
+    companions_took_a_turn: u64,
 }
 
 fn stats(data: &Ff7BattleData, formation: u16, characters: &[u8], level: Option<u8>, speed: u8, tps: u32, seeds: u64) -> Stats {
@@ -137,16 +193,43 @@ fn stats(data: &Ff7BattleData, formation: u16, characters: &[u8], level: Option<
 
 #[allow(clippy::too_many_arguments)]
 fn stats_with(data: &Ff7BattleData, formation: u16, characters: &[u8], level: Option<u8>, canon: bool, speed: u8, tps: u32, seeds: u64) -> Stats {
-    let mut out = Stats { won: 0, lost: 0, with_losses: 0, longest_ticks: 0, mean_ticks: 0, fewest_attacks: usize::MAX, every_player_acted: 0 };
+    stats_paced(data, formation, characters, level, canon, speed, tps, seeds, Pacing::OFF, 0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stats_paced(
+    data: &Ff7BattleData,
+    formation: u16,
+    characters: &[u8],
+    level: Option<u8>,
+    canon: bool,
+    speed: u8,
+    tps: u32,
+    seeds: u64,
+    pacing: Pacing,
+    player_delay_ms: u32,
+) -> Stats {
+    let mut out = Stats {
+        won: 0,
+        lost: 0,
+        with_losses: 0,
+        longest_ticks: 0,
+        mean_ticks: 0,
+        fewest_attacks: usize::MAX,
+        every_player_acted: 0,
+        companions_took_a_turn: 0,
+    };
     let mut total = 0u64;
     for seed in 0..seeds {
-        let s = simulate_with(data, formation, characters, level, canon, seed, speed, tps);
+        let s = simulate_paced(data, formation, characters, level, canon, seed, speed, tps, pacing, player_delay_ms);
         match s.outcome {
             Some(Outcome::Victory) => {
                 out.won += 1;
                 out.with_losses += u64::from(s.dead > 0);
                 out.fewest_attacks = out.fewest_attacks.min(s.acted.iter().copied().min().unwrap_or(0));
                 out.every_player_acted += u64::from(s.acted.iter().all(|&n| n >= 1));
+                let left_out = s.acted.iter().zip(&s.players_alive).any(|(&n, &alive)| alive && n == 0);
+                out.companions_took_a_turn += u64::from(left_out && s.companion_attacks > 0);
             }
             Some(Outcome::Defeat) => out.lost += 1,
             Some(Outcome::Escaped) => panic!("formation {formation} seed {seed}: nobody gave Escape"),
@@ -261,8 +344,9 @@ const SMOKE_FORMATION: u16 = 12;
 /// The gate behind `scripts/battle-smoke.sh` (protocol v9): the smokes' players (headless bots on Barret's curve, at the
 /// level the canon party leader has) fight [`SMOKE_FORMATION`] beside the canon Cloud and Barret, alone, with one other
 /// player and with two, at the smoke's pace and at the engine's own, and must win it EVERY time (200 seeds each) with
-/// EVERY player attacking at least once, in a fight that is not too long to sit through. The formation can also be run
-/// from (the smoke's `--commands` mode escapes from it).
+/// EVERY player attacking at least once, in a fight that is not too long to sit through. The companions follow the
+/// server's default pacing (`Pacing::default()`, the players go first), as on a real server. The formation can also be
+/// run from (the smoke's `--commands` mode escapes from it).
 #[test]
 #[ignore = "needs the owner's library: set FMV_FF7_LIBRARY"]
 fn the_smoke_formation_is_won_every_time_with_every_player_acting_beside_the_canon_party() {
@@ -273,9 +357,10 @@ fn the_smoke_formation_is_won_every_time_with_every_player_acting_beside_the_can
     let scene = data.scenes().formation(usize::from(SMOKE_FORMATION)).expect("it is in scene.bin");
     assert!(scene.setup().run_difficulty().is_some(), "the smoke's escape run needs a formation that can be run from");
     // (speed, ticks per second, longest acceptable fight in seconds)
-    for (speed, tps, limit_s) in [(0u8, 240u32, 20u64), (128, 60, 120)] {
+    // At the engine's own pace a lone player's 16 or so attacks, which the paced companions follow, take two minutes.
+    for (speed, tps, limit_s) in [(0u8, 240u32, 20u64), (128, 60, 150)] {
         for (characters, what) in [(&[1u8][..], "one player"), (&[1, 1][..], "two players"), (&[1, 1, 1][..], "three players")] {
-            let s = stats_with(&data, SMOKE_FORMATION, characters, None, true, speed, tps, 200);
+            let s = stats_paced(&data, SMOKE_FORMATION, characters, None, true, speed, tps, 200, Pacing::default(), 0);
             let longest_s = s.longest_ticks / u64::from(tps);
             eprintln!(
                 "formation {SMOKE_FORMATION} at speed {speed}, {tps} ticks/s, {what} beside Cloud and Barret: won {}/200, every player acted in {}, fewest attacks by a player {}, longest {} ticks ({longest_s} s), mean {} ticks",
@@ -334,8 +419,10 @@ fn the_first_fields_two_enemy_formations_are_won_every_time_by_two_players_alone
     }
 }
 
-/// MEASUREMENT (protocol v9), not a gate: with the canon Cloud and Barret fighting first (the server's own companion
-/// rule), do the players still get turns before the weak enemies of md1stin's table die? Prints, for every formation of
+/// MEASUREMENT (protocol v9, the first build: companions WITHOUT pacing), not a gate: with the canon Cloud and Barret
+/// acting the instant their gauge fills (the server's own companion rule), do the players still get turns before the weak
+/// enemies of md1stin's table die? (They did not, which is why the server paces them: see
+/// `with_pacing_every_player_acts_in_every_fight_of_the_first_field`.) Prints, for every formation of
 /// the table, solo and with two players on Barret's curve (what a headless bot is), at the smoke's pace and at the engine's
 /// own, the share of fights (of 200) in which every player attacked at least once and the fewest attacks any made.
 #[test]
@@ -365,6 +452,62 @@ fn how_the_players_fare_beside_the_canon_party() {
                     "{formation:>9} | {enemies:>7} | {speed}/{tps} | {label:>7} | {:>7} | {:>18} | {:>14} | {:>10} | {:>13} | {}",
                     s.won, s.every_player_acted, s.fewest_attacks, s.mean_ticks, s.longest_ticks, s.with_losses
                 );
+            }
+        }
+    }
+}
+
+/// The gate behind the companions' pacing (`fmv_server::companion::may_act`, the server's default `Pacing`): beside the
+/// canon Cloud and Barret, in every formation of md1stin's table (the fights a player of the first field really meets),
+/// alone, with one other player and with two, every fight is still won, a companion never takes a turn in a fight in which
+/// a player got none (`companions_took_a_turn`), and a SOLO player attacks in every fight, whether the players answer at
+/// once (a headless bot) or take a second and a half to choose (a person with the menu that opens by itself); and no
+/// fight is drawn out past what one sits through. With more players md1stin's weak enemies sometimes die to the first
+/// players' blows before the last one's turn (two players: 197 of 200 fights of the one-enemy formation 302 have both
+/// acting; three: hardly any of the two-enemy ones), which is the players' own doing and is printed, not gated. Without pacing
+/// (the first v9 build) a solo player attacked in only 41-88% of these fights, two players in 11-41% and three almost
+/// never. 200 seeds each. The smokes'
+/// sturdier [`SMOKE_FORMATION`] is fought too (won, every player acting) but not timed: it is chosen to last, and since the
+/// companions follow the players' turns its length is the players' own pace.
+#[test]
+#[ignore = "needs the owner's library: set FMV_FF7_LIBRARY"]
+fn with_pacing_every_player_acts_in_every_fight_of_the_first_field() {
+    let Some(source) = source() else { return };
+    let opened = open_ff7(&source).expect("the library opens");
+    let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    rt.block_on(prewarm(&opened.adapter)).expect("prewarm");
+    let data = battle_data(&source);
+    let table = {
+        let field = opened.adapter.load_field("md1stin").expect("md1stin");
+        decode_encounter_section(field.field_file().section(section::ENCOUNTER).expect("section")).expect("md1stin has a table")
+    };
+    let mut formations: Vec<u16> = table.entries.iter().map(|e| e.formation).collect();
+    formations.sort_unstable();
+    formations.dedup();
+    let first_field = formations.clone();
+    formations.push(SMOKE_FORMATION);
+    let pacing = Pacing::default();
+    eprintln!("formation | pace | players | chooser | won/200 | every player acted | companions took a turn | fewest attacks | mean ticks | longest ticks (s)");
+    for formation in formations {
+        // (speed, ticks per second, longest acceptable fight in seconds): the smoke's pace and the engine's own.
+        for (speed, tps, limit_s) in [(0u8, 240u32, 30u64), (128, 60, 120)] {
+            for (characters, label) in [(&[1u8][..], "solo"), (&[1, 1][..], "two"), (&[1, 1, 1][..], "three")] {
+                for delay_ms in [0u32, 1_500] {
+                    let s = stats_paced(&data, formation, characters, None, true, speed, tps, 200, pacing, delay_ms);
+                    let longest_s = s.longest_ticks / u64::from(tps);
+                    eprintln!(
+                        "{formation:>9} | {speed}/{tps} | {label:>7} | {delay_ms:>5} ms | {:>7} | {:>17} | {:>22} | {:>14} | {:>10} | {} ({longest_s})",
+                        s.won, s.every_player_acted, s.companions_took_a_turn, s.fewest_attacks, s.mean_ticks, s.longest_ticks
+                    );
+                    assert_eq!((s.won, s.lost), (200, 0), "formation {formation}, {label}, {delay_ms} ms: every fight is won");
+                    assert_eq!(s.companions_took_a_turn, 0, "formation {formation}, {label}, {delay_ms} ms: a companion never takes a player's turn");
+                    if characters.len() == 1 {
+                        assert_eq!(s.every_player_acted, 200, "formation {formation}, {label}, {delay_ms} ms: a solo player attacks in every fight");
+                    }
+                    if first_field.contains(&formation) {
+                        assert!(longest_s <= limit_s, "formation {formation}, {label}, {delay_ms} ms: the longest fight takes {longest_s} s (limit {limit_s} s)");
+                    }
+                }
             }
         }
     }

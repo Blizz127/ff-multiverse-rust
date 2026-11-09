@@ -733,6 +733,15 @@ field: he is in the party.)
   is the whole rule, a pure function of the engine's state (deterministic, never refused by it). A companion fights at
   the party leader's level (`--battle-level` pins everybody's), is never paid and never saved, cannot be commanded by a
   client (`NotYourActor`), and does not keep a battle alive: a battle with no connected player left is dropped.
+* **The players go first.** A companion whose gauge is full waits while a living, connected player still owes a turn
+  this round (`fmv_server::companion::may_act`), so the players lead every round and Cloud and Barret follow. A player
+  who is choosing holds them for at most `--companion-turn-wait-ms` (default 5000) after its own gauge filled, and no
+  companion holds a full gauge longer than `--companion-max-wait-ms` (default 10000; 0 makes the companions act the
+  instant their gauge fills, as the first v9 build did). Without it the canon pair finished most of md1stin's fights
+  before a player's turn came (a solo player acted in 41-88% of them, two players in 11-41%); with it a solo player acts
+  in every one and a companion never takes a turn in a fight in which a player got none (the real-data gate
+  `with_pacing_every_player_acts_in_every_fight_of_the_first_field`). The `companion acted` line ends with `held_ms=`,
+  how long it waited. Pacing only decides WHEN the server submits a companion's command, so clients need no change.
 * **Players are paid, companions are not.** Experience and gil are shared among the living PLAYERS only
   (`fmv_protocol::reward_roster`, used by the server and by every replaying client), AP goes to each player, and only
   a player's progress, inventory and limit gauge are saved.

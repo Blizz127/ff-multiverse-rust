@@ -29,8 +29,13 @@
 //!   ordinary command from [`crate::companion::command`] (heal a hurt member, else the limit break, else attack the
 //!   first living enemy: a pure function of the engine's own state), applied through the same engine call as a
 //!   player's and announced to every member in a `BattleEvent` with the command attached, so every client replays and
-//!   checks it like any other. It is logged as `companion acted battle=.. actor=.. name=.. command=..` and counted in
-//!   the battle's `commands`. A companion has no account and no entity: it is never paid or saved, no player may
+//!   checks it like any other. **The players go first** ([`crate::companion::may_act`], `BattleSettings::companion_pacing`):
+//!   a companion holds its full gauge while a living, connected player still owes a turn this round (has given no more
+//!   commands than the companion), for at most `turn_wait_ms` after that player's own gauge filled and `max_wait_ms` in
+//!   all, so the players lead every round and an idle one never stalls the fight. Pacing only moves the tick at which
+//!   the server submits the command, so it is invisible to a replay. It is logged as
+//!   `companion acted battle=.. actor=.. name=.. command=.. character=.. held_ms=..` and counted in the battle's
+//!   `commands`. A companion has no account and no entity: it is never paid or saved, no player may
 //!   command it (`NotYourActor`), it does not keep a battle alive (a battle with no connected PLAYER left is dropped)
 //!   and the rewards (`reward_roster`) are split among the living PLAYERS only, exactly as before. Players have no limit
 //!   break in v9, so only a companion's gauge moves, and it is never stored.
@@ -167,6 +172,9 @@ struct Battle {
     /// `commands[i]`: how many commands of `ActorId(i)` the engine accepted (logged when the battle
     /// ends, so a log shows that every member really fought).
     commands: Vec<u32>,
+    /// `ready_since[i]`: the engine tick `ActorId(i)`'s gauge has been full since (it waits for a command), `None` while
+    /// it fills or once it is dead. What the companions' pacing measures its waits from (`companion::may_act`).
+    ready_since: Vec<Option<u64>>,
     /// The engine has consumed time up to here.
     clock: Instant,
     /// The formation (`scene * 4 + slot`) and the seed the battle was started with: what the drops of a
@@ -188,6 +196,36 @@ impl Battle {
         let ms = elapsed.as_millis() as u32;
         self.clock += Duration::from_millis(u64::from(ms));
         ms
+    }
+
+    /// Note which gauges are full now and since when (`ready_since`): a gauge that was full stays dated from when it
+    /// filled, one that is not full (it is filling, its owner acted or died) loses its date.
+    fn note_ready(&mut self) {
+        let now = self.state.tick();
+        let ready = self.state.ready_actors();
+        for (i, since) in self.ready_since.iter_mut().enumerate() {
+            let is_ready = u8::try_from(i).is_ok_and(|i| ready.contains(&ActorId(i)));
+            *since = match (is_ready, *since) {
+                (true, Some(at)) => Some(at),
+                (true, None) => Some(now),
+                (false, _) => None,
+            };
+        }
+    }
+
+    /// The living, connected players as the companions' pacing sees them (`companion::may_act`).
+    fn player_turns(&self) -> Vec<companion::PlayerTurn> {
+        self.members
+            .iter()
+            .enumerate()
+            .filter(|(i, m)| {
+                m.info.is_player() && m.connected && u8::try_from(*i).ok().and_then(|i| self.state.actor(ActorId(i))).is_some_and(|c| c.is_alive())
+            })
+            .map(|(i, _)| companion::PlayerTurn {
+                commands: self.commands.get(i).copied().unwrap_or(0),
+                ready_since: self.ready_since.get(i).copied().flatten(),
+            })
+            .collect()
     }
 
     fn connected(&self) -> Vec<EntityId> {
@@ -502,6 +540,7 @@ impl World {
                 state,
                 members: party.iter().cloned().map(|info| Member { connected: info.is_player(), info }).collect(),
                 commands: vec![0; party.len()],
+                ready_since: vec![None; party.len()],
                 clock: now,
                 formation,
                 seed,
@@ -708,16 +747,26 @@ impl World {
         for _ in 0..MAX_BATTLE_PARTY {
             let acted = {
                 let Some(bw) = self.battle.as_mut() else { return };
+                let pacing = bw.settings.companion_pacing;
                 let Some(battle) = bw.battles.get_mut(&id) else { return };
                 if battle.state.outcome().is_some() {
                     return;
                 }
+                // The players go first (`companion::may_act`): a companion whose gauge is full holds it while a living,
+                // connected player still owes a turn, within the pacing's bounds.
+                battle.note_ready();
+                let (now, tps, players) = (battle.state.tick(), battle.state.config().ticks_per_second, battle.player_turns());
                 let next = battle.state.ready_actors().into_iter().find_map(|actor| {
-                    let member = battle.members.get(usize::from(actor.0))?;
+                    let index = usize::from(actor.0);
+                    let member = battle.members.get(index)?;
                     member.info.is_companion().then_some(())?;
-                    companion::command(&battle.state, actor).map(|command| (actor, command))
+                    let since = battle.ready_since.get(index).copied().flatten().unwrap_or(now);
+                    let own = battle.commands.get(index).copied().unwrap_or(0);
+                    companion::may_act(pacing, tps, now, own, since, &players).then_some(())?;
+                    companion::command(&battle.state, actor).map(|command| (actor, command, now.saturating_sub(since)))
                 });
-                let Some((actor, command)) = next else { return };
+                let Some((actor, command, held_ticks)) = next else { return };
+                let held_ms = held_ticks * 1000 / u64::from(tps.max(1));
                 let index = usize::from(actor.0);
                 let (name, character) = battle.members.get(index).map(|m| (log_token(&m.info.name), m.info.character)).unwrap_or_default();
                 // A limit says which one it is, before it empties the gauge (for the log).
@@ -728,7 +777,7 @@ impl World {
                             *n += 1;
                         }
                         let note = format!(
-                            "companion acted battle={} actor={} name={name} command={} character={character}",
+                            "companion acted battle={} actor={} name={name} command={} character={character} held_ms={held_ms}",
                             id.0,
                             actor.0,
                             describe_command(&command, limit_id)
@@ -1091,6 +1140,12 @@ mod tests {
             fixed_seed: Some(7),
             ..BattleSettings::new(Arc::new(rules))
         }
+    }
+
+    /// `settings` with the companions' pacing off: they act the instant their gauge fills. For the tests about WHAT a
+    /// companion does and how its command travels; WHEN it acts (the players first) has tests of its own.
+    fn settings_unpaced(rules: SyntheticRules) -> BattleSettings {
+        BattleSettings { companion_pacing: companion::Pacing::OFF, ..settings(rules) }
     }
 
     /// The synthetic rules with a limit break for the PLAYERS' fighters too: the real rules give them none (protocol v9,
@@ -2415,9 +2470,10 @@ mod tests {
     #[test]
     fn a_player_can_heal_a_companion_and_a_whole_party_cast_reaches_the_companions_and_the_players() {
         let t0 = Instant::now();
-        // A dummy that outlasts the test, so that the canon pair's attacks do not end the battle.
+        // A dummy that outlasts the test, so that the canon pair's attacks do not end the battle. (The companions' pacing
+        // is off: this is about whom a command can aim at, not about when a companion acts.)
         let rules = SyntheticRules { enemy_hp: 100_000, ..SyntheticRules::default() };
-        let mut w = world_with_party(settings(rules), cloud_and_barret);
+        let mut w = world_with_party(settings_unpaced(rules), cloud_and_barret);
         let (mut a, mut b) = (seat(&mut w, "Aria", t0), seat(&mut w, "Brom", t0));
         party_up(&mut w, &a, &b, t0);
         a.drain();
@@ -3262,12 +3318,13 @@ mod tests {
         assert_eq!(names, ["Cloud", "Barret", "B"]);
     }
 
-    /// Preemptive start: every gauge is full at once. The companions act on the server's first step, as ordinary commands
-    /// the players are told about; no player can command a companion; the player's own turn is still its own.
+    /// Preemptive start: every gauge is full at once. With pacing off the companions act on the server's first step, as
+    /// ordinary commands the players are told about; no player can command a companion; the player's own turn is still
+    /// its own.
     #[test]
     fn the_companions_act_through_ordinary_commands_applied_and_announced_and_no_player_can_command_one() {
         let t0 = Instant::now();
-        let mut w = world_with_party(settings(SyntheticRules::default()), cloud_and_barret);
+        let mut w = world_with_party(settings_unpaced(SyntheticRules::default()), cloud_and_barret);
         let mut a = seat(&mut w, "Aria", t0);
         a.drain();
         assert_eq!(w.request_encounter(a.entity, Some(3), t0), BattleReply::Done);
@@ -3289,8 +3346,8 @@ mod tests {
         let logs = logs_of(&mut w);
         let lines: Vec<&String> = logs.iter().filter(|l| l.starts_with("companion acted")).collect();
         assert_eq!(lines.len(), 2, "{logs:?}");
-        assert_eq!(lines[0], "companion acted battle=1 actor=0 name=Cloud command=attack target=3 character=0");
-        assert_eq!(lines[1], "companion acted battle=1 actor=1 name=Barret command=attack target=3 character=1");
+        assert_eq!(lines[0], "companion acted battle=1 actor=0 name=Cloud command=attack target=3 character=0 held_ms=0");
+        assert_eq!(lines[1], "companion acted battle=1 actor=1 name=Barret command=attack target=3 character=1 held_ms=0");
         // They are counted for their actors, the player has not acted.
         assert_eq!(w.battle.as_ref().unwrap().battles.get(&id).unwrap().commands, vec![1, 1, 0]);
         // No player may command a companion (whatever the gauge says), and a companion's turn is nobody's to take.
@@ -3360,7 +3417,7 @@ mod tests {
     fn a_companions_blow_can_win_the_battle_and_the_player_who_never_acted_is_paid() {
         let rules = SyntheticRules { enemy_hp: 1, ..SyntheticRules::default() };
         let t0 = Instant::now();
-        let mut w = world_with_party(settings(rules), cloud_and_barret);
+        let mut w = world_with_party(settings_unpaced(rules), cloud_and_barret);
         let (handle, mut rx) = SaverHandle::channel();
         w.set_progress_saver(handle);
         let mut a = seat(&mut w, "Aria", t0);
@@ -3399,7 +3456,7 @@ mod tests {
     #[test]
     fn a_companion_with_a_full_limit_gauge_gives_its_limit_first() {
         let t0 = Instant::now();
-        let mut s = settings(SyntheticRules::default());
+        let mut s = settings_unpaced(SyntheticRules::default());
         s.debug_limit_full = true;
         let mut w = world_with_party(s, cloud_and_barret);
         let (handle, mut rx) = SaverHandle::channel();
@@ -3412,8 +3469,8 @@ mod tests {
         let started = logs.iter().find(|l| l.starts_with("battle started")).expect("a start line");
         assert!(started.contains("limits=[255, 255, 255]"), "every fighter starts full under the flag: {started}");
         let lines: Vec<&String> = logs.iter().filter(|l| l.starts_with("companion acted")).collect();
-        assert_eq!(lines[0], "companion acted battle=1 actor=0 name=Cloud command=limit attack=128 target=3 character=0");
-        assert_eq!(lines[1], "companion acted battle=1 actor=1 name=Barret command=limit attack=128 target=3 character=1");
+        assert_eq!(lines[0], "companion acted battle=1 actor=0 name=Cloud command=limit attack=128 target=3 character=0 held_ms=0");
+        assert_eq!(lines[1], "companion acted battle=1 actor=1 name=Barret command=limit attack=128 target=3 character=1 held_ms=0");
         // Two limits are more than the dummy has (the battle is won on the spot and the player is paid), but no gauge is
         // stored: not the companions' and not the made-up one of the player.
         let jobs = saved_all(&mut rx);
@@ -3445,5 +3502,105 @@ mod tests {
         assert_eq!(w.battle_count(), 1, "A is still there");
         play_out(&mut w, &mut [&mut a], &SyntheticRules::default(), t0);
         assert_eq!(w.battle_count(), 0);
+    }
+
+    // ---- pacing: the players go first (`companion::may_act`) ----
+
+    /// The commands the server applied, in order, from what a seat was told: `(actor, command)`.
+    fn applied(seat: &mut Seat) -> Vec<(ActorId, Command)> {
+        seat.battle_msgs()
+            .iter()
+            .filter_map(|m| match m {
+                ServerMsg::BattleEvent { command: Some(c), .. } => Some((c.actor, c.command)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Advance the world's battles in 10 ms steps from `from` ms to `to` ms after `t0`.
+    fn run(w: &mut World, t0: Instant, from: u64, to: u64) {
+        let mut at = from;
+        while at < to {
+            at = (at + 10).min(to);
+            w.advance_battles(ms(t0, at));
+        }
+    }
+
+    /// Preemptive start, every gauge full: the companions hold theirs until the player has taken its turn, then follow at
+    /// once, in actor order; the log says how long each held.
+    #[test]
+    fn the_players_go_first_and_the_companions_follow() {
+        let t0 = Instant::now();
+        let mut w = world_with_party(settings(SyntheticRules::default()), cloud_and_barret);
+        let mut a = seat(&mut w, "Aria", t0);
+        a.drain();
+        assert_eq!(w.request_encounter(a.entity, Some(3), t0), BattleReply::Done);
+        let (id, enemy) = (BattleId(1), ActorId(3));
+        // Half a second of battle: the player has not chosen yet, so nobody has acted.
+        run(&mut w, t0, 0, 500);
+        assert!(applied(&mut a).is_empty(), "the companions wait for the player's turn");
+        assert!(w.battle.as_ref().unwrap().battles.get(&id).unwrap().commands.iter().all(|&n| n == 0));
+        // The player attacks; on the next step Cloud and Barret follow, in actor order.
+        assert_eq!(w.battle_command(a.entity, id, ActorId(2), Command::Attack { target: enemy }, ms(t0, 500)), BattleReply::Done);
+        run(&mut w, t0, 500, 510);
+        let acted = applied(&mut a);
+        assert_eq!(acted[0], (ActorId(2), Command::Attack { target: enemy }), "{acted:?}");
+        assert_eq!(&acted[1..], &[(ActorId(0), Command::Attack { target: enemy }), (ActorId(1), Command::Attack { target: enemy })], "{acted:?}");
+        let logs = logs_of(&mut w);
+        let lines: Vec<&String> = logs.iter().filter(|l| l.starts_with("companion acted")).collect();
+        assert_eq!(lines.len(), 2, "{logs:?}");
+        for line in lines {
+            let held: u64 = line.rsplit("held_ms=").next().and_then(|n| n.parse().ok()).expect("a held_ms");
+            assert!((500..=520).contains(&held), "held for the player's half second: {line}");
+        }
+    }
+
+    /// A player who does not choose holds the companions only for the turn wait, counted from its own full gauge; after
+    /// that the fight goes on without it, and the companions do not wait for it again while its gauge stays full.
+    #[test]
+    fn an_idle_player_holds_the_companions_only_for_the_turn_wait() {
+        let t0 = Instant::now();
+        let pacing = companion::Pacing { turn_wait_ms: 300, max_wait_ms: 2_000 };
+        let mut w = world_with_party(BattleSettings { companion_pacing: pacing, ..settings(SyntheticRules::default()) }, cloud_and_barret);
+        let mut a = seat(&mut w, "Aria", t0);
+        a.drain();
+        assert_eq!(w.request_encounter(a.entity, Some(3), t0), BattleReply::Done);
+        // At 1000 ticks a second the 300 ms turn wait is 300 ticks: nobody has acted just before it.
+        run(&mut w, t0, 0, 290);
+        assert!(applied(&mut a).is_empty());
+        run(&mut w, t0, 290, 320);
+        let acted = applied(&mut a);
+        assert_eq!(acted.iter().map(|(actor, _)| *actor).collect::<Vec<_>>(), [ActorId(0), ActorId(1)], "the companions went without the idle player");
+        // And they keep fighting without it: the battle ends while the player never acts.
+        run(&mut w, t0, 320, 20_000);
+        assert_eq!(w.battle_count(), 0, "the fight did not stall on the idle player");
+        let logs = logs_of(&mut w);
+        let ended = logs.iter().find(|l| l.starts_with("battle ended")).expect("an end line");
+        assert!(ended.contains("outcome=Victory") && ended.contains(", 0] limits="), "the player gave nothing: {ended}");
+    }
+
+    /// The companions wait only for LIVING, CONNECTED players: one who left is not waited for, the other one still is.
+    #[test]
+    fn a_player_who_left_is_not_waited_for() {
+        let t0 = Instant::now();
+        let mut w = world_with_party(settings(SyntheticRules::default()), cloud_and_barret);
+        let (mut a, b) = (seat(&mut w, "A", t0), seat(&mut w, "B", t0));
+        party_up(&mut w, &a, &b, t0);
+        a.drain();
+        assert_eq!(w.request_encounter(a.entity, Some(3), t0), BattleReply::Done);
+        let (id, enemy) = (BattleId(1), ActorId(4));
+        run(&mut w, t0, 0, 100);
+        assert!(applied(&mut a).is_empty(), "both players owe a turn");
+        // B leaves; A still owes its turn, so nothing happens yet.
+        let b_entity = b.entity;
+        drop(b);
+        assert!(w.leave(b_entity));
+        run(&mut w, t0, 100, 200);
+        assert!(applied(&mut a).is_empty(), "A is still waited for");
+        // A acts: the companions follow at once, without waiting for B.
+        assert_eq!(w.battle_command(a.entity, id, ActorId(2), Command::Attack { target: enemy }, ms(t0, 200)), BattleReply::Done);
+        run(&mut w, t0, 200, 210);
+        let actors: Vec<ActorId> = applied(&mut a).iter().map(|(actor, _)| *actor).collect();
+        assert_eq!(actors, [ActorId(2), ActorId(0), ActorId(1)]);
     }
 }

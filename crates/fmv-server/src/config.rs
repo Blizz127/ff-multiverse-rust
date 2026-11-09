@@ -109,6 +109,11 @@ pub struct BattleSettings {
     /// `limit kept` save (the log line says `debug_bonus_limit=N`), so that a smoke run can show a non-empty gauge
     /// surviving a server restart over real processes. 0 is off.
     pub debug_bonus_limit: u8,
+    /// When the canon companions act (protocol v9 companions, see `crate::companion`, "Pacing"): a companion with a full
+    /// gauge waits for every living, connected player that still owes a turn, at most `turn_wait_ms` after that
+    /// player's own gauge filled and at most `max_wait_ms` in all. `--companion-turn-wait-ms` / `--companion-max-wait-ms`;
+    /// `Pacing::OFF` (a max wait of 0) makes them act the instant their gauge fills.
+    pub companion_pacing: crate::companion::Pacing,
 }
 
 impl BattleSettings {
@@ -126,6 +131,7 @@ impl BattleSettings {
             debug_limit_full: false,
             debug_bonus_exp: 0,
             debug_bonus_limit: 0,
+            companion_pacing: crate::companion::Pacing::default(),
         }
     }
 }
@@ -145,6 +151,7 @@ impl fmt::Debug for BattleSettings {
             .field("debug_limit_full", &self.debug_limit_full)
             .field("debug_bonus_exp", &self.debug_bonus_exp)
             .field("debug_bonus_limit", &self.debug_bonus_limit)
+            .field("companion_pacing", &self.companion_pacing)
             .finish()
     }
 }
