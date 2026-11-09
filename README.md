@@ -1123,7 +1123,7 @@ together. The story record keeps its v2 shape, so a v13 server can read what v14
 links or scripted battle, and how its exits judge a moment past 13 was never tested: once a player has gone past moment
 13, prefer rolling forward to rolling back.
 
-**The countdown message (added after v14; the version is bumped at integration)** adds one server message,
+**Protocol v15 (the countdown message)** adds one server message,
 `ServerMsg::Countdown { state }`, with `CountdownState::Running { remaining_ms, total_ms }` and
 `CountdownState::Over { reason: CountdownEnd::TimeUp | Cleared }` (see "After the Guard Scorpion"): sent when the step that
 won the Guard Scorpion starts the bomb's countdown, to a player that joins or leaves the party that has one, and when it
