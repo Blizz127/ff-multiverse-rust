@@ -737,9 +737,16 @@ fn md1stin_and_md1_1_npcs_and_the_guards() {
             );
         }
         let expected: Vec<String> = inits.iter().filter(|e| verdict(e, &area).is_ok()).map(|e| e.name.clone()).collect();
-        let got: Vec<String> = npcs.iter().map(|n| n.entity_name.clone()).collect();
-        assert_eq!(got, expected, "{name}: npcs() against the restated rules");
-        assert!(npcs.iter().all(|n| n.unconditional));
+        // What the DATA places (unconditional placements of non-player entities) is exactly the restated rules; the
+        // canon cast the slice keeps in these two fields (`CANON_STAND_INS`: Barret, one conditional placement,
+        // flagged `unconditional: false`) comes after it. That is why these lists are one longer than the data's:
+        // md1stin 2 -> 3 (`gu0`, `gu1`, Barret), md1_1 5 -> 6 (`av_m`, `av_l`, `av_s`, `drL`, `drR`, Barret).
+        let got: Vec<String> = npcs.iter().filter(|n| n.unconditional).map(|n| n.entity_name.clone()).collect();
+        assert_eq!(got, expected, "{name}: the data's NPCs against the restated rules");
+        let stand_ins: Vec<&str> = npcs.iter().filter(|n| !n.unconditional).map(|n| n.entity_name.as_str()).collect();
+        assert_eq!(stand_ins, ["Barret"], "{name}: the canon cast stand-in");
+        assert_eq!(npcs.len(), expected.len() + 1, "{name}: the stand-in is the only addition");
+        assert!(npcs.last().is_some_and(|n| n.entity_name == "Barret"), "{name}: after the NPCs of the data, so their indexes do not move");
         if name == "md1stin" {
             for guard in ["gu0", "gu1", "guadd"] {
                 let e = inits.iter().find(|e| e.name == guard).unwrap_or_else(|| panic!("{guard} is not an entity of md1stin"));
@@ -790,14 +797,17 @@ fn describe_fields_from_the_environment() {
     }
 }
 
-/// Barret in the first Mako reactor fields (`md1stin`, `md1_1`, `md1_2`): his skeleton (`acgd`) is
-/// there as a PLAYER entity (a `CHAR` that is also a `PC`, party slot 1) and never as an NPC, and
-/// `md1_2` has neither a loader record with his skeleton nor an entity that wears it. Across the
-/// archive the adapter reports an NPC with his skeleton in only five fields, none of them a
-/// reactor field. Prints counts only.
+/// Barret in the first Mako reactor fields (`md1stin`, `md1_1`, `md1_2`): in the DATA his skeleton (`acgd`) is
+/// there as a PLAYER entity (a `CHAR` that is also a `PC`, party slot 1) and never as an NPC the NPC rules
+/// report, and `md1_2` has neither a loader record with his skeleton nor an entity that wears it. Across the
+/// archive the rules report an NPC with his skeleton in only five fields, none of them a reactor field. The
+/// slice keeps the canon cast in the story (`CANON_STAND_INS`): `md1stin` and `md1_1` report ONE more NPC, Barret
+/// under his canon name at that entity's one (conditional) placement, flagged `unconditional: false`;
+/// `md1_2` reports none. So `npcs()` has 3, 6 and 3 entries where the data's rules give 2, 5 and 3. Prints counts
+/// only.
 #[test]
 #[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
-fn barret_is_a_party_member_not_an_npc_of_the_first_reactor_fields() {
+fn barret_is_a_party_member_in_the_data_and_a_stand_in_npc_in_the_first_reactor_fields() {
     let Some(dir) = data_dir() else { return };
     let a = adapter(&dir);
     let barrets_model = |e: &EntityInit| e.model_ref.as_ref().is_some_and(|m| m.hrc.eq_ignore_ascii_case("ACGD.HRC"));
@@ -805,12 +815,14 @@ fn barret_is_a_party_member_not_an_npc_of_the_first_reactor_fields() {
     // per field: loader records with his skeleton, entities wearing it, NPCs the adapter reports,
     // and the one placement of his entity (x, y), z, walkmesh triangle (all conditional)
     type PcPlacement = Option<((i16, i16), i16, u16)>;
-    let reactor: [(&str, usize, usize, usize, PcPlacement); 3] = [
-        ("md1stin", 1, 1, 2, Some(((3921, 27_489), 323, 30))),
-        ("md1_1", 1, 1, 5, Some(((2264, 1236), 1298, 71))),
-        ("md1_2", 0, 0, 3, None),
+    // (field, loader records with his skeleton, entities wearing it, NPCs the data's rules give, NPCs `npcs()` returns,
+    // his entity's placement)
+    let reactor: [(&str, usize, usize, usize, usize, PcPlacement); 3] = [
+        ("md1stin", 1, 1, 2, 3, Some(((3921, 27_489), 323, 30))),
+        ("md1_1", 1, 1, 5, 6, Some(((2264, 1236), 1298, 71))),
+        ("md1_2", 0, 0, 3, 3, None),
     ];
-    for (name, records, entities, npc_count, placement) in reactor {
+    for (name, records, entities, data_npcs, npc_count, placement) in reactor {
         let area = a.load_field(name).unwrap();
         let npcs = area.npcs();
         let loader = area.field_file().model_loader().unwrap();
@@ -823,7 +835,23 @@ fn barret_is_a_party_member_not_an_npc_of_the_first_reactor_fields() {
             npcs.len()
         );
         assert_eq!((in_loader, barrets.len(), npcs.len()), (records, entities, npc_count), "{name}");
-        assert!(npcs.iter().all(|n| n.appearance.model != "acgd"), "{name}: no NPC wears Barret's skeleton");
+        // The data's rules report no NPC with his skeleton; the one more NPC of md1stin and md1_1 is the canon cast
+        // stand-in (a slice rule, `CANON_STAND_INS`), which wears it under his canon name, at the one (conditional)
+        // placement of his entity, after the data's NPCs.
+        let data: Vec<_> = npcs.iter().filter(|n| n.unconditional).collect();
+        assert_eq!(data.len(), data_npcs, "{name}");
+        assert!(data.iter().all(|n| n.appearance.model != "acgd"), "{name}: no NPC of the data wears Barret's skeleton");
+        let stand_ins: Vec<_> = npcs.iter().filter(|n| !n.unconditional).collect();
+        match placement {
+            Some(((x, y), z, _)) => {
+                assert_eq!(stand_ins.len(), 1, "{name}");
+                let n = stand_ins[0];
+                assert_eq!((n.entity_name.as_str(), n.appearance.model.as_str()), ("Barret", "acgd"), "{name}");
+                assert_eq!((n.pos.x, n.pos.y, n.pos.z), (f32::from(x), f32::from(y), f32::from(z)), "{name}: his entity's placement");
+                assert!(npcs.last().is_some_and(|last| last.entity_name == "Barret"), "{name}: after the data's NPCs");
+            }
+            None => assert!(stand_ins.is_empty(), "{name}: no Barret record, so no stand-in"),
+        }
         for e in &barrets {
             // CHAR and PC: the entity stands for the party member in slot 1 (a player), not an NPC
             assert!(e.is_character() && e.is_player(), "{name}");
@@ -841,13 +869,19 @@ fn barret_is_a_party_member_not_an_npc_of_the_first_reactor_fields() {
     let keys: Vec<String> = a.list_areas().into_iter().map(|i| i.id.key).collect();
     let (mut with_entity, mut with_player, mut with_plain) = (0usize, 0usize, 0usize);
     let mut npc_fields: BTreeMap<String, usize> = BTreeMap::new();
+    let mut stand_in_fields: Vec<String> = Vec::new();
     for key in &keys {
         let Ok(area) = a.load_field(key) else { continue };
         let barrets: Vec<EntityInit> = inits_of(&area).into_iter().filter(|e| barrets_model(e)).collect();
         with_entity += usize::from(!barrets.is_empty());
         with_player += usize::from(barrets.iter().any(|e| e.is_player()));
         with_plain += usize::from(barrets.iter().any(|e| !e.is_player()));
-        let npcs = area.npcs().iter().filter(|n| n.appearance.model == "acgd").count();
+        // The NPCs the data places (the canon cast stand-ins, flagged `unconditional: false`, are counted below).
+        let npcs = area.npcs().iter().filter(|n| n.unconditional && n.appearance.model == "acgd").count();
+        let stand_in = area.npcs().iter().filter(|n| !n.unconditional && n.appearance.model == "acgd").count();
+        if stand_in > 0 {
+            stand_in_fields.push(key.clone());
+        }
         if npcs > 0 {
             npc_fields.insert(key.clone(), npcs);
         }
@@ -862,6 +896,9 @@ fn barret_is_a_party_member_not_an_npc_of_the_first_reactor_fields() {
     let want: BTreeMap<String, usize> =
         [("blackbg5", 1), ("blackbg6", 2), ("blackbg8", 1), ("blackbgi", 1), ("tunnel_4", 1)].map(|(k, n)| (k.to_string(), n)).into();
     assert_eq!(npc_fields, want);
+    // The canon cast stand-in is in exactly the two fields of the allowlist, and nowhere else.
+    stand_in_fields.sort();
+    assert_eq!(stand_in_fields, ["md1_1", "md1stin"], "the stand-in fields");
 
     // "Nearest" in the game's own field order (the maplist): the reactor fields are ids 116 to 118,
     // the nearest fields with a reported Barret NPC are `blackbgi` (6 before) and then `blackbg8`,
@@ -892,9 +929,11 @@ fn npcs_of_every_field_follow_the_rules() {
         let inits = inits_of(&area);
         let npcs = area.npcs();
         let expected: Vec<(String, Pos)> = inits.iter().filter_map(|e| Some((e.name.clone(), verdict(e, &area).ok()?))).collect();
-        let got: Vec<(String, Pos)> = npcs.iter().map(|n| (n.entity_name.clone(), n.pos)).collect();
+        // The data's NPCs are exactly the restated rules; the canon cast stand-ins (`unconditional: false`, only md1stin and
+        // md1_1) come after them and are checked by `barret_is_a_party_member_in_the_data_and_a_stand_in_npc_...`.
+        let got: Vec<(String, Pos)> = npcs.iter().filter(|n| n.unconditional).map(|n| (n.entity_name.clone(), n.pos)).collect();
         assert_eq!(got, expected, "{key}");
-        for n in &npcs {
+        for n in npcs.iter().filter(|n| n.unconditional) {
             assert!(n.pos.is_finite() && n.facing.is_finite() && n.unconditional, "{key}: {n:?}");
             assert!(!n.appearance.model.is_empty() && n.appearance.model.len() <= 8, "{key}: {}", n.appearance.model);
             assert!(n.facing > -std::f32::consts::PI - 1e-5 && n.facing <= std::f32::consts::PI + 1e-5);
