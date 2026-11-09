@@ -1105,7 +1105,8 @@ from a server and keeps none anywhere but the library.
   - **Ladders and jumps.** When the server puts you through one (it tells your client with `MoveRejected`, and you stand where the link
     leads), the sounds that the line's script, and the scripts of your own character it calls, play, at the times the script gives:
     the take-off of a jump (sound 62) half a second in, a ladder's first sound (sound 21) at once. A script's sounds after a walk, a jump or a
-    climb have no time in the script and are not played. **The lift** of `elevtr1` plays the sound its panel's script starts when the
+    climb have no time in the script and are not played (of the archive's 190 links, 123 in 26 fields play something at a time the script
+    gives; 47 more, in 9 fields, have only sounds of that other kind: the plan line counts them, `links 5 (+1 untimed)`). **The lift** of `elevtr1` plays the sound its panel's script starts when the
     story bit it sets flips (sound 42, a loop clip, once through: its stop is behind waits the data do not give). A sound an event plays
     replaces what its channel was playing, as the game's channels do.
   - **Doors.** A gateway is data and makes no sound. A door whose script plays before its jump does when you come through it; the
