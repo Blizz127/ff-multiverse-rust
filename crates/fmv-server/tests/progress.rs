@@ -528,14 +528,16 @@ async fn a_member_who_left_mid_battle_is_still_paid_in_the_store() {
 /// still a Hello too, and the target of its first spell, item or limit would be a bare actor, which a v10 server does
 /// not read as a target, while a v9 client could not read the whole sides a v10 server announces; v11: nothing it would
 /// be sent is new, but its engine picks the enemies' moves without their AI scripts, so its replay of the first battle
-/// would diverge from the server's at the first enemy turn; v12: it cannot decode the status events and refusals).
+/// would diverge from the server's at the first enemy turn; v12: it cannot decode the status events and refusals; v13:
+/// nothing it would be sent is new, but its engine skips a scripted enemy's status-only attacks and the Death counter of
+/// an enemy that Poison kills, so its replay would diverge).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_client_of_the_previous_protocol_version_is_refused_at_the_handshake() {
-    assert_eq!(PROTOCOL_VERSION, 12);
+    assert_eq!(PROTOCOL_VERSION, 13);
     let server = TestServer::start(fast(None)).await;
-    for old_version in [11u16, 10, 9, 8, 7, 6, 5, 4] {
+    for old_version in [12u16, 11, 10, 9, 8, 7, 6, 5, 4] {
         let mut old = Client::connect(server.addr).await;
-        // A v8 to v11 Hello asks for a character (and reads as a v12 Hello); the older ones carried a colour and a look.
+        // A v8 to v12 Hello asks for a character (and reads as a v13 Hello); the older ones carried a colour and a look.
         let hello = if old_version >= 8 {
             format!(
                 r#"{{"Hello":{{"protocol_version":{old_version},"client_build":"old","auth":{{"Register":{{"display_name":"Old{old_version}"}}}},"character":{{"tint":[1,2,3],"body":null,"slot":null}}}}}}"#

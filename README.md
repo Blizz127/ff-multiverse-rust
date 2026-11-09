@@ -1010,6 +1010,12 @@ effects" above), so a v11 peer cannot decode them and the version has to move wi
 together. It stores nothing new (a status is battle state; the starting statuses are a debug input), so rolling back is
 pointing the server and the clients back at a v11 build together.
 
+**Protocol v13** is again a change of the ENGINE only: a scripted enemy's status-only attacks are played, and an enemy
+that a turn of Poison kills runs its Death counter in the same step (see "Status effects" above). No message, event or
+stored record changed shape, but a v12 engine would skip those attacks and counters, so its replay would diverge: a v12
+client or server is refused at the handshake. **Rolling back v13:** nothing it stores is new, so point the server and
+the clients back at a v12 build together.
+
 ## Importing your own FF7 data
 
 Point the importer at an installed PC copy of FF7 that you own. Your install is only ever
