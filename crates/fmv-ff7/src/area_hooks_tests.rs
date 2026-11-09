@@ -8,7 +8,7 @@ use crate::field::FieldFile;
 use crate::script::synth::SynthScript;
 use crate::story::StoryState;
 use crate::testutil::{asm, build_lgp, maplist_bytes, pack_literals, script_section, FieldSpec, GatewaySpec, LoaderModelSpec};
-use fmv_adapter_api::{AdapterError, AreaRuntime, EncounterEntry, EncounterTable, ExitKind, GameAdapter, NpcSpawn};
+use fmv_adapter_api::{AdapterError, AreaRuntime, EncounterEntry, EncounterTable, ExitKind, ExitState, GameAdapter, NpcSpawn};
 use fmv_core::{EditionProvenance, GameId, Platform, Pos, SourceRef};
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -806,6 +806,52 @@ fn script_exits_and_story_points_are_offered_in_a_reviewed_field_only() {
     assert_eq!(surveyed.links().len(), 1, "the survey sees what the data holds");
     assert_eq!(surveyed.story_withheld(), None);
     assert_eq!(surveyed.story_advance(&[], 0).map(|s| s.summary), Some("moment=1->5".to_string()));
+}
+
+/// The same story field as in [`story_archive`], reviewed, with its line's script exit and its gateway leading to
+/// `md1_1`, a field that is reviewed too.
+fn reviewed_pair_archive() -> Ff7Adapter {
+    let field = FieldSpec {
+        gateways: Some(vec![gateway([0, 0, 1], [0, 100, 2], [10, 20, 1], 1)]),
+        overrides: vec![(0, story_section())],
+        ..FieldSpec::default()
+    };
+    adapter_over(&[("maplist", maplist_bytes(&["zero", "md1_1"])), ("md1stin", entry(&field)), ("md1_1", entry(&FieldSpec::default()))])
+}
+
+#[test]
+fn a_script_exit_that_leads_out_of_the_reviewed_fields_is_closed_in_a_served_field_and_one_that_stays_in_is_open() {
+    let stories = [Vec::new(), StoryState::at(1).encode(), StoryState::at(5).encode(), StoryState::at(33).encode(), StoryState::at(500).encode()];
+    // `dest` is a field nobody reviewed: the exit the line's script decides is closed whatever the story says
+    let a = story_archive();
+    let served = a.load_field("md1stin").unwrap();
+    let exits = served.exits();
+    assert_eq!(exits.len(), 2, "the exit stays in the list, closed: {exits:?}");
+    let (gateway, scripted) = (&exits[0], &exits[1]);
+    assert_eq!((gateway.kind, gateway.target.as_str()), (ExitKind::Gateway, "dest"));
+    assert_eq!((scripted.kind, scripted.target.as_str()), (ExitKind::Script { id: 0 }, "dest"));
+    for blob in &stories {
+        assert_eq!(served.exit_state(gateway, blob), ExitState::Open, "a gateway is data");
+        assert_eq!(served.exit_state(scripted, blob), ExitState::Closed, "it leads where nothing is reviewed");
+    }
+    assert!(matches!(served.exit_state(scripted, &[7, 7]), ExitState::Unknown(_)), "a progression nobody reads is unjudged, not closed");
+    // as the server loads it, through the trait object
+    let area = a.load_area("md1stin").unwrap();
+    assert_eq!(area.exit_state(&area.exits()[1], &[]), ExitState::Closed);
+    // the survey's loader says what the data holds: no conditions, so open
+    let surveyed = a.survey_field("md1stin").unwrap();
+    for blob in &stories {
+        assert_eq!(surveyed.exit_state(&surveyed.exits()[1], blob), ExitState::Open, "what the data holds");
+    }
+
+    // the same field with the exit into a reviewed field: judged on the story alone, as before
+    let pair = reviewed_pair_archive();
+    let served = pair.load_field("md1stin").unwrap();
+    let scripted = served.exits()[1].clone();
+    assert_eq!((scripted.kind, scripted.target.as_str()), (ExitKind::Script { id: 0 }, "md1_1"));
+    for blob in &stories {
+        assert_eq!(served.exit_state(&scripted, blob), ExitState::Open);
+    }
 }
 
 #[test]
