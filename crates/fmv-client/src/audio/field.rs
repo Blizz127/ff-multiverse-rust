@@ -145,6 +145,9 @@ pub struct FieldPlan {
     pub unjudged: usize,
     /// Loops left out because their channel could still be changed by a part of a script that was not reached.
     pub left_open: usize,
+    /// Links that have a sound in their scripts and none that a time can be given for (it comes after an animation that is
+    /// waited for, a walk, a condition nothing can judge): not played, counted.
+    pub withheld_links: usize,
 }
 
 impl FieldPlan {
@@ -201,6 +204,7 @@ pub struct FieldFrame<'a> {
     pub pos: Option<Pos>,
     /// How many `MoveRejected` the client has had (every one counts).
     pub rejected: u64,
+    /// A battle has the field: a fight is on, or its end panel is still up.
     pub in_battle: bool,
 }
 
@@ -286,12 +290,6 @@ impl FieldState {
         self.loops.iter().enumerate().filter_map(|(c, l)| l.as_ref().map(|l| (c as u8 + 1, l.id))).collect()
     }
 
-    /// The plan the field has now (tests).
-    #[cfg(test)]
-    pub fn plan(&self) -> Option<&FieldPlan> {
-        self.plan.as_ref()
-    }
-
     /// What a run's field sounds came to, `None` when there were none: `4 sounds (21x3 62x1), 2 loops (38x1 60x1)`.
     pub fn summary(&self) -> Option<String> {
         let list = |m: &BTreeMap<u16, u32>| m.iter().map(|(id, n)| format!("{id}x{n}")).collect::<Vec<_>>().join(" ");
@@ -312,7 +310,9 @@ impl FieldState {
         } else if story_changed {
             self.on_story(frame);
         }
-        self.wanted = frame.story.to_vec();
+        if story_changed {
+            self.wanted = frame.story.to_vec();
+        }
         if let Some(key) = frame.key {
             if !self.requested && self.plan.as_ref().is_none_or(|p| p.story != self.wanted) {
                 self.requested = true;
@@ -454,12 +454,18 @@ impl FieldState {
     /// Make the loops that play the ones the plan has for the story the client holds: a loop still wanted is left alone, one that is
     /// not fades out, a new one fades in (once its time has come and its clip is here).
     fn apply_ambient(&mut self, engine: &AudioEngine, log: &Logger, now: f64) {
-        let Some(plan) = self.plan.as_ref().filter(|p| p.story == self.wanted) else { return };
+        // (a plan for an older story is not applied: a newer one is on its way)
+        if !self.plan.as_ref().is_some_and(|p| p.story == self.wanted) {
+            return;
+        }
         let elapsed = now - self.entered;
-        let wanted: Vec<AmbientLoop> = plan.ambient.clone();
         for channel in 1..=4u8 {
             let index = usize::from(channel - 1);
-            let want = wanted.iter().find(|a| a.channel == channel).filter(|_| !self.replaced.get(index).copied().unwrap_or(false));
+            let want: Option<AmbientLoop> = self
+                .plan
+                .as_ref()
+                .and_then(|p| p.ambient.iter().find(|a| a.channel == channel).copied())
+                .filter(|_| !self.replaced.get(index).copied().unwrap_or(false));
             let have = self.loops.get(index).and_then(|l| l.as_ref().map(|l| l.id));
             if have == want.map(|w| w.id) {
                 continue;
@@ -539,8 +545,9 @@ impl FieldState {
         } else {
             plan.ambient.iter().map(|a| if a.at == 0 { format!("ch{}:{}", a.channel, a.id) } else { format!("ch{}:{}@{}f", a.channel, a.id, a.at) }).collect::<Vec<_>>().join(" ")
         };
+        let withheld = if plan.withheld_links > 0 { format!(" (+{} untimed)", plan.withheld_links) } else { String::new() };
         log(&format!(
-            "field {key} sounds at moment {moment}: ambient {ambient}; {} link(s), {} lift flip(s), {} door(s) with a sound; {} condition(s) not judged (skipped), {} loop(s) left out (channel still open); read in {} ms",
+            "field {key} sounds (moment {moment}): ambient {ambient}; links {}{withheld}, lift {}, doors {}; unjudged {}, open {}; {} ms",
             plan.links.len(),
             plan.flips.len(),
             plan.exits.len(),

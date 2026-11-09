@@ -79,6 +79,9 @@ fn main() {
             for (ok, events) in &r.links {
                 println!("   link{}: {}", if *ok { " (OK)" } else { "" }, show_events(events));
             }
+            if r.withheld > 0 {
+                println!("   {} more link(s) have a sound that no time can be given for (not played)", r.withheld);
+            }
             for (on, events) in &r.flips {
                 println!("   lift bit {}: {}", if *on { "on" } else { "off" }, show_events(events));
             }
@@ -95,9 +98,12 @@ fn main() {
         for &moment in &moments {
             let plans = common::all_plans(&archive, &bank, moment);
             println!(
-                "== plans at moment {moment}: links {} in {} fields; flips {} in {} fields; walk-on exits with a sound {} in {} fields; {} distinct ids; the callees of links stop: {:?}",
+                "== plans at moment {moment}: of {} links, {} play something in {} fields and {} more are withheld (a sound with no time) in {} fields; flips {} in {} fields; walk-on exits with a sound {} in {} fields; {} distinct ids; the callees of links stop: {:?}",
+                plans.links_in_all,
                 plans.links,
                 plans.fields_with_links.len(),
+                plans.withheld,
+                plans.fields_with_withheld.len(),
                 plans.flips,
                 plans.fields_with_flips.len(),
                 plans.exits,

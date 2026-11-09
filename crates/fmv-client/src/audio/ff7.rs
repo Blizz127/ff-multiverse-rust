@@ -47,7 +47,7 @@ pub fn tasks(source: &Ff7Source, adapter: Arc<Ff7Adapter>, log: &Logger) -> Opti
         move |files| {
             let maplist: OnceLock<Option<Maplist>> = OnceLock::new();
             Arc::new(move |key, story, have| {
-                let maplist = maplist.get_or_init(|| flevel.as_ref().and_then(|path| read_maplist(path)));
+                let maplist = maplist.get_or_init(|| flevel.as_ref().and_then(read_maplist));
                 read_field(&adapter, &files, maplist.as_ref(), key, story, have)
             })
         },
@@ -250,10 +250,14 @@ fn read_field(adapter: &Ff7Adapter, files: &ResolvedAudio, maplist: Option<&Mapl
     let unjudged_in = |runs: &[field_sound::RunInfo]| runs.iter().filter(|r| matches!(r.stop, field_sound::Stop::Unjudged { .. })).count();
     // What its ladders, jumps, lift and doors play (the lift's sounds are those that follow the story bit the lift sets or clears,
     // judged for the story right after that).
-    let mut links = Vec::new();
+    let (mut links, mut withheld_links) = (Vec::new(), 0);
     for link in field_sound::link_events(&script, area.walkmesh(), &story) {
         unjudged += unjudged_in(&link.runs);
-        links.push(LinkPlan { line: link.line, to: link.to, needs_ok: link.needs_ok, calls: calls_of(&link.events) });
+        withheld_links += usize::from(link.withheld);
+        // (a link that plays nothing in time is not in the plan)
+        if !link.events.is_empty() {
+            links.push(LinkPlan { line: link.line, to: link.to, needs_ok: link.needs_ok, calls: calls_of(&link.events) });
+        }
     }
     let mut flips = Vec::new();
     for on in [true, false] {
@@ -267,7 +271,7 @@ fn read_field(adapter: &Ff7Adapter, files: &ResolvedAudio, maplist: Option<&Mapl
         unjudged += unjudged_in(&exit.runs);
         exits.push(ExitPlan { target: exit.target, arrival: exit.arrival, line: exit.line, calls: calls_of(&exit.events) });
     }
-    let plan = FieldPlan { key: key.to_string(), story: blob.to_vec(), ambient, links, flips, exits, unjudged, left_open: start.ambient_left_open(is_loop) };
+    let plan = FieldPlan { key: key.to_string(), story: blob.to_vec(), ambient, links, flips, exits, unjudged, left_open: start.ambient_left_open(is_loop), withheld_links };
     // The clips the plan names, minus the ones the caller holds.
     let wanted: Vec<u16> = plan.ids().into_iter().filter(|id| !have.contains(id)).collect::<BTreeSet<_>>().into_iter().collect();
     let clips = load_sounds(files, &wanted);

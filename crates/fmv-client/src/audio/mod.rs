@@ -39,7 +39,7 @@
 //! finishes, `audio: playing <track> (<why>)` at the moment a track really starts, `audio: battle sounds: N loaded`
 //! when a fight's clips were read, `audio: battle sound <id> (<hit|critical|miss|impact|...>)` at the moment each one
 //! plays and, when the run ends, `audio: battle sounds played: N (<id>x<times> ...)`. For the field's sounds: `audio: field
-//! <area> sounds at moment <m>: ambient ch3:38; ...` when a plan is read, `audio: field loop start ch3 38` and `... stop ...
+//! <area> sounds (moment <m>): ambient ch3:38; ...` when a plan is read, `audio: field loop start ch3 38` and `... stop ...
 //! (<why>)`, `audio: field sound ch1 62 (link)` and, at the end, `audio: field sounds played: ...`.
 
 mod cues;
@@ -568,13 +568,17 @@ impl GameAudio {
                 .collect();
             live.field.set_links(spots);
         }
+        // The field is the battle's until its end panel is gone too (the window freezes the field for as long): the loops come
+        // back then, when the story the win moved has long been told.
+        let now = session.now();
+        let battle = &session.state.battle;
         let frame = FieldFrame {
-            now: session.now(),
+            now,
             key,
             story: session.state.story.progress(),
             pos: Some(session.state.own.pos()),
             rejected: session.state.rejected(),
-            in_battle: session.state.battle.in_battle(),
+            in_battle: battle.in_battle() || battle.lingering(now),
         };
         self.follow_field(&frame);
     }
@@ -704,6 +708,9 @@ mod tests {
         DecodedMusic::from_stereo(RATE, vec![8_000; frames * 2], None).expect("a track")
     }
 
+    /// What a field plays for a story blob.
+    type PlanOf = Rc<dyn Fn(&[u8]) -> field::FieldPlan>;
+
     #[derive(Default)]
     struct State {
         /// What each field says; a field not listed says nothing.
@@ -721,7 +728,7 @@ mod tests {
         /// The sound ids the library has no clip for (an empty slot, say); every other id has one.
         no_clip: Vec<u16>,
         /// What each field plays, as a function of the story blob it is asked for; a field not listed plays nothing.
-        fields: HashMap<String, Rc<dyn Fn(&[u8]) -> field::FieldPlan>>,
+        fields: HashMap<String, PlanOf>,
         /// The ids whose clips loop (their loop region is the whole clip).
         loop_ids: Vec<u16>,
         /// Fields that cannot be read.
@@ -1566,7 +1573,7 @@ mod tests {
         assert_eq!(rig.audio.field_loops(), [(3, 38)]);
         assert_eq!(rig.audio.status().expect("on").loops_playing, 1);
         let lines = field_lines(&rig);
-        assert!(lines.iter().any(|l| l.starts_with("field nmkin_2 sounds at moment 15: ambient ch3:38; 0 link(s), 0 lift flip(s), 0 door(s) with a sound; 0 condition(s) not judged")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.starts_with("field nmkin_2 sounds (moment 15): ambient ch3:38; links 0, lift 0, doors 0; unjudged 0, open 0; ")), "{lines:?}");
         assert!(lines.contains(&"field loop start ch3 38".to_string()), "{lines:?}");
         // a clip of a tenth of a second is still playing a second later: it is a loop
         rig.audio.pump(48_000);
@@ -1614,7 +1621,7 @@ mod tests {
         let lines = field_lines(&rig);
         let at = |needle: &str| lines.iter().position(|l| l == needle).unwrap_or_else(|| panic!("{needle}: {lines:?}"));
         // (the plan for 27 is read first; the two channels are then changed in the same look, in channel order)
-        let plan_27 = lines.iter().position(|l| l.starts_with("field nmkin_4 sounds at moment 27: ambient ch2:60;")).unwrap_or_else(|| panic!("{lines:?}"));
+        let plan_27 = lines.iter().position(|l| l.starts_with("field nmkin_4 sounds (moment 27): ambient ch2:60;")).unwrap_or_else(|| panic!("{lines:?}"));
         assert!(at("field loop start ch3 38") < plan_27 && plan_27 < at("field loop start ch2 60") && plan_27 < at("field loop stop ch3 38 (the story moved)"), "{lines:?}");
         // a story that moves again without changing what the field plays leaves the alarm alone
         follow(&mut rig, &frame("nmkin_4", &blob(28), 3.0));
@@ -1680,6 +1687,39 @@ mod tests {
         let lines = field_lines(&rig);
         assert_eq!(lines.iter().filter(|l| l.starts_with("field loop start")).count(), 4);
         assert!(lines.contains(&"field loop stop ch3 38 (a battle)".to_string()), "{lines:?}");
+    }
+
+    #[test]
+    fn a_battle_that_moves_the_story_gives_the_loops_back_for_the_new_story_and_never_for_the_old_one() {
+        // the boss of nmkin_5, in shape: the hum (15) is stopped for the fight, the win moves the story to 27 while the end panel
+        // is up (the session's frame keeps `in_battle` for as long), and the loops that come back are the ones for 27
+        let mut rig = Rig::new(&[], &[]);
+        {
+            let mut s = rig.state.borrow_mut();
+            s.loop_ids = vec![38, 60];
+            s.fields.insert(
+                "nmkin_5".to_string(),
+                Rc::new(|story: &[u8]| plan_of(if StoryState::decode(story).is_some_and(|s| s.moment == 27) { vec![ambient(2, 60)] } else { vec![ambient(3, 38)] })),
+            );
+        }
+        let (before, after) = (blob(15), blob(27));
+        follow(&mut rig, &frame("nmkin_5", &before, 0.0));
+        follow(&mut rig, &frame("nmkin_5", &before, 0.05));
+        assert_eq!(rig.audio.field_loops(), [(3, 38)]);
+        let fight = |story: &'static [u8], now: f64| FieldFrame { in_battle: true, ..frame("nmkin_5", story, now) };
+        let (before, after): (&'static [u8], &'static [u8]) = (Box::leak(before.into_boxed_slice()), Box::leak(after.into_boxed_slice()));
+        follow(&mut rig, &fight(before, 1.0));
+        assert!(rig.audio.field_loops().is_empty());
+        // the fight is won and the story moves, with the end panel still up
+        follow(&mut rig, &fight(after, 2.0));
+        follow(&mut rig, &fight(after, 2.05));
+        assert!(rig.audio.field_loops().is_empty(), "nothing plays under the end panel");
+        // the panel goes: the loops of the story the player has now
+        follow(&mut rig, &frame("nmkin_5", after, 4.0));
+        assert_eq!(rig.audio.field_loops(), [(2, 60)]);
+        let lines = field_lines(&rig);
+        assert_eq!(lines.iter().filter(|l| l.starts_with("field loop start ch3 38")).count(), 1, "the hum was started once, before the fight: {lines:?}");
+        assert!(lines.contains(&"field loop start ch2 60".to_string()), "{lines:?}");
     }
 
     #[test]
@@ -1844,14 +1884,14 @@ mod tests {
 
     #[test]
     fn what_cannot_be_judged_is_counted_and_said_and_a_plan_that_cannot_be_read_is_said_once() {
-        let plan = field::FieldPlan { ambient: vec![ambient(3, 38)], unjudged: 3, left_open: 1, ..field::FieldPlan::default() };
+        let plan = field::FieldPlan { ambient: vec![ambient(3, 38)], unjudged: 3, left_open: 1, withheld_links: 2, ..field::FieldPlan::default() };
         let mut rig = field_rig("a", plan, &[38]);
         let story = blob(15);
         follow(&mut rig, &frame("a", &story, 0.0));
         follow(&mut rig, &frame("a", &story, 0.05));
         assert!(
-            field_lines(&rig).iter().any(|l| l.contains("3 condition(s) not judged (skipped), 1 loop(s) left out (channel still open)")),
-            "{:?}",
+            field_lines(&rig).iter().any(|l| l.starts_with("field a sounds (moment 15): ambient ch3:38; links 0 (+2 untimed), lift 0, doors 0; unjudged 3, open 1; ")),
+            "what could not be judged, what is left open and what has no time are all in the line: {:?}",
             field_lines(&rig)
         );
         // a field that cannot be read: one line, silence, and it is not asked for again for that story
@@ -1876,7 +1916,7 @@ mod tests {
         }
         assert_eq!(rig.audio.field_loops(), [(2, 60)]);
         let lines = rig.lines();
-        let about_38 = lines.iter().filter(|l| l.contains("38") && l.contains("clip") && !l.contains("sounds at moment")).collect::<Vec<_>>();
+        let about_38 = lines.iter().filter(|l| l.contains("38") && l.contains("clip") && !l.contains("sounds (moment")).collect::<Vec<_>>();
         assert_eq!(about_38.len(), 1, "said once, however many frames follow: {lines:?}");
         assert!(about_38[0].starts_with("no clip for field sound 38 (an empty slot)"), "{about_38:?}");
     }

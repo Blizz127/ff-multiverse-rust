@@ -227,8 +227,10 @@ pub struct Reviewed {
     pub field: String,
     /// `(moment, ambient)`.
     pub ambient: Vec<(u16, Vec<Ambient>)>,
-    /// `(needs OK, events)`.
+    /// `(needs OK, events)` of the links that play something in time.
     pub links: Vec<(bool, Vec<Timed>)>,
+    /// How many links of the field have a sound that no time can be given for (not played).
+    pub withheld: usize,
     /// `(on, events)`.
     pub flips: Vec<(bool, Vec<Timed>)>,
     pub exits: Vec<(String, Vec<Timed>)>,
@@ -249,9 +251,14 @@ pub fn reviewed_field(archive: &Archive, bank: &SfxBank, name: &str, moments: &[
         out.ambient.push((moment, ambient));
         // links, flips and exits are judged for the story of the moment too (the last moment's are kept)
         out.links.clear();
+        out.withheld = 0;
         out.flips.clear();
         out.exits.clear();
         for link in link_events(&script, &mesh, &story) {
+            out.withheld += usize::from(link.withheld);
+            if link.events.is_empty() {
+                continue;
+            }
             out.ids.extend(link.events.iter().map(|e| e.call.id).filter(|id| *id != 0));
             out.links.push((link.needs_ok, link.events));
         }
@@ -275,6 +282,11 @@ pub struct Plans {
     pub ids: BTreeSet<u16>,
     pub fields_with_links: BTreeSet<String>,
     pub links: usize,
+    /// Links that have a sound no time can be given for, and the fields they are in.
+    pub withheld: usize,
+    pub fields_with_withheld: BTreeSet<String>,
+    /// All the links the archive's fields have (the ones with a sound, the withheld ones and the silent ones).
+    pub links_in_all: usize,
     pub fields_with_flips: BTreeSet<String>,
     pub flips: usize,
     pub fields_with_exits: BTreeSet<String>,
@@ -293,6 +305,14 @@ pub fn all_plans(archive: &Archive, bank: &SfxBank, moment: u16) -> Plans {
         out.ids.extend(start.ambient(|id| loops(bank, id)).iter().map(|a| a.id));
         if let Ok(mesh) = field.walkmesh() {
             for link in link_events(&script, &mesh, &story) {
+                out.links_in_all += 1;
+                if link.withheld {
+                    out.withheld += 1;
+                    out.fields_with_withheld.insert(name.clone());
+                }
+                if link.events.is_empty() {
+                    continue;
+                }
                 out.ids.extend(link.events.iter().map(|e| e.call.id).filter(|id| *id != 0));
                 out.fields_with_links.insert(name.clone());
                 out.links += 1;

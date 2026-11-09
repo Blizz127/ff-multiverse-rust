@@ -71,6 +71,10 @@ fn lader(x: i16, y: i16, z: i16, triangle: u16) -> Vec<u8> {
 fn scrlw() -> Vec<u8> {
     vec![0x67]
 }
+/// `CANM!1 animation 4, frames 0 to 39, speed 1`: an animation that is waited for.
+fn canm1() -> Vec<u8> {
+    vec![0xB1, 4, 0, 39, 1]
+}
 fn dfanm() -> Vec<u8> {
     vec![0xA2, 4, 1]
 }
@@ -491,17 +495,22 @@ fn a_ladder_and_a_jump_play_what_the_players_own_scripts_play_with_the_times_the
     let jump = cat(&[dfanm(), wait(15), sound(62, 64), jump_to(110, 10, 1), wait(20), ret()]);
     let ladder = cat(&[sound(21, 64), move_to(205, 10), lader(210, 20, 5, 2), sound(62, 64), ret()]);
     let silent = cat(&[jump_to(10, 10, 0), ret()]);
+    // an animation that is waited for comes before the sound: the data have the sound and no time for it
+    let slow = cat(&[canm1(), wait(15), sound(62, 64), jump_to(110, 10, 1), ret()]);
     let bytes = field_with_lines(
-        vec![(3, jump), (4, ladder), (5, silent)],
+        vec![(3, jump), (4, ladder), (5, silent), (6, slow)],
         vec![
             (line((-10, 0), (-10, 50), 7), vec![(2, cat(&[reqew(0, 3), ret()]))]),
             (line((300, 0), (300, 50), 9), vec![(4, cat(&[when_key(0x220, &reqew(0, 4)), ret()]))]),
-            // a link that plays nothing is left out
             (line((500, 0), (500, 50), 9), vec![(2, cat(&[reqew(0, 5), ret()]))]),
+            (line((700, 0), (700, 50), 9), vec![(2, cat(&[reqew(0, 6), ret()]))]),
         ],
     );
     let found = link_events(&parsed(&bytes), &mesh(3), &story(13));
-    let [jumping, climbing] = found.as_slice() else { panic!("{found:?}") };
+    let [jumping, climbing, quiet, untimed] = found.as_slice() else { panic!("{found:?}") };
+    assert!(quiet.events.is_empty() && !quiet.withheld, "a link that plays nothing is in the list, with nothing: {quiet:?}");
+    assert!(untimed.events.is_empty() && untimed.withheld, "a sound with no time to give it is withheld, not guessed: {untimed:?}");
+    assert!(!jumping.withheld && !climbing.withheld);
     assert!(!jumping.needs_ok && climbing.needs_ok);
     assert_eq!(plays(&jumping.events), [(15, 1, 62)], "the take-off half a second in");
     assert!(matches!(jumping.stop, Stop::Unknown { opcode: 0x03, .. }), "the line script waits for the player's: {:?}", jumping.stop);

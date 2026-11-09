@@ -219,6 +219,10 @@ pub struct LinkSounds {
     pub needs_ok: bool,
     /// What the trigger script plays, with times, up to where the run could go on.
     pub events: Vec<Timed>,
+    /// The link plays nothing in time but a script of it has a sound opcode after the point where its run had to stop (an
+    /// animation that is waited for, a walk, a condition nothing here can judge): a sound the data have and no time can be
+    /// given for. `false` for a link that has none, and for one that has events.
+    pub withheld: bool,
     /// Why the trigger script's own run stopped (a script that waits for one it started, `REQEW`, stops with that
     /// opcode as its reason when the other cannot be timed: the reason it could not is in [`LinkSounds::runs`]).
     pub stop: Stop,
@@ -227,8 +231,9 @@ pub struct LinkSounds {
     pub unjudged: Vec<Unjudged>,
 }
 
-/// The sounds of every link of a field ([`crate::links::scan_links`]: the ladders and jumps its scripts define), for `story`.
-/// A link that plays nothing is left out.
+/// The sounds of every link of a field ([`crate::links::scan_links`]: the ladders and jumps its scripts define), for `story`,
+/// in the order the area lists the links. A link that plays nothing in time is in the list with no events (and
+/// [`LinkSounds::withheld`] says whether it has a sound it cannot give a time for).
 pub fn link_events(script: &FieldScript<'_>, mesh: &Walkmesh, story: &StoryState) -> Vec<LinkSounds> {
     let mut out = Vec::new();
     for def in scan_links(script, mesh).found {
@@ -236,10 +241,8 @@ pub fn link_events(script: &FieldScript<'_>, mesh: &Walkmesh, story: &StoryState
         let keys = if def.needs_ok { crate::script::dialogue::KEY_OK } else { 0 };
         let mut machine = Machine::new(script, Env { story, keys });
         let run = machine.run(at, Part::Whole, None, 0);
-        if machine.events.is_empty() {
-            continue;
-        }
         let stop = machine.runs.get(run).map_or(Stop::Broken, |r| r.stop);
+        let withheld = machine.events.is_empty() && machine.runs.iter().any(|r| r.open != 0);
         out.push(LinkSounds {
             entity: def.entity,
             slot: def.slot,
@@ -248,6 +251,7 @@ pub fn link_events(script: &FieldScript<'_>, mesh: &Walkmesh, story: &StoryState
             to_hint: Some(def.triangle),
             needs_ok: def.needs_ok,
             events: machine.events,
+            withheld,
             stop,
             runs: machine.runs,
             unjudged: machine.unjudged,
