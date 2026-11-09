@@ -631,6 +631,11 @@ where
             ServerMsg::AreaChange { .. } => {
                 return Err(NetError::Protocol("AreaChange during the handshake".into()));
             }
+            // The answer to a `DeleteCharacter`, which is the first message of a connection of its own and is made by
+            // `crate::delete`, never by this handshake: a server that says it here is broken (no server text is echoed).
+            ServerMsg::CharacterDeleted { .. } => {
+                return Err(NetError::Protocol("CharacterDeleted during the handshake".into()));
+            }
             ServerMsg::Pong { .. } => {}
             other @ (ServerMsg::EntityUpdate { .. }
             | ServerMsg::PlayerJoined { .. }

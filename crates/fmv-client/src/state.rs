@@ -596,6 +596,12 @@ impl ClientState {
             // The countdown the server runs for our story (the server's word, never ends the session): the HUD draws
             // what it says and counts down on this clock between messages (see `crate::ui::countdown`).
             ServerMsg::Countdown { state } => self.countdown.on_message(now, state),
+            // The answer to a `DeleteCharacter`, which is made on a connection of its own (see `crate::delete`) and never
+            // by a joined session: a server that says it here is broken, and a character it says is gone must not go on
+            // being played as if it were not. Like the area offer above it ends the session (no server text is echoed).
+            ServerMsg::CharacterDeleted { .. } => {
+                return Some("protocol error: the server announced a deleted character to a joined session".to_string());
+            }
         }
         None
     }
