@@ -13,8 +13,8 @@
 
 use super::cues::Cue;
 use super::director::AreaMusic;
-use super::worker::Tasks;
-use crate::ff7::Ff7Source;
+use super::worker::{AnalyzeTask, Tasks};
+use crate::ff7::{Ff7ResolveError, Ff7Source};
 use fmv_audio::{decode_music_file, Logger, SfxClip};
 use fmv_ff7::music::{field_music_of, FieldMusic, MusicList, MusicUse};
 use fmv_ff7::script::INIT_SCRIPT;
@@ -26,7 +26,18 @@ use std::sync::Arc;
 /// The tasks of the FF7 soundtrack over this machine's copy, or `None` (after one line saying why)
 /// when there is nothing to play.
 pub fn tasks(source: &Ff7Source, adapter: Arc<Ff7Adapter>, log: &Logger) -> Option<Tasks> {
-    let files = match resolve_audio(source) {
+    tasks_from(resolve_audio(source), log, move |list| Arc::new(move |key| area_music(&adapter, &list, key)))
+}
+
+/// [`tasks`] over what [`resolve_audio`] said, with `analyze` building the task that reads a field's script
+/// from the track list (the one part that needs the adapter, so that everything else is testable without
+/// one).
+fn tasks_from(
+    resolved: Result<ResolvedAudio, Ff7ResolveError>,
+    log: &Logger,
+    analyze: impl FnOnce(Arc<MusicList>) -> AnalyzeTask,
+) -> Option<Tasks> {
+    let files = match resolved {
         Ok(files) => files,
         Err(error) => {
             log(&format!("cannot look for the sound files ({error}); playing without sound"));
@@ -59,10 +70,7 @@ pub fn tasks(source: &Ff7Source, adapter: Arc<Ff7Adapter>, log: &Logger) -> Opti
     let files = Arc::new(files);
     let list = Arc::new(list);
     Some(Tasks {
-        analyze: {
-            let list = Arc::clone(&list);
-            Arc::new(move |key| area_music(&adapter, &list, key))
-        },
+        analyze: analyze(Arc::clone(&list)),
         decode: {
             let files = Arc::clone(&files);
             Arc::new(move |name| {
@@ -149,7 +157,7 @@ mod tests {
 
     /// An invented music list: line n (counted from 1) is `t<n>`, so that frame id n + 1 names `t<n>`.
     fn list() -> MusicList {
-        MusicList::parse((1..=20).map(|n| format!("t{n}\\r\\n")).collect::<String>().as_bytes())
+        MusicList::parse((1..=20).map(|n| format!("t{n}\r\n")).collect::<String>().as_bytes())
     }
 
     #[test]
@@ -202,6 +210,92 @@ mod tests {
         for cue in Cue::ALL {
             assert!(sound::entry_for_sound_id(sound_id(cue)).is_some(), "{cue:?}");
         }
+    }
+
+    fn lines() -> (Logger, Arc<std::sync::Mutex<Vec<String>>>) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let log: Logger = Arc::new(move |line| sink.lock().expect("log").push(line.to_string()));
+        (log, seen)
+    }
+
+    fn no_script(_: Arc<MusicList>) -> AnalyzeTask {
+        Arc::new(|_| AreaMusic::default())
+    }
+
+    /// A 16-bit mono PCM WAV file of `frames` frames (an invented one, no game data).
+    fn wav(frames: usize) -> Vec<u8> {
+        let data = u32::try_from(frames * 2).expect("small");
+        let mut out = b"RIFF".to_vec();
+        out.extend_from_slice(&(36 + data).to_le_bytes());
+        out.extend_from_slice(b"WAVEfmt ");
+        out.extend_from_slice(&16u32.to_le_bytes());
+        out.extend_from_slice(&[1, 0, 1, 0]); // PCM, mono
+        out.extend_from_slice(&22_050u32.to_le_bytes());
+        out.extend_from_slice(&44_100u32.to_le_bytes());
+        out.extend_from_slice(&[2, 0, 16, 0]);
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&data.to_le_bytes());
+        out.extend((0..frames).flat_map(|i| (i as i16).to_le_bytes()));
+        out
+    }
+
+    #[test]
+    fn a_library_without_sound_is_no_tasks_and_exactly_one_line() {
+        let (log, seen) = lines();
+        assert!(tasks_from(Ok(ResolvedAudio::default()), &log, no_script).is_none());
+        let seen = seen.lock().expect("log");
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert!(seen[0].contains("no sound files") && seen[0].contains("FMV_FF7_REIMPORT=1"), "{}", seen[0]);
+    }
+
+    #[test]
+    fn a_library_that_cannot_be_read_is_no_tasks_and_exactly_one_line() {
+        let (log, seen) = lines();
+        let error = Ff7ResolveError::NoLibrary { dir: "/nowhere".into() };
+        assert!(tasks_from(Err(error), &log, no_script).is_none());
+        let seen = seen.lock().expect("log");
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert!(seen[0].starts_with("cannot look for the sound files"), "{}", seen[0]);
+    }
+
+    #[test]
+    fn tracks_without_a_list_still_decode_and_a_track_that_is_missing_says_so() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        std::fs::write(dir.path().join("bat.wav"), wav(500)).expect("a track");
+        let files = ResolvedAudio { music_wav: [("bat".to_string(), dir.path().join("bat.wav"))].into(), ..ResolvedAudio::default() };
+        let (log, seen) = lines();
+        let tasks = tasks_from(Ok(files), &log, no_script).expect("a track is something to play");
+        assert_eq!((tasks.analyze)("md1stin"), AreaMusic::default());
+        // The track decodes through its file (a blob has no extension: the content says what it is).
+        assert_eq!((tasks.decode)("bat").expect("bat decodes").frames(), 500);
+        assert!((tasks.decode)("Bat").is_ok(), "names match without regard to case");
+        assert!((tasks.decode)("fanfare").unwrap_err().contains("no file"));
+        // No effect files: no menu sounds, with a reason.
+        assert!((tasks.cues)().unwrap_err().contains("no audio.fmt"));
+        // One line about the missing track list and one that says what was found: nothing else.
+        let seen = seen.lock().expect("log");
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(seen[0].contains("no music.idx"), "{}", seen[0]);
+        assert!(seen[1].starts_with("sound files found: 1 music tracks (0 ogg, 1 wav), music.idx 0 names"), "{}", seen[1]);
+    }
+
+    #[test]
+    fn the_track_list_goes_to_the_script_reader() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        std::fs::write(dir.path().join("music.idx"), b"oa\r\nob\r\ndun2\r\n").expect("a list");
+        let files = ResolvedAudio { music_idx: Some(dir.path().join("music.idx")), ..ResolvedAudio::default() };
+        let (log, seen) = lines();
+        let names = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let kept = Arc::clone(&names);
+        let tasks = tasks_from(Ok(files), &log, move |list| {
+            *kept.lock().expect("names") = list.names().to_vec();
+            Arc::new(|_| AreaMusic::default())
+        })
+        .expect("a list alone is something");
+        assert_eq!(*names.lock().expect("names"), ["oa", "ob", "dun2"]);
+        assert!((tasks.decode)("oa").is_err(), "a name in the list without a file is a missing track");
+        assert!(seen.lock().expect("log").iter().any(|l| l.contains("music.idx 3 names")));
     }
 
     #[test]

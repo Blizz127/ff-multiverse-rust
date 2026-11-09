@@ -37,7 +37,7 @@ use worker::{Done, Tasks, ThreadWorker, Worker};
 use crate::session::Session;
 use fmv_audio::{AudioConfig, AudioEngine, DecodedMusic, Logger, Mode, PlayOptions, SfxClip, TrackId};
 use fmv_core::GameId;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::Instant;
 
 /// Decoded tracks kept at once (the playing one, the next fight's, the fanfare, and a little slack): about
@@ -111,8 +111,9 @@ struct Live {
     log: Logger,
     cache: Cache,
     /// Tracks asked of the worker that are being decoded, or failed (a failed one is never asked for
-    /// again); a decoded one lives in the cache instead.
-    asked: HashSet<String>,
+    /// again); a decoded one lives in the cache instead. The value says whether it was asked for as
+    /// urgent (something is waiting for it) or only in advance.
+    asked: HashMap<String, bool>,
     /// The track the director wants that is not decoded yet, and since when.
     waiting: Option<(String, Instant)>,
     /// What was last handed to the engine.
@@ -150,8 +151,17 @@ impl Live {
         if self.cache.contains(track) {
             return;
         }
-        if self.asked.insert(track.to_string()) {
-            self.worker.decode(track, urgent);
+        match self.asked.get(track).copied() {
+            None => {
+                self.asked.insert(track.to_string(), urgent);
+                self.worker.decode(track, urgent);
+            }
+            // Asked for in advance and wanted now: tell the worker, which moves it to the front.
+            Some(false) if urgent => {
+                self.asked.insert(track.to_string(), true);
+                self.worker.decode(track, true);
+            }
+            Some(_) => {}
         }
     }
 
@@ -184,6 +194,8 @@ impl Live {
                     Err(why) => {
                         self.say(&format!("cannot play the track {name} ({why}); going on without it"));
                         self.director.unavailable(&name);
+                        // Never asked for again, urgent or not.
+                        self.asked.insert(name.clone(), true);
                         if self.waiting.as_ref().is_some_and(|(t, _)| *t == name) {
                             self.waiting = None;
                         }
@@ -258,7 +270,7 @@ impl GameAudio {
                 director: Director::new(),
                 log,
                 cache: Cache { entries: Vec::new() },
-                asked: HashSet::new(),
+                asked: HashMap::new(),
                 waiting: None,
                 playing: None,
                 ids: Vec::new(),
@@ -694,6 +706,27 @@ mod tests {
         rig.frame(Some("a"), counts(false, 2, 2, 2));
         assert_eq!(rig.playing().as_deref(), Some("fanfare"), "the second win is heard too");
         assert_eq!(rig.audio.history(), ["bat", "fanfare", "bat", "fanfare"]);
+    }
+
+    #[test]
+    fn a_track_asked_for_in_advance_is_asked_for_again_as_urgent_when_it_is_wanted_now() {
+        let mut rig = Rig::new(&[("a", area(Some("ob"), None, None))], &[("ob", 4_800), ("bat", 4_800), ("fanfare", 2_400)]);
+        // The answers are held back, as slow decodes would hold them: `bat` and `fanfare` are asked for in
+        // advance when the script is read.
+        rig.frame(Some("a"), NONE);
+        rig.state.borrow_mut().hold = true;
+        rig.frame(Some("a"), NONE);
+        let asked = rig.state.borrow().asked.clone();
+        assert!(asked.contains(&"decode bat".to_string()), "{asked:?}");
+        // A fight starts before they arrive: the theme is wanted now, so the worker is told it is urgent...
+        rig.frame(Some("a"), counts(true, 1, 0, 0));
+        let asked = rig.state.borrow().asked.clone();
+        assert!(asked.contains(&"decode bat (urgent)".to_string()), "{asked:?}");
+        // ...once, however many frames the fight lasts.
+        rig.frame(Some("a"), counts(true, 1, 0, 0));
+        rig.frame(Some("a"), counts(true, 1, 0, 0));
+        let urgent = rig.state.borrow().asked.iter().filter(|a| *a == "decode bat (urgent)").count();
+        assert_eq!(urgent, 1);
     }
 
     #[test]

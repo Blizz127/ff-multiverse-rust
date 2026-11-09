@@ -899,8 +899,8 @@ from a server and keeps none anywhere but the library.
   back to the field's music. The next fight's music and the fanfare are decoded in the background as soon as
   you enter a field, so that a fight does not wait for them.
 - **Menus.** The battle menu and the character menu click, confirm, cancel and buzz with the game's own sounds.
-- **Keys and flags.** **M** mutes and unmutes (the music keeps moving while muted); **-** and **=** change the
-  volume. `--mute` or `FMV_AUDIO=off` builds no sound at all (no device is opened, nothing is decoded);
+- **Keys and flags.** In the game **M** mutes and unmutes (the music keeps moving while muted); **-** and **=**
+  change the volume (the character menu has no sound keys: its name field would take them as letters). `--mute` or `FMV_AUDIO=off` builds no sound at all (no device is opened, nothing is decoded);
   `FMV_AUDIO=null` runs the whole soundtrack against a clock with no device; `FMV_AUDIO=auto`, the default of
   a window, plays through the default output and falls back to the null sink when there is none. A
   `--headless` bot is silent unless `FMV_AUDIO` is set; with `null` or `auto` it logs what it plays.
@@ -908,7 +908,10 @@ from a server and keeps none anywhere but the library.
   not name it, so if your ears say another track of `music.idx` is the real one, `FMV_AUDIO_FANFARE=fan2`
   (say) plays that instead.
 - **When something is missing**: no sound files in the library, a missing or damaged track, no sound card. Each is one line starting
-  `audio:` on stderr and silence for that part; the game carries on. A sound card is not needed to play.
+  `audio:` on stderr and silence for that part; the game carries on. A sound card is not needed to play: without
+  one the client says `audio: no audio output device; continuing silently` (once; libasound's own complaints are
+  kept off the terminal) and runs the same soundtrack against a clock. With one it says
+  `audio: playing through "<device>" (<rate> Hz, <n> channels)`.
 - **Runtime dependency.** The client needs `libasound.so.2` (ALSA; PipeWire and PulseAudio serve it through
   their ALSA plugins), which the Bazzite image has. Without it the binary does not start (the dynamic loader
   says which library it misses), so a machine that cannot have it cannot run this build.

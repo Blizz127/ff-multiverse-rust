@@ -225,8 +225,8 @@ SOUND:
 
 WINDOW CONTROLS:
   WASD / arrow keys move, Esc twice quits (never during a battle: close the window to quit
-  there). M mutes the sound, - and = change its volume (see SOUND). P invites the nearest other
-  player to your party, Y accepts
+  there). M mutes the sound, - and = change its volume (see SOUND). P invites the nearest other player
+  to your party, Y accepts
   the newest pending invite, L leaves your party. The window shows player names over their
   markers, your party in the top right corner, the area name and the connection status; a FIXTURE
   area is labelled \"FIXTURE (synthetic, not FF7)\". The window title shows your party size and a

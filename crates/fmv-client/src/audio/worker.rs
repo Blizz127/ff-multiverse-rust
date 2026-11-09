@@ -13,7 +13,7 @@
 use super::cues::Cue;
 use super::director::AreaMusic;
 use fmv_audio::{DecodedMusic, SfxClip};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
@@ -70,7 +70,17 @@ enum Job {
 struct Queues {
     urgent: VecDeque<Job>,
     background: VecDeque<Job>,
+    /// Tracks a thread is decoding right now (asking for one of those again would decode it twice).
+    running: HashSet<String>,
     closed: bool,
+}
+
+impl Queues {
+    /// Whether a decode of `name` is waiting (in either lane) or running.
+    fn has_decode(&self, name: &str) -> bool {
+        let is = |j: &Job| matches!(j, Job::Decode(n) if n == name);
+        self.running.contains(name) || self.urgent.iter().any(is) || self.background.iter().any(is)
+    }
 }
 
 struct Shared {
@@ -102,6 +112,20 @@ impl ThreadWorker {
 
     fn push(&self, job: Job, urgent: bool) {
         if let Ok(mut queues) = self.shared.queues.lock() {
+            if let Job::Decode(name) = &job {
+                // A track that is already being decoded or waiting is not queued twice. A request that is
+                // urgent moves a waiting one from the background lane to the front: a track asked for in
+                // advance and wanted now must not stay behind the rest of the advance work.
+                if queues.has_decode(name) {
+                    if urgent {
+                        let at = queues.background.iter().position(|j| matches!(j, Job::Decode(n) if n == name));
+                        if let Some(waiting) = at.and_then(|at| queues.background.remove(at)) {
+                            queues.urgent.push_back(waiting);
+                        }
+                    }
+                    return;
+                }
+            }
             if urgent {
                 queues.urgent.push_back(job);
             } else {
@@ -151,6 +175,9 @@ fn run(shared: &Shared, tasks: &Tasks, send: &Sender<Done>) {
                     return;
                 }
                 if let Some(job) = queues.urgent.pop_front().or_else(|| queues.background.pop_front()) {
+                    if let Job::Decode(name) = &job {
+                        queues.running.insert(name.clone());
+                    }
                     break job;
                 }
                 queues = match shared.wake.wait(queues) {
@@ -168,6 +195,9 @@ fn run(shared: &Shared, tasks: &Tasks, send: &Sender<Done>) {
             Job::Decode(name) => {
                 let started = Instant::now();
                 let result = catch_unwind(AssertUnwindSafe(|| (tasks.decode)(&name))).unwrap_or_else(|_| Err("the decoder panicked".into()));
+                if let Ok(mut queues) = shared.queues.lock() {
+                    queues.running.remove(&name);
+                }
                 Done::Track { name, result, took: started.elapsed() }
             }
             Job::Cues => Done::Cues(catch_unwind(AssertUnwindSafe(|| (tasks.cues)())).unwrap_or_else(|_| Err("the sound file reader panicked".into()))),
@@ -269,6 +299,53 @@ mod tests {
         let at = |n: &str| order.iter().position(|x| x == n).expect("it ran");
         assert!(at("urgent") < at("background"), "{order:?}");
         // Let the other thread go too, so that nothing is left running.
+        gates[1].store(1, SeqCst);
+    }
+
+    #[test]
+    fn a_waiting_background_decode_is_promoted_by_an_urgent_request_and_never_queued_twice() {
+        let started = Arc::new(Mutex::new(Vec::<String>::new()));
+        let gates = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+        let (log, gate) = (Arc::clone(&started), Arc::clone(&gates));
+        let tasks = Tasks {
+            analyze: Arc::new(|_| AreaMusic::default()),
+            decode: Arc::new(move |name| {
+                log.lock().expect("log").push(name.to_string());
+                if let Some(n) = name.strip_prefix("block").and_then(|n| n.parse::<usize>().ok()) {
+                    while gate[n].load(SeqCst) == 0 {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                Ok(tracks(10))
+            }),
+            cues: Arc::new(|| Err("none".into())),
+        };
+        let mut worker = ThreadWorker::start(tasks);
+        let mut backlog = Vec::new();
+        for n in 0..THREADS {
+            worker.decode(&format!("block{n}"), true);
+        }
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while started.lock().expect("log").len() < THREADS {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // `first` is asked for in advance, then `wanted` too; `wanted` is then wanted now, twice over.
+        worker.decode("first", false);
+        worker.decode("wanted", false);
+        worker.decode("wanted", true);
+        worker.decode("wanted", true);
+        worker.decode("first", false);
+        // A decode a thread is running right now is not queued again either.
+        worker.decode("block0", true);
+        gates[0].store(1, SeqCst);
+        wait_for(&mut worker, &mut backlog, |d| matches!(d, Done::Track { name, .. } if name == "first"), "the other job");
+        let order = started.lock().expect("log").clone();
+        let at = |n: &str| order.iter().position(|x| x == n).expect("it ran");
+        assert!(at("wanted") < at("first"), "the promoted job ran first: {order:?}");
+        assert_eq!(order.iter().filter(|n| *n == "wanted").count(), 1, "decoded once: {order:?}");
+        assert_eq!(order.iter().filter(|n| *n == "first").count(), 1, "decoded once: {order:?}");
+        assert_eq!(order.iter().filter(|n| *n == "block0").count(), 1, "a running decode is not started again: {order:?}");
         gates[1].store(1, SeqCst);
     }
 
