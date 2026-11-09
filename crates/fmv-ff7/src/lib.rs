@@ -130,6 +130,8 @@ pub use model::{
     PartBlend,
 };
 pub use playable::{load_playable, playable_field_models, resolve_appearance, Character, PlayableModel, DEFAULT_APPEARANCE};
+// STUB-SW-PC (temporary, not to be committed): the helper's real re-exports replace this line.
+pub use playable::{body_or_default, resolve_body, resolve_model, PlaceholderBody, DEFAULT_BODY, PLACEHOLDER_BODIES};
 pub use tex::RgbaImage;
 
 /// Status string a surface that presents FF7 data from this crate can show. The decoders have
