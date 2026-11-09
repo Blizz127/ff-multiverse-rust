@@ -1386,7 +1386,8 @@ engine's handle can stop (its one-shots cannot be stopped one by one), freed whe
 named by Echo-S's dialog numbers), so it plays only for a character that talks from Echo-S's section.
 
 **Music.** Echo-S has a track for 91 of the 98 names in `music.idx` (the other seven play the original); the three names its `config.toml` shuffles (`bat`,
-`bee`, `gun`) pick a variant at random each time.
+`bee`, `gun`) pick a variant at random each time. All 91 decode (about 3.7 hours of audio in all); 81 carry the `LOOPSTART`/`LOOPLENGTH` tags the engine
+reads and loop between them, the other 10 repeat whole.
 
 **Sound.** The game's sound id (`audio.fmt`'s id space, `1..=750`) is looked up in Cosmo's `config.toml` the way FFNx does
 ([`src/audio.cpp`](https://github.com/julianxhokaxhiu/FFNx/blob/4fc392ba5e1bfdd53d39aa6542464379a446083a/src/audio.cpp) `playSFX`): the section named
