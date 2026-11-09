@@ -112,6 +112,13 @@ HEADLESS OUTPUT:
   windows=<n>` when it is over, `talk: npc=<enc> story=<moment|-> nothing to say` for a character without a
   talk script, and `talk: npc=<enc> was never in the area` at the end for one the area never announced. The
   text is the game's own, never renamed for the player.
+  A bot presses OK (a ladder that waits for the button, a lift's panel, a character whose talk moves the
+  story) when it stands where the press does something: `headless: interact area=<AreaId> npc=<id|->` for
+  each press it sends (`npc` is the character addressed, the id of the area's list that `headless: npc` printed,
+  `-` for a press where it stands), and `headless: OK presses sent: <n>` at the end. In an area with ladders
+  and jumps (links) a bot that travels or advances its story plans its way over them: `headless: route:
+  <what>` says the routes it made (`plan: <n> link(s) <index>...`) and the links that fired (`link <n> fired:
+  now at (<x>, <y>)`).
   A server that goes silent for 10 s is treated as gone (exit code 1, the summary is still printed).
   Party events and refusals are logged on stderr, one `party:` line each.
   --party-invite-first-peer invites the visible player with the lowest entity id (a refused invite
@@ -410,7 +417,9 @@ pub struct Args {
     /// (`--travel md1_1,md1stin`: there and back). A bot with --party-invite-first-peer or
     /// --party-accept holds still until its party has two members (at most 12 s); in every area
     /// but the last it also waits to see another player (at most 8 s) and a moment longer, so they
-    /// see it too, before it moves on. Bots without --travel never cross an exit by accident.
+    /// see it too, before it moves on. Bots without --travel never cross an exit by accident. In an area of
+    /// ladders and jumps (FF7's first reactor) the bot takes the ones it needs (it presses OK at the foot of a
+    /// ladder that waits for the button) and keeps off the jumps it does not.
     #[arg(long, value_name = "AREA[,AREA...]", value_delimiter = ',', value_parser = parse_area_key, requires = "headless")]
     pub travel: Vec<String>,
 
@@ -427,7 +436,11 @@ pub struct Args {
     /// stands in that would advance THIS account's story (the same points and rule the server uses; in
     /// FF7's first field `md1stin` it is walkmesh triangle 12, in `nmkin_1` a line to walk across), stay
     /// there until the server has moved the story, then stand still (or, with --travel, go on to the next
-    /// exit). The server decides: the bot only goes where the data says the story happens. With
+    /// exit). The server decides: the bot only goes where the data says the story happens. A point may ask for
+    /// more than walking: OK pressed in a region (a lift's panel), OK pressed next to a character whose talk moves
+    /// the story (the bot walks up to it and addresses it), or a battle the party fights first (the bot goes there
+    /// last, and a bot that leads a party waits for the others to be in view, at most 20 s). In an area of ladders
+    /// and jumps it walks over them to get there. With
     /// --party-invite-first-peer it first waits (at most 15 s) until its invite is out.
     /// Never crosses an exit. Run the server with --no-random-encounters (or give the bot --battle-auto):
     /// a bot caught in a battle without it stands frozen until the run ends.

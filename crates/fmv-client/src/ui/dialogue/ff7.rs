@@ -17,11 +17,19 @@ use super::Conversations;
 use crate::state::NpcView;
 use fmv_ff7::script::dialogue::{characters, find_character, Character, MessageSource, StartOfGame, StoryVars, TalkSession};
 use fmv_ff7::script::FieldScript;
+use fmv_ff7::story::StoryState;
 use fmv_ff7::Ff7Adapter;
 use std::sync::Arc;
 
 /// A source of the story hook: called once for every conversation.
 pub type StoryFactory = Box<dyn Fn() -> Box<dyn StoryVars>>;
+
+/// The story hook for a conversation: the player's own story state as it is when this is called (a copy: what a
+/// conversation reads is fixed when it starts), or a new game's when the progression is not FF7's.
+pub fn story_of(state: Option<StoryState>) -> StoryFactory {
+    let state = state.unwrap_or_else(StoryState::new_game);
+    Box::new(move || Box::new(state.clone()))
+}
 
 /// The field script of one area, kept while the player is in it.
 struct Loaded {

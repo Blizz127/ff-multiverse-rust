@@ -247,6 +247,16 @@ impl Session {
         }
     }
 
+    /// The player pressed OK: tell the server (`ClientMsg::Interact`), with the character addressed (`NpcView::id`) if
+    /// there is one. The server works out what the press does from where it holds the player, so the intent that told it
+    /// where we stand must have gone out first: the network thread sends commands in the order they were given, and
+    /// a bot that needs the press to be judged where it stands waits until nothing is unsent
+    /// ([`crate::state::OwnPlayer::has_unsent`]). Whatever the press does comes back as a `StoryUpdate` or a `MoveRejected`
+    /// (a ladder), which the mirrors apply as always.
+    pub fn send_interact(&self, npc: Option<u32>) {
+        self.net.send(NetCommand::Interact { npc });
+    }
+
     /// Send a party request (the server decides and answers with `PartyEvent` / `PartyRejected`).
     pub fn send_party(&self, cmd: PartyCommand) {
         self.net.send(NetCommand::Party(cmd));
@@ -457,6 +467,72 @@ mod tests {
             }
         }
         answers
+    }
+
+    /// The server side of ONE connection that only listens: the handshake into the hall, then every `MoveIntent` and
+    /// `Interact` the client sends, in the order they arrive, until it says `Leave`.
+    async fn record(listener: tokio::net::TcpListener) -> Vec<ClientMsg> {
+        let (stream, _) = listener.accept().await.expect("a client");
+        let (mut rd, mut wr) = stream.into_split();
+        let hall = info_of(HALL);
+        let _hello: ClientMsg = read_msg(&mut rd).await.expect("Hello");
+        let welcome = ServerMsg::Welcome {
+            protocol_version: PROTOCOL_VERSION,
+            server_build: "fake".into(),
+            session: SessionId(1),
+            entity: EntityId(7),
+            account: AccountId(1),
+            issued_token: None,
+            character: CharacterCard::plain("Me", [1, 2, 3]),
+        };
+        write_msg(&mut wr, &welcome).await.unwrap();
+        let manifest = ServerMsg::AreaManifest {
+            area: hall.id.clone(),
+            display_name: hall.display_name.clone(),
+            fingerprint: hall.fingerprint,
+            provenance: hall.provenance.summary(),
+            fixture: true,
+        };
+        write_msg(&mut wr, &manifest).await.unwrap();
+        let _join: ClientMsg = read_msg(&mut rd).await.expect("JoinArea");
+        write_msg(&mut wr, &ServerMsg::AreaSnapshot { area: hall.id.clone(), tick: 1, entities: vec![me(Pos::new(-100.0, 0.0, 0.0))], npcs: vec![] })
+            .await
+            .unwrap();
+        let mut got = Vec::new();
+        loop {
+            match read_msg::<_, ClientMsg>(&mut rd).await {
+                Ok(msg @ (ClientMsg::MoveIntent { .. } | ClientMsg::Interact { .. })) => got.push(msg),
+                Ok(ClientMsg::Leave) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+        got
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn a_press_goes_out_after_the_intent_that_told_the_server_where_we_stand() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(record(listener));
+        let client = tokio::task::spawn_blocking(move || {
+            let mut net = NetHandle::spawn(config(addr), Box::new(RoomsAdapter::new())).expect("net thread");
+            let joined = net.wait_joined().expect("joined");
+            let mut session = Session::new(net, joined);
+            // A step the server does not know of yet: a press now would be judged where it still holds us.
+            session.state.own.set_motion(Pos::new(-90.0, 0.0, 0.0), 0.0, AnimState::Walk);
+            assert!(session.state.own.has_unsent());
+            session.flush_intent();
+            assert!(!session.state.own.has_unsent(), "the intent went out");
+            session.send_interact(Some(4));
+            session.send_interact(None);
+            session.leave(Duration::from_secs(2));
+        });
+        client.await.expect("the client thread");
+        let got = server.await.expect("the server task");
+        match &got[..] {
+            [ClientMsg::MoveIntent { seq: 1, pos, .. }, ClientMsg::Interact { npc: Some(4) }, ClientMsg::Interact { npc: None }] => assert_eq!((pos.x, pos.y), (-90.0, 0.0)),
+            other => panic!("the intent first, then the two presses, in that order: {other:?}"),
+        }
     }
 
     /// Pump `session` until `done` says so (or ten seconds pass).
