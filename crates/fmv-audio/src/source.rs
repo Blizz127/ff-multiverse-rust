@@ -55,6 +55,9 @@ pub struct SfxClip {
     rate: u32,
     /// Interleaved stereo.
     samples: Arc<[f32]>,
+    /// The part that repeats when the clip is played as a loop ([`crate::AudioEngine::play_sfx_loop`]), in frames of
+    /// the clip: `start < end <= frames`. A one-shot ([`crate::AudioEngine::play_sfx`]) ignores it.
+    loop_region: Option<(usize, usize)>,
 }
 
 impl SfxClip {
@@ -64,7 +67,29 @@ impl SfxClip {
         if rate == 0 || !interleaved.len().is_multiple_of(2) {
             return None;
         }
-        Some(Self { rate, samples: interleaved.into() })
+        Some(Self { rate, samples: interleaved.into(), loop_region: None })
+    }
+
+    /// The same clip with the part `[start, end)` (in frames of the clip) as the one a loop repeats after playing the
+    /// intro before `start`. A region that is empty, backwards or past the end of the clip is no region (a loop then
+    /// repeats the whole clip).
+    pub fn with_loop(mut self, start: u64, end: u64) -> Self {
+        let frames = self.frames();
+        self.loop_region = match (usize::try_from(start), usize::try_from(end)) {
+            (Ok(start), Ok(end)) if start < end && end <= frames => Some((start, end)),
+            _ => None,
+        };
+        self
+    }
+
+    /// The loop region `[start, end)` in frames, if the clip has one.
+    pub fn loop_region(&self) -> Option<(u64, u64)> {
+        self.loop_region.map(|(start, end)| (start as u64, end as u64))
+    }
+
+    /// The loop region as the mixer indexes it.
+    pub(crate) fn loop_frames(&self) -> Option<(usize, usize)> {
+        self.loop_region
     }
 
     /// A clip from mono samples at `rate` Hz, played equally on both sides (`None` for a zero rate).
@@ -166,6 +191,20 @@ mod tests {
         assert_eq!(clip.samples(), &[0.25, 0.25, -0.5, -0.5]);
         assert_eq!(clip.rate(), 22_050);
         assert_eq!(SfxClip::from_stereo(100, vec![0.0; 200]).map(|c| c.duration()), Some(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn a_loop_region_is_kept_when_it_lies_inside_the_clip_and_dropped_when_it_does_not() {
+        let clip = || SfxClip::from_mono(1_000, &[0.0; 10]).expect("a clip");
+        assert_eq!(clip().loop_region(), None, "a clip has no region until it is given one");
+        assert_eq!(clip().with_loop(2, 10).loop_region(), Some((2, 10)));
+        assert_eq!(clip().with_loop(0, 1).loop_region(), Some((0, 1)));
+        for (start, end) in [(5, 5), (6, 5), (0, 11), (11, 20), (u64::MAX, u64::MAX)] {
+            assert_eq!(clip().with_loop(start, end).loop_region(), None, "{start}..{end}");
+        }
+        // a later, valid call replaces an earlier region, and an invalid one removes it
+        assert_eq!(clip().with_loop(2, 4).with_loop(3, 9).loop_region(), Some((3, 9)));
+        assert_eq!(clip().with_loop(2, 4).with_loop(9, 3).loop_region(), None);
     }
 
     #[test]

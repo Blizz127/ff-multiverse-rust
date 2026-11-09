@@ -26,6 +26,9 @@ use std::time::Duration;
 pub(crate) const BLOCK_FRAMES: usize = 128;
 /// Sound effects that can play at once; a new one cuts the oldest short.
 pub(crate) const MAX_SFX_VOICES: usize = 16;
+/// Looping sound effects that can play at once (apart from the one-shots, which cannot cut them); a ninth cuts the oldest
+/// loop short.
+pub(crate) const MAX_LOOP_VOICES: usize = 8;
 /// Tracks that can be fading out at once; a third cuts the oldest short.
 pub(crate) const MAX_FADING_MUSIC: usize = 2;
 /// Source frames a music voice reads at a time.
@@ -38,6 +41,11 @@ pub(crate) enum Command {
     PlayMusic { voice: Box<MusicVoice>, fade: Duration },
     StopMusic { fade: Duration },
     PlaySfx(SfxVoice),
+    /// A looping voice (built with [`SfxVoice::looping`]), fading in over `fade_in`.
+    PlayLoop { voice: SfxVoice, fade_in: Duration },
+    /// Stop the loop `id`, fading out over `fade` (zero: cut). An id that is not playing is ignored.
+    StopLoop { id: u64, fade: Duration },
+    /// Stop every sound effect, one-shots and loops alike.
     StopSfx,
 }
 
@@ -304,13 +312,60 @@ impl MusicVoice {
 // Sound effects
 // ---------------------------------------------------------------------------------------------
 
-/// One sound effect being played, from memory.
+/// What a looping voice's level is doing: nothing, rising from silence, or falling to it.
+#[derive(Clone, Copy, Debug)]
+enum LoopEnv {
+    Steady,
+    In { done: u64, total: u64 },
+    Out { from: f32, done: u64, total: u64 },
+}
+
+/// The part of a [`SfxVoice`] that makes it a loop: where it repeats, the handle it is stopped by, and its envelope.
+struct LoopState {
+    /// The region `[start, end)` that repeats, in clip frames; the frames before `start` are the intro.
+    start: usize,
+    end: usize,
+    id: u64,
+    env: LoopEnv,
+    /// The envelope's level at the end of the last block (what a fade out starts from).
+    level: f32,
+}
+
+impl LoopState {
+    /// Step the envelope over `n` frames: the level at the start of the block, at its end, and whether a fade out is over.
+    fn advance(&mut self, n: usize) -> (f32, f32, bool) {
+        let g0 = self.level;
+        let n = n as u64;
+        let (env, g1, over) = match self.env {
+            LoopEnv::Steady => (LoopEnv::Steady, 1.0, false),
+            LoopEnv::In { done, total } => {
+                let done = (done + n).min(total);
+                if done >= total {
+                    (LoopEnv::Steady, 1.0, false)
+                } else {
+                    (LoopEnv::In { done, total }, rise(done as f32 / total as f32), false)
+                }
+            }
+            LoopEnv::Out { from, done, total } => {
+                let done = (done + n).min(total);
+                (LoopEnv::Out { from, done, total }, from * fall(done as f32 / total as f32), done >= total)
+            }
+        };
+        self.env = env;
+        self.level = g1;
+        (g0, g1, over)
+    }
+}
+
+/// One sound effect being played, from memory: a one-shot that ends with its clip, or a loop that goes on until it is stopped.
 pub(crate) struct SfxVoice {
     clip: SfxClip,
     /// Position in the clip, in clip frames.
     pos: f64,
     gain_left: f32,
     gain_right: f32,
+    /// `Some` for a loop.
+    looped: Option<LoopState>,
 }
 
 impl SfxVoice {
@@ -319,7 +374,68 @@ impl SfxVoice {
     pub(crate) fn new(clip: SfxClip, gain: f32, pan: f32) -> Self {
         let gain = if gain.is_nan() { 1.0 } else { gain.clamp(0.0, 1.0) };
         let pan = if pan.is_nan() { 0.0 } else { pan.clamp(-1.0, 1.0) };
-        Self { clip, pos: 0.0, gain_left: gain * (1.0 - pan).min(1.0), gain_right: gain * (1.0 + pan).min(1.0) }
+        Self { clip, pos: 0.0, gain_left: gain * (1.0 - pan).min(1.0), gain_right: gain * (1.0 + pan).min(1.0), looped: None }
+    }
+
+    /// A voice that plays the clip's intro and then repeats its loop region (the whole clip when it has none) until it
+    /// is stopped, known by `id`.
+    pub(crate) fn looping(clip: SfxClip, gain: f32, pan: f32, id: u64) -> Self {
+        let frames = clip.frames();
+        let (start, end) = clip.loop_frames().unwrap_or((0, frames));
+        let mut voice = Self::new(clip, gain, pan);
+        voice.looped = Some(LoopState { start, end, id, env: LoopEnv::Steady, level: 1.0 });
+        voice
+    }
+
+    /// The handle a loop is stopped by (`None` for a one-shot).
+    fn loop_id(&self) -> Option<u64> {
+        self.looped.as_ref().map(|l| l.id)
+    }
+
+    fn fade_in(&mut self, total: u64) {
+        if let Some(l) = self.looped.as_mut().filter(|_| total > 0) {
+            l.env = LoopEnv::In { done: 0, total };
+            l.level = 0.0;
+        }
+    }
+
+    /// Start the loop's fade out (a loop already fading is left alone: stopping it twice does nothing more).
+    fn fade_out(&mut self, total: u64) {
+        if let Some(l) = self.looped.as_mut().filter(|l| !matches!(l.env, LoopEnv::Out { .. })) {
+            l.env = LoopEnv::Out { from: l.level, done: 0, total: total.max(1) };
+        }
+    }
+
+    /// Add `n` frames of a looping voice into `acc`, wrapping from the loop's end back to its start without a gap (the
+    /// interpolation between the last frame of the loop and the first one wraps too, so the seam has no step); `true`
+    /// once a fade out is over (a one-shot voice never gets here).
+    fn render_loop_block(&mut self, out_rate: u32, n: usize, acc: &mut [f32]) -> bool {
+        let Some(state) = self.looped.as_mut() else { return true };
+        let (g0, g1, faded_out) = state.advance(n);
+        let (start, end) = (state.start, state.end);
+        let step = f64::from(self.clip.rate()) / f64::from(out_rate.max(1));
+        let samples = self.clip.samples();
+        let frames = samples.len() / 2;
+        let length = (end - start).max(1) as f64;
+        let ramp = (g1 - g0) / n.max(1) as f32;
+        for i in 0..n {
+            if self.pos >= end as f64 {
+                self.pos = start as f64 + (self.pos - start as f64) % length;
+            }
+            let at = self.pos as usize;
+            if at >= frames {
+                return true;
+            }
+            let frac = (self.pos - at as f64) as f32;
+            let next = if at + 1 >= end { start } else { at + 1 };
+            let (l0, r0) = (samples[at * 2], samples[at * 2 + 1]);
+            let (l1, r1) = (samples[next * 2], samples[next * 2 + 1]);
+            let level = g0 + ramp * (i + 1) as f32;
+            acc[i * 2] += (l0 + (l1 - l0) * frac) * self.gain_left * level;
+            acc[i * 2 + 1] += (r0 + (r1 - r0) * frac) * self.gain_right * level;
+            self.pos += step;
+        }
+        faded_out
     }
 
     /// Add `n` frames into `acc`; `true` once the clip is over.
@@ -373,6 +489,8 @@ pub(crate) struct Mixer {
     music: Option<Box<MusicVoice>>,
     fading: Vec<MusicVoice>,
     sfx: Vec<SfxVoice>,
+    /// The looping effects, apart from the one-shots so that a burst of those cannot cut an ambience.
+    loops: Vec<SfxVoice>,
     master: Ramp,
     music_gain: Ramp,
     sfx_gain: Ramp,
@@ -385,6 +503,7 @@ impl Mixer {
         shared.set_rate(rate);
         shared.set_music(None);
         shared.set_sfx(0);
+        shared.set_loops(0);
         let v = shared.volumes();
         let master = if shared.muted() { 0.0 } else { v.master };
         Self {
@@ -392,6 +511,7 @@ impl Mixer {
             music: None,
             fading: Vec::with_capacity(MAX_FADING_MUSIC),
             sfx: Vec::with_capacity(MAX_SFX_VOICES),
+            loops: Vec::with_capacity(MAX_LOOP_VOICES),
             master: Ramp::at(master),
             music_gain: Ramp::at(v.music),
             sfx_gain: Ramp::at(v.sfx),
@@ -450,9 +570,30 @@ impl Mixer {
                 self.sfx.push(voice);
                 self.shared.set_sfx(self.sfx.len());
             }
+            Command::PlayLoop { mut voice, fade_in } => {
+                voice.fade_in(self.fade_frames(fade_in));
+                if self.loops.len() >= MAX_LOOP_VOICES {
+                    self.loops.remove(0);
+                }
+                self.loops.push(voice);
+                self.shared.set_loops(self.loops.len());
+            }
+            Command::StopLoop { id, fade } => {
+                let frames = self.fade_frames(fade);
+                if frames == 0 {
+                    self.loops.retain(|voice| voice.loop_id() != Some(id));
+                } else {
+                    for voice in self.loops.iter_mut().filter(|voice| voice.loop_id() == Some(id)) {
+                        voice.fade_out(frames);
+                    }
+                }
+                self.shared.set_loops(self.loops.len());
+            }
             Command::StopSfx => {
                 self.sfx.clear();
+                self.loops.clear();
                 self.shared.set_sfx(0);
+                self.shared.set_loops(0);
             }
         }
     }
@@ -504,6 +645,11 @@ impl Mixer {
         if self.sfx.len() != before {
             self.shared.set_sfx(self.sfx.len());
         }
+        let before = self.loops.len();
+        self.loops.retain_mut(|voice| !voice.render_loop_block(rate, n, sfx_acc));
+        if self.loops.len() != before {
+            self.shared.set_loops(self.loops.len());
+        }
 
         let max_step = n as f32 / (GAIN_RAMP_SECONDS * rate as f32);
         let (m0, m1) = self.music_gain.advance(max_step);
@@ -530,6 +676,11 @@ impl Mixer {
     #[cfg(test)]
     pub(crate) fn sfx_count(&self) -> usize {
         self.sfx.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn loop_count(&self) -> usize {
+        self.loops.len()
     }
 }
 
@@ -983,5 +1134,139 @@ mod tests {
         assert_eq!(shared.snapshot().sfx_playing as usize, MAX_SFX_VOICES);
         m.apply(Command::StopSfx);
         assert_eq!(shared.snapshot().sfx_playing, 0);
+    }
+
+    // ---------- looping effects ----------
+
+    /// A mono clip of `n` frames whose frame `i` is `(i + 1) / 100`: what is rendered says which frame it came from.
+    fn counting(n: usize, rate: u32) -> SfxClip {
+        SfxClip::from_mono(rate, &(0..n).map(|i| (i + 1) as f32 / 100.0).collect::<Vec<_>>()).expect("clip")
+    }
+
+    /// The frames (as `value * 100`, rounded) a mono counting clip is heard as.
+    fn heard(out: &[f32]) -> Vec<i32> {
+        left(out).iter().map(|v| (v * 100.0).round() as i32).collect()
+    }
+
+    fn start_loop(m: &mut Mixer, clip: SfxClip, id: u64, fade_in: Duration) {
+        m.apply(Command::PlayLoop { voice: SfxVoice::looping(clip, 1.0, 0.0, id), fade_in });
+    }
+
+    #[test]
+    fn a_loop_plays_its_intro_once_and_then_its_region_over_and_over() {
+        let (mut m, shared) = mixer();
+        start_loop(&mut m, counting(10, RATE).with_loop(4, 8), 1, Duration::ZERO);
+        let status = shared.snapshot();
+        assert_eq!((status.loops_playing, status.sfx_playing), (1, 0), "a loop is not a one-shot");
+        // frames 0 to 3 are the intro (1 to 4), then 4 to 7 (5 to 8) again and again; frames 8 and 9 never play
+        assert_eq!(heard(&render(&mut m, 20)), [1, 2, 3, 4, 5, 6, 7, 8, 5, 6, 7, 8, 5, 6, 7, 8, 5, 6, 7, 8]);
+        assert_eq!(shared.snapshot().loops_playing, 1, "and it goes on");
+        // a clip with no region repeats whole
+        let (mut m, _) = mixer();
+        start_loop(&mut m, counting(4, RATE), 1, Duration::ZERO);
+        assert_eq!(heard(&render(&mut m, 10)), [1, 2, 3, 4, 1, 2, 3, 4, 1, 2]);
+    }
+
+    #[test]
+    fn the_seam_of_a_loop_has_no_step_even_when_the_clip_is_played_at_another_rate() {
+        // a clip at half the mixer's rate: each output frame is half a clip frame, interpolated; the half frame
+        // after the last frame of the loop is interpolated towards the FIRST frame of the loop, not towards silence
+        let (mut m, _) = mixer();
+        start_loop(&mut m, counting(4, RATE / 2), 1, Duration::ZERO);
+        let out = left(&render(&mut m, 10));
+        let expect = [0.01, 0.015, 0.02, 0.025, 0.03, 0.035, 0.04, 0.025, 0.01, 0.015];
+        assert!(out.iter().zip(expect).all(|(a, b)| approx(*a, b)), "{out:?}");
+    }
+
+    #[test]
+    fn a_loop_fades_in_and_stops_one_handle_while_the_others_and_the_one_shots_play_on() {
+        let (mut m, shared) = mixer();
+        let steady = |value: f32, frames: usize| SfxClip::from_mono(RATE, &vec![value; frames]).expect("clip");
+        start_loop(&mut m, steady(0.1, 50), 1, Duration::ZERO);
+        start_loop(&mut m, steady(0.2, 50), 2, Duration::from_millis(100));
+        m.apply(Command::PlaySfx(SfxVoice::new(steady(0.4, 1_000), 1.0, 0.0)));
+        // the second loop rises over 100 frames; the first is at full level at once
+        let first = left(&render(&mut m, 10));
+        assert!(first[0] > 0.1 + 0.4 - 1e-4 && first[0] < 0.1 + 0.4 + 0.05, "the first frame: the first loop and the one-shot, the second one still near silence: {}", first[0]);
+        assert!(first.windows(2).all(|w| w[1] >= w[0] - 1e-6), "and it rises");
+        let after = left(&render(&mut m, 200));
+        assert!(approx(after[150], 0.1 + 0.2 + 0.4), "all three at full level: {}", after[150]);
+        // stop the first: the second and the one-shot are untouched
+        m.apply(Command::StopLoop { id: 1, fade: Duration::ZERO });
+        assert_eq!(shared.snapshot().loops_playing, 1);
+        let out = left(&render(&mut m, 20));
+        assert!(out.iter().all(|&v| approx(v, 0.2 + 0.4)), "{out:?}");
+        // stop the second: only the one-shot is left
+        m.apply(Command::StopLoop { id: 2, fade: Duration::ZERO });
+        assert_eq!((shared.snapshot().loops_playing, shared.snapshot().sfx_playing), (0, 1));
+        assert!(left(&render(&mut m, 20)).iter().all(|&v| approx(v, 0.4)));
+    }
+
+    #[test]
+    fn a_loop_that_is_stopped_with_a_fade_falls_to_silence_and_goes_and_a_second_or_stale_stop_does_nothing() {
+        let (mut m, shared) = mixer();
+        let steady = SfxClip::from_mono(RATE, &[0.5; 40]).expect("clip");
+        start_loop(&mut m, steady, 7, Duration::ZERO);
+        render(&mut m, 10);
+        m.apply(Command::StopLoop { id: 7, fade: Duration::from_millis(100) });
+        let first = left(&render(&mut m, 50));
+        assert!(first.windows(2).all(|w| w[1] <= w[0] + 1e-6) && first[49] < first[0] && first[0] < 0.5, "it falls: {first:?}");
+        // a second stop of the same loop, half way through its fade, does not start the fade again
+        let half = first[49];
+        m.apply(Command::StopLoop { id: 7, fade: Duration::from_millis(100) });
+        let second = left(&render(&mut m, 40));
+        assert!(second[0] <= half + 1e-4, "the fade went on from where it was: {} after {half}", second[0]);
+        assert_eq!(shared.snapshot().loops_playing, 1, "still fading out: it counts until it is over");
+        let rest = left(&render(&mut m, 40));
+        assert_eq!(shared.snapshot().loops_playing, 0, "and it is gone after its hundred frames");
+        // (the last block of a fade is ramped to its end as a whole, like the music's: it ends at silence)
+        assert!(rest[0] < half && rest[rest.len() - 1].abs() < 1e-6, "{rest:?}");
+        assert!(render(&mut m, 10).iter().all(|&v| v == 0.0), "and nothing is left after it");
+        // stale handles and ones never given are ignored
+        m.apply(Command::StopLoop { id: 7, fade: Duration::from_millis(100) });
+        m.apply(Command::StopLoop { id: 99, fade: Duration::ZERO });
+        assert_eq!(m.loop_count(), 0);
+        assert!(render(&mut m, 10).iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn loops_are_few_and_one_shots_cannot_cut_them_and_stop_sfx_stops_them_all() {
+        let (mut m, shared) = mixer();
+        let steady = SfxClip::from_mono(RATE, &[0.01; 100]).expect("clip");
+        for id in 0..MAX_LOOP_VOICES as u64 + 3 {
+            start_loop(&mut m, steady.clone(), id, Duration::ZERO);
+        }
+        assert_eq!((m.loop_count(), shared.snapshot().loops_playing as usize), (MAX_LOOP_VOICES, MAX_LOOP_VOICES), "a ninth loop cuts the oldest");
+        // the oldest three were cut: stopping them is a no-op, the newest is still there
+        for id in 0..3 {
+            m.apply(Command::StopLoop { id, fade: Duration::ZERO });
+        }
+        assert_eq!(m.loop_count(), MAX_LOOP_VOICES);
+        // a burst of one-shots, more than the one-shot list holds, does not touch the loops
+        let long = SfxClip::from_mono(RATE, &[0.01; 10_000]).expect("clip");
+        for _ in 0..MAX_SFX_VOICES + 5 {
+            m.apply(Command::PlaySfx(SfxVoice::new(long.clone(), 1.0, 0.0)));
+        }
+        assert_eq!((m.sfx_count(), m.loop_count()), (MAX_SFX_VOICES, MAX_LOOP_VOICES));
+        // stop_sfx stops everything, loops included
+        m.apply(Command::StopSfx);
+        let status = shared.snapshot();
+        assert_eq!((m.sfx_count(), m.loop_count(), status.sfx_playing, status.loops_playing), (0, 0, 0, 0));
+        assert!(render(&mut m, 10).iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn a_loop_obeys_the_master_volume_the_effect_volume_and_the_mute_like_any_effect() {
+        let (mut m, shared) = mixer_with(Volumes { master: 1.0, music: 1.0, sfx: 0.5 });
+        let steady = SfxClip::from_mono(RATE, &[0.8; 50]).expect("clip");
+        start_loop(&mut m, steady, 1, Duration::ZERO);
+        assert!(left(&render(&mut m, 100)).iter().all(|&v| approx(v, 0.4)), "half the effect volume");
+        shared.set_muted(true);
+        render(&mut m, 100);
+        assert!(left(&render(&mut m, 50)).iter().all(|&v| v.abs() < 1e-6), "muted: the loop goes on, silently");
+        assert_eq!(shared.snapshot().loops_playing, 1);
+        shared.set_muted(false);
+        render(&mut m, 100);
+        assert!(left(&render(&mut m, 50)).iter().all(|&v| approx(v, 0.4)), "and is heard again where it is");
     }
 }
