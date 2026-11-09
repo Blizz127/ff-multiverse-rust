@@ -1153,7 +1153,7 @@ deleted on the server with its own token (its records in the trash byte for byte
 `index.log`); its name registers again as a different account; its old token is refused, also after a server restart;
 and `fmv-characters restore` gives another deleted character back with a new token that logs in.
 
-**Wire (added after v14; the integrator bumps the version).** `ClientMsg::DeleteCharacter { protocol_version, client_build,
+**Wire (protocol v16).** `ClientMsg::DeleteCharacter { protocol_version, client_build,
 token }` is the first message of its own connection instead of `Hello`; the server answers `ServerMsg::CharacterDeleted
 { name }` and closes, or `Reject`: `InvalidToken` (the server does not know the login: nothing to delete, the client forgets it
 locally, which also settles a delete whose answer was lost), `AlreadyOnline` (the character is in the world, from any computer:
@@ -1252,6 +1252,12 @@ stored (a countdown is a clock of the server process), and the story record keep
 is carried so that the finale's guard can be judged but this server never writes it, so a record is readable by a v14
 server, which just has no finale, no countdown and no `Countdown` message. **Rolling back:** point the server and the
 clients back at a v14 build together.
+
+**Protocol v16 (deleting a character)** adds `ClientMsg::DeleteCharacter` (asked with the character's own login token,
+as the first message instead of a Hello) and `ServerMsg::CharacterDeleted`: the server moves that account's records into
+its trash and frees the name (see "Deleting a character"). A v15 peer cannot decode either, so it is refused at the
+handshake. **Rolling back v16:** point the server and the clients back at a v15 build together; a deleted character
+stays deleted (its records are in the trash, and `fmv-characters restore` gives it back with a new login).
 
 ## Importing your own FF7 data
 
