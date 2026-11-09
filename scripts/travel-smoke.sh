@@ -316,13 +316,22 @@ run_chain() {
       problem "client $n reported a BATTLE DIVERGENCE"
     fi
     # The fields that have characters of their own announced them (the snapshot of an area carries them).
-    for key in md1stin md1_1 md1_2 nrthmk; do
+    # The client logs its NPC list only when the list CHANGES, and nrthmk lists the same names as md1_2,
+    # so it can print nothing there: nrthmk is checked on the server's side below instead.
+    for key in md1stin md1_1 md1_2 nmkin_1 elevtr1; do
       log_has "$log" "NPC(s) in Ff7/$key" || problem "client $n was never told of any NPC in Ff7/$key"
     done
   done
 
+  local loaded
   for key in "${CHAIN_ROUTE[@]}"; do
-    log_has "$WORK/server.log" "area loaded area=Ff7/$key " || problem "the server never loaded $key"
+    if loaded=$(last_line_with "$WORK/server.log" "area loaded area=Ff7/$key "); then
+      # every field of the route has characters of its own: the server loaded its NPCs with it
+      value=$(field "$loaded" npcs)
+      [[ $value =~ ^[1-9][0-9]*$ ]] || problem "the server loaded $key without NPCs (npcs=${value:-?}): $loaded"
+    else
+      problem "the server never loaded $key"
+    fi
   done
   value=$(count_lines_with "$WORK/server.log" "player leaves through an exit")
   [[ $value == $((2 * ${#CHAIN_ROUTE[@]})) ]] ||
