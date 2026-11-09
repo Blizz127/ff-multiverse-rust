@@ -614,7 +614,10 @@ pub trait AreaRuntime: Send + Sync {
     /// progression of the account that governs the crossing player's instance (the party leader's, for a party
     /// member), and takes the first exit that answers [`ExitState::Open`]; a player that crosses a line whose exits
     /// are all closed walks over it as over any line. The default is open (a gateway is data), so only an adapter
-    /// that reports [`ExitKind::Script`] exits needs to answer.
+    /// that reports [`ExitKind::Script`] exits needs to answer. An adapter may close a script exit whatever the story
+    /// says when it leads to an area it does not offer in full (FF7: a field nobody has reviewed), so that the story
+    /// moving on never sends a player where nothing of it is served. (A member of a party that crosses the line its
+    /// leader left the area by is taken through the leader's exit instead of the story's: the server's `follow` module.)
     fn exit_state(&self, exit: &Exit, progress: &[u8]) -> ExitState {
         let _ = (exit, progress);
         ExitState::Open

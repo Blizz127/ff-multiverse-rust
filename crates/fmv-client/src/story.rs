@@ -146,8 +146,10 @@ const STUCK_LIMIT: u32 = 500;
 /// Steps to wait before planning again after a plan failed.
 const PLAN_COOLDOWN_STEPS: u32 = 100;
 /// A bot that leads a party holds still before a point that starts a battle until the rest of the party is in view, but
-/// at most this long (seconds).
-pub const BATTLE_PARTY_WAIT_S: f32 = 20.0;
+/// at most this long (seconds). A member that follows (`--travel-follow`) trails its leader by the wait it makes in
+/// every field (it crosses only after the leader has left), which a loaded machine stretches: 20 s was not enough for the
+/// Guard Scorpion of `travel-smoke.sh --chain` when the box was busy (the member came after the fight and missed it).
+pub const BATTLE_PARTY_WAIT_S: f32 = 45.0;
 /// A press is made ONCE: a bot that has pressed OK waits for the server's step (the `StoryUpdate` that changes the
 /// progress it was pressed on) and presses nothing else before it comes. A press that brings no step in this long
 /// (seconds) is a failure the bot reports and stops on, not one it repeats: a second press on a story the server

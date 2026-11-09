@@ -57,6 +57,13 @@
 //! closed is walked over like any line. An exit whose conditions the area cannot judge (a variable the story does not
 //! carry, a key the player would have to press) stays closed, and the server says so ONCE PER AREA
 //! (`exit closed: its conditions cannot be judged ...`), with what the first such exit reads.
+//!
+//! **A member follows its leader's way out.** The story that judges a member is its leader's, and it moves while the
+//! members are still on their way (the leader's finale moves FF7's story past the point where the lift of the first
+//! reactor leads back into it). So when a party's leader leaves an area through an exit its story decided, the world
+//! remembers which one, and a member of that party that later crosses the same line in the same area takes THAT exit,
+//! once, whatever the story now says (the `follow` module; logged as `player follows its leader's way out` when the
+//! story would have sent it elsewhere).
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -394,6 +401,8 @@ impl World {
     pub(super) fn announce_entry(&mut self, entity: EntityId, failed: &mut Vec<(EntityId, bool)>) {
         // Placed here, wherever it came from: every link within reach of the player starts disarmed.
         self.place_links(entity);
+        // A leader that is back in an area is with its party again: the way it left by is over (`follow` module).
+        self.forget_ways_into(entity);
         self.settle(entity, true, failed);
         // What the area's own scripts do by themselves from the first frame on moves the story of whoever stands
         // there (the points that fire on entry; a no-op in an area without any).
@@ -404,10 +413,29 @@ impl World {
     /// the story that governs it, if any (module docs, "Exits a script decides"). Gateways are always open; a script
     /// exit is asked of the area with the progression of the account that governs the player's instance. An exit
     /// the area cannot judge stays closed and is reported once per area.
+    ///
+    /// A member of a party that crosses the line its leader left the area by takes the exit the leader took, once,
+    /// whatever the story now says (module docs, "A member follows its leader's way out"; the `follow` module).
     pub(super) fn open_exit(&mut self, entity: EntityId, crossed: Vec<Exit>) -> Option<Exit> {
         if crossed.is_empty() {
             return None;
         }
+        let by_story = self.open_exit_by_story(entity, &crossed);
+        let area_key = self.players.get(&entity)?.area.clone();
+        let Some(way) = self.followed_exit(entity, &area_key, &crossed) else { return by_story };
+        if by_story.as_ref() != Some(&way) {
+            self.logs.info(format!(
+                "player follows its leader's way out (the story it is judged on now would send it elsewhere) entity={} area={area_key} follows={} story_says={}",
+                entity.0,
+                clip_text(&way.target),
+                by_story.as_ref().map_or_else(|| "nowhere".to_string(), |e| clip_text(&e.target))
+            ));
+        }
+        Some(way)
+    }
+
+    /// The first of `crossed` that is open for the story that governs `entity` (see [`World::open_exit`]).
+    fn open_exit_by_story(&mut self, entity: EntityId, crossed: &[Exit]) -> Option<Exit> {
         let progress = self.instance_progression(entity);
         let area_key = self.players.get(&entity)?.area.clone();
         let mut unjudged: Option<(String, String)> = None;
@@ -415,9 +443,9 @@ impl World {
         {
             let area = self.areas.get(&area_key)?;
             for exit in crossed {
-                match area.runtime.exit_state(&exit, &progress) {
+                match area.runtime.exit_state(exit, &progress) {
                     ExitState::Open => {
-                        open = Some(exit);
+                        open = Some(exit.clone());
                         break;
                     }
                     ExitState::Closed => {}
@@ -535,6 +563,8 @@ impl World {
         p.dirty = false;
         let account = p.account;
         self.logs.info(format!("player leaves through an exit entity={} from={old_key} to={target_key}", entity.0));
+        // The members of its party that come this way later go where it went (`follow` module).
+        self.note_way_out(entity, &old_key, exit);
 
         // Everyone left behind in its instance hears it (the player is in no instance while in
         // transit, so it is not one of them), then the player hears where it goes.
@@ -921,6 +951,186 @@ mod tests {
         // the leader is judged by itself, of course
         cross_the_gated_line(&mut w, &leader, &mut now);
         assert_eq!(offered_arrival(&leader.drain()), GATE_ADVANCED_ARRIVAL);
+    }
+
+    // ---- a member follows its leader's way out ----
+
+    /// `leader` invites `member` (both in the world) and `member` accepts.
+    fn form_party(w: &mut World, leader: &Seat, member: &Seat, now: Instant) {
+        assert_eq!(w.party_invite(leader.entity, member.entity, now), PartyOutcome::Done);
+        let invite = w.parties.invites().next().expect("an invite").id;
+        assert_eq!(w.party_accept(member.entity, invite, now), PartyOutcome::Done);
+    }
+
+    /// `s` crosses the hall's gated line and its client answers: it stands in the yard (where it is the entry point
+    /// that moves a new account's story on). Returns where the line put it.
+    fn through_the_gated_line_into_the_yard(w: &mut World, s: &mut Seat, now: &mut Instant) -> (f32, f32) {
+        cross_the_gated_line(w, s, now);
+        let msgs = s.drain();
+        let arrival = offered_arrival(&msgs);
+        assert_eq!(answer_join(w, s, &area_change(&msgs), *now), TravelReply::Done);
+        s.drain();
+        arrival
+    }
+
+    /// `s` (in the yard, where the gated line put it) walks out through the yard's gateway into the hall.
+    fn back_into_the_hall(w: &mut World, s: &mut Seat, now: &mut Instant) {
+        assert_eq!(walk_to(w, s, -350.0, -100.0, now), MoveOutcome::Applied);
+        let msgs = s.drain();
+        assert_eq!(answer_join(w, s, &area_change(&msgs), *now), TravelReply::Done);
+        assert_eq!(w.area_of(s.entity), Some((HALL.to_string(), false)));
+        s.drain();
+    }
+
+    /// THE RACE (found on the first reactor's lift, `scripts/travel-smoke.sh --escape` with a member some seconds behind):
+    /// the leader takes the exit that is open for its story and the area it comes to moves that story on (the finale), and
+    /// the member, still in the old area, comes to the same line afterwards: judged on the story the party has NOW it
+    /// would be sent through another exit of the line (the later story's, to a field nobody has reviewed). It must go
+    /// where the leader went.
+    #[test]
+    fn a_member_that_comes_to_the_line_after_its_leader_has_gone_through_takes_the_leaders_exit_though_the_story_moved_on() {
+        let t0 = Instant::now();
+        let mut w = rooms_world(RoomsAdapter::with_gates());
+        let mut leader = seat(&mut w, "Leader", t0);
+        let mut member = seat(&mut w, "Member", t0);
+        form_party(&mut w, &leader, &member, t0);
+        leader.drain();
+        member.drain();
+        w.take_logs();
+        let mut now = t0;
+
+        // the leader takes the exit that is open for a new account's story; the yard's entry moves its story on
+        assert_eq!(through_the_gated_line_into_the_yard(&mut w, &mut leader, &mut now), GATE_NEW_ARRIVAL);
+        assert_eq!(w.players.get(&leader.entity).map(|p| p.progression.clone()), Some(STORY_ADVANCED.to_vec()), "the story moved on");
+        assert_eq!(w.ways_of(leader.entity), 1, "the leader remembers the exit it took");
+        assert_eq!(w.area_of(member.entity), Some((HALL.to_string(), false)), "the member is still in the hall");
+        assert_eq!(logged(&mut w, "player follows"), 0);
+        member.drain();
+
+        // the member comes to the line only now: the story of its party says the other exit is the open one...
+        cross_the_gated_line(&mut w, &member, &mut now);
+        // ...and it goes where the leader went
+        assert_eq!(offered_arrival(&member.drain()), GATE_NEW_ARRIVAL, "the leader's way out, not the one the story now opens");
+        assert_eq!(w.transit_target(member.entity), Some(YARD.to_string()));
+        let said = w.take_logs();
+        let lines: Vec<&str> = said.iter().map(|l| l.text()).filter(|t| t.contains("player follows its leader's way out")).collect();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("area=hall") && lines[0].contains("follows=yard") && lines[0].contains("story_says=yard"), "{}", lines[0]);
+        assert!(!lines[0].contains("from=") && !lines[0].contains(" to="), "not a move: a smoke that counts the server's moves must not count it: {}", lines[0]);
+        // following is no story step: nobody's story moved, nothing was saved for the member, its own progression is its own
+        assert_eq!(w.players.get(&member.entity).map(|p| p.progression.clone()), Some(Vec::new()));
+        assert!(!said.iter().any(|l| l.text().contains("story advanced")), "following moves no story");
+    }
+
+    #[test]
+    fn every_member_follows_once_and_the_next_time_it_comes_by_it_is_judged_on_the_story_as_always() {
+        let t0 = Instant::now();
+        let mut w = rooms_world(RoomsAdapter::with_gates());
+        let mut leader = seat(&mut w, "Leader", t0);
+        let mut first = seat(&mut w, "First", t0);
+        let mut second = seat(&mut w, "Second", t0);
+        form_party(&mut w, &leader, &first, t0);
+        form_party(&mut w, &leader, &second, t0);
+        let mut now = t0;
+        assert_eq!(through_the_gated_line_into_the_yard(&mut w, &mut leader, &mut now), GATE_NEW_ARRIVAL);
+        first.drain();
+        second.drain();
+
+        // both come to the line afterwards and both go where the leader went: the way is not used up by the first
+        for s in [&mut first, &mut second] {
+            assert_eq!(through_the_gated_line_into_the_yard(&mut w, s, &mut now), GATE_NEW_ARRIVAL);
+        }
+        // `first` walks back into the hall and to the line again, the leader being in the yard still: that is no
+        // way left by the leader any more, the story of the party decides (it is the advanced one now)
+        back_into_the_hall(&mut w, &mut first, &mut now);
+        cross_the_gated_line(&mut w, &first, &mut now);
+        assert_eq!(offered_arrival(&first.drain()), GATE_ADVANCED_ARRIVAL, "judged on the story, not on a way it followed already");
+    }
+
+    #[test]
+    fn a_leader_that_comes_back_to_the_area_is_with_its_party_again_and_the_story_decides() {
+        let t0 = Instant::now();
+        let mut w = rooms_world(RoomsAdapter::with_gates());
+        let mut leader = seat(&mut w, "Leader", t0);
+        let mut member = seat(&mut w, "Member", t0);
+        form_party(&mut w, &leader, &member, t0);
+        let mut now = t0;
+        assert_eq!(through_the_gated_line_into_the_yard(&mut w, &mut leader, &mut now), GATE_NEW_ARRIVAL);
+        assert_eq!(w.ways_of(leader.entity), 1);
+        member.drain();
+        // the leader is back in the hall: the way it left by is forgotten...
+        back_into_the_hall(&mut w, &mut leader, &mut now);
+        assert_eq!(w.ways_of(leader.entity), 0);
+        // ...so the member is judged on the story of its party (the advanced one) as before this existed
+        cross_the_gated_line(&mut w, &member, &mut now);
+        assert_eq!(offered_arrival(&member.drain()), GATE_ADVANCED_ARRIVAL);
+    }
+
+    #[test]
+    fn a_way_out_is_for_the_party_it_was_made_for_and_ends_with_its_leadership() {
+        let t0 = Instant::now();
+        // a member that leaves the party before it comes to the line is nobody's follower: its own story judges it
+        let mut w = rooms_world(RoomsAdapter::with_gates());
+        let mut leader = seat(&mut w, "Leader", t0);
+        let mut ahead = seat_with(&mut w, "Ahead", STORY_ADVANCED, t0);
+        form_party(&mut w, &leader, &ahead, t0);
+        let mut now = t0;
+        assert_eq!(through_the_gated_line_into_the_yard(&mut w, &mut leader, &mut now), GATE_NEW_ARRIVAL);
+        ahead.drain();
+        assert_eq!(w.party_leave(ahead.entity), PartyOutcome::Done);
+        ahead.drain();
+        cross_the_gated_line(&mut w, &ahead, &mut now);
+        assert_eq!(offered_arrival(&ahead.drain()), GATE_ADVANCED_ARRIVAL, "its own (advanced) story, no way to follow");
+
+        // a leader that hands its party over remembers nothing of what it was
+        let mut w = rooms_world(RoomsAdapter::with_gates());
+        let mut leader = seat(&mut w, "Leader", t0);
+        let member = seat(&mut w, "Member", t0);
+        form_party(&mut w, &leader, &member, t0);
+        let mut now = t0;
+        assert_eq!(through_the_gated_line_into_the_yard(&mut w, &mut leader, &mut now), GATE_NEW_ARRIVAL);
+        assert_eq!(w.ways_of(leader.entity), 1);
+        assert_eq!(w.party_promote(leader.entity, member.entity), PartyOutcome::Done);
+        assert_eq!(w.ways_of(leader.entity), 0, "a new leader: the old one's ways are over");
+    }
+
+    #[test]
+    fn only_the_exits_a_story_decides_are_remembered_a_way_replaces_the_one_of_its_area_and_a_leader_keeps_a_few() {
+        use fmv_adapter_api::ExitKind;
+        let t0 = Instant::now();
+        let mut w = rooms_world(RoomsAdapter::with_gates());
+        let leader = seat(&mut w, "Leader", t0);
+        let member = seat(&mut w, "Member", t0);
+        let solo = seat(&mut w, "Solo", t0);
+        form_party(&mut w, &leader, &member, t0);
+        let mut now = t0;
+
+        // a gateway is data: open for every story, nothing to follow
+        walk_to(&mut w, &leader, NEAR, 0.0, &mut now);
+        walk_to(&mut w, &leader, FAR, 0.0, &mut now);
+        assert_eq!(w.transit_target(leader.entity), Some(YARD.to_string()));
+        assert_eq!(w.ways_of(leader.entity), 0, "a gateway is not a way a story decided");
+
+        // the exits a script decides, as the world is told of them
+        let exit = |id: u32, target: &str| Exit {
+            line: (Pos::new(0.0, 0.0, 0.0), Pos::new(1.0, 0.0, 0.0)),
+            target: target.to_string(),
+            arrival: Pos::new(0.0, 0.0, 0.0),
+            arrival_facing: None,
+            arrival_hint: None,
+            kind: ExitKind::Script { id },
+        };
+        w.note_way_out(leader.entity, &"a".to_string(), &exit(0, "x"));
+        w.note_way_out(leader.entity, &"a".to_string(), &exit(1, "y"));
+        assert_eq!(w.ways_of(leader.entity), 1, "the second way out of an area replaces the first");
+        for i in 0..20 {
+            w.note_way_out(leader.entity, &format!("area{i}"), &exit(i, "x"));
+        }
+        assert_eq!(w.ways_of(leader.entity), super::super::follow::MAX_WAYS_PER_LEADER, "a leader keeps the last few");
+        // a member and a solo player remember nothing (only a party's leader is followed)
+        w.note_way_out(member.entity, &"a".to_string(), &exit(0, "x"));
+        w.note_way_out(solo.entity, &"a".to_string(), &exit(0, "x"));
+        assert_eq!((w.ways_of(member.entity), w.ways_of(solo.entity)), (0, 0));
     }
 
     #[test]
