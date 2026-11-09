@@ -10,7 +10,7 @@ archive is laid out carries a tag, in one of three tiers:
 
 | Tag | Meaning |
 |---|---|
-| `[verify: doc <id>]` | A public page I fetched and read says so (source ids in Appendix A). Still unconfirmed against the owner's files: those pages describe particular builds. |
+| `[verify: doc <id>]` | A public page I fetched and read says so (source ids in Appendix 1). Still unconfirmed against the owner's files: those pages describe particular builds. |
 | `[verify: snippet <id>]` | Seen only in a search-result snippet, or resting on one forum poster's remark (even on a page I fetched). A lead, not a documented fact. |
 | `[verify: inference]` | No source: recall, a guess, or an inference. May simply be wrong. |
 
@@ -18,7 +18,7 @@ The HobbitDur FF8 pages (the most detailed source) describe the 2000 PC build (`
 for its exe-table page, the 2013 English PC release. **None of them describes the 2019 Remaster.**
 The FF7 pipeline is not assumed to carry over: where this design reuses an FF7 idea (archive
 reader, tile-and-depth backgrounds, walkmesh plus gateways) the FF8/FF9 equivalent is a claim to check.
-The per-game evidence tables (claim, source, tier, how to check on owned files) are in Appendix B,
+The per-game evidence tables (claim, source, tier, how to check on owned files) are in Appendix 2,
 so that the body stays about decisions.
 
 ---
@@ -42,11 +42,12 @@ so that the body stays about decisions.
    `fmv-ff7-battle`; the server calls the concrete FF7 `BattleState` and has FF7 `match` arms for
    looks and characters; the client is an FF7 renderer and battle UI used directly (49 client
    files import the FF7 crates).
-4. **The critical path to a first two-player FF8 area is short and needs none of those refactors
-   (section 9.1).** It is a field adapter on today's single-game server, exactly as `md1stin` was:
-   importer generalisation, an FI/FL/FS reader, field decode (walkmesh, camera, gateways,
-   background), an FF8 `GameAdapter`/`AreaRuntime`, and a client rendering seam. Battle, the battle
-   envelope, multi-game hosting and the identity/slot model come after it.
+4. **The critical path to a first two-player FF8 area is short and needs none of those three seams
+   except the field half of the client one (section 9.1).** It is a field adapter on today's single-game
+   server, exactly as `md1stin` was: importer generalisation, an FI/FL/FS reader, field decode (walkmesh,
+   camera, gateways, background), an FF8 `GameAdapter`/`AreaRuntime`, and the field half of the client
+   presentation seam. Battle, the battle envelope, multi-game hosting and the identity/slot model come
+   after it.
 5. **The story model's scenes rest on a hosted script VM that does not exist for any game.** FF7 has
    a bounded, read-only *talk-script walker* (`fmv_ff7::script::dialogue`, merged in `aa3462a`) that runs an
    NPC's talk script just far enough to collect its message windows and never changes the world; the
@@ -290,7 +291,7 @@ Concrete facts from the code at `aa3462a`:
 |---|---|---|
 | F1 | A stored, explicit **slot** per account and game (registration and the character menu get a "role" choice). `character_for_look` becomes `slot_for_account`. **Migration:** snapshot the current look-derived character as the slot once, then decouple the two. | no |
 | F2 | Stop defaulting everyone to Cloud; reserve the canon looks for NPC use; run the **wardrobe survey** (2.6); interim default look comes from its result, canon looks stay selectable behind a clearly labelled flag until it lands | no |
-| F3 | Battle bodies: interim per D4 | no |
+| F3 | Battle bodies: interim per decision D4 | no |
 | F4 | Seating algorithm (2.3) replaces "i-th party member is `ActorId(i)`"; ally logic for canon companions (2.5) | no |
 | F5a | **The layer on talk conversations** (2.8): `Added` sources wrapped around the canon `TalkSession` (acknowledge, aside and offer lines after an NPC's own text), flags kept server-side, `StoryVars` fed from the account's story | **no** (the seam exists) |
 | F5b | Canon protagonist as a script-driven NPC in instances; observer marks; the layer inside shared scenes (2.7) | **yes** |
@@ -444,7 +445,7 @@ is the same in every game, the party and the progression are not.
 | Triple Triad | A collectible card minigame; cards refine into magic `[doc WP8]` | a multiplayer table feature (5.5) |
 | Three characters | Three fight at once (the Wikipedia battle caption; common knowledge) | three slots (2.3) |
 
-### 5.2 The data we expect on the PC releases (summary; claim-by-claim in Appendix B-1)
+### 5.2 The data we expect on the PC releases (summary; claim-by-claim in Appendix 2a)
 
 * **Three PC builds, treated as separate editions** (editions are never mixed, README rule 6): the original
   2000 PC release (not on Steam), the 2013 Steam port (Steam app 39150 `[verify: snippet S-APP]`) and the 2019
@@ -612,13 +613,13 @@ answers the first, a look at the decoded field the second.
 * Camera lives in the scene data (probably the `.bgs`) `[verify: inference]`. Models are Unity skinned meshes and clips
   from the model and animation archives; players start as **markers**, as FF7 did, and get models once the Unity reader
   decodes meshes.
-* A shared "Unity" decoder is a track of its own (D1 in 9.4) and can start from the probe.
+* A shared "Unity" decoder is a track of its own (N1 in 9.4) and can start from the probe.
 
 ### 6.4 Battle engine plan (`fmv-ff9-battle`), in stages
 
 | Stage | Adds | Needs (`[verify]` until read) |
 |---|---|---|
-| A | four seats, ATB, Attack, Defend, Item, monsters from `dbfile0000.raw16.bytes`, formations | the raw16 layout; the tables route (D9) for characters and items |
+| A | four seats, ATB, Attack, Defend, Item, monsters from `dbfile0000.raw16.bytes`, formations | the raw16 layout; the tables route (decision D9) for characters and items |
 | B | equipment, AP, learned abilities, Magic Stones, action and support abilities | ability, item and leveling tables |
 | C | **Trance** (gauge, state, per-template command set), eidolons | trance data, command tables |
 | D | statuses, the scripted attack sequences (`.raw17`), enemy AI | battle scripts |
@@ -675,7 +676,7 @@ tells the segment apart is the "scenario counter" (a Memoria knowledge-base page
 An encounter rolls on the server's seeded RNG. The roster is Squall (AI), A, B; **team level is the mean of A's and
 B's levels** and Squall's canon sheet copies it. Every player has their own menus: A draws Fire from an enemy and it
 lands in **A's** stock, never B's; B starts a GF summon, B's seat shows a summon timer while A and Squall keep acting,
-and the cinematic is an overlay (D10). When A is at low HP the engine, on its seeded RNG, offers A's limit (the Zell
+and the cinematic is an overlay (decision D10). When A is at low HP the engine, on its seeded RNG, offers A's limit (the Zell
 template's Duel); A's timing inputs travel as bounded parameters on the command and the server accepts them inside a
 window. If B's connection drops, the companion logic plays B's seat until it returns. The battle ends in Victory,
 rewards are computed per account by the engine, and each client replays every step from its own files: the red band
@@ -706,7 +707,7 @@ provenance; `Identification { verified: false }` until a known-hash table exists
 2. **A read-only probe** (`fmv-import probe <game> <dir>`, part of R1) enumerates and hashes: file names, sizes,
    modification times, blake3 of each candidate file, the appmanifest facts, and whether known mods are present. It
    does not decode and writes no game bytes. The report is plain text and safe to paste.
-3. **We compare** the report with the expected candidates below and with the anchors in Appendix B and C. Surprises
+3. **We compare** the report with the expected candidates below and with the anchors in Appendices 2 and 3. Surprises
    change this document, not the code's assumptions.
 4. **Import** into a library set with provenance:
    `{ game, platform: Pc, edition, region: unknown, language, revision: "build <id>", sources: Install{path}, modded }`
@@ -744,8 +745,8 @@ whether Memoria or other mods are installed. Expected candidates (all `[verify: 
 | `FF9_Data/sharedassets2.assets` | UI atlases, Tetra Master card art | UI, cards |
 | `p0data3.bin` | world map | later |
 | `p0data61.bin`, `p0data62.bin`, `p0data63.bin` | music, sounds, effects | later |
-| the game's compiled code, `x64/FF9_Data/Managed/*.dll` `[verify: inference]` | candidate home of the gameplay tables (items, abilities, characters, Tetra Master stats) | battle (route 1 of D9) |
-| Memoria files if present (`Memoria.ini`, `Plugins/`, `StreamingAssets/Data` CSV) `[verify: doc M-README, M-DB]` | **modded** provenance class | route 2 of D9 only |
+| the game's compiled code, `x64/FF9_Data/Managed/*.dll` `[verify: inference]` | candidate home of the gameplay tables (items, abilities, characters, Tetra Master stats) | battle (route 1 of decision D9) |
+| Memoria files if present (`Memoria.ini`, `Plugins/`, `StreamingAssets/Data` CSV) `[verify: doc M-README, M-DB]` | **modded** provenance class | route 2 of decision D9 only |
 
 The path of `StreamingAssets` relative to the install root differs between the sources I read
 `[verify: inference]`; the probe lists what is really there.
@@ -780,8 +781,8 @@ Track B  shared work, starts now, needs NO FF8/FF9 media      Track A  FF8 first
   B2 slot split + FF7 migration (R7: F1-F3)                     -> A3 field decode -> A4 adapter + two bots
   B3 battle envelope + synthetic second engine (R5)             -> A5 window -> A6 models -> A7 smoke
   B4 adapter API v2 (R4)
-  B5 multi-game server (R6)                                   Track D  FF9: D0 probe (early, cheap) -> D1 Unity reader
-  B6 sheets, transfer journal, card rules (R8)                  -> D2 field decode -> D3 adapter + two bots -> ...
+  B5 multi-game server (R6)                                   Track N  FF9: N0 probe (early, cheap) -> N1 Unity reader
+  B6 sheets, transfer journal, card rules (R8)                  -> N2 field decode -> N3 adapter + two bots -> ...
 Track C  FF8 depth, after A                                   Track E  story runtime: per-game script VMs; owner-gated,
                                                                        parallel, NOT on the A, C or D path
 ```
@@ -793,7 +794,7 @@ FF8 runs on today's single-game server (`--game ff8`), exactly as `md1stin` did.
 
 | # | Increment | Ready-check | Media | Refactor | Size |
 |---|---|---|---|---|---|
-| A0 | **Probe**: `fmv-import probe ff8` reads the appmanifest, lists and hashes the candidate set | report shows the set; anchors of Appendix C compared; deviations written down | FF8 install | R1 min | S |
+| A0 | **Probe**: `fmv-import probe ff8` reads the appmanifest, lists and hashes the candidate set | report shows the set; anchors of Appendix 3 compared; deviations written down | FF8 install | R1 min | S |
 | A1 | **Library set** with provenance (`import-pc` generalised) | `list` shows labels; source mtime and hash unchanged | FF8 install | R1 min | S |
 | A2 | **`fmv-ff8` archive reader**: `.fl` list, `.fi` index, `.fs` data, LZS, nested archives (ZZZ if Remaster) | lists the fields; extracts one; sizes equal the `.fi` | yes | R3 | M |
 | A3 | **Field decode**: walkmesh and access, camera, gateways, tile background with depth | an offscreen render of the chosen field shows the walkmesh projected through its own camera on its background (the wiki reports `bghall_1` lines up `[verify: doc H-CA]`) | yes | R2 lite | L |
@@ -808,7 +809,7 @@ A **FIXTURE** FF8-shaped area is not FF8 support (README rule 5): none of A coun
 
 | # | Increment | Ready-check | Needs |
 |---|---|---|---|
-| B1 | **Wardrobe survey** (FF7 data on this box): which skeletons have idle, walk and run clips | a table of candidate non-canon looks, or "none"; decides D2 and D4 | FF7 data |
+| B1 | **Wardrobe survey** (FF7 data on this box): which skeletons have idle, walk and run clips | a table of candidate non-canon looks, or "none"; decides decisions D2 and D4 | FF7 data |
 | B2 | **Slot split and FF7 migration** (F1 to F3): explicit slot, no Cloud default, canon looks reserved | login no longer derives the fighter from the look; an old account keeps who it fought as | none |
 | B3 | **Envelope, `BattleSession`, synthetic second engine** (R5) | `battle-smoke` passes on FF7 and on the FIXTURE engine, 0 divergences | none |
 | B4 | **Adapter API v2** (R4) | FF7 implements the new capabilities; FF8 starts with the defaults | none |
@@ -826,17 +827,17 @@ A **FIXTURE** FF8-shaped area is not FF8 support (README rule 5): none of A coun
 | C5 | Triple Triad PvP (5.5; needs B6; the card table needs the exe or Remaster file) | friendly first |
 | C6 | World-map area type | its own design |
 
-### 9.4 Track D: FF9, after the FF8 area but with an early probe
+### 9.4 Track N: FF9, after the FF8 area but with an early probe
 
 | # | Increment | Ready-check |
 |---|---|---|
-| D0 | **Probe** (cheap, can run now-ish): names, sizes, hashes, mods | tells us the container family and whether D9's route 1 can exist |
-| D1 | **`fmv-unity`**: bounded, panic-free reader for the field archives first | lists `FieldMaps/*` and compares the count with about 674 `[verify: snippet S-MK]` |
-| D2 | Field decode: atlas, `.bgs` tileset, `.bgi` walkmesh, camera | an offscreen render of one field |
-| D3 | `Ff9Adapter`, server `--game ff9`, two bots, markers | as A4; the first area is free roam (6.3) |
-| D4 | Models: skinned meshes and clips from the model and animation archives | players walk as models |
-| D5 | Tables route decided (D9), then battle stages A to D (6.4) | needs B3, B5 |
-| D6 | Tetra Master PvP (6.5) | needs B6 |
+| N0 | **Probe** (cheap, can run now-ish): names, sizes, hashes, mods | tells us the container family and whether decision D9's route 1 can exist |
+| N1 | **`fmv-unity`**: bounded, panic-free reader for the field archives first | lists `FieldMaps/*` and compares the count with about 674 `[verify: snippet S-MK]` |
+| N2 | Field decode: atlas, `.bgs` tileset, `.bgi` walkmesh, camera | an offscreen render of one field |
+| N3 | `Ff9Adapter`, server `--game ff9`, two bots, markers | as A4; the first area is free roam (6.3) |
+| N4 | Models: skinned meshes and clips from the model and animation archives | players walk as models |
+| N5 | Tables route decided (decision D9), then battle stages A to D (6.4) | needs B3, B5 |
+| N6 | Tetra Master PvP (6.5) | needs B6 |
 
 ### 9.5 Track E: story runtime (all games, owner-gated)
 
@@ -848,7 +849,7 @@ A **FIXTURE** FF8-shaped area is not FF8 support (README rule 5): none of A coun
 | E3 | The **hosted script VM** per game, party-affecting opcodes intercepted, run per instance | this is it |
 | E4 | Scene staging (observer marks, scene lock) and the layer inside shared scenes (2.7) | yes |
 
-**None of Tracks A, C or D waits for any of it.** Sections 2.5 to 2.7 are not deliverable without E3; the talk half of
+**None of Tracks A, C or N waits for any of it.** Sections 2.5 to 2.7 are not deliverable without E3; the talk half of
 2.8 is (E0, E1). The size of the E3 job per game is real: FF8's wiki has a page per documented field opcode, with ids
 running from `000` to `177` in hex `[verify: doc H-IDX]`, and FF7's read-only walker already interprets dozens of message,
 branch, request and variable opcodes just to answer "which messages show, in what order".
@@ -859,10 +860,10 @@ branch, request and variable opcodes just to answer "which messages show, in wha
 
 | # | Risk | Effect | Mitigation |
 |---|---|---|---|
-| 1 | FF9 data is in Unity archives; the exact container, compression and asset types are unconfirmed | no FF9 field, model or table until read | probe first (D0); a bounded `fmv-unity`; fuzz it; keep FF9 behind FF8 |
-| 2 | FF9 gameplay tables may be in compiled code (or absent from data) | battle blocked, or forced onto modded or approximate tables | decide D9 after the probe; label approximations; never mix vanilla and modded sets |
+| 1 | FF9 data is in Unity archives; the exact container, compression and asset types are unconfirmed | no FF9 field, model or table until read | probe first (N0); a bounded `fmv-unity`; fuzz it; keep FF9 behind FF8 |
+| 2 | FF9 gameplay tables may be in compiled code (or absent from data) | battle blocked, or forced onto modded or approximate tables | decide decision D9 after the probe; label approximations; never mix vanilla and modded sets |
 | 3 | `net.offline = true` | new crates may not resolve | `lz4_flex`, `lzma-rust2`, `bzip2`, `ruzstd`, `zip` are already cached; a Unity parser is not; confirm resolution before relying on them |
-| 4 | Edition drift: the best FF8 documentation describes 2000/2013; the Remaster repacks and changes models | wrong layouts | separate edition labels; Appendix B and C record what was confirmed; decoders are total and fail soft |
+| 4 | Edition drift: the best FF8 documentation describes 2000/2013; the Remaster repacks and changes models | wrong layouts | separate edition labels; Appendices 2 and 3 record what was confirmed; decoders are total and fail soft |
 | 5 | Format claims here are unverified | wasted work | every claim tagged; the probe and the checklist come before decoders |
 | 6 | No hosted script VM exists (FF7 has only a read-only talk walker) | the scenes half of the story model (O3, O4 of 2.1) is blocked | free-roam areas first (as FF7 M1); a separate track E, starting with the talk layer (E0), which needs no VM; do not promise story presence in scenes early |
 | 7 | Few non-canon models may be pose-ready (FF7 survey unknown) | "thirty Clouds" cannot be fully avoided in the field | B1 first; recolour; reserved canon models; an opt-in cosplay later |
@@ -872,8 +873,8 @@ branch, request and variable opcodes just to answer "which messages show, in wha
 | 11 | Protocol churn per game | repeated version bumps | envelope plus per-game schema versions and golden tests |
 | 12 | Two-account card transfers | duplicated or lost cards after a crash | the transfer journal (R8) before any stake |
 | 13 | FMV | the player cannot appear in prerendered video | player beats before and after FMV |
-| 14 | Names outside the game font | broken glyphs in game windows | client-font fallback (D8) |
-| 15 | Archive sizes and the 4 GiB cap | slow or impossible FF9 import | reference-in-place (D12) |
+| 14 | Names outside the game font | broken glyphs in game windows | client-font fallback (decision D8) |
+| 15 | Archive sizes and the 4 GiB cap | slow or impossible FF9 import | reference-in-place (decision D12) |
 | 16 | Balance and feel of AI companions and scaling | frustration or trivial fights | engine-internal seeded logic; label approximations as FF7 does; tune against owned-data sanity checks |
 
 ---
@@ -888,17 +889,17 @@ branch, request and variable opcodes just to answer "which messages show, in wha
 | D4 | **Battle bodies** while only canon battle models exist (FF7). | (a) the slot's canon battle body with the player's name and tint, labelled interim; (b) neutral stand-in silhouettes; (c) recolour or accessory composites from owned models; (d) delay battle presentation for originals | **(a) now**, **(c)** as the target once B1 reports; say plainly that (a) looks like the canon member | F3 |
 | D5 | **FF7 retrofit timing and existing accounts.** | do F1 to F4 before any FF8/FF9 demo of originals / after | **before**: snapshot each account's current look-derived character as its explicit slot once, then decouple; stop defaulting to Cloud | B2 |
 | D6 | **Party-swap segments** (FF8 Laguna dreams, FF9 splits and Steiner/Vivi/Dagger stretches, FF7 stretches without Cloud): what do originals do? | (a) watch from marks (`CastOnly`); (b) seat if the segment's party fights and slots allow; (c) separate "mirror" content | **(a)** for dream and vision segments, **(b)** for ordinary sub-parties; the leader chooses which team a split follows, others watch | segment data, Track E |
-| D7 | **Card games** (Triple Triad, Tetra Master). | friendly matches only / stakes with consent; rare cards unique or per account | **friendly first**; stakes later with mutual consent and the transfer journal; rare cards per account and excluded from stakes | B6, C5, D6 |
+| D7 | **Card games** (Triple Triad, Tetra Master). | friendly matches only / stakes with consent; rare cards unique or per account | **friendly first**; stakes later with mutual consent and the transfer journal; rare cards per account and excluded from stakes | B6, C5, N6 |
 | D8 | **Dialogue layer.** Who writes it, pronouns, name rendering, canon choices. | project-authored original text, optional pronoun set in the identity, game-styled window with client-font fallback for names, leader answers canon choices | **all of those**; start with one showcase NPC conversation on the FF7 seam that already exists (`MessageOrigin::Added`), not a scene | layer, Track E (E0) |
 | D9 | **FF9 gameplay-table route** if the tables are in the game's code. | (1) read the owner's vanilla assembly; (2) read Memoria CSV from a Memoria install (`modded`); (3) author approximations | probe first; **(1)** if the tables are there; accept **(2)** as an explicit `modded` set that cannot play with vanilla sets; **(3)** last resort | FF9 battle |
 | D10 | **Cinematic locks** (summons, limit breaks, eidolons). | freeze the battle clock for everyone / overlay while the clock runs | **overlay with a short engine-side beat** (faithful pausing is slow with three summoners) | FF8, FF9 battle |
 | D11 | **Hosting.** One multi-game server process or one per game? | one process with an adapter registry, a `World` partition and a `PartyManager` per game; or separate servers with a shared account service | **one process**; parties stay per game, friends and identity are cross-game | R6 |
-| D12 | **Editions and storage.** Which FF8 edition first, does the owner run Memoria on FF9, and how are big archives stored? | FF8 Steam 2013 / Remastered / both; FF9 vanilla / Memoria; copy / reference-in-place | **FF8 2013 first if owned** (best documented), Remastered as a second edition label; FF9 vanilla; **reference-in-place** for archives above a threshold chosen after the probe; PS1 later | A0, D0 |
-| D13 | **Order of work.** | A first, then FF9 / A and B in parallel with an early FF9 probe | **A and B in parallel; B2 first** (the owner's model blocks every public demo of originals), **D0 early**, FF9 proper after the FF8 area | planning |
+| D12 | **Editions and storage.** Which FF8 edition first, does the owner run Memoria on FF9, and how are big archives stored? | FF8 Steam 2013 / Remastered / both; FF9 vanilla / Memoria; copy / reference-in-place | **FF8 2013 first if owned** (best documented), Remastered as a second edition label; FF9 vanilla; **reference-in-place** for archives above a threshold chosen after the probe; PS1 later | A0, N0 |
+| D13 | **Order of work.** | A first, then FF9 / A and B in parallel with an early FF9 probe | **A and B in parallel; B2 first** (the owner's model blocks every public demo of originals), **N0 early**, FF9 proper after the FF8 area | planning |
 
 ---
 
-## Appendix A. Sources
+## Appendix 1. Sources
 
 Read in full or in part with the fetch tool (summaries by the tool; check wording against the pages when it matters):
 
@@ -941,9 +942,9 @@ READMEs name no editions or archives. No game data was downloaded.
 
 ---
 
-## Appendix B. Evidence tables (what is claimed, by whom, how to check)
+## Appendix 2. Evidence tables (what is claimed, by whom, how to check)
 
-### B-1. FF8
+### 2a. FF8
 
 | # | Claim | Source | Tier | How to check on the owned files |
 |---|---|---|---|---|
@@ -970,7 +971,7 @@ READMEs name no editions or archives. No game data was downloaded.
 | 21 | PS1: `FF8DISCn.IMG` with 8-byte index entries (sector, length), LZS | H-PS1 | doc | later |
 | 22 | These pages describe the 2000 PC and 2013 builds, not the Remaster | the pages' own text | doc | n/a |
 
-### B-2. FF9
+### 2b. FF9
 
 | # | Claim | Source | Tier | How to check on the owned files |
 |---|---|---|---|---|
@@ -990,7 +991,7 @@ READMEs name no editions or archives. No game data was downloaded.
 
 ---
 
-## Appendix C. First-contact checklist (when the owner's files arrive)
+## Appendix 3. First-contact checklist (when the owner's files arrive)
 
 **FF8**
 
@@ -1002,7 +1003,7 @@ READMEs name no editions or archives. No game data was downloaded.
 3. Decode one field (`bghall_1`): walkmesh size identity, `.inf` size 676, camera projection over the background,
    tile `Z` levels.
 4. Find the card table (exe, or the Remaster's file) and note its offset.
-5. Write the result into Appendix B by changing each confirmed row's tier to "confirmed on owned <edition>, <date>",
+5. Write the result into Appendix 2 by changing each confirmed row's tier to "confirmed on owned <edition>, <date>",
    as `fmv-ff7` did ("Verified on owned FF7 Steam Edition (en) on 2026-11-08").
 
 **FF9**
@@ -1010,5 +1011,5 @@ READMEs name no editions or archives. No game data was downloaded.
 1. Run the probe: names and sizes of `p0data*`, `*.assets`, `Managed/*.dll`; mods present or not.
 2. First run of the Unity reader: header signature, block compression kinds, asset counts per archive, asset names;
    compare the field count with about 674.
-3. Answer D9: are items, abilities and characters in the assembly, in assets, or only in Memoria's CSV?
+3. Answer decision D9: are items, abilities and characters in the assembly, in assets, or only in Memoria's CSV?
 4. Decode one field (`.bgs`, `.bgi`, atlas) and choose the first area from the ones that decode cleanly.
