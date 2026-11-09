@@ -73,6 +73,8 @@ pub mod plan;
 #[cfg(test)]
 mod sheets;
 #[cfg(test)]
+mod identity_tests;
+#[cfg(test)]
 mod shots;
 pub mod stage;
 
@@ -87,7 +89,7 @@ use crate::avatar::library::AvatarAsset;
 use crate::render::{Camera, Vertex};
 use crate::state::ClientState;
 use camera::{fit, BattleCamera, View, V3, NOMINAL_TAN_HALF_V};
-use fmv_core::Pos;
+use fmv_core::{EntityId, Pos};
 use fmv_ff7::model::{mat4_mul, mat4_translate, transform_point};
 use clips::Kit;
 use effects::{EffectKit, Element, Look};
@@ -201,6 +203,16 @@ struct Actor {
     rig: Arc<ActorRig>,
     /// Where it stands and which way it faces when it is doing nothing.
     home: Spot,
+    /// The identity colour of the player behind a party member, when this client knows it (see
+    /// [`BattleScene::show_player_colours`]): its body (not its weapon) is drawn in it, as a player's body is in
+    /// the field. `None`: the model keeps its own colours.
+    colour: Option<[u8; 3]>,
+}
+
+impl Actor {
+    fn identity(&self) -> Identity {
+        self.colour.map_or(Identity::NONE, Identity::of)
+    }
 }
 
 /// Where an actor is on the screen, in pixels from the top left (tests).
@@ -253,6 +265,9 @@ pub struct BattleScene {
     /// The meshes the effects are drawn with, shared with every other scene of the kit.
     effects: Arc<EffectKit>,
     my_actor: Option<ActorId>,
+    /// The field entity of each party member, in actor order: whose colour is whose
+    /// ([`BattleScene::show_player_colours`]).
+    entities: Vec<EntityId>,
     /// The party members waiting for a command.
     ready: Vec<bool>,
     /// The scene clock: the time of the last [`BattleScene::update`], seconds.
@@ -298,7 +313,7 @@ impl BattleScene {
             let who = PartyLook { actor: id, character: start.party.get(i).map_or(0, |m| m.character), mine: Some(id) == start.my_actor };
             let model = kit.source.party_member(&who);
             let rig = kit.rigs.resolve(&model, BoxSpec::for_party(i));
-            actors.push(Actor { side: Side::Party, rig, home: spots.party[i] });
+            actors.push(Actor { side: Side::Party, rig, home: spots.party[i], colour: None });
         }
         for (j, &id) in enemy_ids.iter().enumerate() {
             let combatant = engine.actor(id)?;
@@ -311,7 +326,7 @@ impl BattleScene {
             };
             let model = kit.source.enemy(&who);
             let rig = kit.rigs.resolve(&model, BoxSpec::for_enemy(0, combatant.max_hp));
-            actors.push(Actor { side: Side::Enemy, rig, home: spots.enemies[j] });
+            actors.push(Actor { side: Side::Enemy, rig, home: spots.enemies[j], colour: None });
         }
 
         let mut cast: Vec<V3> = Vec::with_capacity(actors.len() * 8);
@@ -364,9 +379,27 @@ impl BattleScene {
             director: Director::with_kits(sides, anchors, kits),
             effects: Arc::clone(&kit.effects),
             my_actor: start.my_actor,
+            entities: start.party.iter().map(|m| m.entity).collect(),
             ready: vec![false; n],
             now: 0.0,
         })
+    }
+
+    /// Show each party member's player's colour on the member's body: `tint_of` answers with the identity colour
+    /// of the player whose field entity a member is (`None`: not known here, the member keeps its own colours, as
+    /// it did before there was any). The window asks every frame, from what its snapshots say, so a colour that
+    /// arrives late applies and one that changes follows; a colour once known stays (a player that drops out in
+    /// the middle of the fight does not change colour with it). Nothing else of the scene changes.
+    pub fn show_player_colours(&mut self, tint_of: impl Fn(EntityId) -> Option<[u8; 3]>) {
+        for (actor, entity) in self.actors.iter_mut().zip(&self.entities) {
+            actor.colour = tint_of(*entity).or(actor.colour);
+        }
+    }
+
+    /// Every model in its own colours again (tests: the same scene, drawn without the colours it was given).
+    #[cfg(test)]
+    pub fn clear_player_colours(&mut self) {
+        self.actors.iter_mut().for_each(|a| a.colour = None);
     }
 
     pub fn id(&self) -> BattleId {
@@ -456,6 +489,8 @@ impl BattleScene {
         let camera_matrix = view.camera.matrix();
         let mut models: Vec<SkinnedModel> = Vec::new();
         let mut tints: Vec<Tint> = Vec::new();
+        // In step with `models` up to the effects, which have none (a model past the end of the list has none).
+        let mut identities: Vec<Identity> = Vec::new();
         let mut marks: Vec<(f64, Vec<GroundShape>)> = Vec::new();
         let to_view = |p: Pos| {
             // `Pos` carries a ground position `(x, z)` in its first two fields; see `ground::circle`.
@@ -514,11 +549,13 @@ impl BattleScene {
             if skin(&actor.rig.asset, &pose, &place, &camera_matrix, &mut positions) {
                 models.push(SkinnedModel { asset: Arc::clone(&actor.rig.asset), positions });
                 tints.push(tint);
+                identities.push(actor.identity());
                 for (asset, pose) in weapons {
                     let mut positions = Vec::new();
                     if skin(asset, &pose, &place, &camera_matrix, &mut positions) {
                         models.push(SkinnedModel { asset: Arc::clone(asset), positions });
                         tints.push(tint);
+                        identities.push(Identity::NONE);
                     }
                 }
             }
@@ -557,7 +594,7 @@ impl BattleScene {
                 scenery: None,
             },
             tints,
-            identities: Vec::new(),
+            identities,
             camera: view.gpu_camera(),
         }
     }
@@ -692,6 +729,9 @@ pub fn scene_for<'a>(
         *slot = BattleScene::new(&start, state.battle.engine(), kit);
     }
     let scene = slot.as_mut()?;
+    // Each party member's body is drawn in its player's colour, as the field draws the player (what the area's
+    // snapshots say, asked every frame so that one that arrives late applies).
+    scene.show_player_colours(|entity| state.tint_of(entity));
     scene.update(now, events, state.battle.engine());
     Some(scene)
 }
