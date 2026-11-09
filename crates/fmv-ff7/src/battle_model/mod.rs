@@ -14,7 +14,7 @@
 //! | entry | content |
 //! |---|---|
 //! | `abaa` | the skeleton ([`skeleton`]): header and bones; its first word says enemy, location or character |
-//! | `abab` | extra data this module does not read (enemies' and characters' own run-time tables) |
+//! | `abab` | the animation scripts ([`script`]): which clips of the pack the game plays for each action, strung together with movements |
 //! | `abac`, `abad`, .. | the model's textures (`.tex`, [`crate::tex`]), as many as the skeleton says |
 //! | `abam`, `aban`, .. | the meshes (`.p`, [`crate::pmodel`]), one per bone that has one, or per piece of a location |
 //! | `abck`, `abcl`, .. | the weapon meshes of a playable character |
@@ -134,6 +134,7 @@
 //! costs its slot, not the model.
 
 pub mod animation;
+pub mod script;
 pub mod skeleton;
 mod tiling;
 
@@ -144,8 +145,8 @@ use crate::pmodel::{PModel, PRenderState};
 use crate::tex::{parse_tex, RgbaImage};
 use animation::{clip_to_animation, decode_clip, rest_animation, split_pack, PackEntry};
 use skeleton::{
-    animation_pack_name, id_of_prefix, part_name, prefix_of_id, skeleton_name, texture_name, weapon_name, BattleModelKind,
-    BattleSkeleton,
+    animation_pack_name, id_of_prefix, part_name, prefix_of_id, script_name, skeleton_name, texture_name, weapon_name,
+    BattleModelKind, BattleSkeleton,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Seek};
@@ -291,6 +292,12 @@ pub struct BattleModel {
     pub weapon_tracks: Vec<FieldAnimation>,
     /// Whether `weapon_tracks[i]` is the track's own clip.
     pub weapon_track_ok: Vec<bool>,
+    /// The model's animation scripts ([`script`]): `scripts[i]` is script `i` of the game's table (74 for a
+    /// character, 32 for an enemy), the clips and movements the game plays for action `i`. A script that does
+    /// not decode or does not end properly is an empty [`script::Script`]; empty for a model whose `ab` entry
+    /// is missing or damaged (a clip or a script that does not decode costs its own slot, not the model) and
+    /// for a location.
+    pub scripts: Vec<script::Script>,
 }
 
 impl BattleModel {
@@ -532,6 +539,9 @@ impl<R: Read + Seek> BattleModels<R> {
             (animations, slot_ok, tracks, track_ok)
         };
 
+        // The scripts that say which clips an action plays. A model with none (or damaged ones) is still a model.
+        let scripts = if is_location { Vec::new() } else { self.read_scripts(prefix, &mut budget) };
+
         let mut model = model;
         model.missing_textures = textures.missing;
         Ok(BattleModel {
@@ -543,7 +553,21 @@ impl<R: Read + Seek> BattleModels<R> {
             weapons,
             weapon_tracks,
             weapon_track_ok,
+            scripts,
         })
+    }
+
+    /// The decoded scripts of `prefix`'s `ab` entry, index-aligned with the game's table; empty if the entry is
+    /// missing or its table does not parse, an empty script for each one that does not decode to a proper end.
+    fn read_scripts(&mut self, prefix: &str, budget: &mut u64) -> Vec<script::Script> {
+        let Ok(bytes) = read_entry(&mut self.lgp, "animation scripts", &script_name(prefix), budget) else { return Vec::new() };
+        let Ok(table) = script::AnimationScripts::parse(&bytes) else { return Vec::new() };
+        (0..table.len())
+            .map(|i| match table.script(i) {
+                Some(Ok(script)) if script.terminated => script,
+                _ => script::Script::default(),
+            })
+            .collect()
     }
 }
 

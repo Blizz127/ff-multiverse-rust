@@ -386,10 +386,13 @@ fn real_window_path_finds_the_battle_archive_through_open_ff7() {
     } else {
         assert!(rig.kit.attacks.is_empty(), "without a library there is no scene.bin to name the attacks");
     }
-    // A party member's kit is the shared table.
+    // A party member's kit: the shared slots, and its blow from its own scripts.
     let cloud = kit.source.party_member(&PartyLook { actor: ActorId(0), character: 0, mine: true });
     let cloud = resolve(&mut kit, cloud);
-    assert_eq!((cloud.kit.attack, cloud.kit.hurt, cloud.kit.death, cloud.kit.victory), (Some(10), Some(15), Some(18), Some(2)));
+    assert_eq!((cloud.kit.hurt, cloud.kit.death, cloud.kit.victory), (Some(15), Some(18), Some(2)));
+    // His blow is his own script's: a crouch and a run, the chop (slot 30), the recovery, the run back. Not slot 10.
+    let blow = cloud.kit.attack.as_ref().expect("Cloud's blow");
+    assert_eq!((blow.approach.as_slice(), blow.strike.as_slice(), blow.back.as_slice()), (&[26, 27][..], &[30, 28][..], &[29][..]));
     // a party member by the combat slot it fights in
     for (character, height) in [(0u8, 862.0), (2, 837.0), (1, 919.0)] {
         let model = kit.source.party_member(&PartyLook { actor: ActorId(0), character, mine: true });

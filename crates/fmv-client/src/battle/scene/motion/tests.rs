@@ -2,6 +2,7 @@
 //! blow lands on schedule whatever the clips, and that nothing a server sends can grow the schedule
 //! without bound or break it.
 
+use super::super::clips::testing::{cloud_like_pack, cloud_like_scripts};
 use super::super::clips::{party, ClipSet};
 use super::super::cue::{self, DEATH_BEAT, MAX_IMPACT_DELAY};
 use super::*;
@@ -24,11 +25,12 @@ fn pack(n: usize, frames: u16) -> ClipSet {
     ClipSet { frames: vec![frames; n], ok: vec![true; n], travel: vec![0.0; n], fps: 15.0 }
 }
 
-/// The same four with real clips: the party's table (52 slots of 15 frames) and enemies that attack with
-/// attack 272 (slot 3, 15 frames) and run up with slot 2 (1 000 units forward) and back with slot 5.
+/// The same four with real clips: the party's shared slots and blows of Cloud's shape (52 slots, `cloud_like_pack`)
+/// and enemies that attack with attack 272 (slot 3, 15 frames) and run up with slot 2 (1 000 units forward) and back
+/// with slot 5.
 fn with_clips() -> Director {
     let sides = vec![Side::Party, Side::Party, Side::Enemy, Side::Enemy];
-    let party = Kit::party(pack(52, 15));
+    let party = Kit::party(cloud_like_pack(), &cloud_like_scripts());
     let mut set = pack(8, 15);
     set.travel[2] = -1000.0;
     set.travel[5] = 1000.0;
@@ -130,7 +132,7 @@ fn no_blow_lands_later_than_the_cap_whatever_its_clips_its_reach_or_what_its_act
     // Very long clips (200 frames: 13 seconds), every kind of action, at several distances, with the
     // actor busy with an earlier performance that is still running.
     let sides = vec![Side::Party, Side::Party, Side::Enemy, Side::Enemy];
-    let party = Kit::party(pack(52, 200));
+    let party = Kit::party(pack(52, 200), &cloud_like_scripts());
     let enemy = Kit::enemy(pack(8, 200), &[(272, 3)]);
     for far in [0.0f32, 500.0, 3000.0, 20_000.0] {
         let anchors = vec![Anchor { ground: [0.0, 0.0], radius: 150.0 }, Anchor { ground: [10.0, 0.0], radius: 150.0 }, Anchor { ground: [0.0, -far], radius: 150.0 }, Anchor { ground: [0.0, -far], radius: 150.0 }];
@@ -188,7 +190,7 @@ fn a_new_performance_of_an_actor_takes_over_from_its_start() {
     let cast_begin = d.segments[0].iter().find(|s| s.slot == 12).expect("the cast begins").start;
     assert!(cast_begin >= 10.2 - 1e-9);
     let at = |t: f64| d.motion(0, t).clip.map(|c| c.slot);
-    assert!(matches!(at(10.15), Some(7) | Some(10)), "still the first blow's clips: {:?}", at(10.15));
+    assert!(matches!(at(10.15), Some(26 | 27 | 30)), "still the first blow's clips: {:?}", at(10.15));
     assert_eq!(at(cast_begin + 0.05), Some(12), "the cast has taken over");
 }
 
@@ -197,11 +199,16 @@ fn a_party_members_blow_plays_its_attack_the_target_flinches_and_a_burst_flashes
     let mut d = with_clips();
     d.on_batch(10.0, &blow(0, 2), PLAIN);
     let impact = 10.5;
-    // The attacker runs (slot 7), then swings (slot 10); at the impact it is at the swing's impact frame.
-    assert_eq!(d.motion(0, 10.01).clip.map(|c| c.slot), Some(7));
+    // The attacker plays its own script's clips (Cloud's shape: crouch 26, run 27, chop 30, recover 28, back 29); at the
+    // impact it is two ticks into the chop, which is the tick its script marks the damage at. Slot 10, the item thrown at
+    // an enemy that the first version took for the attack, is never played.
+    assert_eq!(d.motion(0, 10.01).clip.map(|c| c.slot), Some(26));
     let swing = d.motion(0, impact - 0.001).clip.expect("swinging");
-    assert_eq!(swing.slot, 10);
-    assert!(near(swing.frame, 0.55 * 14.0, 1.0), "the impact frame lands at the impact: {swing:?}");
+    assert_eq!(swing.slot, 30);
+    assert!(near(swing.frame, 2.0, 0.05), "the blow lands at the impact: {swing:?}");
+    assert!(d.segments_of(0).iter().all(|s| s.slot != 10));
+    assert_eq!(d.motion(0, impact + 0.1).clip.map(|c| c.slot), Some(30), "the chop goes on");
+    assert_eq!(d.motion(0, impact + 0.45).clip.map(|c| c.slot), Some(28), "then the recovery");
     // The target starts its hurt clip (slot 1 of an enemy) at the impact, not before.
     assert_eq!(d.motion(2, impact - 0.01).clip, None);
     assert_eq!(d.motion(2, impact + 0.05).clip.map(|c| c.slot), Some(1));
@@ -213,6 +220,34 @@ fn a_party_members_blow_plays_its_attack_the_target_flinches_and_a_burst_flashes
     assert!(d.motion(0, impact).offset[2] < -1000.0, "it ran at its target (to -z): {:?}", d.motion(0, impact));
     d.prune(20.0);
     assert_eq!(d.motion(0, 20.0), Motion::default());
+}
+
+#[test]
+fn a_long_range_blow_hops_forward_and_no_further_and_an_item_at_an_enemy_is_the_throw_forward() {
+    let mut d = with_clips();
+    let shoot = |_: ActorId, _: ActionRef| Look { melee: false, element: Element::Plain };
+    d.on_batch(10.0, &blow(0, 2), &shoot);
+    let impact = 10.5;
+    // The clips of its other script: the hop forward (3), the shot (31), the hop back (4); it never runs.
+    let slots: Vec<Slot> = d.segments_of(0).iter().map(|s| s.slot).collect();
+    assert_eq!(slots, [3, 31, 31, 4]);
+    let o = d.motion(0, impact).offset;
+    let went = o[0].hypot(o[2]);
+    assert!(went > 100.0 && went <= party::HOP + 1.0, "it hopped towards the target and did not run to it ({went}, the target is 3 000 units away)");
+    // The impact is where it always is, and the target flinches then.
+    assert_eq!(impacts(&d).len(), 1);
+    assert!((impacts(&d)[0] - impact).abs() < 1e-9);
+    assert_eq!(d.motion(2, impact + 0.05).clip.map(|c| c.slot), Some(1));
+    // It is home when it is over.
+    d.prune(20.0);
+    assert_eq!(d.motion(0, 20.0), Motion::default());
+    // An item thrown at an enemy is the throw forward (slot 10); used on an ally, the gesture with the arm raised (9).
+    let mut d = with_clips();
+    d.on_batch(1.0, &[action(0, ActionRef::Item(3)), damage(0, 2, false)], PLAIN);
+    assert_eq!(d.motion(0, 1.2).clip.map(|c| c.slot), Some(10));
+    let mut d = with_clips();
+    d.on_batch(1.0, &[action(0, ActionRef::Item(3)), BattleEvent::Heal { actor: ActorId(0), target: ActorId(1), amount: 50 }], PLAIN);
+    assert_eq!(d.motion(0, 1.2).clip.map(|c| c.slot), Some(9));
 }
 
 #[test]

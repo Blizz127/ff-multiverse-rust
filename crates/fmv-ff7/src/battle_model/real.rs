@@ -272,3 +272,82 @@ fn every_location_loads_with_a_floor_near_the_ground() {
     eprintln!("the largest location has {most_vertices} vertices");
     assert_eq!(floors, 90);
 }
+
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA or FMV_FF7_BATTLE_LGP)"]
+fn animation_scripts_decode_and_the_characters_share_their_common_ones() {
+    use super::script::{AnimationScripts, Script};
+    let Some(path) = battle_lgp() else { return };
+    let mut models = BattleModels::open(&path).unwrap();
+    // Every model that is not a location has an `ab` entry; count what parses and what decodes.
+    let (mut parsed, mut tables, mut scripts, mut proper, mut absent) = (0usize, 0usize, 0usize, 0usize, 0usize);
+    let mut unparsed: Vec<String> = Vec::new();
+    let mut lgp = LgpArchive::open_path(&path).unwrap();
+    for id in 0..481usize {
+        let prefix = skeleton::prefix_of_id(id).unwrap();
+        if models.kind_of(&prefix) == Some(BattleModelKind::Location) {
+            continue;
+        }
+        tables += 1;
+        let bytes = lgp.read(&skeleton::script_name(&prefix)).unwrap();
+        let Ok(table) = AnimationScripts::parse(&bytes) else {
+            unparsed.push(prefix);
+            continue;
+        };
+        parsed += 1;
+        for i in 0..table.len() {
+            match table.script(i) {
+                None => absent += 1,
+                Some(decoded) => {
+                    scripts += 1;
+                    if decoded.map(|s| s.terminated).unwrap_or(false) {
+                        proper += 1;
+                    }
+                }
+            }
+        }
+    }
+    eprintln!("{parsed} of {tables} tables parse ({unparsed:?} do not); {scripts} scripts present, {proper} decode to a proper end, {absent} absent");
+    assert!(unparsed.is_empty(), "{unparsed:?}");
+
+    // The nine playable characters: 74 scripts each; the ones the choreography reads (0 to 45) all decode to their end,
+    // and the common scripts play the same clips in all nine.
+    let shared: [(usize, &[u8]); 10] = [
+        (0, &[0]),
+        (1, &[1]),
+        (3, &[3]),
+        (4, &[4]),
+        (5, &[15]),
+        (7, &[18]),
+        (13, &[7]),
+        (17, &[3, 12, 13, 14, 4]),
+        (32, &[3, 9, 4]),
+        (33, &[3, 10, 4]),
+    ];
+    for c in BattleCharacter::ALL.into_iter().filter(|c| *c != BattleCharacter::Sephiroth) {
+        let model = models.load_character(c).unwrap();
+        assert_eq!(model.scripts.len(), 74, "{c:?}");
+        for (i, script) in model.scripts.iter().enumerate().take(46) {
+            assert!(script.terminated, "{c:?}: script {i} does not decode to its end");
+        }
+        for (index, clips) in shared {
+            assert_eq!(model.scripts[index].clips(), clips, "{c:?}: script {index}");
+        }
+        assert_eq!(model.scripts[12].clips().first(), Some(&2), "{c:?}: the victory script starts with slot 2");
+        // Every clip a script plays is a slot of the pack.
+        for (i, script) in model.scripts.iter().enumerate().take(46) {
+            for clip in script.clips() {
+                assert!(usize::from(clip) < model.animations.len(), "{c:?}: script {i} plays slot {clip} of {}", model.animations.len());
+            }
+        }
+        // The two blows: script 20 and 21 each strike (they mark the damage) and end by returning the actor or hopping
+        // back.
+        for index in [20usize, 21] {
+            let script = &model.scripts[index];
+            assert!(script.uses(super::script::code::DAMAGE) || script.uses(super::script::code::DAMAGE_QUIET), "{c:?}: script {index} marks no damage");
+        }
+        let _: &Script = &model.scripts[0];
+    }
+    // The table of Sephiroth, who is not in the party, has absent scripts.
+    assert!(models.load_character(BattleCharacter::Sephiroth).unwrap().scripts.iter().all(|s| s.terminated || s.ops.is_empty()));
+}

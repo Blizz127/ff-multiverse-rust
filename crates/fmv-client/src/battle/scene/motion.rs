@@ -329,7 +329,11 @@ impl Director {
                 // target with a strong effect (see `land`).
                 Some(ActionRef::Magic(_) | ActionRef::Limit(_)) if self.sides[pi] == Side::Party => Shape::Cast,
                 Some(ActionRef::Magic(_) | ActionRef::Limit(_)) => Shape::Stand { strike: kit.plain.map(|slot| plan::Strike { slot, impact: 0.5 }) },
-                Some(ActionRef::Item(_)) => Shape::Stand { strike: plan::item_strike(kit) },
+                // Thrown at an enemy it is the throw forward, used on an ally the gesture with the arm raised.
+                Some(ActionRef::Item(_)) => {
+                    let at_enemy = targets.iter().any(|&t| self.anchor(t).is_some_and(|(i, _)| self.sides[i] == Side::Enemy));
+                    Shape::Stand { strike: plan::item_strike(kit, at_enemy) }
+                }
                 Some(ActionRef::Defend) => Shape::Guard,
                 // Running has no clip of its own here: a failed attempt only stumbles (below), a successful one
                 // makes the whole party run off (`on_escape`, which plays the run clip).
@@ -343,8 +347,10 @@ impl Director {
             };
             self.segments[pi].extend(performance.segments);
             cap(&mut self.segments[pi]);
+            // The plan says how far the actor goes: the whole way for a runner, a hop's length for a character whose
+            // script hops.
             if let Some(lunge) = performance.lunge {
-                self.effects.push(Effect::Lunge { actor: pi, lunge, reach, dir });
+                self.effects.push(Effect::Lunge { actor: pi, lunge, reach: performance.reach, dir });
             }
             // A spell's caster glows while it gathers the spell, a limit's performer while it gathers its power.
             if matches!(action, Some(ActionRef::Magic(_) | ActionRef::Limit(_))) {
@@ -386,10 +392,11 @@ impl Director {
 
     /// The shape of a blow: runs up to its target when `melee` and there is ground to cover, plays the
     /// clip its attack names (for an enemy: `attack`'s slot, else its first attack's), or a party
-    /// member's own attack clip.
+    /// member's own blow, the clips of its animation script ([`Shape::Blow`]: its short-range script when `melee`,
+    /// its long-range one otherwise).
     fn strike_shape(&self, kit: &Kit, attack: Option<u16>, melee: bool, reach: f32, actor: usize) -> Shape {
         let strike = match self.sides[actor] {
-            Side::Party => plan::party_strike(kit),
+            Side::Party => return Shape::Blow { reach, melee },
             // The clip its attack names; an attack whose clip cannot be played moves procedurally (it does not
             // borrow another attack's); a plain attack, or an id the scene does not name, plays its first.
             Side::Enemy => match attack.and_then(|id| kit.attack_clip(id)) {
