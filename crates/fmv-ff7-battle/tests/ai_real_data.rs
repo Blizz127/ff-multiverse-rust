@@ -534,6 +534,131 @@ fn guard_scorpion_answers_a_blow_with_its_tail_laser_only_while_its_tail_is_up()
     assert_eq!(state.outcome(), None);
 }
 
+/// The same arena, with the enemy of `slot` starting poisoned with `hp` left of 3200 (so that every turn of Poison takes 100 of it): it
+/// dies on the clock, `hp / 100` turns of Poison in. One plain dummy keeps the battle going when `others` is 1.
+fn poisoned_arena(scene: &Scene, slot: usize, seed: u64, hp: u32, others: usize) -> BattleState {
+    use fmv_ff7_battle::status::{Status, StatusState};
+    let record = scene.enemies[slot].as_ref().expect("enemy record");
+    let mut foe = Combatant::from_enemy_in_scene(scene, slot, record);
+    foe.max_hp = 3200;
+    foe.hp = hp;
+    foe.status = StatusState::starting([Status::Poison].into_iter().collect());
+    foe.status_immune = fmv_ff7_battle::status::StatusSet::EMPTY;
+    let mut party = party(0);
+    party[0].dex = 255;
+    let mut foes = vec![foe];
+    foes.extend((0..others).map(|i| Combatant::new(format!("Dummy {i}"), 1, 100_000)));
+    BattleState::with_config(seed, party, foes, BattleConfig { start: StartMode::Zero, ..BattleConfig::default() })
+}
+
+#[test]
+#[ignore = "needs FMV_FF7_DATA pointing at the owner's FF7 data directory"]
+fn guard_scorpion_killed_by_poison_on_the_clock_runs_its_death_counter() {
+    let Some(bin) = load() else { return };
+    let (scene_index, slot) = bin.find_enemies_by_name("Guard Scorpion")[0];
+    let scene = bin.scene(scene_index).unwrap();
+    let foe = ActorId(3);
+    let tail_down = 288u16;
+    // How many turns of Main the Scorpion has played when Poison kills it, for several amounts of HP left.
+    type Answers = Vec<(u16, Vec<u8>)>;
+    let mut seen: Vec<(u32, u32, Answers)> = Vec::new();
+    for turns_of_poison in [8u32, 14, 20, 26, 32] {
+        let mut state = poisoned_arena(scene, slot, 2, turns_of_poison * 100, 1);
+        let mut died_in = None;
+        for _ in 0..200_000 {
+            let events = state.step_ticks(1);
+            if events.contains(&BattleEvent::Death { actor: foe }) {
+                died_in = Some(events);
+                break;
+            }
+        }
+        let events = died_in.unwrap_or_else(|| panic!("{turns_of_poison}: poison never killed it"));
+        let turns = state.actors()[3].ai.as_ref().unwrap().stats().turns;
+        seen.push((turns_of_poison, turns, answers(&events, foe)));
+        eprintln!("Guard Scorpion, {turns_of_poison} turns of Poison from death: it had played {turns} turns of Main; the death's step: {:?}", answers(&events, foe));
+    }
+    // While its tail is up (after its fifth turn and before its eighth) the Death counter plays the tail coming down: an attack announced with
+    // nothing to do, in the very step of the death, as when a blow kills it.
+    let tail_up: Vec<&(u32, u32, Answers)> = seen.iter().filter(|(_, turns, _)| (5..8).contains(turns)).collect();
+    assert!(!tail_up.is_empty(), "some death came with the tail up: {seen:?}");
+    for (_, _, got) in &tail_up {
+        assert_eq!(got, &vec![(tail_down, Vec::<u8>::new())]);
+    }
+    // Before its tail is up (fewer than five turns) it has no answer to its death, as when a blow kills it.
+    for (_, turns, got) in seen.iter().filter(|(_, turns, _)| *turns < 5) {
+        assert!(got.is_empty(), "{turns} turns: {got:?}");
+    }
+    // The last enemy that Poison kills ends the battle, and nothing is played after that.
+    let mut state = poisoned_arena(scene, slot, 2, 3200, 0);
+    let mut last = Vec::new();
+    for _ in 0..200_000 {
+        last = state.step_ticks(1);
+        if state.outcome().is_some() {
+            break;
+        }
+    }
+    assert_eq!(last.last(), Some(&BattleEvent::Victory), "{last:?}");
+    assert!(answers(&last, foe).is_empty(), "no counter once the battle is won: {last:?}");
+}
+
+/// Over every enemy of the scene.bin that has scripts: the attacks their scripts queue that have ONLY a status (a curse on the party, a
+/// buff on themselves) are carried out in real battles (the party strikes too): counts and ids only.
+#[test]
+#[ignore = "needs FMV_FF7_DATA pointing at the owner's FF7 data directory"]
+fn scripted_attacks_with_only_a_status_are_carried_out_in_real_battles() {
+    use fmv_ff7_battle::action::{ActionSpec, Formula};
+    use fmv_ff7_battle::rules::Command;
+    let Some(bin) = load() else { return };
+    let (mut casters, mut inflicting, mut announced, mut landed) = (0usize, 0usize, 0usize, 0usize);
+    let (mut on_party, mut on_self) = (0usize, 0usize);
+    let foe = ActorId(3);
+    for (_, (scene_index, slot)) in distinct_enemies(&bin) {
+        let scene = bin.scene(scene_index).unwrap();
+        if scene.ai.enemy(slot).is_none() {
+            continue;
+        }
+        let (mut cast_by_it, mut landed_by_it) = (false, false);
+        for seed in 0..3u64 {
+            let mut state = arena(scene, slot, seed, Some(5_000_000), 0);
+            for _ in 0..120_000u32 {
+                let events = state.step_ticks(1);
+                for who in state.ready_actors() {
+                    if who != foe {
+                        let _ = state.submit_command(who, Command::Attack { target: foe });
+                    }
+                }
+                let mut status_only = false;
+                for e in &events {
+                    if let BattleEvent::Action { actor, action: ActionRef::EnemyAttack(id) } = e {
+                        status_only = *actor == foe
+                            && scene.attack_by_id(*id).and_then(|a| ActionSpec::from_attack(&a.record)).is_some_and(|s| s.formula == Formula::None);
+                        announced += usize::from(status_only);
+                        cast_by_it |= status_only;
+                    }
+                    if let (true, BattleEvent::StatusInflicted { target, .. } | BattleEvent::StatusEnded { target, .. }) = (status_only, e) {
+                        landed += 1;
+                        landed_by_it = true;
+                        if target.0 == foe.0 {
+                            on_self += 1;
+                        } else if target.0 < 3 {
+                            on_party += 1;
+                        }
+                    }
+                }
+                if state.actors()[3].ai.as_ref().unwrap().stats().turns >= 30 {
+                    break;
+                }
+            }
+        }
+        casters += usize::from(cast_by_it);
+        inflicting += usize::from(landed_by_it);
+    }
+    eprintln!("{casters} enemies cast an attack with only a status in their scripts ({announced} casts); {inflicting} of them saw a status land ({landed} landings: {on_party} on the party, {on_self} on the caster)");
+    assert!(casters >= 30, "enemies with such a cast: {casters}");
+    assert!(inflicting * 10 >= casters * 8, "most of them inflict something: {inflicting} of {casters}");
+    assert!(on_party > 0 && on_self > 0, "curses on the party and buffs on the caster both land");
+}
+
 #[test]
 #[ignore = "needs FMV_FF7_DATA pointing at the owner's FF7 data directory"]
 fn the_first_reactors_enemies_never_fall_back_in_the_engine() {

@@ -94,11 +94,14 @@
 //!   (`0x40D0` ...), not the command or the action that struck (`0x2000`, `0x2008`, `0x2150`, `0x2120`), the
 //!   flags of the blow (`0x4027`, "the attack lands") or the statuses it inflicts; a counter that reads them
 //!   cannot be followed and is skipped.
-//! * Statuses other than Death are not modelled by the engine, so the scripts read them as clear.
+//! * The scripts read the statuses the rules play ([`crate::status::MODELLED`]) and Death and Near-death from the
+//!   engine; every other status bit reads as clear.
 //! * An attack may be one the scene defines (its table); an attack the scene does not define falls back for
 //!   that turn. (Attacks below `0x100` are the kernel's standard spells, which a scene that uses one carries
-//!   its own copy of: Mono Drive's Fire plays.) An attack the scene defines but the rules cannot play (no
-//!   damage, healing, a status) is announced and has no effect.
+//!   its own copy of: Mono Drive's Fire plays.) An attack the scene defines that has only a status plays
+//!   ([`crate::rules::Combatant::status_actions`]: a curse on the party, a buff on the enemy itself or on its
+//!   side; it costs no MP). An attack the scene defines but the rules cannot play (an animation: no damage, no
+//!   healing, no status they model) is announced and has no effect.
 //! * A target mask of several actors is [`Target::AllEnemies`] / [`Target::AllAllies`] only when it is
 //!   exactly the living side; any other mix falls back. The engine plays [`Target::AllEnemies`] (the whole
 //!   party) as one attack announced once and played on each living member in turn by the whole-side rules
