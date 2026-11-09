@@ -29,10 +29,11 @@
 //! # When a number is born
 //!
 //! Not when its event arrives: when the blow LANDS. [`Popups::on_events`] groups the batch into
-//! performances ([`cue::cues`]) and schedules each number [`cue::impact_delay`] after the batch's
-//! arrival, the very instant the scene's impact frame is played at (see [`cue`] for why the two
-//! agree without talking), never more than [`cue::MAX_IMPACT_DELAY`] later. A popup that is not
-//! born yet is not in [`Popups::views`].
+//! performances ([`cue::cues`]) and schedules each number [`cue::impact_delay`] after its performance
+//! begins, the very instant the scene's impact frame is played at (see [`cue`] for why the two
+//! agree without talking): never more than [`cue::MAX_IMPACT_DELAY`] after the batch's arrival for the
+//! first performance of a batch, and for a counter or any later one after the performance before it is
+//! over ([`cue::Cue::start`]). A popup that is not born yet is not in [`Popups::views`].
 //!
 //! Popups over one fighter that are on screen together (a second hit lands while the first number is
 //! still rising) are kept apart where they are drawn, newest lowest: see `panels::draw_popups`.
@@ -134,9 +135,10 @@ impl Popups {
         self.live.clear();
     }
 
-    /// A popup over `target` that appears at `at` (seconds on the client's clock).
+    /// A popup over `target` that appears at `at` (seconds on the client's clock): at the arrival of its batch or, for a
+    /// blow that has to land first, later (the oldest are dropped when too many are waiting; the ones that are over are
+    /// dropped by [`Popups::on_events`], by the clock of the batch that arrives, never by the birth of a later one).
     pub fn push(&mut self, at: f64, target: ActorId, kind: PopupKind) {
-        self.live.retain(|p| at - p.at < LIFETIME_S);
         if self.live.len() >= MAX_POPUPS {
             self.live.remove(0);
         }
@@ -144,14 +146,15 @@ impl Popups {
         self.live.insert(place, Born { target, kind, at });
     }
 
-    /// The popups the events of a batch that arrived at `now` make: each when its blow lands
-    /// ([`cue::delay_of`]), not when it arrived.
+    /// The popups the events of a batch that arrived at `now` make: each when its blow lands ([`cue::Cue::delay_of`]: the
+    /// performance's own start, one after the other, and then its impact), not when it arrived.
     pub fn on_events(&mut self, now: f64, events: &[BattleEvent]) {
+        // What is over by now is forgotten; what is born later (a counter's number, waiting for the blow before it) is not.
+        self.live.retain(|p| now - p.at < LIFETIME_S);
         for cue in cue::cues(events) {
-            let action = cue.action.map(|(_, a)| a);
             for event in cue.events {
                 if let Some((target, kind)) = popup_of(event) {
-                    self.push(now + cue::delay_of(action, event), target, kind);
+                    self.push(now + cue.delay_of(event), target, kind);
                 }
             }
         }
@@ -210,21 +213,40 @@ mod tests {
         );
         // Nothing is up the moment the batch arrives: every blow still has to land.
         assert!(p.views(1.0).is_empty());
-        // By the cap they are all up, in the order they land: the effects no action announced first
-        // (the short beat), then the two items, then the spell (the longest cast).
-        let kinds: Vec<(u8, PopupKind)> = p.views(1.0 + cue::MAX_IMPACT_DELAY).iter().map(|v| (v.target.0, v.kind)).collect();
+        // They come up in the order the performances are played, one after the other: the effects no action announced
+        // first (the short beat), then the spell, then the two items (the actions of a batch do not land together, see `cue`).
+        let kinds = |p: &Popups| -> Vec<(u8, PopupKind)> { p.live.iter().map(|b| (b.target.0, b.kind)).collect() };
         assert_eq!(
-            kinds,
+            kinds(&p),
             [
                 (3, PopupKind::Damage { amount: 120, critical: false }),
                 (4, PopupKind::Damage { amount: 999, critical: true }),
                 (5, PopupKind::Miss),
+                (1, PopupKind::Heal { amount: 271 }),
                 (2, PopupKind::Mp { amount: 100 }),
                 (0, PopupKind::Heal { amount: 88 }),
-                (1, PopupKind::Heal { amount: 271 }),
             ],
             "a revival floats the HP the fighter came back with, like a heal"
         );
+        // The first three land with the beat, the spell's heal after that beat is over and its own impact, the items after the
+        // spell is over.
+        let beat = cue::length_of(None);
+        let (spell, item) = (cue::length_of(Some(ActionRef::Magic(0))), cue::length_of(Some(ActionRef::Item(3))));
+        let births: Vec<f64> = p.births().iter().map(|(_, at)| *at).collect();
+        let want = [
+            1.0 + cue::impact_delay(None),
+            1.0 + cue::impact_delay(None),
+            1.0 + cue::impact_delay(None),
+            1.0 + beat + cue::impact_delay(Some(ActionRef::Magic(0))),
+            1.0 + beat + spell + cue::impact_delay(Some(ActionRef::Item(3))),
+            1.0 + beat + spell + item + cue::impact_delay(Some(ActionRef::Item(7))),
+        ];
+        assert!(births.iter().zip(want).all(|(got, want)| (got - want).abs() < 1e-9), "{births:?} against {want:?}");
+        assert!(births.windows(2).all(|w| w[0] <= w[1]) && births[5] - 1.0 <= cue::MAX_BATCH_SPAN, "in order, and within the span of a batch");
+        // The first three are up before the spell is: a counter does not float its number over the blow it answers.
+        let up_by = |p: &Popups, at: f64| p.views(at).iter().map(|v| v.target.0).collect::<Vec<_>>();
+        assert_eq!(up_by(&p, 1.0 + cue::impact_delay(None) + 0.01), [3, 4, 5]);
+        assert_eq!(up_by(&p, want[3] + 0.01), [3, 4, 5, 1]);
         assert_eq!(PopupKind::Damage { amount: 120, critical: false }.text(), "120");
         assert_eq!(PopupKind::Miss.text(), "Miss");
         assert_eq!(PopupKind::Heal { amount: 7 }.text(), "7");
@@ -281,9 +303,12 @@ mod tests {
         assert!(p.views(10.0 + LIFETIME_S + 0.001).is_empty(), "gone at the end of its life");
         // A clock that went backwards finds a popup that is not born yet: nothing, not an age out of nothing.
         assert!(p.views(9.0).is_empty());
-        // Pushing prunes what has expired.
-        p.push(20.0, ActorId(4), PopupKind::Miss);
+        // The clock of a batch that arrives forgets what has expired (never the birth of a later popup of the same batch:
+        // that one has not landed yet, and the ones before it have to be seen first).
+        p.on_events(20.0, &[BattleEvent::Miss { actor: ActorId(0), target: ActorId(4) }]);
         assert_eq!(p.live.len(), 1);
+        p.push(20.0 + 3.0 * LIFETIME_S, ActorId(5), PopupKind::Miss);
+        assert_eq!(p.live.len(), 2, "pushing one that is born much later drops nothing");
     }
 
     #[test]

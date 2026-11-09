@@ -116,7 +116,7 @@ use crate::headless::encode_name;
 use crate::progress::slot_name;
 use fmv_core::{AccountId, Fingerprint};
 use fmv_ff7_battle::rules::{Aim, BattleState, Combatant, Target, GAUGE_MAX};
-use fmv_protocol::battle::{BattleEvent, Command, Outcome};
+use fmv_protocol::battle::{ActionRef, BattleEvent, Command, Outcome};
 use fmv_protocol::{
     ActorId, AppliedCommand, BattleId, BattleMember, BattleRejection, BattleReplay, BattleReward, BattleRules, BattleSetup, ClientMsg,
     InventoryEntry, ServerMsg, MAX_CHARACTER_NAME_CHARS, MAX_INVENTORY_STACKS,
@@ -341,6 +341,9 @@ pub struct ActiveBattle {
     my_commands: Applied,
     /// The status events the server announced in this battle.
     statuses: StatusCounts,
+    /// The enemy attacks that answered a command (an enemy's counter scripts run inside the command that provoked them, so
+    /// every enemy attack in the events of a COMMAND is one): what the server counts too.
+    counters: u64,
 }
 
 impl ActiveBattle {
@@ -725,6 +728,7 @@ impl BattleClient {
             messages: 0,
             my_commands: Applied::default(),
             statuses: StatusCounts::default(),
+            counters: 0,
         });
         if let Some(why) = failure {
             self.diverged(why);
@@ -756,25 +760,30 @@ impl BattleClient {
             self.events.push_back(*event);
         }
         // The statuses the server announced: counted, and each one that came or went said in a note.
-        let mut status_notes = Vec::new();
+        let mut event_notes = Vec::new();
         for event in events {
             match *event {
                 BattleEvent::StatusInflicted { target, status } => {
                     active.statuses.inflicted += 1;
-                    status_notes.push(format!("status: inflicted actor={} status={}", target.0, status.name()));
+                    event_notes.push(format!("status: inflicted actor={} status={}", target.0, status.name()));
                 }
                 BattleEvent::StatusEnded { target, status } => {
                     active.statuses.ended += 1;
-                    status_notes.push(format!("status: ended actor={} status={}", target.0, status.name()));
+                    event_notes.push(format!("status: ended actor={} status={}", target.0, status.name()));
                 }
                 BattleEvent::StatusTick { .. } => active.statuses.ticks += 1,
+                // An enemy that acts in the batch of a command is answering it (a command never advances the clock).
+                BattleEvent::Action { actor, action: ActionRef::EnemyAttack(attack) } if command.is_some() => {
+                    active.counters += 1;
+                    event_notes.push(format!("counter: actor={} attack={attack}", actor.0));
+                }
                 _ => {}
             }
         }
         // Floating numbers and the menu follow the events, whether or not this machine can replay them.
         self.hud.on_events(now, events, my_command);
         let Some(replay) = active.replay.as_mut() else {
-            for line in status_notes {
+            for line in event_notes {
                 self.note(line);
             }
             return;
@@ -782,7 +791,7 @@ impl BattleClient {
         if let Err(d) = replay.apply(tick, events, command.as_ref()) {
             self.diverged(format!("{battle_id} at tick {tick}: {d}"));
         }
-        for line in status_notes {
+        for line in event_notes {
             self.note(line);
         }
         // What the menu offers follows the replay: a limit gauge moves with these messages (and nowhere else).
@@ -839,6 +848,7 @@ impl BattleClient {
         self.applied.add(active.my_commands);
         let counts = active.statuses;
         self.note(format!("status: {battle_id} inflicted={} ended={} ticks={}", counts.inflicted, counts.ended, counts.ticks));
+        self.note(format!("counter: {battle_id} counters={}", active.counters));
         self.note(format!(
             "{battle_id} ended in {outcome:?} ({paid}); back in the field; {} command(s) of yours applied; {how}",
             active.my_commands.total()

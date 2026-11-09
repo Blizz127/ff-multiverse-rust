@@ -15,9 +15,10 @@
 //! * [`model`]: where each actor's model comes from ([`BattleActorModel`]: a field model, a real
 //!   battle model, or a box) and who decides ([`BattleModelSource`]): the real models of the
 //!   machine's own `battle.lgp` when the client found one ([`model::ArchiveModels`]), stand-ins otherwise.
-//! * [`cue`]: a batch of events as performances, and WHEN each lands (the one table the overlay's
+//! * [`cue`]: a batch of events as performances, and WHEN each begins and lands (the one table the overlay's
 //!   numbers and the scene share, so that the numbers appear at the impact frame without the two
-//!   talking; never later than [`cue::MAX_IMPACT_DELAY`] after the events arrived).
+//!   talking; the first performance of a batch lands at most [`cue::MAX_IMPACT_DELAY`] after the events
+//!   arrived, and a counter or any later one begins when the one before it is over).
 //! * [`clips`]: which slot of a real battle model plays what (attack, cast, hurt, death, victory...),
 //!   verified on contact sheets; a slot that is missing or not the slot's own clip is never played.
 //! * [`plan`]: time-warps a performance's clips so that the impact frame lands on schedule: faster
@@ -42,7 +43,8 @@
 //!
 //! The engine's state (the bars, the menu, who is alive) moves when a message arrives; the scene is
 //! presentation and **nothing waits on it**. A performance's impact lands at most
-//! [`cue::MAX_IMPACT_DELAY`] after its events arrived, however long its clips are, and an actor that
+//! [`cue::MAX_IMPACT_DELAY`] after the performance begins (the first one of a batch begins when the events
+//! arrive, the next ones one after the other, see [`cue`]), however long its clips are, and an actor that
 //! is given a new performance takes it over from its start.
 //!
 //! # Data flow

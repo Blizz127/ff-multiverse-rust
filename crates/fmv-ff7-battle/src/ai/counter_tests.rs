@@ -1,8 +1,9 @@
 //! Counter scripts inside a running battle: who answers which blow and in what order, what an answer that
 //! cannot be followed leaves behind (nothing), and that a replay of the same inputs agrees exactly.
 
-use crate::action::{ActionSpec, Spell};
+use crate::action::{ActionSpec, EnemyAction, Spell, StatusEffect};
 use crate::rules::{ActionRef, ActorId, BattleEvent, BattleState, Combatant, Command, Outcome, Target};
+use crate::status::{Status, StatusState};
 
 use super::asm::{battle_with, count_in, foe_with, laser, party_of, plain_foe, scripted_foe, Asm, ATTACK, LASER, OTHER};
 use super::script::{op, slot};
@@ -453,6 +454,14 @@ fn random_scripts_in_every_slot_never_panic_the_engine_and_a_replay_always_agree
                 foe.actions.push(laser());
                 foe.hp = 60 + (next() % 300) as u32;
                 foe.max_hp = foe.hp;
+                // OTHER is an attack with only a status here: a curse on whoever it is aimed at or a buff (the scripts aim at the party,
+                // at the foe itself and at its side by the dice), and a third of the foes are poisoned, so that some die on the clock.
+                let buff = next() % 2 == 0;
+                let effect = if buff { StatusEffect::inflict(Status::Barrier, 63) } else { StatusEffect::inflict(Status::Sleep, 40) };
+                foe.status_actions.push(EnemyAction { id: OTHER, spec: ActionSpec { mp_cost: 4, ..ActionSpec::status_item(effect, buff) } });
+                if next() % 3 == 0 {
+                    foe.status = StatusState::starting([Status::Poison].into_iter().collect());
+                }
                 foe
             })
             .collect();
@@ -477,4 +486,205 @@ fn random_scripts_in_every_slot_never_panic_the_engine_and_a_replay_always_agree
     // The scripts did something in a good share of the battles, as counters and as Main turns.
     assert!(answered >= 15, "commands answered by a counter: {answered}");
     assert!(enemy_turns >= 100, "enemy turns with an attack: {enemy_turns}");
+}
+
+// --- attacks that have only a status, and an enemy that Poison kills -----------------------------------------------
+
+/// An attack with only a status that the invented scene defines at 4 MP ([`OTHER`]), as a foe's status action: Sleep on whoever it is
+/// aimed at, which never misses, or Barrier on its own side (`buff`).
+fn status_attack(buff: bool) -> EnemyAction {
+    let effect = if buff { StatusEffect::inflict(Status::Barrier, 63) } else { StatusEffect::inflict(Status::Sleep, 63) };
+    EnemyAction { id: OTHER, spec: ActionSpec { mp_cost: 4, ..ActionSpec::status_item(effect, buff) } }
+}
+
+/// `targets = <mask>; act(OTHER); end` for the mask at `field` (`0x20A0` the foe's enemies, `0x2060` itself, `0x2080` its side).
+fn cast_at(field: u16) -> Asm {
+    Asm::default().addr(2, 0x2070).val(2, field).op(op::STORE).k1(0x20).k2(OTHER).op(op::ACT).op(op::END)
+}
+
+/// Steps until the foe's next action is announced: the events of that step.
+fn until_foe_acts(state: &mut BattleState) -> Vec<BattleEvent> {
+    for _ in 0..5000 {
+        let events = state.step_ticks(1);
+        if events.iter().any(|e| matches!(e, BattleEvent::Action { actor, .. } if *actor == FOE)) {
+            return events;
+        }
+    }
+    panic!("the foe never acted");
+}
+
+#[test]
+fn a_scripted_attack_with_only_a_status_is_played_on_whomever_the_script_aims_it_at_and_costs_no_mp() {
+    // A curse aimed at the whole party: both members fall asleep, the foe pays nothing, and it was one announcement.
+    let mut foe = scripted_foe(None, &cast_at(0x20A0));
+    foe.status_actions.push(status_attack(false));
+    foe.mp = 20;
+    foe.max_mp = 20;
+    let mut state = battle_with(3, party(), vec![foe]);
+    let events = until_foe_acts(&mut state);
+    assert_eq!(events.iter().filter(|e| matches!(e, BattleEvent::Action { .. })).count(), 1, "{events:?}");
+    for who in [CLOUD, BARRET] {
+        assert!(events.contains(&BattleEvent::StatusInflicted { target: who, status: Status::Sleep }), "{who:?}: {events:?}");
+        assert!(state.has_status(who, Status::Sleep));
+    }
+    assert!(!events.iter().any(|e| matches!(e, BattleEvent::MpSpent { .. })), "a status-only attack costs no MP: {events:?}");
+    assert_eq!(state.actor(FOE).unwrap().mp, 20);
+    // The same script without the action (the scene's attack the rules do not play) is announced and does nothing.
+    let mut state = battle_with(3, party(), vec![scripted_foe(None, &cast_at(0x20A0))]);
+    let events = until_foe_acts(&mut state);
+    assert_eq!(shape(&events).iter().filter(|s| s.starts_with("2:enemy111")).count(), 1, "{events:?}");
+    assert!(!events.iter().any(|e| matches!(e, BattleEvent::StatusInflicted { .. })), "{events:?}");
+    assert!(!state.has_status(CLOUD, Status::Sleep));
+    // Not enough MP is no reason to refuse it (the turn is followed, not handed to the plain behaviour).
+    let mut broke = scripted_foe(None, &cast_at(0x20A0));
+    broke.status_actions.push(status_attack(false));
+    broke.mp = 0;
+    let mut state = battle_with(3, party(), vec![broke]);
+    let events = until_foe_acts(&mut state);
+    assert!(events.contains(&BattleEvent::StatusInflicted { target: CLOUD, status: Status::Sleep }), "{events:?}");
+    assert_eq!(state.actor(FOE).unwrap().ai.as_ref().unwrap().stats().fallbacks, 0);
+}
+
+#[test]
+fn a_scripted_buff_lands_on_the_enemy_that_casts_it_and_on_its_side_and_the_script_sees_it() {
+    // On itself.
+    let mut foe = scripted_foe(None, &cast_at(0x2060));
+    foe.status_actions.push(status_attack(true));
+    let mut state = battle_with(3, party(), vec![foe]);
+    let events = until_foe_acts(&mut state);
+    assert!(events.contains(&BattleEvent::StatusInflicted { target: FOE, status: Status::Barrier }), "{events:?}");
+    assert!(state.has_status(FOE, Status::Barrier));
+    assert!(!state.has_status(CLOUD, Status::Barrier) && !state.has_status(BARRET, Status::Barrier), "nothing for the party");
+    // The status word the scripts read now says so: bit 16 of the foe's own `0x4000` (script slot 4 in a battle of two).
+    let attacks = super::asm::attacks();
+    let world = super::world::BattleWorld::new(&state, 2, &attacks).unwrap();
+    assert_eq!(super::vm::World::actor_field(&world, 4, 0x4000, 3), Some(Status::Barrier.bit()));
+    // On its whole side (the allies mask, itself included): the foe next to it gets it too.
+    let mut caster = scripted_foe(None, &cast_at(0x2080));
+    caster.status_actions.push(status_attack(true));
+    let mut state = battle_with(3, party(), vec![caster, plain_foe()]);
+    let events = until_foe_acts(&mut state);
+    for who in [FOE, ActorId(3)] {
+        assert!(events.contains(&BattleEvent::StatusInflicted { target: who, status: Status::Barrier }), "{who:?}: {events:?}");
+    }
+    assert!(!state.has_status(CLOUD, Status::Barrier));
+}
+
+/// A foe that has a Death counter (a strike at the whole party with the Laser) and Poison, with `hp` left, and a second, plain foe so that
+/// the battle goes on when it falls (none without `second`).
+fn poisoned_with_a_death_counter(hp: u32, second: bool) -> BattleState {
+    let death = count_in(DEATH_RAN).then(&Asm::act_on(|a| a.val(2, 0x20A0), LASER)).op(op::END);
+    let mut foe = foe_with(&[(slot::MAIN, &pass()), (slot::DEATH_COUNTER, &death)]);
+    foe.actions.push(laser());
+    foe.max_hp = 320;
+    foe.hp = hp;
+    foe.status = StatusState::starting([Status::Poison].into_iter().collect());
+    let mut foes = vec![foe];
+    if second {
+        let mut other = plain_foe();
+        other.hp = 5000;
+        other.max_hp = 5000;
+        foes.push(other);
+    }
+    battle_with(3, party(), foes)
+}
+
+/// Steps until `who` falls: the events of the step in which it did.
+fn until_it_falls(state: &mut BattleState, who: ActorId) -> Vec<BattleEvent> {
+    for _ in 0..20_000 {
+        let events = state.step_ticks(1);
+        if events.contains(&BattleEvent::Death { actor: who }) {
+            return events;
+        }
+    }
+    panic!("{who:?} never fell");
+}
+
+#[test]
+fn a_foe_killed_by_poison_on_the_clock_runs_its_death_counter_in_the_same_step() {
+    let mut state = poisoned_with_a_death_counter(5, true);
+    let events = until_it_falls(&mut state, FOE);
+    // The turn of Poison, the death, then its answer: the Laser on the whole party, announced once.
+    assert_eq!(
+        shape(&events),
+        vec![
+            format!("{:?}", BattleEvent::StatusTick { target: FOE, status: Status::Poison, amount: 10 }),
+            "x2".to_string(),
+            "2:enemy112".to_string(),
+            "2>0".to_string(),
+            "2>1".to_string()
+        ],
+        "{events:?}"
+    );
+    assert_eq!(ran(&state, FOE, DEATH_RAN), 1);
+    assert_eq!(state.outcome(), None, "the other foe fights on");
+    // Nobody struck it, so nobody is noted as its attacker.
+    assert_eq!(memory(&state, FOE).last_attacker(), 0);
+    let stats = state.actor(FOE).unwrap().ai.as_ref().unwrap().stats();
+    assert_eq!((stats.counters, stats.counters_skipped), (1, 0));
+    // It does not answer twice: its clock is over.
+    for _ in 0..3000 {
+        assert!(!state.step_ticks(1).iter().any(|e| matches!(e, BattleEvent::Action { actor, .. } if *actor == FOE)));
+    }
+}
+
+#[test]
+fn the_last_foe_that_poison_kills_ends_the_battle_without_a_counter() {
+    let mut state = poisoned_with_a_death_counter(5, false);
+    let events = until_it_falls(&mut state, FOE);
+    assert_eq!(events.last(), Some(&BattleEvent::Victory), "{events:?}");
+    assert!(!events.iter().any(|e| matches!(e, BattleEvent::Action { .. })), "nothing is played once the battle has an outcome: {events:?}");
+    assert_eq!(ran(&state, FOE, DEATH_RAN), 0);
+    assert_eq!(state.outcome(), Some(Outcome::Victory));
+}
+
+#[test]
+fn a_death_counter_that_aims_at_the_attacker_finds_nobody_when_poison_did_it_and_is_skipped() {
+    // `targets = me.last_attacker; act(ATTACK)`: after a blow that is the one who struck, after Poison it is nobody.
+    let death = count_in(DEATH_RAN).then(&strike_back(0x40D0, ATTACK)).op(op::END);
+    let mut foe = foe_with(&[(slot::MAIN, &pass()), (slot::DEATH_COUNTER, &death)]);
+    foe.max_hp = 320;
+    foe.hp = 5;
+    foe.status = StatusState::starting([Status::Poison].into_iter().collect());
+    let mut state = battle_with(3, party(), vec![foe, plain_foe()]);
+    let events = until_it_falls(&mut state, FOE);
+    assert!(!events.iter().any(|e| matches!(e, BattleEvent::Action { actor, .. } if *actor == FOE)), "no attacker, no answer: {events:?}");
+    assert_eq!(state.actor(FOE).unwrap().ai.as_ref().unwrap().stats().counters_skipped, 1);
+    // The same counter after a blow answers the one who struck (the control).
+    let mut foe = foe_with(&[(slot::MAIN, &pass()), (slot::DEATH_COUNTER, &death)]);
+    foe.hp = 1;
+    let mut state = battle_with(3, party(), vec![foe, plain_foe()]);
+    let events = give(&mut state, BARRET, attack_on(FOE));
+    assert_eq!(shape(&events), vec!["1:attack", "1>2", "x2", "2:enemy110", "2>1"], "{events:?}");
+}
+
+#[test]
+fn statuses_cast_by_a_script_and_a_death_on_the_clock_replay_exactly() {
+    // One foe curses the party every turn, one is poisoned with a Death counter: every slice size replays to the same state.
+    let main = cast_at(0x20A0);
+    let death = count_in(DEATH_RAN).then(&Asm::act_on(|a| a.val(2, 0x20A0), LASER)).op(op::END);
+    let build = || {
+        // The party can hurt (one blow beats the caster), so that the battle ends and the messages are all of it.
+        let mut people = party();
+        for member in &mut people {
+            member.attack = 100;
+        }
+        let mut caster = foe_with(&[(slot::MAIN, &main)]);
+        caster.status_actions.push(status_attack(false));
+        caster.hp = 30;
+        caster.max_hp = 400;
+        let mut sick = foe_with(&[(slot::MAIN, &pass()), (slot::DEATH_COUNTER, &death)]);
+        sick.actions.push(laser());
+        sick.max_hp = 320;
+        sick.hp = 40;
+        sick.status = StatusState::starting([Status::Poison].into_iter().collect());
+        battle_with(17, people, vec![caster, sick])
+    };
+    for slice in [1u64, 7, 50] {
+        let (log, server_state) = serve(build, slice);
+        let all: Vec<&BattleEvent> = log.iter().flat_map(|(_, events, _)| events).collect();
+        assert!(all.iter().any(|e| matches!(e, BattleEvent::StatusInflicted { status: Status::Sleep, .. })), "slice {slice}: the curse was cast");
+        assert!(all.iter().any(|e| matches!(e, BattleEvent::Death { actor } if actor.0 == 3)), "slice {slice}: the poisoned foe fell");
+        assert_eq!(replay(build, &log).as_deref(), Ok(server_state.as_str()), "slice {slice}");
+    }
 }

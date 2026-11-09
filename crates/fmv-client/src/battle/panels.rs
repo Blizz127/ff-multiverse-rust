@@ -291,21 +291,37 @@ const ENEMY_TAGS: usize = 3;
 const MIN_NAME_CELLS: usize = 6;
 /// Most status codes the party panel makes room for after a name.
 const MAX_PARTY_TAGS: usize = 3;
+/// Cells of a name the party panel keeps whatever the statuses ask for (the enemy list keeps as many).
+const MIN_PARTY_NAME_CELLS: usize = 6;
 
 /// Name first, then (when some row has statuses: `want_codes` is the most codes any row wants, at most three) the
 /// statuses, then HP, then MP with the bar, or the bar alone when MP does not fit too. The statuses take what they can
 /// from the bar (never below its shortest) and nothing from the HP and MP columns; without room they have no column.
+///
+/// When the room after a long name is not what the rows want, the statuses also take cells from the NAME, down to
+/// [`MIN_PARTY_NAME_CELLS`] and only as many as it takes to reach the room the rows want (or, when that cannot be had, the
+/// most that can): at the default 1100 x 680 a row that has more statuses than one code is then given two places, a code
+/// and the `+N` for the others, where it had one (and no sign of the rest).
 fn columns(inner_x: i32, inner_w: i32, want_codes: usize) -> Columns {
     let end = inner_x + inner_w;
     let name_x = inner_x + POINTER_W;
-    let name_cells = cells_in(end - name_x).clamp(1, NAME_CELLS);
-    let mut x = name_x + i32::try_from(name_cells).unwrap_or(1) * 8;
+    let mut name_cells = cells_in(end - name_x).clamp(1, NAME_CELLS);
+    let tail = COL_GAP + HP_W + COL_GAP + MP_W + COL_GAP + BAR_MIN;
+    let after_name = |name: usize| name_x + i32::try_from(name).unwrap_or(1) * 8;
+    // How many whole codes fit after a name of `name` cells with the HP, MP and the shortest bar kept behind them.
+    let room_after = |name: usize| tags::room(cells_in(end - after_name(name) - tail - COL_GAP));
+    if want_codes > 0 {
+        let target = room_after(MIN_PARTY_NAME_CELLS.min(name_cells)).min(want_codes.min(MAX_PARTY_TAGS));
+        while name_cells > MIN_PARTY_NAME_CELLS && room_after(name_cells) < target {
+            name_cells -= 1;
+        }
+    }
+    let mut x = after_name(name_cells);
     let mut cols = Columns { name_x, name_cells, tags: None, hp_x: None, mp_x: None, bar: None };
     // The statuses come right after the name, as many whole codes as are wanted and the rest allows (HP, MP and the
     // shortest bar keep their places behind them).
     if want_codes > 0 {
-        let tail = COL_GAP + HP_W + COL_GAP + MP_W + COL_GAP + BAR_MIN;
-        let codes = want_codes.min(MAX_PARTY_TAGS).min(tags::room(cells_in(end - x - tail - COL_GAP)));
+        let codes = want_codes.min(MAX_PARTY_TAGS).min(room_after(name_cells));
         if codes > 0 {
             let cells = codes * 4 - 1;
             cols.tags = Some((x + COL_GAP, cells));
@@ -820,7 +836,8 @@ mod tests {
 
     /// A status is a code in its own colour after the name (party panel) or at the right of it (enemy list), the ATB bar of a
     /// fighter whose pace changes is not the usual blue, and what does not fit is a `+N`. A window as wide as 1920 x 1080
-    /// has room for three codes in the party panel, the default 1100 x 680 for one.
+    /// has room for three codes in the party panel, the default 1100 x 680 for two (a long name gives up two cells for the
+    /// second place, see `columns`): a code and the `+N` for the others, or both codes of a member that has two.
     #[test]
     fn statuses_are_written_in_their_colours_and_the_atb_bar_takes_the_colour_of_the_pace() {
         use crate::battle::tags;
@@ -859,9 +876,43 @@ mod tests {
         let said = drawn(&draw(&v, 1920, 1080));
         assert!(said.contains(&"Psn".to_string()) && said.contains(&"Sil".to_string()) && said.contains(&"+3".to_string()), "{said:?}");
         assert!(!said.contains(&"Rgn".to_string()) && !said.contains(&"Bar".to_string()), "{said:?}");
-        // At 1100 x 680 there is room for one: the one that matters most, and nothing else of Cloud's.
+        // At 1100 x 680 there is room for two places: the code that matters most and the +N for the other four of Cloud's.
         let said = drawn(&draw(&v, 1100, 680));
-        assert!(said.contains(&"Psn".to_string()) && !said.contains(&"Sil".to_string()) && !said.iter().any(|t| t.starts_with('+')), "{said:?}");
+        assert!(said.contains(&"Psn".to_string()) && !said.contains(&"Sil".to_string()) && said.contains(&"+4".to_string()), "{said:?}");
+        // Three statuses: one code and "+2"; exactly two: both codes and no "+N" (nothing is hidden, so nothing is counted).
+        v.party[0].status = set(&[Status::Poison, Status::Silence, Status::Haste]);
+        let said = drawn(&draw(&v, 1100, 680));
+        assert!(said.contains(&"Psn".to_string()) && said.contains(&"+2".to_string()) && !said.contains(&"Sil".to_string()), "{said:?}");
+        v.party[0].status = set(&[Status::Poison, Status::Silence]);
+        let said = drawn(&draw(&v, 1100, 680));
+        assert!(said.contains(&"Psn".to_string()) && said.contains(&"Sil".to_string()) && !said.iter().any(|t| t.starts_with('+')), "{said:?}");
+        // One status, one code, whatever the width.
+        v.party[0].status = set(&[Status::Silence]);
+        let said = drawn(&draw(&v, 1100, 680));
+        assert!(said.contains(&"Sil".to_string()) && !said.iter().any(|t| t.starts_with('+')), "{said:?}");
+    }
+
+    /// At the default 1100 x 680 the party panel's content is 307 units wide: a long name gives up as many cells as the places
+    /// for the statuses need (never below six: the enemy list keeps as many), and not one when the rows have no more than one.
+    #[test]
+    fn a_long_name_gives_up_cells_for_the_statuses_only_as_far_as_they_need() {
+        use crate::battle::tags;
+        let inner_w = 307;
+        let names = |want: usize| columns(0, inner_w, want).name_cells;
+        assert_eq!((names(0), names(1)), (NAME_CELLS, NAME_CELLS), "no status, or one that fits: the name is whole");
+        for want in [2, 3, 4, 13] {
+            assert_eq!(names(want), NAME_CELLS - 1, "{want} statuses: two places for them take one cell");
+            let column = columns(0, inner_w, want).tags.expect("a column for them");
+            assert_eq!(tags::room(column.1), 2, "{want} statuses: a code and the +N, or two codes");
+        }
+        // A wide panel needs nothing from the name, a hopeless one takes nothing either (no room however short the name).
+        assert_eq!(columns(0, 374, 3).name_cells, NAME_CELLS);
+        assert_eq!(columns(0, 100, 3).name_cells, NAME_CELLS);
+        assert!((0..=40).all(|extra| columns(0, 150 + extra * 8, 13).name_cells >= MIN_PARTY_NAME_CELLS.min(NAME_CELLS)), "never below six");
+        // And the names that do not fit then are cut, not the HP and MP columns.
+        let plain = columns(0, inner_w, 0);
+        let sick = columns(0, inner_w, 3);
+        assert_eq!((sick.hp_x.is_some(), sick.mp_x.is_some(), sick.bar.is_some()), (plain.hp_x.is_some(), plain.mp_x.is_some(), plain.bar.is_some()));
     }
 
     /// The statuses take what they need from the ATB bar and nothing from the HP and MP columns; a window with no status

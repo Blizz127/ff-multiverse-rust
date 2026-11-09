@@ -19,16 +19,19 @@
 //!
 //! Every `Action` event names what is being done, for [`BANNER_S`] seconds: a spell or an item by its
 //! name from this machine's [`NameBook`] (`Spell 27` / `Item 7` without one), an enemy's own attack by
-//! its scene's name (no banner when the scene has none), `Defend`; a plain attack says nothing. When
-//! several actions arrive together the last one wins.
+//! its scene's name (no banner when the scene has none), `Defend`; a plain attack says nothing. Each name
+//! comes up when its performance BEGINS ([`cue::Cue::start`]): the actions of one batch are played one after
+//! the other (a counter after the blow that provoked it), and the banner names the one that is being played, the
+//! last one begun winning.
 //!
 //! # Numbers and the enemy list follow the blow
 //!
 //! The battle's state moves when a message arrives (bars, the menu, the command that is applied), but
-//! the SHOW lags a little by design, never by more than [`cue::MAX_IMPACT_DELAY`]: a number floats up
-//! when its blow lands ([`Popups`], scheduled with [`cue::delay_of`]), and an enemy that was beaten
+//! the SHOW lags a little by design, by [`cue::MAX_IMPACT_DELAY`] at the most for the first blow of a batch
+//! (and for a counter, or any later action of it, until the one before has played, see [`cue`]): a number floats up
+//! when its blow lands ([`Popups`], scheduled with [`cue::Cue::delay_of`]), and an enemy that was beaten
 //! stays in the enemy list until its collapse begins on screen ([`BattleHud::decorate`] and
-//! [`BattleHud::linger_view`] keep it, at the most [`cue::MAX_DEATH_DELAY`] after the blow arrived).
+//! [`BattleHud::linger_view`] keep it, at the most [`cue::MAX_BATCH_SPAN`] after the batch arrived).
 //! Everything else (gauges, HP, MP, the banner, the menu) follows the state at once. The scene plays
 //! its clips so that the impact frame lands at the same instants: see [`cue`].
 //!
@@ -36,8 +39,10 @@
 //!
 //! When the server ends the battle, the client drops its mirror at once (the player is free in the
 //! field), but the screen keeps the last view for a few seconds: the last blow's number floats up,
-//! then the panel appears. A key press closes it (after a moment, so a key still held from the
-//! battle does not skip it) and so does time ([`LINGER_S`]).
+//! then the panel appears. The panel counts from the moment the LAST performance began on screen (a counter that
+//! finishes the party begins after the blow that provoked it, so that is later than the message that ended the
+//! battle): the blow's number is seen before the panel comes. A key press closes it (after a moment, so a key
+//! still held from the battle does not skip it) and so does time ([`LINGER_S`]).
 
 use super::menu::{BattleMenu, BattleMenuModel, Ctx, Fighter, MenuKey, Reply};
 use super::names::{item_name, limit_name, spell_name, NameBook};
@@ -70,8 +75,9 @@ pub struct BattleHud {
     menu: BattleMenu,
     model: BattleMenuModel,
     popups: Popups,
-    /// The action banner and when it appeared.
-    banner: Option<(String, f64)>,
+    /// The action banners and when each comes up (in the order they were scheduled; the one on screen is the last that
+    /// has begun, see [`BattleHud::decorate`]). A few are kept: a batch has a handful of performances at most.
+    banners: Vec<(String, f64)>,
     my_actor: Option<ActorId>,
     /// The formation of the battle (`scene * 4 + slot`): which scene names an enemy's attacks.
     formation: u16,
@@ -80,6 +86,9 @@ pub struct BattleHud {
     /// Fighters whose death is on its way to the screen, and when their collapse begins there: a beaten
     /// enemy stays in the enemy list until then.
     dying: Vec<(ActorId, f64)>,
+    /// When the last performance of everything that arrived begins on screen (the clock of [`BattleHud::on_events`] plus
+    /// [`cue::Cue::start`]): the battle's end counts from here when it comes later than the message that ended it.
+    last_start: f64,
 }
 
 /// The party members and enemies of `bars` as the menu sees them.
@@ -107,9 +116,10 @@ impl BattleHud {
     pub fn begin(&mut self, formation: u16, my_actor: Option<ActorId>) {
         self.menu.reset();
         self.popups.clear();
-        self.banner = None;
+        self.banners.clear();
         self.ended = None;
         self.dying.clear();
+        self.last_start = f64::NEG_INFINITY;
         self.my_actor = my_actor;
         self.formation = formation;
     }
@@ -136,9 +146,13 @@ impl BattleHud {
         &mut self.model
     }
 
-    /// The action banner shows `text` from `now` for [`BANNER_S`] seconds.
-    pub fn show_banner(&mut self, now: f64, text: String) {
-        self.banner = Some((text, now));
+    /// The action banner shows `text` from `at` for [`BANNER_S`] seconds (a performance that has not begun yet leaves the
+    /// banner of the one on screen alone until it does).
+    pub fn show_banner(&mut self, at: f64, text: String) {
+        const KEPT: usize = 8;
+        self.banners.push((text, at));
+        let over = self.banners.len().saturating_sub(KEPT);
+        self.banners.drain(..over);
     }
 
     /// The words the banner shows for `action`, if it shows any (see the module docs).
@@ -162,24 +176,25 @@ impl BattleHud {
         self.popups.on_events(now, events);
         self.dying.retain(|(_, due)| *due > now);
         for cue in cue::cues(events) {
-            let action = cue.action.map(|(_, a)| a);
-            for event in cue.events {
-                if let BattleEvent::Death { actor } = *event {
-                    self.dying.retain(|(who, _)| *who != actor);
-                    self.dying.push((actor, now + cue::delay_of(action, event)));
-                }
+            // Each performance has its banner when it begins (one after the other: a counter's name does not hide the
+            // name of the blow it answers before that blow is played).
+            let begins = now + cue.start;
+            if cue.action.is_some() || cue.length() > 0.0 {
+                self.last_start = self.last_start.max(begins);
             }
-        }
-        for event in events {
-            match event {
-                BattleEvent::Action { action, .. } => {
-                    if let Some(text) = self.action_text(*action) {
-                        self.show_banner(now, text);
+            if let Some(text) = cue.action.and_then(|(_, action)| self.action_text(action)) {
+                self.show_banner(begins, text);
+            }
+            for event in cue.events {
+                match event {
+                    BattleEvent::Death { actor } => {
+                        self.dying.retain(|(who, _)| who != actor);
+                        self.dying.push((*actor, now + cue.delay_of(event)));
                     }
+                    // The attempt to run failed: the banner of `Escape` gives way to the verdict (the last one wins).
+                    BattleEvent::EscapeFailed { .. } => self.show_banner(begins, "Couldn't escape".to_string()),
+                    _ => {}
                 }
-                // The attempt to run failed: the banner of `Escape` gives way to the verdict (the last one wins).
-                BattleEvent::EscapeFailed { .. } => self.show_banner(now, "Couldn't escape".to_string()),
-                _ => {}
             }
         }
         let mine = |actor: &ActorId| Some(*actor) == self.my_actor;
@@ -195,7 +210,14 @@ impl BattleHud {
     /// Dress `view`, the state of a battle that runs, with the live parts of the UI at `now`.
     pub fn decorate(&self, view: &mut BattleView, now: f64) {
         view.popups = self.popups.views(now);
-        view.banner = self.banner.as_ref().filter(|(_, at)| now - at < BANNER_S).map(|(text, at)| Banner {
+        // The banner on screen is the last one that has begun (a later pushed one wins a tie), while it lasts.
+        let mut on_screen: Option<&(String, f64)> = None;
+        for banner in self.banners.iter().filter(|(_, at)| *at <= now) {
+            if on_screen.is_none_or(|(_, at)| banner.1 >= *at) {
+                on_screen = Some(banner);
+            }
+        }
+        view.banner = on_screen.filter(|(_, at)| now - at < BANNER_S).map(|(text, at)| Banner {
             text: text.clone(),
             age_ms: ((now - at).max(0.0) * 1000.0).round() as u32,
         });
@@ -229,8 +251,11 @@ impl BattleHud {
     /// earned on screen for a while.
     pub fn finish(&mut self, now: f64, last: BattleView, outcome: Outcome, reward: Option<RewardLine>) {
         self.menu.reset();
-        self.banner = None;
-        self.ended = Some(Ended { view: last, outcome, reward, at: now, dismissed: false });
+        self.banners.clear();
+        // The end counts from the last performance that begins on screen, when that is later than the message (a counter
+        // that wipes the party begins after the blow that provoked it).
+        let at = if self.last_start.is_finite() { now.max(self.last_start).min(now + cue::MAX_BATCH_SPAN) } else { now };
+        self.ended = Some(Ended { view: last, outcome, reward, at, dismissed: false });
     }
 
     /// Is the end of a battle still on screen at `now`?
@@ -541,14 +566,22 @@ mod tests {
     }
 
     #[test]
-    fn the_last_action_of_a_batch_wins_the_banner() {
+    fn each_action_of_a_batch_has_its_banner_when_it_begins_and_the_last_one_begun_wins() {
+        use crate::battle::scene::cue::length_of;
         let mut hud = hud_with_names();
         hud.on_events(5.0, &[action(1, ActionRef::Magic(27)), action(2, ActionRef::EnemyAttack(272)), action(1, ActionRef::Item(7))], false);
-        assert_eq!(banner_text(&hud, 5.1).as_deref(), Some("Phoenix Down"));
-        // A later batch replaces it and restarts its time.
-        hud.on_events(6.0, &[action(2, ActionRef::EnemyAttack(272))], false);
+        // The actions of a batch are played one after the other: the spell's name is up while the spell is played, the enemy's
+        // answer (named, like a counter) comes up when it begins, the item after it, each replacing the one before.
+        let second = 5.0 + length_of(Some(ActionRef::Magic(27)));
+        let third = second + length_of(Some(ActionRef::EnemyAttack(272)));
+        assert_eq!(banner_text(&hud, 5.1).as_deref(), Some("Fire"));
+        assert_eq!(banner_text(&hud, second - 0.01).as_deref(), Some("Fire"), "the answer waits for the blow it answers");
+        assert_eq!(banner_text(&hud, second + 0.05).as_deref(), Some("Machine Gun"));
+        assert_eq!(banner_text(&hud, third + 0.05).as_deref(), Some("Phoenix Down"));
+        // A later batch (after that show) replaces it and restarts its time.
+        hud.on_events(9.0, &[action(2, ActionRef::EnemyAttack(272))], false);
         let mut v = view(false);
-        hud.decorate(&mut v, 6.25);
+        hud.decorate(&mut v, 9.25);
         assert_eq!(v.banner, Some(Banner { text: "Machine Gun".into(), age_ms: 250 }));
         // Actions are not damage: they make no number over anybody.
         assert!(v.popups.is_empty());
@@ -576,6 +609,43 @@ mod tests {
         hud.on_events(20.0, &[BattleEvent::Damage { actor: ActorId(1), target: ActorId(2), amount: 99, critical: true }], true);
         hud.finish(20.0, view(false), Outcome::Victory, Some(RewardLine { exp: 5, gil: 6, ap: 7, items: vec![] }));
         hud
+    }
+
+    /// The panel counts from the moment the LAST performance begins on screen: a counter that ends the battle begins after the
+    /// blow it answers, so its number must be seen before the panel comes (the panel is due [`PANEL_DELAY_MS`] after that).
+    #[test]
+    fn the_end_of_the_battle_counts_from_the_last_performance_that_begins_not_from_the_message_that_ended_it() {
+        use crate::battle::scene::cue::{impact_delay, length_of};
+        let counter_batch = [
+            action(1, ActionRef::Attack),
+            BattleEvent::Damage { actor: ActorId(1), target: ActorId(2), amount: 40, critical: false },
+            action(2, ActionRef::EnemyAttack(272)),
+            BattleEvent::Damage { actor: ActorId(2), target: ActorId(1), amount: 999, critical: false },
+            BattleEvent::Death { actor: ActorId(1) },
+            BattleEvent::Defeat,
+        ];
+        let mut hud = hud();
+        hud.on_events(30.0, &counter_batch, true);
+        hud.finish(30.0, view(false), Outcome::Defeat, None);
+        let begins = 30.0 + length_of(Some(ActionRef::Attack));
+        let age = |t: f64| hud.linger_view(t).and_then(|v| v.finale).map(|f| f.age_ms);
+        // Before the counter begins the panel has not started to count; from there it does.
+        assert_eq!(age(30.0 + 0.2), Some(0));
+        assert_eq!(age(begins), Some(0));
+        assert_eq!(age(begins + 0.25), Some(250));
+        // The counter's number is up before the panel is due, and the panel comes after it has landed.
+        let lands = begins + impact_delay(Some(ActionRef::EnemyAttack(272)));
+        let seen = hud.linger_view(lands + 0.01).expect("lingering");
+        assert!(seen.popups.iter().any(|p| p.target == ActorId(1) && matches!(p.kind, PopupKind::Damage { amount: 999, .. })), "{:?}", seen.popups);
+        assert!(seen.finale.as_ref().is_some_and(|f| f.age_ms < PANEL_DELAY_MS), "the panel is not due yet: {:?}", seen.finale);
+        assert!(((lands - begins) * 1000.0) < f64::from(PANEL_DELAY_MS), "it lands before the panel is due");
+        // A key right after the message does not skip it: nothing can be closed before the panel has been due and seen.
+        assert!(!hud.linger_view(30.2).and_then(|v| v.finale).is_some_and(|f| f.dismissible));
+        // A battle whose last batch has ONE performance ends as it did: the panel counts from the message.
+        let mut single = self::hud();
+        single.on_events(40.0, &[action(1, ActionRef::Attack), BattleEvent::Damage { actor: ActorId(1), target: ActorId(2), amount: 9, critical: false }, BattleEvent::Victory], true);
+        single.finish(40.0, view(false), Outcome::Victory, None);
+        assert_eq!(single.linger_view(40.1).and_then(|v| v.finale).map(|f| f.age_ms), Some(100));
     }
 
     #[test]

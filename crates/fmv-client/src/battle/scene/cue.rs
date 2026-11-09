@@ -13,13 +13,29 @@
 //! * the **scene** ([`super::motion`]) plays real clips of different lengths and must make the blow's
 //!   impact frame land at the instant the numbers are born.
 //!
-//! Both call [`cues`] on the batch and [`impact_delay`] for the performance, and add it to the time
-//! the batch arrived. The delay depends on the KIND of action only (never on a model's clips: those
-//! are time-warped to fit, see [`super::plan`]), is fixed in the table below and never exceeds
-//! [`MAX_IMPACT_DELAY`]: **nothing a player sees waits on an animation**. The only skew left is that
+//! Both call [`cues`] on the batch and add the time the performance BEGINS ([`Cue::start`], 0 for the
+//! first one of a batch) and its [`impact_delay`] to the time the batch arrived. The delay depends on
+//! the KIND of action only (never on a model's clips: those are time-warped to fit, see
+//! [`super::plan`]), is fixed in the table below and never exceeds [`MAX_IMPACT_DELAY`] after the
+//! performance's own start: **nothing a player sees waits on an animation**. The only skew left is that
 //! the scene is brought up to date at the next drawn frame while the hud hears of the batch the
 //! moment its message arrives (at most a frame, unless the window stopped drawing: then the scene
 //! catches up by skipping, see [`super::plan::fit`], and the numbers keep their own clock).
+//!
+//! # Several performances in one batch: one after the other
+//!
+//! A batch can hold more than one announcement. The engine plays an enemy's COUNTER inside the command that
+//! provoked it (the Guard Scorpion's Tail Laser answers the blow that struck it, in the same batch: see
+//! `fmv_ff7_battle::ai`, "Counters"), a death on the clock is followed by its Death counter, and two enemies
+//! whose gauges fill in one step act in the same batch. Played from the batch's arrival they would all begin
+//! at once, the counter over the blow that provoked it. So each performance **begins when the one before it is
+//! over** ([`Cue::start`] is the sum of the [`length_of`] the ones before it, at most [`MAX_SEQUENCE`]): the
+//! blow lands, its follow-through plays, and then the counter runs up. A performance that shows nothing (events
+//! before the first announcement that land on nobody) takes no time. Every consumer that schedules anything
+//! ([`Cue::delay_of`] for the numbers and the deaths, the director for the bodies, the hud for the banner and for
+//! the end of the battle) goes through the same [`cues`], so they cannot drift apart. What is NOT sequenced is
+//! one batch after another: a batch that arrives while the show of the last one goes on starts at its own
+//! arrival, as it always did.
 //!
 //! # Protocol v7: limit breaks and escape
 //!
@@ -53,6 +69,15 @@ pub const DEATH_BEAT: f64 = 0.25;
 /// then, as its collapse begins.
 pub const MAX_DEATH_DELAY: f64 = MAX_IMPACT_DELAY + DEATH_BEAT;
 
+/// The latest a performance of a batch begins after the batch arrived, in seconds: a batch with so many announcements
+/// that they would not fit plays the rest over each other from here. (A counter after the blow is one performance late;
+/// nothing the engine plays comes near.)
+pub const MAX_SEQUENCE: f64 = 4.0;
+
+/// Nothing of a batch lands, or dies, later than this after it arrived: the last performance begins by
+/// [`MAX_SEQUENCE`] and its death by [`MAX_DEATH_DELAY`] after that.
+pub const MAX_BATCH_SPAN: f64 = MAX_SEQUENCE + MAX_DEATH_DELAY;
+
 /// Seconds from a batch's arrival to the impact of the action it announced (`None`: effects no
 /// action announced, as an older server sends them). Fixed per kind so that the overlay and the
 /// scene need not talk; every entry is at most [`MAX_IMPACT_DELAY`].
@@ -72,6 +97,32 @@ pub fn impact_delay(action: Option<ActionRef>) -> f64 {
         // Running has no results to wait for: a failed attempt only stumbles, a successful one runs off.
         Some(ActionRef::Escape) => 0.0,
     }
+}
+
+/// Seconds after a performance's impact that its performer is still busy (the follow-through of a blow, the glow of a
+/// spell that has broken, the guard pose held, a stumble): the next performance of the same batch, a counter or a second
+/// enemy's action, begins when it is over. Fixed per kind, like [`impact_delay`].
+pub fn follow_through(action: Option<ActionRef>) -> f64 {
+    match action {
+        // No announcement: the lunge's way back.
+        None => 0.35,
+        Some(ActionRef::Attack) => 0.45,
+        Some(ActionRef::EnemyAttack(_)) => 0.50,
+        Some(ActionRef::Magic(_)) => 0.45,
+        Some(ActionRef::Item(_)) => 0.35,
+        // Nothing lands, but the guard is seen for a moment.
+        Some(ActionRef::Defend) => 0.40,
+        // The longest show: the burst has to fade.
+        Some(ActionRef::Limit(_)) => 0.70,
+        // A failed attempt stumbles back (the director's own effect lasts about as long).
+        Some(ActionRef::Escape) => 0.45,
+    }
+}
+
+/// Seconds from the start of a performance of `action` to the start of the next one of its batch: its impact and its
+/// follow-through.
+pub fn length_of(action: Option<ActionRef>) -> f64 {
+    impact_delay(action) + follow_through(action)
 }
 
 /// How an event shows on screen.
@@ -127,12 +178,32 @@ pub struct Cue<'a> {
     pub action: Option<(ActorId, ActionRef)>,
     /// The events after the announcement (not including it) up to the next one.
     pub events: &'a [BattleEvent],
+    /// Seconds from the batch's arrival to the start of this performance: 0 for the first one, and for each later one
+    /// the time the ones before it take ([`Cue::length`]), at most [`MAX_SEQUENCE`] (see the module docs).
+    pub start: f64,
 }
 
 impl Cue<'_> {
-    /// Seconds from arrival to impact.
+    /// Seconds from the START of this performance to its impact.
     pub fn impact(&self) -> f64 {
         impact_delay(self.action.map(|(_, a)| a))
+    }
+
+    /// Seconds from the batch's arrival to the moment `event` of this performance lands (what a number or a death
+    /// is scheduled at).
+    pub fn delay_of(&self, event: &BattleEvent) -> f64 {
+        self.start + delay_of(self.action.map(|(_, a)| a), event)
+    }
+
+    /// Seconds this performance occupies: from its start to the start of the next one. Events before any announcement
+    /// that show nothing at anybody (a turn of Poison, a gauge filling) take no time; a death with no announcement does.
+    pub fn length(&self) -> f64 {
+        let shows = self.action.is_some() || self.events.iter().any(|e| landing(e).is_some());
+        if shows {
+            length_of(self.action.map(|(_, a)| a))
+        } else {
+            0.0
+        }
     }
 
     /// Who performs it: the announcer, else whoever dealt the first effect.
@@ -174,14 +245,20 @@ pub fn cues(events: &[BattleEvent]) -> Vec<Cue<'_>> {
     for (i, event) in events.iter().enumerate() {
         if let BattleEvent::Action { actor, action } = *event {
             if open.is_some() || i > from {
-                out.push(Cue { action: open, events: &events[from..i] });
+                out.push(Cue { action: open, events: &events[from..i], start: 0.0 });
             }
             open = Some((actor, action));
             from = i + 1;
         }
     }
     if open.is_some() || from < events.len() {
-        out.push(Cue { action: open, events: &events[from..] });
+        out.push(Cue { action: open, events: &events[from..], start: 0.0 });
+    }
+    // One after the other: each begins when the one before it is over (and none later than the cap).
+    let mut begins: f64 = 0.0;
+    for cue in &mut out {
+        cue.start = begins.min(MAX_SEQUENCE);
+        begins += cue.length();
     }
     out
 }
@@ -286,6 +363,103 @@ mod tests {
         // Every event is in exactly one cue.
         assert_eq!(cues.iter().map(|c| c.events.len() + usize::from(c.action.is_some())).sum::<usize>(), batch.len());
         assert_eq!(cues[1].impact(), impact_delay(Some(ActionRef::Attack)));
+    }
+
+    #[test]
+    fn a_counter_and_any_later_action_begin_when_the_action_before_it_is_over() {
+        // A blow and the enemy's counter to it (the Guard Scorpion's Tail Laser: one announcement, a blow on each of the party), then a
+        // second action of the party in the same batch.
+        let batch = [
+            action(0, ActionRef::Attack),
+            damage(0, 3),
+            action(3, ActionRef::EnemyAttack(286)),
+            damage(3, 0),
+            damage(3, 1),
+            action(1, ActionRef::Magic(1)),
+            BattleEvent::Heal { actor: ActorId(1), target: ActorId(0), amount: 30 },
+        ];
+        let cues = cues(&batch);
+        assert_eq!(cues.len(), 3);
+        // The first begins with the batch (as every batch did before), the others one after the other.
+        let (attack, counter) = (length_of(Some(ActionRef::Attack)), length_of(Some(ActionRef::EnemyAttack(286))));
+        assert_eq!(cues[0].start, 0.0);
+        assert!((cues[1].start - attack).abs() < 1e-12 && (cues[2].start - (attack + counter)).abs() < 1e-12, "{:?}", cues.iter().map(|c| c.start).collect::<Vec<_>>());
+        // So the counter's blows land after the blow they answer has landed AND its follow-through has played, never at once.
+        let blow_lands = cues[0].delay_of(&batch[1]);
+        for blow in &batch[3..5] {
+            let lands = cues[1].delay_of(blow);
+            assert!(lands >= blow_lands + follow_through(Some(ActionRef::Attack)) - 1e-12, "the counter lands at {lands}, the blow at {blow_lands}");
+            assert!((lands - (attack + impact_delay(Some(ActionRef::EnemyAttack(286))))).abs() < 1e-12);
+        }
+        assert!(cues[2].delay_of(&batch[6]) > cues[1].delay_of(&batch[3]), "and the action after it lands after the counter");
+        // The first performance of a batch lands where it always did.
+        assert_eq!(cues[0].delay_of(&batch[1]), impact_delay(Some(ActionRef::Attack)));
+        // A batch of one announcement is exactly what it was.
+        let one = [action(0, ActionRef::Magic(27)), damage(0, 3)];
+        assert_eq!(super::cues(&one)[0].start, 0.0);
+        assert_eq!(super::cues(&one)[0].delay_of(&one[1]), impact_delay(Some(ActionRef::Magic(27))));
+    }
+
+    #[test]
+    fn what_shows_nothing_takes_no_time_and_a_death_on_the_clock_is_over_before_its_counter_begins() {
+        use fmv_ff7_battle::status::Status;
+        // A turn of Poison and nothing else: the enemy's own action after it begins with the batch.
+        let tick = BattleEvent::StatusTick { target: T, status: Status::Poison, amount: 5 };
+        let calm = [tick, BattleEvent::GaugeReady { actor: A }, action(3, ActionRef::EnemyAttack(272)), damage(3, 0)];
+        let of_calm = cues(&calm);
+        assert_eq!(of_calm.len(), 2);
+        assert_eq!((of_calm[0].length(), of_calm[1].start), (0.0, 0.0), "a tick and a gauge show nothing at anybody");
+        // A turn of Poison that kills, and the Death counter that answers it: the death (the short beat and its own beat) is over first.
+        let dies = [tick, BattleEvent::Death { actor: T }, action(T.0, ActionRef::EnemyAttack(288))];
+        let of_dies = cues(&dies);
+        assert_eq!(of_dies.len(), 2);
+        assert!((of_dies[0].length() - length_of(None)).abs() < 1e-12 && of_dies[0].length() > 0.0);
+        assert!((of_dies[1].start - length_of(None)).abs() < 1e-12);
+        assert!(of_dies[1].start >= delay_of(None, &BattleEvent::Death { actor: T }) - follow_through(None), "the counter does not begin before the death does");
+        // Announcements with nothing after them (a guard) take their time too, so the one after them waits.
+        let guard = [action(0, ActionRef::Defend), action(3, ActionRef::EnemyAttack(272)), damage(3, 0)];
+        let of_guard = cues(&guard);
+        assert!((of_guard[1].start - length_of(Some(ActionRef::Defend))).abs() < 1e-12 && of_guard[1].start > 0.0);
+    }
+
+    #[test]
+    fn a_batch_with_very_many_performances_starts_none_of_them_later_than_the_cap() {
+        let mut batch = Vec::new();
+        for i in 0..40u8 {
+            batch.push(action(i % 3, ActionRef::Magic(1)));
+            batch.push(damage(i % 3, 3));
+        }
+        let cues = cues(&batch);
+        assert_eq!(cues.len(), 40);
+        assert!(cues.windows(2).all(|w| w[0].start <= w[1].start), "in order");
+        assert!(cues.iter().all(|c| c.start <= MAX_SEQUENCE), "{:?}", cues.last().map(|c| c.start));
+        assert_eq!(cues.last().map(|c| c.start), Some(MAX_SEQUENCE), "the rest play over each other at the cap");
+        // Nothing of the batch lands, or dies, later than the span says.
+        for c in &cues {
+            for e in c.events {
+                assert!(c.delay_of(e) <= MAX_BATCH_SPAN, "{}", c.delay_of(e));
+            }
+            assert!(c.delay_of(&BattleEvent::Death { actor: T }) <= MAX_BATCH_SPAN);
+        }
+    }
+
+    #[test]
+    fn every_performance_has_a_length_that_covers_its_impact_and_its_follow_through() {
+        for what in [
+            None,
+            Some(ActionRef::Attack),
+            Some(ActionRef::EnemyAttack(272)),
+            Some(ActionRef::Magic(27)),
+            Some(ActionRef::Item(3)),
+            Some(ActionRef::Defend),
+            Some(ActionRef::Limit(128)),
+            Some(ActionRef::Escape),
+        ] {
+            let (impact, follow, length) = (impact_delay(what), follow_through(what), length_of(what));
+            assert!(follow > 0.0 && (length - impact - follow).abs() < 1e-12, "{what:?}");
+            // Whatever one performance takes, the cap leaves room for a few of them before it.
+            assert!(length <= MAX_IMPACT_DELAY + 0.8 && length * 3.0 < MAX_SEQUENCE, "{what:?}: {length}");
+        }
     }
 
     #[test]

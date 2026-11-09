@@ -644,8 +644,7 @@ impl EnemyAction {
     ///
     /// A damaging attack that also has a status keeps it ([`ActionSpec::status`]: the stinging attacks of the
     /// scenes inflict theirs). An attack with **only** a status is left out of the pool the random AI picks from,
-    /// as it always was (an AI that chooses attacks by script decodes it with [`ActionSpec::from_attack`] itself,
-    /// which does model it).
+    /// as it always was: an enemy's script can still queue it ([`EnemyAction::status_from_scene`]).
     pub fn from_scene(attack: &SceneAttack) -> Option<Self> {
         let mut spec = ActionSpec::from_attack(&attack.record)?;
         if spec.heals() || spec.formula == Formula::None {
@@ -653,6 +652,19 @@ impl EnemyAction {
         }
         spec.short_range = spec.kind == ActionKind::Physical;
         Some(Self {
+            id: attack.id,
+            spec,
+        })
+    }
+
+    /// The enemy action for a scene attack that has **only** a status (a curse or a buff: [`Formula::None`]), or
+    /// `None` for any other attack. The random AI never picks one (`Combatant::status_actions`, which holds them, is
+    /// not its pool); an enemy's script that queues it has it played ([`ActionSpec::status`] on whomever the
+    /// script aims it at). An attack with no damage, no healing and no status the rules play (an animation: the
+    /// Guard Scorpion's tail going up) is not an action at all.
+    pub fn status_from_scene(attack: &SceneAttack) -> Option<Self> {
+        let spec = ActionSpec::from_attack(&attack.record)?;
+        (spec.formula == Formula::None).then_some(Self {
             id: attack.id,
             spec,
         })
@@ -1387,7 +1399,7 @@ mod tests {
     }
 
     #[test]
-    fn a_status_only_spell_can_be_cast_and_a_status_only_enemy_attack_is_left_to_the_ai_scripts() {
+    fn a_status_only_spell_can_be_cast_and_a_status_only_enemy_attack_is_for_the_ai_scripts_alone() {
         let sleep_record = with_status(attack(0x22, 0, 90, 0x0F, 0, 0xFFFF), 63, Status::Sleep.bit());
         let spell = Spell::from_attack(6, &sleep_record).unwrap();
         assert_eq!((spell.info().targets_allies, spell.info().aim, spell.info().mp_cost), (false, Aim::OneOrSide, 7));
@@ -1408,6 +1420,16 @@ mod tests {
         assert_eq!(sting.spec.status, Some(effect(&[Status::Poison], 30, StatusMode::Inflict)));
         assert!(EnemyAction::from_scene(&scene_attack(2, sleep_record)).is_none());
         assert!(ActionSpec::from_attack(&sleep_record).is_some());
+        // The script's own pool: an attack with only a status (a curse on the other side, a buff on its own), and nothing else.
+        let curse = EnemyAction::status_from_scene(&scene_attack(2, sleep_record)).expect("a curse is a status-only action");
+        assert_eq!((curse.id, curse.spec.formula, curse.spec.status.map(|s| s.set)), (2, Formula::None, Some(effect(&[Status::Sleep], 63, StatusMode::Inflict).set)));
+        assert!(!curse.spec.on_allies, "the record aims at the other side");
+        let buff = EnemyAction::status_from_scene(&scene_attack(3, with_status(attack(0x22, 0, 255, 0x0D, 0, 0xFFFF), 63, Status::Barrier.bit()))).expect("a buff");
+        assert!(buff.spec.on_allies && buff.spec.aims_at_allies());
+        assert!(EnemyAction::status_from_scene(&scene_attack(1, with_status(attack(0x11, 16, 100, 0x03, element::HIT, 0xFFFF), 30, Status::Poison.bit()))).is_none(), "a damaging attack is not one");
+        // No damage, no healing and no status the rules play: an animation, which is no action in either pool.
+        let animation = attack(0xFF, 0, 255, 0x03, 0, 0xFFFF);
+        assert!(EnemyAction::from_scene(&scene_attack(4, animation)).is_none() && EnemyAction::status_from_scene(&scene_attack(4, animation)).is_none());
     }
 
     #[test]

@@ -649,10 +649,13 @@ fn a_guard_scorpion_fight_with_its_counters_is_replayed_exactly_by_a_client_engi
     let Some(source) = source() else { return };
     let data = battle_data(&source);
     let scenes = data.scenes();
-    let formation = (0..scenes.formation_count())
-        .find(|&f| scenes.formation(f).is_some_and(|fr| fr.enemies().iter().any(|e| e.record.name == "Guard Scorpion")))
-        .and_then(|f| u16::try_from(f).ok())
-        .expect("a formation has the Guard Scorpion");
+    let with_scorpion: Vec<u16> = (0..scenes.formation_count())
+        .filter(|&f| scenes.formation(f).is_some_and(|fr| fr.enemies().iter().any(|e| e.record.name == "Guard Scorpion")))
+        .filter_map(|f| u16::try_from(f).ok())
+        .collect();
+    // `scripts/battle-smoke.sh --boss` hard-codes this number (BOSS_FORMATION): it is the one formation that has the boss.
+    assert_eq!(with_scorpion, [SMOKE_BOSS_FORMATION], "the Guard Scorpion's formation moved: change BOSS_FORMATION in scripts/battle-smoke.sh");
+    let formation = with_scorpion[0];
     let info = data.formation(formation).expect("it has enemies");
     let (mut counter_batches, mut companion_counter_batches, mut limit_counter_batches) = (0usize, 0usize, 0usize);
     let mut tails_up = 0usize;
@@ -738,4 +741,108 @@ fn a_guard_scorpion_fight_with_its_counters_is_replayed_exactly_by_a_client_engi
     assert!(tails_up > 0, "the Scorpion's tail came up in some fight");
     assert!(counter_batches > 0, "a counter came inside a command's own batch of events");
     assert!(companion_counter_batches > 0, "a counter came inside a canon companion's command");
+}
+
+/// The Guard Scorpion's formation, the level, the pace, the script and the Tail Laser's attack id of `scripts/battle-smoke.sh --boss`
+/// (`BOSS_FORMATION`, `BOSS_LEVEL`, `BATTLE_SPEED`/`TICK_RATE`, `BOSS_SCRIPT`, `BOSS_COUNTER_ATTACK`): the numbers its header quotes are
+/// measured here.
+const SMOKE_BOSS_FORMATION: u16 = 324;
+const SMOKE_BOSS_LEVEL: u8 = 8;
+const SMOKE_BOSS_DEFENDS: usize = 2;
+const SMOKE_BOSS_TAIL_LASER: u16 = 286;
+
+/// One fight of the boss smoke at the engine level: the canon Cloud and Barret as the server's companions (its own rule, its own
+/// pacing), two players on the Barret curve who defend `defends` times and then attack the first living enemy, all at `level`, at the
+/// smoke's pace (battle speed 0, 240 ticks a second). Returns the outcome and how many of the boss's attacks that answered a command
+/// were `attack` (a counter: a command never advances the clock).
+fn boss_fight(data: &Ff7BattleData, formation: u16, level: u8, defends: usize, seed: u64, attack: u16) -> (Option<Outcome>, usize) {
+    use fmv_ff7_battle::rules::{ActionRef, ActorId};
+    let (speed, tps) = (0u8, 240u32);
+    let players = (0..2u64).map(|i| fmv_protocol::BattleMember::player(fmv_core::EntityId(i + 1), fmv_core::AccountId(i + 1), format!("P{i}"), 1, level, 0));
+    let companions = [0u8, 1].map(|c| fmv_protocol::BattleMember::companion(data.character_name(c).expect("a canon name"), c, level, 0));
+    let companion_count = companions.len();
+    let party: Vec<fmv_protocol::BattleMember> = companions.into_iter().chain(players).collect();
+    let fighters = party.len();
+    let info = data.formation(formation).expect("a real formation");
+    let setup = BattleSetup { formation_id: formation, seed, party, preemptive: info.preemptive, back_attack: info.back_attack, battle_speed: speed, ticks_per_second: tps };
+    let mut state = data.build(&setup).expect("builds");
+    let foe = ActorId(fighters as u8);
+    let pacing = Pacing::default();
+    let (mut commands, mut ready_since) = (vec![0u32; fighters], vec![None::<u64>; fighters]);
+    let mut defends_left = vec![defends; fighters];
+    let mut answered = 0usize;
+    let slice = u64::from((tps / 20).max(1));
+    let mut count = |events: &[BattleEvent]| {
+        answered += events.iter().filter(|e| matches!(e, BattleEvent::Action { actor, action: ActionRef::EnemyAttack(id) } if *actor == foe && *id == attack)).count();
+    };
+    for _ in 0..2_000_000u32 {
+        if state.outcome().is_some() {
+            break;
+        }
+        state.step_ticks(slice);
+        let now = state.tick();
+        let ready = state.ready_actors();
+        for (i, since) in ready_since.iter_mut().enumerate() {
+            *since = if ready.contains(&ActorId(i as u8)) { Some(since.unwrap_or(now)) } else { None };
+        }
+        // The companions first, as the server's `companions_act` runs right after every step, each when the pacing lets it.
+        for id in state.ready_actors().into_iter().filter(|id| usize::from(id.0) < companion_count) {
+            if state.outcome().is_some() {
+                break;
+            }
+            let players: Vec<PlayerTurn> = (companion_count..fighters)
+                .filter(|&i| state.actor(ActorId(i as u8)).is_some_and(|c| c.is_alive()))
+                .map(|i| PlayerTurn { commands: commands[i], ready_since: ready_since[i] })
+                .collect();
+            let i = usize::from(id.0);
+            if !companion::may_act(pacing, tps, now, commands[i], ready_since[i].unwrap_or(now), &players) {
+                continue;
+            }
+            let Some(command) = companion::command(&state, id) else { continue };
+            if let Ok(events) = state.submit_command(id, command) {
+                count(&events);
+                commands[i] += 1;
+                ready_since[i] = None;
+            }
+        }
+        // Then the players' commands arrive at once (a headless bot answers as soon as its gauge is full).
+        for id in state.ready_actors().into_iter().filter(|id| usize::from(id.0) >= companion_count) {
+            let i = usize::from(id.0);
+            let Some(target) = state.enemy_ids().into_iter().find(|e| state.actor(*e).is_some_and(|c| c.is_alive())) else { break };
+            let command = if defends_left[i] > 0 {
+                defends_left[i] -= 1;
+                Command::Defend
+            } else {
+                Command::Attack { target }
+            };
+            if let Ok(events) = state.submit_command(id, command) {
+                count(&events);
+                commands[i] += 1;
+                ready_since[i] = None;
+            }
+        }
+    }
+    (state.outcome(), answered)
+}
+
+/// The numbers the `--boss` smoke's header quotes: at level 8, with the bots defending twice, the Guard Scorpion's Tail Laser answers a
+/// command in EVERY one of 40 seeds, and the party wins nearly all of them (39 of 40 measured; a loss is a fine outcome for the smoke
+/// but a pace at which most fights were lost would not be one). At the starting level 6 the Laser still fires every time and about one
+/// fight in six is lost, which is why the smoke pins the level.
+#[test]
+#[ignore = "needs the owner's library: set FMV_FF7_LIBRARY"]
+fn the_boss_smoke_fight_answers_with_the_tail_laser_in_every_seed() {
+    let Some(source) = source() else { return };
+    let data = battle_data(&source);
+    let (mut wins, mut lasers_in) = (0, 0);
+    let seeds = 40u64;
+    for seed in 0..seeds {
+        let (outcome, lasers) = boss_fight(&data, SMOKE_BOSS_FORMATION, SMOKE_BOSS_LEVEL, SMOKE_BOSS_DEFENDS, seed, SMOKE_BOSS_TAIL_LASER);
+        assert!(outcome.is_some(), "seed {seed}: the fight was never decided");
+        wins += usize::from(outcome == Some(Outcome::Victory));
+        lasers_in += usize::from(lasers > 0);
+    }
+    eprintln!("boss smoke fight (formation {SMOKE_BOSS_FORMATION}, level {SMOKE_BOSS_LEVEL}, {SMOKE_BOSS_DEFENDS} defends): won {wins} of {seeds}, a Tail Laser counter in {lasers_in}");
+    assert_eq!(lasers_in as u64, seeds, "the Tail Laser answered a command in every seed");
+    assert!(wins as u64 * 10 >= seeds * 9, "at least nine fights in ten are won at the smoke's level: {wins} of {seeds}");
 }
