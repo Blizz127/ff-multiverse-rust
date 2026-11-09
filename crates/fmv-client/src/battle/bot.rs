@@ -4,8 +4,9 @@
 //! `pending` guard keeps it from repeating a command before the server answered). Its rule is
 //! `BattleClient::bot_command`: when its character's HP is under 30% of the maximum and it knows a
 //! restoring spell it can pay for, it casts the cheapest one on itself; otherwise, when its limit gauge is
-//! full (protocol v7), it gives its limit break (a damaging one on the first living enemy, a healing one
-//! on a wounded ally); otherwise it attacks the first living enemy. It never escapes, unless a script
+//! full (protocol v7), it gives its limit break (a damaging one on the first living enemy, a healing one,
+//! which heals the whole party since protocol v10, when somebody is wounded); otherwise it attacks the first
+//! living enemy. It never escapes, unless a script
 //! tells it to: with `--battle-script` (see `script`) it first gives the commands of that script, in
 //! order, one per full gauge (Defend, Magic, Item, Limit and Escape included), and only when the script is
 //! used up does the rule above take over. With

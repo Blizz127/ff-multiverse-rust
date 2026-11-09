@@ -132,7 +132,11 @@ HEADLESS OUTPUT:
   is item 0, Phoenix Down is item 7), for example --battle-script defend,item:0,magic:0,limit.
   An offensive spell, item or limit, and attack, aim at the first living enemy; a healing spell,
   item or limit at the party member with the least HP left (the bot itself on a tie); a reviving
-  one at a fallen member. An entry this character cannot give at that moment (not enough MP, none
+  one at a fallen member. `magic:<id>:all` and `item:<id>:all` aim at the whole side instead (every
+  enemy, or the whole party for a healing one: magic:0:all is Cure on the party), which costs the
+  once-per-battle All materia use of a Cure or Fire kind of spell; what only ever hits a whole side
+  (Megalixir, item:6; Ultima, magic:52; Aerith's Healing Wind, limit) needs no `:all`. An entry
+  this character cannot give at that moment (not enough MP, none
   of the item left, the limit gauge is not full, a battle that cannot be escaped, nobody has
   fallen) is logged as a `battle: script: ... skipped: <why>` line, counted and skipped for good,
   and the next entry is tried at once. An entry is used up when the server applies (or refuses)
@@ -626,7 +630,7 @@ pub fn parse_area_key(s: &str) -> Result<String, String> {
     Ok(key.to_string())
 }
 
-/// One entry of `--battle-script` (`attack`, `defend`, `escape`, `limit`, `magic:<id>`, `item:<id>`).
+/// One entry of `--battle-script` (`attack`, `defend`, `escape`, `limit`, `magic:<id>[:all]`, `item:<id>[:all]`).
 pub fn parse_script_step(s: &str) -> Result<ScriptStep, String> {
     s.parse()
 }
@@ -1062,6 +1066,10 @@ mod tests {
         let a = parse(&["--battle-script", "defend,item:0,magic:0,limit,escape,attack"]).unwrap();
         assert_eq!(a.battle_script, [Defend, Item(0), Magic(0), Limit, Escape, Attack]);
         assert_eq!(parse(&["--battle-script", "Magic:27"]).unwrap().battle_script, [Magic(27)], "case does not matter");
+        // Whole sides (protocol v10): `:all` after the id of a spell or an item.
+        let a = parse(&["--battle-script", "magic:0:all,item:6:all,magic:27"]).unwrap();
+        assert_eq!(a.battle_script, [crate::battle::ScriptStep::MagicAll(0), crate::battle::ScriptStep::ItemAll(6), Magic(27)]);
+        assert!(parse(&["--battle-script", "magic:0:everyone"]).is_err() && parse(&["--battle-script", "limit:all"]).is_err());
         assert!(parse(&[]).unwrap().battle_script.is_empty(), "no script unless asked for");
         // Given twice, the lists add up.
         let a = parse(&["--battle-script", "defend", "--battle-script", "escape,escape"]).unwrap();

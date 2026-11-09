@@ -1,7 +1,7 @@
 //! Tests of the limit gauge, the Limit command and Escape in the battle engine (the rules are in
 //! [`crate::limit`] and [`crate::rules`]; the hand-computed numbers are in their docs).
 
-use crate::action::{ActionSpec, Formula};
+use crate::action::{ActionSpec, Aim, Formula};
 use crate::limit::{LimitBreak, LimitInfo, LIMIT_MAX};
 use crate::rules::*;
 
@@ -22,7 +22,7 @@ fn hero(limit: u16) -> Combatant {
     c
 }
 
-/// Like [`hero`], but its limit heals one ally for half of its max HP.
+/// Like [`hero`], but its limit heals the whole party, each ally for half of its max HP.
 fn healer(limit: u16) -> Combatant {
     let mut c = hero(limit);
     c.name = "Healer".into();
@@ -121,7 +121,7 @@ fn only_an_enemys_blow_on_a_party_member_with_a_limit_fills_a_gauge() {
     let mut ally = hero(0);
     ally.hp = 100;
     let mut battle = BattleState::with_config(1, vec![cure, ally], vec![foe(900, 5)], config(StartMode::Preemptive));
-    let events = battle.submit_command(A, Command::Magic { spell: 0, target: ActorId(1) }).expect("cure");
+    let events = battle.submit_command(A, Command::Magic { spell: 0, target: Target::One(ActorId(1)) }).expect("cure");
     assert!(gauges(&events).is_empty() && battle.limit_gauge(ActorId(1)) == 0);
 }
 
@@ -133,7 +133,7 @@ fn a_starting_gauge_is_kept_but_never_above_full_and_only_for_the_living_with_a_
     assert_eq!([0, 1, 2].map(|i| battle.limit_gauge(ActorId(i))), [100, LIMIT_MAX, 0]);
     assert!(!battle.limit_ready(ActorId(0)) && battle.limit_ready(ActorId(1)) && !battle.limit_ready(ActorId(2)));
     assert_eq!(battle.limit_gauge(ActorId(77)), 0, "an unknown actor has no gauge");
-    assert_eq!(battle.limit_for(ActorId(1)), Some(LimitInfo { attack: 128, targets_allies: false }));
+    assert_eq!(battle.limit_for(ActorId(1)), Some(LimitInfo { attack: 128, targets_allies: false, aim: Aim::One }));
 }
 
 #[test]
@@ -143,7 +143,7 @@ fn the_limit_command_needs_a_limit_a_full_gauge_an_open_turn_and_a_target_on_the
     plain.limit_break = None;
     let mut battle = settled(BattleState::with_config(1, vec![plain, hero(254), hero(255)], vec![foe(900, 5)], config(StartMode::Preemptive)));
     let enemy = ActorId(3);
-    let limit = |target| Command::Limit { target };
+    let limit = |target| Command::Limit { target: Target::One(target) };
     assert_eq!(battle.check_command(A, &limit(enemy)), Err(CommandError::NoLimit(A)));
     assert_eq!(battle.check_command(ActorId(1), &limit(enemy)), Err(CommandError::LimitNotReady(ActorId(1))));
     assert_eq!(battle.check_command(ActorId(2), &limit(ActorId(0))), Err(CommandError::InvalidTarget(ActorId(0))), "a damaging limit aims at an enemy");
@@ -181,7 +181,7 @@ fn the_limit_command_needs_a_limit_a_full_gauge_an_open_turn_and_a_target_on_the
 }
 
 #[test]
-fn a_healing_limit_aims_at_a_living_ally_and_restores_half_of_its_max_hp() {
+fn a_healing_limit_restores_half_of_every_living_allys_max_hp_and_only_aims_at_the_whole_party() {
     let mut hurt = hero(0);
     hurt.hp = 100;
     let mut dead = hero(0);
@@ -189,24 +189,31 @@ fn a_healing_limit_aims_at_a_living_ally_and_restores_half_of_its_max_hp() {
     let mut almost = hero(0);
     almost.hp = 350;
     let mut battle = settled(BattleState::with_config(1, vec![healer(255), hurt, dead, almost], vec![foe(900, 5)], config(StartMode::Preemptive)));
-    assert_eq!(battle.limit_for(A), Some(LimitInfo { attack: 142, targets_allies: true }));
-    let limit = |target| Command::Limit { target };
-    assert_eq!(battle.check_command(A, &limit(ActorId(4))), Err(CommandError::InvalidTarget(ActorId(4))), "an enemy is not an ally");
-    assert_eq!(battle.check_command(A, &limit(ActorId(2))), Err(CommandError::TargetDead(ActorId(2))));
-    let mut spare = battle.clone();
-    let events = battle.submit_command(A, limit(ActorId(1))).expect("heal the hurt one");
+    assert_eq!(battle.limit_for(A), Some(LimitInfo { attack: 142, targets_allies: true, aim: Aim::Side }));
+    // It is the whole party or nothing: one ally, one enemy or the enemies are no way to aim it.
+    for target in [Target::One(ActorId(1)), Target::One(A), Target::One(ActorId(4)), Target::AllEnemies] {
+        assert_eq!(battle.check_command(A, &Command::Limit { target }), Err(CommandError::InvalidReach(target)), "{target:?}");
+    }
+    let wind = Command::Limit { target: Target::AllAllies };
+    assert_eq!(battle.check_command(A, &wind), Ok(()));
+    let events = battle.submit_command(A, wind).expect("heal everyone");
+    // Everyone who is alive, in actor order, each for half of its own max HP (400 / 2) and never more than
+    // it was missing; the fallen are not touched. Not split: a fraction of max HP never is.
     assert_eq!(
         events,
         [
             BattleEvent::Action { actor: A, action: ActionRef::Limit(142) },
             BattleEvent::LimitGauge { actor: A, value: 0 },
+            BattleEvent::Heal { actor: A, target: A, amount: 0 },
             BattleEvent::Heal { actor: A, target: ActorId(1), amount: 200 },
+            BattleEvent::Heal { actor: A, target: ActorId(3), amount: 50 },
         ]
     );
-    assert_eq!(battle.actor(ActorId(1)).unwrap().hp, 300);
-    // Never more than the ally was missing.
-    let events = spare.submit_command(A, limit(ActorId(3))).expect("heal the other");
-    assert_eq!(events[2], BattleEvent::Heal { actor: A, target: ActorId(3), amount: 50 });
+    assert_eq!([A, ActorId(1), ActorId(2), ActorId(3)].map(|id| battle.actor(id).unwrap().hp), [400, 300, 0, 400]);
+    // A party with every ally fallen but the healer still has someone to heal: the healer.
+    let mut alone = settled(BattleState::with_config(1, vec![healer(255)], vec![foe(900, 5)], config(StartMode::Preemptive)));
+    let events = alone.submit_command(A, wind).expect("the healer heals itself");
+    assert_eq!(events.last(), Some(&BattleEvent::Heal { actor: A, target: A, amount: 0 }));
 }
 
 #[test]
@@ -233,7 +240,7 @@ fn a_knockout_empties_the_gauge_and_says_so_before_the_battle_ends() {
 #[test]
 fn a_limit_that_ends_the_battle_still_ends_it_on_the_victory() {
     let mut battle = settled(BattleState::with_config(1, vec![hero(255)], vec![foe(10, 5)], config(StartMode::Preemptive)));
-    let events = battle.submit_command(A, Command::Limit { target: ActorId(1) }).expect("the limit");
+    let events = battle.submit_command(A, Command::Limit { target: Target::One(ActorId(1)) }).expect("the limit");
     assert_eq!(events[1], BattleEvent::LimitGauge { actor: A, value: 0 }, "the gauge is spent before the effects");
     assert_eq!(events.last(), Some(&BattleEvent::Victory));
     assert_eq!(battle.outcome(), Some(Outcome::Victory));
@@ -387,9 +394,15 @@ fn random_battle(seed: u64, rule: Option<EscapeRule>) -> (BattleState, Vec<Battl
         log.extend(battle.step_ticks(40));
         for id in battle.ready_actors() {
             let target = ActorId(pick.below(5) as u8);
+            // One actor, or either whole side: the healer's limit is a whole side only.
+            let aim = match pick.below(4) {
+                0 => Target::AllEnemies,
+                1 => Target::AllAllies,
+                _ => Target::One(target),
+            };
             let command = match pick.below(10) {
                 0..=3 => Command::Attack { target },
-                4..=7 => Command::Limit { target },
+                4..=7 => Command::Limit { target: aim },
                 8 => Command::Defend,
                 _ => Command::Escape,
             };
@@ -455,7 +468,7 @@ fn the_new_events_commands_and_outcome_roundtrip_through_json() {
         let text = serde_json::to_string(&event).unwrap();
         assert_eq!(serde_json::from_str::<BattleEvent>(&text).unwrap(), event, "{text}");
     }
-    for command in [Command::Limit { target: ActorId(4) }, Command::Escape] {
+    for command in [Command::Limit { target: Target::One(ActorId(4)) }, Command::Escape] {
         let text = serde_json::to_string(&command).unwrap();
         assert_eq!(serde_json::from_str::<Command>(&text).unwrap(), command, "{text}");
     }

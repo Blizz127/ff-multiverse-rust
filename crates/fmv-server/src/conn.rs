@@ -981,7 +981,8 @@ mod tests {
     #[test]
     fn only_the_current_protocol_version_is_accepted() {
         assert!(check_version(PROTOCOL_VERSION).is_ok());
-        for other in [0, 1, PROTOCOL_VERSION + 1, u16::MAX] {
+        // The version before this one is refused too (v9 for v10: the target of a spell, an item or a limit changed shape).
+        for other in [0, 1, PROTOCOL_VERSION - 1, PROTOCOL_VERSION + 1, u16::MAX] {
             let err = check_version(other).unwrap_err();
             assert!(err.contains("protocol version mismatch"), "{err}");
             assert!(err.contains(&format!("v{PROTOCOL_VERSION}")) && err.contains(&format!("v{other}")), "{err}");
