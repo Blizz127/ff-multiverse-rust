@@ -63,8 +63,9 @@
 //!
 //! Placements in the main part (after the first `RET`) and conditional ones are left out
 //! (`NpcSpawn::unconditional` is therefore `true` for every NPC the data places; the flag stays so a later
-//! version can report story-dependent placements; the one exception today is the canon-cast stand-in
-//! below, which is flagged `false`).
+//! version can report story-dependent placements). The canon-cast stand-in below is flagged `true` too, although
+//! its placement is the script's conditional one: the server announces only the NPCs flagged so, and the
+//! allowlist is the decision that these characters stand there.
 //!
 //! **The canon cast** is the exception to "`PC` entities are the players": in a few fields the canon party
 //! member's own `PC` entity is reported as an NPC under his canon name, at the one conditional placement the
@@ -352,9 +353,11 @@ pub const CANON_STAND_INS: &[CanonStandIn] = &[
 ];
 
 /// The canon-cast stand-ins of `field_name`, after the NPCs the data places (so that the index of an NPC of the
-/// data, which the protocol keeps stable, never moves). Each is flagged `unconditional: false`: its placement is
-/// the script's conditional one, taken as it is. Nothing for a field that is not in [`CANON_STAND_INS`], or
-/// whose script or model-loader section is too big or damaged (the same guards as the NPCs).
+/// data, which the protocol keeps stable, never moves). Each is flagged `unconditional: true` although its placement
+/// is the script's conditional one, taken as it is: the server announces only the NPCs flagged so (a stand-in
+/// flagged `false` would never reach a client), and the allowlist is what says it stands there. Nothing for a field
+/// that is not in [`CANON_STAND_INS`], or whose script or model-loader section is too big or damaged (the same
+/// guards as the NPCs).
 pub(crate) fn canon_stand_in_spawns(
     field_name: &str,
     field: &FieldFile,
@@ -384,7 +387,7 @@ pub(crate) fn canon_stand_in_spawns(
             let character = init.player.and_then(|p| p.value.literal())?;
             let stand_in = wanted.iter().find(|s| s.character == character)?;
             let placement = init.placement()?;
-            spawn_of(init, stand_in.name, placement, false, loader.as_ref(), walkmesh, &height_at)
+            spawn_of(init, stand_in.name, placement, true, loader.as_ref(), walkmesh, &height_at)
         })
         .collect()
 }

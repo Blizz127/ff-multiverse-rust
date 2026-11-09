@@ -234,6 +234,10 @@
 //! instead of the canon character's, while the engine uses the slot's combat template. Nothing here is game
 //! data (ids, a colour, a name), and nothing about the canon NPCs of a field changes.
 //!
+//! The story lane's [`ServerMsg::StoryUpdate`] (see "Story, phases and instances" above) was added to v7 without
+//! a version of its own, because only an account that has advanced a story is sent one; v8 is the first version
+//! every client of which knows it. A player's story is the account's, never the character's or the slot's.
+//!
 //! # Rejections
 //!
 //! A refusal (or the end of a session the server decides to close) is `Reject { reason, code }`:

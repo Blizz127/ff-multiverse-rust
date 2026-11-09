@@ -600,10 +600,15 @@ its look named, Cloud without a look; a migrated account may hold Cloud's slot) 
 its binding (an account that never chose one gets the default placeholder body). The window's character
 creator takes a name, a body, a colour and a combat slot; headless players take `--body` and `--slot`
 (`fmv-client --help`). `scripts/slice-smoke.sh` proves the whole slice on your real data over real
-processes: two players with different identities and slots register, party up and win a shared battle
-whose roster shows their own names with their slots' templates while the canon Barret stays an NPC of the
-field, the server process is stopped and started again, and every card, number and record is exactly what
-it was.
+processes: two players with different identities and slots register, party up, advance one player's
+story (the server-validated story point of `md1stin`), talk to the field's guard and to the canon
+Barret (`fmv-client --headless --talk gu0,Barret` prints what a character says as `talk:` lines, read
+from your own copy of the field script with the player's own story: the guard says the game's own
+words, the same to both players, and Barret, who is no script entity, has nothing to say) and win a
+shared battle whose roster shows their own names with their slots' templates while the canon Barret
+stays an NPC of the field; the server process is stopped and started again, the same players log in
+again and are told exactly what they ended with (a login changes no record byte), and a second battle on
+the restarted server pays on top of what was saved, to the point.
 
 **Protocol v8** (`fmv-protocol`) carries all of the above; its module docs describe the flow,
 and golden JSON tests pin the wire format (the engine's own event, command and outcome types
@@ -611,6 +616,8 @@ included). v8 replaced `Hello`'s colour and look by the character to create (`He
 colour, body, slot), added the character card to `Welcome` and the player's own name to every battle
 roster member (`BattleMember::name`, required); neither side can read the other's `Hello`, so a v7
 client (or server) is refused at the handshake, cleanly, because the version of any `Hello` is readable.
+(v8 is also the first version every client of which knows the story lane's `StoryUpdate`, which v7 gained
+without a version of its own: only an account that advanced a story is sent one.)
 **Rolling back v8:** a v7 server never reads or writes `characters/`, so every record of v7 shape comes
 back exactly as it was (the migrated accounts included); a character created by v8 comes back as the
 canon character of its slot (its avatar profile carries that look as a compatibility mirror, which v8

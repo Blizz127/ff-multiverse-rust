@@ -337,6 +337,33 @@ stored_numbers() {
   jq -r '[.level, .exp, .gil, .ap, (.limit // 0)] | map(tostring) | join(" ")' "$progress"
 }
 
+# reward_of <server log> <account>: "exp gil ap" the server's `battle reward battle=1 account=<n> exp=.. gil=.. ap=..`
+# line says <account> was paid (nothing if there is no such line; a server process numbers its battles from 1).
+reward_of() {
+  local line
+  line=$(first_line_with "$1" "battle reward battle=1 account=$2 ") || return 0
+  line=$(strip_ansi "$line")
+  printf '%s %s %s' "$(field "$line" exp)" "$(field "$line" gil)" "$(field "$line" ap)"
+}
+
+# check_paid <what> <server log> <account> <before> <after>: <after> is <before> plus what the battle paid. Both are
+# "level exp gil ap ..." (the experience, gil and AP are the 2nd to 4th numbers): the arithmetic is exact, so a server
+# that dropped or reset a saved record (or paid twice) cannot pass.
+check_paid() {
+  local what="$1" log="$2" account="$3" reward
+  local -a b=() a=() r=()
+  reward=$(reward_of "$log" "$account")
+  if [[ -z $reward ]]; then
+    problem "$what: the server logged no 'battle reward' line for account $account"
+    return 0
+  fi
+  read -r -a b <<<"$4"
+  read -r -a a <<<"$5"
+  read -r -a r <<<"$reward"
+  expect_equal "$what: experience, gil and AP are what the player had plus the battle's reward ($reward)" \
+    "${a[1]:-?} ${a[2]:-?} ${a[3]:-?}" "$((${b[1]:-0} + ${r[0]:-0})) $((${b[2]:-0} + ${r[1]:-0})) $((${b[3]:-0} + ${r[2]:-0}))"
+}
+
 # stored_items <name>: the stored inventory as "item:count,..." ("-" when empty), or "none" when the record has no
 # inventory key (nothing ever changed it: the account still carries the game's starting stock, which is not stored).
 stored_items() {
@@ -389,6 +416,14 @@ npc_lines() {
   printf '%s' "$out"
 }
 
+# text_digest <text>: "<characters> characters, sha256 <12 hex>" of the text. The game's own dialogue is game data: the
+# smoke compares it and describes it this way, and never prints it.
+text_digest() {
+  local text="$1" sum
+  sum=$(printf '%s' "$text" | sha256sum)
+  printf '%d characters, sha256 %s' "${#text}" "${sum:0:12}"
+}
+
 # talk_text <client log> <npc>: the percent-decoded text of every window of the client's conversation with <npc>
 # (`talk: npc=<npc> ... window=<n> origin=<canon|added> text=<enc>`), joined with " | " (empty if there was none).
 talk_text() {
@@ -401,6 +436,47 @@ talk_text() {
     out+="${out:+ | }$text"
   done <"$log"
   printf '%s' "$out"
+}
+
+# roster_pairs <server "battle started" line>: the members' `name:slot` pairs from `names=[..]` and `characters=[..]`,
+# sorted and space separated. The server seats the two players in an order of its own (the party's), so what is checked
+# is which name goes with which slot template, never the seat.
+roster_pairs() {
+  local line names characters i
+  local -a n=() c=() out=()
+  line=$(strip_ansi "$1")
+  [[ $line =~ names=\[([^]]*)\] ]] || return 0
+  names="${BASH_REMATCH[1]}"
+  [[ $line =~ characters=\[([0-9,\ ]*)\] ]] || return 0
+  characters="${BASH_REMATCH[1]}"
+  IFS=',' read -r -a n <<<"$names"
+  IFS=', ' read -r -a c <<<"$characters"
+  for ((i = 0; i < ${#n[@]}; i++)); do
+    out+=("${n[$i]}:${c[$i]:-?}")
+  done
+  sorted_words_text "${out[@]}"
+}
+
+# roster_triples <client log>: the `name:slot:slot_name` of every `battle: roster actor=<i>` line of the log (every
+# battle it fought), sorted and space separated.
+roster_triples() {
+  local log="$1" line out=""
+  local -a rows=()
+  [[ -r $log ]] || return 0
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line == *"battle: roster actor="* ]] || continue
+    line=$(strip_ansi "$line")
+    rows+=("$(field "$line" name):$(field "$line" slot):$(field "$line" slot_name)")
+  done <"$log"
+  ((${#rows[@]})) || return 0
+  sorted_words_text "${rows[@]}"
+}
+
+# sorted_words_text <words...>: the words in byte order, space separated.
+sorted_words_text() {
+  local sorted
+  sorted=$(printf '%s\n' "$@" | LC_ALL=C sort | tr '\n' ' ')
+  printf '%s' "${sorted% }"
 }
 
 # last_items <client log>: the items= of the client's last `inventory:` note; first_items: of its first.
@@ -533,19 +609,21 @@ run_slice() {
   local text_a text_b
   text_a=$(talk_text "$la" gu0)
   text_b=$(talk_text "$lb" gu0)
-  say "A talks to gu0: $text_a"
+  local windows_a
+  windows_a=$(count_lines_with "$la" "talk: npc=gu0 story=1 window=")
+  say "A talks to gu0 (the game's own words, not printed): $windows_a window(s), $(text_digest "$text_a")"
   [[ -n $text_a ]] || problem "client A had no conversation with the guard gu0 ('talk: npc=gu0 ... text=' lines)"
-  [[ $text_a == *Potion* ]] || problem "the guard's first words do not mention the Potion it gives at the start of the game: '$text_a'"
-  expect_equal "the guard says the same to the Barret-slot player and to the Tifa-slot one" "$text_a" "$text_b"
+  [[ $text_a == *Potion* ]] || problem "the guard's first words do not name the Potion it gives at the start of the game ($(text_digest "$text_a"))"
+  [[ $text_a == "$text_b" ]] || problem "the guard says something else to the Tifa-slot player than to the Barret-slot one (A: $(text_digest "$text_a"); B: $(text_digest "$text_b"))"
   for n in "$NAME_A" "$NAME_B" Aria Brom Vale; do
-    [[ $text_a != *"$n"* && $text_b != *"$n"* ]] || problem "the dialogue contains the player's name '$n' (dialogue is never name-swapped): '$text_a' / '$text_b'"
+    [[ $text_a != *"$n"* && $text_b != *"$n"* ]] || problem "the dialogue contains the player's name '$n' (dialogue is never name-swapped)"
   done
-  if [[ $(first_line_with "$la" "talk: npc=Barret " || true) != *"nothing to say"* ]]; then
-    problem "the canon Barret NPC should have nothing to say (it needs no talk script): $(first_line_with "$la" "talk: npc=Barret " || echo none)"
-  fi
-  if [[ $(first_line_with "$la" "talk: npc=gu0 " || true) != *"origin=canon"* ]]; then
-    problem "the guard's words are not the game's own (origin=canon): $(first_line_with "$la" "talk: npc=gu0 " || echo none)"
-  fi
+  # (a failure prints the line without its text: the game's own words are game data)
+  local talk_line
+  talk_line=$(first_line_with "$la" "talk: npc=Barret " || echo none)
+  [[ $talk_line == *"nothing to say"* ]] || problem "the canon Barret NPC should have nothing to say (it needs no talk script): ${talk_line%% text=*}"
+  talk_line=$(first_line_with "$la" "talk: npc=gu0 " || echo none)
+  [[ $talk_line == *"origin=canon"* ]] || problem "the guard's words are not the game's own (origin=canon): ${talk_line%% text=*}"
 
   # The shared battle: both, the same one, won, verified by replay.
   local value ids=() smoke_line
@@ -575,14 +653,12 @@ run_slice() {
   started=$(first_line_with "$sl" "battle started" || true)
   started=$(strip_ansi "$started")
   [[ $started == *"members=2"* ]] || problem "the server's battle did not have two members: $started"
-  expect_equal "the server's roster names (battle started names=[..])" "$(field "$started" names)" "[$enc_a,$enc_b]"
-  [[ $started == *"characters=[$SLOT_A, $SLOT_B]"* ]] || problem "the server's battle did not use the slot templates [$SLOT_A, $SLOT_B] (Barret, Tifa): $started"
+  local want_pairs want_triples
+  want_pairs=$(sorted_words_text "$enc_a:$SLOT_A" "$enc_b:$SLOT_B")
+  want_triples=$(sorted_words_text "$enc_a:$SLOT_A:$SLOT_NAME_A" "$enc_b:$SLOT_B:$SLOT_NAME_B")
+  expect_equal "the server's roster (battle started: each player's own name with the slot template that fights for it)" "$(roster_pairs "$started")" "$want_pairs"
   for n in A B; do
-    local roster
-    roster=$(first_line_with "$WORK/r1-client-$n.log" "battle: roster actor=0" || true)
-    [[ $roster == *"name=$enc_a"* && $roster == *"slot=$SLOT_A"* && $roster == *"slot_name=$SLOT_NAME_A"* ]] || problem "client $n's roster line for actor 0 does not say $NAME_A / slot $SLOT_A: $roster"
-    roster=$(first_line_with "$WORK/r1-client-$n.log" "battle: roster actor=1" || true)
-    [[ $roster == *"name=$enc_b"* && $roster == *"slot=$SLOT_B"* && $roster == *"slot_name=$SLOT_NAME_B"* ]] || problem "client $n's roster line for actor 1 does not say $NAME_B / slot $SLOT_B: $roster"
+    expect_equal "client $n's roster lines (name, slot, slot name of each member)" "$(roster_triples "$WORK/r1-client-$n.log")" "$want_triples"
   done
   # What a player did is logged under its own name, whatever template it fights with (the bots only attack, and a
   # defeated enemy needs no more: the lines exist when a bot defended, cast or used a limit, so this is a soft check).
@@ -630,6 +706,8 @@ run_slice() {
     stored=$(stored_numbers "$name")
     # told is "level exp gil ap", stored is "level exp gil ap limit": compare the first four.
     expect_equal "session 1 $n: what the server last told it (level exp gil ap) is what is stored" "$told" "${stored% *}"
+    # And it is exactly what the player started with (told on joining) plus what the battle paid.
+    check_paid "session 1 $n" "$sl" "$(account_of "$name")" "$(progress_numbers "$WORK/r1-client-$n.log" first)" "$stored"
     # The inventory the server told is what is stored when the record holds one (a drop or an item used wrote it);
     # a record without the key means nothing changed it, so the player still carries the starting stock it was told
     # at its first join.
@@ -723,8 +801,10 @@ run_slice() {
   local started2
   started2=$(first_line_with "$s3" "battle started" || true)
   started2=$(strip_ansi "$started2")
-  expect_equal "the restarted server's roster names" "$(field "$started2" names)" "[$enc_a,$enc_b]"
-  [[ $started2 == *"characters=[$SLOT_A, $SLOT_B]"* ]] || problem "after the restart the battle did not use the slot templates [$SLOT_A, $SLOT_B]: $started2"
+  expect_equal "the restarted server's roster (each player's own name with the slot template that fights for it)" "$(roster_pairs "$started2")" "$want_pairs"
+  for n in A B; do
+    expect_equal "after the restart client $n's roster lines" "$(roster_triples "$WORK/r3-client-$n.log")" "$want_triples"
+  done
   # The levels and limit gauges the players ended session 1 with (the stored record: level is the first number, the
   # limit gauge the fifth) are what the restarted server fights them with.
   local -a sa sb
@@ -753,6 +833,8 @@ run_slice() {
     read -r -a now_a <<<"$now"
     ((${now_a[0]:-0} >= ${was_a[0]:-1})) || problem "session 2b $n: the level went DOWN ($was -> $now)"
     ((${now_a[1]:-0} > ${was_a[1]:-0})) || problem "session 2b $n: a won battle paid no experience ($was -> $now)"
+    # Exactly what session 1 saved plus what the second battle paid: the restarted server started from the saved record.
+    check_paid "session 2b $n" "$s3" "$(account_of "$name")" "$was" "$now"
   done
 
   after=$(ls -A -- "$state_real" | sort | tr '\n' ' ')
@@ -771,7 +853,7 @@ run_slice() {
     say "session 2 client $n: $(card_of "$WORK/r2-client-$n.log")"
   done
   say "session 1 NPCs of md1stin (the Barret-slot player's list; the Tifa-slot player's is identical): $npcs_a"
-  say "session 1 guard talk: $text_a"
+  say "session 1 guard talk: $windows_a window(s), origin=canon, the same text for both players ($(text_digest "$text_a"))"
   say "session 2b server: $started2"
   RESULT=pass
   say "PASS: two original characters (distinct identities, bodies and slots) partied up, advanced a story and won a shared battle; the roster named them, not their slot's canon characters; the canon Barret NPC was in the field for both and the dialogue was the game's own; after a REAL server restart every card, record, level, experience, gil, AP, inventory, limit gauge and story was exactly what it was, the records were byte for byte unchanged by a login, and the restarted server fought them as their slots; $state_real unchanged ($after)."

@@ -13,7 +13,7 @@
 //! files are only ever opened read-only, and what the tests print are counts, field names, entity
 //! names, model stems and numbers: no game bytes and no dialog text.
 
-use fmv_adapter_api::{AreaRuntime, GameAdapter, MoveResult};
+use fmv_adapter_api::{AreaRuntime, GameAdapter, MoveResult, NpcSpawn};
 use fmv_core::{EditionProvenance, GameId, Platform, Pos};
 use fmv_ff7::background::Projection;
 use fmv_ff7::field::{FieldFile, Walkmesh};
@@ -23,7 +23,7 @@ use fmv_ff7::script::{
     parse_model_list, resolve_gateways, resolve_map_jumps, triangle_contains_xy, triangle_height_at, Arg, EntityInit, FieldScript, Maplist,
     Phase,
 };
-use fmv_ff7::{decode_encounter_section, field_direction_to_facing, Ff7Adapter, Ff7FieldArea};
+use fmv_ff7::{decode_encounter_section, field_direction_to_facing, Ff7Adapter, Ff7FieldArea, CANON_STAND_INS};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -54,6 +54,14 @@ fn adapter(dir: &std::path::Path) -> Ff7Adapter {
         modded: false,
     };
     Ff7Adapter::from_flevel_path(flevel(dir), provenance).unwrap()
+}
+
+/// `npcs` (what `npcs()` of `field` returns) as the NPCs the data places and, after them, the canon-cast stand-ins of
+/// the field (`CANON_STAND_INS`; none for most fields). Both are flagged `unconditional`: the server announces only the
+/// NPCs flagged so, and a stand-in flagged otherwise would never reach a client.
+fn split_stand_ins<'a>(field: &str, npcs: &'a [NpcSpawn]) -> (&'a [NpcSpawn], &'a [NpcSpawn]) {
+    let count = CANON_STAND_INS.iter().filter(|s| s.field.eq_ignore_ascii_case(field)).count();
+    npcs.split_at(npcs.len().saturating_sub(count))
 }
 
 /// Wall-clock cost of `Ff7Adapter::load_field` for `md1stin`: the first call of a fresh adapter
@@ -738,12 +746,15 @@ fn md1stin_and_md1_1_npcs_and_the_guards() {
         }
         let expected: Vec<String> = inits.iter().filter(|e| verdict(e, &area).is_ok()).map(|e| e.name.clone()).collect();
         // What the DATA places (unconditional placements of non-player entities) is exactly the restated rules; the
-        // canon cast the slice keeps in these two fields (`CANON_STAND_INS`: Barret, one conditional placement,
-        // flagged `unconditional: false`) comes after it. That is why these lists are one longer than the data's:
-        // md1stin 2 -> 3 (`gu0`, `gu1`, Barret), md1_1 5 -> 6 (`av_m`, `av_l`, `av_s`, `drL`, `drR`, Barret).
-        let got: Vec<String> = npcs.iter().filter(|n| n.unconditional).map(|n| n.entity_name.clone()).collect();
+        // canon cast the slice keeps in these two fields (`CANON_STAND_INS`: Barret, one conditional placement, flagged
+        // like the others so that the server announces it) comes after it. That is why these lists are one longer than
+        // the data's: md1stin 2 -> 3 (`gu0`, `gu1`, Barret), md1_1 5 -> 6 (`av_m`, `av_l`, `av_s`, `drL`, `drR`, Barret).
+        let (data, stand_in_npcs) = split_stand_ins(name, &npcs);
+        assert!(data.iter().all(|n| n.unconditional), "{name}");
+        let got: Vec<String> = data.iter().map(|n| n.entity_name.clone()).collect();
         assert_eq!(got, expected, "{name}: the data's NPCs against the restated rules");
-        let stand_ins: Vec<&str> = npcs.iter().filter(|n| !n.unconditional).map(|n| n.entity_name.as_str()).collect();
+        assert!(stand_in_npcs.iter().all(|n| n.unconditional), "{name}: the server announces only the NPCs flagged unconditional");
+        let stand_ins: Vec<&str> = stand_in_npcs.iter().map(|n| n.entity_name.as_str()).collect();
         assert_eq!(stand_ins, ["Barret"], "{name}: the canon cast stand-in");
         assert_eq!(npcs.len(), expected.len() + 1, "{name}: the stand-in is the only addition");
         assert!(npcs.last().is_some_and(|n| n.entity_name == "Barret"), "{name}: after the NPCs of the data, so their indexes do not move");
@@ -802,7 +813,8 @@ fn describe_fields_from_the_environment() {
 /// report, and `md1_2` has neither a loader record with his skeleton nor an entity that wears it. Across the
 /// archive the rules report an NPC with his skeleton in only five fields, none of them a reactor field. The
 /// slice keeps the canon cast in the story (`CANON_STAND_INS`): `md1stin` and `md1_1` report ONE more NPC, Barret
-/// under his canon name at that entity's one (conditional) placement, flagged `unconditional: false`;
+/// under his canon name at that entity's one (conditional) placement, flagged `unconditional` so that the server
+/// announces it;
 /// `md1_2` reports none. So `npcs()` has 3, 6 and 3 entries where the data's rules give 2, 5 and 3. Prints counts
 /// only.
 #[test]
@@ -838,14 +850,14 @@ fn barret_is_a_party_member_in_the_data_and_a_stand_in_npc_in_the_first_reactor_
         // The data's rules report no NPC with his skeleton; the one more NPC of md1stin and md1_1 is the canon cast
         // stand-in (a slice rule, `CANON_STAND_INS`), which wears it under his canon name, at the one (conditional)
         // placement of his entity, after the data's NPCs.
-        let data: Vec<_> = npcs.iter().filter(|n| n.unconditional).collect();
+        let (data, stand_ins) = split_stand_ins(name, &npcs);
         assert_eq!(data.len(), data_npcs, "{name}");
         assert!(data.iter().all(|n| n.appearance.model != "acgd"), "{name}: no NPC of the data wears Barret's skeleton");
-        let stand_ins: Vec<_> = npcs.iter().filter(|n| !n.unconditional).collect();
+        assert!(stand_ins.iter().all(|n| n.unconditional), "{name}: the server announces only the NPCs flagged unconditional");
         match placement {
             Some(((x, y), z, _)) => {
                 assert_eq!(stand_ins.len(), 1, "{name}");
-                let n = stand_ins[0];
+                let n = &stand_ins[0];
                 assert_eq!((n.entity_name.as_str(), n.appearance.model.as_str()), ("Barret", "acgd"), "{name}");
                 assert_eq!((n.pos.x, n.pos.y, n.pos.z), (f32::from(x), f32::from(y), f32::from(z)), "{name}: his entity's placement");
                 assert!(npcs.last().is_some_and(|last| last.entity_name == "Barret"), "{name}: after the data's NPCs");
@@ -876,9 +888,11 @@ fn barret_is_a_party_member_in_the_data_and_a_stand_in_npc_in_the_first_reactor_
         with_entity += usize::from(!barrets.is_empty());
         with_player += usize::from(barrets.iter().any(|e| e.is_player()));
         with_plain += usize::from(barrets.iter().any(|e| !e.is_player()));
-        // The NPCs the data places (the canon cast stand-ins, flagged `unconditional: false`, are counted below).
-        let npcs = area.npcs().iter().filter(|n| n.unconditional && n.appearance.model == "acgd").count();
-        let stand_in = area.npcs().iter().filter(|n| !n.unconditional && n.appearance.model == "acgd").count();
+        // The NPCs the data places (the canon cast stand-ins, which come after them, are counted below).
+        let all = area.npcs();
+        let (data, stand_ins) = split_stand_ins(key, &all);
+        let npcs = data.iter().filter(|n| n.appearance.model == "acgd").count();
+        let stand_in = stand_ins.iter().filter(|n| n.appearance.model == "acgd").count();
         if stand_in > 0 {
             stand_in_fields.push(key.clone());
         }
@@ -929,11 +943,12 @@ fn npcs_of_every_field_follow_the_rules() {
         let inits = inits_of(&area);
         let npcs = area.npcs();
         let expected: Vec<(String, Pos)> = inits.iter().filter_map(|e| Some((e.name.clone(), verdict(e, &area).ok()?))).collect();
-        // The data's NPCs are exactly the restated rules; the canon cast stand-ins (`unconditional: false`, only md1stin and
-        // md1_1) come after them and are checked by `barret_is_a_party_member_in_the_data_and_a_stand_in_npc_...`.
-        let got: Vec<(String, Pos)> = npcs.iter().filter(|n| n.unconditional).map(|n| (n.entity_name.clone(), n.pos)).collect();
+        // The data's NPCs are exactly the restated rules; the canon cast stand-ins (only md1stin and md1_1) come after them
+        // and are checked by `barret_is_a_party_member_in_the_data_and_a_stand_in_npc_...`.
+        let (data, _) = split_stand_ins(key, &npcs);
+        let got: Vec<(String, Pos)> = data.iter().map(|n| (n.entity_name.clone(), n.pos)).collect();
         assert_eq!(got, expected, "{key}");
-        for n in npcs.iter().filter(|n| n.unconditional) {
+        for n in data {
             assert!(n.pos.is_finite() && n.facing.is_finite() && n.unconditional, "{key}: {n:?}");
             assert!(!n.appearance.model.is_empty() && n.appearance.model.len() <= 8, "{key}: {}", n.appearance.model);
             assert!(n.facing > -std::f32::consts::PI - 1e-5 && n.facing <= std::f32::consts::PI + 1e-5);

@@ -451,7 +451,9 @@ fn the_canon_barret_is_an_npc_of_the_fields_that_say_so_under_his_canon_name() {
         assert_eq!(barret.facing, field_direction_to_facing(64), "{key}");
         assert_eq!((barret.appearance.model.as_str(), barret.appearance.idle_animation.as_deref()), ("acgd", Some("adcb")), "{key}");
         assert_eq!(barret.appearance.label, "md.barret");
-        assert!(!barret.unconditional, "{key}: a placement the script makes conditional");
+        // The server announces only the NPCs flagged unconditional: a stand-in flagged otherwise would never reach a client
+        // (the first real-process slice run found exactly that), so the allowlist's characters are flagged as announced.
+        assert!(barret.unconditional, "{key}: the stand-in is announced by the server");
         assert!(find(&npcs, "guard").unwrap().unconditional, "{key}: what the data places is unconditional as before");
     }
 }
