@@ -269,6 +269,18 @@ right, the area name (`FF7 md1stin`), the connection status (players, round-trip
 pending invite; a FIXTURE area wears the label `FIXTURE (synthetic, not FF7)`. The window title
 still shows your party size and a pending invite.
 
+*Talking.* In an FF7 field, **Enter** or **Space** (the controller's **A**) next to a character, facing
+it, opens that character's own dialogue in a blue window at the bottom of the screen. The text is the
+game's, read by your client from your own copy of the field's script and shown exactly as written (the
+names in it are the game's default names: whoever you play is never written into a line about Cloud
+or the rest of the cast; nothing about dialogue goes over the network). **Enter**, **Space** or **A**
+turns the page, goes on to the next window and answers a question (**Up/Down** or **W/S** move the
+pointer), **Backspace**, **B** or **Esc** closes the window, and you stand still while it is open. A
+character's talk script is run only as far as the messages it shows (`fmv_ff7::script::dialogue`): what
+it would do besides (give an item, start a battle, move you to another field) is not done, and until a
+story source is plugged in its branches are read as at the start of a new game. A character with
+nothing to say there (hidden, silenced, no talk script) does nothing when you talk to it.
+
 *Characters.* In an FF7 field every player, you included, is drawn as the field model of the
 look they chose (`ff7/cloud`, `ff7/tifa`, ... `ff7/vincent`), standing on the walkmesh at their
 position and facing the way they face, with the idle, walk or run animation of what they are

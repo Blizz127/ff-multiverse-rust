@@ -121,6 +121,7 @@
 
 mod analysis;
 mod decode;
+pub mod dialogue;
 mod layout;
 mod maplist;
 mod models;

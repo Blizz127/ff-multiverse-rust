@@ -56,6 +56,17 @@ const HIGH_GLYPHS: [Option<char>; 0x74] = {
 /// First byte covered by [`HIGH_GLYPHS`].
 const HIGH_BASE: u8 = 0x60;
 
+/// The character a plain text byte stands for (`0x00..=0x5E` is ASCII minus `0x20`, `0x60..=0xD3`
+/// the accented letters and symbols of the table above), `None` for control bytes and for the
+/// bytes the table leaves empty. The one place the dialogue module reads the glyph table from.
+pub(crate) fn glyph(byte: u8) -> Option<char> {
+    match byte {
+        0x00..=0x5E => Some(char::from(byte + 0x20)),
+        HIGH_BASE..=0xD3 => HIGH_GLYPHS.get(usize::from(byte - HIGH_BASE)).copied().flatten(),
+        _ => None,
+    }
+}
+
 /// Names of the colour escapes `FE D2..=DB`.
 const COLOURS: [&str; 10] = ["GRAY", "BLUE", "RED", "PURPLE", "GREEN", "CYAN", "YELLOW", "WHITE", "FLASH", "RAINBOW"];
 
