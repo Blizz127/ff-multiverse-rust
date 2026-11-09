@@ -206,7 +206,7 @@ fn offscreen_character_create_screens() {
     shoot(&mut gpu, "22-create-1920x1080", &m, 1920, 1080);
 }
 
-/// The create screen as a player sees it: the Body and Slot rows, each with the line that says what it means under it
+/// The create screen as a player sees it: the Body and Fighting style rows, each with the line that says what it means under it
 /// (`creator.png` in `$FMV_SHOT_DIR`, at the window's default size). The other sizes (`creator-<w>x<h>.png`) show how
 /// the lines give way where the window has no room for both: the help of the focused row takes the place of the key
 /// hints under the buttons.
@@ -226,11 +226,11 @@ fn offscreen_creator() {
     for _ in 0..4 {
         press(&mut m, NavKey::Tab); // red, green, blue, the slot
     }
-    press(&mut m, NavKey::Right); // Tifa's slot
+    press(&mut m, NavKey::Right); // the Martial artist
     let img = shoot(&mut gpu, "creator", &m, W, H);
     let mut list = DrawList::new();
     screens::draw_menu(&m, W, H, &mut list);
-    for needle in ["Name", "Body", "Slot", "Tifa Lockhart", "how you look on the field (a placeholder model)", "who you fight as: its combat moves and level curve", "(fixed once created)"] {
+    for needle in ["Name", "Body", "Fighting style", "Martial artist", "how you look on the field (a placeholder model)", "how you fight: its stats, spells and level curve", "(fixed once created)"] {
         assert!(list.says(needle), "{needle:?} is on the screen");
     }
     // The help lines are DIM text under their rows, and they reach the screen.

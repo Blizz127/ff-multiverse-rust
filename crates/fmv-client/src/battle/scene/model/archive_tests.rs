@@ -140,8 +140,9 @@ fn enemy(id: Option<u16>) -> EnemyLook {
     EnemyLook { actor: ActorId(3), enemy_id: id, name: "MP".into(), max_hp: 30, level: 2 }
 }
 
+/// A canon companion: the only kind of party member the archive gives a battle model.
 fn party(character: u8) -> PartyLook {
-    PartyLook { actor: ActorId(0), character, mine: true }
+    PartyLook::companion(ActorId(0), character, true)
 }
 
 /// Battle placeholder: the slot's own battle model. The model of a party member is the character in whose

@@ -38,7 +38,7 @@
 use super::camera::{BattleCamera, View};
 use super::clips::{Chain, ClipSet, Kit, Role};
 use super::effects::Element;
-use super::shots::{contact_sheet, member, open_real, Real, Server, ME, H, W};
+use super::shots::{canon, contact_sheet, open_real, Real, Server, ME, H, W};
 use super::*;
 use crate::avatar::ground::{circle, GroundShape};
 use crate::avatar::library::AvatarAsset;
@@ -732,8 +732,9 @@ struct Fight {
 }
 
 impl Fight {
-    /// Formation `formation` (301: two MPs) against Cloud, Tifa and Barret at level 12, the party ready (a
-    /// preemptive start), the engine seeded with `seed`.
+    /// Formation `formation` (301: two MPs) against the canon Cloud, Tifa and Barret at level 12 (companions: the canon
+    /// characters' own battle models, clips and blows are what the sheets show), the party ready (a preemptive start),
+    /// the engine seeded with `seed`.
     fn new(real: &Real, formation: u16, seed: u64) -> Option<Self> {
         Self::with_limits(real, formation, seed, [0; 3])
     }
@@ -744,15 +745,15 @@ impl Fight {
         Self::with_party(real, formation, seed, [0, 2, 1], limits)
     }
 
-    /// The same fight with a party of the combat slots `characters` (FF7's ids: Cloud 0, Barret 1, Tifa 2, Aerith 3, Red
-    /// XIII 4, Yuffie 5, Cait Sith 6, Vincent 7, Cid 8), the first one ours.
+    /// The same fight with a party of the canon characters `characters` (FF7's ids: Cloud 0, Barret 1, Tifa 2, Aerith 3, Red
+    /// XIII 4, Yuffie 5, Cait Sith 6, Vincent 7, Cid 8), all of them companions (no player is in these battles).
     fn with_party(real: &Real, formation: u16, seed: u64, characters: [u8; 3], limits: [u16; 3]) -> Option<Self> {
         let gpu = Offscreen::new()?;
-        let limited = |i: u64, character: u8| BattleMember { limit: limits[i as usize], ..member(i, character) };
+        let limited = |i: usize, character: u8| BattleMember { limit: limits[i], ..canon(character) };
         let setup = BattleSetup {
             formation_id: formation,
             seed,
-            party: characters.iter().enumerate().map(|(i, &c)| limited(i as u64, c)).collect(),
+            party: characters.iter().enumerate().map(|(i, &c)| limited(i, c)).collect(),
             preemptive: true,
             back_attack: false,
             battle_speed: 0,
@@ -918,7 +919,7 @@ fn party_attack_range_by_starting_weapon() {
         let setup = BattleSetup {
             formation_id: 301,
             seed: SEED,
-            party: ids.iter().enumerate().map(|(i, &c)| member(i as u64, c)).collect(),
+            party: ids.iter().map(|&c| canon(c)).collect(),
             preemptive: true,
             back_attack: false,
             battle_speed: 0,

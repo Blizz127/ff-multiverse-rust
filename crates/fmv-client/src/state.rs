@@ -490,6 +490,17 @@ impl ClientState {
         }
     }
 
+    /// How the server shows `entity` (its binding, the `appearance_ref` of its snapshots), ours or another player's in
+    /// this area (`None` for one it has not told us of, or one it showed with no look): what the battle scene draws a
+    /// PLAYER's body as. Untrusted text, only ever looked up in this machine's own table of models.
+    pub fn appearance_of(&self, entity: EntityId) -> Option<&str> {
+        if entity == self.self_entity {
+            self.own_appearance.as_deref()
+        } else {
+            self.remotes.get(&entity).and_then(|r| r.appearance.as_deref())
+        }
+    }
+
     /// The other players first seen (or whose colour or binding changed) since the last call, oldest first.
     pub fn drain_peer_sightings(&mut self) -> Vec<PeerSighting> {
         self.peer_sightings.drain(..).collect()

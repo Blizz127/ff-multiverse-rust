@@ -719,6 +719,29 @@ mod tests {
         assert_eq!((hp("427/427"), hp("120/480"), hp("0/390")), (Some(TEXT), Some(HP_LOW), Some(ERROR)));
     }
 
+    /// The most a battle has in protocol v9: the canon Cloud and Barret and the three players of a full party. The panel
+    /// lists all five with their own names, one row each, and its window stays inside the canvas at the usual sizes.
+    #[test]
+    fn the_party_panel_lists_all_five_members_of_a_full_party_at_the_usual_sizes() {
+        let mut view = battle();
+        view.party = vec![
+            bar(0, "Cloud", 427, 427, 59, 59, false),
+            bar(1, "Barret", 480, 480, 40, 40, false),
+            bar(2, "Blizzy", 332, 332, 44, 44, true),
+            bar(3, "Wedge", 314, 314, 46, 46, false),
+            bar(4, "Biggs", 326, 326, 46, 46, false),
+        ];
+        view.enemies = vec![bar(5, "MP", 55, 55, 0, 0, false), bar(6, "MP", 55, 55, 0, 0, false)];
+        for (w, h) in [(1100u32, 680u32), (1280, 720), (1920, 1080), (800, 600)] {
+            let l = layout(w, h, view.party.len());
+            assert!(l.party.y >= 0 && l.party.y + l.party.h <= l.ch, "{w}x{h}: the party window is inside the canvas");
+            let said = drawn(&draw(&view, w, h));
+            for name in ["Cloud", "Barret", "Blizzy", "Wedge", "Biggs"] {
+                assert!(said.iter().any(|t| t.contains(name)), "{w}x{h}: the party panel names {name}: {said:?}");
+            }
+        }
+    }
+
     #[test]
     fn the_enemy_list_names_the_living_and_leaves_out_the_dead() {
         let said = drawn(&draw(&battle(), 1100, 680));
