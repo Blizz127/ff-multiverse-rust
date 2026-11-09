@@ -508,8 +508,9 @@ Same design as FF7: a pure engine of owned data, seed and inputs; server-authori
 | C | GF summons, GF abilities, compatibility | `kernel.bin` GF sections; initial compatibility data (probably `init.out`: the page exists in the wiki index `[verify: doc H-IDX]`, contents unread) |
 | D | limit breaks, statuses, the monsters' AI scripts | `kernel.bin` limit sections; `c0mXXX.dat` section 8; the wiki documents an enemy-AI VM `[verify: doc H-IDX]` |
 
-FF7's engine does not decode enemy AI scripts (enemies pick among their attacks); FF8 starts the same way and
-adds the AI VM in stage D. The documented formulas (`battle/formulas` in the wiki index) are unread: reading them
+FF7's engine runs the enemies' own AI scripts since protocol v11 (`fmv_ff7_battle::ai`, a bounded interpreter with
+the plain pick among their attacks as the per-turn fallback); FF8 starts with the plain pick and adds its AI VM in
+stage D. The documented formulas (`battle/formulas` in the wiki index) are unread: reading them
 is the first task of stage A, with approximations labelled as the FF7 engine labels them.
 
 ### 5.5 Triple Triad as a multiplayer feature
