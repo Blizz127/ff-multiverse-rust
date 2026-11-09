@@ -435,3 +435,102 @@ fn an_area_without_links_is_not_the_navigators_business() {
     assert!(!bot.wants_press());
     assert_eq!(bot.take_press(), None);
 }
+
+/// The surface of [`Dogleg`]: the west room, a corridor over the top, the strip east of the exit's line, and the strip west
+/// of it, as `(x0, x1, y0, y1)`. The strip west of the line ends 10 units short of the corridor, so the only way into it
+/// from the west room is round the corridor and over the line from the EAST.
+const DOGLEG: [(f32, f32, f32, f32); 4] = [(-300.0, -100.0, -100.0, 100.0), (-300.0, 340.0, 100.0, 140.0), (300.0, 340.0, -100.0, 140.0), (100.0, 300.0, -100.0, 90.0)];
+
+/// An area whose exit (the line x = 300, y -100..100, to `next`) is reached by walkers that start in the west room from the
+/// far side: the way round is the corridor. It has one walk-on link (far from everything) so that its walkers use the navigator.
+struct Dogleg {
+    info: AreaInfo,
+}
+
+impl Dogleg {
+    fn holds(x: f32, y: f32) -> bool {
+        DOGLEG.iter().any(|&(x0, x1, y0, y1)| (x0..=x1).contains(&x) && (y0..=y1).contains(&y))
+    }
+}
+
+impl AreaRuntime for Dogleg {
+    fn info(&self) -> &AreaInfo {
+        &self.info
+    }
+    fn spawn_points(&self) -> Vec<Pos> {
+        vec![Pos::new(-200.0, 0.0, 0.0)]
+    }
+    fn validate_move(&self, from: Pos, to: Pos) -> MoveResult {
+        if !(from.is_finite() && to.is_finite()) || !Self::holds(from.x, from.y) {
+            return MoveResult::Corrected(self.spawn_points()[0]);
+        }
+        let n = (from.dist_xy(to) / 2.0).ceil().max(1.0) as usize;
+        let walkable = (1..=n).all(|i| {
+            let t = i as f32 / n as f32;
+            Self::holds(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t)
+        });
+        if walkable {
+            MoveResult::Accepted(Pos::new(to.x, to.y, 0.0))
+        } else {
+            MoveResult::Corrected(Pos::new(from.x, from.y, 0.0))
+        }
+    }
+    fn bounds(&self) -> Bounds {
+        Bounds { min: Pos::new(-300.0, -100.0, 0.0), max: Pos::new(340.0, 140.0, 0.0) }
+    }
+    fn walk_triangles(&self) -> Vec<[Pos; 3]> {
+        Vec::new()
+    }
+    fn max_speed(&self) -> f32 {
+        600.0
+    }
+    fn exits(&self) -> Vec<Exit> {
+        vec![Exit {
+            line: (Pos::new(300.0, -100.0, 0.0), Pos::new(300.0, 100.0, 0.0)),
+            target: AreaKey::from("next"),
+            arrival: Pos::new(0.0, 0.0, 0.0),
+            arrival_facing: None,
+            arrival_hint: None,
+            kind: ExitKind::Gateway,
+        }]
+    }
+    fn links(&self) -> Vec<Link> {
+        vec![Link {
+            line: (Pos::new(-290.0, -90.0, 0.0), Pos::new(-290.0, -80.0, 0.0)),
+            to: Pos::new(-250.0, -50.0, 0.0),
+            to_hint: None,
+            needs_ok: false,
+            label: "jump".into(),
+        }]
+    }
+}
+
+#[test]
+fn a_walker_whose_way_round_comes_to_the_exit_from_the_far_side_aims_again_from_where_it_stands_and_crosses() {
+    // The aim of an exit is a little past the middle of its line along the way from where the walk STARTED (here the west
+    // room, so due east): a point east of the line. The way there is the corridor, which comes to the line from the east, so
+    // the walker arrives at the aim without having crossed anything and the exit is still ahead of it, to the WEST. A
+    // walker that stood there for good (as one did, in the stair up from the reactor's core) is the failure; it aims again
+    // from where it stands and crosses.
+    let area = Dogleg { info: RoomsAdapter::new().list_areas().remove(0) };
+    let exit = area.exits().remove(0);
+    let mut sim = Sim::new(&area, Pos::new(-200.0, 0.0, 0.0));
+    let mut bot = to_next();
+    let mut east = false;
+    let mut crossed_from_east = false;
+    let dt = 0.01_f32;
+    for _ in 0..6000 {
+        bot.observe(sim.area, sim.pos);
+        let before = sim.pos;
+        let step = bot.step(sim.area, sim.pos, dt, 360.0);
+        sim.apply(step);
+        east |= sim.pos.x > 310.0;
+        if exit.is_crossed_by(before, sim.pos) {
+            crossed_from_east = before.x > 300.0;
+            break;
+        }
+    }
+    assert!(bot.gave_up().is_none(), "{:?}", bot.gave_up());
+    assert!(east, "the way round is by the east side of the line: {:?}", sim.pos);
+    assert!(crossed_from_east, "it crossed the line going west, after it had come round: {:?}", sim.pos);
+}

@@ -441,6 +441,13 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>, mut 
     if story_bot.is_requested() || session.state.story.advances() > 0 {
         eprintln!("headless: story advances: {}", session.state.story.advances());
     }
+    if session.state.countdown.told() > 0 {
+        eprintln!(
+            "headless: countdown: told {} time(s), {} at the end",
+            session.state.countdown.told(),
+            if session.state.countdown.is_running() { "still running" } else { "over" }
+        );
+    }
     if presses_sent > 0 {
         eprintln!("headless: OK presses sent: {presses_sent}");
     }

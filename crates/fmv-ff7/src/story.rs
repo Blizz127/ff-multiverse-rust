@@ -194,14 +194,23 @@ pub struct TrackedVar {
 
 /// Bit 0 of the reactor's state byte: the lift of `elevtr1` is at the bottom (see [`REACTOR_STATE`]).
 pub const LIFT_BIT: u8 = 0;
+/// Bit 5 of the reactor's state byte: the woman who is stuck on the way out of `nmkin_3` has been freed (see
+/// [`REACTOR_STATE`]).
+pub const FREED_BIT: u8 = 5;
 /// Bit 7 of the reactor's state byte: the countdown ran out (see [`REACTOR_STATE`]).
 pub const TIMEOUT_BIT: u8 = 7;
 
-/// **The reactor's state byte (`Var[1][225]`): two of its bits are carried.**
+/// **The reactor's state byte (`Var[1][225]`): three of its bits are carried.**
 ///
 /// * **Bit 0, the lift of `elevtr1` is at the bottom.** The `ele` entity of that field sets it when the party rides
 ///   down (its panel, then `BITON Var[1][225] bit 0`), clears it on the ride back up, and the four exits of the lift's
 ///   line are decided by it (`Var[1][225] lacks bit 0`: up to `nmkin_1`; set: down to `nmkin_2`).
+/// * **Bit 5, the woman of `nmkin_3` is freed.** On the way out, at moment 27 or later, her talk script (slot 1 of `av_j`) turns
+///   it on, with the bit clear, and she walks off. It is a talk that moves the story (the model's own definition: a tracked
+///   bit turned on), so it is a talk point like the ones of the way down. The bit only decides where she and her
+///   namesake of `nmkin_1` stand and whether the second door of `nmkin_1` opens, none of which a server models (it has no
+///   locks and its cast does not change with the moment), so no exit or point waits for it: it is carried because the
+///   party takes the step, and the saved story keeps it.
 /// * **Bit 7, the countdown ran out.** Each reactor field's `timeo` entity sets it when the timer that the Guard
 ///   Scorpion step starts reaches zero (then a `MAPJUMP` to `nrthmk`), and `nrthmk`'s finale reads it: with it clear the
 ///   party has escaped (moment 33), with it set the finale ends in `GAMEOVER`. It is carried ONLY so that the finale's
@@ -209,10 +218,14 @@ pub const TIMEOUT_BIT: u8 = 7;
 ///   (see `fmv-server`'s `world::countdown`), so the finale applies to a party that was late as much as to one that was
 ///   not, and nobody is ever held at moment 27.
 ///
-/// The byte has six more bits that the first mission's scripts set (the doors, the bomb, the characters on the way out)
+/// The byte has five more bits that the first mission's scripts set (the doors, the bomb, the characters on the way out)
 /// and that nothing here writes: a guard that tests one of them cannot be judged.
-pub const REACTOR_STATE: TrackedVar =
-    TrackedVar { bank: 1, address: 225, bits: (1 << LIFT_BIT) | (1 << TIMEOUT_BIT), never_set: 1 << TIMEOUT_BIT };
+pub const REACTOR_STATE: TrackedVar = TrackedVar {
+    bank: 1,
+    address: 225,
+    bits: (1 << LIFT_BIT) | (1 << FREED_BIT) | (1 << TIMEOUT_BIT),
+    never_set: 1 << TIMEOUT_BIT,
+};
 
 /// Every variable beyond the moment the model carries. Adding one is adding a row here, and a story point
 /// that writes it.

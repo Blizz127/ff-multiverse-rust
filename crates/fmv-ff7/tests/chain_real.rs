@@ -683,7 +683,7 @@ fn the_woman_and_the_materia_are_talk_points_and_the_talk_scripts_decide_their_s
     assert_eq!(radius, 80.0, "the radius a character without its own has");
     let npcs = nmkin_3.npcs();
     assert_eq!(npcs.iter().filter(|n| n.pos == center).count(), 1, "one NPC stands at the point's centre: the woman");
-    for (moment, want) in [(1, Some("moment=1->14")), (13, Some("moment=13->14")), (14, None), (15, None), (27, None), (40, None)] {
+    for (moment, want) in [(1, Some("moment=1->14")), (13, Some("moment=13->14")), (14, None), (15, None), (27, Some("var1.225=0->32")), (40, Some("var1.225=0->32"))] {
         assert_eq!(step(nmkin_3.as_ref(), 0, moment).as_deref(), want, "nmkin_3's woman at moment {moment}");
     }
     assert_eq!(nmkin_3.story_battle(0), None);
@@ -959,7 +959,7 @@ fn the_finale_moves_a_party_that_walks_out_at_27_to_33_and_applies_to_a_late_par
         let other = adapter.load_area(field).unwrap();
         for id in 0..8 {
             if let Some(s) = other.story_advance(&state(27, true), id) {
-                assert!(!s.summary.contains("->33"), "{field}#{id}: {s:?}");
+                assert_ne!(StoryState::decode(&s.progress).map(|st| st.moment), Some(33), "{field}#{id}: {s:?}");
             }
         }
     }
@@ -1021,13 +1021,88 @@ fn nobody_is_stranded_at_27_or_33_in_any_reviewed_field() {
             assert_eq!(area.npcs_in_phase(&phase), area.npcs(), "{field} at {name}: the cast is the one the data places");
         }
     }
-    // nothing of the mission re-fires at 33 (the points of the reviewed fields apply to the story before them only, but the
-    // lift's panel, which rides back up as often as it is pressed, and the finale, which turns the lift's bit on)
+    // nothing of the mission re-fires at 33: the points of the reviewed fields apply to the story before them only, except the
+    // lift's panel (it rides back up as often as it is pressed) and the woman of nmkin_3 (her talk frees her once, from moment
+    // 27 on, and moves no moment)
     for field in fmv_ff7::REVIEWED_FIELDS {
         let area = adapter.load_area(field).unwrap();
         for point in area.story_points() {
             let step = area.story_advance(&state(33, true), point.id);
-            assert_eq!(step.is_some(), field == "elevtr1" && point.id == 1, "{field}#{}: {step:?}", point.id);
+            assert_eq!(step.is_some(), (field == "elevtr1" && point.id == 1) || (field == "nmkin_3" && point.id == 0), "{field}#{}: {step:?}", point.id);
         }
     }
+}
+
+/// **What each field is at 27 and after: its phase.** The phase of a field for a story is the interval of the moment that its
+/// own scripts compare the counter with, so two accounts in the same interval share one instance and see each other. The
+/// first three fields only compare the moment against numbers of the way in (7 and 8 at the most): they are one phase for every
+/// story from 8 on, the escape's and the later ones. The six reactor fields and `nrthmk` compare it with 27: moment 27 (the
+/// bomb is set and the countdown runs) is a phase of its own in each, 28 on (the party has got out) another (the lift's own
+/// field has one more edge, at 33, where its way leads to the second reactor), and the finale's step from 27 to 33 moves
+/// the party from the first to the second.
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn each_reviewed_field_is_one_phase_at_27_of_its_own_and_one_from_28_on() {
+    let Some(adapter) = adapter() else { return };
+    let phase = |area: &dyn AreaRuntime, moment: u16| area.phase_key(&state(moment, false)).expect("a story the adapter reads");
+    for field in ["md1stin", "md1_1", "md1_2"] {
+        let area = adapter.load_area(field).unwrap();
+        assert!([8, 26, 27, 28, 33, 120].iter().all(|&m| phase(area.as_ref(), m) == phase(area.as_ref(), 8)), "{field}: one phase from 8 on");
+    }
+    for field in ["nrthmk", "elevtr1", "nmkin_1", "nmkin_2", "nmkin_3", "nmkin_4", "nmkin_5"] {
+        let area = adapter.load_area(field).unwrap();
+        let (before, bomb, out) = (phase(area.as_ref(), 26), phase(area.as_ref(), 27), phase(area.as_ref(), 28));
+        assert_ne!(before, bomb, "{field}: 27 is not 26");
+        assert_ne!(bomb, out, "{field}: 27 is not 28");
+        assert!([28, 30, 32].iter().all(|&m| phase(area.as_ref(), m) == out), "{field}: 28 on is one phase (up to the next comparison: the lift's own, at 33)");
+        // the phase does not depend on the lift's bit or on the woman's, which are not part of the phases
+        let mut variant = StoryState::at(27);
+        assert!(variant.set_bit(1, 225, 0, true) && variant.set_bit(1, 225, 5, true));
+        assert_eq!(area.phase_key(&variant.encode()), Some(bomb.clone()), "{field}");
+    }
+}
+
+/// **The woman who is stuck on the way out.** The talk point of `nmkin_3` (entity 4) was the way down's step 13 to 14; at
+/// moment 27 or later its own script takes the other branch: with bit 5 of the reactor byte clear it turns the bit on (she
+/// is freed and walks off), and with it set she is gone (her set-up hides her), so the talk is a step once. It moves no
+/// moment and no exit or point waits for the bit; it is a story step the party takes, saved with the story (the lift's bit
+/// and hers are both in the byte, whichever order the party does them in), and it never gets in the way of the lift's ride
+/// back or the finale.
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn the_woman_of_nmkin_3_is_freed_on_the_way_out_once_and_it_changes_nothing_else() {
+    let Some(adapter) = adapter() else { return };
+    let woman = adapter.load_area("nmkin_3").unwrap();
+    let step = |blob: &[u8]| woman.story_advance(blob, 0);
+    // the way out: at 27 with the lift down (what the descent left), the first talk frees her
+    let freed = step(&state(27, true)).expect("a talk at 27");
+    assert_eq!((freed.summary.as_str(), freed.progress.as_slice(), freed.countdown), ("var1.225=1->33", &[2, 27, 0, 1, 1, 225, 0x21][..], None));
+    assert_eq!(step(&freed.progress), None, "she is gone: the talk is a step once");
+    // any moment from 27 on (the escape's own, and later ones), with the lift either way
+    for moment in [27u16, 28, 33, 40] {
+        assert!(step(&state(moment, true)).is_some() && step(&state(moment, false)).is_some(), "moment {moment}");
+    }
+    // not before the bomb is set: the way down's talk stops at 14, and between 14 and 27 there is nothing to say that moves anything
+    for moment in [14u16, 15, 20, 26] {
+        assert_eq!(step(&state(moment, true)), None, "moment {moment}");
+    }
+    // the saved story keeps both bits, in whichever order the party takes the lift's ride back and the talk
+    let mut s = StoryState::at(27);
+    assert!(s.set_bit(1, 225, 0, true));
+    let stored = s.encode();
+    let mut later = StoryState::at(27);
+    assert!(later.set_bit(1, 225, 5, true)); // the talk after the lift's ride back up: bit 0 off, bit 5 on
+    assert_eq!(adapter.merge_progression(&stored, &later.encode()), vec![2, 27, 0, 1, 1, 225, 0x21]);
+    assert_eq!(adapter.merge_progression(&later.encode(), &stored), vec![2, 27, 0, 1, 1, 225, 0x21]);
+    // her bit changes nothing about the lift or the finale
+    let lift = adapter.load_area("elevtr1").unwrap();
+    let freed_and_down = freed.progress.clone();
+    assert_eq!(open_target(lift.as_ref(), &freed_and_down), ["nmkin_2"], "the lift's exit follows its own bit only");
+    let back = lift.story_advance(&freed_and_down, 1).expect("the ride back with her bit set");
+    assert_eq!((back.summary.as_str(), back.progress.as_slice()), ("var1.225=33->32", &[2, 27, 0, 1, 1, 225, 0x20][..]));
+    assert_eq!(open_target(lift.as_ref(), &back.progress), ["nmkin_1"]);
+    let finale = adapter.load_area("nrthmk").unwrap().story_advance(&back.progress, 1).expect("the finale with her bit set");
+    assert_eq!((finale.summary.as_str(), finale.progress.as_slice()), ("moment=27->33 var1.225=32->33", &[2, 33, 0, 1, 1, 225, 0x21][..]));
+    // and the story the smoke ends with
+    assert_eq!(adapter.merge_progression(&[2, 27, 0, 1, 1, 225, 0x21], &finale.progress), finale.progress);
 }

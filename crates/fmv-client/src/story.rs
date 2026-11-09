@@ -35,6 +35,11 @@
 //!
 //! In an area with links (ladders, jumps: `AreaRuntime::links`) the bot walks with a [`crate::route::Navigator`], which
 //! takes the links it needs to get to the point and keeps off the others.
+//!
+//! A bot that also travels (`--travel`) tells the story bot where its route goes next ([`StoryBot::set_wanted_exit`]), and
+//! that changes which steps are pursued: one that OPENS the exit to that area is pursued even when it is not forward (the
+//! first reactor's lift ridden back UP), and one that would CLOSE it is not even when it is (the ride down, forward again once
+//! the lift is up), so the lift is ridden once each way and never flaps.
 
 use std::collections::VecDeque;
 use std::sync::Arc;

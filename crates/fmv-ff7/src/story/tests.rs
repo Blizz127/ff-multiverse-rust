@@ -203,8 +203,8 @@ fn a_version_2_blob_carries_the_moment_and_the_variables_in_one_canonical_form()
 fn only_the_tracked_bits_can_be_set_and_known() {
     let mut s = StoryState::new_game();
     assert_eq!(REACTOR_STATE, tracked_var(1, 225).unwrap());
-    assert_eq!(REACTOR_STATE.bits, 0b1000_0001, "the lift (bit 0) and the countdown's timeout flag (bit 7)");
-    assert!(!s.set_bit(1, 225, 6, true) && !s.set_bit(1, 225, 5, true), "the other bits of the reactor byte are not carried");
+    assert_eq!(REACTOR_STATE.bits, 0b1010_0001, "the lift (bit 0), the woman who is freed (bit 5) and the countdown's timeout flag (bit 7)");
+    assert!(!s.set_bit(1, 225, 6, true) && !s.set_bit(1, 225, 4, true) && !s.set_bit(1, 225, 3, true), "the other bits of the reactor byte are not carried");
     assert!(!s.set_bit(1, 224, 0, true), "nor is another variable");
     assert!(!s.set_bit(1, 225, 8, true) && !s.set_bit(1, 225, 200, true), "there are eight bits");
     assert_eq!(s.vars().count(), 0);
@@ -889,6 +889,134 @@ fn a_talk_that_asks_another_script_to_write_the_story_is_judged_with_that_script
     assert_eq!(story.advance_with(&script, &at(14), 0).unwrap().summary, "moment=14->15");
     assert_eq!(story.advance_with(&script, &at(15), 0), None, "the chest switched its talk off by itself: it is gone");
     assert_eq!(story.advance_with(&script, &at(20), 0), None);
+}
+
+// ---- the countdown a block sets, and the writes of a script a main loop requests ----
+
+/// `REQ entity script` at priority 6 (what the first mission's directors use).
+fn req(entity: u8, script: u8) -> Vec<u8> {
+    vec![0x01, entity, (6 << 5) | script]
+}
+/// `STTIM hours minutes seconds` with literal operands.
+fn sttim(hours: u8, minutes: u8, seconds: u8) -> Vec<u8> {
+    vec![0x38, 0, 0, hours, minutes, seconds]
+}
+
+#[test]
+fn a_timer_the_block_of_the_write_sets_is_the_countdown_of_its_step() {
+    // the guard scorpion's shape: on the triangle, and under the moment, the timer and then the write
+    let write = |block: &[u8]| when_on_triangle(3, &when_moment(3, 9, block));
+    let story_of = |block: &[u8]| scan(&field_with_player(|s| s.entity("e", vec![(0, entity_script(&[], &looping(&write(block))))])), &mesh(5));
+    let story = story_of(&concat(&[sttim(0, 10, 0), setword(2, 0, 9)]));
+    assert_eq!(story.points()[0].label, "triangle 3: moment <9 -> 9 (starts a countdown of 600 s)");
+    let step = story.advance(&at(8), 0).expect("the step");
+    assert_eq!((step.summary.as_str(), step.countdown), ("moment=8->9", Some(600)));
+    // the same after the write, in hours and seconds too, and a step that sets none starts none
+    assert_eq!(story_of(&concat(&[setword(2, 0, 9), sttim(1, 2, 3)])).advance(&at(8), 0).and_then(|s| s.countdown), Some(3723));
+    assert_eq!(story_of(&setword(2, 0, 9)).advance(&at(8), 0).map(|s| s.countdown), Some(None));
+    // a timer that is not in the write's block is not its countdown: one before the moment's guard would start over every
+    // time the loop turns, and one under another condition of its own may not run
+    let before_guard = when_on_triangle(3, &concat(&[sttim(0, 10, 0), when_moment(3, 9, &setword(2, 0, 9))]));
+    let story = scan(&field_with_player(|s| s.entity("e", vec![(0, entity_script(&[], &looping(&before_guard)))])), &mesh(5));
+    assert_eq!(story.advance(&at(8), 0).map(|s| s.countdown), Some(None));
+    let own_guard = concat(&[when_lift_bit(10, 0, &sttim(0, 10, 0)), setword(2, 0, 9)]);
+    assert_eq!(story_of(&own_guard).advance(&at(8), 0).map(|s| s.countdown), Some(None));
+    // a timer whose length is a variable is not read
+    let banked = vec![0x38, 0x10, 0x00, 2, 3, 4];
+    assert_eq!(story_of(&concat(&[banked, setword(2, 0, 9)])).advance(&at(8), 0).map(|s| s.countdown), Some(None));
+}
+
+#[test]
+fn the_writes_of_a_script_a_main_loop_requests_are_an_entry_point_that_fires_when_a_player_comes_to_stand_there() {
+    // caller: while the moment is 27 or more and the timeout flag (bit 7) is clear, REQ the script 3 of the entity after it
+    let guard = |body: &[u8]| when_moment(4, 27, &when_lift_bit(10, 7, body));
+    let target = |script: Vec<u8>| vec![(0, entity_script(&[], &[])), (3, script)];
+    let field = |caller_main: Vec<u8>, script: Vec<u8>| {
+        field_with_player(|s| s.entity("caller", vec![(0, entity_script(&[], &caller_main))]).entity("target", target(script)))
+    };
+    let writes = concat(&[setword(2, 0, 33), biton(1, 225, 0), ret()]);
+    let story = scan(&field(looping(&guard(&req(3, 3))), writes.clone()), &mesh(3));
+    assert_eq!(story.point_count(), 1);
+    let point = story.points().remove(0);
+    assert_eq!(point.trigger, StoryTrigger::Enter);
+    assert_eq!(point.label, "entry: moment >=27 and Var[1][225] bit 7 clear -> 33; moment >=27 and Var[1][225] bit 7 clear -> Var[1][225] bit 0 on");
+    // the finale's rule: 27 or later, and only forward (the lift's bit comes on with the moment)
+    assert_eq!(story.advance(&at(27), 0).unwrap().summary, "moment=27->33 var1.225=0->1");
+    assert_eq!(story.advance(&lifted(27).encode(), 0).unwrap().summary, "moment=27->33");
+    assert_eq!(story.advance(&at(30), 0).unwrap().summary, "moment=30->33 var1.225=0->1");
+    assert_eq!(story.advance(&at(26), 0), None, "not before the moment");
+    assert_eq!(story.advance(&lifted(33).encode(), 0), None, "once: nothing moves forward at 33 with the bit on");
+    assert_eq!(story.advance(&at(33), 0).unwrap().summary, "var1.225=0->1", "at 33 only the bit would come on");
+    // the timeout flag set (nothing sets it): the point does not apply, whatever the moment
+    let timed_out = vec![2, 27, 0, 1, 1, 225, 0x80];
+    assert_eq!(story.advance(&timed_out, 0), None);
+    // the comparisons of the loop and of the script shape the phases as ever
+    assert_eq!(story.edges(), [27]);
+
+    // the loop that wants the flag SET (a late party's game over) can never apply and is not a point
+    let late = when_moment(4, 27, &when_lift_bit(9, 7, &req(3, 3)));
+    assert_eq!(scan(&field(looping(&late), writes.clone()), &mesh(3)).point_count(), 0);
+    // a request in the INIT part runs by itself too
+    let init = entity_script(&guard(&req(3, 3)), &[]);
+    let story = scan(&field_with_player(|s| s.entity("caller", vec![(0, init)]).entity("target", target(writes.clone()))), &mesh(3));
+    assert_eq!(story.point_count(), 1);
+    // `REQEW` and `REQSW` are requests too, and a request with nothing to write adds nothing
+    for opcode in [0x02u8, 0x03] {
+        let request = vec![opcode, 3, (6 << 5) | 3];
+        assert_eq!(scan(&field(looping(&guard(&request)), writes.clone()), &mesh(3)).point_count(), 1, "opcode {opcode}");
+    }
+    assert_eq!(scan(&field(looping(&guard(&req(3, 3))), concat(&[setbyte_noop(), ret()])), &mesh(3)).point_count(), 0);
+}
+
+/// A write the model does not carry (a byte of another variable): a script that "writes" nothing of the story.
+fn setbyte_noop() -> Vec<u8> {
+    vec![0x80, 0x50, 3, 1]
+}
+
+#[test]
+fn a_request_the_server_cannot_be_sure_runs_and_writes_is_not_read() {
+    let guard = |body: &[u8]| when_moment(4, 27, body);
+    let field = |caller_main: Vec<u8>, script: Vec<u8>| {
+        field_with_player(|s| s.entity("caller", vec![(0, entity_script(&[], &caller_main))]).entity("target", vec![(0, entity_script(&[], &[])), (3, script)]))
+    };
+    let count = |caller_main: Vec<u8>, script: Vec<u8>| scan(&field(caller_main, script), &mesh(3)).point_count();
+    let write = || concat(&[setword(2, 0, 33), ret()]);
+    assert_eq!(count(looping(&guard(&req(3, 3))), write()), 1, "the plain case");
+    // a write behind the requested script's own guard, after its RET, after a loop, after a question, or after a map jump
+    assert_eq!(count(looping(&guard(&req(3, 3))), concat(&[when_moment(0, 1, &setword(2, 0, 33)), ret()])), 0, "its own guard");
+    assert_eq!(count(looping(&guard(&req(3, 3))), concat(&[ret(), setword(2, 0, 33)])), 0, "after a RET");
+    assert_eq!(count(looping(&guard(&req(3, 3))), concat(&[looping(&setbyte_noop()), setword(2, 0, 33), ret()])), 0, "after a loop");
+    assert_eq!(count(looping(&guard(&req(3, 3))), concat(&[vec![0x48, 0, 0, 0, 0, 1, 0], setword(2, 0, 33), ret()])), 0, "after a question");
+    let jump = vec![0x60, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+    assert_eq!(count(looping(&guard(&req(3, 3))), concat(&[jump, setword(2, 0, 33), ret()])), 0, "after a map jump");
+    // a guard of the request the model cannot judge: a key, a triangle, the party, a variable it does not carry
+    assert_eq!(count(looping(&when_ok_pressed(&req(3, 3))), write()), 0, "a key");
+    assert_eq!(count(looping(&when_on_triangle(1, &req(3, 3))), write()), 0, "a triangle");
+    assert_eq!(count(looping(&concat(&[ifub_lit(5, 3, 1, 0, skip(req(3, 3).len())), req(3, 3)])), write()), 0, "a variable it does not carry");
+    // nothing before the request may end the part or wait: a loop, a question
+    assert_eq!(count(concat(&[looping(&setbyte_noop()), guard(&req(3, 3))]), write()), 0, "after a loop");
+    // a request to a script that does not exist or that requests another (one level is followed)
+    assert_eq!(count(looping(&guard(&req(9, 3))), write()), 0, "no such entity");
+    assert_eq!(count(looping(&guard(&req(3, 3))), concat(&[req(3, 4), ret()])), 0, "a request in the requested script is not followed");
+    // the request is not under a condition at all: a script that does not say when it writes is not read
+    assert_eq!(count(looping(&req(3, 3)), write()), 0);
+}
+
+#[test]
+fn a_write_that_turns_on_a_bit_nothing_sets_is_no_write_and_a_point_that_only_does_so_is_none() {
+    // the timeout flag is carried and never set: a step that would turn it on is refused, and a point that is only that is not offered
+    let flag = looping(&when_moment(3, 9, &biton(1, 225, 7)));
+    let sec = field_with_player(|s| s.entity("e", vec![(0, entity_script(&[], &flag))]));
+    assert_eq!(scan(&sec, &mesh(3)).point_count(), 0);
+    let mut s = StoryState::at(27);
+    assert!(!s.set_bit(1, 225, 7, true));
+    assert!(s.set_bit(1, 225, 0, true) && s.set_bit(1, 225, 5, true) && !s.set_bit(1, 225, 6, true));
+    // it reads clear and a test of it is judged
+    assert_eq!(s.known_bit(1, 225, 7), Some(false));
+    // turning it OFF is a write that moves nothing forward
+    let off = looping(&when_moment(3, 9, &bitoff(1, 225, 7)));
+    let sec = field_with_player(|s| s.entity("e", vec![(0, entity_script(&[], &off))]));
+    assert_eq!(scan(&sec, &mesh(3)).point_count(), 0);
 }
 
 #[test]

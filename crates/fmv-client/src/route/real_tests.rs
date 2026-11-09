@@ -233,6 +233,12 @@ fn the_bots_climb_back_up_through_the_reactor_fields_at_the_moment_the_bomb_is_s
         assert_eq!(found.refused, 0, "{field}: every announced step is one the server walks to");
         assert_eq!(found.moment, 27, "{field}: nothing on the way moves the story");
     }
+    // nmkin_3: the story bot talks to the woman first (the one step of the way up that is its own: she is freed, which moves
+    // no moment) and then the travel bot takes the links it needs to the gateway
+    let found = run_field_with("nmkin_3", "nmkin_4", at_the_bomb(), "nmkin_2");
+    assert_eq!(found.log.iter().filter(|l| l.starts_with("point")).collect::<Vec<_>>(), ["point 0"], "{:?}", found.log);
+    assert_eq!(found.presses.iter().filter(|p| p.is_some()).count(), 1, "one talk: {:?}", found.presses);
+    assert!(found.log.first().is_some_and(|l| l.starts_with("link") || l.starts_with("point")), "{:?}", found.log);
 }
 
 /// The lift, both ways, with the bots of the headless loop (the story bot first, told where the route goes next). Going
