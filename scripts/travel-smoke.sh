@@ -493,7 +493,7 @@ run_chain() {
   value=$(count_lines_with "$WORK/server.log" "player follows its leader's way out")
   if ((value > 0)); then
     say "server: the member followed its leader's way out of the lift $value time(s), the story having moved on: $(strip_ansi "$(last_line_with "$WORK/server.log" "player follows its leader's way out" || true)")"
-    [[ $(count_lines_with "$WORK/server.log" "from=elevtr1 to=nmkin_1 story_says=") == "$value" ]] ||
+    [[ $(count_lines_with "$WORK/server.log" "area=elevtr1 follows=nmkin_1 story_says=") == "$value" ]] ||
       problem "a member followed its leader's way out somewhere that is not the lift's way up: $(last_line_with "$WORK/server.log" "player follows its leader's way out" || true)"
   fi
   value=$(count_lines_with "$WORK/server.log" "smkin")

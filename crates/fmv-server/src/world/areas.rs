@@ -425,7 +425,7 @@ impl World {
         let Some(way) = self.followed_exit(entity, &area_key, &crossed) else { return by_story };
         if by_story.as_ref() != Some(&way) {
             self.logs.info(format!(
-                "player follows its leader's way out (the story it is judged on now would send it elsewhere) entity={} from={area_key} to={} story_says={}",
+                "player follows its leader's way out (the story it is judged on now would send it elsewhere) entity={} area={area_key} follows={} story_says={}",
                 entity.0,
                 clip_text(&way.target),
                 by_story.as_ref().map_or_else(|| "nowhere".to_string(), |e| clip_text(&e.target))
@@ -1015,7 +1015,8 @@ mod tests {
         let said = w.take_logs();
         let lines: Vec<&str> = said.iter().map(|l| l.text()).filter(|t| t.contains("player follows its leader's way out")).collect();
         assert_eq!(lines.len(), 1, "{lines:?}");
-        assert!(lines[0].contains("from=hall") && lines[0].contains("to=yard") && lines[0].contains("story_says=yard"), "{}", lines[0]);
+        assert!(lines[0].contains("area=hall") && lines[0].contains("follows=yard") && lines[0].contains("story_says=yard"), "{}", lines[0]);
+        assert!(!lines[0].contains("from=") && !lines[0].contains(" to="), "not a move: a smoke that counts the server's moves must not count it: {}", lines[0]);
         // following is no story step: nobody's story moved, nothing was saved for the member, its own progression is its own
         assert_eq!(w.players.get(&member.entity).map(|p| p.progression.clone()), Some(Vec::new()));
         assert!(!said.iter().any(|l| l.text().contains("story advanced")), "following moves no story");

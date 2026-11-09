@@ -135,7 +135,7 @@ fn on_the_real_lift_a_member_that_comes_after_the_leaders_finale_still_rides_to_
     let (area, arrival) = answer(&mut w, &mut member, now);
     assert_eq!((area.as_str(), arrival), ("nmkin_1", (-1485.0, 4298.0)));
     let said: Vec<String> = w.take_logs().iter().map(|l| l.text().to_string()).collect();
-    assert!(said.iter().any(|l| l.contains("player follows its leader's way out") && l.contains("to=nmkin_1") && l.contains("story_says=nowhere")), "{said:?}");
+    assert!(said.iter().any(|l| l.contains("player follows its leader's way out") && l.contains("area=elevtr1 follows=nmkin_1") && l.contains("story_says=nowhere")), "{said:?}");
     assert!(!said.iter().any(|l| l.contains("smkin")), "nobody was sent to the second reactor: {said:?}");
     assert_eq!(w.players.get(&member.entity).map(|p| p.progression.clone()), Some(Vec::new()), "following moves no story");
 
