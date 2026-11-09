@@ -456,31 +456,39 @@ fn triangles_at(mesh: &fmv_ff7::field::Walkmesh, exit: &Exit) -> Vec<usize> {
 }
 
 
-/// The triangles of `mesh` that a walker can get to from the triangles of `start`, over the access words and over the
-/// links (ladders and jumps) of `area` whose line the walker can touch: a sample along the line lies in a triangle it
-/// can stand on, at the line's level (the height of the triangle there within `Link::LEVEL` of the line's). A link puts
-/// the walker on the triangle its destination names, from which it walks on. (OK links count: a press is a key, not a
-/// place.)
-fn reach_with_links(area: &fmv_ff7::Ff7FieldArea, start: usize) -> std::collections::BTreeSet<usize> {
+/// The triangles a link's line touches AT ITS LEVEL: a sample along the line lies in the triangle, at a height within
+/// `Link::LEVEL` of the line's there.
+fn link_triangles(mesh: &fmv_ff7::field::Walkmesh, link: &fmv_adapter_api::Link) -> std::collections::BTreeSet<usize> {
     use fmv_adapter_api::Link;
+    let (a, b) = link.line;
+    let mut found = std::collections::BTreeSet::new();
+    for k in 0..=24 {
+        let t = k as f32 / 24.0;
+        let (x, y, z) = (a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t);
+        let (px, py) = (x.round() as i32, y.round() as i32);
+        for (tri, vertices) in mesh.triangles.iter().enumerate() {
+            if fmv_ff7::script::triangle_contains_xy(vertices, px, py)
+                && fmv_ff7::script::triangle_height_at(vertices, px, py).is_some_and(|h| (h as f32 - z).abs() <= Link::LEVEL)
+            {
+                found.insert(tri);
+            }
+        }
+    }
+    found
+}
+
+/// The triangles of `mesh` that a walker can get to from the triangles of `start`, over the access words and over the
+/// links (ladders and jumps) of `area` whose line the walker can touch (see [`link_triangles`]). A link puts the walker on
+/// the triangle its destination names, from which it walks on. (OK links count: a press is a key, not a place.)
+fn reach_with_links(area: &fmv_ff7::Ff7FieldArea, start: usize) -> std::collections::BTreeSet<usize> {
     let mesh = area.walkmesh();
     let mut reach = walkable_from(mesh, start);
     let links = area.links();
+    let touched: Vec<std::collections::BTreeSet<usize>> = links.iter().map(|l| link_triangles(mesh, l)).collect();
     loop {
         let before = reach.len();
-        for link in &links {
-            let (a, b) = link.line;
-            let touched = (0..=24).any(|k| {
-                let t = k as f32 / 24.0;
-                let (x, y, z) = (a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t);
-                reach.iter().any(|&tri| {
-                    let vertices = &mesh.triangles[tri];
-                    let (px, py) = (x.round() as i32, y.round() as i32);
-                    fmv_ff7::script::triangle_contains_xy(vertices, px, py)
-                        && fmv_ff7::script::triangle_height_at(vertices, px, py).is_some_and(|h| (h as f32 - z).abs() <= Link::LEVEL)
-                })
-            });
-            if touched {
+        for (link, tris) in links.iter().zip(&touched) {
+            if tris.iter().any(|t| reach.contains(t)) {
                 let to = usize::try_from(link.to_hint.expect("a link names the triangle it leads to")).unwrap();
                 reach.extend(walkable_from(mesh, to));
             }
@@ -770,4 +778,72 @@ fn the_lift_rides_back_up_with_every_press_and_never_flaps() {
     assert_eq!((back.summary.as_str(), StoryState::decode(&back.progress).unwrap().moment), ("var1.225=1->0", 33));
     // the saved story is the join: the lift stays down in the store while the story the player holds says up
     assert_eq!(adapter.merge_progression(&late, &back.progress), late);
+}
+
+/// **The links trap nobody and stay off the way that was walked before they were offered.** Every reviewed field's links
+/// are live for every player in it, so two things are pinned. (1) From where each link puts a player, walking and the links
+/// lead to an exit of the field or to the triangles players arrive on: no link drops anybody in a pocket. (2) In `nmkin_2`,
+/// which was walked on foot from the lift to the way on before it had links (and has a walk-on jump), the shortest walk
+/// over the triangles touches no walk-on line of the field: the jump is not on the way, so the route that worked still
+/// works with no help from the bots' avoidance of lines.
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn the_links_trap_nobody_and_the_walk_that_worked_before_does_not_touch_them() {
+    let Some(adapter) = adapter() else { return };
+    let chain = ["elevtr1", "nmkin_1", "nmkin_2", "nmkin_3", "nmkin_4", "nmkin_5"];
+    for field in ["nmkin_2", "nmkin_3", "nmkin_4"] {
+        let area = adapter.load_field(field).unwrap();
+        let mesh = area.walkmesh();
+        let links = area.links();
+        assert!(!links.is_empty(), "{field}");
+        // where a player can end up on its own: the exits' triangles, and the triangles the other fields arrive on
+        let mut safe: std::collections::BTreeSet<usize> = area.exits().iter().flat_map(|e| triangles_at(mesh, e)).collect();
+        for other in chain {
+            let from = adapter.load_field(other).unwrap();
+            safe.extend(from.exits().iter().filter(|e| e.target == field).filter_map(|e| e.arrival_hint).map(|h| h as usize));
+        }
+        for (i, link) in links.iter().enumerate() {
+            let dest = usize::try_from(link.to_hint.unwrap()).unwrap();
+            let reach = reach_with_links(&area, dest);
+            let out = reach.iter().filter(|t| safe.contains(t)).count();
+            println!("{field}#{i}: from triangle {dest}: {} triangles on foot and by links, {out} of them exits or arrivals", reach.len());
+            assert!(out > 0, "{field}#{i}: the destination (triangle {dest}) is a pocket: nothing from there reaches an exit or an arrival");
+        }
+    }
+
+    // nmkin_2: the shortest way on foot from the lift's arrival to the gateway to nmkin_3 touches no walk-on line
+    let area = adapter.load_field("nmkin_2").unwrap();
+    let mesh = area.walkmesh();
+    let start = adapter.load_field("elevtr1").unwrap().exits().iter().find(|e| e.target == "nmkin_2").and_then(|e| e.arrival_hint).unwrap() as usize;
+    let goal: std::collections::BTreeSet<usize> = area.exits().iter().filter(|e| e.target == "nmkin_3").flat_map(|e| triangles_at(mesh, e)).collect();
+    let mut parent = vec![usize::MAX; mesh.triangles.len()];
+    let mut queue = std::collections::VecDeque::from([start]);
+    let mut seen = std::collections::BTreeSet::from([start]);
+    let mut found = None;
+    while let Some(t) = queue.pop_front() {
+        if goal.contains(&t) {
+            found = Some(t);
+            break;
+        }
+        for &next in mesh.access.get(t).into_iter().flatten() {
+            let next = usize::from(next);
+            if next != 0xFFFF && next < mesh.triangles.len() && seen.insert(next) {
+                parent[next] = t;
+                queue.push_back(next);
+            }
+        }
+    }
+    let mut path = vec![found.expect("nmkin_2 is walked on foot from the lift to nmkin_3")];
+    while let Some(&last) = path.last() {
+        if parent[last] == usize::MAX {
+            break;
+        }
+        path.push(parent[last]);
+    }
+    let path: std::collections::BTreeSet<usize> = path.into_iter().collect();
+    for (i, link) in area.links().iter().enumerate().filter(|(_, l)| !l.needs_ok) {
+        let touched = link_triangles(mesh, link);
+        println!("nmkin_2 walk-on link #{i}: touches {touched:?}; the shortest way is {} triangles", path.len());
+        assert!(touched.is_disjoint(&path), "the shortest way on foot passes over walk-on link #{i} of nmkin_2");
+    }
 }
