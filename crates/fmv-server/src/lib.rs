@@ -116,6 +116,7 @@
 //!   destination-only check is therefore enough to keep clients off holes and walls between two
 //!   walkable points, as long as those are wider than one step.
 
+pub mod admin;
 mod accounts;
 mod character;
 mod config;
