@@ -1330,17 +1330,13 @@ run_commands() {
   if [[ -n $escape_battle ]]; then
     value=$(count_lines_with "$WORK/server.log" "battle reward battle=$escape_battle ")
     [[ $value == 0 ]] || problem "the server paid $value reward(s) for the battle that was escaped from (battle=$escape_battle)"
-    # The debug gauge is never stored: a full gauge nobody spent is not written, and the escape battle spent none.
-    while IFS= read -r line || [[ -n $line ]]; do
-      if [[ $line == *"limit kept battle="* ]]; then
-        line=$(strip_ansi "$line")
-        value=$(field "$line" limit)
-        [[ $value != 255 ]] || problem "the server kept the debug gauge of 255: $line"
-        if [[ $line == *"limit kept battle=$escape_battle "* && $value != 0 ]]; then
-          problem "the server kept a gauge of $value after the escape battle, in which nobody spent one (only a knocked-out member may keep 0): $line"
-        fi
-      fi
-    done <"$WORK/server.log"
+    # Under --debug-limit-full NO gauge is ever stored, spent or not: no 'limit kept' line at all, and one
+    # 'limit not kept battle=N reason=debug-limit-full' line for every battle that ended.
+    value=$(count_lines_with "$WORK/server.log" "limit kept battle=")
+    [[ $value == 0 ]] || problem "the server kept $value limit gauge(s) under --debug-limit-full: $(last_line_with "$WORK/server.log" "limit kept battle=")"
+    value=$(count_lines_with "$WORK/server.log" "battle ended battle=")
+    got=$(count_lines_with "$WORK/server.log" "limit not kept battle=")
+    [[ $got == "$value" ]] || problem "the server skipped the gauge save for $got of $value ended battle(s) ('limit not kept ... reason=debug-limit-full'), expected all"
   fi
 
   stop_server

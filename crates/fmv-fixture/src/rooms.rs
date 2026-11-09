@@ -19,11 +19,28 @@
 //! [`RoomsAdapter::with_unloadable_area`] the hall also has an exit at its top edge (y = 250) to
 //! `ghost`, an area the adapter lists but cannot load, to test what a server does with a target
 //! that turns out to be unusable.
+//!
+//! With [`RoomsAdapter::with_story`] the rooms also have a synthetic story, to exercise phasing
+//! without owned data: progression is one byte string (empty for a new account, [`STORY_ADVANCED`]
+//! after the hall's story region [`STORY_REGION`] was entered), both rooms are in the empty phase for
+//! the first and in [`STORY_ADVANCED_PHASE`] for the second, and the yard's guard exists only in the
+//! second phase (the cast is decided by the phase).
 
 use fmv_adapter_api::{
-    AdapterError, AreaInfo, AreaKey, AreaRuntime, Bounds, Exit, ExitKind, GameAdapter, MoveResult, NpcAppearance, NpcSpawn,
+    AdapterError, AreaInfo, AreaKey, AreaRuntime, Bounds, Exit, ExitKind, GameAdapter, MoveResult, NpcAppearance, NpcSpawn, StoryPoint,
+    StoryStep, StoryTrigger,
 };
-use fmv_core::{AreaId, EditionProvenance, Fingerprint, GameId, Platform, Pos, SourceRef};
+use fmv_core::{AreaId, EditionProvenance, Fingerprint, GameId, PhaseKey, Platform, Pos, SourceRef};
+
+/// With [`RoomsAdapter::with_story`], the progression of an account that has advanced the synthetic
+/// story (a new account's is the empty blob). Any other blob is not this story's.
+pub const STORY_ADVANCED: &[u8] = &[1];
+/// With [`RoomsAdapter::with_story`], the phase key of both rooms for [`STORY_ADVANCED`] (a new
+/// account's is the empty key, as the adapter API requires).
+pub const STORY_ADVANCED_PHASE: &[u8] = &[0xA1];
+/// With [`RoomsAdapter::with_story`], the corners of the hall's story region: stepping into it takes an
+/// account from the empty progression to [`STORY_ADVANCED`].
+pub const STORY_REGION: [(f32, f32); 4] = [(150.0, -50.0), (250.0, -50.0), (250.0, 50.0), (150.0, 50.0)];
 
 /// The area the players enter first.
 pub const HALL: &str = "hall";
@@ -88,6 +105,7 @@ fn info_for(key: &str) -> AreaInfo {
 #[derive(Debug, Clone, Default)]
 pub struct RoomsAdapter {
     ghost: bool,
+    story: bool,
 }
 
 impl RoomsAdapter {
@@ -97,7 +115,12 @@ impl RoomsAdapter {
 
     /// Also list [`GHOST`] and give the hall an exit to it; `load_area(GHOST)` always fails.
     pub fn with_unloadable_area() -> Self {
-        Self { ghost: true }
+        Self { ghost: true, story: false }
+    }
+
+    /// Give the rooms the synthetic story described in the module docs.
+    pub fn with_story() -> Self {
+        Self { ghost: false, story: true }
     }
 
     fn keys(&self) -> Vec<&'static str> {
@@ -120,9 +143,19 @@ impl GameAdapter for RoomsAdapter {
 
     fn load_area(&self, key: &str) -> Result<Box<dyn AreaRuntime>, AdapterError> {
         match key {
-            HALL | YARD => Ok(Box::new(Room { info: info_for(key), ghost_exit: self.ghost && key == HALL })),
+            HALL | YARD => Ok(Box::new(Room { info: info_for(key), ghost_exit: self.ghost && key == HALL, story: self.story })),
             GHOST if self.ghost => Err(AdapterError::Decode("the ghost area cannot be loaded (by design)".into())),
             other => Err(AdapterError::AreaNotFound(other.to_string())),
+        }
+    }
+
+    /// The synthetic story keeps the longer of two progressions (the advanced one over a new
+    /// account's); without a story the newest write wins, as the trait's default says.
+    fn merge_progression(&self, stored: &[u8], advanced: &[u8]) -> Vec<u8> {
+        if self.story && stored.len() >= advanced.len() {
+            stored.to_vec()
+        } else {
+            advanced.to_vec()
         }
     }
 }
@@ -132,6 +165,8 @@ struct Room {
     info: AreaInfo,
     /// The hall's extra exit to the unloadable area.
     ghost_exit: bool,
+    /// The adapter was built with the synthetic story.
+    story: bool,
 }
 
 impl Room {
@@ -207,11 +242,78 @@ impl AreaRuntime for Room {
             unconditional: true,
         }]
     }
+
+    fn phase_key(&self, progress: &[u8]) -> Option<PhaseKey> {
+        if !self.story {
+            return None;
+        }
+        match progress {
+            [] => Some(PhaseKey::default()),
+            p if p == STORY_ADVANCED => Some(PhaseKey(STORY_ADVANCED_PHASE.to_vec())),
+            _ => None,
+        }
+    }
+
+    fn story_points(&self) -> Vec<StoryPoint> {
+        if !(self.story && !self.is_yard()) {
+            return Vec::new();
+        }
+        vec![StoryPoint {
+            id: 0,
+            trigger: StoryTrigger::Region(STORY_REGION.iter().map(|&(x, y)| Pos::new(x, y, 0.0)).collect()),
+            label: "hall story region: progress 0 -> 1".into(),
+        }]
+    }
+
+    fn story_advance(&self, progress: &[u8], point: u32) -> Option<StoryStep> {
+        (self.story && !self.is_yard() && point == 0 && progress.is_empty())
+            .then(|| StoryStep { progress: STORY_ADVANCED.to_vec(), summary: "moment=0->1".into() })
+    }
+
+    /// The yard's guard stands only in the advanced phase.
+    fn npcs_in_phase(&self, phase: &PhaseKey) -> Vec<NpcSpawn> {
+        if self.story && phase.0 != STORY_ADVANCED_PHASE {
+            return Vec::new();
+        }
+        self.npcs()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_synthetic_story_phases_advances_and_decides_the_cast() {
+        // Without the story the rooms have none of it.
+        let plain = RoomsAdapter::new().load_area(HALL).unwrap();
+        assert!(plain.story_points().is_empty() && plain.phase_key(&[]).is_none() && plain.story_advance(&[], 0).is_none());
+        assert_eq!(RoomsAdapter::new().merge_progression(&[1], &[]), Vec::<u8>::new(), "the default is the newest write");
+
+        let a = RoomsAdapter::with_story();
+        let (hall, yard) = (a.load_area(HALL).unwrap(), a.load_area(YARD).unwrap());
+        for room in [&hall, &yard] {
+            assert_eq!(room.phase_key(&[]), Some(PhaseKey::default()), "a new account is the empty phase");
+            assert_eq!(room.phase_key(STORY_ADVANCED), Some(PhaseKey(STORY_ADVANCED_PHASE.to_vec())));
+            assert_eq!(room.phase_key(&[7, 7]), None, "not this story's blob");
+        }
+        // One story point, in the hall, that only a new account can use.
+        assert!(yard.story_points().is_empty());
+        let points = hall.story_points();
+        assert_eq!(points.len(), 1);
+        assert!(points[0].is_hit_by(Pos::new(100.0, 0.0, 0.0), Pos::new(200.0, 0.0, 0.0)));
+        assert!(!points[0].is_hit_by(Pos::new(-100.0, 0.0, 0.0), Pos::new(100.0, 0.0, 0.0)), "the spawns are outside it");
+        assert_eq!(hall.story_advance(&[], 0).unwrap().progress, STORY_ADVANCED);
+        assert_eq!(hall.story_advance(STORY_ADVANCED, 0), None);
+        assert_eq!(hall.story_advance(&[], 1), None);
+        assert_eq!(yard.story_advance(&[], 0), None);
+        // The cast is decided by the phase: the guard is only in the advanced one.
+        assert!(yard.npcs_in_phase(&PhaseKey::default()).is_empty());
+        assert_eq!(yard.npcs_in_phase(&PhaseKey(STORY_ADVANCED_PHASE.to_vec())).len(), 1);
+        // Merging keeps the advanced story, whichever order the saves arrive in.
+        assert_eq!(a.merge_progression(&[], STORY_ADVANCED), STORY_ADVANCED);
+        assert_eq!(a.merge_progression(STORY_ADVANCED, &[]), STORY_ADVANCED);
+    }
 
     #[test]
     fn the_rooms_are_connected_both_ways_and_labelled_fixture() {

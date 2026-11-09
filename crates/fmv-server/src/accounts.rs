@@ -61,13 +61,15 @@ pub struct Login {
     pub account: AccountId,
     /// What other players see, from the stored profile and for the hosted game.
     pub avatar: AvatarAppearance,
-    /// The account's story phase for the hosted game, taken from its progression (empty by
-    /// default, so every player is in the single free-roam phase).
-    pub phase: PhaseKey,
+    /// The account's story progression for the hosted game: the stored blob, which only the game's
+    /// adapter reads (empty for a new account and for one that never advanced; see
+    /// [`kept_progression`] for what becomes of an enormous one). The world turns it into the phase of
+    /// each area the player stands in.
+    pub progression: Vec<u8>,
     /// `Some` only when this call registered the account: the token, to be sent once.
     pub issued_token: Option<String>,
     /// The character its look names and what the store holds of its character progress (nothing for
-    /// a new account). Separate from `phase`: see `progress`.
+    /// a new account). Separate from `progression`: see `progress`.
     pub progress: ProgressSeed,
 }
 
@@ -171,6 +173,23 @@ pub fn phase_key(blob: Vec<u8>) -> PhaseKey {
     PhaseKey(key)
 }
 
+/// Longest progression blob the world keeps per player as it is. A game's own blob is a handful of
+/// bytes (FF7: three); anything longer than this cannot be one and is kept as its digest
+/// ([`phase_key`]), an unreadable blob of 33 bytes with the same identity, so that a hand-edited
+/// 256 KiB record cannot cost 256 KiB per connected player.
+pub const MAX_PROGRESSION_BYTES: usize = 256;
+
+/// The progression the world keeps for a stored blob: the blob itself, or, when it is longer than
+/// [`MAX_PROGRESSION_BYTES`], its digest. Neither is ever written back by the story code (an
+/// unreadable blob is never advanced or overwritten).
+pub fn kept_progression(blob: Vec<u8>) -> Vec<u8> {
+    if blob.len() <= MAX_PROGRESSION_BYTES {
+        blob
+    } else {
+        phase_key(blob).0
+    }
+}
+
 /// A registration whose every client-chosen part has been checked (see the module docs).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Registration {
@@ -220,15 +239,15 @@ pub fn login_with_token(store: &Store, game: GameId, token: &Secret, tint: [u8; 
         // `None` (a record of an older build, or no record) is "never stored": the starting stock.
         inventory: stored.as_ref().and_then(|record| record.inventory.clone()),
     };
-    Ok(Login { account, avatar, phase: phase_key(progression.blob), issued_token: None, progress })
+    Ok(Login { account, avatar, progression: kept_progression(progression.blob), issued_token: None, progress })
 }
 
 /// Create the account and its avatar in one store call. `on_created` runs the moment the account
 /// exists (the registration rate limits count it then; a request that never gets this far counts
 /// for nothing). Nothing after that can fail: the reply is built from what the store returned.
 ///
-/// A brand-new account has no progression, so its phase is the default one and nothing else is
-/// read.
+/// A brand-new account has no progression (the empty blob: a new account to every game), and nothing
+/// else is read.
 pub fn register(
     store: &Store,
     game: GameId,
@@ -247,7 +266,7 @@ pub fn register(
     Ok(Login {
         account: registered.account_id,
         avatar,
-        phase: PhaseKey::default(),
+        progression: Vec::new(),
         issued_token: Some(registered.token),
         progress,
     })
@@ -351,7 +370,7 @@ mod tests {
         assert_eq!(reg.avatar.display_name, "Cloud", "the name is cleaned like everywhere else");
         assert_eq!(reg.avatar.tint, [10, 20, 30]);
         assert_eq!(reg.avatar.appearance_ref.as_deref(), Some("ff7/cloud"));
-        assert_eq!(reg.phase, PhaseKey::default());
+        assert!(reg.progression.is_empty(), "a new account has no story progression");
         let token = reg.issued_token.clone().expect("a registration issues a token");
         assert!(!token.is_empty());
 
@@ -430,15 +449,18 @@ mod tests {
     }
 
     #[test]
-    fn the_phase_comes_from_the_accounts_progression() {
+    fn the_progression_comes_from_the_accounts_record_for_this_game() {
         let (_dir, store) = store();
         let reg = register_ff7(&store, "Vincent", [0; 3], None).unwrap();
         let token = reg.issued_token.unwrap();
+        assert!(with_token(&store, &token).unwrap().progression.is_empty(), "never stored: a new account");
         store.put_progression(&Progression::new(reg.account, GameId::Ff7, vec![7, 7], NOW)).unwrap();
-        assert_eq!(with_token(&store, &token).unwrap().phase, PhaseKey(vec![7, 7]));
-        // Another game's progression is not this game's phase.
+        assert_eq!(with_token(&store, &token).unwrap().progression, vec![7, 7]);
+        // Another game's progression is not this game's.
         store.put_progression(&Progression::new(reg.account, GameId::Fixture, vec![1], NOW)).unwrap();
-        assert_eq!(with_token(&store, &token).unwrap().phase, PhaseKey(vec![7, 7]));
+        assert_eq!(with_token(&store, &token).unwrap().progression, vec![7, 7]);
+        // Whatever the adapter does not read keeps the old identity: one phase per distinct blob.
+        assert_eq!(phase_key(with_token(&store, &token).unwrap().progression), PhaseKey(vec![7, 7]));
     }
 
     #[test]
@@ -469,7 +491,10 @@ mod tests {
         store
             .put_progression(&Progression::new(reg.account, GameId::Ff7, vec![0xAB; fmv_persist::MAX_BLOB_BYTES], NOW))
             .unwrap();
-        let phase = with_token(&store, &token).unwrap().phase;
+        let kept = with_token(&store, &token).unwrap().progression;
+        assert_eq!(kept.len(), 33, "kept as its digest, not as 256 KiB per player");
+        assert_eq!(kept[0], PHASE_DIGEST_TAG);
+        let phase = phase_key(kept);
         assert_eq!(phase.0.len(), 33);
         // The placement that carries it is a tiny frame, not a 1 MiB JSON number array.
         let key = fmv_protocol::InstanceKey::new(fmv_core::AreaId { game: GameId::Ff7, key: "md1stin".into() }, phase);
@@ -679,8 +704,8 @@ mod tests {
         let again = with_token(&store, &token).unwrap();
         assert_eq!(again.progress.character, 1);
         assert_eq!(again.progress.stored, Some(Progress { character: 1, level: 8, exp: 700, ap: 9, gil: 250, limit: 0 }));
-        // It is not the story: the phase is untouched by it.
-        assert_eq!(again.phase, PhaseKey::default());
+        // It is not the story: the progression is untouched by it.
+        assert!(again.progression.is_empty());
         // Another game's record is not this game's.
         store.put_character_progress(&fmv_persist::CharacterProgress::new(reg.account, GameId::Ff8, 0, 40, NOW)).unwrap();
         assert_eq!(with_token(&store, &token).unwrap().progress, again.progress);

@@ -8,6 +8,7 @@ use crate::bot::{Bot, PartyBot, TravelBot, TravelGate};
 use crate::cli::{exit, Args};
 use crate::interp::render_time;
 use crate::session::Session;
+use crate::story::StoryBot;
 use fmv_core::{AnimState, AreaId, EntityId, Pos};
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -125,7 +126,10 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
         session.area.bounds(),
         session.area.max_speed(),
     );
-    let mut party_bot = PartyBot::new(args.party_invite_first_peer, args.party_accept);
+    let mut party_bot = PartyBot::new(args.party_invite_first_peer, args.party_accept).with_accept_after_split(args.party_accept_after_split);
+    // `--story-advance`: walk to the story point that would advance this account and stand on it. With an
+    // invite to send it holds still until the invite is out (the invite must go out while the others are in view).
+    let mut story_bot = StoryBot::new(args.story_advance, args.party_invite_first_peer);
     // `--travel`: walk through the exits to these areas; with a party to form first it waits for it.
     let mut travel_bot = TravelBot::new(args.travel.clone(), args.party_invite_first_peer || args.party_accept);
     let mut battle_bot = BattleBot::new(args.battle_auto, args.debug_encounters, args.battle_wait_party).with_script(args.battle_script.clone());
@@ -145,6 +149,15 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
     }
     if travel_bot.is_active() {
         eprintln!("headless: travel behaviour: walk through the exits to {}", args.travel.join(", then "));
+    }
+    if story_bot.is_requested() {
+        eprintln!(
+            "headless: story behaviour: walk to the story point that would advance this account and stand on it{}",
+            if args.party_invite_first_peer { " (after the party invite is out)" } else { "" }
+        );
+    }
+    if args.party_accept_after_split {
+        eprintln!("headless: party behaviour: accept an invite only once a player seen before is out of view");
     }
     if battle_bot.is_active() {
         let script = battle_bot.script_steps();
@@ -177,6 +190,8 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
     let mut battles_ended = 0;
     // The names of the area's NPCs as last reported (the snapshot of an area says who they are).
     let mut last_npcs: Vec<String> = Vec::new();
+    // How many other players were in view at the last look (`usize::MAX`: none yet).
+    let mut last_in_view = usize::MAX;
     while start.elapsed() < args.duration
         || finishing_a_battle(battle_bot.is_active(), session.state.battle.in_battle(), start.elapsed(), args.duration)
     {
@@ -188,6 +203,7 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
         session.log_party_notes();
         session.log_battle_notes();
         session.log_progress_notes();
+        session.log_story_notes();
         // The server moved us to another area: walk the pattern of the new one, and cross it off
         // the route if that is where the bot meant to go.
         if let Some(change) = session.take_area_change() {
@@ -223,6 +239,12 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
         for peer in &remotes {
             peer_walks.entry(peer.id).or_default().feed(peer.pose.pos);
         }
+        // How many other players this one can see, whenever it changes: a phase split shows as the count
+        // falling to 0 while both are still connected, and a party that joins the phases as it rising again.
+        if remotes.len() != last_in_view {
+            eprintln!("headless: peers in view: {}", remotes.len());
+            last_in_view = remotes.len();
+        }
         // Party requests: what the bot flags ask for, and a resync if events were lost.
         let visible: Vec<EntityId> = remotes.iter().map(|p| p.id).collect();
         for cmd in party_bot.step(now, &session.state.party, &visible) {
@@ -241,7 +263,15 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
         // A player in a battle is frozen in the field: it neither walks nor sends movement.
         let frozen = session.state.battle.in_battle();
         if dt > 0.0 && !frozen {
-            let step = if travel_bot.is_active() {
+            let step = if story_bot.is_requested() {
+                // The story bot decides every step (it stands still when there is nothing to advance).
+                if story_bot.may_walk(now, session.state.party.outgoing_invite_seen()) {
+                    let speed = session.area.max_speed() * crate::bot::BOT_SPEED_FACTOR;
+                    story_bot.step(session.area.as_ref(), session.state.own.pos(), dt, speed, session.state.story.progress())
+                } else {
+                    crate::bot::BotStep { pos: session.state.own.pos(), facing: None, moved: false }
+                }
+            } else if travel_bot.is_active() {
                 let gate = TravelGate { now, party_size: session.state.party.party_size(), peers_seen: session.state.peers_seen() };
                 if travel_bot.may_walk(gate) {
                     travel_bot.step(session.area.as_ref(), session.state.own.pos(), dt, session.area.max_speed() * crate::bot::BOT_SPEED_FACTOR)
@@ -262,6 +292,12 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
         if let Some(rest) = TICK.checked_sub(tick_start.elapsed()) {
             std::thread::sleep(rest);
         }
+    }
+    if let Some(why) = story_bot.gave_up() {
+        eprintln!("headless: story: gave up: {why}");
+    }
+    if story_bot.is_requested() || session.state.story.advances() > 0 {
+        eprintln!("headless: story advances: {}", session.state.story.advances());
     }
     if let Some(why) = travel_bot.gave_up() {
         eprintln!("headless: travel: gave up: {why}");
@@ -287,6 +323,7 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
     session.log_party_notes();
     session.log_battle_notes();
     session.log_progress_notes();
+    session.log_story_notes();
     eprintln!("headless: {}", session.state.party.summary());
     if battle_bot.is_active() || session.state.battle.entered() > 0 || session.state.battle.rejections() > 0 {
         eprintln!("headless: battles: {}", session.state.battle.summary());

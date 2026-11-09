@@ -283,6 +283,14 @@ impl Session {
         }
     }
 
+    /// Print what the server said about our story since the last call, one `story:` line each, on
+    /// stderr (never stdout: the headless bot's stdout carries exactly one line).
+    pub fn log_story_notes(&mut self) {
+        for line in self.state.story.drain_notes() {
+            eprintln!("story: {line}");
+        }
+    }
+
     /// Say goodbye and wait (bounded) for the network thread to flush `Leave`.
     pub fn leave(&mut self, wait: Duration) {
         self.net.leave_and_join(wait);

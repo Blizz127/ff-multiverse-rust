@@ -175,12 +175,13 @@ use crate::encounter::decode_encounter_section;
 use crate::field::{section, Background, Camera, FieldError, FieldFile, Palette, Triggers, Vertex, Walkmesh, FIELD_SCALE_ONE};
 use crate::lgp::{LgpArchive, LgpError};
 use crate::lzss;
-use crate::script::{triangle_contains_xy, triangle_height_at, Maplist};
+use crate::script::{triangle_contains_xy, triangle_height_at, FieldScript, Maplist};
+use crate::story::{self, AreaStory};
 use crate::walk::{LinkReport, Route, Surface};
 use fmv_adapter_api::{
-    AdapterError, AreaInfo, AreaRuntime, Bounds, EncounterTable, Exit, GameAdapter, MoveResult, NpcSpawn,
+    AdapterError, AreaInfo, AreaRuntime, Bounds, EncounterTable, Exit, GameAdapter, MoveResult, NpcSpawn, StoryPoint, StoryStep,
 };
-use fmv_core::{AreaId, EditionProvenance, Fingerprint, GameId, Platform, Pos, ProvenanceSummary, SourceRef};
+use fmv_core::{AreaId, EditionProvenance, Fingerprint, GameId, PhaseKey, Platform, Pos, ProvenanceSummary, SourceRef};
 use std::collections::HashSet;
 use std::io::{Read, Seek};
 use std::path::Path;
@@ -634,6 +635,11 @@ impl GameAdapter for Ff7Adapter {
     fn load_area(&self, key: &str) -> Result<Box<dyn AreaRuntime>, AdapterError> {
         Ok(Box::new(self.load_field(key)?))
     }
+
+    /// The further of two FF7 story states (`crate::story::merge_progression`).
+    fn merge_progression(&self, stored: &[u8], advanced: &[u8]) -> Vec<u8> {
+        story::merge_progression(stored, advanced)
+    }
 }
 
 fn finite_xy(p: Pos) -> bool {
@@ -661,6 +667,9 @@ pub struct Ff7FieldArea {
     npcs: Vec<NpcSpawn>,
     /// The random-encounter table of the field's own section 6, decoded at load time.
     encounters: Option<EncounterTable>,
+    /// What the field's scripts say about the story: its phases and story points, read at load time
+    /// (see `crate::story`).
+    story: AreaStory,
 }
 
 impl std::fmt::Debug for Ff7FieldArea {
@@ -695,7 +704,9 @@ impl Ff7FieldArea {
             _ => FIELD_SCALE_ONE,
         };
         let encounters = field.section(section::ENCOUNTER).ok().and_then(decode_encounter_section);
-        let mut area = Self { info, field, walkmesh, surface, bounds, spawns, field_scale, exits, npcs: Vec::new(), encounters };
+        // A field whose script section cannot be parsed has no story of its own: one phase, no points.
+        let story = FieldScript::from_field(&field).map(|script| AreaStory::scan(&script, &walkmesh)).unwrap_or_default();
+        let mut area = Self { info, field, walkmesh, surface, bounds, spawns, field_scale, exits, npcs: Vec::new(), encounters, story };
         // NPCs without a literal height stand on this area's own surface, so they are worked out last.
         area.npcs = area_content::npc_spawns(&area.field, &area.walkmesh, |x, y| area.height_at(x, y, None));
         area
@@ -847,6 +858,24 @@ impl AreaRuntime for Ff7FieldArea {
     fn npcs(&self) -> Vec<NpcSpawn> {
         self.npcs.clone()
     }
+
+    /// The phase of this field for an account's progression (`crate::story`): the intervals of the
+    /// story counter that this field's own scripts distinguish. The empty progression (a new account)
+    /// is the empty key in every field. `None` for a blob that is not FF7's.
+    fn phase_key(&self, progress: &[u8]) -> Option<PhaseKey> {
+        self.story.phase_key(progress)
+    }
+
+    fn story_points(&self) -> Vec<StoryPoint> {
+        self.story.points()
+    }
+
+    fn story_advance(&self, progress: &[u8], point: u32) -> Option<StoryStep> {
+        self.story.advance(progress, point)
+    }
+
+    // `npcs_in_phase` keeps its default: every account sees the NPCs it has always seen. The phase
+    // key is where a later lane hangs the canon cast (see `crate::story`, "What this does not do").
 
     /// The hint is the index of a triangle of this walkmesh (an exit's `arrival_hint`): when it
     /// names one that holds the arrival point, the point stands on that triangle, at its height

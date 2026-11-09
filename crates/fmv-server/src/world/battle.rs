@@ -381,7 +381,7 @@ impl World {
                 let own = p.progress.unwrap_or_else(|| progress::fresh(bw.rules(), progress::DEFAULT_CHARACTER));
                 let level = bw.settings.level.unwrap_or(own.level);
                 // The limit gauge is the account's own, inside the game's cap (the engine would refuse more);
-                // `--debug-limit-full` starts everybody at the cap (see the module docs: only the start changes).
+                // `--debug-limit-full` starts everybody at the cap and `keep_limits` then saves no gauge (module docs).
                 let max_limit = bw.rules().progress_limits().max_limit;
                 let limit = if bw.settings.debug_limit_full { max_limit } else { own.limit.min(max_limit) };
                 Some(BattleMember { entity, account: p.account, character: own.character, level, weapon: None, armor: None, limit })
@@ -664,7 +664,9 @@ impl World {
     }
 
     /// Keep the limit gauge every member of a finished battle ended with, whatever the outcome (an
-    /// escape pays nothing, but its gauges are kept): a member whose gauge is not the one it started with
+    /// escape pays nothing, but its gauges are kept), EXCEPT under `--debug-limit-full`, where every
+    /// starting gauge was faked and nothing is kept (logged as `limit not kept ... reason=debug-limit-full`).
+    /// Otherwise a member whose gauge is not the one it started with
     /// has the new one queued for the saver (whether or not it is still connected: its character fought
     /// on) and put in its mirror (found by its account, which may have logged in again). A gauge that did
     /// not move writes nothing. A knocked-out character ended with an empty one, which is what is kept.
@@ -857,7 +859,7 @@ mod tests {
     use super::*;
     use crate::world::{MoveOutcome, NewPlayer};
     use fmv_adapter_api::{AreaRuntime, EncounterEntry};
-    use fmv_core::{AccountId, AnimState, AvatarAppearance, PhaseKey, Pos};
+    use fmv_core::{AccountId, AnimState, AvatarAppearance, Pos};
     use fmv_fixture::{FixtureAdapter, FIXTURE_AREA_KEY};
     use fmv_adapter_api::{AreaInfo, Bounds, GameAdapter, MoveResult};
     use crate::progress::{Progress, ProgressSeed};
@@ -928,7 +930,7 @@ mod tests {
         let close = Arc::new(watch::channel(false).0);
         let avatar = AvatarAppearance { display_name: name.into(), tint: [1, 2, 3], appearance_ref: None };
         let account = AccountId(entity.0);
-        w.join(NewPlayer { session, entity, account, avatar, phase: PhaseKey::default(), progress, tx, close }, now).expect("joins");
+        w.join(NewPlayer { session, entity, account, avatar, progression: Vec::new(), progress, tx, close }, now).expect("joins");
         Seat { entity, account, rx, log: Vec::new() }
     }
 
@@ -955,6 +957,8 @@ mod tests {
         while let Ok(msg) = rx.try_recv() {
             match msg {
                 Msg::Save(job) => jobs.push(job),
+                // Story saves are `saved_story`'s business (world/story.rs tests), not a payment.
+                Msg::Story(_) => {}
                 Msg::Stop(_) => panic!("nobody asked the saver to stop"),
             }
         }
@@ -1927,8 +1931,8 @@ mod tests {
         };
 
         // Formation 3 is the preemptive one: a sure escape, with every party gauge full at once. Both start
-        // with a full limit gauge, and nobody spends it: it ends where it started, so NOTHING is written and the
-        // accounts keep what they really have.
+        // with a full limit gauge (the flag fakes it) and, under the flag, NO gauge is ever written: the
+        // accounts keep what they really have, and the server says why.
         assert_eq!(w.request_encounter(a.entity, Some(3), t0), BattleReply::Done);
         assert_eq!(started_with(&mut a), vec![255, 255], "full, whatever the accounts have");
         let first = seat_battle_id(&a.log);
@@ -1938,10 +1942,11 @@ mod tests {
         assert_eq!((mirrored_limit(&w, &a), mirrored_limit(&w, &b)), (0, 100), "the accounts keep their own gauges");
         let logs = logs_of(&mut w);
         assert!(logs.iter().any(|l| l.starts_with("battle started battle=1") && l.contains("limits=[255, 255]")), "{logs:?}");
+        assert!(logs.iter().any(|l| l == "limit not kept battle=1 reason=debug-limit-full"), "the early return ran: {logs:?}");
         assert!(!logs.iter().any(|l| l.starts_with("limit kept")), "{logs:?}");
 
-        // Next battle: A gives its limit (B does nothing). What each member ENDS with is stored, as after any
-        // battle, unless it is the gauge the battle started with; and the fake full one is never written.
+        // Next battle: A gives its limit (B does nothing), so A ENDS below the faked start. Even that moved
+        // gauge is not written: it started from the faked full one, so it is not A's own.
         assert_eq!(w.request_encounter(a.entity, Some(3), t0), BattleReply::Done);
         assert_eq!(started_with(&mut a), vec![255, 255], "every battle starts them full again");
         let second = seat_battle_id(&a.log);

@@ -269,6 +269,18 @@ right, the area name (`FF7 md1stin`), the connection status (players, round-trip
 pending invite; a FIXTURE area wears the label `FIXTURE (synthetic, not FF7)`. The window title
 still shows your party size and a pending invite.
 
+*Talking.* In an FF7 field, **Enter** or **Space** (the controller's **A**) next to a character, facing
+it, opens that character's own dialogue in a blue window at the bottom of the screen. The text is the
+game's, read by your client from your own copy of the field's script and shown exactly as written (the
+names in it are the game's default names: whoever you play is never written into a line about Cloud
+or the rest of the cast; nothing about dialogue goes over the network). **Enter**, **Space** or **A**
+turns the page, goes on to the next window and answers a question (**Up/Down** or **W/S** move the
+pointer), **Backspace**, **B** or **Esc** closes the window, and you stand still while it is open. A
+character's talk script is run only as far as the messages it shows (`fmv_ff7::script::dialogue`): what
+it would do besides (give an item, start a battle, move you to another field) is not done, and until a
+story source is plugged in its branches are read as at the start of a new game. A character with
+nothing to say there (hidden, silenced, no talk script) does nothing when you talk to it.
+
 *Characters.* In an FF7 field every player, you included, is drawn as the field model of the
 look they chose (`ff7/cloud`, `ff7/tifa`, ... `ff7/vincent`), standing on the walkmesh at their
 position and facing the way they face, with the idle, walk or run animation of what they are
@@ -370,6 +382,21 @@ bots in a party from `md1stin` through its gateway to `md1_1` against your own l
 synthetic FIXTURE rooms (`fmv-server --game fixture-rooms`, `fmv-client --game fixture-rooms
 --name X`: a hall and a yard joined by an exit each way, with one NPC in the yard; **not FF7**) and
 needs no owned data.
+
+Story phasing: every account has one story progression per game (the opaque `Progression` blob; an
+account that never advanced has none, which is a new account) and the world keeps one instance of a
+field per story phase, so players only see the players of their own instance. Solo, a player is in
+the instance of its own phase; in a party, in its leader's, keeping its own progression. For FF7 the
+progression is the main story counter `Var[2][0]` (`crates/fmv-ff7/src/story.rs`): each field's
+phases are the intervals of the values its own scripts compare it against, every new account is the
+empty phase of every field, and the story advances where the field's own script says it does and the
+server can see it: in `md1stin` a player's character stepping onto walkmesh triangle 12 while the counter
+is 1 sets it to 6 (the server logs `story advanced account=<n> entity=<n> area=Ff7/md1stin point=0
+moment=1->6`; the script's battle after it is not run). A headless bot does it with `fmv-client
+--headless --story-advance` (against a server run with `--no-random-encounters`, or give the bot
+`--battle-auto`: a bot caught in a battle stands frozen). `scripts/phase-smoke.sh` runs it against your own library (read-only,
+throw-away state): A advances and B does not, so they stop seeing each other; B joins A's party and is
+placed in A's instance; the server restarts, both log in again, and the phases persisted.
 
 Area travel is what **protocol v4** adds to v3: a v3 client does not know `AreaChange`, so the
 version was bumped and a server refuses a v3 client at the handshake with a clear
@@ -529,8 +556,8 @@ went, and the `headless: battles:` line counts what the server applied for the b
 `(<n> attack, <n> magic, <n> item, <n> defend, <n> limit, <n> escape)`.
 `fmv-server --debug-encounters --debug-limit-full` (the second flag is refused unless the first is given, and is
 logged as a warning when the server starts) makes every member of every battle start with a **full limit
-gauge**, whatever its account's is. It changes only the gauge a battle STARTS with (the `battle started ...
-limits=[255, 255]` line and every replay carry it), and under it no limit gauge is ever stored: a gauge that
+gauge**, whatever its account's is. It changes exactly two things: the gauge a battle STARTS with (the `battle started ...
+limits=[255, 255]` line and every replay carry it), and the end-of-battle gauge save, so no limit gauge is ever stored: a gauge that
 started from a faked full one is not the account's own, so the end-of-battle save is skipped (logged as
 `limit not kept ... reason=debug-limit-full`) and every account keeps the gauge it really has, even when a
 member spent its limit or was knocked out. A smoke run can never overwrite a real gauge. The server also logs
@@ -644,6 +671,7 @@ scripts/ff-multiverse.sh the launcher entry point shipped in the package (docs/L
 scripts/smoke.sh         two-bot local smoke test
 scripts/battle-smoke.sh  shared-battle smoke test (real data; modes --fixture --random --progress --commands)
 scripts/travel-smoke.sh  walking between fields: two bots, md1stin -> md1_1 and back (real data)
+scripts/phase-smoke.sh   story phasing: A advances md1stin's story and B does not, party, restart, persist (real data)
 deploy/                  systemd user unit template and deployment procedure
 docs/LAUNCHER.md         the package as an owner-only launcher port: layout, entry point, data dir
 IMPLEMENTATION-PLAN.md   first-milestone plan and design constraints
