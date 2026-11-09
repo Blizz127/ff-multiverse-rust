@@ -18,6 +18,7 @@
 mod battle_models;
 mod depth;
 mod identity;
+mod looks;
 
 use super::anim::Who;
 use super::frame::tests::{stage, view};

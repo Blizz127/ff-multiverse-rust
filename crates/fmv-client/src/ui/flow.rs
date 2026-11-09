@@ -6,8 +6,9 @@
 
 use super::looks::LookCache;
 use super::menu::{CharacterEntry, Look, MenuAction, Notice};
-use crate::accounts::{SavedAccount, TokenStore};
+use crate::accounts::{AccountsError, SavedAccount, TokenStore};
 use crate::cli::tint_from_name;
+use crate::delete::DeleteOutcome;
 use crate::login::{plan_login, LoginPlan};
 use crate::net::{clean, NetConfig, NetError, SessionTiming, TokenSink};
 use fmv_protocol::{NewCharacter, RejectCode};
@@ -105,9 +106,91 @@ pub fn prepare(env: &Env<'_>, accounts: &[SavedAccount], action: &MenuAction) ->
             let cfg = config(&plan, NewCharacter { tint: *tint, body: body.clone(), slot: *slot }, sink);
             Ok(Attempt { plan, cfg })
         }
-        MenuAction::Quit | MenuAction::Forget { .. } | MenuAction::CancelConnect => {
+        // A delete is its own short exchange (see `crate::delete`), not a login: `delete_notice` says what it came to.
+        MenuAction::Quit | MenuAction::Delete { .. } | MenuAction::Forget { .. } | MenuAction::CancelConnect => {
             Err(Notice::error("That is not a connection."))
         }
+    }
+}
+
+/// What the player is told when a delete came to an end, and whether the saved login is to be forgotten now: the
+/// notice, and `true` only when the server said the character is gone (`Deleted`) or that it never knew this login
+/// (`AlreadyGone`: the character was deleted before, possibly by this very request whose answer was lost, or the
+/// server's accounts were reset). **Every other result keeps the saved login**, so that nothing is lost that is still
+/// on the server and the player can try again. `name` is the character's name, already cleaned.
+///
+/// Like [`failure_notice`], the text quotes the error and the advice comes from the refusal's CODE alone (see
+/// [`delete_hint`]): the server's words are shown, cleaned, and never read for a clue. A refusal with the code
+/// `InvalidToken` cannot reach this as an error (the exchange makes it `AlreadyGone`); if it ever did, the login would be
+/// kept, as for any error.
+pub fn delete_notice(result: &Result<DeleteOutcome, NetError>, name: &str) -> (Notice, bool) {
+    match result {
+        Ok(DeleteOutcome::Deleted(_)) => (Notice::info(format!("Deleted {name}. Its name is free again.")), true),
+        Ok(DeleteOutcome::AlreadyGone) => (
+            Notice::info(format!("The server no longer had {name} (its accounts may have been reset), so its saved login was removed.")),
+            true,
+        ),
+        Err(error) => {
+            let notice = Notice::error(crate::delete::failure_text(name, error));
+            let notice = match error {
+                NetError::Rejected { code, .. } => notice.with_hint(delete_hint(*code)),
+                // Whatever else failed (it could not connect, the answer never came, it was not an answer):
+                // the same advice as for a login that could not connect.
+                NetError::Connect { .. }
+                | NetError::ConnectTimeout(..)
+                | NetError::Timeout(_)
+                | NetError::Io { .. }
+                | NetError::Protocol(_)
+                | NetError::Runtime(_)
+                | NetError::Content(_)
+                | NetError::TokenNotSaved { .. } => notice.with_hint(DELETE_TRY_AGAIN),
+            };
+            (notice, false)
+        }
+    }
+}
+
+/// The notice for a character the server deleted (or never had) whose saved login could not then be removed from this
+/// computer (the file is not writable, or it changed since it was listed): the server's side is done, so the player is told
+/// that, and what is left to do here. `error` never holds a token.
+pub fn login_not_removed_notice(name: &str, error: &AccountsError) -> Notice {
+    Notice::warning(format!("{name} is gone from the server, but its saved login could not be removed from this computer: {error}"))
+        .with_hint("Press Del, then F to forget it again, or delete its file in the accounts folder by hand.")
+}
+
+/// The advice for a delete that was not carried out and has nothing more specific to say: look at the server, try again,
+/// or let go of the saved login on this computer.
+const DELETE_TRY_AGAIN: &str =
+    "Check the server address and that the server is running, then try again. Or press Del, then F to forget the saved login on this computer only.";
+
+/// What the player can do about a refused delete, decided from the code alone. Exhaustive on purpose, without a
+/// catch-all arm, like [`reject_hint`]: a code added to the protocol has to be given its advice here before this client
+/// builds.
+fn delete_hint(code: RejectCode) -> &'static str {
+    match code {
+        RejectCode::AlreadyOnline => "Leave the game first, then delete it.",
+        // A delete of this very character is already being carried out (a second request, a request given up on).
+        RejectCode::RateLimited => "A delete of this character is already under way. Wait a moment, then press Del, then Y to ask again.",
+        RejectCode::ProtocolMismatch => {
+            "This client and the server speak different protocol versions: update the older one. Or press Del, then F to forget the saved login on this computer only."
+        }
+        // What a server that predates deleting says to a request it cannot read.
+        RejectCode::BadRequest => {
+            "The server did not understand the request: it may be older than this client. Update it, or press Del, then F to forget the saved login on this computer only."
+        }
+        RejectCode::ServerFull | RejectCode::TooManyConnections | RejectCode::ShuttingDown => {
+            "The server cannot take it right now. Wait a moment, then press Del, then Y to try again."
+        }
+        // Not refusals a delete can get; if one comes anyway, nothing was deleted and the advice is the general one.
+        RejectCode::InvalidToken
+        | RejectCode::NameTaken
+        | RejectCode::InvalidName
+        | RejectCode::RegistrationClosed
+        | RejectCode::ContentMismatch
+        | RejectCode::Timeout
+        | RejectCode::IdleTimeout
+        | RejectCode::Internal
+        | RejectCode::Unspecified => DELETE_TRY_AGAIN,
     }
 }
 
@@ -152,7 +235,7 @@ fn reject_hint(code: RejectCode, plan: &LoginPlan) -> &'static str {
         // Only a saved login can be stale: a registration sends no token for the server to refuse.
         RejectCode::InvalidToken => match plan {
             LoginPlan::Token(_) => {
-                "The server does not know this saved login (its accounts may have been reset). Press Del to forget it, then N to create a new character."
+                "The server does not know this saved login (its accounts may have been reset). Press Del, then F to forget it on this computer (or Y to delete it), then N to create a new character."
             }
             LoginPlan::Register { .. } => TRY_AGAIN,
         },
@@ -266,7 +349,7 @@ mod tests {
         let err = prepare(&f.env(), &[], &MenuAction::Play { index: 3 }).err().expect("an error");
         assert_eq!(err.kind, NoticeKind::Error);
         assert!(err.text.contains("gone"));
-        for other in [MenuAction::Quit, MenuAction::CancelConnect, MenuAction::Forget { index: 0 }] {
+        for other in [MenuAction::Quit, MenuAction::CancelConnect, MenuAction::Forget { index: 0 }, MenuAction::Delete { index: 0 }] {
             assert!(prepare(&f.env(), &[], &other).is_err(), "{other:?} is not a connection");
         }
     }
@@ -524,14 +607,21 @@ mod tests {
         }
     }
 
+    /// A stale saved login (the server does not know it) is cleared with Del: F forgets it on this computer, Y asks the server
+    /// (which answers "already gone": the same end), and then N makes a new character. Del alone asks a question, so the
+    /// advice names the keys of the question.
     #[test]
-    fn a_stale_saved_token_points_at_forget_and_new_character() {
+    fn a_stale_saved_token_points_at_forget_delete_and_new_character() {
         let stale = refused(RejectCode::InvalidToken, "invalid or unknown token");
         let saved = token_plan();
         let n = failure_notice(&stale, &saved);
         assert!(n.text.contains("invalid or unknown token"));
         let hint = n.hint.unwrap();
-        assert!(hint.contains("Del") && hint.contains("forget") && hint.contains("N to create"), "{hint}");
+        assert!(
+            hint.contains("Press Del, then F to forget it on this computer (or Y to delete it), then N to create a new character."),
+            "{hint}"
+        );
+        assert!(!hint.contains("Press Del to forget"), "the old advice (Del alone forgets) is gone: {hint}");
         // The code points at the saved login, not the sentence: any words do for InvalidToken...
         let other_words = failure_notice(&refused(RejectCode::InvalidToken, "we lost your account"), &saved);
         assert_eq!(other_words.hint.as_deref(), Some(hint.as_str()));
@@ -578,5 +668,146 @@ mod tests {
         assert!(n.text.contains("Cannot join") && n.text.contains("differs"));
         let n = failure_notice(&NetError::Protocol("server speaks protocol v9".into()), &plan);
         assert!(n.text.contains("protocol v9"));
+    }
+
+    // ---- what a delete came to ---------------------------------------------------------------------------
+
+    const TRY_AGAIN_OR_FORGET: &str =
+        "Check the server address and that the server is running, then try again. Or press Del, then F to forget the saved login on this computer only.";
+
+    fn refusal(code: RejectCode, words: &str) -> Result<DeleteOutcome, NetError> {
+        Err(NetError::Rejected { code, reason: words.to_string() })
+    }
+
+    #[test]
+    fn a_deleted_character_is_said_gone_and_its_login_is_to_be_forgotten() {
+        let (n, forget) = delete_notice(&Ok(DeleteOutcome::Deleted("Cloud".into())), "Cloud");
+        assert!(forget, "the server said it is gone: the saved login goes too");
+        assert_eq!((n.kind, n.text.as_str()), (NoticeKind::Info, "Deleted Cloud. Its name is free again."));
+        assert!(n.hint.is_none() && n.secret.is_none());
+        // The notice is about the character the player chose, not about what the server called it.
+        let (n, _) = delete_notice(&Ok(DeleteOutcome::Deleted("Someone Else".into())), "Cloud");
+        assert!(n.text.contains("Cloud") && !n.text.contains("Someone Else"), "{}", n.text);
+    }
+
+    #[test]
+    fn a_login_the_server_never_knew_is_to_be_forgotten_and_the_notice_says_why() {
+        let (n, forget) = delete_notice(&Ok(DeleteOutcome::AlreadyGone), "Cloud");
+        assert!(forget, "the server does not know it: nothing is left to keep");
+        assert_eq!(n.kind, NoticeKind::Info);
+        for needle in ["The server no longer had Cloud", "accounts may have been reset", "saved login was removed"] {
+            assert!(n.text.contains(needle), "{needle:?} is not in {:?}", n.text);
+        }
+    }
+
+    #[test]
+    fn a_character_that_is_in_the_game_is_refused_with_its_own_sentence_and_the_login_is_kept() {
+        let (n, forget) = delete_notice(&refusal(RejectCode::AlreadyOnline, "words of the server"), "Cloud");
+        assert!(!forget);
+        assert_eq!((n.kind, n.text.as_str()), (NoticeKind::Error, "Cloud is in the game right now (from this or another computer)."));
+        assert_eq!(n.hint.as_deref(), Some("Leave the game first, then delete it."));
+    }
+
+    #[test]
+    fn every_failure_that_is_not_a_refusal_keeps_the_login_and_says_what_to_try() {
+        let failures = [
+            NetError::Connect { addr: SERVER.into(), source: std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused") },
+            NetError::ConnectTimeout(SERVER.into(), 5),
+            NetError::Timeout("CharacterDeleted"),
+            NetError::Io { during: "waiting for CharacterDeleted", detail: "the server closed the connection".into() },
+            NetError::Protocol("the server answered the delete request with something else".into()),
+            NetError::Runtime("the delete thread ended unexpectedly".into()),
+            NetError::Content("not a delete's business".into()),
+        ];
+        for failure in failures {
+            let shown = failure.to_string();
+            let (n, forget) = delete_notice(&Err(failure), "Cloud");
+            assert!(!forget, "{shown}: nothing was deleted, so the login stays");
+            assert_eq!(n.kind, NoticeKind::Error, "{shown}");
+            assert!(
+                n.text.starts_with("Cloud was NOT deleted and its saved login was kept: ") && n.text.contains(&shown),
+                "{shown}: {:?}",
+                n.text
+            );
+            assert_eq!(n.hint.as_deref(), Some(TRY_AGAIN_OR_FORGET), "{shown}");
+        }
+    }
+
+    /// Every refusal keeps the login; its advice is decided by the code alone, so the same words with another code get
+    /// the other code's advice, and the server's words are quoted and never read for a clue.
+    #[test]
+    fn every_refusal_keeps_the_login_and_its_advice_comes_from_the_code_alone() {
+        let wait = "The server cannot take it right now. Wait a moment, then press Del, then Y to try again.";
+        // (the code, its advice). Every code has a row, so a code added to the protocol shows up here too.
+        let table = [
+            (RejectCode::AlreadyOnline, "Leave the game first, then delete it."),
+            (RejectCode::RateLimited, "A delete of this character is already under way. Wait a moment, then press Del, then Y to ask again."),
+            (
+                RejectCode::ProtocolMismatch,
+                "This client and the server speak different protocol versions: update the older one. Or press Del, then F to forget the saved login on this computer only.",
+            ),
+            (
+                RejectCode::BadRequest,
+                "The server did not understand the request: it may be older than this client. Update it, or press Del, then F to forget the saved login on this computer only.",
+            ),
+            (RejectCode::ServerFull, wait),
+            (RejectCode::TooManyConnections, wait),
+            (RejectCode::ShuttingDown, wait),
+            (RejectCode::InvalidToken, TRY_AGAIN_OR_FORGET),
+            (RejectCode::NameTaken, TRY_AGAIN_OR_FORGET),
+            (RejectCode::InvalidName, TRY_AGAIN_OR_FORGET),
+            (RejectCode::RegistrationClosed, TRY_AGAIN_OR_FORGET),
+            (RejectCode::ContentMismatch, TRY_AGAIN_OR_FORGET),
+            (RejectCode::Timeout, TRY_AGAIN_OR_FORGET),
+            (RejectCode::IdleTimeout, TRY_AGAIN_OR_FORGET),
+            (RejectCode::Internal, TRY_AGAIN_OR_FORGET),
+            (RejectCode::Unspecified, TRY_AGAIN_OR_FORGET),
+        ];
+        let covered: std::collections::HashSet<RejectCode> = table.iter().map(|(code, _)| *code).collect();
+        for code in RejectCode::ALL {
+            assert!(covered.contains(&code), "{code:?} has no row in the table");
+        }
+        for (code, advice) in table {
+            for words in ["words of the server", "invalid or unknown token", "that character is in the game right now", "a delete of it is under way", ""] {
+                let (n, forget) = delete_notice(&refusal(code, words), "Cloud");
+                assert!(!forget, "{code:?} {words:?}: a refusal never forgets the login");
+                assert_eq!(n.kind, NoticeKind::Error, "{code:?} {words:?}");
+                assert_eq!(n.hint.as_deref(), Some(advice), "{code:?} {words:?}: the advice is the code's, whatever the words");
+                if code == RejectCode::AlreadyOnline {
+                    // Its own sentence: the player's, not the server's.
+                    assert_eq!(n.text, "Cloud is in the game right now (from this or another computer).", "{words:?}");
+                } else {
+                    assert_eq!(n.text, format!("Cloud was NOT deleted and its saved login was kept. The server refused: {words}"), "{code:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_delete_never_forgets_a_login_on_anything_but_deleted_or_already_gone() {
+        // The only two results that forget, and no error ever does (also not one that quotes the very sentence of "already gone").
+        let results: Vec<(Result<DeleteOutcome, NetError>, bool)> = [
+            (Ok(DeleteOutcome::Deleted(String::new())), true),
+            (Ok(DeleteOutcome::AlreadyGone), true),
+            (Err(NetError::Timeout("CharacterDeleted")), false),
+            (refusal(RejectCode::InvalidToken, "invalid or unknown token"), false),
+        ]
+        .into_iter()
+        .chain(RejectCode::ALL.into_iter().map(|code| (refusal(code, "invalid or unknown token"), false)))
+        .collect();
+        for (result, forgets) in results {
+            assert_eq!(delete_notice(&result, "Cloud").1, forgets, "{result:?}");
+        }
+    }
+
+    #[test]
+    fn a_login_that_could_not_be_removed_is_a_warning_that_says_the_server_is_done() {
+        let error = AccountsError::Forget("the saved login changed since it was listed; it was not removed".into());
+        let n = login_not_removed_notice("Cloud", &error);
+        assert_eq!(n.kind, NoticeKind::Warning);
+        for needle in ["Cloud is gone from the server", "could not be removed from this computer", "changed since it was listed"] {
+            assert!(n.text.contains(needle), "{needle:?} is not in {:?}", n.text);
+        }
+        assert!(n.hint.as_deref().is_some_and(|h| h.contains("Del") && h.contains("F to forget")), "{n:?}");
     }
 }

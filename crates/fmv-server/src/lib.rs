@@ -129,6 +129,7 @@ pub mod companion;
 mod config;
 mod conn;
 mod deferred;
+mod deletion;
 mod inventory;
 pub mod ff7;
 mod limits;
@@ -395,6 +396,7 @@ impl Server {
             store,
             saver,
             limits,
+            deleted: Default::default(),
             _ephemeral_state: ephemeral_state,
         });
         Ok(Self { listener, local_addr, shared, fixture })

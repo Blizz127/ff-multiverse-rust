@@ -59,16 +59,18 @@ fn game_line(game: GameId) -> (String, Rgba) {
     }
 }
 
-/// A "Key  Label" hint row, centred; wraps to a second row when it is too wide. Returns the y
-/// after the last row.
-fn hints(c: &mut Canvas<'_>, left: i32, width: i32, y: i32, items: &[(&str, &str)]) -> i32 {
-    // Break the items into rows that fit.
-    let cells = |item: &(&str, &str)| cell_count(item.0) + 1 + cell_count(item.1);
+/// How many cells a hint "Key  Label" takes.
+fn hint_cells(item: &(&str, &str)) -> usize {
+    cell_count(item.0) + 1 + cell_count(item.1)
+}
+
+/// The hint items broken into rows that fit `width` canvas units (each row as many as fit; an item is never torn apart).
+fn hint_rows<'a>(width: i32, items: &[(&'a str, &'a str)]) -> Vec<Vec<(&'a str, &'a str)>> {
     let max_cells = (width / 8).max(8) as usize;
     let mut rows: Vec<Vec<(&str, &str)>> = vec![Vec::new()];
     let mut used = 0_usize;
     for item in items {
-        let own = cells(item);
+        let own = hint_cells(item);
         let gap = if used == 0 { 0 } else { 3 };
         if used > 0 && used + gap + own > max_cells {
             rows.push(Vec::new());
@@ -78,8 +80,15 @@ fn hints(c: &mut Canvas<'_>, left: i32, width: i32, y: i32, items: &[(&str, &str
         }
         rows.last_mut().expect("a row").push(*item);
     }
+    rows
+}
+
+/// A "Key  Label" hint row, centred; wraps to a second row when it is too wide. Returns the y
+/// after the last row.
+fn hints(c: &mut Canvas<'_>, left: i32, width: i32, y: i32, items: &[(&str, &str)]) -> i32 {
+    let cells = hint_cells;
     let mut y = y;
-    for row in rows {
+    for row in hint_rows(width, items) {
         let total: usize = row.iter().map(cells).sum::<usize>() + 3 * row.len().saturating_sub(1);
         let mut x = left + (width - total as i32 * 8) / 2;
         for (i, (key, label)) in row.iter().enumerate() {
@@ -260,7 +269,7 @@ fn draw_select(c: &mut Canvas<'_>, menu: &Menu, state: &SelectState, cw: i32, ch
     }
     y += ph + 6;
 
-    y = hints(c, 8, cw - 16, y, &[("Enter", "Play"), ("N", "New character"), ("Del", "Forget"), ("Esc", "Quit")]);
+    y = hints(c, 8, cw - 16, y, &[("Enter", "Play"), ("N", "New character"), ("Del", "Delete"), ("Esc", "Quit")]);
     y += 2;
     let room = ((ch - 16 - y) / 10).max(1) as usize;
     if let Some(notice) = menu.notice() {
@@ -278,29 +287,55 @@ fn draw_select(c: &mut Canvas<'_>, menu: &Menu, state: &SelectState, cw: i32, ch
     }
 }
 
+/// What the question says deleting does, in plain words: the character and its progress go from the server and its name is
+/// free again, and the server keeps a copy that only its operator can bring back.
+pub const CONFIRM_DELETE_TEXT: &str =
+    "The character and its progress are deleted from the server, and its name is free again. The server keeps a recoverable copy that only its operator can restore.";
+/// What the question says forgetting does: only this computer's saved login goes, the character stays where it is.
+pub const CONFIRM_FORGET_TEXT: &str =
+    "Forget only removes the saved login from this computer: the character stays on the server and its name stays taken.";
+/// The keys of the question, in the order of its buttons: delete, forget on this computer only, keep.
+const CONFIRM_KEYS: [(&str, &str); 3] = [("Y", "delete"), ("F", "forget on this computer only"), ("N or Esc", "keep")];
+
 fn draw_confirm(c: &mut Canvas<'_>, menu: &Menu, confirm: Confirm, cw: i32, ch: i32) {
     c.fill(0, 0, cw, ch, DIMMER);
     let w = (cw - 24).min(300);
     let x = (cw - w) / 2;
+    let cells = ((w - 16) / 8) as usize;
     let name = menu.accounts().get(confirm.index).map_or("?", |a| a.name.as_str());
-    let body = wrap(
-        "This deletes the saved login on THIS computer only. The character stays on the server, but you can only log in as it again if you still have its token.",
-        ((w - 16) / 8) as usize,
-    );
-    let h = 16 + 12 + 12 + body.len() as i32 * 10 + 10 + BUTTON_H + 8 + 8 + 8;
+    let delete_text = wrap(CONFIRM_DELETE_TEXT, cells);
+    let forget_text = wrap(CONFIRM_FORGET_TEXT, cells);
+    let key_rows = hint_rows(w - 16, &CONFIRM_KEYS).len() as i32;
+    // The rows of the panel, top to bottom: the question and the name, what each answer does, the buttons, the keys.
+    let text_h = (delete_text.len() + forget_text.len()) as i32 * 10 + 4;
+    let h = 36 + text_h + 4 + BUTTON_H + 8 + key_rows * 11 + 6;
     let y = ((ch - h) / 2).max(4);
     c.panel(x, y, w, h);
-    c.centered(x, w, y + 8, ACCENT, "Forget this saved login?");
-    let shown = ellipsize(name, ((w - 16) / 8) as usize);
-    c.centered(x, w, y + 20, TEXT, &shown);
-    for (i, line) in body.iter().enumerate() {
-        c.shadowed(x + 8, y + 36 + i as i32 * 10, DIM, line);
+    c.centered(x, w, y + 8, ACCENT, "Delete this character?");
+    c.centered(x, w, y + 20, TEXT, &ellipsize(name, cells));
+    let mut ty = y + 36;
+    for line in &delete_text {
+        c.shadowed(x + 8, ty, DIM, line);
+        ty += 10;
     }
-    let by = y + h - 8 - 8 - 8 - BUTTON_H;
-    let bw = 80;
-    c.button(x + w / 2 - bw - 6, by, bw, "Keep", confirm.focus == ConfirmChoice::Keep);
-    c.button(x + w / 2 + 6, by, bw, "Forget", confirm.focus == ConfirmChoice::Forget);
-    c.centered(x, w, y + h - 8 - 8, DIM, "Y forget   N or Esc keep");
+    ty += 4;
+    for line in &forget_text {
+        c.shadowed(x + 8, ty, DIM, line);
+        ty += 10;
+    }
+    // The buttons, each as wide as its label needs (with room to spare where the panel has it), side by side.
+    let buttons = [("Keep", ConfirmChoice::Keep), ("Delete", ConfirmChoice::Delete), ("Forget here", ConfirmChoice::Forget)];
+    let gap = 6;
+    let widths = |pad: i32| buttons.map(|(label, _)| cell_count(label) as i32 * 8 + pad);
+    let pad = if widths(16).iter().sum::<i32>() + 2 * gap <= w - 16 { 16 } else { 8 };
+    let widths = widths(pad);
+    let by = ty + 4;
+    let mut bx = x + (w - (widths.iter().sum::<i32>() + 2 * gap)) / 2;
+    for ((label, choice), bw) in buttons.iter().zip(widths) {
+        c.button(bx, by, bw, label, confirm.focus == *choice);
+        bx += bw + gap;
+    }
+    hints(c, x + 8, w - 16, by + BUTTON_H + 8, &CONFIRM_KEYS);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -587,14 +622,16 @@ fn draw_connecting(c: &mut Canvas<'_>, menu: &Menu, target: &Target, elapsed: f3
     title(c, cw, y.saturating_sub(34).max(4), "FF MULTIVERSE");
     c.panel(x, y, w, h);
     let cells = ((w - 16) / 8) as usize;
-    let (head, line) = match target {
-        Target::Login { name } => ("Logging in".to_string(), format!("as {name}")),
-        Target::Register { name } => ("Creating your character".to_string(), name.clone()),
+    let (head, line, leave) = match target {
+        Target::Login { name } => ("Logging in".to_string(), format!("as {name}"), "Esc: cancel"),
+        Target::Register { name } => ("Creating your character".to_string(), name.clone(), "Esc: cancel"),
+        // The request is already with the server: Esc only ends the wait.
+        Target::Delete { name } => ("Deleting this character".to_string(), name.clone(), "Esc: stop waiting"),
     };
     c.centered(x, w, y + 8, ACCENT, &format!("{} {}", spinner(menu.clock()), head));
     c.centered(x, w, y + 22, TEXT, &ellipsize(&line, cells));
     c.centered(x, w, y + 36, DIM, &ellipsize(&format!("on {}   {} s", menu.config().server, elapsed as u32), cells));
-    c.centered(x, w, y + 54, DIM, "Esc: cancel");
+    c.centered(x, w, y + 54, DIM, leave);
     draw_game_line(c, menu, cw, ch);
 }
 
@@ -654,7 +691,7 @@ mod tests {
     use super::*;
     use crate::ui::draw::DrawnText;
     use crate::ui::widgets::SHADOW;
-    use crate::ui::menu::{CharacterEntry, KeyPress, Look, MenuConfig, NavKey};
+    use crate::ui::menu::{CharacterEntry, KeyPress, Look, MenuAction, MenuConfig, NavKey};
 
     const SIZES: [(u32, u32); 9] =
         [(320, 240), (400, 270), (480, 270), (640, 360), (800, 600), (1100, 680), (1280, 720), (1920, 1080), (3840, 2160)];
@@ -765,10 +802,11 @@ mod tests {
         }
         // A character whose look this machine has not seen says so.
         assert!(list.says("look unknown"));
-        // The key hints are all there.
-        for key in ["Enter", "Play", "New character", "Del", "Forget", "Esc", "Quit"] {
+        // The key hints are all there: Del asks to delete (it is not "forget" any more).
+        for key in ["Enter", "Play", "New character", "Del", "Delete", "Esc", "Quit"] {
             assert!(list.says(key), "{key}");
         }
+        assert!(!list.says("Forget"), "the list no longer offers to forget: Del asks to delete");
         // The FF7 footer is a plain one: no FIXTURE label for real content.
         assert!(list.says("Game: FF7") && !list.says("FIXTURE"));
         assert_text_inside(&list, 1100, 680, "select");
@@ -837,16 +875,90 @@ mod tests {
     }
 
     #[test]
-    fn the_confirmation_names_the_character_and_says_what_forgetting_means() {
+    fn the_confirmation_names_the_character_and_says_what_deleting_and_forgetting_mean() {
         let mut menu = Menu::new(cfg(GameId::Ff7), sample_accounts());
         menu.key(KeyPress::new(NavKey::Down));
         menu.key(KeyPress::new(NavKey::Delete));
         let list = draw(&menu, 1100, 680);
-        assert!(list.says("Forget this saved login?"));
+        assert!(list.says("Delete this character?"));
+        assert!(!list.says("Forget this saved login?"), "the old question is gone");
         assert!(list.texts().iter().any(|t| t.text == "Tifa"), "it names the character");
-        assert!(list.says("THIS computer only") && list.says("stays on the server"));
-        assert!(list.says("Keep") && list.says("Forget") && list.says("Y forget"));
+        let said = said(&list);
+        // What deleting does, plainly: the character and its progress go from the server, the name is free again, and the
+        // server keeps a copy that only its operator can bring back.
+        for needle in ["deleted from the server", "its name is free again", "recoverable copy that only its operator can restore"] {
+            assert!(said.contains(needle), "{needle:?} is not on the question: {said}");
+        }
+        // What forgetting does: the saved login of this computer only, the character stays on the server.
+        for needle in ["Forget only removes the saved login from this computer", "stays on the server", "its name stays taken"] {
+            assert!(said.contains(needle), "{needle:?} is not on the question: {said}");
+        }
+        // The three answers and the keys that give them.
+        for label in ["Keep", "Delete", "Forget here"] {
+            assert!(list.texts().iter().any(|t| t.text == label), "the {label} button");
+        }
+        for keys in ["Y delete", "F forget on this computer only", "N or Esc keep"] {
+            assert!(said.contains(keys), "{keys:?} is not on the question: {said}");
+        }
+        assert!(!said.contains("Y forget") && !said.contains("This deletes the saved login"), "the old strings are gone: {said}");
         assert_text_inside(&list, 1100, 680, "confirm");
+    }
+
+    /// The focused answer is the bright one (the others are dimmer), whichever it is; it starts on Keep.
+    #[test]
+    fn the_focused_answer_is_the_bright_one() {
+        let mut menu = Menu::new(cfg(GameId::Ff7), sample_accounts());
+        menu.key(KeyPress::new(NavKey::Delete));
+        // (The word Delete is also on the list's key hints, in bright text: that one is always there.)
+        let dim = |menu: &Menu, label: &str| draw(menu, 1100, 680).texts().iter().filter(|t| t.text == label && t.color == SOFT).count();
+        for (moves, focused) in [(0, "Keep"), (1, "Delete"), (2, "Forget here"), (3, "Keep")] {
+            if moves > 0 {
+                menu.key(KeyPress::new(NavKey::Right));
+            }
+            for label in ["Keep", "Delete", "Forget here"] {
+                assert_eq!(dim(&menu, label), usize::from(label != focused), "{label} after {moves} moves (focus: {focused})");
+            }
+        }
+    }
+
+    /// Nothing on the question overlaps anything else on it, in any window: the three buttons, the two texts and the
+    /// keys (which break over rows where the panel is narrow) each have their own place.
+    #[test]
+    fn nothing_on_the_confirmation_overlaps_and_it_fits_every_window() {
+        let mut menu = Menu::new(cfg(GameId::Ff7), sample_accounts());
+        menu.key(KeyPress::new(NavKey::Delete));
+        for (w, h) in SIZES {
+            let list = draw(&menu, w, h);
+            // The question is drawn last: everything from its title on is its own.
+            let panel: Vec<&DrawnText> = list.texts().iter().skip_while(|t| t.text != "Delete this character?").filter(|t| t.color != SHADOW).collect();
+            assert!(panel.len() >= 12, "{w}x{h}: only {} texts", panel.len());
+            for (i, a) in panel.iter().enumerate() {
+                for b in &panel[i + 1..] {
+                    let (ra, rb) = (rect_of(a), rect_of(b));
+                    let apart = ra.2 <= rb.0 || rb.2 <= ra.0 || ra.3 <= rb.1 || rb.3 <= ra.1;
+                    assert!(apart, "{w}x{h}: {:?} {ra:?} overlaps {:?} {rb:?}", a.text, b.text);
+                }
+            }
+            assert_text_inside(&list, w, h, "confirm");
+        }
+    }
+
+    #[test]
+    fn the_deleting_screen_says_what_is_happening_and_that_escape_only_stops_the_wait() {
+        let mut menu = Menu::new(cfg(GameId::Ff7), sample_accounts());
+        menu.key(KeyPress::new(NavKey::Down));
+        menu.key(KeyPress::new(NavKey::Delete));
+        assert_eq!(menu.text("y"), Some(MenuAction::Delete { index: 1 }));
+        // (One tick counts for at most a second, so two seconds and a bit are three ticks.)
+        for dt in [1.0, 1.0, 0.5] {
+            menu.tick(dt);
+        }
+        let list = draw(&menu, 1100, 680);
+        assert!(list.says("Deleting this character") && list.texts().iter().any(|t| t.text == "Tifa"), "{:?}", list.texts().iter().map(|t| &t.text).collect::<Vec<_>>());
+        assert!(list.says("127.0.0.1:47770") && list.says("2 s"));
+        assert!(list.says("Esc: stop waiting") && !list.says("Esc: cancel"), "Esc only ends the wait: the server may still delete it");
+        assert!(!list.says("Logging in") && !list.says("Creating your character"));
+        assert_text_inside(&list, 1100, 680, "deleting");
     }
 
     #[test]
@@ -1061,9 +1173,13 @@ mod tests {
             let mut v = Vec::new();
             v.push(("select", Menu::new(cfg(GameId::Ff7), sample_accounts())));
             v.push(("select one", Menu::new(cfg(GameId::Ff7), vec![entry("Cloud", Some([1, 2, 3]), Some("ff7/cloud"))])));
-            let mut forget = Menu::new(cfg(GameId::Ff7), sample_accounts());
-            forget.key(KeyPress::new(NavKey::Delete));
-            v.push(("forget", forget));
+            let mut ask = Menu::new(cfg(GameId::Ff7), sample_accounts());
+            ask.key(KeyPress::new(NavKey::Delete));
+            v.push(("delete question", ask));
+            let mut deleting = Menu::new(cfg(GameId::Ff7), sample_accounts());
+            deleting.key(KeyPress::new(NavKey::Delete));
+            deleting.text("y");
+            v.push(("deleting", deleting));
             let mut create = Menu::new(cfg(GameId::Ff7), vec![]);
             create.text(&"W".repeat(24));
             v.push(("create", create));

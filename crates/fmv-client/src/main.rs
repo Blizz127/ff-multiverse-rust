@@ -18,6 +18,9 @@
 //! the server, or a registration) is decided first of all, before the content is opened or a
 //! connection made (see `login`); the token a registration issues is saved by the handshake the
 //! moment it arrives (see `net` and `accounts`).
+//!
+//! `--delete NAME` deletes a character on the server and exits (see `delete`): no window, no game
+//! files, no login; the same deleting is what `Del` then `Y` does in the character menu.
 
 mod accounts;
 mod audio;
@@ -26,6 +29,7 @@ mod backdrop;
 mod battle;
 mod bot;
 mod cli;
+mod delete;
 mod ff7;
 mod gamemode;
 mod gamepad;
@@ -268,6 +272,22 @@ fn run_menu(args: &Args, state_dir: &Path, store: TokenStore) -> u8 {
     )
 }
 
+/// `--delete NAME`: ask the server to delete the character saved under NAME (see `delete`). Nothing else is started:
+/// no window, no game files, no login. One line on stdout on success; the exit code says how it went.
+fn run_delete(args: &Args, name: &str, state_dir: &Path, store: &TokenStore) -> u8 {
+    let looks = ui::looks::LookCache::new(state_dir);
+    let command = delete::Command { server: &args.server, name, store, looks: &looks };
+    // The content is never opened, so the build is the plain client's (what a fixture run says in its `Hello`).
+    let client_build = format!("fmv-client/{}", env!("CARGO_PKG_VERSION"));
+    let (stdout, stderr) = (std::io::stdout(), std::io::stderr());
+    delete::run_command(
+        &command,
+        |token| delete::delete_blocking(&args.server, token, &client_build),
+        &mut stdout.lock(),
+        &mut stderr.lock(),
+    )
+}
+
 fn run(args: Args) -> u8 {
     // Accounts first: it is cheap and local, so a missing `--name` or a broken token file is
     // reported before the (slow) content indexing and before anything reaches a server.
@@ -279,6 +299,10 @@ fn run(args: Args) -> u8 {
         }
     };
     let store = TokenStore::new(&state_dir);
+    // `--delete NAME` is a command of its own: it opens no window, opens no game files and makes no login.
+    if let Some(name) = &args.delete {
+        return run_delete(&args, name, &state_dir, &store);
+    }
     // A window without --name opens on the character menu; --name and --headless keep the
     // command-line behaviour below.
     if args.wants_menu() {

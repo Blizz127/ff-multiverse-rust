@@ -1,10 +1,28 @@
-//! Operator tool for a player's character: show it, or change an existing account's look to a generic placeholder
-//! body (an account that still looks like a canon character, for instance).
+//! Operator tool for a player's character: show it, change an existing account's look to a generic placeholder
+//! body (an account that still looks like a canon character, for instance), or delete a character and bring it back.
 //!
 //! ```text
 //! fmv-characters <state-dir> show <account-id|name> [--game ff7]
 //! fmv-characters <state-dir> restyle <account-id|name> --body <lean|sturdy|slight> [--tint rrggbb] [--game ff7] [--dry-run]
+//! fmv-characters <state-dir> delete <account-id|name> [--dry-run]
+//! fmv-characters <state-dir> trash
+//! fmv-characters <state-dir> restore <trash-entry|account-id|name> [--dry-run]
 //! ```
+//!
+//! # delete, trash and restore
+//!
+//! `delete` does what a player's own delete does (the client's Del key asks the server, with the character's token):
+//! it moves the account's records (account, avatar, player character, progress) into a timestamped entry of the
+//! state directory's `trash/` folder, frees the name, voids the token and takes the account off the index, and
+//! **nothing else changes**: the tool hashes every file of the state directory before and after and fails the run
+//! if any file other than the account's own records and `index.log` differs. It is the way to free a name whose
+//! player has no token (or to remove a character by hand). `trash` lists the entries. `restore` brings one back: the
+//! name must still be free, the character comes back as a **new** account (the old id is retired for good, a new
+//! one is given, every record is re-keyed) with a **new token** that is printed once, so it is how a character a
+//! player deleted by mistake is given back (the client forgot the old token when it deleted). A restored entry is
+//! kept in the trash under a `.restored-<id>` name and cannot be restored a second time. An entry is named as
+//! `trash` lists it, by the id the deleted account had, or by the character's name. Like every command here, these
+//! need the server stopped (the tool takes the state directory's lock).
 //!
 //! `<state-dir>` is the SERVER's state directory, the one that holds `accounts/`, `avatars/`, `characters/` and
 //! `progression/` (the server's default is the `server` directory inside its base state directory, which is not
@@ -63,8 +81,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use fmv_core::{AccountId, GameId};
-use fmv_persist::{PersistError, PlayerCharacter, ProgressRef, Restyle, RestyleAdded, Store};
+use fmv_core::{name_key, AccountId, GameId};
+use fmv_persist::{PersistError, PlayerCharacter, ProgressRef, Restyle, RestyleAdded, Store, TrashEntry, TrashState};
 use fmv_server::admin::{self, BindingKind};
 
 /// The default for `--game`.
@@ -80,6 +98,9 @@ fn now() -> u64 {
 enum Command {
     Show { account: String, game: GameId },
     Restyle { account: String, game: GameId, body: String, tint: Option<[u8; 3]>, dry_run: bool },
+    Delete { account: String, dry_run: bool },
+    Trash,
+    Restore { entry: String, dry_run: bool },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -184,6 +205,26 @@ fn parse(args: &[String]) -> Result<Invocation, String> {
                 dry_run: scanned.switches.contains("dry-run"),
             }
         }
+        "delete" => {
+            let scanned = scan_args(rest, &[], &["dry-run"])?;
+            Command::Delete { account: the_account(&scanned)?, dry_run: scanned.switches.contains("dry-run") }
+        }
+        "trash" => {
+            let scanned = scan_args(rest, &[], &[])?;
+            if !scanned.positional.is_empty() {
+                return Err("trash takes no arguments".into());
+            }
+            Command::Trash
+        }
+        "restore" => {
+            let scanned = scan_args(rest, &[], &["dry-run"])?;
+            let entry = match scanned.positional.as_slice() {
+                [entry] => entry.clone(),
+                [] => return Err("a trash entry (as `trash` lists it, or the deleted account's id or the character's name) is required".into()),
+                _ => return Err("exactly one trash entry is expected".into()),
+            };
+            Command::Restore { entry, dry_run: scanned.switches.contains("dry-run") }
+        }
         other => return Err(format!("unknown command {other:?}")),
     };
     Ok(Invocation { dir: PathBuf::from(dir), command })
@@ -193,7 +234,10 @@ fn usage() -> ExitCode {
     let bodies: Vec<&str> = admin::offered_bodies(DEFAULT_GAME).iter().map(|body| body.archetype).collect();
     eprintln!(
         "usage: fmv-characters <state-dir> show <account-id|name> [--game ff7]\n       \
-         fmv-characters <state-dir> restyle <account-id|name> --body <{}> [--tint rrggbb] [--game ff7] [--dry-run]\n\
+         fmv-characters <state-dir> restyle <account-id|name> --body <{}> [--tint rrggbb] [--game ff7] [--dry-run]\n       \
+         fmv-characters <state-dir> delete <account-id|name> [--dry-run]\n       \
+         fmv-characters <state-dir> trash\n       \
+         fmv-characters <state-dir> restore <trash-entry|account-id|name> [--dry-run]\n\
          <state-dir> is the server's state directory (accounts/, avatars/, characters/, progression/); stop the server first",
         bodies.join("|")
     );
@@ -735,6 +779,390 @@ fn restyle(dir: &Path, account_arg: &str, game: GameId, body_arg: &str, tint: Op
     ExitCode::SUCCESS
 }
 
+// ---- delete, trash and restore ----------------------------------------------------------------------------------
+
+/// What a delete or a restore may change in the state directory: these paths, and everything under `prefixes`, may
+/// appear, change or disappear. Every other path must be exactly as it was.
+#[derive(Debug, Default)]
+struct Allowed {
+    exact: BTreeSet<String>,
+    prefixes: Vec<String>,
+}
+
+impl Allowed {
+    fn permits(&self, rel: &str) -> bool {
+        self.exact.contains(rel) || self.prefixes.iter().any(|prefix| rel.starts_with(prefix.as_str()))
+    }
+}
+
+/// What comparing the tree before and after found outside the allowed paths.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Untouched {
+    /// How many files and directories were compared and are identical (every other account's records among them).
+    files: usize,
+    dirs: usize,
+    failures: Vec<String>,
+}
+
+/// Every path that is not allowed to change must be there before and after with the same digest.
+fn verify_untouched(opened: &Tree, after: &Tree, allowed: &Allowed) -> Untouched {
+    let mut out = Untouched::default();
+    let paths: BTreeSet<&str> = opened.keys().chain(after.keys()).map(String::as_str).collect();
+    for rel in paths {
+        if allowed.permits(rel) {
+            continue;
+        }
+        match (opened.get(rel), after.get(rel)) {
+            (Some(a), Some(b)) if a == b => match a {
+                Entry::File(_) => out.files += 1,
+                Entry::Dir => out.dirs += 1,
+                Entry::Other => {}
+            },
+            (a, b) => out.failures.push(format!("{rel} {} -> {}, and it is not one of the files this run may change", describe(a), describe(b))),
+        }
+    }
+    out
+}
+
+fn print_untouched(untouched: &Untouched) {
+    println!("  {} other file(s) and {} director(ies): byte for byte unchanged (sha256 before and after)", untouched.files, untouched.dirs);
+}
+
+/// The proof block's failures, printed like the restyle's; `true` if there were none.
+fn report_failures(failures: &[String]) -> bool {
+    for failure in failures {
+        println!("VERIFICATION FAILED: {failure}");
+        eprintln!("VERIFICATION FAILED: {failure}");
+    }
+    failures.is_empty()
+}
+
+/// The deleted trash entry the operator means: by the name `trash` lists, by the id the deleted account had, or by the
+/// character's name (compared by the store's own rule). More than one candidate is refused with the list, never guessed.
+fn pick_entry<'a>(entries: &'a [TrashEntry], arg: &str) -> Result<&'a TrashEntry, String> {
+    let restorable: Vec<&TrashEntry> = entries.iter().filter(|e| e.state == TrashState::Deleted && e.problem.is_none()).collect();
+    if let Some(exact) = restorable.iter().find(|e| e.name == arg) {
+        return Ok(exact);
+    }
+    let by_id = arg.parse::<u64>().ok().map(|id| restorable.iter().copied().filter(|e| e.account_id.0 == id).collect::<Vec<_>>());
+    let by_name = {
+        let wanted = name_key(arg);
+        restorable.iter().copied().filter(|e| !wanted.is_empty() && name_key(&e.display_name) == wanted).collect::<Vec<_>>()
+    };
+    let candidates = match by_id {
+        Some(found) if !found.is_empty() => found,
+        _ => by_name,
+    };
+    match candidates.as_slice() {
+        [one] => Ok(one),
+        [] => Err(format!("no restorable trash entry matches {arg:?} (`trash` lists them; a restored or interrupted one cannot be restored)")),
+        many => {
+            let names: Vec<&str> = many.iter().map(|e| e.name.as_str()).collect();
+            Err(format!("{arg:?} matches {} trash entries ({}): name one of them exactly", many.len(), names.join(", ")))
+        }
+    }
+}
+
+fn state_text(state: TrashState) -> String {
+    match state {
+        TrashState::Deleted => "deleted".to_owned(),
+        TrashState::Pending => "delete interrupted (the next open of the store settles it)".to_owned(),
+        TrashState::Restoring { as_account } => format!("restore interrupted, as account {} (the next open of the store settles it)", as_account.0),
+        TrashState::Restored { as_account } => format!("restored as account {}", as_account.0),
+    }
+}
+
+fn delete(dir: &Path, account_arg: &str, dry_run: bool) -> ExitCode {
+    if let Err(why) = check_state_dir(dir) {
+        eprintln!("{why}");
+        return ExitCode::FAILURE;
+    }
+    let scan_failed = |when: &str, e: io::Error| {
+        eprintln!("cannot read the state directory {when}: {e}");
+        ExitCode::FAILURE
+    };
+    let store = match open_store(dir) {
+        Ok(store) => store,
+        Err(code) => return code,
+    };
+    let opened = match scan_tree(dir) {
+        Ok(tree) => tree,
+        Err(e) => return scan_failed("after opening it", e),
+    };
+    let (account, name) = match resolve_account(&store, account_arg) {
+        Ok(found) => found,
+        Err(why) => {
+            eprintln!("{why}; no file was written");
+            return ExitCode::FAILURE;
+        }
+    };
+    let plan = match store.deletion_plan(account) {
+        Ok(plan) => plan,
+        Err(e) => {
+            eprintln!("account {} {name:?}: {e}; no file was written", account.0);
+            return ExitCode::FAILURE;
+        }
+    };
+    if dry_run {
+        println!("dry run: nothing was written");
+    }
+    println!("account {} {name:?}", account.0);
+    println!("delete: {} file(s) move into the trash:", plan.len());
+    for rel in &plan {
+        println!("  {rel}");
+    }
+    println!("afterwards the name {name:?} is free, the token stops working and the account id {} is retired for good", account.0);
+
+    if dry_run {
+        drop(store);
+        let after = match scan_tree(dir) {
+            Ok(tree) => tree,
+            Err(e) => return scan_failed("after the dry run", e),
+        };
+        println!("verification (every file of the state directory, hashed before and after):");
+        let untouched = verify_untouched(&opened, &after, &Allowed::default());
+        print_untouched(&untouched);
+        if !report_failures(&untouched.failures) {
+            return ExitCode::FAILURE;
+        }
+        println!("result: dry run; no file was written");
+        return ExitCode::SUCCESS;
+    }
+
+    let deleted = match store.delete_account(account, now()) {
+        Ok(deleted) => deleted,
+        Err(e) => {
+            eprintln!("account {} {name:?}: {e}; nothing was deleted", account.0);
+            return ExitCode::FAILURE;
+        }
+    };
+    drop(store);
+    let after = match scan_tree(dir) {
+        Ok(tree) => tree,
+        Err(e) => return scan_failed("after the delete", e),
+    };
+
+    // The proof: the account's files are in the trash entry byte for byte and gone from where they were; the index grew;
+    // everything else is exactly as it was.
+    let entry_dir = format!("trash/{}", deleted.entry);
+    let mut failures = Vec::new();
+    println!("verification (every file of the state directory, hashed after the store was opened and after the delete):");
+    for rel in &deleted.files {
+        let moved_to = format!("{entry_dir}/{rel}");
+        match (opened.get(rel), after.get(&moved_to), after.contains_key(rel)) {
+            (Some(Entry::File(was)), Some(Entry::File(now_is)), false) if was == now_is => {
+                println!("  moved: {rel} (sha256 {}) -> {moved_to}, the same bytes", short(was));
+            }
+            (was, now_is, still_there) => failures.push(format!(
+                "{rel} was {} and is now {} in the trash{}",
+                describe(was),
+                describe(now_is),
+                if still_there { " and is still where it was" } else { "" }
+            )),
+        }
+    }
+    if opened.get("index.log") == after.get("index.log") {
+        failures.push("index.log did not change, so the account was not taken off the index".to_owned());
+    } else {
+        println!("  index.log: changed (the release of account {} was appended to it)", account.0);
+    }
+    if !after.contains_key(&format!("{entry_dir}/manifest.json")) {
+        failures.push(format!("{entry_dir}/manifest.json was not written"));
+    }
+    let mut allowed = Allowed::default();
+    allowed.exact.extend(["index.log".to_owned(), "trash".to_owned(), entry_dir.clone(), format!("progression/{}", account.0)]);
+    allowed.exact.extend(deleted.files.iter().cloned());
+    allowed.prefixes.push(format!("{entry_dir}/"));
+    let untouched = verify_untouched(&opened, &after, &allowed);
+    print_untouched(&untouched);
+    failures.extend(untouched.failures);
+    if !report_failures(&failures) {
+        return ExitCode::FAILURE;
+    }
+    if !deleted.unfinished.is_empty() {
+        println!("note: the move of {} file(s) could not be finished ({}); the next open of the store finishes it", deleted.unfinished.len(), deleted.unfinished.join("; "));
+    }
+    println!(
+        "result: done; account {} {name:?} is in the trash entry {} (its name is free); restore it with: fmv-characters {} restore {}",
+        account.0,
+        deleted.entry,
+        dir.display(),
+        deleted.entry
+    );
+    ExitCode::SUCCESS
+}
+
+fn trash(dir: &Path) -> ExitCode {
+    if let Err(why) = check_state_dir(dir) {
+        eprintln!("{why}");
+        return ExitCode::FAILURE;
+    }
+    let store = match open_store(dir) {
+        Ok(store) => store,
+        Err(code) => return code,
+    };
+    let entries = match store.trash_entries() {
+        Ok(entries) => entries,
+        Err(e) => {
+            eprintln!("cannot read the trash: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if entries.is_empty() {
+        println!("the trash is empty");
+        return ExitCode::SUCCESS;
+    }
+    println!("the trash: {} entr(ies), oldest first", entries.len());
+    for entry in &entries {
+        match &entry.problem {
+            None => println!(
+                "  {}  {:?}  account {}, deleted {}, {} file(s); {}",
+                entry.name,
+                entry.display_name,
+                entry.account_id.0,
+                entry.deleted_at_utc,
+                entry.files,
+                state_text(entry.state)
+            ),
+            Some(problem) => println!("  {}  account {}; {}; its manifest cannot be read: {problem}", entry.name, entry.account_id.0, state_text(entry.state)),
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn restore(dir: &Path, entry_arg: &str, dry_run: bool) -> ExitCode {
+    if let Err(why) = check_state_dir(dir) {
+        eprintln!("{why}");
+        return ExitCode::FAILURE;
+    }
+    let scan_failed = |when: &str, e: io::Error| {
+        eprintln!("cannot read the state directory {when}: {e}");
+        ExitCode::FAILURE
+    };
+    let store = match open_store(dir) {
+        Ok(store) => store,
+        Err(code) => return code,
+    };
+    let opened = match scan_tree(dir) {
+        Ok(tree) => tree,
+        Err(e) => return scan_failed("after opening it", e),
+    };
+    let entries = match store.trash_entries() {
+        Ok(entries) => entries,
+        Err(e) => {
+            eprintln!("cannot read the trash: {e}; no file was written");
+            return ExitCode::FAILURE;
+        }
+    };
+    let entry = match pick_entry(&entries, entry_arg) {
+        Ok(entry) => entry.clone(),
+        Err(why) => {
+            eprintln!("{why}; no file was written");
+            return ExitCode::FAILURE;
+        }
+    };
+    // The same checks the restore runs, before anything is written: the entry reads cleanly, the name is free, the
+    // store has room.
+    if let Err(e) = store.restore_check(&entry.name) {
+        eprintln!("cannot restore {}: {e}; no file was written", entry.name);
+        return ExitCode::FAILURE;
+    }
+    if dry_run {
+        println!("dry run: nothing was written");
+    }
+    println!(
+        "trash entry {}: {:?}, account {} deleted {}, {} file(s)",
+        entry.name, entry.display_name, entry.account_id.0, entry.deleted_at_utc, entry.files
+    );
+    println!("restore: as a NEW account (the old id {} is retired and stays so) with a NEW token; the name {:?} is free", entry.account_id.0, entry.display_name);
+
+    if dry_run {
+        drop(store);
+        let after = match scan_tree(dir) {
+            Ok(tree) => tree,
+            Err(e) => return scan_failed("after the dry run", e),
+        };
+        println!("verification (every file of the state directory, hashed before and after):");
+        let untouched = verify_untouched(&opened, &after, &Allowed::default());
+        print_untouched(&untouched);
+        if !report_failures(&untouched.failures) {
+            return ExitCode::FAILURE;
+        }
+        println!("result: dry run; no file was written");
+        return ExitCode::SUCCESS;
+    }
+
+    let restored = match store.restore_account(&entry.name, now()) {
+        Ok(restored) => restored,
+        Err(e) => {
+            eprintln!("cannot restore {}: {e}; the entry is as it was", entry.name);
+            return ExitCode::FAILURE;
+        }
+    };
+    drop(store);
+    let after = match scan_tree(dir) {
+        Ok(tree) => tree,
+        Err(e) => return scan_failed("after the restore", e),
+    };
+
+    // The proof: the new account's records exist, the entry's records are byte for byte what they were (only its
+    // manifest gained the plan), and every other file is exactly as it was.
+    let new = restored.account_id.0;
+    let (old_dir, new_dir) = (format!("trash/{}", entry.name), format!("trash/{}", restored.entry));
+    let mut failures = Vec::new();
+    println!("verification (every file of the state directory, hashed after the store was opened and after the restore):");
+    let mut written = vec![format!("accounts/{new}.json")];
+    written.extend(restored.avatar_id.map(|avatar| format!("avatars/{}.json", avatar.0)));
+    for rel in after.keys().filter(|rel| rel.starts_with(&format!("characters/{new}.json")) || rel.starts_with(&format!("progression/{new}/"))) {
+        written.push(rel.clone());
+    }
+    for rel in &written {
+        match after.get(rel) {
+            Some(Entry::File(digest)) => println!("  written: {rel} (sha256 {})", short(digest)),
+            other => failures.push(format!("{rel} was not written ({})", describe(other))),
+        }
+    }
+    let prefix = format!("{old_dir}/");
+    let mut kept = 0usize;
+    for (rel, was) in opened.iter().filter(|(rel, _)| rel.starts_with(&prefix)) {
+        let inside = rel.strip_prefix(&prefix).unwrap_or(rel);
+        if inside == "manifest.json" || matches!(was, Entry::Dir) {
+            continue;
+        }
+        match after.get(&format!("{new_dir}/{inside}")) {
+            Some(now_is) if now_is == was => kept += 1,
+            other => failures.push(format!("{rel} in the trash was {} and is now {} in {new_dir}", describe(Some(was)), describe(other))),
+        }
+    }
+    println!("  the trash entry kept its {kept} record file(s) byte for byte (as {new_dir})");
+    if opened.get("index.log") == after.get("index.log") {
+        failures.push("index.log did not change, so the account was not added to the index".to_owned());
+    } else {
+        println!("  index.log: changed (the new account {new} was appended to it)");
+    }
+    let mut allowed = Allowed::default();
+    allowed.exact.extend(["index.log".to_owned(), old_dir.clone(), new_dir.clone(), format!("progression/{new}")]);
+    allowed.exact.extend(written.iter().cloned());
+    allowed.prefixes.extend([format!("{old_dir}/"), format!("{new_dir}/"), format!("progression/{new}/")]);
+    let untouched = verify_untouched(&opened, &after, &allowed);
+    print_untouched(&untouched);
+    failures.extend(untouched.failures);
+    if !report_failures(&failures) {
+        return ExitCode::FAILURE;
+    }
+    if !restored.unfinished.is_empty() {
+        println!("note: {} progress record(s) could not be written ({}); the next open of the store writes them", restored.unfinished.len(), restored.unfinished.join("; "));
+    }
+    println!("result: done; {:?} is account {new} again (the old id {} stays retired)", restored.display_name, entry.account_id.0);
+    println!("token: {}", restored.token);
+    println!(
+        "(shown once; it is a password and the server keeps only its hash. The player's client keeps it in its state directory as accounts/<server>.<name>.token: \
+         two lines, the token, then `name={}`)",
+        restored.display_name
+    );
+    ExitCode::SUCCESS
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let invocation = match parse(&args) {
@@ -747,6 +1175,9 @@ fn main() -> ExitCode {
     match invocation.command {
         Command::Show { account, game } => show(&invocation.dir, &account, game),
         Command::Restyle { account, game, body, tint, dry_run } => restyle(&invocation.dir, &account, game, &body, tint, dry_run),
+        Command::Delete { account, dry_run } => delete(&invocation.dir, &account, dry_run),
+        Command::Trash => trash(&invocation.dir),
+        Command::Restore { entry, dry_run } => restore(&invocation.dir, &entry, dry_run),
     }
 }
 
@@ -985,5 +1416,134 @@ mod tests {
         assert!(check_state_dir(&file).unwrap_err().contains("not a directory"));
         fs::write(dir.path().join("index.log"), b"x").unwrap();
         assert!(check_state_dir(dir.path()).is_ok());
+    }
+
+    // ---- delete, trash and restore
+
+    #[test]
+    fn the_delete_trash_and_restore_commands_are_parsed_strictly() {
+        let delete = parse(&args(&["/s", "delete", "Blizz", "--dry-run"])).unwrap();
+        assert_eq!(delete.command, Command::Delete { account: "Blizz".into(), dry_run: true });
+        assert_eq!(parse(&args(&["/s", "delete", "7"])).unwrap().command, Command::Delete { account: "7".into(), dry_run: false });
+        assert_eq!(parse(&args(&["/s", "trash"])).unwrap().command, Command::Trash);
+        assert_eq!(
+            parse(&args(&["/s", "restore", "20261109T165905Z-7"])).unwrap().command,
+            Command::Restore { entry: "20261109T165905Z-7".into(), dry_run: false }
+        );
+        assert_eq!(parse(&args(&["/s", "restore", "--dry-run", "Aria Vale"])).unwrap().command, Command::Restore { entry: "Aria Vale".into(), dry_run: true });
+        for bad in [
+            vec!["/s", "delete"],
+            vec!["/s", "delete", "a", "b"],
+            vec!["/s", "delete", "a", "--dry-run=yes"],
+            vec!["/s", "delete", "a", "--dry-run", "--dry-run"],
+            vec!["/s", "delete", "a", "--game", "ff7"],
+            vec!["/s", "delete", "a", "--force"],
+            vec!["/s", "trash", "extra"],
+            vec!["/s", "trash", "--dry-run"],
+            vec!["/s", "restore"],
+            vec!["/s", "restore", "a", "b"],
+            vec!["/s", "restore", "a", "--body", "lean"],
+        ] {
+            assert!(parse(&args(&bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    fn entry(name: &str, state: TrashState, account: u64, display: &str) -> TrashEntry {
+        TrashEntry {
+            name: name.into(),
+            state,
+            account_id: AccountId(account),
+            display_name: display.into(),
+            deleted_at: 0,
+            deleted_at_utc: "1970-01-01T00:00:00Z".into(),
+            files: 5,
+            problem: None,
+        }
+    }
+
+    #[test]
+    fn a_trash_entry_is_found_by_its_name_the_id_it_had_or_the_characters_name_and_never_guessed() {
+        let aria = entry("20261109T100000Z-7", TrashState::Deleted, 7, "Aria Vale");
+        let aria_again = entry("20261109T120000Z-9", TrashState::Deleted, 9, "ARIA VALE");
+        let brom = entry("20261109T110000Z-8", TrashState::Deleted, 8, "Brom");
+        let done = entry("20261109T090000Z-3", TrashState::Restored { as_account: AccountId(12) }, 3, "Cid");
+        let stuck = entry("20261109T080000Z-4.pending", TrashState::Pending, 4, "Dyne");
+        let mut broken = entry("20261109T070000Z-5", TrashState::Deleted, 5, "");
+        broken.problem = Some("its manifest cannot be read".into());
+        let all = [aria.clone(), brom.clone(), aria_again.clone(), done, stuck, broken];
+        let name_of = |arg: &str| pick_entry(&all, arg).map(|e| e.name.clone());
+        // by the exact entry name, by the id the deleted account had, by the character's name (case and width do not matter)
+        assert_eq!(name_of("20261109T100000Z-7").unwrap(), aria.name);
+        assert_eq!(name_of("8").unwrap(), brom.name);
+        assert_eq!(name_of("brom").unwrap(), brom.name);
+        assert_eq!(name_of("BROM").unwrap(), brom.name);
+        // two characters of one name: the operator is asked to say which, with the candidates named
+        let err = name_of("aria vale").unwrap_err();
+        assert!(err.contains("matches 2 trash entries") && err.contains(&aria.name) && err.contains(&aria_again.name), "{err}");
+        assert_eq!(name_of("20261109T120000Z-9").unwrap(), aria_again.name, "an exact entry name settles it");
+        assert_eq!(name_of("9").unwrap(), aria_again.name, "and so does the id");
+        // an entry that is restored, in flight or unreadable is not offered, and nothing else matches
+        for arg in ["Cid", "3", "20261109T090000Z-3", "Dyne", "4", "20261109T080000Z-4.pending", "5", "20261109T070000Z-5", "nobody", "", "99", " "] {
+            let err = name_of(arg).unwrap_err();
+            assert!(err.contains("no restorable trash entry matches"), "{arg:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_untouched_check_fails_on_any_change_outside_the_allowed_paths() {
+        let start = tree(&[
+            ("accounts", Entry::Dir),
+            ("accounts/1.json", file(b"one")),
+            ("accounts/2.json", file(b"two")),
+            ("index.log", file(b"log")),
+            ("progression", Entry::Dir),
+            ("progression/2", Entry::Dir),
+            ("progression/2/Ff7.json", file(b"story")),
+        ]);
+        let mut allowed = Allowed::default();
+        allowed.exact.extend(["index.log".to_owned(), "accounts/1.json".to_owned(), "trash".to_owned()]);
+        allowed.prefixes.push("trash/entry/".to_owned());
+        // account 1 left, the trash and the log grew: all allowed, the rest is counted as unchanged
+        let mut moved = start.clone();
+        moved.remove("accounts/1.json");
+        moved.insert("index.log".into(), file(b"log + release"));
+        moved.insert("trash".into(), Entry::Dir);
+        moved.insert("trash/entry".into(), Entry::Dir);
+        moved.insert("trash/entry/accounts".into(), Entry::Dir);
+        moved.insert("trash/entry/accounts/1.json".into(), file(b"one"));
+        let ok = verify_untouched(&start, &moved, &allowed);
+        // (`trash/entry` itself is a directory the allowed list names only as a prefix of its contents: it is a failure
+        // unless it is named exactly, which is why the tool names it)
+        assert_eq!(ok.failures.len(), 1, "{:?}", ok.failures);
+        allowed.exact.insert("trash/entry".to_owned());
+        let ok = verify_untouched(&start, &moved, &allowed);
+        assert!(ok.failures.is_empty(), "{:?}", ok.failures);
+        assert_eq!((ok.files, ok.dirs), (2, 3), "accounts/2.json and progression/2/Ff7.json; accounts, progression, progression/2");
+
+        // another account's record changing, disappearing or appearing is a failure each
+        for (what, mutate) in [
+            ("changed", Box::new(|t: &mut Tree| { t.insert("accounts/2.json".into(), file(b"TWO")); }) as Box<dyn Fn(&mut Tree)>),
+            ("removed", Box::new(|t: &mut Tree| { t.remove("progression/2/Ff7.json"); })),
+            ("added", Box::new(|t: &mut Tree| { t.insert("accounts/3.json".into(), file(b"three")); })),
+            ("replaced by a directory", Box::new(|t: &mut Tree| { t.insert("accounts/2.json".into(), Entry::Dir); })),
+        ] {
+            let mut bad = moved.clone();
+            mutate(&mut bad);
+            let found = verify_untouched(&start, &bad, &allowed);
+            assert_eq!(found.failures.len(), 1, "{what}: {:?}", found.failures);
+            assert!(found.failures[0].contains("not one of the files this run may change"), "{what}: {:?}", found.failures);
+        }
+        // a path that merely starts like an allowed one is not allowed (`trash/entry-2` is not under `trash/entry/`)
+        let mut sneaky = moved.clone();
+        sneaky.insert("trash/entry-2".into(), Entry::Dir);
+        assert_eq!(verify_untouched(&start, &sneaky, &allowed).failures.len(), 1);
+    }
+
+    #[test]
+    fn states_are_described_in_words() {
+        assert_eq!(state_text(TrashState::Deleted), "deleted");
+        assert_eq!(state_text(TrashState::Restored { as_account: AccountId(12) }), "restored as account 12");
+        assert!(state_text(TrashState::Pending).contains("interrupted"));
+        assert!(state_text(TrashState::Restoring { as_account: AccountId(3) }).contains("as account 3"));
     }
 }

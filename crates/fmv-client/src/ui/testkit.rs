@@ -309,6 +309,79 @@ pub fn serve_join(reply: Reply) -> (String, std::thread::JoinHandle<Seen>) {
     (addr, handle)
 }
 
+/// How a [`serve_delete`] server answers the request.
+pub enum DeleteReply {
+    /// `CharacterDeleted` with this name.
+    Deleted(&'static str),
+    /// A `Reject` with this code and sentence.
+    Reject(fmv_protocol::RejectCode, &'static str),
+    /// Reads the request and hangs up without a word (a server that died).
+    Hangup,
+    /// Answers with a message that has no business in an answer to a delete (a `Pong`).
+    Nonsense,
+}
+
+/// What a [`serve_delete`] server saw.
+#[derive(Debug)]
+pub struct SeenDelete {
+    /// The first message of the connection: `None` when the client sent none.
+    pub first: Option<fmv_protocol::ClientMsg>,
+    /// How many messages came after it (none, for a client that asks once and is done).
+    pub after: usize,
+}
+
+/// A fake server for ONE delete request on a local port. Returns its address and a handle for what it saw. The thread
+/// ends when the client hangs up (an answer is followed by the client's own hang-up), or after 30 s.
+pub fn serve_delete(reply: DeleteReply) -> (String, std::thread::JoinHandle<SeenDelete>) {
+    serve_delete_gated(reply, None)
+}
+
+/// [`serve_delete`] that, with a `gate`, reads the request and then waits for a message on it (a dropped sender releases
+/// it too) before it answers: a test can look at the window while the delete is under way, and then let it finish, with
+/// no timing involved.
+pub fn serve_delete_gated(reply: DeleteReply, gate: Option<std::sync::mpsc::Receiver<()>>) -> (String, std::thread::JoinHandle<SeenDelete>) {
+    use fmv_protocol::{read_msg, write_msg, ClientMsg, ServerMsg};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr").to_string();
+    let handle = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        rt.block_on(async move {
+            let limit = std::time::Duration::from_secs(30);
+            listener.set_nonblocking(true).expect("nonblocking");
+            let listener = tokio::net::TcpListener::from_std(listener).expect("listener");
+            let (stream, _) = tokio::time::timeout(limit, listener.accept()).await.expect("a client in time").expect("accept");
+            let (mut rd, mut wr) = stream.into_split();
+            let first = match tokio::time::timeout(limit, read_msg::<_, ClientMsg>(&mut rd)).await {
+                Ok(Ok(msg)) => Some(msg),
+                _ => None,
+            };
+            let mut seen = SeenDelete { first, after: 0 };
+            if let Some(gate) = gate {
+                // Blocks this server thread only: it serves one connection and nothing else needs to run meanwhile.
+                let _ = gate.recv_timeout(limit);
+            }
+            match reply {
+                DeleteReply::Deleted(name) => {
+                    let _ = write_msg(&mut wr, &ServerMsg::CharacterDeleted { name: name.to_string() }).await;
+                }
+                DeleteReply::Reject(code, reason) => {
+                    let _ = write_msg(&mut wr, &ServerMsg::reject(code, reason)).await;
+                }
+                DeleteReply::Hangup => return seen,
+                DeleteReply::Nonsense => {
+                    let _ = write_msg(&mut wr, &ServerMsg::Pong { nonce: 1, tick: 1 }).await;
+                }
+            }
+            // Whatever the client sends from here on is counted (it should send nothing) until it hangs up.
+            while let Ok(Ok(_)) = tokio::time::timeout(limit, read_msg::<_, ClientMsg>(&mut rd)).await {
+                seen.after += 1;
+            }
+            seen
+        })
+    });
+    (addr, handle)
+}
+
 /// A tiny deterministic random generator (xorshift64*), for the monkey tests: the same seed is
 /// the same run, so a failure can be reproduced.
 pub struct Rng(u64);

@@ -5,7 +5,10 @@
 //!   [`input::menu_input`] to the [`Menu`] state machine; the [`MenuAction`]s it returns are run
 //!   here: `Play` and `Register` build a login plan and a network configuration
 //!   ([`flow::prepare`]) and start a [`Connector`], so the window stays alive while the handshake
-//!   runs; `Forget` deletes a saved login from this machine; `Quit` leaves. A refusal comes back
+//!   runs; `Delete` asks the server to delete the character with its saved login's token (a
+//!   [`Deleter`], polled each frame like the connector), and takes the saved login out ONLY when the
+//!   server says the character is gone ([`flow::delete_notice`] decides; every other result keeps it);
+//!   `Forget` deletes a saved login from this machine alone; `Quit` leaves. A refusal comes back
 //!   as a message on the screen it started from.
 //! * **Join.** When the handshake succeeds the shell shows a "Loading" frame (decoding an FF7
 //!   background takes a moment), then builds the [`Session`] and the field view exactly as the
@@ -16,6 +19,7 @@
 //! [`super::flow`] and are tested without a window; this file only wires them to winit.
 
 use super::connect::{Connected, Connector, Outcome};
+use super::deleter::{Deleter, Outcome as DeleteResult};
 use super::draw::DrawList;
 use super::flow::{self, Env, Saved};
 use super::hud::area_label;
@@ -23,9 +27,10 @@ use super::input::{menu_input, pad_menu_input, MenuInput};
 use super::looks::LookCache;
 use super::menu::{Menu, MenuAction, MenuConfig, Notice, NoticeKind, Screen};
 use super::screens;
-use crate::accounts::{loose_mode_warning, TokenStore};
+use crate::accounts::{loose_mode_warning, SavedAccount, TokenStore};
 use crate::audio::{menu_cue, Cue, GameAudio};
 use crate::cli::exit;
+use crate::delete::{failure_text, DeleteOutcome};
 use crate::ff7::SharedFf7;
 use crate::gamemode::{osk_transition, request_osk, DeviceMode};
 use crate::gamepad::{PadEvent, PadMode, Pads};
@@ -106,6 +111,14 @@ struct Pending {
     frames: u32,
 }
 
+/// A delete under way: the thread that asks the server, and the saved login it is for. The login is the one the player
+/// chose, as it was listed then (its token is what the request carries): it is the very one removed if the server says the
+/// character is gone, and a login that changed meanwhile is refused (see `TokenStore::forget`).
+struct PendingDelete {
+    deleter: Deleter,
+    account: SavedAccount,
+}
+
 pub struct Shell {
     launch: Launch,
     menu: Menu,
@@ -116,6 +129,9 @@ pub struct Shell {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     connector: Option<Connector>,
+    /// The delete the player is waiting for, if there is one (never together with a connection attempt: the menu waits
+    /// for one thing at a time).
+    deleting: Option<PendingDelete>,
     /// How the running attempt logs in (for the message if it fails).
     plan: Option<LoginPlan>,
     pending: Option<Pending>,
@@ -148,6 +164,7 @@ impl Shell {
             window: None,
             renderer: None,
             connector: None,
+            deleting: None,
             plan: None,
             pending: None,
             game: None,
@@ -257,12 +274,19 @@ impl Shell {
             MenuAction::CancelConnect => {
                 // Dropping the connector abandons the attempt: if it still joins, its helper
                 // thread says goodbye. A registration still saves its token, which the next
-                // listing shows.
+                // listing shows. Dropping a delete only ends the wait: the request was sent and the
+                // server may still carry it out, which is why the saved login stays (it goes when
+                // the answer is heard, and asking again gets the answer).
                 self.connector = None;
                 self.plan = None;
-                eprintln!("connecting: cancelled");
+                if self.deleting.take().is_some() {
+                    eprintln!("delete: stopped waiting for the server (it may still delete the character; the saved login is kept)");
+                } else {
+                    eprintln!("connecting: cancelled");
+                }
                 self.relist();
             }
+            MenuAction::Delete { index } => self.start_delete(index),
             MenuAction::Forget { index } => {
                 if let Some(account) = self.saved.accounts.get(index).cloned() {
                     let name = clean(&account.name);
@@ -271,7 +295,10 @@ impl Shell {
                             self.launch.looks.forget(&self.launch.server, &account.name);
                             eprintln!("account: forgot the saved login of \"{name}\" on this computer (the server keeps the character)");
                             self.relist();
-                            self.menu.set_notice(Notice::info(format!("Forgot the saved login of {name}.")));
+                            self.menu.set_notice(
+                                Notice::info(format!("Forgot the saved login of {name} on this computer only."))
+                                    .with_hint("The character is still on the server and its name stays taken."),
+                            );
                         }
                         Err(e) => {
                             eprintln!("error: cannot forget the saved login of \"{name}\": {e}");
@@ -312,6 +339,63 @@ impl Shell {
                 eprintln!("error: {e}");
                 self.menu.connect_failed(Notice::error(e));
             }
+        }
+    }
+
+    /// Start deleting the character at `index` on the server. The menu is already waiting (it moved to its waiting
+    /// screen when the player confirmed); a problem before anything is sent goes straight back to the list as a message.
+    fn start_delete(&mut self, index: usize) {
+        let Some(account) = self.saved.accounts.get(index).cloned() else {
+            self.menu.delete_over(Notice::error("That saved character is gone.").with_hint("Pick another one from the list."));
+            return;
+        };
+        if let Some(mode) = account.loose_mode {
+            eprintln!("{}", loose_mode_warning(&account.path, mode));
+        }
+        eprintln!("deleting the character \"{}\" on {}...", clean(&account.name), self.launch.server);
+        match Deleter::start(self.launch.server.clone(), account.token.clone(), self.launch.client_build.clone()) {
+            Ok(deleter) => self.deleting = Some(PendingDelete { deleter, account }),
+            Err(e) => {
+                eprintln!("error: {e}");
+                self.menu.delete_over(Notice::error(e));
+            }
+        }
+    }
+
+    /// A delete ended: say what it came to and, only when the server said the character is gone (it deleted it, or it
+    /// never knew this login), take the saved login out. Any other result keeps the login, so nothing that is still on the
+    /// server is lost and the player can try again.
+    fn on_deleted(&mut self, account: &SavedAccount, result: &DeleteResult) {
+        let name = clean(&account.name);
+        let (mut notice, forget) = flow::delete_notice(result, &name);
+        match result {
+            Ok(DeleteOutcome::Deleted(_)) => eprintln!("account: deleted the character \"{name}\" on the server (its name is free again)"),
+            Ok(DeleteOutcome::AlreadyGone) => eprintln!("account: the server does not have the character \"{name}\" (nothing left to delete)"),
+            Err(e) => eprintln!("error: {}", failure_text(&name, e)),
+        }
+        if forget {
+            match self.launch.store.forget(&self.launch.server, account) {
+                Ok(()) => {
+                    self.launch.looks.forget(&self.launch.server, &account.name);
+                    eprintln!("account: forgot the saved login of \"{name}\"");
+                }
+                Err(e) => {
+                    eprintln!("error: cannot forget the saved login of \"{name}\": {e}");
+                    notice = flow::login_not_removed_notice(&name, &e);
+                }
+            }
+        }
+        // The list first (so the menu comes back to a list that is true), then the screen it started from.
+        self.relist();
+        self.menu.delete_over(notice);
+    }
+
+    /// Poll the running delete (never blocks).
+    fn poll_deleter(&mut self) {
+        let Some(pending) = self.deleting.as_mut() else { return };
+        let Some(result) = pending.deleter.poll() else { return };
+        if let Some(PendingDelete { account, .. }) = self.deleting.take() {
+            self.on_deleted(&account, &result);
         }
     }
 
@@ -406,6 +490,7 @@ impl Shell {
         self.menu.tick(dt);
         self.poll_pads(el);
         self.poll_connector();
+        self.poll_deleter();
         self.sync_keyboard();
         if let Some(pending) = self.pending.as_mut() {
             pending.frames += 1;
@@ -455,8 +540,10 @@ impl Shell {
             let Connected { mut net, .. } = *pending.connected;
             net.leave_and_join(LEAVE_WAIT);
         }
-        // A connection attempt still running is dropped: if it joins, its thread says goodbye.
+        // A connection attempt still running is dropped: if it joins, its thread says goodbye. So is a delete: the
+        // request was sent, the server may still carry it out, and the saved login stays.
         self.connector = None;
+        self.deleting = None;
         match (self.failure.take(), window::describe_loop_failure(&result)) {
             (Some(msg), _) | (None, Some(msg)) => {
                 eprintln!("error: {msg}");
@@ -566,8 +653,8 @@ mod tests {
     use crate::gamemode::{take_asked, Osk};
     use crate::gamepad::PadKey;
     use crate::ui::menu::{KeyPress, Look, NavKey, NoticeKind, Screen};
-    use crate::ui::testkit::{serve_join, Reply};
-    use fmv_protocol::{RejectCode, Secret};
+    use crate::ui::testkit::{serve_delete, serve_delete_gated, serve_join, DeleteReply, Reply};
+    use fmv_protocol::{ClientMsg, RejectCode, Secret, PROTOCOL_VERSION};
     use std::net::TcpListener;
 
     /// A launch on an ordinary desktop: windowed, and nothing is ever asked of Steam.
@@ -611,6 +698,7 @@ mod tests {
         let start = Instant::now();
         while shell.menu.is_connecting() {
             shell.poll_connector();
+            shell.poll_deleter();
             assert!(start.elapsed() < Duration::from_secs(20), "the attempt never ended");
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -648,11 +736,14 @@ mod tests {
         assert_eq!(shell.saved.accounts.len(), 1, "the logins and the menu entries stay in step");
     }
 
+    /// Forgetting is local: Del asks, F (or the Forget here button) removes the saved login of THIS computer, and the
+    /// server is never asked (this server address has nothing behind it, and nothing is ever started).
     #[test]
-    fn forgetting_deletes_the_saved_login_here_and_updates_the_list() {
+    fn forgetting_removes_the_saved_login_here_only_and_updates_the_list() {
         let dir = tempfile::tempdir().unwrap();
         let store = TokenStore::new(dir.path());
-        let server = "127.0.0.1:47770";
+        let server = closed_port();
+        let server = server.as_str();
         store.save_new(server, "Cloud", &Secret::new("tok_cloud")).unwrap();
         store.save_new(server, "Tifa", &Secret::new("tok_tifa")).unwrap();
         let looks = LookCache::new(dir.path());
@@ -663,8 +754,10 @@ mod tests {
         assert_eq!(shell.handle_input(nav(NavKey::Enter)), Next::Stay);
         assert_eq!(shell.menu.accounts().len(), 2, "Keep is the default answer");
         assert!(store.find(server, Some("Cloud")).unwrap().is_some());
-        // Del, move to Forget, Enter: gone from disk and from the list; the other one stays.
+        // Del, move to the Forget here button (the last of the three), Enter: gone from disk and from the list; the
+        // other one stays.
         shell.handle_input(nav(NavKey::Delete));
+        shell.handle_input(nav(NavKey::Right));
         shell.handle_input(nav(NavKey::Right));
         assert_eq!(shell.handle_input(nav(NavKey::Enter)), Next::Stay);
         assert!(store.find(server, Some("Cloud")).unwrap().is_none(), "the token file is gone");
@@ -673,13 +766,292 @@ mod tests {
         assert_eq!(shell.menu.accounts()[0].name, "Tifa");
         assert!(store.find(server, Some("Tifa")).unwrap().is_some(), "the other login is untouched");
         let notice = shell.menu.notice().expect("it says what happened");
-        assert!(notice.text.contains("Forgot") && notice.text.contains("Cloud"), "{notice:?}");
-        // The last one too: the menu falls back to the create form.
+        assert_eq!(notice.kind, NoticeKind::Info);
+        assert!(notice.text.contains("Forgot") && notice.text.contains("Cloud") && notice.text.contains("on this computer only"), "{notice:?}");
+        assert!(notice.hint.as_deref().is_some_and(|h| h.contains("still on the server")), "{notice:?}");
+        // The last one too, with the F key: the menu falls back to the create form.
         shell.handle_input(nav(NavKey::Delete));
-        assert_eq!(shell.handle_input(MenuInput::Text("y".into())), Next::Stay);
+        assert_eq!(shell.handle_input(MenuInput::Text("f".into())), Next::Stay);
         assert!(shell.menu.accounts().is_empty());
         assert!(matches!(shell.menu.screen(), Screen::Create(_)));
         assert!(store.list(server).accounts.is_empty());
+        // Nothing was started for any of it: forgetting never connects.
+        assert!(shell.deleting.is_none() && shell.connector.is_none());
+    }
+
+    // ---- deleting a character on the server ----------------------------------------------------------------------------
+
+    /// A shell over two saved characters of `server`, Cloud (token `tok_cloud`) first and Tifa (`tok_tifa`) second, each
+    /// with a note about its look; Cloud is highlighted.
+    fn two_characters(dir: &std::path::Path, server: &str) -> Shell {
+        let store = TokenStore::new(dir);
+        store.save_new(server, "Cloud", &Secret::new("tok_cloud")).unwrap();
+        store.save_new(server, "Tifa", &Secret::new("tok_tifa")).unwrap();
+        let looks = LookCache::new(dir);
+        looks.store(server, "Cloud", &Look::plain([1, 2, 3], None)).unwrap();
+        looks.store(server, "Tifa", &Look::plain([4, 5, 6], None)).unwrap();
+        Shell::new(launch(dir, server))
+    }
+
+    /// Del, then Y: ask to delete the highlighted character.
+    fn ask_to_delete(shell: &mut Shell) {
+        shell.handle_input(nav(NavKey::Delete));
+        assert_eq!(shell.handle_input(MenuInput::Text("y".into())), Next::Stay);
+    }
+
+    /// Poll until the delete the player waits for has ended (panics if it never does).
+    fn wait_until_deleted(shell: &mut Shell) {
+        let start = Instant::now();
+        while shell.deleting.is_some() {
+            shell.poll_deleter();
+            assert!(start.elapsed() < Duration::from_secs(20), "the delete never ended");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// The names of the logins saved for `server`, in the store's order.
+    fn saved_names(dir: &std::path::Path, server: &str) -> Vec<String> {
+        TokenStore::new(dir).list(server).accounts.into_iter().map(|a| a.name).collect()
+    }
+
+    /// The request a delete of the login `token` makes: what the server must receive first.
+    fn delete_request(token: &str) -> ClientMsg {
+        ClientMsg::DeleteCharacter { protocol_version: PROTOCOL_VERSION, client_build: "test-build".into(), token: Secret::new(token) }
+    }
+
+    /// Both characters are still saved, with their tokens and notes: nothing was removed.
+    fn assert_both_kept(dir: &std::path::Path, server: &str) {
+        let store = TokenStore::new(dir);
+        assert_eq!(saved_names(dir, server), ["Cloud", "Tifa"]);
+        for (name, token) in [("Cloud", "tok_cloud"), ("Tifa", "tok_tifa")] {
+            assert_eq!(store.find(server, Some(name)).unwrap().unwrap().token.expose(), token, "{name}'s login");
+            assert!(LookCache::new(dir).load(server, name).is_some(), "{name}'s note");
+        }
+    }
+
+    #[test]
+    fn deleting_asks_the_server_and_removes_the_login_only_on_its_word() {
+        let dir = tempfile::tempdir().unwrap();
+        let (addr, server) = serve_delete(DeleteReply::Deleted("Cloud"));
+        let mut shell = two_characters(dir.path(), &addr);
+        ask_to_delete(&mut shell);
+        assert!(shell.menu.is_connecting() && shell.deleting.is_some() && shell.connector.is_none(), "the menu waits for the server");
+        assert_eq!(shell.menu.accounts().len(), 2, "nothing leaves the list before the server has spoken");
+        wait_until_deleted(&mut shell);
+        assert!(!shell.menu.is_connecting());
+        // The request went out as the first and only frame of its own connection, with Cloud's own token...
+        let seen = server.join().unwrap();
+        assert_eq!(seen.first, Some(delete_request("tok_cloud")));
+        assert_eq!(seen.after, 0);
+        // ...and on the server's word its login and its note are gone, and nothing else is touched.
+        let store = TokenStore::new(dir.path());
+        assert!(store.find(&addr, Some("Cloud")).unwrap().is_none(), "the token file is gone");
+        assert_eq!(LookCache::new(dir.path()).load(&addr, "Cloud"), None, "and so is the note about its look");
+        assert_eq!(saved_names(dir.path(), &addr), ["Tifa"]);
+        assert_eq!(store.find(&addr, Some("Tifa")).unwrap().unwrap().token.expose(), "tok_tifa", "the other login is untouched");
+        assert!(LookCache::new(dir.path()).load(&addr, "Tifa").is_some());
+        // The list is what is left, on the screen the player started from, with the notice.
+        assert!(matches!(shell.menu.screen(), Screen::Select(_)));
+        assert_eq!(shell.menu.accounts().len(), 1);
+        assert_eq!(shell.menu.selected_name(), Some("Tifa"));
+        let notice = shell.menu.notice().expect("a notice");
+        assert_eq!((notice.kind, notice.text.as_str()), (NoticeKind::Info, "Deleted Cloud. Its name is free again."));
+    }
+
+    #[test]
+    fn deleting_the_last_character_leaves_the_create_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let (addr, server) = serve_delete(DeleteReply::Deleted("Cloud"));
+        TokenStore::new(dir.path()).save_new(&addr, "Cloud", &Secret::new("tok_cloud")).unwrap();
+        let mut shell = Shell::new(launch(dir.path(), &addr));
+        ask_to_delete(&mut shell);
+        wait_until_deleted(&mut shell);
+        assert!(saved_names(dir.path(), &addr).is_empty());
+        assert!(matches!(shell.menu.screen(), Screen::Create(_)));
+        assert!(shell.menu.notice().is_some_and(|n| n.text.contains("Deleted Cloud")));
+        drop(server.join());
+    }
+
+    #[test]
+    fn a_login_the_server_never_knew_is_removed_too_and_the_notice_says_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let (addr, server) = serve_delete(DeleteReply::Reject(RejectCode::InvalidToken, "invalid or unknown token"));
+        let mut shell = two_characters(dir.path(), &addr);
+        shell.handle_input(nav(NavKey::Down));
+        ask_to_delete(&mut shell);
+        wait_until_deleted(&mut shell);
+        assert_eq!(server.join().unwrap().first, Some(delete_request("tok_tifa")), "Tifa's token, the character under the cursor");
+        assert_eq!(saved_names(dir.path(), &addr), ["Cloud"], "Tifa's login is removed, Cloud's is not");
+        assert_eq!(LookCache::new(dir.path()).load(&addr, "Tifa"), None);
+        assert!(LookCache::new(dir.path()).load(&addr, "Cloud").is_some());
+        let notice = shell.menu.notice().expect("a notice");
+        assert_eq!(notice.kind, NoticeKind::Info);
+        for needle in ["The server no longer had Tifa", "accounts may have been reset", "saved login was removed"] {
+            assert!(notice.text.contains(needle), "{needle:?} is not in {:?}", notice.text);
+        }
+        assert_eq!(shell.menu.selected_name(), Some("Cloud"));
+    }
+
+    #[test]
+    fn a_character_in_the_game_is_refused_and_both_logins_are_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let (addr, server) = serve_delete(DeleteReply::Reject(RejectCode::AlreadyOnline, "that character is in the game right now"));
+        let mut shell = two_characters(dir.path(), &addr);
+        ask_to_delete(&mut shell);
+        wait_until_deleted(&mut shell);
+        assert_eq!(server.join().unwrap().first, Some(delete_request("tok_cloud")));
+        assert_both_kept(dir.path(), &addr);
+        let notice = shell.menu.notice().expect("a notice");
+        assert_eq!((notice.kind, notice.text.as_str()), (NoticeKind::Error, "Cloud is in the game right now (from this or another computer)."));
+        assert_eq!(notice.hint.as_deref(), Some("Leave the game first, then delete it."));
+        // Back on the list with the same character highlighted, and the question can be asked again at once.
+        assert_eq!(shell.menu.selected_name(), Some("Cloud"));
+        assert_eq!(shell.handle_input(nav(NavKey::Delete)), Next::Stay);
+        assert!(matches!(shell.menu.screen(), Screen::Select(s) if s.confirm.is_some()));
+    }
+
+    #[test]
+    fn every_other_result_keeps_both_logins_and_says_nothing_was_deleted() {
+        // A server that is not there at all...
+        let dir = tempfile::tempdir().unwrap();
+        let gone = closed_port();
+        let mut shell = two_characters(dir.path(), &gone);
+        ask_to_delete(&mut shell);
+        wait_until_deleted(&mut shell);
+        assert_both_kept(dir.path(), &gone);
+        let notice = shell.menu.notice().expect("a notice");
+        assert_eq!(notice.kind, NoticeKind::Error);
+        assert!(notice.text.starts_with("Cloud was NOT deleted and its saved login was kept: cannot connect to"), "{notice:?}");
+        assert!(notice.hint.as_deref().is_some_and(|h| h.contains("Check the server address") && h.contains("Del, then F")), "{notice:?}");
+        // ...and a server that answers with a refusal, nothing, or nonsense.
+        let replies = [
+            DeleteReply::Reject(RejectCode::Internal, "internal error; try again later"),
+            DeleteReply::Reject(RejectCode::ProtocolMismatch, "protocol version mismatch"),
+            DeleteReply::Reject(RejectCode::RateLimited, "a delete of this character is under way"),
+            DeleteReply::Reject(RejectCode::BadRequest, "malformed message"),
+            DeleteReply::Reject(RejectCode::Unspecified, "some reason nobody foresaw"),
+            DeleteReply::Hangup,
+            DeleteReply::Nonsense,
+        ];
+        for reply in replies {
+            let dir = tempfile::tempdir().unwrap();
+            let (addr, server) = serve_delete(reply);
+            let mut shell = two_characters(dir.path(), &addr);
+            ask_to_delete(&mut shell);
+            wait_until_deleted(&mut shell);
+            assert_eq!(server.join().unwrap().first, Some(delete_request("tok_cloud")));
+            assert_both_kept(dir.path(), &addr);
+            let notice = shell.menu.notice().expect("a notice");
+            assert_eq!(notice.kind, NoticeKind::Error);
+            assert!(notice.text.starts_with("Cloud was NOT deleted and its saved login was kept"), "{notice:?}");
+            assert!(notice.hint.as_deref().is_some_and(|h| !h.is_empty()), "{notice:?}");
+            assert_eq!(shell.menu.accounts().len(), 2, "the list is as it was");
+            assert_eq!(shell.menu.selected_name(), Some("Cloud"));
+        }
+    }
+
+    /// While the request is with the server the window says so, and nothing but Escape does anything: keys and letters
+    /// neither start another delete nor answer anything; the login is still there; the server's answer then ends it.
+    #[test]
+    fn while_a_delete_is_under_way_the_window_says_so_and_only_escape_does_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let (addr, server) = serve_delete_gated(DeleteReply::Deleted("Cloud"), Some(gate));
+        let mut shell = two_characters(dir.path(), &addr);
+        ask_to_delete(&mut shell);
+        for key in [NavKey::Enter, NavKey::Down, NavKey::Up, NavKey::Left, NavKey::Right, NavKey::Delete, NavKey::Tab, NavKey::Backspace] {
+            assert_eq!(shell.handle_input(nav(key)), Next::Stay, "{key:?}");
+        }
+        for text in ["y", "Y", "f", "n", "x"] {
+            assert_eq!(shell.handle_input(MenuInput::Text(text.into())), Next::Stay, "{text:?}");
+        }
+        assert!(shell.menu.is_connecting() && shell.deleting.is_some(), "still waiting, still one delete");
+        assert_both_kept(dir.path(), &addr);
+        // The window says what is happening.
+        let mut list = DrawList::new();
+        screens::draw_menu(&shell.menu, 1100, 680, &mut list);
+        assert!(list.says("Deleting this character") && list.says("Cloud") && list.says("Esc: stop waiting"));
+        // The answer ends it.
+        release.send(()).unwrap();
+        wait_until_deleted(&mut shell);
+        assert_eq!(saved_names(dir.path(), &addr), ["Tifa"]);
+        let seen = server.join().unwrap();
+        assert_eq!((seen.first, seen.after), (Some(delete_request("tok_cloud")), 0), "one request, and nothing after it");
+    }
+
+    #[test]
+    fn escape_stops_the_wait_and_the_login_is_kept_even_if_the_server_deletes_the_character_after_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let (addr, server) = serve_delete_gated(DeleteReply::Deleted("Cloud"), Some(gate));
+        let mut shell = two_characters(dir.path(), &addr);
+        ask_to_delete(&mut shell);
+        assert!(shell.deleting.is_some());
+        assert_eq!(shell.handle_input(nav(NavKey::Escape)), Next::Stay);
+        assert!(shell.deleting.is_none(), "the delete is given up on");
+        assert!(matches!(shell.menu.screen(), Screen::Select(_)) && !shell.menu.is_connecting());
+        let notice = shell.menu.notice().expect("a notice");
+        assert!(notice.text.contains("Stopped waiting") && notice.text.contains("may still be deleted"), "{notice:?}");
+        assert_both_kept(dir.path(), &addr);
+        // The server carries the request out anyway: nobody hears it, so nothing here changes.
+        release.send(()).unwrap();
+        let seen = server.join().unwrap();
+        assert_eq!(seen.first, Some(delete_request("tok_cloud")), "the request had been sent");
+        shell.poll_deleter();
+        shell.relist();
+        assert_both_kept(dir.path(), &addr);
+        assert_eq!(shell.menu.accounts().len(), 2);
+    }
+
+    #[test]
+    fn a_login_that_changed_while_the_server_deleted_is_not_removed_and_the_player_is_told() {
+        let dir = tempfile::tempdir().unwrap();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let (addr, server) = serve_delete_gated(DeleteReply::Deleted("Cloud"), Some(gate));
+        let mut shell = two_characters(dir.path(), &addr);
+        ask_to_delete(&mut shell);
+        // Meanwhile another process registered the name anew (the file now holds another token).
+        TokenStore::new(dir.path()).save_replacing(&addr, "Cloud", &Secret::new("tok_the_new_one")).unwrap();
+        release.send(()).unwrap();
+        wait_until_deleted(&mut shell);
+        drop(server.join());
+        let notice = shell.menu.notice().expect("a notice");
+        assert_eq!(notice.kind, NoticeKind::Warning);
+        assert!(notice.text.contains("Cloud is gone from the server") && notice.text.contains("could not be removed from this computer"), "{notice:?}");
+        assert_eq!(TokenStore::new(dir.path()).find(&addr, Some("Cloud")).unwrap().unwrap().token.expose(), "tok_the_new_one", "the new login is untouched");
+        assert!(!format!("{notice:?}").contains("tok_"), "no token in the notice");
+        assert!(matches!(shell.menu.screen(), Screen::Select(_)) && !shell.menu.is_connecting());
+    }
+
+    /// A controller alone can delete a character (Y, the stick to Delete, A), stop waiting (B) and forget a saved login on
+    /// this computer (Y, the stick to Forget here, A).
+    #[test]
+    fn a_controller_deletes_stops_waiting_and_forgets_through_the_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        // Nothing listens here: the delete fails fast if it is ever polled, which this test does not do before B.
+        let server = closed_port();
+        let mut shell = two_characters(dir.path(), &server);
+        assert_eq!(shell.handle_pad(pad_press(PadKey::Accept)), Next::Stay);
+        assert_eq!(shell.handle_pad(pad_press(PadKey::Right)), Next::Stay);
+        assert_eq!(shell.handle_pad(pad_press(PadKey::Confirm)), Next::Stay);
+        assert!(shell.menu.is_connecting() && shell.deleting.is_some(), "A on Delete asks the server");
+        assert_eq!(shell.handle_pad(pad_press(PadKey::Back)), Next::Stay);
+        assert!(shell.deleting.is_none() && !shell.menu.is_connecting(), "B stops the wait");
+        assert_both_kept(dir.path(), &server);
+        // Y, the stick to the last answer (Forget here), A: only the saved login of this computer goes.
+        shell.handle_pad(pad_press(PadKey::Accept));
+        shell.handle_pad(pad_press(PadKey::Left));
+        assert_eq!(shell.handle_pad(pad_press(PadKey::Confirm)), Next::Stay);
+        assert!(!shell.menu.is_connecting() && shell.deleting.is_none(), "forgetting waits for nothing");
+        assert_eq!(saved_names(dir.path(), &server), ["Tifa"]);
+    }
+
+    #[test]
+    fn the_confirm_cue_is_heard_for_a_delete_like_for_a_forget() {
+        // (`menu_cue` is the audio lane's; a delete must click like the other answers.)
+        let delete = MenuAction::Delete { index: 0 };
+        assert_eq!(menu_cue(NavKey::Enter, false, true, Some(&delete), false), Some(Cue::Confirm));
+        assert_eq!(menu_cue(NavKey::Enter, false, true, Some(&MenuAction::Forget { index: 0 }), false), Some(Cue::Confirm));
     }
 
     #[test]

@@ -102,7 +102,14 @@ fn the_help_describes_the_menu() {
     let help = text(&out.stdout);
     assert_eq!(out.status.code(), Some(0));
     let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
-    for needle in ["CHARACTER MENU:", "N creates a new one", "Del forgets a saved login", "the menu is skipped"] {
+    for needle in [
+        "CHARACTER MENU:",
+        "N creates a new one",
+        "Del asks to delete the highlighted character",
+        "Y (or Enter on Delete) deletes it ON THE SERVER",
+        "F forgets the saved login on THIS computer only",
+        "the menu is skipped",
+    ] {
         assert!(flat.contains(needle), "{needle:?} is missing from --help:\n{help}");
     }
 }

@@ -77,7 +77,7 @@ pub fn menu_cue(key: NavKey, changed: bool, on_list: bool, action: Option<&MenuA
     match (key, action) {
         (_, Some(MenuAction::Quit)) => None,
         (_, Some(MenuAction::CancelConnect)) => Some(Cue::Cancel),
-        (_, Some(MenuAction::Play { .. } | MenuAction::Register { .. } | MenuAction::Forget { .. })) => Some(Cue::Confirm),
+        (_, Some(MenuAction::Play { .. } | MenuAction::Register { .. } | MenuAction::Delete { .. } | MenuAction::Forget { .. })) => Some(Cue::Confirm),
         (NavKey::Up | NavKey::Down | NavKey::Left | NavKey::Right | NavKey::Tab | NavKey::Home | NavKey::End | NavKey::PageUp | NavKey::PageDown, None) => {
             changed.then_some(Cue::Cursor)
         }
