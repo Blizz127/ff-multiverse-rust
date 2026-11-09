@@ -17,6 +17,9 @@ use std::f32::consts::{PI, TAU};
 const WHITE: [f32; 3] = [1.0, 1.0, 1.0];
 const GOLD: [f32; 3] = [1.0, 0.82, 0.3];
 const YELLOW: [f32; 3] = [1.0, 0.9, 0.4];
+/// How much bigger than its target a spell's blast is drawn: the party is a few dozen pixels tall in a window, and a spell fills
+/// more of the screen than the body it lands on.
+const BLAST_SIZE: f32 = 1.3;
 /// The widest half-width of the streak mesh at an `x` scale of 1 (see [`Prim::Streak`]).
 const STREAK_WIDTH: f32 = 0.14;
 
@@ -250,6 +253,7 @@ fn gather(c: &mut Ctx, p: f32, rgb: [f32; 3], strength: f32) {
 /// A spell of `element` breaks over the target. Every one starts with a ring that spreads on the ground and a bloom in its
 /// colour, and goes on in shapes of its own.
 fn blast(c: &mut Ctx, element: Element, a: f32) {
+    c.s *= BLAST_SIZE;
     let (h, s, col) = (c.h, c.s, c.col);
     let spread = grow(a, 0.3, 1.15) * h * s;
     c.ring(0.0, 0.5 * h, spread, spread * 0.38, col, fade(a, 1.0) * 0.9);
@@ -263,7 +267,9 @@ fn blast(c: &mut Ctx, element: Element, a: f32) {
                 let x = (k as f32 - 1.5) * 0.2 * h * s + (c.n(k) - 0.5) * 0.06 * h;
                 let flick = 0.85 + 0.15 * (a * 24.0 + k as f32 * 2.1).sin();
                 let tall = (0.55 + 0.35 * c.n(4 + k)) * h * s * flick * (1.0 - a * 0.45);
-                c.glow(x, 0.45 * h - tall * 0.5, 0.11 * h * s, tall * 0.55, col, fade(a, 1.1) * 0.85);
+                // A bulb at the foot, a body that rises from it and a hot core.
+                c.glow(x, 0.38 * h, 0.15 * h * s, 0.16 * h * s, col, fade(a, 1.1) * 0.7);
+                c.glow(x, 0.45 * h - tall * 0.5, 0.09 * h * s, tall * 0.55, col, fade(a, 1.1) * 0.8);
                 c.streak(x, 0.45 * h - tall * 0.5, 0.05 * h * s, tall * 0.5, 0.0, mix(col, YELLOW, 0.7), fade(a, 1.3) * 0.8);
             }
             // Embers rise.

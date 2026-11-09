@@ -1411,3 +1411,230 @@ fn fight_defend_sheets() {
     let offsets: Vec<f64> = (0..16).map(|k| f64::from(k) * 0.1).collect();
     perform_and_draw(&mut fight, "defend", &events, &[0, 1, 2], &offsets, &[0.0, 0.2, 0.4, 0.6, 0.8, 1.2, 1.6, 2.0]);
 }
+
+// ----- the effects of the picture, in real fights ----------------------------------------------------------------------
+
+impl Fight {
+    /// The fight at `t` (never before an earlier call) in a window of `w` x `h`, drawn as the window draws it, `label` in the corner.
+    fn frame_sized(&mut self, t: f64, label: &str, (w, h): (u32, u32)) -> Vec<u8> {
+        self.scene.update(t, &[], self.client.engine());
+        self.sync_statuses(t);
+        let view = self.client.view(t).expect("a view");
+        let scene_view = self.scene.view(w, h);
+        let mut overlay = DrawList::new();
+        draw_battle_overlay(&view, &self.scene.head_anchors(&scene_view), w, h, &mut overlay);
+        overlay.draw_text_shadowed(8, (h as f32 * 0.68) as i32, if w > 1500 { 3 } else { 2 }, [255, 255, 255, 255], [0, 0, 0, 255], label);
+        self.gpu.render_battle(w, h, &self.scene.frame(&scene_view, false), &overlay)
+    }
+
+    /// The fight at `t` at both sizes of the pictures (`fx-<name>-1100x680.png` and `fx-<name>-1920x1080.png`); the small one back.
+    fn save_both(&mut self, name: &str, t: f64, label: &str) -> Vec<u8> {
+        let small = self.frame_sized(t, label, (W, H));
+        save(&format!("fx-{name}-{W}x{H}"), W, H, &small);
+        let big = self.frame_sized(t, label, (1920, 1080));
+        save(&format!("fx-{name}-1920x1080"), 1920, 1080, &big);
+        small
+    }
+
+    /// The middle of actor `i`'s chest in a `W` x `H` window.
+    fn chest_px(&self, i: usize) -> [f32; 2] {
+        let view = self.scene.view(W, H);
+        view.to_pixels(self.scene.chest_of(i, &view).expect("on the stage").0).expect("on the screen")
+    }
+
+    /// A fight of formation `formation` in which the party is ready and the server has said its first word, at `2.0`.
+    fn ready(real: &Real, formation: u16, seed: u64) -> Option<(Self, f64)> {
+        let mut fight = Fight::new(real, formation, seed)?;
+        fight.now = 2.0;
+        let first = fight.server.step(1);
+        fight.say(first);
+        let arrival = fight.now;
+        Some((fight, arrival))
+    }
+}
+
+/// How many pixels within `r` of `at` the picture `shot` (`W` wide) has that `want` likes.
+fn pixels_near(shot: &[u8], at: [f32; 2], r: i32, want: impl Fn([u8; 3]) -> bool) -> usize {
+    let mut n = 0;
+    for dy in -r..=r {
+        for dx in -r..=r {
+            let (px, py) = ((at[0] as i32 + dx).clamp(0, W as i32 - 1) as u32, (at[1] as i32 + dy).clamp(0, H as i32 - 1) as u32);
+            n += usize::from(want(pixel(shot, W, px, py)));
+        }
+    }
+    n
+}
+
+/// A fight of the Guard Scorpion (formation 324) against the canon trio, played (every ready member attacks, the server steps) until
+/// the Scorpion answers a blow with its Tail Laser (attack 286, which it can do only while its tail is up): the fight, the time the
+/// batch that says so arrived and the time the laser lands. `None` when it never does.
+fn scorpion_laser(real: &Real) -> Option<(Fight, f64, f64)> {
+    let mut fight = Fight::new(real, 324, SEED)?;
+    fight.now = 2.0;
+    for _ in 0..4000 {
+        fight.now += 0.03;
+        let mut messages: Vec<ServerMsg> = fight.server.step(30).into_iter().collect();
+        for id in fight.server.state.ready_actors() {
+            messages.extend(fight.server.attack(id));
+        }
+        for msg in messages {
+            let ServerMsg::BattleEvent { events, .. } = &msg else { continue };
+            // When the laser lands, if this batch has it: the start of its performance and its impact.
+            let lands = cue::cues(events).iter().find(|c| matches!(c.action, Some((_, ActionRef::EnemyAttack(286))))).map(|c| fight.now + c.start + c.impact());
+            fight.say(Some(msg));
+            if let Some(lands) = lands {
+                let arrival = fight.now;
+                return Some((fight, arrival, lands));
+            }
+        }
+        if fight.server.state.outcome().is_some() {
+            return None;
+        }
+    }
+    None
+}
+
+/// The mean of the three channels over the whole picture.
+fn mean_level(shot: &[u8]) -> f32 {
+    let sum: u64 = shot.chunks_exact(4).map(|p| u64::from(p[0]) + u64::from(p[1]) + u64::from(p[2])).sum();
+    sum as f32 / (shot.len() / 4) as f32 / 3.0
+}
+
+fn orange(p: [u8; 3]) -> bool {
+    p[0] > 200 && p[1] > 80 && p[1] < 200 && p[2] < 120
+}
+
+fn blue(p: [u8; 3]) -> bool {
+    p[2] > 150 && i32::from(p[2]) > i32::from(p[0]) + 40
+}
+
+fn green(p: [u8; 3]) -> bool {
+    p[1] > 140 && i32::from(p[1]) > i32::from(p[0]) + 30 && p[1] > p[2]
+}
+
+/// The effects of the picture as real fights play them, each saved at 1100 x 680 and at 1920 x 1080 (`$FMV_SHOT_DIR/fx-<name>-<size>.png`):
+/// a fire spell landing, an ice spell, a fire spell on the whole side, a cure on the whole party, a limit break (the gathering and the
+/// break), an enemy's laser beam (the Guard Scorpion's Tail Laser at the party, in flight and after it lands) and a status landing (a Light
+/// Curtain on Cloud: the blue shell and the tag on the panel come up at the very instant the item lands). The pictures are
+/// checked on their pixels and, for the statuses, on the panel itself.
+#[test]
+#[ignore = "needs the owner's real FF7 data (FMV_FF7_DATA or FMV_FF7_LIBRARY) and a GPU or a software Vulkan/GL driver"]
+fn offscreen_battle_effects_in_real_fights() {
+    use fmv_ff7_battle::status::Status;
+    let Some(real) = open_real() else { return };
+
+    // A fire spell and an ice spell at an MP: Cloud gathers, the element breaks over the MP at the landing.
+    for (spell, name, colour) in [(27u16, "fire-landing", orange as fn([u8; 3]) -> bool), (30, "ice-landing", blue)] {
+        let Some((mut fight, arrival)) = Fight::ready(&real, 301, SEED) else { return };
+        let target = fight.server.first_enemy().expect("an enemy");
+        let msg = fight.server.command(ActorId(0), Command::Magic { spell, target: Target::One(target) });
+        assert!(msg.is_some(), "the engine takes spell {spell}");
+        fight.say(msg);
+        let landing = arrival + cue::impact_delay(Some(ActionRef::Magic(spell)));
+        let at = fight.chest_px(usize::from(target.0));
+        let gathering = fight.frame(landing - 0.25, "");
+        let shot = fight.save_both(name, landing + 0.10, &format!("spell {spell}, 0.10 s after it lands"));
+        let (a, b) = (pixels_near(&gathering, at, 70, colour), pixels_near(&shot, at, 70, colour));
+        eprintln!("{name}: {a} pixels of its colour over the MP while Cloud gathers, {b} just after it lands");
+        assert!(b > 120 && b > a * 3, "{name}: the blast comes up at the landing ({a} before, {b} after)");
+    }
+
+    // Fire on the whole side: a blast over each of the two MPs.
+    {
+        let Some((mut fight, arrival)) = Fight::ready(&real, 301, SEED) else { return };
+        let msg = fight.server.command(ActorId(0), Command::Magic { spell: 27, target: Target::AllEnemies });
+        assert!(msg.is_some(), "Cloud has an All use for Fire");
+        fight.say(msg);
+        let landing = arrival + cue::impact_delay(Some(ActionRef::Magic(27)));
+        let shot = fight.save_both("fire-all-enemies", landing + 0.10, "Fire on every enemy, 0.10 s after it lands");
+        for foe in fight.server.state.enemy_ids() {
+            let n = pixels_near(&shot, fight.chest_px(usize::from(foe.0)), 70, orange);
+            assert!(n > 80, "a blast over enemy {}: {n} orange pixels", foe.0);
+        }
+    }
+
+    // A cure on the whole party: a green ring and sparkles on each of the three.
+    {
+        let Some((mut fight, arrival)) = Fight::ready(&real, 301, SEED) else { return };
+        let msg = fight.server.command(ActorId(0), Command::Magic { spell: 0, target: Target::AllAllies });
+        assert!(msg.is_some(), "Cloud's Cure may be aimed at the whole party once");
+        fight.say(msg);
+        let landing = arrival + cue::impact_delay(Some(ActionRef::Magic(0)));
+        let shot = fight.save_both("cure-party", landing + 0.15, "Cure on the whole party, 0.15 s after it lands");
+        for member in 0..3 {
+            let n = pixels_near(&shot, fight.chest_px(member), 60, green);
+            assert!(n > 40, "party member {member} glows green: {n} pixels");
+        }
+    }
+
+    // A limit break: the performer gathers its power (a white ring closes in), it breaks over the MP with a flash over the picture.
+    {
+        let Some(mut fight) = Fight::with_limits(&real, 301, SEED, [255, 0, 0]) else { return };
+        fight.now = 2.0;
+        let first = fight.server.step(1);
+        fight.say(first);
+        let arrival = fight.now;
+        let target = fight.server.first_enemy().expect("an enemy");
+        let msg = fight.server.command(ActorId(0), Command::Limit { target: Target::One(target) });
+        assert!(msg.is_some(), "a full gauge gives the limit");
+        fight.say(msg);
+        let landing = arrival + cue::MAX_IMPACT_DELAY;
+        let gathering = fight.save_both("limit-gathering", landing - 0.2, "Braver: Cloud gathers its power");
+        let broken = fight.save_both("limit-break", landing + 0.04, "Braver breaks: the flash");
+        let after = fight.save_both("limit-after", landing + 0.45, "Braver, 0.45 s after");
+        let (g, b, a) = (mean_level(&gathering), mean_level(&broken), mean_level(&after));
+        eprintln!("mean level of the picture: {g:.1} gathering, {b:.1} at the flash, {a:.1} after");
+        assert!(b > g + 12.0, "the flash lights the whole picture ({g:.1} then {b:.1})");
+        assert!(a < b - 6.0, "and is short ({b:.1} then {a:.1})");
+    }
+
+    // An enemy's laser: the Guard Scorpion answers a blow with its Tail Laser at the whole party.
+    {
+        let Some((mut fight, arrival, landing)) = scorpion_laser(&real) else { panic!("the Guard Scorpion never answered with its Tail Laser") };
+        eprintln!("the Scorpion's Tail Laser: its batch arrived at {arrival:.2}, it lands at {landing:.2}");
+        let in_flight = fight.save_both("enemy-laser-flight", landing - 0.07, "Tail Laser: the bolts in flight");
+        let beam = fight.scene.effects.asset(effects::Prim::Beam).id;
+        let ribbons = fight.scene.frame(&fight.scene.view(W, H), false).models.models.iter().filter(|m| m.asset.id == beam).count();
+        let hit = fight.save_both("enemy-laser-hit", landing + 0.03, "Tail Laser: it lands");
+        // The whole party was aimed at: a bolt (a ribbon and its glow) for each, and an impact on each of them.
+        let aimed = fight.scene.director.fx().iter().filter(|f| matches!(f.kind, effects::Kind::Bolt { .. }) && (f.land - landing).abs() < 1e-6).count();
+        assert!(aimed >= 2, "a bolt for each member the laser was aimed at: {aimed}");
+        assert!(ribbons >= 2 * aimed, "a ribbon and its glow for each bolt: {ribbons} ribbons for {aimed} bolts");
+        let before: usize = (0..3).map(|i| pixels_near(&in_flight, fight.chest_px(i), 40, |p| p.iter().all(|&c| c > 235))).sum();
+        let after: usize = (0..3).map(|i| pixels_near(&hit, fight.chest_px(i), 40, |p| p.iter().all(|&c| c > 235))).sum();
+        eprintln!("white pixels over the three chests: {before} in flight, {after} as the laser lands");
+        assert!(after > before + 30, "the laser strikes them as it lands ({before} -> {after})");
+    }
+
+    // A status landing: Tifa gives Cloud a Light Curtain (Barrier). The blue shell and the tag on the panel come up at the instant the
+    // item lands, and not before: the picture just before has neither.
+    {
+        let Some((mut fight, arrival)) = Fight::ready(&real, 301, SEED) else { return };
+        let msg = fight.server.command(ActorId(1), Command::Item { item: 44, target: Target::One(ActorId(0)) });
+        assert!(msg.is_some(), "the engine takes a Light Curtain");
+        fight.say(msg);
+        let landing = arrival + cue::impact_delay(Some(ActionRef::Item(44)));
+        assert!(fight.server.state.has_status(ActorId(0), Status::Barrier), "the engine has it the moment the message arrived");
+        let tagged = |fight: &Fight, t: f64| fight.client.view(t).expect("a view").party[0].status.contains(Status::Barrier);
+        assert!(!tagged(&fight, arrival) && !tagged(&fight, landing - 0.01), "the panel does not say Barrier before the item lands");
+        let at = fight.chest_px(0);
+        let before = fight.save_both("status-before-landing", landing - 0.02, "Light Curtain: just before it lands");
+        let shot = fight.save_both("status-landing", landing + 0.16, "Light Curtain: the shell and the tag, 0.16 s after it lands");
+        assert!(tagged(&fight, landing + 0.16), "the panel says Barrier as it lands");
+        let (b, a) = (pixels_near(&before, at, 90, blue), pixels_near(&shot, at, 90, blue));
+        eprintln!("blue pixels around Cloud: {b} before the item lands, {a} after");
+        assert!(a > b + 150, "the shell comes up when the item lands ({b} -> {a})");
+    }
+
+    // Two more statuses at once, for the sheet: Cloud gives Tifa a Speed Drink (Haste) and Barret drinks a Hyper (Fury).
+    {
+        let Some((mut fight, arrival)) = Fight::ready(&real, 301, SEED) else { return };
+        let (haste, fury) = (fight.server.command(ActorId(0), Command::Item { item: 17, target: Target::One(ActorId(1)) }), fight.server.command(ActorId(2), Command::Item { item: 13, target: Target::One(ActorId(2)) }));
+        assert!(haste.is_some() && fury.is_some(), "the engine takes a Speed Drink and a Hyper");
+        fight.say(haste);
+        fight.say(fury);
+        let landing = arrival + cue::impact_delay(Some(ActionRef::Item(17)));
+        let shot = fight.save_both("statuses-haste-and-fury", landing + 0.15, "Haste on Tifa, Fury on Barret");
+        assert!(pixels_near(&shot, fight.chest_px(2), 80, |p| p[0] > 200 && i32::from(p[0]) > i32::from(p[1]) + 50) > 60, "Barret glows red");
+    }
+}
