@@ -365,7 +365,7 @@ impl AreaStory {
         let point = self.points.get(usize::try_from(id).ok()?)?;
         point.applies_to(state.moment).then(|| StoryStep {
             progress: StoryState { moment: point.sets }.encode(),
-            summary: format!("moment {} -> {}", state.moment, point.sets),
+            summary: format!("moment={}->{}", state.moment, point.sets),
         })
     }
 
@@ -645,7 +645,7 @@ mod tests {
         // A new account (empty blob) is at the moment the point needs: it advances to 6.
         let step = story.advance(&[], 0).expect("a new account advances");
         assert_eq!(step.progress, at(6));
-        assert_eq!(step.summary, "moment 1 -> 6");
+        assert_eq!(step.summary, "moment=1->6");
         // Once advanced it cannot do it again, and nobody at another moment can.
         assert_eq!(story.advance(&step.progress, 0), None);
         for m in [0u16, 2, 5, 6, 7, 1600] {
@@ -662,7 +662,7 @@ mod tests {
         let story = scan(&field_script(7, 3, 7, Some(0)), &mesh(13));
         assert_eq!(story.point_count(), 1);
         assert_eq!(story.advance(&at(1), 0).unwrap().progress, at(7));
-        assert_eq!(story.advance(&at(6), 0).unwrap().summary, "moment 6 -> 7");
+        assert_eq!(story.advance(&at(6), 0).unwrap().summary, "moment=6->7");
         assert_eq!(story.advance(&at(7), 0), None);
         // A point whose value is not higher than the moment never lowers it, whatever the guard says.
         let story = scan(&field_script(3, 3, 7, Some(0)), &mesh(13));

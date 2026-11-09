@@ -82,7 +82,7 @@ fn md1stin_has_exactly_the_station_trigger_and_new_accounts_can_use_it() {
     assert_eq!(NEW_GAME_MOMENT, 1);
     let step = area.story_advance(&[], point.id).expect("a new account advances here");
     assert_eq!(step.progress, at(6));
-    assert_eq!(step.summary, "moment 1 -> 6");
+    assert_eq!(step.summary, "moment=1->6");
     assert_eq!(area.story_advance(&step.progress, point.id), None, "only once");
     for moment in [0u16, 2, 7, 8, 12, 1600] {
         assert_eq!(area.story_advance(&at(moment), point.id), None, "moment {moment} cannot");

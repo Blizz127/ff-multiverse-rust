@@ -483,6 +483,10 @@ const MAX_ACCEPTED: usize = 4096;
 pub struct PartyBot {
     invite_first_peer: bool,
     accept: bool,
+    /// Accept only once a player this bot had seen has left its view (`--party-accept-after-split`).
+    accept_after_split: bool,
+    /// Every remote player seen so far (bounded), for [`PartyBot::with_accept_after_split`].
+    seen: BTreeSet<EntityId>,
     invite: InviteDriver,
     accepted: BTreeSet<InviteId>,
 }
@@ -504,7 +508,22 @@ impl PartyBot {
     /// `invite_first_peer`: invite the visible player with the lowest entity id as soon as there
     /// is one. `accept`: accept every invite addressed to this account, once per invite.
     pub fn new(invite_first_peer: bool, accept: bool) -> Self {
-        Self { invite_first_peer, accept, invite: InviteDriver::default(), accepted: BTreeSet::new() }
+        Self {
+            invite_first_peer,
+            accept,
+            accept_after_split: false,
+            seen: BTreeSet::new(),
+            invite: InviteDriver::default(),
+            accepted: BTreeSet::new(),
+        }
+    }
+
+    /// Accept invites only once a player this bot had seen is no longer in view (the other player left
+    /// its instance: it advanced its story, or went away). Until then an invite stays pending (it
+    /// lives for the party's invite lifetime, 60 s by default).
+    pub fn with_accept_after_split(mut self, on: bool) -> Self {
+        self.accept_after_split = on;
+        self
     }
 
     /// The requests to send now. `now` is seconds on the session clock; `visible` the entities of
@@ -522,7 +541,12 @@ impl PartyBot {
                 out.push(PartyCommand::Invite(target));
             }
         }
-        if self.accept {
+        // Who has been seen, and whether one of them has gone from view since.
+        if self.seen.len() < MAX_ACCEPTED {
+            self.seen.extend(visible.iter().copied());
+        }
+        let split = self.seen.iter().any(|id| !visible.contains(id));
+        if self.accept && (!self.accept_after_split || split) {
             for invite in mirror.invites_to_me() {
                 if self.accepted.len() < MAX_ACCEPTED && self.accepted.insert(invite.id) {
                     out.push(PartyCommand::Accept(invite.id));

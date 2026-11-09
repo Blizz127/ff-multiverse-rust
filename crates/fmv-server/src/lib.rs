@@ -268,15 +268,21 @@ impl Server {
         let display_name = label.display_name;
 
         let mut world = World::with_party_config(area, config.party)?;
+        let saver_adapter = Arc::clone(&adapter);
         world.set_area_source(adapter);
         world.set_travel_timeout(config.join_timeout);
         world.configure_battle(config.battle.clone(), config.debug_encounters);
         let (store, ephemeral_state) = open_store(&config).await?;
-        // A server that runs battles saves what they pay, off the world lock (see `saver`).
-        let saver = config.battle.as_ref().map(|b| saver::Saver::spawn(Arc::clone(&store), area_id.game, Arc::clone(&b.rules)));
-        if let Some(saver) = &saver {
-            world.set_progress_saver(saver.handle());
-        }
+        // Every server saves, off the world lock (see `saver`): what battles pay (a server that runs
+        // them) and the story steps players make (any server whose adapter has a story).
+        let saver = saver::Saver::spawn(
+            Arc::clone(&store),
+            area_id.game,
+            config.battle.as_ref().map(|b| Arc::clone(&b.rules)),
+            saver_adapter,
+        );
+        world.set_progress_saver(saver.handle());
+        let saver = Some(saver);
         let listener = TcpListener::bind(config.bind)
             .await
             .map_err(|source| ServerError::Bind { addr: config.bind, source })?;

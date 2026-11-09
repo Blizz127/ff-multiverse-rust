@@ -35,19 +35,28 @@
 //! The area a player left stays loaded until the transfer is over (it is where a refused player
 //! goes back to), and so does the target (a transit counts as being there when areas are unloaded).
 //!
-//! What is not here: exits that scripts decide (FF7 `MAPJUMP`s and line triggers), and phases:
-//! an area is one instance whatever the story phases of the players in it.
+//! # Instances
+//!
+//! An area is loaded once, but its players are split into INSTANCES by story phase and party (see
+//! the `instances` module): a player's `AreaSnapshot`, `PlayerJoined`/`PlayerLeft` and `EntityUpdate`s
+//! concern its own instance only, the NPCs it is shown are the cast of its instance's phase
+//! ([`AreaState::cast`]), and a transfer moves the player out of one instance and into one of the
+//! target area: which one is decided by the player's phase there (or its party leader's), after the
+//! `JoinArea` answer, exactly like the first join. The area stays loaded while anybody stands in any
+//! instance of it.
+//!
+//! What is not here: exits that scripts decide (FF7 `MAPJUMP`s and line triggers).
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use fmv_adapter_api::{AreaKey, AreaRuntime, Exit, GameAdapter};
-use fmv_core::{AnimState, AreaId, EntityId, Fingerprint, Pos, ProvenanceSummary};
+use fmv_adapter_api::{AreaKey, AreaRuntime, Exit, GameAdapter, NpcSpawn, StoryPoint};
+use fmv_core::{AnimState, AreaId, EntityId, Fingerprint, PhaseKey, Pos, ProvenanceSummary};
 use fmv_protocol::{NpcSnapshot, RejectCode, ServerMsg, MAX_NPCS_PER_AREA, NPC_NAME_CHARS, NPC_REF_CHARS};
 
 use super::battle::{AreaEncounters, BattleWorld};
-use super::{is_full, normalize_facing, MoveBudget, MoveRules, Outbound, World};
+use super::{is_full, normalize_facing, MoveBudget, MoveRules, World};
 use crate::ServerError;
 
 /// How long an area that no player is in (or heading for) stays loaded.
@@ -59,6 +68,8 @@ pub const TRAVEL_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_LOADED_AREAS: usize = 128;
 /// Most exits kept per area (FF7 has twelve gateway slots).
 const MAX_EXITS_PER_AREA: usize = 64;
+/// Most story points kept per area (a real field has at most a few).
+const MAX_STORY_POINTS_PER_AREA: usize = 64;
 
 /// What an area is offered as: the fields of `AreaManifest` / `AreaChange` that do not depend on
 /// who is asking.
@@ -82,7 +93,11 @@ pub(super) struct AreaState {
     exits: Vec<Exit>,
     /// Targets whose load failed: their exits are not watched any more.
     closed: BTreeSet<AreaKey>,
+    /// The NPCs shown when no phase says otherwise (counted in the "area loaded" log line); what an
+    /// instance shows is [`AreaState::cast`].
     npcs: Vec<NpcSnapshot>,
+    /// The places where this area's story can advance a player, decoded once at load.
+    story_points: Vec<StoryPoint>,
     /// The area's random encounters, when battles are on and it has a table.
     encounters: Option<AreaEncounters>,
     /// Since when no player is in or heading for the area (`None` while there is one).
@@ -93,6 +108,25 @@ pub(super) struct AreaState {
 /// goes into frames the client shows, so it is bounded and clean anyway).
 fn clip(text: &str, max: usize) -> String {
     text.chars().filter(|c| !c.is_control()).take(max).collect()
+}
+
+/// What the server shows of the NPCs an area places: only the ones the data places for certain (a
+/// story-dependent NPC may not be there at all), at most [`MAX_NPCS_PER_AREA`], bounded and clean.
+fn npc_snapshots(spawns: Vec<NpcSpawn>) -> Vec<NpcSnapshot> {
+    spawns
+        .into_iter()
+        .filter(|n| n.unconditional && n.pos.is_finite() && n.facing.is_finite())
+        .take(MAX_NPCS_PER_AREA)
+        .enumerate()
+        .map(|(i, n)| NpcSnapshot {
+            id: u32::try_from(i).unwrap_or(u32::MAX),
+            name: clip(&n.entity_name, NPC_NAME_CHARS),
+            model: clip(&n.appearance.model, NPC_REF_CHARS),
+            idle_animation: n.appearance.idle_animation.as_deref().map(|a| clip(a, NPC_REF_CHARS)),
+            pos: n.pos,
+            facing: normalize_facing(n.facing),
+        })
+        .collect()
 }
 
 impl AreaState {
@@ -119,22 +153,8 @@ impl AreaState {
             })
             .take(MAX_EXITS_PER_AREA)
             .collect();
-        let npcs = runtime
-            .npcs()
-            .into_iter()
-            // Only what the data places for certain: a story-dependent NPC may not be there at all.
-            .filter(|n| n.unconditional && n.pos.is_finite() && n.facing.is_finite())
-            .take(MAX_NPCS_PER_AREA)
-            .enumerate()
-            .map(|(i, n)| NpcSnapshot {
-                id: u32::try_from(i).unwrap_or(u32::MAX),
-                name: clip(&n.entity_name, NPC_NAME_CHARS),
-                model: clip(&n.appearance.model, NPC_REF_CHARS),
-                idle_animation: n.appearance.idle_animation.as_deref().map(|a| clip(a, NPC_REF_CHARS)),
-                pos: n.pos,
-                facing: normalize_facing(n.facing),
-            })
-            .collect();
+        let npcs = npc_snapshots(runtime.npcs());
+        let story_points: Vec<StoryPoint> = runtime.story_points().into_iter().take(MAX_STORY_POINTS_PER_AREA).collect();
         let encounters = battle.and_then(|b| b.area_encounters(runtime.as_ref()));
         Ok(Self {
             offer: AreaOffer {
@@ -151,6 +171,7 @@ impl AreaState {
             exits,
             closed: BTreeSet::new(),
             npcs,
+            story_points,
             encounters,
             empty_since: None,
         })
@@ -172,8 +193,16 @@ impl AreaState {
         &self.rules
     }
 
-    pub(super) fn npcs(&self) -> &[NpcSnapshot] {
-        &self.npcs
+    /// The NPCs of the instance of this area that runs `phase`: what the area says its cast is in that
+    /// phase (`AreaRuntime::npcs_in_phase`, the same NPCs in every phase unless the adapter says
+    /// otherwise), cleaned and bounded like every NPC list.
+    pub(super) fn cast(&self, phase: &PhaseKey) -> Vec<NpcSnapshot> {
+        npc_snapshots(self.runtime.npcs_in_phase(phase))
+    }
+
+    /// The places where this area's story can advance a player.
+    pub(super) fn story_points(&self) -> &[StoryPoint] {
+        &self.story_points
     }
 
     pub(super) fn encounters(&self) -> Option<&AreaEncounters> {
@@ -290,47 +319,14 @@ impl World {
         self.players.get(&entity).and_then(|p| p.transit.as_ref().map(|t| t.to.clone()))
     }
 
-    /// Queue `msg` for every player standing in area `key` (not those in transit). Players whose
-    /// queue is full or closed are appended to `failed` for the caller to drop.
-    pub(super) fn tell_area(&self, key: &str, msg: Outbound, failed: &mut Vec<(EntityId, bool)>) {
-        for (id, p) in self.players.iter().filter(|(_, p)| p.area == key && p.transit.is_none()) {
-            if let Err(e) = p.tx.try_send(Arc::clone(&msg)) {
-                failed.push((*id, is_full(&e)));
-            }
-        }
-    }
-
-    /// `entity` has just come to stand in its area (it joined, or finished a transfer): send it the
-    /// `AreaSnapshot` (everyone of the area, itself included, and the area's NPCs) and, directly
-    /// after, its `InstancePlacement`; tell the others of the area it is there. The placement is
-    /// always sent, even when it equals the last one told (a player sent back to the area it came
+    /// `entity` has just come to stand in its area (it joined, or finished a transfer): place it in
+    /// the instance its phase (or its party leader's) selects, send it the `AreaSnapshot` (the entities
+    /// of that instance, itself included, and the cast of its phase) and, directly after, its
+    /// `InstancePlacement`; tell the others of the instance it is there (`World::settle`). The placement
+    /// is always sent, even when it equals the last one told (a player sent back to the area it came
     /// from), so that every entry looks the same to a client.
     pub(super) fn announce_entry(&mut self, entity: EntityId, failed: &mut Vec<(EntityId, bool)>) {
-        let Some(me) = self.players.get(&entity) else { return };
-        let (key, account) = (me.area.clone(), me.account);
-        let Some(area) = self.areas.get(&key) else { return };
-        let snapshot = Arc::new(ServerMsg::AreaSnapshot {
-            area: area.id().clone(),
-            tick: self.tick,
-            entities: self
-                .players
-                .values()
-                .filter(|p| p.area == key && p.transit.is_none())
-                .map(|p| p.snapshot.clone())
-                .collect(),
-            npcs: area.npcs().to_vec(),
-        });
-        let joined = Arc::new(ServerMsg::PlayerJoined { snapshot: me.snapshot.clone() });
-        for (id, p) in self.players.iter().filter(|(_, p)| p.area == key && p.transit.is_none()) {
-            let msg = if *id == entity { &snapshot } else { &joined };
-            if let Err(e) = p.tx.try_send(Arc::clone(msg)) {
-                failed.push((*id, is_full(&e)));
-            }
-        }
-        if let Some(me) = self.players.get_mut(&entity) {
-            me.placement = None;
-        }
-        self.refresh_placements(&BTreeSet::from([account]), failed);
+        self.settle(entity, true, failed);
     }
 
     /// Make sure area `key` is loaded, loading it from the area source if it is not. Returns the key
@@ -416,12 +412,15 @@ impl World {
             bounced: false,
         });
         p.dirty = false;
+        let account = p.account;
         self.logs.info(format!("player leaves through an exit entity={} from={old_key} to={target_key}", entity.0));
 
-        // Everyone left behind hears it (the player is in transit now, so it is not one of them),
-        // then the player hears where it goes.
+        // Everyone left behind in its instance hears it (the player is in no instance while in
+        // transit, so it is not one of them), then the player hears where it goes.
         let mut failed = Vec::new();
-        self.tell_area(&old_key, Arc::new(ServerMsg::PlayerLeft { entity }), &mut failed);
+        if let Some(instance) = self.leave_instance(account) {
+            self.tell_instance(instance, Arc::new(ServerMsg::PlayerLeft { entity }), &mut failed);
+        }
         if let Some(p) = self.players.get(&entity) {
             if let Err(e) = p.tx.try_send(offer) {
                 failed.push((entity, is_full(&e)));
@@ -567,9 +566,9 @@ impl World {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{MoveOutcome, NewPlayer, PartyOutcome};
+    use super::super::{MoveOutcome, NewPlayer, Outbound, PartyOutcome};
     use super::*;
-    use fmv_core::{AccountId, AvatarAppearance, PhaseKey};
+    use fmv_core::{AccountId, AvatarAppearance};
     use fmv_fixture::rooms::{RoomsAdapter, EXIT_X, GHOST, HALL, HALL_ARRIVAL, HALL_MAX_SPEED, YARD, YARD_ARRIVAL, YARD_MAX_SPEED};
 
     /// Near and far side of the hall's exit line (x = `EXIT_X`).
@@ -609,7 +608,7 @@ mod tests {
         let close_rx = close.subscribe();
         let avatar = AvatarAppearance { display_name: name.into(), tint: [1, 2, 3], appearance_ref: None };
         let account = AccountId(entity.0);
-        w.join(NewPlayer { session, entity, account, avatar, phase: PhaseKey::default(), progress: Default::default(), tx, close }, now)
+        w.join(NewPlayer { session, entity, account, avatar, progression: Vec::new(), progress: Default::default(), tx, close }, now)
             .expect("joins");
         Seat { entity, account, rx, close: close_rx }
     }

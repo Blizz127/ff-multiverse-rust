@@ -286,8 +286,8 @@ pub struct StoryStep {
     /// The new progression blob, in the adapter's own encoding (what the server stores for the
     /// account and game).
     pub progress: Vec<u8>,
-    /// What changed, as numbers and names of the adapter's own, for logs and the client's log
-    /// (FF7: `moment 1 -> 6`). Never text of the game.
+    /// What changed, as `key=value` words of the adapter's own without spaces, for logs and the
+    /// client's log (FF7: `moment=1->6`). Never text of the game.
     pub summary: String,
 }
 

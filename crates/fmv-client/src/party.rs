@@ -430,8 +430,11 @@ impl PartyMirror {
 /// One line about an instance placement (for the log).
 pub fn describe_placement(p: &Placement) -> String {
     let party = p.party.map_or_else(|| "solo".to_string(), |id| id.to_string());
+    // The phase is opaque: the empty key is the one every new account has, anything else is shown as hex
+    // (it is a few bytes: the server keeps keys small).
+    let phase = if p.key.phase.0.is_empty() { "default".to_string() } else { p.key.phase.0.iter().take(16).map(|b| format!("{b:02x}")).collect() };
     format!(
-        "{} ({party}, story advance {})",
+        "{} ({party}, story advance {}, phase {phase})",
         clean(&p.key.area.to_string()),
         if p.story_advance_allowed { "allowed" } else { "not allowed" }
     )

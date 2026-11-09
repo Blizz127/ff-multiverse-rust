@@ -312,6 +312,22 @@ pub struct Args {
     /// see it too, before it moves on. Bots without --travel never cross an exit by accident.
     #[arg(long, value_name = "AREA[,AREA...]", value_delimiter = ',', value_parser = parse_area_key, requires = "headless")]
     pub travel: Vec<String>,
+
+    // ---- story (phasing): one contiguous block ----
+    /// Advance this player's story as a bot (headless only): walk to the story point of the area it
+    /// stands in that would advance THIS account's story (the same points and rule the server uses; in
+    /// FF7's first field `md1stin` it is walkmesh triangle 12), stay there until the server has moved the
+    /// story, then stand still. The server decides: the bot only goes where the data says the story
+    /// happens. With --party-invite-first-peer it first waits (at most 15 s) until its invite is out.
+    /// Never crosses an exit.
+    #[arg(long, requires = "headless")]
+    pub story_advance: bool,
+
+    /// With --party-accept: do not accept an invite until a player this bot had seen is no longer in
+    /// view (that other player left its instance: advanced its story, or went away), instead of at once.
+    /// This is how a smoke test joins a party across a phase split.
+    #[arg(long, requires = "party_accept")]
+    pub party_accept_after_split: bool,
 }
 
 /// Default server for `--server`. Kept in sync with `DEFAULT_DEV_PORT` by a unit test.

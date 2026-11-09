@@ -39,6 +39,14 @@
 //!   stored is absent, not a default (the game's own data supplies the start, so there is nothing
 //!   to migrate), and the game's caps and curves stay with its adapter: the store checks only what
 //!   is true of every game.
+//! * **The story blob moves forward through one atomic step.** [`Progression`] (one opaque blob per
+//!   account and game, read only by the game's adapter) is written with [`Store::put_progression`] or,
+//!   when the new value depends on the old one, [`Store::update_progression`]: a read-modify-write under
+//!   the writer lock, so two saves for one account that arrive out of order cannot take a story back
+//!   (the adapter's merge runs inside the closure). A record that cannot be read is an error and is
+//!   never replaced by a default. No record is written for an account that never advanced: an absent
+//!   record is a new account, and the record keeps the shape it always had (`SCHEMA_VERSION` 1, the
+//!   same five keys), so a build from before the story model reads it too (the blob is opaque there).
 //! * **An inventory that was never stored is not an empty one.** The inventory is optional inside
 //!   the character record: `None` (no `inventory` key on disk, which is what every record written
 //!   before inventories existed looks like) means *never stored*, so the server starts from its
