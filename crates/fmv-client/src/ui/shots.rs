@@ -89,10 +89,15 @@ fn offscreen_character_select_screens() {
         assert!(count(&img, tint) > 100, "swatch {tint:?} is on screen");
     }
 
-    // Forgetting asks first.
+    // Deleting asks first (Keep, Delete or Forget here), at the usual size and at the smallest window; then Y
+    // deletes, and the window waits for the server.
     press(&mut m, NavKey::Delete);
-    let img = shoot(&mut gpu, "02-select-forget-confirm", &m, W, H);
+    let img = shoot(&mut gpu, "02-select-delete-confirm", &m, W, H);
     assert!(bright(&img) > 800);
+    shoot(&mut gpu, "02b-select-delete-confirm-320x240", &m, 320, 240);
+    m.text("y");
+    m.tick(2.0);
+    shoot(&mut gpu, "02c-deleting", &m, W, H);
 
     // A refused login comes back to the list with the reason.
     let mut m = menu(GameId::Ff7, accounts());
@@ -101,7 +106,7 @@ fn offscreen_character_select_screens() {
     shoot(&mut gpu, "03-connecting", &m, W, H);
     m.connect_failed(
         Notice::error("The server refused: invalid or unknown token")
-            .with_hint("The server does not know this saved login (its accounts may have been reset). Press Del to forget it, then N to create a new character."),
+            .with_hint("The server does not know this saved login (its accounts may have been reset). Press Del, then F to forget it on this computer (or Y to delete it), then N to create a new character."),
     );
     shoot(&mut gpu, "04-select-login-refused", &m, W, H);
 

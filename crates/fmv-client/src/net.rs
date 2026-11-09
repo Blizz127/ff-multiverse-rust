@@ -446,7 +446,7 @@ pub fn check_local_content(
 // Handshake
 // ---------------------------------------------------------------------------------------------
 
-async fn send<W: AsyncWrite + Unpin>(
+pub(crate) async fn send<W: AsyncWrite + Unpin>(
     wr: &mut W,
     msg: &ClientMsg,
     during: &'static str,
@@ -795,7 +795,7 @@ async fn session_loop<R, W>(
     reader.abort();
 }
 
-async fn connect(server: &str) -> Result<TcpStream, NetError> {
+pub(crate) async fn connect(server: &str) -> Result<TcpStream, NetError> {
     match timeout(CONNECT_TIMEOUT, TcpStream::connect(server)).await {
         Err(_) => Err(NetError::ConnectTimeout(server.to_string(), CONNECT_TIMEOUT.as_secs())),
         Ok(Err(source)) => Err(NetError::Connect {
