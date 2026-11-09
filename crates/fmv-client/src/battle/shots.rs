@@ -13,7 +13,7 @@
 //! up (no game data is read).
 
 use super::hud::BattleHud;
-use super::menu::{MenuItem, MenuKey, MenuLimit, MenuSpell, TargetRule};
+use super::menu::{MenuItem, MenuKey, MenuLimit, MenuSpell, Reach, TargetRule};
 use super::panels::{layout, Banner, Layout, RewardItem, RewardLine, DISABLED, PANEL_DELAY_MS};
 use super::popups::{Popup, PopupKind};
 use super::text::draw_battle_text;
@@ -308,6 +308,60 @@ fn offscreen_battle_target_selection() {
         let around = (ax as i32 - cell, ay as i32 - cell, ax as i32 + cell, ay as i32 + 4);
         assert!(count_near(&img, w, h, around, [ACCENT[0], ACCENT[1], ACCENT[2], 255], 6) > 20 * (l.s * l.s) as usize, "{w}x{h}: the pointer is over Barret");
         assert!(text_pixels(&img, w, h, &l, l.party, [ACCENT[0], ACCENT[1], ACCENT[2], 255]) > 15 * (l.s * l.s) as usize, "{w}x{h}: and his row in the party panel is marked");
+    }
+}
+
+/// Protocol v8: the pointer on ALL. The Magic list says how many whole-side casts are left, the status line says what
+/// ALL is, and a spell on every enemy (or the whole party) marks every one of them at once: an arrow over each head
+/// and each name in the list in the aimed colour.
+#[test]
+#[ignore = "needs a GPU or software Vulkan/GL driver"]
+fn offscreen_battle_target_all() {
+    let Some(mut gpu) = Shooter::new() else { return };
+    // Fire and Cure can hit a whole side (Barret has one All use); Meteor is the kind that only hits one.
+    let all_hud = || {
+        let mut hud = hud();
+        let model = hud.model_mut();
+        model.all_left = 1;
+        model.spells[0].reach = Reach::OneOrAll;
+        model.spells[3].reach = Reach::OneOrAll;
+        hud
+    };
+    let yellow = [ACCENT[0], ACCENT[1], ACCENT[2], 255];
+    for (w, h) in SIZES {
+        let l = layout(w, h, 3);
+        let one_cell = (l.s * l.s) as usize;
+        let cell = 8 * (l.s + 1);
+        let arrow_over = |img: &[u8], view: &BattleView, who: u8| {
+            let (ax, ay) = flat_anchors(view, w, h).of(view, ActorId(who)).expect("an anchor");
+            count_near(img, w, h, (ax as i32 - cell, ay as i32 - cell, ax as i32 + cell, ay as i32 + 4), yellow, 6)
+        };
+        // The Magic list: ALL x1 in the info colour, on the title row.
+        let mut hud = all_hud();
+        let view = pressed(&mut hud, &battle(), &[MenuKey::Down, MenuKey::Confirm]);
+        let img = gpu.shoot("07-magic-list-all", &view, w, h);
+        assert_windows(&img, w, h, &l, &[l.left, l.party]);
+        assert!(text_pixels(&img, w, h, &l, l.left, [INFO[0], INFO[1], INFO[2], 255]) > 5 * one_cell, "{w}x{h}: ALL x1 on the list's title row");
+
+        // Fire at the first enemy, then one step back: ALL. All three enemies are marked, the party is not.
+        let mut hud = all_hud();
+        let view = pressed(&mut hud, &battle(), &[MenuKey::Down, MenuKey::Confirm, MenuKey::Confirm, MenuKey::Left]);
+        let img = gpu.shoot("08-target-all-enemies", &view, w, h);
+        for who in [3, 4, 5] {
+            assert!(arrow_over(&img, &view, who) > 20 * one_cell, "{w}x{h}: a yellow arrow over enemy {who}");
+        }
+        assert_eq!(arrow_over(&img, &view, 0), 0, "{w}x{h}: and none over the party");
+        assert!(text_pixels(&img, w, h, &l, l.enemy, yellow) > 3 * 15 * one_cell, "{w}x{h}: every name in the enemy list is in the aimed colour");
+        assert!(count_near(&img, w, h, (0, 14, w as i32, 14 + 12 * l.s), yellow, 6) > 100, "{w}x{h}: the status line says what ALL is");
+
+        // Cure on the whole party: three arrows over the three members, their rows marked.
+        let mut hud = all_hud();
+        let view = pressed(&mut hud, &battle(), &[MenuKey::Down, MenuKey::Confirm, MenuKey::Down, MenuKey::Down, MenuKey::Down, MenuKey::Confirm, MenuKey::Left]);
+        let img = gpu.shoot("09-target-all-allies", &view, w, h);
+        for who in [0, 1, 2] {
+            assert!(arrow_over(&img, &view, who) > 20 * one_cell, "{w}x{h}: a yellow arrow over party member {who}");
+        }
+        assert!(text_pixels(&img, w, h, &l, l.party, yellow) > 3 * 8 * one_cell, "{w}x{h}: every member's row in the party panel is marked");
     }
 }
 
