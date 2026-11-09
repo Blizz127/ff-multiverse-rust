@@ -26,7 +26,7 @@ const H: u32 = 680;
 fn entry(name: &str, tint: Option<[u8; 3]>, look: Option<&str>) -> CharacterEntry {
     CharacterEntry {
         name: name.into(),
-        look: tint.map(|t| Look { tint: t, appearance: look.map(str::to_string) }),
+        look: tint.map(|t| Look::plain(t, look)),
         loose_permissions: false,
     }
 }
@@ -129,7 +129,7 @@ fn offscreen_character_select_screens() {
 fn offscreen_character_create_screens() {
     let Some(mut gpu) = Offscreen::new() else { return };
 
-    // A fresh install opens on the form. Type a name, move to the look and pick Tifa.
+    // A fresh install opens on the form. Type a name, move to the body and pick the next one.
     let mut m = menu(GameId::Ff7, vec![]);
     m.text("Cloud");
     let img = shoot(&mut gpu, "10-create-name", &m, W, H);
@@ -139,7 +139,7 @@ fn offscreen_character_create_screens() {
     }
     press(&mut m, NavKey::Tab);
     press(&mut m, NavKey::Right);
-    shoot(&mut gpu, "11-create-look", &m, W, H);
+    shoot(&mut gpu, "11-create-body", &m, W, H);
 
     // The palette focused with a colour chosen: the preview swatch follows.
     press(&mut m, NavKey::Tab);
@@ -180,7 +180,7 @@ fn offscreen_character_create_screens() {
     m.text("Jos\u{e9} \u{4e2d}");
     shoot(&mut gpu, "16-create-unsupported-characters", &m, W, H);
 
-    // The fixture has no looks.
+    // The fixture has no bodies and no slots.
     let mut m = menu(GameId::Fixture, vec![]);
     m.text("Bot");
     shoot(&mut gpu, "17-create-fixture", &m, W, H);
@@ -204,6 +204,42 @@ fn offscreen_character_create_screens() {
     shoot(&mut gpu, "20-create-320x240", &m, 320, 240);
     shoot(&mut gpu, "21-create-640x360", &m, 640, 360);
     shoot(&mut gpu, "22-create-1920x1080", &m, 1920, 1080);
+}
+
+/// The create screen as a player sees it: the Body and Slot rows, each with the line that says what it means under it
+/// (`creator.png` in `$FMV_SHOT_DIR`, at the window's default size). The other sizes (`creator-<w>x<h>.png`) show how
+/// the lines give way where the window has no room for both: the help of the focused row takes the place of the key
+/// hints under the buttons.
+#[test]
+#[ignore = "needs a GPU or software Vulkan/GL driver"]
+fn offscreen_creator() {
+    use super::widgets::DIM;
+    let Some(mut gpu) = Offscreen::new() else { return };
+    let mut m = menu(GameId::Ff7, vec![]);
+    m.text("Wedge");
+    press(&mut m, NavKey::Tab); // the body
+    press(&mut m, NavKey::Right); // the next one
+    press(&mut m, NavKey::Tab); // the colour
+    for _ in 0..3 {
+        press(&mut m, NavKey::Right);
+    }
+    for _ in 0..4 {
+        press(&mut m, NavKey::Tab); // red, green, blue, the slot
+    }
+    press(&mut m, NavKey::Right); // Tifa's slot
+    let img = shoot(&mut gpu, "creator", &m, W, H);
+    let mut list = DrawList::new();
+    screens::draw_menu(&m, W, H, &mut list);
+    for needle in ["Name", "Body", "Slot", "Tifa Lockhart", "how you look on the field (a placeholder model)", "who you fight as: its combat moves and level curve", "(fixed once created)"] {
+        assert!(list.says(needle), "{needle:?} is on the screen");
+    }
+    // The help lines are DIM text under their rows, and they reach the screen.
+    let dim = img.chunks(4).filter(|p| p[..3] == [DIM[0], DIM[1], DIM[2]]).count();
+    assert!(dim > 300, "the help lines are drawn: {dim} pixels of the dim text colour");
+    for (w, h) in [(640, 360), (1920, 1080), (320, 240)] {
+        let img = shoot(&mut gpu, &format!("creator-{w}x{h}"), &m, w, h);
+        assert!(bright(&img) > 500, "{w}x{h}: there is text on the screen");
+    }
 }
 
 /// The HUD over a fixture area seen from above: names, the party, the status and the FIXTURE label.
@@ -267,12 +303,12 @@ fn offscreen_hud_over_the_fixture_area() {
     let plain_bright = bright(&img);
     let plain_gold = count(&img, [255, 208, 64]);
     let mut overlay = DrawList::new();
-    hud::draw_hud_with(&real, Some(&hud::ProgressLine { text: "Cloud Lv 7  EXP 626/949  Gil 20".into(), level_up: false }), W, H, &mut overlay);
+    hud::draw_hud_with(&real, Some(&hud::ProgressLine { text: "Wedge (Barret)  Lv 7  EXP 626/949  Gil 20".into(), level_up: false }), W, H, &mut overlay);
     let with_line = gpu.render(W, H, &scene, &overlay);
     save("33-hud-ff7-character", W, H, &with_line);
     assert!(bright(&with_line) > plain_bright, "the character line puts more text on screen");
     let mut overlay = DrawList::new();
-    hud::draw_hud_with(&real, Some(&hud::ProgressLine { text: "Cloud Lv 7  EXP 626/949  Gil 20".into(), level_up: true }), W, H, &mut overlay);
+    hud::draw_hud_with(&real, Some(&hud::ProgressLine { text: "Wedge (Barret)  Lv 7  EXP 626/949  Gil 20".into(), level_up: true }), W, H, &mut overlay);
     let level_up = gpu.render(W, H, &scene, &overlay);
     save("34-hud-ff7-level-up", W, H, &level_up);
     assert!(count(&level_up, [255, 208, 64]) > plain_gold, "the gold LEVEL UP! text is on screen");

@@ -229,7 +229,7 @@ impl Rig {
             clear_rgb: [70, 78, 92],
             stage: Vec::new(),
             location: None,
-            models: AvatarFrame { models, zoom: view.zoom as f32, overlay_bias: 3.0, ground, scenery: None },
+            models: AvatarFrame { models, tints: Vec::new(), zoom: view.zoom as f32, overlay_bias: 3.0, ground, scenery: None },
             tints: Vec::new(),
             camera: view.gpu_camera(),
         };
@@ -402,7 +402,7 @@ impl Fight {
         client.on_message(0.0, server.start(&setup, real.rules.data_fingerprint()));
         let start = client.scene_start().expect("a battle to draw");
         let mut kit = real.kit();
-        let scene = BattleScene::new(&start, client.engine(), &[None, None, None], &mut kit).expect("a scene");
+        let scene = BattleScene::new(&start, client.engine(), &mut kit).expect("a scene");
         let mut fight = Self { gpu, client, server, scene, now: 1.0 };
         let events = client_events(&mut fight.client);
         fight.scene.update(1.0, &events, fight.client.engine());

@@ -22,7 +22,7 @@ fn kit() -> ModelKit {
 }
 
 fn member(i: u64, character: u8) -> BattleMember {
-    BattleMember { entity: EntityId(1 + i), account: AccountId(1 + i), character, level: 5, weapon: None, armor: None, limit: 0 }
+    BattleMember { entity: EntityId(1 + i), account: AccountId(1 + i), name: format!("P{i}"), character, level: 5, weapon: None, armor: None, limit: 0 }
 }
 
 fn setup_for(formation: u16, party: usize) -> BattleSetup {
@@ -61,7 +61,7 @@ fn start(party: usize, formation: Option<FormationScene>) -> SceneStart {
 
 fn scene(party: usize, with_formation: bool) -> (BattleScene, BattleState) {
     let engine = engine(1, party);
-    let scene = BattleScene::new(&start(party, with_formation.then(formation)), Some(&engine), &[], &mut kit()).expect("a scene");
+    let scene = BattleScene::new(&start(party, with_formation.then(formation)), Some(&engine), &mut kit()).expect("a scene");
     (scene, engine)
 }
 
@@ -148,20 +148,18 @@ fn a_scene_has_the_party_first_then_the_enemies_with_models_to_match() {
 }
 
 #[test]
-fn the_look_of_a_player_decides_its_model_and_without_one_the_character_does() {
-    // Looks aligned with the party: the first member's player chose Barret, the third has none.
+fn the_combat_slot_of_a_member_decides_its_model() {
+    // Battle placeholder: the slot's own model. The party of `start(3, ..)` fights in the slots 0, 1 and 2.
     let engine = engine(1, 3);
     let asked = Rc::new(RefCell::new(Vec::new()));
     let mut kit = ModelKit::new(Box::new(StandInModels), Some(Box::new(Counting::new(Rc::clone(&asked), vec![]))));
-    let looks = [Some("ff7/barret".to_string()), None, None];
-    BattleScene::new(&start(3, None), Some(&engine), &looks, &mut kit).unwrap();
-    // Member 0: the look (Barret). Member 1: character id 1 is Barret too (already loaded). Member 2: character 2, Tifa.
-    assert_eq!(*asked.borrow(), ["ff7/barret", "ff7/tifa"]);
+    BattleScene::new(&start(3, None), Some(&engine), &mut kit).unwrap();
+    assert_eq!(*asked.borrow(), ["ff7/cloud", "ff7/barret", "ff7/tifa"], "Cloud's, Barret's and Tifa's field models, one per slot");
 }
 
 #[test]
 fn without_an_engine_there_is_no_scene() {
-    assert!(BattleScene::new(&start(2, None), None, &[], &mut kit()).is_none());
+    assert!(BattleScene::new(&start(2, None), None, &mut kit()).is_none());
 }
 
 #[test]
@@ -203,7 +201,7 @@ fn a_formation_camera_that_does_not_suit_the_cast_falls_back_to_the_default_view
     // Looking away from everyone.
     f.camera = CameraPose { position: [9000, -2400, 1800], target: [20_000, -300, 1800] };
     let engine = engine(1, 3);
-    let scene = BattleScene::new(&start(3, Some(f)), Some(&engine), &[], &mut kit()).unwrap();
+    let scene = BattleScene::new(&start(3, Some(f)), Some(&engine), &mut kit()).unwrap();
     assert_eq!(scene.cameras.len(), 3, "the formation's, the default and the one of last resort");
     let view = scene.view(W, H);
     let default = BattleCamera::look_at(DEFAULT_POSE.0, DEFAULT_POSE.1).unwrap();
@@ -214,7 +212,7 @@ fn a_formation_camera_that_does_not_suit_the_cast_falls_back_to_the_default_view
     // A camera that is not a camera at all (no direction) is the default as well.
     let mut g = formation();
     g.camera = CameraPose { position: [100, 100, 100], target: [100, 100, 100] };
-    let scene = BattleScene::new(&start(3, Some(g)), Some(&engine), &[], &mut kit()).unwrap();
+    let scene = BattleScene::new(&start(3, Some(g)), Some(&engine), &mut kit()).unwrap();
     assert_eq!(scene.cameras.len(), 2);
     assert_eq!(scene.view(W, H).camera, default);
 }
@@ -320,7 +318,7 @@ fn a_blow_makes_the_attacker_lunge_and_the_target_blink_and_collapse() {
     let (state, events, attacker, target) = killing_blow();
     let engine_before = SyntheticRules::default().build(&setup_for(1, 2)).unwrap();
     // A scene for the engine's actors (2 party, 2 enemies), started before the blow.
-    let mut scene = BattleScene::new(&start(2, Some(formation())), Some(&engine_before), &[], &mut kit()).unwrap();
+    let mut scene = BattleScene::new(&start(2, Some(formation())), Some(&engine_before), &mut kit()).unwrap();
     let view = view(&scene);
     let home = scene.screen_anchors(&view)[usize::from(attacker.0)].feet.unwrap();
     scene.update(10.0, &events, Some(&state));
@@ -356,7 +354,7 @@ fn events_that_arrive_after_the_battle_ended_are_still_played() {
     // time the scene is updated, but the events still play.
     let (state, events, _, target) = killing_blow();
     let engine_before = SyntheticRules::default().build(&setup_for(1, 2)).unwrap();
-    let mut scene = BattleScene::new(&start(2, Some(formation())), Some(&engine_before), &[], &mut kit()).unwrap();
+    let mut scene = BattleScene::new(&start(2, Some(formation())), Some(&engine_before), &mut kit()).unwrap();
     let view = view(&scene);
     drop(state);
     scene.update(5.0, &events, None);
@@ -376,7 +374,7 @@ fn events_that_arrive_after_the_battle_ended_are_still_played() {
 fn a_scene_that_starts_after_an_enemy_died_does_not_draw_it() {
     let (state, _, _, target) = killing_blow();
     // The scene is built from the engine as it stands now: one enemy is already dead.
-    let scene = BattleScene::new(&start(2, None), Some(&state), &[], &mut kit()).unwrap();
+    let scene = BattleScene::new(&start(2, None), Some(&state), &mut kit()).unwrap();
     let mut scene = scene;
     scene.update(1.0, &[], Some(&state));
     let view = view(&scene);
@@ -449,7 +447,7 @@ fn a_limit_break_from_the_engine_gathers_at_the_performer_and_breaks_over_the_ta
     let target = engine.enemy_ids()[0];
     assert!(events.contains(&BattleEvent::Action { actor: ActorId(0), action: ActionRef::Limit(128) }), "{events:?}");
     assert!(events.contains(&BattleEvent::LimitGauge { actor: ActorId(0), value: 0 }), "the gauge is emptied");
-    let mut scene = BattleScene::new(&start(2, None), Some(&before), &[], &mut kit()).unwrap();
+    let mut scene = BattleScene::new(&start(2, None), Some(&before), &mut kit()).unwrap();
     scene.update(10.0, &events, Some(&engine));
     // One glow at the performer, a bloom and a star over the target, both at the cap of the delay.
     let charges = scene.director.charges().to_vec();
@@ -472,7 +470,7 @@ fn a_limit_break_from_the_engine_gathers_at_the_performer_and_breaks_over_the_ta
 fn a_party_that_runs_away_turns_its_back_leaves_the_stage_and_shows_no_victory_while_the_enemy_stays() {
     let (before, engine, events) = command_of_the_first_hero(0, |_| Command::Escape);
     assert_eq!(engine.outcome(), Some(fmv_ff7_battle::rules::Outcome::Escaped), "a preemptive start gets away for sure");
-    let mut scene = BattleScene::new(&start(2, None), Some(&before), &[], &mut kit()).unwrap();
+    let mut scene = BattleScene::new(&start(2, None), Some(&before), &mut kit()).unwrap();
     let view = view(&scene);
     let home: Vec<Option<[f32; 2]>> = scene.screen_anchors(&view).iter().map(|a| a.feet).collect();
     // The battle is over by the time the scene hears of it (no engine), and the run plays all the same.
@@ -502,7 +500,7 @@ fn an_escape_that_fails_throws_the_runner_back_and_nobody_leaves() {
     let failed = [BattleEvent::Action { actor: ActorId(0), action: ActionRef::Escape }, BattleEvent::EscapeFailed { actor: ActorId(0) }];
     // How far (px) the first hero strays from its mark in two seconds after `events`, and where it ends.
     let sweep = |events: &[BattleEvent]| {
-        let mut scene = BattleScene::new(&start(2, None), Some(&before), &[], &mut kit()).unwrap();
+        let mut scene = BattleScene::new(&start(2, None), Some(&before), &mut kit()).unwrap();
         let view = view(&scene);
         let home = scene.screen_anchors(&view)[0].feet.unwrap();
         scene.update(10.0, events, Some(&before));
@@ -582,17 +580,30 @@ fn state_in_battle() -> ClientState {
 }
 
 #[test]
-fn the_looks_of_the_party_are_ours_from_our_snapshot_and_the_others_from_the_area() {
+fn the_scene_starts_from_the_roster_with_each_members_own_name_and_slot() {
     let s = state_in_battle();
     let start = s.battle.scene_start().unwrap();
     assert_eq!(start.id, BattleId(4));
     assert_eq!(start.party.len(), 2);
     assert_eq!(start.my_actor, Some(ActorId(0)));
     assert!(start.formation.is_none(), "the synthetic rules have no placement data");
-    assert_eq!(party_looks(&s, &start.party), [Some("ff7/barret".to_string()), Some("ff7/tifa".to_string())]);
-    // A member nobody knows has no look.
-    let stranger = BattleMember { entity: EntityId(99), ..member(2, 2) };
-    assert_eq!(party_looks(&s, &[stranger]), [None]);
+    // The roster is the server's: who is in it, under which name, fighting in which slot.
+    let roster: Vec<(&str, u8)> = start.party.iter().map(|m| (m.name.as_str(), m.character)).collect();
+    assert_eq!(roster, [("P0", 0), ("P1", 1)]);
+}
+
+/// The model of a party member in battle is its combat slot's, whatever the player looks like on the field:
+/// here the area shows entity 1 as Barret and entity 2 as Tifa, and the roster says they fight in the slots of
+/// Cloud (0) and Barret (1), so Cloud's and Barret's models are asked for and never the looks'.
+#[test]
+fn a_battle_model_is_the_slots_whatever_the_player_looks_like_on_the_field() {
+    let s = state_in_battle();
+    let view = s.battle.view(1.0).unwrap();
+    let asked = Rc::new(RefCell::new(Vec::new()));
+    let mut kit_slot = Some(ModelKit::new(Box::new(StandInModels), Some(Box::new(Counting::new(Rc::clone(&asked), vec![])))));
+    let mut slot = None;
+    assert!(scene_for(&mut slot, &mut kit_slot, &s, &view, 1.0, &[]).is_some());
+    assert_eq!(*asked.borrow(), ["ff7/cloud", "ff7/barret"], "the slots' models, not the looks the players have in the field");
 }
 
 #[test]
@@ -668,7 +679,7 @@ fn a_battle_that_cannot_be_replayed_here_is_drawn_flat() {
     assert!(scene_for(&mut slot, &mut kit_slot, &done, &ended, 2.0, &[]).is_none());
     // And a stale scene for another battle is dropped, not reused.
     let live = state_in_battle();
-    let mut other = Some(BattleScene::new(&start(1, None), Some(&engine(1, 1)), &[], &mut kit()).unwrap());
+    let mut other = Some(BattleScene::new(&start(1, None), Some(&engine(1, 1)), &mut kit()).unwrap());
     let mut wrong = BattleId(77);
     if let Some(scene) = other.as_mut() {
         scene.id = wrong;
@@ -695,7 +706,7 @@ fn a_model_source_is_asked_per_actor_in_the_engines_order_with_who_the_actor_is(
     }
     let asked = Rc::new(RefCell::new(Vec::new()));
     let mut kit = ModelKit::new(Box::new(Recorder(Rc::clone(&asked))), None);
-    let scene = BattleScene::new(&start(2, Some(formation())), Some(&engine(1, 2)), &[], &mut kit).unwrap();
+    let scene = BattleScene::new(&start(2, Some(formation())), Some(&engine(1, 2)), &mut kit).unwrap();
     assert_eq!(
         *asked.borrow(),
         ["party 0 char 0 mine true", "party 1 char 1 mine false", "enemy 2 id Some(3) Dummy A hp 200", "enemy 3 id Some(5) Dummy B hp 200"]
@@ -736,7 +747,7 @@ impl BattleModelSource for Armed {
 fn a_weapon_is_drawn_with_its_owners_placement_and_frame() {
     let engine = engine(1, 2);
     let mut kit = ModelKit::new(Box::new(Armed), None);
-    let scene = BattleScene::new(&start(2, Some(formation())), Some(&engine), &[], &mut kit).unwrap();
+    let scene = BattleScene::new(&start(2, Some(formation())), Some(&engine), &mut kit).unwrap();
     let frame = scene.frame(&view(&scene), false);
     // Two party members with a weapon each, then the two boxes.
     assert_eq!(frame.models.models.len(), 2 * 2 + 2);
@@ -756,7 +767,7 @@ fn a_location_model_replaces_the_stand_in_floor_and_is_placed_as_it_is() {
     let mut at_nine = formation();
     at_nine.location = 9;
     let mut kit = ModelKit::new(Box::new(Armed), None);
-    let scene = BattleScene::new(&start(2, Some(at_nine)), Some(&engine), &[], &mut kit).unwrap();
+    let scene = BattleScene::new(&start(2, Some(at_nine)), Some(&engine), &mut kit).unwrap();
     let view = view(&scene);
     let frame = scene.frame(&view, false);
     let location = frame.location.as_ref().expect("the formation's location has a model");
@@ -775,11 +786,11 @@ fn a_location_model_replaces_the_stand_in_floor_and_is_placed_as_it_is() {
     // A formation whose location the source has no model for keeps the stand-in floor.
     let mut elsewhere = formation();
     elsewhere.location = 3;
-    let scene = BattleScene::new(&start(2, Some(elsewhere)), Some(&engine), &[], &mut ModelKit::new(Box::new(Armed), None)).unwrap();
+    let scene = BattleScene::new(&start(2, Some(elsewhere)), Some(&engine), &mut ModelKit::new(Box::new(Armed), None)).unwrap();
     let frame = scene.frame(&scene.view(W, H), false);
     assert!(frame.location.is_none() && frame.stage.len() > 500, "the stand-in floor: {} vertices", frame.stage.len());
     // A scene without placement data has no location to ask for.
-    let scene = BattleScene::new(&start(2, None), Some(&engine), &[], &mut ModelKit::new(Box::new(Armed), None)).unwrap();
+    let scene = BattleScene::new(&start(2, None), Some(&engine), &mut ModelKit::new(Box::new(Armed), None)).unwrap();
     assert!(scene.frame(&scene.view(W, H), false).location.is_none());
 }
 
@@ -804,7 +815,7 @@ impl BattleModelSource for Slab {
 fn a_location_around_the_camera_is_cut_to_what_is_in_front_of_it_once_per_camera() {
     let engine = engine(1, 2);
     let mut kit = ModelKit::new(Box::new(Slab), None);
-    let scene = BattleScene::new(&start(2, Some(formation())), Some(&engine), &[], &mut kit).unwrap();
+    let scene = BattleScene::new(&start(2, Some(formation())), Some(&engine), &mut kit).unwrap();
     let view = view(&scene);
     let frame = scene.frame(&view, false);
     let location = frame.location.expect("a location");
@@ -847,7 +858,7 @@ fn head_anchors_are_over_each_head_party_first_then_enemies_in_the_engines_order
     // An enemy that has collapsed away has none; the others still do. Killed by the engine's own
     // events: the scene follows what happened.
     let (state, events, _, target) = killing_blow();
-    scene = BattleScene::new(&start(2, Some(formation())), Some(&engine_for_two()), &[], &mut kit()).unwrap();
+    scene = BattleScene::new(&start(2, Some(formation())), Some(&engine_for_two()), &mut kit()).unwrap();
     scene.update(1.0, &events, Some(&state));
     scene.update(30.0, &[], Some(&state));
     let Anchors { party, enemies } = scene.head_anchors(&scene.view(W, H));

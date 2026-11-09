@@ -22,13 +22,20 @@
 //!   fail, because the registered name is unusable without it. The token is a [`Secret`]: it is
 //!   never logged, and appears in text only in [`NetError::TokenNotSaved`], the one case where
 //!   showing it is the user's only way to keep the account.
+//! * The character (protocol v8): `Hello` also carries the character a registration asks for
+//!   ([`NewCharacter`]: colour, body choice, combat slot) and the `Welcome` says what the server holds
+//!   of the player's own ([`CharacterCard`]), which the handshake hands on cleaned and bounded
+//!   ([`keep_card`]) in [`Joined::character`].
 
 use crate::battle::BattleCmd;
 use crate::cli::exit;
 use crate::state::Intent;
 use fmv_adapter_api::{AreaRuntime, GameAdapter};
 use fmv_core::{AccountId, AreaId, EntityId, EntitySnapshot, Fingerprint, GameId, ProvenanceSummary, SessionId};
-use fmv_protocol::{read_msg, write_msg, Auth, ClientMsg, InviteId, ProtoError, RejectCode, Secret, ServerMsg, PROTOCOL_VERSION};
+use fmv_protocol::{
+    read_msg, write_msg, Auth, CharacterCard, ClientMsg, InviteId, NewCharacter, ProtoError, RejectCode, Secret, ServerMsg, MAX_CHARACTER_NAME_CHARS,
+    MAX_CHARACTER_REF_CHARS, PROTOCOL_VERSION,
+};
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -102,10 +109,10 @@ pub struct NetConfig {
     pub server: String,
     /// How to authenticate: the saved token, or the display name to register.
     pub auth: Auth,
-    /// The look requested for a NEW avatar (only used when `auth` is a registration; a login
-    /// takes the stored profile).
-    pub tint: [u8; 3],
-    pub appearance_ref: Option<String>,
+    /// The character requested for a NEW account (only used when `auth` is a registration; a login
+    /// takes the stored character, except that the colour of an account without an avatar comes from
+    /// here): its colour, body choice and combat slot (protocol v8).
+    pub character: NewCharacter,
     pub client_build: String,
     pub timing: SessionTiming,
     /// Stores the token a registration issues.
@@ -160,6 +167,9 @@ pub struct Joined {
     /// recognises itself in them).
     pub account: AccountId,
     pub server_build: String,
+    /// What the server says it holds of our own character (protocol v8), cleaned and bounded by
+    /// [`keep_card`]: the identity, how the game draws it and the combat slot it fights with.
+    pub character: CharacterCard,
     pub area_id: AreaId,
     pub area_name: String,
     pub fixture: bool,
@@ -284,6 +294,34 @@ fn clean_to(s: &str, max: usize) -> String {
 /// or a window title.
 pub fn clean(s: &str) -> String {
     clean_to(s, MAX_TEXT)
+}
+
+/// The text of a field of the server's [`CharacterCard`] as this client keeps it: cleaned like every
+/// text from the network ([`clean`]), at most `max` characters, trimmed; `None` when nothing is left.
+fn kept_text(text: &str, max: usize) -> Option<String> {
+    let cleaned = clean(text);
+    let bounded: String = cleaned.trim().chars().take(max).collect();
+    let bounded = bounded.trim_end();
+    (!bounded.is_empty()).then(|| bounded.to_string())
+}
+
+/// The name shown for a character whose card gave none that survives the cleaning.
+pub const UNKNOWN_CHARACTER_NAME: &str = "?";
+
+/// The card the server sent (`Welcome::character`) as this client keeps it. It is untrusted text: the
+/// name and the body and binding ids are cleaned ([`clean`]) and bounded (a name to
+/// [`MAX_CHARACTER_NAME_CHARS`] characters, an id to [`MAX_CHARACTER_REF_CHARS`]); a name with nothing
+/// left is `?` (a card always has one) and an id with nothing left is none. The colour, the slot and the
+/// flag are plain numbers and stay as they are.
+pub fn keep_card(card: CharacterCard) -> CharacterCard {
+    CharacterCard {
+        name: kept_text(&card.name, MAX_CHARACTER_NAME_CHARS).unwrap_or_else(|| UNKNOWN_CHARACTER_NAME.to_string()),
+        tint: card.tint,
+        body: card.body.as_deref().and_then(|b| kept_text(b, MAX_CHARACTER_REF_CHARS)),
+        binding: card.binding.as_deref().and_then(|b| kept_text(b, MAX_CHARACTER_REF_CHARS)),
+        slot: card.slot,
+        migrated: card.migrated,
+    }
 }
 
 /// A short description of a transport error that is safe to print. Decoding errors are NOT
@@ -425,6 +463,7 @@ struct Welcome {
     entity: EntityId,
     account: AccountId,
     server_build: String,
+    character: CharacterCard,
 }
 
 struct Offer {
@@ -457,8 +496,7 @@ where
         protocol_version: PROTOCOL_VERSION,
         client_build: cfg.client_build.clone(),
         auth: cfg.auth.clone(),
-        tint: cfg.tint,
-        appearance_ref: cfg.appearance_ref.clone(),
+        character: cfg.character.clone(),
     };
     send(wr, &hello, "sending Hello", deadline).await?;
 
@@ -496,6 +534,7 @@ where
                 entity,
                 account,
                 issued_token,
+                character,
             } => {
                 // FIRST, before any check that could fail: a registered name is unique and cannot
                 // be recovered without this token, which the server shows exactly once.
@@ -521,6 +560,7 @@ where
                     entity,
                     account,
                     server_build,
+                    character: keep_card(character),
                 });
             }
             ServerMsg::AreaManifest {
@@ -621,6 +661,7 @@ where
                 entity: w.entity,
                 account: w.account,
                 server_build: clean(&w.server_build),
+                character: w.character,
                 area_id: o.area,
                 area_name: clean(&o.display_name),
                 fixture: o.fixture,
@@ -893,8 +934,7 @@ mod tests {
         NetConfig {
             server: "unused".into(),
             auth: Auth::Register { display_name: "tester".into() },
-            tint: [1, 2, 3],
-            appearance_ref: None,
+            character: NewCharacter { tint: [1, 2, 3], body: Some("slim".into()), slot: Some(2) },
             client_build: "test".into(),
             timing: SessionTiming::DEFAULT,
             token_sink: TokenSink::new(|_| Ok(())),
@@ -965,7 +1005,23 @@ mod tests {
         welcome_with(None)
     }
 
+    /// The card the fake server tells its player: a new character with a placeholder body and a slot.
+    fn card() -> CharacterCard {
+        CharacterCard {
+            name: "tester".into(),
+            tint: [1, 2, 3],
+            body: Some("slim".into()),
+            binding: Some("ff7/body/slim".into()),
+            slot: Some(2),
+            migrated: false,
+        }
+    }
+
     fn welcome_with(issued_token: Option<&str>) -> ServerMsg {
+        welcome_card(issued_token, card())
+    }
+
+    fn welcome_card(issued_token: Option<&str>, character: CharacterCard) -> ServerMsg {
         ServerMsg::Welcome {
             protocol_version: PROTOCOL_VERSION,
             server_build: "srv".into(),
@@ -973,6 +1029,7 @@ mod tests {
             entity: EntityId(7),
             account: AccountId(42),
             issued_token: issued_token.map(Secret::new),
+            character,
         }
     }
 
@@ -1011,15 +1068,19 @@ mod tests {
             let ClientMsg::Hello {
                 protocol_version,
                 auth,
-                tint,
+                character,
                 ..
             } = hello
             else {
                 panic!("expected Hello")
             };
             assert_eq!(
-                (protocol_version, auth, tint),
-                (PROTOCOL_VERSION, Auth::Register { display_name: "tester".into() }, [1, 2, 3])
+                (protocol_version, auth, character),
+                (
+                    PROTOCOL_VERSION,
+                    Auth::Register { display_name: "tester".into() },
+                    NewCharacter { tint: [1, 2, 3], body: Some("slim".into()), slot: Some(2) }
+                )
             );
             // Unusual order: manifest first, welcome only after the client joined.
             write_msg(&mut swr, &manifest(&srv_adapter, |_| {})).await.unwrap();
@@ -1043,6 +1104,7 @@ mod tests {
         assert_eq!((joined.session, joined.entity), (SessionId(5), EntityId(7)));
         assert_eq!(joined.account, AccountId(42), "the Welcome's account is returned");
         assert_eq!(joined.server_build, "srv");
+        assert_eq!(joined.character, card(), "the Welcome's card is returned");
         assert!(joined.fixture);
         assert_eq!(joined.area_id.key, "plaza");
         assert_eq!(joined.entities.len(), 2);
@@ -1288,6 +1350,7 @@ mod tests {
                 entity: EntityId(1),
                 account: AccountId(1),
                 issued_token: None,
+                character: card(),
             },
         )
         .await
@@ -1610,10 +1673,10 @@ mod tests {
         let (mut crd, mut cwr) = split(client);
         let (_srd, mut swr) = split(server);
         let (sink, seen, _notify) = recording_sink(Ok(()));
-        let ServerMsg::Welcome { server_build, session, entity, account, issued_token, .. } = welcome_with(Some("fmvt_v99")) else {
+        let ServerMsg::Welcome { server_build, session, entity, account, issued_token, character, .. } = welcome_with(Some("fmvt_v99")) else {
             panic!("a Welcome")
         };
-        let wrong = ServerMsg::Welcome { protocol_version: 99, server_build, session, entity, account, issued_token };
+        let wrong = ServerMsg::Welcome { protocol_version: 99, server_build, session, entity, account, issued_token, character };
         write_msg(&mut swr, &wrong).await.unwrap();
         let err = handshake(&mut crd, &mut cwr, &cfg_with(sink), &adapter, Duration::from_secs(5)).await.err().unwrap();
         assert!(matches!(&err, NetError::Protocol(m) if m.contains("v99")), "{err}");
@@ -1688,7 +1751,8 @@ mod tests {
         assert!(!format!("{err:?}").contains("fmvt_unsaved_secret"), "{err:?}");
     }
 
-    /// `Hello` carries the authentication exactly as configured, tint and appearance included.
+    /// `Hello` carries the authentication exactly as configured, and the character asked for (colour, body
+    /// choice, combat slot) with it.
     #[tokio::test]
     async fn hello_carries_the_configured_auth() {
         let adapter = FixtureAdapter::new();
@@ -1703,20 +1767,91 @@ mod tests {
             });
             let mut config = cfg();
             config.auth = auth.clone();
-            config.appearance_ref = Some("cloud_model".into());
+            config.character = NewCharacter { tint: [9, 8, 7], body: Some("tall".into()), slot: Some(8) };
             config.client_build = "fmv-client/test".into();
             let err = handshake(&mut crd, &mut cwr, &config, &adapter, Duration::from_secs(5)).await.err().unwrap();
             assert!(matches!(err, NetError::Rejected { code: RejectCode::ShuttingDown, .. }));
             match server_task.await.unwrap() {
-                ClientMsg::Hello { protocol_version, client_build, auth: sent, tint, appearance_ref } => {
+                ClientMsg::Hello { protocol_version, client_build, auth: sent, character } => {
                     assert_eq!(protocol_version, PROTOCOL_VERSION);
                     assert_eq!(client_build, "fmv-client/test");
                     assert_eq!(sent, auth);
-                    assert_eq!((tint, appearance_ref.as_deref()), ([1, 2, 3], Some("cloud_model")));
+                    assert_eq!(character, NewCharacter { tint: [9, 8, 7], body: Some("tall".into()), slot: Some(8) });
                 }
                 other => panic!("expected Hello, got {other:?}"),
             }
         }
+    }
+
+    /// The `Hello` on the wire is the v8 shape (a `character` with the colour, the body and the slot), and a
+    /// `Hello` of an older version can no longer be decoded as a message at all: only its version can be read,
+    /// which is how a server refuses it as a mismatch and not as garbage.
+    #[test]
+    fn the_hello_on_the_wire_is_the_v8_shape_and_an_older_one_only_gives_its_version() {
+        let hello = ClientMsg::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            client_build: "c/1".into(),
+            auth: Auth::Register { display_name: "Wedge".into() },
+            character: NewCharacter { tint: [1, 2, 3], body: Some("slim".into()), slot: Some(2) },
+        };
+        let frame = fmv_protocol::encode(&hello).unwrap();
+        let json = std::str::from_utf8(&frame[4..]).unwrap();
+        assert!(json.contains(r#""character":{"tint":[1,2,3],"body":"slim","slot":2}"#), "{json}");
+        assert!(!json.contains("appearance_ref"), "{json}");
+        assert_eq!(fmv_protocol::probe_hello_version(&frame[4..]), Some(PROTOCOL_VERSION));
+        let v7 = br#"{"Hello":{"protocol_version":7,"client_build":"c","auth":{"Token":"x"},"tint":[0,0,0],"appearance_ref":null}}"#;
+        assert!(fmv_protocol::decode::<ClientMsg>(v7).is_err(), "a v7 Hello has no character: it is not a v8 message");
+        assert_eq!(fmv_protocol::probe_hello_version(v7), Some(7));
+    }
+
+    /// What the server says of our own character is untrusted text: control characters and deceptive marks go,
+    /// a name and an id are bounded, a name with nothing left is `?` and an id with nothing left is none, and the
+    /// numbers are untouched.
+    #[test]
+    fn the_card_is_cleaned_and_bounded_like_every_text_from_the_network() {
+        let hostile = CharacterCard {
+            name: format!("  Bl\u{1b}[31mizz\u{202e}\n{}  ", "x".repeat(100)),
+            tint: [10, 20, 30],
+            body: Some(format!("slim\u{7}\u{200b}{}", "y".repeat(200))),
+            binding: Some("\u{1b}\n  ".into()),
+            slot: Some(255),
+            migrated: true,
+        };
+        let kept = keep_card(hostile);
+        assert!(kept.name.starts_with("Bl[31mizz") && kept.name.chars().count() == MAX_CHARACTER_NAME_CHARS, "{:?}", kept.name);
+        assert!(!kept.name.chars().any(|c| c.is_control() || is_deceptive(c)), "{:?}", kept.name);
+        let body = kept.body.expect("what is left of the body id");
+        assert!(body.starts_with("slim") && body.chars().count() == MAX_CHARACTER_REF_CHARS, "{body:?}");
+        assert!(!body.chars().any(|c| c.is_control() || is_deceptive(c)), "{body:?}");
+        assert_eq!(kept.binding, None, "nothing printable is no binding");
+        assert_eq!((kept.tint, kept.slot, kept.migrated), ([10, 20, 30], Some(255), true));
+        // A blank name is the neutral one; a good card is kept as it is.
+        assert_eq!(keep_card(CharacterCard::plain(" \u{1b} ", [0, 0, 0])).name, UNKNOWN_CHARACTER_NAME);
+        assert_eq!(keep_card(card()), card());
+        let wide = CharacterCard::plain("\u{4e2d}".repeat(40), [0, 0, 0]);
+        assert_eq!(keep_card(wide).name.chars().count(), MAX_CHARACTER_NAME_CHARS, "bounded in characters, not bytes");
+    }
+
+    /// The card reaches the game cleaned: what a hostile server put in it never gets to the screen or the log.
+    #[tokio::test]
+    async fn the_joined_card_is_the_cleaned_card() {
+        let adapter = FixtureAdapter::new();
+        let (client, server) = duplex(64 * 1024);
+        let (mut crd, mut cwr) = split(client);
+        let (mut srd, mut swr) = split(server);
+        let srv_adapter = FixtureAdapter::new();
+        let server_task = tokio::spawn(async move {
+            let _hello: ClientMsg = read_msg(&mut srd).await.unwrap();
+            let hostile = CharacterCard { name: "Wedge\u{1b}]0;PWNED\u{7}".into(), body: Some("slim".into()), ..card() };
+            write_msg(&mut swr, &welcome_card(None, hostile)).await.unwrap();
+            write_msg(&mut swr, &manifest(&srv_adapter, |_| {})).await.unwrap();
+            let _join: ClientMsg = read_msg(&mut srd).await.unwrap();
+            write_msg(&mut swr, &area_snapshot(&srv_adapter, vec![snap(7, 0.0)])).await.unwrap();
+        });
+        let joined = handshake(&mut crd, &mut cwr, &cfg(), &adapter, Duration::from_secs(5)).await.unwrap();
+        server_task.await.unwrap();
+        assert_eq!(joined.character.name, "Wedge]0;PWNED", "the escape and the bell are gone");
+        assert_eq!((joined.character.slot, joined.character.body.as_deref()), (Some(2), Some("slim")));
     }
 
     /// The fixture's catalog with another language and the `modded` flag: both are part of the

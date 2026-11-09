@@ -80,7 +80,9 @@ impl Status {
 pub struct Bar {
     /// Who it is in the battle (what events and commands call it).
     pub actor: ActorId,
-    /// The fighter's name from this machine's own data.
+    /// The fighter's name: a party member is called by its player's own name (the roster's, protocol v8: the
+    /// canon character whose combat template it fights with is never named), an enemy by the name this
+    /// machine's own data gives it.
     pub name: String,
     pub hp: u32,
     pub max_hp: u32,

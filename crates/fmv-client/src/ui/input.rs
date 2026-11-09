@@ -336,7 +336,11 @@ mod tests {
         assert_eq!(pad(&mut m, PadKey::Down), None);
         assert_eq!(pad(&mut m, PadKey::Right), None);
         match m.screen() {
-            Screen::Create(f) => assert_eq!((f.focus, f.appearance), (crate::ui::menu::Field::Look, 1), "down to Look, right picks the next look"),
+            Screen::Create(f) => {
+                let default = crate::ui::menu::body_options(GameId::Ff7).iter().position(|o| o.id == fmv_ff7::playable::DEFAULT_BODY).unwrap_or(0);
+                let next = (default + 1) % crate::ui::menu::body_options(GameId::Ff7).len();
+                assert_eq!((f.focus, f.body), (crate::ui::menu::Field::Body, next), "down to the body, right picks the next one")
+            }
             other => panic!("{other:?}"),
         }
         assert_eq!(pad(&mut m, PadKey::Confirm), None, "no name yet: refused with a notice, nothing is sent");

@@ -11,6 +11,12 @@
 //! * [`BattleClient`] is the mirror of the whole battle situation (no active battle, or one), fed
 //!   by the four battle messages ([`BattleClient::on_message`]); it counts battles entered,
 //!   victories, defeats, divergences and refusals, and says what happened as one-line notes.
+//! * Names (protocol v8): a party member is called by its PLAYER'S OWN name, the roster's
+//!   `BattleMember::name` ([`ActiveBattle::roster_name`], cleaned for the UI font by `names::clean_name`), in the
+//!   party panel, the HP list, the target pointer list, the banners and popups, the 3D scene's labels, the
+//!   window title and the log; the engine's `Combatant::name` of a party member is the canon character whose
+//!   combat template it fights with (its SLOT), and is never shown. Enemies keep the names of the engine. At
+//!   the start of every battle one `roster` note per member says who fights in which slot.
 //! * [`BattleView`] is what the screen shows, as plain data: the fighters ([`Bar`]), the replay's
 //!   standing, and the live parts of the battle UI (the command menu of our turn, the floating
 //!   numbers, the action banner, the victory or defeat panel). [`draw_battle_overlay`] draws all of
@@ -94,16 +100,18 @@ pub use text::draw_battle_overlay;
 #[allow(unused_imports)]
 pub use view::{flat_anchors, Anchors};
 
+use crate::headless::encode_name;
+use crate::progress::slot_name;
 use fmv_core::{AccountId, Fingerprint};
 use fmv_ff7_battle::rules::{BattleState, Combatant, GAUGE_MAX};
 use fmv_protocol::battle::{BattleEvent, Command, Outcome};
 use fmv_protocol::{
     ActorId, AppliedCommand, BattleId, BattleMember, BattleRejection, BattleReplay, BattleReward, BattleRules, BattleSetup, ClientMsg,
-    InventoryEntry, ServerMsg, MAX_INVENTORY_STACKS,
+    InventoryEntry, ServerMsg, MAX_CHARACTER_NAME_CHARS, MAX_INVENTORY_STACKS,
 };
 use hud::BattleHud;
 use menu::{Choice, Reply};
-use names::{item_name, limit_name, spell_name};
+use names::{clean_name, item_name, limit_name, spell_name};
 use panels::{RewardItem, RewardLine};
 use std::collections::VecDeque;
 use std::sync::{Arc, OnceLock};
@@ -257,6 +265,29 @@ fn item_list(items: &[InventoryEntry]) -> String {
     items.iter().map(|e| format!("{}:{}", e.item, e.count)).collect::<Vec<_>>().join(",")
 }
 
+/// What the UI calls party member `index`: the player's OWN name from the roster (protocol v8), made drawable
+/// ([`clean_name`]: printable ASCII, a `?` for what the font lacks), or `Player N` for a name with nothing left.
+/// Never the name of the canon character whose combat template the member fights with.
+fn roster_display_name(raw: &str, index: usize) -> String {
+    let name = clean_name(raw);
+    if name.is_empty() {
+        format!("Player {}", index + 1)
+    } else {
+        name
+    }
+}
+
+/// The note that says who fights as party member `index` of a battle that starts:
+/// `roster actor=<i> name=<name> slot=<n> slot_name=<name> level=<n>`. The names are percent-encoded like the names of
+/// the SMOKE line ([`encode_name`]; `-` for none), the player's own as the roster says it (bounded to the length
+/// a name has) and the slot's from this client's own table of characters.
+fn roster_note(index: usize, member: &BattleMember) -> String {
+    let own: String = member.name.chars().take(MAX_CHARACTER_NAME_CHARS).collect();
+    let name = if own.is_empty() { "-".to_string() } else { encode_name(&own) };
+    let slot_name = slot_name(member.character).map_or_else(|| "-".to_string(), encode_name);
+    format!("roster actor={index} name={name} slot={} slot_name={slot_name} level={}", member.character, member.level)
+}
+
 /// One battle this client is in.
 #[derive(Debug)]
 pub struct ActiveBattle {
@@ -284,6 +315,15 @@ pub struct ActiveBattle {
 impl ActiveBattle {
     pub fn id(&self) -> BattleId {
         self.id
+    }
+
+    /// What the screen and the log call `actor`: the PLAYER'S OWN name from the roster (`BattleMember::name`,
+    /// cleaned for the UI font), never the canon character's name from the engine's `Combatant::name`. `None`
+    /// for an actor that is not in the roster (an enemy, which keeps its engine name). Every place that shows
+    /// a party member's name goes through here.
+    pub fn roster_name(&self, actor: ActorId) -> Option<String> {
+        let index = usize::from(actor.0);
+        self.party.get(index).map(|member| roster_display_name(&member.name, index))
     }
 
     /// The replayed engine, if this client could build it.
@@ -635,6 +675,10 @@ impl BattleClient {
             setup.ticks_per_second,
             setup.seed
         ));
+        // Who fights, as the server's roster says it: each player's own name and the combat slot it fights in.
+        for (index, member) in setup.party.iter().enumerate() {
+            self.note(roster_note(index, member));
+        }
         self.active = Some(ActiveBattle {
             id: battle_id,
             formation_id: setup.formation_id,
@@ -975,7 +1019,8 @@ impl BattleClient {
             };
             Some(Bar {
                 actor: id,
-                name: c.name.clone(),
+                // A party member is its player's own name, an enemy the engine's.
+                name: active.roster_name(id).unwrap_or_else(|| c.name.clone()),
                 hp: c.hp,
                 max_hp: c.max_hp,
                 mp: c.mp,

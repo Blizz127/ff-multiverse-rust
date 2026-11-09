@@ -16,8 +16,8 @@ use fmv_adapter_api::{GameAdapter, MoveResult};
 use fmv_core::{AccountId, AnimState, AreaId, AvatarAppearance, EntityId, EntitySnapshot, GameId, PhaseKey, Pos, SessionId};
 use fmv_fixture::FixtureAdapter;
 use fmv_protocol::{
-    read_msg, write_msg, Auth, ClientMsg, InstanceKey, InviteId, Party, PartyEvent, PartyFailure, PartyId, PartyName, Placement,
-    RejectCode, Secret, ServerMsg, PROTOCOL_VERSION,
+    read_msg, write_msg, Auth, CharacterCard, ClientMsg, InstanceKey, InviteId, NewCharacter, NpcSnapshot, Party, PartyEvent, PartyFailure,
+    PartyId, PartyName, Placement, RejectCode, Secret, ServerMsg, PROTOCOL_VERSION,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -73,11 +73,17 @@ struct Script {
     /// If set, the Welcome waits until every holder of this barrier reached it (so two
     /// connections answer at the same instant and the clients really race).
     rendezvous: Option<Arc<Barrier>>,
+    /// Announce one non-player character in the area's snapshot (the canon Barret, with his skeleton).
+    npc: bool,
 }
 
 impl Script {
     fn new(kind: Kind) -> Self {
-        Script { kind, party: PartyPlay::Nothing, rendezvous: None }
+        Script { kind, party: PartyPlay::Nothing, rendezvous: None, npc: false }
+    }
+    fn npc(mut self) -> Self {
+        self.npc = true;
+        self
     }
     fn happy() -> Self {
         Script::new(Kind::Happy)
@@ -150,9 +156,18 @@ fn avatar(name: &str) -> AvatarAppearance {
     AvatarAppearance { display_name: name.into(), tint: [200, 100, 50], appearance_ref: None }
 }
 
+/// How the fake draws the other players (entities 8 and up): a placeholder body of FF7's, as the real server
+/// binds a new character, so that a client that prints each peer's binding has one to print. (The FIXTURE area
+/// shows markers: nothing here draws the model.)
+const PEER_BINDING: &str = "ff7/body/slim";
+
 fn entity(id: u64, name: &str, x: f32, y: f32) -> EntitySnapshot {
-    EntitySnapshot { id: EntityId(id), pos: Pos::new(x, y, 0.0), facing: 0.0, anim: AnimState::Walk, avatar: avatar(name) }
+    let avatar = AvatarAppearance { appearance_ref: (id >= 8).then(|| PEER_BINDING.to_string()), ..avatar(name) };
+    EntitySnapshot { id: EntityId(id), pos: Pos::new(x, y, 0.0), facing: 0.0, anim: AnimState::Walk, avatar }
 }
+
+/// What a real server says to a registration that asks for a combat slot no new character may take.
+const SLOT_REFUSAL: &str = "that combat slot is not available to a new character (the protagonist's slot stays his); choose another party member";
 
 /// The peer account of the party scripts (entity 8). Distinct from every issued account id.
 const PEER: AccountId = AccountId(900);
@@ -215,14 +230,20 @@ async fn handle(stream: TcpStream, script: Script, db: Arc<Mutex<Accounts>>) -> 
 
     let info = FixtureAdapter::new().list_areas().remove(0);
     let Some((at, hello)) = rx.recv().await else { return report };
-    let auth = match &hello {
-        ClientMsg::Hello { auth, .. } => auth.clone(),
+    let (auth, requested) = match &hello {
+        ClientMsg::Hello { auth, character, .. } => (auth.clone(), character.clone()),
         other => panic!("the first message must be Hello, got {other:?}"),
     };
     report.push(at, hello);
 
     if script.kind == Kind::Reject {
         let _ = write_msg(&mut wr, &ServerMsg::reject(RejectCode::ServerFull, "server full")).await;
+        return report;
+    }
+    // Like the real server: a registration is refused (BadRequest, no account made) when it asks for a combat slot
+    // the game does not offer to a new character: Cloud's, 0, or one that is nobody's.
+    if matches!(auth, Auth::Register { .. }) && matches!(requested.slot, Some(slot) if !(1..=8).contains(&slot)) {
+        let _ = write_msg(&mut wr, &ServerMsg::reject(RejectCode::BadRequest, SLOT_REFUSAL)).await;
         return report;
     }
     let (account, name, issued) = match authenticate(&db, &auth) {
@@ -244,6 +265,16 @@ async fn handle(stream: TcpStream, script: Script, db: Arc<Mutex<Accounts>>) -> 
             entity: EntityId(7),
             account,
             issued_token: issued,
+            // The character the server holds, from what the registration asked for: its body is bound to FF7's
+            // model of that name, its slot is the one asked for.
+            character: CharacterCard {
+                name: name.clone(),
+                tint: requested.tint,
+                binding: requested.body.as_ref().map(|body| format!("ff7/body/{body}")),
+                body: requested.body.clone(),
+                slot: requested.slot,
+                migrated: false,
+            },
         },
     )
     .await
@@ -281,7 +312,23 @@ async fn handle(stream: TcpStream, script: Script, db: Arc<Mutex<Accounts>>) -> 
     // The player's entity carries the name the SERVER stored for the account.
     write_msg(
         &mut wr,
-        &ServerMsg::AreaSnapshot { area: area.clone(), tick: 1, entities: vec![entity(7, &name, -100.0, 0.0), entity(8, "peer", 100.0, 0.0)], npcs: vec![] },
+        &ServerMsg::AreaSnapshot {
+            area: area.clone(),
+            tick: 1,
+            entities: vec![entity(7, &name, -100.0, 0.0), entity(8, "peer", 100.0, 0.0)],
+            npcs: if script.npc {
+                vec![NpcSnapshot {
+                    id: 0,
+                    name: "Barret".into(),
+                    model: "acgd".into(),
+                    idle_animation: Some("adcb".into()),
+                    pos: Pos::new(0.0, 200.0, 0.0),
+                    facing: 0.5,
+                }]
+            } else {
+                vec![]
+            },
+        },
     )
     .await
     .unwrap();
@@ -575,10 +622,16 @@ fn as_strs(v: &[String]) -> Vec<&str> {
 
 /// The `Hello` (the first message) of a report: its authentication and tint.
 fn hello_of(report: &Report) -> (Auth, [u8; 3]) {
+    let (auth, character) = hello_full(report);
+    (auth, character.tint)
+}
+
+/// The `Hello` of a report: its authentication and the whole character it asks for.
+fn hello_full(report: &Report) -> (Auth, NewCharacter) {
     match &report.received[0] {
-        ClientMsg::Hello { protocol_version, auth, tint, .. } => {
+        ClientMsg::Hello { protocol_version, auth, character, .. } => {
             assert_eq!(*protocol_version, PROTOCOL_VERSION);
-            (auth.clone(), *tint)
+            (auth.clone(), character.clone())
         }
         other => panic!("first message must be Hello, got {other:?}"),
     }
@@ -1166,5 +1219,101 @@ fn failures_exit_with_distinct_codes_and_clear_messages() {
     ] {
         let out = run_client(args, &[]);
         assert_eq!(out.status.code(), Some(2), "usage error for {args:?}");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The player's own character (protocol v8)
+// ---------------------------------------------------------------------------------------------
+
+/// A registration carries the colour, the body and the combat slot the command line asks for; the run says on
+/// stderr, once after joining, what the server holds of the character (its card); and every other player is
+/// reported with its colour and binding when it appears, and not again.
+#[test]
+fn a_registration_carries_the_body_and_the_slot_and_the_run_says_who_it_is_and_who_it_sees() {
+    let (port, server) = spawn_fake_server(Script::happy().npc());
+    let args = headless_args(port, Some("Wedge"), &["--duration", "1.5", "--tint", "c80a0a", "--body", "slim", "--slot", "Red XIII"]);
+    let out = Sandbox::new().run(&as_strs(&args));
+    let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+    assert!(out.status.success(), "status {:?}\nstdout: {stdout}\nstderr: {stderr}", out.status);
+    // stdout is still exactly the SMOKE line, with the keys it always had.
+    assert_eq!(assert_smoke_contract(&stdout)["name"], "Wedge");
+
+    let report = server.join().unwrap();
+    let (auth, character) = hello_full(&report);
+    assert_eq!(auth, Auth::Register { display_name: "Wedge".into() });
+    assert_eq!(character, NewCharacter { tint: [0xc8, 0x0a, 0x0a], body: Some("slim".into()), slot: Some(4) }, "slot 4 is Red XIII's");
+
+    // What the server holds, once: the Welcome's card, every network value percent-encoded.
+    assert_eq!(stderr.matches("character: ").count(), 1, "{stderr}");
+    assert!(
+        stderr.contains("character: name=Wedge tint=c80a0a body=slim binding=ff7%2Fbody%2Fslim slot=4 slot_name=Red%20XIII migrated=false"),
+        "{stderr}"
+    );
+    // The other players, each once and with the binding the server shows (a placeholder body: not a canon model).
+    for (entity, name) in [(8, "peer"), (9, "late")] {
+        let line = format!("headless: peer entity={entity} name={name} tint=c86432 binding=ff7%2Fbody%2Fslim area=Fixture/plaza");
+        assert_eq!(stderr.matches(&line).count(), 1, "{line}\n{stderr}");
+    }
+    assert_eq!(stderr.matches("headless: peer entity=").count(), 2, "never every frame: {stderr}");
+    // The area's non-player characters, once: the summary and one line each (the canon Barret stays in the field
+    // whoever holds his slot: here the player holds Red XIII's).
+    assert_eq!(stderr.matches("headless: 1 NPC(s) in Fixture/plaza: Barret").count(), 1, "{stderr}");
+    assert_eq!(stderr.matches("headless: npc area=Fixture/plaza id=0 name=Barret model=acgd").count(), 1, "{stderr}");
+}
+
+/// Without `--body` and `--slot` a registration asks for neither (the server's defaults), and the card says what
+/// the server holds either way.
+#[test]
+fn without_a_body_or_a_slot_the_registration_asks_for_neither() {
+    let (port, server) = spawn_fake_server(Script::happy());
+    let args = headless_args(port, Some("botA"), &["--duration", "1", "--tint", "336699"]);
+    let out = Sandbox::new().run(&as_strs(&args));
+    let stderr = text(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    let report = server.join().unwrap();
+    assert_eq!(hello_full(&report).1, NewCharacter { tint: [0x33, 0x66, 0x99], body: None, slot: None });
+    assert!(stderr.contains("character: name=botA tint=336699 body=- binding=- slot=- slot_name=- migrated=false"), "{stderr}");
+}
+
+/// A registration the server refuses for its slot (Cloud's, 0, is never offered to a new character) is shown as
+/// the refusal it is: the run exits 1 with the server's own sentence, creates no account and saves no token.
+#[test]
+fn a_combat_slot_the_server_refuses_ends_the_run_with_its_sentence_and_makes_no_account() {
+    for slot in ["0", "9", "255"] {
+        let (port, server) = spawn_fake_server(Script::happy());
+        let sandbox = Sandbox::new();
+        let args = headless_args(port, Some("Wedge"), &["--slot", slot]);
+        let out = sandbox.run(&as_strs(&args));
+        let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+        assert_eq!(out.status.code(), Some(1), "--slot {slot}\nstdout: {stdout}\nstderr: {stderr}");
+        assert!(stdout.is_empty(), "no SMOKE line for a run that never joined: {stdout:?}");
+        assert!(stderr.contains("server rejected the connection") && stderr.contains(SLOT_REFUSAL), "the server's sentence, as it said it: {stderr}");
+        assert!(!stderr.contains("character: "), "nothing was joined: {stderr}");
+        assert!(sandbox.account_files().is_empty(), "no account, so no token: {:?}", sandbox.account_files());
+        let report = server.join().unwrap();
+        assert_eq!(report.received.len(), 1, "nothing but the Hello was sent");
+        assert_eq!(hello_full(&report).1.slot, slot.parse::<u8>().ok());
+    }
+}
+
+/// `--body` and `--slot` are checked before anything runs: a usage error (exit code 2) that says what is expected.
+#[test]
+fn a_bad_body_or_slot_is_a_usage_error_before_anything_runs() {
+    for (args, says) in [
+        (&["--body", "has space"][..], "body id"),
+        (&["--body", "../etc"][..], "body id"),
+        (&["--body", ""][..], "body id"),
+        (&["--slot", "9999"][..], "out of range"),
+        (&["--slot", "1.5"][..], "not a combat slot"),
+        (&["--slot", "sephiroth"][..], "not a combat slot"),
+        (&["--slot", "cloud"][..], "never offered"),
+    ] {
+        let mut full = vec!["--server", "127.0.0.1:1", "--name", "x", "--headless"];
+        full.extend_from_slice(args);
+        let out = Sandbox::new().run(&full);
+        let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {stderr}");
+        assert!(stdout.is_empty() && stderr.contains(says) && !stderr.contains("connecting"), "{args:?}: {stderr}");
     }
 }

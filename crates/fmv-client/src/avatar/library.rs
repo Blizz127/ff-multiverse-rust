@@ -1,13 +1,16 @@
 //! The characters this window can draw: each appearance is loaded once, merged into a drawable
 //! mesh and kept.
 //!
-//! An avatar names its look by an `appearance_ref` (`ff7/tifa`) that comes from the network, so it
-//! is untrusted text: it is only ever *looked up* in the table of playable characters
-//! ([`fmv_ff7::resolve_appearance`]); what is cached is keyed by the table's own id, never by the
-//! raw string, so no stream of odd refs can grow the cache beyond the table's size. An avatar
-//! without an appearance, or with one the table does not know, is drawn as the default character
+//! An avatar names how the game draws it by an `appearance_ref` (its binding: `ff7/body/sturdy` for a
+//! new character's generic placeholder body, `ff7/tifa` for the canon look of an account that predates
+//! protocol v8) that comes from the network, so it is untrusted text: it is only ever *looked up* in the
+//! table of playable models, the canon characters AND the placeholder bodies
+//! ([`fmv_ff7::playable::resolve_model`]); what is cached is keyed by the table's own id, never by the raw
+//! string, so no stream of odd refs can grow the cache beyond the two tables' size. An avatar without an
+//! appearance, or with one the tables do not know, is drawn as the default character
 //! ([`fmv_ff7::DEFAULT_APPEARANCE`]) and flagged as a stand-in, which the renderer marks with the
-//! player's tint so such players can still be told apart.
+//! player's tint so such players can still be told apart. A placeholder body is told from a canon model by
+//! [`is_placeholder_body`]: the renderer tints a body with its player's colour and leaves a canon model its own.
 //!
 //! A character that fails to load (a damaged archive) is remembered as failed and reported once, so
 //! the frame loop never retries it: those players are drawn as markers.
@@ -15,7 +18,7 @@
 use super::mesh::MergedMesh;
 use super::source::CharacterLoader;
 use fmv_ff7::model::mat4_identity;
-use fmv_ff7::playable::{resolve_appearance, Character, PlayableModel};
+use fmv_ff7::playable::{resolve_model, Character, PlayableModel, PLACEHOLDER_BODIES, PLAYABLE_FIELD_MODELS};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -91,12 +94,21 @@ enum Slot {
 /// What identifies a loaded non-player model: its skeleton stem and standing clip, lower case.
 type NpcKey = (String, String);
 
+/// Most placeholder bodies the players can wear at once (the table of bodies holds up to this many: a test
+/// fails when it grows past it, so the cache arithmetic below is never silently wrong).
+pub const MAX_BODY_MODELS: usize = 4;
+
+/// Most player models a window holds: every canon character ([`PLAYABLE_FIELD_MODELS`]) and every placeholder
+/// body ([`MAX_BODY_MODELS`]). The player table is bounded by this whatever the network says.
+pub const MAX_PLAYER_MODELS: usize = PLAYABLE_FIELD_MODELS.len() + MAX_BODY_MODELS;
+
 /// Most distinct non-player models the library holds at once, loaded or failed. The references
 /// come from the server, which can name a new model in every area, so the cache is bounded; the
-/// GPU keeps at most 32 characters (`gpu::MAX_GPU_MODELS`), which is why this leaves room under
-/// that for the eight playable ones. Beyond it a model is not loaded (its NPCs are markers) until
+/// GPU keeps at most 32 characters ([`super::gpu::MAX_GPU_MODELS`]), which is why this is what is left of
+/// them once the players have theirs: [`MAX_PLAYER_MODELS`] (the 8 canon characters and up to 4 placeholder
+/// bodies), so 32 - 12 = 20. Beyond it a model is not loaded (its NPCs are markers) until
 /// [`AvatarLibrary::keep_npcs`] has dropped those of the area that was left.
-pub const MAX_NPC_MODELS: usize = 24;
+pub const MAX_NPC_MODELS: usize = super::gpu::MAX_GPU_MODELS - MAX_PLAYER_MODELS;
 
 /// A model or clip reference worth looking up: a stem of the archive's entry names (letters,
 /// digits and underscores) within the length the protocol allows. Anything else cannot name an
@@ -126,9 +138,10 @@ impl AvatarLibrary {
         Self { loader, slots: HashMap::new(), npc_slots: HashMap::new(), npc_cap_reported: false }
     }
 
-    /// The table entry `appearance_ref` means, and whether the default had to stand in.
+    /// The table entry `appearance_ref` means (a canon character's model or a placeholder body's), and
+    /// whether the default had to stand in.
     pub fn resolve(appearance_ref: Option<&str>) -> (PlayableModel, bool) {
-        match appearance_ref.filter(|r| r.len() <= MAX_APPEARANCE_REF).and_then(resolve_appearance) {
+        match appearance_ref.filter(|r| r.len() <= MAX_APPEARANCE_REF).and_then(resolve_model) {
             Some(model) => (model, false),
             None => (fmv_ff7::playable::resolve_appearance_or_default(None), true),
         }
@@ -213,6 +226,12 @@ impl AvatarLibrary {
     pub fn cached_npcs(&self) -> usize {
         self.npc_slots.len()
     }
+}
+
+/// Is `model` one of the generic placeholder bodies a new character is drawn with (a model of
+/// [`PLACEHOLDER_BODIES`]), as opposed to a canon character's? Only a body is tinted with its player's colour.
+pub fn is_placeholder_body(model: &PlayableModel) -> bool {
+    PLACEHOLDER_BODIES.iter().any(|body| body.model.appearance_ref == model.appearance_ref)
 }
 
 /// The default appearance's id.
@@ -363,9 +382,76 @@ pub(crate) mod tests {
             lib.get(Some(model.appearance_ref));
         }
         assert_eq!(lib.cached(), fmv_ff7::playable_field_models().len());
+        // The placeholder bodies are in the table too, and only they: an id that merely looks like one is unknown.
+        for body in PLACEHOLDER_BODIES {
+            lib.get(Some(body.model.appearance_ref));
+        }
+        assert_eq!(lib.cached(), PLAYABLE_FIELD_MODELS.len() + PLACEHOLDER_BODIES.len());
+        for i in 0..200 {
+            lib.get(Some(&format!("ff7/body/{i}")));
+            lib.get(Some(&format!("ff7/body/{}{i}", PLACEHOLDER_BODIES[0].archetype)));
+        }
+        assert_eq!(lib.cached(), PLAYABLE_FIELD_MODELS.len() + PLACEHOLDER_BODIES.len(), "unknown bodies share the default's entry");
         // An over-long ref is unknown even if it starts like a real one.
         let long = format!("ff7/tifa{}", " ".repeat(MAX_APPEARANCE_REF));
         assert!(lib.get(Some(&long)).stand_in);
+    }
+
+    /// A placeholder body is an appearance like a canon character: found by the table's own id (any spelling),
+    /// loaded once, never a stand-in. Its archetype id is the identity's body choice, not its binding: the
+    /// binding is what the entity carries.
+    #[test]
+    fn a_placeholder_body_is_an_appearance_and_not_a_stand_in() {
+        let (mut lib, asked) = library(vec![]);
+        let body = PLACEHOLDER_BODIES[0];
+        let got = lib.get(Some(body.model.appearance_ref));
+        assert_eq!((got.id, got.stand_in), (body.model.appearance_ref, false));
+        assert!(got.asset.is_some());
+        let loud = lib.get(Some(&format!("  {}  ", body.model.appearance_ref.to_uppercase())));
+        assert!(Arc::ptr_eq(got.asset.as_ref().unwrap(), loud.asset.as_ref().unwrap()), "one asset whatever the spelling");
+        assert_eq!(*asked.borrow(), [body.model.appearance_ref], "loaded once");
+        assert_eq!(lib.get(Some(body.archetype)).id, default_id(), "the archetype is not a binding");
+        assert!(lib.get(Some(body.archetype)).stand_in);
+        // Every body of the table resolves to itself, and to a model that is not a canon character's.
+        for body in PLACEHOLDER_BODIES {
+            let (model, stand_in) = AvatarLibrary::resolve(Some(body.model.appearance_ref));
+            assert_eq!((model, stand_in), (body.model, false), "{}", body.archetype);
+            assert!(fmv_ff7::playable::resolve_appearance(body.model.appearance_ref).is_none(), "{} is not a canon id", body.archetype);
+        }
+    }
+
+    #[test]
+    fn only_the_placeholder_bodies_are_bodies() {
+        for body in PLACEHOLDER_BODIES {
+            assert!(is_placeholder_body(&body.model), "{}", body.archetype);
+        }
+        for canon in PLAYABLE_FIELD_MODELS {
+            assert!(!is_placeholder_body(canon), "{}", canon.appearance_ref);
+        }
+        // Neither a non-player model nor the default character that stands in for an unknown look.
+        assert!(!is_placeholder_body(&crate::avatar::source::NON_PLAYABLE));
+        assert!(!is_placeholder_body(&AvatarLibrary::resolve(None).0));
+        assert!(!is_placeholder_body(&AvatarLibrary::resolve(Some("ff7/nobody")).0));
+    }
+
+    /// The cache arithmetic: the players hold the 8 canon characters and up to 4 placeholder bodies, the area's
+    /// non-player characters the rest of the GPU's 32 (20). A table of bodies that outgrows its room fails here,
+    /// instead of making the GPU's cache start over in the middle of a frame.
+    #[test]
+    fn the_players_and_the_area_fit_the_gpu_cache() {
+        assert!(PLACEHOLDER_BODIES.len() <= MAX_BODY_MODELS, "the table of bodies has {} rows: raise MAX_BODY_MODELS and lower MAX_NPC_MODELS", PLACEHOLDER_BODIES.len());
+        assert_eq!((PLAYABLE_FIELD_MODELS.len(), MAX_BODY_MODELS, MAX_PLAYER_MODELS, MAX_NPC_MODELS), (8, 4, 12, 20));
+        assert_eq!(MAX_PLAYER_MODELS + MAX_NPC_MODELS, crate::avatar::gpu::MAX_GPU_MODELS, "the players and the area share the GPU's models exactly");
+        assert_eq!(crate::avatar::gpu::MAX_GPU_MODELS, 32);
+        // Everything the players can wear, at once, is within the players' share.
+        let (mut lib, _) = library(vec![]);
+        for model in PLAYABLE_FIELD_MODELS {
+            lib.get(Some(model.appearance_ref));
+        }
+        for body in PLACEHOLDER_BODIES {
+            lib.get(Some(body.model.appearance_ref));
+        }
+        assert!(lib.cached() <= MAX_PLAYER_MODELS, "{} players' models", lib.cached());
     }
 
     #[test]
@@ -493,7 +579,7 @@ pub(crate) mod tests {
     #[test]
     fn the_head_height_is_measured_from_the_idle_pose() {
         // The stick figure's head top is at local y = -25 with the root 5 above the ground: 30 up.
-        let asset = AvatarAsset::new(character(resolve_appearance("ff7/cloud").unwrap(), 1, 4, 3)).unwrap();
+        let asset = AvatarAsset::new(character(resolve_model("ff7/cloud").unwrap(), 1, 4, 3)).unwrap();
         assert!((asset.height_units - 30.0).abs() < 1e-3, "{}", asset.height_units);
         assert_eq!(asset.character.pose(AnimState::Idle, 0).map(|p| p.len()), Some(1));
         assert!(format!("{asset:?}").contains("ff7/cloud"));

@@ -63,7 +63,7 @@ pub struct Launch {
     pub looks: LookCache,
     /// `client_build` for `Hello`.
     pub client_build: String,
-    /// The game whose content this machine holds (it decides the looks on offer and the labels).
+    /// The game whose content this machine holds (it decides the bodies and slots on offer and the labels).
     pub game: GameId,
     /// `--tint`: the colour the create form starts with.
     pub tint: Option<[u8; 3]>,
@@ -353,8 +353,8 @@ impl Shell {
         self.game = Some(app);
     }
 
-    /// Everything about joining that needs no window: say what was joined, remember how the
-    /// server shows this character, and build the session and the field view exactly as the
+    /// Everything about joining that needs no window: say what was joined, remember what the
+    /// server holds of this character, and build the session and the field view exactly as the
     /// command line does.
     fn begin_game(&mut self, pending: Pending) -> App {
         let Pending { connected, plan, .. } = pending;
@@ -363,7 +363,7 @@ impl Shell {
         if let LoginPlan::Token(account) = &plan {
             eprintln!("account: logged in with the saved token for \"{}\"", clean(&account.name));
         }
-        self.launch.looks.remember_joined(&self.launch.server, plan.name(), &joined.entities, joined.entity);
+        self.launch.looks.remember_card(&self.launch.server, plan.name(), &joined.character);
         let mut session = Session::new(net, joined);
         if let Some(adapter) = &self.launch.ff7 {
             // This machine's own FF7 data lets the session follow the server to other areas.
@@ -597,7 +597,7 @@ mod tests {
         let store = TokenStore::new(dir.path());
         store.save_new("127.0.0.1:47770", "Cloud", &Secret::new("tok_cloud")).unwrap();
         store.save_new("127.0.0.1:47770", "Tifa", &Secret::new("tok_tifa")).unwrap();
-        LookCache::new(dir.path()).store("127.0.0.1:47770", "Tifa", &Look { tint: [200, 50, 50], appearance: Some("ff7/tifa".into()) }).unwrap();
+        LookCache::new(dir.path()).store("127.0.0.1:47770", "Tifa", &Look::plain([200, 50, 50], Some("ff7/tifa"))).unwrap();
         let shell = Shell::new(launch(dir.path(), "127.0.0.1:47770"));
         assert!(matches!(shell.menu.screen(), Screen::Select(_)));
         let names: Vec<&str> = shell.menu.accounts().iter().map(|a| a.name.as_str()).collect();
@@ -629,7 +629,7 @@ mod tests {
         store.save_new(server, "Cloud", &Secret::new("tok_cloud")).unwrap();
         store.save_new(server, "Tifa", &Secret::new("tok_tifa")).unwrap();
         let looks = LookCache::new(dir.path());
-        looks.store(server, "Cloud", &Look { tint: [1, 2, 3], appearance: None }).unwrap();
+        looks.store(server, "Cloud", &Look::plain([1, 2, 3], None)).unwrap();
         let mut shell = Shell::new(launch(dir.path(), server));
         // Del asks first; the default answer keeps the login.
         assert_eq!(shell.handle_input(nav(NavKey::Delete)), Next::Stay);
@@ -750,30 +750,39 @@ mod tests {
         }
     }
 
-    fn hello_of(seen: &crate::ui::testkit::Seen) -> (fmv_protocol::Auth, [u8; 3], Option<String>, String) {
+    fn hello_of(seen: &crate::ui::testkit::Seen) -> (fmv_protocol::Auth, fmv_protocol::NewCharacter, String) {
         match &seen.hello {
-            fmv_protocol::ClientMsg::Hello { auth, tint, appearance_ref, client_build, .. } => {
-                (auth.clone(), *tint, appearance_ref.clone(), client_build.clone())
-            }
+            fmv_protocol::ClientMsg::Hello { auth, character, client_build, .. } => (auth.clone(), character.clone(), client_build.clone()),
             other => panic!("{other:?}"),
         }
     }
 
-    /// Key presses of a new player to a joined game: the server receives exactly what was chosen,
-    /// the issued token is saved at once under the name, and what the server then says about the
-    /// character (its stored profile) is what the list remembers.
+    /// Key presses of a new player to a joined game: the server receives exactly what was chosen (the colour,
+    /// a body and a combat slot), the issued token is saved at once under the name, and what the server then
+    /// says about the character (its card) is what the list remembers.
     #[test]
     fn registering_through_the_menu_reaches_the_game_and_the_server_gets_what_was_chosen() {
         use crate::cli::tint_from_name;
-        use fmv_core::AvatarAppearance;
-        use fmv_protocol::Auth;
+        use fmv_protocol::{Auth, CharacterCard, NewCharacter};
+        let second_body = fmv_ff7::playable::PLACEHOLDER_BODIES[1].archetype;
         let dir = tempfile::tempdir().unwrap();
-        let stored = AvatarAppearance::new("Tifa", [9, 8, 7], Some("ff7/tifa".into()));
-        let (addr, server) = serve_join(Reply::Join { stored: Some(stored), token: Some("fmvt_issued_by_the_fake"), gate: None });
+        let stored = CharacterCard {
+            name: "Tifa".into(),
+            tint: [9, 8, 7],
+            body: Some(second_body.into()),
+            binding: Some(fmv_ff7::playable::PLACEHOLDER_BODIES[1].model.appearance_ref.into()),
+            slot: Some(2),
+            migrated: false,
+        };
+        let (addr, server) = serve_join(Reply::Join { stored: Some(stored.clone()), token: Some("fmvt_issued_by_the_fake"), gate: None });
         let mut shell = Shell::new(launch(dir.path(), &addr));
         shell.handle_input(MenuInput::Text("  Tifa ".into()));
-        shell.handle_input(nav(NavKey::Tab)); // the look
-        shell.handle_input(nav(NavKey::Right)); // Tifa Lockhart
+        shell.handle_input(nav(NavKey::Tab)); // the body
+        shell.handle_input(nav(NavKey::Right)); // the second one
+        for _ in 0..5 {
+            shell.handle_input(nav(NavKey::Tab)); // palette, red, green, blue, the slot
+        }
+        shell.handle_input(nav(NavKey::Right)); // Tifa's
         assert_eq!(shell.handle_input(nav(NavKey::Enter)), Next::Stay);
         assert!(shell.menu.is_connecting());
         wait_for_join(&mut shell);
@@ -782,32 +791,33 @@ mod tests {
         // The token the server issued was saved the moment its Welcome arrived.
         let saved = TokenStore::new(dir.path()).find(&addr, Some("Tifa")).unwrap().expect("the token was saved");
         assert_eq!(saved.token.expose(), "fmvt_issued_by_the_fake");
-        // Joining remembers how the SERVER shows the character, not what was asked for.
+        // Joining remembers what the SERVER holds of the character, not what was asked for.
         let pending = shell.pending.take().expect("a join is waiting for its first frames");
         let mut app = shell.begin_game(pending);
         assert_eq!(
             LookCache::new(dir.path()).load(&addr, "Tifa"),
-            Some(Look { tint: [9, 8, 7], appearance: Some("ff7/tifa".into()) }),
-            "the server's stored profile wins"
+            Some(Look { tint: [9, 8, 7], appearance: stored.binding.clone(), body: Some(second_body.into()), slot: Some(2) }),
+            "the server's card wins"
         );
         // Quitting the game says goodbye.
         assert_eq!(app.finish(Ok(Ok(()))), exit::OK);
         let seen = server.join().unwrap();
-        let (auth, tint, appearance, build) = hello_of(&seen);
+        let (auth, character, build) = hello_of(&seen);
         assert_eq!(auth, Auth::Register { display_name: "Tifa".into() }, "the cleaned name");
-        assert_eq!(tint, tint_from_name("Tifa"), "no colour was chosen: the command line's default for the name");
-        assert_eq!(appearance.as_deref(), Some("ff7/tifa"));
+        // No colour was chosen: the command line's default for the name.
+        assert_eq!(character, NewCharacter { tint: tint_from_name("Tifa"), body: Some(second_body.into()), slot: Some(2) });
         assert_eq!(build, "test-build");
         assert!(seen.join.is_some(), "the area was joined");
         assert!(seen.left, "and left politely");
     }
 
     #[test]
-    fn playing_a_saved_character_logs_in_with_its_token_and_remembers_its_look() {
-        use fmv_core::AvatarAppearance;
-        use fmv_protocol::Auth;
+    fn playing_a_saved_character_logs_in_with_its_token_and_remembers_its_card() {
+        use crate::cli::tint_from_name;
+        use fmv_protocol::{Auth, CharacterCard, NewCharacter};
         let dir = tempfile::tempdir().unwrap();
-        let stored = AvatarAppearance::new("Cloud", [1, 2, 3], Some("ff7/cloud".into()));
+        // An account that predates the character creator: its canon look is its binding, its slot the one it fought as.
+        let stored = CharacterCard { name: "Cloud".into(), tint: [1, 2, 3], body: None, binding: Some("ff7/cloud".into()), slot: Some(0), migrated: true };
         let (addr, server) = serve_join(Reply::Join { stored: Some(stored), token: None, gate: None });
         TokenStore::new(dir.path()).save_new(&addr, "Cloud", &Secret::new("tok_cloud")).unwrap();
         let mut shell = Shell::new(launch(dir.path(), &addr));
@@ -818,16 +828,16 @@ mod tests {
         let mut app = shell.begin_game(pending);
         assert_eq!(
             LookCache::new(dir.path()).load(&addr, "Cloud"),
-            Some(Look { tint: [1, 2, 3], appearance: Some("ff7/cloud".into()) })
+            Some(Look { tint: [1, 2, 3], appearance: Some("ff7/cloud".into()), body: None, slot: Some(0) })
         );
         // Next time the list shows it.
         shell.relist();
         assert_eq!(shell.menu.accounts()[0].look.as_ref().map(|l| l.tint), Some([1, 2, 3]));
         assert_eq!(app.finish(Ok(Ok(()))), exit::OK);
         let seen = server.join().unwrap();
-        let (auth, _, appearance, _) = hello_of(&seen);
+        let (auth, character, _) = hello_of(&seen);
         assert_eq!(auth, Auth::Token(Secret::new("tok_cloud")), "the saved token, never a registration");
-        assert_eq!(appearance, None);
+        assert_eq!(character, NewCharacter::with_tint(tint_from_name("Cloud")), "a login asks for nothing but a colour");
         assert!(seen.left);
     }
 
@@ -951,7 +961,7 @@ mod tests {
         assert_eq!(take_asked(), [Osk::Open]);
         shell.sync_keyboard();
         assert_eq!(take_asked(), [], "staying in the field asks for nothing more");
-        // Down to the Look row: out of the field.
+        // Down to the Body row: out of the field.
         shell.handle_pad(pad_press(PadKey::Down));
         shell.sync_keyboard();
         assert_eq!(take_asked(), [Osk::Close]);

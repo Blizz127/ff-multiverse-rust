@@ -7,8 +7,15 @@
 //! * **Select**: the characters saved for this server (arrows, Enter plays, `N` creates, `Del`
 //!   asks to forget a saved login on THIS machine, `Esc` quits). Forgetting is confirmed first
 //!   and never touches the server.
-//! * **Create**: name, look, tint (a palette grid and three sliders), then Create or Back. Enter
-//!   registers (wherever the focus is, except on Back); Esc goes back.
+//! * **Create**: name, body, tint (a palette grid and three sliders), combat slot, then Create or Back,
+//!   in that order (the body and the slot only when the game offers them: the synthetic FIXTURE offers
+//!   neither). Left, Right and Space change a choice, Enter registers (wherever the focus is, except
+//!   on Back); Esc goes back. The three things a player chooses are separate, and the screen says so:
+//!   the **body** is how the character looks on the field (FF7: a generic placeholder model, which the
+//!   game tints with the chosen colour), the **colour** is its identity colour (also the ring under its
+//!   feet and its swatch in the list), and the **slot** is who it fights as (FF7: the combat moves and
+//!   level curve of a canon party member other than Cloud, fixed once created). The slot says nothing
+//!   about how the character looks.
 //! * **Connecting**: an attempt is running; Esc abandons it.
 //! * **Loading**: the area is being prepared after the join.
 //!
@@ -24,61 +31,129 @@ use fmv_core::GameId;
 use fmv_protocol::Secret;
 
 // ---------------------------------------------------------------------------------------------
-// Looks
+// The character's choices: a body, a colour and a combat slot
 // ---------------------------------------------------------------------------------------------
 
-/// One look offered on the create screen.
+/// One body offered on the create screen: how the character looks on the field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AppearanceOption {
-    /// The stable id sent to the server (`Hello::appearance_ref`) and stored in the avatar
-    /// profile. Adapters map it to a model.
+pub struct BodyOption {
+    /// The id sent to the server (`NewCharacter::body`): the game's own name for the body.
     pub id: &'static str,
     pub label: &'static str,
 }
 
-/// The FF7 field models a character can wear (a parallel piece of work maps these ids to models
-/// decoded from the owner's own copy; until then the create screen shows the names and a
-/// coloured marker).
-pub const FF7_APPEARANCES: [AppearanceOption; 4] = [
-    AppearanceOption { id: "ff7/cloud", label: "Cloud Strife" },
-    AppearanceOption { id: "ff7/tifa", label: "Tifa Lockhart" },
-    AppearanceOption { id: "ff7/barret", label: "Barret Wallace" },
-    AppearanceOption { id: "ff7/aerith", label: "Aerith Gainsborough" },
+/// The bodies offered for `game`'s content (FF7: the generic placeholder bodies, from
+/// [`fmv_ff7::playable::PLACEHOLDER_BODIES`]: an id and a label each, in the table's order). Games without
+/// models of their own (the synthetic FIXTURE) offer none: the character is the plain coloured marker.
+pub fn body_options(game: GameId) -> Vec<BodyOption> {
+    match game {
+        GameId::Ff7 => fmv_ff7::playable::PLACEHOLDER_BODIES.iter().map(|b| BodyOption { id: b.archetype, label: b.label }).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The index in `options` of the body a registration that asks for none gets (the game's default; the
+/// first one if the table does not hold it), so that the form starts on what would be registered anyway.
+fn default_body(options: &[BodyOption]) -> usize {
+    options.iter().position(|o| o.id == fmv_ff7::playable::DEFAULT_BODY).unwrap_or(0)
+}
+
+/// One combat slot offered on the create screen: the canon party member whose combat moves and level curve
+/// the character fights with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotOption {
+    /// The game's own character id (`NewCharacter::slot`).
+    pub id: u8,
+    /// The member's full name (the name `fmv_ff7_battle::kernel::CharacterId` gives it, and the surname).
+    pub label: &'static str,
+}
+
+/// The FF7 slots a NEW character can take: the canon party members except Cloud, who stays the story's
+/// protagonist (the server refuses 0). Barret, the first row, is the default (and the server's).
+pub const FF7_SLOTS: [SlotOption; 8] = [
+    SlotOption { id: 1, label: "Barret Wallace" },
+    SlotOption { id: 2, label: "Tifa Lockhart" },
+    SlotOption { id: 3, label: "Aerith Gainsborough" },
+    SlotOption { id: 4, label: "Red XIII" },
+    SlotOption { id: 5, label: "Yuffie Kisaragi" },
+    SlotOption { id: 6, label: "Cait Sith" },
+    SlotOption { id: 7, label: "Vincent Valentine" },
+    SlotOption { id: 8, label: "Cid Highwind" },
 ];
 
-/// The looks offered for `game`'s content. Games without models of their own (the synthetic
-/// FIXTURE) offer none: the character is the plain coloured marker.
-pub fn appearance_options(game: GameId) -> &'static [AppearanceOption] {
+/// The slots offered for `game`'s content. A game without combat slots (the synthetic FIXTURE) offers none.
+pub fn slot_options(game: GameId) -> &'static [SlotOption] {
     match game {
-        GameId::Ff7 => &FF7_APPEARANCES,
+        GameId::Ff7 => &FF7_SLOTS,
         _ => &[],
     }
 }
 
-/// A short human label for any appearance id: a known one by its name, an unknown one as it is
-/// (cleaned, so text from a server cannot carry control characters), none as `default marker`.
+/// The name of the slot `id` for the character list (`slot: Barret`): the canon character's name from this
+/// client's own table, or the bare number for an id it has no name for.
+pub fn slot_label(id: u8) -> String {
+    crate::progress::slot_name(id).map_or_else(|| id.to_string(), str::to_string)
+}
+
+/// A text from the network (or from a note on disk) as the list shows it: cleaned, none if nothing is left.
+fn shown_text(text: &str) -> Option<String> {
+    let cleaned = crate::net::clean(text);
+    let cleaned = cleaned.trim();
+    (!cleaned.is_empty()).then(|| cleaned.to_string())
+}
+
+/// A short human label for any appearance id (how the game draws a character, which the server says): a
+/// model this client knows by its name (a canon character's, or a placeholder body's), an unknown one as it
+/// is (cleaned, so text from a server cannot carry control characters), none as `default marker`.
 pub fn appearance_label(id: Option<&str>) -> String {
-    match id {
-        None => "default marker".to_string(),
-        Some(id) => match FF7_APPEARANCES.iter().find(|o| o.id == id) {
-            Some(o) => o.label.to_string(),
-            None => {
-                let cleaned = crate::net::clean(id);
-                if cleaned.trim().is_empty() {
-                    "default marker".to_string()
-                } else {
-                    cleaned
-                }
-            }
-        },
+    let Some(id) = id else { return "default marker".to_string() };
+    match fmv_ff7::playable::resolve_model(id) {
+        Some(model) => model.display_name.to_string(),
+        None => shown_text(id).unwrap_or_else(|| "default marker".to_string()),
     }
 }
 
-/// How a character looks, as last seen from this machine.
+/// The label of the body `id` (a placeholder body by its label, an unknown id as it is, cleaned).
+pub fn body_label(id: &str) -> String {
+    match fmv_ff7::playable::resolve_body(id) {
+        Some(body) => body.label.to_string(),
+        None => shown_text(id).unwrap_or_else(|| "default marker".to_string()),
+    }
+}
+
+/// What the character list says of a saved character's look, in one line: the body it was created with
+/// (or, for a character that has none, how the game draws it), then `slot: <name>`.
+pub fn look_label(look: &Look) -> String {
+    let body = match look.body.as_deref().and_then(shown_text) {
+        Some(body) => body_label(&body),
+        None => appearance_label(look.appearance.as_deref()),
+    };
+    match look.slot {
+        Some(slot) => format!("{body}  slot: {}", slot_label(slot)),
+        None => body,
+    }
+}
+
+/// What this machine last saw of a character: the colour, how the game draws it, the body it was created
+/// with and the combat slot it fights with (the server's own card, see `LookCache::remember_card`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Look {
     pub tint: [u8; 3],
+    /// How the game draws the character: its binding, an appearance id as the server shows it. `None` when
+    /// not known (before the first join) or the game's default look.
     pub appearance: Option<String>,
+    /// The identity's body choice. `None` for a character that predates it or has not joined yet.
+    pub body: Option<String>,
+    /// The combat slot (FF7: the character id). `None` for a game without slots or one not seen yet.
+    pub slot: Option<u8>,
+}
+
+impl Look {
+    /// A look of only a colour and a binding (a character of an older client's note).
+    #[cfg(test)]
+    pub fn plain(tint: [u8; 3], appearance: Option<&str>) -> Self {
+        Self { tint, appearance: appearance.map(str::to_string), body: None, slot: None }
+    }
 }
 
 /// A saved character as the select screen lists it.
@@ -86,7 +161,7 @@ pub struct Look {
 pub struct CharacterEntry {
     /// The display name (cleaned).
     pub name: String,
-    /// `None` until this machine has seen the character join once (the server keeps the look;
+    /// `None` until this machine has seen the character join once (the server keeps the character;
     /// the saved login does not).
     pub look: Option<Look>,
     /// The token file can be read by other users (shown as a warning).
@@ -144,8 +219,9 @@ pub enum MenuAction {
     Quit,
     /// Log in with the saved character at this index of [`Menu::accounts`].
     Play { index: usize },
-    /// Create a character: register `name` with this tint and look.
-    Register { name: String, tint: [u8; 3], appearance: Option<String> },
+    /// Create a character: register `name` with this tint, body and combat slot (`None` for a game that
+    /// offers none: the FIXTURE).
+    Register { name: String, tint: [u8; 3], body: Option<String>, slot: Option<u8> },
     /// Forget the saved login of the character at this index (locally; never on the server).
     Forget { index: usize },
     /// Abandon the running connection attempt.
@@ -250,22 +326,30 @@ pub struct SelectState {
     pub confirm: Option<Confirm>,
 }
 
+/// The rows of the create form. [`Field::Body`] and [`Field::Slot`] are there only when the game offers
+/// bodies and combat slots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
     Name,
-    Look,
+    /// How the character looks on the field (a placeholder model, in FF7).
+    Body,
     Palette,
     Red,
     Green,
     Blue,
+    /// Who the character fights as (FF7: a canon party member's combat moves and level curve).
+    Slot,
     Create,
     Back,
 }
 
-const FIELDS_WITH_LOOKS: [Field; 8] =
-    [Field::Name, Field::Look, Field::Palette, Field::Red, Field::Green, Field::Blue, Field::Create, Field::Back];
-const FIELDS_WITHOUT_LOOKS: [Field; 7] =
-    [Field::Name, Field::Palette, Field::Red, Field::Green, Field::Blue, Field::Create, Field::Back];
+const FIELDS_WITH_BODY_AND_SLOT: [Field; 9] =
+    [Field::Name, Field::Body, Field::Palette, Field::Red, Field::Green, Field::Blue, Field::Slot, Field::Create, Field::Back];
+const FIELDS_WITH_BODY: [Field; 8] =
+    [Field::Name, Field::Body, Field::Palette, Field::Red, Field::Green, Field::Blue, Field::Create, Field::Back];
+const FIELDS_WITH_SLOT: [Field; 8] =
+    [Field::Name, Field::Palette, Field::Red, Field::Green, Field::Blue, Field::Slot, Field::Create, Field::Back];
+const FIELDS_PLAIN: [Field; 7] = [Field::Name, Field::Palette, Field::Red, Field::Green, Field::Blue, Field::Create, Field::Back];
 
 /// Step of an RGB slider per key press (`Shift` makes it 1), and of PageUp/PageDown.
 pub const SLIDER_STEP: i16 = 8;
@@ -280,23 +364,29 @@ pub struct CreateForm {
     /// (until then it is the name-derived tint the command line would have used).
     pub tint_chosen: bool,
     pub palette_cursor: usize,
-    /// Index into [`appearance_options`] (meaningless when there are none).
-    pub appearance: usize,
+    /// Index into [`body_options`] (meaningless when there are none). Starts on the game's default body.
+    pub body: usize,
+    /// Index into [`slot_options`] (meaningless when there are none). Starts on the first row, Barret.
+    pub slot: usize,
     pub focus: Field,
-    has_looks: bool,
+    has_bodies: bool,
+    has_slots: bool,
 }
 
 impl CreateForm {
     fn new(cfg: &MenuConfig) -> Self {
         let tint = tint_from_name("");
+        let bodies = body_options(cfg.game);
         let mut form = Self {
             name: TextEntry::for_names(),
             tint,
             tint_chosen: false,
             palette_cursor: palette::nearest(tint),
-            appearance: 0,
+            body: default_body(&bodies),
+            slot: 0,
             focus: Field::Name,
-            has_looks: !appearance_options(cfg.game).is_empty(),
+            has_bodies: !bodies.is_empty(),
+            has_slots: !slot_options(cfg.game).is_empty(),
         };
         if let Some(asked) = cfg.tint {
             form.palette_cursor = palette::nearest(asked);
@@ -305,18 +395,25 @@ impl CreateForm {
         form
     }
 
-    /// The fields in focus order.
+    /// The fields in focus order: name, body, palette, red, green, blue, slot, Create, Back (the body and
+    /// the slot only when the game offers them).
     pub fn fields(&self) -> &'static [Field] {
-        if self.has_looks {
-            &FIELDS_WITH_LOOKS
-        } else {
-            &FIELDS_WITHOUT_LOOKS
+        match (self.has_bodies, self.has_slots) {
+            (true, true) => &FIELDS_WITH_BODY_AND_SLOT,
+            (true, false) => &FIELDS_WITH_BODY,
+            (false, true) => &FIELDS_WITH_SLOT,
+            (false, false) => &FIELDS_PLAIN,
         }
     }
 
-    /// Does the form have a look row (the game has models to choose from)?
-    pub fn has_looks(&self) -> bool {
-        self.has_looks
+    /// Does the form have a body row (the game has bodies to choose from)?
+    pub fn has_bodies(&self) -> bool {
+        self.has_bodies
+    }
+
+    /// Does the form have a slot row (the game has combat slots to choose from)?
+    pub fn has_slots(&self) -> bool {
+        self.has_slots
     }
 
     fn focus_index(&self) -> usize {
@@ -369,10 +466,17 @@ impl CreateForm {
         self.choose_tint(tint);
     }
 
-    fn cycle_look(&mut self, game: GameId, forward: bool) {
-        let n = appearance_options(game).len();
+    fn cycle_body(&mut self, game: GameId, forward: bool) {
+        let n = body_options(game).len();
         if n > 0 {
-            self.appearance = if forward { (self.appearance + 1) % n } else { (self.appearance + n - 1) % n };
+            self.body = if forward { (self.body + 1) % n } else { (self.body + n - 1) % n };
+        }
+    }
+
+    fn cycle_slot(&mut self, game: GameId, forward: bool) {
+        let n = slot_options(game).len();
+        if n > 0 {
+            self.slot = if forward { (self.slot + 1) % n } else { (self.slot + n - 1) % n };
         }
     }
 }
@@ -474,9 +578,14 @@ impl Menu {
         self.clock
     }
 
-    /// The looks the create screen offers.
-    pub fn appearances(&self) -> &'static [AppearanceOption] {
-        appearance_options(self.cfg.game)
+    /// The bodies the create screen offers.
+    pub fn bodies(&self) -> Vec<BodyOption> {
+        body_options(self.cfg.game)
+    }
+
+    /// The combat slots the create screen offers.
+    pub fn slots(&self) -> &'static [SlotOption] {
+        slot_options(self.cfg.game)
     }
 
     /// The name of the highlighted saved character (select screen only).
@@ -755,7 +864,8 @@ impl Menu {
                             f.name.left();
                         }
                     }
-                    Field::Look => f.cycle_look(game, forward),
+                    Field::Body => f.cycle_body(game, forward),
+                    Field::Slot => f.cycle_slot(game, forward),
                     Field::Palette => f.move_palette(if forward { 1 } else { -1 }, 0),
                     Field::Red => f.adjust_channel(0, signed),
                     Field::Green => f.adjust_channel(1, signed),
@@ -811,8 +921,12 @@ impl Menu {
                 }
                 None
             }
-            (Field::Look, ' ') => {
-                f.cycle_look(game, true);
+            (Field::Body, ' ') => {
+                f.cycle_body(game, true);
+                None
+            }
+            (Field::Slot, ' ') => {
+                f.cycle_slot(game, true);
                 None
             }
             (Field::Create, ' ') => self.submit(),
@@ -848,8 +962,11 @@ impl Menu {
             );
             return None;
         }
-        let appearance = appearance_options(game).get(f.appearance).map(|o| o.id.to_string());
-        let action = MenuAction::Register { name: name.clone(), tint: f.tint, appearance };
+        // What is shown is what is registered: the body and the slot on the form's rows, never "none" for
+        // a game that offers them (the server's default would be the same one, but the player saw it).
+        let body = body_options(game).get(f.body).map(|o| o.id.to_string());
+        let slot = slot_options(game).get(f.slot).map(|o| o.id);
+        let action = MenuAction::Register { name: name.clone(), tint: f.tint, body, slot };
         Some(self.begin(Target::Register { name }, action))
     }
 
@@ -886,6 +1003,15 @@ mod tests {
 
     fn entry(name: &str) -> CharacterEntry {
         CharacterEntry { name: name.to_string(), look: None, loose_permissions: false }
+    }
+
+    /// The bodies the FF7 form offers, in order, and the index the form starts on (the game's default body).
+    fn bodies() -> Vec<BodyOption> {
+        body_options(GameId::Ff7)
+    }
+
+    fn default_body_index() -> usize {
+        default_body(&bodies())
     }
 
     fn menu_with(names: &[&str]) -> Menu {
@@ -1149,7 +1275,7 @@ mod tests {
     #[test]
     fn tab_walks_the_fields_in_order_and_wraps_and_shift_tab_goes_back() {
         let mut m = menu_with(&[]);
-        let order = [Field::Look, Field::Palette, Field::Red, Field::Green, Field::Blue, Field::Create, Field::Back, Field::Name];
+        let order = [Field::Body, Field::Palette, Field::Red, Field::Green, Field::Blue, Field::Slot, Field::Create, Field::Back, Field::Name];
         for want in order {
             press(&mut m, NavKey::Tab);
             assert_eq!(form(&m).focus, want);
@@ -1160,36 +1286,159 @@ mod tests {
         assert_eq!(form(&m).focus, Field::Create);
         // Down and Up move the focus too, outside the palette.
         press(&mut m, NavKey::Up);
-        assert_eq!(form(&m).focus, Field::Blue);
+        assert_eq!(form(&m).focus, Field::Slot);
         press(&mut m, NavKey::Down);
         assert_eq!(form(&m).focus, Field::Create);
-        // The fixture has no models to choose from, so the form has no look row.
+        // The fixture has no models and no combat slots to choose from, so the form has neither row.
         let mut f = Menu::new(cfg(GameId::Fixture), vec![]);
-        assert!(!form(&f).has_looks());
+        assert!(!form(&f).has_bodies() && !form(&f).has_slots());
         press(&mut f, NavKey::Tab);
         assert_eq!(form(&f).focus, Field::Palette);
-        assert!(!form(&f).fields().contains(&Field::Look));
+        assert!(!form(&f).fields().contains(&Field::Body) && !form(&f).fields().contains(&Field::Slot));
+    }
+
+    /// The rows of the create form, exactly: name, body, palette, red, green, blue, slot, Create, Back; the body
+    /// and the slot only when the game offers them (the FIXTURE offers neither, as before the character creator).
+    #[test]
+    fn the_create_form_has_these_rows_in_this_order_and_the_fixture_has_neither_body_nor_slot() {
+        let m = menu_with(&[]);
+        assert_eq!(
+            form(&m).fields(),
+            [Field::Name, Field::Body, Field::Palette, Field::Red, Field::Green, Field::Blue, Field::Slot, Field::Create, Field::Back]
+        );
+        let f = Menu::new(cfg(GameId::Fixture), vec![]);
+        assert_eq!(form(&f).fields(), [Field::Name, Field::Palette, Field::Red, Field::Green, Field::Blue, Field::Create, Field::Back]);
+        assert!(f.bodies().is_empty() && f.slots().is_empty());
+        // A game that offered only one of the two would have only that row, in the same place.
+        let mut only_body = form(&m).clone();
+        only_body.has_slots = false;
+        assert_eq!(only_body.fields(), [Field::Name, Field::Body, Field::Palette, Field::Red, Field::Green, Field::Blue, Field::Create, Field::Back]);
+        let mut only_slot = form(&m).clone();
+        only_slot.has_bodies = false;
+        assert_eq!(only_slot.fields(), [Field::Name, Field::Palette, Field::Red, Field::Green, Field::Blue, Field::Slot, Field::Create, Field::Back]);
+        // The focus is always on a row that is there, and the keys that move it never leave the rows.
+        for game in [GameId::Ff7, GameId::Fixture] {
+            let mut m = Menu::new(cfg(game), vec![]);
+            for _ in 0..40 {
+                press(&mut m, NavKey::Tab);
+                assert!(form(&m).fields().contains(&form(&m).focus));
+            }
+        }
     }
 
     #[test]
-    fn the_look_cycles_with_the_arrows_and_wraps() {
+    fn the_body_cycles_with_the_arrows_and_wraps() {
         let mut m = menu_with(&[]);
-        assert_eq!(m.appearances().len(), 4);
+        let n = bodies().len();
+        assert_eq!(m.bodies().len(), n);
+        assert!(n >= 2, "there is something to choose from");
         press(&mut m, NavKey::Tab);
-        assert_eq!(form(&m).focus, Field::Look);
+        assert_eq!(form(&m).focus, Field::Body);
+        // The form starts on the game's default body: what a registration that asks for none would get.
+        let start = default_body_index();
+        assert_eq!(form(&m).body, start);
+        assert_eq!(bodies()[start].id, fmv_ff7::playable::DEFAULT_BODY);
         press(&mut m, NavKey::Right);
-        assert_eq!(form(&m).appearance, 1);
-        for _ in 0..3 {
+        assert_eq!(form(&m).body, (start + 1) % n);
+        for _ in 0..n - 1 {
             press(&mut m, NavKey::Right);
         }
-        assert_eq!(form(&m).appearance, 0, "past the last wraps to the first");
+        assert_eq!(form(&m).body, start, "all the way round comes back to where it started");
         press(&mut m, NavKey::Left);
-        assert_eq!(form(&m).appearance, 3);
+        assert_eq!(form(&m).body, (start + n - 1) % n, "left of the first wraps to the last");
         m.text(" ");
-        assert_eq!(form(&m).appearance, 0, "space picks the next one");
-        // Typing letters while the look has the focus does not touch the name.
+        assert_eq!(form(&m).body, start, "space picks the next one");
+        // Typing letters while the body has the focus does not touch the name.
         m.text("abc");
         assert!(form(&m).name.is_empty());
+        // The slot did not move.
+        assert_eq!(form(&m).slot, 0);
+    }
+
+    #[test]
+    fn the_slot_starts_on_barret_cycles_with_the_arrows_and_wraps_and_never_offers_cloud() {
+        let mut m = menu_with(&[]);
+        assert_eq!(m.slots().len(), 8, "the eight party members that are not the protagonist");
+        assert_eq!(form(&m).slot, 0);
+        assert_eq!(m.slots()[form(&m).slot], SlotOption { id: 1, label: "Barret Wallace" }, "the first row, Barret, is the default");
+        for _ in 0..6 {
+            press(&mut m, NavKey::Tab); // body, palette, red, green, blue, slot
+        }
+        assert_eq!(form(&m).focus, Field::Slot);
+        press(&mut m, NavKey::Right);
+        assert_eq!(m.slots()[form(&m).slot].id, 2, "Tifa");
+        for _ in 0..7 {
+            press(&mut m, NavKey::Right);
+        }
+        assert_eq!(m.slots()[form(&m).slot].id, 1, "past Cid wraps to Barret");
+        press(&mut m, NavKey::Left);
+        assert_eq!(m.slots()[form(&m).slot].id, 8, "left of Barret wraps to Cid");
+        m.text(" ");
+        assert_eq!(m.slots()[form(&m).slot].id, 1, "space picks the next one");
+        // Typing letters while the slot has the focus does not touch the name, and the body did not move.
+        m.text("abc");
+        assert!(form(&m).name.is_empty());
+        assert_eq!(form(&m).body, default_body_index());
+        // Whatever the keys do, Cloud (0) is never on offer, and every id is a party member the kernel names.
+        assert!(FF7_SLOTS.iter().all(|o| o.id != 0), "Cloud stays the protagonist");
+        for option in FF7_SLOTS {
+            let canon = fmv_ff7_battle::kernel::CharacterId::from_index(usize::from(option.id)).expect("a canon character");
+            assert!(option.label.starts_with(canon.name()), "{} is {}'s slot", option.label, canon.name());
+            assert_eq!(slot_label(option.id), canon.name());
+        }
+        assert_eq!(FF7_SLOTS.iter().map(|o| o.id).collect::<Vec<_>>(), [1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    /// Each body and each slot registers under its own id, and the form's defaults are what is registered when
+    /// nothing was touched: what is shown is what is sent, never "no choice" for a game that offers some.
+    #[test]
+    fn every_body_and_every_slot_registers_under_its_id() {
+        for (i, body) in bodies().iter().enumerate() {
+            let mut m = menu_with(&[]);
+            type_name(&mut m, "P");
+            press(&mut m, NavKey::Tab);
+            for _ in 0..(i + bodies().len() - default_body_index()) % bodies().len() {
+                press(&mut m, NavKey::Right);
+            }
+            match press(&mut m, NavKey::Enter) {
+                Some(MenuAction::Register { body: sent, slot, .. }) => {
+                    assert_eq!(sent.as_deref(), Some(body.id), "body {i}");
+                    assert_eq!(slot, Some(1), "the slot stayed on Barret");
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        for (i, option) in FF7_SLOTS.iter().enumerate() {
+            let mut m = menu_with(&[]);
+            type_name(&mut m, "P");
+            for _ in 0..6 {
+                press(&mut m, NavKey::Tab);
+            }
+            for _ in 0..i {
+                press(&mut m, NavKey::Right);
+            }
+            match press(&mut m, NavKey::Enter) {
+                Some(MenuAction::Register { body, slot, .. }) => {
+                    assert_eq!(slot, Some(option.id), "slot {i}");
+                    assert_eq!(body.as_deref(), Some(fmv_ff7::playable::DEFAULT_BODY), "the body stayed on the default");
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        // Nothing touched: the default body and Barret, sent as such.
+        let mut m = menu_with(&[]);
+        type_name(&mut m, "P");
+        match press(&mut m, NavKey::Enter) {
+            Some(MenuAction::Register { body, slot, .. }) => assert_eq!((body.as_deref(), slot), (Some(fmv_ff7::playable::DEFAULT_BODY), Some(1))),
+            other => panic!("{other:?}"),
+        }
+        // The synthetic FIXTURE has no bodies and no slots: nothing is sent.
+        let mut f = Menu::new(cfg(GameId::Fixture), vec![]);
+        f.text("P");
+        match press(&mut f, NavKey::Enter) {
+            Some(MenuAction::Register { body, slot, .. }) => assert_eq!((body, slot), (None, None)),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
@@ -1266,7 +1515,7 @@ mod tests {
         assert_eq!(palette::cell(form(&m).palette_cursor), (0, 0));
         assert_eq!(form(&m).focus, Field::Palette);
         press(&mut m, NavKey::Up);
-        assert_eq!(form(&m).focus, Field::Look);
+        assert_eq!(form(&m).focus, Field::Body);
     }
 
     #[test]
@@ -1322,55 +1571,27 @@ mod tests {
     }
 
     #[test]
-    fn enter_registers_the_cleaned_name_with_the_chosen_tint_and_look() {
+    fn enter_registers_the_cleaned_name_with_the_chosen_tint_body_and_slot() {
         let mut m = menu_with(&[]);
         type_name(&mut m, "  Cloud  ");
-        press(&mut m, NavKey::Tab); // look
-        press(&mut m, NavKey::Right); // Tifa
+        press(&mut m, NavKey::Tab); // body
+        press(&mut m, NavKey::Right); // the next one
         press(&mut m, NavKey::Tab); // palette
         press(&mut m, NavKey::Right);
         let tint = form(&m).tint;
-        // Enter works from any field but Back: here with the focus on the palette.
+        for _ in 0..4 {
+            press(&mut m, NavKey::Tab); // red, green, blue, slot
+        }
+        press(&mut m, NavKey::Right); // Tifa's slot
+        press(&mut m, NavKey::Up); // back to the blue slider: Enter works from anywhere but Back
+        let body = bodies()[(default_body_index() + 1) % bodies().len()].id;
         let action = press(&mut m, NavKey::Enter);
-        assert_eq!(
-            action,
-            Some(MenuAction::Register { name: "Cloud".into(), tint, appearance: Some("ff7/tifa".into()) })
-        );
+        assert_eq!(action, Some(MenuAction::Register { name: "Cloud".into(), tint, body: Some(body.into()), slot: Some(2) }));
         match m.screen() {
             Screen::Connecting(c) => {
                 assert_eq!(c.target, Target::Register { name: "Cloud".into() });
                 assert!(matches!(c.previous.as_ref(), Screen::Create(f) if f.name.text() == "  Cloud  "));
             }
-            other => panic!("{other:?}"),
-        }
-    }
-
-    #[test]
-    fn every_look_registers_under_its_stable_id() {
-        for (i, id) in ["ff7/cloud", "ff7/tifa", "ff7/barret", "ff7/aerith"].into_iter().enumerate() {
-            let mut m = menu_with(&[]);
-            type_name(&mut m, "P");
-            press(&mut m, NavKey::Tab);
-            for _ in 0..i {
-                press(&mut m, NavKey::Right);
-            }
-            match press(&mut m, NavKey::Enter) {
-                Some(MenuAction::Register { appearance, .. }) => assert_eq!(appearance.as_deref(), Some(id)),
-                other => panic!("{other:?}"),
-            }
-        }
-        // The default look (the first) is sent as `ff7/cloud`, never as "no look": what is shown is what is registered.
-        let mut m = menu_with(&[]);
-        type_name(&mut m, "P");
-        match press(&mut m, NavKey::Enter) {
-            Some(MenuAction::Register { appearance, .. }) => assert_eq!(appearance.as_deref(), Some("ff7/cloud")),
-            other => panic!("{other:?}"),
-        }
-        // The synthetic FIXTURE has no models: no appearance is sent.
-        let mut f = Menu::new(cfg(GameId::Fixture), vec![]);
-        f.text("P");
-        match press(&mut f, NavKey::Enter) {
-            Some(MenuAction::Register { appearance, .. }) => assert_eq!(appearance, None),
             other => panic!("{other:?}"),
         }
     }
@@ -1424,7 +1645,7 @@ mod tests {
     fn back_and_escape_leave_the_form_and_a_space_presses_the_focused_button() {
         let mut m = menu_with(&["Cloud"]);
         m.text("n");
-        for _ in 0..7 {
+        for _ in 0..8 {
             press(&mut m, NavKey::Tab);
         }
         assert_eq!(form(&m).focus, Field::Back);
@@ -1452,7 +1673,7 @@ mod tests {
         assert!(matches!(m.screen(), Screen::Select(_)));
         // With nothing saved the button is a Quit.
         let mut m = menu_with(&[]);
-        for _ in 0..7 {
+        for _ in 0..8 {
             press(&mut m, NavKey::Tab);
         }
         assert_eq!(form(&m).focus, Field::Back);
@@ -1469,7 +1690,7 @@ mod tests {
         m.connect_failed(Notice::error("that display name is already taken").with_hint("Pick another name."));
         let f = form(&m);
         assert_eq!(f.name.text(), "Cloud", "the name is still there to edit");
-        assert_eq!(f.appearance, 1, "and so is the look");
+        assert_eq!(f.body, (default_body_index() + 1) % bodies().len(), "and so is the body");
         assert_eq!(f.focus, Field::Name, "the cursor is in the name field");
         assert!(m.notice().unwrap().text.contains("already taken"));
         // Editing the name keeps the message on screen until the next attempt.
@@ -1479,9 +1700,11 @@ mod tests {
         let second = press(&mut m, NavKey::Enter).expect("register again");
         assert!(m.notice().is_none());
         match (first, second) {
-            (MenuAction::Register { name: a, appearance: la, .. }, MenuAction::Register { name: b, appearance: lb, .. }) => {
+            (MenuAction::Register { name: a, body: la, slot: sa, .. }, MenuAction::Register { name: b, body: lb, slot: sb, .. }) => {
                 assert_eq!((a.as_str(), b.as_str()), ("Cloud", "Cloux"));
-                assert_eq!((la, lb), (Some("ff7/tifa".into()), Some("ff7/tifa".into())));
+                let want = Some(bodies()[(default_body_index() + 1) % bodies().len()].id.to_string());
+                assert_eq!((la, lb), (want.clone(), want));
+                assert_eq!((sa, sb), (Some(1), Some(1)));
             }
             other => panic!("{other:?}"),
         }
@@ -1520,7 +1743,7 @@ mod tests {
         assert!(m.is_connecting());
         assert_eq!(press(&mut m, NavKey::Escape), Some(MenuAction::CancelConnect));
         let f = form(&m);
-        assert_eq!((f.name.text().as_str(), f.appearance), ("Cloud", 1));
+        assert_eq!((f.name.text().as_str(), f.body), ("Cloud", (default_body_index() + 1) % bodies().len()));
         // The token the abandoned attempt may still save shows up on the next refresh.
         m.refresh_accounts(vec![entry("Cloud")]);
         assert!(matches!(m.screen(), Screen::Create(_)), "a form in progress is not taken over");
@@ -1593,17 +1816,50 @@ mod tests {
 
     #[test]
     fn looks_have_labels_and_unknown_ones_are_shown_cleaned() {
+        // How the game draws a character (its binding): a canon model or a placeholder body by its name.
         assert_eq!(appearance_label(Some("ff7/cloud")), "Cloud Strife");
         assert_eq!(appearance_label(Some("ff7/aerith")), "Aerith Gainsborough");
+        let body = fmv_ff7::playable::PLACEHOLDER_BODIES[0];
+        assert_eq!(appearance_label(Some(body.model.appearance_ref)), body.model.display_name);
         assert_eq!(appearance_label(None), "default marker");
         assert_eq!(appearance_label(Some("custom/rude\u{1b}[31m")), "custom/rude[31m");
         assert_eq!(appearance_label(Some("\u{1b}")), "default marker");
-        assert_eq!(appearance_options(GameId::Ff7).len(), 4);
-        assert!(appearance_options(GameId::Fixture).is_empty());
-        assert!(appearance_options(GameId::Ff8).is_empty());
-        // The ids are the stable ones other work relies on.
-        let ids: Vec<&str> = FF7_APPEARANCES.iter().map(|o| o.id).collect();
-        assert_eq!(ids, ["ff7/cloud", "ff7/tifa", "ff7/barret", "ff7/aerith"]);
+        // The bodies of a new character, by their labels; an id nobody knows as it is, cleaned.
+        for b in fmv_ff7::playable::PLACEHOLDER_BODIES {
+            assert_eq!(body_label(b.archetype), b.label);
+        }
+        assert_eq!(body_label("nobody\u{1b}[31m"), "nobody[31m");
+        assert_eq!(body_label("\u{7}"), "default marker");
+        // What the game offers on the form is the table, in its order, and nothing else.
+        let offered: Vec<(&str, &str)> = body_options(GameId::Ff7).iter().map(|o| (o.id, o.label)).collect();
+        let table: Vec<(&str, &str)> = fmv_ff7::playable::PLACEHOLDER_BODIES.iter().map(|b| (b.archetype, b.label)).collect();
+        assert_eq!(offered, table);
+        assert!(body_options(GameId::Fixture).is_empty() && body_options(GameId::Ff8).is_empty());
+        assert!(slot_options(GameId::Fixture).is_empty() && slot_options(GameId::Ff8).is_empty());
+        assert_eq!(slot_options(GameId::Ff7).len(), 8);
+    }
+
+    /// What the list says of a saved character in its one line: the body it was created with, or how the game
+    /// draws it when it has none, then the slot's name.
+    #[test]
+    fn the_list_line_of_a_character_says_its_body_and_its_slot() {
+        let body = fmv_ff7::playable::PLACEHOLDER_BODIES[0];
+        let created = Look { tint: [1, 2, 3], appearance: Some(body.model.appearance_ref.into()), body: Some(body.archetype.into()), slot: Some(1) };
+        assert_eq!(look_label(&created), format!("{}  slot: Barret", body.label));
+        // A character of before the creator: how it is drawn (a canon look), and the slot it fights in.
+        let migrated = Look { tint: [1, 2, 3], appearance: Some("ff7/tifa".into()), body: None, slot: Some(2) };
+        assert_eq!(look_label(&migrated), "Tifa Lockhart  slot: Tifa");
+        // Nothing known of the slot: just the look. Nothing known at all: the plain marker.
+        assert_eq!(look_label(&Look::plain([1, 2, 3], Some("ff7/cloud"))), "Cloud Strife");
+        assert_eq!(look_label(&Look::plain([1, 2, 3], None)), "default marker");
+        // The names of the slots are the kernel's (Red XIII, Cait Sith), an id it does not know is its number.
+        let slot = |slot| Look { tint: [0; 3], appearance: None, body: None, slot: Some(slot) };
+        assert_eq!(look_label(&slot(4)), "default marker  slot: Red XIII");
+        assert_eq!(look_label(&slot(6)), "default marker  slot: Cait Sith");
+        assert_eq!(look_label(&slot(200)), "default marker  slot: 200");
+        // Text from a note on disk is cleaned.
+        let hostile = Look { tint: [0; 3], appearance: None, body: Some("slim\u{1b}[31m".into()), slot: None };
+        assert_eq!(look_label(&hostile), "slim[31m");
     }
 
     #[test]
@@ -1690,7 +1946,7 @@ mod tests {
         let mut m = menu_with(&[]);
         assert!(m.text_input_focused(), "a fresh install opens in the name field");
         press(&mut m, NavKey::Down);
-        assert_eq!(form(&m).focus, Field::Look);
+        assert_eq!(form(&m).focus, Field::Body);
         assert!(!m.text_input_focused());
         press(&mut m, NavKey::Up);
         assert!(m.text_input_focused());

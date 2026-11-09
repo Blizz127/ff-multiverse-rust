@@ -32,7 +32,7 @@ use crate::progress::ProgressMirror;
 use fmv_adapter_api::{AreaRuntime, MoveResult};
 use fmv_core::{AccountId, AnimState, AreaId, AvatarAppearance, EntityId, EntitySnapshot, Pos};
 use fmv_protocol::{NpcSnapshot, ServerMsg, MAX_NPCS_PER_AREA, NPC_NAME_CHARS, NPC_REF_CHARS};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Duration;
 
 /// `MoveIntent` is sent at most this often (20 Hz).
@@ -322,6 +322,25 @@ impl NpcView {
 /// dropped, which draws the default look.
 pub const MAX_APPEARANCE_REF: usize = 64;
 
+/// Sightings kept until the loop takes them ([`ClientState::drain_peer_sightings`]); beyond this the oldest are
+/// dropped (a window never takes them).
+const MAX_PEER_SIGHTINGS: usize = 64;
+
+/// What this client saw of another player the first time it appeared in the area, or when its colour or its
+/// binding (the `appearance_ref` the game draws it with) changed: the headless bot says it as one
+/// `headless: peer` line, which is how a smoke test sees each player's binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerSighting {
+    pub entity: EntityId,
+    /// The player's name, cleaned.
+    pub name: String,
+    pub tint: [u8; 3],
+    /// The `appearance_ref` of its entity, as the server said it (bounded by [`MAX_APPEARANCE_REF`]).
+    pub binding: Option<String>,
+    /// The area it was seen in (ours: the one this client joined and checked against its own content).
+    pub area: AreaId,
+}
+
 /// An `appearance_ref` from the network as stored: at most [`MAX_APPEARANCE_REF`] bytes.
 fn kept_appearance(avatar: &AvatarAppearance) -> Option<String> {
     avatar.appearance_ref.as_deref().filter(|r| r.len() <= MAX_APPEARANCE_REF).map(str::to_string)
@@ -357,6 +376,11 @@ pub struct ClientState {
     last_rtt: Option<Duration>,
     /// The look the server shows for our own entity (from its snapshots).
     own_appearance: Option<String>,
+    /// What was last reported of each other player's colour and binding in the CURRENT area (a full snapshot
+    /// of the area does not forget it: an unchanged player is not reported again; a change of area does).
+    peer_looks: BTreeMap<EntityId, ([u8; 3], Option<String>)>,
+    /// Players seen or changed, until the loop takes them; bounded by [`MAX_PEER_SIGHTINGS`].
+    peer_sightings: VecDeque<PeerSighting>,
 }
 
 impl ClientState {
@@ -379,6 +403,8 @@ impl ClientState {
             area_changes: 0,
             last_rtt: None,
             own_appearance: None,
+            peer_looks: BTreeMap::new(),
+            peer_sightings: VecDeque::new(),
         }
     }
 
@@ -415,6 +441,7 @@ impl ClientState {
         self.npcs.clear();
         self.npc_epoch += 1;
         self.peers_seen.clear();
+        self.peer_looks.clear();
         self.own = OwnPlayer::at(arrival, facing);
         if forward {
             self.area_changes += 1;
@@ -444,6 +471,11 @@ impl ClientState {
     /// The look the server shows for our own entity (`appearance_ref`), if it said.
     pub fn own_appearance(&self) -> Option<&str> {
         self.own_appearance.as_deref()
+    }
+
+    /// The other players first seen (or whose colour or binding changed) since the last call, oldest first.
+    pub fn drain_peer_sightings(&mut self) -> Vec<PeerSighting> {
+        self.peer_sightings.drain(..).collect()
     }
 
     /// Apply one server message. Returns `Some(reason)` when the session must end: the server
@@ -537,6 +569,15 @@ impl ClientState {
             return;
         }
         let name = AvatarAppearance::sanitize_name(&snap.avatar.display_name).unwrap_or_else(|| "?".to_string());
+        // The first time this player is seen in the area, and whenever its colour or binding changes: a note.
+        let shown = (snap.avatar.tint, kept_appearance(&snap.avatar));
+        if self.peer_looks.get(&snap.id) != Some(&shown) && (self.peer_looks.len() < MAX_PEERS_SEEN || self.peer_looks.contains_key(&snap.id)) {
+            self.peer_looks.insert(snap.id, shown.clone());
+            if self.peer_sightings.len() >= MAX_PEER_SIGHTINGS {
+                self.peer_sightings.pop_front();
+            }
+            self.peer_sightings.push_back(PeerSighting { entity: snap.id, name: name.clone(), tint: shown.0, binding: shown.1, area: self.area.clone() });
+        }
         let r = self.remotes.entry(snap.id).or_insert_with(|| Remote {
             name: String::new(),
             tint: snap.avatar.tint,
@@ -658,6 +699,77 @@ mod tests {
         // A leaving peer disappears from rendering but stays counted as "seen".
         s.apply(0.6, ServerMsg::PlayerLeft { entity: EntityId(3) });
         assert_eq!((s.peers_seen(), s.remote_count()), (3, 2));
+    }
+
+    /// Another player's first appearance in the area, and each change of its colour or binding, is one
+    /// sighting. An unchanged player in a full snapshot or an update is none (and never every frame); we are
+    /// never one; a change of area starts over.
+    #[test]
+    fn a_player_is_sighted_when_first_seen_and_when_its_colour_or_binding_changes() {
+        let with = |id: u64, tint: [u8; 3], binding: Option<&str>| EntitySnapshot {
+            avatar: AvatarAppearance { display_name: format!("p{id}"), tint, appearance_ref: binding.map(str::to_string) },
+            ..snap(id, 0.0, 0.0)
+        };
+        let sighting = |id: u64, tint: [u8; 3], binding: Option<&str>, area: &AreaId| PeerSighting {
+            entity: EntityId(id),
+            name: format!("p{id}"),
+            tint,
+            binding: binding.map(str::to_string),
+            area: area.clone(),
+        };
+        let full = |entities| ServerMsg::AreaSnapshot { area: plaza(), tick: 0, entities, npcs: vec![] };
+        let mut s = state(at(0.0));
+        // The snapshot of the area: us (never a sighting) and one peer.
+        s.apply(0.0, full(vec![snap(1, 0.0, 0.0), with(2, [9, 9, 9], Some("ff7/body/sturdy"))]));
+        assert_eq!(s.drain_peer_sightings(), [sighting(2, [9, 9, 9], Some("ff7/body/sturdy"), &plaza())]);
+        assert!(s.drain_peer_sightings().is_empty(), "taken once");
+        // The same peer again, in a full snapshot and in updates: nothing, however often.
+        s.apply(0.1, full(vec![snap(1, 0.0, 0.0), with(2, [9, 9, 9], Some("ff7/body/sturdy"))]));
+        for t in 1..5 {
+            s.apply(0.2 + f64::from(t), update(vec![with(2, [9, 9, 9], Some("ff7/body/sturdy"))]));
+        }
+        assert!(s.drain_peer_sightings().is_empty());
+        // A player who joins, one whose binding changes, one whose colour changes, one whose appearance goes.
+        s.apply(1.0, ServerMsg::PlayerJoined { snapshot: with(3, [1, 2, 3], None) });
+        s.apply(1.1, update(vec![with(2, [9, 9, 9], Some("ff7/body/slim"))]));
+        s.apply(1.2, update(vec![with(3, [7, 7, 7], None)]));
+        s.apply(1.3, update(vec![with(2, [9, 9, 9], None)]));
+        assert_eq!(
+            s.drain_peer_sightings(),
+            [
+                sighting(3, [1, 2, 3], None, &plaza()),
+                sighting(2, [9, 9, 9], Some("ff7/body/slim"), &plaza()),
+                sighting(3, [7, 7, 7], None, &plaza()),
+                sighting(2, [9, 9, 9], None, &plaza()),
+            ]
+        );
+        // Leaving and coming back as the same thing is not a new sighting; coming back as something else is.
+        s.apply(2.0, ServerMsg::PlayerLeft { entity: EntityId(3) });
+        s.apply(2.1, ServerMsg::PlayerJoined { snapshot: with(3, [7, 7, 7], None) });
+        assert!(s.drain_peer_sightings().is_empty());
+        s.apply(2.2, ServerMsg::PlayerLeft { entity: EntityId(3) });
+        s.apply(2.3, ServerMsg::PlayerJoined { snapshot: with(3, [7, 7, 7], Some("ff7/body/tall")) });
+        assert_eq!(s.drain_peer_sightings(), [sighting(3, [7, 7, 7], Some("ff7/body/tall"), &plaza())]);
+        // A binding too long for the protocol is not kept (the default look is drawn), as for every look.
+        s.apply(3.0, update(vec![with(4, [5, 5, 5], Some(&"x".repeat(MAX_APPEARANCE_REF + 1)))]));
+        assert_eq!(s.drain_peer_sightings(), [sighting(4, [5, 5, 5], None, &plaza())]);
+        // The server moves us to another area: whoever is there is seen afresh, with that area named.
+        let yard = AreaId { game: GameId::Fixture, key: "yard".into() };
+        s.change_area(yard.clone(), at(0.0), 0.0, true);
+        s.apply(4.0, ServerMsg::AreaSnapshot { area: yard.clone(), tick: 1, entities: vec![snap(1, 0.0, 0.0), with(2, [9, 9, 9], None)], npcs: vec![] });
+        assert_eq!(s.drain_peer_sightings(), [sighting(2, [9, 9, 9], None, &yard)]);
+    }
+
+    /// A window never takes the sightings: they are bounded, the oldest go.
+    #[test]
+    fn the_sightings_are_bounded() {
+        let mut s = state(at(0.0));
+        for id in 2..(2 + 3 * MAX_PEER_SIGHTINGS as u64) {
+            s.apply(0.0, update(vec![snap(id, 0.0, 0.0)]));
+        }
+        let kept = s.drain_peer_sightings();
+        assert_eq!(kept.len(), MAX_PEER_SIGHTINGS);
+        assert_eq!(kept.last().map(|p| p.entity), Some(EntityId(1 + 3 * MAX_PEER_SIGHTINGS as u64)), "the newest are kept");
     }
 
     #[test]

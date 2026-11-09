@@ -290,8 +290,7 @@ fn run(args: Args) -> u8 {
     let cfg = NetConfig {
         server: args.server.clone(),
         auth: plan.auth(),
-        tint: args.effective_tint(plan.name()),
-        appearance_ref: None,
+        character: args.new_character(plan.name()),
         client_build,
         timing: net::SessionTiming::DEFAULT,
         token_sink: plan.token_sink(&store, &args.server),
@@ -319,10 +318,10 @@ fn run(args: Args) -> u8 {
     }
 
     announce_joined(&joined);
-    // The window (not a headless bot, whose accounts folder stays exactly as it was) remembers how
-    // the server shows this character, so the character menu can show it next time.
+    // The window (not a headless bot, whose accounts folder stays exactly as it was) remembers what the
+    // server holds of this character, so the character menu can show it next time.
     if !args.headless {
-        ui::looks::LookCache::new(&state_dir).remember_joined(&args.server, plan.name(), &joined.entities, joined.entity);
+        ui::looks::LookCache::new(&state_dir).remember_card(&args.server, plan.name(), &joined.character);
     }
 
     let mut session = Session::new(net, joined);

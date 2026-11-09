@@ -85,7 +85,7 @@ mod tests {
     use crate::ui::testkit::{serve_join, Reply};
     use fmv_core::EntityId;
     use fmv_fixture::FixtureAdapter;
-    use fmv_protocol::{Auth, Secret};
+    use fmv_protocol::{Auth, NewCharacter, Secret};
     use std::net::TcpListener;
     use std::time::Instant;
 
@@ -93,8 +93,7 @@ mod tests {
         NetConfig {
             server,
             auth,
-            tint: [1, 2, 3],
-            appearance_ref: None,
+            character: NewCharacter::with_tint([1, 2, 3]),
             client_build: "test".into(),
             timing: SessionTiming::DEFAULT,
             token_sink: TokenSink::new(|_| Ok(())),

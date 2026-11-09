@@ -191,12 +191,13 @@ impl Offscreen {
 
 /// How a [`serve_join`] server answers the `Hello`.
 pub enum Reply {
-    /// Welcome (issuing `token` if given), the fixture area, and a snapshot whose own entity is
-    /// `stored` (the profile a server would hold for a login); without it, the look the `Hello`
-    /// asked for (a registration). With a `gate`, the server waits for a message on it before it
-    /// sends the `Welcome`: a test can change something on disk and then release it, with no
-    /// timing involved.
-    Join { stored: Option<fmv_core::AvatarAppearance>, token: Option<&'static str>, gate: Option<std::sync::mpsc::Receiver<()>> },
+    /// Welcome (issuing `token` if given), the fixture area, and a snapshot whose own entity is drawn
+    /// from `stored` (the character a server would hold for a login: the card its `Welcome` carries);
+    /// without it, the character the `Hello` asked for (a registration), the way a server with FF7's
+    /// bodies would make it (the binding is `ff7/body/<body>`). With a `gate`, the server waits for a
+    /// message on it before it sends the `Welcome`: a test can change something on disk and then release
+    /// it, with no timing involved.
+    Join { stored: Option<fmv_protocol::CharacterCard>, token: Option<&'static str>, gate: Option<std::sync::mpsc::Receiver<()>> },
     /// Refuse the `Hello` with this code and sentence (the client acts on the code).
     Reject(fmv_protocol::RejectCode, &'static str),
 }
@@ -224,7 +225,7 @@ pub fn serve_join(reply: Reply) -> (String, std::thread::JoinHandle<Seen>) {
     use fmv_adapter_api::GameAdapter;
     use fmv_core::{AccountId, AnimState, AvatarAppearance, EntityId, EntitySnapshot, SessionId};
     use fmv_fixture::FixtureAdapter;
-    use fmv_protocol::{read_msg, write_msg, Auth, ClientMsg, Secret, ServerMsg, PROTOCOL_VERSION};
+    use fmv_protocol::{read_msg, write_msg, Auth, CharacterCard, ClientMsg, Secret, ServerMsg, PROTOCOL_VERSION};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr").to_string();
     let handle = std::thread::spawn(move || {
@@ -251,11 +252,22 @@ pub fn serve_join(reply: Reply) -> (String, std::thread::JoinHandle<Seen>) {
                     (stored, token)
                 }
             };
-            let ClientMsg::Hello { auth, tint, appearance_ref, .. } = hello else { panic!("the first message must be Hello") };
-            let own = stored.unwrap_or_else(|| match auth {
-                Auth::Register { display_name } => AvatarAppearance::new(display_name, tint, appearance_ref),
-                Auth::Token(_) => AvatarAppearance::new("tester", tint, appearance_ref),
+            let ClientMsg::Hello { auth, character, .. } = hello else { panic!("the first message must be Hello") };
+            let card = stored.unwrap_or_else(|| {
+                let name = match auth {
+                    Auth::Register { display_name } => display_name,
+                    Auth::Token(_) => "tester".to_string(),
+                };
+                CharacterCard {
+                    name,
+                    tint: character.tint,
+                    binding: character.body.as_ref().map(|body| format!("ff7/body/{body}")),
+                    body: character.body,
+                    slot: character.slot,
+                    migrated: false,
+                }
             });
+            let own = AvatarAppearance::new(card.name.clone(), card.tint, card.binding.clone());
             let adapter = FixtureAdapter::new();
             let info = adapter.list_areas().remove(0);
             let welcome = ServerMsg::Welcome {
@@ -265,6 +277,7 @@ pub fn serve_join(reply: Reply) -> (String, std::thread::JoinHandle<Seen>) {
                 entity: EntityId(7),
                 account: AccountId(42),
                 issued_token: token.map(Secret::new),
+                character: card,
             };
             write_msg(&mut wr, &welcome).await.expect("welcome");
             let manifest = ServerMsg::AreaManifest {
@@ -352,7 +365,7 @@ fn random_entries(rng: &mut Rng, max: usize) -> Vec<CharacterEntry> {
     (0..rng.below(max + 1))
         .map(|i| CharacterEntry {
             name: format!("Hero {i}{}", rng.below(3)),
-            look: rng.chance(2).then(|| Look { tint: [rng.below(256) as u8, 1, 2], appearance: None }),
+            look: rng.chance(2).then(|| Look { tint: [rng.below(256) as u8, 1, 2], appearance: None, body: rng.chance(2).then(|| rng.string(8)), slot: rng.chance(2).then(|| rng.below(300) as u8) }),
             loose_permissions: rng.chance(4),
         })
         .collect()
@@ -373,8 +386,11 @@ pub fn assert_sane(m: &Menu, what: &str) {
             assert!(f.name.len() <= 24, "{what}: {} characters in the name", f.name.len());
             assert!(f.palette_cursor < crate::ui::palette::PALETTE.len(), "{what}");
             assert!(f.fields().contains(&f.focus), "{what}: focus on a field that is not there");
-            if f.has_looks() {
-                assert!(f.appearance < m.appearances().len(), "{what}");
+            if f.has_bodies() {
+                assert!(f.body < m.bodies().len(), "{what}");
+            }
+            if f.has_slots() {
+                assert!(f.slot < m.slots().len(), "{what}");
             }
             assert!(f.name.cursor() <= f.name.len(), "{what}");
         }

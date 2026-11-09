@@ -14,8 +14,8 @@ use fmv_adapter_api::GameAdapter;
 use fmv_core::{AccountId, AnimState, AvatarAppearance, EntityId, EntitySnapshot, PhaseKey, Pos, SessionId};
 use fmv_fixture::FixtureAdapter;
 use fmv_protocol::{
-    read_msg, write_msg, BattleId, BattleMember, BattleRejection, BattleReward, ClientMsg, InstanceKey, InventoryEntry, Placement, Secret,
-    ServerMsg, PROTOCOL_VERSION,
+    read_msg, write_msg, BattleId, BattleMember, BattleRejection, BattleReward, CharacterCard, ClientMsg, InstanceKey, InventoryEntry, Placement,
+    Secret, ServerMsg, PROTOCOL_VERSION,
 };
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
@@ -103,6 +103,15 @@ async fn serve(stream: TcpStream, on_request: OnRequest) -> Report {
             entity: EntityId(7),
             account,
             issued_token: Some(Secret::new("fmvt_fake_battle_test")),
+            // A new character of a server with FF7's bodies: a placeholder body, in Barret's combat slot.
+            character: CharacterCard {
+                name: "Tester".into(),
+                tint: [200, 100, 50],
+                body: Some("sturdy".into()),
+                binding: Some("ff7/body/sturdy".into()),
+                slot: Some(1),
+                migrated: false,
+            },
         },
     )
     .await
@@ -137,7 +146,7 @@ async fn serve(stream: TcpStream, on_request: OnRequest) -> Report {
     };
     write_msg(&mut wr, &ServerMsg::InstancePlacement { placement }).await.unwrap();
     if matches!(on_request, OnRequest::FightAndPay(_)) {
-        let joined = ServerMsg::CharacterProgress { character: 0, level: 6, exp: 610, exp_to_next: 6, gil: 0, ap: 0, leveled_up: false };
+        let joined = ServerMsg::CharacterProgress { character: 1, level: 6, exp: 610, exp_to_next: 6, gil: 0, ap: 0, leveled_up: false };
         write_msg(&mut wr, &joined).await.unwrap();
         let stock = ServerMsg::Inventory { items: vec![InventoryEntry::new(0, 3), InventoryEntry::new(3, 1), InventoryEntry::new(7, 1)] };
         write_msg(&mut wr, &stock).await.unwrap();
@@ -165,7 +174,8 @@ async fn serve(stream: TcpStream, on_request: OnRequest) -> Report {
                                 party: vec![BattleMember {
                                     entity: EntityId(7),
                                     account,
-                                    character: 0,
+                                    name: "Tester".into(),
+                                    character: 1,
                                     level: 5,
                                     weapon: None,
                                     armor: None,
@@ -208,7 +218,7 @@ async fn serve(stream: TcpStream, on_request: OnRequest) -> Report {
                 let _ = write_msg(&mut wr, &ServerMsg::EntityUpdate { tick: 2, entities: vec![entity(7, "Tester", -100.0)] }).await;
                 if matches!(on_request, OnRequest::FightAndPay(_)) {
                     // What the win paid, right after the end: 5 experience, 7 gil, 1 AP, and level 7.
-                    let paid = ServerMsg::CharacterProgress { character: 0, level: 7, exp: 615, exp_to_next: 334, gil: 7, ap: 1, leveled_up: true };
+                    let paid = ServerMsg::CharacterProgress { character: 1, level: 7, exp: 615, exp_to_next: 334, gil: 7, ap: 1, leveled_up: true };
                     let _ = write_msg(&mut wr, &paid).await;
                     let more = ServerMsg::Inventory { items: vec![InventoryEntry::new(0, 4), InventoryEntry::new(3, 3), InventoryEntry::new(7, 1)] };
                     let _ = write_msg(&mut wr, &more).await;
@@ -248,6 +258,9 @@ fn a_bot_that_is_refused_logs_it_once_never_retries_and_exits_cleanly() {
     let (stdout, stderr) = (stdout_line(&out), String::from_utf8_lossy(&out.stderr).into_owned());
     assert!(out.status.success(), "a refused battle must not fail the bot: {:?}\n{stderr}", out.status);
     assert!(stdout.starts_with("SMOKE name=Tester area=Fixture/plaza fixture=true "), "{stdout}");
+    // After joining, once: what the server holds of the player's own character (the Welcome's card).
+    assert_eq!(stderr.matches("character: ").count(), 1, "{stderr}");
+    assert!(stderr.contains("character: name=Tester tint=c86432 body=sturdy binding=ff7%2Fbody%2Fsturdy slot=1 slot_name=Barret migrated=false"), "{stderr}");
     // A server that reports no progress (no battle data): level 0 and experience 0, which is "unknown".
     assert!(stdout.ends_with(" battles=0 victories=0 area_changes=0 level=0 exp=0 items=0"), "{stdout}");
     assert!(!stderr.contains("progress:"), "nothing was reported, so nothing is noted: {stderr}");
@@ -327,6 +340,8 @@ fn a_battle_freezes_the_player_and_play_goes_on_after_it() {
     // "diverged" and counts the battle and the server's victory.
     assert!(stdout.ends_with(" battles=1 victories=1 area_changes=0 level=0 exp=0 items=0"), "{stdout}");
     assert!(stderr.contains("battle: battle#1 started: formation 3, party of 1, you fight as actor 0"), "{stderr}");
+    // Who fights, at the start of the battle: the player's own name and the combat slot (Barret's), by key.
+    assert!(stderr.contains("battle: roster actor=0 name=Tester slot=1 slot_name=Barret level=5"), "{stderr}");
     assert!(stderr.contains("no battle data"), "{stderr}");
     assert!(stderr.contains("battle: battle#1 ended in Victory (you earned 5 exp, 7 gil, 1 ap); back in the field"), "{stderr}");
     assert!(stderr.contains("headless: after the last battle:"), "{stderr}");
@@ -356,8 +371,9 @@ fn the_progress_the_server_reports_is_noted_and_ends_the_smoke_line() {
     // The inventory the server said last: Potion x4, Ether x3 and Phoenix Down x1 are 8 items.
     assert!(stdout.ends_with(" battles=1 victories=1 area_changes=0 level=7 exp=615 items=8"), "{stdout}");
     // Said once on joining and once after the win, in that order, with `key=value` numbers a script can read.
-    let on_joining = "progress: Cloud level=6 exp=610 exp_to_next=6 gil=0 ap=0 leveled_up=false (on joining)";
-    let after_the_win = "progress: Cloud level=7 exp=615 exp_to_next=334 gil=7 ap=1 leveled_up=true (was level 6)";
+    // They say who the player is (its own name) and the combat slot it fights in, which is Barret's here.
+    let on_joining = "progress: name=Tester slot=Barret level=6 exp=610 exp_to_next=6 gil=0 ap=0 leveled_up=false (on joining)";
+    let after_the_win = "progress: name=Tester slot=Barret level=7 exp=615 exp_to_next=334 gil=7 ap=1 leveled_up=true (was level 6)";
     let (a, b) = (stderr.find(on_joining), stderr.find(after_the_win));
     assert!(a.is_some() && b.is_some() && a < b, "{stderr}");
     assert_eq!(stderr.matches("progress: ").count(), 2, "one note per message: {stderr}");

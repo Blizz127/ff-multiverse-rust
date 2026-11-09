@@ -2,11 +2,11 @@
 //! headless bot loop and the window loop.
 
 use crate::battle::BattleCmd;
-use crate::net::{check_local_content, clean, AreaAnswer, Joined, LocalContent, NetCommand, NetEvent, NetHandle, PartyCommand};
+use crate::net::{check_local_content, clean, AreaAnswer, Joined, LocalContent, NetCommand, NetEvent, NetHandle, PartyCommand, UNKNOWN_CHARACTER_NAME};
 use crate::state::ClientState;
 use fmv_adapter_api::{AreaRuntime, GameAdapter};
 use fmv_core::{AreaId, AvatarAppearance, EntityId, EntitySnapshot, Fingerprint, Pos, ProvenanceSummary};
-use fmv_protocol::ServerMsg;
+use fmv_protocol::{CharacterCard, ServerMsg};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -20,6 +20,10 @@ pub struct SessionInfo {
     pub area_id: AreaId,
     /// True for synthetic FIXTURE content, which must be labelled everywhere it is surfaced.
     pub fixture: bool,
+    /// What the server holds of our own character (protocol v8; cleaned and bounded, see
+    /// `crate::net::keep_card`): its name, colour, body choice, how the game draws it (the binding) and the
+    /// combat slot it fights with. What the window and the headless bot show of who we are.
+    pub card: CharacterCard,
 }
 
 /// Shown for our own entity if the first snapshot (against the protocol) does not contain it.
@@ -85,6 +89,7 @@ impl Session {
         let Joined {
             entity,
             account,
+            character,
             area_id,
             fixture,
             area,
@@ -100,6 +105,11 @@ impl Session {
             .unwrap_or(Pos::new(0.0, 0.0, 0.0));
         let origin = Instant::now();
         let mut state = ClientState::new(entity, account, spawn, area_id.clone());
+        // Who we are, BEFORE the backlog is applied: the progress the server sent on joining is noted (and
+        // shown) with the player's name, which the mirror cannot know otherwise.
+        let (name, tint) = own_identity(&entities, entity);
+        let player = if character.name == UNKNOWN_CHARACTER_NAME { name.as_str() } else { character.name.as_str() };
+        state.progress.set_player(player);
         let mut pending_end = None;
         for msg in backlog {
             // The handshake already refuses a Reject, a foreign snapshot and a second manifest, so
@@ -108,12 +118,12 @@ impl Session {
                 pending_end.get_or_insert(reason);
             }
         }
-        let (name, tint) = own_identity(&entities, entity);
         let info = SessionInfo {
             name,
             tint,
             area_id,
             fixture,
+            card: character,
         };
         Self {
             net,
@@ -317,7 +327,7 @@ mod tests {
     use fmv_adapter_api::{AdapterError, AreaInfo};
     use fmv_core::{AccountId, GameId, SessionId};
     use fmv_fixture::rooms::{RoomsAdapter, HALL, YARD, YARD_ARRIVAL};
-    use fmv_protocol::{read_msg, write_msg, Auth, ClientMsg, NpcSnapshot, ServerMsg, PROTOCOL_VERSION};
+    use fmv_protocol::{read_msg, write_msg, Auth, ClientMsg, NewCharacter, NpcSnapshot, ServerMsg, PROTOCOL_VERSION};
 
     /// Only the hall of the rooms: a machine that does not hold the yard.
     struct OnlyHall(RoomsAdapter);
@@ -363,8 +373,7 @@ mod tests {
         NetConfig {
             server: addr.to_string(),
             auth: Auth::Register { display_name: "Me".into() },
-            tint: [1, 2, 3],
-            appearance_ref: None,
+            character: NewCharacter::with_tint([1, 2, 3]),
             client_build: "test".into(),
             timing: SessionTiming::DEFAULT,
             token_sink: TokenSink::new(|_| Ok(())),
@@ -389,6 +398,7 @@ mod tests {
             entity: EntityId(7),
             account: AccountId(1),
             issued_token: None,
+            character: CharacterCard::plain("Me", [1, 2, 3]),
         };
         write_msg(&mut wr, &welcome).await.unwrap();
         let manifest = ServerMsg::AreaManifest {
