@@ -537,8 +537,16 @@ fn check_models(b: &RealBattle, kit: &mut ModelKit, case: &Case) {
         let canon = kit.rigs.resolve(&model, BoxSpec::for_party(0));
         assert!(Arc::ptr_eq(&rig.asset, &canon.asset), "{}: member {i} is canon character {character}'s own battle model", case.name);
     }
+    // The size a field body is drawn at beside the canon battle models is MEASURED from Cloud's own two models (the
+    // owner's report of 2026-11-09: at the stand-in scale his character stood about twice as tall as Cloud and Barret).
+    let field_scale = kit.rigs.field_scale();
+    let cloud = &members[0];
+    eprintln!("{}: field bodies at {field_scale:.2} battle units per field unit (the stand-in scale is {}); Cloud's battle model {:.0} tall", case.name, model::FIELD_TO_BATTLE_SCALE, cloud.height);
     for (i, rig) in members.iter().enumerate().skip(CANON.len()) {
-        assert_eq!(rig.scale, model::FIELD_TO_BATTLE_SCALE, "{}: player {i} is a field body at the field's scale", case.name);
+        assert_eq!(rig.scale, field_scale, "{}: player {i} is a field body at the measured scale", case.name);
+        let ratio = rig.height / cloud.height;
+        eprintln!("{}: player {i} is {:.0} tall, {ratio:.2} of Cloud", case.name, rig.height);
+        assert!((0.75..=1.3).contains(&ratio), "{}: player {i} is {ratio:.2} times as tall as the canon Cloud (a body stands about as tall as he does)", case.name);
         assert!(rig.attachments.is_empty(), "{}: a field body carries no weapon", case.name);
         assert_eq!(rig.kit, Kit::none(), "{}: a field body has no battle clips of its own", case.name);
         // Every case here gives each player a body of its own, so no two members share a model.
