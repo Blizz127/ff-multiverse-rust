@@ -160,6 +160,40 @@
 //!
 //! A server without battle data (the FIXTURE one) has no items and sends none.
 //!
+//! # Story, phases and instances
+//!
+//! Each account has ONE story progression per game (`fmv-persist`'s `Progression` blob; only the
+//! game's adapter reads it, an empty one is a new account). It is the account's, not the player's
+//! character's: it does not depend on the look or the combat slot. The adapter turns it into a story
+//! PHASE for each area (`AreaRuntime::phase_key`, an opaque key that the empty progression maps to the
+//! empty key in every area), and the world keeps one INSTANCE of an area per phase that somebody is
+//! in: players see, hear and fight with only the players of their own instance.
+//!
+//! * Solo, a player is in the instance of its own phase. In a party every member is in the instance
+//!   of the LEADER's phase (for the area the member stands in) and keeps its own progression;
+//!   [`Placement::story_advance_allowed`] is whether the story may advance for it there (its own phase
+//!   is the one that chose the instance).
+//! * The server moves a player between two instances of the SAME area when its placement changes (it
+//!   advanced the story, a party formed, changed leader or broke up). Everyone left behind gets
+//!   `PlayerLeft`, the player gets a fresh `AreaSnapshot` of the instance it is in (the same area, the
+//!   entities and NPCs of that instance) and then its `InstancePlacement`, and the instance it enters
+//!   gets `PlayerJoined`. A client already replaces its whole picture of an area on a snapshot.
+//! * The story advances only by something the server verifies for itself: the player's validated
+//!   position reaches a story point of the area (for FF7 the loop of a field script that sets the
+//!   main progress counter when a player's character stands on a walkmesh triangle; see
+//!   `fmv-ff7`'s `story`). The server logs it as one line,
+//!   `story advanced account=<n> entity=<n> area=<AreaId> point=<id> moment=<from>-><to>`, saves it,
+//!   and tells the player with [`ServerMsg::StoryUpdate`] and, if its phase changed, the move above.
+//!
+//! ```text
+//! S -> C  AreaSnapshot, InstancePlacement, CharacterProgress, Inventory, StoryUpdate { advance: None }   join, non-default story only
+//! S -> C  StoryUpdate { progress, advance: Some { point, summary } }       the story advanced
+//! S -> C  AreaSnapshot { same area, the new instance's entities and NPCs }, InstancePlacement   its phase changed
+//! (S -> old instance  PlayerLeft { entity })    (S -> new instance  PlayerJoined { snapshot })
+//! ```
+//!
+//! An account that has never advanced gets exactly the messages it always got.
+//!
 //! # Accounts
 //!
 //! `Hello::auth` is [`Auth::Register`] (create an account with that display name) or
@@ -529,6 +563,26 @@ pub enum ServerMsg {
     /// dropped it items (see the module docs, "Inventory"). `items` is at most
     /// [`MAX_INVENTORY_STACKS`] entries, one per item, none of zero.
     Inventory { items: Vec<InventoryEntry> },
+    /// This player's story progress, as the server holds it (see the module docs, "Story"): sent right
+    /// after the join messages when the account's progression is not a new account's (the empty
+    /// blob), and again whenever the server advances it (`advance` says which story point did). A
+    /// client that never receives one is a new account. `progress` is the game's own opaque blob
+    /// (FF7: `[1, moment_lo, moment_hi]`): the client's adapter reads it, nothing else may.
+    StoryUpdate {
+        progress: Vec<u8>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        advance: Option<StoryAdvance>,
+    },
+}
+
+/// What moved a player's story (see [`ServerMsg::StoryUpdate`]): the story point the server saw it
+/// reach and what it changed, in the adapter's own `key=value` words (FF7: `moment=1->6`; numbers
+/// and names of the adapter's own, never text of the game).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoryAdvance {
+    /// The area's id of the story point (`AreaRuntime::story_points`).
+    pub point: u32,
+    pub summary: String,
 }
 
 impl ServerMsg {
@@ -817,6 +871,34 @@ mod tests {
                 r#""party":1,"phase_owner":1,"story_advance_allowed":true}}}"#
             ),
         );
+        // A phase key is just bytes in the placement: a non-default one changes nothing about its shape.
+        golden(
+            ServerMsg::InstancePlacement {
+                placement: Placement {
+                    account: AccountId(2),
+                    key: InstanceKey::new(AreaId { game: GameId::Ff7, key: "md1stin".into() }, PhaseKey(vec![0x4D, 2, 0])),
+                    party: None,
+                    phase_owner: AccountId(2),
+                    story_advance_allowed: true,
+                },
+            },
+            concat!(
+                r#"{"InstancePlacement":{"placement":{"account":2,"key":{"area":{"game":"Ff7","key":"md1stin"},"phase":[77,2,0]},"#,
+                r#""party":null,"phase_owner":2,"story_advance_allowed":true}}}"#
+            ),
+        );
+    }
+
+    #[test]
+    fn golden_story_update() {
+        // A step: the whole progression (the game's opaque blob) and what moved it.
+        golden(
+            ServerMsg::StoryUpdate { progress: vec![1, 6, 0], advance: Some(StoryAdvance { point: 0, summary: "moment=1->6".into() }) },
+            r#"{"StoryUpdate":{"progress":[1,6,0],"advance":{"point":0,"summary":"moment=1->6"}}}"#,
+        );
+        // Said at join: no `advance` key at all.
+        golden(ServerMsg::StoryUpdate { progress: vec![1, 6, 0], advance: None }, r#"{"StoryUpdate":{"progress":[1,6,0]}}"#);
+        golden(ServerMsg::StoryUpdate { progress: vec![], advance: None }, r#"{"StoryUpdate":{"progress":[]}}"#);
     }
 
     // -----------------------------------------------------------------------------------------

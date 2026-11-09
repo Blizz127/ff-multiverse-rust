@@ -34,6 +34,8 @@ mod progress;
 mod render;
 mod session;
 mod state;
+mod story;
+mod talkbot;
 mod ui;
 mod window;
 
@@ -330,7 +332,7 @@ fn run(args: Args) -> u8 {
         session = session.with_content(Arc::clone(content));
     }
     match event_loop {
-        None => headless::run(&args, session),
+        None => headless::run(&args, session, ff7),
         Some(el) => {
             let view = field_view(ff7.as_deref(), &session);
             window::run(el, session, view, ff7, device)

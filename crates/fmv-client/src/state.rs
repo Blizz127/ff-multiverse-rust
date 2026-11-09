@@ -29,6 +29,7 @@ use crate::battle::BattleClient;
 use crate::interp::{normalize_angle, Pose, Sample, SnapshotBuffer};
 use crate::party::{nearest_peer, PartyMirror};
 use crate::progress::ProgressMirror;
+use crate::story::StoryMirror;
 use fmv_adapter_api::{AreaRuntime, MoveResult};
 use fmv_core::{AccountId, AnimState, AreaId, AvatarAppearance, EntityId, EntitySnapshot, Pos};
 use fmv_protocol::{NpcSnapshot, ServerMsg, MAX_NPCS_PER_AREA, NPC_NAME_CHARS, NPC_REF_CHARS};
@@ -360,6 +361,8 @@ pub struct ClientState {
     /// What the server says our character has earned (level, experience, AP, gil; see
     /// `crate::progress`). Empty until it says (a server without battles never does).
     pub progress: ProgressMirror,
+    /// Where the server says our story stands (see `crate::story`). Empty until it says: a new account.
+    pub story: StoryMirror,
     remotes: BTreeMap<EntityId, Remote>,
     /// The non-player characters of the current area (from its `AreaSnapshot`).
     npcs: Vec<NpcView>,
@@ -394,6 +397,7 @@ impl ClientState {
             party: PartyMirror::new(account),
             battle: BattleClient::new(account),
             progress: ProgressMirror::default(),
+            story: StoryMirror::default(),
             remotes: BTreeMap::new(),
             npcs: Vec::new(),
             npc_epoch: 0,
@@ -549,6 +553,9 @@ impl ClientState {
             // menu's Item list is made of it. Like the progress it is the server's word and never ends
             // the session.
             ServerMsg::Inventory { items } => self.battle.on_inventory(now, items),
+            // Where our story stands (the server's word, never ends the session): the mirror keeps the
+            // blob for whatever reads story variables on this side (see `crate::story`).
+            ServerMsg::StoryUpdate { progress, advance } => self.story.on_update(progress, advance),
         }
         None
     }

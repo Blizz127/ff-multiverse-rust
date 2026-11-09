@@ -101,6 +101,14 @@ HEADLESS OUTPUT:
   `headless: <n> NPC(s) in <AreaId>: <names>` and, for each of them, `headless: npc area=<AreaId>
   id=<n> name=<enc> model=<enc>` whenever the area's non-player characters change: the canon characters
   of a field stay in it whoever holds their slot.
+  --talk NAME[,NAME...] talks to those characters once each, as soon as the area announces them, through
+  the window's own conversation code (their own talk scripts in your copy of the field, read with the story
+  this player has reached): `talk: npc=<enc> story=<moment|-> window=<n> origin=<canon|added> [ask=<first>-<last>]
+  text=<enc>` for each message window (a question is answered with the cursor's starting line),
+  `talk: npc=<enc> story=<moment|-> ended=<Finished|Budget|Broken|MapJump|Battle|MiniGame|GameOver|Limit>
+  windows=<n>` when it is over, `talk: npc=<enc> story=<moment|-> nothing to say` for a character without a
+  talk script, and `talk: npc=<enc> was never in the area` at the end for one the area never announced. The
+  text is the game's own, never renamed for the player.
   A server that goes silent for 10 s is treated as gone (exit code 1, the summary is still printed).
   Party events and refusals are logged on stderr, one `party:` line each.
   --party-invite-first-peer invites the visible player with the lowest entity id (a refused invite
@@ -367,6 +375,34 @@ pub struct Args {
     /// see it too, before it moves on. Bots without --travel never cross an exit by accident.
     #[arg(long, value_name = "AREA[,AREA...]", value_delimiter = ',', value_parser = parse_area_key, requires = "headless")]
     pub travel: Vec<String>,
+
+    // ---- story (phasing): one contiguous block ----
+    /// Advance this player's story as a bot (headless only): walk to the story point of the area it
+    /// stands in that would advance THIS account's story (the same points and rule the server uses; in
+    /// FF7's first field `md1stin` it is walkmesh triangle 12), stay there until the server has moved the
+    /// story, then stand still. The server decides: the bot only goes where the data says the story
+    /// happens. With --party-invite-first-peer it first waits (at most 15 s) until its invite is out.
+    /// Never crosses an exit. Run the server with --no-random-encounters (or give the bot --battle-auto):
+    /// a bot caught in a battle without it stands frozen until the run ends.
+    #[arg(long, requires = "headless")]
+    pub story_advance: bool,
+
+    /// With --party-accept: do not accept an invite until a player this bot had seen is no longer in
+    /// view (that other player left its instance: advanced its story, or went away), instead of at once.
+    /// This is how a smoke test joins a party across a phase split.
+    #[arg(long, requires = "party_accept")]
+    pub party_accept_after_split: bool,
+
+    // ---- dialogue: one contiguous block ----
+    /// Talk to these non-player characters of the area as a bot (headless only), through the same conversation
+    /// code the window uses: the character's own talk script, read from YOUR copy of the field's script with the
+    /// story this player has reached, shown exactly as the game wrote it. Each name is the one the area announces
+    /// the character under (the `headless: npc` lines: `gu0` in md1stin), several are separated by commas, and
+    /// each is talked to once, as soon as the area has announced it; the bot does not walk up to them. What they
+    /// say is printed as `talk:` lines on stderr (see HEADLESS OUTPUT); a character without a talk script (the
+    /// canon Barret of md1stin, who is no script entity) has `nothing to say`. Without FF7 data nobody has.
+    #[arg(long, value_name = "NAME[,NAME...]", value_delimiter = ',', value_parser = parse_npc_name, requires = "headless")]
+    pub talk: Vec<String>,
 }
 
 /// Default server for `--server`. Kept in sync with `DEFAULT_DEV_PORT` by a unit test.
@@ -511,6 +547,16 @@ pub fn parse_slot(s: &str) -> Result<u8, String> {
             clean_for_error(s)
         )),
     }
+}
+
+/// A character's name for `--talk`: the label the area announces it under (a script entity's name: `gu0`,
+/// `Barret`), 1 to 24 printable ASCII characters other than the comma that separates the names.
+pub fn parse_npc_name(s: &str) -> Result<String, String> {
+    let name = s.trim();
+    if name.is_empty() || name.chars().count() > 24 || !name.chars().all(|c| c.is_ascii_graphic() || c == ' ') {
+        return Err(format!("`{}` is not a character's name (1 to 24 printable ASCII characters, as the `headless: npc` lines print them)", clean_for_error(s)));
+    }
+    Ok(name.to_string())
 }
 
 /// Deterministic, random-looking, bright tint derived from a name hash (FNV-1a -> hue).
@@ -881,6 +927,35 @@ mod tests {
         }
         let a = Args::try_parse_from(["fmv-client", "--headless", "--party-invite-first-peer", "--party-accept"]).unwrap();
         assert!(a.party_invite_first_peer && a.party_accept);
+    }
+
+    #[test]
+    fn talk_takes_comma_separated_character_names_and_is_headless_only() {
+        assert!(Args::try_parse_from(["fmv-client", "--name", "x", "--talk", "gu0"]).is_err(), "--talk needs --headless");
+        let a = Args::try_parse_from(["fmv-client", "--name", "x", "--headless", "--talk", "gu0,Barret"]).unwrap();
+        assert_eq!(a.talk, ["gu0", "Barret"]);
+        let a = Args::try_parse_from(["fmv-client", "--name", "x", "--headless", "--talk", " gu 1 "]).unwrap();
+        assert_eq!(a.talk, ["gu 1"], "a name keeps its inner space and loses the outer ones");
+        let a = Args::try_parse_from(["fmv-client", "--name", "x", "--headless"]).unwrap();
+        assert!(a.talk.is_empty(), "nobody is talked to unless asked for");
+        // A name is what the area prints a character under: printable ASCII, bounded.
+        for bad in ["", "   ", "a,,b", "x".repeat(25).as_str(), "caf\u{e9}", "line\nbreak", "\u{1b}[31m"] {
+            assert!(Args::try_parse_from(["fmv-client", "--name", "x", "--headless", "--talk", bad]).is_err(), "{bad:?} must be refused");
+        }
+        assert_eq!(parse_npc_name("x".repeat(24).as_str()), Ok("x".repeat(24)));
+        // The help says what the lines mean.
+        use clap::CommandFactory;
+        let help = Args::command().render_long_help().to_string();
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        for needle in [
+            "--talk <NAME[,NAME...]>",
+            "talk: npc=<enc> story=<moment|-> window=<n> origin=<canon|added> [ask=<first>-<last>] text=<enc>",
+            "talk: npc=<enc> story=<moment|-> nothing to say",
+            "talk: npc=<enc> was never in the area",
+            "the canon Barret of md1stin, who is no script entity",
+        ] {
+            assert!(flat.contains(needle), "--help must mention {needle:?}:\n{help}");
+        }
     }
 
     #[test]

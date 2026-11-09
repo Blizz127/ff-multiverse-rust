@@ -492,7 +492,7 @@ impl Conn {
         check_version(protocol_version).map_err(|why| Close::reject(RejectCode::ProtocolMismatch, why))?;
 
         // 2. Who is this? Registration or token login, against the persistent store.
-        let Login { account, avatar, phase, issued_token, progress, card } = self.authenticate(auth, character).await?;
+        let Login { account, avatar, progression, issued_token, progress, card } = self.authenticate(auth, character).await?;
         let registered = issued_token.is_some();
         if registered {
             // Until the Welcome with its token is known to be written, this account is released
@@ -577,7 +577,7 @@ impl Conn {
         self.guard = Some(JoinGuard { shared: Arc::clone(&shared), entity, session });
         let name = avatar.display_name.clone();
         let joined = {
-            let new = NewPlayer { session, entity, account, avatar, phase, progress, tx: self.tx.clone(), close: Arc::clone(&self.close) };
+            let new = NewPlayer { session, entity, account, avatar, progression, progress, tx: self.tx.clone(), close: Arc::clone(&self.close) };
             shared.with_world(|world| world.join(new, Instant::now()).map(|spawn| (spawn, world.player_count())))
         };
         let (spawn, online) = match joined {

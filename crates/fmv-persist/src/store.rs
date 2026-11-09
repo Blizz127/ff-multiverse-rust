@@ -888,6 +888,10 @@ impl Store {
         if !self.index().contains_account(account.0) {
             return Err(PersistError::UnknownAccount(account));
         }
+        self.read_progression(account, game)
+    }
+
+    fn read_progression(&self, account: AccountId, game: GameId) -> Result<Progression> {
         let path = self.progression_path(account.0, game)?;
         let Some(progression) = fsio::read_json::<Progression>(&path, MAX_RECORD_BYTES)? else {
             return Ok(Progression::empty(account, game));
@@ -926,6 +930,51 @@ impl Store {
         let mut stored = progression.clone();
         stored.schema_version = SCHEMA_VERSION;
         fsio::write_json(&path, &stored, MAX_RECORD_BYTES)
+    }
+
+    /// Read-modify-write of the account's [`Progression`] for `game`, as one step that no other
+    /// writer can interleave with: `change` gets the stored record (the empty default if there is none
+    /// yet, as [`Store::get_progression`] returns it) and returns the record to store, which is
+    /// returned in turn. This is what lets a story that only moves forward stay so when two writes for
+    /// one account arrive out of order (the adapter's merge decides, inside `change`).
+    ///
+    /// `change` runs while the store's writer lock is held: it must be quick and must not call back
+    /// into this store (the lock is not reentrant, so that would deadlock). What it returns must be
+    /// for the same account and game and its blob at most [`MAX_BLOB_BYTES`]; otherwise nothing is
+    /// written and the old record stays. A stored record that cannot be read ([`PersistError::Corrupt`],
+    /// [`PersistError::FutureSchema`], [`PersistError::TooLarge`]) is an error and is never replaced by
+    /// a default. Only the `blob` is the caller's to set: `schema_version` is stamped and the
+    /// `updated_at` it returns is stored as given, so pass the time of the write.
+    pub fn update_progression<F>(&self, account: AccountId, game: GameId, change: F) -> Result<Progression>
+    where
+        F: FnOnce(Progression) -> Progression,
+    {
+        let path = self.progression_path(account.0, game)?;
+
+        let _counters = self.writer();
+        if !self.index().contains_account(account.0) {
+            return Err(PersistError::UnknownAccount(account));
+        }
+        let mut next = change(self.read_progression(account, game)?);
+        if next.account_id != account || next.game != game {
+            return Err(PersistError::InvalidField {
+                field: "account_id",
+                reason: format!(
+                    "the updated record is for account {:?} / {}, not the account {:?} / {} it replaces",
+                    next.account_id,
+                    game_key(next.game),
+                    account,
+                    game_key(game)
+                ),
+            });
+        }
+        if next.blob.len() > MAX_BLOB_BYTES {
+            return Err(PersistError::BlobTooLarge { len: next.blob.len(), max: MAX_BLOB_BYTES });
+        }
+        next.schema_version = SCHEMA_VERSION;
+        fsio::ensure_dir(&self.progression_dir(account.0))?;
+        fsio::write_json(&path, &next, MAX_RECORD_BYTES)?;
+        Ok(next)
     }
 
     // ---- character progress ------------------------------------------------------------

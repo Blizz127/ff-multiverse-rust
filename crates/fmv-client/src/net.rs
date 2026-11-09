@@ -650,7 +650,9 @@ where
             | ServerMsg::BattleEnd { .. }
             | ServerMsg::BattleRejected { .. }
             | ServerMsg::CharacterProgress { .. }
-            | ServerMsg::Inventory { .. }) => push_backlog(&mut backlog, other),
+            | ServerMsg::Inventory { .. }
+            // Where the player's story stands (said once on joining when it is not a new account's).
+            | ServerMsg::StoryUpdate { .. }) => push_backlog(&mut backlog, other),
         }
         if let (Some(_), Some(_), Some(_)) = (&welcome, &offer, &snapshot) {
             let (Some(w), Some(o), Some(entities)) = (welcome, offer, snapshot) else {

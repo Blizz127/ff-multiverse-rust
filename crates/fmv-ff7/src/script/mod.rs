@@ -121,6 +121,7 @@
 
 mod analysis;
 mod decode;
+pub mod dialogue;
 mod layout;
 mod maplist;
 mod models;
@@ -128,7 +129,7 @@ mod opcodes;
 mod text;
 
 #[cfg(test)]
-mod synth;
+pub(crate) mod synth;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

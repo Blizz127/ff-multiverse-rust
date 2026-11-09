@@ -103,6 +103,7 @@ pub mod playable;
 pub mod pmodel;
 pub mod rsd;
 pub mod script;
+pub mod story;
 pub mod tex;
 
 mod area_content;

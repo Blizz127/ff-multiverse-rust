@@ -17,11 +17,16 @@ use crate::interp::render_time;
 use crate::progress::slot_name;
 use crate::session::Session;
 use crate::state::PeerSighting;
+use crate::story::StoryBot;
+use crate::talkbot::TalkBot;
+use crate::ui::dialogue::ff7::Ff7Conversations;
 use crate::ui::palette;
 use fmv_core::{AnimState, AreaId, EntityId, Pos};
+use fmv_ff7::Ff7Adapter;
 use fmv_protocol::CharacterCard;
 use std::collections::BTreeMap;
 use std::io::Write;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Simulation tick. Intents still go out at most every 50 ms (20 Hz); the finer tick keeps the
@@ -175,17 +180,23 @@ pub fn smoke_line(smoke: &Smoke<'_>) -> String {
     format!("SMOKE name={name} area={area} fixture={fixture} peers_seen={peers_seen} updates={updates} rejected={rejected} rtt_ms={rtt_ms} party={party} battles={battles} victories={victories} area_changes={area_changes} level={level} exp={exp} items={items}")
 }
 
-pub fn run(args: &Args, mut session: Session) -> u8 {
+pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>) -> u8 {
     let mut bot = Bot::new(
         args.bot,
         session.state.own.pos(),
         session.area.bounds(),
         session.area.max_speed(),
     );
-    let mut party_bot = PartyBot::new(args.party_invite_first_peer, args.party_accept);
+    let mut party_bot = PartyBot::new(args.party_invite_first_peer, args.party_accept).with_accept_after_split(args.party_accept_after_split);
+    // `--story-advance`: walk to the story point that would advance this account and stand on it. With an
+    // invite to send it holds still until the invite is out (the invite must go out while the others are in view).
+    let mut story_bot = StoryBot::new(args.story_advance, args.party_invite_first_peer);
     // `--travel`: walk through the exits to these areas; with a party to form first it waits for it.
     let mut travel_bot = TravelBot::new(args.travel.clone(), args.party_invite_first_peer || args.party_accept);
     let mut battle_bot = BattleBot::new(args.battle_auto, args.debug_encounters, args.battle_wait_party).with_script(args.battle_script.clone());
+    // `--talk`: talk to these characters of the area through the window's own conversation code (this machine's
+    // own copy of the field's scripts; without FF7 data nobody has anything to say).
+    let mut talk_bot = TalkBot::new(&args.talk, Box::new(Ff7Conversations::new(ff7)));
     eprintln!(
         "headless: joined {} as `{}` (entity {}), bot={:?} for {:.1} s",
         session.info.area_id,
@@ -204,6 +215,18 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
     }
     if travel_bot.is_active() {
         eprintln!("headless: travel behaviour: walk through the exits to {}", args.travel.join(", then "));
+    }
+    if story_bot.is_requested() {
+        eprintln!(
+            "headless: story behaviour: walk to the story point that would advance this account and stand on it{}",
+            if args.party_invite_first_peer { " (after the party invite is out)" } else { "" }
+        );
+    }
+    if args.party_accept_after_split {
+        eprintln!("headless: party behaviour: accept an invite only once a player seen before is out of view");
+    }
+    if talk_bot.is_active() {
+        eprintln!("headless: talk behaviour: talk once to {}, as soon as the area announces them, read with this player's own story", args.talk.join(", "));
     }
     if battle_bot.is_active() {
         let script = battle_bot.script_steps();
@@ -236,6 +259,8 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
     let mut battles_ended = 0;
     // The area's NPCs as last reported: id, name and model (the snapshot of an area says who they are).
     let mut last_npcs: Vec<(u32, String, String)> = Vec::new();
+    // How many other players were in view at the last look (`usize::MAX`: none yet).
+    let mut last_in_view = usize::MAX;
     while start.elapsed() < args.duration
         || finishing_a_battle(battle_bot.is_active(), session.state.battle.in_battle(), start.elapsed(), args.duration)
     {
@@ -247,6 +272,7 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
         session.log_party_notes();
         session.log_battle_notes();
         session.log_progress_notes();
+        session.log_story_notes();
         for peer in session.state.drain_peer_sightings() {
             eprintln!("{}", peer_line(&peer));
         }
@@ -280,6 +306,13 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
             }
             last_npcs = npcs;
         }
+        // Conversations: each wanted character is talked to once, when the area has announced it (and with the
+        // story this player has reached by then).
+        if !talk_bot.is_done() {
+            for line in talk_bot.step(&session.info.area_id.key, session.state.npc_views(), session.state.story.moment()) {
+                eprintln!("{line}");
+            }
+        }
         if session.state.battle.ended() > battles_ended {
             battles_ended = session.state.battle.ended();
             after_battle = Some((own_walk.total, session.state.updates()));
@@ -288,6 +321,12 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
         let remotes = session.state.remote_views(render_time(now));
         for peer in &remotes {
             peer_walks.entry(peer.id).or_default().feed(peer.pose.pos);
+        }
+        // How many other players this one can see, whenever it changes: a phase split shows as the count
+        // falling to 0 while both are still connected, and a party that joins the phases as it rising again.
+        if remotes.len() != last_in_view {
+            eprintln!("headless: peers in view: {}", remotes.len());
+            last_in_view = remotes.len();
         }
         // Party requests: what the bot flags ask for, and a resync if events were lost.
         let visible: Vec<EntityId> = remotes.iter().map(|p| p.id).collect();
@@ -307,7 +346,15 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
         // A player in a battle is frozen in the field: it neither walks nor sends movement.
         let frozen = session.state.battle.in_battle();
         if dt > 0.0 && !frozen {
-            let step = if travel_bot.is_active() {
+            let step = if story_bot.is_requested() {
+                // The story bot decides every step (it stands still when there is nothing to advance).
+                if story_bot.may_walk(now, session.state.party.outgoing_invite_seen()) {
+                    let speed = session.area.max_speed() * crate::bot::BOT_SPEED_FACTOR;
+                    story_bot.step(session.area.as_ref(), session.state.own.pos(), dt, speed, session.state.story.progress())
+                } else {
+                    crate::bot::BotStep { pos: session.state.own.pos(), facing: None, moved: false }
+                }
+            } else if travel_bot.is_active() {
                 let gate = TravelGate { now, party_size: session.state.party.party_size(), peers_seen: session.state.peers_seen() };
                 if travel_bot.may_walk(gate) {
                     travel_bot.step(session.area.as_ref(), session.state.own.pos(), dt, session.area.max_speed() * crate::bot::BOT_SPEED_FACTOR)
@@ -328,6 +375,15 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
         if let Some(rest) = TICK.checked_sub(tick_start.elapsed()) {
             std::thread::sleep(rest);
         }
+    }
+    for line in talk_bot.finish() {
+        eprintln!("{line}");
+    }
+    if let Some(why) = story_bot.gave_up() {
+        eprintln!("headless: story: gave up: {why}");
+    }
+    if story_bot.is_requested() || session.state.story.advances() > 0 {
+        eprintln!("headless: story advances: {}", session.state.story.advances());
     }
     if let Some(why) = travel_bot.gave_up() {
         eprintln!("headless: travel: gave up: {why}");
@@ -353,6 +409,7 @@ pub fn run(args: &Args, mut session: Session) -> u8 {
     session.log_party_notes();
     session.log_battle_notes();
     session.log_progress_notes();
+    session.log_story_notes();
     for peer in session.state.drain_peer_sightings() {
         eprintln!("{}", peer_line(&peer));
     }

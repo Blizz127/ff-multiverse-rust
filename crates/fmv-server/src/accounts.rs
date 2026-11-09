@@ -73,13 +73,15 @@ pub struct Login {
     /// What other players see, from the stored player character and for the hosted game: its name and colour and
     /// its binding.
     pub avatar: AvatarAppearance,
-    /// The account's story phase for the hosted game, taken from its progression (empty by
-    /// default, so every player is in the single free-roam phase).
-    pub phase: PhaseKey,
+    /// The account's story progression for the hosted game: the stored blob, which only the game's
+    /// adapter reads (empty for a new account and for one that never advanced; see
+    /// [`kept_progression`] for what becomes of an enormous one). The world turns it into the phase of
+    /// each area the player stands in.
+    pub progression: Vec<u8>,
     /// `Some` only when this call registered the account: the token, to be sent once.
     pub issued_token: Option<String>,
     /// The character it fights as (its combat slot) and what the store holds of its character progress
-    /// (nothing for a new account). Separate from `phase`: see `progress`.
+    /// (nothing for a new account). Separate from `progression`: see `progress`.
     pub progress: ProgressSeed,
     /// What the player is told about its own character in `Welcome` (identity, binding, slot).
     pub card: CharacterCard,
@@ -164,6 +166,23 @@ pub fn phase_key(blob: Vec<u8>) -> PhaseKey {
     key.push(PHASE_DIGEST_TAG);
     key.extend_from_slice(blake3::hash(&blob).as_bytes());
     PhaseKey(key)
+}
+
+/// Longest progression blob the world keeps per player as it is. A game's own blob is a handful of
+/// bytes (FF7: three); anything longer than this cannot be one and is kept as its digest
+/// ([`phase_key`]), an unreadable blob of 33 bytes with the same identity, so that a hand-edited
+/// 256 KiB record cannot cost 256 KiB per connected player.
+pub const MAX_PROGRESSION_BYTES: usize = 256;
+
+/// The progression the world keeps for a stored blob: the blob itself, or, when it is longer than
+/// [`MAX_PROGRESSION_BYTES`], its digest. Neither is ever written back by the story code (an
+/// unreadable blob is never advanced or overwritten).
+pub fn kept_progression(blob: Vec<u8>) -> Vec<u8> {
+    if blob.len() <= MAX_PROGRESSION_BYTES {
+        blob
+    } else {
+        phase_key(blob).0
+    }
 }
 
 /// A registration whose every client-chosen part has been checked (see the module docs).
@@ -256,7 +275,7 @@ pub fn login_with_token(store: &Store, game: GameId, token: &Secret, tint: [u8; 
     Ok(Login {
         account,
         avatar: character::shown(game, &record),
-        phase: phase_key(progression.blob),
+        progression: kept_progression(progression.blob),
         issued_token: None,
         progress,
         card: character::card(game, &record),
@@ -267,7 +286,8 @@ pub fn login_with_token(store: &Store, game: GameId, token: &Secret, tint: [u8; 
 /// account exists (the registration rate limits count it then; a request that never gets this far counts for
 /// nothing). Nothing after that can fail: the reply is built from what the store returned.
 ///
-/// A brand-new account has no progression, so its phase is the default one and nothing else is read.
+/// A brand-new account has no progression (the empty blob: a new account to every game), and nothing
+/// else is read.
 pub fn register(store: &Store, game: GameId, registration: Registration, now: u64, on_created: impl FnOnce()) -> Result<Login, LoginError> {
     let Registration { name, tint, creation } = registration;
     let wanted = NewPlayerCharacter::for_game(creation.body.clone(), game, creation.entry.clone());
@@ -285,7 +305,7 @@ pub fn register(store: &Store, game: GameId, registration: Registration, now: u6
     Ok(Login {
         account: registered.account_id,
         avatar,
-        phase: PhaseKey::default(),
+        progression: Vec::new(),
         issued_token: Some(registered.token),
         progress: ProgressSeed::of(slot.unwrap_or(progress::DEFAULT_CHARACTER), None),
         card,
