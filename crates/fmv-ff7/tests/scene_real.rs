@@ -407,7 +407,8 @@ fn the_proof_scene_writes_only_its_mark_once_and_a_scene_that_moves_the_moment_r
         assert_eq!(out.writes.moment, None, "the conversation does not move the moment");
         let [((3, 212), byte)] = out.writes.tracked[..] else { panic!("exactly the bar's byte is carried: {:?}", out.writes) };
         assert!(byte & 0b100 != 0, "the mark is on: {byte:#b}");
-        assert_eq!(out.writes.untracked.get(&(1, 4)), Some(&5), "Tifa's affection points are the field's own");
+        // (the long way, 'something hard', gives Tifa's affection points a bump: the field's own, never carried)
+        assert_eq!(out.writes.untracked.get(&(1, 4)), (answers == [2]).then_some(&5), "Tifa's affection points are the field's own");
         assert!(!out.writes.untracked.contains_key(&(3, 212)), "the bar's byte is carried now");
         // applied once: the story keeps the mark (and only the mark) and the scene is no longer offered to it
         let mut state = story.clone();

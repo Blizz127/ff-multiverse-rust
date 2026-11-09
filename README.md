@@ -1187,7 +1187,7 @@ files when the scene runs.
 | `id`, `game`, `field` | `ff7/mds7pb_1/tifa-bar`, `ff7`, `mds7pb_1` |
 | `trigger` | the script entity talked to (20, `tifa`), its talk script slot (1), the talk radius (150, `TALKR` at scale 512) and the story moments it is offered at (72..=72) |
 | `setup` | the field's own stage scripts that put the cast where it stands when the scene begins (Tifa's script 7), run once, quietly |
-| `given` | the field variables the scene assumes (`Var[3][211]` bit 2, `Var[3][212]` bit 1: flags of the field's own progress that the story model does not carry); the moment is the player's own story's |
+| `given` | the field variables the scene assumes (`Var[3][211]` bit 2, `Var[3][212]` bit 1: flags of the field's own progress that the story model does not carry; the bits it does carry, like the bar's mark `Var[3][212]` bit 2, come from the player's story); the moment is the player's own story's |
 | `root` | what the field's own trigger does to start it, in order: `SetBit`, `Await(script)`, `Start(script)` |
 | `cast` | script entity to actor: Cloud (18) `Appearance("ff7/cloud")` starting at the stool (-95, -144), Tifa (20) `Appearance("ff7/tifa")`; `Look::Model` names any `char.lgp` model, so a scene can be replayed with another cast (`SceneDef::with_cast`) |
 | `speakers` | a window's first line names who speaks (the game's own convention); `Tifa` is 20, `Cloud` is 18 |
@@ -1290,8 +1290,19 @@ builds the scene from its own files. A peer that predates them cannot decode the
 ```
 FMV_FF7_DATA=<.../data> cargo test --offline -p fmv-ff7 --test scene_real -- --ignored       # the interpreter on the real field
 FMV_FF7_FLEVEL=<.../flevel.lgp> cargo test --offline -p fmv-server --test scene_real -- --ignored   # a real server and socket
+cargo test --offline -p fmv-server --test scene_preview   # a real store and sockets: preview never saves, a real write is saved once, restart
 scripts/scene-smoke.sh --debug --build                 # two real headless players, the scene, a server restart (real data)
+FMV_FF7_LIBRARY=<state dir> FMV_SHOT_DIR=<dir> cargo test --offline -p fmv-client --bin fmv-client -- --ignored \
+    --exact scene::shots::offscreen_real_ff7_the_proof_scene --test-threads=1 --nocapture   # the pictures and what the camera shows
 ```
+
+The last one plays both ways through the scene on the real field through the window's own drawing code (offscreen, software
+Vulkan is enough), writes `scene-*.png` (the field before, the first frame, a window over Tifa, one over Cloud, the question,
+the field after; each with a close-up) and holds every frame to the acceptance numbers: the witness drawn at the cast's model
+scale with a height inside the cast's span, people at least 44 units apart, at most 10% of any person's picture covered by
+another's, the witness inside its walkmesh triangle, feet where the stage stands them, the trigger found within its reach.
+`FMV_SCENE_SPOTS`/`FMV_SCENE_ARRIVAL` try other spots, and `scene::shots::offscreen_real_ff7_the_witness_spots_and_a_recommendation`
+ranks the floor for them. The pictures contain game art: they stay out of the repository.
 
 ### Known gaps of the proof
 
