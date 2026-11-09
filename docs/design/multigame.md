@@ -269,7 +269,8 @@ the protagonist stays unique, and the role of the story's lead is never a player
 
 The original's capabilities in a game are defined by **that game's own system and the slot template**, and
 nothing crosses games. FF7: the slot's growth curve, weapon class and limit set, plus materia the account
-owns (materia is not modelled per account yet: today's spells come from the starting record plus a starter grimoire). FF8: the slot's stat base and GF compatibility table, junctions the account sets, magic it draws, GFs
+owns (materia is not modelled per account yet: today's spells come from the starting record plus a starter
+grimoire). FF8: the slot's stat base and GF compatibility table, junctions the account sets, magic it draws, GFs
 it earns in its own phase. FF9: the slot's learnable-ability list (equipment teaches), Magic Stone capacity
 and the slot's Trance set. Details per game are in sections 5 and 6.
 
