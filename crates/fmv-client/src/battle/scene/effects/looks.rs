@@ -572,7 +572,7 @@ fn boost(c: &mut Ctx, st: Status, a: f32) {
         Status::Barrier | Status::MBarrier => {
             // A shell of light forms around the body, shivers and fades.
             let form = ramp(a, 0.0, 0.2);
-            let (rx, ry) = (lerp(0.45, 0.62, form) * h * s, lerp(0.7, 0.95, form) * h * s);
+            let (rx, ry) = (lerp(0.4, 0.52, form) * h * s, lerp(0.65, 0.85, form) * h * s);
             let alpha = fade(a, 1.3);
             c.glow(0.0, 0.0, rx * 0.97, ry * 0.97, rgb, 0.22 * alpha);
             c.ring(0.0, 0.0, rx, ry, rgb, 0.95 * alpha);

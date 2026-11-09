@@ -33,7 +33,7 @@
 //!
 //! The matches on actions and events here and in [`cue`] are exhaustive on purpose. Protocol v7: a limit
 //! break ([`ActionRef::Limit`]) is a spell-like show (the performer gathers with the cast clips and a
-//! glow, then a strong burst: a bloom and a gold star, breaks over the target); an escape that fails
+//! bigger glow, then a strong effect and a flash break over the target: see [`super::effects`]); an escape that fails
 //! ([`BattleEvent::EscapeFailed`]) makes the performer stumble a little way back; one that succeeds (an
 //! [`ActionRef::Escape`] with no failure after it, and no victory pose: a battle that was escaped has no
 //! `Victory`) makes the whole party turn and run off the screen with the run clip ([`Director::on_escape`]).
@@ -78,8 +78,9 @@ const MAX_FX: usize = 160;
 /// How long a shot's bolt flies from its shooter to its target, and the least an item is in the air, in seconds.
 const BOLT_FLIGHT: f64 = 0.14;
 const TOSS_AFTER: f64 = 0.08;
-/// How much stronger than a spell's the glow a limit break gathers is.
+/// How much stronger than a spell's the glow a limit break gathers is, and how much weaker an enemy's.
 const LIMIT_CHARGE: f32 = 1.6;
+const ENEMY_CHARGE: f32 = 0.8;
 /// How long a hurt clip plays at the most, in seconds, whatever its length.
 const MAX_HURT: f64 = 0.8;
 /// The party's victory poses start this far apart, in seconds, and this long after the last blow.
@@ -377,6 +378,8 @@ impl Director {
             match action {
                 Some(ActionRef::Magic(_)) => self.show(Kind::Charge, look.element, pi, None, (arrival, impact), 1.0),
                 Some(ActionRef::Limit(_)) => self.show(Kind::Charge, look.element, pi, None, (arrival, impact), LIMIT_CHARGE),
+                // An enemy's magic (a spell or a curse of its scene) gathers a little less than a party member's.
+                Some(ActionRef::EnemyAttack(_)) if look.style == Style::Spell => self.show(Kind::Charge, look.element, pi, None, (arrival, impact), ENEMY_CHARGE),
                 Some(ActionRef::Defend) => self.show(Kind::Guard, Element::Plain, pi, None, (arrival, arrival), 1.0),
                 _ => {}
             }

@@ -372,8 +372,12 @@ fn an_enemys_spell_is_cast_where_it_stands_and_lands_at_the_effect() {
     assert_eq!(d.motion(2, 5.55 - 0.001).clip.map(|c| c.slot), Some(13));
     assert_eq!(d.motion(2, 5.55 + 0.05).clip.map(|c| c.slot), Some(14));
     assert_eq!(d.pending(), 0, "it does not run anywhere");
-    // The burst is at the target at the impact.
+    // The burst is at the target at the impact, and the enemy gathers its spell where it stands (a little less brightly than a party member).
     assert!(impacts(&d).iter().all(|&at| (at - 5.55).abs() < 1e-9));
+    let charges = of_kind(&d, |k| k == Kind::Charge);
+    assert_eq!(charges.len(), 1);
+    assert_eq!((charges[0].target, charges[0].element), (2, Element::Fire));
+    assert!(charges[0].scale < 1.0 && (charges[0].start - 5.0).abs() < 1e-9 && (charges[0].land - 5.55).abs() < 1e-9, "{charges:?}");
 }
 
 #[test]

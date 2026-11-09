@@ -1307,3 +1307,48 @@ fn an_items_look_is_read_from_its_own_record_and_a_failing_lookup_is_a_plain_ite
     assert_eq!(item(4000), Look { melee: false, element: Element::Plain, style: Style::Item });
     assert_eq!(look_in(None, who, ActionRef::Item(0)), Look::PLAIN);
 }
+
+/// What a frame costs with a great deal of effect on the screen. CPU only (the GPU draws the pieces as small models: the cost on a window is
+/// the number of draws, and this prints it): the scene's `frame()` with nothing going on, with a whole-side spell and a limit break at their
+/// peak, and with so many effects that the cap of pieces is what is drawn. Run with `--nocapture` to read the numbers; the bounds are
+/// generous (the machine that runs this may be busy) and say only that the cap does its job.
+#[test]
+#[ignore = "timing: run with --nocapture to read the numbers"]
+fn a_frame_with_every_effect_at_its_peak_costs_little_and_a_frame_never_draws_more_than_the_cap() {
+    use std::time::Instant;
+    let (mut scene, engine) = scene(5, true);
+    let view = view(&scene);
+    let fx = |kind: effects::Kind, element: Element, target: usize, from: Option<usize>, scale: f32| effects::Fx { kind, element, target, from, start: 10.0, land: 10.6, scale, seed: 5 + target as u32 };
+    let measure = |scene: &mut BattleScene, label: &str| -> (f64, usize) {
+        scene.update(10.62, &[], Some(&engine));
+        let frames = 300;
+        let start = Instant::now();
+        let mut drawn = 0;
+        for _ in 0..frames {
+            let frame = scene.frame(&view, false);
+            drawn = pieces(scene, &frame).len();
+            std::hint::black_box(&frame);
+        }
+        let ms = start.elapsed().as_secs_f64() * 1000.0 / f64::from(frames);
+        eprintln!("{label}: {drawn} pieces of effects, {ms:.3} ms a frame");
+        (ms, drawn)
+    };
+    scene.director.set_fx(Vec::new());
+    let (idle_ms, idle_pieces) = measure(&mut scene, "nothing going on");
+    // A whole-side spell on both enemies and a limit break's strike and flash on the first, the performer's glow, a Barrier sign on every member.
+    let mut busy = vec![fx(effects::Kind::Blast, Element::Fire, 5, None, 1.0), fx(effects::Kind::Blast, Element::Fire, 6, None, 1.0), fx(effects::Kind::Charge, Element::Plain, 0, None, 1.6)];
+    busy.push(fx(effects::Kind::Strike { how: effects::Strike::Slash, critical: true }, Element::Plain, 5, None, 1.5));
+    busy.push(fx(effects::Kind::Flash, Element::Plain, 5, None, 1.0));
+    busy.extend((0..5).map(|i| fx(effects::Kind::Boost(fmv_ff7_battle::status::Status::Barrier), Element::Plain, i, None, 1.0)));
+    scene.director.set_fx(busy);
+    let (busy_ms, busy_pieces) = measure(&mut scene, "a whole-side spell, a limit break and a Barrier on all five");
+    // Far more than a battle can have: every kind on every actor, many times over.
+    let kinds = [effects::Kind::Blast, effects::Kind::Mend, effects::Kind::Raise, effects::Kind::Mana, effects::Kind::Boost(fmv_ff7_battle::status::Status::Haste), effects::Kind::Afflict(fmv_ff7_battle::status::Status::Sleep)];
+    let flood: Vec<effects::Fx> = (0..120).map(|k| fx(kinds[k % kinds.len()], Element::Fire, k % 7, None, 1.0)).collect();
+    scene.director.set_fx(flood);
+    let (flood_ms, flood_pieces) = measure(&mut scene, "120 effects at once (the cap)");
+    assert_eq!(idle_pieces, 0);
+    assert!(busy_pieces > 40 && busy_pieces <= effects::MAX_LAYERS, "{busy_pieces}");
+    assert_eq!(flood_pieces, effects::MAX_LAYERS, "the cap is what is drawn");
+    assert!(flood_ms < idle_ms + 25.0, "{idle_ms} {busy_ms} {flood_ms}");
+}

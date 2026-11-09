@@ -748,8 +748,13 @@ impl Fight {
     /// The same fight with a party of the canon characters `characters` (FF7's ids: Cloud 0, Barret 1, Tifa 2, Aerith 3, Red
     /// XIII 4, Yuffie 5, Cait Sith 6, Vincent 7, Cid 8), all of them companions (no player is in these battles).
     fn with_party(real: &Real, formation: u16, seed: u64, characters: [u8; 3], limits: [u16; 3]) -> Option<Self> {
+        Self::with_level(real, formation, seed, characters, limits, 12)
+    }
+
+    /// The same with the whole party at `level` (the Guard Scorpion is fought at level 8, as the boss smoke fights it).
+    fn with_level(real: &Real, formation: u16, seed: u64, characters: [u8; 3], limits: [u16; 3], level: u8) -> Option<Self> {
         let gpu = Offscreen::new()?;
-        let limited = |i: usize, character: u8| BattleMember { limit: limits[i], ..canon(character) };
+        let limited = |i: usize, character: u8| BattleMember { limit: limits[i], level, ..canon(character) };
         let setup = BattleSetup {
             formation_id: formation,
             seed,
@@ -1465,17 +1470,24 @@ fn pixels_near(shot: &[u8], at: [f32; 2], r: i32, want: impl Fn([u8; 3]) -> bool
     n
 }
 
-/// A fight of the Guard Scorpion (formation 324) against the canon trio, played (every ready member attacks, the server steps) until
-/// the Scorpion answers a blow with its Tail Laser (attack 286, which it can do only while its tail is up): the fight, the time the
-/// batch that says so arrived and the time the laser lands. `None` when it never does.
+/// A fight of the Guard Scorpion (formation 324) against the canon trio at level 8, as the boss smoke fights it: Cloud and Barret
+/// attack whenever they are ready, Tifa guards twice first (so that the fight lasts until the Scorpion has raised its tail), and the
+/// server steps, until the Scorpion answers a blow with its Tail Laser (attack 286, which it can do only while its tail is up): the
+/// fight, the time the batch that says so arrived and the time the laser lands. `None` when it never does.
 fn scorpion_laser(real: &Real) -> Option<(Fight, f64, f64)> {
-    let mut fight = Fight::new(real, 324, SEED)?;
+    let mut fight = Fight::with_level(real, 324, SEED, [0, 2, 1], [0; 3], 8)?;
     fight.now = 2.0;
-    for _ in 0..4000 {
+    let mut guards_left = 2;
+    for _ in 0..6000 {
         fight.now += 0.03;
         let mut messages: Vec<ServerMsg> = fight.server.step(30).into_iter().collect();
         for id in fight.server.state.ready_actors() {
-            messages.extend(fight.server.attack(id));
+            if id == ActorId(1) && guards_left > 0 {
+                guards_left -= 1;
+                messages.extend(fight.server.command(id, Command::Defend));
+            } else {
+                messages.extend(fight.server.attack(id));
+            }
         }
         for msg in messages {
             let ServerMsg::BattleEvent { events, .. } = &msg else { continue };
@@ -1606,24 +1618,28 @@ fn offscreen_battle_effects_in_real_fights() {
         assert!(after > before + 30, "the laser strikes them as it lands ({before} -> {after})");
     }
 
-    // A status landing: Tifa gives Cloud a Light Curtain (Barrier). The blue shell and the tag on the panel come up at the instant the
-    // item lands, and not before: the picture just before has neither.
+    // A status landing on a whole side: Tifa uses a Light Curtain, which puts a Barrier on every member of the party. The blue shells and the
+    // tags on the panel come up at the instant the item lands, and not before: the picture just before has neither.
     {
         let Some((mut fight, arrival)) = Fight::ready(&real, 301, SEED) else { return };
-        let msg = fight.server.command(ActorId(1), Command::Item { item: 44, target: Target::One(ActorId(0)) });
-        assert!(msg.is_some(), "the engine takes a Light Curtain");
+        let msg = fight.server.command(ActorId(1), Command::Item { item: 44, target: Target::AllAllies });
+        assert!(msg.is_some(), "the engine takes a Light Curtain, which hits the whole party");
         fight.say(msg);
         let landing = arrival + cue::impact_delay(Some(ActionRef::Item(44)));
-        assert!(fight.server.state.has_status(ActorId(0), Status::Barrier), "the engine has it the moment the message arrived");
-        let tagged = |fight: &Fight, t: f64| fight.client.view(t).expect("a view").party[0].status.contains(Status::Barrier);
-        assert!(!tagged(&fight, arrival) && !tagged(&fight, landing - 0.01), "the panel does not say Barrier before the item lands");
-        let at = fight.chest_px(0);
+        for member in 0..3u8 {
+            assert!(fight.server.state.has_status(ActorId(member), Status::Barrier), "the engine has it the moment the message arrived");
+        }
+        let tagged = |fight: &Fight, t: f64, member: usize| fight.client.view(t).expect("a view").party[member].status.contains(Status::Barrier);
+        assert!((0..3).all(|m| !tagged(&fight, arrival, m) && !tagged(&fight, landing - 0.01, m)), "the panel does not say Barrier before the item lands");
         let before = fight.save_both("status-before-landing", landing - 0.02, "Light Curtain: just before it lands");
-        let shot = fight.save_both("status-landing", landing + 0.16, "Light Curtain: the shell and the tag, 0.16 s after it lands");
-        assert!(tagged(&fight, landing + 0.16), "the panel says Barrier as it lands");
-        let (b, a) = (pixels_near(&before, at, 90, blue), pixels_near(&shot, at, 90, blue));
-        eprintln!("blue pixels around Cloud: {b} before the item lands, {a} after");
-        assert!(a > b + 150, "the shell comes up when the item lands ({b} -> {a})");
+        let shot = fight.save_both("status-landing", landing + 0.16, "Light Curtain: shells and tags, 0.16 s after it lands");
+        assert!((0..3).all(|m| tagged(&fight, landing + 0.16, m)), "the panel says Barrier on each of them as it lands");
+        for member in 0..3 {
+            let at = fight.chest_px(member);
+            let (b, a) = (pixels_near(&before, at, 90, blue), pixels_near(&shot, at, 90, blue));
+            eprintln!("blue pixels around member {member}: {b} before the item lands, {a} after");
+            assert!(a > b + 100, "the shell comes up around member {member} when the item lands ({b} -> {a})");
+        }
     }
 
     // Two more statuses at once, for the sheet: Cloud gives Tifa a Speed Drink (Haste) and Barret drinks a Hyper (Fury).

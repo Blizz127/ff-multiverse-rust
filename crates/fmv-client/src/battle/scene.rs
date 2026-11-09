@@ -28,8 +28,9 @@
 //! * [`motion`]: what the actors do with time: the clips that play, lunges, flinches, dodges, deaths
 //!   (a party member's clip, an enemy's fade), the victory pose; the procedural motion for an actor
 //!   without clips.
-//! * [`effects`]: simple additive effects (a spell's burst coloured by its element, an item's
-//!   sparkle, the sparks of a blow, the glow a caster gathers) made of four shared meshes.
+//! * [`effects`]: what every performance looks like, from the action's own data (a blow's slashes, a shot's bolt, a spell's
+//!   element, a heal, a status's sign, an item in the air, a limit break's flash, a guard, a fizzle), on the cue timeline: it
+//!   begins with its performance, peaks at the landing and fades; made of seven shared additive meshes.
 //! * [`stage`]: the stand-in location: sky, haze, a round tiled floor. A real location model, when
 //!   the [`BattleModelSource`] has one, replaces its floor (and is cut to the camera first, see
 //!   `clip`).
