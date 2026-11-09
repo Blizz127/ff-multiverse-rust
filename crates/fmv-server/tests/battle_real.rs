@@ -18,7 +18,7 @@ use std::sync::Arc;
 use fmv_ff7::field::section;
 use fmv_ff7_battle::rules::{BattleEvent, Command, Outcome};
 use fmv_protocol::{BattleRules, BattleSetup, Ff7BattleData};
-use fmv_server::companion::{self, Pacing, PlayerTurn};
+use fmv_server::companion::{self, Clock, Pacing, PlayerTurn};
 use fmv_server::ff7::{decode_encounter_section, open_battle_data, open_ff7, prewarm, Ff7Source};
 
 fn source() -> Option<Ff7Source> {
@@ -94,6 +94,8 @@ struct Sim {
     /// Turns the enemies took (announced actions of theirs, counters included), and the tick of the first.
     enemy_actions: usize,
     first_enemy_action: Option<u64>,
+    /// Every command the party gave, in order: the engine tick it was applied at and whether it was a companion's.
+    party_commands: Vec<(u64, bool)>,
 }
 
 /// One simulated battle (see [`Sim`]) with the server's companion pacing (`companion::may_act`: each companion on its own clock, a player's first turn kept) and players who take
@@ -150,6 +152,7 @@ fn simulate_paced(
     let mut acted = vec![0usize; fighters];
     let (mut enemy_actions, mut first_enemy_action) = (0usize, None::<u64>);
     let mut ended_before_a_players_turn = false;
+    let mut party_commands: Vec<(u64, bool)> = Vec::new();
     let mut commands = vec![0u32; fighters];
     let mut ready_since: Vec<Option<u64>> = vec![None; fighters];
     let mut last_action: Option<u64> = None;
@@ -183,6 +186,7 @@ fn simulate_paced(
         // The companions first (the server's `companions_act` runs right after the step), each when the pacing lets it.
         for events in companions_go(&mut state, pacing, companion_count, &mut commands, &mut ready_since, &mut last_action) {
             count(&events, now);
+            party_commands.push((state.tick(), true));
             if events.contains(&BattleEvent::Victory) {
                 // The command that won the battle was a companion's: did a living player still owe its first turn?
                 ended_before_a_players_turn |= (companion_count..fighters)
@@ -201,6 +205,7 @@ fn simulate_paced(
                 commands[i] += 1;
                 ready_since[i] = None;
                 last_action = Some(state.tick());
+                party_commands.push((state.tick(), false));
             }
         }
     }
@@ -215,6 +220,7 @@ fn simulate_paced(
         ended_before_a_players_turn,
         enemy_actions,
         first_enemy_action,
+        party_commands,
     }
 }
 
@@ -239,8 +245,12 @@ struct Stats {
     enemy_turns: u64,
     /// The mean tick of the first turn an enemy took, over the fights in which one did (0 when none did).
     mean_first_enemy_tick: u64,
+    /// The mean tick of the first command the party gave (a companion's or a player's), over the won fights.
+    mean_first_party_tick: u64,
     /// Attacks (damage or miss) the party made in all the fights, the companions' and the players' together.
     party_attacks: u64,
+    /// Attacks the PLAYERS made in all the fights (a person's commands, what the fight asks of them).
+    player_attacks: u64,
 }
 
 fn stats(data: &Ff7BattleData, formation: u16, characters: &[u8], level: Option<u8>, speed: u8, tps: u32, seeds: u64) -> Stats {
@@ -277,9 +287,11 @@ fn stats_paced(
         fights_with_enemy_turns: 0,
         enemy_turns: 0,
         mean_first_enemy_tick: 0,
+        mean_first_party_tick: 0,
         party_attacks: 0,
+        player_attacks: 0,
     };
-    let (mut total, mut first_enemy_total) = (0u64, 0u64);
+    let (mut total, mut first_enemy_total, mut first_party_total) = (0u64, 0u64, 0u64);
     for seed in 0..seeds {
         let s = simulate_paced(data, formation, characters, level, canon, seed, speed, tps, pacing, player_delay_ms);
         match s.outcome {
@@ -299,10 +311,13 @@ fn stats_paced(
         out.fights_with_enemy_turns += u64::from(s.enemy_actions > 0);
         out.enemy_turns += s.enemy_actions as u64;
         out.party_attacks += (s.companion_attacks + s.acted.iter().sum::<usize>()) as u64;
+        out.player_attacks += s.acted.iter().sum::<usize>() as u64;
         first_enemy_total += s.first_enemy_action.unwrap_or(0);
+        first_party_total += s.party_commands.first().map_or(0, |c| c.0);
     }
     out.mean_ticks = total / seeds.max(1);
     out.mean_first_enemy_tick = first_enemy_total / out.fights_with_enemy_turns.max(1);
+    out.mean_first_party_tick = first_party_total / seeds.max(1);
     if out.fewest_attacks == usize::MAX {
         out.fewest_attacks = 0;
     }
@@ -588,10 +603,45 @@ fn with_pacing_every_player_acts_in_every_fight_of_the_first_field() {
     }
 }
 
+/// The release the first pacing made is gone: a companion's command never comes in the same breath as the one before it. In every
+/// fight of every formation of the first reactor, solo (a bot, and a person with 1.5 s to choose) and with two players, at the default
+/// pace and at the smokes', each command of a companion comes at least the stage gap ([`Clock::gap`]: 60 ticks at the default pace,
+/// 20 at the fastest Battle Speed) after the command of the party that came before it, a player's included; so nobody is released
+/// together with the player's command and the party's blows are spaced. 100 seeds each.
+#[test]
+#[ignore = "needs the owner's library: set FMV_FF7_LIBRARY"]
+fn the_companions_never_give_a_command_in_the_same_breath_as_the_one_before_it() {
+    let Some(source) = source() else { return };
+    let data = battle_data(&source);
+    let formations = first_reactor_formations(&source);
+    let (mut fights, mut companion_commands, mut closest) = (0usize, 0usize, u64::MAX);
+    for (speed, tps) in [(128u8, 60u32), (0, 240)] {
+        let gap = Clock { ticks_per_second: tps, battle_speed: speed }.gap();
+        for &formation in &formations {
+            for (characters, delay_ms) in [(&[1u8][..], 0u32), (&[1][..], 1_500), (&[1, 1][..], 0)] {
+                for seed in 0..100u64 {
+                    let s = simulate_paced(&data, formation, characters, None, true, seed, speed, tps, Pacing::default(), delay_ms);
+                    fights += 1;
+                    for pair in s.party_commands.windows(2) {
+                        if pair[1].1 {
+                            companion_commands += 1;
+                            let spacing = pair[1].0 - pair[0].0;
+                            closest = closest.min(spacing);
+                            assert!(spacing >= gap, "formation {formation}, seed {seed}, {speed}/{tps}: a companion's command came {spacing} ticks after the one before it (gap {gap}): {:?}", s.party_commands);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    eprintln!("{fights} fights, {companion_commands} companion commands that had a command of the party before them: the closest was {closest} ticks after it");
+}
+
 /// The enemies take their turns on their own gauges while a player sits in a menu (FF7's Active mode, `companion`, "Active, Recommended
 /// and Wait"): three players on whom nobody ever gives a command (their gauges fill and stay full: three menus left open) are
-/// attacked in every formation of the first reactor, the first enemy turn coming within the first seconds of the fight. (A formation
-/// of Mono Drives alone is the exception that proves the script: their own AI lets their first turn pass.)
+/// attacked in every formation of the first reactor, the first enemy turn coming within the first seconds of the fight (within 12 s
+/// in every one of 200 fights; a formation of Mono Drives alone is the slowest, 8.9 s on average: their own AI lets their first turn
+/// pass).
 #[test]
 #[ignore = "needs the owner's library: set FMV_FF7_LIBRARY"]
 fn the_enemies_take_their_turns_while_the_players_sit_in_their_menus() {
@@ -632,9 +682,7 @@ fn the_enemies_take_their_turns_while_the_players_sit_in_their_menus() {
         let mean = first_total / acted.max(1) as f64;
         eprintln!("{formation:>9} | {:>7} | {early:>51} | {mean:>25.1} | {latest:.1}", info.enemies);
         assert_eq!(acted, 200, "formation {formation}: an enemy takes a turn in every fight within a minute, whatever the players do");
-        if formation != 305 {
-            assert!(early >= 190, "formation {formation}: in {early} of 200 fights an enemy took a turn within 12 s");
-        }
+        assert_eq!(early, 200, "formation {formation}: in {early} of 200 fights an enemy took a turn within 12 s");
     }
 }
 
@@ -651,8 +699,9 @@ fn how_the_first_reactors_fights_flow_for_the_canon_pair_alone_and_with_a_player
     let data = battle_data(&source);
     let (speed, tps) = (128u8, 60u32);
     let secs = |ticks: u64| ticks as f64 / f64::from(tps);
-    eprintln!("formation | enemies | party | won/200 | mean secs | party attacks | enemy turns | fights with an enemy turn | first enemy turn (s)");
-    let mut totals = [(0u64, 0u64, 0u64, 0u64); 2];
+    eprintln!("formation | enemies | party | won/200 | mean secs | party attacks | the person's commands | enemy turns | fights with an enemy turn | first party command (s) | first enemy turn (s)");
+    // Per party, summed over the formations: ticks, enemy turns, fights with an enemy turn, party attacks, the person's commands.
+    let mut totals = [[0u64; 5]; 2];
     let formations = first_reactor_formations(&source);
     for &formation in &formations {
         let enemies = data.formation(formation).map_or(0, |f| f.enemies);
@@ -661,29 +710,31 @@ fn how_the_first_reactors_fights_flow_for_the_canon_pair_alone_and_with_a_player
         let three = stats_paced(&data, formation, &[1], None, true, speed, tps, 200, Pacing::default(), 1_500);
         for (i, (label, s)) in [("canon pair only", two), ("pair + player", three)].into_iter().enumerate() {
             eprintln!(
-                "{formation:>9} | {enemies:>7} | {label:>15} | {:>7} | {:>9.1} | {:>13.2} | {:>11.2} | {:>25} | {:.1}",
+                "{formation:>9} | {enemies:>7} | {label:>15} | {:>7} | {:>9.1} | {:>13.2} | {:>21.2} | {:>11.2} | {:>25} | {:>23.1} | {:.1}",
                 s.won,
                 secs(s.mean_ticks),
                 s.party_attacks as f64 / 200.0,
+                s.player_attacks as f64 / 200.0,
                 s.enemy_turns as f64 / 200.0,
                 s.fights_with_enemy_turns,
+                secs(s.mean_first_party_tick),
                 secs(s.mean_first_enemy_tick)
             );
             assert_eq!((s.won, s.lost), (200, 0), "formation {formation}, {label}: every fight is won");
             assert!(s.fights_with_enemy_turns > 0 || formation == 305, "formation {formation}, {label}: the enemies take turns");
-            totals[i].0 += s.mean_ticks;
-            totals[i].1 += s.enemy_turns;
-            totals[i].2 += s.fights_with_enemy_turns;
-            totals[i].3 += s.party_attacks;
+            for (total, v) in totals[i].iter_mut().zip([s.mean_ticks, s.enemy_turns, s.fights_with_enemy_turns, s.party_attacks, s.player_attacks]) {
+                *total += v;
+            }
         }
     }
     let n = formations.len() as f64;
-    for (label, (ticks, turns, fights, attacks)) in ["canon pair only", "pair + player"].into_iter().zip(totals) {
+    for (label, [ticks, turns, fights, attacks, commands]) in ["canon pair only", "pair + player"].into_iter().zip(totals) {
         eprintln!(
-            "{label}, averaged over the {} formations: {:.1} s a fight, {:.2} party attacks and {:.2} enemy turns a fight, an enemy turn in {:.0}% of the fights",
+            "{label}, averaged over the {} formations: {:.1} s a fight, {:.2} party attacks ({:.2} the person's own) and {:.2} enemy turns a fight, an enemy turn in {:.0}% of the fights",
             formations.len(),
             secs(ticks) / n,
             attacks as f64 / 200.0 / n,
+            commands as f64 / 200.0 / n,
             turns as f64 / 200.0 / n,
             fights as f64 / 200.0 / n * 100.0
         );

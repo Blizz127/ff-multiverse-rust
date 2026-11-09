@@ -13,8 +13,13 @@
 # (everything after the companions) of `commands=`, `levels=` and `limits=`, so "members=2" and "both members acted" still
 # mean the two bots. Players have no limit break in v9: the `limit` command is exercised by the companions here.
 # The canon party kills the weak first-field formations (301-303) in about a hundred ticks, before every bot has had a
-# turn (measured: crates/fmv-server/tests/battle_real.rs), so the modes that need the bots to ACT fight FORMATION 12 (two
-# sturdier enemies of the game's own data, escapable, won every time with every player acting in 200 of 200 seeds).
+# turn (measured: crates/fmv-server/tests/battle_real.rs; the companions act on their own clocks and only keep a player's
+# FIRST turn, `fmv_server::companion`, so a bot acts at least once in every fight but not several times), so the modes that
+# need the bots to ACT, again and again (--commands, --status, --boss), fight FORMATION 12 (one of the game's test
+# formations: two enemies of 1000 HP that act four times as often as a party member, escapable, won every time with every
+# player acting in 200 of 200 seeds at one, two and three players). The smokes run the engine fast (--battle-speed 0
+# --battle-tick-rate 240); the companions' stage gap is a length of BATTLE time, so it shrinks with them and does not
+# throttle the canon pair at this pace.
 #
 # DEFAULT MODE (real data): the server hosts the real FF7 field md1stin from the owner's own
 # imported library (read-only) with --debug-encounters, and two headless bots form a party and
@@ -263,7 +268,9 @@ STATUS_COUNT=0
 # counter, how long the bots run and the script they follow (fmv-client --battle-script syntax: they defend twice, then play as
 # --battle-auto does; overridable with FMV_SMOKE_BOSS_SCRIPT). Measured at the engine level over 40 seeds at this pace
 # (crates/fmv-server/tests/battle_real.rs, `the_boss_smoke_fight_answers_with_the_tail_laser_in_every_seed`): at level 8 with two
-# defends the Tail Laser fires in every fight and the party wins nearly all of them; the starting level 6 loses about one in six.
+# defends the Tail Laser fires in every fight and the party wins nearly all of them (37 of 40); the starting level 6 loses about
+# one in eight (35 of 40) and level 10 none (40 of 40). The bots' script is fixed (defend twice, then strike whatever the tail
+# is doing), so the level is what decides how many Lasers the party takes.
 BOSS_FORMATION=324
 BOSS_LEVEL=8
 BOSS_COUNTER_ATTACK=286

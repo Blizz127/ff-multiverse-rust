@@ -836,6 +836,53 @@ whole party.
 `FMV_SMOKE_SCRIPT_A`, `FMV_SMOKE_SCRIPT_B` and
 `FMV_SMOKE_ESCAPE_SCRIPT` override the scripts (to try its failure paths).
 
+**The battle's clock: FF7's own starting timers and who acts when (protocol v15, engine change).** Every fighter, the canon
+companions and the enemies included, acts when its OWN gauge is full, at the pace its Dexterity and the Battle Speed give it
+(`speed value = 32768 / (120 + Battle Speed * 15 / 8)`, a V-timer of twice that, `(Dex + 50) * V / normal speed` a tick for a
+party member and `Dex * V / normal speed` for an enemy, the normal speed being the party's rounded average Dexterity plus
+50: the FF7 Project's "Stats & Battle Timers", from Fergusson's *Battle Mechanics* FAQ; the first reactor's party of Cloud,
+Barret and a player on Barret's curve at level 6 has a normal speed of 59 and fills in 355 to 369 ticks, an MP in 426, a Grunt
+in 369, a 1st Ray in 533: about 6 to 9 seconds at the 60 ticks a second the engine is run at). **The gauges start the way the
+game starts them** (`fmv_ff7_battle::rules`, "Starting turn timers", from the FAQ's "Starting Turn Timers" section, which only
+its excerpts in search results could be read for: the page answers our fetcher with HTTP 403): every fighter is dealt a random
+timer in half a bar, and a normal battle raises them all until the highest is at 87.5% (57344), so nobody starts under 37.5% and
+the luckiest is an eighth of a bar from its turn; a pre-emptive strike or a side attack fills the party and divides the
+enemies' by 8; a back attack or an ambush raises them to 93.75% and then empties the party. Before this version a normal
+start was a random half of a bar and nobody's first turn came before 3 to 6 seconds: the first reactor's fights now open
+with an enemy's first turn about 1.1 to 2.8 seconds in (8.9 s for a pair of Mono Drives, whose own script lets their first
+turn pass) and the party's first turn within about the same, which is how they begin in the game. **A hit is critical
+only when its chance is STRICTLY above its roll** (the disassembly-derived pseudocode of the Qhimm wiki's
+`FF7/DamageFormula`; it was `>=`, a point more). The numbers are pinned against that pseudocode in
+`crates/fmv-ff7-battle/tests/md1_real.rs`, over your own files and in numbers, not bytes: the enemies' stat records, the
+level-6 pair, the gauge speeds and the order the gauges first fill in (tick for tick), every damage, hit and critical roll
+of every blow between the pair and the reactor's enemies at levels 5 to 8, the hit and critical rates through the engine's
+own draws against the exact odds, and that a battle ends only with its last enemy (or its last party member). *Not
+played:* a target that is asleep or stopped is always hit in the game and is rolled for here; the pseudocode's two-roll magic
+hit rule (the one-roll rule here agrees with it over the whole first reactor, where no spell can miss either way).
+**Active, not Wait.** FF7's ATB has three modes (Qhimm forum, "[FF7 PSX] ATB Recommended/Wait Pause Logic", which read the game's
+code): Active stops the gauges only for a summon, Recommended (the default) also while an animation plays, Wait also in
+the Magic, Item and Summon menus and while a target is chosen; the command menu itself never stops anything. A shared
+battle cannot pause for one of several people, so it plays Active: an enemy acts the tick its gauge fills even while a
+player has a menu open (over the first reactor, with three players who never choose, the first enemy turn comes within 12
+seconds in every one of 200 fights of every formation). **The companions** (`fmv_server::companion::may_act`) act on their own
+clocks too, with two bounds: a companion never delivers the blow that ENDS the battle while a living, connected player has
+not had a first turn (released by `--companion-turn-wait-ms`, 5 s from that player's own full gauge, and
+`--companion-max-wait-ms`, 10 s in all), so a player always acts and an idle one stalls nobody; and it does not start while
+another party member's command is on the stage, for a gap of battle time (a second at the default pace, scaled with the
+Battle Speed like the game's own animation pause) that spaces the blows instead of releasing them together, the companion
+whose gauge has been full longest going first. (The first pacing held every companion until the players had given as many
+commands as it had, so ONE command of the player's released both companions in the same instant and ended most fights;
+see "The canon party fights beside the players" below.) `--companion-max-wait-ms 0` turns it all off.
+**What a first-reactor fight looks like** (`how_the_first_reactors_fights_flow_for_the_canon_pair_alone_and_with_a_player`,
+200 seeds a formation over the 18 formations the reactor's fields send, one person taking 1.5 s over each command): with FF7's
+own party of TWO (Cloud and Barret, both at that person's menu) a fight takes 12.2 s on average, 3.9 party attacks and 3.5
+enemy turns, and an enemy takes a turn in 93% of them; with the pair as companions and ONE player a fight takes 6.6 s, the
+same 3.9 party attacks (the enemies' HP is the game's), 1.9 enemy turns, an enemy turn in 87%, and the player gives about
+one command. Cloud's blow takes 41 to 44 off an MP, a Grunt or a Mono Drive, Barret's 35 to 38, so the weak enemies die to
+one hit each: a third fighter makes the reactor's fights about half as long and halves the enemy's turns, and "one attack
+wins" is what three fighters against two or three one-hit enemies come to; a balance change is a choice of the owner's
+(enemy HP or gauge speed scaled with the party's size), and none is made here.
+
 **Status effects (protocol v12).** `fmv_ff7_battle::status` is the model and its module docs hold the
 sources and every number: the 32 status bits of the game, what an attack, item or `scene.bin` record's status fields
 mean (a mask and a byte, the low six bits of which are the chance out of 63 and the high bits say inflict, cure or
@@ -900,11 +947,15 @@ and 303 (18, two enemies); the second table is disabled. The server reads every 
 same way (checked over all 702 fields of that build: every enabled table's weights add up to 64
 and every formation exists in `scene.bin`). A starting party of two players wins 301 and 303 every time (200 of
 200 seeded runs each, both members attacking). Since protocol v9 the canon Cloud and Barret fight beside the players and
-end those fights in about a hundred ticks, before every player has had a turn (measured by
-`crates/fmv-server/tests/battle_real.rs`: the players act in only about a tenth to a half of the fights), which is why
-the smoke scripts that need every bot to act fight formation 12 instead (two sturdier enemies of the game's own data,
-won every time with every player acting in 200 of 200 seeds; `--formation` picks another) and only `--random` fights
-`md1stin`'s own.
+would end those fights in about a hundred ticks, before every player has had a turn (measured by
+`crates/fmv-server/tests/battle_real.rs`, without the companions' pacing: a solo player acts in 44-87% of them, two players
+in 13-47%, three in 0-12%), which is why the companions keep a player's first turn (below) and why the smoke scripts that
+need every bot to act fight formation 12 (one of the game's test formations, two enemies of 1000 HP that act four times as
+often as a party member, won every time with every player acting in 200 of 200 seeds at one, two and three players;
+`--formation` picks another) and only `--random` fights `md1stin`'s own. The whole first reactor's tables
+(`md1stin`/`md1_1`/`md1_2`: 301-303; `nrthmk`: 305-307; `nmkin_1`/`nmkin_2`: 308-313; `nmkin_3`: 316-318; `nmkin_4`: 320-322,
+and the Guard Scorpion's own fight, 324 when the story starts it) hold only Mono Drives, MPs, a Guard Hound, 1st Rays,
+Grunts and a Sweeper (18 to 140 HP; the Scorpion has 800), which Cloud's and Barret's blows take down in one to four hits.
 
 **Your own character (protocol v8; in the party since v9).** Every player has ONE original character that travels
 across games. In FF7 it fights with the **stat curve** of a canon party member (its *fighting style*: Gunner, Mage and so
@@ -985,15 +1036,23 @@ field: he is in the party.)
   is the whole rule, a pure function of the engine's state (deterministic, never refused by it). A companion fights at
   the party leader's level (`--battle-level` pins everybody's), is never paid and never saved, cannot be commanded by a
   client (`NotYourActor`), and does not keep a battle alive: a battle with no connected player left is dropped.
-* **The players go first.** A companion whose gauge is full waits while a living, connected player still owes a turn
-  this round (`fmv_server::companion::may_act`), so the players lead every round and Cloud and Barret follow. A player
-  who is choosing holds them for at most `--companion-turn-wait-ms` (default 5000) after its own gauge filled, and no
-  companion holds a full gauge longer than `--companion-max-wait-ms` (default 10000; 0 makes the companions act the
-  instant their gauge fills, as the first v9 build did). Without it the canon pair finished most of md1stin's fights
-  before a player's turn came (a solo player acted in 41-88% of them, two players in 11-41%); with it a solo player acts
-  in every one and a companion never takes a turn in a fight in which a player got none (the real-data gate
-  `with_pacing_every_player_acts_in_every_fight_of_the_first_field`). The `companion acted` line ends with `held_ms=`,
-  how long it waited. Pacing only decides WHEN the server submits a companion's command, so clients need no change.
+* **Each acts on its own clock, and a player always gets a first turn.** A companion acts when its OWN gauge is full
+  (`fmv_server::companion::may_act`), like every fighter of the battle, and is held in only two ways. It never delivers
+  the blow that ENDS the battle while a living, connected player has not had a first turn (the engine is asked on a
+  copy): a player who is choosing holds that blow for at most `--companion-turn-wait-ms` (default 5000) after its own
+  gauge filled, and no companion holds a full gauge for any reason longer than `--companion-max-wait-ms` (default
+  10000; 0 makes the companions act the instant their gauge fills, as the first v9 build did). And it does not start
+  while another party member's command is on the stage, for a gap of battle time (a second at the default pace, scaled
+  with the Battle Speed like the game's own animation pause, whatever the tick rate), the companion whose gauge has
+  been full the longest going first, so the blows are spaced and not released together. (The first pacing held EVERY
+  companion until the players had given as many commands as it had, which released both at the moment of a player's
+  command: one attack of the player's could be followed in the same instant by the whole party's and end any fight.)
+  Without any pacing the canon pair ends most of md1stin's fights before a player's turn comes (a solo player acts in
+  44-87% of them, two players in 13-47%); with it a solo player acts in every fight of every formation of the first
+  reactor and no companion's command ends a fight in which a living player has had no turn (the real-data gate
+  `with_pacing_every_player_acts_in_every_fight_of_the_first_field`, 200 seeds a formation, a bot and a person with a
+  second and a half to choose). The `companion acted` line ends with `held_ms=`, how long it waited. Pacing only decides WHEN
+  the server submits a companion's command, so clients need no change.
 * **Players are paid, companions are not.** Experience and gil are shared among the living PLAYERS only
   (`fmv_protocol::reward_roster`, used by the server and by every replaying client), AP goes to each player, and only
   a player's progress, inventory and limit gauge are saved.
