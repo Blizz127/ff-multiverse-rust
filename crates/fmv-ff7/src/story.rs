@@ -109,8 +109,14 @@
 //! **The OK button.** Since `ClientMsg::Interact` the server sees the press: a point whose triangle test also
 //! wants OK (the elevator's panel) is a [`StoryTrigger::Press`], reached by pressing OK while standing in the
 //! triangle (the point's label says `OK`). It is the only place a key guard is tolerated; everywhere else (a line,
-//! entering, an exit) a key guard keeps the write or the exit out. And only the elevator going DOWN is a point: the
-//! trip back up clears the bit (`BITOFF`), which is not forward (see [`merge_progression`]).
+//! entering, an exit) a key guard keeps the write or the exit out. The elevator going DOWN is the point the text shows
+//! (the bit on, and the story to 12 the first time). The trip back UP clears the bit (`BITOFF`, in a script the panel
+//! requests), which is not a step forward and which the text does not show, so each such panel has a sibling point
+//! ([`Trigger::Panel`], `AreaStory::points` ends with them) that RUNS the panel's own script for the player's story and
+//! takes the tracked bits it turned off. The two exclude each other (the lift is up or down), a press is one ride, and
+//! nothing flaps: the way back is taken by pressing OK, never by walking. The model only carries a story forward
+//! ([`merge_progression`] is a join), so the SAVED story keeps the lift down while the story the player holds in the
+//! world, which decides the lift's exits, has it up until the player rides down again.
 //!
 //! Advancing is monotone: a point applies only when its conditions hold for the player's current story **and**
 //! the story moves forward by it.
@@ -622,6 +628,13 @@ enum Trigger {
     /// off the script here: the talk script is run (the dialogue walker) for the story the player has when it presses
     /// OK, so it sees the conditions the character's own set-up and its talk put on the story, however it spells them.
     Talk { entity: usize, center: Pos, radius: f32 },
+    /// The same press as a [`Trigger::Triangle`] that wants OK (the sibling the scan adds for each), but what it does
+    /// is not read off the text: the panel entity's own script is RUN (its init part and then its main loop, with the
+    /// player standing on the triangle: `vars` are the variables the loops read the player's triangle from, filled with
+    /// it) for the story the player has, and the step is what that run writes that is a step BACK of a tracked bit: the
+    /// lift going up. The ride down is the static point's (a step forward); this one applies only when the story has the
+    /// lift down, so the two exclude each other and a press is one ride.
+    Panel { entity: usize, triangle: usize, corners: [Pos; 3], vars: Vec<(u8, u8)> },
 }
 
 /// One story point as the script defines it (see the module docs).
@@ -668,6 +681,7 @@ impl PointDef {
             Trigger::Line { .. } => "line".to_string(),
             Trigger::Enter => "entry".to_string(),
             Trigger::Talk { entity, .. } => return format!("talk to entity {entity}: the talk script moves the story"),
+            Trigger::Panel { triangle, .. } => return format!("triangle {triangle} (OK): the panel's own script runs, what it does to a tracked bit besides a step forward (the ride back)"),
         };
         let first = self.battle_first.map_or(String::new(), |b| format!(" (starts battle {b} first, the step is paid when it is won)"));
         let battle = self.battle.map_or(String::new(), |b| format!(" (the script then starts battle {b}, which the server does not run)"));
@@ -695,6 +709,7 @@ impl PointDef {
             Trigger::Line { a, b } => StoryTrigger::Line(*a, *b),
             Trigger::Enter => StoryTrigger::Enter,
             Trigger::Talk { center, radius, .. } => StoryTrigger::Talk { center: *center, radius: *radius },
+            Trigger::Panel { corners, .. } => StoryTrigger::Press(corners.to_vec()),
         }
     }
 }
@@ -726,6 +741,59 @@ fn talk_step(script: &FieldScript<'_>, entity: usize, state: &StoryState) -> Opt
         }
     }
     forward.then_some(next)
+}
+
+/// The story after pressing OK on the triangle of a panel when the story is `state`, when that is a step BACK of a tracked
+/// bit (see [`Trigger::Panel`]): the panel entity's script 0 is run through its init part into its main loop with OK
+/// pressed and the player's triangle in the variables the loop reads it from, and the tracked bits the run turned off
+/// that the story had on are turned off. `None` when the run moves anything forward (the moment up, a tracked bit on:
+/// that is the ride down, a point of its own) or clears nothing.
+fn panel_step(script: &FieldScript<'_>, entity: usize, triangle: usize, vars: &[(u8, u8)], state: &StoryState) -> Option<StoryState> {
+    /// The story, with the player's triangle in the variables the panel's loop reads it from.
+    struct Standing<'a> {
+        state: &'a StoryState,
+        triangle: BTreeMap<(u8, u8), u8>,
+    }
+    impl StoryVars for Standing<'_> {
+        fn byte(&self, bank: u8, address: u8) -> u8 {
+            self.triangle.get(&(bank, address)).copied().unwrap_or_else(|| self.state.byte(bank, address))
+        }
+        fn party_member(&self, slot: u8) -> Option<u8> {
+            self.state.party_member(slot)
+        }
+    }
+    let [lo, hi] = u16::try_from(triangle).ok()?.to_le_bytes();
+    let mut seeds = BTreeMap::new();
+    for &(bank, address) in vars {
+        seeds.insert((bank, address), lo);
+        if let Some(next) = address.checked_add(1) {
+            seeds.insert((bank, next), hi);
+        }
+    }
+    let env = Standing { state, triangle: seeds };
+    let mut walk = dialogue::Walk::script(entity, crate::script::INIT_SCRIPT, 1, dialogue::Limits::default()).through_init().pressing(dialogue::KEY_OK);
+    while !matches!(walk.resume(script, &env, None), dialogue::Beat::End(_)) {}
+    let (mut next, mut raised, mut cleared) = (state.clone(), false, false);
+    let (lo, hi) = (walk.written(MOMENT_BANK, MOMENT_ADDRESS), walk.written(MOMENT_BANK, MOMENT_ADDRESS.wrapping_add(1)));
+    if lo.is_some() || hi.is_some() {
+        let [now_lo, now_hi] = state.moment.to_le_bytes();
+        raised |= u16::from_le_bytes([lo.unwrap_or(now_lo), hi.unwrap_or(now_hi)]) > state.moment;
+    }
+    for tracked in TRACKED_VARS {
+        let Some(written) = walk.written(tracked.bank, tracked.address) else { continue };
+        for bit in 0..8u8 {
+            let mask = 1u8 << bit;
+            if tracked.bits & mask == 0 {
+                continue;
+            }
+            match (state.known_bit(tracked.bank, tracked.address, bit) == Some(true), written & mask != 0) {
+                (false, true) => raised = true,
+                (true, false) => cleared |= next.set_bit(tracked.bank, tracked.address, bit, false),
+                _ => {}
+            }
+        }
+    }
+    (cleared && !raised).then_some(next)
 }
 
 /// What changed between two states, as `key=value` words without spaces (`moment=1->6`, `var1.225=0->1`).
@@ -822,6 +890,7 @@ impl AreaStory {
         let point = self.points.get(usize::try_from(id).ok()?)?;
         let next = match &point.trigger {
             Trigger::Talk { entity, .. } => talk_step(script, *entity, &state)?,
+            Trigger::Panel { entity, triangle, vars, .. } => panel_step(script, *entity, *triangle, vars, &state)?,
             _ => point.apply(&state)?,
         };
         Some(StoryStep { summary: summary(&state, &next), progress: next.encode() })

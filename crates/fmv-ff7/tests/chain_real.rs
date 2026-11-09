@@ -165,10 +165,20 @@ fn the_story_points_of_the_chain_are_the_ones_the_scripts_make() {
     assert_eq!(points("md1_2"), one("entry", "entry: moment <8 -> 8"));
     assert_eq!(points("nrthmk"), one("entry", "entry: moment <10 -> 10"));
     assert_eq!(points("nmkin_1"), one("line", "line: moment <11 -> 11"));
-    // the lift's panel waits for the OK button: a press, not a region walked into
+    // the lift's panel waits for the OK button: presses, not regions walked into: the ride down, and the ride back that
+    // the panel's own script makes
     assert_eq!(
         points("elevtr1"),
-        one("press(3)", "triangle 8 (OK): Var[1][225] bit 0 clear -> Var[1][225] bit 0 on; Var[1][225] bit 0 clear and moment <12 -> 12")
+        [
+            (
+                "press(3)".to_string(),
+                "triangle 8 (OK): Var[1][225] bit 0 clear -> Var[1][225] bit 0 on; Var[1][225] bit 0 clear and moment <12 -> 12".to_string()
+            ),
+            (
+                "press(3)".to_string(),
+                "triangle 8 (OK): the panel's own script runs, what it does to a tracked bit besides a step forward (the ride back)".to_string()
+            )
+        ]
     );
     assert_eq!(points("nmkin_2"), one("entry", "entry: moment <13 -> 13"));
     // the woman who moves the story to 14 is talked to (entity 4 of the field)
@@ -288,9 +298,9 @@ fn script_exits_and_story_points_of_the_archive_in_numbers() {
     // two points start a fight first, and the ladders and jumps are 141 walk-on lines and 49 that wait for OK)
     assert_eq!(
         (points.get("region").copied(), points.get("press").copied(), points.get("talk").copied(), points.get("line").copied(), points.get("entry").copied()),
-        (Some(6), Some(1), Some(49), Some(20), Some(56))
+        (Some(6), Some(2), Some(49), Some(20), Some(56))
     );
-    assert_eq!((fields_with_points, ok_points, battle_first), (81, 1, 2));
+    assert_eq!((fields_with_points, ok_points, battle_first), (81, 2, 2), "the lift's two presses want OK");
     assert_eq!((walk_on_links, ok_links, fields_with_links), (141, 49, 33));
 }
 
@@ -308,8 +318,8 @@ fn gateways(area: &dyn AreaRuntime) -> Vec<Exit> {
 /// story points and links; every other field offers its gateways exactly as ever and leaves the rest off, saying what it
 /// left off and why. Over the whole archive: gateways are the same everywhere, a field that is not reviewed has no script
 /// exit, no point, no link and no step a point could take for any story, its phases are what they were, and what it says
-/// it left off is exactly what its data holds. The data holds 917 script exits, 132 points and 190 links; the ten
-/// fields offer 4, 13 and 11 of them (the lift's four exits, the mission's thirteen points, and the ladders and jumps of
+/// it left off is exactly what its data holds. The data holds 917 script exits, 133 points and 190 links; the ten
+/// fields offer 4, 14 and 11 of them (the lift's four exits, the mission's fourteen points, and the ladders and jumps of
 /// `nmkin_2`, `nmkin_3` and `nmkin_4`), the other fields that have any leave off the rest (see the numbers asserted at the
 /// end).
 #[test]
@@ -360,7 +370,7 @@ fn the_fields_that_are_not_reviewed_offer_their_gateways_and_nothing_else_of_the
         }
     }
     println!("offered by the reviewed fields: {offered:?} (script exits, points, links); left off in {fields_left_off} other fields: {left_off:?}");
-    assert_eq!(offered, (4, 13, 11));
+    assert_eq!(offered, (4, 14, 11));
     assert_eq!((left_off, fields_left_off), ((913, 119, 179), 299));
 }
 
@@ -718,4 +728,46 @@ fn walking_the_whole_mission_moves_a_new_account_from_1_to_27() {
         assert_eq!(area.story_advance(&blob, point), None, "{field}#{point} a second time");
     }
     assert_eq!(blob, vec![2, 27, 0, 1, 1, 225, 1], "moment 27, the lift bit on");
+}
+
+/// **The ride back up.** The panel of the lift (`elevtr1`, triangle 8) is two presses of one triangle: the ride down (the
+/// lift bit on, and the story to 12 the first time) and the ride back, which the panel's OWN script makes when the lift is
+/// down (it asks the director's script to clear the bit), run for the story the player has. A press is one ride: down,
+/// back, down again, and the lift's exits follow the bit (up to `nmkin_1` while it is up, down to `nmkin_2` while it is
+/// down) with the story's moment untouched. The model only carries a story forward, so the saved story keeps the bit
+/// (the join of the two), and the player's story in the world is what the lift is for this session.
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn the_lift_rides_back_up_with_every_press_and_never_flaps() {
+    let Some(adapter) = adapter() else { return };
+    let area = adapter.load_area("elevtr1").unwrap();
+    let points = area.story_points();
+    assert_eq!(points.iter().filter(|p| matches!(&p.trigger, StoryTrigger::Press(c) if c.len() == 3)).count(), 2, "{points:?}");
+    let mut blob: Vec<u8> = state(11, false);
+    // (the point the press reaches, what it did, where the lift's exit leads afterwards)
+    for (point, summary, leads) in [
+        (0, "moment=11->12 var1.225=0->1", "nmkin_2"),
+        (1, "var1.225=1->0", "nmkin_1"),
+        (0, "var1.225=0->1", "nmkin_2"),
+        (1, "var1.225=1->0", "nmkin_1"),
+        (1, "", "nmkin_1"),
+    ] {
+        match area.story_advance(&blob, point) {
+            Some(step) => {
+                assert_eq!(step.summary, summary, "point {point} at {blob:02x?}");
+                blob = step.progress;
+            }
+            None => assert_eq!(summary, "", "point {point} does not apply to {blob:02x?}"),
+        }
+        assert_eq!(open_target(area.as_ref(), &blob), [leads], "the lift's exit after point {point}");
+        // exactly one of the two applies in any state: a press is one ride, never both
+        let both = (0..2).filter(|&p| area.story_advance(&blob, p).is_some()).count();
+        assert_eq!(both, 1, "{blob:02x?}: one ride at a time");
+    }
+    // later in the story the ride back still works (the lift is the same lift) and the moment stays where it was
+    let late = state(33, true);
+    let back = area.story_advance(&late, 1).expect("a ride back at moment 33");
+    assert_eq!((back.summary.as_str(), StoryState::decode(&back.progress).unwrap().moment), ("var1.225=1->0", 33));
+    // the saved story is the join: the lift stays down in the store while the story the player holds says up
+    assert_eq!(adapter.merge_progression(&late, &back.progress), late);
 }

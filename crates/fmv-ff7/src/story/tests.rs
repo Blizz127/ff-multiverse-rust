@@ -481,7 +481,7 @@ fn the_ride() -> Vec<u8> {
 fn the_ride_is_one_point_whose_writes_are_judged_together_on_the_story_as_it_was() {
     let sec = field_with_player(|s| s.entity("ele", vec![(0, the_ride())]));
     let story = scan(&sec, &mesh(9));
-    assert_eq!(story.point_count(), 1, "the bit and the moment are one ride");
+    assert_eq!(story.point_count(), 2, "the bit and the moment are one ride; the other point is the ride back (the panel run)");
     let point = story.points().remove(0);
     let StoryTrigger::Press(corners) = &point.trigger else { panic!("a panel that waits for OK is a press, not a region: {point:?}") };
     assert_eq!(corners.len(), 3);
@@ -503,6 +503,56 @@ fn the_ride_is_one_point_whose_writes_are_judged_together_on_the_story_as_it_was
     let step = story.advance(&at(20), 0).expect("the bit");
     assert_eq!(StoryState::decode(&step.progress), Some(lifted(20)));
     assert_eq!(step.summary, "var1.225=0->1");
+}
+
+/// The panel with both of its rides, as the real one has them: pressing OK on the triangle with the lift up rides down (the
+/// bit on, the moment to 12 the first time), with the lift down it asks another entity's script (the director's, which
+/// clears the bit) to ride up.
+fn the_panel_with_both_rides() -> Vec<u8> {
+    let down = concat(&[biton(1, 225, 0), when_moment(3, 12, &setword(2, 0, 12))]);
+    let up = reqew(3, 3);
+    let pressed = concat(&[ifub_lit(1, 225, 0, 10, skip(down.len() + 2)), down, vec![0x10, skip(up.len())], up]);
+    entity_script(&[], &looping(&when_on_triangle(8, &when_ok_pressed(&pressed))))
+}
+
+#[test]
+fn the_ride_back_up_is_the_panels_own_script_run_and_a_press_is_one_ride() {
+    // entities: the director (0) and the hero (1) of `field_with_player`, the panel (2) and the one whose script 3 lifts
+    let sec = field_with_player(|s| s.entity("ele", vec![(0, the_panel_with_both_rides())]).entity("lift", vec![(3, concat(&[bitoff(1, 225, 0), ret()]))]));
+    let script = FieldScript::parse(&sec).unwrap();
+    let story = AreaStory::scan(&script, &mesh(9));
+    let points = story.points();
+    assert_eq!(points.len(), 2, "the ride down and the ride back: {points:?}");
+    for p in &points {
+        assert!(matches!(&p.trigger, StoryTrigger::Press(c) if c.len() == 3), "both are presses of the same triangle: {p:?}");
+    }
+    assert!(points[0].label.starts_with("triangle 8 (OK): Var[1][225] bit 0 clear -> "), "{}", points[0].label);
+    assert!(points[1].label.starts_with("triangle 8 (OK): the panel's own script runs"), "{}", points[1].label);
+
+    // with the lift UP a press rides down (point 0) and the second point has nothing to do
+    for blob in [Vec::new(), at(5), at(11), at(12), at(40)] {
+        assert!(story.advance_with(&script, &blob, 0).is_some(), "{blob:?}: the ride down");
+        assert_eq!(story.advance_with(&script, &blob, 1), None, "{blob:?}: the ride back is not there with the lift up");
+    }
+    // with the lift DOWN the ride down has nothing to do and a press rides back up: the bit off, the moment left alone
+    for moment in [1u16, 12, 13, 40] {
+        let down = lifted(moment).encode();
+        assert_eq!(story.advance_with(&script, &down, 0), None, "moment {moment}");
+        let step = story.advance_with(&script, &down, 1).expect("the ride back");
+        assert_eq!(step.summary, "var1.225=1->0", "moment {moment}");
+        assert_eq!(step.progress, at(moment), "the story's moment stays, and a state without variables is a version 1 blob");
+    }
+    // and a ride down, a ride up and a ride down again are three presses, none of which flaps
+    let mut blob: Vec<u8> = at(11);
+    for (point, want) in [(0, "moment=11->12 var1.225=0->1"), (1, "var1.225=1->0"), (0, "var1.225=0->1")] {
+        let step = story.advance_with(&script, &blob, point).unwrap_or_else(|| panic!("point {point} at {blob:?}"));
+        assert_eq!(step.summary, want);
+        blob = step.progress;
+    }
+    // the way back is not offered by a story the model cannot read
+    assert_eq!(story.advance_with(&script, &[7, 7], 1), None);
+    // without the field's script (the plain `advance`) there is no ride back to run
+    assert_eq!(story.advance(&lifted(12).encode(), 1), None);
 }
 
 #[test]

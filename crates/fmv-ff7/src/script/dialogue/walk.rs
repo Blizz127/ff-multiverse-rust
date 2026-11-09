@@ -223,6 +223,9 @@ pub struct Walk {
     pressed: u32,
     /// The walk follows the movement opcodes (see [`Walk::tracking_moves`]); off, they are ignored as they always were.
     track: bool,
+    /// The first `RET` of the entity's script 0 carries the walk on into its main part instead of ending it (see
+    /// [`Walk::through_init`]).
+    through_init: bool,
     /// Where the movement opcodes have left each entity, by entity.
     spots: BTreeMap<usize, Spot>,
     /// The movements in the order they happened: the entity and where it was left (at most [`MAX_MOVES`]).
@@ -271,6 +274,7 @@ impl Walk {
             queued: None,
             pressed: 0,
             track: false,
+            through_init: false,
             spots: BTreeMap::new(),
             moves: Vec::new(),
             battle: None,
@@ -284,6 +288,15 @@ impl Walk {
     #[must_use]
     pub fn pressing(mut self, keys: u32) -> Self {
         self.pressed = keys;
+        self
+    }
+
+    /// The same walk, running an entity's script 0 as the engine does: the init part and then, after its first `RET`,
+    /// the main part (a loop that waits for something: a panel that waits for OK). A loop that has nothing more to do
+    /// (the press was used up, nothing changed) ends the walk as any idle loop does.
+    #[must_use]
+    pub fn through_init(mut self) -> Self {
+        self.through_init = true;
         self
     }
 
@@ -679,7 +692,7 @@ impl Walk {
         let op = ins.opcode;
         match op {
             0x00 => {
-                if self.quiet && !self.passed_init && self.frames.len() == 1 {
+                if (self.quiet || self.through_init) && !self.passed_init && self.frames.len() == 1 {
                     // The main part of script 0 follows the first RET.
                     self.passed_init = true;
                     return Flow::Continue;
@@ -732,7 +745,14 @@ impl Walk {
             // of the keys they ask for is among them, `IFKEYOFF` (a key let go of) never does.
             0x30..=0x32 => {
                 let asked = ins.literal("keys").and_then(|k| u32::try_from(k).ok()).unwrap_or(0);
-                self.branch(&ins, op != 0x32 && asked & self.pressed != 0)
+                let holds = op != 0x32 && asked & self.pressed != 0;
+                // `IFKEYON` is the frame the key goes down: the press is used up by the first test that sees it (a loop
+                // that polls the key runs its body once for one press)
+                if holds && op == 0x31 {
+                    self.pressed &= !asked;
+                    self.idle.clear();
+                }
+                self.branch(&ins, holds)
             }
             0x20 => Flow::End(End::MiniGame),
             0x40 => {

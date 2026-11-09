@@ -121,7 +121,7 @@ struct Write {
 pub(super) fn scan_points(script: &FieldScript, mesh: &Walkmesh) -> Vec<PointDef> {
     let players: BTreeSet<usize> = script.player_entities().into_iter().map(|(entity, _)| entity).collect();
     let triangle_vars = player_triangle_vars(script, &players);
-    let (mut triangles, mut lines, mut enters) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut triangles, mut lines, mut enters, mut panels) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for entity in 0..script.entity_count() {
         let Ok(listing) = script.disassemble_partial(entity, INIT_SCRIPT) else { continue };
         let code = listing.instructions.as_slice();
@@ -147,17 +147,30 @@ pub(super) fn scan_points(script: &FieldScript, mesh: &Walkmesh) -> Vec<PointDef
             }
         }
         for point in found {
+            // A panel that waits for OK also has the way back, which is not a step forward and which the text does not
+            // show: a sibling point that runs the panel's own script (appended after every other kind, so no id moves).
+            if let Trigger::Triangle { triangle, corners, wants_ok: true } = point.trigger {
+                let vars = triangle_vars.iter().copied().collect();
+                panels.push(PointDef {
+                    trigger: Trigger::Panel { entity, triangle, corners, vars },
+                    requires: Vec::new(),
+                    effects: Vec::new(),
+                    battle: None,
+                    battle_first: None,
+                });
+            }
             match point.trigger {
                 Trigger::Triangle { .. } => triangles.push(point),
                 Trigger::Line { .. } => lines.push(point),
                 Trigger::Enter => enters.push(point),
-                // (talk points are added by `AreaStory::add_talk_points`, not found in the scan)
-                Trigger::Talk { .. } => {}
+                // (talk points are added by `AreaStory::add_talk_points`, panels above: not found by the scan)
+                Trigger::Talk { .. } | Trigger::Panel { .. } => {}
             }
         }
     }
     triangles.extend(lines);
     triangles.extend(enters);
+    triangles.extend(panels);
     triangles
 }
 
@@ -281,7 +294,7 @@ fn write_at(code: &[Instruction], k: usize, part: Part, ctx: &Ctx) -> Option<Wri
         Trigger::Triangle { .. } => false,
         Trigger::Line { .. } => asks,
         Trigger::Enter => asks || loops,
-        Trigger::Talk { .. } => false,
+        Trigger::Talk { .. } | Trigger::Panel { .. } => false,
     };
     if by_itself {
         return None;
