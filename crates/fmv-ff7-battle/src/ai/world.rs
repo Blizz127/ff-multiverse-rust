@@ -34,6 +34,7 @@
 //! | `0x4060` | character id + `0x10` for a party member (by its name), the instance for an enemy | a party member that is not one of the nine characters has none |
 //! | `0x4120` (word) | "Index of actor": the enemy's id in `scene.bin` | see below |
 //! | `0x40A0`, `0x40A8` | Dexterity, Luck | |
+//! | `0x40D0`, `0x40E0`, `0x40F0` (word) | the slot mask of the last actor that acted on this one at all, physically, magically | an enemy's own record of who hit it ([`super::vm::Memory::note_hit`], set by the engine before the counters run); 0 for a party member and for nobody yet |
 //! | `0x4100`, `0x4110` (word) | physical and magical defense | a script can write them ([`super::vm::Effect`]) |
 //! | `0x4140`, `0x4150` (word), `0x4160`, `0x4180` (dword) | MP, max MP, HP, max HP | |
 //!
@@ -139,6 +140,11 @@ struct Fields {
     /// The id of its enemy record ([`Combatant::enemy_id`]); [`NO_ENEMY_ID`] for a party member and an
     /// enemy that was not built from a scene.
     enemy_id: u16,
+    /// Who hit it last: any action, a physical one, a magical one (slot masks, see
+    /// [`super::vm::Memory::note_hit`]).
+    last_attacker: u16,
+    last_physical: u16,
+    last_magical: u16,
     dex: u8,
     luck: u8,
     defense: u16,
@@ -170,6 +176,9 @@ impl Fields {
             level: c.level,
             id,
             enemy_id: c.enemy_id.unwrap_or(NO_ENEMY_ID),
+            last_attacker: c.ai.as_ref().map_or(0, |ai| ai.memory().last_attacker()),
+            last_physical: c.ai.as_ref().map_or(0, |ai| ai.memory().last_physical_attacker()),
+            last_magical: c.ai.as_ref().map_or(0, |ai| ai.memory().last_magical_attacker()),
             dex: clamp8(c.dex),
             luck: clamp8(c.luck),
             defense: clamp16(c.defense),
@@ -199,6 +208,9 @@ impl Fields {
         }
         img.put_le(0x14, 1, u32::from(self.dex));
         img.put_le(0x15, 1, u32::from(self.luck));
+        img.put_le(0x1A, 2, u32::from(self.last_attacker));
+        img.put_le(0x1C, 2, u32::from(self.last_physical));
+        img.put_le(0x1E, 2, u32::from(self.last_magical));
         img.put_le(0x20, 2, u32::from(self.defense));
         img.put_le(0x22, 2, u32::from(self.magic_defense));
         img.put_le(0x24, 2, u32::from(self.enemy_id));
@@ -208,6 +220,15 @@ impl Fields {
         img.put_le(0x30, 4, self.max_hp);
         img
     }
+}
+
+/// The mask of the script slot of the actor at position `idx` of `state`'s battle (what a script sees in
+/// `0x40D0` when that actor hit an enemy last); `None` when the actor does not exist or the battle does not
+/// fit the script slots.
+pub fn slot_mask(state: &BattleState, idx: usize) -> Option<u16> {
+    let party = state.party_ids().len();
+    let slots = Slots::new(party, state.actors().len().checked_sub(party)?)?;
+    Some(1u16 << slots.slot_of(idx)?)
 }
 
 /// Whether the battle models the actor field of `size` at `addr` (for any actor that has an id).
@@ -539,6 +560,59 @@ mod tests {
         assert_eq!(w.actor_field(2, 0x4160, 3), None);
         assert_eq!(w.actor_field(0, 0x2060, 2), None);
         assert_eq!(w.actor_field(0, 0x4999, 2), None);
+    }
+
+    #[test]
+    fn who_hit_an_enemy_last_is_a_field_of_that_enemy() {
+        use crate::ai::script::EnemyScripts;
+        use crate::ai::{AiAttack, EnemyAi};
+        use std::sync::Arc;
+        let battle = |ai: EnemyAi| {
+            let mut foe = Combatant::new("Foe", 5, 80);
+            foe.ai = Some(ai);
+            BattleState::with_config(
+                1,
+                vec![Combatant::new("Cloud", 7, 100), Combatant::new("Barret", 7, 100)],
+                vec![foe],
+                BattleConfig {
+                    start: StartMode::Zero,
+                    ..BattleConfig::default()
+                },
+            )
+        };
+        let fresh = || EnemyAi::new(Arc::new(EnemyScripts::parse_block(&[])), Arc::from(Vec::<AiAttack>::new()));
+        let read = |state: &BattleState, slot: u8, addr: u16| BattleWorld::new(state, 2, &[]).unwrap().actor_field(slot, addr, 2);
+        // Nobody has hit it yet; the slots of the two party members are 0 and 1, the foe's is 4.
+        let state = battle(fresh());
+        for addr in [0x40D0, 0x40E0, 0x40F0] {
+            assert_eq!(read(&state, 4, addr), Some(0), "{addr:#06x}");
+            assert_eq!(read(&state, 0, addr), Some(0), "a party member has none");
+        }
+        assert_eq!(slot_mask(&state, 0), Some(0b01));
+        assert_eq!(slot_mask(&state, 1), Some(0b10));
+        assert_eq!(slot_mask(&state, 2), Some(0b1_0000), "the foe");
+        assert_eq!(slot_mask(&state, 3), None, "no such actor");
+        // Cloud hit it by hand, then Barret with a spell (the battle keeps what its enemy's memory held).
+        let mut hit = fresh();
+        hit.note_hit(0b01, true);
+        hit.note_hit(0b10, false);
+        let state = battle(hit);
+        assert_eq!(read(&state, 4, 0x40D0), Some(0b10), "any action: the last one");
+        assert_eq!(read(&state, 4, 0x40E0), Some(0b01), "the last physical one");
+        assert_eq!(read(&state, 4, 0x40F0), Some(0b10), "the last magical one");
+        // The fields are known to the static analysis too, and they are for reading only.
+        for addr in [0x40D0u16, 0x40E0, 0x40F0] {
+            assert!(field_known(addr, 2), "{addr:#06x}");
+        }
+        assert_eq!(super::super::vm::unsupported_address(&super::super::script::Insn::PushAddr { size: 2, addr: 0x40D0 }, field_known), Some(0x40D0));
+    }
+
+    #[test]
+    fn slot_masks_follow_the_remapped_slots_of_a_big_party() {
+        let party: Vec<Combatant> = (0..5).map(|i| Combatant::new(format!("P{i}"), 5, 100)).collect();
+        let state = BattleState::new(1, party, vec![Combatant::new("Foe", 5, 80)]);
+        let masks: Vec<Option<u16>> = (0..7).map(|i| slot_mask(&state, i)).collect();
+        assert_eq!(masks, vec![Some(1), Some(2), Some(4), Some(1 << 10), Some(1 << 11), Some(1 << 4), None]);
     }
 
     #[test]

@@ -22,7 +22,7 @@
 //! |---|---|---|
 //! | `0x0000..=0x03FF` | the actor's own variables (they last through the battle) | [`Memory::local`], 128 bytes |
 //! | `0x2000..=0x21DF` | the battle's globals | the masks of [`Masks`] and the target mask `0x2070`, which a script writes |
-//! | `0x4000..=0x433F` | per-actor fields (statuses, row, level, HP, MP, ...) | whatever [`World::actor_field`] knows |
+//! | `0x4000..=0x433F` | per-actor fields (statuses, row, level, HP, MP, ...) | whatever [`World::actor_field`] knows (among them who hit an enemy last: `0x40D0`, `0x40E0`, `0x40F0`) |
 //!
 //! Addresses count **bits**: the byte is `address / 8` and a bit-sized access uses bit `address % 8`.
 //! Everything the machine does not model ends the run with an error ([`AiError`]), never a guess; the
@@ -270,6 +270,11 @@ pub struct Memory {
     idle_animation: u32,
     damaged_animation: u32,
     immune_death: bool,
+    /// The slot masks of the last actors that hit this one by any action, by a physical one and by a magical
+    /// one (the fields `0x40D0`, `0x40E0` and `0x40F0` of the owner's counters and Main scripts); 0: nobody yet.
+    last_attacker: u16,
+    last_physical: u16,
+    last_magical: u16,
     pub phase: Phase,
 }
 
@@ -286,6 +291,9 @@ impl Memory {
             idle_animation: 0,
             damaged_animation: 0,
             immune_death: false,
+            last_attacker: 0,
+            last_physical: 0,
+            last_magical: 0,
             phase: Phase::Fresh,
         }
     }
@@ -294,6 +302,32 @@ impl Memory {
     /// battle looks at it).
     pub fn immune_death(&self) -> bool {
         self.immune_death
+    }
+
+    /// The slot mask of the last actor that acted on this one (`0x40D0`); 0 if none has.
+    pub fn last_attacker(&self) -> u16 {
+        self.last_attacker
+    }
+
+    /// The slot mask of the last actor that hit this one with a physical action (`0x40E0`).
+    pub fn last_physical_attacker(&self) -> u16 {
+        self.last_physical
+    }
+
+    /// The slot mask of the last actor that hit this one with a magical action (`0x40F0`).
+    pub fn last_magical_attacker(&self) -> u16 {
+        self.last_magical
+    }
+
+    /// Take note that the actor whose slot mask is `attacker` acted on this one, with a physical action or a
+    /// magical one. The engine does it before the owner's counters run, so that they can answer the blow.
+    pub fn note_hit(&mut self, attacker: u16, physical: bool) {
+        self.last_attacker = attacker;
+        if physical {
+            self.last_physical = attacker;
+        } else {
+            self.last_magical = attacker;
+        }
     }
 
     /// The value of `size` at local address `addr` (a bit address), `None` out of range.

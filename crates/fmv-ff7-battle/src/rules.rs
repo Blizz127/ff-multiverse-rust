@@ -54,10 +54,18 @@
 //!   attack) is kept, so that its cycle goes on.
 //! * **The whole party** ([`crate::ai::Target::AllEnemies`]): one announcement and one payment, then the
 //!   attack is played on every living party member in ascending [`ActorId`] order, each as a one-target
-//!   action with its own rolls ([`BattleState::resolve_on_targets`]; APPROXIMATION until protocol v10's
+//!   action with its own rolls (`BattleState::resolve_on_targets`; APPROXIMATION until protocol v10's
 //!   whole-side rules replace it: the damage is not split 2/3 between several targets as the original does).
 //! * An attack of the scene that the rules cannot play (no damage, healing, a status) is announced and does
 //!   nothing, whomever it is aimed at.
+//! * **Counters.** When a party member's action ([`Command::Attack`], [`Command::Magic`], [`Command::Item`] or
+//!   [`Command::Limit`]) has been played on its targets, every enemy among them that has scripts notes who
+//!   hit it and answers with its counter scripts ([`crate::ai`], "Counters": the Death counter if the blow
+//!   killed it, else the General counter and the Physical or Magical one by the [`ActionKind`] of the
+//!   action). What a counter queues is played like an enemy turn (without touching the enemy's gauge), as
+//!   events right after the action's own, in the same batch ([`BattleState::submit_command`] returns them),
+//!   so a client that replays the command gets them from its own engine. Nothing answers a healing
+//!   action, and nothing once the battle has an outcome.
 //!
 //! # Formula sources and provenance
 //!
@@ -107,6 +115,13 @@
 //!   order for a whole-party attack; none for an attack that fizzles or that the rules cannot play). A turn
 //!   the script cannot be followed on ([`crate::ai::choose`] gives `None`) draws nothing for it and takes the
 //!   next bullet.
+//! * [`Command::Attack`], [`Command::Magic`], [`Command::Item`] and [`Command::Limit`] on an enemy that has
+//!   scripts: after the action's own draws below, the draws of its counters, enemy by enemy in ascending
+//!   position when the action has several targets: the Death counter alone if the blow killed it, else the
+//!   General counter and then the Physical or the Magical one, each with exactly the draws of its script and
+//!   then of the attacks it queued, as an enemy turn draws them. A counter that cannot be followed or carried
+//!   out draws nothing. Nothing is drawn for an enemy with no scripts, for a healing action, or once the
+//!   battle has an outcome.
 //! * Enemy turn: first `below(living_party_count)` to pick the target (living party members
 //!   in id order); then, **only if the enemy has two or more usable attacks** (those it has the MP
 //!   for), `below(usable_count)` to pick one (so an enemy with one attack, or with none, draws exactly
@@ -1371,6 +1386,7 @@ impl BattleState {
                 let spec = self.actors.get(idx).map(Combatant::attack_spec);
                 if let Some(spec) = spec {
                     self.resolve_action(idx, target, &spec, &mut events);
+                    self.run_counters(idx, &[target], &spec, &mut events);
                 }
             }
             Plan::Magic { spell, target } => {
@@ -1380,6 +1396,7 @@ impl BattleState {
                 });
                 self.spend_mp(idx, spell.spec.mp_cost, &mut events);
                 self.resolve_action(idx, target, &spell.spec, &mut events);
+                self.run_counters(idx, &[target], &spell.spec, &mut events);
             }
             Plan::Item { item, data, target } => {
                 events.push(BattleEvent::Action {
@@ -1387,6 +1404,7 @@ impl BattleState {
                     action: ActionRef::Item(item),
                 });
                 self.resolve_action(idx, target, &data.spec, &mut events);
+                self.run_counters(idx, &[target], &data.spec, &mut events);
             }
             Plan::Defend => {
                 events.push(BattleEvent::Action {
@@ -1409,6 +1427,7 @@ impl BattleState {
                 }
                 events.push(BattleEvent::LimitGauge { actor, value: 0 });
                 self.resolve_action(idx, target, &limit.spec, &mut events);
+                self.run_counters(idx, &[target], &limit.spec, &mut events);
             }
             Plan::Escape(rule) => {
                 events.push(BattleEvent::Action {
@@ -1655,15 +1674,21 @@ impl BattleState {
     /// turn pass). `false` when it has no script or the turn cannot be followed (nothing was drawn or
     /// changed: the caller uses the plain behaviour).
     fn enemy_act_by_script(&mut self, idx: usize, events: &mut Vec<BattleEvent>) -> bool {
+        let scripted = self.actors[idx].ai.as_ref().is_some_and(|ai| ai.memory().phase == crate::ai::Phase::Ready);
         let mut rng = self.rng.clone();
-        let Some(turn) = crate::ai::choose(self, idx, &mut rng) else {
-            return false;
-        };
-        let Some(planned) = self.plan_choices(idx, &turn.actions) else {
+        let planned = crate::ai::choose(self, idx, &mut rng)
+            .and_then(|turn| Some((self.plan_choices(idx, &turn.actions)?, turn)));
+        let Some((planned, turn)) = planned else {
+            if let (true, Some(ai)) = (scripted, self.actors[idx].ai.as_mut()) {
+                ai.note_fallback();
+            }
             return false;
         };
         self.rng = rng;
         self.apply_ai(idx, turn.memory, &turn.changes);
+        if let Some(ai) = self.actors[idx].ai.as_mut() {
+            ai.note_turn();
+        }
         self.play_choices(idx, &planned, events);
         true
     }
@@ -1759,6 +1784,76 @@ impl BattleState {
             }
             self.resolve_action(actor, target, spec, events);
         }
+    }
+
+    /// The party member `attacker` has played `spec` on `targets` (ascending positions): every enemy among
+    /// them that has scripts takes note of who acted on it, then runs its counter scripts in the order of
+    /// the original's ([`crate::ai`], "Counters"): the Death counter if the blow killed it (and no other),
+    /// else the General counter and then the Physical or the Magical one by the [kind](ActionKind) of the
+    /// action. It is called once the WHOLE action has been played, so that an action on several targets has hit
+    /// every one of them before any of them answers; a healing action starts no counter, and none is run
+    /// once the battle has an outcome. A counter plays like an enemy's turn but is not one (the enemy's gauge
+    /// is untouched): its attacks come as events right after the action, in the same batch.
+    fn run_counters(&mut self, attacker: usize, targets: &[usize], spec: &ActionSpec, events: &mut Vec<BattleEvent>) {
+        use crate::ai::script::slot;
+        if attacker >= self.party_len || spec.heals() {
+            return;
+        }
+        let Some(hit_by) = crate::ai::world::slot_mask(self, attacker) else {
+            return;
+        };
+        let physical = spec.kind == ActionKind::Physical;
+        for &target in targets {
+            if target < self.party_len {
+                continue;
+            }
+            let Some(ai) = self.actors.get_mut(target).and_then(|c| c.ai.as_mut()) else {
+                continue;
+            };
+            if ai.memory().phase != crate::ai::Phase::Ready {
+                continue;
+            }
+            // Whoever it is that hit the enemy, it remembers it, whether or not it has a counter to answer with.
+            ai.note_hit(hit_by, physical);
+            let scripts: &[usize] = if !self.actors[target].is_alive() {
+                &[slot::DEATH_COUNTER]
+            } else if physical {
+                &[slot::GENERAL_COUNTER, slot::PHYSICAL_COUNTER]
+            } else {
+                &[slot::GENERAL_COUNTER, slot::MAGICAL_COUNTER]
+            };
+            for &script in scripts {
+                if self.outcome.is_some() {
+                    break;
+                }
+                self.run_counter(target, script, events);
+            }
+        }
+    }
+
+    /// Run the counter script `script` of the enemy at `idx` and play what it queued, as a Main turn is played:
+    /// on a copy of the random stream, kept only if the counter can be followed and carried out (otherwise
+    /// nothing at all is drawn or changed: no counter).
+    fn run_counter(&mut self, idx: usize, script: usize, events: &mut Vec<BattleEvent>) {
+        let has_script = self.actors[idx].ai.as_ref().is_some_and(|ai| ai.scripts().entry(script).is_some());
+        if !has_script {
+            return;
+        }
+        let mut rng = self.rng.clone();
+        let planned = crate::ai::react(self, idx, script, &mut rng)
+            .and_then(|turn| Some((self.plan_choices(idx, &turn.actions)?, turn)));
+        let Some((planned, turn)) = planned else {
+            if let Some(ai) = self.actors[idx].ai.as_mut() {
+                ai.note_counter_skipped();
+            }
+            return;
+        };
+        self.rng = rng;
+        self.apply_ai(idx, turn.memory, &turn.changes);
+        if let Some(ai) = self.actors[idx].ai.as_mut() {
+            ai.note_counter();
+        }
+        self.play_choices(idx, &planned, events);
     }
 
     fn finish_turn(&mut self, idx: usize) {

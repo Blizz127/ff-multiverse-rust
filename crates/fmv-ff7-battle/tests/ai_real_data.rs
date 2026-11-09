@@ -423,6 +423,211 @@ fn guard_scorpion_follows_its_eight_step_cycle() {
     assert_eq!(cycle[0][7], cycle[2][7]);
 }
 
+/// Cloud, Barret and Tifa who cannot die and whose Cloud is quick (his gauge fills long before an enemy's),
+/// against the enemy of `slot` and `others` plain dummies that keep the battle from ending.
+fn arena(scene: &Scene, slot: usize, seed: u64, hp: Option<u32>, others: usize) -> BattleState {
+    let record = scene.enemies[slot].as_ref().expect("enemy record");
+    let mut foe = Combatant::from_enemy_in_scene(scene, slot, record);
+    if let Some(hp) = hp {
+        foe.hp = hp;
+        foe.max_hp = foe.max_hp.max(hp);
+    }
+    let mut party = party(0);
+    party[0].dex = 255;
+    let mut foes = vec![foe];
+    foes.extend((0..others).map(|i| Combatant::new(format!("Dummy {i}"), 1, 100_000)));
+    BattleState::with_config(
+        seed,
+        party,
+        foes,
+        BattleConfig {
+            start: StartMode::Zero,
+            ..BattleConfig::default()
+        },
+    )
+}
+
+/// Step until the enemy at position 3 has played `turns` turns of its Main script.
+fn until_turns(state: &mut BattleState, turns: u32) {
+    for _ in 0..200_000 {
+        if state.actors()[3].ai.as_ref().expect("scripts").stats().turns >= turns {
+            return;
+        }
+        state.step_ticks(1);
+    }
+    panic!("the enemy never played {turns} turns");
+}
+
+/// Cloud strikes the enemy at position 3 as soon as his gauge is full: the events of that command.
+fn cloud_strikes(state: &mut BattleState) -> Vec<BattleEvent> {
+    let cloud = ActorId(0);
+    for _ in 0..200_000 {
+        if state.ready_actors().contains(&cloud) {
+            break;
+        }
+        state.step_ticks(1);
+    }
+    state.submit_command(cloud, fmv_ff7_battle::rules::Command::Attack { target: ActorId(3) }).expect("accepted")
+}
+
+/// The enemy's attacks announced in `events` and, after each, the party members it hit or missed.
+fn answers(events: &[BattleEvent], foe: ActorId) -> Vec<(u16, Vec<u8>)> {
+    let mut out: Vec<(u16, Vec<u8>)> = Vec::new();
+    for e in events {
+        match e {
+            BattleEvent::Action { actor, action: ActionRef::EnemyAttack(id) } if *actor == foe => out.push((*id, Vec::new())),
+            BattleEvent::Damage { actor, target, .. } | BattleEvent::Miss { actor, target } if *actor == foe => {
+                if let Some(last) = out.last_mut() {
+                    last.1.push(target.0);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+#[test]
+#[ignore = "needs FMV_FF7_DATA pointing at the owner's FF7 data directory"]
+fn guard_scorpion_answers_a_blow_with_its_tail_laser_only_while_its_tail_is_up() {
+    let Some(bin) = load() else { return };
+    let (scene_index, slot) = bin.find_enemies_by_name("Guard Scorpion")[0];
+    let scene = bin.scene(scene_index).unwrap();
+    let foe = ActorId(3);
+    // The attack ids of its tail laser (the General counter's) and of its tail coming down (the Death counter's
+    // and the eighth turn's), as the data gives them (see the numbers the cycle test above prints).
+    let (tail_laser, tail_down) = (286u16, 288u16);
+
+    // Before its tail is up it does not answer.
+    let mut state = arena(scene, slot, 2, None, 0);
+    let events = cloud_strikes(&mut state);
+    assert!(answers(&events, foe).is_empty(), "no answer before the tail is up: {events:?}");
+
+    // After its fifth turn (tail up) every blow is answered by the Tail Laser, on the whole party at once.
+    let mut state = arena(scene, slot, 2, None, 0);
+    until_turns(&mut state, 5);
+    let events = cloud_strikes(&mut state);
+    let got = answers(&events, foe);
+    eprintln!("Guard Scorpion, a physical blow with its tail up: {got:?}");
+    assert_eq!(got, vec![(tail_laser, vec![0, 1, 2])], "{events:?}");
+    // A magical blow too (the same General counter), and again on the next one.
+    let again = cloud_strikes(&mut state);
+    assert_eq!(answers(&again, foe), vec![(tail_laser, vec![0, 1, 2])]);
+    let stats = state.actors()[3].ai.as_ref().unwrap().stats();
+    assert_eq!((stats.fallbacks, stats.counters_skipped), (0, 0), "{stats:?}");
+    assert!(stats.counters >= 2);
+
+    // Its tail comes down on its eighth turn (an attack of its own, "tail down"): no answer again.
+    let mut state = arena(scene, slot, 2, None, 0);
+    until_turns(&mut state, 8);
+    let events = cloud_strikes(&mut state);
+    assert!(answers(&events, foe).is_empty(), "the tail is down: {events:?}");
+
+    // Killed with its tail up, in a battle that goes on, its Death counter brings the tail down (an attack
+    // announced with nothing to do) and no General counter answers the killing blow.
+    let mut state = arena(scene, slot, 2, Some(1), 1);
+    until_turns(&mut state, 5);
+    let events = cloud_strikes(&mut state);
+    let got = answers(&events, foe);
+    assert_eq!(got, vec![(tail_down, vec![])], "{events:?}");
+    assert!(events.contains(&BattleEvent::Death { actor: foe }));
+    assert_eq!(state.outcome(), None);
+}
+
+#[test]
+#[ignore = "needs FMV_FF7_DATA pointing at the owner's FF7 data directory"]
+fn the_first_reactors_enemies_never_fall_back_in_the_engine() {
+    let Some(bin) = load() else { return };
+    for name in ["MP", "Guard Hound", "Mono Drive", "Grunt", "Sweeper", "1st Ray", "Guard Scorpion"] {
+        let (scene_index, slot) = bin.find_enemies_by_name(name)[0];
+        let scene = bin.scene(scene_index).unwrap();
+        let (mut turns, mut fallbacks) = (0u32, 0u32);
+        for seed in 0..6 {
+            let mut state = arena(scene, slot, seed, None, 0);
+            for _ in 0..60_000 {
+                state.step_ticks(1);
+                if state.actors()[3].ai.as_ref().unwrap().stats().turns >= 40 {
+                    break;
+                }
+            }
+            let stats = state.actors()[3].ai.as_ref().unwrap().stats();
+            turns += stats.turns;
+            fallbacks += stats.fallbacks;
+        }
+        eprintln!("{name}: {turns} scripted turns, {fallbacks} fallbacks to the plain behaviour (engine level, 6 seeds)");
+        assert!(turns >= 200, "{name} played its script: {turns}");
+        assert_eq!(fallbacks, 0, "{name}");
+    }
+}
+
+#[test]
+#[ignore = "needs FMV_FF7_DATA pointing at the owner's FF7 data directory"]
+fn how_many_enemies_keep_their_scripts_and_never_fall_back_in_the_real_engine() {
+    // The engine-level counterpart of the machine-level coverage numbers above: each distinct enemy that has a
+    // Main script fights (with a dummy beside it, so that the battle goes on) for up to 24 of its turns against
+    // a party that cannot die, Cloud striking it whenever his gauge is full (so that its counters and the
+    // last-attacker fields are used); the battle builds its Initialize script, and the plain behaviour plays
+    // every turn the script cannot be followed on.
+    let Some(bin) = load() else { return };
+    let enemies = distinct_enemies(&bin);
+    let (mut with_main, mut kept, mut never_fall_back, mut turns_total, mut fallbacks_total) = (0, 0, 0, 0u64, 0u64);
+    let (mut counters, mut counters_skipped, mut with_counters, mut with_counters_all_run) = (0u64, 0u64, 0, 0);
+    for (&_id, &(scene_index, slot)) in &enemies {
+        let scene = bin.scene(scene_index).unwrap();
+        let Some(scripts) = scene.ai.enemy(slot) else { continue };
+        if scripts.entry(script::slot::MAIN).is_none() {
+            continue;
+        }
+        with_main += 1;
+        let has_counters = (script::slot::GENERAL_COUNTER..=script::slot::MAGICAL_COUNTER).any(|s| scripts.entry(s).is_some());
+        let mut state = arena(scene, slot, 1, None, 1);
+        let ai = state.actors()[3].ai.as_ref().expect("scripts attached");
+        if ai.memory().phase != fmv_ff7_battle::ai::Phase::Ready {
+            continue;
+        }
+        kept += 1;
+        let played = |state: &BattleState| {
+            let stats = state.actors()[3].ai.as_ref().unwrap().stats();
+            stats.turns + stats.fallbacks
+        };
+        for _ in 0..24 {
+            let before = played(&state);
+            for _ in 0..40_000 {
+                if played(&state) > before || !state.actors()[3].is_alive() {
+                    break;
+                }
+                state.step_ticks(1);
+            }
+            if !state.actors()[3].is_alive() || state.outcome().is_some() {
+                break;
+            }
+            // A blow between turns when it is Cloud's: the enemy may answer it.
+            if state.ready_actors().contains(&ActorId(0)) {
+                let _ = state.submit_command(ActorId(0), fmv_ff7_battle::rules::Command::Attack { target: ActorId(3) });
+            }
+        }
+        let stats = state.actors()[3].ai.as_ref().unwrap().stats();
+        turns_total += u64::from(stats.turns);
+        fallbacks_total += u64::from(stats.fallbacks);
+        never_fall_back += usize::from(stats.fallbacks == 0 && stats.turns > 0);
+        counters += u64::from(stats.counters);
+        counters_skipped += u64::from(stats.counters_skipped);
+        if has_counters {
+            with_counters += 1;
+            with_counters_all_run += usize::from(stats.counters_skipped == 0);
+        }
+    }
+    eprintln!(
+        "engine level, lone enemy (with a dummy beside it) against a party that cannot die: {with_main} enemies have a Main \
+         script; {kept} keep their scripts after Initialize (the others use the plain behaviour); {never_fall_back} of \
+         them never fall back in 24 turns ({turns_total} scripted turns, {fallbacks_total} fallbacks); {counters} counters \
+         played and {counters_skipped} skipped (could not be followed) for {with_counters} enemies that have counter \
+         scripts, of which {with_counters_all_run} skipped none"
+    );
+    assert!(kept > 200, "{kept}");
+    assert!(never_fall_back > 100, "{never_fall_back}");
+}
+
 #[test]
 #[ignore = "needs FMV_FF7_DATA pointing at the owner's FF7 data directory"]
 fn two_engines_with_the_same_seed_play_a_real_scripted_battle_alike() {

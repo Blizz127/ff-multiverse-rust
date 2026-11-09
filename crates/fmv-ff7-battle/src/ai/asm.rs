@@ -40,6 +40,12 @@ impl Asm {
         self
     }
 
+    /// This code followed by `other` (so that a script can be built from parts).
+    pub fn then(mut self, other: &Asm) -> Self {
+        self.0.extend_from_slice(&other.0);
+        self
+    }
+
     pub fn jump(mut self, opcode: u8, target: u16) -> Self {
         self.0.extend([opcode, target as u8, (target >> 8) as u8]);
         self
@@ -89,6 +95,26 @@ pub fn block(init: Option<&Asm>, main: &Asm) -> EnemyScripts {
     EnemyScripts::parse_block(&block)
 }
 
+/// A block with the scripts given as `(slot, code)`, whatever the slots (the counters, ...).
+pub fn block_of(scripts: &[(usize, &Asm)]) -> EnemyScripts {
+    let mut header = [0xFFu8; script::HEADER_BYTES];
+    let mut code = Vec::new();
+    let mut at = script::HEADER_BYTES;
+    for &(slot, asm) in scripts {
+        header[slot * 2..slot * 2 + 2].copy_from_slice(&(at as u16).to_le_bytes());
+        code.extend_from_slice(&asm.0);
+        at += asm.0.len();
+    }
+    let mut block = header.to_vec();
+    block.extend_from_slice(&code);
+    EnemyScripts::parse_block(&block)
+}
+
+/// `LV<addr> (byte) = LV<addr> + 1`: a script that leaves a trace of having run in its memory.
+pub fn count_in(addr: u16) -> Asm {
+    Asm::default().addr(1, addr).val(1, addr).k1(1).op(op::ADD).op(op::STORE)
+}
+
 // --- battles for the tests ---
 
 /// An attack the invented scene defines and the foes can play.
@@ -121,6 +147,13 @@ pub fn scripted_foe(init: Option<&Asm>, main: &Asm) -> Combatant {
         spec: ActionSpec::basic_attack(16, 100, true),
     });
     foe.ai = Some(EnemyAi::new(Arc::new(block(init, main)), attacks()));
+    foe
+}
+
+/// The same foe with the scripts given as `(slot, code)`.
+pub fn foe_with(scripts: &[(usize, &Asm)]) -> Combatant {
+    let mut foe = scripted_foe(None, &Asm::default().op(op::END));
+    foe.ai = Some(EnemyAi::new(Arc::new(block_of(scripts)), attacks()));
     foe
 }
 

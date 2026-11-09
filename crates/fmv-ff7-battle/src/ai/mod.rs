@@ -22,6 +22,7 @@
 //!   which the engine carries out one after the other in the order queued, or end without one: then the
 //!   enemy **passes its turn** (1st Ray attacks every other turn this way). The variables the script wrote
 //!   stay in the enemy ([`EnemyAi`]) for its next turn.
+//! * When it is hit ([`react`]) its counter scripts run, see "Counters".
 //! * **Anything the machine does not understand, and any answer the engine cannot carry out, makes the
 //!   turn use today's behaviour** (a random living party member, one of the enemy's attacks): an unknown
 //!   opcode, an address or an actor field that is not modelled, a budget overrun ([`vm::MAX_STEPS`]), an
@@ -30,6 +31,39 @@
 //!   and changes nothing, and an enemy whose Initialize script fails stays on the plain behaviour for good.
 //!   Nothing here panics or loops. (A one-target attack whose target has fallen by the time it comes up is
 //!   not such a case: it fizzles, see [`crate::rules`] "Enemy turns".)
+//!
+//! # Counters
+//!
+//! The original runs an enemy's other scripts when it is hit. The Qhimm wiki's list of "the order of scripts
+//! executed" (<https://wiki.ffrtt.ru/index.php/FF7/Battle/Battle_Scenes#AI_Data>) puts them after an
+//! attack, for every target of it: "Death Counter (If script owner died, execution stops here)", then "General
+//! Counter (Executed by all targets)", then "Physical Counter/Magical Counter (Executed by all targets
+//! depending on damage type)". Any attack the script queues in answer goes into the same action queue
+//! as every other (<https://wiki.ffrtt.ru/index.php/FF7/Battle/Battle_Mechanics>, where "limits/counters" have
+//! priority 0, ahead of the player's spells), so it is played at once, after the blow.
+//!
+//! The engine does the same, deterministically, from a helper that [`crate::rules::BattleState::submit_command`]
+//! calls once a party member's action has been played on all its targets (nothing here runs inside an enemy's
+//! own turn: enemies do not hit enemies):
+//!
+//! 1. every enemy among the targets that has scripts takes note of who acted on it ([`Memory::note_hit`]: the
+//!    slot mask of the attacker, as "the last actor to attack it", "...physically" and "...with magic", the
+//!    fields `0x40D0`, `0x40E0` and `0x40F0` that the counters and 34 of the Main scripts read), whether or not it
+//!    has a counter to answer with; a healing action starts nothing, and nothing runs once the battle is over;
+//! 2. if the blow killed it, its Death counter runs, and no other; else its General counter runs, then its
+//!    Physical counter if the action was [physical](crate::action::ActionKind::Physical) or its Magical one
+//!    if it was magical (limits and items count as the kind of their action);
+//! 3. each counter is run with [`react`], like Main with [`choose`]: on a copy of the battle's random stream,
+//!    kept only if the counter can be followed and carried out, and then what it queued is played as an enemy
+//!    turn is played (announced by [`BattleEvent::Action`](crate::rules::BattleEvent::Action), the whole party
+//!    at once for a whole-party attack) inside the batch of events of the command. A counter that cannot be
+//!    followed is no counter: nothing is drawn, changed or announced ([`AiStats::counters_skipped`]).
+//!
+//! Because a counter is a pure function of the engine's state and its random stream, applied at one fixed point
+//! of [`crate::rules::BattleState::submit_command`], a peer that replays the same commands at the same ticks gets the same events
+//! (`counters_replay_exactly_from_the_commands_alone` replays a server's messages the way the protocol's
+//! `BattleReplay` does). Not run: the Pre-action script (slot 7, which "occurs on all participants prior to any
+//! actions") and the Battle-end and custom-event scripts.
 //!
 //! # Opcodes and addresses implemented
 //!
@@ -55,13 +89,16 @@
 //!   <https://wiki.ffrtt.ru/index.php/FF7/Battle/Battle_Scenes#AI_Data>). Many scripts draw random numbers
 //!   there (to start a counter at a random value): they consume the battle's stream at that point, which is
 //!   part of the draw order ([`crate::rules`], "RNG draw order").
-//! * Only the Main and Initialize scripts run. The counters (General, Death, Physical, Magical), Pre-action,
-//!   Battle-end and the formation's own scripts are not run, so an enemy that reacts to being hit does not.
+//! * Only the Initialize, Main and counter scripts run. Pre-action, Battle-end, the custom events and the
+//!   formation's own scripts are not run. A counter reads what the engine models of the blow: who struck
+//!   (`0x40D0` ...), not the command or the action that struck (`0x2000`, `0x2008`, `0x2150`, `0x2120`), the
+//!   flags of the blow (`0x4027`, "the attack lands") or the statuses it inflicts; a counter that reads them
+//!   cannot be followed and is skipped.
 //! * Statuses other than Death are not modelled by the engine, so the scripts read them as clear.
-//! * An attack may be one the scene defines (its table). Attacks below `0x100` are the kernel's standard
-//!   spells, which the scene does not carry: a script that casts one (Mono Drive's Fire) falls back for that
-//!   turn. An attack the scene defines but the rules cannot play (no damage, healing) is announced and has no
-//!   effect.
+//! * An attack may be one the scene defines (its table); an attack the scene does not define falls back for
+//!   that turn. (Attacks below `0x100` are the kernel's standard spells, which a scene that uses one carries
+//!   its own copy of: Mono Drive's Fire plays.) An attack the scene defines but the rules cannot play (no
+//!   damage, healing, a status) is announced and has no effect.
 //! * A target mask of several actors is [`Target::AllEnemies`] / [`Target::AllAllies`] only when it is
 //!   exactly the living side; any other mix falls back. The engine plays [`Target::AllEnemies`] (the whole
 //!   party) as one attack announced once and played on each living member in turn; [`Target::AllAllies`] is
@@ -140,12 +177,27 @@ pub struct Started {
     pub changes: Vec<Change>,
 }
 
+/// What an enemy's scripts came to over a battle, kept beside them for tests and measurements (no script can
+/// read it).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AiStats {
+    /// Turns its Main script played.
+    pub turns: u32,
+    /// Turns it could not be followed on, which the plain behaviour played instead.
+    pub fallbacks: u32,
+    /// Counter scripts that played.
+    pub counters: u32,
+    /// Counter scripts that could not be followed (no counter came of the blow).
+    pub counters_skipped: u32,
+}
+
 /// An enemy's scripts and the memory they keep through the battle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnemyAi {
     scripts: Arc<EnemyScripts>,
     attacks: Arc<[AiAttack]>,
     memory: Memory,
+    stats: AiStats,
 }
 
 impl EnemyAi {
@@ -155,7 +207,34 @@ impl EnemyAi {
             scripts,
             attacks,
             memory: Memory::new(),
+            stats: AiStats::default(),
         }
+    }
+
+    /// What the scripts came to so far.
+    pub fn stats(&self) -> AiStats {
+        self.stats
+    }
+
+    pub(crate) fn note_turn(&mut self) {
+        self.stats.turns += 1;
+    }
+
+    pub(crate) fn note_fallback(&mut self) {
+        self.stats.fallbacks += 1;
+    }
+
+    pub(crate) fn note_counter(&mut self) {
+        self.stats.counters += 1;
+    }
+
+    pub(crate) fn note_counter_skipped(&mut self) {
+        self.stats.counters_skipped += 1;
+    }
+
+    /// Take note that the actor with slot mask `attacker` acted on this enemy ([`Memory::note_hit`]).
+    pub(crate) fn note_hit(&mut self, attacker: u16, physical: bool) {
+        self.memory.note_hit(attacker, physical);
     }
 
     pub fn scripts(&self) -> &EnemyScripts {
@@ -227,13 +306,34 @@ pub fn initialize(state: &BattleState, idx: usize, rng: &mut Rng) -> Option<Star
 /// changed (`rng` was advanced only if the answer is returned: the caller passes a copy and keeps it on
 /// `Some`).
 pub fn choose(state: &BattleState, idx: usize, rng: &mut Rng) -> Option<AiTurn> {
+    run_slot(state, idx, script::slot::MAIN, rng)
+}
+
+/// Run the counter script in `slot` ([`script::slot::GENERAL_COUNTER`], [`script::slot::DEATH_COUNTER`],
+/// [`script::slot::PHYSICAL_COUNTER`] or [`script::slot::MAGICAL_COUNTER`]) of the enemy at position `idx`,
+/// which has just been hit, and say what it does: the attacks it queues are the enemy's answer to the blow.
+/// Everything [`choose`] says holds, with "counter" for "turn": `None` is no counter (the enemy has no such
+/// script, it cannot be followed, or its answer cannot be carried out) and changes nothing. The caller has
+/// already told the enemy who hit it ([`Memory::note_hit`]), which is what these scripts read.
+pub fn react(state: &BattleState, idx: usize, slot: usize, rng: &mut Rng) -> Option<AiTurn> {
+    use script::slot;
+    matches!(
+        slot,
+        slot::GENERAL_COUNTER | slot::DEATH_COUNTER | slot::PHYSICAL_COUNTER | slot::MAGICAL_COUNTER
+    )
+    .then(|| run_slot(state, idx, slot, rng))
+    .flatten()
+}
+
+/// Run the script in `slot` of the enemy at `idx` ([`choose`] and [`react`]).
+fn run_slot(state: &BattleState, idx: usize, slot: usize, rng: &mut Rng) -> Option<AiTurn> {
     let ai = state.actors().get(idx)?.ai.as_ref()?;
     if ai.memory().phase != Phase::Ready {
         return None;
     }
     let world = BattleWorld::new(state, idx, ai.attacks())?;
     let mut memory = ai.memory().clone();
-    let out = vm::run(ai.scripts(), script::slot::MAIN, &world, &mut memory, rng).ok()?;
+    let out = vm::run(ai.scripts(), slot, &world, &mut memory, rng).ok()?;
     let actions = out
         .actions
         .iter()
@@ -304,6 +404,8 @@ fn resolve(
     })
 }
 
+#[cfg(test)]
+mod counter_tests;
 #[cfg(test)]
 mod engine_tests;
 #[cfg(test)]
