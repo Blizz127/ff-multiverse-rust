@@ -147,6 +147,8 @@ pub struct SceneBot {
     phase: Phase,
     /// When the bot first looked.
     began: Option<f64>,
+    /// When it first pressed OK (the wait for the scene to start counts from it).
+    first_press: Option<f64>,
     /// The index of the scene it asked a preview of in the game's list, when this machine knows it.
     wanted: Option<usize>,
     /// The NPC list epoch at the time the preview was asked for.
@@ -203,7 +205,7 @@ impl SceneBot {
     pub fn new(cfg: SceneBotConfig) -> Self {
         let wanted = cfg.preview.as_deref().and_then(|id| scenes().iter().position(|s| s.id == id));
         let phase = if cfg.preview.is_some() { Phase::Waiting } else { Phase::Watching };
-        Self { cfg, phase, began: None, wanted, epoch_at_preview: 0, lines: Vec::new(), outcome: None, moved: None, failure: None }
+        Self { cfg, phase, began: None, first_press: None, wanted, epoch_at_preview: 0, lines: Vec::new(), outcome: None, moved: None, failure: None }
     }
 
     /// Whether a `--scene-*` flag asked for a scene.
@@ -340,6 +342,7 @@ impl SceneBot {
                 let others = s.peers_in_view >= self.cfg.watchers || s.now - since >= wait;
                 if let (true, true, Some(id)) = (!s.unsent, others, self.trigger_of(s.npcs)) {
                     acts.push(Act::Press(id));
+                    self.first_press = Some(s.now);
                     self.phase = Phase::Pressed { at: s.now, presses: 1 };
                 }
             }
@@ -368,11 +371,12 @@ impl SceneBot {
             }
             Phase::Watching | Phase::Playing { .. } | Phase::Done => {}
         }
-        // The deadlines: to start, and to end.
+        // The deadlines, each `--scene-wait-secs`: to get to the trigger (the party, the preview, the arrival) or, for a watcher, to be
+        // given a scene; from the first press to the scene starting; from its start to its end. (The wait for the owner's watchers
+        // is its own: it ends with a press, never with a failure.)
         match self.phase {
-            Phase::Waiting | Phase::Previewed | Phase::Ready { .. } | Phase::Pressed { .. } | Phase::Watching if s.now - began > wait => {
-                self.fail(format!("no scene started within {wait:.0} s"));
-            }
+            Phase::Waiting | Phase::Previewed | Phase::Watching if s.now - began > wait => self.fail(format!("no scene started within {wait:.0} s")),
+            Phase::Pressed { .. } if s.now - self.first_press.unwrap_or(began) > wait => self.fail(format!("no scene started within {wait:.0} s of the press")),
             Phase::Playing { since } if s.now - since > wait => self.fail(format!("the scene did not end within {wait:.0} s")),
             _ => {}
         }
@@ -464,6 +468,13 @@ pub(super) mod tests {
         assert!(bot.step(&s).is_empty());
         s.now = 31.0;
         assert_eq!(bot.step(&s), [Act::Press(SCENE_NPC_ID_BASE)]);
+        assert!(!bot.is_done() && bot.failure().is_none(), "the wait for watchers ends with a press, never with a failure");
+        // The press has its own wait for the scene to start: from the press, not from the start of the run.
+        s.now = 31.0 + 29.0;
+        assert!(bot.step(&s).iter().all(|a| !matches!(a, Act::Probe)) && !bot.is_done());
+        s.now = 31.0 + 31.0;
+        bot.step(&s);
+        assert!(bot.is_done() && bot.failure().is_some_and(|f| f.contains("of the press")));
     }
 
     #[test]

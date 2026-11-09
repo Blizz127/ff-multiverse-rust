@@ -824,3 +824,67 @@ fn the_scene_keys_are_the_talk_windows() {
     assert_eq!(SceneKey::from_event(KeyCode::ArrowDown, true, false), Some(SceneKey::Down));
     assert_eq!(SceneKey::from_event(KeyCode::Enter, false, false), None);
 }
+
+// ---- where the window goes ---------------------------------------------------------------------------------------------
+
+/// A window whose first line names nobody the scene knows (no speaker).
+fn nobody_speaks() -> Beat {
+    Beat { stage: vec![], then: Then::Window(window(0, 18, None, message(7, 18, "a note"))) }
+}
+
+#[test]
+fn the_window_is_anchored_to_its_speakers_head_and_feet_and_knows_who_else_is_in_the_way() {
+    use super::draw::speaker_spot;
+    use crate::avatar::frame::{tests::view, AvatarFrame, Built};
+    use crate::render::view_to_window;
+    use crate::ui::draw::DrawList;
+    use std::collections::HashMap;
+    let view = view();
+    let mut rig = rig_with(vec![say(0, 18, 18, 1), end(0)], false);
+    rig.client.on_message(AREA, start(RUN, SceneRole::Watcher, &[(1, 0), (2, 1)]));
+    let scene = rig.client.player().unwrap();
+    assert_eq!(scene.speaker(), Some(18));
+    let empty = || AvatarFrame { models: vec![], tints: vec![], identities: vec![], zoom: 400.0, overlay_bias: 0.0, ground: vec![], scenery: None };
+    let built = |anchors: HashMap<Who, Pos>| Built { frame: empty(), markers: vec![], anchors };
+    let head = Pos::new(12.0, 34.0, 0.0);
+    let (vw, vh) = (1100, 680);
+    // Only the speaker is drawn as a model: its head is the anchor the frame computed for it, its feet are where the stage
+    // stands it, and nobody else is in the way.
+    let alone = built(HashMap::from([(cast_who(18), head)]));
+    let spot = speaker_spot(scene, Some(&alone), &view, vw, vh).expect("a speaker that is drawn has a place");
+    let want_head = view_to_window(&view.bounds, vw, vh, head.x, head.y);
+    assert_eq!(spot.head, (want_head[0], want_head[1]));
+    let feet = view.to_view(Pos::new(10.0, 10.0, 11.0)).expect("the actor's place is on the screen");
+    let want_feet = view_to_window(&view.bounds, vw, vh, feet.x, feet.y);
+    assert_eq!(spot.feet, (want_feet[0], want_feet[1]));
+    assert!(spot.others.is_empty(), "nobody else is drawn in this frame");
+    // The other cast member and both participants (they stand on witness spots) are drawn too: each is a rectangle the window
+    // must not hide, around the line from its head to its feet.
+    let crowd = built(HashMap::from([
+        (cast_who(18), head),
+        (cast_who(20), Pos::new(40.0, 50.0, 0.0)),
+        (Who(1), Pos::new(-20.0, 30.0, 0.0)),
+        (Who(2), Pos::new(0.0, 60.0, 0.0)),
+    ]));
+    let spot = speaker_spot(scene, Some(&crowd), &view, vw, vh).expect("the speaker is still drawn");
+    assert_eq!(spot.others.len(), 3, "the other cast member and both witnesses");
+    for r in &spot.others {
+        assert!(r.0 < r.2 && r.1 < r.3, "a rectangle with an area: {r:?}");
+        assert!(![r.0, r.1, r.2, r.3].iter().any(|v| v.is_nan()));
+    }
+    // Nobody is anchored when the frame drew no model for the speaker (its model did not load), or there is no frame.
+    assert!(speaker_spot(scene, Some(&built(HashMap::new())), &view, vw, vh).is_none());
+    assert!(speaker_spot(scene, None, &view, vw, vh).is_none());
+    // A window with nobody to speak it is not anchored either.
+    let mut quiet = rig_with(vec![nobody_speaks(), end(0)], false);
+    quiet.client.on_message(AREA, start(RUN, SceneRole::Watcher, &[(1, 0)]));
+    assert_eq!(quiet.client.player().unwrap().speaker(), None);
+    assert!(speaker_spot(quiet.client.player().unwrap(), Some(&crowd), &view, vw, vh).is_none());
+    // Drawn with a spot the window is above the speaker's head and on the screen; without one it is at the bottom.
+    let (mut near, mut bottom) = (DrawList::new(), DrawList::new());
+    scene.draw(vw, vh, 0.0, Some(&speaker_spot(scene, Some(&alone), &view, vw, vh).unwrap()), &mut near);
+    scene.draw(vw, vh, 0.0, None, &mut bottom);
+    let (a, b) = (near.quads()[0], bottom.quads()[0]);
+    assert!(a.y + a.h <= want_head[1] as i32, "the window stands above the head ({} <= {})", a.y + a.h, want_head[1]);
+    assert!(b.y > a.y, "the one without a speaker is lower, at the bottom of the screen");
+}

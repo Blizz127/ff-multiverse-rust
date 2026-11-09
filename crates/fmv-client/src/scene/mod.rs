@@ -46,6 +46,8 @@ mod stage;
 mod trigger;
 
 #[cfg(test)]
+mod shots;
+#[cfg(test)]
 pub(crate) mod tests;
 
 pub use bot::{pick_probe, Act, SceneBot, SceneBotConfig, Senses};

@@ -16,7 +16,7 @@
 //!
 //! Players that are not participants keep being drawn at their real places.
 
-use super::panel::SpeakerSpot;
+use super::panel::{Rect, SpeakerSpot};
 use super::player::ScenePlayer;
 use crate::avatar::frame::{Built, NpcRef};
 use crate::avatar::{AvatarPlayer, Who};
@@ -100,12 +100,28 @@ pub fn place_witnesses(players: &mut [AvatarPlayer<'_>], scene: &ScenePlayer) {
 }
 
 /// Where the speaker of the window on show stands on a `vw` x `vh` screen: the top of its head (the anchor the avatar
-/// frame computed for it) and its feet. `None` when the window has no speaker, or the speaker is not drawn as a model.
+/// frame computed for it) and its feet, with the rectangles of the other people of the scene (every participant and every
+/// other cast member that is drawn as a model: what the window should not hide). `None` when the window has no speaker, or
+/// the speaker is not drawn as a model.
 pub fn speaker_spot(scene: &ScenePlayer, built: Option<&Built>, view: &FieldView, vw: u32, vh: u32) -> Option<SpeakerSpot> {
     let entity = scene.speaker()?;
-    let head = *built?.anchors.get(&cast_who(entity))?;
-    let feet = view.to_view(scene.cast_draws().into_iter().find(|c| c.entity == entity)?.pos)?;
+    let built = built?;
     let pixels = |p: Pos| view_to_window(&view.bounds, vw, vh, p.x, p.y);
-    let (head, feet) = (pixels(head), pixels(feet));
-    Some(SpeakerSpot { head: (head[0], head[1]), feet: (feet[0], feet[1]) })
+    let casts = scene.cast_draws();
+    let person = |who: Who, stands: Pos| -> Option<((f32, f32), (f32, f32))> {
+        let head = pixels(*built.anchors.get(&who)?);
+        let feet = pixels(view.to_view(stands)?);
+        Some(((head[0], head[1]), (feet[0], feet[1])))
+    };
+    let (head, feet) = person(cast_who(entity), casts.iter().find(|c| c.entity == entity)?.pos)?;
+    // A person's rectangle: the height between the head and the feet, about half as wide, and a few pixels more each way.
+    let rect = |(head, feet): ((f32, f32), (f32, f32))| -> Rect {
+        let tall = (feet.1 - head.1).abs().max(8.0);
+        let half = 0.3 * tall;
+        let (cx, pad) = ((head.0 + feet.0) / 2.0, 4.0);
+        (cx - half - pad, head.1.min(feet.1) - pad, cx + half + pad, head.1.max(feet.1) + pad)
+    };
+    let mut others: Vec<Rect> = casts.iter().filter(|c| c.entity != entity).filter_map(|c| person(cast_who(c.entity), c.pos)).map(rect).collect();
+    others.extend(scene.witnesses().iter().filter_map(|w| person(Who(w.entity.0), w.pos)).map(rect));
+    Some(SpeakerSpot { head, feet, others })
 }
