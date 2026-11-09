@@ -31,33 +31,70 @@
 //! players' battle for them. A spell is never cast on a whole side (that costs an All materia use, and the rule
 //! has no use for the choice); only a limit that can be given no other way is.
 //!
-//! # Pacing: the players go first
+//! # Pacing: each on its own clock, the players' first turn kept, one performance at a time
 //!
-//! The rule above says WHAT a companion does; [`may_act`] says WHEN. A companion that acted the instant its gauge filled
-//! would end most fights of the first reactor before a player's turn came (md1stin's enemies die to a hit or two, and the
-//! canon pair is as quick as any player), so a companion whose gauge is full HOLDS it while a living, connected player
-//! still owes a turn: one that has given no more commands in this battle than the companion has. The players therefore
-//! lead every round and the companions follow. Two bounds keep a fight from stalling on a player who does not act:
+//! The rule above says WHAT a companion does; [`may_act`] says WHEN. The answer is FF7's own: **a companion acts when its
+//! OWN gauge is full**, at the pace its Dexterity and the battle speed give it ([`fmv_ff7_battle::rules`], "Starting turn
+//! timers" and the gauge formulas), like every other fighter of the battle, enemies included. Two things hold it, and only
+//! while they apply:
 //!
-//! * a player whose own gauge has been full for [`Pacing::turn_wait_ms`] (the time to choose a command in the menu that
-//!   opens by itself) no longer holds anybody;
-//! * a companion never holds its full gauge longer than [`Pacing::max_wait_ms`] (for a player whose gauge is slow to fill
-//!   or never fills).
+//! * **The players' first turn.** The first reactor's enemies die to a blow or two, and the canon pair is as quick as any
+//!   player, so a companion that took every turn on its own clock would end most fights of md1 before a player's gauge had
+//!   even filled (without any pacing a solo player acted in only 44-87% of md1stin's fights, two players in 13-47% and three
+//!   in 0-12%: `how_the_players_fare_beside_the_canon_party`). So a companion **never delivers the blow that ends the battle
+//!   while a living, connected player has not had a
+//!   turn yet**: it leaves the last enemy standing (it holds its command, with its gauge full, as a fighter waiting for the
+//!   other's move would) until that player has given a command, which is released by [`Pacing::turn_wait_ms`] (the time to
+//!   choose in the menu that opens by itself, counted from that player's OWN full gauge, so an idle player stalls nobody)
+//!   and by [`Pacing::max_wait_ms`] (the longest a companion holds a full gauge for any reason). Only the finishing blow is
+//!   held: everything else a companion does, a heal, a limit break, a blow that leaves the enemy standing, goes on its own
+//!   clock, and the player's first turn needs only that one enemy to be there when its gauge fills. This replaces the
+//!   first pacing, which held EVERY command of a companion until the players had given as many as it had: it gave the
+//!   players the lead but it also released the whole party at the moment of the player's command, so that one attack of the
+//!   player's could be followed in the same instant by both companions' blows and end any fight ("one attack causes
+//!   victory"). The companions no longer wait for a command's count, only for the one first turn.
+//! * **One performance on the stage at a time.** FF7 plays one action at a time (the queue; a fighter whose gauge fills during
+//!   another's animation waits for it), and the client plays each message's performance from its arrival, so two commands
+//!   of the same instant are drawn on top of each other. A companion therefore waits until [`ACTION_GAP_MS`] after the last
+//!   command of ANY party member, a player's included (about the length of an Attack's performance on the client: its
+//!   impact 0.5 s after it begins and 0.45 s of follow-through; 1 s at the default pace), and never longer than
+//!   `max_wait_ms`. The gap is a length of BATTLE time ([`Clock::gap`]): it scales with the Battle Speed the way the game's own
+//!   animation pause does (the qhimm thread below: 1, 3 and 5 seconds at the fastest, default and slowest speed) and not with
+//!   the tick rate, so a battle run faster than the default (the smokes' `--battle-speed 0 --battle-tick-rate 240`) keeps the
+//!   gap a sixth of a gauge, as at the default, instead of making it longer than a gauge and halving what the companions do.
+//!   Where two companions are ready the one whose gauge has been full longest goes first (FF7's own order: the order the
+//!   gauges filled). The enemies are not on this account and are not held for a performance: the engine plays an enemy's turn
+//!   inside the step that fills its gauge (FF7's Active mode, see below), and a stage that every enemy turn made busy would
+//!   starve the companions at a fast battle pace; a player's command is never delayed.
+//!
+//! # Active, Recommended and Wait
+//!
+//! FF7's ATB has three modes (the qhimm thread "[FF7 PSX] ATB Recommended/Wait Pause Logic", which read the game's code,
+//! <https://forums.qhimm.com/index.php?topic=28474.0>): in **Active** the gauges stop only for a summon; in **Recommended**
+//! (the game's default) they also stop while an animation plays, never while a menu is open; **Wait** also stops them in
+//! the Magic, Item and Summon menus and while a target is chosen, but the command menu itself never stops anything. A
+//! shared battle cannot pause for one of several people (the others, the companions and the enemies share its clock, and the
+//! server cannot see which menu a client has open), so it plays **Active**: every gauge runs while a player chooses, an
+//! enemy acts the tick its gauge fills even with a menu open (verified over the real first reactor, see the
+//! `battle_real` tests), and the whole of what Wait gives a player, time to choose, is given instead as the first-turn
+//! rule above (the fight cannot end under a player's menu, for `turn_wait_ms`) and the starting timers (a player's first turn
+//! comes within a few seconds, and nobody starts a battle behind).
 //!
 //! Pacing only decides the tick at which the server submits a companion's command; nothing of it is part of what a replay
 //! depends on (every client replays the command at the tick the server announces), so it needs no wire change.
-//! `max_wait_ms == 0` turns it off: a companion then acts the instant its gauge fills, as in the first protocol-v9 build.
+//! `max_wait_ms == 0` turns it all off: a companion then acts the instant its gauge fills, as in the first protocol-v9 build.
 
 use fmv_ff7_battle::action::Aim;
 use fmv_ff7_battle::limit::LimitInfo;
-use fmv_ff7_battle::rules::{ActorId, BattleState, Combatant, Command, Target};
+use fmv_ff7_battle::rules::{v_timer_increase, ActorId, BattleState, Combatant, Command, Outcome, Target, DEFAULT_BATTLE_SPEED, DEFAULT_TICKS_PER_SECOND};
 
-/// How long the canon companions let the players go first (see the module docs, "Pacing"). Battle time, in milliseconds.
+/// How the canon companions let the players have a first turn (see the module docs, "Pacing"). Battle time, in milliseconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Pacing {
-    /// How long a player whose gauge is full may take to choose before the companions stop waiting for it.
+    /// How long a player whose gauge is full may take to choose before a companion may end the battle without its first turn.
     pub turn_wait_ms: u32,
-    /// The longest a companion holds a full gauge for the players. 0 turns pacing off (it acts as soon as it can).
+    /// The longest a companion holds a full gauge, for a player's first turn or a busy stage. 0 turns pacing off (it acts as soon
+    /// as it can).
     pub max_wait_ms: u32,
 }
 
@@ -65,6 +102,13 @@ pub struct Pacing {
 pub const DEFAULT_TURN_WAIT_MS: u32 = 5_000;
 /// [`Pacing::max_wait_ms`] by default.
 pub const DEFAULT_MAX_WAIT_MS: u32 = 10_000;
+/// How long after the last command of a party member the stage is busy and no companion starts another (module docs,
+/// "Pacing"), in milliseconds at the DEFAULT pace (60 ticks a second, Battle Speed 128): an Attack's performance is its impact
+/// (0.5 s) and its follow-through (0.45 s). It is a length of battle time, not of the clock on the wall: the gap is 60 ticks at the
+/// default Battle Speed and shortens or lengthens with it like the game's own animation pause (1, 3 and 5 seconds at the fastest,
+/// default and slowest speed, [`Clock::gap`]), whatever the tick rate, so a battle run faster than the default (the smokes'
+/// `--battle-speed 0 --battle-tick-rate 240`) keeps the gap in proportion to a gauge instead of throttling the companions.
+pub const ACTION_GAP_MS: u32 = 1_000;
 
 impl Default for Pacing {
     fn default() -> Self {
@@ -80,29 +124,102 @@ impl Pacing {
 /// A living, connected player of the battle as [`may_act`] sees it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlayerTurn {
-    /// How many of its commands the engine has accepted in this battle.
+    /// How many of its commands the engine has accepted in this battle (0: it has not had its first turn).
     pub commands: u32,
     /// The engine tick its gauge has been full since (it is waiting for its player's command), `None` while it fills.
     pub ready_since: Option<u64>,
 }
 
-/// `ms` of battle time in engine ticks, rounded up (so a wait is never shorter than asked).
-fn ticks(ms: u32, ticks_per_second: u32) -> u64 {
-    (u64::from(ms) * u64::from(ticks_per_second.max(1))).div_ceil(1000)
+/// How a battle's time maps to its engine ticks: the tick rate (the pacing's waits are milliseconds of battle time, which
+/// the server runs in real time) and the Battle Speed (the stage gap follows it). [`Clock::of`] reads both from a battle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Clock {
+    pub ticks_per_second: u32,
+    /// FF7's Battle Speed, 0 fastest to 255 slowest.
+    pub battle_speed: u8,
 }
 
-/// Whether a canon companion whose gauge has been full since tick `ready_since`, and which has given `commands` commands
-/// in this battle, may give its next one at tick `now` (module docs, "Pacing"). `players` are the battle's LIVING,
-/// CONNECTED players (the caller leaves out the dead, who cannot act, and the disconnected, who never will); with none
-/// left nobody is waited for.
-pub fn may_act(pacing: Pacing, ticks_per_second: u32, now: u64, commands: u32, ready_since: u64, players: &[PlayerTurn]) -> bool {
-    if now.saturating_sub(ready_since) >= ticks(pacing.max_wait_ms, ticks_per_second) {
+impl Clock {
+    /// The clock of `state`'s battle.
+    pub fn of(state: &BattleState) -> Self {
+        let config = state.config();
+        Self { ticks_per_second: config.ticks_per_second, battle_speed: config.battle_speed }
+    }
+
+    /// `ms` of battle time in engine ticks, rounded up (so a wait is never shorter than asked).
+    pub fn ticks(self, ms: u32) -> u64 {
+        (u64::from(ms) * u64::from(self.ticks_per_second.max(1))).div_ceil(1000)
+    }
+
+    /// The stage gap in engine ticks ([`ACTION_GAP_MS`]): its length in ticks at the default pace (60 ticks a second), scaled by how
+    /// much faster or slower than the default Battle Speed's V-timer ([`v_timer_increase`]) this battle's gauges fill, so 60
+    /// ticks at the default speed, about 20 at the fastest and 100 at the slowest, whatever the tick rate. Rounded up, and at
+    /// least one tick.
+    pub fn gap(self) -> u64 {
+        let default_ticks = u64::from(ACTION_GAP_MS) * u64::from(DEFAULT_TICKS_PER_SECOND) / 1000;
+        let (default_pace, pace) = (u64::from(v_timer_increase(DEFAULT_BATTLE_SPEED)), u64::from(v_timer_increase(self.battle_speed)));
+        (default_ticks * default_pace).div_ceil(pace.max(1)).max(1)
+    }
+}
+
+/// Whether a canon companion whose gauge has been full since tick `ready_since` may give its command at tick `now` (module
+/// docs, "Pacing"): not while the stage is busy (`last_action` is the tick of the last command of any party member, `None`
+/// before the first), and a command that `ends_battle` (asked only when it matters, so the caller can make it as costly as a
+/// probe of the engine) not while a player in `players` has not had its first turn. `players` are the battle's LIVING,
+/// CONNECTED players that can take a turn (the caller leaves out the dead, who cannot act, the disconnected, who never will,
+/// and the asleep or stopped, who owe none); with none left nobody is waited for. A companion that has held its full gauge
+/// for the pacing's `max_wait_ms` acts whatever the stage or the players do.
+pub fn may_act(
+    pacing: Pacing,
+    clock: Clock,
+    now: u64,
+    ready_since: u64,
+    last_action: Option<u64>,
+    players: &[PlayerTurn],
+    ends_battle: impl FnOnce() -> bool,
+) -> bool {
+    if now.saturating_sub(ready_since) >= clock.ticks(pacing.max_wait_ms) {
         return true;
     }
-    let turn_wait = ticks(pacing.turn_wait_ms, ticks_per_second);
-    players
-        .iter()
-        .all(|p| p.commands > commands || p.ready_since.is_some_and(|since| now.saturating_sub(since) >= turn_wait))
+    if last_action.is_some_and(|at| now.saturating_sub(at) < clock.gap()) {
+        return false;
+    }
+    let turn_wait = clock.ticks(pacing.turn_wait_ms);
+    let owes_a_turn = players.iter().any(|p| p.commands == 0 && !p.ready_since.is_some_and(|since| now.saturating_sub(since) >= turn_wait));
+    !owes_a_turn || !ends_battle()
+}
+
+/// A canon companion whose gauge is full, as [`next_move`] sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ready {
+    pub actor: ActorId,
+    /// The engine tick its gauge has been full since.
+    pub since: u64,
+}
+
+/// The command a canon companion gives NOW, with how many ticks it held its full gauge for it, if one may: of the `ready`
+/// companions the one whose gauge has been full the longest (the lower actor on a tie: FF7's own order, the order the
+/// gauges filled) that has something to do ([`command`]) and that [`may_act`] lets go at the engine's current tick. The one
+/// definition of who goes next that the server and the tests that play a battle the way the server does share.
+/// `last_action` is the tick of the last command of any party member and `players` the living, connected players that can
+/// take a turn, as [`may_act`] says.
+pub fn next_move(state: &BattleState, pacing: Pacing, last_action: Option<u64>, players: &[PlayerTurn], ready: &[Ready]) -> Option<(ActorId, Command, u64)> {
+    let (now, clock) = (state.tick(), Clock::of(state));
+    let mut order = ready.to_vec();
+    order.sort_unstable_by_key(|r| (r.since, r.actor));
+    order.into_iter().find_map(|r| {
+        let given = command(state, r.actor)?;
+        let probe = || ends_in_victory(state, r.actor, &given);
+        may_act(pacing, clock, now, r.since, last_action, players, probe).then_some((r.actor, given, now.saturating_sub(r.since)))
+    })
+}
+
+/// Whether `command` of `actor`, given now, would win the battle: the probe the first-turn rule asks about a companion's
+/// command, run on a copy of the engine (the copy has the same generator, so the real command, given before anything else
+/// happens, does exactly what the probe did). A command the engine refuses ends nothing.
+pub fn ends_in_victory(state: &BattleState, actor: ActorId, command: &Command) -> bool {
+    let mut probe = state.clone();
+    probe.submit_command(actor, *command).is_ok() && probe.outcome() == Some(Outcome::Victory)
 }
 
 /// Whether `c` is hurt enough to be healed: under half of its maximum HP.
@@ -216,69 +333,178 @@ mod tests {
     // ---- pacing ----
 
     /// 60 ticks per second: 1 s is 60 ticks.
-    const TPS: u32 = 60;
+    const TPS: Clock = Clock { ticks_per_second: 60, battle_speed: DEFAULT_BATTLE_SPEED };
     const PACE: Pacing = Pacing { turn_wait_ms: 5_000, max_wait_ms: 10_000 };
 
     fn player(commands: u32, ready_since: Option<u64>) -> PlayerTurn {
         PlayerTurn { commands, ready_since }
     }
 
+    /// `may_act` for a companion whose gauge has been full since `ready_since`, asked at `now`, with the last action at
+    /// `last` and a command that does (`ends`) or does not end the battle.
+    fn may(pacing: Pacing, clock: Clock, now: u64, ready_since: u64, last: Option<u64>, players: &[PlayerTurn], ends: bool) -> bool {
+        may_act(pacing, clock, now, ready_since, last, players, || ends)
+    }
+
     #[test]
-    fn a_companion_waits_for_every_player_that_still_owes_a_turn_this_round() {
-        // Cloud's gauge filled at tick 100, before the player's: the player has not acted yet, so Cloud holds.
-        assert!(!may_act(PACE, TPS, 101, 0, 100, &[player(0, None)]));
-        // The player's gauge fills at 130 and its player is choosing: Cloud still holds.
-        assert!(!may_act(PACE, TPS, 140, 0, 100, &[player(0, Some(130))]));
-        // The player acted: Cloud follows at once.
-        assert!(may_act(PACE, TPS, 141, 0, 100, &[player(1, None)]));
-        // Next round: Cloud has acted once, so the player has to have acted twice before Cloud's second command.
-        assert!(!may_act(PACE, TPS, 400, 1, 390, &[player(1, None)]));
-        assert!(may_act(PACE, TPS, 401, 1, 390, &[player(2, None)]));
-        // Two players: both have to have taken their turn.
-        assert!(!may_act(PACE, TPS, 401, 0, 390, &[player(1, None), player(0, Some(395))]));
-        assert!(may_act(PACE, TPS, 402, 0, 390, &[player(1, None), player(1, None)]));
+    fn a_companion_acts_on_its_own_clock_whatever_the_players_have_given() {
+        // A blow that leaves the enemy standing is never held for a player's turn: not while the player's gauge is still
+        // filling, not while it chooses, and the count of anybody's commands is nobody's business.
+        for players in [&[player(0, None)][..], &[player(0, Some(130))], &[player(1, None)], &[player(0, None), player(0, Some(100))]] {
+            assert!(may(PACE, TPS, 101, 100, None, players, false), "{players:?}");
+        }
+        // No player at all (all dead or gone) or none that owes a turn: even the blow that ends the battle goes.
+        assert!(may(PACE, TPS, 101, 100, None, &[], true));
+        assert!(may(PACE, TPS, 101, 100, None, &[player(1, None), player(4, Some(30))], true));
+    }
+
+    #[test]
+    fn the_blow_that_ends_the_battle_waits_for_every_players_first_turn() {
+        // The player's gauge is still filling, or full and it is choosing: the last enemy is left for it.
+        assert!(!may(PACE, TPS, 101, 100, None, &[player(0, None)], true));
+        assert!(!may(PACE, TPS, 140, 100, None, &[player(0, Some(130))], true));
+        // It has given a command (its first turn is behind it): the companion finishes the fight.
+        assert!(may(PACE, TPS, 141, 100, None, &[player(1, None)], true));
+        // Two players: both have to have had their first turn.
+        assert!(!may(PACE, TPS, 401, 390, None, &[player(1, None), player(0, Some(395))], true));
+        assert!(may(PACE, TPS, 402, 390, None, &[player(1, None), player(2, None)], true));
     }
 
     #[test]
     fn a_player_who_does_not_choose_holds_nobody_after_the_turn_wait() {
-        // The player's gauge has been full since tick 100 and it has not chosen: 5 s (300 ticks) later Cloud goes anyway.
-        assert!(!may_act(PACE, TPS, 399, 0, 100, &[player(0, Some(100))]));
-        assert!(may_act(PACE, TPS, 400, 0, 100, &[player(0, Some(100))]));
-        // ... and in the next rounds too, without a new wait, for as long as that player's gauge stays full.
-        assert!(may_act(PACE, TPS, 700, 1, 690, &[player(0, Some(100))]));
+        // The player's gauge has been full since tick 100 and it has not chosen: 5 s (300 ticks) later the companion goes
+        // anyway.
+        assert!(!may(PACE, TPS, 399, 100, None, &[player(0, Some(100))], true));
+        assert!(may(PACE, TPS, 400, 100, None, &[player(0, Some(100))], true));
+        // ... and later ones too, without a new wait, for as long as that player's gauge stays full.
+        assert!(may(PACE, TPS, 700, 690, None, &[player(0, Some(100))], true));
         // A turn wait counts from the player's own full gauge, not from the companion's.
-        assert!(!may_act(PACE, TPS, 600, 0, 100, &[player(0, Some(400))]));
+        assert!(!may(PACE, TPS, 600, 100, None, &[player(0, Some(400))], true));
     }
 
     #[test]
     fn a_companion_never_holds_its_gauge_longer_than_the_cap() {
         // The player's gauge never fills (a very slow player, or one that cannot act): 10 s (600 ticks) is the limit.
-        assert!(!may_act(PACE, TPS, 699, 0, 100, &[player(0, None)]));
-        assert!(may_act(PACE, TPS, 700, 0, 100, &[player(0, None)]));
+        assert!(!may(PACE, TPS, 699, 100, None, &[player(0, None)], true));
+        assert!(may(PACE, TPS, 700, 100, None, &[player(0, None)], true));
         // The waits are battle time: at 240 ticks per second the same 10 s are 2400 ticks.
-        assert!(!may_act(PACE, 240, 100 + 2399, 0, 100, &[player(0, None)]));
-        assert!(may_act(PACE, 240, 100 + 2400, 0, 100, &[player(0, None)]));
+        let fast = Clock { ticks_per_second: 240, battle_speed: DEFAULT_BATTLE_SPEED };
+        assert!(!may(PACE, fast, 100 + 2399, 100, None, &[player(0, None)], true));
+        assert!(may(PACE, fast, 100 + 2400, 100, None, &[player(0, None)], true));
     }
 
     #[test]
-    fn with_nobody_to_wait_for_or_pacing_off_a_companion_acts_at_once() {
-        // Every player is dead or gone (the caller leaves them out).
-        assert!(may_act(PACE, TPS, 100, 3, 100, &[]));
-        // Off: the instant its gauge fills, whatever the players do.
-        assert!(may_act(Pacing::OFF, TPS, 100, 0, 100, &[player(0, None)]));
-        assert!(may_act(Pacing::OFF, TPS, 100, 5, 100, &[player(0, Some(100))]));
+    fn one_performance_is_on_the_stage_at_a_time_and_a_busy_stage_cannot_starve_a_companion() {
+        // The last command (anybody's of the party) was at tick 100: for 1 s (60 ticks at the default pace) no companion starts
+        // another, whatever it is.
+        assert!(!may(PACE, TPS, 100, 90, Some(100), &[], false));
+        assert!(!may(PACE, TPS, 159, 90, Some(100), &[], false));
+        assert!(may(PACE, TPS, 160, 90, Some(100), &[], false));
+        // The gap is a length of battle time, so it is the same number of ticks at any tick rate (a faster rate runs the whole
+        // battle faster) and follows the Battle Speed like the game's own animation pause: 20, 60 and 102 ticks at the
+        // fastest, default and slowest speed (the pause the Qhimm thread measured is 1, 3 and 5 seconds).
+        for ticks_per_second in [60, 240, 1000] {
+            let at = |battle_speed| Clock { ticks_per_second, battle_speed };
+            assert_eq!((at(0).gap(), at(DEFAULT_BATTLE_SPEED).gap(), at(255).gap()), (20, 60, 102), "{ticks_per_second} ticks a second");
+        }
+        let fastest = Clock { ticks_per_second: 240, battle_speed: 0 };
+        assert!(!may(PACE, fastest, 100 + 19, 90, Some(100), &[], false));
+        assert!(may(PACE, fastest, 100 + 20, 90, Some(100), &[], false));
+        let slowest = Clock { ticks_per_second: 60, battle_speed: 255 };
+        assert!(!may(PACE, slowest, 100 + 101, 90, Some(100), &[], false));
+        assert!(may(PACE, slowest, 100 + 102, 90, Some(100), &[], false));
+        // A stage that is busy again and again still lets a companion through once it has held its gauge for the cap.
+        assert!(!may(PACE, TPS, 689, 90, Some(650), &[], false));
+        assert!(may(PACE, TPS, 690, 90, Some(650), &[], false));
+        // Before the first action there is no performance to wait for.
+        assert!(may(PACE, TPS, 0, 0, None, &[], false));
+    }
+
+    #[test]
+    fn with_pacing_off_a_companion_acts_at_once_whatever_happens() {
+        for players in [&[][..], &[player(0, None)], &[player(0, Some(100))]] {
+            assert!(may(Pacing::OFF, TPS, 100, 100, Some(100), players, true), "{players:?}");
+        }
         // A turn wait of 0 alone releases a player the moment its gauge is full, but one still filling is waited for.
         let no_turn_wait = Pacing { turn_wait_ms: 0, ..PACE };
-        assert!(may_act(no_turn_wait, TPS, 100, 0, 90, &[player(0, Some(100))]));
-        assert!(!may_act(no_turn_wait, TPS, 100, 0, 90, &[player(0, None)]));
+        assert!(may(no_turn_wait, TPS, 100, 90, None, &[player(0, Some(100))], true));
+        assert!(!may(no_turn_wait, TPS, 100, 90, None, &[player(0, None)], true));
+    }
+
+    #[test]
+    fn the_probe_of_a_blow_is_asked_only_when_a_player_owes_a_turn_and_the_stage_is_free() {
+        let asked = std::cell::Cell::new(0);
+        let probe = || {
+            asked.set(asked.get() + 1);
+            true
+        };
+        // Nobody owes a turn, the cap is up or the stage is busy: the answer does not depend on the engine.
+        assert!(may_act(PACE, TPS, 101, 100, None, &[], probe));
+        assert!(may_act(PACE, TPS, 101, 100, None, &[player(1, None)], probe));
+        assert!(may_act(PACE, TPS, 700, 100, None, &[player(0, None)], probe));
+        assert!(!may_act(PACE, TPS, 101, 100, Some(100), &[player(0, None)], probe));
+        assert_eq!(asked.get(), 0, "the engine is not copied for nothing");
+        // A player owes its first turn and the stage is free: now it matters.
+        assert!(!may_act(PACE, TPS, 101, 100, None, &[player(0, None)], probe));
+        assert_eq!(asked.get(), 1);
     }
 
     #[test]
     fn waits_are_rounded_up_to_whole_ticks() {
-        assert_eq!(ticks(5_000, 60), 300);
-        assert_eq!(ticks(10, 60), 1, "10 ms at 60/s is 0.6 ticks: one whole tick");
-        assert_eq!(ticks(0, 60), 0);
-        assert_eq!(ticks(1_000, 0), 1, "a zero rate is read as 1 per second");
+        let at = |ticks_per_second| Clock { ticks_per_second, battle_speed: DEFAULT_BATTLE_SPEED };
+        assert_eq!(at(60).ticks(5_000), 300);
+        assert_eq!(at(60).ticks(10), 1, "10 ms at 60/s is 0.6 ticks: one whole tick");
+        assert_eq!(at(60).ticks(0), 0);
+        assert_eq!(at(0).ticks(1_000), 1, "a zero rate is read as 1 per second");
+        assert_eq!(at(60).gap(), 60);
+    }
+
+    #[test]
+    fn next_move_gives_the_longest_waiting_companion_its_turn_and_the_stage_and_the_first_turn_apply_to_it() {
+        let party = || vec![fighter("Cloud", 200, 60), fighter("Barret", 200, 60), fighter("Player", 200, 60)];
+        let (cloud, barret) = (ActorId(0), ActorId(1));
+        let ready = |cloud_since, barret_since| [Ready { actor: cloud, since: cloud_since }, Ready { actor: barret, since: barret_since }];
+        let go = |state: &BattleState, ready: &[Ready], last: Option<u64>, players: &[PlayerTurn]| {
+            next_move(state, PACE, last, players, ready).map(|(actor, _, held)| (actor, held))
+        };
+        // The battle stands at tick 0. FF7 takes the turns in the order the gauges filled: whoever has been full the longest goes
+        // first, whatever its place in the party, and the lower actor on a tie.
+        let state = battle(party(), vec![foe(100_000)]);
+        assert_eq!(go(&state, &ready(9, 5), None, &[]), Some((barret, 0)));
+        assert_eq!(go(&state, &ready(5, 9), None, &[]), Some((cloud, 0)));
+        assert_eq!(go(&state, &ready(7, 7), None, &[]), Some((cloud, 0)));
+        // A performance on the stage holds them both; the held ticks are what the log says.
+        assert_eq!(go(&state, &ready(0, 0), Some(0), &[]), None);
+        // A player that owes its first turn does not hold a blow that leaves the enemy standing ...
+        assert_eq!(go(&state, &ready(0, 0), None, &[player(0, None)]), Some((cloud, 0)));
+        // ... but does hold the one that ends the battle (an enemy with one HP dies to any blow that hits), until it has had it.
+        let doomed = battle(party(), vec![foe(1)]);
+        assert_eq!(go(&doomed, &ready(0, 0), None, &[player(0, None)]), None);
+        assert_eq!(go(&doomed, &ready(0, 0), None, &[player(1, None)]), Some((cloud, 0)));
+        assert_eq!(go(&doomed, &ready(0, 0), None, &[]), Some((cloud, 0)));
+        // Nobody ready, nobody goes; a companion with nothing to do is passed over for the next.
+        assert_eq!(go(&state, &[], None, &[]), None);
+        let dead_enemies = battle(party(), vec![foe(0)]);
+        assert_eq!(go(&dead_enemies, &ready(0, 0), None, &[]), None, "nothing to hit");
+    }
+
+    #[test]
+    fn a_probe_says_whether_a_command_would_win_and_changes_nothing() {
+        // Two foes: a blow on one of them leaves the other standing, whatever the blow does.
+        let state = battle(vec![fighter("Cloud", 200, 60)], vec![foe(1), foe(100_000)]);
+        let before = state.clone();
+        assert!(!ends_in_victory(&state, ActorId(0), &Command::Attack { target: ActorId(1) }), "one enemy is left");
+        assert!(!ends_in_victory(&state, ActorId(0), &Command::Attack { target: ActorId(2) }), "one enemy is left");
+        assert_eq!(state, before, "the probe ran on a copy");
+        // The last enemy standing: the probe agrees with what the real command then does, hit or miss.
+        let state = battle(vec![fighter("Cloud", 200, 60)], vec![foe(0), foe(1)]);
+        let attack = Command::Attack { target: ActorId(2) };
+        let mut real = state.clone();
+        real.submit_command(ActorId(0), attack).unwrap();
+        assert_eq!(ends_in_victory(&state, ActorId(0), &attack), real.outcome() == Some(Outcome::Victory));
+        // A command the engine refuses ends nothing.
+        assert!(!ends_in_victory(&state, ActorId(0), &Command::Attack { target: ActorId(1) }), "the target is dead");
+        assert!(!ends_in_victory(&state, ActorId(9), &attack), "nobody");
     }
 
     #[test]
