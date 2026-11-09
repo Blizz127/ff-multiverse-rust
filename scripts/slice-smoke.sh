@@ -328,6 +328,29 @@ stored_items() {
   jq -r '(.inventory // []) | if length == 0 then "-" else map("\(.item):\(.count)") | join(",") end' "$progress"
 }
 
+# npc_lines <client log> <area>: the NPCs a client reported for <area> (`headless: npc area=<area> id=<n> name=<enc>
+# model=<stem>`), one `name=.. model=..` per NPC in id order, joined with `;` (empty if none): the last report of each id
+# (an NPC set is reported again whenever it changes).
+npc_lines() {
+  local log="$1" area="$2" line id out="" row
+  local -A seen=()
+  local -a ids=()
+  [[ -r $log ]] || return 0
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line == *"headless: npc area=$area "* ]] || continue
+    line=$(strip_ansi "$line")
+    id=$(field "$line" id)
+    [[ -n $id ]] || continue
+    [[ -n ${seen[$id]:-} ]] || ids+=("$id")
+    seen[$id]="name=$(field "$line" name) model=$(field "$line" model)"
+  done <"$log"
+  for id in "${ids[@]}"; do
+    row="${seen[$id]}"
+    out+="$row;"
+  done
+  printf '%s' "$out"
+}
+
 # last_items <client log>: the items= of the client's last `inventory:` note.
 last_items() {
   line_field "$1" "inventory: stacks=" items
@@ -447,13 +470,19 @@ run_slice() {
     [[ $acted == *" name=$enc_a"* || $acted == *" name=$enc_b"* ]] || problem "a battle action line does not name the player: $acted"
   done
 
-  # The canon Barret is still a character of the field the Barret-slot player walks (an NPC: the story keeps its
-  # canon characters), seen with Barret's own skeleton.
-  if log_has "$la" "headless: npc "; then
-    log_has "$la" "model=acgd" || problem "the Barret-slot player's field has no NPC with Barret's skeleton (model=acgd): the canon Barret is not in its story"
+  # The canon Barret is still a character of the field (an NPC: the story keeps its canon characters), seen with
+  # Barret's own skeleton, for the player who holds Barret's slot AND for the one who holds Tifa's: everybody sees
+  # the same canon cast, and nobody is drawn as the canon character whose slot they hold.
+  local npcs_a npcs_b
+  npcs_a=$(npc_lines "$la" Ff7/md1stin)
+  npcs_b=$(npc_lines "$lb" Ff7/md1stin)
+  if [[ -z $npcs_a ]]; then
+    problem "client A (Barret's slot) reported no NPC of md1stin at all (it prints 'headless: npc area=Ff7/md1stin ...' lines)"
   else
-    problem "client A reported no NPC of its field at all (it prints 'headless: npc ...' lines)"
+    [[ $npcs_a == *"name=Barret model=acgd"* ]] || problem "the Barret-slot player's md1stin has no canon Barret NPC (name=Barret model=acgd): $npcs_a"
   fi
+  expect_equal "A (Barret's slot) and B (Tifa's slot) see the same NPCs in md1stin" "$npcs_a" "$npcs_b"
+  [[ $npcs_a == *"name=gu0 "* && $npcs_a == *"name=gu1 "* ]] || problem "the guards of md1stin are not in the NPC list any more: $npcs_a"
 
   stop_server
   # Stopping the server saved everything queued: both payments are in the store.

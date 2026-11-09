@@ -236,6 +236,38 @@ fn a_v6_shaped_record_migrates_without_changing_any_number() {
     assert_eq!(fs::read_to_string(progress_file(&root, AccountId(1))).unwrap(), V6_PROGRESS);
 }
 
+/// Copy a directory tree (std only).
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    fs::create_dir_all(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let path = entry.unwrap().path();
+        let target = to.join(path.file_name().unwrap());
+        if path.is_dir() {
+            copy_tree(&path, &target);
+        } else if path.file_name().is_some_and(|n| n != "LOCK") {
+            fs::copy(&path, &target).unwrap();
+        }
+    }
+}
+
+/// The ROLLBACK check, with the real older build: writes the directories of a v6 and a v7 account AFTER this build
+/// migrated them to `$FMV_EMIT_MIGRATED_DIR/{v6,v7}`, so that the persist crate of the v7 commit (`4be1cb0`, built on its
+/// own: `git archive 4be1cb0 crates/fmv-persist crates/fmv-core Cargo.toml Cargo.lock`) can open them and read what a
+/// rolled-back v7 server reads at login. Ignored: it only makes the inputs; the reading is done by the other build.
+#[test]
+#[ignore = "writes the migrated directories to $FMV_EMIT_MIGRATED_DIR for a check with the v7 build"]
+fn emit_the_migrated_directories_for_a_rollback_check() {
+    let Some(out) = std::env::var_os("FMV_EMIT_MIGRATED_DIR").map(std::path::PathBuf::from) else {
+        eprintln!("skipped: FMV_EMIT_MIGRATED_DIR is not set");
+        return;
+    };
+    for (name, json, expect) in [("v6", V6_PROGRESS, v6_record()), ("v7", V7_PROGRESS, v7_record())] {
+        let (_dir, root) = legacy_directory(json);
+        migrate_and_check(&root, &expect);
+        copy_tree(&root, &out.join(name));
+    }
+}
+
 #[test]
 fn a_v7_shaped_record_migrates_without_changing_any_number() {
     let (_dir, root) = legacy_directory(V7_PROGRESS);
