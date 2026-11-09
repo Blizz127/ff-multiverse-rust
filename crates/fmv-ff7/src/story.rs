@@ -84,6 +84,7 @@ use fmv_adapter_api::{StoryPoint, StoryStep, StoryTrigger};
 use fmv_core::{PhaseKey, Pos};
 
 use crate::field::Walkmesh;
+use crate::script::dialogue::{StartOfGame, StoryVars};
 use crate::script::{FieldScript, Instruction, Operand, INIT_SCRIPT, SCRIPTS_PER_ENTITY};
 
 /// The bank of the main progress counter (`Var[2][0]`).
@@ -127,6 +128,27 @@ impl StoryState {
     pub fn encode(self) -> Vec<u8> {
         let [lo, hi] = self.moment.to_le_bytes();
         vec![BLOB_VERSION, lo, hi]
+    }
+}
+
+/// The dialogue lane's source of story variables (`StoryVars`) for an account: `Var[2][0]` is its moment
+/// (the word at bank 2, address 0: low byte first), every other variable is 0 as in a new game, and the
+/// party is a new game's (the Bombing Mission's) until the combat-slot lane decides who stands in it. So
+/// a conversation reads the player's OWN story, whichever character the player looks like:
+/// `talk.set_story(Box::new(move || Box::new(state)))` with `state` decoded from the progression the
+/// server told this client (`fmv-client`'s `StoryMirror::progress`).
+impl StoryVars for StoryState {
+    fn byte(&self, bank: u8, address: u8) -> u8 {
+        let [lo, hi] = self.moment.to_le_bytes();
+        match (bank, address) {
+            (MOMENT_BANK, MOMENT_ADDRESS) => lo,
+            (MOMENT_BANK, a) if a == MOMENT_ADDRESS.wrapping_add(1) => hi,
+            _ => 0,
+        }
+    }
+
+    fn party_member(&self, slot: u8) -> Option<u8> {
+        StartOfGame.party_member(slot)
     }
 }
 
@@ -567,6 +589,22 @@ mod tests {
         for bad in [&[7u8, 7][..], &[2, 1, 0], &[1, 1], &[1, 1, 0, 0], &[0], &[0xAB; 64]] {
             assert_eq!(StoryState::decode(bad), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn an_accounts_story_is_the_dialogue_lanes_story_variables() {
+        // Var[2][0] is the moment as a little-endian word; everything else is a new game's.
+        for moment in [0u16, 1, 6, 255, 256, 1600, u16::MAX] {
+            let state = StoryState { moment };
+            let [lo, hi] = moment.to_le_bytes();
+            assert_eq!((state.byte(2, 0), state.byte(2, 1)), (lo, hi), "moment {moment}");
+            for (bank, address) in [(1u8, 0u8), (2, 2), (2, 255), (6, 0), (15, 32)] {
+                assert_eq!(state.byte(bank, address), 0, "bank {bank} address {address}");
+            }
+        }
+        let state = StoryState::new_game();
+        assert_eq!((0..3).map(|s| state.party_member(s)).collect::<Vec<_>>(), (0..3).map(|s| StartOfGame.party_member(s)).collect::<Vec<_>>());
+        assert_eq!(StoryState::decode(&[]).map(|s| s.byte(2, 0)), Some(1), "a new account reads moment 1");
     }
 
     #[test]
