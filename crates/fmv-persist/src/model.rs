@@ -9,6 +9,7 @@ use std::fmt;
 use fmv_core::{AccountId, AvatarAppearance, GameId, InventoryEntry, MAX_INVENTORY_STACKS};
 use serde::{Deserialize, Serialize};
 
+use crate::character::PlayerCharacter;
 use crate::error::{PersistError, Result};
 
 /// Record format version written by this build. Loaders accept `1..=SCHEMA_VERSION` and
@@ -261,13 +262,17 @@ fn check_stored_appearance_ref(value: &str) -> Result<()> {
 }
 
 /// What [`Store::register`](crate::Store::register) returns: the new account, the one-time
-/// plaintext token, and the avatar that was created with it.
+/// plaintext token, and the avatar that was created with it (and, from
+/// [`Store::register_with_character`](crate::Store::register_with_character), its player-character
+/// record).
 #[derive(Clone, PartialEq, Eq)]
 pub struct Registered {
     pub account_id: AccountId,
     /// Shown exactly once: only `blake3(token)` is stored. `Debug` does not print it.
     pub token: String,
     pub avatar: AvatarProfile,
+    /// The player-character record created with the account, as stored. `None` for a plain `register`.
+    pub character: Option<PlayerCharacter>,
 }
 
 impl fmt::Debug for Registered {
@@ -276,6 +281,7 @@ impl fmt::Debug for Registered {
             .field("account_id", &self.account_id)
             .field("token", &"<redacted>")
             .field("avatar", &self.avatar)
+            .field("character", &self.character)
             .finish()
     }
 }
