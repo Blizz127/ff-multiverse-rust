@@ -122,8 +122,8 @@
 //!   `StatusEnded { target, status }` (a cure, a timer that ran out, or a sleeper woken by a physical blow) and
 //!   `StatusTick { target, status, amount }` (a turn of Poison, which took `amount` HP, or of Regen, which gave it). A
 //!   `status` travels as its name (`"Poison"`, `"MBarrier"`), a status set as its bit mask (a number: bit `n` is the
-//!   `n`th status of `Status::ALL`, as in the game's own records). A v11 peer cannot decode them, so this needs the
-//!   protocol version that follows 11.
+//!   `n`th status of `Status::ALL`, as in the game's own records). A v11 peer cannot decode them, so they came with
+//!   protocol v12.
 //! * **A held turn.** A member that is asleep, stopped or paralysed keeps its full gauge and gives no command: the
 //!   engine's `ready_actors()` leaves it out, a command from it is refused (`CannotAct`), and a silenced member's
 //!   Magic is (`Silenced`). Both are new [`BattleRejection`]s; the server's own rule for a companion never asks for

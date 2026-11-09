@@ -1,4 +1,8 @@
-//! FF Multiverse wire protocol v11.
+//! FF Multiverse wire protocol v12.
+//!
+//! v12 is v11 plus STATUS EFFECTS (see "Statuses (v12)" below and [`battle`], "Statuses"): three battle events, two
+//! refusals and one optional field of the roster ([`BattleMember::status`]). A v11 peer cannot decode the new events or
+//! refusals, so a v11 client or server is refused at the handshake. Nothing new is stored (a status is battle state).
 //!
 //! v11 is v10 with the ENEMIES' own AI: every peer's engine now has the enemies act by their real `scene.bin` AI
 //! scripts (a bounded interpreter, with the enemy's counter scripts after a blow and the plain behaviour as the per-turn
@@ -106,7 +110,7 @@
 //! spell, an item or a limit is a [`Target`] since v10 (one actor or a whole side): see [`battle`], "Whole-side
 //! targeting".
 //!
-//! # Statuses (the version after 11)
+//! # Statuses (v12)
 //!
 //! The engine plays Poison, Sleep, Haste and the other statuses of `fmv_ff7_battle::status`. The battle gains three
 //! events (`StatusInflicted`, `StatusEnded`, `StatusTick`), two refusals (`CannotAct` for a member that is asleep,
@@ -331,7 +335,7 @@ pub use fmv_party::{
     PartyEvent, PartyId, Placement,
 };
 
-pub const PROTOCOL_VERSION: u16 = 11;
+pub const PROTOCOL_VERSION: u16 = 12;
 /// Hard cap on a single frame payload (bytes).
 pub const MAX_FRAME: u32 = 256 * 1024;
 /// Default TCP port for development. Deployment port is UNASSIGNED (see DEPLOYMENT-CONTRACT.md).
@@ -746,8 +750,8 @@ mod tests {
     }
 
     #[test]
-    fn the_version_is_eleven() {
-        assert_eq!(PROTOCOL_VERSION, 11);
+    fn the_version_is_twelve() {
+        assert_eq!(PROTOCOL_VERSION, 12);
     }
 
     // -----------------------------------------------------------------------------------------
@@ -1889,7 +1893,7 @@ mod tests {
     #[test]
     fn golden_character_messages() {
         // A registration that chose a body and a slot, one that chose nothing, and a token login (which ignores it). The
-        // version number is a literal, as in `golden_client_messages`: these pin the SHAPE, and `the_version_is_eleven`
+        // version number is a literal, as in `golden_client_messages`: these pin the SHAPE, and `the_version_is_twelve`
         // pins the version, so a bump does not have to rewrite them.
         golden(
             ClientMsg::Hello {
@@ -2043,7 +2047,7 @@ mod tests {
         assert_eq!(decode::<Controller>(br#""Companion""#).unwrap(), Controller::Companion);
     }
 
-    /// Statuses (the version after 11): the member that starts with some says so (a bit mask, after the limit gauge),
+    /// Statuses (v12): the member that starts with some says so (a bit mask, after the limit gauge),
     /// one that starts with none is exactly what it was, and a v11 peer can read neither the events nor the refusals.
     #[test]
     fn golden_member_statuses_and_what_a_v11_peer_cannot_read() {
@@ -2152,8 +2156,8 @@ mod tests {
         let v2 = br#"{"Hello":{"protocol_version":2,"client_build":"x","auth":{"Register":{"display_name":"n"}},"tint":[1,2,3],"appearance_ref":null}}"#;
         assert!(decode::<ClientMsg>(v2).is_err(), "no Hello before v8 is a v8 ClientMsg");
         assert_eq!(probe_hello_version(v2), Some(2));
-        let future = br#"{"Hello":{"protocol_version":12,"anything":{"at":"all"}}}"#;
-        assert_eq!(probe_hello_version(future), Some(12));
+        let future = br#"{"Hello":{"protocol_version":13,"anything":{"at":"all"}}}"#;
+        assert_eq!(probe_hello_version(future), Some(13));
         for not_hello in [&br#""Leave""#[..], br#"{"Ping":{"nonce":1}}"#, b"not json", b"{}", br#"{"Hello":{}}"#, br#"{"Hello":{"protocol_version":70000}}"#] {
             assert_eq!(probe_hello_version(not_hello), None, "{}", String::from_utf8_lossy(not_hello));
         }

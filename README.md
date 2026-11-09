@@ -61,7 +61,7 @@ canon party member, separate from the canon story roles) and pointers to its pro
 reactor mission are in every battle as companions the server commands, and each player's character is ADDED
 after them, in its own body, replacing nobody, and **a spell, an item or a limit can hit a whole side (protocol
 v10)**: an ALL place for the target pointer, FF7's All materia rule and the 2/3 split, and **battles have status
-effects (the version after 11)**: Poison, Regen, Sleep, Stop, Paralysis, Silence, Haste, Slow, Barrier, MBarrier,
+effects (protocol v12)**: Poison, Regen, Sleep, Stop, Paralysis, Silence, Haste, Slow, Barrier, MBarrier,
 Sadness, Fury and Darkness, inflicted and cured by the game's own spells, items and enemy attacks. The
 synthetic **FIXTURE** plaza still exists
 as a labelled test area; it says nothing about FF7 support.
@@ -75,7 +75,7 @@ as a labelled test area; it says nothing about FF7 support.
 | M2-e | Player characters: identity, per-game binding, fighting style (a stat curve) separate from canon roles, pointers to progress (protocol v8) | done for the slice (FF7: generic placeholder bodies, fixed styles; `scripts/slice-smoke.sh`) |
 | M2-f | The story's canon party fights beside the players as server-controlled companions; players are added after them (protocol v9) | done for the first reactor mission (FF7: Cloud and Barret; `scripts/battle-smoke.sh`, `scripts/slice-smoke.sh`) |
 | M2-g | Whole-side targeting: spells, items and limits can hit one target or a whole side, the party side being the canon companions and the players (protocol v10) | done for spells, items and limits (FF7: the All materia rule, the 2/3 split; the enemies' own AI still picks one party member; `scripts/battle-smoke.sh --commands`) |
-| M2-h | Status effects: the statuses of the game's own spells, items and enemy attacks, their clocks, what they do to turns, damage and hit rate, cures, panels and body cues (the version after 11) | done for 13 statuses (the engine's `status` module lists what is left out: Confusion, Berserk, Reflect, Petrify, Frog, ...; `scripts/battle-smoke.sh --status`) |
+| M2-h | Status effects: the statuses of the game's own spells, items and enemy attacks, their clocks, what they do to turns, damage and hit rate, cures, panels and body cues (protocol v12) | done for 13 statuses (the engine's `status` module lists what is left out: Confusion, Berserk, Reflect, Petrify, Frog, ...; `scripts/battle-smoke.sh --status`) |
 | Later | FF8, FF9, FF10 and FF12 adapters on the same core | planned |
 
 **Walking between fields (protocol v4).** The server hosts many fields: the entry field
@@ -703,7 +703,7 @@ whole party.
 `FMV_SMOKE_SCRIPT_A`, `FMV_SMOKE_SCRIPT_B` and
 `FMV_SMOKE_ESCAPE_SCRIPT` override the scripts (to try its failure paths).
 
-**Status effects (the version after 11).** `fmv_ff7_battle::status` is the model and its module docs hold the
+**Status effects (protocol v12).** `fmv_ff7_battle::status` is the model and its module docs hold the
 sources and every number: the 32 status bits of the game, what an attack, item or `scene.bin` record's status fields
 mean (a mask and a byte, the low six bits of which are the chance out of 63 and the high bits say inflict, cure or
 toggle; the data's own "no status" marker), and the clocks. The sources are Terence Fergusson's *FF7 Battle
@@ -964,7 +964,7 @@ v10 engine would pick different enemy moves from the same seed, so its replay wo
 v10 client or server is refused at the handshake instead (the real socket test refuses v10 and every older version).
 **Rolling back v11:** nothing it stores is new, so point the server and the clients back at a v10 build together.
 
-**The version after 11 (statuses)** adds three battle events, two refusals and one optional field of the roster (see "Status
+**Protocol v12 (statuses)** adds three battle events, two refusals and one optional field of the roster (see "Status
 effects" above), so a v11 peer cannot decode them and the version has to move with them: the server and the clients change
 together. It stores nothing new (a status is battle state; the starting statuses are a debug input), so rolling back is
 pointing the server and the clients back at a v11 build together.
