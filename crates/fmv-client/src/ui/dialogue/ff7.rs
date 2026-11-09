@@ -52,12 +52,6 @@ impl Ff7Conversations {
         Self { ff7, area: None, story: Box::new(|| Box::new(StartOfGame)), started: 0 }
     }
 
-    /// Where the story comes from (the hook for story progress): called for every conversation.
-    #[allow(dead_code)] // the story layer plugs in here; nothing in the window does yet
-    pub fn set_story(&mut self, story: StoryFactory) {
-        self.story = story;
-    }
-
     /// The script of `area`, loaded now if it is not the one held.
     fn loaded(&mut self, area: &str) -> Option<&Loaded> {
         let ff7 = self.ff7.as_ref()?;
@@ -94,5 +88,9 @@ impl Conversations for Ff7Conversations {
         self.started = self.started.wrapping_add(1);
         let session = TalkSession::talk(section, character.entity, (self.story)(), self.started).ok()?;
         Some(Box::new(session))
+    }
+
+    fn set_story(&mut self, story: StoryFactory) {
+        self.story = story;
     }
 }

@@ -6,7 +6,7 @@ use crate::ui::font::is_drawable;
 use crate::ui::testkit::Rng;
 use crate::ui::widgets::{ACCENT, BORDER};
 use fmv_ff7::script::dialogue::{Choice, End, MessageOrigin, Piece};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
 
@@ -364,9 +364,15 @@ struct Fake {
     radius: f32,
     says: Vec<(&'static str, Vec<Message>)>,
     started: Rc<RefCell<Vec<String>>>,
+    /// How many times the story hook was set.
+    stories: Rc<Cell<u32>>,
 }
 
 impl Conversations for Fake {
+    fn set_story(&mut self, _story: ff7::StoryFactory) {
+        self.stories.set(self.stories.get() + 1);
+    }
+
     fn talk_radius(&mut self, _area: &str, npc: &NpcView) -> f32 {
         if self.says.iter().any(|(n, _)| *n == npc.name) {
             self.radius
@@ -388,7 +394,7 @@ fn npc(id: u32, name: &str, x: f32, y: f32) -> NpcView {
 
 fn talk_with(says: Vec<(&'static str, Vec<Message>)>) -> (Talk, Rc<RefCell<Vec<String>>>) {
     let started: Rc<RefCell<Vec<String>>> = Rc::default();
-    (Talk::new(Box::new(Fake { radius: 80.0, says, started: Rc::clone(&started) })), started)
+    (Talk::new(Box::new(Fake { radius: 80.0, says, started: Rc::clone(&started), stories: Rc::default() })), started)
 }
 
 fn around<'a>(npcs: &'a [NpcView], own: (f32, f32), facing: f32) -> Around<'a> {
@@ -472,13 +478,53 @@ fn while_open_the_dialogue_takes_its_keys_and_lets_the_rest_through() {
     assert!(!talk.key(KeyCode::Enter, false, false, &a));
     assert!(!talk.key(KeyCode::Enter, true, true, &a), "a held Enter does not page through a conversation");
     assert!(talk.is_open());
-    // The question: the arrows move the pointer (and repeat), Enter answers, Esc closes everything.
-    assert!(talk.key(KeyCode::ArrowDown, true, true, &a));
+    // The question: a fresh arrow press moves the pointer, Enter answers, Esc closes everything.
+    assert!(talk.key(KeyCode::ArrowDown, true, false, &a));
     assert_eq!(talk.window.as_ref().map(|w| w.position().1), Some(1));
     assert!(press(&mut talk, KeyCode::Enter, &a));
     assert!(talk.is_open() && talk.message().is_some_and(|m| m.choice.is_none()));
     assert!(press(&mut talk, KeyCode::Escape, &a), "Esc closes the dialogue instead of arming the quit prompt");
     assert!(!talk.is_open());
+}
+
+#[test]
+fn a_direction_held_while_the_window_opens_does_not_spin_the_pointer() {
+    let npcs = [npc(0, "gu0", 60.0, 0.0)];
+    let (mut talk, _) = talk_with(vec![("gu0", vec![question(3, 0), lines(1)])]);
+    let a = around(&npcs, (0.0, 0.0), 0.0);
+    let pointer = |t: &Talk| t.window.as_ref().map(|w| w.position().1);
+    // The player walks up holding W and presses Enter: the window opens with the key still down, and
+    // the system goes on sending repeats of it (a pad past its repeat delay does the same).
+    assert!(!talk.key(KeyCode::KeyW, true, false, &a), "closed: the walk's");
+    assert!(press(&mut talk, KeyCode::Enter, &a));
+    for _ in 0..10 {
+        assert!(!talk.key(KeyCode::KeyW, true, true, &a), "repeats of a key held before the window opened belong to the walk");
+    }
+    assert_eq!(pointer(&talk), Some(0), "the pointer stayed where the script put it");
+    // A key pressed fresh while the window is open moves it, and its repeats do too.
+    assert!(talk.key(KeyCode::KeyW, true, false, &a));
+    assert_eq!(pointer(&talk), Some(2), "up from the first option wraps to the last");
+    assert!(talk.key(KeyCode::KeyW, true, true, &a));
+    assert_eq!(pointer(&talk), Some(1));
+    // Let go: the release reaches the walk, and later repeats of that key are not the pointer's again.
+    assert!(!talk.key(KeyCode::KeyW, false, false, &a));
+    assert!(!talk.key(KeyCode::KeyW, true, true, &a));
+    assert_eq!(pointer(&talk), Some(1));
+    // The same for the other direction and for another window: nothing stays armed across one.
+    assert!(talk.key(KeyCode::ArrowDown, true, false, &a));
+    assert!(press(&mut talk, KeyCode::Enter, &a) && press(&mut talk, KeyCode::Enter, &a));
+    assert!(!talk.is_open());
+    assert!(press(&mut talk, KeyCode::Enter, &a));
+    assert!(!talk.key(KeyCode::ArrowDown, true, true, &a), "a key armed for the last window is not armed for this one");
+    assert_eq!(pointer(&talk), Some(0));
+}
+
+#[test]
+fn the_story_hook_reaches_the_conversations() {
+    let stories = Rc::new(Cell::new(0));
+    let mut talk = Talk::new(Box::new(Fake { radius: 80.0, says: vec![], started: Rc::default(), stories: Rc::clone(&stories) }));
+    talk.set_story(Box::new(|| Box::new(fmv_ff7::script::dialogue::StartOfGame)));
+    assert_eq!(stories.get(), 1);
 }
 
 #[test]

@@ -24,8 +24,10 @@
 //! | `Up`/`W`, `Down`/`S` (stick, D-pad) | (not ours) | move the cursor of a question (wraps) |
 //!
 //! Only a fresh press of `Enter`, `Space`, `Backspace` and `Esc` counts (a held key must not page
-//! through a whole conversation); the arrows repeat. Releases are never ours: a movement key let go
-//! of during a dialogue still reaches the walk. A battle owns `Enter` while it is on and while its
+//! through a whole conversation). The arrows repeat, but only a key pressed while the window is
+//! open: the player who walked up holding a direction and pressed `Enter` has that key's repeats
+//! sent on to the walk, and no question's pointer spins through its answers. Releases are never
+//! ours: a movement key let go of during a dialogue still reaches the walk. A battle owns `Enter` while it is on and while its
 //! panel lingers, so no conversation starts then, and one that is open when a battle begins is
 //! closed.
 //!
@@ -402,6 +404,10 @@ pub trait Conversations {
 
     /// The conversation with `npc`, or `None` when it has nothing to say.
     fn start(&mut self, area: &str, npc: &NpcView) -> Option<Box<dyn MessageSource>>;
+
+    /// Where the story comes from (the hook for story progress), for sources whose branches depend
+    /// on it; the others ignore it.
+    fn set_story(&mut self, _story: ff7::StoryFactory) {}
 }
 
 /// What the player's surroundings are, for a key press.
@@ -422,6 +428,11 @@ pub struct Talk {
     window: Option<DialogueWindow>,
     /// The screen the window was last drawn for (keys lay the text out for the same one).
     size: Cell<(u32, u32)>,
+    /// The arrow keys pressed (fresh) while the window has been open, and not yet let go of. Only
+    /// they move the pointer, and only they may repeat: a direction held while walking up to the
+    /// character goes on repeating when the window opens, and those repeats are the walk's, not
+    /// a pointer that spins through the answers.
+    armed: Vec<KeyCode>,
 }
 
 impl std::fmt::Debug for Talk {
@@ -432,7 +443,21 @@ impl std::fmt::Debug for Talk {
 
 impl Talk {
     pub fn new(conversations: Box<dyn Conversations>) -> Self {
-        Self { conversations, window: None, size: Cell::new((960, 540)) }
+        Self { conversations, window: None, size: Cell::new((960, 540)), armed: Vec::new() }
+    }
+
+    /// Where the story comes from: THE hook for story progress (`fmv_ff7::script::dialogue::StoryVars`
+    /// through a factory called for every conversation). Until something is plugged in here every
+    /// branch of every talk script is read as at the start of a new game.
+    #[allow(dead_code)] // the story layer plugs in here; nothing in the window does yet
+    pub fn set_story(&mut self, story: ff7::StoryFactory) {
+        self.conversations.set_story(story);
+    }
+
+    /// Open, replace or close the window; no key is armed across it.
+    fn set_window(&mut self, window: Option<DialogueWindow>) {
+        self.window = window;
+        self.armed.clear();
     }
 
     /// A talk controller over this machine's own FF7 field data (`None`: nobody has anything to say).
@@ -447,7 +472,7 @@ impl Talk {
 
     /// Close the dialogue (a battle began, the area changed).
     pub fn close(&mut self) {
-        self.window = None;
+        self.set_window(None);
     }
 
     /// The message on show.
@@ -459,12 +484,28 @@ impl Talk {
     /// A key event. Returns whether the dialogue took it (the window then does nothing else with it).
     pub fn key(&mut self, code: KeyCode, pressed: bool, repeat: bool, around: &Around<'_>) -> bool {
         if around.blocked {
-            self.window = None;
+            self.set_window(None);
+        }
+        if !pressed {
+            // A release is never ours (the walk must see it), but it ends an arrow key's claim.
+            self.armed.retain(|k| *k != code);
+            return false;
         }
         let Some(key) = dialogue_key(code, pressed, repeat) else { return false };
+        if matches!(key, DialogueKey::Up | DialogueKey::Down) {
+            if self.window.is_none() {
+                return false;
+            }
+            // Only a key pressed while the window is open moves the pointer, and only that one repeats.
+            match (repeat, self.armed.contains(&code)) {
+                (false, false) => self.armed.push(code),
+                (true, false) => return false,
+                _ => {}
+            }
+        }
         if let Some(window) = self.window.as_mut() {
             if !window.key(key, self.size.get()) {
-                self.window = None;
+                self.set_window(None);
             }
             return true;
         }
@@ -477,7 +518,7 @@ impl Talk {
         let Some(source) = self.conversations.start(around.area, npc) else { return false };
         match DialogueWindow::open(source) {
             Some(window) => {
-                self.window = Some(window);
+                self.set_window(Some(window));
                 true
             }
             None => false,
