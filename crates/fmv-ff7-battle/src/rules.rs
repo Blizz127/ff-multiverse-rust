@@ -3530,6 +3530,87 @@ mod tests {
         assert_eq!(state.outcome(), Some(Outcome::Victory));
     }
 
+    /// A battle is won when EVERY enemy is dead, lost when EVERY party member is, and ended by nothing else but an escape: one
+    /// blow, even a whole-side one, that leaves somebody standing ends nothing, and the last one ends it with exactly one event.
+    #[test]
+    fn a_battle_is_won_only_with_its_last_enemy_and_lost_only_with_its_last_member() {
+        // Enemies that die to any blow that lands (1 HP, no defense) and that never act (dex 0, so their gauges stay empty).
+        let frail = |name: &str| {
+            let mut e = fighter(name, 1, 1, 1, 0, 0);
+            e.luck = 0;
+            e
+        };
+        let striker = || {
+            let mut c = fighter("Hero", 20, 400, 80, 10, 40);
+            c.accuracy = 255;
+            c.luck = 100; // a lucky hit, always
+            c
+        };
+        let config = BattleConfig { start: StartMode::Preemptive, ..BattleConfig::default() };
+        for killed_first in 0..3u8 {
+            let mut state = BattleState::with_config(5, vec![striker()], vec![frail("A"), frail("B"), frail("C")], config);
+            let mut log = Vec::new();
+            let order: Vec<u8> = (0..3).map(|i| 1 + (killed_first + i) % 3).collect();
+            for (n, target) in order.iter().enumerate() {
+                for _ in 0..1_000 {
+                    if state.ready_actors().contains(&ActorId(0)) {
+                        break;
+                    }
+                    log.extend(state.step_ticks(1));
+                }
+                let events = state.submit_command(ActorId(0), Command::Attack { target: ActorId(*target) }).expect("a living enemy");
+                let victory = events.iter().filter(|e| **e == BattleEvent::Victory).count();
+                if n + 1 < order.len() {
+                    assert_eq!((victory, state.outcome()), (0, None), "{} of 3 are dead", n + 1);
+                } else {
+                    assert_eq!((victory, state.outcome()), (1, Some(Outcome::Victory)));
+                    assert_eq!(events.last(), Some(&BattleEvent::Victory), "nothing follows the end");
+                }
+                log.extend(events);
+            }
+            assert_eq!(log.iter().filter(|e| matches!(e, BattleEvent::Death { .. })).count(), 3);
+            assert!(!log.contains(&BattleEvent::Defeat));
+            assert_eq!(state.step_ticks(100), vec![], "an ended battle goes no further");
+        }
+        // A whole-side blow that kills two of three leaves the battle on.
+        let blast = ActionSpec { aim: Aim::Side, ..ActionSpec::damage_item(10, 0) };
+        let mut tough = frail("Tough");
+        tough.hp = 5_000;
+        tough.max_hp = 5_000;
+        let mut state = BattleState::with_config(5, vec![striker()], vec![frail("A"), frail("B"), tough], config);
+        let mut events = Vec::new();
+        state.resolve_action(0, &[1, 2, 3], &blast, &mut events);
+        assert_eq!(events.iter().filter(|e| matches!(e, BattleEvent::Death { .. })).count(), 2, "{events:?}");
+        assert_eq!(state.outcome(), None);
+        assert!(!events.contains(&BattleEvent::Victory));
+
+        // The other side: a party of two falls only with its second member, and then the battle is lost, once.
+        let mut brute = fighter("Brute", 30, 9_000, 200, 50, 90);
+        brute.actions = vec![EnemyAction { id: 1, spec: ActionSpec { formula: Formula::Flat, ..ActionSpec::damage_item(30, 0) } }];
+        let heroes = vec![fighter("Weak A", 5, 100, 10, 0, 10), fighter("Weak B", 5, 100, 10, 0, 10)];
+        let mut state = BattleState::with_config(5, heroes, vec![brute], BattleConfig { start: StartMode::EnemiesFirst, ..BattleConfig::default() });
+        let mut log = Vec::new();
+        let mut deaths = 0;
+        for _ in 0..2_000 {
+            if state.outcome().is_some() {
+                break;
+            }
+            let events = state.step_ticks(1);
+            for e in &events {
+                match e {
+                    BattleEvent::Death { .. } => deaths += 1,
+                    BattleEvent::Defeat => assert_eq!(deaths, 2, "lost only with both members down"),
+                    _ => {}
+                }
+            }
+            log.extend(events);
+        }
+        assert_eq!(state.outcome(), Some(Outcome::Defeat));
+        assert_eq!(log.iter().filter(|e| **e == BattleEvent::Defeat).count(), 1);
+        assert_eq!(deaths, 2);
+        assert!(!log.contains(&BattleEvent::Victory));
+    }
+
     #[test]
     fn start_modes_set_initial_gauges() {
         let mk_seeded = |seed: u64, start: StartMode| {
