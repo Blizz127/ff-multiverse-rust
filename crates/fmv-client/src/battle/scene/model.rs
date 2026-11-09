@@ -843,6 +843,7 @@ impl Rigs {
     }
 
     /// Battle units per field-model unit at which a field body is drawn (see [`ModelKit::measure_field_scale`]).
+    #[cfg(test)]
     pub fn field_scale(&self) -> f32 {
         self.field_scale
     }
