@@ -642,7 +642,9 @@ in the protocol and in the store:
 * the **binding**: how the hosted game draws the character, stored per game. In FF7 it is a generic
   placeholder body, a non-canon human model of your own `char.lgp` (`lean`, `sturdy` or `slight`: see
   the `playable` module of `fmv-ff7` for which models and why), tinted with the identity colour, and
-  never a canon character's model. Every player sees every other player's binding, in the field and in battle;
+  never a canon character's model (an account that predates the creator keeps the canon look it chose until it is
+  converted with `fmv-characters restyle`, below). Every player sees every other player's binding, in the field and in
+  battle;
 * the **fighting style** (the record's `slot`): the stat curve of a canon party member, whose combat template,
   abilities and experience curve the character fights with. It is chosen once, at creation, and fixed (FF7's
   experience curves differ per character, so a change would change a player's level). It is internal: the creator's
@@ -719,10 +721,15 @@ field: he is in the party.)
 * **Drawn as themselves.** The canon companions are the canon characters' own battle models (weapons and clips); each
   player is its own body, the placeholder body and colour its entity has on the field (the snapshot's appearance ref),
   moving procedurally: the lunge, the hop back, the flinch and the fall. Colours follow the players' entities, never the
-  order of the roster. The pictures of `offscreen_battle_canon_party_with_every_player_in_its_own_body` (`cargo test -p
-  fmv-client -- --ignored --test-threads=1`, with `FMV_FF7_DATA` and `FMV_SHOT_DIR`) show the canon pair and two players,
-  three, and one alone in each of the owner's two cases (a new character on Barret's curve and an account that predates
-  the creator on Cloud's).
+  order of the roster. An account that predates the creator and chose a canon look (the preview's Blizz may be one:
+  `fmv-characters show` says) is drawn in battle as that look's FIELD model, as in the field, tinted, beside the canon
+  battle model of the same character: it reads as a second Cloud until the account is restyled with a placeholder
+  body (`fmv-characters restyle`, below: identity, tint and binding only, never the curve, the progress or the story).
+  The pictures of `offscreen_battle_canon_party_with_every_player_in_its_own_body` (`cargo test -p fmv-client --
+  --ignored --test-threads=1`, with `FMV_FF7_DATA` and `FMV_SHOT_DIR`) show the canon pair and two players, three
+  players (five fighters, at three window sizes), and one alone in each of three cases: a new character on Barret's
+  curve, an account that predates the creator and never chose a look (Cloud's curve, the default body), and one that
+  chose Cloud's own look.
 
 **Converting an existing account to an original look (`fmv-characters`).** An account made before protocol v8
 (the preview's Blizz is one) is a canon look and the character that look named; to turn it into a character with

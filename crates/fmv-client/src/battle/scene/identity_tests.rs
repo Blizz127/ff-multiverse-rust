@@ -40,13 +40,13 @@ fn member(i: u64, character: u8) -> BattleMember {
 }
 
 fn look(id: u64, name: &str, tint: [u8; 3]) -> EntitySnapshot {
-    look_of(id, name, tint, "lean")
+    look_of(id, name, tint, "ff7/body/lean")
 }
 
-/// What the area's snapshot says about a player's entity: its name and colour, and the placeholder body (`ff7/body/<body>`)
-/// the game draws it as on the field.
-fn look_of(id: u64, name: &str, tint: [u8; 3], body: &str) -> EntitySnapshot {
-    EntitySnapshot { id: EntityId(id), pos: Pos::default(), facing: 0.0, anim: AnimState::Idle, avatar: AvatarAppearance::new(name, tint, Some(format!("ff7/body/{body}"))) }
+/// What the area's snapshot says about a player's entity: its name and colour, and the binding (`ff7/body/<body>`, or the
+/// canon look `ff7/cloud` and so on that an account of before the creator may have kept) the game draws it as on the field.
+fn look_of(id: u64, name: &str, tint: [u8; 3], binding: &str) -> EntitySnapshot {
+    EntitySnapshot { id: EntityId(id), pos: Pos::default(), facing: 0.0, anim: AnimState::Idle, avatar: AvatarAppearance::new(name, tint, Some(binding.to_string())) }
 }
 
 /// A client in the synthetic battle of formation 1 (two dummies) between two party members (entities 1, ours, and 2), of
@@ -340,7 +340,7 @@ fn offscreen_battle_identity_before_after() {
     let area = AreaId { game: GameId::Ff7, key: "md1stin".into() };
     let mut state = ClientState::new(EntityId(1), ME, Pos::default(), area.clone());
     state.battle.set_rules(Some(Arc::clone(&real.rules)));
-    let looks = vec![look(1, "Blizz", BLUE), look_of(2, "Wedge", ORANGE, "slight")];
+    let looks = vec![look(1, "Blizz", BLUE), look_of(2, "Wedge", ORANGE, "ff7/body/slight")];
     state.apply(0.0, ServerMsg::AreaSnapshot { area, tick: 1, entities: looks, npcs: vec![] });
     assert!(state.apply(0.0, server.start(&setup, real.rules.data_fingerprint())).is_none());
     let (mut slot, mut kit) = (None, Some(real.kit()));
@@ -482,7 +482,7 @@ fn real_battle(real: &Real, kit: &mut Option<ModelKit>, party: Vec<BattleMember>
 }
 
 /// One of the owner's cases: the players of a battle in party order, each with its name, its stat curve (internal: who it
-/// fights like), the placeholder body the field draws it as and its colour.
+/// fights like), the binding the field draws it as (a placeholder body, or a canon look an old account kept) and its colour.
 struct Case {
     name: &'static str,
     players: &'static [(&'static str, u8, &'static str, [u8; 3])],
@@ -490,15 +490,21 @@ struct Case {
 
 const GREEN: [u8; 3] = [60, 200, 90];
 
-const CASES: [Case; 4] = [
+const CASES: [Case; 5] = [
     // The DoD picture: the canon pair and two players.
-    Case { name: "two_players", players: &[("Blizzy", 1, "lean", BLUE), ("Wedge", 2, "slight", ORANGE)] },
+    Case { name: "two_players", players: &[("Blizzy", 1, "ff7/body/lean", BLUE), ("Wedge", 2, "ff7/body/slight", ORANGE)] },
     // Up to five in the party: the canon pair and the three players the party allows.
-    Case { name: "three_players", players: &[("Blizzy", 1, "lean", BLUE), ("Wedge", 2, "slight", ORANGE), ("Biggs", 4, "sturdy", GREEN)] },
+    Case { name: "three_players", players: &[("Blizzy", 1, "ff7/body/lean", BLUE), ("Wedge", 2, "ff7/body/slight", ORANGE), ("Biggs", 4, "ff7/body/sturdy", GREEN)] },
     // The owner's bug: a new character on Barret's curve (his "Blizzy"), alone, was drawn as Barret and fought alone.
-    Case { name: "solo_new_character_on_barrets_curve", players: &[("Blizzy", 1, "lean", BLUE)] },
-    // An account of before the creator, on Cloud's curve (his "Blizz"), alone: Cloud is the canon one only.
-    Case { name: "solo_migrated_account_on_clouds_curve", players: &[("Blizz", 0, "lean", ORANGE)] },
+    Case { name: "solo_new_character_on_barrets_curve", players: &[("Blizzy", 1, "ff7/body/lean", BLUE)] },
+    // An account of before the creator that never chose a look (a headless bot's, say), on Cloud's curve, alone: it was
+    // given the default placeholder body when it was migrated, so Cloud is the canon one only.
+    Case { name: "solo_migrated_account_with_no_look_on_clouds_curve", players: &[("Blizz", 0, "ff7/body/lean", ORANGE)] },
+    // An account of before the creator that CHOSE Cloud's own look (the canon `ff7/cloud`, which the migration keeps as its
+    // binding: what every player sees of it on the field): its own body in battle is the field's Cloud model at the
+    // field's scale, tinted, beside the canon Cloud's battle model (`fmv-characters restyle` gives such an account a
+    // placeholder body of its own).
+    Case { name: "solo_migrated_account_with_clouds_field_look", players: &[("Blizz", 0, "ff7/cloud", ORANGE)] },
 ];
 
 /// The canon characters of the first reactor mission, in the order the roster has them.
@@ -586,11 +592,15 @@ fn offscreen_battle_canon_party_with_every_player_in_its_own_body() {
         // stand apart (no one hides another's body).
         let anchors = b.scene.screen_anchors(&view);
         let mut party_x = Vec::new();
+        let windows_top = |w: u32, h: u32| {
+            let l = crate::battle::panels::layout(w, h, CANON.len() + case.players.len());
+            (l.enemy.y * l.s) as f32
+        };
         for a in &anchors {
             let (feet, head) = (a.feet.expect("feet"), a.head.expect("head"));
             assert!(a.drawn, "{}: {a:?} is drawn", case.name);
             assert!(feet[0] > w as f32 * 0.04 && feet[0] < w as f32 * 0.96, "{}: {a:?} is inside the side margins", case.name);
-            assert!(head[1] > 0.0 && feet[1] < h as f32 * 0.86, "{}: {a:?} is inside, and the bottom is free", case.name);
+            assert!(head[1] > 0.0 && feet[1] < windows_top(w, h), "{}: {a:?} is inside, above the bottom windows (the party panel has a row per member)", case.name);
             if a.side == Side::Party {
                 party_x.push((feet[0], feet[1] - head[1]));
             }
@@ -619,6 +629,22 @@ fn offscreen_battle_canon_party_with_every_player_in_its_own_body() {
             assert!(drawn_at(&bare, &stage_bare, w, a), "{}: {a:?} is in the picture without it", case.name);
         }
         save(&format!("battle_canon_{}_1920x1080", case.name), w, h, &with_overlay);
+        // The most members the battle has (five) at the window sizes the window and the other pictures use: everybody on
+        // the screen and above the bottom windows (the party panel has five rows here).
+        if case.name == "three_players" {
+            for (w2, h2) in [(1100u32, 680u32), (640, 480)] {
+                let view2 = b.scene.view(w2, h2);
+                let frame2 = b.scene.frame(&view2, false);
+                let mut overlay2 = DrawList::new();
+                draw_battle_overlay(&b.battle, &b.scene.head_anchors(&view2), w2, h2, &mut overlay2);
+                for a in &b.scene.screen_anchors(&view2) {
+                    let (feet, head) = (a.feet.expect("feet"), a.head.expect("head"));
+                    assert!(a.drawn && feet[0] > w2 as f32 * 0.02 && feet[0] < w2 as f32 * 0.98, "{w2}x{h2}: {a:?} is inside the side margins");
+                    assert!(head[1] > 0.0 && feet[1] < windows_top(w2, h2), "{w2}x{h2}: {a:?} is inside, above the bottom windows");
+                }
+                save(&format!("battle_canon_{}_{w2}x{h2}", case.name), w2, h2, &gpu.render_battle(w2, h2, &frame2, &overlay2));
+            }
+        }
         let closeups: Vec<Img> = anchors
             .iter()
             .filter(|a| a.side == Side::Party)
