@@ -126,8 +126,12 @@ const RING_READY: (f32, f32) = (1.18, 1.62);
 #[derive(Debug, Clone)]
 pub struct SceneStart {
     pub id: BattleId,
-    /// The party, `party[i]` fighting as `ActorId(i)`.
+    /// The party, `party[i]` fighting as `ActorId(i)`: the canon companions first, then the players.
     pub party: Vec<BattleMember>,
+    /// How the game draws each PLAYER of `party` on the field (its binding, from the area's snapshots), in the same order:
+    /// `None` for a companion and for a player whose look this client does not know. Missing entries (a list that is
+    /// shorter, or empty) read as `None`; a player without a known look is drawn as the default placeholder body.
+    pub bindings: Vec<Option<String>>,
     /// Our own character.
     pub my_actor: Option<ActorId>,
     /// Where the enemies stand and the camera, from this machine's own rules (`None` for rules
@@ -265,10 +269,9 @@ pub struct BattleScene {
     /// The meshes the effects are drawn with, shared with every other scene of the kit.
     effects: Arc<EffectKit>,
     my_actor: Option<ActorId>,
-    /// The field entity of each party member, in actor order: whose colour is whose
-    /// ([`BattleScene::show_player_colours`]).
-    /// The field entity of each party member that is a PLAYER (`None` for a canon companion: it has no player, so no
-    /// colour and nothing to look up).
+    /// The field entity of each party member that is a PLAYER, in actor order: whose colour is whose
+    /// ([`BattleScene::show_player_colours`]); `None` for a canon companion, which has no player, so no colour and
+    /// nothing to look up.
     entities: Vec<Option<EntityId>>,
     /// The party members waiting for a command.
     ready: Vec<bool>,
@@ -301,9 +304,9 @@ fn look_in(engine: Option<&BattleState>, actor: ActorId, action: ActionRef) -> L
 }
 
 impl BattleScene {
-    /// The scene of the battle `start` describes and `engine` (the replayed engine) has built. A party
-    /// member's model is its combat SLOT's (`BattleMember::character`, see [`model::party_appearance`]):
-    /// nothing about how its player looks on the field is asked. `None` without an engine (nothing is
+    /// The scene of the battle `start` describes and `engine` (the replayed engine) has built. A canon companion's
+    /// model is the canon character's own battle model; a PLAYER is drawn as its own body, the field look its binding
+    /// names ([`model::player_appearance`]: never a canon battle model). `None` without an engine (nothing is
     /// known of who fights): the flat view is used then.
     pub fn new(start: &SceneStart, engine: Option<&BattleState>, kit: &mut ModelKit) -> Option<Self> {
         let engine = engine?;
@@ -312,7 +315,15 @@ impl BattleScene {
 
         let mut actors: Vec<Actor> = Vec::with_capacity(party_ids.len() + enemy_ids.len());
         for (i, &id) in party_ids.iter().enumerate() {
-            let who = PartyLook { actor: id, character: start.party.get(i).map_or(0, |m| m.character), mine: Some(id) == start.my_actor };
+            let member = start.party.get(i);
+            let (character, mine) = (member.map_or(0, |m| m.character), Some(id) == start.my_actor);
+            // A member the roster does not describe (the engine has more than the roster, which the server never sends)
+            // is a player without a known look: the default body.
+            let who = if member.is_some_and(BattleMember::is_companion) {
+                PartyLook::companion(id, character, mine)
+            } else {
+                PartyLook::player(id, character, mine, start.bindings.get(i).cloned().flatten())
+            };
             let model = kit.source.party_member(&who);
             let rig = kit.rigs.resolve(&model, BoxSpec::for_party(i));
             actors.push(Actor { side: Side::Party, rig, home: spots.party[i], colour: None });
@@ -727,7 +738,9 @@ pub fn scene_for<'a>(
     }
     if slot.as_ref().map(BattleScene::id) != Some(view.id) {
         *slot = None;
-        let start = state.battle.scene_start().filter(|s| s.id == view.id)?;
+        let mut start = state.battle.scene_start().filter(|s| s.id == view.id)?;
+        // A player is drawn as its own body: how the area's snapshots say the game draws it on the field.
+        start.bindings = start.party.iter().map(|m| m.entity().and_then(|entity| state.appearance_of(entity)).map(str::to_string)).collect();
         let kit = kit.get_or_insert_with(ModelKit::from_local_content);
         *slot = BattleScene::new(&start, state.battle.engine(), kit);
     }

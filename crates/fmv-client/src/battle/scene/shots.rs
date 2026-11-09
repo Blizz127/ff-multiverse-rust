@@ -192,7 +192,7 @@ fn synthetic_scene(kit: &mut ModelKit, location: u16) -> BattleScene {
             fmv_protocol::battle::EnemyPlacement { enemy_id: 2, position: [600, 0, -2100], row: 1 },
         ],
     };
-    let start = SceneStart { id: BattleId(1), party: setup.party.clone(), my_actor: Some(ActorId(0)), formation: Some(formation) };
+    let start = SceneStart { id: BattleId(1), party: setup.party.clone(), bindings: Vec::new(), my_actor: Some(ActorId(0)), formation: Some(formation) };
     let mut scene = BattleScene::new(&start, Some(&engine), kit).expect("a scene");
     scene.update(1.0, &[], Some(&engine));
     scene
@@ -390,7 +390,7 @@ fn real_window_path_finds_the_battle_archive_through_open_ff7() {
         assert!(rig.kit.attacks.is_empty(), "without a library there is no scene.bin to name the attacks");
     }
     // A party member's kit: the shared slots, and its blow from its own scripts.
-    let cloud = kit.source.party_member(&PartyLook { actor: ActorId(0), character: 0, mine: true });
+    let cloud = kit.source.party_member(&PartyLook::companion(ActorId(0), 0, true));
     let cloud = resolve(&mut kit, cloud);
     assert_eq!((cloud.kit.hurt, cloud.kit.death, cloud.kit.victory), (Some(15), Some(18), Some(2)));
     // His blow is his own script's: a crouch and a run, the chop (slot 30), the recovery, the run back. Not slot 10.
@@ -398,7 +398,7 @@ fn real_window_path_finds_the_battle_archive_through_open_ff7() {
     assert_eq!((blow.approach.as_slice(), blow.strike.as_slice(), blow.back.as_slice()), (&[26, 27][..], &[30, 28][..], &[29][..]));
     // a party member by the combat slot it fights in
     for (character, height) in [(0u8, 862.0), (2, 837.0), (1, 919.0)] {
-        let model = kit.source.party_member(&PartyLook { actor: ActorId(0), character, mine: true });
+        let model = kit.source.party_member(&PartyLook::companion(ActorId(0), character, true));
         let rig = resolve(&mut kit, model);
         assert!(rig.scale == 1.0 && rig.attachments.len() == 1, "character {character} is a real battle model with its weapon");
         assert!((rig.height - height).abs() < 5.0, "character {character}: {}", rig.height);
@@ -599,7 +599,10 @@ fn offscreen_real_battle_names() {
     state.battle.set_rules(Some(Arc::clone(&real.rules)));
     assert!(state.apply(0.0, server.start(&setup, real.rules.data_fingerprint())).is_none());
     let notes = state.battle.drain_notes();
-    for line in ["roster actor=0 name=Blizz slot=1 slot_name=Barret level=6", "roster actor=1 name=Wedge slot=2 slot_name=Tifa level=6"] {
+    for line in [
+        "roster actor=0 name=Blizz slot=1 slot_name=Barret level=6 controller=player",
+        "roster actor=1 name=Wedge slot=2 slot_name=Tifa level=6 controller=player",
+    ] {
         assert!(notes.iter().any(|n| n == line), "{line:?} in {notes:?}");
     }
     let (mut slot, mut kit) = (None, Some(real.kit()));

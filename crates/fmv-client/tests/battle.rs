@@ -332,7 +332,7 @@ fn a_battle_freezes_the_player_and_play_goes_on_after_it() {
     assert!(stdout.ends_with(" battles=1 victories=1 area_changes=0 level=0 exp=0 items=0"), "{stdout}");
     assert!(stderr.contains("battle: battle#1 started: formation 3, party of 1, you fight as actor 0"), "{stderr}");
     // Who fights, at the start of the battle: the player's own name and the combat slot (Barret's), by key.
-    assert!(stderr.contains("battle: roster actor=0 name=Tester slot=1 slot_name=Barret level=5"), "{stderr}");
+    assert!(stderr.contains("battle: roster actor=0 name=Tester slot=1 slot_name=Barret level=5 controller=player"), "{stderr}");
     assert!(stderr.contains("no battle data"), "{stderr}");
     assert!(stderr.contains("battle: battle#1 ended in Victory (you earned 5 exp, 7 gil, 1 ap); back in the field"), "{stderr}");
     assert!(stderr.contains("headless: after the last battle:"), "{stderr}");

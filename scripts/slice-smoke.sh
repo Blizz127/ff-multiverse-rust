@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/slice-smoke.sh - the foundations slice over REAL processes and REAL data (protocol v8).
+# scripts/slice-smoke.sh - the foundations slice over REAL processes and REAL data (protocol v9).
 #
 # Usage: scripts/slice-smoke.sh [--release|--debug] [--bin-dir DIR] [--build] [--library STATE_DIR]
 #                               [--duration SECS] [--formation ID] [--seed N] [--keep-logs] [-h|--help]
@@ -7,11 +7,12 @@
 # WHAT THE SLICE PROVES (one playable FF7 slice of the owner's "foundations first" priority):
 #   (1) a persistent ORIGINAL player character with a saved identity (name, colour, body choice);
 #   (2) multiplayer party membership (two players party up and fight one shared battle);
-#   (3) a COMBAT-SLOT replacement separate from canon story roles: each player fights with a canon party
-#       member's combat template (here Barret's and Tifa's) while its field look is a generic placeholder body
-#       and the canon NPCs stay in the story (the canon Barret is an NPC of md1stin for the player who holds his
-#       slot as for the one who holds Tifa's, and talking to the field's characters is the canon dialogue, never
-#       name-swapped);
+#   (3) the canon party FIGHTS BESIDE the players and nobody is replaced (v9): every battle's party is the story's canon
+#       party first, Cloud and Barret, commanded by the SERVER with ordinary commands every client replays and verifies
+#       (`companion acted battle=.. actor=.. name=Cloud command=..`), and then the players, each with the stat curve
+#       (its "fighting style", here Barret's and Tifa's curves) of its character and its own body (a generic placeholder
+#       body) in the field; the canon Barret is no longer a field NPC (he is in the party), and talking to the field's
+#       characters is the canon dialogue, never name-swapped;
 #   (4) per-player story progress (sw-story: the story blob of each account, and the phase it puts a player in);
 #   (5) a world-specific appearance binding: how FF7 draws each character, stored per game and independent of the slot.
 #
@@ -28,15 +29,18 @@
 #   field's guard and to the canon Barret through the client's own conversation code. The run checks:
 #     * the Welcome card of each player says what was asked (name, colour, body, binding `ff7/body/<body>`, slot);
 #     * each player SEES the other's binding (the placeholder body) and nothing in it is a canon model;
-#     * the battle roster names the players, not the canon characters: the server's "battle started" line says
-#       names=[Aria%20Vale,Brom] characters=[1, 2] (their names and their slot templates), the clients' own
-#       `battle: roster` lines say the same, and the log lines of what they did carry name=<their own name>;
-#     * the canon Barret NPC is in the field for the Barret-slot player and for the Tifa-slot one alike, with Barret's
-#       skeleton, next to the guards; the guard's dialogue is the game's own text (origin=canon), identical for both
-#       and without either player's name; Barret has nothing to say (the canon NPC needs no talk script);
+#     * the battle roster is the canon party first and then the players: the server's "battle started" line says
+#       names=[Cloud,Barret,Aria%20Vale,Brom] characters=[0, 1, 1, 2] companions=2 (the two canon members and the two
+#       players' own names with their stat curves), the clients' own `battle: roster` lines say the same (each with its
+#       controller, companion or player), and the log lines of what a player did carry name=<its own name>; the
+#       companions acted (`companion acted` lines naming Cloud and Barret) through commands every client replayed, so
+#       the battle verified by replay with 0 divergences, and the rewards went to the two players only;
+#     * md1stin's field shows no canon Barret NPC for either player (he is in the party now), the guards are there,
+#       and both players see the same NPCs; the guard's dialogue is the game's own text (origin=canon), identical for
+#       both and without either player's name;
 #     * story: exactly one advance (A's, 1->6), saved as 010600 in A's story blob, none stored for B; the view of each
 #       goes together, apart, together again (the party follows its leader's phase) and the placements agree;
-#     * the server saved progress for both under the SLOT's character (progression/<account>/Ff7.character.json
+#     * the server saved progress for both under the stat curve's character (progression/<account>/Ff7.character.json
 #       says character 1 and 2, never the look's character), and what the clients were told is what is stored (the
 #       inventory included: the starting stock when nothing changed it, the stock plus the drops when something did).
 #   Then the server is STOPPED (SIGTERM, exit 0) and every persisted record is snapshotted.
@@ -90,11 +94,14 @@ PROFILE=debug
 LIBRARY="${FMV_FF7_LIBRARY:-$HOME/.local/share/ff-multiverse}"
 SLICE_DURATION=60
 SESSION2_DURATION=8
-FORMATION=301
+# Formation 12 of the game's own data (two enemies, escapable): the canon Cloud and Barret kill md1stin's own 301-303 in about
+# a hundred ticks, before every player has had a turn, and this slice needs both players to act (see battle-smoke.sh).
+FORMATION=12
 TICK_RATE=240
 BATTLE_SPEED=0
-# Seed 5 makes formation 301 drop a Potion in every battle (crates/fmv-server/tests/battle_real.rs), so the chain
-# "a drop is stored, survives the restart and is told again" runs for real.
+# The server's --battle-seed. What the formation drops under it depends on the formation: whenever a drop is made the chain
+# "a drop is stored, survives the restart and is told again" runs for real, and when none is the inventory checks below
+# hold with no drop (the stock told on joining).
 SEED=5
 AREA=Ff7/md1stin
 
@@ -120,7 +127,11 @@ OTHER_SLOT=cid
 # processes and the carry-over of a LEVEL and of a LIMIT GAUGE across the restart would go unproven. Only session 1's
 # server has them: the restarted servers do not, so what survives is what the first one SAVED.
 BONUS_EXP=900
-BONUS_LIMIT=100
+# The limit gauges the smoke WRITES into the stored records between session 1 and the restart (as an account that predates
+# v9 and holds a gauge would have): players have no limit break in v9, so no battle can move them, and the check is that
+# the stored gauge is preserved through a battle and a real restart.
+SEEDED_LIMIT_A=200
+SEEDED_LIMIT_B=120
 
 usage() {
   cat <<'EOF'
@@ -138,8 +149,9 @@ was saved, levels and limit gauges included. See the header of this script for e
   --library DIR    state directory that contains library/ (default $FMV_FF7_LIBRARY, else
                    ~/.local/share/ff-multiverse); only the library is read, never written
   --duration SECS  how long each player stays in session 1 (default 60)
-  --formation ID   the enemy formation of the debug battles (default 301)
-  --seed N         the server's --battle-seed (default 5: formation 301 drops a Potion in every battle)
+  --formation ID   the enemy formation of the debug battles (default 12: two enemies the canon party does not kill before
+                   every player has acted)
+  --seed N         the server's --battle-seed (default 5)
   --debug          use <target>/debug binaries (the default of this script; the other smokes default to release)
   --release        use <target>/release binaries
   --build          cargo build fmv-server and fmv-client first, with the chosen profile
@@ -477,6 +489,32 @@ roster_pairs() {
   sorted_words_text "${out[@]}"
 }
 
+# seed_stored_gauge <name> <gauge>: write `"limit": <gauge>` into the stored progress record of <name>, as a record of an
+# account that predates v9 and holds a gauge would be (a server stopped: nothing else touches the file).
+seed_stored_gauge() {
+  local name="$1" gauge="$2" account progress
+  account=$(account_of "$name")
+  [[ -n $account ]] || return 1
+  progress="$WORK/server-state/progression/$account/Ff7.character.json"
+  [[ -f $progress ]] || return 1
+  jq --argjson g "$gauge" '.limit = $g' "$progress" >"$progress.seed" && mv -- "$progress.seed" "$progress"
+}
+
+# roster_controllers <client log>: the `name:controller` of every `battle: roster actor=<i>` line of the log (every battle
+# it fought), sorted and space separated.
+roster_controllers() {
+  local log="$1" line
+  local -a rows=()
+  [[ -r $log ]] || return 0
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line == *"battle: roster actor="* ]] || continue
+    line=$(strip_ansi "$line")
+    rows+=("$(field "$line" name):$(field "$line" controller)")
+  done <"$log"
+  ((${#rows[@]})) || return 0
+  sorted_words_text "${rows[@]}"
+}
+
 # roster_triples <client log>: the `name:slot:slot_name` of every `battle: roster actor=<i>` line of the log (every
 # battle it fought), sorted and space separated.
 roster_triples() {
@@ -569,12 +607,12 @@ run_slice() {
   # ------------------------------------------------------------------------------------------------------------
   # Session 1: register, party up, advance one story, talk, fight one shared battle.
   # ------------------------------------------------------------------------------------------------------------
-  start_slice_server 0 "$WORK/s1-server.log" --debug-bonus-exp "$BONUS_EXP" --debug-bonus-limit "$BONUS_LIMIT"
+  start_slice_server 0 "$WORK/s1-server.log" --debug-bonus-exp "$BONUS_EXP"
   local port="${ADDR##*:}"
-  say "session 1 (the server has the DEBUG bonuses: +$BONUS_EXP experience per win, +$BONUS_LIMIT limit gauge per battle): players A ($NAME_A, body $BODY_A, slot $SLOT_NAME_A) and B ($NAME_B, body $BODY_B, slot $SLOT_NAME_B) register, party up, advance a story and fight (${SLICE_DURATION}s)"
-  start_player A r1 "$SLICE_DURATION" --tint "$TINT_A" --body "$BODY_A" --slot "$SLOT_A" --talk gu0,Barret \
+  say "session 1 (the server has the DEBUG experience bonus: +$BONUS_EXP experience per win): players A ($NAME_A, body $BODY_A, stat curve $SLOT_NAME_A's) and B ($NAME_B, body $BODY_B, stat curve $SLOT_NAME_B's) register, party up, advance a story and fight beside the canon Cloud and Barret (${SLICE_DURATION}s)"
+  start_player A r1 "$SLICE_DURATION" --tint "$TINT_A" --body "$BODY_A" --slot "$SLOT_A" --talk gu0 \
     --story-advance --party-invite-first-peer --battle-auto --debug-encounters --battle-wait-party 2
-  start_player B r1 "$SLICE_DURATION" --tint "$TINT_B" --body "$BODY_B" --slot "$SLOT_B" --talk gu0,Barret \
+  start_player B r1 "$SLICE_DURATION" --tint "$TINT_B" --body "$BODY_B" --slot "$SLOT_B" --talk gu0 \
     --party-accept --party-accept-after-split --battle-auto
   wait_clients $((SLICE_DURATION + CLIENT_GRACE))
 
@@ -626,7 +664,7 @@ run_slice() {
   has_in_order "$seq_b" 1 0 1 || problem "B's view should go 1, 0, 1: '$seq_b'"
 
   # The talk (sw-dialog's path, client-local): the guard says the game's own words, the same to both players and
-  # without either player's name; the canon Barret has nothing to say.
+  # without either player's name.
   local text_a text_b
   text_a=$(talk_text "$la" gu0)
   text_b=$(talk_text "$lb" gu0)
@@ -635,14 +673,12 @@ run_slice() {
   say "A talks to gu0 (the game's own words, not printed): $windows_a window(s), $(text_digest "$text_a")"
   [[ -n $text_a ]] || problem "client A had no conversation with the guard gu0 ('talk: npc=gu0 ... text=' lines)"
   [[ $text_a == *Potion* ]] || problem "the guard's first words do not name the Potion it gives at the start of the game ($(text_digest "$text_a"))"
-  [[ $text_a == "$text_b" ]] || problem "the guard says something else to the Tifa-slot player than to the Barret-slot one (A: $(text_digest "$text_a"); B: $(text_digest "$text_b"))"
+  [[ $text_a == "$text_b" ]] || problem "the guard says something else to the second player than to the first (A: $(text_digest "$text_a"); B: $(text_digest "$text_b"))"
   for n in "$NAME_A" "$NAME_B" Aria Brom Vale; do
     [[ $text_a != *"$n"* && $text_b != *"$n"* ]] || problem "the dialogue contains the player's name '$n' (dialogue is never name-swapped)"
   done
   # (a failure prints the line without its text: the game's own words are game data)
   local talk_line
-  talk_line=$(first_line_with "$la" "talk: npc=Barret " || echo none)
-  [[ $talk_line == *"nothing to say"* ]] || problem "the canon Barret NPC should have nothing to say (it needs no talk script): ${talk_line%% text=*}"
   talk_line=$(first_line_with "$la" "talk: npc=gu0 " || echo none)
   [[ $talk_line == *"origin=canon"* ]] || problem "the guard's words are not the game's own (origin=canon): ${talk_line%% text=*}"
 
@@ -669,18 +705,39 @@ run_slice() {
   done
   [[ -n ${ids[0]} && ${ids[0]} == "${ids[1]}" ]] || problem "the players did not enter the same battle (A: '${ids[0]}', B: '${ids[1]}')"
 
-  # The roster: their own names and their slot templates, on the server and in each client.
+  # The roster: the canon party (Cloud and Barret, commanded by the server) first, then the two players with their own
+  # names and their stat curves, on the server and in each client: nobody is replaced.
   local started
   started=$(first_line_with "$sl" "battle started" || true)
   started=$(strip_ansi "$started")
-  [[ $started == *"members=2"* ]] || problem "the server's battle did not have two members: $started"
-  local want_pairs want_triples
-  want_pairs=$(sorted_words_text "$enc_a:$SLOT_A" "$enc_b:$SLOT_B")
-  want_triples=$(sorted_words_text "$enc_a:$SLOT_A:$SLOT_NAME_A" "$enc_b:$SLOT_B:$SLOT_NAME_B")
-  expect_equal "the server's roster (battle started: each player's own name with the slot template that fights for it)" "$(roster_pairs "$started")" "$want_pairs"
+  [[ $started == *"members=2"* && $started == *"companions=2"* ]] || problem "the server's battle did not have two players and the two canon companions: $started"
+  [[ $started == *"names=[Cloud,Barret,$enc_a,$enc_b]"* || $started == *"names=[Cloud,Barret,$enc_b,$enc_a]"* ]] || problem "the server's roster is not Cloud, Barret and then the two players: $started"
+  [[ $started == *"characters=[0, 1, "* ]] || problem "the canon pair is not first in the server's roster (characters=[0, 1, ..]): $started"
+  local want_pairs want_triples want_controllers
+  want_pairs=$(sorted_words_text "Cloud:0" "Barret:1" "$enc_a:$SLOT_A" "$enc_b:$SLOT_B")
+  want_triples=$(sorted_words_text "Cloud:0:Cloud" "Barret:1:Barret" "$enc_a:$SLOT_A:$SLOT_NAME_A" "$enc_b:$SLOT_B:$SLOT_NAME_B")
+  want_controllers=$(sorted_words_text "Cloud:companion" "Barret:companion" "$enc_a:player" "$enc_b:player")
+  expect_equal "the server's roster (battle started: Cloud and Barret, then each player's own name with its stat curve)" "$(roster_pairs "$started")" "$want_pairs"
   for n in A B; do
-    expect_equal "client $n's roster lines (name, slot, slot name of each member)" "$(roster_triples "$WORK/r1-client-$n.log")" "$want_triples"
+    expect_equal "client $n's roster lines (name, stat curve, its name, of every fighter)" "$(roster_triples "$WORK/r1-client-$n.log")" "$want_triples"
+    expect_equal "client $n's roster lines (who commands each fighter)" "$(roster_controllers "$WORK/r1-client-$n.log")" "$want_controllers"
   done
+  # The canon companions really fought, through commands the server applied and every client replayed (the battle is
+  # "verified by replay" with 0 divergences above): both gave commands under their own names.
+  local companion_name
+  for companion_name in Cloud Barret; do
+    (($(count_lines_with "$sl" "companion acted battle=1 actor=") >= 1)) && log_has "$sl" " name=$companion_name command=" || problem "the canon $companion_name never acted ('companion acted ... name=$companion_name command=..' in the server log)"
+  done
+  local ended_line
+  ended_line=$(first_line_with "$sl" "battle ended" || true)
+  ended_line=$(strip_ansi "$ended_line")
+  [[ $(companions_of "$ended_line") == 2 ]] || problem "the server's battle-end line does not say companions=2: $ended_line"
+  local -a companion_counts=()
+  read -r -a companion_counts <<<"$(companion_commands_of "$ended_line")"
+  ((${#companion_counts[@]} == 2 && companion_counts[0] + companion_counts[1] >= 2)) || problem "the canon companions gave fewer than two commands in all (commands=[..] of the end line: $ended_line)"
+  local -a player_counts=()
+  read -r -a player_counts <<<"$(commands_of "$ended_line")"
+  ((${#player_counts[@]} == 2 && player_counts[0] >= 1 && player_counts[1] >= 1)) || problem "both players should have given a command in a fight beside the canon party (commands per player: ${player_counts[*]:-none}): $ended_line"
   # What a player did is logged under its own name, whatever template it fights with (the bots only attack, and a
   # defeated enemy needs no more: the lines exist when a bot defended, cast or used a limit, so this is a soft check).
   local acted="" what
@@ -691,27 +748,25 @@ run_slice() {
     [[ $acted == *" name=$enc_a"* || $acted == *" name=$enc_b"* ]] || problem "a battle action line does not name the player: $acted"
   done
 
-  # The canon Barret is still a character of the field (an NPC: the story keeps its canon characters), seen with
-  # Barret's own skeleton, for the player who holds Barret's slot AND for the one who holds Tifa's: everybody sees
-  # the same canon cast, and nobody is drawn as the canon character whose slot they hold.
+  # The canon Barret is in the PARTY now and no longer a character of the field (the field shows only the leader the player
+  # controls): md1stin's NPCs are exactly the data's, the guards, the same for both players, with no Barret among them.
   local npcs_a npcs_b
   npcs_a=$(npc_lines "$la" "$AREA")
   npcs_b=$(npc_lines "$lb" "$AREA")
   if [[ -z $npcs_a ]]; then
-    problem "client A (Barret's slot) reported no NPC of md1stin at all (it prints 'headless: npc area=$AREA ...' lines)"
+    problem "client A reported no NPC of md1stin at all (it prints 'headless: npc area=$AREA ...' lines)"
   else
-    [[ $npcs_a == *"name=Barret model=acgd"* ]] || problem "the Barret-slot player's md1stin has no canon Barret NPC (name=Barret model=acgd): $npcs_a"
+    [[ $npcs_a != *"name=Barret"* && $npcs_a != *"model=acgd"* ]] || problem "md1stin still shows a canon Barret NPC (he is in the battle party now): $npcs_a"
   fi
-  expect_equal "A (Barret's slot) and B (Tifa's slot) see the same NPCs in md1stin" "$npcs_a" "$npcs_b"
+  expect_equal "A and B see the same NPCs in md1stin" "$npcs_a" "$npcs_b"
   [[ $npcs_a == *"name=gu0 "* && $npcs_a == *"name=gu1 "* ]] || problem "the guards of md1stin are not in the NPC list any more: $npcs_a"
 
   stop_server
-  # The DEBUG bonuses were loud (a warning at start-up, and every payment and every kept gauge says so), and only this
-  # server had them.
+  # The DEBUG experience bonus was loud (a warning at start-up, and every payment says so), and only this server had it.
   log_has "$sl" "DEBUG: --debug-bonus-exp $BONUS_EXP is on" || problem "session 1's server never warned about --debug-bonus-exp"
-  log_has "$sl" "DEBUG: --debug-bonus-limit $BONUS_LIMIT is on" || problem "session 1's server never warned about --debug-bonus-limit"
   (($(count_lines_with "$sl" "debug_bonus_exp=$BONUS_EXP") >= 2)) || problem "the server's 'battle reward' lines do not all say debug_bonus_exp=$BONUS_EXP (one per paid member)"
-  (($(count_lines_with "$sl" "debug_bonus_limit=$BONUS_LIMIT") >= 2)) || problem "the server's 'limit kept' lines do not all say debug_bonus_limit=$BONUS_LIMIT (one per member)"
+  # Players have no limit break (v9): the battle kept no gauge for anybody (a companion's is never stored).
+  ! log_has "$sl" "limit kept battle=" || problem "the server kept a limit gauge although players have none and a companion's is never stored: $(last_line_with "$sl" "limit kept battle=")"
   # Stopping the server saved everything queued: both payments and A's story are in the store.
   (($(count_lines_with "$sl" "progress saved account=") >= 2)) || problem "the server did not save the progress of both members"
   if log_has "$sl" "progress saved account="; then
@@ -735,20 +790,18 @@ run_slice() {
     expect_equal "session 1 $n: what the server last told it (level exp gil ap) is what is stored" "$told" "${stored% *}"
     # And it is exactly what the player started with (told on joining) plus what the battle paid.
     check_paid "session 1 $n" "$sl" "$(account_of "$name")" "$(progress_numbers "$WORK/r1-client-$n.log" first)" "$stored"
-    # The DEBUG bonuses made this NEW character level up and fill a gauge in this one session: it joined at the level its
-    # slot starts at with an empty gauge, and what is stored now is higher and non-empty (the carry-over of both across
-    # the restart is checked below, against exactly these stored numbers).
-    local join_numbers join_level stored_level stored_limit kept
+    # The DEBUG experience bonus made this NEW character level up in this one session: it joined at the level its stat curve
+    # starts at, and what is stored now is higher (the carry-over of the level across the restart is checked below, against
+    # exactly these stored numbers). Its stored limit gauge is empty: players have no limit break, nothing fills one.
+    local join_numbers join_level stored_level stored_limit
     join_numbers=$(progress_numbers "$WORK/r1-client-$n.log" first)
     join_level=${join_numbers%% *}
     stored_level=${stored%% *}
     ((stored_level > join_level)) || problem "session 1 $n: no level up (told level $join_level on joining, stored level $stored_level): the DEBUG experience bonus did not reach the record"
     log_has "$WORK/r1-client-$n.log" "leveled_up=true" || problem "session 1 $n: the server never told it leveled_up=true"
     stored_limit=${stored##* }
-    ((stored_limit > 0)) || problem "session 1 $n: the stored limit gauge is $stored_limit, expected a non-empty one (the DEBUG limit bonus did not reach the record)"
-    kept=$(line_field "$sl" "limit kept battle=1 account=$(account_of "$name") " limit)
-    expect_equal "session 1 $n: the stored limit gauge is the one the server logged keeping (the battle's own plus the bonus)" "$stored_limit" "$kept"
-    LEVEL_UPS[$n]="level $join_level -> $stored_level, limit gauge $stored_limit"
+    expect_equal "session 1 $n: the stored limit gauge (players have no limit break: nothing fills one)" "$stored_limit" "0"
+    LEVEL_UPS[$n]="level $join_level -> $stored_level"
     # The inventory the server told is what is stored when the record holds one (a drop or an item used wrote it);
     # a record without the key means nothing changed it, so the player still carries the starting stock it was told
     # at its first join.
@@ -760,6 +813,15 @@ run_slice() {
       expect_equal "session 1 $n: the items it was told it carries are the stored ones" "$(last_items "$WORK/r1-client-$n.log")" "$stored_inv"
     fi
   done
+
+  # Players have no limit break in v9, so no battle can move a player's limit gauge and "a gauge filled by a battle carries
+  # over a restart" cannot be shown over real processes while that stays so (owner default, pending his answer). What can
+  # be shown is that a STORED gauge, one an account of before v9 holds, is preserved by a battle and by a real restart:
+  # the server is stopped, so a gauge is written into both stored records (as such an account would have it), and the
+  # restarted servers must tell it, fight with it on the wire and leave it exactly as it is.
+  seed_stored_gauge "$NAME_A" "$SEEDED_LIMIT_A" || problem "could not write a stored limit gauge into A's progress record"
+  seed_stored_gauge "$NAME_B" "$SEEDED_LIMIT_B" || problem "could not write a stored limit gauge into B's progress record"
+  say "note: limit carry-over for players is moot while players have no Limit Break (owner default, pending his answer), so the check is 'stored gauge preserved': gauges $SEEDED_LIMIT_A and $SEEDED_LIMIT_B were written into the stored records and must come out of the battle and the real restart unchanged. If player limits are enabled later the real carry-over check returns."
 
   # Snapshot every persisted record (not the index log: it records each claim, which a login may add).
   snapshot_records "$WORK/server-state" "$WORK/snap1"
@@ -842,9 +904,11 @@ run_slice() {
   local started2
   started2=$(first_line_with "$s3" "battle started" || true)
   started2=$(strip_ansi "$started2")
-  expect_equal "the restarted server's roster (each player's own name with the slot template that fights for it)" "$(roster_pairs "$started2")" "$want_pairs"
+  expect_equal "the restarted server's roster (Cloud and Barret, then each player's own name with its stat curve)" "$(roster_pairs "$started2")" "$want_pairs"
+  [[ $started2 == *"members=2"* && $started2 == *"companions=2"* ]] || problem "the restarted server's battle did not have two players and the two canon companions: $started2"
   for n in A B; do
     expect_equal "after the restart client $n's roster lines" "$(roster_triples "$WORK/r3-client-$n.log")" "$want_triples"
+    expect_equal "after the restart client $n's roster lines (who commands each fighter)" "$(roster_controllers "$WORK/r3-client-$n.log")" "$want_controllers"
   done
   # The levels and limit gauges the players ended session 1 with (the stored record: level is the first number, the
   # limit gauge the fifth) are what the restarted server fights them with.
@@ -852,23 +916,24 @@ run_slice() {
   read -r -a sa <<<"$stored_a"
   read -r -a sb <<<"$stored_b"
   expect_equal "the restarted server fights them at the levels session 1 saved" "$(levels_of "$started2")" "$(sorted_words "${sa[0]}" "${sb[0]}")"
-  expect_equal "the restarted server starts them with the limit gauges session 1 saved" "$(limits_of "$started2")" "$(sorted_words "${sa[4]}" "${sb[4]}")"
-  # What that proves, this time: session 1's server (with the DEBUG bonuses) made both characters LEVEL UP and fill a LIMIT
-  # GAUGE, checked above against the stored record, and the restarted servers have no bonus: they cannot invent either. So a
-  # restarted server that ignored a saved level or gauge would fight them at their slot's starting level with an empty gauge
-  # and fail the two checks above, and these ones say that the values that survived are not the starting ones.
+  expect_equal "the restarted server starts them with the limit gauges they have stored (sent on the wire, ignored by the engine)" "$(limits_of "$started2")" "$(sorted_words "${sa[4]}" "${sb[4]}")"
+  expect_equal "the stored gauges are the ones written between the sessions" "$(sorted_words "${sa[4]}" "${sb[4]}")" "$(sorted_words "$SEEDED_LIMIT_A" "$SEEDED_LIMIT_B")"
+  # What that proves, this time: session 1's server (with the DEBUG experience bonus) made both characters LEVEL UP, checked
+  # above against the stored record, and the restarted servers have no bonus: they cannot invent a level. So a restarted
+  # server that ignored a saved level would fight them at their stat curve's starting level and fail the check above, and
+  # this one says that the level that survived is not the starting one. The gauge was written between the sessions.
   local join_level_a join_level_b
   join_level_a=$(progress_numbers "$WORK/r1-client-A.log" first)
   join_level_b=$(progress_numbers "$WORK/r1-client-B.log" first)
   ((${sa[0]} > ${join_level_a%% *} && ${sb[0]} > ${join_level_b%% *})) ||
     problem "session 1 raised no level for both players (A ${join_level_a%% *} -> ${sa[0]}, B ${join_level_b%% *} -> ${sb[0]}): a restarted server that forgot the level could not be told apart"
-  ((${sa[4]} > 0 && ${sb[4]} > 0)) || problem "session 1 filled no gauge for both players (A ${sa[4]}, B ${sb[4]}): a restarted server that forgot the gauge could not be told apart"
+  ((${sa[4]} > 0 && ${sb[4]} > 0)) || problem "no stored gauge for both players (A ${sa[4]}, B ${sb[4]}): a restarted server that forgot or rewrote the gauge could not be told apart"
   local server_log
   for server_log in "$WORK/s2-server.log" "$s3"; do
     ! log_has "$server_log" "DEBUG: --debug-bonus" || problem "a restarted server ran with a DEBUG bonus ($server_log): what survived the restart would not be proven"
   done
-  CARRIED="A level ${join_level_a%% *} -> ${sa[0]} and limit gauge ${sa[4]}, B level ${join_level_b%% *} -> ${sb[0]} and limit gauge ${sb[4]}"
-  say "carried over a REAL server restart (told and fought again by servers without the bonuses): $CARRIED"
+  CARRIED="A level ${join_level_a%% *} -> ${sa[0]} and stored gauge ${sa[4]} preserved, B level ${join_level_b%% *} -> ${sb[0]} and stored gauge ${sb[4]} preserved"
+  say "carried over a REAL server restart (told and fought again by servers without the bonus): $CARRIED"
   stop_server
   # What the second battle changed is progress (and B's story); identity, binding, slot and pointers are unchanged.
   check_stored_character A "$NAME_A" "$TINT_A" "$BODY_A" "$SLOT_A"
@@ -889,6 +954,9 @@ run_slice() {
     read -r -a was_a <<<"$was"
     read -r -a now_a <<<"$now"
     ((${now_a[0]:-0} >= ${was_a[0]:-1})) || problem "session 2b $n: the level went DOWN ($was -> $now)"
+    # The stored limit gauge (the fifth number) is untouched by the battle: players have no limit break, so nothing may
+    # overwrite it with the empty gauge the engine reports.
+    expect_equal "session 2b $n: the stored limit gauge is preserved by the battle" "${now_a[4]:-?}" "${was_a[4]:-?}"
     ((${now_a[1]:-0} > ${was_a[1]:-0})) || problem "session 2b $n: a won battle paid no experience ($was -> $now)"
     # Exactly what session 1 saved plus what the second battle paid: the restarted server started from the saved record.
     check_paid "session 2b $n" "$s3" "$(account_of "$name")" "$was" "$now"
@@ -909,14 +977,15 @@ run_slice() {
     say "session 1 client $n: $(card_of "$WORK/r1-client-$n.log")"
     say "session 2 client $n: $(card_of "$WORK/r2-client-$n.log")"
   done
-  say "session 1 NPCs of md1stin (the Barret-slot player's list; the Tifa-slot player's is identical): $npcs_a"
+  say "session 1 NPCs of md1stin (the first player's list; the second player's is identical; no canon Barret among them): $npcs_a"
   say "session 1 guard talk: $windows_a window(s), origin=canon, the same text for both players ($(text_digest "$text_a"))"
+  say "session 1 server end: $ended_line"
   say "session 2b server: $started2"
   for n in A B; do
     say "session 1 -> restart, player $n: ${LEVEL_UPS[$n]}"
   done
   RESULT=pass
-  say "PASS: two original characters (distinct identities, bodies and slots) partied up, advanced a story and won a shared battle; the roster named them, not their slot's canon characters; the canon Barret NPC was in the field for both and the dialogue was the game's own; session 1's server (with the DEBUG bonuses) made both LEVEL UP and fill a LIMIT GAUGE and after a REAL server restart every card, record, level, experience, gil, AP, limit gauge, inventory and story was exactly what it was ($CARRIED), the records were byte for byte unchanged by a login, a second battle (on servers without the bonuses) paid on top of what was saved to the point and started with the saved levels and gauges, and the restarted server fought them as their slots; $state_real unchanged ($after)."
+  say "PASS: two original characters (distinct identities, bodies and stat curves) partied up, advanced a story and won a shared battle BESIDE the canon Cloud and Barret, whom the server commanded and every client replayed (0 divergences): the roster was Cloud, Barret and then the two players by their own names, nobody replaced, the rewards went to the players only and no canon Barret stands in the field any more; the dialogue was the game's own; session 1's server (with the DEBUG experience bonus) made both LEVEL UP and after a REAL server restart every card, record, level, experience, gil, AP, stored limit gauge, inventory and story was exactly what it was ($CARRIED), the records were byte for byte unchanged by a login, a second battle (on servers without the bonus) paid on top of what was saved to the point and started with the saved levels, and the restarted server fought them as their stat curves; $state_real unchanged ($after)."
 }
 
 main() {

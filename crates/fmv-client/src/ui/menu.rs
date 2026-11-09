@@ -58,27 +58,27 @@ fn default_body(options: &[BodyOption]) -> usize {
     options.iter().position(|o| o.id == fmv_ff7::playable::DEFAULT_BODY).unwrap_or(0)
 }
 
-/// One combat slot offered on the create screen: the canon party member whose combat moves and level curve
-/// the character fights with.
+/// One fighting style offered on the create screen (see [`crate::progress::FightingStyle`]): the stat curve of a canon
+/// character, which the player sees by its style's label and never by the character's name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SlotOption {
-    /// The game's own character id (`NewCharacter::slot`).
+    /// The game's own id of the curve (`NewCharacter::slot`). Internal.
     pub id: u8,
-    /// The member's full name (the name `fmv_ff7_battle::kernel::CharacterId` gives it, and the surname).
+    /// The style's label: what the picker shows (`crate::progress::FF7_FIGHTING_STYLES`).
     pub label: &'static str,
 }
 
-/// The FF7 slots a NEW character can take: the canon party members except Cloud, who stays the story's
-/// protagonist (the server refuses 0). Barret, the first row, is the default (and the server's).
+/// The FF7 fighting styles a NEW character can take: every style but the Swordsman's (Cloud's curve, which a new
+/// character is not offered and the server refuses, 0). The Gunner, the first row, is the default (and the server's).
 pub const FF7_SLOTS: [SlotOption; 8] = [
-    SlotOption { id: 1, label: "Barret Wallace" },
-    SlotOption { id: 2, label: "Tifa Lockhart" },
-    SlotOption { id: 3, label: "Aerith Gainsborough" },
-    SlotOption { id: 4, label: "Red XIII" },
-    SlotOption { id: 5, label: "Yuffie Kisaragi" },
-    SlotOption { id: 6, label: "Cait Sith" },
-    SlotOption { id: 7, label: "Vincent Valentine" },
-    SlotOption { id: 8, label: "Cid Highwind" },
+    SlotOption { id: 1, label: "Gunner" },
+    SlotOption { id: 2, label: "Martial artist" },
+    SlotOption { id: 3, label: "Mage" },
+    SlotOption { id: 4, label: "Guardian" },
+    SlotOption { id: 5, label: "Ninja" },
+    SlotOption { id: 6, label: "Gambler" },
+    SlotOption { id: 7, label: "Marksman" },
+    SlotOption { id: 8, label: "Lancer" },
 ];
 
 /// The slots offered for `game`'s content. A game without combat slots (the synthetic FIXTURE) offers none.
@@ -89,10 +89,10 @@ pub fn slot_options(game: GameId) -> &'static [SlotOption] {
     }
 }
 
-/// The name of the slot `id` for the character list (`slot: Barret`): the canon character's name from this
-/// client's own table, or the bare number for an id it has no name for.
+/// The fighting style of curve `id` for the character list (`style: Gunner`): its label from this client's own table,
+/// or the bare number for an id it has no style for. Never a canon character's name.
 pub fn slot_label(id: u8) -> String {
-    crate::progress::slot_name(id).map_or_else(|| id.to_string(), str::to_string)
+    crate::progress::fighting_style(id).map_or_else(|| id.to_string(), |s| s.label.to_string())
 }
 
 /// A text from the network (or from a note on disk) as the list shows it: cleaned, none if nothing is left.
@@ -129,7 +129,7 @@ pub fn look_label(look: &Look) -> String {
         None => appearance_label(look.appearance.as_deref()),
     };
     match look.slot {
-        Some(slot) => format!("{body}  slot: {}", slot_label(slot)),
+        Some(slot) => format!("{body}  style: {}", slot_label(slot)),
         None => body,
     }
 }
@@ -366,7 +366,7 @@ pub struct CreateForm {
     pub palette_cursor: usize,
     /// Index into [`body_options`] (meaningless when there are none). Starts on the game's default body.
     pub body: usize,
-    /// Index into [`slot_options`] (meaningless when there are none). Starts on the first row, Barret.
+    /// Index into [`slot_options`] (meaningless when there are none). Starts on the first row, the Gunner.
     pub slot: usize,
     pub focus: Field,
     has_bodies: bool,
@@ -1356,35 +1356,39 @@ mod tests {
     }
 
     #[test]
-    fn the_slot_starts_on_barret_cycles_with_the_arrows_and_wraps_and_never_offers_cloud() {
+    fn the_fighting_style_starts_on_the_gunner_cycles_with_the_arrows_and_wraps_and_never_offers_the_swordsman() {
         let mut m = menu_with(&[]);
-        assert_eq!(m.slots().len(), 8, "the eight party members that are not the protagonist");
+        assert_eq!(m.slots().len(), 8, "the eight styles that are not the protagonist's");
         assert_eq!(form(&m).slot, 0);
-        assert_eq!(m.slots()[form(&m).slot], SlotOption { id: 1, label: "Barret Wallace" }, "the first row, Barret, is the default");
+        assert_eq!(m.slots()[form(&m).slot], SlotOption { id: 1, label: "Gunner" }, "the first row, the Gunner, is the default");
         for _ in 0..6 {
             press(&mut m, NavKey::Tab); // body, palette, red, green, blue, slot
         }
         assert_eq!(form(&m).focus, Field::Slot);
         press(&mut m, NavKey::Right);
-        assert_eq!(m.slots()[form(&m).slot].id, 2, "Tifa");
+        assert_eq!(m.slots()[form(&m).slot].id, 2, "the Martial artist");
         for _ in 0..7 {
             press(&mut m, NavKey::Right);
         }
-        assert_eq!(m.slots()[form(&m).slot].id, 1, "past Cid wraps to Barret");
+        assert_eq!(m.slots()[form(&m).slot].id, 1, "past the Lancer wraps to the Gunner");
         press(&mut m, NavKey::Left);
-        assert_eq!(m.slots()[form(&m).slot].id, 8, "left of Barret wraps to Cid");
+        assert_eq!(m.slots()[form(&m).slot].id, 8, "left of the Gunner wraps to the Lancer");
         m.text(" ");
         assert_eq!(m.slots()[form(&m).slot].id, 1, "space picks the next one");
         // Typing letters while the slot has the focus does not touch the name, and the body did not move.
         m.text("abc");
         assert!(form(&m).name.is_empty());
         assert_eq!(form(&m).body, default_body_index());
-        // Whatever the keys do, Cloud (0) is never on offer, and every id is a party member the kernel names.
+        // Whatever the keys do, Cloud's curve (0) is never on offer, every id is a curve of a canon character, and what the
+        // player reads is its fighting style, which is the table's and names no canon character.
         assert!(FF7_SLOTS.iter().all(|o| o.id != 0), "Cloud stays the protagonist");
         for option in FF7_SLOTS {
-            let canon = fmv_ff7_battle::kernel::CharacterId::from_index(usize::from(option.id)).expect("a canon character");
-            assert!(option.label.starts_with(canon.name()), "{} is {}'s slot", option.label, canon.name());
-            assert_eq!(slot_label(option.id), canon.name());
+            let style = crate::progress::fighting_style(option.id).expect("a style for every curve on offer");
+            assert_eq!(option.label, style.label);
+            assert_eq!(slot_label(option.id), style.label);
+            for canon in fmv_ff7_battle::kernel::CharacterId::ALL {
+                assert!(!option.label.contains(canon.name()), "{} names {}", option.label, canon.name());
+            }
         }
         assert_eq!(FF7_SLOTS.iter().map(|o| o.id).collect::<Vec<_>>(), [1, 2, 3, 4, 5, 6, 7, 8]);
     }
@@ -1842,21 +1846,21 @@ mod tests {
     /// What the list says of a saved character in its one line: the body it was created with, or how the game
     /// draws it when it has none, then the slot's name.
     #[test]
-    fn the_list_line_of_a_character_says_its_body_and_its_slot() {
+    fn the_list_line_of_a_character_says_its_body_and_its_fighting_style() {
         let body = fmv_ff7::playable::PLACEHOLDER_BODIES[0];
         let created = Look { tint: [1, 2, 3], appearance: Some(body.model.appearance_ref.into()), body: Some(body.archetype.into()), slot: Some(1) };
-        assert_eq!(look_label(&created), format!("{}  slot: Barret", body.label));
-        // A character of before the creator: how it is drawn (a canon look), and the slot it fights in.
+        assert_eq!(look_label(&created), format!("{}  style: Gunner", body.label));
+        // A character of before the creator: how it is drawn (a canon look), and its fighting style.
         let migrated = Look { tint: [1, 2, 3], appearance: Some("ff7/tifa".into()), body: None, slot: Some(2) };
-        assert_eq!(look_label(&migrated), "Tifa Lockhart  slot: Tifa");
-        // Nothing known of the slot: just the look. Nothing known at all: the plain marker.
+        assert_eq!(look_label(&migrated), "Tifa Lockhart  style: Martial artist");
+        // Nothing known of the style: just the look. Nothing known at all: the plain marker.
         assert_eq!(look_label(&Look::plain([1, 2, 3], Some("ff7/cloud"))), "Cloud Strife");
         assert_eq!(look_label(&Look::plain([1, 2, 3], None)), "default marker");
-        // The names of the slots are the kernel's (Red XIII, Cait Sith), an id it does not know is its number.
+        // The styles are this client's table (Guardian, Gambler), an id it does not know is its number.
         let slot = |slot| Look { tint: [0; 3], appearance: None, body: None, slot: Some(slot) };
-        assert_eq!(look_label(&slot(4)), "default marker  slot: Red XIII");
-        assert_eq!(look_label(&slot(6)), "default marker  slot: Cait Sith");
-        assert_eq!(look_label(&slot(200)), "default marker  slot: 200");
+        assert_eq!(look_label(&slot(4)), "default marker  style: Guardian");
+        assert_eq!(look_label(&slot(6)), "default marker  style: Gambler");
+        assert_eq!(look_label(&slot(200)), "default marker  style: 200");
         // Text from a note on disk is cleaned.
         let hostile = Look { tint: [0; 3], appearance: None, body: Some("slim\u{1b}[31m".into()), slot: None };
         assert_eq!(look_label(&hostile), "slim[31m");

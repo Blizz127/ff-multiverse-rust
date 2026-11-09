@@ -139,7 +139,7 @@ fn the_scene_asks_for_the_colour_of_each_members_own_entity_and_never_of_an_enem
         ticks_per_second: 1000,
     });
     let engine = engine.unwrap();
-    let start = SceneStart { id: BattleId(1), party: (0..3).map(|i| member(i, i as u8)).collect(), my_actor: Some(ActorId(0)), formation: None };
+    let start = SceneStart { id: BattleId(1), party: (0..3).map(|i| member(i, i as u8)).collect(), bindings: Vec::new(), my_actor: Some(ActorId(0)), formation: None };
     let mut scene = BattleScene::new(&start, Some(&engine), &mut ModelKit::new(Box::new(Armed), None)).unwrap();
     let asked = std::cell::RefCell::new(Vec::new());
     scene.show_player_colours(|entity| {
@@ -237,7 +237,7 @@ fn the_scene_asks_for_the_colour_of_each_players_entity_and_never_of_a_companion
     let engine = SyntheticRules::default()
         .build(&BattleSetup { formation_id: 1, seed: 7, party: party.clone(), preemptive: false, back_attack: false, battle_speed: 0, ticks_per_second: 1000 })
         .unwrap();
-    let start = SceneStart { id: BattleId(1), party, my_actor: Some(ActorId(2)), formation: None };
+    let start = SceneStart { id: BattleId(1), party, bindings: Vec::new(), my_actor: Some(ActorId(2)), formation: None };
     let mut scene = BattleScene::new(&start, Some(&engine), &mut ModelKit::new(Box::new(Armed), None)).unwrap();
     let asked = std::cell::RefCell::new(Vec::new());
     scene.show_player_colours(|entity| {
@@ -266,7 +266,7 @@ fn real_identity_battle_models_are_vertex_coloured_with_face_decals_only() {
     let Some(real) = open_real() else { return };
     let mut kit = real.kit();
     for character in [0u8, 1, 2, 3, 4, 5, 6, 7, 8] {
-        let model = kit.source.party_member(&PartyLook { actor: ActorId(0), character, mine: true });
+        let model = kit.source.party_member(&PartyLook::companion(ActorId(0), character, true));
         let rig = kit.rigs.resolve(&model, BoxSpec::for_party(0));
         let s = shares(&rig.asset.mesh);
         eprintln!(

@@ -278,14 +278,17 @@ fn roster_display_name(raw: &str, index: usize) -> String {
 }
 
 /// The note that says who fights as party member `index` of a battle that starts:
-/// `roster actor=<i> name=<name> slot=<n> slot_name=<name> level=<n>`. The names are percent-encoded like the names of
-/// the SMOKE line ([`encode_name`]; `-` for none), the player's own as the roster says it (bounded to the length
-/// a name has) and the slot's from this client's own table of characters.
+/// `roster actor=<i> name=<name> slot=<n> slot_name=<name> level=<n> controller=<companion|player>`. The names are
+/// percent-encoded like the names of the SMOKE line ([`encode_name`]; `-` for none), the member's own as the roster says it
+/// (bounded to the length a name has) and the stat curve's from this client's own table of characters (internal: for a canon
+/// companion it is the character it is). `controller` says who commands it: a `companion` of the story's canon party is
+/// commanded by the server, a `player` by its player (protocol v9).
 fn roster_note(index: usize, member: &BattleMember) -> String {
     let own: String = member.name.chars().take(MAX_CHARACTER_NAME_CHARS).collect();
     let name = if own.is_empty() { "-".to_string() } else { encode_name(&own) };
     let slot_name = slot_name(member.character).map_or_else(|| "-".to_string(), encode_name);
-    format!("roster actor={index} name={name} slot={} slot_name={slot_name} level={}", member.character, member.level)
+    let controller = if member.is_companion() { "companion" } else { "player" };
+    format!("roster actor={index} name={name} slot={} slot_name={slot_name} level={} controller={controller}", member.character, member.level)
 }
 
 /// One battle this client is in.
@@ -587,6 +590,8 @@ impl BattleClient {
         Some(SceneStart {
             id: active.id,
             party: active.party.clone(),
+            // The window fills in how each player looks on the field (it has the area's snapshots, this has not).
+            bindings: Vec::new(),
             my_actor: active.my_actor,
             formation: self.rules.as_ref().and_then(|rules| rules.formation_scene(active.formation_id)),
         })

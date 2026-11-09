@@ -307,15 +307,16 @@ fn draw_confirm(c: &mut Canvas<'_>, menu: &Menu, confirm: Confirm, cw: i32, ch: 
 // Create
 // ---------------------------------------------------------------------------------------------
 
-const LABEL_W: i32 = 60;
+/// The width of the label column, in canvas units: wide enough for "Fighting style", the longest label.
+const LABEL_W: i32 = 112;
 
 /// The widest the create form gets, in canvas units: wide enough for the help line of the Body row on one
 /// line (at the design width of 400 it is the width of the canvas less a margin).
 const CREATE_W: i32 = 440;
 /// What the Body row means, in one short line.
 pub const BODY_HELP: &str = "how you look on the field (a placeholder model)";
-/// What the Slot row means, in one short line (wrapped where the form is narrower than it is long).
-pub const SLOT_HELP: &str = "who you fight as: its combat moves and level curve (fixed once created)";
+/// What the Fighting style row means, in one short line (wrapped where the form is narrower than it is long).
+pub const SLOT_HELP: &str = "how you fight: its stats, spells and level curve (fixed once created)";
 /// Height of one line of help text, in canvas units, and the space left under a block of them.
 const HELP_LINE_H: i32 = 10;
 const HELP_PAD: i32 = 2;
@@ -509,9 +510,9 @@ fn draw_create(c: &mut Canvas<'_>, menu: &Menu, form: &CreateForm, cw: i32, ch: 
         ry += slider_h;
     }
 
-    // Slot: who the character fights as.
+    // Fighting style: how the character fights (the stat curve of one of the game's characters; never who it is).
     if slots {
-        row(c, Field::Slot, ry, row_h, "Slot");
+        row(c, Field::Slot, ry, row_h, "Fighting style");
         let options = menu.slots();
         let label = options.get(form.slot).map_or("?", |o| o.label);
         picker(c, ctl_x, ry + (row_h - 8) / 2, form.focus == Field::Slot, label);
@@ -849,15 +850,20 @@ mod tests {
     }
 
     #[test]
-    fn the_create_screen_shows_the_form_the_body_and_the_slot() {
+    fn the_create_screen_shows_the_form_the_body_and_the_fighting_style() {
         let mut menu = Menu::new(cfg(GameId::Ff7), vec![]);
         menu.text("Cloud");
         let list = draw(&menu, 1100, 680);
         let default_body = crate::ui::menu::body_options(GameId::Ff7)[0].label;
-        for needle in ["NEW CHARACTER", "Name", "Body", default_body, "Color", "Red", "Green", "Blue", "Slot", "Barret Wallace", "Preview", "Create", "Quit", "5/24"] {
+        for needle in ["NEW CHARACTER", "Name", "Body", default_body, "Color", "Red", "Green", "Blue", "Fighting style", "Gunner", "Preview", "Create", "Quit", "5/24"] {
             assert!(list.says(needle), "missing {needle:?}");
         }
         assert!(!list.says("Look"), "the old row is gone");
+        assert!(!list.texts().iter().any(|t| t.text == "Slot"), "the Slot row is the Fighting style row now");
+        // (The name typed above is Cloud's: the rest of the screen names no canon character.)
+        for canon in fmv_ff7_battle::kernel::CharacterId::ALL.into_iter().skip(1) {
+            assert!(!list.says(canon.name()), "the create screen never names {}", canon.name());
+        }
         assert!(list.texts().iter().any(|t| t.text == "Cloud"), "the typed name is in the field");
         assert!(list.says("#"), "the preview shows the colour as hex");
         assert_text_inside(&list, 1100, 680, "create");
@@ -873,31 +879,31 @@ mod tests {
         let menu = Menu::new(cfg(GameId::Fixture), vec![]);
         let list = draw(&menu, 1100, 680);
         assert!(list.says("Name") && list.says("Color"));
-        assert!(!list.texts().iter().any(|t| t.text == "Body" || t.text == "Slot" || t.text == "Look"));
-        assert!(!list.says("Barret") && !list.says("how you look") && !list.says("who you fight as"));
+        assert!(!list.texts().iter().any(|t| t.text == "Body" || t.text == "Slot" || t.text == "Fighting style" || t.text == "Look"));
+        assert!(!list.says("Barret") && !list.says("Gunner") && !list.says("how you look") && !list.says("how you fight"));
         assert_text_inside(&list, 1100, 680, "fixture create");
         assert_no_text_overlap(&list, "fixture create");
     }
 
     /// The create screen says what each choice means, in one short line under its row (wrapped where the
-    /// window is narrow): the body is how you look on the field, the slot is who you fight as.
+    /// window is narrow): the body is how you look on the field, the fighting style is how you fight.
     #[test]
     fn each_row_says_what_it_means_under_it_where_the_window_has_room() {
         let menu = Menu::new(cfg(GameId::Ff7), vec![]);
         let list = draw(&menu, 1100, 680);
         let said = said(&list);
         assert!(said.contains("how you look on the field (a placeholder model)"), "{said}");
-        assert!(said.contains("who you fight as: its combat moves and level curve (fixed once created)"), "{said}");
-        // The help is DIM text under the row it is about: the body's between the Body and Color rows, the slot's
-        // between the Slot row and the Preview line.
+        assert!(said.contains("how you fight: its stats, spells and level curve (fixed once created)"), "{said}");
+        // The help is DIM text under the row it is about: the body's between the Body and Color rows, the style's
+        // between the Fighting style row and the Preview line.
         let y_of = |text: &str| list.texts().iter().find(|t| t.text == text && t.color != SHADOW).map(|t| t.y).unwrap_or_else(|| panic!("{text:?} is drawn"));
-        let (body_row, color_row, slot_row, preview) = (y_of("Body"), y_of("Color"), y_of("Slot"), y_of("Preview"));
+        let (body_row, color_row, slot_row, preview) = (y_of("Body"), y_of("Color"), y_of("Fighting style"), y_of("Preview"));
         let body_help = list.texts().iter().find(|t| t.text.starts_with("how you look") && t.color == DIM).expect("the body's help").y;
-        let slot_help = list.texts().iter().find(|t| t.text.starts_with("who you fight") && t.color == DIM).expect("the slot's help").y;
+        let slot_help = list.texts().iter().find(|t| t.text.starts_with("how you fight") && t.color == DIM).expect("the style's help").y;
         assert!(body_row < body_help && body_help < color_row, "{body_row} < {body_help} < {color_row}");
         assert!(slot_row < slot_help && slot_help < preview, "{slot_row} < {slot_help} < {preview}");
-        // The Body row's help is one line here, the Slot row's wraps over two (it is longer than the window is wide).
-        let helps: Vec<&DrawnText> = list.texts().iter().filter(|t| t.color == DIM && (t.text.starts_with("how you look") || t.text.starts_with("who you fight") || t.text.starts_with("curve") || t.text.starts_with("(fixed"))).collect();
+        // The Body row's help is one line here, the Fighting style row's wraps over two (it is longer than the window is wide).
+        let helps: Vec<&DrawnText> = list.texts().iter().filter(|t| t.color == DIM && (t.text.starts_with("how you look") || t.text.starts_with("how you fight") || t.text.starts_with("(fixed"))).collect();
         assert!(helps.len() >= 3, "{helps:?}");
     }
 
@@ -906,7 +912,7 @@ mod tests {
     #[test]
     fn the_focused_choice_is_explained_at_every_window_size_and_nothing_overlaps() {
         for (w, h) in SIZES {
-            for (presses, want) in [(1, "how you look on the field (a placeholder model)"), (6, "who you fight as: its combat moves and level curve (fixed once created)")] {
+            for (presses, want) in [(1, "how you look on the field (a placeholder model)"), (6, "how you fight: its stats, spells and level curve (fixed once created)")] {
                 let mut menu = Menu::new(cfg(GameId::Ff7), vec![]);
                 for _ in 0..presses {
                     menu.key(KeyPress::new(NavKey::Tab));
@@ -927,9 +933,9 @@ mod tests {
         }
     }
 
-    /// The list line of a character says its body and its slot where the row has the room.
+    /// The list line of a character says its body and its fighting style where the row has the room.
     #[test]
-    fn the_select_screen_says_each_characters_body_and_slot() {
+    fn the_select_screen_says_each_characters_body_and_fighting_style() {
         use crate::ui::menu::Look;
         let body = fmv_ff7::playable::PLACEHOLDER_BODIES[0];
         let created = Look { tint: [200, 40, 40], appearance: Some(body.model.appearance_ref.into()), body: Some(body.archetype.into()), slot: Some(1) };
@@ -940,8 +946,8 @@ mod tests {
         ];
         let list = draw(&Menu::new(cfg(GameId::Ff7), accounts), 1100, 680);
         let said = said(&list);
-        assert!(said.contains(&format!("{}  slot: Barret", body.label)), "{said}");
-        assert!(said.contains("Tifa Lockhart  slot: Tifa"), "{said}");
+        assert!(said.contains(&format!("{}  style: Gunner", body.label)), "{said}");
+        assert!(said.contains("Tifa Lockhart  style: Martial artist"), "{said}");
         assert_text_inside(&list, 1100, 680, "select with slots");
     }
 

@@ -2942,6 +2942,33 @@ mod tests {
         assert!(started.contains("names=[Cloud,Barret,Aria]"), "{started}");
     }
 
+    /// The owner's own cases, and every other: whatever a player's internal curve is, a solo player fights as
+    /// [Cloud, Barret, the player]. A new character on Barret's curve (a "Blizzy": created with slot 1) must not make Barret
+    /// the player's model or drop the canon Barret; an account that predates the creator, on Cloud's curve (slot 0, like
+    /// the owner's Blizz), must not drop Cloud or give a second one. Neither canon member is ever dropped or replaced.
+    #[test]
+    fn neither_canon_member_is_ever_dropped_or_replaced_whatever_a_players_curve_is() {
+        let t0 = Instant::now();
+        for curve in 0..=8u8 {
+            let mut w = world_with_party(settings(SyntheticRules::default()), cloud_and_barret);
+            let mut a = seat_as(&mut w, "Blizzy", t0, ProgressSeed::of(curve, None));
+            a.drain();
+            assert_eq!(w.request_encounter(a.entity, Some(1), t0), BattleReply::Done, "curve {curve}");
+            let party = roster_of(&mut a);
+            assert_eq!(
+                party.iter().map(|m| (m.is_companion(), m.name.as_str(), m.character)).collect::<Vec<_>>(),
+                vec![(true, "Cloud", 0), (true, "Barret", 1), (false, "Blizzy", curve)],
+                "curve {curve}: the canon pair first and untouched, the player added with its own name and its curve"
+            );
+            // The engine fights the player with the curve's template and the canon pair with their own.
+            let engine = &w.battle.as_ref().unwrap().battles.get(&BattleId(1)).unwrap().state;
+            let canon = fmv_ff7_battle::kernel::CharacterId::from_index(usize::from(curve)).map(|c| c.name());
+            assert_eq!(engine.actors().iter().take(3).map(|c| c.name.as_str()).collect::<Vec<_>>(), ["Cloud", "Barret", canon.unwrap_or("?")], "curve {curve}");
+            // Exactly one entity is frozen (the player's): a companion has none.
+            assert_eq!(party.iter().filter_map(BattleMember::entity).collect::<Vec<_>>(), vec![a.entity]);
+        }
+    }
+
     #[test]
     fn two_players_fight_as_cloud_barret_then_the_players_in_the_partys_own_order() {
         let t0 = Instant::now();
