@@ -218,6 +218,32 @@ async fn the_debug_limit_flag_needs_debug_encounters_and_a_fixture_server_says_i
     assert!(log.contains("--debug-limit-full has no effect"), "the operator is told that the flag does nothing here:\n{log}");
 }
 
+/// `--debug-status` is a debug flag too: alone, or with a name a battle does not play, or with a pair that cannot start a
+/// battle together, it is a usage error (exit code 2, nothing printed or bound); on a server without battle data it says at
+/// start-up that it does nothing there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_debug_status_flag_needs_debug_encounters_refuses_what_a_battle_cannot_start_with_and_a_fixture_server_says_it_has_no_effect() {
+    let env_state = tempfile::tempdir().expect("tempdir");
+    let state = env_state.path().to_str().expect("utf-8 temp path");
+    let out = run_failing(&["--ephemeral", "--debug-status", "poison"], state).await;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("--debug-encounters"), "the usage error names the flag it needs: {stderr}");
+    assert!(out.stdout.is_empty(), "no READY line");
+    for (bad, says) in [("frog", "not a status a battle plays"), ("haste,slow", "cannot all start"), ("nonsense", "nonsense")] {
+        let out = run_failing(&["--ephemeral", "--debug-encounters", "--debug-status", bad], state).await;
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{bad}: {stderr}");
+        assert!(stderr.contains(says), "{bad}: {stderr}");
+        assert!(out.stdout.is_empty(), "{bad}: no READY line");
+    }
+
+    let server = start(&["--ephemeral", "--debug-encounters", "--debug-status", "poison,silence"], env_state.path()).await;
+    let (status, log) = server.stop("TERM").await;
+    assert_eq!(status.code(), Some(0), "{log}");
+    assert!(log.contains("--debug-status has no effect"), "the operator is told that the flag does nothing here:\n{log}");
+}
+
 /// Accounts live in the state directory: a registration made against one process is honoured by the
 /// next process on the same `--state-dir`, the directory is held locked while a server runs, and
 /// a refused second server says so without printing a READY line.

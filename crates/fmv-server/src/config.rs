@@ -509,6 +509,29 @@ mod tests {
     }
 
     #[test]
+    fn the_debug_status_flag_is_off_by_default_needs_debug_encounters_and_only_takes_a_set_a_battle_can_start_with() {
+        use fmv_ff7_battle::status::Status;
+        use fmv_protocol::SyntheticRules;
+        assert!(BattleSettings::new(Arc::new(SyntheticRules::default())).debug_status.is_empty(), "off unless asked for");
+        let with = |debug_encounters: bool, statuses: &[Status]| {
+            let mut b = BattleSettings::new(Arc::new(SyntheticRules::default()));
+            b.debug_status = statuses.iter().copied().collect();
+            ServerConfig { battle: Some(b), debug_encounters, ..ServerConfig::default() }
+        };
+        with(true, &[Status::Poison, Status::Silence]).validate().unwrap();
+        with(true, &[]).validate().unwrap();
+        with(false, &[]).validate().unwrap();
+        let err = with(false, &[Status::Poison]).validate().expect_err("a debug flag without --debug-encounters is refused").to_string();
+        assert!(err.contains("--debug-status") && err.contains("--debug-encounters"), "{err}");
+        // Haste with Slow, Sadness with Fury and a status the battle does not play are not sets a member starts with.
+        for bad in [&[Status::Haste, Status::Slow][..], &[Status::Sadness, Status::Fury], &[Status::Confusion], &[Status::Death]] {
+            let err = with(true, bad).validate().expect_err("not a set a battle can start with").to_string();
+            assert!(err.contains("--debug-status") && err.contains("cannot start") || err.contains("not a set a battle can start with"), "{bad:?}: {err}");
+        }
+        assert!(format!("{:?}", with(true, &[Status::Poison]).battle).contains("debug_status: StatusSet(8)"), "{:?}", with(true, &[Status::Poison]).battle);
+    }
+
+    #[test]
     fn the_debug_bonus_flags_are_off_by_default_need_debug_encounters_and_never_meet_the_full_gauge_flag() {
         use fmv_protocol::SyntheticRules;
         let off = BattleSettings::new(Arc::new(SyntheticRules::default()));

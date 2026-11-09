@@ -346,7 +346,7 @@ impl Server {
                 if !b.debug_status.is_empty() {
                     warn!(
                         "DEBUG: --debug-status {} is on: every member of every battle starts with those statuses instead of none (a smoke-test aid; leave it off on a server real players use). \
-                         Nothing is stored under it: it only changes what a battle starts with (logged as `battle started ... statuses=[..]`)",
+                         Nothing is stored under it: it only changes what a battle starts with (the `statuses=[..]` key of each start line says it)",
                         b.debug_status
                     );
                 }

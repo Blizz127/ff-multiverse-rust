@@ -2045,7 +2045,7 @@ mod tests {
         }
         let logs = logs_of(&mut w);
         assert!(
-            logs.iter().any(|l| l.starts_with("battle started battle=1") && l.contains("characters=[1, 1]") && l.ends_with("names=[A,Red%20XIII] companions=0")),
+            logs.iter().any(|l| l.starts_with("battle started battle=1") && l.contains("characters=[1, 1]") && l.contains("names=[A,Red%20XIII] companions=0 statuses=[-,-]")),
             "{logs:?}"
         );
     }
@@ -2246,8 +2246,8 @@ mod tests {
             logs.iter().any(|l| l.starts_with("limit kept battle=1") && l.contains(&format!("limit={end} was=255")) && l.contains("mirrored=true saving=queued")),
             "{logs:?}"
         );
-        assert!(logs.iter().any(|l| l.starts_with("battle started battle=1") && l.contains("limits=[255]") && l.ends_with("run_difficulty=1 names=[A] companions=0")), "{logs:?}");
-        assert!(logs.iter().any(|l| l.starts_with("battle ended battle=1 outcome=Victory") && l.ends_with(&format!("limits=[{end}] companions=0"))), "{logs:?}");
+        assert!(logs.iter().any(|l| l.starts_with("battle started battle=1") && l.contains("limits=[255]") && l.contains("run_difficulty=1 names=[A] companions=0 statuses=[-]")), "{logs:?}");
+        assert!(logs.iter().any(|l| l.starts_with("battle ended battle=1 outcome=Victory") && l.contains(&format!("limits=[{end}] companions=0 status_inflicted=0 status_ended=0 status_ticks=0"))), "{logs:?}");
         // A win pays as before: the payment is its own job, and the next battle starts from the gauge kept.
         assert_eq!(jobs.iter().filter(|j| j.paid().is_some()).count(), 1);
         assert_eq!(w.request_encounter(a.entity, Some(0), ms(t0, 700_000)), BattleReply::Done);
@@ -2255,6 +2255,130 @@ mod tests {
             Some(ServerMsg::EncounterStart { party, .. }) => assert_eq!(party[0].limit, end),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// `--debug-status`: every member starts the battle with those statuses, they travel in the `EncounterStart`, the
+    /// engine announces them with its first step, a client's replay of the whole battle agrees with the server's (the
+    /// harness panics at the first divergence), and the server logs what the engine said about them.
+    #[test]
+    fn debug_status_starts_every_member_with_those_statuses_and_the_whole_battle_replays_and_is_logged() {
+        use fmv_ff7_battle::status::{Status, StatusSet};
+        let t0 = Instant::now();
+        let rules = SyntheticRules::default();
+        let mut s = settings(SyntheticRules::default());
+        let given: StatusSet = [Status::Silence, Status::Haste, Status::Regen].into_iter().collect();
+        s.debug_status = given;
+        let mut w = world_with(Some(s), true);
+        let mut a = seat(&mut w, "A", t0);
+        assert_eq!(w.request_encounter(a.entity, Some(1), t0), BattleReply::Done);
+        assert_eq!(roster_of(&mut a).iter().map(|m| m.status).collect::<Vec<_>>(), vec![given]);
+        let started = logs_of(&mut w).into_iter().find(|l| l.starts_with("battle started")).expect("a start line");
+        assert!(started.ends_with(" statuses=[Silence+Haste+Regen]"), "{started}");
+        play_out(&mut w, &mut [&mut a], &rules, t0);
+        // The first message of events announces them, in bit order, for the one member.
+        let first = a
+            .battle_msgs()
+            .iter()
+            .find_map(|m| match m {
+                ServerMsg::BattleEvent { events, .. } => Some(events.clone()),
+                _ => None,
+            })
+            .expect("events");
+        let me = ActorId(0);
+        assert_eq!(
+            first[..3],
+            [
+                BattleEvent::StatusInflicted { target: me, status: Status::Silence },
+                BattleEvent::StatusInflicted { target: me, status: Status::Haste },
+                BattleEvent::StatusInflicted { target: me, status: Status::Regen },
+            ]
+        );
+        let logs = logs_of(&mut w);
+        for status in ["Silence", "Haste", "Regen"] {
+            let line = format!("status inflicted battle=1 actor=0 status={status}");
+            assert!(logs.contains(&line), "{line} in {logs:?}");
+        }
+        let ended = logs.iter().find(|l| l.starts_with("battle ended battle=1")).expect("an end line");
+        assert!(ended.contains(" status_inflicted=3 status_ended=") && ended.contains(" status_ticks="), "{ended}");
+        // Nothing is stored for it, and a server without the flag starts the same battle clean.
+        let mut w = world_with(Some(settings(SyntheticRules::default())), true);
+        let mut a = seat(&mut w, "A", t0);
+        assert_eq!(w.request_encounter(a.entity, Some(1), t0), BattleReply::Done);
+        assert_eq!(roster_of(&mut a).iter().map(|m| m.status).collect::<Vec<_>>(), vec![StatusSet::EMPTY]);
+        assert!(logs_of(&mut w).iter().any(|l| l.starts_with("battle started") && l.ends_with(" statuses=[-]")));
+    }
+
+    /// The engine's refusals reach the player under their own names: a silenced member cannot cast (and its turn is still
+    /// there), a sleeper cannot act until it wakes; and a player that cannot take a turn holds nobody up.
+    #[test]
+    fn a_silenced_member_cannot_cast_a_sleeper_cannot_act_and_the_server_says_which() {
+        use fmv_ff7_battle::status::Status;
+        let t0 = Instant::now();
+        let hit = Command::Attack { target: ActorId(1) };
+        // Silence: Magic is refused, the Attack is not, and a refusal spends no turn.
+        let mut s = settings(SyntheticRules::default());
+        s.debug_status = [Status::Silence].into_iter().collect();
+        let mut w = world_with(Some(s), true);
+        let mut a = seat(&mut w, "A", t0);
+        assert_eq!(w.request_encounter(a.entity, Some(3), t0), BattleReply::Done);
+        a.drain();
+        let id = seat_battle_id(&a.log);
+        let cast = Command::Magic { spell: 27, target: Target::One(ActorId(1)) };
+        assert_eq!(w.battle_command(a.entity, id, ActorId(0), cast, t0), refused(Some(id), BattleRejection::Silenced));
+        assert!(w.battle.as_ref().unwrap().battles.get(&id).unwrap().state.ready_actors().contains(&ActorId(0)), "a refusal spends no turn");
+        assert_eq!(w.battle_command(a.entity, id, ActorId(0), hit, t0), BattleReply::Done);
+
+        // Sleep: nothing at all is accepted while it lasts, and the owner of a sleeper is not waited for.
+        let mut s = settings(SyntheticRules::default());
+        s.debug_status = [Status::Sleep].into_iter().collect();
+        let mut w = world_with(Some(s), true);
+        let mut a = seat(&mut w, "A", t0);
+        assert_eq!(w.request_encounter(a.entity, Some(3), t0), BattleReply::Done);
+        a.drain();
+        let id = seat_battle_id(&a.log);
+        for command in [hit, Command::Defend, Command::Magic { spell: 27, target: Target::One(ActorId(1)) }] {
+            assert_eq!(w.battle_command(a.entity, id, ActorId(0), command, t0), refused(Some(id), BattleRejection::CannotAct), "{command:?}");
+        }
+        let battle = w.battle.as_ref().unwrap().battles.get(&id).unwrap();
+        assert!(battle.state.ready_actors().is_empty() && battle.player_turns().is_empty(), "it holds a full gauge and owes no turn");
+        // Awake again (a blow, or the end of its 30 units: well within a second and a half): the same command is taken.
+        w.advance_battles(ms(t0, 1_500));
+        assert_eq!(w.battle_command(a.entity, id, ActorId(0), hit, ms(t0, 1_500)), BattleReply::Done);
+        let logs = logs_of(&mut w);
+        assert!(logs.contains(&"status ended battle=1 actor=0 status=Sleep".to_string()), "{logs:?}");
+        // A battle with no status: the same player does owe a turn.
+        let mut w = world_with(Some(settings(SyntheticRules::default())), true);
+        let a = seat(&mut w, "A", t0);
+        assert_eq!(w.request_encounter(a.entity, Some(3), t0), BattleReply::Done);
+        let battle = w.battle.as_ref().unwrap().battles.values().next().unwrap();
+        assert_eq!(battle.player_turns().len(), 1);
+    }
+
+    /// The canon companions and the status: a companion that is asleep takes no turn (the server never asks the engine for
+    /// one, and the engine is never asked to refuse), and it takes it as soon as it wakes.
+    #[test]
+    fn a_sleeping_companion_takes_no_turn_until_it_wakes_and_nothing_is_refused() {
+        use fmv_ff7_battle::status::Status;
+        let t0 = Instant::now();
+        let mut s = settings_unpaced(SyntheticRules::default());
+        s.debug_status = [Status::Sleep].into_iter().collect();
+        let mut w = world_with_party(s, cloud_and_barret);
+        let mut a = seat_as(&mut w, "Aria", t0, ProgressSeed::of(2, None));
+        a.drain();
+        assert_eq!(w.request_encounter(a.entity, Some(3), t0), BattleReply::Done);
+        assert_eq!(roster_of(&mut a).iter().map(|m| m.status.len()).collect::<Vec<_>>(), [1, 1, 1], "everybody starts asleep");
+        // A tenth of a second of battle (the enemy has not acted, and Sleep lasts 0.9 s): nobody acted, nothing was refused.
+        w.advance_battles(ms(t0, 100));
+        let logs = logs_of(&mut w);
+        assert!(!logs.iter().any(|l| l.starts_with("companion acted") || l.contains("was refused by the engine")), "{logs:?}");
+        assert_eq!(logs.iter().filter(|l| l.starts_with("status inflicted battle=1")).count(), 3, "one Sleep each: {logs:?}");
+        // Two seconds on, the sleepers have woken (a blow, or the end of their 30 units) and the companions have taken the
+        // turns they held: still nothing was refused.
+        w.advance_battles(ms(t0, 2_000));
+        let logs = logs_of(&mut w);
+        assert!(logs.iter().any(|l| l.starts_with("status ended battle=1 ") && l.ends_with(" status=Sleep")), "{logs:?}");
+        assert!(logs.iter().any(|l| l.starts_with("companion acted battle=1")), "they act once awake: {logs:?}");
+        assert!(!logs.iter().any(|l| l.contains("was refused by the engine")), "{logs:?}");
     }
 
     /// `--debug-limit-full`: the battle STARTS with full gauges, whatever the accounts have, and NO gauge is ever

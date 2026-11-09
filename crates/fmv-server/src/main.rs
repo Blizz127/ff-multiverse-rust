@@ -620,6 +620,45 @@ mod tests {
         }
     }
 
+    /// `--debug-status` takes the names of the statuses a battle plays (any case, spaces and hyphens ignored), refuses the
+    /// ones it does not, and refuses a set a battle cannot start with; like the other debug flags it needs
+    /// `--debug-encounters`.
+    #[test]
+    fn debug_status_takes_names_of_statuses_a_battle_plays_and_needs_debug_encounters() {
+        use fmv_ff7_battle::status::{Status, StatusSet};
+        let set = |list: &[Status]| list.iter().copied().collect::<StatusSet>();
+        let ok = |list: &str| parse(&["--debug-encounters", "--debug-status", list]).map(|c| c.debug_status);
+        assert_eq!(ok("poison").unwrap(), Some(set(&[Status::Poison])));
+        assert_eq!(ok("Poison, SILENCE ,m-barrier").unwrap(), Some(set(&[Status::Poison, Status::Silence, Status::MBarrier])));
+        assert_eq!(ok("sleep,sleep").unwrap(), Some(set(&[Status::Sleep])), "twice is once");
+        assert_eq!(parse(&["--debug-encounters"]).unwrap().debug_status, None, "off unless asked for");
+        for (bad, says) in [
+            ("confusion", "not a status a battle plays"),
+            ("frog", "not a status a battle plays"),
+            ("death", "not a status a battle plays"),
+            ("near-death", "not a status a battle plays"),
+            ("poison,nonsense", "nonsense"),
+            ("", "names no status"),
+            (",", "names no status"),
+            ("haste,slow", "cannot all start"),
+            ("sadness,fury,poison", "cannot all start"),
+        ] {
+            let err = ok(bad).err().unwrap_or_else(|| panic!("{bad:?} must be refused")).to_string();
+            assert!(err.contains(says), "{bad:?}: {err}");
+        }
+        // The list of the ones it plays is in the error, so that the operator can pick.
+        let err = ok("frog").err().unwrap().to_string();
+        assert!(err.contains("Poison") && err.contains("Haste"), "{err}");
+        // A debug aid never runs on its own.
+        let err = parse(&["--debug-status", "poison"]).err().expect("needs --debug-encounters").to_string();
+        assert!(err.contains("--debug-encounters"), "{err}");
+        // It reaches the battle settings as the set.
+        let cli = parse(&["--debug-encounters", "--debug-status", "regen,haste"]).unwrap();
+        let settings = cli.battle_settings(std::sync::Arc::new(fmv_protocol::SyntheticRules::default()));
+        assert_eq!(settings.debug_status, set(&[Status::Haste, Status::Regen]));
+        assert!(parse(&["--debug-encounters"]).unwrap().battle_settings(std::sync::Arc::new(fmv_protocol::SyntheticRules::default())).debug_status.is_empty());
+    }
+
     #[test]
     fn ff7_source_flags_select_the_game_and_the_source() {
         let cli = parse(&[]).unwrap();
