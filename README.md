@@ -262,9 +262,12 @@ target/release/fmv-client --server <addr> --name Me   # straight in as Me (regis
 
 *Character menu.* A window started without `--name` opens on a menu, in the same window the game
 then runs in. It lists the characters saved for that server (name, colour swatch, look):
-**Up/Down** choose, **Enter** plays, **N** creates a new one, **Del** forgets a saved login on
-this computer (it asks first, and the default answer keeps it: the character stays on the
-server, but its token, shown only once at registration, cannot be recovered), **Esc** quits.
+**Up/Down** choose, **Enter** plays, **N** creates a new one, **Del** deletes the character (it asks first, and
+the default answer keeps it: **Y** deletes it ON THE SERVER, with its own login token, which frees its name and
+removes it from the server; the server keeps a recoverable copy that only its operator can restore, see "Deleting a
+character"; **F** only forgets the saved login on this computer, for a server that is gone; **N** or **Esc** keeps
+it); the saved login is removed only after the server says it deleted the character or no longer knew it, and a
+character that is in the game right now is refused), **Esc** quits.
 With nothing saved yet it opens on the create screen: a **name** (up to 24 characters, cleaned
 exactly as the server cleans it), a **body** (a generic placeholder model of your own `char.lgp`,
 the field look of your character, see "In the game"), a **tint** (a palette grid plus red, green
@@ -320,8 +323,11 @@ skin was pulled to brown). It is carried per DRAW (an `Identity`, a second insta
 a model is never copied per player, because the client's GPU cache holds 32) and the fragment shader repaints
 the **cloth** in the colour's hue and saturation at the cloth's own value, lifted (`0.2 + 0.8 * v^0.6`) so that
 dark cloth shows it while the shading, belts and shoes stay told apart, and bright cloth stays a paler pastel;
-**skin-hued texels** (a smooth hue, saturation and value mask) and the **face decals** keep their own colours under
-a 5% tint; white, grey and black colours fall back to the old multiplicative look, and a model without an identity
+**skin-hued texels** (a smooth hue, saturation and value mask), the **face decals** and the **hair** keep their own
+colours under a 5% tint (hair is dark brown, very saturated and very dark, which the skin mask's gates exclude, so a
+blue player's `lean` used to have blue hair: the mesh now flags the head bone's vertices of a skin or hair hue, and its
+dark greys, as the model's own colours, `avatar::identity::head_colour_is_own`; the same colours on the shoes or the
+suit are still cloth, and a cap's white or a hood's blue is cloth too); white, grey and black colours fall back to the old multiplicative look, and a model without an identity
 is drawn bit for bit as it always was (enemies, canon models, non-player characters, effects and fades are
 untouched). A CPU mirror of the look is the test oracle and the shader agrees with it on 99.6% of 110 116 body
 pixels (the rest are face decals); an sRGB target and a plain one show one picture (99.89% of pixels within 4
@@ -334,13 +340,33 @@ colour of the player each member is, the same look: a blue player's placeholder 
 skin, an orange player's is orange (a colour that is not known yet, for instance before that player's snapshot
 arrived, leaves the model as it was and is picked up as soon as it is). Limits: pure black cloth (all channels 0) only gets a very dark shade of the colour (near-black cloth,
 which is what the models contain, is lifted plainly); an orange or peach colour sits near skin hue, so those
-players' pastel clothes stay told apart from their skin by saturation and brightness only; and the `sturdy`
-body's covered face (red eyes and a brown visor are ordinary coloured polygons, not face decals) is repainted with
-the rest, so its eyes turn pale. The pictures come from the real-data tests (`cargo test -p fmv-client --
+players' pastel clothes stay told apart from their skin by saturation and brightness only; and a head's cap, hood or
+helmet that is grey, white or a cool colour is repainted with the clothes (the `sturdy` body's hood is; its visor and
+red marks are on the head bone, in warm and dark colours, and keep their own). The pictures come from the real-data tests (`cargo test -p fmv-client --
 --ignored offscreen_field_identity --test-threads=1`, `offscreen_battle_identity_before_after`, with
 `FMV_FF7_LIBRARY` and `FMV_SHOT_DIR`): each body in four colours as untinted | old | new from one frame, a 1920x1080
 overview, and the battle before and after from one scene at one instant (54 339 pixels differ, all of them on the
 two players' bodies: the canon pair, the enemies and every weapon are bit for bit as they were).
+
+*Faces and scale of the field models (measured 2026-11-09).* Every character of `char.lgp`, the cast and the
+three placeholder bodies alike, gets its face from three decals on the head bone: two eye quads (the same eye
+twice) and a mouth. The data shifts a decal's texture coordinates by whole numbers (the right eye's `u` runs 1.00 to
+1.97, a mouth's `v` 5.00 to 5.94), which the game's wrap-around addressing ignores; this client's sampler
+clamps (so a decal at the edge of its texture does not blend with the opposite edge), and a clamped coordinate past
+1 reads the transparent edge, so **the right eye and the mouth of every model were not drawn: one eye, Cloud's included**. The
+mesh merge (`avatar::mesh`) now takes the whole number off a textured part whose coordinates lie in one cell (a part that
+really tiles is left as it was): every model has both eyes and its brows, in the field and in battle (the extras'
+mouth textures are blank in the data, as `lean`'s and `slight`'s are; Cloud's has a mouth and has one now). The
+`sturdy` body's face is covered by a visor by design. The bodies are the cast's size: the idle pose is 28.7
+(`lean`), 30.4 (`sturdy`) and 29.2 (`slight`) model units against Cloud's 33.2 (86%, 91%, 88%; Tifa is 86%, Yuffie 80%)
+and Jessie's 30.8, and every model is drawn at the field's one model scale, so at one place the bodies are 82 to 86% of
+Cloud and 92 to 97% of Jessie on the screen (in battle 0.86, 0.88 and 0.91 of Cloud's battle model for `lean`, `slight` and
+`sturdy`); a player who looks a
+quarter taller than a character stands nearer to the camera. `slight`'s orange skin (255,131,80) is the model's own
+colour (a tanned beach extra), kept by the colour look; it is not the tint. The pictures are
+`offscreen_field_lineup_bodies_beside_cloud_and_an_npc` (Cloud, the field's character and the three bodies at one
+spot, front and three-quarter, their own colours over the player look, orange and blue) and the numbers
+`real_looks_survey_heights_parts_and_faces`; `fmv_ff7::playable` has the table.
 
 The picture of an FF7 field is drawn **tile by tile with a depth
 per tile**, in the same depth-tested pass as the models, as the game does it: a layer-2 tile is
@@ -1044,6 +1070,56 @@ exact v7- and v8-shaped state directories before and after and require every fil
 (and the lock) byte for byte identical, a dry run that writes nothing, and the refusal while locked. The tool ships
 in the release package next to `fmv-server`.
 
+**Deleting a character, and getting it back.** A player deletes a character from the character menu (**Del**, then
+**Y**; see "Character menu"): the client asks the server with the character's own login token, so only the one who holds
+the token can, and the server never deletes a character that is in the world. The delete is **soft**:
+
+```
+<state-dir>/trash/<UTC time>-<account id>/      e.g. trash/20261109T165905Z-7/
+    manifest.json                               who, when (unix and UTC text), and the files the entry holds
+    accounts/7.json  avatars/3.json  characters/7.json
+    progression/7/Ff7.json  progression/7/Ff7.character.json     the records exactly as they were
+```
+
+The account's records are moved there, its name is free at once (anyone can register it, and gets a fresh character with
+nothing of the old one), its token is void and its account id is retired for good (ids only grow). Nothing of any other
+account is read, written or moved. The commit is one synced `release` entry of `index.log` (the entry an orphan's release
+writes), between a plan written first and the file moves done after it, so the index and the files agree at every instant
+a crash can stop at: opening the store finishes a delete whose entry was written and abandons one whose entry was not
+(`fmv-persist`'s `store/trash.rs` has the argument and `store/trash/tests.rs` builds every crash state). With the server
+STOPPED, an operator can do the same and undo it (the same state directory argument as `restyle`):
+
+```
+target/release/fmv-characters <state-dir> delete  <account-id|name> [--dry-run]
+target/release/fmv-characters <state-dir> trash
+target/release/fmv-characters <state-dir> restore <trash-entry|account-id|name> [--dry-run]
+```
+
+`delete` frees a name whose player has no token, or removes a character by hand; it hashes every file of the state
+directory before and after and fails the run if anything but the account's own records, `index.log` and the trash
+differs (`moved: accounts/7.json (sha256 ...) -> trash/.../accounts/7.json, the same bytes`, then `N other file(s) and M
+director(ies): byte for byte unchanged`). `trash` lists the entries (name, character, when, files, state). `restore` brings
+an entry back as a **new** account: the name must still be free (else it is refused and nothing changes), the character
+gets a new account id and avatar id (the old ones are retired and the index refuses to replay a smaller id), every record
+that carries an id is re-keyed, the account is marked claimed (it is nobody's orphan) and gets a **new token, printed once**
+(the client forgot the old one when it deleted); the player puts it in `accounts/<server>.<name>.token` of the client's state
+directory, two lines: the token, then `name=<display name>`. The entry is renamed `.restored-<new id>` and cannot be restored
+twice. `--dry-run` runs the same checks and writes nothing. Exit codes as `restyle`. Snapshots (`Store::snapshot`) are
+rollback images of the live records and do not copy the trash. `scripts/delete-smoke.sh` runs all of it over real
+processes on the FIXTURE server (no game data, temp state only): a character in the game is refused; one that left is
+deleted on the server with its own token (its records in the trash byte for byte, every other file unchanged but for
+`index.log`); its name registers again as a different account; its old token is refused, also after a server restart;
+and `fmv-characters restore` gives another deleted character back with a new token that logs in.
+
+**Wire (added after v14; the integrator bumps the version).** `ClientMsg::DeleteCharacter { protocol_version, client_build,
+token }` is the first message of its own connection instead of `Hello`; the server answers `ServerMsg::CharacterDeleted
+{ name }` and closes, or `Reject`: `InvalidToken` (the server does not know the login: nothing to delete, the client forgets it
+locally, which also settles a delete whose answer was lost), `AlreadyOnline` (the character is in the world, from any computer:
+nothing deleted), `ProtocolMismatch`, `RateLimited` (a delete of the same character is under way) or `Internal`. A login that
+authenticated before a delete cannot join after it: the accounts a run deleted are tombstones checked under the world lock by
+every join. The server logs `character deleted: its records are in the trash and its name is free` with the account, the
+trash entry and the file count.
+
 **Protocol v8** (`fmv-protocol`) carries all of the above; its module docs describe the flow,
 and golden JSON tests pin the wire format (the engine's own event, command and outcome types
 included). v8 replaced `Hello`'s colour and look by the character to create (`Hello::character`:
@@ -1300,7 +1376,8 @@ UNKNOWN placeholders; see `deploy/README.md`.
 <state>/library/     owned-content library (fmv-import): blobs and one manifest per edition (the music and
                      sound files included)
 <state>/server/      the server's accounts, avatar profiles, player characters (characters/, v8),
-                     progression and character progress (LOCK = single writer)
+                     progression and character progress (LOCK = single writer); trash/ holds the
+                     records of deleted characters, one timestamped entry each (made by the first delete)
 <state>/client/      a client's saved login tokens: accounts/<server>.token (mode 0600), and next to
                      each one a display-only note of how that character looked when last seen
                      (accounts/<server>.<name>.look: tint and look, no secret; safe to delete)

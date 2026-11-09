@@ -596,6 +596,45 @@ fn offscreen_field_lineup_bodies_beside_cloud_and_an_npc() {
         if view_name == "front" {
             heights = players.iter().zip(&boxes).map(|((label, _), b)| (label.clone(), b.3 - b.1)).collect();
         }
+        // BOTH EYES: seen from the front, the model's own colours, the two eye quads each show their dark texels (pupil,
+        // lashes, brow), about as many on each side. One of them used to show none (the second eye of every model was not
+        // drawn: its texture coordinates are shifted by a whole number, see `mesh::whole_cell_offsets`).
+        if view_name == "front" && colour == "blue" {
+            let cam = Camera::fit(&none.bounds, W1 as f32, H1 as f32, MARGIN_PX);
+            for ((label, _), frame) in players.iter().zip(&frames) {
+                let model = &frame.models[0];
+                let img = render(&mut gpu, &fx, &dressed(frame, Look::Plain), false);
+                // The textured parts in file order: the right eye, the left eye and the mouth (the covered face of `sturdy` has only a mouth).
+                let (mut base, mut eyes) = (0usize, Vec::new());
+                for part in &model.asset.character.model.parts {
+                    let vertices = model.positions.get(base..base + part.positions.len()).unwrap_or(&[]);
+                    if part.texture.is_some() && eyes.len() < 2 && !vertices.is_empty() {
+                        let projected: Vec<(f32, f32)> = vertices.iter().map(|p| project_pixel(&cam, frame.zoom, W1, H1, *p)).collect();
+                        let lo = projected.iter().fold((f32::MAX, f32::MAX), |a, p| (a.0.min(p.0), a.1.min(p.1)));
+                        let hi = projected.iter().fold((f32::MIN, f32::MIN), |a, p| (a.0.max(p.0), a.1.max(p.1)));
+                        eyes.push((lo, hi));
+                    }
+                    base += part.positions.len();
+                }
+                if eyes.len() < 2 {
+                    eprintln!("{label}: no pair of eyes in the data (a covered face)");
+                    continue;
+                }
+                let dark_in = |(lo, hi): ((f32, f32), (f32, f32))| -> usize {
+                    (lo.1.floor().max(0.0) as u32..hi.1.ceil().min(H1 as f32) as u32)
+                        .flat_map(|y| (lo.0.floor().max(0.0) as u32..hi.0.ceil().min(W1 as f32) as u32).map(move |x| (x, y)))
+                        .filter(|&(x, y)| {
+                            let at = ((y * W1 + x) * 4) as usize;
+                            img.get(at..at + 3).is_some_and(|p| u32::from(p[0]) + u32::from(p[1]) + u32::from(p[2]) < 230)
+                        })
+                        .count()
+                };
+                let (a, b) = (dark_in(eyes[0]), dark_in(eyes[1]));
+                eprintln!("{label}: dark pixels in the two eye quads: {a} and {b}");
+                assert!(a >= 15 && b >= 15, "{label}: both eyes are drawn ({a} and {b} dark pixels)");
+                assert!(a.min(b) as f32 >= 0.4 * a.max(b) as f32, "{label}: the two eyes are about as visible as each other ({a} and {b})");
+            }
+        }
         let mut rows = Vec::new();
         for look in [Look::Plain, Look::New] {
             let panels: Vec<Img> = frames
