@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/battle-smoke.sh - shared-battle smoke test for fmv-server + fmv-client (protocol v10).
 #
-# Usage: scripts/battle-smoke.sh [--fixture|--random|--progress|--commands|--solo|--status] [--release|--debug]
+# Usage: scripts/battle-smoke.sh [--fixture|--random|--progress|--commands|--solo|--status|--boss] [--release|--debug]
 #                                [--bin-dir DIR] [--build] [--library STATE_DIR] [--duration SECS]
 #                                [--formation ID] [--tick-rate TPS] [--battle-speed N] [--seed N]
 #                                [--bot idle|circle] [--keep-logs] [-h|--help]
@@ -176,6 +176,24 @@
 #   * the flag is refused by the real binary without --debug-encounters and for `frog` and `haste,slow` (exit code 2).
 # The battle may be won or lost (Poison on the whole party is deadly): either is a fine outcome for what this checks.
 #
+# --boss (real data): the BOSS of the first reactor, the real Guard Scorpion (formation 324: the only formation of the game's own
+# scene.bin that has it; the real-data test `a_guard_scorpion_fight_with_its_counters_is_replayed_exactly_by_a_client_engine` finds
+# it by name and asserts the number this script hard-codes). Its AI scripts play an eight-turn cycle, and from the fifth turn its
+# tail is up: every blow struck at it is then answered by its Tail Laser, a COUNTER script that runs inside the very command that
+# provoked it (on the whole party). The canon Cloud and Barret (commanded by the server) and the two bots fight it at level 8
+# (--battle-level), the bots defending twice and then fighting (`--battle-script defend,defend`; FMV_SMOKE_BOSS_SCRIPT changes it),
+# at the smoke's pace. The mode FAILS unless:
+#   * both bots exit 0, entered the same single battle (formation 324, the one enemy), replayed it from their own scene.bin and
+#     kernel.bin and matched ("verified by replay") with 0 divergences: the scripts, their counters and every draw they make are
+#     part of what the bots replayed, so a client that played them differently than the server diverges;
+#   * the server logged `counter battle=N actor=I attack=A` for every enemy attack that answered a command (the enemy is actor 4,
+#     behind the canon pair and the bots), at least one of them the Tail Laser (attack 286, the id the real-data test
+#     `guard_scorpion_answers_a_blow_with_its_tail_laser_only_while_its_tail_is_up` pins), and its "battle ended" line says
+#     counters=<that number>;
+#   * each bot counted the same: its `battle: counter: battle#N counters=K` line and its `battle: counter: actor=I attack=A` notes
+#     are EXACTLY the server's (the events travelled whole), the Tail Lasers among them.
+# The battle may be won or lost: either is a fine outcome for what this checks (at level 8 it is won about 39 times in 40).
+#
 # Isolation (the owner's state directory is never touched, only its LIBRARY is read): the server and
 # the clients run with XDG_DATA_HOME/XDG_STATE_HOME/XDG_CONFIG_HOME/XDG_CACHE_HOME and FMV_STATE_DIR
 # pointing into a throw-away directory, the server with --ephemeral, each client with its own
@@ -207,6 +225,8 @@ BATTLE_DURATION=40
 # an explicit --duration still wins.
 PROGRESS_DURATION=16
 DURATION_SET=0
+# 1 once --formation was given (--boss then fights that formation instead of the Guard Scorpion's).
+FORMATION_SET=0
 # The debug formation of the modes that need every bot to act (default, --progress, --commands): formation 12 of the game's
 # own data, two enemies, escapable, won every time with every player acting in 200 of 200 seeds beside the canon Cloud and
 # Barret (crates/fmv-server/tests/battle_real.rs, `the_smoke_formation_is_won_every_time_with_every_player_acting_...`).
@@ -239,10 +259,20 @@ STATUS_SCRIPT_A="${FMV_SMOKE_STATUS_SCRIPT_A:-magic:0,defend,item:0,magic:0}"
 STATUS_SCRIPT_B="${FMV_SMOKE_STATUS_SCRIPT_B:-magic:0,item:0,defend}"
 STATUS_NAMES=()
 STATUS_COUNT=0
+# --boss: the Guard Scorpion's formation, the level the fight is pinned to (--battle-level), the attack id of its Tail Laser
+# counter, how long the bots run and the script they follow (fmv-client --battle-script syntax: they defend twice, then play as
+# --battle-auto does; overridable with FMV_SMOKE_BOSS_SCRIPT). Measured at the engine level over 40 seeds at this pace
+# (crates/fmv-server/tests/battle_real.rs, `the_boss_smoke_fight_answers_with_the_tail_laser_in_every_seed`): at level 8 with two
+# defends the Tail Laser fires in every fight and the party wins nearly all of them; the starting level 6 loses about one in six.
+BOSS_FORMATION=324
+BOSS_LEVEL=8
+BOSS_COUNTER_ATTACK=286
+BOSS_DURATION=16
+BOSS_SCRIPT="${FMV_SMOKE_BOSS_SCRIPT:-defend,defend}"
 
 usage() {
   cat <<'EOF'
-Usage: scripts/battle-smoke.sh [--fixture|--random|--progress|--commands|--solo|--status] [--release|--debug]
+Usage: scripts/battle-smoke.sh [--fixture|--random|--progress|--commands|--solo|--status|--boss] [--release|--debug]
                                [--bin-dir DIR] [--build] [--library STATE_DIR] [--duration SECS]
                                [--formation ID] [--tick-rate TPS] [--battle-speed N] [--seed N]
                                [--bot idle|circle] [--keep-logs] [-h|--help]
@@ -276,6 +306,12 @@ mode passes when the server announced every status (its `status inflicted` lines
 bots' rosters and status notes say the same and their counts of the status events equal the server's, and both
 bots replayed the whole battle from their own data with 0 divergences; the flag must also be refused without
 --debug-encounters and for what a battle cannot start with.
+--boss: the real Guard Scorpion (formation 324) fought at level 8 by the canon Cloud and Barret and the two bots (who
+defend twice and then fight; FMV_SMOKE_BOSS_SCRIPT changes the script): once its tail is up every blow is answered by
+its Tail Laser, a counter script that runs inside the command that provoked it. The mode passes when the server logged
+at least one such counter (`counter battle=.. actor=.. attack=286` and `counters=N` on its end line), both bots counted
+the same ones, and both replayed the whole battle, counters included, from their own data with 0 divergences. Won or
+lost does not matter.
 
   --library DIR     state directory that contains library/ (default $FMV_FF7_LIBRARY, else
                      ~/.local/share/ff-multiverse); only the library is read, never written
@@ -1922,6 +1958,173 @@ run_status() {
   say "PASS: the statuses ($STATUS_LIST on the canon pair and both bots) were applied by the real server, announced to both bots and replayed by each from its own battle data with 0 divergences (the clients' counts of the status events equal the server's: $counts); the flag is refused without --debug-encounters and for what a battle cannot start with; $state_real unchanged ($after)"
 }
 
+# check_boss_phase <run>: the checks of the one run of both bots of --boss (see the header): clean exit, one battle of the
+# boss's formation that both entered, replayed from their own data and matched with 0 divergences, and the counters they were
+# told of (BOSS_CLIENT_COUNTERS[n] = "<all of them> <the Tail Lasers among them>", for the comparison with the server's).
+check_boss_phase() {
+  local run="$1" n log smoke_line line value all lasers
+  local -a ids=()
+  for n in "${CLIENT_NAMES[@]}"; do
+    log="$WORK/client-$n.$run.log"
+    if [[ ${CRC[$n]:-} == timeout ]]; then
+      problem "$run: client $n was still running ${CLIENT_GRACE}s after its duration and was killed"
+    elif [[ ${CRC[$n]:-} != 0 ]]; then
+      problem "$run: client $n exited with status ${CRC[$n]:-unknown}"
+    fi
+    if ! smoke_line=$(last_line_with "$log" "SMOKE name="); then
+      problem "$run: client $n printed no SMOKE line"
+      continue
+    fi
+    smoke_line=$(strip_ansi "$smoke_line")
+    SMOKE_LINES+=("$run client $n: $smoke_line")
+    for value in "party=2" "battles=1"; do
+      [[ $smoke_line == *" $value "* ]] || problem "$run: client $n: the SMOKE line lacks $value: $smoke_line"
+    done
+    [[ $(field "$smoke_line" fixture) == false ]] || problem "$run: client $n: fixture is not false: $smoke_line"
+    if log_has "$log" "DIVERGENCE"; then
+      problem "$run: client $n reported a BATTLE DIVERGENCE (its replay disagreed with the server)"
+    fi
+    # The bot REPLAYED the whole battle from its own scene.bin/kernel.bin, the scripts' counters included, and matched.
+    check_mirror "$n ($run)" "$log" 1
+    ids+=("$(battle_id_of "$log" || true)")
+    line=$(strip_ansi "$(last_line_with "$log" "started: formation" || true)")
+    [[ $line == *"started: formation $FORMATION,"* ]] || problem "$run: client $n did not start a battle of formation $FORMATION: $line"
+
+    # The counters it was told of: a note for each (and how many of them were the Tail Laser), and the count of the battle.
+    all=$(count_lines_with "$log" "battle: counter: actor=")
+    lasers=0
+    while IFS= read -r line || [[ -n $line ]]; do
+      [[ $line == *"battle: counter: actor="* ]] || continue
+      line=$(strip_ansi "$line")
+      if [[ $(field "$line" attack) == "$BOSS_COUNTER_ATTACK" ]]; then
+        lasers=$((lasers + 1))
+      fi
+    done <"$log"
+    line=$(strip_ansi "$(last_line_with "$log" "battle: counter: battle#" || true)")
+    if [[ -z $line ]]; then
+      problem "$run: client $n printed no 'battle: counter: battle#N counters=K' count"
+    else
+      [[ $(field "$line" counters) == "$all" ]] || problem "$run: client $n's count disagrees with its own notes ($all counter notes): $line"
+      BOSS_CLIENT_COUNTERS[$n]="$all $lasers"
+    fi
+  done
+  if [[ -z ${ids[0]:-} || ${ids[0]} != "${ids[1]:-}" ]]; then
+    problem "$run: the bots did not enter the same battle (A: '${ids[0]:-}', B: '${ids[1]:-}')"
+  fi
+  PROGRESS_SUMMARY+=("$run: both bots fought ${ids[0]:-?} (formation $FORMATION, level $BOSS_LEVEL)")
+}
+
+# run_boss (real data): the BOSS of the first reactor over real processes (see the header): the real Guard Scorpion, whose tail-up
+# Tail Laser is a counter script that the engine runs inside the command that provoked it. The server pins the level
+# (--battle-level) and the formation (--debug-formation); the canon pair and the two bots fight it, the bots defending first
+# (--battle-script). The mode FAILS unless the bots replayed the battle with 0 divergences, the server announced at least one Tail
+# Laser counter (`counter battle=N actor=I attack=A` lines, `counters=N` on its end line) and both bots counted the same ones.
+run_boss() {
+  local state_real="$LIBRARY"
+  [[ -d $state_real/library/sets ]] || {
+    err "no library under $state_real (needs owned FF7 content imported with fmv-import); pass --library STATE_DIR"
+    exit 1
+  }
+  local before after
+  before=$(ls -A -- "$state_real" | sort | tr '\n' ' ')
+  ((FORMATION_SET)) || FORMATION=$BOSS_FORMATION
+
+  mkdir -p -- "$WORK/lib-state" "$WORK/state-env" "$WORK/server-state" "$WORK/client-A" "$WORK/client-B"
+  ln -s -- "$(cd -- "$state_real" && pwd -P)/library" "$WORK/lib-state/library"
+  export FMV_STATE_DIR="$WORK/state-env"
+
+  local -a server_args=(--bind 127.0.0.1:0 --ff7-library "$WORK/lib-state" --state-dir "$WORK/server-state"
+    --debug-encounters --no-random-encounters --battle-speed "$BATTLE_SPEED" --battle-tick-rate "$TICK_RATE" --battle-level "$BOSS_LEVEL")
+  server_args+=(--debug-formation "$FORMATION")
+  if [[ -n $SEED ]]; then
+    server_args+=(--battle-seed "$SEED")
+  fi
+  say "starting server: $SERVER_BIN ${server_args[*]}"
+  "$SERVER_BIN" "${server_args[@]}" >"$WORK/server.log" 2>&1 &
+  SERVER_PID=$!
+  wait_ready "$WORK/server.log"
+  say "server READY: $READY_LINE"
+  [[ $(field "$READY_LINE" area) == Ff7/md1stin && $(field "$READY_LINE" fixture) == false ]] || fail "the server is not hosting the real FF7 field md1stin: $READY_LINE"
+
+  local duration=$BATTLE_DURATION
+  ((DURATION_SET)) || duration=$BOSS_DURATION
+  SMOKE_LINES=()
+  declare -gA BOSS_CLIENT_COUNTERS=()
+  say "the battle: formation $FORMATION at level $BOSS_LEVEL, both bots --battle-script $BOSS_SCRIPT (${duration}s)"
+  start_script_bots boss "$duration" "$BOSS_SCRIPT" "$BOSS_SCRIPT"
+  check_boss_phase boss
+
+  # The server's side.
+  local started ended line outcome="" n all=0 lasers=0 wrong_actor=0 counters_told
+  log_has "$WORK/server.log" "was refused by the engine" && problem "the server's own rule gave a command the engine refused: $(last_line_with "$WORK/server.log" "was refused by the engine")"
+  (($(count_lines_with "$WORK/server.log" "battle started battle=") == 1)) || problem "the server started $(count_lines_with "$WORK/server.log" "battle started battle=") battle(s), expected 1"
+  started=$(strip_ansi "$(first_line_with "$WORK/server.log" "battle started battle=" || true)")
+  ended=$(strip_ansi "$(last_line_with "$WORK/server.log" "battle ended battle=" || true)")
+  if [[ -z $started ]]; then
+    problem "the server never logged a battle start"
+  else
+    [[ $(field "$started" formation) == "$FORMATION" ]] || problem "the server's battle was not formation $FORMATION: $started"
+    [[ $(field "$started" enemies) == 1 ]] || problem "the Guard Scorpion's formation has one enemy, the server's start line says enemies=$(field "$started" enemies): $started"
+    [[ $started == *"members=2"* && $(companions_of "$started") == 2 ]] || problem "the battle did not have the canon pair and both bots: $started"
+    [[ $started == *"levels=[$BOSS_LEVEL, $BOSS_LEVEL, $BOSS_LEVEL, $BOSS_LEVEL]"* ]] || problem "the fight was not pinned to level $BOSS_LEVEL for all four fighters (--battle-level): $started"
+  fi
+  if [[ -z $ended ]]; then
+    problem "the server never logged the end of the battle"
+  else
+    outcome=$(field "$ended" outcome)
+    [[ $outcome == Victory || $outcome == Defeat ]] || problem "the server's battle ended in '$outcome', expected Victory or Defeat: $ended"
+  fi
+
+  # Every enemy attack that answered a command, one log line each: the enemy is actor 4 (behind the canon pair and the bots), and
+  # at least one of them is the Tail Laser.
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line == *"counter battle="* ]] || continue
+    line=$(strip_ansi "$line")
+    all=$((all + 1))
+    if [[ $(field "$line" attack) == "$BOSS_COUNTER_ATTACK" ]]; then
+      lasers=$((lasers + 1))
+    fi
+    if [[ $(field "$line" actor) != 4 ]]; then
+      wrong_actor=$((wrong_actor + 1))
+    fi
+  done <"$WORK/server.log"
+  ((lasers >= 1)) || problem "the server logged no Tail Laser counter (attack=$BOSS_COUNTER_ATTACK) among its $all 'counter battle=' line(s): the tail never came up in a fight where a blow was struck, or the counter did not run"
+  ((wrong_actor == 0)) || problem "$wrong_actor 'counter battle=' line(s) are not the enemy's (actor=4): $(last_line_with "$WORK/server.log" "counter battle=" || true)"
+  if [[ -n $ended ]]; then
+    [[ $(field "$ended" counters) == "$all" ]] || problem "the server's end line says counters=$(field "$ended" counters) but it logged $all 'counter battle=' line(s): $ended"
+  fi
+  # The clients' own counts of the battle are the server's, exactly: the events travelled and arrived whole.
+  counters_told="$all $lasers"
+  for n in "${CLIENT_NAMES[@]}"; do
+    [[ ${BOSS_CLIENT_COUNTERS[$n]:-} == "$counters_told" ]] || problem "client $n counted '${BOSS_CLIENT_COUNTERS[$n]:-nothing}' (counters, Tail Lasers) where the server logged '$counters_told'"
+  done
+
+  stop_server
+  after=$(ls -A -- "$state_real" | sort | tr '\n' ' ')
+  [[ $before == "$after" ]] || problem "the library state directory changed: before [$before], after [$after]"
+
+  if ((${#PROBLEMS[@]})); then
+    finish_failed
+  fi
+  for line in "${SMOKE_LINES[@]}"; do
+    say "$line"
+  done
+  for n in "${CLIENT_NAMES[@]}"; do
+    say "boss client $n: $(last_line_with "$WORK/client-$n.boss.log" "headless: battles:" || true)"
+    say "boss client $n: $(last_line_with "$WORK/client-$n.boss.log" "headless: battle script:" || true)"
+    say "boss client $n: $(last_line_with "$WORK/client-$n.boss.log" "battle: counter: battle#" || true)"
+    say "boss client $n: $(last_line_with "$WORK/client-$n.boss.log" "battle: counter: actor=" || true)"
+  done
+  for line in "${PROGRESS_SUMMARY[@]}"; do
+    say "$line"
+  done
+  say "server: $started"
+  say "server: $ended"
+  say "server: $all 'counter battle=' line(s), $lasers of them the Tail Laser, e.g. $(last_line_with "$WORK/server.log" "counter battle=" || true)"
+  RESULT=pass
+  say "PASS: the real Guard Scorpion (formation $FORMATION, level $BOSS_LEVEL) was fought by the canon pair and both bots and ended in $outcome; $all of its attacks answered commands, $lasers of them its Tail Laser (attack $BOSS_COUNTER_ATTACK): the server logged each and counted them on its end line, both bots counted the same, and both replayed the whole battle, counters included, from their own battle data with 0 divergences; $state_real unchanged ($after)"
+}
+
 run_fixture() {
   mkdir -p -- "$WORK/state-env" "$WORK/client-A"
   export FMV_STATE_DIR="$WORK/state-env"
@@ -1968,6 +2171,7 @@ main() {
       --commands) MODE=commands ;;
       --solo) MODE=solo ;;
       --status) MODE=status ;;
+      --boss) MODE=boss ;;
       --release) PROFILE=release ;;
       --debug) PROFILE=debug ;;
       --bin-dir)
@@ -1990,6 +2194,7 @@ main() {
       --formation)
         (($# >= 2)) || usage_error "--formation needs a formation id"
         FORMATION="$2"
+        FORMATION_SET=1
         shift
         ;;
       --seed)
@@ -2032,7 +2237,7 @@ main() {
   fi
   # The scripts of --commands go to `fmv-client --battle-script` as they are: words, ids, ':' and ','.
   local script
-  for script in "$SCRIPT_A" "$SCRIPT_B" "$ESCAPE_SCRIPT" "$STATUS_SCRIPT_A" "$STATUS_SCRIPT_B"; do
+  for script in "$SCRIPT_A" "$SCRIPT_B" "$ESCAPE_SCRIPT" "$STATUS_SCRIPT_A" "$STATUS_SCRIPT_B" "$BOSS_SCRIPT"; do
     [[ $script =~ ^[A-Za-z0-9:,]+$ ]] || usage_error "a smoke script is made of command words, ids, ':' and ',' (see fmv-client --help), got '$script'"
   done
 
@@ -2061,6 +2266,7 @@ main() {
     commands) run_commands ;;
     solo) run_solo ;;
     status) run_status ;;
+    boss) run_boss ;;
     *) run_real ;;
   esac
 }

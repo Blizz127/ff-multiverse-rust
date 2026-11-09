@@ -97,6 +97,7 @@ pub mod battle_model;
 pub mod field;
 pub mod hrc;
 pub mod lgp;
+pub mod links;
 pub mod lzss;
 pub mod model;
 pub mod music;

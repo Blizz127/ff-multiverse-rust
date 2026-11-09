@@ -85,6 +85,10 @@ pub const LINK_C_TO: (f32, f32) = (0.0, -150.0);
 /// With [`RoomsAdapter::with_interactions`], the corners of the hall's press region: OK pressed inside it takes a new
 /// account to [`STORY_ADVANCED`] (point 1; walking through it does nothing).
 pub const PRESS_REGION: [(f32, f32); 4] = [(150.0, 100.0), (250.0, 100.0), (250.0, 160.0), (150.0, 160.0)];
+/// With [`RoomsAdapter::with_interactions`], the corners of the hall's toggle region (point 4): OK pressed inside it takes an
+/// account that has advanced back to a new account's story, a step that is NOT forward (the lift's ride back), and does
+/// nothing for a new account.
+pub const TOGGLE_REGION: [(f32, f32); 4] = [(150.0, 170.0), (250.0, 170.0), (250.0, 230.0), (150.0, 230.0)];
 /// With [`RoomsAdapter::with_interactions`], the corners of the hall's battle region (point 2): coming to it starts
 /// the battle [`BATTLE_FORMATION`], and a WON battle takes a new account to [`STORY_ADVANCED`].
 pub const BATTLE_REGION: [(f32, f32); 4] = [(-300.0, 200.0), (-250.0, 200.0), (-250.0, 250.0), (-300.0, 250.0)];
@@ -410,6 +414,7 @@ impl AreaRuntime for Room {
         if self.interactive {
             let corners = |c: [(f32, f32); 4]| c.iter().map(|&(x, y)| Pos::new(x, y, 0.0)).collect::<Vec<_>>();
             points.push(StoryPoint { id: 1, trigger: StoryTrigger::Press(corners(PRESS_REGION)), label: "hall press region: progress 0 -> 1".into() });
+            points.push(StoryPoint { id: 4, trigger: StoryTrigger::Press(corners(TOGGLE_REGION)), label: "hall toggle region: progress 1 -> 0".into() });
             points.push(StoryPoint { id: 2, trigger: StoryTrigger::Region(corners(BATTLE_REGION)), label: "hall battle region: progress 0 -> 1".into() });
             points.push(StoryPoint { id: 3, trigger: StoryTrigger::Region(corners(LOSING_REGION)), label: "hall losing battle region: progress 0 -> 1".into() });
         }
@@ -449,6 +454,10 @@ impl AreaRuntime for Room {
     }
 
     fn story_advance(&self, progress: &[u8], point: u32) -> Option<StoryStep> {
+        // The toggle region: a step that is not forward, from the advanced story back to a new account's.
+        if self.interactive && !self.is_yard() && point == 4 {
+            return (progress == STORY_ADVANCED).then(|| StoryStep { progress: Vec::new(), summary: "moment=1->0".into() });
+        }
         let exists = self.story
             && if self.is_yard() {
                 (self.scripted && !self.withheld && point == 0) || (self.interactive && point == 0)

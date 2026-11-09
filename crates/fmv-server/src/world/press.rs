@@ -422,6 +422,40 @@ mod tests {
     }
 
     #[test]
+    fn a_press_whose_step_is_not_forward_is_applied_as_the_step_says_and_walking_into_its_region_does_not_press() {
+        use fmv_fixture::rooms::TOGGLE_REGION;
+        let t0 = Instant::now();
+        let (mut w, mut saved) = world();
+        let mut a = seat(&mut w, "A", t0);
+        a.drain();
+        w.take_logs();
+        let mut now = t0;
+        // the press region first: a new account's story moves
+        for (x, y) in [(0.0, 60.0), (100.0, 100.0), (200.0, 130.0), (240.0, 150.0)] {
+            assert_eq!(go(&mut w, &a, x, y, &mut now), MoveOutcome::Applied);
+        }
+        assert_eq!(w.press(a.entity, None, now), PressOutcome::Nothing);
+        assert_eq!(progression(&w, &a), STORY_ADVANCED);
+        // walking into the toggle region is not pressing it
+        assert_eq!(TOGGLE_REGION[0], (150.0, 170.0));
+        assert_eq!(go(&mut w, &a, 240.0, 200.0, &mut now), MoveOutcome::Applied);
+        assert_eq!(progression(&w, &a), STORY_ADVANCED, "standing in the toggle region is not pressing OK");
+        // the press is the ride back: the story the world holds is what the step gives (a new account's), the player is told
+        // with the step, and the saver is handed it (what the store keeps of it is the adapter's merge)
+        a.drain();
+        w.take_logs();
+        assert_eq!(w.press(a.entity, None, now), PressOutcome::Nothing);
+        assert!(progression(&w, &a).is_empty());
+        assert!(a.drain().iter().any(|m| matches!(m, ServerMsg::StoryUpdate { progress, advance: Some(_) } if progress.is_empty())));
+        assert!(log_text(&mut w).contains("point=4 moment=1->0"));
+        assert_eq!(saved_stories(&mut saved), [STORY_ADVANCED.to_vec(), Vec::new()]);
+        // pressing again: a new account's story has nowhere to go back to
+        assert_eq!(w.press(a.entity, None, now), PressOutcome::Nothing);
+        assert!(progression(&w, &a).is_empty());
+        assert!(saved_stories(&mut saved).is_empty(), "nothing more was saved");
+    }
+
+    #[test]
     fn a_player_in_a_battle_is_moved_by_no_link_and_presses_nothing() {
         let t0 = Instant::now();
         let (mut w, _saved) = world();

@@ -657,7 +657,9 @@ fn hammer(section: &[u8], rng: &mut Rng) {
     for entity in 0..script.entity_count().min(4) {
         let _ = availability(&script, entity, &StartOfGame);
         for slot in 0..7 {
-            let mut walk = Walk::script(entity, slot, 1, limits);
+            // once as a conversation, once as a press of OK that follows the movements
+            let base = Walk::script(entity, slot, 1, limits);
+            let mut walk = if slot % 2 == 0 { base } else { base.pressing(KEY_OK).tracking_moves() };
             let mut given = None;
             for _ in 0..40 {
                 let beat = walk.resume(&script, &StartOfGame, given.take());
@@ -736,4 +738,192 @@ fn every_opcode_with_every_filler_is_survived_by_the_walker() {
             hammer(&section, &mut Rng(u64::from(opcode) * 31 + u64::from(filler) + 1));
         }
     }
+}
+
+// ---- the keys, the battle and where characters end up --------------------------------------------
+
+/// `IFKEYON keys` guarding `body`.
+fn if_key_on(keys: u16, body: &[u8]) -> Vec<u8> {
+    let mut v = vec![0x31];
+    v.extend(keys.to_le_bytes());
+    v.push(u8::try_from(body.len() + 1).unwrap());
+    v.extend_from_slice(body);
+    v
+}
+
+/// `JUMP x y triangle height` with literal operands.
+fn jump_to(x: i16, y: i16, triangle: u16, height: i16) -> Vec<u8> {
+    let mut v = vec![0xC0, 0, 0];
+    v.extend(x.to_le_bytes());
+    v.extend(y.to_le_bytes());
+    v.extend(triangle.to_le_bytes());
+    v.extend(height.to_le_bytes());
+    v
+}
+
+/// `LADER x y z triangle` with literal operands (way, animation, direction and speed are arbitrary).
+fn lader(x: i16, y: i16, z: i16, triangle: u16) -> Vec<u8> {
+    let mut v = vec![0xC2, 0, 0];
+    v.extend(x.to_le_bytes());
+    v.extend(y.to_le_bytes());
+    v.extend(z.to_le_bytes());
+    v.extend(triangle.to_le_bytes());
+    v.extend([1, 5, 64, 1]);
+    v
+}
+
+/// `MOVE x y` with literal operands.
+fn move_to(x: i16, y: i16) -> Vec<u8> {
+    let mut v = vec![0xA8, 0];
+    v.extend(x.to_le_bytes());
+    v.extend(y.to_le_bytes());
+    v
+}
+
+/// `AXYZI entity` into the words `Var[6][a]` (x), `Var[6][a + 2]` (y), `Var[6][a + 4]` (z) and `Var[6][t]` (triangle).
+fn axyzi(entity: u8, a: u8, t: u8) -> Vec<u8> {
+    vec![0xC1, 0x66, 0x66, entity, a, a + 2, a + 4, t]
+}
+
+/// `GETAI entity` into the word `Var[6][t]`.
+fn getai(entity: u8, t: u8) -> Vec<u8> {
+    vec![0xB9, 0x06, entity, t]
+}
+
+/// `IFSW Var[bank][addr] <op> right` guarding `body` (the jump skips exactly the body).
+fn if_sw(bank: u8, addr: u8, op: u8, right: i16, body: &[u8]) -> Vec<u8> {
+    let mut v = vec![0x16, bank << 4, addr, 0];
+    v.extend(right.to_le_bytes());
+    v.push(op);
+    v.push(u8::try_from(body.len() + 1).unwrap());
+    v.extend_from_slice(body);
+    v
+}
+
+/// Walk `slot` of `entity` to its end, pressing `keys` and following movements as asked.
+fn walked(section: &[u8], entity: usize, slot: usize, keys: u32, track: bool, env: &dyn StoryVars) -> Walk {
+    let script = FieldScript::parse(section).unwrap();
+    let mut walk = Walk::script(entity, slot, 7, Limits::default()).pressing(keys);
+    if track {
+        walk = walk.tracking_moves();
+    }
+    for _ in 0..100 {
+        if matches!(walk.resume(&script, env, None), Beat::End(_)) {
+            break;
+        }
+    }
+    walk
+}
+
+#[test]
+fn a_key_test_holds_only_for_a_walk_that_presses_the_key_it_asks_for() {
+    // the ladders' test asks for 0x220 (OK is the bit 0x20 of it)
+    let section = one(&[if_key_on(0x220, &setbyte(3, 5, 9))], Vec::new());
+    assert_eq!(walked(&section, 0, 1, 0, false, &StartOfGame).written(3, 5), None, "no key is held unless the walk presses one");
+    assert_eq!(walked(&section, 0, 1, KEY_OK, false, &StartOfGame).written(3, 5), Some(9));
+    assert_eq!(walked(&section, 0, 1, 0x40, false, &StartOfGame).written(3, 5), None, "another key is not OK");
+    // a key let go of is never what a press does: IFKEYOFF skips its body even for a walk that presses OK
+    let off = one(&[vec![0x32, 0x20, 0x00, 0x05], setbyte(3, 6, 1)], Vec::new());
+    assert_eq!(walked(&off, 0, 1, KEY_OK, false, &StartOfGame).written(3, 6), None);
+}
+
+#[test]
+fn a_battle_is_named_by_the_walk_that_reaches_it() {
+    let battle = vec![0x70, 0x00, 0x44, 0x01]; // BATTLE 324
+    let section = one(&[setbyte(3, 1, 1), battle, setbyte(3, 2, 2)], Vec::new());
+    let walk = walked(&section, 0, 1, 0, false, &StartOfGame);
+    assert_eq!(walk.battle(), Some(324));
+    assert_eq!(walk.written(3, 1), Some(1));
+    assert_eq!(walk.written(3, 2), None, "the walk ends at the battle");
+    let none = walked(&one(&[setbyte(3, 1, 1)], Vec::new()), 0, 1, 0, false, &StartOfGame);
+    assert_eq!(none.battle(), None);
+}
+
+/// A line (entity 0) that requests the character (entity 1)'s script 3 when walked on, and its script 4 on OK; script 3
+/// of the character is `script3`, script 4 a jump.
+fn ladder_section(script3: Vec<u8>) -> Vec<u8> {
+    SynthScript::default()
+        .entity("line", vec![(2, cat(&[req(1, 3), vec![RET]])), (4, cat(&[if_key_on(0x220, &req(1, 4)), vec![RET]]))])
+        .entity("pc", vec![(3, [script3, vec![RET]].concat()), (4, [jump_to(11, 22, 3, 17), vec![RET]].concat())])
+        .build()
+}
+
+#[test]
+fn the_movement_opcodes_leave_a_character_where_they_end_and_a_read_back_sees_it() {
+    // a jump onto a ladder top, the climb down, the read-back of where that left the character, and a second jump when
+    // the height read back is above 1000 (it is not: the climb ends at 400)
+    let script3 = cat(&[jump_to(50, 60, 7, 17), lader(70, 80, 400, 9), axyzi(1, 7, 0), if_sw(6, 11, 2, 1000, &jump_to(5, 5, 1, 17))]);
+    let section = ladder_section(script3);
+    let walk = walked(&section, 0, 2, 0, true, &StartOfGame);
+    let spot = walk.spot(1).expect("entity 1 was moved");
+    assert_eq!((spot.x, spot.y, spot.z, spot.triangle, spot.by), (70, 80, Some(400), Some(9), "LADER"));
+    assert_eq!(walk.moves().len(), 2, "the jump and the climb; the second jump was not made");
+    assert_eq!(walk.moves().first().map(|(e, s)| (*e, s.x, s.y, s.z, s.triangle)), Some((1, 50, 60, None, Some(7))));
+    // the read-back filled the words, and the test of the height decided on them
+    assert_eq!((walk.written(6, 7), walk.written(6, 9), walk.written(6, 0)), (Some(70), Some(80), Some(9)));
+    assert_eq!((walk.written(6, 11), walk.written(6, 12)), (Some(0x90), Some(0x01)), "400 = 0x0190");
+    assert!(!walk.unresolved());
+    assert_eq!(walk.spot(0), None, "the line itself was not moved");
+
+    // the same climb ending above the height tested follows the second jump
+    let script3 = cat(&[jump_to(50, 60, 7, 17), lader(70, 80, 1500, 9), axyzi(1, 7, 0), if_sw(6, 11, 2, 1000, &jump_to(5, 5, 1, 17))]);
+    let walk = walked(&ladder_section(script3), 0, 2, 0, true, &StartOfGame);
+    assert_eq!(walk.spot(1).map(|s| (s.x, s.y, s.triangle, s.by)), Some((5, 5, Some(1), "JUMP")));
+    assert_eq!(walk.moves().len(), 3);
+
+    // a walk that does not follow movements ignores all of it, as a conversation always did
+    let plain = walked(&section, 0, 2, 0, false, &StartOfGame);
+    assert_eq!((plain.spot(1), plain.moves().len(), plain.written(6, 7)), (None, 0, None));
+}
+
+#[test]
+fn the_line_that_waits_for_ok_moves_the_character_only_for_a_walk_that_presses_it() {
+    let section = ladder_section(Vec::new());
+    // slot 2 (walked on) requests script 3, which does nothing; slot 4 waits for OK and requests script 4, a jump
+    let walk_on = walked(&section, 0, 2, 0, true, &StartOfGame);
+    assert!(walk_on.moves().is_empty());
+    let idle = walked(&section, 0, 4, 0, true, &StartOfGame);
+    assert!(idle.moves().is_empty(), "nobody pressed OK");
+    let pressed = walked(&section, 0, 4, KEY_OK, true, &StartOfGame);
+    assert_eq!(pressed.spot(1).map(|s| (s.x, s.y, s.triangle)), Some((11, 22, Some(3))));
+}
+
+#[test]
+fn a_read_back_the_walk_cannot_fill_is_marked_and_a_height_hook_fills_it() {
+    // MOVE leaves the height and the triangle to the engine
+    let script3 = cat(&[move_to(30, 40), axyzi(1, 7, 0), getai(1, 3)]);
+    let section = ladder_section(script3);
+    let walk = walked(&section, 0, 2, 0, true, &StartOfGame);
+    assert!(walk.unresolved(), "the height after a MOVE is not known to the walk");
+    assert_eq!((walk.written(6, 7), walk.written(6, 9), walk.written(6, 11)), (Some(30), Some(40), None));
+
+    struct Floor;
+    impl StoryVars for Floor {
+        fn byte(&self, _: u8, _: u8) -> u8 {
+            0
+        }
+        fn party_member(&self, _: u8) -> Option<u8> {
+            None
+        }
+        fn height(&self, x: i32, y: i32, triangle: Option<u16>) -> Option<i32> {
+            assert_eq!((x, y, triangle), (30, 40, None));
+            Some(123)
+        }
+    }
+    let walk = walked(&section, 0, 2, 0, true, &Floor);
+    assert_eq!(walk.written(6, 11), Some(123));
+    assert!(walk.unresolved(), "the triangle after a MOVE is not known either (GETAI)");
+
+    // a read-back of a character the walk never moved has nothing to read
+    let walk = walked(&ladder_section(axyzi(1, 7, 0)), 0, 2, 0, true, &StartOfGame);
+    assert!(walk.unresolved() && walk.written(6, 7).is_none());
+}
+
+#[test]
+fn a_loop_that_moves_a_character_to_the_same_place_is_idle_like_any_other() {
+    // MOVE and jump back, for ever: the walk must end (idle), not run to its budget
+    let looped = cat(&[move_to(1, 2), vec![0x12, 6]]); // JMPB back to the start of the 6-byte MOVE
+    let walk = walked(&ladder_section(looped), 0, 2, 0, true, &StartOfGame);
+    assert!(walk.steps() < 50, "{}", walk.steps());
+    assert_eq!(walk.spot(1).map(|s| (s.x, s.y)), Some((1, 2)));
 }

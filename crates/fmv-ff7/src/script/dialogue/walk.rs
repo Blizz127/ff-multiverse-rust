@@ -31,6 +31,26 @@ impl Default for Limits {
     }
 }
 
+/// The OK button's bit in a key mask (`IFKEYON 0x20` is "OK pressed"; the ladders and the lift's panel ask for 0x220).
+pub const KEY_OK: u32 = 0x20;
+
+/// Most movements a walk keeps in its journal (a script that moves a character more often than this keeps the first).
+const MAX_MOVES: usize = 64;
+
+/// Where the movement opcodes have left a character: the end of the movement, with what the opcode said of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Spot {
+    pub x: i32,
+    pub y: i32,
+    /// The height, when the opcode says it (`XYZI`, `XYZ`, `LADER`); `None` after one that leaves it to the engine
+    /// (`MOVE`, `JUMP`, `XYI`).
+    pub z: Option<i32>,
+    /// The walkmesh triangle the place is on, when the opcode says it (`XYZI`, `XYI`, `JUMP`, `LADER`).
+    pub triangle: Option<u16>,
+    /// Which opcode it was (the mnemonic of the last one that moved the character).
+    pub by: &'static str,
+}
+
 /// A script being run: where it is in each script it requested.
 #[derive(Debug, Clone)]
 struct Frame {
@@ -199,6 +219,21 @@ pub struct Walk {
     gift_not_given: bool,
     /// The added note, waiting to be shown after the canon window that announced the gift.
     queued: Option<Message>,
+    /// The keys the player presses, as a bit mask ([`KEY_OK`]): what `IFKEY` and `IFKEYON` test. 0: none.
+    pressed: u32,
+    /// The walk follows the movement opcodes (see [`Walk::tracking_moves`]); off, they are ignored as they always were.
+    track: bool,
+    /// The first `RET` of the entity's script 0 carries the walk on into its main part instead of ending it (see
+    /// [`Walk::through_init`]).
+    through_init: bool,
+    /// Where the movement opcodes have left each entity, by entity.
+    spots: BTreeMap<usize, Spot>,
+    /// The movements in the order they happened: the entity and where it was left (at most [`MAX_MOVES`]).
+    moves: Vec<(usize, Spot)>,
+    /// The battle a `BATTLE` started, if one did.
+    battle: Option<u16>,
+    /// A read-back (`AXYZI`) could not fill a variable because the walk did not know the place's height.
+    unresolved: bool,
 }
 
 /// The layer of the notes this project adds when a script's effect is not performed.
@@ -237,7 +272,62 @@ impl Walk {
             visible: true,
             gift_not_given: false,
             queued: None,
+            pressed: 0,
+            track: false,
+            through_init: false,
+            spots: BTreeMap::new(),
+            moves: Vec::new(),
+            battle: None,
+            unresolved: false,
         }
+    }
+
+    /// The same walk, with the player pressing the keys of `keys` (a bit mask, [`KEY_OK`] for the OK button) for
+    /// as long as it runs: `IFKEY` and `IFKEYON` answer true for a mask that shares a bit with it (`IFKEYOFF`
+    /// never does). Without this no key is ever held.
+    #[must_use]
+    pub fn pressing(mut self, keys: u32) -> Self {
+        self.pressed = keys;
+        self
+    }
+
+    /// The same walk, running an entity's script 0 as the engine does: the init part and then, after its first `RET`,
+    /// the main part (a loop that waits for something: a panel that waits for OK). A loop that has nothing more to do
+    /// (the press was used up, nothing changed) ends the walk as any idle loop does.
+    #[must_use]
+    pub fn through_init(mut self) -> Self {
+        self.through_init = true;
+        self
+    }
+
+    /// The same walk, following the movement opcodes (`XYZI`, `XYI`, `XYZ`, `MOVE`, `JUMP`, `LADER`) and the read-backs
+    /// (`GETAI`, `AXYZI`). Without this they are ignored, which is what a conversation wants: a character that walks about
+    /// in a loop must not keep a walk from seeing that nothing else changes.
+    #[must_use]
+    pub fn tracking_moves(mut self) -> Self {
+        self.track = true;
+        self
+    }
+
+    /// Where the walk has left `entity` by a movement opcode (`None`: it has not moved it).
+    pub fn spot(&self, entity: usize) -> Option<Spot> {
+        self.spots.get(&entity).copied()
+    }
+
+    /// The movements the walk made, in order: the entity and the place each was left at.
+    pub fn moves(&self) -> &[(usize, Spot)] {
+        &self.moves
+    }
+
+    /// The battle the script started (`BATTLE`), if it got that far.
+    pub fn battle(&self) -> Option<u16> {
+        self.battle
+    }
+
+    /// A read-back of a character's place could not fill its height variable (the walk did not know the height and
+    /// [`StoryVars::height`] did not either): whatever the script decided from it was decided on a guess.
+    pub fn unresolved(&self) -> bool {
+        self.unresolved
     }
 
     /// A walk through the talk script (slot 1) of `entity`.
@@ -369,7 +459,14 @@ impl Walk {
 
     fn arithmetic(&mut self, env: &dyn StoryVars, ins: &Instruction, op: Arith, wide: bool, saturate: bool) {
         let Some(var) = Self::dest(ins, "var") else { return };
-        let cur = if wide { i64::from(self.var_word(env, var.0, var.1)) } else { i64::from(self.var_byte(env, var.0, var.1)) };
+        // (a plain set never looks at what the variable held)
+        let cur = if matches!(op, Arith::Set) {
+            0
+        } else if wide {
+            i64::from(self.var_word(env, var.0, var.1))
+        } else {
+            i64::from(self.var_byte(env, var.0, var.1))
+        };
         let value = i64::from(self.num(env, ins, "value", if wide { Width::S16 } else { Width::U8 }));
         let new = match op {
             Arith::Set => value,
@@ -408,6 +505,56 @@ impl Walk {
             _ => cur ^ mask,
         };
         self.set_byte(bank, byte_at, new);
+    }
+
+    /// `XYZI`, `XYI`, `XYZ`, `MOVE`, `JUMP` and `LADER`: `entity` is left where the instruction says (the movement
+    /// is not timed or animated here: it is its end).
+    fn moved(&mut self, env: &dyn StoryVars, entity: usize, ins: &Instruction) {
+        let has = |name: &str| ins.operand(name).is_some();
+        let x = self.num(env, ins, "x", Width::S16);
+        let y = self.num(env, ins, "y", Width::S16);
+        let z = has("z").then(|| self.num(env, ins, "z", Width::S16));
+        let triangle = if has("triangle") { u16::try_from(self.num(env, ins, "triangle", Width::U16)).ok() } else { None };
+        let spot = Spot { x, y, z, triangle, by: ins.mnemonic };
+        if self.moves.len() < MAX_MOVES {
+            self.moves.push((entity, spot));
+        }
+        // A loop that moves a character to the same place every lap changes nothing, like any other idle loop.
+        if self.spots.insert(entity, spot) != Some(spot) {
+            self.idle.clear();
+        }
+    }
+
+    /// `GETAI` (the triangle) and `AXYZI` (the place) of an entity, into the variables the instruction names, as
+    /// words. Only what the walk knows is written; a read-back it cannot fill (the entity was never moved by the walk,
+    /// or its height is not known) leaves the variable alone and marks the walk [`Walk::unresolved`].
+    fn read_back(&mut self, env: &dyn StoryVars, ins: &Instruction) {
+        let Some(entity) = ins.literal("entity").and_then(|e| usize::try_from(e).ok()) else { return };
+        let Some(spot) = self.spots.get(&entity).copied() else {
+            self.unresolved = true;
+            return;
+        };
+        let word = |v: i32| u16::from_le_bytes(i16::try_from(v).unwrap_or(0).to_le_bytes());
+        if let (Some((bank, address)), Some(triangle)) = (Self::dest(ins, "var_triangle"), spot.triangle) {
+            self.set_word(bank, address, triangle);
+        } else if ins.operand("var_triangle").is_some_and(|o| o.bank != 0) {
+            self.unresolved = true;
+        }
+        if ins.mnemonic != "AXYZI" {
+            return;
+        }
+        if let Some((bank, address)) = Self::dest(ins, "var_x") {
+            self.set_word(bank, address, word(spot.x));
+        }
+        if let Some((bank, address)) = Self::dest(ins, "var_y") {
+            self.set_word(bank, address, word(spot.y));
+        }
+        if let Some((bank, address)) = Self::dest(ins, "var_z") {
+            match spot.z.or_else(|| env.height(spot.x, spot.y, spot.triangle)) {
+                Some(z) => self.set_word(bank, address, word(z)),
+                None => self.unresolved = true,
+            }
+        }
     }
 
     fn random(&mut self) -> u8 {
@@ -545,7 +692,7 @@ impl Walk {
         let op = ins.opcode;
         match op {
             0x00 => {
-                if self.quiet && !self.passed_init && self.frames.len() == 1 {
+                if (self.quiet || self.through_init) && !self.passed_init && self.frames.len() == 1 {
                     // The main part of script 0 follows the first RET.
                     self.passed_init = true;
                     return Flow::Continue;
@@ -594,8 +741,19 @@ impl Walk {
                 let holds = compare(ins.literal("op").unwrap_or(-1), left, right, bits);
                 self.branch(&ins, holds)
             }
-            // No key is ever held: the body of a key test is skipped.
-            0x30..=0x32 => self.branch(&ins, false),
+            // The keys the walk presses (none unless asked to: `Walk::pressing`): `IFKEY` and `IFKEYON` hold when one
+            // of the keys they ask for is among them, `IFKEYOFF` (a key let go of) never does.
+            0x30..=0x32 => {
+                let asked = ins.literal("keys").and_then(|k| u32::try_from(k).ok()).unwrap_or(0);
+                let holds = op != 0x32 && asked & self.pressed != 0;
+                // `IFKEYON` is the frame the key goes down: the press is used up by the first test that sees it (a loop
+                // that polls the key runs its body once for one press)
+                if holds && op == 0x31 {
+                    self.pressed &= !asked;
+                    self.idle.clear();
+                }
+                self.branch(&ins, holds)
+            }
             0x20 => Flow::End(End::MiniGame),
             0x40 => {
                 let (Some(window), Some(dialog)) = (ins.literal("window"), ins.literal("dialog")) else { return Flow::Continue };
@@ -616,7 +774,20 @@ impl Walk {
                 Flow::Continue
             }
             0x60 => Flow::End(End::MapJump { field: ins.literal("field").and_then(|f| u16::try_from(f).ok()).unwrap_or(0) }),
-            0x70 => Flow::End(End::Battle),
+            0x70 => {
+                self.battle = u16::try_from(self.num(env, &ins, "battle", Width::U16)).ok();
+                Flow::End(End::Battle)
+            }
+            // The movement opcodes: a character is left where the movement ends.
+            0xA5..=0xA8 | 0xC0 | 0xC2 if self.track => {
+                self.moved(env, frame.entity, &ins);
+                Flow::Continue
+            }
+            // GETAI and AXYZI read a character's place back into variables.
+            0xB9 | 0xC1 if self.track => {
+                self.read_back(env, &ins);
+                Flow::Continue
+            }
             0x74 => {
                 // GETPC: the character in a party slot (0xFF for none).
                 let slot = ins.literal("party").and_then(|s| u8::try_from(s).ok()).unwrap_or(u8::MAX);
@@ -707,6 +878,37 @@ fn prelude(script: &FieldScript<'_>, env: &dyn StoryVars, entity: usize, limits:
 /// [`prelude`] for callers that only want the verdict.
 pub fn availability(script: &FieldScript<'_>, entity: usize, env: &dyn StoryVars) -> Availability {
     prelude(script, env, entity, Limits::default()).0
+}
+
+/// What a whole conversation did to the variables, see [`run_talk`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TalkRun {
+    /// The variables the talk script wrote, as `(bank, address)` to byte, besides what the character's own set-up
+    /// (the init and main part, run first) had already written.
+    pub writes: BTreeMap<(u8, u8), u8>,
+    /// How the conversation ended.
+    pub end: End,
+}
+
+/// Run the whole conversation with `entity` (every window handed on without an answer, so a question takes its
+/// cursor's starting line) and report what it wrote: the character's own set-up decides first whether it can be
+/// talked to in the story `env` tells (as [`TalkSession::talk`] does), then its talk script runs to its end.
+pub fn run_talk(script: &FieldScript<'_>, entity: usize, env: &dyn StoryVars, seed: u32) -> Result<TalkRun, TalkError> {
+    if entity >= script.entity_count() {
+        return Err(TalkError::NoSuchEntity);
+    }
+    let (verdict, setup) = prelude(script, env, entity, Limits::default());
+    if !(verdict.talkable && verdict.visible) {
+        return Err(TalkError::NotTalkable);
+    }
+    let mut walk = Walk::talk(entity, seed, Limits::default()).with_writes(setup.clone());
+    let end = loop {
+        if let Beat::End(end) = walk.resume(script, env, None) {
+            break end;
+        }
+    };
+    let writes = walk.writes.into_iter().filter(|(key, value)| setup.get(key) != Some(value)).collect();
+    Ok(TalkRun { writes, end })
 }
 
 /// Why a conversation could not be started.

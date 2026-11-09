@@ -83,6 +83,13 @@
 //!   Whatever the engine announces about statuses is logged as `status inflicted battle=.. actor=.. status=..` and
 //!   `status ended battle=.. actor=.. status=..` (a Poison or Regen turn is only counted: the `battle ended` line ends with
 //!   `status_inflicted=N status_ended=N status_ticks=N`).
+//! * **Counters.** An enemy with scripts answers a blow with its counter scripts (`fmv_ff7_battle::ai`, "Counters"), inside
+//!   the very command that provoked it: the enemy's attacks come in that command's `BattleEvent` right after the
+//!   command's own. The server counts every enemy attack in the events of a COMMAND (`Battle::note_counters`: submitting a
+//!   command never advances the clock, so an enemy that acts in its batch is answering it) and logs each as
+//!   `counter battle=.. actor=.. attack=..`; the `battle ended` line ends with `counters=N`. A Death counter that the clock
+//!   runs (an enemy killed by a turn of Poison) comes in a step's events and is not counted. `scripts/battle-smoke.sh --boss`
+//!   reads these lines (the real Guard Scorpion's Tail Laser).
 //! * **`--debug-bonus-exp N` and `--debug-bonus-limit N`** (`BattleSettings::debug_bonus_exp` /
 //!   `debug_bonus_limit`, debug flags that need `--debug-encounters` and which `main` refuses to run on the default
 //!   state directory, or together with `--debug-limit-full`): they exist so that a smoke run over real processes can
@@ -136,7 +143,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use fmv_adapter_api::{AreaRuntime, EncounterTable};
 use fmv_core::{AccountId, EntityId};
 use fmv_ff7_battle::rng::Rng;
-use fmv_ff7_battle::rules::{ActorId, BattleEvent, BattleState, Combatant, Command, CommandError, Outcome, Target, MAX_STEP_MS};
+use fmv_ff7_battle::rules::{ActionRef, ActorId, BattleEvent, BattleState, Combatant, Command, CommandError, Outcome, Target, MAX_STEP_MS};
 use fmv_ff7_battle::status::StatusSet;
 use fmv_protocol::{
     assign_drops, clip_character_name, reward_roster, split_rewards, AppliedCommand, BattleId, BattleMember, BattleRejection, BattleReward,
@@ -201,6 +208,8 @@ struct Battle {
     /// The story step this battle is the price of, applied when it is won (a battle a story point starts first); `None`
     /// for an encounter.
     then: Option<StoryThen>,
+    /// How many enemy attacks answered a command (see [`Battle::note_counters`]; logged when the battle ends, and one by one).
+    counters: u32,
 }
 
 /// How a set of statuses reads in a log line: the names joined by `+`, or `-` for none (one token, so that a list of
@@ -229,6 +238,22 @@ impl Battle {
                 }
                 BattleEvent::StatusTick { .. } => self.status_counts[2] += 1,
                 _ => {}
+            }
+        }
+        lines
+    }
+
+    /// Count the enemy attacks among `events`, the events of ONE COMMAND's batch, and say each as a log line:
+    /// `counter battle=.. actor=.. attack=..`. Every enemy attack in such a batch is a counter, an enemy script's answer to
+    /// the blow: submitting a command never advances the clock (an enemy's own turn only ever comes with a step), so an
+    /// enemy that acts inside a command's batch is answering that command. (A Death counter that the CLOCK runs, after a
+    /// turn of Poison killed its enemy, comes in a step's events and is not in this count.)
+    fn note_counters(&mut self, id: BattleId, events: &[BattleEvent]) -> Vec<String> {
+        let mut lines = Vec::new();
+        for event in events {
+            if let BattleEvent::Action { actor, action: ActionRef::EnemyAttack(attack) } = event {
+                self.counters += 1;
+                lines.push(format!("counter battle={} actor={} attack={attack}", id.0, actor.0));
             }
         }
         lines
@@ -624,6 +649,7 @@ impl World {
                 seed,
                 status_counts: [0; 3],
                 then,
+                counters: 0,
             },
         );
         for entity in &entities {
@@ -734,7 +760,9 @@ impl World {
                     )),
                     _ => None,
                 };
-                let status_notes = battle.note_statuses(battle_id, &events);
+                // What the engine announced about statuses, and the counters that answered this command.
+                let mut event_notes = battle.note_statuses(battle_id, &events);
+                event_notes.extend(battle.note_counters(battle_id, &events));
                 let msg = ServerMsg::BattleEvent {
                     battle_id,
                     tick: battle.state.tick(),
@@ -745,7 +773,7 @@ impl World {
                 if let Some(note) = note {
                     self.logs.info(note);
                 }
-                for line in status_notes {
+                for line in event_notes {
                     self.logs.info(line);
                 }
                 self.fan_to(&recipients, Arc::new(msg));
@@ -871,14 +899,15 @@ impl World {
                             actor.0,
                             describe_command(&command, limit_id)
                         );
-                        let status_notes = battle.note_statuses(id, &events);
+                        let mut event_notes = battle.note_statuses(id, &events);
+                        event_notes.extend(battle.note_counters(id, &events));
                         let msg = ServerMsg::BattleEvent {
                             battle_id: id,
                             tick: battle.state.tick(),
                             events,
                             command: Some(AppliedCommand { actor, command }),
                         };
-                        Ok((note, status_notes, msg, battle.state.outcome().is_some(), battle.connected()))
+                        Ok((note, event_notes, msg, battle.state.outcome().is_some(), battle.connected()))
                     }
                     // Not reachable (the rule only picks what `check_command` accepts, in the same state): said loudly
                     // and the round ends rather than trying the same thing again.
@@ -886,9 +915,9 @@ impl World {
                 }
             };
             match acted {
-                Ok((note, status_notes, msg, ended, recipients)) => {
+                Ok((note, event_notes, msg, ended, recipients)) => {
                     self.logs.info(note);
-                    for line in status_notes {
+                    for line in event_notes {
                         self.logs.info(line);
                     }
                     self.fan_to(&recipients, Arc::new(msg));
@@ -931,7 +960,7 @@ impl World {
         // `members` counts the PLAYERS (as it always did); `commands` and `limits` have one entry per fighter in actor
         // order, the `companions` canon companions first.
         self.logs.info(format!(
-            "battle ended battle={} outcome={outcome:?} ticks={} members={} commands={:?} limits={:?} companions={} status_inflicted={} status_ended={} status_ticks={}",
+            "battle ended battle={} outcome={outcome:?} ticks={} members={} commands={:?} limits={:?} companions={} status_inflicted={} status_ended={} status_ticks={} counters={}",
             id.0,
             battle.state.tick(),
             battle.members.iter().filter(|m| m.info.is_player()).count(),
@@ -941,6 +970,7 @@ impl World {
             battle.status_counts[0],
             battle.status_counts[1],
             battle.status_counts[2],
+            battle.counters,
         ));
         let told = self.pay_members(id, &battle.members, &rewards);
         self.keep_limits(id, &battle);
@@ -2281,7 +2311,7 @@ mod tests {
             "{logs:?}"
         );
         assert!(logs.iter().any(|l| l.starts_with("battle started battle=1") && l.contains("limits=[255]") && l.contains("run_difficulty=1 names=[A] companions=0 statuses=[-]")), "{logs:?}");
-        assert!(logs.iter().any(|l| l.starts_with("battle ended battle=1 outcome=Victory") && l.contains(&format!("limits=[{end}] companions=0 status_inflicted=0 status_ended=0 status_ticks=0"))), "{logs:?}");
+        assert!(logs.iter().any(|l| l.starts_with("battle ended battle=1 outcome=Victory") && l.contains(&format!("limits=[{end}] companions=0 status_inflicted=0 status_ended=0 status_ticks=0 counters=0"))), "{logs:?}");
         // A win pays as before: the payment is its own job, and the next battle starts from the gauge kept.
         assert_eq!(jobs.iter().filter(|j| j.paid().is_some()).count(), 1);
         assert_eq!(w.request_encounter(a.entity, Some(0), ms(t0, 700_000)), BattleReply::Done);
@@ -2289,6 +2319,40 @@ mod tests {
             Some(ServerMsg::EncounterStart { party, .. }) => assert_eq!(party[0].limit, end),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// A counter is an enemy attack inside the events of a COMMAND: the server counts each one, says it as a log line
+    /// (`counter battle=.. actor=.. attack=..`) and the `battle ended` line ends with the total. Only enemy attacks count:
+    /// a party member's own action, its effects and everything else in the batch say nothing.
+    #[test]
+    fn an_enemy_attack_inside_a_commands_events_is_a_counter_and_is_counted_and_logged() {
+        let t0 = Instant::now();
+        let mut w = world_with(Some(settings(SyntheticRules::default())), true);
+        let mut a = seat(&mut w, "A", t0);
+        assert_eq!(w.request_encounter(a.entity, Some(1), t0), BattleReply::Done);
+        let id = seat_battle_id(&a.battle_msgs());
+        let foe = ActorId(3);
+        let events = [
+            BattleEvent::Action { actor: ActorId(0), action: ActionRef::Attack },
+            BattleEvent::Damage { actor: ActorId(0), target: foe, amount: 40, critical: false },
+            BattleEvent::Action { actor: foe, action: ActionRef::EnemyAttack(286) },
+            BattleEvent::Damage { actor: foe, target: ActorId(0), amount: 25, critical: false },
+            BattleEvent::Action { actor: foe, action: ActionRef::EnemyAttack(288) },
+            BattleEvent::MpSpent { actor: foe, amount: 0 },
+        ];
+        let battle = w.battle.as_mut().unwrap().battles.get_mut(&id).unwrap();
+        assert_eq!(battle.counters, 0);
+        let lines = battle.note_counters(id, &events);
+        assert_eq!(lines, vec![format!("counter battle={} actor=3 attack=286", id.0), format!("counter battle={} actor=3 attack=288", id.0)]);
+        assert_eq!(battle.counters, 2);
+        assert!(battle.note_counters(id, &events[..2]).is_empty(), "a batch without an enemy attack says nothing");
+        assert_eq!(battle.counters, 2);
+        // And what was counted ends the battle's record (a synthetic battle ends with the count it was left at).
+        battle.counters = 7;
+        let rules = SyntheticRules::default();
+        play_out(&mut w, &mut [&mut a], &rules, t0);
+        let ended = logs_of(&mut w).into_iter().find(|l| l.starts_with("battle ended battle=1")).expect("an end line");
+        assert!(ended.ends_with(" counters=7"), "{ended}");
     }
 
     /// `--debug-status`: every member starts the battle with those statuses, they travel in the `EncounterStart`, the

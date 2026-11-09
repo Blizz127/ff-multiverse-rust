@@ -155,7 +155,8 @@ fn every_field_scans_and_a_new_account_is_in_the_empty_phase_of_all_of_them() {
         // Every point is one that a step can actually reach: its triangle exists and its corners are finite.
         for p in story.points() {
             match &p.trigger {
-                StoryTrigger::Region(c) => {
+                // (a triangle that also waits for OK, the lift's panel, is a press)
+                StoryTrigger::Region(c) | StoryTrigger::Press(c) => {
                     assert_eq!(c.len(), 3);
                     assert!(c.iter().all(|p| p.is_finite()));
                 }

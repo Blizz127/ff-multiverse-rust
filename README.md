@@ -84,10 +84,11 @@ player walks through the gateway and unloaded a minute after the last player lef
 span fields, and the fields' NPCs (the characters a field's own data places: Sector 1's guards,
 for example) are announced with every snapshot. See "Walking between fields" below.
 
-Not done yet: field scripts as a whole (what is carried out is the exits a line's walk-on script decides
-and the story steps the scripts make where the server can see them, see "Walking between fields"; no cutscenes,
-no talk-driven story, no ladders), NPC animation and talking, music, and the window's scrolling camera (it shows
-the whole background). The increment-by-increment plan is in `IMPLEMENTATION-PLAN.md`.
+Not done yet: field scripts as a whole (what is carried out is the exits a line's walk-on script decides, the
+ladders and jumps of the lines, and the story steps the scripts make where the server can see them: a walk, a press of
+OK, a talk, a scripted battle, see "Walking between fields"; no cutscenes), NPC animation and conversations beyond the
+story steps, music, and the window's scrolling camera (it shows the whole background). The increment-by-increment
+plan is in `IMPLEMENTATION-PLAN.md`.
 
 ## Workspace
 
@@ -433,9 +434,9 @@ bots in a party from `md1stin` through its gateway to `md1_1` against your own l
 (read-only, throw-away state) and back; `scripts/travel-smoke.sh --fixture` does the same on the
 synthetic FIXTURE rooms (`fmv-server --game fixture-rooms`, `fmv-client --game fixture-rooms
 --name X`: a hall and a yard joined by an exit each way, with one NPC in the yard; **not FF7**) and
-needs no owned data. `scripts/travel-smoke.sh --chain` walks the whole first reactor mission as far as the
-walkmesh goes (`md1stin`, `md1_1`, `md1_2`, `nrthmk`, `nmkin_1`, `elevtr1`, `nmkin_2`, `nmkin_3`) with the real story:
-see below.
+needs no owned data. `scripts/travel-smoke.sh --chain` walks the whole first reactor mission, from the first field
+to the reactor's core and the Guard Scorpion (`md1stin`, `md1_1`, `md1_2`, `nrthmk`, `nmkin_1`, `elevtr1`, `nmkin_2`,
+`nmkin_3`, `nmkin_4`, `nmkin_5`), with the real story: see below.
 
 The bots find their way with `crates/fmv-client/src/nav.rs`: a grid over the field, A* over its cells, string pulling
 into a few straight legs that the server's own `validate_move` accepts, and never across the line of an exit they do
@@ -456,33 +457,60 @@ is open, and walks a player over a line whose exits are all closed. An exit whos
 (a variable the progression does not carry, a key to press, the party) stays closed and the server says so once per
 area (`exit closed: its conditions cannot be judged ...`). Rules and numbers: `crates/fmv-ff7/src/exit_gate.rs`.
 
-The story advances along the way where the scripts advance it and the server can see it: a walkmesh triangle, a line
-the player walks across, or the player coming to stand in a field whose own scripts move the story by themselves
-(`crates/fmv-ff7/src/story.rs`). The first mission's steps: 1->6 (`md1stin`), 6->7 (`md1_1`), 7->8 (`md1_2`), 8->10 (`nrthmk`),
-10->11 (`nmkin_1`, a line), 11->12 together with the lift bit (`elevtr1`: stand on the panel's triangle; the script
-wants OK pressed, which protocol v9 cannot carry, so standing there stands for it), 12->13 (`nmkin_2`). Not carried out:
-steps a talk makes (`nmkin_3`'s woman, `nmkin_5`'s chest), the ride back up, and the ladder from `nmkin_3` down to
-`nmkin_4` (scripted jumps and climbs the walkmesh does not link). The progression blob is `[1, lo, hi]` until a step sets
-a variable beyond the moment, then `[2, lo, hi, n, (bank, address, value)*n]` (an old blob loads exactly as before;
-a build that predates version 2 reads a version 2 blob as unreadable and leaves it alone).
+**The OK button, ladders and jumps (protocol v14, `ClientMsg::Interact`).** The server sees where a player walks, and
+since `Interact` it sees the OK button too (Enter or Space in the window, one message per press, with the character the
+client addressed, if any). What a press does is the world's call from where the server holds the player
+(`crates/fmv-server/src/world/press.rs`): next to the character it names, a talk (below); standing in a press triangle
+(the lift's panel), a ride; touching a ladder's line, a climb. **Links** are the ladders and jumps of a field: lines whose
+scripts put the player's character somewhere else in the SAME field (`crates/fmv-ff7/src/links.rs` walks each line's
+trigger scripts, once as walking up to the line and once as a press of OK, and what they do to the player's entity is the
+link; a script that reads the story, reads back a place it cannot know or does not end normally is dropped, not guessed).
+A walk-on link fires when the player walks up to its line, a link that waits for OK when the player presses OK touching it.
+The server puts the player at the destination (on the destination's own floor) and tells the client with `MoveRejected {
+corrected }`, the message that already puts a client where the server says it is: no wire change for it. Two rules keep
+that honest. A link is **armed** only while the player is farther than 30 units from its line, and a player placed
+anywhere starts with every line within reach disarmed, so a landing next to a line does not send the player straight back
+(`fmv_adapter_api::LinkArming`; the first jump of `nmkin_3` lands 23 units from the second, the stair of `nmkin_4` within a
+unit of the ladder back up). And the player is **fenced** after a link: until one of its intents agrees with the new place
+(within 60 units, on its level) or two seconds pass, every intent is answered with the destination and moves nothing, and a
+press does nothing, so the intents already on their way from the old place cannot walk the player on over a change of level.
 
-**Only eight fields are reviewed: the allowlist.** The script exits and story points above are **active in the eight
-fields of the first mission only**: `md1stin`, `md1_1`, `md1_2`, `nrthmk`, `nmkin_1`, `elevtr1`, `nmkin_2` and `nmkin_3`
-(`fmv_ff7::REVIEWED_FIELDS`, in `crates/fmv-ff7/src/area.rs`), each read against its own script case by case. Every other
-field offers what it always did, its gateways (data, always open, so a party can still walk out of the mission) and its
-phases, and leaves its script exits and story points off: a point raises a story for good, a story only moves
-forward, and nobody has read the others (the data holds 917 script exits and 83 points; the eight fields offer 4 and
-8, and the 274 other fields that have any leave 913 and 75 off). The server says what a field left off once per area
-when it loads it (`story left off (said once for this area) area=Ff7/md8_1 why=unreviewed field script_exits=0
-story_points=1 ...`). A field joins the list by review, not by a casual edit: `cargo run -p fmv-ff7 --example
-world_survey -- <field>` shows what it would offer (the survey loads fields with everything on), each point and exit is
-checked against the field's script, the result is pinned in `crates/fmv-ff7/tests/chain_real.rs`, and only then is
-the name added.
+The story advances along the way where the scripts advance it and the server can see it: a walkmesh triangle, a line the
+player walks across, the player coming to stand in a field whose own scripts move the story by themselves, a press of
+OK on the lift's panel, a talk, or a scripted battle won (`crates/fmv-ff7/src/story.rs`). The first mission's steps: 1->6
+(`md1stin`), 6->7 (`md1_1`), 7->8 (`md1_2`), 8->10 (`nrthmk`), 10->11 (`nmkin_1`, a line), 11->12 together with the lift
+bit (`elevtr1`: press OK on the panel's triangle), 12->13 (`nmkin_2`), 13->14 (`nmkin_3`: talk to the woman), 14->15
+(`nmkin_5`: talk to the materia on the floor), 15->27 (`nmkin_5`: the core's triangle starts the Guard Scorpion, formation
+324, and the step is paid when the party WINS). A **talk** point is a character whose own talk script (or one it requests)
+writes the story: what the talk does is not read off the text, the character's script is run (the dialogue walker) for the
+story the player has when it presses OK, after the character's own set-up has decided whether it can be talked to at all
+(the materia switches itself off once the story has moved to 15). The client's conversation shows the lines for the story
+as it was BEFORE the step; the server applies the step on the press and the mirrored story moves on after. A **scripted
+battle** is a `BATTLE` the block starts before its write (the director's loop in `nmkin_5` asks the characters' scripts to run
+the cutscene, which fights): the server starts it for the party, a battle point fires only by coming to it from outside, a
+lost fight leaves the story where it was, and the step waits for the win. The progression blob is `[1, lo, hi]` until a
+step sets a variable beyond the moment, then `[2, lo, hi, n, (bank, address, value)*n]` (an old blob loads exactly as
+before; a build that predates version 2 reads a version 2 blob as unreadable and leaves it alone).
 
-**The lift only goes down, for now.** The ride is carried one way: standing on the panel's triangle sets the lift bit
-and moves the story, and the exit to `nmkin_2` opens. The way back up (the lift's other exit, a toggle of that bit) is
-not carried, so a player who has gone down returns to `md1stin` by logging out and back in (every login joins the entry
-area).
+**Only ten fields are reviewed: the allowlist.** The script exits, story points and links above are **active in the ten
+fields of the first mission only**: `md1stin`, `md1_1`, `md1_2`, `nrthmk`, `nmkin_1`, `elevtr1`, `nmkin_2`, `nmkin_3`,
+`nmkin_4` and `nmkin_5` (`fmv_ff7::REVIEWED_FIELDS`, in `crates/fmv-ff7/src/area.rs`), each read against its own script
+case by case. Every other field offers what it always did, its gateways (data, always open, so a party can still walk out
+of the mission) and its phases, and leaves its script exits, story points and links off: a point raises a story for good, a
+story only moves forward, a link teleports a player, and nobody has read the others (the data holds 917 script exits, 133
+points and 190 links; the ten fields offer 4, 14 and 11, and the other 299 fields that have any leave 913, 119 and 179 off).
+The server says what a field left off once per area when it loads it (`story left off (said once for this area)
+area=Ff7/md8_1 why=unreviewed field script_exits=0 story_points=1 ... links=0 link_list=[])`). A field joins the list by review, not by a casual
+edit: `cargo run -p fmv-ff7 --example world_survey -- <field>` shows what it would offer (the survey loads fields with
+everything on), each point, exit and link is checked against the field's script, the result is pinned in
+`crates/fmv-ff7/tests/chain_real.rs`, and only then is the name added.
+
+**The lift goes down and back up, one ride per press.** The panel is two presses of one triangle: the ride down (the lift
+bit on, and the story to 12 the first time) and the ride back, which the panel's own script makes when the lift is down
+(the panel's script is run for the player's story and the tracked bit it turned off is turned off). They exclude each other,
+a press is one ride and nothing flaps; the lift's exits follow the bit (`nmkin_1` up, `nmkin_2` down) and the moment stays.
+The model only carries a story FORWARD (merging two stories is a join), so the saved story keeps the lift down while the
+story the player holds in the world has it up until the player rides down again.
 
 Story phasing: every account has one story progression per game (the opaque `Progression` blob; an
 account that never advanced has none, which is a new account) and the world keeps one instance of a
@@ -504,8 +532,8 @@ version was bumped and a server refuses a v3 client at the handshake with a clea
 `ProtocolMismatch` reject (instead of losing it at the first exit it crosses). Both sides must be
 built from this version or later.
 
-Not done: exits a talk or a director decides, scripted ladders and jumps, the script exits and story points of every
-field but the first mission's eight (they are left off until reviewed), conditional NPCs, NPC animation and talking.
+Not done: exits a talk or a director decides, the script exits, story points and links of every field but the first
+mission's ten (they are left off until reviewed), conditional NPCs, NPC animation, cutscenes.
 
 ## Accounts, avatars and parties
 
@@ -581,7 +609,13 @@ weakness, resistance, nullify, absorb and full-heal from `scene.bin`), and the e
 `scene.bin` attacks, chosen by their own AI scripts since protocol v11 (`fmv_ff7_battle::ai`: a bounded
 interpreter of the scripts, with counters after a blow, such as Guard Scorpion's tail-up Tail Laser; anything it
 cannot follow falls back, for that turn, to a uniform pick among the damaging attacks the enemy has the MP
-for). Spells: the magic materia a character's starting record equips, plus a
+for). A counter comes in the same message as the blow that provoked it, and the client plays the two **one after
+the other** (`scene::cue`: each performance of a batch begins when the one before it is over, so the Tail Laser is
+seen after the blow, its name comes up in the banner when it begins, its numbers land after the blow's, and the
+victory or defeat panel counts from the last performance that begins). `scripts/battle-smoke.sh --boss --build` fights the
+real Guard Scorpion (formation 324, level 8) with the canon pair and two bots and FAILS unless the server logged at
+least one Tail Laser counter (`counter battle=.. actor=.. attack=286`, and `counters=N` on the `battle ended` line),
+both bots counted the same ones and both replayed the whole battle, counters included, with 0 divergences. Spells: the magic materia a character's starting record equips, plus a
 starter grimoire every character is given (Restore, Fire, Ice and Lightning at level 1: Cure, Fire,
 Ice, Bolt), because on the Steam copy only Cloud and Red XIII start with magic materia. **The engine
 knows no inventory**: the server checks the account owns the item, submits the command and takes the
@@ -734,13 +768,15 @@ says which statuses AFFECT it (a set bit), so all ones is "immune to nothing" (2
 immunity (Haste and Slow share one). The starting party's grimoire has none of them, and the first mission's enemies
 inflict none, which is why a smoke run needs the debug aid below. Draws: an action without a status effect draws exactly
 what it did; one with a status draws one `below(63)` per target that still stands after its effects (`rules`, "RNG draw
-order"); Poison, Regen and the timers draw nothing.
+order"); the clocks of Poison, Regen and the timers draw nothing themselves (a scripted enemy that Poison kills answers with its
+Death counter, which draws as any counter does).
 
 *On the wire:* three events (`StatusInflicted`, `StatusEnded`, `StatusTick`), two refusals (`CannotAct`, `Silenced`) and
 one input, `BattleMember::status`: the statuses a member STARTS with (absent from the JSON when empty; a set the engine
 does not play, or Haste with Slow, or Sadness with Fury, is refused when the battle is built). *In the client:* the party panel
 and the enemy list tag each fighter with the statuses it has (`Psn`, `Slp`, `Sil`, ... in their colours, as many as the
-window has room for, then a `+N`), the ATB bar is cyan under Haste, violet under Slow and grey while held, the Magic row of
+window has room for, then a `+N` for the rest: at the default 1100 x 680 the party panel has two places, a code and the
+`+N` or both codes of a member with two, a long name giving up a cell or two for it), the ATB bar is cyan under Haste, violet under Slow and grey while held, the Magic row of
 the menu is greyed out while the character is silenced (with the reason under the cursor), the line under the status band
 says "You are asleep", the popups float a status's name and the turns of Poison, and in the 3D scene a poisoned body is
 tinted and pulses, a sleeper droops and is dim, and a stopped or paralysed one is grey and holds its idle frame.
@@ -750,8 +786,13 @@ of every battle start with those statuses; `scripts/battle-smoke.sh --status --b
 real field with it and FAILS unless the server announced every status, both bots' rosters and status notes agree and their
 counts of the status events are EXACTLY the server's, and both bots replayed the battle from their own data with 0
 divergences. *Not played:* Confusion, Berserk, Frog, Small, Petrify, Slow-numb, Reflect, Manipulate, Death Sentence and
-the rest (they decode and are ignored), armor protections, weapon status attacks, Sadness and Fury across battles, and a
-scripted enemy's status-only attack (still announced and nothing: only its damaging attacks inflict).
+the rest (they decode and are ignored), armor protections, weapon status attacks, and Sadness and Fury across battles.
+An enemy's script can queue an attack that has ONLY a status (44 of the 341 scripted enemies of the Steam copy do, checked by `ai_real_data`: a curse on
+the party, or a buff such as Barrier on itself or its own side): it is played wherever the script aims it, costs the enemy no MP
+(charging for it made some casters run dry and fall back to the plain behaviour for good: measured over every enemy of
+`scene.bin`), and the statuses it inflicts are in the status word the scripts read, so a script that casts a buff until it has
+it now stops. An enemy that Poison kills on the clock answers its death like one a blow kills: its Death counter runs in the
+same step (nobody struck it, so a counter that aims at the attacker finds nobody and is skipped).
 
 `md1stin`'s own encounter table (section 6 of the field file, Steam PC build): the first of its
 two 24-byte tables is the enabled one, with rate 128 (a roll succeeds with probability 128/1024)
@@ -1093,9 +1134,10 @@ crates/                  the Cargo workspace (see the table above)
 scripts/package.sh       build and package a release tarball (and dist/SHA256SUMS)
 scripts/ff-multiverse.sh the launcher entry point shipped in the package (docs/LAUNCHER.md)
 scripts/smoke.sh         two-bot local smoke test
-scripts/battle-smoke.sh  shared-battle smoke test (real data; modes --fixture --random --progress --commands --solo --status)
+scripts/battle-smoke.sh  shared-battle smoke test (real data; modes --fixture --random --progress --commands --solo --status --boss)
 scripts/travel-smoke.sh  walking between fields: two bots, md1stin -> md1_1 and back (real data); --chain: the first reactor mission
-                         down to nmkin_3 with its real story, the lift ridden, the member following the leader
+                         down to the Guard Scorpion in nmkin_5 with its real story, the lift ridden, the ladders and jumps
+                         climbed, the woman and the materia talked to, the fight won, the member following the leader
 scripts/phase-smoke.sh   story phasing: A advances md1stin's story and B does not, party, restart, persist (real data)
 scripts/slice-smoke.sh   the foundations slice: two original characters, a story, a talk, a shared battle, a real server restart
 deploy/                  systemd user unit template and deployment procedure
