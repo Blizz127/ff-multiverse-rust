@@ -189,6 +189,58 @@ fn real_looks_face_decals_vertex_by_vertex() {
     }
 }
 
+/// The mesh merge takes the whole-number shift off a decal's texture coordinates (`mesh::whole_cell_offsets`), and battle
+/// draws every one of its models through the same merge. The battle loader already brings a model's coordinates into
+/// `0..1` itself (`fmv_ff7::battle_model::tiling`: the game repeats them, this window's sampler clamps), so the merge must
+/// find nothing to take off in any of them. Every character, weapon, enemy and location of the owned `battle.lgp`, read-only:
+/// the merged coordinates are exactly the loader's, bit for bit.
+#[test]
+#[ignore = "needs the owner's real FF7 data: FMV_FF7_DATA with battle/battle.lgp"]
+fn real_battle_models_are_not_touched_by_the_merges_unwrap() {
+    use crate::avatar::mesh::MergedMesh;
+    use fmv_ff7::battle_model::skeleton::BattleModelKind;
+    use fmv_ff7::battle_model::{BattleCharacter, BattleModels};
+    let Some(data) = std::env::var_os("FMV_FF7_DATA") else {
+        eprintln!("skipped: FMV_FF7_DATA is not set");
+        return;
+    };
+    let path = std::path::PathBuf::from(data).join("battle").join("battle.lgp");
+    let Ok(mut models) = BattleModels::open(&path) else {
+        eprintln!("skipped: no battle/battle.lgp under FMV_FF7_DATA");
+        return;
+    };
+    let (mut checked, mut textured, mut changed) = (0usize, 0usize, 0usize);
+    let mut check = |model: &fmv_ff7::FieldModel| {
+        let Ok(mesh) = MergedMesh::build(model) else { return };
+        let raw: Vec<[f32; 2]> = model.parts.iter().flat_map(|p| (0..p.positions.len()).map(move |i| p.uvs.get(i).copied().unwrap_or([0.0; 2]))).collect();
+        checked += 1;
+        textured += model.parts.iter().filter(|p| p.texture.is_some()).count();
+        if mesh.uvs != raw {
+            changed += 1;
+        }
+    };
+    for which in BattleCharacter::ALL {
+        if let Ok(m) = models.load_character(which) {
+            check(&m.model);
+            m.weapons.iter().for_each(&mut check);
+        }
+    }
+    for id in models.ids_of_kind(BattleModelKind::Enemy) {
+        if let Ok(m) = models.load_enemy(u16::try_from(id).unwrap_or(u16::MAX)) {
+            check(&m.model);
+            m.weapons.iter().for_each(&mut check);
+        }
+    }
+    for code in 0..models.location_count() {
+        if let Ok(m) = models.load_location(u16::try_from(code).unwrap_or(u16::MAX)) {
+            check(&m.model);
+        }
+    }
+    eprintln!("{checked} battle models and weapons, {textured} textured parts: the merge changed the texture coordinates of {changed} of them");
+    assert!(checked > 100, "the survey saw {checked} models");
+    assert_eq!(changed, 0, "a battle model's coordinates are the loader's, untouched by the merge");
+}
+
 #[test]
 #[ignore = "needs the owner's real FF7 data (FMV_FF7_LIBRARY or FMV_FF7_DATA)"]
 fn real_looks_survey_heights_parts_and_faces() {

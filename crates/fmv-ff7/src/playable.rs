@@ -104,9 +104,10 @@
 //!   22.9 Red XIII, 32.2 Cid, 26.6 Yuffie, 32.8 Vincent and 30.8 Jessie; the bodies are 28.7 (`lean`, 86% of Cloud), 30.4
 //!   (`sturdy`, 91%) and 29.2 (`slight`, 88%): the cast's own range (Tifa 86%, Yuffie 80%). Every model, a player's or a
 //!   character's, is drawn at the field's one model scale, so at one spot the bodies are 82 to 86% of Cloud and 92 to 97% of
-//!   Jessie on the screen. A player who looks a quarter taller than a character in a picture stands nearer to the camera:
-//!   in `elevtr1` the character stands at camera depth 808 and the spawn points lie at 638 to 799, where a `slight` body
-//!   is 388 px tall at depth 638 against the character's 328 (1.18 times) and 313 at depth 799.
+//!   Jessie on the screen. A player who looks taller than a character in a picture stands nearer to the camera (the
+//!   owner's `elevtr1` picture, read off by eye, shows about a quarter): the character there stands at camera depth 808 and
+//!   the spawn points lie at 638 to 799, where a `slight` body is 388 px tall at depth 638 against the character's 328
+//!   (1.18 times; 1.21 times at the nearest open place, depth 622) and 313 at depth 799.
 //! * **Faces.** Every field model in `char.lgp` (the cast and the bodies alike) puts a face on the head with three decals on
 //!   the head bone: two eye quads (each its own 32x32 texture, the same eye twice) and a mouth. The data shifts a decal's
 //!   texture coordinates by whole numbers (the right eye's `u` runs from 1.00 to 1.97, a mouth's `v` from 5.00 to 5.94), which the

@@ -344,12 +344,13 @@ blue player's `lean` used to have blue hair: the mesh now flags the head bone's 
 dark greys, as the model's own colours, `avatar::identity::head_colour_is_own`; the same colours on the shoes or the
 suit are still cloth, and a cap's white or a hood's blue is cloth too); white, grey and black colours fall back to the old multiplicative look, and a model without an identity
 is drawn bit for bit as it always was (enemies, canon models, non-player characters, effects and fades are
-untouched). A CPU mirror of the look is the test oracle and the shader agrees with it on 99.6% of 110 116 body
-pixels (the rest are face decals); an sRGB target and a plain one show one picture (99.89% of pixels within 4
+untouched). A CPU mirror of the look is the test oracle and the shader agrees with it on 91.8% of 110 116 body
+pixels (the rest are the face decals and the head's hair and skin, which keep their own colours; it was 99.6% before the
+hair was kept, when only the decals were exempt); an sRGB target and a plain one show one picture (99.79% of pixels within 4
 levels). With a blue player: the dark cloak `[57,66,109]` becomes `[54,91,164]`, dark suit grey `[48,48,52]`
 `[46,71,120]`; with an orange one `[157,86,43]` and `[118,68,34]`; skin `[230,180,150]` moves by 5 levels at most
 (the old tint moved it by 28 to 57). At 1x two players' bodies are told apart at a glance (mean colour distance
-of two bodies 25 of 441 before, 119 after). **In battle** the PLAYERS' bodies (not the canon companions Cloud and
+of two bodies 24 of 441 before, 112 after). **In battle** the PLAYERS' bodies (not the canon companions Cloud and
 Barret, who have no player and keep their own colours; not any sword, not the enemies, not the location) wear the
 colour of the player each member is, the same look: a blue player's placeholder body is blue clothes with its own
 skin, an orange player's is orange (a colour that is not known yet, for instance before that player's snapshot
@@ -360,8 +361,9 @@ helmet that is grey, white or a cool colour is repainted with the clothes (the `
 red marks are on the head bone, in warm and dark colours, and keep their own). The pictures come from the real-data tests (`cargo test -p fmv-client --
 --ignored offscreen_field_identity --test-threads=1`, `offscreen_battle_identity_before_after`, with
 `FMV_FF7_LIBRARY` and `FMV_SHOT_DIR`): each body in four colours as untinted | old | new from one frame, a 1920x1080
-overview, and the battle before and after from one scene at one instant (54 339 pixels differ, all of them on the
-two players' bodies: the canon pair, the enemies and every weapon are bit for bit as they were).
+overview, and the battle before and after from one scene at one instant (29 062 pixels differ, 12 945 and 17 876 of
+them on the two players' bodies and none anywhere else: the canon pair, the enemies and every weapon are bit for bit as
+they were).
 
 *Faces and scale of the field models (measured 2026-11-09).* Every character of `char.lgp`, the cast and the
 three placeholder bodies alike, gets its face from three decals on the head bone: two eye quads (the same eye
@@ -376,8 +378,10 @@ mouth textures are blank in the data, as `lean`'s and `slight`'s are; Cloud's ha
 (`lean`), 30.4 (`sturdy`) and 29.2 (`slight`) model units against Cloud's 33.2 (86%, 91%, 88%; Tifa is 86%, Yuffie 80%)
 and Jessie's 30.8, and every model is drawn at the field's one model scale, so at one place the bodies are 82 to 86% of
 Cloud and 92 to 97% of Jessie on the screen (in battle 0.86, 0.88 and 0.91 of Cloud's battle model for `lean`, `slight` and
-`sturdy`); a player who looks a
-quarter taller than a character stands nearer to the camera. `slight`'s orange skin (255,131,80) is the model's own
+`sturdy`). The owner's `elevtr1` picture shows the player about a quarter taller than the character (read off a
+screenshot by eye): that is perspective, not scale; the spawn points lie nearer the camera than the character (depth 638
+to 799 against 808), where a `slight` body is 1.18 times the character's height on the screen at the nearest spawn point
+and 1.21 times at the nearest open place (depth 622), the rest being the models' own heights. `slight`'s orange skin (255,131,80) is the model's own
 colour (a tanned beach extra), kept by the colour look; it is not the tint. The pictures are
 `offscreen_field_lineup_bodies_beside_cloud_and_an_npc` (Cloud, the field's character and the three bodies at one
 spot, front and three-quarter, their own colours over the player look, orange and blue) and the numbers
