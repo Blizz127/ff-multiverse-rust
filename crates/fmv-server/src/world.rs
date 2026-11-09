@@ -96,7 +96,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use fmv_adapter_api::{AreaKey, AreaRuntime, GameAdapter, MoveResult};
+use fmv_adapter_api::{AreaKey, AreaRuntime, Exit, GameAdapter, MoveResult};
 use fmv_core::{AccountId, AnimState, AvatarAppearance, EntityId, EntitySnapshot, Pos, SessionId};
 use fmv_party::{InstanceRegistry, Invite, PartyConfig, PartyEvent, PartyManager, Placement, Tick};
 use fmv_protocol::{BattleId, PartyName, ServerMsg};
@@ -516,11 +516,12 @@ impl World {
                 return MoveOutcome::Rejected { corrected: from, reason: Rejection::TooFast };
             }
             let chord = walk_chord(area.runtime(), from, to, dist, area.rules());
-            // Crossing an exit line leaves the area. Judged on the move as the adapter accepted
-            // it, and only where there is somewhere to go (a single-area world has no exits).
-            let crossed = match &chord {
-                Chord::Clear(accepted) if self.source.is_some() => area.crossed_exit(from, *accepted).cloned(),
-                _ => None,
+            // Crossing an exit line leaves the area, when one of the exits there is open for the story that governs
+            // the player. Judged on the move as the adapter accepted it, and only where there is somewhere to go
+            // (a single-area world has no exits).
+            let crossed: Vec<Exit> = match &chord {
+                Chord::Clear(accepted) if self.source.is_some() => area.crossed_exits(from, *accepted).into_iter().cloned().collect(),
+                _ => Vec::new(),
             };
             (from, chord, crossed)
         };
@@ -529,7 +530,7 @@ impl World {
 
         match chord {
             Chord::Clear(accepted) => {
-                if let Some(exit) = crossed {
+                if let Some(exit) = self.open_exit(entity, crossed) {
                     // `from` is where a refused transfer puts the player back (on the near side
                     // of the line, so that crossing again is a new crossing).
                     if self.start_travel(entity, &exit, from, facing, now) {

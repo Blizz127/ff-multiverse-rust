@@ -45,13 +45,24 @@
 //! `JoinArea` answer, exactly like the first join. The area stays loaded while anybody stands in any
 //! instance of it.
 //!
-//! What is not here: exits that scripts decide (FF7 `MAPJUMP`s and line triggers).
+//! # Exits a script decides
+//!
+//! An exit of kind `ExitKind::Script` is a way out that the area's scripts decide, with conditions on the story (FF7:
+//! a `MAPJUMP` that a line's trigger script runs when the player walks onto the line). Several of them may share a
+//! line (the elevator of the first reactor has four, picked by the story): when a move crosses it, the server asks the
+//! area which of the exits it crosses is open (`AreaRuntime::exit_state`) for the **story of the account that governs
+//! the crossing player's instance**: its own progression solo, the party leader's for a member of a party (the phase
+//! owner of its placement, the one whose phase chose the instance), and takes the first exit in the order
+//! the area lists them (gateways first, then the scripts' in script order) that is open. A line whose exits are all
+//! closed is walked over like any line. An exit whose conditions the area cannot judge (a variable the story does not
+//! carry, a key the player would have to press) stays closed, and the server says so ONCE PER AREA
+//! (`exit closed: its conditions cannot be judged ...`), with what the first such exit reads.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use fmv_adapter_api::{AreaKey, AreaRuntime, Exit, GameAdapter, NpcSpawn, StoryPoint};
+use fmv_adapter_api::{AreaKey, AreaRuntime, Exit, ExitState, GameAdapter, NpcSpawn, StoryPoint};
 use fmv_core::{AnimState, AreaId, EntityId, Fingerprint, PhaseKey, Pos, ProvenanceSummary};
 use fmv_protocol::{NpcSnapshot, RejectCode, ServerMsg, MAX_NPCS_PER_AREA, NPC_NAME_CHARS, NPC_REF_CHARS};
 
@@ -66,8 +77,8 @@ pub const TRAVEL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Most areas loaded at once (the entry area included). Every player that walks through an exit
 /// can load one, so this bounds what a crowd can make the server hold.
 const MAX_LOADED_AREAS: usize = 128;
-/// Most exits kept per area (FF7 has twelve gateway slots).
-const MAX_EXITS_PER_AREA: usize = 64;
+/// Most exits kept per area (FF7 has twelve gateway slots; the adapter adds at most 96 exits its scripts decide).
+const MAX_EXITS_PER_AREA: usize = 128;
 /// Most story points kept per area (a real field has at most a few).
 const MAX_STORY_POINTS_PER_AREA: usize = 64;
 
@@ -93,6 +104,8 @@ pub(super) struct AreaState {
     exits: Vec<Exit>,
     /// Targets whose load failed: their exits are not watched any more.
     closed: BTreeSet<AreaKey>,
+    /// An exit whose conditions the area cannot judge has been reported (once per area, see the module docs).
+    unjudged_exit_noted: bool,
     /// The NPCs shown when no phase says otherwise (counted in the "area loaded" log line); what an
     /// instance shows is [`AreaState::cast`].
     npcs: Vec<NpcSnapshot>,
@@ -170,6 +183,7 @@ impl AreaState {
             next_spawn: 0,
             exits,
             closed: BTreeSet::new(),
+            unjudged_exit_noted: false,
             npcs,
             story_points,
             encounters,
@@ -222,14 +236,19 @@ impl AreaState {
         self.encounters = battle.and_then(|b| b.area_encounters(self.runtime.as_ref()));
     }
 
-    /// The exit a move `from -> to` meets first, if it crosses any.
-    pub(super) fn crossed_exit(&self, from: Pos, to: Pos) -> Option<&Exit> {
-        self.exits
+    /// The exits a move `from -> to` crosses, the one it meets first first (ties keep the area's order: gateways
+    /// before the exits scripts decide, those in script order). Whether any of them is open for the player is
+    /// [`World::open_exit`].
+    pub(super) fn crossed_exits(&self, from: Pos, to: Pos) -> Vec<&Exit> {
+        let mut crossed: Vec<(f64, &Exit)> = self
+            .exits
             .iter()
             .filter(|e| !self.closed.contains(&e.target))
             .filter_map(|e| e.crossing(from, to).map(|t| (t, e)))
-            .min_by(|a, b| a.0.total_cmp(&b.0))
-            .map(|(_, e)| e)
+            .collect();
+        // a stable sort: equal crossings (several exits on one line) stay in the area's order
+        crossed.sort_by(|a, b| a.0.total_cmp(&b.0));
+        crossed.into_iter().map(|(_, e)| e).collect()
     }
 
     /// The `AreaChange` that offers this area and says where the player will stand.
@@ -327,6 +346,50 @@ impl World {
     /// from), so that every entry looks the same to a client.
     pub(super) fn announce_entry(&mut self, entity: EntityId, failed: &mut Vec<(EntityId, bool)>) {
         self.settle(entity, true, failed);
+        // What the area's own scripts do by themselves from the first frame on moves the story of whoever stands
+        // there (the points that fire on entry; a no-op in an area without any).
+        self.enter_story(entity);
+    }
+
+    /// The first of `crossed` (the exits a move of `entity` crosses, in the order they are met) that is open for
+    /// the story that governs it, if any (module docs, "Exits a script decides"). Gateways are always open; a script
+    /// exit is asked of the area with the progression of the account that governs the player's instance. An exit
+    /// the area cannot judge stays closed and is reported once per area.
+    pub(super) fn open_exit(&mut self, entity: EntityId, crossed: Vec<Exit>) -> Option<Exit> {
+        if crossed.is_empty() {
+            return None;
+        }
+        let progress = self.instance_progression(entity);
+        let area_key = self.players.get(&entity)?.area.clone();
+        let mut unjudged: Option<(String, String)> = None;
+        let mut open = None;
+        {
+            let area = self.areas.get(&area_key)?;
+            for exit in crossed {
+                match area.runtime.exit_state(&exit, &progress) {
+                    ExitState::Open => {
+                        open = Some(exit);
+                        break;
+                    }
+                    ExitState::Closed => {}
+                    ExitState::Unknown(why) => {
+                        unjudged.get_or_insert((exit.target.clone(), why));
+                    }
+                }
+            }
+        }
+        if let Some((target, why)) = unjudged {
+            if let Some(area) = self.areas.get_mut(&area_key).filter(|a| !a.unjudged_exit_noted) {
+                area.unjudged_exit_noted = true;
+                self.logs.info(format!(
+                    "exit closed: its conditions cannot be judged (said once for this area) area={} to={} reads={}",
+                    area.id,
+                    clip_text(&target),
+                    clip_text(&why)
+                ));
+            }
+        }
+        open
     }
 
     /// Make sure area `key` is loaded, loading it from the area source if it is not. Returns the key
@@ -574,7 +637,10 @@ mod tests {
     use super::super::{MoveOutcome, NewPlayer, Outbound, PartyOutcome};
     use super::*;
     use fmv_core::{AccountId, AvatarAppearance};
-    use fmv_fixture::rooms::{RoomsAdapter, EXIT_X, GHOST, HALL, HALL_ARRIVAL, HALL_MAX_SPEED, YARD, YARD_ARRIVAL, YARD_MAX_SPEED};
+    use fmv_fixture::rooms::{
+        RoomsAdapter, EXIT_X, GATE_ADVANCED_ARRIVAL, GATE_LINE_Y, GATE_NEW_ARRIVAL, GATE_WALL_X, GHOST, HALL, HALL_ARRIVAL, HALL_MAX_SPEED,
+        STORY_ADVANCED, YARD, YARD_ARRIVAL, YARD_MAX_SPEED,
+    };
 
     /// Near and far side of the hall's exit line (x = `EXIT_X`).
     const NEAR: f32 = EXIT_X - 50.0;
@@ -607,13 +673,18 @@ mod tests {
     }
 
     fn seat(w: &mut World, name: &str, now: Instant) -> Seat {
+        seat_with(w, name, &[], now)
+    }
+
+    /// A player whose account has the story progression `progression` (empty: a new account).
+    fn seat_with(w: &mut World, name: &str, progression: &[u8], now: Instant) -> Seat {
         let (session, entity) = w.allocate_ids();
         let (tx, rx) = mpsc::channel(256);
         let close = Arc::new(watch::channel(false).0);
         let close_rx = close.subscribe();
         let avatar = AvatarAppearance { display_name: name.into(), tint: [1, 2, 3], appearance_ref: None };
         let account = AccountId(entity.0);
-        w.join(NewPlayer { session, entity, account, avatar, progression: Vec::new(), progress: Default::default(), tx, close }, now)
+        w.join(NewPlayer { session, entity, account, avatar, progression: progression.to_vec(), progress: Default::default(), tx, close }, now)
             .expect("joins");
         Seat { entity, account, rx, close: close_rx }
     }
@@ -726,6 +797,100 @@ mod tests {
             [ServerMsg::PlayerJoined { snapshot }] => assert_eq!(snapshot.id, b.entity),
             other => panic!("A is told B arrived: {other:?}"),
         }
+    }
+
+    // ---- exits a script decides ----
+
+    /// Where the `AreaChange` in `msgs` puts the player, in the target's coordinates.
+    fn offered_arrival(msgs: &[ServerMsg]) -> (f32, f32) {
+        match area_change(msgs) {
+            ServerMsg::AreaChange { arrival, .. } => (arrival.x, arrival.y),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Walk from the spawn to the gated line of the hall (y = `GATE_LINE_Y`) and across it.
+    fn cross_the_gated_line(w: &mut World, s: &Seat, now: &mut Instant) {
+        assert_eq!(walk_to(w, s, 0.0, GATE_LINE_Y + 50.0, now), MoveOutcome::Applied);
+        assert_eq!(walk_to(w, s, 0.0, GATE_LINE_Y - 30.0, now), MoveOutcome::Applied, "the crossing move is accepted");
+    }
+
+    fn logged(w: &mut World, needle: &str) -> usize {
+        w.take_logs().iter().filter(|l| l.text().contains(needle)).count()
+    }
+
+    #[test]
+    fn of_several_exits_on_one_line_the_first_that_is_open_for_the_story_is_taken_and_a_condition_it_cannot_judge_is_said_once() {
+        let t0 = Instant::now();
+        let mut w = rooms_world(RoomsAdapter::with_gates());
+        let mut new_account = seat(&mut w, "New", t0);
+        let mut advanced = seat_with(&mut w, "Advanced", STORY_ADVANCED, t0);
+        new_account.drain();
+        advanced.drain();
+        w.take_logs();
+        let mut now = t0;
+
+        // The three exits of the line (hall y = -250) all lead to the yard but put the player in different places: the
+        // first cannot be judged, the second is open for the advanced story, the third for a new account.
+        cross_the_gated_line(&mut w, &new_account, &mut now);
+        assert_eq!(w.transit_target(new_account.entity), Some(YARD.to_string()));
+        assert_eq!(offered_arrival(&new_account.drain()), GATE_NEW_ARRIVAL, "a new account takes the exit that is open for it");
+        let said = w.take_logs();
+        let lines: Vec<&str> = said.iter().map(|l| l.text()).filter(|t| t.contains("exit closed")).collect();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("area=Fixture/hall") && lines[0].contains("to=yard") && lines[0].contains("reads=a key the fixture's hall wants pressed"), "{}", lines[0]);
+
+        cross_the_gated_line(&mut w, &advanced, &mut now);
+        assert_eq!(offered_arrival(&advanced.drain()), GATE_ADVANCED_ARRIVAL, "the advanced story takes the other one");
+        assert_eq!(logged(&mut w, "exit closed"), 0, "once per area: the hall has said it");
+    }
+
+    #[test]
+    fn a_member_of_a_party_crosses_with_the_story_of_its_leader_and_a_solo_player_with_its_own() {
+        let t0 = Instant::now();
+        let mut w = rooms_world(RoomsAdapter::with_gates());
+        let mut leader = seat_with(&mut w, "Leader", STORY_ADVANCED, t0);
+        let mut member = seat(&mut w, "Member", t0);
+        let mut solo = seat(&mut w, "Solo", t0);
+        assert_eq!(w.party_invite(leader.entity, member.entity, t0), PartyOutcome::Done);
+        let invite = w.parties.invites().next().expect("an invite").id;
+        assert_eq!(w.party_accept(member.entity, invite, t0), PartyOutcome::Done);
+        for s in [&mut leader, &mut member, &mut solo] {
+            s.drain();
+        }
+        let mut now = t0;
+        // the member's own story is a new account's, but its instance is the leader's: the leader's exit is open
+        cross_the_gated_line(&mut w, &member, &mut now);
+        assert_eq!(offered_arrival(&member.drain()), GATE_ADVANCED_ARRIVAL, "the party's story, not the member's own");
+        // a solo player with the same progression as the member takes the exit open for its own story
+        cross_the_gated_line(&mut w, &solo, &mut now);
+        assert_eq!(offered_arrival(&solo.drain()), GATE_NEW_ARRIVAL);
+        // the leader is judged by itself, of course
+        cross_the_gated_line(&mut w, &leader, &mut now);
+        assert_eq!(offered_arrival(&leader.drain()), GATE_ADVANCED_ARRIVAL);
+    }
+
+    #[test]
+    fn a_line_whose_exits_are_all_closed_is_walked_over_like_any_line() {
+        let t0 = Instant::now();
+        let mut w = rooms_world(RoomsAdapter::with_gates());
+        let mut a = seat(&mut w, "A", t0);
+        a.drain();
+        w.take_logs();
+        let mut now = t0;
+        assert_eq!(walk_to(&mut w, &a, GATE_WALL_X + 50.0, 0.0, &mut now), MoveOutcome::Applied);
+        assert_eq!(walk_to(&mut w, &a, GATE_WALL_X - 50.0, 0.0, &mut now), MoveOutcome::Applied, "walked over, not refused");
+        assert_eq!(w.area_of(a.entity), Some((HALL.to_string(), false)), "nothing happened: the exit is closed");
+        assert!(w.transit_target(a.entity).is_none());
+        assert_eq!(w.players.get(&a.entity).map(|p| p.snapshot.pos.x), Some(GATE_WALL_X - 50.0));
+        assert!(!a.drain().iter().any(|m| matches!(m, ServerMsg::AreaChange { .. })));
+        assert_eq!(logged(&mut w, "exit closed"), 0, "a closed exit is not an unjudged one");
+        // the gateway to the yard is still a gateway: open whatever the story (B, from its own spawn)
+        let mut b = seat(&mut w, "B", t0);
+        b.drain();
+        walk_to(&mut w, &b, NEAR, 0.0, &mut now);
+        walk_to(&mut w, &b, FAR, 0.0, &mut now);
+        assert_eq!(offered_arrival(&b.drain()), YARD_ARRIVAL);
     }
 
     #[test]
