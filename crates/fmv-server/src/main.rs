@@ -103,7 +103,18 @@ DEBUG FLAGS (smoke-test aids; leave them off on a server real players use):
   command. It changes exactly two things: the gauge a battle starts with (the `battle started ...
   limits=[..]` log line shows it), and the end-of-battle gauge save, which is skipped (`limit not
   kept ... reason=debug-limit-full`): a limit gauge is never stored under it, so every account keeps
-  the gauge it really has, even after a member spent its limit or was knocked out.";
+  the gauge it really has, even after a member spent its limit or was knocked out.
+  --debug-bonus-exp EXP and --debug-bonus-limit GAUGE (each refused unless --debug-encounters is given
+  too, refused on the DEFAULT state directory (name a throw-away one with --state-dir, or use
+  --ephemeral), warned about at start-up and on every use; --debug-bonus-limit is also refused with
+  --debug-limit-full) are the opposite of --debug-limit-full: they make up numbers and STORE them, so
+  that a smoke run over real processes can level a new character up (a win pays about 16 of the ~250
+  experience a level costs) and fill a limit gauge, then prove both survive a real server restart.
+  Every won battle pays each member that fought on EXP experience more than the battle gave it (the
+  `battle reward ... exp=N debug_bonus_exp=EXP` line says what was really paid; the clients' replay of
+  the battle still verifies the rewards the battle itself earned), and every member's end-of-battle
+  limit gauge is kept GAUGE higher than the battle left it, up to the cap (`limit kept ...
+  debug_bonus_limit=GAUGE`). What is stored is indistinguishable from earned numbers.";
 
 #[derive(Parser, Debug)]
 #[command(name = "fmv-server", version, about = "Authoritative FF Multiverse server", after_help = AFTER_HELP)]
@@ -248,6 +259,20 @@ struct Cli {
     /// overwrite a real account's gauge. Logged as a warning at start-up.
     #[arg(long, requires = "debug_encounters")]
     debug_limit_full: bool,
+
+    /// DEBUG, needs --debug-encounters and an explicit --state-dir (or --ephemeral): every won battle pays each
+    /// member that fought on EXP experience MORE than it earned, through the ordinary save path, so that a smoke run
+    /// can make a new character level up over real processes. What is stored is indistinguishable from earned
+    /// experience: only ever run it on a throw-away state directory (refused on the default one). Logged as a
+    /// warning at start-up and on every payment.
+    #[arg(long, value_name = "EXP", requires = "debug_encounters", value_parser = clap::value_parser!(u32).range(1..))]
+    debug_bonus_exp: Option<u32>,
+
+    /// DEBUG, same rules as --debug-bonus-exp, and refused together with --debug-limit-full: the limit gauge
+    /// every member is kept with at the end of a battle is GAUGE (1-255) more than the battle left it, up to the
+    /// cap, through the ordinary save path, so that a smoke run can show a non-empty gauge surviving a restart.
+    #[arg(long, value_name = "GAUGE", requires = "debug_encounters", conflicts_with = "debug_limit_full", value_parser = clap::value_parser!(u8).range(1..=255))]
+    debug_bonus_limit: Option<u8>,
 }
 
 /// `--idle-timeout-secs` and `--inactivity-timeout-secs`: 0 disables the timeout.
@@ -353,8 +378,24 @@ impl Cli {
             debug_formation: self.debug_formation,
             random_encounters: !self.no_random_encounters,
             debug_limit_full: self.debug_limit_full,
+            debug_bonus_exp: self.debug_bonus_exp.unwrap_or(0),
+            debug_bonus_limit: self.debug_bonus_limit.unwrap_or(0),
             ..BattleSettings::new(rules)
         }
+    }
+
+    /// The two bonus flags make up numbers that are then STORED like earned ones, so they refuse to run on the default
+    /// state directory (the one a real server keeps its accounts in, next to the owner's library): the operator must name
+    /// a throw-away directory (`--state-dir`) or keep nothing (`--ephemeral`).
+    fn check_bonus_flags_state(&self) -> Result<(), String> {
+        let uses_bonus = self.debug_bonus_exp.is_some() || self.debug_bonus_limit.is_some();
+        let explicit = self.state_dir.as_deref().is_some_and(|dir| !dir.as_os_str().is_empty());
+        if uses_bonus && !self.ephemeral && !explicit {
+            return Err("--debug-bonus-exp and --debug-bonus-limit make up numbers that are then saved like earned ones, so they refuse to run on the \
+                        default state directory (the one a real server keeps its accounts in): pass --state-dir <a throw-away directory> or --ephemeral"
+                .to_string());
+        }
+        Ok(())
     }
 }
 
@@ -446,12 +487,17 @@ fn info_signal(name: &str) {
 }
 
 async fn real_main(cli: Cli) -> Result<(), String> {
+    // Before anything is built or bound: a debug flag that fabricates stored numbers never touches the default state.
+    cli.check_bonus_flags_state()?;
     let hosted = build_adapter(&cli).await.map_err(|e| e.to_string())?;
     let state_dir = server_state_dir(cli.state_dir.as_deref(), cli.ephemeral, || fmv_library::resolve_state_dir(None))?;
     // The library says the same about --debug-encounters; the flag lives in the battle settings, which a
     // server without battle data does not have, so this is the one place that can say it.
     if cli.debug_limit_full && hosted.battle.is_none() {
         warn!("--debug-limit-full has no effect: this server has no battle data, so battles are unsupported");
+    }
+    if (cli.debug_bonus_exp.is_some() || cli.debug_bonus_limit.is_some()) && hosted.battle.is_none() {
+        warn!("--debug-bonus-exp / --debug-bonus-limit have no effect: this server has no battle data, so battles are unsupported");
     }
     let config = cli.with_limits(ServerConfig {
         bind: cli.bind,
@@ -706,6 +752,65 @@ mod tests {
         for stale in ["stored as the gauge the member ended with", "save is the normal one", "Only the gauge a battle STARTS with changes"] {
             assert!(!flat.contains(stale), "--help must not describe the old save rule ({stale:?}):\n{help}");
         }
+    }
+
+    #[test]
+    fn the_bonus_flags_are_off_by_default_need_debug_encounters_never_meet_the_full_gauge_flag_and_map_into_the_settings() {
+        use fmv_protocol::SyntheticRules;
+        let rules = || std::sync::Arc::new(SyntheticRules::default());
+        let cli = parse(&["--debug-encounters"]).unwrap();
+        assert_eq!((cli.debug_bonus_exp, cli.debug_bonus_limit), (None, None), "off unless asked for");
+        let s = cli.battle_settings(rules());
+        assert_eq!((s.debug_bonus_exp, s.debug_bonus_limit), (0, 0));
+
+        let cli = parse(&["--debug-encounters", "--debug-bonus-exp", "900", "--debug-bonus-limit", "100"]).unwrap();
+        let s = cli.battle_settings(rules());
+        assert_eq!((s.debug_bonus_exp, s.debug_bonus_limit), (900, 100));
+        ServerConfig { battle: Some(s), debug_encounters: true, ..ServerConfig::default() }.validate().unwrap();
+
+        // A debug flag never runs alone: the parser refuses each one without --debug-encounters (a usage error).
+        assert!(parse(&["--debug-bonus-exp", "900"]).is_err());
+        assert!(parse(&["--debug-bonus-limit", "100"]).is_err());
+        // Nor next to the flag whose early return would make the limit bonus do nothing, nor with nonsense numbers.
+        assert!(parse(&["--debug-encounters", "--debug-limit-full", "--debug-bonus-limit", "100"]).is_err());
+        assert!(parse(&["--debug-encounters", "--debug-limit-full", "--debug-bonus-exp", "900"]).is_ok(), "the experience bonus has no quarrel with it");
+        for bad in [["--debug-bonus-exp", "0"], ["--debug-bonus-exp", "-5"], ["--debug-bonus-limit", "0"], ["--debug-bonus-limit", "256"]] {
+            assert!(parse(&["--debug-encounters", bad[0], bad[1]]).is_err(), "{bad:?}");
+        }
+
+        // The help says what they do, where they may not run and that they store what they make up.
+        use clap::CommandFactory;
+        let help = Cli::command().render_long_help().to_string();
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        for needle in [
+            "--debug-bonus-exp",
+            "--debug-bonus-limit",
+            "refused on the DEFAULT state directory",
+            "make up numbers and STORE them",
+            "debug_bonus_exp=EXP",
+        ] {
+            assert!(flat.contains(needle), "--help must mention {needle:?}:\n{help}");
+        }
+    }
+
+    /// The bonus flags store numbers nobody earned: they never run on the default state directory, only on one the
+    /// operator named (or none at all).
+    #[test]
+    fn the_bonus_flags_refuse_the_default_state_directory() {
+        let refused = |args: &[&str]| parse(args).unwrap().check_bonus_flags_state();
+        let on = ["--debug-encounters", "--debug-bonus-exp", "900"];
+        let err = refused(&on).expect_err("no --state-dir: the default (real) one");
+        assert!(err.contains("--state-dir") && err.contains("--ephemeral") && err.contains("default state directory"), "{err}");
+        assert!(refused(&["--debug-encounters", "--debug-bonus-limit", "100"]).is_err());
+        // (An empty --state-dir is refused by the parser itself, and `server_state_dir` would fall back to the default for
+        // one that got through, which the check does not count as a choice either.)
+        assert!(parse(&["--debug-encounters", "--debug-bonus-exp", "900", "--state-dir", ""]).is_err());
+        // A named directory, or none kept at all, is fine; and the check is silent about everything else.
+        assert!(refused(&["--debug-encounters", "--debug-bonus-exp", "900", "--state-dir", "/tmp/throw-away"]).is_ok());
+        assert!(refused(&["--debug-encounters", "--debug-bonus-limit", "100", "--ephemeral"]).is_ok());
+        assert!(refused(&["--debug-encounters"]).is_ok());
+        assert!(refused(&[]).is_ok());
+        assert!(refused(&["--debug-encounters", "--debug-limit-full"]).is_ok(), "the full-gauge flag stores nothing");
     }
 
     #[test]
