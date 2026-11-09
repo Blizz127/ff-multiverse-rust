@@ -208,7 +208,7 @@ impl AreaState {
         &self.id.key
     }
 
-    /// The one log line about the exits and story points the adapter left off this area (`AreaRuntime::story_withheld`),
+    /// The one log line about the exits, story points and links the adapter left off this area (`AreaRuntime::story_withheld`),
     /// said when the area is loaded: how many, which (the first few) and why. `None` when nothing was left off.
     pub(super) fn withheld_line(&self) -> Option<String> {
         let withheld = self.runtime.story_withheld()?;
@@ -220,13 +220,15 @@ impl AreaState {
             shown.join("; ")
         };
         Some(format!(
-            "story left off (said once for this area) area={} why={} script_exits={} story_points={} exits=[{}] points=[{}]",
+            "story left off (said once for this area) area={} why={} script_exits={} story_points={} exits=[{}] points=[{}] links={} link_list=[{}]",
             self.id,
             clip(&withheld.reason, 60),
             withheld.exits.len(),
             withheld.points.len(),
             listed(&withheld.exits),
-            listed(&withheld.points)
+            listed(&withheld.points),
+            withheld.links.len(),
+            listed(&withheld.links)
         ))
     }
 
