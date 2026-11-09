@@ -99,10 +99,10 @@
 //! real track for slot 5 (held by `party_clips_agree_across_the_characters`). In the scene: `defend-close-<n>.png`
 //! of `sheets::fight_defend_sheets`, before and after.
 //!
-//! **The hops around a cast are not played.** Script 17 hops forward (3: 8 to 14 frames, the root carries the actor
+//! **The hops around a cast are not played.** Script 17 hops forward (3: 7 to 14 frames, the root carries the actor
 //! hundreds of units), gathers (12, 13), runs the effect (`EC`), ends (14) and hops back (4). The plan can only cover
 //! [`super::plan::MAX_SPEEDUP`] x [`super::cue::MAX_IMPACT_DELAY`] of natural time before the impact (27 ticks), and the
-//! gathering alone (36 ticks for Cloud, never fewer than 32) is longer: [`super::plan::fit`] drops the START of a plan that is
+//! gathering alone (36 ticks for Cloud, 33 to 42 across the nine) is longer: [`super::plan::fit`] drops the START of a plan that is
 //! too long, so a hop forward put before the gathering would be the part cut, every time; and a hop back with no hop
 //! forward is a jump in place. The arithmetic is held to the owner's files by `party_clips_agree_across_the_characters`;
 //! the cast stays the gathering clips (begin to the impact, hold, end).

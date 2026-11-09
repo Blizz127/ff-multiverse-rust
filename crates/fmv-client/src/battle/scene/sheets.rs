@@ -138,7 +138,7 @@ fn party_clips_agree_across_the_characters() {
         let gathering: f64 = [12u16, 13].iter().map(|&s| f64::from(kit.clips.frames_of(s))).sum();
         let hop = f64::from(kit.clips.frames_of(3));
         eprintln!("{name}: cast hop forward {hop} ticks, gathering {gathering} ticks, the plan covers {cap:.0} ticks before the impact");
-        assert!(gathering >= cap - 1.0, "{name}: the gathering ({gathering} ticks) fills what the cap lets the plan cover ({cap:.0}) without the hop ({hop})");
+        assert!(gathering > cap, "{name}: the gathering ({gathering} ticks) is longer than what the cap lets the plan cover ({cap:.0}) without the hop ({hop})");
         // The weapon rides on a track of its own for each slot played: every slot the kit uses, the clips of the blows
         // included, has a real one (a slot with a stand-in track would draw the weapon at some other slot's place).
         let mut played = vec![0usize, 2, 3, 4, 6, 7, 9, 10, 12, 13, 14, 15, 18];
