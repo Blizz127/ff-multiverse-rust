@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fmv_ff7_battle::rules::{DEFAULT_BATTLE_SPEED, DEFAULT_TICKS_PER_SECOND};
+use fmv_ff7_battle::status::StatusSet;
 use fmv_fixture::FIXTURE_AREA_KEY;
 use fmv_party::PartyConfig;
 use fmv_protocol::{BattleRules, DEFAULT_DEV_PORT};
@@ -109,6 +110,13 @@ pub struct BattleSettings {
     /// `limit kept` save (the log line says `debug_bonus_limit=N`), so that a smoke run can show a non-empty gauge
     /// surviving a server restart over real processes. 0 is off.
     pub debug_bonus_limit: u8,
+    /// DEBUG, `--debug-status LIST` (refused without `--debug-encounters`, and when the set is not one a battle can
+    /// start with: see [`StatusSet::is_valid_start`]): every member of every battle this server starts, the canon
+    /// companions and the players alike, begins it with these statuses, so that a smoke run can show a status applied,
+    /// travelling and replayed over real processes (a real battle starts clean, and the first mission's enemies inflict
+    /// none). It changes exactly one thing, the statuses a battle starts with (`BattleMember::status`: `EncounterStart`,
+    /// the `battle started` log line and every client's replay carry it); nothing is stored. Empty (off) by default.
+    pub debug_status: StatusSet,
     /// When the canon companions act (protocol v9 companions, see `crate::companion`, "Pacing"): a companion with a full
     /// gauge waits for every living, connected player that still owes a turn, at most `turn_wait_ms` after that
     /// player's own gauge filled and at most `max_wait_ms` in all. `--companion-turn-wait-ms` / `--companion-max-wait-ms`;
@@ -131,6 +139,7 @@ impl BattleSettings {
             debug_limit_full: false,
             debug_bonus_exp: 0,
             debug_bonus_limit: 0,
+            debug_status: StatusSet::EMPTY,
             companion_pacing: crate::companion::Pacing::default(),
         }
     }
@@ -151,6 +160,7 @@ impl fmt::Debug for BattleSettings {
             .field("debug_limit_full", &self.debug_limit_full)
             .field("debug_bonus_exp", &self.debug_bonus_exp)
             .field("debug_bonus_limit", &self.debug_bonus_limit)
+            .field("debug_status", &self.debug_status)
             .field("companion_pacing", &self.companion_pacing)
             .finish()
     }
@@ -376,6 +386,16 @@ impl ServerConfig {
                     "debug_bonus_exp and debug_bonus_limit (--debug-bonus-exp, --debug-bonus-limit) are debug flags and need debug_encounters (--debug-encounters) too"
                         .into(),
                 );
+            }
+            // A status every member starts with is a debug aid, and must be a set the engine can start with.
+            if !b.debug_status.is_empty() && !self.debug_encounters {
+                return bad("debug_status (--debug-status) is a debug flag and needs debug_encounters (--debug-encounters) too".into());
+            }
+            if !b.debug_status.is_valid_start() {
+                return bad(format!(
+                    "debug_status (--debug-status) {} is not a set a battle can start with (only the statuses the battle plays, and never Haste with Slow or Sadness with Fury)",
+                    b.debug_status
+                ));
             }
             // `keep_limits` returns early under --debug-limit-full, so a limit bonus would silently do nothing.
             if b.debug_bonus_limit > 0 && b.debug_limit_full {

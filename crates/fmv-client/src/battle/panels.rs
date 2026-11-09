@@ -184,6 +184,8 @@ const HP_LOW: Rgba = WARN;
 const HEAL: Rgba = [112, 236, 132, 255];
 const MP_POP: Rgba = [130, 210, 255, 255];
 const MISS: Rgba = [214, 218, 236, 255];
+/// Poison's own purple, for its turns and for the names of the statuses that hurt.
+const POISON_POP: Rgba = [196, 128, 236, 255];
 
 /// An FF7-style window: a light border with rounded corners, a blue gradient inside, a dark outline
 /// that separates it from whatever is behind.
@@ -497,6 +499,9 @@ fn popup_look(p: &Popup) -> (Rgba, String) {
         PopupKind::Heal { .. } => HEAL,
         PopupKind::Mp { .. } => MP_POP,
         PopupKind::Miss => MISS,
+        PopupKind::Poison { .. } => POISON_POP,
+        PopupKind::Status { status } if status.is_beneficial() => HEAL,
+        PopupKind::Status { .. } => POISON_POP,
     };
     (color, p.kind.text())
 }

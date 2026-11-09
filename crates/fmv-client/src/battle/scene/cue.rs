@@ -77,7 +77,7 @@ pub fn impact_delay(action: Option<ActionRef>) -> f64 {
 /// How an event shows on screen.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Landing {
-    /// A blow (or a heal, or a revival, or MP coming back) lands on `target` at the impact.
+    /// A blow (or a heal, or a revival, or MP coming back, or a status) lands on `target` at the impact.
     Impact { target: ActorId },
     /// `actor` begins to die: after the blow that did it, [`DEATH_BEAT`] later.
     Death { actor: ActorId },
@@ -91,7 +91,11 @@ pub fn landing(event: &BattleEvent) -> Option<Landing> {
         | BattleEvent::Miss { target, .. }
         | BattleEvent::Heal { target, .. }
         | BattleEvent::Revive { target, .. }
-        | BattleEvent::MpRestored { target, .. } => Some(Landing::Impact { target }),
+        | BattleEvent::MpRestored { target, .. }
+        // A status an action inflicts or cures is the whole effect of a Sleep, a Haste or an Antidote: it lands with the
+        // action, so that its target is the action's and its word comes up when the cast does.
+        | BattleEvent::StatusInflicted { target, .. }
+        | BattleEvent::StatusEnded { target, .. } => Some(Landing::Impact { target }),
         BattleEvent::Death { actor } => Some(Landing::Death { actor }),
         BattleEvent::GaugeReady { .. }
         | BattleEvent::Victory
@@ -100,6 +104,8 @@ pub fn landing(event: &BattleEvent) -> Option<Landing> {
         // The gauge's bar is the overlay's; the stumble of a failed escape is the director's own.
         | BattleEvent::LimitGauge { .. }
         | BattleEvent::EscapeFailed { .. }
+        // A turn of Poison or Regen is the clock's, not an action's: its number comes up at once.
+        | BattleEvent::StatusTick { .. }
         | BattleEvent::MpSpent { .. } => None,
     }
 }

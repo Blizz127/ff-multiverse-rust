@@ -327,6 +327,7 @@ impl Server {
                 info!(
                     debug_encounters = debug_on,
                     debug_limit_full = b.debug_limit_full,
+                    debug_status = %b.debug_status,
                     debug_bonus_exp = b.debug_bonus_exp,
                     debug_bonus_limit = b.debug_bonus_limit,
                     battle_speed = b.battle_speed,
@@ -340,6 +341,13 @@ impl Server {
                     warn!(
                         "DEBUG: --debug-limit-full is on: every member of every battle starts with a FULL limit gauge instead of its account's own (a smoke-test aid; leave it off on a server real players use). \
                          No limit gauge is ever stored under it: the end-of-battle gauge save is skipped (logged as `limit not kept ... reason=debug-limit-full`), so a debug run can never overwrite a real account's gauge"
+                    );
+                }
+                if !b.debug_status.is_empty() {
+                    warn!(
+                        "DEBUG: --debug-status {} is on: every member of every battle starts with those statuses instead of none (a smoke-test aid; leave it off on a server real players use). \
+                         Nothing is stored under it: it only changes what a battle starts with (logged as `battle started ... statuses=[..]`)",
+                        b.debug_status
                     );
                 }
                 if b.debug_bonus_exp > 0 {

@@ -71,6 +71,18 @@
 //!   reason=debug-limit-full`) and every account keeps the gauge it really has, even when a member spent
 //!   its limit or was knocked out. A test run with this flag can therefore never overwrite a real account's
 //!   gauge. The server logs the flag loudly when it starts.
+//! * **`--debug-status LIST`** (`BattleSettings::debug_status`, a debug flag that needs `--debug-encounters`): every
+//!   member of every battle this server starts, the canon companions and the players alike, begins with those statuses
+//!   (a real battle starts clean, and the first mission's enemies inflict none, so without this a smoke run over real
+//!   processes would never see one). It changes only what the battle STARTS with (`BattleMember::status`, which
+//!   travels in `EncounterStart`, so every replay starts from it and the engine announces them with its first step):
+//!   the `battle started` line says `statuses=[Poison+Silence, ..]` (one entry per fighter in actor order, `-` for
+//!   none), nothing is stored, and the server logs the flag loudly when it starts. The engine's own refusals
+//!   (`CannotAct` for a member that is asleep, stopped or paralysed, `Silenced` for a silenced one's spell) answer a
+//!   command like any other, and a member that cannot take a turn owes none to the companions' pacing.
+//!   Whatever the engine announces about statuses is logged as `status inflicted battle=.. actor=.. status=..` and
+//!   `status ended battle=.. actor=.. status=..` (a Poison or Regen turn is only counted: the `battle ended` line ends with
+//!   `status_inflicted=N status_ended=N status_ticks=N`).
 //! * **`--debug-bonus-exp N` and `--debug-bonus-limit N`** (`BattleSettings::debug_bonus_exp` /
 //!   `debug_bonus_limit`, debug flags that need `--debug-encounters` and which `main` refuses to run on the default
 //!   state directory, or together with `--debug-limit-full`): they exist so that a smoke run over real processes can
@@ -124,7 +136,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use fmv_adapter_api::{AreaRuntime, EncounterTable};
 use fmv_core::{AccountId, EntityId};
 use fmv_ff7_battle::rng::Rng;
-use fmv_ff7_battle::rules::{ActorId, BattleState, Command, CommandError, Outcome, Target, MAX_STEP_MS};
+use fmv_ff7_battle::rules::{ActorId, BattleEvent, BattleState, Combatant, Command, CommandError, Outcome, Target, MAX_STEP_MS};
+use fmv_ff7_battle::status::StatusSet;
 use fmv_protocol::{
     assign_drops, clip_character_name, reward_roster, split_rewards, AppliedCommand, BattleId, BattleMember, BattleRejection, BattleReward,
     BattleRules, BattleSetup, ServerMsg, MAX_BATTLE_PARTY,
@@ -181,9 +194,42 @@ struct Battle {
     /// win are rolled from (they are not part of the replayed battle).
     formation: u16,
     seed: u64,
+    /// How many `StatusInflicted`, `StatusEnded` and `StatusTick` events the engine has announced (logged when the
+    /// battle ends; the first two are also logged one by one, see [`Battle::note_statuses`]).
+    status_counts: [u32; 3],
+}
+
+/// How a set of statuses reads in a log line: the names joined by `+`, or `-` for none (one token, so that a list of
+/// them never splits a line).
+fn status_word(set: StatusSet) -> String {
+    if set.is_empty() {
+        return "-".to_string();
+    }
+    set.iter().map(|s| s.name()).collect::<Vec<_>>().join("+")
 }
 
 impl Battle {
+    /// Count the status events among `events` and say each inflicted or ended one as a log line:
+    /// `status inflicted battle=.. actor=.. status=..` and `status ended ...` (a Poison or Regen turn is only counted).
+    fn note_statuses(&mut self, id: BattleId, events: &[BattleEvent]) -> Vec<String> {
+        let mut lines = Vec::new();
+        for event in events {
+            match event {
+                BattleEvent::StatusInflicted { target, status } => {
+                    self.status_counts[0] += 1;
+                    lines.push(format!("status inflicted battle={} actor={} status={}", id.0, target.0, status.name()));
+                }
+                BattleEvent::StatusEnded { target, status } => {
+                    self.status_counts[1] += 1;
+                    lines.push(format!("status ended battle={} actor={} status={}", id.0, target.0, status.name()));
+                }
+                BattleEvent::StatusTick { .. } => self.status_counts[2] += 1,
+                _ => {}
+            }
+        }
+        lines
+    }
+
     /// Whole milliseconds since the last step, bounded by what one engine step takes; the clock
     /// moves by exactly what is returned, so no fraction of a millisecond is ever lost.
     fn take_elapsed_ms(&mut self, now: Instant) -> u32 {
@@ -213,13 +259,15 @@ impl Battle {
         }
     }
 
-    /// The living, connected players as the companions' pacing sees them (`companion::may_act`).
+    /// The living, connected players as the companions' pacing sees them (`companion::may_act`). A player that cannot
+    /// take a turn (asleep, stopped or paralysed: it holds its full gauge but gives no command) owes none, so it holds
+    /// nobody up.
     fn player_turns(&self) -> Vec<companion::PlayerTurn> {
         self.members
             .iter()
             .enumerate()
             .filter(|(i, m)| {
-                m.info.is_player() && m.connected && u8::try_from(*i).ok().and_then(|i| self.state.actor(ActorId(i))).is_some_and(|c| c.is_alive())
+                m.info.is_player() && m.connected && u8::try_from(*i).ok().and_then(|i| self.state.actor(ActorId(i))).is_some_and(Combatant::can_act)
             })
             .map(|(i, _)| companion::PlayerTurn {
                 commands: self.commands.get(i).copied().unwrap_or(0),
@@ -365,6 +413,9 @@ fn rejection_of(e: CommandError) -> BattleRejection {
         CommandError::NoLimit(_) => BattleRejection::NoLimit,
         CommandError::LimitNotReady(_) => BattleRejection::LimitNotReady,
         CommandError::CannotEscape => BattleRejection::CannotEscape,
+        // A sleeper, a stopped or a paralysed member holds its turn; a silenced one cannot cast (statuses).
+        CommandError::CannotAct(_) => BattleRejection::CannotAct,
+        CommandError::Silenced(_) => BattleRejection::Silenced,
     }
 }
 
@@ -476,7 +527,7 @@ impl World {
             .iter()
             .filter_map(|&character| {
                 let name = clip_character_name(&bw.rules().character_name(character)?);
-                Some(BattleMember::companion(name, character, companion_level, companion_limit))
+                Some(BattleMember { status: bw.settings.debug_status, ..BattleMember::companion(name, character, companion_level, companion_limit) })
             })
             .take(MAX_BATTLE_PARTY.saturating_sub(entities.len()))
             .collect();
@@ -496,7 +547,8 @@ impl World {
                 // The roster carries the PLAYER'S OWN name (v8): every peer's panel, list and banners show it, while
                 // `character` (the stat curve) alone decides which combat template the engine uses.
                 let name = clip_character_name(&p.snapshot.avatar.display_name);
-                Some((entity, BattleMember::player(entity, p.account, name, own.character, level, limit)))
+                let member = BattleMember { status: bw.settings.debug_status, ..BattleMember::player(entity, p.account, name, own.character, level, limit) };
+                Some((entity, member))
             })
             .collect();
         let entities: Vec<EntityId> = players.iter().map(|(entity, _)| *entity).collect();
@@ -544,6 +596,7 @@ impl World {
                 clock: now,
                 formation,
                 seed,
+                status_counts: [0; 3],
             },
         );
         for entity in &entities {
@@ -558,7 +611,7 @@ impl World {
         // (`character::log_token`) so that a name with a space never splits the line; `characters` are their
         // stat curves (a companion's own character), in the same order.
         self.logs.info(format!(
-            "battle started battle={} formation={formation} members={} enemies={} preemptive={} back_attack={} seed={seed} characters={:?} levels={:?} limits={:?} run_difficulty={escape} names=[{}] companions={}",
+            "battle started battle={} formation={formation} members={} enemies={} preemptive={} back_attack={} seed={seed} characters={:?} levels={:?} limits={:?} run_difficulty={escape} names=[{}] companions={} statuses=[{}]",
             id.0,
             entities.len(),
             info.enemies,
@@ -569,6 +622,7 @@ impl World {
             party.iter().map(|m| m.limit).collect::<Vec<_>>(),
             party.iter().map(|m| log_token(&m.name)).collect::<Vec<_>>().join(","),
             companions.len(),
+            party.iter().map(|m| status_word(m.status)).collect::<Vec<_>>().join(","),
         ));
         self.fan_to(&entities, start);
         Ok(id)
@@ -653,6 +707,7 @@ impl World {
                     )),
                     _ => None,
                 };
+                let status_notes = battle.note_statuses(battle_id, &events);
                 let msg = ServerMsg::BattleEvent {
                     battle_id,
                     tick: battle.state.tick(),
@@ -662,6 +717,9 @@ impl World {
                 let (ended, recipients) = (battle.state.outcome().is_some(), battle.connected());
                 if let Some(note) = note {
                     self.logs.info(note);
+                }
+                for line in status_notes {
+                    self.logs.info(line);
                 }
                 self.fan_to(&recipients, Arc::new(msg));
                 // The engine took the command, so the item is spent (even if the player dropped meanwhile).
@@ -722,9 +780,13 @@ impl World {
         let Some(battle) = bw.battles.get_mut(&id) else { return };
         let ms = battle.take_elapsed_ms(now);
         let events = battle.state.step(ms);
+        let status_notes = battle.note_statuses(id, &events);
         let (tick, ended, recipients) = (battle.state.tick(), battle.state.outcome().is_some(), battle.connected());
         if !events.is_empty() {
             self.fan_to(&recipients, Arc::new(ServerMsg::BattleEvent { battle_id: id, tick, events, command: None }));
+        }
+        for line in status_notes {
+            self.logs.info(line);
         }
         if ended {
             self.finish_battle(id);
@@ -782,13 +844,14 @@ impl World {
                             actor.0,
                             describe_command(&command, limit_id)
                         );
+                        let status_notes = battle.note_statuses(id, &events);
                         let msg = ServerMsg::BattleEvent {
                             battle_id: id,
                             tick: battle.state.tick(),
                             events,
                             command: Some(AppliedCommand { actor, command }),
                         };
-                        Ok((note, msg, battle.state.outcome().is_some(), battle.connected()))
+                        Ok((note, status_notes, msg, battle.state.outcome().is_some(), battle.connected()))
                     }
                     // Not reachable (the rule only picks what `check_command` accepts, in the same state): said loudly
                     // and the round ends rather than trying the same thing again.
@@ -796,8 +859,11 @@ impl World {
                 }
             };
             match acted {
-                Ok((note, msg, ended, recipients)) => {
+                Ok((note, status_notes, msg, ended, recipients)) => {
                     self.logs.info(note);
+                    for line in status_notes {
+                        self.logs.info(line);
+                    }
                     self.fan_to(&recipients, Arc::new(msg));
                     if ended {
                         self.finish_battle(id);
@@ -838,13 +904,16 @@ impl World {
         // `members` counts the PLAYERS (as it always did); `commands` and `limits` have one entry per fighter in actor
         // order, the `companions` canon companions first.
         self.logs.info(format!(
-            "battle ended battle={} outcome={outcome:?} ticks={} members={} commands={:?} limits={:?} companions={}",
+            "battle ended battle={} outcome={outcome:?} ticks={} members={} commands={:?} limits={:?} companions={} status_inflicted={} status_ended={} status_ticks={}",
             id.0,
             battle.state.tick(),
             battle.members.iter().filter(|m| m.info.is_player()).count(),
             battle.commands,
             (0..battle.members.len()).map(|i| u8::try_from(i).map_or(0, |i| battle.state.limit_gauge(ActorId(i)))).collect::<Vec<_>>(),
             battle.members.iter().filter(|m| m.info.is_companion()).count(),
+            battle.status_counts[0],
+            battle.status_counts[1],
+            battle.status_counts[2],
         ));
         let told = self.pay_members(id, &battle.members, &rewards);
         self.keep_limits(id, &battle);

@@ -104,6 +104,13 @@ DEBUG FLAGS (smoke-test aids; leave them off on a server real players use):
   limits=[..]` log line shows it), and the end-of-battle gauge save, which is skipped (`limit not
   kept ... reason=debug-limit-full`): a limit gauge is never stored under it, so every account keeps
   the gauge it really has, even after a member spent its limit or was knocked out.
+  --debug-status LIST (refused unless --debug-encounters is given too, and warned about at start-up) makes
+  every member of every battle start with those statuses (comma-separated names of the ones a battle plays:
+  Sleep, Poison, Silence, Haste, Slow, Stop, Regen, Barrier, MBarrier, Sadness, Fury, Paralysis, Darkness;
+  never Haste with Slow or Sadness with Fury), so that a smoke run can show a status applied, announced to
+  every client and replayed by it with no divergence: a real battle starts clean and the first mission's
+  enemies inflict none. It changes only what a battle starts with (the `battle started ... statuses=[..]` log
+  line shows it; the `status inflicted` / `status ended` lines follow them); nothing is stored.
   --debug-bonus-exp EXP and --debug-bonus-limit GAUGE (each refused unless --debug-encounters is given
   too, refused on the DEFAULT state directory (name a throw-away one with --state-dir, or use
   --ephemeral), warned about at start-up and on every use; --debug-bonus-limit is also refused with
@@ -260,6 +267,14 @@ struct Cli {
     #[arg(long, requires = "debug_encounters")]
     debug_limit_full: bool,
 
+    /// DEBUG, needs --debug-encounters: every member of every battle (the canon companions and the players) starts it
+    /// with these statuses, a comma-separated list of the names of the ones a battle plays (Sleep, Poison, Silence,
+    /// Haste, Slow, Stop, Regen, Barrier, MBarrier, Sadness, Fury, Paralysis, Darkness; never Haste with Slow or Sadness
+    /// with Fury), so that a smoke run can show a status applied, announced and replayed over real processes. Nothing is
+    /// stored. Logged as a warning at start-up.
+    #[arg(long, value_name = "LIST", requires = "debug_encounters", value_parser = parse_status_list)]
+    debug_status: Option<fmv_ff7_battle::status::StatusSet>,
+
     /// DEBUG, needs --debug-encounters and an explicit --state-dir (or --ephemeral): every won battle pays each
     /// member that fought on EXP experience MORE than it earned, through the ordinary save path, so that a smoke run
     /// can make a new character level up over real processes. What is stored is indistinguishable from earned
@@ -283,6 +298,26 @@ struct Cli {
     /// companions act the instant their gauge fills.
     #[arg(long, value_name = "MS", default_value_t = fmv_server::companion::DEFAULT_MAX_WAIT_MS)]
     companion_max_wait_ms: u32,
+}
+
+/// `--debug-status`: a comma-separated list of status names (any case, with or without spaces and hyphens) that a
+/// battle can start with. Says which name or pair it cannot take.
+fn parse_status_list(list: &str) -> Result<fmv_ff7_battle::status::StatusSet, String> {
+    use fmv_ff7_battle::status::{Status, StatusSet, MODELLED};
+    let mut set = StatusSet::EMPTY;
+    for word in list.split(',').map(str::trim).filter(|w| !w.is_empty()) {
+        let status = Status::from_name(word).filter(|s| s.is_modelled()).ok_or_else(|| {
+            format!("`{word}` is not a status a battle plays (it plays {MODELLED})")
+        })?;
+        set.insert(status);
+    }
+    if set.is_empty() {
+        return Err("the list names no status".into());
+    }
+    if !set.is_valid_start() {
+        return Err(format!("{set} cannot all start a battle together (never Haste with Slow, nor Sadness with Fury)"));
+    }
+    Ok(set)
 }
 
 /// `--idle-timeout-secs` and `--inactivity-timeout-secs`: 0 disables the timeout.
@@ -388,6 +423,7 @@ impl Cli {
             debug_formation: self.debug_formation,
             random_encounters: !self.no_random_encounters,
             debug_limit_full: self.debug_limit_full,
+            debug_status: self.debug_status.unwrap_or_default(),
             debug_bonus_exp: self.debug_bonus_exp.unwrap_or(0),
             debug_bonus_limit: self.debug_bonus_limit.unwrap_or(0),
             companion_pacing: fmv_server::companion::Pacing { turn_wait_ms: self.companion_turn_wait_ms, max_wait_ms: self.companion_max_wait_ms },
@@ -506,6 +542,9 @@ async fn real_main(cli: Cli) -> Result<(), String> {
     // server without battle data does not have, so this is the one place that can say it.
     if cli.debug_limit_full && hosted.battle.is_none() {
         warn!("--debug-limit-full has no effect: this server has no battle data, so battles are unsupported");
+    }
+    if cli.debug_status.is_some() && hosted.battle.is_none() {
+        warn!("--debug-status has no effect: this server has no battle data, so battles are unsupported");
     }
     if (cli.debug_bonus_exp.is_some() || cli.debug_bonus_limit.is_some()) && hosted.battle.is_none() {
         warn!("--debug-bonus-exp / --debug-bonus-limit have no effect: this server has no battle data, so battles are unsupported");

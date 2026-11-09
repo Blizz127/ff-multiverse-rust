@@ -447,8 +447,12 @@ impl Director {
                 let kind = if matches!(action, Some(ActionRef::Magic(_) | ActionRef::Limit(_))) { BurstKind::Spell } else { BurstKind::Item };
                 self.burst(impact, i, kind, if look.element == Element::Plain { Element::Cure } else { look.element });
             }
+            // A status shows as a word over the target and a tag on the panel (and, for the ones that show on the
+            // body, in how it is drawn): nothing moves because of it.
+            BattleEvent::StatusInflicted { .. } | BattleEvent::StatusEnded { .. } => {}
             // Not a landing at the target (the cue's own `landing` does not make these).
-            BattleEvent::Death { .. }
+            BattleEvent::StatusTick { .. }
+            | BattleEvent::Death { .. }
             | BattleEvent::GaugeReady { .. }
             | BattleEvent::Victory
             | BattleEvent::Defeat

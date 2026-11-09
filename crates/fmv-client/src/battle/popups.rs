@@ -18,9 +18,13 @@
 //! | `Heal { target, amount }` | [`PopupKind::Heal`] with `amount` |
 //! | `Revive { target, hp }` | [`PopupKind::Heal`] with `hp` (the HP it came back with) |
 //! | `MpRestored { target, amount }` | [`PopupKind::Mp`] with `amount` |
+//! | `StatusInflicted { target, status }` | [`PopupKind::Status`]: the status's name, over `target` |
+//! | `StatusTick { target, status: Poison, amount }` | [`PopupKind::Poison`] with `amount` |
+//! | `StatusTick { target, status: Regen, amount }` | [`PopupKind::Heal`] with `amount` |
 //!
 //! Everything else says nothing over a fighter: gauges filling, deaths and the end, an `Action` (its
-//! name goes to the banner, see `hud`) and `MpSpent` (the caster's own MP bar shows it).
+//! name goes to the banner, see `hud`), `MpSpent` (the caster's own MP bar shows it) and `StatusEnded` (the tag
+//! on the panel goes away).
 //!
 //! # When a number is born
 //!
@@ -38,6 +42,7 @@
 
 use super::scene::cue;
 use fmv_ff7_battle::rules::{ActorId, BattleEvent};
+use fmv_ff7_battle::status::Status;
 
 /// How long a popup stays, in seconds.
 pub const LIFETIME_S: f64 = 1.1;
@@ -53,14 +58,21 @@ pub enum PopupKind {
     /// MP restored (the engine's `MpRestored` event).
     Mp { amount: u32 },
     Miss,
+    /// A turn of Poison (the engine's `StatusTick`): HP lost, in the colour of the status.
+    Poison { amount: u32 },
+    /// A status the fighter now has (the engine's `StatusInflicted`): its name.
+    Status { status: Status },
 }
 
 impl PopupKind {
     /// The words on screen.
     pub fn text(self) -> String {
         match self {
-            PopupKind::Damage { amount, .. } | PopupKind::Heal { amount } | PopupKind::Mp { amount } => amount.to_string(),
+            PopupKind::Damage { amount, .. } | PopupKind::Heal { amount } | PopupKind::Mp { amount } | PopupKind::Poison { amount } => {
+                amount.to_string()
+            }
             PopupKind::Miss => "Miss".to_string(),
+            PopupKind::Status { status } => status.name().to_string(),
         }
     }
 }
@@ -83,6 +95,9 @@ pub fn popup_of(event: &BattleEvent) -> Option<(ActorId, PopupKind)> {
         BattleEvent::Heal { target, amount, .. } => Some((target, PopupKind::Heal { amount })),
         BattleEvent::Revive { target, hp, .. } => Some((target, PopupKind::Heal { amount: hp })),
         BattleEvent::MpRestored { target, amount, .. } => Some((target, PopupKind::Mp { amount })),
+        BattleEvent::StatusInflicted { target, status } => Some((target, PopupKind::Status { status })),
+        BattleEvent::StatusTick { target, status: Status::Poison, amount } => Some((target, PopupKind::Poison { amount })),
+        BattleEvent::StatusTick { target, amount, .. } => Some((target, PopupKind::Heal { amount })),
         // Gauges filling, deaths and the end say nothing over a fighter, nor does an action's start
         // (the banner has its name) or the MP it cost (the caster's bar shows it). Protocol v7: the limit
         // gauge has its own bar in the party panel, and a failed escape its words in the banner.
@@ -93,6 +108,7 @@ pub fn popup_of(event: &BattleEvent) -> Option<(ActorId, PopupKind)> {
         | BattleEvent::Action { .. }
         | BattleEvent::LimitGauge { .. }
         | BattleEvent::EscapeFailed { .. }
+        | BattleEvent::StatusEnded { .. }
         | BattleEvent::MpSpent { .. } => None,
     }
 }

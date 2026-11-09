@@ -395,6 +395,14 @@ impl StatusSet {
         StatusSet(self.0 & !other.0)
     }
 
+    /// Whether a combatant can begin a battle with exactly this set: only statuses the rules play ([`MODELLED`]) and
+    /// never both of a pair that cancel each other (Haste with Slow, Sadness with Fury), which the rules themselves
+    /// never produce. The one check of the debug input that gives a battle its starting statuses.
+    pub fn is_valid_start(self) -> bool {
+        let pair = |a: Status, b: Status| self.contains(a) && self.contains(b);
+        self.difference(MODELLED).is_empty() && !pair(Status::Haste, Status::Slow) && !pair(Status::Sadness, Status::Fury)
+    }
+
     /// The statuses in the set, in bit order.
     pub fn iter(self) -> impl Iterator<Item = Status> {
         Status::ALL.into_iter().filter(move |s| self.contains(*s))
