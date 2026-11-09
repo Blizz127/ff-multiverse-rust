@@ -463,8 +463,8 @@ fn random_scripts_in_every_slot_never_panic_the_engine_and_a_replay_always_agree
             party[0].max_mp = 50;
             battle_with(case, party, foes.clone())
         };
-        let (log, state) = serve(&build, 1 + case % 9);
-        assert_eq!(replay(&build, &log).as_deref(), Ok(state.as_str()), "case {case}: the replay agrees");
+        let (log, state) = serve(build, 1 + case % 9);
+        assert_eq!(replay(build, &log).as_deref(), Ok(state.as_str()), "case {case}: the replay agrees");
         answered += log
             .iter()
             .filter(|(_, events, command)| {

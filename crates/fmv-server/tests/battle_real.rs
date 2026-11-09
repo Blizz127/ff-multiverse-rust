@@ -632,11 +632,14 @@ fn how_auto_attackers_fare_against_early_formations() {
 }
 
 /// A fight with the real Guard Scorpion, whose General counter (the Tail Laser, on the whole party) and Death counter
-/// run inside the commands that provoke them: four players (Cloud, Barret, Tifa and Aerith, so that the enemy's
-/// script slots hold more fighters than the three the original has) defend until the Scorpion's tail is up, then
-/// strike it, the way a server drives a battle; every message the server would send (the engine's tick, its events,
-/// the command that caused them) is then fed to a client's own engine, which must reproduce each one exactly and end
-/// in the very same state. Run at the engine's own pace and at the smoke's, with several seeds.
+/// run inside the commands that provoke them. Two rosters: four players (Cloud, Barret, Tifa and Aerith, so that the
+/// enemy's script slots hold more fighters than the three the original has), and the real first-reactor shape, the
+/// canon Cloud and Barret as the server's companions (full limit gauges, commanded by the server's own rule,
+/// `fmv_server::companion::command`) and two players. They defend until the Scorpion's tail is up, then strike it (the
+/// companions as the server's rule says, a limit break among it), the way a server drives a battle; every message
+/// the server would send (the engine's tick, its events, the command that caused them) is then fed to a client's own
+/// engine, which must reproduce each one exactly and end in the very same state. Run at the engine's own pace and at
+/// the smoke's, with several seeds.
 #[test]
 #[ignore = "needs the owner's library: set FMV_FF7_LIBRARY"]
 fn a_guard_scorpion_fight_with_its_counters_is_replayed_exactly_by_a_client_engine() {
@@ -651,62 +654,88 @@ fn a_guard_scorpion_fight_with_its_counters_is_replayed_exactly_by_a_client_engi
         .and_then(|f| u16::try_from(f).ok())
         .expect("a formation has the Guard Scorpion");
     let info = data.formation(formation).expect("it has enemies");
-    let characters = [0u8, 1, 2, 3];
-    let mut counter_batches = 0usize;
+    let (mut counter_batches, mut companion_counter_batches, mut limit_counter_batches) = (0usize, 0usize, 0usize);
     let mut tails_up = 0usize;
-    for (speed, tps) in [(128u8, 60u32), (0, 240)] {
-        for seed in 0..6u64 {
-            let party: Vec<fmv_protocol::BattleMember> = characters
-                .iter()
-                .enumerate()
-                .map(|(i, &character)| {
-                    fmv_protocol::BattleMember::player(fmv_core::EntityId(i as u64 + 1), fmv_core::AccountId(i as u64 + 1), format!("P{i}"), character, 20, 0)
-                })
-                .collect();
-            let setup = BattleSetup {
-                formation_id: formation,
-                seed,
-                party,
-                preemptive: info.preemptive,
-                back_attack: info.back_attack,
-                battle_speed: speed,
-                ticks_per_second: tps,
-            };
-            let foe = ActorId(characters.len() as u8);
-            let mut state = data.build(&setup).expect("builds");
-            assert!(state.actor(foe).is_some_and(|c| c.ai.is_some()), "the Scorpion has its scripts");
-            let mut log: Vec<(u64, Vec<BattleEvent>, Option<AppliedCommand>)> = Vec::new();
-            let slice = u64::from((tps / 20).max(1));
-            for _ in 0..400_000u32 {
-                if state.outcome().is_some() {
-                    break;
-                }
-                let events = state.step_ticks(slice);
-                if !events.is_empty() {
-                    log.push((state.tick(), events, None));
-                }
-                for id in state.ready_actors() {
-                    let tail_up = state.actor(foe).and_then(|c| c.ai.as_ref()).is_some_and(|ai| ai.stats().turns >= 5);
-                    let command = match state.enemy_ids().into_iter().find(|e| state.actor(*e).is_some_and(|c| c.is_alive())) {
-                        Some(target) if tail_up => Command::Attack { target },
-                        _ => Command::Defend,
-                    };
-                    if let Ok(events) = state.submit_command(id, command) {
-                        counter_batches += usize::from(events.iter().any(|e| matches!(e, BattleEvent::Action { actor, .. } if *actor == foe)));
-                        log.push((state.tick(), events, Some(AppliedCommand { actor: id, command })));
+    let mut fights = 0usize;
+    for canon in [false, true] {
+        for (speed, tps) in [(128u8, 60u32), (0, 240)] {
+            for seed in 0..6u64 {
+                let party: Vec<fmv_protocol::BattleMember> = if canon {
+                    let companions = [0u8, 1].map(|c| fmv_protocol::BattleMember::companion(data.character_name(c).expect("a canon name"), c, 20, 255));
+                    let players = [2u8, 3].iter().enumerate().map(|(i, &character)| {
+                        fmv_protocol::BattleMember::player(fmv_core::EntityId(i as u64 + 1), fmv_core::AccountId(i as u64 + 1), format!("P{i}"), character, 20, 0)
+                    });
+                    companions.into_iter().chain(players).collect()
+                } else {
+                    [0u8, 1, 2, 3]
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &character)| {
+                            fmv_protocol::BattleMember::player(fmv_core::EntityId(i as u64 + 1), fmv_core::AccountId(i as u64 + 1), format!("P{i}"), character, 20, 0)
+                        })
+                        .collect()
+                };
+                let companion_count = party.iter().filter(|m| m.is_companion()).count();
+                let setup = BattleSetup {
+                    formation_id: formation,
+                    seed,
+                    party,
+                    preemptive: info.preemptive,
+                    back_attack: info.back_attack,
+                    battle_speed: speed,
+                    ticks_per_second: tps,
+                };
+                let foe = ActorId(setup.party.len() as u8);
+                let mut state = data.build(&setup).expect("builds");
+                assert!(state.actor(foe).is_some_and(|c| c.ai.is_some()), "the Scorpion has its scripts");
+                let mut log: Vec<(u64, Vec<BattleEvent>, Option<AppliedCommand>)> = Vec::new();
+                let slice = u64::from((tps / 20).max(1));
+                for _ in 0..400_000u32 {
+                    if state.outcome().is_some() {
+                        break;
+                    }
+                    let events = state.step_ticks(slice);
+                    if !events.is_empty() {
+                        log.push((state.tick(), events, None));
+                    }
+                    for id in state.ready_actors() {
+                        let tail_up = state.actor(foe).and_then(|c| c.ai.as_ref()).is_some_and(|ai| ai.stats().turns >= 5);
+                        let first_living = state.enemy_ids().into_iter().find(|e| state.actor(*e).is_some_and(|c| c.is_alive()));
+                        let command = match first_living {
+                            // The server's own rule for a canon companion, once the tail is up.
+                            Some(_) if tail_up && usize::from(id.0) < companion_count => {
+                                fmv_server::companion::command(&state, id).unwrap_or(Command::Defend)
+                            }
+                            Some(target) if tail_up => Command::Attack { target },
+                            _ => Command::Defend,
+                        };
+                        if let Ok(events) = state.submit_command(id, command) {
+                            let answered = events.iter().any(|e| matches!(e, BattleEvent::Action { actor, .. } if *actor == foe));
+                            counter_batches += usize::from(answered);
+                            companion_counter_batches += usize::from(answered && usize::from(id.0) < companion_count);
+                            limit_counter_batches += usize::from(answered && matches!(command, Command::Limit { .. }));
+                            log.push((state.tick(), events, Some(AppliedCommand { actor: id, command })));
+                        }
                     }
                 }
+                tails_up += usize::from(state.actor(foe).and_then(|c| c.ai.as_ref()).is_some_and(|ai| ai.stats().turns >= 5));
+                fights += 1;
+                // The client: its own engine from its own data, advanced only by what the messages say.
+                let mut client = BattleReplay::start(&*data, &setup).expect("the client builds the same battle");
+                for (tick, events, command) in &log {
+                    client
+                        .apply(*tick, events, command.as_ref())
+                        .unwrap_or_else(|d| panic!("canon {canon}, speed {speed}, seed {seed}: the client diverged: {d}"));
+                }
+                assert_eq!(client.state(), &state, "canon {canon}, speed {speed}, seed {seed}: the same final state");
             }
-            tails_up += usize::from(state.actor(foe).and_then(|c| c.ai.as_ref()).is_some_and(|ai| ai.stats().turns >= 5));
-            // The client: its own engine from its own data, advanced only by what the messages say.
-            let mut client = BattleReplay::start(&*data, &setup).expect("the client builds the same battle");
-            for (tick, events, command) in &log {
-                client.apply(*tick, events, command.as_ref()).unwrap_or_else(|d| panic!("speed {speed}, seed {seed}: the client diverged: {d}"));
-            }
-            assert_eq!(client.state(), &state, "speed {speed}, seed {seed}: the same final state");
         }
     }
-    eprintln!("Guard Scorpion (formation {formation}): {counter_batches} commands were answered by a counter, in {tails_up} of 12 fights its tail came up; every message replayed exactly");
+    eprintln!(
+        "Guard Scorpion (formation {formation}): {counter_batches} commands were answered by a counter ({companion_counter_batches} \
+         were a companion's, {limit_counter_batches} a limit break), in {tails_up} of {fights} fights its tail came up; every message replayed exactly"
+    );
     assert!(tails_up > 0, "the Scorpion's tail came up in some fight");
     assert!(counter_batches > 0, "a counter came inside a command's own batch of events");
+    assert!(companion_counter_batches > 0, "a counter came inside a canon companion's command");
 }

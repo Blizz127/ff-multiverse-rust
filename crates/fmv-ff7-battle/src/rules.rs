@@ -52,10 +52,12 @@
 //!   ([`Target::One`]: a party member; [`Target::AllEnemies`]: the whole party; [`Target::AllAllies`] is not
 //!   played for a damaging attack and the turn falls back). A whole-party attack is one announcement and one
 //!   payment, then `resolve_action` plays it on every living member in ascending order with its
-//!   own rolls each, and the 2/3 split of "Whole-side targeting" below. The script's mask is authoritative, as
-//!   in the original: the attack record's own targeting ([`Aim`], the rule of the player's menu, which
-//!   `aim_at` checks a command against) is not consulted, so a one-target attack aimed at the
-//!   whole party and a whole-side one aimed at one member are played as the script says. An attack whose
+//!   own rolls each, and the 2/3 split of "Whole-side targeting" below. This engine treats the script's mask
+//!   as authoritative (an engine choice, NOT checked against the original): the attack record's own
+//!   targeting ([`Aim`], which is read as the rule of the player's menu and which `aim_at` checks a command
+//!   against) is not consulted, so a one-target attack aimed at the whole party and a whole-side one aimed
+//!   at one member are played as the script says (refusing them would make five more of the owner's enemies
+//!   fall back to the plain behaviour). An attack whose
 //!   record aims at a random target ([`Aim::Random`], which `aim_at` refuses) is played on ONE party member:
 //!   the single member the script named, or, for a whole-party mask, one of the living members drawn with
 //!   `below(n)`.
@@ -1936,12 +1938,12 @@ impl BattleState {
 
     /// Whether the rules can aim an attack of an enemy as its script says: at a party member or at the whole
     /// party. (A damaging attack on the enemy's own side, [`Target::AllAllies`], is not played.) The attack's
-    /// [`Aim`] is NOT consulted: it is the rule of the player's target menu ([`BattleState::aim_at`] checks a
-    /// command against it), while the original carries out whatever target mask an enemy's script sets, so a
-    /// script that aims a one-target attack at the whole party, or a whole-side one at a single member, is
-    /// followed (measured on the owner's data: refusing what a command could not do makes more enemies fall
-    /// back to the plain behaviour than the original's scripts would). A fallen target or an empty side does
-    /// not count against it either: that attack fizzles when it comes up.
+    /// [`Aim`] is NOT consulted (an engine choice, not checked against the original): it is read as the rule
+    /// of the player's target menu ([`BattleState::aim_at`] checks a command against it), while an enemy's
+    /// script names its target mask itself, so a script that aims a one-target attack at the whole party, or a
+    /// whole-side one at a single member, is followed (measured on the owner's data: refusing what a command
+    /// could not do makes five more enemies fall back to the plain behaviour). A fallen target or an empty
+    /// side does not count against it either: that attack fizzles when it comes up.
     fn can_aim(&self, target: Target) -> bool {
         match target {
             Target::One(who) => usize::from(who.0) < self.party_len,

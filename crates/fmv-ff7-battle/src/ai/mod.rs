@@ -103,8 +103,9 @@
 //!   exactly the living side; any other mix falls back. The engine plays [`Target::AllEnemies`] (the whole
 //!   party) as one attack announced once and played on each living member in turn by the whole-side rules
 //!   of protocol v10 (`resolve_action`: each target with its own rolls, the 2/3 split of damage when the
-//!   action splits). The script's mask is authoritative, as in the original: the attack record's own
-//!   targeting (`Aim`, the rule of the player's target menu, which `aim_at` checks a command against) is not
+//!   action splits). This engine treats the script's mask as authoritative (an engine choice, not checked
+//!   against the original): the attack record's own
+//!   targeting (`Aim`, read as the rule of the player's target menu, which `aim_at` checks a command against) is not
 //!   consulted, so a one-target attack aimed at the whole party and a whole-side one aimed at a single member
 //!   are played as the script says (measured on the owner's data: refusing what a command could not do would
 //!   make five more enemies fall back to the plain behaviour). [`Target::AllAllies`] and a single enemy as the target
