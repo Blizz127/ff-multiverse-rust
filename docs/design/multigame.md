@@ -98,6 +98,13 @@ aand ff11 is the best way of doing it" ("perfect ok lets do it"). The design tar
   its own field and battle presentation read from the owner's own files for that game, while the account, the one
   original character, parties, phasing and saves are shared. The original character gets a per-world restyled model (its
   identity drawn in that game's art style, section 2.6), never another game's assets.
+* **A per-world appearance step at character creation (the owner, 10:30 CST):** "having the character model for each
+  game style is much easier i think since its just the one character, maybe durign character select they can design the
+  character for each game". The creator and the character select get one appearance step per world (FF7's now: today's
+  body, colour and fighting-style rows; FF8's and later ones as each game arrives), all for the SAME persistent character
+  and save. The record already has the shape: one game-agnostic identity plus a per-game binding (`PlayerCharacter`,
+  section 2), so a new world adds a binding (and its creator step) without touching the identity or any other game's.
+  A character entering a world it has no look for yet is asked for one there (or given that world's default body).
 
 ---
 
