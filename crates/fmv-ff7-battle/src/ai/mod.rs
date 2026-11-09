@@ -15,8 +15,8 @@
 //! # What an enemy does with its script
 //!
 //! * At the start of the battle ([`initialize`], called by [`BattleState`] once the battle is built) its
-//!   Initialize script runs, if it has one: it sets up the enemy's variables and may change its
-//!   defense ratings (Guard Scorpion does).
+//!   Initialize script runs, if it has one: it sets up the enemy's variables and may change its stats (its
+//!   defense ratings, attack and magic strength, evasion: Guard Scorpion changes its defenses).
 //! * When its gauge is full ([`choose`]) its Main script runs against the battle as it is. The script may
 //!   queue attacks (`ACT`, each on the mask of targets of that moment: a "double attack" is two of them),
 //!   which the engine carries out one after the other in the order queued, or end without one: then the
@@ -106,8 +106,8 @@
 //!   action splits). The script's mask is authoritative, as in the original: the attack record's own
 //!   targeting (`Aim`, the rule of the player's target menu, which `aim_at` checks a command against) is not
 //!   consulted, so a one-target attack aimed at the whole party and a whole-side one aimed at a single member
-//!   are played as the script says (checked on the owner's data: obeying it as a command is would make five
-//!   more enemies fall back to the plain behaviour). [`Target::AllAllies`] and a single enemy as the target
+//!   are played as the script says (measured on the owner's data: refusing what a command could not do would
+//!   make five more enemies fall back to the plain behaviour). [`Target::AllAllies`] and a single enemy as the target
 //!   of a damaging attack fall back (an attack the rules cannot play anyway is only announced, whatever its
 //!   target). An attack whose record aims at a random target is played on one member.
 

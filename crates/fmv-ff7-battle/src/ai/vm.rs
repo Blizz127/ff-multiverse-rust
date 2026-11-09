@@ -80,8 +80,9 @@ pub const ADDR_IDLE_ANIMATION: u16 = 0x4080;
 /// Address of the damaged animation id of an actor (script-private here).
 pub const ADDR_DAMAGED_ANIMATION: u16 = 0x4088;
 /// Address of the "Immune to Death" flag of an actor (a bit). Every script of the owner's data only ever
-/// *sets* it, for its own actor (Initialize makes a Chocobo immune; a Death counter shields the dying one
-/// from being killed again): script-private here, the engine has no Death status for it to guard against.
+/// *sets* it, for its own actor (an Initialize script makes its enemy immune; a Death counter shields the
+/// dying one from being killed again): script-private here, the engine has no Death status for it to guard
+/// against.
 pub const ADDR_IMMUNE_DEATH: u16 = 0x402C;
 /// Address of the physical defense rating.
 pub const ADDR_DEFENSE: u16 = 0x4100;
@@ -386,9 +387,9 @@ pub enum Effect {
     Defense { slot: u8, value: u32 },
     /// Set the magical defense rating of the actor in `slot`.
     MagicDefense { slot: u8, value: u32 },
-    /// Set the physical evasion of the actor in `slot` (Zemzelett and Griffin raise it while they fly).
+    /// Set the physical evasion of the actor in `slot` (some enemies raise it while they fly).
     Evade { slot: u8, value: u32 },
-    /// Set the physical attack strength of the actor in `slot` (Golem raises it as it winds up).
+    /// Set the physical attack strength of the actor in `slot` (an enemy may raise it as it winds up).
     Attack { slot: u8, value: u32 },
     /// Set the magical attack strength of the actor in `slot`.
     MagicAttack { slot: u8, value: u32 },

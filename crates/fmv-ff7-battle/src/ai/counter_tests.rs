@@ -407,3 +407,74 @@ fn counters_replay_exactly_from_the_commands_alone() {
     let (log, _) = serve(build, 5);
     assert!(replay(|| seeded(22), &log).is_err(), "another seed is another battle");
 }
+
+#[test]
+fn random_scripts_in_every_slot_never_panic_the_engine_and_a_replay_always_agrees() {
+    // A fixed xorshift stream builds scripts of random chunks (random opcodes, stores of a target mask, attacks
+    // of known and unknown ids, whole-party attacks) for Main and for each counter of one to three foes, and
+    // battles of two to six fighters are played through the server's loop and replayed: whatever the scripts do
+    // (most cannot be followed, some queue several attacks, some answer every blow), the engine neither
+    // panics nor loses its determinism.
+    let mut x = 0x2545_F491_4F6C_DD1Du64;
+    let mut next = move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    const OPS: [u8; 18] = [
+        0x30, 0x31, 0x34, 0x37, 0x40, 0x42, 0x50, 0x52, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x87, 0x90, 0x91, 0x92,
+    ];
+    let attacks = [ATTACK, OTHER, LASER, 0x0999];
+    let random_script = |next: &mut dyn FnMut() -> u64| {
+        let mut asm = Asm::default();
+        for _ in 0..(next() % 14) {
+            asm = match next() % 6 {
+                0 => asm.op(OPS[(next() % OPS.len() as u64) as usize]),
+                1 => asm.addr(2, 0x2070).val(2, [0x20A0, 0x2080, 0x2060, 0x40D0, 0x40E0][(next() % 5) as usize]).op(op::STORE),
+                2 => asm.addr(2, 0x2070).val(2, 0x20A0).op(op::RANDOM_BIT).op(op::STORE),
+                3 | 4 => asm.k1(0x20).k2(attacks[(next() % 4) as usize]).op(op::ACT),
+                _ => asm.val(2, 0x20A0).val(3, 0x4160).op(op::MASK).op([op::LEAST, op::GREATEST][(next() % 2) as usize]),
+            };
+        }
+        asm.op(op::END)
+    };
+    let (mut answered, mut enemy_turns) = (0usize, 0usize);
+    for case in 0..120u64 {
+        let party_size = 2 + (next() % 5) as usize;
+        let foes: Vec<Combatant> = (0..1 + next() % 3)
+            .map(|_| {
+                let scripts: Vec<(usize, Asm)> = [slot::MAIN, slot::GENERAL_COUNTER, slot::DEATH_COUNTER, slot::PHYSICAL_COUNTER, slot::MAGICAL_COUNTER]
+                    .iter()
+                    .map(|&s| (s, random_script(&mut next)))
+                    .collect();
+                let refs: Vec<(usize, &Asm)> = scripts.iter().map(|(s, a)| (*s, a)).collect();
+                let mut foe = foe_with(&refs);
+                foe.actions.push(laser());
+                foe.hp = 60 + (next() % 300) as u32;
+                foe.max_hp = foe.hp;
+                foe
+            })
+            .collect();
+        let build = || {
+            let mut party = party_of(party_size);
+            party[0].spells = vec![Spell::new(27, ActionSpec::damage_spell(20, 255, 0, 4))];
+            party[0].mp = 50;
+            party[0].max_mp = 50;
+            battle_with(case, party, foes.clone())
+        };
+        let (log, state) = serve(&build, 1 + case % 9);
+        assert_eq!(replay(&build, &log).as_deref(), Ok(state.as_str()), "case {case}: the replay agrees");
+        answered += log
+            .iter()
+            .filter(|(_, events, command)| {
+                command.is_some()
+                    && events.iter().any(|e| matches!(e, BattleEvent::Action { actor, .. } if usize::from(actor.0) >= party_size))
+            })
+            .count();
+        enemy_turns += log.iter().filter(|(_, events, command)| command.is_none() && events.iter().any(|e| matches!(e, BattleEvent::Action { actor, .. } if usize::from(actor.0) >= party_size))).count();
+    }
+    // The scripts did something in a good share of the battles, as counters and as Main turns.
+    assert!(answered >= 15, "commands answered by a counter: {answered}");
+    assert!(enemy_turns >= 100, "enemy turns with an attack: {enemy_turns}");
+}

@@ -41,9 +41,9 @@
 //!
 //! **`0x4120`.** Every use in the owner's `scene.bin` compares it with a constant: an Initialize script finds
 //! the actors of one kind among a mask (`mask of the actors whose 0x4120 == 58`), to see whether a sibling
-//! enemy is in the battle (checked: the scenes that do this hold exactly the enemy ids they compare with, the
-//! Mighty Grunt of id 57 looks for the one of id 58, the Levrikon for the Chocobos 339 and 340 of its own
-//! formation). So it is the id of the enemy record the actor was made from ([`Combatant::enemy_id`], the
+//! enemy is in the battle (checked: the scenes that do this hold exactly the enemy ids they compare with: the
+//! enemy of id 57 looks for the one of id 58 in its own formation, the enemy of id 80 for those of ids 339
+//! and 340). So it is the id of the enemy record the actor was made from ([`Combatant::enemy_id`], the
 //! scene's `enemy_ids`); a party member and an enemy built without a scene have `0xFFFF`, which no enemy id is.
 
 use crate::kernel::CharacterId;
