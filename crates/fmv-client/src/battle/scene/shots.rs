@@ -116,6 +116,12 @@ pub(super) fn feed(client: &mut BattleClient, scene: &mut BattleScene, msg: Opti
         client.on_message(now, msg);
     }
     scene.update(now, &client.take_events(), client.engine());
+    // The statuses of the bodies are the panels', as the window gives them (`scene_for`).
+    if client.engine().is_some() {
+        if let Some(view) = client.view(now) {
+            scene.show_statuses(&view);
+        }
+    }
 }
 
 /// What the rules' server would say: one engine, its messages in the order a server sends them.
@@ -182,7 +188,7 @@ pub(super) fn canon(character: u8) -> BattleMember {
 
 /// The synthetic battle: a party of three against the two dummies of the synthetic rules' formation 1,
 /// with the formation's own placement and a camera to the side (made-up numbers), at `location`.
-fn synthetic_scene(kit: &mut ModelKit, location: u16) -> BattleScene {
+pub(super) fn synthetic_scene(kit: &mut ModelKit, location: u16) -> BattleScene {
     let setup = BattleSetup {
         formation_id: 1,
         seed: 3,
@@ -208,7 +214,7 @@ fn synthetic_scene(kit: &mut ModelKit, location: u16) -> BattleScene {
     scene
 }
 
-fn stand_ins() -> ModelKit {
+pub(super) fn stand_ins() -> ModelKit {
     ModelKit::new(Box::new(StandInModels), Some(Box::new(Counting::new(Rc::new(RefCell::new(Vec::new())), vec![]))))
 }
 
