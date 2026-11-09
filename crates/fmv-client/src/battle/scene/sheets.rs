@@ -769,7 +769,18 @@ impl Fight {
         let mut fight = Self { gpu, client, server, scene, now: 1.0 };
         let events = client_events(&mut fight.client);
         fight.scene.update(1.0, &events, fight.client.engine());
+        fight.sync_statuses(1.0);
         Some(fight)
+    }
+
+    /// Give the scene the statuses the panels show at `t`, as the window does after every update (`scene_for`): they change when
+    /// the performance that changes them lands, not when the message arrives.
+    fn sync_statuses(&mut self, t: f64) {
+        if self.client.engine().is_some() {
+            if let Some(view) = self.client.view(t) {
+                self.scene.show_statuses(&view);
+            }
+        }
     }
 
     /// The server says `msg` at the fight's clock: the client mirrors it and the scene is told.
@@ -779,12 +790,14 @@ impl Fight {
         }
         let events = client_events(&mut self.client);
         self.scene.update(self.now, &events, self.client.engine());
+        self.sync_statuses(self.now);
     }
 
     /// The fight at time `t` (never before an earlier call): the scene brought up to `t`, drawn with the
     /// overlay as the window draws it, `label` written in the corner.
     fn frame(&mut self, t: f64, label: &str) -> Vec<u8> {
         self.scene.update(t, &[], self.client.engine());
+        self.sync_statuses(t);
         let view = self.client.view(t).expect("a view");
         let scene_view = self.scene.view(W, H);
         let mut overlay = DrawList::new();
@@ -797,6 +810,7 @@ impl Fight {
     /// the actor, `label` written in the corner of the crop.
     fn close_up(&mut self, t: f64, i: usize, label: &str, (w, h): (u32, u32), (cw, ch): (u32, u32)) -> Vec<u8> {
         self.scene.update(t, &[], self.client.engine());
+        self.sync_statuses(t);
         let view = self.scene.view(w, h);
         let at = self.scene.pose_of(i).and_then(|(pos, ..)| view.to_pixels([pos[0], pos[1] - 380.0, pos[2]])).unwrap_or([w as f32 / 2.0, h as f32 / 2.0]);
         let x0 = (at[0] as i32 - cw as i32 / 2).clamp(0, (w - cw) as i32) as u32;
@@ -1052,7 +1066,7 @@ fn fight_cast_with_an_effect() {
     assert!(msg.is_some(), "the engine takes the spell");
     fight.say(msg);
     let impact = arrival + cue::impact_delay(Some(ActionRef::Magic(27)));
-    assert!(fight.scene.director.charges().iter().any(|c| c.element == Element::Fire), "the caster gathers a fire glow");
+    assert!(fight.scene.director.fx().iter().any(|f| f.kind == effects::Kind::Charge && f.element == Element::Fire), "the caster gathers a fire glow");
     assert_eq!(fight.scene.director.motion(0, arrival + 0.1).clip.map(|c| c.slot), Some(12), "the cast begins");
     let numbers = fight.client.view(impact).expect("a view").popups;
     assert!(numbers.iter().any(|p| p.target.0 >= 3), "the number appears at the impact: {numbers:?}");
@@ -1088,7 +1102,7 @@ fn fight_the_elements() {
             continue;
         };
         fight.say(Some(msg));
-        let burst = fight.scene.director.bursts().first().copied();
+        let burst = fight.scene.director.fx().iter().find(|f| f.kind == effects::Kind::Blast || f.kind == effects::Kind::Mend).copied();
         eprintln!("spell {spell}: burst {burst:?}");
         shots.push(fight.frame(arrival + cue::impact_delay(Some(ActionRef::Magic(spell))) + 0.12, &format!("spell {spell}")));
     }
@@ -1117,7 +1131,9 @@ fn fight_item_and_defend() {
     fight.say(guard);
     assert_eq!(fight.scene.director.motion(0, arrival + 0.2).clip.map(|c| c.slot), Some(9), "Cloud's item gesture");
     assert_eq!(fight.scene.director.motion(2, arrival + 0.3).clip.map(|c| c.slot), Some(5), "Barret guards with the clip of script 8");
-    assert!(fight.scene.director.bursts().iter().any(|b| b.kind == effects::BurstKind::Item && b.target == 1), "a sparkle on Tifa");
+    assert!(fight.scene.director.fx().iter().any(|f| f.kind == effects::Kind::Mend && f.target == 1 && f.scale < 1.0), "a lesser restoring sparkle on Tifa");
+    assert!(fight.scene.director.fx().iter().any(|f| f.kind == effects::Kind::Toss && f.from == Some(0) && f.target == 1), "and the Potion in the air from Cloud");
+    assert!(fight.scene.director.fx().iter().any(|f| f.kind == effects::Kind::Guard && f.target == 2), "Barret's guard shimmers");
     fight.sheet("item-and-defend", arrival, &[0.1, 0.3, 0.46, 0.6, 0.8, 1.1], 2);
 }
 
@@ -1221,12 +1237,12 @@ fn fight_a_limit_break() {
     assert!(fight.server.state.limit_gauge(ActorId(0)) < 255, "the limit spent the gauge");
     // The glow gathers from the arrival to the cap of the delay, and the burst pair breaks on the target then.
     let impact = arrival + cue::MAX_IMPACT_DELAY;
-    let charges = fight.scene.director.charges().to_vec();
-    assert_eq!((charges.len(), charges[0].caster), (1, 0));
-    assert!((charges[0].end - impact).abs() < 1e-9, "{charges:?}");
-    let bursts = fight.scene.director.bursts().to_vec();
-    assert!(bursts.len() >= 2 && bursts.iter().all(|b| (b.at - impact).abs() < 1e-9 && b.target == usize::from(target.0)), "{bursts:?}");
-    assert!(bursts.iter().any(|b| b.kind == effects::BurstKind::Spell) && bursts.iter().any(|b| matches!(b.kind, effects::BurstKind::Hit { critical: true })));
+    let charges: Vec<_> = fight.scene.director.fx().iter().filter(|f| f.kind == effects::Kind::Charge).copied().collect();
+    assert_eq!((charges.len(), charges[0].target), (1, 0));
+    assert!((charges[0].land - impact).abs() < 1e-9, "{charges:?}");
+    let at_target: Vec<_> = fight.scene.director.fx().iter().filter(|f| f.kind != effects::Kind::Charge).copied().collect();
+    assert!(at_target.len() >= 2 && at_target.iter().all(|f| (f.land - impact).abs() < 1e-9 && f.target == usize::from(target.0)), "{at_target:?}");
+    assert!(at_target.iter().any(|f| f.kind == effects::Kind::Flash) && at_target.iter().any(|f| matches!(f.kind, effects::Kind::Strike { critical: true, .. })), "a strike as hard as a critical hit and a flash: {at_target:?}");
     fight.sheet("limit-break-braver", arrival, &[0.05, 0.25, 0.45, 0.58, 0.64, 0.75, 0.95, 1.4], 2);
 }
 

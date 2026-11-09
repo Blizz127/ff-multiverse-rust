@@ -461,12 +461,15 @@ fn a_miss_makes_the_target_step_aside_and_a_clock_that_goes_wrong_does_not_break
 fn a_limit_break_never_runs_up_and_takes_the_colour_of_what_it_does_and_running_is_no_blow() {
     // Party of four: Cloud (actor 0) strikes with his limit, Aeris (actor 3) heals with hers.
     let engine = engine(1, 4);
-    let plain = Look { melee: false, element: Element::Plain };
-    assert_eq!(look_in(Some(&engine), ActorId(0), ActionRef::Limit(128)), plain);
-    assert_eq!(look_in(Some(&engine), ActorId(3), ActionRef::Limit(142)), Look { melee: false, element: Element::Cure });
-    assert_eq!(look_in(Some(&engine), ActorId(0), ActionRef::Escape), plain);
+    // Cloud's limit strikes (a physical one: Braver), Aeris's heals (it breaks like a spell, in cure green).
+    let strikes = Look { melee: false, element: Element::Plain, style: Style::Limit { physical: true } };
+    let heals = Look { melee: false, element: Element::Cure, style: Style::Limit { physical: false } };
+    assert_eq!(look_in(Some(&engine), ActorId(0), ActionRef::Limit(128)), strikes);
+    assert_eq!(look_in(Some(&engine), ActorId(3), ActionRef::Limit(142)), heals);
+    assert_eq!(look_in(Some(&engine), ActorId(0), ActionRef::Escape), STILL);
+    assert_eq!(look_in(Some(&engine), ActorId(0), ActionRef::Defend), STILL);
     // The id the server names is not looked up: the performer's own limit decides (a lie changes nothing).
-    assert_eq!(look_in(Some(&engine), ActorId(3), ActionRef::Limit(7)), Look { melee: false, element: Element::Cure });
+    assert_eq!(look_in(Some(&engine), ActorId(3), ActionRef::Limit(7)), heals);
     // Without the engine, or for somebody who is not there, it is a plain blow like any other action.
     assert_eq!(look_in(None, ActorId(0), ActionRef::Limit(128)), Look::PLAIN);
     assert_eq!(look_in(Some(&engine), ActorId(99), ActionRef::Escape), Look::PLAIN);
@@ -494,13 +497,15 @@ fn a_limit_break_from_the_engine_gathers_at_the_performer_and_breaks_over_the_ta
     assert!(events.contains(&BattleEvent::LimitGauge { actor: ActorId(0), value: 0 }), "the gauge is emptied");
     let mut scene = BattleScene::new(&start(2, None), Some(&before), &mut kit()).unwrap();
     scene.update(10.0, &events, Some(&engine));
-    // One glow at the performer, a bloom and a star over the target, both at the cap of the delay.
-    let charges = scene.director.charges().to_vec();
+    // One glow at the performer, a strike and a flash over the target, all landing at the cap of the delay.
+    let fx = scene.director.fx().to_vec();
+    let charges: Vec<_> = fx.iter().filter(|f| f.kind == effects::Kind::Charge).collect();
     assert_eq!(charges.len(), 1);
-    assert_eq!(charges[0].caster, 0);
-    let bursts = scene.director.bursts().to_vec();
-    assert!(bursts.len() >= 2 && bursts.iter().all(|b| b.target == usize::from(target.0)), "{bursts:?}");
-    assert!(bursts.iter().all(|b| b.at > 10.0 + 0.5), "a long show: nothing breaks at once ({bursts:?})");
+    assert_eq!(charges[0].target, 0);
+    let at_target: Vec<_> = fx.iter().filter(|f| f.kind != effects::Kind::Charge).collect();
+    assert!(at_target.len() >= 2 && at_target.iter().all(|f| f.target == usize::from(target.0)), "{at_target:?}");
+    assert!(at_target.iter().all(|f| f.land > 10.0 + 0.5), "a long show: nothing breaks at once ({at_target:?})");
+    assert!(at_target.iter().any(|f| f.kind == effects::Kind::Flash), "{at_target:?}");
     // Nobody left: the party is drawn all the time, and after the show the enemy took the damage as numbers.
     let view = view(&scene);
     let mut t = 10.0;
@@ -1081,4 +1086,224 @@ fn the_last_events_of_a_battle_can_still_be_taken_after_it_ended_and_the_queue_i
     let taken = flood.battle.take_events();
     assert_eq!(taken.len(), 256);
     assert!(matches!(taken.last(), Some(BattleEvent::Damage { amount: 1999, .. })), "the newest are kept");
+}
+
+// ----- effects in the frame, and what an action looks like --------------------------------------------------------------
+
+/// The ids of the meshes of the effects: a model of the frame with one of them is a piece of an effect.
+fn effect_ids(scene: &BattleScene) -> std::collections::BTreeSet<u64> {
+    effects::PRIMS.iter().map(|p| scene.effects.asset(*p).id).collect()
+}
+
+/// The pieces of effects in `frame`.
+fn pieces<'a>(scene: &BattleScene, frame: &'a BattleFrame) -> Vec<&'a SkinnedModel> {
+    let ids = effect_ids(scene);
+    frame.models.models.iter().filter(|m| ids.contains(&m.asset.id)).collect()
+}
+
+/// Where a point of camera space is in the window, in pixels from the top left.
+fn pixel_of(view: &View, c: [f32; 3]) -> Option<[f32; 2]> {
+    let [u, v] = view.pinhole(c.map(f64::from), 1.0)?;
+    Some([(f64::from(view.width) * 0.5 + f64::from(u) + view.shift[0]) as f32, (f64::from(view.height) * 0.5 - f64::from(v) - view.shift[1]) as f32])
+}
+
+/// The middle of a skinned piece, in the window.
+fn centre_of(view: &View, piece: &SkinnedModel) -> [f32; 2] {
+    let n = piece.positions.len() as f32;
+    let sum = piece.positions.iter().fold([0.0f32; 3], |s, p| [s[0] + p[0], s[1] + p[1], s[2] + p[2]]);
+    pixel_of(view, [sum[0] / n, sum[1] / n, sum[2] / n]).expect("in front of the camera")
+}
+
+fn blast(target: usize, start: f64, land: f64) -> effects::Fx {
+    effects::Fx { kind: effects::Kind::Blast, element: Element::Fire, target, from: None, start, land, scale: 1.0, seed: 3 + target as u32 }
+}
+
+#[test]
+fn a_frame_draws_an_effect_while_it_is_on_and_not_before_it_starts_or_after_it_is_over() {
+    let (mut scene, engine) = scene(2, true);
+    let view = view(&scene);
+    let fx = blast(2, 10.0, 10.6);
+    for (t, on) in [(9.0, false), (9.99, false), (10.1, true), (10.6, true), (11.0, true), (fx.end() + 0.01, false)] {
+        scene.director.set_fx(vec![fx]);
+        scene.update(t, &[], Some(&engine));
+        let frame = scene.frame(&view, false);
+        assert_eq!(frame.models.models.len(), frame.tints.len(), "a tint for every model, the pieces' glow included");
+        assert_eq!(!pieces(&scene, &frame).is_empty(), on, "at {t}");
+    }
+    // The pieces are the kit's own meshes (a handful of them however many effects there are), tinted by their glow.
+    scene.director.set_fx(vec![fx]);
+    scene.update(10.6, &[], Some(&engine));
+    let frame = scene.frame(&view, false);
+    let first_piece = frame.models.models.iter().position(|m| effect_ids(&scene).contains(&m.asset.id)).expect("a piece");
+    assert!(frame.tints[first_piece].alpha > 0.0 && frame.tints[first_piece].alpha <= 1.0);
+    assert!(frame.identities.len() <= first_piece, "the identity colours are the bodies' only: none for an effect");
+    // An effect for an actor the scene does not have is nothing, and so is one for a clock that is not a time.
+    let mut ghost = fx;
+    ghost.target = 99;
+    scene.director.set_fx(vec![ghost]);
+    scene.update(10.6, &[], Some(&engine));
+    assert!(pieces(&scene, &scene.frame(&view, false)).is_empty());
+}
+
+#[test]
+fn a_whole_side_shows_an_effect_at_every_target_and_what_a_frame_draws_is_capped() {
+    let (mut scene, engine) = scene(2, true);
+    let view = view(&scene);
+    let count = |scene: &mut BattleScene, fx: Vec<effects::Fx>| {
+        scene.director.set_fx(fx);
+        scene.update(10.7, &[], Some(&engine));
+        let frame = scene.frame(&view, false);
+        let found = pieces(scene, &frame);
+        let near: Vec<[f32; 2]> = found.iter().map(|p| centre_of(&view, p)).collect();
+        (found.len(), near)
+    };
+    let (a, near_a) = count(&mut scene, vec![blast(2, 10.0, 10.6)]);
+    let (b, near_b) = count(&mut scene, vec![blast(3, 10.0, 10.6)]);
+    let (both, _) = count(&mut scene, vec![blast(2, 10.0, 10.6), blast(3, 10.0, 10.6)]);
+    assert!(a > 5 && b > 5, "{a} and {b} pieces");
+    assert_eq!(both, a + b, "each target has its own effect");
+    // Each is over its own target: the mean of its pieces is nearer to the target it is at.
+    let mean = |ps: &[[f32; 2]]| [ps.iter().map(|p| p[0]).sum::<f32>() / ps.len() as f32, ps.iter().map(|p| p[1]).sum::<f32>() / ps.len() as f32];
+    let chest = |i: usize| view.to_pixels(scene.chest_of(i, &view).unwrap().0).unwrap();
+    let dist = |p: [f32; 2], q: [f32; 2]| (p[0] - q[0]).hypot(p[1] - q[1]);
+    assert!(dist(mean(&near_a), chest(2)) < dist(mean(&near_a), chest(3)), "the first is over the first enemy");
+    assert!(dist(mean(&near_b), chest(3)) < dist(mean(&near_b), chest(2)), "the second over the second");
+    // However many are on at once, a frame draws at most so many pieces, and the newest effects are the ones kept.
+    let many: Vec<effects::Fx> = (0..300).map(|k| blast(2 + k % 2, 10.0, 10.6)).collect();
+    let (capped, _) = count(&mut scene, many);
+    assert!(capped > 0 && capped <= effects::MAX_LAYERS, "{capped} pieces");
+}
+
+#[test]
+fn a_bolt_is_a_ribbon_from_the_shooter_to_the_target_and_a_limit_flash_covers_the_window() {
+    let (mut scene, engine) = scene(2, true);
+    let view = view(&scene);
+    let beam = scene.effects.asset(effects::Prim::Beam).id;
+    // The line a shot leaves: a ribbon whose two ends are the two actors' chests.
+    let line = effects::Fx { kind: effects::Kind::Bolt { hit: true }, element: Element::Plain, target: 2, from: Some(0), start: 10.46, land: 10.6, scale: 1.0, seed: 1 };
+    scene.director.set_fx(vec![line]);
+    scene.update(10.61, &[], Some(&engine));
+    let frame = scene.frame(&view, false);
+    let ribbons: Vec<&SkinnedModel> = frame.models.models.iter().filter(|m| m.asset.id == beam).collect();
+    assert!(!ribbons.is_empty(), "a bolt is drawn with the ribbon mesh");
+    // The mesh runs from its head row to its tail row: the first four vertices are one end, the last four the other.
+    let end = |m: &SkinnedModel, rows: std::ops::Range<usize>| {
+        let n = rows.len() as f32;
+        let sum = m.positions[rows].iter().fold([0.0f32; 3], |s, p| [s[0] + p[0], s[1] + p[1], s[2] + p[2]]);
+        pixel_of(&view, [sum[0] / n, sum[1] / n, sum[2] / n]).expect("in front")
+    };
+    let (shooter, target) = (view.to_pixels(scene.chest_of(0, &view).unwrap().0).unwrap(), view.to_pixels(scene.chest_of(2, &view).unwrap().0).unwrap());
+    let long = ribbons.iter().find(|m| (end(m, 0..4)[0] - end(m, 12..16)[0]).abs() > 50.0).expect("the line between them");
+    let (a, b) = (end(long, 0..4), end(long, 12..16));
+    let near = |p: [f32; 2], q: [f32; 2]| (p[0] - q[0]).hypot(p[1] - q[1]) < 10.0;
+    assert!((near(a, shooter) && near(b, target)) || (near(a, target) && near(b, shooter)), "{a:?} {b:?} against {shooter:?} {target:?}");
+    // The flash of a limit break covers the whole window, with the lens axis as its middle.
+    let flash = effects::Fx { kind: effects::Kind::Flash, element: Element::Plain, target: 2, from: None, start: 10.6, land: 10.6, scale: 1.0, seed: 1 };
+    scene.director.set_fx(vec![flash]);
+    scene.update(10.62, &[], Some(&engine));
+    let frame = scene.frame(&view, false);
+    let covers = pieces(&scene, &frame).into_iter().any(|m| {
+        let px: Vec<[f32; 2]> = m.positions.iter().filter_map(|p| pixel_of(&view, *p)).collect();
+        let (min_x, max_x) = px.iter().fold((f32::MAX, f32::MIN), |(lo, hi), p| (lo.min(p[0]), hi.max(p[0])));
+        let (min_y, max_y) = px.iter().fold((f32::MAX, f32::MIN), |(lo, hi), p| (lo.min(p[1]), hi.max(p[1])));
+        min_x <= 0.0 && max_x >= W as f32 && min_y <= 0.0 && max_y >= H as f32
+    });
+    assert!(covers, "a piece of the flash is bigger than the window");
+    // And it is in front of everyone: nearer to the camera than any body.
+    let nearest_body = frame.models.models.iter().filter(|m| !effect_ids(&scene).contains(&m.asset.id)).flat_map(|m| m.positions.iter().map(|p| p[2])).fold(f32::MAX, f32::min);
+    let wash = pieces(&scene, &frame).into_iter().map(|m| m.positions.iter().map(|p| p[2]).fold(f32::MAX, f32::min)).fold(f32::MAX, f32::min);
+    assert!(wash < nearest_body, "the wash is at {wash}, the nearest body at {nearest_body}");
+}
+
+#[test]
+fn the_bodies_statuses_are_the_panels_and_the_engines_come_back_with_the_next_update() {
+    use fmv_ff7_battle::status::{Status, StatusSet};
+    let (mut scene, engine) = scene(2, true);
+    let view = view(&scene);
+    let bodies = |scene: &BattleScene| -> Vec<[f32; 3]> { scene.frame(&view, false).tints.iter().map(|t| t.rgb).collect() };
+    let plain = bodies(&scene);
+    assert!(plain.iter().all(|c| *c == [1.0; 3]), "no status, no tint");
+    // The panels say that actor 0 sleeps and the first enemy is poisoned (the engine says nothing of the kind).
+    let bar = |actor: u8, status: StatusSet| crate::battle::Bar { actor: ActorId(actor), status, ..crate::battle::Bar::default() };
+    let shown = crate::battle::BattleView {
+        party: vec![bar(0, StatusSet::EMPTY.with(Status::Sleep)), bar(1, StatusSet::EMPTY)],
+        enemies: vec![bar(2, StatusSet::EMPTY.with(Status::Poison)), bar(3, StatusSet::EMPTY), bar(99, StatusSet::EMPTY.with(Status::Stop))],
+        ..crate::battle::BattleView::default()
+    };
+    scene.show_statuses(&shown);
+    let tinted = bodies(&scene);
+    assert_eq!(tinted[0], body::of(StatusSet::EMPTY.with(Status::Sleep), scene.now, 0).rgb, "the sleeper is dim and blue");
+    assert_eq!(tinted[2], body::of(StatusSet::EMPTY.with(Status::Poison), scene.now, 2).rgb, "the enemy is purple");
+    assert!(tinted[1] == [1.0; 3] && tinted[3] == [1.0; 3], "the others are as they were; a bar of an actor that is not there changes nothing");
+    // The sleeper droops (a status that is on the panel shows on the pose, not only on the colour).
+    assert!(scene.pose_of(0).unwrap().1[5] < scene.pose_of(1).unwrap().1[5] * 0.95);
+    // The next update copies the engine's again; the window gives the panels' statuses after every update (`scene_for`).
+    scene.update(2.0, &[], Some(&engine));
+    assert!(bodies(&scene).iter().all(|c| *c == [1.0; 3]), "the engine says nothing");
+    // After the battle (no engine) nothing is left on anybody, whatever the last panels said.
+    scene.show_statuses(&shown);
+    scene.update(3.0, &[], None);
+    assert!(bodies(&scene).iter().all(|c| *c == [1.0; 3]));
+}
+
+#[test]
+fn an_action_looks_as_its_own_record_says_a_shot_a_spell_a_blow_an_item_or_a_status_alone() {
+    use fmv_ff7_battle::action::{EnemyAction, Formula, StatusEffect, StatusMode};
+    use fmv_ff7_battle::rules::{element, ActionKind, ActionSpec, Combatant};
+    use fmv_ff7_battle::status::{Status, StatusSet};
+    let mut gunner = Combatant::new("Gunner", 5, 100);
+    let with_mask = |mask: u16, short: bool| ActionSpec { element_mask: mask, ..ActionSpec::basic_attack(16, 255, short) };
+    let curse = ActionSpec {
+        kind: ActionKind::Magical,
+        formula: Formula::None,
+        status: Some(StatusEffect { set: StatusSet::EMPTY.with(Status::Sleep), chance: 63, mode: StatusMode::Inflict }),
+        on_allies: false,
+        ..ActionSpec::damage_spell(0, 255, 0, 0)
+    };
+    gunner.actions = vec![
+        EnemyAction { id: 272, spec: with_mask(element::SHOOT, true) },
+        EnemyAction { id: 273, spec: with_mask(element::HIT, true) },
+        EnemyAction { id: 274, spec: ActionSpec::damage_spell(8, 255, element::FIRE, 0) },
+        EnemyAction { id: 276, spec: with_mask(element::PUNCH | element::CUT, true) },
+    ];
+    gunner.status_actions = vec![EnemyAction { id: 275, spec: curse }];
+    let mut hero = Combatant::new("Hero", 5, 100);
+    hero.spells = fmv_protocol::SyntheticRules::spells();
+    hero.short_range = false;
+    let engine = BattleState::with_config(1, vec![hero.clone(), Combatant { short_range: true, ..hero }], vec![gunner], BattleConfig::default());
+    let (hero, swordsman, foe) = (ActorId(0), ActorId(1), ActorId(2));
+    let look = |who: ActorId, action: ActionRef| look_in(Some(&engine), who, action);
+    // An enemy's attack with the SHOOT bit is a shot, and a shooter does not run up to its target.
+    assert_eq!(look(foe, ActionRef::EnemyAttack(272)), Look { melee: false, element: Element::Plain, style: Style::Shot });
+    // The other physical ones strike as their element bits say, and run up.
+    assert_eq!(look(foe, ActionRef::EnemyAttack(273)), Look { melee: true, element: Element::Plain, style: Style::Blow(Strike::Thump) });
+    assert_eq!(look(foe, ActionRef::EnemyAttack(276)), Look { melee: true, element: Element::Plain, style: Style::Blow(Strike::Punch) });
+    // A magical one is a spell in the colour of its element; a status alone (the pool the AI does not pick from, a script does) is
+    // looked up too, and is a spell with no colour.
+    assert_eq!(look(foe, ActionRef::EnemyAttack(274)), Look { melee: false, element: Element::Fire, style: Style::Spell });
+    assert_eq!(look(foe, ActionRef::EnemyAttack(275)), Look { melee: false, element: Element::Plain, style: Style::Spell });
+    // An attack the enemy does not have is a plain blow like any other, and so is a plain Attack by an enemy (a thump).
+    assert_eq!(look(foe, ActionRef::EnemyAttack(999)), Look::PLAIN);
+    assert_eq!(look(foe, ActionRef::Attack), Look { melee: true, element: Element::Plain, style: Style::Blow(Strike::Thump) });
+    // The party: a gun shoots, a blade slashes (and runs up), a spell is a spell in its element (a heal green).
+    assert_eq!(look(hero, ActionRef::Attack), Look { melee: false, element: Element::Plain, style: Style::Shot });
+    assert_eq!(look(swordsman, ActionRef::Attack), Look::PLAIN);
+    assert_eq!(look(hero, ActionRef::Magic(27)), Look { melee: false, element: Element::Fire, style: Style::Spell });
+    assert_eq!(look(hero, ActionRef::Magic(0)), Look { melee: false, element: Element::Cure, style: Style::Spell });
+    assert_eq!(look(hero, ActionRef::Magic(99)), Look { melee: false, element: Element::Plain, style: Style::Spell }, "a spell it does not know is a plain spell");
+}
+
+#[test]
+fn an_items_look_is_read_from_its_own_record_and_a_failing_lookup_is_a_plain_item() {
+    let engine = engine(1, 2);
+    let who = ActorId(0);
+    // Potion (0) restores: cure green. Grenade (20) hurts with the SHOOT bit (not an element): no colour. Phoenix Down (7) revives.
+    let item = |id: u16| look_in(Some(&engine), who, ActionRef::Item(id));
+    assert_eq!(item(0), Look { melee: false, element: Element::Cure, style: Style::Item });
+    assert_eq!(item(3), Look { melee: false, element: Element::Cure, style: Style::Item });
+    assert_eq!(item(20), Look { melee: false, element: Element::Plain, style: Style::Item });
+    assert_eq!(item(7).style, Style::Item);
+    // An item the engine does not know is a plain item, and without an engine the look is a plain blow.
+    assert_eq!(item(4000), Look { melee: false, element: Element::Plain, style: Style::Item });
+    assert_eq!(look_in(None, who, ActionRef::Item(0)), Look::PLAIN);
 }

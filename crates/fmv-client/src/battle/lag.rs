@@ -24,8 +24,20 @@
 //! be late, never wrong**, and it is gone at the instant of the last landing of the batch ([`MAX_BATCH_SPAN`] after the
 //! batch arrived at the latest).
 //!
+//! # Statuses: the tags and the bodies
+//!
+//! A status is held back the same way. A status an action inflicts or cures is an event of its performance
+//! (`StatusInflicted`, `StatusEnded`), so it becomes a [`Change`] due at the landing of that performance, which is the instant its
+//! word floats up and its sign breaks over the fighter; a status that ran out on the clock lands with the 0.3 s beat of an
+//! event that has no announcement; a knockout, which removes every status without saying so, takes them with the collapse.
+//! What the panels show is the engine's set minus the flips that have not landed: [`Lag::apply`] undoes the ones still ahead,
+//! the latest first, so that a status inflicted by one performance of a batch and cured by a later one is shown from the
+//! first landing to the second. The 3D scene does not keep a second
+//! lag: it takes the statuses of the bodies from the very bars the panels are drawn from
+//! ([`super::scene::BattleScene::show_statuses`]), so a body's colour, droop and held pose change at the instant its tag does.
+//!
 //! What is NOT held back: the gauges (the ATB bar fills continuously, and the menu opens when the engine says it is our
-//! turn), the limit gauge, the statuses on the panel (the 3D bodies' colours follow the engine too) and the menu, which
+//! turn), the limit gauge, whether a fighter is ready (a sleeper loses its gold ring at once) and the menu, which
 //! reads the engine's own numbers (the MP of the next spell, the targets that are alive) before this is applied. The
 //! enemy list's held-back deaths ([`super::hud::BattleHud::decorate`]) are the same idea for the same moment.
 //!
@@ -34,7 +46,7 @@
 use super::scene::cue;
 use super::view::BattleView;
 use fmv_ff7_battle::rules::{ActorId, BattleEvent, BattleState};
-use fmv_ff7_battle::status::Status;
+use fmv_ff7_battle::status::{Status, StatusSet};
 
 /// Changes kept at most; beyond this the oldest are dropped (a window that stopped drawing must not grow the list).
 const MAX_PENDING: usize = 256;
@@ -47,6 +59,8 @@ pub struct Vitals {
     pub mp: u32,
     pub max_mp: u32,
     pub alive: bool,
+    /// The statuses it has (the ones the rules play).
+    pub status: StatusSet,
 }
 
 /// The numbers of everybody in `state`, party first and then the enemies.
@@ -55,12 +69,12 @@ pub fn vitals_of(state: &BattleState) -> Vec<(ActorId, Vitals)> {
         .party_ids()
         .into_iter()
         .chain(state.enemy_ids())
-        .filter_map(|id| state.actor(id).map(|c| (id, Vitals { hp: c.hp, max_hp: c.max_hp, mp: c.mp, max_mp: c.max_mp, alive: c.is_alive() })))
+        .filter_map(|id| state.actor(id).map(|c| (id, Vitals { hp: c.hp, max_hp: c.max_hp, mp: c.mp, max_mp: c.max_mp, alive: c.is_alive(), status: c.status.set() })))
         .collect()
 }
 
 /// A change of one fighter's numbers that has not landed yet: HP and MP by what they change by, the standing by what it
-/// becomes.
+/// becomes, the statuses by the ones it gains and the ones it loses.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Change {
     /// When it lands (seconds on the client's clock).
@@ -70,11 +84,14 @@ struct Change {
     mp: i64,
     /// `Some(true)`: the fighter stands up (a revival), `Some(false)`: it falls.
     stands: Option<bool>,
+    /// The statuses it gains and the ones it loses at that instant.
+    on: StatusSet,
+    off: StatusSet,
 }
 
 impl Change {
     fn is_nothing(&self) -> bool {
-        self.hp == 0 && self.mp == 0 && self.stands.is_none()
+        self.hp == 0 && self.mp == 0 && self.stands.is_none() && self.on.is_empty() && self.off.is_empty()
     }
 }
 
@@ -110,6 +127,8 @@ impl Lag {
                     hp: i64::from(v.hp) - i64::from(was.hp),
                     mp: i64::from(v.mp) - i64::from(was.mp),
                     stands: (v.alive != was.alive).then_some(v.alive),
+                    on: v.status.difference(was.status),
+                    off: was.status.difference(v.status),
                 };
                 match touched.iter_mut().find(|(a, _)| *a == actor) {
                     Some((_, last)) => *last = last.max(at),
@@ -130,6 +149,8 @@ impl Lag {
                 hp: i64::from(end.hp) - i64::from(got.hp),
                 mp: i64::from(end.mp) - i64::from(got.mp),
                 stands: (end.alive != got.alive).then_some(end.alive),
+                on: end.status.difference(got.status),
+                off: got.status.difference(end.status),
             };
             if !rest.is_nothing() {
                 changes.push(rest);
@@ -155,13 +176,29 @@ impl Lag {
             if let Some(next) = ahead().filter(|c| c.stands.is_some()).min_by(|a, b| a.at.total_cmp(&b.at)) {
                 bar.alive = next.stands != Some(true);
             }
+            // The statuses: the engine's set with the flips that have not landed undone, the latest first (a tie keeps the order
+            // of the events), so that what one performance inflicted and a later one cured is seen between the two landings.
+            let mut flips: Vec<&Change> = ahead().filter(|c| !c.on.is_empty() || !c.off.is_empty()).collect();
+            flips.sort_by(|a, b| a.at.total_cmp(&b.at));
+            for flip in flips.iter().rev() {
+                bar.status = bar.status.difference(flip.on).union(flip.off);
+            }
         }
     }
 
-    /// The changes still ahead of `now`, by time (tests).
+    /// The changes of numbers and standing still ahead of `now`, by time (tests; the statuses are [`Lag::flips_ahead`]).
     #[cfg(test)]
     pub fn ahead(&self, now: f64) -> Vec<(f64, ActorId, i64, i64, Option<bool>)> {
-        let mut out: Vec<_> = self.pending.iter().filter(|c| c.at > now).map(|c| (c.at, c.actor, c.hp, c.mp, c.stands)).collect();
+        let mut out: Vec<_> =
+            self.pending.iter().filter(|c| c.at > now && (c.hp != 0 || c.mp != 0 || c.stands.is_some())).map(|c| (c.at, c.actor, c.hp, c.mp, c.stands)).collect();
+        out.sort_by(|a, b| a.0.total_cmp(&b.0));
+        out
+    }
+
+    /// The status flips still ahead of `now`, by time: when, whose, which statuses come and which go (tests).
+    #[cfg(test)]
+    pub fn flips_ahead(&self, now: f64) -> Vec<(f64, ActorId, StatusSet, StatusSet)> {
+        let mut out: Vec<_> = self.pending.iter().filter(|c| c.at > now && (!c.on.is_empty() || !c.off.is_empty())).map(|c| (c.at, c.actor, c.on, c.off)).collect();
         out.sort_by(|a, b| a.0.total_cmp(&b.0));
         out
     }
@@ -192,8 +229,21 @@ fn effect(event: &BattleEvent) -> Option<(ActorId, Edit, u32)> {
     fn pay(v: &mut Vitals, n: u32) {
         v.mp = v.mp.saturating_sub(n);
     }
+    /// A knockout: it falls, and every status goes with it (the engine says nothing of those).
     fn fall(v: &mut Vitals, _: u32) {
         v.alive = false;
+        v.status = StatusSet::EMPTY;
+    }
+    /// A status an action inflicted (the number is its bit) or one that ended (a cure, the clock, a blow that woke it).
+    fn inflict(v: &mut Vitals, n: u32) {
+        if let Some(status) = u8::try_from(n).ok().and_then(Status::from_index) {
+            v.status.insert(status);
+        }
+    }
+    fn end(v: &mut Vitals, n: u32) {
+        if let Some(status) = u8::try_from(n).ok().and_then(Status::from_index) {
+            v.status.remove(status);
+        }
     }
     Some(match *event {
         BattleEvent::Damage { target, amount, .. } | BattleEvent::StatusTick { target, status: Status::Poison, amount } => (target, lose, amount),
@@ -202,6 +252,8 @@ fn effect(event: &BattleEvent) -> Option<(ActorId, Edit, u32)> {
         BattleEvent::MpRestored { target, amount, .. } => (target, restore, amount),
         BattleEvent::MpSpent { actor, amount } => (actor, pay, amount),
         BattleEvent::Death { actor } => (actor, fall, 0),
+        BattleEvent::StatusInflicted { target, status } => (target, inflict, u32::from(status.index())),
+        BattleEvent::StatusEnded { target, status } => (target, end, u32::from(status.index())),
         _ => return None,
     })
 }
@@ -213,7 +265,7 @@ mod tests {
     use fmv_ff7_battle::rules::ActionRef as A;
 
     fn v(hp: u32, max_hp: u32, mp: u32, max_mp: u32) -> Vitals {
-        Vitals { hp, max_hp, mp, max_mp, alive: hp > 0 }
+        Vitals { hp, max_hp, mp, max_mp, alive: hp > 0, status: StatusSet::EMPTY }
     }
 
     fn dmg(actor: u8, target: u8, amount: u32) -> BattleEvent {
@@ -231,7 +283,7 @@ mod tests {
 
     /// The panel the view would show from `state` (the engine's numbers).
     fn view_of(state: &[(ActorId, Vitals)]) -> BattleView {
-        let bar = |(actor, v): &(ActorId, Vitals)| Bar { actor: *actor, name: format!("F{}", actor.0), hp: v.hp, max_hp: v.max_hp, mp: v.mp, max_mp: v.max_mp, alive: v.alive, ..Bar::default() };
+        let bar = |(actor, v): &(ActorId, Vitals)| Bar { actor: *actor, name: format!("F{}", actor.0), hp: v.hp, max_hp: v.max_hp, mp: v.mp, max_mp: v.max_mp, alive: v.alive, status: v.status, ..Bar::default() };
         BattleView { party: state.iter().filter(|(a, _)| a.0 < 3).map(bar).collect(), enemies: state.iter().filter(|(a, _)| a.0 >= 3).map(bar).collect(), ..BattleView::default() }
     }
 
@@ -241,6 +293,13 @@ mod tests {
         lag.apply(&mut view, now);
         let bar = view.party.iter().chain(&view.enemies).find(|b| b.actor == ActorId(actor)).expect("a bar");
         (bar.hp, bar.mp, bar.alive)
+    }
+
+    /// The statuses the panel shows for `actor` at `now`.
+    fn tags(lag: &Lag, state: &[(ActorId, Vitals)], now: f64, actor: u8) -> StatusSet {
+        let mut view = view_of(state);
+        lag.apply(&mut view, now);
+        view.party.iter().chain(&view.enemies).find(|b| b.actor == ActorId(actor)).expect("a bar").status
     }
 
     const T: f64 = 50.0;
@@ -420,7 +479,7 @@ mod tests {
     fn the_turns_of_poison_and_regen_change_hp_at_once_and_a_status_alone_changes_nothing() {
         use fmv_ff7_battle::status::Status;
         let before = engine(&[(0, v(100, 200, 0, 0)), (1, v(100, 200, 0, 0))]);
-        let after = engine(&[(0, v(93, 200, 0, 0)), (1, v(120, 200, 0, 0))]);
+        let after = engine(&[(0, with(v(93, 200, 0, 0), &[Status::Sleep])), (1, v(120, 200, 0, 0))]);
         let mut lag = Lag::default();
         lag.on_batch(
             T,
@@ -436,7 +495,13 @@ mod tests {
         // Both ticks are the clock's, not an action's: nothing waits.
         assert_eq!(shown(&lag, &after, T, 0).0, 93);
         assert_eq!(shown(&lag, &after, T, 1).0, 120);
+        // The status alone changes no number: nothing of HP, MP or standing is ahead, only the Sleep's tag, which comes up with
+        // the short beat of an event that has no announcement.
         assert!(lag.ahead(T).is_empty());
+        let beat = T + cue::impact_delay(None);
+        assert_eq!(lag.flips_ahead(T).len(), 1);
+        assert_eq!(tags(&lag, &after, beat - 0.01, 0), StatusSet::EMPTY);
+        assert_eq!(tags(&lag, &after, beat + 0.01, 0), set(&[Status::Sleep]));
     }
 
     #[test]
@@ -468,5 +533,130 @@ mod tests {
         assert!(lag.pending.len() <= MAX_PENDING);
         lag.clear();
         assert!(lag.pending.is_empty());
+    }
+
+    // ----- statuses ------------------------------------------------------------------------------------------------------------
+
+    fn with(mut v: Vitals, list: &[Status]) -> Vitals {
+        v.status = list.iter().copied().collect();
+        v
+    }
+
+    fn set(list: &[Status]) -> StatusSet {
+        list.iter().copied().collect()
+    }
+
+    fn inflicted(target: u8, status: Status) -> BattleEvent {
+        BattleEvent::StatusInflicted { target: ActorId(target), status }
+    }
+
+    fn ended(target: u8, status: Status) -> BattleEvent {
+        BattleEvent::StatusEnded { target: ActorId(target), status }
+    }
+
+    #[test]
+    fn a_status_comes_up_on_the_panel_when_its_spell_lands_and_not_when_the_message_arrives() {
+        // Cloud (0) puts the foe (3) to sleep: the engine says Sleep the moment the batch arrives.
+        let before = engine(&[(0, v(300, 400, 20, 30)), (3, v(100, 120, 0, 0))]);
+        let after = engine(&[(0, v(300, 400, 12, 30)), (3, with(v(100, 120, 0, 0), &[Status::Sleep]))]);
+        let events = [act(0, A::Magic(11)), BattleEvent::MpSpent { actor: ActorId(0), amount: 8 }, inflicted(3, Status::Sleep)];
+        let mut lag = Lag::default();
+        lag.on_batch(T, &events, &before, &after);
+        let lands = T + cue::impact_delay(Some(A::Magic(11)));
+        assert_eq!(tags(&lag, &after, T, 3), StatusSet::EMPTY, "the engine has it, the panel does not yet");
+        assert_eq!(tags(&lag, &after, lands - 0.001, 3), StatusSet::EMPTY);
+        assert_eq!(tags(&lag, &after, lands, 3), set(&[Status::Sleep]), "at the instant its word floats up");
+        assert_eq!(tags(&lag, &after, lands + 9.0, 3), set(&[Status::Sleep]));
+        // Nobody else is touched, and the numbers are still the engine's (the spell's MP is paid as it begins).
+        assert_eq!(tags(&lag, &after, T, 0), StatusSet::EMPTY);
+        assert_eq!(shown(&lag, &after, T + 0.01, 0), (300, 12, true));
+        assert_eq!(lag.flips_ahead(T).len(), 1);
+    }
+
+    #[test]
+    fn a_cure_takes_a_tag_off_when_it_lands_and_the_one_it_does_not_cure_stays() {
+        let poisoned = [Status::Poison, Status::Silence];
+        let before = engine(&[(0, with(v(100, 200, 10, 30), &poisoned)), (3, v(10, 10, 0, 0))]);
+        let after = engine(&[(0, with(v(100, 200, 7, 30), &[Status::Silence])), (3, v(10, 10, 0, 0))]);
+        let mut lag = Lag::default();
+        lag.on_batch(T, &[act(0, A::Magic(4)), BattleEvent::MpSpent { actor: ActorId(0), amount: 3 }, ended(0, Status::Poison)], &before, &after);
+        let lands = T + cue::impact_delay(Some(A::Magic(4)));
+        assert_eq!(tags(&lag, &after, lands - 0.01, 0), set(&poisoned), "still poisoned on the panel until the cure lands");
+        assert_eq!(tags(&lag, &after, lands + 0.01, 0), set(&[Status::Silence]));
+    }
+
+    #[test]
+    fn haste_that_cancels_slow_flips_both_tags_at_one_instant_and_a_status_inflicted_then_cured_is_seen_between_the_two() {
+        let before = engine(&[(0, with(v(100, 200, 30, 30), &[Status::Slow])), (1, v(100, 200, 30, 30))]);
+        let after = engine(&[(0, with(v(100, 200, 12, 30), &[Status::Haste])), (1, v(100, 200, 30, 30))]);
+        let mut lag = Lag::default();
+        // Slow ends and Haste begins, as the engine announces a Haste that replaces a Slow.
+        lag.on_batch(T, &[act(1, A::Magic(19)), ended(0, Status::Slow), inflicted(0, Status::Haste)], &before, &after);
+        let lands = T + cue::impact_delay(Some(A::Magic(19)));
+        assert_eq!(tags(&lag, &after, lands - 0.01, 0), set(&[Status::Slow]));
+        assert_eq!(tags(&lag, &after, lands + 0.01, 0), set(&[Status::Haste]));
+        // Sleep put on by the first performance of a batch and cured by the next one: the engine ends with nothing, the panel
+        // shows nothing before the first landing, the Sleep between the two, and nothing after the cure.
+        let before = engine(&[(0, v(100, 200, 30, 30)), (3, v(10, 10, 0, 0))]);
+        let events = [act(3, A::EnemyAttack(1)), inflicted(0, Status::Sleep), act(1, A::Item(9)), ended(0, Status::Sleep)];
+        let mut lag = Lag::default();
+        lag.on_batch(T, &events, &before, &before);
+        let (slept, cured) = (T + cue::impact_delay(Some(A::EnemyAttack(1))), T + cue::length_of(Some(A::EnemyAttack(1))) + cue::impact_delay(Some(A::Item(9))));
+        for (at, want) in [(T, StatusSet::EMPTY), (slept - 0.01, StatusSet::EMPTY), (slept + 0.01, set(&[Status::Sleep])), (cured - 0.01, set(&[Status::Sleep])), (cured + 0.01, StatusSet::EMPTY), (T + 9.0, StatusSet::EMPTY)] {
+            assert_eq!(tags(&lag, &before, at, 0), want, "at {at}");
+        }
+    }
+
+    #[test]
+    fn a_status_that_runs_out_on_the_clock_and_a_battle_that_starts_with_one_land_with_the_short_beat_of_an_unannounced_event() {
+        let before = engine(&[(0, with(v(100, 200, 30, 30), &[Status::Barrier])), (3, v(10, 10, 0, 0))]);
+        let after = engine(&[(0, v(100, 200, 30, 30)), (3, v(10, 10, 0, 0))]);
+        let mut lag = Lag::default();
+        lag.on_batch(T, &[ended(0, Status::Barrier)], &before, &after);
+        let beat = T + cue::impact_delay(None);
+        assert_eq!(tags(&lag, &after, beat - 0.01, 0), set(&[Status::Barrier]));
+        assert_eq!(tags(&lag, &after, beat + 0.01, 0), StatusSet::EMPTY, "the same beat as the word that says it ended");
+    }
+
+    #[test]
+    fn a_knockout_takes_the_tags_with_the_collapse_and_a_status_the_events_do_not_explain_goes_with_the_last_landing() {
+        // Poisoned Tifa (2) is struck down by the foe (3): her tags stay until her collapse begins.
+        let before = engine(&[(2, with(v(30, 390, 20, 50), &[Status::Poison, Status::Haste])), (3, v(55, 55, 0, 0))]);
+        let after = engine(&[(2, v(0, 390, 20, 50)), (3, v(55, 55, 0, 0))]);
+        let events = [act(3, A::EnemyAttack(286)), dmg(3, 2, 130), BattleEvent::Death { actor: ActorId(2) }];
+        let mut lag = Lag::default();
+        lag.on_batch(T, &events, &before, &after);
+        let blow = T + cue::impact_delay(Some(A::EnemyAttack(286)));
+        let collapse = blow + cue::DEATH_BEAT;
+        assert_eq!(tags(&lag, &after, blow + 0.01, 2), set(&[Status::Poison, Status::Haste]), "the blow has landed, she has not fallen");
+        assert_eq!(tags(&lag, &after, collapse + 0.01, 2), StatusSet::EMPTY, "and her statuses are gone with her");
+        // A rule the walk does not know: the engine took a status away that no event named. It goes with the last landing.
+        let before = engine(&[(0, with(v(100, 200, 30, 30), &[Status::Fury])), (3, v(10, 10, 0, 0))]);
+        let after = engine(&[(0, v(100, 200, 30, 30)), (3, v(10, 10, 0, 0))]);
+        let mut lag = Lag::default();
+        lag.on_batch(T, &[act(3, A::EnemyAttack(1)), dmg(3, 0, 0)], &before, &after);
+        let lands = T + cue::impact_delay(Some(A::EnemyAttack(1)));
+        assert_eq!(tags(&lag, &after, lands - 0.01, 0), set(&[Status::Fury]));
+        assert_eq!(tags(&lag, &after, lands + 0.01, 0), StatusSet::EMPTY);
+    }
+
+    #[test]
+    fn two_batches_in_flight_compose_their_status_flips_and_all_end_at_the_engines_set() {
+        // Batch one: a counter that poisons Cloud lands late. Batch two arrives first and puts Barrier on him.
+        let s0 = engine(&[(0, v(400, 500, 30, 30)), (3, v(50, 50, 0, 0))]);
+        let s1 = engine(&[(0, with(v(400, 500, 30, 30), &[Status::Poison])), (3, v(30, 50, 0, 0))]);
+        let s2 = engine(&[(0, with(v(400, 500, 14, 30), &[Status::Poison, Status::Barrier])), (3, v(30, 50, 0, 0))]);
+        let mut lag = Lag::default();
+        lag.on_batch(T, &[act(0, A::Attack), dmg(0, 3, 20), act(3, A::EnemyAttack(286)), inflicted(0, Status::Poison)], &s0, &s1);
+        let poisoned = T + cue::length_of(Some(A::Attack)) + cue::impact_delay(Some(A::EnemyAttack(286)));
+        let second = T + 0.2;
+        assert!(second < poisoned);
+        lag.on_batch(second, &[act(0, A::Magic(15)), BattleEvent::MpSpent { actor: ActorId(0), amount: 16 }, inflicted(0, Status::Barrier)], &s1, &s2);
+        let barrier = second + cue::impact_delay(Some(A::Magic(15)));
+        assert!(barrier < poisoned, "the barrier lands before the counter's poison");
+        assert_eq!(tags(&lag, &s2, second + 0.01, 0), StatusSet::EMPTY);
+        assert_eq!(tags(&lag, &s2, barrier + 0.01, 0), set(&[Status::Barrier]), "the later flip is undone, the earlier one is not");
+        assert_eq!(tags(&lag, &s2, poisoned + 0.01, 0), set(&[Status::Poison, Status::Barrier]), "the engine's set");
+        assert!(lag.flips_ahead(poisoned + 0.001).is_empty());
     }
 }
