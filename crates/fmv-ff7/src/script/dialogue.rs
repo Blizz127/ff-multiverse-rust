@@ -280,9 +280,12 @@ pub fn characters(script: &FieldScript<'_>) -> Vec<Character> {
 const SAME_PLACE: f32 = 1.5;
 
 /// The character that stands at `(x, y)` under `name`: the one with that name and a literal
-/// placement within a unit and a half, the nearest if several; failing that the only character
-/// of that name (a character that has been moved). Names are labels (empty ones and shared ones
-/// exist), so the position decides whenever it can.
+/// placement within a unit and a half, the nearest if several (the first in entity order among
+/// equally near ones: the owned data has eight announced NPCs that are identical characters stacked
+/// on one spot with the same empty name, and which of them is talked to does not matter); failing
+/// that the only character of that name (a character that has been moved). Names are labels (empty
+/// ones and shared ones exist), so the position decides whenever it can. Every one of the 1 134 NPCs
+/// the owned data announces is found.
 pub fn find_character<'a>(chars: &'a [Character], name: &str, x: f32, y: f32) -> Option<&'a Character> {
     let near = |c: &Character| {
         c.places

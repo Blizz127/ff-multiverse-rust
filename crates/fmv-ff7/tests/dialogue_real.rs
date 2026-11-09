@@ -209,6 +209,68 @@ fn every_character_of_every_field_can_be_walked_and_nothing_is_garbage() {
     assert!(window_loops <= 3, "{window_loops}: questions that loop for ever (answered 'last' every time)");
 }
 
+/// The client finds the script entity of an NPC the server announced by its name and its place
+/// alone (no protocol change): every announced NPC of the 702 fields must match an entity of that
+/// name that stands there. Eight of the 1 134 cannot be told from another entity (identical
+/// characters stacked on one spot with the same, empty, name: five in `bonevil2`, one in
+/// `loslake1`, two in `loslake3`); the first of them, in entity order, is the one that is talked to.
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn every_npc_the_server_announces_is_matched_to_its_script_entity() {
+    use fmv_adapter_api::{AreaRuntime, GameAdapter};
+    use fmv_core::{EditionProvenance, GameId, Platform};
+    use fmv_ff7::script::dialogue::find_character;
+    let Some(dir) = data_dir() else {
+        eprintln!("FMV_FF7_DATA is not set; skipping");
+        return;
+    };
+    let provenance = EditionProvenance {
+        game: GameId::Ff7,
+        platform: Platform::Pc,
+        edition: "steam".into(),
+        region: "any".into(),
+        language: "en".into(),
+        revision: "test".into(),
+        sources: vec![],
+        modded: false,
+    };
+    let adapter = fmv_ff7::Ff7Adapter::from_flevel_path(flevel_path(&dir), provenance).unwrap();
+    let (mut fields, mut announced, mut matched, mut with_text, mut empty_names) = (0usize, 0usize, 0usize, 0usize, 0usize);
+    let (mut mismatched, mut stacked): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+    for info in adapter.list_areas() {
+        let Ok(area) = adapter.load_field(&info.id.key) else { continue };
+        let Ok(script) = FieldScript::from_field(area.field_file()) else { continue };
+        fields += 1;
+        let chars = characters(&script);
+        for npc in area.npcs().iter().filter(|n| n.unconditional) {
+            announced += 1;
+            empty_names += usize::from(npc.entity_name.is_empty());
+            let found = find_character(&chars, &npc.entity_name, npc.pos.x, npc.pos.y);
+            // The match must be the entity of that name that stands there: no other entity of the
+            // field has the same name and place.
+            let twins = chars.iter().filter(|c| c.name == npc.entity_name && c.places.iter().any(|&(x, y)| (f32::from(x) - npc.pos.x).hypot(f32::from(y) - npc.pos.y) <= 1.5)).count();
+            match found {
+                Some(c) => {
+                    matched += 1;
+                    if twins > 1 {
+                        stacked.push(format!("{} {:?} x{twins}", info.id.key, npc.entity_name));
+                    }
+                    let session = TalkSession::talk(script.bytes().to_vec(), c.entity, Box::new(StartOfGame), 1);
+                    if let Ok(mut session) = session {
+                        with_text += usize::from(matches!(session.next(None), Beat::Message(_)));
+                    }
+                }
+                None => mismatched.push(format!("{} {:?} ({}, {})", info.id.key, npc.entity_name, npc.pos.x, npc.pos.y)),
+            }
+        }
+    }
+    eprintln!("{fields} fields, {announced} announced NPCs ({empty_names} unnamed): {matched} matched an entity ({} stacked), {with_text} of them have something to say at the start of the game; unmatched {mismatched:?}", stacked.len());
+    assert_eq!(fields, 702);
+    assert!(mismatched.is_empty(), "{mismatched:?}");
+    assert_eq!((announced, matched), (1_134, 1_134));
+    assert_eq!(stacked.len(), 8, "{stacked:?}");
+}
+
 /// The lines of the last page of a dialog (a page break restarts the count), each as the bytes of
 /// the line (control arguments skipped), for the `ASK` measurements.
 fn last_page_lines(raw: &[u8]) -> Vec<Vec<u8>> {
