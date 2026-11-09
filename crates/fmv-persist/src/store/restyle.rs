@@ -14,9 +14,9 @@
 //!
 //! It never changes the **slot**, the **progress pointers**, the identity's **name**, the **origin**, the
 //! **created_at** time, any other game's entry or any other file: no avatar profile, account record, index entry,
-//! character-progress record (level, experience, gil, AP, items, limit gauge) or story blob is read for writing.
-//! The one file it writes is the record itself, atomically (the old record or the new one is on the disk, never a
-//! torn one), under the store's writer lock.
+//! character-progress record (level, experience, gil, AP, items, limit gauge) or story blob is written (the account's
+//! own records are only READ, to build a record that is missing). The one file it writes is the record itself,
+//! atomically (the old record or the new one is on the disk, never a torn one), under the store's writer lock.
 //!
 //! # An account without a record yet
 //!
