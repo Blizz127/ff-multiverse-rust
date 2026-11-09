@@ -794,7 +794,7 @@ impl Ff7FieldArea {
         let mut story = FieldScript::from_field(&field).map(|script| AreaStory::scan(&script, &walkmesh)).unwrap_or_default();
         let withheld = exits_left_off.and_then(|exits| {
             let points = story.withhold_points();
-            (!exits.is_empty() || !points.is_empty()).then(|| StoryWithheld { reason: UNREVIEWED_FIELD.to_string(), exits, points })
+            (!exits.is_empty() || !points.is_empty()).then(|| StoryWithheld { reason: UNREVIEWED_FIELD.to_string(), exits, links: Vec::new(), points })
         });
         let mut area = Self { info, field, walkmesh, surface, bounds, spawns, field_scale, exits, gates, npcs: Vec::new(), encounters, story, withheld };
         // NPCs without a literal height stand on this area's own surface, so they are worked out last.

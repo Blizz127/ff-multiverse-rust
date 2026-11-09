@@ -143,6 +143,7 @@ use fmv_protocol::{
     BattleRules, BattleSetup, ServerMsg, MAX_BATTLE_PARTY,
 };
 
+use super::story::StoryThen;
 use super::{is_full, Outbound, World};
 use crate::character::log_token;
 use crate::companion;
@@ -197,6 +198,9 @@ struct Battle {
     /// How many `StatusInflicted`, `StatusEnded` and `StatusTick` events the engine has announced (logged when the
     /// battle ends; the first two are also logged one by one, see [`Battle::note_statuses`]).
     status_counts: [u32; 3],
+    /// The story step this battle is the price of, applied when it is won (a battle a story point starts first); `None`
+    /// for an encounter.
+    then: Option<StoryThen>,
 }
 
 /// How a set of statuses reads in a log line: the names joined by `+`, or `-` for none (one token, so that a list of
@@ -468,14 +472,36 @@ impl World {
         let Some(formation) = formation.or_else(|| bw.default_formation(table)) else {
             return refused(None, BattleRejection::UnknownFormation);
         };
-        match self.begin_battle(entity, formation, now) {
+        match self.begin_battle(entity, formation, now, None) {
             Ok(_) => BattleReply::Done,
             Err(reason) => refused(None, reason),
         }
     }
 
-    /// Start a battle with `formation` for `requester`'s party (or just `requester`).
-    fn begin_battle(&mut self, requester: EntityId, formation: u16, now: Instant) -> Result<BattleId, BattleRejection> {
+    /// A story point of `entity`'s area starts the battle `formation` (`AreaRuntime::story_battle`): the party fights
+    /// it now and the point's step is applied if it is won. Returns whether the battle started; when it cannot (the
+    /// server runs no battles, a member is already in one) the story waits, and the server says so.
+    pub(super) fn start_story_battle(&mut self, entity: EntityId, point: u32, formation: u16, now: Instant) -> bool {
+        let Some(area) = self.players.get(&entity).map(|p| p.area.clone()) else { return false };
+        let game_area = self.areas.get(&area).map_or_else(|| area.clone(), |a| a.id().to_string());
+        match self.begin_battle(entity, formation, now, Some(StoryThen { entity, area, point })) {
+            Ok(id) => {
+                self.logs.info(format!("story battle started battle={} entity={} area={game_area} point={point} formation={formation}", id.0, entity.0));
+                true
+            }
+            Err(reason) => {
+                self.logs.info(format!(
+                    "a story battle could not start, the story waits entity={} area={game_area} point={point} formation={formation} reason={reason:?}",
+                    entity.0
+                ));
+                false
+            }
+        }
+    }
+
+    /// Start a battle with `formation` for `requester`'s party (or just `requester`). `then` is the story step the
+    /// battle is the price of (applied when it is won), for the battle a story point starts.
+    fn begin_battle(&mut self, requester: EntityId, formation: u16, now: Instant, then: Option<StoryThen>) -> Result<BattleId, BattleRejection> {
         let Some(bw) = self.battle.as_mut() else {
             return Err(BattleRejection::Unsupported);
         };
@@ -597,6 +623,7 @@ impl World {
                 formation,
                 seed,
                 status_counts: [0; 3],
+                then,
             },
         );
         for entity in &entities {
@@ -934,6 +961,13 @@ impl World {
         for (entity, msg) in told {
             self.fan_to(&[entity], msg);
         }
+        // A battle a story point started is the price of the point's step: paid when it is won, never when it is lost
+        // or fled (the story stays where it was, and the point can be reached again).
+        if outcome == Outcome::Victory {
+            if let Some(then) = battle.then.clone() {
+                self.story_after_battle(then);
+            }
+        }
     }
 
     /// Keep the limit gauge every member of a finished battle ended with, whatever the outcome (an
@@ -1130,7 +1164,7 @@ impl World {
             }
         };
         if let Some(formation) = triggered {
-            if let Err(reason) = self.begin_battle(entity, formation, now) {
+            if let Err(reason) = self.begin_battle(entity, formation, now, None) {
                 self.logs.debug(format!("a random encounter could not start entity={} formation={formation} reason={reason:?}", entity.0));
             }
         }
@@ -3031,6 +3065,167 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(!w.in_battle(a.entity) && !w.in_battle(b.entity));
+    }
+
+    /// The rooms with the story point that starts a battle (`RoomsAdapter::with_interactions`), a saver queue to read,
+    /// and battles on (`settings`, or none).
+    fn rooms_world(settings: Option<BattleSettings>) -> (World, mpsc::UnboundedReceiver<Msg>) {
+        use fmv_fixture::rooms::{RoomsAdapter, HALL};
+        let adapter: Arc<dyn GameAdapter> = Arc::new(RoomsAdapter::with_interactions());
+        let mut w = World::with_party_config(adapter.load_area(HALL).unwrap(), fmv_party::PartyConfig::default()).unwrap();
+        w.set_area_source(adapter);
+        let (handle, rx) = SaverHandle::channel();
+        w.set_progress_saver(handle);
+        w.configure_battle(settings, false);
+        (w, rx)
+    }
+
+    /// Hop to (x, y) 700 ms after `*now`.
+    fn hop(w: &mut World, seat: &Seat, x: f32, y: f32, now: &mut Instant) -> MoveOutcome {
+        *now += Duration::from_millis(700);
+        w.apply_move(seat.entity, Pos::new(x, y, 0.0), 0.0, AnimState::Walk, *now)
+    }
+
+    fn progression_of(w: &World, seat: &Seat) -> Vec<u8> {
+        w.players.get(&seat.entity).unwrap().progression.clone()
+    }
+
+    fn story_lines(w: &mut World) -> Vec<String> {
+        w.take_logs().iter().map(|l| l.text().to_string()).filter(|l| l.contains("story ") || l.starts_with("battle ")).collect()
+    }
+
+    #[test]
+    fn a_story_point_that_starts_a_battle_pays_its_step_when_the_battle_is_won_and_not_before() {
+        use fmv_fixture::rooms::{BATTLE_FORMATION, BATTLE_REGION, STORY_ADVANCED};
+        let rules = SyntheticRules::default();
+        let t0 = Instant::now();
+        let (mut w, mut saved) = rooms_world(Some(settings(rules)));
+        let mut a = seat(&mut w, "A", t0);
+        a.drain();
+        w.take_logs();
+        let mut now = t0;
+        // The way to the battle region (x -300..-250, y 200..250): the story waits for the fight.
+        for (x, y) in [(-100.0, 100.0), (-200.0, 180.0)] {
+            assert_eq!(hop(&mut w, &a, x, y, &mut now), MoveOutcome::Applied);
+        }
+        assert_eq!(BATTLE_REGION[0], (-300.0, 200.0));
+        assert!(!w.in_battle(a.entity));
+        assert_eq!(hop(&mut w, &a, -270.0, 220.0, &mut now), MoveOutcome::Applied);
+        assert!(w.in_battle(a.entity), "the region started the battle");
+        assert!(progression_of(&w, &a).is_empty(), "the step is the price of the win: nothing yet");
+        let started = story_lines(&mut w);
+        assert!(started.iter().any(|l| l.starts_with("story battle started battle=1") && l.contains("point=2") && l.contains(&format!("formation={BATTLE_FORMATION}"))), "{started:?}");
+        assert!(started.iter().any(|l| l.starts_with("battle started battle=1")), "{started:?}");
+        assert!(!started.iter().any(|l| l.contains("story advanced")), "{started:?}");
+        assert!(saved_stories_of(&mut saved).is_empty());
+        // Won: the step is applied, the player is told after the battle's end, and it is saved.
+        play_out(&mut w, &mut [&mut a], &rules, t0);
+        assert_eq!(progression_of(&w, &a), STORY_ADVANCED);
+        let msgs = a.drain();
+        let kinds: Vec<&str> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                ServerMsg::BattleEnd { outcome, .. } => Some(if *outcome == fmv_protocol::battle::Outcome::Victory { "victory" } else { "other" }),
+                ServerMsg::StoryUpdate { advance: Some(_), .. } => Some("step"),
+                _ => None,
+            })
+            .collect();
+        let after = a.log.iter().filter_map(|m| match m {
+            ServerMsg::BattleEnd { .. } => Some("end"),
+            ServerMsg::StoryUpdate { advance: Some(_), .. } => Some("step"),
+            _ => None,
+        });
+        assert_eq!(after.collect::<Vec<_>>(), ["end", "step"], "the step comes after the end of the battle ({kinds:?})");
+        let lines = story_lines(&mut w);
+        assert!(lines.iter().any(|l| l.contains("story advanced") && l.contains("point=2") && l.contains("moment=0->1")), "{lines:?}");
+        assert_eq!(saved_stories_of(&mut saved), [STORY_ADVANCED.to_vec()]);
+        // Standing in the region now starts nothing (the step is taken), and neither does a second visit.
+        assert_eq!(hop(&mut w, &a, -260.0, 230.0, &mut now), MoveOutcome::Applied);
+        assert!(!w.in_battle(a.entity));
+    }
+
+    fn saved_stories_of(rx: &mut mpsc::UnboundedReceiver<Msg>) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let Msg::Story(job) = msg {
+                out.push(job.progress);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_lost_story_battle_leaves_the_story_where_it_was_and_the_region_is_reached_again_only_from_outside() {
+        use fmv_fixture::rooms::{LOSING_FORMATION, LOSING_REGION};
+        let rules = SyntheticRules::default();
+        let t0 = Instant::now();
+        let (mut w, mut saved) = rooms_world(Some(settings(rules)));
+        let mut a = seat(&mut w, "A", t0);
+        a.drain();
+        w.take_logs();
+        let mut now = t0;
+        // The losing region (x 250..300, y -250..-200): the overwhelming enemy.
+        assert_eq!(LOSING_REGION[0], (250.0, -250.0));
+        for (x, y) in [(0.0, -100.0), (100.0, -180.0), (200.0, -230.0)] {
+            assert_eq!(hop(&mut w, &a, x, y, &mut now), MoveOutcome::Applied);
+        }
+        assert_eq!(hop(&mut w, &a, 270.0, -230.0, &mut now), MoveOutcome::Applied);
+        assert!(w.in_battle(a.entity));
+        let started = story_lines(&mut w);
+        assert!(started.iter().any(|l| l.starts_with("story battle started") && l.contains(&format!("formation={LOSING_FORMATION}"))), "{started:?}");
+        play_out(&mut w, &mut [&mut a], &rules, t0);
+        assert!(a.log.iter().any(|m| matches!(m, ServerMsg::BattleEnd { outcome: fmv_protocol::battle::Outcome::Defeat, .. })));
+        assert!(!w.in_battle(a.entity), "the party is back in the field");
+        assert!(progression_of(&w, &a).is_empty(), "a defeat leaves the story where it was");
+        assert!(saved_stories_of(&mut saved).is_empty());
+        assert!(!story_lines(&mut w).iter().any(|l| l.contains("story advanced")));
+        // The player stands in the region still: its next step inside it does not start the fight again...
+        let later = ms(t0, 60_000 * 10);
+        assert_eq!(w.apply_move(a.entity, Pos::new(275.0, -225.0, 0.0), 0.0, AnimState::Walk, later), MoveOutcome::Applied);
+        assert!(!w.in_battle(a.entity));
+        // ...but coming to it from outside does
+        assert_eq!(w.apply_move(a.entity, Pos::new(200.0, -230.0, 0.0), 0.0, AnimState::Walk, ms(t0, 60_000 * 10 + 700)), MoveOutcome::Applied);
+        assert_eq!(w.apply_move(a.entity, Pos::new(270.0, -230.0, 0.0), 0.0, AnimState::Walk, ms(t0, 60_000 * 10 + 1_400)), MoveOutcome::Applied);
+        assert!(w.in_battle(a.entity));
+    }
+
+    #[test]
+    fn a_server_that_runs_no_battles_cannot_pay_the_price_so_the_story_waits_and_says_so() {
+        let t0 = Instant::now();
+        let (mut w, mut saved) = rooms_world(None);
+        let mut a = seat(&mut w, "A", t0);
+        a.drain();
+        w.take_logs();
+        let mut now = t0;
+        for (x, y) in [(-100.0, 100.0), (-200.0, 180.0), (-270.0, 220.0)] {
+            assert_eq!(hop(&mut w, &a, x, y, &mut now), MoveOutcome::Applied);
+        }
+        assert!(!w.in_battle(a.entity));
+        assert!(progression_of(&w, &a).is_empty(), "the step is never taken without the fight");
+        assert!(saved_stories_of(&mut saved).is_empty());
+        let lines = story_lines(&mut w);
+        assert!(lines.iter().any(|l| l.starts_with("a story battle could not start, the story waits") && l.contains("point=2") && l.contains("Unsupported")), "{lines:?}");
+    }
+
+    #[test]
+    fn a_member_of_a_party_that_may_not_advance_the_story_does_not_start_the_story_battle() {
+        let rules = SyntheticRules::default();
+        let t0 = Instant::now();
+        let (mut w, _saved) = rooms_world(Some(settings(rules)));
+        // A leads with the advanced story; B joins its party with a new account's story
+        let (mut a, mut b) = (seat_as(&mut w, "A", t0, ProgressSeed::default()), seat_as(&mut w, "B", t0, ProgressSeed::default()));
+        w.players.get_mut(&a.entity).unwrap().progression = fmv_fixture::rooms::STORY_ADVANCED.to_vec();
+        assert_eq!(w.party_invite(a.entity, b.entity, t0), crate::world::PartyOutcome::Done);
+        let invite = w.parties.invites().next().expect("an invite").id;
+        assert_eq!(w.party_accept(b.entity, invite, t0), crate::world::PartyOutcome::Done);
+        a.drain();
+        b.drain();
+        let mut now = t0;
+        for (x, y) in [(100.0, 100.0), (0.0, 180.0), (-200.0, 190.0), (-270.0, 220.0)] {
+            assert_eq!(hop(&mut w, &b, x, y, &mut now), MoveOutcome::Applied);
+        }
+        assert!(!w.in_battle(b.entity) && !w.in_battle(a.entity), "the member's own story may not advance in the leader's phase");
+        assert_eq!(w.battle_count(), 0);
     }
 
     #[test]

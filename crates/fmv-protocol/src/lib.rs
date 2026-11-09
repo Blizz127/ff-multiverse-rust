@@ -1,4 +1,10 @@
-//! FF Multiverse wire protocol v12.
+//! FF Multiverse wire protocol v12 (and the `Interact` message that v13 will carry).
+//!
+//! Pending v13: [`ClientMsg::Interact`], the OK button. Until now nothing told the server that a player pressed OK, so
+//! a talk, a ladder that waits for the button and the elevator's panel could only be approximated by where a player
+//! walks. A client now sends one `Interact` per press (with the character it addressed, if any) and the server decides
+//! what the press does. Nothing else changed shape; [`PROTOCOL_VERSION`] stays 12 until the integrator bumps it with
+//! the other changes of v13 (a v12 client never sends it, and no server behaviour depends on it for a v12 client).
 //!
 //! v12 is v11 plus STATUS EFFECTS (see "Statuses (v12)" below and [`battle`], "Statuses"): three battle events, two
 //! refusals and one optional field of the roster ([`BattleMember::status`]). A v11 peer cannot decode the new events or
@@ -465,6 +471,18 @@ pub enum ClientMsg {
     /// Client cannot join: it lacks the area or has an incompatible edition.
     CannotJoin { area: AreaId, reason: String },
     MoveIntent { seq: u32, pos: Pos, facing: f32, anim: AnimState },
+    /// The player pressed the OK button (Enter or Space) in the field. The server works out what OK does from where
+    /// the player stands: a character in reach is talked to (its talk script may move the story), a ladder or a lift
+    /// panel under the player's feet is used. `npc` is the character the client addressed (the `id` of an
+    /// [`NpcSnapshot`] of the area, the one it opened a conversation with), `None` when the client found nobody in
+    /// reach; the server checks the claim against where the player stands and where that character stands, and a
+    /// press that reaches nothing does nothing and is not answered. One message per press (not per frame the key is
+    /// held). Added on top of v12: the version is bumped to v13 when it joins the rest of the changes of that
+    /// version, and a v12 client never sends it (a server must not need it for anything else).
+    Interact {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        npc: Option<u32>,
+    },
     Ping { nonce: u64 },
     Leave,
     /// Invite the player with this entity into your party (or to form one).
@@ -832,6 +850,11 @@ mod tests {
                 r#"","provenance":{"game":"Ff7","platform":"Pc","edition":"Steam","region":"unknown","language":"en","revision":"r1","modded":false}}}"#
             ),
         );
+        // The OK button (pending v13, see `ClientMsg::Interact`): the character addressed, or nobody.
+        golden(ClientMsg::Interact { npc: Some(3) }, r#"{"Interact":{"npc":3}}"#);
+        golden(ClientMsg::Interact { npc: None }, r#"{"Interact":{}}"#);
+        // a sender that writes the absent character as null is read the same
+        assert_eq!(serde_json::from_str::<ClientMsg>(r#"{"Interact":{"npc":null}}"#).unwrap(), ClientMsg::Interact { npc: None });
         golden(ClientMsg::PartyInvite { target: EntityId(7) }, r#"{"PartyInvite":{"target":7}}"#);
         golden(ClientMsg::PartyAccept { invite: InviteId(3) }, r#"{"PartyAccept":{"invite":3}}"#);
         golden(ClientMsg::PartyDecline { invite: InviteId(3) }, r#"{"PartyDecline":{"invite":3}}"#);

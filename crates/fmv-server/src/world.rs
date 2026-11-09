@@ -96,7 +96,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use fmv_adapter_api::{AreaKey, AreaRuntime, Exit, GameAdapter, MoveResult};
+use fmv_adapter_api::{AreaKey, AreaRuntime, Exit, GameAdapter, LinkArming, MoveResult};
 use fmv_core::{AccountId, AnimState, AvatarAppearance, EntityId, EntitySnapshot, Pos, SessionId};
 use fmv_party::{InstanceRegistry, Invite, PartyConfig, PartyEvent, PartyManager, Placement, Tick};
 use fmv_protocol::{BattleId, PartyName, ServerMsg};
@@ -113,10 +113,12 @@ mod areas;
 mod battle;
 mod instances;
 mod party;
+mod press;
 mod story;
 pub use areas::{TravelReply, AREA_UNLOAD_GRACE, TRAVEL_TIMEOUT};
 pub use battle::BattleReply;
 pub use party::PartyOutcome;
+pub use press::PressOutcome;
 
 /// A message queued for one or more connections. Broadcasts share one allocation.
 pub type Outbound = Arc<ServerMsg>;
@@ -237,6 +239,12 @@ struct Player {
     /// Set while the player is between two areas (see the `areas` module): it is in no area,
     /// nobody sees it and its moves are ignored.
     transit: Option<areas::Transit>,
+    /// Which walk-on links of the area the player can fire (see the `press` module): placed anew at every entry and
+    /// relocation.
+    arming: LinkArming,
+    /// Set after a link moved the player: until the client has taken the new position (an intent that agrees with it)
+    /// every intent is answered with that position (see the `press` module).
+    fence: Option<press::Fence>,
 }
 
 /// Everything the world needs to admit a player into the area.
@@ -278,6 +286,10 @@ pub enum MoveOutcome {
     Applied,
     /// The move was refused. `corrected` is the authoritative position to send back.
     Rejected { corrected: Pos, reason: Rejection },
+    /// The player was moved to `corrected` (by a link, see the `press` module), or its move came from a client that
+    /// has not taken that yet. `corrected` is the authoritative position to send back, as for a refusal: but this is
+    /// no refusal, and a connection does not count or log it as one.
+    Relocated { corrected: Pos },
     /// The player is in a battle: the move is ignored (not applied, not answered).
     Frozen,
     /// The entity is no longer in the world (dropped or disconnected).
@@ -446,6 +458,8 @@ impl World {
                 walked: 0.0,
                 area: home,
                 transit: None,
+                arming: LinkArming::default(),
+                fence: None,
             },
         );
         self.by_account.insert(account, entity);
@@ -514,6 +528,11 @@ impl World {
             if !to.is_finite() || !facing.is_finite() {
                 return MoveOutcome::Rejected { corrected: from, reason: Rejection::NonFinite };
             }
+            // A client that has not yet taken the position a link gave the player is answered with it (no budget is
+            // spent): its intents are judged from the old place.
+            if let Some(corrected) = press::fenced(&mut p.fence, to, now) {
+                return MoveOutcome::Relocated { corrected };
+            }
 
             p.budget.refill(now, area.rules());
             let dist = dist_xy(from, to);
@@ -553,7 +572,11 @@ impl World {
                 p.budget.tokens -= dist;
                 p.dirty |= changed;
                 // Reaching a story point is what advances the story (a no-op in an area without any).
-                self.check_story(entity, from, accepted);
+                self.check_story(entity, from, accepted, now);
+                // Walking up to a line that no key fires may put the player somewhere else in the area.
+                if let Some(corrected) = self.walk_links(entity, from, accepted, now) {
+                    return MoveOutcome::Relocated { corrected };
+                }
                 // Walking is what rolls random encounters (a no-op without an encounter table).
                 self.roll_encounter(entity, dist, now);
                 MoveOutcome::Applied
