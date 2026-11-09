@@ -3,7 +3,7 @@
 //!
 //! Everything here is data derived from the owner's own files (or hand-made in tests) and is plain,
 //! `Copy`-friendly, total on any input: [`ActionSpec::from_attack`] and [`ActionSpec::from_item`] return
-//! `None` for a record the rules do not model (a status-only spell, a scripted special) instead of
+//! `None` for a record the rules do not model (a scripted special, a status the rules do not play) instead of
 //! guessing, which is how "skip it safely" is decided in one place. The state machine that plays an
 //! action is in [`crate::rules`].
 //!
@@ -36,7 +36,9 @@
 //!
 //! "Stat" is Strength (plus weapon) for physical actions and Magic for magical ones, "Defense" the
 //! matching defense. Formulas 1, 2, 5 and 7 are followed by the random variance `(3841 + 0..=255)/4096`;
-//! 3, 4, 6 and 8 are not. `Power` of 0 means "no damage, only an effect" (a status spell): not modelled.
+//! 3, 4, 6 and 8 are not. A `Power` of 0, or a byte with no formula (`0x50`, the `0xFF` of a record with no
+//! damage part), means "no damage, only an effect": a **status-only** action ([`Formula::None`], see "Statuses"
+//! below), which is not modelled when the statuses it has are not ones the rules play.
 //! A record whose element is Restorative ([`element::RESTORATIVE`]) with formula 4, 5, 6 or 8 **restores**
 //! ([`ActionSpec::heals`]): Cure and Life and every potion are such records.
 //!
@@ -64,7 +66,18 @@
 //! was aimed at "all" and one enemy was left. APPROXIMATION to note: the pseudocode page writes the
 //! split as `Damage * 3 / 2`, which is read as a transcription slip (the FAQ, the Final Fantasy Wiki and
 //! the community all say 2/3), and the same FAQ says the chance of a status that comes with a split
-//! attack is cut to 2/3 too, which matters only once statuses are modelled.
+//! attack is cut to 2/3 too, which [`crate::rules`] does (see [`crate::status::StatusEffect::chance_among`]).
+//!
+//! # Statuses
+//!
+//! A record's status mask and chance byte decode to a [`StatusEffect`] ([`crate::status`] has the layout and the
+//! statuses the rules play); an action carries it in [`ActionSpec::status`]. A damaging or restoring action with
+//! one tries it on every target it hit that still stands; a **status-only** action (Sleep, Haste, Poisona, an
+//! Antidote or an Echo Screen) has nothing else, and rolls to hit like a spell (an accuracy roll when its
+//! damage-calculation byte has one, never against an ally). Which side a status-only action aims at is the
+//! record's own targeting bit `0x02` ("the cursor starts on the enemies"): clear for a buff or a cure
+//! ([`ActionSpec::on_allies`]), set for a curse. A record whose only statuses are ones the rules do not play
+//! decodes exactly as it did before they were modelled.
 //!
 //! # Elements
 //!
@@ -78,6 +91,7 @@ use std::collections::BTreeMap;
 
 use crate::kernel::{ItemRecord, Kernel, ITEM_COUNT};
 use crate::scene::{AffinityRate, AttackRecord, SceneAttack};
+pub use crate::status::{StatusEffect, StatusMode};
 
 /// Element bit masks of an attack record (`<https://wiki.ffrtt.ru/index.php/FF7/Battle/Elemental_Data>`).
 pub mod element {
@@ -104,6 +118,8 @@ const FLAG_HITS_MP: u16 = 0x0001;
 const FLAG_HITS_DEAD: u16 = 0x0100;
 const FLAG_IGNORES_DEFENSE: u16 = 0x0400;
 /// Targeting bits.
+/// The cursor starts on the enemies (clear: on the actor's own side).
+const TARGET_ENEMY_ROW: u8 = 0x02;
 const TARGET_MULTI_DEFAULT: u8 = 0x04;
 const TARGET_TOGGLE_MULTI: u8 = 0x08;
 const TARGET_SHORT_RANGE: u8 = 0x20;
@@ -180,6 +196,10 @@ pub enum Formula {
     Fixed,
     /// `0x?8`: everything (Elixir).
     Full,
+    /// No damage or recovery at all (a Power of 0, the byte `0x50` or `0xFF`): the action only has its status
+    /// ([`ActionSpec::status`]). Never in a damage-calculation byte's low nybble: it is what a record without a
+    /// formula decodes to when it has a status.
+    None,
 }
 
 impl Formula {
@@ -233,6 +253,15 @@ pub struct ActionSpec {
     pub mp_cost: u16,
     /// How many it can be aimed at (see [`Aim`]).
     pub aim: Aim,
+    /// What it does to the statuses of its targets, if anything (see the module docs, "Statuses").
+    pub status: Option<StatusEffect>,
+    /// The Attack command itself, the weapon attack (Darkness halves its hit rate, a party member's only: see
+    /// [`crate::status`]). Set by [`ActionSpec::basic_attack`] and nothing else.
+    pub weapon_attack: bool,
+    /// For a status-only action ([`Formula::None`]): it aims at the actor's own side (a buff or a cure, the
+    /// record's targeting bit `0x02` clear) and not at the other one. Meaningless for any other action, whose side
+    /// is [`ActionSpec::heals`]'s answer.
+    pub on_allies: bool,
 }
 
 impl ActionSpec {
@@ -252,6 +281,9 @@ impl ActionSpec {
             short_range,
             mp_cost: 0,
             aim: Aim::One,
+            status: None,
+            weapon_attack: true,
+            on_allies: false,
         }
     }
 
@@ -268,7 +300,7 @@ impl ActionSpec {
         match self.formula {
             Formula::Standard | Formula::Restore => true,
             Formula::Spell => self.aim == Aim::OneOrSide,
-            Formula::CurrentHp | Formula::MaxHp | Formula::Flat | Formula::Fixed | Formula::Full => false,
+            Formula::CurrentHp | Formula::MaxHp | Formula::Flat | Formula::Fixed | Formula::Full | Formula::None => false,
         }
     }
 
@@ -290,6 +322,9 @@ impl ActionSpec {
             short_range: false,
             mp_cost,
             aim: Aim::OneOrSide,
+            status: None,
+            weapon_attack: false,
+            on_allies: false,
         }
     }
 
@@ -367,6 +402,9 @@ impl ActionSpec {
             short_range: false,
             mp_cost: 0,
             aim: Aim::One,
+            status: None,
+            weapon_attack: false,
+            on_allies: false,
         }
     }
 
@@ -388,6 +426,40 @@ impl ActionSpec {
         }
     }
 
+    /// A hand-made action that only has a status (Sleep's kind: magical, an accuracy roll of `accuracy` unless it
+    /// is aimed at allies; `on_allies` says which side it aims at, [`ActionSpec::on_allies`]), one target or a
+    /// whole side like the records' `0x0D` and `0x0F`.
+    pub fn status_spell(effect: StatusEffect, accuracy: u32, mp_cost: u16, on_allies: bool) -> Self {
+        Self {
+            formula: Formula::None,
+            power: 0,
+            status: Some(effect),
+            on_allies,
+            ..Self::damage_spell(0, accuracy, 0, mp_cost)
+        }
+    }
+
+    /// A hand-made item that only has a status (an Antidote's kind: it never misses, one target; `on_allies` as for
+    /// [`ActionSpec::status_spell`]; [`ActionSpec::with_aim`] makes it hit a whole side).
+    pub fn status_item(effect: StatusEffect, on_allies: bool) -> Self {
+        Self { rolls_accuracy: false, aim: Aim::One, ..Self::status_spell(effect, 255, 0, on_allies) }
+    }
+
+    /// The same action with a status effect added (Bio's kind: damage and then a chance of Poison).
+    pub fn with_status(self, effect: StatusEffect) -> Self {
+        Self { status: Some(effect), ..self }
+    }
+
+    /// Whether the action aims at the actor's own side: a restoring action does ([`ActionSpec::heals`]), a
+    /// damaging one does not, and a status-only one says so itself ([`ActionSpec::on_allies`]).
+    pub fn aims_at_allies(&self) -> bool {
+        if self.formula == Formula::None {
+            self.on_allies
+        } else {
+            self.heals()
+        }
+    }
+
     /// Decode an attack record (a spell of the kernel's attack table or an enemy's attack of
     /// `scene.bin`), or `None` if the rules do not model it (see the module docs).
     pub fn from_attack(rec: &AttackRecord) -> Option<Self> {
@@ -399,6 +471,7 @@ impl ActionSpec {
             rec.target_flags,
             rec.element_mask,
             rec.special_flags,
+            StatusEffect::from_record(rec.status_mask, rec.status_chance_mode),
         )
     }
 
@@ -413,6 +486,7 @@ impl ActionSpec {
             rec.target_flags,
             rec.element_mask,
             rec.special_flags,
+            StatusEffect::from_record(rec.status_mask, rec.status_chance_mode),
         )?;
         // Items that do something else as well (Stardust, Smoke Bomb, Hero Drink) are not modelled.
         if rec.extra_effect != 0xFF {
@@ -422,6 +496,7 @@ impl ActionSpec {
         Some(spec)
     }
 
+    #[allow(clippy::too_many_arguments)] // the fields of a record, in the order of its layout
     fn decode(
         calc: u8,
         power: u32,
@@ -430,6 +505,7 @@ impl ActionSpec {
         target_flags: u8,
         element_mask: u16,
         special_flags: u16,
+        status: Option<StatusEffect>,
     ) -> Option<Self> {
         let (kind, rolls_accuracy, can_crit) = match calc >> 4 {
             0x0 | 0x3 => (ActionKind::Physical, false, false),
@@ -437,12 +513,36 @@ impl ActionSpec {
             0xB => (ActionKind::Physical, true, false),
             0x2 => (ActionKind::Magical, true, false),
             0x4 | 0x5 => (ActionKind::Magical, false, false),
+            // `0xFF`: no damage part at all, so only a status can make it an action (below).
+            0xF if status.is_some() => (ActionKind::Magical, true, false),
             _ => return None,
         };
-        let formula = Formula::from_code(calc & 0x0F)?;
-        if power == 0 && formula != Formula::Full {
-            return None;
-        }
+        let aim = Aim::from_target_flags(target_flags);
+        let formula = match Formula::from_code(calc & 0x0F) {
+            Some(formula) if power > 0 || formula == Formula::Full => formula,
+            // No formula, or no Power: nothing to deal or restore. With a status it is a status-only action.
+            _ => {
+                status?;
+                return Some(Self {
+                    kind,
+                    formula: Formula::None,
+                    power: 0,
+                    accuracy,
+                    rolls_accuracy,
+                    can_crit: false,
+                    element_mask,
+                    hits_mp: false,
+                    hits_dead: false,
+                    ignores_defense: false,
+                    short_range: false,
+                    mp_cost,
+                    aim,
+                    status,
+                    weapon_attack: false,
+                    on_allies: target_flags & TARGET_ENEMY_ROW == 0,
+                });
+            }
+        };
         // "Everything" is a recovery: without the restorative element it would mean nothing.
         if formula == Formula::Full && element_mask & element::RESTORATIVE == 0 {
             return None;
@@ -460,7 +560,10 @@ impl ActionSpec {
             ignores_defense: special_flags & FLAG_IGNORES_DEFENSE == 0,
             short_range: target_flags & TARGET_SHORT_RANGE != 0,
             mp_cost,
-            aim: Aim::from_target_flags(target_flags),
+            aim,
+            status,
+            weapon_attack: false,
+            on_allies: false,
         })
     }
 
@@ -506,7 +609,7 @@ impl Spell {
         SpellInfo {
             spell: self.index,
             mp_cost: self.spec.mp_cost,
-            targets_allies: self.spec.heals(),
+            targets_allies: self.spec.aims_at_allies(),
             aim: self.spec.aim,
         }
     }
@@ -538,9 +641,14 @@ impl EnemyAction {
     /// (status-only, scripted, healing). The enemy attack command is always row-sensitive, and an enemy
     /// aims by its own rules (one random party member here), so the record's targeting does not choose
     /// the target (it stays in [`ActionSpec::aim`] for the rules that decide whom an attack hits).
+    ///
+    /// A damaging attack that also has a status keeps it ([`ActionSpec::status`]: the stinging attacks of the
+    /// scenes inflict theirs). An attack with **only** a status is left out of the pool the random AI picks from,
+    /// as it always was (an AI that chooses attacks by script decodes it with [`ActionSpec::from_attack`] itself,
+    /// which does model it).
     pub fn from_scene(attack: &SceneAttack) -> Option<Self> {
         let mut spec = ActionSpec::from_attack(&attack.record)?;
-        if spec.heals() {
+        if spec.heals() || spec.formula == Formula::None {
             return None;
         }
         spec.short_range = spec.kind == ActionKind::Physical;
@@ -610,6 +718,9 @@ pub enum ItemKind {
     Revive,
     /// Damages one enemy (Grenade).
     Damage,
+    /// Only changes statuses: an Antidote, an Echo Screen or a Remedy cures them, a Speed Drink inflicts a
+    /// buff and a Dazers inflicts a curse (whom it aims at is [`ItemInfo::targets_allies`]).
+    Status,
 }
 
 /// An item the rules can use in battle.
@@ -637,7 +748,9 @@ impl ItemData {
 
     pub fn kind(&self) -> ItemKind {
         let spec = &self.spec;
-        if !spec.heals() {
+        if spec.formula == Formula::None {
+            ItemKind::Status
+        } else if !spec.heals() {
             ItemKind::Damage
         } else if spec.hits_dead {
             ItemKind::Revive
@@ -656,7 +769,7 @@ impl ItemData {
         ItemInfo {
             item,
             kind,
-            targets_allies: kind != ItemKind::Damage,
+            targets_allies: self.spec.aims_at_allies(),
             revives: kind == ItemKind::Revive,
             aim: self.spec.aim,
         }
@@ -671,7 +784,7 @@ pub struct ItemInfo {
     /// The kernel item index; its name is in the machine's own text.
     pub item: u16,
     pub kind: ItemKind,
-    /// Aimed at the party (everything but a damage item).
+    /// Aimed at the party: everything but a damage item and a curse (a Dazers, a Hourglass: [`ActionSpec::aims_at_allies`]).
     pub targets_allies: bool,
     /// Only a dead ally is a valid target (Phoenix Down).
     pub revives: bool,
@@ -729,6 +842,7 @@ impl ItemTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::status::Status;
     use crate::testutil::{attack_record, synthetic_kernel_bytes};
 
     fn attack(
@@ -1192,5 +1306,143 @@ mod tests {
         // A hand-made table holds exactly what it is given.
         let one = ItemTable::new([(9, *table.get(0).unwrap())]);
         assert_eq!(one.indexes().collect::<Vec<_>>(), [9]);
+    }
+
+    // --- statuses (checkpoint 2 of "deeper battles") ---
+
+    /// `rec` with a status: the chance/mode byte and the mask of its record.
+    fn with_status(rec: AttackRecord, chance_mode: u8, mask: u32) -> AttackRecord {
+        AttackRecord { status_chance_mode: chance_mode, status_mask: mask, ..rec }
+    }
+
+    fn effect(statuses: &[Status], chance: u8, mode: StatusMode) -> StatusEffect {
+        StatusEffect { set: statuses.iter().copied().collect(), chance, mode }
+    }
+
+    #[test]
+    fn a_damaging_record_keeps_its_damage_and_gains_the_status_of_its_two_fields() {
+        // Bio's kind: damage, then a chance (21 of 63) of Poison.
+        let bio = with_status(attack(0x22, 8, 100, 0x0F, element::FIRE, 0xFDFF), 21, Status::Poison.bit());
+        let spec = ActionSpec::from_attack(&bio).unwrap();
+        assert_eq!((spec.formula, spec.power, spec.kind), (Formula::Spell, 8, ActionKind::Magical));
+        assert_eq!(spec.status, Some(effect(&[Status::Poison], 21, StatusMode::Inflict)));
+        // The chance is the low six bits, the high bits the mode: 0x40 cures, 0x80 toggles.
+        for (byte, expect) in [
+            (0x3F, effect(&[Status::Poison], 63, StatusMode::Inflict)),
+            (0x40 | 63, effect(&[Status::Poison], 63, StatusMode::Cure)),
+            (0x80 | 20, effect(&[Status::Poison], 20, StatusMode::Toggle)),
+            (0x00, effect(&[Status::Poison], 0, StatusMode::Inflict)),
+        ] {
+            let rec = with_status(attack(0x22, 8, 100, 0x0F, 0, 0xFDFF), byte, Status::Poison.bit());
+            assert_eq!(ActionSpec::from_attack(&rec).unwrap().status, Some(expect), "{byte:#x}");
+        }
+        // Several at once, and only the ones the rules play: Poison and Silence stay, Confusion is dropped.
+        let mixed = with_status(attack(0x22, 8, 100, 0x0F, 0, 0xFDFF), 30, Status::Poison.bit() | Status::Silence.bit() | Status::Confusion.bit());
+        assert_eq!(ActionSpec::from_attack(&mixed).unwrap().status, Some(effect(&[Status::Poison, Status::Silence], 30, StatusMode::Inflict)));
+        // Statuses the rules do not play, and the "no status" markers, leave the record exactly as it was.
+        let plain = ActionSpec::from_attack(&attack(0x22, 8, 100, 0x0F, 0, 0xFDFF)).unwrap();
+        assert_eq!(plain.status, None);
+        let unplayed = with_status(attack(0x22, 8, 100, 0x0F, 0, 0xFDFF), 30, Status::Confusion.bit() | Status::Frog.bit() | Status::Death.bit());
+        assert_eq!(ActionSpec::from_attack(&unplayed), Some(plain));
+        for (byte, mask) in [(0xFF, Status::Poison.bit()), (30, 0xFFFF_FFFF), (0xFF, 0xFFFF_FFFF), (30, 0)] {
+            let marker = with_status(attack(0x22, 8, 100, 0x0F, 0, 0xFDFF), byte, mask);
+            assert_eq!(ActionSpec::from_attack(&marker), Some(plain), "{byte:#x} {mask:#x}");
+        }
+        // The action keeps what it was in every other respect.
+        assert!(!spec.weapon_attack && !spec.on_allies && spec.aim == Aim::OneOrSide);
+        assert!(ActionSpec::basic_attack(16, 100, false).weapon_attack, "only the Attack command is a weapon attack");
+    }
+
+    #[test]
+    fn a_record_with_no_damage_part_is_a_status_only_action_that_knows_its_side() {
+        // Sleep's kind: no Power, an accuracy roll, the cursor on the enemies (0x0F).
+        let sleep = ActionSpec::from_attack(&with_status(attack(0x22, 0, 90, 0x0F, 0, 0xFFFF), 63, Status::Sleep.bit())).unwrap();
+        assert_eq!((sleep.formula, sleep.power, sleep.kind, sleep.rolls_accuracy), (Formula::None, 0, ActionKind::Magical, true));
+        assert!(!sleep.on_allies && !sleep.aims_at_allies() && !sleep.heals() && !sleep.splits());
+        assert_eq!((sleep.accuracy, sleep.aim, sleep.mp_cost), (90, Aim::OneOrSide, 7));
+        assert_eq!(sleep.status, Some(effect(&[Status::Sleep], 63, StatusMode::Inflict)));
+        // Haste's kind: calc 0x50 (never misses), the cursor on the party (0x0D: bit 0x02 clear).
+        let haste = ActionSpec::from_attack(&with_status(attack(0x50, 0, 255, 0x0D, 0, 0xFFFF), 63, Status::Haste.bit())).unwrap();
+        assert!(haste.on_allies && haste.aims_at_allies() && !haste.rolls_accuracy && haste.formula == Formula::None);
+        // Calc 0xFF (no damage byte at all) and a physical record (0x10: a roll with the luck check) are the same.
+        for calc in [0xFF, 0x47, 0x10, 0x11] {
+            let rec = with_status(attack(calc, 0, 100, 0x03, 0, 0xFFFF), 63, Status::Poison.bit());
+            let spec = ActionSpec::from_attack(&rec).unwrap_or_else(|| panic!("{calc:#x}"));
+            assert_eq!(spec.formula, Formula::None, "{calc:#x}");
+            assert!(!spec.on_allies, "target flags 0x03 start on the enemies: {calc:#x}");
+        }
+        // Without a status there is nothing to do; with only statuses the rules do not play, still nothing.
+        for (calc, byte, mask) in [(0xFF, 0xFF, 0xFFFF_FFFF), (0x50, 63, Status::Confusion.bit()), (0x22, 63, 0), (0x50, 0xFF, Status::Haste.bit())] {
+            assert!(ActionSpec::from_attack(&with_status(attack(calc, 0, 100, 0x0D, 0, 0xFFFF), byte, mask)).is_none(), "{calc:#x} {byte:#x}");
+        }
+        // A record with a Power but no formula to give it (the nybble 0) deals nothing: with a status it is
+        // status-only, without one it is not an action.
+        let no_formula = with_status(attack(0x20, 9, 100, 0x0F, 0, 0xFFFF), 63, Status::Poison.bit());
+        assert_eq!(ActionSpec::from_attack(&no_formula).map(|s| (s.formula, s.power)), Some((Formula::None, 0)));
+        assert!(ActionSpec::from_attack(&attack(0x20, 9, 100, 0x0F, 0, 0xFFFF)).is_none());
+        // A hand-made one decodes to the same thing.
+        let made = ActionSpec::status_spell(effect(&[Status::Sleep], 63, StatusMode::Inflict), 90, 7, false);
+        assert_eq!((made.formula, made.accuracy, made.aim, made.on_allies), (sleep.formula, sleep.accuracy, sleep.aim, sleep.on_allies));
+        assert_eq!(ActionSpec::status_item(effect(&[Status::Poison], 63, StatusMode::Cure), true).aim, Aim::One);
+    }
+
+    #[test]
+    fn a_status_only_spell_can_be_cast_and_a_status_only_enemy_attack_is_left_to_the_ai_scripts() {
+        let sleep_record = with_status(attack(0x22, 0, 90, 0x0F, 0, 0xFFFF), 63, Status::Sleep.bit());
+        let spell = Spell::from_attack(6, &sleep_record).unwrap();
+        assert_eq!((spell.info().targets_allies, spell.info().aim, spell.info().mp_cost), (false, Aim::OneOrSide, 7));
+        let regen = Spell::from_attack(8, &with_status(attack(0x22, 0, 255, 0x0D, 0, 0xFFFF), 63, Status::Regen.bit())).unwrap();
+        assert!(regen.info().targets_allies);
+        // A physical record is not a spell, and a spell with an extra effect is not either.
+        assert!(Spell::from_attack(9, &with_status(attack(0x11, 0, 100, 0x03, 0, 0xFFFF), 63, Status::Poison.bit())).is_none());
+        let extra = AttackRecord { extra_effect: 3, ..sleep_record };
+        assert!(Spell::from_attack(6, &extra).is_none());
+        // An enemy: the attacks it picks at random are the damaging ones, with their statuses; the status-only
+        // ones decode (a script can use them) but are not in that pool.
+        let scene_attack = |id, record| SceneAttack { id, name: "x".into(), record };
+        let sting = EnemyAction::from_scene(&scene_attack(
+            1,
+            with_status(attack(0x11, 16, 100, 0x03, element::HIT, 0xFFFF), 30, Status::Poison.bit()),
+        ))
+        .unwrap();
+        assert_eq!(sting.spec.status, Some(effect(&[Status::Poison], 30, StatusMode::Inflict)));
+        assert!(EnemyAction::from_scene(&scene_attack(2, sleep_record)).is_none());
+        assert!(ActionSpec::from_attack(&sleep_record).is_some());
+    }
+
+    #[test]
+    fn an_item_with_only_a_status_is_a_status_item_and_says_which_side_it_aims_at() {
+        let kernel = Kernel::parse(&synthetic_kernel_bytes()).unwrap();
+        let potion = kernel.item(0).unwrap();
+        // An Antidote as the data has it: no damage part, the Poison bit, a cure that always works, on one ally.
+        let antidote = ItemRecord { target_flags: 0x01, damage_calc: 0x47, power: 0, status_chance_mode: 0x40 | 63, status_mask: Status::Poison.bit(), element_mask: 0, special_flags: 0xFFFF, ..potion };
+        let data = ItemData::from_record(&antidote).expect("an item the rules play");
+        assert_eq!(data.kind(), ItemKind::Status);
+        assert_eq!(data.spec.status, Some(effect(&[Status::Poison], 63, StatusMode::Cure)));
+        assert_eq!(data.info(8), ItemInfo { item: 8, kind: ItemKind::Status, targets_allies: true, revives: false, aim: Aim::One });
+        assert!(!data.spec.rolls_accuracy && data.spec.on_allies);
+        // Whole party at once (Remedy for all): the same, aimed at a side.
+        let party = ItemRecord { target_flags: 0x05, ..antidote };
+        assert_eq!(ItemData::from_record(&party).unwrap().spec.aim, Aim::Side);
+        // A thrown curse starts on the enemies: it is not aimed at the party.
+        let dazers = ItemRecord { target_flags: 0x03, status_chance_mode: 63, status_mask: Status::Paralysis.bit(), ..antidote };
+        let curse = ItemData::from_record(&dazers).unwrap();
+        assert_eq!((curse.kind(), curse.info(9).targets_allies), (ItemKind::Status, false));
+        // The marker of "no status" (the synthetic Antidote has one: a mode byte of 0xFF) and the unplayed ones stay out.
+        assert!(ItemData::from_record(&ItemRecord { status_chance_mode: 0xFF, ..antidote }).is_none());
+        assert!(ItemData::from_record(&ItemRecord { status_mask: Status::Frog.bit(), ..antidote }).is_none());
+        // The restriction bit that forbids battle use still does.
+        assert!(ItemData::from_record(&ItemRecord { restrictions: 0xFFFF, ..antidote }).is_none());
+        // And a table built from a kernel with such a record has it.
+        let mut sections = crate::testutil::synthetic_kernel_sections();
+        let items = &mut sections[4].1;
+        let at = 8 * crate::kernel::ITEM_RECORD_SIZE;
+        items[at + 0x0E] = 0x47;
+        items[at + 0x0F] = 0;
+        items[at + 0x11] = 0x40 | 63;
+        let bytes = crate::testutil::pack_kernel(&sections, &[0, 0]);
+        let table = ItemTable::from_kernel(&Kernel::parse(&bytes).unwrap());
+        assert_eq!(table.indexes().collect::<Vec<_>>(), [0, 1, 2, 3, 4, 5, 6, 7, 8, 20]);
+        assert_eq!(table.info(8).unwrap().kind, ItemKind::Status);
     }
 }

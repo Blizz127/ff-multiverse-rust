@@ -413,4 +413,6 @@ mod counter_tests;
 #[cfg(test)]
 mod engine_tests;
 #[cfg(test)]
+mod status_tests;
+#[cfg(test)]
 mod tests;

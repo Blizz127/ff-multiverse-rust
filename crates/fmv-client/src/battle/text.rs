@@ -16,6 +16,7 @@ use crate::ui::draw::{DrawList, Rgba};
 use crate::ui::text::{ellipsize, text_width};
 use crate::ui::widgets::{Canvas, ACCENT, DIM, ERROR, INFO, SHADOW, TEXT, WARN};
 use fmv_ff7_battle::rules::Outcome;
+use fmv_ff7_battle::status::Status as Ailment;
 
 /// The line under the status band for an open menu: why the entry under the cursor cannot be chosen,
 /// else what the keys do at this level.
@@ -54,6 +55,10 @@ pub fn status_line(view: &BattleView) -> (&'static str, Rgba) {
             Some(b) if !b.alive => ("Your character is down", ERROR),
             Some(b) if b.ready && view.waiting_for_answer => ("Waiting for the server...", INFO),
             Some(b) if b.ready => view.menu.as_ref().map_or(("YOUR TURN", ACCENT), menu_line),
+            // A sleeper, a stopped or a paralysed character holds its turn: it says so instead of "waiting".
+            Some(b) if b.status.contains(Ailment::Sleep) => ("You are asleep", WARN),
+            Some(b) if b.status.contains(Ailment::Stop) => ("You are stopped", WARN),
+            Some(b) if b.status.contains(Ailment::Paralysis) => ("You are paralysed", WARN),
             Some(_) => ("Waiting for your gauge", DIM),
         },
     }

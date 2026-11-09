@@ -16,8 +16,10 @@
 use super::menu::MenuView;
 use super::panels::{layout, Banner, Finale};
 use super::popups::Popup;
+use super::tags;
 use crate::render::{color, Vertex, MAX_VERTICES};
 use fmv_ff7_battle::rules::{ActorId, GAUGE_MAX, LIMIT_MAX};
+use fmv_ff7_battle::status::StatusSet;
 use fmv_protocol::BattleId;
 
 // Palette (sRGB bytes).
@@ -30,6 +32,8 @@ pub const BORDER_PARTY_RGB: [u8; 3] = [90, 110, 160];
 pub const BORDER_ENEMY_RGB: [u8; 3] = [150, 60, 60];
 pub const BORDER_READY_RGB: [u8; 3] = [255, 200, 40];
 pub const BORDER_DEAD_RGB: [u8; 3] = [70, 70, 78];
+/// The border of a token whose fighter has a status that hurts or holds it (Poison, Sleep, Stop, ...).
+pub const BORDER_STATUS_RGB: [u8; 3] = [170, 110, 220];
 pub const MARKER_RGB: [u8; 3] = [255, 255, 255];
 pub const BAR_BACK_RGB: [u8; 3] = [8, 9, 14];
 pub const HP_GOOD_RGB: [u8; 3] = [80, 200, 100];
@@ -90,9 +94,12 @@ pub struct Bar {
     pub max_mp: u32,
     /// ATB gauge, `0..=GAUGE_MAX` (extrapolated between server messages for display).
     pub gauge: u32,
-    /// The engine says this fighter can act now (a party member waits for a command).
+    /// The engine says this fighter can act now: its gauge is full and it can take a turn (a party member waits for a
+    /// command). A sleeper, a stopped or a paralysed fighter holds a full gauge and is not `ready`.
     pub ready: bool,
     pub alive: bool,
+    /// The statuses the fighter has (the ones the rules play: Death and Near-death are `alive` and the HP).
+    pub status: StatusSet,
     /// Our own character.
     pub mine: bool,
     /// The fighter's limit gauge, `0..=`[`LIMIT_MAX`] (protocol v7; always 0 for an enemy and for a
@@ -113,6 +120,7 @@ impl Default for Bar {
             gauge: 0,
             ready: false,
             alive: false,
+            status: StatusSet::EMPTY,
             mine: false,
             limit: 0,
         }
@@ -322,6 +330,8 @@ pub fn battle_vertices(view: &BattleView, vw: u32, vh: u32, srgb: bool) -> Vec<V
             BORDER_DEAD_RGB
         } else if ready && !card.enemy {
             BORDER_READY_RGB
+        } else if tags::is_afflicted(bar.status) {
+            BORDER_STATUS_RGB
         } else if card.enemy {
             BORDER_ENEMY_RGB
         } else {
@@ -460,6 +470,23 @@ mod tests {
         // An enemy that is "ready" is still an enemy.
         let foe = battle_vertices(&view(vec![], vec![bar(10, 10, true, true, false)], Status::Verified), w, h, false);
         assert!(count(&foe, BORDER_ENEMY_RGB) > 0 && count(&foe, BORDER_READY_RGB) == 0);
+    }
+
+    #[test]
+    fn a_token_whose_fighter_is_hurt_or_held_by_a_status_has_its_own_border_and_a_buff_or_a_ready_gauge_does_not() {
+        use fmv_ff7_battle::status::{Status as Ailment, StatusSet};
+        let (w, h) = (1000u32, 700u32);
+        let with = |mut b: Bar, status: &[Ailment]| {
+            b.status = status.iter().copied().collect::<StatusSet>();
+            b
+        };
+        let border = |party: Vec<Bar>, enemies: Vec<Bar>| count(&battle_vertices(&view(party, enemies, Status::Verified), w, h, false), BORDER_STATUS_RGB);
+        assert_eq!(border(vec![bar(10, 10, false, true, false)], vec![]), 0, "nothing wrong with it");
+        assert_eq!(border(vec![with(bar(10, 10, false, true, false), &[Ailment::Poison])], vec![]), 6, "one border rectangle");
+        assert_eq!(border(vec![], vec![with(bar(10, 10, false, true, false), &[Ailment::Sleep, Ailment::Silence])]), 6, "an enemy's too");
+        assert_eq!(border(vec![with(bar(10, 10, false, true, false), &[Ailment::Haste, Ailment::Regen])], vec![]), 0, "a buff is not a trouble");
+        assert_eq!(border(vec![with(bar(10, 10, true, true, false), &[Ailment::Poison])], vec![]), 0, "a member that can act shows its gold border");
+        assert_eq!(border(vec![with(bar(0, 10, false, false, false), &[Ailment::Poison])], vec![]), 0, "a fallen one is dim whatever it had");
     }
 
     #[test]

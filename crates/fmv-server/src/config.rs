@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fmv_ff7_battle::rules::{DEFAULT_BATTLE_SPEED, DEFAULT_TICKS_PER_SECOND};
+use fmv_ff7_battle::status::StatusSet;
 use fmv_fixture::FIXTURE_AREA_KEY;
 use fmv_party::PartyConfig;
 use fmv_protocol::{BattleRules, DEFAULT_DEV_PORT};
@@ -109,6 +110,13 @@ pub struct BattleSettings {
     /// `limit kept` save (the log line says `debug_bonus_limit=N`), so that a smoke run can show a non-empty gauge
     /// surviving a server restart over real processes. 0 is off.
     pub debug_bonus_limit: u8,
+    /// DEBUG, `--debug-status LIST` (refused without `--debug-encounters`, and when the set is not one a battle can
+    /// start with: see [`StatusSet::is_valid_start`]): every member of every battle this server starts, the canon
+    /// companions and the players alike, begins it with these statuses, so that a smoke run can show a status applied,
+    /// travelling and replayed over real processes (a real battle starts clean, and the first mission's enemies inflict
+    /// none). It changes exactly one thing, the statuses a battle starts with (`BattleMember::status`: `EncounterStart`,
+    /// the `battle started` log line and every client's replay carry it); nothing is stored. Empty (off) by default.
+    pub debug_status: StatusSet,
     /// When the canon companions act (protocol v9 companions, see `crate::companion`, "Pacing"): a companion with a full
     /// gauge waits for every living, connected player that still owes a turn, at most `turn_wait_ms` after that
     /// player's own gauge filled and at most `max_wait_ms` in all. `--companion-turn-wait-ms` / `--companion-max-wait-ms`;
@@ -131,6 +139,7 @@ impl BattleSettings {
             debug_limit_full: false,
             debug_bonus_exp: 0,
             debug_bonus_limit: 0,
+            debug_status: StatusSet::EMPTY,
             companion_pacing: crate::companion::Pacing::default(),
         }
     }
@@ -151,6 +160,7 @@ impl fmt::Debug for BattleSettings {
             .field("debug_limit_full", &self.debug_limit_full)
             .field("debug_bonus_exp", &self.debug_bonus_exp)
             .field("debug_bonus_limit", &self.debug_bonus_limit)
+            .field("debug_status", &self.debug_status)
             .field("companion_pacing", &self.companion_pacing)
             .finish()
     }
@@ -377,6 +387,16 @@ impl ServerConfig {
                         .into(),
                 );
             }
+            // A status every member starts with is a debug aid, and must be a set the engine can start with.
+            if !b.debug_status.is_empty() && !self.debug_encounters {
+                return bad("debug_status (--debug-status) is a debug flag and needs debug_encounters (--debug-encounters) too".into());
+            }
+            if !b.debug_status.is_valid_start() {
+                return bad(format!(
+                    "debug_status (--debug-status) {} is not a set a battle can start with (only the statuses the battle plays, and never Haste with Slow or Sadness with Fury)",
+                    b.debug_status
+                ));
+            }
             // `keep_limits` returns early under --debug-limit-full, so a limit bonus would silently do nothing.
             if b.debug_bonus_limit > 0 && b.debug_limit_full {
                 return bad(
@@ -486,6 +506,29 @@ mod tests {
         let err = with(false, true).validate().expect_err("a debug flag without --debug-encounters is refused").to_string();
         assert!(err.contains("--debug-limit-full") && err.contains("--debug-encounters"), "{err}");
         assert!(format!("{:?}", with(true, true).battle).contains("debug_limit_full: true"));
+    }
+
+    #[test]
+    fn the_debug_status_flag_is_off_by_default_needs_debug_encounters_and_only_takes_a_set_a_battle_can_start_with() {
+        use fmv_ff7_battle::status::Status;
+        use fmv_protocol::SyntheticRules;
+        assert!(BattleSettings::new(Arc::new(SyntheticRules::default())).debug_status.is_empty(), "off unless asked for");
+        let with = |debug_encounters: bool, statuses: &[Status]| {
+            let mut b = BattleSettings::new(Arc::new(SyntheticRules::default()));
+            b.debug_status = statuses.iter().copied().collect();
+            ServerConfig { battle: Some(b), debug_encounters, ..ServerConfig::default() }
+        };
+        with(true, &[Status::Poison, Status::Silence]).validate().unwrap();
+        with(true, &[]).validate().unwrap();
+        with(false, &[]).validate().unwrap();
+        let err = with(false, &[Status::Poison]).validate().expect_err("a debug flag without --debug-encounters is refused").to_string();
+        assert!(err.contains("--debug-status") && err.contains("--debug-encounters"), "{err}");
+        // Haste with Slow, Sadness with Fury and a status the battle does not play are not sets a member starts with.
+        for bad in [&[Status::Haste, Status::Slow][..], &[Status::Sadness, Status::Fury], &[Status::Confusion], &[Status::Death]] {
+            let err = with(true, bad).validate().expect_err("not a set a battle can start with").to_string();
+            assert!(err.contains("--debug-status") && err.contains("cannot start") || err.contains("not a set a battle can start with"), "{bad:?}: {err}");
+        }
+        assert!(format!("{:?}", with(true, &[Status::Poison]).battle).contains("debug_status: StatusSet(8)"), "{:?}", with(true, &[Status::Poison]).battle);
     }
 
     #[test]

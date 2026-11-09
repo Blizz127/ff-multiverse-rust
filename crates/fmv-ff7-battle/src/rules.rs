@@ -36,9 +36,34 @@
 //! attacks ([`Combatant::actions`]: the damaging ones the rules model), or a plain attack when it has
 //! none. Every action, party or enemy, is announced by a [`BattleEvent::Action`] before its effects
 //! ([`BattleEvent::MpSpent`], [`BattleEvent::Damage`], [`BattleEvent::Heal`], ...). Not modelled:
-//! statuses (Berserk, Sadness, Fury, Poison, ...), summons, back-attack damage
-//! bonus, covering, enemy rows, AI scripts other than Initialize, Main and the counters, AP/EXP growth, party
-//! elemental resistances, limit levels above 1 (see [`crate::limit`]).
+//! the statuses [`crate::status`] lists as left out (Confusion, Berserk, Frog, ...), summons, back-attack
+//! damage bonus, covering, enemy rows, AI scripts other than Initialize, Main and the counters, AP/EXP growth,
+//! party elemental resistances, limit levels above 1 (see [`crate::limit`]).
+//!
+//! # Statuses
+//!
+//! [`crate::status`] is the model (the statuses, what a record's status fields mean, the clocks and the
+//! durations, with their sources); this is where they act. A combatant has [`Combatant::status`] and
+//! [`Combatant::statuses`] says everything it has, Death and Near-death included. Every tick, before the gauges
+//! fill, each living combatant's statuses run: a Poison or Regen turn is a [`BattleEvent::StatusTick`], a timed
+//! status that runs out a [`BattleEvent::StatusEnded`] (in actor order), and a combatant that Poison knocks out
+//! gets the usual [`BattleEvent::Death`] (and the battle its outcome). An action's status effect arrives as
+//! [`BattleEvent::StatusInflicted`] (or `StatusEnded` for a cure, or for Sleep woken by a physical blow), after
+//! the effects of the action on that target.
+//!
+//! * **Who acts.** Sleep, Stop and Paralysis hold a turn: the gauge of a sleeper keeps filling, the one of a
+//!   stopped or paralysed combatant is frozen (Haste doubles the gauge and Slow halves it, Stop and Paralysis
+//!   freeze it: [`crate::status::Pace`]), and [`BattleState::ready_actors`] leaves out whoever cannot take its turn.
+//!   An enemy that cannot act waits with its full gauge and acts the tick it can, and a blow that leaves it asleep,
+//!   stopped or paralysed gets no counter (it still notes who hit it; a physical blow wakes a sleeper first, so that
+//!   one answers: an engine choice, not checked against the original); a party member's command is
+//!   refused with [`CommandError::CannotAct`]. Silence refuses the Magic command with [`CommandError::Silenced`].
+//! * **Damage and hit rate.** After the formulas: Barrier halves a physical blow and MBarrier a magical one,
+//!   Sadness takes 30% off either ([`crate::status::damage_after_statuses`]); Fury takes 30% off the hit rate of the
+//!   one who has it and Darkness halves the hit rate of a party member's Attack command
+//!   ([`crate::status::hit_chance_after_statuses`]); Sadness halves the limit gauge a blow fills, Fury doubles it and
+//!   Paralysis stops it. A physical blow that does damage wakes a sleeper; a magical one does not. A knockout
+//!   removes every status.
 //!
 //! # Enemy turns
 //!
@@ -186,6 +211,16 @@
 //!   action on that one target would draw (the rolls above, one set per target); the split of its damage
 //!   and the spending of an All use are arithmetic and draw nothing, so an action on one target draws
 //!   exactly what it did before whole-side targets existed.
+//! * An action with a **status effect** ([`ActionSpec::status`]) draws, after its effects on a target that still
+//!   stands, one `below(63)` for that target and inflicts (or cures, or toggles) when the draw is below the
+//!   effect's chance ([`crate::status::StatusEffect::chance_among`]: out of 63, cut to 2/3 when a splitting action
+//!   hits several targets); a target that was missed or knocked out draws nothing for it. A **status-only** action
+//!   ([`Formula::None`]) first rolls to hit like a spell on each target it aims at the other side with (a magical
+//!   one: `miss_roll`; a physical one: `luck_roll` then `miss_roll`, as above), and never against an ally or with an
+//!   item. The draw is made before anything else is asked of the target, so an immune target (or one that
+//!   already has the status) costs it too; a record whose statuses the rules do not play has no status effect at
+//!   all ([`ActionSpec::status`] is `None`) and draws nothing. Poison, Regen and the timers draw nothing: the
+//!   draws of every action without a status effect are exactly what they were before statuses.
 //! * [`Command::Defend`] and every validation failure draw nothing.
 //! * [`Command::Limit`] draws what the limit's action draws: a damaging limit never misses and cannot
 //!   be a critical hit, so only its `variance = range_inclusive(0, 255)` (the standard formula has
@@ -302,6 +337,8 @@ use crate::kernel::{CharacterId, Kernel, MateriaRecord};
 pub use crate::limit::{limit_gain, LimitBreak, LimitInfo, LIMIT_MAX};
 use crate::rng::Rng;
 use crate::scene::{AffinityRate, AttackRecord, BattleLayout, EnemyRecord, Scene};
+pub use crate::status::{Status, StatusSet, StatusState};
+use crate::status::{self, Change, CHANCE_OUT_OF, POISON_DIVISOR, REGEN_DIVISOR};
 
 /// Turn-timer value at which a combatant can act.
 pub const GAUGE_MAX: u32 = 65_535;
@@ -451,6 +488,13 @@ pub struct Combatant {
     /// [`BattleState`] takes one off for each such cast, see the module docs). 0 for everyone who has no All
     /// materia and for every enemy. Battle state only: it is never sent or kept.
     pub all_left: u8,
+    /// The statuses the combatant has, with their timers (see the module docs, "Statuses"). Runtime state owned by
+    /// [`BattleState`]; what is passed in are the STARTING statuses, an input like the level and the limit gauge
+    /// ([`BattleState::with_config`] keeps the modelled ones, announces them and starts their timers).
+    pub status: StatusState,
+    /// The statuses the combatant cannot be given: an enemy's own immunities (its record's status mask says which
+    /// statuses affect it; see [`crate::status`]). Empty for a party member.
+    pub status_immune: StatusSet,
     /// The enemy's own AI scripts and the memory they keep ([`Combatant::from_enemy_in_scene`] gives it
     /// the scene's); `None`: the enemy uses the plain behaviour.
     pub ai: Option<crate::ai::EnemyAi>,
@@ -494,6 +538,8 @@ impl Combatant {
             limit: 0,
             limit_break: None,
             all_left: 0,
+            status: StatusState::none(),
+            status_immune: StatusSet::EMPTY,
             ai: None,
             enemy_id: None,
         }
@@ -501,6 +547,30 @@ impl Combatant {
 
     pub fn is_alive(&self) -> bool {
         self.hp > 0
+    }
+
+    /// Everything the combatant has: Death when it is out of HP, Near-death when it stands with a quarter of its
+    /// HP or less, and the statuses it carries ([`StatusState::set`]). The one place to ask "what is wrong with
+    /// this combatant", for a panel or an AI script.
+    pub fn statuses(&self) -> StatusSet {
+        if !self.is_alive() {
+            return StatusSet::EMPTY.with(Status::Death);
+        }
+        let mut set = self.status.set();
+        if u64::from(self.hp) * 4 <= u64::from(self.max_hp) {
+            set.insert(Status::NearDeath);
+        }
+        set
+    }
+
+    /// Whether the combatant has `status` ([`Combatant::statuses`]).
+    pub fn has_status(&self, status: Status) -> bool {
+        self.statuses().contains(status)
+    }
+
+    /// Whether the combatant can take a turn: alive, and not asleep, stopped or paralysed.
+    pub fn can_act(&self) -> bool {
+        self.is_alive() && !self.status.blocks_turns()
     }
 
     /// The Attack command as an action: a physical attack of this combatant's Power and accuracy.
@@ -539,6 +609,8 @@ impl Combatant {
             gil: record.gil,
             ap: u32::from(record.ap),
         };
+        // The record's status mask says which statuses AFFECT the enemy (a set bit), so a clear bit is an immunity.
+        c.status_immune = StatusSet::from_bits(!record.status_immunities);
         // Element codes `0..=15` are elements; the codes from `0x20` are statuses (not modelled).
         c.affinities = record
             .affinities()
@@ -816,6 +888,15 @@ pub enum BattleEvent {
     /// event of its own: the [`BattleEvent::Action`] with [`ActionRef::Escape`] is followed by the end of
     /// the battle with [`Outcome::Escaped`].
     EscapeFailed { actor: ActorId },
+    /// `target` now has `status` (an action inflicted it, or the battle started with it): see the module docs,
+    /// "Statuses". Only a status the rules model is ever announced.
+    StatusInflicted { target: ActorId, status: Status },
+    /// `target` no longer has `status`: an action cured it, its timer ran out, or (Sleep) a physical blow woke it.
+    StatusEnded { target: ActorId, status: Status },
+    /// A turn of a status that hurts or heals: `Poison` took `amount` HP from `target` (what was rolled; its HP
+    /// drops by at most that, and a knockout follows as [`BattleEvent::Death`]), `Regen` gave it `amount` HP
+    /// (what it gained, never more than it was missing; a turn that would give nothing is not announced).
+    StatusTick { target: ActorId, status: Status, amount: u32 },
 }
 
 /// Why a command was refused.
@@ -857,6 +938,13 @@ pub enum CommandError {
     /// battle. (Protocol v10.)
     #[error("actor {0:?} has no All left this battle")]
     NoAllLeft(ActorId),
+    /// The actor is asleep, stopped or paralysed: it takes no turn until that is over (see the module docs,
+    /// "Statuses").
+    #[error("actor {0:?} cannot act: it is asleep, stopped or paralysed")]
+    CannotAct(ActorId),
+    /// The actor is silenced: it cannot cast a spell.
+    #[error("actor {0:?} is silenced")]
+    Silenced(ActorId),
     #[error("actor {0:?} has no limit break")]
     NoLimit(ActorId),
     #[error("actor {0:?} has no full limit gauge")]
@@ -1022,6 +1110,8 @@ pub fn action_damage_among(
         Formula::Fixed => finish(((512 - defense64) * power) / 32),
         // Only a restoring action has this formula (see `ActionSpec`); as damage it is the target's HP.
         Formula::Full => finish(u64::from(target.hp)),
+        // A status-only action deals nothing (the rules never ask for its damage).
+        Formula::None => 0,
     }
 }
 
@@ -1066,7 +1156,7 @@ pub fn restore_amount_among(
         Formula::Flat => 20 * power,
         Formula::Full => u64::from(pool),
         // Not restoring formulas: a restoring spec never has them.
-        Formula::Standard | Formula::Spell | Formula::CurrentHp | Formula::Fixed => 0,
+        Formula::Standard | Formula::Spell | Formula::CurrentHp | Formula::Fixed | Formula::None => 0,
     };
     amount.min(u64::from(u32::MAX)) as u32
 }
@@ -1288,6 +1378,8 @@ impl BattleState {
                 _ => 0,
             };
             c.ready = false;
+            // The statuses passed in are the starting ones: the modelled ones of a living combatant, timers full.
+            c.status = if c.is_alive() { StatusState::starting(c.status.set()) } else { StatusState::none() };
         }
 
         let mut state = Self {
@@ -1315,6 +1407,12 @@ impl BattleState {
                 state.pending.push(BattleEvent::GaugeReady {
                     actor: ActorId(i as u8),
                 });
+            }
+        }
+        // The statuses a combatant starts with are announced like any other, in actor and bit order.
+        for i in 0..state.actors.len() {
+            for status in state.actors[i].status.set().iter() {
+                state.pending.push(BattleEvent::StatusInflicted { target: ActorId(i as u8), status });
             }
         }
         let mut initial = Vec::new();
@@ -1365,10 +1463,11 @@ impl BattleState {
             .collect()
     }
 
-    /// Party members that are alive and waiting for a command.
+    /// Party members that are alive, waiting for a command and able to give one (a sleeper, a stopped or a
+    /// paralysed member holds its turn: see the module docs, "Statuses").
     pub fn ready_actors(&self) -> Vec<ActorId> {
         (0..self.party_len)
-            .filter(|&i| self.actors[i].is_alive() && self.actors[i].ready)
+            .filter(|&i| self.actors[i].can_act() && self.actors[i].ready)
             .map(|i| ActorId(i as u8))
             .collect()
     }
@@ -1451,15 +1550,32 @@ impl BattleState {
         self.outcome
     }
 
-    /// Gauge increase per tick of `id` (for pacing displays and tests).
+    /// Gauge increase per tick of `id` (for pacing displays and tests), at the pace its statuses give it: doubled by
+    /// Haste, halved by Slow, 0 while Stopped or Paralysed.
     pub fn gauge_increase(&self, id: ActorId) -> Option<u32> {
         let c = self.actor(id)?;
-        Some(turn_timer_increase(
-            c.side,
-            c.dex,
-            self.v_timer_increase,
-            self.normal_speed,
-        ))
+        let increase = turn_timer_increase(c.side, c.dex, self.v_timer_increase, self.normal_speed);
+        Some(c.status.pace().scale(increase))
+    }
+
+    /// Everything `id` has, Death and Near-death included ([`Combatant::statuses`]); empty for an unknown actor.
+    pub fn statuses(&self, id: ActorId) -> StatusSet {
+        self.actor(id).map_or(StatusSet::EMPTY, Combatant::statuses)
+    }
+
+    /// Whether `id` has `status` ([`BattleState::statuses`]).
+    pub fn has_status(&self, id: ActorId, status: Status) -> bool {
+        self.statuses(id).contains(status)
+    }
+
+    /// Whether `id` can take a turn: alive, and not asleep, stopped or paralysed (`false` for an unknown actor).
+    pub fn can_act(&self, id: ActorId) -> bool {
+        self.actor(id).is_some_and(Combatant::can_act)
+    }
+
+    /// Whether `id` is silenced: a party member cannot give the Magic command.
+    pub fn is_silenced(&self, id: ActorId) -> bool {
+        self.actor(id).is_some_and(|c| c.status.silenced())
     }
 
     /// The party's "normal speed" (rounded average Dex + 50) used to scale every gauge.
@@ -1646,11 +1762,17 @@ impl BattleState {
         if !me.ready {
             return Err(CommandError::GaugeNotFull(actor));
         }
+        if me.status.blocks_turns() {
+            return Err(CommandError::CannotAct(actor));
+        }
         let plan = match *command {
             Command::Attack { target } => Plan::Attack {
                 target: self.check_target(target, false, false)?,
             },
             Command::Magic { spell, target } => {
+                if me.status.silenced() {
+                    return Err(CommandError::Silenced(actor));
+                }
                 let known = me
                     .spells
                     .iter()
@@ -1703,7 +1825,7 @@ impl BattleState {
     /// [`BattleState::check_target`]'s answer; a whole side is every combatant of it that can be hit, in
     /// ascending order, and [`CommandError::NoTargets`] when that is nobody.
     pub(crate) fn aim_at(&self, actor: usize, spec: &ActionSpec, target: Target) -> Result<Vec<usize>, CommandError> {
-        let (ally, dead) = (spec.heals(), spec.hits_dead);
+        let (ally, dead) = (spec.aims_at_allies(), spec.hits_dead);
         // Whether the action aims at the party's side of the battle: its own side for a restoring action when the
         // actor is a party member (and the other one for an enemy), the opposite for a damaging one.
         let in_party = ally == (actor < self.party_len);
@@ -1754,12 +1876,15 @@ impl BattleState {
     /// One tick: fill gauges, then let ready enemies act (in id order).
     fn tick_once(&mut self, events: &mut Vec<BattleEvent>) {
         self.tick += 1;
+        self.run_status_clocks(events);
         for i in 0..self.actors.len() {
             let c = &self.actors[i];
             if !c.is_alive() || c.ready {
                 continue;
             }
             let inc = turn_timer_increase(c.side, c.dex, self.v_timer_increase, self.normal_speed);
+            // Haste doubles the gauge, Slow halves it, Stop and Paralysis freeze it.
+            let inc = c.status.pace().scale(inc);
             let c = &mut self.actors[i];
             c.gauge = (c.gauge + inc).min(GAUGE_MAX);
             if c.gauge >= GAUGE_MAX {
@@ -1775,8 +1900,56 @@ impl BattleState {
             if self.outcome.is_some() {
                 break;
             }
-            if self.actors[i].is_alive() && self.actors[i].ready {
+            // An enemy that is asleep, stopped or paralysed waits with its full gauge.
+            if self.actors[i].can_act() && self.actors[i].ready {
                 self.enemy_act(i, events);
+            }
+        }
+    }
+
+    /// One tick of every living combatant's statuses (see the module docs, "Statuses"): the turns of Poison and
+    /// Regen, then the statuses whose timers ran out, in actor order. Poison can knock a combatant out, and the
+    /// battle then has its outcome like after any blow; no clock runs once it has one.
+    fn run_status_clocks(&mut self, events: &mut Vec<BattleEvent>) {
+        for i in 0..self.actors.len() {
+            if self.outcome.is_some() {
+                break;
+            }
+            if !self.actors[i].is_alive() || self.actors[i].status.is_empty() {
+                continue;
+            }
+            let elapsed = self.actors[i].status.advance(self.v_timer_increase);
+            let target = ActorId(i as u8);
+            if elapsed.poison {
+                let amount = (self.actors[i].max_hp / POISON_DIVISOR).max(1);
+                let c = &mut self.actors[i];
+                c.hp = c.hp.saturating_sub(amount);
+                events.push(BattleEvent::StatusTick { target, status: Status::Poison, amount });
+                if c.hp == 0 {
+                    c.gauge = 0;
+                    c.ready = false;
+                    c.defending = false;
+                    c.status.clear();
+                    let emptied = c.limit != 0;
+                    c.limit = 0;
+                    events.push(BattleEvent::Death { actor: target });
+                    if emptied {
+                        events.push(BattleEvent::LimitGauge { actor: target, value: 0 });
+                    }
+                    self.check_outcome(events);
+                    continue;
+                }
+            }
+            if elapsed.regen {
+                let c = &mut self.actors[i];
+                let gained = (c.max_hp / REGEN_DIVISOR).max(1).min(c.max_hp.saturating_sub(c.hp));
+                if gained > 0 {
+                    c.hp += gained;
+                    events.push(BattleEvent::StatusTick { target, status: Status::Regen, amount: gained });
+                }
+            }
+            for status in elapsed.ended.iter() {
+                events.push(BattleEvent::StatusEnded { target, status });
             }
         }
     }
@@ -2038,6 +2211,10 @@ impl BattleState {
             ai.note_hit(hit_by, physical);
             let scripts: &[usize] = if !self.actors[target].is_alive() {
                 &[slot::DEATH_COUNTER]
+            } else if !self.actors[target].can_act() {
+                // Asleep, stopped or paralysed (a physical blow has already woken a sleeper): it notes the hit and
+                // does not answer it (see "Statuses"; an engine choice, not checked against the original).
+                &[]
             } else if physical {
                 &[slot::GENERAL_COUNTER, slot::PHYSICAL_COUNTER]
             } else {
@@ -2113,8 +2290,12 @@ impl BattleState {
             if self.outcome.is_some() {
                 break;
             }
-            if spec.heals() {
+            if spec.formula == Formula::None {
+                self.resolve_status_only(actor, target, spec, targets.len(), events);
+            } else if spec.heals() {
                 self.resolve_restore(actor, target, spec, targets.len(), events);
+                // A recovery with a status of its own (Angel Whisper heals and cures) tries it on the one it restored.
+                self.apply_status_effect(target, spec, targets.len(), events);
             } else {
                 self.resolve_offense(actor, target, spec, targets.len(), events);
             }
@@ -2153,18 +2334,24 @@ impl BattleState {
                 response,
                 Some(AffinityRate::Nullify | AffinityRate::Absorb | AffinityRate::FullHeal)
             );
+            let party_member = a.side == Side::Party;
             let hit = !spec.rolls_accuracy
                 || sure
                 || match spec.kind {
-                    ActionKind::Physical => resolve_hit(
-                        a,
-                        t,
-                        hit_chance_with(a, t, spec.accuracy),
-                        luck_roll,
-                        miss_roll,
-                    ),
+                    ActionKind::Physical => {
+                        // Fury takes 30% off the hit rate, Darkness halves the Attack command's (party only).
+                        let chance = status::hit_chance_after_statuses(
+                            i64::from(hit_chance_with(a, t, spec.accuracy)),
+                            &a.status,
+                            spec.weapon_attack,
+                            party_member,
+                        );
+                        let chance = chance.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+                        resolve_hit(a, t, chance, luck_roll, miss_roll)
+                    }
                     ActionKind::Magical => {
-                        magic_hit_chance(spec.accuracy, t) >= i64::from(miss_roll)
+                        let chance = status::hit_chance_after_statuses(magic_hit_chance(spec.accuracy, t), &a.status, false, party_member);
+                        chance >= i64::from(miss_roll)
                     }
                 };
             (hit, critical_chance(a, t), response)
@@ -2205,13 +2392,19 @@ impl BattleState {
             Some(AffinityRate::FullHeal) => Offense::Heal(victim.max_hp),
             Some(AffinityRate::Absorb) => Offense::Heal(damage_of(Elemental::Normal, false)),
             _ => Offense::Damage {
-                amount: damage_of(Elemental::of(response), critical),
+                // Barrier, MBarrier and Sadness take their share off what the formulas gave.
+                amount: status::damage_after_statuses(
+                    damage_of(Elemental::of(response), critical),
+                    spec.kind == ActionKind::Physical,
+                    &victim.status,
+                ),
                 critical,
             },
         };
         match outcome {
             Offense::Damage { amount, critical } => {
                 let mut died = false;
+                let mut woke = false;
                 // Only an enemy hurting a party member fills a limit gauge (see `crate::limit`).
                 let hurts_party = attacker >= self.party_len && target < self.party_len;
                 let mut gauge: Option<u16> = None;
@@ -2222,18 +2415,28 @@ impl BattleState {
                         t.gauge = 0;
                         t.ready = false;
                         t.defending = false;
+                        // A knockout removes every status.
+                        t.status.clear();
                         // A knocked-out character loses its whole limit gauge.
                         if t.limit != 0 {
                             t.limit = 0;
                             gauge = Some(0);
                         }
-                    } else if hurts_party && amount > 0 {
-                        if let Some(limit) = t.limit_break {
-                            let value = t.limit.saturating_add(limit_gain(amount, t.max_hp, limit.divisor)).min(LIMIT_MAX);
-                            if value != t.limit {
-                                t.limit = value;
-                                gauge = Some(value);
+                    } else {
+                        if hurts_party && amount > 0 {
+                            if let Some(limit) = t.limit_break {
+                                // Sadness halves the gauge a blow fills, Fury doubles it, Paralysis stops it.
+                                let gain = status::limit_gain_after_statuses(limit_gain(amount, t.max_hp, limit.divisor), &t.status);
+                                let value = t.limit.saturating_add(gain).min(LIMIT_MAX);
+                                if value != t.limit {
+                                    t.limit = value;
+                                    gauge = Some(value);
+                                }
                             }
+                        }
+                        // A physical blow that does damage wakes a sleeper; a magical one does not.
+                        if spec.kind == ActionKind::Physical && amount > 0 {
+                            woke = t.status.wake();
                         }
                     }
                 }
@@ -2249,7 +2452,14 @@ impl BattleState {
                 if let Some(value) = gauge {
                     events.push(BattleEvent::LimitGauge { actor: target_id, value });
                 }
+                if woke {
+                    events.push(BattleEvent::StatusEnded { target: target_id, status: Status::Sleep });
+                }
                 self.check_outcome(events);
+                // The blow's own status effect, on a target that still stands (see the module docs).
+                if self.outcome.is_none() {
+                    self.apply_status_effect(target, spec, among, events);
+                }
             }
             Offense::Heal(amount) => {
                 let gained = match self.actors.get_mut(target) {
@@ -2267,6 +2477,67 @@ impl BattleState {
                 });
             }
         }
+    }
+
+    /// Try the status effect of `spec` on `target` (when it has one and the target stands): one draw
+    /// `below(63)` and, when it is below the chance, the effect (see the module docs, "RNG draw order"). What
+    /// changed is announced in bit order; a status the target is immune to, has already, or that the rules do not
+    /// model says nothing.
+    fn apply_status_effect(&mut self, target: usize, spec: &ActionSpec, among: usize, events: &mut Vec<BattleEvent>) {
+        let Some(effect) = spec.status else { return };
+        let Some(t) = self.actors.get(target) else { return };
+        if !t.is_alive() {
+            return;
+        }
+        let roll = self.rng.below(CHANCE_OUT_OF);
+        if roll >= effect.chance_among(among > 1 && spec.splits()) {
+            return;
+        }
+        let immune = t.status_immune;
+        let target_id = ActorId(target as u8);
+        if let Some(t) = self.actors.get_mut(target) {
+            for change in t.status.apply(&effect, immune) {
+                events.push(match change {
+                    Change::Inflicted(status) => BattleEvent::StatusInflicted { target: target_id, status },
+                    Change::Ended(status) => BattleEvent::StatusEnded { target: target_id, status },
+                });
+            }
+        }
+    }
+
+    /// Resolve one status-only action ([`Formula::None`]) on a target: a curse rolls to hit first, like a spell
+    /// of its kind does (an ally, or an item, is never missed), then its status effect.
+    fn resolve_status_only(&mut self, user: usize, target: usize, spec: &ActionSpec, among: usize, events: &mut Vec<BattleEvent>) {
+        if !spec.on_allies && spec.rolls_accuracy {
+            let (luck_roll, miss_roll) = match spec.kind {
+                ActionKind::Physical => {
+                    let luck = self.rng.range_inclusive(0, 99);
+                    (luck, percent_roll(self.rng.next_u16()))
+                }
+                ActionKind::Magical => (0, percent_roll(self.rng.next_u16())),
+            };
+            let hit = {
+                let (Some(a), Some(t)) = (self.actors.get(user), self.actors.get(target)) else {
+                    return;
+                };
+                let party_member = a.side == Side::Party;
+                match spec.kind {
+                    ActionKind::Physical => {
+                        let chance = status::hit_chance_after_statuses(i64::from(hit_chance_with(a, t, spec.accuracy)), &a.status, false, party_member);
+                        let chance = chance.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+                        resolve_hit(a, t, chance, luck_roll, miss_roll)
+                    }
+                    ActionKind::Magical => {
+                        status::hit_chance_after_statuses(magic_hit_chance(spec.accuracy, t), &a.status, false, party_member) >= i64::from(miss_roll)
+                    }
+                }
+            };
+            if !hit {
+                events.push(BattleEvent::Miss { actor: ActorId(user as u8), target: ActorId(target as u8) });
+                return;
+            }
+        }
+        self.apply_status_effect(target, spec, among, events);
     }
 
     /// Resolve one restoring action on an ally: HP, MP, both (Elixir) or a revival.
@@ -2450,6 +2721,9 @@ mod tests {
             }
             BattleEvent::LimitGauge { actor, value } => format!("limit-gauge {} {value}", actor.0),
             BattleEvent::EscapeFailed { actor } => format!("escape-failed {}", actor.0),
+            BattleEvent::StatusInflicted { target, status } => format!("status+ {} {status}", target.0),
+            BattleEvent::StatusEnded { target, status } => format!("status- {} {status}", target.0),
+            BattleEvent::StatusTick { target, status, amount } => format!("status-tick {} {status} {amount}", target.0),
         }
     }
 
@@ -5242,3 +5516,6 @@ mod tests {
 
 #[cfg(test)]
 mod side_tests;
+
+#[cfg(test)]
+mod status_tests;

@@ -57,6 +57,12 @@
 //!   Magic list says `ALL xN` for the All materia uses our character has left, Healing Wind and Megalixir start
 //!   on ALL, and the bot gives Healing Wind to the whole party. Everything it needs to know (what a spell can
 //!   aim at, how many uses are left) comes from the replayed engine, so the menu is always the engine's word.
+//! * Statuses: the party panel and the enemy list tag each fighter with the statuses it has (`Bar::status`, read from
+//!   the replayed engine), the ATB bar shows Haste, Slow and the stops, a sleeper, a stopped or a paralysed member is
+//!   not `ready` (it keeps its full gauge and gives no command), the Magic row of the menu is greyed out while our
+//!   character is silenced, the 3D scene tints and poses the bodies (`scene::body`), and every status the server
+//!   announces is one `status:` note (`inflicted`/`ended` with the actor and the status) and, with the turns of
+//!   Poison and Regen, one count per battle (`status: battle#N inflicted=A ended=B ticks=C`, before the end note).
 //! * [`open_rules`] reads this machine's battle data (the same library set as the field archive);
 //!   [`open_names`] reads the spell, item and enemy attack names the windows show from the same files.
 //!
@@ -77,6 +83,7 @@ mod panels;
 mod popups;
 pub mod scene;
 mod script;
+mod tags;
 #[cfg(test)]
 mod glue_tests;
 #[cfg(test)]
@@ -242,6 +249,15 @@ impl Applied {
     }
 }
 
+/// The status events of one battle, as the server announced them (counted whether or not this machine can replay them).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct StatusCounts {
+    inflicted: u64,
+    ended: u64,
+    /// Turns of Poison and Regen.
+    ticks: u64,
+}
+
 /// An inventory as this client keeps it, whatever the server sent (it is untrusted): no stack of
 /// zero, an item that appears twice merged into its first place (the count saturating at `u16`),
 /// at most [`MAX_INVENTORY_STACKS`] different items (the first ones), otherwise in the order sent. A
@@ -287,13 +303,18 @@ fn roster_display_name(raw: &str, index: usize) -> String {
 /// percent-encoded like the names of the SMOKE line ([`encode_name`]; `-` for none), the member's own as the roster says it
 /// (bounded to the length a name has) and the stat curve's from this client's own table of characters (internal: for a canon
 /// companion it is the character it is). `controller` says who commands it: a `companion` of the story's canon party is
-/// commanded by the server, a `player` by its player (protocol v9).
+/// commanded by the server, a `player` by its player (protocol v9); `status` is what the member starts the battle with
+/// (the names joined by `+`, `-` for none).
 fn roster_note(index: usize, member: &BattleMember) -> String {
     let own: String = member.name.chars().take(MAX_CHARACTER_NAME_CHARS).collect();
     let name = if own.is_empty() { "-".to_string() } else { encode_name(&own) };
     let slot_name = slot_name(member.character).map_or_else(|| "-".to_string(), encode_name);
     let controller = if member.is_companion() { "companion" } else { "player" };
-    format!("roster actor={index} name={name} slot={} slot_name={slot_name} level={} controller={controller}", member.character, member.level)
+    let status = if member.status.is_empty() { "-".to_string() } else { member.status.iter().map(|s| s.name()).collect::<Vec<_>>().join("+") };
+    format!(
+        "roster actor={index} name={name} slot={} slot_name={slot_name} level={} controller={controller} status={status}",
+        member.character, member.level
+    )
 }
 
 /// One battle this client is in.
@@ -318,6 +339,8 @@ pub struct ActiveBattle {
     messages: u64,
     /// Commands of OUR character that the server applied (it echoes each one in its event), by kind.
     my_commands: Applied,
+    /// The status events the server announced in this battle.
+    statuses: StatusCounts,
 }
 
 impl ActiveBattle {
@@ -701,6 +724,7 @@ impl BattleClient {
             diverged: false,
             messages: 0,
             my_commands: Applied::default(),
+            statuses: StatusCounts::default(),
         });
         if let Some(why) = failure {
             self.diverged(why);
@@ -731,11 +755,35 @@ impl BattleClient {
             }
             self.events.push_back(*event);
         }
+        // The statuses the server announced: counted, and each one that came or went said in a note.
+        let mut status_notes = Vec::new();
+        for event in events {
+            match *event {
+                BattleEvent::StatusInflicted { target, status } => {
+                    active.statuses.inflicted += 1;
+                    status_notes.push(format!("status: inflicted actor={} status={}", target.0, status.name()));
+                }
+                BattleEvent::StatusEnded { target, status } => {
+                    active.statuses.ended += 1;
+                    status_notes.push(format!("status: ended actor={} status={}", target.0, status.name()));
+                }
+                BattleEvent::StatusTick { .. } => active.statuses.ticks += 1,
+                _ => {}
+            }
+        }
         // Floating numbers and the menu follow the events, whether or not this machine can replay them.
         self.hud.on_events(now, events, my_command);
-        let Some(replay) = active.replay.as_mut() else { return };
+        let Some(replay) = active.replay.as_mut() else {
+            for line in status_notes {
+                self.note(line);
+            }
+            return;
+        };
         if let Err(d) = replay.apply(tick, events, command.as_ref()) {
             self.diverged(format!("{battle_id} at tick {tick}: {d}"));
+        }
+        for line in status_notes {
+            self.note(line);
         }
         // What the menu offers follows the replay: a limit gauge moves with these messages (and nowhere else).
         self.refresh_menu_model();
@@ -789,6 +837,8 @@ impl BattleClient {
             }
         };
         self.applied.add(active.my_commands);
+        let counts = active.statuses;
+        self.note(format!("status: {battle_id} inflicted={} ended={} ticks={}", counts.inflicted, counts.ended, counts.ticks));
         self.note(format!(
             "{battle_id} ended in {outcome:?} ({paid}); back in the field; {} command(s) of yours applied; {how}",
             active.my_commands.total()
@@ -883,7 +933,7 @@ impl BattleClient {
             MenuLimit::new(info.attack, limit_name(book, info.attack), TargetRule::from_allies(info.targets_allies), state.limit_ready(mine))
                 .with_reach(reach_of(info.aim, false))
         });
-        BattleMenuModel { spells, items, defend: true, limit, escape: state.can_escape(), all_left }
+        BattleMenuModel { spells, items, defend: true, limit, escape: state.can_escape(), all_left, silenced: state.is_silenced(mine) }
     }
 
     fn on_rejected(&mut self, battle_id: Option<BattleId>, reason: BattleRejection) {
@@ -1055,8 +1105,10 @@ impl BattleClient {
                 mp: c.mp,
                 max_mp: c.max_mp,
                 gauge,
-                ready: c.ready && c.is_alive(),
+                // A sleeper, a stopped or a paralysed fighter keeps its full gauge but is not waiting for a command.
+                ready: c.ready && c.can_act(),
                 alive: c.is_alive(),
+                status: c.status.set(),
                 mine: Some(id) == active.my_actor,
                 limit: state.limit_gauge(id),
             })
@@ -1112,6 +1164,9 @@ impl BattleClient {
         let me = match view.party.iter().find(|b| b.mine) {
             Some(b) if !b.alive => "you are down",
             Some(b) if b.ready => "YOUR TURN: choose a command",
+            Some(b) if b.status.contains(fmv_ff7_battle::status::Status::Sleep) => "asleep",
+            Some(b) if b.status.contains(fmv_ff7_battle::status::Status::Stop) => "stopped",
+            Some(b) if b.status.contains(fmv_ff7_battle::status::Status::Paralysis) => "paralysed",
             Some(_) => "waiting for your gauge",
             None => "watching",
         };

@@ -111,6 +111,29 @@
 //! * An item command still spends one item, however many targets it hits (the server checks the count as it
 //!   always did).
 //!
+//! # Statuses
+//!
+//! The engine plays Poison, Regen, Sleep, Stop, Paralysis, Silence, Haste, Slow, Barrier, MBarrier, Sadness, Fury and
+//! Darkness (`fmv_ff7_battle::status` has the model, the clocks and their sources); an action that inflicts or cures
+//! one gets it from the peer's own `kernel.bin` and `scene.bin`, so nothing about a status is ever sent except what
+//! the engine itself says happened:
+//!
+//! * **Three new events.** `StatusInflicted { target, status }` (an action inflicted it, or the battle started with it),
+//!   `StatusEnded { target, status }` (a cure, a timer that ran out, or a sleeper woken by a physical blow) and
+//!   `StatusTick { target, status, amount }` (a turn of Poison, which took `amount` HP, or of Regen, which gave it). A
+//!   `status` travels as its name (`"Poison"`, `"MBarrier"`), a status set as its bit mask (a number: bit `n` is the
+//!   `n`th status of `Status::ALL`, as in the game's own records). A v11 peer cannot decode them, so this needs the
+//!   protocol version that follows 11.
+//! * **A held turn.** A member that is asleep, stopped or paralysed keeps its full gauge and gives no command: the
+//!   engine's `ready_actors()` leaves it out, a command from it is refused (`CannotAct`), and a silenced member's
+//!   Magic is (`Silenced`). Both are new [`BattleRejection`]s; the server's own rule for a companion never asks for
+//!   either (it checks every candidate command with the engine first).
+//! * **Starting statuses are an input**, like the level and the limit gauge: [`BattleMember::status`] is what the
+//!   member begins the battle with (the engine keeps the modelled ones, announces them with the first step and gives
+//!   the timed ones their whole duration). Today only the server's debug flag `--debug-status` sets it; a real battle
+//!   starts clean. A set the engine does not play, or one that holds Haste with Slow or Sadness with Fury (the engine
+//!   never has both), is refused when the battle is built ([`BattleBuildError::InvalidStatus`]).
+//!
 //! # Rewards
 //!
 //! [`split_rewards`] is a pure function of the engine's total reward and the ROSTER ([`reward_roster`]: every
@@ -138,11 +161,13 @@ use fmv_ff7_battle::rules::{
     element, enemies_for_formation, BattleConfig, BattleState, Combatant, EscapeRule, Reward, StartMode, LIMIT_MAX, MAX_PER_SIDE,
 };
 use fmv_ff7_battle::scene::{BattleLayout, SceneBin, SceneError, MAX_SCENE_BIN_BYTES};
+use fmv_ff7_battle::status::StatusState;
 use serde::{Deserialize, Serialize};
 
 /// The engine types that travel in battle messages, re-exported so a peer can match on them
 /// without a direct dependency.
 pub use fmv_ff7_battle::rules::{ActionRef, ActorId, BattleEvent, Command, Outcome, Target};
+pub use fmv_ff7_battle::status::{Status, StatusSet};
 
 /// The random stream item drops are rolled on (the engine's own is [`fmv_ff7_battle::rng::DEFAULT_STREAM`]),
 /// so drops never depend on, or disturb, the replayed battle.
@@ -235,17 +260,37 @@ pub struct BattleMember {
     /// so a player's value does not matter; a companion starts empty (full under the debug flag
     /// `--debug-limit-full`).
     pub limit: u16,
+    /// The statuses the member begins the battle with (see the module docs, "Statuses"): an input of the engine like
+    /// the level and the limit gauge, so every peer replays what the server had. Empty in a real battle; the server's
+    /// debug flag `--debug-status` sets it. Only statuses the engine plays are valid and never both of a pair that
+    /// cancel each other ([`BattleBuildError::InvalidStatus`]). Absent from the JSON when empty.
+    #[serde(default, skip_serializing_if = "no_status")]
+    pub status: StatusSet,
+}
+
+/// `skip_serializing_if` of [`BattleMember::status`] (serde passes a reference).
+fn no_status(set: &StatusSet) -> bool {
+    set.is_empty()
 }
 
 impl BattleMember {
     /// A player's character in a battle (see [`Controller::Player`]).
     pub fn player(entity: EntityId, account: AccountId, name: impl Into<String>, character: u8, level: u8, limit: u16) -> Self {
-        Self { controller: Controller::Player { entity, account }, name: name.into(), character, level, weapon: None, armor: None, limit }
+        Self {
+            controller: Controller::Player { entity, account },
+            name: name.into(),
+            character,
+            level,
+            weapon: None,
+            armor: None,
+            limit,
+            status: StatusSet::EMPTY,
+        }
     }
 
     /// A canon companion of the story's party in a battle (see [`Controller::Companion`]).
     pub fn companion(name: impl Into<String>, character: u8, level: u8, limit: u16) -> Self {
-        Self { controller: Controller::Companion, name: name.into(), character, level, weapon: None, armor: None, limit }
+        Self { controller: Controller::Companion, name: name.into(), character, level, weapon: None, armor: None, limit, status: StatusSet::EMPTY }
     }
 
     /// The FF7 character, if `character` names one.
@@ -377,6 +422,10 @@ pub enum BattleRejection {
     LimitNotReady,
     /// The party cannot run from this battle (protocol v7).
     CannotEscape,
+    /// The actor is asleep, stopped or paralysed: it takes no turn until that is over (statuses).
+    CannotAct,
+    /// The actor is silenced: it cannot cast a spell (statuses).
+    Silenced,
 }
 
 impl fmt::Display for BattleRejection {
@@ -401,6 +450,8 @@ impl fmt::Display for BattleRejection {
             BattleRejection::NoLimit => "that character has no limit break",
             BattleRejection::LimitNotReady => "that character's limit gauge is not full",
             BattleRejection::CannotEscape => "you cannot escape from this battle",
+            BattleRejection::CannotAct => "that character cannot act (asleep, stopped or paralysed)",
+            BattleRejection::Silenced => "that character is silenced and cannot cast",
         })
     }
 }
@@ -465,6 +516,19 @@ pub enum BattleBuildError {
     /// A starting limit gauge above the most there is (a hostile or broken server; the real one never sends it).
     #[error("character id {character} starts with a limit gauge of {limit}, the most there is is {max}")]
     InvalidLimit { character: u8, limit: u16, max: u16 },
+    /// A starting status set the engine does not play, or one that has both Haste and Slow or both Sadness and Fury.
+    #[error("character id {character} starts with the status set {bits:#x}, which is not one the battle plays")]
+    InvalidStatus { character: u8, bits: u32 },
+}
+
+/// The statuses a member begins a battle with, checked: only ones the engine plays, and never both of a pair that
+/// cancel each other ([`StatusSet::is_valid_start`]). One definition for every [`BattleRules`].
+pub fn start_status(member: &BattleMember) -> Result<StatusState, BattleBuildError> {
+    let set = member.status;
+    if !set.is_valid_start() {
+        return Err(BattleBuildError::InvalidStatus { character: member.character, bits: set.bits() });
+    }
+    Ok(StatusState::starting(set))
 }
 
 /// What a formation looks like to the server (for choosing flags and for logs). Names and stats
@@ -992,6 +1056,7 @@ impl Ff7BattleData {
                     c.limit_break = None;
                 }
                 c.limit = m.limit;
+                c.status = start_status(m)?;
                 Ok(c)
             })
             .collect()
@@ -1258,6 +1323,7 @@ impl BattleRules for SyntheticRules {
                 c.spells = Self::spells();
                 c.all_left = Self::ALL_USES;
                 c.limit = m.limit;
+                c.status = start_status(m)?;
                 c.limit_break = (m.is_companion() || self.player_limits).then(|| match who {
                     CharacterId::Aeris => LimitBreak::new(142, ActionSpec::limit_heal(16), 40),
                     _ => LimitBreak::new(128, ActionSpec::limit_strike(48), 40),
@@ -1639,6 +1705,88 @@ mod tests {
             assert!(matches!(replay.check_end(Outcome::Victory, &greedy), Err(Divergence::RewardsDiffer { .. })));
             assert!(matches!(replay.check_end(Outcome::Defeat, &[]), Err(Divergence::OutcomeDiffers { .. })));
         }
+    }
+
+    /// A member that starts the battle with `statuses`.
+    fn sick(i: u64, character: u8, statuses: &[Status]) -> BattleMember {
+        BattleMember { status: statuses.iter().copied().collect(), ..member(i, character) }
+    }
+
+    /// The statuses a member starts with are an input like its level: every peer builds the same battle from them, the engine
+    /// announces them with its first step and says what they do after that, and a replay of the server's log agrees.
+    #[test]
+    fn a_battle_that_starts_with_statuses_announces_them_and_replays_exactly() {
+        let rules = SyntheticRules::default();
+        let mut ticks = 0;
+        for seed in 0..24u64 {
+            let setup = BattleSetup {
+                seed,
+                party: vec![
+                    sick(0, 0, &[Status::Poison, Status::Haste, Status::Silence]),
+                    sick(1, 1, &[Status::Regen, Status::Sadness]),
+                    member(2, 2),
+                ],
+                ..setup([0u16, 1, 4][seed as usize % 3], 1)
+            };
+            let mut server = rules.build(&setup).unwrap();
+            let log = serve(&mut server, [1u64, 7, 40][seed as usize % 3]);
+            // Whatever the fight came to, the first message begins with the statuses, in actor and then bit order.
+            let first = &log.first().expect("something happened").1;
+            let (a, b) = (ActorId(0), ActorId(1));
+            assert_eq!(
+                first[..5],
+                [
+                    BattleEvent::StatusInflicted { target: a, status: Status::Poison },
+                    BattleEvent::StatusInflicted { target: a, status: Status::Silence },
+                    BattleEvent::StatusInflicted { target: a, status: Status::Haste },
+                    BattleEvent::StatusInflicted { target: b, status: Status::Sadness },
+                    BattleEvent::StatusInflicted { target: b, status: Status::Regen },
+                ],
+                "seed {seed}"
+            );
+            ticks += log.iter().flat_map(|(_, events, _)| events).filter(|e| matches!(e, BattleEvent::StatusTick { .. })).count();
+            let replay = replay_all(&rules, &setup, &log).unwrap_or_else(|d| panic!("seed {seed}: {d}"));
+            assert_eq!(replay.state(), &server, "seed {seed}: the replayed engine IS the server's engine");
+            // Nothing else about them was ever sent: a peer that dropped the one thing that carries them replays a
+            // different battle, which is caught at the first message.
+            let mut forged = BattleReplay::start(&rules, &BattleSetup { party: vec![member(0, 0), member(1, 1), member(2, 2)], ..setup.clone() }).unwrap();
+            let (tick, events, command) = &log[0];
+            assert!(forged.apply(*tick, events, command.as_ref()).is_err(), "seed {seed}: a peer without the statuses diverges");
+        }
+        assert!(ticks > 0, "the Poison and the Regen ran in at least one of the fights");
+    }
+
+    /// A starting set the engine does not play, or one that cannot be reached (Haste with Slow, Sadness with Fury), is
+    /// refused when the battle is built, by every rule set: a hostile server cannot make a peer start from a state the
+    /// engine never produces.
+    #[test]
+    fn a_starting_set_the_battle_does_not_play_is_refused() {
+        let rules = SyntheticRules::default();
+        let build = |statuses: &[Status]| {
+            let setup = BattleSetup { party: vec![sick(0, 3, statuses)], ..setup(0, 1) };
+            rules.build(&setup)
+        };
+        for good in [&[][..], &[Status::Poison], &[Status::Haste, Status::Regen, Status::Barrier, Status::MBarrier], &[Status::Sleep, Status::Stop, Status::Paralysis, Status::Darkness]] {
+            let state = build(good).unwrap_or_else(|e| panic!("{good:?}: {e}"));
+            assert_eq!(state.actor(ActorId(0)).unwrap().status.set(), good.iter().copied().collect::<StatusSet>());
+        }
+        for bad in [
+            &[Status::Haste, Status::Slow][..],
+            &[Status::Sadness, Status::Fury],
+            &[Status::Confusion],
+            &[Status::Poison, Status::Frog],
+            &[Status::Death],
+            &[Status::NearDeath],
+        ] {
+            let bits: u32 = bad.iter().fold(0, |m, s| m | s.bit());
+            assert_eq!(build(bad).unwrap_err(), BattleBuildError::InvalidStatus { character: 3, bits }, "{bad:?}");
+        }
+        // Every bit at once, and one that is no status of the 32.
+        let mut member = member(0, 3);
+        member.status = StatusSet::from_bits(u32::MAX);
+        assert!(matches!(rules.build(&BattleSetup { party: vec![member], ..setup(0, 1) }), Err(BattleBuildError::InvalidStatus { bits: u32::MAX, .. })));
+        let message = BattleBuildError::InvalidStatus { character: 3, bits: 0x600 }.to_string();
+        assert!(message.contains("0x600") && message.contains('3'), "{message}");
     }
 
     /// Like `serve`, but every ready member gives a different kind of command in turn: attack, Fire, Cure

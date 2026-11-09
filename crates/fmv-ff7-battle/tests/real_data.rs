@@ -652,13 +652,13 @@ fn real_kernel_has_spells_items_materia_and_a_starting_stock() {
     assert_eq!((amount(0), amount(1), amount(3)), (100, 500, 100));
     assert_eq!(amount(7), healthy.max_hp * 8 / 32);
     // Megalixir restores the whole party and only that (it is Elixir for every ally); a potion, an Elixir and a
-    // Phoenix Down hit one; the status cures are left out.
+    // Phoenix Down hit one; the status items are the next test's (the cures of the statuses the rules play are in).
     assert_eq!(kernel.item_name(6).as_deref(), Some("Megalixir"));
     assert_eq!((info(6).kind, info(6).aim, info(6).targets_allies), (ItemKind::RestoreAll, Aim::Side, true));
     assert!([0, 1, 2, 3, 4, 5, 7].iter().all(|i| info(*i).aim == Aim::One));
-    assert!(table.info(8).is_none());
+    assert_eq!((info(8).kind, kernel.item_name(8).as_deref()), (ItemKind::Status, Some("Antidote")));
     assert!(
-        table.len() >= 8 && table.len() < 60,
+        table.len() >= 8 && table.len() < 80,
         "{} usable items",
         table.len()
     );
@@ -930,6 +930,206 @@ fn real_battles_with_every_kind_of_command_are_deterministic_and_sane() {
         "casts {casts}, items {items_used}, enemy attacks {enemy_attacks}"
     );
     println!("real battles with every command: {wins}/{runs} won; {casts} spells, {items_used} items, {enemy_attacks} enemy attacks");
+}
+
+/// Status effects over the owner's data (checkpoint 2 of "deeper battles"): which spells and items inflict or cure what, the
+/// immunities of the enemies, how many of the scenes' attacks carry a status, and real fights that run with them. Ids,
+/// names the game's own menus show, booleans and counts: nothing of the files is kept.
+#[test]
+#[ignore = "needs FMV_FF7_DATA pointing at the owner's FF7 data directory"]
+fn real_statuses_decode_from_the_kernel_and_the_scenes_and_play_in_real_battles() {
+    use fmv_ff7_battle::action::{ActionSpec, Aim, Formula, ItemKind, ItemTable, StatusEffect, StatusMode};
+    use fmv_ff7_battle::status::{Status, StatusSet, MODELLED};
+    use std::sync::Arc;
+
+    let (Some(sp), Some(kp)) = (scene_path(), kernel_path()) else {
+        return;
+    };
+    let bin = SceneBin::open(sp).expect("scene.bin");
+    let kernel = Kernel::open(kp).expect("kernel.bin");
+    let table = ItemTable::from_kernel(&kernel);
+    let set = |list: &[Status]| -> StatusSet { list.iter().copied().collect() };
+
+    // Items: what each does, to whom. (The names are the game's own, to pin the ids.)
+    let item = |i: u16, name: &str| {
+        assert_eq!(kernel.item_name(i).as_deref(), Some(name), "item {i}");
+        table.get(i).unwrap_or_else(|| panic!("{name} can be used in battle")).spec
+    };
+    let cures = |list: &[Status]| StatusEffect { set: set(list), chance: 63, mode: StatusMode::Cure };
+    let antidote = item(8, "Antidote");
+    assert_eq!((antidote.status, antidote.formula, antidote.aims_at_allies(), antidote.aim), (Some(StatusEffect::cure(Status::Poison, 63)), Formula::None, true, Aim::One));
+    assert_eq!(item(12, "Echo Screen").status, Some(StatusEffect::cure(Status::Silence, 63)));
+    assert_eq!(item(52, "Eye drop").status, Some(StatusEffect::cure(Status::Darkness, 63)));
+    let remedy = item(15, "Remedy");
+    assert_eq!(
+        remedy.status,
+        Some(cures(&[Status::Sleep, Status::Poison, Status::Sadness, Status::Fury, Status::Silence, Status::Paralysis, Status::Darkness])),
+        "a Remedy cures every ailment the rules play"
+    );
+    assert_eq!(item(17, "Speed Drink").status, Some(StatusEffect::inflict(Status::Haste, 63)));
+    // The ones thrown at the enemies aim at them, a whole side at once for the powders and the gong.
+    let dazers = item(59, "Dazers");
+    assert_eq!((dazers.status, dazers.aims_at_allies(), dazers.aim), (Some(StatusEffect::inflict(Status::Paralysis, 63)), false, Aim::One));
+    let powder = table.get(26).unwrap().spec;
+    assert_eq!((powder.status.map(|s| (s.set, s.mode)), powder.aims_at_allies(), powder.aim), (Some((set(&[Status::Sleep]), StatusMode::Inflict)), false, Aim::Side));
+    assert_eq!(table.get(23).unwrap().spec.status.map(|s| s.set), Some(set(&[Status::Stop])));
+    assert_eq!(table.get(44).unwrap().spec.status.map(|s| (s.set, s.mode)), Some((set(&[Status::Barrier]), StatusMode::Inflict)));
+    assert!(table.get(44).unwrap().spec.aims_at_allies() && table.get(44).unwrap().spec.aim == Aim::Side);
+    // A damaging item with a status keeps its damage (Deadly Waste: a poison that sometimes sticks).
+    let waste = table.get(38).unwrap().spec;
+    assert_eq!((waste.status.map(|s| s.set), waste.formula != Formula::None, table.info(38).unwrap().kind), (Some(set(&[Status::Poison])), true, ItemKind::Damage));
+    // The cures of the statuses the rules do not play, and the items with more to them, are not in the table.
+    for gone in [9u16, 10, 11, 16, 18, 19, 24] {
+        assert!(table.info(gone).is_none(), "item {gone} is not played");
+    }
+    let status_items = table.indexes().filter(|i| table.info(*i).is_some_and(|info| info.kind == ItemKind::Status)).count();
+    assert!(status_items >= 15, "{status_items} items only change statuses");
+
+    // Spells.
+    let spell = |index: usize, name: &str| {
+        assert_eq!(kernel.magic_name(index as u16).as_deref(), Some(name), "attack {index}");
+        ActionSpec::from_attack(&kernel.attack(index).unwrap()).unwrap_or_else(|| panic!("{name} is decoded"))
+    };
+    let bio = spell(39, "Bio");
+    assert_eq!((bio.formula, bio.status.map(|s| (s.set, s.chance, s.mode))), (Formula::Spell, Some((set(&[Status::Poison]), 12, StatusMode::Inflict))));
+    for (index, name, status, on_allies) in [
+        (3usize, "Regen", Status::Regen, true),
+        (19, "Haste", Status::Haste, true),
+        (15, "Barrier", Status::Barrier, true),
+        (11, "Sleepel", Status::Sleep, false),
+        (13, "Silence", Status::Silence, false),
+        (20, "Slow", Status::Slow, false),
+        (21, "Stop", Status::Stop, false),
+    ] {
+        let spec = spell(index, name);
+        assert_eq!((spec.formula, spec.status.map(|s| s.set), spec.aims_at_allies(), spec.aim), (Formula::None, Some(set(&[status])), on_allies, Aim::OneOrSide), "{name}");
+    }
+    let poisona = spell(4, "Poisona");
+    assert_eq!((poisona.status, poisona.aims_at_allies()), (Some(StatusEffect::cure(Status::Poison, 63)), true));
+    assert_eq!(spell(5, "Esuna").status.map(|s| s.mode), Some(StatusMode::Cure));
+    // The grimoire of a starting party has none of them (Regen and the rest come with the Restore and Status materia).
+    for who in CharacterId::ALL {
+        let spells = fmv_ff7_battle::rules::party_spells(&kernel, who);
+        assert!(spells.iter().all(|s| s.spec.formula != Formula::None), "{who:?}");
+    }
+
+    // The enemies: a set bit says "affected", so a record with every bit set is immune to nothing (209 of them here), and
+    // the statuses a good many enemies shrug off (Stop, Paralysis) are the ones that are clear.
+    let (mut enemies, mut immune_to_nothing) = (0, 0);
+    let mut immune = [0u32; 32];
+    let (mut attacks, mut with_status, mut status_only, mut unplayed_only) = (0, 0, 0, 0);
+    for scene in (0..MAX_SCENES).filter_map(|i| bin.scene(i)) {
+        for record in scene.enemies.iter().flatten() {
+            enemies += 1;
+            let c = Combatant::from_enemy(record, None);
+            immune_to_nothing += usize::from(c.status_immune.is_empty());
+            for status in c.status_immune.iter() {
+                immune[usize::from(status.index())] += 1;
+            }
+            assert!(c.status_immune.bits() & !record.status_immunities == c.status_immune.bits(), "a clear bit is an immunity and only that");
+        }
+        for attack in &scene.attacks {
+            attacks += 1;
+            let rec = &attack.record;
+            match ActionSpec::from_attack(&rec.clone()) {
+                Some(spec) if spec.status.is_some() => {
+                    with_status += 1;
+                    status_only += usize::from(spec.formula == Formula::None);
+                    assert!(spec.status.unwrap().set.difference(MODELLED).is_empty());
+                }
+                _ => unplayed_only += usize::from(rec.status_chance_mode != 0xFF && rec.status_mask != 0xFFFF_FFFF && rec.status_mask != 0),
+            }
+        }
+    }
+    assert!(enemies > 500 && immune_to_nothing > 150, "{immune_to_nothing} of {enemies} enemies are affected by everything");
+    assert!(immune[Status::Stop.index() as usize] > 100 && immune[Status::Paralysis.index() as usize] > 100);
+    assert!(immune[Status::Stop.index() as usize] < enemies && immune[Status::Haste.index() as usize] == immune[Status::Slow.index() as usize]);
+    assert!(attacks > 2000 && with_status > 200 && status_only > 80, "{with_status} of {attacks} scene attacks carry a status the rules play ({status_only} have nothing else)");
+    println!(
+        "statuses: {status_items} status items; {with_status} of {attacks} scene attacks carry one ({status_only} have nothing else, {unplayed_only} only ones the rules do not play); {immune_to_nothing} of {enemies} enemies are affected by everything"
+    );
+
+    // Real fights with real status attacks: formations whose enemies inflict something, played with the policy of the other
+    // battle test plus the cures. Deterministic, finished, and what the engine says about statuses is sane at every step.
+    let level = kernel.init_character_by_id(0).unwrap().level;
+    let items = Arc::new(table);
+    let sting_formations: Vec<usize> = (0..bin.formation_count())
+        .filter(|g| {
+            let f = bin.formation(*g).unwrap();
+            enemies_for_formation(f.scene, f.slot).iter().any(|e| e.actions.iter().any(|a| a.spec.status.is_some()))
+        })
+        .collect();
+    assert!(sting_formations.len() > 20, "{} formations have a stinging enemy", sting_formations.len());
+    let play = |seed: u64, formation: usize| {
+        let f = bin.formation(formation).unwrap();
+        let party = vec![
+            Combatant::from_character(&kernel, CharacterId::Cloud, level, None, None).unwrap(),
+            Combatant::from_character(&kernel, CharacterId::Aeris, level, None, None).unwrap(),
+        ];
+        let mut state = BattleState::with_config(
+            seed,
+            party,
+            enemies_for_formation(f.scene, f.slot),
+            BattleConfig { start: StartMode::from_layout(f.setup().layout), ..BattleConfig::default() },
+        )
+        .with_items(Arc::clone(&items));
+        let mut log = Vec::new();
+        let mut round = 0u64;
+        for _ in 0..4_000 {
+            if state.outcome().is_some() {
+                break;
+            }
+            log.extend(state.step(100));
+            for id in state.ready_actors() {
+                if state.outcome().is_some() {
+                    break;
+                }
+                round += 1;
+                let enemy = state.enemy_ids().into_iter().find(|e| state.actor(*e).is_some_and(|c| c.is_alive())).unwrap();
+                // Antidote, Echo Screen, Remedy and Eye drop on whoever has what they cure; else Fire and attack.
+                let sick = state.party_ids().into_iter().find(|a| state.statuses(*a).intersects(set(&[Status::Poison, Status::Silence, Status::Darkness, Status::Sleep])));
+                let candidates = [
+                    sick.map(|target| Command::Item { item: 15, target: Target::One(target) }),
+                    sick.map(|target| Command::Item { item: 8, target: Target::One(target) }),
+                    Some(Command::Magic { spell: 27, target: Target::One(enemy) }),
+                    Some(Command::Attack { target: enemy }),
+                ];
+                let pick = candidates[round as usize % candidates.len()].filter(|c| state.check_command(id, c).is_ok());
+                let command = pick.unwrap_or(Command::Attack { target: enemy });
+                log.extend(state.submit_command(id, command).unwrap_or_else(|e| panic!("{command:?}: {e}")));
+            }
+            for (i, c) in state.actors().iter().enumerate() {
+                assert!(c.hp <= c.max_hp && c.mp <= c.max_mp);
+                assert!(c.status.set().difference(MODELLED).is_empty(), "{} {i}: only the statuses the rules play are kept", c.name);
+                assert!(c.is_alive() || c.status.is_empty(), "{} {i}: a knockout removes every status", c.name);
+                assert_eq!(state.ready_actors().contains(&fmv_ff7_battle::rules::ActorId(i as u8)), i < 2 && c.ready && c.can_act());
+            }
+        }
+        (state, log)
+    };
+    let (mut runs, mut inflicted, mut ticks, mut ended) = (0, 0, 0, 0);
+    let mut kinds: std::collections::BTreeSet<Status> = std::collections::BTreeSet::new();
+    for &formation in sting_formations.iter().step_by((sting_formations.len() / 12).max(1)) {
+        for seed in 0..6u64 {
+            let (state, log) = play(seed, formation);
+            let (again, log_again) = play(seed, formation);
+            assert_eq!((&state, &log), (&again, &log_again), "formation {formation} seed {seed}");
+            runs += 1;
+            for e in &log {
+                match e {
+                    BattleEvent::StatusInflicted { status, .. } => {
+                        inflicted += 1;
+                        kinds.insert(*status);
+                    }
+                    BattleEvent::StatusEnded { .. } => ended += 1,
+                    BattleEvent::StatusTick { .. } => ticks += 1,
+                    _ => {}
+                }
+            }
+        }
+    }
+    assert!(inflicted > 0, "no status was ever inflicted in {runs} real fights");
+    println!("real fights with statuses: {runs} runs over {} stinging formations, {inflicted} inflicted ({} kinds), {ended} ended, {ticks} turns", sting_formations.len(), kinds.len());
 }
 
 /// The limit data of the owner's `kernel.bin`: the first limit of every character and what the engine

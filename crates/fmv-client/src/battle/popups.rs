@@ -18,9 +18,13 @@
 //! | `Heal { target, amount }` | [`PopupKind::Heal`] with `amount` |
 //! | `Revive { target, hp }` | [`PopupKind::Heal`] with `hp` (the HP it came back with) |
 //! | `MpRestored { target, amount }` | [`PopupKind::Mp`] with `amount` |
+//! | `StatusInflicted { target, status }` | [`PopupKind::Status`]: the status's name, over `target` |
+//! | `StatusTick { target, status: Poison, amount }` | [`PopupKind::Poison`] with `amount` |
+//! | `StatusTick { target, status: Regen, amount }` | [`PopupKind::Heal`] with `amount` |
 //!
 //! Everything else says nothing over a fighter: gauges filling, deaths and the end, an `Action` (its
-//! name goes to the banner, see `hud`) and `MpSpent` (the caster's own MP bar shows it).
+//! name goes to the banner, see `hud`), `MpSpent` (the caster's own MP bar shows it) and `StatusEnded` (the tag
+//! on the panel goes away).
 //!
 //! # When a number is born
 //!
@@ -38,6 +42,7 @@
 
 use super::scene::cue;
 use fmv_ff7_battle::rules::{ActorId, BattleEvent};
+use fmv_ff7_battle::status::Status;
 
 /// How long a popup stays, in seconds.
 pub const LIFETIME_S: f64 = 1.1;
@@ -53,14 +58,21 @@ pub enum PopupKind {
     /// MP restored (the engine's `MpRestored` event).
     Mp { amount: u32 },
     Miss,
+    /// A turn of Poison (the engine's `StatusTick`): HP lost, in the colour of the status.
+    Poison { amount: u32 },
+    /// A status the fighter now has (the engine's `StatusInflicted`): its name.
+    Status { status: Status },
 }
 
 impl PopupKind {
     /// The words on screen.
     pub fn text(self) -> String {
         match self {
-            PopupKind::Damage { amount, .. } | PopupKind::Heal { amount } | PopupKind::Mp { amount } => amount.to_string(),
+            PopupKind::Damage { amount, .. } | PopupKind::Heal { amount } | PopupKind::Mp { amount } | PopupKind::Poison { amount } => {
+                amount.to_string()
+            }
             PopupKind::Miss => "Miss".to_string(),
+            PopupKind::Status { status } => status.name().to_string(),
         }
     }
 }
@@ -83,6 +95,9 @@ pub fn popup_of(event: &BattleEvent) -> Option<(ActorId, PopupKind)> {
         BattleEvent::Heal { target, amount, .. } => Some((target, PopupKind::Heal { amount })),
         BattleEvent::Revive { target, hp, .. } => Some((target, PopupKind::Heal { amount: hp })),
         BattleEvent::MpRestored { target, amount, .. } => Some((target, PopupKind::Mp { amount })),
+        BattleEvent::StatusInflicted { target, status } => Some((target, PopupKind::Status { status })),
+        BattleEvent::StatusTick { target, status: Status::Poison, amount } => Some((target, PopupKind::Poison { amount })),
+        BattleEvent::StatusTick { target, amount, .. } => Some((target, PopupKind::Heal { amount })),
         // Gauges filling, deaths and the end say nothing over a fighter, nor does an action's start
         // (the banner has its name) or the MP it cost (the caster's bar shows it). Protocol v7: the limit
         // gauge has its own bar in the party panel, and a failed escape its words in the banner.
@@ -93,6 +108,7 @@ pub fn popup_of(event: &BattleEvent) -> Option<(ActorId, PopupKind)> {
         | BattleEvent::Action { .. }
         | BattleEvent::LimitGauge { .. }
         | BattleEvent::EscapeFailed { .. }
+        | BattleEvent::StatusEnded { .. }
         | BattleEvent::MpSpent { .. } => None,
     }
 }
@@ -223,6 +239,36 @@ mod tests {
         assert_eq!(popup_of(&BattleEvent::MpRestored { actor: a, target: t, amount: 4 }), Some((t, PopupKind::Mp { amount: 4 })));
         assert_eq!(popup_of(&BattleEvent::Action { actor: a, action: ActionRef::Defend }), None);
         assert_eq!(popup_of(&BattleEvent::MpSpent { actor: a, amount: 4 }), None);
+    }
+
+    #[test]
+    fn a_status_is_a_word_over_its_target_and_the_turns_of_poison_and_regen_are_numbers() {
+        use fmv_ff7_battle::status::Status;
+        let t = ActorId(2);
+        assert_eq!(popup_of(&BattleEvent::StatusInflicted { target: t, status: Status::Poison }), Some((t, PopupKind::Status { status: Status::Poison })));
+        assert_eq!(popup_of(&BattleEvent::StatusEnded { target: t, status: Status::Poison }), None, "the tag on the panel goes away, nothing floats");
+        assert_eq!(popup_of(&BattleEvent::StatusTick { target: t, status: Status::Poison, amount: 7 }), Some((t, PopupKind::Poison { amount: 7 })));
+        assert_eq!(popup_of(&BattleEvent::StatusTick { target: t, status: Status::Regen, amount: 20 }), Some((t, PopupKind::Heal { amount: 20 })));
+        assert_eq!(PopupKind::Status { status: Status::MBarrier }.text(), "MBarrier");
+        assert_eq!(PopupKind::Poison { amount: 7 }.text(), "7");
+        // A status an action inflicts comes up when that action lands; a turn of Poison at once; the start of a battle
+        // (no action) after the short beat of the effects nobody announced.
+        let mut p = Popups::default();
+        p.on_events(
+            3.0,
+            &[
+                BattleEvent::Action { actor: ActorId(0), action: ActionRef::Magic(11) },
+                BattleEvent::StatusInflicted { target: ActorId(3), status: Status::Sleep },
+                BattleEvent::StatusEnded { target: ActorId(1), status: Status::Poison },
+            ],
+        );
+        let landing = 3.0 + cue::impact_delay(Some(ActionRef::Magic(11)));
+        assert!(p.views(3.0).is_empty() && p.views(landing - 0.001).is_empty(), "not before the cast lands");
+        let up: Vec<(u8, PopupKind)> = p.views(landing).iter().map(|v| (v.target.0, v.kind)).collect();
+        assert_eq!(up, [(3, PopupKind::Status { status: Status::Sleep })], "the Sleep, and nothing for the Poison that ended");
+        let mut p = Popups::default();
+        p.on_events(5.0, &[BattleEvent::StatusTick { target: ActorId(0), status: Status::Poison, amount: 9 }]);
+        assert_eq!(p.views(5.0).iter().map(|v| v.kind).collect::<Vec<_>>(), [PopupKind::Poison { amount: 9 }], "at once");
     }
 
     #[test]

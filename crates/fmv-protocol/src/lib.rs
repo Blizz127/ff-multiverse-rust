@@ -106,6 +106,15 @@
 //! spell, an item or a limit is a [`Target`] since v10 (one actor or a whole side): see [`battle`], "Whole-side
 //! targeting".
 //!
+//! # Statuses (the version after 11)
+//!
+//! The engine plays Poison, Sleep, Haste and the other statuses of `fmv_ff7_battle::status`. The battle gains three
+//! events (`StatusInflicted`, `StatusEnded`, `StatusTick`), two refusals (`CannotAct` for a member that is asleep,
+//! stopped or paralysed, `Silenced` for a silenced member's spell) and one input: [`BattleMember::status`], the
+//! statuses a member starts with (absent from the JSON when empty, set only by the server's debug flag
+//! `--debug-status`). A v11 peer cannot decode the new events or refusals, so the version has to move with them: see
+//! [`battle`], "Statuses".
+//!
 //! # Area travel (v4)
 //!
 //! A server hosts many areas. The one in the handshake is the entry area; a player leaves it by
@@ -311,7 +320,8 @@ pub use reject::RejectCode;
 pub use battle::{
     assign_drops, reward_roster, split_rewards, ActionRef, ActorId, AppliedCommand, BattleBuildError, BattleId, BattleMember,
     BattleRejection, BattleReplay, BattleReward, BattleRules, BattleSetup, Controller, Divergence, Ff7BattleData,
-    Ff7BattleDataError, FormationInfo, ProgressLimits, SyntheticRules, Target, MAX_BATTLE_PARTY, PLAYER_LIMIT_BREAKS,
+    Ff7BattleDataError, FormationInfo, ProgressLimits, Status, StatusSet, SyntheticRules, Target, MAX_BATTLE_PARTY,
+    PLAYER_LIMIT_BREAKS,
 };
 
 /// The party types carried on the wire, re-exported so a client needs no direct `fmv-party`
@@ -1573,6 +1583,19 @@ mod tests {
                 battle::BattleEvent::Action { actor: a, action: battle::ActionRef::Escape },
                 r#"{"Action":{"actor":0,"action":"Escape"}}"#,
             ),
+            // The statuses: a status travels as its name.
+            (
+                battle::BattleEvent::StatusInflicted { target: t, status: Status::Poison },
+                r#"{"StatusInflicted":{"target":3,"status":"Poison"}}"#,
+            ),
+            (
+                battle::BattleEvent::StatusEnded { target: a, status: Status::MBarrier },
+                r#"{"StatusEnded":{"target":0,"status":"MBarrier"}}"#,
+            ),
+            (
+                battle::BattleEvent::StatusTick { target: a, status: Status::Regen, amount: 20 },
+                r#"{"StatusTick":{"target":0,"status":"Regen","amount":20}}"#,
+            ),
         ];
         for (event, expected) in events {
             golden(event, expected);
@@ -1624,6 +1647,9 @@ mod tests {
             (BattleRejection::NoLimit, r#""NoLimit""#),
             (BattleRejection::LimitNotReady, r#""LimitNotReady""#),
             (BattleRejection::CannotEscape, r#""CannotEscape""#),
+            // statuses
+            (BattleRejection::CannotAct, r#""CannotAct""#),
+            (BattleRejection::Silenced, r#""Silenced""#),
         ];
         for (reason, expected) in cases {
             golden(reason, expected);
@@ -2017,6 +2043,53 @@ mod tests {
         assert_eq!(decode::<Controller>(br#""Companion""#).unwrap(), Controller::Companion);
     }
 
+    /// Statuses (the version after 11): the member that starts with some says so (a bit mask, after the limit gauge),
+    /// one that starts with none is exactly what it was, and a v11 peer can read neither the events nor the refusals.
+    #[test]
+    fn golden_member_statuses_and_what_a_v11_peer_cannot_read() {
+        let poisoned = BattleMember {
+            status: StatusSet::from_bits(Status::Poison.bit() | Status::Haste.bit()),
+            ..BattleMember::companion("Cloud", 0, 7, 0)
+        };
+        golden(
+            poisoned.clone(),
+            r#"{"controller":"Companion","name":"Cloud","character":0,"level":7,"weapon":null,"armor":null,"limit":0,"status":264}"#,
+        );
+        // Without statuses there is no key, and a v11 member (no key) reads as a member with none.
+        let clean = BattleMember::companion("Cloud", 0, 7, 0);
+        golden(clean.clone(), r#"{"controller":"Companion","name":"Cloud","character":0,"level":7,"weapon":null,"armor":null,"limit":0}"#);
+        assert_eq!(clean.status, StatusSet::EMPTY);
+        // A v11 peer's member type has no `status` and ignores it (serde skips unknown fields), so the members are
+        // not what breaks it: the events and the refusals are, and the version moves with them.
+        #[derive(Debug, Deserialize)]
+        enum EventV11 {
+            #[allow(dead_code)]
+            GaugeReady { actor: ActorId },
+            #[allow(dead_code)]
+            Victory,
+        }
+        #[derive(Debug, Deserialize)]
+        enum RejectionV11 {
+            #[allow(dead_code)]
+            CannotEscape,
+        }
+        for event in [
+            battle::BattleEvent::StatusInflicted { target: ActorId(0), status: Status::Poison },
+            battle::BattleEvent::StatusEnded { target: ActorId(0), status: Status::Poison },
+            battle::BattleEvent::StatusTick { target: ActorId(0), status: Status::Poison, amount: 1 },
+        ] {
+            assert!(decode::<EventV11>(&encode(&event).unwrap()[4..]).is_err(), "{event:?}");
+        }
+        assert!(decode::<EventV11>(br#"{"GaugeReady":{"actor":0}}"#).is_ok(), "the stand-in decodes what it knows");
+        for reason in [BattleRejection::CannotAct, BattleRejection::Silenced] {
+            assert!(decode::<RejectionV11>(&encode(&reason).unwrap()[4..]).is_err(), "{reason:?}");
+        }
+        assert!(decode::<RejectionV11>(br#""CannotEscape""#).is_ok());
+        // A status that is not one of the 32 names is not read, and neither is a mask that is not a number.
+        assert!(decode::<battle::BattleEvent>(br#"{"StatusEnded":{"target":0,"status":"Nonsense"}}"#).is_err());
+        assert!(decode::<BattleMember>(br#"{"controller":"Companion","name":"x","character":0,"level":1,"weapon":null,"armor":null,"limit":0,"status":"Poison"}"#).is_err());
+    }
+
     /// No battle message can carry anything but ids, seeds, numbers and the engine's events: the
     /// fields of the largest one are all fixed-size numbers, flags, ids and a fingerprint.
     #[test]
@@ -2036,6 +2109,8 @@ mod tests {
                     weapon: Some(u8::MAX),
                     armor: Some(u8::MAX),
                     limit: u16::MAX,
+                    // Every bit of a status set: ten digits.
+                    status: StatusSet::from_bits(u32::MAX),
                 })
                 .collect(),
             preemptive: false,

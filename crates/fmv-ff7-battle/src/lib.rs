@@ -12,6 +12,7 @@
 //! | [`action`] | what an action is: the damage-calculation byte, formulas, spells, enemy attacks, elements, the item table |
 //! | [`limit`] | the limit gauge and each character's first limit break (Braver, Big Shot, ...) |
 //! | [`rules`] | the deterministic battle engine: ATB gauges, the commands (Attack, Magic, Item, Defend, Limit, Escape) on one target or a whole side, enemy turns and counters |
+//! | [`status`] | status effects (Poison, Sleep, Haste, Silence, ...): the 32 status bits, what a record's status fields mean, the clocks and durations (with their sources) |
 //! | [`ai`] | the enemies' real `scene.bin` AI scripts (Initialize, Main, counters): decoder and interpreter, with the plain behaviour as the fallback |
 //! | [`rng`] | the seeded PCG32 generator behind every roll |
 //! | [`text`] | FF7 text encoding |
@@ -111,6 +112,7 @@ pub mod limit;
 pub mod rng;
 pub mod rules;
 pub mod scene;
+pub mod status;
 pub mod text;
 
 #[cfg(test)]

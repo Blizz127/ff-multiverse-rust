@@ -77,7 +77,7 @@ pub fn impact_delay(action: Option<ActionRef>) -> f64 {
 /// How an event shows on screen.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Landing {
-    /// A blow (or a heal, or a revival, or MP coming back) lands on `target` at the impact.
+    /// A blow (or a heal, or a revival, or MP coming back, or a status) lands on `target` at the impact.
     Impact { target: ActorId },
     /// `actor` begins to die: after the blow that did it, [`DEATH_BEAT`] later.
     Death { actor: ActorId },
@@ -91,7 +91,11 @@ pub fn landing(event: &BattleEvent) -> Option<Landing> {
         | BattleEvent::Miss { target, .. }
         | BattleEvent::Heal { target, .. }
         | BattleEvent::Revive { target, .. }
-        | BattleEvent::MpRestored { target, .. } => Some(Landing::Impact { target }),
+        | BattleEvent::MpRestored { target, .. }
+        // A status an action inflicts or cures is the whole effect of a Sleep, a Haste or an Antidote: it lands with the
+        // action, so that its target is the action's and its word comes up when the cast does.
+        | BattleEvent::StatusInflicted { target, .. }
+        | BattleEvent::StatusEnded { target, .. } => Some(Landing::Impact { target }),
         BattleEvent::Death { actor } => Some(Landing::Death { actor }),
         BattleEvent::GaugeReady { .. }
         | BattleEvent::Victory
@@ -100,6 +104,8 @@ pub fn landing(event: &BattleEvent) -> Option<Landing> {
         // The gauge's bar is the overlay's; the stumble of a failed escape is the director's own.
         | BattleEvent::LimitGauge { .. }
         | BattleEvent::EscapeFailed { .. }
+        // A turn of Poison or Regen is the clock's, not an action's: its number comes up at once.
+        | BattleEvent::StatusTick { .. }
         | BattleEvent::MpSpent { .. } => None,
     }
 }
@@ -226,6 +232,26 @@ mod tests {
         }
         // A limit break is the longest show (the cap), an escape has nothing to wait for.
         assert_eq!((impact_delay(Some(ActionRef::Limit(128))), impact_delay(Some(ActionRef::Escape))), (MAX_IMPACT_DELAY, 0.0));
+    }
+
+    #[test]
+    fn a_status_lands_with_its_action_and_is_a_target_of_it_and_a_turn_of_poison_lands_at_once() {
+        use fmv_ff7_battle::status::Status;
+        let sleep = BattleEvent::StatusInflicted { target: T, status: Status::Sleep };
+        let cured = BattleEvent::StatusEnded { target: T, status: Status::Poison };
+        let tick = BattleEvent::StatusTick { target: T, status: Status::Poison, amount: 7 };
+        for e in [sleep, cured] {
+            assert_eq!(landing(&e), Some(Landing::Impact { target: T }), "{e:?}");
+            assert_eq!(delay_of(Some(ActionRef::Magic(11)), &e), impact_delay(Some(ActionRef::Magic(11))), "{e:?}");
+        }
+        assert_eq!((landing(&tick), delay_of(Some(ActionRef::Magic(11)), &tick)), (None, 0.0));
+        // A Sleep spell is one cue whose target is the one it put to sleep (it has no damage to say so), performed by its caster.
+        let spell = [action(0, ActionRef::Magic(11)), BattleEvent::MpSpent { actor: A, amount: 8 }, sleep];
+        let cue = &cues(&spell)[0];
+        assert_eq!((cue.targets(), cue.performer()), (vec![T], Some(A)));
+        // And a blow with a status on it (Bio) has its target once, not twice.
+        let bio = [action(0, ActionRef::Magic(39)), damage(0, 2), BattleEvent::StatusInflicted { target: T, status: Status::Poison }];
+        assert_eq!(cues(&bio)[0].targets(), vec![T]);
     }
 
     #[test]

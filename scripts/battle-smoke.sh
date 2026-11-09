@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/battle-smoke.sh - shared-battle smoke test for fmv-server + fmv-client (protocol v10).
 #
-# Usage: scripts/battle-smoke.sh [--fixture|--random|--progress|--commands|--solo] [--release|--debug]
+# Usage: scripts/battle-smoke.sh [--fixture|--random|--progress|--commands|--solo|--status] [--release|--debug]
 #                                [--bin-dir DIR] [--build] [--library STATE_DIR] [--duration SECS]
 #                                [--formation ID] [--tick-rate TPS] [--battle-speed N] [--seed N]
 #                                [--bot idle|circle] [--keep-logs] [-h|--help]
@@ -155,6 +155,27 @@
 #   * each bot's script line "entries=N applied=N skipped=N refused=N lost=N unused=N" adds up, and the
 #     default script B skipped exactly its one impossible entry.
 #
+# --status (real data): STATUS EFFECTS over real processes (the model is `fmv_ff7_battle::status`, its sources and numbers are
+# in the docs of that module). The first mission's enemies inflict no status and a real battle starts clean, so the server runs
+# with --debug-status poison,silence,haste (FMV_SMOKE_STATUSES changes the list; it needs --debug-encounters, and is refused for
+# a name a battle does not play or for Haste with Slow and Sadness with Fury): every member of the battle, the canon Cloud and
+# Barret and the two bots, STARTS with those statuses (they travel in the EncounterStart roster, so every replay starts from
+# them). The bots fight ONE battle of formation 12 following a --battle-script (magic:0 entries are Magic, which the engine
+# refuses while a character is silenced: the script skips them, counted). The mode FAILS unless:
+#   * both bots exit 0, entered the same single battle, replayed it from their own scene.bin/kernel.bin and matched
+#     ("verified by replay"), with 0 divergences and no refusal for a status (`CannotAct`, `Silenced`) from the server;
+#   * the server's "battle started" line says `statuses=[..]` with all four fighters starting with exactly the list, it warned
+#     about the flag at start-up, it logged `status inflicted battle=N actor=I status=S` once for every status of every
+#     fighter, and its "battle ended" line says status_inflicted=<4 x the list> and, with Poison, at least one turn of it
+#     (status_ticks);
+#   * each bot's roster notes (`battle: roster actor=I ... status=..`) carry the same statuses, each bot was told every one as a
+#     `battle: status: inflicted actor=I status=S` note, and its per-battle count (`battle: status: battle#N inflicted=A
+#     ended=B ticks=C`) is EXACTLY the server's (the events arrived whole);
+#   * with Silence, the server applied no `magic used` command and no canon companion cast (`companion acted ... command=magic`):
+#     the bots' Magic entries were skipped locally and the server's own rule falls back to Attack through the engine's check;
+#   * the flag is refused by the real binary without --debug-encounters and for `frog` and `haste,slow` (exit code 2).
+# The battle may be won or lost (Poison on the whole party is deadly): either is a fine outcome for what this checks.
+#
 # Isolation (the owner's state directory is never touched, only its LIBRARY is read): the server and
 # the clients run with XDG_DATA_HOME/XDG_STATE_HOME/XDG_CONFIG_HOME/XDG_CACHE_HOME and FMV_STATE_DIR
 # pointing into a throw-away directory, the server with --ephemeral, each client with its own
@@ -209,10 +230,19 @@ COMMANDS_DURATION=12
 SCRIPT_A="${FMV_SMOKE_SCRIPT_A:-magic:0:all,defend,item:0,magic:0}"
 SCRIPT_B="${FMV_SMOKE_SCRIPT_B:-magic:0,magic:9999,item:0,defend}"
 ESCAPE_SCRIPT="${FMV_SMOKE_ESCAPE_SCRIPT:-escape,escape,escape,escape,escape,escape}"
+# --status: the statuses every member starts the battle with (the server's --debug-status), the scripts of the two bots and
+# how long they run. Cure (spell 0) is a Magic command: while the bots are silenced the engine refuses it and the script
+# skips the entry. Overridable (FMV_SMOKE_STATUSES: comma-separated names of the statuses a battle plays).
+STATUS_LIST="${FMV_SMOKE_STATUSES:-poison,silence,haste}"
+STATUS_DURATION=14
+STATUS_SCRIPT_A="${FMV_SMOKE_STATUS_SCRIPT_A:-magic:0,defend,item:0,magic:0}"
+STATUS_SCRIPT_B="${FMV_SMOKE_STATUS_SCRIPT_B:-magic:0,item:0,defend}"
+STATUS_NAMES=()
+STATUS_COUNT=0
 
 usage() {
   cat <<'EOF'
-Usage: scripts/battle-smoke.sh [--fixture|--random|--progress|--commands|--solo] [--release|--debug]
+Usage: scripts/battle-smoke.sh [--fixture|--random|--progress|--commands|--solo|--status] [--release|--debug]
                                [--bin-dir DIR] [--build] [--library STATE_DIR] [--duration SECS]
                                [--formation ID] [--tick-rate TPS] [--battle-speed N] [--seed N]
                                [--bot idle|circle] [--keep-logs] [-h|--help]
@@ -239,6 +269,13 @@ be applied by the server at least once (the bots' own breakdown
 "(N attack, N magic, N item, N defend, N limit, N escape)" and the server's own log lines must agree)
 and every battle must be verified by replay with 0 divergences. The scripts can be overridden with
 FMV_SMOKE_SCRIPT_A, FMV_SMOKE_SCRIPT_B and FMV_SMOKE_ESCAPE_SCRIPT (see the header of this script).
+--status: status effects over real processes: the server runs with --debug-status (every member of the battle, the
+canon Cloud and Barret and the two bots, starts with Poison, Silence and Haste; FMV_SMOKE_STATUSES changes the list),
+the bots fight one battle with a --battle-script whose Magic entries are skipped while they are silenced, and the
+mode passes when the server announced every status (its `status inflicted` lines and its start and end lines), both
+bots' rosters and status notes say the same and their counts of the status events equal the server's, and both
+bots replayed the whole battle from their own data with 0 divergences; the flag must also be refused without
+--debug-encounters and for what a battle cannot start with.
 
   --library DIR     state directory that contains library/ (default $FMV_FF7_LIBRARY, else
                      ~/.local/share/ff-multiverse); only the library is read, never written
@@ -1627,6 +1664,264 @@ run_commands() {
   say "PASS: every battle command was applied by the real server for the real-data bots (${CMD_TOTAL[magic]} magic, ${CMD_TOTAL[item]} item, ${CMD_TOTAL[defend]} defend, ${CMD_TOTAL[escape]} escape; the server's own log lines match; players have no limit break, the canon companions gave $(count_lines_with "$WORK/server.log" "command=limit attack=") limit break(s) through the server's rule), the first battle was won and the second escaped from, and every battle, the companions' commands included, was replayed by each bot from its own battle data with 0 divergences; $state_real unchanged ($after)"
 }
 
+# statuses_of <server log line>: the entries of `statuses=[..]` of a "battle started" line (one per fighter in actor
+# order, the canon companions first; the statuses of one fighter joined by `+`, `-` for none), space separated (nothing if
+# the line has none).
+statuses_of() {
+  local line
+  line=$(strip_ansi "$1")
+  if [[ $line =~ statuses=\[([A-Za-z+,-]*)\] ]]; then
+    printf '%s' "${BASH_REMATCH[1]//,/ }"
+  fi
+}
+
+# check_status_phase <run>: the checks of the one run of both bots of --status (see the header): clean exit, one battle that
+# both entered, replayed from their own data and matched with 0 divergences, whose roster says the statuses every member
+# started with, whose status events they counted exactly as the server announced them, and (with Silence) a script whose
+# Magic entries were skipped.
+check_status_phase() {
+  local run="$1" n log smoke_line line id entry inflicted ended script_line s value
+  local -a ids=() roster=()
+  for n in "${CLIENT_NAMES[@]}"; do
+    log="$WORK/client-$n.$run.log"
+    if [[ ${CRC[$n]:-} == timeout ]]; then
+      problem "$run: client $n was still running ${CLIENT_GRACE}s after its duration and was killed"
+    elif [[ ${CRC[$n]:-} != 0 ]]; then
+      problem "$run: client $n exited with status ${CRC[$n]:-unknown}"
+    fi
+    if ! smoke_line=$(last_line_with "$log" "SMOKE name="); then
+      problem "$run: client $n printed no SMOKE line"
+      continue
+    fi
+    smoke_line=$(strip_ansi "$smoke_line")
+    SMOKE_LINES+=("$run client $n: $smoke_line")
+    for value in "party=2" "battles=1"; do
+      [[ $smoke_line == *" $value "* ]] || problem "$run: client $n: the SMOKE line lacks $value: $smoke_line"
+    done
+    [[ $(field "$smoke_line" fixture) == false ]] || problem "$run: client $n: fixture is not false: $smoke_line"
+    if log_has "$log" "DIVERGENCE"; then
+      problem "$run: client $n reported a BATTLE DIVERGENCE (its replay disagreed with the server)"
+    fi
+    # The bot REPLAYED the battle from its own scene.bin/kernel.bin and matched; the statuses are part of what it replayed.
+    check_mirror "$n ($run)" "$log" 1
+    ids+=("$(battle_id_of "$log" || true)")
+    # No refusal for a status (a command from a character that cannot act, a spell from a silenced one): the bots check with the
+    # engine first, so the server never has to say so. (Another refusal, such as a command resent after a slow answer, is not
+    # this mode's business.)
+    if log_has "$log" "request refused: that character cannot act" || log_has "$log" "request refused: that character is silenced"; then
+      problem "$run: client $n was refused for a status by the server: $(last_line_with "$log" "request refused: that character" || true)"
+    fi
+
+    # The roster it was told: every fighter starts with the statuses of the flag (the canon companions too).
+    roster=()
+    while IFS= read -r line || [[ -n $line ]]; do
+      [[ $line == *"battle: roster actor="* ]] || continue
+      line=$(strip_ansi "$line")
+      roster+=("$(field "$line" status)")
+    done <"$log"
+    if ((${#roster[@]} != 4)); then
+      problem "$run: client $n's roster has ${#roster[@]} fighter(s), expected 4 (the canon pair and the two players): ${roster[*]:-}"
+    fi
+    for entry in "${roster[@]}"; do
+      status_entry_ok "$entry" || problem "$run: client $n's roster says a fighter starts with '$entry', expected exactly $STATUS_LIST"
+    done
+
+    # The status events it was told, one note each way, and the count of the battle: what the server announced (below).
+    inflicted=$(count_lines_with "$log" "battle: status: inflicted actor=")
+    ended=$(count_lines_with "$log" "battle: status: ended actor=")
+    line=$(last_line_with "$log" "battle: status: battle#" || true)
+    line=$(strip_ansi "$line")
+    if [[ -z $line ]]; then
+      problem "$run: client $n printed no 'battle: status: battle#N inflicted=.. ended=.. ticks=..' count"
+    else
+      [[ $(field "$line" inflicted) == "$inflicted" && $(field "$line" ended) == "$ended" ]] || problem "$run: client $n's count disagrees with its own notes ($inflicted inflicted, $ended ended notes): $line"
+      CLIENT_STATUS_COUNTS[$n]="$(field "$line" inflicted) $(field "$line" ended) $(field "$line" ticks)"
+    fi
+    ((inflicted == 4 * STATUS_COUNT)) || problem "$run: client $n was told $inflicted status(es) inflicted, expected $((4 * STATUS_COUNT)) (every fighter starts with $STATUS_LIST)"
+
+    # With Silence the Magic entries of its script are skipped by the engine's own check ("entries=N applied=N skipped=N ...").
+    script_line=$(last_line_with "$log" "headless: battle script:" || true)
+    script_line=$(strip_ansi "$script_line")
+    if [[ -z $script_line ]]; then
+      problem "$run: client $n printed no 'headless: battle script:' line"
+    elif [[ ${STATUS_LIST,,} == *silence* ]]; then
+      s=$(field "$script_line" skipped)
+      [[ $s =~ ^[0-9]+$ ]] && ((s >= 1)) || problem "$run: client $n is silenced and its script skipped no Magic entry: $script_line"
+    fi
+  done
+  if [[ -z ${ids[0]:-} || ${ids[0]} != "${ids[1]:-}" ]]; then
+    problem "$run: the bots did not enter the same battle (A: '${ids[0]:-}', B: '${ids[1]:-}')"
+  fi
+  id=${ids[0]:-}
+  PROGRESS_SUMMARY+=("$run: both bots fought ${id:-?} with $STATUS_LIST on everybody")
+}
+
+# status_entry_ok <entry>: is <entry> (the statuses of one fighter, joined by `+`) exactly the statuses of $STATUS_LIST, in
+# any order and any case?
+status_entry_ok() {
+  local -a have=()
+  local name found have_name
+  IFS='+' read -r -a have <<<"${1,,}"
+  ((${#have[@]} == STATUS_COUNT)) || return 1
+  for name in "${STATUS_NAMES[@]}"; do
+    found=0
+    for have_name in "${have[@]}"; do
+      [[ ${have_name//[-_ ]/} == "${name//[-_ ]/}" ]] && found=1
+    done
+    ((found)) || return 1
+  done
+  return 0
+}
+
+# run_status (real data): STATUS EFFECTS over real processes. The first mission's enemies inflict no status and a real battle
+# starts clean, so the server runs with --debug-status (every member of the battle, the canon Cloud and Barret and the two
+# bots, STARTS with the statuses of $STATUS_LIST); ONE battle of formation 12 is fought by the two bots, which follow a
+# --battle-script (the Magic entries of which are skipped while they are silenced). The mode FAILS unless:
+#   * every bot exits 0 and entered exactly one battle, the same as the other bot, REPLAYED it from its own scene.bin and
+#     kernel.bin and matched ("verified by replay"), with 0 divergences and no refusal for a status by the server: the statuses are
+#     part of what the engine replayed, so a client that played them differently than the server diverges;
+#   * the server warned about the debug flag when it started, and its "battle started" line says `statuses=[..]` with
+#     every one of the four fighters starting with exactly those statuses;
+#   * the server logged `status inflicted battle=N actor=I status=S` once for every status of every fighter (4 x the
+#     number in the list), and its "battle ended" line says status_inflicted=<that>, and (with Poison) at least one
+#     turn of it (status_ticks);
+#   * every bot's roster note carries the same statuses for the four fighters, it was told every one of them as a
+#     `battle: status: inflicted actor=I status=S` note, and its per-battle count (`battle: status: battle#N
+#     inflicted=A ended=B ticks=C`) is EXACTLY the server's (the events travelled and arrived whole);
+#   * with Silence in the list, no `magic used` line (the bots' script entries were skipped locally) and no
+#     `companion acted ... command=magic` line (the server's rule falls back to Attack through the engine's own check);
+#   * the owner's state directory is unchanged (only the library is read).
+# The battle can be won or lost (Poison on the whole party is deadly): either is a fine result for what this checks.
+run_status() {
+  local state_real="$LIBRARY"
+  [[ -d $state_real/library/sets ]] || {
+    err "no library under $state_real (needs owned FF7 content imported with fmv-import); pass --library STATE_DIR"
+    exit 1
+  }
+  local before after
+  before=$(ls -A -- "$state_real" | sort | tr '\n' ' ')
+
+  mkdir -p -- "$WORK/lib-state" "$WORK/state-env" "$WORK/server-state" "$WORK/client-A" "$WORK/client-B"
+  ln -s -- "$(cd -- "$state_real" && pwd -P)/library" "$WORK/lib-state/library"
+  export FMV_STATE_DIR="$WORK/state-env"
+
+  local -a server_args=(--bind 127.0.0.1:0 --ff7-library "$WORK/lib-state" --state-dir "$WORK/server-state"
+    --debug-encounters --debug-status "$STATUS_LIST" --no-random-encounters --battle-speed "$BATTLE_SPEED" --battle-tick-rate "$TICK_RATE")
+  server_args+=(--debug-formation "$FORMATION")
+  if [[ -n $SEED ]]; then
+    server_args+=(--battle-seed "$SEED")
+  fi
+  say "starting server: $SERVER_BIN ${server_args[*]}"
+  "$SERVER_BIN" "${server_args[@]}" >"$WORK/server.log" 2>&1 &
+  SERVER_PID=$!
+  wait_ready "$WORK/server.log"
+  say "server READY: $READY_LINE"
+  [[ $(field "$READY_LINE" area) == Ff7/md1stin && $(field "$READY_LINE" fixture) == false ]] || fail "the server is not hosting the real FF7 field md1stin: $READY_LINE"
+
+  # The refusal half of the contract, over the real binary: the flag alone, and a name or a pair a battle cannot start with,
+  # are usage errors (exit code 2, no READY line); nothing of them touches a state directory.
+  local out rc=0
+  for out in "--debug-status poison" "--debug-encounters --debug-status frog" "--debug-encounters --debug-status haste,slow"; do
+    # shellcheck disable=SC2086
+    "$SERVER_BIN" --bind 127.0.0.1:0 --ephemeral $out >"$WORK/refused.out" 2>"$WORK/refused.err" </dev/null || rc=$?
+    [[ $rc == 2 ]] || problem "'fmv-server $out' exited with status $rc, expected the usage error 2: $(cat "$WORK/refused.err" 2>/dev/null | head -3)"
+    [[ ! -s $WORK/refused.out ]] || problem "'fmv-server $out' printed a READY line although it was refused"
+    rc=0
+  done
+
+  local duration=$BATTLE_DURATION
+  ((DURATION_SET)) || duration=$STATUS_DURATION
+  SMOKE_LINES=()
+  declare -gA CLIENT_STATUS_COUNTS=()
+  say "the battle: A --battle-script $STATUS_SCRIPT_A, B --battle-script $STATUS_SCRIPT_B, every fighter starting with $STATUS_LIST (${duration}s)"
+  start_script_bots status "$duration" "$STATUS_SCRIPT_A" "$STATUS_SCRIPT_B"
+  check_status_phase status
+
+  # The server's side.
+  local started ended entry value counts n name line
+  local -a entries=()
+  log_has "$WORK/server.log" "DEBUG: --debug-status " || problem "the server did not warn about --debug-status when it started"
+  (($(count_lines_with "$WORK/server.log" "battle started battle=") == 1)) || problem "the server started $(count_lines_with "$WORK/server.log" "battle started battle=") battle(s), expected 1"
+  started=$(strip_ansi "$(first_line_with "$WORK/server.log" "battle started battle=" || true)")
+  ended=$(strip_ansi "$(last_line_with "$WORK/server.log" "battle ended battle=" || true)")
+  if [[ -z $started ]]; then
+    problem "the server never logged a battle start"
+  else
+    [[ $started == *"members=2"* && $(companions_of "$started") == 2 ]] || problem "the battle did not have the canon pair and both bots: $started"
+    value=$(statuses_of "$started")
+    read -r -a entries <<<"$value"
+    ((${#entries[@]} == 4)) || problem "the server's start line has ${#entries[@]} 'statuses=[..]' entr(y/ies), expected 4: $started"
+    for entry in "${entries[@]}"; do
+      status_entry_ok "$entry" || problem "the server's start line says a fighter starts with '$entry', expected exactly $STATUS_LIST: $started"
+    done
+  fi
+  if [[ -z $ended ]]; then
+    problem "the server never logged the end of the battle"
+  else
+    [[ $(field "$ended" status_inflicted) == "$((4 * STATUS_COUNT))" ]] || problem "the server's end line says status_inflicted=$(field "$ended" status_inflicted), expected $((4 * STATUS_COUNT)): $ended"
+    value=$(field "$ended" status_ticks)
+    [[ $value =~ ^[0-9]+$ ]] || problem "the server's end line has no numeric status_ticks: $ended"
+    if [[ ${STATUS_LIST,,} == *poison* ]]; then
+      [[ $value =~ ^[0-9]+$ ]] && ((value >= 1)) || problem "with Poison on everybody the server saw no turn of it (status_ticks=$value): $ended"
+    fi
+    # The clients' own counts of the battle are the server's, exactly.
+    counts="$(field "$ended" status_inflicted) $(field "$ended" status_ended) $(field "$ended" status_ticks)"
+    for n in "${CLIENT_NAMES[@]}"; do
+      [[ ${CLIENT_STATUS_COUNTS[$n]:-} == "$counts" ]] || problem "client $n counted '${CLIENT_STATUS_COUNTS[$n]:-nothing}' (inflicted ended ticks) where the server announced '$counts'"
+    done
+  fi
+  value=$(count_lines_with "$WORK/server.log" "status inflicted battle=")
+  [[ $value == "$((4 * STATUS_COUNT))" ]] || problem "the server logged $value 'status inflicted' line(s), expected $((4 * STATUS_COUNT)) (4 fighters x $STATUS_COUNT statuses)"
+  # Each status of the list, once for each of the four fighters.
+  local -A per_status=()
+  local key
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line == *"status inflicted battle="* ]] || continue
+    line=$(strip_ansi "$line")
+    key=$(field "$line" status)
+    key=${key,,}
+    per_status[$key]=$((${per_status[$key]:-0} + 1))
+  done <"$WORK/server.log"
+  for name in "${STATUS_NAMES[@]}"; do
+    key=${name//[-_ ]/}
+    [[ ${per_status[$key]:-0} == 4 ]] || problem "the server logged ${per_status[$key]:-0} 'status inflicted ... status=$name' line(s), expected 4 (one per fighter)"
+  done
+  if [[ ${STATUS_LIST,,} == *silence* ]]; then
+    value=$(count_lines_with "$WORK/server.log" "magic used battle=")
+    [[ $value == 0 ]] || problem "the server applied $value Magic command(s) of the bots although they were silenced: $(last_line_with "$WORK/server.log" "magic used battle=")"
+    value=$(count_lines_with_both "$WORK/server.log" "companion acted battle=" "command=magic")
+    [[ $value == 0 ]] || problem "a silenced canon companion cast a spell ($value 'companion acted ... command=magic' line(s))"
+  fi
+  if log_has "$WORK/server.log" "was refused by the engine"; then
+    problem "the server's own rule gave a command the engine refused: $(last_line_with "$WORK/server.log" "was refused by the engine")"
+  fi
+
+  stop_server
+  after=$(ls -A -- "$state_real" | sort | tr '\n' ' ')
+  [[ $before == "$after" ]] || problem "the library state directory changed: before [$before], after [$after]"
+
+  if ((${#PROBLEMS[@]})); then
+    finish_failed
+  fi
+  for line in "${SMOKE_LINES[@]}"; do
+    say "$line"
+  done
+  for n in "${CLIENT_NAMES[@]}"; do
+    say "status client $n: $(last_line_with "$WORK/client-$n.status.log" "headless: battles:" || true)"
+    say "status client $n: $(last_line_with "$WORK/client-$n.status.log" "headless: battle script:" || true)"
+    say "status client $n: $(last_line_with "$WORK/client-$n.status.log" "battle: status: battle#" || true)"
+    say "status client $n: $(last_line_with "$WORK/client-$n.status.log" "battle: status: inflicted actor=" || true)"
+  done
+  for line in "${PROGRESS_SUMMARY[@]}"; do
+    say "$line"
+  done
+  say "server: $started"
+  say "server: $ended"
+  say "server: $(count_lines_with "$WORK/server.log" "status inflicted battle=") 'status inflicted' line(s), $(count_lines_with "$WORK/server.log" "status ended battle=") 'status ended' line(s), e.g. $(last_line_with "$WORK/server.log" "status inflicted battle=" || true)"
+  RESULT=pass
+  say "PASS: the statuses ($STATUS_LIST on the canon pair and both bots) were applied by the real server, announced to both bots and replayed by each from its own battle data with 0 divergences (the clients' counts of the status events equal the server's: $counts); the flag is refused without --debug-encounters and for what a battle cannot start with; $state_real unchanged ($after)"
+}
+
 run_fixture() {
   mkdir -p -- "$WORK/state-env" "$WORK/client-A"
   export FMV_STATE_DIR="$WORK/state-env"
@@ -1672,6 +1967,7 @@ main() {
       --progress) MODE=progress ;;
       --commands) MODE=commands ;;
       --solo) MODE=solo ;;
+      --status) MODE=status ;;
       --release) PROFILE=release ;;
       --debug) PROFILE=debug ;;
       --bin-dir)
@@ -1736,9 +2032,14 @@ main() {
   fi
   # The scripts of --commands go to `fmv-client --battle-script` as they are: words, ids, ':' and ','.
   local script
-  for script in "$SCRIPT_A" "$SCRIPT_B" "$ESCAPE_SCRIPT"; do
+  for script in "$SCRIPT_A" "$SCRIPT_B" "$ESCAPE_SCRIPT" "$STATUS_SCRIPT_A" "$STATUS_SCRIPT_B"; do
     [[ $script =~ ^[A-Za-z0-9:,]+$ ]] || usage_error "a smoke script is made of command words, ids, ':' and ',' (see fmv-client --help), got '$script'"
   done
+
+  # --debug-status takes the names of the statuses a battle plays, comma separated (the server validates them).
+  [[ $STATUS_LIST =~ ^[A-Za-z][-A-Za-z]*(,[A-Za-z][-A-Za-z]*)*$ ]] || usage_error "FMV_SMOKE_STATUSES is a comma-separated list of status names, got '$STATUS_LIST'"
+  IFS=',' read -r -a STATUS_NAMES <<<"${STATUS_LIST,,}"
+  STATUS_COUNT=${#STATUS_NAMES[@]}
 
   locate_binaries
 
@@ -1759,6 +2060,7 @@ main() {
     progress) run_progress ;;
     commands) run_commands ;;
     solo) run_solo ;;
+    status) run_status ;;
     *) run_real ;;
   esac
 }

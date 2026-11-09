@@ -26,7 +26,7 @@
 //!
 //! | address | field | note |
 //! |---|---|---|
-//! | `0x4000` (dword) | statuses | only Death (bit 0) can be set: the engine has no statuses |
+//! | `0x4000` (dword) | statuses | [`Combatant::statuses`] as the game's own status word (bit `n` is [`crate::status::Status`] number `n`): Death and Near-death (derived from HP) and the statuses the rules play ([`crate::status::MODELLED`]); the others are never set |
 //! | `0x4025`, `0x4026`, `0x402D` (bits) | defending, back row, dead | |
 //! | `0x402C` (bit) | "Immune to Death" | 0 for everyone but the owner of the script, which can set it (script-private, see [`super::vm::ADDR_IMMUNE_DEATH`]) |
 //! | `0x4040` | actor index | the slot |
@@ -34,6 +34,7 @@
 //! | `0x4060` | character id + `0x10` for a party member (by its name), the instance for an enemy | a party member that is not one of the nine characters has none |
 //! | `0x4068`, `0x4070`, `0x4078` (byte) | physical attack strength, magical attack strength, physical evasion | the stats the actor was built with (an enemy's strength, magic and evade; a party member's Strength + weapon, Magic and armor evade, cut to a byte); a script can write them for its own actor ([`super::vm::Effect`]) |
 //! | `0x4120` (word) | "Index of actor": the enemy's id in `scene.bin` | see below |
+//! | `0x4028`, `0x4029` (bits) | "Immune to physical damage", "Immune to magical damage" (<https://wiki.ffrtt.ru/index.php/FF7/Battle/Battle_Scenes/Battle_AI_Addresses>) | not modelled: they are damage immunities a script sets on its own actor, not the status immunities of the enemy record (those are [`Combatant::status_immune`] and no script can read them) |
 //! | `0x40A0`, `0x40A8` | Dexterity, Luck | |
 //! | `0x40D0`, `0x40E0`, `0x40F0` (word) | the slot mask of the last actor that acted on this one at all, physically, magically | an enemy's own record of who hit it ([`super::vm::Memory::note_hit`], set by the engine before the counters run); 0 for a party member and for nobody yet |
 //! | `0x4100`, `0x4110` (word) | physical and magical defense | a script can write them ([`super::vm::Effect`]) |
@@ -131,6 +132,8 @@ fn character_id(name: &str) -> Option<u8> {
 /// The values behind an actor's field image.
 #[derive(Debug, Clone, Copy, Default)]
 struct Fields {
+    /// The status word: Death, Near-death and the statuses the rules play ([`Combatant::statuses`]).
+    statuses: u32,
     dead: bool,
     defending: bool,
     back_row: bool,
@@ -174,6 +177,7 @@ fn clamp8(v: u32) -> u8 {
 impl Fields {
     fn of(c: &Combatant, slot: u8, id: Option<u8>) -> Self {
         Self {
+            statuses: c.statuses().bits(),
             dead: !c.is_alive(),
             defending: c.defending,
             back_row: c.row == Row::Back,
@@ -202,7 +206,7 @@ impl Fields {
     /// does not depend on them, except the id of an actor that has none).
     fn image(&self) -> Image {
         let mut img = Image::new(0x40);
-        img.put_le(0x00, 4, u32::from(self.dead));
+        img.put_le(0x00, 4, self.statuses);
         img.put_bits(0x04, 1 << 5, u8::from(self.defending) << 5);
         img.put_bits(0x04, 1 << 6, u8::from(self.back_row) << 6);
         img.put_bits(0x05, 1 << 5, u8::from(self.dead) << 5);
@@ -443,6 +447,8 @@ mod tests {
         }
         for (addr, size) in [
             (0x4021u16, 0u8), // "ally of current actor": not modelled
+            (0x4028, 0),      // "immune to physical damage": a script's own flag, not modelled
+            (0x4029, 0),      // "immune to magical damage": likewise
             (0x4020, 1),      // a whole flag byte: some of its bits are unknown
             (0x4090, 1),
             (0x4999, 2),

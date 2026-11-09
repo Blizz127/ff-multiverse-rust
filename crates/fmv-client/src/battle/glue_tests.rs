@@ -246,3 +246,97 @@ fn a_new_battle_wipes_the_lingering_one_and_its_numbers() {
     assert!(v.finale.is_none() && v.popups.is_empty(), "nothing of the last battle is left on screen");
     assert!(v.menu.is_some(), "and our gauge is full in this one too");
 }
+
+// --- statuses ---------------------------------------------------------------------------------------------------------
+
+use fmv_ff7_battle::status::{Status, StatusSet};
+
+/// A server whose one character starts the battle with `statuses`.
+fn sick_server(statuses: &[Status]) -> Server {
+    let mut server = Server::new();
+    server.setup.party[0].status = statuses.iter().copied().collect::<StatusSet>();
+    server.state = SyntheticRules::default().build(&server.setup).expect("a battle");
+    server
+}
+
+#[test]
+fn a_sleeper_holds_a_full_gauge_without_a_menu_and_the_client_says_so() {
+    let mut server = sick_server(&[Status::Sleep, Status::Poison]);
+    let mut c = started(&server, 1.0);
+    // The roster note says what the member starts with, and the view has it on the bar.
+    let notes = c.drain_notes();
+    assert!(notes.iter().any(|n| n.starts_with("roster actor=0") && n.ends_with("status=Sleep+Poison")), "{notes:?}");
+    let v = c.view(1.0).expect("a battle");
+    assert_eq!(v.party[0].status, [Status::Sleep, Status::Poison].into_iter().collect::<StatusSet>());
+    assert_eq!(v.enemies[0].status, StatusSet::EMPTY);
+    // The formation is preemptive: the gauge is full, and the character cannot use the turn.
+    assert_eq!(v.party[0].gauge, fmv_ff7_battle::rules::GAUGE_MAX);
+    assert!(!v.party[0].ready && v.menu.is_none(), "a sleeper is not waiting for a command");
+    assert_eq!(text::status_line(&v).0, "You are asleep");
+    assert!(c.title_suffix(1.0).contains("asleep"), "{}", c.title_suffix(1.0));
+    assert_eq!(c.menu_key(MenuKey::Confirm, 1.0), MenuReply::Ignored, "no menu, the key is not the menu's");
+    assert_eq!(c.attack_command(1.0), None, "nor does the bot try");
+    assert_eq!(c.bot_command(1.0), None);
+    // The engine's first message announces the statuses, the notes and the popups say so, and the count is per battle.
+    c.on_message(1.2, server.until_something_happens());
+    let notes = c.drain_notes();
+    assert!(notes.contains(&"status: inflicted actor=0 status=Poison".to_string()), "{notes:?}");
+    assert!(notes.contains(&"status: inflicted actor=0 status=Sleep".to_string()), "{notes:?}");
+    let landed = 1.2 + scene::cue::impact_delay(None);
+    let words: Vec<String> = c.view(landed).expect("a battle").popups.iter().map(|p| p.kind.text()).collect();
+    assert!(words.contains(&"Sleep".to_string()) && words.contains(&"Poison".to_string()), "{words:?}");
+    assert_eq!(c.divergences(), 0);
+}
+
+#[test]
+fn a_silenced_character_keeps_its_turn_and_loses_its_magic() {
+    let server = sick_server(&[Status::Silence]);
+    let mut c = started(&server, 1.0);
+    // Two Potions in the bag (item 0), so that the Item row has something to open.
+    c.on_inventory(1.0, vec![InventoryEntry::new(0, 2)]);
+    let v = c.view(1.0).expect("a battle");
+    assert!(v.party[0].ready, "silence does not hold a turn");
+    let menu = v.menu.expect("a menu");
+    let enabled: Vec<bool> = menu.commands.iter().map(|row| row.enabled).collect();
+    assert_eq!(enabled, [true, false, true, true, true], "only Magic is greyed out: {:?}", menu.commands);
+    assert_eq!(menu.commands[1].label, "Magic");
+    // Down to Magic: the hint says why, and Enter does nothing.
+    assert_eq!(c.menu_key(MenuKey::Down, 1.0), MenuReply::Handled);
+    assert_eq!(c.view(1.0).and_then(|v| v.menu).and_then(|m| m.hint), Some("Silenced: cannot cast"));
+    assert_eq!(c.menu_key(MenuKey::Confirm, 1.0), MenuReply::Refused("Silenced: cannot cast"));
+    // Item still opens.
+    assert_eq!(c.menu_key(MenuKey::Down, 1.0), MenuReply::Handled);
+    assert_eq!(c.menu_key(MenuKey::Confirm, 1.0), MenuReply::Handled);
+    assert_eq!(c.view(1.0).and_then(|v| v.menu).map(|m| m.level), Some(menu::Level::Items));
+}
+
+#[test]
+fn the_end_of_a_battle_says_how_many_statuses_it_had() {
+    let mut server = sick_server(&[Status::Poison, Status::Regen]);
+    let mut c = started(&server, 1.0);
+    c.drain_notes();
+    // The party fights on (Attack whenever its gauge is full) until the dummy is beaten, and the clock of Poison and
+    // Regen runs all the while.
+    let mut t = 1.0;
+    for _ in 0..4000 {
+        if server.state.outcome().is_some() {
+            break;
+        }
+        t += 0.1;
+        if server.state.ready_actors().contains(&ActorId(0)) {
+            c.on_message(t, server.attack());
+        } else {
+            c.on_message(t, server.until_something_happens());
+        }
+    }
+    assert!(server.state.outcome().is_some(), "the battle was never decided");
+    c.on_message(t + 1.0, server.end());
+    let notes = c.drain_notes();
+    let counts = notes.iter().find(|n| n.starts_with("status: battle#1 ")).unwrap_or_else(|| panic!("no count: {notes:?}"));
+    assert!(counts.contains("inflicted=2") && counts.contains("ended="), "{counts}");
+    assert!(counts.split("ticks=").nth(1).and_then(|s| s.trim().parse::<u64>().ok()).is_some(), "a number of turns: {counts}");
+    // The count line comes right before the end note.
+    let at = notes.iter().position(|n| n == counts).expect("it is there");
+    assert!(notes[at + 1].contains("ended in"), "{notes:?}");
+    assert_eq!(c.divergences(), 0, "{notes:?}");
+}
