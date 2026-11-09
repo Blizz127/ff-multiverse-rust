@@ -944,6 +944,16 @@ mod tests {
         assert_eq!(s.countdown.told(), 2);
     }
 
+    /// `CharacterDeleted` answers a delete request, which is made on a connection of its own and never by a joined session:
+    /// a server that sends it to one is broken, so the session ends (and the reason holds no text of the server).
+    #[test]
+    fn a_character_deleted_message_in_a_joined_session_ends_it_without_echoing_the_server() {
+        let mut s = state(at(0.0));
+        let reason = s.apply(1.0, ServerMsg::CharacterDeleted { name: "PWNED\u{1b}[2J".into() }).expect("the session ends");
+        assert!(reason.starts_with("protocol error:") && reason.contains("deleted character"), "{reason}");
+        assert!(!reason.contains("PWNED") && !reason.chars().any(char::is_control), "{reason}");
+    }
+
     #[test]
     fn untrusted_snapshots_are_filtered_and_bounded() {
         let mut s = ClientState::new(EntityId(1), AccountId(1), Pos::default(), plaza());

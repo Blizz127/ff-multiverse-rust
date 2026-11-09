@@ -165,17 +165,22 @@ async fn a_server_that_is_gone_before_the_request_is_a_connection_error() {
 /// deadline ends the wait. On tokio's paused clock, so it is exact and independent of the load of the machine.
 #[tokio::test(start_paused = true)]
 async fn a_server_that_never_answers_runs_into_the_deadline() {
+    let (client, peer) = duplex(64 * 1024);
+    let (mut crd, mut cwr) = split(client);
+    let (mut srd, swr) = split(peer);
     let started = Instant::now();
-    let (result, ()) = exchange(Duration::from_secs(3), |mut srd, swr| async move {
+    // The server reads the request and then holds the connection open, saying nothing (`swr` stays alive).
+    let server = tokio::spawn(async move {
         let _request: ClientMsg = read_msg(&mut srd).await.expect("a request");
-        tokio::time::sleep(Duration::from_secs(60)).await;
-        drop(swr);
-    })
-    .await;
-    assert!(matches!(result, Err(NetError::Timeout("CharacterDeleted"))), "{result:?}");
+        tokio::time::sleep(Duration::from_secs(600)).await;
+    });
+    let result = delete_character(&mut crd, &mut cwr, &token(), "test-build", Duration::from_secs(3)).await;
     let waited = started.elapsed();
+    assert!(matches!(result, Err(NetError::Timeout("CharacterDeleted"))), "{result:?}");
     assert!(waited >= Duration::from_secs(3) && waited < Duration::from_secs(10), "gave up after {waited:?}");
     assert!(result.unwrap_err().to_string().contains("timed out"));
+    server.abort();
+    drop(swr);
 }
 
 #[tokio::test]

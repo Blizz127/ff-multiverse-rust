@@ -58,7 +58,8 @@ ACCOUNTS:
   percent-encoded like the name= of the smoke line below), with exit code 0. On a failure (the server cannot be reached,
   it refuses, the saved login cannot be removed) the error is on stderr, the saved login is kept and the exit code is
   1; when no login is saved for NAME the exit code is 2 and nothing is sent. It cannot be combined with --name,
-  --register, --headless, --fullscreen, --game, the --ff7-* flags, --tint, --body or --slot.
+  --register, --headless, --fullscreen, --game, the --ff7-* flags, --tint, --body, --slot or the flags of a
+  headless bot; only --server, --state-dir and --mute go with it.
   Your account has ONE original character that travels across games: a name, a colour and a body
   (its identity), how the game draws it and, in FF7, a fighting style: the stat curve (stats, spells and
   level curve) of one of the game's characters other than Cloud, the gunner's, say. Your character is
@@ -324,12 +325,7 @@ pub struct Args {
     /// the server says the character is gone (or never knew the login). One line on stdout on success
     /// (`deleted character name=<n>` or `character already gone on the server name=<n>`), exit code 1 on a failure
     /// (the login is kept) and 2 when no login is saved for NAME. See ACCOUNTS below.
-    #[arg(
-        long,
-        value_name = "NAME",
-        value_parser = parse_name,
-        conflicts_with_all = ["name", "register", "headless", "fullscreen", "game", "ff7_library", "ff7_set", "ff7_flevel", "tint", "body", "slot"]
-    )]
+    #[arg(long, value_name = "NAME", value_parser = parse_name, conflicts_with_all = DELETE_CONFLICTS)]
     pub delete: Option<String>,
 
     /// Where this client keeps its state, the saved account tokens (in `accounts/`). Default:
@@ -509,6 +505,46 @@ pub struct Args {
 
 /// Default server for `--server`. Kept in sync with `DEFAULT_DEV_PORT` by a unit test.
 const DEFAULT_SERVER: &str = "127.0.0.1:47770";
+
+/// What `--delete NAME` cannot be combined with: every flag but `--server`, `--state-dir` (where the saved logins are)
+/// and `--mute` (which a script may pass to every run). A delete names its character itself, opens no window, reads no
+/// game files and runs no bot; the bot's flags need `--headless`, a requirement clap waives next to an argument that
+/// conflicts with it, so they have to be named here or they would be accepted and ignored. A unit test checks that every
+/// flag of [`Args`] is either here or one of those three, so a flag added later has to be decided about.
+const DELETE_CONFLICTS: [&str; 28] = [
+    // who it is
+    "name",
+    "register",
+    "tint",
+    "body",
+    "slot",
+    // a window
+    "headless",
+    "fullscreen",
+    // game files
+    "game",
+    "ff7_library",
+    "ff7_set",
+    "ff7_flevel",
+    "ff7_edition",
+    "ff7_region",
+    "ff7_language",
+    "ff7_revision",
+    // a bot
+    "bot",
+    "duration",
+    "party_invite_first_peer",
+    "party_accept",
+    "battle_auto",
+    "battle_script",
+    "debug_encounters",
+    "battle_wait_party",
+    "travel",
+    "travel_follow",
+    "story_advance",
+    "party_accept_after_split",
+    "talk",
+];
 
 impl Args {
     /// The tint to send in `Hello`: the explicit `--tint`, or one derived from `name`. (Only a
@@ -964,10 +1000,47 @@ mod tests {
             let args = ["fmv-client", "--delete", "Cloud"].into_iter().chain(extra.iter().copied());
             assert!(Args::try_parse_from(args).is_err(), "--delete cannot go with {extra:?}");
         }
-        // The flags of the bot need a headless run, which a delete is not.
-        assert!(Args::try_parse_from(["fmv-client", "--delete", "Cloud", "--bot", "idle"]).is_err());
+        // The flags of the bot need a headless run, which a delete is not: clap waives that requirement next to a conflicting
+        // argument, so they are named in the conflicts of --delete too (or they would be accepted and ignored).
+        for extra in [
+            &["--bot", "idle"][..],
+            &["--duration", "3"],
+            &["--party-invite-first-peer"],
+            &["--party-accept"],
+            &["--battle-auto"],
+            &["--battle-script", "attack"],
+            &["--debug-encounters"],
+            &["--travel", "md1_1"],
+            &["--story-advance"],
+            &["--talk", "gu0"],
+            &["--ff7-edition", "x"],
+        ] {
+            let args = ["fmv-client", "--delete", "Cloud"].into_iter().chain(extra.iter().copied());
+            assert!(Args::try_parse_from(args).is_err(), "--delete cannot go with {extra:?}");
+        }
         // Sound has nothing to do with it either way: it is accepted (and ignored), so a script can pass its usual flags.
         assert!(Args::try_parse_from(["fmv-client", "--delete", "Cloud", "--mute"]).is_ok());
+    }
+
+    /// Every flag of the client has been decided about for `--delete`: it conflicts with it, or it is one of the three that
+    /// a delete uses or ignores. A flag added later without a decision fails here instead of being silently ignored.
+    #[test]
+    fn every_flag_is_either_a_conflict_of_delete_or_one_a_delete_uses() {
+        use clap::CommandFactory;
+        let command = Args::command();
+        let ids: Vec<&str> = command.get_arguments().map(|a| a.get_id().as_str()).collect();
+        let allowed = ["server", "state_dir", "mute", "delete", "help", "version"];
+        for id in &ids {
+            assert!(allowed.contains(id) || DELETE_CONFLICTS.contains(id), "--{id} has no decision for --delete: add it to DELETE_CONFLICTS (or to this test's allowed list)");
+        }
+        for id in DELETE_CONFLICTS {
+            assert!(ids.contains(&id), "DELETE_CONFLICTS names `{id}`, which is not an argument");
+        }
+        // The three a delete uses (or ignores) really are accepted next to it.
+        for extra in [["--server", "10.0.0.9:1"].as_slice(), &["--state-dir", "/tmp/s"], &["--mute"]] {
+            let args = ["fmv-client", "--delete", "Cloud"].into_iter().chain(extra.iter().copied());
+            assert!(Args::try_parse_from(args).is_ok(), "--delete can go with {extra:?}");
+        }
     }
 
     #[test]

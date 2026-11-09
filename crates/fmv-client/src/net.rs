@@ -1163,6 +1163,24 @@ mod tests {
         }
     }
 
+    /// `CharacterDeleted` answers a `DeleteCharacter`, which is made on a connection of its own (see `crate::delete`) and never
+    /// by this handshake: a server that answers a `Hello` with it is broken, and the error echoes nothing of the server.
+    #[tokio::test]
+    async fn a_character_deleted_answer_to_a_hello_is_a_protocol_error() {
+        let adapter = FixtureAdapter::new();
+        let (client, server) = duplex(64 * 1024);
+        let (mut crd, mut cwr) = split(client);
+        let (mut srd, mut swr) = split(server);
+        let server_task = tokio::spawn(async move {
+            let _hello: ClientMsg = read_msg(&mut srd).await.unwrap();
+            write_msg(&mut swr, &ServerMsg::CharacterDeleted { name: "PWNED".into() }).await.unwrap();
+        });
+        let err = handshake(&mut crd, &mut cwr, &cfg(), &adapter, Duration::from_secs(5)).await.err().expect("must fail");
+        server_task.await.unwrap();
+        assert!(matches!(&err, NetError::Protocol(why) if why.contains("CharacterDeleted")), "{err}");
+        assert_printable_and_short(&err.to_string());
+    }
+
     #[test]
     fn content_check_reasons_are_concrete() {
         let adapter = FixtureAdapter::new();
