@@ -409,3 +409,75 @@ fn the_proof_scene_writes_nothing_the_story_carries_and_a_scene_that_does_report
     assert!(!out.writes.apply_to(&mut later) && later.moment == 96, "a story never goes back");
     eprintln!("the leaving scene: {} windows, ends {:?}, writes {:?}, unknown {:?}", out.windows, out.end, out.writes.moment, out.stats.unknown);
 }
+
+// ---- robustness: every script of the game ------------------------------------------------------
+
+/// Run the VM on EVERY script slot of EVERY field of the game as if it were a scene's root: none may panic or run past its
+/// budget, and what the VM does not know is counted by mnemonic (the survey of what a later scene would need).
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn the_vm_ends_every_script_of_the_game_within_its_budget_and_counts_what_it_does_not_know() {
+    use fmv_ff7::script::scene::{Limits, SceneVars, Vm};
+    use std::collections::BTreeMap;
+    let Some(dir) = data_dir() else {
+        eprintln!("FMV_FF7_DATA is not set; skipping");
+        return;
+    };
+    let mut lgp = LgpArchive::open_path(flevel_path(&dir)).unwrap();
+    let entries: Vec<(usize, String)> =
+        lgp.list().iter().enumerate().filter(|(_, e)| script_common::is_field_name(&e.name)).map(|(i, e)| (i, e.name.clone())).collect();
+    let limits = Limits { steps: 4_000, windows: 16, threads: 16, frames: 1_800 };
+    let (mut fields, mut runs, mut windows) = (0usize, 0usize, 0usize);
+    let mut ends: BTreeMap<String, usize> = BTreeMap::new();
+    let mut unknown: BTreeMap<&'static str, u32> = BTreeMap::new();
+    let mut ignored: BTreeMap<&'static str, u32> = BTreeMap::new();
+    for (index, _name) in &entries {
+        let Ok(stored) = lgp.read_index(*index) else { continue };
+        let Ok(bytes) = fmv_ff7::lzss::decompress(&stored) else { continue };
+        let Ok(field) = FieldFile::parse(bytes) else { continue };
+        let Ok(script) = FieldScript::from_field(&field) else { continue };
+        fields += 1;
+        for entity in 0..script.entity_count() {
+            for slot in 1..fmv_ff7::script::SCRIPTS_PER_ENTITY {
+                if script.span(entity, slot).is_none() {
+                    continue;
+                }
+                let (Ok(e), Ok(s)) = (u8::try_from(entity), u8::try_from(slot)) else { continue };
+                let mut vm = Vm::new(SceneVars::new(StoryState::new_game(), &[]), 1, limits);
+                vm.begin(vec![Step::Start(ScriptRef::new(e, s))]);
+                runs += 1;
+                let mut resumes = 0;
+                let end = loop {
+                    let beat = vm.resume(&script, None);
+                    resumes += 1;
+                    assert!(resumes <= 200, "a scene that never ends: {_name} entity {entity} slot {slot}");
+                    match beat.then {
+                        Then::End { how, .. } => break how,
+                        Then::Window(_) => windows += 1,
+                    }
+                };
+                let key = match end {
+                    End::Finished => "Finished",
+                    End::Budget => "Budget",
+                    End::Broken => "Broken",
+                    End::MapJump { .. } => "MapJump",
+                    End::Battle => "Battle",
+                    End::MiniGame => "MiniGame",
+                    End::GameOver => "GameOver",
+                };
+                *ends.entry(key.to_string()).or_default() += 1;
+                for (op, n) in &vm.stats().unknown {
+                    *unknown.entry(op).or_default() += n;
+                }
+                for (op, n) in &vm.stats().ignored {
+                    *ignored.entry(op).or_default() += n;
+                }
+            }
+        }
+    }
+    eprintln!("{fields} fields, {runs} scripts run as a scene root, {windows} windows handed out; ends: {ends:?}");
+    eprintln!("unknown opcodes (count over all runs): {unknown:?}");
+    eprintln!("skipped as known to change nothing a scene shows: {} distinct opcodes", ignored.len());
+    assert!(fields >= 700 && runs > 20_000, "{fields} fields, {runs} runs");
+    assert_eq!(ends.values().sum::<usize>(), runs, "every run ended");
+}
