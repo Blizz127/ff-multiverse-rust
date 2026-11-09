@@ -835,7 +835,7 @@ impl Gpu {
         if let Some(location) = &frame.location {
             self.avatars.draw_models(target, size, &frame.camera, location, false);
         }
-        self.avatars.draw_models_tinted(target, size, &frame.camera, &frame.models, &frame.tints, false);
+        self.avatars.draw_models_tinted(target, size, &frame.camera, &frame.models, &frame.tints, &frame.identities, false);
     }
 }
 

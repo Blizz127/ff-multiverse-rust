@@ -19,7 +19,8 @@
 #      name gets a -prebuilt suffix and manifest.json gets "build_mode": "prebuilt",
 #      because the commit, rustc and target fields then describe the packaging host and
 #      checkout, not necessarily how the binaries were made. Real releases use the default.
-#   2. Stage ONLY the allowlist (ALLOWLIST below): the three binaries, the launcher entry
+#   2. Stage ONLY the allowlist (ALLOWLIST below): the three binaries (and fmv-characters, the
+#      admin tool that fmv-server's package builds as well), the launcher entry
 #      point ff-multiverse.sh (scripts/ff-multiverse.sh, which must pass `bash -n`),
 #      README.md, a generated LICENSE-NOTICE.txt and a generated manifest.json.
 #   3. Guard: fail if anything staged is not on the allowlist, is not a plain file, or
@@ -64,8 +65,12 @@ PRODUCT="ff-multiverse"
 PLATFORM="linux-x86_64"
 # Cargo packages to release; each builds a binary of the same name.
 PACKAGES=(fmv-server fmv-client fmv-import)
+# Binaries that one of the packages above builds besides its own (so `cargo build -p` of them builds these too) and
+# that ship as well: fmv-characters, the offline admin tool for a stopped server's player characters (a second binary
+# of fmv-server, which needs the server's game rules).
+EXTRA_BINARIES=(fmv-characters)
 # The ONLY names allowed in a package (flat: no subdirectories, no symlinks).
-ALLOWLIST=(fmv-server fmv-client fmv-import ff-multiverse.sh README.md LICENSE-NOTICE.txt manifest.json)
+ALLOWLIST=(fmv-server fmv-client fmv-import fmv-characters ff-multiverse.sh README.md LICENSE-NOTICE.txt manifest.json)
 # Owned-data lookalikes, lower case. Matched against the lower-cased basename and
 # reported with a clearer message than "not in the allowlist". There are no exceptions:
 # no *.bin file may ever ship.
@@ -82,7 +87,8 @@ usage() {
 Usage: scripts/package.sh [--skip-build [--bin-dir DIR]] [-h|--help]
 
 Builds release binaries for fmv-server, fmv-client and fmv-import, stages an explicit
-allowlist (the three binaries, the launcher entry point ff-multiverse.sh, README.md, a
+allowlist (the three binaries and fmv-characters, the admin tool that fmv-server's package
+builds as well, the launcher entry point ff-multiverse.sh, README.md, a
 LICENSE-NOTICE.txt and a manifest.json) into
 dist/ff-multiverse-<version>-<gitshort>-linux-x86_64/, verifies that no owned game data is
 present, and writes a .tar.gz, a sidecar manifest and dist/SHA256SUMS under dist/.
@@ -91,8 +97,8 @@ script for details.
 
   --skip-build     do not compile; package binaries that already exist. The package is
                    marked -prebuilt (name) and "build_mode": "prebuilt" (manifest).
-  --bin-dir DIR    with --skip-build: directory holding fmv-server, fmv-client and
-                   fmv-import (default: <cargo target dir>/release).
+  --bin-dir DIR    with --skip-build: directory holding fmv-server, fmv-client,
+                   fmv-import and fmv-characters (default: <cargo target dir>/release).
 
 Environment: CARGO_TARGET_DIR (optional), SOURCE_DATE_EPOCH (optional, reproducible
 timestamps), FMV_SKIP_BUILD=1 (same as --skip-build).
@@ -395,7 +401,7 @@ main() {
     log "cargo build --release --offline --locked ${pkg_args[*]}"
     cargo build --release --offline --locked "${pkg_args[@]}" >&2 || die "cargo build failed"
   fi
-  for pkg in "${PACKAGES[@]}"; do
+  for pkg in "${PACKAGES[@]}" "${EXTRA_BINARIES[@]}"; do
     [[ -f $bin_src_dir/$pkg && -x $bin_src_dir/$pkg ]] ||
       die "expected executable not found: $bin_src_dir/$pkg"
   done
@@ -439,7 +445,7 @@ main() {
   mkdir -p -- "$dist_dir"
   prepare_stage "$stage_dir"
 
-  for pkg in "${PACKAGES[@]}"; do
+  for pkg in "${PACKAGES[@]}" "${EXTRA_BINARIES[@]}"; do
     cp -- "$bin_src_dir/$pkg" "$stage_dir/$pkg"
     chmod 0755 -- "$stage_dir/$pkg"
   done
@@ -475,7 +481,7 @@ EOF
 
   # --- manifest (in archive) -------------------------------------------------
   local binaries_json='{}' files_json='{}' allow_json file sha size
-  for file in "${PACKAGES[@]}"; do
+  for file in "${PACKAGES[@]}" "${EXTRA_BINARIES[@]}"; do
     sha=$(sha256_of "$stage_dir/$file")
     size=$(size_of "$stage_dir/$file")
     binaries_json=$(jq -c --arg k "$file" --arg sha "$sha" --argjson bytes "$size" \
