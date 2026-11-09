@@ -486,6 +486,18 @@ run_chain() {
   else
     [[ $value == 0 ]] || problem "a player left elevtr1 for nmkin_1 ($value moves): it crossed the lift's line before the leader had ridden"
   fi
+  # A member that comes to the lift only after its leader's finale (some seconds behind: the story is at 33 by then, where the
+  # lift leads to the second reactor) is taken through the exit the leader took (`player follows its leader's way out`). How
+  # often that happens depends on how far behind the member is, so it is only reported; where it happens it must be the leader's
+  # way up and never anywhere else (no `smkin_*` appears in any move: the two moves per player above are the whole story).
+  value=$(count_lines_with "$WORK/server.log" "player follows its leader's way out")
+  if ((value > 0)); then
+    say "server: the member followed its leader's way out of the lift $value time(s), the story having moved on: $(strip_ansi "$(last_line_with "$WORK/server.log" "player follows its leader's way out" || true)")"
+    [[ $(count_lines_with "$WORK/server.log" "area=elevtr1 follows=nmkin_1 story_says=") == "$value" ]] ||
+      problem "a member followed its leader's way out somewhere that is not the lift's way up: $(last_line_with "$WORK/server.log" "player follows its leader's way out" || true)"
+  fi
+  value=$(count_lines_with "$WORK/server.log" "smkin")
+  [[ $value == 0 ]] || problem "the server mentions smkin ($value lines): somebody was sent, or offered a way, into the second reactor: $(last_line_with "$WORK/server.log" "smkin" || true)"
   # The Guard Scorpion: nmkin_5's triangle started the scripted fight (formation 324, one enemy) for the party, the canon pair
   # and both bots at the pinned level, and the story step came after the win. Every bot played the whole battle from its own
   # data and matched the server (0 divergences, every battle verified by replay).

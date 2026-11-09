@@ -488,11 +488,25 @@ it sits under); the adapter reports them (in the reviewed fields, see below) aft
 story, which of them is open (`AreaRuntime::exit_state`). Several can share one line: the lift of the first
 reactor (`elevtr1`) has no gateway and four exits on one line, picked by a bit of `Var[1][225]` and by
 `Var[2][0] < 33`, so the way down to `nmkin_2` is open only after the ride and the later story's `smkin_*` stay
-closed because their conditions say so. The server judges them against **the story of the account that governs
+closed because their conditions say so. **A script exit of a served field that leads to a field that is not reviewed is
+closed whatever the story says** (from moment 33 the lift's data says `smkin_1` / `smkin_2` are open; no server offers
+them until those fields are reviewed: `Ff7Adapter::load_field` closes them, the survey's loader shows what the data
+holds). Gateways keep their behaviour (`nrthmk` to `md8_4` is how a party reaches the end of the reviewed slice on
+purpose). The server judges them against **the story of the account that governs
 the crossing player's instance** (its own, solo; the leader's, for a party member), takes the first exit that
 is open, and walks a player over a line whose exits are all closed. An exit whose condition the model cannot judge
 (a variable the progression does not carry, a key to press, the party) stays closed and the server says so once per
 area (`exit closed: its conditions cannot be judged ...`). Rules and numbers: `crates/fmv-ff7/src/exit_gate.rs`.
+**A member follows its leader's way out.** A member is judged on its leader's story, and that moves while the member is
+still on its way: the leader's finale in `nrthmk` takes the story from 27 to 33 and a member that comes to the lift a few
+seconds later would be judged on moment 33 (found by `travel-smoke.sh --escape` with the member 18 s behind: it was sent
+to `smkin_2`). So when a party's leader leaves an area through an exit its story decided, the world remembers which
+(`crates/fmv-server/src/world/follow.rs`: per leader, the last 8 areas), and a member of that party that crosses the same
+line in the same area takes THAT exit, once, whatever the story now says (the server logs `player follows its leader's
+way out ... story_says=<where the story would have sent it>` when that differs). It is not a story step and changes
+nobody's progression. The way is forgotten when the leader comes to stand in that area again, when its next way out of the
+area replaces it, when the party's leader changes or the party is disbanded, and with the leader leaving the world; it
+never applies to a player outside the party it was made for.
 
 **The OK button, ladders and jumps (protocol v14, `ClientMsg::Interact`).** The server sees where a player walks, and
 since `Interact` it sees the OK button too (Enter or Space in the window, one message per press, with the character the
@@ -586,7 +600,12 @@ party can do of it. Everything below is pinned against the real data in `crates/
   not change with the moment, so she stays on the field after she is freed). A bot that also travels (`--story-advance --travel`) pursues a story step that OPENS the exit its route
   goes to (the ride back, which is not a step forward) and never one that would CLOSE it (the ride down, forward again once
   the lift is up), so the lift is ridden once each way and never flaps (`StoryBot::set_wanted_exit`). The way out of the reactor is the
-  gateway from `nmkin_1` to `nrthmk`.
+  gateway from `nmkin_1` to `nrthmk`. **A member that is behind its leader at the lift still goes up:** the finale moves the
+  party's story to 33 as soon as the leader stands in `nrthmk`, and from 33 the lift of `elevtr1` leads to the second reactor
+  (closed here, nobody has reviewed it), so a member that comes to the lift after that takes the exit its leader took
+  (nmkin_1) instead of the one its party's story now says (see "A member follows its leader's way out" above; the real-data
+  test `on_the_real_lift_a_member_that_comes_after_the_leaders_finale_still_rides_to_nmkin_1` in `follow/real_tests.rs`
+  reproduces the order on the owned data, and `travel-smoke.sh --escape` reports the times it happened in a live run).
 * **The finale (27 to 33).** In `nrthmk` the loop of a nameless entity runs, whenever the moment is 27 or more and bit 7 of the
   reactor byte is clear, the cutscene scripts of the field's director: the explosion's movie, moment 33, the lift bit on, and
   a jump to `md8_4`. The adapter reads it the way it reads any script a main loop requests (the unguarded writes of the
@@ -606,10 +625,14 @@ party can do of it. Everything below is pinned against the real data in `crates/
   cleared, never time-up, 0 battle divergences), then restarts the server, logs the leader in again at the saved 33 and
   walks `md1stin` to `md8_4` by the gateways with nothing firing again. Nobody is stranded at the new moments
   (`chain_real.rs`: from every place a player arrives in a reviewed field, walking and the links reach an open exit at
-  27 and 33 with the lift up and down).
+  27 and 33 with the lift up and down), except on the lift itself at 33 (see "Not done").
 * **Not done:** the places the reactor's characters stand and the doors they open by the other bits of the reactor byte at 27
   (the characters on the way out in `nmkin_3` and `nmkin_1`: the server's walkmesh has no locks and its cast does not change
-  with the moment), the movie, and `md8_4` and `md8_1`.
+  with the moment), the movie, and `md8_4` and `md8_1`. **One dead end:** the lift of `elevtr1` at moment 33 and later leads
+  nowhere a server offers (its way on is the second reactor's, not reviewed; its way back is the first mission's, closed by
+  the story from 33). The story never takes a party there; only a party that walks back into the reactor after the finale
+  stands on it (a member that is behind its leader is taken through by the leader's way out, above). Reconnecting puts a
+  player in `md1stin` again; reviewing `smkin_1` and `smkin_2` opens the lift's way on.
 
 Story phasing: every account has one story progression per game (the opaque `Progression` blob; an
 account that never advanced has none, which is a new account) and the world keeps one instance of a
@@ -1124,7 +1147,7 @@ together. The story record keeps its v2 shape, so a v13 server can read what v14
 links or scripted battle, and how its exits judge a moment past 13 was never tested: once a player has gone past moment
 13, prefer rolling forward to rolling back.
 
-**The countdown message (added after v14; the version is bumped at integration)** adds one server message,
+**Protocol v15 (the countdown message)** adds one server message,
 `ServerMsg::Countdown { state }`, with `CountdownState::Running { remaining_ms, total_ms }` and
 `CountdownState::Over { reason: CountdownEnd::TimeUp | Cleared }` (see "After the Guard Scorpion"): sent when the step that
 won the Guard Scorpion starts the bomb's countdown, to a player that joins or leaves the party that has one, and when it
