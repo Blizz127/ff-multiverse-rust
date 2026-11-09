@@ -813,6 +813,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fmv-mods"
+version = "0.1.0"
+dependencies = [
+ "fmv-ff7",
+ "fmv-mods",
+ "tempfile",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "fmv-party"
 version = "0.1.0"
 dependencies = [
