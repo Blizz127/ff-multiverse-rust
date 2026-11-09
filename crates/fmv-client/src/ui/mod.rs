@@ -12,7 +12,8 @@
 //! * [`entry`], [`palette`]: editing the name, the tint palette.
 //! * [`menu`]: the character select / create state machine. It takes key events and returns
 //!   [`menu::MenuAction`]s; it does no I/O.
-//! * [`screens`]: draws a [`menu::Menu`]; [`hud`] draws the in-game overlay.
+//! * [`screens`]: draws a [`menu::Menu`]; [`hud`] draws the in-game overlay; [`countdown`] keeps what the server last said
+//!   about the countdown of the player's story (the first reactor's bomb) and draws it at the top centre of the HUD.
 //! * [`input`]: the one place that turns winit key events into menu input.
 //! * [`flow`], [`looks`], [`connect`], [`shell`]: the impure edges, kept thin: turning a menu
 //!   action into a login plan and a connection, the local cache of how saved characters look,
@@ -23,6 +24,7 @@
 //! every screen and of the HUD to `~/.cache/claude-tmp/fmv-client-shots/`.
 
 pub mod connect;
+pub mod countdown;
 pub mod dialogue;
 pub mod draw;
 pub mod entry;

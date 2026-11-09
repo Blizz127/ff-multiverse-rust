@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/travel-smoke.sh - area-travel smoke test for fmv-server + fmv-client.
 #
-# Usage: scripts/travel-smoke.sh [--fixture|--chain] [--release|--debug] [--bin-dir DIR] [--build]
+# Usage: scripts/travel-smoke.sh [--fixture|--chain|--escape] [--release|--debug] [--bin-dir DIR] [--build]
 #                                [--library STATE_DIR] [--duration SECS] [--keep-logs] [-h|--help]
 #
 # DEFAULT MODE (real data): the server hosts the real FF7 field md1stin from the owner's own imported
@@ -61,6 +61,29 @@
 # (this is about walking). The default duration is 300 s (the bots run for the whole of it; the walk takes about 130 s on a
 # debug build, measured; --duration changes it).
 #
+# --escape (real data): the same walk, and then the way OUT: after the Guard Scorpion is won (moment 27) the party turns round
+# and climbs back up through the reactor, the countdown running, to the way out of it, in ONE continuous run (a party that is
+# put at the saved moment 27 cannot be put inside the reactor: a re-login always joins md1stin, and the walk from there to the
+# reactor goes through nrthmk, where the finale moves the story on to 33 before the party is back inside). The route is
+#   md1stin -> ... -> nmkin_5 (the fight) -> nmkin_4 -> nmkin_3 -> nmkin_2 -> elevtr1 -> (the lift, up) -> nmkin_1 -> nrthmk
+# (fifteen area changes). What the leader's story does after 27 (all read from the field scripts, see the READMEs "After the
+# Guard Scorpion"): the lift is ridden BACK UP by pressing OK on the panel again (the panel's own script clears the lift bit:
+# a step that is not forward, which the leader's bot pursues because it opens the way it is going), and coming to stand in
+# nrthmk with the story at 27 or later is the finale of the mission (the explosion's cutscene), which moves it to 33. On the
+# way the leader also talks to the woman of nmkin_3, who is stuck (her talk script turns bit 5 of the reactor byte on from
+# moment 27 on: a talk that moves the story, which the leader's bot pursues like any other). Exactly the steps of --chain, then
+#   nmkin_3 27->27 with var1.225=1->33 (point 0, the woman), elevtr1 27->27 with var1.225=33->32 (point 1, the ride back),
+#   nrthmk 27->33 with var1.225=32->33 (point 1, the finale)
+# and the blob the server saved is 0221000101e121 (moment 33, bits 0 and 5 of Var[1][225]). The COUNTDOWN: the server logged exactly
+# one `countdown started account=<A> seconds=600` (the step that won the fight, from the STTIM of the field's script) and one
+# `countdown over account=<A> reason=cleared` (the finale), never `time-up`, and both bots' clients said so (`countdown:
+# running: ...`, `countdown: over: cleared`). 0 battle divergences, the one battle the chain has and no other.
+# Then the server is restarted on the same state directory and A logs in again (a re-login joins md1stin, now at the saved
+# moment 33): A walks md1stin -> md1_1 -> md1_2 -> nrthmk -> md8_4 (the gateways: md8_4 is a cutscene field with no
+# player-controlled character, where what the server can judge ends), the finale does NOT fire again (33 is not past 33), no
+# story step is logged, no countdown is started, nothing is saved, and A is told its story (`joined with progress
+# 0221000101e121`) at the start.
+#
 # Isolation (the owner's state directory is never touched, only its LIBRARY is read): the server and the
 # clients run with XDG_DATA_HOME/XDG_STATE_HOME/XDG_CONFIG_HOME/XDG_CACHE_HOME and FMV_STATE_DIR
 # pointing into a throw-away directory, the server with --state-dir (or --ephemeral) inside it, each
@@ -114,11 +137,28 @@ CHAIN_FINAL_BLOB=021b000101e101
 # `battle-smoke.sh --boss` is where the boss itself is fought and checked).
 CHAIN_BATTLE_FORMATION=324
 CHAIN_BATTLE_LEVEL=30
+# --escape: the way back out after the fight (see the header). The fields after nmkin_5, in order; the two steps the leader makes
+# on the way (the lift's ride back is the panel's second point, the finale is nrthmk's second); the blob the server saves at
+# the end (moment 33, bit 0 of Var[1][225]); the length of the bomb's countdown (the STTIM of the field's script, seconds).
+# (the walk takes about 200 s on a debug build, measured: 130 s down and 70 s back up; --duration changes it)
+ESCAPE_DURATION=330
+ESCAPE_ROUTE_TAIL=(nmkin_4 nmkin_3 nmkin_2 elevtr1 nmkin_1 nrthmk)
+ESCAPE_STORY_TAIL=(
+  "Ff7/nmkin_3|0|var1.225=1->33"
+  "Ff7/elevtr1|1|var1.225=33->32"
+  "Ff7/nrthmk|1|moment=27->33 var1.225=32->33"
+)
+ESCAPE_FINAL_BLOB=0221000101e121
+ESCAPE_COUNTDOWN_SECS=600
+# After the server restarts, A logs in again at the saved moment 33 and walks to md8_4 by the gateways.
+# (the walk takes about 35 s, measured)
+RELOGIN_DURATION=100
+RELOGIN_ROUTE=(md1_1 md1_2 nrthmk md8_4)
 MODE=real
 
 usage() {
   cat <<'EOF'
-Usage: scripts/travel-smoke.sh [--fixture|--chain] [--release|--debug] [--bin-dir DIR] [--build]
+Usage: scripts/travel-smoke.sh [--fixture|--chain|--escape] [--release|--debug] [--bin-dir DIR] [--build]
                                [--library STATE_DIR] [--duration SECS] [--keep-logs] [-h|--help]
 
 Two headless bots form a party on the real FF7 field md1stin, both walk through its gateway to md1_1
@@ -134,9 +174,13 @@ synthetic FIXTURE rooms (hall and yard) and needs no owned data.
                       down to the Guard Scorpion): the leader advances the story on the way (rides the lift, talks to the
                       woman and the materia, wins the scripted fight), both climb the ladders and jump the gap, the member
                       follows
+  --escape           the same walk and then the way back out of the reactor with the bomb's countdown running (real data):
+                      up the ladders, the lift ridden back up with OK, out to nrthmk, where the finale moves the story to 33
+                      (one continuous run), then the server restarts and the leader logs in again at 33 and walks
+                      md1stin -> md8_4 by the gateways with nothing firing again
   --library DIR      state directory that contains library/ (default $FMV_FF7_LIBRARY, else
                       ~/.local/share/ff-multiverse); only the library is read, never written
-  --duration SECS    how long each bot runs (default 45; 300 with --chain)
+  --duration SECS    how long each bot runs (default 45; 300 with --chain; 330 with --escape)
 EOF
 }
 
@@ -325,11 +369,21 @@ client_story_of() {
 run_chain() {
   local state_real="$LIBRARY" before="" after="" route_csv="" expected="" key n smoke_line value
   local -a server_args client_args
+  # The route, the story and the final blob of this walk: --chain's, and --escape's after them (see the header).
+  local -a ROUTE=("${CHAIN_ROUTE[@]}") STORY=("${CHAIN_STORY[@]}")
+  local FINAL_BLOB=$CHAIN_FINAL_BLOB last_story_area=Ff7/nmkin_5 min_links=6
+  if [[ $MODE == escape ]]; then
+    ROUTE+=("${ESCAPE_ROUTE_TAIL[@]}")
+    STORY+=("${ESCAPE_STORY_TAIL[@]}")
+    FINAL_BLOB=$ESCAPE_FINAL_BLOB
+    last_story_area=Ff7/nrthmk
+    min_links=16 # (measured: 16 = two players, four links down and four back up)
+  fi
   route_csv=$(
     IFS=,
-    printf '%s' "${CHAIN_ROUTE[*]}"
+    printf '%s' "${ROUTE[*]}"
   )
-  for key in "${CHAIN_ROUTE[@]}"; do
+  for key in "${ROUTE[@]}"; do
     expected+="Ff7/$key "
   done
   expected="${expected% }"
@@ -352,6 +406,8 @@ run_chain() {
   say "server READY: $READY_LINE"
   [[ $(field "$READY_LINE" area) == Ff7/md1stin && $(field "$READY_LINE" fixture) == false ]] ||
     fail "the server is not hosting Ff7/md1stin: $READY_LINE"
+  # (a client keeps the token of an account per server ADDRESS, so --escape's second run must come back to this port)
+  local first_addr="$ADDR"
 
   say "starting bots A (the leader, advances the story) and B (follows it) for ${TRAVEL_DURATION}s against $CONNECT; route md1stin,$route_csv"
   local common=(--server "$CONNECT" --headless --duration "$TRAVEL_DURATION" --bot circle --battle-auto "${client_args[@]}")
@@ -377,10 +433,10 @@ run_chain() {
       SMOKE_LINES+=("$smoke_line")
       LINE[$n]="$smoke_line"
       [[ $(field "$smoke_line" fixture) == false ]] || problem "client $n: fixture is not false: $smoke_line"
-      [[ $(field "$smoke_line" area) == "Ff7/${CHAIN_ROUTE[${#CHAIN_ROUTE[@]} - 1]}" ]] ||
-        problem "client $n should end in Ff7/${CHAIN_ROUTE[${#CHAIN_ROUTE[@]} - 1]}: $smoke_line"
+      [[ $(field "$smoke_line" area) == "Ff7/${ROUTE[${#ROUTE[@]} - 1]}" ]] ||
+        problem "client $n should end in Ff7/${ROUTE[${#ROUTE[@]} - 1]}: $smoke_line"
       value=$(area_changes_of "$smoke_line")
-      [[ $value == "${#CHAIN_ROUTE[@]}" ]] || problem "client $n should have changed area ${#CHAIN_ROUTE[@]} times (area_changes=${value:-?}): $smoke_line"
+      [[ $value == "${#ROUTE[@]}" ]] || problem "client $n should have changed area ${#ROUTE[@]} times (area_changes=${value:-?}): $smoke_line"
       value=$(field "$smoke_line" party)
       [[ $value =~ ^[0-9]+$ ]] && ((value >= 2)) || problem "client $n was never in a party of two (party=${value:-?}): $smoke_line"
     else
@@ -402,7 +458,7 @@ run_chain() {
   done
 
   local loaded
-  for key in "${CHAIN_ROUTE[@]}"; do
+  for key in "${ROUTE[@]}"; do
     if loaded=$(last_line_with "$WORK/server.log" "area loaded area=Ff7/$key "); then
       case $key in
         nmkin_2 | nmkin_3 | nmkin_4 | nmkin_5) ;; # their characters are hidden by their own scripts or placed only in some stories
@@ -417,13 +473,31 @@ run_chain() {
     fi
   done
   value=$(count_lines_with "$WORK/server.log" "player leaves through an exit")
-  [[ $value == $((2 * ${#CHAIN_ROUTE[@]})) ]] ||
-    problem "the server should have moved the two players through an exit ${#CHAIN_ROUTE[@]} times each (it logged $value moves)"
-  # The lift: both players left elevtr1 for nmkin_2 (the exit the story opened for the leader), none for nmkin_1.
+  [[ $value == $((2 * ${#ROUTE[@]})) ]] ||
+    problem "the server should have moved the two players through an exit ${#ROUTE[@]} times each (it logged $value moves)"
+  # The lift: both players left elevtr1 for nmkin_2 (the exit the story opened for the leader). With --chain none went back up
+  # (and none crossed the lift's line toward nmkin_1 before the leader had ridden); with --escape both did, after the leader's
+  # ride back up opened that exit.
   value=$(count_lines_with "$WORK/server.log" "from=elevtr1 to=nmkin_2")
   [[ $value == 2 ]] || problem "both players should have left elevtr1 for nmkin_2 (the server logged $value such moves)"
   value=$(count_lines_with "$WORK/server.log" "from=elevtr1 to=nmkin_1")
-  [[ $value == 0 ]] || problem "a player left elevtr1 for nmkin_1 ($value moves): it crossed the lift's line before the leader had ridden"
+  if [[ $MODE == escape ]]; then
+    [[ $value == 2 ]] || problem "both players should have left elevtr1 for nmkin_1 after the leader rode back up (the server logged $value such moves)"
+  else
+    [[ $value == 0 ]] || problem "a player left elevtr1 for nmkin_1 ($value moves): it crossed the lift's line before the leader had ridden"
+  fi
+  # A member that comes to the lift only after its leader's finale (some seconds behind: the story is at 33 by then, where the
+  # lift leads to the second reactor) is taken through the exit the leader took (`player follows its leader's way out`). How
+  # often that happens depends on how far behind the member is, so it is only reported; where it happens it must be the leader's
+  # way up and never anywhere else (no `smkin_*` appears in any move: the two moves per player above are the whole story).
+  value=$(count_lines_with "$WORK/server.log" "player follows its leader's way out")
+  if ((value > 0)); then
+    say "server: the member followed its leader's way out of the lift $value time(s), the story having moved on: $(strip_ansi "$(last_line_with "$WORK/server.log" "player follows its leader's way out" || true)")"
+    [[ $(count_lines_with "$WORK/server.log" "area=elevtr1 follows=nmkin_1 story_says=") == "$value" ]] ||
+      problem "a member followed its leader's way out somewhere that is not the lift's way up: $(last_line_with "$WORK/server.log" "player follows its leader's way out" || true)"
+  fi
+  value=$(count_lines_with "$WORK/server.log" "smkin")
+  [[ $value == 0 ]] || problem "the server mentions smkin ($value lines): somebody was sent, or offered a way, into the second reactor: $(last_line_with "$WORK/server.log" "smkin" || true)"
   # The Guard Scorpion: nmkin_5's triangle started the scripted fight (formation 324, one enemy) for the party, the canon pair
   # and both bots at the pinned level, and the story step came after the win. Every bot played the whole battle from its own
   # data and matched the server (0 divergences, every battle verified by replay).
@@ -458,7 +532,8 @@ run_chain() {
   [[ -n ${battle_ids[0]:-} && ${battle_ids[0]} == "${battle_ids[1]:-}" ]] || problem "the bots did not enter the same battle (A: '${battle_ids[0]:-}', B: '${battle_ids[1]:-}')"
   # Ladders and jumps: the server moved each player inside nmkin_3 and nmkin_4 by their lines (it logs each one).
   value=$(count_lines_with "$WORK/server.log" "player used a link entity=")
-  ((value >= 6)) || problem "the server logged only $value link use(s): the party cannot have climbed down nmkin_3 and nmkin_4 (two players, at least three links each)"
+  ((value >= min_links)) ||
+    problem "the server logged only $value link use(s), expected at least $min_links: the party cannot have climbed nmkin_3 and nmkin_4 (two players, at least three links each way)"
   # Nothing on the route has an exit the server cannot judge.
   value=$(count_lines_with "$WORK/server.log" "exit closed: its conditions cannot be judged")
   [[ $value == 0 ]] || problem "the server reported an exit it could not judge on the route ($value time(s)): $(last_line_with "$WORK/server.log" 'exit closed: its conditions' || true)"
@@ -476,33 +551,33 @@ run_chain() {
     while IFS= read -r step; do
       [[ -n $step ]] && seen_story+=("$step")
     done < <(story_steps_of "$WORK/server.log" "$a_entity")
-    if [[ "${seen_story[*]:-}" != "${CHAIN_STORY[*]}" ]]; then
+    if [[ "${seen_story[*]:-}" != "${STORY[*]}" ]]; then
       problem "A's story steps (server log) were [$(
         IFS=';'
         printf '%s' "${seen_story[*]:-none}"
       )], expected [$(
         IFS=';'
-        printf '%s' "${CHAIN_STORY[*]}"
+        printf '%s' "${STORY[*]}"
       )]"
     fi
     while IFS= read -r step; do
       [[ -n $step ]] && client_steps+=("$step")
     done < <(client_story_of "$WORK/client-A.log")
-    if ((${#client_steps[@]} != ${#CHAIN_STORY[@]})); then
-      problem "A's client was told ${#client_steps[@]} story steps, expected ${#CHAIN_STORY[@]}: [$(
+    if ((${#client_steps[@]} != ${#STORY[@]})); then
+      problem "A's client was told ${#client_steps[@]} story steps, expected ${#STORY[@]}: [$(
         IFS=';'
         printf '%s' "${client_steps[*]:-none}"
       )]"
     else
       i=0
       for step in "${client_steps[@]}"; do
-        want=${CHAIN_STORY[$i]}
+        want=${STORY[$i]}
         rest=${want#*|} # point|what
         [[ "${step%|*}" == "$rest" ]] || problem "A's client step $((i + 1)) was [${step%|*}], expected [$rest]"
         i=$((i + 1))
       done
-      [[ "${client_steps[$((${#client_steps[@]} - 1))]##*|}" == "$CHAIN_FINAL_BLOB" ]] ||
-        problem "A's story ended as ${client_steps[$((${#client_steps[@]} - 1))]##*|}, expected $CHAIN_FINAL_BLOB"
+      [[ "${client_steps[$((${#client_steps[@]} - 1))]##*|}" == "$FINAL_BLOB" ]] ||
+        problem "A's story ended as ${client_steps[$((${#client_steps[@]} - 1))]##*|}, expected $FINAL_BLOB"
     fi
   fi
 
@@ -512,13 +587,20 @@ run_chain() {
     local last_step re_account='story advanced account=([0-9]+) entity='"$a_entity"' '
     # (the story line of the last step is not the last line that names the entity and the area: a move may follow it,
     # and that line has no account)
-    last_step=$(last_line_with "$WORK/server.log" "entity=$a_entity area=Ff7/nmkin_5 point=" || true)
+    last_step=$(last_line_with "$WORK/server.log" "entity=$a_entity area=$last_story_area point=" || true)
     [[ $last_step =~ $re_account ]] && a_account=${BASH_REMATCH[1]}
     if [[ -z $a_account ]]; then
       problem "could not read A's account from the server log"
     else
-      log_has "$WORK/server.log" "story saved account=$a_account bytes=7 progress=$CHAIN_FINAL_BLOB" ||
-        problem "the server never saved A's story as $CHAIN_FINAL_BLOB: $(last_line_with "$WORK/server.log" "story saved account=$a_account" || echo 'no story saved line')"
+      log_has "$WORK/server.log" "story saved account=$a_account bytes=7 progress=$FINAL_BLOB" ||
+        problem "the server never saved A's story as $FINAL_BLOB: $(last_line_with "$WORK/server.log" "story saved account=$a_account" || echo 'no story saved line')"
+    fi
+  fi
+  if [[ $MODE == escape ]]; then
+    check_countdown "$a_account"
+    # Only a walk that held together is worth a second run.
+    if ((${#PROBLEMS[@]} == 0)); then
+      relogin_at_33 "$a_account" "$first_addr" "${server_args[@]}"
     fi
   fi
   after=$(ls -A -- "$state_real" | sort | tr '\n' ' ')
@@ -539,10 +621,120 @@ run_chain() {
   while IFS= read -r l; do
     say "  $l"
   done < <(story_steps_of "$WORK/server.log" "$a_entity")
-  say "server: $(last_line_with "$WORK/server.log" "area loaded area=Ff7/${CHAIN_ROUTE[${#CHAIN_ROUTE[@]} - 1]} " || true)"
+  say "server: $(last_line_with "$WORK/server.log" "area loaded area=Ff7/${ROUTE[${#ROUTE[@]} - 1]} " || true)"
   say "server: $(last_line_with "$WORK/server.log" "story saved account=$a_account" || true)"
   RESULT=pass
-  say "PASS: two bots in a party walked md1stin -> ${route_csv//,/ -> } with the real story: the leader moved it 1 -> 27 (the lift ridden with OK, the woman and the materia talked to, the Guard Scorpion fought and won), the ladders and jumps of nmkin_3 and nmkin_4 were climbed, the exit to nmkin_2 was the one the story opened, the member followed; $state_real unchanged ($after)"
+  if [[ $MODE == escape ]]; then
+    say "PASS: two bots in a party walked md1stin -> ${route_csv//,/ -> } with the real story: the leader moved it 1 -> 27 (the Guard Scorpion fought and won, which started the bomb's ${ESCAPE_COUNTDOWN_SECS} s countdown), the lift was ridden back up with OK, the ladders and jumps were climbed in both directions, the finale in nrthmk moved the story to 33 (blob $FINAL_BLOB saved) and ended the countdown (cleared, never time-up), the member followed; after a restart the leader logged in at 33, walked md1stin -> md8_4 by the gateways and nothing fired again; $state_real unchanged ($after)"
+  else
+    say "PASS: two bots in a party walked md1stin -> ${route_csv//,/ -> } with the real story: the leader moved it 1 -> 27 (the lift ridden with OK, the woman and the materia talked to, the Guard Scorpion fought and won), the ladders and jumps of nmkin_3 and nmkin_4 were climbed, the exit to nmkin_2 was the one the story opened, the member followed; $state_real unchanged ($after)"
+  fi
+}
+
+# stored_blob <progression file>: the hex of the progression blob a store record holds, or empty.
+stored_blob() {
+  local file="$1" text
+  [[ -r $file ]] || return 0
+  text=$(<"$file")
+  if [[ $text =~ \"blob\"[[:space:]]*:[[:space:]]*\"([0-9a-f]*)\" ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+  fi
+}
+
+# check_countdown <account of the leader>: what --escape's first run says of the bomb's countdown (header): the server started
+# exactly one, from the field's own timer (STTIM), ended it exactly once because the story moved past it (the finale), never
+# because the time ran out; and both clients said so.
+check_countdown() {
+  local account="$1" n value
+  value=$(count_lines_with "$WORK/server.log" "countdown started ")
+  [[ $value == 1 ]] || problem "the server should have started exactly one countdown (it logged $value)"
+  value=$(count_lines_with "$WORK/server.log" "countdown started account=$account seconds=$ESCAPE_COUNTDOWN_SECS")
+  [[ $value == 1 ]] || problem "the server should have started the leader's countdown of $ESCAPE_COUNTDOWN_SECS s once (it logged $value such lines): $(last_line_with "$WORK/server.log" 'countdown started' || echo 'none')"
+  value=$(count_lines_with "$WORK/server.log" "countdown over account=$account reason=cleared")
+  [[ $value == 1 ]] || problem "the server should have ended the countdown once because the story moved past it (it logged $value such lines): $(last_line_with "$WORK/server.log" 'countdown over' || echo 'none')"
+  value=$(count_lines_with "$WORK/server.log" "reason=time-up")
+  [[ $value == 0 ]] || problem "the countdown ran out ($value time-up lines): the party was too slow, or the walk was"
+  for n in "${CLIENT_NAMES[@]}"; do
+    log_has "$WORK/client-$n.log" "countdown: running: ${ESCAPE_COUNTDOWN_SECS}.0 s left of ${ESCAPE_COUNTDOWN_SECS}.0 s" ||
+      problem "client $n was never told the countdown started ($(last_line_with "$WORK/client-$n.log" 'countdown:' || echo 'no countdown line'))"
+    log_has "$WORK/client-$n.log" "countdown: over: cleared" || problem "client $n was never told the countdown was cleared"
+    if log_has "$WORK/client-$n.log" "countdown: over: time is up"; then
+      problem "client $n was told the time was up"
+    fi
+  done
+}
+
+# relogin_at_33 <account of the leader> <address of the first server> <the first server's arguments>...: --escape's second run
+# (header): the server restarts on the same state directory, A logs in again at the saved moment 33 (a re-login joins md1stin),
+# walks md1stin -> md1_1 -> md1_2 -> nrthmk -> md8_4 by the gateways with its story bot on, and nothing fires: no story step, no
+# countdown, nothing saved, the record in the store is what the first run left, and A is told its story at the start.
+relogin_at_33() {
+  local account="$1" first_addr="$2" n line value stored relogin_csv expected_areas=""
+  shift 2
+  local -a args=("$@") client_args=(--ff7-library "$WORK/lib-state")
+  # (the first server argument is --bind, its value the next one)
+  args[1]="$first_addr"
+  relogin_csv=$(
+    IFS=,
+    printf '%s' "${RELOGIN_ROUTE[*]}"
+  )
+  for n in "${RELOGIN_ROUTE[@]}"; do
+    expected_areas+="Ff7/$n "
+  done
+  expected_areas="${expected_areas% }"
+  say "run 2: restarting the server on the same state directory ($first_addr)"
+  "$SERVER_BIN" "${args[@]}" >"$WORK/server-2.log" 2>&1 &
+  SERVER_PID=$!
+  wait_ready "$WORK/server-2.log"
+  say "server READY: $READY_LINE"
+  CPID=()
+  CRC=()
+  CLIENT_NAMES=(A)
+  say "run 2: bot A logs in again for ${RELOGIN_DURATION}s against $CONNECT; route md1stin,$relogin_csv"
+  "$CLIENT_BIN" --server "$CONNECT" --headless --duration "$RELOGIN_DURATION" --bot circle --battle-auto "${client_args[@]}" \
+    --name A --state-dir "$WORK/client-A" --story-advance --travel "$relogin_csv" >"$WORK/client-A-2.log" 2>&1 &
+  CPID[A]=$!
+  wait_clients $((RELOGIN_DURATION + CLIENT_GRACE))
+  local log="$WORK/client-A-2.log"
+  if [[ ${CRC[A]:-} == timeout ]]; then
+    problem "run 2: client A was still running ${CLIENT_GRACE}s after its ${RELOGIN_DURATION}s duration and was killed"
+  elif [[ ${CRC[A]:-} != 0 ]]; then
+    problem "run 2: client A exited with status ${CRC[A]:-unknown}"
+  fi
+  if line=$(last_line_with "$log" "SMOKE name="); then
+    line=$(strip_ansi "$line")
+    [[ $(field "$line" area) == "Ff7/${RELOGIN_ROUTE[${#RELOGIN_ROUTE[@]} - 1]}" ]] ||
+      problem "run 2: A should end in Ff7/${RELOGIN_ROUTE[${#RELOGIN_ROUTE[@]} - 1]}: $line"
+    value=$(area_changes_of "$line")
+    [[ $value == "${#RELOGIN_ROUTE[@]}" ]] || problem "run 2: A should have changed area ${#RELOGIN_ROUTE[@]} times (area_changes=${value:-?}): $line"
+    say "run 2 client: $line"
+  else
+    problem "run 2: client A printed no SMOKE line"
+  fi
+  entered_areas "$log"
+  [[ "${ENTERED[*]:-}" == "$expected_areas" ]] || problem "run 2: A entered [${ENTERED[*]:-nothing}], expected [$expected_areas]"
+  log_has "$log" "headless: travel: the route" || problem "run 2: A did not finish its route: $(last_line_with "$log" "headless: travel:" || echo 'no travel summary')"
+  log_has "$log" "story: joined with progress $ESCAPE_FINAL_BLOB" ||
+    problem "run 2: A was not told its story ($ESCAPE_FINAL_BLOB) when it logged in again: $(last_line_with "$log" 'story:' || echo 'no story line')"
+  if log_has "$log" "story: advanced"; then
+    problem "run 2: A's story moved again at 33: $(last_line_with "$log" 'story: advanced' || true)"
+  fi
+  if log_has "$log" "countdown:"; then
+    problem "run 2: A was told of a countdown after logging in (a countdown is not stored): $(last_line_with "$log" 'countdown:' || true)"
+  fi
+  stop_server
+  value=$(count_lines_with "$WORK/server-2.log" "story advanced ")
+  [[ $value == 0 ]] || problem "run 2: the server moved a story ($value steps) at moment 33: $(last_line_with "$WORK/server-2.log" 'story advanced' || true)"
+  value=$(count_lines_with "$WORK/server-2.log" "countdown ")
+  [[ $value == 0 ]] || problem "run 2: the server said something about a countdown ($value lines)"
+  value=$(count_lines_with "$WORK/server-2.log" "story saved ")
+  [[ $value == 0 ]] || problem "run 2: the server saved a story ($value lines) although nothing moved"
+  value=$(count_lines_with "$WORK/server-2.log" "player leaves through an exit")
+  [[ $value == "${#RELOGIN_ROUTE[@]}" ]] || problem "run 2: the server should have moved A through an exit ${#RELOGIN_ROUTE[@]} times (it logged $value moves)"
+  value=$(count_lines_with "$WORK/server-2.log" "exit closed: its conditions cannot be judged")
+  [[ $value == 0 ]] || problem "run 2: the server reported an exit it could not judge ($value time(s))"
+  stored=$(stored_blob "$WORK/server-state/progression/$account/Ff7.json")
+  [[ $stored == "$ESCAPE_FINAL_BLOB" ]] || problem "run 2: the stored story is '$stored', expected $ESCAPE_FINAL_BLOB (what the first run saved)"
 }
 
 main() {
@@ -550,6 +742,7 @@ main() {
     case "$1" in
       --fixture) MODE=fixture ;;
       --chain) MODE=chain ;;
+      --escape) MODE=escape ;;
       --release) PROFILE=release ;;
       --debug) PROFILE=debug ;;
       --bin-dir)
@@ -582,6 +775,9 @@ main() {
   if [[ $MODE == chain && $DURATION_GIVEN == 0 ]]; then
     TRAVEL_DURATION=$CHAIN_DURATION
   fi
+  if [[ $MODE == escape && $DURATION_GIVEN == 0 ]]; then
+    TRAVEL_DURATION=$ESCAPE_DURATION
+  fi
   if [[ $DO_BUILD == 1 && -n $BIN_DIR ]]; then
     usage_error "--build cannot be combined with --bin-dir"
   fi
@@ -599,7 +795,7 @@ main() {
   export XDG_CONFIG_HOME="$WORK/xdg/config" XDG_CACHE_HOME="$WORK/xdg/cache"
   export NO_COLOR=1
 
-  if [[ $MODE == chain ]]; then
+  if [[ $MODE == chain || $MODE == escape ]]; then
     run_chain
   else
     run_travel

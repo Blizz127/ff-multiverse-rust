@@ -166,6 +166,10 @@
 //!   exit with a guard the model cannot judge stays closed). A `MAPJUMP` a talk or a director runs is not
 //!   a walk-on exit and is not offered. **Only in the [`REVIEWED_FIELDS`]**: any other field offers its gateways and
 //!   leaves its script exits (and its story points and links) off, and [`AreaRuntime::story_withheld`] says which.
+//!   And **a script exit of a served field that leads to a field that is not reviewed is closed** whatever the story
+//!   says (`Ff7Adapter::load_field`; the survey's loader keeps what the data says): the elevator's way on to the
+//!   second reactor (`smkin_1`, `smkin_2`, open from moment 33) is not offered until those fields are reviewed.
+//!   Gateways keep their behaviour.
 //! * [`AreaRuntime::place_arrival`]: an exit's `arrival_hint` is the index of the target walkmesh
 //!   triangle that holds the arrival point; where that triangle holds the point, the arrival
 //!   stands at the triangle's height there (the right floor of a layered field), otherwise the
@@ -524,7 +528,16 @@ impl Ff7Adapter {
         let reviewed = everything || is_reviewed_field(&loaded.key);
         // After `load_validated` has let go of the archive: `maplist` and the exit targets lock it.
         let mut exits = self.gateway_exits(&loaded.field);
-        let (script_exits, gates) = self.script_exits(&loaded.field);
+        let (script_exits, mut gates) = self.script_exits(&loaded.field);
+        if !everything {
+            // Served to players: a script exit into a field that is not reviewed is closed, whatever the story says (a
+            // party's story moving on must not send a player where nothing of the story is offered).
+            for (exit, gate) in script_exits.iter().zip(gates.iter_mut()) {
+                if !is_reviewed_field(&exit.target) {
+                    gate.lead_out();
+                }
+            }
+        }
         // A field that is not reviewed keeps its gateways and says what it did not take: its script exits are neither
         // offered nor judged.
         let left_off: Option<Vec<String>> =
@@ -1013,6 +1026,12 @@ impl AreaRuntime for Ff7FieldArea {
     /// The battle a story point starts before its step is paid (a scripted fight: the guard scorpion).
     fn story_battle(&self, point: u32) -> Option<u16> {
         self.story.battle_of(point)
+    }
+
+    /// The first reactor's countdown matters while the story counter is where the step that started it left it
+    /// ([`crate::story::countdown_live`]).
+    fn countdown_live(&self, started: &[u8], now: &[u8]) -> bool {
+        story::countdown_live(started, now)
     }
 
     /// The ladders and jumps of the field (only in a reviewed field, see [`crate::links`]).

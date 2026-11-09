@@ -1,6 +1,7 @@
 //! The slow work of the soundtrack, off the game's thread: reading a field's script for its music,
-//! decoding a music file into memory, and reading the menu sounds and the sounds of a battle out of `audio.dat` (only
-//! the clips asked for: the file is 70 MB).
+//! decoding a music file into memory, reading the menu sounds and the sounds of a battle out of `audio.dat` (only
+//! the clips asked for: the file is 70 MB), and reading what a field's scripts play for the player's story (the plan,
+//! and only the clips it names).
 //!
 //! [`Worker`] is what the soundtrack asks of it and [`ThreadWorker`] is the real one: a couple of
 //! threads over a queue with two lanes. A track the soundtrack is waiting for right now goes in the
@@ -14,6 +15,7 @@
 
 use super::cues::Cue;
 use super::director::AreaMusic;
+use super::field::FieldRead;
 use fmv_audio::{DecodedMusic, SfxClip};
 use std::collections::{HashSet, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -35,6 +37,9 @@ pub enum Done {
     Cues(Result<Vec<(Cue, SfxClip)>, String>),
     /// The sounds of a battle that were asked for (by the game's sound id), and how long reading them took.
     Sounds { read: SoundsRead, took: Duration },
+    /// What a field's scripts play for a story (the plan and the clips it names), or why that could not be read, and how
+    /// long it took. `story` is the progression blob it was made for.
+    Field { key: String, story: Vec<u8>, read: Result<FieldRead, String>, took: Duration },
 }
 
 /// What reading a list of sound ids gave: the clips that exist and, for each id that has none, why not (an empty slot, a
@@ -55,6 +60,9 @@ pub trait Worker {
     fn load_cues(&mut self);
     /// Read the clips of these sound ids (a battle that starts: what its fights can need), before anything in advance.
     fn load_sounds(&mut self, ids: Vec<u16>);
+    /// Read what the scripts of the field `key` play for the progression `story`, and the clips that plan names which are not
+    /// in `have` (the ids the caller holds already), before anything in advance.
+    fn scan_field(&mut self, key: &str, story: Vec<u8>, have: Vec<u16>);
     /// What finished since the last call.
     fn poll(&mut self) -> Vec<Done>;
 }
@@ -68,6 +76,8 @@ pub type CuesTask = Arc<dyn Fn() -> Result<Vec<(Cue, SfxClip)>, String> + Send +
 
 /// Reads the clips of some of the game's sound ids.
 pub type SoundsTask = Arc<dyn Fn(&[u16]) -> SoundsRead + Send + Sync>;
+/// Reads what the scripts of a field play for a story (the progression blob), with the clips of the ids not in the list.
+pub type FieldTask = Arc<dyn Fn(&str, &[u8], &[u16]) -> Result<FieldRead, String> + Send + Sync>;
 
 /// The work, as closures that run on the worker threads.
 #[derive(Clone)]
@@ -76,6 +86,7 @@ pub struct Tasks {
     pub decode: DecodeTask,
     pub cues: CuesTask,
     pub sounds: SoundsTask,
+    pub field: FieldTask,
 }
 
 enum Job {
@@ -83,6 +94,7 @@ enum Job {
     Decode(String),
     Cues,
     Sounds(Vec<u16>),
+    Field { key: String, story: Vec<u8>, have: Vec<u16> },
 }
 
 #[derive(Default)]
@@ -183,6 +195,10 @@ impl Worker for ThreadWorker {
         self.push(Job::Sounds(ids), true);
     }
 
+    fn scan_field(&mut self, key: &str, story: Vec<u8>, have: Vec<u16>) {
+        self.push(Job::Field { key: key.to_string(), story, have }, true);
+    }
+
     fn poll(&mut self) -> Vec<Done> {
         self.results.try_iter().collect()
     }
@@ -230,6 +246,11 @@ fn run(shared: &Shared, tasks: &Tasks, send: &Sender<Done>) {
                     .unwrap_or_else(|_| SoundsRead { clips: Vec::new(), missing: ids.iter().map(|id| (*id, "the sound file reader panicked".to_string())).collect() });
                 Done::Sounds { read, took: started.elapsed() }
             }
+            Job::Field { key, story, have } => {
+                let started = Instant::now();
+                let read = catch_unwind(AssertUnwindSafe(|| (tasks.field)(&key, &story, &have))).unwrap_or_else(|_| Err("the field reader panicked".to_string()));
+                Done::Field { key, story, read, took: started.elapsed() }
+            }
         };
         if send.send(done).is_err() {
             return;
@@ -240,6 +261,7 @@ fn run(shared: &Shared, tasks: &Tasks, send: &Sender<Done>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::field::FieldPlan;
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 
     fn tracks(frames: usize) -> DecodedMusic {
@@ -274,6 +296,16 @@ mod tests {
                 clips: ids.iter().filter(|id| **id != 99).map(|id| (*id, SfxClip::from_mono(22_050, &[0.1, 0.2]).expect("a clip"))).collect(),
                 missing: ids.iter().filter(|id| **id == 99).map(|id| (*id, "an empty slot".to_string())).collect(),
             }),
+            field: Arc::new(move |key, story, have| {
+                assert_ne!(std::thread::current().id(), caller);
+                if key == "nowhere" {
+                    return Err("no such field".to_string());
+                }
+                // the plan carries the key and the story it was asked for; the clips are those not held
+                let plan = FieldPlan { key: key.to_string(), story: story.to_vec(), ..FieldPlan::default() };
+                let clips = (1..=3u16).filter(|id| !have.contains(id)).map(|id| (id, SfxClip::from_mono(22_050, &[0.1, 0.2]).expect("a clip"))).collect();
+                Ok(FieldRead { plan, clips: SoundsRead { clips, missing: Vec::new() } })
+            }),
         };
         let mut worker = ThreadWorker::start(tasks);
         let mut backlog = Vec::new();
@@ -282,6 +314,8 @@ mod tests {
         worker.decode("bad", false);
         worker.load_cues();
         worker.load_sounds(vec![5, 99, 18]);
+        worker.scan_field("nmkin_2", vec![1, 15, 0], vec![2]);
+        worker.scan_field("nowhere", Vec::new(), Vec::new());
         let area = wait_for(&mut worker, &mut backlog, |d| matches!(d, Done::Area { .. }), "the analysis");
         assert!(matches!(&area, Done::Area { key, music } if key == "md1stin" && music.arrival.as_deref() == Some("music-of-md1stin")));
         let good = wait_for(&mut worker, &mut backlog, |d| matches!(d, Done::Track { name, .. } if name == "ob"), "a decode");
@@ -294,6 +328,15 @@ mod tests {
         let Done::Sounds { read, .. } = sounds else { unreachable!("waited for it") };
         assert_eq!(read.clips.iter().map(|(id, _)| *id).collect::<Vec<_>>(), [5, 18]);
         assert_eq!(read.missing, [(99, "an empty slot".to_string())]);
+        // a field's plan comes back with the story it was made for, and the clips of the ids that were not held
+        let field = wait_for(&mut worker, &mut backlog, |d| matches!(d, Done::Field { key, .. } if key == "nmkin_2"), "the field's sounds");
+        let Done::Field { story, read, .. } = field else { unreachable!("waited for it") };
+        assert_eq!(story, [1, 15, 0]);
+        let read = read.expect("a plan");
+        assert_eq!((read.plan.key.as_str(), read.plan.story.as_slice()), ("nmkin_2", &[1u8, 15, 0][..]));
+        assert_eq!(read.clips.clips.iter().map(|(id, _)| *id).collect::<Vec<_>>(), [1, 3], "id 2 was held");
+        let nowhere = wait_for(&mut worker, &mut backlog, |d| matches!(d, Done::Field { key, .. } if key == "nowhere"), "the failing field");
+        assert!(matches!(nowhere, Done::Field { read: Err(why), .. } if why == "no such field"));
         assert!(worker.poll().is_empty(), "nothing is delivered twice");
     }
 
@@ -318,6 +361,7 @@ mod tests {
             }),
             cues: Arc::new(|| Err("none".into())),
             sounds: Arc::new(|_| SoundsRead::default()),
+            field: Arc::new(|_, _, _| Err("no field".to_string())),
         };
         let mut worker = ThreadWorker::start(tasks);
         let mut backlog = Vec::new();
@@ -359,6 +403,7 @@ mod tests {
             }),
             cues: Arc::new(|| Err("none".into())),
             sounds: Arc::new(|_| SoundsRead::default()),
+            field: Arc::new(|_, _, _| Err("no field".to_string())),
         };
         let mut worker = ThreadWorker::start(tasks);
         let mut backlog = Vec::new();
@@ -411,6 +456,7 @@ mod tests {
                 sounds_log.lock().expect("log").push(format!("sounds {ids:?}"));
                 SoundsRead::default()
             }),
+            field: Arc::new(|_, _, _| Err("no field".to_string())),
         };
         let mut worker = ThreadWorker::start(tasks);
         let mut backlog = Vec::new();
@@ -439,6 +485,7 @@ mod tests {
             decode: Arc::new(|name| if name == "boom" { panic!("a broken decoder") } else { Ok(tracks(5)) }),
             cues: Arc::new(|| panic!("a broken sound file")),
             sounds: Arc::new(|_| panic!("a broken sound file")),
+            field: Arc::new(|_, _, _| panic!("a broken field")),
         };
         let mut worker = ThreadWorker::start(tasks);
         let mut backlog = Vec::new();
@@ -454,6 +501,9 @@ mod tests {
         worker.load_sounds(vec![7, 8]);
         let sounds = wait_for(&mut worker, &mut backlog, |d| matches!(d, Done::Sounds { .. }), "the battle sounds");
         assert!(matches!(sounds, Done::Sounds { read, .. } if read.clips.is_empty() && read.missing.iter().map(|(id, _)| *id).eq([7, 8])));
+        worker.scan_field("anywhere", Vec::new(), Vec::new());
+        let field = wait_for(&mut worker, &mut backlog, |d| matches!(d, Done::Field { .. }), "the field's sounds");
+        assert!(matches!(field, Done::Field { read: Err(_), .. }));
         worker.decode("fine", true);
         let fine = wait_for(&mut worker, &mut backlog, |d| matches!(d, Done::Track { name, .. } if name == "fine"), "a decode after the panics");
         assert!(matches!(fine, Done::Track { result: Ok(_), .. }));
@@ -471,6 +521,7 @@ mod tests {
             decode: Arc::new(|_| Ok(tracks(1))),
             cues: Arc::new(|| Err("none".into())),
             sounds: Arc::new(|_| SoundsRead::default()),
+            field: Arc::new(|_, _, _| Err("no field".to_string())),
         };
         let worker = ThreadWorker::start(tasks);
         drop(worker);

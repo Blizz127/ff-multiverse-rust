@@ -35,11 +35,16 @@
 //!
 //! In an area with links (ladders, jumps: `AreaRuntime::links`) the bot walks with a [`crate::route::Navigator`], which
 //! takes the links it needs to get to the point and keeps off the others.
+//!
+//! A bot that also travels (`--travel`) tells the story bot where its route goes next ([`StoryBot::set_wanted_exit`]), and
+//! that changes which steps are pursued: one that OPENS the exit to that area is pursued even when it is not forward (the
+//! first reactor's lift ridden back UP), and one that would CLOSE it is not even when it is (the ride down, forward again once
+//! the lift is up), so the lift is ridden once each way and never flaps.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use fmv_adapter_api::{AreaKey, AreaRuntime, Exit, GameAdapter, Link, MoveResult, StoryPoint, StoryTrigger, SAME_SPOT};
+use fmv_adapter_api::{AreaKey, AreaRuntime, Exit, ExitState, GameAdapter, Link, MoveResult, StoryPoint, StoryTrigger, SAME_SPOT};
 use fmv_core::Pos;
 use fmv_protocol::StoryAdvance;
 
@@ -141,8 +146,10 @@ const STUCK_LIMIT: u32 = 500;
 /// Steps to wait before planning again after a plan failed.
 const PLAN_COOLDOWN_STEPS: u32 = 100;
 /// A bot that leads a party holds still before a point that starts a battle until the rest of the party is in view, but
-/// at most this long (seconds).
-pub const BATTLE_PARTY_WAIT_S: f32 = 20.0;
+/// at most this long (seconds). A member that follows (`--travel-follow`) trails its leader by the wait it makes in
+/// every field (it crosses only after the leader has left), which a loaded machine stretches: 20 s was not enough for the
+/// Guard Scorpion of `travel-smoke.sh --chain` when the box was busy (the member came after the fight and missed it).
+pub const BATTLE_PARTY_WAIT_S: f32 = 45.0;
 /// A press is made ONCE: a bot that has pressed OK waits for the server's step (the `StoryUpdate` that changes the
 /// progress it was pressed on) and presses nothing else before it comes. A press that brings no step in this long
 /// (seconds) is a failure the bot reports and stops on, not one it repeats: a second press on a story the server
@@ -242,6 +249,19 @@ pub struct StoryBot {
     sent_progress: Vec<u8>,
     /// Tells forward steps from the others (none: every step the area offers is pursued).
     judge: Option<Judge>,
+    /// The area the bot's route goes to next, when it travels as well (see [`StoryBot::set_wanted_exit`]).
+    wanted_exit: Option<String>,
+}
+
+/// How the step of a story point bears on the exit a travelling bot is heading for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Bearing {
+    /// The exit is closed for the story the bot has and open for the one the step makes.
+    Opens,
+    /// The exit is open for the story the bot has and closed for the one the step makes.
+    Closes,
+    /// The step changes nothing about it (or there is no such exit).
+    Neither,
 }
 
 impl StoryBot {
@@ -264,6 +284,36 @@ impl StoryBot {
             press_point: None,
             sent_progress: Vec::new(),
             judge: None,
+            wanted_exit: None,
+        }
+    }
+
+    /// The area the bot's route leads to next (`--travel`), when it travels as well as advances the story: the exit to
+    /// it changes what the bot pursues. The lift of the first reactor is the case. Going UP, the exit to `nmkin_1` is
+    /// closed while the lift is down, and the panel's ride back (a step that is not forward: the story only moves forward)
+    /// opens it, so that press is pursued; once the lift is up, the ride DOWN is a step forward again (the lift bit on)
+    /// but it would close the exit the bot is heading for, so it is not pursued, and the bot does not ride up and down for
+    /// ever. Going down the same ride is forward AND opens the exit to `nmkin_2`. `None`: no route, and every step that
+    /// goes forward is pursued, as ever.
+    pub fn set_wanted_exit(&mut self, target: Option<&str>) {
+        if self.wanted_exit.as_deref() != target {
+            self.wanted_exit = target.map(str::to_string);
+        }
+    }
+
+    /// How the step `step` (the progression a point would make of `progress`) bears on the exits of `area` that lead to the
+    /// area the bot's route goes to next: whether it opens or closes them, or neither.
+    fn bearing(&self, area: &dyn AreaRuntime, progress: &[u8], step: &[u8]) -> Bearing {
+        let Some(want) = self.wanted_exit.as_deref() else { return Bearing::Neither };
+        let exits: Vec<Exit> = area.exits().into_iter().filter(|e| e.target.eq_ignore_ascii_case(want)).collect();
+        if exits.is_empty() {
+            return Bearing::Neither;
+        }
+        let open = |story: &[u8]| exits.iter().any(|e| area.exit_state(e, story) == ExitState::Open);
+        match (open(progress), open(step)) {
+            (false, true) => Bearing::Opens,
+            (true, false) => Bearing::Closes,
+            _ => Bearing::Neither,
         }
     }
 
@@ -350,10 +400,18 @@ impl StoryBot {
                     // what fires when the player comes to stand in the area needs no walking
                     _ => return None,
                 };
-                // only a step that goes forward (the lift's ride back would take the story backwards)
+                // only a step that goes forward (the lift's ride back would take the story backwards), unless it opens the
+                // way the bot is going (the ride back is what lets it go up), and never one that would close that way
+                // (the ride down, once the lift is up: the bot would ride up and down for ever)
                 let step = area.story_advance(progress, point.id)?;
-                if !self.is_forward(progress, &step.progress) {
-                    return None;
+                match self.bearing(area, progress, &step.progress) {
+                    Bearing::Closes => return None,
+                    Bearing::Opens => {}
+                    Bearing::Neither => {
+                        if !self.is_forward(progress, &step.progress) {
+                            return None;
+                        }
+                    }
                 }
                 let battle = area.story_battle(point.id).is_some();
                 Some(Target { point, kind, battle })
@@ -795,5 +853,7 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod open_tests;
 #[cfg(test)]
 mod press_tests;

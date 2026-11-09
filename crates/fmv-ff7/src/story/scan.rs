@@ -5,6 +5,13 @@
 //! somewhere: script 0's init part and main part, and the walk-on slots of a `LINE` entity. For each write the
 //! jumps that can skip it are classified ([`write_at`]); a write whose guards are all understood has a
 //! trigger, the writes that share a trigger and nest their guards are one point ([`points_of`]).
+//!
+//! Two more things are read there. **A timer** (`STTIM` with literal operands) that the write's own block sets is the
+//! countdown the step starts ([`timer_of_block`]). **A script that a main loop requests** (`REQ`, `REQEW`, `REQSW`
+//! under guards the model can judge, nothing that waits or asks before it) writes the story on behalf of the loop: what
+//! the requested script writes on every path from its start, before anything that ends it or waits, is the loop's own
+//! entry point ([`requested_events`]; the first reactor's finale is one: the loop of a nameless entity in `nrthmk`
+//! runs the director's cutscene script, which sets the moment).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -22,6 +29,7 @@ const OP_RETTO: u8 = 0x07;
 const OP_JMPB: u8 = 0x12;
 const OP_JMPBL: u8 = 0x13;
 const OP_MINIGAME: u8 = 0x20;
+const OP_STTIM: u8 = 0x38;
 const OP_IFKEY: u8 = 0x30;
 const OP_IFKEYON: u8 = 0x31;
 const OP_ASK: u8 = 0x48;
@@ -115,6 +123,8 @@ struct Write {
     battle: Option<u16>,
     /// A `BATTLE` the script starts before the write, in the block the write is in.
     battle_first: Option<u16>,
+    /// A timer the write's block sets, in seconds.
+    countdown: Option<u32>,
 }
 
 /// The story points of a field: triangles first, then lines, then entry points, each in entity order.
@@ -157,6 +167,7 @@ pub(super) fn scan_points(script: &FieldScript, mesh: &Walkmesh) -> Vec<PointDef
                     effects: Vec::new(),
                     battle: None,
                     battle_first: None,
+                    countdown: None,
                 });
             }
             match point.trigger {
@@ -235,9 +246,68 @@ pub(crate) fn line_of(init: &[Instruction]) -> Option<LineOf> {
     Some(LineOf { a, b, enabled })
 }
 
-/// Every write of the model in `code` that has a trigger, in script order.
+/// Every write of the model in `code` that has a trigger, in script order, and the writes of the scripts it requests.
 fn events(code: &[Instruction], part: Part, ctx: &Ctx) -> Vec<Write> {
-    (0..code.len()).filter_map(|k| write_at(code, k, part, ctx)).collect()
+    let mut writes: Vec<Write> = (0..code.len()).filter_map(|k| write_at(code, k, part, ctx)).collect();
+    if part != Part::Line {
+        writes.extend(requested_events(code, ctx));
+    }
+    writes
+}
+
+/// What the scripts that `code` (the init or the main part of an entity's script 0) REQUESTS write, as entry points.
+///
+/// A request (`REQ`, `REQEW`, `REQSW` with a literal entity and script) that the part makes on every path under guards
+/// the model can judge (the moment against a literal, a carried bit: no triangle, no key, no party) makes the
+/// requested script run, and what that script writes of the story on every path from its start (before a `RET`, a
+/// `MAPJUMP`, a loop or an `ASK`, and under no `IF` of its own) is written by the requesting part: one [`Write`] per
+/// write, in the requested script's order, all with the requesting guards and the trigger [`Trigger::Enter`] (the
+/// part runs by itself from the field's first frame on, so does what it requests). Nothing before the request in the
+/// requesting part may end it, loop or ask (a part that waits for something the server cannot see is not one). One
+/// level of request is followed: a request in the requested script is not.
+fn requested_events(code: &[Instruction], ctx: &Ctx) -> Vec<Write> {
+    let mut writes = Vec::new();
+    for (k, ins) in code.iter().enumerate() {
+        let Some(target) = requested(ins) else { continue };
+        let before = code.get(..k).unwrap_or(&[]);
+        if before.iter().any(|i| STOPPERS.contains(&i.opcode) || is_wait_for_player(i)) {
+            continue;
+        }
+        let guards = guards_of(code, k);
+        let conds: Option<Vec<Cond>> = guards
+            .iter()
+            .map(|g| moment_compare(g).map(|(cmp, literal)| Cond::Moment(cmp, literal)).or_else(|| bit_cond(g)))
+            .collect();
+        let Some(conds) = conds else { continue };
+        let Some(listing) = ctx.script.span(target.0, target.1).and_then(|_| ctx.script.disassemble_partial(target.0, target.1).ok()) else {
+            continue;
+        };
+        let requested_code = listing.instructions.as_slice();
+        for (k2, written) in requested_code.iter().enumerate() {
+            let Some(op) = write_op(written) else { continue };
+            let upto = requested_code.get(..k2).unwrap_or(&[]);
+            if upto.iter().any(|i| STOPPERS.contains(&i.opcode) || is_wait_for_player(i)) || !guards_of(requested_code, k2).is_empty() {
+                continue;
+            }
+            writes.push(Write {
+                k,
+                op,
+                trigger: Trigger::Enter,
+                chain: guards.iter().map(|g| g.offset).collect(),
+                conds: conds.iter().copied().map(Some).collect(),
+                battle: None,
+                battle_first: None,
+                countdown: None,
+            });
+        }
+    }
+    writes
+}
+
+/// An instruction after which a script may be waiting for something the server cannot see: a loop (a backward jump) or
+/// a question for the player.
+fn is_wait_for_player(ins: &Instruction) -> bool {
+    matches!(ins.opcode, OP_JMPB | OP_JMPBL | OP_ASK)
 }
 
 /// The write of the model that `code[k]` makes, with its trigger and conditions, if it makes one and every jump
@@ -309,7 +379,23 @@ fn write_at(code: &[Instruction], k: usize, part: Part, ctx: &Ctx) -> Option<Wri
         .and_then(|i| i.literal("battle"))
         .and_then(|b| u16::try_from(b).ok());
     let battle_first = battle_first(code, k, &guards, ctx);
-    Some(Write { k, op, trigger, chain, conds, battle, battle_first })
+    let countdown = timer_of_block(code, k, &guards);
+    Some(Write { k, op, trigger, chain, conds, battle, battle_first, countdown })
+}
+
+/// The timer (`STTIM` with literal hours, minutes and seconds) that the block of the write at `code[k]` sets, in seconds: an
+/// `STTIM` that runs on every path that reaches the write, in the block the nearest guard opens (before the write or after
+/// it). The first reactor's Guard Scorpion step sets the bomb's ten minutes in the same block as the moment.
+fn timer_of_block(code: &[Instruction], k: usize, guards: &[&Instruction]) -> Option<u32> {
+    let from = guards.iter().map(|g| g.end()).max().unwrap_or(0);
+    let block_end = guards.iter().filter_map(|g| g.jump_target).min();
+    code.iter().enumerate().filter(|(j, i)| *j != k && i.opcode == OP_STTIM && i.offset >= from && block_end.is_none_or(|end| i.offset < end)).find_map(|(j, i)| {
+        if !guards_of(code, j).iter().all(|g| guards.iter().any(|w| w.offset == g.offset)) {
+            return None;
+        }
+        let part = |name: &str, unit: u32| i.literal(name).and_then(|v| u32::try_from(v).ok()).and_then(|v| v.checked_mul(unit));
+        part("hours", 3600)?.checked_add(part("minutes", 60)?)?.checked_add(part("seconds", 1)?)
+    })
 }
 
 /// How deep a request chain is followed for a battle or a write (a script requests a script requests a script ...).
@@ -477,10 +563,19 @@ fn points_of(writes: &[Write]) -> Vec<PointDef> {
     for (base, mut members) in groups {
         members.sort_by_key(|w| w.k);
         let requires: Vec<Cond> = base.conds.iter().flatten().copied().collect();
+        // A point that wants a bit set that nothing in the model sets (the countdown's timeout flag: the loop of
+        // `nrthmk` that plays the way a late party's escape goes wrong) can never apply: it is not offered, so it does not
+        // take the id of a point that can.
+        if !requires.iter().all(|c| c.possible()) {
+            continue;
+        }
         let mut effects = Vec::new();
-        let (mut battle, mut battle_first) = (None, None);
+        let (mut battle, mut battle_first, mut countdown) = (None, None, None);
         for member in members {
             let extra: Vec<Cond> = member.conds.get(base.conds.len()..).unwrap_or(&[]).iter().flatten().copied().collect();
+            if !extra.iter().all(|c| c.possible()) || !member.op.possible() {
+                continue;
+            }
             // A write nothing conditions would set the story on every visit: a script that does not state when
             // is not read.
             if requires.is_empty() && extra.is_empty() {
@@ -488,11 +583,12 @@ fn points_of(writes: &[Write]) -> Vec<PointDef> {
             }
             battle = battle.or(member.battle);
             battle_first = battle_first.or(member.battle_first);
+            countdown = countdown.or(member.countdown);
             effects.push(Effect { requires: extra, op: member.op });
         }
         // A point that could only clear bits moves nothing forward.
         if effects.iter().any(|e| matches!(e.op, Op::Moment(_) | Op::Bit { on: true, .. })) {
-            points.push(PointDef { trigger: base.trigger.clone(), requires, effects, battle, battle_first });
+            points.push(PointDef { trigger: base.trigger.clone(), requires, effects, battle, battle_first, countdown });
         }
     }
     points

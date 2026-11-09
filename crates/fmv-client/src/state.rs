@@ -31,6 +31,7 @@ use crate::party::{nearest_peer, PartyMirror};
 use crate::progress::ProgressMirror;
 use crate::scene::SceneClient;
 use crate::story::StoryMirror;
+use crate::ui::countdown::CountdownMirror;
 use fmv_adapter_api::{AreaRuntime, MoveResult};
 use fmv_core::{AccountId, AnimState, AreaId, AvatarAppearance, EntityId, EntitySnapshot, Pos};
 use fmv_protocol::{NpcSnapshot, ServerMsg, MAX_NPCS_PER_AREA, NPC_NAME_CHARS, NPC_REF_CHARS};
@@ -375,6 +376,8 @@ pub struct ClientState {
     pub story: StoryMirror,
     /// The story scene we are in, if any, and what is owed the server about it (see `crate::scene`).
     pub scene: SceneClient,
+    /// The countdown the server runs for our story, as it last said (see `crate::ui::countdown`). Empty until it says.
+    pub countdown: CountdownMirror,
     remotes: BTreeMap<EntityId, Remote>,
     /// The non-player characters of the current area (from its `AreaSnapshot`).
     npcs: Vec<NpcView>,
@@ -417,6 +420,7 @@ impl ClientState {
             progress: ProgressMirror::default(),
             story: StoryMirror::default(),
             scene: SceneClient::new(),
+            countdown: CountdownMirror::default(),
             remotes: BTreeMap::new(),
             npcs: Vec::new(),
             npc_epoch: 0,
@@ -612,6 +616,9 @@ impl ClientState {
             msg @ (ServerMsg::SceneStart { .. } | ServerMsg::SceneStep { .. } | ServerMsg::SceneEnded { .. } | ServerMsg::SceneRefused { .. }) => {
                 self.scene.on_message(&self.area.key, msg);
             }
+            // The countdown the server runs for our story (the server's word, never ends the session): the HUD draws
+            // what it says and counts down on this clock between messages (see `crate::ui::countdown`).
+            ServerMsg::Countdown { state } => self.countdown.on_message(now, state),
         }
         None
     }
@@ -933,6 +940,27 @@ mod tests {
         }
         s.own.set_motion(at(12.0), 0.0, AnimState::Walk);
         assert_eq!(s.own.next_intent(61.0).unwrap().seq, 4, "movement is announced as usual");
+    }
+
+    /// The server's countdown (its bomb timer) reaches the mirror the HUD draws from, never ends the session and is not
+    /// forgotten by walking into another area (it follows the player's story, not the area).
+    #[test]
+    fn the_servers_countdown_reaches_the_mirror_and_survives_a_change_of_area() {
+        use fmv_protocol::{CountdownEnd, CountdownState};
+        let mut s = state(at(0.0));
+        assert!(s.countdown.view(0.0).is_none());
+        let running = ServerMsg::Countdown { state: CountdownState::Running { remaining_ms: 600_000, total_ms: 600_000 } };
+        assert_eq!(s.apply(10.0, running), None, "the server's word never ends the session");
+        assert_eq!(s.countdown.view(10.0).map(|v| v.clock), Some("10:00".to_string()));
+        assert_eq!(s.countdown.view(70.0).map(|v| v.clock), Some("9:00".to_string()), "it counts down on the client's clock");
+        // an area change keeps it
+        s.change_area(AreaId { game: GameId::Fixture, key: "yard".into() }, at(5.0), 0.0, true);
+        assert_eq!(s.countdown.view(70.0).map(|v| v.clock), Some("9:00".to_string()));
+        // and the end of it ends it
+        let over = ServerMsg::Countdown { state: CountdownState::Over { reason: CountdownEnd::Cleared } };
+        assert_eq!(s.apply(71.0, over), None);
+        assert!(s.countdown.view(71.0).is_none() && !s.countdown.is_running());
+        assert_eq!(s.countdown.told(), 2);
     }
 
     #[test]

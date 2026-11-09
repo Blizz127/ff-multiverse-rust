@@ -68,6 +68,12 @@ impl Backend {
     }
 }
 
+/// A looping sound effect that is playing, to stop it by ([`crate::AudioEngine::play_sfx_loop`] gives one,
+/// [`crate::AudioEngine::stop_sfx_loop`] takes it). Opaque; a handle whose loop has ended is stale and stopping it again
+/// does nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SfxHandle(pub(crate) u64);
+
 /// How to start a piece of music (see [`crate::AudioEngine::play_music`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PlayOptions {
@@ -100,8 +106,10 @@ pub struct AudioStatus {
     pub music: Option<TrackId>,
     /// One-shot tracks that played to their end (not stopped, not replaced).
     pub music_ended: u64,
-    /// Sound effects playing now.
+    /// One-shot sound effects playing now.
     pub sfx_playing: u32,
+    /// Looping sound effects playing now (a loop that is fading out still counts until it is over).
+    pub loops_playing: u32,
     pub volumes: Volumes,
     pub muted: bool,
     /// Frames the mixer has rendered since the engine started.

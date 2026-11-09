@@ -996,6 +996,7 @@ impl App {
         };
         let hud_input = hud::gather_anchored(state, &self.session.info, view, render_t, &anchor);
         hud::draw_hud_with(&hud_input, hud::progress_line(state, render_t).as_ref(), vw, vh, &mut overlay);
+        crate::ui::countdown::draw(&state.countdown, vw, vh, self.session.info.fixture, now, &mut overlay);
         self.talk.draw(vw, vh, now, &mut overlay);
         // The window of a story scene, near whoever speaks.
         if let Some(story) = story {

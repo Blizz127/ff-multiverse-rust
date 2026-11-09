@@ -71,6 +71,12 @@
 //! told to the player with `ServerMsg::StoryUpdate`; a changed phase moves the player (and its party's
 //! members) to another instance of the same area. See `world::story`.
 //!
+//! A step can also start a COUNTDOWN (`StoryStep::countdown`: FF7's first reactor, whose Guard Scorpion step sets a
+//! ten minute timer): the server owns the clock, tells the account and the members of its party
+//! (`ServerMsg::Countdown`), and ends it when the story moves past it, when its account leaves, or when the time runs
+//! out, which logs one line (`countdown over account=<n> reason=time-up`), tells the players and **does nothing
+//! else**: no story step, no saved progress touched. See `world::countdown`.
+//!
 //! # Story scenes
 //!
 //! A story scene is a game's own scripted conversation, played by the clients from their own files for a player
@@ -631,6 +637,7 @@ async fn tick_loop(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) {
                     world.expire_parties(now);
                     world.advance_battles(now);
                     world.advance_scenes(now);
+                    world.advance_countdowns(now);
                     world.manage_areas(now);
                 });
             }

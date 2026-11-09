@@ -17,7 +17,10 @@
 //!    adapter's own merge, so a stale save can never take a story back (a server without a saver, like
 //!    a unit test of the world, saves nothing);
 //! 4. the player is told with `ServerMsg::StoryUpdate`;
-//! 5. the placement of the player and of every member of its party is refreshed (`World::settle`): a
+//! 5. a countdown the step starts (`StoryStep::countdown`), or the story having moved past the one the account
+//!    had, is recorded (`countdown` module: the server owns the clock; whoever the account's story governs is told
+//!    by the placements of the next step);
+//! 6. the placement of the player and of every member of its party is refreshed (`World::settle`): a
 //!    changed phase moves the player to another instance of the same area, and when the player leads a
 //!    party its members follow (they keep their own progression).
 //!
@@ -136,7 +139,7 @@ impl World {
 
     /// Apply `step` of point `point` to `entity` (module docs: the mirror, the log line, the save, the message, the
     /// placements).
-    fn apply_story_step(&mut self, entity: EntityId, point: u32, step: StoryStep) {
+    pub(super) fn apply_story_step(&mut self, entity: EntityId, point: u32, step: StoryStep) {
         let Some(player) = self.players.get_mut(&entity) else { return };
         // A player in a debug scene preview plays on a made-up story: no step of it is ever kept, saved or told (this is
         // the one place the world saves a story, so this is what keeps the preview from touching a real account).
@@ -145,11 +148,14 @@ impl World {
         }
         let (account, area_id) = (player.account, player.area.clone());
         player.progression = step.progress.clone();
-        let game_area = self.areas.get(&area_id).map(|a| a.id().to_string()).unwrap_or(area_id);
+        let game_area = self.areas.get(&area_id).map(|a| a.id().to_string()).unwrap_or(area_id.clone());
         self.logs.info(format!(
             "story advanced account={} entity={} area={game_area} point={point} {}",
             account.0, entity.0, step.summary
         ));
+        // A step may start a countdown, or leave the story past the one the account had (the players are told by the
+        // placements below: see the `countdown` module).
+        self.countdown_after_step(account, &area_id, &step);
         if !self.saver.as_ref().is_none_or(|saver| saver.save_story(account, step.progress.clone())) {
             self.logs.warn(format!("story progress NOT SAVED (the saver has stopped; the player has it, the store does not) account={}", account.0));
         }

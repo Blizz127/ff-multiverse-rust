@@ -658,6 +658,8 @@ where
             | ServerMsg::Inventory { .. }
             // Where the player's story stands (said once on joining when it is not a new account's).
             | ServerMsg::StoryUpdate { .. }
+            // The countdown the server runs for the player's story (kept like the story: said once, not repeated).
+            | ServerMsg::Countdown { .. }
             // A story scene's traffic is for the scene player (`crate::scene`); the server only sends it to a player that
             // started or watches one, so nothing of it can arrive before the join, but if it did it must not be lost: the
             // player is held until the run ends.

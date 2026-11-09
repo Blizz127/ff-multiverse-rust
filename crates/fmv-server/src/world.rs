@@ -111,6 +111,8 @@ use crate::ServerError;
 
 mod areas;
 mod battle;
+mod countdown;
+mod follow;
 mod instances;
 mod party;
 mod press;
@@ -251,6 +253,12 @@ struct Player {
     scene: Option<fmv_protocol::SceneRunId>,
     /// Set while the player is in a debug scene preview: its `progression` is made up and nothing of it is ever saved.
     preview: Option<scene::Preview>,
+    /// The account whose countdown this player was last told is running (see the `countdown` module): `None` when it was
+    /// told of none, or that it is over.
+    countdown_told: Option<AccountId>,
+    /// The ways out of an area that this player, as the leader of a party, took through an exit its story decided: what
+    /// its members follow (see the `follow` module).
+    ways: Vec<follow::WayOut>,
 }
 
 /// Everything the world needs to admit a player into the area.
@@ -336,6 +344,10 @@ pub struct World {
     logs: DeferredLogs,
     /// Story scenes: the game's scenes, the runs in progress and the debug preview switch (see `scene`).
     scenes: scene::SceneWorld,
+    /// The countdowns that story steps started, one per account (see `countdown`).
+    countdowns: BTreeMap<AccountId, countdown::Countdown>,
+    /// The `now` of the last [`World::advance_countdowns`]: what a countdown's time left is measured against.
+    clock: Instant,
 }
 
 impl World {
@@ -373,6 +385,8 @@ impl World {
             saver: None,
             logs,
             scenes: scene::SceneWorld::default(),
+            countdowns: BTreeMap::new(),
+            clock: Instant::now(),
         })
     }
 
@@ -471,6 +485,8 @@ impl World {
                 fence: None,
                 scene: None,
                 preview: None,
+                countdown_told: None,
+                ways: Vec::new(),
             },
         );
         self.by_account.insert(account, entity);
@@ -518,6 +534,8 @@ impl World {
         if let Some(instance) = left {
             self.tell_instance(instance, Arc::new(ServerMsg::PlayerLeft { entity }), failed);
         }
+        // Its countdown (a clock of the story it held) goes with it, and so does what its party was told of it.
+        self.countdown_account_left(player.account, failed);
         Some(player)
     }
 
@@ -681,6 +699,12 @@ impl World {
     ) {
         let mut moved: BTreeSet<AccountId> = BTreeSet::new();
         for event in events {
+            // A party that has a new leader, or is gone, has no way out left to follow (the `follow` module).
+            match &event {
+                PartyEvent::LeaderChanged { old_leader, new_leader, .. } => self.forget_ways_of(&[*old_leader, *new_leader]),
+                PartyEvent::Disbanded { members, .. } => self.forget_ways_of(members),
+                _ => {}
+            }
             let mut audience = event.audience();
             audience.sort();
             audience.dedup();

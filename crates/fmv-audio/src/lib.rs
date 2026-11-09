@@ -1,5 +1,6 @@
 //! The audio engine of the FF Multiverse client: a music channel with crossfades and loop points,
-//! a sound-effect channel, three volumes and a mute, played through the machine's output device
+//! sound effects (one-shots, and loops that run until their handle is stopped, apart from the one-shots so that a
+//! burst of those cannot cut one), three volumes and a mute, played through the machine's output device
 //! (cpal) or, when there is none, through a null sink that keeps the same time.
 //!
 //! This crate is game-agnostic: it knows tracks only by [`TrackId`] and plays whatever a
@@ -83,4 +84,4 @@ pub use engine::{AudioEngine, DeviceError, DeviceLink, DeviceOpener, LostReporte
 pub use host::MixerHandle;
 pub use music::{decode_music_bytes, decode_music_file, loop_points_from_tags, DecodeError, DecodedMusic, MAX_FRAMES};
 pub use source::{LoopPoints, MusicSource, Pull, SfxClip, ToneSource};
-pub use types::{AudioStatus, Backend, PlayOptions, TrackId, Volumes};
+pub use types::{AudioStatus, Backend, PlayOptions, SfxHandle, TrackId, Volumes};

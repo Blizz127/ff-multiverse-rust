@@ -332,6 +332,14 @@ impl Session {
         }
     }
 
+    /// Print what the server said about the countdown of our story since the last call, one `countdown:` line each, on
+    /// stderr (see `crate::ui::countdown`).
+    pub fn log_countdown_notes(&mut self) {
+        for line in self.state.countdown.drain_notes() {
+            eprintln!("countdown: {line}");
+        }
+    }
+
     /// Say goodbye and wait (bounded) for the network thread to flush `Leave`.
     pub fn leave(&mut self, wait: Duration) {
         self.net.leave_and_join(wait);

@@ -5,7 +5,7 @@ use crate::field::FieldFile;
 use crate::script::dialogue::End;
 use crate::script::synth::{dialog, SynthScript};
 use crate::script::FieldScript;
-use crate::story::{StoryState, REACTOR_LIFT};
+use crate::story::{StoryState, REACTOR_STATE};
 use crate::testutil::{FieldSpec, LoaderModelSpec};
 
 // ---- a tiny assembler ------------------------------------------------------------------------
@@ -565,14 +565,14 @@ fn what_the_scene_writes_is_reported_by_kind_and_applied_forward_only() {
     assert_eq!(outcome.end, End::Finished);
     assert_eq!(outcome.windows, 1);
     assert_eq!(outcome.writes.moment, Some(80));
-    assert_eq!(outcome.writes.tracked, [((REACTOR_LIFT.bank, REACTOR_LIFT.address), 0b1)]);
+    assert_eq!(outcome.writes.tracked, [((REACTOR_STATE.bank, REACTOR_STATE.address), 0b1)]);
     assert_eq!(outcome.writes.untracked.get(&(3, 212)), Some(&0b100), "a field's own flag is not the story's, and is said so");
     assert!(!outcome.writes.is_story_neutral());
 
     let mut state = story.clone();
     assert!(outcome.writes.apply_to(&mut state));
     assert_eq!(state.moment, 80);
-    assert_eq!(state.var(REACTOR_LIFT.bank, REACTOR_LIFT.address), 1);
+    assert_eq!(state.var(REACTOR_STATE.bank, REACTOR_STATE.address), 1);
     // applied again, it changes nothing (once)
     assert!(!outcome.writes.apply_to(&mut state));
     // and never takes a story back

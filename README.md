@@ -87,8 +87,9 @@ for example) are announced with every snapshot. See "Walking between fields" bel
 Not done yet: field scripts as a whole (what is carried out is the exits a line's walk-on script decides, the
 ladders and jumps of the lines, and the story steps the scripts make where the server can see them: a walk, a press of
 OK, a talk, a scripted battle, see "Walking between fields"; no cutscenes), NPC animation and conversations beyond the
-story steps, field sounds (what a field's scripts and footsteps play; the music and a battle's sounds are done, see
-"Sound"), and the window's scrolling camera (it shows the whole background). The increment-by-increment
+story steps, the field sounds that no script names (footsteps, and the sounds of cutscenes and of talks; the music, a battle's
+sounds and what the fields' scripts play by themselves and for a ladder, a jump or the lift are done, see "Sound"), and the
+window's scrolling camera (it shows the whole background). The increment-by-increment
 plan is in `IMPLEMENTATION-PLAN.md`.
 
 ## Workspace
@@ -469,7 +470,9 @@ synthetic FIXTURE rooms (`fmv-server --game fixture-rooms`, `fmv-client --game f
 --name X`: a hall and a yard joined by an exit each way, with one NPC in the yard; **not FF7**) and
 needs no owned data. `scripts/travel-smoke.sh --chain` walks the whole first reactor mission, from the first field
 to the reactor's core and the Guard Scorpion (`md1stin`, `md1_1`, `md1_2`, `nrthmk`, `nmkin_1`, `elevtr1`, `nmkin_2`,
-`nmkin_3`, `nmkin_4`, `nmkin_5`), with the real story: see below.
+`nmkin_3`, `nmkin_4`, `nmkin_5`), with the real story: see below. `scripts/travel-smoke.sh --escape` goes on past the
+boss: the party turns round and climbs back out of the reactor with the bomb's countdown running, rides the lift back up
+and takes the finale in `nrthmk` (see "After the Guard Scorpion").
 
 The bots find their way with `crates/fmv-client/src/nav.rs`: a grid over the field, A* over its cells, string pulling
 into a few straight legs that the server's own `validate_move` accepts, and never across the line of an exit they do
@@ -484,11 +487,25 @@ it sits under); the adapter reports them (in the reviewed fields, see below) aft
 story, which of them is open (`AreaRuntime::exit_state`). Several can share one line: the lift of the first
 reactor (`elevtr1`) has no gateway and four exits on one line, picked by a bit of `Var[1][225]` and by
 `Var[2][0] < 33`, so the way down to `nmkin_2` is open only after the ride and the later story's `smkin_*` stay
-closed because their conditions say so. The server judges them against **the story of the account that governs
+closed because their conditions say so. **A script exit of a served field that leads to a field that is not reviewed is
+closed whatever the story says** (from moment 33 the lift's data says `smkin_1` / `smkin_2` are open; no server offers
+them until those fields are reviewed: `Ff7Adapter::load_field` closes them, the survey's loader shows what the data
+holds). Gateways keep their behaviour (`nrthmk` to `md8_4` is how a party reaches the end of the reviewed slice on
+purpose). The server judges them against **the story of the account that governs
 the crossing player's instance** (its own, solo; the leader's, for a party member), takes the first exit that
 is open, and walks a player over a line whose exits are all closed. An exit whose condition the model cannot judge
 (a variable the progression does not carry, a key to press, the party) stays closed and the server says so once per
 area (`exit closed: its conditions cannot be judged ...`). Rules and numbers: `crates/fmv-ff7/src/exit_gate.rs`.
+**A member follows its leader's way out.** A member is judged on its leader's story, and that moves while the member is
+still on its way: the leader's finale in `nrthmk` takes the story from 27 to 33 and a member that comes to the lift a few
+seconds later would be judged on moment 33 (found by `travel-smoke.sh --escape` with the member 18 s behind: it was sent
+to `smkin_2`). So when a party's leader leaves an area through an exit its story decided, the world remembers which
+(`crates/fmv-server/src/world/follow.rs`: per leader, the last 8 areas), and a member of that party that crosses the same
+line in the same area takes THAT exit, once, whatever the story now says (the server logs `player follows its leader's
+way out ... story_says=<where the story would have sent it>` when that differs). It is not a story step and changes
+nobody's progression. The way is forgotten when the leader comes to stand in that area again, when its next way out of the
+area replaces it, when the party's leader changes or the party is disbanded, and with the leader leaving the world; it
+never applies to a player outside the party it was made for.
 
 **The OK button, ladders and jumps (protocol v14, `ClientMsg::Interact`).** The server sees where a player walks, and
 since `Interact` it sees the OK button too (Enter or Space in the window, one message per press, with the character the
@@ -514,7 +531,9 @@ OK on the lift's panel, a talk, or a scripted battle won (`crates/fmv-ff7/src/st
 (`md1stin`), 6->7 (`md1_1`), 7->8 (`md1_2`), 8->10 (`nrthmk`), 10->11 (`nmkin_1`, a line), 11->12 together with the lift
 bit (`elevtr1`: press OK on the panel's triangle), 12->13 (`nmkin_2`), 13->14 (`nmkin_3`: talk to the woman), 14->15
 (`nmkin_5`: talk to the materia on the floor), 15->27 (`nmkin_5`: the core's triangle starts the Guard Scorpion, formation
-324, and the step is paid when the party WINS). A **talk** point is a character whose own talk script (or one it requests)
+324, and the step is paid when the party WINS); and the way out, after it: the second talk to the woman of `nmkin_3` (a tracked bit turned on, the moment stays 27), the
+lift's ride back up (`elevtr1`, a tracked bit turned off, the moment stays 27) and 27->33 (`nrthmk`: the finale, see "After
+the Guard Scorpion"). A **talk** point is a character whose own talk script (or one it requests)
 writes the story: what the talk does is not read off the text, the character's script is run (the dialogue walker) for the
 story the player has when it presses OK, after the character's own set-up has decided whether it can be talked to at all
 (the materia switches itself off once the story has moved to 15). The client's conversation shows the lines for the story
@@ -530,8 +549,10 @@ fields of the first mission only**: `md1stin`, `md1_1`, `md1_2`, `nrthmk`, `nmki
 `nmkin_4` and `nmkin_5` (`fmv_ff7::REVIEWED_FIELDS`, in `crates/fmv-ff7/src/area.rs`), each read against its own script
 case by case. Every other field offers what it always did, its gateways (data, always open, so a party can still walk out
 of the mission) and its phases, and leaves its script exits, story points and links off: a point raises a story for good, a
-story only moves forward, a link teleports a player, and nobody has read the others (the data holds 917 script exits, 133
-points and 190 links; the ten fields offer 4, 14 and 11, and the other 299 fields that have any leave 913, 119 and 179 off).
+story only moves forward, a link teleports a player, and nobody has read the others (the data holds 917 script exits, 151
+points and 190 links; the ten fields offer 4, 15 and 11, and the other 310 fields that have any leave 913, 136 and 179 off.
+The points were 133, 14 and 119 in 299 fields until the writes of a script that a main loop requests were read, which
+found 18 more entry points: `nrthmk`'s finale and seventeen in fields that are left off).
 The server says what a field left off once per area when it loads it (`story left off (said once for this area)
 area=Ff7/md8_1 why=unreviewed field script_exits=0 story_points=1 ... links=0 link_list=[])`). A field joins the list by review, not by a casual
 edit: `cargo run -p fmv-ff7 --example world_survey -- <field>` shows what it would offer (the survey loads fields with
@@ -544,6 +565,73 @@ bit on, and the story to 12 the first time) and the ride back, which the panel's
 a press is one ride and nothing flaps; the lift's exits follow the bit (`nmkin_1` up, `nmkin_2` down) and the moment stays.
 The model only carries a story FORWARD (merging two stories is a join), so the saved story keeps the lift down while the
 story the player holds in the world has it up until the player rides down again.
+
+**After the Guard Scorpion: the bomb, the way out and the countdown.** What the game does after moment 27, read from
+the owned field scripts (`--example script_dump` and `--example world_survey`; ids, offsets and moments only), and what a
+party can do of it. Everything below is pinned against the real data in `crates/fmv-ff7/tests/chain_real.rs` and
+`crates/fmv-client/src/route/real_tests.rs`.
+
+* **The bomb.** There is no separate "set the bomb" step after 27, and it is not Barret's: the cutscene that comes before the
+  fight does it (`nmkin_5`: Barret's talk script runs Cloud's scripts, the last of which walks Cloud to the reactor, plays
+  the placing animation and the machine sounds, and starts battle 324), and the block of the director's loop that writes
+  moment 27 when that is over also **starts a timer of ten minutes** (`STTIM 0:10:00`, just before the write) and flips bits of
+  the reactor byte `Var[1][225]` that are not carried (bit 6 on, bits 3 and 4 off: the bomb and the doors). The other points of `nmkin_5` are for moments 120 to 127, a much later visit nobody on the first mission reaches.
+  **There is no menu:** none of the ten fields has an `ASK`, so the countdown is not a choice. It is 10:00, always.
+* **The countdown.** The `time` entity of every reactor field (`nmkin_1` to `nmkin_5`, `elevtr1`) opens the game's timer window
+  only at moment 27, and the `timeo` entity of each sets bit 7 of the reactor byte and jumps to `nrthmk` when the timer reads
+  zero at moment 27; `nrthmk`'s finale then ends in a game over for that case. The server runs the timer: the step that wins the
+  fight carries its length (`StoryStep::countdown`, read from the `STTIM` of the step's own block: 600 s), the world keeps one
+  countdown per account whose story it is (the leader's, in a party) and tells the account and the members of its party
+  (`ServerMsg::Countdown`: `Running { remaining_ms, total_ms }` at the start, to a member that joins the party and to one that
+  returns, `Over { Cleared }` when the story moves past 27 or the account or the party is gone, `Over { TimeUp }` when it
+  runs out), and the window draws it at the top centre (`crates/fmv-client/src/ui/countdown.rs`: `M:SS`, the last minute in the
+  warning colour, "TIME IS UP" for eight seconds; the headless client says it in `countdown:` lines).
+  **A countdown that runs out does nothing:** the server logs one line (`countdown over account=<n> reason=time-up`), sends
+  `Over { TimeUp }` and goes on. No story step, nothing saved, wiped or reset, nobody moved; the finale below still applies to
+  a party that was late (the game's own late party gets a game over; a persistent multiplayer account never loses what it
+  saved to a clock). A countdown is not stored: a server that restarts, and an account that logs in again at 27, have none.
+* **The way out.** Every gateway stays open both ways, the ladders and jumps of `nmkin_3` and `nmkin_4` have their way up
+  (the same lines, other links: the bots take 3 in `nmkin_3` and 1 in `nmkin_4`), and the lift is ridden back up by pressing OK on
+  the panel again. In `nmkin_3` the woman who is stuck on the way out is freed by a talk (her talk script, from moment 27 on,
+  turns bit 5 of the reactor byte on, which is carried for it: a talk that moves the story, once, `var1.225=1->33` with the
+  lift down; no exit or point waits for the bit, which only decides where she and her namesake of `nmkin_1` stand and
+  whether the second door of `nmkin_1` opens, neither of which a server models: the walkmesh has no locks and the cast does
+  not change with the moment, so she stays on the field after she is freed). A bot that also travels (`--story-advance --travel`) pursues a story step that OPENS the exit its route
+  goes to (the ride back, which is not a step forward) and never one that would CLOSE it (the ride down, forward again once
+  the lift is up), so the lift is ridden once each way and never flaps (`StoryBot::set_wanted_exit`). The way out of the reactor is the
+  gateway from `nmkin_1` to `nrthmk`. **A member that is behind its leader at the lift still goes up:** the finale moves the
+  party's story to 33 as soon as the leader stands in `nrthmk`, and from 33 the lift of `elevtr1` leads to the second reactor
+  (closed here, nobody has reviewed it), so a member that comes to the lift after that takes the exit its leader took
+  (nmkin_1) instead of the one its party's story now says (see "A member follows its leader's way out" above; the real-data
+  test `on_the_real_lift_a_member_that_comes_after_the_leaders_finale_still_rides_to_nmkin_1` in `follow/real_tests.rs`
+  reproduces the order on the owned data, and `travel-smoke.sh --escape` reports the times it happened in a live run).
+* **The finale (27 to 33).** In `nrthmk` the loop of a nameless entity runs, whenever the moment is 27 or more and bit 7 of the
+  reactor byte is clear, the cutscene scripts of the field's director: the explosion's movie, moment 33, the lift bit on, and
+  a jump to `md8_4`. The adapter reads it the way it reads any script a main loop requests (the unguarded writes of the
+  requested script, under guards the model can judge) as an entry point of `nrthmk`, id 1, that fires when a player comes to
+  stand there, so a party's leader goes 27 to 33 by walking out of the reactor. Bit 7 is carried only so that the step's own
+  guard can be judged, and **this server never sets it** (the loop that plays the late party's game over wants it set, and
+  is not a point at all). The jump to `md8_4` is NOT performed (a director's jump is not a walk-on exit): the party stays in
+  `nrthmk`, whose gateway to `md8_4` is data and always open.
+* **Where the evidence ends: `md8_4`.** That field has no player-controlled character. It is a cutscene (the AVALANCHE members
+  and Cloud as characters at moment 33, a director that plays their talk and jumps on to `md8_1`), which the server cannot
+  play, judge or leave by a walk: a party gets there by `nrthmk`'s gateway and walks about on its walkmesh, and this slice stops
+  there.
+* **What a re-login at 27 does.** A re-login always joins `md1stin`, and the walk from there to the reactor goes through
+  `nrthmk`, where the finale moves the story on to 33 before the party is back inside: so the escape through the reactor is
+  one continuous run, never a restart. `scripts/travel-smoke.sh --escape` walks down, wins the fight, climbs back out and
+  takes the finale in one run (the story steps and the saved blob `0221000101e121` asserted exactly, one countdown started and
+  cleared, never time-up, 0 battle divergences), then restarts the server, logs the leader in again at the saved 33 and
+  walks `md1stin` to `md8_4` by the gateways with nothing firing again. Nobody is stranded at the new moments
+  (`chain_real.rs`: from every place a player arrives in a reviewed field, walking and the links reach an open exit at
+  27 and 33 with the lift up and down), except on the lift itself at 33 (see "Not done").
+* **Not done:** the places the reactor's characters stand and the doors they open by the other bits of the reactor byte at 27
+  (the characters on the way out in `nmkin_3` and `nmkin_1`: the server's walkmesh has no locks and its cast does not change
+  with the moment), the movie, and `md8_4` and `md8_1`. **One dead end:** the lift of `elevtr1` at moment 33 and later leads
+  nowhere a server offers (its way on is the second reactor's, not reviewed; its way back is the first mission's, closed by
+  the story from 33). The story never takes a party there; only a party that walks back into the reactor after the finale
+  stands on it (a member that is behind its leader is taken through by the leader's way out, above). Reconnecting puts a
+  player in `md1stin` again; reviewing `smkin_1` and `smkin_2` opens the lift's way on.
 
 Story phasing: every account has one story progression per game (the opaque `Progression` blob; an
 account that never advanced has none, which is a new account) and the world keeps one instance of a
@@ -565,8 +653,9 @@ version was bumped and a server refuses a v3 client at the handshake with a clea
 `ProtocolMismatch` reject (instead of losing it at the first exit it crosses). Both sides must be
 built from this version or later.
 
-Not done: exits a talk or a director decides, the script exits, story points and links of every field but the first
-mission's ten (they are left off until reviewed), conditional NPCs, NPC animation, cutscenes.
+Not done: exits a talk or a director decides (the finale's jump from `nrthmk` to `md8_4` among them), the script exits, story
+points and links of every field but the first mission's ten (they are left off until reviewed), conditional NPCs (the cast
+does not change with the moment), NPC animation, cutscenes (`md8_4`, where the first mission's evidence ends, is one).
 
 ## Accounts, avatars and parties
 
@@ -1057,6 +1146,18 @@ together. The story record keeps its v2 shape, so a v13 server can read what v14
 links or scripted battle, and how its exits judge a moment past 13 was never tested: once a player has gone past moment
 13, prefer rolling forward to rolling back.
 
+**Protocol v15 (the countdown message)** adds one server message,
+`ServerMsg::Countdown { state }`, with `CountdownState::Running { remaining_ms, total_ms }` and
+`CountdownState::Over { reason: CountdownEnd::TimeUp | Cleared }` (see "After the Guard Scorpion"): sent when the step that
+won the Guard Scorpion starts the bomb's countdown, to a player that joins or leaves the party that has one, and when it
+is over. A peer that does not know it cannot decode it (an unknown message is a decode error), so a v14 client would be
+cut off at the first countdown a v15 server starts: the version has to move with it and a v14 peer be refused at the
+handshake. `StoryStep` gained a `countdown` and `AreaRuntime` a `countdown_live` (library API, not wire). Nothing new is
+stored (a countdown is a clock of the server process), and the story record keeps its v2 shape: the reactor byte's bit 7
+is carried so that the finale's guard can be judged but this server never writes it, so a record is readable by a v14
+server, which just has no finale, no countdown and no `Countdown` message. **Rolling back:** point the server and the
+clients back at a v14 build together.
+
 ## Story scenes
 
 A story scene is the game's own scripted conversation or cutscene, played from the owner's files for a player who stands
@@ -1238,7 +1339,8 @@ fine: the game runs without sound and says so in one line (see "Sound").
 
 ## Sound
 
-The window plays your own FF7's music, menu sounds and the sounds of a battle's blows, read from the same library as the game's data (the
+The window plays your own FF7's music, menu sounds, the sounds of a battle's blows and the sounds the fields' own scripts play, read from
+the same library as the game's data (the
 importer takes the music and sound files along with the rest, see above). The client never receives audio
 from a server and keeps none anywhere but the library.
 
@@ -1265,6 +1367,41 @@ from a server and keeps none anywhere but the library.
   `--mute`/`FMV_AUDIO` with the rest. **`FMV_BATTLE_SOUNDS`** picks which are played: `off` none, `data` (the default)
   what the data names, `all` also an enemy's death and an escape, which only a hand-made list of the sound bank names (by
   ear, and nothing says when the game plays them: a boss has a death clip of its own).
+- **A field's own sounds.** A field's scripts play sounds on the game's four effect channels, with two opcodes: `SOUND` (channel 1)
+  and `AKAO` 40 to 43 (channels 1 to 4; the pan and the sound id are its operands, id 0 stops the channel): 4 387 and 2 579 plays in
+  446 and 260 of the 702 fields, 566 between them (`crates/fmv-ff7/src/field_sound.rs` has the evidence for all that follows, counts
+  and ids only; `FMV_FF7_DATA=... FMV_FF7_AUDIO_DATA=... cargo run --release -p fmv-ff7 --example field_sound_survey` recomputes it
+  from your `data/` folders, and `cargo test -p fmv-ff7 --release --test field_sound_real -- --ignored` checks it). The client plays:
+  - **Ambient loops.** What a field's scripts leave playing when they have run (every entity's init part, then its main part, run as
+    far as their waits and conditions can be known): 48 fields have one at the start of the story (55 loops; every one of the 208 plays
+    in an init part is a stop or a loop clip). They start when you enter the field, on the channel the script names, and stop when you
+    leave. **The conditions are judged against your story** (the moment and the story bits the server keeps), so the reactor of
+    `nmkin_2` to `nmkin_4` hums (sound 38, channel 3) until the story reaches 27 and sounds its alarm (sound 60, channel 2) from there
+    on, and **when the server moves your story the loops are read again and changed**: the hum fades into the alarm while you stand
+    there. A condition on something the story does not carry (the party, a variable, the random number) is **not guessed**: what lies
+    behind it is left out, counted, and said in the log; so is a loop whose channel a part of a script that was not run could still
+    change. A fight takes over: the loops fade out when it starts and come back, from their start, when it is over.
+  - **Ladders and jumps.** When the server puts you through one (it tells your client with `MoveRejected`, and you stand where the link
+    leads), the sounds that the line's script, and the scripts of your own character it calls, play, at the times the script gives:
+    the take-off of a jump (sound 62) half a second in, a ladder's first sound (sound 21) at once. A script's sounds after a walk, a jump or a
+    climb have no time in the script and are not played (of the archive's 190 links, 123 in 26 fields play something at a time the script
+    gives; 47 more, in 9 fields, have only sounds of that other kind: the plan line counts them, `links 5 (+1 untimed)`). **The lift** of `elevtr1` plays the sound its panel's script starts when the
+    story bit it sets flips (sound 42, a loop clip, once through: its stop is behind waits the data do not give). A sound an event plays
+    replaces what its channel was playing, as the game's channels do.
+  - **Doors.** A gateway is data and makes no sound. A door whose script plays before its jump does when you come through it; the
+    server offers script exits in the reviewed fields only, and none of those has a door with a sound (150 of the archive's 1 114
+    walk-on script exits play a sound before the jump, in 63 fields; 6 of them can be followed from their line to the jump with
+    everything judged).
+  - **Not played, on purpose**: sounds inside a script's loop (a spark every two to four seconds in `md8_3`: the rhythm is a random
+    number), a cutscene's one-shots (their picture is not shown), the sounds of a talk, and the volume and pan envelopes of `AKAO` 160
+    to 175 (a sound plays at its start pan, at the master volume). Only the clips a field needs are read from `audio.dat`, off the
+    game's thread, when you enter it (and again for the ones a story change adds).
+
+  They share the master volume, **M** and `--mute`/`FMV_AUDIO` with the rest. **`FMV_FIELD_SOUNDS`** picks them: `data` (the
+  default) plays what the scripts say, `off` asks for nothing and plays nothing (the field's music and a battle's sounds are not
+  affected). **A party member's client keeps its own story** (the server tells it its own account's, not the leader's), so it
+  hears the field for ITS moment and not the lift the leader rode: in the first mission's walk the member's client stays at the
+  moment 1 throughout.
 - **Keys and flags.** In the game **M** mutes and unmutes (the music keeps moving while muted); **-** and **=**
   change the volume (the character menu has no sound keys: its name field would take them as letters). `--mute` or `FMV_AUDIO=off` builds no sound at all (no device is opened, nothing is decoded);
   `FMV_AUDIO=null` runs the whole soundtrack against a clock with no device; `FMV_AUDIO=auto`, the default of
@@ -1288,7 +1425,12 @@ in 842 ms` as each track finishes, `audio: playing bat (battle)` at the moment a
 sounds: 7 loaded in 5 ms` when a fight's clips were read, `audio: battle sound 18 (hit)` (or `critical`, `miss`, `impact`)
 at the moment each blow's sound plays, a closing `headless: audio: sound Null, tracks started: ob > bat > fanfare > ob`,
 and, when the run ends, `audio: battle sounds played: 86 (16x39 18x12 46x1 227x34)` (each sound id and how many times it
-played).
+played). The field's sounds say what they read, what they start and what they play, in short lines (`audio: field nmkin_2 sounds
+(moment 13): ambient ch3:38; links 3, lift 0, doors 0; unjudged 0, open 0; 13 ms` when a plan is read, and again when the story
+changes; `unjudged` counts the conditions that were skipped, `open` the loops left out, a link count may say `(+1 untimed)`
+for a link whose sound has no time to give it), `audio: field loop start ch3 38` and `audio: field loop stop ch3 38 (the field
+was left)` (or `(the story moved)`, `(a battle)`), `audio: field sound ch1 62 (link)` (or `(lift)`, `(door)`) at the moment an
+event's sound plays, and, when the run ends, `audio: field sounds played: 4 sounds (21x1 42x1 62x2), 4 loops (38x4)`.
 
 ## Packaging and smoke test
 

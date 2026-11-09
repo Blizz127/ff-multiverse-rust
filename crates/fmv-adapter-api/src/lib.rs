@@ -531,6 +531,11 @@ pub struct StoryStep {
     /// What changed, as `key=value` words of the adapter's own without spaces, for logs and the
     /// client's log (FF7: `moment=1->6`). Never text of the game.
     pub summary: String,
+    /// A countdown this step starts, in seconds (FF7: the bomb of the first reactor, a timer its script sets in the very
+    /// block that moves the story). The SERVER owns the clock and tells the players (`ServerMsg::Countdown`); the
+    /// adapter says how long and, with [`AreaRuntime::countdown_live`], for how long it matters. `None`: the step
+    /// starts nothing.
+    pub countdown: Option<u32>,
 }
 
 /// What an area's data holds of the story (exits its scripts decide, points that move the story) that its adapter
@@ -609,7 +614,10 @@ pub trait AreaRuntime: Send + Sync {
     /// progression of the account that governs the crossing player's instance (the party leader's, for a party
     /// member), and takes the first exit that answers [`ExitState::Open`]; a player that crosses a line whose exits
     /// are all closed walks over it as over any line. The default is open (a gateway is data), so only an adapter
-    /// that reports [`ExitKind::Script`] exits needs to answer.
+    /// that reports [`ExitKind::Script`] exits needs to answer. An adapter may close a script exit whatever the story
+    /// says when it leads to an area it does not offer in full (FF7: a field nobody has reviewed), so that the story
+    /// moving on never sends a player where nothing of it is served. (A member of a party that crosses the line its
+    /// leader left the area by is taken through the leader's exit instead of the story's: the server's `follow` module.)
     fn exit_state(&self, exit: &Exit, progress: &[u8]) -> ExitState {
         let _ = (exit, progress);
         ExitState::Open
@@ -671,6 +679,17 @@ pub trait AreaRuntime: Send + Sync {
     /// Additive: the default is none.
     fn links(&self) -> Vec<Link> {
         Vec::new()
+    }
+
+    /// Whether the countdown that a story step started (its [`StoryStep::progress`] is `started`) still matters to an
+    /// account whose progression is `now`. The server asks it whenever the account's progression changes and ends the
+    /// countdown (`Over { Cleared }`: it did not run out) when the answer is `false`. FF7: while the main story counter is
+    /// still where the step left it (the timer of the first reactor is shown, and runs out, only at that moment: a
+    /// step further on makes it moot, a lift that goes up or down does not). The default is `true`: a countdown
+    /// matters until it runs out. A blob the adapter cannot read is never live.
+    fn countdown_live(&self, started: &[u8], now: &[u8]) -> bool {
+        let _ = (started, now);
+        true
     }
 
     /// The battle that reaching story point `point` starts first, if it starts one (an FF7 script that runs a
