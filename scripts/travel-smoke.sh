@@ -36,7 +36,7 @@
 # only one line whose four exits the story picks from (crates/fmv-ff7/src/exit_gate.rs), so the party has to RIDE the
 # lift first (stand on the panel's triangle: the server turns the lift bit on and moves the story to 12) before the
 # exit to nmkin_2 is the open one. The route stops at nmkin_3 because that is as far as the walkmesh goes: its way
-# down to nmkin_4 is a scripted ladder (see the README of the adapter's story docs).
+# down to nmkin_4 is a scripted ladder (crates/fmv-ff7/tests/chain_real.rs, the_walkmesh_carries_the_party_down_to_nmkin_3).
 #   A (the leader):  --story-advance --party-invite-first-peer --travel ...   walks to the story point of each field
 #                    that moves ITS story (a triangle, a line it crosses; the fields that move it by themselves do it
 #                    when it comes to stand there), then on to the next exit

@@ -57,7 +57,9 @@ impl TalkBot {
 
     /// Talk to every wanted character that `npcs` (the area `area` announces) now contains and that has not
     /// been talked to yet; the lines to print. `moment` is the player's story counter (`None`: the
-    /// progression is not FF7's: the conversation is read as at the start of a new game).
+    /// progression is not FF7's: the conversation is read as at the start of a new game). (The tests' form of
+    /// [`TalkBot::step_with`], which the headless loop calls with the whole story state.)
+    #[cfg(test)]
     pub fn step(&mut self, area: &str, npcs: &[NpcView], moment: Option<u16>) -> Vec<String> {
         self.step_with(area, npcs, moment.map(StoryState::at))
     }
