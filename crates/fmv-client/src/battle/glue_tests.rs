@@ -412,3 +412,68 @@ fn an_enemy_attack_inside_a_commands_events_is_a_counter_and_only_that_is_counte
     let notes = c.drain_notes();
     assert!(notes.contains(&"counter: battle#1 counters=1".to_string()), "{notes:?}");
 }
+
+/// What the window does each frame of a battle: the scene is brought up to `t` with what arrived, then given the statuses the
+/// panels show (the very tags the view is drawn with: see `scene_for`).
+fn frame_of(c: &mut BattleClient, scene: &mut scene::BattleScene, t: f64) -> BattleView {
+    scene.update(t, &c.take_events(), c.engine());
+    let view = c.view(t).expect("a view");
+    if c.engine().is_some() {
+        scene.show_statuses(&view);
+    }
+    view
+}
+
+/// The colour factor of actor 0's body in the picture of `scene`.
+fn body_colour(scene: &scene::BattleScene) -> [f32; 3] {
+    scene.frame(&scene.view(1100, 680), false).tints[0].rgb
+}
+
+/// A sleeper wakes when the blow that wakes it LANDS: its tag leaves the panel and its body stands up straight and is itself
+/// again at the instant the blow's number floats up, and not when the message that carried the blow arrived (the engine has
+/// woken it by then). The same for the status that goes with a blow in every other case: the picture and the number agree.
+#[test]
+fn a_sleepers_tag_and_body_wake_when_the_blow_that_wakes_it_lands_and_not_when_the_message_arrives() {
+    let mut server = sick_server(&[Status::Sleep]);
+    let mut c = started(&server, 1.0);
+    let start = c.scene_start().expect("a battle to draw");
+    let mut kit = scene::ModelKit::new(Box::new(scene::model::StandInModels), None);
+    let mut scene = scene::BattleScene::new(&start, c.engine(), &mut kit).expect("a scene");
+    let view = frame_of(&mut c, &mut scene, 1.0);
+    assert!(view.party[0].status.contains(Status::Sleep), "asleep from the start");
+    assert_ne!(body_colour(&scene), [1.0; 3], "and the body says so");
+    // Time passes (the sleeper's own gauge is full, the dummy's fills) until the dummy's blow wakes the sleeper.
+    let mut t = 1.0;
+    let mut woken = None;
+    for _ in 0..4000 {
+        t += 0.05;
+        let msg = server.until_something_happens();
+        let wakes = |m: &ServerMsg| matches!(m, ServerMsg::BattleEvent { events, .. } if events.iter().any(|e| matches!(e, BattleEvent::StatusEnded { status: Status::Sleep, .. })));
+        let found = wakes(&msg);
+        let ServerMsg::BattleEvent { events, .. } = &msg else { unreachable!("a battle message") };
+        let landing = scene::cue::cues(events).iter().find_map(|cue| cue.events.iter().find(|e| matches!(e, BattleEvent::StatusEnded { .. })).map(|e| cue.delay_of(e)));
+        c.on_message(t, msg);
+        frame_of(&mut c, &mut scene, t);
+        if found {
+            woken = landing.map(|after| (t, after));
+            break;
+        }
+    }
+    let (arrival, after) = woken.expect("a blow woke the sleeper");
+    assert!(after > 0.0 && after <= scene::cue::MAX_IMPACT_DELAY, "it lands within the cap: {after}");
+    // The engine has woken it the moment the message arrived...
+    assert!(!c.engine().expect("a battle").statuses(ActorId(0)).contains(Status::Sleep));
+    // ...the panel and the body do not know it yet...
+    let at = |c: &BattleClient, t: f64| c.view(t).expect("a view").party[0].status.contains(Status::Sleep);
+    assert!(at(&c, arrival), "the tag is still on the panel when the message arrives");
+    assert_ne!(body_colour(&scene), [1.0; 3], "and the body is still asleep");
+    let view = frame_of(&mut c, &mut scene, arrival + after - 0.01);
+    assert!(view.party[0].status.contains(Status::Sleep), "a moment before the blow lands");
+    assert_ne!(body_colour(&scene), [1.0; 3]);
+    // ...and both change at the instant the blow lands, the instant its number is born.
+    let view = frame_of(&mut c, &mut scene, arrival + after + 0.01);
+    assert!(!view.party[0].status.contains(Status::Sleep), "the tag is gone as the blow lands");
+    assert_eq!(body_colour(&scene), [1.0; 3], "and so is the sleeper's dim blue");
+    assert!(view.popups.iter().any(|p| p.target == ActorId(0) && matches!(p.kind, popups::PopupKind::Damage { .. })), "with its number: {:?}", view.popups);
+    assert_eq!(c.divergences(), 0);
+}

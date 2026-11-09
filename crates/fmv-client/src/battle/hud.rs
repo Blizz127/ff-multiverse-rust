@@ -30,7 +30,8 @@
 //! the SHOW lags a little by design, by [`cue::MAX_IMPACT_DELAY`] at the most for the first blow of a batch
 //! (and for a counter, or any later action of it, until the one before has played, see [`cue`]): a number floats up
 //! when its blow lands ([`Popups`], scheduled with [`cue::Cue::delay_of`]), the HP and MP of the panels and the names of
-//! the fallen change at that same instant ([`Lag`]: the view is the engine's numbers minus the changes that have not
+//! the fallen change at that same instant, and so do the statuses the panels tag them with and the colours of the 3D bodies
+//! ([`Lag`]: the view is the engine's numbers minus the changes that have not
 //! landed), and an enemy that was beaten stays in the enemy list until its collapse begins on screen
 //! ([`BattleHud::decorate`] and [`BattleHud::linger_view`] keep it, at the most [`cue::MAX_BATCH_SPAN`] after the batch
 //! arrived). The sounds of the performances ([`Sounds`]: a weapon's hit, critical hit and miss, an enemy attack's
@@ -502,7 +503,7 @@ mod tests {
 
     /// Everybody's numbers for [`view`]'s four fighters (party 0 and 1, enemies 2 and 3): `hp` each, out of 10.
     fn everyone(hp: [u32; 4]) -> Vec<(ActorId, Vitals)> {
-        hp.iter().enumerate().map(|(i, hp)| (ActorId(i as u8), Vitals { hp: *hp, max_hp: 10, mp: 12, max_mp: 20, alive: *hp > 0 })).collect()
+        hp.iter().enumerate().map(|(i, hp)| (ActorId(i as u8), Vitals { hp: *hp, max_hp: 10, mp: 12, max_mp: 20, alive: *hp > 0, status: fmv_ff7_battle::status::StatusSet::EMPTY })).collect()
     }
 
     #[test]

@@ -33,14 +33,14 @@
 //!
 //! The matches on actions and events here and in [`cue`] are exhaustive on purpose. Protocol v7: a limit
 //! break ([`ActionRef::Limit`]) is a spell-like show (the performer gathers with the cast clips and a
-//! glow, then a strong burst: a bloom and a gold star, breaks over the target); an escape that fails
+//! bigger glow, then a strong effect and a flash break over the target: see [`super::effects`]); an escape that fails
 //! ([`BattleEvent::EscapeFailed`]) makes the performer stumble a little way back; one that succeeds (an
 //! [`ActionRef::Escape`] with no failure after it, and no victory pose: a battle that was escaped has no
 //! `Victory`) makes the whole party turn and run off the screen with the run clip ([`Director::on_escape`]).
 
 use super::clips::{Kit, Slot};
 use super::cue::{self, Cue, Landing};
-use super::effects::{Burst, BurstKind, Charge, Element, Look};
+use super::effects::{self, Element, Fx, Kind, Look, Style};
 use super::plan::{self, Lunge, Segment, Shape};
 use fmv_ff7_battle::rules::{ActionRef, ActorId, BattleEvent, Side};
 
@@ -73,7 +73,14 @@ const LONG_AGO: f64 = 1000.0;
 /// messages (or a window that was not drawing) cannot make the schedule grow without bound.
 pub const MAX_SEGMENTS: usize = 24;
 const MAX_EFFECTS: usize = 128;
-const MAX_BURSTS: usize = 64;
+/// The picture effects the scene remembers at the most (see [`super::effects`]).
+const MAX_FX: usize = 160;
+/// How long a shot's bolt flies from its shooter to its target, and the least an item is in the air, in seconds.
+const BOLT_FLIGHT: f64 = 0.14;
+const TOSS_AFTER: f64 = 0.08;
+/// How much stronger than a spell's the glow a limit break gathers is, and how much weaker an enemy's.
+const LIMIT_CHARGE: f32 = 1.6;
+const ENEMY_CHARGE: f32 = 0.8;
 /// How long a hurt clip plays at the most, in seconds, whatever its length.
 const MAX_HURT: f64 = 0.8;
 /// The party's victory poses start this far apart, in seconds, and this long after the last blow.
@@ -244,9 +251,10 @@ pub struct Director {
     /// When each party member began to run off after a successful escape, and the unit direction on the
     /// ground it runs along (`None`: it stays).
     escapes: Vec<Option<(f64, [f32; 2])>>,
-    /// What flashes at whom, for [`super::effects`].
-    bursts: Vec<Burst>,
-    charges: Vec<Charge>,
+    /// What the picture shows besides the bodies: the glows, bolts, bursts and signs of [`super::effects`].
+    fx: Vec<Fx>,
+    /// What makes the next effect's particles its own.
+    next_seed: u32,
     /// When the last blow of any performance lands.
     last_impact: f64,
 }
@@ -272,8 +280,8 @@ impl Director {
             deaths: vec![None; n],
             victories: vec![None; n],
             escapes: vec![None; n],
-            bursts: Vec::new(),
-            charges: Vec::new(),
+            fx: Vec::new(),
+            next_seed: 1,
             last_impact: f64::NEG_INFINITY,
         }
     }
@@ -365,9 +373,27 @@ impl Director {
             if let Some(lunge) = performance.lunge {
                 self.effects.push(Effect::Lunge { actor: pi, lunge, reach: performance.reach, dir });
             }
-            // A spell's caster glows while it gathers the spell, a limit's performer while it gathers its power.
-            if matches!(action, Some(ActionRef::Magic(_) | ActionRef::Limit(_))) {
-                self.charges.push(Charge { caster: pi, start: arrival, end: impact, element: look.element });
+            // A spell's caster glows while it gathers the spell, a limit's performer (more brightly) while it gathers its power; a
+            // guard shimmers at once.
+            match action {
+                Some(ActionRef::Magic(_)) => self.show(Kind::Charge, look.element, pi, None, (arrival, impact), 1.0),
+                Some(ActionRef::Limit(_)) => self.show(Kind::Charge, look.element, pi, None, (arrival, impact), LIMIT_CHARGE),
+                // An enemy's magic (a spell or a curse of its scene) gathers a little less than a party member's.
+                Some(ActionRef::EnemyAttack(_)) if look.style == Style::Spell => self.show(Kind::Charge, look.element, pi, None, (arrival, impact), ENEMY_CHARGE),
+                Some(ActionRef::Defend) => self.show(Kind::Guard, Element::Plain, pi, None, (arrival, arrival), 1.0),
+                _ => {}
+            }
+            // What flies from the performer to each of its targets: a shot's bolt (past a target it missed), an item.
+            for &t in &targets {
+                let Some((ti, _)) = self.anchor(t) else { continue };
+                match (look.style, action) {
+                    (Style::Shot, Some(ActionRef::Attack | ActionRef::EnemyAttack(_))) => {
+                        let missed = cue.events.iter().filter(|e| matches!(cue::landing(e), Some(Landing::Impact { target }) if target == t)).all(|e| matches!(e, BattleEvent::Miss { .. }));
+                        self.show(Kind::Bolt { hit: !missed }, look.element, ti, Some(pi), ((impact - BOLT_FLIGHT).max(arrival), impact), 1.0);
+                    }
+                    (Style::Item, Some(ActionRef::Item(_))) => self.show(Kind::Toss, Element::Plain, ti, Some(pi), ((arrival + TOSS_AFTER).min(impact), impact), 1.0),
+                    _ => {}
+                }
             }
             // An escape: the performer that failed is thrown back (away from the enemies); one that
             // got away takes the whole party with it.
@@ -383,7 +409,7 @@ impl Director {
         // What lands on whom, at the impact.
         for event in cue.events {
             match cue::landing(event) {
-                Some(Landing::Impact { target }) => self.land(event, target, impact, dir, action, look),
+                Some(Landing::Impact { target }) => self.land(event, target, (arrival, impact), dir, action, look),
                 Some(Landing::Death { actor }) => {
                     if let Some((i, _)) = self.anchor(actor) {
                         if self.deaths[i].is_none() {
@@ -395,12 +421,31 @@ impl Director {
                 None => {}
             }
         }
+        // A spell or an item that landed on nobody (a curse that did not take, an antidote with nothing to cure) fizzles at its
+        // performer; a limit break breaks with a flash over its first target.
+        let performer_at = performer.and_then(|p| self.anchor(p)).map(|(i, _)| i);
+        let first_target = targets.iter().find_map(|&t| self.anchor(t)).map(|(i, _)| i);
+        if let Some(pi) = performer_at {
+            if first_target.is_none() && matches!(action, Some(ActionRef::Magic(_) | ActionRef::Limit(_) | ActionRef::Item(_))) {
+                self.show(Kind::Fizzle, look.element, pi, None, (impact, impact), 1.0);
+            }
+        }
+        if let (Some(ActionRef::Limit(_)), Some(at)) = (action, first_target.or(performer_at)) {
+            self.show(Kind::Flash, look.element, at, None, (impact, impact), 1.0);
+        }
         self.last_impact = self.last_impact.max(impact);
-        self.charges.retain(|c| c.end > arrival - 1.0);
-        let over = self.bursts.len().saturating_sub(MAX_BURSTS);
-        self.bursts.drain(..over);
+        let over = self.fx.len().saturating_sub(MAX_FX);
+        self.fx.drain(..over);
         let over = self.effects.len().saturating_sub(MAX_EFFECTS);
         self.effects.drain(..over);
+    }
+
+    /// Schedule an effect of kind `kind` at actor `target` (coming from `from`), first drawn at `span.0` and landing at
+    /// `span.1`, `scale` strong.
+    fn show(&mut self, kind: Kind, element: Element, target: usize, from: Option<usize>, span: (f64, f64), scale: f32) {
+        let seed = self.next_seed;
+        self.next_seed = self.next_seed.wrapping_add(1);
+        self.fx.push(Fx { kind, element, target, from, start: span.0, land: span.1, scale, seed });
     }
 
     /// The shape of a blow: a party member's own blow, the clips of its animation script ([`Shape::Blow`]: its short-range
@@ -417,9 +462,16 @@ impl Director {
         }
     }
 
-    /// What `event` does to `target` when it lands at `impact`.
-    fn land(&mut self, event: &BattleEvent, target: ActorId, impact: f64, dir: [f32; 2], action: Option<ActionRef>, look: Look) {
+    /// What `event` does to `target` when it lands at `span.1` (its performance began at `span.0`).
+    fn land(&mut self, event: &BattleEvent, target: ActorId, span: (f64, f64), dir: [f32; 2], action: Option<ActionRef>, look: Look) {
         let Some((i, _)) = self.anchor(target) else { return };
+        let impact = span.1;
+        // What the picture shows at the target (see `effects`): a spell or a limit break gathers at its targets from the
+        // start of its performance, everything else happens at the impact.
+        if let Some(shown) = effects::show(event, &look, action.is_none()) {
+            let gathers = matches!(look.style, Style::Spell | Style::Limit { .. }) && action.is_some();
+            self.show(shown.kind, shown.element, i, None, (if gathers { span.0 } else { impact }, impact), shown.scale);
+        }
         let kit = &self.kits[i];
         match *event {
             BattleEvent::Damage { critical, .. } => {
@@ -436,24 +488,14 @@ impl Director {
                     }
                     None => self.effects.push(Effect::Flinch { actor: i, start: impact, critical, dir }),
                 }
-                let spellish = matches!(action, Some(ActionRef::Magic(_) | ActionRef::Limit(_)));
-                self.burst(impact, i, if spellish { BurstKind::Spell } else { BurstKind::Hit { critical } }, look.element);
-                // A limit break breaks with a strong effect: the gold star of a critical hit on top of the bloom.
-                if matches!(action, Some(ActionRef::Limit(_))) {
-                    self.burst(impact, i, BurstKind::Hit { critical: true }, look.element);
-                }
             }
             BattleEvent::Miss { .. } => {
                 // Step to alternating sides, so a run of misses does not all go the same way.
                 let side = if i % 2 == 0 { 1.0 } else { -1.0 };
                 self.effects.push(Effect::Dodge { actor: i, start: impact, dir: [-dir[1] * side, dir[0] * side] });
             }
-            BattleEvent::Heal { .. } | BattleEvent::Revive { .. } | BattleEvent::MpRestored { .. } => {
-                let kind = if matches!(action, Some(ActionRef::Magic(_) | ActionRef::Limit(_))) { BurstKind::Spell } else { BurstKind::Item };
-                self.burst(impact, i, kind, if look.element == Element::Plain { Element::Cure } else { look.element });
-            }
-            // A status shows as a word over the target and a tag on the panel (and, for the ones that show on the
-            // body, in how it is drawn): nothing moves because of it.
+            // Restoring and statuses move nobody (their sign is the effect above, the word and the tag are the overlay's).
+            BattleEvent::Heal { .. } | BattleEvent::Revive { .. } | BattleEvent::MpRestored { .. } => {}
             BattleEvent::StatusInflicted { .. } | BattleEvent::StatusEnded { .. } => {}
             // Not a landing at the target (the cue's own `landing` does not make these).
             BattleEvent::StatusTick { .. }
@@ -466,10 +508,6 @@ impl Director {
             | BattleEvent::EscapeFailed { .. }
             | BattleEvent::MpSpent { .. } => {}
         }
-    }
-
-    fn burst(&mut self, at: f64, target: usize, kind: BurstKind, element: Element) {
-        self.bursts.push(Burst { at, target, kind, element });
     }
 
     /// The battle was won at `now`: every party member still standing rejoices, one after the other,
@@ -533,18 +571,18 @@ impl Director {
         for segments in &mut self.segments {
             segments.retain(|s| s.end() > t - 0.05);
         }
-        self.bursts.retain(|b| t < b.at + super::effects::BURST_LIFE);
-        self.charges.retain(|c| t < c.end + 0.05);
+        self.fx.retain(|f| t < f.end());
     }
 
-    /// The effects that flash at actors (see [`super::effects`]).
-    pub fn bursts(&self) -> &[Burst] {
-        &self.bursts
+    /// The effects of the picture, oldest first (see [`super::effects`]): the scene draws the ones that are on at its clock.
+    pub fn fx(&self) -> &[Fx] {
+        &self.fx
     }
 
-    /// The spells that are being gathered.
-    pub fn charges(&self) -> &[Charge] {
-        &self.charges
+    /// Replace the picture's effects with `fx` (tests: the pictures of every effect on a scene that has no fight).
+    #[cfg(test)]
+    pub fn set_fx(&mut self, fx: Vec<Fx>) {
+        self.fx = fx;
     }
 
     /// Is actor `i` dead as far as the scene shows (its death has begun)? (tests)

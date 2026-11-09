@@ -707,7 +707,7 @@ fn offscreen_battle_a_counter_plays_after_the_blow_that_provoked_it() {
     use std::sync::Arc;
     let Some(mut gpu) = Shooter::new() else { return };
     let vitals = |v: &BattleView| -> Vec<(ActorId, Vitals)> {
-        v.party.iter().chain(&v.enemies).map(|b| (b.actor, Vitals { hp: b.hp, max_hp: b.max_hp, mp: b.mp, max_mp: b.max_mp, alive: b.alive })).collect()
+        v.party.iter().chain(&v.enemies).map(|b| (b.actor, Vitals { hp: b.hp, max_hp: b.max_hp, mp: b.mp, max_mp: b.max_mp, alive: b.alive, status: b.status })).collect()
     };
     for (w, h) in SIZES {
         let l = layout(w, h, 3);

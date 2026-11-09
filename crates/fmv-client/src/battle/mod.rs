@@ -60,7 +60,8 @@
 //! * Statuses: the party panel and the enemy list tag each fighter with the statuses it has (`Bar::status`, read from
 //!   the replayed engine), the ATB bar shows Haste, Slow and the stops, a sleeper, a stopped or a paralysed member is
 //!   not `ready` (it keeps its full gauge and gives no command), the Magic row of the menu is greyed out while our
-//!   character is silenced, the 3D scene tints and poses the bodies (`scene::body`), and every status the server
+//!   character is silenced, the 3D scene tints and poses the bodies (`scene::body`) and shows each status inflicted or cured as a
+//!   sign over the fighter (`scene::effects`), and every status the server
 //!   announces is one `status:` note (`inflicted`/`ended` with the actor and the status) and, with the turns of
 //!   Poison and Regen, one count per battle (`status: battle#N inflicted=A ended=B ticks=C`, before the end note).
 //! * Sounds (`sounds`): each performance plays its sound from the game's own data at the instant it lands (the moment its
@@ -68,9 +69,11 @@
 //!   impact from `scene.bin`'s attack record; what the data names no sound for (spells, items, limit breaks) is silent. The
 //!   hud schedules them like the numbers ([`BattleClient::sounds_due`]), the audio asks for the ones that came due and
 //!   reads only the clips this battle can need, when it starts ([`BattleClient::sound_plan`]).
-//! * HP in time (`lag`): the panels show the HP and MP of a fighter and whether it stands when the performance that changes
-//!   them lands (a counter's damage is seen when the counter lands, not when the message that carried it arrived); the
-//!   gauges, the menu and the 3D bodies follow the engine at once, and the lag is gone `MAX_BATCH_SPAN` after a batch.
+//! * HP in time (`lag`): the panels show the HP and MP of a fighter, whether it stands and the statuses it is tagged with when
+//!   the performance that changes them lands (a counter's damage is seen when the counter lands, not when the message that
+//!   carried it arrived; a Sleep's tag comes up when its spell breaks); the 3D bodies' colours, droop and held pose take their
+//!   statuses from those very tags (`scene::BattleScene::show_statuses`); the gauges and the menu follow the engine at once, and
+//!   the lag is gone `MAX_BATCH_SPAN` after a batch.
 //! * [`open_rules`] reads this machine's battle data (the same library set as the field archive);
 //!   [`open_names`] reads the spell, item and enemy attack names the windows show from the same files (and the sounds
 //!   the same data names, which travel in the [`NameBook`]).

@@ -64,10 +64,24 @@ fn near(a: f32, b: f32, tol: f32) -> bool {
     (a - b).abs() <= tol
 }
 
-/// The instants at which blows land on someone: the bursts of the physical hits.
-fn impacts(d: &Director) -> Vec<f64> {
-    d.bursts().iter().map(|b| b.at).collect()
+/// Whether an effect is what lands on a target (a blow, a burst, a sign), not what its performer does (a glow it gathers, a
+/// bolt or an item in the air, a guard, a fizzle, the flash of a limit break).
+fn lands_on_target(kind: Kind) -> bool {
+    !matches!(kind, Kind::Charge | Kind::Bolt { .. } | Kind::Toss | Kind::Guard | Kind::Fizzle | Kind::Flash)
 }
+
+/// The instants at which blows land on someone: the effects that land on targets.
+fn impacts(d: &Director) -> Vec<f64> {
+    d.fx().iter().filter(|f| lands_on_target(f.kind)).map(|f| f.land).collect()
+}
+
+/// The effects of a kind.
+fn of_kind(d: &Director, want: fn(Kind) -> bool) -> Vec<Fx> {
+    d.fx().iter().filter(|f| want(f.kind)).copied().collect()
+}
+
+const SLASH: Kind = Kind::Strike { how: effects::Strike::Slash, critical: false };
+const SPELL: Style = Style::Spell;
 
 // ----- the events and the schedule ------------------------------------------------------------
 
@@ -90,7 +104,7 @@ fn a_blow_lands_the_instant_its_numbers_are_born_and_what_lands_follows_the_tabl
 fn the_overlays_numbers_and_the_scenes_impacts_are_the_same_instants_for_the_same_batch() {
     use crate::battle::hud::BattleHud;
     use crate::battle::popups::Popups;
-    let cure = |_: ActorId, _: ActionRef| Look { melee: false, element: Element::Cure };
+    let cure = |_: ActorId, _: ActionRef| Look { melee: false, element: Element::Cure, style: SPELL };
     // Every kind of action that has something land, with the effects it can have.
     type LookFn<'a> = &'a dyn Fn(ActorId, ActionRef) -> Look;
     let batches: [(Vec<BattleEvent>, LookFn); 7] = [
@@ -144,7 +158,7 @@ fn the_overlays_numbers_and_the_scenes_impacts_are_the_same_instants_for_the_sam
 /// after the blow has landed and its follow-through has played, and the battle's victory pose waits for it.
 #[test]
 fn a_counter_in_the_batch_of_the_blow_plays_after_it_and_not_at_the_same_time() {
-    let melee: &dyn Fn(ActorId, ActionRef) -> Look = &|_, _| Look { melee: true, element: Element::Plain };
+    let melee: &dyn Fn(ActorId, ActionRef) -> Look = &|_, _| Look::PLAIN;
     let batch = [action(0, ActionRef::Attack), damage(0, 2, false), action(2, ActionRef::EnemyAttack(272)), damage(2, 0, false), damage(2, 1, false)];
     let counter_begins = 10.0 + cue::length_of(Some(ActionRef::Attack));
     // With clips: the blow lands at 10.5, the counter's blows (one announcement, a burst on each of the two) land together
@@ -192,15 +206,16 @@ fn no_blow_lands_later_than_the_cap_whatever_its_clips_its_reach_or_what_its_act
         let mut d = Director::with_kits(sides.clone(), anchors, vec![party.clone(), party.clone(), enemy.clone(), enemy.clone()]);
         let mut now = 100.0;
         for (i, what) in [ActionRef::Attack, ActionRef::Magic(27), ActionRef::Item(3), ActionRef::Defend, ActionRef::Attack].into_iter().enumerate() {
-            let before = d.bursts().len();
+            let before = d.fx().len();
             // The same actor again before the last one is over: its performance takes over.
             d.on_batch(now, &[action(0, what), damage(0, 2, i % 2 == 0)], PLAIN);
             // Every shape of the enemy's scripts (the gun, the swing, the spell) in turn.
             let attack = [272, 273, 274][i % 3];
             d.on_batch(now + 0.01, &[action(2, ActionRef::EnemyAttack(attack)), damage(2, 1, false)], PLAIN);
-            for burst in &d.bursts()[before..] {
-                assert!(burst.at <= now + 0.01 + MAX_IMPACT_DELAY + 1e-9, "{what:?} at {far}: the blow lands at {} after arrival {now}", burst.at);
-                assert!(burst.at >= now, "never before the batch arrived");
+            for fx in &d.fx()[before..] {
+                assert!(fx.land <= now + 0.01 + MAX_IMPACT_DELAY + 1e-9, "{what:?} at {far}: the effect lands at {} after arrival {now}", fx.land);
+                assert!(fx.land >= now && fx.start >= now, "never before the batch arrived");
+                assert!(fx.start <= fx.land, "it begins before it lands");
             }
             now += 0.2;
         }
@@ -226,14 +241,14 @@ fn a_flood_of_batches_does_not_make_the_schedule_grow_and_none_of_them_lands_lat
         d.on_batch(t, &[action(2, ActionRef::EnemyAttack(272)), damage(2, 0, false), BattleEvent::Death { actor: ActorId(3) }], PLAIN);
     }
     assert!(d.segments.iter().all(|s| s.len() <= MAX_SEGMENTS), "{:?}", d.segments.iter().map(Vec::len).collect::<Vec<_>>());
-    assert!(d.pending() <= MAX_EFFECTS && d.bursts().len() <= MAX_BURSTS, "{} effects, {} bursts", d.pending(), d.bursts().len());
+    assert!(d.pending() <= MAX_EFFECTS && d.fx().len() <= MAX_FX, "{} effects, {} pictures", d.pending(), d.fx().len());
     let last = 10.0 + 0.499;
     assert!(impacts(&d).iter().all(|&at| at <= last + MAX_IMPACT_DELAY + 1e-9), "{:?}", impacts(&d));
     // A death still counts, whatever was dropped.
     assert!(d.deaths[3].is_some());
     // Everything is over a few seconds later.
     d.prune(20.0);
-    assert!(d.pending() == 0 && d.bursts().is_empty() && d.segments.iter().all(Vec::is_empty));
+    assert!(d.pending() == 0 && d.fx().is_empty() && d.segments.iter().all(Vec::is_empty));
 }
 
 #[test]
@@ -268,9 +283,10 @@ fn a_party_members_blow_plays_its_attack_the_target_flinches_and_a_burst_flashes
     assert_eq!(d.motion(2, impact - 0.01).clip, None);
     assert_eq!(d.motion(2, impact + 0.05).clip.map(|c| c.slot), Some(1));
     assert!(d.motion(2, impact + 0.05).visible, "a hurt clip is the flinch: no blinking");
-    // The burst (sparks) is at the target from the impact.
-    assert_eq!(d.bursts().len(), 1);
-    assert_eq!((d.bursts()[0].target, d.bursts()[0].kind), (2, BurstKind::Hit { critical: false }));
+    // The slashes and sparks are at the target from the impact, and nothing else is shown (a blow has no lead).
+    assert_eq!(d.fx().len(), 1);
+    assert_eq!((d.fx()[0].target, d.fx()[0].kind), (2, SLASH));
+    assert_eq!((d.fx()[0].start, d.fx()[0].land), (impact, impact));
     // It runs up to its target and is back home when it is over.
     assert!(d.motion(0, impact).offset[2] < -1000.0, "it ran at its target (to -z): {:?}", d.motion(0, impact));
     d.prune(20.0);
@@ -280,9 +296,15 @@ fn a_party_members_blow_plays_its_attack_the_target_flinches_and_a_burst_flashes
 #[test]
 fn a_long_range_blow_hops_forward_and_no_further_and_an_item_at_an_enemy_is_the_throw_forward() {
     let mut d = with_clips();
-    let shoot = |_: ActorId, _: ActionRef| Look { melee: false, element: Element::Plain };
+    let shoot = |_: ActorId, _: ActionRef| Look { melee: false, element: Element::Plain, style: Style::Shot };
     d.on_batch(10.0, &blow(0, 2), &shoot);
     let impact = 10.5;
+    // A shot: a bolt flies from the shooter to the target and lands with the blow, which is a shot's small impact.
+    let bolts = of_kind(&d, |k| matches!(k, Kind::Bolt { hit: true }));
+    assert_eq!(bolts.len(), 1);
+    assert_eq!((bolts[0].from, bolts[0].target, bolts[0].land), (Some(0), 2, impact));
+    assert!(bolts[0].start >= 10.0 && bolts[0].start < impact, "it leaves the muzzle before it lands: {bolts:?}");
+    assert_eq!(of_kind(&d, |k| matches!(k, Kind::Impact { critical: false })).len(), 1);
     // The clips of its other script: the hop forward (3), the shot (31), the hop back (4); it never runs.
     let slots: Vec<Slot> = d.segments_of(0).iter().map(|s| s.slot).collect();
     assert_eq!(slots, [3, 31, 31, 4]);
@@ -342,7 +364,7 @@ fn an_enemys_attack_plays_the_clips_of_the_script_scene_bin_names_and_goes_as_fa
 #[test]
 fn an_enemys_spell_is_cast_where_it_stands_and_lands_at_the_effect() {
     let mut d = with_clips();
-    let fire = |_: ActorId, _: ActionRef| Look { melee: false, element: Element::Fire };
+    let fire = |_: ActorId, _: ActionRef| Look { melee: false, element: Element::Fire, style: SPELL };
     d.on_batch(5.0, &[action(2, ActionRef::EnemyAttack(274)), damage(2, 1, false)], &fire);
     // The gathering (11, 12, 13) up to the effect at the impact, then the end (14).
     let slots: Vec<Slot> = d.segments[2].iter().map(|s| s.slot).collect();
@@ -350,8 +372,12 @@ fn an_enemys_spell_is_cast_where_it_stands_and_lands_at_the_effect() {
     assert_eq!(d.motion(2, 5.55 - 0.001).clip.map(|c| c.slot), Some(13));
     assert_eq!(d.motion(2, 5.55 + 0.05).clip.map(|c| c.slot), Some(14));
     assert_eq!(d.pending(), 0, "it does not run anywhere");
-    // The burst is at the target at the impact.
+    // The burst is at the target at the impact, and the enemy gathers its spell where it stands (a little less brightly than a party member).
     assert!(impacts(&d).iter().all(|&at| (at - 5.55).abs() < 1e-9));
+    let charges = of_kind(&d, |k| k == Kind::Charge);
+    assert_eq!(charges.len(), 1);
+    assert_eq!((charges[0].target, charges[0].element), (2, Element::Fire));
+    assert!(charges[0].scale < 1.0 && (charges[0].start - 5.0).abs() < 1e-9 && (charges[0].land - 5.55).abs() < 1e-9, "{charges:?}");
 }
 
 #[test]
@@ -370,7 +396,7 @@ fn an_attack_whose_script_cannot_be_played_moves_procedurally_and_does_not_borro
         let run = d.effects.iter().filter(|e| matches!(e, Effect::Lunge { actor: 3, .. })).count();
         assert_eq!(run, 1, "it runs up to its target like an actor without clips");
         // It lands on schedule all the same.
-        assert!(d.bursts().iter().any(|b| (b.at - (9.0 + cue::impact_delay(Some(ActionRef::EnemyAttack(bad))))).abs() < 1e-9));
+        assert!(d.fx().iter().any(|f| (f.land - (9.0 + cue::impact_delay(Some(ActionRef::EnemyAttack(bad))))).abs() < 1e-9));
     }
     // An attack the scene does not name for it at all (or a plain attack) plays the first attack's script.
     let mut named_nowhere = d.clone();
@@ -379,10 +405,11 @@ fn an_attack_whose_script_cannot_be_played_moves_procedurally_and_does_not_borro
 }
 
 #[test]
-fn a_miss_is_a_step_aside_with_no_burst_and_a_spell_that_misses_shows_nothing_either() {
+fn a_miss_is_a_step_aside_and_a_small_whiff_beside_the_target() {
     let mut d = with_clips();
     d.on_batch(3.0, &[action(0, ActionRef::Attack), BattleEvent::Miss { actor: ActorId(0), target: ActorId(3) }], PLAIN);
-    assert!(d.bursts().is_empty());
+    assert_eq!(d.fx().len(), 1);
+    assert_eq!((d.fx()[0].kind, d.fx()[0].target, d.fx()[0].land), (Kind::Whiff, 3, 3.5));
     let mid = d.motion(3, 3.5 + f64::from(DODGE) * 0.5);
     assert!(near(mid.offset[0].hypot(mid.offset[2]), DODGE_DISTANCE, 1.0), "{mid:?}");
     assert_eq!(mid.clip, None, "a dodge plays no hurt clip");
@@ -393,29 +420,43 @@ fn a_miss_is_a_step_aside_with_no_burst_and_a_spell_that_misses_shows_nothing_ei
 #[test]
 fn a_cast_gathers_a_glow_begins_to_the_impact_and_breaks_in_the_elements_colour() {
     let mut d = with_clips();
-    let fire = |_: ActorId, _: ActionRef| Look { melee: false, element: Element::Fire };
+    let fire = |_: ActorId, _: ActionRef| Look { melee: false, element: Element::Fire, style: SPELL };
     d.on_batch(10.0, &[action(0, ActionRef::Magic(27)), BattleEvent::MpSpent { actor: ActorId(0), amount: 4 }, damage(0, 2, false)], &fire);
-    assert_eq!(d.charges().len(), 1);
-    assert_eq!((d.charges()[0].caster, d.charges()[0].element), (0, Element::Fire));
-    assert!((d.charges()[0].start - 10.0).abs() < 1e-9 && (d.charges()[0].end - 10.6).abs() < 1e-9);
+    let charges = of_kind(&d, |k| k == Kind::Charge);
+    assert_eq!(charges.len(), 1);
+    assert_eq!((charges[0].target, charges[0].element, charges[0].scale), (0, Element::Fire, 1.0));
+    assert!((charges[0].start - 10.0).abs() < 1e-9 && (charges[0].land - 10.6).abs() < 1e-9, "{charges:?}");
     assert_eq!(d.motion(0, 10.1).clip.map(|c| c.slot), Some(12));
     assert_eq!(d.motion(0, 10.7).clip.map(|c| c.slot), Some(13), "holds the pose as the spell breaks");
     // The burst is a spell's, in the colour of fire, on the target, at the impact; the target flinches.
-    assert_eq!((d.bursts()[0].kind, d.bursts()[0].element, d.bursts()[0].target), (BurstKind::Spell, Element::Fire, 2));
-    assert!((d.bursts()[0].at - 10.6).abs() < 1e-9);
+    let blasts = of_kind(&d, |k| k == Kind::Blast);
+    assert_eq!(blasts.len(), 1);
+    assert_eq!((blasts[0].element, blasts[0].target), (Element::Fire, 2));
+    assert!((blasts[0].land - 10.6).abs() < 1e-9);
+    // It gathers over the target from the start of the performance and peaks at the impact.
+    assert!((blasts[0].start - 10.0).abs() < 1e-9, "{blasts:?}");
     assert_eq!(d.motion(2, 10.65).clip.map(|c| c.slot), Some(1));
 }
 
 #[test]
 fn a_heal_bursts_green_and_an_items_effect_is_an_items_and_a_guard_is_the_guard_clip_once() {
     let mut d = with_clips();
-    let cure = |_: ActorId, _: ActionRef| Look { melee: false, element: Element::Cure };
+    let cure = |_: ActorId, _: ActionRef| Look { melee: false, element: Element::Cure, style: SPELL };
     d.on_batch(1.0, &[action(0, ActionRef::Magic(0)), BattleEvent::Heal { actor: ActorId(0), target: ActorId(1), amount: 80 }], &cure);
-    assert_eq!((d.bursts()[0].kind, d.bursts()[0].element, d.bursts()[0].target), (BurstKind::Spell, Element::Cure, 1));
+    let mends = of_kind(&d, |k| k == Kind::Mend);
+    assert_eq!(mends.len(), 1);
+    assert_eq!((mends[0].element, mends[0].target, mends[0].scale), (Element::Cure, 1, 1.0));
     assert_eq!(d.motion(1, 1.7).clip, None, "a heal is no flinch");
+    // An item: tossed from its user to the target, a lesser restoring effect there.
     let mut d = with_clips();
-    d.on_batch(1.0, &[action(0, ActionRef::Item(3)), BattleEvent::Heal { actor: ActorId(0), target: ActorId(0), amount: 50 }], PLAIN);
-    assert_eq!(d.bursts()[0].kind, BurstKind::Item);
+    let item = |_: ActorId, _: ActionRef| Look { melee: false, element: Element::Cure, style: Style::Item };
+    d.on_batch(1.0, &[action(0, ActionRef::Item(3)), BattleEvent::Heal { actor: ActorId(0), target: ActorId(1), amount: 50 }], &item);
+    let mends = of_kind(&d, |k| k == Kind::Mend);
+    assert!(mends.len() == 1 && mends[0].scale < 1.0, "{mends:?}");
+    let tosses = of_kind(&d, |k| k == Kind::Toss);
+    assert_eq!(tosses.len(), 1);
+    assert_eq!((tosses[0].from, tosses[0].target), (Some(0), 1));
+    assert!(tosses[0].start > 1.0 && tosses[0].start < tosses[0].land && (tosses[0].land - (1.0 + cue::impact_delay(Some(ActionRef::Item(3))))).abs() < 1e-9);
     assert_eq!(d.motion(0, 1.2).clip.map(|c| c.slot), Some(9), "the item gesture");
     let mut d = with_clips();
     d.on_batch(1.0, &[action(1, ActionRef::Defend)], PLAIN);
@@ -425,7 +466,9 @@ fn a_heal_bursts_green_and_an_items_effect_is_an_items_and_a_guard_is_the_guard_
     assert_eq!(guarding.slot, 5);
     assert!(near(guarding.frame, 6.0, 0.1), "{guarding:?}");
     assert!(d.segments_of(1).iter().all(|s| s.slot != 8 && !s.looping));
-    assert!(d.bursts().is_empty() && d.charges().is_empty());
+    // A guard shimmers at the guard, at once, and that is all it shows.
+    assert_eq!(d.fx().len(), 1);
+    assert_eq!((d.fx()[0].kind, d.fx()[0].target, d.fx()[0].start, d.fx()[0].land), (Kind::Guard, 1, 1.0, 1.0));
     assert_eq!(d.motion(1, 1.0 + 10.0 / 15.0 + 0.05).clip, None, "and it is over with the clip: back to the stance");
 }
 
@@ -567,7 +610,8 @@ fn a_critical_blow_blinks_longer_and_shakes_harder() {
     assert!(!critical.motion(2, impact + 0.50).visible && normal.motion(2, impact + 0.50).visible);
     let magnitude = |m: Motion| m.offset[0].hypot(m.offset[2]);
     assert!(magnitude(critical.motion(2, impact + 0.02)) > magnitude(normal.motion(2, impact + 0.02)));
-    assert_eq!(critical.bursts()[0].kind, BurstKind::Hit { critical: true });
+    assert_eq!(critical.fx()[0].kind, Kind::Strike { how: effects::Strike::Slash, critical: true });
+    assert_eq!(normal.fx()[0].kind, SLASH);
 }
 
 #[test]
@@ -669,30 +713,33 @@ fn idle_sway_is_small_distinct_per_actor_and_periodic() {
 // ----- protocol v7: limit breaks and escape ----------------------------------------------------------
 
 /// What `look_in` says of a limit break that strikes (it does not run up) and of one that heals.
-const STRIKE_LIMIT: &dyn Fn(ActorId, ActionRef) -> Look = &|_, _| Look { melee: false, element: Element::Plain };
-const HEAL_LIMIT: &dyn Fn(ActorId, ActionRef) -> Look = &|_, _| Look { melee: false, element: Element::Cure };
+const STRIKE_LIMIT: &dyn Fn(ActorId, ActionRef) -> Look = &|_, _| Look { melee: false, element: Element::Plain, style: Style::Limit { physical: true } };
+const HEAL_LIMIT: &dyn Fn(ActorId, ActionRef) -> Look = &|_, _| Look { melee: false, element: Element::Cure, style: Style::Limit { physical: false } };
 
 #[test]
 fn a_limit_break_is_a_long_spell_like_show_the_performer_gathers_and_a_strong_burst_breaks() {
     let mut d = with_clips();
     let batch = [action(0, ActionRef::Limit(128)), BattleEvent::LimitGauge { actor: ActorId(0), value: 0 }, damage(0, 2, false)];
     d.on_batch(10.0, &batch, STRIKE_LIMIT);
-    // It lands at the cap, like the longest spell, and the gauge event lands nothing of its own.
-    assert_eq!(impacts(&d).len(), 2, "a bloom and a star at the same instant");
+    // It lands at the cap, like the longest spell, and the gauge event lands nothing of its own: a strike as hard as a
+    // critical hit, bigger than any blow, and a flash over the first target at the same instant.
+    assert_eq!(impacts(&d).len(), 1);
     assert!(impacts(&d).iter().all(|&at| (at - (10.0 + MAX_IMPACT_DELAY)).abs() < 1e-9), "{:?}", impacts(&d));
-    let kinds: Vec<BurstKind> = d.bursts().iter().map(|b| b.kind).collect();
-    assert!(kinds.contains(&BurstKind::Spell) && kinds.contains(&BurstKind::Hit { critical: true }), "{kinds:?}");
-    assert!(d.bursts().iter().all(|b| b.target == 2));
-    // The performer glows from the arrival to the impact and plays the cast clips (it does not run up).
-    assert_eq!(d.charges().len(), 1);
-    assert_eq!((d.charges()[0].caster, d.charges()[0].start), (0, 10.0));
-    assert!((d.charges()[0].end - 10.6).abs() < 1e-9);
+    let strikes = of_kind(&d, |k| matches!(k, Kind::Strike { critical: true, .. }));
+    assert!(strikes.len() == 1 && strikes[0].target == 2 && strikes[0].scale > 1.0, "{strikes:?}");
+    let flashes = of_kind(&d, |k| k == Kind::Flash);
+    assert!(flashes.len() == 1 && flashes[0].target == 2 && (flashes[0].land - 10.6).abs() < 1e-9, "{flashes:?}");
+    // The performer glows from the arrival to the impact, more brightly than a caster, and plays the cast clips (it does not run up).
+    let charges = of_kind(&d, |k| k == Kind::Charge);
+    assert_eq!(charges.len(), 1);
+    assert_eq!((charges[0].target, charges[0].start), (0, 10.0));
+    assert!((charges[0].land - 10.6).abs() < 1e-9 && charges[0].scale > 1.0);
     assert!(d.segments_of(0).iter().any(|s| s.slot == party::CAST[0]), "{:?}", d.segments_of(0));
     assert_eq!(d.pending(), 0, "no lunge: nothing runs at the target");
     // The same show for what the performer does without clips: the burst and the glow, no panic.
     let mut plain = procedural();
     plain.on_batch(10.0, &batch, STRIKE_LIMIT);
-    assert_eq!((plain.bursts().len(), plain.charges().len()), (2, 1));
+    assert_eq!(plain.fx().len(), 3, "the glow, the strike and the flash");
     // The numbers and the blow agree whatever the show: the same instant the overlay's number is born.
     use crate::battle::popups::Popups;
     let mut popups = Popups::default();
@@ -707,11 +754,13 @@ fn a_healing_limit_glows_green_over_the_ally_it_heals() {
     let mut d = with_clips();
     let batch = [action(1, ActionRef::Limit(142)), BattleEvent::LimitGauge { actor: ActorId(1), value: 0 }, BattleEvent::Heal { actor: ActorId(1), target: ActorId(0), amount: 100 }];
     d.on_batch(5.0, &batch, HEAL_LIMIT);
-    assert_eq!(d.bursts().len(), 1);
-    let burst = d.bursts()[0];
-    assert_eq!((burst.target, burst.kind, burst.element), (0, BurstKind::Spell, Element::Cure));
-    assert!((burst.at - (5.0 + MAX_IMPACT_DELAY)).abs() < 1e-9);
-    assert_eq!((d.charges().len(), d.charges()[0].element), (1, Element::Cure));
+    let mends = of_kind(&d, |k| k == Kind::Mend);
+    assert_eq!(mends.len(), 1);
+    assert_eq!((mends[0].target, mends[0].element), (0, Element::Cure));
+    assert!(mends[0].scale > 1.0, "a limit heals bigger than a spell");
+    assert!((mends[0].land - (5.0 + MAX_IMPACT_DELAY)).abs() < 1e-9);
+    let charges = of_kind(&d, |k| k == Kind::Charge);
+    assert_eq!((charges.len(), charges[0].element), (1, Element::Cure));
 }
 
 #[test]
@@ -719,7 +768,7 @@ fn a_failed_escape_throws_the_performer_back_and_it_comes_back_and_nobody_runs()
     let mut d = with_clips();
     d.on_batch(10.0, &[action(0, ActionRef::Escape), BattleEvent::EscapeFailed { actor: ActorId(0) }], PLAIN);
     assert_eq!(d.pending(), 1, "one stumble");
-    assert!(d.bursts().is_empty() && d.charges().is_empty(), "nothing lands and nothing is gathered");
+    assert!(d.fx().is_empty(), "nothing lands and nothing is gathered");
     // Away from the enemies (they stand at z = -1500, the party at +2000): +z, to its farthest in a third of
     // the time, and home again when it is over.
     let at = |t: f64| d.motion(0, t).offset;
@@ -797,4 +846,155 @@ fn nothing_a_server_sends_about_limits_or_escapes_breaks_the_director() {
     let mut party_only = Director::new(vec![Side::Party], vec![Anchor { ground: [0.0, 2000.0], radius: 100.0 }]);
     party_only.on_escape(1.0);
     assert!(party_only.motion(0, 1.5).offset[2] > 0.0);
+}
+
+// ----- the picture's effects: what every kind of performance shows -----------------------------------------------------
+
+/// What the effects of the director are, in order.
+fn kinds(d: &Director) -> Vec<Kind> {
+    d.fx().iter().map(|f| f.kind).collect()
+}
+
+fn heal(actor: u8, target: u8) -> BattleEvent {
+    BattleEvent::Heal { actor: ActorId(actor), target: ActorId(target), amount: 40 }
+}
+
+fn inflicted(target: u8, status: fmv_ff7_battle::status::Status) -> BattleEvent {
+    BattleEvent::StatusInflicted { target: ActorId(target), status }
+}
+
+#[test]
+fn a_spell_on_a_whole_side_shows_on_every_target_and_the_caster_gathers_it_once() {
+    let mut d = with_clips();
+    let fire = |_: ActorId, _: ActionRef| Look { melee: false, element: Element::Fire, style: SPELL };
+    d.on_batch(10.0, &[action(0, ActionRef::Magic(27)), BattleEvent::MpSpent { actor: ActorId(0), amount: 4 }, damage(0, 2, false), damage(0, 3, false)], &fire);
+    let blasts = of_kind(&d, |k| k == Kind::Blast);
+    assert_eq!(blasts.iter().map(|f| f.target).collect::<Vec<_>>(), [2, 3], "an effect on each of the two enemies");
+    assert!(blasts.iter().all(|f| f.element == Element::Fire && (f.land - 10.6).abs() < 1e-9 && (f.start - 10.0).abs() < 1e-9), "{blasts:?}");
+    assert_ne!(blasts[0].seed, blasts[1].seed, "each has particles of its own");
+    assert_eq!(of_kind(&d, |k| k == Kind::Charge).len(), 1, "one glow at the caster, not one per target");
+    // The same for a whole party healed: an effect over every ally.
+    let mut d = with_clips();
+    let cure = |_: ActorId, _: ActionRef| Look { melee: false, element: Element::Cure, style: SPELL };
+    d.on_batch(10.0, &[action(0, ActionRef::Magic(0)), heal(0, 0), heal(0, 1)], &cure);
+    assert_eq!(of_kind(&d, |k| k == Kind::Mend).iter().map(|f| f.target).collect::<Vec<_>>(), [0, 1]);
+}
+
+#[test]
+fn a_shot_flies_a_bolt_to_each_of_its_targets_and_past_the_one_it_missed() {
+    // The MP's machine gun at the whole party: one is hit, one dodges.
+    let shot = |_: ActorId, _: ActionRef| Look { melee: false, element: Element::Plain, style: Style::Shot };
+    let mut d = with_clips();
+    d.on_batch(10.0, &[action(2, ActionRef::EnemyAttack(272)), damage(2, 0, false), BattleEvent::Miss { actor: ActorId(2), target: ActorId(1) }], &shot);
+    let landing = 10.0 + cue::impact_delay(Some(ActionRef::EnemyAttack(272)));
+    let bolts = of_kind(&d, |k| matches!(k, Kind::Bolt { .. }));
+    assert_eq!(bolts.iter().map(|f| (f.target, f.kind)).collect::<Vec<_>>(), [(0, Kind::Bolt { hit: true }), (1, Kind::Bolt { hit: false })]);
+    assert!(bolts.iter().all(|f| f.from == Some(2) && (f.land - landing).abs() < 1e-9 && f.start < f.land && f.start >= 10.0), "{bolts:?}");
+    // What lands is a shot's small impact and a whiff.
+    assert_eq!(kinds(&d).iter().filter(|k| matches!(k, Kind::Impact { critical: false })).count(), 1);
+    assert_eq!(kinds(&d).iter().filter(|k| **k == Kind::Whiff).count(), 1);
+    // A blow with no shot in it flies nothing.
+    let mut d = with_clips();
+    d.on_batch(10.0, &blow(0, 2), PLAIN);
+    assert!(!kinds(&d).iter().any(|k| matches!(k, Kind::Bolt { .. } | Kind::Toss)));
+}
+
+#[test]
+fn a_status_spell_shows_its_sign_where_it_lands_and_one_that_did_not_take_fizzles_at_its_caster() {
+    use fmv_ff7_battle::status::Status;
+    let spell = |_: ActorId, _: ActionRef| Look { melee: false, element: Element::Plain, style: SPELL };
+    // Sleep on the enemy, Haste on an ally: a curse and a buff, each over its target, from the start of the cast.
+    let mut d = with_clips();
+    d.on_batch(10.0, &[action(0, ActionRef::Magic(11)), BattleEvent::MpSpent { actor: ActorId(0), amount: 8 }, inflicted(2, Status::Sleep)], &spell);
+    d.on_batch(20.0, &[action(0, ActionRef::Magic(19)), inflicted(1, Status::Haste)], &spell);
+    let signs: Vec<(Kind, usize, f64)> = d.fx().iter().filter(|f| matches!(f.kind, Kind::Afflict(_) | Kind::Boost(_))).map(|f| (f.kind, f.target, f.land)).collect();
+    assert_eq!(signs, [(Kind::Afflict(Status::Sleep), 2, 10.6), (Kind::Boost(Status::Haste), 1, 20.6)]);
+    assert!(d.fx().iter().filter(|f| matches!(f.kind, Kind::Afflict(_) | Kind::Boost(_))).all(|f| f.start < f.land), "it begins with the cast");
+    // A spell whose roll failed says nothing at all but its announcement and its cost: its glow breaks into a fizzle at the caster.
+    let mut d = with_clips();
+    d.on_batch(10.0, &[action(0, ActionRef::Magic(11)), BattleEvent::MpSpent { actor: ActorId(0), amount: 8 }], &spell);
+    assert_eq!(kinds(&d), [Kind::Charge, Kind::Fizzle]);
+    let fizzle = d.fx()[1];
+    assert_eq!((fizzle.target, fizzle.from), (0, None));
+    assert!((fizzle.land - 10.6).abs() < 1e-9);
+    // An item that found nothing to do (an Antidote on a healthy ally) is the same, with no toss for it to fly.
+    let mut d = with_clips();
+    d.on_batch(10.0, &[action(0, ActionRef::Item(9))], &|_, _| Look { melee: false, element: Element::Plain, style: Style::Item });
+    assert_eq!(kinds(&d), [Kind::Fizzle]);
+    // Running away is no performance with effects of its own (the party turns and runs, or stumbles).
+    let mut d = with_clips();
+    d.on_batch(10.0, &[action(0, ActionRef::Escape), BattleEvent::EscapeFailed { actor: ActorId(0) }], PLAIN);
+    assert!(d.fx().is_empty());
+}
+
+#[test]
+fn a_status_with_no_announcement_lands_with_the_short_beat_and_has_no_lead() {
+    use fmv_ff7_battle::status::Status;
+    // A status that ran out on the clock, and one the battle began with, are events without an action: the beat of the numbers.
+    let mut d = with_clips();
+    d.on_batch(5.0, &[BattleEvent::StatusEnded { target: ActorId(1), status: Status::Barrier }, inflicted(0, Status::Poison)], PLAIN);
+    let beat = 5.0 + cue::impact_delay(None);
+    let all: Vec<(Kind, usize, f64, f64)> = d.fx().iter().map(|f| (f.kind, f.target, f.start, f.land)).collect();
+    assert_eq!(all, [(Kind::Cleanse(Status::Barrier), 1, beat, beat), (Kind::Afflict(Status::Poison), 0, beat, beat)]);
+    assert!(d.fx()[0].scale < 1.0, "it ends quietly");
+}
+
+#[test]
+fn every_kind_of_performance_that_does_something_has_an_effect_and_none_of_them_begins_before_its_performance() {
+    let spell = |_: ActorId, _: ActionRef| Look { melee: false, element: Element::Ice, style: SPELL };
+    let item = |_: ActorId, _: ActionRef| Look { melee: false, element: Element::Cure, style: Style::Item };
+    let miss = BattleEvent::Miss { actor: ActorId(0), target: ActorId(2) };
+    type Show = fn(Kind) -> bool;
+    type LookFn<'a> = &'a dyn Fn(ActorId, ActionRef) -> Look;
+    let cases: Vec<(&str, Vec<BattleEvent>, LookFn, Vec<Show>)> = vec![
+        ("a blow", blow(0, 2), PLAIN, vec![|k| matches!(k, Kind::Strike { critical: false, .. })]),
+        ("a critical blow", vec![action(0, ActionRef::Attack), damage(0, 2, true)], PLAIN, vec![|k| matches!(k, Kind::Strike { critical: true, .. })]),
+        ("a miss", vec![action(0, ActionRef::Attack), miss], PLAIN, vec![|k| k == Kind::Whiff]),
+        ("a damage spell", vec![action(0, ActionRef::Magic(30)), damage(0, 2, false)], &spell, vec![|k| k == Kind::Charge, |k| k == Kind::Blast]),
+        ("a heal", vec![action(0, ActionRef::Magic(0)), heal(0, 1)], &spell, vec![|k| k == Kind::Charge, |k| k == Kind::Mend]),
+        ("a revival", vec![action(0, ActionRef::Magic(7)), BattleEvent::Revive { actor: ActorId(0), target: ActorId(1), hp: 30 }], &spell, vec![|k| k == Kind::Raise]),
+        ("an Ether", vec![action(0, ActionRef::Item(3)), BattleEvent::MpRestored { actor: ActorId(0), target: ActorId(1), amount: 9 }], &item, vec![|k| k == Kind::Toss, |k| k == Kind::Mana]),
+        ("a Potion", vec![action(0, ActionRef::Item(0)), heal(0, 1)], &item, vec![|k| k == Kind::Toss, |k| k == Kind::Mend]),
+        ("a guard", vec![action(1, ActionRef::Defend)], PLAIN, vec![|k| k == Kind::Guard]),
+        ("an enemy's spell", vec![action(2, ActionRef::EnemyAttack(274)), damage(2, 1, false)], &spell, vec![|k| k == Kind::Blast]),
+    ];
+    for (what, events, look, wanted) in cases {
+        let mut d = with_clips();
+        d.on_batch(10.0, &events, look);
+        for want in &wanted {
+            assert!(d.fx().iter().any(|f| want(f.kind)), "{what} shows what it should: {:?}", kinds(&d));
+        }
+        assert!(d.fx().iter().all(|f| f.start >= 10.0 && f.start <= f.land && f.land <= 10.0 + MAX_IMPACT_DELAY + 1e-9), "{what}: {:?}", d.fx());
+    }
+    // A counter's effects begin when the counter does, never with the batch: the blow's own are already over by then.
+    let batch = [action(0, ActionRef::Attack), damage(0, 2, false), action(2, ActionRef::EnemyAttack(272)), damage(2, 0, false), damage(2, 1, false)];
+    let shot = |_: ActorId, a: ActionRef| if matches!(a, ActionRef::EnemyAttack(_)) { Look { melee: false, element: Element::Plain, style: Style::Shot } } else { Look::PLAIN };
+    let mut d = with_clips();
+    d.on_batch(10.0, &batch, &shot);
+    let counter_begins = 10.0 + cue::length_of(Some(ActionRef::Attack));
+    let (first, counter): (Vec<Fx>, Vec<Fx>) = d.fx().iter().copied().partition(|f| f.target == 2);
+    assert_eq!(first.len(), 1, "the blow's strike at the enemy");
+    assert!(first[0].land < counter_begins, "the blow lands before the counter begins");
+    assert_eq!(counter.len(), 4, "a bolt and an impact for each of the two of the party: {counter:?}");
+    assert!(counter.iter().all(|f| f.start >= counter_begins - 1e-9), "nothing of the counter before it begins: {counter:?}");
+    assert!(counter.iter().all(|f| (f.land - (counter_begins + cue::impact_delay(Some(ActionRef::EnemyAttack(272))))).abs() < 1e-9));
+}
+
+#[test]
+fn what_is_over_is_forgotten_and_the_list_of_effects_is_bounded() {
+    let mut d = with_clips();
+    let fire = |_: ActorId, _: ActionRef| Look { melee: false, element: Element::Fire, style: SPELL };
+    d.on_batch(10.0, &[action(0, ActionRef::Magic(27)), damage(0, 2, false)], &fire);
+    let last_end = d.fx().iter().map(Fx::end).fold(0.0, f64::max);
+    assert!(last_end > 10.6 && last_end < 12.0, "an effect is over about a second after it lands: {last_end}");
+    d.prune(10.3);
+    assert_eq!(d.fx().len(), 2, "both are still on");
+    d.prune(last_end + 0.001);
+    assert!(d.fx().is_empty());
+    // Whatever a flood of spells says, the director keeps only so many, the newest ones.
+    for k in 0..400 {
+        d.on_batch(100.0 + f64::from(k) * 1e-4, &[action(0, ActionRef::Magic(27)), damage(0, 2, false), damage(0, 3, false)], &fire);
+    }
+    assert!(d.fx().len() <= MAX_FX, "{} effects", d.fx().len());
+    assert!(d.fx().windows(2).all(|w| w[0].seed < w[1].seed), "the oldest were dropped, in order");
 }

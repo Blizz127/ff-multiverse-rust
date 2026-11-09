@@ -2,8 +2,8 @@
 
 Status: DESIGN NOTES ONLY. Written 2026-11-09 by teammate `sw-ffdesign` (swarm wave 4). The code audit was
 read at `main` `2fea4b5` and re-checked after the talk-dialogue merge `aa3462a` and its follow-up `094681e`. Docs only: nothing here is
-implemented, built or tested. Scope: FF8 and FF9. Later titles (FF10, FF12) wait for an owner clarification and
-are not covered; nothing below should make them harder.
+implemented, built or tested. Scope: FF8 and FF9. Later titles (FF10, then FF12; FF13 maybe later: the owner's order of 2026-11-09, section 0.1) are
+not covered yet; nothing below should make them harder.
 
 **No owned FF8 or FF9 files exist on this box.** Every claim about how an FF8 or FF9 file or
 archive is laid out carries a tag, in one of three tiers:
@@ -61,6 +61,55 @@ so that the body stays about decisions.
    any FF9 commitment (section 6.2, 8).
 7. **Thirteen owner decisions are listed in section 11, each with a recommendation**, and the owned
    files the owner must supply per game are in section 8.
+
+---
+
+## 0.1 The owner's vision and play model (2026-11-09, relayed by the Devbox coordinator)
+
+The owner's words (10:28 CST): "ff14 + pokemmo is the best way of doing it for myself, the best part is i can play solo
+and go through the games or select whatever game or with friends. cool part is connor playing pokemmo alone doing his
+stuff we can team up or go solo. being able to take a "stargate" to other ff worlds to play their game is great too."
+Earlier the same morning: "probably need a 3-4 max party", "do what pokemmo does" (co-op) and, for story scenes, "ff14
+aand ff11 is the best way of doing it" ("perfect ok lets do it"). The design targets that follow from them:
+
+* **Solo or co-op at any time.** Players share the world and see each other (as today, per story phase), and each keeps
+  their OWN progress per game. Battles are solo by default, fought beside the player's own canon companions; fighting
+  together is opt-in (PokeMMO's model: ordinary battles are solo even inside a party, co-op is group content such as
+  raids). A party is a social group the players form and leave freely, never a forced shared battle. **This changes
+  today's rule** (a party always battles together) and is planned for after the single-player early game.
+* **A battle holds at most 4:** the story's canon party first, then as many players' own characters as fit (two in the
+  first mission: Cloud, Barret and two originals). Nobody canon is displaced; a player who does not fit plays on solo.
+  Story bosses can be fought as a linked group, raid-style, each player's story moving only if they stand at that point.
+* **Story scenes like FF14 and FF11.** A player's Interact starts a per-player scene instance; the canon cast speak their
+  real lines from the owner's own files; the player's character is present as a witness, never in Cloud's place; party
+  members nearby can watch together. Scenes are data (a script reference plus a cast list), replayable with a custom
+  cast. The first proof is Cloud and Tifa at the bar in 7th Heaven (Game QA acceptance: the talk starts it, the lines
+  play in order, the witness is at the right scale with no clipping, camera and control come back cleanly, no replay or
+  soft-lock after a save and reload). This is the hosted-script-VM track of section 2.7.
+* **Pick any FF game, and travel between them.** One original character per player crosses every game (section 2),
+  each game keeping its own feel (section 1). The owner wants an in-world way to travel between the FF worlds (his
+  "stargate"): a portal hub that is ORIGINAL to FF Multiverse (no game's art), from which each game's world is entered
+  at that player's own progress in it. It needs the multi-game hosting of section 4 (today's server hosts one game) and
+  an identity that is already game-agnostic (it is: `PlayerCharacter`, per-game bindings and progress pointers).
+* **The roadmap of games (the owner, 10:29 CST):** "well we can go downt he order ff7,8,9,10,12 and loo kat 13 later if
+  all goes well otherwise": **FF7, then FF8, FF9, FF10 and FF12; FF13 is a maybe-later.** This settles the earlier
+  FF11-or-FF12 question (two relays had disagreed) in favour of FF12. FF7 stays the current priority.
+* **One renderer and asset loader per world, behind a shared adventurer and save layer.** Each game keeps its own look:
+  its own field and battle presentation read from the owner's own files for that game, while the account, the one
+  original character, parties, phasing and saves are shared. The original character gets a per-world restyled model (its
+  identity drawn in that game's art style, section 2.6), never another game's assets.
+* **A per-world appearance step at character creation (the owner, 10:30 CST):** "having the character model for each
+  game style is much easier i think since its just the one character, maybe durign character select they can design the
+  character for each game". The creator and the character select get one appearance step per world (FF7's now: today's
+  body, colour and fighting-style rows; FF8's and later ones as each game arrives), all for the SAME persistent character
+  and save. The record already has the shape: one game-agnostic identity plus a per-game binding (`PlayerCharacter`,
+  section 2), so a new world adds a binding (and its creator step) without touching the identity or any other game's.
+  A character entering a world it has no look for yet is asked for one there (or given that world's default body).
+  **Two ways to design it (the owner, 10:31 CST):** "the player can design the charater around one of the games and then
+  it deisngs it for all or they can do each game". Either the player designs the character ONCE, in any one game's style,
+  and the other worlds' looks are generated from that design, or the player designs each world by hand (and may still
+  touch up a generated one). Both rest on one shared, game-agnostic design record (body type, colours, hair, outfit
+  traits) that each world's creator step translates into its own style; the first pass has only FF7's look.
 
 ---
 

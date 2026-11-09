@@ -28,8 +28,9 @@
 //! * [`motion`]: what the actors do with time: the clips that play, lunges, flinches, dodges, deaths
 //!   (a party member's clip, an enemy's fade), the victory pose; the procedural motion for an actor
 //!   without clips.
-//! * [`effects`]: simple additive effects (a spell's burst coloured by its element, an item's
-//!   sparkle, the sparks of a blow, the glow a caster gathers) made of four shared meshes.
+//! * [`effects`]: what every performance looks like, from the action's own data (a blow's slashes, a shot's bolt, a spell's
+//!   element, a heal, a status's sign, an item in the air, a limit break's flash, a guard, a fizzle), on the cue timeline: it
+//!   begins with its performance, peaks at the landing and fades; made of seven shared additive meshes.
 //! * [`stage`]: the stand-in location: sky, haze, a round tiled floor. A real location model, when
 //!   the [`BattleModelSource`] has one, replaces its floor (and is cut to the camera first, see
 //!   `clip`).
@@ -81,6 +82,8 @@ mod sheets;
 mod identity_tests;
 #[cfg(test)]
 mod shots;
+#[cfg(test)]
+mod fx_shots;
 pub mod stage;
 
 pub use model::ModelKit;
@@ -97,7 +100,7 @@ use camera::{fit, BattleCamera, View, V3, NOMINAL_TAN_HALF_V};
 use fmv_core::{EntityId, Pos};
 use fmv_ff7::model::{mat4_mul, mat4_translate, transform_point};
 use clips::Kit;
-use effects::{EffectKit, Element, Look};
+use effects::{EffectKit, Element, Look, Strike, Style};
 use fmv_ff7_battle::rules::{ActionRef, ActorId, BattleEvent, BattleState, Combatant, Side};
 use fmv_ff7_battle::status::StatusSet;
 use fmv_protocol::battle::FormationScene;
@@ -281,33 +284,64 @@ pub struct BattleScene {
     entities: Vec<Option<EntityId>>,
     /// The party members waiting for a command.
     ready: Vec<bool>,
-    /// The statuses each actor has (the replayed engine's, copied by [`BattleScene::update`]): what [`body`] draws.
+    /// The statuses each actor has: what [`body`] draws. [`BattleScene::update`] copies the replayed engine's;
+    /// [`BattleScene::show_statuses`] replaces them with the panels' (which wait for the performance that changes them).
     statuses: Vec<StatusSet>,
     /// The scene clock: the time of the last [`BattleScene::update`], seconds.
     now: f64,
 }
 
-/// What an action looks like, from the engine's own data: whether its performer runs up to its target
-/// (a party member's weapon is short-range, an enemy's physical attack is melee) and which colour its
-/// effect is (a spell's element, a restoring action's cure green). Without the engine, a plain blow.
+/// The look of an action that does nothing the picture shows of its performer (a guard, running away).
+const STILL: Look = Look { melee: false, element: Element::Plain, style: Style::Blow(Strike::Slash) };
+
+/// What an action looks like, from the engine's own data: whether its performer runs up to its target (a party member's
+/// weapon is short-range, an enemy's physical attack is melee unless it is a shot), the colour of its effect (a spell's
+/// element, a restoring action's cure green) and how it is staged ([`Style`]): a record with the `SHOOT` bit (a gun, a
+/// laser, a thrown rock) is a shot, a magical one a spell, a physical one a blow that strikes as its `CUT`, `HIT` and `PUNCH`
+/// bits say; an item and a limit break are staged from their own records. Without the engine, a plain blow.
 fn look_in(engine: Option<&BattleState>, actor: ActorId, action: ActionRef) -> Look {
-    use fmv_ff7_battle::rules::ActionKind;
+    use fmv_ff7_battle::rules::{element, ActionKind, ActionSpec};
     let Some(who) = engine.and_then(|e| e.actor(actor)) else { return Look::PLAIN };
-    let of = |spec: &fmv_ff7_battle::rules::ActionSpec| Look { melee: spec.kind == ActionKind::Physical, element: Element::from_mask(spec.element_mask, spec.aims_at_allies()) };
+    let of = |spec: &ActionSpec| {
+        let shot = spec.element_mask & element::SHOOT != 0;
+        let style = if shot {
+            Style::Shot
+        } else if spec.kind == ActionKind::Magical {
+            Style::Spell
+        } else {
+            Style::Blow(Strike::of_mask(spec.element_mask))
+        };
+        Look { melee: spec.kind == ActionKind::Physical && !shot, element: Element::from_mask(spec.element_mask, spec.aims_at_allies()), style }
+    };
     match action {
-        ActionRef::Attack => Look { melee: who.side == Side::Enemy || who.short_range, element: Element::Plain },
-        ActionRef::EnemyAttack(id) => who.actions.iter().find(|a| a.id == id).map_or(Look::PLAIN, |a| of(&a.spec)),
-        ActionRef::Magic(id) => who.spells.iter().find(|s| s.index == id).map_or(Look { melee: false, element: Element::Plain }, |s| Look { melee: false, element: of(&s.spec).element }),
-        ActionRef::Item(id) => {
-            let heals = engine.and_then(|e| e.item_info(id)).is_some_and(|info| info.targets_allies);
-            Look { melee: false, element: if heals { Element::Cure } else { Element::Plain } }
+        // The party's weapon: a blade slashes, a gun shoots (a short-range weapon runs up). An enemy's plain attack thumps.
+        ActionRef::Attack if who.side == Side::Enemy => Look { melee: true, element: Element::Plain, style: Style::Blow(Strike::Thump) },
+        ActionRef::Attack if who.short_range => Look::PLAIN,
+        ActionRef::Attack => Look { melee: false, element: Element::Plain, style: Style::Shot },
+        // The scene's attacks that deal damage, and the ones that only have a status (a curse, a buff).
+        ActionRef::EnemyAttack(id) => who.actions.iter().chain(&who.status_actions).find(|a| a.id == id).map_or(Look::PLAIN, |a| of(&a.spec)),
+        ActionRef::Magic(id) => {
+            who.spells.iter().find(|s| s.index == id).map_or(Look { style: Style::Spell, ..STILL }, |s| Look { melee: false, style: Style::Spell, ..of(&s.spec) })
         }
-        ActionRef::Defend => Look { melee: false, element: Element::Plain },
-        // A limit break does not run up to its target (the performer gathers its power, see `motion`): its
-        // effect is cure green when it heals (Healing Wind) and the element of its blow otherwise.
-        ActionRef::Limit(_) => Look { melee: false, element: who.limit_break.map_or(Element::Plain, |l| of(&l.spec).element) },
-        // Running is no blow: nothing to colour.
-        ActionRef::Escape => Look { melee: false, element: Element::Plain },
+        ActionRef::Item(id) => {
+            let spec = engine.and_then(|e| e.items().get(id)).map(|item| item.spec);
+            Look { melee: false, element: spec.map_or(Element::Plain, |spec| Element::from_mask(spec.element_mask, spec.aims_at_allies())), style: Style::Item }
+        }
+        // A limit break does not run up to its target (the performer gathers its power, see `motion`): its effect is
+        // cure green when it heals (Healing Wind) and the element of its blow otherwise; a physical one (Braver) strikes.
+        ActionRef::Limit(_) => match who.limit_break {
+            Some(limit) => {
+                let spec = &limit.spec;
+                Look {
+                    melee: false,
+                    element: Element::from_mask(spec.element_mask, spec.aims_at_allies()),
+                    style: Style::Limit { physical: spec.kind == ActionKind::Physical && !spec.heals() },
+                }
+            }
+            None => Look { style: Style::Limit { physical: true }, ..STILL },
+        },
+        // A guard and running away are no blows: nothing to colour.
+        ActionRef::Defend | ActionRef::Escape => STILL,
     }
 }
 
@@ -418,6 +452,18 @@ impl BattleScene {
         for (actor, entity) in self.actors.iter_mut().zip(&self.entities) {
             // A canon companion has no entity, so nothing to be coloured by: it keeps its own colours.
             actor.colour = entity.and_then(&tint_of).or(actor.colour);
+        }
+    }
+
+    /// Show the statuses the panels show: `view`'s bars say which statuses each fighter has, and a status changes there when the
+    /// performance that inflicts or cures it lands (see `lag`), where [`BattleScene::update`] copies the engine's, which has
+    /// the whole batch at once. The window's scene is given this after every update (see [`scene_for`]), so that a body's
+    /// colour, droop and held pose change at the very instant its status tag does.
+    pub fn show_statuses(&mut self, view: &BattleView) {
+        for bar in view.party.iter().chain(&view.enemies) {
+            if let Some(slot) = self.statuses.get_mut(usize::from(bar.actor.0)) {
+                *slot = bar.status;
+            }
         }
     }
 
@@ -645,34 +691,55 @@ impl BattleScene {
         Some(([pos[0] - forward[0] * toward, pos[1] - h * 0.55 - forward[1] * toward, pos[2] - forward[2] * toward], actor.rig.height))
     }
 
-    /// The effects of the moment: what is gathered at each caster and the bursts at their targets, as
-    /// models facing the camera with a tint each (see [`effects`]).
+    /// The effects of the moment ([`effects`]): each one that is on at the scene clock, its pieces placed round the actor it plays
+    /// at as models facing the camera (a bolt as a ribbon between two actors, a flash over the whole window), with a tint each.
+    /// The newest effects win when there are more pieces than [`effects::MAX_LAYERS`].
     fn add_effects(&self, view: &View, camera_matrix: &[f64; 16], models: &mut Vec<SkinnedModel>, tints: &mut Vec<Tint>) {
+        use effects::Place;
         let (right, down, forward) = view.camera.axes();
-        let axes = |v: V3| v.map(|c| c as f32);
-        let (right, down, forward) = (axes(right), axes(down), axes(forward));
+        let to_f32 = |v: V3| v.map(|c| c as f32);
+        let axes = (to_f32(right), to_f32(down), to_f32(forward));
         let identity = [fmv_ff7::model::mat4_identity()];
-        let mut layers: Vec<(V3, f32, effects::Layer)> = Vec::new();
-        for burst in self.director.bursts() {
-            let age = ((self.now - burst.at) / effects::BURST_LIFE) as f32;
-            if let Some((centre, height)) = self.chest_of(burst.target, view).filter(|_| age >= 0.0) {
-                layers.extend(effects::burst_layers(burst.kind, burst.element, age, height).into_iter().map(|l| (centre, height, l)));
+        // The camera-frame offset `o` (right, down, towards the camera) from `centre`, in battle space.
+        let world = |centre: V3, o: [f32; 3]| -> V3 {
+            let o = o.map(f64::from);
+            [0, 1, 2].map(|k| centre[k] + right[k] * o[0] + down[k] * o[1] - forward[k] * o[2])
+        };
+        let mut pieces: Vec<(V3, effects::Layer)> = Vec::new();
+        let mut scratch: Vec<effects::Layer> = Vec::with_capacity(effects::MAX_LAYERS_PER_FX);
+        for fx in self.director.fx().iter().rev() {
+            if pieces.len() >= effects::MAX_LAYERS || fx.phase(self.now).is_none() {
+                continue;
             }
+            let Some((centre, height)) = self.chest_of(fx.target, view) else { continue };
+            // Where the actor a flying effect comes from is, as seen from the actor it flies to.
+            let from = fx.from.and_then(|f| self.chest_of(f, view)).map(|(p, _)| {
+                let d = [p[0] - centre[0], p[1] - centre[1], p[2] - centre[2]];
+                let dot = |a: V3| (d[0] * a[0] + d[1] * a[1] + d[2] * a[2]) as f32;
+                [dot(right), dot(down), -dot(forward)]
+            });
+            scratch.clear();
+            effects::layers(fx, self.now, &effects::Geo { height, from }, &mut scratch);
+            pieces.extend(scratch.drain(..).map(|l| (centre, l)));
         }
-        for charge in self.director.charges() {
-            let span = (charge.end - charge.start).max(1e-6);
-            let progress = ((self.now - charge.start) / span) as f32;
-            if let Some((centre, height)) = self.chest_of(charge.caster, view).filter(|_| self.now >= charge.start) {
-                layers.extend(effects::charge_layers(charge.element, progress, height).into_iter().map(|l| (centre, height, l)));
-            }
-        }
-        for (centre, _, layer) in layers {
-            let at = [
-                centre[0] + f64::from(right[0] * layer.offset[0] + down[0] * layer.offset[1] - forward[0] * layer.offset[2]),
-                centre[1] + f64::from(right[1] * layer.offset[0] + down[1] * layer.offset[1] - forward[1] * layer.offset[2]),
-                centre[2] + f64::from(right[2] * layer.offset[0] + down[2] * layer.offset[1] - forward[2] * layer.offset[2]),
-            ];
-            let place = effects::billboard(at.map(|c| c as f32), layer.radius, layer.spin, (right, down, forward));
+        pieces.truncate(effects::MAX_LAYERS);
+        for (centre, layer) in pieces {
+            let place = match layer.place {
+                Place::Facing { at, half, spin } => Some(effects::billboard(world(centre, at).map(|c| c as f32), half, spin, axes)),
+                Place::Between { from, to, half } => effects::ribbon(world(centre, from).map(|c| c as f32), world(centre, to).map(|c| c as f32), half, axes.0, axes.2),
+                // A plane in front of everyone that covers the window, with the lens axis at its middle.
+                Place::Screen => {
+                    const DEPTH: f64 = 1700.0;
+                    let zoom = view.zoom.max(1.0);
+                    let (hw, hh) = (f64::from(view.width) * 0.5 + view.shift[0].abs(), f64::from(view.height) * 0.5 + view.shift[1].abs());
+                    let reach = (hw.hypot(hh) * DEPTH / zoom * 2.2) as f32;
+                    let at = [-view.shift[0] * DEPTH / zoom, view.shift[1] * DEPTH / zoom, DEPTH];
+                    let eye = view.camera.position();
+                    let middle = [0, 1, 2].map(|k| (eye[k] + right[k] * at[0] + down[k] * at[1] + forward[k] * at[2]) as f32);
+                    Some(effects::billboard(middle, [reach, reach], 0.0, axes))
+                }
+            };
+            let Some(place) = place else { continue };
             let asset = self.effects.asset(layer.prim);
             let mut positions = Vec::new();
             if skin(asset, &identity, &place, camera_matrix, &mut positions) {
@@ -771,6 +838,11 @@ pub fn scene_for<'a>(
     // snapshots say, asked every frame so that one that arrives late applies).
     scene.show_player_colours(|entity| state.tint_of(entity));
     scene.update(now, events, state.battle.engine());
+    // The statuses of the bodies are the panels': they change when the performance that changes them lands (only while the
+    // battle runs: after it, nothing is left on anybody).
+    if state.battle.engine().is_some() {
+        scene.show_statuses(view);
+    }
     Some(scene)
 }
 
