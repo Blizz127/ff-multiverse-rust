@@ -252,6 +252,8 @@ pub enum NetCommand {
     Battle(BattleCmd),
     /// The answer to an `AreaChange`.
     Area(AreaAnswer),
+    /// A story scene's message: the owner's step or end, a watcher's leave, the debug preview (see `crate::scene`).
+    Scene(crate::scene::SceneCmd),
     Leave,
 }
 
@@ -655,7 +657,14 @@ where
             | ServerMsg::CharacterProgress { .. }
             | ServerMsg::Inventory { .. }
             // Where the player's story stands (said once on joining when it is not a new account's).
-            | ServerMsg::StoryUpdate { .. }) => push_backlog(&mut backlog, other),
+            | ServerMsg::StoryUpdate { .. }
+            // A story scene's traffic is for the scene player (`crate::scene`); the server only sends it to a player that
+            // started or watches one, so nothing of it can arrive before the join, but if it did it must not be lost: the
+            // player is held until the run ends.
+            | ServerMsg::SceneStart { .. }
+            | ServerMsg::SceneStep { .. }
+            | ServerMsg::SceneEnded { .. }
+            | ServerMsg::SceneRefused { .. }) => push_backlog(&mut backlog, other),
         }
         if let (Some(_), Some(_), Some(_)) = (&welcome, &offer, &snapshot) {
             let (Some(w), Some(o), Some(entities)) = (welcome, offer, snapshot) else {
@@ -758,6 +767,7 @@ async fn session_loop<R, W>(
                 Some(NetCommand::Party(p)) => p.to_msg(),
                 Some(NetCommand::Battle(b)) => b.to_msg(),
                 Some(NetCommand::Area(a)) => a.into_msg(),
+                Some(NetCommand::Scene(c)) => c.into_msg(),
                 Some(NetCommand::Leave) | None => {
                     let _ = timeout(WRITE_TIMEOUT, write_msg(&mut wr, &ClientMsg::Leave)).await;
                     break;

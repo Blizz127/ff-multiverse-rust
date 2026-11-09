@@ -317,6 +317,21 @@ impl Session {
         }
     }
 
+    /// Send what the scene client owes the server (the owner's steps and end, a watcher's leave, a preview request), in order.
+    pub fn flush_scene(&mut self) {
+        for cmd in self.state.scene.take_commands() {
+            self.net.send(NetCommand::Scene(cmd));
+        }
+    }
+
+    /// Print what the scene client has to say about itself since the last call, one `scene:` line each, on stderr (ids and
+    /// counts only; the headless bot's scene lines go to stdout, see `crate::scene::bot`).
+    pub fn log_scene_notes(&mut self) {
+        for line in self.state.scene.take_notes() {
+            eprintln!("{line}");
+        }
+    }
+
     /// Say goodbye and wait (bounded) for the network thread to flush `Leave`.
     pub fn leave(&mut self, wait: Duration) {
         self.net.leave_and_join(wait);

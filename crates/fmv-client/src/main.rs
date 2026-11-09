@@ -39,6 +39,7 @@ mod party;
 mod progress;
 mod render;
 mod route;
+mod scene;
 mod session;
 mod state;
 mod story;

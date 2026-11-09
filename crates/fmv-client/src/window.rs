@@ -17,6 +17,7 @@ use crate::interp::render_time;
 use crate::net::PartyCommand;
 use crate::npc::{npc_models, npc_players, npc_who};
 use crate::render::{FrameResult, PlayerSprite, Renderer, Scene};
+use crate::scene::{self, SceneRoute};
 use crate::session::{Session, SessionInfo};
 use crate::state::ClientState;
 use crate::ui::dialogue::{field_key, Talk};
@@ -551,6 +552,8 @@ pub(crate) struct App {
     /// The field's music, the battle music, the fanfare and the menu sounds (off unless
     /// [`App::with_audio`] gave it one: `--mute`, a library without sound and the fixture have none).
     audio: GameAudio,
+    /// How many story scenes had begun when the window last looked (a new one lets go of the keys held and closes a talk).
+    scene_started: u64,
 }
 
 impl App {
@@ -589,6 +592,7 @@ impl App {
             pads: Pads::closed(),
             talk: Talk::ff7(None),
             audio: GameAudio::off(),
+            scene_started: 0,
         }
     }
 
@@ -613,6 +617,30 @@ impl App {
     /// A key went down, came up or repeated: from the keyboard or from a game controller, which
     /// make the same key events (`PadKey::key_code`) and so go through this one dispatch.
     fn key_event(&mut self, el: &ActiveEventLoop, code: KeyCode, pressed: bool, repeat: bool, source: InputSource) {
+        // A story scene on show owns every key; with none, F6 asks the server for a preview of the first scene and a fresh OK
+        // next to a scene's trigger starts it (see `crate::scene::route_key`). All before the field's own keys.
+        let now = self.session.now();
+        let area = &self.session.info.area_id.key;
+        match scene::route_key(&mut self.session.state, area, now, self.talk.is_open(), code, pressed, repeat) {
+            SceneRoute::Scene => {
+                // A key let go of during a scene still ends the walk: it must never be lost.
+                if !pressed {
+                    self.input.set(code, false);
+                }
+                return;
+            }
+            SceneRoute::Preview => {
+                eprintln!("scene: asking the server for a preview of the first scene");
+                self.notice = Some(("Asking the server for a scene preview", Instant::now() + NOTICE_TIME));
+                return;
+            }
+            SceneRoute::Press(npc) => {
+                eprintln!("scene: OK next to a scene's trigger (character {npc})");
+                self.session.send_interact(Some(npc));
+                return;
+            }
+            SceneRoute::Field => {}
+        }
         // A dialogue takes its keys first; a fresh Enter or Space outside a battle talks to the
         // character in front of us. It is also a press of OK, which the server must hear of (a character's talk can
         // move the story; a ladder or a lift panel is used by it): the conversation it opens is built first, from the
@@ -646,7 +674,7 @@ impl App {
     /// reads in eight and a held direction is a held key.
     fn poll_pads(&mut self, el: &ActiveEventLoop, now: Instant) {
         let battle = &self.session.state.battle;
-        let menu = battle.in_battle() || battle.lingering(self.session.now()) || self.talk.is_open();
+        let menu = battle.in_battle() || battle.lingering(self.session.now()) || self.talk.is_open() || self.session.state.scene.is_active();
         let mode = if menu { PadMode::Menu } else { PadMode::Field };
         for event in self.pads.poll(now, mode) {
             self.key_event(el, event.key.key_code(), event.pressed, event.repeat, InputSource::Pad);
@@ -685,6 +713,8 @@ impl App {
     /// area, its view (camera, background, walkmesh) is built from this machine's own FF7 data.
     pub(crate) fn with_ff7(mut self, ff7: Option<Arc<Ff7Adapter>>) -> Self {
         self.talk = Talk::ff7(ff7.clone());
+        // Story scenes are built from the same data (without it a scene cannot be played here and its player releases itself).
+        self.session.state.scene.set_builder(Box::new(scene::Ff7Scenes::new(ff7.clone())));
         self.ff7 = ff7;
         self
     }
@@ -825,6 +855,15 @@ impl App {
         }
     }
 
+    /// The server refused a scene request (the F6 preview on a server that does not run it, an OK that cannot start one now):
+    /// one line on the screen and on stderr, as the other refusals are shown.
+    fn scene_notice(&mut self) {
+        if let Some(reason) = self.session.state.scene.take_refusal() {
+            eprintln!("scene: the server refused it ({reason:?})");
+            self.notice = Some((refusal_notice(reason), Instant::now() + NOTICE_TIME));
+        }
+    }
+
     fn tick(&mut self, el: &ActiveEventLoop) {
         let now = Instant::now();
         let dt = now.duration_since(self.last_tick).as_secs_f32().min(MAX_DT);
@@ -843,6 +882,17 @@ impl App {
         if self.session.take_area_change().is_some() {
             self.rebuild_view();
         }
+        // A story scene: its clock, what it owes the server, what it has to say. A new one lets go of the keys held when it
+        // began (their releases may be swallowed) and closes a talk (the server holds the player).
+        self.session.state.scene.advance(dt);
+        self.session.flush_scene();
+        self.session.log_scene_notes();
+        self.scene_notice();
+        if self.session.state.scene.started() != self.scene_started {
+            self.scene_started = self.session.state.scene.started();
+            self.input = Input::default();
+            self.talk.close();
+        }
         // The music follows the area and the battle (before the battle's early return below: a fight is
         // exactly when it changes).
         self.audio.update_from(&self.session);
@@ -859,7 +909,7 @@ impl App {
         let (speed, moving) = movement_pace(self.view.stage.as_ref(), self.input.walking(), self.session.area.max_speed());
         // The keys mean directions on the SCREEN; the area is walked in its own axes. Under a dialogue
         // window the player stands still (no keys: idle, and the intent is sent as usual).
-        let keys = if self.talk.is_open() { (0.0, 0.0) } else { self.input.dir() };
+        let keys = if self.talk.is_open() || self.session.state.scene.is_active() { (0.0, 0.0) } else { self.input.dir() };
         let dir = if keys == (0.0, 0.0) {
             keys
         } else {
@@ -935,10 +985,23 @@ impl App {
         // the head of a model instead of over the marker's centre.
         let (vw, vh) = renderer.size();
         let mut overlay = DrawList::new();
-        let anchor = |subject: Subject, at: Pos| label_anchor(built.as_ref(), view, draw.own_who, subject, at);
+        // (a scene's trigger is not drawn while its scene runs, and is not named either)
+        let story = state.scene.player();
+        let anchor = |subject: Subject, at: Pos| {
+            if scene::label_hidden(story, subject) {
+                None
+            } else {
+                label_anchor(built.as_ref(), view, draw.own_who, subject, at)
+            }
+        };
         let hud_input = hud::gather_anchored(state, &self.session.info, view, render_t, &anchor);
         hud::draw_hud_with(&hud_input, hud::progress_line(state, render_t).as_ref(), vw, vh, &mut overlay);
         self.talk.draw(vw, vh, now, &mut overlay);
+        // The window of a story scene, near whoever speaks.
+        if let Some(story) = story {
+            let spot = scene::speaker_spot(story, built.as_ref(), view, vw, vh);
+            story.draw(vw, vh, now, spot.as_ref(), &mut overlay);
+        }
         if let Some(text) = notice {
             draw_notice(text, vw, vh, &mut overlay);
         }
@@ -949,6 +1012,17 @@ impl App {
             (_, Some(e)) => self.fail(el, format!("GPU error: {e}")),
             _ => {}
         }
+    }
+}
+
+/// What the screen says when the server refuses a scene request.
+fn refusal_notice(reason: fmv_protocol::SceneRefusal) -> &'static str {
+    use fmv_protocol::SceneRefusal;
+    match reason {
+        SceneRefusal::Unavailable => "This server does not run scene previews",
+        SceneRefusal::UnknownScene => "The server has no such scene",
+        SceneRefusal::Busy => "A scene cannot start now",
+        SceneRefusal::NotHere => "That scene is not on offer here",
     }
 }
 
@@ -991,7 +1065,14 @@ pub(crate) fn field_draw(
         }
     }
     let remotes = state.remote_views(render_t);
-    let mut players: Vec<AvatarPlayer<'_>> = npc_players(state.npc_views());
+    // While a story scene runs the cast stands among the area's characters (its trigger is not drawn: the cast member that
+    // plays its part is) and the players that take part are drawn on their witness spots (see `crate::scene::draw`).
+    let story = state.scene.player();
+    let npcs = scene::visible_npcs(state.npc_views(), story);
+    let mut players: Vec<AvatarPlayer<'_>> = npc_players(&npcs);
+    if let Some(story) = story {
+        players.extend(scene::cast_players(story));
+    }
     players.extend(remotes.iter().map(|v| AvatarPlayer {
         who: Who(v.id.0),
         pos: v.pose.pos,
@@ -1015,6 +1096,9 @@ pub(crate) fn field_draw(
         own: true,
         party: state.party.party_size() > 0,
     });
+    if let Some(story) = story {
+        scene::place_witnesses(&mut players, story);
+    }
     let built = match (avatars, view.stage.as_ref()) {
         (Some(avatars), Some(stage)) => Some(avatars.frame(view, stage, &players, dt)),
         _ => None,
