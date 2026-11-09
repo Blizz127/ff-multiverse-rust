@@ -89,8 +89,11 @@
 //! * **One target that has fallen** by the time its attack comes up (the script chose it earlier, perhaps
 //!   turns ago, and kept the mask in its memory) makes the attack **fizzle**: nothing is announced, spent or
 //!   drawn, and the script's memory (stored before the first attack) is kept, so that its cycle goes on.
-//! * An attack of the scene that the rules cannot play (no damage, healing, a status) is announced and does
-//!   nothing, whomever it is aimed at.
+//! * An attack of the scene that has only a status ([`Combatant::status_actions`]) is played wherever its script
+//!   aims it, on the party or, for a buff, on the enemy itself or its own side, with the rules of "RNG draw order"
+//!   for a status-only action; it costs the enemy no MP and is never refused for it (`BattleState::plan_choices`
+//!   says why). An attack of the scene that the rules cannot play (an animation: no damage, no healing, no status
+//!   they model) is announced and does nothing, whomever it is aimed at.
 //! * **Counters.** When a party member's action ([`Command::Attack`], [`Command::Magic`], [`Command::Item`] or
 //!   [`Command::Limit`]) has been played on its targets, every enemy among them that has scripts notes who
 //!   hit it and answers with its counter scripts ([`crate::ai`], "Counters": the Death counter if the blow
@@ -98,7 +101,9 @@
 //!   action). What a counter queues is played like an enemy turn (without touching the enemy's gauge), as
 //!   events right after the action's own, in the same batch ([`BattleState::submit_command`] returns them),
 //!   so a client that replays the command gets them from its own engine. Nothing answers a healing
-//!   action, and nothing once the battle has an outcome.
+//!   action, and nothing once the battle has an outcome. An enemy that **Poison** kills on the clock answers its
+//!   death too: its Death counter runs in the same step's events right after the `Death` (no attacker is noted,
+//!   so a counter that has to aim at the attacker finds nobody and is skipped), unless that death ended the battle.
 //!
 //! # Whole-side targeting
 //!
@@ -219,8 +224,11 @@
 //!   one: `miss_roll`; a physical one: `luck_roll` then `miss_roll`, as above), and never against an ally or with an
 //!   item. The draw is made before anything else is asked of the target, so an immune target (or one that
 //!   already has the status) costs it too; a record whose statuses the rules do not play has no status effect at
-//!   all ([`ActionSpec::status`] is `None`) and draws nothing. Poison, Regen and the timers draw nothing: the
-//!   draws of every action without a status effect are exactly what they were before statuses.
+//!   all ([`ActionSpec::status`] is `None`) and draws nothing. The clocks of Poison, Regen and the timers draw
+//!   nothing themselves, and the draws of every action without a status effect are exactly what they were before
+//!   statuses. What a clock can START draws as it always does: a scripted enemy that Poison kills answers with its
+//!   Death counter (see "Counters"), which draws like any counter (its script's random words, a random target, the
+//!   rolls of the attack it plays), and an enemy's script that casts a status-only attack draws the rolls above for it.
 //! * [`Command::Defend`] and every validation failure draw nothing.
 //! * [`Command::Limit`] draws what the limit's action draws: a damaging limit never misses and cannot
 //!   be a critical hit, so only its `variance = range_inclusive(0, 255)` (the standard formula has
@@ -467,6 +475,10 @@ pub struct Combatant {
     pub spells: Vec<Spell>,
     /// The attacks an enemy picks from when its gauge fills (empty: a plain attack).
     pub actions: Vec<EnemyAction>,
+    /// The attacks of its scene that have only a status (a curse on the party, a buff on itself) and that its AI script can
+    /// queue ([`EnemyAction::status_from_scene`]). The plain behaviour never picks one: they are not in [`Combatant::actions`],
+    /// which is its pool and always was.
+    pub status_actions: Vec<EnemyAction>,
     /// How the combatant answers elements (enemies only, from their record).
     pub affinities: Vec<ElementAffinity>,
     /// Assigned by [`BattleState`]; any value passed in is overwritten.
@@ -530,6 +542,7 @@ impl Combatant {
             reward: Reward::default(),
             spells: Vec::new(),
             actions: Vec::new(),
+            status_actions: Vec::new(),
             affinities: Vec::new(),
             side: Side::Party,
             gauge: 0,
@@ -625,7 +638,9 @@ impl Combatant {
     }
 
     /// Build the enemy in slot `enemy_slot` of `scene` ([`Combatant::from_enemy`]) and give it the
-    /// scene's attacks it can use: its damaging attacks in its own order, each once.
+    /// scene's attacks it can use: its damaging attacks in its own order, each once
+    /// ([`Combatant::actions`]), and the ones that have only a status, for its script's use
+    /// ([`Combatant::status_actions`]).
     pub fn from_enemy_in_scene(scene: &Scene, enemy_slot: usize, record: &EnemyRecord) -> Self {
         let basic = scene.basic_attack(enemy_slot).map(|a| &a.record);
         let mut c = Self::from_enemy(record, basic);
@@ -634,6 +649,10 @@ impl Combatant {
             if let Some(action) = EnemyAction::from_scene(attack) {
                 if !c.actions.iter().any(|known| known.id == action.id) {
                     c.actions.push(action);
+                }
+            } else if let Some(action) = EnemyAction::status_from_scene(attack) {
+                if !c.status_actions.iter().any(|known| known.id == action.id) {
+                    c.status_actions.push(action);
                 }
             }
         }
@@ -1937,6 +1956,11 @@ impl BattleState {
                         events.push(BattleEvent::LimitGauge { actor: target, value: 0 });
                     }
                     self.check_outcome(events);
+                    // An enemy that Poison killed answers its death like one a blow killed: its Death counter runs. There
+                    // is no attacker to note (see `run_death_counter`).
+                    if i >= self.party_len {
+                        self.run_death_counter(i, events);
+                    }
                     continue;
                 }
             }
@@ -2083,18 +2107,32 @@ impl BattleState {
     /// What the rules can carry out of the attacks an enemy's script queued, checked before anything is
     /// drawn or changed: `None` when one of them cannot be carried out (the whole answer is then not followed).
     ///
-    /// * An attack the rules play ([`Combatant::actions`]) must be one the enemy can pay for, in all, and be
-    ///   aimed at a party member or the whole party ([`BattleState::can_aim`]; a target that has fallen or an
-    ///   empty side is no reason to refuse, the attack then fizzles when it comes up).
-    /// * An attack of the scene the rules cannot play (no damage, healing, a status) is announced and has no
-    ///   effect, whomever it is aimed at (a Death counter's own animation has its dead owner as target).
+    /// * A damaging attack the rules play ([`Combatant::actions`]) must be one the enemy can pay for, in all, and be
+    ///   aimed at a party member or the whole party ([`BattleState::can_aim`]); a target that has fallen or an empty
+    ///   side is no reason to refuse, the attack then fizzles when it comes up.
+    /// * An attack that has only a status ([`Combatant::status_actions`]: a curse on the party, a buff on the enemy itself
+    ///   or on its own side) is played wherever its script aims it ([`BattleState::can_aim_status`]) and **costs no MP and
+    ///   is never refused for it**: they were free while they were only announced, and charging for them was measured
+    ///   on the owner's data over every enemy of `scene.bin` (341 with scripts, twelve battles each in which the party
+    ///   strikes too): the spent MP left some casters without what their damaging spells cost, so that they fell back to
+    ///   the plain behaviour for good (an enemy that had never fallen back did so for 3000 turns), and the fallbacks
+    ///   rose by 1.5% where the free cast makes them fall by 0.2%. (The statuses now taking effect move the scripts on to
+    ///   branches they never reached, so a few enemies do meet an unaffordable damaging spell sooner: that is the
+    ///   rule above, not this one.)
+    /// * An attack of the scene the rules cannot play (an animation: no damage, no healing, no status they model) is
+    ///   announced and has no effect, whomever it is aimed at (a Death counter's own animation has its dead owner as
+    ///   target).
     fn plan_choices(&self, idx: usize, choices: &[crate::ai::EnemyChoice]) -> Option<Vec<Planned>> {
         let me = self.actors.get(idx)?;
         let mut mp_left = me.mp;
         let mut planned = Vec::with_capacity(choices.len());
         for choice in choices {
-            let play = match me.actions.iter().find(|a| a.id == choice.attack).copied() {
+            let found = me.actions.iter().chain(me.status_actions.iter()).find(|a| a.id == choice.attack).copied();
+            let play = match found {
                 None => None,
+                // An attack with only a status costs no MP and is never refused for it (see above); only an actor that
+                // does not exist cannot be aimed at, and then the attack is announced and does nothing.
+                Some(action) if action.spec.formula == Formula::None => self.can_aim_status(choice.target).then_some((action, choice.target)),
                 Some(action) => {
                     let cost = u32::from(action.spec.mp_cost);
                     if cost > mp_left || !self.can_aim(choice.target) {
@@ -2107,6 +2145,16 @@ impl BattleState {
             planned.push(Planned { id: choice.attack, play });
         }
         Some(planned)
+    }
+
+    /// Whether the rules can aim an attack of an enemy that has only a status as its script says: at any actor, or at
+    /// either whole side (a curse at the party, a buff at the enemy itself or at its own side). A fallen target or an empty
+    /// side does not count against it: the attack fizzles when it comes up.
+    fn can_aim_status(&self, target: Target) -> bool {
+        match target {
+            Target::One(who) => usize::from(who.0) < self.actors.len(),
+            Target::AllEnemies | Target::AllAllies => true,
+        }
     }
 
     /// Whether the rules can aim an attack of an enemy as its script says: at a party member or at the whole
@@ -2132,13 +2180,20 @@ impl BattleState {
     /// target ([`Aim::Random`], which `aim_at` refuses for one target and for a side alike) hits ONE member:
     /// the single one the script named, or one of the living members drawn with `below(n)` (no draw for one
     /// candidate) when the script named the whole party.
+    ///
+    /// An attack that has only a status goes wherever its script aims it ([`BattleState::can_aim_status`]): the one
+    /// actor it names, on either side, or whichever whole side, so a buff reaches the enemy that casts it (or its whole
+    /// side: every living enemy, in ascending order).
     fn enemy_targets(&mut self, spec: &ActionSpec, target: Target) -> Vec<usize> {
+        let status_only = spec.formula == Formula::None;
+        let alive = |actors: &[Combatant], i: usize| actors.get(i).is_some_and(Combatant::is_alive);
         let living: Vec<usize> = match target {
             Target::One(who) => {
                 let who = usize::from(who.0);
-                if who < self.party_len && self.actors[who].is_alive() { vec![who] } else { Vec::new() }
+                if (who < self.party_len || status_only) && alive(&self.actors, who) { vec![who] } else { Vec::new() }
             }
-            Target::AllEnemies => (0..self.party_len).filter(|&i| self.actors[i].is_alive()).collect(),
+            Target::AllEnemies => (0..self.party_len).filter(|&i| alive(&self.actors, i)).collect(),
+            Target::AllAllies if status_only => (self.party_len..self.actors.len()).filter(|&i| alive(&self.actors, i)).collect(),
             Target::AllAllies => Vec::new(),
         };
         match (spec.aim, living.len()) {
@@ -2175,7 +2230,10 @@ impl BattleState {
                 actor: ActorId(idx as u8),
                 action: ActionRef::EnemyAttack(p.id),
             });
-            self.spend_mp(idx, action.spec.mp_cost, events);
+            // A status-only attack costs the enemy nothing (see `plan_choices`).
+            if action.spec.formula != Formula::None {
+                self.spend_mp(idx, action.spec.mp_cost, events);
+            }
             self.resolve_action(idx, &targets, &action.spec, events);
         }
     }
@@ -2226,6 +2284,18 @@ impl BattleState {
                 }
                 self.run_counter(target, script, events);
             }
+        }
+    }
+
+    /// The enemy at `idx` has just died of something that is no blow of a party member (a turn of Poison on the clock): it
+    /// answers with its Death counter, as one that a blow killed does ([`BattleState::run_counters`]), unless the battle has an
+    /// outcome by now (the death may have been the last one). Nobody struck it, so nobody is noted as the attacker (the script
+    /// reads whoever struck it last, and a counter that has to aim at the attacker finds nobody, cannot be followed and is
+    /// skipped: an engine choice, not checked against the original). The events follow the death in the same step's.
+    fn run_death_counter(&mut self, idx: usize, events: &mut Vec<BattleEvent>) {
+        let scripted = self.actors.get(idx).and_then(|c| c.ai.as_ref()).is_some_and(|ai| ai.memory().phase == crate::ai::Phase::Ready);
+        if scripted && self.outcome.is_none() {
+            self.run_counter(idx, crate::ai::script::slot::DEATH_COUNTER, events);
         }
     }
 
