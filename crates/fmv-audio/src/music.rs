@@ -499,7 +499,7 @@ mod tests {
         let mut source = music.source();
         let mut out = vec![0.0f32; 200];
         assert_eq!(source.read(&mut out), Pull::Frames(100));
-        for (i, frame) in out.chunks_exact(2).enumerate() {
+        for (i, frame) in out.as_chunks::<2>().0.iter().enumerate() {
             assert_eq!(frame[0], frame[1], "frame {i}");
             assert_eq!(frame[0], f32::from(mono[i]) / 32_768.0);
         }
@@ -611,7 +611,7 @@ mod tests {
         let engine = AudioEngine::start_manual(AudioConfig { sample_rate: 48_000, volumes: unity, ..AudioConfig::default() });
         engine.play_music(TrackId(1), music.source(), PlayOptions { fade: Duration::ZERO, repeat: true, gain: 1.0 });
         let out = engine.pump(600);
-        let values: Vec<i32> = out.chunks_exact(2).map(|f| (f[0] * 32_768.0).round() as i32).collect();
+        let values: Vec<i32> = out.as_chunks::<2>().0.iter().map(|f| (f[0] * 32_768.0).round() as i32).collect();
         // Past the first pass, find a loop start (value 5_000) and check the cycle of ten after it.
         let tail = &values[100..];
         let first = tail.iter().position(|&v| v == 5_000).expect("a loop start in the tail");

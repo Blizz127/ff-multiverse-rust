@@ -11,7 +11,7 @@
 //! The files are only opened for reading and nothing decoded is written anywhere; the assertions
 //! record counts, rates and tag numbers, never audio.
 
-use fmv_audio::{decode_music_file, DecodedMusic, LoopPoints, Pull};
+use fmv_audio::{decode_music_file, LoopPoints, Pull};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -159,7 +159,7 @@ fn the_decode_agrees_with_ffmpegs_from_the_first_sample() {
                 return;
             }
         };
-        let reference: Vec<i16> = reference.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
+        let reference: Vec<i16> = reference.as_chunks::<2>().0.iter().map(|&b| i16::from_le_bytes(b)).collect();
         let frames = (reference.len() / 2).min(music.frames() as usize);
         assert!(frames > 40_000, "{track}: only {frames} frames to compare");
         let mut source = music.source();
