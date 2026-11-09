@@ -283,6 +283,21 @@ token is saved before anything else can fail. `--name` skips the menu (the old b
 machine last saw (the server keeps the real profile and sends it on join), so a login that has
 not joined from this machine yet says "look unknown".
 
+*Deleting a character (menu and command line).* **Del** opens "Delete this character?" over the highlighted character,
+with the buttons **Keep** (the default), **Delete** and **Forget here**, and the keys **Y** (delete on the server), **F**
+(forget the saved login on this computer only: the character stays on the server and its name stays taken, for a
+server that is gone or on another protocol version) and **N** or **Esc** (keep); a controller reaches the same three
+buttons. While the server is asked the menu says "Deleting this character" and only **Esc** (stop waiting; the
+server may still delete it, and asking again says so) does anything. The saved login and the note of the character's
+look are removed ONLY when the server answered that it deleted the character or that it does not know the login
+(`InvalidToken`: already gone, which also settles a delete whose answer was lost); a character that is in the game
+(`AlreadyOnline`), an unreachable server and any other refusal keep the login and say that nothing was deleted.
+`fmv-client --delete NAME [--server HOST:PORT] [--state-dir DIR]` does the same without a window, game files or an FF7
+library (it conflicts with every other flag but `--mute`): stdout carries ONE line on success, `deleted character
+name=<n>` or `character already gone on the server name=<n>` (`<n>` percent-encoded like the smoke line's `name=`),
+exit 0; any failure keeps the login and prints the error on stderr, exit 1; no saved login for NAME is exit 2. The
+token is never printed.
+
 *In the game.* WASD or the arrow keys move (up goes up the screen, whatever the camera looks
 like); in an FF7 field you run, and walk while **Shift** is held (at the field's run and walk
 speeds: hypotheses used for pacing only, the server's own cap is unchanged). **P** invites the

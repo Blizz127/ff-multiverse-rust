@@ -463,7 +463,7 @@ main() {
   # ---------------------------------------------------------------------------------------------------------
   run_client delete "$WORK/client" --delete "Smoke Aria"
   expect "deleting Smoke Aria after she left succeeds (exit status $RC)" test "$RC" == 0
-  expect "the client says 'deleted character name=Smoke Aria'" contains "deleted character name=Smoke Aria"
+  expect "the client says 'deleted character name=Smoke%20Aria' (the name is percent-encoded like the SMOKE line's)" contains "deleted character name=Smoke%20Aria"
   expect "the saved login of Smoke Aria is gone from this computer" test ! -e "$aria_token_file"
   expect "the server logged the delete" test "$(count_lines_with "$WORK/server-1.log" "character deleted")" == 1
   snapshot "$WORK/server-state" "$WORK/after-delete.txt"
