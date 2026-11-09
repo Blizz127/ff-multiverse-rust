@@ -1,9 +1,9 @@
 # Multi-game design: FF8 and FF9 next to FF7
 
-Status: DESIGN NOTES ONLY. Written 2026-11-09 against `main` at `2fea4b5` by teammate `sw-ffdesign`
-(swarm wave 4). Docs only: nothing here is implemented, built or tested. Scope: FF8 and FF9. Later
-titles (FF10, FF12) wait for an owner clarification and are not covered; nothing below should make
-them harder.
+Status: DESIGN NOTES ONLY. Written 2026-11-09 by teammate `sw-ffdesign` (swarm wave 4). The code audit was
+read at `main` `2fea4b5` and re-checked after the talk-dialogue merge `aa3462a`. Docs only: nothing here is
+implemented, built or tested. Scope: FF8 and FF9. Later titles (FF10, FF12) wait for an owner clarification and
+are not covered; nothing below should make them harder.
 
 **No owned FF8 or FF9 files exist on this box.** Every claim about how an FF8 or FF9 file or
 archive is laid out carries a tag, in one of three tiers:
@@ -40,17 +40,20 @@ so that the body stays about decisions.
 3. **The shared layers are mostly ready; three seams are FF7-shaped (section 3).** The battle
    messages on the wire re-export the FF7 engine's own types and `fmv-protocol` depends on
    `fmv-ff7-battle`; the server calls the concrete FF7 `BattleState` and has FF7 `match` arms for
-   looks and characters; the client is an FF7 renderer and battle UI used directly (44 client
+   looks and characters; the client is an FF7 renderer and battle UI used directly (49 client
    files import the FF7 crates).
 4. **The critical path to a first two-player FF8 area is short and needs none of those refactors
    (section 9.1).** It is a field adapter on today's single-game server, exactly as `md1stin` was:
    importer generalisation, an FI/FL/FS reader, field decode (walkmesh, camera, gateways,
    background), an FF8 `GameAdapter`/`AreaRuntime`, and a client rendering seam. Battle, the battle
    envelope, multi-game hosting and the identity/slot model come after it.
-5. **The story model rests on a server-side script VM that does not exist for any game.** The
-   README lists field scripts as not done even for FF7. "Cast stays NPC-driven per player phase" and
-   "player visibly present in story scenes" are blocked on that VM per game. The milestone tables keep
-   it on its own track and do not pretend otherwise.
+5. **The story model's scenes rest on a hosted script VM that does not exist for any game.** FF7 has
+   a bounded, read-only *talk-script walker* (`fmv_ff7::script::dialogue`, merged in `aa3462a`) that runs an
+   NPC's talk script just far enough to collect its message windows and never changes the world; the
+   README still lists world-changing field scripts as not done. "Cast stays NPC-driven per player phase"
+   and "player visibly present in story scenes" are blocked on a hosted VM per game, while the **talk half
+   of the dialogue layer already has its seam** (section 2.8). The milestone tables keep the VM on its own
+   track and do not pretend otherwise.
 6. **FF9's packaging is the biggest technical risk.** The Steam release is a Unity build whose data
    sits in Unity archives (`p0data*.bin`, `*.assets`) and, for gameplay tables, possibly in compiled
    code rather than data files. A cheap read-only probe of the owner's install should come before
@@ -220,25 +223,42 @@ the protagonist stays unique, and the role of the story's lead is never a player
 * **FMV cannot show the player.** Both games use prerendered cutscene video (FF8's video archives are `.pak` files
   `[verify: doc F-IDX]`; FF9's packaging is unread): plan player-facing beats **before and after** each FMV, never
   inside it.
-* **Canon choices** (the game's own choice windows) are answered by the **phase owner** (the leader);
-  others see the choice. A vote option can come later.
+* **Two kinds of conversation.** *Talking to an NPC* is per player and client-local, and it exists for FF7 today
+  (`aa3462a`: Enter or Space next to a character opens its own talk script's windows; nothing about dialogue crosses
+  the network, and the player's own `ASK` answers stay with that player). *Scripted scenes* are shared and need the
+  hosted VM; there the game's own choice windows are answered by the **phase owner** (the leader) and the others see
+  the choice. A vote option can come later.
 * **Participation** means addressable moments: a canon NPC turns to the nearest player, offers help, asks a
   question with two or three short replies from the layer (2.8). Replies set layer flags and never change a
   canon branch.
 
 ### 2.8 The dialogue layer (added content, never canon text)
 
+* **The seam already exists (FF7, `aa3462a`).** `fmv_ff7::script::dialogue::Message` carries a
+  `MessageOrigin`: `Canon { entity, dialog }` (the field's own text, shown exactly as written) or
+  `Added { layer }` ("a line this project adds on top of the game: never canon", which the client's dialogue
+  window draws with a different border). A window pulls from a `MessageSource`; the talk walker is one
+  (`TalkSession`) and "an added content layer can be another". On the client, `ui::dialogue::Conversations`
+  hands the window its source for an NPC, and `StoryVars` is the hook through which "a server-fed
+  implementation that mirrors a real player's progress" reads story variables (today `StartOfGame`). The README
+  already promises that whoever you play is never written into a line about Cloud or the cast. What is missing:
+  the `Added` sources themselves, and moving `Message`, `MessageOrigin`, `Beat`, `MessageSource` out of `fmv-ff7`
+  (and `StoryVars` out of FF7's savemap shape: bank and address) into a game-neutral crate, with a talk walker
+  per game (FF8 `.jsm`, FF9 `.eb`).
 * **Original text only.** Layer lines are written for this project, stored in the repository as data, per
-  language. They never copy or edit text from the game's files. Canon lines are read from the owner's files
-  untouched; canon name control codes always resolve to canon names. `{player}` and pronoun tokens exist only
-  in layer lines.
+  language, and **ship with the client** (no dialogue goes over the network; each client reads canon text from
+  its own copy and layer text from the package). They never copy or edit text from the game's files. Canon
+  lines are read from the owner's files untouched; canon name control codes always resolve to canon names.
+  `{player}` and pronoun tokens exist only in layer lines.
 * **Anchors.** A line fires at an **anchor**: `(area, anchor kind, our stable id)`, mapped per game and edition
   to a script position by an anchor table that also stores a hash of the script segment. A hash that does not
   match the owner's edition means the anchor is skipped, never mis-fired.
 * **Kinds:** `Acknowledge` (a canon NPC notices the player), `Aside` (after, never inside, canon dialogue),
   `Offer` (help; may point at an optional quest), `Banter` (field or battle barks), `Farewell`.
 * **State:** a small per-player, per-game flag set ("acknowledged by Barret") stored **beside the story blob,
-  never in it**, so layer state cannot move a player to another instance.
+  never in it**, so layer state cannot move a player to another instance. It is the server's: the client asks for the
+  flags and the story variables of the account it plays (FF7's story variables are the savemap banks the walker reads
+  through `StoryVars`; the account's story blob is where a server-fed hook would read them).
 * **Rendering:** drawn in a window styled after the game's own message window from the owner's files, with
   the client's UI font as fallback, because display names may use scripts the game font lacks (names
   allow CJK and others: `fmv-core/src/names.rs`). Authenticity versus Unicode is part of decision D8.
@@ -255,7 +275,7 @@ and the slot's Trance set. Details per game are in sections 5 and 6.
 
 ### 2.10 The FF7 retrofit (today's code to the model)
 
-Concrete facts from the code at `2fea4b5`:
+Concrete facts from the code at `aa3462a`:
 
 * `fmv_ff7::playable::DEFAULT_APPEARANCE` is `ff7/cloud`: today's default really is "everyone is Cloud".
 * The look picker offers Cloud, Tifa, Barret and Aerith in the character menu (README; `fmv-client/src/ui/*`),
@@ -271,16 +291,19 @@ Concrete facts from the code at `2fea4b5`:
 | F2 | Stop defaulting everyone to Cloud; reserve the canon looks for NPC use; run the **wardrobe survey** (2.6); interim default look comes from its result, canon looks stay selectable behind a clearly labelled flag until it lands | no |
 | F3 | Battle bodies: interim per D4 | no |
 | F4 | Seating algorithm (2.3) replaces "i-th party member is `ActorId(i)`"; ally logic for canon companions (2.5) | no |
-| F5 | Canon protagonist as a script-driven NPC in instances; observer marks; the layer (2.7 to 2.8) | **yes** |
+| F5a | **The layer on talk conversations** (2.8): `Added` sources wrapped around the canon `TalkSession` (acknowledge, aside and offer lines after an NPC's own text), flags kept server-side, `StoryVars` fed from the account's story | **no** (the seam exists) |
+| F5b | Canon protagonist as a script-driven NPC in instances; observer marks; the layer inside shared scenes (2.7) | **yes** |
 
-F1 to F4 remove the "thirty Clouds" problem at the identity, slot and wardrobe level without a VM. F5 is the story
-model proper and waits for the VM track.
+F1 to F4 remove the "thirty Clouds" problem at the identity, slot and wardrobe level without a VM, and F5a gives the
+player a first visible acknowledgement in FF7 on the dialogue code that already exists. F5b is the story model
+proper and waits for the VM track.
 
 ### 2.11 What this section needs that does not exist yet
 
 | Needs | Status |
 |---|---|
-| per-game script VM hosted by the server (FF7 field script, FF8 `.jsm`, FF9 `.eb`), with party-affecting opcodes intercepted | **does not exist for any game** (FF7 has script analysis only: README "not done: ... field scripts") |
+| per-game script VM hosted by the server (FF7 field script, FF8 `.jsm`, FF9 `.eb`), with party-affecting opcodes intercepted | **does not exist for any game.** FF7 has script analysis and, since `aa3462a`, a read-only talk walker (`script::dialogue`: message, branch and variable opcodes only; MAPJUMP, BATTLE, MINIGAME and GAMEOVER just end the walk); the README still lists world-changing field scripts as not done |
+| a game-neutral message and story-variable layer (`Message`, `MessageSource`, a `StoryVars` that is not FF7's savemap) | the types exist, in `fmv-ff7`; promotion is part of R9 |
 | segment data (`SegmentCast` per phase) | curated per game; source is the VM's story variables |
 | canon sheets per phase | pure functions of owned data; per game |
 | wardrobe, scene staging, layer runtime | per game adapter plus shared runtime |
@@ -289,7 +312,7 @@ model proper and waits for the VM track.
 
 ## 3. What is shared and what is per game today
 
-Audit of `main` at `2fea4b5` (read, not run).
+Audit of `main` at `2fea4b5`, re-checked at `aa3462a` (read, not run).
 
 | Layer | Crate | Verdict | Evidence |
 |---|---|---|---|
@@ -299,7 +322,7 @@ Audit of `main` at `2fea4b5` (read, not run).
 | persistence | `fmv-persist` | **mostly shared** | `Progression` is an opaque blob (256 KiB cap), `AvatarProfile` is generic; `CharacterProgress` (32 KiB cap) says game-agnostic but its fields (`ap`, `limit`, one `u8` character) are FF7-shaped |
 | parties, phasing | `fmv-party` | **shared** | `PartyConfig` is per game ("one manager per game"); `DEFAULT_MAX_PARTY_SIZE = 3` is named FF7's |
 | server | `fmv-server` | **mixed, single game** | hosts "the areas of one `GameAdapter`"; `world/battle.rs` calls the concrete `BattleState`; `accounts::canonical_appearance` and `progress::character_for_look` have FF7 arms and a `_ => None`; `ff7.rs` wraps the adapter; `main.rs` selects `GameKind` |
-| client | `fmv-client` | **FF7 throughout** | 44 files import `fmv_ff7*` (34 excluding tests and screenshot code); about 25,400 lines (tests and screenshot code included) in `battle/`, `avatar/`, `backdrop.rs`, `ff7.rs`; `ff7.rs` fills process-wide statics for the window to find (`avatar::source::remember`, `battle::scene::model::remember_battle_lgp`); the battle menu and overlay are FF7's (Attack/Magic/Item/Defend/Limit/Escape, blue windows); 9 `ui/` files name FF7 looks |
+| client | `fmv-client` | **FF7 throughout** | 49 files import `fmv_ff7*` (37 excluding tests and screenshot code); about 27,400 lines (tests and screenshot code included) in `battle/`, `avatar/`, `ui/dialogue*`, `backdrop.rs`, `ff7.rs`; the new dialogue window is built on a game-neutral pair of traits (`Conversations`, `MessageSource`), but their types live in `fmv-ff7` and the one implementation is FF7's; `ff7.rs` fills process-wide statics for the window to find (`avatar::source::remember`, `battle::scene::model::remember_battle_lgp`); the battle menu and overlay are FF7's (Attack/Magic/Item/Defend/Limit/Escape, blue windows); 10 `ui/` files name FF7 or its looks |
 | library, import | `fmv-library`, `fmv-import` | **mixed** | blob store, manifest, `Identification`, fingerprints are generic; `fmv_library::ff7` resolver, `scan.rs` FF7 `WANTED` list, `serial.rs` FF7 serial table (`EXPECTED_DISCS = 3`), `steam.rs` FF7 appids; per-file cap `DEFAULT_MAX_FILE_SIZE = 4 GiB`; imports **copy** into `library/blobs/<blake3>` |
 | game crates | `fmv-ff7`, `fmv-ff7-battle` | **per game** | decoders, area runtime, models, battle engine |
 | second adapter | `fmv-fixture` | **proof of plug-in** | a synthetic adapter shows what a second `GameAdapter` needs today |
@@ -326,7 +349,7 @@ Each keeps FF7 green. **FF7 regression gates:** `scripts/smoke.sh`, `scripts/bat
 | R6 | **Multi-game server** | adapter registry keyed by `GameId`, `World` partitioned per game, one `PartyManager` per game, `Hello` carries the game and per-game schema versions | no (needed for FF7 and FF8 on one server) | L |
 | R7 | **Identity, slot, wardrobe** | section 2.10 F1 to F4: persist, server, character menu | no | L |
 | R8 | **Per-game sheets and transactions** | a generic character-sheet envelope (blob, schema version, small summary); per-game inventory limits; a **two-account transfer journal** for card stakes | no | M |
-| R9 | **Story runtime** | script VM host, instance runtime, staging, layer (section 2) | no | XL, per game |
+| R9 | **Story runtime** | promote the message and story-variable types out of `fmv-ff7`; a talk walker per game; then the hosted script VM, instance runtime, staging and the layer inside scenes (section 2) | no | XL, per game |
 
 Sizes are rough: S = a checkpoint, M = a few, L = a handful, XL = a track of its own.
 
@@ -816,10 +839,18 @@ A **FIXTURE** FF8-shaped area is not FF8 support (README rule 5): none of A coun
 
 ### 9.5 Track E: story runtime (all games, owner-gated)
 
-Per-game script VM hosted by the server (FF7 field script, FF8 `.jsm`, FF9 `.eb`), party-affecting opcodes intercepted;
-segment data and canon sheets (2.3, 2.5); scene staging (2.7); the dialogue layer (2.8). **None of Tracks A, C or D waits
-for it, and sections 2.5 to 2.8 are not deliverable without it.** The size of the job per game is real: FF8's wiki has a
-page per documented field opcode, with ids running from `000` to `177` in hex `[verify: doc H-IDX]`.
+| # | Increment | Needs the hosted VM? |
+|---|---|---|
+| E0 | **The layer on talk conversations in FF7** (F5a): `Added` sources around `TalkSession`, a server-held flag set, `StoryVars` fed from the account's story, the message types promoted out of `fmv-ff7` | no |
+| E1 | A **talk walker per game** (FF8 `.jsm`, FF9 `.eb`), which also gives NPC dialogue and a first story-variable model for each | no |
+| E2 | **Segment data and canon sheets** (2.3, 2.5) per game | partly (story variables) |
+| E3 | The **hosted script VM** per game, party-affecting opcodes intercepted, run per instance | this is it |
+| E4 | Scene staging (observer marks, scene lock) and the layer inside shared scenes (2.7) | yes |
+
+**None of Tracks A, C or D waits for any of it.** Sections 2.5 to 2.7 are not deliverable without E3; the talk half of
+2.8 is (E0, E1). The size of the E3 job per game is real: FF8's wiki has a page per documented field opcode, with ids
+running from `000` to `177` in hex `[verify: doc H-IDX]`, and FF7's read-only walker already interprets dozens of message,
+branch, request and variable opcodes just to answer "which messages show, in what order".
 
 ---
 
@@ -832,7 +863,7 @@ page per documented field opcode, with ids running from `000` to `177` in hex `[
 | 3 | `net.offline = true` | new crates may not resolve | `lz4_flex`, `lzma-rust2`, `bzip2`, `ruzstd`, `zip` are already cached; a Unity parser is not; confirm resolution before relying on them |
 | 4 | Edition drift: the best FF8 documentation describes 2000/2013; the Remaster repacks and changes models | wrong layouts | separate edition labels; Appendix B and C record what was confirmed; decoders are total and fail soft |
 | 5 | Format claims here are unverified | wasted work | every claim tagged; the probe and the checklist come before decoders |
-| 6 | No script VM exists | the story model (O3, O4 of 2.1) is blocked | free-roam areas first (as FF7 M1); a separate track E; do not promise story presence early |
+| 6 | No hosted script VM exists (FF7 has only a read-only talk walker) | the scenes half of the story model (O3, O4 of 2.1) is blocked | free-roam areas first (as FF7 M1); a separate track E, starting with the talk layer (E0), which needs no VM; do not promise story presence in scenes early |
 | 7 | Few non-canon models may be pose-ready (FF7 survey unknown) | "thirty Clouds" cannot be fully avoided in the field | B1 first; recolour; reserved canon models; an opt-in cosplay later |
 | 8 | Battle bodies: FF7's battle models are canon only | a player in Tifa's slot looks like Tifa | decision D4, honest labels, a later composite pipeline |
 | 9 | Dialogue layer volume and edition drift of anchors | little value, or mis-fired lines | a tiny first set; anchors carry a script-segment hash; a lint that bans copying canon strings |
@@ -857,7 +888,7 @@ page per documented field opcode, with ids running from `000` to `177` in hex `[
 | D5 | **FF7 retrofit timing and existing accounts.** | do F1 to F4 before any FF8/FF9 demo of originals / after | **before**: snapshot each account's current look-derived character as its explicit slot once, then decouple; stop defaulting to Cloud | B2 |
 | D6 | **Party-swap segments** (FF8 Laguna dreams, FF9 splits and Steiner/Vivi/Dagger stretches, FF7 stretches without Cloud): what do originals do? | (a) watch from marks (`CastOnly`); (b) seat if the segment's party fights and slots allow; (c) separate "mirror" content | **(a)** for dream and vision segments, **(b)** for ordinary sub-parties; the leader chooses which team a split follows, others watch | segment data, Track E |
 | D7 | **Card games** (Triple Triad, Tetra Master). | friendly matches only / stakes with consent; rare cards unique or per account | **friendly first**; stakes later with mutual consent and the transfer journal; rare cards per account and excluded from stakes | B6, C5, D6 |
-| D8 | **Dialogue layer.** Who writes it, pronouns, name rendering, canon choices. | project-authored original text, optional pronoun set in the identity, game-styled window with client-font fallback for names, leader answers canon choices | **all of those**; start with one showcase scene | layer, Track E |
+| D8 | **Dialogue layer.** Who writes it, pronouns, name rendering, canon choices. | project-authored original text, optional pronoun set in the identity, game-styled window with client-font fallback for names, leader answers canon choices | **all of those**; start with one showcase NPC conversation on the FF7 seam that already exists (`MessageOrigin::Added`), not a scene | layer, Track E (E0) |
 | D9 | **FF9 gameplay-table route** if the tables are in the game's code. | (1) read the owner's vanilla assembly; (2) read Memoria CSV from a Memoria install (`modded`); (3) author approximations | probe first; **(1)** if the tables are there; accept **(2)** as an explicit `modded` set that cannot play with vanilla sets; **(3)** last resort | FF9 battle |
 | D10 | **Cinematic locks** (summons, limit breaks, eidolons). | freeze the battle clock for everyone / overlay while the clock runs | **overlay with a short engine-side beat** (faithful pausing is slow with three summoners) | FF8, FF9 battle |
 | D11 | **Hosting.** One multi-game server process or one per game? | one process with an adapter registry, a `World` partition and a `PartyManager` per game; or separate servers with a shared account service | **one process**; parties stay per game, friends and identity are cross-game | R6 |
