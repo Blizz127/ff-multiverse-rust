@@ -1135,11 +1135,11 @@ fn offscreen_field_two_originals() {
     state.progress.set_player("Blizz");
     state.apply(0.0, ServerMsg::CharacterProgress { character: 1, level: 6, exp: 82, exp_to_next: 2, gil: 25, ap: 0, leveled_up: false });
     let line = hud::progress_line(&state, render_t).expect("the server said something about the character");
-    assert_eq!(line.text, "Blizz (Barret)  Lv 6  EXP 82/84  Gil 25");
+    assert_eq!(line.text, "Blizz (Gunner)  Lv 6  EXP 82/84  Gil 25");
     {
         let mut overlay = DrawList::new();
         hud::draw_hud_with(&hud_input, Some(&line), 1100, 680, &mut overlay);
-        assert!(overlay.says("Blizz (Barret)  Lv 6  EXP 82/84  Gil 25"));
+        assert!(overlay.says("Blizz (Gunner)  Lv 6  EXP 82/84  Gil 25"));
         let img = gpu.render_field(1100, 680, &scene, Some(&draw.built.as_ref().expect("built").frame), &overlay);
         save("field_hud_line", 1100, 680, &img);
     }

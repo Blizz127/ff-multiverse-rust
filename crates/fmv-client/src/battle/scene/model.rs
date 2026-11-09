@@ -80,10 +80,13 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-/// Battle units per field-model unit for a field model standing in for a party member: Cloud's field
-/// model is 33.2 units tall, so this makes him about 1 200 battle units, a bit more than half as
-/// tall as a typical enemy box (see [`BoxSpec::for_enemy`]) is wide-spaced. A stand-in size chosen to
-/// look right, not a measurement.
+/// Battle units per field-model unit for a field model standing in for a party member WHEN NO PARTY MEMBER IS A
+/// BATTLE MODEL (no `battle.lgp`: everyone is a field model, so only their sizes among themselves matter): Cloud's
+/// field model is 33.2 units tall, so this makes him about 1 200 battle units, a bit more than half as tall as a
+/// typical enemy box (see [`BoxSpec::for_enemy`]) is wide-spaced. A stand-in size chosen to look right, not a
+/// measurement. Beside real battle models a field body is drawn at the MEASURED scale instead
+/// ([`ModelKit::measure_field_scale`]): at this one, a player's body stood about twice as tall as the canon Cloud
+/// and Barret (the owner's report of 2026-11-09).
 pub const FIELD_TO_BATTLE_SCALE: f32 = 36.0;
 /// The playback rate assumed for battle clips (an ASSUMPTION about the original: the field's clips
 /// are 30 per second, a battle model's may be half that); [`BattleModelData::fps`] overrides it.
@@ -284,6 +287,13 @@ pub struct EnemyLook {
 pub trait BattleModelSource {
     fn party_member(&mut self, who: &PartyLook) -> BattleActorModel;
     fn enemy(&mut self, who: &EnemyLook) -> BattleActorModel;
+
+    /// The canon Cloud's own BATTLE model, the reference a field body's size in battle is measured against
+    /// ([`ModelKit::measure_field_scale`]). `None` (the default) for a source without battle models of its own: its
+    /// party members are all field models or boxes, so the stand-in scale keeps their sizes right among themselves.
+    fn size_reference(&mut self) -> Option<BattleModelData> {
+        None
+    }
 
     /// The model of battle location `location` (the formation data names one), drawn behind
     /// everyone: a model whose vertices are already in battle coordinates (floor at `y = 0`, a sky far
@@ -505,6 +515,14 @@ impl ArchiveModels {
 }
 
 impl BattleModelSource for ArchiveModels {
+    /// Cloud's battle model as the canon companion has it (the same model, made once).
+    fn size_reference(&mut self) -> Option<BattleModelData> {
+        match self.party_member(&PartyLook::companion(ActorId(0), 0, false)) {
+            BattleActorModel::Battle(data) => Some(data),
+            _ => None,
+        }
+    }
+
     /// A canon companion is the canon character's battle model; a PLAYER is its own field body (the stand-in's answer:
     /// a canon battle model on a player is a bug), which the archive has no say in.
     fn party_member(&mut self, who: &PartyLook) -> BattleActorModel {
@@ -814,11 +832,25 @@ pub struct Rigs {
     cache: HashMap<String, Arc<ActorRig>>,
     /// The attachments made so far by key (`None`: one that could not be drawn).
     attachments: HashMap<String, Option<Arc<AvatarAsset>>>,
+    /// Battle units per field-model unit for the field bodies: [`FIELD_TO_BATTLE_SCALE`] until
+    /// [`ModelKit::measure_field_scale`] measured the real one.
+    field_scale: f32,
 }
 
 impl Rigs {
     pub fn new(loader: Option<Box<dyn CharacterLoader>>) -> Self {
-        Self { library: loader.map(AvatarLibrary::new), cache: HashMap::new(), attachments: HashMap::new() }
+        Self { library: loader.map(AvatarLibrary::new), cache: HashMap::new(), attachments: HashMap::new(), field_scale: FIELD_TO_BATTLE_SCALE }
+    }
+
+    /// Battle units per field-model unit at which a field body is drawn (see [`ModelKit::measure_field_scale`]).
+    pub fn field_scale(&self) -> f32 {
+        self.field_scale
+    }
+
+    /// How tall the field model of `look` is, in field-model units (`None`: no `char.lgp`, or a model that does not load).
+    fn field_height(&mut self, look: Option<&str>) -> Option<f32> {
+        let library = self.library.as_mut()?;
+        library.get(look).asset.map(|asset| asset.height_units)
     }
 
     /// Distinct rigs made so far.
@@ -857,12 +889,12 @@ impl Rigs {
     fn field(&mut self, look: Option<&str>) -> Option<Arc<ActorRig>> {
         let library = self.library.as_mut()?;
         let appearance = library.get(look);
-        let key = format!("field:{}", appearance.id);
+        let scale = self.field_scale;
+        let key = format!("field:{}@{:08x}", appearance.id, scale.to_bits());
         if let Some(rig) = self.cache.get(&key) {
             return Some(Arc::clone(rig));
         }
         let asset = appearance.asset?;
-        let scale = FIELD_TO_BATTLE_SCALE;
         let rig = Arc::new(ActorRig {
             clips: Arc::new(vec![asset.character.idle.clone()]),
             height: asset.height_units * scale,
@@ -933,6 +965,8 @@ impl Rigs {
 pub struct ModelKit {
     pub(super) source: Box<dyn BattleModelSource>,
     pub(super) rigs: Rigs,
+    /// Whether [`Self::measure_field_scale`] has run (it runs once per kit: the scale is a property of the archives).
+    field_scale_measured: bool,
     /// The meshes of the effects, made once and shared by every scene of this kit.
     pub(super) effects: Arc<EffectKit>,
 }
@@ -940,7 +974,26 @@ pub struct ModelKit {
 impl ModelKit {
     /// A kit whose models are chosen by `source` and whose field models are read by `loader`.
     pub fn new(source: Box<dyn BattleModelSource>, loader: Option<Box<dyn CharacterLoader>>) -> Self {
-        Self { source, rigs: Rigs::new(loader), effects: Arc::new(EffectKit::new()) }
+        Self { source, rigs: Rigs::new(loader), effects: Arc::new(EffectKit::new()), field_scale_measured: false }
+    }
+
+    /// Measure, once, the size a FIELD body is drawn at in battle: as many battle units per field-model unit as the
+    /// canon Cloud's own battle model is tall for his field model's height. A player's body (a placeholder body, or the
+    /// canon field look an old account kept) then stands beside the canon party's battle models at the size it has
+    /// beside them in the field. Without Cloud's battle model (no `battle.lgp`: every party member is then a field
+    /// model) or his field model (no `char.lgp`), [`FIELD_TO_BATTLE_SCALE`] stays.
+    pub fn measure_field_scale(&mut self) {
+        if self.field_scale_measured {
+            return;
+        }
+        self.field_scale_measured = true;
+        let Some(battle) = self.source.size_reference() else { return };
+        let Some(battle_rig) = self.rigs.battle(&battle) else { return };
+        let Some(field_height) = self.rigs.field_height(character_appearance(0)) else { return };
+        let scale = battle_rig.height / field_height;
+        if scale.is_finite() && scale > 0.0 {
+            self.rigs.field_scale = scale;
+        }
     }
 
     /// The models of this machine's own archives: the real battle models of its `battle.lgp` when
@@ -1123,6 +1176,47 @@ mod tests {
         let e3 = rigs.resolve(&BattleActorModel::Box(BoxSpec::for_enemy(4, 100)), spec);
         assert!(Arc::ptr_eq(&e1, &e2) && !Arc::ptr_eq(&e1, &e3));
         assert_eq!(rigs.count(), 4);
+    }
+
+    #[test]
+    fn beside_a_real_battle_model_a_field_body_stands_as_tall_as_it_does_beside_cloud_in_the_field() {
+        // A source whose Cloud is a real battle model: the stand-in character (30 model units tall) at twice its size,
+        // 60 battle units. His field model is the same 30-unit character, so a field body is drawn at 60 / 30 = 2 battle
+        // units per field unit: exactly Cloud's height, where the stand-in scale would make it 30 * 36 = 1 080.
+        struct Real;
+        impl BattleModelSource for Real {
+            fn party_member(&mut self, who: &PartyLook) -> BattleActorModel {
+                StandInModels.party_member(who)
+            }
+            fn enemy(&mut self, who: &EnemyLook) -> BattleActorModel {
+                StandInModels.enemy(who)
+            }
+            fn size_reference(&mut self) -> Option<BattleModelData> {
+                let cloud = character(fmv_ff7::playable::resolve_appearance("ff7/cloud").unwrap(), 1, 4, 3);
+                let mut data = BattleModelData::new("cloud", cloud.model, vec![cloud.idle]);
+                data.scale = 2.0;
+                Some(data)
+            }
+        }
+        let asked = Rc::new(RefCell::new(Vec::new()));
+        let mut kit = ModelKit::new(Box::new(Real), Some(Box::new(Counting::new(Rc::clone(&asked), vec![]))));
+        assert_eq!(kit.rigs.field_scale(), FIELD_TO_BATTLE_SCALE, "nothing is measured before the first scene");
+        kit.measure_field_scale();
+        assert!((kit.rigs.field_scale() - 2.0).abs() < 1e-3, "{}", kit.rigs.field_scale());
+        let body = kit.rigs.resolve(&BattleActorModel::Field(Some("ff7/body/lean".into())), BoxSpec::for_party(2));
+        assert!((body.height - 60.0).abs() < 0.5 && body.scale == kit.rigs.field_scale(), "{} at {}", body.height, body.scale);
+        // Measured once per kit: a second call reads nothing again.
+        let reads = asked.borrow().len();
+        kit.measure_field_scale();
+        assert_eq!(asked.borrow().len(), reads);
+        // A source without battle models of its own (the stand-ins: everyone is a field model) keeps the stand-in scale.
+        let mut plain = ModelKit::new(Box::new(StandInModels), Some(Box::new(Counting::new(Rc::default(), vec![]))));
+        plain.measure_field_scale();
+        assert_eq!(plain.rigs.field_scale(), FIELD_TO_BATTLE_SCALE);
+        // And so does a kit that cannot load Cloud's field model (no `char.lgp`): there is nothing to measure against.
+        let mut blind = ModelKit::new(Box::new(Real), None);
+        blind.measure_field_scale();
+        assert_eq!(blind.rigs.field_scale(), FIELD_TO_BATTLE_SCALE);
     }
 
     #[test]

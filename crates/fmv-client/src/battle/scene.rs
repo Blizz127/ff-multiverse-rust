@@ -322,6 +322,8 @@ impl BattleScene {
         let spots = layout::arrange(start.formation.as_ref(), enemy_ids.len(), party_ids.len());
 
         let mut actors: Vec<Actor> = Vec::with_capacity(party_ids.len() + enemy_ids.len());
+        // A player's field body is drawn at the size it has beside the canon battle models (measured once per kit).
+        kit.measure_field_scale();
         for (i, &id) in party_ids.iter().enumerate() {
             let member = start.party.get(i);
             let (character, mine) = (member.map_or(0, |m| m.character), Some(id) == start.my_actor);
