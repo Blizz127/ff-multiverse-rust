@@ -1098,9 +1098,9 @@ from a server and keeps none anywhere but the library.
 The log is the evidence of a headless run, which has no ears: `audio: field md1stin: music ob, battle bat (the
 standard theme), after the fight ob` when the area's script has been read, `audio: decoded bat: 167 s of music
 in 842 ms` as each track finishes, `audio: playing bat (battle)` at the moment a track really starts, `audio: battle
-sounds: 6 loaded in 4 ms` when a fight's clips were read, `audio: battle sound 18 (hit)` (or `critical`, `miss`, `impact`)
+sounds: 7 loaded in 5 ms` when a fight's clips were read, `audio: battle sound 18 (hit)` (or `critical`, `miss`, `impact`)
 at the moment each blow's sound plays, a closing `headless: audio: sound Null, tracks started: ob > bat > fanfare > ob`,
-and, when the run ends, `audio: battle sounds played: 87 (16x38 18x13 46x3 227x33)` (each sound id and how many times it
+and, when the run ends, `audio: battle sounds played: 86 (16x39 18x12 46x1 227x34)` (each sound id and how many times it
 played).
 
 ## Packaging and smoke test
