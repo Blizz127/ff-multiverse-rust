@@ -53,6 +53,13 @@ along one branch only.
 machine: `fmv-client` needs glibc 2.43, `fmv-server` 2.35, `fmv-import` 2.34. The target machine's
 glibc must be at least as new (`ldd --version`).
 
+**Sound.** `fmv-client` also links `libasound.so.2` (ALSA) dynamically and plays the owner's own music
+and menu sounds from the library (the importer takes them from the install together with the rest; see
+the README's "Sound"). Bazzite has the library (PipeWire serves ALSA through its plugin), and a machine
+without a sound card plays on silently with one `audio:` line on stderr. `--mute`, `FMV_AUDIO=off|null|auto`
+reach the client like every other argument and variable. A library imported before the importer took the
+sound files has none: one run with `FMV_FF7_REIMPORT=1` adds them to the existing set.
+
 ## 2. How the launcher starts it
 
 The launcher runs `ff-multiverse.sh` directly (it is executable, `#!/usr/bin/env bash`). Its working
@@ -72,7 +79,7 @@ its own location.
   | `FMV_DATA_DIR` | the data directory (below) |
   | `FMV_FF7_DIR` | FF7 folder to import from instead of searching Steam: the folder that holds `data/`, or the Steam Edition install root |
   | `FMV_FF7_LANGUAGE` | language to import, default `en` |
-  | `FMV_FF7_REIMPORT=1` | import again although a library exists (for example after a build added battle data) |
+  | `FMV_FF7_REIMPORT=1` | import again although a library exists (for example after a build added battle data, or the music and sound files) |
   | `FMV_PORT` | the local server's port, default `47772` |
   | `FMV_READY_TIMEOUT`, `FMV_STOP_TIMEOUT` | seconds to wait for the server's READY line (60) and for it to exit after SIGTERM (30) |
 

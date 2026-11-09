@@ -98,12 +98,12 @@ games plug in behind `fmv-adapter-api` without touching it.
 | `fmv-server` | Authoritative server binary. |
 | `fmv-client` | Client binary: window mode and headless bot mode. |
 | `fmv-library` | Owned-content library: provenance manifest and content-addressed index. Never writes to original sources. Also the one resolver (`fmv_library::ff7`) that finds your FF7 field archive for the server and every client. |
-| `fmv-import` | Owned-content import CLI: PC install scan now, sequential disc import planned. |
-| `fmv-ff7` | FF7 adapter: format decoders (LGP, LZSS, field, background) and the FF7 area runtime. Reads owned data only. |
+| `fmv-import` | Owned-content import CLI: PC install scan (the field and battle data, and the music and sound files when the install has them) now, sequential disc import planned. |
+| `fmv-ff7` | FF7 adapter: format decoders (LGP, LZSS, field, background), the FF7 area runtime, the music track list and the field scripts' music commands, and the sound-effect files. Reads owned data only. |
 | `fmv-ff7-battle` *(coming)* | FF7 battle subset for the shared-battle milestone. |
 | `fmv-persist` | Accounts, avatar profiles, player characters (identity, per-game binding and slot, pointers to progress) and per-game progression in an atomic, single-writer file store. |
 | `fmv-party` | Party membership, leader and story-phase instance selection (pure state machines). |
-| `fmv-audio` | Audio engine: a music and effects mixer (crossfades, loop points, volumes, mute), a null sink for machines without a sound card, and the cpal output device. Game-agnostic and not wired into the client yet; it holds no audio data. |
+| `fmv-audio` | Audio engine: a music and effects mixer (crossfades, loop points, volumes, mute), a null sink for machines without a sound card, the cpal output device, and decoding of Ogg Vorbis, WAV and ADPCM music with its loop tags. Game-agnostic; the client plays it (see "Sound"); it holds no audio data. |
 
 ## Quickstart
 
@@ -122,8 +122,8 @@ fmv-client --game ff7 --name Tifa                                          # ter
 `md1stin` from the library `import-pc` wrote under `~/.local/share/ff-multiverse` and keeps its
 accounts next to it; each client reads the same library and saves its login token next to it. In
 the window, **WASD** runs (hold **Shift** to walk), **P** invites the nearest player, **Y**
-accepts an invite, **L** leaves the party. A missing display, GPU or server is reported with one
-clear line.
+accepts an invite, **L** leaves the party, **M** mutes the sound (**-** and **=** change the volume). A
+missing display, GPU or server is reported with one clear line.
 
 Without `--name` the window opens on the **character menu** instead (see "Window mode"): pick a
 saved character, or press **N** to create one: `fmv-client --game ff7`.
@@ -828,6 +828,53 @@ client need their own local copy of the same edition: they compare content finge
 at the handshake and exchange no asset bytes. The Steam edition keeps its data under
 `data/lang-<xx>/`; `import-pc` takes one language per library set (`--language en`).
 
+**Music and sound.** `import-pc` also takes the install's music and sound files into the library when it
+has them: `data/music_ogg/*.ogg`, `data/music/*.wav` and `music.idx`, `data/sound/audio.dat` and `audio.fmt`
+(the Steam edition has all of them, about 0.9 GB). Nothing is converted and the originals are untouched;
+each file is stored under its hash like the rest and listed in the set's manifest. **To add the sound to a
+library you made before the importer took it, run `import-pc` again on the same install with the same
+labels** (`--edition`, `--region`, `--language`, `--revision`, or none if you gave none the first time): it
+adds the sound files to the set that exists and changes nothing else in it. Other labels would make a
+second FF7 set, and the server and the client then refuse to choose between two ("the library holds several
+FF7 PC sets"), so check with `fmv-import list` that there is still one. If you start the game through the
+launcher script (`ff-multiverse.sh`), run it once with `FMV_FF7_REIMPORT=1`: it imports the install again
+the way it did the first time, which adds the sound to the library it made. A library without sound files is
+fine: the game runs without sound and says so in one line (see "Sound").
+
+## Sound
+
+The window plays your own FF7's music and menu sounds, read from the same library as the game's data (the
+importer takes the music and sound files along with the rest, see above). The client never receives audio
+from a server and keeps none anywhere but the library.
+
+- **Field music.** A field's script names its track (its `MUSIC` command); the client reads it from your
+  copy of the field, finds the track in the game's own `music.idx` and crossfades into it when the server
+  moves you to the area. A field that names none leaves the music playing, as in the game. A track starts as
+  soon as it has decoded (about a second); the loop points in the file are honoured sample for sample.
+- **Battles.** The field's battle music (`BMUSC`), else the standard battle theme, plays when a fight starts.
+  A win plays the victory fanfare once and then the field's music again; running away or losing goes straight
+  back to the field's music. The next fight's music and the fanfare are decoded in the background as soon as
+  you enter a field, so that a fight does not wait for them.
+- **Menus.** The battle menu and the character menu click, confirm, cancel and buzz with the game's own sounds.
+- **Keys and flags.** **M** mutes and unmutes (the music keeps moving while muted); **-** and **=** change the
+  volume. `--mute` or `FMV_AUDIO=off` builds no sound at all (no device is opened, nothing is decoded);
+  `FMV_AUDIO=null` runs the whole soundtrack against a clock with no device; `FMV_AUDIO=auto`, the default of
+  a window, plays through the default output and falls back to the null sink when there is none. A
+  `--headless` bot is silent unless `FMV_AUDIO` is set; with `null` or `auto` it logs what it plays.
+  The victory fanfare is the track `fanfare` (a five-second jingle without a loop); the game's data do
+  not name it, so if your ears say another track of `music.idx` is the real one, `FMV_AUDIO_FANFARE=fan2`
+  (say) plays that instead.
+- **When something is missing**: no sound files in the library, a missing or damaged track, no sound card. Each is one line starting
+  `audio:` on stderr and silence for that part; the game carries on. A sound card is not needed to play.
+- **Runtime dependency.** The client needs `libasound.so.2` (ALSA; PipeWire and PulseAudio serve it through
+  their ALSA plugins), which the Bazzite image has. Without it the binary does not start (the dynamic loader
+  says which library it misses), so a machine that cannot have it cannot run this build.
+
+The log is the evidence of a headless run, which has no ears: `audio: field md1stin: music ob, battle bat (the
+standard theme), after the fight ob` when the area's script has been read, `audio: decoded bat: 167 s of music
+in 842 ms` as each track finishes, `audio: playing bat (battle)` at the moment a track really starts, and a
+closing `headless: audio: sound Null, tracks started: ob > bat > fanfare > ob`.
+
 ## Packaging and smoke test
 
 ```
@@ -853,6 +900,10 @@ testing the guard cheaply). Neither is a clean release.
 To smoke-test the artifact that would ship, unpack the tarball and run
 `scripts/smoke.sh --bin-dir <unpacked directory>`.
 
+The package holds no audio and no game data. The client binary links `libasound.so.2` at run time (see
+"Sound"); `scripts/package.sh` does not change what it ships for that, and on a machine without a sound
+card the packaged client still starts and plays on silently.
+
 ## Deployment
 
 `deploy/` holds a systemd **user** unit template and the install, upgrade and rollback
@@ -862,7 +913,8 @@ UNKNOWN placeholders; see `deploy/README.md`.
 ## State directory layout
 
 ```
-<state>/library/     owned-content library (fmv-import): blobs and one manifest per edition
+<state>/library/     owned-content library (fmv-import): blobs and one manifest per edition (the music and
+                     sound files included)
 <state>/server/      the server's accounts, avatar profiles, player characters (characters/, v8),
                      progression and character progress (LOCK = single writer)
 <state>/client/      a client's saved login tokens: accounts/<server>.token (mode 0600), and next to

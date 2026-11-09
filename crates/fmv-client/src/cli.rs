@@ -196,9 +196,33 @@ FULL SCREEN AND THE ON-SCREEN KEYBOARD:
   types ordinary key events. On a desktop nothing is ever asked of Steam. The `device:` line on
   stderr at start-up says what was seen and what it led to.
 
+SOUND:
+  A window plays YOUR OWN FF7's music and menu sounds, read from the same copy as its data (the
+  library fmv-import wrote; fmv-import import-pc takes the music and sound files along with the
+  rest, and a library made before that gets them by running import-pc on the install again with the
+  same --edition/--region/--language/--revision labels). The field's music follows the area and
+  crossfades when it changes, the battle theme (the field's own, else the standard one) plays when
+  a fight starts, the victory fanfare when it is won, and then the field's music again; running
+  away or losing goes straight back to it. The battle menu and the character menu click, confirm,
+  cancel and buzz as the game does. M mutes and unmutes (the music keeps moving), - and = lower and
+  raise the volume.
+  --mute, or FMV_AUDIO=off, builds nothing: no sound device is opened and nothing is decoded.
+  FMV_AUDIO=null runs the whole soundtrack against a clock with no device (silent, same timeline);
+  FMV_AUDIO=auto, the default of a window, plays through the machine's default output and falls
+  back to the null sink when there is none. A --headless run is silent unless FMV_AUDIO is set to
+  null or auto; then it logs what it plays as `audio:` lines on stderr (`audio: field <area>: ...`,
+  `audio: playing <track> (<why>)`) and ends with a `headless: audio:` summary.
+  A library without sound files, a missing or damaged track and a machine with no sound card are
+  each one `audio:` line on stderr and silence: the game goes on. The client needs libasound.so.2
+  (ALSA; PipeWire and PulseAudio serve it) at run time.
+  The victory fanfare is the track `fanfare` (a five-second jingle without a loop; the game's data
+  do not say which track it is). FMV_AUDIO_FANFARE=<track> plays another track of music.idx instead
+  (`fan2`, say), if your ears disagree.
+
 WINDOW CONTROLS:
   WASD / arrow keys move, Esc twice quits (never during a battle: close the window to quit
-  there). P invites the nearest other player to your party, Y accepts
+  there). M mutes the sound, - and = change its volume (see SOUND). P invites the nearest other
+  player to your party, Y accepts
   the newest pending invite, L leaves your party. The window shows player names over their
   markers, your party in the top right corner, the area name and the connection status; a FIXTURE
   area is labelled \"FIXTURE (synthetic, not FF7)\". The window title shows your party size and a
@@ -291,6 +315,11 @@ pub struct Args {
     /// Run without a window as a scripted bot and print one SMOKE summary line.
     #[arg(long)]
     pub headless: bool,
+
+    /// Play without sound: no sound device is opened and no music file is decoded (the same as
+    /// FMV_AUDIO=off). See SOUND below.
+    #[arg(long)]
+    pub mute: bool,
 
     /// Bot movement pattern (headless only).
     #[arg(long, value_enum, default_value_t = BotKind::Circle, requires = "headless")]
@@ -1163,6 +1192,16 @@ mod tests {
 
     fn parse(extra: &[&str]) -> Result<Args, clap::Error> {
         Args::try_parse_from(["fmv-client", "--name", "x"].into_iter().chain(extra.iter().copied()))
+    }
+
+    #[test]
+    fn mute_is_a_plain_flag_that_is_off_by_default_and_the_help_explains_the_sound() {
+        assert!(!parse(&[]).unwrap().mute);
+        assert!(parse(&["--mute"]).unwrap().mute);
+        assert!(parse(&["--headless", "--mute"]).unwrap().mute);
+        for words in ["SOUND:", "--mute", "FMV_AUDIO=off", "FMV_AUDIO=null", "libasound.so.2", "FMV_AUDIO_FANFARE", "M mutes"] {
+            assert!(AFTER_HELP.contains(words), "the help says {words}");
+        }
     }
 
     #[test]

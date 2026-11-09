@@ -4,6 +4,7 @@
 //! reported cleanly before any network traffic. Every start-up failure (window, GPU) becomes an
 //! error message and a non-zero exit code, never a panic.
 
+use crate::audio::{battle_cue, Cue, GameAudio};
 use crate::avatar::frame::Built;
 use crate::avatar::{AvatarPlayer, Avatars, Stage, Who};
 use crate::backdrop::FieldView;
@@ -204,8 +205,8 @@ pub fn window_attributes(title: String, device: DeviceMode) -> winit::window::Wi
 
 /// `ff7` is where the views of the areas the server moves us to are read from (see
 /// [`App::with_ff7`]); `device` is what the device asks of the window (full screen).
-pub fn run(event_loop: EventLoop<()>, session: Session, view: FieldView, ff7: Option<Arc<Ff7Adapter>>, device: DeviceMode) -> u8 {
-    let mut app = App::new(session, view).with_ff7(ff7).with_device(device);
+pub fn run(event_loop: EventLoop<()>, session: Session, view: FieldView, ff7: Option<Arc<Ff7Adapter>>, device: DeviceMode, audio: GameAudio) -> u8 {
+    let mut app = App::new(session, view).with_ff7(ff7).with_device(device).with_audio(audio);
     // A panic inside the windowing or GPU stack must not skip the goodbye or end as a raw abort.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| event_loop.run_app(&mut app)));
     app.finish(result)
@@ -367,10 +368,40 @@ pub fn battle_request(key: BattleKey, state: &mut ClientState, now: f64) -> Batt
         MenuReply::Handled => BattleRequest::Menu,
         MenuReply::Refused(why) => BattleRequest::Nothing(why),
         MenuReply::Ignored => BattleRequest::Nothing(match (key, state.battle.in_battle()) {
-            (BattleKey::Confirm, true) => "your gauge is not full yet",
-            (BattleKey::Confirm, false) => "no battle to fight in (press B to ask for one)",
+            (BattleKey::Confirm, true) => GAUGE_NOT_FULL,
+            (BattleKey::Confirm, false) => NO_BATTLE_HINT,
             _ => "",
         }),
+    }
+}
+
+/// What [`battle_request`] says when Enter does nothing because the gauge is not full yet, and when there
+/// is no battle at all. Neither is a refusal the game would answer with its buzzer (see `audio::battle_cue`).
+pub const GAUGE_NOT_FULL: &str = "your gauge is not full yet";
+pub const NO_BATTLE_HINT: &str = "no battle to fight in (press B to ask for one)";
+
+/// The sound keys: `M` mutes and unmutes, `-` and `=` (and the keypad's `-` and `+`) lower and raise
+/// the master volume by a tenth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioKey {
+    Mute,
+    VolumeDown,
+    VolumeUp,
+}
+
+impl AudioKey {
+    /// The sound action a keyboard event stands for. Only a PRESS counts, and `M` only a fresh one (a held
+    /// key must not flicker the sound on and off); the volume keys repeat, so that holding one slides it.
+    pub fn from_event(code: KeyCode, pressed: bool, repeat: bool) -> Option<Self> {
+        if !pressed {
+            return None;
+        }
+        match code {
+            KeyCode::KeyM if !repeat => Some(AudioKey::Mute),
+            KeyCode::Minus | KeyCode::NumpadSubtract => Some(AudioKey::VolumeDown),
+            KeyCode::Equal | KeyCode::NumpadAdd => Some(AudioKey::VolumeUp),
+            _ => None,
+        }
     }
 }
 
@@ -381,6 +412,7 @@ enum KeyRoute {
     /// F1: show or hide the walkmesh.
     WalkMesh,
     Party(PartyKey),
+    Audio(AudioKey),
     Battle(BattleKey),
     /// Everything else is for the held-key state of walking (a release always is).
     Movement,
@@ -388,8 +420,8 @@ enum KeyRoute {
     Ignored,
 }
 
-/// Where a key goes. The battle keys come after the party keys and before walking, and the direction
-/// keys are the battle's only `in_battle`, so the field keeps its arrows and WASD.
+/// Where a key goes. The sound keys and the battle keys come after the party keys and before walking,
+/// and the direction keys are the battle's only `in_battle`, so the field keeps its arrows and WASD.
 fn route_key(code: KeyCode, pressed: bool, repeat: bool, in_battle: bool) -> KeyRoute {
     if code == KeyCode::Escape {
         return if pressed && !repeat { KeyRoute::Escape } else { KeyRoute::Ignored };
@@ -399,6 +431,9 @@ fn route_key(code: KeyCode, pressed: bool, repeat: bool, in_battle: bool) -> Key
     }
     if let Some(key) = PartyKey::from_event(code, pressed, repeat) {
         return KeyRoute::Party(key);
+    }
+    if let Some(key) = AudioKey::from_event(code, pressed, repeat) {
+        return KeyRoute::Audio(key);
     }
     if let Some(key) = BattleKey::from_event(code, pressed, repeat, in_battle) {
         return KeyRoute::Battle(key);
@@ -513,6 +548,9 @@ pub(crate) struct App {
     /// Talking to the area's characters (`Enter` or `Space` next to one opens its dialogue window,
     /// which freezes the player while it is open).
     talk: Talk,
+    /// The field's music, the battle music, the fanfare and the menu sounds (off unless
+    /// [`App::with_audio`] gave it one: `--mute`, a library without sound and the fixture have none).
+    audio: GameAudio,
 }
 
 impl App {
@@ -550,12 +588,19 @@ impl App {
             device: DeviceMode::DESKTOP,
             pads: Pads::closed(),
             talk: Talk::ff7(None),
+            audio: GameAudio::off(),
         }
     }
 
     /// What the device asks of the window (see `crate::gamemode`).
     pub(crate) fn with_device(mut self, device: DeviceMode) -> Self {
         self.device = device;
+        self
+    }
+
+    /// The sound of this run (made in `main`; the character menu hands over the one it was using).
+    pub(crate) fn with_audio(mut self, audio: GameAudio) -> Self {
+        self.audio = audio;
         self
     }
 
@@ -584,6 +629,7 @@ impl App {
             KeyRoute::Escape => self.escape(el, source),
             KeyRoute::WalkMesh => self.show_walkmesh = !self.show_walkmesh,
             KeyRoute::Party(key) => self.party_key(key),
+            KeyRoute::Audio(key) => self.audio_key(key),
             KeyRoute::Battle(key) => self.battle_key(key),
             KeyRoute::Movement => {
                 self.input.set(code, pressed);
@@ -610,7 +656,8 @@ impl App {
         let now = Instant::now();
         let (session_now, armed) = (self.session.now(), quit_armed(self.quit_armed_until, now));
         match escape_route(&mut self.session.state, session_now, armed) {
-            EscapeRoute::Battle => {}
+            // The menu went back a level (or the panel after the battle closed).
+            EscapeRoute::Battle => self.audio.cue(Cue::Cancel),
             EscapeRoute::Action(EscapeAction::IgnoreInBattle) => {
                 match source {
                     InputSource::Keyboard => eprintln!("battle: Esc does not quit during a battle (close the window to quit)"),
@@ -718,10 +765,27 @@ impl App {
         window.set_title(&format!("{title}{battle_text}"));
     }
 
-    /// A battle key was pressed: send the request it stands for, and say what it did on stderr.
+    /// A sound key was pressed: mute, or change the volume. The notice says what happened (and, in a run
+    /// that has no sound, that there is none).
+    fn audio_key(&mut self, key: AudioKey) {
+        let said = match key {
+            AudioKey::Mute => self.audio.toggle_mute().map(|muted| if muted { "Sound off (M turns it on)" } else { "Sound on" }),
+            AudioKey::VolumeDown => self.audio.change_volume(false).map(|_| "Volume down"),
+            AudioKey::VolumeUp => self.audio.change_volume(true).map(|_| "Volume up"),
+        };
+        let text = said.unwrap_or("This run has no sound (see --help, SOUND)");
+        self.notice = Some((text, Instant::now() + NOTICE_TIME));
+    }
+
+    /// A battle key was pressed: send the request it stands for, play the menu sound it made, and say what
+    /// it did on stderr.
     fn battle_key(&mut self, key: BattleKey) {
         let now = self.session.now();
-        match battle_request(key, &mut self.session.state, now) {
+        let request = battle_request(key, &mut self.session.state, now);
+        if let Some(cue) = battle_cue(key, &request) {
+            self.audio.cue(cue);
+        }
+        match request {
             BattleRequest::Send(cmd) => {
                 eprintln!(
                     "battle: {}",
@@ -776,6 +840,9 @@ impl App {
         if self.session.take_area_change().is_some() {
             self.rebuild_view();
         }
+        // The music follows the area and the battle (before the battle's early return below: a fight is
+        // exactly when it changes).
+        self.audio.update_from(&self.session);
         self.session.log_party_notes();
         self.session.log_battle_notes();
         self.session.flush_party_sync();

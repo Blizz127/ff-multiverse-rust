@@ -475,7 +475,7 @@ impl BattleClient {
         self.victories
     }
 
-    #[cfg(test)]
+    /// Battles the server ended in defeat.
     pub fn defeats(&self) -> u64 {
         self.defeats
     }
