@@ -324,6 +324,9 @@ pub struct Combatant {
     /// The enemy's own AI scripts and the memory they keep ([`Combatant::from_enemy_in_scene`] gives it
     /// the scene's); `None`: the enemy uses the plain behaviour.
     pub ai: Option<crate::ai::EnemyAi>,
+    /// The id of the `scene.bin` enemy record this enemy was made from ([`Combatant::from_enemy_in_scene`]);
+    /// what an AI script reads as "Index of actor" ([`crate::ai::world`]). `None`: not made from a scene.
+    pub enemy_id: Option<u16>,
 }
 
 impl Combatant {
@@ -361,6 +364,7 @@ impl Combatant {
             limit: 0,
             limit_break: None,
             ai: None,
+            enemy_id: None,
         }
     }
 
@@ -422,6 +426,7 @@ impl Combatant {
     pub fn from_enemy_in_scene(scene: &Scene, enemy_slot: usize, record: &EnemyRecord) -> Self {
         let basic = scene.basic_attack(enemy_slot).map(|a| &a.record);
         let mut c = Self::from_enemy(record, basic);
+        c.enemy_id = scene.enemy_ids.get(enemy_slot).copied().flatten();
         for attack in scene.enemy_attacks(enemy_slot) {
             if let Some(action) = EnemyAction::from_scene(attack) {
                 if !c.actions.iter().any(|known| known.id == action.id) {

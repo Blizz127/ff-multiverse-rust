@@ -28,12 +28,21 @@
 //! |---|---|---|
 //! | `0x4000` (dword) | statuses | only Death (bit 0) can be set: the engine has no statuses |
 //! | `0x4025`, `0x4026`, `0x402D` (bits) | defending, back row, dead | |
+//! | `0x402C` (bit) | "Immune to Death" | 0 for everyone but the owner of the script, which can set it (script-private, see [`super::vm::ADDR_IMMUNE_DEATH`]) |
 //! | `0x4040` | actor index | the slot |
 //! | `0x4048` | level | |
 //! | `0x4060` | character id + `0x10` for a party member (by its name), the instance for an enemy | a party member that is not one of the nine characters has none |
+//! | `0x4120` (word) | "Index of actor": the enemy's id in `scene.bin` | see below |
 //! | `0x40A0`, `0x40A8` | Dexterity, Luck | |
 //! | `0x4100`, `0x4110` (word) | physical and magical defense | a script can write them ([`super::vm::Effect`]) |
 //! | `0x4140`, `0x4150` (word), `0x4160`, `0x4180` (dword) | MP, max MP, HP, max HP | |
+//!
+//! **`0x4120`.** Every use in the owner's `scene.bin` compares it with a constant: an Initialize script finds
+//! the actors of one kind among a mask (`mask of the actors whose 0x4120 == 58`), to see whether a sibling
+//! enemy is in the battle (checked: the scenes that do this hold exactly the enemy ids they compare with, the
+//! Mighty Grunt of id 57 looks for the one of id 58, the Levrikon for the Chocobos 339 and 340 of its own
+//! formation). So it is the id of the enemy record the actor was made from ([`Combatant::enemy_id`], the
+//! scene's `enemy_ids`); a party member and an enemy built without a scene have `0xFFFF`, which no enemy id is.
 
 use crate::kernel::CharacterId;
 use crate::rules::{BattleState, Combatant, Row};
@@ -127,6 +136,9 @@ struct Fields {
     level: u8,
     /// `None`: the actor has no id a script could read.
     id: Option<u8>,
+    /// The id of its enemy record ([`Combatant::enemy_id`]); [`NO_ENEMY_ID`] for a party member and an
+    /// enemy that was not built from a scene.
+    enemy_id: u16,
     dex: u8,
     luck: u8,
     defense: u16,
@@ -136,6 +148,9 @@ struct Fields {
     hp: u32,
     max_hp: u32,
 }
+
+/// What `0x4120` reads for an actor with no enemy record (no real enemy has this id).
+pub const NO_ENEMY_ID: u16 = 0xFFFF;
 
 fn clamp16(v: u32) -> u16 {
     u16::try_from(v).unwrap_or(u16::MAX)
@@ -154,6 +169,7 @@ impl Fields {
             slot,
             level: c.level,
             id,
+            enemy_id: c.enemy_id.unwrap_or(NO_ENEMY_ID),
             dex: clamp8(c.dex),
             luck: clamp8(c.luck),
             defense: clamp16(c.defense),
@@ -173,6 +189,9 @@ impl Fields {
         img.put_bits(0x04, 1 << 5, u8::from(self.defending) << 5);
         img.put_bits(0x04, 1 << 6, u8::from(self.back_row) << 6);
         img.put_bits(0x05, 1 << 5, u8::from(self.dead) << 5);
+        // "Immune to Death" (0x402C, bit 4 of byte 5): nobody is, as far as the battle knows (the owner of a
+        // script can make itself so, in the machine's own memory).
+        img.put_bits(0x05, 1 << 4, 0);
         img.put_le(0x08, 1, u32::from(self.slot));
         img.put_le(0x09, 1, u32::from(self.level));
         if let Some(id) = self.id {
@@ -182,6 +201,7 @@ impl Fields {
         img.put_le(0x15, 1, u32::from(self.luck));
         img.put_le(0x20, 2, u32::from(self.defense));
         img.put_le(0x22, 2, u32::from(self.magic_defense));
+        img.put_le(0x24, 2, u32::from(self.enemy_id));
         img.put_le(0x28, 2, u32::from(self.mp));
         img.put_le(0x2A, 2, u32::from(self.max_mp));
         img.put_le(0x2C, 4, self.hp);
@@ -369,10 +389,12 @@ mod tests {
             (0x401A, 0),
             (0x4025, 0),
             (0x4026, 0),
+            (0x402C, 0),
             (0x402D, 0),
             (0x4040, 1),
             (0x4048, 1),
             (0x4060, 1),
+            (0x4120, 2),
             (0x40A0, 1),
             (0x40A8, 1),
             (0x4100, 2),
@@ -405,6 +427,7 @@ mod tests {
         foe.mp = 12;
         foe.max_mp = 20;
         foe.magic_defense = 44;
+        foe.enemy_id = Some(57);
         let mut hound = Combatant::new("Hound", 5, 60);
         hound.hp = 0;
         BattleState::with_config(
@@ -503,6 +526,15 @@ mod tests {
         assert_eq!(w.actor_field(1, 0x4060, 1), None);
         assert_eq!(w.actor_field(4, 0x4060, 1), Some(0));
         assert_eq!(w.actor_field(5, 0x4060, 1), Some(1));
+        // "Index of actor" is the id of the enemy record; a party member and a combatant that was not made
+        // from a scene have the id no enemy has. "Immune to Death" is clear for everyone the battle knows.
+        assert_eq!(w.actor_field(4, 0x4120, 2), Some(57));
+        assert_eq!(w.actor_field(5, 0x4120, 2), Some(0xFFFF));
+        assert_eq!(w.actor_field(0, 0x4120, 2), Some(0xFFFF));
+        assert_eq!(w.actor_field(4, 0x4120, 1), Some(57), "a byte read sees the low byte of the id");
+        for slot in [0, 1, 4, 5] {
+            assert_eq!(w.actor_field(slot, 0x402C, 0), Some(0), "slot {slot}");
+        }
         // No such actor, an address that is not a field, one that is not modelled.
         assert_eq!(w.actor_field(2, 0x4160, 3), None);
         assert_eq!(w.actor_field(0, 0x2060, 2), None);

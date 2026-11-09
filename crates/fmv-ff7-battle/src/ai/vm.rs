@@ -60,6 +60,10 @@ pub const ADDR_TARGETS: u16 = 0x2070;
 pub const ADDR_IDLE_ANIMATION: u16 = 0x4080;
 /// Address of the damaged animation id of an actor (script-private here).
 pub const ADDR_DAMAGED_ANIMATION: u16 = 0x4088;
+/// Address of the "Immune to Death" flag of an actor (a bit). Every script of the owner's data only ever
+/// *sets* it, for its own actor (Initialize makes a Chocobo immune; a Death counter shields the dying one
+/// from being killed again): script-private here, the engine has no Death status for it to guard against.
+pub const ADDR_IMMUNE_DEATH: u16 = 0x402C;
 /// Address of the physical defense rating.
 pub const ADDR_DEFENSE: u16 = 0x4100;
 /// Address of the magical defense rating.
@@ -246,6 +250,7 @@ pub struct Memory {
     local: [u8; LOCAL_BYTES],
     idle_animation: u32,
     damaged_animation: u32,
+    immune_death: bool,
     pub phase: Phase,
 }
 
@@ -261,8 +266,15 @@ impl Memory {
             local: [0; LOCAL_BYTES],
             idle_animation: 0,
             damaged_animation: 0,
+            immune_death: false,
             phase: Phase::Fresh,
         }
+    }
+
+    /// Whether the scripts have made their actor immune to Death ([`ADDR_IMMUNE_DEATH`]; nothing in the
+    /// battle looks at it).
+    pub fn immune_death(&self) -> bool {
+        self.immune_death
     }
 
     /// The value of `size` at local address `addr` (a bit address), `None` out of range.
@@ -464,6 +476,7 @@ impl Vm<'_> {
             match addr {
                 ADDR_IDLE_ANIMATION => return Ok(trunc(self.mem.idle_animation, size)),
                 ADDR_DAMAGED_ANIMATION => return Ok(trunc(self.mem.damaged_animation, size)),
+                ADDR_IMMUNE_DEATH => return Ok(trunc(u32::from(self.mem.immune_death), size)),
                 _ => {}
             }
         }
@@ -482,6 +495,7 @@ impl Vm<'_> {
         match addr {
             ADDR_IDLE_ANIMATION => self.mem.idle_animation = trunc(v, size),
             ADDR_DAMAGED_ANIMATION => self.mem.damaged_animation = trunc(v, size),
+            ADDR_IMMUNE_DEATH => self.mem.immune_death = trunc(v, size) != 0,
             ADDR_DEFENSE => {
                 let v = trunc(v, size);
                 self.overrides.insert((slot, addr), v);
@@ -575,6 +589,40 @@ impl Vm<'_> {
                     v: u32::from(a == 0),
                     size: 0,
                 })?;
+            }
+            // Bitwise NOT ("Bit-wise NOT of pop"), cut to the size of what was popped; a set is inverted
+            // value by value.
+            op::NOT => {
+                let inverted = match self.pop()? {
+                    Item::Num { v, size } => Item::Num {
+                        v: trunc(!v, size),
+                        size,
+                    },
+                    Item::Set { vals, size } => Item::Set {
+                        vals: vals.into_iter().map(|(slot, v)| (slot, trunc(!v, size))).collect(),
+                        size,
+                    },
+                    _ => return Err(AiError::Type(opcode)),
+                };
+                self.push(inverted)?;
+            }
+            // "Bit count": the number of bits set in what was popped (the first value of a set).
+            op::BIT_COUNT => {
+                let (v, size) = match self.pop()? {
+                    Item::Num { v, size } => (v, size),
+                    Item::Set { vals, size } => (vals.first().map(|&(_, v)| v).ok_or(AiError::EmptySet(opcode))?, size),
+                    _ => return Err(AiError::Type(opcode)),
+                };
+                self.push(Item::Num {
+                    v: v.count_ones(),
+                    size: size.max(1),
+                })?;
+            }
+            // "Type 02 with only bit in pop turned on (1 << [pop])": the mask of one actor from its slot.
+            op::BIT => {
+                let n = self.pop_scalar(opcode)?;
+                let v = if n < 16 { 1u32 << n } else { 0 };
+                self.push(Item::Num { v, size: 2 })?;
             }
             op::END => return Ok(Flow::End),
             op::DROP => {
@@ -854,14 +902,17 @@ pub fn implements(insn: &Insn) -> bool {
                 | op::LAND
                 | op::LOR
                 | op::LNOT
+                | op::NOT
                 | op::END
                 | op::DROP
                 | op::MASK
                 | op::RANDOM
                 | op::RANDOM_BIT
+                | op::BIT_COUNT
                 | op::GREATEST
                 | op::LEAST
                 | op::MP_COST
+                | op::BIT
                 | op::STORE
                 | op::ACT
         ),
@@ -904,7 +955,11 @@ pub fn unsupported_address(insn: &Insn, field_known: impl Fn(u16, u8) -> bool) -
             } else {
                 matches!(
                     addr,
-                    ADDR_IDLE_ANIMATION | ADDR_DAMAGED_ANIMATION | ADDR_DEFENSE | ADDR_MAGIC_DEFENSE
+                    ADDR_IDLE_ANIMATION
+                        | ADDR_DAMAGED_ANIMATION
+                        | ADDR_IMMUNE_DEATH
+                        | ADDR_DEFENSE
+                        | ADDR_MAGIC_DEFENSE
                 )
             }
         }
@@ -1286,6 +1341,82 @@ mod tests {
     }
 
     #[test]
+    fn bitwise_not_keeps_the_size_of_what_it_inverts() {
+        // A byte 5 inverts to 0xFA, a word 0x0010 to 0xFFEF.
+        assert_eq!(targets_of(&Asm::act_on(|a| a.k1(5).op(op::NOT), 1)), 0xFA);
+        assert_eq!(targets_of(&Asm::act_on(|a| a.k2(0x0010).op(op::NOT), 1)), 0xFFEF);
+        // The usual use: a mask with some actors taken out ("the enemies, but not me" is `enemies & !me`).
+        let others = Asm::act_on(|a| a.val(2, 0x20A0).val(2, 0x2060).op(op::NOT).op(op::AND), 1);
+        assert_eq!(targets_of(&others), 0b111, "the party; slot 4 is not among them anyway");
+        let not_slot_one = Asm::act_on(|a| a.val(2, 0x20A0).k1(0b010).op(op::NOT).op(op::AND), 1);
+        assert_eq!(targets_of(&not_slot_one), 0b101);
+        // A set is inverted value by value: the back-row bit of the three players is (0, 0, 1).
+        let inverted = Asm::act_on(|a| a.val(2, 0x20A0).val(0, 0x4026).op(op::MASK).op(op::NOT).k1(1).op(op::EQ), 1);
+        assert_eq!(targets_of(&inverted), 0b011);
+        // An address cannot be inverted.
+        assert_eq!(go(&Asm::default().addr(2, 0x0000).op(op::NOT).op(op::END)), Err(AiError::Type(op::NOT)));
+        assert_eq!(go(&Asm::default().op(op::NOT)), Err(AiError::StackUnderflow));
+    }
+
+    #[test]
+    fn bit_count_counts_the_bits_of_a_mask_and_bit_makes_the_mask_of_a_slot() {
+        // The enemies of slot 4 are the three players; a plain number; nothing.
+        assert_eq!(targets_of(&Asm::act_on(|a| a.val(2, 0x20A0).op(op::BIT_COUNT), 1)), 3);
+        assert_eq!(targets_of(&Asm::act_on(|a| a.k2(0b1011_0000_0000_0001).op(op::BIT_COUNT), 1)), 4);
+        assert_eq!(targets_of(&Asm::act_on(|a| a.k1(0).op(op::BIT_COUNT), 1)), 0);
+        assert_eq!(targets_of(&Asm::act_on(|a| a.k1(0xFF).op(op::BIT_COUNT), 1)), 8);
+        // Of a comparison's mask: how many of the players have 200 HP or more (slots 0 and 2).
+        let strong = Asm::act_on(|a| a.val(2, 0x20A0).val(3, 0x4160).op(op::MASK).k2(200).op(op::GE).op(op::BIT_COUNT), 1);
+        assert_eq!(targets_of(&strong), 2);
+        // Of a set only its first value is looked at (HP 300 = 0b1_0010_1100: four bits).
+        let first = Asm::act_on(|a| a.val(2, 0x20A0).val(3, 0x4160).op(op::MASK).op(op::BIT_COUNT), 1);
+        assert_eq!(targets_of(&first), 4);
+        // The usual test: "am I the only one of my side left?" (the allies of slot 4 are the living foes: 4 and 5).
+        let alone = Asm::act_on(|a| a.val(2, 0x2080).op(op::BIT_COUNT).k1(1).op(op::EQ), 1);
+        assert_eq!(targets_of(&alone), 0, "slot 5 lives too");
+        assert_eq!(go(&Asm::default().op(op::BIT_COUNT)), Err(AiError::StackUnderflow));
+        assert_eq!(go(&Asm::default().addr(1, 0x0000).op(op::BIT_COUNT).op(op::END)), Err(AiError::Type(op::BIT_COUNT)));
+
+        // BIT is 1 << n as a word: a slot's mask; out of the word's reach it is nothing.
+        assert_eq!(targets_of(&Asm::act_on(|a| a.k1(0).op(op::BIT), 1)), 1);
+        assert_eq!(targets_of(&Asm::act_on(|a| a.k1(3).op(op::BIT), 1)), 8);
+        assert_eq!(targets_of(&Asm::act_on(|a| a.k1(15).op(op::BIT), 1)), 0x8000);
+        assert_eq!(targets_of(&Asm::act_on(|a| a.k1(16).op(op::BIT), 1)), 0);
+        assert_eq!(targets_of(&Asm::act_on(|a| a.k2(300).op(op::BIT), 1)), 0);
+        // "Aim at the actor whose index I computed": the mask of slot 2 + 1.
+        let computed = Asm::act_on(|a| a.k1(2).k1(1).op(op::ADD).op(op::BIT), 1);
+        assert_eq!(targets_of(&computed), 0b1000);
+        // Its pop is any value: the first value of a set, and BIT of BIT_COUNT chains.
+        let chained = Asm::act_on(|a| a.val(2, 0x20A0).op(op::BIT_COUNT).op(op::BIT), 1);
+        assert_eq!(targets_of(&chained), 1 << 3);
+        assert_eq!(go(&Asm::default().op(op::BIT)), Err(AiError::StackUnderflow));
+    }
+
+    #[test]
+    fn the_immune_to_death_flag_is_the_owners_to_set_and_nobody_elses() {
+        // me.immune_death = 1, as the Initialize scripts of the real enemies do.
+        let set = Asm::default().addr(2, 0x2060).addr(0, 0x402C).op(op::MASK).k1(1).op(op::STORE).op(op::END);
+        let mut mem = Memory::new();
+        assert!(!mem.immune_death());
+        run_asm(&set, &Fixed::new(4), &mut mem, &mut Rng::new(1)).unwrap();
+        assert!(mem.immune_death());
+        // It reads back (the world is not asked for the owner's), and survives to the next run.
+        let read = Asm::act_on(|a| a.val(2, 0x2060).val(0, 0x402C).op(op::MASK), 1);
+        let out = run_asm(&read, &Fixed::new(4), &mut mem, &mut Rng::new(1)).unwrap();
+        assert_eq!(out.action.unwrap().targets, 1);
+        // Storing 0 clears it.
+        let clear = Asm::default().addr(2, 0x2060).addr(0, 0x402C).op(op::MASK).k1(0).op(op::STORE).op(op::END);
+        run_asm(&clear, &Fixed::new(4), &mut mem, &mut Rng::new(1)).unwrap();
+        assert!(!mem.immune_death());
+        // It is no change to the battle, and another actor's flag cannot be set.
+        assert!(run_asm(&set, &Fixed::new(4), &mut mem, &mut Rng::new(1)).unwrap().effects.is_empty());
+        let other = Asm::default().k1(1).addr(0, 0x402C).op(op::MASK).k1(1).op(op::STORE).op(op::END);
+        assert_eq!(go(&other), Err(AiError::Address(0x402C)));
+        // A fresh memory is not immune.
+        assert!(!Memory::new().immune_death());
+    }
+
+    #[test]
     fn what_the_machine_does_not_model_is_an_error_not_a_guess() {
         // Reading an unmodelled field, an unmodelled global, an unsupported opcode, a bad stack.
         let field = Asm::act_on(|a| a.val(2, 0x20A0).val(2, 0x4999).op(op::MASK), 1);
@@ -1389,6 +1520,9 @@ mod tests {
     #[test]
     fn what_is_implemented_is_what_decodes_to_something_the_machine_runs() {
         assert!(implements(&Insn::Simple(op::STORE)));
+        for opcode in [op::NOT, op::BIT_COUNT, op::BIT] {
+            assert!(implements(&Insn::Simple(opcode)), "{opcode:#04x}");
+        }
         assert!(!implements(&Insn::Simple(op::LINK)));
         assert!(!implements(&Insn::Debug { len: 3 }));
         let known = |addr: u16, size: u8| addr == 0x4160 && size == 3;
@@ -1397,6 +1531,8 @@ mod tests {
         assert_eq!(unsupported_address(&value(3, 0x4160), known), None);
         assert_eq!(unsupported_address(&value(3, 0x4161), known), Some(0x4161));
         assert_eq!(unsupported_address(&place(2, 0x4100), known), None);
+        assert_eq!(unsupported_address(&place(0, 0x402C), known), None, "the owner's immunity flag is a store target");
+        assert_eq!(unsupported_address(&place(0, 0x402D), known), Some(0x402D), "the dead flag is not");
         assert_eq!(unsupported_address(&place(2, 0x4160), known), Some(0x4160));
         assert_eq!(unsupported_address(&value(2, 0x2060), known), None);
         assert_eq!(unsupported_address(&value(2, 0x2070), known), None);

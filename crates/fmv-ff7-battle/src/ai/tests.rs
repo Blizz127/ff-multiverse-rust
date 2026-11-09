@@ -274,6 +274,55 @@ fn initialize_called_directly_reports_what_it_would_do() {
 }
 
 #[test]
+fn an_initialize_script_finds_a_sibling_by_enemy_id_and_may_make_itself_immune_to_death() {
+    // The pattern of the real Initialize scripts: LV0040 = the active actors whose "Index of actor" is 58
+    // (is my sibling in the battle?), and me.immune_death = 1.
+    let init = Asm::default()
+        .addr(2, 0x40)
+        .val(2, 0x2050)
+        .val(2, 0x4120)
+        .op(op::MASK)
+        .k1(58)
+        .op(op::EQ)
+        .op(op::STORE)
+        .addr(2, 0x2060)
+        .addr(0, 0x402C)
+        .op(op::MASK)
+        .k1(1)
+        .op(op::STORE)
+        .op(op::END);
+    let main = Asm::act_on(|a| a.val(2, 0x40), ATTACK);
+    let with_id = |id: u16, init: Option<&Asm>| {
+        let mut foe = scripted_foe(init, &main);
+        foe.enemy_id = Some(id);
+        foe
+    };
+    let mut sibling = plain_foe();
+    sibling.enemy_id = Some(58);
+    let state = battle_of(1, vec![with_id(57, Some(&init)), sibling]);
+    let memory = memory_of(&state, FOE);
+    assert_eq!(memory.phase, Phase::Ready, "Initialize ran to its end");
+    assert!(memory.immune_death());
+    assert_eq!(memory.local(0x40, 2), Some(1 << 5), "the sibling is the enemy in slot 5");
+    // The script's Main then reads what Initialize found: an attack aimed at the sibling's slot.
+    assert_eq!(
+        turn(&state).unwrap().choice.unwrap().target,
+        Target::One(ActorId(3)),
+        "the sibling is position 3 of the battle"
+    );
+    // Without a sibling (another enemy, a party member or an enemy with no id) it found nobody.
+    for other in [Some(59), None] {
+        let mut stranger = plain_foe();
+        stranger.enemy_id = other;
+        let state = battle_of(1, vec![with_id(57, Some(&init)), stranger]);
+        assert_eq!(memory_of(&state, FOE).local(0x40, 2), Some(0), "enemy id {other:?}");
+        assert_eq!(memory_of(&state, FOE).phase, Phase::Ready);
+    }
+    let alone = battle_of(1, vec![with_id(57, Some(&init))]);
+    assert_eq!(memory_of(&alone, FOE).local(0x40, 2), Some(0));
+}
+
+#[test]
 fn a_block_with_both_scripts_keeps_each_in_its_slot() {
     let init = Asm::default().op(op::END);
     let main = weakest(ATTACK);
