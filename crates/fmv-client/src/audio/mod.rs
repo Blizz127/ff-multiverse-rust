@@ -220,7 +220,7 @@ struct Live {
     battles_seen: u64,
     /// The time the battle's due sounds were last asked for up to (the next look asks from here).
     polled_to: Option<f64>,
-    /// How many times each battle sound id was played (the headless summary line, and tests).
+    /// How many times each battle sound id was played (the closing line of the run, and tests).
     battle_played: BTreeMap<u16, u32>,
     /// Ids that came due with no clip to play, said once each.
     unheard: HashSet<u16>,
@@ -320,7 +320,7 @@ impl Live {
         }
     }
 
-    /// What the battle sounds of this run came to, `None` when there were none: `87 (16x38 18x13 46x3 227x33)`, each sound id
+    /// What the battle sounds of this run came to, `None` when there were none: `86 (16x39 18x12 46x1 227x34)`, each sound id
     /// and how many times it played (the closing line of a run that heard any).
     fn battle_sounds_played(&self) -> Option<String> {
         let total: u32 = self.battle_played.values().sum();
