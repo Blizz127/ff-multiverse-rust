@@ -1,4 +1,10 @@
-//! FF Multiverse wire protocol v12.
+//! FF Multiverse wire protocol v13.
+//!
+//! v13 is v12 with a changed ENGINE again: a scripted enemy's status-only attacks are now played (they used to be
+//! skipped), and an enemy that a turn of Poison kills runs its Death counter in the same step. No message, event or
+//! stored record changed shape, but every client replays a battle with its own engine, and a v12 engine would skip
+//! those attacks and counters (and their random draws), so its replay would diverge: a v12 client or server is refused
+//! at the handshake instead.
 //!
 //! v12 is v11 plus STATUS EFFECTS (see "Statuses (v12)" below and [`battle`], "Statuses"): three battle events, two
 //! refusals and one optional field of the roster ([`BattleMember::status`]). A v11 peer cannot decode the new events or
@@ -335,7 +341,7 @@ pub use fmv_party::{
     PartyEvent, PartyId, Placement,
 };
 
-pub const PROTOCOL_VERSION: u16 = 12;
+pub const PROTOCOL_VERSION: u16 = 13;
 /// Hard cap on a single frame payload (bytes).
 pub const MAX_FRAME: u32 = 256 * 1024;
 /// Default TCP port for development. Deployment port is UNASSIGNED (see DEPLOYMENT-CONTRACT.md).
@@ -750,8 +756,8 @@ mod tests {
     }
 
     #[test]
-    fn the_version_is_twelve() {
-        assert_eq!(PROTOCOL_VERSION, 12);
+    fn the_version_is_thirteen() {
+        assert_eq!(PROTOCOL_VERSION, 13);
     }
 
     // -----------------------------------------------------------------------------------------
@@ -2156,8 +2162,8 @@ mod tests {
         let v2 = br#"{"Hello":{"protocol_version":2,"client_build":"x","auth":{"Register":{"display_name":"n"}},"tint":[1,2,3],"appearance_ref":null}}"#;
         assert!(decode::<ClientMsg>(v2).is_err(), "no Hello before v8 is a v8 ClientMsg");
         assert_eq!(probe_hello_version(v2), Some(2));
-        let future = br#"{"Hello":{"protocol_version":13,"anything":{"at":"all"}}}"#;
-        assert_eq!(probe_hello_version(future), Some(13));
+        let future = br#"{"Hello":{"protocol_version":14,"anything":{"at":"all"}}}"#;
+        assert_eq!(probe_hello_version(future), Some(14));
         for not_hello in [&br#""Leave""#[..], br#"{"Ping":{"nonce":1}}"#, b"not json", b"{}", br#"{"Hello":{}}"#, br#"{"Hello":{"protocol_version":70000}}"#] {
             assert_eq!(probe_hello_version(not_hello), None, "{}", String::from_utf8_lossy(not_hello));
         }
