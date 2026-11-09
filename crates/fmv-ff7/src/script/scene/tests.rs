@@ -404,6 +404,19 @@ fn too_many_windows_end_the_scene_in_the_budget() {
 }
 
 #[test]
+fn a_script_that_starts_a_short_lived_thread_every_lap_cannot_grow_the_table_for_ever() {
+    // `a` starts `b` (which ends at once) and loops: each lap is a change (a thread), so it is never parked and only
+    // the limits end it. Neither the live-thread limit nor the step budget alone bounds the table of ended threads.
+    let a = vec![req(0x01, 1, 2, 1), vec![0x12, 3]];
+    let b = vec![wait(1)];
+    let section = script(vec![("a", vec![(1, a)]), ("b", vec![(1, b)])], texts(1));
+    let (beats, vm) = run_with(&section, start(0, 1), &[], Vm::new(SceneVars::new(StoryState::new_game(), &[]), 1, Limits { steps: 100_000, ..Limits::default() }));
+    assert!(matches!(end_of(&beats), End::Budget | End::Finished));
+    assert!(vm.stats().threads <= 4096 + 1, "{} threads were started", vm.stats().threads);
+    assert!(vm.stats().dropped_requests > 0, "the requests past the bound were dropped and counted");
+}
+
+#[test]
 fn damaged_bytes_never_panic_and_end_the_scene() {
     // every opcode byte, then truncations: the VM ends the scene or skips, but never panics
     for op in 0..=255u8 {

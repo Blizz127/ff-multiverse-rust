@@ -73,6 +73,8 @@ const DEFAULT_ANIM_SPEED: u32 = 16;
 const TURN_FRAMES: u32 = 8;
 /// How long a ladder or a jump takes, in frames.
 const JUMP_FRAMES: u32 = 30;
+/// Most threads a run ever starts, ended ones included (the table is bounded, whatever a script does).
+const MAX_THREADS_EVER: usize = 4096;
 
 /// How far one run of the scene may go.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -718,7 +720,8 @@ impl Vm {
 
     /// Start `entity`'s script `slot` as a thread at `time`, on priority slot `prio`. `None` when it cannot be started.
     fn spawn(&mut self, script: &FieldScript<'_>, entity: usize, slot: usize, prio: u8, time: u32) -> Option<usize> {
-        if self.live_threads() >= self.limits.threads {
+        // (the ended threads stay in the table, so a script that starts a short-lived one every lap is bounded too)
+        if self.live_threads() >= self.limits.threads || self.threads.len() >= MAX_THREADS_EVER {
             self.stats.dropped_requests = self.stats.dropped_requests.saturating_add(1);
             return None;
         }
