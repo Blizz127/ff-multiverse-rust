@@ -770,7 +770,106 @@ fn describe_fields_from_the_environment() {
                 Err(why) => println!("      -> not an NPC: {why}"),
             }
         }
+        // what `AreaRuntime::npcs` returns for the field (the facing is `field_direction_to_facing`
+        // of the entity's `DIR` byte, byte 0 = -90 degrees when it has none)
+        let npcs = area.npcs();
+        println!("--- {name}: {} NPCs returned", npcs.len());
+        for n in &npcs {
+            println!(
+                "  {:8} model {:6} idle {:8} label {:30} at ({}, {}, {}) facing {:.1} deg",
+                n.entity_name,
+                n.appearance.model,
+                n.appearance.idle_animation.as_deref().unwrap_or("-"),
+                n.appearance.label,
+                n.pos.x,
+                n.pos.y,
+                n.pos.z,
+                n.facing.to_degrees()
+            );
+        }
     }
+}
+
+/// Barret in the first Mako reactor fields (`md1stin`, `md1_1`, `md1_2`): his skeleton (`acgd`) is
+/// there as a PLAYER entity (a `CHAR` that is also a `PC`, party slot 1) and never as an NPC, and
+/// `md1_2` has neither a loader record with his skeleton nor an entity that wears it. Across the
+/// archive the adapter reports an NPC with his skeleton in only five fields, none of them a
+/// reactor field. Prints counts only.
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn barret_is_a_party_member_not_an_npc_of_the_first_reactor_fields() {
+    let Some(dir) = data_dir() else { return };
+    let a = adapter(&dir);
+    let barrets_model = |e: &EntityInit| e.model_ref.as_ref().is_some_and(|m| m.hrc.eq_ignore_ascii_case("ACGD.HRC"));
+
+    // per field: loader records with his skeleton, entities wearing it, NPCs the adapter reports,
+    // and the one placement of his entity (x, y), z, walkmesh triangle (all conditional)
+    type PcPlacement = Option<((i16, i16), i16, u16)>;
+    let reactor: [(&str, usize, usize, usize, PcPlacement); 3] = [
+        ("md1stin", 1, 1, 2, Some(((3921, 27_489), 323, 30))),
+        ("md1_1", 1, 1, 5, Some(((2264, 1236), 1298, 71))),
+        ("md1_2", 0, 0, 3, None),
+    ];
+    for (name, records, entities, npc_count, placement) in reactor {
+        let area = a.load_field(name).unwrap();
+        let npcs = area.npcs();
+        let loader = area.field_file().model_loader().unwrap();
+        let in_loader = loader.models.iter().filter(|m| m.hrc_stem() == "acgd").count();
+        let barrets: Vec<EntityInit> = inits_of(&area).into_iter().filter(|e| barrets_model(e)).collect();
+        println!(
+            "{name}: {} loader records, {in_loader} with Barret's skeleton; {} entities wear it; {} NPCs reported",
+            loader.models.len(),
+            barrets.len(),
+            npcs.len()
+        );
+        assert_eq!((in_loader, barrets.len(), npcs.len()), (records, entities, npc_count), "{name}");
+        assert!(npcs.iter().all(|n| n.appearance.model != "acgd"), "{name}: no NPC wears Barret's skeleton");
+        for e in &barrets {
+            // CHAR and PC: the entity stands for the party member in slot 1 (a player), not an NPC
+            assert!(e.is_character() && e.is_player(), "{name}");
+            assert_eq!(e.player.map(|p| p.value), Some(Arg::Literal(1)), "{name}: party slot");
+            // its only placement is conditional, which the rules for NPCs would not report either
+            assert!(e.placements.len() == 1 && e.placements.iter().all(|p| p.conditional), "{name}");
+            assert!(verdict(e, &area).is_err(), "{name}");
+            let p = &e.placements[0];
+            assert_eq!(Some((p.xy().unwrap(), p.z.literal().unwrap(), p.triangle.literal().unwrap())), placement, "{name}");
+        }
+    }
+
+    // Over the whole archive: in how many fields does an entity wear Barret's skeleton, as a player
+    // and as a plain `CHAR`, and where does the adapter report one as an NPC?
+    let keys: Vec<String> = a.list_areas().into_iter().map(|i| i.id.key).collect();
+    let (mut with_entity, mut with_player, mut with_plain) = (0usize, 0usize, 0usize);
+    let mut npc_fields: BTreeMap<String, usize> = BTreeMap::new();
+    for key in &keys {
+        let Ok(area) = a.load_field(key) else { continue };
+        let barrets: Vec<EntityInit> = inits_of(&area).into_iter().filter(|e| barrets_model(e)).collect();
+        with_entity += usize::from(!barrets.is_empty());
+        with_player += usize::from(barrets.iter().any(|e| e.is_player()));
+        with_plain += usize::from(barrets.iter().any(|e| !e.is_player()));
+        let npcs = area.npcs().iter().filter(|n| n.appearance.model == "acgd").count();
+        if npcs > 0 {
+            npc_fields.insert(key.clone(), npcs);
+        }
+    }
+    println!(
+        "{} fields; Barret's skeleton on an entity in {with_entity} (a player in {with_player}, a plain CHAR in {with_plain}); an NPC with it reported in {} fields, {} NPCs",
+        keys.len(),
+        npc_fields.len(),
+        npc_fields.values().sum::<usize>()
+    );
+    assert_eq!((keys.len(), with_entity, with_player, with_plain), (702, 314, 296, 18));
+    let want: BTreeMap<String, usize> =
+        [("blackbg5", 1), ("blackbg6", 2), ("blackbg8", 1), ("blackbgi", 1), ("tunnel_4", 1)].map(|(k, n)| (k.to_string(), n)).into();
+    assert_eq!(npc_fields, want);
+
+    // "Nearest" in the game's own field order (the maplist): the reactor fields are ids 116 to 118,
+    // the nearest fields with a reported Barret NPC are `blackbgi` (6 before) and then `blackbg8`,
+    // `blackbg6` and `blackbg5`; `tunnel_4` is far away.
+    let maplist = Maplist::from_archive(&mut LgpArchive::open_path(flevel(&dir)).unwrap()).unwrap();
+    let id = |name: &str| maplist.id_of(name).unwrap();
+    assert_eq!(["md1stin", "md1_1", "md1_2"].map(id), [116, 117, 118]);
+    assert_eq!(["blackbgi", "blackbg8", "blackbg6", "blackbg5", "tunnel_4"].map(id), [110, 100, 98, 97, 736]);
 }
 
 /// Over all 702 fields: `npcs()` is exactly what the restated rules select; totals.
