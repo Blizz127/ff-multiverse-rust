@@ -71,6 +71,18 @@
 //! told to the player with `ServerMsg::StoryUpdate`; a changed phase moves the player (and its party's
 //! members) to another instance of the same area. See `world::story`.
 //!
+//! # Story scenes
+//!
+//! A story scene is a game's own scripted conversation, played by the clients from their own files for a player
+//! that stands in it as a witness (`fmv_ff7::script::scene`, `fmv_protocol::scene`). The server holds a RUN of it
+//! (`world::scene`): OK next to a scene's trigger starts one for that player, party members in range watch, every
+//! participant is held (no moves, no encounters, no OK) until it ends, the owner reports each window it moves
+//! past, and the server ends it whatever a client says (idle and total time limits, an owner that leaves drops
+//! it). What the scene's script wrote to the story is applied by the server itself, once, from the answers the owner
+//! reported. `--debug-scene-preview` (off by default) lets a player put itself in a scene's field at the scene's
+//! own story moment on a made-up story, of which nothing is ever saved. The game's scenes come from a
+//! [`SceneHost`] (`ServerConfig::scenes`); FF7's is [`scene_host::Ff7SceneHost`].
+//!
 //! # Inventory
 //!
 //! Every account also carries items (`inventory`), mirrored in the world and stored inside the same
