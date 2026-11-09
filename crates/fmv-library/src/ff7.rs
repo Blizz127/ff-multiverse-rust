@@ -20,8 +20,12 @@
 //!   `unknown`). They are part of the fingerprint: two peers that read the same bytes but label
 //!   them differently cannot share an instance, which is the safe direction.
 //!
+//! The owner's audio (music and sound effects) is found the same way, by [`resolve_audio`]: from
+//! the same library set, or, for a direct `flevel.lgp`, from the folders of the install it sits in.
+//!
 //! Everything here is read-only. Local paths appear in errors shown on this machine only.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use fmv_core::{EditionProvenance, GameId, Platform, SourceRef};
@@ -489,6 +493,239 @@ pub fn resolve_battle_files(source: &Ff7Source) -> Result<ResolvedBattleFiles, F
     match source {
         Ff7Source::Library { state_dir, set } => resolve_library_battle_files(state_dir.as_deref(), set.as_deref()),
         Ff7Source::Flevel { .. } => Err(Ff7ResolveError::BattleNeedsLibrary),
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Audio (music and sound effects)
+// ---------------------------------------------------------------------------------------------
+
+/// The FF7 audio files found for a source (see [`resolve_audio`]); every field is empty for an
+/// install or library without audio. The files are decoded on this machine only and never sent
+/// over the network.
+#[derive(Debug, Clone, Default)]
+pub struct ResolvedAudio {
+    /// `data/music/music.idx`
+    pub music_idx: Option<PathBuf>,
+    /// `data/music_ogg/<name>.ogg`, keyed by the lower-case file stem (`bat`).
+    pub music_ogg: BTreeMap<String, PathBuf>,
+    /// `data/music/<name>.wav`, keyed the same way.
+    pub music_wav: BTreeMap<String, PathBuf>,
+    /// `data/sound/audio.dat`
+    pub sfx_dat: Option<PathBuf>,
+    /// `data/sound/audio.fmt`
+    pub sfx_fmt: Option<PathBuf>,
+}
+
+impl ResolvedAudio {
+    /// True when there is no audio file at all.
+    pub fn is_empty(&self) -> bool {
+        self.music_idx.is_none()
+            && self.music_ogg.is_empty()
+            && self.music_wav.is_empty()
+            && self.sfx_dat.is_none()
+            && self.sfx_fmt.is_none()
+    }
+
+    /// The file of the music track `name` (matched ASCII-case-insensitively): the `.ogg` first,
+    /// else the `.wav`.
+    pub fn music_file(&self, name: &str) -> Option<&Path> {
+        let key = name.to_ascii_lowercase();
+        self.music_ogg
+            .get(&key)
+            .or_else(|| self.music_wav.get(&key))
+            .map(PathBuf::as_path)
+    }
+
+    /// Fill `slot` with `path`, unless a file already did (the first one found stays).
+    fn fill(&mut self, slot: AudioSlot, path: PathBuf) {
+        match slot {
+            AudioSlot::MusicIdx => {
+                self.music_idx.get_or_insert(path);
+            }
+            AudioSlot::SfxDat => {
+                self.sfx_dat.get_or_insert(path);
+            }
+            AudioSlot::SfxFmt => {
+                self.sfx_fmt.get_or_insert(path);
+            }
+            AudioSlot::MusicOgg(stem) => {
+                self.music_ogg.entry(stem).or_insert(path);
+            }
+            AudioSlot::MusicWav(stem) => {
+                self.music_wav.entry(stem).or_insert(path);
+            }
+        }
+    }
+}
+
+/// What a file of a data directory is, as far as audio goes.
+enum AudioSlot {
+    MusicIdx,
+    MusicOgg(String),
+    MusicWav(String),
+    SfxDat,
+    SfxFmt,
+}
+
+/// The slot of file `file` in folder `dir` of a data directory (both lower case): the places
+/// `fmv-import` stores audio at, and nothing else.
+fn audio_slot(dir: &str, file: &str) -> Option<AudioSlot> {
+    let stem_of = |ext: &str| {
+        file.strip_suffix(ext)
+            .filter(|stem| !stem.is_empty())
+            .map(str::to_string)
+    };
+    match (dir, file) {
+        ("music", "music.idx") => Some(AudioSlot::MusicIdx),
+        ("sound", "audio.dat") => Some(AudioSlot::SfxDat),
+        ("sound", "audio.fmt") => Some(AudioSlot::SfxFmt),
+        ("music_ogg", _) => stem_of(".ogg").map(AudioSlot::MusicOgg),
+        ("music", _) => stem_of(".wav").map(AudioSlot::MusicWav),
+        _ => None,
+    }
+}
+
+/// The slot of a library path (`data/music_ogg/bat.ogg`, ...), in any letter case.
+fn audio_slot_of_logical(logical: &str) -> Option<AudioSlot> {
+    let lower = logical.to_ascii_lowercase();
+    let mut parts = lower.split('/');
+    let (data, dir, file, rest) = (parts.next()?, parts.next()?, parts.next()?, parts.next());
+    if data != "data" || rest.is_some() {
+        return None;
+    }
+    audio_slot(dir, file)
+}
+
+/// The importer's rule for an audio file name it takes (`fmv-import`'s scan): letters, digits, `_`,
+/// `.` and `-` only, at most 64 bytes, no leading dot. A direct folder is held to the same names (not
+/// to the importer's other limits: it reads a local folder in place, so links are followed and there
+/// is no cap on the number of files, as for `char.lgp` and `battle.lgp`).
+fn is_plain_audio_name(name: &str) -> bool {
+    !name.starts_with('.')
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+}
+
+/// Most entries of one audio folder looked at (a real one holds under a hundred).
+const MAX_AUDIO_FOLDER_ENTRIES: usize = 4096;
+
+/// The audio of a `data` directory: the folders `music_ogg`, `music` and `sound` in any letter
+/// case, and in them the regular, non-empty files the importer would take.
+fn audio_in_data_dir(data: &Path) -> ResolvedAudio {
+    let mut out = ResolvedAudio::default();
+    for dir in ["music_ogg", "music", "sound"] {
+        let Some(folder) = child_ignoring_case(data, dir, true) else {
+            continue;
+        };
+        let Ok(entries) = std::fs::read_dir(&folder) else {
+            continue;
+        };
+        let mut files: Vec<PathBuf> = entries
+            .filter_map(Result::ok)
+            .take(MAX_AUDIO_FOLDER_ENTRIES)
+            .map(|e| e.path())
+            .collect();
+        // Several spellings of one name: pick the same one every time.
+        files.sort();
+        for path in files {
+            let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+                continue;
+            };
+            if !is_plain_audio_name(&name) {
+                continue;
+            }
+            let Some(slot) = audio_slot(dir, &name.to_ascii_lowercase()) else {
+                continue;
+            };
+            if std::fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() > 0) {
+                out.fill(slot, path);
+            }
+        }
+    }
+    out
+}
+
+/// The audio of the install a `flevel.lgp` sits in: `field/flevel.lgp` and the folders
+/// `music_ogg/`, `music/` and `sound/` are siblings (of the install's `data` directory), and for a
+/// `lang-xx/field/flevel.lgp` the language folder's own folders are tried first, then the ones in
+/// the folder above it. Of the candidates the first with any audio at all is taken whole, never a
+/// mix of two.
+///
+/// Only the `field` folder of an install says where its `data` directory is: a `flevel.lgp` lying
+/// in some other folder must not make that folder's neighbours "the game's audio" (a `Music` folder
+/// beside the `Downloads` it was put in).
+fn audio_beside_install(flevel: &Path) -> ResolvedAudio {
+    let Some(field_dir) = flevel.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return ResolvedAudio::default();
+    };
+    let is_field_folder = field_dir
+        .file_name()
+        .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("field"));
+    let Some(install) = field_dir.parent().filter(|_| is_field_folder) else {
+        return ResolvedAudio::default();
+    };
+    let mut roots = vec![or_here(install)];
+    let is_language_dir = install.file_name().is_some_and(|n| {
+        n.to_string_lossy()
+            .to_ascii_lowercase()
+            .starts_with("lang-")
+    });
+    if is_language_dir {
+        if let Some(up) = install.parent() {
+            roots.push(or_here(up));
+        }
+    }
+    roots
+        .into_iter()
+        .map(|root| audio_in_data_dir(&root))
+        .find(|audio| !audio.is_empty())
+        .unwrap_or_default()
+}
+
+/// Find the audio (music tracks, music index, sound effects) that belongs with the field archive
+/// [`resolve_flevel`] finds for `source`, read-only; an empty [`ResolvedAudio`] when there is none.
+///
+/// The client plays music and sound effects when it has them and is silent without, so no audio is
+/// not an error here. A library set is chosen by exactly the rules of [`resolve_library_flevel`]
+/// (call it with the same `source`, and both read the same set; a wrong or ambiguous set is the
+/// same error), and the files are the set's entries `data/music_ogg/<name>.ogg`,
+/// `data/music/<name>.wav`, `data/music/music.idx`, `data/sound/audio.dat` and
+/// `data/sound/audio.fmt` (the paths `fmv-import` stores them at); a set imported before audio was
+/// supported has none. A damaged blob (one that is missing, or of another size than its manifest
+/// says) is the library's error, not a silent gap. A direct `flevel.lgp` has audio when its install
+/// does, in the layout `field/flevel.lgp` + `music_ogg/`, `music/`, `sound/` as siblings (folder and
+/// file names in any letter case; for a `lang-xx/field/flevel.lgp` the language folder's own
+/// folders first, then the ones above it): only regular, non-empty files with plain names count
+/// (the importer's name rule; unlike an import this reads the folder in place, so a link is followed
+/// and there is no cap on the number of files). A `flevel.lgp` that does not sit in a folder named
+/// `field` says nothing about where an install is, so it has no audio. Presentation only: never
+/// sent over the network, part of no fingerprint.
+pub fn resolve_audio(source: &Ff7Source) -> Result<ResolvedAudio, Ff7ResolveError> {
+    match source {
+        Ff7Source::Library { state_dir, set } => {
+            let dir = resolve_state_dir(state_dir.as_deref())?;
+            let lib = Library::open_existing(&dir).map_err(|e| match e {
+                LibraryError::NoLibrary(_) => Ff7ResolveError::NoLibrary {
+                    dir: dir.display().to_string(),
+                },
+                other => Ff7ResolveError::Library(other),
+            })?;
+            let (set_id, manifest) = pick_set(&lib, set.as_deref())?;
+            let mut out = ResolvedAudio::default();
+            for entry in &manifest.entries {
+                let Some(slot) = audio_slot_of_logical(&entry.logical_path) else {
+                    continue;
+                };
+                if let Some(path) = lib.get(&set_id, &entry.logical_path)? {
+                    out.fill(slot, path);
+                }
+            }
+            Ok(out)
+        }
+        Ff7Source::Flevel { path, .. } => Ok(audio_beside_install(path)),
     }
 }
 
@@ -1053,5 +1290,392 @@ mod tests {
         assert_eq!(resolve_battle_lgp(&source(Path::new("/flevel.lgp"))).unwrap(), None);
         assert_eq!(resolve_battle_lgp(&source(Path::new("field/flevel.lgp"))).unwrap(), None);
         assert_eq!(resolve_battle_lgp(&source(Path::new("/definitely/not/here/field/flevel.lgp"))).unwrap(), None);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // audio
+    // -----------------------------------------------------------------------------------------
+
+    /// The five kinds of audio file as `fmv-import` stores them.
+    const AUDIO_FILES: [(&str, &[u8]); 7] = [
+        ("data/music_ogg/bat.ogg", b"ogg-bat"),
+        ("data/music_ogg/victory.ogg", b"ogg-victory"),
+        ("data/music/bat.wav", b"wav-bat"),
+        ("data/music/heart.wav", b"wav-heart"),
+        ("data/music/music.idx", b"idx"),
+        ("data/sound/audio.dat", b"sfx-dat"),
+        ("data/sound/audio.fmt", b"sfx-fmt"),
+    ];
+
+    fn read(p: &Path) -> Vec<u8> {
+        fs::read(p).unwrap()
+    }
+
+    fn read_opt(p: &Option<PathBuf>) -> Vec<u8> {
+        read(p.as_deref().expect("a file"))
+    }
+
+    #[test]
+    fn the_audio_of_a_library_set_is_found_by_the_importers_paths_and_nothing_else_counts() {
+        let state = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let lib = Library::open(state.path()).unwrap();
+        let mut files: Vec<(&str, &[u8])> = vec![("data/field/flevel.lgp", b"field")];
+        files.extend(AUDIO_FILES);
+        // look-alikes that are not audio of the set: another language folder, a deeper folder, a
+        // wrong extension in the right folder, an ogg in the wav folder, a file called like a folder
+        files.extend([
+            ("data/lang-en/music_ogg/lang.ogg", &b"lang"[..]),
+            ("data/music_ogg/sub/deep.ogg", b"deep"),
+            ("data/music_ogg/readme.txt", b"text"),
+            ("data/music_ogg/.ogg", b"no stem"),
+            ("data/music/clip.ogg", b"ogg in the wav folder"),
+            ("data/music_ogg/bat.wav", b"wav in the ogg folder"),
+            ("data/sound/other.dat", b"not audio.dat"),
+            ("data/music.idx", b"not in the folder"),
+        ]);
+        let id = make_set(&lib, provenance("Steam", "en"), &files, scratch.path());
+
+        let audio = resolve_audio(&lib_source(state.path(), None)).unwrap();
+        assert!(!audio.is_empty());
+        assert_eq!(
+            audio.music_ogg.keys().collect::<Vec<_>>(),
+            ["bat", "victory"]
+        );
+        assert_eq!(audio.music_wav.keys().collect::<Vec<_>>(), ["bat", "heart"]);
+        assert_eq!(read(&audio.music_ogg["bat"]), b"ogg-bat");
+        assert_eq!(read(&audio.music_ogg["victory"]), b"ogg-victory");
+        assert_eq!(read(&audio.music_wav["heart"]), b"wav-heart");
+        assert_eq!(read_opt(&audio.music_idx), b"idx");
+        assert_eq!(read_opt(&audio.sfx_dat), b"sfx-dat");
+        assert_eq!(read_opt(&audio.sfx_fmt), b"sfx-fmt");
+        // the paths are the library's blobs: the same ones `Library::get` gives
+        assert_eq!(
+            audio.music_ogg["bat"],
+            lib.get(&id, "data/music_ogg/bat.ogg").unwrap().unwrap()
+        );
+        // an explicit set id reads the same set
+        let named = resolve_audio(&lib_source(state.path(), Some(&id))).unwrap();
+        assert_eq!(named.music_ogg, audio.music_ogg);
+
+        // a track by name: the ogg first, else the wav; any letter case
+        assert_eq!(read(audio.music_file("bat").unwrap()), b"ogg-bat");
+        assert_eq!(read(audio.music_file("BAT").unwrap()), b"ogg-bat");
+        assert_eq!(read(audio.music_file("Victory").unwrap()), b"ogg-victory");
+        assert_eq!(read(audio.music_file("HEART").unwrap()), b"wav-heart");
+        assert_eq!(audio.music_file("clip"), None);
+        assert_eq!(audio.music_file(""), None);
+    }
+
+    #[test]
+    fn a_library_without_audio_resolves_to_nothing_and_the_set_errors_are_the_field_archives() {
+        let state = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let lib = Library::open(state.path()).unwrap();
+        // a library that holds no FF7 set at all
+        let err = resolve_audio(&lib_source(state.path(), None)).unwrap_err();
+        assert!(matches!(err, Ff7ResolveError::NoFf7Set), "{err}");
+
+        // a set from before audio was imported: no error, nothing found
+        let id = make_set(
+            &lib,
+            provenance("Steam", "en"),
+            &[("data/field/flevel.lgp", b"field")],
+            scratch.path(),
+        );
+        let none = resolve_audio(&lib_source(state.path(), None)).unwrap();
+        assert!(none.is_empty());
+        assert!(none.music_file("bat").is_none());
+        assert!(resolve_audio(&lib_source(state.path(), Some(&id)))
+            .unwrap()
+            .is_empty());
+
+        // a second real set: the choice is ambiguous exactly as for the field archive, and an
+        // explicit id picks that set's own audio
+        let mut with_audio: Vec<(&str, &[u8])> = vec![("data/field/flevel.lgp", b"f2")];
+        with_audio.extend(AUDIO_FILES);
+        let other = make_set(
+            &lib,
+            provenance("PC 1998", "en"),
+            &with_audio,
+            scratch.path(),
+        );
+        let err = resolve_audio(&lib_source(state.path(), None)).unwrap_err();
+        assert!(matches!(err, Ff7ResolveError::AmbiguousSet(_)), "{err}");
+        assert!(
+            err.to_string().contains(&id) && err.to_string().contains(&other),
+            "{err}"
+        );
+        assert!(err.to_string().contains("--ff7-set"), "{err}");
+        let found = resolve_audio(&lib_source(state.path(), Some(&other))).unwrap();
+        assert_eq!(read_opt(&found.sfx_dat), b"sfx-dat");
+        assert!(resolve_audio(&lib_source(state.path(), Some(&id)))
+            .unwrap()
+            .is_empty());
+
+        // PlayStation media and other games are refused when named, like the field archive
+        let ps1 = EditionProvenance {
+            platform: Platform::Ps1,
+            ..provenance("PS1 original", "en")
+        };
+        let ps1_id = make_set(&lib, ps1, &[("data/sound/audio.dat", b"x")], scratch.path());
+        let err = resolve_audio(&lib_source(state.path(), Some(&ps1_id))).unwrap_err();
+        assert!(matches!(err, Ff7ResolveError::UnusableSet { .. }), "{err}");
+
+        // a set that is not there, and one that is not a set id
+        assert!(matches!(
+            resolve_audio(&lib_source(state.path(), Some("ff7-pc-nope-00000000"))).unwrap_err(),
+            Ff7ResolveError::Library(LibraryError::SetNotFound(_))
+        ));
+        assert!(resolve_audio(&lib_source(state.path(), Some("../escape"))).is_err());
+    }
+
+    #[test]
+    fn no_library_points_at_fmv_import_and_resolving_audio_creates_nothing() {
+        let empty = tempfile::tempdir().unwrap();
+        let err = resolve_audio(&lib_source(empty.path(), None)).unwrap_err();
+        assert!(matches!(err, Ff7ResolveError::NoLibrary { .. }), "{err}");
+        assert!(err.to_string().contains("fmv-import"), "{err}");
+        assert!(
+            fs::read_dir(empty.path()).unwrap().next().is_none(),
+            "nothing is created"
+        );
+        // a directory that is not there at all
+        let missing = empty.path().join("not-yet");
+        assert!(matches!(
+            resolve_audio(&lib_source(&missing, None)).unwrap_err(),
+            Ff7ResolveError::NoLibrary { .. }
+        ));
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn a_damaged_audio_blob_is_the_librarys_error_and_not_a_silent_gap() {
+        let state = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let lib = Library::open(state.path()).unwrap();
+        let mut files: Vec<(&str, &[u8])> = vec![("data/field/flevel.lgp", b"field")];
+        files.extend(AUDIO_FILES);
+        let id = make_set(&lib, provenance("Steam", "en"), &files, scratch.path());
+        let blob = lib.get(&id, "data/sound/audio.dat").unwrap().unwrap();
+        fs::remove_file(blob).unwrap();
+        let err = resolve_audio(&lib_source(state.path(), None)).unwrap_err();
+        assert!(matches!(err, Ff7ResolveError::Library(_)), "{err}");
+    }
+
+    #[test]
+    fn music_by_name_prefers_the_ogg_and_ignores_letter_case() {
+        let mut audio = ResolvedAudio::default();
+        assert!(audio.is_empty());
+        audio
+            .music_wav
+            .insert("tune".into(), PathBuf::from("/x/tune.wav"));
+        assert!(!audio.is_empty());
+        assert_eq!(audio.music_file("TUNE"), Some(Path::new("/x/tune.wav")));
+        audio
+            .music_ogg
+            .insert("tune".into(), PathBuf::from("/x/tune.ogg"));
+        assert_eq!(audio.music_file("Tune"), Some(Path::new("/x/tune.ogg")));
+        assert_eq!(
+            audio.music_file("tune.ogg"),
+            None,
+            "a name, not a file name"
+        );
+        // each of the single files alone makes it non-empty
+        for fill in [
+            |a: &mut ResolvedAudio| a.music_idx = Some("/x".into()),
+            |a: &mut ResolvedAudio| a.sfx_dat = Some("/x".into()),
+            |a: &mut ResolvedAudio| a.sfx_fmt = Some("/x".into()),
+        ] {
+            let mut a = ResolvedAudio::default();
+            fill(&mut a);
+            assert!(!a.is_empty());
+        }
+    }
+
+    /// An install in the layout of the real game, with every name in odd letter cases.
+    fn odd_case_install(root: &Path) -> PathBuf {
+        let data = root.join("Data");
+        for (rel, body) in [
+            ("Field/FLEVEL.LGP", &b"field"[..]),
+            ("MUSIC_OGG/BAT.OGG", b"ogg-bat"),
+            ("MUSIC_OGG/Victory.Ogg", b"ogg-victory"),
+            ("Music/Heart.WAV", b"wav-heart"),
+            ("Music/MUSIC.IDX", b"idx"),
+            ("SOUND/Audio.Dat", b"sfx-dat"),
+            ("SOUND/AUDIO.fmt", b"sfx-fmt"),
+        ] {
+            let p = data.join(rel);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, body).unwrap();
+        }
+        data.join("Field").join("FLEVEL.LGP")
+    }
+
+    fn direct(path: &Path) -> Ff7Source {
+        Ff7Source::Flevel {
+            path: path.to_path_buf(),
+            labels: Ff7Labels::default(),
+        }
+    }
+
+    #[test]
+    fn a_direct_flevel_finds_the_audio_in_its_installs_folders_in_any_letter_case() {
+        let install = tempfile::tempdir().unwrap();
+        let flevel = odd_case_install(install.path());
+        let audio = resolve_audio(&direct(&flevel)).unwrap();
+        assert_eq!(
+            audio.music_ogg.keys().collect::<Vec<_>>(),
+            ["bat", "victory"]
+        );
+        assert_eq!(audio.music_wav.keys().collect::<Vec<_>>(), ["heart"]);
+        assert_eq!(read(&audio.music_ogg["bat"]), b"ogg-bat");
+        assert_eq!(read(&audio.music_ogg["victory"]), b"ogg-victory");
+        assert_eq!(read(&audio.music_wav["heart"]), b"wav-heart");
+        assert_eq!(read_opt(&audio.music_idx), b"idx");
+        assert_eq!(read_opt(&audio.sfx_dat), b"sfx-dat");
+        assert_eq!(read_opt(&audio.sfx_fmt), b"sfx-fmt");
+        // the files are the install's own (read-only: nothing is copied or created)
+        assert!(audio.music_ogg["bat"].starts_with(install.path()));
+        assert_eq!(read(audio.music_file("VICTORY").unwrap()), b"ogg-victory");
+        // the field folder may be spelled any way too
+        let other = tempfile::tempdir().unwrap();
+        let moved = other.path().join("data").join("FIELD");
+        fs::create_dir_all(&moved).unwrap();
+        fs::create_dir_all(other.path().join("data").join("sound")).unwrap();
+        fs::write(
+            other.path().join("data").join("sound").join("audio.dat"),
+            b"d",
+        )
+        .unwrap();
+        assert!(resolve_audio(&direct(&moved.join("flevel.lgp")))
+            .unwrap()
+            .sfx_dat
+            .is_some());
+    }
+
+    #[test]
+    fn a_direct_folder_is_read_by_the_importers_rules() {
+        let install = tempfile::tempdir().unwrap();
+        let flevel = odd_case_install(install.path());
+        let data = install.path().join("Data");
+        // what an import would not take is not found either: empty files, folders that carry a
+        // file's name, names that are not plain, other extensions, files in the wrong folder
+        fs::write(data.join("MUSIC_OGG").join("empty.ogg"), b"").unwrap();
+        fs::create_dir(data.join("MUSIC_OGG").join("folder.ogg")).unwrap();
+        fs::write(data.join("MUSIC_OGG").join("odd name.ogg"), b"x").unwrap();
+        fs::write(data.join("MUSIC_OGG").join(".hidden.ogg"), b"x").unwrap();
+        fs::write(data.join("MUSIC_OGG").join("note.txt"), b"x").unwrap();
+        fs::write(data.join("MUSIC_OGG").join("wrong.wav"), b"x").unwrap();
+        fs::write(data.join("Music").join("wrong.ogg"), b"x").unwrap();
+        fs::write(data.join("SOUND").join("other.dat"), b"x").unwrap();
+        let audio = resolve_audio(&direct(&flevel)).unwrap();
+        assert_eq!(
+            audio.music_ogg.keys().collect::<Vec<_>>(),
+            ["bat", "victory"]
+        );
+        assert_eq!(audio.music_wav.keys().collect::<Vec<_>>(), ["heart"]);
+        // an empty index file is not an index
+        fs::write(data.join("Music").join("MUSIC.IDX"), b"").unwrap();
+        assert!(resolve_audio(&direct(&flevel)).unwrap().music_idx.is_none());
+        // two spellings of one name: always the same one
+        fs::write(
+            data.join("MUSIC_OGG").join("bat.ogg"),
+            b"lower-case spelling",
+        )
+        .unwrap();
+        if fs::read_dir(data.join("MUSIC_OGG"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case("bat.ogg")
+            })
+            .count()
+            == 2
+        {
+            let first = resolve_audio(&direct(&flevel)).unwrap();
+            let second = resolve_audio(&direct(&flevel)).unwrap();
+            assert_eq!(first.music_ogg["bat"], second.music_ogg["bat"]);
+            assert!(
+                first.music_ogg["bat"].ends_with("BAT.OGG"),
+                "upper case sorts first: {:?}",
+                first.music_ogg["bat"]
+            );
+        }
+    }
+
+    #[test]
+    fn a_direct_flevel_in_a_language_folder_looks_there_first_and_then_above() {
+        let steam = tempfile::tempdir().unwrap();
+        let data = steam.path().join("data");
+        let lang_field = data.join("lang-en").join("field");
+        fs::create_dir_all(&lang_field).unwrap();
+        let flevel = lang_field.join("flevel.lgp");
+        fs::write(&flevel, b"field").unwrap();
+        assert!(
+            resolve_audio(&direct(&flevel)).unwrap().is_empty(),
+            "no audio anywhere"
+        );
+
+        // the audio of the data folder, above the language folder
+        fs::create_dir_all(data.join("music_ogg")).unwrap();
+        fs::write(data.join("music_ogg").join("bat.ogg"), b"above").unwrap();
+        fs::create_dir_all(data.join("sound")).unwrap();
+        fs::write(data.join("sound").join("audio.dat"), b"above-dat").unwrap();
+        let audio = resolve_audio(&direct(&flevel)).unwrap();
+        assert_eq!(read(&audio.music_ogg["bat"]), b"above");
+        assert_eq!(read_opt(&audio.sfx_dat), b"above-dat");
+
+        // the language folder's own audio wins, whole: nothing is mixed in from above
+        fs::create_dir_all(data.join("lang-en").join("music_ogg")).unwrap();
+        fs::write(
+            data.join("lang-en").join("music_ogg").join("bat.ogg"),
+            b"own",
+        )
+        .unwrap();
+        let audio = resolve_audio(&direct(&flevel)).unwrap();
+        assert_eq!(read(&audio.music_ogg["bat"]), b"own");
+        assert!(audio.sfx_dat.is_none(), "the folder above is not mixed in");
+    }
+
+    #[test]
+    fn a_direct_flevel_that_is_not_in_a_field_folder_says_nothing_about_audio() {
+        // a field archive somebody put into a download folder, with a music folder next to it
+        let home = tempfile::tempdir().unwrap();
+        let downloads = home.path().join("Downloads");
+        fs::create_dir_all(&downloads).unwrap();
+        fs::write(downloads.join("flevel.lgp"), b"field").unwrap();
+        fs::create_dir_all(home.path().join("Music")).unwrap();
+        fs::write(
+            home.path().join("Music").join("song.wav"),
+            b"a song of the user's",
+        )
+        .unwrap();
+        assert!(resolve_audio(&direct(&downloads.join("flevel.lgp")))
+            .unwrap()
+            .is_empty());
+
+        // a field folder without audio around it, and a data folder without those folders
+        let install = tempfile::tempdir().unwrap();
+        fs::create_dir_all(install.path().join("data").join("field")).unwrap();
+        fs::create_dir_all(install.path().join("data").join("battle")).unwrap();
+        let flevel = install.path().join("data").join("field").join("flevel.lgp");
+        fs::write(&flevel, b"field").unwrap();
+        assert!(resolve_audio(&direct(&flevel)).unwrap().is_empty());
+
+        // a path without a directory, one without an install above it, one that is not there
+        for p in [
+            "flevel.lgp",
+            "/flevel.lgp",
+            "field/flevel.lgp",
+            "/definitely/not/here/field/flevel.lgp",
+        ] {
+            assert!(
+                resolve_audio(&direct(Path::new(p))).unwrap().is_empty(),
+                "{p}"
+            );
+        }
     }
 }

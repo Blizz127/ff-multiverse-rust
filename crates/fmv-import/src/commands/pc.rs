@@ -18,6 +18,16 @@
 //! resolved one, so a link inside the tree changes nothing about what the set holds. Labels not given on the command line come from the scan:
 //! the Steam Edition is `Steam Edition (appid 3837340)` / region `unknown` / revision
 //! `build <id>`, the exact strings `--edition` and `--revision` took for the sets that exist.
+//!
+//! Audio: the install's music and sound files (`data/music_ogg/*.ogg`, `data/music/*.wav` and
+//! `music.idx`, `data/sound/audio.dat` and `audio.fmt`, see [`crate::scan`]) are language-neutral
+//! files of role `audio` and are imported with the rest, by the same machinery and the same checks
+//! (hash, stamps before and after, a second read hashed again, a state directory that may not be
+//! inside the install). Audio alone is not an import: without a `flevel.lgp` the import is
+//! refused as ever. Importing an install again with the same labels (the same set id) ADDS what
+//! it has now to the set that is there and leaves every entry that exists as it is; audio never
+//! counts for what the manifest records about its own identification (`identification_for`), so
+//! the set says the same about itself with or without it. Other labels make another set.
 
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -32,7 +42,8 @@ use super::{
     imported, importer_version, CommandError, ImportedFile, SourceEvidence, SourceSummary, Totals,
 };
 use crate::scan::{
-    scan_pc, EditionGuess, ScanError, ScanReport, WouldImport, LANGUAGE_DEFAULT_PREFIX,
+    scan_pc, EditionGuess, ScanError, ScanReport, WouldImport, AUDIO_WARNING_PREFIX,
+    LANGUAGE_DEFAULT_PREFIX,
 };
 
 /// Absolute, symlink-resolved form of `p` even when `p` (or its tail) does not exist yet.
@@ -166,16 +177,19 @@ pub fn import_pc(args: &ImportPcArgs, now: u64) -> Result<ImportPcResult, Comman
 
     // Every refusal up to the library being opened happens before anything is written.
     if !report.would_import.iter().any(|w| is_flevel(&w.logical_path)) {
-        if !report.refused_links.is_empty() {
+        // Only links that took a game file with them: a refused link to a piece of audio is no
+        // reason a flevel.lgp is missing (audio alone is not an import either way).
+        let links: Vec<&str> = report
+            .refused_links
+            .iter()
+            .filter(|l| !l.audio)
+            .take(4)
+            .map(|l| l.relative_path.as_str())
+            .collect();
+        if !links.is_empty() {
             return Err(CommandError::NoFlevelOnlyLinks {
                 dir: args.dir.display().to_string(),
-                links: report
-                    .refused_links
-                    .iter()
-                    .take(4)
-                    .map(|l| l.relative_path.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", "),
+                links: links.join(", "),
             });
         }
         return Err(CommandError::NoFlevel(args.dir.display().to_string()));
@@ -256,11 +270,13 @@ pub fn import_pc(args: &ImportPcArgs, now: u64) -> Result<ImportPcResult, Comman
     };
     // The classic `data/...` layout is taken as language-neutral and kept next to the chosen
     // language's own files. On an install that also has language directories that is an
-    // assumption (the Steam layout is uncertain [verify]); the manifest says so.
+    // assumption (the Steam layout is uncertain [verify]); the manifest says so. Audio does not
+    // count (like the executables): it has no language variants to be mistaken for, and adding it
+    // to a set later must not change what the set says about itself.
     let neutral_data_beside_languages = !report.languages.is_empty()
         && chosen
             .iter()
-            .any(|w| w.language.is_none() && w.role != "identify");
+            .any(|w| w.language.is_none() && w.role != "identify" && w.role != "audio");
     let identification = identification_for(
         args,
         &report,
@@ -417,11 +433,12 @@ fn identification_for(
             f.language.as_deref().unwrap_or("unknown")
         ));
     }
-    // the first warning about the files themselves (the language default has its own caveat)
+    // the first warning about the files themselves (the language default has its own caveat, and
+    // a warning about audio says nothing about how far the labels can be trusted)
     if let Some(first) = report
         .warnings
         .iter()
-        .find(|w| !w.starts_with(LANGUAGE_DEFAULT_PREFIX))
+        .find(|w| !w.starts_with(LANGUAGE_DEFAULT_PREFIX) && !w.starts_with(AUDIO_WARNING_PREFIX))
     {
         caveats.push(first.clone());
     }
