@@ -43,9 +43,10 @@
 //! option voice, played as the cursor of an ASK reaches a line: <field>/<dialog>_<line>   (the line is absolute)
 //! ```
 //!
-//! In the archive 8 827 voice files are `<dialog>.ogg`, 1 425 are `<dialog>_<line>.ogg` (option voices) and about 5 000
-//! carry a page letter (2 102 messages exist *only* as `<dialog>a.ogg`, `<dialog>b.ogg`, ...: a lookup of
-//! `<dialog>.ogg` alone would silently lose them).
+//! In the archive 8 827 voice files are `<dialog>.ogg`, 1 425 are `<dialog>_<line>.ogg` (option voices), 21 are window-specific
+//! and 5 061 carry a page letter. Of the 10 909 dialog numbers (over 547 fields) that have a clip, 8 799 have a plain one
+//! only, **2 077 have lettered clips only** (`<dialog>a.ogg`, `<dialog>b.ogg`, ...: a lookup of `<dialog>.ogg` alone would
+//! silently lose them) and 33 have both.
 
 /// The folder of the replacement field entries.
 pub const FLEVEL_DIR: &str = "Echo-S\\flevel.lgp\\";

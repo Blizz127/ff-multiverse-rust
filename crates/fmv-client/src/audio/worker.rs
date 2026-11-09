@@ -16,6 +16,7 @@
 use super::cues::Cue;
 use super::director::AreaMusic;
 use super::field::FieldRead;
+use crate::mods::VoiceCue;
 use fmv_audio::{DecodedMusic, SfxClip};
 use std::collections::{HashSet, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -40,6 +41,26 @@ pub enum Done {
     /// What a field's scripts play for a story (the plan and the clips it names), or why that could not be read, and how
     /// long it took. `story` is the progression blob it was made for.
     Field { key: String, story: Vec<u8>, read: Result<FieldRead, String>, took: Duration },
+    /// The voice clip an ask wanted (`Ok(None)`: it has none, which is most windows), or why it could not be read; `seq` is
+    /// the ask, so that an answer to an ask that has been replaced is thrown away.
+    Voice { seq: u64, result: Result<Option<VoiceClip>, String> },
+}
+
+/// What the voice layer is asked for: the clip of one window (or of one choice of a question), and which ask it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoiceRequest {
+    pub seq: u64,
+    pub cue: VoiceCue,
+}
+
+/// A voice clip ready to play: its path in the mod archive (for the log) and the mixer clip, which ends in a silent loop region so
+/// that the engine's loop handle can stop it (see [`super::Live`]'s voice).
+#[derive(Debug)]
+pub struct VoiceClip {
+    pub name: String,
+    pub clip: SfxClip,
+    /// How long the voice itself is (the clip also holds the silent tail).
+    pub length: Duration,
 }
 
 /// What reading a list of sound ids gave: the clips that exist and, for each id that has none, why not (an empty slot, a
@@ -63,6 +84,9 @@ pub trait Worker {
     /// Read what the scripts of the field `key` play for the progression `story`, and the clips that plan names which are not
     /// in `have` (the ids the caller holds already), before anything in advance.
     fn scan_field(&mut self, key: &str, story: Vec<u8>, have: Vec<u16>);
+    /// Read the voice clip a window asks for, before anything in advance (a voice is wanted the moment its window opens). A worker
+    /// without a voice layer does nothing.
+    fn load_voice(&mut self, _request: VoiceRequest) {}
     /// What finished since the last call.
     fn poll(&mut self) -> Vec<Done>;
 }
@@ -78,6 +102,14 @@ pub type CuesTask = Arc<dyn Fn() -> Result<Vec<(Cue, SfxClip)>, String> + Send +
 pub type SoundsTask = Arc<dyn Fn(&[u16]) -> SoundsRead + Send + Sync>;
 /// Reads what the scripts of a field play for a story (the progression blob), with the clips of the ids not in the list.
 pub type FieldTask = Arc<dyn Fn(&str, &[u8], &[u16]) -> Result<FieldRead, String> + Send + Sync>;
+/// Reads the clip a voice cue asks for: `Ok(None)` when there is none (most windows have no voice), why not when it cannot.
+pub type VoiceTask = Arc<dyn Fn(&VoiceCue) -> Result<Option<VoiceClip>, String> + Send + Sync>;
+
+/// The voice task of a soundtrack without a voice layer: there is never a clip.
+#[cfg(test)]
+pub fn no_voice() -> VoiceTask {
+    Arc::new(|_| Ok(None))
+}
 
 /// The work, as closures that run on the worker threads.
 #[derive(Clone)]
@@ -87,6 +119,7 @@ pub struct Tasks {
     pub cues: CuesTask,
     pub sounds: SoundsTask,
     pub field: FieldTask,
+    pub voice: VoiceTask,
 }
 
 enum Job {
@@ -95,6 +128,7 @@ enum Job {
     Cues,
     Sounds(Vec<u16>),
     Field { key: String, story: Vec<u8>, have: Vec<u16> },
+    Voice(VoiceRequest),
 }
 
 #[derive(Default)]
@@ -199,6 +233,10 @@ impl Worker for ThreadWorker {
         self.push(Job::Field { key: key.to_string(), story, have }, true);
     }
 
+    fn load_voice(&mut self, request: VoiceRequest) {
+        self.push(Job::Voice(request), true);
+    }
+
     fn poll(&mut self) -> Vec<Done> {
         self.results.try_iter().collect()
     }
@@ -251,6 +289,10 @@ fn run(shared: &Shared, tasks: &Tasks, send: &Sender<Done>) {
                 let read = catch_unwind(AssertUnwindSafe(|| (tasks.field)(&key, &story, &have))).unwrap_or_else(|_| Err("the field reader panicked".to_string()));
                 Done::Field { key, story, read, took: started.elapsed() }
             }
+            Job::Voice(request) => {
+                let result = catch_unwind(AssertUnwindSafe(|| (tasks.voice)(&request.cue))).unwrap_or_else(|_| Err("the voice reader panicked".to_string()));
+                Done::Voice { seq: request.seq, result }
+            }
         };
         if send.send(done).is_err() {
             return;
@@ -286,6 +328,7 @@ mod tests {
     fn jobs_run_off_the_callers_thread_and_come_back_as_messages() {
         let caller = std::thread::current().id();
         let tasks = Tasks {
+            voice: no_voice(),
             analyze: Arc::new(move |key| {
                 assert_ne!(std::thread::current().id(), caller);
                 AreaMusic { arrival: Some(format!("music-of-{key}")), ..AreaMusic::default() }
@@ -349,6 +392,7 @@ mod tests {
         let gates = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
         let (log, gate) = (Arc::clone(&started), Arc::clone(&gates));
         let tasks = Tasks {
+            voice: no_voice(),
             analyze: Arc::new(|_| AreaMusic::default()),
             decode: Arc::new(move |name| {
                 log.lock().expect("log").push(name.to_string());
@@ -391,6 +435,7 @@ mod tests {
         let gates = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
         let (log, gate) = (Arc::clone(&started), Arc::clone(&gates));
         let tasks = Tasks {
+            voice: no_voice(),
             analyze: Arc::new(|_| AreaMusic::default()),
             decode: Arc::new(move |name| {
                 log.lock().expect("log").push(name.to_string());
@@ -441,6 +486,7 @@ mod tests {
         let (log, hold) = (Arc::clone(&started), Arc::clone(&gate));
         let sounds_log = Arc::clone(&started);
         let tasks = Tasks {
+            voice: no_voice(),
             analyze: Arc::new(|_| AreaMusic::default()),
             decode: Arc::new(move |name| {
                 log.lock().expect("log").push(name.to_string());
@@ -481,6 +527,7 @@ mod tests {
     #[test]
     fn a_panicking_task_is_an_error_for_that_job_and_the_threads_carry_on() {
         let tasks = Tasks {
+            voice: no_voice(),
             analyze: Arc::new(|_| panic!("a broken script")),
             decode: Arc::new(|name| if name == "boom" { panic!("a broken decoder") } else { Ok(tracks(5)) }),
             cues: Arc::new(|| panic!("a broken sound file")),
@@ -514,6 +561,7 @@ mod tests {
         let ran = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&ran);
         let tasks = Tasks {
+            voice: no_voice(),
             analyze: Arc::new(move |_| {
                 counter.fetch_add(1, SeqCst);
                 AreaMusic::default()

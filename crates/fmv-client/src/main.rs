@@ -32,6 +32,7 @@ mod gamepad;
 mod headless;
 mod interp;
 mod login;
+mod mods;
 mod nav;
 mod net;
 mod npc;
@@ -144,6 +145,9 @@ fn open_game(args: &Args) -> Result<LocalGame, String> {
                 }
                 Err(e) => eprintln!("note: no battle data on this machine ({e}); shared battles cannot be replayed or fought here"),
             }
+            // The optional mod layers over this copy (Echo-S, Cosmo Memory): one line says what each plays. Opened once for the
+            // whole process (the conversations and the soundtrack ask `mods::active`).
+            mods::setup(&args.mods, fmv_library::resolve_state_dir(args.ff7_library.as_deref()).ok().as_deref());
             Ok(LocalGame {
                 adapter: Box::new(ff7::SharedFf7(Arc::clone(&opened.adapter))),
                 client_build: format!("fmv-client/{version}+{}", ff7::build_tag()),
@@ -169,7 +173,7 @@ fn start_audio(args: &Args, ff7: Option<&Arc<Ff7Adapter>>) -> GameAudio {
     if mode == fmv_audio::Mode::Off {
         return GameAudio::off();
     }
-    let Some(tasks) = audio::ff7::tasks(&args.ff7_source(), Arc::clone(adapter), &config.logger) else { return GameAudio::off() };
+    let Some(tasks) = audio::ff7::tasks(&args.ff7_source(), Arc::clone(adapter), &config.logger, mods::active()) else { return GameAudio::off() };
     let sound = GameAudio::start(config, tasks);
     // The fanfare after a fight is chosen from the shape of the files (a one-shot of five seconds, not a
     // looping one), not from anything the game's data says; this is the way to another track if the

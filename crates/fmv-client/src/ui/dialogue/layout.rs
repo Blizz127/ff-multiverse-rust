@@ -144,6 +144,9 @@ pub struct Page {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Laid {
     pub pages: Vec<Page>,
+    /// For each of `pages`, the game's own page of the message it belongs to (0 for the first): the window may cut one of the game's
+    /// pages (a `NEWPAGE` is the break) into several that fit it, and the voice of a message follows the game's pages, not these.
+    pub game_pages: Vec<usize>,
     /// Width of the widest row, in cells (a choice row counts its pointer column).
     pub cells: usize,
     /// Rows the window shows at a time: the tallest page, at most the limit asked for.
@@ -278,7 +281,9 @@ pub fn lay_out(message: &Message, max_cells: usize, max_rows: usize) -> Laid {
     let pages_in = hard_pages(&message.pieces);
     let last = pages_in.len().saturating_sub(1);
     let mut pages: Vec<Page> = Vec::new();
+    let mut game_pages: Vec<usize> = Vec::new();
     for (index, lines) in pages_in.iter().enumerate() {
+        let made_before = pages.len();
         let choices = (index == last).then_some(message.choice).flatten().and_then(|c| choice_range(c, lines.len()));
         let (before, mine, after): (&[HardLine], &[HardLine], &[HardLine]) = match &choices {
             Some(r) => (lines.get(..r.start).unwrap_or(&[]), lines.get(r.clone()).unwrap_or(&[]), lines.get(r.end..).unwrap_or(&[])),
@@ -307,10 +312,12 @@ pub fn lay_out(message: &Message, max_cells: usize, max_rows: usize) -> Laid {
             pages.extend(chunks.drain(..).map(|rows| Page { rows, choices: None }));
         }
         pages.extend(after.chunks(max_rows).map(|rows| Page { rows: rows.to_vec(), choices: None }));
+        game_pages.extend(std::iter::repeat_n(index, pages.len() - made_before));
     }
     // An empty message is one empty page: the window still shows.
     if pages.is_empty() {
         pages.push(Page::default());
+        game_pages.push(0);
     }
     let cells = pages
         .iter()
@@ -318,7 +325,7 @@ pub fn lay_out(message: &Message, max_cells: usize, max_rows: usize) -> Laid {
         .max()
         .unwrap_or(0);
     let rows = pages.iter().map(|p| p.rows.len()).max().unwrap_or(1).clamp(1, max_rows);
-    Laid { pages, cells, rows }
+    Laid { pages, game_pages, cells, rows }
 }
 
 /// The lines of the last page that are choices: `first..=last` clamped to what exists (`None` when
@@ -367,6 +374,18 @@ mod tests {
         assert_eq!(rows_of(&laid.pages[1]), ["Bye"]);
         assert_eq!((laid.cells, laid.rows), (11, 2));
         assert!(laid.pages.iter().all(|p| p.choices.is_none()));
+    }
+
+    #[test]
+    fn every_laid_page_knows_the_games_page_it_belongs_to() {
+        // Two game pages; the first is longer than the window, so the window cuts it in two.
+        let m = msg(vec![text("a"), Piece::NewLine, text("b"), Piece::NewLine, text("c"), Piece::NewPage, text("d")]);
+        let laid = lay_out(&m, 40, 2);
+        assert_eq!(laid.pages.len(), 3);
+        assert_eq!(laid.game_pages, [0, 0, 1]);
+        assert_eq!(laid.game_pages.len(), laid.pages.len());
+        // An empty message is one page, the first.
+        assert_eq!(lay_out(&msg(vec![]), 40, 2).game_pages, [0]);
     }
 
     #[test]

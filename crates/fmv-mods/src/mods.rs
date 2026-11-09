@@ -114,6 +114,15 @@ impl Opened {
         let entry = self.archive.find(path)?;
         self.archive.read_limited(entry, limit).ok()
     }
+
+    /// The short name of the mod this archive is (`echo-s` or `cosmo`), for logs.
+    fn label(&self) -> &'static str {
+        if self.info.id == ECHO_S_ID {
+            "echo-s"
+        } else {
+            "cosmo"
+        }
+    }
 }
 
 /// The two layers' archives as discovery finds them.
@@ -152,6 +161,8 @@ pub struct Clip {
     /// The path inside the archive (a name for logs; never a local path).
     pub name: String,
     pub bytes: Vec<u8>,
+    /// Which mod's archive it came from: `echo-s` or `cosmo`.
+    pub source: &'static str,
 }
 
 /// The clips a sound id plays instead of the original, from the layer's `config.toml`.
@@ -410,7 +421,7 @@ impl Mods {
     pub fn voice(&self, field: &str, window: u8, dialog: usize, page: usize) -> Option<Clip> {
         let (echo, entry) = self.voice_entry(field, &echo::voice_names(window, dialog, page))?;
         let bytes = echo.archive.read_limited(entry, MAX_CLIP_BYTES).ok()?;
-        Some(Clip { name: entry.name.clone(), bytes })
+        Some(Clip { name: entry.name.clone(), bytes, source: echo.label() })
     }
 
     /// The voice played when the cursor of the `ASK` of `dialog` reaches the absolute `line`.
@@ -418,7 +429,7 @@ impl Mods {
         let names = [echo::option_voice_name(dialog, line)];
         let (echo, entry) = self.voice_entry(field, &names)?;
         let bytes = echo.archive.read_limited(entry, MAX_CLIP_BYTES).ok()?;
-        Some(Clip { name: entry.name.clone(), bytes })
+        Some(Clip { name: entry.name.clone(), bytes, source: echo.label() })
     }
 
     // ---- music ----------------------------------------------------------------------------------
@@ -447,7 +458,7 @@ impl Mods {
                     let path = format!("{dir}{stem}.{ext}");
                     if let Some(entry) = echo.archive.find(&path) {
                         let bytes = echo.archive.read_limited(entry, MAX_TRACK_BYTES).ok()?;
-                        return Some(Clip { name: entry.name.clone(), bytes });
+                        return Some(Clip { name: entry.name.clone(), bytes, source: echo.label() });
                     }
                 }
             }
@@ -480,7 +491,7 @@ impl Mods {
             for ext in echo::CLIP_EXTENSIONS {
                 if let Some(entry) = opened.archive.find(&format!("{dir}{stem}.{ext}")) {
                     let bytes = opened.archive.read_limited(entry, MAX_CLIP_BYTES).ok()?;
-                    return Some(Clip { name: entry.name.clone(), bytes });
+                    return Some(Clip { name: entry.name.clone(), bytes, source: opened.label() });
                 }
             }
         }

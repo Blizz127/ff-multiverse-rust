@@ -50,14 +50,16 @@ mod tests;
 
 pub use layout::{lay_out, Laid, Page, POINTER_CELLS};
 
+use crate::mods::{ModSink, VoiceCue};
 use crate::state::{ClientState, NpcView};
 use crate::ui::draw::{DrawList, Rgba};
 use crate::ui::font::Special;
 use crate::ui::hud::hud_scale;
 use crate::ui::widgets::{Canvas, ACCENT, BORDER, DIM, PANEL_BOTTOM, PANEL_TOP, TEXT};
 use fmv_core::Pos;
-use fmv_ff7::script::dialogue::{Beat, Message, MessageSource, TextColour};
+use fmv_ff7::script::dialogue::{Beat, Message, MessageOrigin, MessageSource, TextColour};
 use std::cell::Cell;
+use std::sync::Arc;
 use winit::keyboard::KeyCode;
 
 // ---- geometry ----------------------------------------------------------------------------------
@@ -158,10 +160,36 @@ impl Shown {
 /// codes, or a damaged one, must not make it spin).
 const MAX_BLANKS: usize = 8;
 
+/// What a window tells the voice layer as the player moves through a message (a conversation that is voiced gives its windows one):
+/// the voice of the game's next page when the player reaches it, and of a question's line when the pointer reaches it. The voice of the
+/// first page is the source's, when the window opens.
+struct WindowVoice {
+    field: String,
+    sink: Arc<dyn ModSink>,
+}
+
+impl WindowVoice {
+    /// The player reached the game's page `page` of `message`.
+    fn page(&self, message: &Message, page: usize) {
+        if let MessageOrigin::Canon { dialog, .. } = &message.origin {
+            self.sink.cue(VoiceCue::Say { field: self.field.clone(), window: message.window, dialog: *dialog, page });
+        }
+    }
+
+    /// The pointer of the question `message` reached its absolute line `line`.
+    fn choice(&self, message: &Message, line: usize) {
+        if let MessageOrigin::Canon { dialog, .. } = &message.origin {
+            self.sink.cue(VoiceCue::Choice { field: self.field.clone(), dialog: *dialog, line });
+        }
+    }
+}
+
 /// A dialogue window: a source of messages and the one on show.
 pub struct DialogueWindow {
     source: Box<dyn MessageSource>,
     shown: Shown,
+    /// Where the window says what a voice follows (none: no voices).
+    voice: Option<WindowVoice>,
 }
 
 impl std::fmt::Debug for DialogueWindow {
@@ -175,7 +203,14 @@ impl DialogueWindow {
     pub fn open(source: Box<dyn MessageSource>) -> Option<Self> {
         let mut source = source;
         let message = pull(&mut *source, None)?;
-        Some(Self { source, shown: Shown::new(message) })
+        Some(Self { source, shown: Shown::new(message), voice: None })
+    }
+
+    /// The same window, telling `sink` which voice follows as the player pages and moves the pointer (`field` is the area the
+    /// conversation is in, which names the voices).
+    pub fn with_voice(mut self, field: &str, sink: Arc<dyn ModSink>) -> Self {
+        self.voice = Some(WindowVoice { field: field.to_string(), sink });
+        self
     }
 
     /// The message on show.
@@ -233,6 +268,10 @@ impl DialogueWindow {
                     let cursor = self.shown.cursor.min(n - 1);
                     self.shown.cursor = if key == DialogueKey::Up { (cursor + n - 1) % n } else { (cursor + 1) % n };
                     self.shown.scroll = self.scroll_of(&laid, page);
+                    // The pointer is on another line: the voice of the line it reached (an absolute line number, as a script counts).
+                    if let (Some(voice), true) = (&self.voice, self.shown.cursor != cursor) {
+                        voice.choice(&self.shown.message, self.shown.message.choice.map_or(0, |c| c.first) + self.shown.cursor);
+                    }
                 }
             }
             DialogueKey::Confirm => {
@@ -243,6 +282,13 @@ impl DialogueWindow {
                 }
                 if self.shown.page < last_page {
                     self.shown.page += 1;
+                    // The player reached the next page of the game's message (not just the next of the window's cuts of one): its voice.
+                    if let Some(voice) = &self.voice {
+                        let at = |page: usize| laid.game_pages.get(page).copied().unwrap_or(0);
+                        if at(self.shown.page) != at(self.shown.page - 1) {
+                            voice.page(&self.shown.message, at(self.shown.page));
+                        }
+                    }
                     self.shown.scroll = 0;
                     if let Some(next) = laid.pages.get(self.shown.page) {
                         self.shown.scroll = self.scroll_of(&laid, next);
@@ -408,6 +454,12 @@ pub trait Conversations {
     /// Where the story comes from (the hook for story progress), for sources whose branches depend
     /// on it; the others ignore it.
     fn set_story(&mut self, _story: ff7::StoryFactory) {}
+
+    /// Where the windows of the conversation that [`Conversations::start`] just returned send the voices of its later pages and of a
+    /// question's lines, when it is a voiced one (the voice of each message's first page is the source's own, as the window opens).
+    fn voice(&mut self) -> Option<Arc<dyn ModSink>> {
+        None
+    }
 }
 
 /// What the player's surroundings are, for a key press.
@@ -531,7 +583,13 @@ impl Talk {
         // this press does to the story is the server's, comes back later, and never reaches a window that is open.
         let opened = target.and_then(|npc| {
             let source = self.conversations.start(around.area, npc)?;
-            DialogueWindow::open(source).map(|window| (npc.id, window))
+            let window = DialogueWindow::open(source)?;
+            // A voiced conversation's window says when its player reaches a later page or moves the pointer.
+            let window = match self.conversations.voice() {
+                Some(sink) => window.with_voice(around.area, sink),
+                None => window,
+            };
+            Some((npc.id, window))
         });
         // A fresh OK in the field is a press, and the server decides what it does (a character's talk can move the
         // story, a ladder or a lift panel under the player's feet is used). It names the character only when the

@@ -241,6 +241,37 @@ SOUND:
   loops come back after it. FMV_FIELD_SOUNDS=off plays none, `data` (the default) what the scripts
   name. The log says `audio: field loop start ch1 42` and `audio: field sound ch1 62 (link)`.
 
+MODS:
+  Optional community mods are LAYERS over the accurate base game, each switched off on its own, and
+  all ON by default when their archives are found. They are YOUR OWN files, fetched onto this
+  machine (the tsunamods.com downloads), only ever read: nothing is extracted, copied or sent.
+    text   Echo-S 7's retranslated script as the dialog text (its own script section for the field,
+           per character; the original 1997 text is the switch back, and what plays where Echo-S has
+           nothing, for example a character it does not have)
+    voice  Echo-S's voice acting, played when a dialog window opens (it goes with Echo-S's text,
+           which its files are named for) and stopped when the window moves on or closes
+    music  Echo-S's \"Echoes of the Planet\" in place of the original track of the same name
+    sound  Cosmo Memory's sound effects in place of the original clip of the same sound id
+  Where the archives are: --echo-s FILE ($FMV_ECHO_S_IRO) and --cosmo-memory FILE ($FMV_COSMO_IRO),
+  or --mods-dir DIR ($FMV_MODS_DIR) for a folder that holds them (files, or folders that do); the
+  default folder is `mods` in the library's state directory (--ff7-library, else $FMV_STATE_DIR, else
+  ~/.local/share/ff-multiverse), looked in and never created. An archive is told by the ID in its own
+  mod.xml, not by its name. The same files are fetched separately onto each machine.
+  Where the switches are, one order for each layer: a flag, else an environment variable, else the
+  settings file, else on. --mods on|off (FMV_MODS) switches every layer; --mods-text, --mods-voice,
+  --mods-music and --mods-sound (FMV_MODS_TEXT, FMV_MODS_VOICE, FMV_MODS_MUSIC, FMV_MODS_SOUND) one
+  each; the settings file is `settings.json` in the mods folder (--mods-settings FILE or
+  FMV_MODS_SETTINGS names another): a JSON object of booleans, for example {\"voice\": false}, read
+  and never written. With nothing found every layer plays the base game.
+  A line on stderr says each layer's effective source: `mods: text=echo-s voice=echo-s music=echo-s
+  sound=cosmo [echo-s 1.24, cosmo 1.22]` (`original (off)` for a switched-off layer, `original (no
+  archive)` for one with nothing to play), and a `mods: note:` line for an archive that is damaged,
+  truncated or the wrong mod. A conversation says where its text came from (`mods: talk <field>
+  <npc>: echo-s section|original section`), a voice that plays `audio: voice <field>/<clip>` (a
+  clip's archive path, never its words), a track and a sound the same way (`audio: music <name>
+  from echo-s`, `audio: sound <id> from cosmo`). Voices need an audio output: FMV_AUDIO=null runs
+  them against a clock with none.
+
 WINDOW CONTROLS:
   WASD / arrow keys move, Esc twice quits (never during a battle: close the window to quit
   there). M mutes the sound, - and = change its volume (see SOUND). P invites the nearest other player
@@ -474,6 +505,10 @@ pub struct Args {
     /// canon Barret of md1stin, who is no script entity) has `nothing to say`. Without FF7 data nobody has.
     #[arg(long, value_name = "NAME[,NAME...]", value_delimiter = ',', value_parser = parse_npc_name, requires = "headless")]
     pub talk: Vec<String>,
+
+    /// The optional community-mod layers (Echo-S, Cosmo Memory): where their archives are and which layers are on. See MODS.
+    #[command(flatten)]
+    pub mods: crate::mods::ModFlags,
 }
 
 /// Default server for `--server`. Kept in sync with `DEFAULT_DEV_PORT` by a unit test.
