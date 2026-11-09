@@ -16,7 +16,7 @@
 
 mod script_common;
 
-use fmv_adapter_api::GameAdapter;
+use fmv_adapter_api::{ExitKind, GameAdapter};
 use fmv_core::{EditionProvenance, GameId, Platform};
 use fmv_ff7::lgp::LgpArchive;
 use fmv_ff7::script::{ExitTrigger, FieldScript, Maplist, ScriptExit};
@@ -162,11 +162,12 @@ fn the_automatic_jumps_of_the_reactor_chain() {
     }
 }
 
-/// What the adapter offers TODAY (gateways only): which fields of the reactor chain a player can
-/// walk to from `md1stin`. The elevator is a dead end, so the reactor below it cannot be reached.
+/// What the gateways alone offer: which fields of the reactor chain a player can walk to from `md1stin`. The
+/// elevator has no gateway, so the reactor below it cannot be reached by gateways (the adapter now also offers the
+/// exits the elevator's script decides: `tests/chain_real.rs`).
 #[test]
 #[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
-fn today_the_gateway_chain_ends_at_the_elevator() {
+fn the_gateway_chain_ends_at_the_elevator() {
     let Some((_, _, path)) = open() else { return };
     let provenance = EditionProvenance {
         game: GameId::Ff7,
@@ -187,7 +188,8 @@ fn today_the_gateway_chain_ends_at_the_elevator() {
             continue;
         }
         let area = adapter.load_area(&name).unwrap();
-        for e in area.exits() {
+        // the gateways only: what a walk could always do (the lift's exits are `tests/chain_real.rs`'s)
+        for e in area.exits().into_iter().filter(|e| e.kind == ExitKind::Gateway) {
             if !seen.contains_key(&e.target) {
                 seen.insert(e.target.clone(), depth + 1);
                 queue.push_back(e.target.clone());
@@ -204,10 +206,11 @@ fn today_the_gateway_chain_ends_at_the_elevator() {
     for field in ["nmkin_2", "nmkin_3", "nmkin_4", "nmkin_5", "smkin_1", "smkin_2"] {
         assert_eq!(at(field), None, "{field} should not be reachable without the elevator's line");
     }
-    assert!(adapter.load_area("elevtr1").unwrap().exits().is_empty(), "the elevator has no gateway: a dead end today");
+    let lift = adapter.load_area("elevtr1").unwrap().exits();
+    assert!(lift.iter().all(|e| matches!(e.kind, ExitKind::Script { .. })), "the elevator has no gateway: its four exits are the script's");
     let below: Vec<String> = ["nmkin_2", "nmkin_3", "nmkin_4"]
         .iter()
-        .flat_map(|f| adapter.load_area(f).unwrap().exits().into_iter().map(|e| e.target))
+        .flat_map(|f| adapter.load_area(f).unwrap().exits().into_iter().filter(|e| e.kind == ExitKind::Gateway).map(|e| e.target))
         .collect();
     assert_eq!(below, ["elevtr1", "nmkin_3", "nmkin_2", "nmkin_4", "nmkin_3", "nmkin_5"]);
 }

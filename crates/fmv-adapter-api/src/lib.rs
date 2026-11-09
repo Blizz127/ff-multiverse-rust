@@ -103,15 +103,34 @@ pub type AreaKey = String;
 
 /// How an [`Exit`] is triggered.
 ///
-/// Only [`ExitKind::Gateway`] exists. The other ways out of an FF7 field are decided by its
-/// scripts (a `MAPJUMP` run from a line or a talk script, which needs the script VM and the game's
-/// story variables); they are not exits in this sense, and adding them later means adding a kind.
+/// A [`ExitKind::Gateway`] is data and always open. A [`ExitKind::Script`] is a way out that a script
+/// decides (FF7: a `MAPJUMP` that a line's trigger script runs when the player walks onto the line): whether
+/// it is open depends on the game's story variables, which only the adapter reads
+/// ([`AreaRuntime::exit_state`]). The other ways out of an FF7 field (a `MAPJUMP` a talk script runs, a
+/// cut-scene's director) are not walk-on exits and are not reported; adding them later means adding a kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ExitKind {
     /// A gateway of the area's own data (FF7: one of the twelve gateways of the field's trigger
     /// section): walking across its line leads straight to another area, no script involved.
     Gateway,
+    /// An exit a script decides. `id` is the adapter's own number for it, handed back to
+    /// [`AreaRuntime::exit_state`]. Several script exits may share one line (a script that picks the
+    /// destination from the story): at most one of them is open for a given progression.
+    Script { id: u32 },
+}
+
+/// Whether an exit is open for an account's story ([`AreaRuntime::exit_state`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExitState {
+    /// Crossing the line leads to the target.
+    Open,
+    /// The exit's conditions say no for this story (it belongs to another moment of it).
+    Closed,
+    /// A condition of the exit reads something the adapter cannot evaluate (a variable the progression does
+    /// not carry, a key the player has to press): the exit stays closed. The text says what, in numbers and
+    /// the adapter's own words, never text of the game; the server reports it once per area.
+    Unknown(String),
 }
 
 /// One way out of an area: walking across [`Exit::line`] leaves the area for [`Exit::target`] and
@@ -158,30 +177,7 @@ impl Exit {
     /// [`Exit::is_crossed_by`] for the rule). When one move crosses several exits, the one with the
     /// smallest `t` is the one reached first.
     pub fn crossing(&self, from: Pos, to: Pos) -> Option<f64> {
-        if !(from.is_finite() && to.is_finite() && self.line.0.is_finite() && self.line.1.is_finite()) {
-            return None;
-        }
-        let (ax, ay) = (f64::from(self.line.0.x), f64::from(self.line.0.y));
-        let (bx, by) = (f64::from(self.line.1.x), f64::from(self.line.1.y));
-        let (dx, dy) = (bx - ax, by - ay);
-        if dx == 0.0 && dy == 0.0 {
-            return None;
-        }
-        let side = |x: f32, y: f32| dx * (f64::from(y) - ay) - dy * (f64::from(x) - ax);
-        let (s_from, s_to) = (side(from.x, from.y), side(to.x, to.y));
-        // Strictly on one side at the start; on the other side, or on the line, at the end.
-        if s_from == 0.0 || (s_to != 0.0 && (s_from > 0.0) == (s_to > 0.0)) {
-            return None;
-        }
-        // Where the move meets the line's extension, as a fraction of the move; and where that is
-        // along the segment (0 = first end point, 1 = the second).
-        let t = s_from / (s_from - s_to);
-        let (mx, my) = (
-            f64::from(from.x) + t * (f64::from(to.x) - f64::from(from.x)),
-            f64::from(from.y) + t * (f64::from(to.y) - f64::from(from.y)),
-        );
-        let along = ((mx - ax) * dx + (my - ay) * dy) / (dx * dx + dy * dy);
-        (0.0..=1.0).contains(&along).then_some(t)
+        line_crossing(self.line, from, to)
     }
 
     /// The middle of the exit line (z is the mean of the end points' heights): a point to steer
@@ -190,6 +186,45 @@ impl Exit {
         let (a, b) = self.line;
         Pos::new((a.x + b.x) / 2.0, (a.y + b.y) / 2.0, (a.z + b.z) / 2.0)
     }
+
+    /// Whether `other` is the same line as this exit's (the same two end points on x and y, in either order; the
+    /// heights play no part in a crossing): the several script exits of one trigger line share it.
+    pub fn same_line_as(&self, other: &Exit) -> bool {
+        let xy = |p: Pos| (p.x, p.y);
+        let (a, b) = (xy(self.line.0), xy(self.line.1));
+        let (c, d) = (xy(other.line.0), xy(other.line.1));
+        (a == c && b == d) || (a == d && b == c)
+    }
+}
+
+/// How far along the move `from -> to` it meets the line segment `line` (`Some(t)` with `t` in `(0, 1]`),
+/// or `None` when it does not cross it. The one crossing rule of exits ([`Exit::crossing`], which says why it
+/// is what it is) and of line triggers ([`StoryTrigger::Line`]).
+fn line_crossing(line: (Pos, Pos), from: Pos, to: Pos) -> Option<f64> {
+    if !(from.is_finite() && to.is_finite() && line.0.is_finite() && line.1.is_finite()) {
+        return None;
+    }
+    let (ax, ay) = (f64::from(line.0.x), f64::from(line.0.y));
+    let (bx, by) = (f64::from(line.1.x), f64::from(line.1.y));
+    let (dx, dy) = (bx - ax, by - ay);
+    if dx == 0.0 && dy == 0.0 {
+        return None;
+    }
+    let side = |x: f32, y: f32| dx * (f64::from(y) - ay) - dy * (f64::from(x) - ax);
+    let (s_from, s_to) = (side(from.x, from.y), side(to.x, to.y));
+    // Strictly on one side at the start; on the other side, or on the line, at the end.
+    if s_from == 0.0 || (s_to != 0.0 && (s_from > 0.0) == (s_to > 0.0)) {
+        return None;
+    }
+    // Where the move meets the line's extension, as a fraction of the move; and where that is
+    // along the segment (0 = first end point, 1 = the second).
+    let t = s_from / (s_from - s_to);
+    let (mx, my) = (
+        f64::from(from.x) + t * (f64::from(to.x) - f64::from(from.x)),
+        f64::from(from.y) + t * (f64::from(to.y) - f64::from(from.y)),
+    );
+    let along = ((mx - ax) * dx + (my - ay) * dy) / (dx * dx + dy * dy);
+    (0.0..=1.0).contains(&along).then_some(t)
 }
 
 /// What a non-player character looks like, in the adapter's own terms.
@@ -227,15 +262,23 @@ pub struct NpcSpawn {
 
 /// What makes the story move in an area, in terms the server can verify for itself.
 ///
-/// Only [`StoryTrigger::Region`] exists. The other things that move an FF7 story (a talk script, a
-/// cutscene that runs by itself, a battle that has to be won) need the script VM or the dialogue
-/// lane; adding them later means adding a kind.
+/// The things the server can see are where a player walks ([`StoryTrigger::Region`], [`StoryTrigger::Line`])
+/// and that it came to stand in the area ([`StoryTrigger::Enter`]). The other things that move an FF7 story
+/// (a talk script, a battle that has to be won) need an interaction the protocol does not carry, the script
+/// VM or the dialogue lane; adding them later means adding a kind.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum StoryTrigger {
     /// The player's character stands in this convex polygon (judged on x and y only, like exits). The
     /// corners are in THIS area's coordinates, in either winding order.
     Region(Vec<Pos>),
+    /// The player's character walks across this line (the rule of [`Exit::crossing`]: strictly from one
+    /// side to the other, or onto it), in THIS area's coordinates.
+    Line(Pos, Pos),
+    /// The player has just come to stand in the area (it joined, or arrived through an exit): what an area's
+    /// own scripts do by themselves from the first frame on (an FF7 field's characters walking about and
+    /// moving the story along). Never touched by a move.
+    Enter,
 }
 
 /// One place where an area's story can advance a player, as its own data defines it. The point says
@@ -253,9 +296,11 @@ pub struct StoryPoint {
 
 impl StoryPoint {
     /// Whether a move `from -> to` (both in this area's coordinates) touches the trigger: the chord
-    /// crosses or ends inside a [`StoryTrigger::Region`]. A move that starts inside it counts too,
-    /// so a player that is standing in the region when the point becomes available (its story moved
-    /// on while it stood there) is caught by its next step. Non-finite positions never hit.
+    /// crosses or ends inside a [`StoryTrigger::Region`], or crosses a [`StoryTrigger::Line`] (see
+    /// [`Exit::crossing`]; standing on a line is not crossing it). A move that starts inside a region counts
+    /// too, so a player that is standing in the region when the point becomes available (its story moved
+    /// on while it stood there) is caught by its next step. A [`StoryTrigger::Enter`] is never touched by a
+    /// move. Non-finite positions never hit.
     ///
     /// The whole chord is tested and not only where it ends, so a fast mover cannot step over a thin
     /// region between two ticks.
@@ -265,10 +310,18 @@ impl StoryPoint {
         }
         match &self.trigger {
             StoryTrigger::Region(corners) => chord_touches_polygon(corners, from, to),
+            StoryTrigger::Line(a, b) => line_crossing((*a, *b), from, to).is_some(),
+            StoryTrigger::Enter => false,
         }
     }
 
-    /// The middle of the trigger, in x, y and z: a point to steer toward.
+    /// Whether the point fires when the player comes to stand in the area ([`StoryTrigger::Enter`]).
+    pub fn is_on_entry(&self) -> bool {
+        matches!(self.trigger, StoryTrigger::Enter)
+    }
+
+    /// The middle of the trigger, in x, y and z: a point to steer toward (the origin for an
+    /// [`StoryTrigger::Enter`], which is nowhere).
     pub fn center(&self) -> Pos {
         match &self.trigger {
             StoryTrigger::Region(corners) => {
@@ -276,6 +329,8 @@ impl StoryPoint {
                 let sum = corners.iter().fold((0.0, 0.0, 0.0), |s, p| (s.0 + p.x, s.1 + p.y, s.2 + p.z));
                 Pos::new(sum.0 / n, sum.1 / n, sum.2 / n)
             }
+            StoryTrigger::Line(a, b) => Pos::new((a.x + b.x) / 2.0, (a.y + b.y) / 2.0, (a.z + b.z) / 2.0),
+            StoryTrigger::Enter => Pos::default(),
         }
     }
 }
@@ -345,6 +400,17 @@ pub trait AreaRuntime: Send + Sync {
     /// is none, which makes the area a dead end. See [`ExitKind`] for what is and is not included.
     fn exits(&self) -> Vec<Exit> {
         Vec::new()
+    }
+
+    /// Whether `exit` (one of [`AreaRuntime::exits`]) is open for the story `progress` (an account's progression
+    /// blob, as for [`AreaRuntime::phase_key`]): the server asks it of every exit a move crosses, with the
+    /// progression of the account that governs the crossing player's instance (the party leader's, for a party
+    /// member), and takes the first exit that answers [`ExitState::Open`]; a player that crosses a line whose exits
+    /// are all closed walks over it as over any line. The default is open (a gateway is data), so only an adapter
+    /// that reports [`ExitKind::Script`] exits needs to answer.
+    fn exit_state(&self, exit: &Exit, progress: &[u8]) -> ExitState {
+        let _ = (exit, progress);
+        ExitState::Open
     }
     /// The non-player characters the area's data places (see [`NpcSpawn`]). Additive: the default
     /// is none.
@@ -630,6 +696,99 @@ mod tests {
         assert!(!region(&[(0.0, 0.0), (10.0, 0.0)]).is_hit_by(at(1.0, 0.0), at(2.0, 0.0)), "two corners are no region");
         assert!(!region(&[(0.0, 0.0), (f32::NAN, 0.0), (0.0, 10.0)]).is_hit_by(at(1.0, 1.0), at(2.0, 2.0)));
         assert_eq!(p.center(), Pos::new(10.0 / 3.0, 10.0 / 3.0, 3.0));
+    }
+
+    fn line_point(a: (f32, f32), b: (f32, f32)) -> StoryPoint {
+        StoryPoint { id: 3, trigger: StoryTrigger::Line(Pos::new(a.0, a.1, 1.0), Pos::new(b.0, b.1, 3.0)), label: "line".into() }
+    }
+
+    #[test]
+    fn a_line_trigger_is_hit_by_exactly_the_moves_that_would_cross_an_exit_on_it() {
+        let (a, b) = ((0.0, 0.0), (10.0, 0.0));
+        let p = line_point(a, b);
+        let e = exit(a, b);
+        // the same rule as an exit's, over a grid of chords
+        for (fx, fy, tx, ty) in [
+            (5.0, 1.0, 5.0, -1.0),
+            (5.0, -1.0, 5.0, 1.0),
+            (5.0, 2.0, 5.0, 0.0),
+            (5.0, 0.0, 5.0, -2.0),
+            (5.0, 0.0, 5.0, 5.0),
+            (11.0, 1.0, 11.0, -1.0),
+            (-5.0, 3.0, 15.0, -3.0),
+            (2.0, 0.0, 8.0, 0.0),
+            (5.0, 3.0, 5.0, 1.0),
+        ] {
+            assert_eq!(p.is_hit_by(at(fx, fy), at(tx, ty)), e.is_crossed_by(at(fx, fy), at(tx, ty)), "{fx},{fy} -> {tx},{ty}");
+        }
+        assert!(p.is_hit_by(at(5.0, 1.0), at(5.0, -1.0)) && !p.is_hit_by(at(5.0, 1.0), at(5.0, 3.0)));
+        assert!(!p.is_hit_by(at(5.0, 0.0), at(5.0, 0.0)), "standing on a line is not walking over it, unlike a region");
+        assert_eq!(p.center(), Pos::new(5.0, 0.0, 2.0));
+        assert!(!p.is_on_entry());
+        // garbage never hits
+        assert!(!p.is_hit_by(at(f32::NAN, 1.0), at(5.0, -1.0)) && !p.is_hit_by(at(5.0, 1.0), at(5.0, f32::INFINITY)));
+    }
+
+    #[test]
+    fn an_entry_trigger_is_never_touched_by_a_move_and_says_it_fires_on_entry() {
+        let p = StoryPoint { id: 0, trigger: StoryTrigger::Enter, label: "enter".into() };
+        assert!(p.is_on_entry());
+        for (from, to) in [(at(0.0, 0.0), at(0.0, 0.0)), (at(-100.0, 0.0), at(100.0, 0.0))] {
+            assert!(!p.is_hit_by(from, to));
+        }
+        assert!(!region(&[(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)]).is_on_entry());
+        assert_eq!(p.center(), Pos::default());
+    }
+
+    #[test]
+    fn script_exits_share_a_line_in_either_direction_and_every_exit_is_open_by_default() {
+        let one = exit((0.0, 0.0), (10.0, 0.0));
+        let mut other = exit((10.0, 0.0), (0.0, 0.0));
+        other.kind = ExitKind::Script { id: 4 };
+        assert!(one.same_line_as(&other) && other.same_line_as(&one), "the same two points, either way round");
+        assert!(!one.same_line_as(&exit((0.0, 0.0), (10.0, 1.0))));
+        assert_ne!(one.kind, other.kind);
+        // a plain adapter answers open for every exit of any kind (a gateway is data)
+        struct Plain(AreaInfo);
+        impl AreaRuntime for Plain {
+            fn info(&self) -> &AreaInfo {
+                &self.0
+            }
+            fn spawn_points(&self) -> Vec<Pos> {
+                Vec::new()
+            }
+            fn validate_move(&self, from: Pos, _to: Pos) -> MoveResult {
+                MoveResult::Corrected(from)
+            }
+            fn bounds(&self) -> Bounds {
+                Bounds { min: Pos::default(), max: Pos::default() }
+            }
+            fn walk_triangles(&self) -> Vec<[Pos; 3]> {
+                Vec::new()
+            }
+            fn max_speed(&self) -> f32 {
+                1.0
+            }
+        }
+        let info = AreaInfo {
+            id: fmv_core::AreaId { game: GameId::Fixture, key: "plain".into() },
+            display_name: "plain".into(),
+            fingerprint: Fingerprint([0; 32]),
+            provenance: EditionProvenance {
+                game: GameId::Fixture,
+                platform: fmv_core::Platform::Synthetic,
+                edition: "t".into(),
+                region: "t".into(),
+                language: "t".into(),
+                revision: "t".into(),
+                sources: vec![],
+                modded: false,
+            },
+            fixture: true,
+        };
+        let area = Plain(info);
+        assert_eq!(area.exit_state(&one, &[]), ExitState::Open);
+        assert_eq!(area.exit_state(&other, &[9, 9]), ExitState::Open);
     }
 
     #[test]

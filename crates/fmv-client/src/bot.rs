@@ -190,6 +190,9 @@ pub const ARRIVAL_LINGER_S: f64 = 1.0;
 pub const PEER_WAIT_S: f64 = 8.0;
 /// ...and then this long after it first saw one, so that the other can see it too.
 pub const PEER_LINGER_S: f64 = 1.5;
+/// A follower ([`TravelBot::following`]) that has seen nobody in the area gives whoever it follows this long
+/// (seconds) to show up before it goes on alone.
+pub const FOLLOW_UNSEEN_WAIT_S: f64 = 10.0;
 /// How far past the middle of an exit line the bot aims, so that a step that does not end exactly on
 /// the line ends beyond it.
 const OVERSHOOT: f32 = 30.0;
@@ -205,6 +208,8 @@ pub struct TravelGate {
     pub party_size: usize,
     /// Other players seen in the current area so far.
     pub peers_seen: usize,
+    /// Other players in view right now (see [`TravelBot::following`]).
+    pub peers_in_view: usize,
 }
 
 /// What `--travel` does: walk through the exits to a list of areas, in order. A pure state machine
@@ -224,6 +229,8 @@ pub struct TravelBot {
     route: VecDeque<String>,
     /// Hold still until the party has two members (see [`PARTY_WAIT_S`]).
     wait_for_party: bool,
+    /// Go only when nobody else is in view (see [`TravelBot::following`]).
+    follow: bool,
     /// When the bot arrived in the area it is in now (`None`: it started here).
     arrived_at: Option<f64>,
     /// When it first saw another player in the area it is in now.
@@ -265,6 +272,7 @@ impl TravelBot {
         Self {
             route: route.into(),
             wait_for_party,
+            follow: false,
             arrived_at: None,
             peer_seen_at: None,
             stuck: 0,
@@ -273,6 +281,18 @@ impl TravelBot {
             plan_cooldown: 0,
             failed_plans: 0,
         }
+    }
+
+    /// Follow the others (`--travel-follow`): the bot crosses an exit only when no other player is in view, so it
+    /// goes after whoever it travels with has left the area, and never before. A party whose exits depend on its
+    /// leader's story (the elevator of the first reactor leads where the leader's story says, the leader having
+    /// ridden it) needs its members to cross after the leader, not alongside. A follower that has seen nobody in
+    /// the area waits [`FOLLOW_UNSEEN_WAIT_S`] for the one it follows (who may be on the way) and then goes on
+    /// alone; after an arrival it also waits [`ARRIVAL_LINGER_S`], by which time the area's snapshot has said who is
+    /// there.
+    pub fn following(mut self, on: bool) -> Self {
+        self.follow = on;
+        self
     }
 
     /// There is somewhere left to go (and the bot has not given up).
@@ -318,6 +338,17 @@ impl TravelBot {
         if self.wait_for_party && gate.party_size < 2 && gate.now < PARTY_WAIT_S {
             return false;
         }
+        if self.follow {
+            if gate.peers_in_view > 0 {
+                return false;
+            }
+            // Nobody here now: the one it follows has left, if it was ever here. A follower that has not seen
+            // anybody in this area gives them a while to turn up (they may be on their way), then goes on.
+            let here_for = self.arrived_at.map_or(gate.now, |at| gate.now - at);
+            if gate.peers_seen == 0 && here_for < FOLLOW_UNSEEN_WAIT_S {
+                return false;
+            }
+        }
         if let Some(at) = self.arrived_at {
             if gate.peers_seen > 0 {
                 self.peer_seen_at.get_or_insert(gate.now);
@@ -326,10 +357,12 @@ impl TravelBot {
             if waited < ARRIVAL_LINGER_S {
                 return false;
             }
-            match self.peer_seen_at {
-                Some(seen) if gate.now - seen < PEER_LINGER_S => return false,
-                None if waited < PEER_WAIT_S => return false,
-                _ => {}
+            if !self.follow {
+                match self.peer_seen_at {
+                    Some(seen) if gate.now - seen < PEER_LINGER_S => return false,
+                    None if waited < PEER_WAIT_S => return false,
+                    _ => {}
+                }
             }
         }
         true
@@ -367,8 +400,10 @@ impl TravelBot {
         for deg in FANOUT_DEG {
             let h = heading + deg.to_radians();
             let want = Pos::new(cur.x + h.cos() * len, cur.y + h.sin() * len, cur.z);
-            // Other exits are not for us; the wanted one is crossed on purpose.
-            if exits.iter().any(|e| !std::ptr::eq(e, goal_exit) && e.is_crossed_by(cur, want)) {
+            // Other exits are not for us; the wanted one is crossed on purpose (and so are the exits that share its
+            // line: a script that picks the destination from the story has several on one line, and the server
+            // takes the one that is open).
+            if exits.iter().any(|e| !e.same_line_as(goal_exit) && e.is_crossed_by(cur, want)) {
                 continue;
             }
             if let MoveResult::Accepted(p) = area.validate_move(cur, want) {
@@ -444,8 +479,8 @@ impl TravelBot {
         let (ux, uy) = ((wp.x - cur.x) / dist, (wp.y - cur.y) / dist);
         let step_len = len.min(dist);
         let want = Pos::new(cur.x + ux * step_len, cur.y + uy * step_len, cur.z);
-        // Other exits are not for us; the wanted one is crossed on purpose.
-        let blocked = exits.iter().any(|e| !std::ptr::eq(e, goal_exit) && e.is_crossed_by(cur, want));
+        // Other exits are not for us; the wanted one (and any on its line) is crossed on purpose.
+        let blocked = exits.iter().any(|e| !e.same_line_as(goal_exit) && e.is_crossed_by(cur, want));
         match area.validate_move(cur, want) {
             MoveResult::Accepted(p) if p.is_finite() && !blocked => {
                 if step_len >= dist {
@@ -1092,7 +1127,7 @@ mod travel_tests {
 
     #[test]
     fn the_gate_holds_the_bot_for_its_party_and_lingers_after_an_arrival() {
-        let gate = |now: f64, party_size: usize, peers_seen: usize| TravelGate { now, party_size, peers_seen };
+        let gate = |now: f64, party_size: usize, peers_seen: usize| TravelGate { now, party_size, peers_seen, peers_in_view: peers_seen };
         // Waiting for a party: not before it has two members, but never longer than PARTY_WAIT_S.
         let mut bot = TravelBot::new(vec![YARD.into()], true);
         assert!(!bot.may_walk(gate(0.0, 0, 0)));
@@ -1121,6 +1156,96 @@ mod travel_tests {
         assert!(bot.arrived(YARD, 100.0));
         assert!(!bot.may_walk(gate(100.0 + PEER_WAIT_S - 0.1, 0, 0)));
         assert!(bot.may_walk(gate(100.0 + PEER_WAIT_S + 0.1, 0, 0)), "it gives up waiting for company");
+    }
+
+    #[test]
+    fn a_follower_goes_only_when_nobody_is_in_view_and_somebody_was() {
+        // (peers seen so far in the area, peers in view now)
+        let gate = |now: f64, seen: usize, in_view: usize| TravelGate { now, party_size: 2, peers_seen: seen, peers_in_view: in_view };
+        // at the start of the route: not while the one it follows is here; once it has been seen and has gone, go
+        let mut bot = TravelBot::new(vec![YARD.into(), HALL.into()], true).following(true);
+        assert!(!bot.may_walk(gate(1.0, 1, 1)), "the one it follows is still here");
+        assert!(bot.may_walk(gate(2.0, 1, 0)), "it has been here and has left");
+        // nobody seen yet: it gives them time to show up, but not for ever
+        let mut bot = TravelBot::new(vec![YARD.into(), HALL.into()], true).following(true);
+        assert!(!bot.may_walk(gate(1.0, 0, 0)), "nobody has been here: they may be on their way");
+        assert!(!bot.may_walk(gate(FOLLOW_UNSEEN_WAIT_S - 0.1, 0, 0)));
+        assert!(bot.may_walk(gate(FOLLOW_UNSEEN_WAIT_S + 0.1, 0, 0)), "it goes on alone");
+        // after an arrival: a moment to take the area in, then only when alone (and somebody was here)
+        let mut bot = TravelBot::new(vec![YARD.into(), HALL.into()], false).following(true);
+        assert!(bot.arrived(YARD, 100.0));
+        assert!(!bot.may_walk(gate(100.5, 1, 0)), "too soon: the snapshot may not have said who is here");
+        assert!(!bot.may_walk(gate(103.0, 1, 1)), "the leader is here");
+        assert!(bot.may_walk(gate(103.1, 1, 0)), "and now it is not");
+        let mut bot = TravelBot::new(vec![YARD.into(), HALL.into()], false).following(true);
+        assert!(bot.arrived(YARD, 100.0));
+        assert!(!bot.may_walk(gate(105.0, 0, 0)), "the leader has not shown up");
+        assert!(bot.may_walk(gate(100.0 + FOLLOW_UNSEEN_WAIT_S + 0.1, 0, 0)), "and is not coming: on alone");
+        // a bot that does not follow ignores who is in view, as it always did
+        let mut bot = TravelBot::new(vec![YARD.into()], false);
+        assert!(bot.may_walk(gate(1.0, 4, 4)));
+    }
+
+    /// An area with two exits on ONE line (what a script that picks the destination from the story makes), to
+    /// different areas: the bot that wants the second must be allowed to cross the line the first is on too.
+    struct SharedLine {
+        inner: Box<dyn AreaRuntime>,
+    }
+
+    impl AreaRuntime for SharedLine {
+        fn info(&self) -> &fmv_adapter_api::AreaInfo {
+            self.inner.info()
+        }
+        fn spawn_points(&self) -> Vec<Pos> {
+            self.inner.spawn_points()
+        }
+        fn validate_move(&self, from: Pos, to: Pos) -> MoveResult {
+            self.inner.validate_move(from, to)
+        }
+        fn bounds(&self) -> Bounds {
+            self.inner.bounds()
+        }
+        fn walk_triangles(&self) -> Vec<[Pos; 3]> {
+            self.inner.walk_triangles()
+        }
+        fn max_speed(&self) -> f32 {
+            self.inner.max_speed()
+        }
+        fn exits(&self) -> Vec<Exit> {
+            let line = (Pos::new(300.0, -100.0, 0.0), Pos::new(300.0, 100.0, 0.0));
+            let exit = |id: u32, target: &str| Exit {
+                line,
+                target: target.into(),
+                arrival: Pos::default(),
+                arrival_facing: None,
+                arrival_hint: None,
+                kind: fmv_adapter_api::ExitKind::Script { id },
+            };
+            vec![exit(0, "north"), exit(1, "south")]
+        }
+    }
+
+    #[test]
+    fn a_travel_bot_crosses_a_line_that_several_exits_share_to_reach_the_one_it_wants() {
+        let area = SharedLine { inner: fmv_fixture::FixtureAdapter::new().load_area(fmv_fixture::FIXTURE_AREA_KEY).unwrap() };
+        let mut bot = TravelBot::new(vec!["south".into()], false);
+        let speed = area.max_speed() * BOT_SPEED_FACTOR;
+        let exits = area.exits();
+        let mut cur = Pos::new(100.0, 0.0, 0.0);
+        let mut crossed = false;
+        for _ in 0..4000 {
+            let step = bot.step(&area, cur, DT, speed);
+            if exits[1].is_crossed_by(cur, step.pos) {
+                crossed = true;
+                break;
+            }
+            cur = step.pos;
+        }
+        assert!(crossed, "the line was crossed (gave up: {:?})", bot.gave_up());
+        assert!(bot.gave_up().is_none());
+        // an exit on ANOTHER line is still not for it: a bot that wants the shared line does not cross a different one
+        let other = Exit { line: (Pos::new(-300.0, -100.0, 0.0), Pos::new(-300.0, 100.0, 0.0)), ..exits[0].clone() };
+        assert!(!other.same_line_as(&exits[1]) && exits[0].same_line_as(&exits[1]));
     }
 
     #[test]

@@ -155,14 +155,16 @@
 //! reported). The rules, with what was measured on the owned copy, are in the `area_content` module
 //! docs; in short:
 //!
-//! * [`AreaRuntime::exits`]: **only line gateways** (the used slots of the trigger section joined with
+//! * [`AreaRuntime::exits`]: the **line gateways** (the used slots of the trigger section joined with
 //!   the archive's `maplist`, read once per adapter) become exits, with the target spelled as the
-//!   archive spells it (so it is also what `list_areas` reports). `MAPJUMP`s and line-trigger
-//!   scripts are script-driven and out of scope: which `REQ` chain turns a crossing into a jump
-//!   depends on the script VM and the story variables. A field whose only way out is a `MAPJUMP`
-//!   has no exits (the elevator `elevtr1` is one: it is a dead end today).
-//!   [`crate::script::FieldScript::script_exits`] describes those jumps (the root script that runs
-//!   them, the line, the conditions) without wiring them in; its docs list the open questions.
+//!   archive spells it (so it is also what `list_areas` reports), always open; after them come the exits the
+//!   field's **scripts** decide (kind `ExitKind::Script`): the `MAPJUMP`s that a line's walk-on trigger script
+//!   runs ([`crate::script::FieldScript::script_exits`]), several of them on one line when the script picks
+//!   the destination from the story (the elevator `elevtr1` has no gateway and four). Whether a script exit
+//!   is open for an account is [`AreaRuntime::exit_state`]: its guards are judged against the story the
+//!   progression records (`crate::exit_gate` has the rules: what is kept, what a guard may read, and that an
+//!   exit with a guard the model cannot judge stays closed). A `MAPJUMP` a talk or a director runs is not
+//!   a walk-on exit and is not offered.
 //! * [`AreaRuntime::place_arrival`]: an exit's `arrival_hint` is the index of the target walkmesh
 //!   triangle that holds the arrival point; where that triangle holds the point, the arrival
 //!   stands at the triangle's height there (the right floor of a layered field), otherwise the
@@ -174,6 +176,7 @@
 
 use crate::area_content;
 use crate::encounter::decode_encounter_section;
+use crate::exit_gate::{self, ScriptGate};
 use crate::field::{section, Background, Camera, FieldError, FieldFile, Palette, Triggers, Vertex, Walkmesh, FIELD_SCALE_ONE};
 use crate::lgp::{LgpArchive, LgpError};
 use crate::lzss;
@@ -181,7 +184,8 @@ use crate::script::{triangle_contains_xy, triangle_height_at, FieldScript, Mapli
 use crate::story::{self, AreaStory};
 use crate::walk::{LinkReport, Route, Surface};
 use fmv_adapter_api::{
-    AdapterError, AreaInfo, AreaRuntime, Bounds, EncounterTable, Exit, GameAdapter, MoveResult, NpcSpawn, StoryPoint, StoryStep,
+    AdapterError, AreaInfo, AreaRuntime, Bounds, EncounterTable, Exit, ExitKind, ExitState, GameAdapter, MoveResult, NpcSpawn, StoryPoint,
+    StoryStep,
 };
 use fmv_core::{AreaId, EditionProvenance, Fingerprint, GameId, PhaseKey, Platform, Pos, ProvenanceSummary, SourceRef};
 use std::collections::HashSet;
@@ -466,8 +470,10 @@ impl Ff7Adapter {
         let loaded = self.load_validated(key)?;
         let info = self.info_for(&loaded.key, loaded.fingerprint);
         // After `load_validated` has let go of the archive: `maplist` and the exit targets lock it.
-        let exits = self.gateway_exits(&loaded.field);
-        Ok(Ff7FieldArea::new(info, loaded.field, loaded.walkmesh, loaded.surface, exits))
+        let mut exits = self.gateway_exits(&loaded.field);
+        let (script_exits, gates) = self.script_exits(&loaded.field);
+        exits.extend(script_exits);
+        Ok(Ff7FieldArea::new(info, loaded.field, loaded.walkmesh, loaded.surface, exits, gates))
     }
 
     /// The archive's name list, read and parsed once per adapter. `None` when the archive has no
@@ -501,6 +507,15 @@ impl Ff7Adapter {
         let Some(maplist) = self.maplist() else { return Vec::new() };
         let archive = self.archive.lock().unwrap_or_else(PoisonError::into_inner);
         area_content::gateway_exits(field, &maplist, |name| listed_key(&archive, name))
+    }
+
+    /// The exits that the field's scripts decide (the walk-on `MAPJUMP`s of its lines) and their gates (see
+    /// `crate::exit_gate`): none for a field whose scripts cannot be read or when the archive has no `maplist`.
+    fn script_exits(&self, field: &FieldFile) -> (Vec<Exit>, Vec<ScriptGate>) {
+        let Some(maplist) = self.maplist() else { return (Vec::new(), Vec::new()) };
+        let Ok(script) = FieldScript::from_field(field) else { return (Vec::new(), Vec::new()) };
+        let archive = self.archive.lock().unwrap_or_else(PoisonError::into_inner);
+        exit_gate::script_exits(&script, &maplist, |name| listed_key(&archive, name))
     }
 
     fn info_for(&self, key: &str, fingerprint: Fingerprint) -> AreaInfo {
@@ -663,8 +678,10 @@ pub struct Ff7FieldArea {
     spawns: Vec<Pos>,
     /// Field scale from the model-loader header; 512 when that header is missing or zero.
     field_scale: u16,
-    /// Gateway exits, resolved at load time (see the module docs).
+    /// The gateway exits, then the exits the field's scripts decide, resolved at load time (see the module docs).
     exits: Vec<Exit>,
+    /// The conditions of the script exits (`ExitKind::Script { id }` is an index into it).
+    gates: Vec<ScriptGate>,
     /// NPCs the field's scripts place unconditionally, worked out at load time.
     npcs: Vec<NpcSpawn>,
     /// The random-encounter table of the field's own section 6, decoded at load time.
@@ -684,7 +701,7 @@ impl Ff7FieldArea {
     /// `surface` must have at least one usable triangle (checked by
     /// `Ff7Adapter::load_validated`, the only caller). `exits` are the gateway exits the adapter
     /// resolved against the archive; the NPCs and the encounter table come from the field itself.
-    fn new(info: AreaInfo, field: FieldFile, walkmesh: Walkmesh, surface: Surface, exits: Vec<Exit>) -> Self {
+    fn new(info: AreaInfo, field: FieldFile, walkmesh: Walkmesh, surface: Surface, exits: Vec<Exit>, gates: Vec<ScriptGate>) -> Self {
         // Bounds over every vertex of every triangle, including degenerate ones.
         let mut min = [f32::MAX; 3];
         let mut max = [f32::MIN; 3];
@@ -708,7 +725,7 @@ impl Ff7FieldArea {
         let encounters = field.section(section::ENCOUNTER).ok().and_then(decode_encounter_section);
         // A field whose script section cannot be parsed has no story of its own: one phase, no points.
         let story = FieldScript::from_field(&field).map(|script| AreaStory::scan(&script, &walkmesh)).unwrap_or_default();
-        let mut area = Self { info, field, walkmesh, surface, bounds, spawns, field_scale, exits, npcs: Vec::new(), encounters, story };
+        let mut area = Self { info, field, walkmesh, surface, bounds, spawns, field_scale, exits, gates, npcs: Vec::new(), encounters, story };
         // NPCs without a literal height stand on this area's own surface, so they are worked out last.
         area.npcs = area_content::npc_spawns(&area.field, &area.walkmesh, |x, y| area.height_at(x, y, None));
         area
@@ -855,6 +872,19 @@ impl AreaRuntime for Ff7FieldArea {
 
     fn exits(&self) -> Vec<Exit> {
         self.exits.clone()
+    }
+
+    /// A gateway is data and always open. A script exit is open when every condition of its jump holds for the
+    /// story `progress` records (`crate::exit_gate`): the moment and the tracked variables are judged, anything else
+    /// a guard reads keeps the exit closed.
+    fn exit_state(&self, exit: &Exit, progress: &[u8]) -> ExitState {
+        match exit.kind {
+            ExitKind::Script { id } => usize::try_from(id)
+                .ok()
+                .and_then(|id| self.gates.get(id))
+                .map_or_else(|| ExitState::Unknown("an exit the field does not have".to_string()), |gate| gate.state(progress)),
+            _ => ExitState::Open,
+        }
     }
 
     fn npcs(&self) -> Vec<NpcSpawn> {

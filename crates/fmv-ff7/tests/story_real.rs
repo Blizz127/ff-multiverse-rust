@@ -49,7 +49,7 @@ fn adapter(dir: &std::path::Path) -> Ff7Adapter {
 }
 
 fn at(moment: u16) -> Vec<u8> {
-    StoryState { moment }.encode()
+    StoryState::at(moment).encode()
 }
 
 fn corners(area: &dyn AreaRuntime, id: u32) -> Vec<Pos> {
@@ -67,7 +67,8 @@ fn md1stin_has_exactly_the_station_trigger_and_new_accounts_can_use_it() {
     let a = adapter(&dir);
     let area = a.load_area("md1stin").unwrap();
     let points = area.story_points();
-    assert_eq!(points.len(), 1, "one story point: {points:?}");
+    assert_eq!(points.len(), 2, "the station trigger, and the intro's own step: {points:?}");
+    assert!(matches!(points[1].trigger, StoryTrigger::Enter) && points[1].label == "entry: moment ==0 -> 1", "{points:?}");
     let point = &points[0];
     println!("md1stin story point: {}", point.label);
     assert!(point.label.contains("triangle 12") && point.label.contains("moment ==1 -> 6"), "{}", point.label);
@@ -153,9 +154,15 @@ fn every_field_scans_and_a_new_account_is_in_the_empty_phase_of_all_of_them() {
         }
         // Every point is one that a step can actually reach: its triangle exists and its corners are finite.
         for p in story.points() {
-            let StoryTrigger::Region(c) = &p.trigger else { panic!("a region") };
-            assert_eq!(c.len(), 3);
-            assert!(c.iter().all(|p| p.is_finite()));
+            match &p.trigger {
+                StoryTrigger::Region(c) => {
+                    assert_eq!(c.len(), 3);
+                    assert!(c.iter().all(|p| p.is_finite()));
+                }
+                StoryTrigger::Line(a, b) => assert!(a.is_finite() && b.is_finite() && (a.x, a.y) != (b.x, b.y), "{name}#{}", p.id),
+                StoryTrigger::Enter => {}
+                other => panic!("{name}#{}: {other:?}", p.id),
+            }
         }
     }
     println!("{} fields scanned; {with_edges} cut the counter into phases ({total_edges} edges in all)", names.len());

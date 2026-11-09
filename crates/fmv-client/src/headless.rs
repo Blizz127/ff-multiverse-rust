@@ -192,7 +192,7 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>) -> u
     // invite to send it holds still until the invite is out (the invite must go out while the others are in view).
     let mut story_bot = StoryBot::new(args.story_advance, args.party_invite_first_peer);
     // `--travel`: walk through the exits to these areas; with a party to form first it waits for it.
-    let mut travel_bot = TravelBot::new(args.travel.clone(), args.party_invite_first_peer || args.party_accept);
+    let mut travel_bot = TravelBot::new(args.travel.clone(), args.party_invite_first_peer || args.party_accept).following(args.travel_follow);
     let mut battle_bot = BattleBot::new(args.battle_auto, args.debug_encounters, args.battle_wait_party).with_script(args.battle_script.clone());
     // `--talk`: talk to these characters of the area through the window's own conversation code (this machine's
     // own copy of the field's scripts; without FF7 data nobody has anything to say).
@@ -281,6 +281,7 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>) -> u
         if let Some(change) = session.take_area_change() {
             bot = Bot::new(args.bot, session.state.own.pos(), session.area.bounds(), session.area.max_speed());
             let reached = travel_bot.arrived(&change.area.key, session.now());
+            story_bot.arrived();
             eprintln!(
                 "headless: now in {} (area change {}){}",
                 change.area,
@@ -309,7 +310,7 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>) -> u
         // Conversations: each wanted character is talked to once, when the area has announced it (and with the
         // story this player has reached by then).
         if !talk_bot.is_done() {
-            for line in talk_bot.step(&session.info.area_id.key, session.state.npc_views(), session.state.story.moment()) {
+            for line in talk_bot.step_with(&session.info.area_id.key, session.state.npc_views(), session.state.story.state()) {
                 eprintln!("{line}");
             }
         }
@@ -346,7 +347,11 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>) -> u
         // A player in a battle is frozen in the field: it neither walks nor sends movement.
         let frozen = session.state.battle.in_battle();
         if dt > 0.0 && !frozen {
-            let step = if story_bot.is_requested() {
+            // The story comes first: while there is a point in this area that would advance this player's story
+            // the story bot walks to it (and stands still if it must wait for its invite); once there is none, a
+            // bot that also travels goes on to the next exit. A bot that only advances its story stands still then.
+            let story_walks = story_bot.wants_to_walk(session.area.as_ref(), session.state.story.progress(), session.state.own.pos());
+            let step = if story_bot.is_requested() && (story_walks || !travel_bot.is_active()) {
                 // The story bot decides every step (it stands still when there is nothing to advance).
                 if story_bot.may_walk(now, session.state.party.outgoing_invite_seen()) {
                     let speed = session.area.max_speed() * crate::bot::BOT_SPEED_FACTOR;
@@ -355,7 +360,12 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>) -> u
                     crate::bot::BotStep { pos: session.state.own.pos(), facing: None, moved: false }
                 }
             } else if travel_bot.is_active() {
-                let gate = TravelGate { now, party_size: session.state.party.party_size(), peers_seen: session.state.peers_seen() };
+                let gate = TravelGate {
+                    now,
+                    party_size: session.state.party.party_size(),
+                    peers_seen: session.state.peers_seen(),
+                    peers_in_view: remotes.len(),
+                };
                 if travel_bot.may_walk(gate) {
                     travel_bot.step(session.area.as_ref(), session.state.own.pos(), dt, session.area.max_speed() * crate::bot::BOT_SPEED_FACTOR)
                 } else {

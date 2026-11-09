@@ -108,6 +108,7 @@ pub mod tex;
 
 mod area_content;
 mod encounter;
+mod exit_gate;
 mod util;
 mod walk;
 

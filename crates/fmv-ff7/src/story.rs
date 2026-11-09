@@ -5,66 +5,103 @@
 //! FF7 keeps its main story position in one field variable, a 16-bit word at **bank 2, address 0**
 //! (`Var[2][0]`; the community calls it the "game moment" or main progress counter). The field
 //! scripts compare it everywhere (391 of the 702 owned fields read it, see
-//! `examples/story_survey.rs`) and 213 write it. This module turns that into the three things the
+//! `examples/story_survey.rs`) and 213 write it. This module turns that into the things the
 //! multiplayer server needs, all per ACCOUNT and independent of which character a player looks like
 //! or fights as:
 //!
-//! * **The progression blob** ([`StoryState`]): `[1, moment_lo, moment_hi]`, three bytes. The
-//!   **empty blob is a new account** and means [`NEW_GAME_MOMENT`] (1): the value the opening scene
-//!   of `md1stin` leaves behind (`SETWORD Var[2][0] = 1`, then control is handed to the player), so
-//!   a player starts where the game first lets them walk. Every account that exists today has no
-//!   progression record and is therefore in the same state. Anything else that is not exactly
-//!   version 1 is unreadable and is never interpreted, advanced or overwritten.
+//! * **The progression blob** ([`StoryState`]): `[1, moment_lo, moment_hi]`, three bytes, and, once a story
+//!   step has set one of the few other variables the model carries ([`TRACKED_VARS`]), a second version
+//!   with those variables after the moment (below). The **empty blob is a new account** and means
+//!   [`NEW_GAME_MOMENT`] (1): the value the opening scene of `md1stin` leaves behind (`SETWORD Var[2][0] =
+//!   1`, then control is handed to the player), so a player starts where the game first lets them walk.
+//!   Every account that exists today has no progression record, or a version 1 one, and is therefore
+//!   exactly as it was. Anything else that is not exactly version 1 or 2 is unreadable and is never
+//!   interpreted, advanced or overwritten.
 //! * **The phase of an area** ([`AreaStory::phase_key`]): each field is partitioned by the moments
 //!   its own scripts compare `Var[2][0]` against (`==`, `!=`, `<`, `>`, `<=`, `>=` with a literal,
 //!   in any script of the field). Two moments in one interval make every one of those comparisons
 //!   answer the same, so the field looks the same to both players; the key of an interval is its
 //!   first moment. **The interval that holds [`NEW_GAME_MOMENT`] is the empty key in every field**,
 //!   which is what makes all existing accounts one phase and keeps their placements byte for byte
-//!   what they were.
-//! * **Story points** ([`AreaStory::points`]): where a field's own scripts advance the moment on
+//!   what they were. (The variables beyond the moment do not take part in phases: the one the model
+//!   carries only ever changes together with a moment the field distinguishes.)
+//! * **Story points** ([`AreaStory::points`]): where a field's own scripts advance the story on
 //!   something the server can see. See below.
 //!
-//! # The one kind of story point: step onto a walkmesh triangle
+//! # Variables beyond the moment (blob version 2)
 //!
-//! FF7 fields advance the story from small loops in an entity's script 0 (its "main" part, after
-//! the first `RET`). The first fields of the first mission do it like this (measured on the owned
-//! Steam copy: the director entity of the first field, and the same shape with another comparison
-//! in the next field; `T`, `N`, `M` and `E` are literals and an entity of the field, whose values are
-//! pinned by the ignored real-data tests in `tests/story_real.rs` and not repeated here):
+//! The exits of a field are decided by more than the moment: the elevator of the first reactor
+//! (`elevtr1`) leads down or up by a bit of `Var[1][225]`. The model carries exactly the variables
+//! (and bits of them) in [`TRACKED_VARS`], every other variable is unknown: a guard that reads one cannot be
+//! evaluated (an exit with such a guard stays closed, see [`crate::area`]) and a script write to one is not
+//! carried out. A tracked variable is 0 for a new account, and only story points set it.
 //!
-//! ```text
-//! init:   SETWORD Var[b][a] = T                ; the walkmesh triangle that matters
-//!         RET
-//! main:   GETAI entity=E Var[b2][a2]           ; which triangle is the (controlled) player on
-//!         IFSW Var[b2][a2] == Var[b][a]        ; ...is it triangle T?
-//!         IFSW Var[2][0] <cmp> N               ; ...and is the story where this step applies
-//!         SETWORD Var[2][0] = M                ; story advances (then a cutscene, often a battle)
-//!         JMPB main
-//! ```
+//! **Blob version 2** is `[2, moment_lo, moment_hi, n, (bank, address, value) * n]`: the same moment, then
+//! `n` (1 to [`MAX_STORY_VARS`]) variables with a non-zero value, in strictly ascending `(bank, address)`
+//! order, so that equal states have exactly one encoding. [`StoryState::encode`] writes version 1 whenever
+//! no variable is set (those blobs are byte for byte what version 1 built wrote, and
+//! [`StoryState::decode`] reads both), and merging two progressions ([`merge_progression`]) is a join: the
+//! further moment, the union of the set bits. **Rollback:** a build that predates version 2 reads a version 2
+//! blob as unreadable (it plays in a phase of its own and never overwrites the record), as it does any blob
+//! it does not know.
 //!
-//! The server cannot run scripts, but it can see this: it knows where a player stands and which
-//! triangle that is. [`AreaStory::scan`] therefore recognises exactly this pattern, and **only
-//! this**, with a witness check on the loaded script and on the loaded walkmesh:
+//! # Story points
 //!
-//! * a `SETWORD`/`SETBYTE` of `Var[2][0]` with a literal, in the main part of an entity's script 0;
-//! * every conditional jump that can skip it is one of: a comparison of `Var[2][0]` with a literal
-//!   (any of the six ordered comparisons, at least one), or one equality between a variable that a
-//!   `GETAI` in the same loop fills with the triangle of entity E and a variable that the init part
-//!   set to a literal (exactly one such test, because it is the region);
-//! * E is **bound to a playable character** (has a `PC`): any of them, never one in particular, so
-//!   the rule is "the player's character", not "Cloud". The same variable is then the position of
-//!   every player who stands for that role;
-//! * the triangle exists in the walkmesh.
+//! A story point is a place or a moment where a field's own scripts advance the story, found by reading
+//! them ([`AreaStory::scan`]; the server never invents one and carries out no write it could not read).
+//! There are three triggers, all of them things the server can see:
 //!
-//! A pattern that does not match every point (another edition, a field that does it differently, a
-//! write that is not guarded by a region) is not a story point: **the server never invents one**.
-//! The script's `BATTLE` after the write is not run (the server has no scripted battles yet); it is
-//! named in the point's label so a log says so. Nothing else of the cutscene happens either: the
-//! story simply moves.
+//! * **A walkmesh triangle** ([`StoryTrigger::Region`]). FF7 fields advance the story from small loops in an
+//!   entity's script 0 (its "main" part, after the first `RET`). The first fields of the first mission do it
+//!   like this (measured on the owned Steam copy: the director entity of the first field, and the same shape
+//!   with another comparison in the next field; `T`, `N`, `M` and `E` are literals and an entity of the field,
+//!   whose values are pinned by the ignored real-data tests in `tests/story_real.rs` and not repeated here):
 //!
-//! Advancing is monotone: a point sets the moment only if the guards hold for the player's current
-//! moment **and** the new value is higher.
+//!   ```text
+//!   init:   SETWORD Var[b][a] = T                ; the walkmesh triangle that matters
+//!           RET
+//!   main:   GETAI entity=E Var[b2][a2]           ; which triangle is the (controlled) player on
+//!           IFSW Var[b2][a2] == Var[b][a]        ; ...is it triangle T?
+//!           IFSW Var[2][0] <cmp> N               ; ...and is the story where this step applies
+//!           SETWORD Var[2][0] = M                ; story advances (then a cutscene, often a battle)
+//!           JMPB main
+//!   ```
+//!
+//!   The test of the triangle may also compare the variable that `GETAI` fills (anywhere in the field: the
+//!   elevator's panel reads the one the director's loop keeps) with a literal. E is **bound to a playable
+//!   character** (has a `PC`): any of them, never one in particular, so the rule is "the player's character".
+//! * **A line** ([`StoryTrigger::Line`]): the trigger script of a `LINE` entity that the player walks onto
+//!   (slots 2 to 6, the ones [`crate::script::ExitTrigger::is_walk_on`] counts; `[OK]` needs the button) and
+//!   that starts enabled. The first mission's way into the reactor is one (`nmkin_1`).
+//! * **Entering the area** ([`StoryTrigger::Enter`]): a write in script 0's init or main part that only the
+//!   story guards, so the field's own scripts do it by themselves from the first frame on (a character walks
+//!   to a spot and the story moves on: `md1_2`, `nrthmk`, `nmkin_2`). The server does it when the player
+//!   comes to stand in the area. A script that loops or asks the player before the write is not one (it waits
+//!   for something the server cannot see).
+//!
+//! What a point does is the list of writes the script makes there ([`Effect`]): the moment, or a bit of a
+//! tracked variable, each under the conditions the script puts around it (comparisons of the moment, tests
+//! of a tracked bit). The conditions of **all of a point's writes are judged on the story as it was when
+//! the point was reached** (the elevator's moment write sits under its bit test, so it must not see the
+//! write of the bit), and the point applies only if it moves the story forward: the moment goes up or a bit
+//! goes on (a write that only clears a bit is no point). **Everything a point cannot do is named, not
+//! guessed:** a guard on anything the model does not carry (a variable, a party, a key) makes the write no
+//! part of a point; a write in an `else` branch, after an early `RET`, `MAPJUMP` or `GAMEOVER`, or in the
+//! middle of a `REQ`'d script is not read at all. The script's `BATTLE` after a write is not run (the server
+//! has no scripted battles yet); it is named in the point's label so a log says so, and nothing else of a
+//! cutscene happens either: the story simply moves. What the server cannot see: **a talk** (nmkin_3's
+//! woman, nmkin_5's chest: the protocol has no interaction message), and **a key press** (below).
+//!
+//! **The one approximation: the OK button.** The elevator's panel is "stand on triangle 8 and press OK"
+//! (`IFKEYON` with OK in its mask under the triangle test). Protocol version 9 carries moves only, so the
+//! server cannot see the press: **a point whose triangle test also wants OK is reached by standing on the
+//! triangle** (the point's label says `OK`). It is the only place a key guard is tolerated; everywhere else
+//! (a line, entering, an exit) a key guard keeps the write or the exit out. And only the elevator going
+//! DOWN is carried out: the trip back up clears the bit (`BITOFF`), which is not forward, and a region fires
+//! on every move inside it, so a toggle would flap.
+//!
+//! Advancing is monotone: a point applies only when its conditions hold for the player's current story **and**
+//! the story moves forward by it.
 //!
 //! # The canon party
 //!
@@ -78,8 +115,8 @@
 //! * No cast per phase for FF7 yet: [`AreaRuntime::npcs_in_phase`] keeps the server's existing
 //!   behaviour (the NPCs the data places unconditionally), so every account sees exactly the NPCs it
 //!   always saw. The phase key is what a later lane keys the field's cast on.
-//! * Only `Var[2][0]` is modelled. Other story variables (the bits NPCs and items hang off) are not
-//!   part of the progression yet; the blob is versioned so they can be added.
+//! * Only the moment and the variables of [`TRACKED_VARS`] are modelled. The other story variables (the
+//!   bits NPCs and items hang off, the countdown timer of the reactor) are not part of the progression yet.
 //!
 //! # Untrusted data
 //!
@@ -92,7 +129,9 @@ use fmv_core::{PhaseKey, Pos};
 
 use crate::field::Walkmesh;
 use crate::script::dialogue::StoryVars;
-use crate::script::{FieldScript, Instruction, Operand, INIT_SCRIPT, SCRIPTS_PER_ENTITY};
+use crate::script::{FieldScript, Instruction, Operand, SCRIPTS_PER_ENTITY};
+
+mod scan;
 
 /// The bank of the main progress counter (`Var[2][0]`).
 pub const MOMENT_BANK: u8 = 2;
@@ -101,40 +140,184 @@ pub const MOMENT_ADDRESS: u8 = 0;
 /// What a new account's (empty) progression stands for: the value `md1stin`'s opening scene leaves
 /// the counter at before it gives the player control.
 pub const NEW_GAME_MOMENT: u16 = 1;
-/// The format version byte of a non-empty progression blob.
+/// The format version byte of a progression blob that holds the moment only.
 pub const BLOB_VERSION: u8 = 1;
+/// The format version byte of a progression blob that also holds variables beyond the moment.
+pub const BLOB_VERSION_VARS: u8 = 2;
+/// Most variables a version 2 blob holds beyond the moment (the whole blob stays under 52 bytes, far under
+/// what the server keeps of a progression).
+pub const MAX_STORY_VARS: usize = 16;
 /// First byte of every non-default [`PhaseKey`] this module makes.
 const PHASE_TAG: u8 = 0x4D;
-/// Most story points one field may offer (a real field has at most a few).
-pub const MAX_STORY_POINTS: usize = 16;
+/// Most story points one field may offer (a real field has a handful).
+pub const MAX_STORY_POINTS: usize = 32;
 
-/// An account's FF7 story state: where its main story stands.
+/// A variable beyond the moment that the story model carries (see the module docs, "Variables beyond the
+/// moment"): which bits of the byte at `bank`/`address` are part of the progression.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrackedVar {
+    pub bank: u8,
+    pub address: u8,
+    /// The bits of the byte the model carries (`0xFF`: the whole byte). A guard that tests another bit of it
+    /// cannot be evaluated.
+    pub bits: u8,
+}
+
+/// **The reactor's state byte, bit 0: the lift of `elevtr1` is at the bottom.** The `ele` entity of that field
+/// sets it when the party rides down (its panel, then `BITON Var[1][225] bit 0`) and the four exits of the
+/// lift's line are decided by it (`Var[1][225] lacks bit 0`: up to `nmkin_1`; set: down to `nmkin_2`). The
+/// byte has seven more bits that the first mission's scripts set (the timer, the bomb) and that nothing here
+/// writes, so only this one is carried.
+pub const REACTOR_LIFT: TrackedVar = TrackedVar { bank: 1, address: 225, bits: 0x01 };
+
+/// Every variable beyond the moment the model carries. Adding one is adding a row here, and a story point
+/// that writes it.
+pub const TRACKED_VARS: &[TrackedVar] = &[REACTOR_LIFT];
+
+/// The tracked variable at `bank`/`address`, if there is one.
+pub fn tracked_var(bank: u8, address: u8) -> Option<TrackedVar> {
+    TRACKED_VARS.iter().copied().find(|t| t.bank == bank && t.address == address)
+}
+
+/// An account's FF7 story state: where its main story stands, and the few other variables the model carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoryState {
     /// The main progress counter (`Var[2][0]`).
     pub moment: u16,
+    /// The tracked variables with a non-zero value, as bytes.
+    vars: BTreeMap<(u8, u8), u8>,
 }
 
 impl StoryState {
-    /// Where a new account starts ([`NEW_GAME_MOMENT`]).
+    /// Where a new account starts ([`NEW_GAME_MOMENT`], every other variable 0).
     pub const fn new_game() -> Self {
-        Self { moment: NEW_GAME_MOMENT }
+        Self::at(NEW_GAME_MOMENT)
     }
 
-    /// Read a progression blob: empty is a new account, `[1, lo, hi]` is a stored moment, anything
-    /// else is unreadable (`None`).
+    /// The story at `moment` with every other variable 0.
+    pub const fn at(moment: u16) -> Self {
+        Self { moment, vars: BTreeMap::new() }
+    }
+
+    /// Read a progression blob: empty is a new account, `[1, lo, hi]` a stored moment, a canonical version 2
+    /// blob a moment and variables; anything else is unreadable (`None`).
+    // (`as_chunks` would satisfy the lint but needs Rust 1.88; the workspace keeps `chunks_exact`, see `lgp`.)
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     pub fn decode(blob: &[u8]) -> Option<Self> {
         match blob {
             [] => Some(Self::new_game()),
-            [BLOB_VERSION, lo, hi] => Some(Self { moment: u16::from_le_bytes([*lo, *hi]) }),
+            [BLOB_VERSION, lo, hi] => Some(Self::at(u16::from_le_bytes([*lo, *hi]))),
+            [BLOB_VERSION_VARS, lo, hi, count, rest @ ..] => {
+                let count = usize::from(*count);
+                if count == 0 || count > MAX_STORY_VARS || rest.len() != count.checked_mul(3)? {
+                    return None;
+                }
+                let mut state = Self::at(u16::from_le_bytes([*lo, *hi]));
+                let mut previous: Option<(u8, u8)> = None;
+                for entry in rest.chunks_exact(3) {
+                    let [bank, address, value] = entry else { return None };
+                    let key = (*bank, *address);
+                    let ascending = previous.is_none_or(|p| p < key);
+                    let is_a_variable = (1..=15).contains(bank) && !(*bank == MOMENT_BANK && *address <= MOMENT_ADDRESS.wrapping_add(1));
+                    if !(ascending && is_a_variable && *value != 0) {
+                        return None; // not the one way to write this state
+                    }
+                    state.vars.insert(key, *value);
+                    previous = Some(key);
+                }
+                Some(state)
+            }
             _ => None,
         }
     }
 
-    /// The blob that stores this state.
-    pub fn encode(self) -> Vec<u8> {
+    /// The blob that stores this state: version 1 (`[1, lo, hi]`, exactly what version 1 builds wrote) when no
+    /// variable is set, else the canonical version 2.
+    pub fn encode(&self) -> Vec<u8> {
         let [lo, hi] = self.moment.to_le_bytes();
-        vec![BLOB_VERSION, lo, hi]
+        if self.vars.is_empty() {
+            return vec![BLOB_VERSION, lo, hi];
+        }
+        let mut blob = vec![BLOB_VERSION_VARS, lo, hi, u8::try_from(self.vars.len()).unwrap_or(u8::MAX)];
+        for (&(bank, address), &value) in &self.vars {
+            blob.extend([bank, address, value]);
+        }
+        blob
+    }
+
+    /// The value of a variable beyond the moment (0 unless a story step set bits in it).
+    pub fn var(&self, bank: u8, address: u8) -> u8 {
+        self.vars.get(&(bank, address)).copied().unwrap_or(0)
+    }
+
+    /// The variables beyond the moment that are not 0, as `((bank, address), value)`.
+    pub fn vars(&self) -> impl Iterator<Item = ((u8, u8), u8)> + '_ {
+        self.vars.iter().map(|(&key, &value)| (key, value))
+    }
+
+    /// Turn bit `bit` of the tracked variable `bank`/`address` on or off. `true` when that changed the state
+    /// (`false`: the bit was already so, the variable or the bit is not one the model carries, or the blob
+    /// would hold more than [`MAX_STORY_VARS`] variables).
+    pub fn set_bit(&mut self, bank: u8, address: u8, bit: u8, on: bool) -> bool {
+        let Some(tracked) = tracked_var(bank, address) else { return false };
+        let Some(mask) = 1u8.checked_shl(u32::from(bit)).filter(|m| tracked.bits & m != 0) else { return false };
+        let old = self.var(bank, address);
+        let new = if on { old | mask } else { old & !mask };
+        if new == old {
+            return false;
+        }
+        if new == 0 {
+            self.vars.remove(&(bank, address));
+        } else if self.vars.contains_key(&(bank, address)) || self.vars.len() < MAX_STORY_VARS {
+            self.vars.insert((bank, address), new);
+        } else {
+            return false;
+        }
+        true
+    }
+
+    /// The byte at `bank`/`address` when the model knows all of it: the moment's two bytes, or a tracked
+    /// variable whose every bit is carried. `None` for anything else (what a guard that reads it cannot decide).
+    pub fn known_byte(&self, bank: u8, address: u8) -> Option<u8> {
+        if bank == MOMENT_BANK {
+            let [lo, hi] = self.moment.to_le_bytes();
+            return match address {
+                MOMENT_ADDRESS => Some(lo),
+                a if a == MOMENT_ADDRESS.wrapping_add(1) => Some(hi),
+                _ => None,
+            };
+        }
+        (tracked_var(bank, address)?.bits == 0xFF).then(|| self.var(bank, address))
+    }
+
+    /// The little-endian word at `bank`/`address` when the model knows both its bytes.
+    pub fn known_word(&self, bank: u8, address: u8) -> Option<u16> {
+        Some(u16::from_le_bytes([self.known_byte(bank, address)?, self.known_byte(bank, address.checked_add(1)?)?]))
+    }
+
+    /// Whether bit `bit` (0 to 7) of the byte at `bank`/`address` is set, when the model carries that bit
+    /// (the moment's bytes, or a bit of a tracked variable); `None` otherwise.
+    pub fn known_bit(&self, bank: u8, address: u8, bit: u8) -> Option<bool> {
+        let mask = 1u8.checked_shl(u32::from(bit))?;
+        if bank == MOMENT_BANK {
+            return self.known_byte(bank, address).map(|b| b & mask != 0);
+        }
+        (tracked_var(bank, address)?.bits & mask != 0).then(|| self.var(bank, address) & mask != 0)
+    }
+
+    /// The least story that has everything either of the two has: the further moment, the union of the bits.
+    /// What [`merge_progression`] stores. (A tracked bit only ever goes on: the one write that clears one is
+    /// not a story point.)
+    fn join(&self, other: &Self) -> Self {
+        let mut joined = self.clone();
+        joined.moment = self.moment.max(other.moment);
+        for (&key, &value) in &other.vars {
+            let merged = joined.vars.get(&key).copied().unwrap_or(0) | value;
+            if joined.vars.contains_key(&key) || joined.vars.len() < MAX_STORY_VARS {
+                joined.vars.insert(key, merged);
+            }
+        }
+        joined
     }
 }
 
@@ -180,7 +363,7 @@ pub const CANON_PARTIES: &[CanonParty] = &[CanonParty { from_moment: 0, members:
 
 /// The canon party of a story state ([`CANON_PARTIES`]): the row with the greatest `from_moment` that is not past
 /// the moment. Cloud and Barret in every row there is today.
-pub fn canon_party(state: StoryState) -> Vec<u8> {
+pub fn canon_party(state: &StoryState) -> Vec<u8> {
     CANON_PARTIES
         .iter()
         .rev()
@@ -192,38 +375,42 @@ pub fn canon_party(state: StoryState) -> Vec<u8> {
 /// the party of the state it records, and, for a blob that cannot be read (never interpreted or advanced), the
 /// new game's own party.
 pub fn canon_party_of(progress: &[u8]) -> Vec<u8> {
-    canon_party(StoryState::decode(progress).unwrap_or_else(StoryState::new_game))
+    canon_party(&StoryState::decode(progress).unwrap_or_else(StoryState::new_game))
 }
 
 /// The dialogue lane's source of story variables (`StoryVars`) for an account: `Var[2][0]` is its moment
-/// (the word at bank 2, address 0: low byte first), every other variable is 0 as in a new game, and the
-/// party is the story's canon party ([`canon_party`]) whatever the player's own character is. So
-/// a conversation reads the player's OWN story, whichever character the player looks like:
-/// `talk.set_story(Box::new(move || Box::new(state)))` with `state` decoded from the progression the
-/// server told this client (`fmv-client`'s `StoryMirror::progress`).
+/// (the word at bank 2, address 0: low byte first), the tracked variables ([`TRACKED_VARS`]) are what the story
+/// has set in them, every other variable is 0 as in a new game, and the party is the story's canon party
+/// ([`canon_party`]) whatever the player's own character is. So a conversation reads the player's OWN story,
+/// whichever character the player looks like: `talk.set_story(Box::new(move || Box::new(state.clone())))` with
+/// `state` decoded from the progression the server told this client (`fmv-client`'s `StoryMirror::progress`).
 impl StoryVars for StoryState {
     fn byte(&self, bank: u8, address: u8) -> u8 {
         let [lo, hi] = self.moment.to_le_bytes();
         match (bank, address) {
             (MOMENT_BANK, MOMENT_ADDRESS) => lo,
             (MOMENT_BANK, a) if a == MOMENT_ADDRESS.wrapping_add(1) => hi,
-            _ => 0,
+            _ => self.var(bank, address),
         }
     }
 
     fn party_member(&self, slot: u8) -> Option<u8> {
-        canon_party(*self).get(usize::from(slot)).copied()
+        canon_party(self).get(usize::from(slot)).copied()
     }
 }
 
-/// The progression to store when `advanced` is saved over `stored`: whichever records the further
-/// moment, so that a story never goes back and a late save cannot undo a later one. A `stored` blob
-/// that cannot be read stays as it is (it is never overwritten), and so does one when `advanced`
-/// cannot be read.
+/// The progression to store when `advanced` is saved over `stored`: the join of the two (the further moment, the
+/// union of the set variable bits), so that a story never goes back and a late save cannot undo a later one. The
+/// stored bytes come back exactly as they were when the join adds nothing to them (a new account's empty blob
+/// stays empty under an equal story). A `stored` blob that cannot be read stays as it is (it is never
+/// overwritten), and so does one when `advanced` cannot be read.
 pub fn merge_progression(stored: &[u8], advanced: &[u8]) -> Vec<u8> {
-    match (StoryState::decode(stored), StoryState::decode(advanced)) {
-        (Some(s), Some(a)) if a.moment > s.moment => advanced.to_vec(),
-        _ => stored.to_vec(),
+    let (Some(kept), Some(newer)) = (StoryState::decode(stored), StoryState::decode(advanced)) else { return stored.to_vec() };
+    let joined = kept.join(&newer);
+    if joined == kept {
+        stored.to_vec()
+    } else {
+        joined.encode()
     }
 }
 
@@ -334,15 +521,6 @@ fn moment_compare(ins: &Instruction) -> Option<(Cmp, i32)> {
     }
 }
 
-/// `(variable, literal)` of a `SETBYTE`/`SETWORD` of a variable with a literal.
-fn literal_set(ins: &Instruction) -> Option<((u8, u8), i32)> {
-    if !matches!(ins.mnemonic, "SETBYTE" | "SETWORD") {
-        return None;
-    }
-    let (var, value) = (ins.operand("var")?, ins.operand("value")?);
-    (var.bank != 0 && value.bank == 0).then(|| (var_of(var), value.value))
-}
-
 /// The jumps before `list[k]` that skip over it when taken: the forward jumps whose target lies
 /// beyond it. Instruction `k` runs only if every one of them did NOT jump.
 fn guards_of(list: &[Instruction], k: usize) -> Vec<&Instruction> {
@@ -354,30 +532,156 @@ fn guards_of(list: &[Instruction], k: usize) -> Vec<&Instruction> {
         .collect()
 }
 
+/// A condition on the story that a script puts around a write: what the model can judge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cond {
+    /// `moment <cmp> literal`.
+    Moment(Cmp, i32),
+    /// Bit `bit` of the tracked variable is `set` (or clear).
+    Bit { bank: u8, address: u8, bit: u8, set: bool },
+}
+
+impl Cond {
+    fn holds(self, state: &StoryState) -> bool {
+        match self {
+            Self::Moment(cmp, literal) => cmp.holds(state.moment, literal),
+            Self::Bit { bank, address, bit, set } => state.known_bit(bank, address, bit) == Some(set),
+        }
+    }
+
+    /// The comparison without the name of what is compared (`==1`), for a point whose conditions are all moments.
+    fn short(self) -> String {
+        match self {
+            Self::Moment(cmp, literal) => format!("{}{literal}", cmp.symbol()),
+            Self::Bit { .. } => self.full(),
+        }
+    }
+
+    fn full(self) -> String {
+        match self {
+            Self::Moment(cmp, literal) => format!("moment {}{literal}", cmp.symbol()),
+            Self::Bit { bank, address, bit, set } => format!("Var[{bank}][{address}] bit {bit} {}", if set { "set" } else { "clear" }),
+        }
+    }
+}
+
+/// What a script writes that the model carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Op {
+    /// `Var[2][0] = n`.
+    Moment(u16),
+    /// `BITON` / `BITOFF` of a bit of a tracked variable.
+    Bit { bank: u8, address: u8, bit: u8, on: bool },
+}
+
+impl Op {
+    fn text(self) -> String {
+        match self {
+            Self::Moment(n) => n.to_string(),
+            Self::Bit { bank, address, bit, on } => format!("Var[{bank}][{address}] bit {bit} {}", if on { "on" } else { "off" }),
+        }
+    }
+}
+
+/// One write of a story point, under the conditions the script puts around it besides the point's own.
+#[derive(Debug, Clone, PartialEq)]
+struct Effect {
+    requires: Vec<Cond>,
+    op: Op,
+}
+
+/// Where a story point is.
+#[derive(Debug, Clone, PartialEq)]
+enum Trigger {
+    /// The player's character stands on this walkmesh triangle (the script may also want OK pressed there).
+    Triangle { triangle: usize, corners: [Pos; 3], wants_ok: bool },
+    /// The player walks onto this line.
+    Line { a: Pos, b: Pos },
+    /// The player comes to stand in the area.
+    Enter,
+}
+
 /// One story point as the script defines it (see the module docs).
 #[derive(Debug, Clone, PartialEq)]
 struct PointDef {
-    /// The walkmesh triangle that is the region.
-    triangle: usize,
-    corners: [Pos; 3],
-    /// The comparisons of the counter that must all hold.
-    requires: Vec<(Cmp, i32)>,
-    /// What the counter is set to.
-    sets: u16,
+    trigger: Trigger,
+    /// The conditions every one of the writes needs.
+    requires: Vec<Cond>,
+    /// The writes, in the order the script makes them.
+    effects: Vec<Effect>,
     /// A `BATTLE` the script starts right after (not run by the server).
     battle: Option<u16>,
 }
 
 impl PointDef {
-    fn applies_to(&self, moment: u16) -> bool {
-        self.sets > moment && self.requires.iter().all(|&(cmp, literal)| cmp.holds(moment, literal))
+    /// The story after reaching this point with `state`, or `None` when it does not apply: the point's conditions
+    /// fail, or the writes whose own conditions hold do not move the story forward (the moment up, a bit on).
+    /// Every write is judged on `state`, not on what an earlier write of the point did.
+    fn apply(&self, state: &StoryState) -> Option<StoryState> {
+        if !self.requires.iter().all(|c| c.holds(state)) {
+            return None;
+        }
+        let mut next = state.clone();
+        let mut forward = false;
+        for effect in self.effects.iter().filter(|e| e.requires.iter().all(|c| c.holds(state))) {
+            match effect.op {
+                Op::Moment(n) if n > next.moment => {
+                    next.moment = n;
+                    forward = true;
+                }
+                Op::Moment(_) => {}
+                Op::Bit { bank, address, bit, on } => forward |= next.set_bit(bank, address, bit, on) && on,
+            }
+        }
+        forward.then_some(next)
     }
 
     fn label(&self) -> String {
-        let when: Vec<String> = self.requires.iter().map(|&(cmp, literal)| format!("{}{literal}", cmp.symbol())).collect();
+        let place = match &self.trigger {
+            Trigger::Triangle { triangle, wants_ok, .. } => format!("triangle {triangle}{}", if *wants_ok { " (OK)" } else { "" }),
+            Trigger::Line { .. } => "line".to_string(),
+            Trigger::Enter => "entry".to_string(),
+        };
         let battle = self.battle.map_or(String::new(), |b| format!(" (the script then starts battle {b}, which the server does not run)"));
-        format!("triangle {}: moment {} -> {}{battle}", self.triangle, when.join(" and "), self.sets)
+        let effects: Vec<String> = self
+            .effects
+            .iter()
+            .map(|e| {
+                let conds: Vec<Cond> = self.requires.iter().chain(&e.requires).copied().collect();
+                let when = if conds.iter().all(|c| matches!(c, Cond::Moment(..))) {
+                    format!("moment {}", conds.iter().map(|c| c.short()).collect::<Vec<_>>().join(" and "))
+                } else {
+                    conds.iter().map(|c| c.full()).collect::<Vec<_>>().join(" and ")
+                };
+                format!("{when} -> {}", e.op.text())
+            })
+            .collect();
+        format!("{place}: {}{battle}", effects.join("; "))
     }
+
+    fn story_trigger(&self) -> StoryTrigger {
+        match &self.trigger {
+            Trigger::Triangle { corners, .. } => StoryTrigger::Region(corners.to_vec()),
+            Trigger::Line { a, b } => StoryTrigger::Line(*a, *b),
+            Trigger::Enter => StoryTrigger::Enter,
+        }
+    }
+}
+
+/// What changed between two states, as `key=value` words without spaces (`moment=1->6`, `var1.225=0->1`).
+fn summary(before: &StoryState, after: &StoryState) -> String {
+    let mut words = Vec::new();
+    if before.moment != after.moment {
+        words.push(format!("moment={}->{}", before.moment, after.moment));
+    }
+    let keys: BTreeSet<(u8, u8)> = before.vars.keys().chain(after.vars.keys()).copied().collect();
+    for (bank, address) in keys {
+        let (was, is) = (before.var(bank, address), after.var(bank, address));
+        if was != is {
+            words.push(format!("var{bank}.{address}={was}->{is}"));
+        }
+    }
+    words.join(" ")
 }
 
 /// What one field's scripts say about the story: the intervals of the counter that make its phases,
@@ -408,11 +712,7 @@ impl AreaStory {
                 }
             }
         }
-        let players: BTreeSet<usize> = script.player_entities().into_iter().map(|(entity, _)| entity).collect();
-        let mut points = Vec::new();
-        for entity in 0..script.entity_count() {
-            entity_points(script, entity, &players, mesh, &mut points);
-        }
+        let mut points = scan::scan_points(script, mesh);
         points.truncate(MAX_STORY_POINTS);
         Self { edges: edges.into_iter().collect(), points }
     }
@@ -434,16 +734,13 @@ impl AreaStory {
         Some(PhaseKey(vec![PHASE_TAG, lo, hi]))
     }
 
-    /// The story points, `id` being the index.
+    /// The story points, `id` being the index: the walkmesh triangles first, then the lines, then the
+    /// entry points (each in the order of the entities and their scripts).
     pub fn points(&self) -> Vec<StoryPoint> {
         self.points
             .iter()
             .enumerate()
-            .map(|(i, p)| StoryPoint {
-                id: u32::try_from(i).unwrap_or(u32::MAX),
-                trigger: StoryTrigger::Region(p.corners.to_vec()),
-                label: p.label(),
-            })
+            .map(|(i, p)| StoryPoint { id: u32::try_from(i).unwrap_or(u32::MAX), trigger: p.story_trigger(), label: p.label() })
             .collect()
     }
 
@@ -451,10 +748,8 @@ impl AreaStory {
     pub fn advance(&self, blob: &[u8], id: u32) -> Option<StoryStep> {
         let state = StoryState::decode(blob)?;
         let point = self.points.get(usize::try_from(id).ok()?)?;
-        point.applies_to(state.moment).then(|| StoryStep {
-            progress: StoryState { moment: point.sets }.encode(),
-            summary: format!("moment={}->{}", state.moment, point.sets),
-        })
+        let next = point.apply(&state)?;
+        Some(StoryStep { summary: summary(&state, &next), progress: next.encode() })
     }
 
     /// The first moment of every interval after the first (for tests and surveys).
@@ -468,381 +763,5 @@ impl AreaStory {
     }
 }
 
-/// The story points of one entity's script 0 (see the module docs for the pattern).
-fn entity_points(script: &FieldScript, entity: usize, players: &BTreeSet<usize>, mesh: &Walkmesh, out: &mut Vec<PointDef>) {
-    let Ok(listing) = script.disassemble_partial(entity, INIT_SCRIPT) else { return };
-    let code = listing.instructions.as_slice();
-    let Some(first_ret) = code.iter().position(|i| i.opcode == 0x00) else { return };
-    let init = code.get(..first_ret).unwrap_or(&[]);
-    let main = code.get(first_ret + 1..).unwrap_or(&[]);
-
-    // What the init part sets to a literal on every path.
-    let mut constants: BTreeMap<(u8, u8), i32> = BTreeMap::new();
-    for (k, ins) in init.iter().enumerate() {
-        if let Some((var, value)) = literal_set(ins) {
-            if guards_of(init, k).is_empty() {
-                constants.insert(var, value);
-            }
-        }
-    }
-
-    // Variables that hold the triangle of an entity, as the loop reads them.
-    let mut triangle_vars: BTreeMap<(u8, u8), usize> = BTreeMap::new();
-    for (k, ins) in main.iter().enumerate() {
-        if ins.mnemonic == "GETAI" {
-            if let (Some(target), Some(var)) = (ins.literal("entity"), ins.operand("var_triangle")) {
-                if let (Ok(target), true) = (usize::try_from(target), var.bank != 0) {
-                    triangle_vars.insert(var_of(var), target);
-                }
-            }
-            continue;
-        }
-        let Some((var, value)) = literal_set(ins) else { continue };
-        if var != (MOMENT_BANK, MOMENT_ADDRESS) {
-            continue;
-        }
-        if let Some(point) = point_at(main, k, value, &constants, &triangle_vars, players, mesh) {
-            out.push(point);
-        }
-    }
-}
-
-/// The story point that the `SETWORD`/`SETBYTE` `main[k]` of the counter (to `value`) makes, if
-/// every jump that can skip it is understood and it is a step onto a triangle.
-fn point_at(
-    main: &[Instruction],
-    k: usize,
-    value: i32,
-    constants: &BTreeMap<(u8, u8), i32>,
-    triangle_vars: &BTreeMap<(u8, u8), usize>,
-    players: &BTreeSet<usize>,
-    mesh: &Walkmesh,
-) -> Option<PointDef> {
-    let sets = u16::try_from(value).ok()?;
-    let guards = guards_of(main, k);
-    let mut triangle: Option<(usize, usize)> = None;
-    let mut requires = Vec::new();
-    for guard in &guards {
-        if let Some(compare) = moment_compare(guard) {
-            requires.push(compare);
-        } else {
-            // A jump the server cannot judge makes the whole write no point.
-            let found = triangle_guard(guard, constants, triangle_vars)?;
-            if triangle.replace(found).is_some() {
-                return None; // two region tests: not the pattern
-            }
-        }
-    }
-    let (triangle, entity) = triangle?;
-    if requires.is_empty() || !players.contains(&entity) {
-        return None;
-    }
-    let verts = mesh.triangles.get(triangle)?;
-    let corner = |i: usize| verts.get(i).map(|v| Pos::new(f32::from(v.x), f32::from(v.y), f32::from(v.z)));
-    let corners = [corner(0)?, corner(1)?, corner(2)?];
-    // A battle the script starts inside the same guarded block, before the nearest guard's target.
-    let block_end = guards.iter().filter_map(|g| g.jump_target).min();
-    let battle = main
-        .iter()
-        .skip(k + 1)
-        .take_while(|i| block_end.is_none_or(|end| i.offset < end))
-        .find(|i| i.mnemonic == "BATTLE")
-        .and_then(|i| i.literal("battle"))
-        .and_then(|b| u16::try_from(b).ok());
-    Some(PointDef { triangle, corners, requires, sets, battle })
-}
-
-/// `(triangle, entity)` when `guard` tests that a variable filled with the triangle of `entity` equals
-/// a variable the init part set to a literal.
-fn triangle_guard(
-    guard: &Instruction,
-    constants: &BTreeMap<(u8, u8), i32>,
-    triangle_vars: &BTreeMap<(u8, u8), usize>,
-) -> Option<(usize, usize)> {
-    let (left, right, op) = compare_parts(guard)?;
-    if op != Cmp::Eq || left.bank == 0 || right.bank == 0 {
-        return None;
-    }
-    let pick = |tri: (u8, u8), constant: (u8, u8)| Some((usize::try_from(*constants.get(&constant)?).ok()?, *triangle_vars.get(&tri)?));
-    let (l, r) = (var_of(left), var_of(right));
-    pick(l, r).or_else(|| pick(r, l))
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::field::Vertex;
-    use crate::script::dialogue::StartOfGame;
-    use crate::script::synth::SynthScript;
-
-    // ---- a tiny assembler for the opcodes the story reads ----
-
-    fn ret() -> Vec<u8> {
-        vec![0x00]
-    }
-    /// `SETWORD Var[bank][addr] = value`.
-    fn setword(bank: u8, addr: u8, value: i16) -> Vec<u8> {
-        let v = value.to_le_bytes();
-        vec![0x81, bank << 4, addr, v[0], v[1]]
-    }
-    /// `GETAI entity -> Var[bank][addr]`.
-    fn getai(entity: u8, bank: u8, addr: u8) -> Vec<u8> {
-        vec![0xB9, bank, entity, addr]
-    }
-    /// `IFSW Var[lb][la] <op> Var[rb][ra]` (a variable on each side); `jump` is counted from the jump
-    /// operand (the last byte) and taken when the comparison is false.
-    fn ifsw_vars(lb: u8, la: u8, rb: u8, ra: u8, op: u8, jump: u8) -> Vec<u8> {
-        vec![0x16, (lb << 4) | rb, la, 0, ra, 0, op, jump]
-    }
-    /// `IFSW Var[bank][addr] <op> literal`.
-    fn ifsw_lit(bank: u8, addr: u8, literal: i16, op: u8, jump: u8) -> Vec<u8> {
-        let l = literal.to_le_bytes();
-        vec![0x16, bank << 4, addr, 0, l[0], l[1], op, jump]
-    }
-    fn concat(parts: &[Vec<u8>]) -> Vec<u8> {
-        parts.concat()
-    }
-
-    /// `n` triangles side by side (triangle `i` at x = 100 i).
-    fn mesh(n: usize) -> Walkmesh {
-        let tri = |i: i16| {
-            let o = i * 100;
-            [Vertex { x: o, y: 0, z: 5 }, Vertex { x: o + 90, y: 0, z: 5 }, Vertex { x: o, y: 90, z: 5 }]
-        };
-        let count = i16::try_from(n).unwrap();
-        Walkmesh { triangles: (0..count).map(tri).collect(), access: vec![[0xFFFF; 3]; n] }
-    }
-
-    /// The first mission's pattern: `dir` runs the loop, `hero` is the entity it asks about and is
-    /// bound to the playable character `pc` (`None`: bound to none).
-    fn field_script(set_to: i16, moment_op: u8, moment_lit: i16, pc: Option<u8>) -> Vec<u8> {
-        // The loop: GETAI, two IFSW that skip to the JMPB at its end, the write, JMPB back to the top.
-        let tail = concat(&[setword(2, 0, set_to), vec![0xBF, 0x01]]); // SETWORD, then CC (any instruction)
-        let second = ifsw_lit(2, 0, moment_lit, moment_op, u8::try_from(tail.len() + 1).unwrap());
-        let first = ifsw_vars(6, 4, 6, 9, 0, u8::try_from(second.len() + tail.len() + 1).unwrap());
-        let top = getai(1, 6, 4);
-        let jmpb = vec![0x12, u8::try_from(top.len() + first.len() + second.len() + tail.len()).unwrap()];
-        let init = concat(&[setword(6, 9, 12), ret()]);
-        let director = concat(&[init, top, first, second, tail, jmpb]);
-        let hero = match pc {
-            Some(c) => concat(&[vec![0xA1, 0x00], vec![0xA0, c], ret()]),
-            None => concat(&[vec![0xA1, 0x00], ret()]),
-        };
-        SynthScript { model_count: 1, scale: 512, ..Default::default() }.entity("dir", vec![(0, director)]).entity("hero", vec![(0, hero)]).build()
-    }
-
-    fn scan(section: &[u8], mesh: &Walkmesh) -> AreaStory {
-        AreaStory::scan(&FieldScript::parse(section).unwrap(), mesh)
-    }
-
-    fn at(moment: u16) -> Vec<u8> {
-        StoryState { moment }.encode()
-    }
-
-    // ---- the blob ----
-
-    #[test]
-    fn the_empty_blob_is_a_new_account_and_a_stored_moment_round_trips() {
-        assert_eq!(StoryState::decode(&[]), Some(StoryState::new_game()));
-        assert_eq!(StoryState::new_game().moment, NEW_GAME_MOMENT);
-        for moment in [0u16, 1, 6, 255, 256, 1600, u16::MAX] {
-            let blob = at(moment);
-            assert_eq!(blob.len(), 3);
-            assert_eq!(StoryState::decode(&blob), Some(StoryState { moment }));
-        }
-        // What is not exactly version 1 is not read: other versions, other lengths, the old test blobs.
-        for bad in [&[7u8, 7][..], &[2, 1, 0], &[1, 1], &[1, 1, 0, 0], &[0], &[0xAB; 64]] {
-            assert_eq!(StoryState::decode(bad), None, "{bad:?}");
-        }
-    }
-
-    #[test]
-    fn an_accounts_story_is_the_dialogue_lanes_story_variables() {
-        // Var[2][0] is the moment as a little-endian word; everything else is a new game's.
-        for moment in [0u16, 1, 6, 255, 256, 1600, u16::MAX] {
-            let state = StoryState { moment };
-            let [lo, hi] = moment.to_le_bytes();
-            assert_eq!((state.byte(2, 0), state.byte(2, 1)), (lo, hi), "moment {moment}");
-            for (bank, address) in [(1u8, 0u8), (2, 2), (2, 255), (6, 0), (15, 32)] {
-                assert_eq!(state.byte(bank, address), 0, "bank {bank} address {address}");
-            }
-        }
-        let state = StoryState::new_game();
-        assert_eq!((0..3).map(|s| state.party_member(s)).collect::<Vec<_>>(), (0..3).map(|s| StartOfGame.party_member(s)).collect::<Vec<_>>());
-        assert_eq!(StoryState::decode(&[]).map(|s| s.byte(2, 0)), Some(1), "a new account reads moment 1");
-    }
-
-    /// The canon party table is a small contract: it covers every moment, ascends, and names at most three
-    /// distinct characters of the nine.
-    #[test]
-    fn the_canon_party_table_covers_every_moment_in_order() {
-        assert_eq!(CANON_PARTIES.first().map(|row| row.from_moment), Some(0), "every moment has a party");
-        assert!(CANON_PARTIES.windows(2).all(|w| w[0].from_moment < w[1].from_moment), "rows ascend by moment");
-        for row in CANON_PARTIES {
-            assert!(!row.members.is_empty() && row.members.len() <= 3, "{row:?}: FF7's party has three slots");
-            assert!(row.members.iter().all(|&c| c <= 8), "{row:?}: a character id");
-            let mut seen = row.members.to_vec();
-            seen.sort_unstable();
-            seen.dedup();
-            assert_eq!(seen.len(), row.members.len(), "{row:?}: nobody twice");
-        }
-        for moment in [0u16, 1, 6, 7, 255, 1600, u16::MAX] {
-            assert_eq!(canon_party(StoryState { moment }), vec![CLOUD, BARRET], "moment {moment}");
-        }
-    }
-
-    /// The first reactor mission is fought by Cloud and Barret, from the very start: the party the story has
-    /// always answered to a dialogue script's `IFPRTYQ`, for a new account (the empty blob), a stored moment and a
-    /// blob nobody can read.
-    #[test]
-    fn the_first_missions_canon_party_is_cloud_and_barret_for_every_blob() {
-        let stored = StoryState { moment: 6 }.encode();
-        let blobs: [&[u8]; 5] = [&[], &stored, &[9, 9], &[BLOB_VERSION, 1], &[2, 1, 0]];
-        for blob in blobs {
-            assert_eq!(canon_party_of(blob), vec![CLOUD, BARRET], "{blob:?}");
-        }
-        assert_eq!(
-            canon_party(StoryState::new_game()).iter().map(|&c| Some(c)).collect::<Vec<_>>(),
-            (0..2).map(|slot| StartOfGame.party_member(slot)).collect::<Vec<_>>(),
-            "the table agrees with the new game's party the dialogue lane has always used"
-        );
-        // A table row is what a later moment reads: the lookup takes the last row that has begun.
-        let state = StoryState { moment: 40 };
-        assert_eq!(canon_party(state), CANON_PARTIES.iter().rev().find(|r| r.from_moment <= 40).unwrap().members.to_vec());
-    }
-
-    #[test]
-    fn merging_keeps_the_further_moment_and_never_replaces_what_it_cannot_read() {
-        assert_eq!(merge_progression(&[], &at(6)), at(6), "a new account takes the advanced story");
-        assert_eq!(merge_progression(&at(6), &at(7)), at(7));
-        assert_eq!(merge_progression(&at(7), &at(6)), at(7), "a late, older save cannot take the story back");
-        assert_eq!(merge_progression(&at(6), &at(6)), at(6));
-        assert_eq!(merge_progression(&at(6), &[]), at(6), "the default is not further than anything");
-        assert_eq!(merge_progression(&[], &at(1)), Vec::<u8>::new(), "an equal story leaves the stored blob as it is");
-        assert_eq!(merge_progression(&[7, 7], &at(9)), vec![7, 7], "an unreadable record is never overwritten");
-        assert_eq!(merge_progression(&at(9), &[7, 7]), at(9));
-    }
-
-    // ---- phases ----
-
-    #[test]
-    fn the_intervals_between_the_literals_a_field_compares_are_its_phases() {
-        // `moment == 1` cuts the axis at 1 and 2: the intervals are [0,1) [1,2) [2,..)
-        let story = scan(&field_script(6, 0, 1, Some(0)), &mesh(13));
-        assert_eq!(story.edges(), [1, 2]);
-        let key = |m: u16| story.phase_key(&at(m));
-        assert_eq!(key(1), Some(PhaseKey::default()), "the interval of the new-game moment is the empty key");
-        assert_eq!(story.phase_key(&[]), Some(PhaseKey::default()), "a new account");
-        assert_eq!(key(0), Some(PhaseKey(vec![PHASE_TAG, 0, 0])));
-        assert_eq!(key(2), Some(PhaseKey(vec![PHASE_TAG, 2, 0])));
-        assert_eq!(key(6), key(2), "6 and 2 look the same to this field");
-        assert_eq!(key(9999), key(2));
-        assert_eq!(story.phase_key(&[7, 7]), None, "a blob that is not ours has no phase of ours");
-    }
-
-    #[test]
-    fn every_comparison_cuts_the_axis_where_its_answer_changes() {
-        for (op, lit, cuts) in [(0u8, 5i16, vec![5u16, 6]), (1, 5, vec![5, 6]), (2, 5, vec![6]), (3, 5, vec![5]), (4, 5, vec![5]), (5, 5, vec![6])] {
-            // a field with one comparison and nothing else
-            let code = concat(&[ifsw_lit(2, 0, lit, op, 1), ret()]);
-            let sec = SynthScript::default().entity("e", vec![(0, code)]).build();
-            let story = scan(&sec, &mesh(1));
-            assert_eq!(story.edges(), &cuts[..], "op {op}");
-            // and two moments share a phase exactly when the comparison answers the same for both
-            let cmp = Cmp::from_code(i32::from(op)).unwrap();
-            let key = |x: u16| story.phase_key(&at(x)).unwrap();
-            for m in 0..12u16 {
-                let same_answer = cmp.holds(m, i32::from(lit)) == cmp.holds(m + 1, i32::from(lit));
-                assert_eq!(key(m) == key(m + 1), same_answer, "op {op}, moments {m} and {}", m + 1);
-            }
-        }
-        // the literal on the left means the comparison from the other side: `5 < moment` is `moment > 5`
-        let flipped = vec![0x16, 0x02, 0x05, 0x00, 0x00, 0x00, 3, 1];
-        let sec = SynthScript::default().entity("e", vec![(0, concat(&[flipped, ret()]))]).build();
-        assert_eq!(scan(&sec, &mesh(1)).edges(), [6]);
-    }
-
-    #[test]
-    fn a_field_that_never_compares_the_counter_has_one_phase_for_everybody() {
-        let sec = SynthScript::default().entity("e", vec![(0, ret())]).build();
-        let story = scan(&sec, &mesh(1));
-        assert!(story.edges().is_empty() && story.point_count() == 0);
-        for blob in [vec![], at(0), at(900)] {
-            assert_eq!(story.phase_key(&blob), Some(PhaseKey::default()));
-        }
-    }
-
-    // ---- story points ----
-
-    #[test]
-    fn stepping_onto_the_triangle_of_the_loop_advances_a_player_whose_story_matches() {
-        let story = scan(&field_script(6, 0, 1, Some(0)), &mesh(13));
-        assert_eq!(story.point_count(), 1);
-        let points = story.points();
-        let point = points.first().unwrap();
-        assert_eq!(point.id, 0);
-        let StoryTrigger::Region(corners) = &point.trigger else { panic!("{point:?}") };
-        assert_eq!(corners.len(), 3);
-        assert_eq!((corners[0].x, corners[0].y), (1200.0, 0.0), "triangle 12 of the mesh");
-        assert!(point.label.contains("triangle 12") && point.label.contains("moment ==1 -> 6"), "{}", point.label);
-
-        // A new account (empty blob) is at the moment the point needs: it advances to 6.
-        let step = story.advance(&[], 0).expect("a new account advances");
-        assert_eq!(step.progress, at(6));
-        assert_eq!(step.summary, "moment=1->6");
-        // Once advanced it cannot do it again, and nobody at another moment can.
-        assert_eq!(story.advance(&step.progress, 0), None);
-        for m in [0u16, 2, 5, 6, 7, 1600] {
-            assert_eq!(story.advance(&at(m), 0), None, "moment {m}");
-        }
-        // An unknown point and an unreadable blob do nothing.
-        assert_eq!(story.advance(&[], 1), None);
-        assert_eq!(story.advance(&[7, 7], 0), None);
-    }
-
-    #[test]
-    fn a_lower_guard_such_as_less_than_works_the_same_and_a_story_never_goes_back() {
-        // `moment < 7 -> 7` (the shape of the next field of the first mission)
-        let story = scan(&field_script(7, 3, 7, Some(0)), &mesh(13));
-        assert_eq!(story.point_count(), 1);
-        assert_eq!(story.advance(&at(1), 0).unwrap().progress, at(7));
-        assert_eq!(story.advance(&at(6), 0).unwrap().summary, "moment=6->7");
-        assert_eq!(story.advance(&at(7), 0), None);
-        // A point whose value is not higher than the moment never lowers it, whatever the guard says.
-        let story = scan(&field_script(3, 3, 7, Some(0)), &mesh(13));
-        assert_eq!(story.advance(&at(5), 0), None, "5 -> 3 would be going back");
-        assert_eq!(story.advance(&at(1), 0).unwrap().progress, at(3));
-    }
-
-    #[test]
-    fn a_loop_that_is_not_the_pattern_makes_no_story_point() {
-        // the entity the loop asks about is not bound to a playable character
-        assert_eq!(scan(&field_script(6, 0, 1, None), &mesh(13)).point_count(), 0, "no PC: not the player");
-        // the triangle is not in the walkmesh
-        assert_eq!(scan(&field_script(6, 0, 1, Some(0)), &mesh(12)).point_count(), 0, "triangle 12 does not exist");
-        // a guard the server cannot judge (a bit test on the counter instead of a comparison)
-        assert_eq!(scan(&field_script(6, 6, 1, Some(0)), &mesh(13)).point_count(), 0);
-    }
-
-    #[test]
-    fn a_write_with_no_region_is_not_a_story_point_whatever_it_is_guarded_by() {
-        // main: IFSW Var[2][0] == 1 -> SETWORD Var[2][0] = 8 (the shape of a cutscene that just runs)
-        let tail = setword(2, 0, 8);
-        let guard = ifsw_lit(2, 0, 1, 0, u8::try_from(tail.len() + 1).unwrap());
-        let jmpb = vec![0x12, u8::try_from(guard.len() + tail.len()).unwrap()];
-        let code = concat(&[ret(), guard, tail, jmpb]);
-        let sec = SynthScript::default().entity("runner", vec![(0, code)]).build();
-        let story = scan(&sec, &mesh(13));
-        assert_eq!(story.point_count(), 0, "nothing the server can see decides it");
-        // ...but its comparison still shapes the phases
-        assert_eq!(story.edges(), [1, 2]);
-    }
-
-    #[test]
-    fn the_player_in_the_rule_is_any_playable_character_never_one_in_particular() {
-        // The entity the loop asks about may stand for any character at all: the rule is "the player".
-        for character in [0u8, 1, 5, 8, 10] {
-            assert_eq!(scan(&field_script(6, 0, 1, Some(character)), &mesh(13)).point_count(), 1, "character {character}");
-        }
-    }
-}
+mod tests;

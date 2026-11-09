@@ -13,9 +13,11 @@
 //! [`StoryBot`] walks to the story point of the area it stands in that would advance THIS player's
 //! story (the same points and the same rule the server uses, from the client's own copy of the field:
 //! `AreaRuntime::story_points` and `AreaRuntime::story_advance` on the progress it was told), and keeps
-//! to that spot until the server has moved the story. It never crosses an exit (that would take it to
-//! another area) and never walks off the walkable surface. The server decides, as always: the bot only
-//! walks where the data says the story happens.
+//! to that spot until the server has moved the story: a triangle or region it stands in, a line it walks
+//! across (it aims a little past the middle of the line, so that the move really crosses it). The points
+//! that fire when the player comes to stand in an area need no walking and are left to the server. It never
+//! crosses an exit (that would take it to another area) and never walks off the walkable surface. The
+//! server decides, as always: the bot only walks where the data says the story happens.
 
 use std::collections::VecDeque;
 
@@ -76,6 +78,12 @@ impl StoryMirror {
         fmv_ff7::story::StoryState::decode(&self.progress).map(|s| s.moment)
     }
 
+    /// The whole FF7 story state (the moment and the variables beyond it) for the dialogue lane, as the story model
+    /// reads the progress the server told us; `None` when the blob is not FF7's.
+    pub fn state(&self) -> Option<fmv_ff7::story::StoryState> {
+        fmv_ff7::story::StoryState::decode(&self.progress)
+    }
+
     /// Whether the server ever sent a `StoryUpdate` (a new account's session never gets one until it advances).
     #[cfg(test)]
     pub fn told(&self) -> bool {
@@ -104,6 +112,8 @@ impl StoryMirror {
 pub const INVITE_WAIT_S: f64 = 15.0;
 /// How far from the middle of the region a bot that is standing in it steps to touch it again.
 const NUDGE: f32 = 12.0;
+/// How far past a line the bot aims, tried in this order until one of them is walkable.
+const LINE_OVERSHOOTS: [f32; 4] = [24.0, 12.0, 6.0, 3.0];
 /// Headings tried in a step, as degrees away from the straight line to the goal, best first.
 const FANOUT_DEG: [f32; 11] = [0.0, 15.0, -15.0, 30.0, -30.0, 45.0, -45.0, 60.0, -60.0, 90.0, -90.0];
 /// Steps without headway after which the bot gives up (at 100 steps per second: 5 s).
@@ -147,6 +157,17 @@ impl StoryBot {
         self.requested
     }
 
+    /// The session entered another area: what the bot learned about the last one (a plan, how long it was stuck,
+    /// that it gave up) is of no use in this one. A bot that travels meets a new area's story points with a clean
+    /// slate; one stuck moment in a field must not turn the story off for the rest of the run.
+    pub fn arrived(&mut self) {
+        self.plan = None;
+        self.plan_cooldown = 0;
+        self.stuck = 0;
+        self.gave_up = None;
+        self.nudges = 0;
+    }
+
     pub fn gave_up(&self) -> Option<&str> {
         self.gave_up.as_deref()
     }
@@ -157,13 +178,40 @@ impl StoryBot {
         self.requested && self.gave_up.is_none() && !(self.wait_for_invite && !invited && now < INVITE_WAIT_S)
     }
 
-    /// The region point of `area` that would advance an account whose progress is `progress`, nearest
-    /// to `from` first.
+    /// The point of `area` that the bot can walk to (a region, a line) and that would advance an account whose
+    /// progress is `progress`, nearest to `from` first.
     fn target(area: &dyn AreaRuntime, progress: &[u8], from: Pos) -> Option<StoryPoint> {
         area.story_points()
             .into_iter()
-            .filter(|p| matches!(p.trigger, StoryTrigger::Region(_)) && area.story_advance(progress, p.id).is_some())
+            .filter(|p| matches!(p.trigger, StoryTrigger::Region(_) | StoryTrigger::Line(..)) && area.story_advance(progress, p.id).is_some())
             .min_by(|a, b| a.center().dist_xy(from).total_cmp(&b.center().dist_xy(from)))
+    }
+
+    /// Whether there is a story point to walk to that would advance `progress` (and the bot has not given up):
+    /// what a bot that also travels asks, to do the story of an area before it leaves it.
+    pub fn wants_to_walk(&self, area: &dyn AreaRuntime, progress: &[u8], from: Pos) -> bool {
+        self.requested && self.gave_up.is_none() && Self::target(area, progress, from).is_some()
+    }
+
+    /// Where to walk for `point`: the middle of a region, and for a line a point just past its middle on the side
+    /// the bot is not on, so that the step that gets there crosses it (a step that ended exactly on the line, or
+    /// short of it, would not).
+    fn goal(area: &dyn AreaRuntime, point: &StoryPoint, from: Pos) -> Pos {
+        let centre = point.center();
+        let StoryTrigger::Line(a, b) = &point.trigger else { return centre };
+        let (dx, dy) = (b.x - a.x, b.y - a.y);
+        let len = dx.hypot(dy);
+        if !(len.is_finite() && len > 1e-3) {
+            return centre;
+        }
+        // the unit normal of the line, and which side of it the bot stands on
+        let (nx, ny) = (-dy / len, dx / len);
+        let side = if (from.x - a.x) * nx + (from.y - a.y) * ny >= 0.0 { 1.0 } else { -1.0 };
+        LINE_OVERSHOOTS
+            .iter()
+            .map(|d| Pos::new(centre.x - side * nx * d, centre.y - side * ny * d, centre.z))
+            .find(|p| matches!(area.validate_move(*p, *p), MoveResult::Accepted(q) if q.is_finite() && q.dist_xy(*p) < 0.75))
+            .unwrap_or(centre)
     }
 
     /// Advance the bot by `dt` seconds from `cur` at `speed` units per second.
@@ -176,11 +224,11 @@ impl StoryBot {
         let Some(point) = Self::target(area, progress, cur) else { return still };
         let exits = area.exits();
         let len = speed * dt;
-        let centre = point.center();
+        let centre = Self::goal(area, &point, cur);
 
         // Standing in the region and the server has not advanced the story yet: touch it again by
         // stepping a little way and back (it judges every accepted move).
-        if point.is_hit_by(cur, cur) && cur.dist_xy(centre) < NUDGE * 2.0 {
+        if matches!(point.trigger, StoryTrigger::Region(_)) && point.is_hit_by(cur, cur) && cur.dist_xy(centre) < NUDGE * 2.0 {
             self.nudges += 1;
             // Forty steps one way, forty the other, and so on (the lowest bit of the count of forties).
             let sign = if (self.nudges / 40) & 1 == 0 { 1.0 } else { -1.0 };
@@ -338,6 +386,62 @@ mod tests {
         assert!(bot.gave_up().is_none());
         // It never crossed the hall's exit (x = 300) on the way.
         assert!(area.exits().iter().all(|e| !e.is_crossed_by(start, pos)));
+    }
+
+    #[test]
+    fn the_bot_crosses_a_story_line_by_aiming_past_its_middle_from_either_side() {
+        let area = RoomsAdapter::with_gates().load_area(HALL).unwrap();
+        let line = area.story_points().remove(1);
+        assert!(matches!(line.trigger, StoryTrigger::Line(..)), "the hall's second point is a line");
+        for start in [Pos::new(0.0, 100.0, 0.0), Pos::new(0.0, 260.0, 0.0)] {
+            // the line is the nearest point to either start (the region is 100 to 250 units away), and it is not a place to stand
+            assert!(StoryBot::target(area.as_ref(), &[], start).is_some_and(|p| p.id == 1), "{start:?}");
+            assert!(!line.is_hit_by(start, start));
+            let mut bot = StoryBot::new(true, false);
+            let mut pos = start;
+            let mut crossed = false;
+            for _ in 0..600 {
+                let step = bot.step(area.as_ref(), pos, 0.01, 600.0, &[]);
+                crossed |= line.is_hit_by(pos, step.pos);
+                if crossed {
+                    break;
+                }
+                pos = step.pos;
+            }
+            assert!(crossed, "a step from {pos:?} crossed the line (started at {start:?})");
+            assert!(bot.gave_up().is_none());
+        }
+        // the goal is just past the middle on the far side, and walkable
+        let goal = StoryBot::goal(area.as_ref(), &line, Pos::new(0.0, 100.0, 0.0));
+        assert!((goal.x, goal.y) == (0.0, 200.0 + 24.0), "{goal:?}");
+        let goal = StoryBot::goal(area.as_ref(), &line, Pos::new(0.0, 260.0, 0.0));
+        assert!((goal.x, goal.y) == (0.0, 200.0 - 24.0), "{goal:?}");
+        // a point that fires on entry is nothing to walk to
+        let yard = RoomsAdapter::with_gates().load_area(YARD).unwrap();
+        assert!(yard.story_points().iter().all(|p| p.is_on_entry()));
+        let bot = StoryBot::new(true, false);
+        assert!(!bot.wants_to_walk(yard.as_ref(), &[], Pos::new(-200.0, 0.0, 0.0)), "the server moves the story on entry");
+        assert!(bot.wants_to_walk(area.as_ref(), &[], Pos::new(0.0, 0.0, 0.0)));
+        assert!(!bot.wants_to_walk(area.as_ref(), STORY_ADVANCED, Pos::new(0.0, 0.0, 0.0)), "nothing applies to an advanced story");
+        assert!(!StoryBot::new(false, false).wants_to_walk(area.as_ref(), &[], Pos::new(0.0, 0.0, 0.0)), "a bot that was not asked to wants nothing");
+    }
+
+    #[test]
+    fn a_new_area_is_a_clean_slate_for_a_bot_that_gave_up_in_the_last_one() {
+        let area = RoomsAdapter::with_story().load_area(HALL).unwrap();
+        let mut bot = StoryBot::new(true, false);
+        let start = Pos::new(-100.0, 0.0, 0.0);
+        // make it give up: a bot that makes no headway for STUCK_LIMIT steps (a wall between it and the region)
+        bot.gave_up = Some("stuck on the way to a story point at (0, 0)".into());
+        bot.stuck = 7;
+        bot.nudges = 3;
+        bot.plan_cooldown = 50;
+        assert!(!bot.wants_to_walk(area.as_ref(), &[], start), "a bot that gave up wants nothing");
+        assert_eq!(walk(&mut bot, area.as_ref(), start, &[], 20), start, "and stands still");
+        bot.arrived();
+        assert!(bot.gave_up().is_none() && bot.stuck == 0 && bot.nudges == 0 && bot.plan_cooldown == 0 && bot.plan.is_none());
+        assert!(bot.wants_to_walk(area.as_ref(), &[], start), "in the next area it goes after the story again");
+        assert_ne!(walk(&mut bot, area.as_ref(), start, &[], 20), start);
     }
 
     #[test]

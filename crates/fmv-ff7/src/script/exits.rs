@@ -33,29 +33,27 @@
 //!   the owned data (10, 27, 33, ... 1 614), which fits a story progress counter; that reading
 //!   rests on the pattern only, not on a source this crate checked.
 //!
-//! Nothing is evaluated: the analysis is flow-insensitive within a script (it lists every
+//! Nothing is evaluated here (`crate::exit_gate` judges the guards): the analysis is flow-insensitive within a script (it lists every
 //! `MAPJUMP` the code contains, whether or not an earlier instruction would have returned), and the
 //! guards are the nesting of the code, not a proof that a branch can be taken. A root that contains
 //! no `MAPJUMP` on any chain simply produces nothing. The party-addressed requests (`PREQ`, `PRQSW`,
 //! `PRQEW`) are not followed (they name a party slot, not an entity), and a `MAPJUMP` that only such a
 //! call reaches is reported as an orphan.
 //!
-//! # Status: description only
+//! # Status: consumed by `crate::exit_gate`
 //!
-//! **This module only describes exits; nothing consults it at run time.** `Ff7FieldArea::exits()`
-//! (and so the server and the client bots) still reports gateways only, so a field whose way on is
-//! a `MAPJUMP` is a dead end in play. `ExitTrigger::is_walk_on` says which of them a walk could set
-//! off, and [`ExitGuard`] keeps what each depends on, so that a story layer can gate them; wiring
-//! them in is a separate step because of the open questions below.
+//! **The walk-on exits of this module are the area's exits** (`Ff7FieldArea::exits()` reports them after the gateways,
+//! each with its guards kept for `AreaRuntime::exit_state`; see `crate::exit_gate` for which are kept and how the
+//! guards are judged against an account's story). The rest stays description: talk and contact jumps, `[OK]` lines
+//! and the automatic jumps of a director or a timer are not walk-on exits and nothing offers them.
 //!
 //! * **One line, several destinations.** The script often picks the destination itself: the
 //!   elevator `elevtr1` has no gateway, one `LINE` (entity `jp0`, slot 3) and four `MAPJUMP`s under
 //!   `Var[1][225]` bit 0 (the `ele` entity's script sets it as part of its ride, so it reads as the
 //!   elevator's state) and `Var[2][0] < 33` (north or south reactor fields). The data hold 78 lines with two or more
-//!   different destinations. Static exits cannot tell them apart (the server takes the first of
-//!   several exits crossed at the same point, so the elevator would always lead back where the
-//!   player came from), and opening all of them would also open destinations that belong to later
-//!   story. That is a design decision for whoever owns the story state, not something to settle here.
+//!   different destinations. They are several exits on one line, and the server takes the first that is open for the
+//!   crossing player's story (`crate::exit_gate`), so a destination that belongs to later story stays closed
+//!   because its guards say so.
 //! * **What is a trigger.** Makou Reactor names a line entity's slots 1 to 6 `[OK]`, `Move`, `Move`,
 //!   `Go`, `Go 1x` and `Go away` (`GrpScript::scriptName`, <https://github.com/myst6re/makoureactor>).
 //!   *When* each runs is UNVERIFIED (nothing this crate could reach says). The data have jumps in
