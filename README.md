@@ -581,7 +581,13 @@ weakness, resistance, nullify, absorb and full-heal from `scene.bin`), and the e
 `scene.bin` attacks, chosen by their own AI scripts since protocol v11 (`fmv_ff7_battle::ai`: a bounded
 interpreter of the scripts, with counters after a blow, such as Guard Scorpion's tail-up Tail Laser; anything it
 cannot follow falls back, for that turn, to a uniform pick among the damaging attacks the enemy has the MP
-for). Spells: the magic materia a character's starting record equips, plus a
+for). A counter comes in the same message as the blow that provoked it, and the client plays the two **one after
+the other** (`scene::cue`: each performance of a batch begins when the one before it is over, so the Tail Laser is
+seen after the blow, its name comes up in the banner when it begins, its numbers land after the blow's, and the
+victory or defeat panel counts from the last performance that begins). `scripts/battle-smoke.sh --boss --build` fights the
+real Guard Scorpion (formation 324, level 8) with the canon pair and two bots and FAILS unless the server logged at
+least one Tail Laser counter (`counter battle=.. actor=.. attack=286`, and `counters=N` on the `battle ended` line),
+both bots counted the same ones and both replayed the whole battle, counters included, with 0 divergences. Spells: the magic materia a character's starting record equips, plus a
 starter grimoire every character is given (Restore, Fire, Ice and Lightning at level 1: Cure, Fire,
 Ice, Bolt), because on the Steam copy only Cloud and Red XIII start with magic materia. **The engine
 knows no inventory**: the server checks the account owns the item, submits the command and takes the
@@ -734,13 +740,15 @@ says which statuses AFFECT it (a set bit), so all ones is "immune to nothing" (2
 immunity (Haste and Slow share one). The starting party's grimoire has none of them, and the first mission's enemies
 inflict none, which is why a smoke run needs the debug aid below. Draws: an action without a status effect draws exactly
 what it did; one with a status draws one `below(63)` per target that still stands after its effects (`rules`, "RNG draw
-order"); Poison, Regen and the timers draw nothing.
+order"); the clocks of Poison, Regen and the timers draw nothing themselves (a scripted enemy that Poison kills answers with its
+Death counter, which draws as any counter does).
 
 *On the wire:* three events (`StatusInflicted`, `StatusEnded`, `StatusTick`), two refusals (`CannotAct`, `Silenced`) and
 one input, `BattleMember::status`: the statuses a member STARTS with (absent from the JSON when empty; a set the engine
 does not play, or Haste with Slow, or Sadness with Fury, is refused when the battle is built). *In the client:* the party panel
 and the enemy list tag each fighter with the statuses it has (`Psn`, `Slp`, `Sil`, ... in their colours, as many as the
-window has room for, then a `+N`), the ATB bar is cyan under Haste, violet under Slow and grey while held, the Magic row of
+window has room for, then a `+N` for the rest: at the default 1100 x 680 the party panel has two places, a code and the
+`+N` or both codes of a member with two, a long name giving up a cell or two for it), the ATB bar is cyan under Haste, violet under Slow and grey while held, the Magic row of
 the menu is greyed out while the character is silenced (with the reason under the cursor), the line under the status band
 says "You are asleep", the popups float a status's name and the turns of Poison, and in the 3D scene a poisoned body is
 tinted and pulses, a sleeper droops and is dim, and a stopped or paralysed one is grey and holds its idle frame.
@@ -750,8 +758,13 @@ of every battle start with those statuses; `scripts/battle-smoke.sh --status --b
 real field with it and FAILS unless the server announced every status, both bots' rosters and status notes agree and their
 counts of the status events are EXACTLY the server's, and both bots replayed the battle from their own data with 0
 divergences. *Not played:* Confusion, Berserk, Frog, Small, Petrify, Slow-numb, Reflect, Manipulate, Death Sentence and
-the rest (they decode and are ignored), armor protections, weapon status attacks, Sadness and Fury across battles, and a
-scripted enemy's status-only attack (still announced and nothing: only its damaging attacks inflict).
+the rest (they decode and are ignored), armor protections, weapon status attacks, and Sadness and Fury across battles.
+An enemy's script can queue an attack that has ONLY a status (44 of the 341 scripted enemies of the Steam copy do, checked by `ai_real_data`: a curse on
+the party, or a buff such as Barrier on itself or its own side): it is played wherever the script aims it, costs the enemy no MP
+(charging for it made some casters run dry and fall back to the plain behaviour for good: measured over every enemy of
+`scene.bin`), and the statuses it inflicts are in the status word the scripts read, so a script that casts a buff until it has
+it now stops. An enemy that Poison kills on the clock answers its death like one a blow kills: its Death counter runs in the
+same step (nobody struck it, so a counter that aims at the attacker finds nobody and is skipped).
 
 `md1stin`'s own encounter table (section 6 of the field file, Steam PC build): the first of its
 two 24-byte tables is the enabled one, with rate 128 (a roll succeeds with probability 128/1024)
@@ -1093,7 +1106,7 @@ crates/                  the Cargo workspace (see the table above)
 scripts/package.sh       build and package a release tarball (and dist/SHA256SUMS)
 scripts/ff-multiverse.sh the launcher entry point shipped in the package (docs/LAUNCHER.md)
 scripts/smoke.sh         two-bot local smoke test
-scripts/battle-smoke.sh  shared-battle smoke test (real data; modes --fixture --random --progress --commands --solo --status)
+scripts/battle-smoke.sh  shared-battle smoke test (real data; modes --fixture --random --progress --commands --solo --status --boss)
 scripts/travel-smoke.sh  walking between fields: two bots, md1stin -> md1_1 and back (real data); --chain: the first reactor mission
                          down to nmkin_3 with its real story, the lift ridden, the member following the leader
 scripts/phase-smoke.sh   story phasing: A advances md1stin's story and B does not, party, restart, persist (real data)
