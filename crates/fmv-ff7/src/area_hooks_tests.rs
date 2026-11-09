@@ -2,9 +2,11 @@
 //! adapter's public path (`load_field` / `load_area`), over small SYNTHETIC archives. Nothing
 //! here is game data; the scripts, names and numbers are invented.
 
-use crate::area::Ff7Adapter;
+use crate::area::{is_reviewed_field, Ff7Adapter, REVIEWED_FIELDS};
 use crate::area_content::{field_direction_to_facing, npc_spawns, npc_spawns_capped, MAX_NPC_LABEL_CHARS};
 use crate::field::FieldFile;
+use crate::script::synth::SynthScript;
+use crate::story::StoryState;
 use crate::testutil::{asm, build_lgp, maplist_bytes, pack_literals, script_section, FieldSpec, GatewaySpec, LoaderModelSpec};
 use fmv_adapter_api::{AdapterError, AreaRuntime, EncounterEntry, EncounterTable, ExitKind, GameAdapter, NpcSpawn};
 use fmv_core::{EditionProvenance, GameId, Platform, Pos, SourceRef};
@@ -680,4 +682,126 @@ fn hooks_are_additive_for_every_other_trait_method() {
     let area = a.load_area("f").unwrap();
     assert_eq!(area.walk_triangles().len(), 2);
     assert!(area.exits().is_empty() && area.npcs().is_empty() && area.encounters().is_none());
+}
+
+// ---------------------------------------------------------------------------------------
+// the story of a field that is not reviewed
+// ---------------------------------------------------------------------------------------
+
+/// `MAPJUMP` to maplist id `field`, arriving at (`x`, `y`) on `triangle`.
+fn mapjump(field: u16, x: i16, y: i16, triangle: i16, direction: u8) -> Vec<u8> {
+    let mut v = vec![0x60];
+    v.extend_from_slice(&field.to_le_bytes());
+    for c in [x, y, triangle] {
+        v.extend_from_slice(&c.to_le_bytes());
+    }
+    v.push(direction);
+    v
+}
+
+/// A `LINE` across x = `x` (z 5).
+fn line_at(x: i16) -> Vec<u8> {
+    let mut v = vec![0xD0];
+    for c in [x, -60, 5, x, 60, 5] {
+        v.extend_from_slice(&c.to_le_bytes());
+    }
+    v
+}
+
+/// The script section of a field with a story of its own: a walk-on line whose script jumps to maplist id 1 (no
+/// conditions), and a walker whose init part says `IFSW Var[2][0] < 5 -> SETWORD Var[2][0] = 5`, which the adapter reads
+/// as a story point that fires on entry. Invented, like every script here.
+fn story_section() -> Vec<u8> {
+    let setword = vec![0x81, 0x20, 0x00, 5, 0];
+    let guarded = [vec![0x16, 0x20, 0x00, 0x00, 5, 0, 3, 6], setword].concat();
+    let walker = [guarded, vec![0x00]].concat();
+    let hero = vec![0xA1, 0x00, 0xA0, 0x00, 0x00];
+    let jump = [mapjump(1, 50, 40, 1, 64), vec![0x00]].concat();
+    SynthScript { model_count: 1, scale: 512, ..Default::default() }
+        .entity("hero", vec![(0, hero)])
+        .entity("walker", vec![(0, walker)])
+        .entity("jp0", vec![(0, [line_at(-185), vec![0x00]].concat()), (3, jump)])
+        .build()
+}
+
+/// An archive with the same story field under a reviewed name and under a name nobody has reviewed; both have a
+/// gateway to `dest`.
+fn story_archive() -> Ff7Adapter {
+    let field = FieldSpec {
+        gateways: Some(vec![gateway([0, 0, 1], [0, 100, 2], [10, 20, 1], 1)]),
+        overrides: vec![(0, story_section())],
+        ..FieldSpec::default()
+    };
+    adapter_over(&[
+        ("maplist", maplist_bytes(&["zero", "dest"])),
+        ("md1stin", entry(&field)),
+        ("othrfld", entry(&field)),
+        ("dest", entry(&FieldSpec::default())),
+    ])
+}
+
+#[test]
+fn the_reviewed_list_is_the_first_reactor_mission_and_nothing_else() {
+    // (a change here is a review: see the list's docs and the real-data pin that lists what is left off)
+    assert_eq!(REVIEWED_FIELDS, ["md1stin", "md1_1", "md1_2", "nrthmk", "nmkin_1", "elevtr1", "nmkin_2", "nmkin_3"]);
+    assert!(REVIEWED_FIELDS.iter().all(|f| is_reviewed_field(f)));
+    assert!(is_reviewed_field("MD1STIN") && is_reviewed_field("Nmkin_3"), "the archive's spelling decides nothing");
+    for other in ["nmkin_4", "nmkin_5", "md8_1", "md8_4", "md1stin2", "md1stin ", "", "smkin_1"] {
+        assert!(!is_reviewed_field(other), "{other:?}");
+    }
+}
+
+#[test]
+fn script_exits_and_story_points_are_offered_in_a_reviewed_field_only() {
+    let a = story_archive();
+    let reviewed = a.load_field("md1stin").unwrap();
+    let other = a.load_field("othrfld").unwrap();
+
+    // the reviewed field: its gateway, the exit its line's script decides, and the point that fires on entry
+    let kinds: Vec<ExitKind> = reviewed.exits().iter().map(|e| e.kind).collect();
+    assert_eq!(kinds, [ExitKind::Gateway, ExitKind::Script { id: 0 }]);
+    assert_eq!(reviewed.story_points().len(), 1);
+    assert_eq!(reviewed.story_points()[0].label, "entry: moment <5 -> 5");
+    assert_eq!(reviewed.story_advance(&[], 0).expect("a new account takes the step").summary, "moment=1->5");
+    assert_eq!(reviewed.story_withheld(), None);
+
+    // the same field under a name nobody reviewed: the gateway exactly as before, nothing else of the story
+    let exits = other.exits();
+    assert_eq!(exits.len(), 1, "{exits:?}");
+    assert_eq!((exits[0].kind, exits[0].target.as_str()), (ExitKind::Gateway, "dest"));
+    assert_eq!(exits[0], reviewed.exits()[0], "the gateway is the reviewed field's own");
+    assert!(other.story_points().is_empty(), "its entry point does not fire");
+    assert_eq!(other.story_advance(&[], 0), None, "and no step is taken for a point that is not offered");
+    let left_off = other.story_withheld().expect("it says what it left off");
+    assert_eq!(left_off.reason, "unreviewed field");
+    assert_eq!(left_off.points, ["entry: moment <5 -> 5"]);
+    assert_eq!(left_off.exits, ["to dest when no conditions"]);
+
+    // its phases are untouched: the same intervals, the same keys
+    let blobs = [Vec::new(), StoryState::at(1).encode(), StoryState::at(5).encode(), StoryState::at(9).encode()];
+    for blob in &blobs {
+        assert_eq!(other.phase_key(blob), reviewed.phase_key(blob));
+    }
+    assert_ne!(other.phase_key(&blobs[2]), other.phase_key(&blobs[0]), "the field still has its phases");
+
+    // as the server loads it: through the trait object
+    let served = a.load_area("othrfld").unwrap();
+    assert!(served.story_points().is_empty() && served.story_withheld().is_some() && served.exits().len() == 1);
+    // the survey loads everything the data holds, whatever the field is called
+    let surveyed = a.survey_field("othrfld").unwrap();
+    assert_eq!(surveyed.exits().len(), 2);
+    assert_eq!(surveyed.story_points().len(), 1);
+    assert_eq!(surveyed.story_withheld(), None);
+    assert_eq!(surveyed.story_advance(&[], 0).map(|s| s.summary), Some("moment=1->5".to_string()));
+}
+
+#[test]
+fn a_field_with_no_story_leaves_nothing_off_whether_or_not_it_is_reviewed() {
+    let a = story_archive();
+    // `dest` has neither a script exit nor a point, and is not reviewed: there is nothing to say about it
+    let dest = a.load_field("dest").unwrap();
+    assert_eq!(dest.story_withheld(), None);
+    assert!(dest.story_points().is_empty());
+    // a reviewed field is never reported, with or without a story
+    assert_eq!(adapter_over(&[("md1stin", entry(&FieldSpec::default()))]).load_field("md1stin").unwrap().story_withheld(), None);
 }

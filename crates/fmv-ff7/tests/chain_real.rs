@@ -124,9 +124,10 @@ fn the_chain_is_gateways_and_the_lift_and_every_exit_is_open_or_closed_never_unj
     }
     let nmkin_5 = adapter.load_area("nmkin_5").unwrap();
     assert_eq!(nmkin_5.exits().iter().map(|e| e.target.as_str()).collect::<Vec<_>>(), ["nmkin_4"]);
-    // the timers' automatic jumps to nrthmk and the director's jump to md8_4 are nobody's walk-on exit
+    // the timers' automatic jumps to nrthmk and the director's jump to md8_4 are nobody's walk-on exit (nmkin_5 is not
+    // reviewed: what its data holds is read with the survey's loader)
     for field in ["md1_1", "nmkin_1", "elevtr1", "nmkin_2", "nmkin_5"] {
-        let area = adapter.load_area(field).unwrap();
+        let area = adapter.survey_field(field).unwrap();
         assert!(!area.exits().iter().any(|e| e.target == "nrthmk" && matches!(e.kind, ExitKind::Script { .. })), "{field}");
     }
 }
@@ -142,8 +143,13 @@ fn the_story_points_of_the_chain_are_the_ones_the_scripts_make() {
         StoryTrigger::Enter => "entry".to_string(),
         _ => "other".to_string(),
     };
+    // what the field's scripts say (every field is loaded with the survey's loader, so that nmkin_5, which is not one
+    // of the reviewed fields, shows what its data holds; what a server offers of it is the next test's)
     let points = |field: &str| -> Vec<(String, String)> {
-        adapter.load_area(field).unwrap().story_points().iter().map(|p| (kind(&p.trigger), p.label.clone())).collect()
+        let area = adapter.survey_field(field).unwrap();
+        let served = adapter.load_area(field).unwrap().story_points();
+        assert_eq!(served.is_empty(), !fmv_ff7::is_reviewed_field(field) || area.story_points().is_empty(), "{field}: a server offers the points of the reviewed fields only");
+        area.story_points().iter().map(|p| (kind(&p.trigger), p.label.clone())).collect()
     };
     let one = |trigger: &str, label: &str| vec![(trigger.to_string(), label.to_string())];
     assert_eq!(
@@ -216,7 +222,9 @@ fn walking_the_chain_moves_a_new_account_from_1_to_13_with_the_lift_down_and_tha
 }
 
 /// The numbers over the archive (what `examples/world_survey.rs --all` prints): how many exits the scripts add,
-/// how a new account's story judges them, and how many story points there are of each kind.
+/// how a new account's story judges them, and how many story points there are of each kind. This is what the DATA
+/// holds (every field loaded with the survey's loader); what a server offers is the reviewed fields' share of it
+/// (`the_fields_that_are_not_reviewed_offer_their_gateways_and_nothing_else_of_the_story`).
 #[test]
 #[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
 fn script_exits_and_story_points_of_the_archive_in_numbers() {
@@ -228,7 +236,7 @@ fn script_exits_and_story_points_of_the_archive_in_numbers() {
     let mut points: BTreeMap<String, usize> = BTreeMap::new();
     let (mut ok_points, mut fields_with_points) = (0usize, 0usize);
     for info in &areas {
-        let area = adapter.load_field(&info.id.key).unwrap();
+        let area = adapter.survey_field(&info.id.key).unwrap();
         let exits = area.exits();
         with_exits += usize::from(!exits.is_empty());
         let scripts: Vec<_> = exits.iter().filter(|e| matches!(e.kind, ExitKind::Script { .. })).collect();
@@ -261,6 +269,107 @@ fn script_exits_and_story_points_of_the_archive_in_numbers() {
     assert_eq!((with_exits, script, max_script, max_field.as_str()), (558, 917, 88, "move_f"));
     assert_eq!((open, closed, unjudged), (324, 56, 537));
     assert_eq!((points.get("region").copied(), points.get("line").copied(), points.get("entry").copied(), fields_with_points, ok_points), (Some(7), Some(20), Some(56), 66, 1));
+}
+
+/// The script exits of an area (the gateways are data and not counted).
+fn script_exit_count(area: &dyn AreaRuntime) -> usize {
+    area.exits().iter().filter(|e| matches!(e.kind, ExitKind::Script { .. })).count()
+}
+
+/// The gateways of an area.
+fn gateways(area: &dyn AreaRuntime) -> Vec<Exit> {
+    area.exits().into_iter().filter(|e| e.kind == ExitKind::Gateway).collect()
+}
+
+/// **The reviewed list** (`fmv_ff7::REVIEWED_FIELDS`). Only the eight fields of the mission offer their script exits and
+/// story points; every other field offers its gateways exactly as ever and leaves the rest off, saying what it left off
+/// and why. Over the whole archive: gateways are the same everywhere, a field that is not reviewed has no script exit
+/// and no point and no step a point could take for any story, its phases are what they were, and what it says it left
+/// off is exactly what its data holds. The data holds 917 script exits and 83 points; the eight fields offer 4 and 8
+/// of them (the lift's four exits and the mission's eight points), the other 274 fields that have any leave off 913 and 75.
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn the_fields_that_are_not_reviewed_offer_their_gateways_and_nothing_else_of_the_story() {
+    let Some(adapter) = adapter() else { return };
+    // (the list itself is pinned by `the_reviewed_list_is_the_first_reactor_mission_and_nothing_else` in the crate's own
+    // tests; a field that joins it changes the numbers asserted at the end, which is the review's last step)
+    let (mut offered, mut left_off, mut fields_left_off) = ((0usize, 0usize), (0usize, 0usize), 0usize);
+    let blobs = [Vec::new(), StoryState::at(13).encode(), StoryState::at(33).encode(), StoryState::at(120).encode()];
+    for info in adapter.list_areas() {
+        let key = info.id.key.as_str();
+        let served = adapter.load_area(key).unwrap();
+        let surveyed = adapter.survey_field(key).unwrap();
+        // gateways everywhere behave exactly as before
+        assert_eq!(gateways(served.as_ref()), gateways(&surveyed), "{key}: gateways");
+        // phases are not part of what is left off
+        for blob in &blobs {
+            assert_eq!(served.phase_key(blob), surveyed.phase_key(blob), "{key}: phases");
+        }
+        let (exits, points) = (script_exit_count(&surveyed), surveyed.story_points().len());
+        if fmv_ff7::is_reviewed_field(key) {
+            assert_eq!(served.exits(), surveyed.exits(), "{key}");
+            assert_eq!(served.story_points(), surveyed.story_points(), "{key}");
+            assert_eq!(served.story_withheld(), None, "{key}: a reviewed field leaves nothing off");
+            offered = (offered.0 + exits, offered.1 + points);
+        } else {
+            assert_eq!(script_exit_count(served.as_ref()), 0, "{key}: no script exit is offered");
+            assert!(served.story_points().is_empty(), "{key}: no story point is offered");
+            // no step either, whichever point and whichever story (a server only asks about the points it was told of)
+            for blob in &blobs {
+                for id in 0..8 {
+                    assert_eq!(served.story_advance(blob, id), None, "{key}: point {id}");
+                }
+            }
+            match served.story_withheld() {
+                Some(w) => {
+                    assert_eq!((w.reason.as_str(), w.exits.len(), w.points.len()), ("unreviewed field", exits, points), "{key}");
+                    left_off = (left_off.0 + exits, left_off.1 + points);
+                    fields_left_off += 1;
+                }
+                None => assert_eq!((exits, points), (0, 0), "{key}: it says nothing only when there was nothing to leave off"),
+            }
+        }
+    }
+    println!("offered by the reviewed fields: {offered:?} (script exits, points); left off in {fields_left_off} other fields: {left_off:?}");
+    assert_eq!(offered, (4, 8));
+    assert_eq!((left_off, fields_left_off), ((913, 75), 274));
+}
+
+/// The cases that matter, named: the entry point of a Sector 8 field that raises a story from 33 to 36 the moment a
+/// player stands there, the three points of the reactor's core, and the debug field with 88 script exits. A server
+/// offers none of them; the survey still sees them.
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn an_unreviewed_entry_point_does_not_fire_and_the_fields_beyond_the_mission_say_what_they_left_off() {
+    let Some(adapter) = adapter() else { return };
+    let at_33 = StoryState::at(33).encode();
+
+    // md8_1: one entry point, `moment ==33 -> 36`. The survey sees it and it would apply; the server's field has none
+    let surveyed = adapter.survey_field("md8_1").unwrap();
+    assert_eq!(surveyed.story_advance(&at_33, 0).map(|s| s.summary), Some("moment=33->36".to_string()), "the data holds it");
+    let served = adapter.load_area("md8_1").unwrap();
+    assert!(served.story_points().is_empty());
+    assert_eq!(served.story_advance(&at_33, 0), None, "a story at 33 stays at 33 in a field nobody has reviewed");
+    let w = served.story_withheld().expect("md8_1 leaves its point off");
+    assert_eq!((w.reason.as_str(), w.exits.len(), w.points.as_slice()), ("unreviewed field", 0, &["entry: moment ==33 -> 36".to_string()][..]));
+    assert_eq!(gateways(served.as_ref()).iter().map(|e| e.target.as_str()).collect::<Vec<_>>(), ["md8_2"], "its gateway is as ever");
+
+    // md8_4 (the field nrthmk's gateway leads to) has neither exits nor points: nothing is left off
+    let md8_4 = adapter.load_area("md8_4").unwrap();
+    assert_eq!(md8_4.story_withheld(), None);
+    assert_eq!(md8_4.exits().iter().map(|e| e.target.as_str()).collect::<Vec<_>>(), ["nrthmk"]);
+
+    // nmkin_5 (the reactor's core): three points, none offered; nmkin_4 has none to leave
+    let nmkin_5 = adapter.load_area("nmkin_5").unwrap();
+    assert!(nmkin_5.story_points().is_empty());
+    let w = nmkin_5.story_withheld().expect("nmkin_5 leaves its points off");
+    assert_eq!(w.points, ["triangle 2: moment <27 -> 27", "triangle 2: moment ==123 -> 127", "entry: moment ==120 -> 123"]);
+    assert_eq!(adapter.load_area("nmkin_4").unwrap().story_withheld(), None);
+
+    // move_f: 88 script exits, none offered, all named (the log lists the first few and counts the rest)
+    let move_f = adapter.load_area("move_f").unwrap();
+    assert_eq!(script_exit_count(move_f.as_ref()), 0);
+    assert_eq!(move_f.story_withheld().map(|w| (w.exits.len(), w.points.len())), Some((88, 0)));
 }
 
 /// The triangles of `mesh` that a walker standing on triangle `start` can get to: breadth first over the access words

@@ -330,6 +330,11 @@ impl World {
     pub fn with_party_config(area: Box<dyn AreaRuntime>, party: PartyConfig) -> Result<Self, ServerError> {
         let state = areas::AreaState::new(area, None)?;
         let home = state.key().clone();
+        let mut logs = DeferredLogs::default();
+        // (the entry area is not loaded through `ensure_area`, so what its adapter left off is said here)
+        if let Some(line) = state.withheld_line() {
+            logs.info(line);
+        }
         Ok(Self {
             areas: BTreeMap::from([(home.clone(), state)]),
             home,
@@ -346,7 +351,7 @@ impl World {
             epoch: Instant::now(),
             battle: None,
             saver: None,
-            logs: DeferredLogs::default(),
+            logs,
         })
     }
 

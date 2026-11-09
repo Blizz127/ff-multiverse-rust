@@ -103,6 +103,13 @@
 //! Advancing is monotone: a point applies only when its conditions hold for the player's current story **and**
 //! the story moves forward by it.
 //!
+//! **Only in the reviewed fields.** The scan reads every field, but the adapter offers a field's points (and its
+//! script exits) only if the field is one of [`crate::REVIEWED_FIELDS`], the eight of the first mission, each read
+//! case by case: a point raises a story for good, so an unreviewed script must not do it for a live account. In any
+//! other field [`AreaStory::withhold_points`] takes the points out (the phases stay) and
+//! [`fmv_adapter_api::AreaRuntime::story_withheld`] names them; the survey (`Ff7Adapter::survey_field`) still sees them
+//! all, which is how a field is reviewed before it is added to the list.
+//!
 //! # The canon party
 //!
 //! The moment also says who the STORY's party is ([`CANON_PARTIES`], [`canon_party`]): Cloud and Barret
@@ -750,6 +757,13 @@ impl AreaStory {
         let point = self.points.get(usize::try_from(id).ok()?)?;
         let next = point.apply(&state)?;
         Some(StoryStep { summary: summary(&state, &next), progress: next.encode() })
+    }
+
+    /// Take the story points away, keeping the phases (a field that is not on the adapter's list of reviewed
+    /// fields, `crate::REVIEWED_FIELDS`, offers no point): the labels of the points that were taken, in the order of
+    /// their ids.
+    pub fn withhold_points(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.points).iter().map(PointDef::label).collect()
     }
 
     /// The first moment of every interval after the first (for tests and surveys).

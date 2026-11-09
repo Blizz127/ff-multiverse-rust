@@ -164,7 +164,8 @@
 //!   is open for an account is [`AreaRuntime::exit_state`]: its guards are judged against the story the
 //!   progression records (`crate::exit_gate` has the rules: what is kept, what a guard may read, and that an
 //!   exit with a guard the model cannot judge stays closed). A `MAPJUMP` a talk or a director runs is not
-//!   a walk-on exit and is not offered.
+//!   a walk-on exit and is not offered. **Only in the [`REVIEWED_FIELDS`]**: any other field offers its gateways and
+//!   leaves its script exits (and its story points) off, and [`AreaRuntime::story_withheld`] says which.
 //! * [`AreaRuntime::place_arrival`]: an exit's `arrival_hint` is the index of the target walkmesh
 //!   triangle that holds the arrival point; where that triangle holds the point, the arrival
 //!   stands at the triangle's height there (the right floor of a layered field), otherwise the
@@ -185,7 +186,7 @@ use crate::story::{self, AreaStory};
 use crate::walk::{LinkReport, Route, Surface};
 use fmv_adapter_api::{
     AdapterError, AreaInfo, AreaRuntime, Bounds, EncounterTable, Exit, ExitKind, ExitState, GameAdapter, MoveResult, NpcSpawn, StoryPoint,
-    StoryStep,
+    StoryStep, StoryWithheld,
 };
 use fmv_core::{AreaId, EditionProvenance, Fingerprint, GameId, PhaseKey, Platform, Pos, ProvenanceSummary, SourceRef};
 use std::collections::HashSet;
@@ -202,6 +203,33 @@ pub const MAX_FIELD_BYTES: usize = 16 * 1024 * 1024;
 /// `flevel.lgp` is tens of MB). Entries past it are skipped, so a crafted archive whose
 /// entries all point at the same large body cannot make `list_areas` run for long.
 pub const MAX_INDEX_READ_BYTES: u64 = 512 * 1024 * 1024;
+
+/// The fields whose **script exits and story points are active**: the eight of the first reactor mission, from the
+/// station down to the stair after the lift, each reviewed case by case (every point's trigger, guards and effect
+/// read against the field's own script, and the conditions of every exit against what the story model can judge).
+/// Everywhere else the adapter offers what it always has: the field's gateways (data, always open) and its phases;
+/// its script exits and story points are left off ([`AreaRuntime::story_withheld`] names them, and the server logs
+/// them once per area, `unreviewed field`). A point raises an account's story for good (a story only moves forward)
+/// and an exit sends a party somewhere, so neither is switched on for a field nobody has looked at: the gateways
+/// already let a party walk out of the mission into other parts of the game.
+///
+/// **A field joins this list by review, not by a casual edit.** Read what it would offer with
+/// `cargo run -p fmv-ff7 --example world_survey -- <field>` (it loads fields with [`Ff7Adapter::survey_field`], which
+/// has everything on) and check each point and exit against the field's script
+/// (`--example script_dump`, `--example exits_dump`) and the part of the story it belongs to; pin the result with a
+/// real-data test beside `tests/chain_real.rs`; then add the name here. Two tests pin the list on purpose and are
+/// updated with it: `the_reviewed_list_is_the_first_reactor_mission_and_nothing_else` (the names) and, in
+/// `tests/chain_real.rs`, `the_fields_that_are_not_reviewed_offer_their_gateways_and_nothing_else_of_the_story` (how
+/// many script exits and story points the reviewed fields offer and the others leave off).
+pub const REVIEWED_FIELDS: [&str; 8] = ["md1stin", "md1_1", "md1_2", "nrthmk", "nmkin_1", "elevtr1", "nmkin_2", "nmkin_3"];
+
+/// Why a field's script exits and story points are left off (the `reason` of [`fmv_adapter_api::StoryWithheld`]).
+pub const UNREVIEWED_FIELD: &str = "unreviewed field";
+
+/// Is `field` (a key as the archive spells it) one of the [`REVIEWED_FIELDS`]?
+pub fn is_reviewed_field(field: &str) -> bool {
+    REVIEWED_FIELDS.iter().any(|f| f.eq_ignore_ascii_case(field))
+}
 
 /// PLACEHOLDER maximum movement speed in walkmesh units per second **for a field of scale 512**
 /// ([`crate::field::FIELD_SCALE_ONE`]; `Ff7FieldArea::max_speed` multiplies it by the field's own
@@ -466,14 +494,38 @@ impl Ff7Adapter {
     /// Loading also works out what the field's own data says about its surroundings (its gateway
     /// exits, NPCs and encounter table, see the module docs): a few milliseconds more than the
     /// walkmesh alone, plus, on the first load of an adapter, one read of the archive's `maplist`.
+    ///
+    /// The field's script exits and story points are offered only if it is one of the [`REVIEWED_FIELDS`]; for any
+    /// other they are left off and [`AreaRuntime::story_withheld`] says what they were.
     pub fn load_field(&self, key: &str) -> Result<Ff7FieldArea, AdapterError> {
+        self.load_field_as(key, false)
+    }
+
+    /// [`Ff7Adapter::load_field`] with the field's script exits and story points on **whether or not it is reviewed**:
+    /// what the archive holds, for surveys (`examples/world_survey.rs`) and the tests that count it. Never for serving
+    /// players: that is what [`REVIEWED_FIELDS`] is for.
+    pub fn survey_field(&self, key: &str) -> Result<Ff7FieldArea, AdapterError> {
+        self.load_field_as(key, true)
+    }
+
+    fn load_field_as(&self, key: &str, everything: bool) -> Result<Ff7FieldArea, AdapterError> {
         let loaded = self.load_validated(key)?;
         let info = self.info_for(&loaded.key, loaded.fingerprint);
+        let reviewed = everything || is_reviewed_field(&loaded.key);
         // After `load_validated` has let go of the archive: `maplist` and the exit targets lock it.
         let mut exits = self.gateway_exits(&loaded.field);
         let (script_exits, gates) = self.script_exits(&loaded.field);
-        exits.extend(script_exits);
-        Ok(Ff7FieldArea::new(info, loaded.field, loaded.walkmesh, loaded.surface, exits, gates))
+        // A field that is not reviewed keeps its gateways and says what it did not take: its script exits are neither
+        // offered nor judged.
+        let left_off: Option<Vec<String>> =
+            (!reviewed).then(|| script_exits.iter().zip(&gates).map(|(e, gate)| format!("to {} when {}", e.target, gate.conditions())).collect());
+        let gates = if reviewed {
+            exits.extend(script_exits);
+            gates
+        } else {
+            Vec::new()
+        };
+        Ok(Ff7FieldArea::new(info, loaded.field, loaded.walkmesh, loaded.surface, exits, gates, left_off))
     }
 
     /// The archive's name list, read and parsed once per adapter. `None` when the archive has no
@@ -687,8 +739,11 @@ pub struct Ff7FieldArea {
     /// The random-encounter table of the field's own section 6, decoded at load time.
     encounters: Option<EncounterTable>,
     /// What the field's scripts say about the story: its phases and story points, read at load time
-    /// (see `crate::story`).
+    /// (see `crate::story`). The points are empty in a field that is not one of the [`REVIEWED_FIELDS`].
     story: AreaStory,
+    /// The script exits and story points a field that is not reviewed has and does not offer (`None`: nothing left
+    /// off), see [`AreaRuntime::story_withheld`].
+    withheld: Option<StoryWithheld>,
 }
 
 impl std::fmt::Debug for Ff7FieldArea {
@@ -701,7 +756,19 @@ impl Ff7FieldArea {
     /// `surface` must have at least one usable triangle (checked by
     /// `Ff7Adapter::load_validated`, the only caller). `exits` are the gateway exits the adapter
     /// resolved against the archive; the NPCs and the encounter table come from the field itself.
-    fn new(info: AreaInfo, field: FieldFile, walkmesh: Walkmesh, surface: Surface, exits: Vec<Exit>, gates: Vec<ScriptGate>) -> Self {
+    ///
+    /// `exits_left_off` is `Some` for a field that is not reviewed (the descriptions of its script exits, which the
+    /// caller did not put in `exits`): its story points are taken out of the story too, and both are remembered as
+    /// what the field withholds.
+    fn new(
+        info: AreaInfo,
+        field: FieldFile,
+        walkmesh: Walkmesh,
+        surface: Surface,
+        exits: Vec<Exit>,
+        gates: Vec<ScriptGate>,
+        exits_left_off: Option<Vec<String>>,
+    ) -> Self {
         // Bounds over every vertex of every triangle, including degenerate ones.
         let mut min = [f32::MAX; 3];
         let mut max = [f32::MIN; 3];
@@ -724,8 +791,12 @@ impl Ff7FieldArea {
         };
         let encounters = field.section(section::ENCOUNTER).ok().and_then(decode_encounter_section);
         // A field whose script section cannot be parsed has no story of its own: one phase, no points.
-        let story = FieldScript::from_field(&field).map(|script| AreaStory::scan(&script, &walkmesh)).unwrap_or_default();
-        let mut area = Self { info, field, walkmesh, surface, bounds, spawns, field_scale, exits, gates, npcs: Vec::new(), encounters, story };
+        let mut story = FieldScript::from_field(&field).map(|script| AreaStory::scan(&script, &walkmesh)).unwrap_or_default();
+        let withheld = exits_left_off.and_then(|exits| {
+            let points = story.withhold_points();
+            (!exits.is_empty() || !points.is_empty()).then(|| StoryWithheld { reason: UNREVIEWED_FIELD.to_string(), exits, points })
+        });
+        let mut area = Self { info, field, walkmesh, surface, bounds, spawns, field_scale, exits, gates, npcs: Vec::new(), encounters, story, withheld };
         // NPCs without a literal height stand on this area's own surface, so they are worked out last.
         area.npcs = area_content::npc_spawns(&area.field, &area.walkmesh, |x, y| area.height_at(x, y, None));
         area
@@ -904,6 +975,12 @@ impl AreaRuntime for Ff7FieldArea {
 
     fn story_advance(&self, progress: &[u8], point: u32) -> Option<StoryStep> {
         self.story.advance(progress, point)
+    }
+
+    /// The script exits and story points of a field that is not one of the [`REVIEWED_FIELDS`] (`None` for a reviewed
+    /// field, and for a field that has neither).
+    fn story_withheld(&self) -> Option<StoryWithheld> {
+        self.withheld.clone()
     }
 
     /// The story's canon party at this story state ([`crate::story::CANON_PARTIES`]): Cloud and Barret for the

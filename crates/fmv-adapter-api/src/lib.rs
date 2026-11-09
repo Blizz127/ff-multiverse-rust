@@ -346,6 +346,19 @@ pub struct StoryStep {
     pub summary: String,
 }
 
+/// What an area's data holds of the story (exits its scripts decide, points that move the story) that its adapter
+/// does NOT offer, and why: see [`AreaRuntime::story_withheld`]. Descriptions are the adapter's own, in words and
+/// numbers of its own (never text of the game); the server logs them once per area.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StoryWithheld {
+    /// Why they are left off, as a short phrase (FF7: `unreviewed field`).
+    pub reason: String,
+    /// The exits left off, one description each (FF7: the field they lead to and the conditions they sit under).
+    pub exits: Vec<String>,
+    /// The story points left off, one label each (the labels [`StoryPoint::label`] would have had).
+    pub points: Vec<String>,
+}
+
 /// Whether the segment `a -> b` meets the convex polygon `corners` (x and y only). An endpoint
 /// inside counts, and so does a crossing of any edge. A polygon with fewer than three corners, or
 /// with a non-finite corner, is never touched.
@@ -462,6 +475,15 @@ pub trait AreaRuntime: Send + Sync {
     /// A story only moves forward: a step never lowers what the progression already records.
     fn story_advance(&self, progress: &[u8], point: u32) -> Option<StoryStep> {
         let _ = (progress, point);
+        None
+    }
+
+    /// The exits and story points this area's data holds that the adapter chose not to offer (neither in
+    /// [`AreaRuntime::exits`] nor in [`AreaRuntime::story_points`]), and why: `None` (the default) when nothing was
+    /// left off. An adapter whose story data has not been reviewed for every area keeps it off where it has not been
+    /// (a point raises an account's story for good, and an exit sends a party somewhere): the server logs what it
+    /// is told here once per area, so that the owner can see what the world is not doing.
+    fn story_withheld(&self) -> Option<StoryWithheld> {
         None
     }
 
@@ -648,6 +670,7 @@ mod tests {
         };
         let area = Flat(info);
         assert!(area.exits().is_empty() && area.npcs().is_empty() && area.encounters().is_none());
+        assert_eq!(area.story_withheld(), None, "by default nothing is left off");
         assert_eq!(area.place_arrival(Pos::new(3.0, 4.0, 0.0), Some(12)), Pos::new(3.0, 4.0, 9.0), "snapped to the floor");
         assert_eq!(area.place_arrival(Pos::new(-3.0, 4.0, 0.0), None), Pos::new(1.0, 1.0, 9.0), "off the floor: the area's own choice");
     }

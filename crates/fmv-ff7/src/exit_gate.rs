@@ -74,6 +74,16 @@ impl ScriptGate {
         unknown.map_or(ExitState::Open, ExitState::Unknown)
     }
 
+    /// The conditions of this exit in words (`Var[2][0] < 33 and ...`; `no conditions` for a jump with none): what a
+    /// log says about an exit that is left off.
+    pub(crate) fn conditions(&self) -> String {
+        if self.guards.is_empty() {
+            "no conditions".to_string()
+        } else {
+            self.guards.iter().map(ToString::to_string).collect::<Vec<_>>().join(" and ")
+        }
+    }
+
     /// The guards of this exit (tests read them).
     #[cfg(test)]
     pub(crate) fn guards(&self) -> &[ExitGuard] {

@@ -608,6 +608,25 @@ fn a_write_only_the_story_guards_is_an_entry_point() {
 }
 
 #[test]
+fn withholding_the_points_keeps_the_phases_and_names_what_was_taken() {
+    // a field with an entry point and a line point: both are taken, in the order of their ids, and nothing else changes
+    let walker = entity_script(&[], &looping(&when_moment(3, 8, &setword(2, 0, 8))));
+    let liner = vec![(0, entity_script(&line((-50, 20), (50, 20)), &[])), (3, concat(&[when_moment(3, 11, &setword(2, 0, 11)), ret()]))];
+    let mut story = scan(&field_with_player(|s| s.entity("walker", vec![(0, walker)]).entity("lin", liner)), &mesh(3));
+    assert_eq!(story.point_count(), 2);
+    let phases = |story: &AreaStory| [at(1), at(7), at(8), at(11), Vec::new()].iter().map(|b| story.phase_key(b)).collect::<Vec<_>>();
+    let before = phases(&story);
+    let taken = story.withhold_points();
+    assert_eq!(taken, ["line: moment <11 -> 11", "entry: moment <8 -> 8"], "in the order of the ids: lines before entries");
+    assert_eq!((story.point_count(), story.points().len()), (0, 0));
+    assert_eq!(story.advance(&at(7), 0), None);
+    assert_eq!(story.advance(&at(7), 1), None);
+    assert_eq!(story.edges(), [8, 11], "the phases are the field's own comparisons, as before");
+    assert_eq!(phases(&story), before);
+    assert!(story.withhold_points().is_empty(), "nothing is left to take");
+}
+
+#[test]
 fn a_write_the_server_cannot_be_sure_the_script_reaches_is_not_read() {
     let write = || when_moment(3, 8, &setword(2, 0, 8));
     let points = |main: Vec<u8>| scan(&field_with_player(|s| s.entity("e", vec![(0, entity_script(&[], &main))])), &mesh(3)).point_count();

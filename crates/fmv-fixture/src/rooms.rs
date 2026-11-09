@@ -27,6 +27,11 @@
 //! synthetic story too, with two more ways to advance it: walking across a line of the hall ([`STORY_LINE_Y`]) and
 //! coming to stand in the yard (a point that fires on entry).
 //!
+//! With [`RoomsAdapter::with_an_unreviewed_yard`] the rooms are scripted as with `with_gates`, but the yard is one its
+//! adapter has not reviewed (as an FF7 field outside the adapter's list of reviewed fields): its entry point is
+//! left off, and [`AreaRuntime::story_withheld`] says so, to exercise what a server does with an area whose story the
+//! adapter keeps off.
+//!
 //! With [`RoomsAdapter::with_story`] the rooms also have a synthetic story, to exercise phasing
 //! without owned data: progression is one byte string (empty for a new account, [`STORY_ADVANCED`]
 //! after the hall's story region [`STORY_REGION`] was entered), both rooms are in the empty phase for
@@ -35,7 +40,7 @@
 
 use fmv_adapter_api::{
     AdapterError, AreaInfo, AreaKey, AreaRuntime, Bounds, Exit, ExitKind, ExitState, GameAdapter, MoveResult, NpcAppearance, NpcSpawn,
-    StoryPoint, StoryStep, StoryTrigger,
+    StoryPoint, StoryStep, StoryTrigger, StoryWithheld,
 };
 use fmv_core::{AreaId, EditionProvenance, Fingerprint, GameId, PhaseKey, Platform, Pos, SourceRef};
 
@@ -64,6 +69,9 @@ pub const GATE_WALL_X: f32 = -300.0;
 /// With [`RoomsAdapter::with_gates`], y of the hall's story line (it runs from x = -100 to 100): walking across it
 /// takes a new account to [`STORY_ADVANCED`], like the story region.
 pub const STORY_LINE_Y: f32 = 200.0;
+
+/// The label of the yard's entry point (the point of a scripted yard that fires on entry).
+const YARD_ENTRY_LABEL: &str = "yard entry: progress 0 -> 1";
 
 /// The area the players enter first.
 pub const HALL: &str = "hall";
@@ -130,6 +138,7 @@ pub struct RoomsAdapter {
     ghost: bool,
     story: bool,
     gates: bool,
+    unreviewed_yard: bool,
 }
 
 impl RoomsAdapter {
@@ -150,6 +159,13 @@ impl RoomsAdapter {
     /// Give the hall the exits its "scripts" decide (see the module docs), with the synthetic story.
     pub fn with_gates() -> Self {
         Self { story: true, gates: true, ..Self::default() }
+    }
+
+    /// As [`RoomsAdapter::with_gates`], but the yard is a room the adapter has not reviewed: its entry point is not
+    /// offered (and does not advance anybody's story), and [`AreaRuntime::story_withheld`] names it, together with
+    /// one script exit the yard would have had.
+    pub fn with_an_unreviewed_yard() -> Self {
+        Self { story: true, gates: true, unreviewed_yard: true, ..Self::default() }
     }
 
     fn keys(&self) -> Vec<&'static str> {
@@ -178,6 +194,7 @@ impl GameAdapter for RoomsAdapter {
                 story: self.story,
                 gates: self.gates && key == HALL,
                 scripted: self.gates,
+                withheld: self.unreviewed_yard && key == YARD,
             })),
             GHOST if self.ghost => Err(AdapterError::Decode("the ghost area cannot be loaded (by design)".into())),
             other => Err(AdapterError::AreaNotFound(other.to_string())),
@@ -207,6 +224,8 @@ struct Room {
     /// The adapter was built with [`RoomsAdapter::with_gates`]: the hall has a story line and the yard a point that
     /// fires on entry.
     scripted: bool,
+    /// The adapter was built with [`RoomsAdapter::with_an_unreviewed_yard`] and this is the yard: its story is left off.
+    withheld: bool,
 }
 
 impl Room {
@@ -321,7 +340,11 @@ impl AreaRuntime for Room {
         }
         if self.is_yard() {
             // coming to stand in the yard moves a new account's story, when the rooms are scripted
-            return if self.scripted { vec![StoryPoint { id: 0, trigger: StoryTrigger::Enter, label: "yard entry: progress 0 -> 1".into() }] } else { Vec::new() };
+            return if self.scripted && !self.withheld {
+                vec![StoryPoint { id: 0, trigger: StoryTrigger::Enter, label: YARD_ENTRY_LABEL.into() }]
+            } else {
+                Vec::new()
+            };
         }
         let mut points = vec![StoryPoint {
             id: 0,
@@ -339,8 +362,17 @@ impl AreaRuntime for Room {
     }
 
     fn story_advance(&self, progress: &[u8], point: u32) -> Option<StoryStep> {
-        let exists = self.story && if self.is_yard() { self.scripted && point == 0 } else { point == 0 || (self.scripted && point == 1) };
+        let exists = self.story && if self.is_yard() { self.scripted && !self.withheld && point == 0 } else { point == 0 || (self.scripted && point == 1) };
         (exists && progress.is_empty()).then(|| StoryStep { progress: STORY_ADVANCED.to_vec(), summary: "moment=0->1".into() })
+    }
+
+    /// The unreviewed yard's entry point and the exit it would have had, left off.
+    fn story_withheld(&self) -> Option<StoryWithheld> {
+        self.withheld.then(|| StoryWithheld {
+            reason: "unreviewed field".into(),
+            exits: vec!["to hall when a key is pressed".into()],
+            points: vec![YARD_ENTRY_LABEL.into()],
+        })
     }
 
     /// The yard's guard stands only in the advanced phase.
@@ -454,6 +486,29 @@ mod tests {
         assert!(story.load_area(YARD).unwrap().story_points().is_empty());
         assert_eq!(story.load_area(HALL).unwrap().story_points().len(), 1);
         assert_eq!(story.load_area(HALL).unwrap().story_advance(&[], 1), None);
+    }
+
+    #[test]
+    fn an_unreviewed_yard_offers_no_story_and_says_what_it_left_off() {
+        let a = RoomsAdapter::with_an_unreviewed_yard();
+        let (hall, yard) = (a.load_area(HALL).unwrap(), a.load_area(YARD).unwrap());
+        // the hall is as with the gates: both of its points, nothing left off
+        assert_eq!(hall.story_points().len(), 2);
+        assert_eq!(hall.story_withheld(), None);
+        assert_eq!(hall.story_advance(&[], 1).unwrap().progress, STORY_ADVANCED);
+        // the yard offers no point, advances nobody and says what it did not take; its gateway is as ever
+        assert!(yard.story_points().is_empty());
+        assert_eq!(yard.story_advance(&[], 0), None);
+        assert_eq!(yard.exits().len(), 1);
+        let left_off = yard.story_withheld().expect("the yard left something off");
+        assert_eq!((left_off.reason.as_str(), left_off.exits.len(), left_off.points), ("unreviewed field", 1, vec![YARD_ENTRY_LABEL.to_string()]));
+        // its phases are untouched
+        assert_eq!(yard.phase_key(STORY_ADVANCED), Some(PhaseKey(STORY_ADVANCED_PHASE.to_vec())));
+        // the other variants leave nothing off
+        for plain in [RoomsAdapter::with_gates(), RoomsAdapter::with_story(), RoomsAdapter::new()] {
+            assert!([HALL, YARD].iter().all(|k| plain.load_area(k).unwrap().story_withheld().is_none()));
+        }
+        assert_eq!(RoomsAdapter::with_gates().load_area(YARD).unwrap().story_points().len(), 1);
     }
 
     #[test]

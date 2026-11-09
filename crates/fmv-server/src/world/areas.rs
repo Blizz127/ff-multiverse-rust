@@ -81,6 +81,8 @@ const MAX_LOADED_AREAS: usize = 128;
 const MAX_EXITS_PER_AREA: usize = 128;
 /// Most story points kept per area (a real field has at most a few).
 const MAX_STORY_POINTS_PER_AREA: usize = 64;
+/// Most of the exits and points an adapter left off that the log line about them lists (it counts them all).
+const MAX_WITHHELD_LISTED: usize = 8;
 
 /// What an area is offered as: the fields of `AreaManifest` / `AreaChange` that do not depend on
 /// who is asking.
@@ -193,6 +195,28 @@ impl AreaState {
 
     pub(super) fn key(&self) -> &AreaKey {
         &self.id.key
+    }
+
+    /// The one log line about the exits and story points the adapter left off this area (`AreaRuntime::story_withheld`),
+    /// said when the area is loaded: how many, which (the first few) and why. `None` when nothing was left off.
+    pub(super) fn withheld_line(&self) -> Option<String> {
+        let withheld = self.runtime.story_withheld()?;
+        let listed = |items: &[String]| {
+            let mut shown: Vec<String> = items.iter().take(MAX_WITHHELD_LISTED).map(|item| clip(item, 100)).collect();
+            if items.len() > MAX_WITHHELD_LISTED {
+                shown.push(format!("+{} more", items.len() - MAX_WITHHELD_LISTED));
+            }
+            shown.join("; ")
+        };
+        Some(format!(
+            "story left off (said once for this area) area={} why={} script_exits={} story_points={} exits=[{}] points=[{}]",
+            self.id,
+            clip(&withheld.reason, 60),
+            withheld.exits.len(),
+            withheld.points.len(),
+            listed(&withheld.exits),
+            listed(&withheld.points)
+        ))
     }
 
     pub(super) fn id(&self) -> &AreaId {
@@ -427,6 +451,10 @@ impl World {
         ));
         for point in &state.story_points {
             self.logs.info(format!("story point area={} point={} {}", state.id(), point.id, clip(&point.label, 160)));
+        }
+        // What the adapter has not switched on for this area (FF7: a field nobody has reviewed), once per area.
+        if let Some(line) = state.withheld_line() {
+            self.logs.info(line);
         }
         self.areas.insert(stored.clone(), state);
         Ok(stored)

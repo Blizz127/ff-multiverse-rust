@@ -1,6 +1,11 @@
-//! Survey of what the adapter offers a server of the owner's FF7 fields: the exits its scripts decide and the
-//! story points it reads (needs the data; skips otherwise). Prints field names, entity-free labels and numbers only
+//! Survey of what the owner's FF7 fields hold for a server: the exits their scripts decide and the story points
+//! the adapter reads (needs the data; skips otherwise). Prints field names, entity-free labels and numbers only
 //! (never game text), and writes nothing.
+//!
+//! The survey loads every field with everything on (`Ff7Adapter::survey_field`), and says for each whether the field
+//! is one of the reviewed fields (`fmv_ff7::REVIEWED_FIELDS`), the only ones whose script exits and story points a
+//! server offers: for any other it is a list of what is left off, and the way to review a field before it joins the
+//! list (see that constant's docs).
 //!
 //! ```text
 //! FMV_FF7_DATA=<.../data> cargo run -p fmv-ff7 --example world_survey -- --all          # totals, every field
@@ -81,11 +86,13 @@ fn main() {
     let mut fields_with_points = 0usize;
     let mut most_points = (0usize, String::new());
     let (mut ok_points, mut battle_points) = (0usize, 0usize);
+    let (mut active_totals, mut off_totals) = ((0usize, 0usize, 0usize), (0usize, 0usize, 0usize));
     for name in &names {
         if !all && !points && !wanted.iter().any(|w| w.as_str() == name) {
             continue;
         }
-        let Ok(area) = adapter.load_field(name) else { continue };
+        let Ok(area) = adapter.survey_field(name) else { continue };
+        let reviewed = fmv_ff7::is_reviewed_field(name);
         fields += 1;
         let exits = area.exits();
         let scripts: Vec<_> = exits.iter().filter(|e| matches!(e.kind, ExitKind::Script { .. })).collect();
@@ -95,6 +102,12 @@ fn main() {
             (max_script, max_field) = (scripts.len(), name.clone());
         }
         let story_points = area.story_points();
+        // (script exits, story points, fields that have either) of the reviewed fields, which a server offers, and of
+        // the others, which it leaves off
+        let totals = if reviewed { &mut active_totals } else { &mut off_totals };
+        totals.0 += scripts.len();
+        totals.1 += story_points.len();
+        totals.2 += usize::from(!scripts.is_empty() || !story_points.is_empty());
         if !story_points.is_empty() {
             fields_with_points += 1;
         }
@@ -118,7 +131,13 @@ fn main() {
             battle_points += usize::from(p.label.contains("battle"));
         }
         if wanted.iter().any(|w| w.as_str() == name) {
-            println!("== {name}: {} gateways, {} script exits, {} story points", exits.len() - scripts.len(), scripts.len(), story_points.len());
+            println!(
+                "== {name} ({}): {} gateways, {} script exits, {} story points",
+                if reviewed { "reviewed: a server offers them" } else { "NOT reviewed: a server leaves the script exits and points off" },
+                exits.len() - scripts.len(),
+                scripts.len(),
+                story_points.len()
+            );
             for e in &exits {
                 let at = |m: u16| state_name(&area.exit_state(e, &StoryState::at(m).encode()));
                 println!(
@@ -148,5 +167,15 @@ fn main() {
         println!("{fields} fields: {with_exits} have exits; {script_exits} script exits (at most {max_script}, in {max_field}); for a new account {verdicts:?}");
         println!("fields whose script exits a new account may take: {}", open_new.len());
         println!("story points by trigger {by_trigger:?} in {fields_with_points} fields (most: {} in {}); {ok_points} want OK, {battle_points} name a battle", most_points.0, most_points.1);
+        println!(
+            "offered by a server (the {} reviewed fields): {} script exits, {} story points, in {} fields; left off ({} other fields have some): {} script exits, {} story points",
+            fmv_ff7::REVIEWED_FIELDS.len(),
+            active_totals.0,
+            active_totals.1,
+            active_totals.2,
+            off_totals.2,
+            off_totals.0,
+            off_totals.1
+        );
     }
 }

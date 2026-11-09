@@ -538,6 +538,70 @@ mod tests {
         assert_eq!(w.instance_of(new_account.account), w.instance_of(advanced.account));
     }
 
+    /// The rooms of `RoomsAdapter::with_an_unreviewed_yard`: the hall is scripted, the yard is an area whose adapter
+    /// keeps its story off.
+    fn unreviewed_yard_world() -> (World, mpsc::UnboundedReceiver<Msg>) {
+        let adapter: Arc<dyn GameAdapter> = Arc::new(RoomsAdapter::with_an_unreviewed_yard());
+        let mut w = World::with_party_config(adapter.load_area(HALL).unwrap(), PartyConfig::default()).unwrap();
+        w.set_area_source(adapter);
+        let (handle, rx) = SaverHandle::channel();
+        w.set_progress_saver(handle);
+        (w, rx)
+    }
+
+    #[test]
+    fn an_area_whose_story_the_adapter_left_off_does_not_advance_anybody_and_says_so_once() {
+        let t0 = Instant::now();
+        let (mut w, mut saved) = unreviewed_yard_world();
+        let mut a = seat(&mut w, "A", &[], t0);
+        let mut b = seat(&mut w, "B", &[], t0);
+        a.drain();
+        b.drain();
+        // the hall (the entry area) left nothing off
+        assert!(!log_text(&mut w).contains("story left off"));
+        let mut now = t0;
+
+        // A new account walks through the gateway to the yard (gateways are as ever): the entry point the yard's
+        // data holds is not offered, so the account's story stays where it was
+        arrive_in_the_yard(&mut w, &mut a, &mut now);
+        assert!(progression_of(&w, &a).is_empty(), "the entry point of an unreviewed area does not fire");
+        let log = log_text(&mut w);
+        assert!(!log.contains("story advanced") && saved_stories(&mut saved).is_empty(), "{log}");
+        let said: Vec<&str> = log.lines().filter(|l| l.contains("story left off")).collect();
+        assert_eq!(said.len(), 1, "said once, when the area was loaded: {log}");
+        assert!(
+            said[0].contains("area=Fixture/yard")
+                && said[0].contains("why=unreviewed field")
+                && said[0].contains("script_exits=1 story_points=1")
+                && said[0].contains("yard entry: progress 0 -> 1")
+                && said[0].contains("to hall when a key is pressed"),
+            "{}",
+            said[0]
+        );
+        assert!(!log.contains("story point area=Fixture/yard"), "no point of the yard was loaded: {log}");
+        // it is only told its arrival (no step), and it stays in the phase it was in
+        let msgs = a.drain();
+        assert!(msgs.iter().all(|m| !matches!(m, ServerMsg::StoryUpdate { .. })), "{msgs:?}");
+        assert_eq!(placements(&msgs).last().map(|p| p.key.phase.clone()), Some(PhaseKey::default()));
+
+        // the area says it once: a second player arriving adds nothing, and nothing advances for it either
+        arrive_in_the_yard(&mut w, &mut b, &mut now);
+        assert!(progression_of(&w, &b).is_empty());
+        assert!(!log_text(&mut w).contains("story left off"));
+        assert!(saved_stories(&mut saved).is_empty());
+    }
+
+    #[test]
+    fn an_entry_area_whose_story_the_adapter_left_off_says_so_when_the_world_is_made() {
+        let adapter = RoomsAdapter::with_an_unreviewed_yard();
+        let mut w = World::with_party_config(adapter.load_area(YARD).unwrap(), PartyConfig::default()).unwrap();
+        let log = log_text(&mut w);
+        assert_eq!(log.lines().filter(|l| l.contains("story left off") && l.contains("area=Fixture/yard")).count(), 1, "{log}");
+        // and a world whose entry area left nothing off says nothing
+        let mut plain = World::with_party_config(adapter.load_area(HALL).unwrap(), PartyConfig::default()).unwrap();
+        assert!(!log_text(&mut plain).contains("story left off"));
+    }
+
     #[test]
     fn a_party_member_in_the_leaders_phase_does_not_move_its_own_story_by_arriving() {
         let t0 = Instant::now();

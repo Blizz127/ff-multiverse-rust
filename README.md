@@ -443,7 +443,7 @@ says and nothing else, so what they can walk is exactly what the server lets the
 
 **Exits that scripts decide, and the story along the way.** Besides its gateways a field has the exits its
 scripts run when a player walks onto a line (a `MAPJUMP` in a line entity's trigger script, with the conditions
-it sits under); the adapter reports them after the gateways (`ExitKind::Script`) and answers, for an account's
+it sits under); the adapter reports them (in the reviewed fields, see below) after the gateways (`ExitKind::Script`) and answers, for an account's
 story, which of them is open (`AreaRuntime::exit_state`). Several can share one line: the lift of the first
 reactor (`elevtr1`) has no gateway and four exits on one line, picked by a bit of `Var[1][225]` and by
 `Var[2][0] < 33`, so the way down to `nmkin_2` is open only after the ride and the later story's `smkin_*` stay
@@ -462,6 +462,24 @@ steps a talk makes (`nmkin_3`'s woman, `nmkin_5`'s chest), the ride back up, and
 `nmkin_4` (scripted jumps and climbs the walkmesh does not link). The progression blob is `[1, lo, hi]` until a step sets
 a variable beyond the moment, then `[2, lo, hi, n, (bank, address, value)*n]` (an old blob loads exactly as before;
 a build that predates version 2 reads a version 2 blob as unreadable and leaves it alone).
+
+**Only eight fields are reviewed: the allowlist.** The script exits and story points above are **active in the eight
+fields of the first mission only**: `md1stin`, `md1_1`, `md1_2`, `nrthmk`, `nmkin_1`, `elevtr1`, `nmkin_2` and `nmkin_3`
+(`fmv_ff7::REVIEWED_FIELDS`, in `crates/fmv-ff7/src/area.rs`), each read against its own script case by case. Every other
+field offers what it always did, its gateways (data, always open, so a party can still walk out of the mission) and its
+phases, and leaves its script exits and story points off: a point raises a story for good, a story only moves
+forward, and nobody has read the others (the data holds 917 script exits and 83 points; the eight fields offer 4 and
+8, and the 274 other fields that have any leave 913 and 75 off). The server says what a field left off once per area
+when it loads it (`story left off (said once for this area) area=Ff7/md8_1 why=unreviewed field script_exits=0
+story_points=1 ...`). A field joins the list by review, not by a casual edit: `cargo run -p fmv-ff7 --example
+world_survey -- <field>` shows what it would offer (the survey loads fields with everything on), each point and exit is
+checked against the field's script, the result is pinned in `crates/fmv-ff7/tests/chain_real.rs`, and only then is
+the name added.
+
+**The lift only goes down, for now.** The ride is carried one way: standing on the panel's triangle sets the lift bit
+and moves the story, and the exit to `nmkin_2` opens. The way back up (the lift's other exit, a toggle of that bit) is
+not carried, so a player who has gone down returns to `md1stin` by logging out and back in (every login joins the entry
+area).
 
 Story phasing: every account has one story progression per game (the opaque `Progression` blob; an
 account that never advanced has none, which is a new account) and the world keeps one instance of a
@@ -483,8 +501,8 @@ version was bumped and a server refuses a v3 client at the handshake with a clea
 `ProtocolMismatch` reject (instead of losing it at the first exit it crosses). Both sides must be
 built from this version or later.
 
-Not done: exits a talk or a director decides, scripted ladders and jumps, conditional NPCs, NPC animation
-and talking.
+Not done: exits a talk or a director decides, scripted ladders and jumps, the script exits and story points of every
+field but the first mission's eight (they are left off until reviewed), conditional NPCs, NPC animation and talking.
 
 ## Accounts, avatars and parties
 
