@@ -21,9 +21,10 @@ use super::flow::{self, Env, Saved};
 use super::hud::area_label;
 use super::input::{menu_input, pad_menu_input, MenuInput};
 use super::looks::LookCache;
-use super::menu::{Menu, MenuAction, MenuConfig, Notice};
+use super::menu::{Menu, MenuAction, MenuConfig, Notice, NoticeKind, Screen};
 use super::screens;
 use crate::accounts::{loose_mode_warning, TokenStore};
+use crate::audio::{menu_cue, Cue, GameAudio};
 use crate::cli::exit;
 use crate::ff7::SharedFf7;
 use crate::gamemode::{osk_transition, request_osk, DeviceMode};
@@ -72,6 +73,8 @@ pub struct Launch {
     /// What the device asks of the window (full screen) and of the text fields (Steam's keyboard):
     /// decided once in `main` from the flags and the environment.
     pub device: DeviceMode,
+    /// The run's sound: the menu clicks here, and it goes to the game with the window when the player joins.
+    pub audio: GameAudio,
 }
 
 impl Launch {
@@ -189,10 +192,29 @@ impl Shell {
     // ----- menu input and actions ---------------------------------------------------------------
 
     fn handle_input(&mut self, input: MenuInput) -> Next {
+        let before = self.menu.screen().clone();
+        let had_error = self.menu.notice().is_some_and(|n| n.kind == NoticeKind::Error);
+        let key = match &input {
+            MenuInput::Nav(press) => Some(press.key),
+            MenuInput::Text(_) => None,
+        };
         let action = match input {
             MenuInput::Nav(press) => self.menu.key(press),
             MenuInput::Text(text) => self.menu.text(&text),
         };
+        // The menu sounds: what the key did (see `crate::audio::menu_cue`).
+        let cue = match key {
+            Some(key) => {
+                let changed = *self.menu.screen() != before;
+                let error = !had_error && self.menu.notice().is_some_and(|n| n.kind == NoticeKind::Error);
+                menu_cue(key, changed, matches!(before, Screen::Select(_)), action.as_ref(), error)
+            }
+            // Typing is silent, except the letter that opens the create form.
+            None => (std::mem::discriminant(&before) != std::mem::discriminant(self.menu.screen())).then_some(Cue::Confirm),
+        };
+        if let Some(cue) = cue {
+            self.launch.audio.cue(cue);
+        }
         action.map_or(Next::Stay, |a| self.run_action(a))
     }
 
@@ -370,7 +392,11 @@ impl Shell {
             session = session.with_content(adapter.clone());
         }
         let view = crate::field_view(self.launch.ff7.as_deref(), &session);
-        App::new(session, view).with_ff7(self.launch.ff7.clone()).with_device(self.launch.device)
+        // The sound the menu was using goes on into the game (the menu cannot be come back to).
+        App::new(session, view)
+            .with_ff7(self.launch.ff7.clone())
+            .with_device(self.launch.device)
+            .with_audio(std::mem::take(&mut self.launch.audio))
     }
 
     fn tick(&mut self, el: &ActiveEventLoop) {
@@ -555,6 +581,7 @@ mod tests {
             tint: None,
             ff7: None,
             device: DeviceMode::DESKTOP,
+            audio: GameAudio::off(),
         }
     }
 

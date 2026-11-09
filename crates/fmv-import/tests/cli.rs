@@ -574,3 +574,94 @@ fn help_text_and_default_state_dir() {
     help_says_physical_drives_are_out_of_scope();
     default_state_dir_follows_xdg_when_nothing_else_is_set();
 }
+
+/// Audio through the binary: `scan-pc` summarises it in the last key of its report, `import-pc`
+/// takes it, and importing again with the same labels adds it to a library that holds the install
+/// without it. `--help` says how.
+#[test]
+fn audio_is_scanned_imported_and_added_to_an_existing_library_by_importing_again() {
+    let env = Env::new();
+    let install = env.root.join("FF7");
+    for f in ["ff7_en.exe", "data/field/flevel.lgp", "data/field/char.lgp"] {
+        touch(&install, f, b"synthetic placeholder");
+    }
+    let dir = install.to_str().unwrap();
+
+    // without audio: the key is there, all zero, and nothing else says a word about audio
+    let out = env.run(&["scan-pc", dir]);
+    let report = json(&out);
+    assert_eq!(
+        report["audio"],
+        serde_json::json!({
+            "ogg_files": 0, "wav_files": 0, "music_idx": false, "audio_dat": false,
+            "audio_fmt": false, "total_bytes": 0, "skipped_files": 0
+        })
+    );
+    assert_eq!(report["warnings"], serde_json::json!([]));
+    let first = json(&env.run_with_state(&["import-pc", dir]));
+    let set_id = first["set_id"].as_str().unwrap().to_string();
+    assert_eq!(first["totals"]["files"], 3);
+
+    // the audio arrives
+    touch(&install, "data/music_ogg/bat.ogg", b"synthetic ogg");
+    touch(&install, "data/music_ogg/victory.ogg", b"synthetic ogg two");
+    touch(&install, "data/music/heart.wav", b"synthetic wav");
+    touch(&install, "data/music/music.idx", b"idx");
+    touch(&install, "data/sound/audio.dat", b"sound bank");
+    touch(&install, "data/sound/audio.fmt", b"table");
+    let out = env.run(&["scan-pc", dir]);
+    let report = json(&out);
+    assert_eq!(
+        report["audio"],
+        serde_json::json!({
+            "ogg_files": 2, "wav_files": 1, "music_idx": true, "audio_dat": true,
+            "audio_fmt": true, "total_bytes": 13 + 17 + 13 + 3 + 10 + 5, "skipped_files": 0
+        })
+    );
+    // `audio` is the last key of the printed report (new keys only ever come at the end)
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let tail = &text[text.rfind("\"audio\"").unwrap()..];
+    assert_eq!(
+        (tail.matches('{').count(), tail.matches('}').count()),
+        (1, 2),
+        "{tail}"
+    );
+    assert!(text.rfind("\"notes\"").unwrap() < text.rfind("\"audio\"").unwrap());
+    let audio_entries = report["would_import"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|w| w["role"] == "audio")
+        .count();
+    assert_eq!(audio_entries, 6);
+
+    // importing again with the same labels adds the audio to the set that is there
+    let second = json(&env.run_with_state(&["import-pc", dir]));
+    assert_eq!(second["set_id"], set_id.as_str());
+    assert_eq!(second["totals"]["entries_added"], 6);
+    assert_eq!(second["totals"]["entries_unchanged"], 3);
+    assert_eq!(second["identification"], first["identification"]);
+    let listed = json(&env.run_with_state(&["list"]));
+    let sets = listed["sets"].as_array().unwrap();
+    assert_eq!(sets.len(), 1, "{listed}");
+    assert_eq!(sets[0]["files"], 9);
+    assert_eq!(sets[0]["identification"], first["identification"]);
+
+    // the help says how to add audio to an existing library
+    for args in [&["--help"][..], &["import-pc", "--help"][..]] {
+        let text = String::from_utf8_lossy(&env.run(args).stdout)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            text.contains("import-pc again on the same install with the same --edition/--region/--language/--revision labels"),
+            "{args:?}: {text}"
+        );
+        assert!(
+            text.contains("second set") && text.contains("ambiguous"),
+            "{args:?}: {text}"
+        );
+    }
+    let scan_help = String::from_utf8_lossy(&env.run(&["scan-pc", "--help"]).stdout).to_string();
+    assert!(scan_help.contains("audio"), "{scan_help}");
+}

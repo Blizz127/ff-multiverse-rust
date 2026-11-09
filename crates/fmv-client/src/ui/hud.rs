@@ -281,12 +281,13 @@ pub fn draw_hud_with(input: &HudInput, progress: Option<&ProgressLine>, w: u32, 
     let status_lines = vec![(status_tone, status_text.to_string()), (DIM, format!("players {}   rtt {rtt}", input.players))];
     let status = block(out, m, hi - m - block_h(2, s), s, &status_lines);
 
-    // Bottom right: the keys, when there is room beside the status. Shift (walk) and F1 (the
-    // walkmesh) only mean something over a real field's picture, not in a fixture.
+    // Bottom right: the keys, when there is room beside the status. Shift (walk), F1 (the
+    // walkmesh) and M (mute; - and = change the volume) only mean something over a real field's
+    // picture and its music, not in a fixture.
     let hint = if input.fixture {
         "WASD move   P invite   Y accept   L leave   Esc x2 quit"
     } else {
-        "WASD move   Shift walk   F1 mesh   P invite   Y accept   L leave   Esc x2 quit"
+        "WASD move   Shift walk   F1 mesh   P invite   Y accept   L leave   M mute   Esc x2 quit"
     };
     let hint_w = text_width(hint, s as u32) + 2 * pad(s);
     if status.2 + hint_w + 2 * m < wi {

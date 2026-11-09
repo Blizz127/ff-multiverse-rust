@@ -9,12 +9,18 @@
 //! opened and indexed BEFORE connecting, so the (slow) indexing of a large archive never counts
 //! against the handshake deadline or the server's join timeout.
 //!
+//! Sound: FF7 content plays the owner's own music and menu sounds, read from the same library (see
+//! `audio`: the field's music, the battle theme, the victory fanfare, the menu clicks). `--mute` and
+//! `FMV_AUDIO=off` build none of it; a library without sound files, or a machine without a sound card,
+//! is one `audio:` line and silence.
+//!
 //! Accounts: the server knows a player by an account. How this run logs in (the token saved for
 //! the server, or a registration) is decided first of all, before the content is opened or a
 //! connection made (see `login`); the token a registration issues is saved by the handshake the
 //! moment it arrives (see `net` and `accounts`).
 
 mod accounts;
+mod audio;
 mod avatar;
 mod backdrop;
 mod battle;
@@ -40,6 +46,7 @@ mod ui;
 mod window;
 
 use accounts::{loose_mode_warning, TokenStore};
+use audio::GameAudio;
 use backdrop::FieldView;
 use clap::Parser;
 use cli::{exit, Args, GameChoice};
@@ -146,6 +153,32 @@ fn open_game(args: &Args) -> Result<LocalGame, String> {
     }
 }
 
+/// The sound of this run. Only FF7 content has any (the fixture plaza is silent), and only a run that
+/// asks for it: `--mute` and `FMV_AUDIO=off` build nothing, and a headless bot, which is a test tool, is
+/// silent unless `FMV_AUDIO` was set on purpose (`null` runs the soundtrack against a clock and logs it).
+/// A library without sound files, or any trouble reading them, is one `audio:` line and no sound.
+fn start_audio(args: &Args, ff7: Option<&Arc<Ff7Adapter>>) -> GameAudio {
+    let Some(adapter) = ff7 else { return GameAudio::off() };
+    let env = std::env::var(fmv_audio::ENV_VAR).ok();
+    let (mode, note) = audio::run_mode(args.mute, args.headless, env.as_deref());
+    let config = fmv_audio::AudioConfig { mode, ..fmv_audio::AudioConfig::default() };
+    if let Some(note) = note {
+        (config.logger)(&note);
+    }
+    if mode == fmv_audio::Mode::Off {
+        return GameAudio::off();
+    }
+    let Some(tasks) = audio::ff7::tasks(&args.ff7_source(), Arc::clone(adapter), &config.logger) else { return GameAudio::off() };
+    let sound = GameAudio::start(config, tasks);
+    // The fanfare after a fight is chosen from the shape of the files (a one-shot of five seconds, not a
+    // looping one), not from anything the game's data says; this is the way to another track if the
+    // owner's ears disagree (a name from music.idx, for example `fan2`).
+    match std::env::var(audio::FANFARE_ENV).ok().as_deref().map(str::trim) {
+        Some(name) if audio::is_track_name(name) => sound.with_victory_track(name),
+        _ => sound,
+    }
+}
+
 /// The window's view of the joined area: an FF7 field is shown through its own camera with its
 /// background behind it (read from this machine's own copy); anything else, or an FF7 field whose
 /// render data cannot be read, is shown from above.
@@ -211,6 +244,8 @@ fn run_menu(args: &Args, state_dir: &Path, store: TokenStore) -> u8 {
             return exit::FAILURE;
         }
     };
+    // After the window could be made, so that a machine that cannot show one never decodes anything.
+    let audio = start_audio(args, ff7.as_ref());
     let game = match args.effective_game() {
         // (`--game fixture-rooms` was refused above: the menu only knows the one-area fixture.)
         GameChoice::Fixture | GameChoice::FixtureRooms => GameId::Fixture,
@@ -227,6 +262,7 @@ fn run_menu(args: &Args, state_dir: &Path, store: TokenStore) -> u8 {
             tint: args.tint,
             ff7,
             device,
+            audio,
         },
     )
 }
@@ -320,6 +356,8 @@ fn run(args: Args) -> u8 {
     }
 
     announce_joined(&joined);
+    // After the join, so that a refused login or a content mismatch never opens a sound device.
+    let audio = start_audio(&args, ff7.as_ref());
     // The window (not a headless bot, whose accounts folder stays exactly as it was) remembers what the
     // server holds of this character, so the character menu can show it next time.
     if !args.headless {
@@ -332,10 +370,10 @@ fn run(args: Args) -> u8 {
         session = session.with_content(Arc::clone(content));
     }
     match event_loop {
-        None => headless::run(&args, session, ff7),
+        None => headless::run(&args, session, ff7, audio),
         Some(el) => {
             let view = field_view(ff7.as_deref(), &session);
-            window::run(el, session, view, ff7, device)
+            window::run(el, session, view, ff7, device, audio)
         }
     }
 }

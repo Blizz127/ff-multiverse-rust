@@ -39,3 +39,25 @@ unicode-script = "0.5"
 
 [profile.dev]
 opt-level = 1
+
+# The decoders are the one heavy loop of a debug build: the client decodes the owner's music (minutes of
+# Vorbis per track) and a fight cannot wait seconds for its theme. Optimised decoders keep that short;
+# nothing else about the dev profile changes.
+[profile.dev.package.symphonia]
+opt-level = 3
+[profile.dev.package.symphonia-core]
+opt-level = 3
+[profile.dev.package.symphonia-codec-adpcm]
+opt-level = 3
+[profile.dev.package.symphonia-codec-pcm]
+opt-level = 3
+[profile.dev.package.symphonia-codec-vorbis]
+opt-level = 3
+[profile.dev.package.symphonia-format-ogg]
+opt-level = 3
+[profile.dev.package.symphonia-format-riff]
+opt-level = 3
+[profile.dev.package.symphonia-metadata]
+opt-level = 3
+[profile.dev.package.symphonia-utils-xiph]
+opt-level = 3
