@@ -1,6 +1,6 @@
 //! Scripted enemies inside a running battle: the engine hook, the fallback, determinism.
 
-use super::asm::{battle_of, battle_with, party_of, plain_foe, scripted_foe, Asm, ATTACK, OTHER};
+use super::asm::{battle_of, battle_with, laser, party_of, plain_foe, scripted_foe, Asm, ATTACK, LASER, OTHER};
 use super::script::op;
 use crate::rules::{ActionRef, ActorId, BattleEvent, BattleState};
 
@@ -335,14 +335,21 @@ fn a_queued_attack_on_a_target_that_has_fallen_fizzles_and_the_script_goes_on() 
     assert!(killed > 0 && survived > 0, "both cases occurred: killed {killed}, missed {survived}");
 }
 
+/// The foe of [`scripted_foe`] that can also play [`LASER`], which hits the whole party and nothing else.
+fn laser_foe(init: Option<&Asm>, main: &Asm) -> crate::rules::Combatant {
+    let mut foe = scripted_foe(init, main);
+    foe.actions.push(laser());
+    foe
+}
+
 #[test]
 fn an_attack_on_the_whole_party_hits_each_living_member_in_ascending_order() {
     // targets = every enemy of the foe (the whole party); a member who has fallen is not hit.
-    let main = Asm::act_on(|a| a.val(2, 0x20A0), ATTACK);
+    let main = Asm::act_on(|a| a.val(2, 0x20A0), LASER);
     let mut party = party_of(4);
     party[2].hp = 0;
     let foe = ActorId(4);
-    let mut state = battle_with(7, party, vec![scripted_foe(None, &main)]);
+    let mut state = battle_with(7, party, vec![laser_foe(None, &main)]);
     let turn = first_turn_of(&mut state, foe);
     let hits: Vec<u8> = turn
         .iter()
@@ -352,14 +359,126 @@ fn an_attack_on_the_whole_party_hits_each_living_member_in_ascending_order() {
         })
         .collect();
     assert_eq!(hits, vec![0, 1, 3], "{turn:?}");
-    assert_eq!(announced(&turn, foe), vec![ATTACK], "announced once, however many it reaches");
+    assert_eq!(announced(&turn, foe), vec![LASER], "announced once, however many it reaches");
+}
+
+#[test]
+fn a_whole_party_attack_deals_the_split_damage_of_the_whole_side_rules() {
+    // The engine's own rule for an action on several targets (2/3 of the damage to each, see "Whole-side
+    // targeting" of the rules): every non-critical hit of the laser on three members is within what the split
+    // formula allows and below the least a one-target hit of the same attack can do.
+    use crate::rules::{action_damage_among, Elemental, Rolls};
+    let main = Asm::act_on(|a| a.val(2, 0x20A0), LASER);
+    let foe = ActorId(3);
+    let mut hits = 0;
+    for seed in 0..12 {
+        let mut state = battle_with(seed, party_of(3), vec![laser_foe(None, &main)]);
+        let turn = first_turn_of(&mut state, foe);
+        let spec = laser().spec;
+        let me = &state.actors()[3];
+        for e in &turn {
+            let BattleEvent::Damage { target, amount, critical: false, .. } = *e else { continue };
+            let victim = &state.actors()[usize::from(target.0)];
+            let roll = |variance, among| action_damage_among(&spec, me, victim, Elemental::Normal, Rolls { critical: false, variance }, among);
+            assert!(amount >= roll(0, 3) && amount <= roll(255, 3), "seed {seed}: {amount} is not a split hit");
+            assert!(amount < roll(0, 1), "seed {seed}: {amount} is no less than a one-target hit would be");
+            hits += 1;
+        }
+    }
+    assert!(hits >= 20, "{hits} hits looked at");
+}
+
+#[test]
+fn a_script_aims_an_attack_as_it_says_whatever_the_menu_rule_of_its_record() {
+    // A record's targeting ([`Aim`]) is the rule of the player's menu, which `aim_at` checks a command
+    // against; an enemy's script names its target mask and the original carries it out. So a whole-side
+    // attack on one member and a one-target attack on the whole party are played as the script says.
+    let hits = |turn: &[BattleEvent]| -> Vec<u8> {
+        turn.iter()
+            .filter_map(|e| match e {
+                BattleEvent::Damage { target, .. } | BattleEvent::Miss { target, .. } => Some(target.0),
+                _ => None,
+            })
+            .collect()
+    };
+    let foe = ActorId(2);
+    let mut state = battle_of(5, vec![laser_foe(None, &Asm::act_on(|a| a.k1(0b10), LASER))]);
+    let turn = first_turn_of(&mut state, foe);
+    assert_eq!((announced(&turn, foe), hits(&turn)), (vec![LASER], vec![1]), "a whole-side attack on Barret alone");
+    let mut state = battle_of(5, vec![laser_foe(None, &Asm::act_on(|a| a.val(2, 0x20A0), ATTACK))]);
+    let turn = first_turn_of(&mut state, foe);
+    assert_eq!((announced(&turn, foe), hits(&turn)), (vec![ATTACK], vec![0, 1]), "a one-target attack on both");
+    let stats = state.actors()[2].ai.as_ref().unwrap().stats();
+    assert_eq!(stats.fallbacks, 0, "{stats:?}");
+}
+
+#[test]
+fn a_damaging_attack_aimed_at_the_enemys_own_side_falls_back_to_the_plain_behaviour() {
+    // Target::AllAllies (every living enemy) and Target::One(an enemy) are no way for the rules to hit anyone
+    // with a damaging attack: each of those turns is the plain behaviour's, event for event (the same battle
+    // with the foe's scripts taken away plays alike).
+    let two_foes = |main: &Asm, scripted: bool| {
+        let mut first = laser_foe(None, main);
+        if !scripted {
+            first.ai = None;
+        }
+        battle_with(5, party_of(2), vec![first, plain_foe()])
+    };
+    for (what, main) in [
+        ("on the foe's own side (both foes)", Asm::act_on(|a| a.val(2, 0x2080), ATTACK)),
+        ("on the foe itself", Asm::act_on(|a| a.val(2, 0x2060), ATTACK)),
+        ("on the other foe", Asm::act_on(|a| a.k1(0b10_0000), ATTACK)),
+    ] {
+        let mut scripted = two_foes(&main, true);
+        let mut plain = two_foes(&main, false);
+        let (log, expected) = (all(&per_tick(&mut scripted, 600)), all(&per_tick(&mut plain, 600)));
+        assert!(expected.iter().any(|e| matches!(e, BattleEvent::Action { .. })), "{what}: the foes attack");
+        assert_eq!(log, expected, "{what}: the plain behaviour played every turn");
+        let stats = scripted.actors()[2].ai.as_ref().unwrap().stats();
+        assert!(stats.fallbacks >= 3 && stats.turns == 0, "{what}: {stats:?}");
+    }
+}
+
+#[test]
+fn an_attack_with_a_random_aim_hits_one_member_whichever_the_script_names() {
+    use crate::action::Aim;
+    // Aim::Random is refused by the engine's own `aim_at` for one target and for a side; the enemy's own
+    // rule plays it on ONE party member: the one the script named, or one drawn among the living when it
+    // named them all (no draw for a single candidate).
+    let random = crate::action::EnemyAction { id: LASER, spec: laser().spec.with_aim(Aim::Random) };
+    let whole = Asm::act_on(|a| a.val(2, 0x20A0), LASER);
+    let one = Asm::act_on(|a| a.k1(0b10), LASER);
+    let victims = |main: &Asm, seed: u64| {
+        let mut foe = scripted_foe(None, main);
+        foe.actions.push(random);
+        let mut state = battle_with(seed, party_of(3), vec![foe]);
+        let turn = first_turn_of(&mut state, ActorId(3));
+        let hit: Vec<u8> = turn
+            .iter()
+            .filter_map(|e| match e {
+                BattleEvent::Damage { target, .. } | BattleEvent::Miss { target, .. } => Some(target.0),
+                _ => None,
+            })
+            .collect();
+        (hit, announced(&turn, ActorId(3)))
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    for seed in 0..60 {
+        let (hit, said) = victims(&whole, seed);
+        assert_eq!((hit.len(), said), (1, vec![LASER]), "seed {seed}: one member, one announcement");
+        seen.insert(hit[0]);
+        assert_eq!(victims(&one, seed).0, vec![1], "the member the script named");
+    }
+    assert_eq!(seen.into_iter().collect::<Vec<_>>(), vec![0, 1, 2], "every member is drawn sometimes");
 }
 
 #[test]
 fn a_whole_party_attack_pays_its_mp_once_and_queued_attacks_each_pay_theirs() {
     let paying = |mp: u32, main: &Asm| {
-        let mut foe = scripted_foe(None, main);
-        foe.actions[0].spec.mp_cost = 4;
+        let mut foe = laser_foe(None, main);
+        for action in &mut foe.actions {
+            action.spec.mp_cost = 4;
+        }
         foe.mp = mp;
         foe.max_mp = mp;
         foe
@@ -368,7 +487,7 @@ fn a_whole_party_attack_pays_its_mp_once_and_queued_attacks_each_pay_theirs() {
         turn.iter().filter_map(|e| if let BattleEvent::MpSpent { amount, .. } = e { Some(*amount) } else { None }).collect()
     };
     // The whole party in one attack: 4 MP, once.
-    let whole = Asm::act_on(|a| a.val(2, 0x20A0), ATTACK);
+    let whole = Asm::act_on(|a| a.val(2, 0x20A0), LASER);
     let mut state = battle_of(3, vec![paying(10, &whole)]);
     let turn = first_turn_of(&mut state, FOE);
     assert_eq!(spent(&turn), vec![4]);
@@ -389,8 +508,8 @@ fn a_whole_party_attack_pays_its_mp_once_and_queued_attacks_each_pay_theirs() {
 fn queued_and_whole_party_attacks_replay_exactly() {
     // The same battle built twice plays alike, in one go or tick by tick, and another seed differs.
     let double = aim_and_act(aim_and_act(Asm::default(), 0b01, ATTACK), 0b10, ATTACK).op(op::END);
-    let whole = Asm::act_on(|a| a.val(2, 0x20A0), ATTACK);
-    let build = |seed: u64| battle_with(seed, party_of(3), vec![scripted_foe(None, &double), scripted_foe(None, &whole)]);
+    let whole = Asm::act_on(|a| a.val(2, 0x20A0), LASER);
+    let build = |seed: u64| battle_with(seed, party_of(3), vec![scripted_foe(None, &double), laser_foe(None, &whole)]);
     let run = |seed: u64| {
         let mut state = build(seed);
         let log = all(&per_tick(&mut state, 900));

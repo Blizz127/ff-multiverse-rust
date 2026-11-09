@@ -23,7 +23,7 @@ use fmv_ff7_battle::rules::{BattleEvent, Command, Outcome};
 use fmv_persist::CharacterProgress;
 use fmv_protocol::{
     ActionRef, ActorId, BattleMember, BattleReplay, BattleReward, BattleSetup, ClientMsg, PartyEvent, RejectCode, ServerMsg,
-    SyntheticRules, PROTOCOL_VERSION,
+    SyntheticRules, Target, PROTOCOL_VERSION,
 };
 use fmv_server::{BattleSettings, ServerConfig};
 use tempfile::TempDir;
@@ -271,7 +271,7 @@ async fn limit_then_run(j: &mut Joined, rules: &SyntheticRules) -> Ran {
         if !pending && state.outcome().is_none() && state.ready_actors().contains(&mine) {
             let target = state.enemy_ids().into_iter().find(|e| state.actor(*e).is_some_and(|c| c.is_alive())).expect("a living enemy");
             let command = match (limits_used, state.limit_ready(mine), state.limit_gauge(mine)) {
-                (0, true, _) => Command::Limit { target },
+                (0, true, _) => Command::Limit { target: Target::One(target) },
                 (0, false, _) => Command::Attack { target },
                 (_, _, 0) => Command::Attack { target },
                 _ => Command::Escape,
@@ -519,19 +519,21 @@ async fn a_member_who_left_mid_battle_is_still_paid_in_the_store() {
     again.shutdown().await;
 }
 
-/// The reason for v5, v6, v7, v8 and again for v9: a client of the version before is refused at the handshake,
+/// The reason for v5, v6, v7, v8, v9 and again for v10: a client of the version before is refused at the handshake,
 /// with the version in the reason, instead of being sent a message it cannot decode (v5: the progress
 /// that follows every join; v6: the inventory that follows it, and the new battle events; v7: the limit
 /// and escape commands, events and outcome, and the limit gauge of every battle member; v8: its Hello has no character,
 /// so the server cannot even read it, and its roster members have no names; v9: its Hello is still a Hello, so only
-/// the version refuses it, and the roster of its first battle would have members it cannot read).
+/// the version refuses it, and the roster of its first battle would have members it cannot read; v10: its Hello is
+/// still a Hello too, and the target of its first spell, item or limit would be a bare actor, which a v10 server does
+/// not read as a target, while a v9 client could not read the whole sides a v10 server announces).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_client_of_the_previous_protocol_version_is_refused_at_the_handshake() {
-    assert_eq!(PROTOCOL_VERSION, 9);
+    assert_eq!(PROTOCOL_VERSION, 10);
     let server = TestServer::start(fast(None)).await;
-    for old_version in [8u16, 7, 6, 5, 4] {
+    for old_version in [9u16, 8, 7, 6, 5, 4] {
         let mut old = Client::connect(server.addr).await;
-        // A v8 Hello asks for a character (and reads as a v9 Hello); the older ones carried a colour and a look.
+        // A v8 or v9 Hello asks for a character (and reads as a v10 Hello); the older ones carried a colour and a look.
         let hello = if old_version >= 8 {
             format!(
                 r#"{{"Hello":{{"protocol_version":{old_version},"client_build":"old","auth":{{"Register":{{"display_name":"Old{old_version}"}}}},"character":{{"tint":[1,2,3],"body":null,"slot":null}}}}}}"#

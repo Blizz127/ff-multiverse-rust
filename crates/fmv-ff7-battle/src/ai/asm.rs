@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::action::{ActionSpec, EnemyAction};
+use crate::action::{ActionSpec, Aim, EnemyAction};
 use crate::rules::{BattleConfig, BattleState, Combatant, StartMode};
 
 use super::script::{self, op, EnemyScripts};
@@ -122,6 +122,9 @@ pub const ATTACK: u16 = 0x0110;
 /// An attack the invented scene defines that costs 4 MP and that the rules cannot play (no foe has an
 /// action for it).
 pub const OTHER: u16 = 0x0111;
+/// An attack the invented scene defines that can only hit the whole party at once (the record's targeting of
+/// the Guard Scorpion's Tail Laser, [`Aim::Side`]); a foe can play it once it is given [`laser`] as an action.
+pub const LASER: u16 = 0x0112;
 
 /// The attacks of the invented scene.
 pub fn attacks() -> Arc<[AiAttack]> {
@@ -134,7 +137,19 @@ pub fn attacks() -> Arc<[AiAttack]> {
             id: OTHER,
             mp_cost: 4,
         },
+        AiAttack {
+            id: LASER,
+            mp_cost: 0,
+        },
     ])
+}
+
+/// The action [`LASER`]: a physical attack of power 16 that hits a whole side and nothing else.
+pub fn laser() -> EnemyAction {
+    EnemyAction {
+        id: LASER,
+        spec: ActionSpec::basic_attack(16, 100, true).with_aim(Aim::Side),
+    }
 }
 
 /// A foe that can play [`ATTACK`] (a plain physical attack) and follows `main` (and `init`).

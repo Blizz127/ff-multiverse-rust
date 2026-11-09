@@ -332,6 +332,8 @@ impl Server {
                     battle_speed = b.battle_speed,
                     ticks_per_second = b.ticks_per_second,
                     fixed_seed = b.fixed_seed.is_some(),
+                    companion_turn_wait_ms = b.companion_pacing.turn_wait_ms,
+                    companion_max_wait_ms = b.companion_pacing.max_wait_ms,
                     "battles supported (server-authoritative; clients replay them from their own battle data)"
                 );
                 if b.debug_limit_full {

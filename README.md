@@ -59,7 +59,8 @@ per-game appearance binding (a generic placeholder body in FF7), a fighting styl
 canon party member, separate from the canon story roles) and pointers to its progress, and
 **the story's own party fights beside the players (protocol v9)**: the canon Cloud and Barret of the first
 reactor mission are in every battle as companions the server commands, and each player's character is ADDED
-after them, in its own body, replacing nobody. The
+after them, in its own body, replacing nobody, and **a spell, an item or a limit can hit a whole side (protocol
+v10)**: an ALL place for the target pointer, FF7's All materia rule and the 2/3 split. The
 synthetic **FIXTURE** plaza still exists
 as a labelled test area; it says nothing about FF7 support.
 
@@ -71,6 +72,7 @@ as a labelled test area; it says nothing about FF7 support.
 | M2-c/d | Shared battle, battle return, per-player rewards | done (battle subset; rewards paid into each account's own character progress and saved) |
 | M2-e | Player characters: identity, per-game binding, fighting style (a stat curve) separate from canon roles, pointers to progress (protocol v8) | done for the slice (FF7: generic placeholder bodies, fixed styles; `scripts/slice-smoke.sh`) |
 | M2-f | The story's canon party fights beside the players as server-controlled companions; players are added after them (protocol v9) | done for the first reactor mission (FF7: Cloud and Barret; `scripts/battle-smoke.sh`, `scripts/slice-smoke.sh`) |
+| M2-g | Whole-side targeting: spells, items and limits can hit one target or a whole side, the party side being the canon companions and the players (protocol v10) | done for spells, items and limits (FF7: the All materia rule, the 2/3 split; the enemies' own AI still picks one party member; `scripts/battle-smoke.sh --commands`) |
 | Later | FF8, FF9, FF10 and FF12 adapters on the same core | planned |
 
 **Walking between fields (protocol v4).** The server hosts many fields: the entry field
@@ -370,7 +372,10 @@ command menu on your turn, the floating numbers and the pointer over the models'
 band across the top that is green while your client's replay agrees with the server and red if it
 ever diverges); the arrow keys (or WASD) move in the menu, **Space** or **Enter** confirm and
 **Backspace** goes back. The menu has Attack (which says **Limit** while your limit gauge is full),
-Magic, Item, Defend and **Escape** (greyed out in a battle that cannot be run from). A machine without battle data to replay the battle (or one started with
+Magic, Item, Defend and **Escape** (greyed out in a battle that cannot be run from). A spell, item or
+limit that can hit a whole side has one more place for the target pointer, **ALL** (one step past the
+last target, with the same arrow keys: there is no extra key; Healing Wind and Megalixir start on it).
+A machine without battle data to replay the battle (or one started with
 `FMV_BATTLE_FLAT=1`) shows the flat view instead: one token per fighter with a thin HP bar. (The
 battle scene has been checked by unit tests and offscreen renders only: this box has no display,
 so the window itself was not run.)
@@ -533,8 +538,8 @@ inventory is saved inside the account's character record (older records without 
 are not rewritten until an item is used or found), and the server tells the player what it carries
 when it joins, after every item used and after drops. A won battle drops items rolled by the server
 from the enemies' own drop rates (`scene.bin`), dealt to the living members, logged and not part of
-the replay. Known gaps: no statuses, no spells or items that hit a whole side, no summons, party
-elemental resistances are not modelled (limit breaks and escape are in protocol v7, below).
+the replay. Known gaps: no statuses, no summons, party elemental resistances are not modelled (limit
+breaks and escape are in protocol v7, whole sides in v10, below).
 
 **Limit breaks and escape (protocol v7).** Every character has a **limit gauge** (0 to 255) that enemy
 blows fill (`damage * 76800 / (max HP * HP divisor)`; the divisor is the character's own, read from
@@ -546,9 +551,9 @@ each character is its first (limit level 1: Braver, Big Shot, Beat Rush, Healing
 Lightning, Galian Beast, Boost Jump); its id, name and gauge divisor are the owner's own data, while the
 **damage of a limit is not in the owner's files** (the kernel's attack data stops before the limit ids),
 so it is the community's multiplier (Braver 3x a normal attack, Big Shot and Boost Jump 3.25x, ...), and
-Healing Wind heals one chosen ally for half of its max HP (FF7: the whole party). Not modelled: limit
-levels above 1 and the kills and uses that earn them, Cait Sith's Dice, Tifa's slot reels, Vincent's
-transformation, whole-side limits. **Escape** is the last row of the menu (FF7 runs by holding L1+R1,
+Healing Wind heals the whole party, each member for half of its own max HP (protocol v10: its record is
+"All Al (NS)"). Not modelled: limit levels above 1 and the kills and uses that earn them, Cait Sith's
+Dice, Tifa's slot reels, Vincent's transformation, the whole-side limits of the higher levels. **Escape** is the last row of the menu (FF7 runs by holding L1+R1,
 which this window cannot do cleanly): FF7's escape does not depend on levels but on the formation's *Run
 Difficulty* (`scene.bin`'s escape counter, 1 for most fights) and a Run Check that succeeds one time in
 four (always, after a preemptive strike or on a side attack); the actor spends its turn on four checks,
@@ -558,8 +563,32 @@ the battle for the whole party with `Escaped`: nothing is paid. The **gauge is s
 battle**, whatever the outcome (escapes included), in the account's character record (a record of its own
 is made for an account that has never won, so "nothing is written until its first win" now reads "until
 its first win or the first battle that ends with a gauge worth keeping"); records written before v7 load
-with an empty gauge. The headless bot gives its limit when the gauge is full (a healing one only to a
-wounded ally) and never runs, unless a `--battle-script` tells it to (next paragraph).
+with an empty gauge. The headless bot gives its limit when the gauge is full (a healing one, which heals the whole
+party, only when somebody is wounded) and never runs, unless a `--battle-script` tells it to (see below).
+
+**Whole sides (protocol v10).** `Command::Magic`, `Item` and `Limit` carry a `Target`: one actor, or
+`AllEnemies` / `AllAllies` (named from the commanding actor's point of view, so an enemy's AI will ask the
+same way). On the party side `AllAllies` is the whole roster of protocol v9, the canon Cloud and Barret and the
+players alike, so one Cure can heal five fighters, and a player can aim a Cure or a Potion at one companion with
+`One`: the pointer walks the roster in actor order, the companions first, and then ALL. The canon companions give
+a limit the same way, from its own record (Healing Wind on the whole party, only while somebody is hurt; a
+damaging limit at the first living enemy). What can be aimed how is the record's own targeting bits, read from the owner's `kernel.bin`:
+Cure, Life, Fire, Ice and Bolt can hit one target or a whole side ("All Tar/1 Tar"), Ultima, Megalixir and
+Healing Wind only a whole side ("All Tar (NS)"), and no item has a toggle. FF7's rule for the first kind of
+spell is that it needs an **All materia** paired with its magic materia, which allows it as many times per
+battle as the materia's level (Terence Fergusson's *FF7 Party Mechanics Guide*): the engine keeps that count
+per character (`Combatant::all_left`, read from the kernel's All materia, id 23, at level 1: once per battle,
+the one All being counted for the whole starter grimoire), a whole-side cast spends one, and the Magic list
+says `ALL x1`. An action that hits several targets **splits** its damage: 2/3 for each target (Fergusson's
+*Battle Mechanics* FAQ), for the physical formula and Cure's, and for a spell only when it could have been
+one target; a fraction of HP, a flat amount or "everything" (Life, potions, Megalixir) never splits, and
+neither does a lone target. The pseudocode page on the FFRTT wiki writes the factor as 3/2; the FAQ, the Final
+Fantasy Wiki and the community say 2/3, which is used (labelled in `crates/fmv-ff7-battle/src/action.rs`).
+A whole side is one `Action` followed by one `Damage`, `Heal`, `Miss` or `Revive` per target in actor order
+(no new events), every roll drawn per target, so the replay checks it like anything else. The enemies still
+pick one random party member each turn (their own AI, which can ask for a whole side through the same
+`Target`, is another change). `--battle-script` takes `magic:<id>:all` and `item:<id>:all`, and
+`scripts/battle-smoke.sh --commands` casts Cure on the whole party over real processes.
 
 **Every command over real processes (`--battle-script`, `--debug-limit-full`).** The headless bots only attack
 (and heal below 30% HP, which the first enemies never bring about) and a limit gauge fills by only a few points
@@ -608,13 +637,15 @@ session 1 at a higher level than they joined at (told `leveled_up=true`, stored)
 servers it then restarts WITHOUT the flags tell and fight them at exactly those levels and gauges.
 `scripts/battle-smoke.sh --commands --build` uses all of it on the real field `md1stin` and owned data: one
 server (with both debug flags) stays up through two runs of the same two bots; in the first they follow
-`defend,item:0,magic:0` and `magic:0,magic:9999,item:0,defend` (spell 9999 does not exist: that entry
-must be skipped and counted) and win, in the second both try `escape` until the battle ends in Escaped (formation
+`magic:0:all,defend,item:0,magic:0` (Cure on the whole party first, the canon pair included) and
+`magic:0,magic:9999,item:0,defend` (spell 9999 does not exist: that entry must be skipped and counted) and win, in the second both try `escape` until the battle ends in Escaped (formation
 12 has run difficulty 1; one attempt gets away 68% of the time). It FAILS unless the server applied each of
 magic, item, defend and escape at least once (the bots' breakdowns and the server's own log lines must
 agree), a canon companion gave its limit break through the server's rule (players have none, so no bot's `limit` is
 ever applied), every battle was replayed by each bot from its own battle data, the companions' commands included, with
-0 divergences, both battles started with the players' `limits=[255, 255]` and the debug gauge was never stored.
+0 divergences, both battles started with the players' `limits=[255, 255]` and the debug gauge was never stored, and (with
+the default scripts) the server logged exactly one `magic used ... spell=0 target=all-allies` line, bot A's Cure on the
+whole party.
 `FMV_SMOKE_SCRIPT_A`, `FMV_SMOKE_SCRIPT_B` and
 `FMV_SMOKE_ESCAPE_SCRIPT` override the scripts (to try its failure paths).
 
@@ -710,6 +741,15 @@ field: he is in the party.)
   is the whole rule, a pure function of the engine's state (deterministic, never refused by it). A companion fights at
   the party leader's level (`--battle-level` pins everybody's), is never paid and never saved, cannot be commanded by a
   client (`NotYourActor`), and does not keep a battle alive: a battle with no connected player left is dropped.
+* **The players go first.** A companion whose gauge is full waits while a living, connected player still owes a turn
+  this round (`fmv_server::companion::may_act`), so the players lead every round and Cloud and Barret follow. A player
+  who is choosing holds them for at most `--companion-turn-wait-ms` (default 5000) after its own gauge filled, and no
+  companion holds a full gauge longer than `--companion-max-wait-ms` (default 10000; 0 makes the companions act the
+  instant their gauge fills, as the first v9 build did). Without it the canon pair finished most of md1stin's fights
+  before a player's turn came (a solo player acted in 41-88% of them, two players in 11-41%); with it a solo player acts
+  in every one and a companion never takes a turn in a fight in which a player got none (the real-data gate
+  `with_pacing_every_player_acts_in_every_fight_of_the_first_field`). The `companion acted` line ends with `held_ms=`,
+  how long it waited. Pacing only decides WHEN the server submits a companion's command, so clients need no change.
 * **Players are paid, companions are not.** Experience and gil are shared among the living PLAYERS only
   (`fmv_protocol::reward_roster`, used by the server and by every replaying client), AP goes to each player, and only
   a player's progress, inventory and limit gauge are saved.
@@ -801,6 +841,18 @@ the player roster, the companion roster and the controller, and one reads a v8 m
 ever saved, a player's stored limit gauge is kept exactly as it is and no record is re-keyed or moved, so roll the
 server back to a v8 build on the same state directory (and the clients with it: a v8 client is refused by a v9 server
 and the other way round). Characters created by v9 are the same as v8's.
+
+**Protocol v10** (`fmv-protocol`) makes the target of a spell, an item and a limit a `Target`: one actor (`{"One":3}`) or
+a whole side (`"AllEnemies"`, `"AllAllies"`), named from the commanding actor's side, in place of a bare actor number
+(`Command::Attack` keeps its one `target`). It changes no event, message or stored record (a whole side is one `Action` and
+an effect per target in actor order), so only the commands differ, and they differ for everybody who gives one: a player,
+and the server for a canon companion (its commands travel in the same `BattleEvent`s). Neither version reads the other's
+command, and a v9 `Hello` is still a v10 `Hello`, so the version number is what refuses the older peer: a v9 client or
+server is refused at the handshake, cleanly, as v8 was (golden JSON tests pin every shape, a test decodes a v9 command
+with a v10 reader and the other way round and fails on purpose, and a real socket test checks the refusal of v9 and every
+older version). **Rolling back v10:** v10 writes nothing a v9 build cannot read: the All materia uses of a battle are
+engine state derived from the player's own data and nothing stores them, so roll the server back to a v9 build on the
+same state directory (and the clients with it: a v9 client is refused by a v10 server and the other way round).
 
 ## Importing your own FF7 data
 

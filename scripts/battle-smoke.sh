@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/battle-smoke.sh - shared-battle smoke test for fmv-server + fmv-client (protocol v9).
+# scripts/battle-smoke.sh - shared-battle smoke test for fmv-server + fmv-client (protocol v10).
 #
 # Usage: scripts/battle-smoke.sh [--fixture|--random|--progress|--commands|--solo] [--release|--debug]
 #                                [--bin-dir DIR] [--build] [--library STATE_DIR] [--duration SECS]
@@ -118,12 +118,16 @@
 # alone is in `fmv-server --help`) and the bots follow a --battle-script. ONE server stays up through two
 # runs of the same two bots (they log in again with the tokens the first run saved; each run is one
 # battle of formation 12, whose run difficulty is 1, so it can be escaped):
-#   run 1 "cmds":   A: defend,item:0,magic:0   B: magic:0,magic:9999,item:0,defend
-#                   (Potion is item 0, Cure is spell 0; spell 9999 does not exist: the entry must be skipped,
-#                   counted and not retried, and the next one tried in the same turn). There is no `limit` entry:
-#                   players have no limit break in v9 (the server would refuse it, NoLimit), so the limit break is
-#                   the canon companions': --debug-limit-full fills their gauge and the server's rule gives it.
-#                   Expected: both bots win it.
+#   run 1 "cmds":   A: magic:0:all,defend,item:0,magic:0   B: magic:0,magic:9999,item:0,defend
+#                   (Potion is item 0, Cure is spell 0; `magic:0:all` is Cure on the WHOLE PARTY, the canon Cloud and
+#                   Barret and the players alike, which takes the once-per-battle use of the All materia every
+#                   character has (protocol v10: read from the owner's kernel) and is checked below as the server's own
+#                   `target=all-allies`; it goes FIRST so that it is applied in a fight that ends before a bot has had its
+#                   fourth turn (the whole-party cast is the one entry the mode checks the server for); spell 9999 does not
+#                   exist: the entry must be skipped, counted and not retried, and the next one tried in the same turn).
+#                   There is no `limit` entry: players have no limit break in v9 (the server would refuse it, NoLimit),
+#                   so the limit break is the canon companions': --debug-limit-full fills their gauge and the server's
+#                   rule gives it. Expected: both bots win it.
 #   run 2 "escape": A and B: escape x6 (a run check succeeds 68% of the time per attempt, so several attempts
 #                   are listed; the first success ends the battle). Expected: the battle ends in Escaped.
 # The scripts can be overridden to try the mode's failure paths: FMV_SMOKE_SCRIPT_A, FMV_SMOKE_SCRIPT_B
@@ -143,6 +147,9 @@
 #   * both "battle started" lines say the PLAYERS' limits=[255, 255] (the --debug-limit-full gauge, sent in the
 #     roster and ignored by the engine for players), the second one says how hard the fight is to run from
 #     (run_difficulty=N, a number), and the server warned about the debug flag when it started;
+#   * whole sides (protocol v10): with the default script A, the server logged exactly one `magic used ... spell=0
+#     target=all-allies` line (A's `magic:0:all`; a one-target cast says the actor's number, and the canon companions
+#     never cast on a whole side);
 #   * the debug gauge is never stored: no "limit kept" line at all, and one "limit not kept ...
 #     reason=debug-limit-full" line for every battle that ended;
 #   * each bot's script line "entries=N applied=N skipped=N refused=N lost=N unused=N" adds up, and the
@@ -197,7 +204,9 @@ COMMANDS_DURATION=12
 # Potion is item 0, Cure is spell 0 (checked against the owner's data by the --ignored real-data tests of
 # fmv-ff7-battle and fmv-client); spell 9999 does not exist, so script B has one entry that must be skipped. No `limit`
 # entry: players have no limit break in v9 (it would be refused NoLimit); the companions give the limit break.
-SCRIPT_A="${FMV_SMOKE_SCRIPT_A:-defend,item:0,magic:0}"
+# `magic:0:all` is Cure on the whole party (an All materia use, protocol v10); it goes first so that a fight that ends
+# before a bot's fourth turn still has it applied (the mode checks the server's `target=all-allies` line for it).
+SCRIPT_A="${FMV_SMOKE_SCRIPT_A:-magic:0:all,defend,item:0,magic:0}"
 SCRIPT_B="${FMV_SMOKE_SCRIPT_B:-magic:0,magic:9999,item:0,defend}"
 ESCAPE_SCRIPT="${FMV_SMOKE_ESCAPE_SCRIPT:-escape,escape,escape,escape,escape,escape}"
 
@@ -223,8 +232,9 @@ reconnect must show what the run before ended with. --solo: one new character al
 canon Cloud and Barret and then itself (nobody dropped or replaced), the canon pair commanded by the server and
 every command replayed by the bot with 0 divergences. --commands: every battle command over real
 processes: the server runs with --debug-limit-full (every member starts with a full limit gauge) and
-the bots follow a --battle-script, once to use defend, item and magic in a battle they win (the limit
-break is the canon companions': players have none in protocol v9) and once to escape; each command must
+the bots follow a --battle-script, once to use defend, item and magic in a battle they win (Cure on the whole
+party among them, which the server must log as target=all-allies exactly once; the limit break is the
+canon companions': players have none in protocol v9) and once to escape; each command must
 be applied by the server at least once (the bots' own breakdown
 "(N attack, N magic, N item, N defend, N limit, N escape)" and the server's own log lines must agree)
 and every battle must be verified by replay with 0 divergences. The scripts can be overridden with
@@ -359,6 +369,21 @@ count_lines_with() {
   }
   while IFS= read -r line || [[ -n $line ]]; do
     if [[ $line == *"$needle"* ]]; then
+      n=$((n + 1))
+    fi
+  done <"$file"
+  printf '%s' "$n"
+}
+
+# count_lines_with_both <file> <needle> <needle>: how many lines contain both needles.
+count_lines_with_both() {
+  local file="$1" first="$2" second="$3" line n=0
+  [[ -r $file ]] || {
+    printf '0'
+    return 0
+  }
+  while IFS= read -r line || [[ -n $line ]]; do
+    if [[ $line == *"$first"* && $line == *"$second"* ]]; then
       n=$((n + 1))
     fi
   done <"$file"
@@ -1519,6 +1544,15 @@ run_commands() {
     ((value == CMD_TOTAL[$kind])) || problem "the server logged $value '$needle' line(s), but the bots counted ${CMD_TOTAL[$kind]} $kind command(s) applied"
   done
   log_has "$WORK/server.log" "magic used battle=" && { log_has "$WORK/server.log" " spell=0 " || problem "the server's 'magic used' lines name no spell=0 (Cure)"; }
+  # Whole sides (protocol v10): the default script A casts Cure on the whole party once (its All materia use), and the
+  # server's record of it says so; a one-target cast says the actor's number as it always did. Only a `magic used`
+  # line counts (a companion's `companion acted` line never has a whole-side spell, but the check does not rely on it).
+  if [[ -z ${FMV_SMOKE_SCRIPT_A:-} ]]; then
+    value=$(count_lines_with_both "$WORK/server.log" "magic used battle=" " spell=0 target=all-allies ")
+    [[ $value == 1 ]] || problem "the server logged $value 'magic used ... spell=0 target=all-allies' line(s) (Cure on the whole party), expected exactly 1 (only bot A's default script has one)"
+    value=$(count_lines_with "$WORK/server.log" "target=all-allies")
+    [[ $value == 1 ]] || problem "the server logged $value line(s) with a whole-party target (target=all-allies), expected exactly 1 (the one 'magic used' line)"
+  fi
   log_has "$WORK/server.log" "item used battle=" && { log_has "$WORK/server.log" " item=0 left=" || problem "the server's 'item used' lines name no item=0 (Potion)"; }
   while IFS= read -r line || [[ -n $line ]]; do
     if [[ $line == *"item used battle="* ]]; then
@@ -1584,6 +1618,9 @@ run_commands() {
   for needle in "magic used battle=" "defend used battle=" "item used battle=" "escape tried battle=" "companion acted battle="; do
     say "server: $(count_lines_with "$WORK/server.log" "$needle") line(s) '$needle', e.g. $(last_line_with "$WORK/server.log" "$needle" || true)"
   done
+  if [[ -z ${FMV_SMOKE_SCRIPT_A:-} ]]; then
+    say "server: the whole-party Cure (protocol v10), $(count_lines_with_both "$WORK/server.log" "magic used battle=" " spell=0 target=all-allies ") line(s): $(last_line_with "$WORK/server.log" "target=all-allies" || true)"
+  fi
   say "server: the canon companions' limit breaks: $(count_lines_with "$WORK/server.log" "command=limit attack=") 'companion acted ... command=limit' line(s) (players have none: $(count_lines_with "$WORK/server.log" "limit used battle=") 'limit used' lines)"
   say "commands applied by the server for the bots, both runs: ${CMD_TOTAL[attack]} attack, ${CMD_TOTAL[magic]} magic, ${CMD_TOTAL[item]} item, ${CMD_TOTAL[defend]} defend, ${CMD_TOTAL[limit]} limit, ${CMD_TOTAL[escape]} escape"
   RESULT=pass

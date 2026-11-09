@@ -41,8 +41,25 @@
 //! The target is remembered as an [`ActorId`], never as a position, so it survives the roster
 //! changing under the pointer: when the selected fighter dies, the pointer moves to the first valid
 //! one left, and when none is left at all the menu steps back a level.
+//!
+//! # Whole sides (protocol v10)
+//!
+//! A spell, an item or a limit that can hit a whole side ([`Reach`]) has one more place for the pointer:
+//! **ALL**, which brackets every fighter of the side at once (the engine says who is on it: the living, or the
+//! fallen for a revival) and sends `Target::AllEnemies` or `Target::AllAllies`. There is no key for it, so a
+//! window that only has the arrows and Enter needs nothing new: the pointer starts on the first target as it
+//! always did, and **Down or Right past the last target (or Up or Left before the first) moves it to ALL**,
+//! and one more step goes back round to the first target. What can be aimed that way is the engine's word,
+//! from this machine's own data, filled into the model at every message:
+//!
+//! * [`Reach::OneOrAll`]: Cure and Fire and every spell of their kind have the ALL place only while the
+//!   character has an All materia use left this battle ([`BattleMenuModel::all_left`]; the list says
+//!   `ALL x1`), because that is FF7's rule for them; an item or a limit of that kind always has it;
+//! * [`Reach::All`]: Ultima, Megalixir and Healing Wind hit a whole side and nothing else, so the pointer starts
+//!   on ALL and stays there (the arrows do nothing) until Enter sends it or Backspace goes back;
+//! * [`Reach::One`]: everything else, as before.
 
-use fmv_ff7_battle::rules::{ActorId, Command};
+use fmv_ff7_battle::rules::{ActorId, Command, Target};
 
 /// Rows a Magic or Item list shows at once.
 pub const LIST_ROWS: usize = 4;
@@ -99,6 +116,19 @@ impl TargetRule {
     }
 }
 
+/// How many a spell, item or limit can be aimed at, as the menu offers it (the engine's `Aim`, with the All
+/// materia folded in by the client: see the module docs, "Whole sides").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Reach {
+    /// One target.
+    #[default]
+    One,
+    /// One target, or the whole side (the pointer has an ALL place).
+    OneOrAll,
+    /// The whole side only (the pointer starts on ALL and stays).
+    All,
+}
+
 /// One spell of the Magic list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MenuSpell {
@@ -108,11 +138,18 @@ pub struct MenuSpell {
     /// The engine allows it at all (it is greyed out when `false`; MP is checked on top of this).
     pub enabled: bool,
     pub target: TargetRule,
+    /// One target, or a whole side too, or a whole side only (see [`Reach`]).
+    pub reach: Reach,
 }
 
 impl MenuSpell {
     pub fn new(id: u16, name: impl Into<String>, mp_cost: u16, target: TargetRule) -> Self {
-        Self { id, name: name.into(), mp_cost, enabled: true, target }
+        Self { id, name: name.into(), mp_cost, enabled: true, target, reach: Reach::One }
+    }
+
+    /// The same spell with a way of aiming it that is not one target.
+    pub fn with_reach(self, reach: Reach) -> Self {
+        Self { reach, ..self }
     }
 }
 
@@ -125,11 +162,18 @@ pub struct MenuItem {
     /// The engine allows it at all (greyed out when `false`; the count is checked on top of this).
     pub enabled: bool,
     pub target: TargetRule,
+    /// One target, or a whole side too, or a whole side only (see [`Reach`]).
+    pub reach: Reach,
 }
 
 impl MenuItem {
     pub fn new(id: u16, name: impl Into<String>, count: u16, target: TargetRule) -> Self {
-        Self { id, name: name.into(), count, enabled: true, target }
+        Self { id, name: name.into(), count, enabled: true, target, reach: Reach::One }
+    }
+
+    /// The same item with a way of aiming it that is not one target.
+    pub fn with_reach(self, reach: Reach) -> Self {
+        Self { reach, ..self }
     }
 
     fn usable(&self) -> bool {
@@ -149,11 +193,18 @@ pub struct MenuLimit {
     /// The gauge is full: the first command says `Limit` instead of `Attack`. The client refreshes it with
     /// every message of the battle (the gauge moves only with them).
     pub ready: bool,
+    /// One target, or the whole party only (Healing Wind: [`Reach::All`]).
+    pub reach: Reach,
 }
 
 impl MenuLimit {
     pub fn new(id: u16, name: impl Into<String>, target: TargetRule, ready: bool) -> Self {
-        Self { id, name: name.into(), target, ready }
+        Self { id, name: name.into(), target, ready, reach: Reach::One }
+    }
+
+    /// The same limit with a way of aiming it that is not one target.
+    pub fn with_reach(self, reach: Reach) -> Self {
+        Self { reach, ..self }
     }
 }
 
@@ -170,6 +221,10 @@ pub struct BattleMenuModel {
     pub limit: Option<MenuLimit>,
     /// The battle can be run from (the engine takes `Escape`).
     pub escape: bool,
+    /// How many more times in this battle our character may hit a whole side with a spell that needs an All
+    /// materia use (the list shows it; a spell that needs one has [`Reach::OneOrAll`] only while this is not 0,
+    /// which the client sets when it fills the model).
+    pub all_left: u8,
 }
 
 impl BattleMenuModel {
@@ -223,11 +278,13 @@ impl Ctx<'_> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Choice {
     Attack { target: ActorId },
-    Magic { spell: u16, target: ActorId },
-    Item { item: u16, target: ActorId },
+    /// A spell on one target or a whole side (protocol v10).
+    Magic { spell: u16, target: Target },
+    /// An item on one target or a whole side (protocol v10).
+    Item { item: u16, target: Target },
     Defend,
-    /// Our character's limit break (protocol v7).
-    Limit { target: ActorId },
+    /// Our character's limit break (protocol v7), on one target or the whole party (v10).
+    Limit { target: Target },
     /// Run (protocol v7).
     Escape,
 }
@@ -308,11 +365,22 @@ enum Aimed {
     Limit,
 }
 
+/// Where the pointer of an open target selection is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Aim {
+enum At {
+    /// On this one fighter.
+    One(ActorId),
+    /// On the whole side (every fighter [`Ctx::candidates`] says).
+    All,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Aiming {
     what: Aimed,
     rule: TargetRule,
-    target: ActorId,
+    /// What the pointer may be on besides one fighter.
+    reach: Reach,
+    at: At,
     /// The level `Back` returns to.
     from: Level,
 }
@@ -322,7 +390,7 @@ enum State {
     Commands,
     Magic,
     Items,
-    Aiming(Aim),
+    Aiming(Aiming),
 }
 
 impl State {
@@ -408,16 +476,19 @@ impl BattleMenu {
     }
 
     /// The state with a target that is still valid: a target that died is replaced by the first
-    /// valid one left, and a selection with nobody left to aim at goes back a level.
+    /// valid one left, and a selection with nobody left to aim at goes back a level. The whole side stays
+    /// the whole side for as long as anybody is on it.
     fn resolved(&self, ctx: &Ctx<'_>) -> State {
         let State::Aiming(aim) = self.state else { return self.state };
         let candidates = ctx.candidates(aim.rule);
-        if candidates.contains(&aim.target) {
-            self.state
-        } else if let Some(first) = candidates.first() {
-            State::Aiming(Aim { target: *first, ..aim })
-        } else {
-            State::of_level(aim.from)
+        match aim.at {
+            At::All if !candidates.is_empty() => self.state,
+            At::One(target) if candidates.contains(&target) => self.state,
+            At::One(_) => match candidates.first() {
+                Some(first) => State::Aiming(Aiming { at: At::One(*first), ..aim }),
+                None => State::of_level(aim.from),
+            },
+            At::All => State::of_level(aim.from),
         }
     }
 
@@ -446,8 +517,8 @@ impl BattleMenu {
             MenuKey::Confirm => match self.command {
                 // A full limit gauge puts the limit where Attack was.
                 ATTACK => match ctx.model.ready_limit() {
-                    Some(limit) => self.start_aim(Aimed::Limit, limit.target, Level::Commands, ctx),
-                    None => self.start_aim(Aimed::Attack, TargetRule::Enemies, Level::Commands, ctx),
+                    Some(limit) => self.start_aim(Aimed::Limit, limit.target, limit.reach, Level::Commands, ctx),
+                    None => self.start_aim(Aimed::Attack, TargetRule::Enemies, Reach::One, Level::Commands, ctx),
                 },
                 MAGIC if ctx.model.has_magic() => {
                     self.state = State::Magic;
@@ -484,47 +555,75 @@ impl BattleMenu {
             MenuKey::Confirm => {
                 let index = cursor.index;
                 let picked = if magic {
-                    ctx.model.spells.get(index).map(|s| (Aimed::Magic(s.id), s.target, spell_refusal(s, ctx.mp)))
+                    ctx.model.spells.get(index).map(|s| (Aimed::Magic(s.id), s.target, s.reach, spell_refusal(s, ctx.mp)))
                 } else {
-                    ctx.model.items.get(index).map(|i| (Aimed::Item(i.id), i.target, item_refusal(i)))
+                    ctx.model.items.get(index).map(|i| (Aimed::Item(i.id), i.target, i.reach, item_refusal(i)))
                 };
                 return match picked {
                     None => Reply::Refused(if magic { Refusal::NoMagic } else { Refusal::NoItems }),
-                    Some((_, _, Some(why))) => Reply::Refused(why),
-                    Some((what, rule, None)) => self.start_aim(what, rule, from, ctx),
+                    Some((_, _, _, Some(why))) => Reply::Refused(why),
+                    Some((what, rule, reach, None)) => self.start_aim(what, rule, reach, from, ctx),
                 };
             }
         }
         Reply::Handled
     }
 
-    /// Open the target selection for `what` on the first valid target (or the one chosen last).
-    fn start_aim(&mut self, what: Aimed, rule: TargetRule, from: Level, ctx: &Ctx<'_>) -> Reply {
+    /// Open the target selection for `what` on the first valid target (or the one chosen last), or on ALL when
+    /// the action hits a whole side and nothing else.
+    fn start_aim(&mut self, what: Aimed, rule: TargetRule, reach: Reach, from: Level, ctx: &Ctx<'_>) -> Reply {
         let candidates = ctx.candidates(rule);
         let Some(first) = candidates.first().copied() else { return Reply::Refused(Refusal::NoTarget) };
-        let target = self.remembered[rule.slot()].filter(|t| candidates.contains(t)).unwrap_or(first);
-        self.state = State::Aiming(Aim { what, rule, target, from });
+        let at = match reach {
+            Reach::All => At::All,
+            Reach::One | Reach::OneOrAll => At::One(self.remembered[rule.slot()].filter(|t| candidates.contains(t)).unwrap_or(first)),
+        };
+        self.state = State::Aiming(Aiming { what, rule, reach, at, from });
         Reply::Handled
     }
 
-    fn on_aim(&mut self, key: MenuKey, aim: Aim, ctx: &Ctx<'_>) -> Reply {
+    /// The places the pointer goes through, in the order the arrows walk them: every fighter the rule allows and
+    /// then, where the action can hit the whole side, ALL (an action that hits a whole side only has ALL).
+    fn places(aim: &Aiming, candidates: &[ActorId]) -> Vec<At> {
+        let mut places: Vec<At> = match aim.reach {
+            Reach::All => Vec::new(),
+            Reach::One | Reach::OneOrAll => candidates.iter().map(|t| At::One(*t)).collect(),
+        };
+        if aim.reach != Reach::One {
+            places.push(At::All);
+        }
+        places
+    }
+
+    fn on_aim(&mut self, key: MenuKey, aim: Aiming, ctx: &Ctx<'_>) -> Reply {
         let candidates = ctx.candidates(aim.rule);
-        let at = candidates.iter().position(|t| *t == aim.target).unwrap_or(0);
-        let n = candidates.len().max(1);
-        let moved = |at: usize| State::Aiming(Aim { target: candidates.get(at).copied().unwrap_or(aim.target), ..aim });
+        let places = Self::places(&aim, &candidates);
+        let here = places.iter().position(|p| *p == aim.at).unwrap_or(0);
+        let n = places.len().max(1);
+        let moved = |to: usize| State::Aiming(Aiming { at: places.get(to).copied().unwrap_or(aim.at), ..aim });
         match key {
-            MenuKey::Up | MenuKey::Left => self.state = moved((at + n - 1) % n),
-            MenuKey::Down | MenuKey::Right => self.state = moved((at + 1) % n),
+            MenuKey::Up | MenuKey::Left => self.state = moved((here + n - 1) % n),
+            MenuKey::Down | MenuKey::Right => self.state = moved((here + 1) % n),
             MenuKey::Back => self.state = State::of_level(aim.from),
             MenuKey::Confirm => {
-                self.remembered[aim.rule.slot()] = Some(aim.target);
                 self.state = State::Commands;
-                let target = aim.target;
-                return Reply::Send(match aim.what {
-                    Aimed::Attack => Choice::Attack { target },
-                    Aimed::Magic(spell) => Choice::Magic { spell, target },
-                    Aimed::Item(item) => Choice::Item { item, target },
-                    Aimed::Limit => Choice::Limit { target },
+                let target = match aim.at {
+                    At::One(id) => {
+                        self.remembered[aim.rule.slot()] = Some(id);
+                        Target::One(id)
+                    }
+                    // The sides are the commanding actor's: the enemies, or the party (the fallen of it for a
+                    // revival).
+                    At::All if aim.rule == TargetRule::Enemies => Target::AllEnemies,
+                    At::All => Target::AllAllies,
+                };
+                return Reply::Send(match (aim.what, target) {
+                    (Aimed::Attack, Target::One(target)) => Choice::Attack { target },
+                    // The Attack command has no whole-side way: its selection never has ALL.
+                    (Aimed::Attack, _) => return Reply::Handled,
+                    (Aimed::Magic(spell), target) => Choice::Magic { spell, target },
+                    (Aimed::Item(item), target) => Choice::Item { item, target },
+                    (Aimed::Limit, target) => Choice::Limit { target },
                 });
             }
         }
@@ -576,17 +675,29 @@ impl BattleMenu {
                     (all.iter().map(item_row).collect(), hint, all.len())
                 };
                 view.hint = hint.map(Refusal::text);
+                // The Magic list says how many whole-side casts the All materia still allows, when a spell of the
+                // list can use one.
+                let all = (magic && ctx.model.spells.iter().any(|s| s.reach == Reach::OneOrAll)).then_some(ctx.model.all_left);
                 view.list = Some(ListView {
                     title: if magic { "Magic" } else { "Item" },
                     rows: rows.into_iter().skip(cursor.scroll).take(LIST_ROWS).collect(),
                     cursor: cursor.index - cursor.scroll.min(cursor.index),
                     scroll: cursor.scroll,
                     total,
+                    all,
                 });
             }
             State::Aiming(aim) => {
                 view.level = Level::Target;
-                view.aim = Some(AimView { target: aim.target, enemy: aim.rule == TargetRule::Enemies });
+                view.aim = Some(AimView {
+                    at: match aim.at {
+                        At::One(target) => AimAt::One(target),
+                        At::All => AimAt::All,
+                    },
+                    enemy: aim.rule == TargetRule::Enemies,
+                    revive: aim.rule == TargetRule::DeadAllies,
+                    reach: aim.reach,
+                });
             }
         }
         view
@@ -651,14 +762,50 @@ pub struct ListView {
     pub scroll: usize,
     /// Rows in the whole list.
     pub total: usize,
+    /// The Magic list only, when a spell in it can hit a whole side with an All materia use: how many uses
+    /// are left this battle (the list's title row says `ALL x1`).
+    pub all: Option<u8>,
+}
+
+/// Where the pointer of an open target selection is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AimAt {
+    /// On one fighter.
+    One(ActorId),
+    /// On the whole side: every fighter the action hits.
+    All,
 }
 
 /// The pointer of an open target selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AimView {
-    pub target: ActorId,
+    pub at: AimAt,
     /// The target is on the enemy side.
     pub enemy: bool,
+    /// The action brings back the fallen: a whole side is the fallen of the party, not the living.
+    pub revive: bool,
+    /// What else the pointer can be on besides one fighter ([`Reach::OneOrAll`]: ALL, a step past the last one).
+    pub reach: Reach,
+}
+
+impl AimView {
+    /// The fighter the pointer is on, if it is on one.
+    pub fn one(&self) -> Option<ActorId> {
+        match self.at {
+            AimAt::One(id) => Some(id),
+            AimAt::All => None,
+        }
+    }
+
+    /// Whether the pointer is on `actor` (one fighter), or on the whole side and `actor`, a fighter of the side the
+    /// pointer is on (the caller says which: `enemy`), is one the action hits (the living, or the fallen for a
+    /// revival: `alive` says which `actor` is).
+    pub fn covers(&self, actor: ActorId, alive: bool) -> bool {
+        match self.at {
+            AimAt::One(id) => id == actor,
+            AimAt::All => alive != self.revive,
+        }
+    }
 }
 
 /// Everything the panels draw of the menu.
@@ -699,6 +846,7 @@ mod tests {
             defend: true,
             limit: None,
             escape: true,
+            all_left: 0,
         }
     }
 
@@ -743,7 +891,7 @@ mod tests {
         assert_eq!(press(&mut m, &s, &[Confirm]), Reply::Handled);
         assert_eq!(m.level(), Level::Target);
         let aim = m.view(&s.ctx()).aim.expect("a pointer");
-        assert_eq!((aim.target, aim.enemy), (ActorId(3), true));
+        assert_eq!((aim.one(), aim.enemy), (Some(ActorId(3)), true));
         assert_eq!(press(&mut m, &s, &[Confirm]), Reply::Send(Choice::Attack { target: ActorId(3) }));
         assert_eq!(m.level(), Level::Commands, "the menu is back at the top once a choice is made");
     }
@@ -754,7 +902,7 @@ mod tests {
         s.enemies[1].alive = false; // actor 4 is dead
         let mut m = BattleMenu::default();
         press(&mut m, &s, &[Confirm]);
-        let at = |m: &BattleMenu, s: &Scene| m.view(&s.ctx()).aim.expect("aim").target.0;
+        let at = |m: &BattleMenu, s: &Scene| m.view(&s.ctx()).aim.expect("aim").one().expect("a fighter").0;
         assert_eq!(at(&m, &s), 3);
         press(&mut m, &s, &[Right]);
         assert_eq!(at(&m, &s), 5, "the dead enemy is skipped");
@@ -784,13 +932,162 @@ mod tests {
         press(&mut m, &s, &[Confirm]);
         for k in [Up, Down, Left, Right] {
             press(&mut m, &s, &[k]);
-            assert_eq!(m.view(&s.ctx()).aim.expect("aim").target, ActorId(4));
+            assert_eq!(m.view(&s.ctx()).aim.expect("aim").one(), Some(ActorId(4)));
         }
         // No living enemy at all: Attack cannot even open the selection.
         let mut m = BattleMenu::default();
         s.enemies = fighters(&[false; 3], 3);
         assert_eq!(press(&mut m, &s, &[Confirm]), Reply::Refused(Refusal::NoTarget));
         assert_eq!(m.level(), Level::Commands);
+    }
+
+    // --- whole sides (protocol v10) ---
+
+    /// Fire and Cure can hit a whole side while the character has an All use, Ultima hits a whole side only.
+    fn side_scene() -> Scene {
+        let mut s = Scene::new();
+        s.model.spells[0].reach = Reach::OneOrAll; // Fire
+        s.model.spells[2].reach = Reach::OneOrAll; // Cure
+        s.model.spells.push(MenuSpell::new(4, "Ultima", 7, TargetRule::Enemies).with_reach(Reach::All));
+        s.model.all_left = 1;
+        s
+    }
+
+    fn aim_of(m: &BattleMenu, s: &Scene) -> AimView {
+        m.view(&s.ctx()).aim.expect("a pointer")
+    }
+
+    #[test]
+    fn a_spell_that_can_hit_a_whole_side_has_an_all_place_one_step_past_the_last_target() {
+        let s = side_scene();
+        let mut m = BattleMenu::default();
+        // Magic, Fire: the pointer starts on the first enemy, as it always did.
+        assert_eq!(press(&mut m, &s, &[Down, Confirm, Confirm]), Reply::Handled);
+        let aim = aim_of(&m, &s);
+        assert_eq!((aim.at, aim.enemy, aim.reach), (AimAt::One(ActorId(3)), true, Reach::OneOrAll));
+        // Three enemies, then ALL, then round to the first again.
+        for expected in [AimAt::One(ActorId(4)), AimAt::One(ActorId(5)), AimAt::All, AimAt::One(ActorId(3))] {
+            press(&mut m, &s, &[Right]);
+            assert_eq!(aim_of(&m, &s).at, expected);
+        }
+        // Left from the first goes to ALL, and one more step to the last.
+        press(&mut m, &s, &[Left]);
+        let all = aim_of(&m, &s);
+        assert_eq!(all.at, AimAt::All);
+        assert!(all.enemy && all.covers(ActorId(3), true) && all.covers(ActorId(5), true), "every living enemy is on it");
+        assert!(!all.covers(ActorId(4), false), "and not a fallen one");
+        press(&mut m, &s, &[Up]);
+        assert_eq!(aim_of(&m, &s).at, AimAt::One(ActorId(5)));
+        // Confirm on ALL sends the spell at every enemy, and leaves the target remembered alone.
+        press(&mut m, &s, &[Down]);
+        assert_eq!(press(&mut m, &s, &[Confirm]), Reply::Send(Choice::Magic { spell: 1, target: Target::AllEnemies }));
+        assert_eq!(m.level(), Level::Commands);
+        press(&mut m, &s, &[Confirm, Confirm]);
+        assert_eq!(aim_of(&m, &s).at, AimAt::One(ActorId(3)), "the next aim starts on a fighter, never on ALL");
+    }
+
+    #[test]
+    fn cure_on_all_allies_is_the_whole_party_and_a_single_target_spell_has_no_all_place() {
+        let s = side_scene();
+        let mut m = BattleMenu::default();
+        // Magic, Cure (the third row): the party.
+        press(&mut m, &s, &[Down, Confirm, Down, Down, Confirm]);
+        assert_eq!((aim_of(&m, &s).at, aim_of(&m, &s).enemy), (AimAt::One(ActorId(0)), false));
+        press(&mut m, &s, &[Left]);
+        assert_eq!(aim_of(&m, &s).at, AimAt::All);
+        assert_eq!(press(&mut m, &s, &[Confirm]), Reply::Send(Choice::Magic { spell: 3, target: Target::AllAllies }));
+        // Ice is the kind that hits one target: the pointer only walks the three enemies. (The cursors stayed where
+        // they were: Magic, and Cure in its list.)
+        press(&mut m, &s, &[Confirm, Up, Confirm]);
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            seen.push(aim_of(&m, &s).at);
+            press(&mut m, &s, &[Right]);
+        }
+        assert_eq!(seen, [AimAt::One(ActorId(3)), AimAt::One(ActorId(4)), AimAt::One(ActorId(5)), AimAt::One(ActorId(3))]);
+        assert_eq!(aim_of(&m, &s).reach, Reach::One);
+    }
+
+    #[test]
+    fn what_only_hits_a_whole_side_starts_on_all_and_the_arrows_cannot_leave_it() {
+        let s = side_scene();
+        let mut m = BattleMenu::default();
+        // Magic, Ultima (the last row).
+        press(&mut m, &s, &[Down, Confirm, Down, Down, Down, Confirm]);
+        let aim = aim_of(&m, &s);
+        assert_eq!((aim.at, aim.enemy, aim.reach), (AimAt::All, true, Reach::All));
+        for k in [Up, Down, Left, Right] {
+            assert_eq!(press(&mut m, &s, &[k]), Reply::Handled);
+            assert_eq!(aim_of(&m, &s).at, AimAt::All, "{k:?}");
+        }
+        // Back goes to the list with the cursor kept; Confirm sends the whole side.
+        assert_eq!(press(&mut m, &s, &[Back]), Reply::Handled);
+        assert_eq!(m.level(), Level::Magic);
+        press(&mut m, &s, &[Confirm]);
+        assert_eq!(press(&mut m, &s, &[Confirm]), Reply::Send(Choice::Magic { spell: 4, target: Target::AllEnemies }));
+    }
+
+    #[test]
+    fn all_means_the_living_or_for_a_revival_the_fallen_and_the_pointer_follows_the_roster() {
+        let mut s = side_scene();
+        s.allies[1].alive = false;
+        s.model.items[1].reach = Reach::OneOrAll; // a revival of the kind that can hit a whole side
+        let mut m = BattleMenu::default();
+        // Item, Phoenix Down (the second row): the fallen member, then ALL.
+        press(&mut m, &s, &[Down, Down, Confirm, Down, Confirm]);
+        assert_eq!(aim_of(&m, &s).at, AimAt::One(ActorId(1)));
+        press(&mut m, &s, &[Right]);
+        let all = aim_of(&m, &s);
+        assert_eq!((all.at, all.enemy, all.revive), (AimAt::All, false, true));
+        assert!(all.covers(ActorId(1), false) && !all.covers(ActorId(0), true), "the fallen only");
+        assert_eq!(press(&mut m, &s, &[Confirm]), Reply::Send(Choice::Item { item: 11, target: Target::AllAllies }));
+
+        // The pointer on ALL stays there while anybody is on the side, and the menu steps back a level when the
+        // whole side is gone.
+        let mut s = side_scene();
+        let mut m = BattleMenu::default();
+        press(&mut m, &s, &[Down, Confirm, Down, Down, Down, Confirm]);
+        s.enemies[0].alive = false;
+        assert_eq!(aim_of(&m, &s).at, AimAt::All, "two enemies are left");
+        s.enemies = fighters(&[false; 3], 3);
+        assert_eq!(m.view(&s.ctx()).level, Level::Magic, "nobody to hit: back to the list");
+        assert_eq!(press(&mut m, &s, &[Back]), Reply::Handled);
+        assert_eq!(m.level(), Level::Commands);
+    }
+
+    #[test]
+    fn a_limit_that_hits_the_party_starts_on_all_and_sends_the_whole_party() {
+        let mut s = Scene::new();
+        s.model.limit = Some(MenuLimit::new(142, "Healing Wind", TargetRule::Allies, true).with_reach(Reach::All));
+        let mut m = BattleMenu::default();
+        // The first command says Limit; its pointer is ALL.
+        assert_eq!(press(&mut m, &s, &[Confirm]), Reply::Handled);
+        let aim = aim_of(&m, &s);
+        assert_eq!((aim.at, aim.enemy, aim.reach), (AimAt::All, false, Reach::All));
+        assert_eq!(press(&mut m, &s, &[Confirm]), Reply::Send(Choice::Limit { target: Target::AllAllies }));
+        // A limit that strikes one enemy is as it was.
+        s.model.limit = Some(MenuLimit::new(128, "Braver", TargetRule::Enemies, true));
+        press(&mut m, &s, &[Confirm]);
+        assert_eq!((aim_of(&m, &s).at, aim_of(&m, &s).reach), (AimAt::One(ActorId(3)), Reach::One));
+    }
+
+    #[test]
+    fn the_magic_list_says_how_many_all_uses_are_left_when_a_spell_of_it_can_use_one() {
+        let mut s = side_scene();
+        press(&mut BattleMenu::default(), &s, &[]);
+        let mut m = BattleMenu::default();
+        press(&mut m, &s, &[Down, Confirm]);
+        assert_eq!(m.view(&s.ctx()).list.expect("the Magic list").all, Some(1));
+        s.model.all_left = 3;
+        assert_eq!(m.view(&s.ctx()).list.expect("the Magic list").all, Some(3));
+        // No spell that can use one (the client gives the kind that needs an All use only while there is one):
+        // nothing to say. The Item list never says it.
+        for spell in &mut s.model.spells {
+            spell.reach = Reach::One;
+        }
+        assert_eq!(m.view(&s.ctx()).list.expect("the Magic list").all, None);
+        press(&mut m, &s, &[Back, Down, Confirm]);
+        assert_eq!(m.view(&s.ctx()).list.expect("the Item list").all, None);
     }
 
     #[test]
@@ -815,9 +1112,9 @@ mod tests {
         s.mp = 5;
         assert_eq!(press(&mut m, &s, &[Confirm]), Reply::Handled);
         let aim = m.view(&s.ctx()).aim.expect("aim");
-        assert_eq!((aim.target, aim.enemy), (ActorId(0), false), "Cure aims at the party");
+        assert_eq!((aim.one(), aim.enemy), (Some(ActorId(0)), false), "Cure aims at the party");
         press(&mut m, &s, &[Right]);
-        assert_eq!(press(&mut m, &s, &[Confirm]), Reply::Send(Choice::Magic { spell: 3, target: ActorId(1) }));
+        assert_eq!(press(&mut m, &s, &[Confirm]), Reply::Send(Choice::Magic { spell: 3, target: Target::One(ActorId(1)) }));
     }
 
     #[test]
@@ -827,7 +1124,7 @@ mod tests {
         press(&mut m, &s, &[Down, Confirm, Down, Confirm]);
         assert_eq!(m.level(), Level::Target);
         let aim = m.view(&s.ctx()).aim.expect("aim");
-        assert_eq!((aim.target, aim.enemy), (ActorId(3), true));
+        assert_eq!((aim.one(), aim.enemy), (Some(ActorId(3)), true));
         assert_eq!(press(&mut m, &s, &[Back]), Reply::Handled);
         assert_eq!(m.level(), Level::Magic);
         assert_eq!(m.view(&s.ctx()).list.expect("list").cursor, 1, "still on Ice");
@@ -859,16 +1156,16 @@ mod tests {
         for k in [Right, Left, Down, Up] {
             press(&mut m, &s, &[k]);
             let aim = m.view(&s.ctx()).aim.expect("aim");
-            assert_eq!((aim.target, aim.enemy), (ActorId(2), false));
+            assert_eq!((aim.one(), aim.enemy), (Some(ActorId(2)), false));
         }
-        assert_eq!(press(&mut m, &s, &[Confirm]), Reply::Send(Choice::Item { item: 11, target: ActorId(2) }));
+        assert_eq!(press(&mut m, &s, &[Confirm]), Reply::Send(Choice::Item { item: 11, target: Target::One(ActorId(2)) }));
         // A potion aims at the living, and the empty vial cannot be picked.
         let mut m = BattleMenu::default();
         press(&mut m, &s, &[Down, Down, Confirm, Confirm]);
         let aim = m.view(&s.ctx()).aim.expect("aim");
-        assert_eq!(aim.target, ActorId(0));
+        assert_eq!(aim.one(), Some(ActorId(0)));
         press(&mut m, &s, &[Right, Right]);
-        assert_eq!(m.view(&s.ctx()).aim.expect("aim").target, ActorId(0), "only two are alive, so two steps come full circle");
+        assert_eq!(m.view(&s.ctx()).aim.expect("aim").one(), Some(ActorId(0)), "only two are alive, so two steps come full circle");
         press(&mut m, &s, &[Back, Down, Down]);
         assert_eq!(m.view(&s.ctx()).hint, Some("None left"));
         assert_eq!(press(&mut m, &s, &[Confirm]), Reply::Refused(Refusal::OutOfItem));
@@ -941,9 +1238,9 @@ mod tests {
         assert_eq!((v.commands[0].label, v.commands[0].enabled, v.command_cursor), ("Limit", true, 0));
         assert_eq!(press(&mut m, &s, &[Confirm]), Reply::Handled);
         let aim = m.view(&s.ctx()).aim.expect("a pointer");
-        assert_eq!((aim.target, aim.enemy), (ActorId(3), true));
-        assert_eq!(press(&mut m, &s, &[Right, Confirm]), Reply::Send(Choice::Limit { target: ActorId(4) }));
-        assert_eq!(Choice::Limit { target: ActorId(4) }.to_command(), Command::Limit { target: ActorId(4) });
+        assert_eq!((aim.one(), aim.enemy), (Some(ActorId(3)), true));
+        assert_eq!(press(&mut m, &s, &[Right, Confirm]), Reply::Send(Choice::Limit { target: Target::One(ActorId(4)) }));
+        assert_eq!(Choice::Limit { target: Target::One(ActorId(4)) }.to_command(), Command::Limit { target: Target::One(ActorId(4)) });
         assert_eq!(m.level(), Level::Commands);
         // Back from the pointer returns to the commands, where the row still says Limit.
         press(&mut m, &s, &[Confirm]);
@@ -955,8 +1252,8 @@ mod tests {
         let mut m = BattleMenu::default();
         assert_eq!(press(&mut m, &s, &[Confirm]), Reply::Handled);
         let aim = m.view(&s.ctx()).aim.expect("a pointer");
-        assert_eq!((aim.target, aim.enemy), (ActorId(0), false));
-        assert_eq!(press(&mut m, &s, &[Down, Confirm]), Reply::Send(Choice::Limit { target: ActorId(1) }));
+        assert_eq!((aim.one(), aim.enemy), (Some(ActorId(0)), false));
+        assert_eq!(press(&mut m, &s, &[Down, Confirm]), Reply::Send(Choice::Limit { target: Target::One(ActorId(1)) }));
 
         // The other rows do not care: Magic still opens its list, and the gauge emptying puts Attack back.
         let mut s = with_limit(TargetRule::Enemies, true);
@@ -982,7 +1279,7 @@ mod tests {
         s.enemies = fighters(&[true; 3], 3);
         press(&mut m, &s, &[Confirm]);
         s.enemies[0].alive = false;
-        assert_eq!(press(&mut m, &s, &[Confirm]), Reply::Send(Choice::Limit { target: ActorId(4) }));
+        assert_eq!(press(&mut m, &s, &[Confirm]), Reply::Send(Choice::Limit { target: Target::One(ActorId(4)) }));
     }
 
     #[test]
@@ -1016,7 +1313,7 @@ mod tests {
         // The picked row is the one under the cursor, not the first on screen.
         let mut m = BattleMenu::default();
         press(&mut m, &s, &[Down, Confirm, Right, Down, Confirm]);
-        assert_eq!(press(&mut m, &s, &[Confirm]), Reply::Send(Choice::Magic { spell: 5, target: ActorId(3) }));
+        assert_eq!(press(&mut m, &s, &[Confirm]), Reply::Send(Choice::Magic { spell: 5, target: Target::One(ActorId(3)) }));
     }
 
     #[test]
@@ -1024,12 +1321,12 @@ mod tests {
         let mut s = Scene::new();
         let mut m = BattleMenu::default();
         press(&mut m, &s, &[Down, Confirm, Confirm]);
-        assert_eq!(m.view(&s.ctx()).aim.expect("aim").target, ActorId(3));
+        assert_eq!(m.view(&s.ctx()).aim.expect("aim").one(), Some(ActorId(3)));
         // The aimed-at enemy dies while the pointer is on it: the view and the next key agree on the
         // replacement.
         s.enemies[0].alive = false;
-        assert_eq!(m.view(&s.ctx()).aim.expect("aim").target, ActorId(4));
-        assert_eq!(press(&mut m, &s, &[Confirm]), Reply::Send(Choice::Magic { spell: 1, target: ActorId(4) }));
+        assert_eq!(m.view(&s.ctx()).aim.expect("aim").one(), Some(ActorId(4)));
+        assert_eq!(press(&mut m, &s, &[Confirm]), Reply::Send(Choice::Magic { spell: 1, target: Target::One(ActorId(4)) }));
         // Everybody dies: the selection is gone and the menu is back on the list it came from.
         let mut m = BattleMenu::default();
         s.enemies = fighters(&[true; 3], 3);
@@ -1073,8 +1370,8 @@ mod tests {
     #[test]
     fn choices_become_engine_commands_one_to_one() {
         assert_eq!(Choice::Attack { target: ActorId(4) }.to_command(), Command::Attack { target: ActorId(4) });
-        assert_eq!(Choice::Magic { spell: 27, target: ActorId(3) }.to_command(), Command::Magic { spell: 27, target: ActorId(3) });
-        assert_eq!(Choice::Item { item: 7, target: ActorId(1) }.to_command(), Command::Item { item: 7, target: ActorId(1) });
+        assert_eq!(Choice::Magic { spell: 27, target: Target::One(ActorId(3)) }.to_command(), Command::Magic { spell: 27, target: Target::One(ActorId(3)) });
+        assert_eq!(Choice::Item { item: 7, target: Target::One(ActorId(1)) }.to_command(), Command::Item { item: 7, target: Target::One(ActorId(1)) });
         assert_eq!(Choice::Defend.to_command(), Command::Defend);
     }
 
@@ -1087,9 +1384,9 @@ mod tests {
         // Cure (spell 3 of this model) on the second ally, a Potion (the pointer starts on the ally
         // chosen last), Defend.
         let Reply::Send(cure) = press(&mut m, &s, &[Down, Confirm, Down, Down, Confirm, Right, Confirm]) else { panic!("a choice") };
-        assert_eq!(cure.to_command(), Command::Magic { spell: 3, target: ActorId(1) });
+        assert_eq!(cure.to_command(), Command::Magic { spell: 3, target: Target::One(ActorId(1)) });
         let Reply::Send(potion) = press(&mut m, &s, &[Down, Confirm, Confirm, Confirm]) else { panic!("a choice") };
-        assert_eq!(potion.to_command(), Command::Item { item: 10, target: ActorId(1) });
+        assert_eq!(potion.to_command(), Command::Item { item: 10, target: Target::One(ActorId(1)) });
         let Reply::Send(defend) = press(&mut m, &s, &[Down, Confirm]) else { panic!("a choice") };
         assert_eq!(defend.to_command(), Command::Defend);
     }
@@ -1107,6 +1404,15 @@ mod tests {
             // Whom the limit aims at is a fact of the character (Healing Wind heals, Braver strikes), not
             // something that changes during a battle; whether its gauge is full, and the roster, do.
             let limit_target = if rng.chance(2) { TargetRule::Enemies } else { TargetRule::Allies };
+            // How many each thing can be aimed at is a fact of it too (one, one or all, only all).
+            let reaches = [Reach::One, Reach::OneOrAll, Reach::All];
+            for spell in &mut s.model.spells {
+                spell.reach = reaches[rng.below(3)];
+            }
+            for item in &mut s.model.items {
+                item.reach = reaches[rng.below(3)];
+            }
+            let limit_reach = reaches[rng.below(3)];
             for step in 0..120 {
                 if rng.chance(6) {
                     let n = rng.below(5);
@@ -1119,20 +1425,36 @@ mod tests {
                         s.model.items.truncate(rng.below(4));
                     }
                     // A limit that is sometimes full (or the character has none), an escape that is sometimes barred.
-                    s.model.limit = (!rng.chance(3)).then(|| MenuLimit::new(128, "Limit", limit_target, rng.chance(2)));
+                    s.model.limit = (!rng.chance(3)).then(|| MenuLimit::new(128, "Limit", limit_target, rng.chance(2)).with_reach(limit_reach));
                     s.model.escape = rng.chance(2);
                 }
+                let before = m.state;
                 let reply = m.press(keys[rng.below(keys.len())], &s.ctx());
                 if let Reply::Send(choice) = reply {
-                    let (target, rule) = match choice {
-                        Choice::Attack { target } => (Some(target), TargetRule::Enemies),
-                        Choice::Magic { spell, target } => (Some(target), s.model.spells.iter().find(|x| x.id == spell).map_or(TargetRule::Enemies, |x| x.target)),
-                        Choice::Item { item, target } => (Some(target), s.model.items.iter().find(|x| x.id == item).map_or(TargetRule::Allies, |x| x.target)),
-                        Choice::Defend | Choice::Escape => (None, TargetRule::Enemies),
-                        Choice::Limit { target } => (Some(target), s.model.limit.as_ref().map_or(TargetRule::Enemies, |l| l.target)),
+                    // What the choice was aimed with is what the open selection started with (the model may have
+                    // changed under it since, as it does at every message): its rule and its reach.
+                    let aimed = || match before {
+                        State::Aiming(aiming) => (aiming.rule, aiming.reach),
+                        other => panic!("round {round} step {step}: {choice:?} was sent from {other:?}, not from a target selection"),
                     };
-                    if let Some(t) = target {
-                        assert!(s.ctx().candidates(rule).contains(&t), "round {round} step {step}: {choice:?} aims at a fighter the rule does not allow");
+                    let (target, (rule, reach)) = match choice {
+                        Choice::Attack { target } => (Some(Target::One(target)), aimed()),
+                        Choice::Magic { target, .. } | Choice::Item { target, .. } | Choice::Limit { target } => (Some(target), aimed()),
+                        Choice::Defend | Choice::Escape => (None, (TargetRule::Enemies, Reach::One)),
+                    };
+                    let candidates = s.ctx().candidates(rule);
+                    match target {
+                        Some(Target::One(t)) => {
+                            assert!(candidates.contains(&t), "round {round} step {step}: {choice:?} aims at a fighter the rule does not allow");
+                            assert!(reach != Reach::All, "round {round} step {step}: {choice:?} aims at one what only hits a whole side");
+                        }
+                        // A whole side: the side the rule means, for something that can hit one, with somebody on it.
+                        Some(side @ (Target::AllEnemies | Target::AllAllies)) => {
+                            assert!(reach != Reach::One, "round {round} step {step}: {choice:?} aims at a whole side what hits one target");
+                            assert_eq!(side == Target::AllEnemies, rule == TargetRule::Enemies, "round {round} step {step}: {choice:?} is the wrong side");
+                            assert!(!candidates.is_empty(), "round {round} step {step}: {choice:?} hits a side with nobody on it");
+                        }
+                        None => {}
                     }
                 }
                 let v = m.view(&s.ctx());

@@ -101,8 +101,15 @@
 //!   damage, healing, a status) is announced and has no effect.
 //! * A target mask of several actors is [`Target::AllEnemies`] / [`Target::AllAllies`] only when it is
 //!   exactly the living side; any other mix falls back. The engine plays [`Target::AllEnemies`] (the whole
-//!   party) as one attack announced once and played on each living member in turn; [`Target::AllAllies`] is
-//!   not played (it falls back, unless the attack is one the rules cannot play anyway).
+//!   party) as one attack announced once and played on each living member in turn by the whole-side rules
+//!   of protocol v10 (`resolve_action`: each target with its own rolls, the 2/3 split of damage when the
+//!   action splits). The script's mask is authoritative, as in the original: the attack record's own
+//!   targeting (`Aim`, the rule of the player's target menu, which `aim_at` checks a command against) is not
+//!   consulted, so a one-target attack aimed at the whole party and a whole-side one aimed at a single member
+//!   are played as the script says (checked on the owner's data: obeying it as a command is would make five
+//!   more enemies fall back to the plain behaviour). [`Target::AllAllies`] and a single enemy as the target
+//!   of a damaging attack fall back (an attack the rules cannot play anyway is only announced, whatever its
+//!   target). An attack whose record aims at a random target is played on one member.
 
 pub mod script;
 pub mod vm;
@@ -116,6 +123,7 @@ use std::sync::Arc;
 use crate::rng::Rng;
 use crate::rules::{ActorId, BattleState};
 
+pub use crate::rules::Target;
 pub use script::{EnemyScripts, SceneAi};
 pub use vm::{AiError, Effect, Memory, Phase};
 
@@ -130,17 +138,8 @@ pub struct AiAttack {
     pub mp_cost: u16,
 }
 
-/// Whom an enemy's attack is aimed at, from the point of view of the actor that uses it (an enemy's
-/// "enemies" are the party members). This mirrors the whole-side targeting type of the engine's protocol
-/// v10 (`rules::Target`); until that is on this branch it is a local copy, to be swapped for it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Target {
-    One(ActorId),
-    AllEnemies,
-    AllAllies,
-}
-
-/// The attack and the target a script chose.
+/// The attack and the target a script chose. The target is the engine's own [`Target`] (protocol v10), named
+/// from the point of view of the actor that uses the attack: an enemy's "enemies" are the party members.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EnemyChoice {
     /// The attack id (the scene's attack table).

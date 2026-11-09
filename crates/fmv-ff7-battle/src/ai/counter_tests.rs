@@ -2,9 +2,9 @@
 //! cannot be followed leaves behind (nothing), and that a replay of the same inputs agrees exactly.
 
 use crate::action::{ActionSpec, Spell};
-use crate::rules::{ActionRef, ActorId, BattleEvent, BattleState, Combatant, Command, Outcome};
+use crate::rules::{ActionRef, ActorId, BattleEvent, BattleState, Combatant, Command, Outcome, Target};
 
-use super::asm::{battle_with, count_in, foe_with, party_of, plain_foe, scripted_foe, Asm, ATTACK, OTHER};
+use super::asm::{battle_with, count_in, foe_with, laser, party_of, plain_foe, scripted_foe, Asm, ATTACK, LASER, OTHER};
 use super::script::{op, slot};
 use super::vm::{Memory, Phase};
 
@@ -160,7 +160,7 @@ fn the_physical_and_the_magical_counter_follow_the_general_one_by_the_kind_of_th
     assert_eq!([GENERAL_RAN, PHYSICAL_RAN, MAGICAL_RAN, DEATH_RAN].map(|t| ran(&state, FOE, t)), [1, 1, 0, 0]);
 
     // A magical one: the General counter, then the Magical one, on Cloud.
-    let events = give(&mut state, CLOUD, Command::Magic { spell: 27, target: FOE });
+    let events = give(&mut state, CLOUD, Command::Magic { spell: 27, target: Target::One(FOE) });
     assert_eq!(shape(&events), vec!["0:magic27", "0-4mp", "0>2", "2:enemy111", "2:enemy110", "2>0"], "{events:?}");
     assert_eq!([GENERAL_RAN, PHYSICAL_RAN, MAGICAL_RAN, DEATH_RAN].map(|t| ran(&state, FOE, t)), [2, 1, 1, 0]);
     // It remembers who hit it how: Barret by hand, Cloud by magic, and Cloud last of all.
@@ -206,7 +206,7 @@ fn no_counter_runs_once_the_battle_is_over_but_the_enemy_still_noted_the_blow() 
 fn healing_a_friend_and_enemy_actions_start_no_counter() {
     let general = count_in(GENERAL_RAN).then(&announce(OTHER)).op(op::END);
     let mut state = battle_with(3, party(), vec![foe_with(&[(slot::MAIN, &pass()), (slot::GENERAL_COUNTER, &general)])]);
-    let events = give(&mut state, CLOUD, Command::Magic { spell: 0, target: BARRET });
+    let events = give(&mut state, CLOUD, Command::Magic { spell: 0, target: Target::One(BARRET) });
     assert!(!shape(&events).iter().any(|s| s.contains("enemy")), "{events:?}");
     assert_eq!(ran(&state, FOE, GENERAL_RAN), 0);
     assert_eq!(memory(&state, FOE).last_attacker(), 0, "nobody struck it");
@@ -220,7 +220,7 @@ fn healing_a_friend_and_enemy_actions_start_no_counter() {
 fn a_counter_aimed_at_the_whole_party_hits_every_living_member_once_announced_once() {
     // The Guard Scorpion's counter: targets = every enemy of the foe, attack. Tifa is down, the rest are hit
     // in ascending order, after the blow that started it.
-    let laser = count_in(GENERAL_RAN).then(&Asm::default().addr(2, 0x2070).val(2, 0x20A0).op(op::STORE).k1(0x20).k2(ATTACK).op(op::ACT)).op(op::END);
+    let tail_laser = count_in(GENERAL_RAN).then(&Asm::default().addr(2, 0x2070).val(2, 0x20A0).op(op::STORE).k1(0x20).k2(LASER).op(op::ACT)).op(op::END);
     let mut party = party_of(4);
     for member in &mut party {
         member.hp = 5000;
@@ -228,9 +228,11 @@ fn a_counter_aimed_at_the_whole_party_hits_every_living_member_once_announced_on
     }
     party[2].hp = 0;
     let foe = ActorId(4);
-    let mut state = battle_with(3, party, vec![foe_with(&[(slot::MAIN, &pass()), (slot::GENERAL_COUNTER, &laser)])]);
+    let mut scorpion = foe_with(&[(slot::MAIN, &pass()), (slot::GENERAL_COUNTER, &tail_laser)]);
+    scorpion.actions.push(laser());
+    let mut state = battle_with(3, party, vec![scorpion]);
     let events = give(&mut state, BARRET, attack_on(foe));
-    assert_eq!(shape(&events), vec!["1:attack", "1>4", "4:enemy110", "4>0", "4>1", "4>3"], "{events:?}");
+    assert_eq!(shape(&events), vec!["1:attack", "1>4", "4:enemy112", "4>0", "4>1", "4>3"], "{events:?}");
     assert_eq!(ran(&state, foe, GENERAL_RAN), 1);
 }
 
@@ -328,7 +330,7 @@ fn serve(build: impl Fn() -> BattleState, slice: u64) -> (Vec<Message>, String) 
                 break;
             };
             let casts = id == CLOUD && state.actor(id).is_some_and(|c| c.mp >= 4);
-            let command = if casts { Command::Magic { spell: 27, target } } else { attack_on(target) };
+            let command = if casts { Command::Magic { spell: 27, target: Target::One(target) } } else { attack_on(target) };
             if let Ok(events) = state.submit_command(id, command) {
                 log.push((state.tick(), events, Some((id, command))));
             }
