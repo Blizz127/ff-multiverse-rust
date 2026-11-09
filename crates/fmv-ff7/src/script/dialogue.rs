@@ -90,7 +90,7 @@ mod walk;
 mod tests;
 
 pub use pieces::{parse_message, Piece, TextColour, CHARACTER_NAMES};
-pub use walk::{availability, Availability, Limits, TalkError, TalkSession, Walk};
+pub use walk::{availability, Availability, Limits, TalkError, TalkSession, Walk, EFFECT_NOTE_LAYER};
 
 use super::FieldScript;
 

@@ -193,6 +193,23 @@ pub struct Walk {
     visited: BTreeSet<usize>,
     talk_off: bool,
     visible: bool,
+    /// A gift opcode (`STITM` item, `SMTRA` materia, `GOLDu` gil) ran and this walk does not
+    /// perform it: the next window the script shows (the game's own "Received ..." line) is
+    /// followed by an added note that nothing was given, so the canon line never misleads.
+    gift_not_given: bool,
+    /// The added note, waiting to be shown after the canon window that announced the gift.
+    queued: Option<Message>,
+}
+
+/// The layer of the notes this project adds when a script's effect is not performed.
+pub const EFFECT_NOTE_LAYER: &str = "not-performed";
+
+/// The note shown after a canon line that announced a gift this walk does not give.
+fn gift_note() -> Message {
+    Message::new(
+        MessageOrigin::Added { layer: EFFECT_NOTE_LAYER.to_string() },
+        vec![Piece::Text("(Nothing was given: picking up items from".to_string()), Piece::NewLine, Piece::Text("characters is not in the game yet.)".to_string())],
+    )
 }
 
 impl Walk {
@@ -218,6 +235,8 @@ impl Walk {
             visited: BTreeSet::new(),
             talk_off: false,
             visible: true,
+            gift_not_given: false,
+            queued: None,
         }
     }
 
@@ -250,6 +269,9 @@ impl Walk {
     /// Run on to the next window or the end. `answer` is the player's answer to the window this
     /// walk handed out last, if that asked (see [`MessageSource::next`]).
     pub fn resume(&mut self, script: &FieldScript<'_>, env: &dyn StoryVars, answer: Option<usize>) -> Beat {
+        if let Some(note) = self.queued.take() {
+            return Beat::Message(note);
+        }
         if let Some(end) = self.done {
             return Beat::End(end);
         }
@@ -269,7 +291,12 @@ impl Walk {
         loop {
             match self.step(script, env) {
                 Flow::Continue => {}
-                Flow::Show(message) => return Beat::Message(message),
+                Flow::Show(message) => {
+                    if std::mem::take(&mut self.gift_not_given) && !self.quiet {
+                        self.queued = Some(gift_note());
+                    }
+                    return Beat::Message(message);
+                }
                 Flow::Ask(message, pending) => {
                     self.pending = Some(pending);
                     return Beat::Message(message);
@@ -582,6 +609,12 @@ impl Walk {
                 }
             }
             0x48 => self.ask(script, env, frame.entity, &ins),
+            // STITM / SMTRA / GOLDu give the player something: not performed here (the server owns
+            // the inventory), so the announcement that follows gets an added note.
+            0x58 | 0x5B | 0x39 => {
+                self.gift_not_given = true;
+                Flow::Continue
+            }
             0x60 => Flow::End(End::MapJump { field: ins.literal("field").and_then(|f| u16::try_from(f).ok()).unwrap_or(0) }),
             0x70 => Flow::End(End::Battle),
             0x74 => {
