@@ -326,6 +326,8 @@ impl Server {
                 info!(
                     debug_encounters = debug_on,
                     debug_limit_full = b.debug_limit_full,
+                    debug_bonus_exp = b.debug_bonus_exp,
+                    debug_bonus_limit = b.debug_bonus_limit,
                     battle_speed = b.battle_speed,
                     ticks_per_second = b.ticks_per_second,
                     fixed_seed = b.fixed_seed.is_some(),
@@ -335,6 +337,20 @@ impl Server {
                     warn!(
                         "DEBUG: --debug-limit-full is on: every member of every battle starts with a FULL limit gauge instead of its account's own (a smoke-test aid; leave it off on a server real players use). \
                          No limit gauge is ever stored under it: the end-of-battle gauge save is skipped (logged as `limit not kept ... reason=debug-limit-full`), so a debug run can never overwrite a real account's gauge"
+                    );
+                }
+                if b.debug_bonus_exp > 0 {
+                    warn!(
+                        "DEBUG: --debug-bonus-exp {} is on: every won battle pays each member that fought on {} experience MORE than it earned, through the ordinary save path. \
+                         What is stored is indistinguishable from earned experience: this server must only ever run on a throw-away state directory (a smoke-test aid; leave it off on a server real players use)",
+                        b.debug_bonus_exp, b.debug_bonus_exp
+                    );
+                }
+                if b.debug_bonus_limit > 0 {
+                    warn!(
+                        "DEBUG: --debug-bonus-limit {} is on: the limit gauge every member is kept with after a battle is {} more than the battle left it (up to the cap), through the ordinary save path. \
+                         What is stored is indistinguishable from a gauge earned in battle: this server must only ever run on a throw-away state directory (a smoke-test aid; leave it off on a server real players use)",
+                        b.debug_bonus_limit, b.debug_bonus_limit
                     );
                 }
             }

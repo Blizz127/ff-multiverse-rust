@@ -94,6 +94,21 @@ pub struct BattleSettings {
     /// faked full one is not the account's own, so every account keeps the gauge it really has, even when a
     /// member spent its limit or was knocked out. Off by default.
     pub debug_limit_full: bool,
+    /// DEBUG, `--debug-bonus-exp N` (refused without `--debug-encounters`, and by `main` on the default state
+    /// directory: see [`ServerConfig::validate`]): every won battle PAYS each member that fought on `N` experience
+    /// more than the battle gave it, so that a smoke run can make a new character level up over real processes
+    /// (a win pays about 16 of the ~250 a level costs). It changes only what is paid: the payment goes down the
+    /// ordinary road (the member's mirror, the saver, the game's own level-up rule, the `battle reward` log line,
+    /// which says `debug_bonus_exp=N` and whose `exp=` is what was really paid), while the `BattleEnd` that the
+    /// clients verify by replay still carries the rewards the battle itself earned. What is stored afterwards is
+    /// indistinguishable from earned experience: only ever run it on a throw-away state directory. 0 is off.
+    pub debug_bonus_exp: u32,
+    /// DEBUG, `--debug-bonus-limit N` (same rules as `debug_bonus_exp`, and refused together with
+    /// `debug_limit_full`, whose early return would make it do nothing): the limit gauge each member is kept with
+    /// at the end of a battle is `N` more than the battle left it, up to the game's cap, through the ordinary
+    /// `limit kept` save (the log line says `debug_bonus_limit=N`), so that a smoke run can show a non-empty gauge
+    /// surviving a server restart over real processes. 0 is off.
+    pub debug_bonus_limit: u8,
 }
 
 impl BattleSettings {
@@ -109,6 +124,8 @@ impl BattleSettings {
             random_encounters: true,
             encounter_step_units: None,
             debug_limit_full: false,
+            debug_bonus_exp: 0,
+            debug_bonus_limit: 0,
         }
     }
 }
@@ -126,6 +143,8 @@ impl fmt::Debug for BattleSettings {
             .field("random_encounters", &self.random_encounters)
             .field("encounter_step_units", &self.encounter_step_units)
             .field("debug_limit_full", &self.debug_limit_full)
+            .field("debug_bonus_exp", &self.debug_bonus_exp)
+            .field("debug_bonus_limit", &self.debug_bonus_limit)
             .finish()
     }
 }
@@ -344,6 +363,20 @@ impl ServerConfig {
             if b.debug_limit_full && !self.debug_encounters {
                 return bad("debug_limit_full (--debug-limit-full) is a debug flag and needs debug_encounters (--debug-encounters) too".into());
             }
+            // The two bonus flags make up numbers that are then stored like earned ones: debug aids too.
+            if (b.debug_bonus_exp > 0 || b.debug_bonus_limit > 0) && !self.debug_encounters {
+                return bad(
+                    "debug_bonus_exp and debug_bonus_limit (--debug-bonus-exp, --debug-bonus-limit) are debug flags and need debug_encounters (--debug-encounters) too"
+                        .into(),
+                );
+            }
+            // `keep_limits` returns early under --debug-limit-full, so a limit bonus would silently do nothing.
+            if b.debug_bonus_limit > 0 && b.debug_limit_full {
+                return bad(
+                    "debug_bonus_limit (--debug-bonus-limit) cannot be combined with debug_limit_full (--debug-limit-full): no limit gauge is stored under the second, so the first would do nothing"
+                        .into(),
+                );
+            }
         }
         // The build string is one whitespace-free token on the line-based READY message.
         if let Some(suffix) = &self.build_suffix {
@@ -446,6 +479,32 @@ mod tests {
         let err = with(false, true).validate().expect_err("a debug flag without --debug-encounters is refused").to_string();
         assert!(err.contains("--debug-limit-full") && err.contains("--debug-encounters"), "{err}");
         assert!(format!("{:?}", with(true, true).battle).contains("debug_limit_full: true"));
+    }
+
+    #[test]
+    fn the_debug_bonus_flags_are_off_by_default_need_debug_encounters_and_never_meet_the_full_gauge_flag() {
+        use fmv_protocol::SyntheticRules;
+        let off = BattleSettings::new(Arc::new(SyntheticRules::default()));
+        assert_eq!((off.debug_bonus_exp, off.debug_bonus_limit), (0, 0), "off unless asked for");
+        let with = |debug_encounters: bool, exp: u32, limit: u8, full: bool| {
+            let mut b = BattleSettings::new(Arc::new(SyntheticRules::default()));
+            (b.debug_bonus_exp, b.debug_bonus_limit, b.debug_limit_full) = (exp, limit, full);
+            ServerConfig { battle: Some(b), debug_encounters, ..ServerConfig::default() }
+        };
+        with(true, 300, 0, false).validate().unwrap();
+        with(true, 0, 100, false).validate().unwrap();
+        with(true, 300, 100, false).validate().unwrap();
+        with(false, 0, 0, false).validate().unwrap();
+        for (exp, limit) in [(300, 0), (0, 100), (300, 100)] {
+            let err = with(false, exp, limit, false).validate().expect_err("a debug flag without --debug-encounters is refused").to_string();
+            assert!(err.contains("--debug-bonus") && err.contains("--debug-encounters"), "{err}");
+        }
+        // The full-gauge flag skips every limit save, so a limit bonus next to it would do nothing: refused.
+        let err = with(true, 0, 100, true).validate().expect_err("the two limit flags do not meet").to_string();
+        assert!(err.contains("--debug-bonus-limit") && err.contains("--debug-limit-full"), "{err}");
+        with(true, 300, 0, true).validate().unwrap();
+        let shown = format!("{:?}", with(true, 300, 100, false).battle);
+        assert!(shown.contains("debug_bonus_exp: 300") && shown.contains("debug_bonus_limit: 100"), "{shown}");
     }
 
     #[test]
