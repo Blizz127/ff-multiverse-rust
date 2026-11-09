@@ -1091,7 +1091,8 @@ from a server and keeps none anywhere but the library.
 - **A field's own sounds.** A field's scripts play sounds on the game's four effect channels, with two opcodes: `SOUND` (channel 1)
   and `AKAO` 40 to 43 (channels 1 to 4; the pan and the sound id are its operands, id 0 stops the channel): 4 387 and 2 579 plays in
   446 and 260 of the 702 fields, 566 between them (`crates/fmv-ff7/src/field_sound.rs` has the evidence for all that follows, counts
-  and ids only; `cargo run --release -p fmv-ff7 --example field_sound_survey` recomputes it from your files). The client plays:
+  and ids only; `FMV_FF7_DATA=... FMV_FF7_AUDIO_DATA=... cargo run --release -p fmv-ff7 --example field_sound_survey` recomputes it
+  from your `data/` folders, and `cargo test -p fmv-ff7 --release --test field_sound_real -- --ignored` checks it). The client plays:
   - **Ambient loops.** What a field's scripts leave playing when they have run (every entity's init part, then its main part, run as
     far as their waits and conditions can be known): 48 fields have one at the start of the story (55 loops; every one of the 208 plays
     in an init part is a stop or a loop clip). They start when you enter the field, on the channel the script names, and stop when you
@@ -1103,7 +1104,7 @@ from a server and keeps none anywhere but the library.
     change. A fight takes over: the loops fade out when it starts and come back, from their start, when it is over.
   - **Ladders and jumps.** When the server puts you through one (it tells your client with `MoveRejected`, and you stand where the link
     leads), the sounds that the line's script, and the scripts of your own character it calls, play, at the times the script gives:
-    the take-off of a jump (sound 62) half a second in, a ladder's foot (sound 21) at once. A script's sounds after a walk, a jump or a
+    the take-off of a jump (sound 62) half a second in, a ladder's first sound (sound 21) at once. A script's sounds after a walk, a jump or a
     climb have no time in the script and are not played. **The lift** of `elevtr1` plays the sound its panel's script starts when the
     story bit it sets flips (sound 42, a loop clip, once through: its stop is behind waits the data do not give). A sound an event plays
     replaces what its channel was playing, as the game's channels do.
@@ -1115,6 +1116,12 @@ from a server and keeps none anywhere but the library.
     number), a cutscene's one-shots (their picture is not shown), the sounds of a talk, and the volume and pan envelopes of `AKAO` 160
     to 175 (a sound plays at its start pan, at the master volume). Only the clips a field needs are read from `audio.dat`, off the
     game's thread, when you enter it (and again for the ones a story change adds).
+
+  They share the master volume, **M** and `--mute`/`FMV_AUDIO` with the rest. **`FMV_FIELD_SOUNDS`** picks them: `data` (the
+  default) plays what the scripts say, `off` asks for nothing and plays nothing (the field's music and a battle's sounds are not
+  affected). **A party member's client keeps its own story** (the server tells it its own account's, not the leader's), so it
+  hears the field for ITS moment and not the lift the leader rode: in the first mission's walk the member's client stays at the
+  moment 1 throughout.
 - **Keys and flags.** In the game **M** mutes and unmutes (the music keeps moving while muted); **-** and **=**
   change the volume (the character menu has no sound keys: its name field would take them as letters). `--mute` or `FMV_AUDIO=off` builds no sound at all (no device is opened, nothing is decoded);
   `FMV_AUDIO=null` runs the whole soundtrack against a clock with no device; `FMV_AUDIO=auto`, the default of
@@ -1138,7 +1145,12 @@ in 842 ms` as each track finishes, `audio: playing bat (battle)` at the moment a
 sounds: 7 loaded in 5 ms` when a fight's clips were read, `audio: battle sound 18 (hit)` (or `critical`, `miss`, `impact`)
 at the moment each blow's sound plays, a closing `headless: audio: sound Null, tracks started: ob > bat > fanfare > ob`,
 and, when the run ends, `audio: battle sounds played: 86 (16x39 18x12 46x1 227x34)` (each sound id and how many times it
-played).
+played). The field's sounds say what they read, what they start and what they play, in short lines (`audio: field nmkin_2 sounds
+(moment 13): ambient ch3:38; links 3, lift 0, doors 0; unjudged 0, open 0; 13 ms` when a plan is read, and again when the story
+changes; `unjudged` counts the conditions that were skipped, `open` the loops left out, a link count may say `(+1 untimed)`
+for a link whose sound has no time to give it), `audio: field loop start ch3 38` and `audio: field loop stop ch3 38 (the field
+was left)` (or `(the story moved)`, `(a battle)`), `audio: field sound ch1 62 (link)` (or `(lift)`, `(door)`) at the moment an
+event's sound plays, and, when the run ends, `audio: field sounds played: 4 sounds (21x1 42x1 62x2), 4 loops (38x4)`.
 
 ## Packaging and smoke test
 

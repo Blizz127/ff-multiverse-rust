@@ -1256,6 +1256,27 @@ mod tests {
     }
 
     #[test]
+    fn a_loop_of_a_clip_with_no_frames_ends_at_once_and_one_of_a_single_frame_repeats_it_without_spinning() {
+        let (mut m, shared) = mixer();
+        // nothing to repeat: the voice is over in its first block instead of looping on nothing for ever
+        let empty = SfxClip::from_stereo(RATE, Vec::new()).expect("clip");
+        start_loop(&mut m, empty, 1, Duration::ZERO);
+        assert_eq!(shared.snapshot().loops_playing, 1, "it counts from the moment it is asked for");
+        assert!(render(&mut m, 10).iter().all(|&v| v == 0.0));
+        assert_eq!((m.loop_count(), shared.snapshot().loops_playing), (0, 0), "and is gone after its first block");
+        // one frame: that frame, over and over, at the mixer's rate and at half of it
+        start_loop(&mut m, counting(1, RATE), 2, Duration::ZERO);
+        assert_eq!(heard(&render(&mut m, 5)), [1, 1, 1, 1, 1]);
+        assert_eq!(m.loop_count(), 1);
+        m.apply(Command::StopLoop { id: 2, fade: Duration::ZERO });
+        start_loop(&mut m, counting(1, RATE / 2), 3, Duration::ZERO);
+        assert_eq!(heard(&render(&mut m, 5)), [1, 1, 1, 1, 1]);
+        assert_eq!(m.loop_count(), 1);
+        m.apply(Command::StopLoop { id: 3, fade: Duration::ZERO });
+        assert_eq!((m.loop_count(), shared.snapshot().loops_playing), (0, 0));
+    }
+
+    #[test]
     fn a_loop_obeys_the_master_volume_the_effect_volume_and_the_mute_like_any_effect() {
         let (mut m, shared) = mixer_with(Volumes { master: 1.0, music: 1.0, sfx: 0.5 });
         let steady = SfxClip::from_mono(RATE, &[0.8; 50]).expect("clip");
