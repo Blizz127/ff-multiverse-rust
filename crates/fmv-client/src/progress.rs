@@ -23,16 +23,66 @@ pub const LEVEL_UP_SHOWN_S: f64 = 8.0;
 /// Notes kept until the loop prints them; beyond this the oldest are dropped.
 const MAX_NOTES: usize = 32;
 
-/// The name of the combat slot `slot` (FF7: the canon character's id) from this client's own table, or
-/// `None` for an id it has no name for (never text from the network).
+/// The name of the stat curve `slot` (FF7: the canon character's id whose growth, spells and template the character
+/// fights with) from this client's own table, or `None` for an id it has no name for (never text from the network).
+/// **Internal**: it is what the logs and the smoke scripts say; a player is never shown it as who it fights as, see
+/// [`FightingStyle`].
 pub fn slot_name(slot: u8) -> Option<&'static str> {
     CharacterId::from_index(usize::from(slot)).map(CharacterId::name)
+}
+
+/// A FIGHTING STYLE: what a character's stat curve (`NewCharacter::slot`, `BattleMember::character`, `CharacterProgress::character`
+/// in the protocol, which keeps those names) is called to the player. The curve is the growth, spells and combat template of a
+/// canon character of the game, chosen once at creation; it says nothing about who the player is, and the canon
+/// party fights beside the player's character as server-controlled companions. So the screens never say "who you fight as" and
+/// never show the canon character's name for a player: they show the style, whose labels name no canon character. The
+/// mapping (documented here, the one place it lives):
+///
+/// | curve | canon character the stats come from | style |
+/// |---|---|---|
+/// | 0 | Cloud (never offered to a new character; accounts that predate the creator keep it) | Swordsman |
+/// | 1 | Barret | Gunner |
+/// | 2 | Tifa | Martial artist |
+/// | 3 | Aerith | Mage |
+/// | 4 | Red XIII | Guardian |
+/// | 5 | Yuffie | Ninja |
+/// | 6 | Cait Sith | Gambler |
+/// | 7 | Vincent | Marksman |
+/// | 8 | Cid | Lancer |
+///
+/// A style's blurb is one short line of what the curve is good at (its stats, in words of ours).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FightingStyle {
+    /// The game's own id of the curve (FF7: the canon character's): what the protocol carries. Internal.
+    pub curve: u8,
+    /// What the player is shown.
+    pub label: &'static str,
+    /// One line about the curve, for the creator.
+    pub blurb: &'static str,
+}
+
+/// Every FF7 fighting style, by curve id (see [`FightingStyle`]).
+pub const FF7_FIGHTING_STYLES: [FightingStyle; 9] = [
+    FightingStyle { curve: 0, label: "Swordsman", blurb: "a balanced all-rounder" },
+    FightingStyle { curve: 1, label: "Gunner", blurb: "the sturdiest and strongest, but slow" },
+    FightingStyle { curve: 2, label: "Martial artist", blurb: "quick and strong with the fists" },
+    FightingStyle { curve: 3, label: "Mage", blurb: "frail, but a master of magic" },
+    FightingStyle { curve: 4, label: "Guardian", blurb: "tough and swift, with a strong spirit" },
+    FightingStyle { curve: 5, label: "Ninja", blurb: "very fast and very lucky" },
+    FightingStyle { curve: 6, label: "Gambler", blurb: "unpredictable, lives on luck" },
+    FightingStyle { curve: 7, label: "Marksman", blurb: "quick, deadly at range and with magic" },
+    FightingStyle { curve: 8, label: "Lancer", blurb: "strong and sturdy, a hard hitter" },
+];
+
+/// The fighting style of curve `curve`, or `None` for an id this client has no style for (never text from the network).
+pub fn fighting_style(curve: u8) -> Option<&'static FightingStyle> {
+    FF7_FIGHTING_STYLES.iter().find(|s| s.curve == curve)
 }
 
 /// What the server last said about our character.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProgressView {
-    /// The game's character id of the combat SLOT the character fights in (FF7: `CharacterId::index`).
+    /// The game's id of the stat curve the character fights with (FF7: `CharacterId::index`; shown as its fighting style).
     pub character: u8,
     pub level: u8,
     /// Total experience.
@@ -44,17 +94,16 @@ pub struct ProgressView {
 }
 
 impl ProgressView {
-    /// The slot's name from this client's own table, or a neutral word for an id it has no name for
-    /// (never text from the network).
-    pub fn character_name(&self) -> &'static str {
-        slot_name(self.character).unwrap_or("Character")
+    /// The fighting style from this client's own table ([`FightingStyle`]: never a canon character's name), or a
+    /// neutral word for a curve it has no style for (never text from the network).
+    pub fn style_name(&self) -> &'static str {
+        fighting_style(self.character).map_or("Fighter", |s| s.label)
     }
 
-    /// The HUD line: `<PlayerName> (<SlotName>)  Lv N  EXP a/b  Gil g`, for instance
-    /// `Wedge (Barret)  Lv 6  EXP 82/84  Gil 25`: who the player is, the slot it fights in, then the numbers.
+    /// The HUD line: `<PlayerName> (<Style>)  Lv N  EXP a/b  Gil g`, for instance
+    /// `Wedge (Gunner)  Lv 6  EXP 82/84  Gil 25`: who the player is, its fighting style, then the numbers.
     /// The experience shows as `have/next level`; at the highest level (or when the server gave no next
-    /// threshold) as the plain total. Without a player name (the mirror was never told one) the slot's name
-    /// stands alone.
+    /// threshold) as the plain total. Without a player name (the mirror was never told one) the style stands alone.
     pub fn hud_text(&self, player: &str) -> String {
         let exp = if self.exp_to_next > 0 {
             format!("EXP {}/{}", self.exp, self.exp.saturating_add(self.exp_to_next))
@@ -63,7 +112,7 @@ impl ProgressView {
         } else {
             format!("EXP {}", self.exp)
         };
-        let who = if player.is_empty() { self.character_name().to_string() } else { format!("{player} ({})", self.character_name()) };
+        let who = if player.is_empty() { self.style_name().to_string() } else { format!("{player} ({})", self.style_name()) };
         format!("{who}  Lv {}  {exp}  Gil {}", self.level, self.gil)
     }
 }
@@ -243,31 +292,38 @@ mod tests {
     }
 
     #[test]
-    fn the_hud_line_says_who_the_player_is_and_which_slot_it_fights_in() {
+    fn the_hud_line_says_who_the_player_is_and_which_fighting_style_it_has() {
         let view = |level, exp, exp_to_next, gil| ProgressView { character: 1, level, exp, exp_to_next, gil, ap: 3 };
-        assert_eq!(view(6, 82, 2, 25).hud_text("Wedge"), "Wedge (Barret)  Lv 6  EXP 82/84  Gil 25");
-        assert_eq!(view(7, 1234, 266, 250).hud_text("Blizz"), "Blizz (Barret)  Lv 7  EXP 1234/1500  Gil 250");
-        // Another slot, named from our own table (Aerith, not the wire's text).
-        assert_eq!(ProgressView { character: 3, ..view(2, 6, 27, 0) }.hud_text("Wedge"), "Wedge (Aerith)  Lv 2  EXP 6/33  Gil 0");
+        assert_eq!(view(6, 82, 2, 25).hud_text("Wedge"), "Wedge (Gunner)  Lv 6  EXP 82/84  Gil 25");
+        assert_eq!(view(7, 1234, 266, 250).hud_text("Blizz"), "Blizz (Gunner)  Lv 7  EXP 1234/1500  Gil 250");
+        // Another curve, named from our own table of styles (never the wire's text, never a canon name).
+        assert_eq!(ProgressView { character: 3, ..view(2, 6, 27, 0) }.hud_text("Wedge"), "Wedge (Mage)  Lv 2  EXP 6/33  Gil 0");
         // The top: nothing is next. A level below the top with nothing next (no curve) shows the total.
-        assert_eq!(view(99, 2_408_997, 0, 9_999_999).hud_text("Wedge"), "Wedge (Barret)  Lv 99  EXP 2408997 MAX  Gil 9999999");
-        assert_eq!(view(7, 626, 0, 20).hud_text("Wedge"), "Wedge (Barret)  Lv 7  EXP 626  Gil 20");
-        // A migrated account may hold Cloud's slot: its name is the player's, Cloud only the slot.
-        assert_eq!(ProgressView { character: 0, ..view(7, 626, 323, 20) }.hud_text("Blizz"), "Blizz (Cloud)  Lv 7  EXP 626/949  Gil 20");
-        // An id this client has no name for is shown neutrally, and the numbers never overflow.
+        assert_eq!(view(99, 2_408_997, 0, 9_999_999).hud_text("Wedge"), "Wedge (Gunner)  Lv 99  EXP 2408997 MAX  Gil 9999999");
+        assert_eq!(view(7, 626, 0, 20).hud_text("Wedge"), "Wedge (Gunner)  Lv 7  EXP 626  Gil 20");
+        // A migrated account may hold Cloud's curve: its name is the player's, the style a swordsman's.
+        assert_eq!(ProgressView { character: 0, ..view(7, 626, 323, 20) }.hud_text("Blizz"), "Blizz (Swordsman)  Lv 7  EXP 626/949  Gil 20");
+        // An id this client has no style for is shown neutrally, and the numbers never overflow.
         assert_eq!(
             ProgressView { character: 200, ..view(7, u32::MAX, u32::MAX, 1) }.hud_text("Wedge"),
-            "Wedge (Character)  Lv 7  EXP 4294967295/4294967295  Gil 1"
+            "Wedge (Fighter)  Lv 7  EXP 4294967295/4294967295  Gil 1"
         );
-        // A mirror that was never told the name shows the slot's name alone, and the mirror's own line carries its name.
-        assert_eq!(view(7, 626, 323, 20).hud_text(""), "Barret  Lv 7  EXP 626/949  Gil 20");
+        // A mirror that was never told the name shows the style alone, and the mirror's own line carries its name.
+        assert_eq!(view(7, 626, 323, 20).hud_text(""), "Gunner  Lv 7  EXP 626/949  Gil 20");
         let mut m = ProgressMirror::default();
         assert_eq!(m.hud_text(), None, "nothing said: no line");
         m.on_message(0.0, msg(2, 5, 40, 10, 3, 0, false));
-        assert_eq!(m.hud_text().as_deref(), Some("Tifa  Lv 5  EXP 40/50  Gil 3"));
+        assert_eq!(m.hud_text().as_deref(), Some("Martial artist  Lv 5  EXP 40/50  Gil 3"));
         m.set_player("Wedge");
-        assert_eq!(m.hud_text().as_deref(), Some("Wedge (Tifa)  Lv 5  EXP 40/50  Gil 3"));
-        // The slot names are this client's own table: the eight a new character can take, and Cloud's.
+        assert_eq!(m.hud_text().as_deref(), Some("Wedge (Martial artist)  Lv 5  EXP 40/50  Gil 3"));
+        // No line a player can read ever carries a canon character's name for the player.
+        for curve in 0..=8u8 {
+            let line = ProgressView { character: curve, ..view(5, 1, 1, 1) }.hud_text("Wedge");
+            for canon in fmv_ff7_battle::kernel::CharacterId::ALL {
+                assert!(!line.contains(canon.name()), "{line} names {}", canon.name());
+            }
+        }
+        // The curve names are this client's own table (internal: the logs say them): the eight a new character can take, and Cloud's.
         let names: Vec<_> = (0..=9).map(slot_name).collect();
         assert_eq!(names, [Some("Cloud"), Some("Barret"), Some("Tifa"), Some("Aerith"), Some("Red XIII"), Some("Yuffie"), Some("Cait Sith"), Some("Vincent"), Some("Cid"), None]);
     }

@@ -62,11 +62,27 @@
 //! * **Refusals.** `NoLimit` (the character has none), `LimitNotReady` (its gauge is not full) and
 //!   `CannotEscape` (the formation cannot be run from) join the v6 reasons.
 //!
+//! # The party: canon companions, then the players (v9)
+//!
+//! `EncounterStart::party` lists every fighter of the player side, `party[i]` fighting as `ActorId(i)`: first
+//! the story's CANON party ([`Controller::Companion`]: Cloud and Barret in the first reactor mission), then
+//! every player's own character ([`Controller::Player`]) in party order. A player's character is ADDED to the
+//! canon party; nobody is put in a canon member's place. A player commands only its own actor. A companion is
+//! commanded by the SERVER: when its ATB gauge is full the server picks one ordinary [`Command`] with a fixed
+//! rule over the engine's own state and applies it exactly like a player's, so it travels as a `BattleEvent`
+//! with the command attached and every client replays and checks it like any other; the engine has no AI for
+//! it and a client needs no rule of the server's. The commands a companion gave are therefore part of the log
+//! (`BattleEvent::command`), and the two kinds of member can be told apart only by the roster.
+//!
+//! **Players have no limit break** ([`PLAYER_LIMIT_BREAKS`]): [`BattleRules::build`] gives a player's combatant
+//! none, so `BattleState::limit_for` is `None` for it and a peer shows no limit bar. The companions keep theirs
+//! and the server's rule uses them.
+//!
 //! # Rewards
 //!
-//! [`split_rewards`] is a pure function of the engine's total reward and the ROSTER (every member
-//! of `EncounterStart::party`, with whether the engine says it is alive), never of who is still
-//! connected, so a client recomputes the very list the server sent.
+//! [`split_rewards`] is a pure function of the engine's total reward and the ROSTER ([`reward_roster`]: every
+//! PLAYER of `EncounterStart::party`, with whether the engine says it is alive; the companions are never paid),
+//! never of who is still connected, so a client recomputes the very list the server sent.
 //!
 //! **Item drops are the exception.** The server rolls them AFTER the outcome ([`BattleRules::roll_drops`],
 //! from the battle's seed on a stream of its own, logged) and hands them to the living members
@@ -114,42 +130,137 @@ impl fmt::Display for BattleId {
     }
 }
 
-/// One player's character in a battle. Ids, numbers and the player's own name: the stats follow from the
-/// peer's own kernel data. `party[i]` of `EncounterStart` fights as `ActorId(i)`.
+/// Who gives a battle member's commands (protocol v9). A battle's party is the story's CANON party, commanded
+/// by the server, followed by the players' own characters, each commanded by its player: nobody takes a canon
+/// member's place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Controller {
+    /// A player's own original character: only that account's session may command it, and its entity is frozen
+    /// in the field while the battle runs. The entity is what a peer finds the player's look by (the snapshot of
+    /// the area says how every entity looks).
+    Player { entity: EntityId, account: AccountId },
+    /// A member of the story's canon party, commanded by the SERVER: when its gauge is full the server chooses
+    /// the command with a fixed rule over the engine's own state and applies it like a player's, announcing it in
+    /// a `BattleEvent` with the command attached, so every peer replays and checks it (the engine has no AI for
+    /// it). It has no account and no entity: it is never paid, never saved and nobody may command it.
+    Companion,
+}
+
+impl Controller {
+    /// The controlling account, `None` for a companion.
+    pub fn account(&self) -> Option<AccountId> {
+        match self {
+            Controller::Player { account, .. } => Some(*account),
+            Controller::Companion => None,
+        }
+    }
+
+    /// The player's entity in the field, `None` for a companion.
+    pub fn entity(&self) -> Option<EntityId> {
+        match self {
+            Controller::Player { entity, .. } => Some(*entity),
+            Controller::Companion => None,
+        }
+    }
+
+    pub fn is_player(&self) -> bool {
+        matches!(self, Controller::Player { .. })
+    }
+
+    pub fn is_companion(&self) -> bool {
+        matches!(self, Controller::Companion)
+    }
+}
+
+/// One fighter of a battle's party: a player's character or a canon companion. Ids, numbers and a name: the
+/// stats follow from the peer's own kernel data. `party[i]` of `EncounterStart` fights as `ActorId(i)`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BattleMember {
-    /// The player's entity in the field (who is frozen while this battle runs).
-    pub entity: EntityId,
-    /// The account that controls this character (only its session may command it).
-    pub account: AccountId,
-    /// The PLAYER'S OWN name (protocol v8): what the party panel, the HP list, the banners and the log of
-    /// every peer call this fighter, instead of the name of the canon character whose combat template it
-    /// uses. Display only: the engine never reads it, so it is not part of what a replay depends on. Clipped
-    /// by the sender to [`crate::MAX_CHARACTER_NAME_CHARS`] characters, without control characters.
+    /// Who commands this fighter (protocol v9; v8 had the player's `entity` and `account` here).
+    pub controller: Controller,
+    /// What the party panel, the HP list, the banners and the log of every peer call this fighter (protocol
+    /// v8): a player's OWN name, a companion's canon name (Cloud, Barret), instead of the name of the combat
+    /// template the engine uses. Display only: the engine never reads it, so it is not part of what a replay
+    /// depends on. Clipped by the sender to [`crate::MAX_CHARACTER_NAME_CHARS`] characters, without control
+    /// characters.
     pub name: String,
-    /// The combat slot (protocol v8: the player's own, fixed at creation; before v8, the character of the
-    /// player's look): the FF7 character id whose combat template, experience curve and abilities this
-    /// fighter uses: Cloud 0, Barret 1, Tifa 2, Aerith 3, Red XIII 4, Yuffie 5, Cait Sith 6, Vincent 7, Cid 8
-    /// (`fmv_ff7_battle::kernel::CharacterId::index`). Not the player's identity: two players may hold the
-    /// same slot, and their [`BattleMember::name`]s tell them apart.
+    /// The canon character whose combat template the engine fights this member with: FF7 character ids Cloud 0,
+    /// Barret 1, Tifa 2, Aerith 3, Red XIII 4, Yuffie 5, Cait Sith 6, Vincent 7, Cid 8
+    /// (`fmv_ff7_battle::kernel::CharacterId::index`). For a companion it is who they are. For a player it is
+    /// the character's STAT CURVE ("fighting style"; protocol v8: the combat slot): fixed at creation, it
+    /// decides the base stats, the experience curve and the spells, and says nothing about who the player is
+    /// (two players may hold the same one, their [`BattleMember::name`]s tell them apart, and a player on
+    /// Cloud's curve fights beside the canon Cloud).
     pub character: u8,
     pub level: u8,
     /// Equipment override ids; `None` is the character's starting equipment.
     pub weapon: Option<u8>,
     pub armor: Option<u8>,
     /// The character's limit gauge when the battle starts (protocol v7), `0..=LIMIT_MAX` (255; a
-    /// larger number is refused by [`BattleRules::build`]): the account's own, which the server keeps
-    /// and saves at the end of every battle (under the debug flag `--debug-limit-full`: the cap, and no
-    /// gauge is saved). An input of the engine like the level, so every peer
-    /// replays the gauge the server had.
+    /// larger number is refused by [`BattleRules::build`]). An input of the engine like the level, so every peer
+    /// replays the gauge the server had. Players have no limit break (protocol v9, see [`PLAYER_LIMIT_BREAKS`]),
+    /// so a player's value does not matter; a companion starts empty (full under the debug flag
+    /// `--debug-limit-full`).
     pub limit: u16,
 }
 
 impl BattleMember {
+    /// A player's character in a battle (see [`Controller::Player`]).
+    pub fn player(entity: EntityId, account: AccountId, name: impl Into<String>, character: u8, level: u8, limit: u16) -> Self {
+        Self { controller: Controller::Player { entity, account }, name: name.into(), character, level, weapon: None, armor: None, limit }
+    }
+
+    /// A canon companion of the story's party in a battle (see [`Controller::Companion`]).
+    pub fn companion(name: impl Into<String>, character: u8, level: u8, limit: u16) -> Self {
+        Self { controller: Controller::Companion, name: name.into(), character, level, weapon: None, armor: None, limit }
+    }
+
     /// The FF7 character, if `character` names one.
     pub fn character_id(&self) -> Option<CharacterId> {
         CharacterId::from_index(usize::from(self.character))
     }
+
+    /// The controlling account, `None` for a companion.
+    pub fn account(&self) -> Option<AccountId> {
+        self.controller.account()
+    }
+
+    /// The player's entity in the field, `None` for a companion.
+    pub fn entity(&self) -> Option<EntityId> {
+        self.controller.entity()
+    }
+
+    pub fn is_player(&self) -> bool {
+        self.controller.is_player()
+    }
+
+    pub fn is_companion(&self) -> bool {
+        self.controller.is_companion()
+    }
+}
+
+/// Whether a player's character has a limit break (protocol v9: no, for now). The canon companions keep theirs
+/// (Braver for the canon Cloud and so on); a player on Cloud's curve would otherwise also give Braver beside
+/// him. [`BattleRules::build`] gives a player's combatant none, so a peer's engine has no limit gauge for it and
+/// `BattleState::limit_for` is `None`; the stored gauge of an account is left exactly as it is (nothing writes it
+/// for a character with no limit). A later version that gives players limits of their own changes this one
+/// constant and the rules' use of it.
+pub const PLAYER_LIMIT_BREAKS: bool = false;
+
+/// The roster a victory's rewards and drops are split over: every PLAYER of `party`, in party order, with
+/// whether `state` says its actor (`ActorId(i)` for `party[i]`) is alive. Companions are never in it: they are not
+/// paid. The ONE definition the server (`finish_battle`) and every peer's replay ([`BattleReplay::roster`]) use, so
+/// that both split the same list and a client can recompute the very rewards the server sent.
+pub fn reward_roster<'a>(party: impl IntoIterator<Item = &'a BattleMember>, state: &BattleState) -> Vec<(AccountId, bool)> {
+    party
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, member)| {
+            let account = member.account()?;
+            let alive = u8::try_from(i).ok().and_then(|i| state.actor(ActorId(i))).is_some_and(Combatant::is_alive);
+            Some((account, alive))
+        })
+        .collect()
 }
 
 /// What one account earned from a won battle (see [`split_rewards`] and [`assign_drops`]).
@@ -381,6 +492,13 @@ pub trait BattleRules: Send + Sync {
     /// The formation a debug encounter uses when none is named and the area has no table.
     fn default_formation(&self) -> Option<u16>;
 
+    /// The canon name of character `character` (FF7: Cloud, Barret, ...): what a battle's roster calls a canon
+    /// companion (protocol v9), which has no player to name it. `None` for an id that is nobody's, and the default for
+    /// a rule set that names nobody: the story's canon party then has no member to put in the battle.
+    fn character_name(&self, _character: u8) -> Option<String> {
+        None
+    }
+
     // ---- used by the server to keep each player's progress (defaults keep older rule sets valid) ----
 
     /// Total experience at which `character` reaches `level` (level 1 is 0), or `None` if this rule
@@ -580,14 +698,10 @@ impl BattleReplay {
         }
     }
 
-    /// The roster the rewards are split over: every party member and whether the engine says it
-    /// is alive (see [`split_rewards`]).
+    /// The roster the rewards are split over: every PLAYER of the party and whether the engine says it is alive
+    /// (see [`reward_roster`] and [`split_rewards`]); the companions are not paid, so they are not in it.
     pub fn roster(&self) -> Vec<(AccountId, bool)> {
-        self.party
-            .iter()
-            .enumerate()
-            .map(|(i, m)| (m.account, u8::try_from(i).ok().and_then(|i| self.state.actor(ActorId(i))).is_some_and(Combatant::is_alive)))
-            .collect()
+        reward_roster(&self.party, &self.state)
     }
 
     /// The rewards the engine says the battle earned (empty unless it was won).
@@ -838,6 +952,11 @@ impl Ff7BattleData {
                 }
                 let mut c = Combatant::from_character(&self.kernel, who, m.level, m.weapon, m.armor)
                     .ok_or(BattleBuildError::NoCharacterData(m.character))?;
+                // A player's character has no limit break (protocol v9): the combatant of a player on Cloud's
+                // curve must not give Braver beside the canon Cloud. The engine drops a gauge that has no break.
+                if m.is_player() && !PLAYER_LIMIT_BREAKS {
+                    c.limit_break = None;
+                }
                 c.limit = m.limit;
                 Ok(c)
             })
@@ -895,6 +1014,12 @@ impl BattleRules for Ff7BattleData {
             Some(own) if own > 1 => own,
             own => level_of(0).or(own).unwrap_or(DEFAULT_LEVEL),
         }
+    }
+
+    /// The canon characters' own names (`CharacterId::name`: Cloud, Barret, Tifa, Aerith, Red XIII, Yuffie, Cait Sith,
+    /// Vincent, Cid).
+    fn character_name(&self, character: u8) -> Option<String> {
+        CharacterId::from_index(usize::from(character)).map(|who| who.name().to_string())
     }
 
     /// The weakest formation: the one whose enemies have the least HP in total (the lowest id on a
@@ -970,7 +1095,8 @@ pub const DEFAULT_LEVEL: u8 = 5;
 /// with 3 Potions, 1 Ether and 1 Phoenix Down; a won battle drops [`SyntheticRules::drop_item`], one per
 /// enemy, if it is set. The enemies only ever attack.
 ///
-/// **Limits and escape (v7).** Every fighter has a limit that fills quickly (HP divisor 40): id 128, a
+/// **Limits and escape (v7).** Every companion (and, with [`SyntheticRules::player_limits`], every player's fighter:
+/// the real rules give players none, v9) has a limit that fills quickly (HP divisor 40): id 128, a
 /// strike of Power 48 on one enemy, except character 3, whose limit (id 142) heals one ally for half of its
 /// max HP, like Aerith's. Formations `0` and `1` can be run from at difficulty 1, formation `3` (the
 /// preemptive one) surely at difficulty 1, formation `4` at difficulty 2 and formation `2`, the
@@ -981,11 +1107,16 @@ pub struct SyntheticRules {
     pub enemy_hp: u32,
     /// The item every enemy of a won battle drops (one each, for certain); `None` drops nothing.
     pub drop_item: Option<u16>,
+    /// Give the PLAYERS' fighters a limit break too (protocol v9: the real rules give them none, see
+    /// [`PLAYER_LIMIT_BREAKS`], and so does the default here). The companions always have one. It exists so that the
+    /// machinery a player's limit gauge goes through (the gauge a member starts with, the command, the saved end
+    /// gauge, the menu's row) stays under test while no real player has one.
+    pub player_limits: bool,
 }
 
 impl Default for SyntheticRules {
     fn default() -> Self {
-        Self { enemy_hp: 200, drop_item: None }
+        Self { enemy_hp: 200, drop_item: None, player_limits: false }
     }
 }
 
@@ -1078,7 +1209,7 @@ impl BattleRules for SyntheticRules {
                 c.accuracy = 100;
                 c.spells = Self::spells();
                 c.limit = m.limit;
-                c.limit_break = Some(match who {
+                c.limit_break = (m.is_companion() || self.player_limits).then(|| match who {
                     CharacterId::Aeris => LimitBreak::new(142, ActionSpec::limit_heal(16), 40),
                     _ => LimitBreak::new(128, ActionSpec::limit_strike(48), 40),
                 });
@@ -1113,6 +1244,11 @@ impl BattleRules for SyntheticRules {
         Some(0)
     }
 
+    /// The nine canon names, like the real rules.
+    fn character_name(&self, character: u8) -> Option<String> {
+        CharacterId::from_index(usize::from(character)).map(|who| who.name().to_string())
+    }
+
     /// `2 * level * (level - 1)`: level 5 starts at 40, level 6 needs 60, level 7 needs 84 (a step of
     /// `4 * level`), so a won two-dummy formation (24 experience for one player) levels a starting
     /// character up. A made-up curve, like everything here.
@@ -1143,16 +1279,7 @@ mod tests {
     use fmv_ff7_battle::rules::{BattleState, Command};
 
     fn member(i: u64, character: u8) -> BattleMember {
-        BattleMember {
-            entity: EntityId(10 + i),
-            account: AccountId(20 + i),
-            name: format!("Player {i}"),
-            character,
-            level: 6,
-            weapon: None,
-            armor: None,
-            limit: 0,
-        }
+        BattleMember::player(EntityId(10 + i), AccountId(20 + i), format!("Player {i}"), character, 6, 0)
     }
 
     pub(crate) fn setup(formation_id: u16, members: usize) -> BattleSetup {
@@ -1271,6 +1398,135 @@ mod tests {
         // Nobody alive (not a state a victory reaches): nobody is paid, and nothing divides by zero.
         assert!(split_rewards(total, &[(AccountId(1), false)]).iter().all(|r| r.exp == 0 && r.gil == 0 && r.ap == 0));
         assert!(split_rewards(total, &[]).is_empty());
+    }
+
+    // ---- controllers (v9): canon companions first, then the players ----
+
+    fn companion(name: &str, character: u8) -> BattleMember {
+        BattleMember::companion(name, character, 6, 0)
+    }
+
+    /// Cloud and Barret as companions, then a player on Cloud's curve and one on Tifa's.
+    fn canon_then_players() -> Vec<BattleMember> {
+        vec![companion("Cloud", 0), companion("Barret", 1), member(0, 0), member(1, 2)]
+    }
+
+    #[test]
+    fn a_member_is_a_player_with_an_account_and_an_entity_or_a_companion_with_neither() {
+        let player = member(3, 2);
+        assert_eq!((player.is_player(), player.is_companion()), (true, false));
+        assert_eq!((player.account(), player.entity()), (Some(AccountId(23)), Some(EntityId(13))));
+        assert_eq!(player.controller, Controller::Player { entity: EntityId(13), account: AccountId(23) });
+        let cloud = companion("Cloud", 0);
+        assert_eq!((cloud.is_player(), cloud.is_companion()), (false, true));
+        assert_eq!((cloud.account(), cloud.entity()), (None, None));
+        assert_eq!(cloud.controller, Controller::Companion);
+        assert_eq!((cloud.character_id(), cloud.name.as_str()), (Some(CharacterId::Cloud), "Cloud"));
+    }
+
+    #[test]
+    fn players_have_no_limit_break_and_the_companions_keep_theirs() {
+        let rules = SyntheticRules::default();
+        // Everybody starts with a full gauge on the wire and, being preemptive, with a full ATB gauge; only the engine
+        // decides whom a limit gauge means something for.
+        let mut setup = BattleSetup { party: canon_then_players(), preemptive: true, ..setup(0, 1) };
+        for m in &mut setup.party {
+            m.limit = 255;
+        }
+        let state = rules.build(&setup).unwrap();
+        assert_eq!(state.party_ids().len(), 4);
+        let enemy = ActorId(4);
+        for companion in [ActorId(0), ActorId(1)] {
+            assert!(state.limit_for(companion).is_some(), "{companion:?}: a canon companion has its limit break");
+            assert_eq!(state.limit_gauge(companion), 255);
+            assert!(state.limit_ready(companion));
+            assert_eq!(state.check_command(companion, &Command::Limit { target: enemy }), Ok(()));
+        }
+        for player in [ActorId(2), ActorId(3)] {
+            assert!(state.ready_actors().contains(&player), "the player's turn is here");
+            assert!(state.limit_for(player).is_none(), "{player:?}: a player has no limit break");
+            assert_eq!(state.limit_gauge(player), 0, "a gauge a player was sent with is no gauge");
+            assert!(!state.limit_ready(player));
+            assert_eq!(state.check_command(player, &Command::Limit { target: enemy }), Err(fmv_ff7_battle::rules::CommandError::NoLimit(player)));
+        }
+        // The synthetic switch gives the players one too, and the companions are the same either way.
+        let with = SyntheticRules { player_limits: true, ..rules }.build(&setup).unwrap();
+        assert!((0..4).all(|i| with.limit_for(ActorId(i)).is_some() && with.limit_gauge(ActorId(i)) == 255));
+        // A player's stored gauge is a number the wire carries and the engine ignores: it still has to be one the
+        // engine could hold, like any member's.
+        let mut over = setup.clone();
+        over.party[2].limit = 256;
+        assert_eq!(rules.build(&over).unwrap_err(), BattleBuildError::InvalidLimit { character: 0, limit: 256, max: 255 });
+    }
+
+    #[test]
+    fn the_rewards_roster_is_the_players_in_party_order_and_never_a_companion() {
+        let rules = SyntheticRules::default();
+        let party = canon_then_players();
+        let setup = BattleSetup { party: party.clone(), ..setup(0, 1) };
+        let mut state = rules.build(&setup).unwrap();
+        // Everybody is alive at the start; the roster has the two players (accounts 20 and 21), in order.
+        assert_eq!(reward_roster(&party, &state), vec![(AccountId(20), true), (AccountId(21), true)]);
+        assert_eq!(BattleReplay::start(&rules, &setup).unwrap().roster(), reward_roster(&party, &state));
+        // A battle played to the end: the exp is split among the living PLAYERS, the companions take no share.
+        let log = serve(&mut state, 5);
+        assert!(!log.is_empty());
+        assert_eq!(state.outcome(), Some(Outcome::Victory));
+        let total = state.rewards();
+        let rewards = split_rewards(total, &reward_roster(&party, &state));
+        assert_eq!(rewards.iter().map(|r| r.account).collect::<Vec<_>>(), [AccountId(20), AccountId(21)]);
+        let alive = reward_roster(&party, &state).iter().filter(|(_, alive)| *alive).count() as u32;
+        assert!(alive >= 1);
+        assert!(rewards.iter().all(|r| r.exp == 0 || r.exp == total.exp / alive), "{rewards:?}");
+        // Drops are dealt to the same roster, never to a companion.
+        let mut with_drops = rewards.clone();
+        assign_drops(&mut with_drops, &reward_roster(&party, &state), &[InventoryEntry::new(0, 3)], 99);
+        assert_eq!(with_drops.len(), 2);
+        assert_eq!(with_drops.iter().flat_map(|r| &r.items).map(|e| u32::from(e.count)).sum::<u32>(), if alive == 0 { 0 } else { 3 });
+    }
+
+    /// The roster is by ACTOR index: a fallen companion in front of the players does not shift anyone's life or death
+    /// onto a neighbour.
+    #[test]
+    fn the_rewards_roster_follows_each_players_own_actor_even_when_a_companion_has_fallen() {
+        let party = canon_then_players();
+        let mut fighters: Vec<Combatant> = (0..4).map(|i| Combatant::new(format!("F{i}"), 6, 100)).collect();
+        fighters[0].hp = 0; // Cloud, a companion, is down
+        fighters[2].hp = 0; // the first player is down
+        let foe = Combatant::new("Foe", 3, 50);
+        let state = BattleState::with_config(1, fighters, vec![foe], BattleConfig::default());
+        assert_eq!(reward_roster(&party, &state), vec![(AccountId(20), false), (AccountId(21), true)]);
+        // Nobody paid for a fight that a player did not live to see; the living player takes the whole share.
+        let total = Reward { exp: 60, gil: 40, ap: 3 };
+        let rewards = split_rewards(total, &reward_roster(&party, &state));
+        assert_eq!(rewards, vec![BattleReward::new(AccountId(20), 0, 0, 0), BattleReward::new(AccountId(21), 60, 40, 3)]);
+    }
+
+    /// The server commands the companions with ordinary commands, applied and announced like a player's: a battle
+    /// of two canon companions and two players, played by one driver that stands in for the server (the companions)
+    /// and for the players' clients, replays on a peer's engine event for event and ends the way the server says.
+    #[test]
+    fn a_battle_of_companions_and_players_replays_exactly_whoever_gave_the_commands() {
+        let rules = SyntheticRules::default();
+        for seed in 0..40u64 {
+            let setup = BattleSetup { seed, party: canon_then_players(), ..setup([0u16, 1, 3, 4][seed as usize % 4], 1) };
+            let mut server = rules.build(&setup).unwrap();
+            let log = serve(&mut server, [3u64, 11, 40][seed as usize % 3]);
+            let outcome = server.outcome().unwrap_or_else(|| panic!("seed {seed} never ended"));
+            let replay = replay_all(&rules, &setup, &log).unwrap_or_else(|d| panic!("seed {seed}: {d}"));
+            assert_eq!(replay.state(), &server, "seed {seed}: the replayed engine IS the server's engine");
+            // Companions took part: their actors (0 and 1) gave commands, and so did the players' (2 and 3) in some fights.
+            let actors: Vec<u8> = log.iter().filter_map(|(_, _, c)| c.map(|c| c.actor.0)).collect();
+            assert!(actors.contains(&0) || actors.contains(&1), "seed {seed}: the companions fought");
+            let rewards = replay.expected_rewards();
+            replay.check_end(outcome, &rewards).unwrap_or_else(|d| panic!("seed {seed}: {d}"));
+            if outcome == Outcome::Victory {
+                assert!(rewards.iter().all(|r| r.account == AccountId(20) || r.account == AccountId(21)), "seed {seed}: only players are paid: {rewards:?}");
+                assert_eq!(rewards.len(), 2, "seed {seed}: one payment per player");
+            } else {
+                assert!(rewards.is_empty());
+            }
+        }
     }
 
     // ---- the input log: a server simulation and its replay ----
@@ -1455,7 +1711,9 @@ mod tests {
 
     #[test]
     fn a_replay_of_a_battle_with_limits_and_escapes_reproduces_it_and_ends_the_way_the_server_says() {
-        let rules = SyntheticRules::default();
+        // The players' fighters have limit breaks here (the real rules give them none, see `PLAYER_LIMIT_BREAKS`):
+        // the machinery of a limit gauge is what this replays.
+        let rules = SyntheticRules { player_limits: true, ..SyntheticRules::default() };
         let (mut escaped, mut won, mut gauges, mut failed, mut limits_used, mut heals) = (0, 0, 0, 0, 0, 0);
         for seed in 0..120u64 {
             let formation = [0u16, 1, 3, 4][seed as usize % 4];
@@ -1514,7 +1772,7 @@ mod tests {
 
     #[test]
     fn a_limit_or_an_escape_the_engine_would_refuse_is_caught_in_a_replay() {
-        let rules = SyntheticRules::default();
+        let rules = SyntheticRules { player_limits: true, ..SyntheticRules::default() };
         // Formation 2 cannot be run from; a member without a full gauge has no limit to give.
         let mut cannot = rules.build(&BattleSetup { preemptive: false, ..setup(2, 1) }).unwrap();
         assert!(!cannot.can_escape());

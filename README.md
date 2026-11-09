@@ -55,8 +55,11 @@ from its own `scene.bin` and `kernel.bin`, and **every account keeps its own cha
 account, and **limit breaks and escape (protocol v7)**: a limit gauge that enemy blows fill and a
 full one turns Attack into the character's limit break, and any character may try to run, and
 **every player has one original character of their own (protocol v8)**: a saved identity, a
-per-game appearance binding (a generic placeholder body in FF7), a combat slot of a canon party
-member that is separate from the canon story roles, and pointers to its progress. The
+per-game appearance binding (a generic placeholder body in FF7), a fighting style (the stat curve of a
+canon party member, separate from the canon story roles) and pointers to its progress, and
+**the story's own party fights beside the players (protocol v9)**: the canon Cloud and Barret of the first
+reactor mission are in every battle as companions the server commands, and each player's character is ADDED
+after them, in its own body, replacing nobody. The
 synthetic **FIXTURE** plaza still exists
 as a labelled test area; it says nothing about FF7 support.
 
@@ -66,7 +69,8 @@ as a labelled test area; it says nothing about FF7 support.
 | M2-a | Accounts, persistent avatar profile, per-game progression store | done |
 | M2-b | Parties (invite, accept, leave, kick, promote), phase-key instance placement | done (single phase) |
 | M2-c/d | Shared battle, battle return, per-player rewards | done (battle subset; rewards paid into each account's own character progress and saved) |
-| M2-e | Player characters: identity, per-game binding, combat slot separate from canon roles, pointers to progress (protocol v8) | done for the slice (FF7: generic placeholder bodies, fixed slots; `scripts/slice-smoke.sh`) |
+| M2-e | Player characters: identity, per-game binding, fighting style (a stat curve) separate from canon roles, pointers to progress (protocol v8) | done for the slice (FF7: generic placeholder bodies, fixed styles; `scripts/slice-smoke.sh`) |
+| M2-f | The story's canon party fights beside the players as server-controlled companions; players are added after them (protocol v9) | done for the first reactor mission (FF7: Cloud and Barret; `scripts/battle-smoke.sh`, `scripts/slice-smoke.sh`) |
 | Later | FF8, FF9, FF10 and FF12 adapters on the same core | planned |
 
 **Walking between fields (protocol v4).** The server hosts many fields: the entry field
@@ -202,8 +206,9 @@ answered, never a player who registered, played and has not logged in again. (A 
 earlier server has no such records: until each player logs in once with the saved token they look
 unclaimed to `fmv-accounts`, so check `list` and release by id there instead of `release-older-than`.) A body
 (`Hello::character.body`) is only ever one of the ids the hosted game offers; anything else is the default
-body instead of failing the registration, while a combat slot the game does not offer to a new character
-(FF7: Cloud's, or none that exists) is refused, because it would fix how the character fights for good.
+body instead of failing the registration, while a fighting style (`Hello::character.slot`, the id of a stat curve) the
+game does not offer to a new character (FF7: Cloud's curve, or none that exists) is refused, because it would fix how
+the character fights for good.
 
 *Refusals are typed.* `Reject { reason, code }`: the `reason` is a sentence for the screen, the `code`
 (`NameTaken`, `InvalidName`, `InvalidToken`, `RegistrationClosed`, `RateLimited`, `AlreadyOnline`,
@@ -255,9 +260,10 @@ With nothing saved yet it opens on the create screen: a **name** (up to 24 chara
 exactly as the server cleans it), a **body** (a generic placeholder model of your own `char.lgp`,
 the field look of your character, see "In the game"), a **tint** (a palette grid plus red, green
 and blue sliders; until you pick one it is the colour the command line would derive from the
-name) and a **combat slot** (FF7: Barret, Tifa, Aerith, Red XIII, Yuffie, Cait Sith, Vincent or Cid:
-the canon party member whose combat moves and level curve you fight with, fixed once the character is
-created; Cloud stays the canon protagonist and is not offered; see "Your own character"). **Tab** or **Up/Down** move between the fields, **Left/Right** change a value, **Enter**
+name) and a **fighting style** (FF7: Gunner, Martial artist, Mage, Guardian, Ninja, Gambler, Marksman or Lancer:
+how you fight, meaning the stats, spells and level curve, fixed once the character is created; the screen names
+no canon character, and the Swordsman's, Cloud's own curve, is not offered; see "Your own character"). **Tab** or
+**Up/Down** move between the fields, **Left/Right** change a value, **Enter**
 registers. If the server refuses (name taken, registration closed, rate limited) the reason is
 shown on screen and you can edit and try again; the first time a registration succeeds its
 token is saved before anything else can fail. `--name` skips the menu (the old behaviour) and
@@ -289,7 +295,7 @@ nothing to say there (hidden, silenced, no talk script) does nothing when you ta
 
 *Characters.* In an FF7 field every player, you included, is drawn as the binding the server holds for
 them: a generic placeholder body (`ff7/body/lean`, `ff7/body/sturdy`, `ff7/body/slight`) tinted with their
-colour, never the model of the canon character whose combat slot they hold (an account that predates
+colour, never the model of a canon character, whatever stat curve they fight with (an account that predates
 protocol v8 keeps the canon look it chose: `ff7/cloud`, `ff7/tifa`, ... `ff7/vincent`), standing on the walkmesh at their
 position and facing the way they face, with the idle, walk or run animation of what they are
 doing. The models are read from **your own copy** of the game's `char.lgp` (found in the same
@@ -313,19 +319,19 @@ pixels (the rest are face decals); an sRGB target and a plain one show one pictu
 levels). With a blue player: the dark cloak `[57,66,109]` becomes `[54,91,164]`, dark suit grey `[48,48,52]`
 `[46,71,120]`; with an orange one `[157,86,43]` and `[118,68,34]`; skin `[230,180,150]` moves by 5 levels at most
 (the old tint moved it by 28 to 57). At 1x two players' bodies are told apart at a glance (mean colour distance
-of two bodies 25 of 441 before, 119 after). **In battle** the party members' BODIES (not their swords, not the
-enemies, not the location) wear the colour of the player each member is, the same look: Barret's slot in a blue
-player's colour is blue clothes with his own skin, a Tifa in an orange player's is orange (a colour that is not
-known yet, for instance before that player's snapshot arrived, leaves the model as it was and is picked up as soon
-as it is). Limits: pure black cloth (all channels 0) only gets a very dark shade of the colour (near-black cloth,
+of two bodies 25 of 441 before, 119 after). **In battle** the PLAYERS' bodies (not the canon companions Cloud and
+Barret, who have no player and keep their own colours; not any sword, not the enemies, not the location) wear the
+colour of the player each member is, the same look: a blue player's placeholder body is blue clothes with its own
+skin, an orange player's is orange (a colour that is not known yet, for instance before that player's snapshot
+arrived, leaves the model as it was and is picked up as soon as it is). Limits: pure black cloth (all channels 0) only gets a very dark shade of the colour (near-black cloth,
 which is what the models contain, is lifted plainly); an orange or peach colour sits near skin hue, so those
 players' pastel clothes stay told apart from their skin by saturation and brightness only; and the `sturdy`
 body's covered face (red eyes and a brown visor are ordinary coloured polygons, not face decals) is repainted with
 the rest, so its eyes turn pale. The pictures come from the real-data tests (`cargo test -p fmv-client --
 --ignored offscreen_field_identity --test-threads=1`, `offscreen_battle_identity_before_after`, with
 `FMV_FF7_LIBRARY` and `FMV_SHOT_DIR`): each body in four colours as untinted | old | new from one frame, a 1920x1080
-overview, and the battle before and after from one scene at one instant (42 421 pixels differ, all of them on the
-party's bodies).
+overview, and the battle before and after from one scene at one instant (54 339 pixels differ, all of them on the
+two players' bodies: the canon pair, the enemies and every weapon are bit for bit as they were).
 
 The picture of an FF7 field is drawn **tile by tile with a depth
 per tile**, in the same depth-tested pass as the models, as the game does it: a layer-2 tile is
@@ -344,10 +350,12 @@ flat picture as before.
 *In a battle.* **B** asks the server for a debug battle (refused unless it runs with
 `--debug-encounters`; random encounters start battles by themselves in a field that has an
 encounter table). The window then shows the battle as a 3D scene: the formation's own camera
-(from your `scene.bin`), the enemies where the formation puts them, your party opposite them
-facing them, on the location's own model: all of them are the real battle models of your own
-`battle.lgp` (stand-ins when it has none). They play the game's own clips: a party member runs up,
-swings, and hops back (attack), gathers a spell with its cast clips (a glow, then a burst in the
+(from your `scene.bin`), the enemies where the formation puts them, the party opposite them
+facing them (the story's canon party first, then each player: up to five), on the location's own model: the enemies
+and the canon companions are the real battle models of your own `battle.lgp` (stand-ins when it has none) and each
+player is its OWN body, the placeholder body and colour it has on the field, moving procedurally (a lunge, a hop back,
+a flinch, a fall; a canon battle model on a player would be a bug). The real models play the game's own clips: a
+party member runs up, swings, and hops back (attack), gathers a spell with its cast clips (a glow, then a burst in the
 colour of the spell's element: fire, ice, bolt, cure), holds its guard, flinches when it is hit and
 falls when it is beaten, and rejoices when the battle is won; an enemy runs up and plays the clip
 `scene.bin` names for the attack it uses, flinches with its hurt clip and, when beaten, fades away.
@@ -448,7 +456,7 @@ instances (an area is one instance whatever the story phases of the players in i
 the account and its avatar profile on the server and hands the client its token **once**; the
 client saves it under its state directory (`--state-dir`, default `client/` next to the
 library) in `accounts/<server>.token`, owner-only, and uses it from then on. After
-registration the server never trusts a client's name, tint, body or combat slot: they come from the
+registration the server never trusts a client's name, tint, body or fighting style: they come from the
 stored player character, and `--name` is only needed to register. Names are unique (case-insensitive,
 invisible formatting characters are stripped). `--register` forces a new account for `--name`.
 A second account on the same server and machine gets its own file (the first file records
@@ -469,8 +477,9 @@ when a player asks for one and the server runs with `--debug-encounters` (off by
 players in it are frozen in the field. The server owns the battle (`fmv-ff7-battle`'s seeded,
 deterministic engine over its own `scene.bin` and `kernel.bin`), steps it, checks that every
 command comes from the character's own player with a full gauge, and announces every step;
-`EncounterStart` carries only the formation id, a seed, who plays which character at which level
-and a fingerprint of the server's battle data, so each client rebuilds the very same battle
+`EncounterStart` carries only the formation id, a seed, who fights at which level (the canon companions first, then
+each player, and since protocol v9 who commands each one) and a fingerprint of the server's battle data, so each
+client rebuilds the very same battle
 from its own files and replays it, and shouts `BATTLE DIVERGENCE` if its engine ever disagrees
 with the server's. When it ends everyone is back in the field and `BattleEnd` carries the
 rewards (experience and gil shared among the living, AP to each), which the server pays into each
@@ -482,7 +491,7 @@ battle from its own game files and matched (`verified by replay`, not merely "no
 mode fires every command over real processes (see "Every command over real processes", below).
 
 **Character progress (protocol v5).** Every account has its own progress in the game it plays: the
-character it fights as (its combat slot since protocol v8, see "Your own character" below; before that
+character it fights as (its fighting style, the stat curve, since protocol v8, see "Your own character" below; before that
 the character its look named, Cloud unless it chose another look) and that character's level, experience,
 AP and gil. A battle's members fight as their own character at their own level (the old rule that
 gave the `i`-th member of a battle the `i`-th character of the game is gone), a victory pays each
@@ -599,12 +608,14 @@ session 1 at a higher level than they joined at (told `leveled_up=true`, stored)
 servers it then restarts WITHOUT the flags tell and fight them at exactly those levels and gauges.
 `scripts/battle-smoke.sh --commands --build` uses all of it on the real field `md1stin` and owned data: one
 server (with both debug flags) stays up through two runs of the same two bots; in the first they follow
-`defend,item:0,magic:0,limit` and `magic:0,magic:9999,item:0,defend,limit` (spell 9999 does not exist: that entry
+`defend,item:0,magic:0` and `magic:0,magic:9999,item:0,defend` (spell 9999 does not exist: that entry
 must be skipped and counted) and win, in the second both try `escape` until the battle ends in Escaped (formation
-301 has run difficulty 1; one attempt gets away 68% of the time). It FAILS unless the server applied each of
-magic, item, defend, limit and escape at least once (the bots' breakdowns and the server's own log lines must
-agree), every battle was replayed by each bot from its own battle data with 0 divergences, both battles started
-with `limits=[255, 255]` and the debug gauge was never stored. `FMV_SMOKE_SCRIPT_A`, `FMV_SMOKE_SCRIPT_B` and
+12 has run difficulty 1; one attempt gets away 68% of the time). It FAILS unless the server applied each of
+magic, item, defend and escape at least once (the bots' breakdowns and the server's own log lines must
+agree), a canon companion gave its limit break through the server's rule (players have none, so no bot's `limit` is
+ever applied), every battle was replayed by each bot from its own battle data, the companions' commands included, with
+0 divergences, both battles started with the players' `limits=[255, 255]` and the debug gauge was never stored.
+`FMV_SMOKE_SCRIPT_A`, `FMV_SMOKE_SCRIPT_B` and
 `FMV_SMOKE_ESCAPE_SCRIPT` override the scripts (to try its failure paths).
 
 `md1stin`'s own encounter table (section 6 of the field file, Steam PC build): the first of its
@@ -612,52 +623,113 @@ two 24-byte tables is the enabled one, with rate 128 (a roll succeeds with proba
 and three formations whose weights add up to 64: 301 (weight 24, two enemies), 302 (22, one enemy)
 and 303 (18, two enemies); the second table is disabled. The server reads every field's table the
 same way (checked over all 702 fields of that build: every enabled table's weights add up to 64
-and every formation exists in `scene.bin`). A starting party wins 301 and 303 every time (200 of
-200 seeded runs each, both members attacking), which is why the smoke script uses 301.
+and every formation exists in `scene.bin`). A starting party of two players wins 301 and 303 every time (200 of
+200 seeded runs each, both members attacking). Since protocol v9 the canon Cloud and Barret fight beside the players and
+end those fights in about a hundred ticks, before every player has had a turn (measured by
+`crates/fmv-server/tests/battle_real.rs`: the players act in only about a tenth to a half of the fights), which is why
+the smoke scripts that need every bot to act fight formation 12 instead (two sturdier enemies of the game's own data,
+won every time with every player acting in 200 of 200 seeds; `--formation` picks another) and only `--random` fights
+`md1stin`'s own.
 
-**Your own character (protocol v8).** Every player has ONE original character that travels across
-games. In FF7 it takes a canon party member's **combat slot** (Barret's, say) while that canon
-character stays in the story as a non-player character (the canon Barret is an NPC of `md1stin` and
-`md1_1` whichever slot anybody holds; dialogue is never name-swapped); the character's identity and
-appearance persist and each game draws them its own way. Three things are therefore separate, in the
-protocol and in the store:
+**Your own character (protocol v8; in the party since v9).** Every player has ONE original character that travels
+across games. In FF7 it fights with the **stat curve** of a canon party member (its *fighting style*: Gunner, Mage and so
+on; the stored field is still called `slot`) and is **added** to the story's own party in battle, never taking a canon
+character's place (see "The canon party fights beside the players" below); dialogue is never name-swapped, and the
+character's identity and appearance persist and each game draws them its own way. Three things are therefore separate,
+in the protocol and in the store:
 
 * the **identity**: name, colour and a game-agnostic body choice (the creator's Body row);
 * the **binding**: how the hosted game draws the character, stored per game. In FF7 it is a generic
   placeholder body, a non-canon human model of your own `char.lgp` (`lean`, `sturdy` or `slight`: see
   the `playable` module of `fmv-ff7` for which models and why), tinted with the identity colour, and
-  never the slot's canon character. Every player sees every other player's binding;
-* the **slot**: the canon party member whose combat template, abilities and experience curve the
-  character fights with. It is chosen once, at creation, and fixed (FF7's experience curves differ per
-  character, so a slot change would change a player's level). New characters pick among the canon party
-  members other than Cloud, who stays the canon protagonist; two players may hold the same slot; a
-  registration that names none gets Barret's. In battle the party panel, the HP list, the banners and the
-  logs show the player's own name; the engine uses the slot's template, and the battle model is the
-  slot's own battle model (a placeholder until players have battle models of their own), drawn in the
-  player's identity colour like the field body ("The player's colour on a model").
+  never a canon character's model (an account that predates the creator keeps the canon look it chose until it is
+  converted with `fmv-characters restyle`, below). Every player sees every other player's binding, in the field and in
+  battle;
+* the **fighting style** (the record's `slot`): the stat curve of a canon party member, whose combat template,
+  abilities and experience curve the character fights with. It is chosen once, at creation, and fixed (FF7's
+  experience curves differ per character, so a change would change a player's level). It is internal: the creator's
+  row is called "Fighting style" and its labels (the table below) name no canon character. New characters pick any
+  style but the Swordsman's (Cloud's own curve: he stays the protagonist; an account that predates the creator may
+  hold it); two players may hold the same style; a registration that names none gets the Gunner's (Barret's
+  curve). In battle the party panel, the HP list, the banners and the logs show the player's own name; the engine
+  uses the curve's template, and the model is the player's own body, drawn in the player's identity colour like the
+  field body ("The player's colour on a model").
+
+| curve | fighting style | stat curve of |
+|---|---|---|
+| 0 | Swordsman (not offered to a new character) | Cloud |
+| 1 | Gunner (the default) | Barret |
+| 2 | Martial artist | Tifa |
+| 3 | Mage | Aerith |
+| 4 | Guardian | Red XIII |
+| 5 | Ninja | Yuffie |
+| 6 | Gambler | Cait Sith |
+| 7 | Marksman | Vincent |
+| 8 | Lancer | Cid |
 
 The server keeps it in `<state>/server/characters/<account>.json` (`fmv-persist`'s `PlayerCharacter`):
-the identity and, per game, the binding, the slot and **pointers** to where the progress lives.
+the identity and, per game, the binding, the slot (the fighting style's stat curve) and **pointers** to where the progress lives.
 Pointers, never copies: the level, experience, AP, gil, limit gauge and inventory stay in the
 character-progress record under `progression/<account>/<Game>.character.json` and the story in the
-story blob beside it, exactly where they always were (that record's `character` field is the slot's id;
+story blob beside it, exactly where they always were (that record's `character` field is the stat curve's id;
 if a rolled-back build saved another one the slot wins and the next save writes it back). An account that
 predates the record (every account of a v6 or v7 server) gets one at its first login, **added next to
 its files, which are not touched**: a test loads the exact v6 and v7 file shapes and requires every file
-byte for byte unchanged and every number the same. Its slot is the character v7 fought it as (the one
-its look named, Cloud without a look; a migrated account may hold Cloud's slot) and its look is kept as
+byte for byte unchanged and every number the same. Its curve is the character v7 fought it as (the one
+its look named, Cloud without a look; a migrated account may hold Cloud's) and its look is kept as
 its binding (an account that never chose one gets the default placeholder body). The window's character
-creator takes a name, a body, a colour and a combat slot; headless players take `--body` and `--slot`
-(`fmv-client --help`). `scripts/slice-smoke.sh` proves the whole slice on your real data over real
-processes: two players with different identities and slots register, party up, advance one player's
-story (the server-validated story point of `md1stin`), talk to the field's guard and to the canon
-Barret (`fmv-client --headless --talk gu0,Barret` prints what a character says as `talk:` lines, read
-from your own copy of the field script with the player's own story: the guard says the game's own
-words, the same to both players, and Barret, who is no script entity, has nothing to say) and win a
-shared battle whose roster shows their own names with their slots' templates while the canon Barret
-stays an NPC of the field; the server process is stopped and started again, the same players log in
-again and are told exactly what they ended with (a login changes no record byte), and a second battle on
-the restarted server pays on top of what was saved, to the point.
+creator takes a name, a body, a colour and a fighting style; headless players take `--body` and `--slot` (a style:
+`--slot gunner`, or the canon character whose curve it is, `--slot barret`; `fmv-client --help`).
+`scripts/slice-smoke.sh` proves the whole slice on your real data over real
+processes: two players with different identities and fighting styles register, party up, advance one player's
+story (the server-validated story point of `md1stin`), talk to the field's guard (`fmv-client --headless --talk gu0`
+prints what a character says as `talk:` lines, read from your own copy of the field script with the player's own
+story: the guard says the game's own words, the same to both players) and win a shared battle whose roster is the
+canon Cloud and Barret (server-controlled companions: `companion acted` lines, every command replayed by both bots with
+0 divergences) followed by both players under their own names with their styles' stat curves, the rewards going to
+the two players only; the server process is stopped and started again, the same players log in again and are told
+exactly what they ended with (a login changes no record byte), and a second battle on the restarted server pays on
+top of what was saved, to the point. The stored limit gauge of an account (the smoke writes 200 and 120, as an account
+that predates v9 would hold) is preserved by the battle and by the restart.
+
+**The canon party fights beside the players (protocol v9).** A battle's party is the story's canon party first, then
+every PLAYER in party order: in the first reactor mission (`md1stin`, `md1_1`) Cloud and Barret, so a solo player
+fights as [Cloud, Barret, the player] and two players as [Cloud, Barret, player 1, player 2], up to five (a player
+party is still at most three). The canon party is a table (`CANON_PARTIES` in `fmv_ff7::story`: one row from the first
+moment of the game, extended with each story party that comes later), chosen by the party leader's own story progress.
+Nobody is replaced, whatever stat curve a player fights with: a new Barret-curve character gets [Cloud, Barret,
+itself] and is drawn in its own body, never as a second Barret, and an account that predates the creator on Cloud's
+curve gets [Cloud, Barret, itself] with no second Cloud. (The canon Barret is therefore no longer a stand-in NPC of the
+field: he is in the party.)
+
+* **The server commands the companions.** A canon member has no account and no connection: when its gauge is full the
+  server issues its command as an ORDINARY command (heal the most hurt member below half HP with the cheapest healing
+  spell it can pay for; else its limit break when its gauge is full and there is something worth aiming at; else Attack
+  the first living enemy), announces it like a player's (`AppliedCommand`) and logs `companion acted battle=.. actor=..
+  name=Cloud command=..`, so every client replays and verifies it with no change to the engine. `fmv_server::companion`
+  is the whole rule, a pure function of the engine's state (deterministic, never refused by it). A companion fights at
+  the party leader's level (`--battle-level` pins everybody's), is never paid and never saved, cannot be commanded by a
+  client (`NotYourActor`), and does not keep a battle alive: a battle with no connected player left is dropped.
+* **Players are paid, companions are not.** Experience and gil are shared among the living PLAYERS only
+  (`fmv_protocol::reward_roster`, used by the server and by every replaying client), AP goes to each player, and only
+  a player's progress, inventory and limit gauge are saved.
+* **Players have no Limit Break** for now (`fmv_protocol::PLAYER_LIMIT_BREAKS`): every peer's engine gives a player's
+  combatant none (so a Barret-curve player does not give Barret's limit break beside the canon Barret), the window
+  shows no limit gauge for it and a `limit` command is refused (`NoLimit`). The gauge a stored account already has (the
+  preview bot's is about 200) is **never overwritten or zeroed**: the server saves a gauge only for a member that has a
+  limit break. Whether players get limit breaks of their own is the owner's call.
+* **Drawn as themselves.** The canon companions are the canon characters' own battle models (weapons and clips); each
+  player is its own body, the placeholder body and colour its entity has on the field (the snapshot's appearance ref),
+  moving procedurally: the lunge, the hop back, the flinch and the fall. Colours follow the players' entities, never the
+  order of the roster. An account that predates the creator and chose a canon look (the preview's Blizz may be one:
+  `fmv-characters show` says) is drawn in battle as that look's FIELD model, as in the field, tinted, beside the canon
+  battle model of the same character: it reads as a second Cloud until the account is restyled with a placeholder
+  body (`fmv-characters restyle`, below: identity, tint and binding only, never the curve, the progress or the story).
+  The pictures of `offscreen_battle_canon_party_with_every_player_in_its_own_body` (`cargo test -p fmv-client --
+  --ignored --test-threads=1`, with `FMV_FF7_DATA` and `FMV_SHOT_DIR`) show the canon pair and two players, three
+  players (five fighters, at three window sizes), and one alone in each of three cases: a new character on Barret's
+  curve, an account that predates the creator and never chose a look (Cloud's curve, the default body), and one that
+  chose Cloud's own look.
 
 **Converting an existing account to an original look (`fmv-characters`).** An account made before protocol v8
 (the preview's Blizz is one) is a canon look and the character that look named; to turn it into a character with
@@ -717,6 +789,18 @@ reads every v6 record (no `limit` key reads as an empty gauge). The inventory ca
 applies: a server rolled back to a v5 build ignores (and drops) the inventory of a record and
 refuses a record with more than about 70 stacks as too large, so roll back past v6 only from a
 snapshot taken before any inventory was stored.
+
+**Protocol v9** (`fmv-protocol`) puts the story's canon party in the battle roster: every `BattleMember` now carries a
+`controller`, `Player { entity, account }` (the field entity is how every client finds that player's look and colour:
+a superset of just an account) or `Companion` (the server commands it; no account), in place of v8's bare `entity` and
+`account`; `party[i]` still fights as `ActorId(i)`, the companions first. A companion's commands travel as the same
+`AppliedCommand`s as a player's, so no client needs to know who issued one. Neither version can read the other's
+roster, so the version had to change: a v8 peer is refused at the handshake, cleanly, as v7 was (golden JSON tests pin
+the player roster, the companion roster and the controller, and one reads a v8 member as a v9 one and fails on purpose).
+**Rolling back v9:** v9 writes nothing a v8 build cannot read: the stat curve is the same `slot` field, no companion is
+ever saved, a player's stored limit gauge is kept exactly as it is and no record is re-keyed or moved, so roll the
+server back to a v8 build on the same state directory (and the clients with it: a v8 client is refused by a v9 server
+and the other way round). Characters created by v9 are the same as v8's.
 
 ## Importing your own FF7 data
 

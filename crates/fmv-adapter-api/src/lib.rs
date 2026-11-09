@@ -407,6 +407,20 @@ pub trait AreaRuntime: Send + Sync {
         let _ = phase;
         self.npcs()
     }
+
+    /// The game's CANON party at this story state: the characters of the story that fight beside the
+    /// players, as the game's own character ids (what `BattleMember::character` carries), in the order the
+    /// story lists them (FF7: Cloud, Barret in the first reactor mission). `progress` is the progression of the
+    /// account whose story the party follows (a party's leader). A player's original character is ADDED to this
+    /// party, never put in a member's place, and the server commands these members (see `fmv-server`'s
+    /// `world::companion`). The default is none: a game whose story has no party of its own fights with
+    /// only the players. It must answer for any blob, an unreadable one included (a story that cannot be
+    /// read has its game's starting party), and never depends on who the player is or which combat curve
+    /// it uses.
+    fn story_party(&self, progress: &[u8]) -> Vec<u8> {
+        let _ = progress;
+        Vec::new()
+    }
 }
 
 /// A game adapter bound to one owned-content source (or the synthetic fixture).
@@ -662,6 +676,7 @@ mod tests {
         assert!(area.story_points().is_empty());
         assert_eq!(area.story_advance(&[], 0), None);
         assert!(area.npcs_in_phase(&PhaseKey(vec![9])).is_empty());
+        assert!(area.story_party(&[1, 2, 3]).is_empty(), "no canon party: the players fight alone");
     }
 
     #[test]

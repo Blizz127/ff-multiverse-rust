@@ -22,7 +22,7 @@ fn kit() -> ModelKit {
 }
 
 fn member(i: u64, character: u8) -> BattleMember {
-    BattleMember { entity: EntityId(1 + i), account: AccountId(1 + i), name: format!("P{i}"), character, level: 5, weapon: None, armor: None, limit: 0 }
+    BattleMember::player(EntityId(1 + i), AccountId(1 + i), format!("P{i}"), character, 5, 0)
 }
 
 fn setup_for(formation: u16, party: usize) -> BattleSetup {
@@ -37,9 +37,15 @@ fn setup_for(formation: u16, party: usize) -> BattleSetup {
     }
 }
 
+/// The synthetic rules with a limit break for the players' fighters too (the real rules give them none, protocol v9):
+/// the scene's look of a limit is read from the performer's own engine record.
+fn limit_rules() -> SyntheticRules {
+    SyntheticRules { player_limits: true, ..SyntheticRules::default() }
+}
+
 /// The engine of `formation` (1: two dummies) for `party` members.
 fn engine(formation: u16, party: usize) -> BattleState {
-    SyntheticRules::default().build(&setup_for(formation, party)).unwrap()
+    limit_rules().build(&setup_for(formation, party)).unwrap()
 }
 
 /// A formation of two enemies seen from a camera on the positive-x side (made-up numbers).
@@ -56,7 +62,7 @@ fn formation() -> FormationScene {
 }
 
 fn start(party: usize, formation: Option<FormationScene>) -> SceneStart {
-    SceneStart { id: BattleId(1), party: (0..party as u64).map(|i| member(i, i as u8)).collect(), my_actor: Some(ActorId(0)), formation }
+    SceneStart { id: BattleId(1), party: (0..party as u64).map(|i| member(i, i as u8)).collect(), bindings: Vec::new(), my_actor: Some(ActorId(0)), formation }
 }
 
 fn scene(party: usize, with_formation: bool) -> (BattleScene, BattleState) {
@@ -148,13 +154,14 @@ fn a_scene_has_the_party_first_then_the_enemies_with_models_to_match() {
 }
 
 #[test]
-fn the_combat_slot_of_a_member_decides_its_model() {
-    // Battle placeholder: the slot's own model. The party of `start(3, ..)` fights in the slots 0, 1 and 2.
+fn a_players_model_is_its_own_body_whatever_stat_curve_it_fights_with() {
+    // The party of `start(3, ..)` are three PLAYERS on the curves 0, 1 and 2 (Cloud's, Barret's and Tifa's), none of
+    // whose looks this client knows: each is the default placeholder body, and no canon model is asked for at all.
     let engine = engine(1, 3);
     let asked = Rc::new(RefCell::new(Vec::new()));
     let mut kit = ModelKit::new(Box::new(StandInModels), Some(Box::new(Counting::new(Rc::clone(&asked), vec![]))));
     BattleScene::new(&start(3, None), Some(&engine), &mut kit).unwrap();
-    assert_eq!(*asked.borrow(), ["ff7/cloud", "ff7/barret", "ff7/tifa"], "Cloud's, Barret's and Tifa's field models, one per slot");
+    assert_eq!(*asked.borrow(), ["ff7/body/lean"], "one default body, shared; not Cloud's, Barret's and Tifa's models");
 }
 
 #[test]
@@ -433,7 +440,7 @@ fn command_of_the_first_hero(limit: u16, command: impl Fn(&BattleState) -> Comma
     let mut setup = setup_for(3, 2);
     setup.preemptive = true;
     setup.party[0].limit = limit;
-    let before = SyntheticRules::default().build(&setup).unwrap();
+    let before = limit_rules().build(&setup).unwrap();
     let mut engine = before.clone();
     let mut events = engine.step_ticks(1);
     let command = command(&engine);
@@ -592,18 +599,105 @@ fn the_scene_starts_from_the_roster_with_each_members_own_name_and_slot() {
     assert_eq!(roster, [("P0", 0), ("P1", 1)]);
 }
 
-/// The model of a party member in battle is its combat slot's, whatever the player looks like on the field:
-/// here the area shows entity 1 as Barret and entity 2 as Tifa, and the roster says they fight in the slots of
-/// Cloud (0) and Barret (1), so Cloud's and Barret's models are asked for and never the looks'.
+/// The model of a PLAYER in battle is its own body, the look the area shows for its entity: here the area shows
+/// entity 1 as Barret and entity 2 as Tifa (accounts that predate v8 keep the canon look they chose), and the roster says
+/// they fight on the curves of Cloud (0) and Barret (1): the looks are asked for, and never the curves' canon models.
 #[test]
-fn a_battle_model_is_the_slots_whatever_the_player_looks_like_on_the_field() {
+fn a_players_battle_model_is_the_look_it_has_on_the_field_never_its_stat_curves() {
     let s = state_in_battle();
     let view = s.battle.view(1.0).unwrap();
     let asked = Rc::new(RefCell::new(Vec::new()));
     let mut kit_slot = Some(ModelKit::new(Box::new(StandInModels), Some(Box::new(Counting::new(Rc::clone(&asked), vec![])))));
     let mut slot = None;
     assert!(scene_for(&mut slot, &mut kit_slot, &s, &view, 1.0, &[]).is_some());
-    assert_eq!(*asked.borrow(), ["ff7/cloud", "ff7/barret"], "the slots' models, not the looks the players have in the field");
+    assert_eq!(*asked.borrow(), ["ff7/barret", "ff7/tifa"], "the players' looks, not the models of the curves 0 and 1 (Cloud's and Barret's)");
+}
+
+/// The owner's cases, over every curve: a solo player (a new "Blizzy" of Barret's curve with the lean body, an account of before
+/// the creator on Cloud's curve with the default body, anyone else) is drawn as its OWN body, and the canon Cloud and Barret
+/// appear as themselves beside it: no second Barret, no second Cloud, whatever the player's internal curve is.
+#[test]
+fn a_solo_player_is_its_own_body_beside_the_canon_pair_whatever_its_stat_curve() {
+    for curve in 0..=8u8 {
+        let area = AreaId { game: GameId::Fixture, key: "k".into() };
+        let mut s = ClientState::new(EntityId(1), AccountId(1), Pos::default(), area.clone());
+        s.battle.set_rules(Some(Arc::new(SyntheticRules::default())));
+        let me = EntitySnapshot {
+            id: EntityId(1),
+            pos: Pos::default(),
+            facing: 0.0,
+            anim: AnimState::Idle,
+            avatar: AvatarAppearance::new("Blizzy", [60, 140, 230], Some("ff7/body/lean".to_string())),
+        };
+        s.apply(0.0, ServerMsg::AreaSnapshot { area, tick: 1, entities: vec![me], npcs: vec![] });
+        s.apply(
+            0.0,
+            ServerMsg::EncounterStart {
+                battle_id: BattleId(9),
+                formation_id: 0,
+                seed: 3,
+                party: vec![BattleMember::companion("Cloud", 0, 5, 0), BattleMember::companion("Barret", 1, 5, 0), BattleMember::player(EntityId(1), AccountId(1), "Blizzy", curve, 5, 0)],
+                preemptive: false,
+                back_attack: false,
+                battle_speed: 0,
+                ticks_per_second: 1000,
+                data_fingerprint: SyntheticRules::FINGERPRINT,
+            },
+        );
+        let view = s.battle.view(1.0).unwrap();
+        let asked = Rc::new(RefCell::new(Vec::new()));
+        let mut kit_slot = Some(ModelKit::new(Box::new(StandInModels), Some(Box::new(Counting::new(Rc::clone(&asked), vec![])))));
+        let mut slot = None;
+        assert!(scene_for(&mut slot, &mut kit_slot, &s, &view, 1.0, &[]).is_some(), "curve {curve}");
+        assert_eq!(*asked.borrow(), ["ff7/cloud", "ff7/barret", "ff7/body/lean"], "curve {curve}: Cloud, Barret, then the player's own body");
+        assert_eq!(slot.as_ref().unwrap().actor_count(), 4, "curve {curve}: the three of the party and the one dummy");
+    }
+}
+
+/// The roster of a battle on the first mission: the canon Cloud and Barret first (each is that canon character's own
+/// model), then the two players, each as its own placeholder body, which the area's snapshots name. No canon model is
+/// ever asked for on account of a player.
+#[test]
+fn the_canon_companions_are_the_canon_characters_and_the_players_are_their_own_bodies() {
+    let area = AreaId { game: GameId::Fixture, key: "k".into() };
+    let mut s = ClientState::new(EntityId(1), AccountId(1), Pos::default(), area.clone());
+    s.battle.set_rules(Some(Arc::new(SyntheticRules::default())));
+    let look = |id: u64, name: &str, body: &str| EntitySnapshot {
+        id: EntityId(id),
+        pos: Pos::default(),
+        facing: 0.0,
+        anim: AnimState::Idle,
+        avatar: AvatarAppearance::new(name, [1, 2, 3], Some(body.to_string())),
+    };
+    s.apply(0.0, ServerMsg::AreaSnapshot { area, tick: 1, entities: vec![look(1, "Me", "ff7/body/sturdy"), look(2, "You", "ff7/body/slight")], npcs: vec![] });
+    s.apply(
+        0.0,
+        ServerMsg::EncounterStart {
+            battle_id: BattleId(4),
+            formation_id: 1,
+            seed: 5,
+            // The players' curves are Cloud's (0) and Barret's (1): the very characters that fight beside them.
+            party: vec![BattleMember::companion("Cloud", 0, 5, 0), BattleMember::companion("Barret", 1, 5, 0), member(0, 0), member(1, 1)],
+            preemptive: false,
+            back_attack: false,
+            battle_speed: 0,
+            ticks_per_second: 1000,
+            data_fingerprint: SyntheticRules::FINGERPRINT,
+        },
+    );
+    let view = s.battle.view(1.0).unwrap();
+    let asked = Rc::new(RefCell::new(Vec::new()));
+    let mut kit_slot = Some(ModelKit::new(Box::new(StandInModels), Some(Box::new(Counting::new(Rc::clone(&asked), vec![])))));
+    let mut slot = None;
+    assert!(scene_for(&mut slot, &mut kit_slot, &s, &view, 1.0, &[]).is_some());
+    assert_eq!(
+        *asked.borrow(),
+        ["ff7/cloud", "ff7/barret", "ff7/body/sturdy", "ff7/body/slight"],
+        "Cloud and Barret are themselves, the two players their own bodies (they fight on Cloud's and Barret's curves and are not drawn as them)"
+    );
+    // Four party members and two dummies, in the engine's order: the canon pair first.
+    assert_eq!(slot.as_ref().unwrap().actor_count(), 6);
+    assert_eq!(s.battle.scene_start().unwrap().my_actor, Some(ActorId(2)));
 }
 
 #[test]
