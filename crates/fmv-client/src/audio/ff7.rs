@@ -19,9 +19,11 @@
 use super::cues::Cue;
 use super::director::AreaMusic;
 use super::field::{AmbientLoop, ExitPlan, FieldPlan, FieldRead, FlipPlan, LinkPlan, PlannedCall};
-use super::worker::{AnalyzeTask, FieldTask, SoundsRead, Tasks};
+use super::worker::{AnalyzeTask, FieldTask, SoundsRead, Tasks, VoiceClip};
 use crate::ff7::{resolve_flevel, Ff7ResolveError, Ff7Source};
-use fmv_audio::{decode_music_file, Logger, SfxClip};
+use crate::mods::VoiceCue;
+use fmv_audio::{decode_music_bytes, decode_music_file, DecodedMusic, Logger, Pull, SfxClip};
+use fmv_mods::Mods;
 use fmv_ff7::field_sound::{self, Timed};
 use fmv_ff7::lgp::LgpArchive;
 use fmv_ff7::music::{field_music_of, FieldMusic, MusicList, MusicUse};
@@ -30,25 +32,30 @@ use fmv_ff7::sound::{self, PcmClip, SfxBank, SoundError};
 use fmv_ff7::story::{StoryState, TRACKED_VARS};
 use fmv_ff7::Ff7Adapter;
 use fmv_library::ff7::{resolve_audio, ResolvedAudio};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::time::Duration;
 
 /// The tasks of the FF7 soundtrack over this machine's copy, or `None` (after one line saying why)
-/// when there is nothing to play.
-pub fn tasks(source: &Ff7Source, adapter: Arc<Ff7Adapter>, log: &Logger) -> Option<Tasks> {
+/// when there is nothing to play. `mods` is the optional mod layers (`None`: the base game's sound): Echo-S's music and voices and
+/// Cosmo Memory's sounds play where they have something, and the original plays everywhere else.
+pub fn tasks(source: &Ff7Source, adapter: Arc<Ff7Adapter>, log: &Logger, mods: Option<Arc<Mods>>) -> Option<Tasks> {
     // The archive's name list (the doors' targets) is read when the first field is, on the worker's thread.
     let flevel = resolve_flevel(source).ok().map(|found| found.path);
     let for_music = Arc::clone(&adapter);
-    tasks_from(
+    let layer = SoundLayer::new(mods, log.clone());
+    let for_field = layer.clone();
+    tasks_with(
         resolve_audio(source),
         log,
+        layer,
         move |list| Arc::new(move |key| area_music(&for_music, &list, key)),
         move |files| {
             let maplist: OnceLock<Option<Maplist>> = OnceLock::new();
             Arc::new(move |key, story, have| {
                 let maplist = maplist.get_or_init(|| flevel.as_ref().and_then(read_maplist));
-                read_field(&adapter, &files, maplist.as_ref(), key, story, have)
+                read_field(&adapter, &files, maplist.as_ref(), key, story, have, &for_field)
             })
         },
     )
@@ -60,12 +67,122 @@ fn read_maplist(path: &PathBuf) -> Option<Maplist> {
     Maplist::from_archive(&mut archive).ok()
 }
 
+/// What the mod layers add to the sound: Echo-S's music in place of the original track, Cosmo Memory's clip in place of the original
+/// clip of a sound id, and the voices. Cheap to clone (it shares one note per sound id between the threads that read them).
+#[derive(Clone)]
+struct SoundLayer {
+    mods: Option<Arc<Mods>>,
+    log: Logger,
+    /// The sound ids already said to come from a mod (once each per run: a battle asks for the same ids again and again).
+    said: Arc<Mutex<HashSet<u16>>>,
+}
+
+impl SoundLayer {
+    fn new(mods: Option<Arc<Mods>>, log: Logger) -> Self {
+        Self { mods, log, said: Arc::new(Mutex::new(HashSet::new())) }
+    }
+
+    /// No layer: the original sound (what the tests use).
+    #[cfg(test)]
+    fn off(log: Logger) -> Self {
+        Self::new(None, log)
+    }
+
+    /// The mixer clip that plays in place of sound id `id` (heard in the field `field`, when that is known), if the sound layer has
+    /// clips for it and the first one decodes. A repeating sound plays that first clip each time (the layer's `sequential`/`shuffle`
+    /// order is not followed: a known gap). No loop region is given: the original id's loop offsets are bytes of the original's PCM
+    /// and mean nothing for another file, and a loop plays a clip without a region whole, over and over.
+    fn replacement(&self, id: u16, field: Option<&str>) -> Option<SfxClip> {
+        let set = self.mods.as_ref()?.sfx(id, field)?;
+        let first = set.clips.into_iter().next()?;
+        let music = match decode_music_bytes(first.bytes, extension_of(&first.name)) {
+            Ok(music) => music,
+            Err(e) => {
+                (self.log)(&format!("sound {id}: {} does not decode ({e}); the original plays", first.name));
+                return None;
+            }
+        };
+        let (rate, samples) = pcm_of(&music)?;
+        let clip = SfxClip::from_stereo(rate, samples)?;
+        if self.said.lock().unwrap_or_else(PoisonError::into_inner).insert(id) {
+            (self.log)(&format!("sound {id} from {}", first.source));
+        }
+        Some(clip)
+    }
+
+    /// Echo-S's track `name` decoded, if the music layer has it and it decodes (else the original plays).
+    fn track(&self, name: &str) -> Option<DecodedMusic> {
+        let track = self.mods.as_ref()?.music(name)?;
+        match decode_music_bytes(track.bytes, extension_of(&track.name)) {
+            Ok(music) => {
+                (self.log)(&format!("music {name} from {}", track.source));
+                Some(music)
+            }
+            Err(e) => {
+                (self.log)(&format!("music {name}: {} does not decode ({e}); the original plays", track.name));
+                None
+            }
+        }
+    }
+
+    /// The task of the voice layer: the clip a cue asks for, decoded, as a mixer clip that ends in a silent loop region (so that its
+    /// loop handle can stop it, see [`super::Live`]), with the length of the voice itself; `Ok(None)` when the layer has none.
+    fn voice(&self, cue: &VoiceCue) -> Result<Option<VoiceClip>, String> {
+        let Some(mods) = self.mods.as_ref() else { return Ok(None) };
+        let found = match cue {
+            VoiceCue::Say { field, window, dialog, page } => mods.voice(field, *window, *dialog, *page),
+            VoiceCue::Choice { field, dialog, line } => mods.option_voice(field, *dialog, *line),
+            VoiceCue::Stop => None,
+        };
+        let Some(found) = found else { return Ok(None) };
+        let music = decode_music_bytes(found.bytes, extension_of(&found.name)).map_err(|e| format!("{}: {e}", found.name))?;
+        let (rate, mut samples) = pcm_of(&music).ok_or_else(|| format!("{}: nothing to play", found.name))?;
+        let frames = samples.len() / 2;
+        let tail = (rate / 10).max(1) as usize;
+        samples.extend(std::iter::repeat_n(0.0f32, tail * 2));
+        let clip = SfxClip::from_stereo(rate, samples)
+            .ok_or_else(|| format!("{}: unusable audio", found.name))?
+            .with_loop(frames as u64, (frames + tail) as u64);
+        Ok(Some(VoiceClip { name: found.name, clip, length: Duration::from_secs_f64(frames as f64 / f64::from(rate)) }))
+    }
+}
+
+/// The file extension of an archive path (a hint to the decoder).
+fn extension_of(path: &str) -> Option<&str> {
+    path.rsplit_once('.').map(|(_, ext)| ext)
+}
+
+/// All the frames of a decoded Ogg as interleaved stereo `f32` and its rate (`None` for a track with no frame).
+fn pcm_of(music: &DecodedMusic) -> Option<(u32, Vec<f32>)> {
+    let frames = usize::try_from(music.frames()).ok()?;
+    let mut samples: Vec<f32> = Vec::with_capacity(frames.checked_mul(2)?);
+    let mut source = music.source();
+    let mut buf = vec![0.0f32; 8_192];
+    // (`Pending` never comes from a source that is all in memory; it ends the read like `End` rather than spin.)
+    while let Pull::Frames(n) = source.read(&mut buf) {
+        samples.extend_from_slice(buf.get(..n.checked_mul(2)?)?);
+    }
+    (!samples.is_empty()).then_some((music.rate(), samples))
+}
+
 /// [`tasks`] over what [`resolve_audio`] said, with `analyze` building the task that reads a field's script
 /// from the track list and `field` the one that reads what a field's scripts play from the sound files (the two
-/// parts that need the adapter, so that everything else is testable without one).
+/// parts that need the adapter, so that everything else is testable without one). The original sound only.
+#[cfg(test)]
 fn tasks_from(
     resolved: Result<ResolvedAudio, Ff7ResolveError>,
     log: &Logger,
+    analyze: impl FnOnce(Arc<MusicList>) -> AnalyzeTask,
+    field: impl FnOnce(Arc<ResolvedAudio>) -> FieldTask,
+) -> Option<Tasks> {
+    tasks_with(resolved, log, SoundLayer::off(log.clone()), analyze, field)
+}
+
+/// [`tasks_from`] with the mod layers in `layer`.
+fn tasks_with(
+    resolved: Result<ResolvedAudio, Ff7ResolveError>,
+    log: &Logger,
+    layer: SoundLayer,
     analyze: impl FnOnce(Arc<MusicList>) -> AnalyzeTask,
     field: impl FnOnce(Arc<ResolvedAudio>) -> FieldTask,
 ) -> Option<Tasks> {
@@ -105,19 +222,27 @@ fn tasks_from(
         analyze: analyze(Arc::clone(&list)),
         field: field(Arc::clone(&files)),
         decode: {
-            let files = Arc::clone(&files);
+            let (files, layer) = (Arc::clone(&files), layer.clone());
             Arc::new(move |name| {
+                // Echo-S's track of that name first (the music layer); the original is what plays without it.
+                if let Some(music) = layer.track(name) {
+                    return Ok(music);
+                }
                 let path = files.music_file(name).ok_or_else(|| "this library has no file for it".to_string())?;
                 decode_music_file(path).map_err(|e| e.to_string())
             })
         },
         cues: {
-            let files = Arc::clone(&files);
-            Arc::new(move || load_cues(&files))
+            let (files, layer) = (Arc::clone(&files), layer.clone());
+            Arc::new(move || load_cues_with(&files, &layer))
         },
         sounds: {
-            let files = Arc::clone(&files);
-            Arc::new(move |ids| load_sounds(&files, ids))
+            let (files, layer) = (Arc::clone(&files), layer.clone());
+            Arc::new(move |ids| load_sounds_with(&files, ids, &layer, None))
+        },
+        voice: {
+            let layer = layer.clone();
+            Arc::new(move |cue| layer.voice(cue))
         },
     })
 }
@@ -174,14 +299,24 @@ fn clip_of(pcm: &PcmClip) -> Option<SfxClip> {
     })
 }
 
-/// The four menu sounds out of `audio.dat` (only their bytes are read, not the whole 70 MB file).
+/// The four menu sounds out of `audio.dat` (only their bytes are read, not the whole 70 MB file): the original's.
+#[cfg(test)]
 fn load_cues(files: &ResolvedAudio) -> Result<Vec<(Cue, SfxClip)>, String> {
+    load_cues_with(files, &SoundLayer::off(Arc::new(|_| {})))
+}
+
+/// [`load_cues`] with the sound layer's clip for a cue's sound id where it has one.
+fn load_cues_with(files: &ResolvedAudio, layer: &SoundLayer) -> Result<Vec<(Cue, SfxClip)>, String> {
     let (Some(fmt), Some(dat)) = (&files.sfx_fmt, &files.sfx_dat) else {
         return Err("the library has no audio.fmt and audio.dat".to_string());
     };
     let bank = SfxBank::open(fmt, dat).map_err(|e| e.to_string())?;
     let mut clips = Vec::with_capacity(Cue::ALL.len());
     for cue in Cue::ALL {
+        if let Some(clip) = layer.replacement(sound_id(cue), None) {
+            clips.push((cue, clip));
+            continue;
+        }
         let entry = sound::entry_for_sound_id(sound_id(cue)).ok_or_else(|| format!("no sound id for the {} cue", cue.name()))?;
         let pcm = bank.decode(entry).map_err(|e| format!("the {} sound: {e}", cue.name()))?;
         clips.push((cue, clip_of(&pcm).ok_or_else(|| format!("the {} sound has an unusable format", cue.name()))?));
@@ -191,8 +326,15 @@ fn load_cues(files: &ResolvedAudio) -> Result<Vec<(Cue, SfxClip)>, String> {
 
 /// The clips of the sound ids `ids` out of `audio.dat` (only their bytes are read, not the whole 70 MB file): each id that
 /// names a clip comes back as a mixer clip, each that does not (an empty slot, an id past the bank, a clip that does not
-/// decode) with a short reason. Never an error for the whole list: a battle plays what it can.
+/// decode) with a short reason. Never an error for the whole list: a battle plays what it can. The original's clips.
+#[cfg(test)]
 fn load_sounds(files: &ResolvedAudio, ids: &[u16]) -> SoundsRead {
+    load_sounds_with(files, ids, &SoundLayer::off(Arc::new(|_| {})), None)
+}
+
+/// [`load_sounds`] with the sound layer's clip for an id where it has one (heard in `field`, when that is known: a field's own
+/// sounds are asked for with it).
+fn load_sounds_with(files: &ResolvedAudio, ids: &[u16], layer: &SoundLayer, field: Option<&str>) -> SoundsRead {
     let missing_all = |why: String| SoundsRead { clips: Vec::new(), missing: ids.iter().map(|id| (*id, why.clone())).collect() };
     let (Some(fmt), Some(dat)) = (&files.sfx_fmt, &files.sfx_dat) else {
         return missing_all("the library has no audio.fmt and audio.dat".to_string());
@@ -203,6 +345,10 @@ fn load_sounds(files: &ResolvedAudio, ids: &[u16]) -> SoundsRead {
     };
     let mut read = SoundsRead::default();
     for &id in ids {
+        if let Some(clip) = layer.replacement(id, field) {
+            read.clips.push((id, clip));
+            continue;
+        }
         match bank.decode_sound_id(id) {
             Ok(pcm) => match clip_of(&pcm) {
                 Some(clip) => read.clips.push((id, clip)),
@@ -236,7 +382,15 @@ fn calls_of(events: &[Timed]) -> Vec<PlannedCall> {
 /// Everything the plan says comes from the field's own scripts ([`fmv_ff7::field_sound`]); the clips are read by id out of
 /// `audio.dat` (only those). An error says why there is no plan (and so no sound): the progression is not one this
 /// adapter reads, the library has no sound files, the field cannot be read.
-fn read_field(adapter: &Ff7Adapter, files: &ResolvedAudio, maplist: Option<&Maplist>, key: &str, blob: &[u8], have: &[u16]) -> Result<FieldRead, String> {
+fn read_field(
+    adapter: &Ff7Adapter,
+    files: &ResolvedAudio,
+    maplist: Option<&Maplist>,
+    key: &str,
+    blob: &[u8],
+    have: &[u16],
+    layer: &SoundLayer,
+) -> Result<FieldRead, String> {
     let story = StoryState::decode(blob).ok_or_else(|| "the progression is not one this adapter reads".to_string())?;
     let (Some(fmt), Some(dat)) = (&files.sfx_fmt, &files.sfx_dat) else { return Err("the library has no audio.fmt and audio.dat".to_string()) };
     let bank = SfxBank::open(fmt, dat).map_err(|e| e.to_string())?;
@@ -274,7 +428,7 @@ fn read_field(adapter: &Ff7Adapter, files: &ResolvedAudio, maplist: Option<&Mapl
     let plan = FieldPlan { key: key.to_string(), story: blob.to_vec(), ambient, links, flips, exits, unjudged, left_open: start.ambient_left_open(is_loop), withheld_links };
     // The clips the plan names, minus the ones the caller holds.
     let wanted: Vec<u16> = plan.ids().into_iter().filter(|id| !have.contains(id)).collect::<BTreeSet<_>>().into_iter().collect();
-    let clips = load_sounds(files, &wanted);
+    let clips = load_sounds_with(files, &wanted, layer, Some(key));
     Ok(FieldRead { plan, clips })
 }
 
@@ -536,5 +690,162 @@ mod tests {
         };
         let read = load_sounds(&gone, &[1]);
         assert!(read.clips.is_empty() && read.missing.len() == 1 && !read.missing[0].1.contains("/definitely"), "{:?}", read.missing);
+    }
+
+    // ---- the mod layers' sound ----------------------------------------------------------------------
+
+    use fmv_mods::testkit::{cosmo_archive_blobs, echo_archive, wav as synthetic_wav, EchoSpec};
+    use fmv_mods::{Layers, ModSources};
+
+    /// A sound layer over synthetic Echo-S and Cosmo archives (WAV clips: the decoder takes them as it takes Ogg), with its log.
+    fn layer(echo: &EchoSpec<'_>, cosmo: Option<Vec<u8>>, layers: Layers) -> (tempfile::TempDir, SoundLayer, Arc<Mutex<Vec<String>>>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let echo_path = tmp.path().join("echo.iro");
+        std::fs::write(&echo_path, echo_archive(echo)).unwrap();
+        let cosmo_path = cosmo.map(|bytes| {
+            let p = tmp.path().join("cosmo.iro");
+            std::fs::write(&p, bytes).unwrap();
+            p
+        });
+        let mods = Mods::open(&ModSources { echo_s: Some(echo_path), cosmo: cosmo_path, dir: None }, layers);
+        assert!(mods.notes().is_empty(), "{:?}", mods.notes());
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&lines);
+        let log: Logger = Arc::new(move |l| sink.lock().unwrap().push(l.to_string()));
+        (tmp, SoundLayer::new(Some(Arc::new(mods)), log), lines)
+    }
+
+    fn said(lines: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+        lines.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn a_sound_id_plays_the_clip_its_section_names_and_the_log_says_so_once() {
+        let cosmo = cosmo_archive_blobs(&[("Base\\sfx\\6303.wav", synthetic_wav(8_000, &[100, -100, 200, -200]))], Some("[6]\nsequential = [ 6303 ]\n"));
+        let (_t, layer, lines) = layer(&EchoSpec::default(), Some(cosmo), Layers::ALL);
+        let clip = layer.replacement(6, None).expect("Cosmo's clip for id 6");
+        assert_eq!((clip.rate(), clip.frames()), (8_000, 4));
+        assert_eq!(clip.loop_region(), None, "the original's loop offsets are never applied to another file");
+        assert!(layer.replacement(6, Some("md1stin")).is_some());
+        assert_eq!(said(&lines), ["sound 6 from cosmo"], "said once for the id, whichever field asked");
+        // An id nothing names: the original plays.
+        assert!(layer.replacement(7, None).is_none());
+    }
+
+    #[test]
+    fn the_layer_off_or_a_clip_that_does_not_decode_leaves_the_original() {
+        let blobs = [("Base\\sfx\\6303.ogg", b"OggS-but-not-audio".to_vec())];
+        let cosmo = cosmo_archive_blobs(&blobs, Some("[6]\nsequential = [ 6303 ]\n"));
+        let (_t, bad, lines) = layer(&EchoSpec::default(), Some(cosmo.clone()), Layers::ALL);
+        assert!(bad.replacement(6, None).is_none());
+        assert!(said(&lines).iter().any(|l| l.starts_with("sound 6: Base\\sfx\\6303.ogg does not decode")), "{:?}", said(&lines));
+        let (_t, off, lines) = layer(&EchoSpec::default(), Some(cosmo), Layers { sound: false, ..Layers::ALL });
+        assert!(off.replacement(6, None).is_none() && said(&lines).is_empty());
+        // No mods at all.
+        assert!(SoundLayer::off(Arc::new(|_| {})).replacement(6, None).is_none());
+    }
+
+    #[test]
+    fn a_track_comes_from_echo_s_and_the_original_plays_without_one() {
+        let mut spec = EchoSpec::default();
+        spec.blobs.push(("EchoeS Of The Planet\\vgmstream\\BAT.wav", synthetic_wav(8_000, &[1_000; 80])));
+        let (_t, layer, lines) = layer(&spec, None, Layers::ALL);
+        let music = layer.track("bat").expect("Echo-S's bat");
+        assert_eq!((music.rate(), music.frames()), (8_000, 80));
+        assert_eq!(said(&lines), ["music bat from echo-s"]);
+        assert!(layer.track("aseri").is_none());
+        let (_t, off, _) = layer_with_off(&spec);
+        assert!(off.track("bat").is_none());
+    }
+
+    fn layer_with_off(spec: &EchoSpec<'_>) -> (tempfile::TempDir, SoundLayer, Arc<Mutex<Vec<String>>>) {
+        layer(spec, None, Layers { music: false, ..Layers::ALL })
+    }
+
+    #[test]
+    fn a_voice_is_a_clip_that_ends_in_a_silent_loop_region_and_knows_its_own_length() {
+        let mut spec = EchoSpec::default();
+        spec.blobs.push(("VO\\Voice\\md1stin\\4a.wav", synthetic_wav(8_000, &[500; 800])));
+        spec.blobs.push(("VO\\Voice\\md1stin\\9.ogg", b"OggS-but-not-audio".to_vec()));
+        let (_t, layer, _) = layer(&spec, None, Layers::ALL);
+        let say = |dialog| VoiceCue::Say { field: "md1stin".into(), window: 0, dialog, page: 0 };
+        let found = layer.voice(&say(4)).unwrap().expect("the page-lettered clip is found");
+        assert_eq!(found.name, "VO\\Voice\\md1stin\\4a.wav");
+        assert_eq!(found.length, Duration::from_millis(100), "800 frames at 8 kHz");
+        // The clip is the voice, then 100 ms of silence that loops, so that the loop handle stops it.
+        assert_eq!(found.clip.frames(), 800 + 800);
+        assert_eq!(found.clip.loop_region(), Some((800, 1_600)));
+        // A window with no clip is no error; a clip that does not decode is a reason, not a panic.
+        assert!(layer.voice(&say(5)).unwrap().is_none());
+        assert!(layer.voice(&VoiceCue::Stop).unwrap().is_none());
+        assert!(layer.voice(&say(9)).unwrap_err().starts_with("VO\\Voice\\md1stin\\9.ogg"));
+        // Without mods there is nothing.
+        assert!(SoundLayer::off(Arc::new(|_| {})).voice(&say(4)).unwrap().is_none());
+    }
+
+    /// The owner's real mod clips, read-only and silent (decoding makes no sound): every Echo-S track the music layer offers decodes,
+    /// the first clip of every sound id the sound layer names decodes, and every voice found for a window of the reactor fields'
+    /// scripts decodes. Counts only; nothing is stored, printed or played.
+    #[test]
+    #[ignore = "needs the owner's mod archives and audio data (FMV_ECHO_S_IRO, FMV_COSMO_IRO, FMV_FF7_AUDIO_DATA)"]
+    fn the_owners_mod_clips_decode() {
+        let var = |name: &str| std::env::var_os(name).map(PathBuf::from);
+        let (Some(echo), Some(cosmo), Some(audio)) = (var("FMV_ECHO_S_IRO"), var("FMV_COSMO_IRO"), var("FMV_FF7_AUDIO_DATA")) else {
+            eprintln!("FMV_ECHO_S_IRO, FMV_COSMO_IRO and FMV_FF7_AUDIO_DATA are needed; skipping");
+            return;
+        };
+        let mods = Arc::new(Mods::open(&ModSources { echo_s: Some(echo), cosmo: Some(cosmo), dir: None }, Layers::ALL));
+        assert!(mods.notes().is_empty(), "{:?}", mods.notes());
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&lines);
+        let log: Logger = Arc::new(move |l| sink.lock().unwrap().push(l.to_string()));
+        let layer = SoundLayer::new(Some(Arc::clone(&mods)), log);
+        // Music: every name of music.idx that Echo-S has a track for.
+        let list = MusicList::parse(&std::fs::read(audio.join("music").join("music.idx")).expect("music.idx"));
+        let (mut offered, mut decoded, mut looped, mut seconds) = (0usize, 0usize, 0usize, 0.0f64);
+        for name in list.names() {
+            if mods.music(name).is_some() {
+                offered += 1;
+                if let Some(music) = layer.track(name) {
+                    decoded += 1;
+                    looped += usize::from(music.loop_points().is_some());
+                    seconds += music.duration().as_secs_f64();
+                }
+            }
+        }
+        println!("music: {offered} of the {} names of music.idx have an Echo-S track; {decoded} decode ({seconds:.0} s in all), {looped} carry loop tags the engine reads", list.len());
+        assert!(offered > 0 && offered == decoded, "every track Echo-S offers decodes");
+        // Sounds: the first clip of every id the layer names.
+        let (mut named, mut ok, mut sounds_seconds) = (0usize, 0usize, 0.0f64);
+        for id in 1..=750u16 {
+            if mods.sfx(id, None).is_some() {
+                named += 1;
+                if let Some(clip) = layer.replacement(id, None) {
+                    ok += 1;
+                    sounds_seconds += clip.duration().as_secs_f64();
+                }
+            }
+        }
+        println!("sound: {named} of the 750 ids have clips; the first clip of {ok} decodes ({sounds_seconds:.0} s in all)");
+        assert!(named > 600 && named == ok, "every first clip decodes");
+        // Voices: every clip found for a window of the reactor fields' scripts decodes.
+        let (mut windows, mut found, mut seconds) = (0usize, 0usize, 0.0f64);
+        for field in ["md1stin", "md1_1", "md1_2", "nrthmk", "nmkin_1", "elevtr1", "nmkin_2", "nmkin_3", "nmkin_4", "nmkin_5"] {
+            let section = mods.script_section(field).expect("Echo-S's script for a reactor field");
+            let script = FieldScript::parse(&section).expect("script");
+            for (window, dialog) in fmv_mods::compare::message_lines(&script) {
+                windows += 1;
+                match layer.voice(&VoiceCue::Say { field: field.to_string(), window, dialog, page: 0 }) {
+                    Ok(Some(voice)) => {
+                        found += 1;
+                        seconds += voice.length.as_secs_f64();
+                    }
+                    Ok(None) => {}
+                    Err(why) => panic!("a voice does not decode: {why}"),
+                }
+            }
+        }
+        println!("voice: {found} of the {windows} windows of the reactor fields have a first-page clip, all decode ({seconds:.0} s in all)");
+        assert!(found > 0);
     }
 }

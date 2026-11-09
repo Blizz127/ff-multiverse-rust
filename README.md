@@ -112,6 +112,7 @@ games plug in behind `fmv-adapter-api` without touching it.
 | `fmv-persist` | Accounts, avatar profiles, player characters (identity, per-game binding and slot, pointers to progress) and per-game progression in an atomic, single-writer file store. |
 | `fmv-party` | Party membership, leader and story-phase instance selection (pure state machines). |
 | `fmv-audio` | Audio engine: a music and effects mixer (crossfades, loop points, volumes, mute), a null sink for machines without a sound card, the cpal output device, and decoding of Ogg Vorbis, WAV and ADPCM music with its loop tags. Game-agnostic; the client plays it (see "Sound"); it holds no audio data. |
+| `fmv-mods` | The optional community-mod layers over your own FF7 content (see "Mods"): a bounded, read-only reader for 7th Heaven's `.iro` archives, the FFNx file conventions Echo-S (script, voices, music) and Cosmo Memory (sound effects) follow, and the lookups the client builds on. Reads your own mod files only; never extracts, copies or redistributes them. |
 
 ## Quickstart
 
@@ -1383,6 +1384,135 @@ for a link whose sound has no time to give it), `audio: field loop start ch3 38`
 was left)` (or `(the story moved)`, `(a battle)`), `audio: field sound ch1 62 (link)` (or `(lift)`, `(door)`) at the moment an
 event's sound plays, and, when the run ends, `audio: field sounds played: 4 sounds (21x1 42x1 62x2), 4 loops (38x4)`.
 
+## Mods (Echo-S and Cosmo Memory)
+
+Two free community mods (Tsunamods, for 7th Heaven) can be layered over your own FF7. **The accurate base game comes first and
+the mods are layers on top of it, each switched off on its own; all four layers are ON by default when their files are
+found.** Whatever a layer lacks, the original plays, so nothing is silent or blank because a layer is on.
+
+| Layer | What it is | It replaces | Switch |
+|---|---|---|---|
+| **text** | [Echo-S 7](https://www.tsunamods.com/echo-s-7/)'s retranslated script, the dialog text (required, always on unless you switch it back) | the field's script, per character | `--mods-text off` |
+| **voice** | Echo-S's voice acting, played when a dialog window opens | nothing: the original has no voices | `--mods-voice off` |
+| **music** | Echo-S's "Echoes of the Planet" | the original track of the same `music.idx` name | `--mods-music off` |
+| **sound** | [Cosmo Memory](https://www.tsunamods.com/cosmo-memory/) 1.22's sound effects (Echo-S's own set after it) | the original `audio.dat` clip of the same sound id | `--mods-sound off` |
+
+Cosmo Memory is a *sound* overhaul (its own `mod.xml`: "Complete sound overhaul"), not upscaled field backgrounds; there is no
+background layer.
+
+**The files** are yours to fetch, onto each machine separately; the client only ever reads them (nothing is extracted, copied,
+written or sent, and they are never committed or put in a library). The two in use are
+
+| File | Mod | Bytes | sha256 |
+|---|---|---|---|
+| `Echo-s.iro` | `[Tsunamods] Echo-S 7` 1.24 (2026-07-19), from the 7th Heaven catalog's link `https://gp-mc.net/tsunamods/echo-s-7/latest_full/Echo-s.iro` | 4 335 170 582 (4.04 GiB) | `bc5a4a5f30b50ac80a74613595c680b356eae6ef433b7c6f62672ddb645b3789` |
+| `[Tsunamods]_Cosmo_Memory.iro` | `[Tsunamods] Cosmo Memory` 1.22 (2026-11-07), `https://bonez.7thheaven.rocks/%5BTsunamods%5D_Cosmo_Memory.iro` | 333 643 683 (318.2 MiB) | `836024222598c4ff745a766fb471b4fd2bf254f1a44244fb6f935703b0535af2` |
+
+**Where they go.** Put them in `<state>/mods/` (`~/.local/share/ff-multiverse/mods/` by default, or `mods` inside the directory
+`--ff7-library` names; the launcher's data directory has one): the files themselves or a folder each, one level down. The client looks
+there and never creates it. `--mods-dir DIR` (`$FMV_MODS_DIR`) names another folder; `--echo-s FILE` (`$FMV_ECHO_S_IRO`) and
+`--cosmo-memory FILE` (`$FMV_COSMO_IRO`) name an archive each. An archive is told from the other by the ID in its own `mod.xml`, never
+by its file name (Cosmo's has brackets in it). A damaged, truncated or wrong archive is one `mods: note:` line and its layer plays
+the base game.
+
+**Where the switches are**, one order for each layer: a flag, else an environment variable, else the settings file, else on.
+`--mods on|off` (`$FMV_MODS`) switches every layer; `--mods-text`, `--mods-voice`, `--mods-music`, `--mods-sound` (`$FMV_MODS_TEXT`,
+`$FMV_MODS_VOICE`, `$FMV_MODS_MUSIC`, `$FMV_MODS_SOUND`) one each (`on`/`off`, also `true`/`false`, `yes`/`no`, `1`/`0`). The settings file is
+`settings.json` in the mods folder (`--mods-settings FILE` / `$FMV_MODS_SETTINGS` name another): a JSON object of booleans, for example
+
+```json
+{ "voice": false, "music": false }
+```
+
+and a key that is left out is on. The client only reads it. `fmv-client --help` has the same under MODS.
+
+**What the log says** (stderr): one line at start-up with the effective source of each layer,
+
+```
+mods: text=echo-s voice=echo-s music=echo-s sound=cosmo [echo-s 1.24, cosmo 1.22]
+mods: text=original (off) voice=original (off) music=original (no archive) sound=original (no archive) [echo-s 1.24]
+```
+
+then, as the game uses them, only archive paths and ids, never a line of text: `mods: talk md1stin gu0: echo-s section` (or `original
+section (not in echo-s)`), for each window of such a conversation `mods: window md1stin#12 w0 voice md1stin/12a` (or `voice none`: the lookup, which a
+run without ears shows too), `audio: voice md1stin/12a (2.4 s)` when the clip plays, `audio: music aseri from echo-s`, `audio: sound 6 from cosmo`, and at the end
+`audio: voices played: N (asks without a clip: M)`. The audio lines need a run with sound (`FMV_AUDIO=null` runs it against a clock with no device).
+**The voice, music and sound layers play only through the soundtrack, which needs your original sound files in the library** (a library imported before
+the importer took the music and sound has none: run `import-pc` on the install again with the same labels, see "Importing your own FF7 data"). When the
+soundtrack is off (`--mute`, a headless run without `FMV_AUDIO`, `FMV_AUDIO=off`, or a library without sound files) the start-up line still says which
+layers are on, so the client adds `mods: the voice, music and sound layers play nothing in this run (<why>)`; only the text layer works without sound.
+
+### How each layer works, and what was measured
+
+**The `.iro` format** is 7th Heaven's mod archive: a 16-byte header (`IROS`, a version `0x10000` to `0x10002`, flags, the directory's offset),
+a directory (a count, then per file a size, a UTF-16 name with `\` between folders, flags, an offset and a length) and the payloads. The
+reader (`fmv-mods`, `iro`) follows the layout of `AppWrapper/IrosArc.cs` in tsunamods-codes/7th-Heaven at commit
+`f0d7da92beac69e21c59995fa13ea1b2b0e3cf1f`
+([source](https://github.com/tsunamods-codes/7th-Heaven/blob/f0d7da92beac69e21c59995fa13ea1b2b0e3cf1f/AppWrapper/IrosArc.cs)) and is
+bounded (every offset is checked against the file's real length, so a truncated download is refused with the name of the first entry that
+runs past the end; counts, name lengths and forwarders are capped). Both archives are complete (the last entry ends exactly at the end of
+the file) and every entry of both is *stored*, so there is no decompressor in the tree: an LZS or LZMA entry would be a typed error.
+
+**Inventory** (counts only; `cargo run -p fmv-mods --example iro_inventory -- <archive>` prints it for your copy):
+
+* Echo-S 1.24, 23 178 entries: `Echo-S\flevel.lgp\<field>` 706 (all 702 fields and four stray files: replacement field entries, **where the
+  text lives**), `VO\Voice\<field>\...` 15 461 (field voices; plus 100 `.sfk` peak files), `EchoeS Of The Planet\vgmstream` 112 and
+  `Arranged\vgmstream` 10 (music), `Sound\sfx` 881 (its own sound effects), `V_Attacks`/`NV_Attacks` 155 each, `Battle VO` 1 221 and `Battle VO_S`
+  1 158 (battle lines), `NoCloud\cid`/`tifa` 115 each, `UI\Aavock`/`ESUI`/`FT`/`Retouch` 706 each (window-UI variants of `flevel.lgp`, switched by a
+  byte of the game's memory in 7th Heaven), `60fps\*`, models, textures, kernel and world-map text, hex patches and movie audio.
+* Cosmo Memory 1.22, 1 610 entries: `Base\sfx` 1 001 clips and its 3 507-section `config.toml`, `UI_Dissidia`/`UI_R`/`UI_VII\sfx` 16 each (the three menu
+  sound sets), `V_Attacks`/`NV_Attacks` 170/171, `Ambience\Ambient` 119 and the `FA`, `BA`, `FA+BA` ambience configs, `FMV\movies` 70
+  (movie sound effects), previews.
+
+**Text.** Echo-S's script is not the original with new strings: its field entries are different scripts. Measured on the Steam edition against 1.24
+(the examples `echo_script_compare` and `echo_talk_compare` of `fmv-mods` print it again for your copy): the dialog strings drop from 56 048 to 13 819
+(the original tables are mostly leftovers nothing opens, 114 strings in each of the first reactor fields against the 5 to 21 Echo-S keeps) while the
+lines the scripts open stay about as many (12 526 distinct window-and-dialog pairs, 12 613 in Echo-S's); 17.5% of the 328 675 scripts of the entities both
+have differ in what the dialogue walker can see; of the 12 475 dialog numbers the original's scripts open, 8 326 sit in a script that is the same in
+Echo-S's and 4 934 of those (59%) are another number there; and at the start of a new game 1 421 characters can be talked to in both, 101 of them with
+another number of windows (1 350 windows against 1 480). So a per-line replacement table would show wrong lines, and the unit is the field's whole script
+section: a character that Echo-S's section also has (found by the same name-and-place rule as the original's) talks from Echo-S's section (text, flow,
+dialog numbers, voice names), any other character and every character with the layer off talks from the original's. 2 302 of the 2 412 characters of
+the original are found in Echo-S's script; 84 of its 360 512 scripts do not decode (the original's 337 059 all do). How far you must stand to talk is
+gameplay and stays the original's; the server still judges the story from the original's scripts, so a conversation can show Echo-S's flow where the
+original's would have said something else, and no protocol carries either. `mods::script_source()` is the interface for the scene player (the section of
+Echo-S's replacement for a field, or none).
+
+**Voice.** FFNx plays a voice from the `MESSAGE`/`ASK` that opens a window, by the script's own window and dialog numbers:
+`<field>/w<window>_<dialog><page letter>`, then `<field>/<dialog><letter>`, then on the first page the plain `w<window>_<dialog>` and `<dialog>`
+(2 077 of the 10 909 voiced dialog numbers exist *only* as lettered clips); `<dialog>_<line>` is the clip of a question's line
+([FFNx `src/voice.cpp`](https://github.com/julianxhokaxhiu/FFNx/blob/4fc392ba5e1bfdd53d39aa6542464379a446083a/src/voice.cpp) at commit
+`4fc392ba5e1bfdd53d39aa6542464379a446083a`). FFNx counts a question's line absolutely, as the cursor does; in 1.24 it never matters which way one counts: 5 256
+of Echo-S's 5 680 questions start their choices at line 0 (10 498 of their 13 969 lines have a clip) and the other 424 have no option clip at all. The client
+plays the first page's clip when a window opens, the clip of each later page of the game's
+message when the player reaches it (the window's own cuts of a long page are not the game's pages), and the clip of a question's line as the
+pointer reaches it; each replaces the one before, and the last stops when the conversation ends. A voice is a loop with a silent tail that the
+engine's handle can stop (its one-shots cannot be stopped one by one), freed when its clip is over. A voice rides on the Echo-S text (its files are
+named by Echo-S's dialog numbers), so it plays only for a character that talks from Echo-S's section.
+
+**Music.** Echo-S has a track for 91 of the 98 names in `music.idx` (the other seven play the original); the three names its `config.toml` shuffles (`bat`,
+`bee`, `gun`) pick a variant at random each time. All 91 decode (about 3.7 hours of audio in all); 81 carry the `LOOPSTART`/`LOOPLENGTH` tags the engine
+reads and loop between them, the other 10 repeat whole.
+
+**Sound.** The game's sound id (`audio.fmt`'s id space, `1..=750`) is looked up in Cosmo's `config.toml` the way FFNx does
+([`src/audio.cpp`](https://github.com/julianxhokaxhiu/FFNx/blob/4fc392ba5e1bfdd53d39aa6542464379a446083a/src/audio.cpp) `playSFX`): the section named
+`<field>_<id>`, else `<id>`, lists the clip numbers that play (`[6] sequential = [ 6303 ]` is the file `6303.ogg`), the folders are searched Cosmo first
+(menu set 1, `Base`, the attack folders) then Echo-S's `Sound`, the way 7th Heaven's first-wins rule does it. 720 of the 750 ids have a clip (920
+clips in all); the other 30 play the original. A repeating id plays the first of its clips.
+
+**On the reactor fields** (md1stin, md1_1, md1_2, nrthmk, nmkin_1, elevtr1, nmkin_2..5, the route of `travel-smoke.sh --chain`), measured with the ignored tests
+of `crates/fmv-mods/tests/real_data.rs`: 10 of 10 have an Echo-S script; the dialog strings go 1 140 to 123; the message lines their scripts open are 73 in the
+original and 62 in Echo-S's (every one of them Echo-S text), 43 of the original's 73 sit in a script that is the same to the walker (all 43 under a new
+number); 28 of 32 characters are found in Echo-S's script by name and place (the 4 others, 3 in nmkin_1 and the one of elevtr1, talk from the original);
+of the 62 lines 50 have a voice on at least one page (56 of 68 pages). Most of those lines are cutscene text, which the scene player will show; the talk
+scripts of these fields are short.
+
+**Not done, and why.** Voiced attacks (`battle_char_<index>_<id>` sections of both configs) need to know which character performs a battle sound, which
+the client's battle sounds do not carry. A repeating sound id plays the first of its clips, not each in turn; Cosmo's footsteps
+(`<field>_<triangle>_<id>`), field ambience (`FA\Ambient`), movie sounds and menu sets 2 and 3 are not used; Echo-S's battle lines, `NoCloud` voices,
+models, textures and kernel text are not used either. Only characters that talk are voiced: a cutscene's windows will be voiced by the scene player
+through the same cues once it runs Echo-S's section (`mods::script_source()` and `VoiceCue`). A voice does not duck the music.
+
 ## Packaging and smoke test
 
 ```
@@ -1429,6 +1559,8 @@ UNKNOWN placeholders; see `deploy/README.md`.
 <state>/client/      a client's saved login tokens: accounts/<server>.token (mode 0600), and next to
                      each one a display-only note of how that character looked when last seen
                      (accounts/<server>.<name>.look: tint and look, no secret; safe to delete)
+<state>/mods/        OPTIONAL, yours to fill: the mod archives (Echo-s.iro, [Tsunamods]_Cosmo_Memory.iro) and
+                     an optional settings.json. The client only reads it and never creates it; see "Mods"
 ```
 
 `<state>` is `$FMV_STATE_DIR`, else `~/.local/share/ff-multiverse`. Back up `server/` by

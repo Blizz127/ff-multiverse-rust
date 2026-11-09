@@ -36,6 +36,7 @@ mod gamepad;
 mod headless;
 mod interp;
 mod login;
+mod mods;
 mod nav;
 mod net;
 mod npc;
@@ -148,6 +149,9 @@ fn open_game(args: &Args) -> Result<LocalGame, String> {
                 }
                 Err(e) => eprintln!("note: no battle data on this machine ({e}); shared battles cannot be replayed or fought here"),
             }
+            // The optional mod layers over this copy (Echo-S, Cosmo Memory): one line says what each plays. Opened once for the
+            // whole process (the conversations and the soundtrack ask `mods::active`).
+            mods::setup(&args.mods, fmv_library::resolve_state_dir(args.ff7_library.as_deref()).ok().as_deref());
             Ok(LocalGame {
                 adapter: Box::new(ff7::SharedFf7(Arc::clone(&opened.adapter))),
                 client_build: format!("fmv-client/{version}+{}", ff7::build_tag()),
@@ -163,6 +167,14 @@ fn open_game(args: &Args) -> Result<LocalGame, String> {
 /// silent unless `FMV_AUDIO` was set on purpose (`null` runs the soundtrack against a clock and logs it).
 /// A library without sound files, or any trouble reading them, is one `audio:` line and no sound.
 fn start_audio(args: &Args, ff7: Option<&Arc<Ff7Adapter>>) -> GameAudio {
+    // The mod layers that need the soundtrack (Echo-S's voices and music, Cosmo's sounds) play nothing when it is off: say so, since
+    // the `mods:` line at start-up says which layers are on.
+    let silent = |why: &str| {
+        if let Some(note) = mods::silent_audio_note(mods::active().as_deref(), why) {
+            eprintln!("{note}");
+        }
+        GameAudio::off()
+    };
     let Some(adapter) = ff7 else { return GameAudio::off() };
     let env = std::env::var(fmv_audio::ENV_VAR).ok();
     let (mode, note) = audio::run_mode(args.mute, args.headless, env.as_deref());
@@ -171,9 +183,17 @@ fn start_audio(args: &Args, ff7: Option<&Arc<Ff7Adapter>>) -> GameAudio {
         (config.logger)(&note);
     }
     if mode == fmv_audio::Mode::Off {
-        return GameAudio::off();
+        return silent(if args.mute {
+            "--mute"
+        } else if args.headless && env.is_none() {
+            "a headless run without FMV_AUDIO set to null or auto"
+        } else {
+            "FMV_AUDIO=off"
+        });
     }
-    let Some(tasks) = audio::ff7::tasks(&args.ff7_source(), Arc::clone(adapter), &config.logger) else { return GameAudio::off() };
+    let Some(tasks) = audio::ff7::tasks(&args.ff7_source(), Arc::clone(adapter), &config.logger, mods::active()) else {
+        return silent("the soundtrack did not start: see the audio: line above");
+    };
     let sound = GameAudio::start(config, tasks);
     // The fanfare after a fight is chosen from the shape of the files (a one-shot of five seconds, not a
     // looping one), not from anything the game's data says; this is the way to another track if the
