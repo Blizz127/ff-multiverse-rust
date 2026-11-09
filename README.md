@@ -408,7 +408,10 @@ about a second. Each particle is a pure function of the clock and a seed, so not
 effect is at most 28 pieces and a frame at most 240 (the newest effects win), which costs about 0.3 ms of CPU with nothing on the
 screen and 0.8 ms with the cap drawn (`a_frame_with_every_effect_at_its_peak...`, measured on a busy machine). Known gaps: a ring
 is drawn standing up, not on the floor; a bolt leaves the middle of its shooter's chest, not the muzzle; effects are hidden by
-bodies nearer the camera but not by the location's walls. The pictures: `cargo test -p fmv-client --bin fmv-client -- --ignored
+bodies nearer the camera but not by the location's walls; the gold ring of a party member that has just been put to sleep drops at
+once while its droop waits for the landing (the gauges and the menu follow the engine); every party weapon's blow slashes (the
+weapons' own elements are not modelled); an enemy that shoots (the `SHOOT` bit) no longer runs up to its target when it has no
+clips to say how it moves (it stands and fires). The pictures: `cargo test -p fmv-client --bin fmv-client -- --ignored
 offscreen_battle_effects --test-threads=1` draws every effect on a stage with no game data (`fx-blows`, `fx-elements`,
 `fx-restoring`, `fx-statuses-curses`, `fx-statuses-buffs`, `fx-staging`), and with `FMV_FF7_LIBRARY` and `FMV_SHOT_DIR` it plays the
 real fights and writes `fx-fire-landing`, `fx-ice-landing`, `fx-fire-all-enemies`, `fx-cure-party`, `fx-limit-gathering`,

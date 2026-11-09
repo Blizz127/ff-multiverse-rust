@@ -1,4 +1,5 @@
-//! What the panels show of HP, MP and who is on their feet: the state AFTER an action, shown when the action LANDS.
+//! What the panels show of HP, MP, who is on their feet and which statuses each fighter has: the state AFTER an action, shown when
+//! the action LANDS.
 //!
 //! The replayed engine says what happened to everybody the moment a batch arrives, so a [`BattleView`] built from it
 //! has the HP, the MP and the dead of the WHOLE batch at once, while the show is played one performance after the

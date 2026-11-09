@@ -1458,6 +1458,14 @@ impl Fight {
     }
 }
 
+/// The GPU keeps 32 models in all and drops every one of them when a frame needs more (the actors vanish for that frame): the actors, their
+/// weapons, the location and the effects' seven meshes of the busiest frame so far must be well under it.
+fn assert_gpu_has_room(fight: &Fight, what: &str) {
+    let models = fight.gpu.cached_avatar_models();
+    eprintln!("{models} models on the GPU after {what}");
+    assert!(models <= 24, "{what}: {models} models on the GPU (it starts over at 32 and loses the actors)");
+}
+
 /// How many pixels within `r` of `at` the picture `shot` (`W` wide) has that `want` likes.
 fn pixels_near(shot: &[u8], at: [f32; 2], r: i32, want: impl Fn([u8; 3]) -> bool) -> usize {
     let mut n = 0;
@@ -1598,6 +1606,7 @@ fn offscreen_battle_effects_in_real_fights() {
         eprintln!("mean level of the picture: {g:.1} gathering, {b:.1} at the flash, {a:.1} after");
         assert!(b > g + 12.0, "the flash lights the whole picture ({g:.1} then {b:.1})");
         assert!(a < b - 6.0, "and is short ({b:.1} then {a:.1})");
+        assert_gpu_has_room(&fight, "the limit break");
     }
 
     // An enemy's laser: the Guard Scorpion answers a blow with its Tail Laser at the whole party.
@@ -1616,6 +1625,7 @@ fn offscreen_battle_effects_in_real_fights() {
         let after: usize = (0..3).map(|i| pixels_near(&hit, fight.chest_px(i), 40, |p| p.iter().all(|&c| c > 235))).sum();
         eprintln!("white pixels over the three chests: {before} in flight, {after} as the laser lands");
         assert!(after > before + 30, "the laser strikes them as it lands ({before} -> {after})");
+        assert_gpu_has_room(&fight, "the Tail Laser");
     }
 
     // A status landing on a whole side: Tifa uses a Light Curtain, which puts a Barrier on every member of the party. The blue shells and the
@@ -1640,6 +1650,7 @@ fn offscreen_battle_effects_in_real_fights() {
             eprintln!("blue pixels around member {member}: {b} before the item lands, {a} after");
             assert!(a > b + 100, "the shell comes up around member {member} when the item lands ({b} -> {a})");
         }
+        assert_gpu_has_room(&fight, "the Light Curtain");
     }
 
     // Two more statuses at once, for the sheet: Cloud gives Tifa a Speed Drink (Haste) and Barret drinks a Hyper (Fury).
