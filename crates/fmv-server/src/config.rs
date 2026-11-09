@@ -87,10 +87,10 @@ pub struct BattleSettings {
     pub encounter_step_units: Option<f32>,
     /// DEBUG, `--debug-limit-full` (refused without `--debug-encounters`, see [`ServerConfig::validate`]):
     /// every member of every battle this server starts begins it with a FULL limit gauge (the game's cap)
-    /// instead of its account's own, so that a smoke run can force a Limit command. ONLY the gauge the
-    /// battle starts with changes (`BattleMember::limit`: `EncounterStart`, the `battle started` log line
-    /// and every client's replay carry it); nothing else about the battle or the account does, and no
-    /// limit gauge is ever stored under it (`World::keep_limits` skips the save): a gauge that started from a
+    /// instead of its account's own, so that a smoke run can force a Limit command. It changes exactly two
+    /// things: the gauge a battle starts with (`BattleMember::limit`: `EncounterStart`, the `battle started`
+    /// log line and every client's replay carry it), and the end-of-battle gauge save, which is skipped
+    /// (`World::keep_limits`), so no limit gauge is ever stored under it: a gauge that started from a
     /// faked full one is not the account's own, so every account keeps the gauge it really has, even when a
     /// member spent its limit or was knocked out. Off by default.
     pub debug_limit_full: bool,
