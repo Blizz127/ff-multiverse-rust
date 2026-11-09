@@ -21,6 +21,14 @@
 //!   guard that reads anything else (a variable the progression does not carry, a key the player has to press, the
 //!   party) cannot be judged: the exit stays closed and the server says so once per area. A false guard wins
 //!   over one that cannot be judged (the exit is closed whatever the rest says).
+//! * **Where it leads.** A script exit of a field a server SERVES (`Ff7Adapter::load_field`, not the survey's loader)
+//!   whose target is not one of the [`crate::REVIEWED_FIELDS`] is **closed whatever its guards say**
+//!   ([`ScriptGate::lead_out`]): the story decides it, so a party's story moving on could send a player into a field whose
+//!   own script exits, points and links are left off (the lift of `elevtr1` leads to `smkin_1` and `smkin_2` from moment 33
+//!   on, and a member that comes to it after its leader's finale is judged on that story). Gateways keep their behaviour
+//!   (data, open for every story: `nrthmk` to `md8_4` is how a party reaches the end of the reviewed slice on purpose).
+//!   The exit stays in the list and stays judged for the survey, so that what the data says is still there to read;
+//!   reviewing the target field opens it with no other change.
 //! * **No flow analysis.** The guards of a jump reached through `REQ` calls are the callers' and the callee's
 //!   together, whether or not an earlier instruction of the script would have changed what they test: a conjunction
 //!   that can never hold simply makes an exit that is never open.
@@ -43,6 +51,9 @@ pub(crate) const MAX_SCRIPT_EXITS_PER_AREA: usize = 96;
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ScriptGate {
     guards: Vec<ExitGuard>,
+    /// The exit leads out of the reviewed fields and the area is served: it is closed whatever the guards say (module
+    /// docs, "Where it leads").
+    leads_out: bool,
 }
 
 /// What a guard comes to for a story.
@@ -56,8 +67,23 @@ enum Verdict {
 
 impl ScriptGate {
     /// Whether the exit is open for the story `progress` (see the module docs). A progression that cannot be read
-    /// opens nothing a script decides.
+    /// opens nothing a script decides, and an exit that leads out of the reviewed fields is closed even where its
+    /// guards say open (what the guards cannot judge stays unjudged).
     pub(crate) fn state(&self, progress: &[u8]) -> ExitState {
+        match self.guards_state(progress) {
+            ExitState::Open if self.leads_out => ExitState::Closed,
+            other => other,
+        }
+    }
+
+    /// The exit leads to a field that is not reviewed: for a server that serves the area it is closed (module docs,
+    /// "Where it leads").
+    pub(crate) fn lead_out(&mut self) {
+        self.leads_out = true;
+    }
+
+    /// What the guards alone say of `progress`.
+    fn guards_state(&self, progress: &[u8]) -> ExitState {
         let Some(story) = StoryState::decode(progress) else {
             return ExitState::Unknown("the progression is not one this adapter reads".to_string());
         };
@@ -130,7 +156,7 @@ fn keep(e: &ScriptExit, listed_key: &impl Fn(&str) -> Option<String>) -> Option<
         arrival_hint: u32::try_from(e.triangle).ok(),
         kind: ExitKind::Gateway, // the caller gives it its id
     };
-    Some((exit, ScriptGate { guards: e.guards.clone() }))
+    Some((exit, ScriptGate { guards: e.guards.clone(), leads_out: false }))
 }
 
 /// `guard` for `story`: what an `IF` around the jump comes to (negated for an `else` branch).
@@ -327,6 +353,29 @@ mod tests {
     }
 
     #[test]
+    fn an_exit_that_leads_out_of_the_reviewed_fields_is_closed_whatever_the_story_says_and_what_cannot_be_judged_stays_unjudged() {
+        let (exits, mut gates) = exits_and_gates(&lift_script(), &["zero", "north_up", "south_up", "north_down", "south_down"]);
+        // as the survey loads them: from moment 33 the lift leads to the other reactor
+        assert_eq!(open_target(&exits, &gates, &lifted(33, false)).as_deref(), Some("south_up"));
+        assert_eq!(open_target(&exits, &gates, &lifted(33, true)).as_deref(), Some("south_down"));
+        // a served area closes the two that lead out of the reviewed fields
+        gates[1].lead_out();
+        gates[3].lead_out();
+        assert_eq!(open_target(&exits, &gates, &lifted(33, false)), None, "nothing is open for the later story");
+        assert_eq!(open_target(&exits, &gates, &lifted(33, true)), None);
+        assert_eq!(open_target(&exits, &gates, &lifted(500, false)), None);
+        assert_eq!(gates[1].state(&lifted(33, false)), ExitState::Closed, "closed, not unjudged");
+        // the ones that stay inside are judged as before
+        assert_eq!(open_target(&exits, &gates, &[]).as_deref(), Some("north_up"));
+        assert_eq!(open_target(&exits, &gates, &lifted(32, false)).as_deref(), Some("north_up"));
+        assert_eq!(open_target(&exits, &gates, &lifted(12, true)).as_deref(), Some("north_down"));
+        assert_eq!(open_target(&exits, &gates, &lifted(32, true)).as_deref(), Some("north_down"));
+        assert_eq!(open_target(&exits, &gates, &lifted(33, true)), None, "and they are closed by the story from 33 on");
+        // a progression nobody can read is still unjudged, not closed
+        assert!(matches!(gates[1].state(&[7, 7]), ExitState::Unknown(_)));
+    }
+
+    #[test]
     fn a_progression_the_adapter_cannot_read_opens_no_script_exit() {
         let (exits, gates) = exits_and_gates(&lift_script(), &["zero", "a", "b", "c", "d"]);
         for blob in [&[7u8, 7][..], &[3, 1, 0], &[1, 1]] {
@@ -404,10 +453,10 @@ mod tests {
             right: GuardValue::Literal(0),
         };
         let g = |negated| ExitGuard { offset: 0, test: compare, negated };
-        let state = |progress: &[u8]| ScriptGate { guards: vec![g(false)] }.state(progress);
+        let state = |progress: &[u8]| ScriptGate { guards: vec![g(false)], leads_out: false }.state(progress);
         assert_eq!(state(&[]), ExitState::Open, "a new game: the lift is up");
         assert_eq!(state(&lifted(12, true)), ExitState::Closed);
-        assert_eq!(ScriptGate { guards: vec![g(true)] }.state(&lifted(12, true)), ExitState::Open, "an else branch is the test failing");
+        assert_eq!(ScriptGate { guards: vec![g(true)], leads_out: false }.state(&lifted(12, true)), ExitState::Open, "an else branch is the test failing");
     }
 
     #[test]

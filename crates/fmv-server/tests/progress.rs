@@ -531,14 +531,15 @@ async fn a_member_who_left_mid_battle_is_still_paid_in_the_store() {
 /// would diverge from the server's at the first enemy turn; v12: it cannot decode the status events and refusals; v13:
 /// nothing it would be sent is new, but its engine skips a scripted enemy's status-only attacks and the Death counter of
 /// an enemy that Poison kills, so its replay would diverge; v14: it never sends `Interact`, so it could not ride the lift,
-/// talk to the characters that move the story or climb a ladder that waits for OK).
+/// talk to the characters that move the story or climb a ladder that waits for OK; v15: it cannot decode the `Countdown`
+/// the Guard Scorpion's step starts).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_client_of_the_previous_protocol_version_is_refused_at_the_handshake() {
-    assert_eq!(PROTOCOL_VERSION, 14);
+    assert_eq!(PROTOCOL_VERSION, 15);
     let server = TestServer::start(fast(None)).await;
-    for old_version in [13u16, 12, 11, 10, 9, 8, 7, 6, 5, 4] {
+    for old_version in [14u16, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4] {
         let mut old = Client::connect(server.addr).await;
-        // A v8 to v13 Hello asks for a character (and reads as a v14 Hello); the older ones carried a colour and a look.
+        // A v8 to v14 Hello asks for a character (and reads as a v15 Hello); the older ones carried a colour and a look.
         let hello = if old_version >= 8 {
             format!(
                 r#"{{"Hello":{{"protocol_version":{old_version},"client_build":"old","auth":{{"Register":{{"display_name":"Old{old_version}"}}}},"character":{{"tint":[1,2,3],"body":null,"slot":null}}}}}}"#
