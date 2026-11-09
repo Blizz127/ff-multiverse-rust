@@ -95,6 +95,7 @@ pub mod area;
 pub mod background;
 pub mod battle_model;
 pub mod field;
+pub mod field_sound;
 pub mod hrc;
 pub mod lgp;
 pub mod links;
