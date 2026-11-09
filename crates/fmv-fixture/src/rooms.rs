@@ -456,7 +456,7 @@ impl AreaRuntime for Room {
     fn story_advance(&self, progress: &[u8], point: u32) -> Option<StoryStep> {
         // The toggle region: a step that is not forward, from the advanced story back to a new account's.
         if self.interactive && !self.is_yard() && point == 4 {
-            return (progress == STORY_ADVANCED).then(|| StoryStep { progress: Vec::new(), summary: "moment=1->0".into() });
+            return (progress == STORY_ADVANCED).then(|| StoryStep { progress: Vec::new(), summary: "moment=1->0".into(), countdown: None });
         }
         let exists = self.story
             && if self.is_yard() {
@@ -464,7 +464,7 @@ impl AreaRuntime for Room {
             } else {
                 point == 0 || (self.scripted && point == 1) || (self.interactive && point <= 3)
             };
-        (exists && progress.is_empty()).then(|| StoryStep { progress: STORY_ADVANCED.to_vec(), summary: "moment=0->1".into() })
+        (exists && progress.is_empty()).then(|| StoryStep { progress: STORY_ADVANCED.to_vec(), summary: "moment=0->1".into(), countdown: None })
     }
 
     /// The unreviewed yard's entry point and the exit it would have had, left off.

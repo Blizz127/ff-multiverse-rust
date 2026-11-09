@@ -436,7 +436,10 @@ mod tests {
         assert_eq!(judge(CompareWidth::Word, var(2, 0), CompareOp::BitOn, lit(9), &m), Verdict::False);
         assert_eq!(judge(CompareWidth::Word, var(2, 0), CompareOp::BitOff, lit(9), &m), Verdict::True);
         assert!(matches!(judge(CompareWidth::Byte, var(2, 0), CompareOp::BitOn, lit(9), &m), Verdict::Unknown(_)), "a byte has no bit 9");
-        assert!(matches!(judge(CompareWidth::Byte, var(1, 225), CompareOp::BitOn, lit(7), &m), Verdict::Unknown(_)), "bit 7 of the reactor byte is not carried");
+        assert!(matches!(judge(CompareWidth::Byte, var(1, 225), CompareOp::BitOn, lit(6), &m), Verdict::Unknown(_)), "bit 6 of the reactor byte is not carried");
+        // (bit 7, the countdown's timeout flag, is carried and nothing sets it: it is clear for every story)
+        assert_eq!(judge(CompareWidth::Byte, var(1, 225), CompareOp::BitOn, lit(7), &m), Verdict::False);
+        assert_eq!(judge(CompareWidth::Byte, var(1, 225), CompareOp::BitOff, lit(7), &m), Verdict::True);
         assert_eq!(judge(CompareWidth::Byte, var(1, 225), CompareOp::BitOn, lit(0), &m), Verdict::False);
         // the arithmetic ones
         assert_eq!(judge(CompareWidth::Byte, var(2, 0), CompareOp::And, lit(2), &m), Verdict::True);

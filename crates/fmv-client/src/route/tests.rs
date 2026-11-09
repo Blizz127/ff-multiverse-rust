@@ -130,7 +130,7 @@ impl AreaRuntime for Floors {
         }]
     }
     fn story_advance(&self, progress: &[u8], point: u32) -> Option<StoryStep> {
-        (self.story && point == 0 && progress.is_empty()).then(|| StoryStep { progress: vec![1], summary: "moment=1->2".into() })
+        (self.story && point == 0 && progress.is_empty()).then(|| StoryStep { progress: vec![1], summary: "moment=1->2".into(), countdown: None })
     }
 }
 

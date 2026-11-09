@@ -202,13 +202,15 @@ fn a_version_2_blob_carries_the_moment_and_the_variables_in_one_canonical_form()
 #[test]
 fn only_the_tracked_bits_can_be_set_and_known() {
     let mut s = StoryState::new_game();
-    assert_eq!(REACTOR_LIFT, tracked_var(1, 225).unwrap());
-    assert!(!s.set_bit(1, 225, 7, true), "bit 7 of the reactor byte is not carried");
+    assert_eq!(REACTOR_STATE, tracked_var(1, 225).unwrap());
+    assert_eq!(REACTOR_STATE.bits, 0b1000_0001, "the lift (bit 0) and the countdown's timeout flag (bit 7)");
+    assert!(!s.set_bit(1, 225, 6, true) && !s.set_bit(1, 225, 5, true), "the other bits of the reactor byte are not carried");
     assert!(!s.set_bit(1, 224, 0, true), "nor is another variable");
     assert!(!s.set_bit(1, 225, 8, true) && !s.set_bit(1, 225, 200, true), "there are eight bits");
     assert_eq!(s.vars().count(), 0);
     assert_eq!(s.known_bit(1, 225, 0), Some(false), "a new game has the lift up");
-    assert_eq!(s.known_bit(1, 225, 7), None, "the bits it does not carry are unknown, not 0");
+    assert_eq!(s.known_bit(1, 225, TIMEOUT_BIT), Some(false), "and the countdown has not run out");
+    assert_eq!(s.known_bit(1, 225, 6), None, "the bits it does not carry are unknown, not 0");
     assert_eq!(s.known_byte(1, 225), None, "a byte it carries only a bit of is not known whole");
     assert!(s.set_bit(1, 225, 0, true) && !s.set_bit(1, 225, 0, true), "setting twice changes once");
     assert_eq!((s.known_bit(1, 225, 0), s.var(1, 225)), (Some(true), 1));
@@ -589,13 +591,13 @@ fn a_write_that_only_clears_a_bit_is_no_point() {
 
 #[test]
 fn a_bit_the_model_does_not_carry_is_no_write_and_no_test() {
-    // bit 7 of the reactor byte (the timer's) is not carried: nothing is written and a test of it is not understood
-    let timer = when_on_triangle(3, &when_moment(3, 9, &concat(&[biton(1, 225, 7), setword(2, 0, 9)])));
+    // bit 6 of the reactor byte (the bomb's) is not carried: nothing is written and a test of it is not understood
+    let timer = when_on_triangle(3, &when_moment(3, 9, &concat(&[biton(1, 225, 6), setword(2, 0, 9)])));
     let sec = field_with_player(|s| s.entity("e", vec![(0, entity_script(&[], &looping(&timer)))]));
     let story = scan(&sec, &mesh(5));
     assert_eq!(story.points()[0].label, "triangle 3: moment <9 -> 9", "only the moment is written");
-    let tests_bit_7 = when_on_triangle(3, &when_lift_bit(9, 7, &setword(2, 0, 9)));
-    let sec = field_with_player(|s| s.entity("e", vec![(0, entity_script(&[], &looping(&tests_bit_7)))]));
+    let tests_bit_6 = when_on_triangle(3, &when_lift_bit(9, 6, &setword(2, 0, 9)));
+    let sec = field_with_player(|s| s.entity("e", vec![(0, entity_script(&[], &looping(&tests_bit_6)))]));
     assert_eq!(scan(&sec, &mesh(5)).point_count(), 0);
     // another variable of the same bank is not carried at all
     let other = when_on_triangle(3, &when_moment(3, 9, &biton(1, 224, 0)));

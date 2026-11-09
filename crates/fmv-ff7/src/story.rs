@@ -186,18 +186,37 @@ pub struct TrackedVar {
     /// The bits of the byte the model carries (`0xFF`: the whole byte). A guard that tests another bit of it
     /// cannot be evaluated.
     pub bits: u8,
+    /// The carried bits that nothing in this model ever sets (a subset of `bits`): they read clear for every account.
+    /// A story point that needs one of them SET can never apply and is not offered, and a step that would turn one on
+    /// is refused ([`StoryState::set_bit`]).
+    pub never_set: u8,
 }
 
-/// **The reactor's state byte, bit 0: the lift of `elevtr1` is at the bottom.** The `ele` entity of that field
-/// sets it when the party rides down (its panel, then `BITON Var[1][225] bit 0`) and the four exits of the
-/// lift's line are decided by it (`Var[1][225] lacks bit 0`: up to `nmkin_1`; set: down to `nmkin_2`). The
-/// byte has seven more bits that the first mission's scripts set (the timer, the bomb) and that nothing here
-/// writes, so only this one is carried.
-pub const REACTOR_LIFT: TrackedVar = TrackedVar { bank: 1, address: 225, bits: 0x01 };
+/// Bit 0 of the reactor's state byte: the lift of `elevtr1` is at the bottom (see [`REACTOR_STATE`]).
+pub const LIFT_BIT: u8 = 0;
+/// Bit 7 of the reactor's state byte: the countdown ran out (see [`REACTOR_STATE`]).
+pub const TIMEOUT_BIT: u8 = 7;
+
+/// **The reactor's state byte (`Var[1][225]`): two of its bits are carried.**
+///
+/// * **Bit 0, the lift of `elevtr1` is at the bottom.** The `ele` entity of that field sets it when the party rides
+///   down (its panel, then `BITON Var[1][225] bit 0`), clears it on the ride back up, and the four exits of the lift's
+///   line are decided by it (`Var[1][225] lacks bit 0`: up to `nmkin_1`; set: down to `nmkin_2`).
+/// * **Bit 7, the countdown ran out.** Each reactor field's `timeo` entity sets it when the timer that the Guard
+///   Scorpion step starts reaches zero (then a `MAPJUMP` to `nrthmk`), and `nrthmk`'s finale reads it: with it clear the
+///   party has escaped (moment 33), with it set the finale ends in `GAMEOVER`. It is carried ONLY so that the finale's
+///   own guard can be judged, and **this server never sets it**: a countdown that runs out does nothing to the story
+///   (see `fmv-server`'s `world::countdown`), so the finale applies to a party that was late as much as to one that was
+///   not, and nobody is ever held at moment 27.
+///
+/// The byte has six more bits that the first mission's scripts set (the doors, the bomb, the characters on the way out)
+/// and that nothing here writes: a guard that tests one of them cannot be judged.
+pub const REACTOR_STATE: TrackedVar =
+    TrackedVar { bank: 1, address: 225, bits: (1 << LIFT_BIT) | (1 << TIMEOUT_BIT), never_set: 1 << TIMEOUT_BIT };
 
 /// Every variable beyond the moment the model carries. Adding one is adding a row here, and a story point
 /// that writes it.
-pub const TRACKED_VARS: &[TrackedVar] = &[REACTOR_LIFT];
+pub const TRACKED_VARS: &[TrackedVar] = &[REACTOR_STATE];
 
 /// The tracked variable at `bank`/`address`, if there is one.
 pub fn tracked_var(bank: u8, address: u8) -> Option<TrackedVar> {
@@ -286,6 +305,9 @@ impl StoryState {
     pub fn set_bit(&mut self, bank: u8, address: u8, bit: u8, on: bool) -> bool {
         let Some(tracked) = tracked_var(bank, address) else { return false };
         let Some(mask) = 1u8.checked_shl(u32::from(bit)).filter(|m| tracked.bits & m != 0) else { return false };
+        if on && tracked.never_set & mask != 0 {
+            return false;
+        }
         let old = self.var(bank, address);
         let new = if on { old | mask } else { old & !mask };
         if new == old {
@@ -422,6 +444,15 @@ impl StoryVars for StoryState {
     fn party_member(&self, slot: u8) -> Option<u8> {
         canon_party(self).get(usize::from(slot)).copied()
     }
+}
+
+/// Whether the countdown that a step started (the step left the story at `started`) still matters to an account whose
+/// story is `now` (`AreaRuntime::countdown_live`): while the main story counter is where the step left it. The first
+/// reactor's timer is shown, and runs out, only at that moment (every reactor field's `time` and `timeo` entities test
+/// `Var[2][0] == 27`), so a step that moves the counter on (the finale's 27 to 33) makes it moot, and a lift that goes
+/// up or down (a tracked bit) or a character talked to does not. A blob that cannot be read is never live.
+pub fn countdown_live(started: &[u8], now: &[u8]) -> bool {
+    matches!((StoryState::decode(started), StoryState::decode(now)), (Some(a), Some(b)) if a.moment == b.moment)
 }
 
 /// The progression to store when `advanced` is saved over `stored`: the join of the two (the further moment, the
@@ -574,6 +605,17 @@ impl Cond {
         }
     }
 
+    /// Whether the condition can hold for any story this model makes: a carried bit that nothing sets
+    /// ([`TrackedVar::never_set`]) is never set, so a condition that wants it set never holds.
+    fn possible(self) -> bool {
+        match self {
+            Self::Moment(..) => true,
+            Self::Bit { bank, address, bit, set } => {
+                !set || tracked_var(bank, address).is_none_or(|t| 1u8.checked_shl(u32::from(bit)).is_none_or(|mask| t.never_set & mask == 0))
+            }
+        }
+    }
+
     /// The comparison without the name of what is compared (`==1`), for a point whose conditions are all moments.
     fn short(self) -> String {
         match self {
@@ -600,6 +642,17 @@ enum Op {
 }
 
 impl Op {
+    /// Whether the write can change a story this model makes: turning on a bit that nothing sets
+    /// ([`TrackedVar::never_set`]) changes nothing (the step is refused), so it is no write.
+    fn possible(self) -> bool {
+        match self {
+            Self::Moment(_) | Self::Bit { on: false, .. } => true,
+            Self::Bit { bank, address, bit, on: true } => {
+                tracked_var(bank, address).is_none_or(|t| 1u8.checked_shl(u32::from(bit)).is_none_or(|mask| t.never_set & mask == 0))
+            }
+        }
+    }
+
     fn text(self) -> String {
         match self {
             Self::Moment(n) => n.to_string(),
@@ -650,6 +703,9 @@ struct PointDef {
     /// A `BATTLE` the script starts BEFORE the write, in the block the write is in (a scripted fight whose win is what
     /// moves the story: the server starts it and pays the step when it is won).
     battle_first: Option<u16>,
+    /// A timer the write's block sets (`STTIM` with literal hours, minutes and seconds, in the same block as the write):
+    /// its length in seconds. The step carries it as [`StoryStep::countdown`], and the server runs the countdown.
+    countdown: Option<u32>,
 }
 
 impl PointDef {
@@ -685,6 +741,7 @@ impl PointDef {
         };
         let first = self.battle_first.map_or(String::new(), |b| format!(" (starts battle {b} first, the step is paid when it is won)"));
         let battle = self.battle.map_or(String::new(), |b| format!(" (the script then starts battle {b}, which the server does not run)"));
+        let timer = self.countdown.map_or(String::new(), |s| format!(" (starts a countdown of {s} s)"));
         let effects: Vec<String> = self
             .effects
             .iter()
@@ -698,7 +755,7 @@ impl PointDef {
                 format!("{when} -> {}", e.op.text())
             })
             .collect();
-        format!("{place}: {}{first}{battle}", effects.join("; "))
+        format!("{place}: {}{first}{battle}{timer}", effects.join("; "))
     }
 
     fn story_trigger(&self) -> StoryTrigger {
@@ -879,7 +936,7 @@ impl AreaStory {
         let state = StoryState::decode(blob)?;
         let point = self.points.get(usize::try_from(id).ok()?)?;
         let next = point.apply(&state)?;
-        Some(StoryStep { summary: summary(&state, &next), progress: next.encode() })
+        Some(StoryStep { summary: summary(&state, &next), progress: next.encode(), countdown: point.countdown })
     }
 
     /// [`AreaStory::advance`] for every kind of point: a talk point runs its character's talk script (in `script`, the
@@ -888,12 +945,12 @@ impl AreaStory {
     pub fn advance_with(&self, script: &FieldScript<'_>, blob: &[u8], id: u32) -> Option<StoryStep> {
         let state = StoryState::decode(blob)?;
         let point = self.points.get(usize::try_from(id).ok()?)?;
-        let next = match &point.trigger {
-            Trigger::Talk { entity, .. } => talk_step(script, *entity, &state)?,
-            Trigger::Panel { entity, triangle, vars, .. } => panel_step(script, *entity, *triangle, vars, &state)?,
-            _ => point.apply(&state)?,
+        let (next, countdown) = match &point.trigger {
+            Trigger::Talk { entity, .. } => (talk_step(script, *entity, &state)?, None),
+            Trigger::Panel { entity, triangle, vars, .. } => (panel_step(script, *entity, *triangle, vars, &state)?, None),
+            _ => (point.apply(&state)?, point.countdown),
         };
-        Some(StoryStep { summary: summary(&state, &next), progress: next.encode() })
+        Some(StoryStep { summary: summary(&state, &next), progress: next.encode(), countdown })
     }
 
     /// The battle that point `id` starts before its step is paid (`AreaRuntime::story_battle`): a scripted fight
@@ -925,6 +982,7 @@ impl AreaStory {
                 effects: Vec::new(),
                 battle: None,
                 battle_first: None,
+                countdown: None,
             });
         }
     }

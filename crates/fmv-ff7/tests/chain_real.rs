@@ -163,7 +163,19 @@ fn the_story_points_of_the_chain_are_the_ones_the_scripts_make() {
     );
     assert_eq!(points("md1_1"), one("region(3)", "triangle 62: moment <7 -> 7"));
     assert_eq!(points("md1_2"), one("entry", "entry: moment <8 -> 8"));
-    assert_eq!(points("nrthmk"), one("entry", "entry: moment <10 -> 10"));
+    // nrthmk: the way in (8 -> 10) and the finale of the mission (the explosion's cutscene, which a party that walks out of
+    // the reactor at 27 or later is moved to 33 by); the loop that plays the late party's game over wants the timeout flag
+    // SET, which nothing in the model sets, and is not a point
+    assert_eq!(
+        points("nrthmk"),
+        [
+            ("entry".to_string(), "entry: moment <10 -> 10".to_string()),
+            (
+                "entry".to_string(),
+                "entry: moment >=27 and Var[1][225] bit 7 clear -> 33; moment >=27 and Var[1][225] bit 7 clear -> Var[1][225] bit 0 on".to_string()
+            )
+        ]
+    );
     assert_eq!(points("nmkin_1"), one("line", "line: moment <11 -> 11"));
     // the lift's panel waits for the OK button: presses, not regions walked into: the ride down, and the ride back that
     // the panel's own script makes
@@ -188,7 +200,11 @@ fn the_story_points_of_the_chain_are_the_ones_the_scripts_make() {
         points("nmkin_5"),
         [
             // the guard scorpion: the triangle of the core starts battle 324 first and the step waits for the win
-            ("region(3)".to_string(), "triangle 2: moment <27 -> 27 (starts battle 324 first, the step is paid when it is won)".to_string()),
+            // ... and the ten minutes of the bomb that its block sets
+            (
+                "region(3)".to_string(),
+                "triangle 2: moment <27 -> 27 (starts battle 324 first, the step is paid when it is won) (starts a countdown of 600 s)".to_string()
+            ),
             // the two points of the escape (moments 120 and 123: no account of the first mission is there)
             ("region(3)".to_string(), "triangle 2: moment ==123 -> 127".to_string()),
             ("entry".to_string(), "entry: moment ==120 -> 123".to_string()),
@@ -298,9 +314,9 @@ fn script_exits_and_story_points_of_the_archive_in_numbers() {
     // two points start a fight first, and the ladders and jumps are 141 walk-on lines and 49 that wait for OK)
     assert_eq!(
         (points.get("region").copied(), points.get("press").copied(), points.get("talk").copied(), points.get("line").copied(), points.get("entry").copied()),
-        (Some(6), Some(2), Some(49), Some(20), Some(56))
+        (Some(6), Some(2), Some(49), Some(20), Some(74))
     );
-    assert_eq!((fields_with_points, ok_points, battle_first), (81, 2, 2), "the lift's two presses want OK");
+    assert_eq!((fields_with_points, ok_points, battle_first), (95, 2, 2), "the lift's two presses want OK");
     assert_eq!((walk_on_links, ok_links, fields_with_links), (141, 49, 33));
 }
 
@@ -318,10 +334,11 @@ fn gateways(area: &dyn AreaRuntime) -> Vec<Exit> {
 /// story points and links; every other field offers its gateways exactly as ever and leaves the rest off, saying what it
 /// left off and why. Over the whole archive: gateways are the same everywhere, a field that is not reviewed has no script
 /// exit, no point, no link and no step a point could take for any story, its phases are what they were, and what it says
-/// it left off is exactly what its data holds. The data holds 917 script exits, 133 points and 190 links; the ten
-/// fields offer 4, 14 and 11 of them (the lift's four exits, the mission's fourteen points, and the ladders and jumps of
-/// `nmkin_2`, `nmkin_3` and `nmkin_4`), the other fields that have any leave off the rest (see the numbers asserted at the
-/// end).
+/// it left off is exactly what its data holds. The data holds 917 script exits, 151 points and 190 links (133 points
+/// before the writes of a requested script were read: 18 more entry points, one of them the mission's finale in `nrthmk`
+/// and the other seventeen in fields that are left off); the ten fields offer 4, 15 and 11 of them (the lift's four
+/// exits, the mission's fifteen points, and the ladders and jumps of `nmkin_2`, `nmkin_3` and `nmkin_4`), the other fields
+/// that have any leave off the rest (see the numbers asserted at the end).
 #[test]
 #[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
 fn the_fields_that_are_not_reviewed_offer_their_gateways_and_nothing_else_of_the_story() {
@@ -370,8 +387,8 @@ fn the_fields_that_are_not_reviewed_offer_their_gateways_and_nothing_else_of_the
         }
     }
     println!("offered by the reviewed fields: {offered:?} (script exits, points, links); left off in {fields_left_off} other fields: {left_off:?}");
-    assert_eq!(offered, (4, 14, 11));
-    assert_eq!((left_off, fields_left_off), ((913, 119, 179), 299));
+    assert_eq!(offered, (4, 15, 11));
+    assert_eq!((left_off, fields_left_off), ((913, 136, 179), 310));
 }
 
 /// The cases that matter, named: the entry point of a Sector 8 field that raises a story from 33 to 36 the moment a

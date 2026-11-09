@@ -377,6 +377,9 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>, mut 
             // The story comes first: while there is a point in this area that would advance this player's story
             // the story bot walks to it (and stands still if it must wait for its invite); once there is none, a
             // bot that also travels goes on to the next exit. A bot that only advances its story stands still then.
+            // (a bot that travels too tells the story bot where its route goes next: the lift's ride back is pursued when
+            // it opens that way and the ride down is not when it would close it)
+            story_bot.set_wanted_exit(if travel_bot.is_active() { travel_bot.next_area() } else { None });
             let story_walks = story_bot.wants_to_walk(session.area.as_ref(), session.state.story.progress(), session.state.own.pos());
             story_decides = story_bot.is_requested() && (story_walks || !travel_bot.is_active());
             let step = if story_decides {
