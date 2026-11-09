@@ -139,7 +139,7 @@ impl World {
 
     /// Apply `step` of point `point` to `entity` (module docs: the mirror, the log line, the save, the message, the
     /// placements).
-    fn apply_story_step(&mut self, entity: EntityId, point: u32, step: StoryStep) {
+    pub(super) fn apply_story_step(&mut self, entity: EntityId, point: u32, step: StoryStep) {
         let Some(player) = self.players.get_mut(&entity) else { return };
         let (account, area_id) = (player.account, player.area.clone());
         player.progression = step.progress.clone();

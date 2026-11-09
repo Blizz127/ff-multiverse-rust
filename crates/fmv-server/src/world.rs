@@ -112,6 +112,7 @@ use crate::ServerError;
 mod areas;
 mod battle;
 mod countdown;
+mod follow;
 mod instances;
 mod party;
 mod press;
@@ -249,6 +250,9 @@ struct Player {
     /// The account whose countdown this player was last told is running (see the `countdown` module): `None` when it was
     /// told of none, or that it is over.
     countdown_told: Option<AccountId>,
+    /// The ways out of an area that this player, as the leader of a party, took through an exit its story decided: what
+    /// its members follow (see the `follow` module).
+    ways: Vec<follow::WayOut>,
 }
 
 /// Everything the world needs to admit a player into the area.
@@ -471,6 +475,7 @@ impl World {
                 arming: LinkArming::default(),
                 fence: None,
                 countdown_told: None,
+                ways: Vec::new(),
             },
         );
         self.by_account.insert(account, entity);
@@ -681,6 +686,12 @@ impl World {
     ) {
         let mut moved: BTreeSet<AccountId> = BTreeSet::new();
         for event in events {
+            // A party that has a new leader, or is gone, has no way out left to follow (the `follow` module).
+            match &event {
+                PartyEvent::LeaderChanged { old_leader, new_leader, .. } => self.forget_ways_of(&[*old_leader, *new_leader]),
+                PartyEvent::Disbanded { members, .. } => self.forget_ways_of(members),
+                _ => {}
+            }
             let mut audience = event.audience();
             audience.sort();
             audience.dedup();

@@ -68,23 +68,33 @@ fn the_lift_of_the_first_reactor_routes_by_its_bit_and_the_moment() {
     assert_eq!((by_target["nmkin_2"].arrival.x, by_target["nmkin_2"].arrival.y, by_target["nmkin_2"].arrival_hint), (-682.0, 308.0, Some(92)));
     assert_eq!((by_target["nmkin_1"].arrival.x, by_target["nmkin_1"].arrival.y, by_target["nmkin_1"].arrival_hint), (-1485.0, 4298.0, Some(60)));
     assert_eq!((exits[0].line.0.x, exits[0].line.0.y, exits[0].line.1.x, exits[0].line.1.y), (-185.0, -68.0, -185.0, 56.0));
-    // exactly one exit is open for each state of the lift and the story
+    // exactly one exit is open for each state of the lift and the story up to moment 32; from 33 on NONE is: the lift of
+    // the later story leads to `smkin_1` and `smkin_2`, fields nobody has reviewed, and a script exit of a served field
+    // that leads out of the reviewed fields is closed whatever the story says (`exit_gate`, "Where it leads")
     for (moment, lift_down, want) in [
-        (1, false, "nmkin_1"),
-        (11, false, "nmkin_1"),
-        (12, false, "nmkin_1"),
-        (32, false, "nmkin_1"),
-        (33, false, "smkin_1"),
-        (500, false, "smkin_1"),
-        (1, true, "nmkin_2"),
-        (12, true, "nmkin_2"),
-        (13, true, "nmkin_2"),
-        (32, true, "nmkin_2"),
-        (33, true, "smkin_2"),
-        (500, true, "smkin_2"),
+        (1, false, Some("nmkin_1")),
+        (11, false, Some("nmkin_1")),
+        (12, false, Some("nmkin_1")),
+        (32, false, Some("nmkin_1")),
+        (33, false, None),
+        (500, false, None),
+        (1, true, Some("nmkin_2")),
+        (12, true, Some("nmkin_2")),
+        (13, true, Some("nmkin_2")),
+        (32, true, Some("nmkin_2")),
+        (33, true, None),
+        (500, true, None),
     ] {
-        assert_eq!(open_target(area.as_ref(), &state(moment, lift_down)), [want], "moment {moment}, lift {}", if lift_down { "down" } else { "up" });
+        let open = open_target(area.as_ref(), &state(moment, lift_down));
+        assert_eq!(open, want.map(str::to_string).into_iter().collect::<Vec<_>>(), "moment {moment}, lift {}", if lift_down { "down" } else { "up" });
     }
+    // what the data says (the survey's loader keeps it): from 33 on the lift leads to the other reactor, one exit for each
+    // state of the lift. It is the policy that closes them in a served field, not the guards.
+    let surveyed = adapter.survey_field("elevtr1").unwrap();
+    for (moment, lift_down, want) in [(32, false, "nmkin_1"), (32, true, "nmkin_2"), (33, false, "smkin_1"), (500, false, "smkin_1"), (33, true, "smkin_2"), (500, true, "smkin_2")] {
+        assert_eq!(open_target(&surveyed, &state(moment, lift_down)), [want], "the data, moment {moment}, lift {}", if lift_down { "down" } else { "up" });
+    }
+    assert!(!fmv_ff7::is_reviewed_field("smkin_1") && !fmv_ff7::is_reviewed_field("smkin_2"), "the two fields the later story's lift leads to");
     // a new account's empty blob is the lift up at moment 1
     assert_eq!(open_target(area.as_ref(), &[]), ["nmkin_1"]);
     // the exits of the later story are closed because their guards say so, not because they are unknown
@@ -996,6 +1006,13 @@ fn arrivals_of(adapter: &Ff7Adapter, field: &str, home: &str) -> std::collection
 /// and down. (Open exits exist in every state: what is pinned is that one of them can be WALKED to.) The cast does not
 /// change with the moment (the server keeps every field's characters as the data places them: a known gap), and
 /// the phases of the fields are the intervals their scripts compare the moment with.
+///
+/// **The one place that is a dead end: the lift at 33.** Its way on from moment 33 leads to the second reactor
+/// (`smkin_1`, `smkin_2`), which nobody has reviewed, so a served field closes it (the data says it is open: the survey's
+/// loader shows it) and its way back is the first mission's, closed by the story from 33 on. The story never takes a party
+/// there (the finale ends in `nrthmk`, the lift is behind it); only a party that walks back into the reactor AFTER the
+/// finale stands there, and a member that comes to the lift after its leader's finale is taken through by the leader's
+/// way out instead (the server's `follow` module). Reviewing `smkin_1` and `smkin_2` opens it.
 #[test]
 #[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
 fn nobody_is_stranded_at_27_or_33_in_any_reviewed_field() {
@@ -1008,6 +1025,14 @@ fn nobody_is_stranded_at_27_or_33_in_any_reviewed_field() {
         assert!(!arrivals.is_empty(), "{field} is arrived at from somewhere");
         for (name, story) in &stories {
             let open: Vec<Exit> = area.exits().into_iter().filter(|e| area.exit_state(e, story) == ExitState::Open).collect();
+            if field == "elevtr1" && name.starts_with("33") {
+                // the one dead end (see above): closed by the policy, open in the data, and nowhere else
+                assert!(open.is_empty(), "{field} at {name}: the lift's way on leads out of the reviewed fields: {open:?}");
+                let surveyed = adapter.survey_field(field).unwrap();
+                let data: Vec<String> = surveyed.exits().iter().filter(|e| surveyed.exit_state(e, story) == ExitState::Open).map(|e| e.target.clone()).collect();
+                assert!(data.len() == 1 && data[0].starts_with("smkin_"), "the data's way on is the second reactor's: {data:?}");
+                continue;
+            }
             assert!(!open.is_empty(), "{field} at {name}: some exit is open");
             let open_triangles: std::collections::BTreeSet<usize> = open.iter().flat_map(|e| triangles_at(mesh, e)).collect();
             for &start in &arrivals {
