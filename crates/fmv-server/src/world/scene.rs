@@ -125,6 +125,9 @@ pub trait SceneHost: Send + Sync {
     /// story from `before` to `after` (the point's own step, which the world applies when the scene ends: see
     /// `World::start_point_scene`). `None`: the step is applied at once, as it always was.
     fn point_scene(&self, _field: &str, _before: &[u8], _after: &[u8]) -> Option<String> { None }
+    /// Presentation after a matching story battle wins. The victory step is still applied immediately and once;
+    /// this scene neither saves nor starts a second fight.
+    fn victory_scene(&self, _field: &str, _before: &[u8], _after: &[u8], _formation: u16) -> Option<String> { None }
     /// Where an account whose story is `progress` comes into the world, when that is not where everyone joins: a story that
     /// a scene took somewhere no walk leads back from stands there again on its next login (`World::join` sends the player
     /// on from the entry area through the ordinary area handshake). `None`: it joins like everyone.
@@ -372,15 +375,29 @@ impl World {
     /// has left the world. Returns whether a run was started (the step then waits for it); `false` leaves the step to the
     /// caller, as before cutscenes. A previewing player, or one that is held, in a battle or in transit, gets none.
     pub(super) fn start_point_scene(&mut self, entity: EntityId, point: u32, step: &StoryStep, now: Instant, on_entry: bool, battle: Option<u16>) -> bool {
-        let Some(host) = self.scenes.host.clone() else { return false };
-        let (area, account, pos, before) = {
+        let Some(host) = self.scenes.host.as_ref() else { return false };
+        let Some(p) = self.players.get(&entity) else { return false };
+        let area = p.area.clone();
+        let Some(scene) = host.point_scene(&area, &p.progression, &step.progress) else { return false };
+        self.start_cutscene(entity, scene, p.progression.clone(), now, Some(PointThen { point, area, on_entry, battle }))
+    }
+
+    /// Called only after a winning story battle's step has been saved, with its pre-victory story retained for staging.
+    pub(super) fn start_victory_scene(&mut self, entity: EntityId, before: Vec<u8>, step: &StoryStep, formation: u16, now: Instant) -> bool {
+        let Some(host) = self.scenes.host.as_ref() else { return false };
+        let Some(p) = self.players.get(&entity) else { return false };
+        let Some(scene) = host.victory_scene(&p.area, &before, &step.progress, formation) else { return false };
+        self.start_cutscene(entity, scene, before, now, None)
+    }
+
+    fn start_cutscene(&mut self, entity: EntityId, scene: String, before: Vec<u8>, now: Instant, then: Option<PointThen>) -> bool {
+        let (account, pos) = {
             let Some(p) = self.players.get(&entity) else { return false };
             if p.preview.is_some() || p.scene.is_some() || p.battle.is_some() || p.transit.is_some() {
                 return false;
             }
-            (p.area.clone(), p.account, p.snapshot.pos, p.progression.clone())
+            (p.account, p.snapshot.pos)
         };
-        let Some(scene) = host.point_scene(&area, &before, &step.progress) else { return false };
         if !self.scenes.list.iter().any(|s| s.id == scene) {
             return false;
         }
@@ -400,7 +417,7 @@ impl World {
             last_activity: now,
             writes_story: false,
             preview: false,
-            then: Some(PointThen { point, area, on_entry, battle }),
+            then,
         };
         self.start_run(run, record, &mut Vec::new());
         true
@@ -613,7 +630,7 @@ impl World {
                 }
             }
         }
-        let story = if record.then.is_some() { "the point's step" } else if !apply { "dropped" } else if !record.writes_story { "none (not the owner's phase)" } else if let Some(result) = &result {
+        let story = if record.then.is_some() { "the point's step" } else if !apply { "dropped" } else if !record.writes_story { "none (read-only run)" } else if let Some(result) = &result {
             self.apply_scene_story(&record, result)
         } else { "none (the scene could not be run)" };
         // A debug preview never changes the real world. A real scene's destination is resolved and

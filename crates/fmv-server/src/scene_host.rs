@@ -156,6 +156,11 @@ impl SceneHost for Ff7SceneHost {
         self.defs.iter().find(|d| d.presents_step(field, &before, &after)).map(|d| d.id.clone())
     }
 
+    fn victory_scene(&self, field: &str, before: &[u8], after: &[u8], formation: u16) -> Option<String> {
+        let (before, after) = (StoryState::decode(before)?, StoryState::decode(after)?);
+        self.defs.iter().find(|d| d.follows_battle_step(field, &before, &after, formation)).map(|d| d.id.clone())
+    }
+
     fn entry(&self, progress: &[u8]) -> Option<fmv_adapter_api::Exit> {
         // (a progression that cannot be read is nobody's story: it joins like everyone, as it always has)
         let entry = fmv_ff7::script::scene::story_entry(StoryState::decode(progress)?.moment)?;

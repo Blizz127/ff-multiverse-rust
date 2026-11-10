@@ -52,7 +52,7 @@ pub(crate) fn def_in(field: &str) -> SceneDef {
             Spot { x: -100, y: -216, triangle: 40, direction: 128 },
             Spot { x: -30, y: -72, triangle: 25, direction: 226 },
         ],
-        arrival: Spot { x: -125, y: -100, triangle: 27, direction: 192 }, presents: None,
+        arrival: Spot { x: -125, y: -100, triangle: 27, direction: 192 }, presents: None, resume_after_battle: None,
     }
 }
 

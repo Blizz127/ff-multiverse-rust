@@ -148,8 +148,8 @@ impl World {
 
     /// The battle that a story point started has been WON: the player's step, if it still applies (the player is where
     /// the point is and its placement still lets it advance the story).
-    pub(super) fn story_after_battle(&mut self, then: StoryThen) {
-        let step = {
+    pub(super) fn story_after_battle(&mut self, then: StoryThen, formation: u16, now: Instant) {
+        let (step, before) = {
             let Some(player) = self.players.get(&then.entity) else { return };
             if player.area != then.area || player.battle.is_some() || player.transit.is_some() {
                 return;
@@ -158,10 +158,13 @@ impl World {
                 return;
             }
             let Some(area) = self.areas.get(&player.area) else { return };
-            area.runtime().story_advance(&player.progression, then.point)
+            (area.runtime().story_advance(&player.progression, then.point), player.progression.clone())
         };
         if let Some(step) = step {
-            self.apply_story_step(then.entity, then.point, step);
+            // Preserve victory even if the dialogue is skipped or the player disconnects. The scene is presentation
+            // only; the existing save and countdown happen exactly once here, as they did before the scene existed.
+            self.apply_story_step(then.entity, then.point, step.clone());
+            self.start_victory_scene(then.entity, before, &step, formation, now);
         }
     }
 

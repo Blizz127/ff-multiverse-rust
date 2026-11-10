@@ -1430,7 +1430,13 @@ point moves the story to):
 * **`ff7/nmkin_1/reactor-door`** (the reactor's door, the line to 11): Barret and Cloud, five windows and the door's.
 * **`ff7/nmkin_5/guard-scorpion`** (the core, the point to 27 that starts the boss first): Barret and Cloud, eleven windows,
   and then the battle. For a point that starts a battle first the run's end starts the battle (not the step), and the step
-  is paid when it is won, as before. The lines after the battle are not played.
+  is paid when it is won, as before.
+* **`ff7/nmkin_5/guard-scorpion-victory`**: the two windows after that victory. The client reconstructs Barret's same
+  script up to its first battle 324, without showing the prelude again, and resumes Cloud's waiting script and then
+  Barret's. A different battle, an unanswered choice or a missing boundary refuses the continuation. No script offsets
+  or dialogue text are embedded. The existing story step and ten-minute countdown still happen immediately on victory,
+  once; they do not wait for the two windows. Skipping, timing out or disconnecting cannot undo the win. This presentation
+  starts only from a matching story victory, never on login, field entry, a defeat or an ordinary encounter.
 
 How it works (`World::start_point_scene`, `SceneHost::point_scene`):
 
@@ -1445,7 +1451,7 @@ How it works (`World::start_point_scene`, `SceneHost::point_scene`):
   `the_team_talk_is_the_cutscene_of_md1_1s_story_point_and_writes_its_step`), so a cutscene never shows a story the server
   did not apply.
 * A player alone sees Echo-S's edition when both editions tell the same story (as for the scenes after the escape). Both
-  reactor cutscenes do on the owner's archive: twelve and six windows, every one voiced. "The same story" compares what
+  gate and door cutscenes do on the owner's archive: twelve and six windows, every one voiced. "The same story" compares what
   the editions write, the party changes and the skipped instructions a window could announce
   (`fmv_ff7::script::scene::ANNOUNCED_STATE_OPS`: gil, items, materia, HP and MP amounts, the party's requests, splits and
   joins); a name entry or a display setting one edition has and the other has not does not count (Echo-S's `md1_1` names one

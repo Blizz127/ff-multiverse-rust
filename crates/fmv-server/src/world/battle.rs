@@ -1095,7 +1095,7 @@ impl World {
         // or fled (the story stays where it was, and the point can be reached again).
         if outcome == Outcome::Victory {
             if let Some(then) = battle.then.clone() {
-                self.story_after_battle(then);
+                self.story_after_battle(then, battle.formation, Instant::now());
             }
         }
     }

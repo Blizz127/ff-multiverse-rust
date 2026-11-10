@@ -37,6 +37,7 @@ struct FakeHost {
     entry: Mutex<Option<fmv_adapter_api::Exit>>,
     /// Whether the hall's story step has its cutscene ([`POINT_SCENE`]).
     cutscene: Mutex<bool>,
+    victory: Mutex<bool>,
 }
 
 impl SceneHost for FakeHost {
@@ -48,6 +49,10 @@ impl SceneHost for FakeHost {
     }
     fn point_scene(&self, field: &str, before: &[u8], after: &[u8]) -> Option<String> {
         (*self.cutscene.lock().unwrap() && field == HALL && before.is_empty() && after == STORY_ADVANCED).then(|| POINT_SCENE.to_string())
+    }
+    fn victory_scene(&self, field: &str, before: &[u8], after: &[u8], formation: u16) -> Option<String> {
+        (*self.victory.lock().unwrap() && formation == fmv_fixture::rooms::BATTLE_FORMATION
+            && field == HALL && before.is_empty() && after == STORY_ADVANCED).then(|| POINT_SCENE.to_string())
     }
     fn offered(&self, scene: &str, progress: &[u8]) -> bool {
         scene == SCENE && (progress.is_empty() || progress == MADE_UP)
@@ -917,4 +922,35 @@ fn two_previews_are_two_instances_and_a_party_member_follows_its_leader_into_the
     b.drain();
     w.press(a.entity, Some(trigger_id()), t0);
     assert_eq!(starts(&b.drain()).first().map(|s| s.1), Some(SceneRole::Watcher));
+}
+
+#[test]
+fn victory_scene_cannot_delay_repeat_or_undo_the_saved_battle_step() {
+    use super::super::story::StoryThen;
+    use fmv_fixture::rooms::BATTLE_FORMATION;
+    for skipped in [false, true] {
+        let (mut w, mut saved_rx, host) = cutscene_world();
+        *host.victory.lock().unwrap() = true;
+        let now = Instant::now();
+        let mut a = seat(&mut w, "A", &[], now);
+        a.drain();
+        // The battle-end path has already released the player; only a victory calls this method.
+        let then = StoryThen { entity: a.entity, area: HALL.to_string(), point: 0 };
+        w.story_after_battle(then.clone(), BATTLE_FORMATION, now);
+        let msgs = a.drain();
+        let started = starts(&msgs);
+        let [(run, _, _)] = &started[..] else { panic!("one victory scene: {msgs:?}") };
+        assert!(msgs.iter().any(|m| matches!(m, ServerMsg::SceneStart { progress, .. } if progress.is_empty())),
+            "staged against the story before victory");
+        assert!(w.in_scene(a.entity));
+        assert_eq!(w.players.get(&a.entity).unwrap().progression, STORY_ADVANCED);
+        assert_eq!(saved(&mut saved_rx), [STORY_ADVANCED.to_vec()]);
+        w.story_after_battle(then, BATTLE_FORMATION, now);
+        assert!(starts(&a.drain()).is_empty(), "no repeat once the step is paid");
+        w.scene_message(a.entity, ClientMsg::SceneEnd { run: *run, skipped }, now);
+        assert!(!w.in_scene(a.entity) && !w.in_battle(a.entity));
+        assert!(saved(&mut saved_rx).is_empty());
+        assert!(host.finished.lock().unwrap().is_empty(), "the presentation has no story writes");
+        assert_eq!(w.players.get(&a.entity).unwrap().progression, STORY_ADVANCED);
+    }
 }

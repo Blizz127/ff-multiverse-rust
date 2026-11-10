@@ -1051,7 +1051,7 @@ fn the_proof_scene_writes_only_its_mark_once_and_a_scene_that_moves_the_moment_r
         ],
         speakers: vec![("Cloud".into(), CLOUD), ("Tifa".into(), TIFA)],
         witness: Vec::new(),
-        arrival: fmv_ff7::script::scene::Spot { x: 0, y: 0, triangle: 0, direction: 0 }, presents: None,
+        arrival: fmv_ff7::script::scene::Spot { x: 0, y: 0, triangle: 0, direction: 0 }, presents: None, resume_after_battle: None,
     };
     let out = run_to_end(&f, &leaving, &StoryState::at(81), 1, &[]).unwrap();
     assert_eq!(out.end, End::MapJump { field: 294 }, "the scene ends where the script leaves the field");
@@ -1137,4 +1137,34 @@ fn the_vm_ends_every_script_of_the_game_within_its_budget_and_counts_what_it_doe
     eprintln!("skipped as known to change nothing a scene shows: {} distinct opcodes", ignored.len());
     assert!(fields >= 700 && runs > 20_000, "{fields} fields, {runs} runs");
     assert_eq!(ends.values().sum::<usize>(), runs, "every run ended");
+}
+
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn guard_scorpion_victory_continuation_has_only_the_two_tail_windows_and_saves_nothing() {
+    use fmv_ff7::script::scene::{auto_witnesses, guard_scorpion_victory_scene};
+    let Some(f) = field("nmkin_5") else { return };
+    let def = guard_scorpion_victory_scene();
+    let story = StoryState::at(26);
+    assert!(!def.offered_to(&story));
+    assert!(!def.presents_step("nmkin_5", &story, &StoryState::at(27)));
+    assert!(def.follows_battle_step("nmkin_5", &story, &StoryState::at(27), 324));
+    assert!(!def.follows_battle_step("nmkin_5", &story, &StoryState::at(27), 323));
+    let mut p = ScenePlay::new(&f, &def, &story, 1).unwrap();
+    let mut dialogs = Vec::new();
+    loop {
+        match p.next(None).then {
+            Then::Window(w) => {
+                let MessageOrigin::Canon { dialog, .. } = w.message.origin else { panic!("unexpected added line") };
+                dialogs.push(dialog);
+            },
+            Then::End { how, .. } => { assert_eq!(how, End::Finished); break; },
+        }
+    }
+    assert_eq!(dialogs, [89, 91]);
+    let outcome = run_to_end(&f, &def, &story, 1, &[]).unwrap();
+    assert!(outcome.is_complete(), "{outcome:?}");
+    assert!(outcome.writes.is_story_neutral(), "{outcome:?}");
+    assert_eq!(outcome.questions, 0);
+    assert_eq!(auto_witnesses(&f, &def, &story, 1, 3).len(), 3);
 }

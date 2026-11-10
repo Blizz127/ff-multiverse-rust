@@ -685,7 +685,7 @@ fn demo_def(cast: Vec<CastMember>, root: Vec<Step>) -> SceneDef {
         cast,
         speakers: vec![("Aya".to_string(), 0), ("Bo".to_string(), 1)],
         witness: vec![Spot { x: 50, y: 10, triangle: 0, direction: 64 }],
-        arrival: Spot { x: 50, y: 10, triangle: 0, direction: 64 }, presents: None,
+        arrival: Spot { x: 50, y: 10, triangle: 0, direction: 64 }, presents: None, resume_after_battle: None,
     }
 }
 
@@ -955,4 +955,33 @@ fn a_scene_reads_the_bits_the_story_carries_from_the_story_and_the_rest_from_wha
     assert_eq!(begun.byte(3, 212), 0b110, "the story's own bit joins what the scene was found with");
     assert_eq!(begun.byte(3, 213), 0b1, "a flag the story does not carry is what the scene was found with");
     assert_eq!(begun.byte(3, 214), 0, "and one it knows nothing of is 0");
+}
+
+#[test]
+fn victory_continuation_resumes_the_waiting_parent_after_the_matching_battle() {
+    let bytes = script(vec![
+        ("parent", vec![(1, vec![message(0, 0), reqew(1, 1), message(0, 3)])]),
+        ("child", vec![(1, vec![message(0, 1), vec![0x70, 0, 0x44, 1], message(0, 2)])]),
+    ], texts(4));
+    let field = FieldScript::parse(&bytes).unwrap();
+    let mut vm = vm_for(StoryState::new_game(), &[]);
+    vm.begin(start(0, 1));
+    assert!(vm.seek_after_battle(&field, 324));
+    let beats = vec![vm.resume(&field, None), vm.resume(&field, None), vm.resume(&field, None)];
+    assert_eq!(dialogs_of(&beats), [2, 3]);
+    assert!(matches!(beats[2].then, Then::End { how: End::Finished, .. }));
+    assert_eq!(vm.stats().handled.get("BATTLE"), Some(&1));
+}
+
+#[test]
+fn victory_continuation_refuses_a_wrong_battle_or_a_choice_in_the_prelude() {
+    for first in [message(0, 0), ask(0, 0, 1, 5, 1)] {
+        let bytes = script(vec![("root", vec![(1, vec![first.clone(), vec![0x70, 0, 0x44, 1], message(0, 1)])])], texts(2));
+        let field = FieldScript::parse(&bytes).unwrap();
+        for formation in [323, 324] {
+            let mut vm = vm_for(StoryState::new_game(), &[]);
+            vm.begin(start(0, 1));
+            assert_eq!(vm.seek_after_battle(&field, formation), formation == 324 && first[0] == 0x40);
+        }
+    }
 }

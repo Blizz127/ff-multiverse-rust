@@ -481,6 +481,7 @@ fn clamp_u8(v: i32) -> u8 {
 #[derive(Debug, Clone)]
 pub struct Vm {
     jump: Option<SceneJump>,
+    battle: Option<u16>,
     limits: Limits,
     vars: SceneVars,
     writes: BTreeMap<(u8, u8), u8>,
@@ -518,6 +519,7 @@ impl Vm {
     pub fn new(vars: SceneVars, seed: u32, limits: Limits) -> Self {
         Self {
             jump: None,
+            battle: None,
             limits,
             vars,
             writes: BTreeMap::new(),
@@ -1194,7 +1196,10 @@ impl Vm {
                 self.jump = jump;
                 Flow::Scene(End::MapJump { field: jump.map_or(0, |j| j.field) })
             },
-            0x70 => Flow::Scene(End::Battle),
+            0x70 => {
+                self.battle = ins.literal("battle").and_then(|n| u16::try_from(n).ok());
+                Flow::Scene(End::Battle)
+            },
             0xFF => Flow::Scene(End::GameOver),
             0x74 => {
                 // GETPC: the character in a party slot (0xFF for none).
@@ -1457,6 +1462,7 @@ impl Vm {
     /// Start the scene: the root thread, which takes the steps the field's own trigger takes.
     pub fn begin(&mut self, root: Vec<Step>) {
         self.jump = None;
+        self.battle = None;
         self.quiet = false;
         self.threads.clear();
         self.slots.clear();
@@ -1476,6 +1482,24 @@ impl Vm {
         self.clock = 0;
         self.out.clear();
         self.done = None;
+    }
+
+    /// Reconstruct a presentation-only continuation. Never guess an answer, skip another kind of termination,
+    /// or pass a different formation. Existing budgets cover both the prelude and the tail.
+    pub(super) fn seek_after_battle(&mut self, script: &FieldScript<'_>, formation: u16) -> bool {
+        loop {
+            match self.resume(script, None).then {
+                Then::Window(w) if w.message.choice.is_none() => {},
+                Then::End { how: End::Battle, .. } if self.battle == Some(formation) => {
+                    self.done = None;
+                    self.battle = None;
+                    self.origin = self.clock;
+                    self.out.clear();
+                    return true;
+                },
+                _ => return false,
+            }
+        }
     }
 
     /// Run the stage scripts quietly (no window opens, nothing is handed out): when it returns, [`Vm::places`] and the

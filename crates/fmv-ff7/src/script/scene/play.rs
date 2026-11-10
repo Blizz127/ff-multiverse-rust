@@ -34,6 +34,8 @@ pub enum SceneError {
     NoSuchEntity,
     #[error("the replacement script does not have unique matching scene entities")]
     UnmatchedEntities,
+    #[error("the scene cannot reconstruct its expected battle boundary")]
+    BattleBoundary,
 }
 
 /// What a scene's script wrote that the story can carry.
@@ -284,6 +286,11 @@ impl ScenePlay {
             }
         }
         vm.begin(def.root.clone());
+        if let Some(formation) = def.resume_after_battle {
+            if !vm.seek_after_battle(script, formation) {
+                return Err(SceneError::BattleBoundary);
+            }
+        }
         let ground = Ground::new(mesh);
         let cast: BTreeSet<u8> = def.cast.iter().map(|m| m.entity).collect();
         let initial = Self::initial_stage(&vm, &ground, &def.cast);
