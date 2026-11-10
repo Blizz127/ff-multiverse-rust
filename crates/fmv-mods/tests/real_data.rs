@@ -365,3 +365,36 @@ fn reactor_opening_echo_s_changes_entry_moment_and_has_unsafe_tail() {
     assert_eq!(vm.writes().get(&(1, 4)), Some(&30));
     assert!(vm.vars().unknown_persistent_reads().contains(&(1, 4)));
 }
+
+#[test]
+#[ignore = "needs the owner's Echo-S archive (FMV_ECHO_S_IRO); prologue is not enabled"]
+fn echo_prologue_survey_reports_untracked_state_and_transition() {
+    use fmv_ff7::script::dialogue::{End, MessageOrigin};
+    use fmv_ff7::script::scene::{Limits, SceneVars, Step, Then, Vm};
+    use fmv_ff7::story::StoryState;
+    let m = mods().expect("FMV_ECHO_S_IRO");
+    let bytes = m.script_section("blackbgh").expect("Echo-S blackbgh section");
+    let script = FieldScript::parse(&bytes).unwrap();
+    let mut vm = Vm::new(SceneVars::new(StoryState::at(0), &[]), 1, Limits::default());
+    vm.begin(vec![Step::StartMain(0)]);
+    let mut dialogs = Vec::new();
+    let end = loop {
+        match vm.resume(&script, None).then {
+            Then::Window(w) => {
+                if let MessageOrigin::Canon { dialog, .. } = w.message.origin {
+                    dialogs.push((w.id, dialog, m.voice_path("blackbgh", w.id, dialog, 0).is_some()));
+                }
+            }
+            Then::End { how, .. } => break how,
+        }
+        assert!(dialogs.len() <= 16);
+    };
+    assert_eq!(end, End::MapJump { field: 116 });
+    assert_eq!(dialogs, [(0, 1, false), (0, 2, false), (0, 3, false), (0, 4, false)]);
+    assert_eq!(vm.writes().get(&(2, 0)), Some(&1));
+    assert_eq!(vm.writes().get(&(1, 10)), Some(&1));
+    assert!(vm.vars().unknown_persistent_reads().contains(&(1, 10)));
+    assert!(vm.stats().ignored.contains_key("MENU"));
+    assert!(vm.stats().ignored.contains_key("SPECIAL"));
+    assert!(vm.stats().unknown.is_empty());
+}

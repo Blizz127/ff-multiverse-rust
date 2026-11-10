@@ -25,3 +25,9 @@ bounded scene boundary, movie and sound presentation, correct battle/party handl
 per-player initialization design and a way to distinguish new from existing player progress.
 The owner-only live-data decision already requested for story persistence remains applicable;
 no reset or automatic migration is implied.
+
+A separate raw-VM run of Echo-S `blackbgh` at moment 0 reached the jump to `md1stin`
+after four windows and wrote moment 1 plus `Var[1][10]` bit 0. None of those windows'
+first-page voice lookups matched a file in the sampled archive. The run skips `MENU` and
+`SPECIAL` and reads the untracked flag before changing it; it is not safe live progression.
+These observations are captured in an opt-in owned-data test, not a rendered or audible scene.
