@@ -278,7 +278,7 @@ pub(crate) fn info(op: u8) -> Option<OpInfo> {
         0xA8 => op!("MOVE", [Banks(1), Bs16("x", 0), Bs16("y", 1)]),
         0xA9 => op!("CMOVE", [Banks(1), Bs16("x", 0), Bs16("y", 1)]),
         0xAA => op!("MOVA", [U8("entity")]),
-        0xAB => op!("TURA", [U8("entity"), U8("direction"), U8("speed")]),
+        0xAB => op!("TURA", [U8("entity"), U8("speed"), U8("direction")]),
         0xAC => op!("ANIMW", []),
         0xAD => op!("FMOVE", [Banks(1), Bs16("x", 0), Bs16("y", 1)]),
         0xAE => op!("ANIME2", [U8("animation"), U8("speed")]),

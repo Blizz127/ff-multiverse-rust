@@ -967,16 +967,18 @@ impl Vm {
     }
 
     /// Turn `entity` towards `target` (`DIRA`, `TURA`): where the scene knows them both.
-    fn face_entity(&mut self, idx: usize, entity: u8, target: u8, frames: u32) {
+    /// Return whether a turn was emitted, so an unresolved/coincident target adds no wait.
+    fn face_entity(&mut self, idx: usize, entity: u8, target: u8, frames: u32) -> bool {
         let (Some(a), Some(b)) = (self.places.get(&entity).copied(), self.places.get(&target).copied()) else {
             self.stats.unresolved = self.stats.unresolved.saturating_add(1);
-            return;
+            return false;
         };
         let (dx, dy) = (f32::from(b.x) - f32::from(a.x), f32::from(b.y) - f32::from(a.y));
         if dx == 0.0 && dy == 0.0 {
-            return;
+            return false;
         }
         self.do_face(idx, entity, dy.atan2(dx), frames);
+        true
     }
 
     fn anim_frames(&self, entity: u8, first: Option<u8>, last: Option<u8>) -> u32 {
@@ -1399,7 +1401,15 @@ impl Vm {
             }
             0xAB => {
                 if let Some(target) = ins.literal("entity").map(clamp_u8) {
-                    self.face_entity(idx, me, target, TURN_FRAMES);
+                    let steps = match (ins.literal("speed"), ins.literal("direction")) {
+                        (Some(steps @ 1..=255), Some(0..=2)) => Some(steps as u32),
+                        _ => None,
+                    };
+                    if self.face_entity(idx, me, target, steps.unwrap_or(TURN_FRAMES)) && steps.is_some() {
+                        // TURA uses the same PSX turn update/completion ordering as TURNGEN.
+                        // Only the timing is supported here; rendering still approximates its path/curve.
+                        self.add_time(idx, 1);
+                    }
                 }
                 Flow::Yield
             }

@@ -510,6 +510,66 @@ fn reqew_waits_for_the_turngen_childs_completion_tick() {
 }
 
 #[test]
+fn tura_uses_authored_steps_before_observing_completion() {
+    for steps in [1u8, 10, 255] {
+        for path in [0u8, 1, 2] {
+            let section = script(vec![
+                ("actor", vec![(1, vec![xyzi(0, 0, 0, 0), vec![0xAB, 1, steps, path], message(0, 0)])]),
+                ("target", vec![(1, vec![xyzi(100, 100, 0, 0)])]),
+            ], texts(1));
+            let (beats, vm) = run_root(&section, vec![Step::Await(ScriptRef::new(1, 1)), Step::Start(ScriptRef::new(0, 1))], &[]);
+            let faces: Vec<_> = stage(&beats).into_iter().filter(|(_, event)| matches!(event, Stage::Face { .. })).collect();
+            assert_eq!(faces, [(0, Stage::Face { entity: 0, heading: std::f32::consts::FRAC_PI_4, frames: u32::from(steps) })]);
+            assert_eq!(windows(&beats)[0].at, u32::from(steps) + 1, "steps={steps}, path={path}");
+            assert_eq!(vm.stats().unresolved, 0);
+            assert_eq!(end_of(&beats), End::Finished);
+            assert!(vm.writes().is_empty());
+        }
+    }
+}
+
+#[test]
+fn reqew_joins_tura_before_the_following_wait() {
+    let section = script(vec![
+        ("director", vec![(1, vec![xyzi(100, 0, 0, 0), reqew(1, 1), wait(4), message(0, 0)])]),
+        ("actor", vec![(1, vec![xyzi(0, 0, 0, 0), vec![0xAB, 0, 10, 2]])]),
+    ], texts(1));
+    let (beats, vm) = run_root(&section, start(0, 1), &[]);
+    let faces: Vec<_> = stage(&beats).into_iter().filter(|(_, event)| matches!(event, Stage::Face { .. })).collect();
+    assert_eq!(faces, [(0, Stage::Face { entity: 1, heading: 0.0, frames: 10 })]);
+    assert_eq!(windows(&beats)[0].at, 15, "eleven ticks for TURA completion, followed by WAIT4");
+    assert_eq!(end_of(&beats), End::Finished);
+    assert!(vm.writes().is_empty());
+}
+
+#[test]
+fn tura_fallbacks_missing_targets_and_immediate_dira_keep_their_timing() {
+    let cases = [
+        (vec![0xAB, 1, 0, 2], Some((100, 0)), Some(8), 0),
+        (vec![0xAB, 1, 10, 3], Some((100, 0)), Some(8), 0),
+        (vec![0xAB, 1, 10, 255], Some((100, 0)), Some(8), 0),
+        (vec![0xAB, 1, 10, 2], None, None, 1),
+        (vec![0xAB, 1, 10, 2], Some((0, 0)), None, 0),
+        (dira(1), Some((100, 0)), Some(0), 0),
+    ];
+    for (instruction, target, duration, unresolved) in cases {
+        let target_code = target.map(|(x, y)| vec![xyzi(x, y, 0, 0)]).unwrap_or_default();
+        let section = script(vec![
+            ("actor", vec![(1, vec![xyzi(0, 0, 0, 0), instruction.clone(), message(0, 0)])]),
+            ("target", vec![(1, target_code)]),
+        ], texts(1));
+        let (beats, vm) = run_root(&section, vec![Step::Await(ScriptRef::new(1, 1)), Step::Start(ScriptRef::new(0, 1))], &[]);
+        let faces: Vec<_> = stage(&beats).into_iter().filter(|(_, event)| matches!(event, Stage::Face { .. })).collect();
+        let expected: Vec<_> = duration.into_iter().map(|frames| (0, Stage::Face { entity: 0, heading: 0.0, frames })).collect();
+        assert_eq!(faces, expected, "{instruction:?}, target={target:?}");
+        assert_eq!(windows(&beats)[0].at, duration.unwrap_or(0), "no extra completion tick for fallback/skipped turns");
+        assert_eq!(vm.stats().unresolved, unresolved);
+        assert_eq!(end_of(&beats), End::Finished);
+        assert!(vm.writes().is_empty());
+    }
+}
+
+#[test]
 fn unsupported_turngen_operands_and_other_turns_keep_the_existing_timing() {
     for instruction in [
         vec![0xB4, 0, 64, 2, 0, 2], // Zero steps.
@@ -517,7 +577,7 @@ fn unsupported_turngen_operands_and_other_turns_keep_the_existing_timing() {
         vec![0xB4, 0, 64, 2, 10, 3],
         vec![0xB4, 0, 64, 3, 10, 2], // Unsupported path.
         vec![0xB5, 0, 64, 2, 10, 2], // TURN remains outside this timing slice.
-        vec![0xAB, 1, 2, 10], // TURA remains outside this timing slice.
+        vec![0xAB, 1, 2, 10], // TURA's path 10 remains unsupported (steps are byte 2).
     ] {
         let section = script(vec![
             ("actor", vec![(1, vec![xyzi(0, 0, 0, 0), instruction.clone(), message(0, 0)])]),

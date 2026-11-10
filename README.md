@@ -1636,7 +1636,12 @@ intervals and an eleven-tick wait, followed by `WAIT1` and a ten-frame Hold befo
 This split follows the [PSX field loop](https://github.com/Akari1982/q-gears_reverse/blob/e0fabf7e121818e5abe2f873e34a07d0eb32742d/ffvii/DISC/FIELD/FIELD.BIN_main.cpp)
 and [turn update](https://github.com/Akari1982/q-gears_reverse/blob/e0fabf7e121818e5abe2f873e34a07d0eb32742d/ffvii/DISC/FIELD/FIELD.BIN_entity.cpp),
 not a measured PC run. Turn presentation still uses a linear shortest arc; forced paths and smooth curves remain approximate.
-Zero steps, unsupported selectors/types, `TURN` and `TURA` keep the existing eight-frame fallback.
+`TURA` (turn toward another actor) reads its step count before its path selector and uses the same completion tick
+for positive steps and paths 0–2 when both actor positions are known and distinct. In Jessie's rescue scene, her
+ten-step turn toward Cloud waits eleven ticks, then `WAIT4` places dialog 68 fifteen frames after the turn starts.
+This follows the [TURA dispatch and helper](https://github.com/Akari1982/q-gears_reverse/blob/e0fabf7e121818e5abe2f873e34a07d0eb32742d/ffvii/DISC/FIELD/FIELD.BIN_event_code_entity.cpp).
+Missing or coincident positions keep their previous skipped-turn behavior; `DIRA` remains immediate.
+Zero steps, unsupported selectors/types and `TURN` keep the existing eight-frame fallback.
 No game bytes, protocol or saved state are added. Movement selection follows the
 [Q-Gears MOVE reconstruction](https://github.com/Akari1982/q-gears_reverse/blob/e0fabf7e121818e5abe2f873e34a07d0eb32742d/ffvii/DISC/FIELD/FIELD.BIN_event_code_entity.cpp#L444-L477).
 The normal-rate default-loop interpretation follows the [Q-Gears DFANM reconstruction](https://github.com/Akari1982/q-gears_reverse/blob/e0fabf7e121818e5abe2f873e34a07d0eb32742d/ffvii/DISC/FIELD/FIELD.BIN_event_code_entity.cpp#L72-L95);

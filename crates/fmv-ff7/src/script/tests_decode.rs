@@ -49,6 +49,29 @@ fn decodes_field_object_instructions() {
 }
 
 #[test]
+fn tura_reads_steps_before_path_and_preserves_instruction_boundaries() {
+    let code = [
+        0xAB, 3, 10, 2, // Target at +1, steps at +2, path at +3.
+        0xB4, 0, 28, 2, 10, 2,
+        0xB5, 0, 64, 1, 9, 1, // B5 is six bytes; its target interpretation is outside this correction.
+        0x00,
+    ];
+    let decoded = disassemble_slice(&code, 0);
+    assert!(decoded.is_complete());
+    let instructions = &decoded.instructions;
+    assert_eq!(instructions.iter().map(|i| (i.offset, i.len, i.opcode)).collect::<Vec<_>>(),
+        [(0, 4, 0xAB), (4, 6, 0xB4), (10, 6, 0xB5), (16, 1, 0x00)]);
+    let tura = &instructions[0];
+    assert_eq!((tura.mnemonic, tura.literal("entity"), tura.literal("speed"), tura.literal("direction")),
+        ("TURA", Some(3), Some(10), Some(2)));
+    assert!(tura.operands.iter().all(|operand| operand.bank == 0));
+    let turngen = &instructions[1];
+    assert_eq!((turngen.literal("direction"), turngen.literal("turns"), turngen.literal("speed"), turngen.literal("unknown")),
+        (Some(28), Some(2), Some(10), Some(2)));
+    assert!(!turngen.stray_banks);
+}
+
+#[test]
 fn bank_nibbles_turn_operands_into_variables() {
     // XYZI with x in bank 1 and the triangle in bank 3: the stored numbers are variable addresses
     let mut bytes = xyzi(5, 6, 7, 9);

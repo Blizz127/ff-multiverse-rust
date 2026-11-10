@@ -1414,6 +1414,15 @@ fn jessie_rescue_plays_three_windows_and_matches_the_existing_saved_step() {
     let f = field("nmkin_3").expect("FMV_FF7_DATA and nmkin_3");
     let def = jessie_rescue_scene();
     assert_eq!(scene(JESSIE_RESCUE_SCENE_ID).as_ref(), Some(&def));
+    let script = FieldScript::from_field(&f).unwrap();
+    let rescue_script = script.disassemble(4, 1).unwrap();
+    let turn_index = rescue_script.iter().position(|ins| ins.offset == 0x07AE).expect("Jessie's original rescue turn");
+    let turn = &rescue_script[turn_index];
+    assert_eq!((turn.opcode, turn.literal("entity"), turn.literal("speed"), turn.literal("direction")),
+        (0xAB, Some(3), Some(10), Some(2)), "TURA preserves Cloud as its target, ten interpolation steps and direction mode two");
+    let wait = &rescue_script[turn_index + 1];
+    assert_eq!((wait.offset, wait.opcode, wait.literal("frames")), (0x07B2, 0x24, Some(4)));
+    assert_eq!(turn.end(), wait.offset, "WAIT4 immediately follows the turn");
     let provenance = EditionProvenance { game: GameId::Ff7, platform: Platform::Pc, edition: "steam".into(), region: "any".into(), language: "en".into(), revision: "test".into(), sources: vec![], modded: false };
     let adapter = fmv_ff7::Ff7Adapter::from_flevel_path(flevel_path(&data_dir().unwrap()), provenance).unwrap();
     let area = adapter.load_field("nmkin_3").unwrap();
@@ -1440,16 +1449,32 @@ fn jessie_rescue_plays_three_windows_and_matches_the_existing_saved_step() {
     assert_eq!(interpreted, after, "only the existing point's writes");
     let mut play = ScenePlay::new(&f, &def, &before, 1).unwrap();
     let mut lines = Vec::new();
+    let mut origin = 0u32;
+    let mut jessie_turns = Vec::new();
+    let mut final_dialog_at = None;
     loop {
-        match play.next(None).then {
+        let beat = play.next(None);
+        for event in &beat.stage {
+            if let Stage::Face { entity: 4, frames, .. } = event.what {
+                if frames > 0 {
+                    jessie_turns.push((origin.checked_add(event.at).expect("rescue event time fits"), frames));
+                }
+            }
+        }
+        match beat.then {
             Then::Window(w) => {
+                origin = origin.checked_add(w.at).expect("rescue window time fits");
                 let MessageOrigin::Canon { dialog, .. } = w.message.origin else { panic!("unexpected added line") };
+                if w.opener == 4 && dialog == 68 { final_dialog_at = Some(origin); }
                 lines.push((w.opener, dialog));
             },
             Then::End { how, .. } => { assert_eq!(how, End::Finished); break; },
         }
     }
     assert_eq!(lines, [(3, 66), (4, 67), (4, 68)]);
+    let [(turn_at, frames)] = jessie_turns.as_slice() else { panic!("one timed Jessie turn in the rescue: {jessie_turns:?}") };
+    assert_eq!(*frames, 10, "TURA stages the original interpolation count");
+    assert_eq!(final_dialog_at.unwrap().checked_sub(*turn_at), Some(15), "TURA waits eleven frames, then WAIT4 precedes dialog 68");
     assert_eq!(play.off_cast(), 0);
     let spots = auto_witnesses(&f, &def, &before, 1, 3);
     assert!(!spots.is_empty(), "owner has a witness spot");
