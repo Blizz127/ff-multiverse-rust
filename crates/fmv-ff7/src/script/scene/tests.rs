@@ -396,6 +396,64 @@ fn places_walks_turns_and_visibility_come_out_as_stage_events_with_where_things_
 }
 
 #[test]
+fn ordinary_move_selects_its_clip_from_source_speed_and_field_scale() {
+    for (scale, speed, distance, animation, frames) in [
+        (512u16, None, 100i16, 1, 50),
+        (256, None, 100, 2, 50), // Same default MSPED/duration; a different field scale.
+        (512, Some(1536u16), 99, 1, 33),
+        (512, Some(1537), 99, 2, 33), // Exact threshold, despite equal rounded durations.
+        (0, Some(0), 0, 1, 1),
+        (0, Some(1), 0, 2, 1), // Use source speed, not the movement calculator's minimum of 128.
+        (u16::MAX, Some(u16::MAX), 100, 1, 1), // Three times scale must not overflow a word.
+        (512, Some(3840), 30000, 2, 900),
+        (512, Some(128), 30000, 1, 900), // Duration clamping cannot select the clip.
+        (512, Some(3840), 0, 2, 1),
+    ] {
+        let mut code = vec![xyzi(0, 0, 17, 2)];
+        if let Some(speed) = speed {
+            code.push(cat(&[vec![0xB2, 0], speed.to_le_bytes().to_vec()]));
+        }
+        code.extend([mov(distance, 0), message(0, 0), vec![RET]]);
+        let section = SynthScript { scale, dialogs: texts(1), ..Default::default() }.entity("a", vec![(1, cat(&code))]).build();
+        let (beats, vm) = run_root(&section, start(0, 1), &[]);
+        let moves: Vec<_> = stage(&beats).into_iter().filter(|(_, event)| matches!(event, Stage::Move { .. })).collect();
+        assert_eq!(moves, [(0, Stage::Move { entity: 0, from: Some((0, 0)), x: distance, y: 0, z: None, triangle: None,
+            frames, how: MoveHow::Walk, animation: Some(animation) })], "scale={scale}, MSPED={speed:?}");
+        assert_eq!(windows(&beats)[0].at, frames);
+        assert_eq!(end_of(&beats), End::Finished);
+        assert!(vm.writes().is_empty());
+    }
+}
+
+#[test]
+fn only_ordinary_move_selects_a_walk_or_run_slot() {
+    let a = vec![
+        xyzi(0, 0, 0, 0), cat(&[vec![0xB2, 0], 3840u16.to_le_bytes().to_vec()]), mov(10, 0),
+        cat(&[vec![0xA9, 0], words(&[20, 0])]), // CMOVE
+        cat(&[vec![0xAD, 0], words(&[30, 0])]), // FMOVE
+        vec![0xAA, 1], // MOVA
+        cat(&[vec![0xC0, 0, 0], words(&[50, 0, 0, 20])]), // JUMP
+        cat(&[vec![0xC2, 0, 0], words(&[60, 0, 40, 0]), vec![0, 1, 0, 1]]), // LADER
+        cat(&[vec![0xB2, 0], 1024u16.to_le_bytes().to_vec()]), mov(70, 0), message(0, 0), vec![RET],
+    ];
+    let section = SynthScript { scale: 512, dialogs: texts(1), ..Default::default() }
+        .entity("a", vec![(1, cat(&a))])
+        .entity("target", vec![(1, cat(&[xyzi(40, 0, 0, 0), vec![RET]]))]).build();
+    let (beats, vm) = run_root(&section, vec![Step::Await(ScriptRef::new(1, 1)), Step::Start(ScriptRef::new(0, 1))], &[]);
+    let moves: Vec<_> = stage(&beats).into_iter().filter_map(|(at, event)| match event {
+        Stage::Move { x, how, animation, .. } => Some((at, x, how, animation)), _ => None,
+    }).collect();
+    assert_eq!(moves, [
+        (0, 10, MoveHow::Walk, Some(2)), (2, 20, MoveHow::Walk, None), (4, 30, MoveHow::Walk, None),
+        (6, 40, MoveHow::Walk, None), (8, 50, MoveHow::Jump, None), (38, 60, MoveHow::Ladder, None),
+        (53, 70, MoveHow::Walk, Some(1)),
+    ]);
+    assert_eq!(windows(&beats)[0].at, 58, "clip metadata leaves the existing movement clock unchanged");
+    assert_eq!(end_of(&beats), End::Finished);
+    assert!(vm.writes().is_empty());
+}
+
+#[test]
 fn a_script_turns_towards_another_entity_it_knows_the_place_of() {
     let a = vec![xyzi(0, 0, 0, 0), dira(1), message(0, 0)];
     let b = vec![xyzi(0, 100, 0, 0)];

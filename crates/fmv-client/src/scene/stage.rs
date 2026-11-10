@@ -7,7 +7,8 @@
 //!
 //! * `Place` puts an actor somewhere at once, and cancels a walk it was on.
 //! * `Move` walks it there over the number of frames the event says (a straight line from where it stood, heading
-//!   toward the target the whole way). A second move of the same actor first finishes the first.
+//!   toward the target the whole way). A second move of the same actor first finishes the first. A resolved ordinary-MOVE
+//!   clip follows only that move's elapsed time, and yields to the standing default when it arrives.
 //! * `Face` turns it (the short way round), at once or over the frames it says.
 //! * `Show` hides or shows it.
 //! * The player resolves supported `Anim` loops and single-frame Holds against the actor's exact field model.
@@ -112,11 +113,12 @@ pub struct Actor {
     /// Scene frames actually spent walking, retained across consecutive movement segments.
     walked_frames: f32,
     animation: Option<SceneAnimation>,
+    movement_animation: Option<SceneAnimation>,
 }
 
 impl Actor {
     fn new(entity: u8) -> Self {
-        Self { entity, pos: None, triangle: None, heading: 0.0, visible: true, walk: None, turn: None, walked_frames: 0.0, animation: None }
+        Self { entity, pos: None, triangle: None, heading: 0.0, visible: true, walk: None, turn: None, walked_frames: 0.0, animation: None, movement_animation: None }
     }
 
     /// The script entity this actor plays.
@@ -148,7 +150,10 @@ impl Actor {
     pub fn walked_frames(&self) -> f32 { self.walked_frames }
 
     pub fn animation(&self) -> Option<(&str, ClipFrame)> {
-        if self.walk.is_some() { return None; }
+        if let Some(walk) = self.walk {
+            return (walk.how == MoveHow::Walk).then_some(self.movement_animation.as_ref()).flatten()
+                .map(|a| (a.clip.as_str(), a.frame));
+        }
         self.animation.as_ref().map(|a| (a.clip.as_str(), a.frame))
     }
 
@@ -176,7 +181,11 @@ impl Actor {
     fn advance_walk(&mut self, frames: f32) {
         if let Some(walk) = &mut self.walk {
             if walk.how == MoveHow::Walk {
-                self.walked_frames += frames.min((walk.frames - walk.elapsed).max(0.0));
+                let spent = frames.min((walk.frames - walk.elapsed).max(0.0));
+                self.walked_frames += spent;
+                if let Some(SceneAnimation { frame: ClipFrame::Loop(frame), .. }) = &mut self.movement_animation {
+                    *frame += spent;
+                }
             }
             walk.elapsed += frames;
             let t = progress(walk.elapsed, walk.frames);
@@ -184,6 +193,7 @@ impl Actor {
             self.pos = Some(at);
             if t >= 1.0 {
                 self.walk = None;
+                self.movement_animation = None;
             }
         }
     }
@@ -278,9 +288,19 @@ impl Cast {
         actor.animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::Loop(frame) });
     }
 
+    /// Use the resolved ordinary MOVE clip only during this movement. Its initial phase includes
+    /// any elapsed part of the event; each new MOVE starts its own presentation clock.
+    pub fn apply_move_animation(&mut self, entity: u8, clip: &str) {
+        let Some(actor) = self.actors.get_mut(&entity) else { return };
+        if let Some(walk) = actor.walk.filter(|walk| walk.how == MoveHow::Walk) {
+            actor.movement_animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::Loop(walk.elapsed) });
+        }
+    }
+
     /// Hold one exact authored frame. The avatar pipeline validates its bounds in the loaded clip.
     pub fn apply_hold(&mut self, entity: u8, clip: &str, frame: u8) {
         let Some(actor) = self.actors.get_mut(&entity) else { return self.off_cast() };
+        actor.movement_animation = None;
         actor.animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::Hold(frame) });
     }
 
@@ -302,12 +322,14 @@ impl Cast {
             Stage::Place { entity, x, y, z, triangle } => {
                 let Some(actor) = self.actors.get_mut(entity) else { return self.off_cast() };
                 actor.walk = None;
+                actor.movement_animation = None;
                 let z = z.map(f32::from).or_else(|| height(*x, *y, *triangle)).or_else(|| actor.pos.map(|p| p[2])).unwrap_or(0.0);
                 actor.pos = Some([f32::from(*x), f32::from(*y), z]);
                 actor.triangle = *triangle;
             }
-            Stage::Move { entity, from, x, y, z, triangle, frames, how } => {
+            Stage::Move { entity, from, x, y, z, triangle, frames, how, .. } => {
                 let Some(actor) = self.actors.get_mut(entity) else { return self.off_cast() };
+                actor.movement_animation = None;
                 // DFANM is a standing default, not the actor's walk/jump/ladder animation.
                 // Restart it when movement ends; any unused part of a tick advances the idle.
                 match &mut actor.animation {
@@ -357,6 +379,7 @@ impl Cast {
             Stage::Anim { entity, .. } => {
                 if let Some(actor) = self.actors.get_mut(entity) {
                     actor.animation = None;
+                    actor.movement_animation = None;
                     self.counts.anims_skipped = self.counts.anims_skipped.saturating_add(1);
                 } else {
                     self.off_cast();
@@ -366,7 +389,9 @@ impl Cast {
                 let Some(actor) = self.actors.get_mut(entity) else { return self.off_cast() };
                 // Dynamic speed changes are outside the supported normal-speed loop subset.
                 // A fresh DFANM can establish another supported loop explicitly.
-                if actor.animation.take().is_some() {
+                let standing = actor.animation.take().is_some();
+                let moving = actor.movement_animation.take().is_some();
+                if standing || moving {
                     self.counts.anims_skipped = self.counts.anims_skipped.saturating_add(1);
                 }
             }
@@ -392,7 +417,7 @@ mod tests {
     }
 
     fn walk(entity: u8, x: i16, y: i16, frames: u32) -> Stage {
-        Stage::Move { entity, from: None, x, y, z: None, triangle: None, frames, how: MoveHow::Walk }
+        Stage::Move { entity, from: None, x, y, z: None, triangle: None, frames, how: MoveHow::Walk, animation: None }
     }
 
     #[test]
@@ -403,7 +428,7 @@ mod tests {
             cast.apply_loop(1, "idle", 0.0);
             cast.advance(7.0);
             assert_eq!(cast.actor(1).unwrap().animation(), Some(("idle", ClipFrame::Loop(7.0))));
-            cast.apply(&Stage::Move { entity: 1, from: None, x: 100, y: 0, z: None, triangle: None, frames: 10, how }, 0.0, &flat);
+            cast.apply(&Stage::Move { entity: 1, from: None, x: 100, y: 0, z: None, triangle: None, frames: 10, how, animation: None }, 0.0, &flat);
             assert_eq!(cast.actor(1).unwrap().animation(), None);
             cast.advance(4.0);
             assert_eq!(cast.actor(1).unwrap().animation(), None, "standing default must not replace a moving pose");
@@ -454,7 +479,7 @@ mod tests {
         cast.apply(&walk(1, 40, 0, 100), 0.0, &flat);
         cast.advance(10.0);
         // The script's next walk was planned from where the first one ends.
-        cast.apply(&Stage::Move { entity: 1, from: Some((40, 0)), x: 40, y: 60, z: None, triangle: None, frames: 20, how: MoveHow::Walk }, 0.0, &flat);
+        cast.apply(&Stage::Move { entity: 1, from: Some((40, 0)), x: 40, y: 60, z: None, triangle: None, frames: 20, how: MoveHow::Walk, animation: None }, 0.0, &flat);
         assert_eq!(cast.actor(1).unwrap().pos(), Some([40.0, 0.0, 7.0]));
         cast.advance(10.0);
         assert_eq!(cast.actor(1).unwrap().pos(), Some([40.0, 30.0, 7.0]));
@@ -474,7 +499,7 @@ mod tests {
         cast.advance(10.0);
         let heading = cast.actor(1).unwrap().heading();
         // A jump does not replace the turn. Catching up that jump must not tick the turn again.
-        let jump = Stage::Move { entity: 1, from: None, x: 120, y: 0, z: None, triangle: None, frames: 20, how: MoveHow::Jump };
+        let jump = Stage::Move { entity: 1, from: None, x: 120, y: 0, z: None, triangle: None, frames: 20, how: MoveHow::Jump, animation: None };
         cast.apply(&jump, 5.0, &flat);
         let a = cast.actor(1).unwrap();
         assert_eq!(a.pos(), Some([105.0, 0.0, 7.0]));
@@ -510,7 +535,7 @@ mod tests {
         cast.advance(50.0);
         assert_eq!(cast.actor(1).unwrap().pos(), Some([-5.0, -5.0, 7.0]), "the walk was cancelled");
         // A jump and a ladder are not walks: the model does not walk for them.
-        cast.apply(&Stage::Move { entity: 1, from: None, x: 0, y: 0, z: Some(50), triangle: None, frames: 30, how: MoveHow::Ladder }, 0.0, &flat);
+        cast.apply(&Stage::Move { entity: 1, from: None, x: 0, y: 0, z: Some(50), triangle: None, frames: 30, how: MoveHow::Ladder, animation: None }, 0.0, &flat);
         assert!(!cast.actor(1).unwrap().moving());
     }
 
@@ -519,7 +544,7 @@ mod tests {
         let mut cast = Cast::new([1]);
         cast.apply(&Stage::Place { entity: 1, x: 0, y: 0, z: Some(0), triangle: Some(0) }, 0.0, &flat);
         let target = |_, _, triangle| match triangle { Some(1) => Some(100.0), _ => Some(0.0) };
-        let mut jump = Stage::Move { entity: 1, from: Some((0, 0)), x: 40, y: 20, z: None, triangle: Some(1), frames: 30, how: MoveHow::Jump };
+        let mut jump = Stage::Move { entity: 1, from: Some((0, 0)), x: 40, y: 20, z: None, triangle: Some(1), frames: 30, how: MoveHow::Jump, animation: None };
         cast.apply(&jump, 0.0, &target);
         cast.advance(15.0);
         assert_eq!(cast.actor(1).unwrap().pos(), Some([20.0, 10.0, 50.0]));

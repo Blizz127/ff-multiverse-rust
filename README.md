@@ -1604,8 +1604,15 @@ restart after arrival, and freeze with dialogue. A normal-speed Hold with equal 
 `md8_4` post-escape pose holds frame 0 of `apfc`. The requested frame must exist in the loaded clip; an invalid frame falls back
 without wrapping. A held pose remains fixed until another animation, speed change or movement replaces it. Once, multi-frame
 Hold, cropped loops, other rates and later ASPED changes clear the override until a supported animation arrives.
-No game bytes, protocol or saved state are added. The normal-rate interpretation
-follows the [Q-Gears DFANM reconstruction](https://github.com/Akari1982/q-gears_reverse/blob/e0fabf7e121818e5abe2f873e34a07d0eb32742d/ffvii/DISC/FIELD/FIELD.BIN_event_code_entity.cpp#L72-L95);
+Ordinary `MOVE` also resolves the same model's walk/run slot from the script's movement speed and field scale:
+slot 1 through three times the scale, slot 2 above it. Wedge's reactor approach uses slot 2 (`aaga`, 15 frames),
+then returns to his standing loop. The movement clip advances one frame per scene tick and freezes with dialogue;
+missing or incompatible clips keep the usual walking pose. Other movement opcodes retain their existing clips.
+Each movement starts its presentation phase at zero; original phase/rate retention across repeated same-slot moves
+is not reproduced. A later unsupported animation or speed change clears the movement override.
+No game bytes, protocol or saved state are added. Movement selection follows the
+[Q-Gears MOVE reconstruction](https://github.com/Akari1982/q-gears_reverse/blob/e0fabf7e121818e5abe2f873e34a07d0eb32742d/ffvii/DISC/FIELD/FIELD.BIN_event_code_entity.cpp#L444-L477).
+The normal-rate default-loop interpretation follows the [Q-Gears DFANM reconstruction](https://github.com/Akari1982/q-gears_reverse/blob/e0fabf7e121818e5abe2f873e34a07d0eb32742d/ffvii/DISC/FIELD/FIELD.BIN_event_code_entity.cpp#L72-L95);
 exact PC visual timing and real mod overlays remain untested.
 A watcher opens window 0 itself and every later one only when the owner's `SceneStep` for the one before arrives, so the two screens
 show the same line at the same time. A client that cannot build the scene (no field data) tells the server at once (`SceneEnd`

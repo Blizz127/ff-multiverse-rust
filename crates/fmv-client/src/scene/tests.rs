@@ -481,7 +481,7 @@ fn a_run_of_empty_windows_without_end_is_cut_off_by_the_scenes_own_limit() {
 
 #[test]
 fn the_stage_is_where_the_scene_puts_it_when_it_begins_and_moves_with_the_clock_and_a_window_pauses_it() {
-    let walk = Stage::Move { entity: 20, from: None, x: 50, y: 110, z: None, triangle: None, frames: 30, how: MoveHow::Walk };
+    let walk = Stage::Move { entity: 20, from: None, x: 50, y: 110, z: None, triangle: None, frames: 30, how: MoveHow::Walk, animation: None };
     let beats = vec![
         // Beat 0: she starts to walk at frame 10 (30 frames, 100 units); the first window opens at frame 20.
         Beat { stage: vec![timed(10, walk)], then: Then::Window(window(20, 18, Some(18), message(1, 18, "one"))) },
@@ -530,7 +530,7 @@ fn the_stage_is_where_the_scene_puts_it_when_it_begins_and_moves_with_the_clock_
 
 #[test]
 fn replacing_moves_and_placing_actors_keeps_the_same_phase_across_tick_sizes() {
-    let walk = |at, x| timed(at, Stage::Move { entity: 20, from: None, x, y: 10, z: None, triangle: None, frames: 100, how: MoveHow::Walk });
+    let walk = |at, x| timed(at, Stage::Move { entity: 20, from: None, x, y: 10, z: None, triangle: None, frames: 100, how: MoveHow::Walk, animation: None });
     let beats = vec![Beat {
         stage: vec![
             walk(0, 150),
@@ -630,6 +630,93 @@ fn authored_loops_start_at_events_pause_and_restart_without_changing_the_base_mo
 }
 
 #[test]
+fn authored_move_clips_reset_pause_and_return_to_standing_for_owner_and_watcher() {
+    use crate::avatar::anim::ClipFrame;
+    use fmv_ff7::script::scene::AnimHow;
+    struct Moving(Scripted);
+    impl SceneSource for Moving {
+        fn initial(&self) -> Vec<Stage> { self.0.initial() }
+        fn next(&mut self, answer: Option<usize>) -> Beat { self.0.next(answer) }
+        fn height_at(&self, x: i16, y: i16, triangle: Option<u16>) -> Option<f32> { self.0.height_at(x, y, triangle) }
+        fn animation_clip(&self, entity: u8, slot: u8) -> Option<&str> {
+            if entity != 20 { return None; }
+            match slot { 0 => Some("idle"), 1 => Some("walk"), 2 => Some("run"), 3 => Some("other"), _ => None }
+        }
+    }
+    let moving = |x, frames, animation| Stage::Move { entity: 20, from: None, x, y: 10, z: None, triangle: None,
+        frames, how: MoveHow::Walk, animation };
+    let cancel = [
+        Stage::AnimSpeed { entity: 20, speed: 32 },
+        Stage::Anim { entity: 20, animation: 3, how: AnimHow::Once, first: None, last: None, speed: 16, divisor: 1 },
+    ];
+    for role in [SceneRole::Owner, SceneRole::Watcher] {
+        let mut initial = places();
+        initial.push(Stage::Anim { entity: 20, animation: 0, how: AnimHow::Loop, first: None, last: None, speed: 16, divisor: 1 });
+        let mut beats = vec![
+            Beat { stage: vec![timed(10, moving(150, 30, Some(1)))], then: say(20, 20, 20, 1).then },
+            Beat { stage: vec![timed(5, moving(250, 20, Some(2))), timed(10, moving(350, 10, Some(2)))], then: say(15, 20, 20, 2).then },
+            say(10, 20, 20, 3),
+        ];
+        beats.extend([None, Some(99), Some(3)].map(|animation| Beat {
+            stage: vec![timed(0, moving(450, 6, animation))], then: say(3, 20, 20, 4).then,
+        }));
+        beats.extend(cancel.iter().cloned().map(|event| Beat {
+            stage: vec![timed(0, moving(550, 10, Some(1))), timed(2, event)], then: say(4, 20, 20, 5).then,
+        }));
+        let mut definition = def();
+        definition.cast[1].look = Look::Model { hrc: "model".into(), idle: "base".into() };
+        let mut player = ScenePlayer::new(Run { id: RUN, participants: vec![], role }, definition,
+            Box::new(Moving(Scripted { initial, beats: beats.into(), asked: Asked::default() })), false);
+        let clip = |p: &ScenePlayer| {
+            let actors = cast_players(p);
+            let actor = actors.iter().find(|actor| actor.who == cast_who(20)).unwrap();
+            let npc = actor.npc.unwrap();
+            assert_eq!((npc.model, npc.idle), ("model", Some("base")), "movement keeps the base mesh/cache identity");
+            actor.scene_clip.map(|(stem, frame)| (stem.to_string(), frame))
+        };
+        let pass = |p: &mut ScenePlayer, step| {
+            if role == SceneRole::Owner { p.key(SceneKey::Confirm); } else { p.on_step(step, None); }
+        };
+        assert_eq!(clip(&player), Some(("idle".into(), ClipFrame::Loop(0.0))));
+        player.advance(0.5);
+        assert_eq!(clip(&player), Some(("walk".into(), ClipFrame::Loop(5.0))), "the move clock begins at its event");
+        player.advance(1.0);
+        assert!(player.has_window() && player.actor(20).unwrap().moving());
+        assert_eq!(clip(&player), Some(("walk".into(), ClipFrame::Loop(10.0))));
+        player.advance(10.0);
+        assert_eq!(clip(&player), Some(("walk".into(), ClipFrame::Loop(10.0))), "dialogue freezes the move clip");
+        pass(&mut player, 0);
+        player.advance(6.0 / 30.0);
+        assert_eq!(clip(&player), Some(("run".into(), ClipFrame::Loop(1.0))), "a new slot starts with the new Move");
+        player.advance(5.0 / 30.0);
+        assert_eq!(clip(&player), Some(("run".into(), ClipFrame::Loop(1.0))), "a repeated slot also restarts for each Move");
+        player.advance(4.0 / 30.0);
+        assert_eq!(clip(&player), Some(("run".into(), ClipFrame::Loop(5.0))));
+        pass(&mut player, 1);
+        player.advance(5.0 / 30.0);
+        assert!(!player.actor(20).unwrap().moving());
+        assert_eq!(clip(&player), Some(("idle".into(), ClipFrame::Loop(0.0))), "movement completion removes its clip and restarts standing");
+        player.advance(2.0 / 30.0);
+        assert_eq!(clip(&player), Some(("idle".into(), ClipFrame::Loop(2.0))));
+        player.advance(3.0 / 30.0);
+        assert!(player.has_window());
+        for index in 0..3 {
+            pass(&mut player, 2 + index);
+            player.advance(3.0 / 30.0);
+            assert!(player.actor(20).unwrap().moving());
+            assert_eq!(clip(&player), None, "missing or unsupported move metadata {index} uses the default walk");
+        }
+        for index in 0..cancel.len() {
+            pass(&mut player, 5 + index as u32);
+            assert_eq!(clip(&player), Some(("walk".into(), ClipFrame::Loop(0.0))));
+            player.advance(4.0 / 30.0);
+            assert!(player.actor(20).unwrap().moving());
+            assert_eq!(clip(&player), None, "animation replacement {index} cancels the movement override");
+        }
+    }
+}
+
+#[test]
 fn single_frame_holds_stay_fixed_until_replaced_for_owner_and_watcher() {
     use crate::avatar::anim::ClipFrame;
     use fmv_ff7::script::scene::AnimHow;
@@ -652,7 +739,7 @@ fn single_frame_holds_stay_fixed_until_replaced_for_owner_and_watcher() {
     for role in [SceneRole::Owner, SceneRole::Watcher] {
         let mut beats = vec![
             Beat { stage: vec![timed(10, hold(1))], then: say(20, 20, 20, 1).then },
-            Beat { stage: vec![timed(1, Stage::Move { entity: 20, from: None, x: 90, y: 10, z: None, triangle: None, frames: 3, how: MoveHow::Walk })], then: say(6, 20, 20, 2).then },
+            Beat { stage: vec![timed(1, Stage::Move { entity: 20, from: None, x: 90, y: 10, z: None, triangle: None, frames: 3, how: MoveHow::Walk, animation: None })], then: say(6, 20, 20, 2).then },
             Beat { stage: vec![
                 timed(0, Stage::Anim { entity: 20, animation: 3, how: AnimHow::Loop, first: None, last: None, speed: 16, divisor: 1 }),
                 timed(3, hold(0)),
@@ -1034,7 +1121,7 @@ fn every_participant_is_drawn_on_its_witness_spot_and_nobody_else_is_moved() {
 
 #[test]
 fn the_cast_is_drawn_as_avatars_under_keys_that_meet_nobody_walking_only_while_a_move_is_on() {
-    let walk = Stage::Move { entity: 20, from: None, x: 50, y: 110, z: None, triangle: None, frames: 60, how: MoveHow::Walk };
+    let walk = Stage::Move { entity: 20, from: None, x: 50, y: 110, z: None, triangle: None, frames: 60, how: MoveHow::Walk, animation: None };
     let beats = vec![
         Beat { stage: vec![timed(0, walk), timed(0, Stage::Show { entity: 18, visible: false })], then: Then::Window(window(30, 20, Some(20), message(1, 20, "x"))) },
         say(60, 20, 20, 2),

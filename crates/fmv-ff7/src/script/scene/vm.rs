@@ -145,7 +145,8 @@ pub enum Stage {
     /// Walk to a place over `frames`, from where the entity stood (`from`, when the scene knows it). `z` is the
     /// script's height (a ladder's), else the ground's at the place ([`super::ScenePlay`] fills it in).
     /// `triangle` preserves the authored landing floor of a jump or ladder when one is supplied.
-    Move { entity: u8, from: Option<(i16, i16)>, x: i16, y: i16, z: Option<i16>, triangle: Option<u16>, frames: u32, how: MoveHow },
+    /// `animation` is ordinary MOVE's authored walk/run loader slot; other move opcodes leave it unknown.
+    Move { entity: u8, from: Option<(i16, i16)>, x: i16, y: i16, z: Option<i16>, triangle: Option<u16>, frames: u32, how: MoveHow, animation: Option<u8> },
     /// Turn to face a heading (radians, counter-clockwise from the field's +x axis seen from above) over `frames`.
     Face { entity: u8, heading: f32, frames: u32 },
     /// Play a clip of the entity's model (`animation` is the index in the model-loader's list).
@@ -367,6 +368,7 @@ struct Goal {
     z: Option<i16>,
     triangle: Option<u16>,
     how: MoveHow,
+    animation: Option<u8>,
     /// How long it takes, when the script says (else the distance and the entity's speed do).
     frames: Option<u32>,
 }
@@ -931,7 +933,7 @@ impl Vm {
     }
 
     fn do_move(&mut self, idx: usize, entity: u8, goal: Goal) {
-        let Goal { x, y, z, triangle, how, frames } = goal;
+        let Goal { x, y, z, triangle, how, animation, frames } = goal;
         let time = self.thread_time(idx);
         let from = self.places.get(&entity).map(|w| (w.x, w.y));
         let frames = frames.unwrap_or_else(|| {
@@ -939,7 +941,7 @@ impl Vm {
             self.move_frames(entity, distance)
         });
         self.places.insert(entity, Where { x, y, z, triangle });
-        self.emit(time, Stage::Move { entity, from, x, y, z, triangle, frames, how });
+        self.emit(time, Stage::Move { entity, from, x, y, z, triangle, frames, how, animation });
         // The script waits until the walk is over.
         self.add_time(idx, frames);
     }
@@ -1309,7 +1311,13 @@ impl Vm {
             }
             0xA8 | 0xA9 | 0xAD => {
                 let (x, y) = (clamp_i16(self.num(ins, "x", Width::S16)), clamp_i16(self.num(ins, "y", Width::S16)));
-                self.do_move(idx, me, Goal { x, y, z: None, triangle: None, how: MoveHow::Walk, frames: None });
+                // Original MOVE selects walk/run from the source MSPED and field scale, not the
+                // presentation's distance or bounded duration. CMOVE/FMOVE clip semantics remain unresolved here.
+                let animation = (op == 0xA8).then(|| {
+                    let speed = self.speeds.get(&me).copied().unwrap_or(DEFAULT_MOVE_SPEED);
+                    if speed <= 3 * i32::from(script.header().scale) { 1 } else { 2 }
+                });
+                self.do_move(idx, me, Goal { x, y, z: None, triangle: None, how: MoveHow::Walk, animation, frames: None });
                 Flow::Yield
             }
             0xAA => {
@@ -1317,7 +1325,7 @@ impl Vm {
                 let target = ins.literal("entity").map(clamp_u8).and_then(|e| self.places.get(&e).copied());
                 match target {
                     Some(w) => {
-                        self.do_move(idx, me, Goal { x: w.x, y: w.y, z: None, triangle: None, how: MoveHow::Walk, frames: None });
+                        self.do_move(idx, me, Goal { x: w.x, y: w.y, z: None, triangle: None, how: MoveHow::Walk, animation: None, frames: None });
                         Flow::Yield
                     }
                     None => {
@@ -1329,7 +1337,7 @@ impl Vm {
             0xC0 => {
                 let (x, y) = (clamp_i16(self.num(ins, "x", Width::S16)), clamp_i16(self.num(ins, "y", Width::S16)));
                 let triangle = u16::try_from(self.num(ins, "triangle", Width::U16)).ok();
-                self.do_move(idx, me, Goal { x, y, z: None, triangle, how: MoveHow::Jump, frames: Some(JUMP_FRAMES) });
+                self.do_move(idx, me, Goal { x, y, z: None, triangle, how: MoveHow::Jump, animation: None, frames: Some(JUMP_FRAMES) });
                 Flow::Yield
             }
             0xC2 => {
@@ -1338,7 +1346,7 @@ impl Vm {
                 let triangle = u16::try_from(self.num(ins, "triangle", Width::U16)).ok();
                 let from_z = self.places.get(&me).and_then(|w| w.z).unwrap_or(z);
                 let frames = (u32::from(from_z.abs_diff(z)) / 4).clamp(JUMP_FRAMES / 2, MAX_MOVE_FRAMES);
-                self.do_move(idx, me, Goal { x, y, z: Some(z), triangle, how: MoveHow::Ladder, frames: Some(frames) });
+                self.do_move(idx, me, Goal { x, y, z: Some(z), triangle, how: MoveHow::Ladder, animation: None, frames: Some(frames) });
                 Flow::Yield
             }
             0xB2 => {

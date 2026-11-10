@@ -485,6 +485,11 @@ impl ScenePlayer {
             }
         }
         cast.apply(event, late, &|x, y, triangle| source.height_at(x, y, triangle));
+        if let Stage::Move { entity, how: fmv_ff7::script::scene::MoveHow::Walk, animation: Some(slot @ (1 | 2)), .. } = event {
+            if let Some(clip) = source.animation_clip(*entity, *slot) {
+                cast.apply_move_animation(*entity, clip);
+            }
+        }
     }
 
     /// Go on as far as the clock allows: pull the next beat, play what is due, open the window or end the scene. Stops at

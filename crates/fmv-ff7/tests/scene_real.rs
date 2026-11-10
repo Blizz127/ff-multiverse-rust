@@ -1542,6 +1542,12 @@ fn reactor_approach_plays_the_crew_paths_and_keeps_wedge_outside() {
     let def = reactor_approach_scene();
     assert_eq!(scene(REACTOR_APPROACH_SCENE_ID), Some(def.clone()));
     assert!(def.given.is_empty(), "no assumed persistent bytes");
+    let script = FieldScript::from_field(&f).unwrap();
+    assert_eq!(script.header().scale, 512);
+    let wedge_script = script.disassemble(5, 0).unwrap();
+    let run = wedge_script.iter().position(|ins| ins.opcode == 0xA8 && ins.literal("x") == Some(-893) && ins.literal("y") == Some(-3038)).unwrap();
+    let speed = wedge_script[..run].iter().rev().find(|ins| ins.mnemonic == "MSPED").unwrap().literal("speed");
+    assert_eq!(speed, Some(3840), "Wedge's authored MOVE uses the run speed at field scale 512");
     let provenance = EditionProvenance { game: GameId::Ff7, platform: Platform::Pc, edition: "steam".into(), region: "any".into(), language: "en".into(), revision: "test".into(), sources: vec![], modded: false };
     let adapter = fmv_ff7::Ff7Adapter::from_flevel_path(flevel_path(&data_dir().unwrap()), provenance).unwrap();
     let area = adapter.load_field("nrthmk").unwrap();
@@ -1570,6 +1576,7 @@ fn reactor_approach_plays_the_crew_paths_and_keeps_wedge_outside() {
         outcome.writes.apply_to(&mut interpreted);
         assert_eq!(interpreted, after, "only the existing step is saved");
         let mut play = ScenePlay::new(&f, &def, &before, 1).unwrap();
+        assert_eq!(play.animation_clip(5, 2), Some("aaga"), "Wedge's authored running slot resolves through his loader model");
         assert_eq!(play.animation_clip(5, 3), Some("bxja"), "Wedge's authored slot resolves through his loader model");
         assert_eq!(play.animation_clip(5, u8::MAX), None);
         let beat = play.next(None);
@@ -1588,6 +1595,10 @@ fn reactor_approach_plays_the_crew_paths_and_keeps_wedge_outside() {
             let hides = beat.stage.iter().filter(|event| event.what == Stage::Show { entity, visible: false }).count();
             assert_eq!(hides, usize::from(entity != 5), "only Biggs and Jessie leave");
         }
+        let wedge_animations: Vec<_> = beat.stage.iter().filter_map(|event| match event.what {
+            Stage::Move { entity: 5, animation, .. } => Some(animation), _ => None,
+        }).collect();
+        assert_eq!(wedge_animations, [Some(2)], "MSPED 3840 exceeds three times scale 512, so ordinary MOVE selects the running slot");
         assert!(beat.stage.iter().any(|event| matches!(event.what, Stage::Anim {
             entity: 5, animation: 3, how: AnimHow::Loop, first: None, last: None, speed: 16, divisor: 1,
         })));
@@ -1607,13 +1618,19 @@ fn reactor_approach_plays_the_crew_paths_and_keeps_wedge_outside() {
         assert!(cast.iter().all(|&(x,y)| (x-f32::from(spot.x)).hypot(y-f32::from(spot.y)) >= 2.0*ring+16.0));
         assert!(scenery_gap(&mesh, f32::from(spot.x), f32::from(spot.y)) >= 1.5*ring);
     }
-    let idle = f.model_loader().unwrap().models.into_iter().find(|model| model.hrc_stem() == "bxbe").unwrap().animations[3].stem();
+    let loader = f.model_loader().unwrap().models.into_iter().find(|model| model.hrc_stem() == "bxbe").unwrap();
+    let idle = loader.animations[3].stem();
     assert_eq!(idle, "bxja");
+    let run = loader.animations[2].stem();
+    assert_eq!(run, "aaga");
     let mut characters = LgpArchive::open_path(data_dir().unwrap().join("field/char.lgp")).unwrap();
     let clip = fmv_ff7::load_field_animation(&mut characters, &idle).unwrap();
     assert_eq!((clip.frame_count(), clip.bone_count()), (80, 21));
     let model = fmv_ff7::load_field_model(&mut characters, "bxbe").unwrap();
     assert!(model.fits(&clip), "the owned loop fits Wedge's retained skeleton");
+    let run_clip = fmv_ff7::load_field_animation(&mut characters, &run).unwrap();
+    assert_eq!((run_clip.frame_count(), run_clip.bone_count()), (15, 21));
+    assert!(model.fits(&run_clip), "the owned run clip fits Wedge's retained skeleton");
     for moment in [0, 8, 9, 10, 12, 26, 27, 33, 32767, 32768, u16::MAX] {
         let story = StoryState::at(moment);
         let saved = story.encode();
