@@ -658,7 +658,7 @@ party can do of it. Everything below is pinned against the real data in `crates/
   goes to (the ride back, which is not a step forward) and never one that would CLOSE it (the ride down, forward again once
   the lift is up), so the lift is ridden once each way and never flaps (`StoryBot::set_wanted_exit`). The way out of the reactor is the
   gateway from `nmkin_1` to `nrthmk`. **A member that is behind its leader at the lift still goes up:** the finale moves the
-  party's story to 33 as soon as the leader stands in `nrthmk`, and from 33 the lift of `elevtr1` leads to the second reactor
+  party's story to 33 after the leader's finale scene in `nrthmk`, and from 33 the lift of `elevtr1` leads to the second reactor
   (closed here, nobody has reviewed it), so a member that comes to the lift after that takes the exit its leader took
   (nmkin_1) instead of the one its party's story now says (see "A member follows its leader's way out" above; the real-data
   test `on_the_real_lift_a_member_that_comes_after_the_leaders_finale_still_rides_to_nmkin_1` in `follow/real_tests.rs`
@@ -1465,6 +1465,11 @@ point moves the story to, or `SceneDef::presents_bit` for an existing saved flag
   Setup reads the already carried timeout bit; byte bit conditions now audit the selected bit, while unknown bits
   and full-byte reads remain audited. This adds no saved flags. The two-client smoke checks independent entry runs;
   rendered movement remains untested.
+* **`ff7/nrthmk/reactor-finale`**: at moment 27, the crew's scripted escape movements play before the existing entry
+  point advances the story to 33 and sets the lift bit. This silent scene adds no saved fields, rewards or party changes.
+  The explosion movie and its frame-triggered actor callbacks are not shown. As with other point cutscenes, its interpreted
+  `MAPJUMP` does not move players; the existing gateway to `md8_4` remains the way onward. Later moments keep their existing
+  entry behavior. Witness floor placement and clearance are checked against the owned data; rendered framing remains untested.
 * **`ff7/nmkin_3/jessie-ladder`**: Jessie's first ladder explanation and descent, one window before the existing talk
   point advances the story to 14. Nearby party members share the scene. Jessie and the potion use their own scripts;
   Cloud has no scripted action in this branch. The upper platform uses one measured witness spot clear of her path;

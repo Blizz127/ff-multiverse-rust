@@ -620,6 +620,29 @@ pub fn reactor_approach_scene() -> SceneDef {
     }
 }
 
+/// Presentation of the existing moment-27 finale point. The crew's ordinary mains
+/// run beside the field's request chain; the movie and its frame-driven callbacks are not
+/// presented. The existing point owns progression; players continue through the existing gateway.
+pub const REACTOR_FINALE_SCENE_ID: &str = "ff7/nrthmk/reactor-finale";
+
+pub fn reactor_finale_scene() -> SceneDef {
+    let cast = [(1, "cl", "aaaa", "acfe"), (2, "ba", "acgd", "adcb"), (3, "av_b", "bwfd", "acfe"),
+                (4, "av_c", "axdc", "acfe"), (5, "av_w", "bxbe", "acfe")]
+        .into_iter().map(|(entity, name, hrc, idle)| CastMember {
+            entity, name: name.into(), look: Look::Model { hrc: hrc.into(), idle: idle.into() }, start: None,
+        }).collect();
+    SceneDef {
+        id: REACTOR_FINALE_SCENE_ID.into(), game: "ff7".into(), field: "nrthmk".into(),
+        trigger: Trigger { entity: 7, name: String::new(), slot: 0, talk_radius: 0, moments: 27..=27 },
+        setup: [0, 1, 2, 3, 4, 5].into_iter().map(|entity| ScriptRef::new(entity, 0)).collect(),
+        given: vec![], root: [2, 3, 4, 5, 6, 7].into_iter().map(Step::StartMain).collect(), cast,
+        speakers: vec![], witness: vec![],
+        // The owned gateway from nmkin_1. Automatic witnesses must clear the crew's full paths.
+        arrival: Spot { x: 15, y: -1218, triangle: 1, direction: 128 },
+        presents: Some(33), resume_after_battle: None, presents_bit: None,
+    }
+}
+
 /// Offline director survey at moment 51. The route, witness, field effects and party state
 /// have not been verified for live play, so this definition is deliberately unregistered.
 pub fn sector7_station_scene() -> SceneDef {
@@ -814,7 +837,7 @@ pub fn proof_scene() -> SceneDef {
 /// ones before it keep their numbers): the proof, the two the escape from the first reactor ends in, and the cutscenes of the
 /// reactor's own story points.
 pub fn scenes() -> Vec<SceneDef> {
-    vec![proof_scene(), post_escape_scene(), station_scene(), team_talk_scene(), reactor_door_scene(), guard_scorpion_scene(), guard_scorpion_victory_scene(), jessie_rescue_scene(), jessie_ladder_scene(), run_ahead_scene(), jessie_descent_scene(), reactor_approach_scene()]
+    vec![proof_scene(), post_escape_scene(), station_scene(), team_talk_scene(), reactor_door_scene(), guard_scorpion_scene(), guard_scorpion_victory_scene(), jessie_rescue_scene(), jessie_ladder_scene(), run_ahead_scene(), jessie_descent_scene(), reactor_approach_scene(), reactor_finale_scene()]
 }
 
 /// Whether `field` (the archive's spelling; case does not matter) is the field of a scene the game offers: a place a

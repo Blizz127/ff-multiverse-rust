@@ -2031,3 +2031,110 @@ fn reactor_approach_plays_the_crew_paths_and_keeps_wedge_outside() {
     }
     eprintln!("reactor approach: three actor paths, {} automatic witness spots, inbound NPC phase; rendering untested", spots.len());
 }
+
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn reactor_finale_at_27_matches_the_existing_step_and_has_clear_witnesses() {
+    use fmv_adapter_api::AreaRuntime;
+    use fmv_core::{EditionProvenance, GameId, Platform};
+    use fmv_ff7::script::scene::{auto_witnesses, cast_places, reactor_finale_scene, scene, SKIPPED_STATE_OPS};
+    use fmv_ff7::story::{FREED_BIT, LIFT_BIT, REACTOR_STATE};
+    let f = field("nrthmk").expect("FMV_FF7_DATA and nrthmk");
+    let def = reactor_finale_scene();
+    assert_eq!(scene(&def.id).as_ref(), Some(&def), "registered after the existing stable scene slots");
+    assert!(def.given.is_empty() && def.witness.is_empty(), "no assumed state or invented witness coordinates");
+    assert_eq!(def.trigger.moments, 27..=27);
+    let script = FieldScript::from_field(&f).unwrap();
+    let caller = script.disassemble(7, 0).unwrap();
+    for (offset, opcode, entity, slot) in [(0x0655, 0x03, 1, 3), (0x0658, 0x01, 0, 3)] {
+        let request = caller.iter().find(|ins| ins.offset == offset).unwrap();
+        assert_eq!((request.opcode, request.literal("entity"), request.literal("script")), (opcode, Some(entity), Some(slot)));
+    }
+    let director = script.disassemble(0, 3).unwrap();
+    let jump = director.iter().find(|ins| ins.offset == 0x038E).unwrap();
+    assert_eq!((jump.literal("field"), jump.literal("x"), jump.literal("y"), jump.literal("triangle"), jump.literal("direction")),
+        (Some(136), Some(-21), Some(156), Some(2), Some(0)));
+    let loader = f.model_loader().unwrap();
+    let inits = script.entity_inits(None);
+    let mut characters = LgpArchive::open_path(data_dir().unwrap().join("field/char.lgp")).unwrap();
+    for (entity, index, hrc) in [(1, 0, "aaaa"), (2, 1, "acgd"), (3, 2, "bwfd"), (4, 3, "axdc"), (5, 4, "bxbe")] {
+        assert_eq!(inits.iter().find(|init| init.entity == entity).unwrap().model_index, Some(index));
+        assert_eq!(loader.models[index].hrc_stem(), hrc);
+        assert!(matches!(&def.member(entity as u8).unwrap().look, Look::Model { hrc: model, .. } if model == hrc));
+        let idle = loader.models[index].animations[0].stem();
+        assert!(matches!(&def.member(entity as u8).unwrap().look, Look::Model { idle: clip, .. } if clip == &idle));
+        let model = fmv_ff7::load_field_model(&mut characters, hrc).unwrap();
+        let clip = fmv_ff7::load_field_animation(&mut characters, &idle).unwrap();
+        assert!(model.fits(&clip), "the actual idle fits actor {entity}'s skeleton");
+    }
+    let provenance = EditionProvenance { game: GameId::Ff7, platform: Platform::Pc, edition: "steam".into(), region: "any".into(), language: "en".into(), revision: "test".into(), sources: vec![], modded: false };
+    let adapter = fmv_ff7::Ff7Adapter::from_flevel_path(flevel_path(&data_dir().unwrap()), provenance).unwrap();
+    let area = adapter.load_field("nrthmk").unwrap();
+    let from = adapter.load_field("nmkin_1").unwrap();
+    let entry = from.exits().into_iter().find(|exit| exit.target == "nrthmk").unwrap();
+    assert_eq!((entry.arrival.x, entry.arrival.y, entry.arrival_hint),
+        (f32::from(def.arrival.x), f32::from(def.arrival.y), Some(u32::from(def.arrival.triangle))));
+    let mesh = f.walkmesh().unwrap();
+    let parts = mesh_parts(&mesh);
+    let ring = 5.5 * fmv_ff7::default_model_scale(script.header().scale);
+    assert!(fmv_ff7::script::triangle_contains_xy(&mesh.triangles[usize::from(def.arrival.triangle)], i32::from(def.arrival.x), i32::from(def.arrival.y)));
+    for lift in [false, true] {
+        for freed in [false, true] {
+            let mut before = StoryState::at(27);
+            before.set_bit(REACTOR_STATE.bank, REACTOR_STATE.address, LIFT_BIT, lift);
+            before.set_bit(REACTOR_STATE.bank, REACTOR_STATE.address, FREED_BIT, freed);
+            let step = area.story_advance(&before.encode(), 1).expect("the existing finale entry point");
+            let after = StoryState::decode(&step.progress).unwrap();
+            assert!(def.presents_step("nrthmk", &before, &after));
+            assert!(!def.starts_on_arrival() && !def.offered_to(&before));
+            assert!(area.story_advance(&step.progress, 1).is_none());
+            let outcome = run_to_end(&f, &def, &before, 1, &[]).unwrap();
+            eprintln!("finale lift={lift} freed={freed}: {outcome:?}");
+            assert_eq!((outcome.end, outcome.windows, outcome.questions), (End::MapJump { field: 136 }, 0, 0));
+            assert!(outcome.is_complete(), "{outcome:?}");
+            // BITON reads the partially tracked reactor byte to preserve its other bits.
+            // The branch uses the already carried timeout bit; no other persistent byte is read.
+            assert_eq!(outcome.unknown_persistent_reads.iter().copied().collect::<Vec<_>>(), [(1, 225)]);
+            assert!(outcome.party.is_empty());
+            assert_eq!(outcome.writes.moment, Some(33));
+            assert!(outcome.writes.tracked.iter().all(|(key, _)| *key == (REACTOR_STATE.bank, REACTOR_STATE.address)));
+            assert!(outcome.writes.untracked.keys().all(|(bank, _)| !(1..=4).contains(bank)));
+            assert!([&outcome.setup_stats, &outcome.stats].iter().all(|stats| stats.ignored.keys().all(|op| !SKIPPED_STATE_OPS.contains(op))));
+            let mut interpreted = before.clone();
+            outcome.writes.apply_to(&mut interpreted);
+            assert_eq!(interpreted, after, "only the existing moment/LIFT step, retaining the rescue bit");
+            let mut play = ScenePlay::new(&f, &def, &before, 1).unwrap();
+            for (entity, x, y, triangle) in [(2, -36, -951, 10), (3, 38, -1035, 1), (4, 30, -1059, 1), (5, -893, -3038, 2)] {
+                assert!(play.initial_stage_events().contains(&Stage::Place { entity, x, y, z: Some(491), triangle: Some(triangle) }));
+                assert!(!play.initial_stage_events().contains(&Stage::Show { entity, visible: false }));
+            }
+            let beat = play.next(None);
+            assert!(matches!(beat.then, Then::End { how: End::MapJump { field: 136 }, .. }));
+            assert!(beat.stage.iter().any(|event| event.what == Stage::Place { entity: 1, x: 0, y: -1001, z: Some(491), triangle: Some(1) }));
+            for (entity, path) in [
+                (1, vec![(56, -3008), (-512, -3008)]),
+                (2, vec![(6, -3031), (-1239, -3042)]),
+                (3, vec![(6, -3031), (-1239, -3042)]),
+                (4, vec![(64, -3072), (-256, -3056), (-448, -3056), (-512, -3056)]),
+                (5, vec![(-1292, -3030)]),
+            ] {
+                let moves: Vec<_> = beat.stage.iter().filter_map(|event| match event.what {
+                    Stage::Move { entity: actor, x, y, .. } if actor == entity => Some((x, y)), _ => None,
+                }).collect();
+                assert_eq!(moves, path, "the pre-movie escape path of actor {entity}");
+            }
+            assert_eq!(play.off_cast(), 0);
+            let spots = auto_witnesses(&f, &def, &before, 1, 3);
+            let cast = cast_places(&f, &def, &before, 1).unwrap();
+            eprintln!("finale lift={lift} freed={freed}: automatic witness spots {spots:?}");
+            assert!(!spots.is_empty(), "no registration without a measured safe owner witness");
+            for spot in &spots {
+                assert!(fmv_ff7::script::triangle_contains_xy(&mesh.triangles[usize::from(spot.triangle)], i32::from(spot.x), i32::from(spot.y)));
+                assert_eq!(parts[usize::from(spot.triangle)], parts[usize::from(def.arrival.triangle)]);
+                assert!(cast.iter().all(|&(x, y)| (x - f32::from(spot.x)).hypot(y - f32::from(spot.y)) >= 2.0 * ring + 16.0));
+                assert!(scenery_gap(&mesh, f32::from(spot.x), f32::from(spot.y)) >= 1.5 * ring);
+            }
+        }
+    }
+    for moment in [0, 26, 28, 32, 33, u16::MAX] { assert!(!def.applies_at(moment)); }
+}
