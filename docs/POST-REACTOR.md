@@ -17,6 +17,15 @@ moment 72 in `mds7pb_1`; it is not reachable from the escape in this branch yet.
 The `md8_2` director has branching questions and one branch removes one gil (`GOLDd`) before
 writing moment 39. A presentation-only replay must not alter currency; a server-owned, once-only
 transaction and its persistence need to be implemented before serving that branch.
+An isolated survey of the director's sampled choice paths found every path sets
+`Var[3][66]` bit 0; purchase paths also set `Var[3][111]` bit 0 and execute `GOLDd 1`.
+Neither flag is carried today. These effects belong in the same validated durable result as
+the gil and moment changes; see `STATION-TRANSACTION-PROPOSAL.md`.
+An unregistered `flower_station_scene()` and owned-data check exercise the short path and all
+four combinations of the later two choices. A local original/Echo-S comparison aligned answers
+by position: sampled paths agree on the `GOLDd` occurrence, moment 39, and persistent flag values,
+but Echo-S has more windows and different choice line numbers. These observations do not prove
+choice meaning, voice playback, safe persistence, or multiplayer synchronization.
 The `md8_1` director also runs `PRTYM` for character 1 (Barret) and `HMPMAX3`; the current
 story party table otherwise continues to offer Cloud and Barret at later moments. Those
 operations and the correct later party must be modeled before this scene advances real progress.

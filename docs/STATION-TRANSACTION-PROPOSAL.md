@@ -6,6 +6,12 @@ The `md8_2` scene has a choice that may subtract one gil and advances the story.
 store keeps story and character progress in separate files. Each file is atomically replaced, but
 two replacements are not one crash-safe transaction. Applying a gil delta and a story write as
 separate saver jobs can lose, duplicate, or mismatch one side after interruption or replay.
+An owned-data survey of the director at moment 36 found that every sampled branch sets
+`Var[3][66]` bit 0 before writing moment 39; the two sampled purchase branches also execute
+`GOLDd 1` and set `Var[3][111]` bit 0. The current story model carries neither flag. The
+transaction's story after-image must preserve both effects where the selected script path
+actually produces them; a moment-only update would lose state. The survey uses assumed clear
+values for uncarried flags, so it does not establish every possible prior-state branch.
 
 ## Proposed change
 

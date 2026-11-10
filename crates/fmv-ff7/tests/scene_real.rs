@@ -244,6 +244,30 @@ fn sector7_intro_survey_reports_its_assumed_flags_and_cast() {
     }
 }
 
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA); the gil scene is not enabled"]
+fn flower_station_survey_distinguishes_purchase_and_nonpurchase_paths() {
+    let f = field("md8_2").expect("FMV_FF7_DATA and md8_2");
+    let def = fmv_ff7::script::scene::flower_station_scene();
+    let story = StoryState::at(36);
+    let loader = f.model_loader().unwrap();
+    for (member, model) in def.cast.iter().zip(&loader.models) {
+        let Look::Model { hrc, idle } = &member.look else { panic!("expected a field model") };
+        assert_eq!(model.hrc_stem(), *hrc);
+        assert_eq!(model.animations.first().map(|a| a.stem()).as_deref(), Some(idle.as_str()));
+    }
+    for (answers, debit, windows) in [(&[2usize][..], false, 3), (&[3, 2, 0][..], true, 7), (&[3, 3, 0][..], true, 8), (&[3, 2, 1][..], false, 6), (&[3, 3, 1][..], false, 7)] {
+        let outcome = run_to_end(&f, &def, &story, 1, answers).unwrap();
+        assert_eq!((outcome.end, outcome.windows, outcome.writes.moment), (End::Finished, windows, Some(39)));
+        assert_eq!(outcome.stats.ignored.contains_key("GOLDd"), debit);
+        assert_eq!(outcome.writes.untracked.get(&(3, 66)), Some(&1));
+        assert_eq!(outcome.writes.untracked.contains_key(&(3, 111)), debit);
+        assert!(outcome.unknown_persistent_reads.contains(&(3, 66)));
+        assert_eq!((outcome.stats.unresolved, outcome.stats.dropped_requests), (0, 0));
+        assert!(outcome.stats.unknown.is_empty());
+    }
+}
+
 // ---- 1. the trigger is found -----------------------------------------------------------------
 
 #[test]

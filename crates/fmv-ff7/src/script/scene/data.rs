@@ -222,6 +222,8 @@ pub const EARLY_BAR_SCENE_ID: &str = "ff7/mds7pb_1/early-bar-survey";
 pub const SECTOR7_STATION_SCENE_ID: &str = "ff7/mds7st3/station-arrival-survey";
 /// Survey-only Sector 7 intro; not registered for play.
 pub const SECTOR7_INTRO_SCENE_ID: &str = "ff7/mds7/intro-survey";
+/// Survey-only flower seller scene; the gil transaction is not implemented.
+pub const FLOWER_STATION_SCENE_ID: &str = "ff7/md8_2/flower-survey";
 
 /// Field-authored cast and director scripts at moment 33. Not registered until the arrival
 /// trigger and subsequent field transition are ready to serve together.
@@ -345,6 +347,25 @@ pub fn sector7_intro_scene() -> SceneDef {
         trigger: Trigger { entity: 7, name: "produce".into(), slot: 0, talk_radius: 0, moments: 63..=63 },
         setup: vec![], given: vec![], root: vec![Step::StartMain(7)], cast, speakers: vec![],
         witness: vec![], arrival: Spot { x: 1641, y: -328, triangle: 109, direction: 0 },
+    }
+}
+
+/// Offline survey of the flower seller's director. Unregistered until persistent flags,
+/// once-only currency effects, presentation, witness and preceding route are implemented.
+pub fn flower_station_scene() -> SceneDef {
+    let cast = [
+        (1, "cloud", "aaaa", "aafe"), (2, "earith", "cahc", "cbdc"),
+        (3, "panpi1", "cbfe", "caed"), (4, "panpi2", "ccbc", "caed"),
+        (5, "panpi3", "ccbc", "caed"),
+    ].into_iter().map(|(entity, name, hrc, idle)| CastMember {
+        entity, name: name.into(), look: Look::Model { hrc: hrc.into(), idle: idle.into() }, start: None,
+    }).collect();
+    SceneDef {
+        id: FLOWER_STATION_SCENE_ID.into(), game: "ff7".into(), field: "md8_2".into(),
+        trigger: Trigger { entity: 0, name: "dic".into(), slot: 0, talk_radius: 0, moments: 36..=36 },
+        setup: vec![], given: vec![], root: vec![Step::StartMain(0)], cast,
+        speakers: vec![("Cloud".into(), 1), ("Aerith".into(), 2)],
+        witness: vec![], arrival: Spot { x: -3445, y: 21419, triangle: 34, direction: 0 },
     }
 }
 
