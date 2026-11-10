@@ -85,7 +85,9 @@ fn compatible_bar(field: &fmv_ff7::field::FieldFile, def: &SceneDef, story: &Sto
         for _ in 0..=64 {
             match play.next(next.take()).then {
                 fmv_ff7::script::scene::Then::End { how, .. } => {
-                    if how != End::Finished || questions != 1 || !play.stats().unknown.is_empty() || play.stats().unresolved != 0 || play.stats().dropped_requests != 0 { return None; }
+                    let harmless = ["MENU2", "TALKR", "UC", "WREST", "SOUND"];
+                    if how != End::Finished || questions != 1 || !play.stats().unknown.is_empty() || play.stats().unresolved != 0 || play.stats().dropped_requests != 0
+                        || play.stats().ignored.keys().any(|op| !harmless.contains(op)) { return None; }
                     return Some((play.writes(), how));
                 }
                 fmv_ff7::script::scene::Then::Window(w) => if let Some(c) = w.message.choice {

@@ -215,6 +215,7 @@ pub const PROOF_FIELD: &str = "mds7pb_1";
 /// The director sequence immediately after the first reactor escape.
 pub const POST_ESCAPE_SCENE_ID: &str = "ff7/md8_4/post-escape";
 pub const STATION_SCENE_ID: &str = "ff7/md8_1/post-escape-station";
+pub const TRAIN_SCENE_ID: &str = "ff7/tin_1/sector-seven-train";
 
 /// Field-authored cast and director scripts at moment 33. Not registered until the arrival
 /// trigger and subsequent field transition are ready to serve together.
@@ -256,6 +257,28 @@ pub fn station_scene() -> SceneDef {
     // Its witness is deliberately absent until a visible, walkable spot is verified.
     def.witness.clear();
     def
+}
+
+/// The train's arrival director at moment 48. Not registered for live play: presentation,
+/// preceding travel, and persistence effects elsewhere on the route still need review.
+pub fn train_scene() -> SceneDef {
+    let cast = [
+        (30, "cloud", "aaaa", "acfe"), (31, "barret", "acgd", "adcb"),
+        (33, "biggs", "bwfd", "acfe"), (34, "jessie", "axdc", "acfe"),
+        (35, "wedge", "bxbe", "acfe"), (36, "guard", "azhe", "acfe"),
+        (37, "employee", "cdja", "bdcb"), (40, "passenger", "cfha", "cgcc"),
+        (41, "woman", "cbfe", "bajb"),
+    ].into_iter().map(|(entity, name, hrc, idle)| CastMember {
+        entity, name: name.into(), look: Look::Model { hrc: hrc.into(), idle: idle.into() }, start: None,
+    }).collect();
+    SceneDef {
+        id: TRAIN_SCENE_ID.into(), game: "ff7".into(), field: "tin_1".into(),
+        trigger: Trigger { entity: 17, name: "direct".into(), slot: 0, talk_radius: 0, moments: 48..=48 },
+        setup: vec![ScriptRef::new(40, 0)], given: vec![], root: vec![Step::StartMain(17)], cast,
+        speakers: vec![("Cloud".into(), 30), ("Barret".into(), 31), ("Biggs".into(), 33), ("Jessie".into(), 34), ("Wedge".into(), 35)],
+        // Deliberately absent until a visible walkmesh location has been checked.
+        witness: vec![], arrival: Spot { x: -2, y: 608, triangle: 29, direction: 252 },
+    }
 }
 
 /// Script entities and slots of the proof field (measured on the owned Steam copy: `tests/scene_real.rs` checks them).

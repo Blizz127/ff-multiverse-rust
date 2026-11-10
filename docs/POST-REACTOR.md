@@ -62,6 +62,8 @@ text layer is off, a section is missing or validation fails, it uses the origina
 watcher always use the original until mixed-layer window synchronization is implemented. This is
 a preview milestone, not proof that the Reactor-to-bar route or all Echo-S scenes are playable;
 the real bar write remains guarded until its persistent effects are carried safely.
+Echo-S's bar windows in the measured archive do not identify speakers with the original's
+first-line convention; the preview leaves their speaker anchors unset rather than guessing.
 
 The owned-data exit graph also gives the unreviewed continuation `cargoin` → `tin_1` →
 `mds7st3` → `mds7plr1` → `mds7` → `mds7pb_1`. `tin_1` → `mds7st3` is a
@@ -86,3 +88,6 @@ or waiting. A real-data regression exercises this director, and a synthetic chec
 window and a script waiter. This does not prove audiovisual parity or make the scene playable.
 Stopping at Cloud's slot-3 return is not a valid shortcut: the trace still has other actors running
 at later virtual times, including Jessie, Biggs and Wedge.
+The unregistered `train_scene()` now names the measured nine-actor cast and their field-loader
+idle clips; the real-data check verifies that this run drops no off-cast stage events. The witness
+spot, rendering, skipped sounds and background effects, and the preceding route remain unverified.

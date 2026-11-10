@@ -139,16 +139,7 @@ fn station_director_advances_the_post_escape_story() {
 #[ignore = "needs the owner's FF7 data (FMV_FF7_DATA); the train scene is not yet enabled"]
 fn train_director_finishes_after_its_authored_actor_work() {
     let f = field("tin_1").expect("FMV_FF7_DATA and tin_1");
-    let mut def = fmv_ff7::script::scene::station_scene();
-    def.field = "tin_1".into();
-    def.trigger.entity = 17;
-    def.root = vec![Step::StartMain(17)];
-    def.setup = vec![ScriptRef::new(40, 0)];
-    for (member, entity) in def.cast.iter_mut().zip([30u8, 31, 33, 34, 35]) {
-        member.entity = entity;
-        member.start = None;
-    }
-    def.speakers = vec![("Cloud".into(), 30), ("Barret".into(), 31), ("Biggs".into(), 33), ("Jessie".into(), 34), ("Wedge".into(), 35)];
+    let def = fmv_ff7::script::scene::train_scene();
     let outcome = run_to_end(&f, &def, &StoryState::at(48), 1, &[]).unwrap();
     assert_eq!(outcome.end, End::Finished);
     assert_eq!(outcome.windows, 2);
@@ -157,6 +148,16 @@ fn train_director_finishes_after_its_authored_actor_work() {
     assert_eq!(outcome.stats.unresolved, 0);
     assert_eq!(outcome.stats.dropped_requests, 0);
     assert!(outcome.stats.unknown.is_empty());
+    let mut play = ScenePlay::new(&f, &def, &StoryState::at(48), 1).unwrap();
+    loop { if let Then::End { how, .. } = play.next(None).then { assert_eq!(how, End::Finished); break; } }
+    assert_eq!(play.off_cast(), 0, "the authored stage events have a cast actor");
+    let models = f.model_loader().unwrap();
+    for (cast, model_index) in def.cast.iter().zip([0usize, 1, 3, 4, 5, 6, 7, 10, 11]) {
+        let Look::Model { hrc, idle } = &cast.look else { panic!("expected field model") };
+        let model = &models.models[model_index];
+        assert_eq!(model.hrc_stem(), *hrc);
+        assert_eq!(model.animations.first().map(|a| a.stem()).as_deref(), Some(idle.as_str()));
+    }
 }
 
 // ---- 1. the trigger is found -----------------------------------------------------------------

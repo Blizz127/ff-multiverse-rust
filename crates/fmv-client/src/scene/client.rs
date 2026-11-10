@@ -160,6 +160,9 @@ impl SceneClient {
         self.armed.clear();
         self.started += 1;
         self.event(SceneEvent::Started { run, scene: clean_id(&scene), role: you, participants: participants.len() });
+        if scene == fmv_ff7::script::scene::PROOF_SCENE_ID && participants.len() > 1 && crate::mods::script_source().is_some() {
+            self.note("scene: Echo-S bar dialogue is unavailable with watchers; using the original script".into());
+        }
         let built = match StoryState::decode(&progress) {
             Some(story) if you == SceneRole::Owner && participants.len() == 1 => self.builder.build_private(&scene, &story, seed),
             Some(story) => self.builder.build(&scene, &story, seed),
