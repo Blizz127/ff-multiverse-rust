@@ -1419,3 +1419,90 @@ fn run_ahead_plays_all_three_paths_and_only_the_existing_entry_step() {
         if moment >= 8 { assert!(!def.applies_at(moment)); }
     }
 }
+
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn jessie_descends_the_stacked_floors_and_only_advances_the_existing_entry_step() {
+    use fmv_adapter_api::AreaRuntime;
+    use fmv_core::{EditionProvenance, GameId, Platform};
+    use fmv_ff7::script::scene::{auto_witnesses, cast_places, jessie_descent_scene, scene, JESSIE_DESCENT_SCENE_ID, SKIPPED_STATE_OPS};
+    use fmv_ff7::story::{FREED_BIT, LIFT_BIT, REACTOR_STATE, TIMEOUT_BIT};
+    let f = field("nmkin_2").expect("FMV_FF7_DATA and nmkin_2");
+    let def = jessie_descent_scene();
+    assert_eq!(scene(JESSIE_DESCENT_SCENE_ID), Some(def.clone()));
+    let provenance = EditionProvenance { game: GameId::Ff7, platform: Platform::Pc, edition: "steam".into(), region: "any".into(), language: "en".into(), revision: "test".into(), sources: vec![], modded: false };
+    let adapter = fmv_ff7::Ff7Adapter::from_flevel_path(flevel_path(&data_dir().unwrap()), provenance).unwrap();
+    let area = adapter.load_field("nmkin_2").unwrap();
+    let base = area.npcs();
+    assert_eq!(base.iter().map(|n| n.entity_name.as_str()).collect::<Vec<_>>(), ["av_j"]);
+    let mesh = f.walkmesh().unwrap();
+    let ground = Ground::new(mesh.clone());
+    // These targets overlap the ground floor. Nearest world-zero height would put her on
+    // triangles 36 and 5, before the authored path has descended from the upper walkways.
+    assert_eq!(ground.height(786, 818, Some(36), None).unwrap().round() as i16, 0);
+    assert_eq!(ground.height(794, -128, Some(5), None).unwrap().round() as i16, 1);
+    assert_eq!(ground.height(786, 818, Some(173), None).unwrap().round() as i16, 1058);
+    assert_eq!(ground.height(794, -128, Some(56), None).unwrap().round() as i16, 554);
+    for moment in [0, 1, 12] {
+        let before = StoryState::at(moment);
+        let step = area.story_advance(&before.encode(), 0).expect("existing entry point");
+        let after = StoryState::decode(&step.progress).unwrap();
+        assert!(def.presents_step("nmkin_2", &before, &after));
+        assert!(!def.starts_on_arrival() && !def.offered_to(&before));
+        assert!(!def.presents_step("nmkin_3", &before, &after));
+        assert!(area.story_advance(&step.progress, 0).is_none(), "entry step is paid once");
+        let outcome = run_to_end(&f, &def, &before, 1, &[]).unwrap();
+        assert_eq!((outcome.end, outcome.windows, outcome.questions), (End::Finished, 0, 0));
+        assert!(outcome.is_complete(), "{outcome:?}");
+        assert!(outcome.unknown_persistent_reads.is_empty(), "{outcome:?}");
+        assert!(outcome.party.is_empty() && outcome.jump.is_none() && outcome.writes.tracked.is_empty());
+        assert_eq!(outcome.writes.moment, Some(13));
+        assert!(outcome.writes.untracked.keys().all(|(bank, _)| !(1..=4).contains(bank)));
+        assert!([&outcome.setup_stats, &outcome.stats].iter().all(|stats| stats.ignored.keys().all(|op| !SKIPPED_STATE_OPS.contains(op))));
+        let mut interpreted = before.clone();
+        outcome.writes.apply_to(&mut interpreted);
+        assert_eq!(interpreted, after, "exact existing step, no new saved state");
+        let mut play = ScenePlay::new(&f, &def, &before, 1).unwrap();
+        assert!(play.initial_stage_events().contains(&Stage::Place { entity: 4, x: -491, y: -53, z: Some(1500), triangle: Some(72) }));
+        let beat = play.next(None);
+        assert!(matches!(beat.then, Then::End { how: End::Finished, .. }));
+        let moves: Vec<_> = beat.stage.iter().filter_map(|event| match event.what {
+            Stage::Move { entity: 4, x, y, z, .. } => Some((x, y, z)), _ => None,
+        }).collect();
+        assert_eq!(moves.len(), 5);
+        assert_eq!(moves[..4], [(381, -33, Some(1055)), (663, 773, Some(1057)), (786, 818, Some(1058)), (794, -128, Some(554))]);
+        assert_eq!(moves[4], (-816, -252, ground.height(-816, -252, None, None).map(|z| z.round() as i16)));
+        assert!(moves[4].2.is_some_and(|z| z < 554), "last segment reaches the lower floor");
+        assert!(beat.stage.iter().any(|event| event.what == Stage::Show { entity: 4, visible: false }));
+        assert_eq!(play.off_cast(), 0);
+    }
+    let story = StoryState::at(12);
+    let spots = auto_witnesses(&f, &def, &story, 1, 3);
+    assert!(!spots.is_empty(), "the owner has a measured floor position");
+    let cast = cast_places(&f, &def, &story, 1).unwrap();
+    let parts = mesh_parts(&mesh);
+    let ring = 5.5 * fmv_ff7::default_model_scale(FieldScript::from_field(&f).unwrap().header().scale);
+    for spot in spots.iter().chain(std::iter::once(&def.arrival)) {
+        assert!(fmv_ff7::script::triangle_contains_xy(&mesh.triangles[usize::from(spot.triangle)], i32::from(spot.x), i32::from(spot.y)));
+        assert_eq!(parts[usize::from(spot.triangle)], parts[usize::from(def.arrival.triangle)]);
+        assert!(cast.iter().all(|&(x,y)| (x-f32::from(spot.x)).hypot(y-f32::from(spot.y)) >= 2.0*ring+16.0));
+        assert!(scenery_gap(&mesh, f32::from(spot.x), f32::from(spot.y)) >= 1.5*ring);
+    }
+    eprintln!("Jessie descent: five resolved move heights; {} automatic witness spots; rendered movement untested", spots.len());
+    for moment in [0, 1, 12, 13, 14, 27, 33, 32767, 32768, u16::MAX] {
+        for bits in [false, true] {
+            let mut story = StoryState::at(moment);
+            for bit in [LIFT_BIT, FREED_BIT, TIMEOUT_BIT] { story.set_bit(REACTOR_STATE.bank, REACTOR_STATE.address, bit, bits); }
+            let saved = story.encode();
+            let phase = area.phase_key(&saved).unwrap();
+            let init = ScenePlay::new(&f, &def, &story, 1).unwrap();
+            let mut expected = base.clone();
+            for event in init.initial_stage_events() {
+                if let Stage::Show { entity: 4, visible } = *event { expected[0].unconditional = visible; }
+            }
+            assert_eq!(area.npcs_in_phase(&phase), expected, "owned init, signed boundary, stable slot at {moment}; bits={bits}");
+            assert_eq!(area.phase_key(&StoryState::decode(&saved).unwrap().encode()), Some(phase));
+            if moment >= 13 { assert!(!def.applies_at(moment)); }
+        }
+    }
+}

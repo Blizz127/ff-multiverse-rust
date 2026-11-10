@@ -586,6 +586,21 @@ pub fn run_ahead_scene() -> SceneDef {
     }
 }
 
+/// Jessie's descent from the lift, before the existing entry step to 13.
+pub const JESSIE_DESCENT_SCENE_ID: &str = "ff7/nmkin_2/jessie-descent";
+
+pub fn jessie_descent_scene() -> SceneDef {
+    SceneDef {
+        id: JESSIE_DESCENT_SCENE_ID.into(), game: "ff7".into(), field: "nmkin_2".into(),
+        trigger: Trigger { entity: 4, name: "av_j".into(), slot: 0, talk_radius: 0, moments: 0..=12 },
+        setup: vec![ScriptRef::new(4, 0)], given: vec![], root: vec![Step::StartMain(4)],
+        cast: vec![CastMember { entity: 4, name: "av_j".into(), look: Look::Model { hrc: "axdc".into(), idle: "acfe".into() }, start: None }],
+        speakers: vec![], witness: vec![],
+        arrival: Spot { x: -682, y: 308, triangle: 92, direction: 64 },
+        presents: Some(13), resume_after_battle: None, presents_bit: None,
+    }
+}
+
 /// Offline director survey at moment 51. The route, witness, field effects and party state
 /// have not been verified for live play, so this definition is deliberately unregistered.
 pub fn sector7_station_scene() -> SceneDef {
@@ -780,7 +795,7 @@ pub fn proof_scene() -> SceneDef {
 /// ones before it keep their numbers): the proof, the two the escape from the first reactor ends in, and the cutscenes of the
 /// reactor's own story points.
 pub fn scenes() -> Vec<SceneDef> {
-    vec![proof_scene(), post_escape_scene(), station_scene(), team_talk_scene(), reactor_door_scene(), guard_scorpion_scene(), guard_scorpion_victory_scene(), jessie_rescue_scene(), jessie_ladder_scene(), run_ahead_scene()]
+    vec![proof_scene(), post_escape_scene(), station_scene(), team_talk_scene(), reactor_door_scene(), guard_scorpion_scene(), guard_scorpion_victory_scene(), jessie_rescue_scene(), jessie_ladder_scene(), run_ahead_scene(), jessie_descent_scene()]
 }
 
 /// Whether `field` (the archive's spelling; case does not matter) is the field of a scene the game offers: a place a

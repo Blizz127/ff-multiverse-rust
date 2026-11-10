@@ -1455,6 +1455,11 @@ point moves the story to, or `SceneDef::presents_bit` for an existing saved flag
   point turns on reactor bit 5 at moment 27. The scene uses that existing step and introduces no saved fields. It cannot
   start on entry or repeat after the flag is saved. The narrow floor provides one automatic witness spot; other watchers
   keep their actual positions. Camera visibility has not been checked on a rendered frame.
+* **`ff7/nmkin_2/jessie-descent`**: Jessie follows her five scripted movement segments from the lift and disappears
+  before the existing entry step to 13 is saved. MOVE heights use the actor's previous height when floors overlap;
+  the owned descent check pins the upper and middle walkway instead of letting her drop to the ground floor early.
+  Her NPC stays hidden from moment 13, including on re-login. The scene adds no dialogue or saved flags. Rendered movement
+  remains untested; the two-client smoke uses independent entry runs.
 * **`ff7/nmkin_3/jessie-ladder`**: Jessie's first ladder explanation and descent, one window before the existing talk
   point advances the story to 14. Nearby party members share the scene. Jessie and the potion use their own scripts;
   Cloud has no scripted action in this branch. The upper platform uses one measured witness spot clear of her path;

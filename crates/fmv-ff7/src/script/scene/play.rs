@@ -14,7 +14,7 @@
 //! [`run_to_end`] is the headless run the server makes to learn those writes from the answers a player gave.
 
 use super::data::{CastMember, SceneDef, Spot};
-use super::vm::{Beat, Limits, SceneVars, Stage, Stats, Then, Timed, Vm, Where};
+use super::vm::{Beat, Limits, MoveHow, SceneVars, Stage, Stats, Then, Timed, Vm, Where};
 use crate::field::{FieldFile, ModelLoader, Vertex, Walkmesh};
 use crate::field_direction_to_facing;
 use crate::script::dialogue::End;
@@ -232,6 +232,8 @@ pub struct ScenePlay {
     vm: Vm,
     setup: Stats,
     initial: Vec<Stage>,
+    /// Last authored/resolved height of each actor, carried across beats to select overlapping floors.
+    heights: BTreeMap<u8, i16>,
     cast: BTreeSet<u8>,
     off_cast: u32,
     story: StoryState,
@@ -294,7 +296,10 @@ impl ScenePlay {
         let ground = Ground::new(mesh);
         let cast: BTreeSet<u8> = def.cast.iter().map(|m| m.entity).collect();
         let initial = Self::initial_stage(&vm, &ground, &def.cast);
-        Ok(Self { def: def.clone(), section, ground, vm, setup, initial, cast, off_cast: 0, story: story.clone(), ended: None })
+        let heights = initial.iter().filter_map(|event| match *event {
+            Stage::Place { entity, z: Some(z), .. } => Some((entity, z)), _ => None,
+        }).collect();
+        Ok(Self { def: def.clone(), section, ground, vm, setup, initial, heights, cast, off_cast: 0, story: story.clone(), ended: None })
     }
 
     /// Where everyone of the cast stands when the scene begins: what the stage scripts left, else the cast's own start.
@@ -373,11 +378,21 @@ impl ScenePlay {
         self.off_cast = self.off_cast.saturating_add(u32::try_from(before - beat.stage.len()).unwrap_or(u32::MAX));
         for Timed { what, .. } in &mut beat.stage {
             match what {
-                Stage::Place { x, y, z, triangle, .. } if z.is_none() => {
-                    *z = self.ground.height(*x, *y, *triangle, None).map(|h| h.round() as i16);
+                Stage::Place { entity, x, y, z, triangle } => {
+                    if z.is_none() {
+                        *z = self.ground.height(*x, *y, *triangle, self.heights.get(entity).copied()).map(|h| h.round() as i16);
+                    }
+                    if let Some(z) = *z { self.heights.insert(*entity, z); }
                 }
-                Stage::Move { x, y, z, .. } if z.is_none() => {
-                    *z = self.ground.height(*x, *y, None, None).map(|h| h.round() as i16);
+                Stage::Move { entity, x, y, z, how, .. } => {
+                    // MOVE gives no height. On stacked floors use the actor's preceding surface,
+                    // not the surface nearest world zero. Keep jump resolution unchanged: its
+                    // authored destination triangle is not yet carried by Stage::Move.
+                    if z.is_none() {
+                        let hint = (*how == MoveHow::Walk).then(|| self.heights.get(entity).copied()).flatten();
+                        *z = self.ground.height(*x, *y, None, hint).map(|h| h.round() as i16);
+                    }
+                    if let Some(z) = *z { self.heights.insert(*entity, z); }
                 }
                 _ => {}
             }

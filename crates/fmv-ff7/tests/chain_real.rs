@@ -1047,6 +1047,9 @@ fn nobody_is_stranded_at_27_or_33_in_any_reviewed_field() {
             if field == "md1_2" {
                 expected.iter_mut().filter(|npc| ["av_b", "av_c", "av_w"].contains(&npc.entity_name.as_str())).for_each(|npc| npc.unconditional = false);
             }
+            if field == "nmkin_2" {
+                expected.iter_mut().filter(|npc| npc.entity_name == "av_j").for_each(|npc| npc.unconditional = false);
+            }
             if field == "nmkin_5" {
                 expected.iter_mut().filter(|npc| npc.entity_name == "mtr").for_each(|npc| npc.unconditional = false);
             }

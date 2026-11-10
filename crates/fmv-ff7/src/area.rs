@@ -212,6 +212,7 @@ const JESSIE_LOWER_PHASE: u8 = b'L';
 const JESSIE_TRAPPED_PHASE: u8 = b'T';
 const MATERIA_HIDDEN_PHASE: u8 = b'H';
 const RUN_AHEAD_HIDDEN_PHASE: u8 = b'R';
+const JESSIE_DESCENDED_PHASE: u8 = b'D';
 
 /// Cap on a decompressed field file (16 MiB). The largest part of a PC field is its
 /// background (at most 42 texture pages of at most 128 KiB, about 5 MiB) and the largest
@@ -1041,6 +1042,10 @@ impl AreaRuntime for Ff7FieldArea {
             // The three owned inits use signed IFSW >= 8 to hide the crew after they run ahead.
             if (story.moment as i16) >= 8 { phase.0.insert(0, RUN_AHEAD_HIDDEN_PHASE); }
         }
+        if self.info.id.key.eq_ignore_ascii_case("nmkin_2") {
+            let story = story::StoryState::decode(progress)?;
+            if (story.moment as i16) >= 13 { phase.0.insert(0, JESSIE_DESCENDED_PHASE); }
+        }
         if self.info.id.key.eq_ignore_ascii_case("nmkin_5") {
             let story = story::StoryState::decode(progress)?;
             // The owned setup uses IFSW (a signed word) >= 15. Preserve that boundary even for
@@ -1079,6 +1084,11 @@ impl AreaRuntime for Ff7FieldArea {
                 if ["av_b", "av_c", "av_w"].iter().any(|name| npc.entity_name.eq_ignore_ascii_case(name)) {
                     npc.unconditional = false; // retain slots and identities after the scene and on re-login
                 }
+            }
+        }
+        if self.info.id.key.eq_ignore_ascii_case("nmkin_2") && phase.0.first() == Some(&JESSIE_DESCENDED_PHASE) {
+            for npc in &mut npcs {
+                if npc.entity_name.eq_ignore_ascii_case("av_j") { npc.unconditional = false; }
             }
         }
         if self.info.id.key.eq_ignore_ascii_case("nmkin_5") && phase.0.first() == Some(&MATERIA_HIDDEN_PHASE) {
