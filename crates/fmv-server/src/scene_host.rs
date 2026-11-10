@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use fmv_core::Pos;
-use fmv_ff7::script::scene::{run_to_end_with_resources, scenes, trigger_npc, SceneDef, SceneResources};
+use fmv_ff7::script::scene::{run_to_end_with_resources, run_to_end_with_resources_strict, scenes, trigger_npc, SceneDef, SceneResources};
 use fmv_ff7::story::StoryState;
 use fmv_ff7::{field_direction_to_facing, Ff7Adapter, Ff7FieldArea};
 
@@ -76,8 +76,8 @@ pub struct Ff7SceneHost {
     defs: Vec<SceneDef>,
     fields: Mutex<BTreeMap<String, Option<Arc<Ff7FieldArea>>>>,
     /// Whether a scene may save story variables beyond the ones every build has always saved
-    /// ([`saves_only_what_was_always_saved`]). Off unless the server is started with `--story-extended-save`: with it off, a
-    /// scene whose story would carry such a variable is not applied at all (it can be played, it changes nothing).
+    /// ([`saves_only_what_was_always_saved`]). Off unless the server is started with `--story-extended-save`.
+    /// Scenes needing an exact transaction and already extended stories are not offered while it is off.
     extended_save: bool,
 }
 
@@ -103,11 +103,13 @@ impl Ff7SceneHost {
     }
 
     fn finish_scene(&self, scene: &str, progress: &[u8], seed: u32, answers: &[u8], preview: bool, gil: Option<u32>) -> Option<SceneResult> {
-        let (def, story) = (self.def(scene)?, StoryState::decode(progress)?);
+        let def = self.def(scene)?;
+        let story = def.prepare_story(&StoryState::decode(progress)?).ok()?;
         if !preview && story.supports_extended() && (!self.extended_save || gil.is_none()) { return None; }
         let area = self.field(&def.field)?;
         let answers: Vec<usize> = answers.iter().map(|&a| usize::from(a)).collect();
-        let outcome = run_to_end_with_resources(area.field_file(), def, &story, seed, SceneResources { gil }, &answers).ok()?;
+        let run = if !preview && story.supports_extended() { run_to_end_with_resources_strict } else { run_to_end_with_resources };
+        let outcome = run(area.field_file(), def, &story, seed, SceneResources { gil }, &answers).ok()?;
         if !(if preview { complete_outcome(&outcome) } else if story.supports_extended() { safe_interpretation(&outcome) } else { safe_outcome(&outcome) }) { return None; }
         let mut after = story.clone();
         let changed = if story.supports_extended() {
@@ -168,7 +170,9 @@ impl SceneHost for Ff7SceneHost {
 
     fn offered(&self, scene: &str, progress: &[u8]) -> bool {
         let (Some(def), Some(story)) = (self.def(scene), StoryState::decode(progress)) else { return false };
-        def.offered_to(&story)
+        (!(def.requires_exact_transaction() || story.supports_extended()) || self.extended_save)
+            && def.prepare_story(&story).is_ok()
+            && def.offered_to(&story)
     }
 
     fn automatic(&self, scene: &str) -> bool {
@@ -214,7 +218,7 @@ impl SceneHost for Ff7SceneHost {
 
     fn preview_progress(&self, scene: &str) -> Option<Vec<u8>> {
         let def = self.def(scene)?;
-        Some(StoryState::at(*def.trigger.moments.start()).encode())
+        Some(def.prepare_story(&StoryState::at(*def.trigger.moments.start())).ok()?.encode())
     }
 
     fn finish(&self, scene: &str, progress: &[u8], seed: u32, answers: &[u8]) -> Option<SceneResult> {
@@ -332,42 +336,54 @@ mod tests {
         use crate::saver::{persist_scene, SceneSaveJob};
         use fmv_core::GameId;
         use fmv_persist::{CharacterProgress, Progression, Store};
-        use fmv_ff7::script::scene::{flower_station_scene, FLOWER_STATION_SCENE_ID};
+        use fmv_ff7::script::scene::FLOWER_STATION_SCENE_ID;
         let data = std::path::PathBuf::from(std::env::var_os("FMV_FF7_DATA").expect("owned field data"));
         let opened = open_ff7(&Ff7Source::Flevel { path: data.join("field/flevel.lgp"), labels: Ff7Labels::default() }).unwrap();
         let mut host = Ff7SceneHost::with_extended_save(opened.adapter, true);
-        // Survey definition stays unregistered until the complete route and presentation pass.
-        host.defs.push(flower_station_scene());
-        let before = StoryState::at(36).into_extended().unwrap().encode();
-        for gil in [0u32, 1, 600] {
-            for (answers, bought) in [(&[2u8][..], false), (&[3, 2, 0][..], true), (&[3, 3, 0][..], true), (&[3, 2, 1][..], false), (&[3, 3, 1][..], false)] {
-                let result = host.finish_with_resources(FLOWER_STATION_SCENE_ID, &before, 1, answers, gil).expect("complete original scene");
-                let next_gil = if bought { gil.saturating_sub(1) } else { gil };
-                assert_eq!(result.transaction, Some(SceneTransaction { expected_gil: gil, next_gil }));
-                assert!(result.changed && result.travel.is_none());
-                let dir = tempfile::tempdir().unwrap();
-                let store = Store::open(dir.path()).unwrap();
-                let (account, _token) = store.create_account("Flower test", 1).unwrap();
-                store.put_progression(&Progression::new(account, GameId::Ff7, before.clone(), 1)).unwrap();
-                let character = CharacterProgress { account_id: account, game: GameId::Ff7, gil, ..CharacterProgress::new(account, GameId::Ff7, 0, 6, 1) };
-                store.put_character_progress(&character).unwrap();
-                let job = SceneSaveJob { account, scene_key: FLOWER_STATION_SCENE_ID.into(), expected_story: before.clone(),
-                    next_story: result.progress.clone(), expected_gil: gil, next_gil };
-                let saved = persist_scene(&store, GameId::Ff7, &job, 2).unwrap();
-                assert_eq!(saved.pair.character.as_ref().unwrap().gil, next_gil);
-                assert_eq!(saved.pair.story.blob, result.progress);
-                drop(store);
-                let store = Store::open(dir.path()).unwrap();
-                let repeated = persist_scene(&store, GameId::Ff7, &job, 3).unwrap();
-                assert_eq!(repeated.commit, fmv_persist::SceneCommit::AlreadyApplied);
-                assert_eq!(repeated.pair, saved.pair, "reconnect never charges twice");
-                let preview = host.finish_preview_with_resources(FLOWER_STATION_SCENE_ID, &before, 1, answers, gil).unwrap();
-                assert!(preview.transaction.is_none());
+        assert!(host.def(FLOWER_STATION_SCENE_ID).is_some());
+        for before in [StoryState::at(36).encode(), StoryState::at(36).into_extended().unwrap().encode()] {
+            for gil in [0u32, 1, 600] {
+                for answers in [&[][..], &[3][..], &[3, 2][..], &[3, 2, 9][..], &[0][..], &[2, 0][..], &[3, 2, 0, 0][..]] {
+                    assert!(host.finish_with_resources(FLOWER_STATION_SCENE_ID, &before, 1, answers, gil).is_none(),
+                        "incomplete, out-of-range or trailing answers cannot produce a durable outcome: {answers:?}");
+                    assert!(host.finish_preview_with_resources(FLOWER_STATION_SCENE_ID, &before, 1, answers, gil).is_some(),
+                        "previews retain cursor defaults and clamping: {answers:?}");
+                }
+                for (answers, bought) in [(&[2u8][..], false), (&[3, 2, 0][..], true), (&[3, 3, 0][..], true), (&[3, 2, 1][..], false), (&[3, 3, 1][..], false)] {
+                    let result = host.finish_with_resources(FLOWER_STATION_SCENE_ID, &before, 1, answers, gil).expect("complete original scene");
+                    let next_gil = if bought { gil.saturating_sub(1) } else { gil };
+                    assert_eq!(result.transaction, Some(SceneTransaction { expected_gil: gil, next_gil }));
+                    assert!(result.changed && result.travel.is_none());
+                    let dir = tempfile::tempdir().unwrap();
+                    let store = Store::open(dir.path()).unwrap();
+                    let (account, _token) = store.create_account("Flower test", 1).unwrap();
+                    store.put_progression(&Progression::new(account, GameId::Ff7, before.clone(), 1)).unwrap();
+                    let character = CharacterProgress { account_id: account, game: GameId::Ff7, gil, ..CharacterProgress::new(account, GameId::Ff7, 0, 6, 1) };
+                    store.put_character_progress(&character).unwrap();
+                    let job = SceneSaveJob { account, scene_key: FLOWER_STATION_SCENE_ID.into(), expected_story: before.clone(),
+                        next_story: result.progress.clone(), expected_gil: gil, next_gil };
+                    let saved = persist_scene(&store, GameId::Ff7, &job, 2).unwrap();
+                    assert_eq!(saved.pair.character.as_ref().unwrap().gil, next_gil);
+                    assert_eq!(saved.pair.story.blob, result.progress);
+                    drop(store);
+                    let store = Store::open(dir.path()).unwrap();
+                    let repeated = persist_scene(&store, GameId::Ff7, &job, 3).unwrap();
+                    assert_eq!(repeated.commit, fmv_persist::SceneCommit::AlreadyApplied);
+                    assert_eq!(repeated.pair, saved.pair, "reconnect never charges twice");
+                    let preview = host.finish_preview_with_resources(FLOWER_STATION_SCENE_ID, &before, 1, answers, gil).unwrap();
+                    assert!(preview.transaction.is_none());
+                }
             }
+            assert!(host.finish(FLOWER_STATION_SCENE_ID, &before, 1, &[3, 2, 0]).is_none(), "no gil snapshot");
         }
-        assert!(host.finish(FLOWER_STATION_SCENE_ID, &before, 1, &[3, 2, 0]).is_none(), "no gil snapshot");
+        let before = StoryState::at(36).encode();
         host.extended_save = false;
+        assert!(!host.offered(FLOWER_STATION_SCENE_ID, &before), "disabled unless the extended save is enabled");
         assert!(host.finish_with_resources(FLOWER_STATION_SCENE_ID, &before, 1, &[2], 1).is_none(), "explicit v3 save gate");
+        let legacy = StoryState::at(33);
+        let scene = fmv_ff7::script::scene::POST_ESCAPE_SCENE_ID;
+        assert!(host.offered(scene, &legacy.encode()), "legacy reactor route stays available with the flag off");
+        assert!(!host.offered(scene, &legacy.into_extended().unwrap().encode()), "a scene that cannot commit its existing v3 snapshot must not be offered");
     }
 
     /// A scene's party change is accepted only where the story's own party table has the party the scripts leave: the

@@ -28,10 +28,11 @@
 //!
 //! # Honest limits
 //!
-//! * Matching field-model cast can play normal-speed full-range default loops, full Holds and explicit forward Hold ranges. Canonical appearance
+//! * Matching field-model cast can play full-range default loops at normal or double speed, full Holds and explicit forward Hold ranges. Canonical appearance
 //!   substitutions and unsupported animation forms keep their usual clips; skipped events are counted ([`stage::Counts`]).
 //!   A standing loop yields to movement; moving replaces a held pose or range. A full or bounded Once can return to a known,
-//!   different default slot. Same-slot returns, unknown defaults, cropped loops and dynamic rates remain unsupported. Ordinary MOVE can resolve its original walk/run slot on that same model;
+//!   different default slot. A standing full loop preserves its phase when ASPED changes between 16 and 32. Same-slot returns,
+//!   unknown defaults, cropped loops and other dynamic rates remain unsupported. Ordinary MOVE can resolve its original walk/run slot on that same model;
 //!   its clip starts at zero for each move, so same-slot phase/rate retention across repeated moves is not reproduced.
 //! * The scene's camera moves are recorded ([`stage::CameraState`], on the stage's own clock) and shown by the window's field
 //!   camera (`crate::camera`, through [`camera_shot`]): scrolls, follows and the scene's lead.

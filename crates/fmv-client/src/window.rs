@@ -1046,7 +1046,7 @@ impl App {
         // (a scene's trigger is not drawn while its scene runs, and is not named either)
         let story = state.scene.player();
         let anchor = |subject: Subject, at: Pos| {
-            if scene::label_hidden(story, subject) {
+            if scene::label_hidden(story, subject, state.npc_views()) {
                 None
             } else {
                 label_anchor(built.as_ref(), view, draw.own_who, subject, at)

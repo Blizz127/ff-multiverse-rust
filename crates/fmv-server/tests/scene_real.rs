@@ -73,8 +73,16 @@ async fn the_proof_scene_starts_from_its_trigger_on_the_real_field_holds_the_pla
             ("ff7/md1_1/team-talk", "md1_1"),
             ("ff7/nmkin_1/reactor-door", "nmkin_1"),
             ("ff7/nmkin_5/guard-scorpion", "nmkin_5"),
+            ("ff7/nmkin_5/guard-scorpion-victory", "nmkin_5"),
+            ("ff7/nmkin_3/jessie-rescue", "nmkin_3"),
+            ("ff7/nmkin_3/jessie-ladder", "nmkin_3"),
+            ("ff7/md1_2/run-ahead", "md1_2"),
+            ("ff7/nmkin_2/jessie-descent", "nmkin_2"),
+            ("ff7/nrthmk/reactor-approach", "nrthmk"),
+            ("ff7/nrthmk/reactor-finale", "nrthmk"),
+            ("ff7/md8_2/flower", "md8_2"),
         ],
-        "the proof first (its trigger keeps its number), then the scenes after the escape and the reactor's cutscenes"
+        "stable trigger numbers: the proof, post-escape scenes, reactor scenes, then the flower encounter"
     );
     // The two scenes after the escape start by themselves; the cutscene is never offered or started by itself, only played
     // for the step of md1_1's story point that it presents.

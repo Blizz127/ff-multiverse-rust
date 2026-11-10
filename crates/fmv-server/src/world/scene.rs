@@ -766,9 +766,9 @@ impl World {
 
     /// End the presentation once. Durable results retain the hold until the saver acknowledges;
     /// removing the active run first makes repeated ends and timeouts harmless.
-    fn end_run(&mut self, run: SceneRunId, outcome: SceneOutcome, now: Instant) {
+    fn end_run(&mut self, run: SceneRunId, mut outcome: SceneOutcome, now: Instant) {
         let Some(record) = self.scenes.runs.remove(&run) else { return };
-        let apply = matches!(outcome, SceneOutcome::Finished | SceneOutcome::Skipped);
+        let mut apply = matches!(outcome, SceneOutcome::Finished | SceneOutcome::Skipped);
         let mut result = if !apply || !record.writes_story { None } else {
             self.scenes.host.as_ref().and_then(|host| {
                 if record.preview { host.finish_preview_with_resources(&record.scene, &record.progress, record.seed, &record.answers, record.gil) }
@@ -776,8 +776,15 @@ impl World {
             })
         };
         if apply && record.writes_story && !record.preview && record.then.is_none() && result.is_none() {
-            self.fail_scene_save(run, record, "the scene result could not be interpreted");
-            return;
+            if outcome == SceneOutcome::Skipped {
+                // Leaving before an economic choice is answered abandons the presentation. It
+                // cannot invent an answer or publish success, but it is not a storage failure.
+                outcome = SceneOutcome::Aborted;
+                apply = false;
+            } else {
+                self.fail_scene_save(run, record, "the scene result could not be interpreted");
+                return;
+            }
         }
         let durable = !record.preview && result.as_ref().is_some_and(|r| r.transaction.is_some());
         // A story write must not strand a player when its required destination cannot load or

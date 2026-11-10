@@ -56,18 +56,22 @@ pub fn is_trigger(id: u32) -> bool {
 /// puts it, so it is not drawn twice).
 pub fn visible_npcs<'a>(npcs: &'a [NpcView], scene: Option<&ScenePlayer>) -> Cow<'a, [NpcView]> {
     let Some(scene) = scene else { return Cow::Borrowed(npcs) };
-    let cast = &scene.def().cast;
-    let played = |n: &NpcView| !n.name.is_empty() && cast.iter().any(|m| m.name.eq_ignore_ascii_case(&n.name));
-    if npcs.iter().any(|n| is_trigger(n.id) || played(n)) {
-        Cow::Owned(npcs.iter().filter(|n| !is_trigger(n.id) && !played(n)).cloned().collect())
+    if npcs.iter().any(|n| hides_npc(scene, n)) {
+        Cow::Owned(npcs.iter().filter(|n| !hides_npc(scene, n)).cloned().collect())
     } else {
         Cow::Borrowed(npcs)
     }
 }
 
-/// Whether a name label is not drawn while `scene` is on show: the label of a scene's trigger.
-pub fn label_hidden(scene: Option<&ScenePlayer>, subject: Subject) -> bool {
-    scene.is_some() && matches!(subject, Subject::Npc(id) if is_trigger(id))
+fn hides_npc(scene: &ScenePlayer, npc: &NpcView) -> bool {
+    is_trigger(npc.id) || (!npc.name.is_empty() && scene.def().cast.iter().any(|m| m.name.eq_ignore_ascii_case(&npc.name)))
+}
+
+/// A scene replaces the trigger and cast NPCs, including their old labels. Otherwise a hidden
+/// pedestrian's label would remain at its field position after the scene moves or hides its body.
+pub fn label_hidden(scene: Option<&ScenePlayer>, subject: Subject, npcs: &[NpcView]) -> bool {
+    let (Some(scene), Subject::Npc(id)) = (scene, subject) else { return false };
+    is_trigger(id) || npcs.iter().find(|n| n.id == id).is_some_and(|n| hides_npc(scene, n))
 }
 
 /// The cast as avatars to draw.

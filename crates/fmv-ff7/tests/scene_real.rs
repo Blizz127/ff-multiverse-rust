@@ -611,7 +611,9 @@ fn the_guard_scorpion_talk_is_the_cutscene_of_the_point_that_starts_the_boss_bat
     assert_eq!(sounds.iter().map(|(_, id, pan)| (*id, *pan)).collect::<Vec<_>>(),
         [(236, 64), (0, 64), (61, 64), (59, 64), (60, 64), (0, 64)]);
     assert_eq!(sounds[3].0 - sounds[2].0, 60, "the bomb's two sounds are separated by WAIT 60");
-    assert_eq!(sounds[4].0 - sounds[3].0, 30, "WAIT 10 and WAIT 20 precede the alarm");
+    // cl.6: WAIT10@05DE, blocking ANIM!2@05E1, WAIT20@05E4, SOUND60@05E7.
+    // Full-clip lengths still use the VM's 15-frame estimate; ANIM!2 has waited since e1def05.
+    assert_eq!(sounds[4].0 - sounds[3].0, 45, "both waits and the blocking animation precede the alarm");
     assert_eq!(play.off_cast(), 0);
 }
 
@@ -713,10 +715,13 @@ fn every_story_entry_stands_on_the_floor_the_fields_ways_out_are_on() {
     let jump = run_to_end(&field("md8_4").unwrap(), &fmv_ff7::script::scene::post_escape_scene(), &StoryState::at(33), 1, &[]).unwrap().jump.unwrap();
     let street = story_entry(36).unwrap();
     assert_eq!((street.field, street.spot.x, street.spot.y, i16::try_from(street.spot.triangle).unwrap(), street.spot.direction), ("md8_1", jump.x, jump.y, jump.triangle, jump.direction));
-    assert_eq!(story_entry(u16::MAX).map(|e| e.field), Some("md8_1"), "until a later row says otherwise");
+    assert_eq!(story_entry(38).map(|e| e.field), Some("md8_1"));
+    let flower = story_entry(39).unwrap();
+    assert_eq!((flower.field, flower.spot.x, flower.spot.y, flower.spot.triangle, flower.spot.direction), ("md8_2", -3989, 21138, 19, 150));
+    assert_eq!(story_entry(u16::MAX).map(|e| e.field), Some("md8_2"), "until a later row says otherwise");
 
     // Each scene's witness stands on its own triangle, on the floor the entry is on (the player walks away from it after).
-    for def in [fmv_ff7::script::scene::post_escape_scene(), fmv_ff7::script::scene::station_scene()] {
+    for def in [fmv_ff7::script::scene::post_escape_scene(), fmv_ff7::script::scene::station_scene(), fmv_ff7::script::scene::flower_station_scene()] {
         let f = field(&def.field).unwrap();
         let mesh = f.walkmesh().unwrap();
         let parts = mesh_parts(&mesh);
@@ -877,8 +882,8 @@ fn sector7_intro_survey_reports_its_assumed_flags_and_cast() {
 }
 
 #[test]
-#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA); the gil scene is not enabled"]
-fn flower_station_survey_distinguishes_purchase_and_nonpurchase_paths() {
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn flower_station_distinguishes_purchase_and_nonpurchase_paths() {
     let f = field("md8_2").expect("FMV_FF7_DATA and md8_2");
     let def = fmv_ff7::script::scene::flower_station_scene();
     let story = StoryState::at(36);
@@ -889,14 +894,102 @@ fn flower_station_survey_distinguishes_purchase_and_nonpurchase_paths() {
         assert_eq!(model.animations.first().map(|a| a.stem()).as_deref(), Some(idle.as_str()));
     }
     for (answers, debit, windows) in [(&[2usize][..], false, 3), (&[3, 2, 0][..], true, 7), (&[3, 3, 0][..], true, 8), (&[3, 2, 1][..], false, 6), (&[3, 3, 1][..], false, 7)] {
-        let outcome = run_to_end(&f, &def, &story, 1, answers).unwrap();
+        let outcome = fmv_ff7::script::scene::run_to_end_with_resources(&f, &def, &story, 1, fmv_ff7::script::scene::Resources { gil: Some(600) }, answers).unwrap();
         assert_eq!((outcome.end, outcome.windows, outcome.writes.moment), (End::Finished, windows, Some(39)));
-        assert_eq!(outcome.stats.ignored.contains_key("GOLDd"), debit);
-        assert_eq!(outcome.writes.untracked.get(&(3, 66)), Some(&1));
-        assert_eq!(outcome.writes.untracked.contains_key(&(3, 111)), debit);
-        assert!(outcome.unknown_persistent_reads.contains(&(3, 66)));
+        assert!(outcome.is_complete());
+        assert!(!outcome.stats.ignored.contains_key("GOLDd"));
+        assert_eq!(outcome.resources.gil_after, Some(if debit { 599 } else { 600 }));
+        assert_eq!(outcome.writes.persistent.get(&(3, 66)), Some(&(1, 1)));
+        assert_eq!(outcome.writes.persistent.contains_key(&(3, 111)), debit);
+        assert!(outcome.unknown_persistent_reads.is_empty());
+        assert!(!story.supports_extended(), "automatic playback promotion leaves the input save untouched");
         assert_eq!((outcome.stats.unresolved, outcome.stats.dropped_requests), (0, 0));
         assert!(outcome.stats.unknown.is_empty());
+    }
+}
+
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn the_registered_flower_route_and_return_use_authored_walkable_positions() {
+    use fmv_adapter_api::{AreaRuntime, ExitKind, ExitState};
+    use fmv_core::{EditionProvenance, GameId, Platform};
+    use fmv_ff7::script::scene::{flower_station_scene, story_entry, Resources};
+    let def = flower_station_scene();
+    let f = field("md8_2").expect("FMV_FF7_DATA and md8_2");
+    let station = field("md8_1").unwrap();
+    let gateway = station.triggers().unwrap().gateways.into_iter().filter(fmv_ff7::field::Gateway::is_used)
+        .find(|g| g.target_field_id == 134).expect("the authored gateway from md8_1 to md8_2");
+    assert_eq!(gateway.destination, [def.arrival.x, def.arrival.y, def.arrival.triangle as i16]);
+    let reach = |mesh: &fmv_ff7::field::Walkmesh, start: usize| {
+        let mut seen = std::collections::BTreeSet::from([start]);
+        let mut stack = vec![start];
+        while let Some(t) = stack.pop() {
+            for edge in 0..3 {
+                if let Some(next) = mesh.neighbor(t, edge) {
+                    if seen.insert(next) { stack.push(next); }
+                }
+            }
+        }
+        seen
+    };
+    let contains = |mesh: &fmv_ff7::field::Walkmesh, seen: &std::collections::BTreeSet<usize>, x: i32, y: i32| {
+        seen.iter().any(|&t| fmv_ff7::script::triangle_contains_xy(&mesh.triangles[t], x, y))
+    };
+    let station_mesh = station.walkmesh().unwrap();
+    let seen = reach(&station_mesh, usize::from(story_entry(36).unwrap().spot.triangle));
+    let midpoint = |g: &fmv_ff7::field::Gateway| ((i32::from(g.exit_a[0]) + i32::from(g.exit_b[0])) / 2, (i32::from(g.exit_a[1]) + i32::from(g.exit_b[1])) / 2);
+    let (x, y) = midpoint(&gateway);
+    assert!(contains(&station_mesh, &seen, x, y), "the station entry can reach the flower gateway");
+
+    let entry = story_entry(39).unwrap();
+    let mesh = f.walkmesh().unwrap();
+    let seen = reach(&mesh, usize::from(entry.spot.triangle));
+    assert!(seen.contains(&usize::from(def.arrival.triangle)), "entry and arrival share reachable floor");
+    let exits: Vec<_> = f.triggers().unwrap().gateways.into_iter().filter(fmv_ff7::field::Gateway::is_used).collect();
+    assert_eq!(exits.iter().map(|g| g.target_field_id).collect::<Vec<_>>(), [133, 135]);
+    for gateway in exits {
+        let (x, y) = midpoint(&gateway);
+        assert!(contains(&mesh, &seen, x, y), "returning at moment39 can walk to field {}", gateway.target_field_id);
+    }
+    // The serving adapter keeps these raw gateways open without enabling the unreviewed directors.
+    let provenance = EditionProvenance { game: GameId::Ff7, platform: Platform::Pc, edition: "steam".into(), region: "any".into(),
+        language: "en".into(), revision: "test".into(), sources: vec![], modded: false };
+    let adapter = fmv_ff7::Ff7Adapter::from_flevel_path(flevel_path(&data_dir().unwrap()), provenance).unwrap();
+    for (from, target) in [("md8_1", "md8_2"), ("md8_2", "md8_3"), ("md8_3", "md8brdg")] {
+        let area = adapter.load_field(from).unwrap();
+        let exit = area.exits().into_iter().find(|e| e.target == target).unwrap_or_else(|| panic!("served route {from}->{target}"));
+        assert_eq!(exit.kind, ExitKind::Gateway);
+        assert_eq!(area.exit_state(&exit, &StoryState::at(39).into_extended().unwrap().encode()), ExitState::Open);
+    }
+    assert!(adapter.load_field("md8_2").unwrap().story_points().is_empty(), "the arrival scene owns the flower choices");
+    let bridge = adapter.load_field("md8brdg").unwrap();
+    assert!(!bridge.exits().iter().any(|e| e.target == "cargoin"), "the unimplemented battle/movie route stays withheld");
+    for answers in [&[2usize][..], &[3, 2, 0], &[3, 3, 0], &[3, 2, 1], &[3, 3, 1]] {
+        let mut play = ScenePlay::with_resources(&f, &def, &StoryState::at(36), 1, Resources { gil: Some(1) }).unwrap();
+        let mut answers = answers.iter().copied();
+        let (mut answer, mut place, mut direction, mut flower_lines) = (None, None, None, 0);
+        loop {
+            let beat = play.next(answer.take());
+            for event in beat.stage {
+                match event.what {
+                    Stage::Place { entity: 1, x, y, .. } | Stage::Move { entity: 1, x, y, .. } => place = Some((x, y)),
+                    Stage::Face { entity: 1, heading, .. } => direction = Some(fmv_ff7::facing_to_field_direction(heading)),
+                    _ => {},
+                }
+            }
+            match beat.then {
+                Then::Window(w) => {
+                    if w.speaker == Some(2) { flower_lines += 1; }
+                    if w.message.choice.is_some() { answer = answers.next(); }
+                },
+                Then::End { how, .. } => { assert_eq!(how, End::Finished); break; },
+            }
+        }
+        assert_eq!(play.writes().moment, Some(39));
+        assert_eq!(place, Some((entry.spot.x, entry.spot.y)), "the return uses the scene's final Cloud placement");
+        assert_eq!(direction, Some(entry.spot.direction));
+        assert!(flower_lines > 0, "the script's Flower girl label names the drawn cast entity");
+        assert!(!def.offered_to(&StoryState::at(39)), "returning cannot replay the purchase");
     }
 }
 
@@ -1001,7 +1094,7 @@ fn extended_opening_retains_authored_defaults_at_the_first_window_including_zero
 }
 
 #[test]
-#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA); flower scene is not enabled"]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
 fn extended_flower_paths_retain_each_authored_flag_without_guessing_other_bits() {
     let f = field("md8_2").expect("FMV_FF7_DATA and md8_2");
     let def = fmv_ff7::script::scene::flower_station_scene();

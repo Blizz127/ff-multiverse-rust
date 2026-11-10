@@ -793,9 +793,12 @@ AP and gil. A battle's members fight as their own character at their own level (
 gave the `i`-th member of a battle the `i`-th character of the game is gone), a victory pays each
 member that fought on, and the server adds the payment to that member's progress with FF7's own
 level-up rule, tells the player (`CharacterProgress`, which it also gets when it joins) and saves it:
-a new account starts at its character's starting level and experience from the kernel (Cloud: level 6
-with 610 experience, six short of level 7), nothing is written until its first win (or, since protocol v7,
-the first battle that ends with a limit gauge worth keeping), and it is kept in
+a new character starts at its character's starting level and experience from the kernel (Cloud: level 6
+with 610 experience, six short of level 7), with the kernel's starting gil (240 on the owner's data)
+and item stock. A server with battle rules stores those resources atomically with registration, before
+issuing the token. Login of an older account that has no character-progress record stores its historical
+zero-gil defaults once; existing records and their inventory are left unchanged. This gives a character
+an authoritative balance for a story purchase before its first battle. Progress is kept in
 `<state>/server/progression/<account>/<Game>.character.json`, a record of its own beside, and
 never mixed with, the story blob that selects the account's story phase (so a battle can never move a
 player to another instance). The window shows it under the area name (`Cloud Lv 7  EXP 626/949
@@ -859,9 +862,8 @@ four (always, after a preemptive strike or on a side attack); the actor spends i
 the difficulty that is left is kept, and a formation whose flag bit `0x0004` is clear (every counter of 9
 or more in the owner's file: bosses and story fights) cannot be escaped at all. A successful escape ends
 the battle for the whole party with `Escaped`: nothing is paid. The **gauge is saved at the end of every
-battle**, whatever the outcome (escapes included), in the account's character record (a record of its own
-is made for an account that has never won, so "nothing is written until its first win" now reads "until
-its first win or the first battle that ends with a gauge worth keeping"); records written before v7 load
+battle**, whatever the outcome (escapes included), in the account's character record, initialized at
+registration or on a legacy account's first login with battle rules. Records written before v7 load
 with an empty gauge. The headless bot gives its limit when the gauge is full (a healing one, which heals the whole
 party, only when somebody is wounded) and never runs, unless a `--battle-script` tells it to (see below).
 
@@ -1414,6 +1416,19 @@ at moment 33, and the game's own next two fields carry it on.
   performs as an ordinary area change.
 * **`ff7/md8_1/post-escape-station`** (the street, moment 33): the five jump down, four windows (five in Echo-S), the team
   splits up, and the director writes **moment 36**.
+* **`ff7/md8_2/flower`** (the next street, moment 36, requires `--story-extended-save`): walking through the station's
+  original gateway starts the flower conversation. Its five choice paths end at **moment 39**. Every path sets
+  bank 3/address 66 bit 0; buying also sets address 111 bit 0 and subtracts one gil, saturating at zero as the original
+  instruction does. The owner reports the choices; the server replays the original script against the exact starting
+  story and gil snapshot and commits the flags, moment and balance together before releasing the player.
+  Repeating the completion cannot charge twice. A failed save does not advance the scene. Missing, invalid or extra
+  choice answers cannot commit; pressing Back before all choices are answered cancels without spending gil.
+
+The flower encounter prepares a known-bit v3 story in memory when reading a supported legacy save. Unknown bits remain
+unknown; the original stored bytes remain the transaction's expected predecessor. Only successful completion stores the
+new format. Other scene definitions do not automatically promote their saves, and the flower is not offered when the
+extended-save switch is off. The route and rendering checks use temporary saves and read the owned game files without
+changing them; these changes do not deploy or convert the live preview store.
 
 **They start by themselves.** A scene whose trigger nobody can talk to (`SceneDef::starts_on_arrival`: a talk radius of 0)
 is started by the server for a player whose story it is offered to as soon as that player comes to stand in its field, for
@@ -1422,9 +1437,10 @@ that player alone (no watchers; a party member plays its own). The server announ
 **What such a scene may save.** The server applies a scene's story only if the headless run was complete and
 (`scene_host::safe_outcome`, `Ff7SceneHost::finish_scene`):
 
-* it skipped no instruction that touches the player's state (`fmv_ff7::script::scene::SKIPPED_STATE_OPS`: gil, items, HP and
+* it skipped no instruction that touches the player's state (`fmv_ff7::script::scene::SKIPPED_STATE_OPS`: items, HP and
   MP by an amount, the menus, materia, who belongs to the team). The full restores (`FULL_RESTORE_OPS`: `HMPMAX1/2/3`, `MHMMX`)
-  are the exception: this server keeps no HP or MP between battles, so every battle already starts full;
+  are the exception: this server keeps no HP or MP between battles, so every battle already starts full. Gil operations
+  execute against the server snapshot and require an exact durable transaction; unknown persistent inputs refuse a real save;
 * **the party it leaves is the story's own.** `PRTYP`, `PRTYM` and `PRTYE` are recorded by the interpreter
   (`Outcome::party`), a later test of the party in the same scene sees them, and the scene is accepted only when the
   party table (`fmv_ff7::story::CANON_PARTIES`) has that party at the story the scene wrote. The street scene runs
@@ -1432,7 +1448,7 @@ that player alone (no watchers; a party member plays its own). The server announ
   carried. A change the table has no row for is refused, never dropped;
 * **it saves nothing an older build did not**, unless the server was started with `--story-extended-save` (OFF by default):
   the moment and the reactor's long-saved byte only. A scene whose story would carry any other variable is played and then
-  not applied. These two scenes write the moment alone.
+  not applied. The two earlier post-escape scenes write the moment alone; the flower encounter requires the extended path.
 
 **Echo-S.** A player alone in a scene that asks nothing is shown the Echo-S edition of it (the client runs both editions
 first and uses the replacement only if they come to the same story: `Outcome::same_story_as`: the same end and
@@ -1442,12 +1458,14 @@ watcher, the original is shown.
 
 **Coming back.** Everyone joins in `md1stin`. A story that a scene took somewhere no walk leads back from stands there
 again at the next login (`fmv_ff7::script::scene::STORY_ENTRIES`, `SceneHost::entry`, `World::enter_at_story`): from moment
-33 outside the reactor in `md8_4`, from 36 on the street of `md8_1`, each at an arrival the game's own data names. The
+33 outside the reactor in `md8_4`, from 36 on the street of `md8_1`, and from 39 at Cloud's authored final flower-scene
+position in `md8_2`, each at a place the game's own data names. The
 player joins like everyone and is sent on through the ordinary area handshake. Without it an account at 36 could never
 reach the story again (`md8_1` has no way back and only the scene jumps there).
 
-**Not done here:** the opening movie of the street scene is skipped, scripted one-shot animation clips are not played,
-and past the street nothing of the story is offered yet (`md8_2` onwards are plain fields).
+**Not done here:** the opening movie of the street scene is skipped. The bridge confrontation after `md8_2` needs
+choice-dependent battles and continuation before its cargo-train exit can open. Later train, Sector 7 and bar scenes
+remain outside the verified playable route; see `docs/POST-REACTOR.md`. This is not a claim of complete Disc 1 accuracy.
 
 ```
 scripts/story-smoke.sh --debug --build                    # one real headless player: both scenes, 33 -> 36 saved once, restart, re-login on the street
@@ -1657,10 +1675,14 @@ frame number. Another animation, speed change or movement replaces the pose. Mis
 A fresh full Hold at ASPED 32 and literal divisor 1 also plays at twice normal speed. Jessie's post-escape scene
 uses this for slot 5, `ccif` (15 frames), on her original `axdc` model. Clip time advances by two frames per scene
 tick, including a late start, freezes with dialogue, and clamps at the loaded endpoint. A new animation resets its
-rate; a later ASPED still cancels the override. Other rates, divisors, doubled ranges and doubled Once/default loops
+rate; a later ASPED still cancels the Hold override. Other rates, divisors, doubled ranges and doubled Once clips
 keep their existing fallback. The rate follows the original [animation setup](https://github.com/Akari1982/q-gears_reverse/blob/e0fabf7e121818e5abe2f873e34a07d0eb32742d/ffvii/DISC/FIELD/FIELD.BIN_event_code_entity.cpp)
 and [frame update](https://github.com/Akari1982/q-gears_reverse/blob/e0fabf7e121818e5abe2f873e34a07d0eb32742d/ffvii/DISC/FIELD/FIELD.BIN_entity.cpp).
 The VM's existing wait estimates are unchanged; original PC render-tick matching remains unverified.
+Full standing default loops also support ASPED 16 and 32 with divisor 1. Cloud's flower-scene slots 3 and 4 run at
+twice normal speed; the later ASPED 16 resumes normal speed without restarting the current clip. These two supported
+standing-loop rate changes preserve phase and pause with dialogue. Other dynamic rates, movement, Hold and Once rate
+changes retain their existing fallback.
 A normal-speed Once can also play while the actor stands, when its default animation is known and uses a different
 slot. Biggs's team-talk gesture uses `bxic` frames 10–19, then returns to slot 0, `acfe`. The default is retained separately
 from temporary Holds and gestures, including setup and resumed-scene state. Completion restarts the different default slot

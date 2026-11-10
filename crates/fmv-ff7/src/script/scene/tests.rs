@@ -1677,10 +1677,66 @@ fn route_survey_definitions_are_not_registered_for_play() {
     assert!(scene(EARLY_BAR_SCENE_ID).is_none());
     assert!(scene(SECTOR7_STATION_SCENE_ID).is_none());
     assert!(scene(SECTOR7_INTRO_SCENE_ID).is_none());
-    assert!(scene(FLOWER_STATION_SCENE_ID).is_none());
     assert!(scene(SECTOR7_PILLAR_SCENE_ID).is_none());
     assert!(scene(CARGO_TRAIN_SCENE_ID).is_none());
     assert!(scene(REACTOR_OPENING_SCENE_ID).is_none());
+}
+
+#[test]
+fn flower_registration_promotes_only_its_local_playback_snapshot() {
+    let def = scene(FLOWER_STATION_SCENE_ID).expect("the reviewed flower scene is registered");
+    assert_eq!(def.id, "ff7/md8_2/flower");
+    assert_eq!(scenes().last(), Some(&def), "existing scene numbers stay stable");
+    assert!(def.requires_exact_transaction() && def.starts_on_arrival());
+    assert!(def.offered_to(&StoryState::at(36)));
+    assert!(!def.offered_to(&StoryState::at(39)));
+    assert!(!crate::REVIEWED_FIELDS.contains(&"md8_2"), "an eager point must not bypass the choices");
+    let original = StoryState::at(36);
+    let stored = original.encode();
+    let prepared = def.prepare_story(&original).unwrap();
+    assert!(prepared.supports_extended());
+    assert!(def.offered_to(&prepared));
+    assert_eq!(prepared.moment, original.moment);
+    assert_eq!(prepared.known_bit(3, 66, 0), None);
+    assert_eq!(prepared.known_bit(3, 111, 0), None);
+    assert_eq!(original.encode(), stored, "preparing playback does not migrate the predecessor");
+    assert_eq!(def.prepare_story(&prepared), Ok(prepared));
+    let mut tracked = original.clone();
+    tracked.set_bit(1, 225, 0, true);
+    assert_eq!(tracked.encode()[0], 2);
+    assert_eq!(def.prepare_story(&tracked).unwrap().known_bit(1, 225, 0), Some(true));
+    assert!(!tracked.supports_extended(), "legacy tracked bits are preserved without migrating their source");
+    for other in scenes().into_iter().filter(|s| s.id != def.id) {
+        assert!(!other.requires_exact_transaction());
+        assert_eq!(other.prepare_story(&original), Ok(original.clone()));
+    }
+    let bad = StoryState::decode(&[2, 36, 0, 1, 5, 10, 1]).unwrap();
+    assert!(def.prepare_story(&bad).is_err(), "unsupported legacy state must never be discarded");
+    let conflicting = StoryState::decode(&[2, 36, 0, 1, 2, 225, 1]).unwrap();
+    assert!(matches!(def.prepare_story(&conflicting), Err(crate::story::StoryWriteError::ConflictingLegacyAlias { .. })),
+        "a word-bank alias must not overwrite the tracked byte's known-zero bit");
+}
+
+#[test]
+fn flower_original_and_replacement_play_use_the_same_promoted_snapshot() {
+    let section = script(vec![("a", vec![(1, vec![biton(3, 66, 0), gold(0x3A, 1), setword(2, 0, 39)])]), ("b", vec![])], vec![]);
+    let field = field_of(section.clone());
+    let mut def = demo_def(vec![], start(0, 1));
+    def.id = FLOWER_STATION_SCENE_ID.into();
+    let story = StoryState::at(36);
+    let resources = Resources { gil: Some(1) };
+    let original = run_to_end_with_resources(&field, &def, &story, 1, resources, &[]).unwrap();
+    let replacement = run_section_to_end_with_resources(&field, &def, &story, 1, &section, resources, &[]).unwrap();
+    let prepared = def.prepare_story(&story).unwrap();
+    let explicit = run_to_end_with_resources(&field, &def, &prepared, 1, resources, &[]).unwrap();
+    assert!(original.same_story_as(&replacement) && original.same_story_as(&explicit));
+    assert!(original.unknown_persistent_reads.is_empty());
+    assert_eq!(original.writes.persistent.get(&(3, 66)), Some(&(1, 1)));
+    assert!(original.writes.tracked.is_empty());
+    assert_eq!(original.resources.gil_after, Some(0));
+    assert!(!story.supports_extended() && story.moment == 36, "the authoritative predecessor is untouched");
+    let bad = StoryState::decode(&[2, 36, 0, 1, 5, 10, 1]).unwrap();
+    assert!(matches!(ScenePlay::with_resources(&field, &def, &bad, 1, resources), Err(SceneError::Story(_))));
 }
 
 #[test]
@@ -1754,6 +1810,35 @@ fn the_answers_a_player_gave_decide_what_the_headless_run_writes() {
     assert_eq!(run_to_end(&field, &def, &story, 1, &[2]).unwrap().writes.moment, Some(90));
     assert_eq!(run_to_end(&field, &def, &story, 1, &[1]).unwrap().writes.moment, None);
     assert_eq!(run_to_end(&field, &def, &story, 1, &[]).unwrap().writes.moment, None, "no answer takes the cursor's line (the first)");
+}
+
+#[test]
+fn durable_scene_answers_must_match_every_choice_on_the_selected_path_exactly() {
+    let question = [dialog("Q").split_last().map(|(_, r)| r.to_vec()).unwrap(), vec![0xE7], vec![b'A' - 0x20], vec![0xE7], vec![b'B' - 0x20, 0xFF]].concat();
+    // The second choice exists only after choosing line 2. Its line 1 spends one gil.
+    let purchase = cat(&[ask(0, 1, 2, 5, 14), if_ub(5, 14, 0, 1, &gold(0x3A, 1))]);
+    let body = vec![message(0, 1), ask(0, 1, 2, 5, 13), if_ub(5, 13, 0, 2, &purchase), setword(2, 0, 39)];
+    let field = field_of(script(vec![("a", vec![(1, body)])], vec![question, dialog("Before the question.")]));
+    let def = demo_def(vec![], start(0, 1));
+    let story = StoryState::at(36).into_extended().unwrap();
+    let resources = SceneResources { gil: Some(600) };
+    let strict = |answers: &[usize]| run_to_end_with_resources_strict(&field, &def, &story, 7, resources, answers);
+    for (answers, gil) in [(&[1][..], 600), (&[2, 1][..], 599), (&[2, 2][..], 600)] {
+        let result = strict(answers).expect("one explicit answer per question on this path");
+        assert_eq!(result.resources.gil_after, Some(gil));
+        assert_eq!(result.writes.moment, Some(39));
+        assert_eq!(result, run_to_end_with_resources(&field, &def, &story, 7, resources, answers).unwrap());
+    }
+    assert_eq!(strict(&[]), Err(SceneError::MissingAnswer { question: 1 }));
+    assert_eq!(strict(&[2]), Err(SceneError::MissingAnswer { question: 2 }));
+    for (answers, question, answer) in [(&[0][..], 1, 0), (&[3][..], 1, 3), (&[2, 0][..], 2, 0), (&[2, 255][..], 2, 255)] {
+        assert_eq!(strict(answers), Err(SceneError::InvalidAnswer { question, answer, first: 1, last: 2 }));
+    }
+    assert_eq!(strict(&[1, 1]), Err(SceneError::TrailingAnswers { remaining: 1 }), "no invented second question on the short branch");
+    assert_eq!(strict(&[2, 1, 1, 1]), Err(SceneError::TrailingAnswers { remaining: 2 }));
+    let survey = |answers: &[usize]| run_to_end_with_resources(&field, &def, &story, 7, resources, answers).unwrap();
+    assert_eq!(survey(&[2]).resources.gil_after, Some(599), "surveys retain their cursor-default behavior");
+    assert_eq!(survey(&[2, 0, 255]), survey(&[2, 1]), "lenient previews retain clamping and ignore unused answers");
 }
 
 #[test]

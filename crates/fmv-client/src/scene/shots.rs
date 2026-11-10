@@ -13,9 +13,11 @@
 //! FMV_FF7_LIBRARY=<state dir> FMV_SHOT_DIR=<dir> FMV_EXPLORATORY_MASK=3 cargo test --offline -p fmv-client --bin fmv-client \
 //!     -- --ignored --exact scene::shots::offscreen_survey_flower_witness --test-threads=1 --nocapture
 //! ```
-//! The unregistered early-bar and flower surveys accept `FMV_EXPLORATORY_SPOT` (one spot) and
+//! The exploratory early-bar and flower surveys accept `FMV_EXPLORATORY_SPOT` (one spot) and
 //! `FMV_EXPLORATORY_MASK` (choice ordinals). They save sample pictures and check walkmesh
 //! distance, but do not validate all-frame screen occlusion, live progression or audio.
+//! The registered flower scene has a separate all-branch visual regression,
+//! [`offscreen_real_ff7_flower_choices_and_camera`], using its actual witnesses and owner-resource snapshot.
 //!
 //! The two post-escape scenes ask nothing, so their surveys (`offscreen_survey_post_escape_witness`, field `md8_4`, and
 //! `offscreen_survey_station_witness`, field `md8_1`; also `FMV_EXPLORATORY_SPOT`, plus `FMV_SCENE_WITNESS_BODY` for the other
@@ -272,6 +274,7 @@ struct Rig {
     looks: [&'static str; 3],
     def: SceneDef,
     story: StoryState,
+    gil: u32,
     /// The interpreter's own copy of the scene, for the ground's facts.
     play: ScenePlay,
     scale: f32,
@@ -286,12 +289,17 @@ const SPOT_NAMES: [&str; 3] = ["witness0", "witness1", "witness2"];
 /// The rig for `def`: the game's proof scene (made by [`Ff7Scenes`]) or, when `moved`, one made from `def` itself (the witness
 /// spots changed). The local player is the owner; two party members stand in the area too, to watch.
 fn make_rig(real: &Real, def: SceneDef, moved: bool) -> Rig {
-    let key = def.field.as_str();
     let story = StoryState::at(*def.trigger.moments.start());
+    make_rig_with_snapshot(real, def, moved, story, 0)
+}
+
+/// Build both the reference interpreter and the actual scene with the same server snapshot.
+fn make_rig_with_snapshot(real: &Real, def: SceneDef, moved: bool, story: StoryState, gil: u32) -> Rig {
+    let key = def.field.as_str();
     let area = real.adapter.load_field(key).expect("the proof field loads");
     let view = FieldView::ff7_with(&real.adapter, key, true).expect("field view");
     let scale = view.stage.as_ref().expect("the field has a stage").model_scale;
-    let play = ScenePlay::with_resources(area.field_file(), &def, &story, SEED, fmv_ff7::script::scene::SceneResources { gil: Some(0) }).expect("the proof scene plays here");
+    let play = ScenePlay::with_resources(area.field_file(), &def, &story, SEED, fmv_ff7::script::scene::SceneResources { gil: Some(gil) }).expect("the scene plays here");
     // The area's own characters, announced as the server announces them, and then the scene's trigger as the server adds it
     // while the scene is on offer.
     let clip = |text: &str, max: usize| -> String { text.chars().filter(|c| !c.is_control()).take(max).collect() };
@@ -351,7 +359,7 @@ fn make_rig(real: &Real, def: SceneDef, moved: bool) -> Rig {
         fmv_ff7::script::scene::POST_ESCAPE_SCENE_ID,
         fmv_ff7::script::scene::STATION_SCENE_ID,
     ];
-    if owner_alone.contains(&def.id.as_str()) { entities.truncate(1); }
+    if owner_alone.contains(&def.id.as_str()) && def.witness.len() <= 1 { entities.truncate(1); }
     assert!(state.apply(0.0, ServerMsg::AreaSnapshot { area: area_id, tick: 1, entities, npcs }).is_none());
     if moved {
         state.scene.set_builder(Box::new(Moved { adapter: Arc::clone(&real.adapter), def: def.clone(), reach: Ff7Scenes::new(Some(Arc::clone(&real.adapter))) }));
@@ -359,7 +367,7 @@ fn make_rig(real: &Real, def: SceneDef, moved: bool) -> Rig {
         state.scene.set_builder(Box::new(Ff7Scenes::new(Some(Arc::clone(&real.adapter)))));
     }
     let avatars = Avatars::new(AvatarLibrary::new(Box::new(LgpLoader::new(&real.char_lgp))));
-    Rig { view, state, avatars, npc_epoch: 0, own_tint, own_real, looks, def, story, play, scale, report: Report { min_separation: f32::MAX, ..Report::default() } }
+    Rig { view, state, avatars, npc_epoch: 0, own_tint, own_real, looks, def, story, gil, play, scale, report: Report { min_separation: f32::MAX, ..Report::default() } }
 }
 
 /// Every place the cast takes in a played scene, as the interpreter's stage events say it: the initial placements and every
@@ -571,7 +579,7 @@ fn survey_quiet_witness(def: SceneDef, default: Spot, prefix: &str) {
 
 /// A survey, not visual acceptance: sample one witness's walkmesh distance to visible cast
 /// while saving frames. Background occlusion, other bodies and the frames between pictures must
-/// still be inspected; neither survey definition is in the live scene registry.
+/// still be inspected. The registered flower scene has its own stronger all-branch test below.
 fn survey(mut def: SceneDef, default: Spot, prefix: &str, mode: Survey) {
     let Some(real) = open() else { return };
     let mut gpu = Offscreen::new().expect("software or physical GPU");
@@ -695,6 +703,167 @@ fn offscreen_survey_early_bar_witness() {
 #[ignore = "requires owned FF7 data and an offscreen GPU; exploratory flower-scene staging"]
 fn offscreen_survey_flower_witness() {
     survey_witness(fmv_ff7::script::scene::flower_station_scene(), Spot { x: -3785, y: 20901, triangle: 31, direction: 192 }, "flower");
+}
+
+/// Every authored branch of the flower encounter, through the real client stage, models, camera and dialogue UI.
+/// The reference interpreter uses the same v3 story and explicit gil snapshot as SceneStart. Save every window for
+/// visual review; assert its identity/choices, cast models, camera framing and witness clearance across the full paths.
+#[test]
+#[ignore = "needs the owner's FF7 data and an offscreen GPU; writes flower-path-*.png"]
+fn offscreen_real_ff7_flower_choices_and_camera() {
+    use crate::camera::FieldCamera;
+    use crate::window::camera_input;
+    use fmv_ff7::script::dialogue::End;
+    use fmv_ff7::script::scene::{flower_station_scene, SceneResources};
+    let Some(real) = open() else { return };
+    let mut gpu = Offscreen::new().expect("software or physical GPU");
+    let area = real.adapter.load_field("md8_2").expect("the flower field");
+    let story = StoryState::at(36).into_extended().expect("known-bit story");
+    let gil = 1;
+    let resources = SceneResources { gil: Some(gil) };
+    let mut def = flower_station_scene();
+    let moved = std::env::var_os("FMV_SCENE_SPOTS").is_some();
+    if let Ok(spots) = std::env::var("FMV_SCENE_SPOTS") {
+        def.witness = spots.split(';').filter_map(parse_spot).collect();
+        assert!(!def.witness.is_empty());
+    }
+    eprintln!("flower witnesses: {:?}; automatic candidates: {:?}", def.witness,
+        fmv_ff7::script::scene::auto_witnesses_with_resources(area.field_file(), &def, &story, SEED, resources, 3));
+    let paths: &[(&str, &[usize], usize)] = &[
+        ("leave", &[2], 3), ("buy", &[3, 2, 0], 7), ("ask-buy", &[3, 3, 0], 8),
+        ("decline", &[3, 2, 1], 6), ("ask-decline", &[3, 3, 1], 7),
+    ];
+    let mut problems = Vec::new();
+    for &(name, answers, windows) in paths {
+        let mut reference = ScenePlay::with_resources(area.field_file(), &def, &story, SEED, resources).unwrap();
+        let mut expected = Vec::new();
+        let mut events = reference.initial_stage_events().to_vec();
+        let (mut next, mut choice) = (None, 0usize);
+        for _ in 0..64 {
+            let beat = reference.next(next.take());
+            events.extend(beat.stage.into_iter().map(|t| t.what));
+            match beat.then {
+                Then::End { how, .. } => { assert_eq!(how, End::Finished); break; }
+                Then::Window(w) => {
+                    if w.message.choice.is_some() { next = Some(answers[choice]); choice += 1; }
+                    expected.push(w);
+                }
+            }
+        }
+        assert_eq!(expected.len(), windows, "{name}: authored window count");
+        assert_eq!(choice, answers.len());
+        assert_eq!(reference.off_cast(), 0, "{name}: every staged actor is declared");
+        let path = cast_path(&events);
+        if name == "buy" { eprintln!("flower authored animations: {:?}", events.iter().filter(|e| matches!(e, Stage::Anim { .. } | Stage::AnimSpeed { .. })).collect::<Vec<_>>()); }
+        let mut rig = make_rig_with_snapshot(&real, def.clone(), moved, story.clone(), gil);
+        for spot in &def.witness {
+            let triangle = &rig.play.ground().mesh().triangles[usize::from(spot.triangle)];
+            assert!(triangle_contains_xy(triangle, i32::from(spot.x), i32::from(spot.y)));
+            let clearance = path.iter().map(|&(_, x, y)| (x - f32::from(spot.x)).hypot(y - f32::from(spot.y))).fold(f32::MAX, f32::min);
+            let edge = boundary_gap(rig.play.ground().mesh(), f32::from(spot.x), f32::from(spot.y));
+            assert!(edge >= 1.5 * RING_RADIUS_UNITS * rig.scale, "{name}: witness too close to floor edge ({edge:.1})");
+            eprintln!("{name}: witness {spot:?} cast clearance {clearance:.1}, needs {:.1}", 2.0 * RING_RADIUS_UNITS * rig.scale + 16.0);
+            if clearance < 2.0 * RING_RADIUS_UNITS * rig.scale + 16.0 { problems.push(format!("{name}: witness crosses a cast path ({clearance:.1})")); }
+        }
+        rig.start();
+        let mut camera = FieldCamera::default();
+        let (mut last_window, mut shown, mut answered) = (None, 0usize, 0usize);
+        let (mut samples, mut models, mut seen) = (0usize, BTreeSet::new(), BTreeSet::new());
+        let mut overlaps: Vec<_> = def.witness.iter().map(|_| Overlap::new()).collect();
+        let mut dialogue_overlaps: Vec<_> = def.witness.iter().map(|_| Overlap::new()).collect();
+        let mut foreground_checked = false;
+        let mut last_counts = super::stage::Counts::default();
+        for step in 0..2400usize {
+            if !rig.state.scene.is_active() { break; }
+            rig.draw(); // load each newly shown model before checking its anchor
+            let draw = rig.draw();
+            rig.view.bounds = camera.update(&camera_input(&rig.view, &rig.state, &draw, SIZE, 0.25));
+            if name == "buy" && matches!(step, 39 | 47) {
+                rig.picture(&mut gpu, &format!("flower-entry-{step}"), SIZE, false);
+            }
+            let player = rig.state.scene.player().unwrap();
+            last_counts = player.counts();
+            let casts = player.cast_draws();
+            let built = draw.built.as_ref().expect("field models");
+            let cast: Vec<_> = casts.iter().map(|c| (c.entity, c.pos)).collect();
+            for c in &casts {
+                seen.insert(c.entity);
+                if built.anchors.contains_key(&cast_who(c.entity)) { models.insert(c.entity); }
+                else { problems.push(format!("{name} step {step}: entity {} has no model", c.entity)); }
+            }
+            // Only overlap inside the viewport can hide a visible body. The opening authored
+            // camera pan intentionally starts above the cast and witnesses; offscreen rectangles
+            // crossing later do not cover any pixels of the actual picture.
+            let pics: Vec<_> = rig.pics_of(built, SIZE).into_iter().filter_map(|mut p| {
+                p.rect = (p.rect.0.max(0.0), p.rect.1.max(0.0), p.rect.2.min(SIZE.0 as f32), p.rect.3.min(SIZE.1 as f32));
+                (p.rect.2 > p.rect.0 && p.rect.3 > p.rect.1).then_some(p)
+            }).collect();
+            for (index, w) in player.witnesses().iter().enumerate() {
+                if let Some(overlap) = overlaps.get_mut(index) { overlap.note(step, &pics, w.pos, &cast, rig.scale, SIZE); }
+                if player.has_window() {
+                    if let Some(overlap) = dialogue_overlaps.get_mut(index) { overlap.note(step, &pics, w.pos, &cast, rig.scale, SIZE); }
+                }
+            }
+            let window = player.panel().map(|p| (player.epoch(), p.window().clone(), p.on_choices(SIZE), p.position().1));
+            if let Some((epoch, window, choices, cursor)) = window {
+                if last_window != Some(epoch) {
+                    let wanted = &expected[shown];
+                    assert_eq!((&window.message.origin, window.message.choice, window.speaker), (&wanted.message.origin, wanted.message.choice, wanted.speaker), "{name} window {shown}");
+                    let speaker = player.speaker();
+                    eprintln!("{name} window {shown}: origin={:?} speaker={speaker:?}, cast={:?}, counts={last_counts:?}", window.message.origin, cast.iter().map(|c| c.0).collect::<Vec<_>>());
+                    // The first line calls from offscreen before Aerith is shown. Every later
+                    // spoken line has a visible actor; dialog 6 is the unlabelled purchase choice.
+                    if speaker.is_some_and(|speaker| cast.iter().any(|c| c.0 == speaker)) && speaker_spot(player, Some(built), &rig.view, SIZE.0, SIZE.1).is_none() {
+                        problems.push(format!("{name} window {shown}: speaker is not framed"));
+                    }
+                    if shown == 0 { assert_eq!((speaker, cast.iter().any(|c| c.0 == 2)), (Some(2), false)); }
+                    if !foreground_checked && shown == 1 {
+                        for (index, spot) in def.witness.iter().enumerate() {
+                            let fraction = visible_fraction(&mut rig, &mut gpu, looks()[index], spot, SIZE);
+                            eprintln!("{name}: witness {index} visible in foreground {:.1}%", fraction * 100.0);
+                            if fraction < 0.9 { problems.push(format!("{name}: witness {index} is hidden by foreground ({fraction:.3})")); }
+                        }
+                        foreground_checked = true;
+                    }
+                    rig.picture(&mut gpu, &format!("flower-path-{name}-{shown:02}"), SIZE, true);
+                    shown += 1;
+                    last_window = Some(epoch);
+                }
+                if choices {
+                    let range = window.message.choice.unwrap();
+                    let target = answers[answered] - range.first;
+                    for _ in 0..cursor { rig.state.scene.key(KeyCode::ArrowUp, true, false); }
+                    for _ in 0..target { rig.state.scene.key(KeyCode::ArrowDown, true, false); }
+                    answered += 1;
+                }
+                rig.state.scene.key(KeyCode::Enter, true, false);
+            } else {
+                rig.state.scene.advance(0.25);
+            }
+            samples += 1;
+        }
+        let commands = rig.state.scene.take_commands();
+        let sent: Vec<_> = commands.iter().filter_map(|c| match c { super::SceneCmd::Step { answer: Some(a), .. } => Some(usize::from(*a)), _ => None }).collect();
+        assert_eq!(sent, answers, "{name}: actual UI choices");
+        assert_eq!(shown, windows, "{name}: every authored window was displayed");
+        assert!(commands.iter().any(|c| matches!(c, super::SceneCmd::End { skipped: false, .. })), "{name}: finishes normally");
+        assert_eq!(seen, models, "{name}: every visible actor loads");
+        assert_eq!(models, BTreeSet::from([1, 2]), "{name}: Cloud and the flower seller are the shown cast");
+        assert_eq!(last_counts.anims_skipped, 0, "{name}: every authored animation is presented");
+        for (index, overlap) in overlaps.iter().enumerate() {
+            eprintln!("{name}: witness {index} visible {} of {samples} frames; hidden {:.1}%, blocks {:.1}%, worst step {}/{}", overlap.found, overlap.hidden.0 * 100.0, overlap.blocks.0 * 100.0, overlap.hidden.1, overlap.blocks.1);
+            // Cloud's authored entrance crosses in front of the two watchers, which is natural
+            // depth occlusion (reviewed flower-entry-39/47.png). They never obscure her; every
+            // witness is clear during dialogue, and the owner's view is clear throughout.
+            let speaking = &dialogue_overlaps[index];
+            if overlap.blocks.0 > MAX_COVERED || (index == 0 && overlap.hidden.0 > MAX_COVERED)
+                || speaking.hidden.0 > MAX_COVERED || speaking.blocks.0 > MAX_COVERED {
+                problems.push(format!("{name}: witness {index} obstructs presentation (all {:.3}/{:.3}, dialogue {:.3}/{:.3})", overlap.hidden.0, overlap.blocks.0, speaking.hidden.0, speaking.blocks.0));
+            }
+        }
+        eprintln!("{name}: {samples} samples, {shown} windows, actors {models:?}, last counts {last_counts:?}");
+    }
+    assert!(problems.is_empty(), "{problems:#?}");
 }
 
 /// The tunnel mouth `md8_4`. NO spot of its floor clears every bar (surveyed over the whole floor: 621 places): the only floor
@@ -822,6 +991,7 @@ fn offscreen_real_ff7_the_field_camera_keeps_each_route_scenes_lead_in_view() {
             "ff7/nmkin_2/jessie-descent" => (12, None),
             "ff7/nrthmk/reactor-approach" => (8, None),
             "ff7/nrthmk/reactor-finale" => (27, Some((1, 225, 5))),
+            "ff7/md8_2/flower" => (36, None),
             _ => (0, None),
         };
         let mut story = StoryState::at(moment);
@@ -884,7 +1054,7 @@ impl Rig {
             scene: self.def.id.clone(),
             seed: SEED,
             progress: self.story.encode(),
-            gil: 0,
+            gil: self.gil,
             owner: EntityId(1),
             participants,
             you: SceneRole::Owner,
@@ -1090,7 +1260,7 @@ impl Rig {
         SessionInfo {
             name: "Wedge".into(),
             tint: self.own_tint,
-            area_id: AreaId { game: GameId::Ff7, key: PROOF_FIELD.to_string() },
+            area_id: AreaId { game: GameId::Ff7, key: self.def.field.clone() },
             fixture: false,
             card: fmv_protocol::CharacterCard::plain("Wedge", self.own_tint),
         }
@@ -1104,7 +1274,7 @@ impl Rig {
         let built = draw.built.as_ref().expect("the models were built");
         let scene = Scene { bounds: self.view.bounds, triangles: &[], players: &draw.markers, fixture_banner: false, backdrop: self.view.backdrop.as_ref() };
         let story = self.state.scene.player();
-        let anchor = |subject: Subject, at: Pos| if label_hidden(story, subject) { None } else { label_anchor(draw.built.as_ref(), &self.view, draw.own_who, subject, at) };
+        let anchor = |subject: Subject, at: Pos| if label_hidden(story, subject, self.state.npc_views()) { None } else { label_anchor(draw.built.as_ref(), &self.view, draw.own_who, subject, at) };
         let hud_input = hud::gather_anchored(&self.state, &self.info(), &self.view, 1.0, &anchor);
         let mut overlay = DrawList::new();
         hud::draw_hud(&hud_input, w, h, &mut overlay);

@@ -183,8 +183,8 @@ pub enum Stage {
     /// `speed` is ASPED (default 16); `divisor` preserves the animation opcode's separate literal
     /// speed byte. Neither metadata field changes the interpreter's existing wait calculation.
     Anim { entity: u8, animation: u8, how: AnimHow, first: Option<u8>, last: Option<u8>, speed: u8, divisor: u8 },
-    /// `ASPED` changed the actor's animation speed. Clear a presentation override until a fresh
-    /// animation instruction; its phase cannot be reconstructed by restarting the old loop.
+    /// `ASPED` changed the actor's animation speed. Supported full standing loops keep their phase
+    /// when switching between rates 16 and 32; other forms clear the presentation override.
     AnimSpeed { entity: u8, speed: u16 },
     /// Show or hide (`VISI`).
     Show { entity: u8, visible: bool },

@@ -464,11 +464,15 @@ impl World {
             return Err(JoinError::AlreadyOnline);
         }
         // DEBUG (`SceneSettings::debug_new_story`, off on every real server): an account with no story yet starts with the
-        // one the server was told to give new accounts. It is this session's story from here on and is stored like any
-        // other the first time it moves.
+        // one the server was told to give new accounts. Queue that baseline before admission so every later scene
+        // transaction checks the same predecessor after this FIFO write. This is queued, not acknowledged durable at
+        // join; if it cannot be saved, the later exact scene precondition fails without publishing its result.
         let mut new = new;
         if new.progression.is_empty() {
             if let Some(story) = self.scenes.debug_new_story.clone() {
+                if self.saver.as_ref().is_some_and(|saver| !saver.save_story(new.account, story.clone())) {
+                    return Err(JoinError::StorageUnavailable);
+                }
                 self.logs.warn(format!("DEBUG: account={} starts with the debug story, not the game's new one (--debug-start-moment)", new.account.0));
                 new.progression = story;
             }

@@ -146,6 +146,20 @@ pub struct SceneDef {
 }
 
 impl SceneDef {
+    /// Reviewed scenes whose persistent bytes or resources need the exact-base save transaction.
+    /// Keep this capability attached to the stable scene identity: another scene in the same field
+    /// does not inherit permission to promote a save or publish economic effects.
+    pub fn requires_exact_transaction(&self) -> bool {
+        self.id == FLOWER_STATION_SCENE_ID
+    }
+
+    /// The snapshot used to interpret this scene. Promotion is local and preserves unknown bits;
+    /// the host must retain the original stored bytes for its eventual compare-and-swap. Preparing
+    /// a scene never writes a save, and unrelated scenes keep the input representation unchanged.
+    pub fn prepare_story(&self, story: &StoryState) -> Result<StoryState, crate::story::StoryWriteError> {
+        if self.requires_exact_transaction() { story.clone().into_extended() } else { Ok(story.clone()) }
+    }
+
     /// Rebind every entity reference to a replacement section by its original entity name,
     /// ignoring ASCII case as field scripts can capitalize the same actor differently.
     /// Refuse missing or ambiguous names: guessing would drive the wrong actor or script.
@@ -275,8 +289,8 @@ pub const EARLY_BAR_SCENE_ID: &str = "ff7/mds7pb_1/early-bar-survey";
 pub const SECTOR7_STATION_SCENE_ID: &str = "ff7/mds7st3/station-arrival-survey";
 /// Survey-only Sector 7 intro; not registered for play.
 pub const SECTOR7_INTRO_SCENE_ID: &str = "ff7/mds7/intro-survey";
-/// Survey-only flower seller scene; the gil transaction is not implemented.
-pub const FLOWER_STATION_SCENE_ID: &str = "ff7/md8_2/flower-survey";
+/// The flower seller's arrival scene, committed through an exact story-and-gil transaction.
+pub const FLOWER_STATION_SCENE_ID: &str = "ff7/md8_2/flower";
 /// Survey-only Sector 7 pillar-field entry; not registered for play.
 pub const SECTOR7_PILLAR_SCENE_ID: &str = "ff7/mds7plr1/entry-survey";
 
@@ -684,8 +698,9 @@ pub fn sector7_intro_scene() -> SceneDef {
     }
 }
 
-/// Offline survey of the flower seller's director. Unregistered until persistent flags,
-/// once-only currency effects, presentation, witness and preceding route are implemented.
+/// The flower seller's director at moment 36. All five answer paths finish at moment 39;
+/// purchasing subtracts the authored one gil and sets the flower flag. Playback promotes only
+/// its local snapshot, and the host commits the flags and gil against the original stored state.
 pub fn flower_station_scene() -> SceneDef {
     let cast = [
         (1, "cloud", "aaaa", "aafe"), (2, "earith", "cahc", "cbdc"),
@@ -698,8 +713,14 @@ pub fn flower_station_scene() -> SceneDef {
         id: FLOWER_STATION_SCENE_ID.into(), game: "ff7".into(), field: "md8_2".into(),
         trigger: Trigger { entity: 0, name: "dic".into(), slot: 0, talk_radius: 0, moments: 36..=36 },
         setup: vec![], given: vec![], root: vec![Step::StartMain(0)], cast,
-        speakers: vec![("Cloud".into(), 1), ("Aerith".into(), 2)],
-        witness: vec![], arrival: Spot { x: -3445, y: 21419, triangle: 34, direction: 0 }, presents: None, resume_after_battle: None, presents_bit: None,
+        speakers: vec![("Cloud".into(), 1), ("Flower girl".into(), 2), ("Aerith".into(), 2)],
+        // On the arrival's floor, clear of every cast walk on all five answer paths; reviewed with the field camera.
+        witness: vec![
+            Spot { x: -4100, y: 21300, triangle: 10, direction: 192 },
+            Spot { x: -3800, y: 21350, triangle: 2, direction: 192 },
+            Spot { x: -3700, y: 21350, triangle: 1, direction: 192 },
+        ],
+        arrival: Spot { x: -3445, y: 21419, triangle: 34, direction: 0 }, presents: None, resume_after_battle: None, presents_bit: None,
     }
 }
 
@@ -835,9 +856,9 @@ pub fn proof_scene() -> SceneDef {
 
 /// Every scene the game offers, in the order a server numbers their triggers by (a scene is added at the END, so the
 /// ones before it keep their numbers): the proof, the two the escape from the first reactor ends in, and the cutscenes of the
-/// reactor's own story points.
+/// reactor's own story points, followed by the flower encounter.
 pub fn scenes() -> Vec<SceneDef> {
-    vec![proof_scene(), post_escape_scene(), station_scene(), team_talk_scene(), reactor_door_scene(), guard_scorpion_scene(), guard_scorpion_victory_scene(), jessie_rescue_scene(), jessie_ladder_scene(), run_ahead_scene(), jessie_descent_scene(), reactor_approach_scene(), reactor_finale_scene()]
+    vec![proof_scene(), post_escape_scene(), station_scene(), team_talk_scene(), reactor_door_scene(), guard_scorpion_scene(), guard_scorpion_victory_scene(), jessie_rescue_scene(), jessie_ladder_scene(), run_ahead_scene(), jessie_descent_scene(), reactor_approach_scene(), reactor_finale_scene(), flower_station_scene()]
 }
 
 /// Whether `field` (the archive's spelling; case does not matter) is the field of a scene the game offers: a place a
@@ -857,8 +878,8 @@ pub struct StoryEntry {
     pub spot: Spot,
 }
 
-/// **Where a story that has left the reactor comes into the world.** Everyone joins in `md1stin` and walks from there;
-/// that is right for as long as the way the story took is still a way a player can walk. Two story scenes end that:
+/// **Where a story that has left the reactor comes into the world.** Everyone initially joins in `md1stin` and walks
+/// from there. These reviewed continuation points keep a returning player near the latest completed scene:
 ///
 /// * **From moment 33** (the reactor is gone) the story is outside it, in `md8_4`, where the first scene after the
 ///   escape starts by itself. The spot is the arrival the field's own gateway from `nrthmk` names, which is where a
@@ -866,14 +887,17 @@ pub struct StoryEntry {
 /// * **From moment 36** the story is in `md8_1`: the scene of `md8_4` ends in a script jump there, a jump only that
 ///   scene makes, and `md8_1` has no way back. Without this row an account that left the game at moment 36 or later
 ///   would join in `md1stin` and could never reach the story again. The spot is the arrival that jump names.
+/// * **From moment 39** the flower scene has finished in `md8_2`. Return at Cloud's authored final MOVE and TURNGEN
+///   position, on the connected floor leading to both ways out. The scene is no longer offered at that moment.
 ///
-/// A row is added with each scene that takes the story somewhere no walk leads back from, and names a place the game's
-/// own data puts the player at (never an invented one). Rows ascend by moment. `tests/scene_real.rs` holds every row to
+/// A row names a place the game's own data puts the player at (never an invented one). Rows ascend by moment.
+/// `tests/scene_real.rs` holds every row to
 /// the owner's data: the field exists, the spot is on the triangle it names, and that triangle is in the part of the
 /// floor the field's ways out are in.
 pub const STORY_ENTRIES: &[StoryEntry] = &[
     StoryEntry { from_moment: 33, field: "md8_4", spot: Spot { x: 82, y: 267, triangle: 3, direction: 0 } },
     StoryEntry { from_moment: 36, field: "md8_1", spot: Spot { x: 1629, y: -5357, triangle: 15, direction: 192 } },
+    StoryEntry { from_moment: 39, field: "md8_2", spot: Spot { x: -3989, y: 21138, triangle: 19, direction: 150 } },
 ];
 
 /// The entry of a story at `moment` ([`STORY_ENTRIES`]): the row with the greatest `from_moment` that is not past it.

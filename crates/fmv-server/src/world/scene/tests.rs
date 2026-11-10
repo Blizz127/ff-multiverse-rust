@@ -676,6 +676,43 @@ fn reconnect(w: &mut World, account: AccountId, story: &[u8]) -> (NewPlayer, mps
 }
 
 #[test]
+fn debug_new_story_queues_its_baseline_before_the_player_can_start_a_scene() {
+    let (mut w, mut queue, _host) = world();
+    w.scenes.debug_new_story = Some(MADE_UP.to_vec());
+    let now = Instant::now();
+    let a = seat(&mut w, "debug fresh", &[], now);
+    assert_eq!(w.players.get(&a.entity).unwrap().progression, MADE_UP);
+    let Some(Msg::Story(job)) = queue.try_recv().ok() else { panic!("debug baseline was not queued before join returned") };
+    assert_eq!((job.account, job.progress), (a.account, MADE_UP.to_vec()));
+    let b = seat(&mut w, "existing story", &[5], now);
+    assert_eq!(w.players.get(&b.entity).unwrap().progression, [5]);
+    assert!(queue.try_recv().is_err(), "an existing story gets no debug initialization write");
+}
+
+#[test]
+fn debug_new_story_refuses_admission_if_its_configured_saver_has_stopped() {
+    let (mut w, queue, _host) = world();
+    w.scenes.debug_new_story = Some(MADE_UP.to_vec());
+    drop(queue);
+    let account = AccountId(123);
+    let (new, mut rx) = reconnect(&mut w, account, &[]);
+    assert_eq!(w.join(new, Instant::now()), Err(crate::world::JoinError::StorageUnavailable));
+    assert_eq!(w.player_count(), 0);
+    assert!(!w.is_online(account));
+    assert!(rx.try_recv().is_err(), "no area or story was published for the refused join");
+}
+
+#[test]
+fn debug_new_story_still_works_in_a_fixture_without_any_saver() {
+    let (mut w, queue, _host) = world();
+    w.scenes.debug_new_story = Some(MADE_UP.to_vec());
+    w.saver = None;
+    drop(queue);
+    let a = seat(&mut w, "ephemeral debug", &[], Instant::now());
+    assert_eq!(w.players.get(&a.entity).unwrap().progression, MADE_UP);
+}
+
+#[test]
 fn a_disconnected_pending_owner_is_reserved_and_stale_admission_is_fenced_even_after_ack() {
     let (mut w, mut queue, host, mut a, mut b, now) = two_at_the_trigger();
     *host.transaction.lock().unwrap() = Some(SceneTransaction { expected_gil: 0, next_gil: 0 });
@@ -743,6 +780,35 @@ fn a_refused_scene_interpretation_cannot_be_reported_as_success() {
     assert!(!w.players.contains_key(&a.entity) && !w.in_scene(b.entity));
     assert_eq!(ends(&b.drain()), [SceneOutcome::Aborted]);
     assert!(!a.drain().iter().any(|m| matches!(m, ServerMsg::SceneEnded { .. } | ServerMsg::StoryUpdate { .. } | ServerMsg::AreaChange { .. })));
+}
+
+#[test]
+fn skipping_before_a_scene_can_be_interpreted_aborts_without_saving_or_disconnecting() {
+    let (mut w, mut queue, host) = world_with(false, true);
+    let mut now = Instant::now();
+    let mut a = seat(&mut w, "A", &[], now);
+    up_to_the_trigger(&mut w, &mut a, &mut now);
+    w.players.get_mut(&a.entity).unwrap().progress.as_mut().unwrap().gil = 600;
+    *host.refuse.lock().unwrap() = true;
+    *host.travel.lock().unwrap() = Some(entry_to(HALL));
+    let before = {
+        let p = w.players.get(&a.entity).unwrap();
+        (p.progression.clone(), p.progress, p.inventory.as_ref().unwrap().entries().to_vec(), p.snapshot.pos, p.area.clone())
+    };
+    w.press(a.entity, Some(trigger_id()), now);
+    let run = starts(&a.drain())[0].0;
+    w.scene_message(a.entity, ClientMsg::SceneEnd { run, skipped: true }, now);
+    assert!(queue.try_recv().is_err());
+    assert!(w.is_online(a.account) && !w.in_scene(a.entity));
+    assert!(!w.scenes.storage_failed);
+    let p = w.players.get(&a.entity).unwrap();
+    assert_eq!((p.progression.clone(), p.progress, p.inventory.as_ref().unwrap().entries().to_vec(), p.snapshot.pos, p.area.clone()), before);
+    assert!(p.transit.is_none());
+    let msgs = a.drain();
+    assert_eq!(ends(&msgs), [SceneOutcome::Aborted]);
+    assert!(!msgs.iter().any(|m| matches!(m, ServerMsg::Reject { .. } | ServerMsg::StoryUpdate { .. } | ServerMsg::CharacterProgress { .. } | ServerMsg::Inventory { .. } | ServerMsg::AreaChange { .. })));
+    w.scene_message(a.entity, ClientMsg::SceneEnd { run, skipped: false }, now);
+    assert!(queue.try_recv().is_err() && a.drain().is_empty(), "a later completion cannot revive the abandoned run");
 }
 
 #[test]

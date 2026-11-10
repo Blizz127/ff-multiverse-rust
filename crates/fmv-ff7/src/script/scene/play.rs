@@ -36,6 +36,14 @@ pub enum SceneError {
     UnmatchedEntities,
     #[error("the scene cannot reconstruct its expected battle boundary")]
     BattleBoundary,
+    #[error("the scene cannot prepare its story snapshot: {0}")]
+    Story(#[from] crate::story::StoryWriteError),
+    #[error("the scene is missing the answer to question {question}")]
+    MissingAnswer { question: usize },
+    #[error("answer {answer} to question {question} is outside its choices {first}..={last}")]
+    InvalidAnswer { question: usize, answer: usize, first: usize, last: usize },
+    #[error("the scene ended with {remaining} unused answers")]
+    TrailingAnswers { remaining: usize },
 }
 
 /// What a scene's script wrote that the story can carry.
@@ -313,6 +321,7 @@ impl ScenePlay {
     }
 
     fn with_script(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32, limits: Limits, script: &FieldScript<'_>, resources: SceneResources) -> Result<Self, SceneError> {
+        let story = def.prepare_story(story)?;
         if usize::from(def.trigger.entity) >= script.entity_count() {
             return Err(SceneError::NoSuchEntity);
         }
@@ -560,27 +569,35 @@ fn stage_entity(stage: &Stage) -> Option<u8> {
 /// player chose, in order; when they run out, the cursor's starting line). What the server does to learn what the scene
 /// wrote, from what the owner answered.
 pub fn run_to_end(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32, answers: &[usize]) -> Result<Outcome, SceneError> {
-    Ok(outcome_of(ScenePlay::new(field, def, story, seed)?, answers))
+    outcome_of(ScenePlay::new(field, def, story, seed)?, answers, false)
 }
 
 /// [`run_to_end`] over a replacement script section (another edition of the field's script, with `def`'s entities found in
 /// it by name: [`ScenePlay::with_script_section`]) on the original field's floor. What a client runs beside the original to
 /// learn whether the replacement comes to the same story ([`Outcome::same_story_as`]) before it shows it.
 pub fn run_section_to_end(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32, section: &[u8], answers: &[usize]) -> Result<Outcome, SceneError> {
-    Ok(outcome_of(ScenePlay::with_script_section(field, def, story, seed, section)?, answers))
+    outcome_of(ScenePlay::with_script_section(field, def, story, seed, section)?, answers, false)
 }
 
 /// Headless evaluation against the same resource snapshot the client received at scene start.
 pub fn run_to_end_with_resources(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32, resources: SceneResources, answers: &[usize]) -> Result<Outcome, SceneError> {
-    Ok(outcome_of(ScenePlay::with_resources(field, def, story, seed, resources)?, answers))
+    outcome_of(ScenePlay::with_resources(field, def, story, seed, resources)?, answers, false)
+}
+
+/// Evaluate a durable scene against its exact resource snapshot and the player's complete answer
+/// transcript. Every question on the selected path must have one in-range answer and no answers
+/// may remain at the end. Unlike previews and surveys, this never substitutes a cursor default or
+/// clamps an invalid choice before calculating persistent or economic effects.
+pub fn run_to_end_with_resources_strict(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32, resources: SceneResources, answers: &[usize]) -> Result<Outcome, SceneError> {
+    outcome_of(ScenePlay::with_resources(field, def, story, seed, resources)?, answers, true)
 }
 
 /// Replacement-script equivalent of [`run_to_end_with_resources`].
 pub fn run_section_to_end_with_resources(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32, section: &[u8], resources: SceneResources, answers: &[usize]) -> Result<Outcome, SceneError> {
-    Ok(outcome_of(ScenePlay::with_script_section_and_resources(field, def, story, seed, section, resources)?, answers))
+    outcome_of(ScenePlay::with_script_section_and_resources(field, def, story, seed, section, resources)?, answers, false)
 }
 
-fn outcome_of(mut play: ScenePlay, answers: &[usize]) -> Outcome {
+fn outcome_of(mut play: ScenePlay, answers: &[usize], strict: bool) -> Result<Outcome, SceneError> {
     let mut answers = answers.iter().copied();
     let mut given: Option<usize> = None;
     let (mut windows, mut questions) = (0usize, 0usize);
@@ -590,15 +607,24 @@ fn outcome_of(mut play: ScenePlay, answers: &[usize]) -> Outcome {
             Then::End { how, .. } => break how,
             Then::Window(w) => {
                 windows += 1;
-                if w.message.choice.is_some() {
+                if let Some(choice) = w.message.choice {
                     questions += 1;
                     given = answers.next();
+                    if strict {
+                        let answer = given.ok_or(SceneError::MissingAnswer { question: questions })?;
+                        if !(choice.first..=choice.last).contains(&answer) {
+                            return Err(SceneError::InvalidAnswer { question: questions, answer, first: choice.first, last: choice.last });
+                        }
+                    }
                 }
             }
         }
     };
+    if strict && answers.len() != 0 {
+        return Err(SceneError::TrailingAnswers { remaining: answers.len() });
+    }
     let writes = play.writes();
-    Outcome {
+    Ok(Outcome {
         end,
         windows,
         questions,
@@ -609,7 +635,7 @@ fn outcome_of(mut play: ScenePlay, answers: &[usize]) -> Outcome {
         party: play.vm.party_ops().to_vec(),
         resources: play.resources().clone(),
         stats: play.stats().clone(),
-    }
+    })
 }
 
 /// Every place the cast stands or walks through in one run of `def` (played to its end with the cursor's answers), as
@@ -763,6 +789,7 @@ pub fn auto_witnesses_with_resources(field: &FieldFile, def: &SceneDef, story: &
 
 /// The character that starts `def`, as the field stands him at the scene's story (see [`TriggerNpc`]).
 pub fn trigger_npc(field: &FieldFile, def: &SceneDef, story: &StoryState) -> Option<TriggerNpc> {
+    let story = def.prepare_story(story).ok()?;
     let script = FieldScript::from_field(field).ok()?;
     let loader: ModelLoader = field.model_loader().ok()?;
     let models = parse_model_list(field.section(crate::field::section::MODEL_LOADER).ok()?).ok()?;

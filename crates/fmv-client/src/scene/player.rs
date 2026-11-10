@@ -526,10 +526,11 @@ impl ScenePlayer {
 
     fn apply_stage(cast: &mut Cast, source: &dyn SceneSource, event: &Stage, late: f32, movement_phase: f32) {
         // Presentation uses the script's own field model and loaded clip bounds: normal-rate
-        // loops/Holds/Once, plus fresh full Holds at twice that rate. Other forms clear an old override.
-        if let Stage::Anim { entity, animation, how: AnimHow::Loop, first: None, last: None, speed: 16, divisor: 1 } = event {
+        // Holds/Once, plus full loops and fresh full Holds at normal or doubled speed.
+        // Other forms clear an old override; the stage handles supported standing-loop rate changes.
+        if let Stage::Anim { entity, animation, how: AnimHow::Loop, first: None, last: None, speed: speed @ (16 | 32), divisor: 1 } = event {
             if let Some(clip) = source.animation_clip(*entity, *animation) {
-                cast.apply_loop(*entity, *animation, clip, late);
+                cast.apply_loop(*entity, *animation, clip, late, *speed == 32);
                 return;
             }
         }

@@ -578,9 +578,9 @@ fn authored_loops_start_at_events_pause_and_restart_without_changing_the_base_mo
         // (A full Hold at twice the rate, 32, is shown since the doubled Holds of the post-escape scene; 48 is not.)
         Stage::Anim { entity: 20, animation: 3, how: AnimHow::Hold, first: None, last: None, speed: 48, divisor: 1 },
         Stage::Anim { entity: 20, animation: 3, how: AnimHow::Loop, first: Some(0), last: Some(1), speed: 16, divisor: 1 },
-        Stage::Anim { entity: 20, animation: 3, how: AnimHow::Loop, first: None, last: None, speed: 32, divisor: 1 },
+        Stage::Anim { entity: 20, animation: 3, how: AnimHow::Loop, first: None, last: None, speed: 48, divisor: 1 },
         Stage::Anim { entity: 20, animation: 3, how: AnimHow::Loop, first: None, last: None, speed: 16, divisor: 2 },
-        Stage::AnimSpeed { entity: 20, speed: 32 },
+        Stage::AnimSpeed { entity: 20, speed: 48 },
     ];
     unsupported.push(looping(99));
     for role in [SceneRole::Owner, SceneRole::Watcher] {
@@ -629,6 +629,58 @@ fn authored_loops_start_at_events_pause_and_restart_without_changing_the_base_mo
             assert_eq!(drawn(&player), None, "unsupported/unresolved event {index} clears the previous loop");
         }
         assert_eq!(player.counts().anims_skipped, unsupported.len() as u32);
+    }
+}
+
+#[test]
+fn doubled_full_loops_reset_to_normal_without_losing_phase_for_owner_and_watcher() {
+    use crate::avatar::anim::ClipFrame;
+    use fmv_ff7::script::scene::AnimHow;
+    struct Loops(Scripted);
+    impl SceneSource for Loops {
+        fn initial(&self) -> Vec<Stage> { self.0.initial() }
+        fn next(&mut self, answer: Option<usize>) -> Beat { self.0.next(answer) }
+        fn animation_clip(&self, entity: u8, slot: u8) -> Option<&str> {
+            if entity != 20 { return None; }
+            match slot { 0 => Some("idle"), 3 => Some("three"), 4 => Some("four"), _ => None }
+        }
+    }
+    let looping = |animation, speed| Stage::Anim { entity: 20, animation, how: AnimHow::Loop,
+        first: None, last: None, speed, divisor: 1 };
+    let clip = |player: &ScenePlayer| {
+        let actor = cast_players(player).into_iter().find(|actor| actor.who == cast_who(20)).unwrap();
+        actor.scene_clip.map(|(stem, frame)| (stem.to_string(), frame))
+    };
+    for role in [SceneRole::Owner, SceneRole::Watcher] {
+        for chunks in [vec![16.0], vec![4.0, 4.0, 4.0, 4.0]] {
+            let mut initial = places();
+            initial.push(looping(0, 16));
+            let beats = vec![
+                Beat { stage: vec![
+                    timed(2, Stage::AnimSpeed { entity: 20, speed: 32 }),
+                    timed(4, looping(3, 32)),
+                    timed(8, looping(4, 32)),
+                    timed(12, Stage::AnimSpeed { entity: 20, speed: 16 }),
+                ], then: say(16, 20, 20, 1).then },
+                Beat { stage: vec![timed(2, Stage::Anim { entity: 20, animation: 3, how: AnimHow::Once,
+                    first: Some(0), last: Some(2), speed: 16, divisor: 1 })], then: say(7, 20, 20, 2).then },
+            ];
+            let mut definition = def();
+            definition.cast[1].look = Look::Model { hrc: "model".into(), idle: "base".into() };
+            let mut player = ScenePlayer::new(Run { id: RUN, participants: vec![], role }, definition,
+                Box::new(Loops(Scripted { initial, beats: beats.into(), asked: Asked::default() })), false);
+            for frames in chunks { player.advance(frames / 30.0); }
+            assert!(player.has_window());
+            assert_eq!(clip(&player), Some(("four".into(), ClipFrame::Loop(12.0))),
+                "four runs at twice the rate for four scene frames, then normally for four, without restarting");
+            player.advance(5.0);
+            assert_eq!(clip(&player), Some(("four".into(), ClipFrame::Loop(12.0))), "dialogue pauses the loop");
+            if role == SceneRole::Owner { player.key(SceneKey::Confirm); } else { player.on_step(0, None); }
+            player.advance(7.0 / 30.0);
+            assert_eq!(clip(&player), Some(("four".into(), ClipFrame::Loop(2.0))),
+                "a later normal Once still returns to the remembered different default after its own three frames");
+            assert_eq!(player.counts().anims_skipped, 0);
+        }
     }
 }
 
@@ -981,7 +1033,7 @@ mod fmove_loop_phase {
             (Stage::Anim { entity: 20, animation: 3, how: AnimHow::Hold, first: None, last: None, speed: 16, divisor: 1 },
                 Some(("other".to_string(), ClipFrame::HoldFull { elapsed: 2.0 }))),
             (Stage::AnimSpeed { entity: 20, speed: 32 }, None),
-            (Stage::Anim { entity: 20, animation: 3, how: AnimHow::Loop, first: None, last: None, speed: 32, divisor: 1 }, None),
+            (Stage::Anim { entity: 20, animation: 3, how: AnimHow::Loop, first: None, last: None, speed: 48, divisor: 1 }, None),
             (looping(99), None),
         ];
         for role in [SceneRole::Owner, SceneRole::Watcher] {
@@ -1032,7 +1084,7 @@ mod fmove_loop_phase {
         for (late, x, walked) in [(f32::NAN, 50.0, 0.0), (-3.0, 50.0, 0.0), (2.0, 60.0, 2.0), (f32::INFINITY, 70.0, 4.0)] {
             let mut cast = Cast::new([20]);
             cast.apply(&Stage::Place { entity: 20, x: 50, y: 10, z: Some(11), triangle: None }, 0.0, &|_, _, _| None);
-            cast.apply_loop(20, 0, "idle", 7.0);
+            cast.apply_loop(20, 0, "idle", 7.0, false);
             cast.advance(3.0);
             cast.apply(&movement(70, 10, Some(11), 4, MoveHow::WalkKeepAnimation), late, &|_, _, _| None);
             let actor = cast.actor(20).unwrap();
@@ -1312,7 +1364,7 @@ fn doubled_full_holds_pause_replace_and_cancel_for_both_roles() {
             frames: 3, how: MoveHow::Walk, animation: None },
         Stage::Anim { entity: 20, animation: 3, how: AnimHow::Hold, first: None, last: None, speed: 32, divisor: 2 },
         Stage::Anim { entity: 20, animation: 3, how: AnimHow::Hold, first: Some(0), last: Some(3), speed: 32, divisor: 1 },
-        Stage::Anim { entity: 20, animation: 3, how: AnimHow::Loop, first: None, last: None, speed: 32, divisor: 1 },
+        Stage::Anim { entity: 20, animation: 3, how: AnimHow::Loop, first: None, last: None, speed: 48, divisor: 1 },
         Stage::Anim { entity: 20, animation: 3, how: AnimHow::Once, first: None, last: None, speed: 32, divisor: 1 },
         hold(99, 32),
     ];
@@ -1432,9 +1484,9 @@ fn bounded_once_restores_only_known_defaults_for_owner_and_watcher() {
     ];
     let invalidators = [
         looping(99),
-        Stage::Anim { entity: 20, animation: 4, how: AnimHow::Loop, first: None, last: None, speed: 32, divisor: 1 },
+        Stage::Anim { entity: 20, animation: 4, how: AnimHow::Loop, first: None, last: None, speed: 48, divisor: 1 },
         Stage::Anim { entity: 20, animation: 4, how: AnimHow::Loop, first: Some(0), last: Some(1), speed: 16, divisor: 1 },
-        Stage::AnimSpeed { entity: 20, speed: 32 },
+        Stage::AnimSpeed { entity: 20, speed: 48 },
     ];
     for role in [SceneRole::Owner, SceneRole::Watcher] {
         let pass = |p: &mut ScenePlayer, step| {
@@ -1561,7 +1613,7 @@ fn full_once_keeps_scene_time_and_a_verified_return_for_owner_and_watcher() {
     ];
     let invalidators = [
         looping(99),
-        Stage::Anim { entity: 20, animation: 4, how: AnimHow::Loop, first: None, last: None, speed: 32, divisor: 1 },
+        Stage::Anim { entity: 20, animation: 4, how: AnimHow::Loop, first: None, last: None, speed: 48, divisor: 1 },
     ];
     for role in [SceneRole::Owner, SceneRole::Watcher] {
         let pass = |p: &mut ScenePlayer, step| {
@@ -1808,15 +1860,15 @@ fn the_trigger_is_hidden_while_its_scene_runs_and_is_back_when_it_is_over() {
     let npcs = vec![NpcView { name: "gamma".into(), ..trigger(3, 0.0) }, trigger(SCENE_NPC_ID_BASE, 10.0), trigger(SCENE_NPC_ID_BASE + 1, 20.0)];
     let mut rig = rig_with(talk(), false);
     assert_eq!(visible_npcs(&npcs, rig.client.player()).len(), 3, "no scene: everybody is drawn");
-    assert!(!label_hidden(rig.client.player(), Subject::Npc(SCENE_NPC_ID_BASE)));
+    assert!(!label_hidden(rig.client.player(), Subject::Npc(SCENE_NPC_ID_BASE), &npcs));
     begin(&mut rig, SceneRole::Owner);
     let shown: Vec<u32> = visible_npcs(&npcs, rig.client.player()).iter().map(|n| n.id).collect();
     assert_eq!(shown, [3], "the area's own character stays, the triggers go");
-    assert!(label_hidden(rig.client.player(), Subject::Npc(SCENE_NPC_ID_BASE)), "and so does its name");
-    assert!(!label_hidden(rig.client.player(), Subject::Npc(3)) && !label_hidden(rig.client.player(), Subject::Own));
+    assert!(label_hidden(rig.client.player(), Subject::Npc(SCENE_NPC_ID_BASE), &npcs), "and so does its name");
+    assert!(!label_hidden(rig.client.player(), Subject::Npc(3), &npcs) && !label_hidden(rig.client.player(), Subject::Own, &npcs));
     ended(&mut rig, RUN, SceneOutcome::Finished);
     assert_eq!(visible_npcs(&npcs, rig.client.player()).len(), 3, "back again");
-    assert!(!label_hidden(rig.client.player(), Subject::Npc(SCENE_NPC_ID_BASE)));
+    assert!(!label_hidden(rig.client.player(), Subject::Npc(SCENE_NPC_ID_BASE), &npcs));
 }
 
 /// An area character the scene's cast plays (the same script entity name, any case) is not drawn while the scene is on
@@ -1830,8 +1882,11 @@ fn an_area_character_the_cast_plays_is_drawn_once_while_the_scene_runs() {
     begin(&mut rig, SceneRole::Owner);
     let shown: Vec<u32> = visible_npcs(&npcs, rig.client.player()).iter().map(|n| n.id).collect();
     assert_eq!(shown, [2, 3], "alpha is the cast's (entity 18); gamma and the unnamed one are not");
+    assert!(label_hidden(rig.client.player(), Subject::Npc(1), &npcs), "the replaced body's old label goes too");
+    assert!(!label_hidden(rig.client.player(), Subject::Npc(2), &npcs));
     ended(&mut rig, RUN, SceneOutcome::Finished);
     assert_eq!(visible_npcs(&npcs, rig.client.player()).len(), 3, "back again when it is over");
+    assert!(!label_hidden(rig.client.player(), Subject::Npc(1), &npcs), "its label returns with the body");
 }
 
 #[test]

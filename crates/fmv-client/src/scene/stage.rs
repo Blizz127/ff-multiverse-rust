@@ -13,7 +13,8 @@
 //! * `Face` turns it (the short way round), at once or over the frames it says.
 //! * `Show` hides or shows it.
 //! * The player resolves supported `Anim` loops, full Holds and explicit forward Holds against the actor's exact field model.
-//!   Loops and Holds follow scene time; a Hold stops at its last frame until replaced. A Once can
+//!   Full loops support ASPED 16 and 32 (normal and double speed), including a standing loop's rate changes without
+//!   restarting its phase. Loops and Holds follow scene time; a Hold stops at its last frame until replaced. A Once can
 //!   restart a separately remembered, different default slot after its range or actual loaded clip length.
 //!   Other animations clear that loop and are counted ([`Counts::anims_skipped`]), never guessed at.
 //! * `Sound` is routed separately by the scene player to its cancellable audio channel.
@@ -77,7 +78,7 @@ struct Turn {
 struct SceneAnimation {
     clip: String,
     frame: ClipFrame,
-    /// Clip frames per scene frame; only a fresh full Hold may use the supported doubled rate.
+    /// Clip frames per scene frame; full loops and fresh full Holds support normal and doubled rates.
     rate: f32,
     once: bool,
 }
@@ -372,13 +373,14 @@ impl Cast {
         }
     }
 
-    /// Set a resolved normal-speed full-range loop without changing the actor's model or movement.
-    pub fn apply_loop(&mut self, entity: u8, slot: u8, clip: &str, overshoot: f32) {
+    /// Set a resolved full-range loop at normal or doubled speed without changing the actor's model or movement.
+    pub fn apply_loop(&mut self, entity: u8, slot: u8, clip: &str, overshoot: f32, doubled: bool) {
         let Some(actor) = self.actors.get_mut(&entity) else { return self.off_cast() };
         actor.replace_kept_animation();
-        let frame = if overshoot.is_finite() { overshoot.max(0.0) } else { 0.0 };
+        let rate = if doubled { 2.0 } else { 1.0 };
+        let frame = if overshoot.is_finite() { overshoot.max(0.0) * rate } else { 0.0 };
         actor.default_animation = Some(DefaultAnimation { slot, clip: clip.to_string() });
-        actor.animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::Loop(frame), rate: 1.0, once: false });
+        actor.animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::Loop(frame), rate, once: false });
     }
 
     /// Use the resolved ordinary MOVE clip only during this movement. The scene player supplies
@@ -534,11 +536,19 @@ impl Cast {
                     self.off_cast();
                 }
             }
-            Stage::AnimSpeed { entity, .. } => {
+            Stage::AnimSpeed { entity, speed } => {
                 let Some(actor) = self.actors.get_mut(entity) else { return self.off_cast() };
+                // ASPED 16 is one clip frame per scene frame, 32 is two. The player advances
+                // precisely to each event: changing a standing loop's rate keeps its current phase.
+                // Do not infer a rate for a movement, held pose, Once, or an unsupported speed.
+                if actor.walk.is_none() && matches!(speed, 16 | 32) {
+                    if let Some(SceneAnimation { frame: ClipFrame::Loop(_), rate, once: false, .. }) = &mut actor.animation {
+                        *rate = if *speed == 32 { 2.0 } else { 1.0 };
+                        return;
+                    }
+                }
                 actor.replace_kept_animation();
-                // Dynamic speed changes are outside the supported normal-speed loop subset.
-                // A fresh DFANM can establish another supported loop explicitly.
+                // A fresh DFANM can establish another supported loop after this fallback.
                 actor.default_animation = None;
                 let standing = actor.animation.take().is_some();
                 let moving = actor.movement_animation.take().is_some();
@@ -576,7 +586,7 @@ mod tests {
         for how in [MoveHow::Walk, MoveHow::Jump, MoveHow::Ladder] {
             let mut cast = Cast::new([1]);
             cast.apply(&place(1, 0, 0), 0.0, &flat);
-            cast.apply_loop(1, 0, "idle", 0.0);
+            cast.apply_loop(1, 0, "idle", 0.0, false);
             cast.advance(7.0);
             assert_eq!(cast.actor(1).unwrap().animation(), Some(("idle", ClipFrame::Loop(7.0))));
             cast.apply(&Stage::Move { entity: 1, from: None, x: 100, y: 0, z: None, triangle: None, frames: 10, how, animation: None }, 0.0, &flat);
@@ -586,6 +596,57 @@ mod tests {
             cast.advance(9.0);
             assert_eq!(cast.actor(1).unwrap().animation(), Some(("idle", ClipFrame::Loop(3.0))), "only time after arrival advances the restarted idle");
             assert_eq!(cast.actor(1).unwrap().pos(), Some([100.0, 0.0, 7.0]));
+        }
+    }
+
+    #[test]
+    fn doubled_loops_catch_up_and_rate_changes_preserve_their_phase() {
+        let mut cast = Cast::new([1]);
+        cast.apply_loop(1, 3, "three", 3.0, true);
+        assert_eq!(cast.actor(1).unwrap().animation(), Some(("three", ClipFrame::Loop(6.0))));
+        cast.advance(4.0);
+        cast.apply(&Stage::AnimSpeed { entity: 1, speed: 16 }, 0.0, &flat);
+        assert_eq!(cast.actor(1).unwrap().animation(), Some(("three", ClipFrame::Loop(14.0))), "resetting the rate does not restart the clip");
+        cast.advance(3.0);
+        assert_eq!(cast.actor(1).unwrap().animation(), Some(("three", ClipFrame::Loop(17.0))));
+        cast.apply(&Stage::AnimSpeed { entity: 1, speed: 32 }, 0.0, &flat);
+        cast.advance(2.0);
+        assert_eq!(cast.actor(1).unwrap().animation(), Some(("three", ClipFrame::Loop(21.0))));
+        cast.apply_loop(1, 4, "four", 0.0, true);
+        assert_eq!(cast.actor(1).unwrap().animation(), Some(("four", ClipFrame::Loop(0.0))), "a fresh loop starts its own phase");
+        assert_eq!(cast.counts().anims_skipped, 0);
+        for late in [f32::NAN, f32::INFINITY, -4.0] {
+            cast.apply_loop(1, 3, "three", late, true);
+            assert_eq!(cast.actor(1).unwrap().animation(), Some(("three", ClipFrame::Loop(0.0))));
+        }
+    }
+
+    #[test]
+    fn unsupported_rates_and_non_loop_speed_changes_keep_the_existing_fallback() {
+        for speed in [0, 8, 24, 48, u16::MAX] {
+            let mut cast = Cast::new([1]);
+            cast.apply_loop(1, 3, "three", 2.0, true);
+            cast.apply(&Stage::AnimSpeed { entity: 1, speed }, 0.0, &flat);
+            assert_eq!(cast.actor(1).unwrap().animation(), None, "speed {speed}");
+            assert!(!cast.apply_once(1, 4, "four", 0, 2, 0.0), "unsupported rate also invalidates the remembered default");
+            assert_eq!(cast.counts().anims_skipped, 1);
+        }
+        for speed in [16, 32] {
+            for mode in 0..4 {
+                let mut cast = Cast::new([1]);
+                cast.apply(&place(1, 0, 0), 0.0, &flat);
+                cast.apply_loop(1, 3, "three", 0.0, false);
+                match mode {
+                    0 => cast.apply_hold_full(1, "four", 0.0, true),
+                    1 => { assert!(cast.apply_once(1, 4, "four", 0, 9, 0.0)); },
+                    2 => { assert!(cast.apply_once_full(1, 4, "four", 0.0)); },
+                    _ => cast.apply(&walk(1, 100, 0, 10), 0.0, &flat),
+                }
+                cast.apply(&Stage::AnimSpeed { entity: 1, speed }, 0.0, &flat);
+                cast.advance(20.0);
+                assert_eq!(cast.actor(1).unwrap().animation(), None, "speed {speed}, mode {mode}");
+                assert_eq!(cast.counts().anims_skipped, 1);
+            }
         }
     }
 
@@ -712,7 +773,7 @@ mod tests {
     fn an_authored_ladder_face_cancels_an_old_turn_and_survives_arrival() {
         let mut cast = Cast::new([1]);
         cast.apply(&place(1, 10, -20), 0.0, &flat);
-        cast.apply_loop(1, 0, "idle", 0.0);
+        cast.apply_loop(1, 0, "idle", 0.0, false);
         cast.apply(&Stage::Face { entity: 1, heading: 1.0, frames: 30 }, 0.0, &flat);
         cast.advance(6.0);
         assert!((cast.actor(1).unwrap().heading() - 0.2).abs() < 1e-5);
