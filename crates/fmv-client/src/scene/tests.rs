@@ -1029,7 +1029,7 @@ fn full_holds_follow_scene_time_and_cancel_cleanly_for_owner_and_watcher() {
         hold(99),
         Stage::Anim { entity: 20, animation: 3, how: AnimHow::Hold, first: Some(0), last: None, speed: 16, divisor: 1 },
         Stage::Anim { entity: 20, animation: 3, how: AnimHow::Hold, first: None, last: Some(2), speed: 16, divisor: 1 },
-        Stage::Anim { entity: 20, animation: 3, how: AnimHow::Hold, first: None, last: None, speed: 32, divisor: 1 },
+        Stage::Anim { entity: 20, animation: 3, how: AnimHow::Hold, first: None, last: None, speed: 48, divisor: 1 },
         Stage::Anim { entity: 20, animation: 3, how: AnimHow::Hold, first: None, last: None, speed: 16, divisor: 2 },
         Stage::Anim { entity: 20, animation: 3, how: AnimHow::Once, first: None, last: None, speed: 16, divisor: 1 },
         Stage::AnimSpeed { entity: 20, speed: 32 },
@@ -1091,6 +1091,102 @@ fn full_holds_follow_scene_time_and_cancel_cleanly_for_owner_and_watcher() {
             assert_eq!(clip(&player), None, "unsupported/unresolved replacement {index} clears the full Hold");
             assert_eq!(player.counts().anims_skipped, index as u32 + 1);
         }
+    }
+}
+
+#[test]
+fn doubled_full_holds_pause_replace_and_cancel_for_both_roles() {
+    use crate::avatar::anim::ClipFrame;
+    use fmv_ff7::script::scene::AnimHow;
+    struct Holds(Scripted);
+    impl SceneSource for Holds {
+        fn initial(&self) -> Vec<Stage> { self.0.initial() }
+        fn next(&mut self, answer: Option<usize>) -> Beat { self.0.next(answer) }
+        fn height_at(&self, x: i16, y: i16, triangle: Option<u16>) -> Option<f32> { self.0.height_at(x, y, triangle) }
+        fn animation_clip(&self, entity: u8, slot: u8) -> Option<&str> {
+            if entity != 20 { return None; }
+            match slot { 3 => Some("fast"), 4 => Some("normal"), _ => None }
+        }
+    }
+    let hold = |animation, speed| Stage::Anim { entity: 20, animation, how: AnimHow::Hold,
+        first: None, last: None, speed, divisor: 1 };
+    let cancel = [
+        Stage::AnimSpeed { entity: 20, speed: 32 },
+        Stage::Move { entity: 20, from: None, x: 90, y: 10, z: None, triangle: None,
+            frames: 3, how: MoveHow::Walk, animation: None },
+        Stage::Anim { entity: 20, animation: 3, how: AnimHow::Hold, first: None, last: None, speed: 32, divisor: 2 },
+        Stage::Anim { entity: 20, animation: 3, how: AnimHow::Hold, first: Some(0), last: Some(3), speed: 32, divisor: 1 },
+        Stage::Anim { entity: 20, animation: 3, how: AnimHow::Loop, first: None, last: None, speed: 32, divisor: 1 },
+        Stage::Anim { entity: 20, animation: 3, how: AnimHow::Once, first: None, last: None, speed: 32, divisor: 1 },
+        hold(99, 32),
+    ];
+    for role in [SceneRole::Owner, SceneRole::Watcher] {
+        for chunks in [vec![11.0], vec![3.0, 4.0, 4.0]] {
+            let mut beats = vec![
+                Beat { stage: vec![timed(6, hold(3, 32))], then: say(11, 20, 20, 1).then },
+                Beat { stage: vec![timed(2, hold(4, 16))], then: say(5, 20, 20, 2).then },
+                Beat { stage: vec![timed(0, hold(3, 32)), timed(3, hold(3, 32))], then: say(5, 20, 20, 3).then },
+            ];
+            beats.extend(cancel.iter().cloned().map(|event| Beat {
+                stage: vec![timed(0, hold(3, 32)), timed(2, event)], then: say(6, 20, 20, 4).then,
+            }));
+            let mut definition = def();
+            definition.cast[1].look = Look::Model { hrc: "model".into(), idle: "base".into() };
+            let mut player = ScenePlayer::new(Run { id: RUN, participants: vec![], role }, definition,
+                Box::new(Holds(Scripted { initial: places(), beats: beats.into(), asked: Asked::default() })), false);
+            let clip = |p: &ScenePlayer| {
+                let actors = cast_players(p);
+                let actor = actors.iter().find(|a| a.who == cast_who(20)).unwrap();
+                let npc = actor.npc.unwrap();
+                assert_eq!((npc.model, npc.idle), ("model", Some("base")), "the original mesh/cache identity is retained");
+                actor.scene_clip.map(|(stem, frame)| (stem.to_string(), frame))
+            };
+            let pass = |p: &mut ScenePlayer, step| {
+                if role == SceneRole::Owner { p.key(SceneKey::Confirm); } else { p.on_step(step, None); }
+            };
+            for frames in chunks { player.advance(frames / 30.0); }
+            assert!(player.has_window());
+            assert_eq!(clip(&player), Some(("fast".into(), ClipFrame::HoldFull { elapsed: 10.0 })));
+            assert_eq!(clip(&player).unwrap().1.in_clip(10), Some(9.0), "a fast full Hold clamps to the actual endpoint");
+            player.advance(20.0);
+            assert_eq!(clip(&player), Some(("fast".into(), ClipFrame::HoldFull { elapsed: 10.0 })), "dialogue freezes clip time");
+            pass(&mut player, 0);
+            player.advance(1.0 / 30.0);
+            assert_eq!(clip(&player), Some(("fast".into(), ClipFrame::HoldFull { elapsed: 12.0 })));
+            player.advance(2.0 / 30.0);
+            assert_eq!(clip(&player), Some(("normal".into(), ClipFrame::HoldFull { elapsed: 1.0 })), "replacement resets the rate and origin");
+            player.advance(2.0 / 30.0);
+            assert_eq!(clip(&player), Some(("normal".into(), ClipFrame::HoldFull { elapsed: 3.0 })));
+            pass(&mut player, 1);
+            player.advance(5.0 / 30.0);
+            assert_eq!(clip(&player), Some(("fast".into(), ClipFrame::HoldFull { elapsed: 4.0 })), "same-clip replacement also restarts");
+            assert_eq!(player.counts().anims_skipped, 0);
+            for (index, _) in cancel.iter().enumerate() {
+                pass(&mut player, 2 + index as u32);
+                assert_eq!(clip(&player), Some(("fast".into(), ClipFrame::HoldFull { elapsed: 0.0 })));
+                player.advance(6.0 / 30.0);
+                assert_eq!(clip(&player), None, "replacement {index} clears the doubled Hold");
+                assert!(player.has_window() && !player.actor(20).unwrap().moving());
+            }
+        }
+    }
+}
+
+#[test]
+fn doubled_full_hold_scales_late_start_once_and_sanitizes_it() {
+    use super::stage::Cast;
+    use crate::avatar::anim::ClipFrame;
+    let mut cast = Cast::new([20]);
+    cast.apply_hold_full(20, "fast", 1.25, true);
+    assert_eq!(cast.actor(20).unwrap().animation(), Some(("fast", ClipFrame::HoldFull { elapsed: 2.5 })));
+    cast.advance(0.75);
+    assert_eq!(cast.actor(20).unwrap().animation(), Some(("fast", ClipFrame::HoldFull { elapsed: 4.0 })));
+    cast.apply_hold_full(20, "normal", 1.25, false);
+    cast.advance(0.75);
+    assert_eq!(cast.actor(20).unwrap().animation(), Some(("normal", ClipFrame::HoldFull { elapsed: 2.0 })));
+    for overshoot in [-1.0, f32::NAN, f32::INFINITY] {
+        cast.apply_hold_full(20, "fast", overshoot, true);
+        assert_eq!(cast.actor(20).unwrap().animation(), Some(("fast", ClipFrame::HoldFull { elapsed: 0.0 })));
     }
 }
 

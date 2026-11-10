@@ -224,6 +224,7 @@ fn the_post_escape_scene_changes_nothing_that_is_saved() {
     let f = field("md8_4").expect("FMV_FF7_DATA and md8_4");
     let def = fmv_ff7::script::scene::post_escape_scene();
     let outcome = run_to_end(&f, &def, &StoryState::at(33), 1, &[]).unwrap();
+    assert_eq!((outcome.end, outcome.windows), (End::MapJump { field: 133 }, 4));
     assert!(outcome.party.is_empty() && outcome.writes.is_story_neutral(), "{:?} {:?}", outcome.party, outcome.writes);
     assert!(outcome.unknown_persistent_reads.is_empty() && !outcome.writes.untracked.keys().any(|(bank, _)| (1..=4).contains(bank)));
     let script = FieldScript::from_field(&f).unwrap();
@@ -232,17 +233,70 @@ fn the_post_escape_scene_changes_nothing_that_is_saved() {
     let loader = f.model_loader().unwrap();
     assert_eq!(loader.models[1].hrc_stem(), "acgd");
     assert_eq!(loader.models[1].animations[3].stem(), "apfc");
+    let jessie = script.entity_inits(None).into_iter().find(|init| init.entity == 5).unwrap();
+    assert_eq!((jessie.name.as_str(), jessie.model_index), ("jesy", Some(3)));
+    let jessie_model = &loader.models[jessie.model_index.unwrap()];
+    let Look::Model { hrc, .. } = &def.member(5).unwrap().look else { panic!("Jessie retains her original field model") };
+    assert_eq!((jessie_model.hrc_stem(), hrc.as_str()), ("axdc".to_string(), "axdc"));
+    let jessie_stem = jessie_model.animations[5].stem();
+    assert_eq!(jessie_stem, "ccif");
+    let jessie_main = script.disassemble(5, 0).unwrap();
+    let speed_index = jessie_main.iter().position(|ins| ins.offset == 0x0414).expect("Jessie's runtime ASPED");
+    let speed = &jessie_main[speed_index];
+    let hold = &jessie_main[speed_index + 1];
+    assert_eq!((speed.opcode, speed.literal("speed")), (0xBD, Some(32)));
+    assert_eq!((hold.offset, hold.opcode, hold.literal("animation"), hold.literal("speed")), (0x0418, 0xBA, Some(5), Some(1)));
+    assert_eq!(speed.end(), hold.offset, "a fresh full Hold follows ASPED32 without an intervening instruction");
     let mut play = ScenePlay::new(&f, &def, &StoryState::at(33), 1).unwrap();
     assert_eq!(play.animation_clip(2, 3), Some("apfc"));
-    assert!(play.next(None).stage.iter().any(|event| matches!(event.what, Stage::Anim {
+    assert_eq!(play.animation_clip(5, 5), Some(jessie_stem.as_str()));
+    assert!(!play.initial_stage_events().iter().any(|event| matches!(event, Stage::Anim { entity: 5, animation: 5, .. })), "Jessie's gesture comes from the main script");
+    let mut beat = play.next(None);
+    assert!(beat.stage.iter().any(|event| matches!(event.what, Stage::Anim {
         entity: 2, animation: 3, how: AnimHow::Hold, first: Some(0), last: Some(0), speed: 16, divisor: 1,
     })), "Barret's main script requests a single held frame before the first window");
+    let mut origin = 0u32;
+    let mut windows = 0;
+    let (mut jessie_speed_at, mut jessie_hold_at) = (None, None);
+    loop {
+        for event in &beat.stage {
+            let at = origin.checked_add(event.at).expect("post-escape event time fits");
+            match event.what {
+                Stage::AnimSpeed { entity: 5, speed: 32 } => assert!(jessie_speed_at.replace(at).is_none(), "one ASPED32 in Jessie's main"),
+                Stage::Anim { entity: 5, animation: 5, how, first, last, speed, divisor } => {
+                    assert_eq!((how, first, last, speed, divisor), (AnimHow::Hold, None, None, 32, 1));
+                    assert!(jessie_hold_at.replace(at).is_none(), "one full Hold of Jessie's clip 5");
+                },
+                _ => {},
+            }
+        }
+        match beat.then {
+            Then::Window(w) => {
+                windows += 1;
+                origin = origin.checked_add(w.at).expect("post-escape window time fits");
+            },
+            Then::End { how, .. } => { assert_eq!(how, End::MapJump { field: 133 }); break; },
+        }
+        beat = play.next(None);
+    }
+    let hold_at = jessie_hold_at.expect("the registered scene reaches Jessie's full Hold");
+    assert!(hold_at > 0);
+    assert_eq!(jessie_speed_at, Some(hold_at), "ASPED32 metadata and the fresh Hold share the same script time");
+    assert_eq!(windows, outcome.windows);
+    assert_eq!(play.off_cast(), 0);
     let mut characters = LgpArchive::open_path(data_dir().unwrap().join("field/char.lgp")).unwrap();
     let clip = fmv_ff7::load_field_animation(&mut characters, "apfc").unwrap();
     let model = fmv_ff7::load_field_model(&mut characters, "acgd").unwrap();
     assert_eq!((clip.frame_count(), clip.bone_count()), (10, 21));
     assert!(model.fits(&clip), "the owned Hold clip fits Barret's retained skeleton");
     assert!(clip.frame(0).is_some() && model.pose(&clip, 0).is_some(), "the authored frame is in bounds and can be posed");
+    let jessie_clip = fmv_ff7::load_field_animation(&mut characters, &jessie_stem).unwrap();
+    let jessie_skeleton = fmv_ff7::load_field_model(&mut characters, hrc).unwrap();
+    assert_eq!((jessie_clip.frame_count(), jessie_clip.bone_count()), (15, 21));
+    assert!(jessie_skeleton.fits(&jessie_clip));
+    for frame in [0, 14] {
+        assert!(jessie_clip.frame(frame).is_some() && jessie_skeleton.pose(&jessie_clip, frame).is_some(), "Jessie's original full-Hold endpoint {frame} fits");
+    }
     // at any other moment the director does nothing at all: no window, no jump
     for moment in [1u16, 27, 32, 34, 36] {
         let idle = run_to_end(&f, &def, &StoryState::at(moment), 1, &[]).unwrap();

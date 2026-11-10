@@ -70,6 +70,8 @@ struct Turn {
 struct SceneAnimation {
     clip: String,
     frame: ClipFrame,
+    /// Clip frames per scene frame; only a fresh full Hold may use the supported doubled rate.
+    rate: f32,
     once: bool,
 }
 
@@ -197,7 +199,7 @@ impl Actor {
                     ClipFrame::HoldRange { elapsed, .. } | ClipFrame::HoldFull { elapsed } | ClipFrame::OnceFull { elapsed } => Some(elapsed),
                     ClipFrame::Hold(_) => None,
                 };
-                if let Some(frame) = advancing { *frame += (frames - moving_frames).max(0.0); }
+                if let Some(frame) = advancing { *frame += (frames - moving_frames).max(0.0) * animation.rate; }
             }
             self.finish_once();
         }
@@ -206,7 +208,7 @@ impl Actor {
     fn restore_default(&mut self, overshoot: f32) {
         let frame = if overshoot.is_finite() { overshoot.max(0.0) } else { 0.0 };
         self.animation = self.default_animation.as_ref().map(|default| SceneAnimation {
-            clip: default.clip.clone(), frame: ClipFrame::Loop(frame), once: false,
+            clip: default.clip.clone(), frame: ClipFrame::Loop(frame), rate: 1.0, once: false,
         });
     }
 
@@ -332,7 +334,7 @@ impl Cast {
         let Some(actor) = self.actors.get_mut(&entity) else { return self.off_cast() };
         let frame = if overshoot.is_finite() { overshoot.max(0.0) } else { 0.0 };
         actor.default_animation = Some(DefaultAnimation { slot, clip: clip.to_string() });
-        actor.animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::Loop(frame), once: false });
+        actor.animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::Loop(frame), rate: 1.0, once: false });
     }
 
     /// Use the resolved ordinary MOVE clip only during this movement. The scene player supplies
@@ -341,7 +343,7 @@ impl Cast {
         let Some(actor) = self.actors.get_mut(&entity) else { return };
         if let Some(walk) = actor.walk.filter(|walk| walk.how == MoveHow::Walk) {
             let phase = if phase_offset.is_finite() { phase_offset.max(0.0) } else { 0.0 };
-            actor.movement_animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::Loop(phase + walk.elapsed), once: false });
+            actor.movement_animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::Loop(phase + walk.elapsed), rate: 1.0, once: false });
         }
     }
 
@@ -349,7 +351,7 @@ impl Cast {
     pub fn apply_hold(&mut self, entity: u8, clip: &str, frame: u8) {
         let Some(actor) = self.actors.get_mut(&entity) else { return self.off_cast() };
         actor.movement_animation = None;
-        actor.animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::Hold(frame), once: false });
+        actor.animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::Hold(frame), rate: 1.0, once: false });
     }
 
     /// Play one normal-speed forward range, holding its final frame. Loaded clip bounds are
@@ -358,16 +360,17 @@ impl Cast {
         let Some(actor) = self.actors.get_mut(&entity) else { return self.off_cast() };
         let elapsed = if overshoot.is_finite() { overshoot.max(0.0) } else { 0.0 };
         actor.movement_animation = None;
-        actor.animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::HoldRange { first, last, elapsed }, once: false });
+        actor.animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::HoldRange { first, last, elapsed }, rate: 1.0, once: false });
     }
 
-    /// Play from frame zero and hold the actual loaded clip's last frame. Sampling resolves
-    /// the endpoint on the matching skeleton; this does not change the interpreter's waits.
-    pub fn apply_hold_full(&mut self, entity: u8, clip: &str, overshoot: f32) {
+    /// Play from frame zero at the normal or supported doubled rate, holding the loaded clip's
+    /// actual last frame. Sampling resolves the endpoint; this does not change the interpreter's waits.
+    pub fn apply_hold_full(&mut self, entity: u8, clip: &str, overshoot: f32, doubled: bool) {
         let Some(actor) = self.actors.get_mut(&entity) else { return self.off_cast() };
-        let elapsed = if overshoot.is_finite() { overshoot.max(0.0) } else { 0.0 };
+        let rate = if doubled { 2.0 } else { 1.0 };
+        let elapsed = if overshoot.is_finite() { overshoot.max(0.0) * rate } else { 0.0 };
         actor.movement_animation = None;
-        actor.animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::HoldFull { elapsed }, once: false });
+        actor.animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::HoldFull { elapsed }, rate, once: false });
     }
 
     /// A bounded Once can return to a verified, different default slot. Same-slot phase
@@ -377,7 +380,7 @@ impl Cast {
         if first > last || actor.walk.is_some() || !actor.default_animation.as_ref().is_some_and(|default| default.slot != slot) { return false; }
         let elapsed = if overshoot.is_nan() { 0.0 } else { overshoot.max(0.0) };
         actor.movement_animation = None;
-        actor.animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::HoldRange { first, last, elapsed }, once: true });
+        actor.animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::HoldRange { first, last, elapsed }, rate: 1.0, once: true });
         actor.finish_once();
         true
     }
@@ -389,7 +392,7 @@ impl Cast {
         if actor.walk.is_some() || !actor.default_animation.as_ref().is_some_and(|default| default.slot != slot) { return false; }
         let elapsed = if overshoot.is_finite() { overshoot.max(0.0) } else { 0.0 };
         actor.movement_animation = None;
-        actor.animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::OnceFull { elapsed }, once: true });
+        actor.animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::OnceFull { elapsed }, rate: 1.0, once: true });
         true
     }
 

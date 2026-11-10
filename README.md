@@ -1608,6 +1608,13 @@ ranges fall back without wrapping. Full normal-speed Holds start at frame 0 and 
 Jessie's team-talk `ANIM!2` uses all 15 frames of `bxie` on her original `axdc` model, then retains its final pose.
 The full clip uses the same scene clock, dialogue pause and bounded cache; its endpoint is not limited to an eight-bit
 frame number. Another animation, speed change or movement replaces the pose. Missing or incompatible clips keep the usual fallback.
+A fresh full Hold at ASPED 32 and literal divisor 1 also plays at twice normal speed. Jessie's post-escape scene
+uses this for slot 5, `ccif` (15 frames), on her original `axdc` model. Clip time advances by two frames per scene
+tick, including a late start, freezes with dialogue, and clamps at the loaded endpoint. A new animation resets its
+rate; a later ASPED still cancels the override. Other rates, divisors, doubled ranges and doubled Once/default loops
+keep their existing fallback. The rate follows the original [animation setup](https://github.com/Akari1982/q-gears_reverse/blob/e0fabf7e121818e5abe2f873e34a07d0eb32742d/ffvii/DISC/FIELD/FIELD.BIN_event_code_entity.cpp)
+and [frame update](https://github.com/Akari1982/q-gears_reverse/blob/e0fabf7e121818e5abe2f873e34a07d0eb32742d/ffvii/DISC/FIELD/FIELD.BIN_entity.cpp).
+The VM's existing wait estimates are unchanged; original PC render-tick matching remains unverified.
 A normal-speed Once can also play while the actor stands, when its default animation is known and uses a different
 slot. Biggs's team-talk gesture uses `bxic` frames 10–19, then returns to slot 0, `acfe`. The default is retained separately
 from temporary Holds and gestures, including setup and resumed-scene state. Completion restarts the different default slot
