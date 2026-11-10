@@ -127,7 +127,16 @@ impl SoundLayer {
     /// The ambience the sound layer has for the field with maplist id `field_id`, decoded as a mixer clip that loops whole, or
     /// `None` (no layer, no section, or the clip does not decode: said once, and the field plays without it).
     fn ambience(&self, field_id: u16) -> Option<super::field::ModAmbience> {
-        let found = self.mods.as_ref()?.field_ambience(field_id)?;
+        self.decoded_ambience(self.mods.as_ref()?.field_ambience(field_id)?)
+    }
+
+    /// The ambience the sound layer has for a battle of formation `formation`, decoded as [`SoundLayer::ambience`] does.
+    fn battle_ambience(&self, formation: u16) -> Option<super::field::ModAmbience> {
+        self.decoded_ambience(self.mods.as_ref()?.battle_ambience(formation)?)
+    }
+
+    /// An ambience of the layer as a mixer clip that loops whole (the decoded clips are kept, see [`SoundLayer::ambiences`]).
+    fn decoded_ambience(&self, found: fmv_mods::Ambience) -> Option<super::field::ModAmbience> {
         let cached = {
             let mut cache = self.ambiences.lock().unwrap_or_else(PoisonError::into_inner);
             let hit = cache.iter().position(|(name, _)| *name == found.clip.name);
@@ -310,6 +319,10 @@ fn tasks_with(
         voice: {
             let layer = layer.clone();
             Arc::new(move |cue| layer.voice(cue))
+        },
+        battle_ambience: {
+            let layer = layer.clone();
+            Some(Arc::new(move |formation| layer.battle_ambience(formation)))
         },
     })
 }
@@ -903,7 +916,7 @@ mod tests {
     /// scripts decodes. Counts only; nothing is stored, printed or played.
     #[test]
     #[ignore = "needs the owner's Cosmo Memory archive and field archive (FMV_COSMO_IRO, FMV_FF7_DATA)"]
-    fn cosmos_field_ambience_plays_in_the_fields_of_the_route_by_their_maplist_numbers() {
+    fn cosmos_field_and_battle_ambience_play_in_the_fields_and_fights_of_the_route() {
         let var = |name: &str| std::env::var_os(name).map(PathBuf::from);
         let (Some(cosmo), Some(data)) = (var("FMV_COSMO_IRO"), var("FMV_FF7_DATA")) else {
             eprintln!("FMV_COSMO_IRO and FMV_FF7_DATA are needed; skipping");
@@ -928,6 +941,12 @@ mod tests {
             }
         }
         assert!(with >= route.len() / 2, "Cosmo names most fields of the route ({with} of {})", route.len());
+        // And the fights of the route by their formations: md1stin's story fight, the window's debug fight, the Guard Scorpion.
+        for formation in [300u16, 303, 324] {
+            let a = layer.battle_ambience(formation).expect("Cosmo's battle ambience for the formation");
+            println!("formation {formation}: {} {} from {}, {:.1} s of sound, fades {:.2} s in, {:.2} s out", a.section, a.name, a.source, a.clip.duration().as_secs_f32(), a.fade_in.as_secs_f32(), a.fade_out.as_secs_f32());
+            assert_eq!(a.section, format!("bat_{formation}"));
+        }
     }
 
     #[test]

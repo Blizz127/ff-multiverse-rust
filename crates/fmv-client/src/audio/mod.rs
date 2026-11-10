@@ -79,6 +79,8 @@ pub const FANFARE_ENV: &str = "FMV_AUDIO_FANFARE";
 pub const BATTLE_SOUNDS_ENV: &str = "FMV_BATTLE_SOUNDS";
 /// How loud a battle sound plays, `0.0..=1.0` (before the master volume, which it shares with everything else).
 const BATTLE_GAIN: f32 = 0.8;
+/// How loud a battle's ambience from the sound layer plays, before the master volume (as loud as a field's).
+const BATTLE_AMBIENCE_GAIN: f32 = 0.6;
 /// A battle sound that came due this long ago or more is not played: a window that stalled does not play a burst.
 const STALE_SOUND_S: f64 = 0.5;
 /// Clips of battle sounds kept at once (a fight needs a dozen or so; the oldest go first).
@@ -91,6 +93,14 @@ const VOICE_CUT: Duration = Duration::from_millis(60);
 const VOICE_GRACE: Duration = Duration::from_millis(250);
 
 /// The voice layer's state: which ask is current, the voice that plays and what the run did.
+/// A battle's ambience (see [`Live::on_battle_ambience`]): the formation of the fight it was asked for, and the loop playing it
+/// with its section (for the log) and its fade out.
+#[derive(Default)]
+struct BattleAmbience {
+    formation: Option<u16>,
+    playing: Option<(fmv_audio::SfxHandle, String, std::time::Duration)>,
+}
+
 #[derive(Default)]
 struct VoiceState {
     /// The ask in flight or playing: the answer to any other is thrown away (a newer window opened, or the conversation ended).
@@ -253,6 +263,8 @@ struct Live {
     sounds_asked: HashSet<u16>,
     /// Battles seen start (the battle counter at the last look): a new one asks for its clips.
     battles_seen: u64,
+    /// The battle's ambience from the sound layer: the formation it was asked for (the fight on now) and the loop playing it.
+    battle_ambience: BattleAmbience,
     /// The time the battle's due sounds were last asked for up to (the next look asks from here).
     polled_to: Option<f64>,
     /// How many times each battle sound id was played (the closing line of the run, and tests).
@@ -290,6 +302,26 @@ impl Live {
     }
 
     /// A voice clip arrived for ask `seq`: play it if that is still the ask, else it is thrown away.
+    /// The worker's answer for a battle's ambience: it plays if it is for the fight on now and none plays yet.
+    fn on_battle_ambience(&mut self, formation: u16, ambience: Option<Box<field::ModAmbience>>) {
+        if self.battle_ambience.formation != Some(formation) || self.battle_ambience.playing.is_some() {
+            return;
+        }
+        let Some(a) = ambience else { return };
+        let handle = self.engine.play_sfx_loop(&a.clip, BATTLE_AMBIENCE_GAIN, 0.0, a.fade_in);
+        self.say(&format!("battle ambience start {} from {} ({})", a.section, a.source, a.name));
+        self.battle_ambience.playing = Some((handle, a.section, a.fade_out));
+    }
+
+    /// The fight is over (or another began): its ambience fades out with its own fade.
+    fn stop_battle_ambience(&mut self, why: &str) {
+        self.battle_ambience.formation = None;
+        if let Some((handle, section, fade)) = self.battle_ambience.playing.take() {
+            self.engine.stop_sfx_loop(handle, fade);
+            self.say(&format!("battle ambience stop {section} ({why})"));
+        }
+    }
+
     fn on_voice(&mut self, seq: u64, result: Result<Option<worker::VoiceClip>, String>) {
         if seq != self.voice.seq {
             return;
@@ -401,6 +433,7 @@ impl Live {
                 }
                 Done::Field { key, story, read, took } => self.field.on_read(&self.log, &key, &story, read, took),
                 Done::Voice { seq, result } => self.on_voice(seq, result),
+                Done::BattleAmbience { formation, ambience } => self.on_battle_ambience(formation, ambience),
             }
         }
     }
@@ -548,6 +581,7 @@ impl GameAudio {
                 battle_clips: Clips::default(),
                 sounds_asked: HashSet::new(),
                 battles_seen: 0,
+                battle_ambience: BattleAmbience::default(),
                 polled_to: None,
                 battle_played: BTreeMap::new(),
                 unheard: HashSet::new(),
@@ -709,6 +743,14 @@ impl GameAudio {
         if battle.entered() > live.battles_seen {
             live.battles_seen = battle.entered();
             live.request_battle_sounds(&battle.sound_plan());
+            live.stop_battle_ambience("another battle began");
+            if let Some(formation) = battle.formation() {
+                live.battle_ambience.formation = Some(formation);
+                live.worker.load_battle_ambience(formation);
+            }
+        }
+        if !battle.in_battle() && live.battle_ambience.formation.is_some() {
+            live.stop_battle_ambience("the battle ended");
         }
         let from = live.polled_to.replace(now).unwrap_or(now);
         for (at, sound) in battle.sounds_due(from, now) {
@@ -843,12 +885,29 @@ mod tests {
         broken: Vec<String>,
         /// The voice clips the mod layer has, by `<field>/<dialog>` (or `<field>/<dialog>_<line>`), with their length in frames.
         voices: HashMap<String, usize>,
+        /// The battle ambiences the sound layer has, by formation: their sections.
+        battle_ambience: HashMap<u16, String>,
     }
 
     /// A worker that answers on the spot (or when told to): no threads, no waiting.
     struct Fake(Rc<RefCell<State>>);
 
     impl Worker for Fake {
+        fn load_battle_ambience(&mut self, formation: u16) {
+            let mut s = self.0.borrow_mut();
+            s.asked.push(format!("battle ambience {formation}"));
+            let ambience = s.battle_ambience.get(&formation).map(|section| Box::new(field::ModAmbience {
+                section: section.clone(),
+                name: format!("Ambience\\Ambient\\{section}.ogg"),
+                source: "cosmo",
+                clip: SfxClip::from_mono(RATE, &vec![0.25; 4_800]).expect("a clip"),
+                fade_in: std::time::Duration::from_millis(500),
+                fade_out: std::time::Duration::from_millis(500),
+            }));
+            let done = Done::BattleAmbience { formation, ambience };
+            if s.hold { s.held.push(done) } else { s.inbox.push(done) }
+        }
+
         fn analyze(&mut self, key: &str) {
             let mut s = self.0.borrow_mut();
             s.asked.push(format!("analyze {key}"));
@@ -1278,6 +1337,7 @@ mod tests {
             sounds: Arc::new(|_| panic!("a muted run must not read the sound files")),
             field: Arc::new(|_, _, _| panic!("a muted run must not read a field's sounds")),
             voice: Arc::new(|_| panic!("a muted run must not read a voice")),
+            battle_ambience: Some(Arc::new(|_| panic!("a muted run must not read an ambience"))),
         };
         let muted = GameAudio::start(AudioConfig { mode: Mode::Off, ..AudioConfig::default() }, tasks);
         assert!(!muted.is_on());
@@ -1887,6 +1947,30 @@ mod tests {
         assert_eq!(count("field ambience stop field_116 (the field was left)"), 1, "{lines:?}");
         rig.audio.pump(48_000);
         assert_eq!(rig.audio.status().expect("on").loops_playing, 0, "faded out and gone");
+    }
+
+    #[test]
+    fn a_battles_ambience_from_the_sound_layer_plays_for_the_fight_and_fades_out_at_its_end() {
+        let mut rig = Rig::new(&[], &[]);
+        rig.state.borrow_mut().battle_ambience.insert(301, "bat_301".to_string());
+        let mut client = battle();
+        look(&mut rig, &client, 0.0);
+        look(&mut rig, &client, 0.05);
+        let lines = rig.lines();
+        assert!(rig.state.borrow().asked.contains(&"battle ambience 301".to_string()));
+        assert!(lines.contains(&"battle ambience start bat_301 from cosmo (Ambience\\Ambient\\bat_301.ogg)".to_string()), "{lines:?}");
+        assert_eq!(rig.audio.status().expect("on").loops_playing, 1);
+        // the fight ends: the ambience fades out and is gone; a formation without one asks and plays nothing
+        client.on_message(5.0, ServerMsg::BattleEnd { battle_id: BattleId(1), outcome: fmv_protocol::battle::Outcome::Victory, rewards: Vec::new() });
+        look(&mut rig, &client, 5.0);
+        assert!(rig.lines().contains(&"battle ambience stop bat_301 (the battle ended)".to_string()), "{:?}", rig.lines());
+        rig.audio.pump(48_000);
+        assert_eq!(rig.audio.status().expect("on").loops_playing, 0);
+        client.on_message(6.0, start(2, 302));
+        look(&mut rig, &client, 6.0);
+        look(&mut rig, &client, 6.05);
+        assert!(rig.state.borrow().asked.contains(&"battle ambience 302".to_string()));
+        assert_eq!(rig.lines().iter().filter(|l| l.starts_with("battle ambience start")).count(), 1);
     }
 
     #[test]

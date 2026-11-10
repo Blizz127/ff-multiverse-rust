@@ -44,6 +44,8 @@ pub enum Done {
     /// The voice clip an ask wanted (`Ok(None)`: it has none, which is most windows), or why it could not be read; `seq` is
     /// the ask, so that an answer to an ask that has been replaced is thrown away.
     Voice { seq: u64, result: Result<Option<VoiceClip>, String> },
+    /// The sound layer's ambience for a battle of this formation (`None`: it has none, or it does not decode).
+    BattleAmbience { formation: u16, ambience: Option<Box<super::field::ModAmbience>> },
 }
 
 /// What the voice layer is asked for: the clip of one window (or of one choice of a question), and which ask it is.
@@ -87,6 +89,9 @@ pub trait Worker {
     /// Read the voice clip a window asks for, before anything in advance (a voice is wanted the moment its window opens). A worker
     /// without a voice layer does nothing.
     fn load_voice(&mut self, _request: VoiceRequest) {}
+    /// Read the sound layer's ambience for a battle of formation `formation`, before anything in advance (a fight that starts
+    /// wants it now). A worker without a sound layer does nothing.
+    fn load_battle_ambience(&mut self, _formation: u16) {}
     /// What finished since the last call.
     fn poll(&mut self) -> Vec<Done>;
 }
@@ -105,6 +110,9 @@ pub type FieldTask = Arc<dyn Fn(&str, &[u8], &[u16]) -> Result<FieldRead, String
 /// Reads the clip a voice cue asks for: `Ok(None)` when there is none (most windows have no voice), why not when it cannot.
 pub type VoiceTask = Arc<dyn Fn(&VoiceCue) -> Result<Option<VoiceClip>, String> + Send + Sync>;
 
+/// Reads the sound layer's ambience of a battle (by its formation), `None` when it has none.
+pub type BattleAmbienceTask = Arc<dyn Fn(u16) -> Option<super::field::ModAmbience> + Send + Sync>;
+
 /// The voice task of a soundtrack without a voice layer: there is never a clip.
 #[cfg(test)]
 pub fn no_voice() -> VoiceTask {
@@ -120,6 +128,8 @@ pub struct Tasks {
     pub sounds: SoundsTask,
     pub field: FieldTask,
     pub voice: VoiceTask,
+    /// The sound layer's battle ambience (`None`: no layer).
+    pub battle_ambience: Option<BattleAmbienceTask>,
 }
 
 enum Job {
@@ -129,6 +139,7 @@ enum Job {
     Sounds(Vec<u16>),
     Field { key: String, story: Vec<u8>, have: Vec<u16> },
     Voice(VoiceRequest),
+    BattleAmbience(u16),
 }
 
 #[derive(Default)]
@@ -233,6 +244,10 @@ impl Worker for ThreadWorker {
         self.push(Job::Field { key: key.to_string(), story, have }, true);
     }
 
+    fn load_battle_ambience(&mut self, formation: u16) {
+        self.push(Job::BattleAmbience(formation), true);
+    }
+
     fn load_voice(&mut self, request: VoiceRequest) {
         self.push(Job::Voice(request), true);
     }
@@ -289,6 +304,10 @@ fn run(shared: &Shared, tasks: &Tasks, send: &Sender<Done>) {
                 let read = catch_unwind(AssertUnwindSafe(|| (tasks.field)(&key, &story, &have))).unwrap_or_else(|_| Err("the field reader panicked".to_string()));
                 Done::Field { key, story, read, took: started.elapsed() }
             }
+            Job::BattleAmbience(formation) => {
+                let ambience = tasks.battle_ambience.as_ref().and_then(|task| catch_unwind(AssertUnwindSafe(|| task(formation))).ok().flatten());
+                Done::BattleAmbience { formation, ambience: ambience.map(Box::new) }
+            }
             Job::Voice(request) => {
                 let result = catch_unwind(AssertUnwindSafe(|| (tasks.voice)(&request.cue))).unwrap_or_else(|_| Err("the voice reader panicked".to_string()));
                 Done::Voice { seq: request.seq, result }
@@ -329,6 +348,7 @@ mod tests {
         let caller = std::thread::current().id();
         let tasks = Tasks {
             voice: no_voice(),
+            battle_ambience: None,
             analyze: Arc::new(move |key| {
                 assert_ne!(std::thread::current().id(), caller);
                 AreaMusic { arrival: Some(format!("music-of-{key}")), ..AreaMusic::default() }
@@ -393,6 +413,7 @@ mod tests {
         let (log, gate) = (Arc::clone(&started), Arc::clone(&gates));
         let tasks = Tasks {
             voice: no_voice(),
+            battle_ambience: None,
             analyze: Arc::new(|_| AreaMusic::default()),
             decode: Arc::new(move |name| {
                 log.lock().expect("log").push(name.to_string());
@@ -436,6 +457,7 @@ mod tests {
         let (log, gate) = (Arc::clone(&started), Arc::clone(&gates));
         let tasks = Tasks {
             voice: no_voice(),
+            battle_ambience: None,
             analyze: Arc::new(|_| AreaMusic::default()),
             decode: Arc::new(move |name| {
                 log.lock().expect("log").push(name.to_string());
@@ -487,6 +509,7 @@ mod tests {
         let sounds_log = Arc::clone(&started);
         let tasks = Tasks {
             voice: no_voice(),
+            battle_ambience: None,
             analyze: Arc::new(|_| AreaMusic::default()),
             decode: Arc::new(move |name| {
                 log.lock().expect("log").push(name.to_string());
@@ -528,6 +551,7 @@ mod tests {
     fn a_panicking_task_is_an_error_for_that_job_and_the_threads_carry_on() {
         let tasks = Tasks {
             voice: no_voice(),
+            battle_ambience: None,
             analyze: Arc::new(|_| panic!("a broken script")),
             decode: Arc::new(|name| if name == "boom" { panic!("a broken decoder") } else { Ok(tracks(5)) }),
             cues: Arc::new(|| panic!("a broken sound file")),
@@ -562,6 +586,7 @@ mod tests {
         let counter = Arc::clone(&ran);
         let tasks = Tasks {
             voice: no_voice(),
+            battle_ambience: None,
             analyze: Arc::new(move |_| {
                 counter.fetch_add(1, SeqCst);
                 AreaMusic::default()

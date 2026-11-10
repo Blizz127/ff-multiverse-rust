@@ -551,6 +551,11 @@ impl BattleClient {
         self.active.as_ref()
     }
 
+    /// The formation of the battle we are in (`scene * 4 + slot`), `None` out of battles.
+    pub fn formation(&self) -> Option<u16> {
+        self.active.as_ref().map(|a| a.formation_id)
+    }
+
     /// Battles we entered (`EncounterStart` received).
     pub fn entered(&self) -> u64 {
         self.entered

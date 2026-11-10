@@ -2056,9 +2056,15 @@ game's own hum plays): `audio::ff7::tests::cosmos_field_ambience_plays_in_the_fi
 (ignored, `FMV_COSMO_IRO` and `FMV_FF7_DATA`). The client log says `field <key>: ambience field_<n> from cosmo (...)` and
 `field ambience start|stop field_<n> (...)`.
 
+**Battle ambience** (Cosmo's `BA` option). A fight's formation names its section of `BA\Ambient\config.toml` (`[bat_324]` is
+the Guard Scorpion), the same clips and fades: the client asks its audio worker for it when the fight starts, it loops while
+the fight is on and fades out when the fight ends (the field's own ambience comes back after it). On the owner's data the
+route's fights have one (formation 300 and the debug fight 303 the station's clip, 324 a reactor hum, `38`). The log says
+`battle ambience start|stop bat_<n> ...`.
+
 **Not done, and why.** Voiced attacks (`battle_char_<index>_<id>` sections of both configs) need to know which character performs a battle sound, which
 the client's battle sounds do not carry. A repeating sound id plays the first of its clips, not each in turn; Cosmo's footsteps
-(`<field>_<triangle>_<id>`), battle ambience (`BA`, `FA+BA`), movie sounds and menu sets 2 and 3 are not used; Echo-S's battle lines, `NoCloud` voices,
+(`<field>_<triangle>_<id>`, the sound id 159 that no script of the game plays), movie sounds and menu sets 2 and 3 are not used; Echo-S's battle lines, `NoCloud` voices,
 models, textures and kernel text are not used either. Only characters that talk are voiced: a cutscene's windows will be voiced by the scene player
 through the same cues once it runs Echo-S's section (`mods::script_source()` and `VoiceCue`). A voice does not duck the music.
 
