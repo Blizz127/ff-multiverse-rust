@@ -335,12 +335,13 @@ impl Cast {
         actor.animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::Loop(frame), once: false });
     }
 
-    /// Use the resolved ordinary MOVE clip only during this movement. Its initial phase includes
-    /// any elapsed part of the event; each new MOVE starts its own presentation clock.
-    pub fn apply_move_animation(&mut self, entity: u8, clip: &str) {
+    /// Use the resolved ordinary MOVE clip only during this movement. The scene player supplies
+    /// a phase offset only for a verified uninterrupted same-slot MOVE; otherwise it starts at zero.
+    pub fn apply_move_animation(&mut self, entity: u8, clip: &str, phase_offset: f32) {
         let Some(actor) = self.actors.get_mut(&entity) else { return };
         if let Some(walk) = actor.walk.filter(|walk| walk.how == MoveHow::Walk) {
-            actor.movement_animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::Loop(walk.elapsed), once: false });
+            let phase = if phase_offset.is_finite() { phase_offset.max(0.0) } else { 0.0 };
+            actor.movement_animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::Loop(phase + walk.elapsed), once: false });
         }
     }
 

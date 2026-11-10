@@ -689,7 +689,7 @@ fn authored_move_clips_reset_pause_and_return_to_standing_for_owner_and_watcher(
         player.advance(6.0 / 30.0);
         assert_eq!(clip(&player), Some(("run".into(), ClipFrame::Loop(1.0))), "a new slot starts with the new Move");
         player.advance(5.0 / 30.0);
-        assert_eq!(clip(&player), Some(("run".into(), ClipFrame::Loop(1.0))), "a repeated slot also restarts for each Move");
+        assert_eq!(clip(&player), Some(("run".into(), ClipFrame::Loop(1.0))), "an overlapping replacement restarts even with the same slot");
         player.advance(4.0 / 30.0);
         assert_eq!(clip(&player), Some(("run".into(), ClipFrame::Loop(5.0))));
         pass(&mut player, 1);
@@ -712,6 +712,141 @@ fn authored_move_clips_reset_pause_and_return_to_standing_for_owner_and_watcher(
             player.advance(4.0 / 30.0);
             assert!(player.actor(20).unwrap().moving());
             assert_eq!(clip(&player), None, "animation replacement {index} cancels the movement override");
+        }
+    }
+}
+
+mod movement_continuity {
+    use super::*;
+    use crate::avatar::anim::ClipFrame;
+    use fmv_ff7::script::scene::AnimHow;
+
+    struct Moving(Scripted);
+    impl SceneSource for Moving {
+        fn initial(&self) -> Vec<Stage> { self.0.initial() }
+        fn next(&mut self, answer: Option<usize>) -> Beat { self.0.next(answer) }
+        fn height_at(&self, x: i16, y: i16, triangle: Option<u16>) -> Option<f32> { self.0.height_at(x, y, triangle) }
+        fn animation_clip(&self, entity: u8, slot: u8) -> Option<&str> {
+            if entity != 20 { return None; }
+            // Two distinct authored slots can refer to the same file; that is not phase continuity.
+            match slot { 0 => Some("idle"), 1 | 2 => Some("stride"), _ => None }
+        }
+    }
+
+    fn movement(at: u32, from: Option<i16>, x: i16, frames: u32, animation: Option<u8>) -> Timed<Stage> {
+        timed(at, Stage::Move { entity: 20, from: from.map(|x| (x, 10)), x, y: 10, z: None,
+            triangle: None, frames, how: MoveHow::Walk, animation })
+    }
+
+    fn player(role: SceneRole, beats: Vec<Beat>) -> ScenePlayer {
+        let mut initial = places();
+        initial.push(Stage::Anim { entity: 20, animation: 0, how: AnimHow::Loop,
+            first: None, last: None, speed: 16, divisor: 1 });
+        let mut definition = def();
+        definition.cast[1].look = Look::Model { hrc: "model".into(), idle: "base".into() };
+        ScenePlayer::new(Run { id: RUN, participants: vec![], role }, definition,
+            Box::new(Moving(Scripted { initial, beats: beats.into(), asked: Asked::default() })), false)
+    }
+
+    fn clip(player: &ScenePlayer) -> (String, f32) {
+        let actors = cast_players(player);
+        let actor = actors.iter().find(|a| a.who == cast_who(20)).unwrap();
+        let npc = actor.npc.unwrap();
+        assert_eq!((npc.model, npc.idle), ("model", Some("base")));
+        let (stem, ClipFrame::Loop(frame)) = actor.scene_clip.expect("resolved scene clip") else { panic!("expected loop") };
+        (stem.to_string(), frame)
+    }
+
+    fn assert_phase(player: &ScenePlayer, stem: &str, expected: f32) {
+        let (actual_stem, frame) = clip(player);
+        assert_eq!(actual_stem, stem);
+        assert!((frame - expected).abs() < 0.0001, "expected phase {expected}, got {frame}");
+    }
+
+    fn pass(player: &mut ScenePlayer, role: SceneRole) {
+        if role == SceneRole::Owner { player.key(SceneKey::Confirm); } else { player.on_step(0, None); }
+    }
+
+    #[test]
+    fn contiguous_moves_keep_phase_across_tick_partitions_for_both_roles() {
+        for role in [SceneRole::Owner, SceneRole::Watcher] {
+            for chunks in [vec![24.0], vec![3.0, 7.0, 1.0, 9.0, 4.0]] {
+                let mut player = player(role, vec![Beat { stage: vec![
+                    movement(2, Some(50), 100, 8, Some(1)),
+                    timed(10, Stage::Place { entity: 18, x: 12, y: 10, z: None, triangle: None }),
+                    movement(10, Some(100), 200, 10, Some(1)),
+                    movement(20, Some(200), 300, 8, Some(1)),
+                ], then: say(24, 20, 20, 1).then }, say(10, 20, 20, 2)]);
+                for frames in chunks { player.advance(frames / 30.0); }
+                assert!(player.has_window() && player.actor(20).unwrap().moving());
+                assert_phase(&player, "stride", 22.0);
+                assert!((player.actor(20).unwrap().pos().unwrap()[0] - 250.0).abs() < 0.0001);
+                player.advance(20.0);
+                assert_phase(&player, "stride", 22.0);
+                pass(&mut player, role);
+                player.advance(6.0 / 30.0);
+                assert!(!player.actor(20).unwrap().moving());
+                assert_phase(&player, "idle", 2.0);
+            }
+        }
+    }
+
+    #[test]
+    fn interrupted_or_unproven_moves_start_a_new_phase() {
+        let reset_events = [
+            Stage::Place { entity: 20, x: 100, y: 10, z: None, triangle: None },
+            Stage::Anim { entity: 20, animation: 0, how: AnimHow::Loop, first: None, last: None, speed: 16, divisor: 1 },
+            Stage::Anim { entity: 20, animation: 0, how: AnimHow::Hold, first: Some(0), last: Some(0), speed: 16, divisor: 1 },
+            Stage::Anim { entity: 20, animation: 99, how: AnimHow::Once, first: None, last: None, speed: 16, divisor: 1 },
+            Stage::AnimSpeed { entity: 20, speed: 32 },
+        ];
+        let first = movement(0, Some(50), 100, 10, Some(1));
+        let second = movement(10, Some(100), 200, 10, Some(1));
+        let mut cases = vec![
+            vec![first.clone(), movement(11, Some(100), 200, 10, Some(1))], // idle gap
+            vec![first.clone(), movement(9, Some(100), 200, 10, Some(1))], // interrupted move
+            vec![first.clone(), movement(10, Some(101), 200, 10, Some(1))], // disconnected start
+            vec![first.clone(), movement(10, None, 200, 10, Some(1))], // unknown start
+            vec![first.clone(), movement(10, Some(100), 200, 10, Some(2))], // different slot, same file
+            vec![movement(0, Some(50), 100, 0, Some(1)), movement(0, Some(100), 200, 10, Some(1))],
+        ];
+        cases.extend([None, Some(99), Some(3)].map(|slot| vec![movement(0, Some(50), 100, 10, slot), second.clone()]));
+        cases.extend(reset_events.into_iter().map(|event| vec![first.clone(), timed(10, event), second.clone()]));
+        for role in [SceneRole::Owner, SceneRole::Watcher] {
+            for stage in &cases {
+                let at = stage.last().unwrap().at + 3;
+                let mut player = player(role, vec![Beat { stage: stage.clone(), then: say(at, 20, 20, 1).then }]);
+                player.advance(at as f32 / 30.0);
+                assert!(player.has_window());
+                assert_phase(&player, "stride", 3.0);
+            }
+        }
+    }
+
+    #[test]
+    fn normal_blank_and_early_watcher_windows_break_phase_continuity() {
+        for role in [SceneRole::Owner, SceneRole::Watcher] {
+            for at in [5, 10] { // a window during walking, and one precisely on arrival
+                for is_blank in [false, true] {
+                    let then = if is_blank { blank(at, 20).then } else { say(at, 20, 20, 1).then };
+                    let mut player = player(role, vec![
+                        Beat { stage: vec![movement(0, Some(50), 100, 10, Some(1))], then },
+                        Beat { stage: vec![movement(10, Some(100), 200, 10, Some(1))], then: say(13, 20, 20, 2).then },
+                    ]);
+                    if is_blank && role == SceneRole::Watcher { player.on_step(0, None); }
+                    player.advance(at as f32 / 30.0);
+                    if !is_blank {
+                        assert!(player.has_window());
+                        let frozen = clip(&player);
+                        player.advance(20.0);
+                        assert_eq!(clip(&player), frozen, "a paused actor keeps its visible phase");
+                        pass(&mut player, role);
+                    }
+                    player.advance(13.0 / 30.0);
+                    assert!(player.has_window());
+                    assert_phase(&player, "stride", 3.0);
+                }
+            }
         }
     }
 }

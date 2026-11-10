@@ -259,7 +259,7 @@ fn the_post_escape_scene_changes_nothing_that_is_saved() {
 fn the_team_talk_is_the_cutscene_of_md1_1s_story_point_and_writes_its_step() {
     use fmv_adapter_api::AreaRuntime;
     use fmv_core::{EditionProvenance, GameId, Platform};
-    use fmv_ff7::script::scene::{scene, team_talk_scene, TEAM_TALK_SCENE_ID};
+    use fmv_ff7::script::scene::{scene, team_talk_scene, MoveHow, TEAM_TALK_SCENE_ID};
     let f = field("md1_1").expect("FMV_FF7_DATA and md1_1");
     let def = team_talk_scene();
     assert_eq!(scene(TEAM_TALK_SCENE_ID).as_ref(), Some(&def), "registered");
@@ -321,6 +321,14 @@ fn the_team_talk_is_the_cutscene_of_md1_1s_story_point_and_writes_its_step() {
     assert!(biggs_script.iter().any(|ins| ins.opcode == 0xBB
         && ins.literal("animation") == Some(3) && ins.literal("first") == Some(10)
         && ins.literal("last") == Some(19) && ins.literal("speed") == Some(1)));
+    let departure = script.disassemble(3, 6).unwrap();
+    assert_eq!((departure[0].offset, departure[0].opcode, departure[0].literal("speed")), (0x05C8, 0xB2, Some(2560)));
+    assert_eq!(script.header().scale, 1024);
+    assert!(2560 <= 3 * i32::from(script.header().scale), "both ordinary MOVE instructions select slot 1");
+    for (ins, offset, x, y) in [(&departure[1], 0x05CC, 1171, 1748), (&departure[2], 0x05D2, 1355, 3376)] {
+        assert_eq!((ins.offset, ins.opcode, ins.literal("x"), ins.literal("y")), (offset, 0xA8, Some(x), Some(y)));
+    }
+    assert_eq!(departure[1].end(), departure[2].offset, "no instruction interrupts Biggs's two MOVE segments");
     let mut characters = LgpArchive::open_path(dir.join("field/char.lgp")).unwrap();
     let clip = fmv_ff7::load_field_animation(&mut characters, "bxic").unwrap();
     let model = fmv_ff7::load_field_model(&mut characters, "bwfd").unwrap();
@@ -329,6 +337,11 @@ fn the_team_talk_is_the_cutscene_of_md1_1s_story_point_and_writes_its_step() {
     let default_clip = fmv_ff7::load_field_animation(&mut characters, &default_clip_stem).unwrap();
     assert_eq!((default_clip.frame_count(), default_clip.bone_count()), (1, 21));
     assert!(model.fits(&default_clip) && default_clip.frame(0).is_some());
+    let walk_stem = biggs_model.animations[1].stem();
+    assert_eq!(walk_stem, "aaff");
+    let walk_clip = fmv_ff7::load_field_animation(&mut characters, &walk_stem).unwrap();
+    assert_eq!((walk_clip.frame_count(), walk_clip.bone_count()), (30, 21));
+    assert!(model.fits(&walk_clip) && walk_clip.frame(0).is_some() && walk_clip.frame(29).is_some());
     let jessie = script.entity_inits(Some(&models)).into_iter().find(|init| init.entity == 4).unwrap();
     assert_eq!((jessie.name.as_str(), jessie.model_index), ("av_l", Some(3)));
     let jessie_model = &loader.models[jessie.model_index.unwrap()];
@@ -352,17 +365,24 @@ fn the_team_talk_is_the_cutscene_of_md1_1s_story_point_and_writes_its_step() {
     }
     // Who speaks: the windows' openers are the team (the survey: av_m, av_l, cl, ba).
     let mut play = ScenePlay::new(&f, &def, &StoryState::at(6), 1).unwrap();
+    assert_eq!(play.animation_clip(3, 1), Some(walk_stem.as_str()));
     assert_eq!(play.animation_clip(3, 3), Some("bxic"));
     assert_eq!(play.initial_default_animation_clip(3), Some((0, default_clip_stem.as_str())));
     assert_eq!(play.animation_clip(4, 4), Some(jessie_clip_stem.as_str()));
     let mut openers = Vec::new();
+    let mut biggs_stage = Vec::new();
     let mut origin = 0u32;
     let (mut biggs_turn_at, mut biggs_dialog_at) = (None, None);
     let (mut biggs_at, mut jessie_at, mut jessie_dialog_at) = (None, None, None);
     loop {
         let beat = play.next(None);
         for event in &beat.stage {
-            let at = origin + event.at;
+            let at = origin.checked_add(event.at).expect("team-talk event time fits");
+            if matches!(event.what, Stage::Place { entity: 3, .. } | Stage::Move { entity: 3, .. }
+                | Stage::Face { entity: 3, .. } | Stage::Show { entity: 3, .. }
+                | Stage::Anim { entity: 3, .. } | Stage::AnimSpeed { entity: 3, .. }) {
+                biggs_stage.push((at, openers.len(), event.what.clone()));
+            }
             match event.what {
                 Stage::Face { entity: 3, heading, frames } if frames > 0 && biggs_turn_at.is_none() => {
                     assert_eq!(heading, fmv_ff7::field_direction_to_facing(28));
@@ -379,7 +399,7 @@ fn the_team_talk_is_the_cutscene_of_md1_1s_story_point_and_writes_its_step() {
         match beat.then {
             Then::End { .. } => break,
             Then::Window(w) => {
-                origin += w.at;
+                origin = origin.checked_add(w.at).expect("team-talk window time fits");
                 if w.opener == 3 && biggs_dialog_at.is_none() {
                     assert!(matches!(w.message.origin, MessageOrigin::Canon { dialog: 31, .. }), "Biggs's first window is the authored dialog 31");
                     biggs_dialog_at = Some(origin);
@@ -392,6 +412,18 @@ fn the_team_talk_is_the_cutscene_of_md1_1s_story_point_and_writes_its_step() {
             },
         }
     }
+    assert_eq!(biggs_stage.iter().filter(|(_, _, event)| matches!(event, Stage::Move { .. })).count(), 2);
+    let pair = biggs_stage.windows(2).find(|pair| matches!((&pair[0].2, &pair[1].2),
+        (Stage::Move { x: 1171, y: 1748, .. }, Stage::Move { x: 1355, y: 3376, .. })))
+        .expect("the two departure moves are adjacent among Biggs's stage events");
+    let Stage::Move { from: first_from, frames: first_frames, how: first_how, animation: first_slot, .. } = &pair[0].2 else { unreachable!() };
+    let Stage::Move { from: second_from, frames: second_frames, how: second_how, animation: second_slot, .. } = &pair[1].2 else { unreachable!() };
+    assert_eq!((*first_from, *second_from), (Some((1002, 1556)), Some((1171, 1748))), "the second move starts at the first target");
+    assert_eq!((*first_how, *second_how), (MoveHow::Walk, MoveHow::Walk));
+    assert_eq!((*first_slot, *second_slot), (Some(1), Some(1)), "both events carry the authored walk slot");
+    assert!(*first_frames > 0 && *second_frames > 0);
+    assert_eq!(pair[0].1, pair[1].1, "no dialogue window separates the movement segments");
+    assert_eq!(pair[0].0.checked_add(*first_frames), Some(pair[1].0), "the second move starts exactly when the first ends");
     assert_eq!(biggs_dialog_at.unwrap().checked_sub(biggs_turn_at.unwrap()), Some(22),
         "TURNGEN's eleven-frame synchronous wait, WAIT1 and the ten-frame Hold precede dialog 31");
     assert_eq!(jessie_at.unwrap().checked_sub(biggs_at.unwrap()), Some(16), "REQEW waits for Biggs's CANIM2 range, then WAIT6 precedes Jessie's animation");

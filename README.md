@@ -1622,8 +1622,14 @@ Ordinary `MOVE` also resolves the same model's walk/run slot from the script's m
 slot 1 through three times the scale, slot 2 above it. Wedge's reactor approach uses slot 2 (`aaga`, 15 frames),
 then returns to his standing loop. The movement clip advances one frame per scene tick and freezes with dialogue;
 missing or incompatible clips keep the usual walking pose. Other movement opcodes retain their existing clips.
-Each movement starts its presentation phase at zero; original phase/rate retention across repeated same-slot moves
-is not reproduced. A later unsupported animation or speed change clears the movement override.
+Consecutive ordinary `MOVE` segments retain their presentation phase when they meet at exactly the same authored
+time and endpoint and use the same animation slot and resolved clip. Biggs's two departure segments in the team-talk
+scene use slot 1 (`aaff`, 30 frames) without restarting that clip at the corner. An idle gap, overlapping replacement,
+unknown start, slot change, placement, animation/speed change or dialogue window starts a new phase.
+This narrow continuity follows the [MOVE handler](https://github.com/Akari1982/q-gears_reverse/blob/e0fabf7e121818e5abe2f873e34a07d0eb32742d/ffvii/DISC/FIELD/FIELD.BIN_event_code_entity.cpp)
+and [instruction/default-animation ordering](https://github.com/Akari1982/q-gears_reverse/blob/e0fabf7e121818e5abe2f873e34a07d0eb32742d/ffvii/DISC/FIELD/FIELD.BIN_event.cpp).
+General rate retention and original PC rendering/tick fidelity are not established. A later unsupported animation
+or speed change clears the movement override.
 `TURNGEN` uses its positive literal step count for presentation when its path selector is 0–2 and its interpolation
 type is 1 or 2. The script waits one more tick to observe completion: Biggs's team-talk turn has ten presentation
 intervals and an eleven-tick wait, followed by `WAIT1` and a ten-frame Hold before his first window at tick 22.

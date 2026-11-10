@@ -43,10 +43,10 @@ use crate::mods::{Global, ModSink, VoiceCue};
 use fmv_core::{EntityId, Pos};
 use fmv_ff7::field_direction_to_facing;
 use fmv_ff7::script::dialogue::{End, MessageOrigin};
-use fmv_ff7::script::scene::{AnimHow, Look, SceneDef, Stage, Then, Timed, Window, FRAMES_PER_SECOND};
+use fmv_ff7::script::scene::{AnimHow, Look, MoveHow, SceneDef, Stage, Then, Timed, Window, FRAMES_PER_SECOND};
 use fmv_protocol::{ClientMsg, SceneOutcome, SceneParticipant, SceneRefusal, SceneRole, SceneRunId, MAX_SCENE_STEPS};
 use std::cell::Cell;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use winit::keyboard::KeyCode;
 
 /// A message for the server about a scene.
@@ -176,6 +176,16 @@ enum Next {
     Held,
 }
 
+/// A resolved ordinary MOVE may continue its clip only at this exact authored boundary.
+/// Keeping integer event times here avoids inferring continuity from rounded render time.
+struct MoveContinuation {
+    slot: u8,
+    clip: String,
+    target: (i16, i16),
+    end_at: u32,
+    phase_at_end: u32,
+}
+
 /// One run of a scene on this machine (see the module docs).
 pub struct ScenePlayer {
     run: Run,
@@ -188,6 +198,8 @@ pub struct ScenePlayer {
     elapsed_frames: f32,
     /// The stage events of the beat in hand that have not happened yet, in order.
     due: VecDeque<Timed<Stage>>,
+    /// Per-actor MOVE boundaries within this beat; a window severs even an active walk's chain.
+    move_continuations: BTreeMap<u8, MoveContinuation>,
     next: Next,
     panel: Option<Panel>,
     /// Windows opened so far.
@@ -253,7 +265,7 @@ impl ScenePlayer {
             }
         }
         for event in source.initial() {
-            Self::apply_stage(&mut cast, source.as_ref(), &event, 0.0);
+            Self::apply_stage(&mut cast, source.as_ref(), &event, 0.0, 0.0);
         }
         cast.settle();
         let mut player = Self {
@@ -264,6 +276,7 @@ impl ScenePlayer {
             clock: 0.0,
             elapsed_frames: 0.0,
             due: VecDeque::new(),
+            move_continuations: BTreeMap::new(),
             next: Next::Pull(None),
             panel: None,
             opened: 0,
@@ -437,6 +450,7 @@ impl ScenePlayer {
 
     fn advance_clock_to(&mut self, target: f32) {
         let frames = (target - self.clock).max(0.0);
+        self.move_continuations.retain(|_, movement| target.is_finite() && target <= movement.end_at as f32);
         self.cast.advance(frames);
         if frames.is_finite() { self.elapsed_frames += frames; }
         self.clock = target;
@@ -471,10 +485,40 @@ impl ScenePlayer {
                 self.sound(SoundAction::Play { id, pan });
             }
         }
-        Self::apply_stage(&mut self.cast, self.source.as_ref(), &event.what, motion_late);
+        let movement_phase = self.move_phase(&event, motion_late);
+        Self::apply_stage(&mut self.cast, self.source.as_ref(), &event.what, motion_late, movement_phase);
     }
 
-    fn apply_stage(cast: &mut Cast, source: &dyn SceneSource, event: &Stage, late: f32) {
+    /// Original MOVE keeps its phase when the selected slot stays the same. Support only
+    /// positive, exactly adjacent ordinary MOVEs with matching authored endpoints and clips.
+    fn move_phase(&mut self, event: &Timed<Stage>, late: f32) -> f32 {
+        match &event.what {
+            Stage::Move { entity, from, x, y, frames, how, animation, .. } => {
+                // Taking the old record also invalidates overlapping/unsupported replacements.
+                let previous = self.move_continuations.remove(entity);
+                if *how != MoveHow::Walk || *frames == 0 || !late.is_finite() || late != 0.0 { return 0.0; }
+                let Some(slot @ (1 | 2)) = *animation else { return 0.0 };
+                let Some(clip) = self.source.animation_clip(*entity, slot) else { return 0.0 };
+                let Some(end_at) = event.at.checked_add(*frames) else { return 0.0 };
+                let phase = previous.filter(|movement| movement.end_at == event.at
+                    && movement.slot == slot && movement.clip == clip && *from == Some(movement.target))
+                    .map_or(0, |movement| movement.phase_at_end);
+                let Some(phase_at_end) = phase.checked_add(*frames) else { return 0.0 };
+                self.move_continuations.insert(*entity, MoveContinuation {
+                    slot, clip: clip.to_string(), target: (*x, *y), end_at, phase_at_end,
+                });
+                phase as f32
+            }
+            // Invalidate before apply_stage's supported animation branches can return early.
+            Stage::Place { entity, .. } | Stage::Anim { entity, .. } | Stage::AnimSpeed { entity, .. } => {
+                self.move_continuations.remove(entity);
+                0.0
+            }
+            _ => 0.0,
+        }
+    }
+
+    fn apply_stage(cast: &mut Cast, source: &dyn SceneSource, event: &Stage, late: f32, movement_phase: f32) {
         // Normal-rate presentation uses the script's own field model and loaded clip bounds:
         // a full default loop, full Hold/Once, or explicit Hold/Once range. Other forms clear an old override.
         if let Stage::Anim { entity, animation, how: AnimHow::Loop, first: None, last: None, speed: 16, divisor: 1 } = event {
@@ -511,9 +555,9 @@ impl ScenePlayer {
             }
         }
         cast.apply(event, late, &|x, y, triangle| source.height_at(x, y, triangle));
-        if let Stage::Move { entity, how: fmv_ff7::script::scene::MoveHow::Walk, animation: Some(slot @ (1 | 2)), .. } = event {
+        if let Stage::Move { entity, how: MoveHow::Walk, animation: Some(slot @ (1 | 2)), .. } = event {
             if let Some(clip) = source.animation_clip(*entity, *slot) {
-                cast.apply_move_animation(*entity, clip);
+                cast.apply_move_animation(*entity, clip, movement_phase);
             }
         }
     }
@@ -532,6 +576,7 @@ impl ScenePlayer {
                         self.abort();
                         return;
                     }
+                    self.move_continuations.clear();
                     let beat = self.source.next(answer);
                     self.clock = if self.instant { f32::INFINITY } else { 0.0 };
                     for event in &beat.stage {
@@ -572,6 +617,7 @@ impl ScenePlayer {
 
     /// Open a window: on show (the owner moves past one of nothing at once).
     fn open(&mut self, window: Window) {
+        self.move_continuations.clear();
         self.opened += 1;
         self.epoch = self.epoch.wrapping_add(1);
         let panel = Panel::new(window);
@@ -627,6 +673,7 @@ impl ScenePlayer {
     /// The scene has played to its end. The owner says so and is over; a watcher stands where the scene left everyone
     /// until the server says the run is over.
     fn play_out(&mut self) {
+        self.move_continuations.clear();
         self.next = Next::Held;
         if self.is_owner() {
             self.finish();
@@ -741,6 +788,7 @@ impl ScenePlayer {
         self.early.clear();
         self.next = Next::Held;
         self.due.clear();
+        self.move_continuations.clear();
         self.cast.clear();
         self.epoch = self.epoch.wrapping_add(1);
     }
