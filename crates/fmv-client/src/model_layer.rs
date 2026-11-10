@@ -147,6 +147,8 @@ mod tests {
     }
     #[test]
     #[ignore = "requires the owner's Ninostyle battle IRO (FMV_NINO_TEST)"]
+    // (`as_chunks` would satisfy the lint but needs Rust 1.88; the workspace keeps `chunks_exact`, see `fmv_ff7::lgp`.)
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     fn owned_battle_enemy_textures_decode_direct_colour_channels() {
         let dir = std::env::var("FMV_NINO_TEST").expect("FMV_NINO_TEST");
         let layer = Layer::open(&Path::new(&dir).join("Ninostyle Battle.iro"), BATTLE_ID, BATTLE_FOLDERS).unwrap();

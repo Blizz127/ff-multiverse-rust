@@ -135,6 +135,136 @@ fn station_director_advances_the_post_escape_story() {
     assert_eq!(outcome.stats.unresolved, 0);
 }
 
+/// The scene of `md8_1` is where the team splits up: its director takes Barret out of the party (`PRTYM 1`) and writes moment
+/// 36, and the story's own party table has exactly that party from 36 on, which is how the server carries the change. The
+/// full restore it runs (`HMPMAX3`) is skipped, and nothing else that touches the player's state is.
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn the_station_scene_takes_barret_out_of_the_party_and_the_storys_party_table_agrees() {
+    use fmv_ff7::story::{canon_party, PartyOp, BARRET, CLOUD};
+    let f = field("md8_1").expect("FMV_FF7_DATA and md8_1");
+    let def = fmv_ff7::script::scene::station_scene();
+    let before = StoryState::at(33);
+    let outcome = run_to_end(&f, &def, &before, 1, &[]).unwrap();
+    assert_eq!(outcome.party, vec![PartyOp::Remove(BARRET)], "the one thing the scene does to the party");
+    let mut after = before.clone();
+    assert!(outcome.writes.apply_to(&mut after));
+    assert_eq!(after.moment, 36);
+    assert_eq!((canon_party(&before), canon_party(&after)), (vec![CLOUD, BARRET], vec![CLOUD]));
+    assert!(outcome.party_is_the_storys(&before, &after), "the table's row of moment 36 is what the script leaves");
+    assert!(!outcome.party_is_the_storys(&before, &before), "the same scene on a story that stays put would lose Barret's leaving");
+    for stats in [&outcome.setup_stats, &outcome.stats] {
+        assert!(stats.unknown.is_empty(), "{:?}", stats.unknown);
+        assert!(!stats.ignored.contains_key("PRTYM"), "a party change is recorded, not skipped");
+    }
+    assert_eq!(outcome.stats.ignored.get("HMPMAX3"), Some(&1), "the full restore: nothing here keeps HP or MP between battles");
+    assert!(outcome.unknown_persistent_reads.is_empty(), "{:?}", outcome.unknown_persistent_reads);
+    assert!(outcome.writes.tracked.is_empty() && !outcome.writes.untracked.keys().any(|(bank, _)| (1..=4).contains(bank)), "{:?}", outcome.writes);
+}
+
+/// The first scene after the escape touches no party and nothing saved: it ends in the field's own jump to `md8_1`.
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn the_post_escape_scene_changes_nothing_that_is_saved() {
+    let f = field("md8_4").expect("FMV_FF7_DATA and md8_4");
+    let def = fmv_ff7::script::scene::post_escape_scene();
+    let outcome = run_to_end(&f, &def, &StoryState::at(33), 1, &[]).unwrap();
+    assert!(outcome.party.is_empty() && outcome.writes.is_story_neutral(), "{:?} {:?}", outcome.party, outcome.writes);
+    assert!(outcome.unknown_persistent_reads.is_empty() && !outcome.writes.untracked.keys().any(|(bank, _)| (1..=4).contains(bank)));
+    // at any other moment the director does nothing at all: no window, no jump
+    for moment in [1u16, 27, 32, 34, 36] {
+        let idle = run_to_end(&f, &def, &StoryState::at(moment), 1, &[]).unwrap();
+        assert_eq!((idle.windows, idle.jump), (0, None), "moment {moment}");
+    }
+}
+
+/// The parts of a walkmesh that a walk can reach from each other (triangles joined by an edge that can be crossed, either way).
+fn mesh_parts(mesh: &fmv_ff7::field::Walkmesh) -> Vec<usize> {
+    let n = mesh.triangles.len();
+    let mut part = vec![usize::MAX; n];
+    let mut next = 0;
+    for start in 0..n {
+        if part[start] != usize::MAX {
+            continue;
+        }
+        let mut stack = vec![start];
+        part[start] = next;
+        while let Some(t) = stack.pop() {
+            for (other, slot) in part.iter_mut().enumerate() {
+                let joined = (0..3).any(|e| mesh.neighbor(t, e) == Some(other) || mesh.neighbor(other, e) == Some(t));
+                if joined && *slot == usize::MAX {
+                    *slot = next;
+                    stack.push(other);
+                }
+            }
+        }
+        next += 1;
+    }
+    part
+}
+
+/// Every place a story comes back into the world at ([`STORY_ENTRIES`]) is a place of the owner's data: the field exists, the
+/// spot is on the triangle it names, and that triangle is in the part of the floor every way out of the field is in (a player
+/// put anywhere else would be stranded). The rows ascend, and each names the arrival the game's own data gives.
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn every_story_entry_stands_on_the_floor_the_fields_ways_out_are_on() {
+    use fmv_ff7::script::scene::{story_entry, STORY_ENTRIES};
+    assert!(STORY_ENTRIES.windows(2).all(|w| w[0].from_moment < w[1].from_moment), "rows ascend by moment");
+    for row in STORY_ENTRIES {
+        let f = field(row.field).unwrap_or_else(|| panic!("FMV_FF7_DATA and {}", row.field));
+        let mesh = f.walkmesh().unwrap();
+        let tri = mesh.triangles.get(usize::from(row.spot.triangle)).unwrap_or_else(|| panic!("{}: triangle {}", row.field, row.spot.triangle));
+        assert!(fmv_ff7::script::triangle_contains_xy(tri, i32::from(row.spot.x), i32::from(row.spot.y)), "{}: the spot is on its triangle", row.field);
+        let parts = mesh_parts(&mesh);
+        let here = parts[usize::from(row.spot.triangle)];
+        let gateways: Vec<_> = f.triggers().unwrap().gateways.into_iter().filter(fmv_ff7::field::Gateway::is_used).collect();
+        assert!(!gateways.is_empty(), "{}: a field somebody is put in has a way out", row.field);
+        for g in &gateways {
+            let (mx, my) = ((i32::from(g.exit_a[0]) + i32::from(g.exit_b[0])) / 2, (i32::from(g.exit_a[1]) + i32::from(g.exit_b[1])) / 2);
+            let on: Vec<usize> = (0..mesh.triangles.len()).filter(|&t| fmv_ff7::script::triangle_contains_xy(&mesh.triangles[t], mx, my)).collect();
+            assert!(on.iter().any(|&t| parts[t] == here), "{}: the way out to field {} is on part(s) {:?}, the entry on part {here}", row.field, g.target_field_id,
+                on.iter().map(|&t| parts[t]).collect::<Vec<_>>());
+        }
+    }
+    // the rows are the arrivals the data names: the gateway out of the reactor, and the jump the first scene ends in
+    assert_eq!(story_entry(32), None, "a story still in the reactor joins where everyone joins");
+    let outside = story_entry(33).unwrap();
+    let nrthmk = field("nrthmk").unwrap();
+    let to_md8_4 = nrthmk.triggers().unwrap().gateways.into_iter().filter(fmv_ff7::field::Gateway::is_used).find(|g| g.destination[0] == outside.spot.x && g.destination[1] == outside.spot.y);
+    assert!(to_md8_4.is_some(), "the entry of moment 33 is where nrthmk's own gateway arrives");
+    let jump = run_to_end(&field("md8_4").unwrap(), &fmv_ff7::script::scene::post_escape_scene(), &StoryState::at(33), 1, &[]).unwrap().jump.unwrap();
+    let street = story_entry(36).unwrap();
+    assert_eq!((street.field, street.spot.x, street.spot.y, i16::try_from(street.spot.triangle).unwrap(), street.spot.direction), ("md8_1", jump.x, jump.y, jump.triangle, jump.direction));
+    assert_eq!(story_entry(u16::MAX).map(|e| e.field), Some("md8_1"), "until a later row says otherwise");
+}
+
+/// The scenes the game offers: ids are unique, a scene a talk starts has a reach and one that starts on arrival has none, and
+/// an arrival scene is offered at moments no other arrival scene of its field is (two could not both start).
+#[test]
+fn the_offered_scenes_are_told_apart_and_start_one_way_each() {
+    use fmv_ff7::script::scene::scenes;
+    let all = scenes();
+    for (i, a) in all.iter().enumerate() {
+        assert!(all.iter().skip(i + 1).all(|b| b.id != a.id), "{}", a.id);
+        assert_eq!(a.starts_on_arrival(), a.trigger.talk_radius == 0);
+        if a.starts_on_arrival() {
+            for b in all.iter().skip(i + 1).filter(|b| b.starts_on_arrival() && b.field.eq_ignore_ascii_case(&a.field)) {
+                assert!(a.trigger.moments.end() < b.trigger.moments.start() || b.trigger.moments.end() < a.trigger.moments.start(), "{} and {}", a.id, b.id);
+            }
+        }
+    }
+    assert_eq!(all.first().map(|s| s.id.as_str()), Some(fmv_ff7::script::scene::PROOF_SCENE_ID), "a scene keeps its number: new ones are added at the end");
+    // An arrival scene's field must not be a reviewed one: in a reviewed field the field's own story points are offered, and
+    // the one that fires on entering it (`md8_1`'s director writes 33 -> 36 as an entry point) would move the story BEFORE the
+    // scene is judged (the world runs the entry points first), so the scene would never be offered. Such a field reaches the
+    // story through its scene alone.
+    for s in all.iter().filter(|s| s.starts_on_arrival()) {
+        assert!(!fmv_ff7::is_reviewed_field(&s.field), "{}: an arrival scene's field is not a reviewed field", s.id);
+    }
+    assert!(fmv_ff7::script::scene::is_scene_field("MD8_1") && !fmv_ff7::script::scene::is_scene_field("md1stin"));
+}
+
 #[test]
 #[ignore = "needs the owner's FF7 data (FMV_FF7_DATA); the train scene is not yet enabled"]
 fn train_director_finishes_after_its_authored_actor_work() {
@@ -329,9 +459,12 @@ fn reactor_opening_survey_exposes_unsafe_director_tail() {
     assert_eq!((result.end, result.windows), (End::Battle, 1));
     assert!(result.stats.handled.contains_key("GETAI"));
     assert!(result.stats.unresolved > 0);
-    for op in ["PRTYE", "MMBLK", "MOVIE", "PMVIE", "SOUND"] {
+    for op in ["MMBLK", "MOVIE", "PMVIE", "SOUND"] {
         assert!(result.stats.ignored.contains_key(op), "{op}");
     }
+    // The opening sets a cutscene's party (`PRTYE 0, 254, 254`: Cloud and two empty slots): recorded, not skipped.
+    assert!(!result.stats.ignored.contains_key("PRTYE"));
+    assert_eq!(result.party, vec![fmv_ff7::story::PartyOp::Set([0, 254, 254])]);
     assert_eq!(result.writes.untracked.get(&(1, 4)), Some(&30));
     assert!(result.unknown_persistent_reads.contains(&(1, 4)));
     let loader = f.model_loader().unwrap();
@@ -660,7 +793,11 @@ fn the_proof_scene_writes_only_its_mark_once_and_a_scene_that_moves_the_moment_r
         assert!(byte & 0b100 != 0, "the mark is on: {byte:#b}");
         // (the long way, 'something hard', gives Tifa's affection points a bump: the field's own, never carried)
         assert_eq!(out.writes.untracked.get(&(1, 4)), (answers == [2]).then_some(&5), "Tifa's affection points are the field's own");
-        assert!(!out.writes.untracked.contains_key(&(3, 212)), "the bar's byte is carried now");
+        // The scene also changes OTHER bits of the bar's byte, the field's own, which the story does not carry: they are
+        // reported as untracked (so a server that saves stories refuses the scene instead of dropping them), and applying
+        // the writes keeps the mark alone.
+        let other = out.writes.untracked.get(&(3, 212)).copied().expect("the byte's other bits change too");
+        assert!(other & !0b100 != 0, "{other:#b}");
         // applied once: the story keeps the mark (and only the mark) and the scene is no longer offered to it
         let mut state = story.clone();
         assert!(def.offered_to(&state));

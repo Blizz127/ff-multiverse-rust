@@ -64,7 +64,7 @@ fn config(state: &Path, preview: bool) -> ServerConfig {
     ServerConfig {
         area_key: HALL.to_string(),
         state_dir: Some(state.to_path_buf()),
-        scenes: Some(SceneSettings { host: Arc::new(FakeHost), debug_preview: preview }),
+        scenes: Some(SceneSettings { host: Arc::new(FakeHost), debug_preview: preview, debug_new_story: None }),
         ..ServerConfig::default()
     }
 }

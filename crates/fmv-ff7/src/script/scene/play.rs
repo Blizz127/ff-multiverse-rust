@@ -19,7 +19,7 @@ use crate::field::{FieldFile, ModelLoader, Vertex, Walkmesh};
 use crate::field_direction_to_facing;
 use crate::script::dialogue::End;
 use crate::script::{parse_model_list, triangle_contains_xy, triangle_height_at, FieldScript};
-use crate::story::{tracked_var, StoryState, MOMENT_ADDRESS, MOMENT_BANK};
+use crate::story::{canon_party, party_after, tracked_var, PartyOp, StoryState, MOMENT_ADDRESS, MOMENT_BANK};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
@@ -74,18 +74,82 @@ impl Writes {
     }
 }
 
+/// **The instructions the interpreter skips that read or change the PLAYER's state** rather than what a scene shows: script
+/// requests to party members, the party's split and join, the clock, gil, HP and MP, the menus, items, materia and who
+/// belongs to the team. Skipping one is not harmless the way skipping a fade is: a caller that SAVES what a scene wrote must
+/// look for them ([`Stats::ignored`] of both the stage scripts and the scene) and refuse what it does not carry out, and two
+/// editions of a scene tell the same story only if they skip the same ones ([`Outcome::same_story_as`]). `PRTYP`, `PRTYM`
+/// and `PRTYE` are not here: the interpreter records those ([`Outcome::party`]).
+pub const SKIPPED_STATE_OPS: &[&str] = &[
+    "PREQ", "PRQSW", "PRQEW", "JOIN", "SPLIT", "SPTYE", "GTPYE", "SPECIAL", "STTIM", "GOLDu", "GOLDd", "CHGLD", "HMPMAX1", "HMPMAX2", "MHMMX",
+    "HMPMAX3", "MPu", "MPd", "MENU", "HPu", "HPd", "STITM", "DLITM", "CKITM", "SMTRA", "DMTRA", "CMTRA", "MMBud", "MMBLK", "MMBUK",
+];
+
+/// The ones of [`SKIPPED_STATE_OPS`] that restore the whole party's HP and MP to full and do nothing else. A server that
+/// keeps no HP or MP between battles (every fighter starts a battle full) loses nothing by skipping them.
+pub const FULL_RESTORE_OPS: &[&str] = &["HMPMAX1", "HMPMAX2", "MHMMX", "HMPMAX3"];
+
 /// What a headless run of a scene came to ([`run_to_end`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Outcome {
     pub end: End,
     pub windows: usize,
+    /// How many of the windows asked something.
+    pub questions: usize,
     pub writes: Writes,
     pub jump: Option<super::vm::SceneJump>,
     /// Interpreter observations from the stage setup, before the main scene starts.
     pub setup_stats: Stats,
     /// Persistent bytes consulted without a complete authoritative value.
     pub unknown_persistent_reads: BTreeSet<(u8, u8)>,
+    /// What the scripts did to the story's party, in order, the stage scripts' part first ([`super::Vm::party_ops`]).
+    /// Nothing here carries it out: a caller that saves the scene's story must hold it against the party that story
+    /// has ([`Outcome::party_is_the_storys`]).
+    pub party: Vec<PartyOp>,
     pub stats: Stats,
+}
+
+impl Outcome {
+    /// Whether the party the scene's scripts leave behind is the one the story has once the scene's writes are
+    /// applied: the story's party at `before`, with the scripts' own joins and leaves, equals the story's party at
+    /// `after` ([`crate::story::canon_party`]). A scene that touches no party always passes; one that does passes only
+    /// where the party table has the row for it, which is how a party change is carried (never guessed, never dropped).
+    pub fn party_is_the_storys(&self, before: &StoryState, after: &StoryState) -> bool {
+        self.party.is_empty() || party_after(&canon_party(before), &self.party) == canon_party(after)
+    }
+
+    /// Whether both runs were interpreted completely: the stage scripts and the scene met no instruction the interpreter
+    /// does not know, read back no place it does not know and dropped no request.
+    pub fn is_complete(&self) -> bool {
+        [&self.setup_stats, &self.stats].iter().all(|s| !s.setup_incomplete && s.unknown.is_empty() && s.unresolved == 0 && s.dropped_requests == 0)
+    }
+
+    /// Whether this run and `other` (the same scene from another edition of the field's script) come to the same story: both
+    /// interpreted completely, the same end and destination, the same writes to the moment, to the variables the story
+    /// carries and to every other saved variable (banks 1 to 4), the same party changes, and the same skipped instructions
+    /// that touch the player's state (so neither does something to the player the other does not). The windows may differ:
+    /// how a scene is worded and how many windows it takes is the edition's own.
+    pub fn same_story_as(&self, other: &Self) -> bool {
+        let persistent = |w: &Writes| w.untracked.iter().filter(|((bank, _), _)| (1..=4).contains(bank)).map(|(k, v)| (*k, *v)).collect::<BTreeMap<_, _>>();
+        let state_ops = |o: &Self| {
+            let mut ops: BTreeMap<&'static str, u32> = BTreeMap::new();
+            for stats in [&o.setup_stats, &o.stats] {
+                for (op, n) in stats.ignored.iter().filter(|(op, _)| SKIPPED_STATE_OPS.contains(op)) {
+                    *ops.entry(op).or_insert(0) += n;
+                }
+            }
+            ops
+        };
+        self.is_complete()
+            && other.is_complete()
+            && self.end == other.end
+            && self.jump == other.jump
+            && self.writes.moment == other.writes.moment
+            && self.writes.tracked == other.writes.tracked
+            && persistent(&self.writes) == persistent(&other.writes)
+            && self.party == other.party
+            && state_ops(self) == state_ops(other)
+    }
 }
 
 /// The character whose talk starts a scene, as the field stands him at the scene's story: what a server needs to
@@ -357,10 +421,20 @@ fn stage_entity(stage: &Stage) -> Option<u8> {
 /// player chose, in order; when they run out, the cursor's starting line). What the server does to learn what the scene
 /// wrote, from what the owner answered.
 pub fn run_to_end(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32, answers: &[usize]) -> Result<Outcome, SceneError> {
-    let mut play = ScenePlay::new(field, def, story, seed)?;
+    Ok(outcome_of(ScenePlay::new(field, def, story, seed)?, answers))
+}
+
+/// [`run_to_end`] over a replacement script section (another edition of the field's script, with `def`'s entities found in
+/// it by name: [`ScenePlay::with_script_section`]) on the original field's floor. What a client runs beside the original to
+/// learn whether the replacement comes to the same story ([`Outcome::same_story_as`]) before it shows it.
+pub fn run_section_to_end(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32, section: &[u8], answers: &[usize]) -> Result<Outcome, SceneError> {
+    Ok(outcome_of(ScenePlay::with_script_section(field, def, story, seed, section)?, answers))
+}
+
+fn outcome_of(mut play: ScenePlay, answers: &[usize]) -> Outcome {
     let mut answers = answers.iter().copied();
     let mut given: Option<usize> = None;
-    let mut windows = 0usize;
+    let (mut windows, mut questions) = (0usize, 0usize);
     let end = loop {
         let beat = play.next(given.take());
         match beat.then {
@@ -368,13 +442,24 @@ pub fn run_to_end(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u
             Then::Window(w) => {
                 windows += 1;
                 if w.message.choice.is_some() {
+                    questions += 1;
                     given = answers.next();
                 }
             }
         }
     };
     let writes = play.writes();
-    Ok(Outcome { end, windows, writes, jump: play.vm.destination(), setup_stats: play.setup_stats().clone(), unknown_persistent_reads: play.vm.vars().unknown_persistent_reads(), stats: play.stats().clone() })
+    Outcome {
+        end,
+        windows,
+        questions,
+        writes,
+        jump: play.vm.destination(),
+        setup_stats: play.setup_stats().clone(),
+        unknown_persistent_reads: play.vm.vars().unknown_persistent_reads(),
+        party: play.vm.party_ops().to_vec(),
+        stats: play.stats().clone(),
+    }
 }
 
 /// The character that starts `def`, as the field stands him at the scene's story (see [`TriggerNpc`]).

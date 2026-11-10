@@ -4306,7 +4306,7 @@ mod tests {
     fn a_battle_whose_companions_a_player_commanded_replays_exactly_for_every_member() {
         let rules = SyntheticRules::default();
         let t0 = Instant::now();
-        let mut w = world_with_party(commanded(rules.clone()), cloud_and_barret);
+        let mut w = world_with_party(commanded(rules), cloud_and_barret);
         let (mut a, mut b) = (seat(&mut w, "Aria", t0), seat(&mut w, "Brom", t0));
         party_up(&mut w, &a, &b, t0);
         a.drain();

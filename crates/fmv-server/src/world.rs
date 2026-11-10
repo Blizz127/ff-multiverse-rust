@@ -451,6 +451,16 @@ impl World {
         if self.by_account.contains_key(&new.account) {
             return Err(JoinError::AlreadyOnline);
         }
+        // DEBUG (`SceneSettings::debug_new_story`, off on every real server): an account with no story yet starts with the
+        // one the server was told to give new accounts. It is this session's story from here on and is stored like any
+        // other the first time it moves.
+        let mut new = new;
+        if new.progression.is_empty() {
+            if let Some(story) = self.scenes.debug_new_story.clone() {
+                self.logs.warn(format!("DEBUG: account={} starts with the debug story, not the game's new one (--debug-start-moment)", new.account.0));
+                new.progression = story;
+            }
+        }
         // Everyone joins the entry area, which is always loaded.
         let home = self.home.clone();
         let pos = self.areas.get_mut(&home).map_or_else(Pos::default, areas::AreaState::next_spawn_point);
@@ -504,6 +514,8 @@ impl World {
             self.tell_story(entity, None, &mut failed);
         }
         self.drop_failed(failed);
+        // A story that a scene took somewhere no walk leads back from stands there again (`scene::SceneHost::entry`).
+        self.enter_at_story(entity, now);
         Ok(pos)
     }
 

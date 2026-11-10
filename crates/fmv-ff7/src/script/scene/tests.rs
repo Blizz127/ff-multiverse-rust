@@ -328,8 +328,7 @@ fn animation_tail_cannot_cut_off_other_work_or_a_waiter() {
     assert_eq!(end_of(&beats), End::Finished);
     assert_eq!(vm.stats().quiescent_tails, 1);
     let section = script(vec![("background", vec![(1, tail)])], vec![]);
-    let mut limits = Limits::default();
-    limits.frames = 100;
+    let limits = Limits { frames: 100, ..Limits::default() };
     let vm = Vm::new(SceneVars::new(StoryState::new_game(), &[]), 7, limits);
     let (beats, vm) = run_with(&section, vec![Step::Await(ScriptRef::new(0, 1))], &[], vm);
     assert_eq!(end_of(&beats), End::Budget, "a waiter must not be released while its script still loops");
@@ -574,6 +573,98 @@ fn read_audit_conservatively_flags_replacing_an_unknown_persistent_byte() {
     let def = demo_def(vec![member(0, "aya")], start(0, 1));
     let result = run_to_end(&field, &def, &StoryState::at(4), 1, &[]).unwrap();
     assert!(result.unknown_persistent_reads.contains(&(3, 5)));
+}
+
+// ---- the party ------------------------------------------------------------------------------------
+
+/// `IFPRTYQ character`: run `body` only if the character is in the party (the jump skips it otherwise).
+fn if_party(character: u8, body: &[u8]) -> Vec<u8> {
+    [vec![0xCB, character, u8::try_from(body.len() + 1).unwrap()], body.to_vec()].concat()
+}
+
+/// What a script does to the party is RECORDED in its order, changes nothing by itself, and is what a later test of the
+/// party in the same scene sees: Barret is in the party the story has at this moment, leaves, is asked for (no window),
+/// comes back, and is asked for again (a window).
+#[test]
+fn party_changes_are_recorded_in_order_and_a_later_test_of_the_party_sees_them() {
+    use crate::story::{canon_party, PartyOp, BARRET, CLOUD};
+    let story = StoryState::at(4);
+    assert_eq!(canon_party(&story), vec![CLOUD, BARRET]);
+    let a = [
+        if_party(BARRET, &message(0, 0)), // in the story's party: a window
+        vec![0xC9, BARRET],               // PRTYM: he leaves
+        if_party(BARRET, &message(0, 1)), // not any more: no window
+        vec![0xC8, BARRET],               // PRTYP: he is back
+        if_party(BARRET, &message(0, 2)), // a window again
+        vec![0xCA, CLOUD, 254, 254],      // PRTYE: Cloud alone
+        if_party(BARRET, &message(0, 1)), // no window
+    ]
+    .concat();
+    let field = field_of(script(vec![("a", vec![(1, vec![a])])], vec![dialog("One."), dialog("Never."), dialog("Three.")]));
+    let def = demo_def(vec![member(0, "aya")], start(0, 1));
+    let outcome = run_to_end(&field, &def, &story, 1, &[]).unwrap();
+    assert_eq!(outcome.windows, 2, "the party as it is at each test, not as the story had it");
+    assert_eq!(outcome.party, vec![PartyOp::Remove(BARRET), PartyOp::Add(BARRET), PartyOp::Set([CLOUD, 254, 254])]);
+    for stats in [&outcome.setup_stats, &outcome.stats] {
+        assert!(stats.unknown.is_empty(), "{:?}", stats.unknown);
+        assert!(!["PRTYP", "PRTYM", "PRTYE"].iter().any(|op| stats.ignored.contains_key(op)), "recorded, not skipped: {:?}", stats.ignored);
+    }
+    assert_eq!((outcome.stats.handled.get("PRTYM"), outcome.stats.handled.get("PRTYP"), outcome.stats.handled.get("PRTYE")), (Some(&1), Some(&1), Some(&1)));
+    // The story's party table has no row for "Cloud alone" at this moment: a caller that saves must refuse it.
+    assert!(!outcome.party_is_the_storys(&story, &story));
+    assert!(outcome.party_is_the_storys(&story, &StoryState::at(36)), "where the table has that party, it is the story's");
+}
+
+/// Two editions of a scene tell the same story when they end the same way with the same saved writes, party changes and
+/// skipped state instructions, however many windows each takes; and not when one of those differs.
+#[test]
+fn two_editions_tell_the_same_story_only_when_what_is_kept_is_the_same() {
+    let run = |body: Vec<u8>, dialogs: Vec<Vec<u8>>| {
+        let field = field_of(script(vec![("a", vec![(1, vec![body])])], dialogs));
+        run_to_end(&field, &demo_def(vec![member(0, "aya")], start(0, 1)), &StoryState::at(4), 1, &[]).unwrap()
+    };
+    let lines = || vec![dialog("One."), dialog("Two.")];
+    let original = run([message(0, 0), setword(2, 0, 9), vec![0x3F]].concat(), lines());
+    // another wording: one window more, the same write and the same full restore
+    let reworded = run([message(0, 0), message(0, 1), setword(2, 0, 9), vec![0x3F]].concat(), lines());
+    assert_ne!(original.windows, reworded.windows);
+    assert!(original.same_story_as(&reworded) && reworded.same_story_as(&original));
+    // a different moment
+    assert!(!original.same_story_as(&run([message(0, 0), setword(2, 0, 10), vec![0x3F]].concat(), lines())));
+    // no moment at all
+    assert!(!original.same_story_as(&run([message(0, 0), vec![0x3F]].concat(), lines())));
+    // a party change the other does not make
+    assert!(!original.same_story_as(&run([message(0, 0), setword(2, 0, 9), vec![0x3F], vec![0xC9, 1]].concat(), lines())));
+    // a state instruction the other does not skip (the restore is missing)
+    assert!(!original.same_story_as(&run([message(0, 0), setword(2, 0, 9)].concat(), lines())));
+    // a saved variable the other does not write (bank 3), while field scratch (bank 5) does not count
+    assert!(!original.same_story_as(&run([message(0, 0), setword(2, 0, 9), vec![0x3F], setbyte(3, 40, 1)].concat(), lines())));
+    assert!(original.same_story_as(&run([message(0, 0), setword(2, 0, 9), vec![0x3F], setbyte(5, 40, 1)].concat(), lines())));
+    // a different end
+    assert!(!original.same_story_as(&run([message(0, 0), setword(2, 0, 9), vec![0x3F], mapjump(7)].concat(), lines())));
+    assert_eq!((original.questions, reworded.questions), (0, 0));
+}
+
+/// The list of skipped instructions that touch the player's state names real instructions, every one of which the
+/// interpreter does skip (so the list cannot rot into names nothing produces), and the party's three are not in it.
+#[test]
+fn the_skipped_state_instructions_are_real_and_skipped() {
+    let table = crate::script::opcodes::opcode_name_table();
+    for name in SKIPPED_STATE_OPS {
+        let op = table.iter().find(|(_, m)| m == name).unwrap_or_else(|| panic!("{name} is not an instruction of the table")).0;
+        // one instruction of that kind, its operands zero (SPECIAL with a sub-opcode that takes none): the run counts it as skipped
+        let width = crate::script::opcodes::info(op).map_or(0, |i| crate::script::opcodes::layout_width(i.fields));
+        let mut body = vec![op];
+        if *name == "SPECIAL" {
+            body.push(0xF9);
+        }
+        body.resize(body.len() + width, 0);
+        let field = field_of(script(vec![("a", vec![(1, vec![body])])], vec![]));
+        let outcome = run_to_end(&field, &demo_def(vec![member(0, "aya")], start(0, 1)), &StoryState::at(4), 1, &[]).unwrap();
+        assert_eq!(outcome.stats.ignored.get(name), Some(&1), "{name} (0x{op:02X}) is skipped: {:?} / unknown {:?}", outcome.stats.ignored, outcome.stats.unknown);
+    }
+    assert!(FULL_RESTORE_OPS.iter().all(|op| SKIPPED_STATE_OPS.contains(op)));
+    assert!(!["PRTYP", "PRTYM", "PRTYE"].iter().any(|op| SKIPPED_STATE_OPS.contains(op)), "the party's are recorded, not skipped");
 }
 
 // ---- the play layer: cast, ground, speakers, writes --------------------------------------------

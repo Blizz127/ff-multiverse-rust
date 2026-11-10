@@ -1,5 +1,19 @@
 //! FF Multiverse wire protocol v18.
 //!
+//! v18 is v17 plus the STORY SCENES (see [`scene`]): [`ClientMsg::SceneStep`], [`ClientMsg::SceneEnd`],
+//! [`ClientMsg::SceneLeave`] and [`ClientMsg::SceneDebugPreview`], and [`ServerMsg::SceneStart`], [`ServerMsg::SceneStep`],
+//! [`ServerMsg::SceneEnded`] and [`ServerMsg::SceneRefused`]. A v17 peer cannot decode any of them, and a v17 client that
+//! a server held in a scene could never move past it, so a v17 client or server is refused at the handshake. Nothing new
+//! is stored unless the server is started with its extended save: a scene moves the story's own moment, in the story
+//! record v2 already stores.
+//!
+//! v17 is v16 plus the COMMANDER of the story's own party members (the canon companions): one optional field of the
+//! battle roster, [`BattleMember::commander`] (an account, for a companion only; absent when the server commands it, so
+//! such a roster is byte for byte what v16 sent), and a server that accepts a [`ClientMsg::BattleCommand`] for a
+//! companion from the account its roster entry names. With the server's default the player commands the companions as
+//! well as their own character and the server gives them no command of its own, so a v16 client would leave them
+//! waiting for commands it never sends: a v16 client or server is refused at the handshake. Nothing new is stored.
+//!
 //! v16 is v15 plus [`ClientMsg::DeleteCharacter`] and [`ServerMsg::CharacterDeleted`]: a player deletes their own
 //! character on the server with that character's login token (sent as the first message instead of a Hello). The
 //! server soft-deletes it (its records move into the state directory's trash) and frees the name. A v15 peer cannot

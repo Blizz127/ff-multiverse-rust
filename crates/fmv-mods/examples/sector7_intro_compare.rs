@@ -23,7 +23,7 @@ fn main() {
     let mut actors = BTreeSet::new();
     let mut windows = 0;
     loop {
-        let beat = vm.resume(&script, None);
+        let beat = vm.resume(script, None);
         for event in beat.stage { match event.what {
             Stage::Place{entity,..} | Stage::Move{entity,..} | Stage::Face{entity,..} | Stage::Anim{entity,..} | Stage::Show{entity,..} => {actors.insert(entity);},
             _ => {}

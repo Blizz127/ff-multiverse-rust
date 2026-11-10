@@ -170,6 +170,16 @@ impl SceneClient {
         };
         match built {
             Ok(built) if built.def.field.eq_ignore_ascii_case(area) => {
+                // One line for the log (ids and words of ours only): which scene, in which role, and whose script it is shown
+                // from, so a log of a play session says what was on show without a word of the game.
+                self.note(format!(
+                    "scene: started run={} {} as {} with {} participant(s), script: {}",
+                    run.0,
+                    clean_id(&scene),
+                    if you == SceneRole::Owner { "owner" } else { "watcher" },
+                    participants.len(),
+                    if built.source.echo_voice() { "echo-s" } else { "original" }
+                ));
                 let run = Run { id: run, participants, role: you };
                 self.player = Some(ScenePlayer::new(run, built.def, built.source, self.instant));
                 self.reap();
@@ -203,6 +213,7 @@ impl SceneClient {
             // Not a run this client has: a repeat of one it already heard end, or somebody else's.
             return;
         };
+        self.note(format!("scene: ended run={} outcome={outcome:?} windows={lines}", run.0));
         self.event(SceneEvent::Ended { run, outcome, lines });
     }
 

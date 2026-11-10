@@ -36,5 +36,5 @@ mod vm;
 mod tests;
 
 pub use data::*;
-pub use play::{run_to_end, trigger_npc, Ground, Outcome, SceneError, ScenePlay, TriggerNpc, Writes};
+pub use play::{run_section_to_end, run_to_end, trigger_npc, Ground, Outcome, SceneError, ScenePlay, TriggerNpc, Writes, FULL_RESTORE_OPS, SKIPPED_STATE_OPS};
 pub use vm::{AnimHow, Beat, CameraOp, Limits, MoveHow, SceneJump, SceneVars, Stage, Stats, Then, Timed, Vm, Where, Window, FRAMES_PER_SECOND};

@@ -427,11 +427,55 @@ pub struct CanonParty {
 /// `examples/script_dump`).
 ///
 /// **A later row is added when someone has established, from the field scripts' `PRTYP`, `PRTYM` and `PRTYE`
-/// instructions and the moment they run at, who joins or leaves and when** (Aerith and Tifa join after the
-/// reactor; none of that is in a field this slice offers yet). Until then a story that has moved past the first
-/// mission keeps the Bombing Mission's party rather than an invented one. Rows ascend by moment and the first is
+/// instructions and the moment they run at, who joins or leaves and when.** Rows ascend by moment and the first is
 /// moment 0, so every moment has a party (a test holds the table to that).
-pub const CANON_PARTIES: &[CanonParty] = &[CanonParty { from_moment: 0, members: &[CLOUD, BARRET] }];
+///
+/// **Moment 36: Cloud alone.** After the escape the director of `md8_1` (the street the team jumps down to) runs
+/// `PRTYM character=1` (Barret leaves the party) and then, with nothing in between that reads the party, writes
+/// moment 36 (measured: `tests/scene_real.rs`, `the_station_scene_takes_barret_out_of_the_party_...`). The team
+/// splits up there, so from 36 on the story's party is Cloud. A story scene that changes the party is accepted only
+/// when this table agrees with what its script did ([`party_after`]): the table is how the server carries the change.
+/// Tifa and Aerith join later, in fields nothing offers yet; until a row says so, a story past 36 keeps Cloud alone
+/// rather than an invented party.
+pub const CANON_PARTIES: &[CanonParty] =
+    &[CanonParty { from_moment: 0, members: &[CLOUD, BARRET] }, CanonParty { from_moment: 36, members: &[CLOUD] }];
+
+/// What a field script does to the story's party (`PRTYP`, `PRTYM`, `PRTYE`), in the script's own words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartyOp {
+    /// `PRTYP`: the character joins (the first free slot).
+    Add(u8),
+    /// `PRTYM`: the character leaves.
+    Remove(u8),
+    /// `PRTYE`: the party is exactly these three slots (254 and 255 are empty slots, as the scripts write them).
+    Set([u8; 3]),
+}
+
+/// The party after `ops`, starting from `party`: joins go to the end (nobody twice, at most three), a leave closes
+/// the gap, a set replaces everyone (ids above 8 are empty slots). The party a script leaves behind, to be held
+/// against [`canon_party`] of the story it wrote.
+pub fn party_after(party: &[u8], ops: &[PartyOp]) -> Vec<u8> {
+    let mut party = party.to_vec();
+    for op in ops {
+        match *op {
+            PartyOp::Add(character) => {
+                if character <= 8 && !party.contains(&character) && party.len() < 3 {
+                    party.push(character);
+                }
+            }
+            PartyOp::Remove(character) => party.retain(|&c| c != character),
+            PartyOp::Set(slots) => {
+                party.clear();
+                for character in slots {
+                    if character <= 8 && !party.contains(&character) {
+                        party.push(character);
+                    }
+                }
+            }
+        }
+    }
+    party
+}
 
 /// The canon party of a story state ([`CANON_PARTIES`]): the row with the greatest `from_moment` that is not past
 /// the moment. Cloud and Barret in every row there is today.

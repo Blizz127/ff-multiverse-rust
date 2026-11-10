@@ -168,6 +168,18 @@ impl SceneDef {
         self.trigger.moments.contains(&moment)
     }
 
+    /// Whether the scene starts by itself when a player whose story it is offered to comes to stand in its field (an
+    /// ARRIVAL scene: what the field's own director does from the first frame on), instead of on a press next to a
+    /// character. That is what a trigger nobody can talk to means: its talk radius is 0, so no press can ever reach it and
+    /// the server announces no character for it. A scene a talk starts always has a radius (the field's own `TALKR`).
+    ///
+    /// The field of an arrival scene must not be one of [`crate::REVIEWED_FIELDS`]: there the field's own story points are
+    /// offered, and the world runs the ones that fire on entry BEFORE it judges the scene, so a point that writes the
+    /// scene's moment (as `md8_1`'s does) would leave the scene never offered (`tests/scene_real.rs` holds the list to it).
+    pub fn starts_on_arrival(&self) -> bool {
+        self.trigger.talk_radius == 0
+    }
+
     /// Whether the scene has already begun for `story`: every mark its own root turns on first (the field's way of saying that
     /// this conversation has started, which the field's own trigger waits to be clear before it starts it) is on in the story.
     /// A mark the story model does not carry ([`crate::story::TRACKED_VARS`]) cannot be read back, so a scene whose marks are
@@ -233,8 +245,13 @@ pub const REACTOR_OPENING_SCENE_ID: &str = "ff7/md1stin/opening-survey";
 /// Survey-only cargo train director; not registered for play.
 pub const CARGO_TRAIN_SCENE_ID: &str = "ff7/cargoin/train-survey";
 
-/// Field-authored cast and director scripts at moment 33. Not registered until the arrival
-/// trigger and subsequent field transition are ready to serve together.
+/// **After the escape: the team at the tunnel mouth** (field `md8_4`, story moment 33). An arrival scene
+/// ([`SceneDef::starts_on_arrival`]): the field's director (`dic`, entity 0) does it by itself when the field loads at
+/// moment 33. It has the five talk (four windows), sends them running and ends in the field's own `MAPJUMP` to `md8_1`,
+/// where the next scene ([`station_scene`]) takes over. It writes nothing that is saved and touches no party
+/// (`tests/scene_real.rs`, `the_post_escape_scene_changes_nothing_that_is_saved`); at any other moment the director does
+/// nothing. The cast is the field's own five characters with the models its loader names, each started where its own
+/// script places it at this moment; the root starts the main part of each of them and of the director, as the field does.
 pub fn post_escape_scene() -> SceneDef {
     let cast = [(1, "cloud", "aaaa", "aafe", 19, 375, 5, 224),
                 (2, "barret", "acgd", "adcb", -100, 493, 5, 0),
@@ -256,8 +273,13 @@ pub fn post_escape_scene() -> SceneDef {
     }
 }
 
-/// The following station director. This data is not registered until its transition and
-/// presentation gaps have been addressed.
+/// **After the escape: the team splits up on the street** (field `md8_1`, story moment 33). An arrival scene, like
+/// [`post_escape_scene`], which ends in the jump to this field: the director (`dic`, entity 0) has the five jump down
+/// from where the player arrives and run along the street, four windows, then takes Barret out of the party (`PRTYM 1`),
+/// writes **moment 36** and restores the party (`HMPMAX3`). The party change is carried by the story's party table (its
+/// row of moment 36 is Cloud alone: `crate::story::CANON_PARTIES`) and the restore is what every battle of this server
+/// starts with anyway (`tests/scene_real.rs`, `the_station_scene_takes_barret_out_of_the_party_and_...`). The opening
+/// movie the director plays first is skipped.
 pub fn station_scene() -> SceneDef {
     let mut def = post_escape_scene();
     def.id = STATION_SCENE_ID.to_string();
@@ -507,9 +529,52 @@ pub fn proof_scene() -> SceneDef {
     }
 }
 
-/// Every scene the game knows (today the proof).
+/// Every scene the game offers, in the order a server numbers their triggers by (a scene is added at the END, so the
+/// ones before it keep their numbers): the proof, then the two the escape from the first reactor ends in.
 pub fn scenes() -> Vec<SceneDef> {
-    vec![proof_scene()]
+    vec![proof_scene(), post_escape_scene(), station_scene()]
+}
+
+/// Whether `field` (the archive's spelling; case does not matter) is the field of a scene the game offers: a place a
+/// story scene may send its players to, since the story goes on there by a scene of its own.
+pub fn is_scene_field(field: &str) -> bool {
+    scenes().iter().any(|s| s.field.eq_ignore_ascii_case(field))
+}
+
+/// Where an account comes into the world when its story has left the first field behind for good (see [`STORY_ENTRIES`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoryEntry {
+    /// The first story moment (`Var[2][0]`) this entry holds for, until the next row's.
+    pub from_moment: u16,
+    /// The field (the key its archive spells it by).
+    pub field: &'static str,
+    /// Where the account stands there.
+    pub spot: Spot,
+}
+
+/// **Where a story that has left the reactor comes into the world.** Everyone joins in `md1stin` and walks from there;
+/// that is right for as long as the way the story took is still a way a player can walk. Two story scenes end that:
+///
+/// * **From moment 33** (the reactor is gone) the story is outside it, in `md8_4`, where the first scene after the
+///   escape starts by itself. The spot is the arrival the field's own gateway from `nrthmk` names, which is where a
+///   player that walked out of the reactor stands.
+/// * **From moment 36** the story is in `md8_1`: the scene of `md8_4` ends in a script jump there, a jump only that
+///   scene makes, and `md8_1` has no way back. Without this row an account that left the game at moment 36 or later
+///   would join in `md1stin` and could never reach the story again. The spot is the arrival that jump names.
+///
+/// A row is added with each scene that takes the story somewhere no walk leads back from, and names a place the game's
+/// own data puts the player at (never an invented one). Rows ascend by moment. `tests/scene_real.rs` holds every row to
+/// the owner's data: the field exists, the spot is on the triangle it names, and that triangle is in the part of the
+/// floor the field's ways out are in.
+pub const STORY_ENTRIES: &[StoryEntry] = &[
+    StoryEntry { from_moment: 33, field: "md8_4", spot: Spot { x: 82, y: 267, triangle: 3, direction: 0 } },
+    StoryEntry { from_moment: 36, field: "md8_1", spot: Spot { x: 1629, y: -5357, triangle: 15, direction: 192 } },
+];
+
+/// The entry of a story at `moment` ([`STORY_ENTRIES`]): the row with the greatest `from_moment` that is not past it.
+/// `None` for a story that is still where everyone joins.
+pub fn story_entry(moment: u16) -> Option<StoryEntry> {
+    STORY_ENTRIES.iter().rev().find(|row| row.from_moment <= moment).copied()
 }
 
 /// The scene with id `id`.

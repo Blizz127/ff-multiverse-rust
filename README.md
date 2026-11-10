@@ -663,16 +663,17 @@ party can do of it. Everything below is pinned against the real data in `crates/
   guard can be judged, and **this server never sets it** (the loop that plays the late party's game over wants it set, and
   is not a point at all). The jump to `md8_4` is NOT performed (a director's jump is not a walk-on exit): the party stays in
   `nrthmk`, whose gateway to `md8_4` is data and always open.
-* **Where the evidence ends: `md8_4`.** That field has no player-controlled character. It is a cutscene (the AVALANCHE members
-  and Cloud as characters at moment 33, a director that plays their talk and jumps on to `md8_1`), which the server cannot
-  play, judge or leave by a walk: a party gets there by `nrthmk`'s gateway and walks about on its walkmesh, and this slice stops
-  there.
-* **What a re-login at 27 does.** A re-login always joins `md1stin`, and the walk from there to the reactor goes through
+* **`md8_4` is a cutscene.** That field has no player-controlled character: the AVALANCHE members and Cloud are characters at
+  moment 33, and a director plays their talk and jumps on to `md8_1`. It is played as a story scene that starts by itself (see
+  "After the escape" in "Story scenes"): a player at 33 who comes in by `nrthmk`'s gateway, or logs in, plays it and is carried
+  to `md8_1`, where the next scene moves the story to 36.
+* **What a re-login at 27 does.** A re-login at 27 joins `md1stin`, and the walk from there to the reactor goes through
   `nrthmk`, where the finale moves the story on to 33 before the party is back inside: so the escape through the reactor is
   one continuous run, never a restart. `scripts/travel-smoke.sh --escape` walks down, wins the fight, climbs back out and
   takes the finale in one run (the story steps and the saved blob `0221000101e121` asserted exactly, one countdown started and
-  cleared, never time-up, 0 battle divergences), then restarts the server, logs the leader in again at the saved 33 and
-  walks `md1stin` to `md8_4` by the gateways with nothing firing again. Nobody is stranded at the new moments
+  cleared, never time-up, 0 battle divergences), then restarts the server and logs the leader in again at the saved 33: a story
+  at 33 stands outside the reactor, so the leader is sent to `md8_4` at once, the two scenes after the escape play by themselves
+  and the story is saved at 36 in `md8_1` (see "After the escape" below). Nobody is stranded at the new moments
   (`chain_real.rs`: from every place a player arrives in a reviewed field, walking and the links reach an open exit at
   27 and 33 with the lift up and down), except on the lift itself at 33 (see "Not done").
 * **Not done:** the places the reactor's characters stand and the doors they open by the other bits of the reactor byte at 27
@@ -1365,6 +1366,59 @@ carries on through Cloud 9, Tifa 13 and Cloud 13 into the lines after the drink.
 ("something hard") gives **eleven windows**, `28 29(ask) 31 32 33 34 35 36 37 38 39`, spoken by Tifa (20) eight times and
 Cloud (18) three times (33, 36 and 38); answering line 1, or nothing, gives six, `28 29(ask) 30 37 38 39`.
 
+### After the escape: the scenes that start by themselves
+
+Two more scenes are offered, and they are the first that a player reaches by playing: the story of the first reactor ends
+at moment 33, and the game's own next two fields carry it on.
+
+* **`ff7/md8_4/post-escape`** (the tunnel mouth, moment 33): the field's director has the team talk (four windows) and then
+  jumps to the street. It changes nothing that is saved; the scene ends in the field's own `MAPJUMP`, which the server
+  performs as an ordinary area change.
+* **`ff7/md8_1/post-escape-station`** (the street, moment 33): the five jump down, four windows (five in Echo-S), the team
+  splits up, and the director writes **moment 36**.
+
+**They start by themselves.** A scene whose trigger nobody can talk to (`SceneDef::starts_on_arrival`: a talk radius of 0)
+is started by the server for a player whose story it is offered to as soon as that player comes to stand in its field, for
+that player alone (no watchers; a party member plays its own). The server announces no trigger character for it.
+
+**What such a scene may save.** The server applies a scene's story only if the headless run was complete and
+(`scene_host::safe_outcome`, `Ff7SceneHost::finish_scene`):
+
+* it skipped no instruction that touches the player's state (`fmv_ff7::script::scene::SKIPPED_STATE_OPS`: gil, items, HP and
+  MP by an amount, the menus, materia, who belongs to the team). The full restores (`FULL_RESTORE_OPS`: `HMPMAX1/2/3`, `MHMMX`)
+  are the exception: this server keeps no HP or MP between battles, so every battle already starts full;
+* **the party it leaves is the story's own.** `PRTYP`, `PRTYM` and `PRTYE` are recorded by the interpreter
+  (`Outcome::party`), a later test of the party in the same scene sees them, and the scene is accepted only when the
+  party table (`fmv_ff7::story::CANON_PARTIES`) has that party at the story the scene wrote. The street scene runs
+  `PRTYM 1` (Barret leaves) and writes 36, and the table's row of moment 36 is Cloud alone: that row is how the change is
+  carried. A change the table has no row for is refused, never dropped;
+* **it saves nothing an older build did not**, unless the server was started with `--story-extended-save` (OFF by default):
+  the moment and the reactor's long-saved byte only. A scene whose story would carry any other variable is played and then
+  not applied. These two scenes write the moment alone.
+
+**Echo-S.** A player alone in a scene that asks nothing is shown the Echo-S edition of it (the client runs both editions
+first and uses the replacement only if they come to the same story: `Outcome::same_story_as`: the same end and
+destination, the same saved writes and party changes, the same skipped state instructions; the windows may differ). On the
+owner's archive both scenes pass, with 4 and 5 windows, each of which has a voice clip. With the text layer off, or with a
+watcher, the original is shown.
+
+**Coming back.** Everyone joins in `md1stin`. A story that a scene took somewhere no walk leads back from stands there
+again at the next login (`fmv_ff7::script::scene::STORY_ENTRIES`, `SceneHost::entry`, `World::enter_at_story`): from moment
+33 outside the reactor in `md8_4`, from 36 on the street of `md8_1`, each at an arrival the game's own data names. The
+player joins like everyone and is sent on through the ordinary area handshake. Without it an account at 36 could never
+reach the story again (`md8_1` has no way back and only the scene jumps there).
+
+**Not done here:** the opening movie of the street scene is skipped, scripted animation clips are not played (the cast
+walks and stands), and past the street nothing of the story is offered yet (`md8_2` onwards are plain fields).
+
+```
+scripts/story-smoke.sh --debug --build                    # one real headless player: both scenes, 33 -> 36 saved once, restart, re-login on the street
+scripts/story-smoke.sh --debug --echo-s <Echo-s.iro>      # the same in Echo-S's edition
+```
+
+The smoke's server runs with `--debug-start-moment 33` (a new account starts where the escape ends; refused on the default
+state directory, like the other debug flags that make up stored numbers), so it takes seconds instead of the whole mission.
+
 ### Scene data (`fmv_ff7::script::scene::SceneDef`)
 
 A scene is DATA: ids, names and numbers, never game text or bytes. The script and the lines are read from the owner's
@@ -1513,7 +1567,7 @@ ranks the floor for them. The pictures contain game art: they stay out of the re
   numbers in about 700 fields; entity names are kept, so resolving by name is the way when such a layer is wired in.
 * **After a scene that changes the story the area's NPC list is not re-sent** unless the player changes instance, so a trigger
   that should be gone can still be drawn; the server refuses the press.
-* Scenes are Rust data (one today), not files.
+* Scenes are Rust data (three today), not files.
 **Protocol v17 (the commander of the canon pair)** adds one optional field to the battle roster, `BattleMember::commander`
 (an account, for a canon companion only; absent from the JSON when the server commands the companion, so that a roster
 without it is byte for byte what v16 sent and reads as "the server's"), and changes who may send a `BattleCommand`:
@@ -1857,6 +1911,7 @@ scripts/travel-smoke.sh  walking between fields: two bots, md1stin -> md1_1 and 
 scripts/phase-smoke.sh   story phasing: A advances md1stin's story and B does not, party, restart, persist (real data)
 scripts/slice-smoke.sh   the foundations slice: two original characters, a story, a talk, a shared battle, a real server restart
 scripts/scene-smoke.sh   a story scene (Cloud and Tifa at the bar of 7th Heaven): owner and watcher over real processes, restart, nothing stored
+scripts/story-smoke.sh   the two scenes after the escape (they start by themselves), 33 -> 36 saved once, restart, re-login where the story stands
 deploy/                  systemd user unit template and deployment procedure
 docs/LAUNCHER.md         the package as an owner-only launcher port: layout, entry point, data dir
 IMPLEMENTATION-PLAN.md   first-milestone plan and design constraints

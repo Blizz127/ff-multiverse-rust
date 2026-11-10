@@ -135,6 +135,18 @@ fn compatible_bar(field: &fmv_ff7::field::FieldFile, def: &SceneDef, story: &Sto
     true
 }
 
+/// Whether a scene that asks nothing may be shown from the replacement section `section`: run to its end in both editions
+/// (bounded, like every run), neither asks a question, and both come to the same story
+/// (`Outcome::same_story_as`: the same end and destination, the same saved writes, the same party changes, the same skipped
+/// instructions that touch the player's state). The windows may differ in number and wording, which is the point; that is
+/// why this is only ever used for a scene nobody watches (a watcher is kept in step window by window).
+fn compatible_without_questions(field: &fmv_ff7::field::FieldFile, def: &SceneDef, story: &StoryState, seed: u32, section: &[u8]) -> bool {
+    use fmv_ff7::script::scene::{run_section_to_end, run_to_end};
+    let (Ok(original), Ok(echo)) = (run_to_end(field, def, story, seed, &[]), run_section_to_end(field, def, story, seed, section, &[])) else { return false };
+    let ended = |how: End| matches!(how, End::Finished | End::MapJump { .. });
+    original.questions == 0 && echo.questions == 0 && ended(original.end) && echo.windows > 0 && original.same_story_as(&echo)
+}
+
 /// A scene made ready to play: its data and its source.
 pub struct Built {
     pub def: SceneDef,
@@ -195,14 +207,18 @@ impl SceneBuilder for Ff7Scenes {
 
     fn build_private(&mut self, id: &str, story: &StoryState, seed: u32) -> Result<Built, String> {
         let fallback = self.build(id, story, seed)?;
-        if id != fmv_ff7::script::scene::PROOF_SCENE_ID { return Ok(fallback); }
         let Some(source) = crate::mods::script_source() else { return Ok(fallback) };
         let Some(section) = source.section(&fallback.def.field) else { return Ok(fallback) };
         let Some(adapter) = self.adapter.as_ref() else { return Ok(fallback) };
         let Ok(field) = adapter.load_field(&fallback.def.field) else { return Ok(fallback) };
-        if !compatible_bar(field.field_file(), &fallback.def, story, seed, &section) { return Ok(fallback); }
+        // The bar scene asks a question, so it has its own measured check (the answers are translated). Any other scene may
+        // use the replacement only if it asks nothing in either edition and both come to the same story.
+        let is_bar = id == fmv_ff7::script::scene::PROOF_SCENE_ID;
+        let compatible = if is_bar { compatible_bar(field.field_file(), &fallback.def, story, seed, &section) }
+            else { compatible_without_questions(field.field_file(), &fallback.def, story, seed, &section) };
+        if !compatible { return Ok(fallback); }
         let Ok(play) = ScenePlay::with_script_section(field.field_file(), &fallback.def, story, seed, &section) else { return Ok(fallback) };
-        let known_bar = known_echo_bar(&section);
+        let known_bar = is_bar && known_echo_bar(&section);
         Ok(Built { def: play.def().clone(), source: Box::new(PrivateEcho { play, known_bar }) })
     }
 
@@ -251,6 +267,66 @@ mod tests {
         assert_eq!(ff7.reach(0, "mds7pb_1"), None);
         assert_eq!(ff7.reach(0, "md1stin"), None, "the proof scene is not in that field");
         assert_eq!(ff7.reach(99, "mds7pb_1"), None, "and there is no scene 99");
+    }
+
+    /// The two scenes the escape ends in ask nothing, and Echo-S's edition of each comes to the same story as the original
+    /// (the same end and destination, the same moment, the same party change), so a player alone in one is shown Echo-S's
+    /// windows, with a voice where the archive has one; with the text layer off, the original.
+    #[test]
+    #[ignore = "requires the owner's FF7 data and verified Echo-S archive"]
+    fn private_post_escape_scenes_use_echo_when_both_editions_tell_the_same_story() {
+        use fmv_core::{EditionProvenance, GameId, Platform};
+        use fmv_ff7::script::scene::{run_section_to_end, run_to_end, POST_ESCAPE_SCENE_ID, STATION_SCENE_ID};
+        use fmv_mods::{Layers, ModSources, Mods};
+        let data = std::env::var_os("FMV_FF7_DATA").expect("FMV_FF7_DATA");
+        let echo = std::env::var_os("FMV_ECHO_S_IRO").expect("FMV_ECHO_S_IRO");
+        let provenance = EditionProvenance { game: GameId::Ff7, platform: Platform::Pc, edition: "steam".into(), region: "any".into(), language: "en".into(), revision: "test".into(), sources: vec![], modded: false };
+        let adapter = Arc::new(Ff7Adapter::from_flevel_path(std::path::Path::new(&data).join("field/flevel.lgp"), provenance).unwrap());
+        let sources = ModSources { echo_s: Some(echo.into()), ..Default::default() };
+        let mods = Arc::new(Mods::open(&sources, Layers::ALL));
+        crate::mods::install(Some(mods.clone()));
+        let story = StoryState::at(33);
+        for id in [POST_ESCAPE_SCENE_ID, STATION_SCENE_ID] {
+            let def = scene(id).expect("an offered scene");
+            let field = adapter.load_field(&def.field).unwrap();
+            let section = crate::mods::script_source().unwrap().section(&def.field).expect("Echo-S has the field");
+            let original = run_to_end(field.field_file(), &def, &story, 1, &[]).unwrap();
+            let replacement = run_section_to_end(field.field_file(), &def, &story, 1, &section, &[]).unwrap();
+            eprintln!(
+                "{id}: original windows={} end={:?} party={:?} writes={:?}; echo windows={} end={:?} party={:?} writes={:?} echo ignored={:?}",
+                original.windows, original.end, original.party, original.writes, replacement.windows, replacement.end, replacement.party, replacement.writes, replacement.stats.ignored
+            );
+            assert!(original.same_story_as(&replacement), "{id}: the two editions tell the same story");
+            let mut builder = Ff7Scenes::new(Some(adapter.clone()));
+            let mut built = builder.build_private(id, &story, 1).unwrap();
+            assert!(built.source.echo_voice(), "{id}: alone, the player is shown Echo-S");
+            let (mut count, mut voices) = (0usize, 0usize);
+            loop {
+                match built.source.next(None).then {
+                    fmv_ff7::script::scene::Then::End { how, .. } => {
+                        assert_eq!(how, original.end, "{id}");
+                        break;
+                    }
+                    fmv_ff7::script::scene::Then::Window(w) => {
+                        count += 1;
+                        assert!(w.message.choice.is_none(), "{id}: asks nothing");
+                        assert_eq!(built.source.server_answer(&w, None), Ok(None));
+                        if let fmv_ff7::script::dialogue::MessageOrigin::Canon { dialog, .. } = &w.message.origin {
+                            voices += usize::from(mods.voice_path(&def.field, w.id, *dialog, 0).is_some());
+                        }
+                    }
+                }
+                assert!(count <= 64);
+            }
+            assert_eq!(count, replacement.windows, "{id}");
+            eprintln!("{id}: {count} Echo-S windows, {voices} with a voice clip");
+            assert!(!builder.build(id, &story, 1).unwrap().source.echo_voice(), "{id}: a shared run keeps the original");
+        }
+        crate::mods::install(Some(Arc::new(Mods::open(&sources, Layers { text: false, ..Layers::ALL }))));
+        for id in [POST_ESCAPE_SCENE_ID, STATION_SCENE_ID] {
+            assert!(!Ff7Scenes::new(Some(adapter.clone())).build_private(id, &story, 1).unwrap().source.echo_voice(), "{id}: the text layer is off");
+        }
+        crate::mods::install(None);
     }
 
     #[test]

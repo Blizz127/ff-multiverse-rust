@@ -157,7 +157,7 @@ fn a_version_1_blob_loads_as_before_and_is_written_back_byte_for_byte() {
         let state = StoryState::decode(&blob).unwrap();
         assert_eq!((state.moment, state.vars().count()), (moment, 0), "{blob:?}");
         assert_eq!(state.encode(), blob, "{blob:?} comes back as it was");
-        assert_eq!(canon_party_of(&blob), vec![CLOUD, BARRET]);
+        assert_eq!(canon_party_of(&blob), if moment >= 36 { vec![CLOUD] } else { vec![CLOUD, BARRET] }, "the party is the moment's, whatever wrote the blob");
     }
     // a state with no variable never grows a version 2 blob, however it was made
     let mut s = StoryState::at(12);
@@ -256,9 +256,30 @@ fn the_canon_party_table_covers_every_moment_in_order() {
         seen.dedup();
         assert_eq!(seen.len(), row.members.len(), "{row:?}: nobody twice");
     }
-    for moment in [0u16, 1, 6, 7, 255, 1600, u16::MAX] {
+    for moment in [0u16, 1, 6, 7, 27, 33, 35] {
         assert_eq!(canon_party(&StoryState::at(moment)), vec![CLOUD, BARRET], "moment {moment}");
     }
+    // From 36 on (the team splits up after the escape: `md8_1`'s `PRTYM`) the story's party is Cloud.
+    for moment in [36u16, 39, 72, 255, 1600, u16::MAX] {
+        assert_eq!(canon_party(&StoryState::at(moment)), vec![CLOUD], "moment {moment}");
+    }
+}
+
+/// What a script does to the party, replayed on a party: a join goes to the end, a leave closes the gap, a set
+/// replaces everyone and reads 254/255 as empty slots. The table row of moment 36 is what `md8_1`'s `PRTYM 1`
+/// leaves of the first mission's party.
+#[test]
+fn party_ops_replay_on_a_party_as_the_scripts_mean_them() {
+    use super::{party_after, PartyOp};
+    let mission = canon_party(&StoryState::at(33));
+    assert_eq!(party_after(&mission, &[]), mission);
+    assert_eq!(party_after(&mission, &[PartyOp::Remove(BARRET)]), canon_party(&StoryState::at(36)), "the table's row is the script's own result");
+    assert_eq!(party_after(&mission, &[PartyOp::Remove(7)]), mission, "someone who is not there leaves nothing");
+    assert_eq!(party_after(&[CLOUD], &[PartyOp::Add(BARRET), PartyOp::Add(BARRET), PartyOp::Add(2), PartyOp::Add(3)]), vec![CLOUD, BARRET, 2], "nobody twice, three at most");
+    assert_eq!(party_after(&mission, &[PartyOp::Add(9), PartyOp::Add(254)]), mission, "not a character");
+    assert_eq!(party_after(&mission, &[PartyOp::Set([CLOUD, 254, 254])]), vec![CLOUD], "254 is an empty slot");
+    assert_eq!(party_after(&mission, &[PartyOp::Set([2, CLOUD, 2])]), vec![2, CLOUD], "a set keeps its order and names nobody twice");
+    assert_eq!(party_after(&mission, &[PartyOp::Set([255, 255, 255]), PartyOp::Add(BARRET)]), vec![BARRET]);
 }
 
 /// The first reactor mission is fought by Cloud and Barret, from the very start: the party the story has

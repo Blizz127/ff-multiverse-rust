@@ -121,6 +121,10 @@ pub trait SceneHost: Send + Sync {
     fn offered(&self, scene: &str, progress: &[u8]) -> bool;
     /// Whether the scene starts automatically on entering its field.
     fn automatic(&self, _scene: &str) -> bool { false }
+    /// Where an account whose story is `progress` comes into the world, when that is not where everyone joins: a story that
+    /// a scene took somewhere no walk leads back from stands there again on its next login (`World::join` sends the player
+    /// on from the entry area through the ordinary area handshake). `None`: it joins like everyone.
+    fn entry(&self, _progress: &[u8]) -> Option<fmv_adapter_api::Exit> { None }
     /// The trigger of scene `scene` for the story `progress` (`None`: it cannot be shown).
     fn trigger(&self, scene: &str, progress: &[u8]) -> Option<TriggerInfo>;
     /// The made-up story the debug preview puts a player in for scene `scene`.
@@ -139,11 +143,15 @@ pub struct SceneSettings {
     pub host: Arc<dyn SceneHost>,
     /// Let players put themselves in a scene's field on a made-up story (`ClientMsg::SceneDebugPreview`). Off by default.
     pub debug_preview: bool,
+    /// DEBUG: the story a NEW account starts with instead of the game's own new story (the game's blob). `None` on every
+    /// real server. A smoke test's way to a later part of the story without playing through everything before it; the
+    /// binary only allows it on a throw-away store (`--debug-start-moment`).
+    pub debug_new_story: Option<Vec<u8>>,
 }
 
 impl std::fmt::Debug for SceneSettings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SceneSettings").field("debug_preview", &self.debug_preview).finish_non_exhaustive()
+        f.debug_struct("SceneSettings").field("debug_preview", &self.debug_preview).field("debug_new_story", &self.debug_new_story.is_some()).finish_non_exhaustive()
     }
 }
 
@@ -190,6 +198,8 @@ struct SceneRun {
 pub(super) struct SceneWorld {
     host: Option<Arc<dyn SceneHost>>,
     preview: bool,
+    /// DEBUG: the story a new account starts with (`SceneSettings::debug_new_story`).
+    pub(super) debug_new_story: Option<Vec<u8>>,
     list: Vec<SceneInfo>,
     next_run: u64,
     runs: BTreeMap<SceneRunId, SceneRun>,
@@ -214,7 +224,7 @@ impl World {
     /// scene NPC is announced and every scene message is refused.
     pub fn configure_scenes(&mut self, settings: Option<SceneSettings>) {
         self.scenes = match settings {
-            Some(s) => SceneWorld { list: s.host.scenes(), host: Some(s.host), preview: s.debug_preview, ..SceneWorld::default() },
+            Some(s) => SceneWorld { list: s.host.scenes(), host: Some(s.host), preview: s.debug_preview, debug_new_story: s.debug_new_story, ..SceneWorld::default() },
             None => SceneWorld::default(),
         };
     }
@@ -530,7 +540,8 @@ impl World {
         if !result.changed {
             return "unchanged";
         }
-        let summary = format!("scene={} {}", clip(&record.scene, MAX_SCENE_ID_CHARS), result.summary);
+        // What changed comes first: a client shows only the head of a summary, and a scene's id is long.
+        let summary = format!("{} scene={}", result.summary, clip(&record.scene, MAX_SCENE_ID_CHARS));
         let Some(p) = self.players.get_mut(&record.owner) else { return "none (the owner is gone)" };
         if p.preview.is_none() {
             // A real story: a scene's write is a story step like any other (the mirror, the log line, a countdown it ends, the
@@ -651,6 +662,23 @@ impl World {
     pub(super) fn scene_entered(&mut self, entity: EntityId, failed: &mut Vec<(EntityId, bool)>) {
         if self.players.get(&entity).is_some_and(|p| p.preview.is_some()) {
             self.tell_story(entity, None, failed);
+        }
+    }
+
+    /// `entity` has just joined (in the entry area, like everyone): if its story stands somewhere else (`SceneHost::entry`),
+    /// send it there through the ordinary area handshake. A story that is still where everyone joins, a game without scenes
+    /// and an area that cannot be hosted all leave the player where it joined.
+    pub(super) fn enter_at_story(&mut self, entity: EntityId, now: Instant) {
+        let Some(host) = self.scenes.host.clone() else { return };
+        let Some(player) = self.players.get(&entity) else { return };
+        if player.preview.is_some() || player.transit.is_some() || player.battle.is_some() || player.scene.is_some() { return; }
+        let Some(exit) = host.entry(&player.progression) else { return };
+        if exit.target.eq_ignore_ascii_case(&player.area) { return; }
+        let (account, from, facing) = (player.account, player.snapshot.pos, player.snapshot.facing);
+        if self.start_travel(entity, &exit, from, facing, now) {
+            self.logs.info(format!("story entry account={} entity={} to={} (where its story stands)", account.0, entity.0, clip(&exit.target, 128)));
+        } else {
+            self.logs.warn(format!("story entry unavailable account={} entity={} to={} (the player stays where everyone joins)", account.0, entity.0, clip(&exit.target, 128)));
         }
     }
 

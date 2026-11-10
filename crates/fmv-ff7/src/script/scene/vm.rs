@@ -52,7 +52,7 @@ use super::data::{Given, ScriptRef, Step};
 use crate::field_direction_to_facing;
 use crate::script::dialogue::{parse_message, Choice, End, Message, MessageOrigin, Piece, StoryVars, EFFECT_NOTE_LAYER};
 use crate::script::{decode_at, FieldScript, Instruction};
-use crate::story::{tracked_var, StoryState, MOMENT_ADDRESS, MOMENT_BANK};
+use crate::story::{tracked_var, PartyOp, StoryState, MOMENT_ADDRESS, MOMENT_BANK};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Field frames per second (the clock of [`Timed::at`]).
@@ -509,6 +509,8 @@ pub struct Vm {
     anim_ends: BTreeMap<u8, u32>,
     camera_end: u32,
     geometry: BTreeMap<u8, (i16, i16, u16, u16)>,
+    /// What the scripts did to the party, in the order they did it (setup included): see [`Vm::party_ops`].
+    party_ops: Vec<PartyOp>,
     stats: Stats,
 }
 
@@ -543,8 +545,23 @@ impl Vm {
             anim_ends: BTreeMap::new(),
             camera_end: 0,
             geometry: BTreeMap::new(),
+            party_ops: Vec::new(),
             stats: Stats::default(),
         }
+    }
+
+    /// The party as the scene's scripts see it: the story's own, with what they have done to it so far.
+    fn party_now(&self) -> Vec<u8> {
+        let story: Vec<u8> = (0..3).filter_map(|slot| self.vars.party_member(slot)).collect();
+        crate::story::party_after(&story, &self.party_ops)
+    }
+
+    /// What the scripts did to the story's party (`PRTYP`, `PRTYM`, `PRTYE`), in order, the stage scripts' part first.
+    /// The VM changes no party: it only says what was asked, so that the caller can hold it against the party the story
+    /// has after the scene ([`crate::story::party_after`], [`crate::story::canon_party`]) and refuse a scene whose party
+    /// the story would not carry.
+    pub fn party_ops(&self) -> &[PartyOp] {
+        &self.party_ops
     }
 
     pub fn stats(&self) -> &Stats {
@@ -1183,7 +1200,7 @@ impl Vm {
                 // GETPC: the character in a party slot (0xFF for none).
                 let slot = ins.literal("party").and_then(|s| u8::try_from(s).ok()).unwrap_or(u8::MAX);
                 if let Some((bank, address)) = Self::dest(ins, "var_character") {
-                    let who = self.vars.party_member(slot).unwrap_or(u8::MAX);
+                    let who = self.party_now().get(usize::from(slot)).copied().unwrap_or(u8::MAX);
                     self.set_byte(bank, address, who);
                 }
                 Flow::Next
@@ -1219,7 +1236,11 @@ impl Vm {
                 Flow::Next
             }
             0xCB | 0xCC => {
-                let holds = ins.literal("character").and_then(|c| u8::try_from(c).ok()).is_some_and(|c| if op == 0xCB { self.vars.in_party(c) } else { self.vars.is_member(c) });
+                // IFPRTYQ asks who is in the party NOW: what the story says, and what this scene's scripts have done to it
+                // since. IFMEMBQ asks whether the character belongs to the team at all, which a party change does not decide.
+                let holds = ins.literal("character").and_then(|c| u8::try_from(c).ok()).is_some_and(|c| {
+                    if op == 0xCB { self.party_now().contains(&c) } else { self.vars.is_member(c) }
+                });
                 self.branch(idx, ins, holds)
             }
             // GETAI reads an entity's current walkmesh triangle. A MOVE without an explicit
@@ -1364,6 +1385,22 @@ impl Vm {
             0x67 => {
                 self.wait_until(idx, self.camera_end);
                 Flow::Yield
+            }
+            // ---- the party: nothing changes here, what was asked is kept for the caller -----------------------
+            0xC8 | 0xC9 => {
+                // (an operand that is not a literal is not made up: the op stays unknown)
+                match ins.literal("character") {
+                    Some(character) => self.party_ops.push(if op == 0xC8 { PartyOp::Add(clamp_u8(character)) } else { PartyOp::Remove(clamp_u8(character)) }),
+                    None => *class = Class::Unknown,
+                }
+                Flow::Next
+            }
+            0xCA => {
+                match (ins.literal("character1"), ins.literal("character2"), ins.literal("character3")) {
+                    (Some(a), Some(b), Some(c)) => self.party_ops.push(PartyOp::Set([clamp_u8(a), clamp_u8(b), clamp_u8(c)])),
+                    _ => *class = Class::Unknown,
+                }
+                Flow::Next
             }
             // ---- known, and no change to what a scene shows ---------------------------------------------------
             _ => {
@@ -1542,7 +1579,7 @@ fn is_ignored(op: u8) -> bool {
         op,
         // controls, menus, party and field logic
         0x04..=0x06 | 0x08..=0x0B | 0x21..=0x23 | 0x26 | 0x27 | 0x2A | 0x2B | 0x33 | 0x38 | 0x3B | 0x49 | 0x4A | 0x4B | 0x6D | 0x6E | 0x71..=0x73
-        | 0x7E | 0xBF | 0xC3 | 0xC4 | 0xC5..=0xC9 | 0xCA | 0xCD..=0xCF | 0xD0..=0xD3 | 0xD6 | 0xD7 | 0xD8 | 0xD9 | 0xDB | 0xDD | 0xDE | 0xDC
+        | 0x7E | 0xBF | 0xC3 | 0xC4 | 0xC5..=0xC7 | 0xCD..=0xCF | 0xD0..=0xD3 | 0xD6 | 0xD7 | 0xD8 | 0xD9 | 0xDB | 0xDD | 0xDE | 0xDC
         // windows other than the one that is shown
         | 0x2E | 0x2F | 0x36 | 0x37 | 0x41..=0x43 | 0x51..=0x55 | 0x56 | 0x57 | 0x45 | 0x47 | 0x4D | 0x4F
         // the picture: fades, shakes, background layers, palettes, scrolls of a layer

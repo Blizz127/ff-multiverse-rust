@@ -257,9 +257,9 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>, mut 
         invite_first_peer: args.party_invite_first_peer,
         accept: args.party_accept,
     });
-    if scene_bot.is_active() {
-        session.state.scene.set_instant(true);
-    }
+    // A headless run has no picture to wait for and no keys: a scene that starts for it (one it asked for with `--scene-*`,
+    // or one the server starts by itself when the player arrives somewhere) is played through at once.
+    session.state.scene.set_instant(true);
     eprintln!(
         "headless: joined {} as `{}` (entity {}), bot={:?} for {:.1} s",
         session.info.area_id,
@@ -426,9 +426,9 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>, mut 
         session.flush_party_sync();
         // Story scenes: a bot plays one through without waiting (it moves past every window at once), and the bot's script
         // around it (the preview, the press, the control check) is stepped here. What it printed goes to stdout, flushed.
-        if scene_bot.is_active() {
-            session.state.scene.autoplay(scene_bot.answer());
-        }
+        // (every headless run moves past the windows of a scene it is in: without it a scene the server started for a route
+        // bot would hold the bot until the server's own timeout, and the story the scene carries would never move)
+        session.state.scene.autoplay(if scene_bot.is_active() { scene_bot.answer() } else { args.scene_answer.map(usize::from) });
         for event in session.state.scene.take_events() {
             if scene_bot.is_active() {
                 scene_bot.on_event(&event, now);

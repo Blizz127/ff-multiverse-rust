@@ -78,11 +78,13 @@
 # one `countdown started account=<A> seconds=600` (the step that won the fight, from the STTIM of the field's script) and one
 # `countdown over account=<A> reason=cleared` (the finale), never `time-up`, and both bots' clients said so (`countdown:
 # running: ...`, `countdown: over: cleared`). 0 battle divergences, the one battle the chain has and no other.
-# Then the server is restarted on the same state directory and A logs in again (a re-login joins md1stin, now at the saved
-# moment 33): A walks md1stin -> md1_1 -> md1_2 -> nrthmk -> md8_4 (the gateways: md8_4 is a cutscene field with no
-# player-controlled character, where what the server can judge ends), the finale does NOT fire again (33 is not past 33), no
-# story step is logged, no countdown is started, nothing is saved, and A is told its story (`joined with progress
-# 0221000101e121`) at the start.
+# Then the server is restarted on the same state directory and A logs in again at the saved moment 33. A story at 33 stands
+# outside the reactor (`fmv_ff7::script::scene::STORY_ENTRIES`), so A joins like everyone, is told its story (`joined with
+# progress 0221000101e121`) and is sent on to md8_4 at once (the server logs `story entry ... to=md8_4`). There the first
+# scene after the escape starts by itself and A's headless client plays it through: it changes nothing that is saved and
+# ends in the field's own jump to md8_1, where the second starts by itself, takes Barret out of the party and moves the
+# story 33 -> 36, once. The server saves it (0224000101e121: moment 36, the reactor byte as it was), no countdown is started,
+# and A ends in md8_1. (`scripts/story-smoke.sh` is the same pair of scenes on a debug-started account, with a re-login.)
 #
 # Isolation (the owner's state directory is never touched, only its LIBRARY is read): the server and the
 # clients run with XDG_DATA_HOME/XDG_STATE_HOME/XDG_CONFIG_HOME/XDG_CACHE_HOME and FMV_STATE_DIR
@@ -150,10 +152,11 @@ ESCAPE_STORY_TAIL=(
 )
 ESCAPE_FINAL_BLOB=0221000101e121
 ESCAPE_COUNTDOWN_SECS=600
-# After the server restarts, A logs in again at the saved moment 33 and walks to md8_4 by the gateways.
-# (the walk takes about 35 s, measured)
-RELOGIN_DURATION=100
-RELOGIN_ROUTE=(md1_1 md1_2 nrthmk md8_4)
+# After the server restarts, A logs in again at the saved moment 33: it is sent to md8_4, plays the two scenes the escape ends
+# in and is saved at 36 in md8_1 (moment 36, the reactor byte of the first run).
+RELOGIN_DURATION=40
+RELOGIN_AREAS=(md8_4 md8_1)
+RELOGIN_FINAL_BLOB=0224000101e121
 MODE=real
 
 usage() {
@@ -176,8 +179,8 @@ synthetic FIXTURE rooms (hall and yard) and needs no owned data.
                       follows
   --escape           the same walk and then the way back out of the reactor with the bomb's countdown running (real data):
                       up the ladders, the lift ridden back up with OK, out to nrthmk, where the finale moves the story to 33
-                      (one continuous run), then the server restarts and the leader logs in again at 33 and walks
-                      md1stin -> md8_4 by the gateways with nothing firing again
+                      (one continuous run), then the server restarts and the leader logs in again at 33: it is sent
+                      to md8_4, the two scenes after the escape play by themselves and the story is saved at 36
   --library DIR      state directory that contains library/ (default $FMV_FF7_LIBRARY, else
                       ~/.local/share/ff-multiverse); only the library is read, never written
   --duration SECS    how long each bot runs (default 45; 300 with --chain; 330 with --escape)
@@ -625,7 +628,7 @@ run_chain() {
   say "server: $(last_line_with "$WORK/server.log" "story saved account=$a_account" || true)"
   RESULT=pass
   if [[ $MODE == escape ]]; then
-    say "PASS: two bots in a party walked md1stin -> ${route_csv//,/ -> } with the real story: the leader moved it 1 -> 27 (the Guard Scorpion fought and won, which started the bomb's ${ESCAPE_COUNTDOWN_SECS} s countdown), the lift was ridden back up with OK, the ladders and jumps were climbed in both directions, the finale in nrthmk moved the story to 33 (blob $FINAL_BLOB saved) and ended the countdown (cleared, never time-up), the member followed; after a restart the leader logged in at 33, walked md1stin -> md8_4 by the gateways and nothing fired again; $state_real unchanged ($after)"
+    say "PASS: two bots in a party walked md1stin -> ${route_csv//,/ -> } with the real story: the leader moved it 1 -> 27 (the Guard Scorpion fought and won, which started the bomb's ${ESCAPE_COUNTDOWN_SECS} s countdown), the lift was ridden back up with OK, the ladders and jumps were climbed in both directions, the finale in nrthmk moved the story to 33 (blob $FINAL_BLOB saved) and ended the countdown (cleared, never time-up), the member followed; after a restart the leader logged in at 33, was sent to md8_4, played the two scenes after the escape and was saved at 36 ($RELOGIN_FINAL_BLOB) in md8_1; $state_real unchanged ($after)"
   else
     say "PASS: two bots in a party walked md1stin -> ${route_csv//,/ -> } with the real story: the leader moved it 1 -> 27 (the lift ridden with OK, the woman and the materia talked to, the Guard Scorpion fought and won), the ladders and jumps of nmkin_3 and nmkin_4 were climbed, the exit to nmkin_2 was the one the story opened, the member followed; $state_real unchanged ($after)"
   fi
@@ -665,20 +668,16 @@ check_countdown() {
 }
 
 # relogin_at_33 <account of the leader> <address of the first server> <the first server's arguments>...: --escape's second run
-# (header): the server restarts on the same state directory, A logs in again at the saved moment 33 (a re-login joins md1stin),
-# walks md1stin -> md1_1 -> md1_2 -> nrthmk -> md8_4 by the gateways with its story bot on, and nothing fires: no story step, no
-# countdown, nothing saved, the record in the store is what the first run left, and A is told its story at the start.
+# (header): the server restarts on the same state directory and A logs in again at the saved moment 33. It is told its story,
+# sent to md8_4, the two scenes after the escape start by themselves and are played through, the story moves 33 -> 36 once and
+# is saved, no countdown is started, and A ends in md8_1.
 relogin_at_33() {
-  local account="$1" first_addr="$2" n line value stored relogin_csv expected_areas=""
+  local account="$1" first_addr="$2" line value stored expected_areas=""
   shift 2
   local -a args=("$@") client_args=(--ff7-library "$WORK/lib-state")
   # (the first server argument is --bind, its value the next one)
   args[1]="$first_addr"
-  relogin_csv=$(
-    IFS=,
-    printf '%s' "${RELOGIN_ROUTE[*]}"
-  )
-  for n in "${RELOGIN_ROUTE[@]}"; do
+  for n in "${RELOGIN_AREAS[@]}"; do
     expected_areas+="Ff7/$n "
   done
   expected_areas="${expected_areas% }"
@@ -690,12 +689,12 @@ relogin_at_33() {
   CPID=()
   CRC=()
   CLIENT_NAMES=(A)
-  say "run 2: bot A logs in again for ${RELOGIN_DURATION}s against $CONNECT; route md1stin,$relogin_csv"
-  "$CLIENT_BIN" --server "$CONNECT" --headless --duration "$RELOGIN_DURATION" --bot circle --battle-auto "${client_args[@]}" \
-    --name A --state-dir "$WORK/client-A" --story-advance --travel "$relogin_csv" >"$WORK/client-A-2.log" 2>&1 &
+  say "run 2: bot A logs in again for ${RELOGIN_DURATION}s against $CONNECT (it stands still: where it goes is the story's doing)"
+  "$CLIENT_BIN" --server "$CONNECT" --headless --duration "$RELOGIN_DURATION" --bot idle --mods off "${client_args[@]}" \
+    --name A --state-dir "$WORK/client-A" >"$WORK/client-A-2.log" 2>&1 &
   CPID[A]=$!
   wait_clients $((RELOGIN_DURATION + CLIENT_GRACE))
-  local log="$WORK/client-A-2.log"
+  local log="$WORK/client-A-2.log" sl="$WORK/server-2.log"
   if [[ ${CRC[A]:-} == timeout ]]; then
     problem "run 2: client A was still running ${CLIENT_GRACE}s after its ${RELOGIN_DURATION}s duration and was killed"
   elif [[ ${CRC[A]:-} != 0 ]]; then
@@ -703,38 +702,40 @@ relogin_at_33() {
   fi
   if line=$(last_line_with "$log" "SMOKE name="); then
     line=$(strip_ansi "$line")
-    [[ $(field "$line" area) == "Ff7/${RELOGIN_ROUTE[${#RELOGIN_ROUTE[@]} - 1]}" ]] ||
-      problem "run 2: A should end in Ff7/${RELOGIN_ROUTE[${#RELOGIN_ROUTE[@]} - 1]}: $line"
+    [[ $(field "$line" area) == "Ff7/${RELOGIN_AREAS[${#RELOGIN_AREAS[@]} - 1]}" ]] ||
+      problem "run 2: A should end in Ff7/${RELOGIN_AREAS[${#RELOGIN_AREAS[@]} - 1]}: $line"
     value=$(area_changes_of "$line")
-    [[ $value == "${#RELOGIN_ROUTE[@]}" ]] || problem "run 2: A should have changed area ${#RELOGIN_ROUTE[@]} times (area_changes=${value:-?}): $line"
+    [[ $value == "${#RELOGIN_AREAS[@]}" ]] || problem "run 2: A should have changed area ${#RELOGIN_AREAS[@]} times (area_changes=${value:-?}): $line"
     say "run 2 client: $line"
   else
     problem "run 2: client A printed no SMOKE line"
   fi
   entered_areas "$log"
   [[ "${ENTERED[*]:-}" == "$expected_areas" ]] || problem "run 2: A entered [${ENTERED[*]:-nothing}], expected [$expected_areas]"
-  log_has "$log" "headless: travel: the route" || problem "run 2: A did not finish its route: $(last_line_with "$log" "headless: travel:" || echo 'no travel summary')"
   log_has "$log" "story: joined with progress $ESCAPE_FINAL_BLOB" ||
     problem "run 2: A was not told its story ($ESCAPE_FINAL_BLOB) when it logged in again: $(last_line_with "$log" 'story:' || echo 'no story line')"
-  if log_has "$log" "story: advanced"; then
-    problem "run 2: A's story moved again at 33: $(last_line_with "$log" 'story: advanced' || true)"
-  fi
+  value=$(count_lines_with "$log" "scene: ended run=")
+  [[ $value == 2 ]] || problem "run 2: A should have played two scenes (it played $value)"
+  value=$(count_lines_with "$log" "outcome=Finished")
+  [[ $value == 2 ]] || problem "run 2: both scenes should end Finished on the client ($value did)"
   if log_has "$log" "countdown:"; then
     problem "run 2: A was told of a countdown after logging in (a countdown is not stored): $(last_line_with "$log" 'countdown:' || true)"
   fi
   stop_server
-  value=$(count_lines_with "$WORK/server-2.log" "story advanced ")
-  [[ $value == 0 ]] || problem "run 2: the server moved a story ($value steps) at moment 33: $(last_line_with "$WORK/server-2.log" 'story advanced' || true)"
-  value=$(count_lines_with "$WORK/server-2.log" "countdown ")
+  log_has "$sl" "to=md8_4 (where its story stands)" || problem "run 2: the server did not send A to md8_4 at login: $(last_line_with "$sl" 'story entry' || echo 'no story entry line')"
+  value=$(count_lines_with "$sl" "scene ended run=")
+  [[ $value == 2 ]] || problem "run 2: the server should have ended two scenes ($value)"
+  log_has "$sl" "scene=ff7/md8_4/post-escape outcome=Finished answers=0 story=unchanged" || problem "run 2: the first scene should end Finished and change no story: $(last_line_with "$sl" 'scene ended run=1' || true)"
+  log_has "$sl" "scene=ff7/md8_1/post-escape-station outcome=Finished answers=0 story=applied" || problem "run 2: the second scene should end Finished and apply its story: $(last_line_with "$sl" 'scene ended run=2' || true)"
+  value=$(count_lines_with "$sl" "story advanced ")
+  [[ $value == 1 ]] || problem "run 2: the server should have moved A's story once ($value steps)"
+  log_has "$sl" "moment=33->36" || problem "run 2: the story should move 33 -> 36: $(last_line_with "$sl" 'story advanced' || true)"
+  value=$(count_lines_with "$sl" "countdown ")
   [[ $value == 0 ]] || problem "run 2: the server said something about a countdown ($value lines)"
-  value=$(count_lines_with "$WORK/server-2.log" "story saved ")
-  [[ $value == 0 ]] || problem "run 2: the server saved a story ($value lines) although nothing moved"
-  value=$(count_lines_with "$WORK/server-2.log" "player leaves through an exit")
-  [[ $value == "${#RELOGIN_ROUTE[@]}" ]] || problem "run 2: the server should have moved A through an exit ${#RELOGIN_ROUTE[@]} times (it logged $value moves)"
-  value=$(count_lines_with "$WORK/server-2.log" "exit closed: its conditions cannot be judged")
-  [[ $value == 0 ]] || problem "run 2: the server reported an exit it could not judge ($value time(s))"
+  value=$(count_lines_with "$sl" "story saved ")
+  [[ $value == 1 ]] || problem "run 2: the server should have saved A's story once ($value lines)"
   stored=$(stored_blob "$WORK/server-state/progression/$account/Ff7.json")
-  [[ $stored == "$ESCAPE_FINAL_BLOB" ]] || problem "run 2: the stored story is '$stored', expected $ESCAPE_FINAL_BLOB (what the first run saved)"
+  [[ $stored == "$RELOGIN_FINAL_BLOB" ]] || problem "run 2: the stored story is '$stored', expected $RELOGIN_FINAL_BLOB (moment 36, the reactor byte of the first run)"
 }
 
 main() {

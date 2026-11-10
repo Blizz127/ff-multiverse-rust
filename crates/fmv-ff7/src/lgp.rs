@@ -133,10 +133,14 @@ pub struct LgpEntry {
     pub path_index: u16,
 }
 
+/// A read-only overlay over an archive ([`LgpArchive::set_overlay`]): the bytes of the file of that name when the overlay
+/// has one, `None` to fall back to the archive's own.
+type Overlay = Box<dyn FnMut(&str) -> Option<io::Result<Vec<u8>>> + Send>;
+
 /// A parsed LGP table of contents over a seekable reader. The data itself is read on demand.
 pub struct LgpArchive<R> {
     reader: R,
-    overlay: Option<Box<dyn FnMut(&str) -> Option<io::Result<Vec<u8>>> + Send>>,
+    overlay: Option<Overlay>,
     file_len: u64,
     entries: Vec<LgpEntry>,
     /// ASCII-lowercased bare name -> index of the FIRST entry with that name.

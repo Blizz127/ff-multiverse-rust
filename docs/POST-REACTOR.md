@@ -1,7 +1,16 @@
 # Post-reactor route work
 
-This is an implementation checkpoint, not a playable route. The current player build stops at
-the first post-escape field. The scene definitions in this branch are not registered for play.
+**What is playable:** the two scenes the escape ends in. `ff7/md8_4/post-escape` and
+`ff7/md8_1/post-escape-station` are registered, start by themselves for a player at moment 33,
+and take the story to 36 (README, "After the escape"; `scripts/story-smoke.sh`). The street
+scene's party change is carried by the party table's row of moment 36, its full restore is a
+no-op here (no HP or MP is kept between battles), and both play in Echo-S for a player alone.
+An account at 33 or later comes back in where its story stands (`STORY_ENTRIES`).
+
+**What is not:** everything from `md8_2` on. The rest of this file is the survey of that
+route as the previous checkpoint left it: the scene definitions it names (flower, cargo train,
+train, Sector 7 station, pillar, Sector 7 intro, early bar) are NOT registered, and its notes
+on `md8_4` and `md8_1` describe the state before they were.
 
 On the owned English Steam data, the escape ends at story moment 33. The `md8_4` director's
 main script runs four windows and jumps to field 133 (`md8_1`), at (1629, -5357), triangle 15,

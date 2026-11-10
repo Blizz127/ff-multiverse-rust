@@ -23,11 +23,16 @@ const TRIGGER_AT: (f32, f32) = (200.0, -100.0);
 /// One `finish` call: scene, story, seed, answers.
 type Finish = (String, Vec<u8>, u32, Vec<u8>);
 
+/// The story the fake host has an entry for (see [`FakeHost::entry`]).
+const FAR_ALONG: &[u8] = &[7, 7];
+
 #[derive(Default)]
 struct FakeHost {
     finished: Mutex<Vec<Finish>>,
     travel: Mutex<Option<fmv_adapter_api::Exit>>,
     automatic: Mutex<bool>,
+    /// Where a story of [`FAR_ALONG`] comes into the world, when the test sets one.
+    entry: Mutex<Option<fmv_adapter_api::Exit>>,
 }
 
 impl SceneHost for FakeHost {
@@ -38,6 +43,9 @@ impl SceneHost for FakeHost {
         scene == SCENE && (progress.is_empty() || progress == MADE_UP)
     }
     fn automatic(&self, scene: &str) -> bool { scene == SCENE && *self.automatic.lock().unwrap() }
+    fn entry(&self, progress: &[u8]) -> Option<fmv_adapter_api::Exit> {
+        if progress == FAR_ALONG { self.entry.lock().unwrap().clone() } else { None }
+    }
     fn trigger(&self, scene: &str, _progress: &[u8]) -> Option<TriggerInfo> {
         (scene == SCENE).then(|| TriggerInfo {
             name: "giver".into(),
@@ -88,6 +96,56 @@ fn automatic_scene_uses_and_saves_only_the_members_own_story() {
     let Some(Msg::Story(job)) = saved_rx.try_recv().ok() else { panic!("the member's story was not saved") };
     assert_eq!((job.account, job.progress), (b.account, vec![5]));
     assert!(saved_rx.try_recv().is_err());
+}
+
+fn logs_of(w: &mut World) -> Vec<String> {
+    w.take_logs().iter().map(|l| l.text().to_string()).collect()
+}
+
+fn entry_to(target: &str) -> fmv_adapter_api::Exit {
+    fmv_adapter_api::Exit { line: (Pos::new(0.0, 0.0, 0.0), Pos::new(0.0, 0.0, 0.0)), target: target.to_string(), arrival: Pos::new(150.0, -100.0, 0.0),
+        arrival_facing: Some(0.0), arrival_hint: None, kind: fmv_adapter_api::ExitKind::Gateway }
+}
+
+/// A story the host has an entry for joins like everyone (the same first messages, in the entry area) and is then sent on to
+/// where its story stands, through the ordinary area handshake; every other story stays where everyone joins.
+#[test]
+fn a_story_that_stands_elsewhere_is_sent_there_at_login_and_no_other_story_is() {
+    let now = Instant::now();
+    let (mut w, mut saved_rx, host) = world();
+    *host.entry.lock().unwrap() = Some(entry_to(YARD));
+    let mut new = seat(&mut w, "New", &[], now);
+    assert_eq!(w.area_of(new.entity), Some((HALL.to_string(), false)), "a new account joins where everyone joins");
+    assert!(new.drain().iter().all(|m| !matches!(m, ServerMsg::AreaChange { .. })));
+    let mut other = seat(&mut w, "Other", &[5], now);
+    assert_eq!(w.area_of(other.entity), Some((HALL.to_string(), false)), "a story the host has no entry for");
+    assert!(other.drain().iter().all(|m| !matches!(m, ServerMsg::AreaChange { .. })));
+
+    let mut far = seat(&mut w, "Far", FAR_ALONG, now);
+    let msgs = far.drain();
+    let snapshot = msgs.iter().position(|m| matches!(m, ServerMsg::AreaSnapshot { .. })).expect("the entry area's snapshot first, as for everyone");
+    let change = msgs.iter().position(|m| matches!(m, ServerMsg::AreaChange { .. })).expect("then the way on");
+    assert!(snapshot < change);
+    assert_eq!(w.transit_target(far.entity), Some(YARD.to_string()));
+    assert!(logs_of(&mut w).iter().any(|l| l.starts_with("story entry account=") && l.contains("to=yard")), "the log says where and why");
+    assert!(saved(&mut saved_rx).is_empty(), "coming in changes no story");
+}
+
+/// An entry that cannot be hosted leaves the player where everyone joins, and says so.
+#[test]
+fn an_entry_that_cannot_be_hosted_leaves_the_player_where_everyone_joins() {
+    let now = Instant::now();
+    let (mut w, _saved_rx, host) = world();
+    *host.entry.lock().unwrap() = Some(entry_to("missing-field"));
+    let mut far = seat(&mut w, "Far", FAR_ALONG, now);
+    assert_eq!(w.area_of(far.entity), Some((HALL.to_string(), false)));
+    assert!(far.drain().iter().all(|m| !matches!(m, ServerMsg::AreaChange { .. })));
+    assert!(logs_of(&mut w).iter().any(|l| l.starts_with("story entry unavailable")));
+    // ... and an entry that IS the entry area is no travel at all.
+    *host.entry.lock().unwrap() = Some(entry_to(HALL));
+    let mut home = seat(&mut w, "Home", FAR_ALONG, now);
+    assert_eq!(w.area_of(home.entity), Some((HALL.to_string(), false)));
+    assert!(home.drain().iter().all(|m| !matches!(m, ServerMsg::AreaChange { .. })));
 }
 
 #[test]
@@ -172,7 +230,7 @@ fn world_with(preview: bool, battles: bool) -> (World, mpsc::UnboundedReceiver<M
     let (handle, rx) = SaverHandle::channel();
     w.set_progress_saver(handle);
     let host = Arc::new(FakeHost::default());
-    w.configure_scenes(Some(SceneSettings { host: host.clone(), debug_preview: preview }));
+    w.configure_scenes(Some(SceneSettings { host: host.clone(), debug_preview: preview, debug_new_story: None }));
     if battles {
         let settings = BattleSettings { battle_speed: 0, ticks_per_second: 1000, fixed_seed: Some(7), ..BattleSettings::new(Arc::new(SyntheticRules::default())) };
         w.configure_battle(Some(settings), true);
@@ -413,7 +471,7 @@ fn when_the_owner_finishes_everyone_is_released_and_the_story_write_is_applied_o
     assert_eq!(calls.len(), 1);
     assert_eq!((calls[0].0.as_str(), calls[0].1.as_slice(), calls[0].3.as_slice()), (SCENE, &[][..], &[2u8][..]), "the host ran it with the owner's answers");
     let log = log_text(&mut w);
-    assert!(log.contains("story advanced") && log.contains(&format!("scene={SCENE} moment=1->5")), "{log}");
+    assert!(log.contains("story advanced") && log.contains(&format!("moment=1->5 scene={SCENE}")), "{log}");
     assert!(log.contains("scene ended run=1") && log.contains("outcome=Finished") && log.contains("story=applied"), "{log}");
     // a second end, a late step and the passing of time change nothing
     w.scene_message(a.entity, ClientMsg::SceneEnd { run, skipped: false }, now);

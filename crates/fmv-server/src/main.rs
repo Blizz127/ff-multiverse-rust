@@ -247,6 +247,22 @@ struct Cli {
     #[arg(long)]
     debug_scene_preview: bool,
 
+    /// Let a story scene SAVE story variables that no build before the story scenes ever saved (a choice a scene asks,
+    /// a field's own progress flags). OFF by default: without it a scene may move the story moment and the first reactor's
+    /// long-saved state and nothing else, so the account store holds exactly the kinds of things it always held, and a scene
+    /// whose story would carry more is played and then not applied. Turn it on only when the store's owner has said that
+    /// such variables may be saved. FF7 only.
+    #[arg(long)]
+    story_extended_save: bool,
+
+    /// DEBUG, needs an explicit --state-dir (or --ephemeral): an account with no story yet starts at story moment N instead of
+    /// the new game's (1). A smoke test's way to a later part of the story without playing through everything before it:
+    /// with 33, a new account comes in right after the escape from the first reactor. Refused on the default state
+    /// directory, the one a real server keeps its accounts in, and warned about at start-up and for every account it
+    /// applies to. FF7 only.
+    #[arg(long, value_name = "N")]
+    debug_start_moment: Option<u16>,
+
     /// Do not roll a field's random-encounter table as players walk.
     #[arg(long)]
     no_random_encounters: bool,
@@ -471,6 +487,12 @@ impl Cli {
                         default state directory (the one a real server keeps its accounts in): pass --state-dir <a throw-away directory> or --ephemeral"
                 .to_string());
         }
+        // The same goes for a made-up story: it is stored like a played one the first time it moves.
+        if self.debug_start_moment.is_some() && !self.ephemeral && !explicit {
+            return Err("--debug-start-moment makes up a story that is then saved like a played one, so it refuses to run on the default state directory \
+                        (the one a real server keeps its accounts in): pass --state-dir <a throw-away directory> or --ephemeral"
+                .to_string());
+        }
         Ok(())
     }
 }
@@ -518,8 +540,9 @@ async fn build_adapter(cli: &Cli) -> Result<Hosted, SetupError> {
             };
             // FF7's story scenes read the same field archive; the debug preview is off unless asked for.
             let scenes = SceneSettings {
-                host: std::sync::Arc::new(fmv_server::scene_host::Ff7SceneHost::new(std::sync::Arc::clone(&opened.adapter))),
+                host: std::sync::Arc::new(fmv_server::scene_host::Ff7SceneHost::with_extended_save(std::sync::Arc::clone(&opened.adapter), cli.story_extended_save)),
                 debug_preview: cli.debug_scene_preview,
+                debug_new_story: cli.debug_start_moment.map(|moment| fmv_ff7::story::StoryState::at(moment).encode()),
             };
             Ok(Hosted {
                 adapter: Box::new(SharedFf7(opened.adapter)),
@@ -588,6 +611,23 @@ async fn real_main(cli: Cli) -> Result<(), String> {
     }
     if cli.debug_scene_preview && hosted.scenes.is_none() {
         warn!("--debug-scene-preview has no effect: this game has no story scenes");
+    }
+    if let Some(moment) = cli.debug_start_moment {
+        if hosted.scenes.is_none() {
+            warn!("--debug-start-moment has no effect: this game has no story scenes");
+        } else {
+            warn!("DEBUG: --debug-start-moment {moment} is on: an account with no story yet starts at story moment {moment}, not at the new game's (a smoke-test aid; never on a server real players use)");
+        }
+    }
+    if cli.story_extended_save && hosted.scenes.is_none() {
+        warn!("--story-extended-save has no effect: this game has no story scenes");
+    }
+    if hosted.scenes.is_some() {
+        if cli.story_extended_save {
+            warn!("--story-extended-save is on: story scenes may save story variables that no build before the story scenes saved");
+        } else {
+            info!("story scenes save the story moment and the first reactor's state only (the extended save is off)");
+        }
     }
     if cli.debug_scene_preview && hosted.scenes.is_some() {
         warn!(
@@ -975,6 +1015,13 @@ mod tests {
         // A named directory, or none kept at all, is fine; and the check is silent about everything else.
         assert!(refused(&["--debug-encounters", "--debug-bonus-exp", "900", "--state-dir", "/tmp/throw-away"]).is_ok());
         assert!(refused(&["--debug-encounters", "--debug-bonus-limit", "100", "--ephemeral"]).is_ok());
+        // A made-up story is stored like a played one: the same rule, and it is off unless asked for.
+        assert_eq!(parse(&[]).unwrap().debug_start_moment, None);
+        assert!(refused(&["--debug-start-moment", "33"]).unwrap_err().contains("default state directory"));
+        assert!(refused(&["--debug-start-moment", "33", "--ephemeral"]).is_ok());
+        assert!(refused(&["--debug-start-moment", "33", "--state-dir", "/tmp/throw-away"]).is_ok());
+        assert!(parse(&["--debug-start-moment", "70000"]).is_err(), "a moment is a 16-bit number");
+        assert!(!parse(&[]).unwrap().story_extended_save, "the extended save is off unless asked for");
         assert!(refused(&["--debug-encounters"]).is_ok());
         assert!(refused(&[]).is_ok());
         assert!(refused(&["--debug-encounters", "--debug-limit-full"]).is_ok(), "the full-gauge flag stores nothing");

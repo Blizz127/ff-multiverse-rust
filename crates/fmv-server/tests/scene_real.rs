@@ -103,7 +103,7 @@ async fn the_proof_scene_starts_from_its_trigger_on_the_real_field_holds_the_pla
         area_key: "md1stin".to_string(),
         build_suffix: Some(build_tag()),
         state_dir: Some(state.path().to_path_buf()),
-        scenes: Some(SceneSettings { host: std::sync::Arc::new(Ff7SceneHost::new(opened.adapter.clone())), debug_preview: true }),
+        scenes: Some(SceneSettings { host: std::sync::Arc::new(Ff7SceneHost::new(opened.adapter.clone())), debug_preview: true, debug_new_story: None }),
         ..ServerConfig::default()
     };
     let server = Server::bind(config, Box::new(SharedFf7(opened.adapter.clone()))).await.expect("bind");

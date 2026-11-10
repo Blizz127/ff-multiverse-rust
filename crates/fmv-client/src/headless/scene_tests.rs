@@ -295,8 +295,10 @@ async fn a_machine_that_cannot_build_the_scene_says_so_releases_the_player_and_f
     assert_eq!(run.code, 1);
     assert!(run.lines.contains(&"scene unavailable (cannot read this machine's field data)".to_string()), "{:?}", run.lines);
     assert!(run.lines.iter().all(|l| !l.starts_with("scene line")), "no line of a scene it could not build");
-    // The player was released at once: the owner said the scene was skipped.
-    assert!(run.seen.messages.contains(&ClientMsg::SceneEnd { run: SceneRunId(1), skipped: true }), "{:?}", run.seen.messages);
+    // The player asks to be let go at once, and says nothing that could move the story: a scene this machine could not
+    // show is LEFT (the server ends the run without applying anything), never reported as skipped.
+    assert!(run.seen.messages.contains(&ClientMsg::SceneLeave { run: SceneRunId(1) }), "{:?}", run.seen.messages);
+    assert!(!run.seen.messages.iter().any(|m| matches!(m, ClientMsg::SceneEnd { .. })), "{:?}", run.seen.messages);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
