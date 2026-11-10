@@ -34,6 +34,8 @@
 //! * A window pauses the whole stage (as the interpreter pauses the whole scene); the game pauses only the script that
 //!   opened it.
 //! * Durations (a walk's length) are the interpreter's estimates: the picture is paced by them.
+//! * A private bar scene may use Echo-S after its choice paths are checked against the original. A scene with watchers
+//!   stays on the original because Echo-S has different window counts; other scenes are not yet Echo-S enabled.
 
 mod bot;
 mod client;

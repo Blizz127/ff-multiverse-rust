@@ -38,6 +38,7 @@ use super::panel::{Outcome, Panel, PanelKey, SpeakerSpot};
 use super::source::SceneSource;
 use super::stage::Cast;
 use crate::ui::dialogue::{dialogue_key, DialogueKey};
+use crate::mods::{Global, ModSink, VoiceCue};
 use fmv_core::{EntityId, Pos};
 use fmv_ff7::field_direction_to_facing;
 use fmv_ff7::script::dialogue::{End, MessageOrigin};
@@ -187,6 +188,12 @@ pub struct ScenePlayer {
     epoch: u32,
     /// The screen the window was last drawn for (keys lay the text out for the same one).
     size: Cell<(u32, u32)>,
+}
+
+impl Drop for ScenePlayer {
+    fn drop(&mut self) {
+        if self.source.echo_voice() { Global.cue(VoiceCue::Stop); }
+    }
 }
 
 /// Counts only: the scene is the game's and never goes to a log.
@@ -452,6 +459,11 @@ impl ScenePlayer {
             self.pass(panel, None);
             return;
         }
+        if self.source.echo_voice() {
+            if let MessageOrigin::Canon { dialog, .. } = &panel.window().message.origin {
+                Global.cue(VoiceCue::Say { field: self.def.field.clone(), window: panel.window().id, dialog: *dialog, page: 0 });
+            }
+        }
         self.panel = Some(panel);
         // A watcher whose owner moved past this window before it opened here moves past it too.
         if let Some(answer) = self.early.pop_front() {
@@ -463,6 +475,10 @@ impl ScenePlayer {
     fn pass(&mut self, panel: Panel, answer: Option<usize>) {
         let answer = panel.resolve(answer);
         let window = panel.window();
+        let server_answer = if self.is_owner() {
+            match self.source.server_answer(window, answer) { Ok(value) => value, Err(()) => { self.abort(); return; } }
+        } else { answer };
+        if self.source.echo_voice() { Global.cue(VoiceCue::Stop); }
         let step = self.passed;
         self.passed += 1;
         self.epoch = self.epoch.wrapping_add(1);
@@ -475,7 +491,7 @@ impl ScenePlayer {
             answer,
         });
         if self.is_owner() {
-            let answer = answer.map(|line| u8::try_from(line).unwrap_or(u8::MAX));
+            let answer = server_answer.map(|line| u8::try_from(line).unwrap_or(u8::MAX));
             self.outbox.push(SceneCmd::Step { run: self.run.id, step, answer });
         }
         self.next = Next::Pull(answer);
@@ -493,8 +509,7 @@ impl ScenePlayer {
     fn play_out(&mut self) {
         self.next = Next::Held;
         if self.is_owner() {
-            self.over = true;
-            self.cast.clear();
+            self.finish();
             if !std::mem::replace(&mut self.sent_end, true) {
                 self.outbox.push(SceneCmd::End { run: self.run.id, skipped: false });
             }
@@ -519,7 +534,19 @@ impl ScenePlayer {
         };
         let (size, answers) = (self.size.get(), self.is_owner());
         let Some(panel) = self.panel.as_mut() else { return };
-        if let Outcome::Pass(answer) = panel.key(panel_key, size, answers) {
+        let before = panel.voice_state(size);
+        let outcome = panel.key(panel_key, size, answers);
+        let after = panel.voice_state(size);
+        if self.source.echo_voice() && outcome == Outcome::Stay {
+            if let MessageOrigin::Canon { dialog, .. } = &panel.window().message.origin {
+                if before.0 != after.0 {
+                    Global.cue(VoiceCue::Say { field: self.def.field.clone(), window: panel.window().id, dialog: *dialog, page: after.0 });
+                } else if before.1 != after.1 {
+                    if let Some(line) = after.1 { Global.cue(VoiceCue::Choice { field: self.def.field.clone(), dialog: *dialog, line }); }
+                }
+            }
+        }
+        if let Outcome::Pass(answer) = outcome {
             if let Some(panel) = self.panel.take() {
                 self.pass(panel, answer);
                 self.settle();
@@ -534,6 +561,7 @@ impl ScenePlayer {
             return false;
         }
         let Some(panel) = self.panel.take() else { return false };
+        let answer = self.source.bot_answer(panel.window(), answer);
         self.pass(panel, answer);
         self.settle();
         true
@@ -585,6 +613,7 @@ impl ScenePlayer {
 
     /// Over: no window, no actors, the field's camera.
     fn finish(&mut self) {
+        if self.source.echo_voice() { Global.cue(VoiceCue::Stop); }
         self.over = true;
         self.panel = None;
         self.early.clear();

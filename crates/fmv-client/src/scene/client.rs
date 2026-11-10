@@ -161,6 +161,7 @@ impl SceneClient {
         self.started += 1;
         self.event(SceneEvent::Started { run, scene: clean_id(&scene), role: you, participants: participants.len() });
         let built = match StoryState::decode(&progress) {
+            Some(story) if you == SceneRole::Owner && participants.len() == 1 => self.builder.build_private(&scene, &story, seed),
             Some(story) => self.builder.build(&scene, &story, seed),
             None => Err("the story the scene plays against cannot be read here".to_string()),
         };

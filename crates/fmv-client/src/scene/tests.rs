@@ -119,6 +119,56 @@ impl SceneSource for Scripted {
     }
 }
 
+#[test]
+fn private_echo_sends_original_choice_and_voice_cues() {
+    struct EchoFake(Scripted);
+    impl SceneSource for EchoFake {
+        fn initial(&self) -> Vec<Stage> { self.0.initial() }
+        fn next(&mut self, answer: Option<usize>) -> Beat { self.0.next(answer) }
+        fn echo_voice(&self) -> bool { true }
+        fn server_answer(&self, w: &Window, answer: Option<usize>) -> Result<Option<usize>, ()> {
+            if w.message.choice.is_some() { answer.filter(|a| *a <= 1).map(|a| Some(a + 1)).ok_or(()) } else { Ok(None) }
+        }
+    }
+    use crate::mods::{take_voices, VoiceCue};
+    let _ = take_voices();
+    let mut question = ask(0, 18, 18, 3, 0);
+    if let Then::Window(ref mut w) = question.then { w.message.choice = Some(Choice { first: 0, last: 1, cursor: 0 }); }
+    let source = EchoFake(Scripted { initial: vec![], beats: vec![question, end(0)].into(), asked: Asked::default() });
+    let run = Run { id: RUN, role: SceneRole::Owner, participants: vec![SceneParticipant { entity: EntityId(1), spot: 0 }] };
+    let mut p = ScenePlayer::new(run, def(), Box::new(source), true);
+    assert_eq!(take_voices(), [VoiceCue::Say { field: AREA.into(), window: 0, dialog: 3, page: 0 }]);
+    p.key(SceneKey::Down);
+    assert_eq!(take_voices(), [VoiceCue::Choice { field: AREA.into(), dialog: 3, line: 1 }]);
+    p.key(SceneKey::Confirm);
+    assert_eq!(p.take_commands(), [step(0, Some(2)), SceneCmd::End { run: RUN, skipped: false }]);
+    assert!(take_voices().contains(&VoiceCue::Stop));
+}
+
+#[test]
+fn private_scene_builder_is_used_only_for_a_lone_owner() {
+    struct Probe { private: Rc<RefCell<u32>>, regular: Rc<RefCell<u32>> }
+    impl SceneBuilder for Probe {
+        fn build(&mut self, _: &str, _: &fmv_ff7::story::StoryState, _: u32) -> Result<Built, String> {
+            *self.regular.borrow_mut() += 1;
+            Err("test".into())
+        }
+        fn build_private(&mut self, _: &str, _: &fmv_ff7::story::StoryState, _: u32) -> Result<Built, String> {
+            *self.private.borrow_mut() += 1;
+            Err("test".into())
+        }
+        fn reach(&mut self, _: usize, _: &str) -> Option<f32> { None }
+    }
+    let private = Rc::new(RefCell::new(0));
+    let regular = Rc::new(RefCell::new(0));
+    let mut c = SceneClient::new();
+    c.set_builder(Box::new(Probe { private: private.clone(), regular: regular.clone() }));
+    c.on_message(AREA, start(RUN, SceneRole::Owner, &[(1, 0)]));
+    c.on_message(AREA, start(RUN, SceneRole::Owner, &[(1, 0), (2, 1)]));
+    c.on_message(AREA, start(RUN, SceneRole::Watcher, &[(1, 0)]));
+    assert_eq!((*private.borrow(), *regular.borrow()), (1, 2));
+}
+
 /// A builder that makes the scripted scene (or fails).
 struct Fake {
     initial: Vec<Stage>,

@@ -38,9 +38,9 @@ An owner whose client cannot build or finish the interpreter run aborts without 
 run also leaves progress untouched rather than silently choosing any remaining answers.
 Echo-S uses a
 rewritten field script with different entity and window numbering, so scene presentation and
-watcher synchronization must be reconciled before claiming that scene dialogue and voices use it.
-`SceneDef::rebind_entities` can map uniquely named entities into a replacement section, refusing
-missing or ambiguous names; it is not wired into playback, and entity identity alone does not prove
+watcher synchronization must be reconciled before claiming that all scene dialogue and voices use it.
+`SceneDef::rebind_entities` maps uniquely named entities into a replacement section, refusing
+missing or ambiguous names; entity identity alone does not prove
 the replacement's slots, choices, windows or timing are compatible.
 
 The verified Echo-S 1.24 archive was compared locally against the owned English field data with
@@ -52,7 +52,16 @@ The original bar question uses absolute lines 1–2, while Echo-S uses 0–1. Co
 does not establish semantic equivalence of every choice or a safe watcher protocol. The bar script
 also capitalizes actor names differently, so identity matching must be case-insensitive and reject
 case-insensitive duplicates. Echo-S's added windows have voice files in these samples. These
-measurements do not enable the layer or claim that sound, animation or all story effects are done.
+measurements do not claim that sound, animation or all story effects are done.
+
+The proof bar scene can now use Echo-S for a single owner with no watchers, including voice cues.
+Before selecting it, the client runs both answer positions in both sections and requires the
+measured question ranges, complete interpretation and matching persistent writes. It maps Echo-S
+answer lines 0–1 back to original lines 1–2 for the server and for headless bot inputs. If the
+text layer is off, a section is missing or validation fails, it uses the original. Scenes with a
+watcher always use the original until mixed-layer window synchronization is implemented. This is
+a preview milestone, not proof that the Reactor-to-bar route or all Echo-S scenes are playable;
+the real bar write remains guarded until its persistent effects are carried safely.
 
 The owned-data exit graph also gives the unreviewed continuation `cargoin` → `tin_1` →
 `mds7st3` → `mds7plr1` → `mds7` → `mds7pb_1`. `tin_1` → `mds7st3` is a

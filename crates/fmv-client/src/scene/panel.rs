@@ -120,6 +120,14 @@ impl Panel {
         self.window.message.choice.is_some()
     }
 
+    pub fn voice_state(&self, size: (u32, u32)) -> (usize, Option<usize>) {
+        let (laid, _) = self.laid(size);
+        let page = self.page.min(laid.pages.len().saturating_sub(1));
+        let game_page = laid.game_pages.get(page).copied().unwrap_or(0);
+        let choice = laid.pages.get(page).and_then(|p| p.choices.as_ref()).and_then(|_| self.cursor_line());
+        (game_page, choice)
+    }
+
     /// The line a question's answer would be if it were given now: the pointer's, as the game's script stores it.
     fn cursor_line(&self) -> Option<usize> {
         let c = self.window.message.choice?;
