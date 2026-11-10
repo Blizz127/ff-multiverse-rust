@@ -73,15 +73,21 @@ fn automatic_scene_starts_once_on_entry_without_a_trigger_npc() {
 }
 
 #[test]
-fn automatic_scene_does_not_start_for_a_member_whose_phase_cannot_advance() {
-    let (mut w, mut saved_rx, host, _a, mut b, now) = two_at_the_trigger();
+fn automatic_scene_uses_and_saves_only_the_members_own_story() {
+    let (mut w, mut saved_rx, host, a, mut b, now) = two_at_the_trigger();
     *host.automatic.lock().unwrap() = true;
     w.players.get_mut(&b.entity).unwrap().placement.as_mut().unwrap().story_advance_allowed = false;
+    w.players.get_mut(&a.entity).unwrap().progression = vec![7];
     b.drain();
     w.automatic_scene_entered(b.entity, now);
-    assert!(!w.in_scene(b.entity));
-    assert!(b.drain().iter().all(|m| !matches!(m, ServerMsg::SceneStart { .. } | ServerMsg::AreaChange { .. })));
-    assert!(saved(&mut saved_rx).is_empty());
+    let run = starts(&b.drain())[0].0;
+    assert!(w.in_scene(b.entity));
+    w.scene_message(b.entity, ClientMsg::SceneEnd { run, skipped: false }, now);
+    assert_eq!(w.players.get(&a.entity).unwrap().progression, [7]);
+    assert_eq!(w.players.get(&b.entity).unwrap().progression, [5]);
+    let Some(Msg::Story(job)) = saved_rx.try_recv().ok() else { panic!("the member's story was not saved") };
+    assert_eq!((job.account, job.progress), (b.account, vec![5]));
+    assert!(saved_rx.try_recv().is_err());
 }
 
 #[test]
@@ -122,6 +128,25 @@ fn debug_preview_never_performs_a_scene_jump_or_saves_it() {
     w.scene_message(a.entity, ClientMsg::SceneEnd { run, skipped: false }, now);
     assert!(a.drain().iter().all(|m| !matches!(m, ServerMsg::AreaChange { .. })));
     assert!(saved(&mut saved_rx).is_empty());
+}
+
+#[test]
+fn unavailable_scene_destination_does_not_advance_story_or_move_player() {
+    use fmv_adapter_api::{Exit, ExitKind};
+    let mut now = Instant::now();
+    let (mut w, mut saved_rx, host) = world();
+    *host.travel.lock().unwrap() = Some(Exit { line: (Pos::new(0.0, 0.0, 0.0), Pos::new(0.0, 0.0, 0.0)),
+        target: "missing-field".to_string(), arrival: Pos::new(0.0, 0.0, 0.0), arrival_facing: None,
+        arrival_hint: None, kind: ExitKind::Gateway });
+    let mut a = seat(&mut w, "A", &[], now);
+    up_to_the_trigger(&mut w, &mut a, &mut now);
+    w.press(a.entity, Some(trigger_id()), now);
+    let run = starts(&a.drain())[0].0;
+    w.scene_message(a.entity, ClientMsg::SceneEnd { run, skipped: false }, now);
+    assert!(a.drain().iter().all(|m| !matches!(m, ServerMsg::AreaChange { .. } | ServerMsg::StoryUpdate { .. })));
+    assert!(saved(&mut saved_rx).is_empty());
+    assert!(w.players.get(&a.entity).unwrap().progression.is_empty());
+    assert_eq!(w.area_of(a.entity), Some((YARD.to_string(), false)));
 }
 
 struct Seat {

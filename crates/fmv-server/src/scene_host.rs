@@ -18,6 +18,16 @@ use fmv_ff7::{field_direction_to_facing, Ff7Adapter, Ff7FieldArea};
 
 use crate::world::{SceneHost, SceneInfo, SceneResult, TriggerInfo};
 
+fn safe_outcome(outcome: &fmv_ff7::script::scene::Outcome) -> bool {
+    (match outcome.end {
+        fmv_ff7::script::dialogue::End::Finished => outcome.jump.is_none(),
+        fmv_ff7::script::dialogue::End::MapJump { field } => outcome.jump.is_some_and(|jump| jump.field == field),
+        _ => false,
+    })
+        && outcome.stats.unknown.is_empty() && outcome.stats.unresolved == 0 && outcome.stats.dropped_requests == 0
+        && !["GOLDu", "GOLDd", "STITM", "SMTRA"].iter().any(|op| outcome.stats.ignored.contains_key(op))
+}
+
 /// The scenes of FF7 over an opened adapter.
 pub struct Ff7SceneHost {
     adapter: Arc<Ff7Adapter>,
@@ -84,6 +94,9 @@ impl SceneHost for Ff7SceneHost {
         let area = self.field(&def.field)?;
         let answers: Vec<usize> = answers.iter().map(|&a| usize::from(a)).collect();
         let outcome = run_to_end(area.field_file(), def, &story, seed, &answers).ok()?;
+        // Never advance or travel on a partial interpretation, or across an inventory/currency
+        // operation that the scene VM currently only displays without performing.
+        if !safe_outcome(&outcome) { return None; }
         let mut after = story.clone();
         let changed = outcome.writes.apply_to(&mut after);
         let mut summary = Vec::new();
@@ -95,7 +108,7 @@ impl SceneHost for Ff7SceneHost {
                 summary.push(format!("var[{bank}][{address}]={value}"));
             }
         }
-        let travel = outcome.jump.and_then(|jump| {
+        let travel = if let Some(jump) = outcome.jump {
             let target = self.adapter.field_key_for_id(jump.field)?;
             // Never send a real player to a field whose story has not been reviewed.
             if !fmv_ff7::is_reviewed_field(&target) { return None; }
@@ -106,7 +119,30 @@ impl SceneHost for Ff7SceneHost {
                 arrival_hint: u32::try_from(jump.triangle).ok(),
                 kind: fmv_adapter_api::ExitKind::Gateway,
             })
-        });
+        } else { None };
         Some(SceneResult { progress: after.encode(), changed, summary: summary.join(" "), travel })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fmv_ff7::script::{dialogue::End, scene::{Outcome, Stats, Writes}};
+
+    #[test]
+    fn incomplete_or_economic_scenes_cannot_advance_or_travel() {
+        let mut outcome = Outcome { end: End::Finished, windows: 0, writes: Writes::default(), jump: None, stats: Stats::default() };
+        assert!(safe_outcome(&outcome));
+        outcome.stats.ignored.insert("GOLDu", 1);
+        assert!(!safe_outcome(&outcome));
+        outcome.stats.ignored.clear();
+        outcome.stats.unknown.insert("GOLDd", 1);
+        assert!(!safe_outcome(&outcome));
+        outcome.stats.unknown.clear();
+        outcome.stats.unresolved = 1;
+        assert!(!safe_outcome(&outcome));
+        outcome.stats.unresolved = 0;
+        outcome.end = End::Budget;
+        assert!(!safe_outcome(&outcome));
     }
 }

@@ -474,7 +474,7 @@ impl World {
 
     /// Make sure area `key` is loaded, loading it from the area source if it is not. Returns the key
     /// the area is stored under (the adapter's own spelling).
-    fn ensure_area(&mut self, key: &str) -> Result<AreaKey, String> {
+    pub(super) fn ensure_area(&mut self, key: &str) -> Result<AreaKey, String> {
         if self.areas.contains_key(key) {
             return Ok(key.to_string());
         }

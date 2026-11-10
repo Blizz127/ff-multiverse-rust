@@ -20,8 +20,11 @@ transaction and its persistence need to be implemented before serving that branc
 
 The branch has an arrival-scene trigger and a scene jump through the ordinary area handshake.
 Scene jumps only resolve to reviewed fields, so `md8_1` remains closed until its transition and
-story are ready. Debug previews never save or perform a scene jump. A party member whose own phase
-cannot advance does not start an automatic scene; follower progression and travel need a design
-that preserves each account's own story before this route can be offered to parties. Echo-S uses a
+story are ready. The server refuses to apply incomplete interpretations or ignored item and gil
+operations, and preflights a destination before saving a scene's story change. Debug previews never
+save or perform a scene jump. An automatic scene is judged and saved against the entering player's
+own story, even when its field uses the party leader's phase. A member whose story has not reached
+the scene's moment is not advanced or teleported; how such a follower catches up remains unfinished.
+Echo-S uses a
 rewritten field script with different entity and window numbering, so scene presentation and
 watcher synchronization must be reconciled before claiming that scene dialogue and voices use it.

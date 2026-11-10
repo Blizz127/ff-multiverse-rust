@@ -481,9 +481,21 @@ impl World {
         for &e in &everyone {
             self.release(e, run, outcome, &mut failed);
         }
-        let result = if outcome == SceneOutcome::Aborted || !record.writes_story { None } else {
+        let mut result = if outcome == SceneOutcome::Aborted || !record.writes_story { None } else {
             self.scenes.host.as_ref().and_then(|host| host.finish(&record.scene, &record.progress, record.seed, &record.answers))
         };
+        // A story write must not strand a player when its required destination cannot load or
+        // place an arrival. The same loaded area and placement are used by start_travel below.
+        if !record.preview {
+            if let Some(exit) = result.as_ref().and_then(|result| result.travel.as_ref()) {
+                let valid = self.ensure_area(&exit.target).ok().and_then(|key| self.areas.get(&key))
+                    .is_some_and(|area| area.runtime().place_arrival(exit.arrival, exit.arrival_hint).is_finite());
+                if !valid {
+                    self.logs.warn(format!("scene destination unavailable scene={} target={}", clip(&record.scene, MAX_SCENE_ID_CHARS), clip(&exit.target, 128)));
+                    result = None;
+                }
+            }
+        }
         let story = if outcome == SceneOutcome::Aborted { "dropped" } else if !record.writes_story { "none (not the owner's phase)" } else if let Some(result) = &result {
             self.apply_scene_story(&record, result)
         } else { "none (the scene could not be run)" };
@@ -640,18 +652,16 @@ impl World {
         let Some(player) = self.players.get(&entity) else { return };
         if player.preview.is_some() || player.transit.is_some() || player.battle.is_some() || player.scene.is_some() { return; }
         let area = player.area.clone();
-        let writes_story = player.placement.as_ref().is_none_or(|p| p.story_advance_allowed);
-        // Until follower progression is reconciled, do not start an arrival scene that cannot
-        // advance or travel this player's own story.
-        if !writes_story { return; }
-        let progress = self.instance_progression(entity);
+        // Arrival scenes are private to this player, even when its shared field follows the
+        // party leader's phase. Judge and replay only the player's own story, never the leader's.
+        let progress = player.progression.clone();
         let Some(info) = self.scenes.list.iter().find(|info| info.field.eq_ignore_ascii_case(&area)
             && host.automatic(&info.id) && host.offered(&info.id, &progress)).cloned() else { return };
         let run = SceneRunId(self.scenes.next_run.max(1));
         self.scenes.next_run = run.0.saturating_add(1);
         let seed = u32::try_from(run.0.wrapping_mul(0x9E37_79B9) & 0xFFFF_FFFF).unwrap_or(1);
         let record = SceneRun { scene: info.id, owner: entity, watchers: vec![], seed, progress, answers: vec![], steps: 0,
-            started: now, last_activity: now, writes_story, preview: false };
+            started: now, last_activity: now, writes_story: true, preview: false };
         self.start_run(run, record, &mut Vec::new());
     }
 }
