@@ -11,8 +11,8 @@
 //!   clip follows only that move's elapsed time, and yields to the standing default when it arrives.
 //! * `Face` turns it (the short way round), at once or over the frames it says.
 //! * `Show` hides or shows it.
-//! * The player resolves supported `Anim` loops and explicit forward Holds against the actor's exact field model.
-//!   Loops and Hold ranges follow scene time; a Hold stops at its last frame until replaced. A bounded Once can
+//! * The player resolves supported `Anim` loops, full Holds and explicit forward Holds against the actor's exact field model.
+//!   Loops and Holds follow scene time; a Hold stops at its last frame until replaced. A bounded Once can
 //!   restart a separately remembered, different default slot after its inclusive range.
 //!   Other animations clear that loop and are counted ([`Counts::anims_skipped`]), never guessed at.
 //! * `Sound` is routed separately by the scene player to its cancellable audio channel.
@@ -184,7 +184,7 @@ impl Actor {
             if let Some(animation) = &mut self.animation {
                 let advancing = match &mut animation.frame {
                     ClipFrame::Loop(frame) => Some(frame),
-                    ClipFrame::HoldRange { elapsed, .. } => Some(elapsed),
+                    ClipFrame::HoldRange { elapsed, .. } | ClipFrame::HoldFull { elapsed } => Some(elapsed),
                     ClipFrame::Hold(_) => None,
                 };
                 if let Some(frame) = advancing { *frame += (frames - moving_frames).max(0.0); }
@@ -348,6 +348,15 @@ impl Cast {
         let elapsed = if overshoot.is_finite() { overshoot.max(0.0) } else { 0.0 };
         actor.movement_animation = None;
         actor.animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::HoldRange { first, last, elapsed }, once: false });
+    }
+
+    /// Play from frame zero and hold the actual loaded clip's last frame. Sampling resolves
+    /// the endpoint on the matching skeleton; this does not change the interpreter's waits.
+    pub fn apply_hold_full(&mut self, entity: u8, clip: &str, overshoot: f32) {
+        let Some(actor) = self.actors.get_mut(&entity) else { return self.off_cast() };
+        let elapsed = if overshoot.is_finite() { overshoot.max(0.0) } else { 0.0 };
+        actor.movement_animation = None;
+        actor.animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::HoldFull { elapsed }, once: false });
     }
 
     /// A bounded Once can return to a verified, different default slot. Same-slot phase

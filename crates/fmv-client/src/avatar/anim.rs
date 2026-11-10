@@ -32,6 +32,8 @@ pub enum ClipFrame {
     Hold(u8),
     /// A forward range that holds its last frame rather than looping past it.
     HoldRange { first: u8, last: u8, elapsed: f32 },
+    /// Play from frame zero through the loaded clip's actual last frame, then hold it.
+    HoldFull { elapsed: f32 },
 }
 
 impl ClipFrame {
@@ -44,6 +46,10 @@ impl ClipFrame {
                 if first > last || usize::from(last) >= frames { return None; }
                 let elapsed = if elapsed.is_finite() { elapsed.max(0.0) } else { 0.0 };
                 Some(f32::from(first) + elapsed.min(f32::from(last - first)))
+            }
+            Self::HoldFull { elapsed } => {
+                let elapsed = if elapsed.is_finite() { elapsed.max(0.0) } else { 0.0 };
+                Some(elapsed.min((frames - 1) as f32))
             }
         }
     }
@@ -163,6 +169,22 @@ impl Animator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_holds_use_the_loaded_endpoint_without_truncating_large_clips() {
+        for elapsed in [0.0, 0.5, 1000.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let frame = ClipFrame::HoldFull { elapsed };
+            assert_eq!(frame.in_clip(0), None);
+            assert_eq!(frame.in_clip(1), Some(0.0));
+        }
+        for elapsed in [-1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(ClipFrame::HoldFull { elapsed }.in_clip(300), Some(0.0));
+        }
+        assert_eq!(ClipFrame::HoldFull { elapsed: 256.5 }.in_clip(300), Some(256.5));
+        for elapsed in [299.0, 300.0, 1000.0, f32::MAX] {
+            assert_eq!(ClipFrame::HoldFull { elapsed }.in_clip(300), Some(299.0));
+        }
+    }
 
     #[test]
     fn npc_idle_loops_wrap_and_reset_for_a_new_clip_while_player_idle_stays_still() {

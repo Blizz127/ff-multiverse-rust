@@ -281,6 +281,13 @@ fn the_team_talk_is_the_cutscene_of_md1_1s_story_point_and_writes_its_step() {
     let jessie_skeleton = fmv_ff7::load_field_model(&mut characters, "axdc").unwrap();
     assert_eq!((jessie_clip.frame_count(), jessie_clip.bone_count()), (15, 21));
     assert!(jessie_skeleton.fits(&jessie_clip));
+    // The owned clip's endpoints are usable poses; this does not establish render timing.
+    for frame in [0, jessie_clip.frame_count() - 1] {
+        assert!(jessie_clip.frame(frame).is_some(), "Jessie's endpoint frame {frame} exists without wrapping");
+        let pose = jessie_skeleton.pose(&jessie_clip, frame).expect("Jessie's endpoint fits her retained skeleton");
+        assert_eq!(pose.len(), jessie_skeleton.bones.len());
+        assert!(pose.iter().flatten().all(|value| value.is_finite()), "Jessie's endpoint frame {frame} has a finite pose");
+    }
     // Who speaks: the windows' openers are the team (the survey: av_m, av_l, cl, ba).
     let mut play = ScenePlay::new(&f, &def, &StoryState::at(6), 1).unwrap();
     assert_eq!(play.animation_clip(3, 3), Some("bxic"));

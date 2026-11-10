@@ -1604,12 +1604,15 @@ restart after arrival, and freeze with dialogue. Normal-speed Holds support expl
 requested first frame, advance with scene time and remain on the requested last frame. Jessie uses `btce` frames 0–39
 in the ladder scene; her authored jump interrupts the range after its existing 15-frame wait. A single-frame Hold stays
 fixed, including Barret's `md8_4` frame 0 of `apfc`. The entire range must exist in the loaded clip; reversed or out-of-bounds
-ranges fall back without wrapping. Another animation, speed change or movement replaces the pose.
+ranges fall back without wrapping. Full normal-speed Holds start at frame 0 and stop at the actual loaded clip's last frame:
+Jessie's team-talk `ANIM!2` uses all 15 frames of `bxie` on her original `axdc` model, then retains its final pose.
+The full clip uses the same scene clock, dialogue pause and bounded cache; its endpoint is not limited to an eight-bit
+frame number. Another animation, speed change or movement replaces the pose. Missing or incompatible clips keep the usual fallback.
 A normal-speed bounded Once can also play while the actor stands, when its default animation is known and uses a different
 slot. Biggs's team-talk gesture uses `bxic` frames 10–19, then returns to slot 0, `acfe`. The default is retained separately
 from temporary Holds and gestures, including setup and resumed-scene state. Completion restarts the different default slot
 at frame 0 and advances it only by time after the gesture's inclusive range. Unsupported default loops or ASPED invalidate
-restoration until a supported default arrives. Unknown defaults, same-slot returns, full-clip Once/Hold, cropped loops and
+restoration until a supported default arrives. Unknown defaults, same-slot returns, full-clip Once, cropped loops and
 other rates keep the usual fallback; the exact original PC render-tick boundary remains unmeasured.
 Ordinary `MOVE` also resolves the same model's walk/run slot from the script's movement speed and field scale:
 slot 1 through three times the scale, slot 2 above it. Wedge's reactor approach uses slot 2 (`aaga`, 15 frames),

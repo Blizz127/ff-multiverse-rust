@@ -789,9 +789,33 @@ pub(crate) mod tests {
                 actor.scene_clip = Some(("range", ClipFrame::HoldRange { first, last, elapsed: 0.0 }));
                 assert_eq!(avatars.frame(&view, &stage, &[actor], 0.0).frame.models[0].positions, base.positions, "invalid range falls back before any pose is sampled");
             }
+            actor.scene_clip = Some(("range", ClipFrame::HoldFull { elapsed: 0.0 }));
+            let full_start = avatars.frame(&view, &stage, &[actor], 1.7).frame.models.remove(0);
+            assert_eq!(full_start.positions, base.positions, "a full Hold starts at frame zero");
+            assert!(std::sync::Arc::ptr_eq(&base.asset, &full_start.asset));
+            actor.scene_clip = Some(("range", ClipFrame::HoldFull { elapsed: 0.5 }));
+            let full_middle = avatars.frame(&view, &stage, &[actor], 0.0).frame.models.remove(0);
+            assert_ne!(full_middle.positions, full_start.positions, "fractional scene time advances inside the full clip");
+            assert_ne!(full_middle.positions, playing.positions, "the fractional pose lies before frame one");
+            assert_eq!(avatars.frame(&view, &stage, &[actor], 20.0).frame.models[0].positions, full_middle.positions, "render time cannot advance a full Hold");
+            actor.scene_clip = Some(("range", ClipFrame::Hold(3)));
+            let full_last = avatars.frame(&view, &stage, &[actor], 0.0).frame.models.remove(0);
+            assert_ne!(full_last.positions, last.positions, "the full clip reaches frame three beyond the cropped range");
+            for elapsed in [3.0, 4.0, 20.0, 1000.0] {
+                actor.scene_clip = Some(("range", ClipFrame::HoldFull { elapsed }));
+                for dt in [0.0, 0.1, 20.0] {
+                    let held = avatars.frame(&view, &stage, &[actor], dt).frame.models.remove(0);
+                    assert_eq!(held.positions, full_last.positions, "a full Hold keeps the loaded clip's actual last frame without wrapping");
+                    assert!(std::sync::Arc::ptr_eq(&base.asset, &held.asset), "full Hold playback retains the base mesh");
+                }
+            }
             actor.scene_clip = Some(("missing", ClipFrame::Loop(1.0)));
             let fallback = avatars.frame(&view, &stage, &[actor], 1.0).frame.models.remove(0);
             assert_eq!(fallback.positions, base.positions, "failed override keeps the normal scene pose");
+            assert!(std::sync::Arc::ptr_eq(&base.asset, &fallback.asset));
+            actor.scene_clip = Some(("missing", ClipFrame::HoldFull { elapsed: 1000.0 }));
+            let fallback = avatars.frame(&view, &stage, &[actor], 20.0).frame.models.remove(0);
+            assert_eq!(fallback.positions, base.positions, "a missing full Hold clip keeps the normal scene pose");
             assert!(std::sync::Arc::ptr_eq(&base.asset, &fallback.asset));
         }
     }

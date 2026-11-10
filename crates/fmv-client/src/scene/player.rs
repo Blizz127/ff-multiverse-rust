@@ -473,11 +473,17 @@ impl ScenePlayer {
     }
 
     fn apply_stage(cast: &mut Cast, source: &dyn SceneSource, event: &Stage, late: f32) {
-        // Supported forms have no guessed duration: a full default loop or an explicit Hold/Once range,
-        // on the script's own field model. Every other Anim clears an old override.
+        // Normal-rate presentation uses the script's own field model and loaded clip bounds:
+        // a full default loop, full Hold, or explicit Hold/Once range. Other forms clear an old override.
         if let Stage::Anim { entity, animation, how: AnimHow::Loop, first: None, last: None, speed: 16, divisor: 1 } = event {
             if let Some(clip) = source.animation_clip(*entity, *animation) {
                 cast.apply_loop(*entity, *animation, clip, late);
+                return;
+            }
+        }
+        if let Stage::Anim { entity, animation, how: AnimHow::Hold, first: None, last: None, speed: 16, divisor: 1 } = event {
+            if let Some(clip) = source.animation_clip(*entity, *animation) {
+                cast.apply_hold_full(*entity, clip, late);
                 return;
             }
         }
