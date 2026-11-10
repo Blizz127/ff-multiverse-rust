@@ -202,6 +202,8 @@ pub struct Stats {
     pub unknown: BTreeMap<&'static str, u32>,
     /// Threads parked in an idle loop.
     pub parked: u32,
+    /// Exact animation-only tails recognized after all other threads finished or parked in self-jumps.
+    pub quiescent_tails: u32,
     /// Requests that waited for a taken priority slot.
     pub queued: u32,
     /// Requests that could not be made (no such script, too many threads).
@@ -825,6 +827,28 @@ impl Vm {
         self.threads.iter().enumerate().filter(|(_, t)| t.state == State::Run).min_by_key(|(_, t)| (t.time, t.seq)).map(|(i, _)| i)
     }
 
+    /// A narrow, verified animation tail: CANIM2, WAIT, ANIME1, WAIT, JMPB to the first
+    /// instruction. Only finish when every other thread has ended or is parked at an
+    /// unconditional self-jump. In particular, a waiter or runnable thread can never be
+    /// skipped. This tail cannot change variables, request work or open a window.
+    fn quiescent_animation_tail(&self, script: &FieldScript<'_>, idx: usize) -> bool {
+        let Some(t) = self.threads.get(idx) else { return false };
+        let Code::Script { pc: start } = t.code else { return false };
+        let Some(code) = script.bytes().get(..script.layout().code_end) else { return false };
+        let mut pc = start;
+        for expected in [0xBB, 0x24, 0xA3, 0x24, 0x12] {
+            let Ok(ins) = decode_at(code, pc, 0) else { return false };
+            if ins.opcode != expected || (expected == 0x12 && ins.jump_target != Some(start)) { return false; }
+            pc = ins.end();
+        }
+        self.threads.iter().enumerate().all(|(i, t)| {
+            if i == idx || t.state == State::Done { return true; }
+            let State::Parked(_) = t.state else { return false };
+            let Code::Script { pc } = t.code else { return false };
+            decode_at(code, pc, 0).is_ok_and(|ins| ins.opcode == 0x12 && ins.jump_target == Some(pc))
+        })
+    }
+
     // ---- stage ------------------------------------------------------------------------------------------------
 
     fn emit(&mut self, time: u32, what: Stage) {
@@ -1446,6 +1470,10 @@ impl Vm {
         }
         loop {
             let Some(idx) = self.pick() else { return self.finish(End::Finished) };
+            if self.quiescent_animation_tail(script, idx) {
+                self.stats.quiescent_tails = self.stats.quiescent_tails.saturating_add(1);
+                return self.finish(End::Finished);
+            }
             if self.steps >= self.limits.steps {
                 return self.finish(End::Budget);
             }

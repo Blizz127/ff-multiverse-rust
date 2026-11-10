@@ -135,6 +135,30 @@ fn station_director_advances_the_post_escape_story() {
     assert_eq!(outcome.stats.unresolved, 0);
 }
 
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA); the train scene is not yet enabled"]
+fn train_director_finishes_after_its_authored_actor_work() {
+    let f = field("tin_1").expect("FMV_FF7_DATA and tin_1");
+    let mut def = fmv_ff7::script::scene::station_scene();
+    def.field = "tin_1".into();
+    def.trigger.entity = 17;
+    def.root = vec![Step::StartMain(17)];
+    def.setup = vec![ScriptRef::new(40, 0)];
+    for (member, entity) in def.cast.iter_mut().zip([30u8, 31, 33, 34, 35]) {
+        member.entity = entity;
+        member.start = None;
+    }
+    def.speakers = vec![("Cloud".into(), 30), ("Barret".into(), 31), ("Biggs".into(), 33), ("Jessie".into(), 34), ("Wedge".into(), 35)];
+    let outcome = run_to_end(&f, &def, &StoryState::at(48), 1, &[]).unwrap();
+    assert_eq!(outcome.end, End::Finished);
+    assert_eq!(outcome.windows, 2);
+    assert_eq!(outcome.writes.moment, Some(51));
+    assert_eq!(outcome.stats.quiescent_tails, 1);
+    assert_eq!(outcome.stats.unresolved, 0);
+    assert_eq!(outcome.stats.dropped_requests, 0);
+    assert!(outcome.stats.unknown.is_empty());
+}
+
 // ---- 1. the trigger is found -----------------------------------------------------------------
 
 #[test]

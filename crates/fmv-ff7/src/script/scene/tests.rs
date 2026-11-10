@@ -305,6 +305,24 @@ fn a_background_idle_loop_does_not_hold_the_scene_open() {
 }
 
 #[test]
+fn animation_tail_cannot_cut_off_other_work_or_a_waiter() {
+    let tail = vec![vec![0xBB, 1, 0, 0, 1], wait(1), vec![0xA3, 1, 1], wait(1), vec![0x12, 14]];
+    let section = script(vec![("background", vec![(1, tail.clone())]), ("speaker", vec![(1, vec![wait(20), message(0, 0)])]), ("parked", vec![(1, vec![idle()])])], texts(1));
+    let root = vec![Step::Start(ScriptRef::new(0, 1)), Step::Start(ScriptRef::new(1, 1)), Step::Start(ScriptRef::new(2, 1))];
+    let (beats, vm) = run_root(&section, root, &[]);
+    assert_eq!(dialogs_of(&beats), [0]);
+    assert_eq!(end_of(&beats), End::Finished);
+    assert_eq!(vm.stats().quiescent_tails, 1);
+    let section = script(vec![("background", vec![(1, tail)])], vec![]);
+    let mut limits = Limits::default();
+    limits.frames = 100;
+    let vm = Vm::new(SceneVars::new(StoryState::new_game(), &[]), 7, limits);
+    let (beats, vm) = run_with(&section, vec![Step::Await(ScriptRef::new(0, 1))], &[], vm);
+    assert_eq!(end_of(&beats), End::Budget, "a waiter must not be released while its script still loops");
+    assert_eq!(vm.stats().quiescent_tails, 0);
+}
+
+#[test]
 fn a_polling_loop_is_woken_by_the_change_it_waits_for() {
     // `poll` waits for Var[5][1] == 1 (a busy loop), then speaks; `setter` waits 30 frames and sets it.
     // L: IFUB Var[5][1] == 1 (true: fall into JMPF, which skips the loop-back; false: land on the JMPB back to L)

@@ -61,7 +61,10 @@ background animations and requests. It is not safe to commit the partial write o
 scene: identify the authored completion boundary before trying again. The unresolved read was a
 turn of entity 40 toward entity 31; running entity 40's initialization as setup supplies its
 authored position and removes that unresolved read. With that setup, the remaining live loop at
-the frame limit is entity 35's slot 6 animation loop; entities 40 and 41 are parked. These are
-exploratory runs, not proof that cutting those threads off preserves the full scene.
+the frame limit is entity 35's slot 6 animation loop; entities 40 and 41 are parked. A narrow VM
+rule recognizes that exact five-instruction animation-only cycle only when every other thread has
+finished or is parked at an unconditional self-jump; it refuses to end while any thread is runnable
+or waiting. A real-data regression exercises this director, and a synthetic check covers a later
+window and a script waiter. This does not prove audiovisual parity or make the scene playable.
 Stopping at Cloud's slot-3 return is not a valid shortcut: the trace still has other actors running
 at later virtual times, including Jessie, Biggs and Wedge.
