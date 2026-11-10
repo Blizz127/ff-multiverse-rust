@@ -222,4 +222,35 @@ impl World {
             }
         }
     }
+
+    /// A changed story may remove or add scene triggers without changing the area's phase.
+    /// Settle the affected accounts first, then refresh those that stayed in their instance.
+    /// Players that moved already received a snapshot from `settle`; party-only refreshes use
+    /// `refresh_placements` and do not generate this additional traffic.
+    pub(super) fn refresh_story_placements(&mut self, accounts: &BTreeSet<AccountId>, failed: &mut Vec<(EntityId, bool)>) {
+        let before: Vec<_> = accounts.iter().filter_map(|account| {
+            let entity = *self.by_account.get(account)?;
+            self.players.get(&entity).filter(|player| player.transit.is_none())?;
+            Some((entity, *account, self.instances.instance_of(*account)?))
+        }).collect();
+        self.refresh_placements(accounts, failed);
+        for (entity, account, instance) in before {
+            if self.instances.instance_of(account) != Some(instance) { continue; }
+            let Some(key) = self.instances.get(instance).map(|instance| instance.key().clone()) else { continue };
+            let Some(player) = self.players.get(&entity).filter(|player| player.transit.is_none() && player.area == key.area.key) else { continue };
+            if player.placement.as_ref().is_none_or(|placement| placement.key != key) { continue; }
+            // Eligibility follows this recipient's phase owner, not necessarily its own story.
+            let scene_npcs = self.scene_npcs(entity, &key.area.key);
+            let Some(area) = self.areas.get(&key.area.key) else { continue };
+            let mut npcs = area.cast(&key.phase);
+            npcs.extend(scene_npcs);
+            let snapshot = Arc::new(ServerMsg::AreaSnapshot {
+                area: area.id().clone(), tick: self.tick, entities: self.instance_entities(instance), npcs,
+            });
+            let Some(player) = self.players.get(&entity) else { continue };
+            if let Err(error) = player.tx.try_send(snapshot) {
+                failed.push((entity, is_full(&error)));
+            }
+        }
+    }
 }

@@ -1553,6 +1553,11 @@ for the long way, no unknown opcode (`tests/scene_real.rs`).
 
 ### What the server does (`fmv-server`, `world/scene.rs`)
 
+After a real or preview story write, affected players who stay in the same instance receive a fresh area snapshot.
+It carries the current player roster, ordinary NPCs and still-offered scene triggers, so a completed trigger disappears
+without leaving the area. A move to another instance already sends its snapshot. This refresh adds no story writes;
+preview progress stays in memory only.
+
 * **A scene run is held state, like a battle.** OK next to the trigger (a *scene NPC*: the server adds the trigger to the
   area's cast under an id from 1,000,000 while the scene is on offer; Tifa is a party member's entity, which the server
   never announces as an NPC) starts it for that player: the scene has to be on offer for the story of the account whose phase
@@ -1742,8 +1747,6 @@ ranks the floor for them. The pictures contain game art: they stay out of the re
   326,525 slots of 702 fields run as scene roots in 6 s with no panic and every one ending (`tests/scene_real.rs`).
 * **Scene data is keyed by the original field's entity numbers.** A replacement script section (a text or voice mod's) has other
   numbers in about 700 fields; entity names are kept, so resolving by name is the way when such a layer is wired in.
-* **After a scene that changes the story the area's NPC list is not re-sent** unless the player changes instance, so a trigger
-  that should be gone can still be drawn; the server refuses the press.
 * Scenes are Rust data (six today), not files.
 **Protocol v17 (the commander of the canon pair)** adds one optional field to the battle roster, `BattleMember::commander`
 (an account, for a canon companion only; absent from the JSON when the server commands the companion, so that a roster

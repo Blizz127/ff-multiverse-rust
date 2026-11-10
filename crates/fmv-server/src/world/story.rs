@@ -204,7 +204,7 @@ impl World {
         if let Some(party) = self.parties.party_of(account) {
             accounts.extend(party.members.iter().copied());
         }
-        self.refresh_placements(&accounts, &mut failed);
+        self.refresh_story_placements(&accounts, &mut failed);
         self.drop_failed(failed);
     }
 

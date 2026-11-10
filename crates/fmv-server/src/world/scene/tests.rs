@@ -1,5 +1,6 @@
 //! Tests of the story scenes in the world, over the FIXTURE rooms and a fake [`SceneHost`] (no game data).
 
+use std::collections::BTreeSet;
 use std::sync::Mutex;
 
 use fmv_adapter_api::GameAdapter;
@@ -418,6 +419,31 @@ fn world() -> (World, mpsc::UnboundedReceiver<Msg>, Arc<FakeHost>) {
     world_with(false, false)
 }
 
+/// These rooms intentionally keep one phase for different stories, as a field can when
+/// its walkable layout is unchanged. The ordinary rooms instead use each blob as its phase.
+struct FixedPhaseRooms;
+struct FixedPhaseRoom(Box<dyn fmv_adapter_api::AreaRuntime>);
+
+impl GameAdapter for FixedPhaseRooms {
+    fn game(&self) -> fmv_core::GameId { RoomsAdapter::new().game() }
+    fn list_areas(&self) -> Vec<fmv_adapter_api::AreaInfo> { RoomsAdapter::new().list_areas() }
+    fn load_area(&self, key: &str) -> Result<Box<dyn fmv_adapter_api::AreaRuntime>, fmv_adapter_api::AdapterError> {
+        Ok(Box::new(FixedPhaseRoom(RoomsAdapter::new().load_area(key)?)))
+    }
+}
+
+impl fmv_adapter_api::AreaRuntime for FixedPhaseRoom {
+    fn info(&self) -> &fmv_adapter_api::AreaInfo { self.0.info() }
+    fn spawn_points(&self) -> Vec<Pos> { self.0.spawn_points() }
+    fn validate_move(&self, from: Pos, to: Pos) -> fmv_adapter_api::MoveResult { self.0.validate_move(from, to) }
+    fn bounds(&self) -> fmv_adapter_api::Bounds { self.0.bounds() }
+    fn walk_triangles(&self) -> Vec<[Pos; 3]> { self.0.walk_triangles() }
+    fn max_speed(&self) -> f32 { self.0.max_speed() }
+    fn exits(&self) -> Vec<fmv_adapter_api::Exit> { self.0.exits() }
+    fn npcs(&self) -> Vec<fmv_adapter_api::NpcSpawn> { self.0.npcs() }
+    fn phase_key(&self, _progress: &[u8]) -> Option<fmv_core::PhaseKey> { Some(fmv_core::PhaseKey::default()) }
+}
+
 fn seat(w: &mut World, name: &str, progression: &[u8], now: Instant) -> Seat {
     let (session, entity) = w.allocate_ids();
     let (tx, rx) = mpsc::channel(256);
@@ -630,6 +656,7 @@ fn a_party_member_out_of_range_or_not_there_does_not_watch() {
 #[test]
 fn when_the_owner_finishes_everyone_is_released_and_the_story_write_is_applied_once_and_saved() {
     let (mut w, mut saved_rx, host, mut a, mut b, now) = two_at_the_trigger();
+    let old_instance = w.instance_of(a.account);
     w.press(a.entity, Some(trigger_id()), now);
     a.drain();
     b.drain();
@@ -637,8 +664,16 @@ fn when_the_owner_finishes_everyone_is_released_and_the_story_write_is_applied_o
     w.scene_message(a.entity, ClientMsg::SceneStep { run, step: 0, answer: Some(2) }, now);
     w.scene_message(a.entity, ClientMsg::SceneEnd { run, skipped: false }, now);
     // released, told how it ended
-    assert_eq!(ends(&a.drain()), [SceneOutcome::Finished]);
-    assert_eq!(ends(&b.drain()), [SceneOutcome::Finished]);
+    let a_msgs = a.drain();
+    let b_msgs = b.drain();
+    assert_eq!(ends(&a_msgs), [SceneOutcome::Finished]);
+    assert_eq!(ends(&b_msgs), [SceneOutcome::Finished]);
+    assert_ne!(w.instance_of(a.account), old_instance, "this fixture's changed blob changes its instance");
+    assert_eq!(w.instance_of(a.account), w.instance_of(b.account));
+    for msgs in [&a_msgs, &b_msgs] {
+        assert_eq!(msgs.iter().filter(|msg| matches!(msg, ServerMsg::AreaSnapshot { .. })).count(), 1,
+            "the instance transition sends its own snapshot, without a story-refresh duplicate");
+    }
     assert!(!w.in_scene(a.entity) && !w.in_scene(b.entity) && w.scene_count() == 0);
     // the owner's story moved once: the mirror, the saver, the log
     assert_eq!(saved(&mut saved_rx), [vec![5u8]], "saved once, as the host said");
@@ -778,7 +813,79 @@ fn a_member_in_its_leaders_phase_owns_a_scene_that_writes_nothing() {
     b.drain();
     w.scene_message(b.entity, ClientMsg::SceneEnd { run: SceneRunId(1), skipped: false }, now);
     assert!(saved(&mut saved_rx).is_empty() && host.finished.lock().unwrap().is_empty());
-    assert_eq!(ends(&b.drain()), [SceneOutcome::Finished]);
+    let a_msgs = a.drain();
+    let b_msgs = b.drain();
+    assert_eq!(ends(&b_msgs), [SceneOutcome::Finished]);
+    assert!(a_msgs.iter().chain(&b_msgs).all(|msg| !matches!(msg, ServerMsg::AreaSnapshot { .. })),
+        "a read-only run has no changed story and does not refresh the cast");
+}
+
+#[test]
+fn same_instance_story_changes_refresh_party_triggers_without_reentry_for_real_and_preview() {
+    for is_preview in [false, true] {
+        let mut now = Instant::now();
+        let adapter: Arc<dyn GameAdapter> = Arc::new(FixedPhaseRooms);
+        let mut w = World::with_party_config(adapter.load_area(HALL).unwrap(), PartyConfig::default()).unwrap();
+        w.set_area_source(adapter);
+        let (handle, mut saved_rx) = SaverHandle::channel();
+        w.set_progress_saver(handle);
+        let host = Arc::new(FakeHost::default());
+        w.configure_scenes(Some(SceneSettings { host: host.clone(), debug_preview: is_preview, debug_new_story: None }));
+        let mut a = seat(&mut w, "A", &[], now);
+        let mut b = seat(&mut w, "B", &[3], now);
+        let mut other = seat(&mut w, "Other", &[], now);
+        party(&mut w, &a, &b, now);
+        let mut ordinary = None;
+        for s in [&mut a, &mut b, &mut other] {
+            let arrived = if is_preview { preview(&mut w, s, now) } else { into_the_yard(&mut w, s, &mut now) };
+            let cast = arrived.into_iter().find_map(|msg| match msg {
+                ServerMsg::AreaSnapshot { npcs, .. } => Some(npcs), _ => None,
+            }).expect("the arrival announced its cast");
+            assert_eq!(cast.iter().filter(|npc| npc.id >= SCENE_NPC_ID_BASE).count(), 1);
+            let base: Vec<_> = cast.into_iter().filter(|npc| npc.id < SCENE_NPC_ID_BASE).collect();
+            assert_eq!(base.len(), 1, "the yard guard is an ordinary NPC");
+            if let Some(expected) = &ordinary { assert_eq!(&base, expected); } else { ordinary = Some(base); }
+            if !is_preview { assert_eq!(go(&mut w, s, 150.0, -100.0, &mut now), MoveOutcome::Applied); }
+        }
+        let ordinary = ordinary.unwrap();
+        let instance = w.instance_of(a.account).unwrap();
+        assert_eq!(w.instance_of(b.account), Some(instance));
+        let roster: Vec<_> = [&a, &b, &other].into_iter().filter(|s| w.instance_of(s.account) == Some(instance))
+            .map(|s| (s.entity, w.players[&s.entity].snapshot.pos)).collect();
+        let member_progress = w.players[&b.entity].progression.clone();
+        a.drain(); b.drain(); other.drain();
+        w.press(a.entity, Some(trigger_id()), now);
+        assert_eq!(starts(&a.drain())[0].1, SceneRole::Owner);
+        assert_eq!(starts(&b.drain())[0].1, SceneRole::Watcher);
+        let run = SceneRunId(1);
+        w.scene_message(a.entity, ClientMsg::SceneEnd { run, skipped: false }, now);
+        for msgs in [a.drain(), b.drain()] {
+            assert_eq!(ends(&msgs), [SceneOutcome::Finished]);
+            let snapshots: Vec<_> = msgs.iter().filter_map(|msg| match msg {
+                ServerMsg::AreaSnapshot { area, entities, npcs, .. } => Some((area, entities, npcs)), _ => None,
+            }).collect();
+            assert_eq!(snapshots.len(), 1, "one fresh cast for an unchanged instance");
+            let (area, entities, npcs) = snapshots[0];
+            assert_eq!(area.key, YARD);
+            assert_eq!(npcs, &ordinary, "only the completed trigger leaves; ordinary IDs, positions and models stay");
+            assert_eq!(entities.iter().map(|entity| (entity.id, entity.pos)).collect::<Vec<_>>(), roster,
+                "a full current roster preserves peers and their positions");
+            assert!(msgs.iter().all(|msg| !matches!(msg, ServerMsg::PlayerJoined { .. } | ServerMsg::PlayerLeft { .. }
+                | ServerMsg::AreaChange { .. } | ServerMsg::InstancePlacement { .. })), "no manufactured movement or membership event");
+        }
+        assert_eq!((w.instance_of(a.account), w.instance_of(b.account)), (Some(instance), Some(instance)));
+        assert_eq!(w.players[&b.entity].progression, member_progress, "watching never advances the member's own story");
+        assert_eq!(w.players[&a.entity].progression, if is_preview { vec![9, 5] } else { vec![5] });
+        assert_eq!(saved(&mut saved_rx), if is_preview { vec![] } else { vec![vec![5u8]] }, "preview never queues a save; real story queues the owner once");
+        assert_eq!(host.finished.lock().unwrap().len(), 1);
+        assert!(other.drain().is_empty(), "an unrelated player gets no refresh or scene traffic");
+        assert_eq!(w.scene_npcs(other.entity, &YARD.to_string()).len(), 1, "the unrelated player's trigger remains eligible");
+        assert!(w.scene_npcs(b.entity, &YARD.to_string()).is_empty(), "the member sees its phase owner's completed story");
+        let mut failed = Vec::new();
+        w.refresh_placements(&BTreeSet::from([a.account, b.account, other.account]), &mut failed);
+        assert!(failed.is_empty() && a.drain().is_empty() && b.drain().is_empty() && other.drain().is_empty(),
+            "an ordinary unchanged placement refresh stays quiet");
+    }
 }
 
 // ---- battles ---------------------------------------------------------------------------------------------
