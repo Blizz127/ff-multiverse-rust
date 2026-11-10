@@ -690,6 +690,28 @@ fn debug_new_story_queues_its_baseline_before_the_player_can_start_a_scene() {
 }
 
 #[test]
+fn debug_new_story_does_not_initialize_an_empty_coherent_token_login() {
+    let (mut w, mut queue, _host) = world();
+    w.scenes.debug_new_story = Some(MADE_UP.to_vec());
+    let account = AccountId(123);
+    let (mut new, _rx) = reconnect(&mut w, account, &[]);
+    let entity = new.entity;
+    let state = fmv_persist::SceneState {
+        pair: fmv_persist::ProgressPair {
+            story: fmv_persist::Progression::new(account, w.home_game(), Vec::new(), 0),
+            character: None,
+        },
+        checkpoint: None,
+        reservation: None,
+    };
+    new.scene_state = Some(state.clone());
+    new.scene_group = vec![state];
+    w.join(new, Instant::now()).unwrap();
+    assert!(w.players.get(&entity).unwrap().progression.is_empty());
+    assert!(queue.try_recv().is_err(), "a token login never queues a new-account baseline");
+}
+
+#[test]
 fn debug_new_story_refuses_admission_if_its_configured_saver_has_stopped() {
     let (mut w, queue, _host) = world();
     w.scenes.debug_new_story = Some(MADE_UP.to_vec());

@@ -279,7 +279,7 @@ mod tests {
 
     #[test]
     fn scenes_require_the_new_protocol() {
-        assert_eq!(crate::PROTOCOL_VERSION, 20);
+        assert_eq!(crate::PROTOCOL_VERSION, 21);
     }
 
     #[test]

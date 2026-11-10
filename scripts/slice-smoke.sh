@@ -8,11 +8,11 @@
 #   (1) a persistent ORIGINAL player character with a saved identity (name, colour, body choice);
 #   (2) multiplayer party membership (two players party up and fight one shared battle);
 #   (3) the canon party FIGHTS BESIDE the players and nobody is replaced (v9): every battle's party is the story's canon
-#       party first, Cloud and Barret, commanded by the party leader's bot (the server's --companions-player-commanded, on by
+#       party first, Cloud alone before moment 11, commanded by the party leader's bot (the server's --companions-player-commanded, on by
 #       default; by the SERVER with it off) with ordinary commands every client replays and verifies
 #       (`companion acted battle=.. actor=.. name=Cloud command=..`), and then the players, each with the stat curve
 #       (its "fighting style", here Barret's and Tifa's curves) of its character and its own body (a generic placeholder
-#       body) in the field; the canon Barret is no longer a field NPC (he is in the party), and talking to the field's
+#       body) in the field; PC-bound actors are excluded from the ambient NPC list, and talking to the field's
 #       characters is the canon dialogue, never name-swapped;
 #   (4) per-player story progress (sw-story: the story blob of each account, and the phase it puts a player in);
 #   (5) a world-specific appearance binding: how FF7 draws each character, stored per game and independent of the slot.
@@ -26,18 +26,18 @@
 #   A invites B while they still see each other, walks onto md1stin's story point and advances its story (the server
 #   validates it from A's moves), which puts A in another phase instance than B; B then accepts and the party puts it
 #   in A's instance; the party fights ONE shared battle (formation 12 of the game's own data, a debug request: md1stin's
-#   own 301-303 end before both players have had a turn beside the canon pair) that
+#   own 301-303 are shorter fights; this formation gives both players room to act beside Cloud) that
 #   both win, each replaying it from its own scene.bin/kernel.bin ("verified by replay"). Both also talk to the
 #   field's guard through the client's own conversation code. The run checks:
 #     * the Welcome card of each player says what was asked (name, colour, body, binding `ff7/body/<body>`, slot);
 #     * each player SEES the other's binding (the placeholder body) and nothing in it is a canon model;
 #     * the battle roster is the canon party first and then the players: the server's "battle started" line says
-#       names=[Cloud,Barret,Aria%20Vale,Brom] characters=[0, 1, 1, 2] companions=2 (the two canon members and the two
+#       names=[Cloud,Aria%20Vale,Brom] characters=[0, 1, 2] companions=1 (Cloud and the two
 #       players' own names with their stat curves), the clients' own `battle: roster` lines say the same (each with its
 #       controller, companion or player), and the log lines of what a player did carry name=<its own name>; the
-#       companions acted (`companion acted` lines naming Cloud and Barret) through commands every client replayed, so
+#       companion acted (`companion acted` lines naming Cloud) through commands every client replayed, so
 #       the battle verified by replay with 0 divergences, and the rewards went to the two players only;
-#     * md1stin's field shows no canon Barret NPC for either player (he is in the party now), the guards are there,
+#     * md1stin's ambient NPC list excludes the PC-bound Barret actor for either player, the guards are there,
 #       and both players see the same NPCs; the guard's dialogue is the game's own text (origin=canon), identical for
 #       both and without either player's name;
 #     * story: exactly one advance (A's, 1->6), saved as 010600 in A's story blob, none stored for B; the view of each
@@ -53,7 +53,7 @@
 #   advanced to while B is in the default one, so they do NOT see each other; and after stopping that server every
 #   persisted record (characters/, avatars/, accounts/, progression/) is byte for byte what it was after session 1:
 #   a login rewrites nothing. Session 2b: B catches up (its own story advance) and the two fight again on the
-#   restarted server: it fights them beside the canon Cloud and Barret (characters=[0, 1, 1, 2], companions first) with
+#   restarted server: it fights them beside Cloud (characters=[0, 1, 2], the companion first) with
 #   their own names, at the levels and stored limit gauges session 1 left, and the identity, binding, slot and pointers of
 #   both records are unchanged.
 #
@@ -101,8 +101,8 @@ PROFILE=debug
 LIBRARY="${FMV_FF7_LIBRARY:-$HOME/.local/share/ff-multiverse}"
 SLICE_DURATION=60
 SESSION2_DURATION=8
-# Formation 12 of the game's own data (two enemies, escapable): the canon Cloud and Barret kill md1stin's own 301-303 in about
-# a hundred ticks, before every player has had a turn, and this slice needs both players to act (see battle-smoke.sh).
+# Formation 12 of the game's own data (two enemies, escapable) gives both players room to act beside Cloud.
+# This slice keeps the opening story: both the initial state and moment 6 have Cloud alone, before Barret joins at 11.
 FORMATION=12
 TICK_RATE=240
 BATTLE_SPEED=0
@@ -147,7 +147,7 @@ Usage: scripts/slice-smoke.sh [--release|--debug] [--bin-dir DIR] [--build] [--l
 
 The foundations slice over real processes and the owner's real FF7 data (protocol v10): two headless
 players with different identities and fighting styles register, party up, advance one story and fight one shared
-battle on md1stin beside the canon Cloud and Barret, whom the leader's bot commands (session 1's server runs with the DEBUG
+battle on md1stin beside Cloud, whom the leader's bot commands (session 1's server runs with the DEBUG
 bonus --debug-bonus-exp, so that both new characters level up); the server is stopped and started again as a new
 process (without the bonus) on the same state directory; the same two players log in and must be told exactly
 what they ended with, every persisted record must be byte for byte unchanged, and a second battle must use what
@@ -617,7 +617,7 @@ run_slice() {
   # ------------------------------------------------------------------------------------------------------------
   start_slice_server 0 "$WORK/s1-server.log" --debug-bonus-exp "$BONUS_EXP"
   local port="${ADDR##*:}"
-  say "session 1 (the server has the DEBUG experience bonus: +$BONUS_EXP experience per win): players A ($NAME_A, body $BODY_A, stat curve $SLOT_NAME_A's) and B ($NAME_B, body $BODY_B, stat curve $SLOT_NAME_B's) register, party up, advance a story and fight beside the canon Cloud and Barret (${SLICE_DURATION}s)"
+  say "session 1 (the server has the DEBUG experience bonus: +$BONUS_EXP experience per win): players A ($NAME_A, body $BODY_A, stat curve $SLOT_NAME_A's) and B ($NAME_B, body $BODY_B, stat curve $SLOT_NAME_B's) register, party up, advance a story and fight beside Cloud (${SLICE_DURATION}s)"
   start_player A r1 "$SLICE_DURATION" --tint "$TINT_A" --body "$BODY_A" --slot "$SLOT_A" --talk gu0 \
     --story-advance --party-invite-first-peer --battle-auto --debug-encounters --battle-wait-party 2
   start_player B r1 "$SLICE_DURATION" --tint "$TINT_B" --body "$BODY_B" --slot "$SLOT_B" --talk gu0 \
@@ -713,36 +713,34 @@ run_slice() {
   done
   [[ -n ${ids[0]} && ${ids[0]} == "${ids[1]}" ]] || problem "the players did not enter the same battle (A: '${ids[0]}', B: '${ids[1]}')"
 
-  # The roster: the canon party (Cloud and Barret, commanded by the leader's bot) first, then the two players with their own
+  # The roster: Cloud (the opening party, commanded by the leader's bot) first, then the two players with their own
   # names and their stat curves, on the server and in each client: nobody is replaced.
   local started
   started=$(first_line_with "$sl" "battle started" || true)
   started=$(strip_ansi "$started")
-  [[ $started == *"members=2"* && $started == *"companions=2"* ]] || problem "the server's battle did not have two players and the two canon companions: $started"
-  [[ $started == *"names=[Cloud,Barret,$enc_a,$enc_b]"* || $started == *"names=[Cloud,Barret,$enc_b,$enc_a]"* ]] || problem "the server's roster is not Cloud, Barret and then the two players: $started"
-  [[ $started == *"characters=[0, 1, "* ]] || problem "the canon pair is not first in the server's roster (characters=[0, 1, ..]): $started"
+  [[ $started == *"members=2"* && $started == *"companions=1"* ]] || problem "the server's battle did not have two players and Cloud: $started"
+  [[ $started == *"names=[Cloud,$enc_a,$enc_b]"* || $started == *"names=[Cloud,$enc_b,$enc_a]"* ]] || problem "the server's roster is not Cloud and then the two players: $started"
+  [[ $started == *"characters=[0, "* ]] || problem "Cloud is not first in the server's roster (characters=[0, ..]): $started"
   local want_pairs want_triples want_controllers
-  want_pairs=$(sorted_words_text "Cloud:0" "Barret:1" "$enc_a:$SLOT_A" "$enc_b:$SLOT_B")
-  want_triples=$(sorted_words_text "Cloud:0:Cloud" "Barret:1:Barret" "$enc_a:$SLOT_A:$SLOT_NAME_A" "$enc_b:$SLOT_B:$SLOT_NAME_B")
-  want_controllers=$(sorted_words_text "Cloud:companion" "Barret:companion" "$enc_a:player" "$enc_b:player")
-  expect_equal "the server's roster (battle started: Cloud and Barret, then each player's own name with its stat curve)" "$(roster_pairs "$started")" "$want_pairs"
+  want_pairs=$(sorted_words_text "Cloud:0" "$enc_a:$SLOT_A" "$enc_b:$SLOT_B")
+  want_triples=$(sorted_words_text "Cloud:0:Cloud" "$enc_a:$SLOT_A:$SLOT_NAME_A" "$enc_b:$SLOT_B:$SLOT_NAME_B")
+  want_controllers=$(sorted_words_text "Cloud:companion" "$enc_a:player" "$enc_b:player")
+  expect_equal "the server's roster (battle started: Cloud, then each player's own name with its stat curve)" "$(roster_pairs "$started")" "$want_pairs"
   for n in A B; do
     expect_equal "client $n's roster lines (name, stat curve, its name, of every fighter)" "$(roster_triples "$WORK/r1-client-$n.log")" "$want_triples"
     expect_equal "client $n's roster lines (who commands each fighter)" "$(roster_controllers "$WORK/r1-client-$n.log")" "$want_controllers"
   done
-  # The canon companions really fought, through commands the server applied and every client replayed (the battle is
-  # "verified by replay" with 0 divergences above): both gave commands under their own names.
-  local companion_name
-  for companion_name in Cloud Barret; do
-    (($(count_lines_with "$sl" "companion acted battle=1 actor=") >= 1)) && log_has "$sl" " name=$companion_name command=" || problem "the canon $companion_name never acted ('companion acted ... name=$companion_name command=..' in the server log)"
-  done
+  # Cloud really fought, through commands the server applied and every client replayed (the battle is
+  # "verified by replay" with 0 divergences above): at least one command is logged under his own name.
+  (($(count_lines_with_both "$sl" "companion acted battle=1 actor=" " name=Cloud command=") >= 1)) ||
+    problem "Cloud never acted ('companion acted ... name=Cloud command=..' in the server log)"
   local ended_line
   ended_line=$(first_line_with "$sl" "battle ended" || true)
   ended_line=$(strip_ansi "$ended_line")
-  [[ $(companions_of "$ended_line") == 2 ]] || problem "the server's battle-end line does not say companions=2: $ended_line"
+  [[ $(companions_of "$ended_line") == 1 ]] || problem "the server's battle-end line does not say companions=1: $ended_line"
   local -a companion_counts=()
   read -r -a companion_counts <<<"$(companion_commands_of "$ended_line")"
-  ((${#companion_counts[@]} == 2 && companion_counts[0] + companion_counts[1] >= 2)) || problem "the canon companions gave fewer than two commands in all (commands=[..] of the end line: $ended_line)"
+  ((${#companion_counts[@]} == 1 && companion_counts[0] >= 1)) || problem "Cloud gave no command (commands=[..] of the end line: $ended_line)"
   local -a player_counts=()
   read -r -a player_counts <<<"$(commands_of "$ended_line")"
   ((${#player_counts[@]} == 2 && player_counts[0] >= 1 && player_counts[1] >= 1)) || problem "both players should have given a command in a fight beside the canon party (commands per player: ${player_counts[*]:-none}): $ended_line"
@@ -756,15 +754,15 @@ run_slice() {
     [[ $acted == *" name=$enc_a"* || $acted == *" name=$enc_b"* ]] || problem "a battle action line does not name the player: $acted"
   done
 
-  # The canon Barret is in the PARTY now and no longer a character of the field (the field shows only the leader the player
-  # controls): md1stin's NPCs are exactly the data's, the guards, the same for both players, with no Barret among them.
+  # Ambient NPC extraction excludes every PC-bound actor, independently of current battle-party membership.
+  # md1stin's guards are the same for both players, with no ambient Barret actor among them.
   local npcs_a npcs_b
   npcs_a=$(npc_lines "$la" "$AREA")
   npcs_b=$(npc_lines "$lb" "$AREA")
   if [[ -z $npcs_a ]]; then
     problem "client A reported no NPC of md1stin at all (it prints 'headless: npc area=$AREA ...' lines)"
   else
-    [[ $npcs_a != *"name=Barret"* && $npcs_a != *"model=acgd"* ]] || problem "md1stin still shows a canon Barret NPC (he is in the battle party now): $npcs_a"
+    [[ $npcs_a != *"name=Barret"* && $npcs_a != *"model=acgd"* ]] || problem "md1stin unexpectedly includes the PC-bound Barret actor as an ambient NPC: $npcs_a"
   fi
   expect_equal "A and B see the same NPCs in md1stin" "$npcs_a" "$npcs_b"
   [[ $npcs_a == *"name=gu0 "* && $npcs_a == *"name=gu1 "* ]] || problem "the guards of md1stin are not in the NPC list any more: $npcs_a"
@@ -912,8 +910,8 @@ run_slice() {
   local started2
   started2=$(first_line_with "$s3" "battle started" || true)
   started2=$(strip_ansi "$started2")
-  expect_equal "the restarted server's roster (Cloud and Barret, then each player's own name with its stat curve)" "$(roster_pairs "$started2")" "$want_pairs"
-  [[ $started2 == *"members=2"* && $started2 == *"companions=2"* ]] || problem "the restarted server's battle did not have two players and the two canon companions: $started2"
+  expect_equal "the restarted server's roster (Cloud, then each player's own name with its stat curve)" "$(roster_pairs "$started2")" "$want_pairs"
+  [[ $started2 == *"members=2"* && $started2 == *"companions=1"* ]] || problem "the restarted server's battle did not have two players and Cloud: $started2"
   for n in A B; do
     expect_equal "after the restart client $n's roster lines" "$(roster_triples "$WORK/r3-client-$n.log")" "$want_triples"
     expect_equal "after the restart client $n's roster lines (who commands each fighter)" "$(roster_controllers "$WORK/r3-client-$n.log")" "$want_controllers"
@@ -993,7 +991,7 @@ run_slice() {
     say "session 1 -> restart, player $n: ${LEVEL_UPS[$n]}"
   done
   RESULT=pass
-  say "PASS: two original characters (distinct identities, bodies and stat curves) partied up, advanced a story and won a shared battle BESIDE the canon Cloud and Barret, whom the leader's bot commanded and every client replayed (0 divergences): the roster was Cloud, Barret and then the two players by their own names, nobody replaced, the rewards went to the players only and no canon Barret stands in the field any more; the dialogue was the game's own; session 1's server (with the DEBUG experience bonus) made both LEVEL UP and after a REAL server restart every card, record, level, experience, gil, AP, stored limit gauge, inventory and story was exactly what it was ($CARRIED), the records were byte for byte unchanged by a login, a second battle (on servers without the bonus) paid on top of what was saved to the point and started with the saved levels, and the restarted server fought them as their stat curves; $state_real unchanged ($after)."
+  say "PASS: two original characters (distinct identities, bodies and stat curves) partied up, advanced a story and won a shared battle BESIDE Cloud, whom the leader's bot commanded and every client replayed (0 divergences): the roster was Cloud and then the two players by their own names, nobody replaced, the rewards went to the players only and the ambient NPC list excluded PC-bound actors; the dialogue was the game's own; session 1's server (with the DEBUG experience bonus) made both LEVEL UP and after a REAL server restart every card, record, level, experience, gil, AP, stored limit gauge, inventory and story was exactly what it was ($CARRIED), the records were byte for byte unchanged by a login, a second battle (on servers without the bonus) paid on top of what was saved to the point and started with the saved levels, and the restarted server fought them as their stat curves; $state_real unchanged ($after)."
 }
 
 main() {

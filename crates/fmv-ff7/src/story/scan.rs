@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use fmv_core::Pos;
 
 use super::{
-    compare_parts, guards_of, moment_compare, tracked_var, var_of, Cmp, Cond, Effect, Op, PointDef, Trigger, COMPARES, MOMENT_ADDRESS,
+    compare_parts, guards_of, moment_compare, tracked_var, var_of, Cmp, Cond, Effect, Op, PointDef, PointSource, Trigger, COMPARES, MOMENT_ADDRESS,
     MOMENT_BANK,
 };
 use crate::field::Walkmesh;
@@ -131,6 +131,7 @@ struct Write {
 pub(super) fn scan_points(script: &FieldScript, mesh: &Walkmesh) -> Vec<PointDef> {
     let players: BTreeSet<usize> = script.player_entities().into_iter().map(|(entity, _)| entity).collect();
     let triangle_vars = player_triangle_vars(script, &players);
+    let triangle_sources = player_triangle_sources(script, &players);
     let (mut triangles, mut lines, mut enters, mut panels) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for entity in 0..script.entity_count() {
         let Ok(listing) = script.disassemble_partial(entity, INIT_SCRIPT) else { continue };
@@ -140,8 +141,33 @@ pub(super) fn scan_points(script: &FieldScript, mesh: &Walkmesh) -> Vec<PointDef
             None => (code, &[][..]),
         };
         let ctx = Ctx { script, mesh, triangle_vars: &triangle_vars, constants: init_constants(init), line: line_of(init) };
-        let mut found = points_of(&events(init, Part::Init, &ctx));
-        found.extend(points_of(&events(main, Part::Main, &ctx)));
+        let source = |slot, start_offset, setup| PointSource { entity, slot, start_offset, setup, triangle_vars: Vec::new(), triangle_sources: Vec::new() };
+        let attach = |mut points: Vec<PointDef>, source: PointSource, code: &[Instruction]| {
+            for point in &mut points {
+                let mut source = source.clone();
+                if let Trigger::Triangle { triangle, .. } = point.trigger {
+                    let inputs: BTreeSet<_> = code.iter().filter(|guard| triangle_test(guard, &ctx) == Some(triangle))
+                        .filter_map(compare_parts).flat_map(|(left, right, _)| [left, right])
+                        .filter(|operand| operand.bank != 0 && ctx.triangle_vars.contains(&var_of(operand)))
+                        .map(var_of).collect();
+                    // One authoritative trigger establishes one input. Multiple PC read-backs
+                    // must not all be guessed to have the same triangle.
+                    if inputs.len() == 1 {
+                        for input in inputs {
+                            if let Some(&actor) = triangle_sources.get(&input) {
+                                source.triangle_vars.push(input);
+                                source.triangle_sources.push((input.0, input.1, actor));
+                            }
+                        }
+                    }
+                }
+                point.source = Some(source);
+            }
+            points
+        };
+        let mut found = attach(points_of(&events(init, Part::Init, &ctx)), source(INIT_SCRIPT, None, false), init);
+        found.extend(attach(points_of(&events(main, Part::Main, &ctx)),
+            source(INIT_SCRIPT, main.first().map(|instruction| instruction.offset), true), main));
         // A line entity's walk-on slots (not `[OK]`), when the line starts enabled; slots that share an entry
         // point are one script.
         if ctx.line.is_some_and(|l| l.enabled != Some(false)) {
@@ -153,7 +179,7 @@ pub(super) fn scan_points(script: &FieldScript, mesh: &Walkmesh) -> Vec<PointDef
                     continue;
                 }
                 let Ok(listing) = script.disassemble_partial(entity, slot) else { continue };
-                found.extend(points_of(&events(&listing.instructions, Part::Line, &ctx)));
+                found.extend(attach(points_of(&events(&listing.instructions, Part::Line, &ctx)), source(slot, None, true), &listing.instructions));
             }
         }
         for point in found {
@@ -168,6 +194,7 @@ pub(super) fn scan_points(script: &FieldScript, mesh: &Walkmesh) -> Vec<PointDef
                     battle: None,
                     battle_first: None,
                     countdown: None,
+                    source: point.source.clone(),
                 });
             }
             match point.trigger {
@@ -211,6 +238,35 @@ fn player_triangle_vars(script: &FieldScript, players: &BTreeSet<usize>) -> BTre
         }
     }
     of_players.difference(&of_others).copied().collect()
+}
+
+/// Exact trigger inputs also retain their producer. Two playable entities writing one
+/// destination do not establish that they stand on the same triangle.
+fn player_triangle_sources(script: &FieldScript, players: &BTreeSet<usize>) -> BTreeMap<(u8, u8), usize> {
+    let mut producers: BTreeMap<(u8, u8), BTreeSet<usize>> = BTreeMap::new();
+    let mut destinations = BTreeSet::new();
+    let canonical = |(bank, address): (u8, u8)|
+        (super::canonical_persistent_bank(bank).unwrap_or(if bank == 6 { 5 } else { bank }), address);
+    let mut seen = BTreeSet::new();
+    for entity in 0..script.entity_count() {
+        for slot in 0..SCRIPTS_PER_ENTITY {
+            let Some(span) = script.span(entity, slot) else { continue };
+            if !seen.insert(span.start) { continue; }
+            let Ok(listing) = script.disassemble_partial(entity, slot) else { continue };
+            for instruction in listing.instructions.iter().filter(|instruction| instruction.mnemonic == "GETAI") {
+                let Some(var) = instruction.operand("var_triangle").filter(|operand| operand.bank != 0) else { continue };
+                let Some(actor) = instruction.literal("entity").and_then(|actor| usize::try_from(actor).ok()) else { continue };
+                let destination = var_of(var);
+                destinations.insert(destination);
+                producers.entry(canonical(destination)).or_default().insert(actor);
+            }
+        }
+    }
+    destinations.into_iter().filter_map(|input| {
+        let actors = producers.get(&canonical(input))?;
+        if actors.len() != 1 { return None; }
+        actors.first().copied().filter(|actor| players.contains(actor)).map(|actor| (input, actor))
+    }).collect()
 }
 
 /// What an init part sets to a literal on every path (a variable the main loop then compares the triangle with).
@@ -588,7 +644,7 @@ fn points_of(writes: &[Write]) -> Vec<PointDef> {
         }
         // A point that could only clear bits moves nothing forward.
         if effects.iter().any(|e| matches!(e.op, Op::Moment(_) | Op::Bit { on: true, .. })) {
-            points.push(PointDef { trigger: base.trigger.clone(), requires, effects, battle, battle_first, countdown });
+            points.push(PointDef { trigger: base.trigger.clone(), requires, effects, battle, battle_first, countdown, source: None });
         }
     }
     points

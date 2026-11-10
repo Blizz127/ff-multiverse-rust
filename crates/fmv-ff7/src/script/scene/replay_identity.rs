@@ -61,6 +61,15 @@ pub(super) fn fingerprint(section: &[u8], def: &SceneDef) -> [u8; 32] {
         None => out.byte(0),
     }
     out.optional_word(def.resume_after_battle);
+    let name_sites = super::default_names::sites(section, def);
+    if !name_sites.is_empty() {
+        // V3 playback authorizes this policy; legacy playback still ignores these menus.
+        // The host separately binds the story encoding. A v3 replay cannot be reconstructed
+        // as an older ignored MENU run. The exact original bytes are already bound above.
+        out.bytes(super::default_names::POLICY);
+        out.len(name_sites.len());
+        for (offset, character) in name_sites { out.len(offset); out.byte(character); }
+    }
     *out.0.finalize().as_bytes()
 }
 

@@ -54,7 +54,7 @@ use super::play::{BattleCheckpoint, WindowCheckpoint, SceneBoundary};
 use super::data::{Given, ScriptRef, Step};
 use super::fade::{FadeOp, FadeState};
 use crate::field_direction_to_facing;
-use crate::background::{BackgroundOp, BackgroundState};
+use crate::background::{BackgroundOp, BackgroundState, PaletteOp};
 use crate::script::dialogue::{parse_message, Choice, End, Message, MessageOrigin, Piece, StoryVars, EFFECT_NOTE_LAYER};
 use crate::script::{decode_at, FieldScript, Instruction};
 use crate::story::{tracked_var, PartyOp, StoryState, MOMENT_ADDRESS, MOMENT_BANK};
@@ -177,6 +177,11 @@ pub enum CameraOp {
 pub enum Stage {
     /// Stand at a place at once (`XYZI`, `XYI`, `XYZ`). `z` is the script's height, when it gives one (else the ground's).
     Place { entity: u8, x: i16, y: i16, z: Option<i16>, triangle: Option<u16> },
+    /// Replace the model's world-space render offset (`OFST` type 0), independently of its
+    /// logical position, floor, movement and facing. These are field units, not model units.
+    Offset { entity: u8, x: i16, y: i16, z: i16 },
+    /// OFST type 1: integer linear model-offset steps, independently of logical movement.
+    OffsetMove { entity: u8, motion: super::OffsetMotion },
     /// Walk to a place over `frames`, from where the entity stood (`from`, when the scene knows it). `z` is the
     /// script's height (a ladder's), else the ground's at the place ([`super::ScenePlay`] fills it in).
     /// For JUMP, `frames` is N+2: N authored motion steps, the completion update and the script's
@@ -203,7 +208,7 @@ pub enum Stage {
     Camera(CameraOp),
     /// The field's one authored additive/subtractive fade, before dialogue and HUD.
     Fade(FadeOp),
-    /// Change authored background group visibility; frames are bit ordinals, not tile-state bytes.
+    /// Change authored background groups or palette state; frames are bit ordinals, not tile-state bytes.
     Background(BackgroundOp),
     /// Nonblocking field-camera shake. Only enabled axes read their banked operands;
     /// disabled axes retain their previous parameters and settle back to zero.
@@ -381,6 +386,8 @@ enum State {
     Run,
     /// Blocked until thread `n` has ended (`REQEW`).
     WaitEnd(usize),
+    /// OFSTW waits for the current offset, including a replacement by another script.
+    WaitOffset(u8),
     /// Waiting for its entity's priority slot.
     WaitSlot,
     /// In an idle loop: runs again when anything changes (the epoch it parked at is the one stored).
@@ -598,6 +605,9 @@ pub struct Vm {
     done: Option<End>,
     quiet: bool,
     places: BTreeMap<u8, Where>,
+    /// Presentation offsets survive placement and quiet setup without changing logical places.
+    offsets: BTreeMap<u8, [i16; 3]>,
+    offset_moves: BTreeMap<u8, (u32, super::OffsetMotion)>,
     headings: BTreeMap<u8, f32>,
     visible: BTreeMap<u8, bool>,
     speeds: BTreeMap<u8, i32>,
@@ -619,12 +629,20 @@ pub struct Vm {
     geometry: BTreeMap<u8, (i16, i16, u16, u16)>,
     /// What the scripts did to the party, in the order they did it (setup included): see [`Vm::party_ops`].
     party_ops: Vec<PartyOp>,
+    /// Main-party slots read by GETPC, including holes; field-party order can differ.
+    party_main: [u8; 3],
+    /// Semantic field tuple for old previews and for replaying the published party journal.
+    /// Version 3 operations read their authoritative raw inputs from bank3 instead.
+    party_bank: [u8; 3],
+    /// Source-validated MENU6 sites that retain the existing canonical names.
+    default_name_sites: Vec<(usize, u8)>,
     resources: ResourceOutcome,
     stats: Stats,
 }
 
 impl Vm {
     pub fn new(vars: SceneVars, seed: u32, limits: Limits) -> Self {
+        let party = [0, 1, 2].map(|slot| vars.party_member(slot).unwrap_or(255));
         Self {
             jump: None,
             battle: None,
@@ -656,6 +674,8 @@ impl Vm {
             done: None,
             quiet: false,
             places: BTreeMap::new(),
+            offsets: BTreeMap::new(),
+            offset_moves: BTreeMap::new(),
             headings: BTreeMap::new(),
             visible: BTreeMap::new(),
             speeds: BTreeMap::new(),
@@ -670,6 +690,9 @@ impl Vm {
             background_state: BackgroundState::default(),
             geometry: BTreeMap::new(),
             party_ops: Vec::new(),
+            party_main: party,
+            party_bank: party,
+            default_name_sites: Vec::new(),
             resources: ResourceOutcome::default(),
             stats: Stats::default(),
         }
@@ -684,16 +707,108 @@ impl Vm {
 
     pub fn resources(&self) -> &ResourceOutcome { &self.resources }
 
-    /// The party as the scene's scripts see it: the story's own, with what they have done to it so far.
-    fn party_now(&self) -> Vec<u8> {
-        let story: Vec<u8> = (0..3).filter_map(|slot| self.vars.party_member(slot)).collect();
-        crate::story::party_after(&story, &self.party_ops)
+    /// Installed by ScenePlay only after validating the original script and semantic scene.
+    /// An empty list keeps every MENU unsupported; this is not a general name-editor capability.
+    pub(super) fn allow_default_name_sites(&mut self, sites: Vec<(usize, u8)>) {
+        self.default_name_sites = sites;
     }
 
-    /// What the scripts did to the story's party (`PRTYP`, `PRTYM`, `PRTYE`), in order, the stage scripts' part first.
-    /// The VM changes no party: it only says what was asked, so that the caller can hold it against the party the story
-    /// has after the scene ([`crate::story::party_after`], [`crate::story::canon_party`]) and refuse a scene whose party
-    /// the story would not carry.
+    fn default_name_menu(&mut self, ins: &Instruction, class: &mut Class) {
+        if !self.vars.story.supports_extended() {
+            *class = Class::Ignored;
+            return;
+        }
+        let param = ins.literal("param").and_then(|value| u8::try_from(value).ok());
+        if ins.stray_banks || ins.literal("type") != Some(6)
+            || !param.is_some_and(|param| param <= 1 && self.default_name_sites.contains(&(ins.offset, param))) {
+            *class = Class::Ignored;
+            return;
+        }
+        // Original OpcodeFuncMenu's completion calls FIELD_Init (field_opcodes.c6664), also
+        // called on native main/110B8.c471 menu return. It reconciles raw slots with the saved
+        // main party without changing names, main membership or PHS availability.
+        let bank = [9, 10, 11].map(|address| self.var_byte(3, address));
+        if [9, 10, 11].into_iter().any(|address|
+            (self.vars.story.known_mask(3, address) | self.written_mask(3, address)) != 255) {
+            self.stats.unresolved = self.stats.unresolved.saturating_add(1);
+            *class = Class::Unknown;
+            return;
+        }
+        let Ok(change) = crate::script::party::sync_from_main(bank, self.party_main) else {
+            self.stats.unresolved = self.stats.unresolved.saturating_add(1);
+            *class = Class::Unknown;
+            return;
+        };
+        // The journal's semantic raw tuple stays where the last authored PartyOp left it.
+        // A later dependent PartyOp compares it to these actual bytes and resolves its journal.
+        for ((address, value), assigned) in [9, 10, 11].into_iter().zip(change.bank).zip(change.assigned) {
+            if assigned { self.record_assignment(3, address, value, 255); }
+        }
+    }
+
+    /// The main-party slots read by GETPC, including the holes left by PRTYM.
+    fn party_now(&self) -> [u8; 3] { self.party_main }
+
+    /// IFPRTYQ reads the physical field tuple; GETPC independently reads the main tuple.
+    /// Keep the original early return, so a match does not depend on later unexamined slots.
+    fn field_party_contains(&mut self, character: u8) -> Option<bool> {
+        if !self.vars.story.supports_extended() { return Some(self.party_bank.contains(&character)); }
+        for address in 9..=11 {
+            let member = self.var_byte(3, address);
+            if (self.vars.story.known_mask(3, address) | self.written_mask(3, address)) != 255 {
+                self.stats.unresolved = self.stats.unresolved.saturating_add(1);
+                return None;
+            }
+            if member == character { return Some(true); }
+        }
+        Some(false)
+    }
+
+    /// Apply the original field/main tuple transition. No initial physical bytes are invented:
+    /// only an authored assignment becomes a write, and a full PRTYE without 255 reads no old tuple.
+    fn change_party(&mut self, op: PartyOp) -> bool {
+        use crate::script::party::transition;
+        let extended = self.vars.story.supports_extended();
+        let replaces_all = matches!(op, PartyOp::Set(slots) if !slots.contains(&255));
+        let bank = if extended && !replaces_all {
+            let raw = [9, 10, 11].map(|address| self.var_byte(3, address));
+            if [9, 10, 11].into_iter().any(|address|
+                (self.vars.story.known_mask(3, address) | self.written_mask(3, address)) != 255) {
+                self.stats.unresolved = self.stats.unresolved.saturating_add(1);
+                return false;
+            }
+            raw
+        } else { self.party_bank };
+        let Ok(change) = transition(bank, self.party_main, op) else { return false };
+        if extended {
+            let compact = change.bank.iter().skip_while(|&&member| member != 255).all(|&member| member == 255);
+            if change.main != change.bank || !compact {
+                self.stats.unresolved = self.stats.unresolved.saturating_add(1);
+                return false;
+            }
+        }
+        // A dependent operation may have consumed a different physical tuple from the journal's
+        // canonical input. Publish resolved slots in that case so replay sees the exact same result.
+        let replay = transition(self.party_bank, self.party_main, op);
+        let journal = if replay.is_ok_and(|r| r.bank == change.bank && r.main == change.main) { op }
+            else { PartyOp::Set(change.bank.map(|member| if member == 255 { 254 } else { member })) };
+        if !transition(self.party_bank, self.party_main, journal)
+            .is_ok_and(|r| r.bank == change.bank && r.main == change.main) { return false; }
+        if self.party_bank != change.bank || self.party_main != change.main { self.epoch = self.epoch.wrapping_add(1); }
+        self.party_bank = change.bank;
+        self.party_main = change.main;
+        self.party_ops.push(journal);
+        if extended {
+            for ((address, value), assigned) in [9, 10, 11].into_iter().zip(change.bank).zip(change.assigned) {
+                if assigned { self.record_assignment(3, address, value, 255); }
+            }
+        }
+        true
+    }
+
+    /// Authored party changes in order, with dependent inputs resolved when replay needs them.
+    /// Version 3 also journals the actual bank3/4 assignments. The caller validates the resulting
+    /// main party against the durable story table ([`crate::story::canon_party`]).
     pub fn party_ops(&self) -> &[PartyOp] {
         &self.party_ops
     }
@@ -738,6 +853,34 @@ impl Vm {
     /// Where the scene knows `entity` stands.
     pub fn place_of(&self, entity: u8) -> Option<Where> {
         self.places.get(&entity).copied()
+    }
+
+    /// The model's render offset, including quiet setup's result; a new field starts at zero.
+    /// Logical position reads and movement continue to use [`Vm::place_of`].
+    pub fn offset(&self, entity: u8) -> [i16; 3] {
+        self.offset_at(entity, self.clock)
+    }
+
+    /// Scripts run before the model updater: a replacement at F+1 sees step 0,
+    /// not the step 1 that will be drawn after that script pass.
+    fn offset_at(&self, entity: u8, time: u32) -> [i16; 3] {
+        self.offset_moves.get(&entity).map_or_else(
+            || self.offsets.get(&entity).copied().unwrap_or([0; 3]),
+            |(start, motion)| motion.at(time.saturating_sub(*start).saturating_sub(1)))
+    }
+
+    fn offsets_running_at(&self, time: u32) -> bool {
+        self.offset_moves.values().any(|(start, motion)| time < start.saturating_add(motion.completion_frames()))
+    }
+
+    /// Original offsets continue while MES/ASK holds a script. The current scene
+    /// timeline cannot reproduce an arbitrary dialogue dwell, so durable boundaries
+    /// require the motion to have completed; legacy previews retain scene-time playback.
+    fn unresolved_offset_boundary(&mut self, time: u32) -> bool {
+        if self.vars.story.supports_extended() && self.offsets_running_at(time) {
+            self.note_unresolved_motion();
+            true
+        } else { false }
     }
 
     /// The heading the scene knows `entity` has.
@@ -807,7 +950,23 @@ impl Vm {
         self.set_masked(bank, address, value, u8::MAX);
     }
 
+    /// Direct mirror writes would change IFPRTYQ's physical tuple without synchronizing GETPC's
+    /// main tuple. Only authored party opcodes have a represented native transfer between them.
+    fn party_mirror_write(&self, bank: u8, address: u8, wide: bool) -> bool {
+        self.vars.story.supports_extended() && self.vars.key(bank, address).0 == 3
+            && ((9..=11).contains(&address) || (wide && address.checked_add(1).is_some_and(|next| (9..=11).contains(&next))))
+    }
+
     fn set_masked(&mut self, bank: u8, address: u8, value: u8, mask: u8) {
+        if self.party_mirror_write(bank, address, false) {
+            self.stats.unresolved = self.stats.unresolved.saturating_add(1);
+            return;
+        }
+        self.record_assignment(bank, address, value, mask);
+    }
+
+    /// Record a validated generic assignment, or an authored party opcode's explicit physical write.
+    fn record_assignment(&mut self, bank: u8, address: u8, value: u8, mask: u8) {
         let key = self.vars.key(bank, address);
         let old = if self.vars.story.supports_extended() { self.peek_byte(bank, address) } else { self.var_byte(bank, address) };
         let old_mask = self.written_masks.get(&key).copied().unwrap_or(0);
@@ -819,9 +978,9 @@ impl Vm {
     }
 
     fn set_word(&mut self, bank: u8, address: u8, value: u16) {
-        if self.vars.story.supports_extended() && address == u8::MAX {
+        if (self.vars.story.supports_extended() && address == u8::MAX) || self.party_mirror_write(bank, address, true) {
             self.stats.unresolved = self.stats.unresolved.saturating_add(1);
-            return; // Refuse the whole assignment, including its low byte.
+            return; // Refuse the whole assignment, including an otherwise valid low byte.
         }
         let [low, high] = value.to_le_bytes();
         self.set_byte(bank, address, low);
@@ -934,6 +1093,12 @@ impl Vm {
             *class = Class::Unknown;
             return;
         };
+        // Preflight both destinations: refusing the high output must not leave a low-half write.
+        if [low, high].into_iter().any(|(bank, address, wide)| self.party_mirror_write(bank, address, wide)) {
+            self.stats.unresolved = self.stats.unresolved.saturating_add(1);
+            *class = Class::Unknown;
+            return;
+        }
         // CHGLD writes the low half first, then the high half; overlapping destinations matter.
         for ((bank, address, wide), value) in [(low, gil as u16), (high, (gil >> 16) as u16)] {
             if wide { self.set_word(bank, address, value); } else { self.set_byte(bank, address, value as u8); }
@@ -1132,7 +1297,30 @@ impl Vm {
                 }
             }
         }
-        self.threads.iter().enumerate().filter(|(_, t)| t.state == State::Run).min_by_key(|(_, t)| (t.time, t.seq)).map(|(i, _)| i)
+        let (idx, time, _) = self.threads.iter().enumerate().filter_map(|(i, t)| {
+            let time = match t.state {
+                State::Run => t.time,
+                State::WaitOffset(entity) => {
+                    // A native higher-priority script owns the entity until RET,
+                    // including its WAIT/REQEW/OFSTW or parked state. Do not let an
+                    // older waiter observe an intermediate cancellation between two
+                    // instructions of that owner. WaitSlot has not acquired ownership.
+                    if self.threads.iter().any(|owner| owner.entity == t.entity && owner.prio < t.prio
+                        && !matches!(owner.state, State::Done | State::WaitSlot)) { return None; }
+                    let end = self.offset_moves.get(&entity).map_or(self.clock,
+                        |(start, motion)| start.saturating_add(motion.completion_frames()));
+                    t.time.max(end).max(self.clock)
+                },
+                _ => return None,
+            };
+            Some((i, time, t.seq))
+        }).min_by_key(|(_, time, seq)| (*time, *seq))?;
+        // Do not move a waiter's stored time forward until it wins: another script
+        // may replace or cancel the motion before this projected completion frame.
+        let selected = self.threads.get_mut(idx)?;
+        selected.time = time;
+        if matches!(selected.state, State::WaitOffset(_)) { selected.state = State::Run; }
+        Some(idx)
     }
 
     /// A narrow, verified animation tail: CANIM2, WAIT, ANIME1, WAIT, JMPB to the first
@@ -1165,7 +1353,7 @@ impl Vm {
         decode_at(script.bytes(), pc, 0).is_ok_and(|ins| ins.opcode == 0x12 && ins.jump_target == Some(pc))
     }
 
-    /// Preserve the existing idle behavior of constant ASPED/background metadata loops.
+    /// Preserve the idle behavior of constant ASPED/background/instant-offset metadata loops.
     /// Parking proves the last lap produced no epoch-changing work. Additionally require
     /// a linear cycle containing only these presentation commands and WAIT: no condition, request,
     /// actor movement, persistent write, resource operation or window may be hidden here.
@@ -1182,7 +1370,8 @@ impl Vm {
                     Some(target) => pc = target,
                     None => return false,
                 },
-                0x24 | 0xBD | 0xE0..=0xE4 => pc = ins.end(),
+                0xC3 if ins.literal("move_type") == Some(0) => pc = ins.end(),
+                0x24 | 0xBD | 0xC4 | 0xE0..=0xE4 => pc = ins.end(),
                 _ => return false,
             }
         }
@@ -1529,6 +1718,10 @@ impl Vm {
                 self.open(idx, entity, ins.offset, window, message, None)
             }
             0x48 => self.ask(script, idx, entity, ins),
+            0x49 => {
+                self.default_name_menu(ins, class);
+                Flow::Next
+            }
             0x50 => {
                 if let Some(window) = ins.literal("window") {
                     let g = (
@@ -1600,14 +1793,28 @@ impl Vm {
                 }
                 Flow::Next
             }
-            // LBYTE and HBYTE set the low and the high byte of a word variable.
+            // LBYTE/HBYTE extract a source byte into the stated destination byte. Original
+            // OpcodeFuncHbyte shifts the source word; it never increments the destination.
             0x9A | 0x9B => {
                 if let Some((bank, address)) = Self::dest(ins, "var") {
-                    let value = u8::try_from(self.num(ins, "value", Width::U16) & 0xFF).unwrap_or(0);
-                    let at = if op == 0x9A { Some(address) } else { address.checked_add(1) };
-                    if let Some(at) = at {
-                        self.set_byte(bank, at, value);
-                    }
+                    let value = if op == 0x9A {
+                        self.num(ins, "value", Width::U8) as u8
+                    } else if let Some(source) = ins.operand("value") {
+                        if source.bank == 0 { ((source.value >> 8) & 255) as u8 }
+                        else if let Some(high) = ((source.value & 255) as u8).checked_add(1) {
+                            // The discarded low byte cannot affect this assignment. Audit only
+                            // the selected high byte, preserving unknown low-byte knowledge.
+                            self.var_byte(source.bank, high)
+                        } else {
+                            self.stats.unresolved = self.stats.unresolved.saturating_add(1);
+                            *class = Class::Unknown;
+                            return Flow::Next;
+                        }
+                    } else {
+                        *class = Class::Unknown;
+                        return Flow::Next;
+                    };
+                    self.set_byte(bank, address, value);
                 }
                 Flow::Next
             }
@@ -1620,12 +1827,23 @@ impl Vm {
                 Flow::Next
             }
             0xCB | 0xCC => {
-                // IFPRTYQ asks who is in the party NOW: what the story says, and what this scene's scripts have done to it
-                // since. IFMEMBQ asks whether the character belongs to the team at all, which a party change does not decide.
-                let holds = ins.literal("character").and_then(|c| u8::try_from(c).ok()).is_some_and(|c| {
-                    if op == 0xCB { self.party_now().contains(&c) } else { self.vars.is_member(c) }
-                });
-                self.branch(idx, ins, holds)
+                // Team/PHS availability is not active membership: Barret remains available after
+                // leaving the party at moment36. V3 has no authoritative input for this query yet.
+                if op == 0xCC && self.vars.story.supports_extended() {
+                    self.stats.unresolved = self.stats.unresolved.saturating_add(1);
+                    *class = Class::Unknown;
+                    return Flow::Next;
+                }
+                // IFPRTYQ reads the physical field tuple; legacy IFMEMBQ retains preview behavior.
+                let Some(character) = ins.literal("character").and_then(|c| u8::try_from(c).ok()) else {
+                    *class = Class::Unknown;
+                    return Flow::Next;
+                };
+                let holds = if op == 0xCB { self.field_party_contains(character) } else { Some(self.vars.is_member(character)) };
+                match holds {
+                    Some(holds) => self.branch(idx, ins, holds),
+                    None => { *class = Class::Unknown; Flow::Next }
+                }
             }
             // GETAI reads an entity's current walkmesh triangle. A MOVE without an explicit
             // triangle does not establish one; never invent it from a stale position.
@@ -1697,6 +1915,52 @@ impl Vm {
                 self.do_move(idx, me, Goal { x, y, z: Some(z), triangle, how: MoveHow::Ladder, animation: None, frames: Some(frames) });
                 Flow::Yield
             }
+            0xC3 => {
+                // ff7-decomp d4db3de3, field_opcodes.c, OpcodeFuncOfst/OpcodeFuncOfstw:
+                // original OFST reads signed words, including its otherwise unused duration
+                // for type 0. Keep those reads in the unknown-state audit. The offset is an
+                // absolute world-space translation added only when drawing the model.
+                let x = clamp_i16(self.num(ins, "x", Width::S16));
+                let y = clamp_i16(self.num(ins, "y", Width::S16));
+                let z = clamp_i16(self.num(ins, "z", Width::S16));
+                let speed = clamp_i16(self.num(ins, "speed", Width::S16));
+                let time = self.thread_time(idx);
+                let next = [x, y, z];
+                if ins.literal("move_type") == Some(1) {
+                    let Some(motion) = super::OffsetMotion::new(self.offset_at(me, time), next, speed) else {
+                        *class = Class::Ignored;
+                        self.note_unresolved_motion();
+                        return Flow::Scene(End::Budget);
+                    };
+                    self.offset_moves.insert(me, (time, motion));
+                    self.emit(time, Stage::OffsetMove { entity: me, motion });
+                    return Flow::Next;
+                }
+                if ins.literal("move_type") != Some(0) {
+                    // Type 2 needs the original cosine table; zero/negative-duration animated
+                    // offsets are outside the bounded arithmetic above. Never guess either.
+                    *class = Class::Ignored;
+                    self.note_unresolved_motion();
+                    return Flow::Scene(End::Budget);
+                }
+                if self.offset_at(me, time) != next || self.offset_moves.contains_key(&me) { self.epoch = self.epoch.wrapping_add(1); }
+                self.offset_moves.remove(&me);
+                self.offsets.insert(me, next);
+                // Redundant instructions still reach the stage, but must not keep an idle
+                // OFST/JMP loop awake by incrementing the scheduler's epoch.
+                self.out.push(Timed {
+                    at: time.saturating_sub(self.origin),
+                    what: Stage::Offset { entity: me, x, y, z },
+                });
+                Flow::Next
+            }
+            0xC4 => {
+                if self.offset_moves.get(&me).is_some_and(|(start, motion)|
+                    self.thread_time(idx) < start.saturating_add(motion.completion_frames())) {
+                    if let Some(thread) = self.threads.get_mut(idx) { thread.state = State::WaitOffset(me); }
+                    Flow::Yield
+                } else { Flow::Next }
+            },
             0xB2 => {
                 let speed = self.num(ins, "speed", Width::U16);
                 self.speeds.insert(me, speed);
@@ -1862,6 +2126,23 @@ impl Vm {
                 }
                 Flow::Next
             }
+            // Palette positions address 16-colour blocks of the field's shared scratch buffer.
+            // The count operand is inclusive; resolving it here preserves 255 as 256 entries.
+            0xE5 | 0xE6 | 0xE7 | 0xEA => {
+                let count = u16::from(clamp_u8(self.num(ins, "count", Width::U8))) + 1;
+                let byte = |name| clamp_u8(self.num(ins, name, Width::U8));
+                let palette = match op {
+                    0xE5 => PaletteOp::Store { palette: byte("palette"), position: byte("position"), count },
+                    0xE6 => PaletteOp::Load { position: byte("position"), palette: byte("palette"), count },
+                    0xE7 => PaletteOp::Copy { source: byte("pos_src"), destination: byte("pos_dst"), count },
+                    _ => PaletteOp::Multiply { source: byte("pos_src"), destination: byte("pos_dst"),
+                        red: byte("r"), green: byte("g"), blue: byte("b"), count },
+                };
+                let change = BackgroundOp::Palette(palette);
+                if self.quiet { self.initial_background.push(change); }
+                self.emit(self.thread_time(idx), Stage::Background(change));
+                Flow::Next
+            }
             // ---- the camera ----------------------------------------------------------------------------------
             0x5E => {
                 // Original field_opcodes.c opcode_SHAKE: low mask bits enable axes;
@@ -1919,18 +2200,24 @@ impl Vm {
                 }
                 Flow::Next
             }
-            // ---- the party: nothing changes here, what was asked is kept for the caller -----------------------
+            // ---- party slots and their authored physical assignments ----------------------------------------
             0xC8 | 0xC9 => {
                 // (an operand that is not a literal is not made up: the op stays unknown)
                 match ins.literal("character") {
-                    Some(character) => self.party_ops.push(if op == 0xC8 { PartyOp::Add(clamp_u8(character)) } else { PartyOp::Remove(clamp_u8(character)) }),
+                    Some(character) => {
+                        if !self.change_party(if op == 0xC8 { PartyOp::Add(clamp_u8(character)) } else { PartyOp::Remove(clamp_u8(character)) }) {
+                            *class = Class::Unknown;
+                        }
+                    },
                     None => *class = Class::Unknown,
                 }
                 Flow::Next
             }
             0xCA => {
                 match (ins.literal("character1"), ins.literal("character2"), ins.literal("character3")) {
-                    (Some(a), Some(b), Some(c)) => self.party_ops.push(PartyOp::Set([clamp_u8(a), clamp_u8(b), clamp_u8(c)])),
+                    (Some(a), Some(b), Some(c)) => {
+                        if !self.change_party(PartyOp::Set([clamp_u8(a), clamp_u8(b), clamp_u8(c)])) { *class = Class::Unknown; }
+                    },
                     _ => *class = Class::Unknown,
                 }
                 Flow::Next
@@ -2063,6 +2350,7 @@ impl Vm {
                 break;
             }
             self.steps = self.steps.saturating_add(1);
+            self.clock = self.clock.max(self.thread_time(idx));
             match self.step_script(script, idx) {
                 Flow::Next | Flow::Yield => {}
                 Flow::Window(_) | Flow::Scene(_) => {
@@ -2071,6 +2359,13 @@ impl Vm {
                 }
             }
         }
+        // Quiet setup cannot carry an unfinished native updater into a reset scene
+        // clock. Completed offsets become its initial fixed presentation.
+        if self.offsets_running_at(self.clock) { self.stats.setup_incomplete = true; }
+        for (&entity, &(start, motion)) in &self.offset_moves {
+            self.offsets.insert(entity, motion.at(self.clock.saturating_sub(start).saturating_sub(1)));
+        }
+        self.offset_moves.clear();
         self.threads.clear();
         self.slots.clear();
         self.out.clear();
@@ -2107,6 +2402,8 @@ impl Vm {
         self.resources.gil_after = resources.gil;
         self.resources.gil_ops.clear();
         self.party_ops.clear();
+        self.party_main = [0, 1, 2].map(|slot| self.vars.party_member(slot).unwrap_or(255));
+        self.party_bank = self.party_main;
         self.done = None;
         self.battle = None;
         self.battle_checkpoint = None;
@@ -2123,6 +2420,17 @@ impl Vm {
     }
 
     fn finish(&mut self, end: End) -> Beat {
+        let end = if end != End::Budget && self.unresolved_offset_boundary(self.clock) {
+            // The terminal opcode may have already prepared a battle or transfer.
+            // Refusal must expose only Budget, never a resumable battle checkpoint
+            // or a destination from a presentation whose outcome was not resolved.
+            self.battle = None;
+            self.battle_checkpoint = None;
+            self.battle_flags = None;
+            self.jump = None;
+            self.window_checkpoint = None;
+            End::Budget
+        } else { end };
         self.done = Some(end);
         let at = self.clock.saturating_sub(self.origin);
         Beat { stage: std::mem::take(&mut self.out), then: Then::End { at, how: end } }
@@ -2186,6 +2494,7 @@ impl Vm {
                 Flow::Next | Flow::Yield => {}
                 Flow::Scene(end) => return self.finish(end),
                 Flow::Window(opened) => {
+                    if self.unresolved_offset_boundary(opened.time) { return self.finish(End::Budget); }
                     let at = opened.time.saturating_sub(self.origin);
                     let geometry = self.geometry.get(&opened.id).copied();
                     let window = Window { at, opener: Self::own(opened.opener), speaker: None, id: opened.id, geometry, message: opened.message };
@@ -2211,11 +2520,11 @@ fn is_ignored(op: u8) -> bool {
         op,
         // controls, menus, party and field logic
         0x04..=0x06 | 0x08..=0x0B | 0x21..=0x23 | 0x26 | 0x27 | 0x2A | 0x2B | 0x33 | 0x38 | 0x3B | 0x49 | 0x4A | 0x4B | 0x6D | 0x6E | 0x71..=0x73
-        | 0x7E | 0xBF | 0xC3 | 0xC4 | 0xC5..=0xC7 | 0xCD..=0xCF | 0xD0..=0xD3 | 0xD6 | 0xD7 | 0xD8 | 0xD9 | 0xDB | 0xDD | 0xDE | 0xDC
+        | 0x7E | 0xBF | 0xC5..=0xC7 | 0xCD..=0xCF | 0xD0..=0xD3 | 0xD6 | 0xD7 | 0xD8 | 0xD9 | 0xDB | 0xDD | 0xDE | 0xDC
         // windows other than the one that is shown
         | 0x2E | 0x2F | 0x36 | 0x37 | 0x41..=0x43 | 0x51..=0x55 | 0x56 | 0x57 | 0x45 | 0x47 | 0x4D | 0x4F
         // unsupported picture effects (palette changes and layer scrolls among them)
-        | 0x2C | 0x2D | 0x69 | 0x6A | 0x61 | 0x62 | 0x6F | 0xDF | 0xE5..=0xEF
+        | 0x2C | 0x2D | 0x69 | 0x6A | 0x61 | 0x62 | 0x6F | 0xDF | 0xE8 | 0xE9 | 0xEB..=0xEF
         // sound commands other than the supported literal channel plays, and music
         | 0xF0 | 0xF3..=0xF7 | 0xF8..=0xFE
         // items and materia: not given here

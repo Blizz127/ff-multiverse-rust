@@ -91,7 +91,9 @@ use std::sync::Arc;
 use winit::keyboard::KeyCode;
 
 mod continuation;
+mod door_offsets;
 mod effects;
+mod rootmap;
 mod train;
 
 /// The most of a witness's picture another's may cover on the screen.

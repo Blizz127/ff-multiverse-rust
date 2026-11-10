@@ -130,6 +130,8 @@ pub struct AvatarFrame {
     pub identities: Vec<Identity>,
     /// The camera's focal length ([`super::stage::StageCamera::zoom`]).
     pub zoom: f32,
+    /// Field-only PC projection/depth calibration. Preview and battle frames keep their existing projection.
+    pub field_depth: Option<fmv_ff7::background::DepthMapping>,
     /// Depth bias of the face overlays, in camera-space units.
     pub overlay_bias: f32,
     /// Marks on the ground, under the models (each at the depth of its feet).
@@ -387,6 +389,7 @@ impl Avatars {
                 tints: Vec::new(),
                 identities,
                 zoom: stage.camera.zoom as f32,
+                field_depth: Some(stage.depth),
                 overlay_bias: OVERLAY_BIAS_MODEL_UNITS * scale,
                 ground,
                 scenery: stage.scenery.clone(),
@@ -418,6 +421,7 @@ pub(crate) mod tests {
 
     pub(crate) fn stage() -> Stage {
         Stage {
+            depth: Default::default(),
             camera: StageCamera::from_camera(&camera()),
             model_scale: 4.0,
             walk_speed: 60.0,

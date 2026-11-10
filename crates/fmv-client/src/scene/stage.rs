@@ -6,6 +6,11 @@
 //! the drawing reads the actors it holds.
 //!
 //! * `Place` puts an actor somewhere at once, and cancels a walk it was on.
+//! * `Offset` replaces the model's world-space render offset without moving its logical position.
+//!   Placement, movement and turning preserve the offset; a new scene starts with zero unless its setup supplies one.
+//!   `OffsetMove` samples the original type-1 integer steps on scene time. Durable scenes reject
+//!   a dialogue/end boundary while it is running: native offsets continue during dialogue,
+//!   which needs the shared field timeline before such a boundary can be reproduced.
 //! * `Move` walks it there over the number of frames the event says (a straight line from where it stood, heading
 //!   toward the target the whole way). A second move of the same actor first finishes the first. A resolved ordinary-MOVE
 //!   clip follows only that move's elapsed time, and yields to the standing default when it arrives.
@@ -133,6 +138,9 @@ pub struct Actor {
     entity: u8,
     /// `x`, `y`, `z` in walkmesh units; `None` until something placed it.
     pos: Option<[f32; 3]>,
+    /// OFST's world-space translation of the picture only; never part of walkmesh movement.
+    render_offset: [i16; 3],
+    offset_motion: Option<(fmv_ff7::script::scene::OffsetMotion, f32)>,
     triangle: Option<u16>,
     heading: f32,
     visible: bool,
@@ -147,7 +155,7 @@ pub struct Actor {
 
 impl Actor {
     fn new(entity: u8) -> Self {
-        Self { entity, pos: None, triangle: None, heading: 0.0, visible: true, walk: None, turn: None, walked_frames: 0.0, animation: None, movement_animation: None, default_animation: None }
+        Self { entity, pos: None, render_offset: [0; 3], offset_motion: None, triangle: None, heading: 0.0, visible: true, walk: None, turn: None, walked_frames: 0.0, animation: None, movement_animation: None, default_animation: None }
     }
 
     /// The script entity this actor plays.
@@ -158,6 +166,13 @@ impl Actor {
     /// Where it stands now (`x`, `y`, `z`), `None` while nothing has placed it.
     pub fn pos(&self) -> Option<[f32; 3]> {
         self.pos
+    }
+
+    /// Where the model is drawn: the logical position plus OFST in field-world units.
+    /// Facing and model scale transform the mesh independently; neither transforms this offset
+    /// (ff7-decomp d4db3de3, field_camera.c, HandleKawaiDataInModel).
+    pub fn render_pos(&self) -> Option<[f32; 3]> {
+        self.pos.map(|p| std::array::from_fn(|axis| p[axis] + f32::from(self.render_offset[axis])))
     }
 
     /// The walkmesh triangle it was last placed on, if the scene said.
@@ -215,10 +230,11 @@ impl Actor {
 
     /// Whether anything is in motion.
     fn busy(&self) -> bool {
-        self.walk.is_some() || self.turn.is_some()
+        self.walk.is_some() || self.turn.is_some() || self.offset_motion.is_some()
     }
 
     fn advance(&mut self, frames: f32) {
+        self.advance_offset(frames);
         let moving_frames = self.walk.map_or(0.0, |w| frames.min((w.frames - w.elapsed).max(0.0)));
         let keep_animation = self.walk.is_some_and(|walk| walk.keep_animation) && self.has_normal_loop();
         self.advance_walk(frames);
@@ -235,6 +251,14 @@ impl Actor {
                 if let Some(frame) = advancing { *frame += animation_frames * animation.rate; }
             }
             self.finish_once();
+        }
+    }
+
+    fn advance_offset(&mut self, frames: f32) {
+        if let Some((motion, elapsed)) = &mut self.offset_motion {
+            *elapsed += frames;
+            self.render_offset = motion.at(*elapsed as u32);
+            if *elapsed >= f32::from(motion.steps()) { self.offset_motion = None; }
         }
     }
 
@@ -547,6 +571,17 @@ impl Cast {
                 let z = z.map(f32::from).or_else(|| height(*x, *y, *triangle)).or_else(|| actor.pos.map(|p| p[2])).unwrap_or(0.0);
                 actor.pos = Some([f32::from(*x), f32::from(*y), z]);
                 actor.triangle = *triangle;
+            }
+            Stage::Offset { entity, x, y, z } => {
+                let Some(actor) = self.actors.get_mut(entity) else { return self.off_cast() };
+                actor.offset_motion = None;
+                actor.render_offset = [*x, *y, *z];
+            }
+            Stage::OffsetMove { entity, motion } => {
+                let Some(actor) = self.actors.get_mut(entity) else { return self.off_cast() };
+                actor.render_offset = motion.start();
+                actor.offset_motion = Some((*motion, 0.0));
+                actor.advance_offset(overshoot);
             }
             Stage::Move { entity, from, x, y, z, triangle, frames, how, .. } => {
                 let Some(actor) = self.actors.get_mut(entity) else { return self.off_cast() };

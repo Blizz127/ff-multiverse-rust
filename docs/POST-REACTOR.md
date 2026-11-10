@@ -73,8 +73,10 @@ play resumes. Guests keep their own story. Recovery handles a prepared fight, a 
 victory, and the bridge-to-cargo landing independently of the moment-based entry table.
 Defeat retains a Game Over checkpoint and rolls back that attempt's staged costs; Confirm
 retries, while Back disconnects and preserves the checkpoint. Held cohorts cannot mutate
-their party until release. The first batch raises the account-store header fence to 3;
-older binaries refuse to open it. Both ends of the connection require protocol 20.
+their party until release. New writes now require account-store compatibility version 4
+and detached archive manifest version 2; older binaries refuse those formats. Both ends
+of the connection require protocol 21. Replay contract 3 includes authored model offsets,
+palette operations and corrected byte extraction; older checkpoints are refused unchanged.
 
 Consecutive fights carry HP, MP, limits, knockout and persistent Sadness/Fury. Mode 8 forbids
 escape. The actual MP formations and their reachable AI were checked against owned data;

@@ -9,9 +9,11 @@
 //!   is silent.
 //! * **A battle has its own music**: the field's `BMUSC` track when the script sets one, otherwise
 //!   the standard battle theme.
-//! * **A victory plays the fanfare once**, and when it is over the field's music comes back (the
+//! * **A victory plays the fanfare once when the encounter permits it**, and then the field's music comes back (the
 //!   field's `FMUSC` track when it sets one, otherwise the track that played before the fight).
-//! * **Running away and losing go straight back** to the field's music.
+//! * **Running away and nonterminal defeats go straight back** to the field's music.
+//! * **An acknowledged Game Over plays `over2` in a loop** until a new encounter or session. Missing
+//!   Game Over music stays silent; it cannot bring the field music back.
 //!
 //! What a *track* is (a name from `music.idx`), how it reaches the speakers (decoding, crossfades) and
 //! what happens when a file is missing are not decided here: [`Director::want`] only says which track
@@ -27,6 +29,8 @@ pub const STANDARD_BATTLE_TRACK: &str = "bat";
 /// The one-shot played after a won battle: 5.2 s, no loop tags (the track `fan2` loops for 54 s, so
 /// it is not a jingle).
 pub const VICTORY_TRACK: &str = "fanfare";
+/// The game's terminal-defeat track (`OVER2.SND` in its Game Over loader; PC `music.idx`: `over2`).
+pub const GAME_OVER_TRACK: &str = "over2";
 
 /// What a field's script says about music, as track names (lower case, as `music.idx` spells them).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -47,8 +51,12 @@ pub struct BattleCounts {
     pub entered: u64,
     pub ended: u64,
     pub victories: u64,
+    /// The last completed battle's authored fanfare policy; read only when its end counter changes.
+    pub victory_fanfare: bool,
     pub defeats: u64,
     pub escapes: u64,
+    /// A retained, authoritative terminal defeat; presentation or predicted events cannot set this.
+    pub game_over: bool,
 }
 
 /// Why a track is wanted (for the log, and for choosing how it fades in).
@@ -62,6 +70,8 @@ pub enum Why {
     Victory,
     /// The field's music is back after a fight.
     AfterFight,
+    /// An authored terminal defeat, acknowledged by the server.
+    GameOver,
 }
 
 impl Why {
@@ -71,6 +81,7 @@ impl Why {
             Why::Battle => "battle",
             Why::Victory => "victory",
             Why::AfterFight => "back in the field after the fight",
+            Why::GameOver => "game over",
         }
     }
 }
@@ -80,7 +91,7 @@ impl Why {
 pub fn fade_into(why: Why) -> Duration {
     match why {
         Why::Field => Duration::from_millis(1_200),
-        Why::Battle => Duration::from_millis(200),
+        Why::Battle | Why::GameOver => Duration::from_millis(200),
         Why::Victory => Duration::from_millis(120),
         Why::AfterFight => Duration::from_millis(700),
     }
@@ -101,6 +112,7 @@ enum Phase {
     Battle,
     /// Won: the fanfare plays, and until it is over nothing else is wanted.
     Fanfare { over: bool },
+    GameOver,
 }
 
 /// See the module docs.
@@ -177,6 +189,10 @@ impl Director {
     /// The battle counters as they are now (call it with them every time; only changes count).
     pub fn battle(&mut self, now: BattleCounts) {
         let before = std::mem::replace(&mut self.seen, now);
+        if now.game_over {
+            self.phase = Phase::GameOver;
+            return;
+        }
         if now.in_battle {
             self.phase = Phase::Battle;
             return;
@@ -186,7 +202,12 @@ impl Director {
             if let Some(after) = &self.music.after_battle {
                 self.field = Some(after.clone());
             }
-            self.phase = if now.victories > before.victories { Phase::Fanfare { over: false } } else { Phase::Field };
+            self.phase = if now.victories > before.victories {
+                // A script can suppress the jingle; the usual FMUSC/field return still applies.
+                Phase::Fanfare { over: !now.victory_fanfare }
+            } else {
+                Phase::Field
+            };
         } else if self.phase == Phase::Battle {
             // A battle that is gone without an end counted (dropped with its area): back to the field.
             self.phase = Phase::Field;
@@ -241,8 +262,14 @@ impl Director {
         Some(Want { track: track.clone(), repeat: true, why })
     }
 
-    /// The track that should be playing now, or `None` when nothing is wanted (the caller then leaves
-    /// things as they are: it never stops music by itself).
+    /// Game Over must be silent when its own track is missing or not ready, rather than leaving the
+    /// previous battle or field music playing. The caller still owns decoding and the mixer.
+    pub fn game_over(&self) -> bool {
+        self.phase == Phase::GameOver
+    }
+
+    /// The track that should be playing now, or `None` when nothing is wanted. Ordinarily the caller
+    /// leaves music alone; [`Director::game_over`] requires silence if its own track is unavailable.
     pub fn want(&self) -> Option<Want> {
         match self.phase {
             Phase::Battle => {
@@ -257,6 +284,7 @@ impl Director {
                 Some(Want { track: self.victory.clone(), repeat: false, why: Why::Victory })
             }
             Phase::Fanfare { .. } => self.field_want(Why::AfterFight),
+            Phase::GameOver => self.available(GAME_OVER_TRACK).then(|| Want { track: GAME_OVER_TRACK.to_string(), repeat: true, why: Why::GameOver }),
             Phase::Field => self.field_want(Why::Field),
         }
     }
@@ -286,7 +314,7 @@ mod tests {
     }
 
     fn counts(in_battle: bool, entered: u64, ended: u64, victories: u64, defeats: u64, escapes: u64) -> BattleCounts {
-        BattleCounts { in_battle, entered, ended, victories, defeats, escapes }
+        BattleCounts { in_battle, entered, ended, victories, victory_fanfare: true, defeats, escapes, game_over: false }
     }
 
     #[test]
@@ -367,6 +395,31 @@ mod tests {
     }
 
     #[test]
+    fn an_authored_silent_victory_keeps_the_after_battle_music_flow() {
+        for observe_battle in [false, true] {
+            let mut d = in_area("a", music(Some("ob"), None, Some("condor")));
+            if observe_battle {
+                d.battle(counts(true, 1, 0, 0, 0, 0));
+            }
+            let ended = BattleCounts { victory_fanfare: false, ..counts(false, 1, 1, 1, 0, 0) };
+            d.battle(ended);
+            assert_eq!(want(&d), Some(("condor".to_string(), true, Why::AfterFight)));
+            d.battle(ended);
+            assert_eq!(want(&d), Some(("condor".to_string(), true, Why::AfterFight)), "repeated looks cannot start the suppressed jingle");
+            d.area("b");
+            assert!(d.area_music("b", music(None, None, None)));
+            assert_eq!(want(&d), field("condor"), "the authored return track stays across a silent field");
+            d.battle(counts(true, 2, 1, 1, 0, 0));
+            d.battle(counts(false, 2, 2, 2, 0, 0));
+            assert_eq!(want(&d), Some(("fanfare".to_string(), false, Why::Victory)), "the next encounter owns its own policy");
+        }
+        // Several fights can arrive in one network pump. The latest completed encounter decides.
+        let mut d = in_area("a", music(Some("ob"), None, None));
+        d.battle(BattleCounts { victory_fanfare: false, ..counts(false, 2, 2, 2, 0, 0) });
+        assert_eq!(want(&d), Some(("ob".to_string(), true, Why::AfterFight)));
+    }
+
+    #[test]
     fn running_away_and_losing_go_straight_back_to_the_field_music() {
         for (escapes, defeats) in [(1, 0), (0, 1)] {
             let mut d = in_area("md1stin", music(Some("ob"), None, None));
@@ -374,6 +427,30 @@ mod tests {
             d.battle(counts(false, 1, 1, 0, defeats, escapes));
             assert_eq!(want(&d), field("ob"), "escapes {escapes} defeats {defeats}");
         }
+    }
+
+    #[test]
+    fn acknowledged_game_over_holds_its_loop_or_silence_until_a_new_battle() {
+        let mut d = in_area("a", music(Some("ob"), None, Some("condor")));
+        d.battle(counts(true, 1, 0, 0, 0, 0));
+        assert_eq!(want(&d), Some(("bat".to_string(), true, Why::Battle)));
+        let ended = BattleCounts { game_over: true, ..counts(false, 1, 1, 0, 1, 0) };
+        d.battle(ended);
+        assert!(d.game_over());
+        assert_eq!(want(&d), Some(("over2".to_string(), true, Why::GameOver)));
+        d.track_ended();
+        d.area("b");
+        assert!(d.area_music("b", music(Some("mati"), None, None)));
+        d.battle(ended);
+        assert_eq!(want(&d), Some(("over2".to_string(), true, Why::GameOver)), "neither a late track end nor field analysis releases Game Over");
+        d.unavailable("over2");
+        assert!(d.game_over());
+        assert_eq!(want(&d), None, "the missing track never falls back to field music");
+        d.battle(ended);
+        assert_eq!(want(&d), None);
+        d.battle(counts(true, 2, 1, 0, 1, 0));
+        assert!(!d.game_over());
+        assert_eq!(want(&d), Some(("bat".to_string(), true, Why::Battle)), "a newly admitted bridge retry starts battle music");
     }
 
     #[test]
@@ -475,7 +552,7 @@ mod tests {
         assert!(fade_into(Why::Victory) < fade_into(Why::Battle));
         assert!(fade_into(Why::Battle) < fade_into(Why::AfterFight));
         assert!(fade_into(Why::AfterFight) < fade_into(Why::Field));
-        for why in [Why::Field, Why::Battle, Why::Victory, Why::AfterFight] {
+        for why in [Why::Field, Why::Battle, Why::Victory, Why::AfterFight, Why::GameOver] {
             assert!(!why.text().is_empty());
         }
     }

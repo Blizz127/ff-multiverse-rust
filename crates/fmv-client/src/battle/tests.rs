@@ -37,6 +37,8 @@ struct Sim {
 impl Sim {
     fn new(formation: u16, accounts: &[AccountId]) -> Self {
         let setup = BattleSetup {
+            victory_fanfare: true,
+            game_over_on_defeat: false,
             initial_party: None,
             escape_policy: fmv_protocol::EscapePolicy::Formation,
             formation_id: formation,
@@ -53,6 +55,8 @@ impl Sim {
 
     fn start(&self) -> ServerMsg {
         ServerMsg::EncounterStart {
+            victory_fanfare: true,
+            game_over_on_defeat: false,
             initial_party: None,
             escape_policy: fmv_protocol::EscapePolicy::Formation,
             battle_id: self.id,

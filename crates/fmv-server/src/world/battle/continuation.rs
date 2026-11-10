@@ -136,6 +136,8 @@ fn start_message(id: BattleId, setup: &BattleSetup, fingerprint: Fingerprint) ->
         battle_speed: setup.battle_speed,
         ticks_per_second: setup.ticks_per_second,
         escape_policy: setup.escape_policy,
+        victory_fanfare: setup.victory_fanfare,
+        game_over_on_defeat: setup.game_over_on_defeat,
         initial_party: setup.initial_party.clone(),
         data_fingerprint: fingerprint,
     }
@@ -170,6 +172,9 @@ impl World {
         escape_policy: EscapePolicy, carry: Option<&SceneCombatCarry>) -> Result<SceneBattlePlan, BattleRejection> {
         let mut setup = self.prepare_battle_setup(requester, formation, Some(run))?;
         setup.escape_policy = escape_policy;
+        // The continuation caller admits only source BTLMD 8 (high byte zero): defeat
+        // retains its checkpoint and is presented by the scene-specific Game Over flow.
+        setup.game_over_on_defeat = true;
         let rules = self.battle.as_ref().ok_or(BattleRejection::Unsupported)?.settings.rules.as_ref();
         if let Some(carry) = carry { apply_carry(&mut setup, carry, rules, false)?; }
         rules.build(&setup).map_err(|_| BattleRejection::UnknownFormation)?;

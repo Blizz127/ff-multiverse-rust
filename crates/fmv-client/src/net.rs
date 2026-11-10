@@ -254,6 +254,8 @@ pub enum NetCommand {
     Area(AreaAnswer),
     /// A story scene's message: the owner's step or end, a watcher's leave, the debug preview (see `crate::scene`).
     Scene(crate::scene::SceneCmd),
+    /// Ordered behind every command sent before the game loop installed this story hold.
+    StoryPendingAck { id: u64 },
     Leave,
 }
 
@@ -663,6 +665,8 @@ where
             | ServerMsg::Inventory { .. }
             // Where the player's story stands (said once on joining when it is not a new account's).
             | ServerMsg::StoryUpdate { .. }
+            | ServerMsg::StoryPending { .. }
+            | ServerMsg::StoryCommitted { .. }
             // The countdown the server runs for the player's story (kept like the story: said once, not repeated).
             | ServerMsg::Countdown { .. }
             // A story scene's traffic is for the scene player (`crate::scene`); the server only sends it to a player that
@@ -778,6 +782,7 @@ async fn session_loop<R, W>(
                 Some(NetCommand::Battle(b)) => b.to_msg(),
                 Some(NetCommand::Area(a)) => a.into_msg(),
                 Some(NetCommand::Scene(c)) => c.into_msg(),
+                Some(NetCommand::StoryPendingAck { id }) => ClientMsg::StoryPendingAck { id },
                 Some(NetCommand::Leave) | None => {
                     let _ = timeout(WRITE_TIMEOUT, write_msg(&mut wr, &ClientMsg::Leave)).await;
                     break;

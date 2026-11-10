@@ -19,6 +19,7 @@ use fmv_ff7::{field_direction_to_facing, Ff7Adapter, Ff7FieldArea};
 use crate::world::{SceneHost, SceneInfo, SceneResult, SceneTransaction, TriggerInfo};
 
 mod continuation;
+mod points;
 
 fn complete_outcome(outcome: &fmv_ff7::script::scene::Outcome) -> bool {
     (match outcome.end {
@@ -181,6 +182,10 @@ impl Ff7SceneHost {
 }
 
 impl SceneHost for Ff7SceneHost {
+    fn fresh_story(&self) -> Option<Vec<u8>> {
+        self.extended_save.then(|| StoryState::fresh_first_control().encode())
+    }
+
     fn scenes(&self) -> Vec<SceneInfo> {
         self.defs
             .iter()
@@ -196,6 +201,9 @@ impl SceneHost for Ff7SceneHost {
 
     fn offered(&self, scene: &str, progress: &[u8]) -> bool {
         let (Some(def), Some(story)) = (self.def(scene), StoryState::decode(progress)) else { return false };
+        if points::is_point_continuation(scene) {
+            return self.exact_point_offered(def, progress);
+        }
         (!(def.requires_exact_transaction() || story.supports_extended()) || self.extended_save)
             && def.prepare_story(&story).is_ok()
             && def.offered_to(&story)
@@ -206,11 +214,30 @@ impl SceneHost for Ff7SceneHost {
     }
 
     fn continuation(&self, scene: &str) -> bool {
-        self.extended_save && self.def(scene).is_some_and(SceneDef::requires_continuation)
+        self.extended_save && self.def(scene).is_some_and(|def|
+            def.requires_continuation() || points::is_early_continuation(&def.id))
+    }
+
+    fn continuation_for(&self, scene: &str, progress: &[u8]) -> bool {
+        self.continuation(scene) && self.def(scene).is_some_and(|def|
+            def.requires_continuation() || StoryState::decode(progress).is_some_and(|story| story.supports_extended()))
+    }
+
+    fn noncombat_continuation(&self, scene: &str) -> bool {
+        points::is_noncombat_restore_scene(scene)
+    }
+
+    fn requires_origin(&self, scene: &str) -> bool {
+        self.def(scene).is_some_and(|def| def.origin_actor().is_some())
     }
 
     fn requires_landing(&self, scene: &str) -> bool {
         self.def(scene).is_some_and(SceneDef::requires_landing)
+    }
+
+    fn requires_landing_for(&self, scene: &str, progress: &[u8]) -> bool {
+        self.requires_landing(scene) || (scene == fmv_ff7::script::scene::STATION_SCENE_ID
+            && self.continuation_for(scene, progress))
     }
 
     fn evaluate_continuation(&self, scene: &str, original_progress: &[u8], seed: u32, original_gil: u32,
@@ -240,6 +267,10 @@ impl SceneHost for Ff7SceneHost {
         self.defs.iter().find(|d| d.presents_step(field, &before, &after)).map(|d| d.id.clone())
     }
 
+    fn point_continuation(&self, field: &str, before: &[u8], point: u32) -> Option<String> {
+        self.exact_point_scene(field, before, point).map(|def| def.id.clone())
+    }
+
     fn victory_scene(&self, field: &str, before: &[u8], after: &[u8], formation: u16) -> Option<String> {
         let (before, after) = (StoryState::decode(before)?, StoryState::decode(after)?);
         self.defs.iter().find(|d| d.follows_battle_step(field, &before, &after, formation)).map(|d| d.id.clone())
@@ -260,6 +291,9 @@ impl SceneHost for Ff7SceneHost {
 
     fn trigger(&self, scene: &str, progress: &[u8]) -> Option<TriggerInfo> {
         let (def, story) = (self.def(scene)?, StoryState::decode(progress)?);
+        // Point scenes are admitted only by the area's authoritative trigger. Making their
+        // director into an Interact target would bypass that trigger, even with radius zero.
+        if def.is_point_cutscene() { return None; }
         let area = self.field(&def.field)?;
         let npc = trigger_npc(area.field_file(), def, &story)?;
         Some(TriggerInfo {
@@ -386,9 +420,12 @@ mod tests {
         outcome.unknown_persistent_reads.insert((3, 66));
         assert!(!safe_segment(&outcome, false), "a guessed branch cannot start a durable fight");
         outcome.unknown_persistent_reads.clear();
-        for op in ["HMPMAX1", "HPu", "STITM", "GOLDd"] {
+        for op in ["HMPMAX1", "HPu", "STITM", "GOLDd", "MENU"] {
             outcome.stats.ignored.insert(op, 1);
             assert!(!safe_segment(&outcome, false), "continuation cannot discard {op}");
+            if op == "MENU" {
+                assert!(!safe_segment(&outcome, true), "a noncombat restore exception does not authorize an unhandled menu");
+            }
             outcome.stats.ignored.clear();
         }
         outcome.setup_stats.setup_incomplete = true;

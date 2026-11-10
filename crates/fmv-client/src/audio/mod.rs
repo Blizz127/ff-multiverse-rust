@@ -199,8 +199,10 @@ impl BattleCounts {
             entered: battle.entered(),
             ended: battle.ended(),
             victories: battle.victories(),
+            victory_fanfare: battle.last_victory_fanfare(),
             defeats: battle.defeats(),
             escapes: battle.escapes(),
+            game_over: battle.game_over().is_some(),
         }
     }
 }
@@ -493,13 +495,18 @@ impl Live {
     }
 
     fn apply_want(&mut self) {
-        let Some(want) = self.director.want() else { return };
+        let Some(want) = self.director.want() else {
+            self.silence_game_over();
+            return;
+        };
         if self.playing.as_deref() == Some(want.track.as_str()) {
             return;
         }
         let Some(music) = self.cache.get(&want.track) else {
-            // Not decoded yet: ask for it now (it jumps the queue) and let the old music play on.
+            // Not decoded yet: ask for it now (it jumps the queue). Game Over waits in silence;
+            // every other transition leaves the old music playing until its replacement is ready.
             self.ask(&want.track, true);
+            self.silence_game_over();
             if self.waiting.as_ref().is_none_or(|(t, _)| *t != want.track) {
                 self.waiting = Some((want.track.clone(), Instant::now()));
             }
@@ -514,6 +521,13 @@ impl Live {
         self.say(&format!("playing {} ({}{note})", want.track, want.why.text()));
         self.history.push(want.track.clone());
         self.playing = Some(want.track);
+    }
+
+    fn silence_game_over(&mut self) {
+        if self.director.game_over() && self.playing.take().is_some() {
+            self.engine.stop_music(director::fade_into(director::Why::GameOver));
+            self.say("game over music unavailable or pending: silence");
+        }
     }
 }
 
@@ -704,8 +718,8 @@ impl GameAudio {
                 .collect();
             live.field.set_links(spots);
         }
-        // The field is the battle's until its end panel is gone too (the window freezes the field for as long): the loops come
-        // back then, when the story the win moved has long been told.
+        // The field is the battle's until its end panel is gone too. An authored Game Over keeps it suspended
+        // through either a title-only or scene-owned hold; its controls do not change this audio policy.
         let now = session.now();
         let battle = &session.state.battle;
         let frame = FieldFrame {
@@ -714,7 +728,7 @@ impl GameAudio {
             story: session.state.story.progress(),
             pos: Some(session.state.own.pos()),
             rejected: session.state.rejected(),
-            in_battle: battle.in_battle() || battle.lingering(now),
+            in_battle: battle.in_battle() || battle.lingering(now) || battle.game_over().is_some(),
         };
         self.follow_field(&frame);
     }
@@ -1080,10 +1094,10 @@ mod tests {
     }
 
     fn counts(in_battle: bool, entered: u64, ended: u64, victories: u64) -> BattleCounts {
-        BattleCounts { in_battle, entered, ended, victories, defeats: 0, escapes: 0 }
+        BattleCounts { in_battle, entered, ended, victories, victory_fanfare: true, defeats: 0, escapes: 0, game_over: false }
     }
 
-    const NONE: BattleCounts = BattleCounts { in_battle: false, entered: 0, ended: 0, victories: 0, defeats: 0, escapes: 0 };
+    const NONE: BattleCounts = BattleCounts { in_battle: false, entered: 0, ended: 0, victories: 0, victory_fanfare: true, defeats: 0, escapes: 0, game_over: false };
 
     #[test]
     fn a_field_plays_its_music_then_the_fight_its_theme_then_the_fanfare_then_the_field_again() {
@@ -1140,9 +1154,78 @@ mod tests {
             }
             rig.frame(Some("a"), counts(true, 1, 0, 0));
             assert_eq!(rig.playing().as_deref(), Some("bat"));
-            rig.frame(Some("a"), BattleCounts { in_battle: false, entered: 1, ended: 1, victories: 0, defeats, escapes });
+            rig.frame(Some("a"), BattleCounts { in_battle: false, entered: 1, ended: 1, victories: 0, victory_fanfare: true, defeats, escapes, game_over: false });
             assert_eq!(rig.playing().as_deref(), Some("ob"), "escapes {escapes} defeats {defeats}");
             assert_eq!(rig.audio.history(), ["ob", "bat", "ob"]);
+        }
+    }
+
+    #[test]
+    fn the_encounters_authored_fanfare_policy_survives_its_start_events_and_end() {
+        let mut rig = Rig::new(
+            &[("a", area(Some("ob"), None, Some("condor")))],
+            &[("ob", 4_800), ("bat", 4_800), ("condor", 4_800), ("fanfare", 2_400)],
+        );
+        for _ in 0..3 { rig.frame(Some("a"), NONE); }
+        let mut client = BattleClient::new(ME);
+        client.set_rules(None);
+        let mut message = start(1, 301);
+        if let ServerMsg::EncounterStart { victory_fanfare, .. } = &mut message {
+            *victory_fanfare = false;
+        }
+        client.on_message(0.0, message);
+        rig.frame(Some("a"), BattleCounts::of(&client));
+        assert_eq!(rig.playing().as_deref(), Some("bat"));
+        // Even the killing event does not publish the end before its durable server acknowledgement.
+        send(&mut client, 1.0, vec![BattleEvent::Victory]);
+        rig.frame(Some("a"), BattleCounts::of(&client));
+        assert_eq!((client.ended(), client.victories()), (0, 0));
+        assert_eq!(rig.playing().as_deref(), Some("bat"));
+        client.on_message(2.0, ServerMsg::BattleEnd { battle_id: BattleId(1), outcome: fmv_protocol::battle::Outcome::Victory, rewards: vec![] });
+        assert!(!client.last_victory_fanfare());
+        assert_eq!(client.victories(), 1, "suppressing music does not suppress a victory");
+        rig.frame(Some("a"), BattleCounts::of(&client));
+        assert_eq!(rig.playing().as_deref(), Some("condor"));
+        assert_eq!(rig.audio.history(), ["ob", "bat", "condor"]);
+        // The same formation in a later encounter can permit the jingle. Audio may miss its start.
+        client.on_message(3.0, start(2, 301));
+        client.on_message(4.0, ServerMsg::BattleEnd { battle_id: BattleId(2), outcome: fmv_protocol::battle::Outcome::Victory, rewards: vec![] });
+        assert!(client.last_victory_fanfare());
+        rig.frame(Some("a"), BattleCounts::of(&client));
+        assert_eq!(rig.playing().as_deref(), Some("fanfare"));
+        assert_eq!(rig.audio.history(), ["ob", "bat", "condor", "fanfare"]);
+    }
+
+    #[test]
+    fn only_acknowledged_game_over_plays_over2_and_a_missing_track_stays_silent_until_retry() {
+        for have_track in [true, false] {
+            let mut tracks = vec![("ob", 4_800), ("bat", 4_800), ("condor", 4_800)];
+            if have_track { tracks.push(("over2", 2_400)); }
+            let mut rig = Rig::new(&[("a", area(Some("ob"), None, Some("condor")))], &tracks);
+            for _ in 0..3 { rig.frame(Some("a"), NONE); }
+            let mut client = BattleClient::new(ME);
+            client.set_rules(None);
+            let mut message = start(1, 301);
+            if let ServerMsg::EncounterStart { game_over_on_defeat, .. } = &mut message { *game_over_on_defeat = true; }
+            client.on_message(0.0, message);
+            rig.frame(Some("a"), BattleCounts::of(&client));
+            send(&mut client, 1.0, vec![BattleEvent::Defeat]);
+            rig.frame(Some("a"), BattleCounts::of(&client));
+            assert_eq!(rig.playing().as_deref(), Some("bat"), "the outcome event cannot get ahead of the acknowledged defeat");
+            assert!(!rig.state.borrow().asked.iter().any(|ask| ask.starts_with("decode over2")));
+            client.on_message(2.0, ServerMsg::BattleEnd { battle_id: BattleId(1), outcome: fmv_protocol::battle::Outcome::Defeat, rewards: vec![] });
+            for _ in 0..3 { rig.frame(Some("a"), BattleCounts::of(&client)); }
+            // Longer than the 200 ms transition and the entire synthetic over2 clip: it loops.
+            rig.audio.pump(20_000);
+            rig.frame(Some("a"), BattleCounts::of(&client));
+            assert_eq!(rig.playing().as_deref(), have_track.then_some("over2"));
+            assert_eq!(rig.audio.history(), if have_track { vec!["ob", "bat", "over2"] } else { vec!["ob", "bat"] });
+            assert_eq!(client.game_over(), Some(BattleId(1)));
+            // An approved scene retry is a new EncounterStart, not a speculative defeat event.
+            client.on_message(3.0, start(2, 301));
+            rig.frame(Some("a"), BattleCounts::of(&client));
+            assert_eq!(client.game_over(), None);
+            assert_eq!(rig.playing().as_deref(), Some("bat"));
         }
     }
 
@@ -1465,6 +1548,8 @@ mod tests {
         ServerMsg::EncounterStart {
             initial_party: None,
             escape_policy: fmv_protocol::EscapePolicy::Formation,
+            victory_fanfare: true,
+            game_over_on_defeat: false,
             battle_id: BattleId(id),
             formation_id: formation,
             seed: 1,

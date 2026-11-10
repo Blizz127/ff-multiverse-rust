@@ -95,6 +95,12 @@ impl GameAdapter for SharedFf7 {
     fn load_area(&self, key: &str) -> Result<Box<dyn AreaRuntime>, AdapterError> {
         self.0.load_area(key)
     }
+    fn merge_progression(&self, stored: &[u8], advanced: &[u8]) -> Vec<u8> {
+        self.0.merge_progression(stored, advanced)
+    }
+    fn compare_exchange_progression(&self, stored: &[u8], expected: &[u8], next: &[u8]) -> Option<Vec<u8>> {
+        self.0.compare_exchange_progression(stored, expected, next)
+    }
 }
 
 /// Why the battle data cannot be opened.

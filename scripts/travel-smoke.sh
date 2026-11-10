@@ -2,7 +2,7 @@
 # scripts/travel-smoke.sh - area-travel smoke test for fmv-server + fmv-client.
 #
 # Usage: scripts/travel-smoke.sh [--fixture|--chain|--escape] [--release|--debug] [--bin-dir DIR] [--build]
-#                                [--library STATE_DIR] [--duration SECS] [--keep-logs] [-h|--help]
+#                                [--story-extended-save] [--library STATE_DIR] [--duration SECS] [--keep-logs] [-h|--help]
 #
 # DEFAULT MODE (real data): the server hosts the real FF7 field md1stin from the owner's own imported
 # library (read-only) and serves every other field its exits lead to (they are loaded when the first
@@ -86,6 +86,21 @@
 # story 33 -> 36, once. The server saves it (0224000101e121: moment 36, the reactor byte as it was), no countdown is started,
 # and A ends in md8_1. (`scripts/story-smoke.sh` is the same pair of scenes on a debug-started account, with a re-login.)
 #
+# --story-extended-save (with --chain/--escape): both bots register new accounts with the server's
+# source-backed v3 first-control profile. No debug story or existing save is supplied. The opening
+# fight (300) and Guard Scorpion (324) both run, with their durable outcomes and the ordinary story
+# transactions. Canonical v3 snapshots, known-bit retention, the complete story sequence, and exact
+# wire/store/relogin equality are checked by travel-extended-check.py. The level-30 battle modifier
+# remains a route-reliability aid; this does not prove the route's native combat difficulty.
+# This required route omits the optional Restore materia pickup: its SMTRA 53/AP 0 grant and
+# bank13:31 result are not supported atomically. No partial moment15 is saved. The authored boss
+# accepts moment14 directly and writes reactor bytes225=65/226=4; subsequent exact bits are checked.
+# The missed pickup disappears after the boss (hidden at moment>=15), so this is not all-choice parity.
+# In extended --escape the finale's authored MAPJUMP continues through md8_4 to md8_1, saving moment
+# 36 during the first run. The restart then checks that story/resources survive without replay.
+# The owner must complete all 17 transfers. The follower completes the 15 reactor transfers and
+# joins the final two only if the finale actually selected it as a watcher; its personal story stays 1.
+#
 # Isolation (the owner's state directory is never touched, only its LIBRARY is read): the server and the
 # clients run with XDG_DATA_HOME/XDG_STATE_HOME/XDG_CONFIG_HOME/XDG_CACHE_HOME and FMV_STATE_DIR
 # pointing into a throw-away directory, the server with --state-dir (or --ephemeral) inside it, each
@@ -114,6 +129,7 @@ err() { printf 'travel-smoke.sh: error: %s\n' "$*" >&2; }
 LIBRARY="${FMV_FF7_LIBRARY:-$HOME/.local/share/ff-multiverse}"
 TRAVEL_DURATION=45
 DURATION_GIVEN=0
+STORY_EXTENDED_SAVE=0
 CHAIN_DURATION=300
 # The route of --chain: the fields after md1stin, in order (see the header).
 CHAIN_ROUTE=(md1_1 md1_2 nrthmk nmkin_1 elevtr1 nmkin_2 nmkin_3 nmkin_4 nmkin_5)
@@ -162,7 +178,7 @@ MODE=real
 usage() {
   cat <<'EOF'
 Usage: scripts/travel-smoke.sh [--fixture|--chain|--escape] [--release|--debug] [--bin-dir DIR] [--build]
-                               [--library STATE_DIR] [--duration SECS] [--keep-logs] [-h|--help]
+                               [--story-extended-save] [--library STATE_DIR] [--duration SECS] [--keep-logs] [-h|--help]
 
 Two headless bots form a party on the real FF7 field md1stin, both walk through its gateway to md1_1
 (the server watches the exit line and moves them; each client loads md1_1 from its own copy), see each
@@ -181,6 +197,10 @@ synthetic FIXTURE rooms (hall and yard) and needs no owned data.
                       up the ladders, the lift ridden back up with OK, out to nrthmk, where the finale moves the story to 33
                       (one continuous run), then the server restarts and the leader logs in again at 33: it is sent
                       to md8_4, the two scenes after the escape play by themselves and the story is saved at 36
+  --story-extended-save  register both bots with fresh v3 story state (--chain/--escape only); checks opening fight 300,
+                      boss 324, durable progression and exact saved/relogin bytes (requires python3). Extended --escape
+                      follows the finale's MAPJUMP through md8_4 to md8_1/36, then reconnects without replay.
+                      Optional Restore materia pickup remains unsupported; this checks the required route only.
   --library DIR      state directory that contains library/ (default $FMV_FF7_LIBRARY, else
                       ~/.local/share/ff-multiverse); only the library is read, never written
   --duration SECS    how long each bot runs (default 45; 300 with --chain; 330 with --escape)
@@ -370,7 +390,7 @@ client_story_of() {
 
 # run_chain: both bots walk the first reactor mission with its real story (see the header, "--chain").
 run_chain() {
-  local state_real="$LIBRARY" before="" after="" route_csv="" expected="" key n smoke_line value
+  local state_real="$LIBRARY" before="" after="" route_csv="" expected="" member_route_csv="" member_expected="" key n smoke_line value
   local -a server_args client_args
   # The route, the story and the final blob of this walk: --chain's, and --escape's after them (see the header).
   local -a ROUTE=("${CHAIN_ROUTE[@]}") STORY=("${CHAIN_STORY[@]}")
@@ -381,6 +401,10 @@ run_chain() {
     FINAL_BLOB=$ESCAPE_FINAL_BLOB
     last_story_area=Ff7/nrthmk
     min_links=16 # (measured: 16 = two players, four links down and four back up)
+    if [[ $STORY_EXTENDED_SAVE == 1 ]]; then
+      ROUTE+=(md8_4 md8_1)
+      last_story_area=Ff7/md8_1
+    fi
   fi
   route_csv=$(
     IFS=,
@@ -390,6 +414,14 @@ run_chain() {
     expected+="Ff7/$key "
   done
   expected="${expected% }"
+  member_route_csv=$route_csv
+  member_expected=$expected
+  if [[ $STORY_EXTENDED_SAVE == 1 && $MODE == escape ]]; then
+    # A late follower may reach nrthmk after the entry finale selected its audience. It still
+    # completes the reactor route; the verifier requires the extra pair iff it was a watcher.
+    member_route_csv=${route_csv%,md8_4,md8_1}
+    member_expected=${expected% Ff7/md8_4 Ff7/md8_1}
+  fi
   [[ -d $state_real/library/sets ]] || {
     err "no library under $state_real (needs owned FF7 content imported with fmv-import); pass --library STATE_DIR"
     exit 1
@@ -400,6 +432,9 @@ run_chain() {
   export FMV_STATE_DIR="$WORK/state-env"
   server_args=(--bind 127.0.0.1:0 --ff7-library "$WORK/lib-state" --state-dir "$WORK/server-state" --no-random-encounters
     --battle-speed 0 --battle-tick-rate 240 --battle-level "$CHAIN_BATTLE_LEVEL")
+  if [[ $STORY_EXTENDED_SAVE == 1 ]]; then
+    server_args+=(--story-extended-save)
+  fi
   client_args=(--ff7-library "$WORK/lib-state")
 
   say "starting server: $SERVER_BIN ${server_args[*]}"
@@ -414,10 +449,13 @@ run_chain() {
 
   say "starting bots A (the leader, advances the story) and B (follows it) for ${TRAVEL_DURATION}s against $CONNECT; route md1stin,$route_csv"
   local common=(--server "$CONNECT" --headless --duration "$TRAVEL_DURATION" --bot circle --battle-auto "${client_args[@]}")
+  if [[ $STORY_EXTENDED_SAVE == 1 ]]; then
+    common+=(--mods off)
+  fi
   "$CLIENT_BIN" "${common[@]}" --name A --state-dir "$WORK/client-A" --party-invite-first-peer --story-advance --travel "$route_csv" \
     >"$WORK/client-A.log" 2>&1 &
   CPID[A]=$!
-  "$CLIENT_BIN" "${common[@]}" --name B --state-dir "$WORK/client-B" --party-accept --travel "$route_csv" --travel-follow \
+  "$CLIENT_BIN" "${common[@]}" --name B --state-dir "$WORK/client-B" --party-accept --travel "$member_route_csv" --travel-follow \
     >"$WORK/client-B.log" 2>&1 &
   CPID[B]=$!
   wait_clients $((TRAVEL_DURATION + CLIENT_GRACE))
@@ -426,6 +464,15 @@ run_chain() {
   SMOKE_LINES=()
   for n in "${CLIENT_NAMES[@]}"; do
     local log="$WORK/client-$n.log"
+    local expected_client="$expected" expected_count=${#ROUTE[@]} expected_final="${ROUTE[${#ROUTE[@]} - 1]}"
+    if [[ $STORY_EXTENDED_SAVE == 1 && $MODE == escape && $n == B ]]; then
+      # Presence in the finale cohort is independently checked against the actual SceneStart.
+      if [[ $(area_changes_of "$(last_line_with "$log" "SMOKE name=" || true)") != "${#ROUTE[@]}" ]]; then
+        expected_client=$member_expected
+        expected_count=$((${#ROUTE[@]} - 2))
+        expected_final=nrthmk
+      fi
+    fi
     if [[ ${CRC[$n]:-} == timeout ]]; then
       problem "client $n was still running ${CLIENT_GRACE}s after its ${TRAVEL_DURATION}s duration and was killed"
     elif [[ ${CRC[$n]:-} != 0 ]]; then
@@ -436,17 +483,17 @@ run_chain() {
       SMOKE_LINES+=("$smoke_line")
       LINE[$n]="$smoke_line"
       [[ $(field "$smoke_line" fixture) == false ]] || problem "client $n: fixture is not false: $smoke_line"
-      [[ $(field "$smoke_line" area) == "Ff7/${ROUTE[${#ROUTE[@]} - 1]}" ]] ||
-        problem "client $n should end in Ff7/${ROUTE[${#ROUTE[@]} - 1]}: $smoke_line"
+      [[ $(field "$smoke_line" area) == "Ff7/$expected_final" ]] ||
+        problem "client $n should end in Ff7/$expected_final: $smoke_line"
       value=$(area_changes_of "$smoke_line")
-      [[ $value == "${#ROUTE[@]}" ]] || problem "client $n should have changed area ${#ROUTE[@]} times (area_changes=${value:-?}): $smoke_line"
+      [[ $value == "$expected_count" ]] || problem "client $n should have changed area $expected_count times (area_changes=${value:-?}): $smoke_line"
       value=$(field "$smoke_line" party)
       [[ $value =~ ^[0-9]+$ ]] && ((value >= 2)) || problem "client $n was never in a party of two (party=${value:-?}): $smoke_line"
     else
       problem "client $n printed no SMOKE line"
     fi
     entered_areas "$log"
-    [[ "${ENTERED[*]:-}" == "$expected" ]] || problem "client $n entered [${ENTERED[*]:-nothing}], expected [$expected]"
+    [[ "${ENTERED[*]:-}" == "$expected_client" ]] || problem "client $n entered [${ENTERED[*]:-nothing}], expected [$expected_client]"
     log_has "$log" "headless: travel: the route" || problem "client $n did not finish its route: $(last_line_with "$log" "headless: travel:" || echo 'no travel summary')"
     if log_has "$log" "DIVERGENCE"; then
       problem "client $n reported a BATTLE DIVERGENCE"
@@ -464,7 +511,7 @@ run_chain() {
   for key in "${ROUTE[@]}"; do
     if loaded=$(last_line_with "$WORK/server.log" "area loaded area=Ff7/$key "); then
       case $key in
-        nmkin_2 | nmkin_3 | nmkin_4 | nmkin_5) ;; # their characters are hidden by their own scripts or placed only in some stories
+        nmkin_2 | nmkin_3 | nmkin_4 | nmkin_5 | md8_4 | md8_1) ;; # hidden/script-placed cast, no static NPC requirement
         *)
           # every other field of the route has characters of its own: the server loaded its NPCs with it
           value=$(field "$loaded" npcs)
@@ -476,8 +523,12 @@ run_chain() {
     fi
   done
   value=$(count_lines_with "$WORK/server.log" "player leaves through an exit")
-  [[ $value == $((2 * ${#ROUTE[@]})) ]] ||
-    problem "the server should have moved the two players through an exit ${#ROUTE[@]} times each (it logged $value moves)"
+  local expected_exits=$((2 * ${#ROUTE[@]}))
+  if [[ $STORY_EXTENDED_SAVE == 1 && $MODE == escape && $(area_changes_of "${LINE[B]:-}") == 15 ]]; then
+    expected_exits=$((expected_exits - 2))
+  fi
+  [[ $value == "$expected_exits" ]] ||
+    problem "the server should have logged $expected_exits authored field transfers for the two players (it logged $value moves)"
   # The lift: both players left elevtr1 for nmkin_2 (the exit the story opened for the leader). With --chain none went back up
   # (and none crossed the lift's line toward nmkin_1 before the leader had ridden); with --escape both did, after the leader's
   # ride back up opened that exit.
@@ -501,38 +552,45 @@ run_chain() {
   fi
   value=$(count_lines_with "$WORK/server.log" "smkin")
   [[ $value == 0 ]] || problem "the server mentions smkin ($value lines): somebody was sent, or offered a way, into the second reactor: $(last_line_with "$WORK/server.log" "smkin" || true)"
-  # The Guard Scorpion: nmkin_5's triangle started the scripted fight (formation 324, one enemy) for the party, the canon pair
-  # and both bots at the pinned level, and the story step came after the win. Every bot played the whole battle from its own
-  # data and matched the server (0 divergences, every battle verified by replay).
-  local started ended outcome="" battle_ids=()
-  # ("world: battle started battle=" is the battle's own start line; the story's "story battle started battle=" says who asked for it)
-  value=$(count_lines_with "$WORK/server.log" "world: battle started battle=")
-  [[ $value == 1 ]] || problem "the server should have started exactly one battle (the scripted one), it logged $value"
-  value=$(count_lines_with "$WORK/server.log" "story battle started battle=")
-  [[ $value == 1 ]] || problem "the one battle should have been started by a story point (the server logged $value 'story battle started' lines)"
-  started=$(strip_ansi "$(first_line_with "$WORK/server.log" "world: battle started battle=" || true)")
-  ended=$(strip_ansi "$(last_line_with "$WORK/server.log" "battle ended battle=" || true)")
-  if [[ -z $started ]]; then
-    problem "the server never started the scripted battle"
+  if [[ $STORY_EXTENDED_SAVE == 1 ]]; then
+    # Extended battle logs and the complete ID/formation sequences are checked after the store closes.
+    for n in "${CLIENT_NAMES[@]}"; do
+      check_mirror "$n" "$WORK/client-$n.log" 2
+    done
   else
-    [[ $(field "$started" formation) == "$CHAIN_BATTLE_FORMATION" ]] || problem "the scripted battle was not formation $CHAIN_BATTLE_FORMATION: $started"
-    [[ $(field "$started" enemies) == 1 ]] || problem "the Guard Scorpion's formation has one enemy: $started"
-    [[ $started == *"members=2"* && $(companions_of "$started") == 2 ]] || problem "the scripted battle did not have the canon pair and both bots: $started"
-    [[ $started == *"levels=[$CHAIN_BATTLE_LEVEL, $CHAIN_BATTLE_LEVEL, $CHAIN_BATTLE_LEVEL, $CHAIN_BATTLE_LEVEL]"* ]] ||
-      problem "the fight was not pinned to level $CHAIN_BATTLE_LEVEL (--battle-level): $started"
+    # The Guard Scorpion: nmkin_5's triangle started the scripted fight (formation 324, one enemy) for the party, the canon pair
+    # and both bots at the pinned level, and the story step came after the win. Every bot played the whole battle from its own
+    # data and matched the server (0 divergences, every battle verified by replay).
+    local started ended outcome="" battle_ids=()
+    # ("world: battle started battle=" is the battle's own start line; the story's "story battle started battle=" says who asked for it)
+    value=$(count_lines_with "$WORK/server.log" "world: battle started battle=")
+    [[ $value == 1 ]] || problem "the server should have started exactly one battle (the scripted one), it logged $value"
+    value=$(count_lines_with "$WORK/server.log" "story battle started battle=")
+    [[ $value == 1 ]] || problem "the one battle should have been started by a story point (the server logged $value 'story battle started' lines)"
+    started=$(strip_ansi "$(first_line_with "$WORK/server.log" "world: battle started battle=" || true)")
+    ended=$(strip_ansi "$(last_line_with "$WORK/server.log" "battle ended battle=" || true)")
+    if [[ -z $started ]]; then
+      problem "the server never started the scripted battle"
+    else
+      [[ $(field "$started" formation) == "$CHAIN_BATTLE_FORMATION" ]] || problem "the scripted battle was not formation $CHAIN_BATTLE_FORMATION: $started"
+      [[ $(field "$started" enemies) == 1 ]] || problem "the Guard Scorpion's formation has one enemy: $started"
+      [[ $started == *"members=2"* && $(companions_of "$started") == 2 ]] || problem "the scripted battle did not have the canon pair and both bots: $started"
+      [[ $started == *"levels=[$CHAIN_BATTLE_LEVEL, $CHAIN_BATTLE_LEVEL, $CHAIN_BATTLE_LEVEL, $CHAIN_BATTLE_LEVEL]"* ]] ||
+        problem "the fight was not pinned to level $CHAIN_BATTLE_LEVEL (--battle-level): $started"
+    fi
+    if [[ -z $ended ]]; then
+      problem "the server never logged the end of the scripted battle"
+    else
+      outcome=$(field "$ended" outcome)
+      [[ $outcome == Victory ]] || problem "the scripted battle was not won (outcome '$outcome'): the story step after it cannot have been paid: $ended"
+    fi
+    for n in "${CLIENT_NAMES[@]}"; do
+      check_mirror "$n" "$WORK/client-$n.log" 1
+      battle_ids+=("$(battle_id_of "$WORK/client-$n.log" || true)")
+      log_has "$WORK/client-$n.log" "started: formation $CHAIN_BATTLE_FORMATION," || problem "client $n did not start a battle of formation $CHAIN_BATTLE_FORMATION"
+    done
+    [[ -n ${battle_ids[0]:-} && ${battle_ids[0]} == "${battle_ids[1]:-}" ]] || problem "the bots did not enter the same battle (A: '${battle_ids[0]:-}', B: '${battle_ids[1]:-}')"
   fi
-  if [[ -z $ended ]]; then
-    problem "the server never logged the end of the scripted battle"
-  else
-    outcome=$(field "$ended" outcome)
-    [[ $outcome == Victory ]] || problem "the scripted battle was not won (outcome '$outcome'): the story step after it cannot have been paid: $ended"
-  fi
-  for n in "${CLIENT_NAMES[@]}"; do
-    check_mirror "$n" "$WORK/client-$n.log" 1
-    battle_ids+=("$(battle_id_of "$WORK/client-$n.log" || true)")
-    log_has "$WORK/client-$n.log" "started: formation $CHAIN_BATTLE_FORMATION," || problem "client $n did not start a battle of formation $CHAIN_BATTLE_FORMATION"
-  done
-  [[ -n ${battle_ids[0]:-} && ${battle_ids[0]} == "${battle_ids[1]:-}" ]] || problem "the bots did not enter the same battle (A: '${battle_ids[0]:-}', B: '${battle_ids[1]:-}')"
   # Ladders and jumps: the server moved each player inside nmkin_3 and nmkin_4 by their lines (it logs each one).
   value=$(count_lines_with "$WORK/server.log" "player used a link entity=")
   ((value >= min_links)) ||
@@ -548,7 +606,7 @@ run_chain() {
   [[ $joined =~ $re_entity ]] && a_entity=${BASH_REMATCH[1]}
   if [[ -z $a_entity ]]; then
     problem "could not read A's entity from its client log ($joined)"
-  else
+  elif [[ $STORY_EXTENDED_SAVE == 0 ]]; then
     local -a seen_story=() client_steps=()
     local step want rest i
     while IFS= read -r step; do
@@ -594,16 +652,21 @@ run_chain() {
     [[ $last_step =~ $re_account ]] && a_account=${BASH_REMATCH[1]}
     if [[ -z $a_account ]]; then
       problem "could not read A's account from the server log"
-    else
+    elif [[ $STORY_EXTENDED_SAVE == 0 ]]; then
       log_has "$WORK/server.log" "story saved account=$a_account bytes=7 progress=$FINAL_BLOB" ||
         problem "the server never saved A's story as $FINAL_BLOB: $(last_line_with "$WORK/server.log" "story saved account=$a_account" || echo 'no story saved line')"
     fi
+  fi
+  if [[ $STORY_EXTENDED_SAVE == 1 ]]; then
+    python3 "$SELF_DIR/travel-extended-check.py" route "$WORK" "$MODE" "$a_account" ||
+      problem "fresh v3 route/state checks failed (see verifier output above)"
+    FINAL_BLOB=$(stored_blob "$WORK/server-state/progression/$a_account/Ff7.json")
   fi
   if [[ $MODE == escape ]]; then
     check_countdown "$a_account"
     # Only a walk that held together is worth a second run.
     if ((${#PROBLEMS[@]} == 0)); then
-      relogin_at_33 "$a_account" "$first_addr" "${server_args[@]}"
+      relogin_after_escape "$a_account" "$first_addr" "${server_args[@]}"
     fi
   fi
   after=$(ls -A -- "$state_real" | sort | tr '\n' ' ')
@@ -627,7 +690,11 @@ run_chain() {
   say "server: $(last_line_with "$WORK/server.log" "area loaded area=Ff7/${ROUTE[${#ROUTE[@]} - 1]} " || true)"
   say "server: $(last_line_with "$WORK/server.log" "story saved account=$a_account" || true)"
   RESULT=pass
-  if [[ $MODE == escape ]]; then
+  if [[ $STORY_EXTENDED_SAVE == 1 ]]; then
+    say "PASS: fresh v3 owner completed the $MODE route and the follower completed the reactor route; fights 300 and 324 were won and replay-verified, authored progression and both personal saved stories passed canonical v3/wire checks; level $CHAIN_BATTLE_LEVEL is a route test modifier; owned library state unchanged."
+    say "COVERAGE GAP: optional Restore materia pickup is unsupported; its grant/result/moment15 are not saved and the pickup is unavailable after the boss."
+    [[ $MODE != escape ]] || say "PASS: the authored escape continued through moment 33 to md8_1/36; relogin retained exact story/resources without replay; the follower kept its own fresh story."
+  elif [[ $MODE == escape ]]; then
     say "PASS: two bots in a party walked md1stin -> ${route_csv//,/ -> } with the real story: the leader moved it 1 -> 27 (the Guard Scorpion fought and won, which started the bomb's ${ESCAPE_COUNTDOWN_SECS} s countdown), the lift was ridden back up with OK, the ladders and jumps were climbed in both directions, the finale in nrthmk moved the story to 33 (blob $FINAL_BLOB saved) and ended the countdown (cleared, never time-up), the member followed; after a restart the leader logged in at 33, was sent to md8_4, played the two scenes after the escape and was saved at 36 ($RELOGIN_FINAL_BLOB) in md8_1; $state_real unchanged ($after)"
   else
     say "PASS: two bots in a party walked md1stin -> ${route_csv//,/ -> } with the real story: the leader moved it 1 -> 27 (the lift ridden with OK, the woman and the materia talked to, the Guard Scorpion fought and won), the ladders and jumps of nmkin_3 and nmkin_4 were climbed, the exit to nmkin_2 was the one the story opened, the member followed; $state_real unchanged ($after)"
@@ -667,17 +734,19 @@ check_countdown() {
   done
 }
 
-# relogin_at_33 <account of the leader> <address of the first server> <the first server's arguments>...: --escape's second run
+# relogin_after_escape <account of the leader> <address of the first server> <the first server's arguments>...: --escape's second run
 # (header): the server restarts on the same state directory and A logs in again at the saved moment 33. It is told its story,
 # sent to md8_4, the two scenes after the escape start by themselves and are played through, the story moves 33 -> 36 once and
-# is saved, no countdown is started, and A ends in md8_1.
-relogin_at_33() {
+# is saved, no countdown is started, and A ends in md8_1. Extended mode already reached 36; its restart must replay nothing.
+relogin_after_escape() {
   local account="$1" first_addr="$2" line value stored expected_areas=""
   shift 2
   local -a args=("$@") client_args=(--ff7-library "$WORK/lib-state")
+  local -a login_areas=("${RELOGIN_AREAS[@]}")
+  [[ $STORY_EXTENDED_SAVE == 0 ]] || login_areas=(md8_1)
   # (the first server argument is --bind, its value the next one)
   args[1]="$first_addr"
-  for n in "${RELOGIN_AREAS[@]}"; do
+  for n in "${login_areas[@]}"; do
     expected_areas+="Ff7/$n "
   done
   expected_areas="${expected_areas% }"
@@ -702,16 +771,22 @@ relogin_at_33() {
   fi
   if line=$(last_line_with "$log" "SMOKE name="); then
     line=$(strip_ansi "$line")
-    [[ $(field "$line" area) == "Ff7/${RELOGIN_AREAS[${#RELOGIN_AREAS[@]} - 1]}" ]] ||
-      problem "run 2: A should end in Ff7/${RELOGIN_AREAS[${#RELOGIN_AREAS[@]} - 1]}: $line"
+    [[ $(field "$line" area) == "Ff7/${login_areas[${#login_areas[@]} - 1]}" ]] ||
+      problem "run 2: A should end in Ff7/${login_areas[${#login_areas[@]} - 1]}: $line"
     value=$(area_changes_of "$line")
-    [[ $value == "${#RELOGIN_AREAS[@]}" ]] || problem "run 2: A should have changed area ${#RELOGIN_AREAS[@]} times (area_changes=${value:-?}): $line"
+    [[ $value == "${#login_areas[@]}" ]] || problem "run 2: A should have changed area ${#login_areas[@]} times (area_changes=${value:-?}): $line"
     say "run 2 client: $line"
   else
     problem "run 2: client A printed no SMOKE line"
   fi
   entered_areas "$log"
   [[ "${ENTERED[*]:-}" == "$expected_areas" ]] || problem "run 2: A entered [${ENTERED[*]:-nothing}], expected [$expected_areas]"
+  if [[ $STORY_EXTENDED_SAVE == 1 ]]; then
+    stop_server
+    python3 "$SELF_DIR/travel-extended-check.py" relogin "$WORK" "$account" ||
+      problem "fresh v3 relogin/state checks failed (see verifier output above)"
+    return
+  fi
   log_has "$log" "story: joined with progress $ESCAPE_FINAL_BLOB" ||
     problem "run 2: A was not told its story ($ESCAPE_FINAL_BLOB) when it logged in again: $(last_line_with "$log" 'story:' || echo 'no story line')"
   value=$(count_lines_with "$log" "scene: ended run=")
@@ -744,6 +819,7 @@ main() {
       --fixture) MODE=fixture ;;
       --chain) MODE=chain ;;
       --escape) MODE=escape ;;
+      --story-extended-save) STORY_EXTENDED_SAVE=1 ;;
       --release) PROFILE=release ;;
       --debug) PROFILE=debug ;;
       --bin-dir)
@@ -773,6 +849,10 @@ main() {
     shift
   done
   [[ $TRAVEL_DURATION =~ ^[1-9][0-9]*$ ]] || usage_error "--duration must be a positive whole number of seconds"
+  if [[ $STORY_EXTENDED_SAVE == 1 ]]; then
+    [[ $MODE == chain || $MODE == escape ]] || usage_error "--story-extended-save requires --chain or --escape"
+    command -v python3 >/dev/null || usage_error "--story-extended-save requires python3"
+  fi
   if [[ $MODE == chain && $DURATION_GIVEN == 0 ]]; then
     TRAVEL_DURATION=$CHAIN_DURATION
   fi

@@ -125,7 +125,7 @@ fn sixteen_full_before_and_after_images_fit_the_batch_intent_limit() {
     }).collect();
     let before: Vec<_> = rows.iter().map(|row| row.before.state(row.account, row.game)).collect();
     let after: Vec<_> = rows.iter().map(|row| row.after.state(row.account, row.game)).collect();
-    assert_eq!(validate_transition(&operation, &before, &after).unwrap(), 0);
+    assert_eq!(validate_transition(&operation, &before, &after).unwrap(), Some(0));
     let intent = BatchIntent { operation, receipt, result, rows };
     let file = BatchIntentFile {
         schema_version: BATCH_INTENT_VERSION, kind: "fmv-scene-batch-transaction".into(), checksum: digest(&intent).unwrap(), intent,

@@ -16,10 +16,17 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use fmv_ff7::field::section;
+use fmv_ff7::story::{canon_party, StoryState};
 use fmv_ff7_battle::rules::{BattleEvent, Command, Outcome};
 use fmv_protocol::{BattleRules, BattleSetup, Ff7BattleData};
 use fmv_server::companion::{self, Clock, Pacing, PlayerTurn};
 use fmv_server::ff7::{decode_encounter_section, open_battle_data, open_ff7, prewarm, Ff7Source};
+
+/// These two-companion simulations deliberately use the source-backed reactor party at moment 11.
+/// Opening-station coverage uses its separate Cloud-only encounter test in `opening_real`.
+fn reactor_canon_party() -> Vec<u8> {
+    canon_party(&StoryState::at(11))
+}
 
 fn source() -> Option<Ff7Source> {
     let Some(dir) = std::env::var_os("FMV_FF7_LIBRARY").map(PathBuf::from) else {
@@ -134,14 +141,14 @@ fn simulate_paced(
         .collect();
     let leader_level = players.first().map_or_else(|| data.starting_level(0), |p| p.level);
     let companions: Vec<fmv_protocol::BattleMember> = if canon {
-        [0u8, 1].iter().map(|&c| fmv_protocol::BattleMember::companion(data.character_name(c).expect("a canon name"), c, leader_level, 0)).collect()
+        reactor_canon_party().into_iter().map(|c| fmv_protocol::BattleMember::companion(data.character_name(c).expect("a canon name"), c, leader_level, 0)).collect()
     } else {
         Vec::new()
     };
     let companion_count = companions.len();
     let party: Vec<fmv_protocol::BattleMember> = companions.into_iter().chain(players).collect();
     let info = data.formation(formation).expect("a real formation");
-    let setup = BattleSetup { initial_party: None, escape_policy: fmv_protocol::EscapePolicy::Formation,
+    let setup = BattleSetup { initial_party: None, victory_fanfare: true, game_over_on_defeat: false, escape_policy: fmv_protocol::EscapePolicy::Formation,
         formation_id: formation,
         seed,
         party,
@@ -257,14 +264,14 @@ fn simulate_commanded(data: &Ff7BattleData, formation: u16, characters: &[u8], l
         })
         .collect();
     let leader_level = players.first().map_or_else(|| data.starting_level(0), |p| p.level);
-    let companions: Vec<fmv_protocol::BattleMember> = [0u8, 1]
-        .iter()
-        .map(|&c| fmv_protocol::BattleMember::companion(data.character_name(c).expect("a canon name"), c, leader_level, 0).commanded_by(leader))
+    let companions: Vec<fmv_protocol::BattleMember> = reactor_canon_party()
+        .into_iter()
+        .map(|c| fmv_protocol::BattleMember::companion(data.character_name(c).expect("a canon name"), c, leader_level, 0).commanded_by(leader))
         .collect();
     let companion_count = companions.len();
     let party: Vec<fmv_protocol::BattleMember> = companions.into_iter().chain(players).collect();
     let info = data.formation(formation).expect("a real formation");
-    let setup = BattleSetup { initial_party: None, escape_policy: fmv_protocol::EscapePolicy::Formation,
+    let setup = BattleSetup { initial_party: None, victory_fanfare: true, game_over_on_defeat: false, escape_policy: fmv_protocol::EscapePolicy::Formation,
         formation_id: formation,
         seed,
         party,
@@ -558,7 +565,7 @@ fn the_default_debug_formation_exists_and_every_formation_builds_for_every_chara
         let Some(info) = data.formation(id) else { continue };
         assert!(info.enemies >= 1);
         for character in 0..9u8 {
-            let setup = BattleSetup { initial_party: None, escape_policy: fmv_protocol::EscapePolicy::Formation,
+            let setup = BattleSetup { initial_party: None, victory_fanfare: true, game_over_on_defeat: false, escape_policy: fmv_protocol::EscapePolicy::Formation,
                 formation_id: id,
                 seed: 1,
                 party: vec![fmv_protocol::BattleMember::player(
@@ -828,7 +835,7 @@ fn the_enemies_take_their_turns_while_the_players_sit_in_their_menus() {
             .collect();
         let (mut early, mut first_total, mut latest, mut acted) = (0u64, 0f64, 0f64, 0u64);
         for seed in 0..200u64 {
-            let setup = BattleSetup { initial_party: None, escape_policy: fmv_protocol::EscapePolicy::Formation, formation_id: formation, seed, party: members.clone(), preemptive: info.preemptive, back_attack: info.back_attack, battle_speed: speed, ticks_per_second: tps };
+            let setup = BattleSetup { initial_party: None, victory_fanfare: true, game_over_on_defeat: false, escape_policy: fmv_protocol::EscapePolicy::Formation, formation_id: formation, seed, party: members.clone(), preemptive: info.preemptive, back_attack: info.back_attack, battle_speed: speed, ticks_per_second: tps };
             let mut state = data.build(&setup).expect("builds");
             let mut first: Option<f64> = None;
             for _ in 0..(60 * u64::from(tps)) {
@@ -1124,7 +1131,7 @@ fn a_guard_scorpion_fight_with_its_counters_is_replayed_exactly_by_a_client_engi
         for (speed, tps) in [(128u8, 60u32), (0, 240)] {
             for seed in 0..6u64 {
                 let party: Vec<fmv_protocol::BattleMember> = if canon {
-                    let companions = [0u8, 1].map(|c| fmv_protocol::BattleMember::companion(data.character_name(c).expect("a canon name"), c, 20, 255));
+                    let companions = reactor_canon_party().into_iter().map(|c| fmv_protocol::BattleMember::companion(data.character_name(c).expect("a canon name"), c, 20, 255));
                     let players = [2u8, 3].iter().enumerate().map(|(i, &character)| {
                         fmv_protocol::BattleMember::player(fmv_core::EntityId(i as u64 + 1), fmv_core::AccountId(i as u64 + 1), format!("P{i}"), character, 20, 0)
                     });
@@ -1139,7 +1146,7 @@ fn a_guard_scorpion_fight_with_its_counters_is_replayed_exactly_by_a_client_engi
                         .collect()
                 };
                 let companion_count = party.iter().filter(|m| m.is_companion()).count();
-                let setup = BattleSetup { initial_party: None, escape_policy: fmv_protocol::EscapePolicy::Formation,
+                let setup = BattleSetup { initial_party: None, victory_fanfare: true, game_over_on_defeat: false, escape_policy: fmv_protocol::EscapePolicy::Formation,
                     formation_id: formation,
                     seed,
                     party,
@@ -1219,12 +1226,12 @@ fn boss_fight(data: &Ff7BattleData, formation: u16, level: u8, defends: usize, s
     use fmv_ff7_battle::rules::{ActionRef, ActorId};
     let (speed, tps) = (0u8, 240u32);
     let players = (0..2u64).map(|i| fmv_protocol::BattleMember::player(fmv_core::EntityId(i + 1), fmv_core::AccountId(i + 1), format!("P{i}"), 1, level, 0));
-    let companions = [0u8, 1].map(|c| fmv_protocol::BattleMember::companion(data.character_name(c).expect("a canon name"), c, level, 0));
+    let companions = reactor_canon_party().into_iter().map(|c| fmv_protocol::BattleMember::companion(data.character_name(c).expect("a canon name"), c, level, 0));
     let companion_count = companions.len();
     let party: Vec<fmv_protocol::BattleMember> = companions.into_iter().chain(players).collect();
     let fighters = party.len();
     let info = data.formation(formation).expect("a real formation");
-    let setup = BattleSetup { initial_party: None, escape_policy: fmv_protocol::EscapePolicy::Formation, formation_id: formation, seed, party, preemptive: info.preemptive, back_attack: info.back_attack, battle_speed: speed, ticks_per_second: tps };
+    let setup = BattleSetup { initial_party: None, victory_fanfare: true, game_over_on_defeat: false, escape_policy: fmv_protocol::EscapePolicy::Formation, formation_id: formation, seed, party, preemptive: info.preemptive, back_attack: info.back_attack, battle_speed: speed, ticks_per_second: tps };
     let mut state = data.build(&setup).expect("builds");
     let foe = ActorId(fighters as u8);
     let pacing = Pacing::default();

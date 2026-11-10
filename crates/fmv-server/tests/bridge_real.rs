@@ -247,12 +247,14 @@ async fn encounter(peer: &mut Peer, run: SceneRunId, ordinal: u32, rules: &fmv_p
                 announced = Some(battle_id);
             }
             ServerMsg::EncounterStart { battle_id, formation_id, seed, party, preemptive, back_attack,
-                battle_speed, ticks_per_second, escape_policy, initial_party, data_fingerprint } => {
+                battle_speed, ticks_per_second, escape_policy, initial_party, victory_fanfare, game_over_on_defeat, data_fingerprint } => {
                 assert_eq!(announced, Some(battle_id), "the scene handoff precedes its encounter");
                 assert_eq!(data_fingerprint, rules.data_fingerprint());
                 assert_eq!(escape_policy, EscapePolicy::Forbidden, "BTLMD 8 overrides escapable scene.bin data");
+                assert!(victory_fanfare, "the bridge script applies BTLMD 8 with fanfare enabled");
+                assert!(game_over_on_defeat, "bridge defeat enters Game Over instead of resuming the script");
                 return (battle_id, BattleSetup { formation_id, seed, party, preemptive, back_attack,
-                    battle_speed, ticks_per_second, escape_policy, initial_party });
+                    battle_speed, ticks_per_second, escape_policy, initial_party, victory_fanfare, game_over_on_defeat });
             }
             ServerMsg::SceneEnded { .. } => panic!("a battle handoff cannot release its scene"),
             ServerMsg::Reject { code, reason } => panic!("battle handoff refused: {code:?}: {reason}"),

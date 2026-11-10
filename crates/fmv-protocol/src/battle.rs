@@ -5,12 +5,14 @@
 //! A shared battle is server-authoritative and client-replayed. The server starts a
 //! [`fmv_ff7_battle::rules::BattleState`] and announces it with `ServerMsg::EncounterStart`: the
 //! formation id (`scene * 4 + slot`), the RNG seed, who fights as which character at which level,
-//! the start flags, the engine pace and a [`Fingerprint`] of the battle data the server built it
-//! from. **No stat, enemy record or other game data is ever sent.** Every peer rebuilds the same
-//! combatants from its OWN `scene.bin` and `kernel.bin` through [`BattleRules::build`] (for FF7,
-//! [`Ff7BattleData`]); the engine is a pure function of those inputs, so a peer that owns the same
-//! edition computes the same numbers. The wire carries the engine's own serde types
-//! ([`BattleEvent`], [`Command`], [`Outcome`], [`ActorId`]), pinned by golden tests in this crate.
+//! the start flags, explicit victory fanfare and defeat presentation choices, the engine pace and
+//! a [`Fingerprint`] of the battle data the server built it from. **No stat, enemy record or other
+//! game data is ever sent.**
+//! Every peer rebuilds the same combatants from its OWN `scene.bin` and `kernel.bin` through
+//! [`BattleRules::build`] (for FF7, [`Ff7BattleData`]); the engine is a pure function of those inputs,
+//! so a peer that owns the same edition computes the same numbers. The wire carries the engine's
+//! own serde types ([`BattleEvent`], [`Command`], [`Outcome`], [`ActorId`]), pinned by golden tests
+//! in this crate.
 //!
 //! # The input log
 //!
@@ -514,7 +516,7 @@ impl fmt::Display for BattleRejection {
 // The shared setup
 // ---------------------------------------------------------------------------------------------
 
-/// Everything a peer needs to build the engine of a battle: the content of `EncounterStart`.
+/// Everything a peer needs to build a battle and select its presentation: the content of `EncounterStart`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BattleSetup {
@@ -528,6 +530,13 @@ pub struct BattleSetup {
     pub initial_party: Option<Vec<BattleInitialState>>,
     /// A field script may forbid escape even when the formation permits it (`BTLMD 8`).
     pub escape_policy: EscapePolicy,
+    /// The server's explicit choice of whether victory plays the fanfare. Required since v21;
+    /// clients must preserve this choice rather than infer it from the formation.
+    pub victory_fanfare: bool,
+    /// Whether an authoritative defeat shows Game Over with only a return to the title screen.
+    /// Required since v21; wait for the server's `BattleEnd` with [`Outcome::Defeat`].
+    /// This presentation choice does not authorize a battle retry.
+    pub game_over_on_defeat: bool,
     /// The party gets the first move (full gauges); the enemies start empty.
     pub preemptive: bool,
     /// The enemies get the first move; the party starts empty.
@@ -1563,6 +1572,8 @@ mod tests {
             party: (0..members as u64).map(|i| member(i, i as u8)).collect(),
             initial_party: None,
             escape_policy: EscapePolicy::Formation,
+            victory_fanfare: true,
+            game_over_on_defeat: false,
             preemptive: false,
             back_attack: false,
             battle_speed: 0,
@@ -1605,6 +1616,30 @@ mod tests {
         // A different seed is a different battle (initial gauges are random).
         let other = rules.build(&BattleSetup { seed: 7, ..setup.clone() }).unwrap();
         assert_ne!(other, rules.build(&setup).unwrap());
+    }
+
+    #[test]
+    fn a_battle_setup_requires_explicit_presentation_choices() {
+        // The same formation preserves every combination of the server's independent choices.
+        for (victory_fanfare, game_over_on_defeat) in [(false, false), (false, true), (true, false), (true, true)] {
+            let setup = BattleSetup { victory_fanfare, game_over_on_defeat, ..setup(328, 1) };
+            let wire = serde_json::to_value(&setup).unwrap();
+            assert_eq!(wire["victory_fanfare"], serde_json::json!(victory_fanfare));
+            assert_eq!(wire["game_over_on_defeat"], serde_json::json!(game_over_on_defeat));
+            assert_eq!(serde_json::from_value::<BattleSetup>(wire.clone()).unwrap(), setup);
+
+            for field in ["victory_fanfare", "game_over_on_defeat"] {
+                let mut missing = wire.clone();
+                missing.as_object_mut().unwrap().remove(field);
+                let error = serde_json::from_value::<BattleSetup>(missing).unwrap_err();
+                assert!(error.to_string().contains(&format!("missing field `{field}`")), "{error}");
+                for invalid in [serde_json::Value::Null, serde_json::json!("true"), serde_json::json!(1), serde_json::json!([])] {
+                    let mut damaged = wire.clone();
+                    damaged[field] = invalid;
+                    assert!(serde_json::from_value::<BattleSetup>(damaged).is_err(), "{field} requires an explicit boolean");
+                }
+            }
+        }
     }
 
     #[test]
@@ -1766,7 +1801,7 @@ mod tests {
             let info = rules.formation(formation).unwrap();
             let mut setup = BattleSetup {
                 formation_id: formation, seed: 17 + ordinal as u64, party: party.clone(),
-                initial_party: None, escape_policy: EscapePolicy::Forbidden,
+                initial_party: None, escape_policy: EscapePolicy::Forbidden, victory_fanfare: true, game_over_on_defeat: false,
                 preemptive: info.preemptive, back_attack: info.back_attack,
                 battle_speed: 0, ticks_per_second: 240,
             };

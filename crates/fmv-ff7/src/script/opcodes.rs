@@ -307,7 +307,7 @@ pub(crate) fn info(op: u8) -> Option<OpInfo> {
             "LADER",
             [Banks(2), Bs16("x", 0), Bs16("y", 1), Bs16("z", 2), Bu16("triangle", 3), U8("way"), U8("animation"), U8("direction"), U8("speed")]
         ),
-        0xC3 => op!("OFST", [Banks(2), U8("move_type"), Bs16("x", 0), Bs16("y", 1), Bs16("z", 2), Bu16("speed", 3)]),
+        0xC3 => op!("OFST", [Banks(2), U8("move_type"), Bs16("x", 0), Bs16("y", 1), Bs16("z", 2), Bs16("speed", 3)]),
         0xC4 => op!("OFSTW", []),
         0xC5 => op!("TALKR", [Banks(1), Bu8("radius", 1)]),
         0xC6 => op!("SLIDR", [Banks(1), Bu8("radius", 1)]),

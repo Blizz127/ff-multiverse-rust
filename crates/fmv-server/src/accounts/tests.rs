@@ -413,6 +413,59 @@ fn token_with_starting_rules(store: &Store, token: &str, now: u64) -> Result<Log
 }
 
 #[test]
+fn fresh_story_and_resources_are_committed_before_the_token_and_reopen_preserves_both() {
+    let (dir, store) = store();
+    let story = fmv_ff7::story::StoryState::fresh_first_control().encode();
+    let registration = validate_registration(GameId::Ff7, "Fresh story", &request([0; 3], None, Some(2))).unwrap();
+    let created = std::cell::Cell::new(false);
+    let registered = register_with_initial_state(&store, GameId::Ff7, registration, NOW, || created.set(true),
+        Some(&StartingRules { gil: 240 }), Some(story.clone())).unwrap();
+    assert!(created.get());
+    assert_eq!(registered.progression, story);
+    let account = registered.account;
+    let pair = store.get_scene_state(account, GameId::Ff7).unwrap();
+    assert_eq!(pair.pair.story.blob, story);
+    assert_eq!(pair.pair.character.as_ref().map(Progress::from_record), registered.progress.stored);
+    assert_eq!(pair.pair.character.as_ref().and_then(|record| record.inventory.clone()), registered.progress.inventory);
+    let token = registered.issued_token.unwrap();
+    let story_file = dir.path().join("state/progression").join(account.0.to_string()).join("Ff7.json");
+    let story_bytes = std::fs::read(&story_file).unwrap();
+    let resource_bytes = std::fs::read(progress_file(&dir, account)).unwrap();
+    drop(store);
+    let store = Store::open(dir.path().join("state")).unwrap();
+    let login = token_with_starting_rules(&store, &token, NOW + 100).unwrap();
+    assert_eq!(login.progression, story);
+    assert_eq!(login.progress, registered.progress);
+    assert_eq!(std::fs::read(story_file).unwrap(), story_bytes);
+    assert_eq!(std::fs::read(progress_file(&dir, account)).unwrap(), resource_bytes);
+}
+
+#[test]
+fn a_fresh_story_can_exist_without_battle_rules_and_undelivered_registration_releases_it() {
+    let (_dir, store) = store();
+    let story = fmv_ff7::story::StoryState::fresh_first_control().encode();
+    let registration = validate_registration(GameId::Ff7, "Undelivered story", &request([0; 3], None, None)).unwrap();
+    let registered = register_with_initial_state(&store, GameId::Ff7, registration, NOW, || {}, None, Some(story.clone())).unwrap();
+    assert_eq!(registered.progression, story);
+    assert!(registered.progress.stored.is_none());
+    assert!(store.get_character_progress(registered.account, GameId::Ff7).unwrap().is_none());
+    assert_eq!(release_unclaimed(&store, registered.account), Release::Released);
+    assert!(plain_ff7(&store, "Undelivered story").is_ok(), "the unclaimed seed does not strand its name");
+}
+
+#[test]
+fn an_initial_story_that_cannot_be_sent_is_refused_before_taking_the_name() {
+    let (_dir, store) = store();
+    let registration = validate_registration(GameId::Ff7, "Oversize story", &request([0; 3], None, None)).unwrap();
+    let created = std::cell::Cell::new(false);
+    let result = register_with_initial_state(&store, GameId::Ff7, registration, NOW, || created.set(true),
+        Some(&StartingRules { gil: 240 }), Some(vec![0; MAX_PROGRESSION_BYTES + 1]));
+    assert!(matches!(result, Err(LoginError::Internal(_))));
+    assert!(!created.get());
+    assert!(plain_ff7(&store, "Oversize story").is_ok());
+}
+
+#[test]
 fn new_registration_commits_authored_starting_resources_once_and_login_never_recredits_them() {
     let (dir, store) = store();
     let registered = register_with_starting_resources(&store, "New resources");

@@ -2,6 +2,7 @@
 //! explicitly. No game files, sockets, sleep, or live account data are involved.
 
 mod door_coop;
+mod retire_landing;
 mod size_bounds;
 
 use std::sync::Arc;
@@ -888,7 +889,7 @@ fn recovery_refuses_old_future_or_changed_script_identity_before_admitting_gamep
     let mut rig = Rig::new(3);
     rig.prepare();
     let original = rig.stored();
-    for version in [None, Some(1), Some(u32::MAX)] {
+    for version in [None, Some(1), Some(2), Some(u32::MAX)] {
         let mut state = original.clone();
         let checkpoint = state.checkpoint.as_mut().unwrap();
         if let Some(version) = version { checkpoint.replay_version = version; }

@@ -17,6 +17,7 @@
 
 use crate::avatar::scenery::Scenery;
 use crate::avatar::stage::{Stage, StageCamera};
+use fmv_ff7::background::calibrate_depth_mapping;
 use fmv_adapter_api::{AreaRuntime, Bounds};
 use fmv_core::Pos;
 use fmv_ff7::background::{decode_background_with, entry_background_ops, BackgroundImage, BackgroundOptions, BackgroundState, GroupFilter, Projection};
@@ -148,6 +149,9 @@ impl FieldView {
     #[cfg(test)]
     pub fn background_state(&self) -> Option<&BackgroundState> { self.background.as_ref().map(DynamicBackground::shown_state) }
 
+    #[cfg(test)]
+    pub fn background_palette(&self) -> Option<&fmv_ff7::field::Palette> { self.background.as_ref().map(DynamicBackground::shown_palette) }
+
     /// World position -> view position (`z` is 0), or `None` if it cannot be drawn.
     pub fn to_view(&self, p: Pos) -> Option<Pos> {
         (self.map)(p).filter(|q| finite_xy(*q))
@@ -265,9 +269,7 @@ impl FieldView {
             format!("FF7 field {key} through its camera, {picture}"),
         );
         if let Some(note) = initial_note { view.description.push_str(&format!("; {note}")); }
-        if view.triangles.is_empty() {
-            return Err(format!("no walkmesh triangle of field {key} is in front of its camera"));
-        }
+        view.require_ff7_content(key)?;
         // FF7's screen scrolls over the field's camera range (a field drawn without its picture is shown whole).
         view.range = range;
         if let Some(r) = range {
@@ -284,17 +286,38 @@ impl FieldView {
             (false, _) => (None, "characters are drawn as markers".to_string()),
         };
         view.description.push_str(&format!("; {note}"));
+        let depth = area.field_file().background().map(|background| {
+            calibrate_depth_mapping(background.tiles.iter().filter(|tile| tile.layer == 2 && tile.param == 0)
+                .map(|tile| (tile.id, tile.id_big)))
+        }).unwrap_or_default();
+        view.description.push_str(&format!("; depth near {:.3}, far {:.0} ({})", depth.near, depth.far,
+            if depth.calibrated { "calibrated PC background" } else { "50/32000 fallback" }));
         view.stage = Some(Stage {
             camera: StageCamera::from_camera(camera),
+            depth,
             model_scale: default_model_scale(area.field_scale()),
             walk_speed: area.walk_speed(),
             run_speed: area.run_speed(),
             scenery,
         });
         if let Some(canvas) = canvas {
-            view.background = Some(DynamicBackground::new(key, area.field_file(), canvas, prepare_scenery, background_state));
+            match DynamicBackground::new(key, area.field_file(), canvas, prepare_scenery, background_state) {
+                Ok(background) => view.background = Some(background),
+                Err(error) => view.description.push_str(&format!("; scripted background unavailable ({error})")),
+            }
         }
         Ok(view)
+    }
+
+    /// Close-up fields such as ROOTMAP have their logical floor behind the camera;
+    /// OFST moves their models into the visible background. Keep that native camera
+    /// and leave the projected floor empty. A view with neither source is unusable.
+    fn require_ff7_content(&self, key: &str) -> Result<(), String> {
+        if self.triangles.is_empty() && self.backdrop.is_none() {
+            Err(format!("field {key} has neither a usable background nor a walkmesh triangle in front of its camera"))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -404,5 +427,27 @@ mod tests {
         let pic = Backdrop::new(1, 1, vec![9, 9, 9, 255], [-100.0, -50.0], [100.0, 50.0]).unwrap();
         let with = FieldView::projected(&world, fallback, map, Some(pic), "test");
         assert_eq!((with.bounds.min.x, with.bounds.min.y, with.bounds.max.x, with.bounds.max.y), (-100.0, -50.0, 100.0, 50.0));
+    }
+
+    #[test]
+    fn a_close_up_background_preserves_its_camera_without_inventing_a_visible_floor() {
+        let world = [tri((-8.0, 0.0), (-2.0, 0.0), (-4.0, 6.0))];
+        let fallback = Bounds { min: Pos::new(-8.0, 0.0, 0.0), max: Pos::new(-2.0, 6.0, 0.0) };
+        let map = |p: Pos| (p.x >= 0.0).then(|| Pos::new(p.x * 2.0, -p.y, 0.0));
+        let backdrop = Backdrop::new(1, 1, vec![9, 9, 9, 255], [-160.0, -120.0], [160.0, 120.0]).unwrap();
+        let view = FieldView::projected(&world, fallback, map, Some(backdrop), "close-up");
+        assert!(view.require_ff7_content("close-up").is_ok());
+        assert!(view.triangles.is_empty(), "the logical floor stays behind the camera");
+        assert_eq!(view.to_view(Pos::new(-4.0, 2.0, 5.0)), None);
+        assert_eq!(view.to_view(Pos::new(6.0, 2.0, 5.0)), Some(Pos::new(12.0, -2.0, 0.0)),
+            "an offset model still uses the supplied camera");
+        assert_eq!(view.bounds, Bounds { min: Pos::new(-160.0, -120.0, 0.0), max: Pos::new(160.0, 120.0, 0.0) });
+
+        let unusable = Backdrop::new(0, 1, vec![], [-160.0, -120.0], [160.0, 120.0]);
+        let empty = FieldView::projected(&world, fallback, map, unusable, "empty");
+        assert!(empty.require_ff7_content("empty").is_err(), "fallback bounds alone do not make a renderable field");
+        let visible = [tri((0.0, 0.0), (2.0, 0.0), (0.0, 2.0))];
+        let geometry = FieldView::projected(&visible, fallback, map, None, "geometry");
+        assert!(geometry.require_ff7_content("geometry").is_ok(), "projected geometry remains usable without a background");
     }
 }

@@ -1346,7 +1346,7 @@ fn if_party(character: u8, body: &[u8]) -> Vec<u8> {
 #[test]
 fn party_changes_are_recorded_in_order_and_a_later_test_of_the_party_sees_them() {
     use crate::story::{canon_party, PartyOp, BARRET, CLOUD};
-    let story = StoryState::at(4);
+    let story = StoryState::at(33);
     assert_eq!(canon_party(&story), vec![CLOUD, BARRET]);
     let a = [
         if_party(BARRET, &message(0, 0)), // in the story's party: a window
@@ -2512,4 +2512,338 @@ fn bridge_origin_is_quantized_validated_and_bound_into_the_replay_source() {
         assert_eq!(with_trigger_position(&field, &def, pos, angle, hint), Err(SceneError::SceneOrigin));
     }
     assert_eq!(with_trigger_position(&field, &flower_station_scene(), Pos::new(25.0, 10.0, 0.0), 0.0, None), Err(SceneError::SceneOrigin));
+}
+
+#[test]
+fn byte_extracts_write_the_stated_destination_and_read_only_the_selected_source_byte() {
+    let mut story = StoryState::at(4).into_extended().unwrap();
+    story.write_byte(3, 80, 0xCD).unwrap(); // The byte after this remains unknown.
+    story.write_byte(3, 91, 0xAB).unwrap(); // The discarded low byte at90 remains unknown.
+    let body = vec![
+        vec![0x9A, 0x33, 66, 80], // LBYTE bank3[66] = bank3[80].
+        vec![0x9B, 0x44, 70, 90, 0], // HBYTE bank4[70] = high(bank4[90..91]).
+        vec![0x9B, 0x30, 72, 0x80, 0xFF], // Literal0xFF80 extracts0xFF.
+        vec![0x9B, 0x30, 255, 0x34, 0x12], // Destination255 is valid for one byte.
+    ];
+    let field = field_of(script(vec![("a", vec![(1, body)])], vec![]));
+    let result = run_to_end_with_resources(&field, &demo_def(vec![], start(0, 1)), &story, 1, SceneResources { gil: None }, &[]).unwrap();
+    assert_eq!(result.end, End::Finished);
+    assert!(result.is_complete());
+    assert!(result.unknown_persistent_reads.is_empty(), "discarded source bytes are not dependencies");
+    assert_eq!(result.writes.persistent, [
+        ((3, 66), (0xCD, 255)), ((3, 70), (0xAB, 255)),
+        ((3, 72), (0xFF, 255)), ((3, 255), (0x12, 255)),
+    ].into_iter().collect());
+    let mut after = story.clone();
+    assert_eq!(result.writes.apply_extended_to(&mut after, &story), Some(true));
+    assert_eq!(after.known_mask(3, 71), 0, "HBYTE never writes the byte after its destination");
+    assert_eq!(after.known_mask(3, 81), 0);
+    assert_eq!(after.known_mask(3, 90), 0);
+}
+
+#[test]
+fn high_byte_extraction_keeps_unknown_selected_inputs_and_bank_boundary_failures_visible() {
+    let story = StoryState::at(4).into_extended().unwrap();
+    let run = |body| {
+        let field = field_of(script(vec![("a", vec![(1, body)])], vec![]));
+        run_to_end_with_resources(&field, &demo_def(vec![], start(0, 1)), &story, 1, SceneResources { gil: None }, &[]).unwrap()
+    };
+    let unknown = run(vec![vec![0x9B, 0x34, 70, 90, 0]]);
+    assert!(unknown.unknown_persistent_reads.contains(&(3, 91)), "the selected high byte remains authoritative input");
+    assert!(!unknown.unknown_persistent_reads.contains(&(3, 90)), "the discarded low byte is not read");
+    let crossing = run(vec![vec![0x9B, 0x34, 70, 255, 0]]);
+    assert!(!crossing.is_complete());
+    assert_eq!(crossing.stats.unresolved, 1);
+    assert!(!crossing.writes.persistent.contains_key(&(3, 70)), "a word outside the bank cannot manufacture a zero assignment");
+}
+
+
+// ---- native party tuples and exact persistent assignment masks -------------------------------
+
+#[test]
+fn extended_scene_party_validation_preserves_unlocks_and_refuses_missing_authored_joins() {
+    let before = StoryState::at(6).into_extended().unwrap();
+    let temporary = run_party_fixture(&before, vec![vec![0xCA, 0, 2, 254], vec![0xC9, 2]]);
+    assert!(temporary.is_complete());
+    assert_eq!(crate::story::party_after(&[0], &temporary.party), [0]);
+    assert!(!temporary.party_is_the_storys(&before, &StoryState::at(7).into_extended().unwrap()),
+        "a temporary addition still unlocks Tifa, which the reviewed route cannot represent");
+    let quiet = run_party_fixture(&before, vec![]);
+    assert!(!quiet.party_is_the_storys(&before, &StoryState::at(11).into_extended().unwrap()),
+        "an empty journal cannot jump over the reactor's actual party join");
+    let later = StoryState::at(64).into_extended().unwrap();
+    assert!(!quiet.party_is_the_storys(&later, &later), "later PHS state is not inferred");
+}
+
+fn run_party_fixture(story: &StoryState, body: Vec<Vec<u8>>) -> Outcome {
+    let field = field_of(script(vec![("a", vec![(1, body)])], vec![]));
+    run_to_end_with_resources(&field, &demo_def(vec![], start(0, 1)), story, 1, SceneResources { gil: None }, &[]).unwrap()
+}
+
+#[test]
+fn exact_party_overwrites_unknown_mirrors_without_inventing_a_startup_tuple() {
+    let story = StoryState::at(10).into_extended().unwrap();
+    let untouched = run_party_fixture(&story, vec![]);
+    assert!(untouched.writes.persistent.is_empty());
+    let result = run_party_fixture(&story, vec![vec![0xCA, 0, 1, 254]]);
+    assert!(result.is_complete());
+    assert!(result.unknown_persistent_reads.is_empty());
+    assert_eq!(result.writes.persistent, [((3, 9), (0, 255)), ((3, 10), (1, 255)), ((3, 11), (255, 255))].into_iter().collect());
+    let mut after = story.clone();
+    assert_eq!(result.writes.apply_extended_to(&mut after, &story), Some(true));
+    for (address, value) in [(9, 0), (10, 1), (11, 255)] {
+        assert_eq!(after.known_byte(4, address), Some(value), "word selector shares physical bytes");
+    }
+}
+
+#[test]
+fn exact_party_remove_and_no_ops_keep_only_actual_physical_assignments() {
+    let mut story = StoryState::at(33).into_extended().unwrap();
+    for (address, value) in [(9, 0), (10, 1), (11, 255)] { story.write_byte(3, address, value).unwrap(); }
+    let result = run_party_fixture(&story, vec![vec![0xC9, 1]]);
+    assert!(result.is_complete());
+    assert_eq!(result.writes.persistent, [((3, 10), (255, 255))].into_iter().collect());
+    for instruction in [vec![0xC9, 7], vec![0xC8, 1]] {
+        let result = run_party_fixture(&story, vec![instruction]);
+        assert!(result.is_complete());
+        assert!(result.writes.persistent.is_empty(), "a no-op must not become three assignments");
+    }
+    let section = script(vec![("a", vec![(1, vec![vec![0xCA, 0, 1, 254]])])], vec![]);
+    let (_, vm) = run_with(&section, start(0, 1), &[], vm_for(story.clone(), &[]));
+    for address in 9..=11 { assert_eq!(vm.written_mask(3, address), 255, "PRTYE assigns unchanged slots too"); }
+    let same = run_party_fixture(&story, vec![vec![0xCA, 0, 1, 254]]);
+    assert!(same.writes.persistent.is_empty(), "known unchanged assignments need no durable delta");
+}
+
+#[test]
+fn exact_party_dependent_unknowns_holes_and_reordered_main_slots_fail_before_writes() {
+    let unknown = StoryState::at(33).into_extended().unwrap();
+    for instruction in [vec![0xC9, 7], vec![0xC8, 1], vec![0xCA, 0, 255, 254]] {
+        let result = run_party_fixture(&unknown, vec![instruction]);
+        assert!(!result.is_complete());
+        assert_eq!(result.unknown_persistent_reads, [(3, 9), (3, 10), (3, 11)].into_iter().collect());
+        assert!(result.writes.persistent.is_empty());
+        assert!(result.party.is_empty());
+    }
+    let mut known = unknown;
+    for (address, value) in [(9, 0), (10, 1), (11, 255)] { known.write_byte(3, address, value).unwrap(); }
+    for instruction in [vec![0xC9, 0], vec![0xCA, 1, 0, 254]] {
+        let result = run_party_fixture(&known, vec![instruction]);
+        assert!(!result.is_complete(), "the durable canonical table cannot represent holes or divergent slot order");
+        assert!(result.writes.persistent.is_empty());
+        assert!(result.party.is_empty());
+    }
+}
+
+#[test]
+fn both_scene_versions_preserve_255_members_and_extended_assignments_feed_later_party_ops() {
+    for story in [StoryState::at(33), StoryState::at(33).into_extended().unwrap()] {
+        let result = run_party_fixture(&story, vec![vec![0xCA, 0, 1, 254], vec![0xCA, 0, 255, 254], vec![0xC9, 1]]);
+        assert!(result.is_complete(), "{:?}", result.stats);
+        assert!(result.unknown_persistent_reads.is_empty());
+        assert_eq!(crate::story::party_after(&[0, 1], &result.party), [0]);
+        if story.supports_extended() {
+            assert_eq!(result.writes.persistent, [((3, 9), (0, 255)), ((3, 10), (255, 255)), ((3, 11), (255, 255))].into_iter().collect());
+        }
+    }
+}
+
+#[test]
+fn scene_getpc_reads_native_main_slots_without_compacting_a_removed_leader() {
+    // GETPC bank5[30+slot] = main party[slot]. PRTYM leaves slot0 empty; Barret stays in slot1.
+    let section = script(vec![("a", vec![(1, vec![
+        vec![0xC9, 0], vec![0x74, 5, 0, 30], vec![0x74, 5, 1, 31],
+        vec![0xC8, 2], vec![0x74, 5, 0, 32], vec![0x74, 5, 1, 33],
+    ])])], vec![]);
+    let (_, vm) = run_with(&section, start(0, 1), &[], vm_for(StoryState::at(33), &[]));
+    assert!(vm.stats().unknown.is_empty());
+    for (address, value) in [(30, 255), (31, 1), (32, 2), (33, 1)] {
+        assert_eq!(vm.writes().get(&(5, address)), Some(&value));
+    }
+}
+
+
+#[test]
+fn exact_generic_party_mirror_writes_refuse_bytes_words_bits_and_both_physical_aliases() {
+    let mut story = StoryState::at(33).into_extended().unwrap();
+    for (address, value) in [(8, 77), (9, 0), (10, 1), (11, 255), (12, 66)] {
+        story.write_byte(3, address, value).unwrap();
+    }
+    for bank in [3, 4] {
+        for address in 9..=11 {
+            for instruction in [setbyte(bank, address, 2), biton(bank, address, 0),
+                vec![0x83, bank << 4, address, 0], vec![0x84, bank << 4, address, 0]] {
+                let result = run_party_fixture(&story, vec![instruction]);
+                assert!(!result.is_complete());
+                assert_eq!(result.stats.unresolved, 1);
+                assert!(result.writes.persistent.is_empty());
+                assert!(result.party.is_empty());
+            }
+        }
+        for address in 8..=11 {
+            let section = script(vec![("a", vec![(1, vec![setword(bank, address, 0x1234)])])], vec![]);
+            let (_, vm) = run_with(&section, start(0, 1), &[], vm_for(story.clone(), &[]));
+            assert_eq!(vm.stats().unresolved, 1);
+            assert!(vm.writes().is_empty(), "the entire overlapping word is refused, including byte8 or12");
+        }
+    }
+    let allowed = run_party_fixture(&story, vec![setbyte(3, 8, 3), setbyte(4, 12, 4), vec![0xCA, 0, 1, 254], vec![0xC9, 1]]);
+    assert!(allowed.is_complete(), "{:?}", allowed.stats);
+    assert_eq!(allowed.writes.persistent, [((3, 8), (3, 255)), ((3, 10), (255, 255)), ((3, 12), (4, 255))].into_iter().collect());
+}
+
+#[test]
+fn exact_multi_output_gil_reads_refuse_all_assignments_when_one_overlaps_a_party_mirror() {
+    let story = StoryState::at(33).into_extended().unwrap();
+    // CHGLD low half -> bank3[60], high half -> bank4[8..9]; the valid first store must not run.
+    let field = field_of(script(vec![("a", vec![(1, vec![vec![0x3B, 0x34, 60, 8]])])], vec![]));
+    let result = run_to_end_with_resources(&field, &demo_def(vec![], start(0, 1)), &story, 1,
+        SceneResources { gil: Some(0x1234_5678) }, &[]).unwrap();
+    assert!(!result.is_complete());
+    assert_eq!(result.stats.unresolved, 1);
+    assert!(result.writes.persistent.is_empty());
+    assert!(result.party.is_empty());
+}
+
+
+#[test]
+fn exact_party_queries_read_physical_membership_while_getpc_keeps_main_slots() {
+    let mut story = StoryState::at(33).into_extended().unwrap();
+    for (address, value) in [(9, 2), (10, 255), (11, 255)] { story.write_byte(3, address, value).unwrap(); }
+    let section = script(vec![("a", vec![(1, vec![
+        if_party(0, &message(0, 0)), if_party(1, &message(0, 1)), if_party(2, &message(0, 2)),
+        vec![0x74, 5, 0, 30], vec![0x74, 5, 1, 31],
+    ])])], texts(3));
+    let (beats, vm) = run_with(&section, start(0, 1), &[], vm_for(story, &[]));
+    assert_eq!(dialogs_of(&beats), [2], "IFPRTYQ follows raw bank3 values, not the canonical main party");
+    assert_eq!(vm.writes().get(&(5, 30)), Some(&0));
+    assert_eq!(vm.writes().get(&(5, 31)), Some(&1));
+    assert!(vm.vars().unknown_persistent_reads().is_empty());
+    assert!(vm.stats().unknown.is_empty());
+}
+
+#[test]
+fn exact_party_queries_refuse_unknown_mirrors_but_do_not_read_beyond_a_known_match() {
+    let unknown = StoryState::at(33).into_extended().unwrap();
+    let section = script(vec![("a", vec![(1, vec![if_party(0, &message(0, 0))])])], texts(1));
+    let (_, vm) = run_with(&section, start(0, 1), &[], vm_for(unknown.clone(), &[]));
+    assert_eq!(vm.stats().unresolved, 1);
+    assert_eq!(vm.stats().unknown.get("IFPRTYQ"), Some(&1));
+    assert_eq!(vm.vars().unknown_persistent_reads(), [(3, 9)].into_iter().collect());
+    let mut first_known = unknown;
+    first_known.write_byte(3, 9, 0).unwrap();
+    let (beats, vm) = run_with(&section, start(0, 1), &[], vm_for(first_known, &[]));
+    assert_eq!(dialogs_of(&beats), [0]);
+    assert!(vm.vars().unknown_persistent_reads().is_empty(), "native early success never examines the two unknown later slots");
+    assert_eq!(vm.stats().unresolved, 0);
+}
+
+
+#[test]
+fn exact_team_availability_query_after_barret_leaves_refuses_instead_of_using_active_party() {
+    let mut story = StoryState::at(36).into_extended().unwrap();
+    for (address, value) in [(9, 0), (10, 255), (11, 255)] { story.write_byte(3, address, value).unwrap(); }
+    // The original PRTYM removed Barret from the active tuple without clearing PHS availability.
+    // Those known mirror bytes therefore cannot decide IFMEMBQ1.
+    let result = run_party_fixture(&story, vec![vec![0xCC, 1, 1]]);
+    assert!(!result.is_complete());
+    assert_eq!(result.stats.unresolved, 1);
+    assert_eq!(result.stats.unknown.get("IFMEMBQ"), Some(&1));
+    assert!(result.writes.persistent.is_empty());
+    assert!(result.party.is_empty());
+}
+
+// ---- audited default-name menu return -------------------------------------------------------
+
+fn name_menu_fixture(story: StoryState, instruction: Vec<u8>, allow: Option<(isize, u8)>) -> Vm {
+    let section = script(vec![("a", vec![(1, vec![instruction])])], vec![]);
+    let site = FieldScript::parse(&section).unwrap().span(0, 1).unwrap().start;
+    let mut vm = vm_for(story, &[]);
+    if let Some((delta, param)) = allow {
+        vm.allow_default_name_sites(vec![(site.checked_add_signed(delta).unwrap(), param)]);
+    }
+    run_with(&section, start(0, 1), &[], vm).1
+}
+
+#[test]
+fn audited_default_name_menu_returns_through_native_party_sync_without_a_party_or_phs_operation() {
+    for param in [0, 1] {
+        let mut story = StoryState::at(33).into_extended().unwrap();
+        for (address, value) in [(9, 0), (10, 2), (11, 255)] { story.write_byte(3, address, value).unwrap(); }
+        let vm = name_menu_fixture(story, vec![0x49, 0, 6, param], Some((0, param)));
+        assert_eq!(vm.stats().handled.get("MENU"), Some(&1));
+        assert!(vm.stats().ignored.is_empty() && vm.stats().unknown.is_empty());
+        assert_eq!(vm.stats().unresolved, 0);
+        assert!(vm.vars().unknown_persistent_reads().is_empty());
+        assert!(vm.party_ops().is_empty(), "a menu return is not a PRTYE and does not unlock anybody");
+        assert_eq!(vm.writes(), &[( (3, 10), 1), ((3, 11), 255)].into_iter().collect());
+        assert_eq!(vm.written_mask(4, 9), 0, "the retained Cloud slot was never assigned");
+        assert_eq!(vm.written_mask(4, 10), 255);
+        assert_eq!(vm.written_mask(4, 11), 255, "native reconciliation assigns the empty slot even unchanged");
+    }
+}
+
+#[test]
+fn default_name_menu_capability_does_not_allow_other_sites_params_menus_or_banked_operands() {
+    let unknown = StoryState::at(33).into_extended().unwrap();
+    for (instruction, allow) in [
+        (vec![0x49, 0, 6, 0], None),
+        (vec![0x49, 0, 6, 0], Some((1, 0))),
+        (vec![0x49, 0, 6, 0], Some((0, 1))),
+        (vec![0x49, 0, 6, 2], Some((0, 2))),
+        (vec![0x49, 0, 7, 0], Some((0, 0))),
+        (vec![0x49, 3, 6, 0], Some((0, 0))),
+        (vec![0x49, 0x10, 6, 0], Some((0, 0))),
+    ] {
+        let vm = name_menu_fixture(unknown.clone(), instruction, allow);
+        assert_eq!(vm.stats().ignored.get("MENU"), Some(&1));
+        assert!(vm.writes().is_empty());
+        assert!(vm.party_ops().is_empty());
+        assert!(vm.vars().unknown_persistent_reads().is_empty(), "denied capabilities never read or synchronize a tuple");
+    }
+}
+
+#[test]
+fn audited_default_name_menu_refuses_unknown_or_invalid_raw_party_before_any_assignment() {
+    let unknown = StoryState::at(33).into_extended().unwrap();
+    let vm = name_menu_fixture(unknown.clone(), vec![0x49, 0, 6, 0], Some((0, 0)));
+    assert_eq!(vm.stats().unknown.get("MENU"), Some(&1));
+    assert_eq!(vm.stats().unresolved, 1);
+    assert_eq!(vm.vars().unknown_persistent_reads(), [(3, 9), (3, 10), (3, 11)].into_iter().collect());
+    assert!(vm.writes().is_empty() && vm.party_ops().is_empty());
+    let mut invalid = unknown;
+    for address in 9..=11 { invalid.write_byte(3, address, 0).unwrap(); }
+    let vm = name_menu_fixture(invalid, vec![0x49, 0, 6, 0], Some((0, 0)));
+    assert_eq!(vm.stats().unknown.get("MENU"), Some(&1));
+    assert_eq!(vm.stats().unresolved, 1);
+    assert!(vm.writes().is_empty() && vm.party_ops().is_empty());
+}
+
+#[test]
+fn audited_default_name_menu_preserves_retained_field_slot_order() {
+    let mut story = StoryState::at(33).into_extended().unwrap();
+    for (address, value) in [(9, 1), (10, 0), (11, 255)] { story.write_byte(3, address, value).unwrap(); }
+    let vm = name_menu_fixture(story, vec![0x49, 0, 6, 0], Some((0, 0)));
+    assert_eq!(vm.stats().handled.get("MENU"), Some(&1));
+    assert_eq!(vm.writes(), &[((3, 11), 255)].into_iter().collect());
+    assert_eq!(vm.written_mask(3, 9), 0);
+    assert_eq!(vm.written_mask(3, 10), 0);
+    assert_eq!(vm.written_mask(3, 11), 255);
+    assert!(vm.party_ops().is_empty());
+}
+
+
+#[test]
+fn legacy_name_menu_keeps_its_ignored_preview_path_even_with_a_configured_site() {
+    let legacy = StoryState::at(33);
+    let vm = name_menu_fixture(legacy.clone(), vec![0x49, 0, 6, 0], Some((0, 0)));
+    assert_eq!(vm.stats().ignored.get("MENU"), Some(&1));
+    assert!(vm.stats().unknown.is_empty());
+    assert_eq!(vm.stats().unresolved, 0);
+    assert!(vm.writes().is_empty() && vm.party_ops().is_empty());
+    assert!(vm.vars().unknown_persistent_reads().is_empty());
+    let vm = name_menu_fixture(legacy.into_extended().unwrap(), vec![0x49, 0, 6, 0], Some((0, 0)));
+    assert_eq!(vm.stats().unknown.get("MENU"), Some(&1));
+    assert_eq!(vm.stats().unresolved, 1);
+    assert!(vm.writes().is_empty() && vm.party_ops().is_empty());
 }

@@ -138,7 +138,7 @@ impl SceneBatchJob {
 
 /// Apply one member's settlement with the same cap, experience-curve and inventory rules as normal
 /// battle saves. A missing item is a stale/invalid attempt, never silently supplied by later drops.
-fn settle(
+pub(super) fn settle(
     record: &mut fmv_persist::CharacterProgress,
     rules: &dyn BattleRules,
     battle: &SceneBattleSettlement,

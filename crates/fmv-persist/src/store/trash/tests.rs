@@ -12,6 +12,8 @@ use crate::CharacterProgress;
 use crate::character::{GameCharacter, NewPlayerCharacter};
 use crate::model::Registered;
 
+mod format;
+
 const NOW: u64 = 1_700_000_000;
 
 fn state_dir() -> (tempfile::TempDir, PathBuf) {
@@ -599,24 +601,54 @@ fn a_crash_before_a_restore_committed_puts_the_entry_back() {
 }
 
 #[test]
-fn a_failed_restore_puts_the_entry_back_and_writes_nothing() {
+fn a_failed_restore_puts_the_records_back_and_retains_the_selected_format_fences() {
     let (_guard, root) = state_dir();
     let store = Store::open(&root).unwrap();
     let a = make(&store, "Aria", 1);
     let deleted = store.delete_account(a.account_id, NOW).unwrap();
-    let before = files(&root);
-    let next = store.writer().unwrap().next_account_id;
+    let mut before = files(&root);
+    let (next, next_avatar) = {
+        let counters = store.writer().unwrap();
+        (counters.next_account_id, counters.next_avatar_id)
+    };
     // The new account's record cannot be written: a directory sits where the file goes.
     fs::create_dir(root.join(format!("accounts/{next}.json"))).unwrap();
     let err = store.restore_account(&deleted.entry, NOW + 5).unwrap_err();
     assert!(matches!(err, PersistError::Io { .. }), "{err}");
-    fs::remove_dir(root.join(format!("accounts/{next}.json"))).unwrap();
-    assert_eq!(files(&root), before, "the entry is back as it was and nothing was left");
+    // Explicit restore selected the durable story format before attempting the first
+    // account write. Rollback must keep that exclusion fence and its detached manifest
+    // marker, while restoring every source record and leaving no new account visible.
+    let after = files(&root);
+    let mut records_after = after.clone();
+    before.remove(crate::index::INDEX_LOG_FILE);
+    records_after.remove(crate::index::INDEX_LOG_FILE);
+    let manifest_path = format!("{TRASH_DIR}/{}/{MANIFEST_FILE}", deleted.entry);
+    let mut expected_manifest: serde_json::Value = serde_json::from_slice(&before.remove(&manifest_path).unwrap()).unwrap();
+    assert_eq!(expected_manifest["schema_version"], LEGACY_MANIFEST_VERSION);
+    expected_manifest["schema_version"] = MANIFEST_VERSION.into();
+    let actual_manifest: serde_json::Value = serde_json::from_slice(&records_after.remove(&manifest_path).unwrap()).unwrap();
+    assert_eq!(actual_manifest, expected_manifest, "only the compatibility marker changes; no restore plan remains");
+    assert_eq!(records_after, before, "every source record is back unchanged and no new record was left");
+    assert_eq!(store.index().format_version(), DURABLE_STORY_INDEX_VERSION);
+    {
+        let counters = store.writer().unwrap();
+        assert_eq!((counters.next_account_id, counters.next_avatar_id), (next, next_avatar));
+    }
     assert!(store.find_account_by_name("Aria").is_none(), "nothing committed");
     let entries = store.trash_entries().unwrap();
     assert_eq!((entries.len(), entries[0].state), (1, TrashState::Deleted));
-    // Once the obstacle is gone it restores.
-    assert!(store.restore_account(&deleted.entry, NOW + 6).is_ok());
+    assert!(matches!(store.restore_account(&deleted.entry, NOW + 6), Err(PersistError::Io { .. })));
+    assert_eq!(files(&root), after, "another proven rollback makes no further durable changes");
+    fs::remove_dir(root.join(format!("accounts/{next}.json"))).unwrap();
+    drop(store);
+    let store = Store::open(&root).unwrap();
+    assert_eq!(store.index().format_version(), DURABLE_STORY_INDEX_VERSION);
+    assert!(store.find_account_by_name("Aria").is_none());
+    assert_eq!(files(&root), after, "reopen preserves the rolled-back records and both format fences");
+    // Once the obstacle is gone, the original allocation can safely restore the account.
+    let restored = store.restore_account(&deleted.entry, NOW + 7).unwrap();
+    assert_eq!((restored.account_id.0, restored.avatar_id.map(|id| id.0)), (next, Some(next_avatar)));
+    assert!(restored.unfinished.is_empty());
 }
 
 #[test]

@@ -27,7 +27,9 @@ pub const MAX_SCENE_CHECKPOINT_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_SCENE_REPLAY_BYTES: usize = 256 * 1024;
 
 /// Where an account's authoritative continuation stopped. A landing is kept durably; a
-/// network acknowledgment alone cannot erase the only place a reconnect can recover.
+/// network acknowledgment alone cannot erase the only place a reconnect can recover. The
+/// adapter may retire it only after verifying that the unchanged story's normal entry is
+/// exactly this destination and that no required linked arrival remains.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum ScenePhase {
@@ -66,7 +68,15 @@ pub struct SceneReservation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SceneOperationKind { PrepareBattle, ResolveBattle, Finish, ContinueLanding, Complete }
+pub enum SceneOperationKind {
+    PrepareBattle, ResolveBattle, Finish, ContinueLanding,
+    /// Finish an unreserved Resume, or retire a terminal Landing without changing its
+    /// progress pair. The caller validates the latter's source and destination semantics;
+    /// persistence checks that it only clears the singleton owner's metadata.
+    Complete,
+    /// An ordinary battle's complete terminal outcome, without a resumable scene checkpoint.
+    BattleOutcome,
+}
 
 /// Stable identity of one durable step. Retries reuse it; an authored repeated battle
 /// increments `attempt` instead of reusing the receipt of an earlier attempt.
@@ -160,6 +170,9 @@ fn conflict(reason: &str) -> PersistError { PersistError::TransactionConflict(re
 fn validate_operation(operation: &SceneOperation, result: &[u8]) -> Result<()> {
     if operation.instance == [0; 32] || operation.ordinal > MAX_BATTLES || operation.attempt > MAX_ATTEMPTS {
         return Err(invalid("invalid scene instance or operation boundary"));
+    }
+    if operation.kind == SceneOperationKind::BattleOutcome && (operation.ordinal != 0 || operation.attempt != 0) {
+        return Err(invalid("ordinary battle outcomes have one terminal operation per instance"));
     }
     if result.len() > MAX_BLOB_BYTES { return Err(invalid("batch selected result exceeds the blob limit")); }
     Ok(())
@@ -309,11 +322,20 @@ fn roster_of(states: &[SceneState], instance: [u8; 32], ordinal: u32, attempt: u
 
 /// Check visible transitions independently of disk. The complete old roster is checked
 /// separately against the private committed roster before an after-image is built.
-fn validate_transition(operation: &SceneOperation, before: &[SceneState], after: &[SceneState]) -> Result<usize> {
+fn validate_transition(operation: &SceneOperation, before: &[SceneState], after: &[SceneState]) -> Result<Option<usize>> {
     validate_states(before)?;
     validate_states(after)?;
     if before.len() != after.len() || before.iter().zip(after).any(|(a, b)| identity(a) != identity(b)) {
         return Err(invalid("batch after-images must have the same accounts and order"));
+    }
+    if operation.kind == SceneOperationKind::BattleOutcome {
+        if operation.ordinal != 0 || operation.attempt != 0 {
+            return Err(invalid("ordinary battle outcomes have one terminal operation per instance"));
+        }
+        if before.iter().chain(after).any(|state| state.checkpoint.is_some() || state.reservation.is_some()) {
+            return Err(conflict("ordinary battle outcome cannot replace an active scene continuation"));
+        }
+        return Ok(None);
     }
     let owners: Vec<_> = before.iter().zip(after).enumerate().filter(|(_, (a, b))| a.checkpoint.is_some() || b.checkpoint.is_some()).map(|(index, _)| index).collect();
     let [owner] = owners.as_slice() else { return Err(invalid("batch requires exactly one checkpoint owner")); };
@@ -323,11 +345,17 @@ fn validate_transition(operation: &SceneOperation, before: &[SceneState], after:
     if operation.kind == SceneOperationKind::Complete {
         let previous = old.checkpoint.as_ref().ok_or_else(|| invalid("completion has no checkpoint"))?;
         if before.len() != 1 || before.iter().chain(after).any(|state| state.reservation.is_some()) || new.checkpoint.is_some()
-            || previous.instance != operation.instance || !matches!(previous.phase, ScenePhase::Resume { .. })
+            || previous.instance != operation.instance
             || operation.ordinal != previous.consumed_battles || operation.attempt != 0 {
-            return Err(invalid("completion must clear one unreserved resumable owner"));
+            return Err(invalid("completion must clear one unreserved owner at its current boundary"));
         }
-        return Ok(owner);
+        match &previous.phase {
+            ScenePhase::Resume { .. } => {},
+            ScenePhase::Landing { .. } if old.pair == new.pair => {},
+            ScenePhase::Landing { .. } => return Err(invalid("landing retirement must preserve the entire progress pair")),
+            ScenePhase::BeforeBattle { .. } => return Err(invalid("completion cannot discard an unresolved battle")),
+        }
+        return Ok(Some(owner));
     }
     let cp = new.checkpoint.as_ref().ok_or_else(|| invalid("missing owner checkpoint"))?;
     if operation.kind == SceneOperationKind::ContinueLanding {
@@ -339,7 +367,7 @@ fn validate_transition(operation: &SceneOperation, before: &[SceneState], after:
             || cp.original_story != old.pair.story.blob || old.pair.character.as_ref().is_none_or(|c| cp.original_gil != c.gil) {
             return Err(invalid("landing continuation must start a fresh scene instance on the exact landed progress"));
         }
-        return Ok(owner);
+        return Ok(Some(owner));
     }
     if cp.instance != operation.instance { return Err(invalid("operation belongs to another scene instance")); }
     for (index, state) in before.iter().enumerate() {
@@ -415,9 +443,9 @@ fn validate_transition(operation: &SceneOperation, before: &[SceneState], after:
                 }
             }
         }
-        SceneOperationKind::ContinueLanding | SceneOperationKind::Complete => return Err(invalid("invalid scene operation transition")),
+        SceneOperationKind::ContinueLanding | SceneOperationKind::Complete | SceneOperationKind::BattleOutcome => return Err(invalid("invalid scene operation transition")),
     }
-    Ok(owner)
+    Ok(Some(owner))
 }
 
 fn receipt_status(images: &[Images], receipt: &str, result: &str) -> Result<bool> {
@@ -437,6 +465,45 @@ fn receipt_status(images: &[Images], receipt: &str, result: &str) -> Result<bool
 }
 
 impl Store {
+    /// Read a coherent roster which can accept one ordinary terminal battle outcome.
+    /// Call before starting its engine or accepting item commands. The world must keep the
+    /// accounts reserved until the acknowledged outcome; this is a capacity/precondition
+    /// snapshot, not a durable reservation or permission to race another writer.
+    pub fn get_battle_outcome_states(&self, accounts: &[AccountId], game: GameId) -> Result<Vec<SceneState>> {
+        validate_accounts(accounts)?;
+        let _read = self.progress_read()?;
+        let images = self.read_batch(accounts, game)?;
+        for image in &images {
+            let character = image.character.as_ref().ok_or_else(|| conflict("ordinary battle requires stored character progress"))?;
+            if character.has_continuation() || character.scene_roster.is_some() {
+                return Err(conflict("ordinary battle cannot overlap an active scene continuation"));
+            }
+            if character.scene_receipts.len() + character.batch_receipts.len() >= MAX_SCENE_RECEIPTS {
+                return Err(conflict("ordinary battle receipt capacity exhausted"));
+            }
+        }
+        Ok(images.iter().zip(accounts).map(|(image, account)| image.state(*account, game)).collect())
+    }
+
+    /// Check an ordinary battle's complete terminal receipt before calculating its resource
+    /// deltas again. `instance` is a fresh stable identity for that battle, reused on retries.
+    pub fn battle_outcome_applied(&self, instance: [u8; 32], selected_result: &[u8], accounts: &[AccountId], game: GameId) -> Result<bool> {
+        let operation = SceneOperation { instance, ordinal: 0, attempt: 0, kind: SceneOperationKind::BattleOutcome };
+        self.scene_batch_applied(&operation, selected_result, accounts, game)
+    }
+
+    /// Commit one ordinary battle's exact story/resource after-images for its entire frozen
+    /// roster. No scene checkpoint is created. The shared recoverable intent and per-member
+    /// receipts make an acknowledged outcome durable and once-only across restart.
+    /// Game rules must validate deltas and which participant owns any authored story change.
+    pub fn commit_battle_outcome(&self, instance: [u8; 32], selected_result: &[u8], expected: &[ProgressPair], next: &[ProgressPair]) -> Result<SceneBatchCommitted> {
+        let operation = SceneOperation { instance, ordinal: 0, attempt: 0, kind: SceneOperationKind::BattleOutcome };
+        let states = |pairs: &[ProgressPair]| pairs.iter().cloned().map(|pair| SceneState {
+            pair, checkpoint: None, reservation: None,
+        }).collect::<Vec<_>>();
+        self.commit_scene_batch(&operation, selected_result, &states(expected), &states(next))
+    }
+
     /// Called with the writer and progress gates held. Ordinary setters cannot drift the
     /// story/resources from the immutable replay input of a held scene or battle.
     pub(in crate::store) fn ensure_no_scene_continuation(&self, account: AccountId, game: GameId) -> Result<()> {
@@ -503,13 +570,23 @@ impl Store {
 
     /// Check every participant's durable receipt before reconstructing rewards or item
     /// costs. A partial/different cohort is a conflict, never a successful owner-only retry.
+    /// A matching receipt establishes the current compatibility fence before acknowledgment;
+    /// a missing or conflicting receipt does not change the store format.
     pub fn scene_batch_applied(&self, operation: &SceneOperation, selected_result: &[u8], accounts: &[AccountId], game: GameId) -> Result<bool> {
         validate_accounts(accounts)?;
         validate_operation(operation, selected_result)?;
         let receipt = operation_key(operation)?;
         let result = selected_key(selected_result)?;
-        let _read = self.progress_read()?;
-        receipt_status(&self.read_batch(accounts, game)?, &receipt, &result)
+        let writer = self.writer()?;
+        let _progress = self.progress_write();
+        let current = self.read_batch(accounts, game)?;
+        if operation.kind == SceneOperationKind::BattleOutcome
+            && current.iter().any(|image| image.character.as_ref().is_some_and(CharacterRecord::has_continuation)) {
+            return Err(conflict("ordinary battle outcome cannot overlap an active scene continuation"));
+        }
+        let applied = receipt_status(&current, &receipt, &result)?;
+        if applied { self.ensure_scene_batch_format(&writer)?; }
+        Ok(applied)
     }
 
     pub fn commit_scene_batch(&self, operation: &SceneOperation, selected_result: &[u8], expected: &[SceneState], next: &[SceneState]) -> Result<SceneBatchCommitted> {
@@ -526,27 +603,36 @@ impl Store {
         let _writer = self.writer()?;
         let _progress = self.progress_write();
         let before = self.read_batch(&accounts, game)?;
+        if operation.kind == SceneOperationKind::BattleOutcome
+            && before.iter().any(|image| image.character.as_ref().is_some_and(CharacterRecord::has_continuation)) {
+            return Err(conflict("ordinary battle outcome cannot overlap an active scene continuation"));
+        }
         if receipt_status(&before, &receipt, &result)? {
+            self.ensure_scene_batch_format(&_writer)?;
             return Ok(SceneBatchCommitted { commit: SceneCommit::AlreadyApplied,
                 current: before.iter().zip(&accounts).map(|(image, account)| image.state(*account, game)).collect() });
         }
         if before.iter().zip(expected).any(|(image, state)| image.state(identity(state).0, game) != *state) {
             return Err(conflict("story, character or continuation precondition changed"));
         }
-        let previous_owner = before.get(owner).and_then(|image| image.character.as_ref()).ok_or_else(|| invalid("missing checkpoint owner"))?;
-        if let Some(roster) = &previous_owner.scene_roster {
+        let previous_owner = owner.and_then(|owner| before.get(owner)).and_then(|image| image.character.as_ref());
+        if let Some(previous_owner) = previous_owner.filter(|previous_owner| previous_owner.scene_roster.is_some()) {
+            let roster = previous_owner.scene_roster.as_ref().ok_or_else(|| invalid("missing checkpoint roster"))?;
             let reservation = previous_owner.reservation.as_ref().ok_or_else(|| invalid("roster has no reservation"))?;
             let (ordinal, attempt) = (reservation.ordinal, reservation.attempt);
             if *roster != roster_of(expected, operation.instance, ordinal, attempt)? {
                 return Err(conflict("batch omits or substitutes a prepared participant"));
             }
         }
-        let next_roster = next.get(owner).and_then(|s| s.reservation.as_ref())
+        let next_roster = owner.and_then(|owner| next.get(owner)).and_then(|s| s.reservation.as_ref())
             .map(|reservation| roster_of(next, reservation.instance, reservation.ordinal, reservation.attempt)).transpose()?;
         let mut rows = Vec::with_capacity(before.len());
-        for ((account, old), new) in accounts.iter().zip(before).zip(next) {
+        for (index, ((account, old), new)) in accounts.iter().zip(before).zip(next).enumerate() {
             let mut character = old.character.clone().ok_or_else(|| invalid("missing stored participant"))?;
             if character.scene_receipts.len() + character.batch_receipts.len() >= MAX_SCENE_RECEIPTS {
+                if operation.kind == SceneOperationKind::BattleOutcome {
+                    return Err(conflict("ordinary battle receipt capacity exhausted"));
+                }
                 return Err(invalid("scene receipt capacity exhausted; receipts cannot be evicted"));
             }
             let slot = match operation.kind {
@@ -554,6 +640,7 @@ impl Store {
                 SceneOperationKind::ResolveBattle => old.character.as_ref().and_then(|r| r.reservation.as_ref()).map(|r| r.slot),
                 SceneOperationKind::Finish => Some(old.character.as_ref().and_then(|r| r.reservation.as_ref()).map_or(0, |r| r.slot)),
                 SceneOperationKind::ContinueLanding | SceneOperationKind::Complete => Some(0),
+                SceneOperationKind::BattleOutcome => Some(index as u16),
             }.ok_or_else(|| invalid("missing participant slot"))?;
             character.progress = new.pair.character.clone().ok_or_else(|| invalid("missing character after-image"))?;
             character.checkpoint = new.checkpoint.clone();
@@ -591,9 +678,9 @@ impl Store {
         let before: Vec<_> = intent.rows.iter().map(|row| row.before.state(row.account, row.game)).collect();
         let after: Vec<_> = intent.rows.iter().map(|row| row.after.state(row.account, row.game)).collect();
         let owner = validate_transition(&intent.operation, &before, &after)?;
-        let next_roster = after.get(owner).and_then(|s| s.reservation.as_ref())
+        let next_roster = owner.and_then(|owner| after.get(owner)).and_then(|s| s.reservation.as_ref())
             .map(|reservation| roster_of(&after, reservation.instance, reservation.ordinal, reservation.attempt)).transpose()?;
-        for row in &intent.rows {
+        for (index, row) in intent.rows.iter().enumerate() {
             row.before.pair(row.account, row.game).validate(row.account, row.game)?;
             row.after.pair(row.account, row.game).validate(row.account, row.game)?;
             if row.after.story.is_none() { return Err(invalid("batch has no story after-image")); }
@@ -608,6 +695,7 @@ impl Store {
                 SceneOperationKind::ResolveBattle => old.reservation.as_ref().map(|r| r.slot),
                 SceneOperationKind::Finish => Some(old.reservation.as_ref().map_or(0, |r| r.slot)),
                 SceneOperationKind::ContinueLanding | SceneOperationKind::Complete => Some(0),
+                SceneOperationKind::BattleOutcome => Some(index as u16),
             }.ok_or_else(|| invalid("batch receipt has no slot"))?;
             let added = BatchReceipt { result: intent.result.clone(), members: intent.rows.len() as u16, slot };
             if receipts.insert(intent.receipt.clone(), added).is_some() || receipts != new.batch_receipts {
@@ -652,6 +740,13 @@ impl Store {
         let file: BatchIntentFile = serde_json::from_slice(bytes).map_err(|e| PersistError::corrupt(path, format!("invalid scene batch intent: {e}")))?;
         if file.schema_version != BATCH_INTENT_VERSION || file.kind != "fmv-scene-batch-transaction" || file.checksum != digest(&file.intent)? {
             return Err(PersistError::corrupt(path, "scene batch intent kind, version or checksum mismatch"));
+        }
+        let retires_landing = file.intent.operation.kind == SceneOperationKind::Complete
+            && file.intent.rows.iter().any(|row| row.before.character.as_ref().and_then(|record| record.checkpoint.as_ref())
+                .is_some_and(|checkpoint| matches!(checkpoint.phase, ScenePhase::Landing { .. })));
+        if (file.intent.operation.kind == SceneOperationKind::BattleOutcome || retires_landing)
+            && self.index().format_version() < crate::index::DURABLE_STORY_INDEX_VERSION {
+            return Err(PersistError::corrupt(path, "durable story intent lacks its required index format fence"));
         }
         self.validate_batch_intent(&file.intent).map_err(|e| PersistError::corrupt(path, e.to_string()))?;
         // Check the entire cohort before installing any row: an unrelated third image

@@ -1,4 +1,14 @@
-//! FF Multiverse wire protocol v20.
+//! FF Multiverse wire protocol v21.
+//!
+//! v21 adds the ordinary story and battle transaction hold: [`ServerMsg::StoryPending`] fixes the player's
+//! authoritative position and implicitly sets [`AnimState::Idle`], [`ClientMsg::StoryPendingAck`]
+//! acknowledges the installed hold in connection order, and [`ServerMsg::StoryCommitted`] releases
+//! only the matching transaction. The server waits for both the durable save and the client's
+//! acknowledgement before releasing the hold. Older peers cannot preserve that hold through story
+//! updates and area changes, so v20 peers are refused at the handshake.
+//! v21 also requires the server's explicit `victory_fanfare` and `game_over_on_defeat` choices in
+//! [`BattleSetup`] and [`ServerMsg::EncounterStart`]. Clients do not infer victory music from a
+//! formation number, and Game Over follows authoritative defeat with only a return to the title screen.
 //!
 //! v20 adds durable scene battle continuations: required replay metadata in [`ServerMsg::SceneStart`],
 //! [`ClientMsg::SceneBattleReady`], [`ClientMsg::SceneRetry`] and the server's battle-start, resume and
@@ -144,7 +154,8 @@
 //! command }`; a client commands its own character, and the canon companions its roster entry names it the commander of
 //! ([`BattleMember::commander`]), with `BattleCommand` once that member's gauge is full
 //! and the server answers a refused one with `BattleRejected`. A won or lost battle ends with
-//! `BattleEnd { outcome, rewards }`, after which everyone is back in the field where they stood.
+//! `BattleEnd { outcome, rewards }`, after which everyone is back in the field where they stood unless
+//! `game_over_on_defeat` selects Game Over following defeat.
 //!
 //! ```text
 //! (C -> S  RequestEncounter { formation_id }            debug servers only)
@@ -155,6 +166,13 @@
 //! S -> C  BattleEvent { .., events: [.., Victory] }, then BattleEnd { battle_id, outcome, rewards }
 //! S -> C  BattleEvent { .., events: [Action { Escape }], command: Escape }, then BattleEnd { outcome: Escaped }
 //! ```
+//!
+//! `EncounterStart::victory_fanfare` explicitly chooses whether a victory plays the fanfare. It
+//! comes from the server's battle context and is required even when false; formation ids do not
+//! determine this choice.
+//! `EncounterStart::game_over_on_defeat` selects Game Over with only a return to the title screen
+//! after the server sends `BattleEnd { outcome: Defeat, .. }`. A locally replayed defeat does not
+//! open it. This required flag grants no retry request.
 //!
 //! A character whose limit gauge is full gives `Limit { target }` instead of Attack; any character
 //! may give `Escape`, which ends the battle for the whole party when it succeeds (nothing is paid) and
@@ -288,6 +306,38 @@
 //! ```
 //!
 //! An account that has never advanced gets exactly the messages it always got.
+//!
+//! ## Ordinary story and battle transactions (v21)
+//!
+//! Before an ordinary story compare-and-swap is submitted to durable storage, the server holds the
+//! affected player and sends [`ServerMsg::StoryPending`]. Its `area`, `pos` and `facing` are the
+//! authoritative stop, with [`AnimState::Idle`] implicit. The client installs the hold and replies
+//! with [`ClientMsg::StoryPendingAck`] on the same ordered connection, after any earlier input.
+//! The save submission does not wait for that client acknowledgement.
+//! The server keeps the hold until both that acknowledgement and its own durable save acknowledgement
+//! arrive; input already in flight cannot move the player after a fast save completes.
+//!
+//! ```text
+//! S -> C  StoryPending { id, area, pos, facing }       install the hold, implicitly Idle
+//! C -> S  StoryPendingAck { id }                     ordered after earlier field input
+//! ...     server receives the durable save acknowledgement and the matching client acknowledgement
+//! S -> C  StoryUpdate / AreaSnapshot / AreaChange / other committed effects, as needed
+//! S -> C  StoryCommitted { id }                      release only the matching story hold
+//! ```
+//!
+//! Story and entity updates, snapshots, placement changes and area transfer do not release this
+//! hold. A `StoryCommitted` for another id does not release it either, and releasing a story hold
+//! does not release an independent scene or battle hold. All fields of the three messages are
+//! required; no asset bytes or client-authorized story mutation travel in them.
+//!
+//! An ordinary battle uses the same hold for each participant, installed before capturing its
+//! resource snapshot and starting combat. The server waits for that snapshot's durable acknowledgement
+//! and every connected participant's pending acknowledgement before sending `EncounterStart`. The
+//! token stays held throughout the battle: field movement, interaction and debug requests remain
+//! blocked, while [`ClientMsg::BattleCommand`] remains available to command the battle's actors.
+//! After the outcome is durable, the server sends `BattleEnd`, resource/story updates, any changed
+//! phase and any victory `SceneStart` before `StoryCommitted`. A victory scene therefore keeps its
+//! own hold even after the matching ordinary transaction hold is released.
 //!
 //! # Countdown
 //!
@@ -437,8 +487,8 @@ pub use fmv_party::{
     PartyEvent, PartyId, Placement,
 };
 
-// Older peers cannot hold, recover or resume a scene across an acknowledged battle transaction.
-pub const PROTOCOL_VERSION: u16 = 20;
+// Older peers cannot acknowledge and preserve an ordinary story or battle transaction's field hold.
+pub const PROTOCOL_VERSION: u16 = 21;
 /// Hard cap on a single frame payload (bytes).
 pub const MAX_FRAME: u32 = 256 * 1024;
 
@@ -600,6 +650,11 @@ pub enum ClientMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         npc: Option<u32>,
     },
+    /// The client installed the hold from [`ServerMsg::StoryPending`] with this exact `id`.
+    /// Sent on the same ordered connection after earlier field input, so the server can drain that
+    /// input before releasing the hold. This is not a claim that the story was saved: the server
+    /// also requires its own durable acknowledgement. New in v21.
+    StoryPendingAck { id: u64 },
     Ping { nonce: u64 },
     Leave,
     /// Invite the player with this entity into your party (or to form one).
@@ -739,6 +794,12 @@ pub enum ServerMsg {
         ticks_per_second: u32,
         /// A field script can forbid escape even when the formation would allow it.
         escape_policy: EscapePolicy,
+        /// Whether victory plays the fanfare, chosen explicitly by the server's battle context.
+        /// Required since v21: clients must not infer this from the formation or default it.
+        victory_fanfare: bool,
+        /// Whether an authoritative defeat opens Game Over with only a return to the title screen.
+        /// Required since v21. Wait for `BattleEnd { outcome: Defeat, .. }`; this grants no retry request.
+        game_over_on_defeat: bool,
         /// Authoritative starting HP/MP and carried status/limit, by roster actor index. Explicit
         /// null keeps an ordinary fresh battle; v20 peers must always supply the field.
         #[serde(deserialize_with = "required_option")]
@@ -759,7 +820,8 @@ pub enum ServerMsg {
     /// The battle is over (the message before it carried `Victory` or `Defeat`, or the `Escape` command
     /// that got the party away, v7: `Escaped`). `rewards` has one entry per member of the party when the
     /// outcome is `Victory` (see [`split_rewards`]; the items in it are the drops, see [`assign_drops`])
-    /// and is empty on `Defeat` and `Escaped`. The receiving player is back in the field.
+    /// and is empty on `Defeat` and `Escaped`. The receiving player is back in the field unless
+    /// `EncounterStart::game_over_on_defeat` selects Game Over on `Defeat`.
     BattleEnd { battle_id: BattleId, outcome: battle::Outcome, rewards: Vec<BattleReward> },
     /// A battle request or command of this client was refused. `battle_id` is the battle it was
     /// about, if any.
@@ -777,6 +839,17 @@ pub enum ServerMsg {
     /// dropped it items (see the module docs, "Inventory"). `items` is at most
     /// [`MAX_INVENTORY_STACKS`] entries, one per item, none of zero.
     Inventory { items: Vec<InventoryEntry> },
+    /// An ordinary story or battle transaction holds this player at the authoritative `area`, `pos` and
+    /// `facing`. Animation is implicitly [`AnimState::Idle`]; there is no animation field. Install
+    /// the hold before sending [`ClientMsg::StoryPendingAck`] with this `id`, and preserve it through
+    /// story/entity updates, snapshots and area transfer. Only [`ServerMsg::StoryCommitted`] with
+    /// the matching `id` releases it. During a battle the field hold still permits battle commands;
+    /// it remains until the outcome is durable and its effects are published. Every field is required. New in v21.
+    StoryPending { id: u64, area: AreaId, pos: Pos, facing: f32 },
+    /// The transaction with this `id` is durable and its ordered [`ClientMsg::StoryPendingAck`]
+    /// has reached the server. Release only the matching story hold; a stale or unrelated id does
+    /// not release another transaction or any independent scene/battle hold. New in v21.
+    StoryCommitted { id: u64 },
     /// This player's story progress, as the server holds it (see the module docs, "Story"): sent right
     /// after the join messages when the account's progression is not a new account's (the empty
     /// blob), and again whenever the server advances it (`advance` says which story point did). A
@@ -992,8 +1065,8 @@ mod tests {
     }
 
     #[test]
-    fn the_version_is_twenty() {
-        assert_eq!(PROTOCOL_VERSION, 20);
+    fn the_version_is_twenty_one() {
+        assert_eq!(PROTOCOL_VERSION, 21);
     }
 
     // -----------------------------------------------------------------------------------------
@@ -1206,6 +1279,116 @@ mod tests {
         // Said at join: no `advance` key at all.
         golden(ServerMsg::StoryUpdate { progress: vec![1, 6, 0], advance: None }, r#"{"StoryUpdate":{"progress":[1,6,0]}}"#);
         golden(ServerMsg::StoryUpdate { progress: vec![], advance: None }, r#"{"StoryUpdate":{"progress":[]}}"#);
+    }
+
+    #[test]
+    fn golden_story_transaction_messages() {
+        golden(ClientMsg::StoryPendingAck { id: 77 }, r#"{"StoryPendingAck":{"id":77}}"#);
+        golden(
+            ServerMsg::StoryPending { id: 77, area: md1stin(), pos: Pos::new(1.0, 2.0, 3.0), facing: 0.5 },
+            r#"{"StoryPending":{"id":77,"area":{"game":"Ff7","key":"md1stin"},"pos":{"x":1.0,"y":2.0,"z":3.0},"facing":0.5}}"#,
+        );
+        golden(ServerMsg::StoryCommitted { id: 77 }, r#"{"StoryCommitted":{"id":77}}"#);
+
+        // IDs retain all 64 bits; the authoritative stop has no animation field (Idle is implicit).
+        golden(ClientMsg::StoryPendingAck { id: u64::MAX }, r#"{"StoryPendingAck":{"id":18446744073709551615}}"#);
+        golden(
+            ServerMsg::StoryPending { id: u64::MAX, area: md1stin(), pos: Pos::new(-1.0, 2.0, -3.0), facing: -0.5 },
+            r#"{"StoryPending":{"id":18446744073709551615,"area":{"game":"Ff7","key":"md1stin"},"pos":{"x":-1.0,"y":2.0,"z":-3.0},"facing":-0.5}}"#,
+        );
+        golden(ServerMsg::StoryCommitted { id: u64::MAX }, r#"{"StoryCommitted":{"id":18446744073709551615}}"#);
+    }
+
+    #[test]
+    fn story_transaction_messages_require_every_field() {
+        fn required<T: DeserializeOwned>(message: serde_json::Value, variant: &str, fields: &[&str]) {
+            for field in fields {
+                let mut missing = message.clone();
+                missing[variant].as_object_mut().unwrap().remove(*field);
+                let error = decode::<T>(&serde_json::to_vec(&missing).unwrap()).err().unwrap();
+                assert!(error.to_string().contains(&format!("missing field `{field}`")), "{error}");
+
+                let mut null = message.clone();
+                null[variant][*field] = serde_json::Value::Null;
+                assert!(decode::<T>(&serde_json::to_vec(&null).unwrap()).is_err(), "{variant}.{field} accepted null");
+            }
+        }
+
+        required::<ClientMsg>(serde_json::json!({"StoryPendingAck": {"id": 77}}), "StoryPendingAck", &["id"]);
+        required::<ServerMsg>(serde_json::json!({"StoryCommitted": {"id": 77}}), "StoryCommitted", &["id"]);
+        let pending = serde_json::to_value(ServerMsg::StoryPending {
+            id: 77, area: md1stin(), pos: Pos::new(1.0, 2.0, 3.0), facing: 0.5,
+        }).unwrap();
+        required::<ServerMsg>(pending.clone(), "StoryPending", &["id", "area", "pos", "facing"]);
+        for (field, components) in [("area", &["game", "key"][..]), ("pos", &["x", "y", "z"][..])] {
+            for component in components {
+                let mut missing = pending.clone();
+                missing["StoryPending"][field].as_object_mut().unwrap().remove(*component);
+                assert!(decode::<ServerMsg>(&serde_json::to_vec(&missing).unwrap()).is_err(), "{field}.{component} was optional");
+
+                let mut null = pending.clone();
+                null["StoryPending"][field][*component] = serde_json::Value::Null;
+                assert!(decode::<ServerMsg>(&serde_json::to_vec(&null).unwrap()).is_err(), "{field}.{component} accepted null");
+            }
+        }
+    }
+
+    #[test]
+    fn story_transaction_messages_reject_malformed_fields() {
+        let pending = serde_json::to_value(ServerMsg::StoryPending {
+            id: 77, area: md1stin(), pos: Pos::new(1.0, 2.0, 3.0), facing: 0.5,
+        }).unwrap();
+        for invalid in ["-1", "1.5", "18446744073709551616", r#""77""#, "true", "[]", "{}"] {
+            let value: serde_json::Value = serde_json::from_str(invalid).unwrap();
+            let ack = serde_json::json!({"StoryPendingAck": {"id": value.clone()}});
+            let committed = serde_json::json!({"StoryCommitted": {"id": value.clone()}});
+            let mut stop = pending.clone();
+            stop["StoryPending"]["id"] = value;
+            assert!(decode::<ClientMsg>(&serde_json::to_vec(&ack).unwrap()).is_err(), "ack accepted id {invalid}");
+            assert!(decode::<ServerMsg>(&serde_json::to_vec(&committed).unwrap()).is_err(), "commit accepted id {invalid}");
+            assert!(decode::<ServerMsg>(&serde_json::to_vec(&stop).unwrap()).is_err(), "pending accepted id {invalid}");
+        }
+        for (field, invalid) in [
+            ("area", serde_json::json!("md1stin")),
+            ("area", serde_json::json!({"game": "Unknown", "key": "md1stin"})),
+            ("area", serde_json::json!({"game": "Ff7", "key": 77})),
+            ("pos", serde_json::json!(false)),
+            ("pos", serde_json::json!({"x": "1", "y": 2, "z": 3})),
+            ("facing", serde_json::json!("0.5")),
+            ("facing", serde_json::json!(true)),
+        ] {
+            let mut damaged = pending.clone();
+            damaged["StoryPending"][field] = invalid;
+            assert!(decode::<ServerMsg>(&serde_json::to_vec(&damaged).unwrap()).is_err(), "pending accepted {damaged}");
+        }
+    }
+
+    #[test]
+    fn v20_peers_cannot_decode_story_transaction_messages_and_are_refused_at_the_handshake() {
+        // A peer with no v21 variants rejects their names before it can interpret their fields.
+        #[derive(Deserialize)]
+        enum V20ClientMsg { Leave }
+        #[derive(Deserialize)]
+        enum V20ServerMsg {
+            StoryUpdate {
+                #[serde(rename = "progress")]
+                _progress: Vec<u8>,
+            },
+        }
+
+        let ack = encode(&ClientMsg::StoryPendingAck { id: 77 }).unwrap();
+        assert!(decode::<V20ClientMsg>(&ack[4..]).is_err());
+        for message in [
+            ServerMsg::StoryPending { id: 77, area: md1stin(), pos: Pos::new(1.0, 2.0, 3.0), facing: 0.5 },
+            ServerMsg::StoryCommitted { id: 77 },
+        ] {
+            let frame = encode(&message).unwrap();
+            assert!(decode::<V20ServerMsg>(&frame[4..]).is_err());
+        }
+        let hello = br#"{"Hello":{"protocol_version":20,"client_build":"c","auth":{"Token":"x"},"character":{"tint":[0,0,0],"body":null,"slot":null}}}"#;
+        assert!(decode::<ClientMsg>(hello).is_ok());
+        assert_eq!(probe_hello_version(hello), Some(20));
+        assert_ne!(probe_hello_version(hello), Some(PROTOCOL_VERSION));
     }
 
     #[test]
@@ -1591,6 +1774,8 @@ mod tests {
                 battle_speed: 128,
                 ticks_per_second: 60,
                 escape_policy: EscapePolicy::Formation,
+                victory_fanfare: true,
+                game_over_on_defeat: false,
                 initial_party: None,
                 data_fingerprint: Fingerprint([0xcd; 32]),
             },
@@ -1598,7 +1783,7 @@ mod tests {
                 r#"{"EncounterStart":{"battle_id":1,"formation_id":517,"seed":12345,"party":["#,
                 r#"{"controller":{"Player":{"entity":10,"account":20}},"name":"Blizz","character":0,"level":6,"weapon":null,"armor":null,"limit":0},"#,
                 r#"{"controller":{"Player":{"entity":11,"account":21}},"name":"Red XIII","character":1,"level":7,"weapon":3,"armor":4,"limit":137}],"#,
-                r#""preemptive":false,"back_attack":true,"battle_speed":128,"ticks_per_second":60,"escape_policy":"Formation","initial_party":null,"data_fingerprint":""#,
+                r#""preemptive":false,"back_attack":true,"battle_speed":128,"ticks_per_second":60,"escape_policy":"Formation","victory_fanfare":true,"game_over_on_defeat":false,"initial_party":null,"data_fingerprint":""#,
                 "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
                 r#""}}"#
             ),
@@ -1616,6 +1801,8 @@ mod tests {
                 battle_speed: 0,
                 ticks_per_second: 240,
                 escape_policy: EscapePolicy::Formation,
+                victory_fanfare: true,
+                game_over_on_defeat: false,
                 initial_party: None,
                 data_fingerprint: Fingerprint([0xab; 32]),
             },
@@ -1625,7 +1812,7 @@ mod tests {
                 r#"{"controller":"Companion","name":"Barret","character":1,"level":7,"weapon":null,"armor":null,"limit":0},"#,
                 r#"{"controller":{"Player":{"entity":10,"account":20}},"name":"Blizz","character":0,"level":6,"weapon":null,"armor":null,"limit":0},"#,
                 r#"{"controller":{"Player":{"entity":11,"account":21}},"name":"Red XIII","character":1,"level":7,"weapon":3,"armor":4,"limit":137}],"#,
-                r#""preemptive":false,"back_attack":false,"battle_speed":0,"ticks_per_second":240,"escape_policy":"Formation","initial_party":null,"data_fingerprint":""#,
+                r#""preemptive":false,"back_attack":false,"battle_speed":0,"ticks_per_second":240,"escape_policy":"Formation","victory_fanfare":true,"game_over_on_defeat":false,"initial_party":null,"data_fingerprint":""#,
                 "abababababababababababababababababababababababababababababababab",
                 r#""}}"#
             ),
@@ -2180,7 +2367,7 @@ mod tests {
     #[test]
     fn golden_character_messages() {
         // A registration that chose a body and a slot, one that chose nothing, and a token login (which ignores it). The
-        // version number is a literal, as in `golden_client_messages`: these pin the SHAPE, and `the_version_is_twelve`
+        // version number is a literal, as in `golden_client_messages`: these pin the SHAPE, and `the_version_is_twenty_one`
         // pins the version, so a bump does not have to rewrite them.
         golden(
             ClientMsg::Hello {
@@ -2381,7 +2568,7 @@ mod tests {
         assert!(decode::<BattleMember>(br#"{"controller":"Companion","name":"x","character":0,"level":1,"weapon":null,"armor":null,"limit":0,"status":"Poison"}"#).is_err());
     }
 
-    /// A continuation's setup cannot silently fall back to full health or formation escape rules.
+    /// A continuation's setup cannot silently choose full health, formation escape rules or battle presentation.
     #[test]
     fn battle_continuation_setup_requires_explicit_escape_and_carried_resources() {
         let initial = BattleInitialState { hp: 301, mp: 27, status: StatusSet::from_bits(16), limit: 137 };
@@ -2391,11 +2578,12 @@ mod tests {
             let message = ServerMsg::EncounterStart {
                 battle_id: BattleId(8), formation_id: 328, seed: 42, party: members(),
                 preemptive: false, back_attack: false, battle_speed: 128, ticks_per_second: 60,
-                escape_policy: EscapePolicy::Forbidden, initial_party, data_fingerprint: Fingerprint([0xab; 32]),
+                escape_policy: EscapePolicy::Forbidden, victory_fanfare: true, game_over_on_defeat: false,
+                initial_party, data_fingerprint: Fingerprint([0xab; 32]),
             };
             let frame = encode(&message).unwrap();
             assert_eq!(decode::<ServerMsg>(&frame[4..]).unwrap(), message);
-            for field in ["escape_policy", "initial_party"] {
+            for field in ["escape_policy", "victory_fanfare", "game_over_on_defeat", "initial_party"] {
                 let mut damaged = serde_json::to_value(&message).unwrap();
                 damaged["EncounterStart"].as_object_mut().unwrap().remove(field);
                 let error = decode::<ServerMsg>(&serde_json::to_vec(&damaged).unwrap()).unwrap_err();
@@ -2406,6 +2594,44 @@ mod tests {
             let mut damaged = serde_json::to_value(initial).unwrap();
             damaged.as_object_mut().unwrap().remove(field);
             assert!(serde_json::from_value::<BattleInitialState>(damaged).is_err(), "missing {field} lost carried resources");
+        }
+    }
+
+    #[test]
+    fn battle_start_preserves_an_explicitly_disabled_victory_fanfare() {
+        let message = ServerMsg::EncounterStart {
+            battle_id: BattleId(8), formation_id: 517, seed: 42, party: members(),
+            preemptive: false, back_attack: false, battle_speed: 128, ticks_per_second: 60,
+            escape_policy: EscapePolicy::Formation, victory_fanfare: false, game_over_on_defeat: false, initial_party: None,
+            data_fingerprint: Fingerprint([0xab; 32]),
+        };
+        let frame = encode(&message).unwrap();
+        assert_eq!(decode::<ServerMsg>(&frame[4..]).unwrap(), message);
+        let wire: serde_json::Value = serde_json::from_slice(&frame[4..]).unwrap();
+        assert_eq!(wire["EncounterStart"]["victory_fanfare"], serde_json::json!(false));
+        for invalid in [serde_json::Value::Null, serde_json::json!(0), serde_json::json!("false"), serde_json::json!([])] {
+            let mut damaged = wire.clone();
+            damaged["EncounterStart"]["victory_fanfare"] = invalid;
+            assert!(decode::<ServerMsg>(&serde_json::to_vec(&damaged).unwrap()).is_err(), "invalid victory fanfare: {damaged}");
+        }
+    }
+
+    #[test]
+    fn battle_start_preserves_an_explicit_game_over_on_defeat() {
+        let message = ServerMsg::EncounterStart {
+            battle_id: BattleId(8), formation_id: 517, seed: 42, party: members(),
+            preemptive: false, back_attack: false, battle_speed: 128, ticks_per_second: 60,
+            escape_policy: EscapePolicy::Formation, victory_fanfare: true, game_over_on_defeat: true, initial_party: None,
+            data_fingerprint: Fingerprint([0xab; 32]),
+        };
+        let frame = encode(&message).unwrap();
+        assert_eq!(decode::<ServerMsg>(&frame[4..]).unwrap(), message);
+        let wire: serde_json::Value = serde_json::from_slice(&frame[4..]).unwrap();
+        assert_eq!(wire["EncounterStart"]["game_over_on_defeat"], serde_json::json!(true));
+        for invalid in [serde_json::Value::Null, serde_json::json!(1), serde_json::json!("true"), serde_json::json!([])] {
+            let mut damaged = wire.clone();
+            damaged["EncounterStart"]["game_over_on_defeat"] = invalid;
+            assert!(decode::<ServerMsg>(&serde_json::to_vec(&damaged).unwrap()).is_err(), "invalid game over choice: {damaged}");
         }
     }
 
@@ -2438,6 +2664,8 @@ mod tests {
             battle_speed: u8::MAX,
             ticks_per_second: u32::MAX,
             escape_policy: EscapePolicy::Forbidden,
+            victory_fanfare: true,
+            game_over_on_defeat: false,
             initial_party: Some(vec![BattleInitialState { hp: u32::MAX, mp: u32::MAX, status: StatusSet::from_bits(u32::MAX), limit: u16::MAX }; MAX_BATTLE_PARTY]),
             data_fingerprint: Fingerprint([0xff; 32]),
         };

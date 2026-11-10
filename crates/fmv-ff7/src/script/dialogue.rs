@@ -69,6 +69,14 @@
 //! new game (every variable 0, Cloud and Barret in the party); a server-fed implementation
 //! that mirrors a real player's progress replaces it without touching the walker.
 //!
+//! [`run_talk_exact`], [`run_panel_exact`] and [`run_script_exact`] are opt-in authoritative
+//! evaluators for version 3 story points. They return canonical persistent assignments with
+//! their authored bit masks, and refuse unknown inputs, unhandled effects, incomplete runs or
+//! missing answers. Talk-time setup may not change saved values or establish new knowledge.
+//! The caller commits the result against its exact predecessor; a configured battle continuation
+//! must be gated on that battle's authoritative victory before publication. These APIs do not
+//! change the permissive window and survey behavior described above.
+//!
 //! # Origins
 //!
 //! Every [`Message`] says where it came from ([`MessageOrigin`]): the field's own script
@@ -93,9 +101,12 @@ mod walk;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod exact_tests;
 
 pub use pieces::{parse_message, Piece, TextColour, CHARACTER_NAMES};
 pub use walk::{availability, run_talk, Availability, Limits, Spot, TalkError, TalkRun, TalkSession, Walk, EFFECT_NOTE_LAYER, KEY_OK};
+pub use walk::{run_panel_exact, run_script_exact, run_talk_exact, ExactBattle, ExactError, ExactRun, ExactScript, ExactWrite};
 
 use super::FieldScript;
 

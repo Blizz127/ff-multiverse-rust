@@ -692,9 +692,9 @@ fn an_account_with_character_progress_is_not_released_as_an_orphan() {
     assert!(matches!(
         store.release_unclaimed(played),
         Err(PersistError::NotReleasable {
-            reason: "it has stored progression",
+            account,
             ..
-        })
+        }) if account == played
     ));
     assert_eq!(
         store

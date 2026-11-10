@@ -27,7 +27,7 @@
 //! * **A talk** ([`StoryTrigger::Talk`]): a character whose talk moves the story. The point names the place the character
 //!   stands; the bot finds the character of the area's snapshot that stands there ([`StoryBot::see_npcs`]), walks up to
 //!   within a part of the point's radius of it and presses OK addressing it (`Interact { npc: Some(id) }`).
-//! * **A battle first** (`AreaRuntime::story_battle`): the party fights before the step. The bot walks to the point like
+//! * **A battle first** (`AreaRuntime::story_battle_for`): the party fights before the step. The bot walks to the point like
 //!   to any region, and last (the points that start no battle come first); a bot that leads a party stands before it until
 //!   the others are in view ([`StoryBot::see_party`]), at most [`BATTLE_PARTY_WAIT_S`]. The server starts the battle when
 //!   a member comes to the point from outside, the bots' battle code fights it, and the step comes when it is won: until
@@ -192,10 +192,9 @@ enum Pressing {
     Sent { since: f32 },
 }
 
-/// How the bot tells a step that goes FORWARD from one that does not: the game's own join of two progressions
-/// (`GameAdapter::merge_progression`). A step is forward when the join of the story the player has and the step's is
-/// something new (a further moment, bits turned on); a step the join adds nothing to (the lift's ride back, which turns
-/// a bit off) is not, and the bot never pursues it.
+/// How the bot recognizes a story change: legacy progression uses the game's monotone join; exact FF7 progression
+/// uses its predecessor-checked replacement, which also permits authored clears and numeric assignments. The route's
+/// exit check separately prevents a lift toggle from closing the way the bot intends to take.
 #[derive(Clone)]
 struct Judge(Arc<dyn GameAdapter>);
 
@@ -317,17 +316,29 @@ impl StoryBot {
         }
     }
 
-    /// The game's own content, to tell a step that goes forward from one that does not: the bot pursues and presses
-    /// only the points whose step is forward of the story it was told (`merge_progression` of the story and the step
-    /// is something new). Without it every step the area offers is pursued.
+    /// The game's own content, to validate a change from the story the bot was told. Exact FF7 state uses the ordered
+    /// replacement validator; legacy state keeps its monotone join. Without it every step the area offers is pursued.
     pub fn with_adapter(mut self, adapter: Option<Arc<dyn GameAdapter>>) -> Self {
         self.judge = adapter.map(Judge);
         self
     }
 
+    fn has_exact_progression(&self, progress: &[u8]) -> bool {
+        self.judge.as_ref().is_some_and(|judge| judge.0.game() == fmv_core::GameId::Ff7)
+            && fmv_ff7::story::StoryState::decode(progress).is_some_and(|s| s.supports_extended())
+    }
+
     /// Is `step` (the progression a point would give) forward of `current` (the one the player has)?
     fn is_forward(&self, current: &[u8], step: &[u8]) -> bool {
-        self.judge.as_ref().is_none_or(|judge| judge.0.merge_progression(current, step) != current)
+        self.judge.as_ref().is_none_or(|judge| {
+            if self.has_exact_progression(current) {
+                // Exact state may clear a flag or replace a number. Joining it would discard those changes; only an
+                // already exact predecessor uses this path, so bot probing cannot promote a legacy/imported save.
+                current != step && judge.0.compare_exchange_progression(current, current, step).is_some_and(|next| next == step)
+            } else {
+                judge.0.merge_progression(current, step) != current
+            }
+        })
     }
 
     /// `--story-advance` was given: the bot decides every step, even when there is nothing to do
@@ -350,6 +361,7 @@ impl StoryBot {
         self.pressing = Pressing::No;
         self.press_npc = None;
         self.press_point = None;
+        self.sent_progress.clear();
         self.party_wait = 0.0;
     }
 
@@ -411,9 +423,14 @@ impl StoryBot {
                         if !self.is_forward(progress, &step.progress) {
                             return None;
                         }
+                        // An exact clear is a real change, but repeatedly undoing the last press is no progress.
+                        // A travelling bot may still reverse it when that opens its requested exit (the branch above).
+                        if self.has_exact_progression(progress) && step.progress == self.sent_progress {
+                            return None;
+                        }
                     }
                 }
-                let battle = area.story_battle(point.id).is_some();
+                let battle = area.story_battle_for(progress, point.id).is_some();
                 Some(Target { point, kind, battle })
             })
             .min_by(|a, b| a.battle.cmp(&b.battle).then_with(|| a.point.center().dist_xy(from).total_cmp(&b.point.center().dist_xy(from))))
@@ -504,7 +521,7 @@ impl StoryBot {
             let step = self.step_toward(area, &exits, cur, want, len).unwrap_or(still);
             return self.gate(&target, cur, step, dt, still);
         }
-        let avoid = Self::battles_to_avoid(area, &target);
+        let avoid = Self::battles_to_avoid(area, progress, &target);
         let step = self.walk_to(area, (&exits, &avoid), &target, cur, centre, (dt, speed));
         self.gate(&target, cur, step, dt, still)
     }
@@ -512,10 +529,10 @@ impl StoryBot {
     /// The regions of the points that start a battle, other than the one the bot goes for: stepping on one on the way
     /// brings the battle on before the party is ready and before the story ahead of it is done (the first reactor's
     /// last field has the talk of the materia to do before the battle's triangle, which lies near the way).
-    fn battles_to_avoid(area: &dyn AreaRuntime, target: &Target) -> Vec<StoryPoint> {
+    fn battles_to_avoid(area: &dyn AreaRuntime, progress: &[u8], target: &Target) -> Vec<StoryPoint> {
         area.story_points()
             .into_iter()
-            .filter(|p| p.id != target.point.id && matches!(p.trigger, StoryTrigger::Region(_) | StoryTrigger::Line(..)) && area.story_battle(p.id).is_some())
+            .filter(|p| p.id != target.point.id && matches!(p.trigger, StoryTrigger::Region(_) | StoryTrigger::Line(..)) && area.story_battle_for(progress, p.id).is_some())
             .collect()
     }
 

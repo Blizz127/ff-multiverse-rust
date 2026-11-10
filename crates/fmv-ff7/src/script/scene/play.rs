@@ -65,7 +65,8 @@ pub enum SceneError {
 }
 
 /// Replay semantics version. Change this when the interpreter's durable replay contract changes.
-pub const REPLAY_VERSION: u32 = 2;
+/// Version 3 adds authored model offsets/palette commands and corrects byte-extraction operands.
+pub const REPLAY_VERSION: u32 = 3;
 
 /// The exact authored instruction at which this run stopped for combat. Ordinals distinguish
 /// repeated executions of the same instruction, including repeated formations.
@@ -276,9 +277,14 @@ pub struct Outcome {
 impl Outcome {
     /// Whether the party the scene's scripts leave behind is the one the story has once the scene's writes are
     /// applied: the story's party at `before`, with the scripts' own joins and leaves, equals the story's party at
-    /// `after` ([`crate::story::canon_party`]). A scene that touches no party always passes; one that does passes only
-    /// where the party table has the row for it, which is how a party change is carried (never guessed, never dropped).
+    /// `after` ([`crate::story::canon_party`]). Extended authoritative scenes also require the actual
+    /// assignments to match the reviewed unlocked-member projection, including members temporarily
+    /// added then removed. Legacy previews keep their earlier no-party-operation behavior.
     pub fn party_is_the_storys(&self, before: &StoryState, after: &StoryState) -> bool {
+        if before.supports_extended() || after.supports_extended() {
+            return party_after(&canon_party(before), &self.party) == canon_party(after)
+                && crate::story::party_visibility_matches(before, after, &self.party);
+        }
         self.party.is_empty() || party_after(&canon_party(before), &self.party) == canon_party(after)
     }
 
@@ -458,6 +464,9 @@ impl ScenePlay {
         let mesh = field.walkmesh().map_err(|e| SceneError::Walkmesh(e.to_string()))?;
         let section = script.bytes().to_vec();
         let mut vm = Vm::with_resources(SceneVars::new(story.clone(), &def.given), seed, limits, resources);
+        if story.supports_extended() {
+            vm.allow_default_name_sites(super::default_names::sites(script.bytes(), def));
+        }
         vm.setup(script, &def.setup);
         let setup = vm.take_stats();
         // A cast member the stage scripts did not place stands where the cast says, and the scene knows it.
@@ -528,6 +537,10 @@ impl ScenePlay {
             if let Some(w) = place {
                 let z = w.z.or_else(|| ground.height(w.x, w.y, w.triangle, None).map(|h| h.round() as i16));
                 out.push(Stage::Place { entity: member.entity, x: w.x, y: w.y, z, triangle: w.triangle });
+            }
+            let [x, y, z] = vm.offset(member.entity);
+            if [x, y, z] != [0; 3] {
+                out.push(Stage::Offset { entity: member.entity, x, y, z });
             }
             let heading = vm.heading_of(member.entity).or_else(|| member.start.as_ref().map(|s| field_direction_to_facing(s.direction)));
             if let Some(heading) = heading {
@@ -827,7 +840,7 @@ pub fn replay_scene_to(field: &FieldFile, def: &SceneDef, story: &StoryState, re
 
 fn stage_entity(stage: &Stage) -> Option<u8> {
     match stage {
-        Stage::Place { entity, .. } | Stage::Move { entity, .. } | Stage::Face { entity, .. } | Stage::Anim { entity, .. } | Stage::AnimSpeed { entity, .. } | Stage::Show { entity, .. } => Some(*entity),
+        Stage::Place { entity, .. } | Stage::Offset { entity, .. } | Stage::OffsetMove { entity, .. } | Stage::Move { entity, .. } | Stage::Face { entity, .. } | Stage::Anim { entity, .. } | Stage::AnimSpeed { entity, .. } | Stage::Show { entity, .. } => Some(*entity),
         Stage::Sound { .. } | Stage::Camera(_) | Stage::Background(_) | Stage::Shake { .. } | Stage::Fade(_) => None,
     }
 }

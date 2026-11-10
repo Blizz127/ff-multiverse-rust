@@ -41,6 +41,6 @@ impl Preview {
         let mut positions = Vec::new();
         if !skin(&asset, &pose, &place, &camera, &mut positions) { return None; }
         Some(AvatarFrame { models: vec![SkinnedModel { asset, positions }], tints: vec![], identities: vec![Identity::of(form.tint)],
-                           zoom: 1000.0, overlay_bias: 0.12 * scale, ground: vec![], scenery: None })
+                           zoom: 1000.0, field_depth: None, overlay_bias: 0.12 * scale, ground: vec![], scenery: None })
     }
 }

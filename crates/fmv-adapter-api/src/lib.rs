@@ -538,6 +538,18 @@ pub struct StoryStep {
     pub countdown: Option<u32>,
 }
 
+/// Authored rules for a battle that gates a story point. Formation defaults still apply;
+/// a script can further forbid escape, suppress the victory fanfare, and require Game Over
+/// on defeat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoryBattlePolicy {
+    pub formation: u16,
+    pub escape_forbidden: bool,
+    pub victory_fanfare: bool,
+    /// Defeat enters Game Over rather than returning control to the field.
+    pub game_over_on_defeat: bool,
+}
+
 /// What an area's data holds of the story (exits its scripts decide, points that move the story) that its adapter
 /// does NOT offer, and why: see [`AreaRuntime::story_withheld`]. Descriptions are the adapter's own, in words and
 /// numbers of its own (never text of the game); the server logs them once per area.
@@ -677,10 +689,21 @@ pub trait AreaRuntime: Send + Sync {
     /// the point is unknown, or `progress` cannot be read: an unreadable blob is never replaced).
     /// Pure: the server applies the step, saves it and tells the player.
     ///
-    /// A story only moves forward: a step never lowers what the progression already records.
+    /// Merge-based stories only move forward. Ordered stories may include clears or numeric
+    /// assignments and must opt into [`AreaRuntime::story_requires_transaction`].
     fn story_advance(&self, progress: &[u8], point: u32) -> Option<StoryStep> {
         let _ = (progress, point);
         None
+    }
+
+    /// Whether ordinary field-story changes require an exact-base durable transaction before
+    /// publication. Such states can contain ordered assignments and cleared bits that a
+    /// monotonic merge cannot preserve. The server must hold the participating account until
+    /// the adapter's compare/exchange validation and durable save have succeeded; a missing
+    /// transaction capability must refuse the change. Legacy adapters default to merge saves.
+    fn story_requires_transaction(&self, progress: &[u8]) -> bool {
+        let _ = progress;
+        false
     }
 
     /// The ways inside this area that put a player somewhere else in it (see [`Link`]): ladders, jumps over gaps.
@@ -708,6 +731,24 @@ pub trait AreaRuntime: Send + Sync {
     fn story_battle(&self, point: u32) -> Option<u16> {
         let _ = point;
         None
+    }
+
+    /// The battle an ordinary point must win for this progression before publishing its step.
+    /// Exact story implementations may also gate writes that the authored script places before
+    /// a battle: the complete action is published only after its verified victory. Defaults to
+    /// the legacy point lookup so existing adapters keep their behavior.
+    fn story_battle_for(&self, progress: &[u8], point: u32) -> Option<u16> {
+        let _ = progress;
+        self.story_battle(point)
+    }
+
+    /// The battle's effective source policy at this exact predecessor. Adapters with no
+    /// script-specific rules retain the formation's escape rules, the usual fanfare and
+    /// their existing field return after defeat.
+    fn story_battle_policy(&self, progress: &[u8], point: u32) -> Option<StoryBattlePolicy> {
+        self.story_battle_for(progress, point).map(|formation| StoryBattlePolicy {
+            formation, escape_forbidden: false, victory_fanfare: true, game_over_on_defeat: false,
+        })
     }
 
     /// The exits and story points this area's data holds that the adapter chose not to offer (neither in
@@ -761,6 +802,15 @@ pub trait GameAdapter: Send + Sync {
     fn merge_progression(&self, stored: &[u8], advanced: &[u8]) -> Vec<u8> {
         let _ = stored;
         advanced.to_vec()
+    }
+
+    /// Validate an ordered story replacement under the store's writer lock. Return the bytes
+    /// to persist only when `stored` exactly matches `expected` and both the predecessor and
+    /// replacement are supported. This pure function performs no write. `None` rejects stale,
+    /// malformed or unsupported replacements; the default supplies no transaction capability.
+    fn compare_exchange_progression(&self, stored: &[u8], expected: &[u8], advanced: &[u8]) -> Option<Vec<u8>> {
+        let _ = (stored, expected, advanced);
+        None
     }
 }
 

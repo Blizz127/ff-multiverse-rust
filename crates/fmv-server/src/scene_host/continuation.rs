@@ -14,7 +14,7 @@ use fmv_protocol::{SceneOrigin, SceneReplay, SceneReplayEvent, MAX_SCENE_STEPS};
 impl Ff7SceneHost {
     pub(super) fn continuation_boundary(&self, scene: &str, original_progress: &[u8], seed: u32,
         original_gil: u32, replay: Option<&SceneReplay>, initial_origin: Option<SceneOrigin>) -> Option<SceneBoundary> {
-        if !self.continuation(scene) || !self.offered(scene, original_progress)
+        if !self.continuation_for(scene, original_progress) || !self.offered(scene, original_progress)
             || !persistable_field_gil(original_gil, original_gil) { return None; }
         let def = self.def(scene)?;
         let original = def.prepare_story(&StoryState::decode(original_progress)?).ok()?;
@@ -37,6 +37,14 @@ impl Ff7SceneHost {
             Some(_) => return None,
             None => &[],
         };
+        // The early post-escape scenes retain the ordinary route's full-restore policy:
+        // ordinary battles start full and there is no carried combat state in this chain.
+        // The runtime also refuses a battle plan/carry on these noncombat checkpoints.
+        // Never extend this exception to the bridge or another chain that carries HP/MP.
+        let full_restore_is_redundant = self.noncombat_continuation(scene);
+        if full_restore_is_redundant && events.iter().any(|event| matches!(event, SceneReplayEvent::Battle { .. })) {
+            return None;
+        }
         let mut segment_story = original;
         let mut segment_gil = original_gil;
         // Retain the original encoding for the first CAS; promotion itself is not a saved write.
@@ -45,7 +53,7 @@ impl Ff7SceneHost {
         for event in events {
             let snapshot = play.snapshot()?;
             let mark = snapshot.boundary;
-            let (_, after, _) = checked_segment(snapshot, &segment_story, segment_gil)?;
+            let (_, after, _) = checked_segment(snapshot, &segment_story, segment_gil, full_restore_is_redundant)?;
             match (mark, event) {
                 (ScriptBoundary::Window(mark), SceneReplayEvent::Window { step, identity, answer }) => {
                     if mark.ordinal.checked_sub(1)? != *step || *step >= MAX_SCENE_STEPS
@@ -72,7 +80,7 @@ impl Ff7SceneHost {
         }
         let snapshot = play.snapshot()?;
         let mark = snapshot.boundary;
-        let (outcome, after, gil) = checked_segment(snapshot, &segment_story, segment_gil)?;
+        let (outcome, after, gil) = checked_segment(snapshot, &segment_story, segment_gil, full_restore_is_redundant)?;
         let at = match mark {
             ScriptBoundary::Window(mark) => {
                 let step = mark.ordinal.checked_sub(1)?;
@@ -93,7 +101,7 @@ impl Ff7SceneHost {
 
 /// Validate and apply just this segment. Earlier committed resource operations have already
 /// been removed by checked resume; cumulative interpreter failures remain grounds for refusal.
-fn checked_segment(snapshot: SceneSnapshot, before: &StoryState, gil: u32) -> Option<(Outcome, StoryState, u32)> {
+fn checked_segment(snapshot: SceneSnapshot, before: &StoryState, gil: u32, full_restore_is_redundant: bool) -> Option<(Outcome, StoryState, u32)> {
     let outcome = Outcome {
         end: match snapshot.boundary { ScriptBoundary::End(end) => end, _ => End::Battle },
         windows: snapshot.stats.windows, questions: 0, writes: snapshot.writes,
@@ -101,7 +109,7 @@ fn checked_segment(snapshot: SceneSnapshot, before: &StoryState, gil: u32) -> Op
         unknown_persistent_reads: snapshot.unknown_persistent_reads, party: snapshot.party,
         resources: snapshot.resources, stats: snapshot.stats,
     };
-    if !safe_segment(&outcome, false) || outcome.resources.gil_before != Some(gil) { return None; }
+    if !safe_segment(&outcome, full_restore_is_redundant) || outcome.resources.gil_before != Some(gil) { return None; }
     let next_gil = outcome.resources.gil_after?;
     if !persistable_field_gil(gil, next_gil) { return None; }
     let mut after = before.clone();

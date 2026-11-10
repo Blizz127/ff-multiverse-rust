@@ -29,6 +29,8 @@ fn setup_for(formation: u16, party: usize) -> BattleSetup {
     BattleSetup {
         initial_party: None,
         escape_policy: fmv_protocol::EscapePolicy::Formation,
+        victory_fanfare: true,
+        game_over_on_defeat: false,
         formation_id: formation,
         seed: 7,
         party: (0..party as u64).map(|i| member(i, i as u8)).collect(),
@@ -235,7 +237,7 @@ fn a_status_tints_the_body_a_sleeper_droops_and_has_no_ring_while_it_cannot_act(
     use fmv_ff7_battle::status::{Status, StatusSet};
     let set = |s: Status| StatusSet::EMPTY.with(s);
     let build = |a: &[Status], b: &[Status], preemptive: bool| {
-        let mut setup = BattleSetup { preemptive, ..setup_for(1, 2) };
+        let mut setup = BattleSetup { victory_fanfare: true, game_over_on_defeat: false, preemptive, ..setup_for(1, 2) };
         setup.party[0].status = a.iter().copied().collect();
         setup.party[1].status = b.iter().copied().collect();
         let engine = limit_rules().build(&setup).unwrap();
@@ -286,7 +288,7 @@ fn a_frame_has_a_stage_every_model_a_shadow_each_and_a_ring_for_the_ready_ones()
     assert_eq!((shadows, bands), (4, 1), "the one band is the white ring of our own character");
     // Make our character ready (a preemptive engine) and tell the scene: a gold ring appears.
     let party = vec![member(0, 0), member(1, 1)];
-    let setup = BattleSetup { preemptive: true, party, ..setup_for(1, 2) };
+    let setup = BattleSetup { victory_fanfare: true, game_over_on_defeat: false, preemptive: true, party, ..setup_for(1, 2) };
     let engine = SyntheticRules::default().build(&setup).unwrap();
     scene.update(1.0, &[], Some(&engine));
     let ready = scene.frame(&view, false);
@@ -619,6 +621,8 @@ fn state_in_battle() -> ClientState {
         ServerMsg::EncounterStart {
             initial_party: None,
             escape_policy: fmv_protocol::EscapePolicy::Formation,
+            victory_fanfare: true,
+            game_over_on_defeat: false,
             battle_id: BattleId(4),
             formation_id: 1,
             seed: 5,
@@ -682,6 +686,8 @@ fn a_solo_player_is_its_own_body_beside_the_canon_pair_whatever_its_stat_curve()
             ServerMsg::EncounterStart {
                 initial_party: None,
                 escape_policy: fmv_protocol::EscapePolicy::Formation,
+                victory_fanfare: true,
+                game_over_on_defeat: false,
                 battle_id: BattleId(9),
                 formation_id: 0,
                 seed: 3,
@@ -724,6 +730,8 @@ fn the_canon_companions_are_the_canon_characters_and_the_players_are_their_own_b
         ServerMsg::EncounterStart {
             initial_party: None,
             escape_policy: fmv_protocol::EscapePolicy::Formation,
+            victory_fanfare: true,
+            game_over_on_defeat: false,
             battle_id: BattleId(4),
             formation_id: 1,
             seed: 5,
@@ -778,6 +786,8 @@ fn a_scene_is_made_for_a_battle_kept_while_it_is_seen_and_rebuilt_for_the_next()
         ServerMsg::EncounterStart {
             initial_party: None,
             escape_policy: fmv_protocol::EscapePolicy::Formation,
+            victory_fanfare: true,
+            game_over_on_defeat: false,
             battle_id: BattleId(5),
             formation_id: 0,
             seed: 1,
@@ -805,6 +815,8 @@ fn a_battle_that_cannot_be_replayed_here_is_drawn_flat() {
         ServerMsg::EncounterStart {
             initial_party: None,
             escape_policy: fmv_protocol::EscapePolicy::Formation,
+            victory_fanfare: true,
+            game_over_on_defeat: false,
             battle_id: BattleId(9),
             formation_id: 1,
             seed: 5,
@@ -1048,6 +1060,8 @@ fn events_are_kept_without_a_replay_and_for_the_battle_that_is_on_only() {
         ServerMsg::EncounterStart {
             initial_party: None,
             escape_policy: fmv_protocol::EscapePolicy::Formation,
+            victory_fanfare: true,
+            game_over_on_defeat: false,
             battle_id: BattleId(6),
             formation_id: 1,
             seed: 5,
@@ -1072,6 +1086,8 @@ fn events_are_kept_without_a_replay_and_for_the_battle_that_is_on_only() {
         ServerMsg::EncounterStart {
             initial_party: None,
             escape_policy: fmv_protocol::EscapePolicy::Formation,
+            victory_fanfare: true,
+            game_over_on_defeat: false,
             battle_id: BattleId(7),
             formation_id: 0,
             seed: 1,

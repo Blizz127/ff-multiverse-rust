@@ -128,6 +128,7 @@ mod maplist;
 mod models;
 mod exits;
 mod opcodes;
+pub(crate) mod party;
 mod text;
 
 #[cfg(test)]

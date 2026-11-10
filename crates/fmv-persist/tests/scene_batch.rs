@@ -530,7 +530,7 @@ fn a_finished_guest_can_be_restored_under_a_new_account_without_losing_rewards_o
 
     let deleted = store.delete_account(accounts[1], NOW + 10).unwrap();
     // A completed archive may also be moved into a separate fresh store. Installing its
-    // v3 receipts must first upgrade that store's format fence, even without its old party.
+    // v4 receipts must first upgrade that store's format fence, even without its old party.
     let (_copy_dir, copy_root) = fresh_root();
     let copy = open(&copy_root);
     assert_eq!(log_lines(&copy_root)[0]["schema_version"], 2);
@@ -543,8 +543,8 @@ fn a_finished_guest_can_be_restored_under_a_new_account_without_losing_rewards_o
     }
     let copied = copy.restore_account(&deleted.entry, NOW + 11).unwrap();
     assert!(copied.unfinished.is_empty());
-    assert_eq!(log_lines(&copy_root)[0]["schema_version"], 3);
-    assert_eq!(read_json(&copy_root.join("index.json"))["schema_version"], 2, "the legacy marker stays at v2; index.log carries the v3 fence");
+    assert_eq!(log_lines(&copy_root)[0]["schema_version"], 4);
+    assert_eq!(read_json(&copy_root.join("index.json"))["schema_version"], 2, "the legacy marker stays at v2; index.log carries the v4 fence");
     let mut copy_expected = earned.clone();
     copy_expected.pair.story.account_id = copied.account_id;
     copy_expected.pair.character.as_mut().unwrap().account_id = copied.account_id;

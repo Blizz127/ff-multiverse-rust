@@ -7,13 +7,17 @@
 //! counts, not only where it ends) and, for each point touched, asks the area what reaching it does for
 //! THIS progression (`AreaRuntime::story_advance`). A point that fires on ENTRY (`StoryTrigger::Enter`: what an area's
 //! own scripts do by themselves from the first frame on) is reached the moment the player comes to stand in the area
-//! (it joined, or arrived through an exit; [`World::enter_story`]). A step is applied as one unit, in this order:
+//! (it joined, or arrived through an exit; [`World::enter_story`]). Exact story formats first hold the
+//! accepted input position and wait for both the client's ordered barrier and the durable exact
+//! predecessor write. Only then are the new story, countdown, and phase published. Their remaining
+//! point ids and movement work resume in order; they are never rescanned against a changed story.
+//! Legacy formats retain their adapter-defined merge path below. A published step does the following:
 //!
-//! 1. the player's mirror takes the new progression (the story only moves forward: the adapter decides);
+//! 1. the player's mirror takes the selected progression (including exact clears and numeric assignments);
 //! 2. the server logs ONE line (the one `scripts/phase-smoke.sh` and a headless bot's caller look for):
 //!    `story advanced account=<n> entity=<n> area=<AreaId> point=<id> <summary>`, for FF7
 //!    `story advanced account=3 entity=7 area=Ff7/md1stin point=0 moment=1->6`;
-//! 3. the save is queued for the saver (`crate::saver`), which writes it off the world lock with the
+//! 3. for a legacy step, the save is queued for the saver (`crate::saver`), which writes it off the world lock with the
 //!    adapter's own merge, so a stale save can never take a story back (a server without a saver, like
 //!    a unit test of the world, saves nothing);
 //! 4. the player is told with `ServerMsg::StoryUpdate`;
@@ -33,10 +37,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use fmv_adapter_api::{AreaKey, StoryStep};
-use fmv_core::{EntityId, Pos};
+use fmv_core::{AccountId, EntityId, Pos};
 use fmv_protocol::{ServerMsg, StoryAdvance};
 
 use super::{is_full, World};
+
+mod save;
+pub(super) use save::{StoryFollowup, StorySaves};
 
 /// What a battle that a story point started does when it is WON: the step of the point, for the player that reached
 /// it, judged again on the story the player has then (see [`World::story_after_battle`]).
@@ -65,6 +72,7 @@ impl World {
     /// reached by coming to it from outside only: a player that stands in its region after losing the fight does
     /// not start it again with every step.
     pub(super) fn check_story(&mut self, entity: EntityId, from: Pos, to: Pos, now: Instant) {
+        if self.ordinary_story_held(entity) { return; }
         let touched: Vec<u32> = {
             let Some(player) = self.players.get(&entity).filter(|p| p.battle.is_none() && p.transit.is_none()) else { return };
             if player.placement.as_ref().is_some_and(|p| !p.story_advance_allowed) {
@@ -73,16 +81,12 @@ impl World {
             let Some(area) = self.areas.get(&player.area) else { return };
             area.story_points()
                 .iter()
-                .filter(|point| point.is_hit_by(from, to) && !(area.runtime().story_battle(point.id).is_some() && point.is_hit_by(from, from)))
+                .filter(|point| point.is_hit_by(from, to) && !(area.runtime().story_battle_for(&player.progression, point.id).is_some() && point.is_hit_by(from, from)))
                 .map(|point| point.id)
                 .collect()
         };
-        for point in touched {
-            // (a point whose cutscene now holds the player is the move's last: the others are judged on the story it leaves)
-            if self.reach_story_point(entity, point, Some(now), now, false) == Reached::Held {
-                break;
-            }
-        }
+        let Some(area) = self.players.get(&entity).map(|p| p.area.clone()) else { return; };
+        self.run_story_points(entity, area, touched, false, now);
     }
 
     /// `entity` has just come to stand in its area (it joined, or finished a transfer: `announce_entry`): reach every
@@ -90,9 +94,10 @@ impl World {
     /// ones before it left. Does nothing for a player whose placement does not let it advance the story (a party
     /// member in the leader's phase), or in an area without such points.
     ///
-    /// A point whose cutscene holds the player is the last judged here: the run's end applies its step and judges the
-    /// area's entry points again (`point_step_after_scene`).
+    /// A point whose cutscene holds the player is the last judged here. Exact progression resumes
+    /// the captured remaining ids after acknowledgment; legacy progression retains its entry rescan.
     pub(super) fn enter_story(&mut self, entity: EntityId, now: Instant) {
+        if self.ordinary_story_held(entity) { return; }
         let entering: Vec<u32> = {
             let Some(player) = self.players.get(&entity).filter(|p| p.battle.is_none() && p.transit.is_none()) else { return };
             if player.placement.as_ref().is_some_and(|p| !p.story_advance_allowed) {
@@ -101,11 +106,33 @@ impl World {
             let Some(area) = self.areas.get(&player.area) else { return };
             area.story_points().iter().filter(|point| point.is_on_entry()).map(|point| point.id).collect()
         };
-        for point in entering {
-            // (no battle clock here: a point that needs a battle is not one that fires by coming to stand somewhere)
-            if self.reach_story_point(entity, point, None, now, true) == Reached::Held {
-                break;
+        let Some(area) = self.players.get(&entity).map(|p| p.area.clone()) else { return; };
+        self.run_story_points(entity, area.clone(), entering, true, now);
+        // The entry caller starts automatic scenes only when no point held it. A deferred
+        // sweep owns that final continuation, after every preceding step is acknowledged.
+        self.defer_story_followup(entity, StoryFollowup::Automatic { area });
+    }
+
+    /// Continue only the point ids not reached before a cutscene or exact write interrupted
+    /// this sweep. Each point observes the previously acknowledged progression.
+    fn run_story_points(&mut self, entity: EntityId, area: AreaKey, points: Vec<u32>, on_entry: bool, now: Instant) {
+        if self.players.get(&entity).is_none_or(|p| p.area != area || p.transit.is_some()) { return; }
+        for (index, &point) in points.iter().enumerate() {
+            if self.reach_story_point(entity, point, (!on_entry).then_some(now), now, on_entry) == Reached::Held {
+                if index + 1 < points.len() {
+                    self.defer_story_followup(entity, StoryFollowup::Sweep { area,
+                        points: points[index + 1..].to_vec(), on_entry });
+                }
+                return;
             }
+            if self.players.get(&entity).is_some_and(|p| p.battle.is_some()) {
+                if index + 1 < points.len() {
+                    self.defer_story_followup(entity, StoryFollowup::Sweep { area,
+                        points: points[index + 1..].to_vec(), on_entry });
+                }
+                return;
+            }
+            if self.players.get(&entity).is_none_or(|p| p.transit.is_some()) { return; }
         }
     }
 
@@ -123,9 +150,11 @@ impl World {
     /// battle the point starts first (`AreaRuntime::story_battle`: the step then waits for the win; `battle_clock` is the
     /// clock of that battle, and without one such a point does nothing), or play the step's cutscene first (the game's
     /// `SceneHost::point_scene`: the step then waits for the run's end; `now` is the run's clock, `on_entry` whether the point
-    /// was reached by coming to stand in the area).
+    /// was reached by coming to stand in the area). A verified exact continuation is selected first:
+    /// its full script may own a map transfer that an ordinary field step cannot safely evaluate.
     pub(super) fn reach_story_point(&mut self, entity: EntityId, point: u32, battle_clock: Option<Instant>, now: Instant, on_entry: bool) -> Reached {
-        let (step, battle) = {
+        if self.ordinary_story_held(entity) { return Reached::Held; }
+        let exact = {
             let Some(player) = self.players.get(&entity) else { return Reached::Nothing };
             // Every trigger, including OK presses, obeys the same phase permission as walking.
             // Reject only the story step: a follower may still use an ordinary ladder or jump.
@@ -133,7 +162,17 @@ impl World {
                 return Reached::Nothing;
             }
             let Some(area) = self.areas.get(&player.area) else { return Reached::Nothing };
-            (area.runtime().story_advance(&player.progression, point), area.runtime().story_battle(point))
+            let exact = area.runtime().story_requires_transaction(&player.progression);
+            if exact && (player.battle.is_some() || player.transit.is_some() || player.scene.is_some()) {
+                return Reached::Nothing;
+            }
+            exact
+        };
+        if exact && self.start_point_continuation(entity, point, now) { return Reached::Held; }
+        let (step, battle) = {
+            let Some(player) = self.players.get(&entity) else { return Reached::Nothing };
+            let Some(area) = self.areas.get(&player.area) else { return Reached::Nothing };
+            (area.runtime().story_advance(&player.progression, point), area.runtime().story_battle_for(&player.progression, point))
         };
         let Some(step) = step else { return Reached::Nothing };
         if let Some(formation) = battle {
@@ -147,8 +186,7 @@ impl World {
         if self.start_point_scene(entity, point, &step, now, on_entry, None) {
             return Reached::Held;
         }
-        self.apply_story_step(entity, point, step);
-        Reached::Applied
+        if self.apply_story_step(entity, point, step) { Reached::Held } else { Reached::Applied }
     }
 
     /// The battle that a story point started has been WON: the player's step, if it still applies (the player is where
@@ -168,15 +206,38 @@ impl World {
         if let Some(step) = step {
             // Preserve victory even if the dialogue is skipped or the player disconnects. The scene is presentation
             // only; the existing save and countdown happen exactly once here, as they did before the scene existed.
-            self.apply_story_step(then.entity, then.point, step.clone());
-            self.start_victory_scene(then.entity, before, &step, formation, now);
+            if self.apply_story_step(then.entity, then.point, step.clone()) {
+                self.defer_story_followup(then.entity, StoryFollowup::Victory { before, step, formation });
+            } else {
+                self.start_victory_scene(then.entity, before, &step, formation, now);
+            }
         }
+    }
+
+    /// Atomic ordinary battle settlement has already stored resources and this owner's story.
+    /// Publish only to the current session of that account; an offline win creates no timer or
+    /// presentation tied to the departed entity id.
+    pub(super) fn ordinary_story_battle_committed(&mut self, owner: AccountId, before: Vec<u8>, step: StoryStep,
+        formation: u16, point: u32, now: Instant) {
+        let Some(entity) = self.by_account.get(&owner).copied() else {
+            self.discard_ordinary_story_battle_followups(owner);
+            return;
+        };
+        if self.players.get(&entity).is_none_or(|p| p.progression != before) {
+            self.fail_story_storage("the ordinary battle's held story predecessor changed"); return;
+        }
+        self.resume_saved_story_battle(entity, before, step, formation, point, now);
     }
 
     /// Apply `step` of point `point` to `entity` (module docs: the mirror, the log line, the save, the message, the
     /// placements).
-    pub(super) fn apply_story_step(&mut self, entity: EntityId, point: u32, step: StoryStep) {
+    pub(super) fn apply_story_step(&mut self, entity: EntityId, point: u32, step: StoryStep) -> bool {
+        let exact = self.players.get(&entity).filter(|p| p.preview.is_none())
+            .and_then(|p| self.areas.get(&p.area).map(|area| area.runtime().story_requires_transaction(&p.progression)))
+            .unwrap_or(false);
+        if exact { return self.queue_story_cas(entity, point, step); }
         self.apply_story_step_inner(entity, point, step, true);
+        false
     }
 
     /// Publish a step already acknowledged by durable storage. It must not enqueue a second save.

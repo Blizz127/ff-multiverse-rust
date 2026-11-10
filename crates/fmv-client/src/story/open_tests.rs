@@ -132,6 +132,9 @@ impl GameAdapter for Ff7Join {
     fn merge_progression(&self, stored: &[u8], advanced: &[u8]) -> Vec<u8> {
         fmv_ff7::story::merge_progression(stored, advanced)
     }
+    fn compare_exchange_progression(&self, stored: &[u8], expected: &[u8], advanced: &[u8]) -> Option<Vec<u8>> {
+        fmv_ff7::story::compare_exchange_progression(stored, expected, advanced)
+    }
 }
 
 fn bot(wanted: Option<&str>) -> StoryBot {
@@ -172,6 +175,50 @@ fn going_down_the_ride_down_is_pursued_and_the_ride_back_is_not() {
     let b = bot(Some(DOWN));
     assert_eq!(goes_for(&b, false), Some(0), "forward, and it opens the way down");
     assert_eq!(goes_for(&b, true), None, "the way down is open, and the ride back would close it");
+}
+
+#[test]
+fn exact_story_clears_can_open_the_wanted_exit_without_toggling_the_lift_back() {
+    let shaft = Shaft::new();
+    let from = Pos::new(0.0, -60.0, 0.0);
+    let exact = |down| StoryState::decode(&lift(down)).unwrap().into_extended().unwrap().encode();
+    let up = exact(false);
+    let down = exact(true);
+    let b = bot(Some(UP));
+    assert_eq!(b.target(&shaft, &down, from).map(|t| t.point.id), Some(1), "an authored clear opens the way up");
+    assert!(b.target(&shaft, &up, from).is_none(), "the exact-state change that closes that way is still refused");
+    let b = bot(Some(DOWN));
+    assert_eq!(b.target(&shaft, &up, from).map(|t| t.point.id), Some(0));
+    assert!(b.target(&shaft, &down, from).is_none(), "the ride back would close the chosen way down");
+    let b = bot(None);
+    assert_eq!(b.target(&shaft, &down, from).map(|t| t.point.id), Some(1), "without a route, an exact authored clear is a valid change");
+}
+
+#[test]
+fn exact_story_without_a_route_does_not_repeatedly_undo_its_last_lift_press() {
+    let shaft = Shaft::new();
+    for initial_down in [false, true] {
+        let mut b = bot(None);
+        let mut progress = StoryState::decode(&lift(initial_down)).unwrap().into_extended().unwrap().encode();
+        let mut pos = Pos::new(0.0, -60.0, 0.0);
+        let mut presses = 0;
+        for _ in 0..4000 {
+            let point = b.target(&shaft, &progress, pos).map(|t| t.point.id);
+            pos = b.step(&shaft, pos, 0.01, 360.0, &progress).pos;
+            if b.take_press().is_some() {
+                presses += 1;
+                progress = shaft.story_advance(&progress, point.expect("the press has a target")).unwrap().progress;
+            }
+        }
+        assert_eq!(presses, 1, "no-route exact bot must stop after its first ride, initial_down={initial_down}");
+        assert!(!b.wants_to_walk(&shaft, &progress, pos));
+        // Choosing the exit on the original side authorizes the return ride; no stale anti-toggle state blocks it.
+        b.set_wanted_exit(Some(if initial_down { DOWN } else { UP }));
+        assert!(b.wants_to_walk(&shaft, &progress, pos));
+        b.set_wanted_exit(None);
+        b.arrived();
+        assert!(b.wants_to_walk(&shaft, &progress, pos), "the last field's press is forgotten on entry");
+    }
 }
 
 #[test]

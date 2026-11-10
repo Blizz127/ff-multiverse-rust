@@ -23,25 +23,33 @@ than calling it accurate. Existing owned installs and saves are read-only inputs
 ## Current coverage
 
 The flower and bridge acceptance results recorded in [POST-REACTOR.md](POST-REACTOR.md)
-are earlier checkpoints. The cargo-door/passenger-train changes below have passed the
-current interpreter, persistence, TCP and rendering checks listed below. These checks do
+are earlier checkpoints. The cargo-door/passenger-train changes below passed the
+interpreter, persistence, TCP and rendering checks at that checkpoint. The fresh-state and
+ordinary transaction changes now pass the combined acceptance checks below. These checks do
 not establish complete original-engine visual or timing parity.
 
 | Segment/system | Implementation/evidence now | Work still required |
 | --- | --- | --- |
-| New-game opening | Original-script initialization survey; new registrations receive kernel gil (240 in owned data) | Faithful first-control story initialization, bounded opening, movies and party/battle boundary |
-| First reactor | Reviewed fields and registered scenes, earlier whole-route smoke | Remaining presentation, resource awards and timing fidelity |
+| New-game opening | Atomic new-account story/resources; explicit first-control profile; Cloud-only opening roster; authored first-battle policy; fresh-registration/restart TCP acceptance | Opening movie/runtime equivalence and complete startup writers |
+| First reactor | Reviewed fields/scenes, exact ordinary CAS, atomic story-battle outcomes and required-route/relogin acceptance | Optional Restore materia, remaining presentation, resource awards and timing fidelity |
 | Escape aftermath | Registered md8_4/md8_1 scenes, moment 33 to 36 | Movie parity and ordinary field health/resource persistence |
 | Flower encounter | Registered opt-in scene; all five choices, atomic story/gil and earlier TCP/relogin acceptance | Original-engine presentation comparisons and wider mod/body coverage |
 | Bridge and cargo arrival | Registered opt-in chain through moment 48; three possible battles, durable recovery and earlier owned/TCP coverage | Movies, remaining field effects and original timing comparisons |
 | Cargo door / passenger train | Registered opt-in scenes 48 to 51; owned-data/TCP checks of crossing, durable landing, two windows and final control placement | Dynamic locks and visual/timing limits below |
-| Train lesson / Sector 7 station | Authored Jessie/rootmap/departure chain surveyed; station 51 to 63 remains unregistered | Known inputs, field-local state, map presentation, movie 24 and complete linked route |
+| Train lesson / Sector 7 station | Unregistered original-script definitions, 14 owned interpreter tests and eight-window ROOTMAP rendering acceptance | Field-local state, remaining map presentation, movie 24 and complete linked route |
 | Sector 7 / bar | Flag and choice surveys; isolated later bar proof | Ordered flags, affection, actual route, party/menu effects |
-| Rest of Disc 1 | No verified continuous route | Chapter/field manifest through Disc 1 end and all required modes |
+| Rest of Disc 1 | [Static chapter/field/mode manifest](DISC1-ROUTE-MANIFEST.md); no verified continuous route | Execute and implement the recorded branches and mode handoffs through the original Disc 1 ending |
 | Battle system | Deterministic subset; bridge fights carry HP/MP, limits and persistent statuses | Remaining enemy behavior, statuses, summons, limits and original progression fidelity |
 | Persistent gameplay | Character progress, inventory and durable scene transactions | Ordinary field HP/MP, canon party state, equipment/materia, shops and remaining scripted resources |
 | World traversal, minigames, movies | No complete end-to-end subsystem | Required Disc 1 modes and transitions |
-| Graphics | Scrolling camera, optional persisted FXAA and 2x scene rendering; authored background/fade/shake work in current wave | Original-game comparisons and broader field/effect coverage |
+| Graphics | Scrolling camera, optional persisted FXAA and 2x scene rendering; authored backgrounds/fades/shake, offsets and palettes; calibrated PC clipping | Original-game comparisons, native scheduling and broader field/effect coverage |
+
+The exact reactor route currently skips the optional Restore materia pickup. Its authored
+`SMTRA(53,0)` requires a materia/AP inventory addition and a bank 13:31 result alongside moment
+15; unsupported execution refuses all of those changes. The separate boss trigger permits
+moment 14 to 27 and writes additional tracked flags. Its success therefore proves the required
+route, not every optional resource action. The original pickup disappears after the boss and
+cannot be recovered later on this route.
 
 ## Durable-state foundations and remaining scope
 
@@ -49,9 +57,15 @@ Version 3 stores byte/word aliases, known masks, clears and numeric updates. Lit
 assignments establish only the bits they write; unknown numeric inputs still refuse authoritative
 completion. Reviewed scene transactions compare exact prior story/resources, retain once-only
 receipts and hold the cohort until the queued store acknowledgment. The bridge adds atomic
-roster batches and durable battle/landing checkpoints; protocol 20 carries their replay data.
+roster batches and durable battle/landing checkpoints; protocol 21 carries their replay data
+and the ordered holds used by ordinary field-story transactions.
 This is not general persistent execution of every field script or automatic save conversion.
-Replay contract 2 rejects older contract-1 checkpoints without changing them. Fully known
+The current change uses replay contract 3 for model offsets, palette state and corrected
+high/low-byte extraction, rejecting older contract-1/2 checkpoints without changing them.
+Index compatibility advances to 4 and detached archive manifests to 2 so older readers do
+not open records with the new interpretation. The complete persistence suite passes
+310 tests (one ignored), including migration fences, crash recovery and exact restore rollback.
+Fully known
 5,117-byte story banks now fit the three-battle continuation: replay is bounded at 256 KiB,
 encoded checkpoints at 2 MiB and character records at 4 MiB. Existing intent limits and
 serialization remain unchanged; a separate 256 KiB wire-frame preflight rejects an oversized
@@ -127,9 +141,11 @@ made complete by this arrival implementation.
 ## Fresh-state provenance and the next route dependency
 
 Version 3 records known masks, including known zero, without inventing values for existing
-v1/v2 records. Registration now credits only new FF7 characters with the owned kernel's
-initial gil; existing zero balances remain zero. Fresh story-bank initialization is still
-research, not an implemented migration or registration change in this wave.
+v1/v2 records. Extended-save registration atomically commits the fresh story profile and
+owned kernel's initial resources before issuing the account token. Existing accounts,
+including empty legacy stories and zero gil balances, never receive those defaults.
+`fresh_reset` records the original reset image; `fresh_first_control` is the explicit port
+profile after reviewed opening assignments, with unsupported engine-owned values unknown.
 
 The pinned original PSX reset explicitly clears all 1,280 persistent bank bytes, then sets
 menu, party and location-buffer exceptions. The owned PC `md1stin` opening assigns affection
@@ -140,6 +156,23 @@ PC source confirms the same bank layout but not its reset routine. One post-rese
 routine is also absent from the pinned reconstruction. Clocks, location text, counters and
 other engine-managed bank bytes need their writers or explicit unknown masks; seeding them
 known and invalidating later is not supported by today's monotonic knownness contract.
+The profile therefore leaves those inputs unknown from creation. It does not claim the
+unrecovered PC startup routine or opening movie has executed.
+
+Cloud starts alone. The door's authored party assignment adds Barret at moment 11;
+the station removes him at 36. Actual bank-3 party-ID assignments are journaled separately
+from the main party slots. A bounded unlocked-member projection covers the reviewed route
+through 63: the door unlocks Barret and removing him does not undo that unlock. General
+PHS persistence, later party layouts and unsupported availability queries remain unimplemented.
+
+The opening's literal `PRTYE(0,254,254)` at `md1stin` offset `0x03FD` establishes all three
+physical party bytes `[0,255,255]` before first control. This fresh-profile exception is
+applied after the general engine-field mask; it never supplies missing bytes to an existing
+save. The two original reactor-gate naming menus use an explicit port policy: retain the
+canon names already used by dialogue. Their return performs the original party reconciliation,
+preserving retained physical slot positions and recording only actual assignments. This
+capability is bound to the reviewed original script and its two exact menu sites. The name
+editor, renaming persistence and modified/localized versions of those menus are not implemented.
 
 Jessie's first train talk requires bit 2 known clear, sets it, and transfers to `rootmap`.
 The lesson requires bit 4 known clear, then returns to a different train placement and a
@@ -149,15 +182,106 @@ one-window 51 to 63 arrival. Optional Jessie dialogue can subtract from affectio
 needs the authored initial value and the field-local once-per-visit latch. None of these
 unknown inputs may be supplied as zero merely to unlock the route.
 
+## Unregistered next segment: train lesson through station arrival
+
+`script/scene/data/train_route.rs` defines `ff7/tin_1/jessie-train-talk`,
+`ff7/rootmap/train-map`, `ff7/tin_1/train-map-return` and
+`ff7/tin_1/sector-seven-departure`. The existing station definition now initializes all
+23 original entities. None of these definitions is added to the production registry.
+They describe original script execution with explicit inputs; they do not enable a route
+by assuming unknown flags are clear.
+
+* Jessie's first talk has two windows, sets only bank 3:223 bit 2, and transfers to
+  rootmap without changing moment 51 or gil. Later talk retains both authored answers:
+  answer 2 leaves affection unchanged; answer 3 subtracts three from bank 1:4 with a
+  floor of zero. Both set scratch 5:31. Another talk in that same visit has one window
+  and no choice. The runtime must preserve this latch across talks, commit it with the
+  affection effect, and clear it only on actual field entry. Supplying `false` to every
+  new scene would incorrectly repeat the affection deduction.
+* Rootmap's independently known bit 4 selects either the eight-window lesson and return
+  to tin_1 `(39,-325)`, triangle 49, direction 28, or movie 24 and the station. Both paths
+  preserve story and resources. The Cloud/Jessie close-up rigs are `clgd`/`cmde`; their
+  original type-0 `OFST` and palette programs are required presentation. Their authored
+  base `(-18,-459,-56)` is on ROOTMAP triangle 4. The script's triangle 53 is outside its
+  five-triangle mesh; the definition keeps the authored coordinates with a verified floor
+  hint instead of the incoming MAPJUMP's zero placeholder.
+* Return runs Cloud's main and the director/Jessie work in one new field VM. Three
+  windows and scratch 5:30 synchronize completion. Final Cloud position is `(72,-319,-53)`,
+  triangle 47, turned toward Jessie by `TURA`, not the initial direction 64. Biggs's
+  independent bank 3:223 bit 0 is also an input to the native carriage setup. Re-entering
+  the field resets scratch; separate talks within that visit must not do so. This return
+  reaches `FADEW` after dialogue, exposing the VM/client elapsed-dialogue-time gap described
+  above; renderer support alone does not resolve its scheduling.
+* Departure requires bit 2 explicitly known set at the original border2 line
+  `(-55,-210,-53)` to `(52,-220,-53)`. Slot 27:2 relies on the main's gate and does not
+  repeat the flag test. It preserves the accepted Cloud crossing, plays ten windows and
+  requests movie 24 before station MAPJUMP 146 at `(-2891,3392)`, triangle 26. A delayed
+  concurrent helper performs audio/fade work during that movie; immediately skipping the
+  movie also truncates this helper. The verified movie basename is `mainplr`; its owned
+  container/location and camera media are not yet established.
+* Station arrival has one window and writes moment 63 without inherited train scratch.
+  Its final Cloud position is `(-2738,3017,101)`, triangle 9, direction 16. Original
+  `UC 0` and the moment write precede Barret's window and remaining actor work. A durable
+  tail hold therefore differs from original control timing, and a checkpoint can already
+  contain moment 63 while that tail is unfinished. Required channel-3 door calls, volume
+  commands and the dynamic triangle-64 lock are separate integration requirements.
+
+The channel-3 audio gap is more than a missing play opcode. Pinned native PSX
+[`akao.c`](https://github.com/Xeeynamo/ff7-decomp/blob/d4db3de3c3aaf61269e048cf3f6a458996290de0/src/main/akao.c#L1677)
+maps commands 162/166 to that channel's persistent gain and gain slide. Command 166 takes
+duration first, target second, and treats duration zero as one audio-envelope tick; these
+ticks are not field frames. Gain survives replacement sounds. Scene-end cleanup must not
+restart the train hum while a stopped channel is still held for transfer. Command 202 in
+the movie helper instead ramps CD/movie audio. PC source corroborates channel scope, but
+the original PC dispatch arithmetic and zero-duration edge remain independently unverified.
+
+The new `train_lesson_real`, `rootmap_real` and `train_departure_real` targets cover these
+branches, partial masks, unknown reads, accepted origins, final poses and script ordering.
+All 14 tests passed on the owned data in the fresh combined build. The ROOTMAP GPU test
+also reached all eight windows and its terminal transfer; matched frames show that the
+authored offsets bring Cloud and Jessie into the foreground. Its monitor remains black
+without movie playback, and original scale and palette timing during dialogue remain
+unverified. These isolated checks do not enable the segment. Production additionally needs
+retained visit state, durable held landings
+through both field transfers and same-moment return, destination handshakes/relogin, movie
+playback with concurrent script scheduling, palette/offset rendering and complete authored
+audio. No live-save conversion or deployment accompanies this evidence.
+
 ## Verification coverage for this wave
 
-Current results: 1,456 client tests, 561 server tests and 257 persistence tests passed. The
-complete FF7 library run passed 661 tests; after the final checked-access lint fixes, all 139
+The earlier cargo/train checkpoint passed 1,456 client tests, 561 server tests and 257
+persistence tests. The complete FF7 library run passed 661 tests; after the final
+checked-access lint fixes, all 139
 scene units and all 39 owned scene tests passed again. Owned train and bridge TCP runs and
 the cargo/train host placement check passed. The renderer checks passed eight owned scene
 tests, the background lifecycle test, the fade compositor test, four supersampling tests and
 the range-clipping regression. Workspace all-target clippy passes with three pre-existing
 warnings. These runs used disposable state; there was no deployment or live-save conversion.
+
+The subsequent workspace suite passes 4,098 tests with zero failures and 378 ignored tests.
+It includes 1,499 client unit tests, 494 server library tests, 16 server binary tests, 769
+FF7 library tests, 94 protocol tests and the complete 310-test persistence suite. The final
+palette checked-access cleanup additionally passes its seven focused tests and the owned
+ROOTMAP color-ramp test. Workspace all-target clippy passes with three pre-existing warnings.
+
+Owned checks separately pass all 39 scene tests, six story tests, 14 train-lesson/ROOTMAP/
+departure tests, six server host tests, 16 server battle tests, and bridge/train/opening TCP
+tests. ROOTMAP reaches all eight windows in the renderer; the actual team-talk door models
+reach their closed, halfway and open positions through all 12 windows. All seven battle
+smoke modes pass; they explicitly seed moment 11 and do not prove fresh progression.
+
+`opening_real` exercises genuine v3 registration, battle 300 and item use, the accepted
+team-talk origin and exact transfer, saved landing recovery, stale ordered-acknowledgment
+fencing and restart at moment 8. The extended full-route smoke completes 17 owner transfers
+to `md8_1`/moment 36 and 15 follower transfers to `nrthmk` while preserving the follower's
+personal moment 1. Both shared victories replay exactly. A 40-second same-store restart
+retains both accounts' exact story and character records, with no battle, scene, transaction
+or reward replay. The full-route run uses a level-30 battle modifier and skips the unsupported
+optional Restore pickup; it is required-route acceptance, not native difficulty or all-choice
+parity. This follower was not selected for the finale, so it does not prove a second station
+arrival. Verifier expectations were corrected from independent original-script evidence;
+the retained-run restart used the same binaries, store and tokens after those checks were
+corrected. Its verifier also rejects 16 deliberately corrupted evidence cases.
 
 * `scene_real::cargo_door_uses_the_actual_crossing_and_transfers_without_changing_story_or_gil`
   covers the accepted origin, unchanged state, zero windows and exact transfer.

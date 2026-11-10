@@ -160,7 +160,7 @@ mod tests {
                     Vertex { pos: [-0.2, 0.9], color: [1.0; 4] },
                 ],
                 location: None,
-                models: AvatarFrame { models: vec![], tints: vec![], identities: vec![], zoom: 1.0, overlay_bias: 0.0, ground: vec![], scenery: None },
+                models: AvatarFrame { models: vec![], tints: vec![], identities: vec![], zoom: 1.0, field_depth: None, overlay_bias: 0.0, ground: vec![], scenery: None },
                 tints: vec![], identities: vec![], camera: Camera::fit(&bounds, 256.0, 192.0, 0.0),
             };
             let mut overlay = DrawList::new();

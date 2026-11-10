@@ -129,6 +129,10 @@ pub struct SceneTransaction {
 /// Where the world gets a game's scenes (see the module docs). Implementations read the game's own files; the world calls
 /// them under its lock, so they must be quick (cache what is slow).
 pub trait SceneHost: Send + Sync {
+    /// The game's explicit starting story for a newly registered account, when this host
+    /// supports storing it. Registration commits it with the identity and starting resources;
+    /// token logins and imported saves never use it. `None` preserves the legacy empty seed.
+    fn fresh_story(&self) -> Option<Vec<u8>> { None }
     /// Every scene, in the game's order: the trigger of the `n`-th is the scene NPC `SCENE_NPC_ID_BASE + n`.
     fn scenes(&self) -> Vec<SceneInfo>;
     /// Whether scene `scene` is on offer to a player whose instance plays the story `progress`.
@@ -138,9 +142,21 @@ pub trait SceneHost: Send + Sync {
     /// Whether this arrival must be linked to an acknowledged predecessor landing. Such a
     /// scene is entered by the continuation handoff, never by an unrelated field login.
     fn requires_landing(&self, _scene: &str) -> bool { false }
+    /// Per-save arrival policy, allowing a new durable arrival to retain older presentation
+    /// behavior for legacy saves. This describes a required predecessor, not executor support.
+    fn requires_landing_for(&self, scene: &str, _progress: &[u8]) -> bool { self.requires_landing(scene) }
     /// Whether this scene uses strict, durable window and battle continuation instead of the
     /// presentation-only scene completion path.
     fn continuation(&self, _scene: &str) -> bool { false }
+    /// Whether this stored story is eligible for the scene's continuation contract. This lets
+    /// a host retain legacy presentation while admitting exact point scripts for full saves.
+    fn continuation_for(&self, scene: &str, _progress: &[u8]) -> bool { self.continuation(scene) }
+    /// This source has a reviewed noncombat restore which is redundant only when no combat
+    /// plan or carried HP/MP exists. The runtime checks that precondition on replay and writes.
+    fn noncombat_continuation(&self, _scene: &str) -> bool { false }
+    /// Whether the source identity must capture the accepted trigger-crossing pose. Authored
+    /// point scenes with their own cast placement do not inherit a mutable player position.
+    fn requires_origin(&self, _scene: &str) -> bool { false }
     /// Reconstruct the exact accepted transcript to its next boundary. `None` starts a new
     /// replay and returns its source identity; an existing replay must match that identity.
     fn evaluate_continuation(&self, _scene: &str, _original_progress: &[u8], _seed: u32,
@@ -152,6 +168,10 @@ pub trait SceneHost: Send + Sync {
     }
     /// The authored scene line crossed by an accepted move, if enabled for this story.
     fn line_scene(&self, _field: &str, _progress: &[u8], _from: Pos, _to: Pos) -> Option<String> { None }
+    /// A source-verified exact point scene which owns its complete script result and travel.
+    /// This is consulted before scalar point evaluation; an unsupported or unmatched source
+    /// returns None and cannot bypass the area's normal step validation.
+    fn point_continuation(&self, _field: &str, _before: &[u8], _point: u32) -> Option<String> { None }
     /// The CUTSCENE of a story point, if the game has one: the scene to play for a player whose step in area `field` takes its
     /// story from `before` to `after` (the point's own step, which the world applies when the scene ends: see
     /// `World::start_point_scene`). `None`: the step is applied at once, as it always was.
@@ -278,6 +298,8 @@ pub(super) struct SceneWorld {
     next_run: u64,
     runs: BTreeMap<SceneRunId, SceneRun>,
     pending: BTreeMap<SceneRunId, PendingScene>,
+    /// A point scene whose ordinary exact story write still owns its presentation hold.
+    ordinary_finishing: BTreeMap<SceneRunId, SceneOutcome>,
     continuations: BTreeMap<SceneRunId, continuation::Continuation>,
     /// Admission fence: a login that read storage across a scene save must load it again.
     save_epoch: u64,
@@ -329,15 +351,27 @@ impl World {
 
     pub(crate) fn scene_save_epoch(&self) -> u64 { self.scenes.save_epoch }
 
+    pub(super) fn bump_story_save_epoch(&mut self) {
+        self.scenes.save_epoch = self.scenes.save_epoch.wrapping_add(1);
+    }
+
+    pub(super) fn fail_story_storage(&mut self, reason: &str) {
+        self.logs.warn(format!("ordinary story storage requires recovery: {reason}"));
+        self.stop_for_scene_storage_recovery();
+    }
+
     /// Validated travel targets stay loaded until the transaction is acknowledged.
     pub(super) fn pending_scene_destinations(&self) -> impl Iterator<Item = AreaKey> + '_ {
         self.scenes.pending.values().filter_map(|p| p.result.travel.as_ref().map(|exit| exit.target.clone()))
             .chain(self.scenes.continuations.values().flat_map(continuation::Continuation::destinations))
+            .chain(self.ordinary_story_destinations())
+            .chain(self.ordinary_battle_destinations())
     }
 
     pub(super) fn scene_save_pending(&self, account: AccountId) -> bool {
         self.scenes.pending.values().any(|pending| pending.account == account)
             || self.scenes.continuations.values().any(|c| c.accounts.contains(&account))
+            || self.ordinary_story_account_held(account) || self.ordinary_battle_account_held(account)
     }
 
     /// The phase of `player` in `area`: the made-up one of a previewing player, else what the area reads of its progression.
@@ -387,7 +421,7 @@ impl World {
         found
     }
 
-    fn send_to(&self, entity: EntityId, msg: ServerMsg, failed: &mut Vec<(EntityId, bool)>) {
+    pub(super) fn send_to(&self, entity: EntityId, msg: ServerMsg, failed: &mut Vec<(EntityId, bool)>) {
         let Some(p) = self.players.get(&entity) else { return };
         if let Err(e) = p.tx.try_send(Arc::new(msg)) {
             failed.push((entity, is_full(&e)));
@@ -404,7 +438,7 @@ impl World {
         if host.automatic(&info.id) { return; }
         let (pos, area, account) = {
             let Some(p) = self.players.get(&entity) else { return };
-            if p.battle.is_some() || p.transit.is_some() || p.scene.is_some() {
+            if p.battle.is_some() || p.transit.is_some() || p.scene.is_some() || p.story_pending.is_some() {
                 return;
             }
             (p.snapshot.pos, p.area.clone(), p.account)
@@ -446,6 +480,29 @@ impl World {
         self.start_run(run, record, &mut Vec::new());
     }
 
+    /// A verified point script owns its full durable continuation, including any authored
+    /// destination. It has no PointThen: the ordinary point must not apply the result again.
+    pub(super) fn start_point_continuation(&mut self, entity: EntityId, point: u32, now: Instant) -> bool {
+        let Some(player) = self.players.get(&entity) else { return false; };
+        if player.preview.is_some() || player.scene.is_some() || player.battle.is_some() || player.transit.is_some()
+            || self.account_in_battle(player.account)
+            || player.placement.as_ref().is_some_and(|placement| !placement.story_advance_allowed)
+            || (player.story_pending.is_some() && !self.ordinary_story_resuming(entity)) { return false; }
+        let Some(host) = self.scenes.host.as_ref() else { return false; };
+        let Some(scene) = host.point_continuation(&player.area, &player.progression, point) else { return false; };
+        if !host.continuation_for(&scene, &player.progression) || !host.offered(&scene, &player.progression)
+            || !self.scenes.list.iter().any(|info| info.id == scene && info.field == player.area) { return false; }
+        let watchers = self.watchers_for(entity, player.account, player.snapshot.pos);
+        let run = SceneRunId(self.scenes.next_run.max(1));
+        self.scenes.next_run = run.0.saturating_add(1);
+        let record = SceneRun { scene, owner: entity, watchers,
+            seed: run.0.wrapping_mul(0x9E37_79B9) as u32, progress: player.progression.clone(),
+            gil: player.progress.map_or(0, |progress| progress.gil), answers: Vec::new(), steps: 0,
+            started: now, last_activity: now, writes_story: true, preview: false, then: None };
+        self.start_run(run, record, &mut Vec::new());
+        true
+    }
+
     /// `entity` reached story point `point` of its area, whose step is `step`: if the game has a cutscene for that step
     /// (`SceneHost::point_scene`), play it first. The run is the player's (party members in range watch, as for any scene),
     /// built against the story it has BEFORE the step; it writes nothing of its own and sends nobody anywhere, and when it
@@ -471,7 +528,8 @@ impl World {
     fn start_cutscene(&mut self, entity: EntityId, scene: String, before: Vec<u8>, now: Instant, then: Option<PointThen>) -> bool {
         let (account, pos) = {
             let Some(p) = self.players.get(&entity) else { return false };
-            if p.preview.is_some() || p.scene.is_some() || p.battle.is_some() || p.transit.is_some() {
+            if p.preview.is_some() || p.scene.is_some() || p.battle.is_some() || p.transit.is_some()
+                || (p.story_pending.is_some() && !self.ordinary_story_resuming(entity)) {
                 return false;
             }
             (p.account, p.snapshot.pos)
@@ -554,8 +612,10 @@ impl World {
             .filter(|e| {
                 self.players.get(e).is_some_and(|p| {
                     p.battle.is_none()
+                        && !self.account_in_battle(p.account)
                         && p.transit.is_none()
                         && p.scene.is_none()
+                        && p.story_pending.is_none()
                         && Some(&p.area) == area.as_ref()
                         && self.instances.instance_of(p.account) == instance
                         && p.snapshot.pos.dist_xy(pos) <= SCENE_WATCH_RANGE
@@ -821,6 +881,30 @@ impl World {
             self.continuation_end(owner, run, outcome, now);
             return;
         }
+        if self.scenes.ordinary_finishing.contains_key(&run) { return; }
+        // A v3 point scene is presentation for the point's exact write. Preserve that scene's
+        // hold until the ordinary CAS and ordered input barrier have both completed.
+        let point_save = self.scenes.runs.get(&run).and_then(|record| {
+            let then = record.then.as_ref().filter(|then| then.battle.is_none())?;
+            let player = self.players.get(&record.owner)?;
+            let area = self.areas.get(&then.area)?;
+            (!record.preview && player.area == then.area && player.scene == Some(run)
+                && player.placement.as_ref().is_none_or(|placement| placement.story_advance_allowed)
+                && area.runtime().story_requires_transaction(&player.progression))
+                .then(|| (record.owner, then.point, area.runtime().story_advance(&player.progression, then.point)))
+        });
+        if let Some((owner, point, step)) = point_save {
+            let Some(step) = step else {
+                if let Some(record) = self.scenes.runs.remove(&run) {
+                    self.fail_scene_save(run, record, "the exact point-scene result could not be interpreted");
+                }
+                return;
+            };
+            self.scenes.ordinary_finishing.insert(run, outcome);
+            self.apply_story_step(owner, point, step);
+            self.defer_story_followup(owner, super::story::StoryFollowup::Scene { run });
+            return;
+        }
         let Some(record) = self.scenes.runs.remove(&run) else { return };
         let mut apply = matches!(outcome, SceneOutcome::Finished | SceneOutcome::Skipped);
         let mut result = if !apply || !record.writes_story { None } else {
@@ -887,6 +971,21 @@ impl World {
         if let Some(then) = record.then {
             self.point_step_after_scene(record.owner, then, now);
         }
+        self.resume_story_followups_after_scene(run, record.owner, now);
+    }
+
+    /// The point's ordinary exact write has been acknowledged. Remaining trigger work belongs
+    /// to the saved story sweep and is resumed by its caller after this presentation is released.
+    pub(super) fn finish_story_point_scene(&mut self, run: SceneRunId, _now: Instant) {
+        let Some(outcome) = self.scenes.ordinary_finishing.remove(&run) else { return; };
+        let Some(record) = self.scenes.runs.remove(&run) else { return; };
+        let mut failed = Vec::new();
+        for entity in std::iter::once(record.owner).chain(record.watchers) {
+            if self.players.get(&entity).is_some_and(|player| player.scene == Some(run)) {
+                self.release(entity, run, outcome, &mut failed);
+            }
+        }
+        self.drop_failed(failed);
     }
 
     /// What the scene's script wrote, applied to the owner's story once (see the module docs). Returns a word for the log.
@@ -924,12 +1023,14 @@ impl World {
 
     /// Housekeeping, once per tick: end the runs that have gone quiet or lasted too long.
     pub fn advance_scenes(&mut self, now: Instant) {
+        self.advance_story_saves(now);
         self.advance_continuations(now);
         let late: Vec<SceneRunId> = self
             .scenes
             .runs
             .iter()
             .filter(|(id, r)| !self.scenes.continuations.contains_key(id)
+                && !self.scenes.ordinary_finishing.contains_key(id)
                 && (now.saturating_duration_since(r.last_activity) >= SCENE_IDLE_TIMEOUT || now.saturating_duration_since(r.started) >= SCENE_MAX_TIME))
             .map(|(id, _)| *id)
             .collect();
@@ -963,7 +1064,7 @@ impl World {
 
     /// The store is shared by every player. Continuing after an uncertain write would publish
     /// rewards and story updates which its poisoned writer cannot persist.
-    fn stop_for_scene_storage_recovery(&mut self) {
+    pub(super) fn stop_for_scene_storage_recovery(&mut self) {
         self.scenes.storage_failed = true;
         self.logs.warn("scene storage requires recovery; disconnecting all players and refusing admission".into());
         let mut failed = Vec::new();
@@ -980,6 +1081,10 @@ impl World {
     /// A pending account remains reserved until its acknowledgment; watchers can leave independently.
     pub(super) fn scene_player_gone(&mut self, entity: EntityId, held: Option<SceneRunId>) {
         let Some(run) = held else { return };
+        if self.scenes.ordinary_finishing.contains_key(&run) {
+            if let Some(record) = self.scenes.runs.get_mut(&run) { record.watchers.retain(|watcher| *watcher != entity); }
+            return;
+        }
         if self.scenes.continuations.contains_key(&run) { self.continuation_player_gone(entity, run); return; }
         if let Some(pending) = self.scenes.pending.get_mut(&run) {
             pending.record.watchers.retain(|w| *w != entity);
@@ -997,7 +1102,7 @@ impl World {
     pub(super) fn scene_check_parties(&mut self) {
         let mut dropped: Vec<(SceneRunId, EntityId)> = Vec::new();
         for (id, r) in self.scenes.runs.iter().chain(self.scenes.pending.iter().map(|(id, pending)| (id, &pending.record))) {
-            if self.scenes.continuations.contains_key(id) { continue; }
+            if self.scenes.continuations.contains_key(id) || self.scenes.ordinary_finishing.contains_key(id) { continue; }
             let Some(owner) = self.players.get(&r.owner) else { continue };
             let party = self.parties.party_of(owner.account);
             for &w in &r.watchers {
@@ -1030,7 +1135,7 @@ impl World {
         let Some(progress) = host.preview_progress(scene) else { return Err(SceneRefusal::UnknownScene) };
         let (from, facing, account) = {
             let Some(p) = self.players.get(&entity) else { return Err(SceneRefusal::Busy) };
-            if p.battle.is_some() || p.transit.is_some() || p.scene.is_some() {
+            if p.battle.is_some() || p.transit.is_some() || p.scene.is_some() || p.story_pending.is_some() {
                 return Err(SceneRefusal::Busy);
             }
             (p.snapshot.pos, p.snapshot.facing, p.account)
@@ -1076,7 +1181,8 @@ impl World {
     pub(super) fn enter_at_story(&mut self, entity: EntityId, now: Instant) {
         let Some(host) = self.scenes.host.clone() else { return };
         let Some(player) = self.players.get(&entity) else { return };
-        if player.preview.is_some() || player.transit.is_some() || player.battle.is_some() || player.scene.is_some() { return; }
+        if player.preview.is_some() || player.transit.is_some() || player.battle.is_some() || player.scene.is_some()
+            || (player.story_pending.is_some() && !self.ordinary_story_resuming(entity)) { return; }
         let Some(exit) = host.entry(&player.progression) else { return };
         if exit.target.eq_ignore_ascii_case(&player.area) { return; }
         let (account, from, facing) = (player.account, player.snapshot.pos, player.snapshot.facing);
@@ -1091,14 +1197,15 @@ impl World {
     pub(super) fn automatic_scene_entered(&mut self, entity: EntityId, now: Instant) {
         let Some(host) = self.scenes.host.clone() else { return };
         let Some(player) = self.players.get(&entity) else { return };
-        if player.preview.is_some() || player.transit.is_some() || player.battle.is_some() || player.scene.is_some() { return; }
+        if player.preview.is_some() || player.transit.is_some() || player.battle.is_some() || player.scene.is_some()
+            || (player.story_pending.is_some() && !self.ordinary_story_resuming(entity)) { return; }
         if self.account_in_battle(player.account) { return; }
         let area = player.area.clone();
         // Arrival scenes are private to this player, even when its shared field follows the
         // party leader's phase. Judge and replay only the player's own story, never the leader's.
         let progress = player.progression.clone();
         let Some(info) = self.scenes.list.iter().find(|info| info.field.eq_ignore_ascii_case(&area)
-            && host.automatic(&info.id) && !host.requires_landing(&info.id) && host.offered(&info.id, &progress)).cloned() else { return };
+            && host.automatic(&info.id) && !host.requires_landing_for(&info.id, &progress) && host.offered(&info.id, &progress)).cloned() else { return };
         let run = SceneRunId(self.scenes.next_run.max(1));
         self.scenes.next_run = run.0.saturating_add(1);
         let seed = u32::try_from(run.0.wrapping_mul(0x9E37_79B9) & 0xFFFF_FFFF).unwrap_or(1);

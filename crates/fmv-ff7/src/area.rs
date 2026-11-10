@@ -749,6 +749,10 @@ impl GameAdapter for Ff7Adapter {
     fn merge_progression(&self, stored: &[u8], advanced: &[u8]) -> Vec<u8> {
         story::merge_progression(stored, advanced)
     }
+
+    fn compare_exchange_progression(&self, stored: &[u8], expected: &[u8], advanced: &[u8]) -> Option<Vec<u8>> {
+        story::compare_exchange_progression(stored, expected, advanced)
+    }
 }
 
 fn finite_xy(p: Pos) -> bool {
@@ -889,6 +893,12 @@ impl Ff7FieldArea {
     /// The decoded field file (all sections, raw).
     pub fn field_file(&self) -> &FieldFile {
         &self.field
+    }
+
+    /// The exact authored root admitted by an existing version-3 story point. Scene hosts
+    /// use this identity to select a full interpreter; it is not a progression result.
+    pub fn story_point_source(&self, progress: &[u8], point: u32) -> Option<crate::story::StoryPointSource> {
+        self.story.point_source(progress, point)
     }
 
     /// The parsed walkmesh (triangles and edge-access data).
@@ -1155,9 +1165,21 @@ impl AreaRuntime for Ff7FieldArea {
         }
     }
 
+    fn story_requires_transaction(&self, progress: &[u8]) -> bool {
+        story::StoryState::decode(progress).is_some_and(|state| state.supports_extended())
+    }
+
     /// The battle a story point starts before its step is paid (a scripted fight: the guard scorpion).
     fn story_battle(&self, point: u32) -> Option<u16> {
         self.story.battle_of(point)
+    }
+
+    fn story_battle_for(&self, progress: &[u8], point: u32) -> Option<u16> {
+        self.story.battle_for(progress, point)
+    }
+
+    fn story_battle_policy(&self, progress: &[u8], point: u32) -> Option<fmv_adapter_api::StoryBattlePolicy> {
+        self.story.battle_policy(progress, point)
     }
 
     /// The first reactor's countdown matters while the story counter is where the step that started it left it

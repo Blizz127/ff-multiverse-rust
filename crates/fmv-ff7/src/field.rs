@@ -851,6 +851,20 @@ impl Palette {
         self.colors.get(at).copied()
     }
 
+    /// Replace one raw color, returning whether it changed, or `None` when the page/index is
+    /// absent. Palette animation changes colors only; [`Palette::rgba`]'s transparency rule stays intact.
+    pub fn set_raw(&mut self, page: usize, index: usize, raw: u16) -> Option<bool> {
+        let per_page = usize::from(self.colors_per_page);
+        if index >= per_page {
+            return None;
+        }
+        let at = page.checked_mul(per_page)?.checked_add(index)?;
+        let color = self.colors.get_mut(at)?;
+        let changed = *color != raw;
+        *color = raw;
+        Some(changed)
+    }
+
     /// RGBA8 colour `index` of `page`. **Index 0 is always transparent** (alpha 0, RGB as
     /// stored), every other index is opaque. See `palette_alpha` for the evidence.
     pub fn rgba(&self, page: usize, index: usize) -> Option<[u8; 4]> {
@@ -1057,6 +1071,9 @@ pub struct TileSprite {
     pub depth: u8,
     /// Draw-order / identifier field as stored.
     pub id: u16,
+    /// PC background depth baked by the original renderer (`IDBig`, a depth-buffer value times 10,000,000).
+    /// Some foreground/sentinel records use a special marker instead; see `background::DepthMapping`.
+    pub id_big: u32,
     /// Animation/visibility group and frame, as stored (layers 2-4).
     pub param: u8,
     pub state: u8,
@@ -1215,7 +1232,9 @@ fn read_tile(r: &mut Reader<'_>, layer: u8, index: u16) -> Result<TileSprite, Fi
     let texture_id2 = t.u8()?; // +34
     t.skip(1)?;
     let depth = t.u8()?; // +36
-    // +37 pad, +38 id_big u32, +42 src_x_big u32, +46 src_y_big u32, +50 blank u16: ignored
+    t.skip(1)?; // +37 pad
+    let id_big = t.u32()?; // +38
+    // +42 src_x_big u32, +46 src_y_big u32, +50 blank u16: ignored
     Ok(TileSprite {
         layer,
         index,
@@ -1232,6 +1251,7 @@ fn read_tile(r: &mut Reader<'_>, layer: u8, index: u16) -> Result<TileSprite, Fi
         type_trans,
         depth,
         id,
+        id_big,
         param,
         state,
         tile_size: if layer > 2 { 32 } else { 16 },

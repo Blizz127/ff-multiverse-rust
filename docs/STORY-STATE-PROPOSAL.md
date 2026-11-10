@@ -1,17 +1,20 @@
 # Proposed story state for the post-reactor route
 
 Status (2026-11-10): local implementation authorized by the owner's full FF7/Disc 1 goal.
-Version 3 known-bit banks and exact-base scene transactions are implemented. Ordinary
-field-point integration, route enablement and fresh-character initialization remain in progress.
+Version 3 known-bit banks and exact-base scene transactions are implemented. Fresh registration,
+ordinary exact story writes and atomic ordinary story-battle settlement are implemented locally
+and pass fresh registration, required reactor-route and restart checks. The later train route remains disabled while its required
+field-local state, effects, movie and timing work is completed.
 No live migration or player state has been changed.
 See `DISC1-IMPLEMENTATION.md` for current scope and `STATION-TRANSACTION-PROPOSAL.md`
 for the paired story/resource transaction.
 
-The current story blob carries the moment and a small set of monotonic bits. It cannot faithfully
+The earlier story blob carried the moment and a small set of monotonic bits. It could not faithfully
 represent the untracked flags sampled in `md8_2`, `mds7` and `mds7pb_1`, or Tifa's numeric
-affection. Missing bytes currently read as zero, which does not prove that an existing player's
+affection. Missing bytes read as zero, which did not prove that an existing player's
 unrecorded values were clear. The scene safety guard therefore refuses unknown persistent inputs
-and effects rather than advancing the real story.
+and effects rather than advancing the real story. Version 3 implements the known-bit
+representation below; legacy records retain their limited knowledge when decoded.
 
 ## Proposed representation
 
@@ -19,7 +22,7 @@ Use a versioned, bounded per-account story record that stores both each carried 
 bits are known. Track only fields whose initialization and update semantics have been established
 from the owner's data. Preserve unknown bits as unknown: do not infer a choice from the moment or
 silently turn an absent old value into an authoritative zero. A known bit may be set or cleared
-only according to the authored action; the current union-of-set-bits merge is insufficient for
+only according to the authored action; the earlier union-of-set-bits merge was insufficient for
 flags that can clear. Numeric affection needs a separately typed value, a verified new-game initial
 value and ordered arithmetic, not bitwise OR. The read-side guard remains until each script input
 and effect it consumes is known and carried.
@@ -33,6 +36,12 @@ health/menu effects require their own authoritative model; a moment-derived part
 ## Existing progress and durability
 
 New characters may start with verified authored defaults only after those defaults are measured.
+The new-account implementation now separates the exact original reset image from an explicit
+first-control port profile: reset defaults plus verified opening assignments, with unsupported
+engine-owned values left unknown. The available original startup source calls an opaque menu
+routine, so this profile is not claimed to reproduce every byte of native PC startup. Registration
+commits the profile and starting character resources atomically before issuing a token. It never
+initializes an existing account or converts a legacy save.
 For old blobs, decode their existing moment and carried bits without changing them; mark newly
 introduced values unknown unless a verified, lossless derivation or an owner-approved choice can
 establish them. An account whose next scene needs an unknown value must remain at its existing
@@ -45,6 +54,13 @@ purchase also changes gil in a separate record, so use the recoverable cross-rec
 proposed separately; its exact story after-image must include both flags as appropriate. Keep the
 single-writer and backup locks, recover outstanding intents before accepting play or backup, and
 fail closed on corruption, unsupported versions, and uncertain writes.
+
+Ordinary field-point story changes instead use a single-record exact compare-and-swap without a
+permanent receipt: a valid A-to-B-to-A-to-B sequence must remain repeatable. Character resources
+are unchanged by that operation. Ordinary story-battle outcomes use a recoverable roster batch
+for rewards, limits and the owner's story; accepted item-use costs stay in the existing ordered
+save queue and are not debited again by the outcome. Protocol 21 holds field control until the
+durable acknowledgment and the client's matching ordered acknowledgment have both arrived.
 
 Before any live use, verify on disposable stores: old and new decode/encode round trips; known and
 unknown bits; set and clear sequences; numeric affection increments/decrements and bounds; both

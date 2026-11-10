@@ -21,8 +21,9 @@ use crate::error::{PersistError, Result};
 /// that is rolled back is documented there.)
 pub const SCHEMA_VERSION: u32 = 1;
 /// Default format version of a new account index (`index.log`, and the small `index.json`
-/// marker beside it). Scene batches raise the log header to version 3 before their first
-/// write, while retaining the legacy marker at version 2. Version 1 was a single
+/// marker beside it). Explicit durable story writes raise the log header to version 4,
+/// while retaining the legacy marker at version 2. Version 3 introduced scene batches and
+/// remains readable without an implicit upgrade. Version 1 was a single
 /// `index.json` holding every name and token; it is migrated
 /// transparently on open. An older build that finds the marker refuses to open the directory
 /// with [`PersistError::FutureSchema`] instead of misreading it.
@@ -44,8 +45,9 @@ pub const MAX_BLOB_BYTES: usize = 256 * 1024;
 /// The original fields and a full inventory use under 18 KiB. Up to
 /// [`MAX_SCENE_RECEIPTS`](crate::MAX_SCENE_RECEIPTS) durable receipt hashes fit alongside them;
 /// those receipts are never evicted. Ordinary receipts require schema 2; batch receipts,
-/// checkpoints and reservations require schema 3. The first batch also upgrades the index
-/// header so older servers refuse the entire store. Records without metadata retain schema 1.
+/// checkpoints and reservations require schema 3. A new batch also upgrades the separate
+/// index header to version 4 so older servers refuse the entire store. Records without
+/// metadata retain schema 1.
 /// A checkpoint's replay has up to 256 KiB of bytes; pretty JSON puts each on an indented
 /// line. This cap includes that expansion, a complete inventory and all 2,048 receipts.
 /// A conservative character bound is `12 * 256 KiB + 16 * (2 * 8 KiB)` for replay,
@@ -128,6 +130,10 @@ pub(crate) struct AccountRecord {
     /// The digest binds the complete initial file, including its account id and timestamp.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registration_progress: Option<RegistrationProgress>,
+    /// The optional story file written in the same registration commit. Together with
+    /// `registration_progress`, this declares the complete, byte-exact initial file set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_story: Option<RegistrationProgress>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -329,6 +335,22 @@ impl Progression {
     /// What `get_progression` returns when nothing was stored yet.
     pub fn empty(account_id: AccountId, game: GameId) -> Self {
         Self::new(account_id, game, Vec::new(), 0)
+    }
+}
+
+/// Game-authored story for a genuinely new registration. The store supplies the account
+/// id, record version and timestamp; this API never seeds an existing account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewProgression {
+    pub game: GameId,
+    pub blob: Vec<u8>,
+}
+
+impl NewProgression {
+    pub fn new(game: GameId, blob: Vec<u8>) -> Self { Self { game, blob } }
+
+    pub(crate) fn record(&self, account: AccountId, now: u64) -> Progression {
+        Progression::new(account, self.game, self.blob.clone(), now)
     }
 }
 

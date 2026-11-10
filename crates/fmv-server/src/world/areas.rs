@@ -427,12 +427,19 @@ impl World {
         self.settle(entity, true, failed);
         // (a player in a debug scene preview is told the made-up story its talks read from)
         self.scene_entered(entity, failed);
+        // A transfer handshake can finish while an acknowledged story update still holds
+        // gameplay. Its snapshot is required; ordinary entry scripts wait for that hold to end.
+        if self.players.get(&entity).is_some_and(|p| (p.story_pending.is_some() && !self.ordinary_story_resuming(entity))
+            || self.ordinary_battle_account_held(p.account)) { return; }
         // A durable replay or landing owns entry until its checkpoint is resolved. Its
         // messages follow the snapshot, and ordinary entry scripts cannot race its save.
         if self.continuation_entered(entity, now) { return; }
         // What the area's own scripts do by themselves from the first frame on moves the story of whoever stands
         // there (the points that fire on entry; a no-op in an area without any).
         self.enter_story(entity, now);
+        // Entering itself can queue an exact story save. Do not start another operation on
+        // the predecessor which that save is about to replace.
+        if self.players.get(&entity).is_some_and(|p| p.story_pending.is_some() && !self.ordinary_story_resuming(entity)) { return; }
         self.automatic_scene_entered(entity, now);
     }
 
@@ -444,6 +451,9 @@ impl World {
     /// A member of a party that crosses the line its leader left the area by takes the exit the leader took, once,
     /// whatever the story now says (module docs, "A member follows its leader's way out"; the `follow` module).
     pub(super) fn open_exit(&mut self, entity: EntityId, crossed: Vec<Exit>) -> Option<Exit> {
+        let player = self.players.get(&entity)?;
+        if (player.story_pending.is_some() && !self.ordinary_story_resuming(entity)) || player.scene.is_some() || player.battle.is_some()
+            || player.transit.is_some() || self.ordinary_battle_account_held(player.account) { return None; }
         if crossed.is_empty() {
             return None;
         }
@@ -1433,6 +1443,32 @@ mod tests {
         assert_eq!(walk_to(&mut w, &a, FAR, 0.0, &mut now), MoveOutcome::Frozen);
         assert_eq!(w.area_of(a.entity), Some((HALL.to_string(), false)));
         assert_eq!(w.loaded_areas(), [HALL.to_string()]);
+    }
+
+    #[test]
+    fn pending_story_refuses_new_exits_but_does_not_break_an_existing_area_handshake() {
+        let now = Instant::now();
+        let mut w = rooms_world(RoomsAdapter::new());
+        let mut a = seat(&mut w, "pending", now);
+        let exits = w.areas.get(HALL).unwrap().exits.clone();
+        assert!(!exits.is_empty());
+        w.players.get_mut(&a.entity).unwrap().story_pending = Some(7);
+        assert!(w.open_exit(a.entity, exits.clone()).is_none());
+        assert!(w.players.get(&a.entity).unwrap().transit.is_none());
+        // The acknowledged operation may already have sent a destination while its input
+        // fence is still present. JoinArea must finish that handshake and publish its snapshot.
+        a.drain();
+        let (from, facing) = {
+            let p = w.players.get(&a.entity).unwrap();
+            (p.snapshot.pos, p.snapshot.facing)
+        };
+        assert!(w.start_travel(a.entity, &exits[0], from, facing, now));
+        let offer = area_change(&a.drain());
+        assert_eq!(answer_join(&mut w, &a, &offer, now), TravelReply::Done);
+        let p = w.players.get(&a.entity).unwrap();
+        assert_eq!(p.story_pending, Some(7));
+        assert!(p.transit.is_none());
+        assert!(a.drain().iter().any(|message| matches!(message, ServerMsg::AreaSnapshot { .. })));
     }
 
     #[test]

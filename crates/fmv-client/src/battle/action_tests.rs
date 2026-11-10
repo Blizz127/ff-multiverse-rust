@@ -182,13 +182,15 @@ impl Sim {
             .enumerate()
             .map(|(i, &account)| BattleMember::player(EntityId(100 + i as u64), account, format!("P{i}"), i as u8, 6, limits.get(i).copied().unwrap_or(0)))
             .collect();
-        let setup = BattleSetup { initial_party: None, escape_policy: fmv_protocol::EscapePolicy::Formation, formation_id: formation, seed: 7, party, preemptive, back_attack: false, battle_speed: 0, ticks_per_second: 1000 };
+        let setup = BattleSetup { victory_fanfare: true, game_over_on_defeat: false, initial_party: None, escape_policy: fmv_protocol::EscapePolicy::Formation, formation_id: formation, seed: 7, party, preemptive, back_attack: false, battle_speed: 0, ticks_per_second: 1000 };
         let state = rules.build(&setup).expect("a battle");
         Sim { id: BattleId(1), setup, state }
     }
 
     fn start(&self) -> ServerMsg {
         ServerMsg::EncounterStart {
+            victory_fanfare: true,
+            game_over_on_defeat: false,
             initial_party: None,
             escape_policy: fmv_protocol::EscapePolicy::Formation,
             battle_id: self.id,
@@ -1640,7 +1642,7 @@ impl Sim {
                 .enumerate()
                 .map(|(i, &account)| BattleMember::player(EntityId(200 + i as u64), account, format!("P{i}"), 1 + i as u8, 6, 0)),
         );
-        let setup = BattleSetup { initial_party: None, escape_policy: fmv_protocol::EscapePolicy::Formation, formation_id: formation, seed: 7, party, preemptive: true, back_attack: false, battle_speed: 0, ticks_per_second: 1000 };
+        let setup = BattleSetup { victory_fanfare: true, game_over_on_defeat: false, initial_party: None, escape_policy: fmv_protocol::EscapePolicy::Formation, formation_id: formation, seed: 7, party, preemptive: true, back_attack: false, battle_speed: 0, ticks_per_second: 1000 };
         let state = rules.build(&setup).expect("a battle");
         Sim { id: BattleId(1), setup, state }
     }

@@ -36,13 +36,15 @@ const ENEMY_HP: u32 = 100_000;
 impl Server {
     /// A preemptive battle (every gauge is full at the first step) against enemies of `enemy_hp`.
     fn new(party: Vec<BattleMember>, enemy_hp: u32) -> Self {
-        let setup = BattleSetup { initial_party: None, escape_policy: fmv_protocol::EscapePolicy::Formation, formation_id: 1, seed: 99, party, preemptive: true, back_attack: false, battle_speed: 0, ticks_per_second: 1000 };
+        let setup = BattleSetup { victory_fanfare: true, game_over_on_defeat: false, initial_party: None, escape_policy: fmv_protocol::EscapePolicy::Formation, formation_id: 1, seed: 99, party, preemptive: true, back_attack: false, battle_speed: 0, ticks_per_second: 1000 };
         let state = SyntheticRules { enemy_hp, ..SyntheticRules::default() }.build(&setup).unwrap();
         Server { setup, state }
     }
 
     fn start(&self) -> ServerMsg {
         ServerMsg::EncounterStart {
+            victory_fanfare: true,
+            game_over_on_defeat: false,
             initial_party: None,
             escape_policy: fmv_protocol::EscapePolicy::Formation,
             battle_id: BattleId(1),

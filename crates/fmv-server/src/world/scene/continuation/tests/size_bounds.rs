@@ -33,7 +33,8 @@ fn plan(accounts: &[AccountId]) -> SceneBattlePlan {
             party: accounts.iter().enumerate().map(|(slot, account)|
                 BattleMember::player(EntityId(0), *account, "W".repeat(64), slot as u8, 99, 255)).collect(),
             initial_party: Some(vec![initial; accounts.len()]), escape_policy: EscapePolicy::Forbidden,
-            preemptive: false, back_attack: false, battle_speed: 255, ticks_per_second: 1000,
+            preemptive: false, back_attack: false, battle_speed: 255, ticks_per_second: 1000, victory_fanfare: true,
+            game_over_on_defeat: true,
         },
         fingerprint: Fingerprint([255; 32]),
         inventories: accounts.iter().map(|account| (*account, (0..MAX_INVENTORY_STACKS)

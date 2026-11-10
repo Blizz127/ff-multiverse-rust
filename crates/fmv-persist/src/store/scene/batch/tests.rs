@@ -1,4 +1,7 @@
 mod size_bounds;
+mod battle_outcome;
+mod format_compatibility;
+mod terminal_landing;
 
 use super::*;
 use crate::{CharacterProgress, Progression};

@@ -139,14 +139,20 @@ use crate::field::{Background, Camera, FieldError, FieldFile, Palette, TileSprit
 
 pub mod depth;
 pub mod state;
+pub mod palette;
 mod entry;
+#[cfg(test)]
+mod palette_real_tests;
+mod projection_depth;
 
 pub use depth::{
-    decode_background_tiles_with_depth, decode_background_tiles_with_depth_options, depth_of_id, depth_of_point,
+    decode_background_tiles_with_depth, decode_background_tiles_with_depth_options, decode_background_tiles_with_depth_palette, depth_of_id, depth_of_point,
     tile_depth, tile_hides_point, DepthTile, TILE_DEPTH_PER_ID,
 };
 pub use state::{BackgroundOp, BackgroundState};
+pub use palette::{PaletteOp, PaletteState};
 pub use entry::entry_background_ops;
+pub use projection_depth::{calibrate as calibrate_depth_mapping, DepthMapping};
 
 /// Logical width of the field screen in field-screen units.
 pub const SCREEN_WIDTH: i32 = 320;
@@ -496,9 +502,15 @@ pub fn decode_background(field: &FieldFile) -> Result<BackgroundImage, FieldErro
 
 /// Decode the field's background with explicit options.
 pub fn decode_background_with(field: &FieldFile, options: &BackgroundOptions) -> Result<BackgroundImage, FieldError> {
-    let background = field.background()?;
     let palette = field.palette()?;
-    compose(&background, &palette, options, camera_range_view(field))
+    decode_background_with_palette(field, &palette, options)
+}
+
+/// Decode with the field's current script-controlled palette. Texture indices, transparency,
+/// blending, tile selection and camera bounds follow the ordinary decoder.
+pub fn decode_background_with_palette(field: &FieldFile, palette: &Palette, options: &BackgroundOptions) -> Result<BackgroundImage, FieldError> {
+    let background = field.background()?;
+    compose(&background, palette, options, camera_range_view(field))
 }
 
 /// The camera range of the field's triggers section as a [`ScreenRect`], if that section parses.

@@ -7,8 +7,9 @@
 //! stops opening. An uncertain write poisons this Store until it is dropped and reopened.
 //!
 //! Ordinary receipts live in a private schema-2 envelope. Co-op checkpoints, reservations
-//! and batch receipts require schema 3, plus a recognized index format fence written before
-//! the first batch intent. Ordinary character saves retain receipts; active continuations
+//! and batch receipts require schema 3. Explicit durable story operations also establish a
+//! recognized index format fence before their first intent or successful acknowledgment.
+//! Ordinary character saves retain receipts; active continuations
 //! refuse ordinary writes and account rekeying. Schema-1 intents remain recoverable alongside
 //! the bounded schema-2 batch intents. Opening a store never opts it into these new writes.
 
@@ -25,6 +26,8 @@ use crate::fsio;
 use crate::model::{MAX_BLOB_BYTES, MAX_CHARACTER_RECORD_BYTES, MAX_RECORD_BYTES, SCHEMA_VERSION};
 
 mod batch;
+#[cfg(test)]
+mod character_write_tests;
 pub use batch::{SceneBatchCommitted, SceneCheckpoint, SceneOperation, SceneOperationKind, ScenePhase, SceneReservation, SceneState,
     MAX_SCENE_BATCH_ACCOUNTS, MAX_SCENE_CHECKPOINT_BYTES, MAX_SCENE_REPLAY_BYTES};
 
@@ -220,7 +223,17 @@ impl Store {
 
     /// Store ordinary character progress, retaining all existing scene receipts. The writer
     /// and progress write locks must already be held. A corrupt prior envelope is not replaced.
+    /// Any uncertain replacement fences the Store before a caller can retry a resource delta.
     pub(super) fn write_character_record(&self, path: &Path, progress: CharacterProgress) -> Result<CharacterProgress> {
+        self.write_character_record_with_writer(path, progress, fsio::atomic_write)
+    }
+
+    fn write_character_record_with_writer(
+        &self,
+        path: &Path,
+        progress: CharacterProgress,
+        write: impl FnOnce(&Path, &[u8]) -> Result<()>,
+    ) -> Result<CharacterProgress> {
         let mut stored = match CharacterRecord::read(path)? {
             Some(record) if record.has_continuation() => return Err(PersistError::TransactionConflict("character has an active scene continuation".into())),
             Some(mut record) => { record.progress = progress; record },
@@ -228,7 +241,13 @@ impl Store {
         };
         stored.stamp();
         stored.validate()?;
-        fsio::write_json(path, &stored, MAX_CHARACTER_RECORD_BYTES)?;
+        // Refusals of shape or size happen before the uncertain-write fence. The exact
+        // bytes validated here are the bytes replaced; a post-rename sync failure must not
+        // let the caller re-read the debited record and apply the same delta again.
+        let bytes = encoded(path, &stored, MAX_CHARACTER_RECORD_BYTES)?;
+        self.transaction_poisoned.store(true, Ordering::Release);
+        write(path, &bytes)?;
+        self.transaction_poisoned.store(false, Ordering::Release);
         Ok(stored.progress)
     }
 
@@ -236,9 +255,12 @@ impl Store {
     /// `selected_result` is a stable, adapter-defined encoding of the selected story outcome
     /// and resource delta. A different result for the same scene and prior story is a conflict.
     /// This does not infer success from the current story or gil balance.
+    /// A matching receipt establishes the store compatibility fence before authorizing an
+    /// acknowledgment. A missing or conflicting receipt changes neither records nor format.
     pub fn scene_progress_applied(&self, scene_key: &str, expected_story: &Progression, selected_result: &[u8]) -> Result<bool> {
         validate_key(scene_key, selected_result)?;
-        let _read = self.progress_read()?;
+        let writer = self.writer()?;
+        let _progress = self.progress_write();
         let (account, game) = (expected_story.account_id, expected_story.game);
         if !self.index().contains_account(account.0) { return Err(PersistError::UnknownAccount(account)) }
         let receipt = receipt_key(scene_key, expected_story)?;
@@ -249,7 +271,10 @@ impl Store {
         }
         match current.character.as_ref().and_then(|c| c.scene_receipts.get(&receipt)) {
             None => Ok(false),
-            Some(recorded) if recorded == &result => Ok(true),
+            Some(recorded) if recorded == &result => {
+                self.ensure_scene_batch_format(&writer)?;
+                Ok(true)
+            }
             Some(_) => Err(PersistError::TransactionConflict("receipt already records a different result".into())),
         }
     }
@@ -304,7 +329,9 @@ impl Store {
             return Err(PersistError::TransactionConflict("account has an active scene continuation".into()));
         }
         if let Some(prior) = before.character.as_ref().and_then(|c| c.scene_receipts.get(&receipt)) {
-            return if prior == &result { Ok(SceneCommit::AlreadyApplied) } else { Err(PersistError::TransactionConflict("receipt already records a different result".into())) };
+            if prior != &result { return Err(PersistError::TransactionConflict("receipt already records a different result".into())); }
+            self.ensure_scene_batch_format(&_writer)?;
+            return Ok(SceneCommit::AlreadyApplied);
         }
         if before.pair(account, game) != *expected {
             return Err(PersistError::TransactionConflict("story or character precondition changed".into()));
@@ -325,6 +352,7 @@ impl Store {
         let path = self.root.join(INTENT_FILE);
         let bytes = encoded(&path, &file, MAX_INTENT_BYTES)?;
         hook(0)?;
+        self.ensure_scene_batch_format(&_writer)?;
         self.transaction_poisoned.store(true, Ordering::Release);
         fsio::atomic_write(&path, &bytes)?;
         hook(1)?;
@@ -429,6 +457,54 @@ mod tests {
     fn expected_after(mut after: ProgressPair) -> ProgressPair {
         after.character.as_mut().unwrap().schema_version = CHARACTER_RECEIPT_VERSION;
         after
+    }
+
+    #[test]
+    fn paired_scene_validation_precedes_the_fence_and_first_commit_protects_extended_story() {
+        let (_dir, store, before, after) = rig();
+        assert_eq!(store.index().format_version(), crate::model::INDEX_LOG_VERSION);
+        let mut invalid = after.clone();
+        invalid.story.account_id = AccountId(999);
+        assert!(store.commit_scene_progress("first durable story", &before, &invalid).is_err());
+        assert_eq!(store.index().format_version(), crate::model::INDEX_LOG_VERSION);
+        assert_eq!(store.get_progress_pair(before.story.account_id, before.story.game).unwrap(), before);
+        assert_eq!(store.commit_scene_progress("first durable story", &before, &after).unwrap(), SceneCommit::Applied);
+        assert_eq!(store.index().format_version(), crate::index::DURABLE_STORY_INDEX_VERSION);
+        assert_eq!(store.get_progress_pair(before.story.account_id, before.story.game).unwrap(), expected_after(after));
+    }
+
+    #[test]
+    fn a_matching_legacy_scene_receipt_fastpath_establishes_the_fence_without_rewriting_progress() {
+        let (dir, store, before, after) = rig();
+        let account = before.story.account_id;
+        let game = before.story.game;
+        let key = "legacy completed scene";
+        let selected = b"stable legacy outcome";
+        let character_path = store.character_path(account.0, game).unwrap();
+        let story_path = store.progression_path(account.0, game).unwrap();
+        // Construct the exact receipt-only schema supported before store-wide fencing.
+        // The input files are already committed; only a duplicate request arrives now.
+        let mut character = CharacterRecord::read(&character_path).unwrap().unwrap();
+        character.progress = after.character.clone().unwrap();
+        character.scene_receipts.insert(receipt_key(key, &before.story).unwrap(), result_key(selected).unwrap());
+        character.stamp();
+        character.validate().unwrap();
+        fsio::write_json(&character_path, &character, MAX_CHARACTER_RECORD_BYTES).unwrap();
+        fsio::write_json(&story_path, &after.story, MAX_RECORD_BYTES).unwrap();
+        let bytes = (std::fs::read(&character_path).unwrap(), std::fs::read(&story_path).unwrap());
+        assert_eq!(store.index().format_version(), crate::model::INDEX_LOG_VERSION);
+        assert!(!store.scene_progress_applied("no matching receipt", &before.story, selected).unwrap());
+        assert!(matches!(store.scene_progress_applied(key, &before.story, b"another result"), Err(PersistError::TransactionConflict(_))));
+        assert_eq!(store.index().format_version(), crate::model::INDEX_LOG_VERSION, "false/conflicting lookup cannot opt into a format");
+        assert!(store.scene_progress_applied(key, &before.story, selected).unwrap(), "the saver's public receipt fastpath");
+        assert_eq!(store.index().format_version(), crate::index::DURABLE_STORY_INDEX_VERSION);
+        assert_eq!(store.commit_scene_progress_with_result(key, selected, &before, &after).unwrap(), SceneCommit::AlreadyApplied);
+        assert_eq!(store.index().format_version(), crate::index::DURABLE_STORY_INDEX_VERSION);
+        assert_eq!((std::fs::read(&character_path).unwrap(), std::fs::read(&story_path).unwrap()), bytes);
+        drop(store);
+        let reopened = Store::open(dir.path().join("state")).unwrap();
+        assert_eq!(reopened.index().format_version(), crate::index::DURABLE_STORY_INDEX_VERSION);
+        assert_eq!(reopened.get_progress_pair(account, game).unwrap(), expected_after(after));
     }
 
     fn interrupted(stage: u8) -> PersistError {

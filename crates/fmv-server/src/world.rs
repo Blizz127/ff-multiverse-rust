@@ -251,6 +251,9 @@ struct Player {
     fence: Option<press::Fence>,
     /// The story scene this player is held in (as owner or watcher), if any (see the `scene` module).
     scene: Option<fmv_protocol::SceneRunId>,
+    /// Correlated ordinary story/battle save hold. Controls return only after storage and the
+    /// client's ordered acknowledgement have both reached the server.
+    story_pending: Option<u64>,
     /// Set while the player is in a debug scene preview: its `progression` is made up and nothing of it is ever saved.
     preview: Option<scene::Preview>,
     /// The account whose countdown this player was last told is running (see the `countdown` module): `None` when it was
@@ -352,6 +355,8 @@ pub struct World {
     logs: DeferredLogs,
     /// Story scenes: the game's scenes, the runs in progress and the debug preview switch (see `scene`).
     scenes: scene::SceneWorld,
+    /// Ordered exact story writes and their deferred field work.
+    story_saves: story::StorySaves,
     /// The countdowns that story steps started, one per account (see `countdown`).
     countdowns: BTreeMap<AccountId, countdown::Countdown>,
     /// The `now` of the last [`World::advance_countdowns`]: what a countdown's time left is measured against.
@@ -393,6 +398,7 @@ impl World {
             saver: None,
             logs,
             scenes: scene::SceneWorld::default(),
+            story_saves: story::StorySaves::default(),
             countdowns: BTreeMap::new(),
             clock: Instant::now(),
         })
@@ -487,12 +493,14 @@ impl World {
             None if new.scene_group.is_empty() => {}
             _ => return Err(JoinError::ProgressChanged),
         }
-        // DEBUG (`SceneSettings::debug_new_story`, off on every real server): an account with no story yet starts with the
-        // one the server was told to give new accounts. Queue that baseline before admission so every later scene
+        // DEBUG (`SceneSettings::debug_new_story`, off on every real server): direct world callers representing new
+        // registrations can still supply an empty seed. Network registration already commits its debug baseline
+        // atomically; token logins carry a coherent scene_state and never receive initialization here.
+        // Queue the direct caller's baseline before admission so every later scene
         // transaction checks the same predecessor after this FIFO write. This is queued, not acknowledged durable at
         // join; if it cannot be saved, the later exact scene precondition fails without publishing its result.
         let mut new = new;
-        if !recovering && new.progression.is_empty() {
+        if !recovering && new.scene_state.is_none() && new.progression.is_empty() {
             if let Some(story) = self.scenes.debug_new_story.clone() {
                 if self.saver.as_ref().is_some_and(|saver| !saver.save_story(new.account, story.clone())) {
                     return Err(JoinError::StorageUnavailable);
@@ -551,6 +559,7 @@ impl World {
                 arming: LinkArming::default(),
                 fence: None,
                 scene: None,
+                story_pending: None,
                 preview: None,
                 countdown_told: None,
                 ways: Vec::new(),
@@ -629,7 +638,7 @@ impl World {
                 return MoveOutcome::Gone;
             };
             // A player in a battle, or between two areas, is frozen: its moves are ignored.
-            if p.battle.is_some() || p.transit.is_some() || p.scene.is_some() {
+            if p.battle.is_some() || p.transit.is_some() || p.scene.is_some() || p.story_pending.is_some() {
                 return MoveOutcome::Frozen;
             }
             let Some(area) = self.areas.get(&p.area) else {
@@ -693,6 +702,12 @@ impl World {
                 }
                 // Reaching a story point is what advances the story (a no-op in an area without any).
                 self.check_story(entity, from, accepted, now);
+                if let Some(player) = self.players.get(&entity).filter(|player| player.story_pending.is_some() || player.scene.is_some()) {
+                    let followup = story::StoryFollowup::Move { area: player.area.clone(), from, to: accepted, distance: dist };
+                    self.defer_story_followup(entity, followup);
+                    return MoveOutcome::Applied;
+                }
+                if !self.players.contains_key(&entity) { return MoveOutcome::Gone; }
                 // Walking up to a line that no key fires may put the player somewhere else in the area.
                 if let Some(corrected) = self.walk_links(entity, from, accepted, now) {
                     return MoveOutcome::Relocated { corrected };
@@ -713,6 +728,25 @@ impl World {
                 }
                 MoveOutcome::Rejected { corrected: place, reason: Rejection::Blocked }
             }
+        }
+    }
+
+    /// Continue the exact accepted move after its story sweep has durably finished. The original
+    /// chord and distance are retained so a delayed save neither loses a link nor rolls twice.
+    pub(super) fn resume_after_story_move(&mut self, entity: EntityId, area: AreaKey, from: Pos, to: Pos, distance: f64, now: Instant) {
+        if !self.players.get(&entity).is_some_and(|player| player.area == area && player.transit.is_none()
+            && player.scene.is_none() && player.battle.is_none() && self.ordinary_story_resuming(entity)) { return; }
+        if self.walk_links(entity, from, to, now).is_some() {
+            if let Some(snapshot) = self.players.get(&entity).map(|player| player.snapshot.clone()) {
+                let mut failed = Vec::new();
+                self.send_to(entity, fmv_protocol::ServerMsg::EntityUpdate { tick: self.tick, entities: vec![snapshot] }, &mut failed);
+                self.drop_failed(failed);
+            }
+            return;
+        }
+        if self.players.get(&entity).is_some_and(|player| player.scene.is_none() && player.battle.is_none()
+            && player.transit.is_none() && self.ordinary_story_resuming(entity)) {
+            self.roll_encounter(entity, distance, now);
         }
     }
 

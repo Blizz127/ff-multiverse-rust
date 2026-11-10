@@ -80,11 +80,11 @@ struct Fought {
 /// whenever our gauge is full (one command at a time), and check the end. Returns at `BattleEnd`.
 async fn fight(j: &mut Joined, rules: &SyntheticRules) -> Fought {
     let start = j.client.until("EncounterStart", |m| matches!(m, ServerMsg::EncounterStart { .. }).then(|| m.clone())).await;
-    let ServerMsg::EncounterStart { battle_id, formation_id, seed, party, initial_party, escape_policy, preemptive, back_attack, battle_speed, ticks_per_second, .. } = start
+    let ServerMsg::EncounterStart { battle_id, formation_id, seed, party, initial_party, escape_policy, victory_fanfare, game_over_on_defeat, preemptive, back_attack, battle_speed, ticks_per_second, .. } = start
     else {
         unreachable!()
     };
-    let setup = BattleSetup { formation_id, seed, party: party.clone(), initial_party, escape_policy, preemptive, back_attack, battle_speed, ticks_per_second };
+    let setup = BattleSetup { formation_id, seed, party: party.clone(), initial_party, escape_policy, victory_fanfare, game_over_on_defeat, preemptive, back_attack, battle_speed, ticks_per_second };
     let mut replay = BattleReplay::start(rules, &setup).expect("the client builds the battle from its own data");
     let mine = ActorId(party.iter().position(|m| m.entity() == Some(j.entity)).expect("we are in the party") as u8);
     let mut pending = false;
@@ -333,11 +333,11 @@ struct Ran {
 /// test: the replay says when each command is legal.
 async fn limit_then_run(j: &mut Joined, rules: &SyntheticRules) -> Ran {
     let start = j.client.until("EncounterStart", |m| matches!(m, ServerMsg::EncounterStart { .. }).then(|| m.clone())).await;
-    let ServerMsg::EncounterStart { battle_id, formation_id, seed, party, initial_party, escape_policy, preemptive, back_attack, battle_speed, ticks_per_second, .. } = start
+    let ServerMsg::EncounterStart { battle_id, formation_id, seed, party, initial_party, escape_policy, victory_fanfare, game_over_on_defeat, preemptive, back_attack, battle_speed, ticks_per_second, .. } = start
     else {
         unreachable!()
     };
-    let setup = BattleSetup { formation_id, seed, party: party.clone(), initial_party, escape_policy, preemptive, back_attack, battle_speed, ticks_per_second };
+    let setup = BattleSetup { formation_id, seed, party: party.clone(), initial_party, escape_policy, victory_fanfare, game_over_on_defeat, preemptive, back_attack, battle_speed, ticks_per_second };
     let mut replay = BattleReplay::start(rules, &setup).expect("the client builds the battle from its own data");
     let mine = ActorId(party.iter().position(|m| m.entity() == Some(j.entity)).expect("we are in the party") as u8);
     let (mut pending, mut limits_used, mut failed_escapes) = (false, 0, 0);
@@ -611,14 +611,15 @@ async fn a_member_who_left_mid_battle_is_still_paid_in_the_store() {
 /// the Guard Scorpion's step starts; v16: it cannot decode a character delete or its answer; v17: it never commands the
 /// canon companions, whose turns a v17 server leaves to the player; v18: it cannot decode a story scene's messages;
 /// v19: earlier peers lack the owner's authoritative gil snapshot for resource-dependent scene branches;
-/// v20: earlier peers lack durable scene replay, battle continuation and authoritative carried combat resources).
+/// v20: earlier peers lack durable scene replay, battle continuation and authoritative carried combat resources;
+/// v21: earlier peers lack ordered story-save acknowledgments and authored battle terminal/audio policy).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_client_of_the_previous_protocol_version_is_refused_at_the_handshake() {
-    assert_eq!(PROTOCOL_VERSION, 20);
+    assert_eq!(PROTOCOL_VERSION, 21);
     let server = TestServer::start(fast(None)).await;
-    for old_version in [19u16, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4] {
+    for old_version in [20u16, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4] {
         let mut old = Client::connect(server.addr).await;
-        // A v8 to v19 Hello asks for a character (and reads as a v20 Hello); the older ones carried a colour and a look.
+        // A v8 to v20 Hello asks for a character (and reads as a v21 Hello); the older ones carried a colour and a look.
         let hello = if old_version >= 8 {
             format!(
                 r#"{{"Hello":{{"protocol_version":{old_version},"client_build":"old","auth":{{"Register":{{"display_name":"Old{old_version}"}}}},"character":{{"tint":[1,2,3],"body":null,"slot":null}}}}}}"#

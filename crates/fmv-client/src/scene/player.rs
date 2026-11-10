@@ -166,7 +166,10 @@ pub struct CastDraw<'a> {
     /// The script entity it plays.
     pub entity: u8,
     pub look: &'a Look,
+    /// Logical walkmesh position, used by movement and the native following camera.
     pub pos: Pos,
+    /// Model position after its independent world-space OFST offset.
+    pub render_pos: Pos,
     pub facing: f32,
     /// Walking now (the avatar's walk clip), standing otherwise.
     pub moving: bool,
@@ -550,7 +553,8 @@ impl ScenePlayer {
             .filter_map(|a| {
                 let member = self.def.member(a.entity())?;
                 let [x, y, z] = a.pos()?;
-                Some(CastDraw { entity: a.entity(), look: &member.look, pos: Pos::new(x, y, z), facing: a.heading(), moving: a.moving(),
+                let [rx, ry, rz] = a.render_pos()?;
+                Some(CastDraw { entity: a.entity(), look: &member.look, pos: Pos::new(x, y, z), render_pos: Pos::new(rx, ry, rz), facing: a.heading(), moving: a.moving(),
                     frame: if a.moving() { a.walked_frames() } else { self.elapsed_frames }, clip: a.animation(), return_clip: a.full_once_return() })
             })
             .collect()

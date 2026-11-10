@@ -57,8 +57,8 @@ full one turns Attack into the character's limit break, and any character may tr
 **every player has one original character of their own (protocol v8)**: a saved identity, a
 per-game appearance binding (a generic placeholder body in FF7), a fighting style (the stat curve of a
 canon party member, separate from the canon story roles) and pointers to its progress, and
-**the story's own party fights beside the players (protocol v9)**: the canon Cloud and Barret of the first
-reactor mission are in every battle as companions that a PLAYER commands, as in FF7 (the party's leader; the server
+**the story's own party fights beside the players (protocol v9)**: Cloud starts alone and Barret joins at the reactor
+door. These canon companions are commanded by a PLAYER, as in FF7 (the party's leader; the server
 commands them only with `--companions-player-commanded=false`), and each player's character is ADDED
 after them, in its own body, replacing nobody, and **a spell, an item or a limit can hit a whole side (protocol
 v10)**: an ALL place for the target pointer, FF7's All materia rule and the 2/3 split, and **battles have status
@@ -74,7 +74,7 @@ as a labelled test area; it says nothing about FF7 support.
 | M2-b | Parties (invite, accept, leave, kick, promote), phase-key instance placement | done (single phase) |
 | M2-c/d | Shared battle, battle return, per-player rewards | done (battle subset; rewards paid into each account's own character progress and saved) |
 | M2-e | Player characters: identity, per-game binding, fighting style (a stat curve) separate from canon roles, pointers to progress (protocol v8) | done for the slice (FF7: generic placeholder bodies, fixed styles; `scripts/slice-smoke.sh`) |
-| M2-f | The story's canon party fights beside the players as companions that the party's leader commands (the server's `--companions-player-commanded`, on by default; the server commands them with it off); players are added after them (protocol v9, the commander v17) | done for the first reactor mission (FF7: Cloud and Barret; `scripts/battle-smoke.sh`, `scripts/slice-smoke.sh`) |
+| M2-f | The story's canon party fights beside the players as companions that the party's leader commands (the server's `--companions-player-commanded`, on by default; the server commands them with it off); players are added after them (protocol v9, the commander v17) | done for the first reactor mission (Cloud, then Cloud and Barret after the door join; `scripts/battle-smoke.sh`, `scripts/slice-smoke.sh`) |
 | M2-g | Whole-side targeting: spells, items and limits can hit one target or a whole side, the party side being the canon companions and the players (protocol v10) | done for spells, items and limits (FF7: the All materia rule, the 2/3 split; the enemies' own AI still picks one party member; `scripts/battle-smoke.sh --commands`) |
 | M2-h | Status effects: the statuses of the game's own spells, items and enemy attacks, their clocks, what they do to turns, damage and hit rate, cures, panels and body cues (protocol v12) | done for 13 statuses (the engine's `status` module lists what is left out: Confusion, Berserk, Reflect, Petrify, Frog, ...; `scripts/battle-smoke.sh --status`) |
 | Later | FF8, FF9, FF10 and FF12 adapters on the same core, in that order (the owner's roadmap; FF13 maybe later) | planned |
@@ -363,6 +363,11 @@ it would do besides (give an item, start a battle, move you to another field) is
 story source is plugged in its branches are read as at the start of a new game. A character with
 nothing to say there (hidden, silenced, no talk script) does nothing when you talk to it.
 
+The reviewed reactor-gate story keeps Cloud's and Barret's default names when the original
+script opens their naming menus. This is an explicit port choice; a canon-character name
+editor is not implemented. Menu return still performs the original party-slot reconciliation,
+and the durable story path refuses unknown party inputs.
+
 *Characters.* In an FF7 field every player, you included, is drawn as the binding the server holds for
 them: a generic placeholder body (`ff7/body/lean`, `ff7/body/sturdy`, `ff7/body/slight`) tinted with their
 colour, never the model of a canon character, whatever stat curve they fight with (an account that predates
@@ -618,7 +623,7 @@ press does nothing, so the intents already on their way from the old place canno
 
 The story advances along the way where the scripts advance it and the server can see it: a walkmesh triangle, a line the
 player walks across, the player coming to stand in a field whose own scripts move the story by themselves, a press of
-OK on the lift's panel, a talk, or a scripted battle won (`crates/fmv-ff7/src/story.rs`). The first mission's steps: 1->6
+OK on the lift's panel, a talk, or a scripted battle won (`crates/fmv-ff7/src/story.rs`). The legacy story path's first-mission steps: 1->6
 (`md1stin`), 6->7 (`md1_1`), 7->8 (`md1_2`), 8->10 (`nrthmk`), 10->11 (`nmkin_1`, a line), 11->12 together with the lift
 bit (`elevtr1`: press OK on the panel's triangle), 12->13 (`nmkin_2`), 13->14 (`nmkin_3`: talk to the woman), 14->15
 (`nmkin_5`: talk to the materia on the floor), 15->27 (`nmkin_5`: the core's triangle starts the Guard Scorpion, formation
@@ -636,6 +641,14 @@ the cutscene, which fights): the server starts it for the party, a battle point 
 lost fight leaves the story where it was, and the step waits for the win. The progression blob is `[1, lo, hi]` until a
 step sets a variable beyond the moment, then `[2, lo, hi, n, (bank, address, value)*n]` (an old blob loads exactly as
 before; a build that predates version 2 reads a version 2 blob as unreadable and leaves it alone).
+
+With `--story-extended-save`, the optional Restore materia pickup is refused until its separate
+materia/AP inventory and success flag can be committed with moment 15. The required route can
+legitimately reach the Guard Scorpion at moment 14: the original trigger requires only a moment
+below 27 and triangle 2. Victory commits the full authored state, including bank 1:225 bit 6 and
+1:226 bit 2, rather than the legacy moment-only projection. The current route test skips this
+optional pickup; it does not prove complete resource-award fidelity, and the original script
+hides the pickup after the boss as well.
 
 **Only ten fields are reviewed: the allowlist.** The script exits, story points and links above are **active in the ten
 fields of the first mission only**: `md1stin`, `md1_1`, `md1_2`, `nrthmk`, `nmkin_1`, `elevtr1`, `nmkin_2`, `nmkin_3`,
@@ -1148,7 +1161,7 @@ processes: two players with different identities and fighting styles register, p
 story (the server-validated story point of `md1stin`), talk to the field's guard (`fmv-client --headless --talk gu0`
 prints what a character says as `talk:` lines, read from your own copy of the field script with the player's own
 story: the guard says the game's own words, the same to both players) and win a shared battle whose roster is the
-canon Cloud and Barret (commanded by the leader's bot, or by the server with `--companions-player-commanded=false`:
+canon Cloud during this opening segment (commanded by the leader's bot, or by the server with `--companions-player-commanded=false`:
 `companion acted` lines, every command replayed by both bots with 0 divergences) followed by both players under their own names with their styles' stat curves, the rewards going to
 the two players only; the server process is stopped and started again, the same players log in again and are told
 exactly what they ended with (a login changes no record byte), and a second battle on the restarted server pays on
@@ -1156,14 +1169,17 @@ top of what was saved, to the point. The stored limit gauge of an account (the s
 that predates v9 would hold) is preserved by the battle and by the restart.
 
 **The canon party fights beside the players (protocol v9).** A battle's party is the story's canon party first, then
-every PLAYER in party order: in the first reactor mission (`md1stin`, `md1_1`) Cloud and Barret, so a solo player
-fights as [Cloud, Barret, the player] and two players as [Cloud, Barret, player 1, player 2], up to five (a player
-party is still at most three). The canon party is a table (`CANON_PARTIES` in `fmv_ff7::story`: one row from the first
-moment of the game, extended with each story party that comes later), chosen by the party leader's own story progress.
-Nobody is replaced, whatever stat curve a player fights with: a new Barret-curve character gets [Cloud, Barret,
-itself] and is drawn in its own body, never as a second Barret, and an account that predates the creator on Cloud's
-curve gets [Cloud, Barret, itself] with no second Cloud. (The canon Barret is therefore no longer a stand-in NPC of the
-field: he is in the party.)
+every PLAYER in party order. Cloud starts alone; Barret joins at the reactor door (moment 11)
+and leaves after the escape (moment 36). A solo player therefore starts as [Cloud, the player],
+then fights as [Cloud, Barret, the player] after the join. Two players after the join fight as
+[Cloud, Barret, player 1, player 2], up to five members with three players. The canon party
+table (`CANON_PARTIES` in `fmv_ff7::story`) follows the party leader's story; authored party
+operations must agree with the table before a story change is accepted. Player bodies and
+identities stay their own regardless of which canon character supplies their stat curve.
+The reviewed route also tracks the separate unlocked-member effect through a bounded projection:
+Cloud is available initially, the door unlocks Barret, and his later removal leaves him available.
+This proof ends at moment 63. It is not a general PHS save representation; unsupported unlocks,
+party-slot layouts and authoritative visibility queries refuse rather than invent state.
 
 * **A player commands the companions (`--companions-player-commanded`, on by default; protocol v17).** As in FF7, where the
   player commands every member of the party, a PLAYER gives Cloud's and Barret's commands: a solo player commands Cloud,
@@ -1459,17 +1475,42 @@ that attempt's staged costs and offers **Confirm** to retry the saved fight; **B
 checkpoint. Party changes involving a held participant are refused until release. Connected guests remain held through
 the linked arrival and receive the final position before release; their story progression remains their own.
 
-The first continuation transaction raises the account-store format fence to version 3, so an older server refuses to
-open that store. Use matching protocol-20 client and server builds. The extended-save switch is off by default; these
+Explicit initial stories, exact ordinary story writes and continuation transactions raise the account-store format
+fence to version 4, so earlier servers (including the previous version-3 reader) refuse to open that store.
+Detached archives from these stores use manifest version 2 so older restore tools also refuse them; new readers
+retain support for older archives. Use matching protocol-21 client and server builds.
+The extended-save switch is off by default; these
 implementation checks use temporary stores and do not change the live preview store.
-Continuation replay contract 2 includes the revised scheduler and authored jump/effect execution. Older contract-1
-checkpoints are refused without changing the save; they are not reinterpreted under the new execution rules.
+Continuation replay contract 3 includes authored model offsets, palette operations and corrected byte extraction,
+in addition to the earlier jump/effect execution. Older contract-1/2 checkpoints are refused without changing the
+save; they are not reinterpreted under the new execution rules. The proposed native field timeline remains separate work.
 
 The flower encounter prepares a known-bit v3 story in memory when reading a supported legacy save. Unknown bits remain
 unknown; the original stored bytes remain the transaction's expected predecessor. Only successful completion stores the
 new format. The bridge-to-train continuations also prepare a known-bit snapshot against their original saved predecessor; unrelated
 scene definitions do not automatically promote saves. The route and rendering checks use temporary saves and read the owned game files without
 changing them; these changes do not deploy or convert the live preview store.
+
+**New extended-save accounts.** Registration stores the fresh story and the kernel's starting resources in the same
+commit as the account, before issuing its token. The story uses the explicit `StoryState::fresh_first_control` port
+profile at moment 1: original reset values plus verified new-game and owned opening-script assignments. Unsupported
+engine-owned values, including clocks, counters and derived menu/party buffers, remain unknown. This is distinct from
+`fresh_reset`, the exact reset image at moment 0. The profile does not claim arbitrary-byte PC startup equivalence:
+the available original startup source calls an opaque menu routine whose full write set has not been recovered.
+Existing token logins, empty legacy saves and imported saves never receive this initialization. An explicit debug
+start story takes precedence only for new registrations on the throw-away servers that allow that option.
+
+**Ordinary extended story changes.** Reviewed field points use an exact predecessor comparison and durable
+acknowledgment, including clears and numeric writes. They do not consume permanent scene receipts, so legitimate
+repeating field transitions can recur. The client holds movement until both the durable save and its ordered hold
+acknowledgment are complete. An ordinary story battle freezes its participants and resource snapshot, then commits
+the owner story and every participant's rewards/limits together before publishing the result. Accepted item costs
+keep their existing FIFO persistence: a crash before outcome commit can retain those costs, but cannot publish or
+repeat an uncommitted reward. This recovery policy differs from the staged retry checkpoints of the bridge scenes.
+An authored ordinary defeat is published only after settlement and holds on Game Over. Confirm or Back
+disconnects; reconnect loads the unchanged story and the already saved item costs. There is no in-place
+retry for this path. Debug encounters keep their nonterminal defeat policy. Accounts whose fighters still
+belong to another battle cannot enter a resource-bearing story transaction, even after reconnecting.
 
 **They start by themselves.** A scene whose trigger nobody can talk to (`SceneDef::starts_on_arrival`: a talk radius of 0)
 is started by the server for a player whose story it is offered to as soon as that player comes to stand in its field, for
@@ -1820,7 +1861,7 @@ on a real store (the whole state directory is byte for byte what it was before t
 `scripts/scene-smoke.sh` over real processes. `mds7pb_1` is not one of `REVIEWED_FIELDS` either, so its story points are
 withheld anyway: that is a second layer, not the first.
 
-### The wire (protocol v20)
+### The wire (protocol v21)
 
 New in `fmv_protocol::scene`: `ClientMsg::{SceneStep, SceneEnd, SceneLeave, SceneDebugPreview}`,
 `ServerMsg::{SceneStart, SceneStep, SceneEnded, SceneRefused}`, `SceneRunId`, `SceneRole`, `SceneParticipant`,
@@ -1837,6 +1878,12 @@ the same carried battle state. Missing fields, oversized transcripts and mismatc
 Stored continuation replay is bounded at 256 KiB, a checkpoint at 2 MiB and a character record at 4 MiB, allowing all
 known persistent script bytes to survive the three-fight bridge. Wire messages retain their separate 256 KiB frame
 limit: scene starts and accepted prefixes must fit before a checkpoint is admitted or saved. Storage encoding is unchanged.
+
+Protocol 21 adds `StoryPending { id, area, pos, facing }`, `StoryPendingAck { id }` and `StoryCommitted { id }`.
+The nonzero token identifies a particular durable hold. The client installs the authoritative stopped position and
+acknowledges it on the same ordered connection; the server waits for that acknowledgment and durable storage before
+releasing control. A stale token, snapshot, area transfer or unrelated scene completion cannot release the hold.
+Battle commands remain usable while a story battle holds field controls. Matching clients and servers are required.
 
 ### Checking it
 
@@ -1934,8 +1981,12 @@ from a server and keeps none anywhere but the library.
   moves you to the area. A field that names none leaves the music playing, as in the game. A track starts as
   soon as it has decoded (about a second); the loop points in the file are honoured sample for sample.
 - **Battles.** The field's battle music (`BMUSC`), else the standard battle theme, plays when a fight starts.
-  A win plays the victory fanfare once and then the field's music again; running away or losing goes straight
-  back to the field's music. The next fight's music and the fanfare are decoded in the background as soon as
+  A win plays the victory fanfare once unless the authored battle mode suppresses it, then returns to the
+  field's music. The opening station fight suppresses it; the Guard Scorpion fight permits it.
+  Running away or a nonterminal defeat returns to the field's music. An authoritative Game Over instead
+  loops the owned `over2` track and keeps field ambience stopped; if that track cannot decode, it remains silent.
+  The track choice follows the original Game Over routine and its loop follows the owned PC audio tags;
+  exact original PC fade timing is unverified. The next fight's music and the fanfare are decoded in the background as soon as
   you enter a field, so that a fight does not wait for them.
 - **Menus.** The battle menu and the character menu click, confirm, cancel and buzz with the game's own sounds.
 - **A battle's sounds.** Each blow plays the sound your own game data names for it, **at the moment it lands** (the

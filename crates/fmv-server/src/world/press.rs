@@ -83,9 +83,12 @@ impl World {
     /// docs). Returns where the player was put. A player that the same hop put into a battle (a story point that starts
     /// one) is frozen where it is: no link moves it.
     pub(super) fn walk_links(&mut self, entity: EntityId, from: Pos, to: Pos, now: Instant) -> Option<Pos> {
+        let account = self.players.get(&entity)?.account;
+        if self.ordinary_battle_account_held(account) { return None; }
+        let resuming = self.ordinary_story_resuming(entity);
         let fired = {
             let p = self.players.get_mut(&entity)?;
-            if p.battle.is_some() || p.transit.is_some() {
+            if p.battle.is_some() || p.transit.is_some() || p.scene.is_some() || (p.story_pending.is_some() && !resuming) {
                 return None;
             }
             let area = self.areas.get(&p.area)?;
@@ -99,6 +102,9 @@ impl World {
     fn relocate(&mut self, entity: EntityId, index: usize, now: Instant) -> Option<Pos> {
         let (dest, area_key, label) = {
             let p = self.players.get(&entity)?;
+            if p.battle.is_some() || p.transit.is_some() || p.scene.is_some()
+                || (p.story_pending.is_some() && !self.ordinary_story_resuming(entity))
+                || self.ordinary_battle_account_held(p.account) { return None; }
             let area = self.areas.get(&p.area)?;
             let link = area.links().get(index)?;
             let dest = area.runtime().place_arrival(link.to, link.to_hint);
@@ -129,7 +135,8 @@ impl World {
         let (pos, area_key, phase) = {
             let Some(p) = self.players.get(&entity) else { return PressOutcome::Gone };
             // (a player held in a story scene presses nothing: see `scene`)
-            if p.battle.is_some() || p.transit.is_some() || p.scene.is_some() || p.fence.is_some_and(|f| now < f.until) {
+            if p.battle.is_some() || p.transit.is_some() || p.scene.is_some() || p.story_pending.is_some()
+                || self.ordinary_battle_account_held(p.account) || p.fence.is_some_and(|f| now < f.until) {
                 return PressOutcome::Nothing;
             }
             (p.snapshot.pos, p.area.clone(), p.placement.as_ref().map(|p| p.key.phase.clone()).unwrap_or_default())
@@ -502,6 +509,32 @@ mod tests {
         // out of the battle the same press is the ladder
         w.players.get_mut(&a.entity).unwrap().battle = None;
         assert_eq!(w.press(a.entity, None, t0), PressOutcome::Relocated { corrected: pos(LINK_C_TO) });
+    }
+
+    #[test]
+    fn a_scene_or_pending_story_save_stops_same_move_links_and_subsequent_presses() {
+        for pending_story in [false, true] {
+            let now = Instant::now();
+            let (mut w, mut saved) = world();
+            let mut a = seat(&mut w, "held", now);
+            a.drain();
+            let p = w.players.get_mut(&a.entity).unwrap();
+            if pending_story { p.story_pending = Some(7); }
+            else { p.scene = Some(fmv_protocol::SceneRunId(7)); }
+            assert_eq!(w.walk_links(a.entity, pos((-100.0, 0.0)), pos((-140.0, 0.0)), now), None);
+            assert_eq!(w.relocate(a.entity, 0, now), None, "a deferred relocation also respects the hold");
+            assert_eq!(at(&w, &a), pos((-100.0, 0.0)));
+            assert!(w.players.get(&a.entity).unwrap().fence.is_none());
+            w.players.get_mut(&a.entity).unwrap().snapshot.pos = Pos::new(0.0, 95.0, 0.0);
+            assert_eq!(w.press(a.entity, None, now), PressOutcome::Nothing);
+            assert_eq!(at(&w, &a), Pos::new(0.0, 95.0, 0.0));
+            assert!(saved.try_recv().is_err() && a.drain().is_empty());
+            let p = w.players.get_mut(&a.entity).unwrap();
+            p.story_pending = None;
+            p.scene = None;
+            assert_eq!(w.press(a.entity, None, now), PressOutcome::Relocated { corrected: pos(LINK_C_TO) },
+                "normal interaction resumes after the hold ends");
+        }
     }
 
     #[test]

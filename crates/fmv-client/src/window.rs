@@ -10,7 +10,7 @@ use crate::avatar::{AvatarPlayer, Avatars, Stage, Who};
 use crate::backdrop::FieldView;
 use crate::camera::{CameraInput, CameraMode, FieldCamera};
 use crate::battle::scene::{scene_for, BattleScene, ModelKit};
-use crate::battle::{battle_vertices, draw_battle_overlay, draw_battle_text, BattleCmd, MenuKey, MenuReply};
+use crate::battle::{battle_vertices, draw_battle_overlay, draw_battle_text, draw_game_over, BattleCmd, MenuKey, MenuReply};
 use crate::cli::exit;
 use crate::gamemode::DeviceMode;
 use crate::gamepad::{PadMode, Pads};
@@ -471,6 +471,42 @@ fn route_key(code: KeyCode, pressed: bool, repeat: bool, in_battle: bool) -> Key
     KeyRoute::Movement
 }
 
+/// During a durable story save, only local presentation controls and an already active battle
+/// remain available. Field confirmation, previews, party changes and new encounters stay blocked.
+fn story_pending_route(code: KeyCode, pressed: bool, repeat: bool, battle_menu: bool) -> KeyRoute {
+    let route = route_key(code, pressed, repeat, battle_menu);
+    match route {
+        KeyRoute::Escape | KeyRoute::WalkMesh | KeyRoute::Camera | KeyRoute::AntiAliasing
+        | KeyRoute::RenderScale | KeyRoute::Audio(_) => route,
+        KeyRoute::Battle(key) if battle_menu && key != BattleKey::Request => route,
+        KeyRoute::Swap if battle_menu => route,
+        _ => KeyRoute::Ignored,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GameOverRoute { Inactive, Held, Disconnect }
+
+/// An acknowledged ordinary defeat has no field controls. Scene continuations keep their own
+/// owner/watcher retry controls; this path only offers a clean local disconnect.
+fn game_over_route(state: &ClientState, code: KeyCode, pressed: bool, repeat: bool) -> GameOverRoute {
+    if !state.ordinary_game_over() { return GameOverRoute::Inactive; }
+    if pressed && !repeat && matches!(code, KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space | KeyCode::Escape | KeyCode::Backspace) {
+        GameOverRoute::Disconnect
+    } else {
+        GameOverRoute::Held
+    }
+}
+
+/// Observe every hold, including a begin and release received in one pump. A release never
+/// resurrects directions that were held before the server froze the field.
+fn observe_story_pending(epoch: &mut u64, observed: u64, input: &mut Input) -> bool {
+    if *epoch == observed { return false; }
+    *epoch = observed;
+    *input = Input::default();
+    true
+}
+
 /// Held movement keys.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Input {
@@ -496,6 +532,13 @@ impl Input {
             _ => return false,
         }
         true
+    }
+
+    /// A field press changes the held state once. OS repeats must not restore a direction
+    /// cleared by a story hold; releases always pass through, including after a blocked press.
+    fn field_event(&mut self, code: KeyCode, pressed: bool, repeat: bool) -> bool {
+        if pressed && repeat { return false; }
+        self.set(code, pressed)
     }
 
     /// Is Shift held (walk instead of run)?
@@ -585,6 +628,7 @@ pub(crate) struct App {
     audio: GameAudio,
     /// How many story scenes had begun when the window last looked (a new one lets go of the keys held and closes a talk).
     scene_started: u64,
+    story_pending_epoch: u64,
     graphics: crate::graphics::Settings,
 }
 
@@ -626,6 +670,7 @@ impl App {
             talk: Talk::ff7(None),
             audio: GameAudio::off(),
             scene_started: 0,
+            story_pending_epoch: 0,
             graphics: crate::graphics::Settings::default(),
         }
     }
@@ -651,42 +696,58 @@ impl App {
     /// A key went down, came up or repeated: from the keyboard or from a game controller, which
     /// make the same key events (`PadKey::key_code`) and so go through this one dispatch.
     fn key_event(&mut self, el: &ActiveEventLoop, code: KeyCode, pressed: bool, repeat: bool, source: InputSource) {
-        // A story scene on show owns every key; with none, F6 asks the server for a preview of the first scene and a fresh OK
-        // next to a scene's trigger starts it (see `crate::scene::route_key`). All before the field's own keys.
         let now = self.session.now();
-        let area = &self.session.info.area_id.key;
-        match scene::route_key(&mut self.session.state, area, now, self.talk.is_open(), code, pressed, repeat) {
-            SceneRoute::Scene => {
-                // A key let go of during a scene still ends the walk: it must never be lost.
-                if !pressed {
-                    self.input.set(code, false);
+        self.sync_story_pending_input();
+        match game_over_route(&self.session.state, code, pressed, repeat) {
+            GameOverRoute::Disconnect => { self.quit(el); return; }
+            GameOverRoute::Held => {
+                self.input = Input::default();
+                self.talk.close();
+                return;
+            }
+            GameOverRoute::Inactive => {}
+        }
+        let route = if self.session.state.field_controls_held() {
+            self.talk.close();
+            // Key releases must survive every hold, even when the associated press was ignored.
+            if !pressed { self.input.set(code, false); }
+            let battle_menu = self.session.state.battle.in_battle() || self.session.state.battle.lingering(now);
+            story_pending_route(code, pressed, repeat, battle_menu)
+        } else {
+            let area = &self.session.info.area_id.key;
+            match scene::route_key(&mut self.session.state, area, now, self.talk.is_open(), code, pressed, repeat) {
+                SceneRoute::Scene => {
+                    // A key let go of during a scene still ends the walk: it must never be lost.
+                    if !pressed {
+                        self.input.set(code, false);
+                    }
+                    return;
                 }
+                SceneRoute::Preview => {
+                    eprintln!("scene: asking the server for a preview of the first scene");
+                    self.notice = Some(("Asking the server for a scene preview".to_string(), Instant::now() + NOTICE_TIME));
+                    return;
+                }
+                SceneRoute::Press(npc) => {
+                    eprintln!("scene: OK next to a scene's trigger (character {npc})");
+                    self.session.send_interact(Some(npc));
+                    return;
+                }
+                SceneRoute::Field => {}
+            }
+            // A dialogue takes its keys first; a fresh Enter or Space outside a battle talks to the
+            // character in front of us. It is also a press of OK, which the server must hear of (a character's talk can
+            // move the story; a ladder or a lift panel is used by it): the conversation it opens is built first, from the
+            // story as it is now, and the press goes out after it (see `field_key`).
+            let key = field_key(&mut self.talk, &self.session.state, &self.session.info.area_id.key, self.session.now(), code, pressed, repeat);
+            if let Some(npc) = key.interact {
+                self.session.send_interact(npc);
+            }
+            if key.consumed {
                 return;
             }
-            SceneRoute::Preview => {
-                eprintln!("scene: asking the server for a preview of the first scene");
-                self.notice = Some(("Asking the server for a scene preview".to_string(), Instant::now() + NOTICE_TIME));
-                return;
-            }
-            SceneRoute::Press(npc) => {
-                eprintln!("scene: OK next to a scene's trigger (character {npc})");
-                self.session.send_interact(Some(npc));
-                return;
-            }
-            SceneRoute::Field => {}
-        }
-        // A dialogue takes its keys first; a fresh Enter or Space outside a battle talks to the
-        // character in front of us. It is also a press of OK, which the server must hear of (a character's talk can
-        // move the story; a ladder or a lift panel is used by it): the conversation it opens is built first, from the
-        // story as it is now, and the press goes out after it (see `field_key`).
-        let key = field_key(&mut self.talk, &self.session.state, &self.session.info.area_id.key, self.session.now(), code, pressed, repeat);
-        if let Some(npc) = key.interact {
-            self.session.send_interact(npc);
-        }
-        if key.consumed {
-            return;
-        }
-        let route = route_key(code, pressed, repeat, self.session.state.battle.in_battle());
+            route_key(code, pressed, repeat, self.session.state.battle.in_battle())
+        };
         if self.talk.is_open() && route != KeyRoute::Movement {
             return; // under a dialogue only the walking keys count (a release must never be lost)
         }
@@ -717,9 +778,15 @@ impl App {
             KeyRoute::Battle(key) => self.battle_key(key),
             KeyRoute::Swap => self.swap_key(),
             KeyRoute::Movement => {
-                self.input.set(code, pressed);
+                self.input.field_event(code, pressed, repeat);
             }
             KeyRoute::Ignored => {}
+        }
+    }
+
+    fn sync_story_pending_input(&mut self) {
+        if observe_story_pending(&mut self.story_pending_epoch, self.session.state.story_pending_epoch(), &mut self.input) {
+            self.talk.close();
         }
     }
 
@@ -728,7 +795,9 @@ impl App {
     /// reads in eight and a held direction is a held key.
     fn poll_pads(&mut self, el: &ActiveEventLoop, now: Instant) {
         let battle = &self.session.state.battle;
-        let menu = battle.in_battle() || battle.lingering(self.session.now()) || self.talk.is_open() || self.session.state.scene.is_active();
+        // A save hold alone keeps Field mode: toggling modes would synthesize fresh presses
+        // for a still-held diagonal stick when the save completes.
+        let menu = battle.in_battle() || battle.lingering(self.session.now()) || self.session.state.ordinary_game_over() || self.talk.is_open() || self.session.state.scene.is_active();
         let mode = if menu { PadMode::Menu } else { PadMode::Field };
         for event in self.pads.poll(now, mode) {
             self.key_event(el, event.key.key_code(), event.pressed, event.repeat, InputSource::Pad);
@@ -942,13 +1011,14 @@ impl App {
             self.fail(el, reason);
             return;
         }
+        self.sync_story_pending_input();
         // The server moved us to another area: draw it before anything is drawn again.
         if self.session.take_area_change().is_some() {
             self.rebuild_view();
         }
         // A story scene: its clock, what it owes the server, what it has to say. A new one lets go of the keys held when it
         // began (their releases may be swallowed) and closes a talk (the server holds the player).
-        let scene_visible = !self.session.state.battle.in_battle() && !self.session.state.battle.lingering(self.session.now());
+        let scene_visible = !self.session.state.field_controls_held() && !self.session.state.battle.in_battle() && !self.session.state.battle.lingering(self.session.now());
         self.session.state.scene.advance_visible(dt, scene_visible);
         self.session.flush_scene();
         self.session.log_scene_notes();
@@ -968,7 +1038,7 @@ impl App {
         self.session.flush_party_sync();
         // A player in a battle is frozen in the field: no walking, no movement intents. So is one whose
         // battle just ended, while the window still shows its victory or defeat panel.
-        if self.session.state.battle.in_battle() || self.session.state.battle.lingering(self.session.now()) {
+        if self.session.state.field_controls_held() || self.session.state.battle.in_battle() || self.session.state.battle.lingering(self.session.now()) {
             self.talk.close();
             self.update_title();
             return;
@@ -1018,6 +1088,9 @@ impl App {
             }
             if let Some(text) = notice.as_deref() {
                 draw_notice(text, vw, vh, &mut overlay);
+            }
+            if self.session.state.ordinary_game_over() {
+                draw_game_over(vw, vh, &mut overlay);
             }
             let result = match drawn {
                 Some((scene, view)) => renderer.render_battle(|_, _, srgb| scene.frame(&view, srgb), Some(&overlay)),
@@ -1077,6 +1150,9 @@ impl App {
         }
         if let Some(text) = notice.as_deref() {
             draw_notice(text, vw, vh, &mut overlay);
+        }
+        if state.ordinary_game_over() {
+            draw_game_over(vw, vh, &mut overlay);
         }
         let result = renderer.render_layers_effects(&scene, built.as_ref().map(|b| &b.frame), Some(&overlay), self.camera.clip_range(view.range), state.scene.fade());
         let gpu_error = renderer.first_gpu_error();
@@ -1305,6 +1381,63 @@ mod tests {
     use super::*;
     use fmv_core::{AccountId, AnimState, AreaId, AvatarAppearance, EntityId, EntitySnapshot, GameId, Pos};
     use fmv_protocol::{InviteId, PartyEvent, PartyId, PartyName, ServerMsg};
+
+    #[test]
+    fn a_story_save_hold_blocks_field_actions_but_keeps_battle_and_local_controls() {
+        for key in [KeyCode::KeyW, KeyCode::ArrowUp, KeyCode::Enter, KeyCode::Space,
+            KeyCode::F6, KeyCode::KeyB, KeyCode::KeyP, KeyCode::KeyY, KeyCode::KeyL] {
+            assert_eq!(story_pending_route(key, true, false, false), KeyRoute::Ignored, "{key:?} cannot begin a field action");
+        }
+        for key in [KeyCode::Escape, KeyCode::F1, KeyCode::F2, KeyCode::F3, KeyCode::F4,
+            KeyCode::KeyM, KeyCode::Minus, KeyCode::Equal] {
+            assert_eq!(story_pending_route(key, true, false, false), route_key(key, true, false, false), "{key:?} remains local");
+        }
+        for (key, expected) in [(KeyCode::Enter, KeyRoute::Battle(BattleKey::Confirm)),
+            (KeyCode::Backspace, KeyRoute::Battle(BattleKey::Back)),
+            (KeyCode::ArrowUp, KeyRoute::Battle(BattleKey::Up)),
+            (KeyCode::Tab, KeyRoute::Swap), (KeyCode::KeyY, KeyRoute::Swap)] {
+            assert_eq!(story_pending_route(key, true, false, true), expected, "a held story may already be fighting or showing its result panel");
+        }
+        assert_eq!(story_pending_route(KeyCode::Escape, true, false, true), KeyRoute::Escape);
+        assert_eq!(story_pending_route(KeyCode::KeyB, true, false, true), KeyRoute::Ignored, "a hold never asks for a second battle");
+        assert_eq!(story_pending_route(KeyCode::KeyL, true, false, true), KeyRoute::Ignored, "battle input does not allow a party mutation");
+    }
+
+    #[test]
+    fn a_story_hold_seen_and_released_in_one_pump_still_clears_old_directions() {
+        let mut input = Input::default();
+        input.set(KeyCode::KeyW, true);
+        input.set(KeyCode::ShiftLeft, true);
+        let mut seen = 0;
+        assert!(!observe_story_pending(&mut seen, 0, &mut input));
+        assert_eq!(input.dir(), (0.0, 1.0));
+        // The pending flag may already be false again; the new epoch still records the hold.
+        assert!(observe_story_pending(&mut seen, 1, &mut input));
+        assert_eq!(input, Input::default());
+        assert!(!observe_story_pending(&mut seen, 1, &mut input), "a repeated message does not create another hold");
+        input.set(KeyCode::KeyD, true);
+        assert!(!observe_story_pending(&mut seen, 1, &mut input));
+        assert_eq!(input.dir(), (1.0, 0.0), "new input after release remains usable");
+        assert!(observe_story_pending(&mut seen, 2, &mut input));
+        assert_eq!(input, Input::default());
+    }
+
+    #[test]
+    fn field_key_repeats_cannot_restore_movement_retired_by_a_story_hold() {
+        let mut input = Input::default();
+        assert!(input.field_event(KeyCode::KeyW, true, false));
+        assert!(input.field_event(KeyCode::ShiftLeft, true, false));
+        let mut epoch = 0;
+        assert!(observe_story_pending(&mut epoch, 1, &mut input));
+        assert!(!input.field_event(KeyCode::KeyW, true, true));
+        assert!(!input.field_event(KeyCode::ShiftLeft, true, true));
+        assert_eq!(input, Input::default(), "a held keyboard key needs a new press after the save");
+        assert!(input.field_event(KeyCode::KeyW, false, true), "releases always survive the repeat guard");
+        assert!(input.field_event(KeyCode::KeyW, true, false));
+        assert_eq!(input.dir(), (0.0, 1.0));
+        assert_eq!(route_key(KeyCode::KeyW, true, true, true), KeyRoute::Battle(BattleKey::Up), "battle menu repeats never enter the field movement guard");
+        assert_eq!(story_pending_route(KeyCode::KeyW, true, true, true), KeyRoute::Battle(BattleKey::Up));
+    }
 
     fn info(fixture: bool) -> SessionInfo {
         SessionInfo {
@@ -1577,6 +1710,10 @@ mod tests {
     /// A state in a battle that starts preemptive (our character's gauge is full at once), with
     /// synthetic rules standing in for the game's.
     fn state_in_a_preemptive_battle() -> ClientState {
+        state_in_a_preemptive_battle_with_game_over(false)
+    }
+
+    fn state_in_a_preemptive_battle_with_game_over(game_over_on_defeat: bool) -> ClientState {
         use fmv_protocol::{BattleId, BattleMember, SyntheticRules};
         let area = AreaId { game: GameId::Fixture, key: "k".into() };
         let mut s = ClientState::new(EntityId(1), AccountId(1), Pos::default(), area);
@@ -1593,11 +1730,36 @@ mod tests {
                 battle_speed: 0,
                 ticks_per_second: 1000,
                 escape_policy: fmv_protocol::EscapePolicy::Formation,
+                victory_fanfare: true,
+                game_over_on_defeat,
                 initial_party: None,
                 data_fingerprint: SyntheticRules::FINGERPRINT,
             },
         );
         s
+    }
+
+    #[test]
+    fn acknowledged_authored_game_over_only_accepts_fresh_confirm_or_back_to_disconnect() {
+        use fmv_protocol::BattleId;
+        use fmv_protocol::battle::Outcome;
+        let mut s = state_in_a_preemptive_battle_with_game_over(true);
+        assert_eq!(game_over_route(&s, KeyCode::Enter, true, false), GameOverRoute::Inactive, "setup policy alone does not end a fight");
+        s.apply(10.0, ServerMsg::BattleEnd { battle_id: BattleId(1), outcome: Outcome::Defeat, rewards: vec![] });
+        for code in [KeyCode::Enter, KeyCode::NumpadEnter, KeyCode::Space, KeyCode::Escape, KeyCode::Backspace] {
+            assert_eq!(game_over_route(&s, code, true, false), GameOverRoute::Disconnect);
+            assert_eq!(game_over_route(&s, code, true, true), GameOverRoute::Held, "an old held key cannot disconnect automatically");
+            assert_eq!(game_over_route(&s, code, false, false), GameOverRoute::Held);
+        }
+        for code in [KeyCode::KeyW, KeyCode::ArrowDown, KeyCode::KeyP, KeyCode::KeyB, KeyCode::F6] {
+            assert_eq!(game_over_route(&s, code, true, false), GameOverRoute::Held, "no walking, party change, debug fight or scene preview");
+        }
+        assert!(!s.battle.lingering(1000.0));
+        assert_eq!(game_over_route(&s, KeyCode::Enter, true, false), GameOverRoute::Disconnect, "the terminal state never becomes ordinary field input");
+        assert!(s.field_controls_held());
+        let mut debug = state_in_a_preemptive_battle();
+        debug.apply(10.0, ServerMsg::BattleEnd { battle_id: BattleId(1), outcome: Outcome::Defeat, rewards: vec![] });
+        assert_eq!(game_over_route(&debug, KeyCode::Enter, true, false), GameOverRoute::Inactive, "debug defeat keeps its existing result/recovery controls");
     }
 
     use crate::battle::Level;

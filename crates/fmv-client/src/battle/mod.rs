@@ -101,6 +101,8 @@ mod action_tests;
 mod bot;
 #[cfg(test)]
 mod crew_tests;
+#[cfg(test)]
+mod game_over_tests;
 mod data;
 mod hud;
 mod lag;
@@ -140,6 +142,27 @@ pub use names::NameBook;
 pub use text::draw_battle_overlay;
 #[allow(unused_imports)]
 pub use view::{flat_anchors, Anchors};
+
+/// An ordinary authored defeat has no in-place retry. The session window draws this after the result
+/// panel and routes Confirm or Back to its existing disconnect action; the battle mirror stays held.
+pub fn draw_game_over(vw: u32, vh: u32, out: &mut crate::ui::draw::DrawList) {
+    use crate::ui::text::{ellipsize, text_height, text_width};
+    use crate::ui::widgets::{BORDER, TEXT};
+    let scale = crate::ui::hud::hud_scale(vw, vh);
+    let cells = vw.saturating_sub(32) / (8 * scale);
+    let title = ellipsize("GAME OVER", cells as usize);
+    let hint = ellipsize("Confirm or Back: disconnect", cells as usize);
+    let width = text_width(&title, scale).max(text_width(&hint, scale));
+    let height = text_height(scale);
+    let (w, h) = (vw.min(i32::MAX as u32) as i32, vh.min(i32::MAX as u32) as i32);
+    let x = ((w - width) / 2).max(0);
+    let y = ((h - height * 3) / 2).max(0);
+    out.fill_rect(0, 0, w, h, [5, 9, 25, 255]);
+    out.fill_rect(x - 12, y - 12, width + 24, height * 3 + 24, [8, 12, 36, 255]);
+    out.frame_rect(x - 12, y - 12, width + 24, height * 3 + 24, 1, BORDER);
+    out.draw_text(x + (width - text_width(&title, scale)) / 2, y, scale, TEXT, &title);
+    out.draw_text(x, y + height * 2, scale, TEXT, &hint);
+}
 
 use crate::headless::encode_name;
 use crate::progress::slot_name;
@@ -352,6 +375,10 @@ pub struct ActiveBattle {
     id: BattleId,
     /// The formation id of the setup (`scene * 4 + slot`).
     formation_id: u16,
+    /// Whether this encounter's authored setup permits the victory fanfare.
+    victory_fanfare: bool,
+    /// Whether an authoritative defeat ends ordinary field play.
+    game_over_on_defeat: bool,
     /// The party of the setup, `party[i]` fighting as `ActorId(i)` (kept even without a replay).
     party: Vec<BattleMember>,
     /// `None` when this client cannot rebuild the battle (no local battle data, or the data
@@ -449,6 +476,10 @@ pub struct BattleClient {
     entered: u64,
     ended: u64,
     victories: u64,
+    /// The authored music policy of the last completed battle, retained after its mirror is removed.
+    last_victory_fanfare: bool,
+    /// An authored Game Over outlives the timed result panel. Only a new encounter or session clears it.
+    game_over: Option<BattleId>,
     defeats: u64,
     /// Battles the party got away from (protocol v7: `Outcome::Escaped`).
     escapes: u64,
@@ -502,6 +533,8 @@ impl BattleClient {
             entered: 0,
             ended: 0,
             victories: 0,
+            last_victory_fanfare: true,
+            game_over: None,
             defeats: 0,
             escapes: 0,
             divergences: 0,
@@ -569,6 +602,18 @@ impl BattleClient {
     /// Battles the server ended in victory.
     pub fn victories(&self) -> u64 {
         self.victories
+    }
+
+    /// Whether the last completed battle permits a victory fanfare. This is captured from its setup
+    /// before prediction begins and published only with its authoritative end, never from a formation id.
+    pub fn last_victory_fanfare(&self) -> bool {
+        self.last_victory_fanfare
+    }
+
+    /// The encounter whose authoritative defeat ended ordinary play. The window handles this only
+    /// outside a retained story battle, whose own continuation controls its retry and disconnect UI.
+    pub fn game_over(&self) -> Option<BattleId> {
+        self.game_over
     }
 
     /// Battles the server ended in defeat.
@@ -724,6 +769,8 @@ impl BattleClient {
                 party,
                 initial_party,
                 escape_policy,
+                victory_fanfare,
+                game_over_on_defeat,
                 preemptive,
                 back_attack,
                 battle_speed,
@@ -733,7 +780,7 @@ impl BattleClient {
                 now,
                 Start {
                     battle_id,
-                    setup: BattleSetup { formation_id, seed, party, initial_party, escape_policy, preemptive, back_attack, battle_speed, ticks_per_second },
+                    setup: BattleSetup { formation_id, seed, party, initial_party, escape_policy, victory_fanfare, game_over_on_defeat, preemptive, back_attack, battle_speed, ticks_per_second },
                     data_fingerprint,
                 },
             ),
@@ -750,6 +797,7 @@ impl BattleClient {
         }
         let Start { battle_id, setup, data_fingerprint } = start;
         self.entered += 1;
+        self.game_over = None;
         // Nothing of an earlier battle is for the scene of this one.
         self.events.clear();
         let my_actor = setup
@@ -819,6 +867,8 @@ impl BattleClient {
         self.active = Some(ActiveBattle {
             id: battle_id,
             formation_id: setup.formation_id,
+            victory_fanfare: setup.victory_fanfare,
+            game_over_on_defeat: setup.game_over_on_defeat,
             party: setup.party.clone(),
             replay,
             my_actor,
@@ -923,6 +973,10 @@ impl BattleClient {
         }
         let Some(active) = self.active.take() else { return };
         self.ended += 1;
+        self.last_victory_fanfare = active.victory_fanfare;
+        if outcome == Outcome::Defeat && active.game_over_on_defeat {
+            self.game_over = Some(battle_id);
+        }
         match outcome {
             Outcome::Victory => self.victories += 1,
             Outcome::Defeat => self.defeats += 1,

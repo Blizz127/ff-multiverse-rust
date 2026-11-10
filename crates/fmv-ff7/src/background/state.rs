@@ -14,7 +14,8 @@
 //! This state belongs to the field, so ending a story scene does not reset it. Unsupported group
 //! or frame indices are ignored, without aliasing another group or overflowing a shift.
 
-/// A resolved background instruction. `frame` is an index from 0 to 7, not a tile's state mask.
+/// A resolved background instruction, including palette scratch work and uploads. For group
+/// commands, `frame` is an index from 0 to 7, not a tile's state mask.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackgroundOp {
     On { group: u8, frame: u8 },
@@ -22,6 +23,8 @@ pub enum BackgroundOp {
     Clear { group: u8 },
     ShiftLeft { group: u8 },
     ShiftRight { group: u8 },
+    /// Palette scratch operations and uploads share the field's ordered presentation stream.
+    Palette(super::PaletteOp),
 }
 
 /// The 64 independent visibility masks of one field. Defaults to the field-entry state, before
@@ -39,12 +42,14 @@ impl Default for BackgroundState {
 
 impl BackgroundState {
     /// Apply one instruction, returning whether a mask changed. Groups outside 0..64 and frame
-    /// indices outside 0..8 are unsupported and leave the state unchanged.
+    /// indices outside 0..8 are unsupported and leave the state unchanged. Palette operations
+    /// belong to [`super::PaletteState`] and do not alter these masks.
     pub fn apply(&mut self, op: BackgroundOp) -> bool {
         let group = match op {
             BackgroundOp::On { group, .. } | BackgroundOp::Off { group, .. }
             | BackgroundOp::Clear { group } | BackgroundOp::ShiftLeft { group }
             | BackgroundOp::ShiftRight { group } => group,
+            BackgroundOp::Palette(_) => return false,
         };
         let Some(mask) = self.masks.get_mut(usize::from(group)) else { return false };
         let old = *mask;

@@ -62,6 +62,8 @@ fn state_in_battle(own: Option<[u8; 3]>, peer: Option<[u8; 3]>) -> ClientState {
         ServerMsg::EncounterStart {
             initial_party: None,
             escape_policy: fmv_protocol::EscapePolicy::Formation,
+            victory_fanfare: true,
+            game_over_on_defeat: false,
             battle_id: BattleId(4),
             formation_id: 1,
             seed: 5,
@@ -140,6 +142,8 @@ fn the_scene_asks_for_the_colour_of_each_members_own_entity_and_never_of_an_enem
     let engine = SyntheticRules::default().build(&BattleSetup {
         initial_party: None,
         escape_policy: fmv_protocol::EscapePolicy::Formation,
+        victory_fanfare: true,
+        game_over_on_defeat: false,
         formation_id: 1,
         seed: 7,
         party: vec![member(0, 0), member(1, 1), member(2, 2)],
@@ -195,6 +199,8 @@ fn state_with_companions(own: [u8; 3], peer: [u8; 3]) -> ClientState {
         ServerMsg::EncounterStart {
             initial_party: None,
             escape_policy: fmv_protocol::EscapePolicy::Formation,
+            victory_fanfare: true,
+            game_over_on_defeat: false,
             battle_id: BattleId(6),
             formation_id: 1,
             seed: 5,
@@ -247,7 +253,7 @@ fn the_players_colours_land_on_the_players_and_never_on_the_canon_companions() {
 fn the_scene_asks_for_the_colour_of_each_players_entity_and_never_of_a_companion() {
     let party = canon_then_two_players();
     let engine = SyntheticRules::default()
-        .build(&BattleSetup { initial_party: None, escape_policy: fmv_protocol::EscapePolicy::Formation, formation_id: 1, seed: 7, party: party.clone(), preemptive: false, back_attack: false, battle_speed: 0, ticks_per_second: 1000 })
+        .build(&BattleSetup { initial_party: None, escape_policy: fmv_protocol::EscapePolicy::Formation, victory_fanfare: true, game_over_on_defeat: false, formation_id: 1, seed: 7, party: party.clone(), preemptive: false, back_attack: false, battle_speed: 0, ticks_per_second: 1000 })
         .unwrap();
     let start = SceneStart { id: BattleId(1), party, bindings: Vec::new(), my_actor: Some(ActorId(2)), formation: None };
     let mut scene = BattleScene::new(&start, Some(&engine), &mut ModelKit::new(Box::new(Armed), None)).unwrap();
@@ -341,7 +347,7 @@ fn offscreen_battle_identity_before_after() {
         BattleMember::player(EntityId(1), ME, "Blizz", 1, 6, 0),
         BattleMember::player(EntityId(2), AccountId(2), "Wedge", 2, 6, 0),
     ];
-    let setup = BattleSetup { initial_party: None, escape_policy: fmv_protocol::EscapePolicy::Formation, formation_id: 301, seed: 0xB11, party, preemptive: true, back_attack: false, battle_speed: 0, ticks_per_second: 1000 };
+    let setup = BattleSetup { initial_party: None, escape_policy: fmv_protocol::EscapePolicy::Formation, victory_fanfare: true, game_over_on_defeat: false, formation_id: 301, seed: 0xB11, party, preemptive: true, back_attack: false, battle_speed: 0, ticks_per_second: 1000 };
     let server = Server { id: BattleId(1), state: real.rules.build(&setup).expect("the formation builds") };
     let area = AreaId { game: GameId::Ff7, key: "md1stin".into() };
     let mut state = ClientState::new(EntityId(1), ME, Pos::default(), area.clone());
@@ -473,7 +479,7 @@ struct RealBattle {
 }
 
 fn real_battle(real: &Real, kit: &mut Option<ModelKit>, party: Vec<BattleMember>, looks: Vec<EntitySnapshot>, seed: u64) -> RealBattle {
-    let setup = BattleSetup { initial_party: None, escape_policy: fmv_protocol::EscapePolicy::Formation, formation_id: 301, seed, party, preemptive: true, back_attack: false, battle_speed: 0, ticks_per_second: 1000 };
+    let setup = BattleSetup { initial_party: None, escape_policy: fmv_protocol::EscapePolicy::Formation, victory_fanfare: true, game_over_on_defeat: false, formation_id: 301, seed, party, preemptive: true, back_attack: false, battle_speed: 0, ticks_per_second: 1000 };
     let server = Server { id: BattleId(1), state: real.rules.build(&setup).expect("the formation builds") };
     let area = AreaId { game: GameId::Ff7, key: "md1stin".into() };
     let mut state = ClientState::new(EntityId(1), ME, Pos::default(), area.clone());

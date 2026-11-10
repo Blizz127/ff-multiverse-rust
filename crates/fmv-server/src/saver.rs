@@ -50,6 +50,12 @@
 //! A terminal battle commits accepted item costs, rewards, gauges and continuation for every member
 //! together. These bounded jobs are larger than normal payments, so the world permits only one
 //! pending operation per reserved roster. Item use during such a fight is staged until settlement.
+//!
+//! [`StoryCasJob`] replaces an ordinary story only against its exact predecessor, without a
+//! permanent receipt for repeatable field changes. [`StoryBattleJob`] settles an ordinary story
+//! battle's rewards, gauges and owner story together. Such battles keep ordinary accepted item
+//! saves; their terminal snapshot follows those saves in this FIFO and never debits them again.
+//! A checked baseline before combat ensures every member has room for the outcome receipt.
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -67,6 +73,8 @@ use crate::progress::{self, Progress};
 
 mod continuation;
 pub(crate) use continuation::{persist_scene_batch, preview_scene_settlement, SceneBatchJob, SceneBatchMember, SceneBattleSettlement, MAX_SCENE_BATTLE_ITEM_USES};
+mod ordinary;
+pub(crate) use ordinary::{persist_story_battle, persist_story_cas, StoryBattleJob, StoryBattleMember, StoryCasJob};
 
 /// How long to wait before each further attempt at a write that failed with an I/O error.
 const RETRY_WAITS: [Duration; 2] = [Duration::from_millis(250), Duration::from_secs(1)];
@@ -202,6 +210,12 @@ impl SceneSaveJob {
 pub(crate) enum Msg {
     Save(SaveJob),
     Story(StoryJob),
+    /// Repeatable exact story transition, with no permanent scene receipt.
+    StoryCas { job: StoryCasJob, done: oneshot::Sender<Result<SceneSaved, SceneSaveError>> },
+    /// Ordinary story battle terminal resources and owner progression, acknowledged together.
+    StoryBattle { job: StoryBattleJob, done: oneshot::Sender<Result<fmv_persist::SceneBatchCommitted, SceneSaveError>> },
+    /// Coherent ordinary battle baseline with room for its terminal receipt, before combat.
+    StoryBattleSnapshot { accounts: Vec<AccountId>, done: oneshot::Sender<Result<Vec<fmv_persist::SceneState>, SceneSaveError>> },
     /// Ordered with rewards and ordinary saves, acknowledged only after a durable transaction.
     Scene { job: SceneSaveJob, done: oneshot::Sender<Result<SceneSaved, SceneSaveError>> },
     /// Every participant's checkpoint, costs and earned resources commit in one durable operation.
@@ -234,6 +248,27 @@ impl SaverHandle {
     /// Queue the story progression `account` has now. `false` if the saver has stopped.
     pub(crate) fn save_story(&self, account: AccountId, progress: Vec<u8>) -> bool {
         self.tx.send(Msg::Story(StoryJob { account, progress })).is_ok()
+    }
+
+    pub(crate) fn save_story_cas(&self, job: StoryCasJob) -> Result<oneshot::Receiver<Result<SceneSaved, SceneSaveError>>, SceneSaveError> {
+        job.validate()?;
+        let (done, finished) = oneshot::channel();
+        self.tx.send(Msg::StoryCas { job, done }).map_err(|_| SceneSaveError::Stopped)?;
+        Ok(finished)
+    }
+
+    pub(crate) fn save_story_battle(&self, job: StoryBattleJob) -> Result<oneshot::Receiver<Result<fmv_persist::SceneBatchCommitted, SceneSaveError>>, SceneSaveError> {
+        job.validate()?;
+        let (done, finished) = oneshot::channel();
+        self.tx.send(Msg::StoryBattle { job, done }).map_err(|_| SceneSaveError::Stopped)?;
+        Ok(finished)
+    }
+
+    pub(crate) fn snapshot_story_battle(&self, accounts: Vec<AccountId>) -> Result<oneshot::Receiver<Result<Vec<fmv_persist::SceneState>, SceneSaveError>>, SceneSaveError> {
+        continuation::validate_accounts(&accounts)?;
+        let (done, finished) = oneshot::channel();
+        self.tx.send(Msg::StoryBattleSnapshot { accounts, done }).map_err(|_| SceneSaveError::Stopped)?;
+        Ok(finished)
     }
 
     /// Queue a complete scene decision. Dropping the receiver never cancels a queued commit.
@@ -313,7 +348,18 @@ pub(crate) struct Saved {
 /// none), as one atomic step, and return what is stored now. Blocking: run it off the executor.
 pub(crate) fn persist(store: &Store, game: GameId, rules: &dyn BattleRules, job: &SaveJob, now: u64) -> Result<Saved, PersistError> {
     let mut items = 0u32;
-    let record = store.update_character_progress(job.account, game, |current| {
+    let record = store.update_character_progress(job.account, game, |mut current| {
+        // Accepting an item command changes inventory, not earned resources. In particular,
+        // an authored full-u32 gil value must not be clamped merely because a potion was used.
+        // Missing records keep the historical default initialization in the general path below.
+        if let (SavedChange::UsedItem(item), Some(record)) = (&job.change, current.as_mut()) {
+            let mut inventory = Inventory::resolve(rules, record.inventory.as_deref());
+            inventory.apply(&Change::Used(*item), rules.max_item_stack());
+            items = inventory.total();
+            record.inventory = Some(inventory.entries().to_vec());
+            record.updated_at = now;
+            return record.clone();
+        }
         let (mut progress, stored) = match current {
             Some(record) => (Progress::from_record(&record), record.inventory),
             None => (progress::fresh(rules, job.character), None),
@@ -417,6 +463,30 @@ async fn run(
                 None => error!(?job, "a battle payment reached a saver that has no battle rules; it is lost"),
             },
             Msg::Story(job) => save_story(&store, game, &adapter, job).await,
+            Msg::StoryCas { job, done } => {
+                let account = job.account;
+                let (store, adapter) = (Arc::clone(&store), Arc::clone(&adapter));
+                let result = tokio::task::spawn_blocking(move || persist_story_cas(&store, game, adapter.as_ref(), &job, unix_now()))
+                    .await.unwrap_or(Err(SceneSaveError::WorkerFailed));
+                if result.is_ok() { info!(account = account.0, "exact story transaction acknowledged"); }
+                else { error!(account = account.0, "exact story transaction not acknowledged; progress must remain held"); }
+                let _ = done.send(result);
+            }
+            Msg::StoryBattle { job, done } => {
+                let members = job.members.len();
+                let (store, adapter, rules) = (Arc::clone(&store), Arc::clone(&adapter), rules.clone());
+                let result = tokio::task::spawn_blocking(move || persist_story_battle(&store, game, rules.as_deref(), adapter.as_ref(), &job, unix_now()))
+                    .await.unwrap_or(Err(SceneSaveError::WorkerFailed));
+                if result.is_ok() { info!(members, "story battle outcome acknowledged"); }
+                else { error!(members, "story battle outcome not acknowledged; participants must remain held"); }
+                let _ = done.send(result);
+            }
+            Msg::StoryBattleSnapshot { accounts, done } => {
+                let store = Arc::clone(&store);
+                let result = tokio::task::spawn_blocking(move || store.get_battle_outcome_states(&accounts, game).map_err(SceneSaveError::from))
+                    .await.unwrap_or(Err(SceneSaveError::WorkerFailed));
+                let _ = done.send(result);
+            }
             Msg::Scene { job, done } => {
                 let account = job.account;
                 let store = Arc::clone(&store);
@@ -854,6 +924,24 @@ mod tests {
     }
 
     // ---- story saves ----
+
+    #[test]
+    fn an_item_only_save_preserves_every_unrelated_stored_resource_without_normalization() {
+        let (_dir, store, account) = store();
+        let mut before = fmv_persist::CharacterProgress::new(account, GameId::Ff7, 9, u8::MAX, NOW);
+        before.exp = u32::MAX;
+        before.ap = u32::MAX - 1;
+        before.gil = u32::MAX;
+        before.limit = u16::MAX;
+        before.inventory = Some(vec![e(0, 3)]);
+        store.put_character_progress(&before).unwrap();
+        let before = store.get_character_progress(account, GameId::Ff7).unwrap().unwrap();
+        persist(&store, GameId::Ff7, rules().as_ref(), &SaveJob::used_item(account, 0, 0), NOW + 1).unwrap();
+        let mut expected = before;
+        expected.inventory = Some(vec![e(0, 2)]);
+        expected.updated_at = NOW + 1;
+        assert_eq!(store.get_character_progress(account, GameId::Ff7).unwrap(), Some(expected));
+    }
 
     /// An adapter that merges progressions like FF7's does (the further moment wins, an unreadable
     /// record stays); nothing else of it is used by the saver.

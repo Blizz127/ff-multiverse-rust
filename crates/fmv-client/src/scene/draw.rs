@@ -97,7 +97,7 @@ pub fn cast_players(scene: &ScenePlayer) -> Vec<AvatarPlayer<'_>> {
             };
             AvatarPlayer {
                 who: cast_who(c.entity),
-                pos: c.pos,
+                pos: c.render_pos,
                 facing: c.facing,
                 anim: if c.moving { AnimState::Walk } else { AnimState::Idle },
                 scene_frame: Some(c.frame),
@@ -146,7 +146,7 @@ pub fn speaker_spot(scene: &ScenePlayer, built: Option<&Built>, view: &FieldView
         let feet = pixels(view.to_view(stands)?);
         Some(((head[0], head[1]), (feet[0], feet[1])))
     };
-    let (head, feet) = person(cast_who(entity), casts.iter().find(|c| c.entity == entity)?.pos)?;
+    let (head, feet) = person(cast_who(entity), casts.iter().find(|c| c.entity == entity)?.render_pos)?;
     // A speaker the field camera has out of the window is nobody to point at.
     let inside = |p: (f32, f32)| (0.0..=vw as f32).contains(&p.0) && (0.0..=vh as f32).contains(&p.1);
     if !inside(head) && !inside(feet) {
@@ -159,14 +159,14 @@ pub fn speaker_spot(scene: &ScenePlayer, built: Option<&Built>, view: &FieldView
         let (cx, pad) = ((head.0 + feet.0) / 2.0, 4.0);
         (cx - half - pad, head.1.min(feet.1) - pad, cx + half + pad, head.1.max(feet.1) + pad)
     };
-    let mut others: Vec<Rect> = casts.iter().filter(|c| c.entity != entity).filter_map(|c| person(cast_who(c.entity), c.pos)).map(rect).collect();
+    let mut others: Vec<Rect> = casts.iter().filter(|c| c.entity != entity).filter_map(|c| person(cast_who(c.entity), c.render_pos)).map(rect).collect();
     others.extend(scene.witnesses().iter().filter_map(|w| person(Who(w.entity.0), w.pos)).map(rect));
     Some(SpeakerSpot { head, feet, others })
 }
 
 /// What the scene asks of the window's field camera this frame ([`crate::camera`]): its last camera instruction on the
-/// stage's own clock, where the actor it follows is drawn, and where its lead is drawn: the canon Cloud when he is in the
-/// cast and on show (the party's leader, whom FF7's camera follows when a scene says nothing of it).
+/// stage's own clock and the followed actor's logical position. OFST moves the model but not this native camera target.
+/// The default lead is the canon Cloud when he is in the cast and on show.
 pub fn camera_shot(scene: &ScenePlayer, view: &FieldView) -> SceneShot {
     let clock = scene.camera_clock();
     let casts = scene.cast_draws();
