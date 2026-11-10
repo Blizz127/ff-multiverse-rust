@@ -47,4 +47,8 @@ its concurrent actor requests must run before concluding the scene.
 An exploratory real-data run of `tin_1` director main at moment 48 produced two windows and a
 moment-51 write, but ended at the VM frame budget with one unresolved read. It also ran looping
 background animations and requests. It is not safe to commit the partial write or enable the
-scene: identify the authored completion boundary and the unresolved read before trying again.
+scene: identify the authored completion boundary before trying again. The unresolved read was a
+turn of entity 40 toward entity 31; running entity 40's initialization as setup supplies its
+authored position and removes that unresolved read. With that setup, the remaining live loop at
+the frame limit is entity 35's slot 6 animation loop; entities 40 and 41 are parked. These are
+exploratory runs, not proof that cutting those threads off preserves the full scene.
