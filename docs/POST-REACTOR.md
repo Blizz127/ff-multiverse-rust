@@ -123,7 +123,8 @@ An unregistered `early_bar_scene()` adds the observed six missing actors and run
 stage director as setup. With the same two answers in owned data, it reaches six windows and
 moment 69 without unresolved positions or off-cast events. Its test verifies model/idle stems
 against the field loader. It still skips party/menu effects and assumes unsaved state; neither
-its witness nor the real route has been validated.
+its witness nor the real route has been validated. A private floor-plan survey drew 23 actor
+walks across the bar with no witness; no safe player position has been established.
 An isolated interpreter comparison used the original director/setup slots and the corresponding
 manually surveyed Echo-S slots (the replacement renames several entities, so automatic rebind
 rejects this definition). At moment 63 each original answer produced six windows and each Echo-S
