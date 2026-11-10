@@ -1624,6 +1624,13 @@ then returns to his standing loop. The movement clip advances one frame per scen
 missing or incompatible clips keep the usual walking pose. Other movement opcodes retain their existing clips.
 Each movement starts its presentation phase at zero; original phase/rate retention across repeated same-slot moves
 is not reproduced. A later unsupported animation or speed change clears the movement override.
+`TURNGEN` uses its positive literal step count for presentation when its path selector is 0–2 and its interpolation
+type is 1 or 2. The script waits one more tick to observe completion: Biggs's team-talk turn has ten presentation
+intervals and an eleven-tick wait, followed by `WAIT1` and a ten-frame Hold before his first window at tick 22.
+This split follows the [PSX field loop](https://github.com/Akari1982/q-gears_reverse/blob/e0fabf7e121818e5abe2f873e34a07d0eb32742d/ffvii/DISC/FIELD/FIELD.BIN_main.cpp)
+and [turn update](https://github.com/Akari1982/q-gears_reverse/blob/e0fabf7e121818e5abe2f873e34a07d0eb32742d/ffvii/DISC/FIELD/FIELD.BIN_entity.cpp),
+not a measured PC run. Turn presentation still uses a linear shortest arc; forced paths and smooth curves remain approximate.
+Zero steps, unsupported selectors/types, `TURN` and `TURA` keep the existing eight-frame fallback.
 No game bytes, protocol or saved state are added. Movement selection follows the
 [Q-Gears MOVE reconstruction](https://github.com/Akari1982/q-gears_reverse/blob/e0fabf7e121818e5abe2f873e34a07d0eb32742d/ffvii/DISC/FIELD/FIELD.BIN_event_code_entity.cpp#L444-L477).
 The normal-rate default-loop interpretation follows the [Q-Gears DFANM reconstruction](https://github.com/Akari1982/q-gears_reverse/blob/e0fabf7e121818e5abe2f873e34a07d0eb32742d/ffvii/DISC/FIELD/FIELD.BIN_event_code_entity.cpp#L72-L95);

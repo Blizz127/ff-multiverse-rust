@@ -1371,7 +1371,22 @@ impl Vm {
                 self.do_face(idx, me, field_direction_to_facing(direction), 0);
                 Flow::Next
             }
-            0xB4 | 0xB5 => {
+            0xB4 => {
+                let direction = clamp_u8(self.num(ins, "direction", Width::U8));
+                let steps = match (ins.literal("turns"), ins.literal("unknown"), ins.literal("speed")) {
+                    (Some(0..=2), Some(1 | 2), Some(steps @ 1..=255)) => Some(steps as u32),
+                    _ => None,
+                };
+                self.do_face(idx, me, field_direction_to_facing(direction), steps.unwrap_or(TURN_FRAMES));
+                // PSX field scripts run before the turn update: step 0 is sampled on the start
+                // frame, and completion at `steps` is observed on the following script tick.
+                // This corrects timing only; the client still approximates the path/curve.
+                if steps.is_some() {
+                    self.add_time(idx, 1);
+                }
+                Flow::Yield
+            }
+            0xB5 => {
                 let direction = clamp_u8(self.num(ins, "direction", Width::U8));
                 self.do_face(idx, me, field_direction_to_facing(direction), TURN_FRAMES);
                 Flow::Yield

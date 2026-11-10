@@ -309,8 +309,16 @@ fn the_team_talk_is_the_cutscene_of_md1_1s_story_point_and_writes_its_step() {
     assert_eq!((biggs.name.as_str(), biggs_model.hrc_stem().as_str()), ("av_m", "bwfd"));
     let default_clip_stem = biggs_model.animations.first().expect("Biggs's default slot 0").stem();
     assert_eq!(default_clip_stem, "acfe");
+    let biggs_script = script.disassemble(3, 3).unwrap();
+    let turn = &biggs_script[0];
+    assert_eq!((turn.offset, turn.opcode, turn.literal("direction"), turn.literal("turns"), turn.literal("speed"), turn.literal("unknown")),
+        (0x055A, 0xB4, Some(28), Some(2), Some(10), Some(2)), "Biggs's authored TURNGEN has ten interpolation steps");
+    assert_eq!((biggs_script[1].opcode, biggs_script[1].literal("frames")), (0x24, Some(1)));
+    let intro = &biggs_script[2];
+    assert_eq!((intro.opcode, intro.literal("animation"), intro.literal("first"), intro.literal("last"), intro.literal("speed")),
+        (0xBC, Some(3), Some(0), Some(9), Some(1)), "WAIT1 then the existing ten-frame Hold precede dialog 31");
     // Biggs's requested CANIM2 uses a ten-frame range of his original clip.
-    assert!(script.disassemble(3, 3).unwrap().iter().any(|ins| ins.opcode == 0xBB
+    assert!(biggs_script.iter().any(|ins| ins.opcode == 0xBB
         && ins.literal("animation") == Some(3) && ins.literal("first") == Some(10)
         && ins.literal("last") == Some(19) && ins.literal("speed") == Some(1)));
     let mut characters = LgpArchive::open_path(dir.join("field/char.lgp")).unwrap();
@@ -349,12 +357,18 @@ fn the_team_talk_is_the_cutscene_of_md1_1s_story_point_and_writes_its_step() {
     assert_eq!(play.animation_clip(4, 4), Some(jessie_clip_stem.as_str()));
     let mut openers = Vec::new();
     let mut origin = 0u32;
+    let (mut biggs_turn_at, mut biggs_dialog_at) = (None, None);
     let (mut biggs_at, mut jessie_at, mut jessie_dialog_at) = (None, None, None);
     loop {
         let beat = play.next(None);
         for event in &beat.stage {
             let at = origin + event.at;
             match event.what {
+                Stage::Face { entity: 3, heading, frames } if frames > 0 && biggs_turn_at.is_none() => {
+                    assert_eq!(heading, fmv_ff7::field_direction_to_facing(28));
+                    assert_eq!(frames, 10, "the staged turn preserves its authored interpolation count");
+                    biggs_turn_at = Some(at);
+                },
                 Stage::Anim { entity: 3, animation: 3, how: fmv_ff7::script::scene::AnimHow::Once,
                     first: Some(10), last: Some(19), speed: 16, divisor: 1 } => { biggs_at.get_or_insert(at); },
                 Stage::Anim { entity: 4, animation: 4, how: fmv_ff7::script::scene::AnimHow::Hold,
@@ -366,6 +380,10 @@ fn the_team_talk_is_the_cutscene_of_md1_1s_story_point_and_writes_its_step() {
             Then::End { .. } => break,
             Then::Window(w) => {
                 origin += w.at;
+                if w.opener == 3 && biggs_dialog_at.is_none() {
+                    assert!(matches!(w.message.origin, MessageOrigin::Canon { dialog: 31, .. }), "Biggs's first window is the authored dialog 31");
+                    biggs_dialog_at = Some(origin);
+                }
                 if w.opener == 4 && jessie_dialog_at.is_none() {
                     assert!(matches!(w.message.origin, MessageOrigin::Canon { dialog: 32, .. }), "Jessie's first window is the authored dialog 32");
                     jessie_dialog_at = Some(origin);
@@ -374,6 +392,8 @@ fn the_team_talk_is_the_cutscene_of_md1_1s_story_point_and_writes_its_step() {
             },
         }
     }
+    assert_eq!(biggs_dialog_at.unwrap().checked_sub(biggs_turn_at.unwrap()), Some(22),
+        "TURNGEN's eleven-frame synchronous wait, WAIT1 and the ten-frame Hold precede dialog 31");
     assert_eq!(jessie_at.unwrap().checked_sub(biggs_at.unwrap()), Some(16), "REQEW waits for Biggs's CANIM2 range, then WAIT6 precedes Jessie's animation");
     assert_eq!(jessie_dialog_at.unwrap().checked_sub(jessie_at.unwrap()), Some(15), "BA waits for Jessie's existing full-clip duration before dialog 32");
     assert_eq!(jessie_dialog_at.unwrap().checked_sub(biggs_at.unwrap()), Some(31));

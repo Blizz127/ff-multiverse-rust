@@ -466,6 +466,74 @@ fn a_script_turns_towards_another_entity_it_knows_the_place_of() {
 }
 
 #[test]
+fn turngen_uses_authored_steps_and_waits_for_the_completion_tick() {
+    for steps in [1u8, 10, 255] {
+        for path in [0u8, 1, 2] {
+            for interpolation in [1u8, 2] {
+                let section = script(vec![("actor", vec![(1, vec![vec![0xB4, 0, 28, path, steps, interpolation], message(0, 0)])])], texts(1));
+                let (beats, vm) = run_root(&section, start(0, 1), &[]);
+                assert_eq!(stage(&beats), [(0, Stage::Face { entity: 0, heading: crate::field_direction_to_facing(28), frames: u32::from(steps) })]);
+                assert_eq!(windows(&beats)[0].at, u32::from(steps) + 1, "steps={steps}, path={path}, interpolation={interpolation}: the script observes completion on the next tick");
+                assert_eq!(end_of(&beats), End::Finished);
+                assert!(vm.writes().is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn turngen_completion_precedes_the_explicit_wait_and_cropped_hold() {
+    let section = script(vec![("actor", vec![(1, vec![
+        vec![0xB4, 0, 28, 2, 10, 2], wait(1), vec![0xBC, 3, 0, 9, 1], message(0, 0),
+    ])])], texts(1));
+    let (beats, vm) = run_root(&section, start(0, 1), &[]);
+    assert_eq!(stage(&beats), [
+        (0, Stage::Face { entity: 0, heading: crate::field_direction_to_facing(28), frames: 10 }),
+        (12, Stage::Anim { entity: 0, animation: 3, how: AnimHow::Hold, first: Some(0), last: Some(9), speed: 16, divisor: 1 }),
+    ]);
+    assert_eq!(windows(&beats)[0].at, 22, "eleven turn ticks, WAIT1, then the existing ten-frame BC wait");
+    assert_eq!(end_of(&beats), End::Finished);
+    assert!(vm.writes().is_empty());
+}
+
+#[test]
+fn reqew_waits_for_the_turngen_childs_completion_tick() {
+    let section = script(vec![
+        ("director", vec![(1, vec![reqew(1, 1), wait(2), message(0, 0)])]),
+        ("actor", vec![(1, vec![vec![0xB4, 0, 64, 2, 10, 2]])]),
+    ], texts(1));
+    let (beats, vm) = run_root(&section, start(0, 1), &[]);
+    assert_eq!(stage(&beats), [(0, Stage::Face { entity: 1, heading: 0.0, frames: 10 })]);
+    assert_eq!(windows(&beats)[0].at, 13, "REQEW joins the child's eleven-tick turn before the director's WAIT2");
+    assert_eq!(end_of(&beats), End::Finished);
+    assert!(vm.writes().is_empty());
+}
+
+#[test]
+fn unsupported_turngen_operands_and_other_turns_keep_the_existing_timing() {
+    for instruction in [
+        vec![0xB4, 0, 64, 2, 0, 2], // Zero steps.
+        vec![0xB4, 0, 64, 2, 10, 0], // Unsupported interpolation.
+        vec![0xB4, 0, 64, 2, 10, 3],
+        vec![0xB4, 0, 64, 3, 10, 2], // Unsupported path.
+        vec![0xB5, 0, 64, 2, 10, 2], // TURN remains outside this timing slice.
+        vec![0xAB, 1, 2, 10], // TURA remains outside this timing slice.
+    ] {
+        let section = script(vec![
+            ("actor", vec![(1, vec![xyzi(0, 0, 0, 0), instruction.clone(), message(0, 0)])]),
+            ("target", vec![(1, vec![xyzi(100, 0, 0, 0)])]),
+        ], texts(1));
+        let root = vec![Step::Await(ScriptRef::new(1, 1)), Step::Start(ScriptRef::new(0, 1))];
+        let (beats, vm) = run_root(&section, root, &[]);
+        let faces: Vec<_> = stage(&beats).into_iter().filter(|(_, event)| matches!(event, Stage::Face { .. })).collect();
+        assert_eq!(faces, [(0, Stage::Face { entity: 0, heading: 0.0, frames: 8 })], "{instruction:?}");
+        assert_eq!(windows(&beats)[0].at, 8, "the existing fallback has no added completion tick: {instruction:?}");
+        assert_eq!(end_of(&beats), End::Finished);
+        assert!(vm.writes().is_empty());
+    }
+}
+
+#[test]
 fn full_holds_dispatch_async_af_and_sync_ba_before_explicit_waits() {
     // Isolated clips exercise dispatch without assuming how overlapping animations are queued.
     // Full clips retain the VM's existing fifteen-frame estimate.
