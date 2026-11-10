@@ -95,6 +95,8 @@ pub struct AvatarPlayer<'a> {
     pub anim: AnimState,
     /// Explicit clip frame from a scene's paused clock. Ordinary players/NPCs use render time.
     pub scene_frame: Option<f32>,
+    /// Optional authored scene clip and frame; the retained character model is never replaced.
+    pub scene_clip: Option<(&'a str, f32)>,
     /// The look the avatar names (untrusted text; only looked up in the table).
     pub appearance: Option<&'a str>,
     /// `Some` for a non-player character of the area instead of a player: the model its data
@@ -288,6 +290,7 @@ impl Avatars {
     /// frame, in seconds (it moves the walk and run loops on).
     pub fn frame(&mut self, view: &FieldView, stage: &Stage, players: &[AvatarPlayer<'_>], dt: f32) -> Built {
         self.animator.begin_frame();
+        self.library.begin_scene_frame();
         let camera = stage.camera.matrix();
         let scale = stage.model_scale;
 
@@ -330,11 +333,13 @@ impl Avatars {
                 markers.push(i);
                 continue;
             };
-            let clip = asset.character.animation(p.anim);
-            let frame = if let Some(frame) = p.scene_frame {
+            let scene_clip = p.scene_clip.and_then(|(stem, frame)| self.library.get_scene_animation(&asset, stem).map(|clip| (clip, frame)));
+            let clip = scene_clip.as_ref().map_or_else(|| asset.character.animation(p.anim), |(clip, _)| clip.as_ref());
+            let scene_frame = scene_clip.as_ref().map(|(_, frame)| *frame).or(p.scene_frame);
+            let frame = if let Some(frame) = scene_frame {
                 // Canon player idles are still poses. Cast NPC idles and walking clips follow
                 // scene time, including a window that freezes an actor halfway through a move.
-                if !frame.is_finite() || (p.npc.is_none() && p.anim == AnimState::Idle) { 0.0 }
+                if !frame.is_finite() || (scene_clip.is_none() && p.npc.is_none() && p.anim == AnimState::Idle) { 0.0 }
                 else { frame.max(0.0).rem_euclid(clip.frame_count().max(1) as f32) }
             } else if p.npc.is_some() && p.anim == AnimState::Idle {
                 self.animator.advance_npc(p.who, dt, clip.frame_count()).frame
@@ -427,7 +432,7 @@ pub(crate) mod tests {
     }
 
     fn player(id: u64, pos: Pos, facing: f32, anim: AnimState) -> AvatarPlayer<'static> {
-        AvatarPlayer { who: Who(id), pos, facing, anim, scene_frame: None, appearance: Some("ff7/cloud"), npc: None, tint: [10, 200, 30], own: false, party: false }
+        AvatarPlayer { who: Who(id), pos, facing, anim, scene_frame: None, scene_clip: None, appearance: Some("ff7/cloud"), npc: None, tint: [10, 200, 30], own: false, party: false }
     }
 
     fn avatars(fail: Vec<&'static str>) -> (Avatars, Rc<RefCell<Vec<&'static str>>>) {
@@ -711,6 +716,10 @@ pub(crate) mod tests {
                 character.idle = character.walk.clone();
                 Ok(character)
             }
+            fn load_scene_animation(&mut self, stem: &str, _bones: &[fmv_ff7::model::ModelBone]) -> Result<fmv_ff7::FieldAnimation, String> {
+                if stem == "missing" { return Err("missing".into()); }
+                Ok(self.load(&fmv_ff7::playable::resolve_appearance_or_default(None))?.walk)
+            }
         }
         let (view, stage) = (view(), stage());
         for mut actor in [player(1, Pos::new(0.0, 0.0, 0.0), 0.0, AnimState::Walk), npc(2, Pos::new(0.0, 0.0, 0.0), 0.0)] {
@@ -726,6 +735,19 @@ pub(crate) mod tests {
             }
             actor.scene_frame = None;
             assert_ne!(avatars.frame(&view, &stage, &[actor], 0.1).frame.models[0].positions, first, "ordinary player/NPC animation still uses render time");
+            actor.scene_frame = Some(0.0);
+            let base = avatars.frame(&view, &stage, &[actor], 0.0).frame.models.remove(0);
+            actor.scene_clip = Some(("scene_loop", 1.0));
+            let playing = avatars.frame(&view, &stage, &[actor], 1.0).frame.models.remove(0);
+            assert_ne!(playing.positions, base.positions, "the authored override selects its pose");
+            assert!(std::sync::Arc::ptr_eq(&base.asset, &playing.asset), "same mesh and asset identity");
+            assert_eq!(avatars.frame(&view, &stage, &[actor], 2.0).frame.models[0].positions, playing.positions, "render time never ticks the override");
+            actor.scene_clip = Some(("scene_loop", 3.0));
+            assert_eq!(avatars.frame(&view, &stage, &[actor], 0.0).frame.models[0].positions, playing.positions, "loop wraps by the actual clip length");
+            actor.scene_clip = Some(("missing", 1.0));
+            let fallback = avatars.frame(&view, &stage, &[actor], 1.0).frame.models.remove(0);
+            assert_eq!(fallback.positions, base.positions, "failed override keeps the normal scene pose");
+            assert!(std::sync::Arc::ptr_eq(&base.asset, &fallback.asset));
         }
     }
 
@@ -787,7 +809,7 @@ pub(crate) mod tests {
             pos,
             facing,
             anim: AnimState::Idle,
-            scene_frame: None,
+            scene_frame: None, scene_clip: None,
             appearance: None,
             npc: Some(NpcRef { model: "agyb", idle: Some("acfe") }),
             tint: [120, 130, 140],

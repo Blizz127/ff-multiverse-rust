@@ -82,6 +82,7 @@ pub fn cast_players(scene: &ScenePlayer) -> Vec<AvatarPlayer<'_>> {
                 facing: c.facing,
                 anim: if c.moving { AnimState::Walk } else { AnimState::Idle },
                 scene_frame: Some(c.frame),
+                scene_clip: c.clip,
                 appearance,
                 npc,
                 tint: CAST_TINT,

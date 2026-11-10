@@ -28,8 +28,9 @@
 //!
 //! # Honest limits
 //!
-//! * The cast are the PLAYABLE models, which have a standing, a walking and a running clip: a script's own animations are
-//!   counted and not played ([`stage::Counts`]); a cast member walks in its walk clip while a move is in progress.
+//! * Matching field-model cast can play normal-speed full-range default loops on scene time. Canonical appearance
+//!   substitutions and unsupported animation forms keep their usual clips; skipped events are counted ([`stage::Counts`]).
+//!   A standing loop yields to movement; one-shot poses, cropped ranges and dynamic rates remain unsupported.
 //! * The scene's camera moves are recorded ([`stage::CameraState`]), not shown: the field's camera stays where it is.
 //! * A window pauses the whole stage (as the interpreter pauses the whole scene); the game pauses only the script that
 //!   opened it.

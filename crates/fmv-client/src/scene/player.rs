@@ -42,7 +42,7 @@ use crate::mods::{Global, ModSink, VoiceCue};
 use fmv_core::{EntityId, Pos};
 use fmv_ff7::field_direction_to_facing;
 use fmv_ff7::script::dialogue::{End, MessageOrigin};
-use fmv_ff7::script::scene::{Look, SceneDef, Stage, Then, Timed, Window, FRAMES_PER_SECOND};
+use fmv_ff7::script::scene::{AnimHow, Look, SceneDef, Stage, Then, Timed, Window, FRAMES_PER_SECOND};
 use fmv_protocol::{ClientMsg, SceneOutcome, SceneParticipant, SceneRefusal, SceneRole, SceneRunId, MAX_SCENE_STEPS};
 use std::cell::Cell;
 use std::collections::VecDeque;
@@ -157,6 +157,8 @@ pub struct CastDraw<'a> {
     pub moving: bool,
     /// Default clip frame from scene time, frozen while a window holds the scene.
     pub frame: f32,
+    /// Resolved authored loop and its frame; independent of the default clip's fallback clock.
+    pub clip: Option<(&'a str, f32)>,
 }
 
 /// What comes after the stage events that are due.
@@ -243,7 +245,7 @@ impl ScenePlayer {
     pub fn new(run: Run, def: SceneDef, source: Box<dyn SceneSource>, instant: bool) -> Self {
         let mut cast = Cast::new(def.cast.iter().map(|m| m.entity));
         for event in source.initial() {
-            cast.apply(&event, 0.0, &|x, y, triangle| source.height_at(x, y, triangle));
+            Self::apply_stage(&mut cast, source.as_ref(), &event, 0.0);
         }
         cast.settle();
         let mut player = Self {
@@ -358,7 +360,7 @@ impl ScenePlayer {
                 let member = self.def.member(a.entity())?;
                 let [x, y, z] = a.pos()?;
                 Some(CastDraw { entity: a.entity(), look: &member.look, pos: Pos::new(x, y, z), facing: a.heading(), moving: a.moving(),
-                    frame: if a.moving() { a.walked_frames() } else { self.elapsed_frames } })
+                    frame: if a.moving() { a.walked_frames() } else { self.elapsed_frames }, clip: a.animation() })
             })
             .collect()
     }
@@ -461,8 +463,19 @@ impl ScenePlayer {
                 self.sound(SoundAction::Play { id, pan });
             }
         }
-        let source = &self.source;
-        self.cast.apply(&event.what, motion_late, &|x, y, triangle| source.height_at(x, y, triangle));
+        Self::apply_stage(&mut self.cast, self.source.as_ref(), &event.what, motion_late);
+    }
+
+    fn apply_stage(cast: &mut Cast, source: &dyn SceneSource, event: &Stage, late: f32) {
+        // The first supported form has no duration/range assumptions: the script's normal-speed
+        // default loop, on its own exact field model. Every other Anim clears an old override.
+        if let Stage::Anim { entity, animation, how: AnimHow::Loop, first: None, last: None, speed: 16, divisor: 1 } = event {
+            if let Some(clip) = source.animation_clip(*entity, *animation) {
+                cast.apply_loop(*entity, clip, late);
+                return;
+            }
+        }
+        cast.apply(event, late, &|x, y, triangle| source.height_at(x, y, triangle));
     }
 
     /// Go on as far as the clock allows: pull the next beat, play what is due, open the window or end the scene. Stops at

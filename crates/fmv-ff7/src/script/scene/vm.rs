@@ -149,7 +149,12 @@ pub enum Stage {
     /// Turn to face a heading (radians, counter-clockwise from the field's +x axis seen from above) over `frames`.
     Face { entity: u8, heading: f32, frames: u32 },
     /// Play a clip of the entity's model (`animation` is the index in the model-loader's list).
-    Anim { entity: u8, animation: u8, how: AnimHow, first: Option<u8>, last: Option<u8>, speed: u8 },
+    /// `speed` is ASPED (default 16); `divisor` preserves the animation opcode's separate literal
+    /// speed byte. Neither metadata field changes the interpreter's existing wait calculation.
+    Anim { entity: u8, animation: u8, how: AnimHow, first: Option<u8>, last: Option<u8>, speed: u8, divisor: u8 },
+    /// `ASPED` changed the actor's animation speed. Clear a presentation override until a fresh
+    /// animation instruction; its phase cannot be reconstructed by restarting the old loop.
+    AnimSpeed { entity: u8, speed: u16 },
     /// Show or hide (`VISI`).
     Show { entity: u8, visible: bool },
     /// Play a literal `SOUND` on effect channel 1; id 0 stops that channel. Pan is the script's byte.
@@ -510,6 +515,8 @@ pub struct Vm {
     visible: BTreeMap<u8, bool>,
     speeds: BTreeMap<u8, i32>,
     anim_speeds: BTreeMap<u8, u32>,
+    /// Last default loop, including those set during quiet setup. A later non-loop clears it.
+    default_anims: BTreeMap<u8, Stage>,
     anim_ends: BTreeMap<u8, u32>,
     camera_end: u32,
     geometry: BTreeMap<u8, (i16, i16, u16, u16)>,
@@ -547,6 +554,7 @@ impl Vm {
             visible: BTreeMap::new(),
             speeds: BTreeMap::new(),
             anim_speeds: BTreeMap::new(),
+            default_anims: BTreeMap::new(),
             anim_ends: BTreeMap::new(),
             camera_end: 0,
             geometry: BTreeMap::new(),
@@ -612,6 +620,11 @@ impl Vm {
     /// Whether the scene has hidden `entity` (`Some(false)`), shown it (`Some(true)`) or said nothing.
     pub fn visible_of(&self, entity: u8) -> Option<bool> {
         self.visible.get(&entity).copied()
+    }
+
+    /// The last default loop still active for `entity`, including quiet setup's result.
+    pub fn default_animation_of(&self, entity: u8) -> Option<&Stage> {
+        self.default_anims.get(&entity)
     }
 
     /// Every place the scene knows, by entity.
@@ -967,7 +980,14 @@ impl Vm {
         let animation = clamp_u8(self.num(ins, "animation", Width::U8));
         let (first, last) = (ins.literal("first").map(clamp_u8), ins.literal("last").map(clamp_u8));
         let speed = self.anim_speeds.get(&entity).copied().unwrap_or(DEFAULT_ANIM_SPEED);
-        self.emit(time, Stage::Anim { entity, animation, how, first, last, speed: u8::try_from(speed.min(255)).unwrap_or(255) });
+        let divisor = ins.literal("speed").map(clamp_u8).unwrap_or(0);
+        let event = Stage::Anim { entity, animation, how, first, last, speed: u8::try_from(speed.min(255)).unwrap_or(255), divisor };
+        if how == AnimHow::Loop {
+            self.default_anims.insert(entity, event.clone());
+        } else {
+            self.default_anims.remove(&entity);
+        }
+        self.emit(time, event);
         if how != AnimHow::Loop {
             let end = time.saturating_add(self.anim_frames(entity, first, last));
             self.anim_ends.insert(entity, end);
@@ -1377,8 +1397,15 @@ impl Vm {
                 Flow::Next
             }
             0xBD => {
-                let speed = u32::try_from(self.num(ins, "speed", Width::U16)).unwrap_or(DEFAULT_ANIM_SPEED).max(1);
-                self.anim_speeds.insert(me, speed);
+                let speed = u32::try_from(self.num(ins, "speed", Width::U16)).unwrap_or(DEFAULT_ANIM_SPEED);
+                self.anim_speeds.insert(me, speed.max(1));
+                self.default_anims.remove(&me);
+                // ASPED never advanced the scheduler epoch. Presentation invalidation must not
+                // turn a constant ASPED/JMP loop into active work that evades idle parking.
+                self.out.push(Timed {
+                    at: self.thread_time(idx).saturating_sub(self.origin),
+                    what: Stage::AnimSpeed { entity: me, speed: u16::try_from(speed).unwrap_or(u16::MAX) },
+                });
                 Flow::Next
             }
             0xAC => {

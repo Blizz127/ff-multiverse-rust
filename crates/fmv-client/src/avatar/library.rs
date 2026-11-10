@@ -19,6 +19,7 @@ use super::mesh::MergedMesh;
 use super::source::CharacterLoader;
 use fmv_ff7::model::mat4_identity;
 use fmv_ff7::playable::{resolve_model, Character, PlayableModel, PLACEHOLDER_BODIES, PLAYABLE_FIELD_MODELS};
+use fmv_ff7::FieldAnimation;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -95,6 +96,19 @@ enum Slot {
 /// What identifies a loaded non-player model: its skeleton stem and standing clip, lower case.
 type NpcKey = (String, String);
 
+/// A clip is compatible with one retained asset, not necessarily another model using its stem.
+type SceneAnimationKey = (u64, String);
+
+struct SceneAnimationSlot {
+    /// `None` remembers a failed load while the scene keeps asking for this clip.
+    clip: Option<Arc<FieldAnimation>>,
+    seen: u64,
+}
+
+/// Scene clips hold no model or GPU mesh. Bound both successful and failed references, with room
+/// for two clips per drawable model across a frame's transition to the next scene animation.
+pub const MAX_SCENE_ANIMATIONS: usize = 2 * super::gpu::MAX_GPU_MODELS;
+
 /// Most placeholder bodies the players can wear at once (the table of bodies holds up to this many: a test
 /// fails when it grows past it, so the cache arithmetic below is never silently wrong).
 pub const MAX_BODY_MODELS: usize = 4;
@@ -132,11 +146,22 @@ pub struct AvatarLibrary {
     npc_slots: HashMap<NpcKey, Slot>,
     /// The cap was said once already (so a crowded field does not repeat it every frame).
     npc_cap_reported: bool,
+    scene_animations: HashMap<SceneAnimationKey, SceneAnimationSlot>,
+    scene_frame: u64,
+    scene_cap_reported: bool,
 }
 
 impl AvatarLibrary {
     pub fn new(loader: Box<dyn CharacterLoader>) -> Self {
-        Self { loader, slots: HashMap::new(), npc_slots: HashMap::new(), npc_cap_reported: false }
+        Self {
+            loader,
+            slots: HashMap::new(),
+            npc_slots: HashMap::new(),
+            npc_cap_reported: false,
+            scene_animations: HashMap::new(),
+            scene_frame: 0,
+            scene_cap_reported: false,
+        }
     }
 
     /// The table entry `appearance_ref` means (a canon character's model or a placeholder body's), and
@@ -214,6 +239,51 @@ impl AvatarLibrary {
         for (model, idle) in &wanted {
             self.get_npc(model, Some(idle));
         }
+    }
+
+    /// Start a drawn frame. Clips not requested during the preceding frame are discarded,
+    /// including failed loads; failures that remain active are not retried every frame.
+    pub fn begin_scene_frame(&mut self) {
+        let current = self.scene_frame;
+        self.scene_animations.retain(|_, slot| slot.seen == current);
+        self.scene_frame = current.wrapping_add(1);
+        if self.scene_animations.len() < MAX_SCENE_ANIMATIONS {
+            self.scene_cap_reported = false;
+        }
+    }
+
+    /// A scene's animation for an already loaded character. The cache key includes that asset's
+    /// identity: a clip that fails for one skeleton can still fit another. Neither loading nor
+    /// retaining these clips changes the model caches or the asset's mesh/standing animation.
+    pub fn get_scene_animation(&mut self, asset: &Arc<AvatarAsset>, stem: &str) -> Option<Arc<FieldAnimation>> {
+        if !plausible_stem(stem) {
+            return None;
+        }
+        let key = (asset.id, stem.to_ascii_lowercase());
+        if !self.scene_animations.contains_key(&key) {
+            if self.scene_animations.len() >= MAX_SCENE_ANIMATIONS {
+                if !self.scene_cap_reported {
+                    self.scene_cap_reported = true;
+                    eprintln!("avatar: this frame names more than {MAX_SCENE_ANIMATIONS} scene animations; the others use their usual clips");
+                }
+                return None;
+            }
+            let bones = &asset.character.model.bones;
+            let loaded = self.loader.load_scene_animation(&key.1, bones).and_then(|clip| {
+                if clip.fits(bones) { Ok(clip) } else { Err("the scene clip does not fit the retained skeleton".to_string()) }
+            });
+            let clip = match loaded {
+                Ok(clip) => Some(Arc::new(clip)),
+                Err(why) => {
+                    eprintln!("avatar: cannot load scene animation {} for asset {} ({why}); using its usual clip", key.1, key.0);
+                    None
+                }
+            };
+            self.scene_animations.insert(key.clone(), SceneAnimationSlot { clip, seen: self.scene_frame });
+        }
+        let slot = self.scene_animations.get_mut(&key)?;
+        slot.seen = self.scene_frame;
+        slot.clip.as_ref().map(Arc::clone)
     }
 
     /// Characters currently held (loaded or failed): never more than the table has.
@@ -332,6 +402,102 @@ pub(crate) mod tests {
         loader.fail_npc = fail_npc;
         let asked = Rc::clone(&loader.asked_npc);
         (AvatarLibrary::new(Box::new(loader)), asked)
+    }
+
+    struct SceneCounting {
+        models: Counting,
+        asked: Rc<RefCell<Vec<(String, usize)>>>,
+    }
+
+    impl CharacterLoader for SceneCounting {
+        fn load(&mut self, appearance: &PlayableModel) -> Result<Character, String> {
+            self.models.load(appearance)
+        }
+
+        fn load_npc(&mut self, model: &str, idle: &str) -> Result<Character, String> {
+            self.models.load_npc(model, idle)
+        }
+
+        fn load_scene_animation(&mut self, stem: &str, bones: &[fmv_ff7::model::ModelBone]) -> Result<FieldAnimation, String> {
+            self.asked.borrow_mut().push((stem.to_string(), bones.len()));
+            if stem.starts_with("missing") {
+                return Err("neither the layered nor the original clip loads".to_string());
+            }
+            // Deliberately return a mismatched clip for a one-bone asset. The cache must reject
+            // it even when a loader fails to uphold its compatibility contract.
+            Ok(clip(4, if stem == "two_bones" { 2 } else { 1 }, 5.0))
+        }
+    }
+
+    fn scene_library() -> (AvatarLibrary, Rc<RefCell<Vec<(String, usize)>>>) {
+        let asked = Rc::default();
+        let loader = SceneCounting { models: Counting::new(Rc::default(), vec![]), asked: Rc::clone(&asked) };
+        (AvatarLibrary::new(Box::new(loader)), asked)
+    }
+
+    #[test]
+    fn scene_animations_cache_success_failure_and_fit_per_retained_asset() {
+        let (mut lib, asked) = scene_library();
+        let asset = lib.get(Some("ff7/cloud")).asset.unwrap();
+        let npc = lib.get_npc("agyb", Some("acfe")).unwrap();
+        let original_idle = npc.character.idle.clone();
+        lib.begin_scene_frame();
+        let first = lib.get_scene_animation(&npc, "SCENE").unwrap();
+        assert!(Arc::ptr_eq(&first, &lib.get_scene_animation(&npc, "scene").unwrap()));
+        for _ in 0..3 {
+            assert!(lib.get_scene_animation(&asset, "missing").is_none());
+            assert!(lib.get_scene_animation(&asset, "two_bones").is_none());
+        }
+        lib.begin_scene_frame();
+        assert!(Arc::ptr_eq(&first, &lib.get_scene_animation(&npc, "Scene").unwrap()));
+        assert!(lib.get_scene_animation(&asset, "MISSING").is_none());
+        assert!(lib.get_scene_animation(&asset, "TWO_BONES").is_none());
+        assert_eq!(*asked.borrow(), [("scene".into(), 1), ("missing".into(), 1), ("two_bones".into(), 1)]);
+
+        let mut other = character(resolve_model("ff7/tifa").unwrap(), 1, 4, 3);
+        other.model.bones.push(other.model.bones[0].clone());
+        other.idle = clip(1, 2, 5.0);
+        let other = Arc::new(AvatarAsset::new(other).unwrap());
+        let fitted = lib.get_scene_animation(&other, "two_bones").unwrap();
+        assert!(fitted.fits(&other.character.model.bones), "another asset is not poisoned by the cached mismatch");
+        assert_eq!(asked.borrow().last().unwrap(), &("two_bones".to_string(), 2));
+
+        assert_eq!((lib.cached(), lib.cached_npcs()), (1, 1), "clips allocate no character cache slots");
+        assert!(Arc::ptr_eq(&asset, &lib.get(Some("ff7/cloud")).asset.unwrap()));
+        assert!(Arc::ptr_eq(&npc, &lib.get_npc("agyb", Some("acfe")).unwrap()));
+        assert_eq!(npc.character.idle, original_idle, "the standing clip and asset/mesh identity are retained");
+    }
+
+    #[test]
+    fn scene_animation_cache_is_bounded_and_discards_only_inactive_keys() {
+        let (mut lib, asked) = scene_library();
+        let asset = lib.get(Some("ff7/cloud")).asset.unwrap();
+        lib.begin_scene_frame();
+        let long = "a".repeat(fmv_protocol::NPC_REF_CHARS + 1);
+        for stem in ["", "../clip", "clip.a", "bad stem", long.as_str()] {
+            assert!(lib.get_scene_animation(&asset, stem).is_none());
+        }
+        assert!(asked.borrow().is_empty(), "invalid names never reach the archive");
+        for i in 0..MAX_SCENE_ANIMATIONS {
+            let stem = if i % 2 == 0 { format!("clip{i}") } else { format!("missing{i}") };
+            assert_eq!(lib.get_scene_animation(&asset, &stem).is_some(), i % 2 == 0);
+        }
+        assert!(lib.get_scene_animation(&asset, "overflow").is_none());
+        assert_eq!(asked.borrow().len(), MAX_SCENE_ANIMATIONS);
+        assert_eq!(lib.scene_animations.len(), MAX_SCENE_ANIMATIONS, "failures count toward the cap too");
+
+        lib.begin_scene_frame();
+        assert!(lib.get_scene_animation(&asset, "clip0").is_some());
+        assert!(lib.get_scene_animation(&asset, "missing1").is_none());
+        lib.begin_scene_frame();
+        assert_eq!(lib.scene_animations.len(), 2, "both active successes and active failures survive");
+        assert!(lib.get_scene_animation(&asset, "overflow").is_some(), "discarding inactive keys makes room");
+        assert_eq!(asked.borrow().len(), MAX_SCENE_ANIMATIONS + 1);
+        lib.begin_scene_frame();
+        lib.begin_scene_frame();
+        assert!(lib.scene_animations.is_empty(), "a frame without scene overrides releases all clips");
+        assert_eq!((lib.cached(), lib.cached_npcs()), (1, 0));
+        assert!(Arc::ptr_eq(&asset, &lib.get(Some("ff7/cloud")).asset.unwrap()));
     }
 
     #[test]

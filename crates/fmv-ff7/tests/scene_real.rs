@@ -1552,6 +1552,8 @@ fn reactor_approach_plays_the_crew_paths_and_keeps_wedge_outside() {
         outcome.writes.apply_to(&mut interpreted);
         assert_eq!(interpreted, after, "only the existing step is saved");
         let mut play = ScenePlay::new(&f, &def, &before, 1).unwrap();
+        assert_eq!(play.animation_clip(5, 3), Some("bxja"), "Wedge's authored slot resolves through his loader model");
+        assert_eq!(play.animation_clip(5, u8::MAX), None);
         let beat = play.next(None);
         assert!(matches!(beat.then, Then::End { how: End::Finished, .. }));
         for (entity, start, path) in [
@@ -1568,7 +1570,9 @@ fn reactor_approach_plays_the_crew_paths_and_keeps_wedge_outside() {
             let hides = beat.stage.iter().filter(|event| event.what == Stage::Show { entity, visible: false }).count();
             assert_eq!(hides, usize::from(entity != 5), "only Biggs and Jessie leave");
         }
-        assert!(beat.stage.iter().any(|event| matches!(event.what, Stage::Anim { entity: 5, animation: 3, how: AnimHow::Loop, .. })));
+        assert!(beat.stage.iter().any(|event| matches!(event.what, Stage::Anim {
+            entity: 5, animation: 3, how: AnimHow::Loop, first: None, last: None, speed: 16, divisor: 1,
+        })));
         assert_eq!(play.off_cast(), 0);
     }
     let mesh = f.walkmesh().unwrap();
@@ -1586,7 +1590,12 @@ fn reactor_approach_plays_the_crew_paths_and_keeps_wedge_outside() {
         assert!(scenery_gap(&mesh, f32::from(spot.x), f32::from(spot.y)) >= 1.5*ring);
     }
     let idle = f.model_loader().unwrap().models.into_iter().find(|model| model.hrc_stem() == "bxbe").unwrap().animations[3].stem();
-    assert!(!idle.is_empty());
+    assert_eq!(idle, "bxja");
+    let mut characters = LgpArchive::open_path(data_dir().unwrap().join("field/char.lgp")).unwrap();
+    let clip = fmv_ff7::load_field_animation(&mut characters, &idle).unwrap();
+    assert_eq!((clip.frame_count(), clip.bone_count()), (80, 21));
+    let model = fmv_ff7::load_field_model(&mut characters, "bxbe").unwrap();
+    assert!(model.fits(&clip), "the owned loop fits Wedge's retained skeleton");
     for moment in [0, 8, 9, 10, 12, 26, 27, 33, 32767, 32768, u16::MAX] {
         let story = StoryState::at(moment);
         let saved = story.encode();
@@ -1601,13 +1610,10 @@ fn reactor_approach_plays_the_crew_paths_and_keeps_wedge_outside() {
             let init = ScenePlay::new(&f, &def, &story, 1).unwrap();
             for entity in [3, 4] { assert!(init.initial_stage_events().contains(&Stage::Show { entity, visible: false })); }
             assert!(init.initial_stage_events().contains(&Stage::Place { entity: 5, x: -893, y: -3038, z: Some(491), triangle: Some(2) }));
-            // Initial-stage snapshots retain placement/heading/visibility only. Execute the
-            // init as an ordinary script to observe its authored animation event as well.
-            let mut init_def = def.clone();
-            init_def.setup.clear();
-            init_def.root = vec![Step::Await(ScriptRef::new(5, 0))];
-            let init_beat = ScenePlay::new(&f, &init_def, &story, 1).unwrap().next(None);
-            assert!(init_beat.stage.iter().any(|event| matches!(event.what, Stage::Anim { entity: 5, animation: 3, how: AnimHow::Loop, .. })));
+            assert_eq!(init.animation_clip(5, 3), Some("bxja"));
+            assert!(init.initial_stage_events().iter().any(|event| matches!(event, Stage::Anim {
+                entity: 5, animation: 3, how: AnimHow::Loop, first: None, last: None, speed: 16, divisor: 1,
+            })), "quiet setup retains Wedge's authored default loop");
         }
         assert_eq!(area.npcs_in_phase(&phase), expected, "stable slots and inbound phase only at {moment}");
         assert_eq!(area.phase_key(&StoryState::decode(&saved).unwrap().encode()), Some(phase));

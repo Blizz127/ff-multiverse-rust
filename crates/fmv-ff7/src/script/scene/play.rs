@@ -13,7 +13,7 @@
 //!
 //! [`run_to_end`] is the headless run the server makes to learn those writes from the answers a player gave.
 
-use super::data::{CastMember, SceneDef, Spot};
+use super::data::{CastMember, Look, SceneDef, Spot};
 use super::vm::{Beat, Limits, MoveHow, SceneVars, Stage, Stats, Then, Timed, Vm, Where};
 use crate::field::{FieldFile, ModelLoader, Vertex, Walkmesh};
 use crate::field_direction_to_facing;
@@ -232,6 +232,8 @@ pub struct ScenePlay {
     vm: Vm,
     setup: Stats,
     initial: Vec<Stage>,
+    /// Loader clips only for cast models whose skeleton matches the script's actual binding.
+    animation_clips: BTreeMap<u8, Vec<String>>,
     /// Last authored/resolved height of each actor, carried across beats to select overlapping floors.
     heights: BTreeMap<u8, i16>,
     cast: BTreeSet<u8>,
@@ -296,13 +298,37 @@ impl ScenePlay {
         let ground = Ground::new(mesh);
         let cast: BTreeSet<u8> = def.cast.iter().map(|m| m.entity).collect();
         let initial = Self::initial_stage(&vm, &ground, &def.cast);
+        let animation_clips = Self::animation_clips(field, script, &def.cast);
         let heights = initial.iter().filter_map(|event| match *event {
             Stage::Place { entity, z: Some(z), .. } => Some((entity, z)), _ => None,
         }).collect();
-        Ok(Self { def: def.clone(), section, ground, vm, setup, initial, heights, cast, off_cast: 0, story: story.clone(), ended: None })
+        Ok(Self { def: def.clone(), section, ground, vm, setup, initial, animation_clips, heights, cast, off_cast: 0, story: story.clone(), ended: None })
     }
 
-    /// Where everyone of the cast stands when the scene begins: what the stage scripts left, else the cast's own start.
+    fn animation_clips(field: &FieldFile, script: &FieldScript<'_>, cast: &[CastMember]) -> BTreeMap<u8, Vec<String>> {
+        let mut clips = BTreeMap::new();
+        let Ok(loader) = field.model_loader() else { return clips };
+        // CHAR's operand is a character id, not a loader index. Records are assigned in entity
+        // order. An uncertain declaration can therefore make all following bindings uncertain.
+        for init in script.entity_inits(None) {
+            if init.decode_error.is_some() || init.char_id.as_ref().is_some_and(|c| {
+                c.phase != crate::script::Phase::Init || c.conditional || c.may_be_overridden
+            }) {
+                break;
+            }
+            let Ok(entity) = u8::try_from(init.entity) else { continue };
+            let Some(member) = cast.iter().find(|m| m.entity == entity) else { continue };
+            let Look::Model { hrc, .. } = &member.look else { continue };
+            let Some(record) = init.model_index.and_then(|index| loader.models.get(index)) else { continue };
+            if !hrc.eq_ignore_ascii_case(&record.hrc_stem()) {
+                continue;
+            }
+            clips.insert(entity, record.animations.iter().take(usize::from(u8::MAX) + 1).map(|a| a.stem()).collect());
+        }
+        clips
+    }
+
+    /// The cast's starting presentation, including default loops left by quiet setup.
     fn initial_stage(vm: &Vm, ground: &Ground, cast: &[CastMember]) -> Vec<Stage> {
         let mut out = Vec::new();
         for member in cast {
@@ -318,6 +344,9 @@ impl ScenePlay {
             if let Some(visible) = vm.visible_of(member.entity) {
                 out.push(Stage::Show { entity: member.entity, visible });
             }
+            if let Some(animation) = vm.default_animation_of(member.entity) {
+                out.push(animation.clone());
+            }
         }
         out
     }
@@ -330,9 +359,15 @@ impl ScenePlay {
         &self.ground
     }
 
-    /// Where the cast stands when the scene begins.
+    /// The cast's placement, visibility and default loops when the scene begins.
     pub fn initial_stage_events(&self) -> &[Stage] {
         &self.initial
+    }
+
+    /// A model-loader slot for this exact cast skeleton, resolved from the script being played.
+    /// Appearance substitutions, missing metadata and uncertain model bindings have no mapping.
+    pub fn animation_clip(&self, entity: u8, slot: u8) -> Option<&str> {
+        self.animation_clips.get(&entity)?.get(usize::from(slot)).map(String::as_str)
     }
 
     /// What the stage scripts did (their counters; the scene's own are [`ScenePlay::stats`]).
@@ -445,7 +480,7 @@ impl ScenePlay {
 
 fn stage_entity(stage: &Stage) -> Option<u8> {
     match stage {
-        Stage::Place { entity, .. } | Stage::Move { entity, .. } | Stage::Face { entity, .. } | Stage::Anim { entity, .. } | Stage::Show { entity, .. } => Some(*entity),
+        Stage::Place { entity, .. } | Stage::Move { entity, .. } | Stage::Face { entity, .. } | Stage::Anim { entity, .. } | Stage::AnimSpeed { entity, .. } | Stage::Show { entity, .. } => Some(*entity),
         Stage::Sound { .. } | Stage::Camera(_) => None,
     }
 }

@@ -521,7 +521,7 @@ impl<'a> Measure<'a> {
     }
 
     fn cloud_facing(&self, pos: Pos, facing: f32) -> AvatarPlayer<'static> {
-        AvatarPlayer { who: Who(1), pos, facing, anim: AnimState::Idle, scene_frame: None, appearance: Some("ff7/cloud"), npc: None, tint: [90, 125, 245], own: true, party: false }
+        AvatarPlayer { who: Who(1), pos, facing, anim: AnimState::Idle, scene_frame: None, scene_clip: None, appearance: Some("ff7/cloud"), npc: None, tint: [90, 125, 245], own: true, party: false }
     }
 
     /// A place far to the side of `pos` on the screen at the same depth: a character there is in the
@@ -936,7 +936,7 @@ fn offscreen_real_ff7_md1_1_has_blended_tiles_in_front_and_its_characters_stand_
             pos: n.pos,
             facing: n.facing,
             anim: AnimState::Idle,
-            scene_frame: None,
+            scene_frame: None, scene_clip: None,
             appearance: None,
             npc: Some(NpcRef { model: n.appearance.model.as_str(), idle: n.appearance.idle_animation.as_deref() }),
             tint: [120, 130, 140],

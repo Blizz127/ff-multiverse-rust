@@ -558,8 +558,77 @@ fn replacing_moves_and_placing_actors_keeps_the_same_phase_across_tick_sizes() {
 }
 
 #[test]
+fn authored_loops_start_at_events_pause_and_restart_without_changing_the_base_model() {
+    use fmv_ff7::script::scene::AnimHow;
+    struct Loops(Scripted);
+    impl SceneSource for Loops {
+        fn initial(&self) -> Vec<Stage> { self.0.initial() }
+        fn next(&mut self, answer: Option<usize>) -> Beat { self.0.next(answer) }
+        fn height_at(&self, x: i16, y: i16, triangle: Option<u16>) -> Option<f32> { self.0.height_at(x, y, triangle) }
+        fn animation_clip(&self, entity: u8, slot: u8) -> Option<&str> {
+            if entity != 20 { return None; }
+            match slot { 0 => Some("zero"), 3 => Some("three"), 4 => Some("four"), _ => None }
+        }
+    }
+    let looping = |slot| Stage::Anim { entity: 20, animation: slot, how: AnimHow::Loop, first: None, last: None, speed: 16, divisor: 1 };
+    let mut unsupported = vec![
+        Stage::Anim { entity: 20, animation: 3, how: AnimHow::Once, first: None, last: None, speed: 16, divisor: 1 },
+        Stage::Anim { entity: 20, animation: 3, how: AnimHow::Hold, first: None, last: None, speed: 16, divisor: 1 },
+        Stage::Anim { entity: 20, animation: 3, how: AnimHow::Loop, first: Some(0), last: Some(1), speed: 16, divisor: 1 },
+        Stage::Anim { entity: 20, animation: 3, how: AnimHow::Loop, first: None, last: None, speed: 32, divisor: 1 },
+        Stage::Anim { entity: 20, animation: 3, how: AnimHow::Loop, first: None, last: None, speed: 16, divisor: 2 },
+        Stage::AnimSpeed { entity: 20, speed: 32 },
+    ];
+    unsupported.push(looping(99));
+    for role in [SceneRole::Owner, SceneRole::Watcher] {
+        let mut initial = places();
+        initial.push(looping(0));
+        let mut beats = vec![
+            Beat { stage: vec![timed(10, looping(3))], then: say(20, 20, 20, 1).then },
+            Beat { stage: vec![timed(5, looping(4))], then: say(10, 20, 20, 2).then },
+        ];
+        beats.extend(unsupported.iter().cloned().map(|event| Beat {
+            stage: vec![timed(0, looping(0)), timed(2, event)], then: say(4, 20, 20, 3).then,
+        }));
+        let mut definition = def();
+        definition.cast[1].look = Look::Model { hrc: "model".into(), idle: "base".into() };
+        let run = Run { id: RUN, participants: vec![], role };
+        let mut player = ScenePlayer::new(run, definition, Box::new(Loops(Scripted { initial, beats: beats.into(), asked: Asked::default() })), false);
+        let drawn = |p: &ScenePlayer| {
+            let actors = cast_players(p);
+            let actor = actors.iter().find(|p| p.who == cast_who(20)).unwrap();
+            let npc = actor.npc.unwrap();
+            assert_eq!((npc.model, npc.idle), ("model", Some("base")), "the base mesh/cache key stays the same");
+            actor.scene_clip.map(|(clip, frame)| (clip.to_string(), frame))
+        };
+        let pass = |p: &mut ScenePlayer, step| {
+            if role == SceneRole::Owner { p.key(SceneKey::Confirm); } else { p.on_step(step, None); }
+        };
+        assert_eq!(drawn(&player), Some(("zero".into(), 0.0)), "setup's loop survives into scene playback");
+        player.advance(0.5);
+        assert_eq!(drawn(&player), Some(("three".into(), 5.0)));
+        player.advance(1.0);
+        assert_eq!(drawn(&player), Some(("three".into(), 10.0)));
+        player.advance(10.0);
+        assert_eq!(drawn(&player), Some(("three".into(), 10.0)), "dialogue freezes the authored pose");
+        pass(&mut player, 0);
+        player.advance(6.0 / 30.0);
+        assert_eq!(drawn(&player), Some(("four".into(), 1.0)), "replacing a clip resets its own origin");
+        player.advance(1.0);
+        assert_eq!(drawn(&player), Some(("four".into(), 5.0)));
+        for index in 0..unsupported.len() {
+            pass(&mut player, 1 + index as u32);
+            assert_eq!(drawn(&player), Some(("zero".into(), 0.0)));
+            player.advance(4.0 / 30.0);
+            assert_eq!(drawn(&player), None, "unsupported/unresolved event {index} clears the previous loop");
+        }
+        assert_eq!(player.counts().anims_skipped, unsupported.len() as u32);
+    }
+}
+
+#[test]
 fn what_the_stage_cannot_show_is_counted_and_the_camera_is_recorded_and_given_back_at_the_end() {
-    let anim = Stage::Anim { entity: 20, animation: 2, how: fmv_ff7::script::scene::AnimHow::Once, first: None, last: None, speed: 16 };
+    let anim = Stage::Anim { entity: 20, animation: 2, how: fmv_ff7::script::scene::AnimHow::Once, first: None, last: None, speed: 16, divisor: 1 };
     let beats = vec![
         Beat {
             stage: vec![timed(0, anim), timed(0, Stage::Camera(CameraOp::Follow { entity: 20 })), timed(0, Stage::Place { entity: 77, x: 0, y: 0, z: None, triangle: None })],
@@ -864,7 +933,7 @@ fn the_server_echoing_our_own_entity_is_counted_for_the_bots_control_check() {
 // ---- what is drawn ---------------------------------------------------------------------------------------------------
 
 fn avatar(id: u64, x: f32, appearance: &'static str, own: bool) -> AvatarPlayer<'static> {
-    AvatarPlayer { who: Who(id), pos: Pos::new(x, 0.0, 5.0), facing: 1.0, anim: AnimState::Walk, scene_frame: None, appearance: Some(appearance), npc: None, tint: [9, 9, 9], own, party: false }
+    AvatarPlayer { who: Who(id), pos: Pos::new(x, 0.0, 5.0), facing: 1.0, anim: AnimState::Walk, scene_frame: None, scene_clip: None, appearance: Some(appearance), npc: None, tint: [9, 9, 9], own, party: false }
 }
 
 #[test]

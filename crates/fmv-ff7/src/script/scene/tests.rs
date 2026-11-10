@@ -418,6 +418,60 @@ fn animations_come_out_with_how_they_play_and_the_script_waits_where_the_engine_
 }
 
 #[test]
+fn animation_literal_speed_is_preserved_separately_without_changing_waits() {
+    let a = vec![vec![0xA2, 3, 2], vec![0xBD, 0, 32, 0], vec![0xAF, 4, 3], vec![0xA2, 5, 0], message(0, 0)];
+    let section = script(vec![("a", vec![(1, a)])], texts(1));
+    let (beats, vm) = run_root(&section, start(0, 1), &[]);
+    let anims: Vec<_> = stage(&beats).into_iter().filter_map(|(at, event)| match event {
+        Stage::Anim { animation, speed, divisor, .. } => Some((at, animation, speed, divisor)), _ => None,
+    }).collect();
+    assert_eq!(anims, [(0, 3, 16, 2), (0, 4, 32, 3), (8, 5, 32, 0)]);
+    assert_eq!(windows(&beats)[0].at, 8, "the existing ASPED-based wait is unchanged by literal metadata");
+    assert!(matches!(vm.default_animation_of(0), Some(Stage::Anim { animation: 5, speed: 32, divisor: 0, .. })));
+    assert!(vm.writes().is_empty());
+}
+
+#[test]
+fn asped_invalidates_setup_and_runtime_loops_until_a_fresh_animation() {
+    for speed in [0u16, 16, 300, u16::MAX] {
+        let asped = cat(&[vec![0xBD, 0], speed.to_le_bytes().to_vec()]);
+        let section = script(vec![("a", vec![
+            (3, vec![vec![0xA2, 3, 1], wait(7), asped.clone()]),
+            (1, vec![vec![0xA2, 4, 1], wait(11), asped, message(0, 0), vec![0xA2, 5, 1]]),
+        ])], texts(1));
+        let parsed = FieldScript::parse(&section).unwrap();
+        let mut vm = Vm::new(SceneVars::new(StoryState::at(4), &[]), 1, Limits::default());
+        vm.setup(&parsed, &[ScriptRef::new(0, 3)]);
+        assert_eq!(vm.default_animation_of(0), None, "setup ASPED clears the old default even at normal speed");
+        vm.begin(start(0, 1));
+        let beat = vm.resume(&parsed, None);
+        assert!(matches!(beat.then, Then::Window(Window { at: 11, .. })));
+        assert!(matches!(beat.stage.first(), Some(Timed { at: 0, what: Stage::Anim { animation: 4, .. } })));
+        assert_eq!(beat.stage.last(), Some(&Timed { at: 11, what: Stage::AnimSpeed { entity: 0, speed } }), "metadata retains the full word, including zero");
+        assert_eq!(vm.default_animation_of(0), None, "runtime ASPED also clears the active default");
+        assert!(matches!(vm.resume(&parsed, None).then, Then::End { at: 0, how: End::Finished }));
+        assert!(matches!(vm.default_animation_of(0), Some(Stage::Anim { animation: 5, how: AnimHow::Loop, .. })), "a fresh DFANM can establish a new default");
+        assert!(vm.writes().is_empty());
+    }
+}
+
+#[test]
+fn constant_asped_loop_parks_without_holding_the_scene_open() {
+    let background = vec![vec![0xBD, 0, 16, 0], vec![0x12, 4]];
+    let speaker = vec![wait(5), message(0, 0)];
+    let section = script(vec![("background", vec![(1, background)]), ("speaker", vec![(1, speaker)])], texts(1));
+    let root = vec![Step::Start(ScriptRef::new(0, 1)), Step::Start(ScriptRef::new(1, 1))];
+    let vm = Vm::new(SceneVars::new(StoryState::at(4), &[]), 1, Limits { steps: 128, ..Limits::default() });
+    let (beats, vm) = run_with(&section, root, &[], vm);
+    assert_eq!(dialogs_of(&beats), [0]);
+    assert_eq!(windows(&beats)[0].at, 5);
+    assert_eq!(end_of(&beats), End::Finished, "constant ASPED metadata must not exhaust the instruction budget");
+    assert!(vm.stats().parked >= 1, "the unchanged background loop still parks");
+    assert!(stage(&beats).iter().any(|(_, event)| *event == Stage::AnimSpeed { entity: 0, speed: 16 }));
+    assert!(vm.writes().is_empty());
+}
+
+#[test]
 fn camera_moves_are_recorded_and_the_script_can_wait_for_a_scroll() {
     let a = vec![cat(&[vec![0x66, 0x00, 0x00], words(&[60, -20]), 30u16.to_le_bytes().to_vec()]), vec![0x67], message(0, 0), vec![0x65]];
     let section = script(vec![("a", vec![(1, a)])], texts(1));
@@ -957,6 +1011,69 @@ fn the_stage_scripts_place_the_cast_and_their_loops_do_not_hold_the_scene() {
     let beat = play.next(None);
     assert!(matches!(beat.then, Then::Window(_)));
     assert!(matches!(play.next(None).then, Then::End { how: End::Finished, .. }));
+}
+
+#[test]
+fn initial_stage_retains_only_the_last_loop_not_later_once_or_hold_animations() {
+    let section = script(vec![
+        ("a", vec![(3, vec![vec![0xA2, 3, 1], vec![0xBD, 0, 32, 0], vec![0xA2, 4, 2]])]),
+        ("b", vec![(3, vec![vec![0xA2, 3, 1], vec![0xAE, 4, 1]])]),
+        ("c", vec![(3, vec![vec![0xA2, 3, 1], vec![0xBA, 4, 1]])]),
+        ("offcast", vec![(3, vec![vec![0xA2, 7, 1]])]),
+    ], vec![]);
+    let field = field_of(section);
+    let mut def = demo_def(vec![member(0, "aya"), member(1, "bo"), member(2, "cy")], Vec::new());
+    def.setup = (0..4).map(|entity| ScriptRef::new(entity, 3)).collect();
+    let mut play = ScenePlay::new(&field, &def, &StoryState::at(4), 1).unwrap();
+    let initial: Vec<_> = play.initial_stage_events().iter().filter(|event| matches!(event, Stage::Anim { .. })).cloned().collect();
+    assert_eq!(initial, [Stage::Anim { entity: 0, animation: 4, how: AnimHow::Loop, first: None, last: None, speed: 32, divisor: 2 }]);
+    let beat = play.next(None);
+    assert!(beat.stage.is_empty(), "quiet setup animations are a snapshot, not replayed events");
+    assert!(matches!(beat.then, Then::End { at: 0, how: End::Finished }));
+    assert!(play.writes().is_story_neutral());
+}
+
+#[test]
+fn animation_slots_use_the_actual_script_binding_and_only_the_matching_cast_model() {
+    let section = script(vec![
+        ("director", vec![]), ("npc", vec![(0, vec![vec![0xA1, 99]])]),
+        ("canon", vec![(0, vec![vec![0xA1, 0]])]), ("wrong", vec![(0, vec![vec![0xA1, 0]])]),
+        ("plain", vec![]), ("missing", vec![(0, vec![vec![0xA1, 0]])]),
+    ], vec![]);
+    let spec = FieldSpec { overrides: vec![(0, section)], models: vec![
+        LoaderModelSpec::new("npc.char", "ABCD.HRC", &["AAFE.aki", "BBBB.yos"]),
+        LoaderModelSpec::new("canon.char", "EFGH.HRC", &["EEEE.aki"]),
+        LoaderModelSpec::new("wrong.char", "IJKL.HRC", &["IIII.aki"]),
+    ], ..FieldSpec::default() };
+    let field = FieldFile::parse(spec.build()).unwrap();
+    let model = |entity, hrc: &str| CastMember { look: Look::Model { hrc: hrc.into(), idle: "aafe".into() }, ..member(entity, "actor") };
+    let def = demo_def(vec![model(1, "AbCd"), member(2, "canon"), model(3, "zzzz"), model(4, "abcd"), model(5, "ijkl")], Vec::new());
+    let play = ScenePlay::new(&field, &def, &StoryState::at(4), 1).unwrap();
+    assert_eq!(play.animation_clip(1, 1), Some("bbbb"), "CHAR 99 still receives loader record 0");
+    assert_eq!(play.animation_clip(1, 2), None, "out-of-range slot");
+    for entity in [0, 2, 3, 4, 5, u8::MAX] {
+        assert_eq!(play.animation_clip(entity, 0), None, "off-cast, appearance, wrong skeleton, absent binding or absent record: {entity}");
+    }
+    // The replacement removes npc's CHAR, moving the remaining records up one. Lookup must use
+    // that script's bindings, not the original entity's old record or its CHAR operand.
+    let replacement = script(vec![
+        ("director", vec![]), ("npc", vec![]), ("canon", vec![(0, vec![vec![0xA1, 99]])]),
+        ("wrong", vec![(0, vec![vec![0xA1, 0]])]), ("plain", vec![]), ("missing", vec![(0, vec![vec![0xA1, 0]])]),
+    ], vec![]);
+    let replacement = ScenePlay::with_script_section(&field, &def, &StoryState::at(4), 1, &replacement).unwrap();
+    assert_eq!(replacement.animation_clip(1, 0), None);
+    assert_eq!(replacement.animation_clip(5, 0), Some("iiii"));
+    assert!(replacement.writes().is_story_neutral());
+    let uncertain = script(vec![
+        ("director", vec![]), ("npc", vec![(0, vec![if_ub(3, 9, 0, 0, &[0xA1, 99])])]),
+        ("canon", vec![(0, vec![vec![0xA1, 0]])]), ("wrong", vec![(0, vec![vec![0xA1, 0]])]),
+        ("plain", vec![]), ("missing", vec![(0, vec![vec![0xA1, 0]])]),
+    ], vec![]);
+    let mut uncertain_def = def.clone();
+    uncertain_def.cast[2] = model(3, "ijkl");
+    let uncertain = ScenePlay::with_script_section(&field, &uncertain_def, &StoryState::at(4), 1, &uncertain).unwrap();
+    assert_eq!(uncertain.animation_clip(1, 0), None, "conditional CHAR has no certain loader binding");
+    assert_eq!(uncertain.animation_clip(3, 0), None, "an uncertain earlier declaration also makes later loader indices uncertain");
 }
 
 #[test]

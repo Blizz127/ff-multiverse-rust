@@ -10,8 +10,8 @@
 //!   toward the target the whole way). A second move of the same actor first finishes the first.
 //! * `Face` turns it (the short way round), at once or over the frames it says.
 //! * `Show` hides or shows it.
-//! * `Anim` is **not played**: the cast are the playable models, which have a standing, a walking and a running clip and
-//!   none of the scripts' clips. The event is counted ([`Counts::anims_skipped`]), never guessed at.
+//! * The player resolves supported `Anim` loops against the actor's exact field model; their clips follow scene time.
+//!   Other animations clear that loop and are counted ([`Counts::anims_skipped`]), never guessed at.
 //! * `Sound` is routed separately by the scene player to its cancellable audio channel.
 //! * `Camera` is **recorded** ([`CameraState`]) and not shown: the field's own camera stays where it is.
 //!
@@ -37,7 +37,7 @@ pub enum CameraState {
 /// What the stage could not show, and said so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Counts {
-    /// `Anim` events of cast members: the clips are not played.
+    /// Unsupported or unresolved `Anim` events of cast members.
     pub anims_skipped: u32,
     /// Camera events recorded and not shown.
     pub camera_ops: u32,
@@ -60,6 +60,12 @@ struct Turn {
     to: f32,
     frames: f32,
     elapsed: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct LoopAnimation {
+    clip: String,
+    frame: f32,
 }
 
 /// How far through a motion of `frames` frames it is after `elapsed` of them (0 to 1; no frames is done).
@@ -103,11 +109,12 @@ pub struct Actor {
     turn: Option<Turn>,
     /// Scene frames actually spent walking, retained across consecutive movement segments.
     walked_frames: f32,
+    animation: Option<LoopAnimation>,
 }
 
 impl Actor {
     fn new(entity: u8) -> Self {
-        Self { entity, pos: None, triangle: None, heading: 0.0, visible: true, walk: None, turn: None, walked_frames: 0.0 }
+        Self { entity, pos: None, triangle: None, heading: 0.0, visible: true, walk: None, turn: None, walked_frames: 0.0, animation: None }
     }
 
     /// The script entity this actor plays.
@@ -138,6 +145,11 @@ impl Actor {
 
     pub fn walked_frames(&self) -> f32 { self.walked_frames }
 
+    pub fn animation(&self) -> Option<(&str, f32)> {
+        if self.walk.is_some() { return None; }
+        self.animation.as_ref().map(|a| (a.clip.as_str(), a.frame))
+    }
+
     /// Whether it is seen at all: it has a place and is not hidden.
     pub fn shown(&self) -> bool {
         self.visible && self.pos.is_some()
@@ -149,8 +161,12 @@ impl Actor {
     }
 
     fn advance(&mut self, frames: f32) {
+        let moving_frames = self.walk.map_or(0.0, |w| frames.min((w.frames - w.elapsed).max(0.0)));
         self.advance_walk(frames);
         self.advance_turn(frames);
+        if frames.is_finite() {
+            if let Some(animation) = &mut self.animation { animation.frame += (frames - moving_frames).max(0.0); }
+        }
     }
 
     fn advance_walk(&mut self, frames: f32) {
@@ -251,6 +267,13 @@ impl Cast {
         }
     }
 
+    /// Set a resolved normal-speed full-range loop without changing the actor's model or movement.
+    pub fn apply_loop(&mut self, entity: u8, clip: &str, overshoot: f32) {
+        let Some(actor) = self.actors.get_mut(&entity) else { return self.off_cast() };
+        let frame = if overshoot.is_finite() { overshoot.max(0.0) } else { 0.0 };
+        actor.animation = Some(LoopAnimation { clip: clip.to_string(), frame });
+    }
+
     /// Show one event of the interpreter. `overshoot` is how many frames ago it should have happened (the clock ran past
     /// its time since the last call): the motion it starts is that far along already. `height` is the ground's height, for
     /// the events that do not carry one.
@@ -275,6 +298,9 @@ impl Cast {
             }
             Stage::Move { entity, from, x, y, z, triangle, frames, how } => {
                 let Some(actor) = self.actors.get_mut(entity) else { return self.off_cast() };
+                // DFANM is a standing default, not the actor's walk/jump/ladder animation.
+                // Restart it when movement ends; any unused part of a tick advances the idle.
+                if let Some(animation) = &mut actor.animation { animation.frame = 0.0; }
                 // A second move of the same actor starts where the first one was going.
                 if let Some(walk) = actor.walk.take() {
                     actor.pos = Some(walk.to);
@@ -316,10 +342,19 @@ impl Cast {
                 actor.visible = *visible;
             }
             Stage::Anim { entity, .. } => {
-                if self.actors.contains_key(entity) {
+                if let Some(actor) = self.actors.get_mut(entity) {
+                    actor.animation = None;
                     self.counts.anims_skipped = self.counts.anims_skipped.saturating_add(1);
                 } else {
                     self.off_cast();
+                }
+            }
+            Stage::AnimSpeed { entity, .. } => {
+                let Some(actor) = self.actors.get_mut(entity) else { return self.off_cast() };
+                // Dynamic speed changes are outside the supported normal-speed loop subset.
+                // A fresh DFANM can establish another supported loop explicitly.
+                if actor.animation.take().is_some() {
+                    self.counts.anims_skipped = self.counts.anims_skipped.saturating_add(1);
                 }
             }
         }
@@ -345,6 +380,24 @@ mod tests {
 
     fn walk(entity: u8, x: i16, y: i16, frames: u32) -> Stage {
         Stage::Move { entity, from: None, x, y, z: None, triangle: None, frames, how: MoveHow::Walk }
+    }
+
+    #[test]
+    fn standing_loops_yield_to_movement_and_restart_after_arrival() {
+        for how in [MoveHow::Walk, MoveHow::Jump, MoveHow::Ladder] {
+            let mut cast = Cast::new([1]);
+            cast.apply(&place(1, 0, 0), 0.0, &flat);
+            cast.apply_loop(1, "idle", 0.0);
+            cast.advance(7.0);
+            assert_eq!(cast.actor(1).unwrap().animation(), Some(("idle", 7.0)));
+            cast.apply(&Stage::Move { entity: 1, from: None, x: 100, y: 0, z: None, triangle: None, frames: 10, how }, 0.0, &flat);
+            assert_eq!(cast.actor(1).unwrap().animation(), None);
+            cast.advance(4.0);
+            assert_eq!(cast.actor(1).unwrap().animation(), None, "standing default must not replace a moving pose");
+            cast.advance(9.0);
+            assert_eq!(cast.actor(1).unwrap().animation(), Some(("idle", 3.0)), "only time after arrival advances the restarted idle");
+            assert_eq!(cast.actor(1).unwrap().pos(), Some([100.0, 0.0, 7.0]));
+        }
     }
 
     #[test]
@@ -505,7 +558,7 @@ mod tests {
     #[test]
     fn the_clips_are_counted_not_played_and_strangers_are_counted_too() {
         let mut cast = Cast::new([1]);
-        let anim = |entity| Stage::Anim { entity, animation: 3, how: AnimHow::Once, first: None, last: None, speed: 16 };
+        let anim = |entity| Stage::Anim { entity, animation: 3, how: AnimHow::Once, first: None, last: None, speed: 16, divisor: 1 };
         cast.apply(&anim(1), 0.0, &flat);
         cast.apply(&anim(1), 0.0, &flat);
         cast.apply(&anim(9), 0.0, &flat);

@@ -15,8 +15,9 @@
 //! loader) explicitly and never touch it.
 
 use fmv_ff7::lgp::LgpArchive;
-use fmv_ff7::model::{load_field_animation, load_field_model, ModelError};
+use fmv_ff7::model::{load_field_animation, load_field_model, ModelBone, ModelError};
 use fmv_ff7::playable::{load_playable, Character, PlayableModel};
+use fmv_ff7::FieldAnimation;
 use std::fs::File;
 use std::io::{Read, Seek};
 use std::path::PathBuf;
@@ -47,6 +48,13 @@ pub trait CharacterLoader {
         let _ = (model, idle);
         Err("this loader has no non-player models".to_string())
     }
+
+    /// A scene clip that fits the character's retained skeleton. This loads animation data only:
+    /// it must never replace the character's model to make a clip fit. The default has no clips.
+    fn load_scene_animation(&mut self, stem: &str, bones: &[ModelBone]) -> Result<FieldAnimation, String> {
+        let _ = (stem, bones);
+        Err("this loader has no scene animations".to_string())
+    }
 }
 
 /// A non-player character standing: the skeleton `model` with the clip `idle`, which must fit it.
@@ -60,6 +68,18 @@ pub fn load_standing<R: Read + Seek>(lgp: &mut LgpArchive<R>, model: &str, idle:
         });
     }
     Ok(Character { appearance: NON_PLAYABLE, model: skeleton, idle: clip.clone(), walk: clip.clone(), run: clip })
+}
+
+/// Read only a clip, checking it against the skeleton already held by the renderer.
+fn load_fitting_animation<R: Read + Seek>(lgp: &mut LgpArchive<R>, stem: &str, bones: &[ModelBone]) -> Result<FieldAnimation, ModelError> {
+    let clip = load_field_animation(lgp, stem)?;
+    if !clip.fits(bones) {
+        return Err(ModelError::Invalid {
+            what: "scene animation",
+            why: format!("the clip drives {} bones but the retained skeleton has {}", clip.bone_count(), bones.len()),
+        });
+    }
+    Ok(clip)
 }
 
 /// Reads characters from a `char.lgp` on disk, read-only. The archive is opened (its table of
@@ -115,6 +135,19 @@ impl CharacterLoader for LgpLoader {
             }
         }
     }
+
+    fn load_scene_animation(&mut self, stem: &str, bones: &[ModelBone]) -> Result<FieldAnimation, String> {
+        let archive = self.archive()?;
+        match load_fitting_animation(archive, stem, bones) {
+            Ok(clip) => Ok(clip),
+            Err(_) => {
+                // A layered clip can be damaged or belong to another skeleton. Retry just the
+                // original clip, still against the same retained bones; never reload the model.
+                let mut original = LgpArchive::open_path(&self.path).map_err(|e| e.to_string())?;
+                load_fitting_animation(&mut original, stem, bones).map_err(|e| e.to_string())
+            }
+        }
+    }
 }
 
 static REMEMBERED: Mutex<Option<PathBuf>> = Mutex::new(None);
@@ -156,5 +189,61 @@ mod tests {
         std::fs::write(&path, b"this is not an LGP archive").unwrap();
         let cloud = resolve_appearance("ff7/cloud").unwrap();
         assert!(LgpLoader::new(&path).load(&cloud).is_err());
+    }
+
+    /// Invented animation bytes, with a distinctive frame count and no changing angles.
+    fn animation_bytes(frames: usize, bones: usize) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for word in [1, frames as u32, bones as u32] {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        bytes.extend_from_slice(&[1, 0, 2, 0]);
+        bytes.extend_from_slice(&[0; 20]);
+        bytes.resize(bytes.len() + frames * (24 + bones * 12), 0);
+        bytes
+    }
+
+    /// One clip in an archive with no skeleton, mesh, or texture entries to load as a replacement.
+    fn animation_archive(bytes: &[u8]) -> Vec<u8> {
+        let mut name = [0u8; 20];
+        name[..6].copy_from_slice(b"clip.a");
+        let offset = 16 + 27 + 3600 + 2;
+        let mut archive = b"\0\0SQUARESOFT".to_vec();
+        archive.extend_from_slice(&1u32.to_le_bytes());
+        archive.extend_from_slice(&name);
+        archive.extend_from_slice(&(offset as u32).to_le_bytes());
+        archive.push(0x0e);
+        archive.extend_from_slice(&0u16.to_le_bytes());
+        archive.resize(offset, 0);
+        archive.extend_from_slice(&name);
+        archive.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        archive.extend_from_slice(bytes);
+        archive.extend_from_slice(b"FINAL FANTASY7");
+        archive
+    }
+
+    #[test]
+    fn scene_animation_fallback_checks_the_retained_skeleton_without_loading_a_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("char.lgp");
+        std::fs::write(&path, animation_archive(&animation_bytes(2, 1))).unwrap();
+        let bone = ModelBone { name: "retained".to_string(), parent: None, length: 1.0 };
+        for (layered, retained_count, expected_frames) in [
+            (animation_bytes(3, 1), 1, Some(3)), // The compatible layered clip wins.
+            (b"broken animation".to_vec(), 1, Some(2)), // Bad decode retries the original.
+            (animation_bytes(3, 2), 1, Some(2)), // Bad fit retries the original.
+            (animation_bytes(3, 2), 3, None), // Neither clip fits this retained skeleton.
+            (animation_bytes(4, 0), 1, Some(4)), // The supported root-only null-model clip.
+        ] {
+            let mut archive = LgpArchive::open_path(&path).unwrap();
+            archive.set_overlay(move |name| (name == "clip.a").then(|| Ok(layered.clone())));
+            let mut loader = LgpLoader { path: path.clone(), archive: Some(archive) };
+            let bones = vec![bone.clone(); retained_count];
+            let result = loader.load_scene_animation("clip", &bones);
+            assert_eq!(result.as_ref().ok().map(FieldAnimation::frame_count), expected_frames, "{retained_count} retained bones: {result:?}");
+            if let Ok(clip) = result {
+                assert!(clip.fits(&bones));
+            }
+        }
     }
 }

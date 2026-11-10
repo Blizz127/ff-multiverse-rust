@@ -1417,7 +1417,7 @@ again at the next login (`fmv_ff7::script::scene::STORY_ENTRIES`, `SceneHost::en
 player joins like everyone and is sent on through the ordinary area handshake. Without it an account at 36 could never
 reach the story again (`md8_1` has no way back and only the scene jumps there).
 
-**Not done here:** the opening movie of the street scene is skipped, scripted animation clips are not played (the cast
+**Not done here:** the opening movie of the street scene is skipped, scripted one-shot animation clips are not played (the cast
 walks and stands), and past the street nothing of the story is offered yet (`md8_2` onwards are plain fields).
 
 ```
@@ -1596,6 +1596,14 @@ A cast member's default walk and idle animation follows scene time, so a dialogu
 its position. Resuming keeps the walking phase. Moves, turns and placements run in event order even during a long frame;
 stale sound effects remain suppressed. Ordinary field players and NPCs keep their normal animation clocks. Focused CPU
 pose checks cover this path; rendered playback is untested.
+Field-model cast members can also use their script's full-length default loops (`DFANM`, ASPED 16 and literal speed 1),
+including Wedge's loop after the `nrthmk` approach. The clip slot must belong to that entity's exact model-loader skeleton;
+canonical appearance substitutions keep their existing clips. A separate bounded clip cache preserves the base mesh and
+checks skeleton compatibility, falling back to the usual pose if the clip cannot load. Standing loops yield during movement,
+restart after arrival, and freeze with dialogue. Once/Hold, cropped ranges, other rates and later ASPED changes clear the
+override until a supported DFANM arrives. No game bytes, protocol or saved state are added. The normal-rate interpretation
+follows the [Q-Gears DFANM reconstruction](https://github.com/Akari1982/q-gears_reverse/blob/e0fabf7e121818e5abe2f873e34a07d0eb32742d/ffvii/DISC/FIELD/FIELD.BIN_event_code_entity.cpp#L72-L95);
+exact PC visual timing and real mod overlays remain untested.
 A watcher opens window 0 itself and every later one only when the owner's `SceneStep` for the one before arrives, so the two screens
 show the same line at the same time. A client that cannot build the scene (no field data) tells the server at once (`SceneEnd`
 skipped, or `SceneLeave`), so a player is never left held.
@@ -1605,8 +1613,8 @@ with a refusal), and the headless bot flags `--scene-preview <ID>` (preview, the
 waits until its party is formed), `--scene-watchers <N>` (the owner waits until N party members are in its field), `--scene-watch` (a
 watcher: never presses OK), `--scene-answer <LINE>` and `--scene-wait-secs <N>`. A scene bot prints one `scene line index=.. opener=..
 speaker=.. dialog=.. asks=.. answer=..` per window moved past, `scene started`, `scene ended` and `scene control restored moved=<bool>`:
-ids and counts only, never text. Camera scrolls and scripted animation clips are carried by the interpreter and **not shown** (the
-view stays on the whole field picture, actors stand idle or walk): see the gaps below.
+ids and counts only, never text. Camera scrolls are recorded but not shown; unsupported animation forms are counted and use
+the actor's usual clips. The view stays on the whole field picture: see the gaps below.
 
 ### The debug preview (`--debug-scene-preview`, OFF by default)
 
@@ -1659,7 +1667,7 @@ ranks the floor for them. The pictures contain game art: they stay out of the re
   hook into it (see "What the server does"); the rest of the byte (`Var[3][212]`'s other bits) and Tifa's affection points
   (`Var[1][4]`) are the field's own and are not carried.
 * **A window pauses the whole scene** (the engine pauses only the script that opened it), durations are estimates (a walk's
-  length from the move speed, a clip's from its range), camera scrolls and scripted animation clips are not shown, and the cast
+  length from the move speed, a clip's from its range), camera scrolls and the bar's scripted character poses are not shown, and the cast
   is Cloud and Tifa: the bar's other characters (Marlene, the patrons) are not drawn.
 * **The interpreter does not know** (counted, never guessed, over every script slot of the game): `AXYZI`, `GETAXY`,
   `GETDIR` (read-backs of a place or a direction), `PDIRA`, `PTURA`, `PXYZI` (the party's own), `DSKCG`, `RDMSD`. (`GETAI` reads a
