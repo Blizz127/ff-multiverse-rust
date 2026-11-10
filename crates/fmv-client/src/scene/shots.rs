@@ -1327,7 +1327,7 @@ struct Candidate {
 }
 
 fn player(tint: [u8; 3], who: Who, look: &'static str, (pos, facing): (Pos, f32), own: bool) -> AvatarPlayer<'static> {
-    AvatarPlayer { who, pos, facing, anim: AnimState::Idle, appearance: Some(look), npc: None, tint, own, party: false }
+    AvatarPlayer { who, pos, facing, anim: AnimState::Idle, scene_frame: None, appearance: Some(look), npc: None, tint, own, party: false }
 }
 
 /// The spot's place on the floor, at the ground's height there.

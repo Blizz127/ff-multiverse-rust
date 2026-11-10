@@ -93,6 +93,8 @@ pub struct AvatarPlayer<'a> {
     pub pos: Pos,
     pub facing: f32,
     pub anim: AnimState,
+    /// Explicit clip frame from a scene's paused clock. Ordinary players/NPCs use render time.
+    pub scene_frame: Option<f32>,
     /// The look the avatar names (untrusted text; only looked up in the table).
     pub appearance: Option<&'a str>,
     /// `Some` for a non-player character of the area instead of a player: the model its data
@@ -329,12 +331,17 @@ impl Avatars {
                 continue;
             };
             let clip = asset.character.animation(p.anim);
-            let playback = if p.npc.is_some() && p.anim == AnimState::Idle {
-                self.animator.advance_npc(p.who, dt, clip.frame_count())
+            let frame = if let Some(frame) = p.scene_frame {
+                // Canon player idles are still poses. Cast NPC idles and walking clips follow
+                // scene time, including a window that freezes an actor halfway through a move.
+                if !frame.is_finite() || (p.npc.is_none() && p.anim == AnimState::Idle) { 0.0 }
+                else { frame.max(0.0).rem_euclid(clip.frame_count().max(1) as f32) }
+            } else if p.npc.is_some() && p.anim == AnimState::Idle {
+                self.animator.advance_npc(p.who, dt, clip.frame_count()).frame
             } else {
-                self.animator.advance(p.who, p.anim, dt, clip.frame_count())
+                self.animator.advance(p.who, p.anim, dt, clip.frame_count()).frame
             };
-            let Some(pose) = clip.pose_at(&asset.character.model.bones, playback.frame) else {
+            let Some(pose) = clip.pose_at(&asset.character.model.bones, frame) else {
                 markers.push(i);
                 continue;
             };
@@ -420,7 +427,7 @@ pub(crate) mod tests {
     }
 
     fn player(id: u64, pos: Pos, facing: f32, anim: AnimState) -> AvatarPlayer<'static> {
-        AvatarPlayer { who: Who(id), pos, facing, anim, appearance: Some("ff7/cloud"), npc: None, tint: [10, 200, 30], own: false, party: false }
+        AvatarPlayer { who: Who(id), pos, facing, anim, scene_frame: None, appearance: Some("ff7/cloud"), npc: None, tint: [10, 200, 30], own: false, party: false }
     }
 
     fn avatars(fail: Vec<&'static str>) -> (Avatars, Rc<RefCell<Vec<&'static str>>>) {
@@ -681,6 +688,48 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn scene_clip_frames_freeze_cpu_poses_independently_of_render_time() {
+        use crate::avatar::source::CharacterLoader;
+        use fmv_ff7::playable::{Character, PlayableModel};
+        struct Moving;
+        impl CharacterLoader for Moving {
+            fn load(&mut self, model: &PlayableModel) -> Result<Character, String> {
+                let mut character = crate::avatar::library::tests::character(*model, 1, 2, 1);
+                let mut bytes = vec![0u8; 108];
+                bytes[0..4].copy_from_slice(&1u32.to_le_bytes());
+                bytes[4..8].copy_from_slice(&2u32.to_le_bytes());
+                bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+                bytes[12..15].copy_from_slice(&[1, 0, 2]);
+                bytes[52..56].copy_from_slice(&5f32.to_le_bytes());
+                bytes[88..92].copy_from_slice(&5f32.to_le_bytes());
+                bytes[84..88].copy_from_slice(&4f32.to_le_bytes());
+                character.walk = fmv_ff7::FieldAnimation::parse(&bytes).unwrap();
+                Ok(character)
+            }
+            fn load_npc(&mut self, _model: &str, _idle: &str) -> Result<Character, String> {
+                let mut character = self.load(&fmv_ff7::playable::resolve_appearance_or_default(None))?;
+                character.idle = character.walk.clone();
+                Ok(character)
+            }
+        }
+        let (view, stage) = (view(), stage());
+        for mut actor in [player(1, Pos::new(0.0, 0.0, 0.0), 0.0, AnimState::Walk), npc(2, Pos::new(0.0, 0.0, 0.0), 0.0)] {
+            let mut avatars = Avatars::new(AvatarLibrary::new(Box::new(Moving)));
+            actor.scene_frame = Some(0.0);
+            let first = avatars.frame(&view, &stage, &[actor], 0.0).frame.models[0].positions.clone();
+            assert_eq!(avatars.frame(&view, &stage, &[actor], 0.1).frame.models[0].positions, first);
+            actor.scene_frame = Some(1.0);
+            assert_ne!(avatars.frame(&view, &stage, &[actor], 0.0).frame.models[0].positions, first, "scene time selects a different pose");
+            for frame in [0.0, f32::NAN, f32::INFINITY, -5.0] {
+                actor.scene_frame = Some(frame);
+                assert_eq!(avatars.frame(&view, &stage, &[actor], 1.7).frame.models[0].positions, first);
+            }
+            actor.scene_frame = None;
+            assert_ne!(avatars.frame(&view, &stage, &[actor], 0.1).frame.models[0].positions, first, "ordinary player/NPC animation still uses render time");
+        }
+    }
+
+    #[test]
     fn ground_marks_show_the_tint_the_own_outline_and_the_party_ring() {
         let (mut avatars, _) = avatars(vec![]);
         let (view, stage) = (view(), stage());
@@ -738,6 +787,7 @@ pub(crate) mod tests {
             pos,
             facing,
             anim: AnimState::Idle,
+            scene_frame: None,
             appearance: None,
             npc: Some(NpcRef { model: "agyb", idle: Some("acfe") }),
             tint: [120, 130, 140],

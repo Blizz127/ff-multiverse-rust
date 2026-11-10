@@ -155,6 +155,8 @@ pub struct CastDraw<'a> {
     pub facing: f32,
     /// Walking now (the avatar's walk clip), standing otherwise.
     pub moving: bool,
+    /// Default clip frame from scene time, frozen while a window holds the scene.
+    pub frame: f32,
 }
 
 /// What comes after the stage events that are due.
@@ -177,6 +179,8 @@ pub struct ScenePlayer {
     cast: Cast,
     /// Frames since the last window opened.
     clock: f32,
+    /// Total advancing scene time across windows; render time never advances cast animation.
+    elapsed_frames: f32,
     /// The stage events of the beat in hand that have not happened yet, in order.
     due: VecDeque<Timed<Stage>>,
     next: Next,
@@ -248,6 +252,7 @@ impl ScenePlayer {
             source,
             cast,
             clock: 0.0,
+            elapsed_frames: 0.0,
             due: VecDeque::new(),
             next: Next::Pull(None),
             panel: None,
@@ -352,7 +357,8 @@ impl ScenePlayer {
             .filter_map(|a| {
                 let member = self.def.member(a.entity())?;
                 let [x, y, z] = a.pos()?;
-                Some(CastDraw { entity: a.entity(), look: &member.look, pos: Pos::new(x, y, z), facing: a.heading(), moving: a.moving() })
+                Some(CastDraw { entity: a.entity(), look: &member.look, pos: Pos::new(x, y, z), facing: a.heading(), moving: a.moving(),
+                    frame: if a.moving() { a.walked_frames() } else { self.elapsed_frames } })
             })
             .collect()
     }
@@ -384,7 +390,7 @@ impl ScenePlayer {
     /// Let `seconds` of real time go by: the stage moves on and what is due happens, unless a window is on show (it pauses
     /// the whole scene) or the scene is over.
     pub fn advance(&mut self, seconds: f32) {
-        if self.over || self.panel.is_some() {
+        if self.over || self.played_out || self.panel.is_some() {
             return;
         }
         let mut left = seconds * FRAMES_PER_SECOND as f32;
@@ -396,14 +402,34 @@ impl ScenePlayer {
         // a boundary or uses up the time.)
         for _ in 0..4 {
             let spend = left.min((self.due_at() - self.clock).max(0.0));
-            self.cast.advance(spend);
-            self.clock += spend;
+            self.advance_stage_to(self.clock + spend);
             left -= spend;
             self.settle();
-            if self.over || self.panel.is_some() || left <= 0.0 {
+            if self.over || self.played_out || self.panel.is_some() || left <= 0.0 {
                 return;
             }
         }
+    }
+
+    /// Advance through each event in order: a replacement move or placement must not credit
+    /// the cancelled walk with time past that event. Audio still measures lateness at the tick's
+    /// endpoint, so crossing several effects in one stalled frame does not replay stale cues.
+    fn advance_stage_to(&mut self, target: f32) {
+        while self.due.front().is_some_and(|event| event.at as f32 <= target) {
+            let Some(event) = self.due.pop_front() else { break };
+            self.advance_clock_to(self.clock.max(event.at as f32));
+            let late = self.clock - event.at as f32;
+            let sound_late = target - event.at as f32;
+            self.apply_event(event, late, sound_late);
+        }
+        self.advance_clock_to(target);
+    }
+
+    fn advance_clock_to(&mut self, target: f32) {
+        let frames = (target - self.clock).max(0.0);
+        self.cast.advance(frames);
+        if frames.is_finite() { self.elapsed_frames += frames; }
+        self.clock = target;
     }
 
     /// The frame at which what is next is due: its window (or the end), and the last stage event before it.
@@ -424,15 +450,19 @@ impl ScenePlayer {
             }
             let Some(event) = self.due.pop_front() else { break };
             let late = self.clock - event.at as f32;
-            if let Stage::Sound { id, pan } = event.what {
-                // A stalled frame must not dump a burst of old effects. Stops still cancel a loop.
-                if id == 0 || self.instant || late <= FRAMES_PER_SECOND as f32 / 2.0 {
-                    self.sound(SoundAction::Play { id, pan });
-                }
-            }
-            let source = &self.source;
-            self.cast.apply(&event.what, late, &|x, y, triangle| source.height_at(x, y, triangle));
+            self.apply_event(event, late, late);
         }
+    }
+
+    fn apply_event(&mut self, event: Timed<Stage>, motion_late: f32, sound_late: f32) {
+        if let Stage::Sound { id, pan } = event.what {
+            // A stalled frame must not dump a burst of old effects. Stops still cancel a loop.
+            if id == 0 || self.instant || sound_late <= FRAMES_PER_SECOND as f32 / 2.0 {
+                self.sound(SoundAction::Play { id, pan });
+            }
+        }
+        let source = &self.source;
+        self.cast.apply(&event.what, motion_late, &|x, y, triangle| source.height_at(x, y, triangle));
     }
 
     /// Go on as far as the clock allows: pull the next beat, play what is due, open the window or end the scene. Stops at

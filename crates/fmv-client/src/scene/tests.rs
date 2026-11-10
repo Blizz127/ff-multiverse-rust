@@ -508,11 +508,16 @@ fn the_stage_is_where_the_scene_puts_it_when_it_begins_and_moves_with_the_clock_
     assert!(rig.client.player().unwrap().has_window());
     let paused = at(&rig, 20).unwrap();
     assert!((paused[1] - (10.0 + 100.0 * 10.0 / 30.0)).abs() < 0.5, "{paused:?}");
+    let frame = |rig: &Rig, entity| cast_players(rig.client.player().unwrap()).into_iter().find(|p| p.who == cast_who(entity)).unwrap().scene_frame.unwrap();
+    assert_eq!(frame(&rig, 20), 10.0, "walk clip counts only time spent walking");
+    assert_eq!(frame(&rig, 18), 20.0, "standing cast carries the scene's elapsed time");
     rig.client.advance(10.0);
     assert_eq!(at(&rig, 20), Some(paused), "a window on show pauses the stage: nothing moves while it is read");
+    assert_eq!((frame(&rig, 20), frame(&rig, 18)), (10.0, 20.0), "both cast clip clocks pause with the window");
     // The window is moved past: the walk goes on from where it stopped, over its remaining frames.
     confirm(&mut rig);
     rig.client.advance(0.1); // 3 of the remaining 20 frames
+    assert_eq!((frame(&rig, 20), frame(&rig, 18)), (13.0, 23.0), "resuming a new beat preserves the clip clocks");
     let y = at(&rig, 20).unwrap()[1];
     assert!((y - (10.0 + 100.0 * 13.0 / 30.0)).abs() < 0.5, "{y}");
     rig.client.advance(0.2); // the next window is due at frame 5 of this beat: the stage stops there too
@@ -521,6 +526,35 @@ fn the_stage_is_where_the_scene_puts_it_when_it_begins_and_moves_with_the_clock_
     assert!((y - (10.0 + 100.0 * 15.0 / 30.0)).abs() < 0.5, "{y}: 5 frames into the beat, 15 into the walk");
     confirm(&mut rig);
     assert_eq!(at(&rig, 20), None, "the scene is over: nobody stands anywhere");
+}
+
+#[test]
+fn replacing_moves_and_placing_actors_keeps_the_same_phase_across_tick_sizes() {
+    let walk = |at, x| timed(at, Stage::Move { entity: 20, from: None, x, y: 10, z: None, triangle: None, frames: 100, how: MoveHow::Walk });
+    let beats = vec![Beat {
+        stage: vec![
+            walk(0, 150),
+            walk(5, 250),
+            timed(8, Stage::Face { entity: 20, heading: 1.0, frames: 20 }),
+            timed(10, Stage::Place { entity: 20, x: 0, y: 10, z: None, triangle: None }),
+            walk(12, 100),
+            walk(15, 200),
+            timed(18, Stage::Face { entity: 20, heading: 2.0, frames: 20 }),
+        ],
+        then: Then::Window(window(20, 18, Some(18), message(1, 18, "one"))),
+    }];
+    let mut whole = rig_with(beats.clone(), false);
+    let mut split = rig_with(beats, false);
+    begin(&mut whole, SceneRole::Owner);
+    begin(&mut split, SceneRole::Owner);
+    whole.client.advance(1.0); // all seven stage events, stopping at the window
+    for _ in 0..4 { split.client.advance(5.0 / 30.0); }
+    let a = whole.client.player().unwrap().actor(20).unwrap();
+    let b = split.client.player().unwrap().actor(20).unwrap();
+    assert_eq!(a, b, "stage and animation phase must not depend on tick size");
+    assert_eq!(a.pos(), Some([105.0, 10.0, 11.0]));
+    assert_eq!(a.walked_frames(), 18.0, "the placement cancels walking for two frames");
+    assert!(whole.client.player().unwrap().has_window() && split.client.player().unwrap().has_window());
 }
 
 #[test]
@@ -830,7 +864,7 @@ fn the_server_echoing_our_own_entity_is_counted_for_the_bots_control_check() {
 // ---- what is drawn ---------------------------------------------------------------------------------------------------
 
 fn avatar(id: u64, x: f32, appearance: &'static str, own: bool) -> AvatarPlayer<'static> {
-    AvatarPlayer { who: Who(id), pos: Pos::new(x, 0.0, 5.0), facing: 1.0, anim: AnimState::Walk, appearance: Some(appearance), npc: None, tint: [9, 9, 9], own, party: false }
+    AvatarPlayer { who: Who(id), pos: Pos::new(x, 0.0, 5.0), facing: 1.0, anim: AnimState::Walk, scene_frame: None, appearance: Some(appearance), npc: None, tint: [9, 9, 9], own, party: false }
 }
 
 #[test]
@@ -993,6 +1027,29 @@ fn the_window_is_anchored_to_its_speakers_head_and_feet_and_knows_who_else_is_in
     let (a, b) = (near.quads()[0], bottom.quads()[0]);
     assert!(a.y + a.h <= want_head[1] as i32, "the window stands above the head ({} <= {})", a.y + a.h, want_head[1]);
     assert!(b.y > a.y, "the one without a speaker is lower, at the bottom of the screen");
+}
+
+#[test]
+fn scene_sound_late_tick_drops_stale_cues_but_keeps_stops_for_both_roles() {
+    use super::SoundAction;
+    let beats = vec![
+        Beat {
+            stage: vec![timed(10, Stage::Sound { id: 61, pan: 63 }), timed(40, Stage::Sound { id: 0, pan: 63 })],
+            then: say(60, 18, 18, 1).then,
+        },
+        end(0),
+    ];
+    for role in [SceneRole::Owner, SceneRole::Watcher] {
+        let mut rig = rig_with(beats.clone(), false);
+        begin(&mut rig, role);
+        let actions = |client: &mut SceneClient| client.take_sounds().into_iter().map(|c| c.action).collect::<Vec<_>>();
+        assert_eq!(actions(&mut rig.client), vec![SoundAction::Begin, SoundAction::Prepare(61)]);
+        rig.client.advance(2.0);
+        assert_eq!(actions(&mut rig.client), vec![SoundAction::Play { id: 0, pan: 63 }], "event substeps must not replay a cue that is 50 frames late");
+        assert!(rig.client.player().unwrap().has_window());
+        rig.client.advance(10.0);
+        assert!(actions(&mut rig.client).is_empty(), "the window pauses the remaining scene");
+    }
 }
 
 #[test]

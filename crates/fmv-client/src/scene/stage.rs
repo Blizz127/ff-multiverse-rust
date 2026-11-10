@@ -101,11 +101,13 @@ pub struct Actor {
     visible: bool,
     walk: Option<Walk>,
     turn: Option<Turn>,
+    /// Scene frames actually spent walking, retained across consecutive movement segments.
+    walked_frames: f32,
 }
 
 impl Actor {
     fn new(entity: u8) -> Self {
-        Self { entity, pos: None, triangle: None, heading: 0.0, visible: true, walk: None, turn: None }
+        Self { entity, pos: None, triangle: None, heading: 0.0, visible: true, walk: None, turn: None, walked_frames: 0.0 }
     }
 
     /// The script entity this actor plays.
@@ -134,6 +136,8 @@ impl Actor {
         self.walk.is_some_and(|w| w.how == MoveHow::Walk)
     }
 
+    pub fn walked_frames(&self) -> f32 { self.walked_frames }
+
     /// Whether it is seen at all: it has a place and is not hidden.
     pub fn shown(&self) -> bool {
         self.visible && self.pos.is_some()
@@ -145,7 +149,15 @@ impl Actor {
     }
 
     fn advance(&mut self, frames: f32) {
+        self.advance_walk(frames);
+        self.advance_turn(frames);
+    }
+
+    fn advance_walk(&mut self, frames: f32) {
         if let Some(walk) = &mut self.walk {
+            if walk.how == MoveHow::Walk {
+                self.walked_frames += frames.min((walk.frames - walk.elapsed).max(0.0));
+            }
             walk.elapsed += frames;
             let t = progress(walk.elapsed, walk.frames);
             let at = [0, 1, 2].map(|i| walk.from[i] + (walk.to[i] - walk.from[i]) * t);
@@ -154,6 +166,9 @@ impl Actor {
                 self.walk = None;
             }
         }
+    }
+
+    fn advance_turn(&mut self, frames: f32) {
         if let Some(turn) = &mut self.turn {
             turn.elapsed += frames;
             let t = progress(turn.elapsed, turn.frames);
@@ -283,7 +298,7 @@ impl Cast {
                 actor.pos = Some(start);
                 actor.walk = Some(Walk { from: start, to, frames: *frames as f32, elapsed: 0.0, how: *how });
                 // (a walk of no frames is a jump to the place: `advance` finishes it at once)
-                actor.advance(overshoot);
+                actor.advance_walk(overshoot);
             }
             Stage::Face { entity, heading, frames } => {
                 let Some(actor) = self.actors.get_mut(entity) else { return self.off_cast() };
@@ -293,7 +308,7 @@ impl Cast {
                     actor.turn = None;
                 } else {
                     actor.turn = Some(Turn { from: actor.heading, to: heading, frames: *frames as f32, elapsed: 0.0 });
-                    actor.advance(overshoot);
+                    actor.advance_turn(overshoot);
                 }
             }
             Stage::Show { entity, visible } => {
@@ -377,6 +392,28 @@ mod tests {
         assert_eq!(cast.actor(1).unwrap().pos(), Some([40.0, 0.0, 7.0]));
         cast.advance(10.0);
         assert_eq!(cast.actor(1).unwrap().pos(), Some([40.0, 30.0, 7.0]));
+    }
+
+    #[test]
+    fn catching_up_one_motion_does_not_advance_the_other_twice() {
+        let mut cast = Cast::new([1]);
+        cast.apply(&place(1, 0, 0), 0.0, &flat);
+        cast.apply(&walk(1, 100, 0, 100), 0.0, &flat);
+        cast.advance(20.0);
+        cast.apply(&Stage::Face { entity: 1, heading: 1.0, frames: 80 }, 10.0, &flat);
+        let a = cast.actor(1).unwrap();
+        assert_eq!(a.pos(), Some([20.0, 0.0, 7.0]), "late turn leaves the already advanced walk alone");
+        assert_eq!(a.walked_frames(), 20.0);
+        assert!((a.heading() - 0.125).abs() < 1e-5);
+        cast.advance(10.0);
+        let heading = cast.actor(1).unwrap().heading();
+        // A jump does not replace the turn. Catching up that jump must not tick the turn again.
+        let jump = Stage::Move { entity: 1, from: None, x: 120, y: 0, z: None, triangle: None, frames: 20, how: MoveHow::Jump };
+        cast.apply(&jump, 5.0, &flat);
+        let a = cast.actor(1).unwrap();
+        assert_eq!(a.pos(), Some([105.0, 0.0, 7.0]));
+        assert_eq!(a.heading(), heading, "late jump leaves the already advanced turn alone");
+        assert_eq!(a.walked_frames(), 30.0, "jump time is not walking animation time");
     }
 
     #[test]

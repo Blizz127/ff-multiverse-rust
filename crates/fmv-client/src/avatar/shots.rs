@@ -130,6 +130,7 @@ fn facing_camera(id: u64, appearance: &'static str, at: Pos) -> AvatarPlayer<'st
         pos: at,
         facing: -std::f32::consts::FRAC_PI_2,
         anim: AnimState::Idle,
+        scene_frame: None,
         appearance: Some(appearance),
         npc: None,
         tint: [10, 200, 30],
@@ -486,7 +487,7 @@ pub(super) mod real {
                 if depth < depth_range.0 || depth > depth_range.1 {
                     return None;
                 }
-                let player = AvatarPlayer { who: Who(0), pos, facing: 0.0, anim: AnimState::Idle, appearance: Some("ff7/cloud"), npc: None, tint: [0; 3], own: false, party: false };
+                let player = AvatarPlayer { who: Who(0), pos, facing: 0.0, anim: AnimState::Idle, scene_frame: None, appearance: Some("ff7/cloud"), npc: None, tint: [0; 3], own: false, party: false };
                 let built = avatars.frame(view, stage, &[player], 0.0);
                 let model = built.frame.models.first()?;
                 let mut rect = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
@@ -600,6 +601,7 @@ fn offscreen_real_ff7_avatars_in_the_field() {
         pos: at,
         facing,
         anim,
+        scene_frame: None,
         appearance,
         npc: None,
         tint: [[90, 125, 245], [235, 80, 80], [60, 200, 90], [250, 190, 40]][(id as usize - 1) % 4],

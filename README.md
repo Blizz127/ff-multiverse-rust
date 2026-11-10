@@ -1592,6 +1592,10 @@ over its speaker (the name on its first line), a question shows its choices with
 answers, Up/Down move the cursor, Esc or Backspace skip the whole scene** (the owner reports it; a watcher just leaves), and
 every other key is swallowed while it runs: no walking, no talking, no battle key. When it ends (its own end, a skip, or the
 server's `SceneEnded`) the cast and the camera state are gone, the hidden NPC is back and the field's keys are the field's again.
+A cast member's default walk and idle animation follows scene time, so a dialogue window freezes its pose as well as
+its position. Resuming keeps the walking phase. Moves, turns and placements run in event order even during a long frame;
+stale sound effects remain suppressed. Ordinary field players and NPCs keep their normal animation clocks. Focused CPU
+pose checks cover this path; rendered playback is untested.
 A watcher opens window 0 itself and every later one only when the owner's `SceneStep` for the one before arrives, so the two screens
 show the same line at the same time. A client that cannot build the scene (no field data) tells the server at once (`SceneEnd`
 skipped, or `SceneLeave`), so a player is never left held.
