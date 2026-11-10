@@ -523,6 +523,16 @@ fn real_kernel2_decodes() {
     );
 }
 
+/// Starting gil comes from the owner's original kernel, independently of battle rewards and
+/// saved characters. No save is read or changed.
+#[test]
+#[ignore = "needs FMV_FF7_DATA pointing at the owner's original FF7 data directory"]
+fn real_kernel_starts_with_240_gil() {
+    let Some(path) = kernel_path() else { return };
+    let kernel = Kernel::open(&path).expect("kernel.bin parses");
+    assert_eq!(kernel.starting_gil(), Some(240));
+}
+
 /// Spells, items, materia and the starting stock of the real `kernel.bin` (this backs the
 /// "checked against the owner's Steam copy" notes of `kernel` and `action`): the attack index of a
 /// spell is the index of its name in "Names - magic", item 0 is Potion, the starting records equip

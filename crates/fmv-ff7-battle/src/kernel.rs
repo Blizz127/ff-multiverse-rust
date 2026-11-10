@@ -32,7 +32,7 @@
 //! | 0 | 32 command records of 8 bytes | parsed ([`CommandRecord`]) |
 //! | 1 | 128 attack records of 28 bytes | on demand ([`Kernel::attack`]) |
 //! | 2 | battle and growth data | parsed ([`GrowthData`]) |
-//! | 3 | initialization data (9 savemap character records, then the party, then the item stock) | parsed ([`InitCharacter`], [`Kernel::starting_inventory`]) |
+//! | 3 | initialization data (characters, party, stock and gil) | parsed ([`InitCharacter`], [`Kernel::starting_inventory`], [`Kernel::starting_gil`]) |
 //! | 4 | 128 item records of 28 bytes | on demand ([`Kernel::item`]) |
 //! | 5, 6 | weapons (44 bytes), armor (36 bytes) | on demand ([`WeaponRecord`], [`WeaponSounds`], [`ArmorRecord`]) |
 //! | 8 | 96 materia records of 20 bytes | on demand ([`Kernel::materia`]) |
@@ -159,6 +159,8 @@ pub(crate) const INIT_MATERIA_SLOTS: usize = 16;
 pub(crate) const OFF_INIT_MATERIA: usize = 0x40;
 /// The item stock follows the nine character records and four party bytes (three slots and a pad).
 pub(crate) const OFF_INIT_ITEMS: usize = CHARACTER_COUNT * INIT_CHARACTER_SIZE + 4;
+/// Gil in the initialization section: savemap offset 0xB7C minus its section base 0x54.
+const OFF_INIT_GIL: usize = 0xB28;
 /// Attack index of the last spell Master Magic unlocks (Shield; the menu hides the two after it).
 const LAST_MASTER_MAGIC_SPELL: u16 = 0x35;
 pub(crate) const GROWTH_RECORD_SIZE: usize = 56;
@@ -1123,6 +1125,23 @@ impl Kernel {
         MateriaRecord::parse(data.get(usize::from(id) * MATERIA_RECORD_SIZE..)?)
     }
 
+    /// The gil a new game starts with, from initialization section 3 (section 4 in one-based
+    /// documentation). This is an unsigned little-endian integer of four bytes at offset `0xB28`;
+    /// a missing or truncated value is `None`, distinct from a stored zero. The owner's original
+    /// Steam kernel contains 240. Values are returned as stored, without applying a reward cap.
+    ///
+    /// The [savemap](https://ff7-mods.github.io/ff7-flat-wiki/FF7/Savemap.html) places gil at
+    /// `0xB7C` and the initialization section at `0x54`. The independent
+    /// [Elena parser](https://github.com/Shojy/Elena/blob/master/Shojy.FF7.Elena/Sections/InitialData.cs)
+    /// reads its `Gil` field directly at `0xB28`. This accessor only reads the kernel; it neither
+    /// initializes nor changes any character or save.
+    pub fn starting_gil(&self) -> Option<u32> {
+        let bytes = self
+            .section(SECTION_INITIALIZATION)?
+            .get(OFF_INIT_GIL..OFF_INIT_GIL + 4)?;
+        Some(u32::from_le_bytes(bytes.try_into().ok()?))
+    }
+
     /// The item stock a new game starts with, from the initialization data (section 3, after the
     /// character records and the party): the savemap's 320 slots of a `u16` each, the item index in
     /// the low nine bits and the count in the high seven, `0xFFFF` for an empty slot. Only consumable
@@ -1608,6 +1627,46 @@ mod tests {
         assert!(k.equipped_spells(CharacterId::Barret).is_empty());
         assert!(k.equipped_spells(CharacterId::CaitSith).is_empty());
         assert!(k.equipped_spells(CharacterId::Vincent).is_empty());
+    }
+
+    #[test]
+    fn starting_gil_uses_the_initialization_offset_and_preserves_zero_and_large_values() {
+        for gil in [0u32, 240, 0x1234_5678, u32::MAX] {
+            let mut sections = synthetic_kernel_sections();
+            let initialization = &mut sections[SECTION_INITIALIZATION].1;
+            initialization.resize(OFF_INIT_GIL + 8, 0xA5);
+            initialization[OFF_INIT_GIL..OFF_INIT_GIL + 4].copy_from_slice(&gil.to_le_bytes());
+            let expected = initialization.clone();
+            let kernel = Kernel::parse(&pack_kernel(&sections, &[])).unwrap();
+            assert_eq!(kernel.starting_gil(), Some(gil));
+            assert_eq!(
+                kernel.section(SECTION_INITIALIZATION),
+                Some(expected.as_slice()),
+                "reading preserves every initialization byte"
+            );
+        }
+    }
+
+    #[test]
+    fn starting_gil_needs_all_four_bytes_in_its_own_section() {
+        for available in 0..=4 {
+            let mut sections = synthetic_kernel_sections();
+            let initialization = &mut sections[SECTION_INITIALIZATION].1;
+            initialization.resize(OFF_INIT_GIL + 4, 0);
+            initialization[OFF_INIT_GIL..OFF_INIT_GIL + 4].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+            initialization.truncate(OFF_INIT_GIL + available);
+            let kernel = Kernel::parse(&pack_kernel(&sections, &[])).unwrap();
+            assert_eq!(
+                kernel.starting_gil(),
+                (available == 4).then_some(0x1234_5678),
+                "available bytes: {available}"
+            );
+        }
+        assert_eq!(
+            Kernel::parse(&synthetic_kernel_bytes()).unwrap().starting_gil(),
+            None,
+            "older short initialization fixtures have no gil value"
+        );
     }
 
     #[test]
