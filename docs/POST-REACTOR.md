@@ -117,6 +117,15 @@ spot, rendering, skipped sounds and background effects, and the preceding route 
 `scene_map` can survey the unregistered train, station, and post-escape definitions without
 registering them; its pictures remain outside the repository. A first train floor-plan run drew
 46 actor walks and no witness, so it does not establish a safe witness position.
+An isolated offscreen exploration later exercised one candidate each in the train and station,
+and the existing post-escape witness spot. All three scene drivers ended in that harness; this
+was a rendering exploration, not a route or all-frame clearance test. The train candidate
+`(169, 571, triangle 69)` filled much of the foreground in the first sampled frame and obscured
+the scene, and the post-escape witness was partly hidden behind scenery in sampled frames. The
+station candidate `(1041, -5165, triangle 28)` appeared clear in the inspected samples, but
+neither temporal clearance nor the complete route has been checked. None of these spots is
+accepted for live use on this evidence. The exploratory harness's field label is hard-coded to
+the bar and is not evidence of which field was rendered.
 The original and Echo-S train director each yielded two windows, the same moment-51 write and no
 unresolved reads on the measured run; both Echo-S windows had voice files. This comparison does not
 enable the scene or prove that the arrival is reachable.
