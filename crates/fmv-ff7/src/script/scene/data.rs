@@ -181,6 +181,52 @@ pub const PROOF_SCENE_ID: &str = "ff7/mds7pb_1/tifa-bar";
 /// The field of the proof scene.
 pub const PROOF_FIELD: &str = "mds7pb_1";
 
+/// The director sequence immediately after the first reactor escape.
+pub const POST_ESCAPE_SCENE_ID: &str = "ff7/md8_4/post-escape";
+pub const STATION_SCENE_ID: &str = "ff7/md8_1/post-escape-station";
+
+/// Field-authored cast and director scripts at moment 33. Not registered until the arrival
+/// trigger and subsequent field transition are ready to serve together.
+pub fn post_escape_scene() -> SceneDef {
+    let cast = [(1, "cloud", "aaaa", "aafe", 19, 375, 5, 224),
+                (2, "barret", "acgd", "adcb", -100, 493, 5, 0),
+                (4, "biggs", "bwfd", "aafe", -41, 699, 7, 0),
+                (5, "jessie", "axdc", "aafe", -65, 95, 1, 192),
+                (6, "wedge", "bxbe", "aafe", 68, 245, 3, 0)]
+        .into_iter().map(|(entity, name, hrc, idle, x, y, triangle, direction)| CastMember {
+            entity, name: name.to_string(), look: Look::Model { hrc: hrc.to_string(), idle: idle.to_string() },
+            start: Some(Spot { x, y, triangle, direction }),
+        }).collect();
+    SceneDef {
+        id: POST_ESCAPE_SCENE_ID.to_string(), game: "ff7".to_string(), field: "md8_4".to_string(),
+        trigger: Trigger { entity: 0, name: "dic".to_string(), slot: 0, talk_radius: 0, moments: 33..=33 },
+        setup: vec![], given: vec![],
+        root: vec![Step::StartMain(1), Step::StartMain(2), Step::StartMain(4), Step::StartMain(5), Step::StartMain(6), Step::StartMain(0)],
+        cast, speakers: vec![("Cloud".into(), 1), ("Barret".into(), 2), ("Biggs".into(), 4), ("Jessie".into(), 5), ("Wedge".into(), 6)],
+        witness: vec![Spot { x: -133, y: 144, triangle: 0, direction: 0 }],
+        arrival: Spot { x: 82, y: 267, triangle: 3, direction: 0 },
+    }
+}
+
+/// The following station director. This data is not registered until its transition and
+/// presentation gaps have been addressed.
+pub fn station_scene() -> SceneDef {
+    let mut def = post_escape_scene();
+    def.id = STATION_SCENE_ID.to_string();
+    def.field = "md8_1".to_string();
+    def.root = vec![Step::StartMain(0)];
+    for (member, entity) in def.cast.iter_mut().zip([1u8, 2, 3, 4, 5]) {
+        member.entity = entity;
+        member.start = Some(Spot { x: if entity == 1 { 1577 } else { 1630 }, y: -5357,
+            triangle: if entity == 1 { 10 } else { 15 }, direction: 192 });
+    }
+    def.speakers = vec![("Cloud".into(), 1), ("Barret".into(), 2), ("Biggs".into(), 3), ("Jessie".into(), 4), ("Wedge".into(), 5)];
+    def.arrival = Spot { x: 1629, y: -5357, triangle: 15, direction: 192 };
+    // Its witness is deliberately absent until a visible, walkable spot is verified.
+    def.witness.clear();
+    def
+}
+
 /// Script entities and slots of the proof field (measured on the owned Steam copy: `tests/scene_real.rs` checks them).
 pub mod proof {
     /// The `ID` entity whose script 0 loop starts the scene.

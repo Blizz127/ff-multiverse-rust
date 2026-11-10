@@ -95,6 +95,18 @@ impl SceneHost for Ff7SceneHost {
                 summary.push(format!("var[{bank}][{address}]={value}"));
             }
         }
-        Some(SceneResult { progress: after.encode(), changed, summary: summary.join(" ") })
+        let travel = outcome.jump.and_then(|jump| {
+            let target = self.adapter.field_key_for_id(jump.field)?;
+            // Never send a real player to a field whose story has not been reviewed.
+            if !fmv_ff7::is_reviewed_field(&target) { return None; }
+            Some(fmv_adapter_api::Exit {
+                line: (Pos::new(0.0, 0.0, 0.0), Pos::new(0.0, 0.0, 0.0)), target,
+                arrival: Pos::new(f32::from(jump.x), f32::from(jump.y), 0.0),
+                arrival_facing: Some(field_direction_to_facing(jump.direction)),
+                arrival_hint: u32::try_from(jump.triangle).ok(),
+                kind: fmv_adapter_api::ExitKind::Gateway,
+            })
+        });
+        Some(SceneResult { progress: after.encode(), changed, summary: summary.join(" "), travel })
     }
 }

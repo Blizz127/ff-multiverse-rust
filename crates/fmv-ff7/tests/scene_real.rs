@@ -95,19 +95,10 @@ const TIFA: u8 = proof::TIFA;
 #[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
 fn post_escape_director_reaches_its_scripted_destination() {
     let f = field("md8_4").expect("FMV_FF7_DATA and md8_4");
-    let mut def = proof_scene();
-    def.field = "md8_4".to_string();
-    def.trigger.entity = 0;
-    def.setup = vec![];
-    def.given = vec![];
-    def.root = vec![Step::StartMain(1), Step::StartMain(2), Step::StartMain(4), Step::StartMain(5), Step::StartMain(6), Step::StartMain(0)];
-    def.cast = [(1, "cloud", "aaaa", 19, 375, 5), (2, "barret", "acgd", -100, 493, 5),
-                (4, "biggs", "bwfd", -41, 699, 7), (5, "jessie", "axdc", -65, 95, 1),
-                (6, "wedge", "bxbe", 68, 245, 3)].into_iter().map(|(entity, name, hrc, x, y, triangle)| CastMember {
-        entity, name: name.to_string(), look: Look::Model { hrc: hrc.to_string(), idle: "acfe".to_string() },
-        start: Some(fmv_ff7::script::scene::Spot { x, y, triangle, direction: 0 }),
-    }).collect();
-    def.speakers.clear();
+    let def = fmv_ff7::script::scene::post_escape_scene();
+    let mesh = f.walkmesh().unwrap();
+    let witness = def.witness[0];
+    assert!(fmv_ff7::script::triangle_contains_xy(&mesh.triangles[usize::from(witness.triangle)], i32::from(witness.x), i32::from(witness.y)));
     let outcome = run_to_end(&f, &def, &StoryState::at(33), 1, &[]).unwrap();
     eprintln!("post-escape outcome: {:?}, windows={}, stats={:?}", outcome.end, outcome.windows, outcome.stats);
     assert_eq!(outcome.end, End::MapJump { field: 133 });
@@ -115,6 +106,32 @@ fn post_escape_director_reaches_its_scripted_destination() {
     assert!(outcome.windows >= 3);
     assert!(outcome.stats.unknown.is_empty());
     assert_eq!(outcome.stats.dropped_requests, 0);
+    assert_eq!(outcome.stats.unresolved, 0);
+}
+
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn scene_jump_field_id_resolves_to_an_existing_field() {
+    use fmv_core::{EditionProvenance, GameId, Platform};
+    let dir = data_dir().expect("FMV_FF7_DATA");
+    let provenance = EditionProvenance { game: GameId::Ff7, platform: Platform::Pc, edition: "steam".into(),
+        region: "any".into(), language: "en".into(), revision: "test".into(), sources: vec![], modded: false };
+    let adapter = fmv_ff7::Ff7Adapter::from_flevel_path(flevel_path(&dir), provenance).unwrap();
+    assert_eq!(adapter.field_key_for_id(133).as_deref(), Some("md8_1"));
+    assert_eq!(adapter.field_key_for_id(u16::MAX), None);
+}
+
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn station_director_advances_the_post_escape_story() {
+    let f = field("md8_1").expect("FMV_FF7_DATA and md8_1");
+    let def = fmv_ff7::script::scene::station_scene();
+    let outcome = run_to_end(&f, &def, &StoryState::at(33), 1, &[]).unwrap();
+    eprintln!("station director: end={:?}, windows={}, writes={:?}, stats={:?}", outcome.end, outcome.windows, outcome.writes, outcome.stats);
+    assert_eq!(outcome.end, End::Finished);
+    assert_eq!(outcome.writes.moment, Some(36));
+    assert!(outcome.windows >= 4);
+    assert!(outcome.stats.unknown.is_empty());
     assert_eq!(outcome.stats.unresolved, 0);
 }
 

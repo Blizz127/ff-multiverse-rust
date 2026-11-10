@@ -497,7 +497,7 @@ impl World {
         // new account's (it advanced it before) is then told where its story stands; a new account gets
         // exactly the messages it always got.
         let mut failed = Vec::new();
-        self.announce_entry(entity, &mut failed);
+        self.announce_entry(entity, now, &mut failed);
         self.tell_progress(entity, false, &mut failed);
         self.tell_inventory(entity, &mut failed);
         if self.players.get(&entity).is_some_and(|p| !p.progression.is_empty()) {

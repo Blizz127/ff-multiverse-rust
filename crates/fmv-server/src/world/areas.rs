@@ -398,7 +398,7 @@ impl World {
     /// `InstancePlacement`; tell the others of the instance it is there (`World::settle`). The placement
     /// is always sent, even when it equals the last one told (a player sent back to the area it came
     /// from), so that every entry looks the same to a client.
-    pub(super) fn announce_entry(&mut self, entity: EntityId, failed: &mut Vec<(EntityId, bool)>) {
+    pub(super) fn announce_entry(&mut self, entity: EntityId, now: Instant, failed: &mut Vec<(EntityId, bool)>) {
         // Placed here, wherever it came from: every link within reach of the player starts disarmed.
         self.place_links(entity);
         // A leader that is back in an area is with its party again: the way it left by is over (`follow` module).
@@ -409,6 +409,7 @@ impl World {
         // What the area's own scripts do by themselves from the first frame on moves the story of whoever stands
         // there (the points that fire on entry; a no-op in an area without any).
         self.enter_story(entity);
+        self.automatic_scene_entered(entity, now);
     }
 
     /// The first of `crossed` (the exits a move of `entity` crosses, in the order they are met) that is open for
@@ -640,7 +641,7 @@ impl World {
         p.dirty = false;
         self.logs.info(format!("player entered the area entity={} to={}", entity.0, transit.to));
         let mut failed = Vec::new();
-        self.announce_entry(entity, &mut failed);
+        self.announce_entry(entity, now, &mut failed);
         self.drop_failed(failed);
         TravelReply::Done
     }

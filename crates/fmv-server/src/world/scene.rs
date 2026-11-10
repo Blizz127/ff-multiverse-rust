@@ -100,7 +100,7 @@ pub struct TriggerInfo {
 }
 
 /// What a finished scene did to the story.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SceneResult {
     /// The progression after the scene's writes (the game's own blob).
     pub progress: Vec<u8>,
@@ -108,6 +108,8 @@ pub struct SceneResult {
     pub changed: bool,
     /// What it changed, in the game's own `key=value` words.
     pub summary: String,
+    /// A validated script destination, if this scene ends in a permitted field transition.
+    pub travel: Option<fmv_adapter_api::Exit>,
 }
 
 /// Where the world gets a game's scenes (see the module docs). Implementations read the game's own files; the world calls
@@ -117,6 +119,8 @@ pub trait SceneHost: Send + Sync {
     fn scenes(&self) -> Vec<SceneInfo>;
     /// Whether scene `scene` is on offer to a player whose instance plays the story `progress`.
     fn offered(&self, scene: &str, progress: &[u8]) -> bool;
+    /// Whether the scene starts automatically on entering its field.
+    fn automatic(&self, _scene: &str) -> bool { false }
     /// The trigger of scene `scene` for the story `progress` (`None`: it cannot be shown).
     fn trigger(&self, scene: &str, progress: &[u8]) -> Option<TriggerInfo>;
     /// The made-up story the debug preview puts a player in for scene `scene`.
@@ -239,7 +243,7 @@ impl World {
         let mut out = Vec::new();
         for index in 0..self.scenes.list.len() {
             let Some(info) = self.scenes.list.get(index) else { continue };
-            if !info.field.eq_ignore_ascii_case(area) || !host.offered(&info.id, &progress) {
+            if !info.field.eq_ignore_ascii_case(area) || host.automatic(&info.id) || !host.offered(&info.id, &progress) {
                 continue;
             }
             let id = info.id.clone();
@@ -284,6 +288,7 @@ impl World {
     pub(super) fn press_scene(&mut self, entity: EntityId, npc: u32, now: Instant) {
         let (Some(host), Some(index)) = (self.scenes.host.clone(), scene_index(npc)) else { return };
         let Some(info) = self.scenes.list.get(index).cloned() else { return };
+        if host.automatic(&info.id) { return; }
         let (pos, area, account) = {
             let Some(p) = self.players.get(&entity) else { return };
             if p.battle.is_some() || p.transit.is_some() || p.scene.is_some() {
@@ -468,26 +473,40 @@ impl World {
 
     /// End `run` as `outcome`: release everyone and, unless it was aborted, apply what the scene's script wrote, once. The run
     /// is taken out first, so nothing that arrives for it afterwards finds it.
-    fn end_run(&mut self, run: SceneRunId, outcome: SceneOutcome, _now: Instant) {
+    fn end_run(&mut self, run: SceneRunId, outcome: SceneOutcome, now: Instant) {
         let Some(record) = self.scenes.runs.remove(&run) else { return };
         let mut failed = Vec::new();
         let mut everyone = vec![record.owner];
         everyone.extend(record.watchers.iter().copied());
-        for e in everyone {
+        for &e in &everyone {
             self.release(e, run, outcome, &mut failed);
         }
-        let story = if outcome == SceneOutcome::Aborted { "dropped" } else { self.apply_scene_story(&record) };
+        let result = if outcome == SceneOutcome::Aborted || !record.writes_story { None } else {
+            self.scenes.host.as_ref().and_then(|host| host.finish(&record.scene, &record.progress, record.seed, &record.answers))
+        };
+        let story = if outcome == SceneOutcome::Aborted { "dropped" } else if !record.writes_story { "none (not the owner's phase)" } else if let Some(result) = &result {
+            self.apply_scene_story(&record, result)
+        } else { "none (the scene could not be run)" };
+        // A debug preview never changes the real world. A real scene's destination is resolved and
+        // validated by its host; each participant travels through the normal area handshake.
+        if !record.preview {
+            if let Some(exit) = result.as_ref().and_then(|result| result.travel.as_ref()) {
+                for entity in everyone {
+                    if let Some((pos, facing)) = self.players.get(&entity).map(|p| (p.snapshot.pos, p.snapshot.facing)) {
+                        self.start_travel(entity, exit, pos, facing, now);
+                    }
+                }
+            }
+        }
         self.logs.info(format!("scene ended run={} scene={} outcome={outcome:?} answers={} story={story}", run.0, record.scene, record.answers.len()));
         self.drop_failed(failed);
     }
 
     /// What the scene's script wrote, applied to the owner's story once (see the module docs). Returns a word for the log.
-    fn apply_scene_story(&mut self, record: &SceneRun) -> &'static str {
+    fn apply_scene_story(&mut self, record: &SceneRun, result: &SceneResult) -> &'static str {
         if !record.writes_story {
             return "none (not the owner's phase)";
         }
-        let Some(host) = self.scenes.host.clone() else { return "none (no host)" };
-        let Some(result) = host.finish(&record.scene, &record.progress, record.seed, &record.answers) else { return "none (the scene could not be run)" };
         if !result.changed {
             return "unchanged";
         }
@@ -496,13 +515,13 @@ impl World {
         if p.preview.is_none() {
             // A real story: a scene's write is a story step like any other (the mirror, the log line, a countdown it ends, the
             // save, the player told and the placements refreshed: `story::apply_story_step`).
-            self.apply_story_step(record.owner, SCENE_STEP_POINT, StoryStep { progress: result.progress, summary, countdown: None });
+            self.apply_story_step(record.owner, SCENE_STEP_POINT, StoryStep { progress: result.progress.clone(), summary, countdown: None });
             return "applied";
         }
         // A previewing player's story is made up: it is told the step and keeps it in memory only, and nothing is saved
         // (`apply_story_step` would not apply it either).
         let account = p.account;
-        p.progression = result.progress;
+        p.progression = result.progress.clone();
         self.logs.info(format!("story advanced (preview: made up, not saved) account={} entity={} {summary}", account.0, record.owner.0));
         let mut failed = Vec::new();
         self.tell_story(record.owner, Some(StoryAdvance { point: SCENE_STEP_POINT, summary }), &mut failed);
@@ -613,6 +632,27 @@ impl World {
         if self.players.get(&entity).is_some_and(|p| p.preview.is_some()) {
             self.tell_story(entity, None, failed);
         }
+    }
+
+    /// Start an offered arrival scene for this player only, after the area's entry story has run.
+    pub(super) fn automatic_scene_entered(&mut self, entity: EntityId, now: Instant) {
+        let Some(host) = self.scenes.host.clone() else { return };
+        let Some(player) = self.players.get(&entity) else { return };
+        if player.preview.is_some() || player.transit.is_some() || player.battle.is_some() || player.scene.is_some() { return; }
+        let area = player.area.clone();
+        let writes_story = player.placement.as_ref().is_none_or(|p| p.story_advance_allowed);
+        // Until follower progression is reconciled, do not start an arrival scene that cannot
+        // advance or travel this player's own story.
+        if !writes_story { return; }
+        let progress = self.instance_progression(entity);
+        let Some(info) = self.scenes.list.iter().find(|info| info.field.eq_ignore_ascii_case(&area)
+            && host.automatic(&info.id) && host.offered(&info.id, &progress)).cloned() else { return };
+        let run = SceneRunId(self.scenes.next_run.max(1));
+        self.scenes.next_run = run.0.saturating_add(1);
+        let seed = u32::try_from(run.0.wrapping_mul(0x9E37_79B9) & 0xFFFF_FFFF).unwrap_or(1);
+        let record = SceneRun { scene: info.id, owner: entity, watchers: vec![], seed, progress, answers: vec![], steps: 0,
+            started: now, last_activity: now, writes_story, preview: false };
+        self.start_run(run, record, &mut Vec::new());
     }
 }
 

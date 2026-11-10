@@ -577,6 +577,14 @@ impl Ff7Adapter {
         list
     }
 
+    /// Resolve a field id from the owned maplist to an archive-backed area key.
+    pub fn field_key_for_id(&self, id: u16) -> Option<String> {
+        let maplist = self.maplist()?;
+        let name = maplist.name(id)?;
+        let archive = self.archive.lock().unwrap_or_else(PoisonError::into_inner);
+        listed_key(&archive, name)
+    }
+
     /// The gateway exits of `field` (see the module docs).
     fn gateway_exits(&self, field: &FieldFile) -> Vec<Exit> {
         let Some(maplist) = self.maplist() else { return Vec::new() };
