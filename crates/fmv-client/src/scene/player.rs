@@ -245,6 +245,11 @@ impl ScenePlayer {
     /// `instant` is for a bot: no clock, the first window is open on return.
     pub fn new(run: Run, def: SceneDef, source: Box<dyn SceneSource>, instant: bool) -> Self {
         let mut cast = Cast::new(def.cast.iter().map(|m| m.entity));
+        for member in &def.cast {
+            if let Some((slot, clip)) = source.initial_default_animation_clip(member.entity) {
+                cast.remember_default(member.entity, slot, clip);
+            }
+        }
         for event in source.initial() {
             Self::apply_stage(&mut cast, source.as_ref(), &event, 0.0);
         }
@@ -468,11 +473,11 @@ impl ScenePlayer {
     }
 
     fn apply_stage(cast: &mut Cast, source: &dyn SceneSource, event: &Stage, late: f32) {
-        // Supported forms have no guessed duration: a full default loop or an explicit Hold range,
+        // Supported forms have no guessed duration: a full default loop or an explicit Hold/Once range,
         // on the script's own field model. Every other Anim clears an old override.
         if let Stage::Anim { entity, animation, how: AnimHow::Loop, first: None, last: None, speed: 16, divisor: 1 } = event {
             if let Some(clip) = source.animation_clip(*entity, *animation) {
-                cast.apply_loop(*entity, clip, late);
+                cast.apply_loop(*entity, *animation, clip, late);
                 return;
             }
         }
@@ -482,6 +487,13 @@ impl ScenePlayer {
                     if first == last { cast.apply_hold(*entity, clip, *first); }
                     else { cast.apply_hold_range(*entity, clip, *first, *last, late); }
                     return;
+                }
+            }
+        }
+        if let Stage::Anim { entity, animation, how: AnimHow::Once, first: Some(first), last: Some(last), speed: 16, divisor: 1 } = event {
+            if first <= last {
+                if let Some(clip) = source.animation_clip(*entity, *animation) {
+                    if cast.apply_once(*entity, *animation, clip, *first, *last, late) { return; }
                 }
             }
         }

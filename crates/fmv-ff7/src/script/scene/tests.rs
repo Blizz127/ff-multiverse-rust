@@ -1155,6 +1155,99 @@ fn initial_stage_retains_only_the_last_loop_not_later_once_or_hold_animations() 
     assert!(play.writes().is_story_neutral());
 }
 
+fn default_animation_play(setup: Vec<Vec<u8>>, runtime: Vec<Vec<u8>>) -> ScenePlay {
+    let section = script(vec![("a", vec![(0, vec![vec![0xA1, 99]]), (3, setup), (1, runtime)])], texts(3));
+    let spec = FieldSpec { overrides: vec![(0, section)], models: vec![
+        LoaderModelSpec::new("npc.char", "ABCD.HRC", &["AAFE.aki", "BBBB.yos", "CCCC.aki"]),
+    ], ..FieldSpec::default() };
+    let field = FieldFile::parse(spec.build()).unwrap();
+    let cast = CastMember { look: Look::Model { hrc: "abcd".into(), idle: "aafe".into() }, ..member(0, "a") };
+    let mut def = demo_def(vec![cast], start(0, 1));
+    def.setup = vec![ScriptRef::new(0, 3)];
+    ScenePlay::new(&field, &def, &StoryState::at(4), 1).unwrap()
+}
+
+#[test]
+fn standing_defaults_survive_setup_once_and_hold_without_replaying_them() {
+    let implicit = default_animation_play(vec![], vec![]);
+    assert_eq!(implicit.initial_default_animation_clip(0), Some((0, "aafe")), "the engine starts with slot 0");
+    assert!(implicit.initial_stage_events().is_empty(), "remembering the implicit default does not add a displayed setup event");
+    for opcode in [0xB0, 0xB1] {
+        let mut play = default_animation_play(vec![vec![0xA2, 1, 1], vec![opcode, 2, 0, 9, 1]], vec![]);
+        assert_eq!(play.initial_default_animation_clip(0), Some((1, "bbbb")), "transient opcode {opcode:#x} keeps DFANM's default");
+        assert!(play.initial_stage_events().is_empty(), "the existing setup snapshot does not display a loop replaced by Once/Hold");
+        let beat = play.next(None);
+        assert!(beat.stage.is_empty(), "quiet setup poses do not replay");
+        assert!(matches!(beat.then, Then::End { at: 0, how: End::Finished }));
+        assert!(play.writes().is_story_neutral());
+    }
+}
+
+#[test]
+fn standing_default_snapshot_requires_a_supported_rate_and_fresh_dfanm_after_asped() {
+    let asped = |speed: u16| cat(&[vec![0xBD, 0], speed.to_le_bytes().to_vec()]);
+    for setup in [
+        vec![vec![0xA2, 1, 0]],
+        vec![vec![0xA2, 1, 2]],
+        vec![asped(32), vec![0xA2, 1, 1]],
+        vec![vec![0xA2, 1, 1], asped(16)],
+        vec![asped(32), asped(16)],
+        vec![vec![0xA2, 99, 1]],
+    ] {
+        let play = default_animation_play(setup, vec![]);
+        assert_eq!(play.initial_default_animation_clip(0), None, "unsupported or invalidated defaults must not turn into guessed slot 0");
+    }
+    let play = default_animation_play(vec![vec![0xA2, 1, 1], asped(32), asped(16), vec![0xA2, 2, 1]], vec![]);
+    assert_eq!(play.initial_default_animation_clip(0), Some((2, "cccc")), "a fresh normal-speed DFANM restores a known default");
+}
+
+#[test]
+fn runtime_default_changes_cannot_mutate_the_initial_default_snapshot() {
+    let mut play = default_animation_play(vec![vec![0xA2, 1, 1], vec![0xB1, 2, 0, 9, 1]], vec![
+        vec![0xA2, 2, 1], message(0, 0), vec![0xBD, 0, 32, 0], message(0, 1), vec![0xA2, 0, 1], message(0, 2),
+    ]);
+    let initial = play.initial_stage_events().to_vec();
+    for expected in [
+        Stage::Anim { entity: 0, animation: 2, how: AnimHow::Loop, first: None, last: None, speed: 16, divisor: 1 },
+        Stage::AnimSpeed { entity: 0, speed: 32 },
+        Stage::Anim { entity: 0, animation: 0, how: AnimHow::Loop, first: None, last: None, speed: 32, divisor: 1 },
+    ] {
+        let beat = play.next(None);
+        assert!(matches!(beat.then, Then::Window(_)));
+        assert_eq!(beat.stage.iter().map(|event| &event.what).collect::<Vec<_>>(), [&expected]);
+        assert_eq!(play.initial_default_animation_clip(0), Some((1, "bbbb")));
+        assert_eq!(play.initial_stage_events(), initial.as_slice(), "runtime metadata does not rewrite setup's displayed snapshot");
+        assert!(play.writes().is_story_neutral());
+    }
+}
+
+#[test]
+fn resumed_scene_captures_the_default_after_the_battle_prelude_without_replaying_it() {
+    let section = script(vec![("a", vec![
+        (0, vec![vec![0xA1, 99]]),
+        (1, vec![vec![0xA2, 1, 1], vec![0xB1, 2, 0, 9, 1], wait(10), message(0, 0),
+            vec![0x70, 0, 0x44, 1], vec![0xA2, 2, 1], message(0, 1)]),
+    ])], texts(2));
+    let spec = FieldSpec { overrides: vec![(0, section)], models: vec![
+        LoaderModelSpec::new("npc.char", "ABCD.HRC", &["AAFE.aki", "BBBB.yos", "CCCC.aki"]),
+    ], ..FieldSpec::default() };
+    let field = FieldFile::parse(spec.build()).unwrap();
+    let cast = CastMember { look: Look::Model { hrc: "abcd".into(), idle: "aafe".into() }, ..member(0, "a") };
+    let mut def = demo_def(vec![cast], start(0, 1));
+    def.resume_after_battle = Some(324);
+    let mut play = ScenePlay::new(&field, &def, &StoryState::at(4), 1).unwrap();
+    assert_eq!(play.initial_default_animation_clip(0), Some((1, "bbbb")), "the prebattle DFANM survives the transient Hold");
+    assert!(play.initial_stage_events().is_empty(), "the Hold still suppresses the initial displayed loop");
+    assert!(play.writes().is_story_neutral());
+    let beat = play.next(None);
+    let Then::Window(window) = &beat.then else { panic!("expected the continuation's window") };
+    assert!(matches!(window.message.origin, crate::script::dialogue::MessageOrigin::Canon { dialog: 1, .. }), "the prelude's window does not replay");
+    assert_eq!(stage(&[beat]), [(0, Stage::Anim { entity: 0, animation: 2, how: AnimHow::Loop, first: None, last: None, speed: 16, divisor: 1 })], "only the continuation's animation is emitted");
+    assert_eq!(play.initial_default_animation_clip(0), Some((1, "bbbb")), "later visible playback cannot mutate the snapshot");
+    assert!(play.initial_stage_events().is_empty());
+    assert!(play.writes().is_story_neutral());
+}
+
 #[test]
 fn animation_slots_use_the_actual_script_binding_and_only_the_matching_cast_model() {
     let section = script(vec![
@@ -1172,9 +1265,11 @@ fn animation_slots_use_the_actual_script_binding_and_only_the_matching_cast_mode
     let def = demo_def(vec![model(1, "AbCd"), member(2, "canon"), model(3, "zzzz"), model(4, "abcd"), model(5, "ijkl")], Vec::new());
     let play = ScenePlay::new(&field, &def, &StoryState::at(4), 1).unwrap();
     assert_eq!(play.animation_clip(1, 1), Some("bbbb"), "CHAR 99 still receives loader record 0");
+    assert_eq!(play.initial_default_animation_clip(1), Some((0, "aafe")));
     assert_eq!(play.animation_clip(1, 2), None, "out-of-range slot");
     for entity in [0, 2, 3, 4, 5, u8::MAX] {
         assert_eq!(play.animation_clip(entity, 0), None, "off-cast, appearance, wrong skeleton, absent binding or absent record: {entity}");
+        assert_eq!(play.initial_default_animation_clip(entity), None);
     }
     // The replacement removes npc's CHAR, moving the remaining records up one. Lookup must use
     // that script's bindings, not the original entity's old record or its CHAR operand.
@@ -1185,6 +1280,8 @@ fn animation_slots_use_the_actual_script_binding_and_only_the_matching_cast_mode
     let replacement = ScenePlay::with_script_section(&field, &def, &StoryState::at(4), 1, &replacement).unwrap();
     assert_eq!(replacement.animation_clip(1, 0), None);
     assert_eq!(replacement.animation_clip(5, 0), Some("iiii"));
+    assert_eq!(replacement.initial_default_animation_clip(1), None);
+    assert_eq!(replacement.initial_default_animation_clip(5), Some((0, "iiii")));
     assert!(replacement.writes().is_story_neutral());
     let uncertain = script(vec![
         ("director", vec![]), ("npc", vec![(0, vec![if_ub(3, 9, 0, 0, &[0xA1, 99])])]),
@@ -1196,6 +1293,8 @@ fn animation_slots_use_the_actual_script_binding_and_only_the_matching_cast_mode
     let uncertain = ScenePlay::with_script_section(&field, &uncertain_def, &StoryState::at(4), 1, &uncertain).unwrap();
     assert_eq!(uncertain.animation_clip(1, 0), None, "conditional CHAR has no certain loader binding");
     assert_eq!(uncertain.animation_clip(3, 0), None, "an uncertain earlier declaration also makes later loader indices uncertain");
+    assert_eq!(uncertain.initial_default_animation_clip(1), None);
+    assert_eq!(uncertain.initial_default_animation_clip(3), None);
 }
 
 #[test]

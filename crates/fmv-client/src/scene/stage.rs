@@ -12,7 +12,8 @@
 //! * `Face` turns it (the short way round), at once or over the frames it says.
 //! * `Show` hides or shows it.
 //! * The player resolves supported `Anim` loops and explicit forward Holds against the actor's exact field model.
-//!   Loops and Hold ranges follow scene time; a Hold stops at its last frame until replaced.
+//!   Loops and Hold ranges follow scene time; a Hold stops at its last frame until replaced. A bounded Once can
+//!   restart a separately remembered, different default slot after its inclusive range.
 //!   Other animations clear that loop and are counted ([`Counts::anims_skipped`]), never guessed at.
 //! * `Sound` is routed separately by the scene player to its cancellable audio channel.
 //! * `Camera` is **recorded** ([`CameraState`]) and not shown: the field's own camera stays where it is.
@@ -20,7 +21,7 @@
 //! Time is in field frames (30 a second), the interpreter's clock. A walk or a turn only moves while the scene runs: a
 //! window pauses the whole stage, as it pauses the interpreter.
 
-use fmv_ff7::script::scene::{CameraOp, MoveHow, Stage};
+use fmv_ff7::script::scene::{AnimHow, CameraOp, MoveHow, Stage};
 use crate::avatar::anim::ClipFrame;
 use std::collections::BTreeMap;
 use std::f32::consts::{PI, TAU};
@@ -69,6 +70,13 @@ struct Turn {
 struct SceneAnimation {
     clip: String,
     frame: ClipFrame,
+    once: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct DefaultAnimation {
+    slot: u8,
+    clip: String,
 }
 
 /// How far through a motion of `frames` frames it is after `elapsed` of them (0 to 1; no frames is done).
@@ -114,11 +122,12 @@ pub struct Actor {
     walked_frames: f32,
     animation: Option<SceneAnimation>,
     movement_animation: Option<SceneAnimation>,
+    default_animation: Option<DefaultAnimation>,
 }
 
 impl Actor {
     fn new(entity: u8) -> Self {
-        Self { entity, pos: None, triangle: None, heading: 0.0, visible: true, walk: None, turn: None, walked_frames: 0.0, animation: None, movement_animation: None }
+        Self { entity, pos: None, triangle: None, heading: 0.0, visible: true, walk: None, turn: None, walked_frames: 0.0, animation: None, movement_animation: None, default_animation: None }
     }
 
     /// The script entity this actor plays.
@@ -180,6 +189,21 @@ impl Actor {
                 };
                 if let Some(frame) = advancing { *frame += (frames - moving_frames).max(0.0); }
             }
+            self.finish_once();
+        }
+    }
+
+    fn restore_default(&mut self, overshoot: f32) {
+        let frame = if overshoot.is_finite() { overshoot.max(0.0) } else { 0.0 };
+        self.animation = self.default_animation.as_ref().map(|default| SceneAnimation {
+            clip: default.clip.clone(), frame: ClipFrame::Loop(frame), once: false,
+        });
+    }
+
+    fn finish_once(&mut self) {
+        if let Some(SceneAnimation { once: true, frame: ClipFrame::HoldRange { first, last, elapsed }, .. }) = &self.animation {
+            let duration = f32::from(last - first) + 1.0;
+            if *elapsed >= duration { self.restore_default(*elapsed - duration); }
         }
     }
 
@@ -286,11 +310,19 @@ impl Cast {
         }
     }
 
+    /// Remember verified setup metadata without changing the currently displayed pose.
+    pub fn remember_default(&mut self, entity: u8, slot: u8, clip: &str) {
+        if let Some(actor) = self.actors.get_mut(&entity) {
+            actor.default_animation = Some(DefaultAnimation { slot, clip: clip.to_string() });
+        }
+    }
+
     /// Set a resolved normal-speed full-range loop without changing the actor's model or movement.
-    pub fn apply_loop(&mut self, entity: u8, clip: &str, overshoot: f32) {
+    pub fn apply_loop(&mut self, entity: u8, slot: u8, clip: &str, overshoot: f32) {
         let Some(actor) = self.actors.get_mut(&entity) else { return self.off_cast() };
         let frame = if overshoot.is_finite() { overshoot.max(0.0) } else { 0.0 };
-        actor.animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::Loop(frame) });
+        actor.default_animation = Some(DefaultAnimation { slot, clip: clip.to_string() });
+        actor.animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::Loop(frame), once: false });
     }
 
     /// Use the resolved ordinary MOVE clip only during this movement. Its initial phase includes
@@ -298,7 +330,7 @@ impl Cast {
     pub fn apply_move_animation(&mut self, entity: u8, clip: &str) {
         let Some(actor) = self.actors.get_mut(&entity) else { return };
         if let Some(walk) = actor.walk.filter(|walk| walk.how == MoveHow::Walk) {
-            actor.movement_animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::Loop(walk.elapsed) });
+            actor.movement_animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::Loop(walk.elapsed), once: false });
         }
     }
 
@@ -306,7 +338,7 @@ impl Cast {
     pub fn apply_hold(&mut self, entity: u8, clip: &str, frame: u8) {
         let Some(actor) = self.actors.get_mut(&entity) else { return self.off_cast() };
         actor.movement_animation = None;
-        actor.animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::Hold(frame) });
+        actor.animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::Hold(frame), once: false });
     }
 
     /// Play one normal-speed forward range, holding its final frame. Loaded clip bounds are
@@ -315,7 +347,19 @@ impl Cast {
         let Some(actor) = self.actors.get_mut(&entity) else { return self.off_cast() };
         let elapsed = if overshoot.is_finite() { overshoot.max(0.0) } else { 0.0 };
         actor.movement_animation = None;
-        actor.animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::HoldRange { first, last, elapsed } });
+        actor.animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::HoldRange { first, last, elapsed }, once: false });
+    }
+
+    /// A bounded Once can return to a verified, different default slot. Same-slot phase
+    /// retention and gestures started during another movement remain unsupported.
+    pub fn apply_once(&mut self, entity: u8, slot: u8, clip: &str, first: u8, last: u8, overshoot: f32) -> bool {
+        let Some(actor) = self.actors.get_mut(&entity) else { return false };
+        if first > last || actor.walk.is_some() || !actor.default_animation.as_ref().is_some_and(|default| default.slot != slot) { return false; }
+        let elapsed = if overshoot.is_nan() { 0.0 } else { overshoot.max(0.0) };
+        actor.movement_animation = None;
+        actor.animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::HoldRange { first, last, elapsed }, once: true });
+        actor.finish_once();
+        true
     }
 
     /// Show one event of the interpreter. `overshoot` is how many frames ago it should have happened (the clock ran past
@@ -344,6 +388,7 @@ impl Cast {
             Stage::Move { entity, from, x, y, z, triangle, frames, how, .. } => {
                 let Some(actor) = self.actors.get_mut(entity) else { return self.off_cast() };
                 actor.movement_animation = None;
+                if actor.animation.as_ref().is_some_and(|animation| animation.once) { actor.restore_default(0.0); }
                 // DFANM is a standing default, not the actor's walk/jump/ladder animation.
                 // Restart it when movement ends; any unused part of a tick advances the idle.
                 match &mut actor.animation {
@@ -390,8 +435,9 @@ impl Cast {
                 let Some(actor) = self.actors.get_mut(entity) else { return self.off_cast() };
                 actor.visible = *visible;
             }
-            Stage::Anim { entity, .. } => {
+            Stage::Anim { entity, how, .. } => {
                 if let Some(actor) = self.actors.get_mut(entity) {
+                    if *how == AnimHow::Loop { actor.default_animation = None; }
                     actor.animation = None;
                     actor.movement_animation = None;
                     self.counts.anims_skipped = self.counts.anims_skipped.saturating_add(1);
@@ -403,6 +449,7 @@ impl Cast {
                 let Some(actor) = self.actors.get_mut(entity) else { return self.off_cast() };
                 // Dynamic speed changes are outside the supported normal-speed loop subset.
                 // A fresh DFANM can establish another supported loop explicitly.
+                actor.default_animation = None;
                 let standing = actor.animation.take().is_some();
                 let moving = actor.movement_animation.take().is_some();
                 if standing || moving {
@@ -439,7 +486,7 @@ mod tests {
         for how in [MoveHow::Walk, MoveHow::Jump, MoveHow::Ladder] {
             let mut cast = Cast::new([1]);
             cast.apply(&place(1, 0, 0), 0.0, &flat);
-            cast.apply_loop(1, "idle", 0.0);
+            cast.apply_loop(1, 0, "idle", 0.0);
             cast.advance(7.0);
             assert_eq!(cast.actor(1).unwrap().animation(), Some(("idle", ClipFrame::Loop(7.0))));
             cast.apply(&Stage::Move { entity: 1, from: None, x: 100, y: 0, z: None, triangle: None, frames: 10, how, animation: None }, 0.0, &flat);

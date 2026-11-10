@@ -1604,8 +1604,13 @@ restart after arrival, and freeze with dialogue. Normal-speed Holds support expl
 requested first frame, advance with scene time and remain on the requested last frame. Jessie uses `btce` frames 0–39
 in the ladder scene; her authored jump interrupts the range after its existing 15-frame wait. A single-frame Hold stays
 fixed, including Barret's `md8_4` frame 0 of `apfc`. The entire range must exist in the loaded clip; reversed or out-of-bounds
-ranges fall back without wrapping. Another animation, speed change or movement replaces the pose. Once, full-clip Holds,
-cropped loops, other rates and later ASPED changes clear the override until a supported animation arrives.
+ranges fall back without wrapping. Another animation, speed change or movement replaces the pose.
+A normal-speed bounded Once can also play while the actor stands, when its default animation is known and uses a different
+slot. Biggs's team-talk gesture uses `bxic` frames 10–19, then returns to slot 0, `acfe`. The default is retained separately
+from temporary Holds and gestures, including setup and resumed-scene state. Completion restarts the different default slot
+at frame 0 and advances it only by time after the gesture's inclusive range. Unsupported default loops or ASPED invalidate
+restoration until a supported default arrives. Unknown defaults, same-slot returns, full-clip Once/Hold, cropped loops and
+other rates keep the usual fallback; the exact original PC render-tick boundary remains unmeasured.
 Ordinary `MOVE` also resolves the same model's walk/run slot from the script's movement speed and field scale:
 slot 1 through three times the scale, slot 2 above it. Wedge's reactor approach uses slot 2 (`aaga`, 15 frames),
 then returns to his standing loop. The movement clip advances one frame per scene tick and freezes with dialogue;

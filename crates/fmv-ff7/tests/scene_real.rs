@@ -250,6 +250,11 @@ fn the_team_talk_is_the_cutscene_of_md1_1s_story_point_and_writes_its_step() {
         assert_eq!((model.hrc_stem(), model.animations.first().map(|a| a.stem())), (hrc.clone(), Some(idle.clone())), "{}", member.name);
         assert_eq!(init.name, member.name);
     }
+    let biggs = script.entity_inits(Some(&models)).into_iter().find(|init| init.entity == 3).unwrap();
+    let biggs_model = &loader.models[biggs.model_index.expect("Biggs's original model binding")];
+    assert_eq!((biggs.name.as_str(), biggs_model.hrc_stem().as_str()), ("av_m", "bwfd"));
+    let default_clip_stem = biggs_model.animations.first().expect("Biggs's default slot 0").stem();
+    assert_eq!(default_clip_stem, "acfe");
     // Biggs's requested CANIM2 uses a ten-frame range of his original clip.
     assert!(script.disassemble(3, 3).unwrap().iter().any(|ins| ins.opcode == 0xBB
         && ins.literal("animation") == Some(3) && ins.literal("first") == Some(10)
@@ -259,9 +264,13 @@ fn the_team_talk_is_the_cutscene_of_md1_1s_story_point_and_writes_its_step() {
     let model = fmv_ff7::load_field_model(&mut characters, "bwfd").unwrap();
     assert_eq!((clip.frame_count(), clip.bone_count()), (20, 21));
     assert!(model.fits(&clip) && clip.frame(10).is_some() && clip.frame(19).is_some());
+    let default_clip = fmv_ff7::load_field_animation(&mut characters, &default_clip_stem).unwrap();
+    assert_eq!((default_clip.frame_count(), default_clip.bone_count()), (1, 21));
+    assert!(model.fits(&default_clip) && default_clip.frame(0).is_some());
     // Who speaks: the windows' openers are the team (the survey: av_m, av_l, cl, ba).
     let mut play = ScenePlay::new(&f, &def, &StoryState::at(6), 1).unwrap();
     assert_eq!(play.animation_clip(3, 3), Some("bxic"));
+    assert_eq!(play.initial_default_animation_clip(3), Some((0, default_clip_stem.as_str())));
     let mut openers = Vec::new();
     let mut origin = 0u32;
     let (mut biggs_at, mut jessie_at) = (None, None);

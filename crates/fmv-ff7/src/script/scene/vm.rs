@@ -519,6 +519,9 @@ pub struct Vm {
     anim_speeds: BTreeMap<u8, u32>,
     /// Last default loop, including those set during quiet setup. A later non-loop clears it.
     default_anims: BTreeMap<u8, Stage>,
+    /// Standing defaults survive transient animations. Missing entries mean the engine's initial
+    /// slot 0; an explicit `None` records a speed change whose presentation is unsupported.
+    standing_defaults: BTreeMap<u8, Option<Stage>>,
     anim_ends: BTreeMap<u8, u32>,
     camera_end: u32,
     geometry: BTreeMap<u8, (i16, i16, u16, u16)>,
@@ -557,6 +560,7 @@ impl Vm {
             speeds: BTreeMap::new(),
             anim_speeds: BTreeMap::new(),
             default_anims: BTreeMap::new(),
+            standing_defaults: BTreeMap::new(),
             anim_ends: BTreeMap::new(),
             camera_end: 0,
             geometry: BTreeMap::new(),
@@ -627,6 +631,13 @@ impl Vm {
     /// The last default loop still active for `entity`, including quiet setup's result.
     pub fn default_animation_of(&self, entity: u8) -> Option<&Stage> {
         self.default_anims.get(&entity)
+    }
+
+    /// The remembered standing default, independently of the currently displayed setup pose.
+    pub(super) fn standing_default_animation_of(&self, entity: u8) -> Option<Stage> {
+        self.standing_defaults.get(&entity).cloned().unwrap_or_else(|| Some(Stage::Anim {
+            entity, animation: 0, how: AnimHow::Loop, first: None, last: None, speed: 16, divisor: 1,
+        }))
     }
 
     /// Every place the scene knows, by entity.
@@ -986,6 +997,7 @@ impl Vm {
         let event = Stage::Anim { entity, animation, how, first, last, speed: u8::try_from(speed.min(255)).unwrap_or(255), divisor };
         if how == AnimHow::Loop {
             self.default_anims.insert(entity, event.clone());
+            self.standing_defaults.insert(entity, Some(event.clone()));
         } else {
             self.default_anims.remove(&entity);
         }
@@ -1426,6 +1438,7 @@ impl Vm {
                 let speed = u32::try_from(self.num(ins, "speed", Width::U16)).unwrap_or(DEFAULT_ANIM_SPEED);
                 self.anim_speeds.insert(me, speed.max(1));
                 self.default_anims.remove(&me);
+                self.standing_defaults.insert(me, None);
                 // ASPED never advanced the scheduler epoch. Presentation invalidation must not
                 // turn a constant ASPED/JMP loop into active work that evades idle parking.
                 self.out.push(Timed {

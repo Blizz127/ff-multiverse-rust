@@ -30,6 +30,9 @@ pub trait SceneSource {
     /// A clip slot belonging to this cast entity's exact field model, if known locally.
     fn animation_clip(&self, _entity: u8, _slot: u8) -> Option<&str> { None }
 
+    /// Verified standing default after setup, kept separately from the active setup pose.
+    fn initial_default_animation_clip(&self, _entity: u8) -> Option<(u8, &str)> { None }
+
     /// Translate a displayed answer into the original server script's answer.
     fn server_answer(&self, _window: &fmv_ff7::script::scene::Window, answer: Option<usize>) -> Result<Option<usize>, ()> { Ok(answer) }
     /// A bot's answer is expressed in original-script line numbers.
@@ -57,6 +60,10 @@ impl SceneSource for ScenePlay {
         ScenePlay::animation_clip(self, entity, slot)
     }
 
+    fn initial_default_animation_clip(&self, entity: u8) -> Option<(u8, &str)> {
+        ScenePlay::initial_default_animation_clip(self, entity)
+    }
+
     fn height_at(&self, x: i16, y: i16, triangle: Option<u16>) -> Option<f32> {
         self.ground().height(x, y, triangle, None)
     }
@@ -80,6 +87,7 @@ struct PrivateEcho { play: ScenePlay, known_bar: bool }
 impl SceneSource for PrivateEcho {
     fn initial(&self) -> Vec<Stage> { self.play.initial_stage_events().to_vec() }
     fn animation_clip(&self, entity: u8, slot: u8) -> Option<&str> { self.play.animation_clip(entity, slot) }
+    fn initial_default_animation_clip(&self, entity: u8) -> Option<(u8, &str)> { self.play.initial_default_animation_clip(entity) }
     fn next(&mut self, answer: Option<usize>) -> Beat {
         let mut beat = self.play.next(answer);
         if self.known_bar {

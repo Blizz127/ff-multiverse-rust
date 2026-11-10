@@ -14,7 +14,7 @@
 //! [`run_to_end`] is the headless run the server makes to learn those writes from the answers a player gave.
 
 use super::data::{CastMember, Look, SceneDef, Spot};
-use super::vm::{Beat, Limits, MoveHow, SceneVars, Stage, Stats, Then, Timed, Vm, Where};
+use super::vm::{AnimHow, Beat, Limits, MoveHow, SceneVars, Stage, Stats, Then, Timed, Vm, Where};
 use crate::field::{FieldFile, ModelLoader, Vertex, Walkmesh};
 use crate::field_direction_to_facing;
 use crate::script::dialogue::End;
@@ -234,6 +234,8 @@ pub struct ScenePlay {
     initial: Vec<Stage>,
     /// Loader clips only for cast models whose skeleton matches the script's actual binding.
     animation_clips: BTreeMap<u8, Vec<String>>,
+    /// Supported standing defaults at the first visible boundary, after any battle prelude.
+    initial_default_animations: BTreeMap<u8, u8>,
     /// Last authored/resolved height of each actor, carried across beats to select overlapping floors.
     heights: BTreeMap<u8, i16>,
     cast: BTreeSet<u8>,
@@ -298,11 +300,17 @@ impl ScenePlay {
         let ground = Ground::new(mesh);
         let cast: BTreeSet<u8> = def.cast.iter().map(|m| m.entity).collect();
         let initial = Self::initial_stage(&vm, &ground, &def.cast);
+        let initial_default_animations = def.cast.iter().filter_map(|member| {
+            match vm.standing_default_animation_of(member.entity) {
+                Some(Stage::Anim { animation, how: AnimHow::Loop, first: None, last: None, speed: 16, divisor: 1, .. }) => Some((member.entity, animation)),
+                _ => None,
+            }
+        }).collect();
         let animation_clips = Self::animation_clips(field, script, &def.cast);
         let heights = initial.iter().filter_map(|event| match *event {
             Stage::Place { entity, z: Some(z), .. } => Some((entity, z)), _ => None,
         }).collect();
-        Ok(Self { def: def.clone(), section, ground, vm, setup, initial, animation_clips, heights, cast, off_cast: 0, story: story.clone(), ended: None })
+        Ok(Self { def: def.clone(), section, ground, vm, setup, initial, animation_clips, initial_default_animations, heights, cast, off_cast: 0, story: story.clone(), ended: None })
     }
 
     fn animation_clips(field: &FieldFile, script: &FieldScript<'_>, cast: &[CastMember]) -> BTreeMap<u8, Vec<String>> {
@@ -368,6 +376,13 @@ impl ScenePlay {
     /// Appearance substitutions, missing metadata and uncertain model bindings have no mapping.
     pub fn animation_clip(&self, entity: u8, slot: u8) -> Option<&str> {
         self.animation_clips.get(&entity)?.get(usize::from(slot)).map(String::as_str)
+    }
+
+    /// The standing default captured before visible playback, only at normal speed and on the
+    /// script's exact field-model binding. This does not change the initial displayed pose.
+    pub fn initial_default_animation_clip(&self, entity: u8) -> Option<(u8, &str)> {
+        let slot = *self.initial_default_animations.get(&entity)?;
+        Some((slot, self.animation_clip(entity, slot)?))
     }
 
     /// What the stage scripts did (their counters; the scene's own are [`ScenePlay::stats`]).
