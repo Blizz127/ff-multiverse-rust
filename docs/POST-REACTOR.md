@@ -91,3 +91,6 @@ at later virtual times, including Jessie, Biggs and Wedge.
 The unregistered `train_scene()` now names the measured nine-actor cast and their field-loader
 idle clips; the real-data check verifies that this run drops no off-cast stage events. The witness
 spot, rendering, skipped sounds and background effects, and the preceding route remain unverified.
+The original and Echo-S train director each yielded two windows, the same moment-51 write and no
+unresolved reads on the measured run; both Echo-S windows had voice files. This comparison does not
+enable the scene or prove that the arrival is reachable.
