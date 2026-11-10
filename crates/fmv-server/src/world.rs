@@ -116,8 +116,11 @@ mod follow;
 mod instances;
 mod party;
 mod press;
+mod resume;
 mod scene;
 mod story;
+
+pub(crate) use resume::StoryEntryFn;
 pub use areas::{TravelReply, AREA_UNLOAD_GRACE, TRAVEL_TIMEOUT};
 pub use battle::BattleReply;
 pub use party::PartyOutcome;
@@ -352,6 +355,8 @@ pub struct World {
     countdowns: BTreeMap<AccountId, countdown::Countdown>,
     /// The `now` of the last [`World::advance_countdowns`]: what a countdown's time left is measured against.
     clock: Instant,
+    /// MMO-style saving: where players stand, saved constantly, and the spots logins put them back on (see `resume`).
+    resume: resume::Resume,
 }
 
 impl World {
@@ -391,6 +396,7 @@ impl World {
             scenes: scene::SceneWorld::default(),
             countdowns: BTreeMap::new(),
             clock: Instant::now(),
+            resume: resume::Resume::default(),
         })
     }
 
@@ -477,16 +483,21 @@ impl World {
                 new.progression = story;
             }
         }
-        // Everyone joins the entry area, which is always loaded.
+        // Everyone joins the entry area, which is always loaded: on the spot it saved there (see `resume`), else on a
+        // spawn point.
         let home = self.home.clone();
-        let pos = self.areas.get_mut(&home).map_or_else(Pos::default, areas::AreaState::next_spawn_point);
+        let saved_home = self.resume_home_spot(new.account, &new.progression);
+        let pos = match saved_home {
+            Some((spot, _)) => spot,
+            None => self.areas.get_mut(&home).map_or_else(Pos::default, areas::AreaState::next_spawn_point),
+        };
         let entity = new.entity;
         let account = new.account;
         // Only a server that runs battles has characters to level and items to carry (see `progress`,
         // `inventory`).
         let progress = self.battle.as_ref().map(|bw| progress::resolve(bw.rules(), &new.progress));
         let inventory = self.battle.as_ref().map(|bw| Inventory::resolve(bw.rules(), new.progress.inventory.as_deref()));
-        let snapshot = EntitySnapshot { id: entity, pos, facing: 0.0, anim: AnimState::Idle, avatar: new.avatar };
+        let snapshot = EntitySnapshot { id: entity, pos, facing: saved_home.map_or(0.0, |(_, facing)| facing), anim: AnimState::Idle, avatar: new.avatar };
         self.players.insert(
             entity,
             Player {
@@ -530,8 +541,9 @@ impl World {
             self.tell_story(entity, None, &mut failed);
         }
         self.drop_failed(failed);
-        // A story that a scene took somewhere no walk leads back from stands there again (`scene::SceneHost::entry`).
-        self.enter_at_story(entity, now);
+        // Back to the spot it saved (see `resume`); else a story that a scene took somewhere no walk leads back from
+        // stands there again (`scene::SceneHost::entry`).
+        self.enter_at_saved_spot_or_story(entity, now);
         Ok(pos)
     }
 
@@ -551,6 +563,8 @@ impl World {
     fn remove_player(&mut self, entity: EntityId, failed: &mut Vec<(EntityId, bool)>) -> Option<Player> {
         let player = self.players.remove(&entity)?;
         self.by_account.remove(&player.account);
+        // Where it stood is saved before anything of it goes (see `resume`).
+        self.location_left(entity, &player);
         // A presentation it owned is dropped; a queued durable scene continues to its acknowledgment.
         self.scene_player_gone(entity, player.scene);
         // A player in transit is in no instance: the one it left was told already.

@@ -75,6 +75,7 @@ use crate::model::{
 };
 use crate::snapshot::{self, SnapshotInfo};
 
+pub mod location;
 mod player_character;
 pub(crate) mod scene;
 pub mod restyle;

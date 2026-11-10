@@ -129,8 +129,14 @@ async fn only_the_holder_of_the_token_can_delete_a_character_and_only_that_one_g
     assert_eq!(trash.len(), 1, "{trash:?}");
     assert!(trash[0].ends_with(&format!("-{aria_account}")), "{trash:?}");
     for (rel, bytes) in &aria_before {
+        if rel.ends_with(".location.json") {
+            // Where she last stood (MMO-style saving) is forgotten, not kept: a restored character joins where everyone does.
+            assert!(!state.join("trash").join(&trash[0]).join(rel).exists(), "{rel} is not kept in the trash");
+            continue;
+        }
         assert_eq!(&fs::read(state.join("trash").join(&trash[0]).join(rel)).unwrap(), bytes, "{rel} is in the trash as it was");
     }
+    assert!(aria_before.keys().any(|rel| rel.ends_with(".location.json")), "her spot was saved when she left: {:?}", aria_before.keys());
     assert_eq!(records_of(&state, brom_account), brom_before, "Brom's records are byte for byte what they were");
 
     // Her login is gone, the second delete is the answer for an unknown login (the client reads it as "already gone")...

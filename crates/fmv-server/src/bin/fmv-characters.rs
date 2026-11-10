@@ -936,6 +936,14 @@ fn delete(dir: &Path, account_arg: &str, dry_run: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // Its saved spots are no records the trash takes (MMO-style saving): forget them, as the server's delete does.
+    let forgotten = match store.forget_locations(account) {
+        Ok(forgotten) => forgotten,
+        Err(e) => {
+            eprintln!("account {} {name:?}: deleted, but its saved spot could not be removed: {e}", account.0);
+            Vec::new()
+        }
+    };
     drop(store);
     let after = match scan_tree(dir) {
         Ok(tree) => tree,
@@ -972,6 +980,14 @@ fn delete(dir: &Path, account_arg: &str, dry_run: bool) -> ExitCode {
     let mut allowed = Allowed::default();
     allowed.exact.extend(["index.log".to_owned(), "trash".to_owned(), entry_dir.clone(), format!("progression/{}", account.0)]);
     allowed.exact.extend(deleted.files.iter().cloned());
+    for rel in &forgotten {
+        if after.contains_key(rel) {
+            failures.push(format!("{rel} (the saved spot) is still there"));
+        } else {
+            println!("  forgotten: {rel} (where the character last stood; not kept in the trash)");
+        }
+    }
+    allowed.exact.extend(forgotten.iter().cloned());
     allowed.prefixes.push(format!("{entry_dir}/"));
     let untouched = verify_untouched(&opened, &after, &allowed);
     print_untouched(&untouched);

@@ -89,6 +89,10 @@ pub struct Login {
     pub progress: ProgressSeed,
     /// What the player is told about its own character in `Welcome` (identity, binding, slot).
     pub card: CharacterCard,
+    /// Where its player last stood in the hosted game (MMO-style saving: see `world::resume`). `None` for a new
+    /// account, an account of an older build, and a record that cannot be read (said in the log; the account then joins
+    /// as it always did).
+    pub location: Option<fmv_persist::SavedLocation>,
 }
 
 /// Why a login failed.
@@ -296,6 +300,10 @@ fn login_with_token_inner(store: &Store, game: GameId, token: &Secret, tint: [u8
         // `None` (a record of an older build, or no record) is "never stored": the starting stock.
         inventory: stored.as_ref().and_then(|record| record.inventory.clone()),
     };
+    let location = store.get_location(account, game).unwrap_or_else(|e| {
+        tracing::warn!(account = account.0, error = %e, "the saved spot cannot be read; the account joins where everyone joins");
+        None
+    });
     Ok(Login {
         account,
         avatar: character::shown(game, &record),
@@ -303,6 +311,7 @@ fn login_with_token_inner(store: &Store, game: GameId, token: &Secret, tint: [u8
         issued_token: None,
         progress,
         card: character::card(game, &record),
+        location,
     })
 }
 
@@ -349,6 +358,7 @@ fn register_inner(store: &Store, game: GameId, registration: Registration, now: 
         progress: ProgressSeed { character: slot.unwrap_or(progress::DEFAULT_CHARACTER), stored: initial.as_ref().map(Progress::from_record),
             inventory: initial.and_then(|record| record.inventory) },
         card,
+        location: None,
     })
 }
 
@@ -378,12 +388,19 @@ pub struct Deletion {
 /// delete that raced one) is `InvalidToken`, like any login with a token the server does not know.
 pub fn delete_character(store: &Store, account: AccountId, now: u64) -> Result<Deletion, LoginError> {
     match store.delete_account(account, now) {
-        Ok(deleted) => Ok(Deletion {
+        Ok(deleted) => {
+            // The saved spot is no record the trash takes (MMO-style saving: `world::resume`): forget it, so nothing of
+            // the deleted character stays in the live directories. A late spot write is refused for a deleted account.
+            if let Err(e) = store.forget_locations(account) {
+                tracing::warn!(account = account.0, error = %e, "the deleted character's saved spot could not be removed");
+            }
+            Ok(Deletion {
             name: deleted.display_name,
             entry: deleted.entry,
             files: deleted.files.len(),
             unfinished: deleted.unfinished.len(),
-        }),
+            })
+        }
         Err(PersistError::UnknownAccount(_)) => Err(LoginError::Refused(RejectCode::InvalidToken, "invalid or unknown token")),
         Err(e) => Err(LoginError::Internal(e.to_string())),
     }
