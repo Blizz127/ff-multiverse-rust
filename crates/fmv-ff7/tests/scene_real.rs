@@ -300,6 +300,50 @@ fn the_reactor_door_talk_is_the_cutscene_of_nmkin_1s_story_line_and_writes_its_s
     assert_eq!(play.off_cast(), 0, "every stage event is about the cast");
 }
 
+/// The talk before the Guard Scorpion is the cutscene of `nmkin_5`'s story point to 27, the point that starts the boss battle
+/// first: played against the story before the step, Barret and Cloud have eleven windows and the scene ends at the battle (the
+/// step is paid by the server when the battle is won, so the scene writes no moment of its own). Cloud is seeded on the
+/// triangle the director watches; without him there nothing happens.
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn the_guard_scorpion_talk_is_the_cutscene_of_the_point_that_starts_the_boss_battle() {
+    use fmv_adapter_api::AreaRuntime;
+    use fmv_core::{EditionProvenance, GameId, Platform};
+    use fmv_ff7::script::scene::{guard_scorpion_scene, scene, GUARD_SCORPION_SCENE_ID};
+    let f = field("nmkin_5").expect("FMV_FF7_DATA and nmkin_5");
+    let def = guard_scorpion_scene();
+    assert_eq!(scene(GUARD_SCORPION_SCENE_ID).as_ref(), Some(&def), "registered");
+    let dir = data_dir().unwrap();
+    let provenance = EditionProvenance { game: GameId::Ff7, platform: Platform::Pc, edition: "steam".into(), region: "any".into(), language: "en".into(), revision: "test".into(), sources: vec![], modded: false };
+    let adapter = fmv_ff7::Ff7Adapter::from_flevel_path(flevel_path(&dir), provenance).unwrap();
+    let area = adapter.load_field("nmkin_5").unwrap();
+    let before = StoryState::at(26);
+    let (point, step) = area.story_points().iter().find_map(|p| area.story_advance(&before.encode(), p.id).map(|s| (p.id, s))).expect("a point applies at 26");
+    assert_eq!(area.story_battle(point), Some(324), "the point starts the Guard Scorpion first");
+    let after = StoryState::decode(&step.progress).unwrap();
+    assert_eq!(after.moment, 27);
+    assert!(def.presents_step("nmkin_5", &before, &after));
+    let outcome = run_to_end(&f, &def, &before, 1, &[]).unwrap();
+    assert_eq!((outcome.end, outcome.windows, outcome.questions), (End::Battle, 11, 0));
+    assert_eq!(outcome.writes.moment, None, "the step comes with the win, not in the scene");
+    assert!(outcome.party.is_empty() && outcome.is_complete(), "{:?} {:?}", outcome.party, outcome.stats.unknown);
+    let mut unseeded = def.clone();
+    for member in &mut unseeded.cast {
+        member.start = None;
+    }
+    assert_eq!(run_to_end(&f, &unseeded, &before, 1, &[]).unwrap().windows, 0);
+    let mut play = ScenePlay::new(&f, &def, &before, 1).unwrap();
+    let mut openers = Vec::new();
+    loop {
+        match play.next(None).then {
+            Then::End { .. } => break,
+            Then::Window(w) => openers.push(w.opener),
+        }
+    }
+    assert_eq!(openers, [4, 4, 3, 4, 3, 3, 3, 3, 4, 3, 3]);
+    assert_eq!(play.off_cast(), 0);
+}
+
 /// The parts of a walkmesh that a walk can reach from each other (triangles joined by an edge that can be crossed, either way).
 fn mesh_parts(mesh: &fmv_ff7::field::Walkmesh) -> Vec<usize> {
     let n = mesh.triangles.len();

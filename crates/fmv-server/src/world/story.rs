@@ -133,9 +133,13 @@ impl World {
         let Some(step) = step else { return Reached::Nothing };
         if let Some(formation) = battle {
             let Some(clock) = battle_clock else { return Reached::Nothing };
+            // (the step's cutscene, if it has one, plays first: the battle starts when it ends)
+            if self.start_point_scene(entity, point, &step, now, on_entry, Some(formation)) {
+                return Reached::Held;
+            }
             return if self.start_story_battle(entity, point, formation, clock) { Reached::Applied } else { Reached::Nothing };
         }
-        if self.start_point_scene(entity, point, &step, now, on_entry) {
+        if self.start_point_scene(entity, point, &step, now, on_entry, None) {
             return Reached::Held;
         }
         self.apply_story_step(entity, point, step);

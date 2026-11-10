@@ -222,6 +222,38 @@ fn a_party_member_in_range_watches_a_cutscene_and_the_step_is_the_owners_alone()
     assert_eq!(saved(&mut saved_rx), [STORY_ADVANCED.to_vec()], "one save: the owner's");
 }
 
+/// A point that starts a battle first, with a cutscene: the cutscene plays first (no battle yet), and when it ends the battle
+/// starts for the player; the step still waits for the win (the battle's own test pays it).
+#[test]
+fn a_battle_point_with_a_cutscene_plays_it_and_then_starts_its_battle() {
+    use fmv_fixture::rooms::{BATTLE_FORMATION, BATTLE_REGION};
+    let adapter: Arc<dyn GameAdapter> = Arc::new(RoomsAdapter::with_interactions());
+    let mut w = World::with_party_config(adapter.load_area(HALL).unwrap(), PartyConfig::default()).unwrap();
+    w.set_area_source(adapter);
+    let (handle, mut saved_rx) = SaverHandle::channel();
+    w.set_progress_saver(handle);
+    let host = Arc::new(FakeHost::default());
+    *host.cutscene.lock().unwrap() = true;
+    w.configure_scenes(Some(SceneSettings { host: host.clone(), debug_preview: false, debug_new_story: None }));
+    let settings = BattleSettings { battle_speed: 0, ticks_per_second: 1000, fixed_seed: Some(7), ..BattleSettings::new(Arc::new(SyntheticRules::default())) };
+    w.configure_battle(Some(settings), false);
+    let mut now = Instant::now();
+    let mut a = seat(&mut w, "A", &[], now);
+    a.drain();
+    assert_eq!(BATTLE_REGION[0], (-300.0, 200.0));
+    for (x, y) in [(-100.0, 100.0), (-200.0, 180.0), (-270.0, 220.0)] {
+        assert_eq!(go(&mut w, &a, x, y, &mut now), MoveOutcome::Applied);
+    }
+    let run = starts(&a.drain()).first().map(|s| s.0).expect("the cutscene first");
+    assert!(w.in_scene(a.entity) && !w.in_battle(a.entity), "no battle while it plays");
+    w.scene_message(a.entity, ClientMsg::SceneEnd { run, skipped: false }, now);
+    assert!(!w.in_scene(a.entity) && w.in_battle(a.entity), "then the point's battle");
+    let log = logs_of(&mut w);
+    assert!(log.iter().any(|l| l.starts_with("story battle started") && l.contains("point=2") && l.contains(&format!("formation={BATTLE_FORMATION}"))), "{log:?}");
+    assert!(w.players.get(&a.entity).unwrap().progression.is_empty(), "the step waits for the win");
+    assert!(saved(&mut saved_rx).is_empty());
+}
+
 /// Without a cutscene for the step (the host has none) the step is applied at once, exactly as before cutscenes.
 #[test]
 fn a_point_without_a_cutscene_applies_its_step_at_once() {

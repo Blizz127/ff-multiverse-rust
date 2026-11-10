@@ -208,6 +208,9 @@ struct PointThen {
     /// Whether the point was reached by coming to stand in the area (`World::enter_story` stopped at it and judges the
     /// area's other entry points again after the step).
     on_entry: bool,
+    /// The battle the point starts first (`AreaRuntime::story_battle`), if it does: when the run ends the battle starts, and
+    /// the step is paid when it is won, as for a point without a cutscene.
+    battle: Option<u16>,
 }
 
 /// The scenes of a world.
@@ -368,7 +371,7 @@ impl World {
     /// ends, however it ends, the point's own step is applied (judged again then: `point_step_after_scene`), unless the player
     /// has left the world. Returns whether a run was started (the step then waits for it); `false` leaves the step to the
     /// caller, as before cutscenes. A previewing player, or one that is held, in a battle or in transit, gets none.
-    pub(super) fn start_point_scene(&mut self, entity: EntityId, point: u32, step: &StoryStep, now: Instant, on_entry: bool) -> bool {
+    pub(super) fn start_point_scene(&mut self, entity: EntityId, point: u32, step: &StoryStep, now: Instant, on_entry: bool, battle: Option<u16>) -> bool {
         let Some(host) = self.scenes.host.clone() else { return false };
         let (area, account, pos, before) = {
             let Some(p) = self.players.get(&entity) else { return false };
@@ -397,7 +400,7 @@ impl World {
             last_activity: now,
             writes_story: false,
             preview: false,
-            then: Some(PointThen { point, area, on_entry }),
+            then: Some(PointThen { point, area, on_entry, battle }),
         };
         self.start_run(run, record, &mut Vec::new());
         true
@@ -405,8 +408,22 @@ impl World {
 
     /// A cutscene run has ended: apply its point's step to its owner, judged on the owner's story NOW (as a battle's step is
     /// after the win), if the owner is still in the world, in that area, free, and allowed to move the story there; then, for a
-    /// point reached on entry, the area's other entry points the run held back.
+    /// point reached on entry, the area's other entry points the run held back. A point that starts a battle first starts it
+    /// instead (the step then waits for the win, `story_after_battle`).
     fn point_step_after_scene(&mut self, owner: EntityId, then: PointThen, now: Instant) {
+        if let Some(formation) = then.battle {
+            // The point starts a battle first: start it now (the step waits for the win), if the point still applies to the
+            // owner where it stands.
+            let applies = self.players.get(&owner).is_some_and(|p| {
+                p.area == then.area && p.battle.is_none() && p.transit.is_none() && p.scene.is_none()
+                    && p.placement.as_ref().is_none_or(|pl| pl.story_advance_allowed)
+                    && self.areas.get(&p.area).is_some_and(|a| a.runtime().story_advance(&p.progression, then.point).is_some())
+            });
+            if applies {
+                self.start_story_battle(owner, then.point, formation, now);
+            }
+            return;
+        }
         let step = {
             let Some(player) = self.players.get(&owner) else { return };
             if player.area != then.area || player.battle.is_some() || player.transit.is_some() || player.scene.is_some() {

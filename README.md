@@ -1428,6 +1428,9 @@ point moves the story to):
 
 * **`ff7/md1_1/team-talk`** (the reactor's gate, the point to 7): Biggs, Jessie, Cloud and Barret, twelve windows.
 * **`ff7/nmkin_1/reactor-door`** (the reactor's door, the line to 11): Barret and Cloud, five windows and the door's.
+* **`ff7/nmkin_5/guard-scorpion`** (the core, the point to 27 that starts the boss first): Barret and Cloud, eleven windows,
+  and then the battle. For a point that starts a battle first the run's end starts the battle (not the step), and the step
+  is paid when it is won, as before. The lines after the battle are not played.
 
 How it works (`World::start_point_scene`, `SceneHost::point_scene`):
 
@@ -1599,7 +1602,7 @@ ranks the floor for them. The pictures contain game art: they stay out of the re
   numbers in about 700 fields; entity names are kept, so resolving by name is the way when such a layer is wired in.
 * **After a scene that changes the story the area's NPC list is not re-sent** unless the player changes instance, so a trigger
   that should be gone can still be drawn; the server refuses the press.
-* Scenes are Rust data (five today), not files.
+* Scenes are Rust data (six today), not files.
 **Protocol v17 (the commander of the canon pair)** adds one optional field to the battle roster, `BattleMember::commander`
 (an account, for a canon companion only; absent from the JSON when the server commands the companion, so that a roster
 without it is byte for byte what v16 sent and reads as "the server's"), and changes who may send a `BattleCommand`:

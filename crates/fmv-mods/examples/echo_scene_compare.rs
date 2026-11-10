@@ -4,7 +4,7 @@ use fmv_ff7::field::FieldFile;
 use fmv_ff7::lgp::LgpArchive;
 use fmv_ff7::lzss;
 use fmv_ff7::script::dialogue::MessageOrigin;
-use fmv_ff7::script::scene::{reactor_door_scene, team_talk_scene, cargo_train_scene, flower_station_scene, post_escape_scene, proof_scene, sector7_intro_scene, sector7_pillar_scene, sector7_station_scene, station_scene, train_scene, ScenePlay, Then};
+use fmv_ff7::script::scene::{guard_scorpion_scene, reactor_door_scene, team_talk_scene, cargo_train_scene, flower_station_scene, post_escape_scene, proof_scene, sector7_intro_scene, sector7_pillar_scene, sector7_station_scene, station_scene, train_scene, ScenePlay, Then};
 use fmv_ff7::script::FieldScript;
 use fmv_ff7::story::StoryState;
 use fmv_mods::{Layers, ModSources, Mods};
@@ -15,7 +15,7 @@ fn main() {
     let mut lgp = LgpArchive::open_path(std::path::Path::new(&data).join("field/flevel.lgp")).expect("original archive");
     let mods = Mods::open(&ModSources { echo_s: Some(archive.into()), ..Default::default() }, Layers::ALL);
     let only = std::env::args().nth(2);
-    for (def, moment) in [(team_talk_scene(), 6), (reactor_door_scene(), 10), (post_escape_scene(), 33), (station_scene(), 33), (flower_station_scene(), 36), (cargo_train_scene(), 39), (train_scene(), 48), (sector7_station_scene(), 51), (sector7_pillar_scene(), 63), (sector7_intro_scene(), 63), (proof_scene(), 72)] {
+    for (def, moment) in [(team_talk_scene(), 6), (reactor_door_scene(), 10), (guard_scorpion_scene(), 26), (post_escape_scene(), 33), (station_scene(), 33), (flower_station_scene(), 36), (cargo_train_scene(), 39), (train_scene(), 48), (sector7_station_scene(), 51), (sector7_pillar_scene(), 63), (sector7_intro_scene(), 63), (proof_scene(), 72)] {
         if only.as_deref().is_some_and(|o| !def.id.contains(o)) {
             continue;
         }

@@ -441,6 +441,43 @@ pub fn reactor_door_scene() -> SceneDef {
     }
 }
 
+/// The id of the talk before the Guard Scorpion (the cutscene of `nmkin_5`'s story point to 27, which starts the battle).
+pub const GUARD_SCORPION_SCENE_ID: &str = "ff7/nmkin_5/guard-scorpion";
+
+/// **Barret and Cloud before the Guard Scorpion** (field `nmkin_5`): the cutscene of the field's story point that starts the
+/// boss fight and moves the story to 27 when it is WON ([`SceneDef::presents`]). The director (`dir`, entity 1) watches the
+/// triangle Cloud stands on; on triangle 2 with the story before 27 it runs Barret's script 3: the talk at the core (eleven
+/// windows) and then the battle, where the scene ends. As a cutscene the root is the director's main loop, the stage
+/// scripts the inits of the director (it names the triangle it watches), Cloud and Barret, and Cloud starts on triangle 2.
+/// When the run ends the server starts the point's battle as before, and the step is paid when it is won; the lines after
+/// the battle are not played.
+pub fn guard_scorpion_scene() -> SceneDef {
+    let cast = [(3, "cl", "aaaa", "acfe"), (4, "ba", "acgd", "adcb")]
+        .into_iter()
+        .map(|(entity, name, hrc, idle)| CastMember {
+            entity,
+            name: name.into(),
+            look: Look::Model { hrc: hrc.into(), idle: idle.into() },
+            start: (entity == 3).then_some(Spot { x: -67, y: -1571, triangle: 2, direction: 0 }),
+        })
+        .collect();
+    SceneDef {
+        id: GUARD_SCORPION_SCENE_ID.into(),
+        game: "ff7".into(),
+        field: "nmkin_5".into(),
+        trigger: Trigger { entity: 1, name: "dir".into(), slot: 0, talk_radius: 0, moments: 0..=26 },
+        setup: [1u8, 3, 4].into_iter().map(|e| ScriptRef::new(e, 0)).collect(),
+        given: vec![],
+        root: vec![Step::StartMain(1)],
+        cast,
+        speakers: vec![("Cloud".into(), 3), ("Barret".into(), 4)],
+        // Known gap until a spot is measured: the player stands where it reached the point.
+        witness: vec![],
+        arrival: Spot { x: -67, y: -1571, triangle: 2, direction: 0 },
+        presents: Some(27),
+    }
+}
+
 /// Offline director survey at moment 51. The route, witness, field effects and party state
 /// have not been verified for live play, so this definition is deliberately unregistered.
 pub fn sector7_station_scene() -> SceneDef {
@@ -635,7 +672,7 @@ pub fn proof_scene() -> SceneDef {
 /// ones before it keep their numbers): the proof, the two the escape from the first reactor ends in, and the cutscenes of the
 /// reactor's own story points.
 pub fn scenes() -> Vec<SceneDef> {
-    vec![proof_scene(), post_escape_scene(), station_scene(), team_talk_scene(), reactor_door_scene()]
+    vec![proof_scene(), post_escape_scene(), station_scene(), team_talk_scene(), reactor_door_scene(), guard_scorpion_scene()]
 }
 
 /// Whether `field` (the archive's spelling; case does not matter) is the field of a scene the game offers: a place a
