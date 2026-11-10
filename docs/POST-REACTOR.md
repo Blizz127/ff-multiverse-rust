@@ -28,3 +28,6 @@ the scene's moment is not advanced or teleported; how such a follower catches up
 Echo-S uses a
 rewritten field script with different entity and window numbering, so scene presentation and
 watcher synchronization must be reconciled before claiming that scene dialogue and voices use it.
+`SceneDef::rebind_entities` can map uniquely named entities into a replacement section, refusing
+missing or ambiguous names; it is not wired into playback, and entity identity alone does not prove
+the replacement's slots, choices, windows or timing are compatible.

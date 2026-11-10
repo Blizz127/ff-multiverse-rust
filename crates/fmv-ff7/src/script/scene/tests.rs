@@ -124,6 +124,28 @@ fn field_of(section: Vec<u8>) -> FieldFile {
     FieldFile::parse(spec.build()).expect("a synthetic field parses")
 }
 
+#[test]
+fn replacement_scene_entities_are_rebound_by_unique_name() {
+    let original = script(vec![("dic", vec![]), ("cloud", vec![]), ("barret", vec![]), ("biggs", vec![]), ("jessie", vec![]), ("wedge", vec![])], vec![]);
+    let replacement = script(vec![("wedge", vec![]), ("jessie", vec![]), ("biggs", vec![]), ("barret", vec![]), ("cloud", vec![]), ("dic", vec![])], vec![]);
+    let original = FieldScript::parse(&original).unwrap();
+    let replacement = FieldScript::parse(&replacement).unwrap();
+    let mut def = station_scene();
+    def.setup.push(ScriptRef::new(1, 3));
+    def.root.extend([Step::Await(ScriptRef::new(2, 4)), Step::Start(ScriptRef::new(3, 5)), Step::SetBit { bank: 1, address: 2, bit: 3 }]);
+    let rebound = def.rebind_entities(&original, &replacement).unwrap();
+    assert_eq!(rebound.trigger.entity, 5);
+    assert_eq!(rebound.setup, vec![ScriptRef::new(4, 3)]);
+    assert_eq!(rebound.root, vec![Step::StartMain(5), Step::Await(ScriptRef::new(3, 4)), Step::Start(ScriptRef::new(2, 5)), Step::SetBit { bank: 1, address: 2, bit: 3 }]);
+    assert_eq!(rebound.cast.iter().map(|m| m.entity).collect::<Vec<_>>(), vec![4, 3, 2, 1, 0]);
+    assert_eq!(rebound.speakers.iter().map(|(_, e)| *e).collect::<Vec<_>>(), vec![4, 3, 2, 1, 0]);
+    let missing = script(vec![("dic", vec![])], vec![]);
+    assert!(def.rebind_entities(&original, &FieldScript::parse(&missing).unwrap()).is_none());
+    let ambiguous = script(vec![("dic", vec![]), ("dic", vec![])], vec![]);
+    assert!(def.rebind_entities(&original, &FieldScript::parse(&ambiguous).unwrap()).is_none());
+    assert!(def.rebind_entities(&FieldScript::parse(&ambiguous).unwrap(), &replacement).is_none());
+}
+
 // ---- running the VM --------------------------------------------------------------------------
 
 fn vm_for(story: StoryState, given: &[Given]) -> Vm {

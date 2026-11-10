@@ -26,6 +26,7 @@
 //!   that watch stand (the others).
 
 use crate::story::StoryState;
+use crate::script::FieldScript;
 use std::ops::RangeInclusive;
 
 /// A script of a field: its entity (index in the field's script) and slot (0..32).
@@ -132,6 +133,35 @@ pub struct SceneDef {
 }
 
 impl SceneDef {
+    /// Rebind every entity reference to a replacement section by its original entity name.
+    /// Refuse missing or ambiguous names: guessing would drive the wrong actor or script.
+    /// This only maps identities; it does not establish that the replacement has equivalent
+    /// script slots, dialogue choices, timing, or multiplayer synchronization.
+    pub fn rebind_entities(&self, original: &FieldScript<'_>, replacement: &FieldScript<'_>) -> Option<Self> {
+        let map = |entity: u8| -> Option<u8> {
+            let name = original.entity_name(usize::from(entity))?;
+            if original.entities().iter().filter(|entry| entry.name == name).count() != 1 {
+                return None;
+            }
+            let mut matches = replacement.entities().iter().enumerate().filter(|(_, entry)| entry.name == name);
+            let index = matches.next()?.0;
+            if matches.next().is_some() { return None; }
+            u8::try_from(index).ok()
+        };
+        let mut def = self.clone();
+        def.trigger.entity = map(def.trigger.entity)?;
+        for script in &mut def.setup { script.entity = map(script.entity)?; }
+        for step in &mut def.root {
+            match step {
+                Step::Await(script) | Step::Start(script) => script.entity = map(script.entity)?,
+                Step::StartMain(entity) => *entity = map(*entity)?,
+                Step::SetBit { .. } => {},
+            }
+        }
+        for member in &mut def.cast { member.entity = map(member.entity)?; }
+        for (_, entity) in &mut def.speakers { *entity = map(*entity)?; }
+        Some(def)
+    }
     /// Whether the scene is offered at story moment `moment`.
     pub fn applies_at(&self, moment: u16) -> bool {
         self.trigger.moments.contains(&moment)
