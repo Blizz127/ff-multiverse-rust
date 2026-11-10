@@ -224,6 +224,8 @@ pub const SECTOR7_STATION_SCENE_ID: &str = "ff7/mds7st3/station-arrival-survey";
 pub const SECTOR7_INTRO_SCENE_ID: &str = "ff7/mds7/intro-survey";
 /// Survey-only flower seller scene; the gil transaction is not implemented.
 pub const FLOWER_STATION_SCENE_ID: &str = "ff7/md8_2/flower-survey";
+/// Survey-only Sector 7 pillar-field entry; not registered for play.
+pub const SECTOR7_PILLAR_SCENE_ID: &str = "ff7/mds7plr1/entry-survey";
 
 /// Field-authored cast and director scripts at moment 33. Not registered until the arrival
 /// trigger and subsequent field transition are ready to serve together.
@@ -366,6 +368,24 @@ pub fn flower_station_scene() -> SceneDef {
         setup: vec![], given: vec![], root: vec![Step::StartMain(0)], cast,
         speakers: vec![("Cloud".into(), 1), ("Aerith".into(), 2)],
         witness: vec![], arrival: Spot { x: -3445, y: 21419, triangle: 34, direction: 0 },
+    }
+}
+
+/// Offline pillar-field entry survey. Its branches depend on and change uncarried flags;
+/// the definition is not registered for live play.
+pub fn sector7_pillar_scene() -> SceneDef {
+    let cast = [
+        (12, "ballet", "acgd", "adcb"), (14, "aval", "bwfd", "acfe"),
+        (15, "avaf", "bxbe", "acfe"), (16, "avaw", "axdc", "acfe"),
+        (20, "man1", "cmif", "acfe"),
+    ].into_iter().map(|(entity, name, hrc, idle)| CastMember {
+        entity, name: name.into(), look: Look::Model { hrc: hrc.into(), idle: idle.into() }, start: None,
+    }).collect();
+    SceneDef {
+        id: SECTOR7_PILLAR_SCENE_ID.into(), game: "ff7".into(), field: "mds7plr1".into(),
+        trigger: Trigger { entity: 1, name: "produce".into(), slot: 0, talk_radius: 0, moments: 63..=63 },
+        setup: vec![], given: vec![], root: vec![Step::StartMain(1)], cast, speakers: vec![],
+        witness: vec![], arrival: Spot { x: 378, y: -264, triangle: 65, direction: 0 },
     }
 }
 

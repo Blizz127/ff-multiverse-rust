@@ -138,6 +138,13 @@ The intermediate `mds7plr1` producer also tests `Var[3][208]` bits 0, 1 and 3 an
 bits 0 and 3 on; a stage script can turn bit 1 off. These field-entry paths must be evaluated
 against actual player state, and the current monotonic union cannot represent the clear. Static
 references do not establish which branch an existing player took.
+An unregistered pillar-entry survey at moment 63 with absent flags assumed clear finishes
+without a window, starts five measured field actors and sets `Var[3][208]` bit 0. It reads
+that uncarried byte, so it cannot safely advance a real player; other flag combinations and
+their clears still need to be modeled. Its arrival spot and presentation are not validated.
+The original and Echo-S sections produced the same sampled write and no windows in this run;
+that does not establish behavior for other flag values or enable either layer. Its offline
+floor plan drew 16 walks and no witness.
 The unregistered `sector7_intro_scene()` surveys the field producer at moment 63 using zero for
 unavailable flags. That sampled run has no dialogue windows, stages ten actors and turns on bits
 0, 2, 3, 5 and 7 of `Var[3][209]`; it also reads uncarried bytes 209, 210 and 213. The outcome

@@ -268,6 +268,30 @@ fn flower_station_survey_distinguishes_purchase_and_nonpurchase_paths() {
     }
 }
 
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA); pillar entry is not enabled"]
+fn sector7_pillar_survey_reports_untracked_entry_flag_and_cast() {
+    let f = field("mds7plr1").expect("FMV_FF7_DATA and mds7plr1");
+    let def = fmv_ff7::script::scene::sector7_pillar_scene();
+    let story = StoryState::at(63);
+    let outcome = run_to_end(&f, &def, &story, 1, &[]).unwrap();
+    assert_eq!((outcome.end, outcome.windows, outcome.writes.moment), (End::Finished, 0, None));
+    assert_eq!(outcome.writes.untracked.get(&(3, 208)), Some(&1));
+    assert!(outcome.unknown_persistent_reads.contains(&(3, 208)));
+    assert_eq!((outcome.stats.unresolved, outcome.stats.dropped_requests), (0, 0));
+    assert!(outcome.stats.unknown.is_empty());
+    let mut play = ScenePlay::new(&f, &def, &story, 1).unwrap();
+    loop { if let Then::End { how, .. } = play.next(None).then { assert_eq!(how, End::Finished); break; } }
+    assert_eq!(play.off_cast(), 0);
+    let loader = f.model_loader().unwrap();
+    for (member, index) in def.cast.iter().zip([2usize, 4, 5, 6, 10]) {
+        let Look::Model { hrc, idle } = &member.look else { panic!("expected a field model") };
+        let model = &loader.models[index];
+        assert_eq!(model.hrc_stem(), *hrc);
+        assert_eq!(model.animations.first().map(|a| a.stem()).as_deref(), Some(idle.as_str()));
+    }
+}
+
 // ---- 1. the trigger is found -----------------------------------------------------------------
 
 #[test]

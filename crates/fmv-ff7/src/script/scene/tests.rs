@@ -675,6 +675,7 @@ fn route_survey_definitions_are_not_registered_for_play() {
     assert!(scene(SECTOR7_STATION_SCENE_ID).is_none());
     assert!(scene(SECTOR7_INTRO_SCENE_ID).is_none());
     assert!(scene(FLOWER_STATION_SCENE_ID).is_none());
+    assert!(scene(SECTOR7_PILLAR_SCENE_ID).is_none());
 }
 
 #[test]
