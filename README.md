@@ -1441,7 +1441,12 @@ How it works (`World::start_point_scene`, `SceneHost::point_scene`):
 * The scene's own interpreted write is held to the point's step by a real-data test (`tests/scene_real.rs`,
   `the_team_talk_is_the_cutscene_of_md1_1s_story_point_and_writes_its_step`), so a cutscene never shows a story the server
   did not apply.
-* A player alone sees Echo-S's edition when both editions tell the same story (as for the scenes after the escape).
+* A player alone sees Echo-S's edition when both editions tell the same story (as for the scenes after the escape). Both
+  reactor cutscenes do on the owner's archive: twelve and six windows, every one voiced. "The same story" compares what
+  the editions write, the party changes and the skipped instructions a window could announce
+  (`fmv_ff7::script::scene::ANNOUNCED_STATE_OPS`: gil, items, materia, HP and MP amounts, the party's requests, splits and
+  joins); a name entry or a display setting one edition has and the other has not does not count (Echo-S's `md1_1` names one
+  character where the original names two).
 
 Known gap: the player's own character stands where it reached the point, which is where the cast's Cloud starts too, until a
 witness spot is measured for the field.

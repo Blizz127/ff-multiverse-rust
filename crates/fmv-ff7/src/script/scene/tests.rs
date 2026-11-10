@@ -635,8 +635,10 @@ fn two_editions_tell_the_same_story_only_when_what_is_kept_is_the_same() {
     assert!(!original.same_story_as(&run([message(0, 0), vec![0x3F]].concat(), lines())));
     // a party change the other does not make
     assert!(!original.same_story_as(&run([message(0, 0), setword(2, 0, 9), vec![0x3F], vec![0xC9, 1]].concat(), lines())));
-    // a state instruction the other does not skip (the restore is missing)
-    assert!(!original.same_story_as(&run([message(0, 0), setword(2, 0, 9)].concat(), lines())));
+    // a full restore the other does not skip announces nothing: the same story
+    assert!(original.same_story_as(&run([message(0, 0), setword(2, 0, 9)].concat(), lines())));
+    // gil the other does not take (GOLDd 1) could be announced in a window: not the same story
+    assert!(!original.same_story_as(&run([message(0, 0), setword(2, 0, 9), vec![0x3F], vec![0x3A, 0, 1, 0, 0, 0]].concat(), lines())));
     // a saved variable the other does not write (bank 3), while field scratch (bank 5) does not count
     assert!(!original.same_story_as(&run([message(0, 0), setword(2, 0, 9), vec![0x3F], setbyte(3, 40, 1)].concat(), lines())));
     assert!(original.same_story_as(&run([message(0, 0), setword(2, 0, 9), vec![0x3F], setbyte(5, 40, 1)].concat(), lines())));
@@ -664,6 +666,8 @@ fn the_skipped_state_instructions_are_real_and_skipped() {
         assert_eq!(outcome.stats.ignored.get(name), Some(&1), "{name} (0x{op:02X}) is skipped: {:?} / unknown {:?}", outcome.stats.ignored, outcome.stats.unknown);
     }
     assert!(FULL_RESTORE_OPS.iter().all(|op| SKIPPED_STATE_OPS.contains(op)));
+    assert!(ANNOUNCED_STATE_OPS.iter().all(|op| SKIPPED_STATE_OPS.contains(op)), "the announced ones are skipped ones");
+    assert!(!ANNOUNCED_STATE_OPS.iter().any(|op| FULL_RESTORE_OPS.contains(op) || ["MENU", "SPECIAL", "STTIM", "CKITM"].contains(op)));
     assert!(!["PRTYP", "PRTYM", "PRTYE"].iter().any(|op| SKIPPED_STATE_OPS.contains(op)), "the party's are recorded, not skipped");
 }
 

@@ -89,6 +89,18 @@ pub const SKIPPED_STATE_OPS: &[&str] = &[
 /// keeps no HP or MP between battles (every fighter starts a battle full) loses nothing by skipping them.
 pub const FULL_RESTORE_OPS: &[&str] = &["HMPMAX1", "HMPMAX2", "MHMMX", "HMPMAX3"];
 
+/// The ones of [`SKIPPED_STATE_OPS`] that a window of the scene could announce or that change who takes part: gil, items,
+/// materia, HP and MP by an amount, the materia menu's locks, and the party's requests, splits and joins. Two editions of a
+/// scene tell the same story only if they skip the same of THESE ([`Outcome::same_story_as`]). The rest are skipped by
+/// both editions alike and announce nothing a player is told was given: a menu the game opens (a name entry, a shop, a
+/// save), the `SPECIAL` family's settings, a timer, a full restore, and an item count a branch reads (whose outcome the
+/// writes and the end already compare). An edition may use more or fewer of those (Echo-S's `md1_1` has one name entry and
+/// two `SPECIAL`s where the original has two name entries).
+pub const ANNOUNCED_STATE_OPS: &[&str] = &[
+    "PREQ", "PRQSW", "PRQEW", "JOIN", "SPLIT", "SPTYE", "GTPYE", "GOLDu", "GOLDd", "CHGLD", "MPu", "MPd", "HPu", "HPd", "STITM", "DLITM",
+    "SMTRA", "DMTRA", "CMTRA", "MMBud", "MMBLK", "MMBUK",
+];
+
 /// What a headless run of a scene came to ([`run_to_end`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Outcome {
@@ -127,14 +139,14 @@ impl Outcome {
     /// Whether this run and `other` (the same scene from another edition of the field's script) come to the same story: both
     /// interpreted completely, the same end and destination, the same writes to the moment, to the variables the story
     /// carries and to every other saved variable (banks 1 to 4), the same party changes, and the same skipped instructions
-    /// that touch the player's state (so neither does something to the player the other does not). The windows may differ:
-    /// how a scene is worded and how many windows it takes is the edition's own.
+    /// whose effect a window could announce ([`ANNOUNCED_STATE_OPS`]: so neither tells of something given or taken that the
+    /// other does not). The windows may differ: how a scene is worded and how many windows it takes is the edition's own.
     pub fn same_story_as(&self, other: &Self) -> bool {
         let persistent = |w: &Writes| w.untracked.iter().filter(|((bank, _), _)| (1..=4).contains(bank)).map(|(k, v)| (*k, *v)).collect::<BTreeMap<_, _>>();
         let state_ops = |o: &Self| {
             let mut ops: BTreeMap<&'static str, u32> = BTreeMap::new();
             for stats in [&o.setup_stats, &o.stats] {
-                for (op, n) in stats.ignored.iter().filter(|(op, _)| SKIPPED_STATE_OPS.contains(op)) {
+                for (op, n) in stats.ignored.iter().filter(|(op, _)| ANNOUNCED_STATE_OPS.contains(op)) {
                     *ops.entry(op).or_insert(0) += n;
                 }
             }

@@ -408,9 +408,9 @@ pub const REACTOR_DOOR_SCENE_ID: &str = "ff7/nmkin_1/reactor-door";
 /// to 11 ([`SceneDef::presents`]). The line (`evb`, entity 12, across the corridor at y 2166) runs its script 3 when the
 /// player's character walks onto it with the story before 11: it writes 11, has Cloud and Barret walk and talk (five
 /// windows), shows the door's window and sets the party back to Cloud and Barret (`PRTYE`, the party the story already
-/// has). As a cutscene the root is that script, the stage scripts the init part of every entity's script 0 (Barret stands at
-/// the door), and Cloud starts on the line, on triangle 25, facing the door; the step is the line's own, applied when the
-/// scene ends (`tests/scene_real.rs` holds the scene's own write to it).
+/// has). As a cutscene the root is that script, the stage scripts the init part of every named entity's script 0 (Barret
+/// stands at the door), and Cloud starts on the line, on triangle 25, facing the door; the step is the line's own, applied
+/// when the scene ends (`tests/scene_real.rs` holds the scene's own write to it).
 pub fn reactor_door_scene() -> SceneDef {
     let cast = [(3, "cl", "aaaa", "acfe"), (4, "ba", "acgd", "adcb")]
         .into_iter()
@@ -426,7 +426,10 @@ pub fn reactor_door_scene() -> SceneDef {
         game: "ff7".into(),
         field: "nmkin_1".into(),
         trigger: Trigger { entity: 12, name: "evb".into(), slot: 3, talk_radius: 0, moments: 0..=10 },
-        setup: (0..15).map(|e| ScriptRef::new(e, 0)).collect(),
+        // The inits of the entities that take part or stage the corridor. Left out: the door's four unnamed pieces and the
+        // bomb's two timers (`time`, `timeo`), which take no part; a scene is bound to another edition of the script by its
+        // entities' names, and Echo-S's edition adds a `Time` entity that a case-blind match cannot tell from `time`.
+        setup: [0u8, 3, 4, 9, 10, 11, 12, 13, 14].into_iter().map(|e| ScriptRef::new(e, 0)).collect(),
         given: vec![],
         root: vec![Step::Await(ScriptRef::new(12, 3))],
         cast,
