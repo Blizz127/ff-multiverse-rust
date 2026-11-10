@@ -670,6 +670,12 @@ fn headless_outcome_includes_setup_interpreter_observations() {
 }
 
 #[test]
+fn route_survey_definitions_are_not_registered_for_play() {
+    assert!(scene(EARLY_BAR_SCENE_ID).is_none());
+    assert!(scene(SECTOR7_STATION_SCENE_ID).is_none());
+}
+
+#[test]
 fn setup_reports_when_a_script_exceeds_its_budget() {
     let section = script(vec![("a", vec![(3, vec![xyzi(10, 20, 0, 0), dir(128)])])], vec![]);
     let parsed = FieldScript::parse(&section).unwrap();

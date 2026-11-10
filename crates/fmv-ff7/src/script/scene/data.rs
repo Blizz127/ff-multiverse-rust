@@ -218,6 +218,8 @@ pub const STATION_SCENE_ID: &str = "ff7/md8_1/post-escape-station";
 pub const TRAIN_SCENE_ID: &str = "ff7/tin_1/sector-seven-train";
 /// Survey-only early Seventh Heaven director; not registered for play.
 pub const EARLY_BAR_SCENE_ID: &str = "ff7/mds7pb_1/early-bar-survey";
+/// Survey-only station arrival in Sector 7; not registered for play.
+pub const SECTOR7_STATION_SCENE_ID: &str = "ff7/mds7st3/station-arrival-survey";
 
 /// Field-authored cast and director scripts at moment 33. Not registered until the arrival
 /// trigger and subsequent field transition are ready to serve together.
@@ -301,6 +303,27 @@ pub fn early_bar_scene() -> SceneDef {
     }
     def.witness.clear();
     def
+}
+
+/// Offline director survey at moment 51. The route, witness, field effects and party state
+/// have not been verified for live play, so this definition is deliberately unregistered.
+pub fn sector7_station_scene() -> SceneDef {
+    let cast = [
+        (11, "cloud", "aaaa", "aafe"), (12, "ballet", "acgd", "adcb"),
+        (14, "aval", "bwfd", "acfe"), (15, "avaf", "bxbe", "acfe"),
+        (16, "avaw", "axdc", "acfe"), (17, "guard", "azhe", "badc"),
+        (18, "man1", "cfha", "cgcc"), (19, "obasan1", "coad", "coab"),
+        (20, "woman1", "cbfe", "bajb"), (22, "child", "cpca", "bnac"),
+    ].into_iter().map(|(entity, name, hrc, idle)| CastMember {
+        entity, name: name.into(), look: Look::Model { hrc: hrc.into(), idle: idle.into() }, start: None,
+    }).collect();
+    SceneDef {
+        id: SECTOR7_STATION_SCENE_ID.into(), game: "ff7".into(), field: "mds7st3".into(),
+        trigger: Trigger { entity: 1, name: "produce".into(), slot: 0, talk_radius: 0, moments: 51..=51 },
+        setup: vec![], given: vec![], root: vec![Step::StartMain(1)], cast,
+        speakers: vec![("Cloud".into(), 11), ("Barret".into(), 12)],
+        witness: vec![], arrival: Spot { x: -2891, y: 3392, triangle: 26, direction: 0 },
+    }
 }
 
 /// Script entities and slots of the proof field (measured on the owned Steam copy: `tests/scene_real.rs` checks them).

@@ -195,6 +195,30 @@ fn early_bar_survey_tracks_both_choices_and_stages_its_cast() {
     }
 }
 
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA); station arrival is not enabled"]
+fn sector7_station_survey_runs_the_authored_arrival_chain() {
+    let f = field("mds7st3").expect("FMV_FF7_DATA and mds7st3");
+    let def = fmv_ff7::script::scene::sector7_station_scene();
+    let story = StoryState::at(51);
+    let outcome = run_to_end(&f, &def, &story, 1, &[]).unwrap();
+    assert_eq!((outcome.end, outcome.windows, outcome.writes.moment), (End::Finished, 1, Some(63)));
+    assert!(outcome.unknown_persistent_reads.is_empty());
+    assert_eq!((outcome.stats.unresolved, outcome.stats.dropped_requests), (0, 0));
+    assert!(outcome.stats.unknown.is_empty());
+    assert!(outcome.stats.ignored.contains_key("SOUND"), "the survey does not claim audio parity");
+    let mut play = ScenePlay::new(&f, &def, &story, 1).unwrap();
+    loop { if let Then::End { how, .. } = play.next(None).then { assert_eq!(how, End::Finished); break; } }
+    assert_eq!(play.off_cast(), 0);
+    let loader = f.model_loader().unwrap();
+    for (member, index) in def.cast.iter().zip([0usize, 1, 3, 4, 5, 6, 7, 8, 9, 11]) {
+        let Look::Model { hrc, idle } = &member.look else { panic!("expected a field model") };
+        let model = &loader.models[index];
+        assert_eq!(model.hrc_stem(), *hrc);
+        assert_eq!(model.animations.first().map(|a| a.stem()).as_deref(), Some(idle.as_str()));
+    }
+}
+
 // ---- 1. the trigger is found -----------------------------------------------------------------
 
 #[test]

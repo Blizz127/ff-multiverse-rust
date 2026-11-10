@@ -176,3 +176,17 @@ the bar and is not evidence of which field was rendered.
 The original and Echo-S train director each yielded two windows, the same moment-51 write and no
 unresolved reads on the measured run; both Echo-S windows had voice files. This comparison does not
 enable the scene or prove that the arrival is reachable.
+
+At `mds7st3`, the entry field's producer starts a chain through the guard, child, a passenger,
+Wedge, Biggs, Jessie and Barret before Cloud's script writes moment 63. The unregistered
+`sector7_station_scene()` surveys the producer at moment 51 with the ten observed actors; the
+owned-data check verifies the field-loader model/idle stems and no dropped cast events. The
+headless run reaches one window and moment 63 without unknown instructions, unresolved positions
+or unknown persistent-byte reads, but it skips sound and field-control/background operations.
+The arriving player's location, audiovisual presentation, party state, and actual route from the
+train remain unverified. The authored train jump names arrival `(-2891, 3392, triangle 26)`;
+that is an arrival, not a validated witness position. An offline floor plan drew 100 actor walks
+and no witness; it does not establish a safe place to stand.
+The original and Echo-S replacement scripts both produced that single window and the same
+moment-63 and scratch-variable writes in the measured run, and the Echo-S window had a local
+voice-file match. This is not a listening check or proof of live scene synchronization.
