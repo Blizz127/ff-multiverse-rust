@@ -91,6 +91,32 @@ fn play(f: &FieldFile, moment: u16, answers: &[usize]) -> Played {
 const CLOUD: u8 = proof::CLOUD;
 const TIFA: u8 = proof::TIFA;
 
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn post_escape_director_reaches_its_scripted_destination() {
+    let f = field("md8_4").expect("FMV_FF7_DATA and md8_4");
+    let mut def = proof_scene();
+    def.field = "md8_4".to_string();
+    def.trigger.entity = 0;
+    def.setup = vec![];
+    def.given = vec![];
+    def.root = vec![Step::StartMain(1), Step::StartMain(2), Step::StartMain(4), Step::StartMain(5), Step::StartMain(6), Step::StartMain(0)];
+    def.cast = [(1, "cloud", "aaaa", 19, 375, 5), (2, "barret", "acgd", -100, 493, 5),
+                (4, "biggs", "bwfd", -41, 699, 7), (5, "jessie", "axdc", -65, 95, 1),
+                (6, "wedge", "bxbe", 68, 245, 3)].into_iter().map(|(entity, name, hrc, x, y, triangle)| CastMember {
+        entity, name: name.to_string(), look: Look::Model { hrc: hrc.to_string(), idle: "acfe".to_string() },
+        start: Some(fmv_ff7::script::scene::Spot { x, y, triangle, direction: 0 }),
+    }).collect();
+    def.speakers.clear();
+    let outcome = run_to_end(&f, &def, &StoryState::at(33), 1, &[]).unwrap();
+    eprintln!("post-escape outcome: {:?}, windows={}, stats={:?}", outcome.end, outcome.windows, outcome.stats);
+    assert_eq!(outcome.end, End::MapJump { field: 133 });
+    assert!(outcome.windows >= 3);
+    assert!(outcome.stats.unknown.is_empty());
+    assert_eq!(outcome.stats.dropped_requests, 0);
+    assert_eq!(outcome.stats.unresolved, 0);
+}
+
 // ---- 1. the trigger is found -----------------------------------------------------------------
 
 #[test]

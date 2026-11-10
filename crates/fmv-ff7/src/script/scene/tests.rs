@@ -158,6 +158,14 @@ fn start(entity: u8, slot: u8) -> Vec<Step> {
     vec![Step::Start(ScriptRef::new(entity, slot))]
 }
 
+#[test]
+fn a_director_main_starts_after_initialization_returns() {
+    let section = script(vec![("director", vec![(0, vec![message(0, 0), vec![RET], message(0, 1)])])], texts(2));
+    let (beats, vm) = run_root(&section, vec![Step::StartMain(0)], &[]);
+    assert_eq!(dialogs_of(&beats), [1]);
+    assert_eq!(vm.stats().dropped_requests, 0);
+}
+
 fn windows(beats: &[Beat]) -> Vec<&Window> {
     beats.iter().filter_map(|b| if let Then::Window(w) = &b.then { Some(w) } else { None }).collect()
 }

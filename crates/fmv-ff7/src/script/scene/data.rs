@@ -50,6 +50,8 @@ pub enum Step {
     Await(ScriptRef),
     /// Start a script and go on (`REQSW`): the scene ends when it and everything it started has.
     Start(ScriptRef),
+    /// Start the main part of an entity's script 0 (after its initial RET).
+    StartMain(u8),
 }
 
 /// A field variable (one byte) the scene assumes when it is offered.

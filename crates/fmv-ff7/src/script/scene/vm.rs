@@ -1321,6 +1321,16 @@ impl Vm {
             }
             match step {
                 Step::SetBit { bank, address, bit } => self.flip_bit(bank, address, i32::from(bit), 0x82),
+                Step::StartMain(entity) => {
+                    let main = script.entity_inits(None).into_iter().find(|init| init.entity == usize::from(entity)).and_then(|init| init.main_start);
+                    if let Some(main) = main {
+                        if let Some(child) = self.spawn(script, usize::from(entity), 0, 7, time) {
+                            if let Some(thread) = self.threads.get_mut(child) { thread.code = Code::Script { pc: main }; }
+                        }
+                    } else {
+                        self.stats.dropped_requests = self.stats.dropped_requests.saturating_add(1);
+                    }
+                }
                 Step::Await(ScriptRef { entity, slot }) | Step::Start(ScriptRef { entity, slot }) => {
                     let wait = matches!(step, Step::Await(_));
                     let Some(child) = self.spawn(script, usize::from(entity), usize::from(slot), 7, time) else { continue };
