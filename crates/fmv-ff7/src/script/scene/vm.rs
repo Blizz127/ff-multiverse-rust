@@ -1417,13 +1417,14 @@ impl Vm {
                 self.do_anim(idx, me, ins, AnimHow::Once, true);
                 Flow::Yield
             }
+            // ANIM!1 starts asynchronously; ANIM!2 waits for the existing clip deadline.
             0xAF => {
-                self.do_anim(idx, me, ins, AnimHow::Hold, true);
-                Flow::Yield
-            }
-            0xBA => {
                 self.do_anim(idx, me, ins, AnimHow::Hold, false);
                 Flow::Next
+            }
+            0xBA => {
+                self.do_anim(idx, me, ins, AnimHow::Hold, true);
+                Flow::Yield
             }
             // CANM!1 starts asynchronously; CANM!2 waits for the existing clip deadline.
             0xB1 => {

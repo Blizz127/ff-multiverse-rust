@@ -466,13 +466,29 @@ fn a_script_turns_towards_another_entity_it_knows_the_place_of() {
 }
 
 #[test]
-fn animations_come_out_with_how_they_play_and_the_script_waits_where_the_engine_does() {
-    // ANIM!1 (waits, holds) then ANIM!2 (does not wait), DFANM (loops).
-    let a = vec![vec![0xAF, 3, 1], vec![0xBA, 4, 1], vec![0xA2, 0, 1], message(0, 0)];
-    let section = script(vec![("a", vec![(1, a)])], texts(1));
-    let (beats, _) = run_root(&section, start(0, 1), &[]);
-    let anims: Vec<(u32, u8, AnimHow)> = stage(&beats).into_iter().filter_map(|(at, s)| if let Stage::Anim { animation, how, .. } = s { Some((at, animation, how)) } else { None }).collect();
-    assert_eq!(anims, [(0, 3, AnimHow::Hold), (15, 4, AnimHow::Hold), (15, 0, AnimHow::Loop)]);
+fn full_holds_dispatch_async_af_and_sync_ba_before_explicit_waits() {
+    // Isolated clips exercise dispatch without assuming how overlapping animations are queued.
+    // Full clips retain the VM's existing fifteen-frame estimate.
+    for (opcode, expected_at) in [(0xAF, 6), (0xBA, 21)] {
+        let section = script(vec![("a", vec![(1, vec![vec![opcode, 4, 1], wait(6), message(0, 0)])])], texts(1));
+        let (beats, vm) = run_root(&section, start(0, 1), &[]);
+        assert_eq!(stage(&beats), [(0, Stage::Anim { entity: 0, animation: 4, how: AnimHow::Hold,
+            first: None, last: None, speed: 16, divisor: 1 })]);
+        assert_eq!(windows(&beats)[0].at, expected_at, "only BA adds the existing clip wait before WAIT6");
+        assert_eq!(end_of(&beats), End::Finished);
+        assert!(vm.writes().is_empty());
+    }
+}
+
+#[test]
+fn animw_joins_the_existing_full_hold_deadline() {
+    for (opcode, expected_at) in [(0xAF, 15), (0xBA, 21)] {
+        let section = script(vec![("a", vec![(1, vec![vec![opcode, 4, 1], wait(6), vec![0xAC], message(0, 0)])])], texts(1));
+        let (beats, vm) = run_root(&section, start(0, 1), &[]);
+        assert_eq!(windows(&beats)[0].at, expected_at, "ANIMW joins the existing deadline without waiting for the full clip twice");
+        assert_eq!(end_of(&beats), End::Finished);
+        assert!(vm.writes().is_empty());
+    }
 }
 
 #[test]
@@ -540,15 +556,15 @@ fn reqew_observes_the_cropped_once_childs_dispatch() {
 }
 
 #[test]
-fn animation_literal_speed_is_preserved_separately_without_changing_waits() {
-    let a = vec![vec![0xA2, 3, 2], vec![0xBD, 0, 32, 0], vec![0xAF, 4, 3], vec![0xA2, 5, 0], message(0, 0)];
+fn animation_literal_speed_is_preserved_separately_with_an_explicit_animw() {
+    let a = vec![vec![0xA2, 3, 2], vec![0xBD, 0, 32, 0], vec![0xAF, 4, 3], vec![0xAC], vec![0xA2, 5, 0], message(0, 0)];
     let section = script(vec![("a", vec![(1, a)])], texts(1));
     let (beats, vm) = run_root(&section, start(0, 1), &[]);
     let anims: Vec<_> = stage(&beats).into_iter().filter_map(|(at, event)| match event {
         Stage::Anim { animation, speed, divisor, .. } => Some((at, animation, speed, divisor)), _ => None,
     }).collect();
     assert_eq!(anims, [(0, 3, 16, 2), (0, 4, 32, 3), (8, 5, 32, 0)]);
-    assert_eq!(windows(&beats)[0].at, 8, "the existing ASPED-based wait is unchanged by literal metadata");
+    assert_eq!(windows(&beats)[0].at, 8, "ANIMW explicitly joins AF's existing ASPED-based deadline; literal metadata does not change it");
     assert!(matches!(vm.default_animation_of(0), Some(Stage::Anim { animation: 5, speed: 32, divisor: 0, .. })));
     assert!(vm.writes().is_empty());
 }

@@ -267,13 +267,28 @@ fn the_team_talk_is_the_cutscene_of_md1_1s_story_point_and_writes_its_step() {
     let default_clip = fmv_ff7::load_field_animation(&mut characters, &default_clip_stem).unwrap();
     assert_eq!((default_clip.frame_count(), default_clip.bone_count()), (1, 21));
     assert!(model.fits(&default_clip) && default_clip.frame(0).is_some());
+    let jessie = script.entity_inits(Some(&models)).into_iter().find(|init| init.entity == 4).unwrap();
+    assert_eq!((jessie.name.as_str(), jessie.model_index), ("av_l", Some(3)));
+    let jessie_model = &loader.models[jessie.model_index.unwrap()];
+    assert_eq!(jessie_model.hrc_stem(), "axdc");
+    let jessie_clip_stem = jessie_model.animations[4].stem();
+    assert_eq!(jessie_clip_stem, "bxie");
+    let jessie_script = script.disassemble(4, 3).unwrap();
+    let gesture = jessie_script.first().unwrap();
+    assert_eq!((gesture.offset, gesture.opcode, gesture.literal("animation"), gesture.literal("speed")), (0x0604, 0xBA, Some(4), Some(1)));
+    assert!(script.disassemble(4, 0).unwrap().iter().chain(jessie_script.iter()).all(|ins| ins.opcode != 0xBD), "Jessie's init and requested script leave ASPED at its default");
+    let jessie_clip = fmv_ff7::load_field_animation(&mut characters, &jessie_clip_stem).unwrap();
+    let jessie_skeleton = fmv_ff7::load_field_model(&mut characters, "axdc").unwrap();
+    assert_eq!((jessie_clip.frame_count(), jessie_clip.bone_count()), (15, 21));
+    assert!(jessie_skeleton.fits(&jessie_clip));
     // Who speaks: the windows' openers are the team (the survey: av_m, av_l, cl, ba).
     let mut play = ScenePlay::new(&f, &def, &StoryState::at(6), 1).unwrap();
     assert_eq!(play.animation_clip(3, 3), Some("bxic"));
     assert_eq!(play.initial_default_animation_clip(3), Some((0, default_clip_stem.as_str())));
+    assert_eq!(play.animation_clip(4, 4), Some(jessie_clip_stem.as_str()));
     let mut openers = Vec::new();
     let mut origin = 0u32;
-    let (mut biggs_at, mut jessie_at) = (None, None);
+    let (mut biggs_at, mut jessie_at, mut jessie_dialog_at) = (None, None, None);
     loop {
         let beat = play.next(None);
         for event in &beat.stage {
@@ -288,10 +303,19 @@ fn the_team_talk_is_the_cutscene_of_md1_1s_story_point_and_writes_its_step() {
         }
         match beat.then {
             Then::End { .. } => break,
-            Then::Window(w) => { origin += w.at; openers.push(w.opener); },
+            Then::Window(w) => {
+                origin += w.at;
+                if w.opener == 4 && jessie_dialog_at.is_none() {
+                    assert!(matches!(w.message.origin, MessageOrigin::Canon { dialog: 32, .. }), "Jessie's first window is the authored dialog 32");
+                    jessie_dialog_at = Some(origin);
+                }
+                openers.push(w.opener);
+            },
         }
     }
     assert_eq!(jessie_at.unwrap().checked_sub(biggs_at.unwrap()), Some(16), "REQEW waits for Biggs's CANIM2 range, then WAIT6 precedes Jessie's animation");
+    assert_eq!(jessie_dialog_at.unwrap().checked_sub(jessie_at.unwrap()), Some(15), "BA waits for Jessie's existing full-clip duration before dialog 32");
+    assert_eq!(jessie_dialog_at.unwrap().checked_sub(biggs_at.unwrap()), Some(31));
     assert_eq!(openers, [3, 4, 4, 3, 3, 1, 3, 1, 2, 2, 2, 2]);
     assert_eq!(play.off_cast(), 0, "every stage event is about the cast");
 }

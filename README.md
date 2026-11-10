@@ -1621,12 +1621,14 @@ No game bytes, protocol or saved state are added. Movement selection follows the
 [Q-Gears MOVE reconstruction](https://github.com/Akari1982/q-gears_reverse/blob/e0fabf7e121818e5abe2f873e34a07d0eb32742d/ffvii/DISC/FIELD/FIELD.BIN_event_code_entity.cpp#L444-L477).
 The normal-rate default-loop interpretation follows the [Q-Gears DFANM reconstruction](https://github.com/Akari1982/q-gears_reverse/blob/e0fabf7e121818e5abe2f873e34a07d0eb32742d/ffvii/DISC/FIELD/FIELD.BIN_event_code_entity.cpp#L72-L95);
 exact PC visual timing and real mod overlays remain untested.
-The cropped animation pairs follow their original dispatch: `CANIM1` and `CANM!1` start asynchronously;
-`CANIM2` and `CANM!2` wait on the existing animation deadline. `ANIMW` can still join an asynchronous clip's deadline.
+The animation pairs follow their original dispatch: `CANIM1`, `CANM!1` and `ANIM!1` start asynchronously;
+`CANIM2`, `CANM!2` and `ANIM!2` wait on the existing animation deadline. `ANIMW` can still join an asynchronous clip's deadline.
 Jessie's ladder jump follows its authored 15-frame wait; the team-talk director waits for Biggs's ten-frame gesture,
-then its explicit six-frame pause before requesting Jessie. The VM's existing duration estimates remain;
-full-clip lengths, arbitrary divisors and clip-bound completion timing are not claimed to match the engine.
-The dispatch distinctions follow the [original cropped-animation handlers](https://github.com/Akari1982/q-gears_reverse/blob/e0fabf7e121818e5abe2f873e34a07d0eb32742d/ffvii/DISC/FIELD/FIELD.BIN_event_code_entity.cpp#L246-L365).
+then its explicit six-frame pause before requesting Jessie. Jessie's blocking `ANIM!2` then delays her first window by
+the existing 15-frame estimate, which matches her original `bxie` clip's frame count. The VM's duration estimates remain;
+general full-clip lengths, arbitrary divisors, busy-animation admission and original PC completion timing remain unverified.
+The dispatch distinctions follow the [original cropped-animation handlers](https://github.com/Akari1982/q-gears_reverse/blob/e0fabf7e121818e5abe2f873e34a07d0eb32742d/ffvii/DISC/FIELD/FIELD.BIN_event_code_entity.cpp#L246-L365)
+and [full-clip Hold handler](https://github.com/Akari1982/q-gears_reverse/blob/e0fabf7e121818e5abe2f873e34a07d0eb32742d/ffvii/DISC/FIELD/FIELD.BIN_event_code_entity.cpp#L200-L241).
 A watcher opens window 0 itself and every later one only when the owner's `SceneStep` for the one before arrives, so the two screens
 show the same line at the same time. A client that cannot build the scene (no field data) tells the server at once (`SceneEnd`
 skipped, or `SceneLeave`), so a player is never left held.
