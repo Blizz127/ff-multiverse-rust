@@ -26,8 +26,9 @@ Under the existing single-writer process lock and store writer mutex:
    changing either record. Resolve the scene's branch before presenting it for commitment.
 2. Durably write the intent by atomic replacement (file sync, rename, directory sync), then atomically
    replace each record with the exact validated after-image, and sync each containing directory.
-   Keep the writer lock throughout. On an error after the intent is durable, stop further writes and
-   retain it for recovery; do not retry by subtracting gil again.
+   Keep the writer lock throughout. Once writing the intent is attempted, any I/O failure has an
+   uncertain durable outcome (a rename can succeed before a directory sync fails): stop further
+   writes and reopen through recovery rather than guessing or subtracting gil again.
 3. Durably clear the completed intent only after both after-images are durable. Until that point,
    recovery idempotently installs the same after-images. A crash after clearing sees both completed
    records; a crash before it sees a durable intent. Treat inconsistent before/after data as corruption

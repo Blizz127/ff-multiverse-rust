@@ -33,3 +33,18 @@ watcher synchronization must be reconciled before claiming that scene dialogue a
 `SceneDef::rebind_entities` can map uniquely named entities into a replacement section, refusing
 missing or ambiguous names; it is not wired into playback, and entity identity alone does not prove
 the replacement's slots, choices, windows or timing are compatible.
+
+The owned-data exit graph also gives the unreviewed continuation `cargoin` → `tin_1` →
+`mds7st3` → `mds7plr1` → `mds7` → `mds7pb_1`. `tin_1` → `mds7st3` is a
+script-driven line with a moment guard, and `mds7` → `mds7pb_1` is a script-driven
+one-shot line, not a plain gateway. The authored scripts contain a write to moment 51 in
+`tin_1` Cloud slot 3, moment 63 in `mds7st3` Cloud slot 3, and moment 69 and 72 in
+`mds7pb_1` Tifa slot 5 and Barret slot 5 respectively. These are static observations, not
+proof those slots are reached, that their skipped side effects are safe, or that the route
+can be played. In particular, `tin_1`'s director starts Barret's slot 3 at moment 48, and
+its concurrent actor requests must run before concluding the scene.
+
+An exploratory real-data run of `tin_1` director main at moment 48 produced two windows and a
+moment-51 write, but ended at the VM frame budget with one unresolved read. It also ran looping
+background animations and requests. It is not safe to commit the partial write or enable the
+scene: identify the authored completion boundary and the unresolved read before trying again.
