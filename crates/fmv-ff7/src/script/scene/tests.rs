@@ -594,6 +594,71 @@ fn a_branch_on_a_given_flag_is_taken_as_the_scene_was_found() {
 }
 
 #[test]
+fn byte_bit_conditions_audit_only_the_selected_story_bit() {
+    fn if_ubl(bank: u8, addr: u8, op: u8, right: u8, body: &[u8]) -> Vec<u8> {
+        cat(&[vec![0x15, bank << 4, addr, right, op], u16::try_from(body.len() + 2).unwrap().to_le_bytes().to_vec(), body.to_vec()])
+    }
+    for long in [false, true] {
+        for bit in [0u8, 5, 7, 3, 4, 6] {
+            let known = [0, 5, 7].contains(&bit);
+            for set in [false, true] {
+                // Decode an existing-value fixture to cover bit7 set as well: this
+                // does not ask the story writer to set the never-set timeout bit.
+                let story = if known && set {
+                    StoryState::decode(&[2, 33, 0, 1, 1, 225, 1u8 << bit]).unwrap()
+                } else {
+                    StoryState::at(33)
+                };
+                let given = if known { vec![] } else { vec![Given { bank: 1, address: 225, value: if set { 1u8 << bit } else { 0 } }] };
+                for op in [9, 10] {
+                    let branch = if long { if_ubl(1, 225, op, bit, &message(0, 0)) } else { if_ub(1, 225, op, bit, &message(0, 0)) };
+                    let section = script(vec![("a", vec![(1, vec![branch, message(0, 1)])])], texts(2));
+                    let (beats, vm) = run_with(&section, start(0, 1), &[], vm_for(story.clone(), &given));
+                    let taken = if op == 9 { set } else { !set };
+                    assert_eq!(dialogs_of(&beats), if taken { vec![0, 1] } else { vec![1] }, "long={long} bit={bit} set={set} op={op}");
+                    let audited = vm.vars().unknown_persistent_reads().into_iter().collect::<Vec<_>>();
+                    assert_eq!(audited, if known { vec![] } else { vec![(1, 225)] }, "long={long} bit={bit} set={set} op={op}");
+                    assert!(vm.writes().is_empty());
+                    assert_eq!(vm.vars().story.encode(), story.encode(), "a bit read changes no saved bytes");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn byte_bit_read_shortcut_preserves_other_audits_and_local_writes() {
+    // Equality still needs the whole partial byte. Invalid bit indices retain
+    // the old full-read audit and the existing bit-on=false / bit-off=true rule.
+    for (op, right, taken) in [(0, 0, true), (9, 8, false), (10, 8, true), (9, 255, false), (10, 255, true)] {
+        let section = script(vec![("a", vec![(1, vec![if_ub(1, 225, op, right, &message(0, 0)), message(0, 1)])])], texts(2));
+        let (beats, vm) = run_with(&section, start(0, 1), &[], vm_for(StoryState::at(33), &[]));
+        assert_eq!(dialogs_of(&beats), if taken { vec![0, 1] } else { vec![1] }, "op={op} right={right}");
+        assert_eq!(vm.vars().unknown_persistent_reads().into_iter().collect::<Vec<_>>(), [(1, 225)], "op={op} right={right}");
+        assert!(vm.writes().is_empty());
+    }
+
+    let code = vec![biton(1, 225, 0), if_ub(1, 225, 9, 0, &message(0, 0)), if_ub(1, 225, 10, 0, &message(0, 1)), message(0, 2)];
+    let section = script(vec![("a", vec![(1, code)])], texts(3));
+    let (beats, vm) = run_with(&section, start(0, 1), &[], vm_for(StoryState::at(33), &[]));
+    assert_eq!(dialogs_of(&beats), [0, 2], "bit conditions read the VM write, not the original clear story bit");
+    assert_eq!(vm.writes().get(&(1, 225)), Some(&1));
+    assert_eq!(vm.vars().unknown_persistent_reads().into_iter().collect::<Vec<_>>(), [(1, 225)], "BITON still conservatively audits its read-modify-write");
+    assert_eq!(vm.vars().story.encode(), [1, 33, 0], "VM writes have not changed the saved story");
+
+    for op in [9, 10] {
+        let mut branch = if_ub(1, 225, op, 5, &message(0, 0));
+        branch[1] = 0x13; // Left Var[1][225], right bit index Var[3][5].
+        let section = script(vec![("a", vec![(1, vec![branch, message(0, 1)])])], texts(2));
+        let given = [Given { bank: 3, address: 5, value: 7 }];
+        let (beats, vm) = run_with(&section, start(0, 1), &[], vm_for(StoryState::at(33), &given));
+        assert_eq!(dialogs_of(&beats), if op == 10 { vec![0, 1] } else { vec![1] }, "the selected timeout bit is clear");
+        assert!(vm.vars().unknown_persistent_reads().contains(&(3, 5)), "Given does not make the persistent bit index authoritative");
+        assert!(vm.writes().is_empty());
+    }
+}
+
+#[test]
 fn unknown_persistent_reads_are_reported_even_without_a_persistent_write() {
     let branch = if_ub(3, 5, 9, 1, &message(0, 0));
     let field = field_of(script(vec![("a", vec![(1, vec![branch])])], vec![dialog("Hello.")]));

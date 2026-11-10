@@ -665,6 +665,15 @@ impl Vm {
         }
     }
 
+    /// A byte condition can read a carried bit without depending on the unknown remainder of
+    /// its saved byte. Unknown bits still use the normal audited read; local writes take priority.
+    fn known_operand_bit(&self, ins: &Instruction, name: &str, bit: i32) -> Option<bool> {
+        let bit = u8::try_from(bit).ok().filter(|bit| *bit < 8)?;
+        let (bank, address) = Self::dest(ins, name)?;
+        self.writes.get(&(bank, address)).map(|value| value & (1 << bit) != 0)
+            .or_else(|| self.vars.story.known_bit(bank, address, bit))
+    }
+
     /// `(bank, address)` of the variable operand `name` (`None` for a literal: nothing to write).
     fn dest(ins: &Instruction, name: &str) -> Option<(u8, u8)> {
         let op = ins.operand(name)?;
@@ -1149,8 +1158,16 @@ impl Vm {
                     0x16 | 0x17 => (Width::S16, 16),
                     _ => (Width::U16, 16),
                 };
-                let (left, right) = (self.num(ins, "left", width), self.num(ins, "right", width));
-                let holds = compare(ins.literal("op").unwrap_or(-1), left, right, bits);
+                let operation = ins.literal("op").unwrap_or(-1);
+                // Read a banked bit index normally so unknown inputs remain audited.
+                let right = self.num(ins, "right", width);
+                let known = if matches!(op, 0x14 | 0x15) && matches!(operation, 9 | 10) {
+                    self.known_operand_bit(ins, "left", right)
+                } else { None };
+                let holds = known.map_or_else(
+                    || compare(operation, self.num(ins, "left", width), right, bits),
+                    |set| if operation == 9 { set } else { !set },
+                );
                 self.branch(idx, ins, holds)
             }
             // The keys: nobody presses any during a scene.

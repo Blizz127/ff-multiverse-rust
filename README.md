@@ -1460,6 +1460,11 @@ point moves the story to, or `SceneDef::presents_bit` for an existing saved flag
   the owned descent check pins the upper and middle walkway instead of letting her drop to the ground floor early.
   Her NPC stays hidden from moment 13, including on re-login. The scene adds no dialogue or saved flags. Rendered movement
   remains untested; the two-client smoke uses independent entry runs.
+* **`ff7/nrthmk/reactor-approach`**: Biggs and Jessie enter the reactor while Wedge takes his place outside, before
+  the existing entry step to 10. During moments 10–26, only Wedge remains, at his scripted position with his idle clip.
+  Setup reads the already carried timeout bit; byte bit conditions now audit the selected bit, while unknown bits
+  and full-byte reads remain audited. This adds no saved flags. The two-client smoke checks independent entry runs;
+  rendered movement remains untested.
 * **`ff7/nmkin_3/jessie-ladder`**: Jessie's first ladder explanation and descent, one window before the existing talk
   point advances the story to 14. Nearby party members share the scene. Jessie and the potion use their own scripts;
   Cloud has no scripted action in this branch. The upper platform uses one measured witness spot clear of her path;

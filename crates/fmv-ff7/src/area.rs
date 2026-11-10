@@ -213,6 +213,7 @@ const JESSIE_TRAPPED_PHASE: u8 = b'T';
 const MATERIA_HIDDEN_PHASE: u8 = b'H';
 const RUN_AHEAD_HIDDEN_PHASE: u8 = b'R';
 const JESSIE_DESCENDED_PHASE: u8 = b'D';
+const REACTOR_APPROACHED_PHASE: u8 = b'A';
 
 /// Cap on a decompressed field file (16 MiB). The largest part of a PC field is its
 /// background (at most 42 texture pages of at most 128 KiB, about 5 MiB) and the largest
@@ -1046,6 +1047,11 @@ impl AreaRuntime for Ff7FieldArea {
             let story = story::StoryState::decode(progress)?;
             if (story.moment as i16) >= 13 { phase.0.insert(0, JESSIE_DESCENDED_PHASE); }
         }
+        if self.info.id.key.eq_ignore_ascii_case("nrthmk") {
+            let story = story::StoryState::decode(progress)?;
+            // Only the inbound phase: the escape at 27 has its own cast placements.
+            if (10..27).contains(&(story.moment as i16)) { phase.0.insert(0, REACTOR_APPROACHED_PHASE); }
+        }
         if self.info.id.key.eq_ignore_ascii_case("nmkin_5") {
             let story = story::StoryState::decode(progress)?;
             // The owned setup uses IFSW (a signed word) >= 15. Preserve that boundary even for
@@ -1089,6 +1095,21 @@ impl AreaRuntime for Ff7FieldArea {
         if self.info.id.key.eq_ignore_ascii_case("nmkin_2") && phase.0.first() == Some(&JESSIE_DESCENDED_PHASE) {
             for npc in &mut npcs {
                 if npc.entity_name.eq_ignore_ascii_case("av_j") { npc.unconditional = false; }
+            }
+        }
+        if self.info.id.key.eq_ignore_ascii_case("nrthmk") && phase.0.first() == Some(&REACTOR_APPROACHED_PHASE) {
+            for npc in &mut npcs {
+                if ["av_b", "av_c"].iter().any(|name| npc.entity_name.eq_ignore_ascii_case(name)) {
+                    npc.unconditional = false;
+                } else if npc.entity_name.eq_ignore_ascii_case("av_w") {
+                    npc.pos = Pos::new(-893.0, -3038.0, 491.0); // owned init, triangle 2
+                    npc.facing = crate::field_direction_to_facing(176);
+                    if let Some(idle) = self.field.model_loader().ok().and_then(|loader| loader.models.into_iter()
+                        .find(|model| model.hrc_stem().eq_ignore_ascii_case(&npc.appearance.model))
+                        .and_then(|model| model.animations.get(3).map(|clip| clip.stem())).filter(|idle| !idle.is_empty())) {
+                        npc.appearance.idle_animation = Some(idle);
+                    }
+                }
             }
         }
         if self.info.id.key.eq_ignore_ascii_case("nmkin_5") && phase.0.first() == Some(&MATERIA_HIDDEN_PHASE) {

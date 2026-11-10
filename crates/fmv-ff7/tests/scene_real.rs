@@ -1239,8 +1239,8 @@ fn jessie_rescue_plays_three_windows_and_matches_the_existing_saved_step() {
     let outcome = run_to_end(&f, &def, &before, 1, &[]).unwrap();
     assert_eq!((outcome.end, outcome.windows, outcome.questions), (End::Finished, 3, 0));
     assert!(outcome.is_complete(), "{outcome:?}");
-    // The byte-level audit conservatively flags this partially carried byte. This branch reads only bit 5
-    // (IFUB op 10, bit-clear test); BITON preserves the rest. No unknown persistent byte is used to choose the rescue path.
+    // The bit-clear condition reads only carried bit 5. BITON still audits the whole byte it
+    // preserves during read-modify-write; no unknown persistent byte chooses the rescue path.
     assert_eq!(outcome.unknown_persistent_reads.iter().copied().collect::<Vec<_>>(), [(1, 225)]);
     assert!(outcome.party.is_empty() && outcome.jump.is_none());
     assert_eq!(outcome.writes.moment, None);
@@ -1505,4 +1505,106 @@ fn jessie_descends_the_stacked_floors_and_only_advances_the_existing_entry_step(
             if moment >= 13 { assert!(!def.applies_at(moment)); }
         }
     }
+}
+
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn reactor_approach_plays_the_crew_paths_and_keeps_wedge_outside() {
+    use fmv_adapter_api::AreaRuntime;
+    use fmv_core::{EditionProvenance, GameId, Platform, Pos};
+    use fmv_ff7::script::scene::{auto_witnesses, cast_places, reactor_approach_scene, scene, AnimHow, REACTOR_APPROACH_SCENE_ID, SKIPPED_STATE_OPS};
+    let f = field("nrthmk").expect("FMV_FF7_DATA and nrthmk");
+    let def = reactor_approach_scene();
+    assert_eq!(scene(REACTOR_APPROACH_SCENE_ID), Some(def.clone()));
+    assert!(def.given.is_empty(), "no assumed persistent bytes");
+    let provenance = EditionProvenance { game: GameId::Ff7, platform: Platform::Pc, edition: "steam".into(), region: "any".into(), language: "en".into(), revision: "test".into(), sources: vec![], modded: false };
+    let adapter = fmv_ff7::Ff7Adapter::from_flevel_path(flevel_path(&data_dir().unwrap()), provenance).unwrap();
+    let area = adapter.load_field("nrthmk").unwrap();
+    let base = area.npcs();
+    assert_eq!(base.iter().map(|n| n.entity_name.as_str()).collect::<Vec<_>>(), ["av_b", "av_c", "av_w"]);
+    let from = adapter.load_field("md1_2").unwrap();
+    let entry = from.exits().into_iter().find(|exit| exit.target == "nrthmk").unwrap();
+    assert_eq!((entry.arrival.x, entry.arrival.y, entry.arrival_hint), (f32::from(def.arrival.x), f32::from(def.arrival.y), Some(u32::from(def.arrival.triangle))));
+    for moment in [0, 1, 8, 9] {
+        let before = StoryState::at(moment);
+        let step = area.story_advance(&before.encode(), 0).expect("existing entry point");
+        let after = StoryState::decode(&step.progress).unwrap();
+        assert!(def.presents_step("nrthmk", &before, &after));
+        assert!(!def.starts_on_arrival() && !def.offered_to(&before));
+        assert!(!def.presents_step("md1_2", &before, &after));
+        assert!(area.story_advance(&step.progress, 0).is_none(), "entry step is paid once");
+        let outcome = run_to_end(&f, &def, &before, 1, &[]).unwrap();
+        assert_eq!((outcome.end, outcome.windows, outcome.questions), (End::Finished, 0, 0));
+        assert!(outcome.is_complete(), "{outcome:?}");
+        assert!(outcome.unknown_persistent_reads.is_empty(), "only known bits choose the path: {outcome:?}");
+        assert!(outcome.party.is_empty() && outcome.jump.is_none() && outcome.writes.tracked.is_empty());
+        assert_eq!(outcome.writes.moment, Some(10));
+        assert!(outcome.writes.untracked.keys().all(|(bank, _)| !(1..=4).contains(bank)));
+        assert!([&outcome.setup_stats, &outcome.stats].iter().all(|stats| stats.ignored.keys().all(|op| !SKIPPED_STATE_OPS.contains(op))));
+        let mut interpreted = before.clone();
+        outcome.writes.apply_to(&mut interpreted);
+        assert_eq!(interpreted, after, "only the existing step is saved");
+        let mut play = ScenePlay::new(&f, &def, &before, 1).unwrap();
+        let beat = play.next(None);
+        assert!(matches!(beat.then, Then::End { how: End::Finished, .. }));
+        for (entity, start, path) in [
+            (3, (192, -2990), vec![(-28, -2870), (15, -811)]),
+            (4, (365, -3089), vec![(-19, -2945), (15, -811)]),
+            (5, (578, -2971), vec![(-893, -3038)]),
+        ] {
+            assert!(play.initial_stage_events().iter().chain(beat.stage.iter().map(|event| &event.what)).any(|event|
+                matches!(event, Stage::Place { entity: actor, x, y, .. } if *actor == entity && (*x, *y) == start)), "authored start for {entity}");
+            let moves: Vec<_> = beat.stage.iter().filter_map(|event| match event.what {
+                Stage::Move { entity: actor, x, y, .. } if actor == entity => Some((x, y)), _ => None,
+            }).collect();
+            assert_eq!(moves, path);
+            let hides = beat.stage.iter().filter(|event| event.what == Stage::Show { entity, visible: false }).count();
+            assert_eq!(hides, usize::from(entity != 5), "only Biggs and Jessie leave");
+        }
+        assert!(beat.stage.iter().any(|event| matches!(event.what, Stage::Anim { entity: 5, animation: 3, how: AnimHow::Loop, .. })));
+        assert_eq!(play.off_cast(), 0);
+    }
+    let mesh = f.walkmesh().unwrap();
+    let parts = mesh_parts(&mesh);
+    let story = StoryState::at(8);
+    let spots = auto_witnesses(&f, &def, &story, 1, 3);
+    let cast = cast_places(&f, &def, &story, 1).unwrap();
+    let ring = 5.5 * fmv_ff7::default_model_scale(FieldScript::from_field(&f).unwrap().header().scale);
+    assert!(!spots.is_empty());
+    assert!(Ground::new(mesh.clone()).height(15, -811, None, None).is_none(), "the authored exit endpoint is offmesh, never a witness position");
+    for spot in &spots {
+        assert!(fmv_ff7::script::triangle_contains_xy(&mesh.triangles[usize::from(spot.triangle)], i32::from(spot.x), i32::from(spot.y)));
+        assert_eq!(parts[usize::from(spot.triangle)], parts[usize::from(def.arrival.triangle)]);
+        assert!(cast.iter().all(|&(x,y)| (x-f32::from(spot.x)).hypot(y-f32::from(spot.y)) >= 2.0*ring+16.0));
+        assert!(scenery_gap(&mesh, f32::from(spot.x), f32::from(spot.y)) >= 1.5*ring);
+    }
+    let idle = f.model_loader().unwrap().models.into_iter().find(|model| model.hrc_stem() == "bxbe").unwrap().animations[3].stem();
+    assert!(!idle.is_empty());
+    for moment in [0, 8, 9, 10, 12, 26, 27, 33, 32767, 32768, u16::MAX] {
+        let story = StoryState::at(moment);
+        let saved = story.encode();
+        let phase = area.phase_key(&saved).unwrap();
+        let mut expected = base.clone();
+        if (10..27).contains(&moment) {
+            expected[0].unconditional = false;
+            expected[1].unconditional = false;
+            expected[2].pos = Pos::new(-893.0, -3038.0, 491.0);
+            expected[2].facing = fmv_ff7::field_direction_to_facing(176);
+            expected[2].appearance.idle_animation = Some(idle.clone());
+            let init = ScenePlay::new(&f, &def, &story, 1).unwrap();
+            for entity in [3, 4] { assert!(init.initial_stage_events().contains(&Stage::Show { entity, visible: false })); }
+            assert!(init.initial_stage_events().contains(&Stage::Place { entity: 5, x: -893, y: -3038, z: Some(491), triangle: Some(2) }));
+            // Initial-stage snapshots retain placement/heading/visibility only. Execute the
+            // init as an ordinary script to observe its authored animation event as well.
+            let mut init_def = def.clone();
+            init_def.setup.clear();
+            init_def.root = vec![Step::Await(ScriptRef::new(5, 0))];
+            let init_beat = ScenePlay::new(&f, &init_def, &story, 1).unwrap().next(None);
+            assert!(init_beat.stage.iter().any(|event| matches!(event.what, Stage::Anim { entity: 5, animation: 3, how: AnimHow::Loop, .. })));
+        }
+        assert_eq!(area.npcs_in_phase(&phase), expected, "stable slots and inbound phase only at {moment}");
+        assert_eq!(area.phase_key(&StoryState::decode(&saved).unwrap().encode()), Some(phase));
+        if moment >= 10 { assert!(!def.applies_at(moment)); }
+    }
+    eprintln!("reactor approach: three actor paths, {} automatic witness spots, inbound NPC phase; rendering untested", spots.len());
 }
