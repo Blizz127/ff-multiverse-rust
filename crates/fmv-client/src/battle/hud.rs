@@ -10,10 +10,13 @@
 //!
 //! # The menu opens by itself
 //!
-//! Our character's menu exists exactly while it is our turn: our gauge is full, we are alive, no
-//! command of ours is waiting for the server's answer and the battle is not over. It starts at the
-//! command list every time our gauge fills (the cursor stays on the command used last), and it is
-//! reset when a command of ours is applied or our character falls.
+//! The menu exists exactly while it is the turn of the member it is for, the FOCUS: the first of the members we command
+//! (our own character and, when the roster names us their commander, the canon companions: protocol v17) whose gauge is
+//! full, who is alive and able to act, while no command of ours is waiting for the server's answer and the battle is not
+//! over. It starts at the command list every time its member's gauge fills (the cursor stays on the command used last), and
+//! it is reset when a command of that member is applied or that member falls. Another member's gauge filling never takes
+//! the menu away from a choice being made: the client says who has it ([`BattleHud::set_focus`], which starts a different
+//! member's menu at the command list), and the focus is our own character when none of ours is ready.
 //!
 //! # The banner
 //!
@@ -50,7 +53,7 @@
 //! still held from the battle does not skip it) and so does time ([`LINGER_S`]).
 
 use super::lag::{Lag, Vitals};
-use super::menu::{BattleMenu, BattleMenuModel, Ctx, Fighter, MenuKey, Reply};
+use super::menu::{BattleMenu, BattleMenuModel, Ctx, Fighter, Level, MenuKey, Reply};
 use super::names::{item_name, limit_name, spell_name, NameBook};
 use super::panels::{Banner, Finale, RewardLine, BANNER_S, PANEL_DELAY_MS};
 use super::popups::Popups;
@@ -85,6 +88,7 @@ pub struct BattleHud {
     /// The action banners and when each comes up (in the order they were scheduled; the one on screen is the last that
     /// has begun, see [`BattleHud::decorate`]). A few are kept: a batch has a handful of performances at most.
     banners: Vec<(String, f64)>,
+    /// The member the menu is for (see the module docs, "The menu opens by itself"): our own character at first.
     my_actor: Option<ActorId>,
     /// The formation of the battle (`scene * 4 + slot`): which scene names an enemy's attacks.
     formation: u16,
@@ -125,8 +129,8 @@ impl BattleHud {
         Self { names, ..Self::default() }
     }
 
-    /// A new battle starts: forget everything of the last one. `my_actor` is our character,
-    /// `formation` the battle's formation id.
+    /// A new battle starts: forget everything of the last one. `my_actor` is our character (the member the menu is for until
+    /// [`BattleHud::set_focus`] says another), `formation` the battle's formation id.
     pub fn begin(&mut self, formation: u16, my_actor: Option<ActorId>) {
         self.menu.reset();
         self.popups.clear();
@@ -139,6 +143,19 @@ impl BattleHud {
         self.last_start = f64::NEG_INFINITY;
         self.my_actor = my_actor;
         self.formation = formation;
+    }
+
+    /// The menu is for `actor` from now on (`None`: nobody). A different member starts at the command list.
+    pub fn set_focus(&mut self, actor: Option<ActorId>) {
+        if self.my_actor != actor {
+            self.my_actor = actor;
+            self.menu.reset();
+        }
+    }
+
+    /// Is the menu at its command list (not in a Magic or Item list, nor choosing a target)?
+    pub fn menu_at_commands(&self) -> bool {
+        self.menu.level() == Level::Commands
     }
 
     /// What the battle that just began sounds like (see [`Palette::new`]).
@@ -204,8 +221,8 @@ impl BattleHud {
         }
     }
 
-    /// Battle events arrived at `now`. `my_command` says that one of them is the command of our
-    /// own character being applied.
+    /// Battle events arrived at `now`. `my_command` says that one of them is the command of the member the menu is for being
+    /// applied.
     pub fn on_events(&mut self, now: f64, events: &[BattleEvent], my_command: bool) {
         self.popups.on_events(now, events);
         self.sounds.on_events(now, events, &self.palette);

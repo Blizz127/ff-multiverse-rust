@@ -85,7 +85,8 @@ impl LgpLoader {
     /// The open archive (opened by the first call).
     fn archive(&mut self) -> Result<&mut LgpArchive<File>, String> {
         if self.archive.is_none() {
-            let archive = LgpArchive::open_path(&self.path).map_err(|e| format!("cannot open char.lgp: {e}"))?;
+            let mut archive = LgpArchive::open_path(&self.path).map_err(|e| format!("cannot open char.lgp: {e}"))?;
+            if let Some(overlay) = crate::model_layer::field() { archive.set_overlay(overlay); }
             self.archive = Some(archive);
         }
         self.archive.as_mut().ok_or_else(|| "cannot open char.lgp".to_string())
@@ -95,12 +96,24 @@ impl LgpLoader {
 impl CharacterLoader for LgpLoader {
     fn load(&mut self, appearance: &PlayableModel) -> Result<Character, String> {
         let archive = self.archive()?;
-        load_playable(archive, appearance).map_err(|e| e.to_string())
+        match load_playable(archive, appearance) {
+            Ok(character) => Ok(character),
+            Err(_) => {
+                let mut original = LgpArchive::open_path(&self.path).map_err(|e| e.to_string())?;
+                load_playable(&mut original, appearance).map_err(|e| e.to_string())
+            }
+        }
     }
 
     fn load_npc(&mut self, model: &str, idle: &str) -> Result<Character, String> {
         let archive = self.archive()?;
-        load_standing(archive, model, idle).map_err(|e| e.to_string())
+        match load_standing(archive, model, idle) {
+            Ok(character) => Ok(character),
+            Err(_) => {
+                let mut original = LgpArchive::open_path(&self.path).map_err(|e| e.to_string())?;
+                load_standing(&mut original, model, idle).map_err(|e| e.to_string())
+            }
+        }
     }
 }
 

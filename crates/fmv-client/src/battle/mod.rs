@@ -17,6 +17,17 @@
 //!   window title and the log; the engine's `Combatant::name` of a party member is the canon character whose
 //!   combat template it fights with (its SLOT), and is never shown. Enemies keep the names of the engine. At
 //!   the start of every battle one `roster` note per member says who fights in which slot.
+//! * **Commanding the canon companions (protocol v17).** As in FF7, where the player commands the whole party, the roster
+//!   can name this client the COMMANDER of the canon companions (`BattleMember::commander`, checked with
+//!   `BattleMember::is_commanded_by`, the very rule the server enforces): [`ActiveBattle::commanded`] is then our own
+//!   character AND those companions, each commanded when its own gauge is full. The menu belongs to the member of ours whose
+//!   turn came first (the one that has waited longest, `ActiveBattle::queue`): it stays with that member while a choice is
+//!   being made (another member's gauge filling never takes it away), moves to the next ready member when the command is
+//!   applied (cycling like FF7's) and `Tab` sends it on to the next ready member at once ([`BattleClient::swap_turn`], at the
+//!   command list). [`Bar::mine`] marks that member in the panels (our own character when none of ours is ready). The bot
+//!   commands every member it may; a `--battle-script` gives our own character's commands only. A server that names no
+//!   commander (the earlier behaviour, or a battle led by another player) commands the companions itself and this client never
+//!   offers them a menu.
 //! * [`BattleView`] is what the screen shows, as plain data: the fighters ([`Bar`]), the replay's
 //!   standing, and the live parts of the battle UI (the command menu of our turn, the floating
 //!   numbers, the action banner, the victory or defeat panel). [`draw_battle_overlay`] draws all of
@@ -45,8 +56,9 @@
 //!   engine itself knows no inventory.
 //! * [`BattleBot`] is the headless `--battle-auto` player: it attacks, gives its limit break when the
 //!   gauge is full (protocol v7), and heals itself with the cheapest healing spell it can pay for when its
-//!   HP is low ([`BattleClient::bot_command`]). With `--battle-script` it first gives the commands of that
-//!   script, in order, one per full gauge (`script`: Defend, Magic, Item, Limit and Escape can be fired from
+//!   HP is low ([`BattleClient::bot_command`]), for every member it commands (its own character and, when the roster names
+//!   it their commander, the canon companions). With `--battle-script` it first gives the commands of that
+//!   script to its own character, in order, one per full gauge (`script`: Defend, Magic, Item, Limit and Escape can be fired from
 //!   the command line, so that a real-process smoke run proves each of them), and only then plays as above.
 //! * Limit breaks and escape (protocol v7): the menu says `Limit` in place of `Attack` while our
 //!   character's limit gauge is full and has an `Escape` row; the party panel draws a limit bar per
@@ -87,6 +99,8 @@
 #[cfg(test)]
 mod action_tests;
 mod bot;
+#[cfg(test)]
+mod crew_tests;
 mod data;
 mod hud;
 mod lag;
@@ -345,6 +359,13 @@ pub struct ActiveBattle {
     replay: Option<BattleReplay>,
     /// Our own character (`ActorId` = our index in the party), if we are in it.
     my_actor: Option<ActorId>,
+    /// Every member whose commands we give (`BattleMember::is_commanded_by`): our own character and, when the roster names us
+    /// as their commander, the canon companions; in actor order.
+    commanded: Vec<ActorId>,
+    /// The members of ours whose turn it is (gauge full, alive, able to act: `BattleState::ready_actors`), in the order they
+    /// became ready. The first has the menu, so the one that has waited longest goes first (FF7's rule); a swap sends it to the
+    /// back. Kept in step with the replay by `BattleClient::reconcile_turns`; empty without a replay.
+    queue: Vec<ActorId>,
     ticks_per_second: u32,
     /// Local clock (seconds) at the last server message of this battle.
     last_message: f64,
@@ -354,6 +375,9 @@ pub struct ActiveBattle {
     messages: u64,
     /// Commands of OUR character that the server applied (it echoes each one in its event), by kind.
     my_commands: Applied,
+    /// Commands of the canon companions we commanded that the server applied, by kind (never mixed with ours: a script and
+    /// the smoke line count our own character's alone).
+    crew_commands: Applied,
     /// The status events the server announced in this battle.
     statuses: StatusCounts,
     /// The enemy attacks that answered a command (an enemy's counter scripts run inside the command that provoked them, so
@@ -373,6 +397,24 @@ impl ActiveBattle {
     pub fn roster_name(&self, actor: ActorId) -> Option<String> {
         let index = usize::from(actor.0);
         self.party.get(index).map(|member| roster_display_name(&member.name, index))
+    }
+
+    /// The member whose menu is on offer: the first of ours whose turn it is (the one that has waited longest), else our own
+    /// character, whom the panels then keep marking.
+    pub fn focus(&self) -> Option<ActorId> {
+        self.queue.first().copied().or(self.my_actor)
+    }
+
+    /// Every member whose commands we give, our own character and the canon companions that name us as their commander.
+    #[cfg(test)]
+    pub fn commanded(&self) -> &[ActorId] {
+        &self.commanded
+    }
+
+    /// The members of ours whose turn it is, the first being the one with the menu.
+    #[cfg(test)]
+    pub fn turns(&self) -> &[ActorId] {
+        &self.queue
     }
 
     /// The replayed engine, if this client could build it.
@@ -415,6 +457,8 @@ pub struct BattleClient {
     verified: u64,
     /// Commands of our character the server applied, over the ended battles, by kind.
     applied: Applied,
+    /// Commands of the canon companions we commanded that the server applied, over the ended battles, by kind.
+    crew: Applied,
     /// Commands of our character the server has applied since this client was made, counted as each one
     /// arrives and never lowered (the `applied` above only gains a battle's commands when it ends, and loses
     /// those of a battle that was dropped): what a script watches to know that its entry was applied.
@@ -463,6 +507,7 @@ impl BattleClient {
             divergences: 0,
             verified: 0,
             applied: Applied::default(),
+            crew: Applied::default(),
             my_applied: 0,
             rejections: 0,
             last_rejection: None,
@@ -595,7 +640,7 @@ impl BattleClient {
         };
         let a = &self.applied;
         format!(
-            "{} battle(s) entered, {} won, {} lost, {} escaped, {} verified by replay, {} divergence(s), {} command(s) of ours applied ({} attack, {} magic, {} item, {} defend, {} limit, {} escape), {refusal}",
+            "{} battle(s) entered, {} won, {} lost, {} escaped, {} verified by replay, {} divergence(s), {} command(s) of ours applied ({} attack, {} magic, {} item, {} defend, {} limit, {} escape), {refusal}, {} command(s) for the canon companions applied",
             self.entered,
             self.victories,
             self.defeats,
@@ -608,7 +653,8 @@ impl BattleClient {
             a.item,
             a.defend,
             a.limit,
-            a.escape
+            a.escape,
+            self.crew.total()
         )
     }
 
@@ -705,6 +751,14 @@ impl BattleClient {
             .position(|m| m.account() == Some(self.me))
             .and_then(|i| u8::try_from(i).ok())
             .map(ActorId);
+        // Whose commands we give: our own character and the canon companions that name us as their commander.
+        let commanded: Vec<ActorId> = setup
+            .party
+            .iter()
+            .enumerate()
+            .filter(|(_, member)| member.is_commanded_by(self.me))
+            .filter_map(|(i, _)| u8::try_from(i).ok().map(ActorId))
+            .collect();
         self.hud.begin(setup.formation_id, my_actor);
         // What this battle sounds like: its party's weapons and its formation's attacks (silent without this machine's book).
         let book = self.hud.names().and_then(|names| names.sounds()).cloned();
@@ -750,24 +804,33 @@ impl BattleClient {
         for (index, member) in setup.party.iter().enumerate() {
             self.note(roster_note(index, member));
         }
+        // The canon companions are ours to command when the roster names us (the server then gives them no command of its own).
+        let crew: Vec<u8> = commanded.iter().filter(|a| Some(**a) != my_actor).map(|a| a.0).collect();
+        if !crew.is_empty() {
+            self.note(format!("{battle_id}: you command the canon companions as well as your own character (actors {crew:?})"));
+        }
         self.active = Some(ActiveBattle {
             id: battle_id,
             formation_id: setup.formation_id,
             party: setup.party.clone(),
             replay,
             my_actor,
+            commanded,
+            queue: Vec::new(),
             ticks_per_second: setup.ticks_per_second,
             last_message: now,
             pending: None,
             diverged: false,
             messages: 0,
             my_commands: Applied::default(),
+            crew_commands: Applied::default(),
             statuses: StatusCounts::default(),
             counters: 0,
         });
         if let Some(why) = failure {
             self.diverged(why);
         }
+        self.reconcile_turns();
         // The menu model outlives a battle: this battle's spells (and the inventory's items) replace
         // whatever the last one left.
         self.refresh_menu_model();
@@ -780,13 +843,20 @@ impl BattleClient {
         };
         active.last_message = now;
         active.messages += 1;
-        let mine = command.filter(|c| Some(c.actor) == active.my_actor);
-        let my_command = mine.is_some();
-        if let Some(applied) = mine {
+        // A command of one of the members we command was applied: the one we were waiting for is answered. Our own character's
+        // are counted apart from the companions' (a script and the smoke line count our own character's alone).
+        let ours = command.filter(|c| active.commanded.contains(&c.actor));
+        if let Some(applied) = ours {
             active.pending = None;
-            active.my_commands.count(&applied.command);
-            self.my_applied += 1;
+            if Some(applied.actor) == active.my_actor {
+                active.my_commands.count(&applied.command);
+                self.my_applied += 1;
+            } else {
+                active.crew_commands.count(&applied.command);
+            }
         }
+        // The menu starts over when the command of the member that had it is applied (see `BattleHud::on_events`).
+        let my_command = ours.is_some_and(|c| Some(c.actor) == active.focus());
         // What happened, for the scene, whether or not this machine can replay it.
         for event in events {
             if self.events.len() >= MAX_EVENTS {
@@ -833,7 +903,9 @@ impl BattleClient {
         for line in event_notes {
             self.note(line);
         }
-        // What the menu offers follows the replay: a limit gauge moves with these messages (and nowhere else).
+        // Whose turn it is follows the replay (the menu moves on to the next member that is ready), and what the menu offers
+        // follows the replay too: a limit gauge moves with these messages (and nowhere else).
+        self.reconcile_turns();
         self.refresh_menu_model();
     }
 
@@ -885,9 +957,14 @@ impl BattleClient {
             }
         };
         self.applied.add(active.my_commands);
+        self.crew.add(active.crew_commands);
         let counts = active.statuses;
         self.note(format!("status: {battle_id} inflicted={} ended={} ticks={}", counts.inflicted, counts.ended, counts.ticks));
         self.note(format!("counter: {battle_id} counters={}", active.counters));
+        // What we commanded for the canon companions (only a client that was named their commander has any to say).
+        if active.commanded.iter().any(|a| Some(*a) != active.my_actor) {
+            self.note(format!("crew: {battle_id} commands={}", active.crew_commands.total()));
+        }
         self.note(format!(
             "{battle_id} ended in {outcome:?} ({paid}); back in the field; {} command(s) of yours applied; {how}",
             active.my_commands.total()
@@ -944,7 +1021,8 @@ impl BattleClient {
 
     fn menu_model_of_battle(&self) -> BattleMenuModel {
         let Some(active) = self.active.as_ref() else { return BattleMenuModel::default() };
-        let (Some(replay), Some(mine)) = (active.replay.as_ref(), active.my_actor) else { return BattleMenuModel::default() };
+        // The menu is the focus member's: the first of ours whose turn it is (our own character when none is).
+        let (Some(replay), Some(mine)) = (active.replay.as_ref(), active.focus()) else { return BattleMenuModel::default() };
         let state = replay.state();
         let book = self.hud.names();
         // How many a thing can be aimed at: a spell that can hit one target or a whole side may hit the whole side
@@ -1020,60 +1098,72 @@ impl BattleClient {
 
     // ----- playing ------------------------------------------------------------------------
 
-    /// Is it our own character's turn to command, as far as the replay knows (which is as far as the
-    /// server has said)? Our gauge is full, the battle is not over and no command of ours is in flight:
-    /// then the battle, its engine and our actor.
-    fn my_turn(&self, now: f64) -> Option<(&ActiveBattle, &BattleState, ActorId)> {
+    /// Is it `actor`'s turn to command, as far as the replay knows (which is as far as the server has said)? Its gauge is full,
+    /// it is alive and can act (`BattleState::ready_actors`), the battle is not over and no command of ours is in flight:
+    /// then the battle and its engine. `actor` must be one we command ([`ActiveBattle::commanded`]).
+    fn turn_of(&self, actor: ActorId, now: f64) -> Option<(&ActiveBattle, &BattleState)> {
         let active = self.active.as_ref()?;
         let state = active.replay.as_ref()?.state();
-        let mine = active.my_actor?;
-        if state.outcome().is_some() || !state.ready_actors().contains(&mine) {
+        if !active.commanded.contains(&actor) || state.outcome().is_some() || !state.ready_actors().contains(&actor) {
             return None;
         }
         if active.pending.is_some_and(|sent| now - sent < PENDING_TIMEOUT_S) {
             return None;
         }
+        Some((active, state))
+    }
+
+    /// Is it our own character's turn to command (see [`BattleClient::turn_of`]): then the battle, its engine and our actor.
+    fn my_turn(&self, now: f64) -> Option<(&ActiveBattle, &BattleState, ActorId)> {
+        let mine = self.active.as_ref()?.my_actor?;
+        let (active, state) = self.turn_of(mine, now)?;
         Some((active, state, mine))
+    }
+
+    /// The attack `actor` can make right now: it is its turn (as [`BattleClient::turn_of`] judges it) and there is a living
+    /// enemy to hit (the first one).
+    fn attack_for(&self, actor: ActorId, now: f64) -> Option<BattleCmd> {
+        let (active, state) = self.turn_of(actor, now)?;
+        let target = state.enemy_ids().into_iter().find(|e| state.actor(*e).is_some_and(Combatant::is_alive))?;
+        Some(BattleCmd::Command { battle_id: active.id, actor, command: Command::Attack { target } })
     }
 
     /// The attack our own character can make right now: it is our turn (our gauge is full as far as the
     /// replay knows, which is as far as the server has said, and no command of ours is in flight) and
     /// there is a living enemy to hit (the first one).
+    #[cfg(test)]
     pub fn attack_command(&self, now: f64) -> Option<BattleCmd> {
-        let (active, state, mine) = self.my_turn(now)?;
-        let target = state.enemy_ids().into_iter().find(|e| state.actor(*e).is_some_and(Combatant::is_alive))?;
-        Some(BattleCmd::Command { battle_id: active.id, actor: mine, command: Command::Attack { target } })
+        self.attack_for(self.active.as_ref()?.my_actor?, now)
     }
 
-    /// Our own character healing itself, if it is our turn and it should: its HP is under 30% of its
-    /// maximum and it knows a restoring spell it can pay for, the cheapest of which (then the lowest
-    /// spell id) it casts on itself. A revival never qualifies: the engine refuses to aim one at a
-    /// character who stands, which is what [`BattleState::check_command`] says here (it also says
-    /// whether the MP is there).
-    fn heal_command(&self, now: f64) -> Option<BattleCmd> {
-        let (active, state, mine) = self.my_turn(now)?;
-        let me = state.actor(mine)?;
+    /// `actor` healing itself, if it is its turn and it should: its HP is under 30% of its maximum and it knows a restoring
+    /// spell it can pay for, the cheapest of which (then the lowest spell id) it casts on itself. A revival never
+    /// qualifies: the engine refuses to aim one at a character who stands, which is what [`BattleState::check_command`]
+    /// says here (it also says whether the MP is there).
+    fn heal_for(&self, actor: ActorId, now: f64) -> Option<BattleCmd> {
+        let (active, state) = self.turn_of(actor, now)?;
+        let me = state.actor(actor)?;
         if u64::from(me.hp) * 10 >= u64::from(me.max_hp) * 3 {
             return None;
         }
         let spell = state
-            .spells_for(mine)
+            .spells_for(actor)
             .into_iter()
             .filter(|s| s.targets_allies)
-            .filter(|s| state.check_command(mine, &Command::Magic { spell: s.spell, target: Target::One(mine) }).is_ok())
+            .filter(|s| state.check_command(actor, &Command::Magic { spell: s.spell, target: Target::One(actor) }).is_ok())
             .min_by_key(|s| (s.mp_cost, s.spell))?;
-        Some(BattleCmd::Command { battle_id: active.id, actor: mine, command: Command::Magic { spell: spell.spell, target: Target::One(mine) } })
+        Some(BattleCmd::Command { battle_id: active.id, actor, command: Command::Magic { spell: spell.spell, target: Target::One(actor) } })
     }
 
-    /// Our character's limit break, if it is our turn and the limit should be given: its gauge is full and
+    /// `actor`'s limit break, if it is its turn and the limit should be given: its gauge is full and
     /// there is a worthwhile target. A damaging limit goes to the first living enemy; a healing one (Healing
     /// Wind, which heals the whole party) only when somebody in the party is under half of its max HP: it is
     /// not wasted on a party that is fine, and one that can only be aimed at one ally goes to the one with the
     /// least HP left (by fraction, the lowest actor id on a tie). The engine says whether the command is legal
     /// ([`BattleState::check_command`]).
-    fn limit_command(&self, now: f64) -> Option<BattleCmd> {
-        let (active, state, mine) = self.my_turn(now)?;
-        let info = state.limit_for(mine).filter(|_| state.limit_ready(mine))?;
+    fn limit_for(&self, actor: ActorId, now: f64) -> Option<BattleCmd> {
+        let (active, state) = self.turn_of(actor, now)?;
+        let info = state.limit_for(actor).filter(|_| state.limit_ready(actor))?;
         let target = if info.targets_allies {
             let worst = state
                 .party_ids()
@@ -1090,18 +1180,32 @@ impl BattleClient {
             Target::One(state.enemy_ids().into_iter().find(|e| state.actor(*e).is_some_and(Combatant::is_alive))?)
         };
         let command = Command::Limit { target };
-        state.check_command(mine, &command).ok()?;
-        Some(BattleCmd::Command { battle_id: active.id, actor: mine, command })
+        state.check_command(actor, &command).ok()?;
+        Some(BattleCmd::Command { battle_id: active.id, actor, command })
     }
 
-    /// What the headless bot does on our character's turn: heal itself when its HP is under 30% and a
-    /// restoring spell is affordable (the cheapest one, on itself), else give its limit when the gauge is
-    /// full and there is a worthwhile target ([`BattleClient::limit_command`]), else attack the first
-    /// living enemy ([`BattleClient::attack_command`]). It never runs: a bot that left a battle would never
-    /// win one (only a `--battle-script` makes it, see [`BattleClient::scripted_command`], and that comes
-    /// before this rule).
+    /// What the headless bot does on `actor`'s turn: heal itself when its HP is under 30% and a restoring spell is affordable
+    /// (the cheapest one, on itself), else give its limit when the gauge is full and there is a worthwhile target, else attack
+    /// the first living enemy. It never runs: a bot that left a battle would never win one.
+    fn rule_for(&self, actor: ActorId, now: f64) -> Option<BattleCmd> {
+        self.heal_for(actor, now).or_else(|| self.limit_for(actor, now)).or_else(|| self.attack_for(actor, now))
+    }
+
+    /// What the headless bot does on our own character's turn, and on the turn of every canon companion it commands (the
+    /// roster names it their commander: see the module docs): the first member whose turn came, the one that has waited longest
+    /// (`ActiveBattle::queue`), gets the rule above, one command at a time (the mirror's `pending` guard keeps it from sending the
+    /// next before the server answered this one). A `--battle-script` makes it give its own character's commands first (see
+    /// [`BattleClient::scripted_command`] and [`BattleClient::crew_command`]), and that comes before this rule.
     pub fn bot_command(&self, now: f64) -> Option<BattleCmd> {
-        self.heal_command(now).or_else(|| self.limit_command(now)).or_else(|| self.attack_command(now))
+        self.active.as_ref()?.queue.iter().find_map(|actor| self.rule_for(*actor, now))
+    }
+
+    /// The turn of a canon companion the bot commands, by the rule above: [`BattleClient::bot_command`] without our own
+    /// character, whose commands a `--battle-script` gives while it has any left, so that the script never keeps the companions
+    /// waiting (or the other way round).
+    pub fn crew_command(&self, now: f64) -> Option<BattleCmd> {
+        let active = self.active.as_ref()?;
+        active.queue.iter().filter(|actor| Some(**actor) != active.my_actor).find_map(|actor| self.rule_for(*actor, now))
     }
 
     /// Record that `cmd` was sent, so the same command is not sent again before the answer.
@@ -1137,6 +1241,8 @@ impl BattleClient {
             return BattleView::unverified(active.id);
         };
         let state = replay.state();
+        // `mine` marks the member whose menu is on offer: the first of ours whose turn it is, else our own character.
+        let focus = active.focus();
         let bar = |id: ActorId| -> Option<Bar> {
             let c = state.actor(id)?;
             let gauge = if c.is_alive() && !c.ready {
@@ -1158,7 +1264,7 @@ impl BattleClient {
                 ready: c.ready && c.can_act(),
                 alive: c.is_alive(),
                 status: c.status.set(),
-                mine: Some(id) == active.my_actor,
+                mine: Some(id) == focus,
                 limit: state.limit_gauge(id),
             })
         };
@@ -1170,6 +1276,42 @@ impl BattleClient {
             waiting_for_answer: active.pending.is_some_and(|sent| now - sent < PENDING_TIMEOUT_S),
             ..BattleView::default()
         }
+    }
+
+    /// Bring the queue of turns in step with the replayed engine: a member of ours that is no longer ready (it acted, fell or
+    /// fell asleep) leaves it, one whose gauge filled joins at the back (in actor order when several filled in the same message),
+    /// and when that changes who has the menu the menu starts again at the command list ([`BattleHud::set_focus`]). Called after
+    /// every message that moves the engine.
+    fn reconcile_turns(&mut self) {
+        let Some(active) = self.active.as_mut() else { return };
+        let Some(state) = active.replay.as_ref().map(BattleReplay::state) else {
+            active.queue.clear();
+            return;
+        };
+        let ready = state.ready_actors();
+        active.queue.retain(|actor| ready.contains(actor));
+        for actor in &active.commanded {
+            if ready.contains(actor) && !active.queue.contains(actor) {
+                active.queue.push(*actor);
+            }
+        }
+        let focus = active.focus();
+        self.hud.set_focus(focus);
+    }
+
+    /// `Tab`: the menu goes to the next member of ours whose turn it is, the one that has waited longest taking its place at
+    /// the back (FF7's Triangle, "switch"), when the menu is at its command list and at least two of ours are waiting.
+    /// Otherwise nothing happens.
+    pub fn swap_turn(&mut self) -> MenuReply {
+        let Some(active) = self.active.as_mut() else { return MenuReply::Ignored };
+        if active.queue.len() < 2 || !self.hud.menu_at_commands() {
+            return MenuReply::Ignored;
+        }
+        active.queue.rotate_left(1);
+        let focus = active.focus();
+        self.hud.set_focus(focus);
+        self.refresh_menu_model();
+        MenuReply::Handled
     }
 
     /// A key of the battle UI (see [`menu::BattleMenu`]): the menu of our character's turn takes it
@@ -1196,10 +1338,11 @@ impl BattleClient {
         self.menu_key(MenuKey::Back, now) == MenuReply::Handled
     }
 
-    /// The request for `choice` of our own character, or why there is none.
+    /// The request for `choice` of the member whose menu is open (the first of ours whose turn it is: see
+    /// [`ActiveBattle::focus`]), or why there is none.
     fn command_for(&self, choice: Choice, now: f64) -> Result<BattleCmd, &'static str> {
         let active = self.active.as_ref().ok_or("there is no battle")?;
-        let actor = active.my_actor.ok_or("you are not in this battle")?;
+        let actor = active.focus().ok_or("you are not in this battle")?;
         if active.pending.is_some_and(|sent| now - sent < PENDING_TIMEOUT_S) {
             return Err("your last command is still waiting for the server");
         }
@@ -1210,14 +1353,17 @@ impl BattleClient {
     pub fn title_suffix(&self, now: f64) -> String {
         let Some(view) = self.active.as_ref().map(|a| self.render(a, now)) else { return String::new() };
         let enemies = view.enemies.iter().filter(|b| b.alive).count();
+        let own = self.active.as_ref().and_then(|a| a.my_actor);
         let me = match view.party.iter().find(|b| b.mine) {
-            Some(b) if !b.alive => "you are down",
-            Some(b) if b.ready => "YOUR TURN: choose a command",
-            Some(b) if b.status.contains(fmv_ff7_battle::status::Status::Sleep) => "asleep",
-            Some(b) if b.status.contains(fmv_ff7_battle::status::Status::Stop) => "stopped",
-            Some(b) if b.status.contains(fmv_ff7_battle::status::Status::Paralysis) => "paralysed",
-            Some(_) => "waiting for your gauge",
-            None => "watching",
+            Some(b) if !b.alive => "you are down".to_string(),
+            // A canon companion we command: say whose menu it is.
+            Some(b) if b.ready && Some(b.actor) != own => format!("{}'S TURN: choose a command", b.name.to_uppercase()),
+            Some(b) if b.ready => "YOUR TURN: choose a command".to_string(),
+            Some(b) if b.status.contains(fmv_ff7_battle::status::Status::Sleep) => "asleep".to_string(),
+            Some(b) if b.status.contains(fmv_ff7_battle::status::Status::Stop) => "stopped".to_string(),
+            Some(b) if b.status.contains(fmv_ff7_battle::status::Status::Paralysis) => "paralysed".to_string(),
+            Some(_) => "waiting for your gauge".to_string(),
+            None => "watching".to_string(),
         };
         let flag = match view.status {
             Status::Verified => "",

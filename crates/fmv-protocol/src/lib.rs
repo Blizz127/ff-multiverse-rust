@@ -1,4 +1,4 @@
-//! FF Multiverse wire protocol v16.
+//! FF Multiverse wire protocol v17.
 //!
 //! v16 is v15 plus [`ClientMsg::DeleteCharacter`] and [`ServerMsg::CharacterDeleted`]: a player deletes their own
 //! character on the server with that character's login token (sent as the first message instead of a Hello). The
@@ -115,7 +115,8 @@
 //! `MoveIntent`s are ignored and nobody else sees it move) and rebuilds the battle from its OWN
 //! `scene.bin` and `kernel.bin`: only ids, seeds and levels travel (see [`battle`]). The server
 //! steps the engine and announces what happened as `BattleEvent { battle_id, tick, events,
-//! command }`; a client commands its own character with `BattleCommand` once its gauge is full
+//! command }`; a client commands its own character, and the canon companions its roster entry names it the commander of
+//! ([`BattleMember::commander`]), with `BattleCommand` once that member's gauge is full
 //! and the server answers a refused one with `BattleRejected`. A won or lost battle ends with
 //! `BattleEnd { outcome, rewards }`, after which everyone is back in the field where they stood.
 //!
@@ -409,7 +410,8 @@ pub use fmv_party::{
     PartyEvent, PartyId, Placement,
 };
 
-pub const PROTOCOL_VERSION: u16 = 16;
+// Older clients cannot command companions, so they must not join a server that expects them to.
+pub const PROTOCOL_VERSION: u16 = 17;
 /// Hard cap on a single frame payload (bytes).
 pub const MAX_FRAME: u32 = 256 * 1024;
 /// Default TCP port for development. Deployment port is UNASSIGNED (see DEPLOYMENT-CONTRACT.md).
@@ -915,8 +917,8 @@ mod tests {
     }
 
     #[test]
-    fn the_version_is_sixteen() {
-        assert_eq!(PROTOCOL_VERSION, 16);
+    fn the_version_is_seventeen() {
+        assert_eq!(PROTOCOL_VERSION, 17);
     }
 
     // -----------------------------------------------------------------------------------------
@@ -2321,6 +2323,8 @@ mod tests {
                     limit: u16::MAX,
                     // Every bit of a status set: ten digits.
                     status: StatusSet::from_bits(u32::MAX),
+                    // The widest commander (a companion's; the type allows it on any member, so the bound holds).
+                    commander: Some(AccountId(u64::MAX - i)),
                 })
                 .collect(),
             preemptive: false,

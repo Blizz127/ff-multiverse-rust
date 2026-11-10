@@ -145,6 +145,8 @@ impl Slots {
         let which = match found.info.id.as_str() {
             ECHO_S_ID => "echo-s",
             COSMO_ID => "cosmo",
+            // The client opens these separately as model overlays.
+            "2b25060c-c60e-426e-ac46-f85439e903e2" | "2b25060c-c60e-426e-ac46-f85439e903e3" => return,
             _ => {
                 notes.push(format!("ignored an archive that is neither Echo-S nor Cosmo Memory ({:?})", found.info.name));
                 return;

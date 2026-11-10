@@ -96,6 +96,14 @@ CHARACTER PROGRESS:
   --battle-speed, --battle-tick-rate, --battle-level, --battle-seed and --debug-formation pin the
   pace, level, seed and fight for reproducible runs; --no-random-encounters turns the rolls off.
 
+  The canon companions (Cloud and Barret in the first reactor mission) fight beside every player's own
+  character and, as in FF7, are commanded by a PLAYER: --companions-player-commanded (on by default)
+  lets the party's leader give their commands (a solo player commands Cloud, Barret and their own
+  character, each when its gauge is full, and the client's menu moves to whichever of them is ready
+  next); every other player of a party commands only their own character. A full gauge waits for its
+  command. --companions-player-commanded=false is the earlier behaviour: the server commands them on
+  their own gauges (--companion-turn-wait-ms and --companion-max-wait-ms pace that).
+
 DEBUG FLAGS (smoke-test aids; leave them off on a server real players use):
   --debug-encounters lets a player start a battle on request. --debug-limit-full (refused unless
   --debug-encounters is given too, and warned about at start-up) makes every member of every battle
@@ -295,15 +303,27 @@ struct Cli {
     #[arg(long, value_name = "GAUGE", requires = "debug_encounters", conflicts_with = "debug_limit_full", value_parser = clap::value_parser!(u8).range(1..=255))]
     debug_bonus_limit: Option<u8>,
 
-    /// How long the canon companions (Cloud and Barret) wait for a player whose turn has come and who is still choosing,
-    /// in milliseconds of battle time, before they act anyway. The players lead every round; the companions follow.
+    /// How long a player whose gauge is full may take to choose, in milliseconds of battle time counted from its own full
+    /// gauge, before a canon companion may deliver the blow that ends the battle without that player's first turn.
+    /// Companions otherwise act on their own gauges. Only for the companions the SERVER commands (see
+    /// --companions-player-commanded).
     #[arg(long, value_name = "MS", default_value_t = fmv_server::companion::DEFAULT_TURN_WAIT_MS)]
     companion_turn_wait_ms: u32,
 
-    /// The longest a canon companion holds its full gauge for the players, in milliseconds of battle time. 0 makes the
-    /// companions act the instant their gauge fills.
+    /// The longest a canon companion holds a full gauge, in milliseconds of battle time, for a player's first turn or for
+    /// another party member's performance. 0 turns the pacing off. Only for the companions the SERVER commands.
     #[arg(long, value_name = "MS", default_value_t = fmv_server::companion::DEFAULT_MAX_WAIT_MS)]
     companion_max_wait_ms: u32,
+
+    /// Who commands the canon companions (Cloud and Barret in the first reactor mission). true (the default): a player
+    /// does, as in FF7 where the player commands every member of the party. The party LEADER commands them (the first
+    /// player that fights when the leader does not; the one player of a solo battle) and every other player commands only
+    /// their own character; a companion whose gauge is full WAITS for its command, and the server commands none of them
+    /// while their commander is in the battle (it takes them back if that player leaves). false: the server commands the
+    /// companions with its own rule, each on its own gauge, and nobody may (the behaviour of protocol v9 to v16). A bare
+    /// flag means true.
+    #[arg(long, value_name = "BOOL", default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+    companions_player_commanded: bool,
 }
 
 /// `--debug-status`: a comma-separated list of status names (any case, with or without spaces and hyphens) that a
@@ -435,6 +455,7 @@ impl Cli {
             debug_bonus_exp: self.debug_bonus_exp.unwrap_or(0),
             debug_bonus_limit: self.debug_bonus_limit.unwrap_or(0),
             companion_pacing: fmv_server::companion::Pacing { turn_wait_ms: self.companion_turn_wait_ms, max_wait_ms: self.companion_max_wait_ms },
+            companions_player_commanded: self.companions_player_commanded,
             ..BattleSettings::new(rules)
         }
     }
@@ -788,6 +809,31 @@ mod tests {
         assert_eq!(cli.game, GameKind::Ff7);
         assert!(parse(&["--tick-hz", "0"]).is_err());
         assert!(parse(&["--max-connections", "0"]).is_err());
+    }
+
+    /// The switch that hands the canon companions to the players: ON for the server binary (the owner's build), OFF in the
+    /// library's own `BattleSettings::new` (code that builds its settings itself keeps the earlier behaviour until it asks).
+    #[test]
+    fn the_companions_are_player_commanded_by_default_and_the_switch_turns_it_off() {
+        use fmv_protocol::SyntheticRules;
+        let settings = |args: &[&str]| {
+            parse(args).unwrap().battle_settings(std::sync::Arc::new(SyntheticRules::default())).companions_player_commanded
+        };
+        assert!(settings(&[]), "the server binary lets the players command the companions unless told otherwise");
+        // A bare flag is true, and a value goes after it either way.
+        assert!(settings(&["--companions-player-commanded"]));
+        assert!(settings(&["--companions-player-commanded", "true"]));
+        assert!(settings(&["--companions-player-commanded=true"]));
+        assert!(!settings(&["--companions-player-commanded=false"]));
+        assert!(!settings(&["--companions-player-commanded", "false"]));
+        // A bare flag in front of another one does not swallow it.
+        assert!(settings(&["--companions-player-commanded", "--no-random-encounters"]));
+        let both = parse(&["--companions-player-commanded", "--no-random-encounters"]).unwrap();
+        assert!(both.no_random_encounters && both.companions_player_commanded);
+        // Anything that is not a boolean is a usage error, not a silent default.
+        assert!(parse(&["--companions-player-commanded=maybe"]).is_err());
+        // The library's own default is the earlier behaviour: the server commands them.
+        assert!(!BattleSettings::new(std::sync::Arc::new(SyntheticRules::default())).companions_player_commanded);
     }
 
     #[test]

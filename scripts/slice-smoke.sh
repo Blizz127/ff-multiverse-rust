@@ -8,7 +8,8 @@
 #   (1) a persistent ORIGINAL player character with a saved identity (name, colour, body choice);
 #   (2) multiplayer party membership (two players party up and fight one shared battle);
 #   (3) the canon party FIGHTS BESIDE the players and nobody is replaced (v9): every battle's party is the story's canon
-#       party first, Cloud and Barret, commanded by the SERVER with ordinary commands every client replays and verifies
+#       party first, Cloud and Barret, commanded by the party leader's bot (the server's --companions-player-commanded, on by
+#       default; by the SERVER with it off) with ordinary commands every client replays and verifies
 #       (`companion acted battle=.. actor=.. name=Cloud command=..`), and then the players, each with the stat curve
 #       (its "fighting style", here Barret's and Tifa's curves) of its character and its own body (a generic placeholder
 #       body) in the field; the canon Barret is no longer a field NPC (he is in the party), and talking to the field's
@@ -146,7 +147,7 @@ Usage: scripts/slice-smoke.sh [--release|--debug] [--bin-dir DIR] [--build] [--l
 
 The foundations slice over real processes and the owner's real FF7 data (protocol v10): two headless
 players with different identities and fighting styles register, party up, advance one story and fight one shared
-battle on md1stin beside the canon Cloud and Barret, whom the server commands (session 1's server runs with the DEBUG
+battle on md1stin beside the canon Cloud and Barret, whom the leader's bot commands (session 1's server runs with the DEBUG
 bonus --debug-bonus-exp, so that both new characters level up); the server is stopped and started again as a new
 process (without the bonus) on the same state directory; the same two players log in and must be told exactly
 what they ended with, every persisted record must be byte for byte unchanged, and a second battle must use what
@@ -712,7 +713,7 @@ run_slice() {
   done
   [[ -n ${ids[0]} && ${ids[0]} == "${ids[1]}" ]] || problem "the players did not enter the same battle (A: '${ids[0]}', B: '${ids[1]}')"
 
-  # The roster: the canon party (Cloud and Barret, commanded by the server) first, then the two players with their own
+  # The roster: the canon party (Cloud and Barret, commanded by the leader's bot) first, then the two players with their own
   # names and their stat curves, on the server and in each client: nobody is replaced.
   local started
   started=$(first_line_with "$sl" "battle started" || true)
@@ -992,7 +993,7 @@ run_slice() {
     say "session 1 -> restart, player $n: ${LEVEL_UPS[$n]}"
   done
   RESULT=pass
-  say "PASS: two original characters (distinct identities, bodies and stat curves) partied up, advanced a story and won a shared battle BESIDE the canon Cloud and Barret, whom the server commanded and every client replayed (0 divergences): the roster was Cloud, Barret and then the two players by their own names, nobody replaced, the rewards went to the players only and no canon Barret stands in the field any more; the dialogue was the game's own; session 1's server (with the DEBUG experience bonus) made both LEVEL UP and after a REAL server restart every card, record, level, experience, gil, AP, stored limit gauge, inventory and story was exactly what it was ($CARRIED), the records were byte for byte unchanged by a login, a second battle (on servers without the bonus) paid on top of what was saved to the point and started with the saved levels, and the restarted server fought them as their stat curves; $state_real unchanged ($after)."
+  say "PASS: two original characters (distinct identities, bodies and stat curves) partied up, advanced a story and won a shared battle BESIDE the canon Cloud and Barret, whom the leader's bot commanded and every client replayed (0 divergences): the roster was Cloud, Barret and then the two players by their own names, nobody replaced, the rewards went to the players only and no canon Barret stands in the field any more; the dialogue was the game's own; session 1's server (with the DEBUG experience bonus) made both LEVEL UP and after a REAL server restart every card, record, level, experience, gil, AP, stored limit gauge, inventory and story was exactly what it was ($CARRIED), the records were byte for byte unchanged by a login, a second battle (on servers without the bonus) paid on top of what was saved to the point and started with the saved levels, and the restarted server fought them as their stat curves; $state_real unchanged ($after)."
 }
 
 main() {

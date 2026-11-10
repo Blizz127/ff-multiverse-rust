@@ -349,7 +349,7 @@ const LABEL_W: i32 = 112;
 /// line (at the design width of 400 it is the width of the canvas less a margin).
 const CREATE_W: i32 = 440;
 /// What the Body row means, in one short line.
-pub const BODY_HELP: &str = "how you look on the field (a placeholder model)";
+pub const BODY_HELP: &str = "how you look on the field";
 /// What the Fighting style row means, in one short line (wrapped where the form is narrower than it is long).
 pub const SLOT_HELP: &str = "how you fight: its stats, spells and level curve (fixed once created)";
 /// Height of one line of help text, in canvas units, and the space left under a block of them.
@@ -1004,7 +1004,7 @@ mod tests {
         let menu = Menu::new(cfg(GameId::Ff7), vec![]);
         let list = draw(&menu, 1100, 680);
         let said = said(&list);
-        assert!(said.contains("how you look on the field (a placeholder model)"), "{said}");
+        assert!(said.contains("how you look on the field"), "{said}");
         assert!(said.contains("how you fight: its stats, spells and level curve (fixed once created)"), "{said}");
         // The help is DIM text under the row it is about: the body's between the Body and Color rows, the style's
         // between the Fighting style row and the Preview line.
@@ -1024,7 +1024,7 @@ mod tests {
     #[test]
     fn the_focused_choice_is_explained_at_every_window_size_and_nothing_overlaps() {
         for (w, h) in SIZES {
-            for (presses, want) in [(1, "how you look on the field (a placeholder model)"), (6, "how you fight: its stats, spells and level curve (fixed once created)")] {
+            for (presses, want) in [(1, "how you look on the field"), (6, "how you fight: its stats, spells and level curve (fixed once created)")] {
                 let mut menu = Menu::new(cfg(GameId::Ff7), vec![]);
                 for _ in 0..presses {
                     menu.key(KeyPress::new(NavKey::Tab));

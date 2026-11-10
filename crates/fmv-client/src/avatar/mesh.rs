@@ -63,7 +63,7 @@ pub struct MergedMesh {
     /// RGBA vertex colours. The alpha of a semi-transparent part's vertices is the part's constant
     /// alpha; everywhere else it is 255.
     pub colors: Vec<[u8; 4]>,
-    /// 1.0 on the vertices of textured opaque parts, 0.0 elsewhere: those parts are overlays that
+    /// 1.0 on face-overlay vertices, 0.0 elsewhere: those parts are overlays that
     /// lie on top of other polygons (a face on a head), so the renderer pulls them a hair towards
     /// the camera in the depth test instead of letting them fight with the skin underneath.
     pub overlay: Vec<f32>,
@@ -147,6 +147,15 @@ impl MergedMesh {
     /// texture the loader could not read draw untextured. The whole-number shifts of a decal's
     /// texture coordinates are taken off (see [`whole_cell_offsets`]).
     pub fn build(model: &FieldModel) -> Result<Self, MeshError> {
+        Self::build_inner(model, false)
+    }
+
+    /// Player bodies may use textures for clothing; only head textures are face overlays.
+    pub fn build_body(model: &FieldModel) -> Result<Self, MeshError> {
+        Self::build_inner(model, true)
+    }
+
+    fn build_inner(model: &FieldModel, body: bool) -> Result<Self, MeshError> {
         let total: usize = model.parts.iter().map(|p| p.positions.len()).sum();
         if total > MAX_MODEL_VERTICES {
             return Err(MeshError::TooManyVertices(total));
@@ -172,7 +181,8 @@ impl MergedMesh {
             let base = u32::try_from(mesh.positions.len()).map_err(|_| MeshError::TooManyVertices(total))?;
             let is_blended = part.blend != PartBlend::Opaque;
             let alpha = if is_blended { (part.alpha.clamp(0.0, 1.0) * 255.0).round() as u8 } else { 255 };
-            let overlay = if !is_blended && part.texture.is_some() { 1.0 } else { 0.0 };
+            let head = model.bones.get(part.bone_index).is_some_and(|bone| bone.name.eq_ignore_ascii_case(HEAD_BONE));
+            let overlay = if !is_blended && part.texture.is_some() && (!body || head) { 1.0 } else { 0.0 };
             let shift = if part.texture.is_some() { whole_cell_offsets(&part.uvs) } else { [0.0; 2] };
             // The hair is on the head bone, drawn from vertex colours (a decal is flagged by `overlay` already).
             let on_head = !is_blended && part.texture.is_none() && model.bones.get(part.bone_index).is_some_and(|bone| bone.name.eq_ignore_ascii_case(HEAD_BONE));
@@ -348,6 +358,16 @@ pub(crate) mod tests {
         p.texture = None;
         let m = MergedMesh::build(&model(vec![p])).unwrap();
         assert_eq!((m.batches.len(), m.batches[0].texture.is_none()), (1, true));
+    }
+
+    #[test]
+    fn body_clothing_textures_accept_tint_while_face_textures_stay_overlays() {
+        let mut clothing = part(0, &[[0, 1, 2]], 3);
+        clothing.texture = Some(image());
+        let mut face = part(1, &[[0, 1, 2]], 3);
+        face.texture = Some(image());
+        let m = MergedMesh::build_body(&model(vec![clothing, face])).unwrap();
+        assert_eq!(m.overlay, [0.0, 0.0, 0.0, 1.0, 1.0, 1.0]);
     }
 
     /// Hair keeps its colour under a player's identity colour: the vertices of the HEAD bone (bone 1 here) whose colour is a

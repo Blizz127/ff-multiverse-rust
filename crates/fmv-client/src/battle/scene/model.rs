@@ -459,6 +459,7 @@ pub fn battle_character(character: u8) -> BattleCharacter {
 /// that actor, reported once on stderr and never asked for again.
 pub struct ArchiveModels {
     models: BattleModels,
+    original_path: std::path::PathBuf,
     /// The models made so far by key (the model's prefix): `None` for one that could not be had.
     made: HashMap<String, Option<BattleModelData>>,
     /// What `scene.bin` says about the enemies' attacks (none: their plain attacks play no clip).
@@ -468,7 +469,10 @@ pub struct ArchiveModels {
 impl ArchiveModels {
     /// Open `battle.lgp` (read-only).
     pub fn open(path: &Path) -> Result<Self, String> {
-        Ok(Self { models: BattleModels::open(path).map_err(|e| e.to_string())?, made: HashMap::new(), book: EnemyBook::default() })
+        let mut archive = fmv_ff7::lgp::LgpArchive::open_path(path).map_err(|e| e.to_string())?;
+        if let Some(overlay) = crate::model_layer::battle() { archive.set_overlay(overlay); }
+        let models = BattleModels::from_archive(archive).or_else(|_| BattleModels::open(path)).map_err(|e| e.to_string())?;
+        Ok(Self { models, original_path: path.to_path_buf(), made: HashMap::new(), book: EnemyBook::default() })
     }
 
     /// This source with `book`: the enemies' attacks play the clips it names.
@@ -499,15 +503,20 @@ impl ArchiveModels {
         key: String,
         role: ModelRole,
         what: impl FnOnce() -> String,
-        load: impl FnOnce(&mut BattleModels) -> Result<BattleModel, BattleModelError>,
+        mut load: impl FnMut(&mut BattleModels) -> Result<BattleModel, BattleModelError>,
     ) -> Option<BattleModelData> {
         self.made
             .entry(key)
             .or_insert_with(|| match load(&mut self.models) {
                 Ok(model) => Some(Self::data_of(model, role)),
                 Err(why) => {
-                    eprintln!("battle: cannot load the model of {} ({why}); a stand-in is drawn", what());
-                    None
+                    match BattleModels::open(&self.original_path).and_then(|mut original| load(&mut original)) {
+                        Ok(model) => Some(Self::data_of(model, role)),
+                        Err(_) => {
+                            eprintln!("battle: cannot load the model of {} ({why}); a stand-in is drawn", what());
+                            None
+                        }
+                    }
                 }
             })
             .clone()

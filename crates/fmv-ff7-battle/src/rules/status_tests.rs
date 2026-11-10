@@ -364,7 +364,7 @@ fn a_blow_that_kills_or_does_nothing_does_not_wake_anyone() {
 #[test]
 fn a_sleeping_enemy_waits_with_a_full_gauge_and_acts_the_tick_it_wakes() {
     let sleeper = with_status(brute(5000), &[Status::Sleep]);
-    let config = BattleConfig { start: StartMode::BackAttack, ..BattleConfig::default() };
+    let config = BattleConfig { start: StartMode::EnemiesFirst, ..BattleConfig::default() };
     let mut state = BattleState::with_config(5, vec![hero()], vec![sleeper], config).with_items(items());
     assert_eq!(state.step_ticks(0), [BattleEvent::GaugeReady { actor: B }, inflicted(B, Status::Sleep)]);
     let events = state.step_ticks(120);
@@ -431,7 +431,7 @@ fn a_stopped_member_cannot_act_and_a_stopped_enemy_waits_until_it_is_over() {
     assert!(state.submit_command(A, Command::Defend).is_ok());
 
     let stopped = with_status(brute(5000), &[Status::Stop]);
-    let config = BattleConfig { start: StartMode::BackAttack, ..BattleConfig::default() };
+    let config = BattleConfig { start: StartMode::EnemiesFirst, ..BattleConfig::default() };
     let mut state = BattleState::with_config(2, vec![hero()], vec![stopped], config).with_items(items());
     state.step_ticks(0);
     let at = tick_of(&mut state, 2000, |e| matches!(e, BattleEvent::Action { actor: B, .. }));
@@ -880,7 +880,7 @@ fn an_enemy_attack_with_a_status_inflicts_it_after_its_damage() {
     let seed = 17;
     let mut stinger = brute(5000);
     stinger.actions = vec![EnemyAction { id: 7, spec: ActionSpec::basic_attack(4, 255, true).with_status(StatusEffect::inflict(Status::Silence, 63)) }];
-    let config = BattleConfig { start: StartMode::BackAttack, ..BattleConfig::default() };
+    let config = BattleConfig { start: StartMode::EnemiesFirst, ..BattleConfig::default() };
     let mut state = BattleState::with_config(seed, vec![hero()], vec![stinger], config).with_items(items());
     let events = state.step_ticks(1);
     let kinds: Vec<&str> = events.iter().map(|e| match e {

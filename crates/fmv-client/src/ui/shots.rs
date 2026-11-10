@@ -235,7 +235,7 @@ fn offscreen_creator() {
     let img = shoot(&mut gpu, "creator", &m, W, H);
     let mut list = DrawList::new();
     screens::draw_menu(&m, W, H, &mut list);
-    for needle in ["Name", "Body", "Fighting style", "Martial artist", "how you look on the field (a placeholder model)", "how you fight: its stats, spells and level curve", "(fixed once created)"] {
+    for needle in ["Name", "Body", "Fighting style", "Martial artist", "how you look on the field", "how you fight: its stats, spells and level curve", "(fixed once created)"] {
         assert!(list.says(needle), "{needle:?} is on the screen");
     }
     // The help lines are DIM text under their rows, and they reach the screen.
@@ -245,6 +245,29 @@ fn offscreen_creator() {
         let img = shoot(&mut gpu, &format!("creator-{w}x{h}"), &m, w, h);
         assert!(bright(&img) > 500, "{w}x{h}: there is text on the screen");
     }
+}
+
+#[test]
+#[ignore = "needs an owned char.lgp and a GPU"]
+fn offscreen_creator_model_preview() {
+    let char_path = std::env::var("FMV_CHAR_LGP").expect("FMV_CHAR_LGP");
+    let dir = std::env::var("FMV_NINO_TEST").ok();
+    crate::avatar::source::remember(Some(char_path.into()));
+    crate::model_layer::install(dir.as_deref().map(std::path::Path::new), dir.is_some());
+    let mut preview = super::preview::Preview::local().expect("preview");
+    let m = menu(GameId::Ff7, vec![]);
+    assert!(matches!(m.screen(), Screen::Create(_)));
+    let frame = preview.frame(&m, (W, H)).expect("preview frame");
+    let Some(mut gpu) = Offscreen::new() else { panic!("no GPU for preview check") };
+    let mut overlay = DrawList::new();
+    screens::draw_menu(&m, W, H, &mut overlay);
+    let img = gpu.render_with(W, H, |gpu, target, srgb| {
+        gpu.draw_field(target, (W, H), &empty_scene(), None, srgb);
+        gpu.draw_overlay(target, &overlay.vertices(W, H, srgb));
+        gpu.draw_creator_preview(target, (W, H), &frame);
+    });
+    save("creator-model-preview", W, H, &img);
+    assert_eq!(frame.models.len(), 1);
 }
 
 /// The HUD over a fixture area seen from above: names, the party, the status and the FIXTURE label.

@@ -57,6 +57,7 @@ pub const TEXT_ENV: &str = "FMV_MODS_TEXT";
 pub const VOICE_ENV: &str = "FMV_MODS_VOICE";
 pub const MUSIC_ENV: &str = "FMV_MODS_MUSIC";
 pub const SOUND_ENV: &str = "FMV_MODS_SOUND";
+pub const MODELS_ENV: &str = "FMV_MODS_MODELS";
 /// The biggest settings file read.
 const MAX_SETTINGS_BYTES: u64 = 16 * 1024;
 
@@ -99,7 +100,11 @@ pub struct ModFlags {
     #[arg(long = "mods-sound", value_name = "on|off", value_parser = parse_switch)]
     pub sound: Option<bool>,
 
-    /// A JSON settings file of booleans (`{"voice": false}`, keys text, voice, music, sound; a left-out key is on). Default:
+    /// Ninostyle models, on by default; off uses the original models.
+    #[arg(long = "mods-models", value_name = "on|off", value_parser = parse_switch)]
+    pub models: Option<bool>,
+
+    /// A JSON settings file of booleans (`{"voice": false}`, keys text, voice, music, sound, models; a left-out key is on). Default:
     /// $FMV_MODS_SETTINGS, else `settings.json` in the mods folder. Read only; flags and environment override it.
     #[arg(long = "mods-settings", value_name = "FILE")]
     pub settings: Option<PathBuf>,
@@ -119,6 +124,7 @@ pub fn parse_switch(value: &str) -> Result<bool, String> {
 pub struct Resolved {
     pub sources: ModSources,
     pub layers: Layers,
+    pub models: bool,
     /// The settings file that was looked for.
     pub settings: Option<PathBuf>,
     /// Things worth a line: a value that was not on or off, a settings file that did not parse.
@@ -175,11 +181,20 @@ pub fn resolve(flags: &ModFlags, env: &dyn Fn(&str) -> Option<String>, state_dir
     };
     let settings = flags.settings.clone().or_else(|| path_env(SETTINGS_ENV)).or_else(|| dir.map(|d| d.join("settings.json")));
     let mut layers = Layers::ALL;
+    let mut models = true;
     // Lowest precedence first: the file, then the environment (every layer, then each), then the flags the same way.
     if let Some(path) = &settings {
         match std::fs::metadata(path) {
             Ok(meta) if meta.is_file() && meta.len() <= MAX_SETTINGS_BYTES => match std::fs::read(path) {
-                Ok(bytes) => parse_settings(&bytes, &mut notes).apply(&mut layers),
+                Ok(bytes) => {
+                    parse_settings(&bytes, &mut notes).apply(&mut layers);
+                    if let Ok(serde_json::Value::Object(map)) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                        if let Some(value) = map.get("models") {
+                            if let Some(value) = value.as_bool() { models = value; }
+                            else { notes.push("the settings file's models is not true or false: ignored".to_string()); }
+                        }
+                    }
+                },
                 Err(e) => notes.push(format!("the settings file cannot be read ({}): ignored", e.kind())),
             },
             Ok(meta) if meta.is_file() => notes.push("the settings file is too big: ignored".to_string()),
@@ -203,7 +218,11 @@ pub fn resolve(flags: &ModFlags, env: &dyn Fn(&str) -> Option<String>, state_dir
     by_env.apply(&mut layers);
     everything(flags.all).apply(&mut layers);
     Partial { text: flags.text, voice: flags.voice, music: flags.music, sound: flags.sound }.apply(&mut layers);
-    Resolved { sources, layers, settings, notes }
+    if let Some(value) = all { models = value; }
+    if let Some(value) = from_env(MODELS_ENV) { models = value; }
+    if let Some(value) = flags.all { models = value; }
+    if let Some(value) = flags.models { models = value; }
+    Resolved { sources, layers, models, settings, notes }
 }
 
 // ---- the opened layers, for the whole process ---------------------------------------------------------
@@ -237,6 +256,7 @@ pub fn script_source() -> Option<Arc<dyn ScriptSource>> {
 /// Never fails: with no archive every layer plays the base game.
 pub fn setup(flags: &ModFlags, state_dir: Option<&Path>) -> Arc<Mods> {
     let resolved = resolve(flags, &|name| std::env::var(name).ok(), state_dir);
+    crate::model_layer::install(resolved.sources.dir.as_deref(), resolved.models);
     let mods = Arc::new(Mods::open(&resolved.sources, resolved.layers));
     for note in resolved.notes.iter().chain(mods.notes()) {
         eprintln!("mods: note: {note}");
@@ -338,12 +358,25 @@ mod tests {
     #[test]
     fn everything_is_on_by_default_and_the_default_folder_is_mods_in_the_state_dir() {
         let r = resolve(&ModFlags::default(), &env_of(&[]), Some(Path::new("/state")));
+        assert!(r.models);
         assert_eq!(r.layers, Layers::ALL);
         assert_eq!(r.sources.dir.as_deref(), Some(Path::new("/state/mods")));
         assert_eq!(r.settings.as_deref(), Some(Path::new("/state/mods/settings.json")));
         assert!(r.sources.echo_s.is_none() && r.sources.cosmo.is_none() && r.notes.is_empty());
         // Without a state directory there is no default folder.
         assert_eq!(resolve(&ModFlags::default(), &env_of(&[]), None).sources.dir, None);
+    }
+
+    #[test]
+    fn model_switch_respects_file_environment_and_flags() {
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = file(tmp.path(), "settings.json", r#"{"models":false}"#);
+        let flags = ModFlags { settings: Some(settings), ..Default::default() };
+        assert!(!resolve(&flags, &env_of(&[]), None).models);
+        assert!(resolve(&flags, &env_of(&[(MODELS_ENV, "on")]), None).models);
+        let flags = ModFlags { all: Some(false), models: Some(true), ..flags };
+        assert!(resolve(&flags, &env_of(&[(MODELS_ENV, "off")]), None).models);
+        assert!(!resolve(&ModFlags { all: Some(false), ..Default::default() }, &env_of(&[]), None).models);
     }
 
     #[test]

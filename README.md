@@ -58,7 +58,8 @@ full one turns Attack into the character's limit break, and any character may tr
 per-game appearance binding (a generic placeholder body in FF7), a fighting style (the stat curve of a
 canon party member, separate from the canon story roles) and pointers to its progress, and
 **the story's own party fights beside the players (protocol v9)**: the canon Cloud and Barret of the first
-reactor mission are in every battle as companions the server commands, and each player's character is ADDED
+reactor mission are in every battle as companions that a PLAYER commands, as in FF7 (the party's leader; the server
+commands them only with `--companions-player-commanded=false`), and each player's character is ADDED
 after them, in its own body, replacing nobody, and **a spell, an item or a limit can hit a whole side (protocol
 v10)**: an ALL place for the target pointer, FF7's All materia rule and the 2/3 split, and **battles have status
 effects (protocol v12)**: Poison, Regen, Sleep, Stop, Paralysis, Silence, Haste, Slow, Barrier, MBarrier,
@@ -73,7 +74,7 @@ as a labelled test area; it says nothing about FF7 support.
 | M2-b | Parties (invite, accept, leave, kick, promote), phase-key instance placement | done (single phase) |
 | M2-c/d | Shared battle, battle return, per-player rewards | done (battle subset; rewards paid into each account's own character progress and saved) |
 | M2-e | Player characters: identity, per-game binding, fighting style (a stat curve) separate from canon roles, pointers to progress (protocol v8) | done for the slice (FF7: generic placeholder bodies, fixed styles; `scripts/slice-smoke.sh`) |
-| M2-f | The story's canon party fights beside the players as server-controlled companions; players are added after them (protocol v9) | done for the first reactor mission (FF7: Cloud and Barret; `scripts/battle-smoke.sh`, `scripts/slice-smoke.sh`) |
+| M2-f | The story's canon party fights beside the players as companions that the party's leader commands (the server's `--companions-player-commanded`, on by default; the server commands them with it off); players are added after them (protocol v9, the commander v17) | done for the first reactor mission (FF7: Cloud and Barret; `scripts/battle-smoke.sh`, `scripts/slice-smoke.sh`) |
 | M2-g | Whole-side targeting: spells, items and limits can hit one target or a whole side, the party side being the canon companions and the players (protocol v10) | done for spells, items and limits (FF7: the All materia rule, the 2/3 split; the enemies' own AI still picks one party member; `scripts/battle-smoke.sh --commands`) |
 | M2-h | Status effects: the statuses of the game's own spells, items and enemy attacks, their clocks, what they do to turns, damage and hit rate, cures, panels and body cues (protocol v12) | done for 13 statuses (the engine's `status` module lists what is left out: Confusion, Berserk, Reflect, Petrify, Frog, ...; `scripts/battle-smoke.sh --status`) |
 | Later | FF8, FF9, FF10 and FF12 adapters on the same core, in that order (the owner's roadmap; FF13 maybe later) | planned |
@@ -429,7 +430,10 @@ battle's own overlay is drawn over the scene (the enemy list, the party's HP, MP
 command menu on your turn, the floating numbers and the pointer over the models' heads, and a
 band across the top that is green while your client's replay agrees with the server and red if it
 ever diverges); the arrow keys (or WASD) move in the menu, **Space** or **Enter** confirm and
-**Backspace** goes back. The menu has Attack (which says **Limit** while your limit gauge is full),
+**Backspace** goes back. As in FF7 you command the whole party: the menu belongs to whichever of Cloud, Barret and your own
+character has been ready longest (the party panel marks that member and the window title says whose turn it is), moves on to the
+next ready member when you give a command, and **Tab** (a controller's **Y**, FF7's Triangle) switches to the next ready one at the
+command list; another member's gauge filling never takes the menu away from a choice you are making. The menu has Attack (which says **Limit** while your limit gauge is full),
 Magic, Item, Defend and **Escape** (greyed out in a battle that cannot be run from). A spell, item or
 limit that can hit a whole side has one more place for the target pointer, **ALL** (one step past the
 last target, with the same arrow keys: there is no extra key; Healing Wind and Megalixir start on it).
@@ -905,6 +909,64 @@ whole party.
 `FMV_SMOKE_SCRIPT_A`, `FMV_SMOKE_SCRIPT_B` and
 `FMV_SMOKE_ESCAPE_SCRIPT` override the scripts (to try its failure paths).
 
+**The battle's clock: FF7's own starting timers and who acts when (protocol v15, engine change).** Every fighter, the canon
+companions and the enemies included, acts when its OWN gauge is full, at the pace its Dexterity and the Battle Speed give it
+(`speed value = 32768 / (120 + Battle Speed * 15 / 8)`, a V-timer of twice that, `(Dex + 50) * V / normal speed` a tick for a
+party member and `Dex * V / normal speed` for an enemy, the normal speed being the party's rounded average Dexterity plus
+50: the FF7 Project's "Stats & Battle Timers", from Fergusson's *Battle Mechanics* FAQ; the first reactor's party of Cloud,
+Barret and a player on Barret's curve at level 6 has a normal speed of 59 and fills in 355 to 369 ticks, an MP in 426, a Grunt
+in 369, a 1st Ray in 533: about 6 to 9 seconds at the 60 ticks a second the engine is run at). **The gauges start the way the
+game starts them** (`fmv_ff7_battle::rules`, "Starting turn timers", from the FAQ's "Starting Turn Timers" section, which only
+its excerpts in search results could be read for: the page answers our fetcher with HTTP 403): every fighter is dealt a random
+timer in half a bar, and a normal battle raises them all until the highest is at 87.5% (57344), so nobody starts under 37.5% and
+the luckiest is an eighth of a bar from its turn; a pre-emptive strike or a side attack fills the party and divides the
+enemies' by 8; a back attack or an ambush raises them to 93.75% and then empties the party. Before this version a normal
+start was a random half of a bar and nobody's first turn came before 3 to 6 seconds: the first reactor's fights now open
+with an enemy's first turn about 1.1 to 2.8 seconds in (8.9 s for a pair of Mono Drives, whose own script lets their first
+turn pass) and the party's first turn within about the same, which is how they begin in the game. **A hit is critical
+only when its chance is STRICTLY above its roll** (the disassembly-derived pseudocode of the Qhimm wiki's
+`FF7/DamageFormula`; it was `>=`, a point more). The numbers are pinned against that pseudocode in
+`crates/fmv-ff7-battle/tests/md1_real.rs`, over your own files and in numbers, not bytes: the enemies' stat records, the
+level-6 pair, the gauge speeds and the order the gauges first fill in (tick for tick), every damage, hit and critical roll
+of every blow between the pair and the reactor's enemies at levels 5 to 8, the hit and critical rates through the engine's
+own draws against the exact odds, and that a battle ends only with its last enemy (or its last party member). *Not
+played:* a target that is asleep or stopped is always hit in the game and is rolled for here; the pseudocode's two-roll magic
+hit rule (the one-roll rule here agrees with it over the whole first reactor, where no spell can miss either way).
+**Active, not Wait.** FF7's ATB has three modes (Qhimm forum, "[FF7 PSX] ATB Recommended/Wait Pause Logic", which read the game's
+code): Active stops the gauges only for a summon, Recommended (the default) also while an animation plays, Wait also in
+the Magic, Item and Summon menus and while a target is chosen; the command menu itself never stops anything. A shared
+battle cannot pause for one of several people, so it plays Active: an enemy acts the tick its gauge fills even while a
+player has a menu open (over the first reactor, with three players who never choose, the first enemy turn comes within 12
+seconds in every one of 200 fights of every formation). **The companions** (`fmv_server::companion::may_act`) act on their own
+clocks too, with two bounds: a companion never delivers the blow that ENDS the battle while a living, connected player has
+not had a first turn (released by `--companion-turn-wait-ms`, 5 s from that player's own full gauge, and
+`--companion-max-wait-ms`, 10 s in all), so a player always acts and an idle one stalls nobody; and it does not start while
+another party member's command is on the stage, for a gap of battle time (a second at the default pace, scaled with the
+Battle Speed like the game's own animation pause) that spaces the blows instead of releasing them together, the companion
+whose gauge has been full longest going first. (The first pacing held every companion until the players had given as many
+commands as it had, so ONE command of the player's released both companions in the same instant and ended most fights;
+see "The canon party fights beside the players" below.) `--companion-max-wait-ms 0` turns it all off.
+**What a first-reactor fight looks like** (`how_the_first_reactors_fights_flow_for_the_canon_pair_alone_and_with_a_player`,
+200 seeds a formation over the 18 formations the reactor's fields send, one person taking 1.5 s over each command): with FF7's
+own party of TWO (Cloud and Barret, both at that person's menu) a fight takes 12.2 s on average, 3.9 party attacks and 3.5
+enemy turns, and an enemy takes a turn in 93% of them; with the pair as companions and ONE player a fight takes 6.6 s, the
+same 3.9 party attacks (the enemies' HP is the game's), 1.9 enemy turns, an enemy turn in 87%, and the player gives 1.2
+commands, 1.00 in 12 of the 18 formations (the first party command comes 1.2 to 1.4 s in, not 6.1 s as before). Cloud's blow
+takes 41 to 44 off an MP, a Grunt or a Mono Drive, Barret's 35 to 38, so most of these enemies die to one hit each and a
+third fighter makes the reactor's fights about half as long and halves the enemy's turns. **That a player's one command
+ends a fight is, in most of the reactor's fights, how it is built, not lockstep:** the lockstep is gone (the first pacing
+put two party commands in ONE server step in 59% of these fights for a person at the menu, 27% for a bot; now 1.2% and 2.9%,
+all of them a player's own command landing in the step after a companion's), the companions' blows come apart (each on its
+own clock, a second or so from the last), but the rule that keeps a player's first turn leaves the LAST enemy standing for
+that player, and the pair has usually taken all the others by then, so "I attacked once and it was over" happens in 12 of
+the 18 formations (the Sweeper alone, 140 HP and three or four hits, included: the companions have worn it down and the
+player's is the blow that ends it) and in 68% (a bot) to 79% (a person) of all these fights, against 55% under the first
+pacing. (The "first pacing" figures are that rule replayed on THIS engine, by a throw-away measurement over the same 18
+formations with a solo player on Barret's curve, 200 seeds each, at the default pace; they are not numbers of the old
+engine and no test keeps them.) Whether that is the feel the owner wants is his to say; the knobs are
+the rule's (`--companion-max-wait-ms 0` turns the whole pacing off, and the last blow goes to whoever's gauge fills first) and the balance (enemy HP
+or gauge speed scaled with the party's size, which FF7's party of two never needed); no balance change is made here.
+
 **Status effects (protocol v12).** `fmv_ff7_battle::status` is the model and its module docs hold the
 sources and every number: the 32 status bits of the game, what an attack, item or `scene.bin` record's status fields
 mean (a mask and a byte, the low six bits of which are the chance out of 63 and the high bits say inflict, cure or
@@ -969,11 +1031,15 @@ and 303 (18, two enemies); the second table is disabled. The server reads every 
 same way (checked over all 702 fields of that build: every enabled table's weights add up to 64
 and every formation exists in `scene.bin`). A starting party of two players wins 301 and 303 every time (200 of
 200 seeded runs each, both members attacking). Since protocol v9 the canon Cloud and Barret fight beside the players and
-end those fights in about a hundred ticks, before every player has had a turn (measured by
-`crates/fmv-server/tests/battle_real.rs`: the players act in only about a tenth to a half of the fights), which is why
-the smoke scripts that need every bot to act fight formation 12 instead (two sturdier enemies of the game's own data,
-won every time with every player acting in 200 of 200 seeds; `--formation` picks another) and only `--random` fights
-`md1stin`'s own.
+would end those fights in about a hundred ticks, before every player has had a turn (measured by
+`crates/fmv-server/tests/battle_real.rs`, without the companions' pacing: a solo player acts in 44-87% of them, two players
+in 13-47%, three in 0-12%), which is why the companions keep a player's first turn (below) and why the smoke scripts that
+need every bot to act fight formation 12 (one of the game's test formations, two enemies of 1000 HP that act four times as
+often as a party member, won every time with every player acting in 200 of 200 seeds at one, two and three players;
+`--formation` picks another) and only `--random` fights `md1stin`'s own. The whole first reactor's tables
+(`md1stin`/`md1_1`/`md1_2`: 301-303; `nrthmk`: 305-307; `nmkin_1`/`nmkin_2`: 308-313; `nmkin_3`: 316-318; `nmkin_4`: 320-322,
+and the Guard Scorpion's own fight, 324 when the story starts it) hold only Mono Drives, MPs, a Guard Hound, 1st Rays,
+Grunts and a Sweeper (18 to 140 HP; the Scorpion has 800), which Cloud's and Barret's blows take down in one to four hits.
 
 **Your own character (protocol v8; in the party since v9).** Every player has ONE original character that travels
 across games. In FF7 it fights with the **stat curve** of a canon party member (its *fighting style*: Gunner, Mage and so
@@ -1029,8 +1095,8 @@ processes: two players with different identities and fighting styles register, p
 story (the server-validated story point of `md1stin`), talk to the field's guard (`fmv-client --headless --talk gu0`
 prints what a character says as `talk:` lines, read from your own copy of the field script with the player's own
 story: the guard says the game's own words, the same to both players) and win a shared battle whose roster is the
-canon Cloud and Barret (server-controlled companions: `companion acted` lines, every command replayed by both bots with
-0 divergences) followed by both players under their own names with their styles' stat curves, the rewards going to
+canon Cloud and Barret (commanded by the leader's bot, or by the server with `--companions-player-commanded=false`:
+`companion acted` lines, every command replayed by both bots with 0 divergences) followed by both players under their own names with their styles' stat curves, the rewards going to
 the two players only; the server process is stopped and started again, the same players log in again and are told
 exactly what they ended with (a login changes no record byte), and a second battle on the restarted server pays on
 top of what was saved, to the point. The stored limit gauge of an account (the smoke writes 200 and 120, as an account
@@ -1046,23 +1112,43 @@ itself] and is drawn in its own body, never as a second Barret, and an account t
 curve gets [Cloud, Barret, itself] with no second Cloud. (The canon Barret is therefore no longer a stand-in NPC of the
 field: he is in the party.)
 
-* **The server commands the companions.** A canon member has no account and no connection: when its gauge is full the
+* **A player commands the companions (`--companions-player-commanded`, on by default; protocol v17).** As in FF7, where the
+  player commands every member of the party, a PLAYER gives Cloud's and Barret's commands: a solo player commands Cloud,
+  Barret and its own character, each when that member's gauge is full; in a party the LEADER commands the canon pair (the
+  first player that fights, when the leader is elsewhere) and every other player commands only their own character
+  (anything else is `NotYourActor`). **A full gauge waits for its command and the server gives it none**, exactly as the
+  player's own character waits; the server takes a companion back only when its commander has left the battle, so that a gauge
+  never waits for a session that is gone. The roster says who commands them (`BattleMember::commander`, the one wire change; the
+  `BattleCommand` already named the actor), so the client opens the menu for the right member and the bot (`--battle-auto`)
+  commands every member it is given. A companion's command is an ordinary one (applied, announced, replayed, counted, logged as
+  `companion acted ... commander=<account>`), an item it uses is paid by the commander's account, and the rewards, saves and
+  limit gauges are what they were. `--companions-player-commanded=false` is the earlier behaviour, below.
+* **When the server commands the companions (the switch off, or their commander left).** A canon member has no account and no connection: when its gauge is full the
   server issues its command as an ORDINARY command (heal the most hurt member below half HP with the cheapest healing
   spell it can pay for; else its limit break when its gauge is full and there is something worth aiming at; else Attack
   the first living enemy), announces it like a player's (`AppliedCommand`) and logs `companion acted battle=.. actor=..
   name=Cloud command=..`, so every client replays and verifies it with no change to the engine. `fmv_server::companion`
   is the whole rule, a pure function of the engine's state (deterministic, never refused by it). A companion fights at
-  the party leader's level (`--battle-level` pins everybody's), is never paid and never saved, cannot be commanded by a
-  client (`NotYourActor`), and does not keep a battle alive: a battle with no connected player left is dropped.
-* **The players go first.** A companion whose gauge is full waits while a living, connected player still owes a turn
-  this round (`fmv_server::companion::may_act`), so the players lead every round and Cloud and Barret follow. A player
-  who is choosing holds them for at most `--companion-turn-wait-ms` (default 5000) after its own gauge filled, and no
-  companion holds a full gauge longer than `--companion-max-wait-ms` (default 10000; 0 makes the companions act the
-  instant their gauge fills, as the first v9 build did). Without it the canon pair finished most of md1stin's fights
-  before a player's turn came (a solo player acted in 41-88% of them, two players in 11-41%); with it a solo player acts
-  in every one and a companion never takes a turn in a fight in which a player got none (the real-data gate
-  `with_pacing_every_player_acts_in_every_fight_of_the_first_field`). The `companion acted` line ends with `held_ms=`,
-  how long it waited. Pacing only decides WHEN the server submits a companion's command, so clients need no change.
+  the party leader's level (`--battle-level` pins everybody's), is never paid and never saved, can be commanded by its
+  commander alone (nobody, with the switch off: `NotYourActor`), and does not keep a battle alive: a battle with no connected
+  player left is dropped.
+* **Each acts on its own clock, and a player always gets a first turn (companions the server commands).** A companion acts when its OWN gauge is full
+  (`fmv_server::companion::may_act`), like every fighter of the battle, and is held in only two ways. It never delivers
+  the blow that ENDS the battle while a living, connected player has not had a first turn (the engine is asked on a
+  copy): a player who is choosing holds that blow for at most `--companion-turn-wait-ms` (default 5000) after its own
+  gauge filled, and no companion holds a full gauge for any reason longer than `--companion-max-wait-ms` (default
+  10000; 0 makes the companions act the instant their gauge fills, as the first v9 build did). And it does not start
+  while another party member's command is on the stage, for a gap of battle time (a second at the default pace, scaled
+  with the Battle Speed like the game's own animation pause, whatever the tick rate), the companion whose gauge has
+  been full the longest going first, so the blows are spaced and not released together. (The first pacing held EVERY
+  companion until the players had given as many commands as it had, which released both at the moment of a player's
+  command: one attack of the player's could be followed in the same instant by the whole party's and end any fight.)
+  Without any pacing the canon pair ends most of md1stin's fights before a player's turn comes (a solo player acts in
+  44-87% of them, two players in 13-47%); with it a solo player acts in every fight of every formation of the first
+  reactor and no companion's command ends a fight in which a living player has had no turn (the real-data gate
+  `with_pacing_every_player_acts_in_every_fight_of_the_first_field`, 200 seeds a formation, a bot and a person with a
+  second and a half to choose). The `companion acted` line ends with `held_ms=`, how long it waited. Pacing only decides WHEN
+  the server submits a companion's command, so clients need no change.
 * **Players are paid, companions are not.** Experience and gil are shared among the living PLAYERS only
   (`fmv_protocol::reward_roster`, used by the server and by every replaying client), AP goes to each player, and only
   a player's progress, inventory and limit gauge are saved.
@@ -1428,6 +1514,17 @@ ranks the floor for them. The pictures contain game art: they stay out of the re
 * **After a scene that changes the story the area's NPC list is not re-sent** unless the player changes instance, so a trigger
   that should be gone can still be drawn; the server refuses the press.
 * Scenes are Rust data (one today), not files.
+**Protocol v17 (the commander of the canon pair)** adds one optional field to the battle roster, `BattleMember::commander`
+(an account, for a canon companion only; absent from the JSON when the server commands the companion, so that a roster
+without it is byte for byte what v16 sent and reads as "the server's"), and changes who may send a `BattleCommand`:
+`ClientMsg::BattleCommand { battle_id, actor, command }` already named the actor and is unchanged, and the server now also
+accepts one for a companion from the account its roster entry names (`BattleMember::is_commanded_by` is the rule both sides
+use), refusing anything else with `NotYourActor` as before. What the server DOES differs too: with
+`--companions-player-commanded` (on by default) it gives the commander's companions no command of its own, so a v16 client
+would leave them waiting for a command it never sends: the version has to move with it and a v16 peer be refused at the
+handshake (a v17 client on a server that names no commander commands only its own character, as ever). No message, event or
+stored record changed, and the replay does not depend on the commander (the engine never reads it). **Rolling back:** point
+the server and the clients back at a v16 build together; nothing it stores is new.
 
 ## Importing your own FF7 data
 
@@ -1553,10 +1650,10 @@ for a link whose sound has no time to give it), `audio: field loop start ch3 38`
 was left)` (or `(the story moved)`, `(a battle)`), `audio: field sound ch1 62 (link)` (or `(lift)`, `(door)`) at the moment an
 event's sound plays, and, when the run ends, `audio: field sounds played: 4 sounds (21x1 42x1 62x2), 4 loops (38x4)`.
 
-## Mods (Echo-S and Cosmo Memory)
+## Mods (Echo-S, Cosmo Memory and Ninostyle)
 
-Two free community mods (Tsunamods, for 7th Heaven) can be layered over your own FF7. **The accurate base game comes first and
-the mods are layers on top of it, each switched off on its own; all four layers are ON by default when their files are
+Community mods for 7th Heaven can be layered over your own FF7. **The accurate base game comes first and
+the mods are layers on top of it, each switched off on its own; all layers are ON by default when their files are
 found.** Whatever a layer lacks, the original plays, so nothing is silent or blank because a layer is on.
 
 | Layer | What it is | It replaces | Switch |
@@ -1565,17 +1662,26 @@ found.** Whatever a layer lacks, the original plays, so nothing is silent or bla
 | **voice** | Echo-S's voice acting, played when a dialog window opens | nothing: the original has no voices | `--mods-voice off` |
 | **music** | Echo-S's "Echoes of the Planet" | the original track of the same `music.idx` name | `--mods-music off` |
 | **sound** | [Cosmo Memory](https://www.tsunamods.com/cosmo-memory/) 1.22's sound effects (Echo-S's own set after it) | the original `audio.dat` clip of the same sound id | `--mods-sound off` |
+| **models** | Ninostyle Chibi field models and Ninostyle battle models | character models, with original files as fallback | `--mods-models off` |
+
+The creator previews the selected body beside the form when the window has enough space; smaller windows retain the body picker.
+The model layer uses the Chibi base, L@zar0 and Efryt field folders and the default battle models. Equipment-dependent dynamic
+field weapons are not supported. The settings file accepts `"models": false`, and `FMV_MODS_MODELS=off` is also supported.
 
 Cosmo Memory is a *sound* overhaul (its own `mod.xml`: "Complete sound overhaul"), not upscaled field backgrounds; there is no
 background layer.
 
 **The files** are yours to fetch, onto each machine separately; the client only ever reads them (nothing is extracted, copied,
-written or sent, and they are never committed or put in a library). The two in use are
+written or sent, and they are never committed or put in a library). The audio and text archives in use are
 
 | File | Mod | Bytes | sha256 |
 |---|---|---|---|
 | `Echo-s.iro` | `[Tsunamods] Echo-S 7` 1.24 (2026-07-19), from the 7th Heaven catalog's link `https://gp-mc.net/tsunamods/echo-s-7/latest_full/Echo-s.iro` | 4 335 170 582 (4.04 GiB) | `bc5a4a5f30b50ac80a74613595c680b356eae6ef433b7c6f62672ddb645b3789` |
 | `[Tsunamods]_Cosmo_Memory.iro` | `[Tsunamods] Cosmo Memory` 1.22 (2026-11-07), `https://bonez.7thheaven.rocks/%5BTsunamods%5D_Cosmo_Memory.iro` | 333 643 683 (318.2 MiB) | `836024222598c4ff745a766fb471b4fd2bf254f1a44244fb6f935703b0535af2` |
+
+The model layer also reads `Ninostyle Chibi.iro` (1,777,952,217 bytes, SHA-256 `4b70c4935e9ba7c1d6776fd4c65a6c0e99a85cf8b898712020dbb09c0b0d308f`)
+and `Ninostyle Battle.iro` (476,307,513 bytes, SHA-256 `a071eea19457f8683d364843986a22052d9d50db1c997622174cf1a7318628d5`),
+obtained from the 7th Heaven catalog's field and battle packages. Both stay in your own mods folder.
 
 **Where they go.** Put them in `<state>/mods/` (`~/.local/share/ff-multiverse/mods/` by default, or `mods` inside the directory
 `--ff7-library` names; the launcher's data directory has one): the files themselves or a folder each, one level down. The client looks

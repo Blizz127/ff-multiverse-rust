@@ -636,6 +636,11 @@ impl Gpu {
         self.ui.draw(&self.device, &self.queue, target, vertices);
     }
 
+    pub fn draw_creator_preview(&mut self, target: &wgpu::TextureView, size: (u32, u32), frame: &crate::avatar::AvatarFrame) {
+        let offset = size.0 as f32 * 0.5 - crate::ui::preview::margin(size) * 0.5;
+        self.avatars.draw_models(target, size, &Camera::pixels(offset, 0.0), frame, false);
+    }
+
     /// Make sure `backdrop` is the picture on the GPU (uploading it if it is a different one).
     /// Returns false if it cannot be used (larger than the device's texture limit): the scene is
     /// then drawn without it.
@@ -1013,6 +1018,17 @@ impl Renderer {
         avatars: Option<&crate::avatar::AvatarFrame>,
         overlay: Option<&crate::ui::draw::DrawList>,
     ) -> FrameResult {
+        self.render_layers_with_preview(scene, avatars, overlay, None)
+    }
+
+    /// Render a character preview after the menu overlay, using pixel-space projection.
+    pub fn render_layers_with_preview(
+        &mut self,
+        scene: &Scene<'_>,
+        avatars: Option<&crate::avatar::AvatarFrame>,
+        overlay: Option<&crate::ui::draw::DrawList>,
+        preview: Option<&crate::avatar::AvatarFrame>,
+    ) -> FrameResult {
         let (w, h) = self.size;
         if w == 0 || h == 0 {
             return FrameResult::Skipped;
@@ -1049,6 +1065,9 @@ impl Renderer {
         self.gpu.draw_field(&view, (w, h), scene, avatars, self.srgb);
         if let Some(overlay) = overlay {
             self.gpu.draw_overlay(&view, &overlay.vertices(w, h, self.srgb));
+        }
+        if let Some(preview) = preview {
+            self.gpu.draw_creator_preview(&view, (w, h), preview);
         }
         self.window.pre_present_notify();
         self.gpu.queue.present(frame);
