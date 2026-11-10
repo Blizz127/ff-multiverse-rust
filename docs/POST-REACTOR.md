@@ -122,8 +122,9 @@ spot, rendering, skipped sounds and background effects, and the preceding route 
 registering them; its pictures remain outside the repository. A first train floor-plan run drew
 46 actor walks and no witness, so it does not establish a safe witness position.
 An isolated offscreen exploration later exercised one candidate each in the train and station,
-and the existing post-escape witness spot. All three scene drivers ended in that harness; this
-was a rendering exploration, not a route or all-frame clearance test. The train candidates
+and the existing post-escape witness spot. All three scene drivers became inactive in that
+harness, but it did not assert the outcome, so this is not evidence of successful completion.
+This was a rendering exploration, not a route or all-frame clearance test. The train candidates
 `(169, 571, triangle 69)` and `(-172, 548, triangle 71)` were partly hidden in sampled frames;
 an oversized foreground actor seen in both is part of the scene, not the witness. The original
 post-escape witness was partly hidden behind scenery, and candidate `(-332, 150, triangle 16)`
