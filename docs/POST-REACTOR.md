@@ -147,6 +147,10 @@ an explicit moment-64 write at its moment-63 branch. Both runs used uncarried fl
 results do not establish behavior for every player; they do establish that substituting the
 replacement without reconciling effects would be unsafe. The comparison example requires the
 owner's local archives and does not enable the scene.
+In the original `mds7` script, bit 7 is also read by the `obasan` talk script to select a
+dialogue branch; it is not merely a value that can be discarded without investigating later
+behavior. The inspected Echo-S field has no direct left-operand bit-7 comparison or `BITON`
+for this byte, which does not establish what other rewritten logic or fields require.
 
 Further static inspection of `mds7pb_1` connects the early bar sequence: director entity 7
 requests Cloud slot 5 and Marlene slot 4 before starting Tifa slot 4. Tifa slot 4 requests
