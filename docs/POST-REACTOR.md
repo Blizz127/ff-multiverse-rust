@@ -104,6 +104,10 @@ one-shot line, not a plain gateway. The authored scripts contain a write to mome
 proof those slots are reached, that their skipped side effects are safe, or that the route
 can be played. In particular, `tin_1`'s director starts Barret's slot 3 at moment 48, and
 its concurrent actor requests must run before concluding the scene.
+In `mds7`, the early director checks and sets `Var[3][209]` bit 0; the script-driven
+entrance to the bar requests Cloud's slot 11, which sets bit 1 before jumping to `mds7pb_1`.
+Neither bit is carried by the current story model. These are static findings, not evidence that
+either sequence can be skipped or that a moment alone reconstructs the player's flags.
 
 Further static inspection of `mds7pb_1` connects the early bar sequence: director entity 7
 requests Cloud slot 5 and Marlene slot 4 before starting Tifa slot 4. Tifa slot 4 requests
