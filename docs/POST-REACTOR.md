@@ -28,6 +28,12 @@ but Echo-S has more windows and different choice line numbers. These observation
 choice meaning, voice playback, safe persistence, or multiplayer synchronization.
 The sampled Echo-S section's `GOLDd` instruction also has the literal amount 1; the scene VM
 does not execute that debit.
+An offscreen short-path exploration tested several possible witness spots. Some were hidden by
+background or scene actors despite large walkmesh separation. At `(-4055, 21419, triangle 6)`
+the witness was visible in the inspected samples, and 100 sampled positions kept it at least
+212.4 units from visible cast actors (ring threshold 44). The run ended unskipped, but other
+choice paths, every rendered frame, full screen occlusion and other models remain unchecked;
+the spot is not accepted for live use.
 The `md8_1` director also runs `PRTYM` for character 1 (Barret) and `HMPMAX3`; the current
 story party table otherwise continues to offer Cloud and Barret at later moments. Those
 operations and the correct later party must be modeled before this scene advances real progress.
