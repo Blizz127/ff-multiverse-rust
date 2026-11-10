@@ -166,11 +166,29 @@ fn the_station_scene_takes_barret_out_of_the_party_and_the_storys_party_table_ag
 #[test]
 #[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
 fn the_post_escape_scene_changes_nothing_that_is_saved() {
+    use fmv_ff7::script::scene::AnimHow;
     let f = field("md8_4").expect("FMV_FF7_DATA and md8_4");
     let def = fmv_ff7::script::scene::post_escape_scene();
     let outcome = run_to_end(&f, &def, &StoryState::at(33), 1, &[]).unwrap();
     assert!(outcome.party.is_empty() && outcome.writes.is_story_neutral(), "{:?} {:?}", outcome.party, outcome.writes);
     assert!(outcome.unknown_persistent_reads.is_empty() && !outcome.writes.untracked.keys().any(|(bank, _)| (1..=4).contains(bank)));
+    let script = FieldScript::from_field(&f).unwrap();
+    let barret = script.entity_inits(None).into_iter().find(|init| init.entity == 2).unwrap();
+    assert_eq!((barret.name.as_str(), barret.model_index), ("balette", Some(1)));
+    let loader = f.model_loader().unwrap();
+    assert_eq!(loader.models[1].hrc_stem(), "acgd");
+    assert_eq!(loader.models[1].animations[3].stem(), "apfc");
+    let mut play = ScenePlay::new(&f, &def, &StoryState::at(33), 1).unwrap();
+    assert_eq!(play.animation_clip(2, 3), Some("apfc"));
+    assert!(play.next(None).stage.iter().any(|event| matches!(event.what, Stage::Anim {
+        entity: 2, animation: 3, how: AnimHow::Hold, first: Some(0), last: Some(0), speed: 16, divisor: 1,
+    })), "Barret's main script requests a single held frame before the first window");
+    let mut characters = LgpArchive::open_path(data_dir().unwrap().join("field/char.lgp")).unwrap();
+    let clip = fmv_ff7::load_field_animation(&mut characters, "apfc").unwrap();
+    let model = fmv_ff7::load_field_model(&mut characters, "acgd").unwrap();
+    assert_eq!((clip.frame_count(), clip.bone_count()), (10, 21));
+    assert!(model.fits(&clip), "the owned Hold clip fits Barret's retained skeleton");
+    assert!(clip.frame(0).is_some() && model.pose(&clip, 0).is_some(), "the authored frame is in bounds and can be posed");
     // at any other moment the director does nothing at all: no window, no jump
     for moment in [1u16, 27, 32, 34, 36] {
         let idle = run_to_end(&f, &def, &StoryState::at(moment), 1, &[]).unwrap();

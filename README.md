@@ -1417,8 +1417,8 @@ again at the next login (`fmv_ff7::script::scene::STORY_ENTRIES`, `SceneHost::en
 player joins like everyone and is sent on through the ordinary area handshake. Without it an account at 36 could never
 reach the story again (`md8_1` has no way back and only the scene jumps there).
 
-**Not done here:** the opening movie of the street scene is skipped, scripted one-shot animation clips are not played (the cast
-walks and stands), and past the street nothing of the story is offered yet (`md8_2` onwards are plain fields).
+**Not done here:** the opening movie of the street scene is skipped, scripted one-shot animation clips are not played,
+and past the street nothing of the story is offered yet (`md8_2` onwards are plain fields).
 
 ```
 scripts/story-smoke.sh --debug --build                    # one real headless player: both scenes, 33 -> 36 saved once, restart, re-login on the street
@@ -1600,8 +1600,11 @@ Field-model cast members can also use their script's full-length default loops (
 including Wedge's loop after the `nrthmk` approach. The clip slot must belong to that entity's exact model-loader skeleton;
 canonical appearance substitutions keep their existing clips. A separate bounded clip cache preserves the base mesh and
 checks skeleton compatibility, falling back to the usual pose if the clip cannot load. Standing loops yield during movement,
-restart after arrival, and freeze with dialogue. Once/Hold, cropped ranges, other rates and later ASPED changes clear the
-override until a supported DFANM arrives. No game bytes, protocol or saved state are added. The normal-rate interpretation
+restart after arrival, and freeze with dialogue. A normal-speed Hold with equal explicit first/last frames also plays: Barret's
+`md8_4` post-escape pose holds frame 0 of `apfc`. The requested frame must exist in the loaded clip; an invalid frame falls back
+without wrapping. A held pose remains fixed until another animation, speed change or movement replaces it. Once, multi-frame
+Hold, cropped loops, other rates and later ASPED changes clear the override until a supported animation arrives.
+No game bytes, protocol or saved state are added. The normal-rate interpretation
 follows the [Q-Gears DFANM reconstruction](https://github.com/Akari1982/q-gears_reverse/blob/e0fabf7e121818e5abe2f873e34a07d0eb32742d/ffvii/DISC/FIELD/FIELD.BIN_event_code_entity.cpp#L72-L95);
 exact PC visual timing and real mod overlays remain untested.
 A watcher opens window 0 itself and every later one only when the owner's `SceneStep` for the one before arrives, so the two screens

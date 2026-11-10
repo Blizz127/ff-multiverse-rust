@@ -28,9 +28,10 @@
 //!
 //! # Honest limits
 //!
-//! * Matching field-model cast can play normal-speed full-range default loops on scene time. Canonical appearance
+//! * Matching field-model cast can play normal-speed full-range default loops and exact single-frame Holds. Canonical appearance
 //!   substitutions and unsupported animation forms keep their usual clips; skipped events are counted ([`stage::Counts`]).
-//!   A standing loop yields to movement; one-shot poses, cropped ranges and dynamic rates remain unsupported.
+//!   A standing loop yields to movement; moving replaces a held pose. Multi-frame one-shot/Hold poses, cropped loops and
+//!   dynamic rates remain unsupported.
 //! * The scene's camera moves are recorded ([`stage::CameraState`]), not shown: the field's camera stays where it is.
 //! * A window pauses the whole stage (as the interpreter pauses the whole scene); the game pauses only the script that
 //!   opened it.

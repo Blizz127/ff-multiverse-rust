@@ -25,6 +25,23 @@ use std::collections::HashMap;
 /// The field module's frame rate, which is the rate the clips were authored at.
 pub const FIELD_FPS: f32 = fmv_ff7::FF7_FIELD_FRAMES_PER_SECOND;
 
+/// A scene-controlled frame. Loops wrap; held poses must name a real frame of the loaded clip.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ClipFrame {
+    Loop(f32),
+    Hold(u8),
+}
+
+impl ClipFrame {
+    pub fn in_clip(self, frames: usize) -> Option<f32> {
+        if frames == 0 { return None; }
+        match self {
+            Self::Loop(frame) => Some(if frame.is_finite() { frame.max(0.0).rem_euclid(frames as f32) } else { 0.0 }),
+            Self::Hold(frame) => (usize::from(frame) < frames).then_some(f32::from(frame)),
+        }
+    }
+}
+
 /// Entities remembered (a frame's drawable players are bounded far below this; the cap only keeps
 /// a hostile stream of entity ids from growing the table).
 const MAX_TRACKED: usize = 1024;

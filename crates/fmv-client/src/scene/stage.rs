@@ -10,7 +10,8 @@
 //!   toward the target the whole way). A second move of the same actor first finishes the first.
 //! * `Face` turns it (the short way round), at once or over the frames it says.
 //! * `Show` hides or shows it.
-//! * The player resolves supported `Anim` loops against the actor's exact field model; their clips follow scene time.
+//! * The player resolves supported `Anim` loops and single-frame Holds against the actor's exact field model.
+//!   Loops follow scene time; held frames stay fixed until replaced.
 //!   Other animations clear that loop and are counted ([`Counts::anims_skipped`]), never guessed at.
 //! * `Sound` is routed separately by the scene player to its cancellable audio channel.
 //! * `Camera` is **recorded** ([`CameraState`]) and not shown: the field's own camera stays where it is.
@@ -19,6 +20,7 @@
 //! window pauses the whole stage, as it pauses the interpreter.
 
 use fmv_ff7::script::scene::{CameraOp, MoveHow, Stage};
+use crate::avatar::anim::ClipFrame;
 use std::collections::BTreeMap;
 use std::f32::consts::{PI, TAU};
 
@@ -63,9 +65,9 @@ struct Turn {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct LoopAnimation {
+struct SceneAnimation {
     clip: String,
-    frame: f32,
+    frame: ClipFrame,
 }
 
 /// How far through a motion of `frames` frames it is after `elapsed` of them (0 to 1; no frames is done).
@@ -109,7 +111,7 @@ pub struct Actor {
     turn: Option<Turn>,
     /// Scene frames actually spent walking, retained across consecutive movement segments.
     walked_frames: f32,
-    animation: Option<LoopAnimation>,
+    animation: Option<SceneAnimation>,
 }
 
 impl Actor {
@@ -145,7 +147,7 @@ impl Actor {
 
     pub fn walked_frames(&self) -> f32 { self.walked_frames }
 
-    pub fn animation(&self) -> Option<(&str, f32)> {
+    pub fn animation(&self) -> Option<(&str, ClipFrame)> {
         if self.walk.is_some() { return None; }
         self.animation.as_ref().map(|a| (a.clip.as_str(), a.frame))
     }
@@ -165,7 +167,9 @@ impl Actor {
         self.advance_walk(frames);
         self.advance_turn(frames);
         if frames.is_finite() {
-            if let Some(animation) = &mut self.animation { animation.frame += (frames - moving_frames).max(0.0); }
+            if let Some(SceneAnimation { frame: ClipFrame::Loop(frame), .. }) = &mut self.animation {
+                *frame += (frames - moving_frames).max(0.0);
+            }
         }
     }
 
@@ -271,7 +275,13 @@ impl Cast {
     pub fn apply_loop(&mut self, entity: u8, clip: &str, overshoot: f32) {
         let Some(actor) = self.actors.get_mut(&entity) else { return self.off_cast() };
         let frame = if overshoot.is_finite() { overshoot.max(0.0) } else { 0.0 };
-        actor.animation = Some(LoopAnimation { clip: clip.to_string(), frame });
+        actor.animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::Loop(frame) });
+    }
+
+    /// Hold one exact authored frame. The avatar pipeline validates its bounds in the loaded clip.
+    pub fn apply_hold(&mut self, entity: u8, clip: &str, frame: u8) {
+        let Some(actor) = self.actors.get_mut(&entity) else { return self.off_cast() };
+        actor.animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::Hold(frame) });
     }
 
     /// Show one event of the interpreter. `overshoot` is how many frames ago it should have happened (the clock ran past
@@ -300,7 +310,10 @@ impl Cast {
                 let Some(actor) = self.actors.get_mut(entity) else { return self.off_cast() };
                 // DFANM is a standing default, not the actor's walk/jump/ladder animation.
                 // Restart it when movement ends; any unused part of a tick advances the idle.
-                if let Some(animation) = &mut actor.animation { animation.frame = 0.0; }
+                match &mut actor.animation {
+                    Some(SceneAnimation { frame: ClipFrame::Loop(frame), .. }) => *frame = 0.0,
+                    _ => actor.animation = None, // A new movement replaces a one-frame held pose.
+                }
                 // A second move of the same actor starts where the first one was going.
                 if let Some(walk) = actor.walk.take() {
                     actor.pos = Some(walk.to);
@@ -389,13 +402,13 @@ mod tests {
             cast.apply(&place(1, 0, 0), 0.0, &flat);
             cast.apply_loop(1, "idle", 0.0);
             cast.advance(7.0);
-            assert_eq!(cast.actor(1).unwrap().animation(), Some(("idle", 7.0)));
+            assert_eq!(cast.actor(1).unwrap().animation(), Some(("idle", ClipFrame::Loop(7.0))));
             cast.apply(&Stage::Move { entity: 1, from: None, x: 100, y: 0, z: None, triangle: None, frames: 10, how }, 0.0, &flat);
             assert_eq!(cast.actor(1).unwrap().animation(), None);
             cast.advance(4.0);
             assert_eq!(cast.actor(1).unwrap().animation(), None, "standing default must not replace a moving pose");
             cast.advance(9.0);
-            assert_eq!(cast.actor(1).unwrap().animation(), Some(("idle", 3.0)), "only time after arrival advances the restarted idle");
+            assert_eq!(cast.actor(1).unwrap().animation(), Some(("idle", ClipFrame::Loop(3.0))), "only time after arrival advances the restarted idle");
             assert_eq!(cast.actor(1).unwrap().pos(), Some([100.0, 0.0, 7.0]));
         }
     }

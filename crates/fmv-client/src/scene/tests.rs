@@ -599,7 +599,10 @@ fn authored_loops_start_at_events_pause_and_restart_without_changing_the_base_mo
             let actor = actors.iter().find(|p| p.who == cast_who(20)).unwrap();
             let npc = actor.npc.unwrap();
             assert_eq!((npc.model, npc.idle), ("model", Some("base")), "the base mesh/cache key stays the same");
-            actor.scene_clip.map(|(clip, frame)| (clip.to_string(), frame))
+            actor.scene_clip.map(|(clip, frame)| {
+                let crate::avatar::anim::ClipFrame::Loop(frame) = frame else { panic!("expected loop") };
+                (clip.to_string(), frame)
+            })
         };
         let pass = |p: &mut ScenePlayer, step| {
             if role == SceneRole::Owner { p.key(SceneKey::Confirm); } else { p.on_step(step, None); }
@@ -623,6 +626,74 @@ fn authored_loops_start_at_events_pause_and_restart_without_changing_the_base_mo
             assert_eq!(drawn(&player), None, "unsupported/unresolved event {index} clears the previous loop");
         }
         assert_eq!(player.counts().anims_skipped, unsupported.len() as u32);
+    }
+}
+
+#[test]
+fn single_frame_holds_stay_fixed_until_replaced_for_owner_and_watcher() {
+    use crate::avatar::anim::ClipFrame;
+    use fmv_ff7::script::scene::AnimHow;
+    struct Holds(Scripted);
+    impl SceneSource for Holds {
+        fn initial(&self) -> Vec<Stage> { self.0.initial() }
+        fn next(&mut self, answer: Option<usize>) -> Beat { self.0.next(answer) }
+        fn height_at(&self, x: i16, y: i16, triangle: Option<u16>) -> Option<f32> { self.0.height_at(x, y, triangle) }
+        fn animation_clip(&self, entity: u8, slot: u8) -> Option<&str> {
+            (entity == 20 && slot == 3).then_some("pose")
+        }
+    }
+    let hold = |frame| Stage::Anim { entity: 20, animation: 3, how: AnimHow::Hold, first: Some(frame), last: Some(frame), speed: 16, divisor: 1 };
+    let replace = [
+        Stage::Anim { entity: 20, animation: 3, how: AnimHow::Hold, first: Some(0), last: Some(1), speed: 16, divisor: 1 },
+        Stage::Anim { entity: 20, animation: 3, how: AnimHow::Once, first: Some(0), last: Some(0), speed: 16, divisor: 1 },
+        Stage::AnimSpeed { entity: 20, speed: 32 },
+        Stage::Anim { entity: 20, animation: 99, how: AnimHow::Hold, first: Some(0), last: Some(0), speed: 16, divisor: 1 },
+    ];
+    for role in [SceneRole::Owner, SceneRole::Watcher] {
+        let mut beats = vec![
+            Beat { stage: vec![timed(10, hold(1))], then: say(20, 20, 20, 1).then },
+            Beat { stage: vec![timed(1, Stage::Move { entity: 20, from: None, x: 90, y: 10, z: None, triangle: None, frames: 3, how: MoveHow::Walk })], then: say(6, 20, 20, 2).then },
+            Beat { stage: vec![
+                timed(0, Stage::Anim { entity: 20, animation: 3, how: AnimHow::Loop, first: None, last: None, speed: 16, divisor: 1 }),
+                timed(3, hold(0)),
+            ], then: say(8, 20, 20, 3).then },
+        ];
+        beats.extend(replace.iter().cloned().map(|event| Beat { stage: vec![timed(0, hold(1)), timed(2, event)], then: say(4, 20, 20, 4).then }));
+        let mut definition = def();
+        definition.cast[1].look = Look::Model { hrc: "model".into(), idle: "base".into() };
+        let mut player = ScenePlayer::new(Run { id: RUN, participants: vec![], role }, definition,
+            Box::new(Holds(Scripted { initial: places(), beats: beats.into(), asked: Asked::default() })), false);
+        let frame = |p: &ScenePlayer| {
+            let actors = cast_players(p);
+            let actor = actors.iter().find(|a| a.who == cast_who(20)).unwrap();
+            let npc = actor.npc.unwrap();
+            assert_eq!((npc.model, npc.idle), ("model", Some("base")));
+            actor.scene_clip.map(|(stem, frame)| { assert_eq!(stem, "pose"); frame })
+        };
+        let pass = |p: &mut ScenePlayer, step| {
+            if role == SceneRole::Owner { p.key(SceneKey::Confirm); } else { p.on_step(step, None); }
+        };
+        player.advance(0.5);
+        assert_eq!(frame(&player), Some(ClipFrame::Hold(1)), "event overshoot must not advance a held frame");
+        player.advance(1.0);
+        player.advance(10.0);
+        assert_eq!(frame(&player), Some(ClipFrame::Hold(1)), "the same held pose through an open window");
+        pass(&mut player, 0);
+        player.advance(2.0 / 30.0);
+        assert_eq!(frame(&player), None, "movement replaces the held pose");
+        player.advance(1.0);
+        assert_eq!(frame(&player), None, "the stale hold does not resume after movement");
+        pass(&mut player, 1);
+        player.advance(2.0 / 30.0);
+        assert_eq!(frame(&player), Some(ClipFrame::Loop(2.0)));
+        player.advance(1.0);
+        assert_eq!(frame(&player), Some(ClipFrame::Hold(0)), "a hold replaces an advancing loop");
+        for index in 0..replace.len() {
+            pass(&mut player, 2 + index as u32);
+            assert_eq!(frame(&player), Some(ClipFrame::Hold(1)));
+            player.advance(1.0);
+            assert_eq!(frame(&player), None, "unsupported/unresolved replacement {index} clears the hold");
+        }
     }
 }
 

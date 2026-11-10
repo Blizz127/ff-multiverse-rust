@@ -37,6 +37,7 @@
 use super::panel::{Outcome, Panel, PanelKey, SpeakerSpot};
 use super::source::SceneSource;
 use super::stage::Cast;
+use crate::avatar::anim::ClipFrame;
 use crate::ui::dialogue::{dialogue_key, DialogueKey};
 use crate::mods::{Global, ModSink, VoiceCue};
 use fmv_core::{EntityId, Pos};
@@ -157,8 +158,8 @@ pub struct CastDraw<'a> {
     pub moving: bool,
     /// Default clip frame from scene time, frozen while a window holds the scene.
     pub frame: f32,
-    /// Resolved authored loop and its frame; independent of the default clip's fallback clock.
-    pub clip: Option<(&'a str, f32)>,
+    /// Resolved authored loop or held frame, independent of the default clip's fallback clock.
+    pub clip: Option<(&'a str, ClipFrame)>,
 }
 
 /// What comes after the stage events that are due.
@@ -467,12 +468,20 @@ impl ScenePlayer {
     }
 
     fn apply_stage(cast: &mut Cast, source: &dyn SceneSource, event: &Stage, late: f32) {
-        // The first supported form has no duration/range assumptions: the script's normal-speed
-        // default loop, on its own exact field model. Every other Anim clears an old override.
+        // Supported forms have no guessed duration: a full default loop or one exact held frame,
+        // on the script's own field model. Every other Anim clears an old override.
         if let Stage::Anim { entity, animation, how: AnimHow::Loop, first: None, last: None, speed: 16, divisor: 1 } = event {
             if let Some(clip) = source.animation_clip(*entity, *animation) {
                 cast.apply_loop(*entity, clip, late);
                 return;
+            }
+        }
+        if let Stage::Anim { entity, animation, how: AnimHow::Hold, first: Some(first), last: Some(last), speed: 16, divisor: 1 } = event {
+            if first == last {
+                if let Some(clip) = source.animation_clip(*entity, *animation) {
+                    cast.apply_hold(*entity, clip, *first);
+                    return;
+                }
             }
         }
         cast.apply(event, late, &|x, y, triangle| source.height_at(x, y, triangle));

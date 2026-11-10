@@ -18,7 +18,7 @@
 //! [`Stage::model_scale`] walkmesh units); the camera is the field camera the picture and the
 //! walkmesh are projected with.
 
-use super::anim::{Animator, Who};
+use super::anim::{Animator, ClipFrame, Who};
 use super::gpu::Tint;
 use super::ground::{self, GroundShape, GroundVertex};
 use super::identity::Identity;
@@ -96,7 +96,7 @@ pub struct AvatarPlayer<'a> {
     /// Explicit clip frame from a scene's paused clock. Ordinary players/NPCs use render time.
     pub scene_frame: Option<f32>,
     /// Optional authored scene clip and frame; the retained character model is never replaced.
-    pub scene_clip: Option<(&'a str, f32)>,
+    pub scene_clip: Option<(&'a str, ClipFrame)>,
     /// The look the avatar names (untrusted text; only looked up in the table).
     pub appearance: Option<&'a str>,
     /// `Some` for a non-player character of the area instead of a player: the model its data
@@ -333,7 +333,11 @@ impl Avatars {
                 markers.push(i);
                 continue;
             };
-            let scene_clip = p.scene_clip.and_then(|(stem, frame)| self.library.get_scene_animation(&asset, stem).map(|clip| (clip, frame)));
+            let scene_clip = p.scene_clip.and_then(|(stem, frame)| {
+                let clip = self.library.get_scene_animation(&asset, stem)?;
+                // A held frame outside this actual clip falls back, never wraps to another pose.
+                frame.in_clip(clip.frame_count()).map(|frame| (clip, frame))
+            });
             let clip = scene_clip.as_ref().map_or_else(|| asset.character.animation(p.anim), |(clip, _)| clip.as_ref());
             let scene_frame = scene_clip.as_ref().map(|(_, frame)| *frame).or(p.scene_frame);
             let frame = if let Some(frame) = scene_frame {
@@ -737,14 +741,24 @@ pub(crate) mod tests {
             assert_ne!(avatars.frame(&view, &stage, &[actor], 0.1).frame.models[0].positions, first, "ordinary player/NPC animation still uses render time");
             actor.scene_frame = Some(0.0);
             let base = avatars.frame(&view, &stage, &[actor], 0.0).frame.models.remove(0);
-            actor.scene_clip = Some(("scene_loop", 1.0));
+            actor.scene_clip = Some(("scene_loop", ClipFrame::Loop(1.0)));
             let playing = avatars.frame(&view, &stage, &[actor], 1.0).frame.models.remove(0);
             assert_ne!(playing.positions, base.positions, "the authored override selects its pose");
             assert!(std::sync::Arc::ptr_eq(&base.asset, &playing.asset), "same mesh and asset identity");
             assert_eq!(avatars.frame(&view, &stage, &[actor], 2.0).frame.models[0].positions, playing.positions, "render time never ticks the override");
-            actor.scene_clip = Some(("scene_loop", 3.0));
+            actor.scene_clip = Some(("scene_loop", ClipFrame::Loop(3.0)));
             assert_eq!(avatars.frame(&view, &stage, &[actor], 0.0).frame.models[0].positions, playing.positions, "loop wraps by the actual clip length");
-            actor.scene_clip = Some(("missing", 1.0));
+            actor.scene_clip = Some(("scene_loop", ClipFrame::Hold(1)));
+            for dt in [0.0, 0.1, 20.0] {
+                let held = avatars.frame(&view, &stage, &[actor], dt).frame.models.remove(0);
+                assert_eq!(held.positions, playing.positions, "held frame selects the exact pose independently of render time");
+                assert!(std::sync::Arc::ptr_eq(&base.asset, &held.asset));
+            }
+            for invalid in [2, 255] {
+                actor.scene_clip = Some(("scene_loop", ClipFrame::Hold(invalid)));
+                assert_eq!(avatars.frame(&view, &stage, &[actor], 0.0).frame.models[0].positions, base.positions, "invalid held frame falls back instead of wrapping");
+            }
+            actor.scene_clip = Some(("missing", ClipFrame::Loop(1.0)));
             let fallback = avatars.frame(&view, &stage, &[actor], 1.0).frame.models.remove(0);
             assert_eq!(fallback.positions, base.positions, "failed override keeps the normal scene pose");
             assert!(std::sync::Arc::ptr_eq(&base.asset, &fallback.asset));
