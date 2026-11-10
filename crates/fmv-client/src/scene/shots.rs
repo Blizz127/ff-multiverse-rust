@@ -796,6 +796,85 @@ fn offscreen_real_ff7_the_field_camera() {
     assert!(inside(&shown));
 }
 
+/// Every registered scene of the route over the owner's data, played through the window's own path with the field camera
+/// (`field_draw`, `camera_input`, `FieldCamera::update`) at four steps a second, each at the story it plays at: at every step
+/// the window shows the scene's lead (the canon Cloud when he is drawn, else the player) and any actor a `SCRLA` follows.
+/// The half second the camera eases in after the scene starts or its camera changes is left out, and so is a lead outside
+/// the field's camera range (FF7's screen does not show that place either). Prints each scene's count and writes one
+/// picture of its middle step (`camera-scene-<field>-<name>.png`); fails if any step has the lead out of the window.
+#[test]
+#[ignore = "needs the owner's real FF7 data (FMV_FF7_LIBRARY, FMV_FF7_DATA or FMV_FF7_FLEVEL) and a GPU or software Vulkan/GL driver"]
+fn offscreen_real_ff7_the_field_camera_keeps_each_route_scenes_lead_in_view() {
+    use crate::camera::{FieldCamera, SceneAim};
+    use crate::render::{Camera, MARGIN_PX};
+    use crate::window::camera_input;
+    let Some(real) = open() else { return };
+    let mut gpu = Offscreen::new().expect("software or physical GPU");
+    let story_for = |id: &str| -> StoryState {
+        let (moment, bit): (u16, Option<(u8, u8, u8)>) = match id {
+            "ff7/md8_4/post-escape" | "ff7/md8_1/post-escape-station" => (33, None),
+            "ff7/md1_1/team-talk" => (6, None),
+            "ff7/nmkin_1/reactor-door" => (10, None),
+            "ff7/nmkin_5/guard-scorpion" | "ff7/nmkin_5/guard-scorpion-victory" => (26, None),
+            "ff7/nmkin_3/jessie-rescue" => (27, Some((1, 225, 0))),
+            "ff7/nmkin_3/jessie-ladder" => (13, None),
+            "ff7/md1_2/run-ahead" => (7, None),
+            "ff7/nmkin_2/jessie-descent" => (12, None),
+            "ff7/nrthmk/reactor-approach" => (8, None),
+            "ff7/nrthmk/reactor-finale" => (27, Some((1, 225, 5))),
+            _ => (0, None),
+        };
+        let mut story = StoryState::at(moment);
+        if let Some((bank, address, bit)) = bit { story.set_bit(bank, address, bit, true); }
+        story
+    };
+    let mut failures = Vec::new();
+    for def in fmv_ff7::script::scene::scenes().into_iter().filter(|d| d.id != fmv_ff7::script::scene::PROOF_SCENE_ID) {
+        let id = def.id.clone();
+        let mut rig = make_rig(&real, def, true);
+        rig.story = story_for(&id);
+        let Some(range) = rig.view.range else { failures.push(format!("{id}: no camera range")); continue };
+        rig.start();
+        let mut camera = FieldCamera::default();
+        let (mut steps, mut checked, mut out, mut since_change, mut last) = (0usize, 0usize, Vec::new(), 0usize, None);
+        let mut middle: Option<usize> = None;
+        for step in 0..2400usize {
+            if !rig.state.scene.is_active() { break; }
+            let draw = rig.draw();
+            let input = camera_input(&rig.view, &rig.state, &draw, SIZE, 0.25);
+            let shown = camera.update(&input);
+            let key = input.scene.map(|s| (s.events, std::mem::discriminant(&s.aim)));
+            if key != last { since_change = 0; last = key; } else { since_change += 1; }
+            let subject = input.scene.and_then(|s| match s.aim {
+                SceneAim::Lead { lead } => lead,
+                SceneAim::Follow { at, lead } => at.or(lead),
+                SceneAim::Scroll { .. } => None,
+            });
+            if let (Some(p), true) = (subject, since_change >= 2) {
+                let in_range = p[0] >= range.min.x && p[0] <= range.max.x && p[1] >= range.min.y && p[1] <= range.max.y;
+                if in_range {
+                    checked += 1;
+                    let fit = Camera::fit(&shown, SIZE.0 as f32, SIZE.1 as f32, MARGIN_PX);
+                    let (hw, hh) = (SIZE.0 as f32 / 2.0 / fit.pixels_per_unit(), SIZE.1 as f32 / 2.0 / fit.pixels_per_unit());
+                    let (cx, cy) = ((shown.min.x + shown.max.x) / 2.0, (shown.min.y + shown.max.y) / 2.0);
+                    if (p[0] - cx).abs() > hw + 1.0 || (p[1] - cy).abs() > hh + 1.0 { out.push(step); }
+                }
+            }
+            steps += 1;
+            if middle.is_none() && step >= 8 && subject.is_some() {
+                middle = Some(step);
+                rig.view.bounds = shown;
+                let name = id.replace("ff7/", "").replace('/', "-");
+                rig.picture(&mut gpu, &format!("camera-scene-{name}"), SIZE, true);
+            }
+            if rig.state.scene.player().is_some_and(|p| p.has_window()) { rig.state.scene.key(KeyCode::Enter, true, false); } else { rig.state.scene.advance(0.25); }
+        }
+        eprintln!("{id}: {steps} steps, the lead checked at {checked}, out of the window at {} {:?}", out.len(), &out[..out.len().min(12)]);
+        if !out.is_empty() { failures.push(format!("{id}: lead out of the window at {} steps", out.len())); }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
 impl Rig {
     /// The server starts the scene for the owner and two watchers: entities 1, 2 and 3 on witness spots 0, 1 and 2.
     fn start(&mut self) {
