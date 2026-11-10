@@ -488,6 +488,8 @@ impl Overlap {
 }
 
 /// How many pixels differ between two renders.
+// (`as_chunks` would satisfy the lint but needs Rust 1.88; the workspace keeps `chunks_exact`, see `fmv_ff7::lgp`.)
+#[allow(clippy::chunks_exact_to_as_chunks)]
 fn changed(a: &[u8], b: &[u8]) -> usize {
     a.chunks_exact(4).zip(b.chunks_exact(4)).filter(|(p, q)| (0..3).map(|i| u32::from(p[i].abs_diff(q[i]))).sum::<u32>() > 30).count()
 }

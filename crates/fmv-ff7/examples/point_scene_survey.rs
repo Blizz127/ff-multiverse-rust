@@ -615,8 +615,11 @@ fn signature(r: &Run) -> String {
     )
 }
 
+/// The runs of one case, each with the answers it was given, and whether the combinations ran out before the cap.
+type Explored = (Vec<(Vec<usize>, Run)>, bool);
+
 /// Run a case for every combination of answers its asking windows allow (the first run takes the cursor's lines).
-fn explore(info: &Info, def: &SceneDef, moment: u16) -> Result<(Vec<(Vec<usize>, Run)>, bool), String> {
+fn explore(info: &Info, def: &SceneDef, moment: u16) -> Result<Explored, String> {
     let mut done: Vec<(Vec<usize>, Run)> = Vec::new();
     let mut seen = BTreeSet::new();
     let mut stack: Vec<Vec<usize>> = vec![Vec::new()];

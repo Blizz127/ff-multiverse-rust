@@ -268,6 +268,10 @@ pub fn post_escape_scene() -> SceneDef {
         setup: vec![], given: vec![],
         root: vec![Step::StartMain(1), Step::StartMain(2), Step::StartMain(4), Step::StartMain(5), Step::StartMain(6), Step::StartMain(0)],
         cast, speakers: vec![("Cloud".into(), 1), ("Barret".into(), 2), ("Biggs".into(), 4), ("Jessie".into(), 5), ("Wedge".into(), 6)],
+        // Known gap: the field's camera looks along the only open floor, so no spot of it shows a witness clear of the cast
+        // (621 places scanned by `fmv-client`'s `scene::shots::offscreen_survey_post_escape_witness`). This one keeps the
+        // walkmesh rule (71 units from the cast, 76 from the edge) and stays out of the way, behind the rock: the body is
+        // barely visible.
         witness: vec![Spot { x: -133, y: 144, triangle: 0, direction: 0 }],
         arrival: Spot { x: 82, y: 267, triangle: 3, direction: 0 },
     }
@@ -292,8 +296,12 @@ pub fn station_scene() -> SceneDef {
     }
     def.speakers = vec![("Cloud".into(), 1), ("Barret".into(), 2), ("Biggs".into(), 3), ("Jessie".into(), 4), ("Wedge".into(), 5)];
     def.arrival = Spot { x: 1629, y: -5357, triangle: 15, direction: 192 };
-    // Its witness is deliberately absent until a visible, walkable spot is verified.
-    def.witness.clear();
+    // The witness stands at the left end of the street, facing the group (which talks near (1347, -5270)): 224 walkmesh
+    // units from every place and walk of the cast, 123 from the nearest edge of the floor, and its whole body in view in
+    // every picture of the scene (the cast's Wedge runs past in front of it for 4 of 105 steps). Measured by `fmv-client`'s
+    // `scene::shots::offscreen_survey_station_witness` on the owner's field; the floor nearer the arrival is crossed by the
+    // cast's run, which is why it is this far along the street.
+    def.witness = vec![Spot { x: 1074, y: -5183, triangle: 28, direction: 52 }];
     def
 }
 

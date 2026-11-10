@@ -237,6 +237,18 @@ fn every_story_entry_stands_on_the_floor_the_fields_ways_out_are_on() {
     let street = story_entry(36).unwrap();
     assert_eq!((street.field, street.spot.x, street.spot.y, i16::try_from(street.spot.triangle).unwrap(), street.spot.direction), ("md8_1", jump.x, jump.y, jump.triangle, jump.direction));
     assert_eq!(story_entry(u16::MAX).map(|e| e.field), Some("md8_1"), "until a later row says otherwise");
+
+    // Each scene's witness stands on its own triangle, on the floor the entry is on (the player walks away from it after).
+    for def in [fmv_ff7::script::scene::post_escape_scene(), fmv_ff7::script::scene::station_scene()] {
+        let f = field(&def.field).unwrap();
+        let mesh = f.walkmesh().unwrap();
+        let parts = mesh_parts(&mesh);
+        let entry = STORY_ENTRIES.iter().find(|e| e.field == def.field).expect("an entry in the scene's field");
+        let w = def.witness.first().copied().unwrap_or_else(|| panic!("{}: a witness spot", def.id));
+        let tri = &mesh.triangles[usize::from(w.triangle)];
+        assert!(fmv_ff7::script::triangle_contains_xy(tri, i32::from(w.x), i32::from(w.y)), "{}: the witness is on triangle {}", def.id, w.triangle);
+        assert_eq!(parts[usize::from(w.triangle)], parts[usize::from(entry.spot.triangle)], "{}: the witness and the entry share the floor", def.id);
+    }
 }
 
 /// The scenes the game offers: ids are unique, a scene a talk starts has a reach and one that starts on arrival has none, and
