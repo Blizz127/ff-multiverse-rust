@@ -3,6 +3,7 @@
 //! ```text
 //! FMV_FF7_DATA=<.../data> cargo run -p fmv-ff7 --example scene_map -j8                       # the proof scene
 //! FMV_FF7_DATA=<.../data> cargo run -p fmv-ff7 --example scene_map -j8 -- ff7/mds7pb_1/tifa-bar
+//! FMV_FF7_DATA=<.../data> cargo run -p fmv-ff7 --example scene_map -j8 -- ff7/tin_1/sector-seven-train
 //! ```
 //!
 //! Writes `<scene>_map.png` to `/home/blizz/.cache/claude-tmp/ffmv-ff7-dump/` (outside the repository; it contains game art:
@@ -10,6 +11,7 @@
 //! places of the scene: every place the cast takes (a red body ring for Cloud, a green one for Tifa, a line for each walk), the
 //! witness spots (yellow for the owner, orange and magenta for the watchers), the preview arrival (cyan) and, standing on each, a stick of the
 //! height of Cloud's model, so the size of a body in the picture is plain. Nothing is printed but counts and ids.
+//! Post-escape, station and train scene definitions can be surveyed here without registering them for live play.
 #![allow(clippy::chunks_exact_to_as_chunks)]
 use fmv_ff7::background::{decode_background, BackgroundImage, Projection};
 use fmv_ff7::field::FieldFile;
@@ -73,7 +75,14 @@ fn main() {
         return;
     };
     let id = std::env::args().nth(1).unwrap_or_else(|| PROOF_SCENE_ID.to_string());
-    let Some(def) = scene(&id) else {
+    // Survey-only scene data remains absent from the live registry.
+    let def = match id.as_str() {
+        fmv_ff7::script::scene::TRAIN_SCENE_ID => Some(fmv_ff7::script::scene::train_scene()),
+        fmv_ff7::script::scene::STATION_SCENE_ID => Some(fmv_ff7::script::scene::station_scene()),
+        fmv_ff7::script::scene::POST_ESCAPE_SCENE_ID => Some(fmv_ff7::script::scene::post_escape_scene()),
+        _ => scene(&id),
+    };
+    let Some(def) = def else {
         eprintln!("no scene {id}");
         return;
     };
