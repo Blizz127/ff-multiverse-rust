@@ -1463,6 +1463,8 @@ mod tests {
             BattleMember::player(EntityId(2), AccountId(12), "B", 3, 6, 0),
         ];
         ServerMsg::EncounterStart {
+            initial_party: None,
+            escape_policy: fmv_protocol::EscapePolicy::Formation,
             battle_id: BattleId(id),
             formation_id: formation,
             seed: 1,

@@ -95,7 +95,8 @@
 //! * **Silence** stops the party's Magic command; an enemy's attack is not stopped by it.
 //! * **MBarrier** halves magical damage but not magical healing (the wiki says it halves both; items are
 //!   "magical" in the damage-calculation byte, so halving healing would halve potions too).
-//! * Sadness and Fury are not carried from one battle to the next (the game keeps them), and there are no armor
+//! * Ordinary encounters do not carry Sadness and Fury to the next battle (the game keeps them); authored
+//!   continuations can retain them through [`PERSISTENT`] and explicit starting resources. There are no armor
 //!   protections, no weapon status attacks, no Resist, no Reflect, no Death Sentence, Slow-numb, Petrify,
 //!   Confusion, Berserk, Manipulate, Frog, Small or the rest: they decode and are ignored.
 //! * A status that is not inflicted (the roll failed, the target is immune) says nothing: there is no event.
@@ -313,6 +314,12 @@ impl std::fmt::Display for Status {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct StatusSet(u32);
+
+/// Statuses saved between battles by FF7's `CommitBattleResults` (`status & 0x30`).
+/// HP separately carries knockout; every other modeled status belongs to the ending fight.
+/// Source: Xeeynamo/ff7-decomp, `src/battle/batres.c`, commit
+/// `d4db3de3c3aaf61269e048cf3f6a458996290de0` (the matching initializer is `batini.c`).
+pub const PERSISTENT: StatusSet = StatusSet((1 << Status::Sadness as u8) | (1 << Status::Fury as u8));
 
 /// The statuses the rules play (see the module docs).
 pub const MODELLED: StatusSet = StatusSet(

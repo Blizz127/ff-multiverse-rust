@@ -30,6 +30,7 @@
 
 mod data;
 mod play;
+mod replay_identity;
 mod vm;
 
 #[cfg(test)]
@@ -38,3 +39,5 @@ mod tests;
 pub use data::*;
 pub use play::{auto_witnesses, auto_witnesses_with_resources, cast_places, cast_places_with_resources, run_section_to_end, run_section_to_end_with_resources, run_to_end, run_to_end_with_resources, run_to_end_with_resources_strict, trigger_npc, Ground, Outcome, SceneError, ScenePlay, TriggerNpc, Writes, ANNOUNCED_STATE_OPS, FULL_RESTORE_OPS, SKIPPED_STATE_OPS};
 pub use vm::{AnimHow, Beat, CameraOp, GilOp, SceneResources, Resources, ResourceOutcome, Limits, MoveHow, SceneJump, SceneVars, Stage, Stats, Then, Timed, Vm, Where, Window, FRAMES_PER_SECOND};
+
+pub use play::{BattleCheckpoint, BattleResolution, BattleResume, WindowCheckpoint, WindowAck, SceneInput, SceneBoundary, SceneSnapshot, ReplayIdentity, REPLAY_VERSION, replay_scene, replay_scene_to, with_trigger_position};

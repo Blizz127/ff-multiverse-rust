@@ -236,6 +236,7 @@ fn start(run: SceneRunId, you: SceneRole, spots: &[(u64, u8)]) -> ServerMsg {
         seed: 5,
         progress: PROGRESS.to_vec(),
         gil: 7,
+        replay: None,
         owner: EntityId(1),
         participants: spots.iter().map(|&(entity, spot)| SceneParticipant { entity: EntityId(entity), spot }).collect(),
         you,
@@ -1116,7 +1117,7 @@ fn single_frame_holds_stay_fixed_until_replaced_for_owner_and_watcher() {
     let replace = [
         Stage::Anim { entity: 20, animation: 3, how: AnimHow::Hold, first: Some(1), last: Some(0), speed: 16, divisor: 1 },
         Stage::Anim { entity: 20, animation: 3, how: AnimHow::Once, first: Some(0), last: Some(0), speed: 16, divisor: 1 },
-        Stage::AnimSpeed { entity: 20, speed: 32 },
+        Stage::AnimSpeed { entity: 20, speed: 48 },
         Stage::Anim { entity: 20, animation: 99, how: AnimHow::Hold, first: Some(0), last: Some(0), speed: 16, divisor: 1 },
     ];
     for role in [SceneRole::Owner, SceneRole::Watcher] {
@@ -1187,10 +1188,10 @@ fn cropped_holds_follow_scene_time_and_cancel_cleanly_for_owner_and_watcher() {
         hold(3, 12, 2),
         Stage::Anim { entity: 20, animation: 3, how: AnimHow::Hold, first: Some(0), last: None, speed: 16, divisor: 1 },
         Stage::Anim { entity: 20, animation: 3, how: AnimHow::Once, first: Some(0), last: Some(2), speed: 16, divisor: 1 },
-        Stage::Anim { entity: 20, animation: 3, how: AnimHow::Hold, first: Some(0), last: Some(2), speed: 32, divisor: 1 },
+        Stage::Anim { entity: 20, animation: 3, how: AnimHow::Hold, first: Some(0), last: Some(2), speed: 48, divisor: 1 },
         Stage::Anim { entity: 20, animation: 3, how: AnimHow::Hold, first: Some(0), last: Some(2), speed: 16, divisor: 2 },
         hold(99, 0, 2),
-        Stage::AnimSpeed { entity: 20, speed: 32 },
+        Stage::AnimSpeed { entity: 20, speed: 48 },
     ];
     for role in [SceneRole::Owner, SceneRole::Watcher] {
         let mut beats = vec![
@@ -1280,7 +1281,7 @@ fn full_holds_follow_scene_time_and_cancel_cleanly_for_owner_and_watcher() {
         Stage::Anim { entity: 20, animation: 3, how: AnimHow::Hold, first: None, last: None, speed: 48, divisor: 1 },
         Stage::Anim { entity: 20, animation: 3, how: AnimHow::Hold, first: None, last: None, speed: 16, divisor: 2 },
         Stage::Anim { entity: 20, animation: 3, how: AnimHow::Once, first: None, last: None, speed: 16, divisor: 1 },
-        Stage::AnimSpeed { entity: 20, speed: 32 },
+        Stage::AnimSpeed { entity: 20, speed: 48 },
     ];
     for role in [SceneRole::Owner, SceneRole::Watcher] {
         let mut beats = vec![
@@ -1359,13 +1360,13 @@ fn doubled_full_holds_pause_replace_and_cancel_for_both_roles() {
     let hold = |animation, speed| Stage::Anim { entity: 20, animation, how: AnimHow::Hold,
         first: None, last: None, speed, divisor: 1 };
     let cancel = [
-        Stage::AnimSpeed { entity: 20, speed: 32 },
+        Stage::AnimSpeed { entity: 20, speed: 48 },
         Stage::Move { entity: 20, from: None, x: 90, y: 10, z: None, triangle: None,
             frames: 3, how: MoveHow::Walk, animation: None },
         Stage::Anim { entity: 20, animation: 3, how: AnimHow::Hold, first: None, last: None, speed: 32, divisor: 2 },
-        Stage::Anim { entity: 20, animation: 3, how: AnimHow::Hold, first: Some(0), last: Some(3), speed: 32, divisor: 1 },
+        Stage::Anim { entity: 20, animation: 3, how: AnimHow::Hold, first: Some(0), last: Some(3), speed: 48, divisor: 1 },
         Stage::Anim { entity: 20, animation: 3, how: AnimHow::Loop, first: None, last: None, speed: 48, divisor: 1 },
-        Stage::Anim { entity: 20, animation: 3, how: AnimHow::Once, first: None, last: None, speed: 32, divisor: 1 },
+        Stage::Anim { entity: 20, animation: 3, how: AnimHow::Once, first: None, last: None, speed: 48, divisor: 1 },
         hold(99, 32),
     ];
     for role in [SceneRole::Owner, SceneRole::Watcher] {
@@ -1565,6 +1566,65 @@ fn bounded_once_restores_only_known_defaults_for_owner_and_watcher() {
 }
 
 #[test]
+fn bridge_and_cargo_doubled_gestures_keep_authored_timing_across_windows_for_both_roles() {
+    use crate::avatar::anim::ClipFrame;
+    use fmv_ff7::script::scene::AnimHow;
+    struct Rated(Scripted);
+    impl SceneSource for Rated {
+        fn initial(&self) -> Vec<Stage> { self.0.initial() }
+        fn next(&mut self, answer: Option<usize>) -> Beat { self.0.next(answer) }
+        fn animation_clip(&self, entity: u8, slot: u8) -> Option<&str> {
+            if entity != 20 { return None; }
+            match slot { 0 => Some("idle"), 3 => Some("waiting"), 4 => Some("gesture"), _ => None }
+        }
+        fn initial_default_animation_clip(&self, entity: u8) -> Option<(u8, &str)> {
+            (entity == 20).then_some((0, "idle"))
+        }
+    }
+    let anim = |animation, how, first, last, speed| Stage::Anim {
+        entity: 20, animation, how, first, last, speed, divisor: 1,
+    };
+    for role in [SceneRole::Owner, SceneRole::Watcher] {
+        for chunks in [vec![8.0], vec![2.0, 3.0, 3.0]] {
+            let beats = vec![
+                Beat { stage: vec![
+                    timed(0, anim(3, AnimHow::Hold, None, None, 16)),
+                    timed(1, Stage::AnimSpeed { entity: 20, speed: 32 }),
+                    timed(1, anim(4, AnimHow::Once, None, None, 32)),
+                    timed(8, Stage::AnimSpeed { entity: 20, speed: 16 }),
+                ], then: say(8, 20, 20, 1).then },
+                Beat { stage: vec![timed(2, anim(3, AnimHow::Hold, Some(15), Some(29), 32))], then: say(10, 20, 20, 2).then },
+                Beat { stage: vec![timed(0, anim(4, AnimHow::Hold, Some(1), Some(7), 16))], then: say(2, 20, 20, 3).then },
+            ];
+            let mut player = ScenePlayer::new(Run { id: RUN, participants: vec![], role }, def(),
+                Box::new(Rated(Scripted { initial: places(), beats: beats.into(), asked: Asked::default() })), false);
+            let frame = |p: &ScenePlayer| p.actor(20).unwrap().animation().unwrap().1;
+            let pass = |p: &mut ScenePlayer, step| {
+                if role == SceneRole::Owner { p.key(SceneKey::Confirm); } else { p.on_step(step, None); }
+            };
+            for frames in chunks { player.advance(frames / 30.0); }
+            assert_eq!(frame(&player), ClipFrame::OnceFullSlowed { elapsed: 14.0, doubled_until: 14.0 });
+            assert_eq!(frame(&player).in_clip(15), Some(14.0));
+            player.advance(10.0);
+            assert_eq!(frame(&player).return_elapsed(15), None, "the open window pauses the final frame");
+            pass(&mut player, 0);
+            player.advance(1.0 / 30.0);
+            assert_eq!(frame(&player).return_elapsed(15), Some(0.0));
+            player.advance(9.0 / 30.0);
+            assert_eq!(frame(&player), ClipFrame::HoldRange { first: 15, last: 29, elapsed: 16.0 });
+            assert_eq!(frame(&player).in_clip(30), Some(29.0));
+            assert_eq!(player.actor(20).unwrap().full_once_return(), None, "the Hold replaced the completed Once");
+            player.advance(10.0);
+            assert_eq!(frame(&player).in_clip(30), Some(29.0), "the cargo Hold stays on its authored endpoint");
+            pass(&mut player, 1);
+            player.advance(2.0 / 30.0);
+            assert_eq!(frame(&player).in_clip(8), Some(3.0), "the next normal Hold starts at its own rate");
+            assert_eq!(player.counts().anims_skipped, 0);
+        }
+    }
+}
+
+#[test]
 fn full_once_keeps_scene_time_and_a_verified_return_for_owner_and_watcher() {
     use crate::avatar::anim::ClipFrame;
     use fmv_ff7::script::scene::AnimHow;
@@ -1608,7 +1668,7 @@ fn full_once_keeps_scene_time_and_a_verified_return_for_owner_and_watcher() {
         once(99),
         Stage::Anim { entity: 20, animation: 3, how: AnimHow::Once, first: Some(0), last: None, speed: 16, divisor: 1 },
         Stage::Anim { entity: 20, animation: 3, how: AnimHow::Once, first: None, last: Some(2), speed: 16, divisor: 1 },
-        Stage::Anim { entity: 20, animation: 3, how: AnimHow::Once, first: None, last: None, speed: 32, divisor: 1 },
+        Stage::Anim { entity: 20, animation: 3, how: AnimHow::Once, first: None, last: None, speed: 48, divisor: 1 },
         Stage::Anim { entity: 20, animation: 3, how: AnimHow::Once, first: None, last: None, speed: 16, divisor: 2 },
     ];
     let invalidators = [
@@ -2000,7 +2060,7 @@ fn a_scene_of_another_field_or_a_story_that_cannot_be_read_is_not_played_either(
     let mut rig = rig_with(talk(), false);
     rig.client.on_message(
         AREA,
-        ServerMsg::SceneStart { run: RUN, scene: SCENE.into(), seed: 5, progress: vec![9, 9, 9, 9], gil: 7, owner: EntityId(1), participants: vec![], you: SceneRole::Watcher },
+        ServerMsg::SceneStart { run: RUN, scene: SCENE.into(), seed: 5, progress: vec![9, 9, 9, 9], gil: 7, replay: None, owner: EntityId(1), participants: vec![], you: SceneRole::Watcher },
     );
     assert!(!rig.client.is_active());
     assert_eq!(*rig.built.borrow(), 0, "nothing was built from a story that is not readable");

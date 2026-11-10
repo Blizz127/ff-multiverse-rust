@@ -428,9 +428,12 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>, mut 
         // (every headless run moves past the windows of a scene it is in: without it a scene the server started for a route
         // bot would hold the bot until the server's own timeout, and the story the scene carries would never move)
         let scene_now = Instant::now();
-        session.state.scene.advance(scene_now.duration_since(scene_tick).as_secs_f32());
+        let scene_visible = !session.state.battle.in_battle() && !session.state.battle.lingering(now);
+        session.state.scene.advance_visible(scene_now.duration_since(scene_tick).as_secs_f32(), scene_visible);
         scene_tick = scene_now;
-        session.state.scene.autoplay(if scene_bot.is_active() { scene_bot.answer() } else { args.scene_answer.map(usize::from) });
+        if scene_visible {
+            session.state.scene.autoplay(if scene_bot.is_active() { scene_bot.answer() } else { args.scene_answer.map(usize::from) });
+        }
         audio.follow_scene(&mut session.state.scene, now);
         for event in session.state.scene.take_events() {
             if scene_bot.is_active() {

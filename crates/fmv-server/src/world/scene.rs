@@ -59,6 +59,9 @@ use fmv_protocol::{
 
 use super::{is_full, normalize_facing, Player, World};
 
+mod continuation;
+pub use continuation::{SceneBoundary, SceneBoundaryKind};
+
 /// How long a scene may go without the owner moving past a window before the server ends it.
 pub const SCENE_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// The longest a scene may last in all.
@@ -132,6 +135,20 @@ pub trait SceneHost: Send + Sync {
     fn offered(&self, scene: &str, progress: &[u8]) -> bool;
     /// Whether the scene starts automatically on entering its field.
     fn automatic(&self, _scene: &str) -> bool { false }
+    /// Whether this scene uses strict, durable window and battle continuation instead of the
+    /// presentation-only scene completion path.
+    fn continuation(&self, _scene: &str) -> bool { false }
+    /// Reconstruct the exact accepted transcript to its next boundary. `None` starts a new
+    /// replay and returns its source identity; an existing replay must match that identity.
+    fn evaluate_continuation(&self, _scene: &str, _original_progress: &[u8], _seed: u32,
+        _original_gil: u32, _replay: Option<&fmv_protocol::SceneReplay>) -> Option<SceneBoundary> { None }
+    /// Capture an authored line trigger's initial cast placement before binding its source.
+    fn initial_continuation(&self, scene: &str, progress: &[u8], seed: u32, gil: u32,
+        _origin: Option<fmv_protocol::SceneOrigin>) -> Option<SceneBoundary> {
+        self.evaluate_continuation(scene, progress, seed, gil, None)
+    }
+    /// The authored scene line crossed by an accepted move, if enabled for this story.
+    fn line_scene(&self, _field: &str, _progress: &[u8], _from: Pos, _to: Pos) -> Option<String> { None }
     /// The CUTSCENE of a story point, if the game has one: the scene to play for a player whose step in area `field` takes its
     /// story from `before` to `after` (the point's own step, which the world applies when the scene ends: see
     /// `World::start_point_scene`). `None`: the step is applied at once, as it always was.
@@ -258,6 +275,7 @@ pub(super) struct SceneWorld {
     next_run: u64,
     runs: BTreeMap<SceneRunId, SceneRun>,
     pending: BTreeMap<SceneRunId, PendingScene>,
+    continuations: BTreeMap<SceneRunId, continuation::Continuation>,
     /// Admission fence: a login that read storage across a scene save must load it again.
     save_epoch: u64,
     /// A failed worker or uncertain store write requires recovery before any player may continue.
@@ -305,10 +323,12 @@ impl World {
     /// Validated travel targets stay loaded until the transaction is acknowledged.
     pub(super) fn pending_scene_destinations(&self) -> impl Iterator<Item = AreaKey> + '_ {
         self.scenes.pending.values().filter_map(|p| p.result.travel.as_ref().map(|exit| exit.target.clone()))
+            .chain(self.scenes.continuations.values().flat_map(continuation::Continuation::destinations))
     }
 
     pub(super) fn scene_save_pending(&self, account: AccountId) -> bool {
         self.scenes.pending.values().any(|pending| pending.account == account)
+            || self.scenes.continuations.values().any(|c| c.accounts.contains(&account))
     }
 
     /// The phase of `player` in `area`: the made-up one of a previewing player, else what the area reads of its progression.
@@ -538,6 +558,10 @@ impl World {
 
     /// Hold every participant of `record`, tell each with `SceneStart` and keep the run.
     fn start_run(&mut self, run: SceneRunId, record: SceneRun, failed: &mut Vec<(EntityId, bool)>) {
+        if !self.initialize_continuation(run, &record) {
+            self.fail_scene_save(run, record, "the continuation could not be initialized");
+            return;
+        }
         let mut participants = vec![SceneParticipant { entity: record.owner, spot: 0 }];
         participants.extend(record.watchers.iter().zip(1u8..).map(|(&entity, spot)| SceneParticipant { entity, spot }));
         for p in &participants {
@@ -551,6 +575,7 @@ impl World {
                 seed: record.seed,
                 progress: record.progress.clone(),
                 gil: record.gil,
+                replay: self.scenes.continuations.get(&run).map(|c| c.payload.replay.clone()),
                 owner: record.owner,
                 participants: participants.clone(),
                 you: role,
@@ -583,6 +608,14 @@ impl World {
                 self.scene_step(entity, run, step, answer, now);
                 SceneReply::Done
             }
+            ClientMsg::SceneBattleReady { run, ordinal, step } => {
+                self.continuation_battle_ready(entity, run, ordinal, step, now);
+                SceneReply::Done
+            }
+            ClientMsg::SceneRetry { run } => {
+                self.continuation_retry(entity, run, now);
+                SceneReply::Done
+            }
             ClientMsg::SceneEnd { run, skipped } => {
                 if self.scenes.runs.get(&run).is_some_and(|r| r.owner == entity) {
                     self.end_run(run, if skipped { SceneOutcome::Skipped } else { SceneOutcome::Finished }, now);
@@ -602,6 +635,10 @@ impl World {
     }
 
     fn scene_step(&mut self, entity: EntityId, run: SceneRunId, step: u32, answer: Option<u8>, now: Instant) {
+        if self.scenes.continuations.contains_key(&run) {
+            self.continuation_step(entity, run, step, answer, now);
+            return;
+        }
         let watchers = {
             let Some(r) = self.scenes.runs.get_mut(&run) else { return };
             // Only the owner drives, one window at a time, in order, within bounds.
@@ -627,6 +664,10 @@ impl World {
 
     /// A participant asks to be let go: the owner abandons the run without applying it; a watcher just stops watching.
     fn scene_leave(&mut self, entity: EntityId, run: SceneRunId, now: Instant) {
+        if self.scenes.continuations.contains_key(&run) {
+            self.continuation_end(entity, run, SceneOutcome::Aborted, now);
+            return;
+        }
         if let Some(pending) = self.scenes.pending.get_mut(&run) {
             // A queued commit cannot be cancelled. A watcher may detach without affecting it.
             if pending.record.owner == entity { return; }
@@ -767,6 +808,10 @@ impl World {
     /// End the presentation once. Durable results retain the hold until the saver acknowledges;
     /// removing the active run first makes repeated ends and timeouts harmless.
     fn end_run(&mut self, run: SceneRunId, mut outcome: SceneOutcome, now: Instant) {
+        if let Some(owner) = self.scenes.runs.get(&run).filter(|_| self.scenes.continuations.contains_key(&run)).map(|r| r.owner) {
+            self.continuation_end(owner, run, outcome, now);
+            return;
+        }
         let Some(record) = self.scenes.runs.remove(&run) else { return };
         let mut apply = matches!(outcome, SceneOutcome::Finished | SceneOutcome::Skipped);
         let mut result = if !apply || !record.writes_story { None } else {
@@ -870,11 +915,13 @@ impl World {
 
     /// Housekeeping, once per tick: end the runs that have gone quiet or lasted too long.
     pub fn advance_scenes(&mut self, now: Instant) {
+        self.advance_continuations(now);
         let late: Vec<SceneRunId> = self
             .scenes
             .runs
             .iter()
-            .filter(|(_, r)| now.saturating_duration_since(r.last_activity) >= SCENE_IDLE_TIMEOUT || now.saturating_duration_since(r.started) >= SCENE_MAX_TIME)
+            .filter(|(id, r)| !self.scenes.continuations.contains_key(id)
+                && (now.saturating_duration_since(r.last_activity) >= SCENE_IDLE_TIMEOUT || now.saturating_duration_since(r.started) >= SCENE_MAX_TIME))
             .map(|(id, _)| *id)
             .collect();
         for run in late {
@@ -924,6 +971,7 @@ impl World {
     /// A pending account remains reserved until its acknowledgment; watchers can leave independently.
     pub(super) fn scene_player_gone(&mut self, entity: EntityId, held: Option<SceneRunId>) {
         let Some(run) = held else { return };
+        if self.scenes.continuations.contains_key(&run) { self.continuation_player_gone(entity, run); return; }
         if let Some(pending) = self.scenes.pending.get_mut(&run) {
             pending.record.watchers.retain(|w| *w != entity);
             return; // An owner's disconnect cannot cancel a transaction already queued.
@@ -940,6 +988,7 @@ impl World {
     pub(super) fn scene_check_parties(&mut self) {
         let mut dropped: Vec<(SceneRunId, EntityId)> = Vec::new();
         for (id, r) in self.scenes.runs.iter().chain(self.scenes.pending.iter().map(|(id, pending)| (id, &pending.record))) {
+            if self.scenes.continuations.contains_key(id) { continue; }
             let Some(owner) = self.players.get(&r.owner) else { continue };
             let party = self.parties.party_of(owner.account);
             for &w in &r.watchers {

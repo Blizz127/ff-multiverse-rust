@@ -985,9 +985,19 @@ fn offscreen_fxaa_keeps_tiled_field_model_occlusion() {
 #[test]
 #[ignore = "needs owned FF7 data and a GPU or software Vulkan/GL driver"]
 fn offscreen_fxaa_real_ff7_field_comparison() {
+    real_ff7_graphics_comparison(false);
+}
+
+#[test]
+#[ignore = "needs owned FF7 data and a GPU or software Vulkan/GL driver"]
+fn offscreen_supersample_real_ff7_field_comparison() {
+    real_ff7_graphics_comparison(true);
+}
+
+fn real_ff7_graphics_comparison(supersample: bool) {
     use crate::backdrop::FieldView;
     use crate::camera::{CameraInput, FieldCamera};
-    use crate::graphics::AntiAliasing;
+    use crate::graphics::{AntiAliasing, RenderScale};
     let real = real::open().expect("owned FF7 data");
     let mut gpu = Offscreen::new().expect("GPU or software adapter");
     let mut view = FieldView::ff7_with(&real.adapter, "md1stin", true).expect("field view");
@@ -1003,7 +1013,7 @@ fn offscreen_fxaa_real_ff7_field_comparison() {
     })).collect();
     let selected = real::spread(&clear, 1);
     let place = selected.first().expect("visible walkable place").pos;
-    let frame = m.frame(&mut avatars, &[m.cloud(place)], true, true);
+    let mut frame = m.frame(&mut avatars, &[m.cloud(place)], true, true);
     assert_eq!(frame.models.len(), 1, "Cloud is loaded from the owned character archive");
     assert!(frame.scenery.is_some(), "the real depth-tested tile path");
     let own = view.to_view(place).map(|p| [p.x, p.y]);
@@ -1014,10 +1024,19 @@ fn offscreen_fxaa_real_ff7_field_comparison() {
     let scene = Scene { bounds: view.bounds, triangles: &[], players: &[], fixture_banner: false, backdrop: view.backdrop.as_ref() };
     let mut overlay = DrawList::new();
     overlay.fill_rect(16, 16, 520, 32, [8, 24, 64, 255]);
-    overlay.draw_text(24, 28, 1, [255, 255, 255, 255], "FF7 md1stin - identical scene and UI, optional edge smoothing");
+    overlay.draw_text(24, 28, 1, [255, 255, 255, 255], "FF7 md1stin - same camera, scene and native UI");
+    let modes = if supersample {
+        vec![(RenderScale::Native, AntiAliasing::Off, "graphics-md1stin-native"),
+             (RenderScale::Double, AntiAliasing::Off, "graphics-md1stin-2x"),
+             (RenderScale::Double, AntiAliasing::Fxaa, "graphics-md1stin-2x-fxaa")]
+    } else {
+        vec![(RenderScale::Native, AntiAliasing::Off, "graphics-md1stin-off"),
+             (RenderScale::Native, AntiAliasing::Fxaa, "graphics-md1stin-fxaa")]
+    };
     let mut images = Vec::new();
-    for (mode, name) in [(AntiAliasing::Off, "graphics-md1stin-off"), (AntiAliasing::Fxaa, "graphics-md1stin-fxaa")] {
+    for (scale, mode, name) in modes {
         let image = gpu.render_with(1100, 680, |gpu, target, srgb| {
+            gpu.set_render_scale(scale);
             gpu.set_anti_aliasing(mode);
             gpu.draw_field(target, (1100, 680), &scene, Some(&frame), srgb);
             gpu.draw_overlay(target, &overlay.vertices(1100, 680, srgb));
@@ -1026,10 +1045,129 @@ fn offscreen_fxaa_real_ff7_field_comparison() {
         images.push(image);
     }
     let different = images[0].chunks_exact(4).zip(images[1].chunks_exact(4)).filter(|(a, b)| a != b).count();
-    eprintln!("optional FXAA changes {different} of 748000 pixels in the owned md1stin comparison");
-    assert!(different > 100, "the real render path applies the filter");
-    for y in 16..48 { for x in 16..536 {
+    eprintln!("optional {} changes {different} of 748000 pixels in the owned md1stin comparison", if supersample { "2x scene rendering" } else { "FXAA" });
+    assert!(different > 100, "the real render path applies the option");
+    for image in &images[1..] { for y in 16..48 { for x in 16..536 {
         let i = (y * 1100 + x) * 4;
-        assert_eq!(&images[0][i..i+4], &images[1][i..i+4], "UI remains unchanged");
+        assert_eq!(&images[0][i..i+4], &image[i..i+4], "UI remains unchanged");
+    } } }
+    if supersample {
+        // Isolate the same owned model from the busy picture to measure its actual rendered
+        // footprint. Subpixel edge coverage may add one pixel; scale or framing must not change.
+        frame.scenery = None;
+        let bare = Scene { backdrop: None, ..scene };
+        let mut footprints = Vec::new();
+        for scale in [RenderScale::Native, RenderScale::Double] {
+            let image = gpu.render_with(1100, 680, |gpu, target, srgb| {
+                gpu.set_anti_aliasing(AntiAliasing::Off);
+                gpu.set_render_scale(scale);
+                gpu.draw_field(target, (1100, 680), &bare, Some(&frame), srgb);
+            });
+            footprints.push(model_footprint(&image, 1100, CLEAR_RGB));
+        }
+        assert_same_footprint(footprints[0], footprints[1]);
+        eprintln!("owned Cloud footprint: native {:?}, 2x {:?}", footprints[0], footprints[1]);
+    }
+}
+
+/// Bound the visible model against a uniform background, ignoring tiny colour conversion noise.
+fn model_footprint(image: &[u8], width: u32, clear: [u8; 3]) -> [u32; 4] {
+    let mut bounds = [u32::MAX, u32::MAX, 0, 0];
+    for (i, rgba) in image.chunks_exact(4).enumerate() {
+        if rgba[..3].iter().zip(clear).any(|(a, b)| a.abs_diff(b) > 2) {
+            let (x, y) = (i as u32 % width, i as u32 / width);
+            bounds = [bounds[0].min(x), bounds[1].min(y), bounds[2].max(x), bounds[3].max(y)];
+        }
+    }
+    assert!(bounds[0] < bounds[2] && bounds[1] < bounds[3], "a visible model: {bounds:?}");
+    bounds
+}
+
+fn assert_same_footprint(native: [u32; 4], doubled: [u32; 4]) {
+    assert!(native.iter().zip(doubled).all(|(a, b)| a.abs_diff(b) <= 1),
+        "2x adds edge coverage within one output pixel; it must not move or scale the model: {native:?} / {doubled:?}");
+}
+
+#[test]
+#[ignore = "needs a GPU or software Vulkan/GL driver"]
+fn offscreen_supersample_keeps_model_framing_and_foreground_depth() {
+    use crate::graphics::{AntiAliasing, RenderScale};
+    use crate::battle::scene::BattleFrame;
+    let mut gpu = Offscreen::new().expect("GPU or software adapter");
+    let mut frame = built(&[facing_camera(1, "ff7/cloud", Pos::new(0.0, 0.0, 0.0))], false);
+    let figure = figure(&frame);
+    // Depth and models use the same doubled projection, and resolving does not expose a
+    // model behind a foreground tile. FXAA is independent and can run after the resolve.
+    for (depth, expected) in [(figure.near - 1.0, GREEN), (figure.far + 1.0, RED)] {
+        frame.scenery = Some(scenery_of(&[tile_over(figure.centre, 2, depth, GREEN, None)], canvas()));
+        for scale in [RenderScale::Native, RenderScale::Double] { for mode in [AntiAliasing::Off, AntiAliasing::Fxaa] {
+            let image = gpu.render_with(W, H, |gpu, target, srgb| {
+                gpu.set_render_scale(scale);
+                gpu.set_anti_aliasing(mode);
+                let scene = Scene { bounds: bounds(), triangles: &[], players: &[], fixture_banner: false, backdrop: None };
+                gpu.draw_field(target, (W, H), &scene, Some(&frame), srgb);
+            });
+            let actual = pixel(&image, W, figure.pixel.0, figure.pixel.1);
+            assert!(close(actual, expected, 2), "{scale:?} {mode:?}, tile depth {depth}: {actual:?}, expected {expected:?}");
+        } }
+    }
+    frame.scenery = None;
+    // Put the authored range just before the model's leftmost vertex. Even its subpixel tip
+    // must be cleared before FXAA/downsampling, not allowed to bleed into the valid field.
+    let first_x = frame.models.iter().flat_map(|model| &model.positions).map(|&p| field_screen(p).0)
+        .fold(f32::INFINITY, f32::min);
+    let range = Bounds { min: Pos::new(-100.0, -100.0, 0.0), max: Pos::new(first_x - 0.01, 100.0, 0.0) };
+    let scene = Scene { bounds: bounds(), triangles: &[], players: &[], fixture_banner: false, backdrop: None };
+    for scale in [RenderScale::Native, RenderScale::Double] { for mode in [AntiAliasing::Off, AntiAliasing::Fxaa] {
+        let mut render = |model| gpu.render_with(W, H, |gpu, target, srgb| {
+            gpu.set_render_scale(scale);
+            gpu.set_anti_aliasing(mode);
+            gpu.draw_field_clipped(target, (W, H), &scene, model, srgb, Some(range));
+        });
+        let empty = render(None);
+        let outside = render(Some(&frame));
+        assert!(outside == empty, "{scale:?} {mode:?}: an off-range model must not leak through effects at the range edge");
     } }
+    let shifted = Bounds { min: Pos::new(-80.0, -110.0, 0.0), max: Pos::new(120.0, 90.0, 0.0) };
+    let scene = Scene { bounds: shifted, triangles: &[], players: &[], fixture_banner: false, backdrop: None };
+    let battle = BattleFrame { clear_rgb: CLEAR_RGB, stage: vec![], location: None,
+        models: frame, tints: vec![], identities: vec![], camera: Camera::pixels(73.0, -29.0) };
+    for field in [true, false] {
+        let camera = if field { Camera::fit(&shifted, W as f32, H as f32, MARGIN_PX) } else { battle.camera };
+        let geometric = battle.models.models.iter().flat_map(|model| &model.positions)
+            .map(|&p| project_pixel(&camera, battle.models.zoom, W, H, p))
+            .fold([f32::MAX, f32::MAX, f32::MIN, f32::MIN], |b, p| [b[0].min(p.0), b[1].min(p.1), b[2].max(p.0), b[3].max(p.1)]);
+        let mut coverage = Vec::new();
+        for scale in [RenderScale::Native, RenderScale::Double] {
+            let image = gpu.render_with(W, H, |gpu, target, srgb| {
+                gpu.set_render_scale(scale);
+                gpu.set_anti_aliasing(AntiAliasing::Off);
+                if field { gpu.draw_field(target, (W, H), &scene, Some(&battle.models), srgb); }
+                else { gpu.draw_battle(target, (W, H), &battle, srgb); }
+            });
+            let footprint = model_footprint(&image, W, CLEAR_RGB);
+            // This fixture has needle-thin triangle tips: native centre samples can miss several
+            // rows which 2x correctly covers. Check the authored projected geometry, not a larger
+            // arbitrary tolerance around the less complete native silhouette.
+            assert!(footprint[0] as f32 >= geometric[0].floor() && footprint[1] as f32 >= geometric[1].floor()
+                && footprint[2] as f32 <= geometric[2].ceil() && footprint[3] as f32 <= geometric[3].ceil(),
+                "{field} {scale:?}: rendered {footprint:?} stays inside projected vertices {geometric:?}");
+            let background = pixel(&image, W, 0, 0);
+            let mut sum = [0.0f64; 3];
+            for (i, rgba) in image.chunks_exact(4).enumerate() {
+                let weight = f64::from(rgba[..3].iter().zip(background).map(|(a, b)| a.abs_diff(b)).max().unwrap()) / 255.0;
+                sum[0] += (i as u32 % W) as f64 * weight;
+                sum[1] += (i as u32 / W) as f64 * weight;
+                sum[2] += weight;
+            }
+            let measured = ([sum[0] / sum[2], sum[1] / sum[2]], sum[2]);
+            eprintln!("{} {scale:?}: projected {geometric:?}, raster {footprint:?}, coverage {measured:?}", if field { "field" } else { "battle" });
+            save(&format!("graphics-framing-{}-{}", if field { "field" } else { "battle" }, if scale == RenderScale::Native { "native" } else { "2x" }), W, H, &image);
+            coverage.push(measured);
+        }
+        assert!(coverage[0].0.iter().zip(coverage[1].0).all(|(a, b)| (a - b).abs() <= 0.5),
+            "coverage centre stays within half a native pixel: {coverage:?}");
+        assert!((coverage[0].1 - coverage[1].1).abs() / coverage[0].1 < 0.05,
+            "the visible area remains the same within raster sampling error: {coverage:?}");
+    }
 }

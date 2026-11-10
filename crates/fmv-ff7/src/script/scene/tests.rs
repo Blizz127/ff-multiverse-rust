@@ -1678,7 +1678,6 @@ fn route_survey_definitions_are_not_registered_for_play() {
     assert!(scene(SECTOR7_STATION_SCENE_ID).is_none());
     assert!(scene(SECTOR7_INTRO_SCENE_ID).is_none());
     assert!(scene(SECTOR7_PILLAR_SCENE_ID).is_none());
-    assert!(scene(CARGO_TRAIN_SCENE_ID).is_none());
     assert!(scene(REACTOR_OPENING_SCENE_ID).is_none());
 }
 
@@ -1686,7 +1685,7 @@ fn route_survey_definitions_are_not_registered_for_play() {
 fn flower_registration_promotes_only_its_local_playback_snapshot() {
     let def = scene(FLOWER_STATION_SCENE_ID).expect("the reviewed flower scene is registered");
     assert_eq!(def.id, "ff7/md8_2/flower");
-    assert_eq!(scenes().last(), Some(&def), "existing scene numbers stay stable");
+    assert_eq!(scenes().get(13), Some(&def), "the flower keeps its existing scene number");
     assert!(def.requires_exact_transaction() && def.starts_on_arrival());
     assert!(def.offered_to(&StoryState::at(36)));
     assert!(!def.offered_to(&StoryState::at(39)));
@@ -1707,8 +1706,13 @@ fn flower_registration_promotes_only_its_local_playback_snapshot() {
     assert_eq!(def.prepare_story(&tracked).unwrap().known_bit(1, 225, 0), Some(true));
     assert!(!tracked.supports_extended(), "legacy tracked bits are preserved without migrating their source");
     for other in scenes().into_iter().filter(|s| s.id != def.id) {
-        assert!(!other.requires_exact_transaction());
-        assert_eq!(other.prepare_story(&original), Ok(original.clone()));
+        if [BRIDGE_SCENE_ID, CARGO_TRAIN_SCENE_ID].contains(&other.id.as_str()) {
+            assert!(other.requires_exact_transaction());
+            assert_eq!(other.prepare_story(&original), original.clone().into_extended());
+        } else {
+            assert!(!other.requires_exact_transaction());
+            assert_eq!(other.prepare_story(&original), Ok(original.clone()));
+        }
     }
     let bad = StoryState::decode(&[2, 36, 0, 1, 5, 10, 1]).unwrap();
     assert!(def.prepare_story(&bad).is_err(), "unsupported legacy state must never be discarded");
@@ -2094,4 +2098,234 @@ fn resource_gold_decoder_keeps_independent_bank_halves_and_only_true_literal_amo
         assert_eq!(variable.operand("amount"), None);
         assert!(!variable.stray_banks);
     }
+}
+
+#[test]
+fn strict_replay_acknowledges_every_exact_window_and_never_invents_a_choice() {
+    let question = [dialog("Q")[..1].to_vec(), vec![0xE7, 0x21, 0xE7, 0x22, 0xFF]].concat();
+    let field = field_of(script(vec![("a", vec![(1, vec![message(0, 1), ask(0, 1, 2, 5, 9), message(0, 1)])])], vec![question, dialog("Hello")]));
+    let def = demo_def(vec![], start(0, 1));
+    let story = StoryState::at(4).into_extended().unwrap();
+    let resources = Resources { gil: Some(20) };
+    let mut play = ScenePlay::with_resources(&field, &def, &story, 77, resources).unwrap();
+    let identity = play.replay_identity();
+    play.next_strict(None).unwrap();
+    let Some(SceneBoundary::Window(first)) = play.boundary() else { panic!() };
+    assert_eq!(first.ordinal, 1);
+    assert_eq!(play.next_strict(None), Err(SceneError::WindowBoundary));
+    assert_eq!(play.next_strict(Some(WindowAck { checkpoint: first, answer: Some(1) })), Err(SceneError::WindowBoundary));
+    let wrong = WindowCheckpoint { instruction_offset: first.instruction_offset.map(|o| o + 1), ..first };
+    assert_eq!(play.next_strict(Some(WindowAck { checkpoint: wrong, answer: None })), Err(SceneError::WindowBoundary));
+    assert!(play.transcript().is_empty());
+    play.next_strict(Some(WindowAck { checkpoint: first, answer: None })).unwrap();
+    let Some(SceneBoundary::Window(second)) = play.boundary() else { panic!() };
+    assert_eq!((second.ordinal, second.choices), (2, Some([1, 2])));
+    for answer in [None, Some(0), Some(3)] {
+        assert_eq!(play.next_strict(Some(WindowAck { checkpoint: second, answer })), Err(SceneError::WindowBoundary));
+    }
+    play.next_strict(Some(WindowAck { checkpoint: second, answer: Some(2) })).unwrap();
+    let Some(SceneBoundary::Window(third)) = play.boundary() else { panic!() };
+    assert_eq!(third.ordinal, 3);
+    let replay = replay_scene_to(&field, &def, &story, resources, identity, play.transcript(), SceneBoundary::Window(third)).unwrap();
+    assert_eq!(replay.snapshot(), play.snapshot());
+    assert!(matches!(replay_scene_to(&field, &def, &story, resources, identity, &play.transcript()[..1], SceneBoundary::Window(third)), Err(SceneError::ReplayBoundary)));
+    play.next_strict(Some(WindowAck { checkpoint: third, answer: None })).unwrap();
+    assert_eq!(play.boundary(), Some(SceneBoundary::End(End::Finished)));
+    assert_eq!(play.next_strict(Some(WindowAck { checkpoint: third, answer: None })), Err(SceneError::WindowBoundary));
+    let mut extra = play.transcript().to_vec();
+    extra.push(SceneInput::Window(WindowAck { checkpoint: third, answer: None }));
+    assert!(matches!(replay_scene(&field, &def, &story, resources, identity, &extra), Err(SceneError::WindowBoundary)));
+    let mut wrong_identity = identity;
+    wrong_identity.version += 1;
+    assert!(matches!(replay_scene(&field, &def, &story, resources, wrong_identity, &[]), Err(SceneError::ReplayIdentity)));
+    let mut preview = ScenePlay::with_resources(&field, &def, &story, 77, resources).unwrap();
+    preview.next(None);
+    assert_eq!(preview.next_strict(None), Err(SceneError::UncheckedReplay));
+}
+
+#[test]
+fn checked_battle_resume_is_once_per_instruction_execution_and_rebases_rewards_without_resetting_scratch() {
+    let body = vec![vec![0x72, 8, 0], setbyte(5, 9, 77), vec![0x99, 5, 2], setbyte(1, 40, 12), gold(0x3A, 5),
+        vec![0x70, 0, 72, 1], vec![0x99, 5, 3], if_ub(5, 9, 0, 77, &message(0, 0)), gold(0x39, 2)];
+    let control = field_of(script(vec![("a", vec![(1, body.iter().filter(|op| op.first() != Some(&0x70)).cloned().collect())])], texts(1)));
+    let field = field_of(script(vec![("a", vec![(1, body)])], texts(1)));
+    let def = demo_def(vec![], vec![Step::Await(ScriptRef::new(0, 1)), Step::Await(ScriptRef::new(0, 1))]);
+    let story = StoryState::at(4).into_extended().unwrap();
+    let resources = Resources { gil: Some(100) };
+    let mut play = ScenePlay::with_resources(&field, &def, &story, 123, resources).unwrap();
+    let identity = play.replay_identity();
+    play.next_strict(None).unwrap();
+    let Some(SceneBoundary::Battle(first)) = play.boundary() else { panic!("{:?}", play.boundary()) };
+    assert_eq!((first.ordinal, first.formation, first.flags), (1, 328, Some(8)));
+    assert_eq!(play.resources().gil_after, Some(95));
+    let mut committed = story.clone();
+    play.writes().apply_extended_to(&mut committed, &story).unwrap();
+    let resume = BattleResume { checkpoint: first, resolution: BattleResolution::Victory, story: committed.clone(), resources: Resources { gil: Some(125) } };
+    for checkpoint in [BattleCheckpoint { ordinal: 2, ..first }, BattleCheckpoint { instruction_offset: first.instruction_offset + 1, ..first }, BattleCheckpoint { formation: 329, ..first }] {
+        assert_eq!(play.resume_battle_checked(BattleResume { checkpoint, ..resume.clone() }), Err(SceneError::BattleBoundary));
+    }
+    assert_eq!(play.resume_battle_checked(BattleResume { resources: Resources { gil: None }, ..resume.clone() }), Err(SceneError::BattleResources));
+    play.resume_battle_checked(resume.clone()).unwrap();
+    assert_eq!(play.resume_battle_checked(resume.clone()), Err(SceneError::BattleBoundary));
+    assert!(play.writes().persistent.is_empty(), "committed writes do not get republished");
+    assert_eq!((play.resources().gil_before, play.resources().gil_after, play.resources().gil_ops.len()), (Some(125), Some(125), 0));
+    play.next_strict(None).unwrap();
+    let Some(SceneBoundary::Window(window)) = play.boundary() else { panic!("the preserved scratch byte opens this window") };
+    play.next_strict(Some(WindowAck { checkpoint: window, answer: None })).unwrap();
+    let Some(SceneBoundary::Battle(second)) = play.boundary() else { panic!() };
+    assert_eq!((second.ordinal, second.instruction_offset, second.formation), (2, first.instruction_offset, first.formation));
+    assert_ne!(first.identity_bytes(), second.identity_bytes());
+    assert_eq!(play.resources().gil_after, Some(122), "125 reward afterimage +2, then next fight's -5");
+    assert_eq!(play.resume_battle_checked(resume), Err(SceneError::BattleBoundary), "old victory cannot unlock a repeated formation");
+    play.resume_battle_checked(BattleResume { checkpoint: second, resolution: BattleResolution::Victory, story: committed, resources: Resources { gil: Some(152) } }).unwrap();
+    play.next_strict(None).unwrap();
+    let Some(SceneBoundary::Window(window)) = play.boundary() else { panic!() };
+    play.next_strict(Some(WindowAck { checkpoint: window, answer: None })).unwrap();
+    assert_eq!(play.resources().gil_after, Some(154));
+    let uninterrupted = run_to_end_with_resources(&control, &def, &story, 123, resources, &[]).unwrap();
+    for key in [(5, 2), (5, 3), (5, 9)] {
+        assert_eq!(play.writes().untracked.get(&key), uninterrupted.writes.untracked.get(&key), "the same scratch/RNG state as an uninterrupted script");
+    }
+    let replayed = replay_scene_to(&field, &def, &story, resources, identity, play.transcript(), SceneBoundary::End(End::Finished)).unwrap();
+    assert_eq!(replayed.snapshot(), play.snapshot(), "scratch, RNG draws, scheduling and effect accounting replay exactly");
+}
+
+#[test]
+fn checked_resume_preserves_unsafe_prefix_observations_and_refuses_unreviewed_modes() {
+    for flags in [0u16, 8, 9] {
+        let body = vec![cat(&[vec![0x72], flags.to_le_bytes().to_vec()]), unknown_op(), if_ub(1, 60, 0, 0, &setbyte(5, 9, 1)), vec![0x70, 0, 72, 1]];
+        let field = field_of(script(vec![("a", vec![(1, body)])], vec![]));
+        let def = demo_def(vec![], start(0, 1));
+        let story = StoryState::at(4).into_extended().unwrap();
+        let mut play = ScenePlay::with_resources(&field, &def, &story, 1, Resources { gil: Some(10) }).unwrap();
+        play.next_strict(None).unwrap();
+        let Some(SceneBoundary::Battle(checkpoint)) = play.boundary() else { panic!() };
+        let before = play.snapshot().unwrap();
+        let result = play.resume_battle_checked(BattleResume { checkpoint, resolution: BattleResolution::Victory, story, resources: Resources { gil: Some(20) } });
+        if flags != 8 { assert_eq!(result, Err(SceneError::BattleMode)); continue; }
+        result.unwrap(); play.next_strict(None).unwrap();
+        let after = play.snapshot().unwrap();
+        assert!(!after.stats.unknown.is_empty());
+        assert_eq!(after.stats.unknown, before.stats.unknown);
+        assert_eq!(after.unknown_persistent_reads, before.unknown_persistent_reads);
+        assert!(after.unknown_persistent_reads.contains(&(1, 60)));
+    }
+}
+
+#[test]
+fn the_bridge_is_registered_after_flower_as_an_explicit_line_trigger_never_an_arrival() {
+    let bridge = bridge_scene();
+    assert!(bridge.requires_exact_transaction());
+    assert!(!bridge.starts_on_arrival());
+    assert_eq!(scene(BRIDGE_SCENE_ID), Some(bridge.clone()));
+    let registered = scenes();
+    assert_eq!(registered.get(14).map(|s| s.id.as_str()), Some(BRIDGE_SCENE_ID));
+    assert_eq!(registered.get(15).map(|s| s.id.as_str()), Some(CARGO_TRAIN_SCENE_ID));
+    assert!(cargo_train_scene().starts_on_arrival() && cargo_train_scene().requires_exact_transaction());
+    assert_eq!(bridge.line_trigger(), Some(SceneLineTrigger { a: [-614, 835, 518], b: [-238, 835, 518] }));
+    assert!(bridge.prepare_story(&StoryState::at(39)).unwrap().supports_extended());
+}
+
+
+#[test]
+fn a_battle_resume_is_external_progress_for_the_same_thread() {
+    // The same BATTLE instruction loops without any intervening write or window. Its next
+    // execution must be a fresh checkpoint, not mistaken for an idle script loop.
+    let body = vec![vec![0x72, 8, 0], vec![0x70, 0, 72, 1], vec![0x12, 4]];
+    let field = field_of(script(vec![("a", vec![(1, body)])], vec![]));
+    let def = demo_def(vec![], start(0, 1));
+    let story = StoryState::at(4).into_extended().unwrap();
+    let mut play = ScenePlay::with_resources(&field, &def, &story, 1, Resources { gil: Some(10) }).unwrap();
+    play.next_strict(None).unwrap();
+    let Some(SceneBoundary::Battle(first)) = play.boundary() else { panic!() };
+    play.resume_battle_checked(BattleResume { checkpoint: first, resolution: BattleResolution::Victory, story, resources: Resources { gil: Some(20) } }).unwrap();
+    play.next_strict(None).unwrap();
+    let Some(SceneBoundary::Battle(second)) = play.boundary() else { panic!("{:?}", play.boundary()) };
+    assert_eq!(second, BattleCheckpoint { ordinal: 2, ..first });
+}
+
+
+#[test]
+fn a_battle_resume_wakes_a_parked_peer_to_observe_authoritative_state() {
+    let conditional = if_ub(1, 40, 0, 1, &message(0, 0));
+    let back = vec![0x12, conditional.len() as u8];
+    let field = field_of(script(vec![
+        ("director", vec![(1, vec![wait(1), vec![0x72, 8, 0], vec![0x70, 0, 72, 1]])]),
+        ("reader", vec![(1, vec![conditional, back])]),
+    ], texts(1)));
+    let def = demo_def(vec![], vec![Step::Start(ScriptRef::new(1, 1)), Step::Await(ScriptRef::new(0, 1))]);
+    let mut story = StoryState::at(4).into_extended().unwrap();
+    story.write_masked(1, 40, 0, 255).unwrap();
+    let mut play = ScenePlay::with_resources(&field, &def, &story, 1, Resources { gil: Some(10) }).unwrap();
+    play.next_strict(None).unwrap();
+    let Some(SceneBoundary::Battle(checkpoint)) = play.boundary() else { panic!() };
+    assert!(play.stats().parked > 0);
+    story.write_masked(1, 40, 1, 255).unwrap();
+    play.resume_battle_checked(BattleResume { checkpoint, resolution: BattleResolution::Victory, story, resources: Resources { gil: Some(20) } }).unwrap();
+    play.next_strict(None).unwrap();
+    let Some(SceneBoundary::Window(window)) = play.boundary() else { panic!("a parked peer must see the new afterimage") };
+    assert_eq!(window.entity, 1);
+}
+
+
+#[test]
+fn durable_replay_refuses_a_setup_question_or_a_malformed_question_default() {
+    let question = vec![0x31, 0xE7, 0x21, 0xE7, 0x22, 0xFF];
+    for setup in [false, true] {
+        let body = vec![ask(0, if setup { 1 } else { 9 }, 10, 5, 9), gold(0x3A, 1)];
+        let field = field_of(script(vec![("a", vec![(if setup { 0 } else { 1 }, body)])], vec![question.clone()]));
+        let mut def = demo_def(vec![], start(0, 1));
+        if setup { def.setup = vec![ScriptRef::new(0, 0)]; }
+        let story = StoryState::at(4).into_extended().unwrap();
+        let resources = Resources { gil: Some(10) };
+        let mut play = ScenePlay::with_resources(&field, &def, &story, 1, resources).unwrap();
+        assert_eq!(play.next_strict(None), Err(SceneError::ImplicitAnswer));
+        assert_eq!(run_to_end_with_resources_strict(&field, &def, &story, 1, resources, &[]), Err(SceneError::ImplicitAnswer));
+    }
+}
+
+
+#[test]
+fn strict_replay_rejects_missing_question_text_and_reversed_authored_choices() {
+    for instruction in [ask(99, 0, 0, 5, 9), ask(0, 2, 1, 5, 9)] {
+        let field = field_of(script(vec![("a", vec![(1, vec![instruction])])], vec![vec![0x31, 0xE7, 0x21, 0xE7, 0x22, 0xFF]]));
+        let def = demo_def(vec![], start(0, 1));
+        let mut play = ScenePlay::with_resources(&field, &def, &StoryState::at(4).into_extended().unwrap(), 1, Resources { gil: Some(0) }).unwrap();
+        assert_eq!(play.next_strict(None), Err(SceneError::ImplicitAnswer));
+    }
+}
+
+
+#[test]
+fn a_missing_message_cannot_be_omitted_from_a_durable_transcript() {
+    let field = field_of(script(vec![("a", vec![(1, vec![message(0, 99), setword(2, 0, 48)])])], texts(1)));
+    let def = demo_def(vec![], start(0, 1));
+    let story = StoryState::at(39).into_extended().unwrap();
+    let resources = Resources { gil: Some(10) };
+    let mut play = ScenePlay::with_resources(&field, &def, &story, 1, resources).unwrap();
+    assert_eq!(play.next_strict(None), Err(SceneError::WindowData));
+    assert_eq!(play.stats().unresolved, 1);
+    assert_eq!(run_to_end_with_resources_strict(&field, &def, &story, 1, resources, &[]), Err(SceneError::WindowData));
+    assert!(!run_to_end_with_resources(&field, &def, &story, 1, resources, &[]).unwrap().is_complete());
+}
+
+#[test]
+fn bridge_origin_is_quantized_validated_and_bound_into_the_replay_source() {
+    use fmv_core::Pos;
+    let field = field_of(script(vec![("a", vec![])], vec![]));
+    let def = bridge_scene();
+    let facing = crate::field_direction_to_facing(73);
+    let bound = with_trigger_position(&field, &def, Pos::new(25.4, 10.2, 0.0), facing, Some(0)).unwrap();
+    assert_eq!(bound.cast.iter().find(|m| m.entity == 1).unwrap().start, Some(Spot { x: 25, y: 10, triangle: 0, direction: 73 }));
+    let looked_up = with_trigger_position(&field, &def, Pos::new(25.4, 10.2, 0.0), facing, None).unwrap();
+    assert_eq!(looked_up, bound);
+    assert!(with_trigger_position(&field, &def, Pos::new(25.0, 10.0, 0.0), f32::MAX, Some(0)).is_ok(), "finite huge headings are normalized before integer conversion");
+    let changed = with_trigger_position(&field, &def, Pos::new(26.4, 10.2, 0.0), facing, Some(0)).unwrap();
+    assert_ne!(super::replay_identity::fingerprint(&[], &bound), super::replay_identity::fingerprint(&[], &changed));
+    for (pos, angle, hint) in [(Pos::new(f32::NAN, 0.0, 0.0), 0.0, None), (Pos::new(40_000.0, 0.0, 0.0), 0.0, None),
+        (Pos::new(25.0, 10.0, 0.0), f32::INFINITY, None), (Pos::new(25.0, 10.0, 0.0), 0.0, Some(u32::MAX)),
+        (Pos::new(-30_000.0, -30_000.0, 0.0), 0.0, None)] {
+        assert_eq!(with_trigger_position(&field, &def, pos, angle, hint), Err(SceneError::SceneOrigin));
+    }
+    assert_eq!(with_trigger_position(&field, &flower_station_scene(), Pos::new(25.0, 10.0, 0.0), 0.0, None), Err(SceneError::SceneOrigin));
 }

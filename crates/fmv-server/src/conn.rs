@@ -515,7 +515,7 @@ impl Conn {
 
         // 2. Who is this? Registration or token login, against the persistent store.
         let scene_save_epoch = shared.with_world(|world| world.scene_save_epoch());
-        let Login { account, avatar, progression, issued_token, progress, card } = self.authenticate(auth, character).await?;
+        let Login { account, avatar, progression, issued_token, progress, scene_state, scene_group, card } = self.authenticate(auth, character).await?;
         let registered = issued_token.is_some();
         if registered {
             // Until the Welcome with its token is known to be written, this account is released
@@ -531,12 +531,11 @@ impl Conn {
             migrated = card.migrated,
             "hello accepted"
         );
-        // A token login that is refused early (before `Welcome`) gets a quick answer; `World::join`
-        // re-checks it atomically because two handshakes can authenticate the same account at
-        // once. A brand-new account cannot be online, and nothing stands between its commit and
-        // its `Welcome`.
+        // A connected account is refused early; World::join rechecks atomically because two
+        // handshakes can authenticate at once. A durable reservation alone must reach admission:
+        // the world uses the coherent recovery snapshot to resume or reattach that participant.
         if !registered {
-            let (online, deleted) = shared.with_world(|w| (w.is_online(account), shared.deleted.contains(account)));
+            let (online, deleted) = shared.with_world(|w| (w.has_session(account), shared.deleted.contains(account)));
             if deleted {
                 // Deleted since the token was checked (or being deleted right now): to this login it is a token the
                 // server does not know.
@@ -602,6 +601,8 @@ impl Conn {
                 | ClientMsg::BattleCommand { .. }
                 | ClientMsg::RequestEncounter { .. }
                 | ClientMsg::SceneStep { .. }
+                | ClientMsg::SceneBattleReady { .. }
+                | ClientMsg::SceneRetry { .. }
                 | ClientMsg::SceneEnd { .. }
                 | ClientMsg::SceneLeave { .. }
                 | ClientMsg::SceneDebugPreview { .. } => {
@@ -614,7 +615,8 @@ impl Conn {
         self.guard = Some(JoinGuard { shared: Arc::clone(&shared), entity, session });
         let name = avatar.display_name.clone();
         let joined = {
-            let new = NewPlayer { session, entity, account, avatar, progression, progress, tx: self.tx.clone(), close: Arc::clone(&self.close) };
+            let new = NewPlayer { session, entity, account, avatar, progression, progress, scene_state, scene_group,
+                tx: self.tx.clone(), close: Arc::clone(&self.close) };
             shared.with_world(|world| {
                 // Checked here, under the world lock, against a delete that began after this login was
                 // authenticated: one of the two comes first (see `deletion`).
@@ -684,7 +686,8 @@ impl Conn {
                 }
                 ClientMsg::CannotJoin { area, .. } => self.travel(|w, now| w.cannot_join(entity, &area, now))?,
                 // Story scenes (see `world::scene`).
-                ClientMsg::SceneStep { .. } | ClientMsg::SceneEnd { .. } | ClientMsg::SceneLeave { .. } | ClientMsg::SceneDebugPreview { .. } => {
+                ClientMsg::SceneStep { .. } | ClientMsg::SceneBattleReady { .. } | ClientMsg::SceneRetry { .. }
+                | ClientMsg::SceneEnd { .. } | ClientMsg::SceneLeave { .. } | ClientMsg::SceneDebugPreview { .. } => {
                     self.on_scene(entity, msg)?
                 }
                 ClientMsg::Hello { .. } | ClientMsg::DeleteCharacter { .. } => {

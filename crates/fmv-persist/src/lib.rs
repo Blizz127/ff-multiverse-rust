@@ -48,6 +48,16 @@
 //!   further progress reads and mutations until reopening recovers it. Character saves preserve
 //!   receipts automatically. Receipt-bearing character records use schema 2; older servers must
 //!   not be used against these records or an outstanding intent.
+//! * **Co-op scene continuations commit every participant together.** [`Store::commit_scene_batch`]
+//!   persists a bounded owner checkpoint, the frozen roster's reservations, and all exact story
+//!   and character after-images through one recoverable intent. Battle results consume one
+//!   ordinal alongside rewards, inventory and limit gauges. Participants remain reserved through
+//!   scene resumption; finishing releases the guests and retains the owner's pending landing.
+//!   [`Store::get_scene_group`] recovers that complete roster from any participant. Ordinary
+//!   progress writes and trash rekeying refuse active continuations. The first batch durably
+//!   raises the index header to version 3 before its intent: older servers refuse the whole
+//!   store. Later compaction and snapshots retain this fence. Rollback requires a snapshot
+//!   taken before that first batch. Existing stores are not upgraded just by opening them.
 //! * **The story blob moves forward through one atomic step.** [`Progression`] (one opaque blob per
 //!   account and game, read only by the game's adapter) is written with [`Store::put_progression`] or,
 //!   when the new value depends on the old one, [`Store::update_progression`]: a read-modify-write under
@@ -139,4 +149,6 @@ pub use snapshot::{restore_snapshot, SnapshotInfo};
 pub use store::restyle::{Restyle, RestyleAdded, RestyleError, RestyleReport};
 pub use store::trash::{Deleted, Restored, TrashEntry, TrashState};
 pub use store::{Store, StoreOptions, DEFAULT_MAX_ACCOUNTS};
-pub use store::scene::{ProgressPair, SceneCommit, MAX_SCENE_RECEIPTS};
+pub use store::scene::{ProgressPair, SceneCommit, SceneBatchCommitted, SceneCheckpoint, SceneOperation,
+    SceneOperationKind, ScenePhase, SceneReservation, SceneState, MAX_SCENE_RECEIPTS,
+    MAX_SCENE_BATCH_ACCOUNTS, MAX_SCENE_CHECKPOINT_BYTES, MAX_SCENE_REPLAY_BYTES};

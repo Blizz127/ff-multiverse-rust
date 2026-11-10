@@ -13,9 +13,10 @@
 //! * `Face` turns it (the short way round), at once or over the frames it says.
 //! * `Show` hides or shows it.
 //! * The player resolves supported `Anim` loops, full Holds and explicit forward Holds against the actor's exact field model.
-//!   Full loops support ASPED 16 and 32 (normal and double speed), including a standing loop's rate changes without
-//!   restarting its phase. Loops and Holds follow scene time; a Hold stops at its last frame until replaced. A Once can
+//!   Loops and Holds support ASPED 16 and 32 (normal and double speed), including standing rate changes without
+//!   restarting their phase. Loops and Holds follow scene time; a Hold stops at its last frame until replaced. A Once can
 //!   restart a separately remembered, different default slot after its range or actual loaded clip length.
+//!   A full doubled Once can return to normal speed at an authored ASPED, retaining its pose and completion time.
 //!   Other animations clear that loop and are counted ([`Counts::anims_skipped`]), never guessed at.
 //! * `Sound` is routed separately by the scene player to its cancellable audio channel.
 //! * `Camera` is **recorded** ([`CameraState`]) with the stage's own clock of it ([`CameraClock`]); the window's field camera
@@ -78,7 +79,7 @@ struct Turn {
 struct SceneAnimation {
     clip: String,
     frame: ClipFrame,
-    /// Clip frames per scene frame; full loops and fresh full Holds support normal and doubled rates.
+    /// Clip frames per scene frame; supported loops, Holds and full Once clips run at normal or doubled rates.
     rate: f32,
     once: bool,
 }
@@ -193,7 +194,7 @@ impl Actor {
     pub fn full_once_return(&self) -> Option<&str> {
         if self.walk.is_some() { return None; }
         match self.animation.as_ref()?.frame {
-            ClipFrame::OnceFull { .. } => self.default_animation.as_ref().map(|default| default.clip.as_str()),
+            ClipFrame::OnceFull { .. } | ClipFrame::OnceFullDoubled { .. } | ClipFrame::OnceFullSlowed { .. } => self.default_animation.as_ref().map(|default| default.clip.as_str()),
             _ => None,
         }
     }
@@ -217,7 +218,8 @@ impl Actor {
             if let Some(animation) = &mut self.animation {
                 let advancing = match &mut animation.frame {
                     ClipFrame::Loop(frame) => Some(frame),
-                    ClipFrame::HoldRange { elapsed, .. } | ClipFrame::HoldFull { elapsed } | ClipFrame::OnceFull { elapsed } => Some(elapsed),
+                    ClipFrame::HoldRange { elapsed, .. } | ClipFrame::HoldFull { elapsed } | ClipFrame::OnceFull { elapsed }
+                    | ClipFrame::OnceFullDoubled { elapsed } | ClipFrame::OnceFullSlowed { elapsed, .. } => Some(elapsed),
                     ClipFrame::Hold(_) => None,
                 };
                 let animation_frames = if keep_animation { frames } else { (frames - moving_frames).max(0.0) };
@@ -404,11 +406,21 @@ impl Cast {
     /// Play one normal-speed forward range, holding its final frame. Loaded clip bounds are
     /// checked by the avatar pipeline before it samples any pose.
     pub fn apply_hold_range(&mut self, entity: u8, clip: &str, first: u8, last: u8, overshoot: f32) {
+        self.hold_range_at_rate(entity, clip, first, last, overshoot, 1.0);
+    }
+
+    /// A supported doubled forward Hold uses the same authored endpoints and holds its last
+    /// pose; only clip time advances twice as quickly as the stage clock.
+    pub fn apply_hold_range_doubled(&mut self, entity: u8, clip: &str, first: u8, last: u8, overshoot: f32) {
+        self.hold_range_at_rate(entity, clip, first, last, overshoot, 2.0);
+    }
+
+    fn hold_range_at_rate(&mut self, entity: u8, clip: &str, first: u8, last: u8, overshoot: f32, rate: f32) {
         let Some(actor) = self.actors.get_mut(&entity) else { return self.off_cast() };
         actor.replace_kept_animation();
-        let elapsed = if overshoot.is_finite() { overshoot.max(0.0) } else { 0.0 };
+        let elapsed = if overshoot.is_finite() { overshoot.max(0.0) * rate } else { 0.0 };
         actor.movement_animation = None;
-        actor.animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::HoldRange { first, last, elapsed }, rate: 1.0, once: false });
+        actor.animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::HoldRange { first, last, elapsed }, rate, once: false });
     }
 
     /// Play from frame zero at the normal or supported doubled rate, holding the loaded clip's
@@ -437,11 +449,23 @@ impl Cast {
     /// A full Once carries its elapsed time and known different default to the avatar cache.
     /// Only that cache knows the actual loaded clip length; no guessed deadline ends this pose.
     pub fn apply_once_full(&mut self, entity: u8, slot: u8, clip: &str, overshoot: f32) -> bool {
+        self.once_full_at_rate(entity, slot, clip, overshoot, false)
+    }
+
+    /// A full Once at doubled speed, returning to the same verified normal standing default.
+    /// The avatar cache converts the gesture's excess clip time back to scene time on return.
+    pub fn apply_once_full_doubled(&mut self, entity: u8, slot: u8, clip: &str, overshoot: f32) -> bool {
+        self.once_full_at_rate(entity, slot, clip, overshoot, true)
+    }
+
+    fn once_full_at_rate(&mut self, entity: u8, slot: u8, clip: &str, overshoot: f32, doubled: bool) -> bool {
         let Some(actor) = self.actors.get_mut(&entity) else { return false };
         if actor.walk.is_some() || !actor.default_animation.as_ref().is_some_and(|default| default.slot != slot) { return false; }
-        let elapsed = if overshoot.is_finite() { overshoot.max(0.0) } else { 0.0 };
+        let rate = if doubled { 2.0 } else { 1.0 };
+        let elapsed = if overshoot.is_finite() { overshoot.max(0.0) * rate } else { 0.0 };
+        let frame = if doubled { ClipFrame::OnceFullDoubled { elapsed } } else { ClipFrame::OnceFull { elapsed } };
         actor.movement_animation = None;
-        actor.animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::OnceFull { elapsed }, rate: 1.0, once: true });
+        actor.animation = Some(SceneAnimation { clip: clip.to_string(), frame, rate, once: true });
         true
     }
 
@@ -540,11 +564,29 @@ impl Cast {
                 let Some(actor) = self.actors.get_mut(entity) else { return self.off_cast() };
                 // ASPED 16 is one clip frame per scene frame, 32 is two. The player advances
                 // precisely to each event: changing a standing loop's rate keeps its current phase.
-                // Do not infer a rate for a movement, held pose, Once, or an unsupported speed.
+                // A standing Hold preserves its phase and known default. The bridge also returns
+                // a doubled full Once to normal speed; retain that one rate boundary so the avatar
+                // can resolve completion against the loaded length without guessing it here.
                 if actor.walk.is_none() && matches!(speed, 16 | 32) {
-                    if let Some(SceneAnimation { frame: ClipFrame::Loop(_), rate, once: false, .. }) = &mut actor.animation {
-                        *rate = if *speed == 32 { 2.0 } else { 1.0 };
-                        return;
+                    // Setup can name a verified standing default before any scene clip plays.
+                    // Cargo's first ASPED precedes its first Hold: no active phase needs changing,
+                    // and discarding that metadata would make the later Once unable to return.
+                    if actor.animation.is_none() && actor.movement_animation.is_none() { return; }
+                    if let Some(animation) = &mut actor.animation {
+                        if !animation.once {
+                            animation.rate = if *speed == 32 { 2.0 } else { 1.0 };
+                            return;
+                        }
+                        match animation.frame {
+                            ClipFrame::OnceFullDoubled { elapsed } if *speed == 16 => {
+                                animation.frame = ClipFrame::OnceFullSlowed { elapsed, doubled_until: elapsed };
+                                animation.rate = 1.0;
+                                return;
+                            }
+                            ClipFrame::OnceFullDoubled { .. } if *speed == 32 => return,
+                            ClipFrame::OnceFullSlowed { .. } if *speed == 16 => return,
+                            _ => {},
+                        }
                     }
                 }
                 actor.replace_kept_animation();
@@ -622,7 +664,118 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_rates_and_non_loop_speed_changes_keep_the_existing_fallback() {
+    fn doubled_ranges_hold_the_authored_endpoint_and_replacements_reset_the_rate() {
+        let mut cast = Cast::new([1]);
+        cast.apply(&place(1, 0, 0), 0.0, &flat);
+        cast.apply_loop(1, 0, "idle", 0.0, false);
+        cast.apply_hold_range_doubled(1, "gesture", 15, 29, 1.25);
+        let frame = cast.actor(1).unwrap().animation().unwrap().1;
+        assert_eq!(frame.in_clip(30), Some(17.5), "late delivery is scaled once");
+        cast.advance(5.75);
+        assert_eq!(cast.actor(1).unwrap().animation().unwrap().1.in_clip(30), Some(29.0));
+        cast.advance(100.0);
+        assert_eq!(cast.actor(1).unwrap().animation().unwrap().1.in_clip(30), Some(29.0), "holding never wraps");
+        cast.apply_hold_range(1, "normal", 1, 7, 1.0);
+        cast.advance(1.0);
+        assert_eq!(cast.actor(1).unwrap().animation().unwrap().1.in_clip(8), Some(3.0), "replacement restores normal rate");
+        cast.apply_hold_range_doubled(1, "gesture", 0, 14, 0.0);
+        cast.apply_loop(1, 0, "idle", 0.0, false);
+        cast.advance(4.0);
+        assert_eq!(cast.actor(1).unwrap().animation(), Some(("idle", ClipFrame::Loop(4.0))));
+        cast.apply_hold_range_doubled(1, "gesture", 0, 14, 0.0);
+        cast.apply(&walk(1, 20, 0, 3), 0.0, &flat);
+        cast.advance(30.0);
+        assert_eq!(cast.actor(1).unwrap().animation(), None, "movement permanently replaces a Hold");
+    }
+
+    #[test]
+    fn doubled_full_once_keeps_its_return_and_cancels_cleanly_for_replacement_and_movement() {
+        let mut cast = Cast::new([1]);
+        cast.apply(&place(1, 0, 0), 0.0, &flat);
+        assert!(!cast.apply_once_full_doubled(1, 3, "gesture", 0.0), "no guessed default");
+        cast.apply_loop(1, 0, "idle", 0.0, false);
+        assert!(!cast.apply_once_full_doubled(1, 0, "idle", 0.0), "same-slot phase remains unsupported");
+        assert!(cast.apply_once_full_doubled(1, 3, "gesture", 1.25));
+        cast.advance(0.5);
+        let actor = cast.actor(1).unwrap();
+        assert_eq!(actor.animation(), Some(("gesture", ClipFrame::OnceFullDoubled { elapsed: 3.5 })));
+        assert_eq!(actor.full_once_return(), Some("idle"));
+        assert_eq!(actor.animation().unwrap().1.in_clip(4), Some(3.0));
+        cast.advance(0.75);
+        assert_eq!(cast.actor(1).unwrap().animation().unwrap().1.return_elapsed(4), Some(0.5));
+        assert!(cast.apply_once_full_doubled(1, 3, "gesture", 0.0));
+        assert_eq!(cast.actor(1).unwrap().animation().unwrap().1, ClipFrame::OnceFullDoubled { elapsed: 0.0 }, "repeat starts afresh");
+        cast.apply_hold(1, "pose", 2);
+        cast.advance(50.0);
+        assert_eq!(cast.actor(1).unwrap().animation(), Some(("pose", ClipFrame::Hold(2))));
+        assert_eq!(cast.actor(1).unwrap().full_once_return(), None, "no delayed return after replacement");
+        assert!(cast.apply_once_full_doubled(1, 3, "gesture", 0.0));
+        cast.apply(&walk(1, 20, 0, 3), 0.0, &flat);
+        cast.advance(5.0);
+        assert_eq!(cast.actor(1).unwrap().animation(), Some(("idle", ClipFrame::Loop(2.0))), "arrival resumes default at normal speed");
+        assert_eq!(cast.actor(1).unwrap().full_once_return(), None);
+        for late in [f32::NAN, f32::INFINITY, -4.0] {
+            assert!(cast.apply_once_full_doubled(1, 3, "gesture", late));
+            assert_eq!(cast.actor(1).unwrap().animation().unwrap().1, ClipFrame::OnceFullDoubled { elapsed: 0.0 });
+        }
+    }
+
+    #[test]
+    fn bridge_hold_then_fast_once_then_normal_rate_preserves_the_verified_default() {
+        let mut cast = Cast::new([1]);
+        cast.apply_loop(1, 0, "idle", 0.0, false);
+        cast.apply_hold_full(1, "waiting", 0.0, false);
+        cast.advance(25.0);
+        cast.apply(&Stage::AnimSpeed { entity: 1, speed: 32 }, 0.0, &flat);
+        assert!(cast.apply_once_full_doubled(1, 4, "gesture", 0.0), "supported Hold rate change keeps the known standing slot");
+        cast.advance(7.0);
+        cast.apply(&Stage::AnimSpeed { entity: 1, speed: 16 }, 0.0, &flat);
+        let frame = cast.actor(1).unwrap().animation().unwrap().1;
+        assert_eq!(frame, ClipFrame::OnceFullSlowed { elapsed: 14.0, doubled_until: 14.0 });
+        assert_eq!(frame.in_clip(15), Some(14.0), "the owned gesture has fifteen frames");
+        cast.advance(0.5);
+        let frame = cast.actor(1).unwrap().animation().unwrap().1;
+        assert_eq!(frame.in_clip(15), Some(14.0));
+        assert_eq!(frame.return_elapsed(15), None);
+        cast.advance(1.0);
+        let actor = cast.actor(1).unwrap();
+        assert_eq!(actor.animation().unwrap().1.return_elapsed(15), Some(0.5));
+        assert_eq!(actor.full_once_return(), Some("idle"));
+        assert_eq!(cast.counts().anims_skipped, 0);
+    }
+
+    #[test]
+    fn cargo_speed_before_the_first_clip_preserves_setup_default_for_its_later_once() {
+        let mut cast = Cast::new([12]);
+        cast.remember_default(12, 0, "adcb");
+        cast.apply(&place(12, 96, 22), 0.0, &flat);
+        // The first ASPED appears before any visible clip, then bounded doubled Holds and
+        // a full doubled Hold run before the script restores normal speed.
+        cast.apply(&Stage::AnimSpeed { entity: 12, speed: 32 }, 0.0, &flat);
+        assert_eq!(cast.actor(12).unwrap().animation(), None, "remembering a default does not start or retime an idle");
+        cast.apply_hold_range_doubled(12, "cdaf", 0, 14, 0.0);
+        cast.advance(8.0);
+        cast.apply_hold_range_doubled(12, "cdbb", 15, 29, 0.0);
+        cast.advance(8.0);
+        cast.apply(&Stage::AnimSpeed { entity: 12, speed: 32 }, 0.0, &flat);
+        cast.apply_hold_full(12, "cdbc", 0.0, true);
+        cast.advance(18.0);
+        cast.apply(&Stage::AnimSpeed { entity: 12, speed: 16 }, 0.0, &flat);
+        cast.apply_hold_range(12, "cdbb", 15, 29, 0.0);
+        cast.advance(58.0);
+        assert!(cast.apply_once_full(12, 8, "cdbd", 0.0), "the distinct setup default survives until the authored Once");
+        assert_eq!(cast.actor(12).unwrap().full_once_return(), Some("adcb"));
+        assert_eq!(cast.counts().anims_skipped, 0);
+        // Unsupported speed still invalidates an unplayed default; it cannot be used to
+        // manufacture a later supported restoration target.
+        let mut unsupported = Cast::new([12]);
+        unsupported.remember_default(12, 0, "adcb");
+        unsupported.apply(&Stage::AnimSpeed { entity: 12, speed: 48 }, 0.0, &flat);
+        assert!(!unsupported.apply_once_full(12, 8, "cdbd", 0.0));
+    }
+
+    #[test]
+    fn unsupported_rates_and_unhandled_once_or_moving_speed_changes_keep_the_existing_fallback() {
         for speed in [0, 8, 24, 48, u16::MAX] {
             let mut cast = Cast::new([1]);
             cast.apply_loop(1, 3, "three", 2.0, true);
@@ -632,12 +785,11 @@ mod tests {
             assert_eq!(cast.counts().anims_skipped, 1);
         }
         for speed in [16, 32] {
-            for mode in 0..4 {
+            for mode in 1..4 {
                 let mut cast = Cast::new([1]);
                 cast.apply(&place(1, 0, 0), 0.0, &flat);
                 cast.apply_loop(1, 3, "three", 0.0, false);
                 match mode {
-                    0 => cast.apply_hold_full(1, "four", 0.0, true),
                     1 => { assert!(cast.apply_once(1, 4, "four", 0, 9, 0.0)); },
                     2 => { assert!(cast.apply_once_full(1, 4, "four", 0.0)); },
                     _ => cast.apply(&walk(1, 100, 0, 10), 0.0, &flat),

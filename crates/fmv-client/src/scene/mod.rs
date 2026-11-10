@@ -28,10 +28,11 @@
 //!
 //! # Honest limits
 //!
-//! * Matching field-model cast can play full-range default loops at normal or double speed, full Holds and explicit forward Hold ranges. Canonical appearance
+//! * Matching field-model cast can play full-range default loops, full Holds and explicit forward Hold ranges at normal or double speed. Canonical appearance
 //!   substitutions and unsupported animation forms keep their usual clips; skipped events are counted ([`stage::Counts`]).
 //!   A standing loop yields to movement; moving replaces a held pose or range. A full or bounded Once can return to a known,
-//!   different default slot. A standing full loop preserves its phase when ASPED changes between 16 and 32. Same-slot returns,
+//!   different default slot. Full Once also supports double speed and its authored reset to normal.
+//!   Standing loops and Holds preserve phase when ASPED changes between 16 and 32. Same-slot returns,
 //!   unknown defaults, cropped loops and other dynamic rates remain unsupported. Ordinary MOVE can resolve its original walk/run slot on that same model;
 //!   its clip starts at zero for each move, so same-slot phase/rate retention across repeated moves is not reproduced.
 //! * The scene's camera moves are recorded ([`stage::CameraState`], on the stage's own clock) and shown by the window's field
@@ -40,7 +41,9 @@
 //!   opened it.
 //! * Durations (a walk's length) are the interpreter's estimates: the picture is paced by them.
 //! * A private bar scene may use Echo-S after its choice paths are checked against the original. A scene with watchers
-//!   stays on the original because Echo-S has different window counts; other scenes are not yet Echo-S enabled.
+//!   or durable combat stays on the original because replay requires the same source and exact window identities.
+//! * Durable combat pauses the local stage until the matching server victory is committed and the battle result panel
+//!   closes. A defeated attempt keeps its scene held for an explicit retry; it never advances the script as a victory.
 
 mod bot;
 mod client;
@@ -56,10 +59,12 @@ mod trigger;
 mod shots;
 #[cfg(test)]
 pub(crate) mod tests;
+#[cfg(test)]
+mod continuation_tests;
 
 pub use bot::{pick_probe, Act, SceneBot, SceneBotConfig, Senses};
 pub use client::{clean_id, SceneClient};
-pub use draw::{camera_shot, cast_players, label_hidden, place_witnesses, speaker_spot, visible_npcs};
+pub use draw::{camera_shot, cast_players, label_hidden, participant_label_hidden, place_witnesses, speaker_spot, visible_npcs};
 pub use keys::{route_key, SceneRoute};
 pub use player::{SceneCmd, SceneSound, SoundAction};
 pub use source::Ff7Scenes;

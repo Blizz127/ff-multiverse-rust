@@ -87,13 +87,13 @@ struct Played {
 /// whenever our gauge is full (one command at a time), and check the end.
 async fn play(j: &mut Joined, rules: &SyntheticRules) -> Played {
     let start = j.client.until("EncounterStart", |m| matches!(m, ServerMsg::EncounterStart { .. }).then(|| m.clone())).await;
-    let ServerMsg::EncounterStart { battle_id, formation_id, seed, party, preemptive, back_attack, battle_speed, ticks_per_second, data_fingerprint } =
+    let ServerMsg::EncounterStart { battle_id, formation_id, seed, party, initial_party, escape_policy, preemptive, back_attack, battle_speed, ticks_per_second, data_fingerprint } =
         start.clone()
     else {
         unreachable!()
     };
     assert_eq!(data_fingerprint, rules.data_fingerprint());
-    let setup = BattleSetup { formation_id, seed, party: party.clone(), preemptive, back_attack, battle_speed, ticks_per_second };
+    let setup = BattleSetup { formation_id, seed, party: party.clone(), initial_party, escape_policy, preemptive, back_attack, battle_speed, ticks_per_second };
     let mut replay = BattleReplay::start(rules, &setup).expect("the client builds the battle from its own data");
     let mine = ActorId(party.iter().position(|m| m.entity() == Some(j.entity)).expect("we are in the party") as u8);
     let (mut pending, mut events, mut commands_sent, mut updates_during_battle) = (false, 0, 0, 0);

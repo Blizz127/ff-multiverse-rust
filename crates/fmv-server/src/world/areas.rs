@@ -427,6 +427,9 @@ impl World {
         self.settle(entity, true, failed);
         // (a player in a debug scene preview is told the made-up story its talks read from)
         self.scene_entered(entity, failed);
+        // A durable replay or landing owns entry until its checkpoint is resolved. Its
+        // messages follow the snapshot, and ordinary entry scripts cannot race its save.
+        if self.continuation_entered(entity, now) { return; }
         // What the area's own scripts do by themselves from the first frame on moves the story of whoever stands
         // there (the points that fire on entry; a no-op in an area without any).
         self.enter_story(entity, now);
@@ -538,7 +541,7 @@ impl World {
     }
 
     /// The game of the entry area (every other area must be of the same one).
-    fn home_game(&self) -> fmv_core::GameId {
+    pub(super) fn home_game(&self) -> fmv_core::GameId {
         self.areas.get(&self.home).map_or(fmv_core::GameId::Fixture, |a| a.id.game)
     }
 
@@ -673,6 +676,11 @@ impl World {
     pub fn cannot_join(&mut self, entity: EntityId, area: &AreaId, now: Instant) -> TravelReply {
         let Some(p) = self.players.get(&entity) else { return TravelReply::Gone };
         let Some(transit) = p.transit.clone() else { return TravelReply::NotTravelling };
+        if self.continuation_held(entity) {
+            self.continuation_failed_entry(entity);
+            return TravelReply::Refused(RejectCode::ContentMismatch,
+                "the durable scene destination could not be loaded; reconnect with matching game data".to_string());
+        }
         self.logs.info(format!("client cannot hold the area it was sent to entity={} area={}", entity.0, clip_text(&area.to_string())));
         if transit.bounced {
             return TravelReply::Refused(RejectCode::ContentMismatch, "you cannot hold the area you came from either".to_string());
@@ -792,7 +800,7 @@ mod tests {
         let close_rx = close.subscribe();
         let avatar = AvatarAppearance { display_name: name.into(), tint: [1, 2, 3], appearance_ref: None };
         let account = AccountId(entity.0);
-        w.join(NewPlayer { session, entity, account, avatar, progression: progression.to_vec(), progress: Default::default(), tx, close }, now)
+        w.join(NewPlayer { session, entity, account, avatar, progression: progression.to_vec(), progress: Default::default(), scene_state: None, scene_group: Vec::new(), tx, close }, now)
             .expect("joins");
         Seat { entity, account, rx, close: close_rx }
     }
@@ -1274,6 +1282,7 @@ mod tests {
         let mut b = seat(&mut w, "B", t0);
         let mut now = t0;
         walk_to(&mut w, &a, NEAR, 0.0, &mut now);
+        w.players.get_mut(&a.entity).unwrap().snapshot.facing = 1.25;
         a.drain();
         b.drain();
         walk_to(&mut w, &a, FAR, 0.0, &mut now);
@@ -1284,9 +1293,10 @@ mod tests {
         assert_eq!(w.cannot_join(a.entity, area, now), TravelReply::Done);
         let back = area_change(&a.drain());
         match &back {
-            ServerMsg::AreaChange { area, arrival, .. } => {
+            ServerMsg::AreaChange { area, arrival, arrival_facing, .. } => {
                 assert_eq!(area.key, HALL);
                 assert_eq!((arrival.x, arrival.y), (NEAR, 0.0), "where it stood before the crossing move");
+                assert_eq!(*arrival_facing, 1.25, "the facing from before the crossing, too");
             }
             other => panic!("{other:?}"),
         }

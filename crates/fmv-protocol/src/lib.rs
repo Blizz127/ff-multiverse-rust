@@ -1,4 +1,10 @@
-//! FF Multiverse wire protocol v19.
+//! FF Multiverse wire protocol v20.
+//!
+//! v20 adds durable scene battle continuations: required replay metadata in [`ServerMsg::SceneStart`],
+//! [`ClientMsg::SceneBattleReady`], [`ClientMsg::SceneRetry`] and the server's battle-start, resume and
+//! game-over notifications. A suspended scene remains held across combat and resumes only after the
+//! server has saved its result. Older peers cannot maintain that hold or reconstruct its accepted
+//! history, so v19 peers are refused at the handshake.
 //!
 //! v19 adds the required `gil` snapshot to [`ServerMsg::SceneStart`]: every participant replays a scene's
 //! money-dependent branches against the same starting balance chosen by the server. An older client would ignore
@@ -411,14 +417,15 @@ pub mod scene;
 pub use character::{clip_character_name, CharacterCard, NewCharacter, MAX_CHARACTER_NAME_CHARS, MAX_CHARACTER_REF_CHARS};
 pub use reject::RejectCode;
 pub use scene::{
-    SceneOutcome, SceneParticipant, SceneRefusal, SceneRole, SceneRunId, MAX_SCENE_ID_CHARS, MAX_SCENE_STEPS, MAX_SCENE_WATCHERS, SCENE_NPC_ID_BASE,
+    SceneOrigin, SceneOutcome, SceneParticipant, SceneRefusal, SceneReplay, SceneReplayEvent, SceneRole, SceneRunId,
+    MAX_SCENE_IDENTITY_BYTES, MAX_SCENE_ID_CHARS, MAX_SCENE_REPLAY_EVENTS, MAX_SCENE_STEPS, MAX_SCENE_WATCHERS, SCENE_NPC_ID_BASE,
 };
 
 /// The battle wire types (the engine's own `BattleEvent`, `Command` and `Outcome` stay under
 /// [`battle`], where their names say what they are).
 pub use battle::{
     assign_drops, reward_roster, split_rewards, ActionRef, ActorId, AppliedCommand, BattleBuildError, BattleId, BattleMember,
-    BattleRejection, BattleReplay, BattleReward, BattleRules, BattleSetup, Controller, Divergence, Ff7BattleData,
+    BattleInitialState, BattleRejection, BattleReplay, BattleReward, BattleRules, BattleSetup, Controller, Divergence, EscapePolicy, Ff7BattleData,
     Ff7BattleDataError, FormationInfo, ProgressLimits, Status, StatusSet, SyntheticRules, Target, MAX_BATTLE_PARTY,
     PLAYER_LIMIT_BREAKS,
 };
@@ -430,8 +437,8 @@ pub use fmv_party::{
     PartyEvent, PartyId, Placement,
 };
 
-// Older peers cannot supply or use the starting balance required for deterministic scene playback.
-pub const PROTOCOL_VERSION: u16 = 19;
+// Older peers cannot hold, recover or resume a scene across an acknowledged battle transaction.
+pub const PROTOCOL_VERSION: u16 = 20;
 /// Hard cap on a single frame payload (bytes).
 pub const MAX_FRAME: u32 = 256 * 1024;
 
@@ -440,6 +447,13 @@ pub const MAX_FRAME: u32 = 256 * 1024;
 pub const MAX_STORY_PROGRESS_BYTES: usize = 8 * 1024;
 /// Default TCP port for development. Deployment port is UNASSIGNED (see DEPLOYMENT-CONTRACT.md).
 pub const DEFAULT_DEV_PORT: u16 = 47_770;
+
+/// A newly required nullable field must be present even when its value is null. Plain Option
+/// deserialization otherwise accepts an omitted field, silently importing an older peer's setup.
+fn required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where D: serde::Deserializer<'de>, T: Deserialize<'de> {
+    Option::<T>::deserialize(deserializer)
+}
 
 /// A secret string (an account token). It serializes as a plain JSON string, but `Debug` never
 /// shows it, so a message printed with `{:?}` (a log line, a failed assertion) cannot leak it.
@@ -538,6 +552,8 @@ pub enum PartyFailure {
     UnknownPlayer,
     /// Too many invites too quickly.
     RateLimited,
+    /// A durable story scene holds an affected player or party until its continuation finishes.
+    Busy,
 }
 
 impl fmt::Display for PartyFailure {
@@ -546,6 +562,7 @@ impl fmt::Display for PartyFailure {
             PartyFailure::Rules(e) => write!(f, "{e}"),
             PartyFailure::UnknownPlayer => f.write_str("that player is not here"),
             PartyFailure::RateLimited => f.write_str("too many invites; wait a moment"),
+            PartyFailure::Busy => f.write_str("finish the current story scene before changing the party"),
         }
     }
 }
@@ -615,6 +632,11 @@ pub enum ClientMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         answer: Option<u8>,
     },
+    /// The owner's local stage reached the battle boundary after these windows. This requests no
+    /// formation or result: the server verifies the exact boundary against its accepted transcript.
+    SceneBattleReady { run: SceneRunId, ordinal: u32, step: u32 },
+    /// The held owner asks to retry a game-over battle from its durable prebattle checkpoint.
+    SceneRetry { run: SceneRunId },
     /// The scene OWNER's client played run `run` to its end (`skipped: false`) or skipped it. The server ends the run
     /// and applies any story write the scene's script makes, once. See [`scene`].
     SceneEnd { run: SceneRunId, skipped: bool },
@@ -715,6 +737,12 @@ pub enum ServerMsg {
         back_attack: bool,
         battle_speed: u8,
         ticks_per_second: u32,
+        /// A field script can forbid escape even when the formation would allow it.
+        escape_policy: EscapePolicy,
+        /// Authoritative starting HP/MP and carried status/limit, by roster actor index. Explicit
+        /// null keeps an ordinary fresh battle; v20 peers must always supply the field.
+        #[serde(deserialize_with = "required_option")]
+        initial_party: Option<Vec<BattleInitialState>>,
         data_fingerprint: Fingerprint,
     },
     /// One operation on the battle engine and what it produced; `tick` is the engine's tick counter
@@ -781,6 +809,10 @@ pub enum ServerMsg {
         /// Starting gil of the account whose story the scene plays in, shared by all participants.
         /// Required since v19: omitting it must never silently choose a zero-balance branch.
         gil: u32,
+        /// Required since v20. `None` is an ordinary scene; `Some` selects durable continuation
+        /// playback, even when its accepted history is empty. Replay uses the original inputs above.
+        #[serde(deserialize_with = "scene::required_replay")]
+        replay: Option<SceneReplay>,
         owner: EntityId,
         participants: Vec<SceneParticipant>,
         you: SceneRole,
@@ -793,6 +825,22 @@ pub enum ServerMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         answer: Option<u8>,
     },
+    /// The saved scene boundary is starting this authoritative battle. The following EncounterStart
+    /// carries its setup. The scene remains held and its stage is suspended, not ended.
+    SceneBattleStarted { run: SceneRunId, ordinal: u32, battle_id: BattleId },
+    /// A victorious battle and all participant resource changes are durable. Rebase the scene on
+    /// the owner's acknowledged story/gil, then continue its suspended interpreter exactly once.
+    SceneBattleResumed {
+        run: SceneRunId,
+        ordinal: u32,
+        battle_id: BattleId,
+        #[serde(deserialize_with = "scene::replay_progress")]
+        progress: Vec<u8>,
+        gil: u32,
+    },
+    /// The battle ended in game over. Keep the scene held at its recoverable checkpoint until the
+    /// owner requests SceneRetry; this does not release control like SceneEnded does.
+    SceneGameOver { run: SceneRunId, ordinal: u32, battle_id: BattleId },
     /// Run `run` is over, as the server saw it: give control and camera back.
     SceneEnded { run: SceneRunId, outcome: SceneOutcome },
     /// A scene request of this client was refused (`SceneDebugPreview`, or an OK on a trigger that cannot start now).
@@ -944,8 +992,8 @@ mod tests {
     }
 
     #[test]
-    fn the_version_is_nineteen() {
-        assert_eq!(PROTOCOL_VERSION, 19);
+    fn the_version_is_twenty() {
+        assert_eq!(PROTOCOL_VERSION, 20);
     }
 
     // -----------------------------------------------------------------------------------------
@@ -1542,13 +1590,15 @@ mod tests {
                 back_attack: true,
                 battle_speed: 128,
                 ticks_per_second: 60,
+                escape_policy: EscapePolicy::Formation,
+                initial_party: None,
                 data_fingerprint: Fingerprint([0xcd; 32]),
             },
             concat!(
                 r#"{"EncounterStart":{"battle_id":1,"formation_id":517,"seed":12345,"party":["#,
                 r#"{"controller":{"Player":{"entity":10,"account":20}},"name":"Blizz","character":0,"level":6,"weapon":null,"armor":null,"limit":0},"#,
                 r#"{"controller":{"Player":{"entity":11,"account":21}},"name":"Red XIII","character":1,"level":7,"weapon":3,"armor":4,"limit":137}],"#,
-                r#""preemptive":false,"back_attack":true,"battle_speed":128,"ticks_per_second":60,"data_fingerprint":""#,
+                r#""preemptive":false,"back_attack":true,"battle_speed":128,"ticks_per_second":60,"escape_policy":"Formation","initial_party":null,"data_fingerprint":""#,
                 "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
                 r#""}}"#
             ),
@@ -1565,6 +1615,8 @@ mod tests {
                 back_attack: false,
                 battle_speed: 0,
                 ticks_per_second: 240,
+                escape_policy: EscapePolicy::Formation,
+                initial_party: None,
                 data_fingerprint: Fingerprint([0xab; 32]),
             },
             concat!(
@@ -1573,7 +1625,7 @@ mod tests {
                 r#"{"controller":"Companion","name":"Barret","character":1,"level":7,"weapon":null,"armor":null,"limit":0},"#,
                 r#"{"controller":{"Player":{"entity":10,"account":20}},"name":"Blizz","character":0,"level":6,"weapon":null,"armor":null,"limit":0},"#,
                 r#"{"controller":{"Player":{"entity":11,"account":21}},"name":"Red XIII","character":1,"level":7,"weapon":3,"armor":4,"limit":137}],"#,
-                r#""preemptive":false,"back_attack":false,"battle_speed":0,"ticks_per_second":240,"data_fingerprint":""#,
+                r#""preemptive":false,"back_attack":false,"battle_speed":0,"ticks_per_second":240,"escape_policy":"Formation","initial_party":null,"data_fingerprint":""#,
                 "abababababababababababababababababababababababababababababababab",
                 r#""}}"#
             ),
@@ -2329,8 +2381,35 @@ mod tests {
         assert!(decode::<BattleMember>(br#"{"controller":"Companion","name":"x","character":0,"level":1,"weapon":null,"armor":null,"limit":0,"status":"Poison"}"#).is_err());
     }
 
-    /// No battle message can carry anything but ids, seeds, numbers and the engine's events: the
-    /// fields of the largest one are all fixed-size numbers, flags, ids and a fingerprint.
+    /// A continuation's setup cannot silently fall back to full health or formation escape rules.
+    #[test]
+    fn battle_continuation_setup_requires_explicit_escape_and_carried_resources() {
+        let initial = BattleInitialState { hp: 301, mp: 27, status: StatusSet::from_bits(16), limit: 137 };
+        golden(initial, r#"{"hp":301,"mp":27,"status":16,"limit":137}"#);
+        golden(EscapePolicy::Forbidden, r#""Forbidden""#);
+        for initial_party in [None, Some(vec![initial, initial])] {
+            let message = ServerMsg::EncounterStart {
+                battle_id: BattleId(8), formation_id: 328, seed: 42, party: members(),
+                preemptive: false, back_attack: false, battle_speed: 128, ticks_per_second: 60,
+                escape_policy: EscapePolicy::Forbidden, initial_party, data_fingerprint: Fingerprint([0xab; 32]),
+            };
+            let frame = encode(&message).unwrap();
+            assert_eq!(decode::<ServerMsg>(&frame[4..]).unwrap(), message);
+            for field in ["escape_policy", "initial_party"] {
+                let mut damaged = serde_json::to_value(&message).unwrap();
+                damaged["EncounterStart"].as_object_mut().unwrap().remove(field);
+                let error = decode::<ServerMsg>(&serde_json::to_vec(&damaged).unwrap()).unwrap_err();
+                assert!(error.to_string().contains(&format!("missing field `{field}`")), "{error}");
+            }
+        }
+        for field in ["hp", "mp", "status", "limit"] {
+            let mut damaged = serde_json::to_value(initial).unwrap();
+            damaged.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<BattleInitialState>(damaged).is_err(), "missing {field} lost carried resources");
+        }
+    }
+
+    /// No battle message carries game data, even with a complete carried party state.
     #[test]
     fn a_battle_start_is_small_and_carries_no_game_data() {
         let msg = ServerMsg::EncounterStart {
@@ -2358,6 +2437,8 @@ mod tests {
             back_attack: false,
             battle_speed: u8::MAX,
             ticks_per_second: u32::MAX,
+            escape_policy: EscapePolicy::Forbidden,
+            initial_party: Some(vec![BattleInitialState { hp: u32::MAX, mp: u32::MAX, status: StatusSet::from_bits(u32::MAX), limit: u16::MAX }; MAX_BATTLE_PARTY]),
             data_fingerprint: Fingerprint([0xff; 32]),
         };
         let frame = encode(&msg).unwrap();

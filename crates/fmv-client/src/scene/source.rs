@@ -11,7 +11,7 @@
 //!
 //! Nothing here carries game text or bytes out of the process: a failure is described in ids and error kinds only.
 
-use fmv_ff7::script::scene::{scene, scenes, trigger_npc, Beat, SceneDef, ScenePlay, SceneResources, Stage};
+use fmv_ff7::script::scene::{scene, scenes, trigger_npc, BattleCheckpoint, BattleResolution, BattleResume, Beat, SceneBoundary, SceneDef, ScenePlay, SceneResources, Stage, WindowAck};
 use fmv_ff7::script::dialogue::End;
 use fmv_ff7::story::StoryState;
 use fmv_ff7::Ff7Adapter;
@@ -26,6 +26,14 @@ pub trait SceneSource {
     /// The next beat: the stage events up to the next window and that window (or the end). `answer` is the answer to the
     /// window handed out last when it asked (the absolute line number the player chose).
     fn next(&mut self, answer: Option<usize>) -> Beat;
+
+    /// Durable continuations use the original script's exact boundaries and source identity.
+    fn fingerprint(&self) -> Option<[u8; 32]> { None }
+    fn boundary(&self) -> Option<SceneBoundary> { None }
+    fn next_checked(&mut self, answer: Option<usize>) -> Result<Beat, String> { Ok(self.next(answer)) }
+    fn resume_battle(&mut self, _checkpoint: BattleCheckpoint, _story: StoryState, _gil: u32) -> Result<(), String> {
+        Err("this scene source cannot continue after combat".into())
+    }
 
     /// A clip slot belonging to this cast entity's exact field model, if known locally.
     fn animation_clip(&self, _entity: u8, _slot: u8) -> Option<&str> { None }
@@ -54,6 +62,25 @@ impl SceneSource for ScenePlay {
 
     fn next(&mut self, answer: Option<usize>) -> Beat {
         ScenePlay::next(self, answer)
+    }
+
+    fn fingerprint(&self) -> Option<[u8; 32]> { Some(self.replay_identity().fingerprint) }
+    fn boundary(&self) -> Option<SceneBoundary> { ScenePlay::boundary(self) }
+    fn next_checked(&mut self, answer: Option<usize>) -> Result<Beat, String> {
+        let ack = match self.boundary() {
+            Some(SceneBoundary::Window(checkpoint)) => Some(WindowAck {
+                checkpoint,
+                answer: answer.map(u8::try_from).transpose().map_err(|_| "scene answer exceeds its encoding")?,
+            }),
+            _ if answer.is_none() => None,
+            _ => return Err("scene answer has no matching window".into()),
+        };
+        self.next_strict(ack).map_err(|e| format!("scene boundary rejected: {e:?}"))
+    }
+    fn resume_battle(&mut self, checkpoint: BattleCheckpoint, story: StoryState, gil: u32) -> Result<(), String> {
+        self.resume_battle_checked(BattleResume {
+            checkpoint, resolution: BattleResolution::Victory, story, resources: SceneResources { gil: Some(gil) },
+        }).map_err(|e| format!("scene battle continuation rejected: {e:?}"))
     }
 
     fn animation_clip(&self, entity: u8, slot: u8) -> Option<&str> {
@@ -176,6 +203,13 @@ pub trait SceneBuilder {
     /// uses this snapshot, including a watcher whose own balance differs. `Err` names ids/errors only.
     fn build(&mut self, scene: &str, story: &StoryState, seed: u32, resources: SceneResources) -> Result<Built, String>;
 
+    /// The original source rebound to the server's accepted trigger crossing, when supplied.
+    /// A builder which cannot validate an origin must reject it instead of using a local pose.
+    fn build_with_origin(&mut self, scene: &str, story: &StoryState, seed: u32, resources: SceneResources, origin: Option<&fmv_protocol::SceneOrigin>) -> Result<Built, String> {
+        if origin.is_some() { return Err("this scene builder cannot bind a saved trigger position".into()); }
+        self.build(scene, story, seed, resources)
+    }
+
     /// Private scenes have no watcher whose windows need to match this client's text layer.
     fn build_private(&mut self, scene: &str, story: &StoryState, seed: u32, resources: SceneResources) -> Result<Built, String> { self.build(scene, story, seed, resources) }
 
@@ -216,9 +250,17 @@ impl Ff7Scenes {
 
 impl SceneBuilder for Ff7Scenes {
     fn build(&mut self, id: &str, story: &StoryState, seed: u32, resources: SceneResources) -> Result<Built, String> {
+        self.build_with_origin(id, story, seed, resources, None)
+    }
+
+    fn build_with_origin(&mut self, id: &str, story: &StoryState, seed: u32, resources: SceneResources, origin: Option<&fmv_protocol::SceneOrigin>) -> Result<Built, String> {
         let mut def = scene(id).ok_or_else(|| "the game has no scene of that id".to_string())?;
         let adapter = self.adapter.as_ref().ok_or_else(|| "this machine has no FF7 data to build scenes from".to_string())?;
         let area = adapter.load_field(&def.field).map_err(|e| format!("the scene's field cannot be loaded here: {e}"))?;
+        if let Some(origin) = origin {
+            def = fmv_ff7::script::scene::with_trigger_position(area.field_file(), &def, origin.pos, origin.facing, origin.triangle)
+                .map_err(|e| format!("the saved scene origin cannot be bound here: {e}"))?;
+        }
         let play = ScenePlay::with_resources(area.field_file(), &def, story, seed, resources).map_err(|e| format!("the scene cannot be set up here: {e}"))?;
         // A scene that names no witness spots gets the ones its own data gives (the same on every machine): the owner and up
         // to two watchers stand clear of the cast instead of where they happen to be (a cutscene's owner would otherwise stand

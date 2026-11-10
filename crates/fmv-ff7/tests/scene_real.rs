@@ -698,6 +698,28 @@ fn every_story_entry_stands_on_the_floor_the_fields_ways_out_are_on() {
         let parts = mesh_parts(&mesh);
         let here = parts[usize::from(row.spot.triangle)];
         let gateways: Vec<_> = f.triggers().unwrap().gateways.into_iter().filter(fmv_ff7::field::Gateway::is_used).collect();
+        if row.field == "cargoin" {
+            assert!(gateways.is_empty(), "cargo leaves by an authored script, not a static gateway");
+            let script = FieldScript::from_field(&f).unwrap();
+            let border = script.disassemble(10, 0).unwrap();
+            let line = border.iter().find(|ins| ins.offset == 0x066B).expect("border1's authored line");
+            assert_eq!(line.mnemonic, "LINE");
+            let [x1, y1, z1, x2, y2, z2] = ["x1", "y1", "z1", "x2", "y2", "z2"].map(|name| line.literal(name).expect("literal line coordinates"));
+            assert_eq!([x1, y1, z1, x2, y2, z2], [-15, -104, 0, 53, -104, 0]);
+            let exit = script.disassemble(10, 2).unwrap();
+            let request = exit.iter().find(|ins| ins.offset == 0x067F).expect("the exit waits for Cloud's departure");
+            assert_eq!((request.mnemonic, request.literal("entity"), request.literal("script")), ("REQEW", Some(11), Some(8)));
+            let jump = exit.iter().find(|ins| ins.offset == 0x0682).expect("the exit's authored map jump");
+            assert_eq!(jump.mnemonic, "MAPJUMP");
+            assert_eq!(["field", "x", "y", "triangle", "direction"].map(|name| jump.literal(name)),
+                [Some(139), Some(-2), Some(608), Some(29), Some(252)]);
+            let (mx, my) = ((x1 + x2) / 2, (y1 + y2) / 2);
+            let on: Vec<usize> = (0..mesh.triangles.len()).filter(|&t| fmv_ff7::script::triangle_contains_xy(&mesh.triangles[t], mx, my)).collect();
+            assert!(on.iter().any(|&t| parts[t] == here), "cargo's entry and authored exit midpoint share the floor");
+            // This checks original geometry and script intent only. It does not assert that the scripted departure is
+            // registered or currently traversable by the host.
+            continue;
+        }
         assert!(!gateways.is_empty(), "{}: a field somebody is put in has a way out", row.field);
         for g in &gateways {
             let (mx, my) = ((i32::from(g.exit_a[0]) + i32::from(g.exit_b[0])) / 2, (i32::from(g.exit_a[1]) + i32::from(g.exit_b[1])) / 2);
@@ -718,7 +740,10 @@ fn every_story_entry_stands_on_the_floor_the_fields_ways_out_are_on() {
     assert_eq!(story_entry(38).map(|e| e.field), Some("md8_1"));
     let flower = story_entry(39).unwrap();
     assert_eq!((flower.field, flower.spot.x, flower.spot.y, flower.spot.triangle, flower.spot.direction), ("md8_2", -3989, 21138, 19, 150));
-    assert_eq!(story_entry(u16::MAX).map(|e| e.field), Some("md8_2"), "until a later row says otherwise");
+    assert_eq!(story_entry(47).map(|e| e.field), Some("md8_2"), "the train arrival must complete before the return entry changes");
+    let cargo = story_entry(48).unwrap();
+    assert_eq!((cargo.field, cargo.spot.x, cargo.spot.y, cargo.spot.triangle, cargo.spot.direction), ("cargoin", -24, 16, 20, 0));
+    assert_eq!(story_entry(u16::MAX).map(|e| e.field), Some("cargoin"), "until a later row says otherwise");
 
     // Each scene's witness stands on its own triangle, on the floor the entry is on (the player walks away from it after).
     for def in [fmv_ff7::script::scene::post_escape_scene(), fmv_ff7::script::scene::station_scene(), fmv_ff7::script::scene::flower_station_scene()] {
@@ -741,7 +766,7 @@ fn the_offered_scenes_are_told_apart_and_start_one_way_each() {
     let all = scenes();
     for (i, a) in all.iter().enumerate() {
         assert!(all.iter().skip(i + 1).all(|b| b.id != a.id), "{}", a.id);
-        assert_eq!(a.starts_on_arrival(), a.trigger.talk_radius == 0 && !a.is_point_cutscene());
+        assert_eq!(a.starts_on_arrival(), a.trigger.talk_radius == 0 && !a.is_point_cutscene() && a.line_trigger().is_none());
         if let Some(moment) = a.presents {
             // A cutscene: no reach, offered at moments before the one its point moves to, and in a field whose story points
             // are served (a reviewed field), or it would never play.
@@ -1018,8 +1043,8 @@ fn sector7_pillar_survey_reports_untracked_entry_flag_and_cast() {
 }
 
 #[test]
-#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA); cargo train is not enabled"]
-fn cargo_train_survey_runs_director_and_field_staging() {
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn cargo_train_runs_director_and_field_staging() {
     let f = field("cargoin").expect("FMV_FF7_DATA and cargoin");
     let def = fmv_ff7::script::scene::cargo_train_scene();
     let story = StoryState::at(39);
@@ -2283,4 +2308,69 @@ fn reactor_finale_at_27_matches_the_existing_step_and_has_clear_witnesses() {
         }
     }
     for moment in [0, 26, 28, 32, 33, u16::MAX] { assert!(!def.applies_at(moment)); }
+}
+
+/// Execute the unchanged owned bridge scripts across every authored choice branch. The tests
+/// acknowledge synthetic victories and explicit reward afterimages; they do not simulate combat
+/// or substitute for the host's real-combat, persistence, and transition gates.
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn bridge_all_eight_paths_pause_and_reconstruct_at_each_exact_battle_and_window() {
+    use fmv_ff7::script::scene::{bridge_scene, replay_scene_to, BattleResume, BattleResolution, Resources, SceneBoundary, WindowAck};
+    let Some(f) = field("md8brdg") else { return };
+    let def = bridge_scene();
+    let story = def.prepare_story(&StoryState::at(39)).unwrap();
+    let resources = Resources { gil: Some(240) };
+    for (answers, formations, windows) in [
+        ([2, 0, 0], vec![328, 329, 330], 13), ([2, 0, 1], vec![328, 329], 11),
+        ([2, 1, 0], vec![328, 330], 11), ([2, 1, 1], vec![328], 9),
+        ([3, 0, 0], vec![329, 330], 12), ([3, 0, 1], vec![329], 10),
+        ([3, 1, 0], vec![330], 10), ([3, 1, 1], vec![], 8),
+    ] {
+        let mut play = ScenePlay::with_resources(&f, &def, &story, 7, resources).unwrap();
+        let identity = play.replay_identity();
+        let (mut asked, mut seen_windows, mut seen_battles, mut gil) = (0usize, 0u32, Vec::new(), 240u32);
+        play.next_strict(None).unwrap();
+        loop {
+            let snapshot = play.snapshot().unwrap();
+            assert!(snapshot.unknown_persistent_reads.is_empty(), "{answers:?}: {:?}", snapshot.unknown_persistent_reads);
+            for stats in [&snapshot.setup_stats, &snapshot.stats] {
+                assert!(stats.unknown.is_empty() && stats.unresolved == 0 && stats.dropped_requests == 0 && !stats.setup_incomplete, "{answers:?}: {stats:?}");
+            }
+            assert!(snapshot.writes.is_story_neutral(), "the bridge does not advance moment 39");
+            assert_eq!(snapshot.resources.gil_after, Some(gil));
+            assert!(snapshot.resources.gil_ops.is_empty() && !snapshot.resources.unknown_gil);
+            let rebuilt = replay_scene_to(&f, &def, &story, resources, identity, play.transcript(), snapshot.boundary).unwrap();
+            assert_eq!(rebuilt.snapshot(), Some(snapshot.clone()), "reconstruct each boundary, path {answers:?}");
+            match snapshot.boundary {
+                SceneBoundary::Window(checkpoint) => {
+                    seen_windows += 1;
+                    assert_eq!(checkpoint.ordinal, seen_windows);
+                    let answer = checkpoint.choices.map(|_| {
+                        let expected_offset = if asked == 0 { 0x096D } else { 0x098B };
+                        assert_eq!((checkpoint.entity, checkpoint.instruction_offset), (6, Some(expected_offset)));
+                        let answer = answers[asked]; asked += 1; answer
+                    });
+                    play.next_strict(Some(WindowAck { checkpoint, answer })).unwrap();
+                }
+                SceneBoundary::Battle(checkpoint) => {
+                    seen_battles.push(checkpoint.formation);
+                    assert_eq!(checkpoint.ordinal as usize, seen_battles.len());
+                    let offset = match checkpoint.formation { 328 => 0x061A, 329 => 0x068F, 330 => 0x06F8, _ => panic!("unexpected battle") };
+                    assert_eq!((checkpoint.entity, checkpoint.instruction_offset, checkpoint.flags), (0, offset, Some(8)));
+                    gil += 10; // Explicit test-only authoritative reward; the VM must preserve it.
+                    play.resume_battle_checked(BattleResume { checkpoint, resolution: BattleResolution::Victory, story: story.clone(), resources: Resources { gil: Some(gil) } }).unwrap();
+                    play.next_strict(None).unwrap();
+                }
+                SceneBoundary::End(end) => {
+                    assert_eq!(end, End::MapJump { field: 138 });
+                    let jump = snapshot.jump.unwrap();
+                    assert_eq!((jump.x, jump.y, jump.triangle, jump.direction), (0, 0, 0, 0), "authored placeholder is not a reviewed train arrival");
+                    break;
+                }
+            }
+            assert!(seen_windows <= 13 && seen_battles.len() <= 3);
+        }
+        assert_eq!((asked, seen_windows, seen_battles), (3, windows, formations), "{answers:?}");
+    }
 }

@@ -141,7 +141,7 @@ fn simulate_paced(
     let companion_count = companions.len();
     let party: Vec<fmv_protocol::BattleMember> = companions.into_iter().chain(players).collect();
     let info = data.formation(formation).expect("a real formation");
-    let setup = BattleSetup {
+    let setup = BattleSetup { initial_party: None, escape_policy: fmv_protocol::EscapePolicy::Formation,
         formation_id: formation,
         seed,
         party,
@@ -264,7 +264,7 @@ fn simulate_commanded(data: &Ff7BattleData, formation: u16, characters: &[u8], l
     let companion_count = companions.len();
     let party: Vec<fmv_protocol::BattleMember> = companions.into_iter().chain(players).collect();
     let info = data.formation(formation).expect("a real formation");
-    let setup = BattleSetup {
+    let setup = BattleSetup { initial_party: None, escape_policy: fmv_protocol::EscapePolicy::Formation,
         formation_id: formation,
         seed,
         party,
@@ -558,7 +558,7 @@ fn the_default_debug_formation_exists_and_every_formation_builds_for_every_chara
         let Some(info) = data.formation(id) else { continue };
         assert!(info.enemies >= 1);
         for character in 0..9u8 {
-            let setup = BattleSetup {
+            let setup = BattleSetup { initial_party: None, escape_policy: fmv_protocol::EscapePolicy::Formation,
                 formation_id: id,
                 seed: 1,
                 party: vec![fmv_protocol::BattleMember::player(
@@ -828,7 +828,7 @@ fn the_enemies_take_their_turns_while_the_players_sit_in_their_menus() {
             .collect();
         let (mut early, mut first_total, mut latest, mut acted) = (0u64, 0f64, 0f64, 0u64);
         for seed in 0..200u64 {
-            let setup = BattleSetup { formation_id: formation, seed, party: members.clone(), preemptive: info.preemptive, back_attack: info.back_attack, battle_speed: speed, ticks_per_second: tps };
+            let setup = BattleSetup { initial_party: None, escape_policy: fmv_protocol::EscapePolicy::Formation, formation_id: formation, seed, party: members.clone(), preemptive: info.preemptive, back_attack: info.back_attack, battle_speed: speed, ticks_per_second: tps };
             let mut state = data.build(&setup).expect("builds");
             let mut first: Option<f64> = None;
             for _ in 0..(60 * u64::from(tps)) {
@@ -1139,7 +1139,7 @@ fn a_guard_scorpion_fight_with_its_counters_is_replayed_exactly_by_a_client_engi
                         .collect()
                 };
                 let companion_count = party.iter().filter(|m| m.is_companion()).count();
-                let setup = BattleSetup {
+                let setup = BattleSetup { initial_party: None, escape_policy: fmv_protocol::EscapePolicy::Formation,
                     formation_id: formation,
                     seed,
                     party,
@@ -1224,7 +1224,7 @@ fn boss_fight(data: &Ff7BattleData, formation: u16, level: u8, defends: usize, s
     let party: Vec<fmv_protocol::BattleMember> = companions.into_iter().chain(players).collect();
     let fighters = party.len();
     let info = data.formation(formation).expect("a real formation");
-    let setup = BattleSetup { formation_id: formation, seed, party, preemptive: info.preemptive, back_attack: info.back_attack, battle_speed: speed, ticks_per_second: tps };
+    let setup = BattleSetup { initial_party: None, escape_policy: fmv_protocol::EscapePolicy::Formation, formation_id: formation, seed, party, preemptive: info.preemptive, back_attack: info.back_attack, battle_speed: speed, ticks_per_second: tps };
     let mut state = data.build(&setup).expect("builds");
     let foe = ActorId(fighters as u8);
     let pacing = Pacing::default();

@@ -756,6 +756,8 @@ impl Fight {
         let gpu = Offscreen::new()?;
         let limited = |i: usize, character: u8| BattleMember { limit: limits[i], level, ..canon(character) };
         let setup = BattleSetup {
+            initial_party: None,
+            escape_policy: fmv_protocol::EscapePolicy::Formation,
             formation_id: formation,
             seed,
             party: characters.iter().enumerate().map(|(i, &c)| limited(i, c)).collect(),
@@ -936,6 +938,8 @@ fn party_attack_range_by_starting_weapon() {
     let mut ranges = Vec::new();
     for ids in [[0u8, 1, 2], [3, 4, 5], [6, 7, 8]] {
         let setup = BattleSetup {
+            initial_party: None,
+            escape_policy: fmv_protocol::EscapePolicy::Formation,
             formation_id: 301,
             seed: SEED,
             party: ids.iter().map(|&c| canon(c)).collect(),

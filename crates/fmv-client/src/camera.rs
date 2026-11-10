@@ -110,6 +110,12 @@ pub struct FieldCamera {
 }
 
 impl FieldCamera {
+    /// Follow mode keeps actors and markers inside the authored camera range. The whole-field
+    /// overview keeps its original extent; invalid ranges never turn into an accidental mask.
+    pub fn clip_range(&self, range: Option<Bounds>) -> Option<Bounds> {
+        range.filter(|range| self.mode == CameraMode::Follow && sound(range))
+    }
+
     /// F2: the other mode. The view is put in place at once.
     pub fn toggle(&mut self) -> CameraMode {
         self.mode = match self.mode {

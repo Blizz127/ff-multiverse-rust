@@ -337,13 +337,10 @@ impl Avatars {
             };
             let scene_clip = p.scene_clip.and_then(|(stem, frame)| {
                 let clip = self.library.get_scene_animation(&asset, stem)?;
-                if let ClipFrame::OnceFull { elapsed } = frame {
-                    let frames = clip.frame_count();
-                    if frames != 0 && elapsed.is_finite() && elapsed >= frames as f32 {
-                        let standing = self.library.get_scene_animation(&asset, p.scene_return?)?;
-                        let frame = ClipFrame::Loop(elapsed - frames as f32).in_clip(standing.frame_count())?;
-                        return Some((standing, frame));
-                    }
+                if let Some(elapsed) = frame.return_elapsed(clip.frame_count()) {
+                    let standing = self.library.get_scene_animation(&asset, p.scene_return?)?;
+                    let frame = ClipFrame::Loop(elapsed).in_clip(standing.frame_count())?;
+                    return Some((standing, frame));
                 }
                 // A held frame outside this actual clip falls back, never wraps to another pose.
                 frame.in_clip(clip.frame_count()).map(|frame| (clip, frame))
@@ -855,6 +852,27 @@ pub(crate) mod tests {
                     assert_eq!(returned.positions, return_middle.positions, "only post-completion scene time advances and wraps the two-frame default");
                     assert!(std::sync::Arc::ptr_eq(&base.asset, &returned.asset), "returning to the default retains the base mesh");
                 }
+            }
+            actor.scene_clip = Some(("range", ClipFrame::OnceFullDoubled { elapsed: 3.5 }));
+            assert_eq!(avatars.frame(&view, &stage, &[actor], 20.0).frame.models[0].positions, full_last.positions,
+                "a doubled Once still shows the loaded final pose before its shortened deadline");
+            actor.scene_clip = Some(("range", ClipFrame::OnceFullDoubled { elapsed: 4.0 }));
+            assert_eq!(avatars.frame(&view, &stage, &[actor], 20.0).frame.models[0].positions, return_start.positions);
+            for elapsed in [5.0, 9.0, 1001.0] {
+                actor.scene_clip = Some(("range", ClipFrame::OnceFullDoubled { elapsed }));
+                for dt in [0.0, 0.1, 20.0] {
+                    let returned = avatars.frame(&view, &stage, &[actor], dt).frame.models.remove(0);
+                    assert_eq!(returned.positions, return_middle.positions, "the return pose uses scene time, not the doubled gesture clock");
+                    assert!(std::sync::Arc::ptr_eq(&base.asset, &returned.asset));
+                }
+            }
+            actor.scene_clip = Some(("range", ClipFrame::OnceFullSlowed { elapsed: 3.5, doubled_until: 3.0 }));
+            assert_eq!(avatars.frame(&view, &stage, &[actor], 20.0).frame.models[0].positions, full_last.positions,
+                "slowing the last interval keeps the final pose");
+            for (elapsed, doubled_until) in [(4.5, 3.0), (7.5, 6.0)] {
+                actor.scene_clip = Some(("range", ClipFrame::OnceFullSlowed { elapsed, doubled_until }));
+                assert_eq!(avatars.frame(&view, &stage, &[actor], 20.0).frame.models[0].positions, return_middle.positions,
+                    "the default samples the right phase whether the rate changed before or after completion");
             }
             actor.scene_clip = Some(("missing", ClipFrame::OnceFull { elapsed: 1000.0 }));
             let fallback = avatars.frame(&view, &stage, &[actor], 20.0).frame.models.remove(0);

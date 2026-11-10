@@ -87,6 +87,7 @@ fn start_msg(you: SceneRole) -> ServerMsg {
         seed: 5,
         progress: vec![1, 72, 0],
         gil: 0,
+        replay: None,
         owner: EntityId(if you == SceneRole::Owner { 7 } else { 8 }),
         // The owner stands on spot 0, the one who watches on spot 1 (this player is whichever `you` says).
         participants: if you == SceneRole::Owner {

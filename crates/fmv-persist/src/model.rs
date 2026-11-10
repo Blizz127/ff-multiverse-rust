@@ -20,8 +20,10 @@ use crate::error::{PersistError, Result};
 /// the version: [`CharacterProgress::inventory`] was added that way. (What that costs a build
 /// that is rolled back is documented there.)
 pub const SCHEMA_VERSION: u32 = 1;
-/// Format version of the account index (`index.log`, and the small `index.json` marker beside
-/// it). Version 1 was a single `index.json` holding every name and token; it is migrated
+/// Default format version of a new account index (`index.log`, and the small `index.json`
+/// marker beside it). Scene batches raise the log header to version 3 before their first
+/// write, while retaining the legacy marker at version 2. Version 1 was a single
+/// `index.json` holding every name and token; it is migrated
 /// transparently on open. An older build that finds the marker refuses to open the directory
 /// with [`PersistError::FutureSchema`] instead of misreading it.
 pub const INDEX_LOG_VERSION: u32 = 2;
@@ -38,11 +40,12 @@ pub const MAX_INDEX_BYTES: u64 = 16 * 1024 * 1024;
 /// serialized as a list of numbers is several times its size), so a server must keep it in the
 /// store and put only a short key of it (an id, a hash) on the wire.
 pub const MAX_BLOB_BYTES: usize = 256 * 1024;
-/// Largest accepted character-progress file, including its private schema-2 scene receipts.
+/// Largest accepted character-progress file, including its private scene receipts and checkpoint.
 /// The original fields and a full inventory use under 18 KiB. Up to
 /// [`MAX_SCENE_RECEIPTS`](crate::MAX_SCENE_RECEIPTS) durable receipt hashes fit alongside them;
-/// those receipts are never evicted. Receipt-bearing records require schema 2, which older
-/// servers refuse to read. Records without receipts retain their original schema-1 shape.
+/// those receipts are never evicted. Ordinary receipts require schema 2; batch receipts,
+/// checkpoints and reservations require schema 3. The first batch also upgrades the index
+/// header so older servers refuse the entire store. Records without metadata retain schema 1.
 pub const MAX_CHARACTER_RECORD_BYTES: u64 = 512 * 1024;
 /// Longest accepted `base_archetype` (bytes).
 pub const MAX_ARCHETYPE_BYTES: usize = 64;
@@ -348,7 +351,8 @@ impl Progression {
 /// change the record that was read (`Store::update_character_progress` hands it to the closure).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CharacterProgress {
-    /// Record format version. The store stamps [`SCHEMA_VERSION`] on every write.
+    /// Record format version. The store stamps the base [`SCHEMA_VERSION`], or its private
+    /// receipt/checkpoint envelope's version (2 or 3); callers cannot downgrade that metadata.
     pub schema_version: u32,
     pub account_id: AccountId,
     pub game: GameId,

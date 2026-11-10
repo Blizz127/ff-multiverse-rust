@@ -90,6 +90,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use winit::keyboard::KeyCode;
 
+mod continuation;
+
 /// The most of a witness's picture another's may cover on the screen.
 const MAX_COVERED: f32 = 0.10;
 
@@ -257,6 +259,16 @@ impl SceneBuilder for Moved {
         let area = self.adapter.load_field(&self.def.field).map_err(|e| e.to_string())?;
         let play = ScenePlay::with_resources(area.field_file(), &self.def, story, seed, resources).map_err(|e| e.to_string())?;
         Ok(Built { def: self.def.clone(), source: Box::new(play) })
+    }
+
+    fn build_with_origin(&mut self, scene: &str, story: &StoryState, seed: u32, resources: fmv_ff7::script::scene::SceneResources,
+        origin: Option<&fmv_protocol::SceneOrigin>) -> Result<Built, String> {
+        let Some(origin) = origin else { return self.build(scene, story, seed, resources) };
+        let area = self.adapter.load_field(&self.def.field).map_err(|e| e.to_string())?;
+        let def = fmv_ff7::script::scene::with_trigger_position(area.field_file(), &self.def, origin.pos, origin.facing, origin.triangle)
+            .map_err(|e| e.to_string())?;
+        let play = ScenePlay::with_resources(area.field_file(), &def, story, seed, resources).map_err(|e| e.to_string())?;
+        Ok(Built { def, source: Box::new(play) })
     }
 
     fn reach(&mut self, index: usize, area: &str) -> Option<f32> {
@@ -588,7 +600,7 @@ fn survey(mut def: SceneDef, default: Spot, prefix: &str, mode: Survey) {
     let path = matches!(mode, Survey::Quiet { .. }).then(|| scene_path(&real, &def));
     let mut rig = make_rig(&real, def, true);
     let msg = ServerMsg::SceneStart {
-        run: SceneRunId(1), scene: rig.def.id.clone(), seed: SEED, progress: rig.story.encode(), gil: 0, owner: EntityId(1),
+        run: SceneRunId(1), scene: rig.def.id.clone(), seed: SEED, progress: rig.story.encode(), gil: 0, replay: None, owner: EntityId(1),
         participants: vec![SceneParticipant { entity: EntityId(1), spot: 0 }], you: SceneRole::Owner,
     };
     assert!(rig.state.apply(0.0, msg).is_none());
@@ -779,7 +791,7 @@ fn offscreen_real_ff7_flower_choices_and_camera() {
             let draw = rig.draw();
             rig.view.bounds = camera.update(&camera_input(&rig.view, &rig.state, &draw, SIZE, 0.25));
             if name == "buy" && matches!(step, 39 | 47) {
-                rig.picture(&mut gpu, &format!("flower-entry-{step}"), SIZE, false);
+                rig.picture_clipped(&mut gpu, &format!("flower-entry-{step}"), SIZE, false, camera.clip_range(rig.view.range));
             }
             let player = rig.state.scene.player().unwrap();
             last_counts = player.counts();
@@ -825,7 +837,7 @@ fn offscreen_real_ff7_flower_choices_and_camera() {
                         }
                         foreground_checked = true;
                     }
-                    rig.picture(&mut gpu, &format!("flower-path-{name}-{shown:02}"), SIZE, true);
+                    rig.picture_clipped(&mut gpu, &format!("flower-path-{name}-{shown:02}"), SIZE, true, camera.clip_range(rig.view.range));
                     shown += 1;
                     last_window = Some(epoch);
                 }
@@ -911,7 +923,7 @@ fn offscreen_real_ff7_the_field_camera() {
         let draw = rig.draw();
         rig.view.bounds = camera.update(&camera_input(&rig.view, &rig.state, &draw, SIZE, 0.0));
         let shown = rig.view.bounds;
-        rig.picture(&mut gpu, name, SIZE, true);
+        rig.picture_clipped(&mut gpu, name, SIZE, true, camera.clip_range(rig.view.range));
         eprintln!("{name}: shows {:.0}..{:.0} x {:.0}..{:.0} of the range {:.0}..{:.0} x {:.0}..{:.0}", shown.min.x, shown.max.x, shown.min.y, shown.max.y, range.min.x, range.max.x, range.min.y, range.max.y);
         shown
     };
@@ -965,12 +977,14 @@ fn offscreen_real_ff7_the_field_camera() {
     assert!(inside(&shown));
 }
 
-/// Every registered scene of the route over the owner's data, played through the window's own path with the field camera
+/// Every registered non-battle scene of the route over the owner's data, played through the window's own path with the field camera
 /// (`field_draw`, `camera_input`, `FieldCamera::update`) at four steps a second, each at the story it plays at: at every step
 /// the window shows the scene's lead (the canon Cloud when he is drawn, else the player) and any actor a `SCRLA` follows.
 /// The half second the camera eases in after the scene starts or its camera changes is left out, and so is a lead outside
 /// the field's camera range (FF7's screen does not show that place either). Prints each scene's count and writes one
 /// picture of its middle step (`camera-scene-<field>-<name>.png`); fails if any step has the lead out of the window.
+/// The bridge's accepted crossing and battle handoffs are exercised by the dedicated all-choice
+/// continuation test, rather than inventing battle acknowledgements in this general scene walk.
 #[test]
 #[ignore = "needs the owner's real FF7 data (FMV_FF7_LIBRARY, FMV_FF7_DATA or FMV_FF7_FLEVEL) and a GPU or software Vulkan/GL driver"]
 fn offscreen_real_ff7_the_field_camera_keeps_each_route_scenes_lead_in_view() {
@@ -992,6 +1006,7 @@ fn offscreen_real_ff7_the_field_camera_keeps_each_route_scenes_lead_in_view() {
             "ff7/nrthmk/reactor-approach" => (8, None),
             "ff7/nrthmk/reactor-finale" => (27, Some((1, 225, 5))),
             "ff7/md8_2/flower" => (36, None),
+            fmv_ff7::script::scene::CARGO_TRAIN_SCENE_ID => (39, None),
             _ => (0, None),
         };
         let mut story = StoryState::at(moment);
@@ -999,7 +1014,8 @@ fn offscreen_real_ff7_the_field_camera_keeps_each_route_scenes_lead_in_view() {
         story
     };
     let mut failures = Vec::new();
-    for def in fmv_ff7::script::scene::scenes().into_iter().filter(|d| d.id != fmv_ff7::script::scene::PROOF_SCENE_ID) {
+    for def in fmv_ff7::script::scene::scenes().into_iter().filter(|d|
+        ![fmv_ff7::script::scene::PROOF_SCENE_ID, fmv_ff7::script::scene::BRIDGE_SCENE_ID].contains(&d.id.as_str())) {
         let id = def.id.clone();
         let mut rig = make_rig(&real, def, true);
         rig.story = story_for(&id);
@@ -1035,7 +1051,7 @@ fn offscreen_real_ff7_the_field_camera_keeps_each_route_scenes_lead_in_view() {
                 middle = Some(step);
                 rig.view.bounds = shown;
                 let name = id.replace("ff7/", "").replace('/', "-");
-                rig.picture(&mut gpu, &format!("camera-scene-{name}"), SIZE, true);
+                rig.picture_clipped(&mut gpu, &format!("camera-scene-{name}"), SIZE, true, camera.clip_range(rig.view.range));
             }
             if rig.state.scene.player().is_some_and(|p| p.has_window()) { rig.state.scene.key(KeyCode::Enter, true, false); } else { rig.state.scene.advance(0.25); }
         }
@@ -1055,6 +1071,7 @@ impl Rig {
             seed: SEED,
             progress: self.story.encode(),
             gil: self.gil,
+            replay: None,
             owner: EntityId(1),
             participants,
             you: SceneRole::Owner,
@@ -1268,13 +1285,22 @@ impl Rig {
 
     /// The field as the window draws it, with the scene's window over it when `window`, saved as `<name>.png`.
     fn picture(&mut self, gpu: &mut Offscreen, name: &str, (w, h): (u32, u32), window: bool) -> (Vec<u8>, FieldDraw) {
+        self.picture_clipped(gpu, name, (w, h), window, None)
+    }
+
+    /// The follow camera also clips actors outside the authored range. Overview surveys pass
+    /// no range, matching F2; their pictures keep the full field and its actors.
+    fn picture_clipped(&mut self, gpu: &mut Offscreen, name: &str, (w, h): (u32, u32), window: bool,
+        range: Option<fmv_adapter_api::Bounds>) -> (Vec<u8>, FieldDraw) {
         // The first frame loads the models the field names; the second is the steady state.
         self.draw();
         let draw = self.draw();
         let built = draw.built.as_ref().expect("the models were built");
         let scene = Scene { bounds: self.view.bounds, triangles: &[], players: &draw.markers, fixture_banner: false, backdrop: self.view.backdrop.as_ref() };
         let story = self.state.scene.player();
-        let anchor = |subject: Subject, at: Pos| if label_hidden(story, subject, self.state.npc_views()) { None } else { label_anchor(draw.built.as_ref(), &self.view, draw.own_who, subject, at) };
+        let anchor = |subject: Subject, at: Pos| if label_hidden(story, subject, self.state.npc_views())
+            || super::draw::participant_label_hidden(story, self.state.self_entity(), subject) { None }
+            else { label_anchor(draw.built.as_ref(), &self.view, draw.own_who, subject, at) };
         let hud_input = hud::gather_anchored(&self.state, &self.info(), &self.view, 1.0, &anchor);
         let mut overlay = DrawList::new();
         hud::draw_hud(&hud_input, w, h, &mut overlay);
@@ -1282,7 +1308,7 @@ impl Rig {
             let spot = speaker_spot(story, draw.built.as_ref(), &self.view, w, h);
             story.draw(w, h, 0.0, spot.as_ref(), &mut overlay);
         }
-        let img = gpu.render_field(w, h, &scene, Some(&built.frame), &overlay);
+        let img = gpu.render_field_clipped(w, h, &scene, Some(&built.frame), &overlay, range);
         save(name, w, h, &img);
         (img, draw)
     }

@@ -34,6 +34,9 @@ clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+getrandom = "0.3"
 # The ephemeral account store (`--ephemeral`, and the in-process default of `ServerConfig`) lives in
 # a temporary directory that is removed when the server stops; the tests also use it for hermetic
 # state directories.
@@ -41,9 +44,3 @@ tempfile.workspace = true
 # Already in the lockfile through tokio. Used only to configure TCP keepalive timers on accepted
 # sockets (tokio exposes just the on/off switch, and the Linux default idle time is 2 hours).
 socket2 = { version = "0.6", features = ["all"] }
-
-
-
-[dev-dependencies]
-# The save-compatibility test writes a record in the exact shape an older server stored it.
-serde_json.workspace = true

@@ -38,7 +38,9 @@
 //! has changed since it met it the first time: an idle loop. It runs again if anything changes. So a background
 //! script that loops for ever (a bartender's idle walk) does not hold a scene open, and a tail a script requested
 //! just before it returned (`REQSW`) does run to its end. A `MAPJUMP`, `BATTLE`, `MINIGAME` or `GAMEOVER` ends it at
-//! once ([`End`]); the world is not changed by any of them.
+//! once ([`End`]); the world is not changed by any of them. A strict [`super::ScenePlay`] may
+//! resume a BATTLE only after an exact checked checkpoint and authoritative victorious afterimage.
+//! The suspended scheduler, scratch variables and RNG are retained across that boundary.
 //!
 //! # Requests and priorities
 //!
@@ -48,6 +50,7 @@
 //! request for a slot that is taken waits for it to be free (the engine's own rule for a taken slot is not
 //! documented; waiting loses no line).
 
+use super::play::{BattleCheckpoint, WindowCheckpoint, SceneBoundary};
 use super::data::{Given, ScriptRef, Step};
 use crate::field_direction_to_facing;
 use crate::script::dialogue::{parse_message, Choice, End, Message, MessageOrigin, Piece, StoryVars, EFFECT_NOTE_LAYER};
@@ -410,6 +413,7 @@ enum Flow {
 }
 
 struct Opened {
+    instruction_offset: u32,
     opener: usize,
     id: u8,
     time: u32,
@@ -548,6 +552,13 @@ fn clamp_u8(v: i32) -> u8 {
 pub struct Vm {
     jump: Option<SceneJump>,
     battle: Option<u16>,
+    battle_checkpoint: Option<BattleCheckpoint>,
+    battle_ordinal: u32,
+    battle_flags: Option<u16>,
+    window_checkpoint: Option<WindowCheckpoint>,
+    window_ordinal: u32,
+    implicit_choice: bool,
+    invalid_message: bool,
     limits: Limits,
     vars: SceneVars,
     writes: BTreeMap<(u8, u8), u8>,
@@ -594,6 +605,13 @@ impl Vm {
         Self {
             jump: None,
             battle: None,
+            battle_checkpoint: None,
+            battle_ordinal: 0,
+            battle_flags: None,
+            window_checkpoint: None,
+            window_ordinal: 0,
+            implicit_choice: false,
+            invalid_message: false,
             limits,
             vars,
             writes: BTreeMap::new(),
@@ -1211,7 +1229,7 @@ impl Vm {
         Some(Message::new(MessageOrigin::Canon { entity: 0, dialog: index }, parse_message(raw, &self.vars)))
     }
 
-    fn open(&mut self, idx: usize, entity: usize, window: i32, mut message: Message, pending: Option<Pending>) -> Flow {
+    fn open(&mut self, idx: usize, entity: usize, instruction_offset: usize, window: i32, mut message: Message, pending: Option<Pending>) -> Flow {
         if let MessageOrigin::Canon { entity: e, .. } = &mut message.origin {
             *e = entity;
         }
@@ -1222,23 +1240,36 @@ impl Vm {
         self.windows = self.windows.saturating_add(1);
         self.stats.windows = self.windows;
         self.epoch = self.epoch.wrapping_add(1);
-        Flow::Window(Opened { opener: entity, id: u8::try_from(window).unwrap_or(0), time: self.thread_time(idx), message, pending })
+        Flow::Window(Opened { instruction_offset: instruction_offset as u32, opener: entity, id: u8::try_from(window).unwrap_or(0), time: self.thread_time(idx), message, pending })
     }
 
     fn ask(&mut self, script: &FieldScript<'_>, idx: usize, entity: usize, ins: &Instruction) -> Flow {
         let (Some(window), Some(dialog), Some(first), Some(last)) =
             (ins.literal("window"), ins.literal("dialog"), ins.literal("first"), ins.literal("last"))
         else {
+            self.implicit_choice = true;
+            self.stats.unresolved = self.stats.unresolved.saturating_add(1);
             return Flow::Next;
         };
-        let Some(mut message) = self.message(script, dialog) else { return Flow::Next };
+        let Some(mut message) = self.message(script, dialog) else {
+            self.implicit_choice = true;
+            self.stats.unresolved = self.stats.unresolved.saturating_add(1);
+            return Flow::Next;
+        };
         let var = Self::dest(ins, "var");
+        let reversed = last < first;
         let first = usize::try_from(first).unwrap_or(0);
         // A last line the text does not have is the text's last line.
         let lines = last_page_lines(&message.pieces);
         let last = usize::try_from(last).unwrap_or(0).max(first).min(lines.saturating_sub(1));
         let held = var.map(|(bank, address)| usize::from(self.var_byte(bank, address)));
         let cursor = held.filter(|c| (first..=last).contains(c)).unwrap_or(first);
+        if self.quiet || first > last || reversed || var.is_none() {
+            // Preview setup retains its historical cursor behavior, but a durable replay cannot
+            // pretend this was a player's accepted answer (nor an ordinary MESSAGE window).
+            self.implicit_choice = true;
+            self.stats.unresolved = self.stats.unresolved.saturating_add(1);
+        }
         if let Some((bank, address)) = var {
             // The variable always ends up holding an answer, even when nobody was asked.
             if self.quiet || first > last {
@@ -1249,10 +1280,10 @@ impl Vm {
             return Flow::Next;
         }
         if first > last {
-            return self.open(idx, entity, window, message, None);
+            return self.open(idx, entity, ins.offset, window, message, None);
         }
         message.choice = Some(Choice { first, last, cursor });
-        self.open(idx, entity, window, message, Some(Pending { var, first, last, cursor }))
+        self.open(idx, entity, ins.offset, window, message, Some(Pending { var, first, last, cursor }))
     }
 
     /// Continue after a conditional: into its body when `holds`, else past it.
@@ -1403,12 +1434,20 @@ impl Vm {
                 Flow::Yield
             }
             0x40 => {
-                let (Some(window), Some(dialog)) = (ins.literal("window"), ins.literal("dialog")) else { return Flow::Next };
-                let Some(message) = self.message(script, dialog) else { return Flow::Next };
+                let (Some(window), Some(dialog)) = (ins.literal("window"), ins.literal("dialog")) else {
+                    self.invalid_message = true;
+                    self.stats.unresolved = self.stats.unresolved.saturating_add(1);
+                    return Flow::Next;
+                };
+                let Some(message) = self.message(script, dialog) else {
+                    self.invalid_message = true;
+                    self.stats.unresolved = self.stats.unresolved.saturating_add(1);
+                    return Flow::Next;
+                };
                 if self.quiet {
                     return Flow::Next;
                 }
-                self.open(idx, entity, window, message, None)
+                self.open(idx, entity, ins.offset, window, message, None)
             }
             0x48 => self.ask(script, idx, entity, ins),
             0x50 => {
@@ -1450,7 +1489,16 @@ impl Vm {
             },
             0x70 => {
                 self.battle = ins.literal("battle").and_then(|n| u16::try_from(n).ok());
+                self.battle_ordinal = self.battle_ordinal.saturating_add(1);
+                self.battle_checkpoint = self.battle.map(|formation| BattleCheckpoint {
+                    ordinal: self.battle_ordinal, entity: Self::own(entity), instruction_offset: ins.offset as u32,
+                    formation, flags: self.battle_flags,
+                });
                 Flow::Scene(End::Battle)
+            },
+            0x72 => {
+                self.battle_flags = ins.literal("flags").and_then(|n| u16::try_from(n).ok());
+                Flow::Next
             },
             0xFF => Flow::Scene(End::GameOver),
             0x74 => {
@@ -1788,6 +1836,10 @@ impl Vm {
     pub fn begin(&mut self, root: Vec<Step>) {
         self.jump = None;
         self.battle = None;
+        self.battle_checkpoint = None;
+        self.battle_ordinal = 0;
+        self.window_checkpoint = None;
+        self.window_ordinal = 0;
         self.quiet = false;
         self.threads.clear();
         self.slots.clear();
@@ -1818,6 +1870,8 @@ impl Vm {
                 Then::End { how: End::Battle, .. } if self.battle == Some(formation) => {
                     self.done = None;
                     self.battle = None;
+                    self.battle_checkpoint = None;
+                    self.window_checkpoint = None;
                     self.origin = self.clock;
                     self.out.clear();
                     return true;
@@ -1857,6 +1911,51 @@ impl Vm {
         self.quiet = false;
     }
 
+    pub(super) fn has_invalid_message(&self) -> bool { self.invalid_message }
+
+    pub(super) fn has_implicit_choice(&self) -> bool { self.implicit_choice }
+
+    pub(super) fn boundary(&self) -> Option<SceneBoundary> {
+        if let Some(window) = self.window_checkpoint { return Some(SceneBoundary::Window(window)); }
+        if let Some(battle) = self.battle_checkpoint { return Some(SceneBoundary::Battle(battle)); }
+        self.done.map(SceneBoundary::End)
+    }
+
+    pub(super) fn accept_window(&mut self, answer: Option<u8>) {
+        if let Some(p) = self.pending.take() {
+            if let (Some((bank, address)), Some(answer)) = (p.var, answer) { self.set_byte(bank, address, answer); }
+        }
+        self.window_checkpoint = None;
+    }
+
+    pub(super) fn resume_battle(&mut self, story: &StoryState, resources: SceneResources) {
+        // Acknowledged persistent assignments now live in the authoritative afterimage. Scratch
+        // selectors (5/6) and every scheduler/actor/RNG detail stay exactly where combat paused.
+        self.writes.retain(|(bank, _), _| crate::story::canonical_persistent_bank(*bank).is_none());
+        self.written_masks.retain(|(bank, _), _| crate::story::canonical_persistent_bank(*bank).is_none());
+        self.vars.story = story.clone();
+        // Combat is external progress. Revisiting the same instruction is now meaningful, and
+        // parked peers must get a chance to observe authoritative post-battle values.
+        self.epoch = self.epoch.wrapping_add(1);
+        self.resources.gil_before = resources.gil;
+        self.resources.gil_after = resources.gil;
+        self.resources.gil_ops.clear();
+        self.party_ops.clear();
+        self.done = None;
+        self.battle = None;
+        self.battle_checkpoint = None;
+        self.origin = self.clock;
+    }
+
+    fn record_window(&mut self, window: &Window, offset: Option<u32>) {
+        self.window_ordinal = self.window_ordinal.saturating_add(1);
+        let dialog = match window.message.origin { MessageOrigin::Canon { dialog, .. } => u16::try_from(dialog).ok(), _ => None };
+        self.window_checkpoint = Some(WindowCheckpoint {
+            ordinal: self.window_ordinal, entity: window.opener, instruction_offset: offset, window: window.id,
+            dialog, choices: window.message.choice.as_ref().map(|c| [c.first as u8, c.last as u8]),
+        });
+    }
+
     fn finish(&mut self, end: End) -> Beat {
         self.done = Some(end);
         let at = self.clock.saturating_sub(self.origin);
@@ -1867,10 +1966,12 @@ impl Vm {
     /// last, if that asked (the absolute line number of the choice, as a script stores it; anything else is clamped
     /// into the choices, `None` takes the cursor's starting line).
     pub fn resume(&mut self, script: &FieldScript<'_>, answer: Option<usize>) -> Beat {
+        self.window_checkpoint = None;
         if let Some((opener, note)) = self.queued_note.take() {
             let at = self.clock.saturating_sub(self.origin);
             let window = Window { at, opener: Self::own(opener), speaker: None, id: 0, geometry: None, message: note };
             self.origin = self.clock;
+            self.record_window(&window, None);
             return Beat { stage: std::mem::take(&mut self.out), then: Then::Window(window) };
         }
         if let Some(end) = self.done {
@@ -1907,6 +2008,7 @@ impl Vm {
                     let at = opened.time.saturating_sub(self.origin);
                     let geometry = self.geometry.get(&opened.id).copied();
                     let window = Window { at, opener: Self::own(opened.opener), speaker: None, id: opened.id, geometry, message: opened.message };
+                    self.record_window(&window, Some(opened.instruction_offset));
                     self.pending = opened.pending;
                     if std::mem::take(&mut self.gift_not_given) && !self.quiet {
                         self.queued_note = Some((opened.opener, gift_note()));

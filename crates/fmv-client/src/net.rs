@@ -670,6 +670,9 @@ where
             // player is held until the run ends.
             | ServerMsg::SceneStart { .. }
             | ServerMsg::SceneStep { .. }
+            | ServerMsg::SceneBattleStarted { .. }
+            | ServerMsg::SceneBattleResumed { .. }
+            | ServerMsg::SceneGameOver { .. }
             | ServerMsg::SceneEnded { .. }
             | ServerMsg::SceneRefused { .. }) => push_backlog(&mut backlog, other),
         }

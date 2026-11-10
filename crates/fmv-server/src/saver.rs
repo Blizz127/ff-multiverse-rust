@@ -44,6 +44,12 @@
 //! survives reconnects and later rewards. The caller receives a durable acknowledgement before it
 //! may publish progress or release a held scene. An uncertain error is never retried here; the store
 //! must recover first. The scene world uses this acknowledgement to commit and release.
+//!
+//! [`SceneBatchJob`] extends this contract to a suspended scene's frozen battle roster. The world
+//! reserves its accounts, requests an ordered snapshot, then commits the checkpoint before combat.
+//! A terminal battle commits accepted item costs, rewards, gauges and continuation for every member
+//! together. These bounded jobs are larger than normal payments, so the world permits only one
+//! pending operation per reserved roster. Item use during such a fight is staged until settlement.
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -58,6 +64,9 @@ use tracing::{error, info, warn};
 
 use crate::inventory::{Change, Inventory};
 use crate::progress::{self, Progress};
+
+mod continuation;
+pub(crate) use continuation::{persist_scene_batch, preview_scene_settlement, SceneBatchJob, SceneBatchMember, SceneBattleSettlement, MAX_SCENE_BATTLE_ITEM_USES};
 
 /// How long to wait before each further attempt at a write that failed with an I/O error.
 const RETRY_WAITS: [Duration; 2] = [Duration::from_millis(250), Duration::from_secs(1)];
@@ -153,6 +162,12 @@ pub(crate) enum SceneSaveError {
     MissingCharacter,
     #[error("the scene's gil precondition changed")]
     StaleGil,
+    #[error("the scene's durable checkpoint or participant resources changed")]
+    StaleState,
+    #[error("the battle consumed an item absent from its durable starting inventory")]
+    InsufficientItems,
+    #[error("the scene battle settlement requires battle rules")]
+    MissingRules,
     #[error("the saver is not accepting scene requests")]
     Stopped,
     #[error("the scene save worker did not complete; reopen the store before retrying")]
@@ -189,6 +204,10 @@ pub(crate) enum Msg {
     Story(StoryJob),
     /// Ordered with rewards and ordinary saves, acknowledged only after a durable transaction.
     Scene { job: SceneSaveJob, done: oneshot::Sender<Result<SceneSaved, SceneSaveError>> },
+    /// Every participant's checkpoint, costs and earned resources commit in one durable operation.
+    SceneBatch { job: SceneBatchJob, done: oneshot::Sender<Result<fmv_persist::SceneBatchCommitted, SceneSaveError>> },
+    /// A coherent baseline after all earlier queued rewards/story writes, without holding the world lock.
+    SceneSnapshot { accounts: Vec<AccountId>, done: oneshot::Sender<Result<Vec<fmv_persist::SceneState>, SceneSaveError>> },
     /// Everything before this has been saved; answer and stop.
     Stop(oneshot::Sender<()>),
 }
@@ -223,6 +242,23 @@ impl SaverHandle {
         job.selected_result()?;
         let (done, finished) = oneshot::channel();
         self.tx.send(Msg::Scene { job, done }).map_err(|_| SceneSaveError::Stopped)?;
+        Ok(finished)
+    }
+
+    /// Queue a checkpoint or a shared battle settlement. A dropped receiver does not cancel it.
+    pub(crate) fn save_scene_batch(&self, job: SceneBatchJob) -> Result<oneshot::Receiver<Result<fmv_persist::SceneBatchCommitted, SceneSaveError>>, SceneSaveError> {
+        job.validate()?;
+        let (done, finished) = oneshot::channel();
+        self.tx.send(Msg::SceneBatch { job, done }).map_err(|_| SceneSaveError::Stopped)?;
+        Ok(finished)
+    }
+
+    /// Read an exact baseline ordered after prior writes. The world must reserve these accounts
+    /// before requesting it and retain that reservation through its following acknowledged commit.
+    pub(crate) fn snapshot_scene_batch(&self, accounts: Vec<AccountId>) -> Result<oneshot::Receiver<Result<Vec<fmv_persist::SceneState>, SceneSaveError>>, SceneSaveError> {
+        continuation::validate_accounts(&accounts)?;
+        let (done, finished) = oneshot::channel();
+        self.tx.send(Msg::SceneSnapshot { accounts, done }).map_err(|_| SceneSaveError::Stopped)?;
         Ok(finished)
     }
 }
@@ -389,6 +425,22 @@ async fn run(
                 // No story bytes, selected choices, or request Debug representation enter logs.
                 if result.is_ok() { info!(account = account.0, "scene transaction acknowledged"); }
                 else { error!(account = account.0, "scene transaction not acknowledged; player progress must remain held"); }
+                let _ = done.send(result);
+            }
+            Msg::SceneBatch { job, done } => {
+                let members = job.members.len();
+                let store = Arc::clone(&store);
+                let rules = rules.clone();
+                let result = tokio::task::spawn_blocking(move || persist_scene_batch(&store, game, rules.as_deref(), &job, unix_now()))
+                    .await.unwrap_or(Err(SceneSaveError::WorkerFailed));
+                if result.is_ok() { info!(members, "scene batch transaction acknowledged"); }
+                else { error!(members, "scene batch transaction not acknowledged; participants must remain held"); }
+                let _ = done.send(result);
+            }
+            Msg::SceneSnapshot { accounts, done } => {
+                let store = Arc::clone(&store);
+                let result = tokio::task::spawn_blocking(move || store.get_scene_states(&accounts, game).map_err(SceneSaveError::from))
+                    .await.unwrap_or(Err(SceneSaveError::WorkerFailed));
                 let _ = done.send(result);
             }
             Msg::Stop(done) => {

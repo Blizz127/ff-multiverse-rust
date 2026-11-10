@@ -613,8 +613,10 @@ impl ClientState {
             ServerMsg::StoryUpdate { progress, advance } => self.story.on_update(progress, advance),
             // A story scene (the server's word; it never ends the session): the scene client plays it from this machine's own
             // game and says what is owed back (see `crate::scene`).
-            msg @ (ServerMsg::SceneStart { .. } | ServerMsg::SceneStep { .. } | ServerMsg::SceneEnded { .. } | ServerMsg::SceneRefused { .. }) => {
+            msg @ (ServerMsg::SceneStart { .. } | ServerMsg::SceneStep { .. } | ServerMsg::SceneEnded { .. } | ServerMsg::SceneRefused { .. }
+                | ServerMsg::SceneBattleStarted { .. } | ServerMsg::SceneBattleResumed { .. } | ServerMsg::SceneGameOver { .. }) => {
                 self.scene.on_message(&self.area.key, msg);
+                if let Some(reason) = self.scene.failure() { return Some(reason.to_string()); }
             }
             // The countdown the server runs for our story (the server's word, never ends the session): the HUD draws
             // what it says and counts down on this clock between messages (see `crate::ui::countdown`).

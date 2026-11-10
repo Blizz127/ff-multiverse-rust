@@ -208,6 +208,10 @@ impl Camera {
         self.scale
     }
 
+    /// Raster density changes without changing the logical camera or its framing. A 2x target
+    /// needs twice the pixel offsets, including a battle camera's native-window offsets.
+    fn at_raster_scale(self, factor: f32) -> Self { Self { scale: self.scale * factor, ..self } }
+
     #[cfg(test)]
     pub fn scale(&self) -> f32 {
         self.scale
@@ -249,6 +253,24 @@ pub fn color(rgb: [u8; 3], srgb_target: bool) -> [f32; 4] {
 pub fn clear_color(rgb: [u8; 3], srgb: bool) -> wgpu::Color {
     let c = color(rgb, srgb);
     wgpu::Color { r: f64::from(c[0]), g: f64::from(c[1]), b: f64::from(c[2]), a: 1.0 }
+}
+
+/// Cover only the area outside the authored camera range. The same NDC vertices fit native
+/// and supersampled targets: layout is always calculated with the native camera and margins.
+fn field_margin_vertices(bounds: &Bounds, range: Option<Bounds>, size: (u32, u32), srgb: bool) -> Vec<Vertex> {
+    let Some(range) = range else { return Vec::new() };
+    if size.0 == 0 || size.1 == 0 || ![range.min.x, range.min.y, range.max.x, range.max.y].iter().all(|v| v.is_finite())
+        || range.min.x >= range.max.x || range.min.y >= range.max.y { return Vec::new(); }
+    let (w, h) = (size.0 as f32, size.1 as f32);
+    let cam = Camera::fit(bounds, w, h, MARGIN_PX);
+    let (lo, hi) = (cam.project(range.min.x, range.min.y), cam.project(range.max.x, range.max.y));
+    let (hw, hh) = (w * 0.5, h * 0.5);
+    let (left, right, bottom, top) = (lo[0].clamp(-hw, hw), hi[0].clamp(-hw, hw), lo[1].clamp(-hh, hh), hi[1].clamp(-hh, hh));
+    let mut out = Builder { out: Vec::new(), hw, hh, srgb };
+    for [x0, y0, x1, y1] in [[-hw, -hh, left, hh], [right, -hh, hw, hh], [-hw, -hh, hw, bottom], [-hw, top, hw, hh]] {
+        if x1 > x0 && y1 > y0 { out.quad([x0, y0], [x1, y0], [x1, y1], [x0, y1], CLEAR_RGB); }
+    }
+    out.out
 }
 
 fn brighten(rgb: [u8; 3]) -> [u8; 3] {
@@ -472,6 +494,16 @@ pub struct Gpu {
     avatars: crate::avatar::gpu::AvatarGpu,
     /// Allocated only while optional edge smoothing is selected.
     fxaa: Option<crate::graphics::fxaa::Fxaa>,
+    supersample: Option<crate::graphics::supersample::Supersample>,
+    /// Say a requested 2x fallback once per window size, rather than every frame.
+    last_scale_fallback: Option<(u32, u32)>,
+}
+
+struct SceneTarget {
+    draw: wgpu::TextureView,
+    downsample_to: Option<wgpu::TextureView>,
+    size: (u32, u32),
+    factor: f32,
 }
 
 const MIN_VERTEX_BYTES: u64 = 64 * 1024;
@@ -574,6 +606,8 @@ impl Gpu {
             ui,
             avatars,
             fxaa: None,
+            supersample: None,
+            last_scale_fallback: None,
         }
     }
 
@@ -585,6 +619,46 @@ impl Gpu {
             }
             _ => {}
         }
+    }
+
+    pub fn set_render_scale(&mut self, scale: crate::graphics::RenderScale) {
+        match scale {
+            crate::graphics::RenderScale::Native => { self.supersample = None; self.last_scale_fallback = None; }
+            crate::graphics::RenderScale::Double if self.supersample.is_none() => {
+                self.supersample = Some(crate::graphics::supersample::Supersample::new(&self.device, self.format));
+            }
+            _ => {}
+        }
+    }
+
+    fn render_plan(&self, size: (u32, u32)) -> crate::graphics::supersample::Plan {
+        use crate::graphics::{supersample::Plan, RenderScale};
+        Plan::new(size, if self.supersample.is_some() { RenderScale::Double } else { RenderScale::Native }, self.device.limits().max_texture_dimension_2d)
+    }
+
+    /// Scene -> optional 2x resolve -> optional native FXAA -> native UI. Building layout at
+    /// native size and scaling only raster coordinates keeps every overlay aligned to the scene.
+    fn scene_target(&mut self, output: &wgpu::TextureView, size: (u32, u32)) -> SceneTarget {
+        let native = self.fxaa.as_mut().map_or_else(|| output.clone(), |fxaa| fxaa.target(&self.device, size));
+        let plan = self.render_plan(size);
+        if self.supersample.is_some() && plan.effective == crate::graphics::RenderScale::Native {
+            if self.last_scale_fallback != Some(size) {
+                eprintln!("graphics: 2x scene rendering requested at {}x{}; using native resolution within GPU dimension and scene allocation limits", size.0, size.1);
+                self.last_scale_fallback = Some(size);
+            }
+        } else { self.last_scale_fallback = None; }
+        let high = self.supersample.as_mut().and_then(|supersample| supersample.target(&self.device, plan));
+        match high {
+            Some(draw) => SceneTarget { draw, downsample_to: Some(native), size: plan.size, factor: plan.factor() },
+            None => SceneTarget { draw: native, downsample_to: None, size, factor: 1.0 },
+        }
+    }
+
+    fn resolve_scene(&self, scene: &SceneTarget, output: &wgpu::TextureView) {
+        if let Some(target) = &scene.downsample_to {
+            self.supersample.as_ref().expect("2x scene target").resolve(&self.device, &self.queue, target);
+        }
+        if let Some(fxaa) = &self.fxaa { fxaa.resolve(&self.device, &self.queue, output); }
     }
 
     /// Characters the avatar renderer has uploaded so far (one entry per character, not per frame).
@@ -613,24 +687,38 @@ impl Gpu {
         avatars: Option<&crate::avatar::AvatarFrame>,
         srgb: bool,
     ) {
-        let filtered = self.fxaa.as_mut().map(|fxaa| fxaa.target(&self.device, size));
-        self.draw_field_raw(filtered.as_ref().unwrap_or(target), size, scene, avatars, srgb);
-        if let Some(fxaa) = &self.fxaa { fxaa.resolve(&self.device, &self.queue, target); }
+        self.draw_field_clipped(target, size, scene, avatars, srgb, None);
+    }
+
+    /// A follow-camera field keeps the scene inside its authored range. Clear the bars before
+    /// downsampling/FXAA so off-range actors cannot bleed into the visible edge, and restore
+    /// their exact clear colour afterward. The caller draws native HUD/text after this method.
+    pub fn draw_field_clipped(
+        &mut self, target: &wgpu::TextureView, size: (u32, u32), scene: &Scene<'_>,
+        avatars: Option<&crate::avatar::AvatarFrame>, srgb: bool, range: Option<Bounds>,
+    ) {
+        let raster = self.scene_target(target, size);
+        let margins = field_margin_vertices(&scene.bounds, range, size, srgb);
+        self.draw_field_raw(&raster, size, scene, avatars, srgb);
+        self.draw_shapes(&raster.draw, &margins);
+        self.resolve_scene(&raster, target);
+        if raster.downsample_to.is_some() || self.fxaa.is_some() { self.draw_shapes(target, &margins); }
     }
 
     fn draw_field_raw(
-        &mut self, target: &wgpu::TextureView, size: (u32, u32), scene: &Scene<'_>,
+        &mut self, raster: &SceneTarget, size: (u32, u32), scene: &Scene<'_>,
         avatars: Option<&crate::avatar::AvatarFrame>, srgb: bool,
     ) {
         let (w, h) = size;
+        let target = &raster.draw;
         // The one fitted camera everything of the frame is placed by.
-        let cam = Camera::fit(&scene.bounds, w.max(1) as f32, h.max(1) as f32, MARGIN_PX);
+        let cam = Camera::fit(&scene.bounds, w.max(1) as f32, h.max(1) as f32, MARGIN_PX).at_raster_scale(raster.factor);
         let vertices = build_vertices(scene, w, h, srgb);
         let tiled = avatars.filter(|f| !f.models.is_empty() && self.avatars.prepare_scenery(f));
         if let Some(frame) = tiled {
-            self.avatars.draw_scenery(target, size, &cam, frame, clear_color(CLEAR_RGB, srgb));
+            self.avatars.draw_scenery(target, raster.size, &cam, frame, clear_color(CLEAR_RGB, srgb));
             self.draw_shapes(target, &vertices);
-            self.avatars.draw_models(target, size, &cam, frame, true);
+            self.avatars.draw_models(target, raster.size, &cam, frame, true);
             return;
         }
         // The picture goes to the GPU once (again only if it changes); without one, or if the
@@ -641,7 +729,7 @@ impl Gpu {
         };
         self.draw_scene(target, &vertices, quad.as_ref(), CLEAR_RGB, srgb);
         if let Some(frame) = avatars {
-            self.avatars.draw_models(target, size, &cam, frame, false);
+            self.avatars.draw_models(target, raster.size, &cam, frame, false);
         }
     }
 
@@ -853,9 +941,9 @@ impl Gpu {
 
     /// A flat fallback battle gets the same optional filter as the 3D scene.
     pub fn draw_flat(&mut self, target: &wgpu::TextureView, size: (u32, u32), vertices: &[Vertex], srgb: bool) {
-        let filtered = self.fxaa.as_mut().map(|fxaa| fxaa.target(&self.device, size));
-        self.draw_scene(filtered.as_ref().unwrap_or(target), vertices, None, CLEAR_RGB, srgb);
-        if let Some(fxaa) = &self.fxaa { fxaa.resolve(&self.device, &self.queue, target); }
+        let raster = self.scene_target(target, size);
+        self.draw_scene(&raster.draw, vertices, None, CLEAR_RGB, srgb);
+        self.resolve_scene(&raster, target);
     }
 
     /// Draw one frame of a battle ([`crate::battle::scene`]) into `target` (`size` pixels): clear it,
@@ -863,19 +951,21 @@ impl Gpu {
     /// the models and the marks on the ground under them through the avatar renderer, depth-tested
     /// with a fresh depth buffer. The UI overlay is the caller's to draw after.
     pub fn draw_battle(&mut self, target: &wgpu::TextureView, size: (u32, u32), frame: &crate::battle::scene::BattleFrame, srgb: bool) {
-        let filtered = self.fxaa.as_mut().map(|fxaa| fxaa.target(&self.device, size));
-        self.draw_battle_raw(filtered.as_ref().unwrap_or(target), size, frame, srgb);
-        if let Some(fxaa) = &self.fxaa { fxaa.resolve(&self.device, &self.queue, target); }
+        let raster = self.scene_target(target, size);
+        self.draw_battle_raw(&raster, frame, srgb);
+        self.resolve_scene(&raster, target);
     }
 
-    fn draw_battle_raw(&mut self, target: &wgpu::TextureView, size: (u32, u32), frame: &crate::battle::scene::BattleFrame, srgb: bool) {
+    fn draw_battle_raw(&mut self, raster: &SceneTarget, frame: &crate::battle::scene::BattleFrame, srgb: bool) {
+        let target = &raster.draw;
+        let cam = frame.camera.at_raster_scale(raster.factor);
         self.draw_scene(target, &frame.stage, None, frame.clear_rgb, srgb);
         // The location, when there is one, in a pass of its own: the actors' pass then starts with a
         // fresh depth buffer, so the marks under the actors are not covered by the location's floor.
         if let Some(location) = &frame.location {
-            self.avatars.draw_models(target, size, &frame.camera, location, false);
+            self.avatars.draw_models(target, raster.size, &cam, location, false);
         }
-        self.avatars.draw_models_tinted(target, size, &frame.camera, &frame.models, &frame.tints, &frame.identities, false);
+        self.avatars.draw_models_tinted(target, raster.size, &cam, &frame.models, &frame.tints, &frame.identities, false);
     }
 }
 
@@ -995,6 +1085,7 @@ impl Renderer {
 
     pub fn set_graphics(&mut self, settings: crate::graphics::Settings) {
         self.gpu.set_anti_aliasing(settings.anti_aliasing);
+        self.gpu.set_render_scale(settings.render_scale);
         self.graphics = settings;
     }
 
@@ -1007,6 +1098,16 @@ impl Renderer {
             return "Graphics changed for this session; settings could not be saved";
         }
         self.graphics.anti_aliasing.notice()
+    }
+
+    pub fn toggle_render_scale(&mut self) -> String {
+        let saved = self.graphics.toggle_render_scale();
+        self.gpu.set_render_scale(self.graphics.render_scale);
+        let notice = self.graphics.render_scale.notice(self.gpu.render_plan(self.size).effective);
+        match saved {
+            Ok(_) => notice.to_string(),
+            Err(e) => { eprintln!("graphics: {e}"); format!("{notice}; not saved") }
+        }
     }
 
     /// "adapter name (backend, device type)" for logs.
@@ -1071,7 +1172,15 @@ impl Renderer {
         avatars: Option<&crate::avatar::AvatarFrame>,
         overlay: Option<&crate::ui::draw::DrawList>,
     ) -> FrameResult {
-        self.render_layers_with_preview(scene, avatars, overlay, None)
+        self.render_layers_clipped(scene, avatars, overlay, None)
+    }
+
+    /// Draw a follow-camera field inside its authored range, with native UI over the result.
+    pub fn render_layers_clipped(
+        &mut self, scene: &Scene<'_>, avatars: Option<&crate::avatar::AvatarFrame>,
+        overlay: Option<&crate::ui::draw::DrawList>, range: Option<Bounds>,
+    ) -> FrameResult {
+        self.render_field_layers(scene, avatars, overlay, None, range)
     }
 
     /// Render a character preview after the menu overlay, using pixel-space projection.
@@ -1081,6 +1190,13 @@ impl Renderer {
         avatars: Option<&crate::avatar::AvatarFrame>,
         overlay: Option<&crate::ui::draw::DrawList>,
         preview: Option<&crate::avatar::AvatarFrame>,
+    ) -> FrameResult {
+        self.render_field_layers(scene, avatars, overlay, preview, None)
+    }
+
+    fn render_field_layers(
+        &mut self, scene: &Scene<'_>, avatars: Option<&crate::avatar::AvatarFrame>,
+        overlay: Option<&crate::ui::draw::DrawList>, preview: Option<&crate::avatar::AvatarFrame>, range: Option<Bounds>,
     ) -> FrameResult {
         let (w, h) = self.size;
         if w == 0 || h == 0 {
@@ -1115,7 +1231,10 @@ impl Renderer {
             wgpu::CurrentSurfaceTexture::Validation => return FrameResult::Skipped,
         };
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        self.gpu.draw_field(&view, (w, h), scene, avatars, self.srgb);
+        match range {
+            Some(range) => self.gpu.draw_field_clipped(&view, (w, h), scene, avatars, self.srgb, Some(range)),
+            None => self.gpu.draw_field(&view, (w, h), scene, avatars, self.srgb),
+        }
         if let Some(overlay) = overlay {
             self.gpu.draw_overlay(&view, &overlay.vertices(w, h, self.srgb));
         }
@@ -1236,6 +1355,23 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extra_raster_samples_preserve_field_margins_and_battle_pixel_framing() {
+        let bounds = Bounds { min: Pos::new(-173.0, -65.0, 0.0), max: Pos::new(227.0, 175.0, 0.0) };
+        for size in [(1100, 680), (319, 241)] {
+            for camera in [Camera::fit(&bounds, size.0 as f32, size.1 as f32, MARGIN_PX), Camera::pixels(73.0, -29.0)] {
+                let high = camera.at_raster_scale(2.0);
+                assert_eq!(high.centre(), camera.centre());
+                for point in [[-50.0, 78.0], [0.0, 0.0], [170.0, -150.0]] {
+                    let a = camera.project(point[0], point[1]);
+                    let b = high.project(point[0], point[1]);
+                    assert_eq!(b, a.map(|v| v * 2.0));
+                    assert_eq!([a[0] / size.0 as f32, a[1] / size.1 as f32], [b[0] / (size.0 * 2) as f32, b[1] / (size.1 * 2) as f32]);
+                }
+            }
+        }
+    }
 
     fn bounds(minx: f32, miny: f32, maxx: f32, maxy: f32) -> Bounds {
         Bounds {

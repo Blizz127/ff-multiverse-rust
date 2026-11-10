@@ -436,6 +436,7 @@ struct EntryRecords {
     account: AccountRecord,
     avatar: Option<AvatarProfile>,
     character: Option<PlayerCharacter>,
+    requires_scene_format: bool,
 }
 
 fn load_records(dir: &Path, manifest: &Manifest) -> Result<EntryRecords> {
@@ -473,16 +474,19 @@ fn load_records(dir: &Path, manifest: &Manifest) -> Result<EntryRecords> {
     };
     // The progress records are only checked here (they are written after the commit, by `write_progress`): a
     // restore that would fail on one of them must fail before it changes anything.
+    let mut requires_scene_format = false;
     for rel in manifest.files.iter().filter(|rel| rel.starts_with(PROGRESSION_DIR)) {
-        read_progress(&dir.join(rel), rel, id)?;
+        if let Progress::Character(record) = read_progress(&dir.join(rel), rel, id)? {
+            requires_scene_format |= record.progress.schema_version >= 3;
+        }
     }
-    Ok(EntryRecords { account, avatar, character })
+    Ok(EntryRecords { account, avatar, character, requires_scene_format })
 }
 
 /// A progress record of an entry (story blob or character progress), checked against the account it was filed under.
 enum Progress {
     Story(Progression),
-    Character(CharacterRecord),
+    Character(Box<CharacterRecord>),
 }
 
 fn read_progress(path: &Path, rel: &str, account: u64) -> Result<Progress> {
@@ -506,7 +510,14 @@ fn read_progress(path: &Path, rel: &str, account: u64) -> Result<Progress> {
             if record.progress.account_id.0 != account || !known(record.progress.game) {
                 return Err(PersistError::corrupt(path, "the record is not for this account and the game its name says"));
             }
-            Ok(Progress::Character(record))
+            // A continuation owns its exact account and roster until it is settled. Trash
+            // restoration allocates a different account id, so preserving these bytes would
+            // leave a checkpoint or another participant's reservation pointing at the old roster.
+            // This check also applies during interrupted-restore recovery, before any rekey.
+            if record.has_continuation() {
+                return Err(PersistError::TransactionConflict("account has an unfinished scene continuation or battle reservation".into()));
+            }
+            Ok(Progress::Character(Box::new(record)))
         }
     }
 }
@@ -532,7 +543,7 @@ fn write_progress(root: &Path, dir: &Path, manifest: &Manifest, new_account: u64
                 Progress::Character(mut record) => {
                     // Keep the durable scene receipts along with the character's earned progress.
                     record.progress.account_id = AccountId(new_account);
-                    fsio::write_json(&target, &record, MAX_CHARACTER_RECORD_BYTES)
+                    fsio::write_json(&target, record.as_ref(), MAX_CHARACTER_RECORD_BYTES)
                 }
             }
         });
@@ -694,7 +705,9 @@ impl Store {
     ///
     /// The store knows nothing of who is connected: a server that must not delete an account while it is being
     /// played refuses before it calls this. Fails with [`PersistError::UnknownAccount`] for an account that does
-    /// not exist (also one that was deleted a moment ago). `now` is the caller's unix time in seconds.
+    /// not exist (also one that was deleted a moment ago). An active durable scene continuation
+    /// or battle reservation refuses deletion before a trash plan is written. `now` is the
+    /// caller's unix time in seconds.
     pub fn delete_account(&self, account: AccountId, now: u64) -> Result<Deleted> {
         // Held for the whole delete: no other write, and no snapshot, sees it half done.
         let _counters = self.writer()?;
@@ -744,6 +757,12 @@ impl Store {
     /// Step 1: collect the account's files and write the plan.
     fn prepare_delete(&self, account: AccountId, now: u64) -> Result<Prepared> {
         let (name, avatar, files) = self.collect_files(account)?;
+        // Do not strand one member of an all-participant scene transaction in the trash.
+        // Check every game before writing the intent, including reservation-only guests;
+        // damaged character records fail closed rather than becoming silently releasable.
+        for rel in files.iter().filter(|rel| rel.starts_with(PROGRESSION_DIR) && rel.ends_with(".character.json")) {
+            read_progress(&self.root.join(rel), rel, account.0)?;
+        }
         let manifest = Manifest {
             schema_version: MANIFEST_VERSION,
             kind: MANIFEST_KIND.to_owned(),
@@ -911,6 +930,9 @@ impl Store {
         };
         let token = new_token()?;
         let hash = token_hash(&token);
+        // A completed schema-3 archive can be brought into an older-format store. Its
+        // receipts still require the same global rollback fence as a fresh batch does.
+        if records.requires_scene_format { self.ensure_scene_batch_format(&counters)?; }
         self.clear_uncommitted_account_state(new_account)?;
 
         // 1. The intent, so that a crash can be undone or finished: the plan goes into the manifest, and the entry
