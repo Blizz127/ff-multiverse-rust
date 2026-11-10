@@ -119,6 +119,11 @@ set both `Var[3][211]` bits 0 and 2; the second set bit 2 only. Each run also sk
 and `MENU`, had one unresolved position read and dropped 28 or 30 off-cast stage events. This
 helps identify the missing work; it does not establish safe playback, cast, state, or completion
 in the real engine.
+An unregistered `early_bar_scene()` adds the observed six missing actors and runs the field's
+stage director as setup. With the same two answers in owned data, it reaches six windows and
+moment 69 without unresolved positions or off-cast events. Its test verifies model/idle stems
+against the field loader. It still skips party/menu effects and assumes unsaved state; neither
+its witness nor the real route has been validated.
 
 An exploratory real-data run of `tin_1` director main at moment 48 produced two windows and a
 moment-51 write, but ended at the VM frame budget with one unresolved read. It also ran looping

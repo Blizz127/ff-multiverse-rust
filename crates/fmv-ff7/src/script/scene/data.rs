@@ -216,6 +216,8 @@ pub const PROOF_FIELD: &str = "mds7pb_1";
 pub const POST_ESCAPE_SCENE_ID: &str = "ff7/md8_4/post-escape";
 pub const STATION_SCENE_ID: &str = "ff7/md8_1/post-escape-station";
 pub const TRAIN_SCENE_ID: &str = "ff7/tin_1/sector-seven-train";
+/// Survey-only early Seventh Heaven director; not registered for play.
+pub const EARLY_BAR_SCENE_ID: &str = "ff7/mds7pb_1/early-bar-survey";
 
 /// Field-authored cast and director scripts at moment 33. Not registered until the arrival
 /// trigger and subsequent field transition are ready to serve together.
@@ -279,6 +281,26 @@ pub fn train_scene() -> SceneDef {
         // Deliberately absent until a visible walkmesh location has been checked.
         witness: vec![], arrival: Spot { x: -2, y: 608, triangle: 29, direction: 252 },
     }
+}
+
+/// Exploratory early bar director at moment 63. This is not registered: party/menu effects,
+/// persistent flags, timing, witness placement and the route into this field are not ready.
+pub fn early_bar_scene() -> SceneDef {
+    let mut def = proof_scene();
+    def.id = EARLY_BAR_SCENE_ID.into();
+    def.trigger = Trigger { entity: 7, name: "direct".into(), slot: 1, talk_radius: 0, moments: 63..=63 };
+    def.setup = vec![ScriptRef::new(10, 1)];
+    def.given.clear();
+    def.root = vec![Step::Await(ScriptRef::new(7, 1))];
+    for (entity, name, hrc, idle) in [
+        (23, "aval", "bwfd", "acfe"), (24, "avas", "bxbe", "acfe"),
+        (25, "marine", "cyae", "bnac"), (26, "camera", "cyif", "acfe"),
+        (28, "cash", "czgb", "czge"), (29, "flower", "czgf", "czhc"),
+    ] {
+        def.cast.push(CastMember { entity, name: name.into(), look: Look::Model { hrc: hrc.into(), idle: idle.into() }, start: None });
+    }
+    def.witness.clear();
+    def
 }
 
 /// Script entities and slots of the proof field (measured on the owned Steam copy: `tests/scene_real.rs` checks them).

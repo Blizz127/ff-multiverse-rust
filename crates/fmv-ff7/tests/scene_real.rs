@@ -161,6 +161,40 @@ fn train_director_finishes_after_its_authored_actor_work() {
     }
 }
 
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA); early bar is not enabled"]
+fn early_bar_survey_tracks_both_choices_and_stages_its_cast() {
+    let f = field("mds7pb_1").expect("FMV_FF7_DATA and mds7pb_1");
+    let def = fmv_ff7::script::scene::early_bar_scene();
+    let loader = f.model_loader().unwrap();
+    for (member, index) in def.cast.iter().skip(2).zip([4usize, 5, 6, 7, 9, 10]) {
+        let Look::Model { hrc, idle } = &member.look else { panic!("expected a field model") };
+        let model = &loader.models[index];
+        assert_eq!(model.hrc_stem(), *hrc);
+        assert_eq!(model.animations.first().map(|a| a.stem()).as_deref(), Some(idle.as_str()));
+    }
+    for answer in [1usize, 2] {
+        let outcome = run_to_end(&f, &def, &StoryState::at(63), 1, &[answer]).unwrap();
+        assert!(outcome.unknown_persistent_reads.contains(&(3, 211)));
+        let mut play = ScenePlay::new(&f, &def, &StoryState::at(63), 1).unwrap();
+        assert!(!play.setup_stats().setup_incomplete);
+        let mut next = None;
+        let mut windows = 0;
+        loop {
+            match play.next(next.take()).then {
+                Then::Window(w) => { windows += 1; if w.message.choice.is_some() { next = Some(answer); } }
+                Then::End { how, .. } => { assert_eq!(how, End::Finished); break; }
+            }
+        }
+        assert_eq!(windows, 6);
+        assert_eq!(play.writes().moment, Some(69));
+        assert_eq!(play.writes().untracked.get(&(3, 211)), Some(&if answer == 1 { 5 } else { 4 }));
+        assert_eq!((play.stats().unresolved, play.stats().dropped_requests, play.off_cast()), (0, 0, 0));
+        assert!(play.stats().unknown.is_empty());
+        assert!(play.stats().ignored.contains_key("MMBud") && play.stats().ignored.contains_key("MENU"));
+    }
+}
+
 // ---- 1. the trigger is found -----------------------------------------------------------------
 
 #[test]
