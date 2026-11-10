@@ -136,6 +136,9 @@ pub struct SceneDef {
     /// own step (read from the script by the story model, not from this run) when it ends. It writes nothing of its own and
     /// sends nobody anywhere. `None` for every other scene.
     pub presents: Option<u16>,
+    /// The same kind of cutscene for an existing saved bit turning on without changing the moment.
+    /// `(bank, address, bit)` must be carried by the story; unknown bits never match. Mutually exclusive with `presents`.
+    pub presents_bit: Option<(u8, u8, u8)>,
     /// A victory-only continuation. Reconstruct this root up to the first BATTLE of this formation, then show only
     /// its tail. Never offered on entry or before combat; the server starts it only after a matching story battle wins.
     /// It cannot save, start combat, or delay the victory's existing story step/countdown.
@@ -187,12 +190,12 @@ impl SceneDef {
     /// offered, and the world runs the ones that fire on entry BEFORE it judges the scene, so a point that writes the
     /// scene's moment (as `md8_1`'s does) would leave the scene never offered (`tests/scene_real.rs` holds the list to it).
     pub fn starts_on_arrival(&self) -> bool {
-        self.trigger.talk_radius == 0 && self.presents.is_none()
+        self.trigger.talk_radius == 0 && !self.is_point_cutscene()
     }
 
     /// Whether this scene is the cutscene of the step of field `field` that takes a story from `before` to `after` (see
-    /// [`SceneDef::presents`]): the field is the scene's, the step moves the moment up to the one the scene presents, and the
-    /// scene applies at the story the step starts from.
+    /// [`SceneDef::presents`] and [`SceneDef::presents_bit`]): the field and transition match, and the scene applies at
+    /// the story the step starts from.
     pub fn presents_step(&self, field: &str, before: &StoryState, after: &StoryState) -> bool {
         self.resume_after_battle.is_none() && self.matches_step(field, before, after)
     }
@@ -203,7 +206,19 @@ impl SceneDef {
     }
 
     fn matches_step(&self, field: &str, before: &StoryState, after: &StoryState) -> bool {
-        self.field.eq_ignore_ascii_case(field) && self.presents == Some(after.moment) && after.moment > before.moment && self.applies_at(before.moment)
+        if !self.field.eq_ignore_ascii_case(field) || !self.applies_at(before.moment) { return false; }
+        match (self.presents, self.presents_bit) {
+            (Some(moment), None) => after.moment == moment && after.moment > before.moment,
+            (None, Some((bank, address, bit))) => before.moment == after.moment
+                && before.known_bit(bank, address, bit) == Some(false)
+                && after.known_bit(bank, address, bit) == Some(true),
+            _ => false,
+        }
+    }
+
+    /// Whether this scene belongs to a story point instead of being offered independently.
+    pub fn is_point_cutscene(&self) -> bool {
+        self.presents.is_some() || self.presents_bit.is_some()
     }
 
     /// Whether the scene has already begun for `story`: every mark its own root turns on first (the field's way of saying that
@@ -222,7 +237,7 @@ impl SceneDef {
     /// Whether the scene is on offer for `story`: at its moment and not begun yet (module docs: a story scene plays once per
     /// story, as far as the story carries its mark).
     pub fn offered_to(&self, story: &StoryState) -> bool {
-        self.presents.is_none() && self.applies_at(story.moment) && !self.begun_in(story)
+        !self.is_point_cutscene() && self.applies_at(story.moment) && !self.begun_in(story)
     }
 
     /// The same scene with another cast (the entities the script drives stay; the actors that play them change).
@@ -299,7 +314,7 @@ pub fn post_escape_scene() -> SceneDef {
         // walkmesh rule (71 units from the cast, 76 from the edge) and stays out of the way, behind the rock: the body is
         // barely visible.
         witness: vec![Spot { x: -133, y: 144, triangle: 0, direction: 0 }],
-        arrival: Spot { x: 82, y: 267, triangle: 3, direction: 0 }, presents: None, resume_after_battle: None,
+        arrival: Spot { x: 82, y: 267, triangle: 3, direction: 0 }, presents: None, resume_after_battle: None, presents_bit: None,
     }
 }
 
@@ -349,7 +364,7 @@ pub fn train_scene() -> SceneDef {
         setup: vec![ScriptRef::new(40, 0)], given: vec![], root: vec![Step::StartMain(17)], cast,
         speakers: vec![("Cloud".into(), 30), ("Barret".into(), 31), ("Biggs".into(), 33), ("Jessie".into(), 34), ("Wedge".into(), 35)],
         // Deliberately absent until a visible walkmesh location has been checked.
-        witness: vec![], arrival: Spot { x: -2, y: 608, triangle: 29, direction: 252 }, presents: None, resume_after_battle: None,
+        witness: vec![], arrival: Spot { x: -2, y: 608, triangle: 29, direction: 252 }, presents: None, resume_after_battle: None, presents_bit: None,
     }
 }
 
@@ -410,7 +425,7 @@ pub fn team_talk_scene() -> SceneDef {
         // Known gap until a spot is measured: the player stands where it reached the point.
         witness: vec![],
         arrival: Spot { x: 1120, y: 1468, triangle: 62, direction: 0 },
-        presents: Some(7), resume_after_battle: None,
+        presents: Some(7), resume_after_battle: None, presents_bit: None,
     }
 }
 
@@ -450,7 +465,7 @@ pub fn reactor_door_scene() -> SceneDef {
         // Known gap until a spot is measured: the player stands where it crossed the line.
         witness: vec![],
         arrival: Spot { x: -704, y: 2150, triangle: 25, direction: 128 },
-        presents: Some(11), resume_after_battle: None,
+        presents: Some(11), resume_after_battle: None, presents_bit: None,
     }
 }
 
@@ -487,7 +502,7 @@ pub fn guard_scorpion_scene() -> SceneDef {
         // Known gap until a spot is measured: the player stands where it reached the point.
         witness: vec![],
         arrival: Spot { x: -67, y: -1571, triangle: 2, direction: 0 },
-        presents: Some(27), resume_after_battle: None,
+        presents: Some(27), resume_after_battle: None, presents_bit: None,
     }
 }
 
@@ -502,6 +517,28 @@ pub fn guard_scorpion_victory_scene() -> SceneDef {
     def.root = vec![Step::Await(ScriptRef::new(4, 3))];
     def.resume_after_battle = Some(324);
     def
+}
+
+/// Jessie's rescue on the way out of the reactor: the existing saved bit, not another moment.
+pub const JESSIE_RESCUE_SCENE_ID: &str = "ff7/nmkin_3/jessie-rescue";
+
+pub fn jessie_rescue_scene() -> SceneDef {
+    use crate::story::{FREED_BIT, REACTOR_STATE};
+    let arrival = Spot { x: -183, y: 1271, triangle: 6, direction: 0 };
+    let cast = [(3, "cl", "aaaa", "acfe"), (4, "av_j", "axdc", "acfe")]
+        .into_iter().map(|(entity, name, hrc, idle)| CastMember {
+            entity, name: name.into(), look: Look::Model { hrc: hrc.into(), idle: idle.into() },
+            start: (entity == 3).then_some(arrival),
+        }).collect();
+    SceneDef {
+        id: JESSIE_RESCUE_SCENE_ID.into(), game: "ff7".into(), field: "nmkin_3".into(),
+        trigger: Trigger { entity: 4, name: "av_j".into(), slot: 1, talk_radius: 0, moments: 27..=27 },
+        setup: [3, 4].into_iter().map(|entity| ScriptRef::new(entity, 0)).collect(),
+        given: vec![], root: vec![Step::Await(ScriptRef::new(4, 1))], cast,
+        speakers: vec![("Cloud".into(), 3), ("Jessie".into(), 4)], witness: vec![], arrival,
+        presents: None, resume_after_battle: None,
+        presents_bit: Some((REACTOR_STATE.bank, REACTOR_STATE.address, FREED_BIT)),
+    }
 }
 
 /// Offline director survey at moment 51. The route, witness, field effects and party state
@@ -521,7 +558,7 @@ pub fn sector7_station_scene() -> SceneDef {
         trigger: Trigger { entity: 1, name: "produce".into(), slot: 0, talk_radius: 0, moments: 51..=51 },
         setup: vec![], given: vec![], root: vec![Step::StartMain(1)], cast,
         speakers: vec![("Cloud".into(), 11), ("Barret".into(), 12)],
-        witness: vec![], arrival: Spot { x: -2891, y: 3392, triangle: 26, direction: 0 }, presents: None, resume_after_battle: None,
+        witness: vec![], arrival: Spot { x: -2891, y: 3392, triangle: 26, direction: 0 }, presents: None, resume_after_battle: None, presents_bit: None,
     }
 }
 
@@ -541,7 +578,7 @@ pub fn sector7_intro_scene() -> SceneDef {
         id: SECTOR7_INTRO_SCENE_ID.into(), game: "ff7".into(), field: "mds7".into(),
         trigger: Trigger { entity: 7, name: "produce".into(), slot: 0, talk_radius: 0, moments: 63..=63 },
         setup: vec![], given: vec![], root: vec![Step::StartMain(7)], cast, speakers: vec![],
-        witness: vec![], arrival: Spot { x: 1641, y: -328, triangle: 109, direction: 0 }, presents: None, resume_after_battle: None,
+        witness: vec![], arrival: Spot { x: 1641, y: -328, triangle: 109, direction: 0 }, presents: None, resume_after_battle: None, presents_bit: None,
     }
 }
 
@@ -560,7 +597,7 @@ pub fn flower_station_scene() -> SceneDef {
         trigger: Trigger { entity: 0, name: "dic".into(), slot: 0, talk_radius: 0, moments: 36..=36 },
         setup: vec![], given: vec![], root: vec![Step::StartMain(0)], cast,
         speakers: vec![("Cloud".into(), 1), ("Aerith".into(), 2)],
-        witness: vec![], arrival: Spot { x: -3445, y: 21419, triangle: 34, direction: 0 }, presents: None, resume_after_battle: None,
+        witness: vec![], arrival: Spot { x: -3445, y: 21419, triangle: 34, direction: 0 }, presents: None, resume_after_battle: None, presents_bit: None,
     }
 }
 
@@ -580,7 +617,7 @@ pub fn reactor_opening_scene() -> SceneDef {
         id: REACTOR_OPENING_SCENE_ID.into(), game: "ff7".into(), field: "md1stin".into(),
         trigger: Trigger { entity: 0, name: "dir".into(), slot: 0, talk_radius: 0, moments: 0..=0 },
         setup: vec![], given: vec![], root: vec![Step::StartMain(0)], cast, speakers: vec![],
-        witness: vec![], arrival: Spot { x: 3655, y: 27432, triangle: 25, direction: 128 }, presents: None, resume_after_battle: None,
+        witness: vec![], arrival: Spot { x: 3655, y: 27432, triangle: 25, direction: 128 }, presents: None, resume_after_battle: None, presents_bit: None,
     }
 }
 
@@ -600,7 +637,7 @@ pub fn cargo_train_scene() -> SceneDef {
         setup: (11..=15).map(|e| ScriptRef::new(e, 0)).collect(), given: vec![],
         root: vec![Step::StartMain(6)], cast,
         speakers: vec![("Cloud".into(), 11), ("Barret".into(), 12)],
-        witness: vec![], arrival: Spot { x: 0, y: 0, triangle: 0, direction: 0 }, presents: None, resume_after_battle: None,
+        witness: vec![], arrival: Spot { x: 0, y: 0, triangle: 0, direction: 0 }, presents: None, resume_after_battle: None, presents_bit: None,
     }
 }
 
@@ -618,7 +655,7 @@ pub fn sector7_pillar_scene() -> SceneDef {
         id: SECTOR7_PILLAR_SCENE_ID.into(), game: "ff7".into(), field: "mds7plr1".into(),
         trigger: Trigger { entity: 1, name: "produce".into(), slot: 0, talk_radius: 0, moments: 63..=63 },
         setup: vec![], given: vec![], root: vec![Step::StartMain(1)], cast, speakers: vec![],
-        witness: vec![], arrival: Spot { x: 378, y: -264, triangle: 65, direction: 0 }, presents: None, resume_after_battle: None,
+        witness: vec![], arrival: Spot { x: 378, y: -264, triangle: 65, direction: 0 }, presents: None, resume_after_battle: None, presents_bit: None,
     }
 }
 
@@ -690,7 +727,7 @@ pub fn proof_scene() -> SceneDef {
             Spot { x: -100, y: 60, triangle: 68, direction: 1 },
         ],
         // At the counter's edge, facing Tifa across it (she stands at (-268, -105); her talk radius is 150).
-        arrival: Spot { x: -124, y: -112, triangle: 27, direction: 192 }, presents: None, resume_after_battle: None,
+        arrival: Spot { x: -124, y: -112, triangle: 27, direction: 192 }, presents: None, resume_after_battle: None, presents_bit: None,
     }
 }
 
@@ -698,7 +735,7 @@ pub fn proof_scene() -> SceneDef {
 /// ones before it keep their numbers): the proof, the two the escape from the first reactor ends in, and the cutscenes of the
 /// reactor's own story points.
 pub fn scenes() -> Vec<SceneDef> {
-    vec![proof_scene(), post_escape_scene(), station_scene(), team_talk_scene(), reactor_door_scene(), guard_scorpion_scene(), guard_scorpion_victory_scene()]
+    vec![proof_scene(), post_escape_scene(), station_scene(), team_talk_scene(), reactor_door_scene(), guard_scorpion_scene(), guard_scorpion_victory_scene(), jessie_rescue_scene()]
 }
 
 /// Whether `field` (the archive's spelling; case does not matter) is the field of a scene the game offers: a place a

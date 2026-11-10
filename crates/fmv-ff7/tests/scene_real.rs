@@ -465,12 +465,18 @@ fn the_offered_scenes_are_told_apart_and_start_one_way_each() {
     let all = scenes();
     for (i, a) in all.iter().enumerate() {
         assert!(all.iter().skip(i + 1).all(|b| b.id != a.id), "{}", a.id);
-        assert_eq!(a.starts_on_arrival(), a.trigger.talk_radius == 0 && a.presents.is_none());
+        assert_eq!(a.starts_on_arrival(), a.trigger.talk_radius == 0 && !a.is_point_cutscene());
         if let Some(moment) = a.presents {
             // A cutscene: no reach, offered at moments before the one its point moves to, and in a field whose story points
             // are served (a reviewed field), or it would never play.
             assert_eq!(a.trigger.talk_radius, 0, "{}", a.id);
             assert!(*a.trigger.moments.end() < moment, "{}", a.id);
+            assert!(fmv_ff7::is_reviewed_field(&a.field), "{}: a cutscene's point must be served", a.id);
+        }
+        if let Some((bank, address, bit)) = a.presents_bit {
+            assert!(a.presents.is_none() && a.resume_after_battle.is_none(), "{}", a.id);
+            assert_eq!(a.trigger.talk_radius, 0, "{}", a.id);
+            assert!(StoryState::at(*a.trigger.moments.start()).known_bit(bank, address, bit).is_some());
             assert!(fmv_ff7::is_reviewed_field(&a.field), "{}: a cutscene's point must be served", a.id);
         }
         if a.starts_on_arrival() {
@@ -1051,7 +1057,7 @@ fn the_proof_scene_writes_only_its_mark_once_and_a_scene_that_moves_the_moment_r
         ],
         speakers: vec![("Cloud".into(), CLOUD), ("Tifa".into(), TIFA)],
         witness: Vec::new(),
-        arrival: fmv_ff7::script::scene::Spot { x: 0, y: 0, triangle: 0, direction: 0 }, presents: None, resume_after_battle: None,
+        arrival: fmv_ff7::script::scene::Spot { x: 0, y: 0, triangle: 0, direction: 0 }, presents: None, resume_after_battle: None, presents_bit: None,
     };
     let out = run_to_end(&f, &leaving, &StoryState::at(81), 1, &[]).unwrap();
     assert_eq!(out.end, End::MapJump { field: 294 }, "the scene ends where the script leaves the field");
@@ -1167,4 +1173,96 @@ fn guard_scorpion_victory_continuation_has_only_the_two_tail_windows_and_saves_n
     assert!(outcome.writes.is_story_neutral(), "{outcome:?}");
     assert_eq!(outcome.questions, 0);
     assert_eq!(auto_witnesses(&f, &def, &story, 1, 3).len(), 3);
+}
+
+#[test]
+fn jessie_rescue_matches_only_the_existing_flag_turning_on() {
+    use fmv_ff7::script::scene::jessie_rescue_scene;
+    use fmv_ff7::story::{FREED_BIT, LIFT_BIT, REACTOR_STATE};
+    let mut def = jessie_rescue_scene();
+    let before = StoryState::at(27);
+    let mut after = before.clone();
+    assert!(after.set_bit(REACTOR_STATE.bank, REACTOR_STATE.address, FREED_BIT, true));
+    assert!(def.presents_step("NMKIN_3", &before, &after));
+    assert!(!def.starts_on_arrival() && !def.offered_to(&before) && !def.offered_to(&after));
+    assert!(!def.presents_step("nmkin_2", &before, &after));
+    assert!(!def.presents_step("nmkin_3", &after, &after), "already rescued");
+    assert!(!def.presents_step("nmkin_3", &after, &before), "never match a reset");
+    assert!(!def.follows_battle_step("nmkin_3", &before, &after, 324));
+    let mut lift_only = before.clone();
+    lift_only.set_bit(REACTOR_STATE.bank, REACTOR_STATE.address, LIFT_BIT, true);
+    assert!(!def.presents_step("nmkin_3", &before, &lift_only));
+    after.moment = 28;
+    assert!(!def.presents_step("nmkin_3", &before, &after), "not a moment step");
+    let mut early = StoryState::at(26);
+    early.set_bit(REACTOR_STATE.bank, REACTOR_STATE.address, FREED_BIT, true);
+    assert!(!def.presents_step("nmkin_3", &StoryState::at(26), &early));
+    after.moment = 27;
+    def.presents_bit = Some((1, 225, 6));
+    assert!(!def.presents_step("nmkin_3", &before, &after), "unknown flags never match");
+    def = jessie_rescue_scene();
+    def.presents = Some(27);
+    assert!(!def.presents_step("nmkin_3", &before, &after), "ambiguous metadata never matches");
+}
+
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn jessie_rescue_plays_three_windows_and_matches_the_existing_saved_step() {
+    use fmv_adapter_api::AreaRuntime;
+    use fmv_core::{EditionProvenance, GameId, Platform};
+    use fmv_ff7::script::scene::{auto_witnesses, jessie_rescue_scene, scene, JESSIE_RESCUE_SCENE_ID, ANNOUNCED_STATE_OPS};
+    use fmv_ff7::story::{LIFT_BIT, REACTOR_STATE};
+    let f = field("nmkin_3").expect("FMV_FF7_DATA and nmkin_3");
+    let def = jessie_rescue_scene();
+    assert_eq!(scene(JESSIE_RESCUE_SCENE_ID).as_ref(), Some(&def));
+    let provenance = EditionProvenance { game: GameId::Ff7, platform: Platform::Pc, edition: "steam".into(), region: "any".into(), language: "en".into(), revision: "test".into(), sources: vec![], modded: false };
+    let adapter = fmv_ff7::Ff7Adapter::from_flevel_path(flevel_path(&data_dir().unwrap()), provenance).unwrap();
+    let area = adapter.load_field("nmkin_3").unwrap();
+    let mut before = StoryState::at(27);
+    before.set_bit(REACTOR_STATE.bank, REACTOR_STATE.address, LIFT_BIT, true);
+    let step = area.story_advance(&before.encode(), 0).expect("existing rescue point");
+    assert_eq!(step.summary, "var1.225=1->33");
+    let after = StoryState::decode(&step.progress).unwrap();
+    assert!(def.presents_step("nmkin_3", &before, &after));
+    assert!(area.story_advance(&step.progress, 0).is_none(), "paid once");
+    let outcome = run_to_end(&f, &def, &before, 1, &[]).unwrap();
+    assert_eq!((outcome.end, outcome.windows, outcome.questions), (End::Finished, 3, 0));
+    assert!(outcome.is_complete(), "{outcome:?}");
+    // The byte-level audit conservatively flags this partially carried byte. This branch reads only bit 5
+    // (IFUB op 10, bit-clear test); BITON preserves the rest. No unknown persistent byte is used to choose the rescue path.
+    assert_eq!(outcome.unknown_persistent_reads.iter().copied().collect::<Vec<_>>(), [(1, 225)]);
+    assert!(outcome.party.is_empty() && outcome.jump.is_none());
+    assert_eq!(outcome.writes.moment, None);
+    assert_eq!(outcome.writes.tracked, [((1, 225), 33)]);
+    assert!(outcome.writes.untracked.keys().all(|(bank, _)| !(1..=4).contains(bank)), "no new saved flags");
+    assert!([&outcome.setup_stats, &outcome.stats].iter().all(|stats| stats.ignored.keys().all(|op| !ANNOUNCED_STATE_OPS.contains(op))));
+    let mut interpreted = before.clone();
+    outcome.writes.apply_to(&mut interpreted);
+    assert_eq!(interpreted, after, "only the existing point's writes");
+    let mut play = ScenePlay::new(&f, &def, &before, 1).unwrap();
+    let mut lines = Vec::new();
+    loop {
+        match play.next(None).then {
+            Then::Window(w) => {
+                let MessageOrigin::Canon { dialog, .. } = w.message.origin else { panic!("unexpected added line") };
+                lines.push((w.opener, dialog));
+            },
+            Then::End { how, .. } => { assert_eq!(how, End::Finished); break; },
+        }
+    }
+    assert_eq!(lines, [(3, 66), (4, 67), (4, 68)]);
+    assert_eq!(play.off_cast(), 0);
+    let spots = auto_witnesses(&f, &def, &before, 1, 3);
+    assert!(!spots.is_empty(), "owner has a witness spot");
+    eprintln!("Jessie rescue: {} automatic witness spot(s): {spots:?}", spots.len());
+    let cast = fmv_ff7::script::scene::cast_places(&f, &def, &before, 1).unwrap();
+    let ring = 5.5 * fmv_ff7::default_model_scale(FieldScript::from_field(&f).unwrap().header().scale);
+    let mesh = f.walkmesh().unwrap();
+    let parts = mesh_parts(&mesh);
+    for spot in &spots {
+        assert!(fmv_ff7::script::triangle_contains_xy(&mesh.triangles[usize::from(spot.triangle)], i32::from(spot.x), i32::from(spot.y)));
+        assert_eq!(parts[usize::from(spot.triangle)], parts[usize::from(def.arrival.triangle)]);
+        assert!(cast.iter().all(|&(x, y)| (x - f32::from(spot.x)).hypot(y - f32::from(spot.y)) >= 2.0 * ring + 16.0));
+        assert!(scenery_gap(&mesh, f32::from(spot.x), f32::from(spot.y)) >= 1.5 * ring);
+    }
 }

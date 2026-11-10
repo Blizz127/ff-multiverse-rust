@@ -495,7 +495,7 @@ fn build_def(info: &Info, site: &Site, root: Vec<Step>, given: &[Given], moment:
         speakers: Vec::new(),
         witness: Vec::new(),
         arrival: Spot { x: 0, y: 0, triangle: 0, direction: 0 },
-        presents: None, resume_after_battle: None,
+        presents: None, resume_after_battle: None, presents_bit: None,
     }
 }
 

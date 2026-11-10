@@ -1424,7 +1424,7 @@ state directory, like the other debug flags that make up stored numbers), so it 
 The first reactor's story moves at story points (README "Walking between fields": a triangle, a line, entering a field, a
 talk), and the server applies each point's step, read statically from the field's script. Where the game plays a scripted
 conversation at a point, that conversation is now played too, as a **cutscene** (`SceneDef::presents`: the moment the
-point moves the story to):
+point moves the story to, or `SceneDef::presents_bit` for an existing saved flag):
 
 * **`ff7/md1_1/team-talk`** (the reactor's gate, the point to 7): Biggs, Jessie, Cloud and Barret, twelve windows.
 * **`ff7/nmkin_1/reactor-door`** (the reactor's door, the line to 11): Barret and Cloud, five windows and the door's.
@@ -1437,6 +1437,10 @@ point moves the story to):
   or dialogue text are embedded. The existing story step and ten-minute countdown still happen immediately on victory,
   once; they do not wait for the two windows. Skipping, timing out or disconnecting cannot undo the win. This presentation
   starts only from a matching story victory, never on login, field entry, a defeat or an ordinary encounter.
+* **`ff7/nmkin_3/jessie-rescue`**: Cloud and Jessie's three windows and escape movement, when the existing rescue
+  point turns on reactor bit 5 at moment 27. The scene uses that existing step and introduces no saved fields. It cannot
+  start on entry or repeat after the flag is saved. The narrow floor provides one automatic witness spot; other watchers
+  keep their actual positions. Camera visibility has not been checked on a rendered frame.
 
 How it works (`World::start_point_scene`, `SceneHost::point_scene`):
 
