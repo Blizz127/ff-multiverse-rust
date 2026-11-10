@@ -20,10 +20,10 @@
 //! * **End.** The owner's client reports `SceneEnd` (finished or skipped); the server ends the run itself when the owner
 //!   says nothing for [`SCENE_IDLE_TIMEOUT`], when the run lasts longer than [`SCENE_MAX_TIME`], and aborts it when the
 //!   owner is gone. Every participant is told with `SceneEnded` and released.
-//! * **The story.** When a run ends as finished, skipped or timed out, the server runs the scene's script itself, headless,
+//! * **The story.** When a run ends as finished or explicitly skipped, the server runs the scene's script itself, headless,
 //!   with the answers the owner reported ([`SceneHost::finish`]) and applies what that run wrote to the story ONCE: the
 //!   mirror, the saver (which merges, forward only), a `StoryUpdate`, and a placement refresh. A run that is aborted (the
-//!   owner disconnected or left its party) applies nothing: the scene can be played again. The run is removed first and every
+//!   owner disconnected, could not play it, or timed out) applies nothing: the scene can be played again. The run is removed first and every
 //!   message about it afterwards finds nothing, so a second `SceneEnd`, a late step or a repeated timeout changes nothing.
 //!   A party member in the leader's phase does not advance the story there (its own phase did not choose the instance), so
 //!   a run it owns writes nothing.
@@ -443,11 +443,11 @@ impl World {
         self.drop_failed(failed);
     }
 
-    /// A participant asks to be let go: the owner abandons the run (a skip), a watcher just stops watching.
+    /// A participant asks to be let go: the owner abandons the run without applying it; a watcher just stops watching.
     fn scene_leave(&mut self, entity: EntityId, run: SceneRunId, now: Instant) {
         let Some(r) = self.scenes.runs.get_mut(&run) else { return };
         if r.owner == entity {
-            self.end_run(run, SceneOutcome::Skipped, now);
+            self.end_run(run, SceneOutcome::Aborted, now);
             return;
         }
         if !r.watchers.contains(&entity) {
@@ -481,7 +481,8 @@ impl World {
         for &e in &everyone {
             self.release(e, run, outcome, &mut failed);
         }
-        let mut result = if outcome == SceneOutcome::Aborted || !record.writes_story { None } else {
+        let apply = matches!(outcome, SceneOutcome::Finished | SceneOutcome::Skipped);
+        let mut result = if !apply || !record.writes_story { None } else {
             self.scenes.host.as_ref().and_then(|host| host.finish(&record.scene, &record.progress, record.seed, &record.answers))
         };
         // A story write must not strand a player when its required destination cannot load or
@@ -496,7 +497,7 @@ impl World {
                 }
             }
         }
-        let story = if outcome == SceneOutcome::Aborted { "dropped" } else if !record.writes_story { "none (not the owner's phase)" } else if let Some(result) = &result {
+        let story = if !apply { "dropped" } else if !record.writes_story { "none (not the owner's phase)" } else if let Some(result) = &result {
             self.apply_scene_story(&record, result)
         } else { "none (the scene could not be run)" };
         // A debug preview never changes the real world. A real scene's destination is resolved and

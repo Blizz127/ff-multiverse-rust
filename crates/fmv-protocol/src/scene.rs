@@ -31,6 +31,7 @@
 //!   order (`step` counts from 0), with the absolute line number it chose when the window asked. The server checks the
 //!   order and relays it to the watchers, whose clients open each window when the owner moves past the one before.
 //! * A **watcher** only watches (it may leave with `SceneLeave`, which frees it at once and nobody else is affected).
+//!   An owner sends `SceneLeave` when it cannot play the scene; the run is aborted without applying story effects.
 //! * When the scene ends, [`ServerMsg::SceneEnded`] says how, and every participant's client hands control and camera
 //!   back. A story write the scene's script makes is applied by the server ONCE, from the answers the owner reported, and
 //!   told with the ordinary [`ServerMsg::StoryUpdate`].

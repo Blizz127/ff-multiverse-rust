@@ -468,8 +468,18 @@ fn a_timeout_ends_what_nobody_ended_and_a_step_starts_the_idle_clock_again() {
     w.advance_scenes(t0 + Duration::from_secs(221));
     assert_eq!(w.scene_count(), 0);
     assert_eq!(ends(&c.drain()), [SceneOutcome::TimedOut]);
-    assert_eq!(saved(&mut saved_rx).len(), 1, "a timed-out scene writes the story as a skip does, so a stuck client cannot hold the story back");
+    assert!(saved(&mut saved_rx).is_empty(), "a timeout must not choose unanswered branches or advance story");
     assert!(!w.in_scene(c.entity));
+}
+
+#[test]
+fn an_owner_that_cannot_play_aborts_without_saving() {
+    let (mut w, mut saved_rx, _, a, mut b, now) = two_at_the_trigger();
+    w.press(a.entity, Some(trigger_id()), now);
+    w.scene_message(a.entity, ClientMsg::SceneLeave { run: SceneRunId(1) }, now);
+    assert_eq!(ends(&b.drain()), [SceneOutcome::Aborted]);
+    assert!(saved(&mut saved_rx).is_empty());
+    assert!(!w.in_scene(a.entity));
 }
 
 #[test]

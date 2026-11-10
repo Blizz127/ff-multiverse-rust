@@ -25,6 +25,8 @@ operations, and preflights a destination before saving a scene's story change. D
 save or perform a scene jump. An automatic scene is judged and saved against the entering player's
 own story, even when its field uses the party leader's phase. A member whose story has not reached
 the scene's moment is not advanced or teleported; how such a follower catches up remains unfinished.
+An owner whose client cannot build or finish the interpreter run aborts without saving; a timed-out
+run also leaves progress untouched rather than silently choosing any remaining answers.
 Echo-S uses a
 rewritten field script with different entity and window numbering, so scene presentation and
 watcher synchronization must be reconciled before claiming that scene dialogue and voices use it.

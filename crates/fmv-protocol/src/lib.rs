@@ -594,7 +594,7 @@ pub enum ClientMsg {
     /// The scene OWNER's client played run `run` to its end (`skipped: false`) or skipped it. The server ends the run
     /// and applies any story write the scene's script makes, once. See [`scene`].
     SceneEnd { run: SceneRunId, skipped: bool },
-    /// A watcher stops watching run `run` (or the owner abandons it, which is a skip). See [`scene`].
+    /// A watcher stops watching run `run`, or the owner aborts it without a story write. See [`scene`].
     SceneLeave { run: SceneRunId },
     /// Debug only (the server must run with `--debug-scene-preview`; refused with `SceneRefused` otherwise): put this
     /// player in the field of scene `scene` at the scene's own story moment, on a made-up story that is never saved.

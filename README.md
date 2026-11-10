@@ -1415,10 +1415,10 @@ for the long way, no unknown opcode (`tests/scene_real.rs`).
 * **A scene always ends.** The owner's `SceneEnd` (finished or skipped), 120 seconds without a window, and 20 minutes in all
   end it; an owner that disconnects (or a watcher that leaves the party) drops it. Every participant is told with
   `SceneEnded` and released.
-* **The story is the server's.** When a run ends as finished, skipped or timed out, the server runs the scene's script
+* **The story is the server's.** When a run ends as finished or deliberately skipped, the server runs the scene's script
   itself, headless, with the answers the owner reported, and applies what that wrote ONCE: the mirror, the saver (which
   merges, forward only), a `StoryUpdate` and a placement refresh. The run is removed first, so a second `SceneEnd`, a late
-  step or a repeated timeout changes nothing. A run that is aborted (owner gone) applies nothing: the scene can be played
+  step or a repeated timeout changes nothing. A run that is aborted or timed out applies nothing: the scene can be played
   again. A party member in its leader's phase owns a run that writes nothing. A real account's write is a story step like any
   other (`story::apply_story_step`: the mirror, the log, a countdown it ends, the save, the player told, the placements); a
   previewing player's is kept in memory only. **A scene is offered once per story:** the proof scene turns on the bar's mark

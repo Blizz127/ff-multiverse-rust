@@ -414,7 +414,7 @@ fn a_run_of_empty_windows_without_end_is_cut_off_by_the_scenes_own_limit() {
     let commands = player.take_commands();
     assert!(player.is_over(), "it ended instead of running away");
     assert_eq!(commands.len(), usize::try_from(MAX_SCENE_STEPS).unwrap() + 1);
-    assert_eq!(commands.last(), Some(&SceneCmd::End { run: RUN, skipped: true }), "a scene that will not end is skipped, once");
+    assert_eq!(commands.last(), Some(&SceneCmd::Leave { run: RUN }), "a scene that will not end is aborted, once");
 }
 
 // ---- time and the stage --------------------------------------------------------------------------------------------
@@ -633,7 +633,7 @@ fn f6_asks_for_the_first_scenes_preview_unless_a_scene_or_a_battle_is_on() {
 
 #[test]
 fn a_scene_that_cannot_be_built_releases_the_player_on_the_spot_and_never_locks_the_keys() {
-    for (role, release) in [(SceneRole::Owner, SceneCmd::End { run: RUN, skipped: true }), (SceneRole::Watcher, SceneCmd::Leave { run: RUN })] {
+    for (role, release) in [(SceneRole::Owner, SceneCmd::Leave { run: RUN }), (SceneRole::Watcher, SceneCmd::Leave { run: RUN })] {
         let mut rig = rig_with(talk(), true);
         begin(&mut rig, role);
         assert!(!rig.client.is_active(), "{role:?}: no player was made, nothing holds the keys");
@@ -651,7 +651,7 @@ fn a_scene_that_cannot_be_built_releases_the_player_on_the_spot_and_never_locks_
     // A client with no builder at all (no game data) does the same.
     let mut client = SceneClient::new();
     client.on_message(AREA, start(RUN, SceneRole::Owner, &[(1, 0)]));
-    assert_eq!((client.is_active(), client.take_commands()), (false, vec![SceneCmd::End { run: RUN, skipped: true }]));
+    assert_eq!((client.is_active(), client.take_commands()), (false, vec![SceneCmd::Leave { run: RUN }]));
     // Through the state, the keys stay the field's.
     let mut state = ClientState::new(EntityId(1), AccountId(1), Pos::new(0.0, 0.0, 0.0), AreaId { game: GameId::Ff7, key: AREA.to_string() });
     state.apply(0.0, start(RUN, SceneRole::Watcher, &[(1, 0), (2, 1)]));
@@ -660,12 +660,25 @@ fn a_scene_that_cannot_be_built_releases_the_player_on_the_spot_and_never_locks_
 }
 
 #[test]
+fn an_incomplete_interpreter_run_leaves_without_claiming_completion() {
+    for role in [SceneRole::Owner, SceneRole::Watcher] {
+        for how in [End::Broken, End::Budget, End::Battle, End::MiniGame, End::GameOver] {
+            let mut rig = rig_with(vec![Beat { stage: vec![], then: Then::End { at: 0, how } }], false);
+            rig.client.set_instant(true);
+            begin(&mut rig, role);
+            assert!(!rig.client.is_active());
+            assert_eq!(rig.client.take_commands(), [SceneCmd::Leave { run: RUN }], "{role:?}, {how:?}");
+        }
+    }
+}
+
+#[test]
 fn a_scene_of_another_field_or_a_story_that_cannot_be_read_is_not_played_either() {
     // The scene plays in `arena`; this player is somewhere else.
     let mut rig = rig_with(talk(), false);
     rig.client.on_message("elsewhere", start(RUN, SceneRole::Owner, &[(1, 0)]));
     assert!(!rig.client.is_active());
-    assert_eq!(rig.client.take_commands(), [SceneCmd::End { run: RUN, skipped: true }]);
+    assert_eq!(rig.client.take_commands(), [SceneCmd::Leave { run: RUN }]);
     // A progression this client cannot read.
     let mut rig = rig_with(talk(), false);
     rig.client.on_message(

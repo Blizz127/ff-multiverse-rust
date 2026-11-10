@@ -12,8 +12,8 @@
 //! keep a player waiting for a scene it cannot show:
 //!
 //! * a scene this machine cannot build (no game data for its field, a story it cannot read, a scene of another field) is
-//!   [`SceneEvent::Unavailable`] and the player releases itself on the spot: the owner tells the server the scene is
-//!   skipped, a watcher that it leaves. Nothing else happens; the server's `SceneEnded` is what releases the player;
+//!   [`SceneEvent::Unavailable`] and the player asks to leave on the spot; an owner aborts the run without a story write.
+//!   The server's `SceneEnded` is what releases the player;
 //! * a scene that ends here (played to its end by its owner, or skipped by a Back key) is dropped at once: no window, no
 //!   actors, the field's camera and the field's keys; the server's later `SceneEnded` for it is reported
 //!   ([`SceneEvent::Ended`]) and changes nothing;
@@ -175,15 +175,12 @@ impl SceneClient {
         }
     }
 
-    /// This machine cannot play the run: release the player now. The owner says the scene is skipped, a watcher leaves;
+    /// This machine cannot play the run: ask to leave without advancing the owner's story;
     /// the server's `SceneEnded` is what lets the player go.
-    fn unavailable(&mut self, run: SceneRunId, role: SceneRole, scene: &str, why: &str) {
+    fn unavailable(&mut self, run: SceneRunId, _role: SceneRole, scene: &str, why: &str) {
         self.note(format!("scene: cannot play {} here: {why}; releasing the player", clean_id(scene)));
         self.event(SceneEvent::Unavailable);
-        self.outbox.push(match role {
-            SceneRole::Owner => SceneCmd::End { run, skipped: true },
-            SceneRole::Watcher => SceneCmd::Leave { run },
-        });
+        self.outbox.push(SceneCmd::Leave { run });
         self.finished = Some((run, 0));
     }
 

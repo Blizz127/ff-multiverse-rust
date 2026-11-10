@@ -40,7 +40,7 @@ use super::stage::Cast;
 use crate::ui::dialogue::{dialogue_key, DialogueKey};
 use fmv_core::{EntityId, Pos};
 use fmv_ff7::field_direction_to_facing;
-use fmv_ff7::script::dialogue::MessageOrigin;
+use fmv_ff7::script::dialogue::{End, MessageOrigin};
 use fmv_ff7::script::scene::{Look, SceneDef, Stage, Then, Timed, Window, FRAMES_PER_SECOND};
 use fmv_protocol::{ClientMsg, SceneOutcome, SceneParticipant, SceneRefusal, SceneRole, SceneRunId, MAX_SCENE_STEPS};
 use std::cell::Cell;
@@ -148,7 +148,7 @@ enum Next {
     /// A window, waiting for its time.
     Window(Window),
     /// The end of the scene, waiting for its time.
-    End { at: u32 },
+    End { at: u32, how: End },
     /// Nothing: the scene has played to its end (a watcher waits here for the server).
     Held,
 }
@@ -381,7 +381,7 @@ impl ScenePlayer {
         let last = self.due.back().map_or(0.0, |t| t.at as f32);
         match &self.next {
             Next::Window(w) => (w.at as f32).max(last),
-            Next::End { at } => (*at as f32).max(last),
+            Next::End { at, .. } => (*at as f32).max(last),
             Next::Pull(_) | Next::Held => f32::INFINITY,
         }
     }
@@ -410,7 +410,7 @@ impl ScenePlayer {
             match std::mem::replace(&mut self.next, Next::Held) {
                 Next::Pull(answer) => {
                     if self.passed >= MAX_SCENE_STEPS {
-                        self.skip();
+                        self.abort();
                         return;
                     }
                     let beat = self.source.next(answer);
@@ -418,7 +418,7 @@ impl ScenePlayer {
                     self.due = beat.stage.into();
                     self.next = match beat.then {
                         Then::Window(w) => Next::Window(w),
-                        Then::End { at, .. } => Next::End { at },
+                        Then::End { at, how } => Next::End { at, how },
                     };
                 }
                 Next::Window(w) => {
@@ -429,13 +429,13 @@ impl ScenePlayer {
                     }
                     self.open(w);
                 }
-                Next::End { at } => {
+                Next::End { at, how } => {
                     self.apply_due();
                     if !self.due.is_empty() || at as f32 > self.clock {
-                        self.next = Next::End { at };
+                        self.next = Next::End { at, how };
                         return;
                     }
-                    self.play_out();
+                    if matches!(how, End::Finished | End::MapJump { .. }) { self.play_out(); } else { self.abort(); }
                     return;
                 }
                 Next::Held => return,
@@ -549,6 +549,15 @@ impl ScenePlayer {
         if !std::mem::replace(&mut self.sent_end, true) {
             let run = self.run.id;
             self.outbox.push(if self.is_owner() { SceneCmd::End { run, skipped: true } } else { SceneCmd::Leave { run } });
+        }
+    }
+
+    /// A failed or unsupported interpreter run must not be treated as the player's choice to skip.
+    fn abort(&mut self) {
+        if self.over { return; }
+        self.finish();
+        if !std::mem::replace(&mut self.sent_end, true) {
+            self.outbox.push(SceneCmd::Leave { run: self.run.id });
         }
     }
 
