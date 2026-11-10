@@ -1595,8 +1595,10 @@ ranks the floor for them. The pictures contain game art: they stay out of the re
 * **A window pauses the whole scene** (the engine pauses only the script that opened it), durations are estimates (a walk's
   length from the move speed, a clip's from its range), camera scrolls and scripted animation clips are not shown, and the cast
   is Cloud and Tifa: the bar's other characters (Marlene, the patrons) are not drawn.
-* **The interpreter does not know** (counted, never guessed, over every script slot of the game): `AXYZI`, `GETAI`, `GETAXY`,
-  `GETDIR` (read-backs of a place or a direction), `PDIRA`, `PTURA`, `PXYZI` (the party's own), `CHAR`, `PC`, `DSKCG`, `RDMSD`;
+* **The interpreter does not know** (counted, never guessed, over every script slot of the game): `AXYZI`, `GETAXY`,
+  `GETDIR` (read-backs of a place or a direction), `PDIRA`, `PTURA`, `PXYZI` (the party's own), `DSKCG`, `RDMSD`. (`GETAI` reads a
+  known triangle and marks an unknown one unresolved; `CHAR` and `PC` are known declarations, skipped: a scene's cast names its
+  models and nothing reads the binding.)
   326,525 slots of 702 fields run as scene roots in 6 s with no panic and every one ending (`tests/scene_real.rs`).
 * **Scene data is keyed by the original field's entity numbers.** A replacement script section (a text or voice mod's) has other
   numbers in about 700 fields; entity names are kept, so resolving by name is the way when such a layer is wired in.
