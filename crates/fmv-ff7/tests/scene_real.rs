@@ -245,6 +245,61 @@ fn the_team_talk_is_the_cutscene_of_md1_1s_story_point_and_writes_its_step() {
     assert_eq!(play.off_cast(), 0, "every stage event is about the cast");
 }
 
+/// Barret's talk at the reactor's door is the cutscene of `nmkin_1`'s story line to 11: played against the story before the
+/// step, the line's own script runs six windows, writes exactly the moment the line point writes, and sets the party the story
+/// already has. Cloud starts on the line (the initial stage puts him there), Barret where the field's staging puts him.
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn the_reactor_door_talk_is_the_cutscene_of_nmkin_1s_story_line_and_writes_its_step() {
+    use fmv_adapter_api::AreaRuntime;
+    use fmv_core::{EditionProvenance, GameId, Platform};
+    use fmv_ff7::script::scene::{reactor_door_scene, scene, REACTOR_DOOR_SCENE_ID};
+    use fmv_ff7::story::{canon_party, party_after, CLOUD, BARRET};
+    let f = field("nmkin_1").expect("FMV_FF7_DATA and nmkin_1");
+    let def = reactor_door_scene();
+    assert_eq!(scene(REACTOR_DOOR_SCENE_ID).as_ref(), Some(&def), "registered");
+    let dir = data_dir().unwrap();
+    let provenance = EditionProvenance { game: GameId::Ff7, platform: Platform::Pc, edition: "steam".into(), region: "any".into(), language: "en".into(), revision: "test".into(), sources: vec![], modded: false };
+    let adapter = fmv_ff7::Ff7Adapter::from_flevel_path(flevel_path(&dir), provenance).unwrap();
+    let area = adapter.load_field("nmkin_1").unwrap();
+    let points = area.story_points();
+    assert_eq!(points.len(), 1, "{points:?}");
+    let before = StoryState::at(10);
+    let step = area.story_advance(&before.encode(), points[0].id).expect("the line applies at 10");
+    let after = StoryState::decode(&step.progress).unwrap();
+    assert_eq!(after.moment, 11);
+    assert!(def.presents_step("nmkin_1", &before, &after));
+    let outcome = run_to_end(&f, &def, &before, 1, &[]).unwrap();
+    assert_eq!((outcome.end, outcome.windows, outcome.questions), (End::Finished, 6, 0));
+    assert_eq!(outcome.writes.moment, Some(after.moment), "the scene's own write is the line's step");
+    assert!(outcome.writes.tracked.is_empty() && !outcome.writes.untracked.keys().any(|(bank, _)| (1..=4).contains(bank)), "{:?}", outcome.writes);
+    assert_eq!(party_after(&canon_party(&before), &outcome.party), vec![CLOUD, BARRET], "the party it sets is the one the story has");
+    assert!(outcome.is_complete(), "setup {:?} / scene {:?}", outcome.setup_stats.unknown, outcome.stats.unknown);
+    let script = FieldScript::from_field(&f).unwrap();
+    let models = fmv_ff7::script::parse_model_list(f.section(fmv_ff7::field::section::MODEL_LOADER).unwrap()).unwrap();
+    let loader = f.model_loader().unwrap();
+    for member in &def.cast {
+        let init = script.entity_inits(Some(&models)).into_iter().find(|i| i.entity == usize::from(member.entity)).unwrap();
+        let model = &loader.models[init.model_index.expect("a model")];
+        let Look::Model { hrc, idle } = &member.look else { panic!("a field model") };
+        assert_eq!((model.hrc_stem(), model.animations.first().map(|a| a.stem())), (hrc.clone(), Some(idle.clone())), "{}", member.name);
+        assert_eq!(init.name, member.name);
+    }
+    let mut play = ScenePlay::new(&f, &def, &before, 1).unwrap();
+    // Both stand somewhere when it begins: Cloud on the line, Barret at the door (the field's own staging).
+    let placed: Vec<u8> = play.initial_stage_events().iter().filter_map(|e| match e { Stage::Place { entity, .. } => Some(*entity), _ => None }).collect();
+    assert!(placed.contains(&3) && placed.contains(&4), "{placed:?}");
+    let mut openers = Vec::new();
+    loop {
+        match play.next(None).then {
+            Then::End { .. } => break,
+            Then::Window(w) => openers.push(w.opener),
+        }
+    }
+    assert_eq!(openers, [4, 3, 4, 4, 3, 12], "Barret, Cloud, Barret, Barret, Cloud, and the door's window");
+    assert_eq!(play.off_cast(), 0, "every stage event is about the cast");
+}
+
 /// The parts of a walkmesh that a walk can reach from each other (triangles joined by an edge that can be crossed, either way).
 fn mesh_parts(mesh: &fmv_ff7::field::Walkmesh) -> Vec<usize> {
     let n = mesh.triangles.len();

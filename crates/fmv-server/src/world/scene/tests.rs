@@ -193,6 +193,35 @@ fn a_cutscene_that_is_left_or_times_out_still_gives_the_step_and_one_whose_owner
     assert!(saved(&mut saved_rx).is_empty(), "the owner left: nothing applied, nothing saved");
 }
 
+/// A party member in range watches the owner's cutscene: it is told the run as a watcher and held, both are released when it
+/// ends, and the step goes to the OWNER only (the member's own story and the saver are untouched by it).
+#[test]
+fn a_party_member_in_range_watches_a_cutscene_and_the_step_is_the_owners_alone() {
+    let mut now = Instant::now();
+    let (mut w, mut saved_rx, _host) = cutscene_world();
+    let mut a = seat(&mut w, "A", &[], now);
+    let mut b = seat(&mut w, "B", &[], now);
+    party(&mut w, &a, &b, now);
+    a.drain();
+    b.drain();
+    // B stands near the region, A walks in.
+    assert_eq!(go(&mut w, &b, 100.0, 60.0, &mut now), MoveOutcome::Applied);
+    into_the_region(&mut w, &a, &mut now);
+    let a_msgs = a.drain();
+    let b_msgs = b.drain();
+    let roles = |msgs: &[ServerMsg]| msgs.iter().filter_map(|m| match m { ServerMsg::SceneStart { you, scene, .. } => Some((*you, scene.clone())), _ => None }).collect::<Vec<_>>();
+    assert_eq!(roles(&a_msgs), [(SceneRole::Owner, POINT_SCENE.to_string())]);
+    assert_eq!(roles(&b_msgs), [(SceneRole::Watcher, POINT_SCENE.to_string())], "the member watches");
+    assert!(w.in_scene(a.entity) && w.in_scene(b.entity));
+    let run = starts(&a_msgs)[0].0;
+    w.scene_message(a.entity, ClientMsg::SceneEnd { run, skipped: false }, now);
+    assert!(!w.in_scene(a.entity) && !w.in_scene(b.entity), "both released");
+    assert!(b.drain().iter().any(|m| matches!(m, ServerMsg::SceneEnded { .. })));
+    assert_eq!(w.players.get(&a.entity).unwrap().progression, STORY_ADVANCED, "the owner's step");
+    assert!(w.players.get(&b.entity).unwrap().progression.is_empty(), "the member's own story is its own");
+    assert_eq!(saved(&mut saved_rx), [STORY_ADVANCED.to_vec()], "one save: the owner's");
+}
+
 /// Without a cutscene for the step (the host has none) the step is applied at once, exactly as before cutscenes.
 #[test]
 fn a_point_without_a_cutscene_applies_its_step_at_once() {

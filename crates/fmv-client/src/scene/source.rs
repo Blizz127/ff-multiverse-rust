@@ -329,6 +329,43 @@ mod tests {
         crate::mods::install(None);
     }
 
+    /// The reactor's cutscenes for a player alone: Echo-S's edition is shown only where both editions tell the same story
+    /// (`Outcome::same_story_as`, and the replacement must bind every entity of the scene by name); otherwise the original. This
+    /// test says which, and why, so a log of it is the evidence either way.
+    #[test]
+    #[ignore = "requires the owner's FF7 data and verified Echo-S archive"]
+    fn private_reactor_cutscenes_use_echo_only_where_both_editions_tell_the_same_story() {
+        use fmv_core::{EditionProvenance, GameId, Platform};
+        use fmv_ff7::script::scene::{run_section_to_end, run_to_end, REACTOR_DOOR_SCENE_ID, TEAM_TALK_SCENE_ID};
+        use fmv_mods::{Layers, ModSources, Mods};
+        let data = std::env::var_os("FMV_FF7_DATA").expect("FMV_FF7_DATA");
+        let echo = std::env::var_os("FMV_ECHO_S_IRO").expect("FMV_ECHO_S_IRO");
+        let provenance = EditionProvenance { game: GameId::Ff7, platform: Platform::Pc, edition: "steam".into(), region: "any".into(), language: "en".into(), revision: "test".into(), sources: vec![], modded: false };
+        let adapter = Arc::new(Ff7Adapter::from_flevel_path(std::path::Path::new(&data).join("field/flevel.lgp"), provenance).unwrap());
+        let sources = ModSources { echo_s: Some(echo.into()), ..Default::default() };
+        crate::mods::install(Some(Arc::new(Mods::open(&sources, Layers::ALL))));
+        for (id, moment) in [(TEAM_TALK_SCENE_ID, 6u16), (REACTOR_DOOR_SCENE_ID, 10)] {
+            let story = StoryState::at(moment);
+            let def = scene(id).expect("a registered scene");
+            let field = adapter.load_field(&def.field).unwrap();
+            let section = crate::mods::script_source().unwrap().section(&def.field).expect("Echo-S has the field");
+            let original = run_to_end(field.field_file(), &def, &story, 1, &[]).unwrap();
+            let why = match run_section_to_end(field.field_file(), &def, &story, 1, &section, &[]) {
+                Err(e) => format!("the replacement cannot be played: {e}"),
+                Ok(replacement) if original.same_story_as(&replacement) => format!("same story ({} original windows, {} Echo-S windows)", original.windows, replacement.windows),
+                Ok(replacement) => format!(
+                    "a different story: end {:?}/{:?}, moment {:?}/{:?}, party {:?}/{:?}, complete {}/{}, windows {}/{}, unknown {:?}",
+                    original.end, replacement.end, original.writes.moment, replacement.writes.moment, original.party, replacement.party,
+                    original.is_complete(), replacement.is_complete(), original.windows, replacement.windows, replacement.stats.unknown
+                ),
+            };
+            let built = Ff7Scenes::new(Some(adapter.clone())).build_private(id, &story, 1).unwrap();
+            eprintln!("{id}: shown from {} ({why})", if built.source.echo_voice() { "echo-s" } else { "the original" });
+            assert_eq!(built.source.echo_voice(), why.starts_with("same story"), "{id}: Echo-S exactly when the editions agree");
+        }
+        crate::mods::install(None);
+    }
+
     #[test]
     #[ignore = "requires the owner's FF7 data and verified Echo-S archive"]
     fn private_bar_uses_echo_with_compatible_choice_translation() {
