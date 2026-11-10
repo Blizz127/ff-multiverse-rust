@@ -12,8 +12,8 @@
 //! * `Face` turns it (the short way round), at once or over the frames it says.
 //! * `Show` hides or shows it.
 //! * The player resolves supported `Anim` loops, full Holds and explicit forward Holds against the actor's exact field model.
-//!   Loops and Holds follow scene time; a Hold stops at its last frame until replaced. A bounded Once can
-//!   restart a separately remembered, different default slot after its inclusive range.
+//!   Loops and Holds follow scene time; a Hold stops at its last frame until replaced. A Once can
+//!   restart a separately remembered, different default slot after its range or actual loaded clip length.
 //!   Other animations clear that loop and are counted ([`Counts::anims_skipped`]), never guessed at.
 //! * `Sound` is routed separately by the scene player to its cancellable audio channel.
 //! * `Camera` is **recorded** ([`CameraState`]) and not shown: the field's own camera stays where it is.
@@ -166,6 +166,16 @@ impl Actor {
         self.animation.as_ref().map(|a| (a.clip.as_str(), a.frame))
     }
 
+    /// A full Once's verified return clip. The avatar cache resolves the actual length without
+    /// mutating the stage, so hidden actors and late first draws use the same scene clock.
+    pub fn full_once_return(&self) -> Option<&str> {
+        if self.walk.is_some() { return None; }
+        match self.animation.as_ref()?.frame {
+            ClipFrame::OnceFull { .. } => self.default_animation.as_ref().map(|default| default.clip.as_str()),
+            _ => None,
+        }
+    }
+
     /// Whether it is seen at all: it has a place and is not hidden.
     pub fn shown(&self) -> bool {
         self.visible && self.pos.is_some()
@@ -184,7 +194,7 @@ impl Actor {
             if let Some(animation) = &mut self.animation {
                 let advancing = match &mut animation.frame {
                     ClipFrame::Loop(frame) => Some(frame),
-                    ClipFrame::HoldRange { elapsed, .. } | ClipFrame::HoldFull { elapsed } => Some(elapsed),
+                    ClipFrame::HoldRange { elapsed, .. } | ClipFrame::HoldFull { elapsed } | ClipFrame::OnceFull { elapsed } => Some(elapsed),
                     ClipFrame::Hold(_) => None,
                 };
                 if let Some(frame) = advancing { *frame += (frames - moving_frames).max(0.0); }
@@ -368,6 +378,17 @@ impl Cast {
         actor.movement_animation = None;
         actor.animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::HoldRange { first, last, elapsed }, once: true });
         actor.finish_once();
+        true
+    }
+
+    /// A full Once carries its elapsed time and known different default to the avatar cache.
+    /// Only that cache knows the actual loaded clip length; no guessed deadline ends this pose.
+    pub fn apply_once_full(&mut self, entity: u8, slot: u8, clip: &str, overshoot: f32) -> bool {
+        let Some(actor) = self.actors.get_mut(&entity) else { return false };
+        if actor.walk.is_some() || !actor.default_animation.as_ref().is_some_and(|default| default.slot != slot) { return false; }
+        let elapsed = if overshoot.is_finite() { overshoot.max(0.0) } else { 0.0 };
+        actor.movement_animation = None;
+        actor.animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::OnceFull { elapsed }, once: true });
         true
     }
 

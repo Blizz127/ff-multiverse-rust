@@ -158,8 +158,10 @@ pub struct CastDraw<'a> {
     pub moving: bool,
     /// Default clip frame from scene time, frozen while a window holds the scene.
     pub frame: f32,
-    /// Resolved authored loop or held frame, independent of the default clip's fallback clock.
+    /// Resolved authored animation, independent of the default clip's fallback clock.
     pub clip: Option<(&'a str, ClipFrame)>,
+    /// Verified return clip for a full Once; its duration comes from the loaded animation.
+    pub return_clip: Option<&'a str>,
 }
 
 /// What comes after the stage events that are due.
@@ -366,7 +368,7 @@ impl ScenePlayer {
                 let member = self.def.member(a.entity())?;
                 let [x, y, z] = a.pos()?;
                 Some(CastDraw { entity: a.entity(), look: &member.look, pos: Pos::new(x, y, z), facing: a.heading(), moving: a.moving(),
-                    frame: if a.moving() { a.walked_frames() } else { self.elapsed_frames }, clip: a.animation() })
+                    frame: if a.moving() { a.walked_frames() } else { self.elapsed_frames }, clip: a.animation(), return_clip: a.full_once_return() })
             })
             .collect()
     }
@@ -474,7 +476,7 @@ impl ScenePlayer {
 
     fn apply_stage(cast: &mut Cast, source: &dyn SceneSource, event: &Stage, late: f32) {
         // Normal-rate presentation uses the script's own field model and loaded clip bounds:
-        // a full default loop, full Hold, or explicit Hold/Once range. Other forms clear an old override.
+        // a full default loop, full Hold/Once, or explicit Hold/Once range. Other forms clear an old override.
         if let Stage::Anim { entity, animation, how: AnimHow::Loop, first: None, last: None, speed: 16, divisor: 1 } = event {
             if let Some(clip) = source.animation_clip(*entity, *animation) {
                 cast.apply_loop(*entity, *animation, clip, late);
@@ -494,6 +496,11 @@ impl ScenePlayer {
                     else { cast.apply_hold_range(*entity, clip, *first, *last, late); }
                     return;
                 }
+            }
+        }
+        if let Stage::Anim { entity, animation, how: AnimHow::Once, first: None, last: None, speed: 16, divisor: 1 } = event {
+            if let Some(clip) = source.animation_clip(*entity, *animation) {
+                if cast.apply_once_full(*entity, *animation, clip, late) { return; }
             }
         }
         if let Stage::Anim { entity, animation, how: AnimHow::Once, first: Some(first), last: Some(last), speed: 16, divisor: 1 } = event {

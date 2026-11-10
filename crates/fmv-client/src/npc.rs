@@ -75,7 +75,7 @@ pub fn npc_players(npcs: &[NpcView]) -> Vec<AvatarPlayer<'_>> {
                 pos: n.pos,
                 facing: n.facing,
                 anim: AnimState::Idle,
-                scene_frame: None, scene_clip: None,
+                scene_frame: None, scene_clip: None, scene_return: None,
                 appearance: None,
                 npc: Some(look.model),
                 tint: look.marker_tint,

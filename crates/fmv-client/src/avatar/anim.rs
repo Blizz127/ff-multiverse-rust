@@ -34,6 +34,8 @@ pub enum ClipFrame {
     HoldRange { first: u8, last: u8, elapsed: f32 },
     /// Play from frame zero through the loaded clip's actual last frame, then hold it.
     HoldFull { elapsed: f32 },
+    /// Play the loaded clip once; completion is resolved against a separate standing default.
+    OnceFull { elapsed: f32 },
 }
 
 impl ClipFrame {
@@ -50,6 +52,10 @@ impl ClipFrame {
             Self::HoldFull { elapsed } => {
                 let elapsed = if elapsed.is_finite() { elapsed.max(0.0) } else { 0.0 };
                 Some(elapsed.min((frames - 1) as f32))
+            }
+            Self::OnceFull { elapsed } => {
+                let elapsed = if elapsed.is_finite() { elapsed.max(0.0) } else { 0.0 };
+                (elapsed < frames as f32).then_some(elapsed.min((frames - 1) as f32))
             }
         }
     }
@@ -184,6 +190,23 @@ mod tests {
         for elapsed in [299.0, 300.0, 1000.0, f32::MAX] {
             assert_eq!(ClipFrame::HoldFull { elapsed }.in_clip(300), Some(299.0));
         }
+    }
+
+    #[test]
+    fn full_once_holds_the_final_interval_and_finishes_at_the_loaded_length() {
+        for elapsed in [0.0, 0.5, 1000.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(ClipFrame::OnceFull { elapsed }.in_clip(0), None);
+        }
+        for elapsed in [-1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(ClipFrame::OnceFull { elapsed }.in_clip(4), Some(0.0));
+        }
+        assert_eq!(ClipFrame::OnceFull { elapsed: 0.5 }.in_clip(1), Some(0.0));
+        assert_eq!(ClipFrame::OnceFull { elapsed: 1.0 }.in_clip(1), None);
+        assert_eq!(ClipFrame::OnceFull { elapsed: 3.5 }.in_clip(4), Some(3.0));
+        assert_eq!(ClipFrame::OnceFull { elapsed: 4.0 }.in_clip(4), None);
+        assert_eq!(ClipFrame::OnceFull { elapsed: 256.5 }.in_clip(300), Some(256.5));
+        assert_eq!(ClipFrame::OnceFull { elapsed: 299.5 }.in_clip(300), Some(299.0));
+        assert_eq!(ClipFrame::OnceFull { elapsed: f32::MAX }.in_clip(300), None);
     }
 
     #[test]

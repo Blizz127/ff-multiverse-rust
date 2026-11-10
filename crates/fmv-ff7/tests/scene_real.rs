@@ -141,6 +141,7 @@ fn station_director_advances_the_post_escape_story() {
 #[test]
 #[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
 fn the_station_scene_takes_barret_out_of_the_party_and_the_storys_party_table_agrees() {
+    use fmv_ff7::script::scene::AnimHow;
     use fmv_ff7::story::{canon_party, PartyOp, BARRET, CLOUD};
     let f = field("md8_1").expect("FMV_FF7_DATA and md8_1");
     let def = fmv_ff7::script::scene::station_scene();
@@ -160,6 +161,59 @@ fn the_station_scene_takes_barret_out_of_the_party_and_the_storys_party_table_ag
     assert_eq!(outcome.stats.ignored.get("HMPMAX3"), Some(&1), "the full restore: nothing here keeps HP or MP between battles");
     assert!(outcome.unknown_persistent_reads.is_empty(), "{:?}", outcome.unknown_persistent_reads);
     assert!(outcome.writes.tracked.is_empty() && !outcome.writes.untracked.keys().any(|(bank, _)| (1..=4).contains(bank)), "{:?}", outcome.writes);
+
+    // Biggs establishes a different default before his full Once; the real clips, rather
+    // than the VM's existing scheduling wait, determine the available presentation poses.
+    let script = FieldScript::from_field(&f).unwrap();
+    let models = fmv_ff7::script::parse_model_list(f.section(fmv_ff7::field::section::MODEL_LOADER).unwrap()).unwrap();
+    let biggs = script.entity_inits(Some(&models)).into_iter().find(|init| init.entity == 3).unwrap();
+    assert_eq!((biggs.name.as_str(), biggs.model_index), ("bigs", Some(2)));
+    let loader = f.model_loader().unwrap();
+    let biggs_model = &loader.models[biggs.model_index.unwrap()];
+    let member = def.cast.iter().find(|member| member.entity == 3).unwrap();
+    let Look::Model { hrc, .. } = &member.look else { panic!("Biggs retains his field model") };
+    assert_eq!((biggs_model.hrc_stem(), hrc.as_str()), ("bwfd".to_string(), "bwfd"));
+    let default_stem = biggs_model.animations[0].stem();
+    let once_stem = biggs_model.animations[4].stem();
+    assert_eq!((default_stem.as_str(), once_stem.as_str()), ("caed", "cagd"));
+    let requested = script.disassemble(3, 3).unwrap();
+    let pair = requested.windows(2).find(|pair| pair[0].offset == 0x04C8).unwrap();
+    assert_eq!((pair[0].opcode, pair[0].literal("animation"), pair[0].literal("speed")), (0xA2, Some(0), Some(1)));
+    assert_eq!((pair[1].offset, pair[1].opcode, pair[1].literal("animation"), pair[1].literal("speed")), (0x04CB, 0xA3, Some(4), Some(1)));
+    assert!(script.disassemble(3, 0).unwrap().iter().chain(requested.iter()).all(|ins| ins.opcode != 0xBD), "Biggs's init and requested script leave ASPED at its default");
+    let mut characters = LgpArchive::open_path(data_dir().unwrap().join("field/char.lgp")).unwrap();
+    let model = fmv_ff7::load_field_model(&mut characters, hrc).unwrap();
+    for (stem, frames) in [(&default_stem, 2), (&once_stem, 15)] {
+        let clip = fmv_ff7::load_field_animation(&mut characters, stem).unwrap();
+        assert_eq!((clip.frame_count(), clip.bone_count()), (frames, 21), "{stem}");
+        assert!(model.fits(&clip), "{stem} fits Biggs's retained model");
+        for frame in [0, clip.frame_count() - 1] {
+            assert!(clip.frame(frame).is_some(), "{stem} endpoint {frame} exists without wrapping");
+            let pose = model.pose(&clip, frame).expect("Biggs's endpoint fits his retained skeleton");
+            assert_eq!(pose.len(), model.bones.len());
+            assert!(pose.iter().flatten().all(|value| value.is_finite()), "{stem} endpoint {frame} has a finite pose");
+        }
+    }
+    let mut play = ScenePlay::new(&f, &def, &before, 1).unwrap();
+    assert_eq!(play.animation_clip(3, 0), Some(default_stem.as_str()));
+    assert_eq!(play.animation_clip(3, 4), Some(once_stem.as_str()));
+    let mut animations = Vec::new();
+    loop {
+        let beat = play.next(None);
+        animations.extend(beat.stage.into_iter().filter_map(|event| match event.what {
+            animation @ Stage::Anim { entity: 3, .. } => Some(animation),
+            _ => None,
+        }));
+        if let Then::End { how, .. } = beat.then {
+            assert_eq!(how, End::Finished);
+            break;
+        }
+    }
+    let expected = [
+        Stage::Anim { entity: 3, animation: 0, how: AnimHow::Loop, first: None, last: None, speed: 16, divisor: 1 },
+        Stage::Anim { entity: 3, animation: 4, how: AnimHow::Once, first: None, last: None, speed: 16, divisor: 1 },
+    ];
+    assert!(animations.windows(2).any(|pair| pair == expected), "the registered station scene emits the authored default followed by its full normal-speed Once: {animations:?}");
 }
 
 /// The first scene after the escape touches no party and nothing saved: it ends in the field's own jump to `md8_1`.

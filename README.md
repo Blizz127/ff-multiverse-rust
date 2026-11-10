@@ -1608,11 +1608,15 @@ ranges fall back without wrapping. Full normal-speed Holds start at frame 0 and 
 Jessie's team-talk `ANIM!2` uses all 15 frames of `bxie` on her original `axdc` model, then retains its final pose.
 The full clip uses the same scene clock, dialogue pause and bounded cache; its endpoint is not limited to an eight-bit
 frame number. Another animation, speed change or movement replaces the pose. Missing or incompatible clips keep the usual fallback.
-A normal-speed bounded Once can also play while the actor stands, when its default animation is known and uses a different
+A normal-speed Once can also play while the actor stands, when its default animation is known and uses a different
 slot. Biggs's team-talk gesture uses `bxic` frames 10–19, then returns to slot 0, `acfe`. The default is retained separately
 from temporary Holds and gestures, including setup and resumed-scene state. Completion restarts the different default slot
-at frame 0 and advances it only by time after the gesture's inclusive range. Unsupported default loops or ASPED invalidate
-restoration until a supported default arrives. Unknown defaults, same-slot returns, full-clip Once, cropped loops and
+at frame 0 and advances it only by time after the gesture's inclusive range. Full Once playback uses the actual loaded clip's
+length: at the post-escape station, Biggs plays slot 4 `cagd` (15 frames), then returns to slot 0 `caed` (2 frames).
+The last frame occupies its full interval before the default restarts; later scene time advances the default loop.
+Both clips must fit the retained model. Delayed first draws and hidden actors use elapsed scene time, so rendering never
+sets the playback clock. Missing clips fall back to the usual pose. Unsupported default loops or ASPED invalidate
+restoration until a supported default arrives. Unknown defaults, same-slot returns, cropped loops and
 other rates keep the usual fallback; the exact original PC render-tick boundary remains unmeasured.
 Ordinary `MOVE` also resolves the same model's walk/run slot from the script's movement speed and field scale:
 slot 1 through three times the scale, slot 2 above it. Wedge's reactor approach uses slot 2 (`aaga`, 15 frames),
@@ -1629,7 +1633,7 @@ The animation pairs follow their original dispatch: `CANIM1`, `CANM!1` and `ANIM
 Jessie's ladder jump follows its authored 15-frame wait; the team-talk director waits for Biggs's ten-frame gesture,
 then its explicit six-frame pause before requesting Jessie. Jessie's blocking `ANIM!2` then delays her first window by
 the existing 15-frame estimate, which matches her original `bxie` clip's frame count. The VM's duration estimates remain;
-general full-clip lengths, arbitrary divisors, busy-animation admission and original PC completion timing remain unverified.
+general full-clip wait lengths, arbitrary divisors, busy-animation admission and original PC completion timing remain unverified.
 The dispatch distinctions follow the [original cropped-animation handlers](https://github.com/Akari1982/q-gears_reverse/blob/e0fabf7e121818e5abe2f873e34a07d0eb32742d/ffvii/DISC/FIELD/FIELD.BIN_event_code_entity.cpp#L246-L365)
 and [full-clip Hold handler](https://github.com/Akari1982/q-gears_reverse/blob/e0fabf7e121818e5abe2f873e34a07d0eb32742d/ffvii/DISC/FIELD/FIELD.BIN_event_code_entity.cpp#L200-L241).
 A watcher opens window 0 itself and every later one only when the owner's `SceneStep` for the one before arrives, so the two screens

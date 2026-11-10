@@ -97,6 +97,8 @@ pub struct AvatarPlayer<'a> {
     pub scene_frame: Option<f32>,
     /// Optional authored scene clip and frame; the retained character model is never replaced.
     pub scene_clip: Option<(&'a str, ClipFrame)>,
+    /// Known standing default used after a full Once finishes; other clip forms ignore it.
+    pub scene_return: Option<&'a str>,
     /// The look the avatar names (untrusted text; only looked up in the table).
     pub appearance: Option<&'a str>,
     /// `Some` for a non-player character of the area instead of a player: the model its data
@@ -335,6 +337,14 @@ impl Avatars {
             };
             let scene_clip = p.scene_clip.and_then(|(stem, frame)| {
                 let clip = self.library.get_scene_animation(&asset, stem)?;
+                if let ClipFrame::OnceFull { elapsed } = frame {
+                    let frames = clip.frame_count();
+                    if frames != 0 && elapsed.is_finite() && elapsed >= frames as f32 {
+                        let standing = self.library.get_scene_animation(&asset, p.scene_return?)?;
+                        let frame = ClipFrame::Loop(elapsed - frames as f32).in_clip(standing.frame_count())?;
+                        return Some((standing, frame));
+                    }
+                }
                 // A held frame outside this actual clip falls back, never wraps to another pose.
                 frame.in_clip(clip.frame_count()).map(|frame| (clip, frame))
             });
@@ -436,7 +446,7 @@ pub(crate) mod tests {
     }
 
     fn player(id: u64, pos: Pos, facing: f32, anim: AnimState) -> AvatarPlayer<'static> {
-        AvatarPlayer { who: Who(id), pos, facing, anim, scene_frame: None, scene_clip: None, appearance: Some("ff7/cloud"), npc: None, tint: [10, 200, 30], own: false, party: false }
+        AvatarPlayer { who: Who(id), pos, facing, anim, scene_frame: None, scene_clip: None, scene_return: None, appearance: Some("ff7/cloud"), npc: None, tint: [10, 200, 30], own: false, party: false }
     }
 
     fn avatars(fail: Vec<&'static str>) -> (Avatars, Rc<RefCell<Vec<&'static str>>>) {
@@ -701,6 +711,9 @@ pub(crate) mod tests {
         use crate::avatar::source::CharacterLoader;
         use fmv_ff7::playable::{Character, PlayableModel};
         fn translated_clip(frames: u32) -> fmv_ff7::FieldAnimation {
+            translated_clip_at(frames, 0.0)
+        }
+        fn translated_clip_at(frames: u32, translation: f32) -> fmv_ff7::FieldAnimation {
             let mut bytes = vec![0u8; 36 + 36 * frames as usize];
             bytes[0..4].copy_from_slice(&1u32.to_le_bytes());
             bytes[4..8].copy_from_slice(&frames.to_le_bytes());
@@ -708,7 +721,7 @@ pub(crate) mod tests {
             bytes[12..15].copy_from_slice(&[1, 0, 2]);
             for frame in 0..frames as usize {
                 let offset = 36 + frame * 36;
-                bytes[offset + 12..offset + 16].copy_from_slice(&(frame as f32 * 4.0).to_le_bytes());
+                bytes[offset + 12..offset + 16].copy_from_slice(&(translation + frame as f32 * 4.0).to_le_bytes());
                 bytes[offset + 16..offset + 20].copy_from_slice(&5f32.to_le_bytes());
             }
             fmv_ff7::FieldAnimation::parse(&bytes).unwrap()
@@ -728,6 +741,7 @@ pub(crate) mod tests {
             fn load_scene_animation(&mut self, stem: &str, _bones: &[fmv_ff7::model::ModelBone]) -> Result<fmv_ff7::FieldAnimation, String> {
                 if stem == "missing" { return Err("missing".into()); }
                 if stem == "range" { return Ok(translated_clip(4)); }
+                if stem == "return" { return Ok(translated_clip_at(2, 20.0)); }
                 Ok(self.load(&fmv_ff7::playable::resolve_appearance_or_default(None))?.walk)
             }
         }
@@ -817,6 +831,44 @@ pub(crate) mod tests {
             let fallback = avatars.frame(&view, &stage, &[actor], 20.0).frame.models.remove(0);
             assert_eq!(fallback.positions, base.positions, "a missing full Hold clip keeps the normal scene pose");
             assert!(std::sync::Arc::ptr_eq(&base.asset, &fallback.asset));
+            actor.scene_return = Some("return");
+            for frame in [ClipFrame::Loop(1.0), ClipFrame::Hold(1), ClipFrame::HoldRange { first: 1, last: 2, elapsed: 0.0 }, ClipFrame::HoldFull { elapsed: 1.0 }] {
+                actor.scene_clip = Some(("range", frame));
+                assert_eq!(avatars.frame(&view, &stage, &[actor], 20.0).frame.models[0].positions, playing.positions, "other clip forms ignore a return clip");
+            }
+            actor.scene_clip = Some(("return", ClipFrame::Hold(0)));
+            let return_start = avatars.frame(&view, &stage, &[actor], 0.0).frame.models.remove(0);
+            actor.scene_clip = Some(("return", ClipFrame::Loop(0.5)));
+            let return_middle = avatars.frame(&view, &stage, &[actor], 0.0).frame.models.remove(0);
+            assert_ne!(return_start.positions, full_last.positions, "the return clip is distinct from the completed clip");
+            assert_ne!(return_middle.positions, return_start.positions);
+            actor.scene_clip = Some(("range", ClipFrame::OnceFull { elapsed: 3.5 }));
+            assert_eq!(avatars.frame(&view, &stage, &[actor], 20.0).frame.models[0].positions, full_last.positions, "the last frame stays visible for its full frame interval");
+            actor.scene_clip = Some(("range", ClipFrame::OnceFull { elapsed: 4.0 }));
+            let returned = avatars.frame(&view, &stage, &[actor], 20.0).frame.models.remove(0);
+            assert_eq!(returned.positions, return_start.positions, "the default starts at zero after the loaded four-frame clip completes");
+            assert!(std::sync::Arc::ptr_eq(&base.asset, &returned.asset));
+            for elapsed in [4.5, 6.5, 1000.5] {
+                actor.scene_clip = Some(("range", ClipFrame::OnceFull { elapsed }));
+                for dt in [0.0, 0.1, 20.0] {
+                    let returned = avatars.frame(&view, &stage, &[actor], dt).frame.models.remove(0);
+                    assert_eq!(returned.positions, return_middle.positions, "only post-completion scene time advances and wraps the two-frame default");
+                    assert!(std::sync::Arc::ptr_eq(&base.asset, &returned.asset), "returning to the default retains the base mesh");
+                }
+            }
+            actor.scene_clip = Some(("missing", ClipFrame::OnceFull { elapsed: 1000.0 }));
+            let fallback = avatars.frame(&view, &stage, &[actor], 20.0).frame.models.remove(0);
+            assert_eq!(fallback.positions, base.positions, "a missing current clip cannot supply a guessed completion time");
+            assert!(std::sync::Arc::ptr_eq(&base.asset, &fallback.asset));
+            for missing in [None, Some("missing")] {
+                actor.scene_return = missing;
+                actor.scene_clip = Some(("range", ClipFrame::OnceFull { elapsed: 3.5 }));
+                assert_eq!(avatars.frame(&view, &stage, &[actor], 20.0).frame.models[0].positions, full_last.positions, "a missing default does not replace an unfinished clip");
+                actor.scene_clip = Some(("range", ClipFrame::OnceFull { elapsed: 4.5 }));
+                let fallback = avatars.frame(&view, &stage, &[actor], 20.0).frame.models.remove(0);
+                assert_eq!(fallback.positions, base.positions, "an absent or missing default falls back after completion");
+                assert!(std::sync::Arc::ptr_eq(&base.asset, &fallback.asset));
+            }
         }
     }
 
@@ -878,7 +930,7 @@ pub(crate) mod tests {
             pos,
             facing,
             anim: AnimState::Idle,
-            scene_frame: None, scene_clip: None,
+            scene_frame: None, scene_clip: None, scene_return: None,
             appearance: None,
             npc: Some(NpcRef { model: "agyb", idle: Some("acfe") }),
             tint: [120, 130, 140],

@@ -572,7 +572,7 @@ fn authored_loops_start_at_events_pause_and_restart_without_changing_the_base_mo
     }
     let looping = |slot| Stage::Anim { entity: 20, animation: slot, how: AnimHow::Loop, first: None, last: None, speed: 16, divisor: 1 };
     let mut unsupported = vec![
-        Stage::Anim { entity: 20, animation: 3, how: AnimHow::Once, first: None, last: None, speed: 16, divisor: 1 },
+        Stage::Anim { entity: 20, animation: 3, how: AnimHow::Once, first: Some(0), last: None, speed: 16, divisor: 1 },
         Stage::Anim { entity: 20, animation: 3, how: AnimHow::Hold, first: None, last: None, speed: 32, divisor: 1 },
         Stage::Anim { entity: 20, animation: 3, how: AnimHow::Loop, first: Some(0), last: Some(1), speed: 16, divisor: 1 },
         Stage::Anim { entity: 20, animation: 3, how: AnimHow::Loop, first: None, last: None, speed: 32, divisor: 1 },
@@ -1001,7 +1001,7 @@ fn bounded_once_restores_only_known_defaults_for_owner_and_watcher() {
         once(3, 2, 0),
         Stage::Anim { entity: 20, animation: 3, how: AnimHow::Once, first: Some(0), last: Some(2), speed: 32, divisor: 1 },
         Stage::Anim { entity: 20, animation: 3, how: AnimHow::Once, first: Some(0), last: Some(2), speed: 16, divisor: 2 },
-        Stage::Anim { entity: 20, animation: 3, how: AnimHow::Once, first: None, last: None, speed: 16, divisor: 1 },
+        Stage::Anim { entity: 20, animation: 3, how: AnimHow::Once, first: Some(0), last: None, speed: 16, divisor: 1 },
     ];
     let invalidators = [
         looping(99),
@@ -1081,6 +1081,147 @@ fn bounded_once_restores_only_known_defaults_for_owner_and_watcher() {
         assert_eq!(clip(&unknown), Some(("four".into(), ClipFrame::Hold(1))));
         unknown.advance(1.0);
         assert_eq!(clip(&unknown), None, "a prior Hold cannot stand in for an unknown default");
+        assert_eq!(unknown.counts().anims_skipped, 1);
+    }
+}
+
+#[test]
+fn full_once_keeps_scene_time_and_a_verified_return_for_owner_and_watcher() {
+    use crate::avatar::anim::ClipFrame;
+    use fmv_ff7::script::scene::AnimHow;
+    struct FullOnce(Scripted, bool);
+    impl SceneSource for FullOnce {
+        fn initial(&self) -> Vec<Stage> { self.0.initial() }
+        fn next(&mut self, answer: Option<usize>) -> Beat { self.0.next(answer) }
+        fn height_at(&self, x: i16, y: i16, triangle: Option<u16>) -> Option<f32> { self.0.height_at(x, y, triangle) }
+        fn animation_clip(&self, entity: u8, slot: u8) -> Option<&str> {
+            if entity != 20 { return None; }
+            match slot { 0 => Some("base"), 3 => Some("three"), 4 => Some("four"), _ => None }
+        }
+        fn initial_default_animation_clip(&self, entity: u8) -> Option<(u8, &str)> {
+            (self.1 && entity == 20).then_some((0, "base"))
+        }
+    }
+    let once = |animation| Stage::Anim { entity: 20, animation, how: AnimHow::Once,
+        first: None, last: None, speed: 16, divisor: 1 };
+    let hold = |animation, frame| Stage::Anim { entity: 20, animation, how: AnimHow::Hold,
+        first: Some(frame), last: Some(frame), speed: 16, divisor: 1 };
+    let looping = |animation| Stage::Anim { entity: 20, animation, how: AnimHow::Loop,
+        first: None, last: None, speed: 16, divisor: 1 };
+    let make = |role, beats: Vec<Beat>, known_default| {
+        let mut definition = def();
+        definition.cast[1].look = Look::Model { hrc: "model".into(), idle: "base".into() };
+        ScenePlayer::new(Run { id: RUN, participants: vec![], role }, definition,
+            Box::new(FullOnce(Scripted { initial: places(), beats: beats.into(), asked: Asked::default() }, known_default)), false)
+    };
+    let drawn = |p: &ScenePlayer| {
+        let actors = cast_players(p);
+        let actor = actors.iter().find(|actor| actor.who == cast_who(20)).unwrap();
+        let npc = actor.npc.unwrap();
+        assert_eq!((npc.model, npc.idle), ("model", Some("base")), "full Once retains the original model/cache identity");
+        (actor.scene_clip.map(|(stem, frame)| (stem.to_string(), frame)), actor.scene_return.map(str::to_string))
+    };
+    let active = |clip: &str, elapsed, default: &str| (
+        Some((clip.to_string(), ClipFrame::OnceFull { elapsed })), Some(default.to_string()),
+    );
+    let unsupported = [
+        once(0), // The incoming slot must differ from the verified default.
+        once(99),
+        Stage::Anim { entity: 20, animation: 3, how: AnimHow::Once, first: Some(0), last: None, speed: 16, divisor: 1 },
+        Stage::Anim { entity: 20, animation: 3, how: AnimHow::Once, first: None, last: Some(2), speed: 16, divisor: 1 },
+        Stage::Anim { entity: 20, animation: 3, how: AnimHow::Once, first: None, last: None, speed: 32, divisor: 1 },
+        Stage::Anim { entity: 20, animation: 3, how: AnimHow::Once, first: None, last: None, speed: 16, divisor: 2 },
+    ];
+    let invalidators = [
+        looping(99),
+        Stage::Anim { entity: 20, animation: 4, how: AnimHow::Loop, first: None, last: None, speed: 32, divisor: 1 },
+    ];
+    for role in [SceneRole::Owner, SceneRole::Watcher] {
+        let pass = |p: &mut ScenePlayer, step| {
+            if role == SceneRole::Owner { p.key(SceneKey::Confirm); } else { p.on_step(step, None); }
+        };
+        let mut beats = vec![
+            Beat { stage: vec![timed(10, once(3))], then: say(40, 20, 20, 1).then },
+            Beat { stage: vec![timed(5, once(4)), timed(8, once(4))], then: say(10, 20, 20, 2).then },
+            Beat { stage: vec![timed(0, hold(4, 1)), timed(2, once(3))], then: say(8, 20, 20, 3).then },
+            Beat { stage: vec![timed(0, once(3)), timed(2, Stage::Move { entity: 20, from: None, x: 90, y: 10,
+                z: None, triangle: None, frames: 3, how: MoveHow::Walk, animation: None })], then: say(8, 20, 20, 4).then },
+            Beat { stage: vec![timed(0, looping(4)), timed(2, once(3))], then: say(20, 20, 20, 5).then },
+            Beat { stage: vec![timed(0, once(3)), timed(3, hold(4, 7))], then: say(20, 20, 20, 6).then },
+            Beat { stage: vec![timed(0, looping(0)), timed(1, once(3)), timed(3, Stage::AnimSpeed { entity: 20, speed: 32 }),
+                timed(4, once(3))], then: say(8, 20, 20, 7).then },
+        ];
+        beats.extend(unsupported.iter().cloned().map(|event| Beat {
+            stage: vec![timed(0, looping(0)), timed(1, once(3)), timed(2, event)], then: say(8, 20, 20, 8).then,
+        }));
+        beats.extend(invalidators.iter().cloned().map(|event| Beat {
+            stage: vec![timed(0, looping(0)), timed(1, once(3)), timed(2, event), timed(3, once(3))], then: say(8, 20, 20, 9).then,
+        }));
+        let mut player = make(role, beats, true);
+        assert_eq!(drawn(&player), (None, None), "initial default metadata creates neither a display override nor a return");
+        player.advance(0.5);
+        assert_eq!(drawn(&player), active("three", 5.0, "base"), "elapsed begins at the event, not the render or beat origin");
+        player.advance(1.0);
+        assert!(player.has_window());
+        assert_eq!(drawn(&player), active("three", 30.0, "base"), "stage must not guess completion at the VM's 15-frame estimate");
+        player.advance(10.0);
+        assert_eq!(drawn(&player), active("three", 30.0, "base"), "dialogue freezes both clip playback and eventual return phase");
+        pass(&mut player, 0);
+        player.advance(3.0 / 30.0);
+        assert_eq!(drawn(&player), active("three", 33.0, "base"));
+        player.advance(3.0 / 30.0);
+        assert_eq!(drawn(&player), active("four", 1.0, "base"), "a new clip resets elapsed");
+        player.advance(3.0 / 30.0);
+        assert_eq!(drawn(&player), active("four", 1.0, "base"), "repeating a full Once also resets elapsed");
+        player.advance(1.0 / 30.0);
+        pass(&mut player, 1);
+        assert_eq!(drawn(&player), (Some(("four".into(), ClipFrame::Hold(1))), None), "a Hold cancels the full Once return");
+        player.advance(3.0 / 30.0);
+        assert_eq!(drawn(&player), active("three", 1.0, "base"), "a transient Hold does not become the return default");
+        player.advance(1.0);
+        pass(&mut player, 2);
+        assert_eq!(drawn(&player), active("three", 0.0, "base"));
+        player.advance(3.0 / 30.0);
+        assert!(player.actor(20).unwrap().moving());
+        assert_eq!(drawn(&player), (None, None), "movement cancels both the full Once and its return descriptor");
+        player.advance(1.0);
+        assert_eq!(drawn(&player), (Some(("base".into(), ClipFrame::Loop(3.0))), None), "arrival restarts the known default without resuming Once");
+        pass(&mut player, 3);
+        assert_eq!(drawn(&player), (Some(("four".into(), ClipFrame::Loop(0.0))), None));
+        player.advance(3.0 / 30.0);
+        assert_eq!(drawn(&player), active("three", 1.0, "four"), "runtime DFANM updates the separately verified return");
+        player.advance(1.0);
+        assert_eq!(drawn(&player), active("three", 18.0, "four"));
+        pass(&mut player, 4);
+        player.advance(1.0);
+        assert_eq!(drawn(&player), (Some(("four".into(), ClipFrame::Hold(7))), None), "replacement prevents a stale return even beyond the old estimate");
+        assert_eq!(player.counts().anims_skipped, 0);
+        pass(&mut player, 5);
+        player.advance(2.0 / 30.0);
+        assert_eq!(drawn(&player), active("three", 1.0, "base"));
+        player.advance(1.0 / 30.0);
+        assert_eq!(drawn(&player), (None, None), "ASPED cancels the active return descriptor");
+        player.advance(1.0);
+        assert_eq!(drawn(&player), (None, None), "ASPED also invalidates the default for a subsequent full Once");
+        assert_eq!(player.counts().anims_skipped, 2);
+        for index in 0..unsupported.len() {
+            pass(&mut player, 6 + index as u32);
+            player.advance(1.0 / 30.0);
+            assert_eq!(drawn(&player), active("three", 0.0, "base"));
+            player.advance(1.0);
+            assert_eq!(drawn(&player), (None, None), "unsupported full Once {index} clears both descriptors");
+        }
+        for index in 0..invalidators.len() {
+            pass(&mut player, 6 + unsupported.len() as u32 + index as u32);
+            player.advance(1.0);
+            assert_eq!(drawn(&player), (None, None), "invalid default {index} cannot provide a later return");
+        }
+        assert_eq!(player.counts().anims_skipped, (2 + unsupported.len() + 2 * invalidators.len()) as u32);
+        let mut unknown = make(role, vec![Beat {
+            stage: vec![timed(0, hold(4, 1)), timed(2, once(3))], then: say(8, 20, 20, 10).then,
+        }], false);
+        unknown.advance(1.0);
+        assert_eq!(drawn(&unknown), (None, None), "an earlier Hold cannot supply an unknown default");
         assert_eq!(unknown.counts().anims_skipped, 1);
     }
 }
@@ -1392,7 +1533,7 @@ fn the_server_echoing_our_own_entity_is_counted_for_the_bots_control_check() {
 // ---- what is drawn ---------------------------------------------------------------------------------------------------
 
 fn avatar(id: u64, x: f32, appearance: &'static str, own: bool) -> AvatarPlayer<'static> {
-    AvatarPlayer { who: Who(id), pos: Pos::new(x, 0.0, 5.0), facing: 1.0, anim: AnimState::Walk, scene_frame: None, scene_clip: None, appearance: Some(appearance), npc: None, tint: [9, 9, 9], own, party: false }
+    AvatarPlayer { who: Who(id), pos: Pos::new(x, 0.0, 5.0), facing: 1.0, anim: AnimState::Walk, scene_frame: None, scene_clip: None, scene_return: None, appearance: Some(appearance), npc: None, tint: [9, 9, 9], own, party: false }
 }
 
 #[test]
