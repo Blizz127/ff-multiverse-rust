@@ -34,6 +34,13 @@ the witness was visible in the inspected samples, and 100 sampled positions kept
 212.4 units from visible cast actors (ring threshold 44). The run ended unskipped, but other
 choice paths, every rendered frame, full screen occlusion and other models remain unchecked;
 the spot is not accepted for live use.
+The longer sampled purchase path also ended unskipped with a 212.4-unit minimum across 104
+position samples, but an inspected frame showed the witness partly covered by scene actors.
+That candidate therefore remains unsuitable even though its walkmesh separation was ample.
+Another candidate `(-3785, 20901, triangle 31)` was visible in inspected frames of the short
+and one purchase path. Both runs ended unskipped; the closest visible actor was 203.3 units away
+in 100 and 104 position samples respectively. The remaining choices, full visual occlusion,
+other models and actual route are still unverified, so this is not an accepted live spot.
 The `md8_1` director also runs `PRTYM` for character 1 (Barret) and `HMPMAX3`; the current
 story party table otherwise continues to offer Cloud and Barret at later moments. Those
 operations and the correct later party must be modeled before this scene advances real progress.
