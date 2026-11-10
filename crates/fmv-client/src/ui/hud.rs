@@ -37,6 +37,9 @@ const FIXTURE_INK: Rgba = [24, 24, 24, 255];
 const NAME_CELLS: usize = 20;
 /// A label sits this many pixels above the marker's centre (clear of the party ring).
 const LABEL_LIFT_PX: i32 = 23;
+/// How far out of the window (pixels, at scale 1) a name label's anchor may be and still get its label: a head just
+/// over an edge keeps its name; somebody the field camera has out of the window does not.
+const OFF_WINDOW_PX: f32 = 32.0;
 
 /// The integer text scale of the HUD for a `w` x `h` window (1 up to 960 x 540, then 2, ...).
 pub fn hud_scale(w: u32, h: u32) -> u32 {
@@ -316,6 +319,12 @@ fn draw_labels(input: &HudInput, w: u32, h: u32, s: i32, top: i32, out: &mut Dra
         }
         let [px, py] = view_to_window(&input.bounds, w, h, label.x, label.y);
         if !(px.is_finite() && py.is_finite()) {
+            continue;
+        }
+        // Somebody the field camera has out of the window gets no label (a near one, a head just over an edge, is kept
+        // inside the window like every label).
+        let off = OFF_WINDOW_PX * s as f32;
+        if px < -off || px > w as f32 + off || py < -off || py > h as f32 + off {
             continue;
         }
         let text = ellipsize(&label.text, NAME_CELLS);
@@ -625,6 +634,22 @@ mod tests {
         for (w, h) in SIZES {
             assert_inside(&draw(&i, w, h), w, h, "edge labels");
         }
+    }
+
+    #[test]
+    fn somebody_the_field_camera_has_out_of_the_window_gets_no_label_but_a_head_over_an_edge_keeps_its_own() {
+        let mut i = input();
+        i.labels = vec![
+            label(0.0, 0.0, "Here", LabelKind::Party),
+            label(-10_000.0, 0.0, "Far Left", LabelKind::Other),
+            label(0.0, 10_000.0, "Far Above", LabelKind::Party),
+            label(0.0, 340.0, "Just Over", LabelKind::Other), // about 18 pixels over the top edge
+        ];
+        let list = draw(&i, 1100, 680);
+        let shown = |name: &str| list.texts().iter().any(|t| t.text == name);
+        assert!(shown("Here") && shown("Just Over"));
+        assert!(!shown("Far Left") && !shown("Far Above"));
+        assert_inside(&list, 1100, 680, "kept labels");
     }
 
     #[test]

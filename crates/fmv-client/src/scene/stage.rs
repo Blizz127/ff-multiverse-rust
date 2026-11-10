@@ -17,7 +17,8 @@
 //!   restart a separately remembered, different default slot after its range or actual loaded clip length.
 //!   Other animations clear that loop and are counted ([`Counts::anims_skipped`]), never guessed at.
 //! * `Sound` is routed separately by the scene player to its cancellable audio channel.
-//! * `Camera` is **recorded** ([`CameraState`]) and not shown: the field's own camera stays where it is.
+//! * `Camera` is **recorded** ([`CameraState`]) with the stage's own clock of it ([`CameraClock`]); the window's field camera
+//!   (`crate::camera`) shows it.
 //!
 //! Time is in field frames (30 a second), the interpreter's clock. A walk or a turn only moves while the scene runs: a
 //! window pauses the whole stage, as it pauses the interpreter.
@@ -27,7 +28,7 @@ use crate::avatar::anim::ClipFrame;
 use std::collections::BTreeMap;
 use std::f32::consts::{PI, TAU};
 
-/// What the scene told the camera last (the camera itself is the field's and never moves here).
+/// What the scene told the camera last (the window's field camera, `crate::camera`, shows it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CameraState {
     /// Nothing asked of it, or given back (`SCRCC`).
@@ -44,7 +45,7 @@ pub enum CameraState {
 pub struct Counts {
     /// Unsupported or unresolved `Anim` events of cast members.
     pub anims_skipped: u32,
-    /// Camera events recorded and not shown.
+    /// Camera events (the window's field camera shows them; counted here as the scene's camera clock).
     pub camera_ops: u32,
     /// Events about an entity that is not in the cast.
     pub off_cast: u32,
@@ -276,11 +277,26 @@ impl Actor {
     }
 }
 
+/// What the scene told the camera last, with the stage's own clock of it: how many camera events the scene has had
+/// (two identical scrolls are two events) and how many frames of scene time went by since the last one. The window's
+/// field camera (`crate::camera`) runs a scroll over its frames on this clock, so a window that pauses the stage pauses
+/// the scroll too, and the scroll ends on the frame the interpreter's `SCRLW` waits for.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct CameraClock {
+    pub state: CameraState,
+    /// Camera events so far in this scene.
+    pub events: u32,
+    /// Frames of scene time since the last camera event (since the start when there was none).
+    pub frames: f32,
+}
+
 /// The cast of one scene and the camera.
 #[derive(Debug, Clone, Default)]
 pub struct Cast {
     actors: BTreeMap<u8, Actor>,
     camera: CameraState,
+    /// Frames of scene time since the last camera event ([`CameraClock::frames`]).
+    camera_frames: f32,
     counts: Counts,
 }
 
@@ -290,7 +306,12 @@ pub type Height<'a> = &'a dyn Fn(i16, i16, Option<u16>) -> Option<f32>;
 impl Cast {
     /// A stage for the cast playing these script entities (every one starts unplaced).
     pub fn new(entities: impl IntoIterator<Item = u8>) -> Self {
-        Self { actors: entities.into_iter().map(|e| (e, Actor::new(e))).collect(), camera: CameraState::Default, counts: Counts::default() }
+        Self { actors: entities.into_iter().map(|e| (e, Actor::new(e))).collect(), camera: CameraState::Default, camera_frames: 0.0, counts: Counts::default() }
+    }
+
+    /// What the scene told the camera and the stage's clock of it ([`CameraClock`]).
+    pub fn camera_clock(&self) -> CameraClock {
+        CameraClock { state: self.camera, events: self.counts.camera_ops, frames: self.camera_frames }
     }
 
     #[cfg(test)]
@@ -323,6 +344,7 @@ impl Cast {
     pub fn clear(&mut self) {
         self.actors.clear();
         self.camera = CameraState::Default;
+        self.camera_frames = 0.0;
     }
 
     /// Move every walk and turn on by `frames` of scene time (no time, or time that is not a number, moves nothing).
@@ -330,6 +352,7 @@ impl Cast {
         if frames.partial_cmp(&0.0).is_none_or(|o| o.is_le()) {
             return;
         }
+        self.camera_frames += frames;
         for actor in self.actors.values_mut() {
             actor.advance(frames);
         }
@@ -429,6 +452,8 @@ impl Cast {
             Stage::Sound { .. } => {},
             Stage::Camera(op) => {
                 self.counts.camera_ops = self.counts.camera_ops.saturating_add(1);
+                // A late event is that far into its scroll already, as a late walk is into its walk.
+                self.camera_frames = overshoot;
                 self.camera = match *op {
                     CameraOp::Scroll { x, y, frames } => CameraState::Scroll { x, y, frames },
                     CameraOp::Follow { entity } => CameraState::Follow { entity },
@@ -743,6 +768,28 @@ mod tests {
         cast.apply(&Stage::Camera(CameraOp::Reset), 0.0, &flat);
         assert_eq!(cast.camera(), CameraState::Default);
         assert_eq!(cast.counts().camera_ops, 3);
+    }
+
+    #[test]
+    fn the_camera_clock_counts_every_instruction_and_runs_on_scene_time_only() {
+        let mut cast = Cast::new([1]);
+        assert_eq!(cast.camera_clock(), CameraClock { state: CameraState::Default, events: 0, frames: 0.0 });
+        cast.advance(10.0);
+        // A scroll that should have started two frames ago is two frames into its run.
+        cast.apply(&Stage::Camera(CameraOp::Scroll { x: 4, y: -5, frames: 12 }), 2.0, &flat);
+        assert_eq!(cast.camera_clock(), CameraClock { state: CameraState::Scroll { x: 4, y: -5, frames: 12 }, events: 1, frames: 2.0 });
+        cast.advance(5.0);
+        assert_eq!(cast.camera_clock().frames, 7.0);
+        // The same scroll again is another instruction: its clock starts again.
+        cast.apply(&Stage::Camera(CameraOp::Scroll { x: 4, y: -5, frames: 12 }), 0.0, &flat);
+        assert_eq!((cast.camera_clock().events, cast.camera_clock().frames), (2, 0.0));
+        // Time that is not time moves nothing; the end of the scene gives the camera back.
+        cast.advance(f32::NAN);
+        cast.advance(-3.0);
+        assert_eq!(cast.camera_clock().frames, 0.0);
+        cast.advance(4.0);
+        cast.clear();
+        assert_eq!((cast.camera_clock().state, cast.camera_clock().frames), (CameraState::Default, 0.0));
     }
 
     #[test]

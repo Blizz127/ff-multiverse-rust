@@ -89,8 +89,8 @@ Not done yet: field scripts as a whole (what is carried out is the exits a line'
 ladders and jumps of the lines, and the story steps the scripts make where the server can see them: a walk, a press of
 OK, a talk, a scripted battle, see "Walking between fields"; no cutscenes), NPC animation and conversations beyond the
 story steps, the field sounds that no script names (footsteps, and the sounds of cutscenes and of talks; the music, a battle's
-sounds and what the fields' scripts play by themselves and for a ladder, a jump or the lift are done, see "Sound"), and the
-window's scrolling camera (it shows the whole background). The increment-by-increment
+sounds and what the fields' scripts play by themselves and for a ladder, a jump or the lift are done, see "Sound"). The
+window's camera scrolls as FF7's does (see "The field camera" under Quickstart). The increment-by-increment
 plan is in `IMPLEMENTATION-PLAN.md`.
 
 ## Workspace
@@ -304,11 +304,30 @@ token is never printed.
 like); in an FF7 field you run, and walk while **Shift** is held (at the field's run and walk
 speeds: hypotheses used for pacing only, the server's own cap is unchanged). **P** invites the
 nearest player to your party, **Y** accepts the pending invite, **L** leaves the party, Esc
-quits, **F1** shows or hides the walkmesh over the picture (hidden by default). The window shows
+quits, **F1** shows or hides the walkmesh over the picture (hidden by default), **F2** switches the field camera
+between FF7's scrolling screen and the whole field at once (see below). The window shows
 player names (over the head of a model, or the marker), your party (leader starred) in the top
 right, the area name (`FF7 md1stin`), the connection status (players, round-trip time) and a
 pending invite; a FIXTURE area wears the label `FIXTURE (synthetic, not FF7)`. The window title
 still shows your party size and a pending invite.
+
+*The field camera* (`fmv-client`, `src/camera.rs`). FF7 never shows a whole field at once: its screen is a 320x240 window
+into the background that follows the player and stops at the field's **camera range** (the triggers section; a field whose
+range is no bigger than the screen does not scroll). The window does the same: the view is FF7's 240 units from the
+window's top to its bottom, centred on your character as it is drawn, in whole field pixels, and as wide as the window's
+shape allows without ever showing past the range (the default 1100 x 680 window shows 388 units of `md1stin`'s 512; a
+narrower range shows black at the sides, as FF7 does). In a story scene it shows what the scene's script asks:
+`SCR2D` puts it at a place at once, `SCR2DC` and `SCR2DL` scroll it there over the script's frames on the scene's own
+clock (a window pauses the scroll with the scene), `SCRLA` follows a cast member, and when the scene says nothing, or
+gives the camera back (`SCRCC`), it follows the scene's lead, the canon Cloud when he is in its cast (whom FF7's camera
+follows), else you. A scroll to field-screen `(x, y)` centres the view on `(-x, -y)`, measured on the owner's data
+(`mds7pb_1`'s `SCR2D 64,-83` centres it on Cloud at `(-64, 84)`; the team talk's `SCR2DC -96,60` brings the team at the
+reactor's gate into view). Changing whom it follows eases over half a second; a new field puts the view in place at once.
+Names of players the view leaves out are not drawn, and a scene's window whose speaker is out of view takes its usual
+place at the bottom. **F2** shows the whole field instead (the overview the window showed before) and back; a FIXTURE
+room is always shown whole. Checked by unit tests (`camera::tests`, the scene's camera clock) and, on the owner's data
+with a GPU or lavapipe, by `scene::shots::offscreen_real_ff7_the_field_camera` (`camera-*.png`: the player in `md1_1`,
+the player at the range's corner, the team talk's scroll).
 
 *Talking.* In an FF7 field, **Enter** or **Space** (the controller's **A**) next to a character, facing
 it, opens that character's own dialogue in a blue window at the bottom of the screen. The text is the
@@ -1693,8 +1712,8 @@ with a refusal), and the headless bot flags `--scene-preview <ID>` (preview, the
 waits until its party is formed), `--scene-watchers <N>` (the owner waits until N party members are in its field), `--scene-watch` (a
 watcher: never presses OK), `--scene-answer <LINE>` and `--scene-wait-secs <N>`. A scene bot prints one `scene line index=.. opener=..
 speaker=.. dialog=.. asks=.. answer=..` per window moved past, `scene started`, `scene ended` and `scene control restored moved=<bool>`:
-ids and counts only, never text. Camera scrolls are recorded but not shown; unsupported animation forms are counted and use
-the actor's usual clips. The view stays on the whole field picture: see the gaps below.
+ids and counts only, never text. The scene's camera instructions move the window's field camera (see "The field camera"
+under Quickstart); unsupported animation forms are counted and use the actor's usual clips.
 
 ### The debug preview (`--debug-scene-preview`, OFF by default)
 
@@ -1747,7 +1766,7 @@ ranks the floor for them. The pictures contain game art: they stay out of the re
   hook into it (see "What the server does"); the rest of the byte (`Var[3][212]`'s other bits) and Tifa's affection points
   (`Var[1][4]`) are the field's own and are not carried.
 * **A window pauses the whole scene** (the engine pauses only the script that opened it), durations are estimates (a walk's
-  length from the move speed, a clip's from its range), camera scrolls and the bar's scripted character poses are not shown, and the cast
+  length from the move speed, a clip's from its range), the bar's scripted character poses are not shown, and the cast
   is Cloud and Tifa: the bar's other characters (Marlene, the patrons) are not drawn.
 * **The interpreter does not know** (counted, never guessed, over every script slot of the game): `AXYZI`, `GETAXY`,
   `GETDIR` (read-backs of a place or a direction), `PDIRA`, `PTURA`, `PXYZI` (the party's own), `DSKCG`, `RDMSD`. (`GETAI` reads a

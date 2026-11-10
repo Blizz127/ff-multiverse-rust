@@ -718,6 +718,84 @@ fn offscreen_survey_station_witness() {
     survey_quiet_witness(fmv_ff7::script::scene::station_scene(), Spot { x: 1074, y: -5183, triangle: 28, direction: 52 }, "station");
 }
 
+/// The window's field camera ([`crate::camera`]) over the owner's `md1_1`, through the window's own path
+/// (`field_draw`, `camera_input`, `FieldCamera::update`, then the frame): FF7's 240-unit screen, as wide as the 1100 x 680
+/// window allows (388 units), following the player where the team-talk preview stands it and at the walkable place inside
+/// the range nearest to its top right, then the team talk's own opening scroll (`SCR2DC -96,60` over 32 frames),
+/// which brings the team into view. Writes `camera-player.png`, `camera-corner.png` and `camera-team-talk.png` and checks
+/// where each view is; look at the pictures (the models' size against the background, nothing cut at the range's edge).
+#[test]
+#[ignore = "needs the owner's real FF7 data (FMV_FF7_LIBRARY, FMV_FF7_DATA or FMV_FF7_FLEVEL) and a GPU or software Vulkan/GL driver"]
+fn offscreen_real_ff7_the_field_camera() {
+    use crate::camera::{clamp_centre, scroll_centre, view_size, FieldCamera};
+    use crate::window::camera_input;
+    use fmv_adapter_api::Bounds;
+    let Some(real) = open() else { return };
+    let mut gpu = Offscreen::new().expect("software or physical GPU");
+    let mut rig = make_rig(&real, fmv_ff7::script::scene::team_talk_scene(), true);
+    let range = rig.view.range.expect("md1_1 has a camera range");
+    let size_units = view_size(&range, SIZE.0 as f32 / SIZE.1 as f32);
+    assert_eq!(size_units, [388.0, 240.0], "FF7's 240 units from the window's top to its bottom, as wide as 1100 x 680");
+    let mut camera = FieldCamera::default();
+    let mut shoot = |rig: &mut Rig, camera: &mut FieldCamera, name: &str| -> Bounds {
+        rig.draw();
+        let draw = rig.draw();
+        rig.view.bounds = camera.update(&camera_input(&rig.view, &rig.state, &draw, SIZE, 0.0));
+        let shown = rig.view.bounds;
+        rig.picture(&mut gpu, name, SIZE, true);
+        eprintln!("{name}: shows {:.0}..{:.0} x {:.0}..{:.0} of the range {:.0}..{:.0} x {:.0}..{:.0}", shown.min.x, shown.max.x, shown.min.y, shown.max.y, range.min.x, range.max.x, range.min.y, range.max.y);
+        shown
+    };
+    let centre = |b: &Bounds| [(b.min.x + b.max.x) / 2.0, (b.min.y + b.max.y) / 2.0];
+    // What the whole window shows (the renderer's fit of the given rectangle, margins and all) is inside the range.
+    let inside = |b: &Bounds| {
+        let fit = crate::render::Camera::fit(b, SIZE.0 as f32, SIZE.1 as f32, crate::render::MARGIN_PX);
+        let [cx, cy] = centre(b);
+        let (hw, hh) = (SIZE.0 as f32 / 2.0 / fit.pixels_per_unit(), SIZE.1 as f32 / 2.0 / fit.pixels_per_unit());
+        cx - hw >= range.min.x - 0.5 && cx + hw <= range.max.x + 0.5 && cy - hh >= range.min.y - 0.5 && cy + hh <= range.max.y + 0.5
+    };
+    let expect = |p: Pos| { let c = clamp_centre([p.x, p.y], &range, size_units); [c[0].round(), c[1].round()] };
+    let near = |a: [f32; 2], b: [f32; 2]| (a[0] - b[0]).abs() < 0.01 && (a[1] - b[1]).abs() < 0.01;
+    // 1. Where the preview stands the player.
+    let own = rig.view.to_view(rig.state.own.pos()).expect("the player is in front of the camera");
+    eprintln!("the player stands at view ({:.0}, {:.0})", own.x, own.y);
+    let shown = shoot(&mut rig, &mut camera, "camera-player");
+    assert!(near(centre(&shown), expect(own)), "{:?} {:?}", centre(&shown), expect(own));
+    assert!(inside(&shown), "never past the camera range");
+    // 2. The walkable place nearest to the range's top right: the view stops at the range's edges.
+    let area = real.adapter.load_field("md1_1").expect("md1_1");
+    let corner = area.walk_triangles().iter()
+        .map(|t| Pos::new((t[0].x + t[1].x + t[2].x) / 3.0, (t[0].y + t[1].y + t[2].y) / 3.0, (t[0].z + t[1].z + t[2].z) / 3.0))
+        .filter_map(|p| rig.view.to_view(p).map(|v| (p, v)))
+        // (the walkmesh runs on past the range into the way out, where FF7's screen leaves the player behind its edge)
+        .filter(|(_, v)| v.x < range.max.x && v.y < range.max.y && v.x > range.min.x && v.y > range.min.y)
+        .max_by(|a, b| (a.1.x + a.1.y).total_cmp(&(b.1.x + b.1.y)))
+        .expect("a walkable place");
+    let area_id = AreaId { game: GameId::Ff7, key: "md1_1".to_string() };
+    rig.state.change_area(area_id, corner.0, 0.0, false);
+    camera.snap();
+    let own = rig.view.to_view(rig.state.own.pos()).expect("the player is in front of the camera");
+    eprintln!("the corner place is at view ({:.0}, {:.0}) (world {:?})", own.x, own.y, corner.0);
+    let shown = shoot(&mut rig, &mut camera, "camera-corner");
+    assert!(near(centre(&shown), expect(own)), "{:?} {:?}", centre(&shown), expect(own));
+    assert!(inside(&shown), "never past the camera range");
+    // 3. The team talk: its opening scroll, once its 32 frames have run on the scene's clock.
+    rig.start();
+    for _ in 0..400 {
+        let clock = rig.state.scene.player().map(|p| p.camera_clock());
+        if clock.is_some_and(|c| c.events > 0 && c.frames >= 32.0) { break; }
+        if rig.state.scene.player().is_some_and(|p| p.has_window()) { rig.state.scene.key(KeyCode::Enter, true, false); } else { rig.state.scene.advance(0.05); }
+        let draw = rig.draw();
+        camera.update(&camera_input(&rig.view, &rig.state, &draw, SIZE, 0.05));
+    }
+    let clock = rig.state.scene.player().expect("the scene still runs").camera_clock();
+    assert!(clock.events > 0 && clock.frames >= 32.0, "the scroll ran: {clock:?}");
+    let shown = shoot(&mut rig, &mut camera, "camera-team-talk");
+    let target = clamp_centre(scroll_centre(-96, 60), &range, size_units);
+    assert!(near(centre(&shown), [target[0].round(), target[1].round()]), "the scroll's place, kept inside the range: {:?}", centre(&shown));
+    assert!(inside(&shown));
+}
+
 impl Rig {
     /// The server starts the scene for the owner and two watchers: entities 1, 2 and 3 on witness spots 0, 1 and 2.
     fn start(&mut self) {

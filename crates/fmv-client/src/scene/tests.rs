@@ -1673,6 +1673,45 @@ fn what_the_stage_cannot_show_is_counted_and_the_camera_is_recorded_and_given_ba
 }
 
 #[test]
+fn the_field_camera_is_told_the_scenes_lead_follows_and_scrolls_on_the_stages_own_clock() {
+    use super::draw::camera_shot;
+    use crate::avatar::frame::tests::view;
+    use crate::camera::{scroll_centre, SceneAim};
+    let view = view();
+    let beats = vec![
+        Beat { stage: vec![timed(30, Stage::Camera(CameraOp::Scroll { x: 64, y: -83, frames: 60 }))], then: Then::Window(window(60, 18, Some(18), message(1, 18, "one"))) },
+        Beat { stage: vec![timed(0, Stage::Camera(CameraOp::Follow { entity: 20 }))], then: Then::Window(window(10, 20, Some(20), message(2, 20, "two"))) },
+        Beat { stage: vec![timed(0, Stage::Camera(CameraOp::Reset)), timed(0, Stage::Show { entity: 18, visible: false })], then: Then::Window(window(5, 20, Some(20), message(3, 20, "three"))) },
+        end(0),
+    ];
+    let mut rig = rig_with(beats, false);
+    begin(&mut rig, SceneRole::Owner);
+    // The flat test ground is at height 11: where the stage stands alpha (the cast's Cloud) and beta.
+    let drawn = |x: f32, y: f32| view.to_view(Pos::new(x, y, 11.0)).map(|p| [p.x, p.y]);
+    let (cloud, tifa) = (drawn(10.0, 10.0), drawn(50.0, 10.0));
+    assert!(cloud.is_some() && tifa.is_some() && cloud != tifa);
+    let shot = |rig: &Rig| camera_shot(rig.client.player().unwrap(), &view);
+    // Before the scene says anything the camera follows its lead, Cloud.
+    assert_eq!((shot(&rig).run, shot(&rig).events, shot(&rig).aim), (RUN.0, 0, SceneAim::Lead { lead: cloud }));
+    // The scroll starts at frame 30; at frame 45 it is 15 frames under way.
+    rig.client.advance(1.5);
+    assert_eq!((shot(&rig).events, shot(&rig).aim), (1, SceneAim::Scroll { centre: scroll_centre(64, -83), frames: 60, elapsed: 15.0 }));
+    // The window at frame 60 pauses the stage, and the scroll with it.
+    rig.client.advance(0.5);
+    rig.client.advance(2.0);
+    assert_eq!(shot(&rig).aim, SceneAim::Scroll { centre: scroll_centre(64, -83), frames: 60, elapsed: 30.0 });
+    // Then it follows beta, with Cloud still the lead.
+    confirm(&mut rig);
+    rig.client.advance(0.1);
+    assert_eq!((shot(&rig).events, shot(&rig).aim), (2, SceneAim::Follow { at: tifa, lead: cloud }));
+    // Given back with Cloud hidden: there is no lead to follow (the window's camera takes the player then).
+    rig.client.advance(1.0);
+    confirm(&mut rig);
+    rig.client.advance(0.1);
+    assert_eq!((shot(&rig).events, shot(&rig).aim), (3, SceneAim::Lead { lead: None }));
+}
+
+#[test]
 fn an_instant_player_has_no_clock_to_wait_for() {
     let mut rig = rig_with(talk(), false);
     rig.client.set_instant(true);
@@ -2121,6 +2160,10 @@ fn the_window_is_anchored_to_its_speakers_head_and_feet_and_knows_who_else_is_in
     let (a, b) = (near.quads()[0], bottom.quads()[0]);
     assert!(a.y + a.h <= want_head[1] as i32, "the window stands above the head ({} <= {})", a.y + a.h, want_head[1]);
     assert!(b.y > a.y, "the one without a speaker is lower, at the bottom of the screen");
+    // A speaker the field camera has out of the window is nobody to point at: the window takes its usual place.
+    let mut away = view;
+    away.bounds = fmv_adapter_api::Bounds { min: Pos::new(5000.0, 5000.0, 0.0), max: Pos::new(5388.0, 5240.0, 0.0) };
+    assert!(speaker_spot(scene, Some(&alone), &away, vw, vh).is_none());
 }
 
 #[test]

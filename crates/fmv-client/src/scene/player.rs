@@ -354,6 +354,12 @@ impl ScenePlayer {
         self.cast.camera()
     }
 
+    /// What the scene told the camera, with the stage's own clock of it (see [`super::stage::CameraClock`]): the
+    /// window's field camera shows it (`crate::camera`).
+    pub fn camera_clock(&self) -> super::stage::CameraClock {
+        self.cast.camera_clock()
+    }
+
     /// What the stage could not show.
     #[cfg(test)]
     pub fn counts(&self) -> super::stage::Counts {

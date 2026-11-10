@@ -33,7 +33,8 @@
 //!   A standing loop yields to movement; moving replaces a held pose or range. A full or bounded Once can return to a known,
 //!   different default slot. Same-slot returns, unknown defaults, cropped loops and dynamic rates remain unsupported. Ordinary MOVE can resolve its original walk/run slot on that same model;
 //!   its clip starts at zero for each move, so same-slot phase/rate retention across repeated moves is not reproduced.
-//! * The scene's camera moves are recorded ([`stage::CameraState`]), not shown: the field's camera stays where it is.
+//! * The scene's camera moves are recorded ([`stage::CameraState`], on the stage's own clock) and shown by the window's field
+//!   camera (`crate::camera`, through [`camera_shot`]): scrolls, follows and the scene's lead.
 //! * A window pauses the whole stage (as the interpreter pauses the whole scene); the game pauses only the script that
 //!   opened it.
 //! * Durations (a walk's length) are the interpreter's estimates: the picture is paced by them.
@@ -57,7 +58,7 @@ pub(crate) mod tests;
 
 pub use bot::{pick_probe, Act, SceneBot, SceneBotConfig, Senses};
 pub use client::{clean_id, SceneClient};
-pub use draw::{cast_players, label_hidden, place_witnesses, speaker_spot, visible_npcs};
+pub use draw::{camera_shot, cast_players, label_hidden, place_witnesses, speaker_spot, visible_npcs};
 pub use keys::{route_key, SceneRoute};
 pub use player::{SceneCmd, SceneSound, SoundAction};
 pub use source::Ff7Scenes;

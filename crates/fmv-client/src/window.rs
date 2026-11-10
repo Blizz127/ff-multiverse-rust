@@ -8,6 +8,7 @@ use crate::audio::{battle_cue, Cue, GameAudio};
 use crate::avatar::frame::Built;
 use crate::avatar::{AvatarPlayer, Avatars, Stage, Who};
 use crate::backdrop::FieldView;
+use crate::camera::{CameraInput, CameraMode, FieldCamera};
 use crate::battle::scene::{scene_for, BattleScene, ModelKit};
 use crate::battle::{battle_vertices, draw_battle_overlay, draw_battle_text, BattleCmd, MenuKey, MenuReply};
 use crate::cli::exit;
@@ -413,6 +414,8 @@ enum KeyRoute {
     Escape,
     /// F1: show or hide the walkmesh.
     WalkMesh,
+    /// F2: FF7's scrolling screen or the whole field.
+    Camera,
     Party(PartyKey),
     Audio(AudioKey),
     Battle(BattleKey),
@@ -434,6 +437,9 @@ fn route_key(code: KeyCode, pressed: bool, repeat: bool, in_battle: bool) -> Key
     }
     if code == KeyCode::F1 {
         return if pressed && !repeat { KeyRoute::WalkMesh } else { KeyRoute::Ignored };
+    }
+    if code == KeyCode::F2 {
+        return if pressed && !repeat { KeyRoute::Camera } else { KeyRoute::Ignored };
     }
     // In a battle a fresh press of Tab, or of Y (a controller's Y is FF7's Triangle), swaps the menu to the next ready member of
     // the party the player commands: FF7's own "switch". Outside a battle Y accepts an invite as ever and Tab is no key of the
@@ -546,6 +552,8 @@ pub(crate) struct App {
     npc_epoch: u64,
     /// F1: draw the walkmesh over the picture (a debugging aid, off by default).
     show_walkmesh: bool,
+    /// Which part of the field the window shows (FF7's scrolling screen; F2: the whole field).
+    camera: FieldCamera,
     /// Session time of the previous frame (for animation).
     last_draw_t: f64,
     /// Until when a first Escape press in the field keeps quitting armed (see [`escape_action`]).
@@ -596,6 +604,7 @@ impl App {
             avatars,
             npc_epoch: 0,
             show_walkmesh: false,
+            camera: FieldCamera::default(),
             last_draw_t: 0.0,
             quit_armed_until: None,
             notice: None,
@@ -670,6 +679,13 @@ impl App {
         match route {
             KeyRoute::Escape => self.escape(el, source),
             KeyRoute::WalkMesh => self.show_walkmesh = !self.show_walkmesh,
+            KeyRoute::Camera => {
+                let text = match self.camera.toggle() {
+                    CameraMode::Follow => "Camera: follows you, as in FF7 (F2: the whole field)",
+                    CameraMode::Whole => "Camera: the whole field (F2: follow you, as in FF7)",
+                };
+                self.notice = Some((text, Instant::now() + NOTICE_TIME));
+            }
             KeyRoute::Party(key) => self.party_key(key),
             KeyRoute::Audio(key) => self.audio_key(key),
             KeyRoute::Battle(key) => self.battle_key(key),
@@ -735,6 +751,8 @@ impl App {
     fn rebuild_view(&mut self) {
         self.talk.close();
         self.view = crate::field_view(self.ff7.as_deref(), &self.session);
+        // A new field: the view is put on the player at once, not scrolled there from the last field's place.
+        self.camera.snap();
         self.base_title = base_title(&self.session.info);
         // The next `update_title` must not wait for its refresh interval.
         self.last_title = Instant::now().checked_sub(TITLE_REFRESH).unwrap_or_else(Instant::now);
@@ -988,9 +1006,13 @@ impl App {
         }
         // Out of battles: whatever scene there was is over.
         self.battle_scene = None;
+        let draw = field_draw(self.avatars.as_mut(), &mut self.npc_epoch, &self.view, &self.session.state, self.session.info.tint, render_t, dt);
+        // The part of the field the window shows this frame: around the player's character as it is drawn now, or
+        // where the scene points the camera (everything below maps view space to the window through it).
+        let (vw, vh) = renderer.size();
+        self.view.bounds = self.camera.update(&camera_input(&self.view, &self.session.state, &draw, (vw, vh), dt));
         let view = &self.view;
         let state = &self.session.state;
-        let draw = field_draw(self.avatars.as_mut(), &mut self.npc_epoch, view, state, self.session.info.tint, render_t, dt);
         let (built, markers) = (draw.built, draw.markers);
 
         // The walkmesh is the scenery of an area without a picture; over a picture it is a
@@ -1005,7 +1027,6 @@ impl App {
         };
         // Names, party, area, connection (and the FIXTURE label) over the scene; a name stays over
         // the head of a model instead of over the marker's centre.
-        let (vw, vh) = renderer.size();
         let mut overlay = DrawList::new();
         // (a scene's trigger is not drawn while its scene runs, and is not named either)
         let story = state.scene.player();
@@ -1038,6 +1059,21 @@ impl App {
     }
 }
 
+/// What the field camera ([`crate::camera`]) needs to know about a frame of the field: the field's range, the player's
+/// character as `draw` drew it, what a running story scene asks, and the shape of a `vw` x `vh` window. The window and the
+/// offscreen pictures both build it here.
+pub(crate) fn camera_input(view: &FieldView, state: &ClientState, draw: &FieldDraw, (vw, vh): (u32, u32), dt: f32) -> CameraInput {
+    CameraInput {
+        range: view.range,
+        whole: view.whole,
+        window: [vw as f32, vh as f32],
+        margin: crate::render::MARGIN_PX,
+        own: draw.own_at.map(|p| [p.x, p.y]),
+        scene: state.scene.player().map(|story| scene::camera_shot(story, view)),
+        dt,
+    }
+}
+
 /// What the screen says when the server refuses a scene request.
 fn refusal_notice(reason: fmv_protocol::SceneRefusal) -> &'static str {
     use fmv_protocol::SceneRefusal;
@@ -1060,6 +1096,9 @@ pub(crate) struct FieldDraw {
     pub markers: Vec<PlayerSprite>,
     /// The key of the local player in `built`.
     pub own_who: Who,
+    /// Where the local player's character is drawn this frame (view space; on its witness spot while a scene runs), for
+    /// the field camera to centre on. `None` when it cannot be drawn.
+    pub own_at: Option<Pos>,
 }
 
 /// Everyone who is drawn in this frame of the field: the area's non-player characters first, then
@@ -1124,6 +1163,7 @@ pub(crate) fn field_draw(
     if let Some(story) = story {
         scene::place_witnesses(&mut players, story);
     }
+    let own_at = players.iter().find(|p| p.own).and_then(|p| view.to_view(p.pos));
     let built = match (avatars, view.stage.as_ref()) {
         (Some(avatars), Some(stage)) => Some(avatars.frame(view, stage, &players, dt)),
         _ => None,
@@ -1134,7 +1174,7 @@ pub(crate) fn field_draw(
         .filter(|(i, _)| built.as_ref().is_none_or(|b| b.markers.contains(i)))
         .filter_map(|(_, p)| marker(view, p))
         .collect();
-    FieldDraw { built, markers, own_who }
+    FieldDraw { built, markers, own_who, own_at }
 }
 
 /// The marker of a player or of a non-player character: where its feet are in view space, in its
@@ -1482,6 +1522,10 @@ mod tests {
         assert_eq!(route_key(KeyCode::Escape, true, true, true), KeyRoute::Ignored, "a held Esc is not a second press");
         assert_eq!(route_key(KeyCode::Escape, false, false, true), KeyRoute::Ignored);
         assert_eq!(route_key(KeyCode::F1, true, false, false), KeyRoute::WalkMesh);
+        assert_eq!(route_key(KeyCode::F2, true, false, false), KeyRoute::Camera);
+        assert_eq!(route_key(KeyCode::F2, true, false, true), KeyRoute::Camera, "in a battle too (it changes nothing there)");
+        assert_eq!(route_key(KeyCode::F2, true, true, false), KeyRoute::Ignored, "a held F2 does not flicker");
+        assert_eq!(route_key(KeyCode::F2, false, false, false), KeyRoute::Ignored);
         assert_eq!(route_key(KeyCode::KeyP, true, false, true), KeyRoute::Party(PartyKey::Invite));
         assert_eq!(route_key(KeyCode::Space, true, false, false), KeyRoute::Battle(BattleKey::Confirm));
         assert_eq!(route_key(KeyCode::ShiftLeft, true, false, true), KeyRoute::Movement, "Shift is still tracked");

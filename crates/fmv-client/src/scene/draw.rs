@@ -12,12 +12,16 @@
 //!   scene's name for where somebody stands) instead of where it really is, with its own look and the field's model scale
 //!   like every other avatar (it is a player body: the same pipeline as the cast). The local player's real place is never
 //!   touched: it is where it was drawn before the scene and where it is drawn after;
-//! * [`speaker_spot`]: where the speaker of the window on show stands on the screen, for [`super::panel::Panel`].
+//! * [`speaker_spot`]: where the speaker of the window on show stands on the screen, for [`super::panel::Panel`] (none
+//!   when the field camera has the speaker out of the window: the window then takes its usual place);
+//! * [`camera_shot`]: what the scene asks of the window's field camera ([`crate::camera`]).
 //!
 //! Players that are not participants keep being drawn at their real places.
 
 use super::panel::{Rect, SpeakerSpot};
 use super::player::ScenePlayer;
+use super::stage::CameraState;
+use crate::camera::{scroll_centre, SceneAim, SceneShot};
 use crate::avatar::frame::{Built, NpcRef};
 use crate::avatar::{AvatarPlayer, Who};
 use crate::backdrop::FieldView;
@@ -122,6 +126,11 @@ pub fn speaker_spot(scene: &ScenePlayer, built: Option<&Built>, view: &FieldView
         Some(((head[0], head[1]), (feet[0], feet[1])))
     };
     let (head, feet) = person(cast_who(entity), casts.iter().find(|c| c.entity == entity)?.pos)?;
+    // A speaker the field camera has out of the window is nobody to point at.
+    let inside = |p: (f32, f32)| (0.0..=vw as f32).contains(&p.0) && (0.0..=vh as f32).contains(&p.1);
+    if !inside(head) && !inside(feet) {
+        return None;
+    }
     // A person's rectangle: the height between the head and the feet, about half as wide, and a few pixels more each way.
     let rect = |(head, feet): ((f32, f32), (f32, f32))| -> Rect {
         let tall = (feet.1 - head.1).abs().max(8.0);
@@ -132,4 +141,28 @@ pub fn speaker_spot(scene: &ScenePlayer, built: Option<&Built>, view: &FieldView
     let mut others: Vec<Rect> = casts.iter().filter(|c| c.entity != entity).filter_map(|c| person(cast_who(c.entity), c.pos)).map(rect).collect();
     others.extend(scene.witnesses().iter().filter_map(|w| person(Who(w.entity.0), w.pos)).map(rect));
     Some(SpeakerSpot { head, feet, others })
+}
+
+/// What the scene asks of the window's field camera this frame ([`crate::camera`]): its last camera instruction on the
+/// stage's own clock, where the actor it follows is drawn, and where its lead is drawn: the canon Cloud when he is in the
+/// cast and on show (the party's leader, whom FF7's camera follows when a scene says nothing of it).
+pub fn camera_shot(scene: &ScenePlayer, view: &FieldView) -> SceneShot {
+    let clock = scene.camera_clock();
+    let casts = scene.cast_draws();
+    let drawn = |c: &super::player::CastDraw<'_>| view.to_view(c.pos).map(|p| [p.x, p.y]);
+    let lead = casts.iter().find(|c| is_lead(c.look)).and_then(drawn);
+    let aim = match clock.state {
+        CameraState::Default => SceneAim::Lead { lead },
+        CameraState::Follow { entity } => SceneAim::Follow { at: casts.iter().find(|c| c.entity == entity).and_then(drawn), lead },
+        CameraState::Scroll { x, y, frames } => SceneAim::Scroll { centre: scroll_centre(x, y), frames, elapsed: clock.frames },
+    };
+    SceneShot { run: scene.run_id().0, events: clock.events, aim }
+}
+
+/// Whether a cast member is the canon Cloud: the playable table's `ff7/cloud`, or a model of his field skeleton `aaaa`.
+fn is_lead(look: &Look) -> bool {
+    match look {
+        Look::Appearance(id) => id == "ff7/cloud",
+        Look::Model { hrc, .. } => hrc.eq_ignore_ascii_case("aaaa"),
+    }
 }

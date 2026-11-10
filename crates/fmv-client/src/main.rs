@@ -28,6 +28,7 @@ mod avatar;
 mod backdrop;
 mod battle;
 mod bot;
+mod camera;
 mod cli;
 mod delete;
 mod ff7;

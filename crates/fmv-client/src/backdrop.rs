@@ -97,8 +97,14 @@ pub struct FieldView {
     /// Walkable triangles in view space (`x`, `y`; `z` is 0). Triangles that cannot be projected
     /// are left out.
     pub triangles: Vec<[Pos; 3]>,
-    /// What the camera fits into the window: the picture's rectangle, else the walkmesh's extent.
+    /// What the camera fits into the window this frame: the part of the field the field camera shows
+    /// ([`crate::camera`]; the window sets it every frame), else [`FieldView::whole`].
     pub bounds: Bounds,
+    /// The whole area: the picture's rectangle, else the walkmesh's extent.
+    pub whole: Bounds,
+    /// The area the view may scroll over (FF7: the field's camera range, in view space), `None` for areas that have none
+    /// (they are always shown whole).
+    pub range: Option<Bounds>,
     pub backdrop: Option<Backdrop>,
     /// One line for the log: how the view was built.
     pub description: String,
@@ -158,6 +164,8 @@ impl FieldView {
             map: Box::new(|p| Some(Pos::new(p.x, p.y, 0.0))),
             triangles: area.walk_triangles(),
             bounds: area.bounds(),
+            whole: area.bounds(),
+            range: None,
             backdrop: None,
             description: "top-down walkmesh view".to_string(),
             stage: None,
@@ -183,7 +191,7 @@ impl FieldView {
             Some(b) => Bounds { min: Pos::new(b.min[0], b.min[1], 0.0), max: Pos::new(b.max[0], b.max[1], 0.0) },
             None => extent(&triangles).unwrap_or(fallback),
         };
-        Self { map: Box::new(map), triangles, bounds, backdrop, description: description.into(), stage: None }
+        Self { map: Box::new(map), triangles, bounds, whole: bounds, range: None, backdrop, description: description.into(), stage: None }
     }
 
     /// An FF7 field seen through its own camera, with its decoded background behind it.
@@ -209,12 +217,16 @@ impl FieldView {
         let map = move |p: Pos| {
             projection.project([p.x, p.y, p.z]).map(|s| Pos::new(s.x, -s.y, 0.0))
         };
-        let (backdrop, canvas, picture) = match decode_background(area.field_file()) {
-            Ok(image) => match Backdrop::from_ff7(&image) {
-                Some(b) => (Some(b), Some(image.bounds()), format!("{}x{} background", image.width, image.height)),
-                None => (None, None, "background image unusable".to_string()),
-            },
-            Err(e) => (None, None, format!("background not decoded ({e})")),
+        let (backdrop, canvas, picture, range) = match decode_background(area.field_file()) {
+            Ok(image) => {
+                let v = image.view_bounds;
+                let range = crate::camera::screen_rect_to_view(v.min_x, v.min_y, v.max_x, v.max_y);
+                match Backdrop::from_ff7(&image) {
+                    Some(b) => (Some(b), Some(image.bounds()), format!("{}x{} background", image.width, image.height), Some(range)),
+                    None => (None, None, "background image unusable".to_string(), None),
+                }
+            }
+            Err(e) => (None, None, format!("background not decoded ({e})"), None),
         };
         let world = area.walk_triangles();
         let mut view = Self::projected(
@@ -226,6 +238,11 @@ impl FieldView {
         );
         if view.triangles.is_empty() {
             return Err(format!("no walkmesh triangle of field {key} is in front of its camera"));
+        }
+        // FF7's screen scrolls over the field's camera range (a field drawn without its picture is shown whole).
+        view.range = range;
+        if let Some(r) = range {
+            view.description.push_str(&format!("; camera range {}x{}", r.max.x - r.min.x, r.max.y - r.min.y));
         }
         // The picture as depth-tested tiles, on the rectangle of the flat picture.
         let (scenery, note) = match (scenery, canvas) {
