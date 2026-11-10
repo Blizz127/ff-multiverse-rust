@@ -259,6 +259,8 @@ struct Live {
     battle_sounds: BattleSounds,
     /// The clips of the battle sounds that were read.
     battle_clips: Clips,
+    /// The ids whose sound-layer section names several clips: all of them, and the turn of the next (FFNx's `sequential`).
+    battle_variants: HashMap<u16, (Vec<SfxClip>, usize)>,
     /// The sound ids asked of the worker (read, being read, or without a clip): never asked for again, until the clip is let go.
     sounds_asked: HashSet<u16>,
     /// Battles seen start (the battle counter at the last look): a new one asks for its clips.
@@ -424,6 +426,12 @@ impl Live {
                         // A clip let go to make room may be asked for again by a later battle.
                         for gone in self.battle_clips.insert(id, clip) {
                             self.sounds_asked.remove(&gone);
+                            self.battle_variants.remove(&gone);
+                        }
+                    }
+                    for (id, clips) in read.variants {
+                        if self.battle_clips.get(id).is_some() && clips.len() > 1 {
+                            self.battle_variants.insert(id, (clips, 0));
                         }
                     }
                     for (id, why) in &read.missing {
@@ -431,7 +439,7 @@ impl Live {
                     }
                     self.say(&format!("effect sounds: {loaded} loaded in {} ms", took.as_millis()));
                 }
-                Done::Field { key, story, read, took } => self.field.on_read(&self.log, &key, &story, read, took),
+                Done::Field { key, story, read, took } => self.field.on_read(&self.log, &key, &story, read.map(|r| *r), took),
                 Done::Voice { seq, result } => self.on_voice(seq, result),
                 Done::BattleAmbience { formation, ambience } => self.on_battle_ambience(formation, ambience),
             }
@@ -467,13 +475,19 @@ impl Live {
         if !self.battle_sounds.plays(sound.why.by_ear()) || now - at > STALE_SOUND_S {
             return;
         }
-        let Some(clip) = self.battle_clips.get(sound.id) else {
+        // A sound with variants plays the next of them in turn (the first time, the first).
+        let variant = self.battle_variants.get_mut(&sound.id).and_then(|(clips, next)| {
+            let clip = clips.get(*next % clips.len().max(1)).cloned();
+            *next = next.wrapping_add(1);
+            clip
+        });
+        let Some(clip) = variant.or_else(|| self.battle_clips.get(sound.id).cloned()) else {
             if self.unheard.insert(sound.id) {
                 self.say(&format!("battle sound {} ({}) has no clip to play", sound.id, sound.why.name()));
             }
             return;
         };
-        self.engine.play_sfx(clip, BATTLE_GAIN, 0.0);
+        self.engine.play_sfx(&clip, BATTLE_GAIN, 0.0);
         *self.battle_played.entry(sound.id).or_default() += 1;
         self.say(&format!("battle sound {} ({})", sound.id, sound.why.name()));
     }
@@ -579,6 +593,7 @@ impl GameAudio {
                 muted: false,
                 battle_sounds: BattleSounds::default(),
                 battle_clips: Clips::default(),
+                battle_variants: HashMap::new(),
                 sounds_asked: HashSet::new(),
                 battles_seen: 0,
                 battle_ambience: BattleAmbience::default(),
@@ -887,6 +902,8 @@ mod tests {
         voices: HashMap<String, usize>,
         /// The battle ambiences the sound layer has, by formation: their sections.
         battle_ambience: HashMap<u16, String>,
+        /// Ids whose sound-layer section names several clips, and how many.
+        variants: HashMap<u16, usize>,
     }
 
     /// A worker that answers on the spot (or when told to): no threads, no waiting.
@@ -945,6 +962,10 @@ mod tests {
                 } else {
                     // A clip of a tenth of a second at the rate of the engine, never silent.
                     read.clips.push((id, SfxClip::from_mono(RATE, &vec![0.5; 4_800]).expect("a clip")));
+                    if let Some(&n) = s.variants.get(&id) {
+                        // variant k is k + 1 tenths of a second long, so a test can tell them apart
+                        read.variants.push((id, (0..n).map(|k| SfxClip::from_mono(RATE, &vec![0.5; 4_800 * (k + 1)]).expect("a clip")).collect()));
+                    }
                 }
             }
             let done = Done::Sounds { read, took: std::time::Duration::from_millis(3) };
@@ -980,7 +1001,7 @@ mod tests {
                 }));
                 Ok(field::FieldRead { plan, clips, ambience })
             };
-            let done = Done::Field { key: key.to_string(), story, read, took: std::time::Duration::from_millis(4) };
+            let done = Done::Field { key: key.to_string(), story, read: read.map(Box::new), took: std::time::Duration::from_millis(4) };
             if s.hold { s.held.push(done) } else { s.inbox.push(done) }
         }
 
@@ -1474,6 +1495,26 @@ mod tests {
 
     fn played(rig: &Rig) -> Vec<String> {
         rig.lines().into_iter().filter(|l| l.starts_with("battle sound ") && !l.contains("loaded") && !l.contains("no clip")).collect()
+    }
+
+    #[test]
+    fn a_sound_the_layer_has_several_clips_for_plays_them_in_turn() {
+        let mut rig = Rig::new(&[], &[]);
+        rig.state.borrow_mut().variants.insert(18, 3);
+        let mut client = battle();
+        look(&mut rig, &client, 0.0);
+        look(&mut rig, &client, 0.1);
+        let frames = |rig: &Rig| rig.audio.live.as_ref().and_then(|l| l.battle_variants.get(&18).map(|(clips, next)| (clips.iter().map(SfxClip::frames).collect::<Vec<_>>(), *next)));
+        assert_eq!(frames(&rig), Some((vec![4_800, 9_600, 14_400], 0)), "the three clips of the hit, in the section's order");
+        for round in 0..4u32 {
+            let at = 10.0 + f64::from(round) * 3.0;
+            send(&mut client, at, blow(0, 2, false));
+            look(&mut rig, &client, at);
+            look(&mut rig, &client, at + 0.6);
+        }
+        assert_eq!(played(&rig), vec!["battle sound 18 (hit)"; 4]);
+        assert_eq!(frames(&rig).map(|(_, next)| next), Some(4), "the first, the second, the third and the first again");
+        assert!(rig.audio.live.as_ref().unwrap().battle_variants.get(&5).is_none(), "an id with one clip has no turns");
     }
 
     #[test]

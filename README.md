@@ -2063,7 +2063,9 @@ route's fights have one (formation 300 and the debug fight 303 the station's cli
 `battle ambience start|stop bat_<n> ...`.
 
 **Not done, and why.** Voiced attacks (`battle_char_<index>_<id>` sections of both configs) need to know which character performs a battle sound, which
-the client's battle sounds do not carry. A repeating sound id plays the first of its clips, not each in turn; Cosmo's footsteps
+the client's battle sounds do not carry. In a fight a sound id whose section names several clips plays them in turn (FFNx's
+`sequential` counter; up to 8, the first again after the last: Cosmo names 6 hits for id 18, 7 misses for id 5), so a repeated
+blow does not sound the same; a field's one-shot sounds still play the first clip each time. Cosmo's footsteps
 (`<field>_<triangle>_<id>`, the sound id 159 that no script of the game plays), movie sounds and menu sets 2 and 3 are not used; Echo-S's battle lines, `NoCloud` voices,
 models, textures and kernel text are not used either. Only characters that talk are voiced: a cutscene's windows will be voiced by the scene player
 through the same cues once it runs Echo-S's section (`mods::script_source()` and `VoiceCue`). A voice does not duck the music.

@@ -40,7 +40,7 @@ pub enum Done {
     Sounds { read: SoundsRead, took: Duration },
     /// What a field's scripts play for a story (the plan and the clips it names), or why that could not be read, and how
     /// long it took. `story` is the progression blob it was made for.
-    Field { key: String, story: Vec<u8>, read: Result<FieldRead, String>, took: Duration },
+    Field { key: String, story: Vec<u8>, read: Result<Box<FieldRead>, String>, took: Duration },
     /// The voice clip an ask wanted (`Ok(None)`: it has none, which is most windows), or why it could not be read; `seq` is
     /// the ask, so that an answer to an ask that has been replaced is thrown away.
     Voice { seq: u64, result: Result<Option<VoiceClip>, String> },
@@ -71,6 +71,9 @@ pub struct VoiceClip {
 pub struct SoundsRead {
     pub clips: Vec<(u16, SfxClip)>,
     pub missing: Vec<(u16, String)>,
+    /// For an id whose sound-layer section names several clips: all of them, in the section's order (the first is the one in
+    /// `clips`). They are played in turn, as FFNx's `sequential` counter does, so a repeated sound does not sound the same.
+    pub variants: Vec<(u16, Vec<SfxClip>)>,
 }
 
 /// What the soundtrack asks of the slow side. Every call returns at once.
@@ -296,13 +299,13 @@ fn run(shared: &Shared, tasks: &Tasks, send: &Sender<Done>) {
             Job::Sounds(ids) => {
                 let started = Instant::now();
                 let read = catch_unwind(AssertUnwindSafe(|| (tasks.sounds)(&ids)))
-                    .unwrap_or_else(|_| SoundsRead { clips: Vec::new(), missing: ids.iter().map(|id| (*id, "the sound file reader panicked".to_string())).collect() });
+                    .unwrap_or_else(|_| SoundsRead { missing: ids.iter().map(|id| (*id, "the sound file reader panicked".to_string())).collect(), ..SoundsRead::default() });
                 Done::Sounds { read, took: started.elapsed() }
             }
             Job::Field { key, story, have } => {
                 let started = Instant::now();
                 let read = catch_unwind(AssertUnwindSafe(|| (tasks.field)(&key, &story, &have))).unwrap_or_else(|_| Err("the field reader panicked".to_string()));
-                Done::Field { key, story, read, took: started.elapsed() }
+                Done::Field { key, story, read: read.map(Box::new), took: started.elapsed() }
             }
             Job::BattleAmbience(formation) => {
                 let ambience = tasks.battle_ambience.as_ref().and_then(|task| catch_unwind(AssertUnwindSafe(|| task(formation))).ok().flatten());
@@ -358,6 +361,7 @@ mod tests {
             sounds: Arc::new(|ids| SoundsRead {
                 clips: ids.iter().filter(|id| **id != 99).map(|id| (*id, SfxClip::from_mono(22_050, &[0.1, 0.2]).expect("a clip"))).collect(),
                 missing: ids.iter().filter(|id| **id == 99).map(|id| (*id, "an empty slot".to_string())).collect(),
+                variants: Vec::new(),
             }),
             field: Arc::new(move |key, story, have| {
                 assert_ne!(std::thread::current().id(), caller);
@@ -367,7 +371,7 @@ mod tests {
                 // the plan carries the key and the story it was asked for; the clips are those not held
                 let plan = FieldPlan { key: key.to_string(), story: story.to_vec(), ..FieldPlan::default() };
                 let clips = (1..=3u16).filter(|id| !have.contains(id)).map(|id| (id, SfxClip::from_mono(22_050, &[0.1, 0.2]).expect("a clip"))).collect();
-                Ok(FieldRead { plan, clips: SoundsRead { clips, missing: Vec::new() }, ambience: None })
+                Ok(FieldRead { plan, clips: SoundsRead { clips, ..SoundsRead::default() }, ambience: None })
             }),
         };
         let mut worker = ThreadWorker::start(tasks);

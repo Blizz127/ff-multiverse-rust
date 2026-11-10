@@ -82,6 +82,9 @@ struct SoundLayer {
     decoded: Arc<std::sync::atomic::AtomicUsize>,
 }
 
+/// The most clips of one sound id that are played in turn (Cosmo names up to 7 for the sounds of a fight).
+const MAX_VARIANTS: usize = 8;
+
 /// How many decoded field ambiences [`SoundLayer`] keeps (a long one is tens of MB of samples).
 const AMBIENCE_CACHE: usize = 3;
 
@@ -106,22 +109,35 @@ impl SoundLayer {
     /// clips for it and the first one decodes. A repeating sound plays that first clip each time (the layer's `sequential`/`shuffle`
     /// order is not followed: a known gap). No loop region is given: the original id's loop offsets are bytes of the original's PCM
     /// and mean nothing for another file, and a loop plays a clip without a region whole, over and over.
+    /// The first of [`SoundLayer::replacements`] (the menu sounds, which play one clip each).
     fn replacement(&self, id: u16, field: Option<&str>) -> Option<SfxClip> {
+        self.replacements(id, field).and_then(|clips| clips.into_iter().next())
+    }
+
+    /// The mixer clips that play in place of sound id `id`, in the order the layer's section names them (at most
+    /// [`MAX_VARIANTS`]): the first decodes or none plays (the original does), a later one that does not decode is left out.
+    fn replacements(&self, id: u16, field: Option<&str>) -> Option<Vec<SfxClip>> {
         let set = self.mods.as_ref()?.sfx(id, field)?;
-        let first = set.clips.into_iter().next()?;
-        let music = match decode_music_bytes(first.bytes, extension_of(&first.name)) {
-            Ok(music) => music,
-            Err(e) => {
-                (self.log)(&format!("sound {id}: {} does not decode ({e}); the original plays", first.name));
-                return None;
+        let source = set.clips.first()?.source;
+        let mut clips = Vec::new();
+        for (i, found) in set.clips.into_iter().take(MAX_VARIANTS).enumerate() {
+            let clip = decode_music_bytes(found.bytes, extension_of(&found.name))
+                .map_err(|e| e.to_string())
+                .and_then(|music| pcm_of(&music).ok_or_else(|| "nothing to play".to_string()))
+                .and_then(|(rate, samples)| SfxClip::from_stereo(rate, samples).ok_or_else(|| "an unusable format".to_string()));
+            match clip {
+                Ok(clip) => clips.push(clip),
+                Err(e) if i == 0 => {
+                    (self.log)(&format!("sound {id}: {} does not decode ({e}); the original plays", found.name));
+                    return None;
+                }
+                Err(_) => {}
             }
-        };
-        let (rate, samples) = pcm_of(&music)?;
-        let clip = SfxClip::from_stereo(rate, samples)?;
-        if self.said.lock().unwrap_or_else(PoisonError::into_inner).insert(id) {
-            (self.log)(&format!("sound {id} from {}", first.source));
         }
-        Some(clip)
+        if self.said.lock().unwrap_or_else(PoisonError::into_inner).insert(id) {
+            (self.log)(&format!("sound {id} from {source}"));
+        }
+        Some(clips)
     }
 
     /// The ambience the sound layer has for the field with maplist id `field_id`, decoded as a mixer clip that loops whole, or
@@ -415,7 +431,7 @@ fn load_sounds(files: &ResolvedAudio, ids: &[u16]) -> SoundsRead {
 /// [`load_sounds`] with the sound layer's clip for an id where it has one (heard in `field`, when that is known: a field's own
 /// sounds are asked for with it).
 fn load_sounds_with(files: &ResolvedAudio, ids: &[u16], layer: &SoundLayer, field: Option<&str>) -> SoundsRead {
-    let missing_all = |why: String| SoundsRead { clips: Vec::new(), missing: ids.iter().map(|id| (*id, why.clone())).collect() };
+    let missing_all = |why: String| SoundsRead { missing: ids.iter().map(|id| (*id, why.clone())).collect(), ..SoundsRead::default() };
     let (Some(fmt), Some(dat)) = (&files.sfx_fmt, &files.sfx_dat) else {
         return missing_all("the library has no audio.fmt and audio.dat".to_string());
     };
@@ -425,8 +441,11 @@ fn load_sounds_with(files: &ResolvedAudio, ids: &[u16], layer: &SoundLayer, fiel
     };
     let mut read = SoundsRead::default();
     for &id in ids {
-        if let Some(clip) = layer.replacement(id, field) {
-            read.clips.push((id, clip));
+        if let Some(mut clips) = layer.replacements(id, field) {
+            if clips.len() > 1 {
+                read.variants.push((id, clips.clone()));
+            }
+            read.clips.push((id, clips.swap_remove(0)));
             continue;
         }
         match bank.decode_sound_id(id) {
@@ -858,6 +877,20 @@ mod tests {
         assert!(layer.ambience(118).is_some() && layer.ambience(118).is_some() && layer.ambience(1).is_none());
         assert_eq!(decoded(), 2);
         assert!(said(&lines).is_empty(), "{:?}", said(&lines));
+    }
+
+    #[test]
+    fn a_sound_ids_clips_come_in_the_order_its_section_names_them_and_a_bad_later_one_is_left_out() {
+        let blobs = [
+            ("Base\\sfx\\6303.wav", synthetic_wav(8_000, &[100, -100])),
+            ("Base\\sfx\\6304.ogg", b"OggS-but-not-audio".to_vec()),
+            ("Base\\sfx\\6305.wav", synthetic_wav(8_000, &[100, -100, 200, -200, 300, -300])),
+        ];
+        let cosmo = cosmo_archive_blobs(&blobs, Some("[6]\nsequential = [ 6303, 6304, 6305 ]\n"));
+        let (_t, layer, _lines) = layer(&EchoSpec::default(), Some(cosmo), Layers::ALL);
+        let clips = layer.replacements(6, None).expect("Cosmo's clips for id 6");
+        assert_eq!(clips.iter().map(SfxClip::frames).collect::<Vec<_>>(), [2, 6]);
+        assert_eq!(layer.replacement(6, None).map(|c| c.frames()), Some(2), "one clip: the first");
     }
 
     #[test]
