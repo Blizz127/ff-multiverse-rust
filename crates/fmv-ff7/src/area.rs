@@ -208,6 +208,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 // Distinct from AreaStory's moment tag (0x4D); never stored in a progression blob.
 const JESSIE_RESCUED_PHASE: u8 = b'J';
+const MATERIA_HIDDEN_PHASE: u8 = b'H';
 
 /// Cap on a decompressed field file (16 MiB). The largest part of a PC field is its
 /// background (at most 42 texture pages of at most 128 KiB, about 5 MiB) and the largest
@@ -1027,6 +1028,14 @@ impl AreaRuntime for Ff7FieldArea {
                 phase.0.insert(0, JESSIE_RESCUED_PHASE);
             }
         }
+        if self.info.id.key.eq_ignore_ascii_case("nmkin_5") {
+            let story = story::StoryState::decode(progress)?;
+            // The owned setup uses IFSW (a signed word) >= 15. Preserve that boundary even for
+            // out-of-route moments; the runtime marker adds no persisted state.
+            if (story.moment as i16) >= 15 {
+                phase.0.insert(0, MATERIA_HIDDEN_PHASE);
+            }
+        }
         Some(phase)
     }
 
@@ -1036,6 +1045,14 @@ impl AreaRuntime for Ff7FieldArea {
             for npc in &mut npcs {
                 if npc.entity_name.eq_ignore_ascii_case("av_j") {
                     // Retain the slot so the other characters keep their server IDs.
+                    npc.unconditional = false;
+                }
+            }
+        }
+        if self.info.id.key.eq_ignore_ascii_case("nmkin_5") && phase.0.first() == Some(&MATERIA_HIDDEN_PHASE) {
+            for npc in &mut npcs {
+                if npc.entity_name.eq_ignore_ascii_case("mtr") {
+                    // Its own setup hides it from moment 15 onward. Keep the slot and all saved state.
                     npc.unconditional = false;
                 }
             }

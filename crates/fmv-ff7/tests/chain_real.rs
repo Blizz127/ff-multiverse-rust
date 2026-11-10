@@ -1040,10 +1040,14 @@ fn nobody_is_stranded_at_27_or_33_in_any_reviewed_field() {
                 assert!(reach.iter().any(|t| open_triangles.contains(t)), "{field} at {name}: from the arrival on triangle {start} no open exit ({:?}) can be walked to", open.iter().map(|e| e.target.as_str()).collect::<Vec<_>>());
             }
         }
-        // the cast is not decided by the moment (the phase of the field for a story does not change who stands there)
+        // Only the reviewed changes to NPC visibility follow these late moments.
         for (name, story) in &stories {
             let phase = area.phase_key(story).expect("a story the adapter reads");
-            assert_eq!(area.npcs_in_phase(&phase), area.npcs(), "{field} at {name}: the cast is the one the data places");
+            let mut expected = area.npcs();
+            if field == "nmkin_5" {
+                expected.iter_mut().filter(|npc| npc.entity_name == "mtr").for_each(|npc| npc.unconditional = false);
+            }
+            assert_eq!(area.npcs_in_phase(&phase), expected, "{field} at {name}: only reviewed cast changes");
         }
     }
     // nothing of the mission re-fires at 33: the points of the reviewed fields apply to the story before them only, except the
@@ -1170,4 +1174,40 @@ fn jessies_saved_rescue_changes_only_her_visibility_and_field_phase() {
         assert_eq!(area.phase_key(&after.encode()), Some(rescued_phase), "lift does not change this cast");
     }
     assert_eq!(area.phase_key(&[255, 1, 2]), None, "unreadable progression is not guessed");
+}
+
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn reactor_materia_disappears_at_its_existing_story_step() {
+    use fmv_ff7::script::scene::{guard_scorpion_scene, CastMember, Look, ScenePlay, ScriptRef, Stage};
+    let adapter = adapter().expect("FMV_FF7_DATA");
+    let area = adapter.load_field("nmkin_5").unwrap();
+    let base = area.npcs();
+    let index = base.iter().position(|npc| npc.entity_name == "mtr").expect("materia");
+    let npc = &base[index];
+    assert!(npc.unconditional);
+    let mut archive = fmv_ff7::lgp::LgpArchive::open_path(flevel_path(&data_dir().unwrap())).unwrap();
+    let field = script_common::load_field(&mut archive, "nmkin_5").unwrap();
+    let mut def = guard_scorpion_scene();
+    def.setup = vec![ScriptRef::new(6, 0)];
+    def.cast = vec![CastMember { entity: 6, name: "mtr".into(),
+        look: Look::Model { hrc: npc.appearance.model.clone(), idle: npc.appearance.idle_animation.clone().unwrap() }, start: None }];
+    for moment in [0, 1, 13, 14, 15, 16, 26, 27, 28, 33, 120, 127, 32767, 32768, u16::MAX] {
+        let before = StoryState::at(moment);
+        let phase = area.phase_key(&before.encode()).unwrap();
+        let script = ScenePlay::new(&field, &def, &before, 1).unwrap();
+        let hidden = script.initial_stage_events().iter().any(|event| matches!(event, Stage::Show { entity: 6, visible: false }));
+        assert_eq!(hidden, (moment as i16) >= 15, "owned setup uses a signed word at {moment}");
+        let mut expected = base.clone();
+        expected[index].unconditional = !hidden;
+        assert_eq!(area.npcs_in_phase(&phase), expected, "same slots, positions and other actors at {moment}");
+        assert_eq!(area.phase_key(&StoryState::decode(&before.encode()).unwrap().encode()), Some(phase), "same after reload");
+    }
+    let before = StoryState::at(14).encode();
+    let step = area.story_advance(&before, 3).expect("existing materia talk point");
+    assert_eq!(step.summary, "moment=14->15");
+    assert_eq!(step.progress, StoryState::at(15).encode(), "unchanged saved format and effects");
+    assert_ne!(area.phase_key(&before), area.phase_key(&step.progress), "immediate snapshot after step");
+    assert!(area.story_advance(&step.progress, 3).is_none(), "not repeatable");
+    assert_eq!(area.npcs_in_phase(&fmv_core::PhaseKey(vec![255])), base, "unknown phase is not interpreted");
 }

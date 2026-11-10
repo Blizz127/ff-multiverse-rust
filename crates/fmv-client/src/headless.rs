@@ -380,12 +380,10 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>, mut 
         audio.update_from(&session);
         let npcs: Vec<(u32, String, String)> = session.state.npc_views().iter().map(|n| (n.id, n.name.clone(), n.model.clone())).collect();
         if npcs != last_npcs {
-            if !npcs.is_empty() {
-                let names: Vec<&str> = npcs.iter().map(|(_, name, _)| name.as_str()).collect();
-                eprintln!("headless: {} NPC(s) in {}: {}", npcs.len(), session.info.area_id, names.join(", "));
-                for (id, name, model) in &npcs {
-                    eprintln!("{}", npc_line(&session.info.area_id, *id, name, model));
-                }
+            let names: Vec<&str> = npcs.iter().map(|(_, name, _)| name.as_str()).collect();
+            eprintln!("headless: {} NPC(s) in {}: {}", npcs.len(), session.info.area_id, names.join(", "));
+            for (id, name, model) in &npcs {
+                eprintln!("{}", npc_line(&session.info.area_id, *id, name, model));
             }
             last_npcs = npcs;
         }

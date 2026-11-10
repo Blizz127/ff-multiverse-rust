@@ -586,7 +586,9 @@ lift's ride back up (`elevtr1`, a tracked bit turned off, the moment stays 27) a
 the Guard Scorpion"). A **talk** point is a character whose own talk script (or one it requests)
 writes the story: what the talk does is not read off the text, the character's script is run (the dialogue walker) for the
 story the player has when it presses OK, after the character's own set-up has decided whether it can be talked to at all
-(the materia switches itself off once the story has moved to 15). The client's conversation shows the lines for the story
+(the materia switches itself off once the story has moved to 15). Its field model also disappears at that step for the
+leader and party members in the field, including after re-login; its NPC slot stays reserved. This only follows the existing
+story counter: the separate materia inventory award is still unimplemented. The client's conversation shows the lines for the story
 as it was BEFORE the step; the server applies the step on the press and the mirrored story moves on after. A **scripted
 battle** is a `BATTLE` the block starts before its write (the director's loop in `nmkin_5` asks the characters' scripts to run
 the cutscene, which fights): the server starts it for the party, a battle point fires only by coming to it from outside, a
@@ -1452,6 +1454,8 @@ point moves the story to, or `SceneDef::presents_bit` for an existing saved flag
 `python3 scripts/ladder-smoke.py <package-bin-dir> [--echo-s <archive>]` checks this last scene with two headless party
 clients walking from `nmkin_2` into the real `nmkin_3`. It requires one shared run, one finished window on each client,
 and one saved 13-to-14 step, using temporary state and read-only owned assets. Shared scenes use the original script.
+Add `--battle --timeout 180` to continue through the materia's disappearance into one shared Guard Scorpion fight,
+requiring both clients' replays to match and one saved victory step/countdown.
 
 How it works (`World::start_point_scene`, `SceneHost::point_scene`):
 
