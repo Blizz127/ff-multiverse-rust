@@ -468,7 +468,7 @@ impl ScenePlayer {
     }
 
     fn apply_stage(cast: &mut Cast, source: &dyn SceneSource, event: &Stage, late: f32) {
-        // Supported forms have no guessed duration: a full default loop or one exact held frame,
+        // Supported forms have no guessed duration: a full default loop or an explicit Hold range,
         // on the script's own field model. Every other Anim clears an old override.
         if let Stage::Anim { entity, animation, how: AnimHow::Loop, first: None, last: None, speed: 16, divisor: 1 } = event {
             if let Some(clip) = source.animation_clip(*entity, *animation) {
@@ -477,9 +477,10 @@ impl ScenePlayer {
             }
         }
         if let Stage::Anim { entity, animation, how: AnimHow::Hold, first: Some(first), last: Some(last), speed: 16, divisor: 1 } = event {
-            if first == last {
+            if first <= last {
                 if let Some(clip) = source.animation_clip(*entity, *animation) {
-                    cast.apply_hold(*entity, clip, *first);
+                    if first == last { cast.apply_hold(*entity, clip, *first); }
+                    else { cast.apply_hold_range(*entity, clip, *first, *last, late); }
                     return;
                 }
             }

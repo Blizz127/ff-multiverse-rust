@@ -700,19 +700,24 @@ pub(crate) mod tests {
     fn scene_clip_frames_freeze_cpu_poses_independently_of_render_time() {
         use crate::avatar::source::CharacterLoader;
         use fmv_ff7::playable::{Character, PlayableModel};
+        fn translated_clip(frames: u32) -> fmv_ff7::FieldAnimation {
+            let mut bytes = vec![0u8; 36 + 36 * frames as usize];
+            bytes[0..4].copy_from_slice(&1u32.to_le_bytes());
+            bytes[4..8].copy_from_slice(&frames.to_le_bytes());
+            bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+            bytes[12..15].copy_from_slice(&[1, 0, 2]);
+            for frame in 0..frames as usize {
+                let offset = 36 + frame * 36;
+                bytes[offset + 12..offset + 16].copy_from_slice(&(frame as f32 * 4.0).to_le_bytes());
+                bytes[offset + 16..offset + 20].copy_from_slice(&5f32.to_le_bytes());
+            }
+            fmv_ff7::FieldAnimation::parse(&bytes).unwrap()
+        }
         struct Moving;
         impl CharacterLoader for Moving {
             fn load(&mut self, model: &PlayableModel) -> Result<Character, String> {
                 let mut character = crate::avatar::library::tests::character(*model, 1, 2, 1);
-                let mut bytes = vec![0u8; 108];
-                bytes[0..4].copy_from_slice(&1u32.to_le_bytes());
-                bytes[4..8].copy_from_slice(&2u32.to_le_bytes());
-                bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
-                bytes[12..15].copy_from_slice(&[1, 0, 2]);
-                bytes[52..56].copy_from_slice(&5f32.to_le_bytes());
-                bytes[88..92].copy_from_slice(&5f32.to_le_bytes());
-                bytes[84..88].copy_from_slice(&4f32.to_le_bytes());
-                character.walk = fmv_ff7::FieldAnimation::parse(&bytes).unwrap();
+                character.walk = translated_clip(2);
                 Ok(character)
             }
             fn load_npc(&mut self, _model: &str, _idle: &str) -> Result<Character, String> {
@@ -722,6 +727,7 @@ pub(crate) mod tests {
             }
             fn load_scene_animation(&mut self, stem: &str, _bones: &[fmv_ff7::model::ModelBone]) -> Result<fmv_ff7::FieldAnimation, String> {
                 if stem == "missing" { return Err("missing".into()); }
+                if stem == "range" { return Ok(translated_clip(4)); }
                 Ok(self.load(&fmv_ff7::playable::resolve_appearance_or_default(None))?.walk)
             }
         }
@@ -757,6 +763,31 @@ pub(crate) mod tests {
             for invalid in [2, 255] {
                 actor.scene_clip = Some(("scene_loop", ClipFrame::Hold(invalid)));
                 assert_eq!(avatars.frame(&view, &stage, &[actor], 0.0).frame.models[0].positions, base.positions, "invalid held frame falls back instead of wrapping");
+            }
+            actor.scene_clip = Some(("range", ClipFrame::HoldRange { first: 1, last: 2, elapsed: 0.0 }));
+            let start = avatars.frame(&view, &stage, &[actor], 1.7).frame.models.remove(0);
+            assert_eq!(start.positions, playing.positions, "the range starts at its authored first frame");
+            actor.scene_clip = Some(("range", ClipFrame::HoldRange { first: 1, last: 2, elapsed: 0.5 }));
+            let middle = avatars.frame(&view, &stage, &[actor], 0.0).frame.models.remove(0);
+            assert_ne!(middle.positions, start.positions, "fractional scene time blends inside the range");
+            assert_eq!(avatars.frame(&view, &stage, &[actor], 20.0).frame.models[0].positions, middle.positions, "render time cannot advance the range");
+            actor.scene_clip = Some(("range", ClipFrame::HoldRange { first: 1, last: 2, elapsed: 1.0 }));
+            let last = avatars.frame(&view, &stage, &[actor], 0.0).frame.models.remove(0);
+            assert_ne!(last.positions, middle.positions);
+            assert_ne!(last.positions, start.positions);
+            for elapsed in [2.0, 20.0, 1000.0] {
+                actor.scene_clip = Some(("range", ClipFrame::HoldRange { first: 1, last: 2, elapsed }));
+                let held = avatars.frame(&view, &stage, &[actor], 1.7).frame.models.remove(0);
+                assert_eq!(held.positions, last.positions, "hold the requested endpoint without wrapping or reaching the rest of the clip");
+                assert!(std::sync::Arc::ptr_eq(&base.asset, &held.asset), "range playback retains the base mesh");
+            }
+            for elapsed in [-1.0, f32::NAN, f32::INFINITY] {
+                actor.scene_clip = Some(("range", ClipFrame::HoldRange { first: 1, last: 2, elapsed }));
+                assert_eq!(avatars.frame(&view, &stage, &[actor], 0.0).frame.models[0].positions, start.positions);
+            }
+            for (first, last) in [(2, 1), (0, 4), (5, 6), (0, 255)] {
+                actor.scene_clip = Some(("range", ClipFrame::HoldRange { first, last, elapsed: 0.0 }));
+                assert_eq!(avatars.frame(&view, &stage, &[actor], 0.0).frame.models[0].positions, base.positions, "invalid range falls back before any pose is sampled");
             }
             actor.scene_clip = Some(("missing", ClipFrame::Loop(1.0)));
             let fallback = avatars.frame(&view, &stage, &[actor], 1.0).frame.models.remove(0);

@@ -731,7 +731,7 @@ fn single_frame_holds_stay_fixed_until_replaced_for_owner_and_watcher() {
     }
     let hold = |frame| Stage::Anim { entity: 20, animation: 3, how: AnimHow::Hold, first: Some(frame), last: Some(frame), speed: 16, divisor: 1 };
     let replace = [
-        Stage::Anim { entity: 20, animation: 3, how: AnimHow::Hold, first: Some(0), last: Some(1), speed: 16, divisor: 1 },
+        Stage::Anim { entity: 20, animation: 3, how: AnimHow::Hold, first: Some(1), last: Some(0), speed: 16, divisor: 1 },
         Stage::Anim { entity: 20, animation: 3, how: AnimHow::Once, first: Some(0), last: Some(0), speed: 16, divisor: 1 },
         Stage::AnimSpeed { entity: 20, speed: 32 },
         Stage::Anim { entity: 20, animation: 99, how: AnimHow::Hold, first: Some(0), last: Some(0), speed: 16, divisor: 1 },
@@ -781,6 +781,96 @@ fn single_frame_holds_stay_fixed_until_replaced_for_owner_and_watcher() {
             player.advance(1.0);
             assert_eq!(frame(&player), None, "unsupported/unresolved replacement {index} clears the hold");
         }
+    }
+}
+
+#[test]
+fn cropped_holds_follow_scene_time_and_cancel_cleanly_for_owner_and_watcher() {
+    use crate::avatar::anim::ClipFrame;
+    use fmv_ff7::script::scene::AnimHow;
+    struct Ranges(Scripted);
+    impl SceneSource for Ranges {
+        fn initial(&self) -> Vec<Stage> { self.0.initial() }
+        fn next(&mut self, answer: Option<usize>) -> Beat { self.0.next(answer) }
+        fn height_at(&self, x: i16, y: i16, triangle: Option<u16>) -> Option<f32> { self.0.height_at(x, y, triangle) }
+        fn animation_clip(&self, entity: u8, slot: u8) -> Option<&str> {
+            if entity != 20 { return None; }
+            match slot { 3 => Some("three"), 4 => Some("four"), _ => None }
+        }
+    }
+    let hold = |animation, first, last| Stage::Anim { entity: 20, animation, how: AnimHow::Hold,
+        first: Some(first), last: Some(last), speed: 16, divisor: 1 };
+    let unsupported = [
+        hold(3, 12, 2),
+        Stage::Anim { entity: 20, animation: 3, how: AnimHow::Hold, first: Some(0), last: None, speed: 16, divisor: 1 },
+        Stage::Anim { entity: 20, animation: 3, how: AnimHow::Once, first: Some(0), last: Some(2), speed: 16, divisor: 1 },
+        Stage::Anim { entity: 20, animation: 3, how: AnimHow::Hold, first: Some(0), last: Some(2), speed: 32, divisor: 1 },
+        Stage::Anim { entity: 20, animation: 3, how: AnimHow::Hold, first: Some(0), last: Some(2), speed: 16, divisor: 2 },
+        hold(99, 0, 2),
+        Stage::AnimSpeed { entity: 20, speed: 32 },
+    ];
+    for role in [SceneRole::Owner, SceneRole::Watcher] {
+        let mut beats = vec![
+            Beat { stage: vec![timed(10, hold(3, 2, 12))], then: say(20, 20, 20, 1).then },
+            Beat { stage: vec![timed(5, hold(4, 1, 7)), timed(8, hold(4, 1, 7))], then: say(12, 20, 20, 2).then },
+            Beat { stage: vec![timed(0, hold(3, 0, 9)), timed(2, Stage::Move { entity: 20, from: None, x: 90, y: 10,
+                z: None, triangle: None, frames: 3, how: MoveHow::Walk, animation: None })], then: say(8, 20, 20, 3).then },
+            Beat { stage: vec![timed(0, hold(4, 1, 7)), timed(2, hold(3, 4, 4))], then: say(5, 20, 20, 4).then },
+        ];
+        beats.extend(unsupported.iter().cloned().map(|event| Beat {
+            stage: vec![timed(0, hold(3, 2, 12)), timed(2, event)], then: say(5, 20, 20, 5).then,
+        }));
+        let mut definition = def();
+        definition.cast[1].look = Look::Model { hrc: "model".into(), idle: "base".into() };
+        let mut player = ScenePlayer::new(Run { id: RUN, participants: vec![], role }, definition,
+            Box::new(Ranges(Scripted { initial: places(), beats: beats.into(), asked: Asked::default() })), false);
+        let clip = |p: &ScenePlayer| {
+            let actors = cast_players(p);
+            let actor = actors.iter().find(|actor| actor.who == cast_who(20)).unwrap();
+            let npc = actor.npc.unwrap();
+            assert_eq!((npc.model, npc.idle), ("model", Some("base")), "cropped playback keeps the base mesh/cache identity");
+            actor.scene_clip.map(|(stem, frame)| (stem.to_string(), frame))
+        };
+        let pass = |p: &mut ScenePlayer, step| {
+            if role == SceneRole::Owner { p.key(SceneKey::Confirm); } else { p.on_step(step, None); }
+        };
+        assert_eq!(clip(&player), None);
+        player.advance(0.5);
+        assert_eq!(clip(&player), Some(("three".into(), ClipFrame::HoldRange { first: 2, last: 12, elapsed: 5.0 })), "late ticks count from the event");
+        player.advance(1.0);
+        assert!(player.has_window());
+        assert_eq!(clip(&player), Some(("three".into(), ClipFrame::HoldRange { first: 2, last: 12, elapsed: 10.0 })));
+        player.advance(10.0);
+        assert_eq!(clip(&player), Some(("three".into(), ClipFrame::HoldRange { first: 2, last: 12, elapsed: 10.0 })), "dialogue freezes the range clock");
+        pass(&mut player, 0);
+        player.advance(3.0 / 30.0);
+        let resumed = clip(&player).unwrap();
+        assert_eq!(resumed, ("three".into(), ClipFrame::HoldRange { first: 2, last: 12, elapsed: 13.0 }));
+        assert_eq!(resumed.1.in_clip(20), Some(12.0), "the avatar holds the requested last frame without wrapping");
+        player.advance(3.0 / 30.0);
+        assert_eq!(clip(&player), Some(("four".into(), ClipFrame::HoldRange { first: 1, last: 7, elapsed: 1.0 })), "replacement starts a fresh range clock");
+        player.advance(3.0 / 30.0);
+        assert_eq!(clip(&player), Some(("four".into(), ClipFrame::HoldRange { first: 1, last: 7, elapsed: 1.0 })), "repeating the same range restarts it too");
+        player.advance(3.0 / 30.0);
+        assert!(player.has_window());
+        pass(&mut player, 1);
+        assert_eq!(clip(&player), Some(("three".into(), ClipFrame::HoldRange { first: 0, last: 9, elapsed: 0.0 })));
+        player.advance(3.0 / 30.0);
+        assert!(player.actor(20).unwrap().moving());
+        assert_eq!(clip(&player), None, "movement replaces the active cropped hold");
+        player.advance(1.0);
+        assert!(!player.actor(20).unwrap().moving() && player.has_window());
+        assert_eq!(clip(&player), None, "the stale range does not resume after movement");
+        pass(&mut player, 2);
+        player.advance(1.0);
+        assert_eq!(clip(&player), Some(("three".into(), ClipFrame::Hold(4))), "a single-frame replacement stays the exact Hold variant");
+        for index in 0..unsupported.len() {
+            pass(&mut player, 3 + index as u32);
+            assert_eq!(clip(&player), Some(("three".into(), ClipFrame::HoldRange { first: 2, last: 12, elapsed: 0.0 })));
+            player.advance(1.0);
+            assert_eq!(clip(&player), None, "unsupported/unresolved replacement {index} clears the range");
+        }
+        assert_eq!(player.counts().anims_skipped, unsupported.len() as u32);
     }
 }
 

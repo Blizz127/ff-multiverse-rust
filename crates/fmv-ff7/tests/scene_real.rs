@@ -1330,6 +1330,27 @@ fn jessie_ladder_plays_one_window_and_matches_only_the_existing_moment_step() {
     let f = field("nmkin_3").expect("FMV_FF7_DATA and nmkin_3");
     let def = jessie_ladder_scene();
     assert_eq!(scene(JESSIE_LADDER_SCENE_ID).as_ref(), Some(&def));
+    let script = FieldScript::from_field(&f).unwrap();
+    let models = fmv_ff7::script::parse_model_list(f.section(fmv_ff7::field::section::MODEL_LOADER).unwrap()).unwrap();
+    let init = script.entity_inits(Some(&models)).into_iter().find(|init| init.entity == 4).expect("Jessie's original entity binding");
+    assert_eq!(init.name, "av_j");
+    let loader = f.model_loader().unwrap();
+    let model_record = &loader.models[init.model_index.expect("Jessie's loader model")];
+    let Look::Model { hrc, .. } = &def.member(4).unwrap().look else { panic!("Jessie's exact field model") };
+    assert_eq!((model_record.hrc_stem(), hrc.as_str()), ("axdc".to_string(), "axdc"));
+    let clip_stem = model_record.animations.get(5).expect("Jessie's wind-up slot").stem();
+    assert_eq!(clip_stem, "btce");
+    assert!(script.disassemble(4, 1).unwrap().iter().any(|ins| ins.opcode == 0xB1
+        && ins.literal("animation") == Some(5) && ins.literal("first") == Some(0)
+        && ins.literal("last") == Some(39) && ins.literal("speed") == Some(1)), "the original script requests the bounded asynchronous Hold");
+    let mut characters = LgpArchive::open_path(data_dir().unwrap().join("field/char.lgp")).unwrap();
+    let clip = fmv_ff7::load_field_animation(&mut characters, &clip_stem).unwrap();
+    let model = fmv_ff7::load_field_model(&mut characters, hrc).unwrap();
+    assert_eq!((clip.frame_count(), clip.bone_count(), model.bones.len()), (70, 21, 21));
+    assert!(model.fits(&clip), "the wind-up clip fits Jessie's retained AXDC skeleton");
+    for frame in [0, 39] {
+        assert!(clip.frame(frame).is_some() && model.pose(&clip, frame).is_some(), "authored Hold endpoint {frame} is in bounds and can be posed");
+    }
     let provenance = EditionProvenance { game: GameId::Ff7, platform: Platform::Pc, edition: "steam".into(), region: "any".into(), language: "en".into(), revision: "test".into(), sources: vec![], modded: false };
     let adapter = fmv_ff7::Ff7Adapter::from_flevel_path(flevel_path(&data_dir().unwrap()), provenance).unwrap();
     let area = adapter.load_field("nmkin_3").unwrap();
@@ -1359,6 +1380,7 @@ fn jessie_ladder_plays_one_window_and_matches_only_the_existing_moment_step() {
         outcome.writes.apply_to(&mut interpreted);
         assert_eq!(interpreted, after, "only the existing point's writes");
         let mut play = ScenePlay::new(&f, &def, &before, 1).unwrap();
+        assert_eq!(play.animation_clip(4, 5), Some(clip_stem.as_str()), "the scene resolves the bounded Hold through Jessie's original loader binding");
         let mut lines = Vec::new();
         let mut jumps = Vec::new();
         let mut origin = 0u32;

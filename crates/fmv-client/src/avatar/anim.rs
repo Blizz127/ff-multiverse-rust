@@ -30,6 +30,8 @@ pub const FIELD_FPS: f32 = fmv_ff7::FF7_FIELD_FRAMES_PER_SECOND;
 pub enum ClipFrame {
     Loop(f32),
     Hold(u8),
+    /// A forward range that holds its last frame rather than looping past it.
+    HoldRange { first: u8, last: u8, elapsed: f32 },
 }
 
 impl ClipFrame {
@@ -38,6 +40,11 @@ impl ClipFrame {
         match self {
             Self::Loop(frame) => Some(if frame.is_finite() { frame.max(0.0).rem_euclid(frames as f32) } else { 0.0 }),
             Self::Hold(frame) => (usize::from(frame) < frames).then_some(f32::from(frame)),
+            Self::HoldRange { first, last, elapsed } => {
+                if first > last || usize::from(last) >= frames { return None; }
+                let elapsed = if elapsed.is_finite() { elapsed.max(0.0) } else { 0.0 };
+                Some(f32::from(first) + elapsed.min(f32::from(last - first)))
+            }
         }
     }
 }

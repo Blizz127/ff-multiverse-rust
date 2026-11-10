@@ -11,8 +11,8 @@
 //!   clip follows only that move's elapsed time, and yields to the standing default when it arrives.
 //! * `Face` turns it (the short way round), at once or over the frames it says.
 //! * `Show` hides or shows it.
-//! * The player resolves supported `Anim` loops and single-frame Holds against the actor's exact field model.
-//!   Loops follow scene time; held frames stay fixed until replaced.
+//! * The player resolves supported `Anim` loops and explicit forward Holds against the actor's exact field model.
+//!   Loops and Hold ranges follow scene time; a Hold stops at its last frame until replaced.
 //!   Other animations clear that loop and are counted ([`Counts::anims_skipped`]), never guessed at.
 //! * `Sound` is routed separately by the scene player to its cancellable audio channel.
 //! * `Camera` is **recorded** ([`CameraState`]) and not shown: the field's own camera stays where it is.
@@ -172,8 +172,13 @@ impl Actor {
         self.advance_walk(frames);
         self.advance_turn(frames);
         if frames.is_finite() {
-            if let Some(SceneAnimation { frame: ClipFrame::Loop(frame), .. }) = &mut self.animation {
-                *frame += (frames - moving_frames).max(0.0);
+            if let Some(animation) = &mut self.animation {
+                let advancing = match &mut animation.frame {
+                    ClipFrame::Loop(frame) => Some(frame),
+                    ClipFrame::HoldRange { elapsed, .. } => Some(elapsed),
+                    ClipFrame::Hold(_) => None,
+                };
+                if let Some(frame) = advancing { *frame += (frames - moving_frames).max(0.0); }
             }
         }
     }
@@ -304,6 +309,15 @@ impl Cast {
         actor.animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::Hold(frame) });
     }
 
+    /// Play one normal-speed forward range, holding its final frame. Loaded clip bounds are
+    /// checked by the avatar pipeline before it samples any pose.
+    pub fn apply_hold_range(&mut self, entity: u8, clip: &str, first: u8, last: u8, overshoot: f32) {
+        let Some(actor) = self.actors.get_mut(&entity) else { return self.off_cast() };
+        let elapsed = if overshoot.is_finite() { overshoot.max(0.0) } else { 0.0 };
+        actor.movement_animation = None;
+        actor.animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::HoldRange { first, last, elapsed } });
+    }
+
     /// Show one event of the interpreter. `overshoot` is how many frames ago it should have happened (the clock ran past
     /// its time since the last call): the motion it starts is that far along already. `height` is the ground's height, for
     /// the events that do not carry one.
@@ -334,7 +348,7 @@ impl Cast {
                 // Restart it when movement ends; any unused part of a tick advances the idle.
                 match &mut actor.animation {
                     Some(SceneAnimation { frame: ClipFrame::Loop(frame), .. }) => *frame = 0.0,
-                    _ => actor.animation = None, // A new movement replaces a one-frame held pose.
+                    _ => actor.animation = None, // A new movement replaces a held pose or range.
                 }
                 // A second move of the same actor starts where the first one was going.
                 if let Some(walk) = actor.walk.take() {

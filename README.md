@@ -1600,10 +1600,12 @@ Field-model cast members can also use their script's full-length default loops (
 including Wedge's loop after the `nrthmk` approach. The clip slot must belong to that entity's exact model-loader skeleton;
 canonical appearance substitutions keep their existing clips. A separate bounded clip cache preserves the base mesh and
 checks skeleton compatibility, falling back to the usual pose if the clip cannot load. Standing loops yield during movement,
-restart after arrival, and freeze with dialogue. A normal-speed Hold with equal explicit first/last frames also plays: Barret's
-`md8_4` post-escape pose holds frame 0 of `apfc`. The requested frame must exist in the loaded clip; an invalid frame falls back
-without wrapping. A held pose remains fixed until another animation, speed change or movement replaces it. Once, multi-frame
-Hold, cropped loops, other rates and later ASPED changes clear the override until a supported animation arrives.
+restart after arrival, and freeze with dialogue. Normal-speed Holds support explicit forward ranges: they start at the
+requested first frame, advance with scene time and remain on the requested last frame. Jessie uses `btce` frames 0–39
+in the ladder scene; her authored jump interrupts the range after its existing 15-frame wait. A single-frame Hold stays
+fixed, including Barret's `md8_4` frame 0 of `apfc`. The entire range must exist in the loaded clip; reversed or out-of-bounds
+ranges fall back without wrapping. Another animation, speed change or movement replaces the pose. Once, full-clip Holds,
+cropped loops, other rates and later ASPED changes clear the override until a supported animation arrives.
 Ordinary `MOVE` also resolves the same model's walk/run slot from the script's movement speed and field scale:
 slot 1 through three times the scale, slot 2 above it. Wedge's reactor approach uses slot 2 (`aaga`, 15 frames),
 then returns to his standing loop. The movement clip advances one frame per scene tick and freezes with dialogue;
