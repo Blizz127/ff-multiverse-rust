@@ -192,6 +192,16 @@ pub fn field_direction_to_facing(direction: u8) -> f32 {
     (f64::from(units) / 256.0 * std::f64::consts::TAU) as f32
 }
 
+/// The script's `DIR` byte nearest a protocol heading (radians, counter-clockwise from +x): the inverse of
+/// [`field_direction_to_facing`], exact at every whole 1/256 turn. A heading that is not finite gives the byte of heading 0.
+pub fn facing_to_field_direction(facing: f32) -> u8 {
+    if !facing.is_finite() {
+        return u8::try_from(DIR_BYTE_OF_HEADING_ZERO).unwrap_or(0);
+    }
+    let units = (f64::from(facing) / std::f64::consts::TAU * 256.0).round() as i64;
+    u8::try_from((units + i64::from(DIR_BYTE_OF_HEADING_ZERO)).rem_euclid(256)).unwrap_or(0)
+}
+
 // ---------------------------------------------------------------------------------------
 // Exits
 // ---------------------------------------------------------------------------------------

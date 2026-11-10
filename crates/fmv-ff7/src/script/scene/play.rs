@@ -474,6 +474,147 @@ fn outcome_of(mut play: ScenePlay, answers: &[usize]) -> Outcome {
     }
 }
 
+/// Every place the cast stands or walks through in one run of `def` (played to its end with the cursor's answers), as
+/// `(x, y)`: the initial places, every place and turn's spot, and each walk sampled every 10 units. What a witness spot must keep
+/// clear of ([`auto_witnesses`]).
+pub fn cast_places(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32) -> Result<Vec<(f32, f32)>, SceneError> {
+    let mut play = ScenePlay::new(field, def, story, seed)?;
+    let mut stage: Vec<Stage> = play.initial_stage_events().to_vec();
+    for _ in 0..=super::vm::Limits::default().windows.max(64) {
+        let beat = play.next(None);
+        stage.extend(beat.stage.into_iter().map(|t| t.what));
+        if matches!(beat.then, Then::End { .. }) {
+            break;
+        }
+    }
+    let mut at: BTreeMap<u8, (f32, f32)> = BTreeMap::new();
+    let mut out = Vec::new();
+    for s in &stage {
+        match *s {
+            Stage::Place { entity, x, y, .. } => {
+                at.insert(entity, (f32::from(x), f32::from(y)));
+                out.push((f32::from(x), f32::from(y)));
+            }
+            Stage::Move { entity, from, x, y, .. } => {
+                let start = from.map(|(fx, fy)| (f32::from(fx), f32::from(fy))).or_else(|| at.get(&entity).copied());
+                let end = (f32::from(x), f32::from(y));
+                if let Some(a) = start {
+                    let n = ((end.0 - a.0).hypot(end.1 - a.1) / 10.0).ceil().clamp(1.0, 4096.0) as u32;
+                    for k in 0..=n {
+                        let t = k as f32 / n as f32;
+                        out.push((a.0 + (end.0 - a.0) * t, a.1 + (end.1 - a.1) * t));
+                    }
+                }
+                at.insert(entity, end);
+                out.push(end);
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+/// The part of the floor each triangle of `mesh` is on: triangles joined by an edge a walk can cross (either way) are on one
+/// part, numbered from 0 in the order of their lowest triangle.
+fn floor_parts(mesh: &Walkmesh) -> Vec<usize> {
+    let n = mesh.triangles.len();
+    let mut part = vec![usize::MAX; n];
+    let mut next = 0usize;
+    for start in 0..n {
+        if part.get(start) != Some(&usize::MAX) {
+            continue;
+        }
+        if let Some(slot) = part.get_mut(start) {
+            *slot = next;
+        }
+        let mut stack = vec![start];
+        while let Some(t) = stack.pop() {
+            for (other, slot) in part.iter_mut().enumerate() {
+                if *slot == usize::MAX && (0..3).any(|e| mesh.neighbor(t, e) == Some(other) || mesh.neighbor(other, e) == Some(t)) {
+                    *slot = next;
+                    stack.push(other);
+                }
+            }
+        }
+        next += 1;
+    }
+    part
+}
+
+/// **Witness spots for a scene that names none**: up to `count` places on the field's floor, each clear of every place the
+/// cast takes in the scene ([`cast_places`]) by two body rings and a margin, clear of the floor's edge (walls, stools, holes) by
+/// one and a half rings, on the part of the floor the scene's arrival is on, apart from each other, and as near the arrival as
+/// that allows; each faces the middle of where the cast stands. The same data gives the same spots on every machine (the
+/// scene's own arrival, never a player's place), so every client of a run puts its people in the same places. Empty when the
+/// scene cannot be played here or no place of the floor qualifies (the participants then keep their own places).
+///
+/// This keeps a witness off the cast on the FLOOR; what the camera shows (a foreground layer in front, another person in the
+/// line of sight) is not judged here: a scene whose spots are measured on the picture names them in its data instead.
+pub fn auto_witnesses(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32, count: usize) -> Vec<Spot> {
+    let (Ok(script), Ok(mesh)) = (FieldScript::from_field(field), field.walkmesh()) else { return Vec::new() };
+    let Ok(cast) = cast_places(field, def, story, seed) else { return Vec::new() };
+    let ring = 5.5 * crate::default_model_scale(script.header().scale);
+    let (clear_of_cast, clear_of_edge) = (2.0 * ring + 16.0, 1.5 * ring);
+    let parts = floor_parts(&mesh);
+    let home = parts.get(usize::from(def.arrival.triangle)).copied();
+    let edge_gap = |x: f32, y: f32| -> f32 {
+        let mut best = f32::INFINITY;
+        for (i, tri) in mesh.triangles.iter().enumerate() {
+            for e in 0..3 {
+                if mesh.neighbor(i, e).is_some() {
+                    continue;
+                }
+                let (Some(a), Some(b)) = (tri.get(e), tri.get((e + 1) % 3)) else { continue };
+                let (ax, ay, bx, by) = (f32::from(a.x), f32::from(a.y), f32::from(b.x), f32::from(b.y));
+                let (dx, dy) = (bx - ax, by - ay);
+                let len2 = dx * dx + dy * dy;
+                let t = if len2 > 0.0 { (((x - ax) * dx + (y - ay) * dy) / len2).clamp(0.0, 1.0) } else { 0.0 };
+                best = best.min((x - (ax + dx * t)).hypot(y - (ay + dy * t)));
+            }
+        }
+        best
+    };
+    // candidates: each triangle's centre and the points halfway from it to each corner, on the arrival's part of the floor
+    let mut candidates: Vec<(f32, i16, i16, u16)> = Vec::new();
+    for (i, tri) in mesh.triangles.iter().enumerate() {
+        if home.is_some_and(|h| parts.get(i) != Some(&h)) {
+            continue;
+        }
+        let Ok(index) = u16::try_from(i) else { continue };
+        let (cx, cy) = (tri.iter().map(|v| f32::from(v.x)).sum::<f32>() / 3.0, tri.iter().map(|v| f32::from(v.y)).sum::<f32>() / 3.0);
+        let mut points = vec![(cx, cy)];
+        points.extend(tri.iter().map(|v| ((cx + f32::from(v.x)) / 2.0, (cy + f32::from(v.y)) / 2.0)));
+        for (x, y) in points {
+            let (xi, yi) = (x.round() as i16, y.round() as i16);
+            if !triangle_contains_xy(tri, i32::from(xi), i32::from(yi)) {
+                continue;
+            }
+            let (fx, fy) = (f32::from(xi), f32::from(yi));
+            if cast.iter().any(|&(px, py)| (px - fx).hypot(py - fy) < clear_of_cast) || edge_gap(fx, fy) < clear_of_edge {
+                continue;
+            }
+            let d = (fx - f32::from(def.arrival.x)).hypot(fy - f32::from(def.arrival.y));
+            candidates.push((d, xi, yi, index));
+        }
+    }
+    candidates.sort_by(|a, b| a.0.total_cmp(&b.0).then((a.1, a.2, a.3).cmp(&(b.1, b.2, b.3))));
+    // face the middle of the cast's places
+    let (sx, sy, m) = cast.iter().fold((0.0f32, 0.0f32, 0usize), |(sx, sy, m), &(x, y)| (sx + x, sy + y, m + 1));
+    let middle = (m > 0).then(|| (sx / m as f32, sy / m as f32));
+    let mut out: Vec<Spot> = Vec::new();
+    for (_, x, y, triangle) in candidates {
+        if out.len() >= count {
+            break;
+        }
+        if out.iter().any(|o| (f32::from(o.x) - f32::from(x)).hypot(f32::from(o.y) - f32::from(y)) < clear_of_cast) {
+            continue;
+        }
+        let direction = middle.map_or(0, |(mx, my)| crate::facing_to_field_direction((my - f32::from(y)).atan2(mx - f32::from(x))));
+        out.push(Spot { x, y, triangle, direction });
+    }
+    out
+}
+
 /// The character that starts `def`, as the field stands him at the scene's story (see [`TriggerNpc`]).
 pub fn trigger_npc(field: &FieldFile, def: &SceneDef, story: &StoryState) -> Option<TriggerNpc> {
     let script = FieldScript::from_field(field).ok()?;

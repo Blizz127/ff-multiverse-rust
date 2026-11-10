@@ -199,10 +199,16 @@ impl Ff7Scenes {
 
 impl SceneBuilder for Ff7Scenes {
     fn build(&mut self, id: &str, story: &StoryState, seed: u32) -> Result<Built, String> {
-        let def = scene(id).ok_or_else(|| "the game has no scene of that id".to_string())?;
+        let mut def = scene(id).ok_or_else(|| "the game has no scene of that id".to_string())?;
         let adapter = self.adapter.as_ref().ok_or_else(|| "this machine has no FF7 data to build scenes from".to_string())?;
         let area = adapter.load_field(&def.field).map_err(|e| format!("the scene's field cannot be loaded here: {e}"))?;
         let play = ScenePlay::new(area.field_file(), &def, story, seed).map_err(|e| format!("the scene cannot be set up here: {e}"))?;
+        // A scene that names no witness spots gets the ones its own data gives (the same on every machine): the owner and up
+        // to two watchers stand clear of the cast instead of where they happen to be (a cutscene's owner would otherwise stand
+        // on the spot the cast's Cloud starts from).
+        if def.witness.is_empty() {
+            def.witness = fmv_ff7::script::scene::auto_witnesses(area.field_file(), &def, story, seed, 3);
+        }
         Ok(Built { def, source: Box::new(play) })
     }
 

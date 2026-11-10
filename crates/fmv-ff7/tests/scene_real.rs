@@ -344,6 +344,46 @@ fn the_guard_scorpion_talk_is_the_cutscene_of_the_point_that_starts_the_boss_bat
     assert_eq!(play.off_cast(), 0);
 }
 
+/// A scene that names no witness spots (the reactor's cutscenes) gets them from its own data: on the floor the arrival is on,
+/// clear of every place the cast takes by two body rings and a margin and of the floor's edge by one and a half, apart from
+/// each other, and the same every time (every client of a run must agree).
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn the_cutscenes_get_witness_spots_clear_of_their_cast() {
+    use fmv_ff7::script::scene::{auto_witnesses, cast_places, guard_scorpion_scene, reactor_door_scene, team_talk_scene};
+    for (def, moment) in [(team_talk_scene(), 6u16), (reactor_door_scene(), 10), (guard_scorpion_scene(), 26)] {
+        assert!(def.witness.is_empty(), "{}: the data names none", def.id);
+        let f = field(&def.field).unwrap();
+        let story = StoryState::at(moment);
+        let spots = auto_witnesses(&f, &def, &story, 1, 3);
+        assert_eq!(spots, auto_witnesses(&f, &def, &story, 1, 3), "{}: the same every time", def.id);
+        assert!(!spots.is_empty(), "{}: at least the owner's", def.id);
+        let mesh = f.walkmesh().unwrap();
+        let parts = mesh_parts(&mesh);
+        let script = FieldScript::from_field(&f).unwrap();
+        let ring = 5.5 * fmv_ff7::default_model_scale(script.header().scale);
+        let cast = cast_places(&f, &def, &story, 1).unwrap();
+        assert!(!cast.is_empty());
+        for (i, s) in spots.iter().enumerate() {
+            let tri = &mesh.triangles[usize::from(s.triangle)];
+            assert!(fmv_ff7::script::triangle_contains_xy(tri, i32::from(s.x), i32::from(s.y)), "{} spot {i} on its triangle", def.id);
+            assert_eq!(parts[usize::from(s.triangle)], parts[usize::from(def.arrival.triangle)], "{} spot {i} on the arrival's floor", def.id);
+            let nearest = cast.iter().map(|&(x, y)| (x - f32::from(s.x)).hypot(y - f32::from(s.y))).fold(f32::INFINITY, f32::min);
+            assert!(nearest >= 2.0 * ring + 16.0, "{} spot {i} is {nearest:.0} from the cast", def.id);
+            assert!(scenery_gap(&mesh, f32::from(s.x), f32::from(s.y)) >= 1.5 * ring, "{} spot {i} too near an edge", def.id);
+            for o in spots.iter().skip(i + 1) {
+                assert!((f32::from(o.x) - f32::from(s.x)).hypot(f32::from(o.y) - f32::from(s.y)) >= 2.0 * ring + 16.0, "{}: spots apart", def.id);
+            }
+            eprintln!("{} spot {i}: ({}, {}) triangle {} direction {} - {nearest:.0} from the cast, {} from the arrival", def.id, s.x, s.y, s.triangle, s.direction,
+                (f32::from(s.x) - f32::from(def.arrival.x)).hypot(f32::from(s.y) - f32::from(def.arrival.y)) as i32);
+        }
+    }
+    // the facing a spot gets is a whole DIR byte that turns back into the heading toward the cast's middle
+    for d in [0u8, 1, 64, 127, 128, 192, 255] {
+        assert_eq!(fmv_ff7::facing_to_field_direction(fmv_ff7::field_direction_to_facing(d)), d);
+    }
+}
+
 /// The parts of a walkmesh that a walk can reach from each other (triangles joined by an edge that can be crossed, either way).
 fn mesh_parts(mesh: &fmv_ff7::field::Walkmesh) -> Vec<usize> {
     let n = mesh.triangles.len();

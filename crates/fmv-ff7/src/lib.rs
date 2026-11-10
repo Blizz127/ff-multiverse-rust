@@ -121,7 +121,7 @@ mod area_hooks_tests;
 #[cfg(test)]
 mod testutil;
 
-pub use area_content::{field_direction_to_facing, MAX_NPCS_PER_AREA, MAX_NPC_LABEL_CHARS, MAX_NPC_SECTION_BYTES};
+pub use area_content::{facing_to_field_direction, field_direction_to_facing, MAX_NPCS_PER_AREA, MAX_NPC_LABEL_CHARS, MAX_NPC_SECTION_BYTES};
 pub use encounter::decode_encounter_section;
 
 pub use area::{

@@ -1451,8 +1451,11 @@ How it works (`World::start_point_scene`, `SceneHost::point_scene`):
   joins); a name entry or a display setting one edition has and the other has not does not count (Echo-S's `md1_1` names one
   character where the original names two).
 
-Known gap: the player's own character stands where it reached the point, which is where the cast's Cloud starts too, until a
-witness spot is measured for the field.
+**Where the player stands.** A scene that names no witness spots (the cutscenes) gets them from its own data
+(`fmv_ff7::script::scene::auto_witnesses`): the owner and up to two watchers stand on the floor the scene's arrival is on, clear
+of every place the cast takes in the scene by two body rings and a margin and of the floor's edge by one and a half, as near the
+arrival as that allows, facing the middle of the cast. Every client computes the same spots from the same data. This judges the
+floor, not the picture: a spot measured on the picture (as for the bar and the street) goes in the scene's data instead.
 
 ### Scene data (`fmv_ff7::script::scene::SceneDef`)
 
