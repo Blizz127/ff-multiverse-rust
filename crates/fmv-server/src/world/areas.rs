@@ -720,6 +720,7 @@ impl World {
             .players
             .values()
             .flat_map(|p| std::iter::once(p.area.clone()).chain(p.transit.as_ref().map(|t| t.to.clone())))
+            .chain(self.pending_scene_destinations())
             .collect();
         let mut unload = Vec::new();
         for (key, area) in &mut self.areas {

@@ -14,7 +14,7 @@
 //! [`run_to_end`] is the headless run the server makes to learn those writes from the answers a player gave.
 
 use super::data::{CastMember, Look, SceneDef, Spot};
-use super::vm::{AnimHow, Beat, Limits, MoveHow, SceneVars, Stage, Stats, Then, Timed, Vm, Where};
+use super::vm::{AnimHow, Beat, Limits, MoveHow, SceneVars, SceneResources, ResourceOutcome, Stage, Stats, Then, Timed, Vm, Where};
 use crate::field::{FieldFile, ModelLoader, Vertex, Walkmesh};
 use crate::field_direction_to_facing;
 use crate::script::dialogue::End;
@@ -101,7 +101,8 @@ impl Writes {
 /// belongs to the team. Skipping one is not harmless the way skipping a fade is: a caller that SAVES what a scene wrote must
 /// look for them ([`Stats::ignored`] of both the stage scripts and the scene) and refuse what it does not carry out, and two
 /// editions of a scene tell the same story only if they skip the same ones ([`Outcome::same_story_as`]). `PRTYP`, `PRTYM`
-/// and `PRTYE` are not here: the interpreter records those ([`Outcome::party`]).
+/// and `PRTYE` are not here: the interpreter records those ([`Outcome::party`]). The gil operations are skipped only
+/// without a resource snapshot; with one, [`Outcome::resources`] records their ordered, evaluated effects instead.
 pub const SKIPPED_STATE_OPS: &[&str] = &[
     "PREQ", "PRQSW", "PRQEW", "JOIN", "SPLIT", "SPTYE", "GTPYE", "SPECIAL", "STTIM", "GOLDu", "GOLDd", "CHGLD", "HMPMAX1", "HMPMAX2", "MHMMX",
     "HMPMAX3", "MPu", "MPd", "MENU", "HPu", "HPd", "STITM", "DLITM", "CKITM", "SMTRA", "DMTRA", "CMTRA", "MMBud", "MMBLK", "MMBUK",
@@ -140,6 +141,8 @@ pub struct Outcome {
     /// Nothing here carries it out: a caller that saves the scene's story must hold it against the party that story
     /// has ([`Outcome::party_is_the_storys`]).
     pub party: Vec<PartyOp>,
+    /// Ordered economic operations and their authoritative before/after values.
+    pub resources: ResourceOutcome,
     pub stats: Stats,
 }
 
@@ -155,16 +158,16 @@ impl Outcome {
     /// Whether both runs were interpreted completely: the stage scripts and the scene met no instruction the interpreter
     /// does not know, read back no place it does not know and dropped no request.
     pub fn is_complete(&self) -> bool {
-        [&self.setup_stats, &self.stats].iter().all(|s| !s.setup_incomplete && s.unknown.is_empty() && s.unresolved == 0 && s.dropped_requests == 0)
+        !self.resources.unknown_gil && [&self.setup_stats, &self.stats].iter().all(|s| !s.setup_incomplete && s.unknown.is_empty() && s.unresolved == 0 && s.dropped_requests == 0)
     }
 
     /// Whether this run and `other` (the same scene from another edition of the field's script) come to the same story: both
-    /// interpreted completely, the same end and destination, the same writes to the moment, to the variables the story
-    /// carries and to every other saved variable (banks 1 to 4), the same party changes, and the same skipped instructions
+    /// interpreted completely, the same resource inputs and ordered effects, the same end and destination, the same writes to the moment, to the variables the story
+    /// carries and to every other persistent bank, the same party changes, and the same skipped instructions
     /// whose effect a window could announce ([`ANNOUNCED_STATE_OPS`]: so neither tells of something given or taken that the
     /// other does not). The windows may differ: how a scene is worded and how many windows it takes is the edition's own.
     pub fn same_story_as(&self, other: &Self) -> bool {
-        let persistent = |w: &Writes| w.untracked.iter().filter(|((bank, _), _)| (1..=4).contains(bank)).map(|(k, v)| (*k, *v)).collect::<BTreeMap<_, _>>();
+        let persistent = |w: &Writes| w.untracked.iter().filter(|((bank, _), _)| crate::story::canonical_persistent_bank(*bank).is_some()).map(|(k, v)| (*k, *v)).collect::<BTreeMap<_, _>>();
         let state_ops = |o: &Self| {
             let mut ops: BTreeMap<&'static str, u32> = BTreeMap::new();
             for stats in [&o.setup_stats, &o.stats] {
@@ -182,6 +185,7 @@ impl Outcome {
             && self.writes.tracked == other.writes.tracked
             && self.writes.persistent == other.writes.persistent
             && persistent(&self.writes) == persistent(&other.writes)
+            && self.resources == other.resources
             && self.party == other.party
             && state_ops(self) == state_ops(other)
     }
@@ -284,26 +288,37 @@ impl ScenePlay {
 
     pub fn with_limits(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32, limits: Limits) -> Result<Self, SceneError> {
         let script = FieldScript::from_field(field).map_err(|e| SceneError::Script(e.to_string()))?;
-        Self::with_script(field, def, story, seed, limits, &script)
+        Self::with_script(field, def, story, seed, limits, &script, SceneResources::default())
+    }
+
+    /// Play with the account's authoritative resource snapshot (or an explicitly synthetic preview).
+    pub fn with_resources(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32, resources: SceneResources) -> Result<Self, SceneError> {
+        let script = FieldScript::from_field(field).map_err(|e| SceneError::Script(e.to_string()))?;
+        Self::with_script(field, def, story, seed, Limits::default(), &script, resources)
     }
 
     /// Build a scene from a replacement script section and the original field's walkmesh.
     /// The caller must establish compatible choices, pacing, and multiplayer synchronization
     /// before using this for a live scene; mapping entity names does not establish those properties.
     pub fn with_script_section(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32, section: &[u8]) -> Result<Self, SceneError> {
+        Self::with_script_section_and_resources(field, def, story, seed, section, SceneResources::default())
+    }
+
+    /// Replacement-script playback with exactly the same resource snapshot as the original.
+    pub fn with_script_section_and_resources(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32, section: &[u8], resources: SceneResources) -> Result<Self, SceneError> {
         let original = FieldScript::from_field(field).map_err(|e| SceneError::Script(e.to_string()))?;
         let replacement = FieldScript::parse(section).map_err(|e| SceneError::Script(e.to_string()))?;
         let rebound = def.rebind_entities(&original, &replacement).ok_or(SceneError::UnmatchedEntities)?;
-        Self::with_script(field, &rebound, story, seed, Limits::default(), &replacement)
+        Self::with_script(field, &rebound, story, seed, Limits::default(), &replacement, resources)
     }
 
-    fn with_script(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32, limits: Limits, script: &FieldScript<'_>) -> Result<Self, SceneError> {
+    fn with_script(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32, limits: Limits, script: &FieldScript<'_>, resources: SceneResources) -> Result<Self, SceneError> {
         if usize::from(def.trigger.entity) >= script.entity_count() {
             return Err(SceneError::NoSuchEntity);
         }
         let mesh = field.walkmesh().map_err(|e| SceneError::Walkmesh(e.to_string()))?;
         let section = script.bytes().to_vec();
-        let mut vm = Vm::new(SceneVars::new(story.clone(), &def.given), seed, limits);
+        let mut vm = Vm::with_resources(SceneVars::new(story.clone(), &def.given), seed, limits, resources);
         vm.setup(script, &def.setup);
         let setup = vm.take_stats();
         // A cast member the stage scripts did not place stands where the cast says, and the scene knows it.
@@ -418,6 +433,8 @@ impl ScenePlay {
     pub fn setup_stats(&self) -> &Stats {
         &self.setup
     }
+
+    pub fn resources(&self) -> &ResourceOutcome { self.vm.resources() }
 
     pub fn stats(&self) -> &Stats {
         self.vm.stats()
@@ -553,6 +570,16 @@ pub fn run_section_to_end(field: &FieldFile, def: &SceneDef, story: &StoryState,
     Ok(outcome_of(ScenePlay::with_script_section(field, def, story, seed, section)?, answers))
 }
 
+/// Headless evaluation against the same resource snapshot the client received at scene start.
+pub fn run_to_end_with_resources(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32, resources: SceneResources, answers: &[usize]) -> Result<Outcome, SceneError> {
+    Ok(outcome_of(ScenePlay::with_resources(field, def, story, seed, resources)?, answers))
+}
+
+/// Replacement-script equivalent of [`run_to_end_with_resources`].
+pub fn run_section_to_end_with_resources(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32, section: &[u8], resources: SceneResources, answers: &[usize]) -> Result<Outcome, SceneError> {
+    Ok(outcome_of(ScenePlay::with_script_section_and_resources(field, def, story, seed, section, resources)?, answers))
+}
+
 fn outcome_of(mut play: ScenePlay, answers: &[usize]) -> Outcome {
     let mut answers = answers.iter().copied();
     let mut given: Option<usize> = None;
@@ -580,6 +607,7 @@ fn outcome_of(mut play: ScenePlay, answers: &[usize]) -> Outcome {
         setup_stats: play.setup_stats().clone(),
         unknown_persistent_reads: play.vm.vars().unknown_persistent_reads(),
         party: play.vm.party_ops().to_vec(),
+        resources: play.resources().clone(),
         stats: play.stats().clone(),
     }
 }
@@ -588,7 +616,11 @@ fn outcome_of(mut play: ScenePlay, answers: &[usize]) -> Outcome {
 /// `(x, y)`: the initial places, every place and turn's spot, and each walk sampled every 10 units. What a witness spot must keep
 /// clear of ([`auto_witnesses`]).
 pub fn cast_places(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32) -> Result<Vec<(f32, f32)>, SceneError> {
-    let mut play = ScenePlay::new(field, def, story, seed)?;
+    cast_places_with_resources(field, def, story, seed, SceneResources::default())
+}
+
+pub fn cast_places_with_resources(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32, resources: SceneResources) -> Result<Vec<(f32, f32)>, SceneError> {
+    let mut play = ScenePlay::with_resources(field, def, story, seed, resources)?;
     let mut stage: Vec<Stage> = play.initial_stage_events().to_vec();
     for _ in 0..=super::vm::Limits::default().windows.max(64) {
         let beat = play.next(None);
@@ -661,8 +693,12 @@ fn floor_parts(mesh: &Walkmesh) -> Vec<usize> {
 /// This keeps a witness off the cast on the FLOOR; what the camera shows (a foreground layer in front, another person in the
 /// line of sight) is not judged here: a scene whose spots are measured on the picture names them in its data instead.
 pub fn auto_witnesses(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32, count: usize) -> Vec<Spot> {
+    auto_witnesses_with_resources(field, def, story, seed, SceneResources::default(), count)
+}
+
+pub fn auto_witnesses_with_resources(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32, resources: SceneResources, count: usize) -> Vec<Spot> {
     let (Ok(script), Ok(mesh)) = (FieldScript::from_field(field), field.walkmesh()) else { return Vec::new() };
-    let Ok(cast) = cast_places(field, def, story, seed) else { return Vec::new() };
+    let Ok(cast) = cast_places_with_resources(field, def, story, seed, resources) else { return Vec::new() };
     let ring = 5.5 * crate::default_model_scale(script.header().scale);
     let (clear_of_cast, clear_of_edge) = (2.0 * ring + 16.0, 1.5 * ring);
     let parts = floor_parts(&mesh);

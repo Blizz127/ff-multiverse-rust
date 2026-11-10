@@ -122,7 +122,7 @@ pub use areas::{TravelReply, AREA_UNLOAD_GRACE, TRAVEL_TIMEOUT};
 pub use battle::BattleReply;
 pub use party::PartyOutcome;
 pub use press::PressOutcome;
-pub use scene::{SceneHost, SceneInfo, SceneReply, SceneResult, SceneSettings, TriggerInfo};
+pub use scene::{SceneHost, SceneInfo, SceneReply, SceneResult, SceneSettings, SceneTransaction, TriggerInfo};
 
 /// A message queued for one or more connections. Broadcasts share one allocation.
 pub type Outbound = Arc<ServerMsg>;
@@ -283,6 +283,10 @@ pub struct NewPlayer {
 pub enum JoinError {
     /// The account already has a session in the world.
     AlreadyOnline,
+    /// A scene transaction crossed the storage snapshot used by this handshake; reload before joining.
+    ProgressChanged,
+    /// The shared store or save worker requires recovery before gameplay can resume.
+    StorageUnavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -436,19 +440,27 @@ impl World {
         ids
     }
 
-    /// Whether `account` has a session in the world.
+    /// Whether `account` has a session or a scene save awaiting acknowledgment in the world.
     pub fn is_online(&self, account: AccountId) -> bool {
-        self.by_account.contains_key(&account)
+        self.by_account.contains_key(&account) || self.scene_save_pending(account)
     }
 
     /// Spawn the player (round-robin over the spawn points), queue the full `AreaSnapshot` and
     /// then the `InstancePlacement` to the joiner (always the first things in its queue after the
     /// handshake replies) and `PlayerJoined` to everyone else. The movement budget starts empty.
     /// Returns the spawn position, or refuses a second session for the same account.
+    /// Atomically fence admission against scene saves that began or ended after authentication
+    /// started reading storage. The bounded global fence can require an unrelated login to retry.
+    pub(crate) fn join_with_scene_epoch(&mut self, new: NewPlayer, now: Instant, read_epoch: u64) -> Result<Pos, JoinError> {
+        if read_epoch != self.scene_save_epoch() { return Err(JoinError::ProgressChanged); }
+        self.join(new, now)
+    }
+
     pub fn join(&mut self, new: NewPlayer, now: Instant) -> Result<Pos, JoinError> {
+        if self.scenes.storage_failed { return Err(JoinError::StorageUnavailable); }
         // Checked here, under the world lock, because two handshakes with the same token can both
         // pass authentication.
-        if self.by_account.contains_key(&new.account) {
+        if self.is_online(new.account) {
             return Err(JoinError::AlreadyOnline);
         }
         // DEBUG (`SceneSettings::debug_new_story`, off on every real server): an account with no story yet starts with the
@@ -535,7 +547,7 @@ impl World {
     fn remove_player(&mut self, entity: EntityId, failed: &mut Vec<(EntityId, bool)>) -> Option<Player> {
         let player = self.players.remove(&entity)?;
         self.by_account.remove(&player.account);
-        // A scene it owned is dropped (nothing it would have written is applied); one it watched goes on without it.
+        // A presentation it owned is dropped; a queued durable scene continues to its acknowledgment.
         self.scene_player_gone(entity, player.scene);
         // A player in transit is in no instance: the one it left was told already.
         let left = self.leave_instance(player.account);

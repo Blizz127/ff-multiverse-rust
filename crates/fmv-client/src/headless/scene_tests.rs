@@ -63,7 +63,7 @@ impl Seen {
 struct Invented;
 
 impl SceneBuilder for Invented {
-    fn build(&mut self, _scene: &str, _story: &fmv_ff7::story::StoryState, _seed: u32) -> Result<Built, String> {
+    fn build(&mut self, _scene: &str, _story: &fmv_ff7::story::StoryState, _seed: u32, _resources: fmv_ff7::script::scene::SceneResources) -> Result<Built, String> {
         Ok(Built { def: def_in(HALL), source: Box::new(Scripted { initial: places(), beats: VecDeque::from(talk()), asked: Asked::default() }) })
     }
 
@@ -86,6 +86,7 @@ fn start_msg(you: SceneRole) -> ServerMsg {
         scene: SCENE_ID.into(),
         seed: 5,
         progress: vec![1, 72, 0],
+        gil: 0,
         owner: EntityId(if you == SceneRole::Owner { 7 } else { 8 }),
         // The owner stands on spot 0, the one who watches on spot 1 (this player is whichever `you` says).
         participants: if you == SceneRole::Owner {

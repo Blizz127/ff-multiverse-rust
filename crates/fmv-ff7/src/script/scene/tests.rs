@@ -1221,6 +1221,10 @@ fn two_editions_tell_the_same_story_only_when_what_is_kept_is_the_same() {
     assert!(!original.same_story_as(&run([message(0, 0), setword(2, 0, 9), vec![0x3F], vec![0x3A, 0, 1, 0, 0, 0]].concat(), lines())));
     // a saved variable the other does not write (bank 3), while field scratch (bank 5) does not count
     assert!(!original.same_story_as(&run([message(0, 0), setword(2, 0, 9), vec![0x3F], setbyte(3, 40, 1)].concat(), lines())));
+    for bank in [7, 11, 13] {
+        let changed = run([message(0, 0), setword(2, 0, 9), vec![0x3F], setbyte(bank, 40, 1)].concat(), lines());
+        assert!(!original.same_story_as(&changed), "persistent bank {bank} matters even when the legacy save cannot carry it");
+    }
     assert!(original.same_story_as(&run([message(0, 0), setword(2, 0, 9), vec![0x3F], setbyte(5, 40, 1)].concat(), lines())));
     // a different end
     assert!(!original.same_story_as(&run([message(0, 0), setword(2, 0, 9), vec![0x3F], mapjump(7)].concat(), lines())));
@@ -1874,5 +1878,135 @@ fn victory_continuation_refuses_a_wrong_battle_or_a_choice_in_the_prelude() {
             vm.begin(start(0, 1));
             assert_eq!(vm.seek_after_battle(&field, formation), formation == 324 && first[0] == 0x40);
         }
+    }
+}
+
+// ---- authoritative scene resources -----------------------------------------------------------
+
+fn gold(op: u8, amount: u32) -> Vec<u8> {
+    [vec![op, 0], amount.to_le_bytes().to_vec()].concat()
+}
+
+fn resource_run(body: Vec<Vec<u8>>, gil: Option<u32>) -> Outcome {
+    let field = field_of(script(vec![("a", vec![(1, body)])], vec![]));
+    let story = StoryState::at(36).into_extended().unwrap();
+    run_to_end_with_resources(&field, &demo_def(vec![], start(0, 1)), &story, 1, SceneResources { gil }, &[]).unwrap()
+}
+
+#[test]
+fn resource_gil_operations_saturate_at_storage_limits_and_keep_their_order() {
+    let result = resource_run(vec![gold(0x3A, 1), gold(0x39, u32::MAX), gold(0x39, 1), gold(0x3A, 2)], Some(0));
+    assert_eq!(result.end, End::Finished);
+    assert!(result.is_complete());
+    assert_eq!(result.resources, ResourceOutcome {
+        gil_before: Some(0), gil_after: Some(u32::MAX - 2),
+        gil_ops: vec![GilOp::Subtract(1), GilOp::Add(u32::MAX), GilOp::Add(1), GilOp::Subtract(2)], unknown_gil: false,
+    });
+    assert!(!result.stats.ignored.contains_key("GOLDu") && !result.stats.ignored.contains_key("GOLDd"));
+    assert_eq!(resource_run(vec![gold(0x3A, 1)], Some(1)).resources.gil_after, Some(0));
+    assert_eq!(resource_run(vec![gold(0x3A, 1)], Some(600)).resources.gil_after, Some(599));
+    assert_eq!(resource_run(vec![gold(0x39, 1)], Some(99_999_999)).resources.gil_after, Some(100_000_000), "no invented display cap");
+}
+
+#[test]
+fn resource_gil_unknown_is_not_zero_and_cannot_produce_a_complete_outcome() {
+    for body in [vec![gold(0x39, 1)], vec![gold(0x3A, 1)], vec![vec![0x3B, 0x66, 10, 12]]] {
+        let result = resource_run(body, None);
+        assert!(result.resources.unknown_gil);
+        assert_eq!((result.resources.gil_before, result.resources.gil_after), (None, None));
+        assert!(!result.is_complete());
+        assert!(result.writes.is_story_neutral());
+    }
+    assert!(resource_run(vec![], None).is_complete(), "a scene that never needs gil needs no supplied balance");
+    let explicit_zero = resource_run(vec![vec![0x3B, 0x66, 10, 12]], Some(0));
+    assert!(explicit_zero.is_complete());
+    assert_eq!(explicit_zero.writes.untracked.get(&(5, 10)), None, "temporary zeros do not become story data");
+}
+
+#[test]
+fn resource_gil_amount_halves_obey_each_selectors_byte_or_word_width() {
+    let result = resource_run(vec![
+        setword(6, 10, 0x02FF), setbyte(5, 20, 1),
+        // low byte from bank5[10], high word from bank6[20].
+        vec![0x39, 0x56, 10, 0, 20, 0],
+        vec![0x3B, 0x66, 30, 32],
+    ], Some(0));
+    assert!(result.is_complete());
+    assert_eq!(result.resources.gil_ops, vec![GilOp::Add(0x0001_00FF), GilOp::Read]);
+    assert_eq!(result.resources.gil_after, Some(0x0001_00FF));
+    assert_eq!(result.writes.untracked.get(&(5, 30)), Some(&255));
+    assert_eq!(result.writes.untracked.get(&(5, 32)), Some(&1));
+    let aliased = resource_run(vec![setword(7, 10, 0x02FF), vec![0x39, 0x7F, 10, 0, 10, 0]], Some(0));
+    assert!(aliased.is_complete());
+    assert_eq!(aliased.resources.gil_after, Some(0x00FF_02FF), "bank7 is the word selector and bank15 its byte alias");
+    let unknown_amount = resource_run(vec![vec![0x3A, 0x10, 40, 0, 0, 0]], Some(600));
+    assert!(!unknown_amount.is_complete());
+    assert!(unknown_amount.unknown_persistent_reads.contains(&(1, 40)));
+    assert_eq!(unknown_amount.resources.gil_after, None, "a guessed amount never yields an authoritative after-image");
+}
+
+#[test]
+fn resource_chgld_writes_low_then_high_halves_and_respects_byte_selectors() {
+    let result = resource_run(vec![vec![0x3B, 0x66, 10, 11]], Some(0x1234_5678));
+    assert!(result.is_complete());
+    assert_eq!(result.resources.gil_ops, vec![GilOp::Read]);
+    for (address, value) in [(10, 0x78), (11, 0x34), (12, 0x12)] {
+        assert_eq!(result.writes.untracked.get(&(5, address)), Some(&value), "overlapping destination {address}");
+    }
+    let byte_dest = resource_run(vec![vec![0x3B, 0x5F, 10, 11]], Some(0x1234_5678));
+    assert!(byte_dest.is_complete());
+    assert_eq!(byte_dest.writes.untracked.get(&(5, 10)), Some(&0x78));
+    assert_eq!(byte_dest.writes.persistent.get(&(7, 11)), Some(&(0x34, 255)));
+    assert!(!byte_dest.writes.persistent.contains_key(&(7, 12)));
+    assert!(!resource_run(vec![vec![0x3B, 0x06, 10, 12]], Some(600)).is_complete(), "invalid destination never silently succeeds");
+    assert!(!resource_run(vec![vec![0x3B, 0x66, 255, 12]], Some(600)).is_complete(), "a word cannot wrap a bank");
+}
+
+#[test]
+fn resource_equivalence_compares_amounts_and_order_even_when_final_balances_match() {
+    let one = resource_run(vec![gold(0x3A, 1)], Some(0));
+    let two = resource_run(vec![gold(0x3A, 2)], Some(0));
+    assert_eq!(one.resources.gil_after, two.resources.gil_after);
+    assert!(!one.same_story_as(&two));
+    assert!(one.same_story_as(&one));
+    let a = resource_run(vec![gold(0x39, 1), gold(0x3A, 1)], Some(10));
+    let b = resource_run(vec![gold(0x3A, 1), gold(0x39, 1)], Some(10));
+    assert_eq!(a.resources.gil_after, b.resources.gil_after);
+    assert!(!a.same_story_as(&b));
+    assert!(!one.same_story_as(&resource_run(vec![gold(0x3A, 1)], None)));
+}
+
+#[test]
+fn resource_setup_and_main_share_one_balance_and_replacement_resources() {
+    let section = script(vec![("a", vec![(0, vec![gold(0x39, 10)]), (1, vec![gold(0x3A, 1)])]), ("b", vec![])], vec![]);
+    let field = field_of(section.clone());
+    let mut def = demo_def(vec![], start(0, 1));
+    def.setup = vec![ScriptRef::new(0, 0)];
+    let story = StoryState::at(36).into_extended().unwrap();
+    let resources = SceneResources { gil: Some(50) };
+    let original = run_to_end_with_resources(&field, &def, &story, 1, resources, &[]).unwrap();
+    assert_eq!(original.resources.gil_after, Some(59));
+    assert_eq!(original.resources.gil_ops, vec![GilOp::Add(10), GilOp::Subtract(1)]);
+    let replacement = run_section_to_end_with_resources(&field, &def, &story, 1, &section, resources, &[]).unwrap();
+    assert!(original.same_story_as(&replacement));
+    let mut play = ScenePlay::with_script_section_and_resources(&field, &def, &story, 1, &section, resources).unwrap();
+    assert_eq!(play.resources().gil_after, Some(60), "setup runs exactly once");
+    while !matches!(play.next(None).then, Then::End { .. }) {}
+    assert_eq!(play.resources(), &original.resources);
+}
+
+#[test]
+fn resource_gold_decoder_keeps_independent_bank_halves_and_only_true_literal_amount_aliases() {
+    use crate::script::decode_at;
+    for op in [0x39, 0x3A] {
+        let literal = decode_at(&gold(op, 0x8765_4321), 0, 0).unwrap();
+        assert_eq!(literal.literal("amount_lo"), Some(0x4321));
+        assert_eq!(literal.literal("amount_hi"), Some(0x8765));
+        assert_eq!(literal.literal("amount").map(|n| n as u32), Some(0x8765_4321));
+        let variable = decode_at(&[op, 0x65, 10, 0, 20, 0], 0, 0).unwrap();
+        assert_eq!(variable.operand("amount_lo").unwrap().bank, 6);
+        assert_eq!(variable.operand("amount_hi").unwrap().bank, 5);
+        assert_eq!(variable.operand("amount"), None);
+        assert!(!variable.stray_banks);
     }
 }

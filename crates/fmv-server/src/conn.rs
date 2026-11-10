@@ -514,6 +514,7 @@ impl Conn {
         check_version(protocol_version).map_err(|why| Close::reject(RejectCode::ProtocolMismatch, why))?;
 
         // 2. Who is this? Registration or token login, against the persistent store.
+        let scene_save_epoch = shared.with_world(|world| world.scene_save_epoch());
         let Login { account, avatar, progression, issued_token, progress, card } = self.authenticate(auth, character).await?;
         let registered = issued_token.is_some();
         if registered {
@@ -621,9 +622,13 @@ impl Conn {
                     return Err(Close::reject(RejectCode::InvalidToken, UNKNOWN_TOKEN));
                 }
                 world
-                    .join(new, Instant::now())
+                    .join_with_scene_epoch(new, Instant::now(), scene_save_epoch)
                     .map(|spawn| (spawn, world.player_count()))
-                    .map_err(|JoinError::AlreadyOnline| Close::reject(RejectCode::AlreadyOnline, ALREADY_ONLINE))
+                    .map_err(|error| match error {
+                        JoinError::AlreadyOnline => Close::reject(RejectCode::AlreadyOnline, ALREADY_ONLINE),
+                        JoinError::ProgressChanged => Close::reject(RejectCode::Internal, "A scene save completed during login. Please reconnect to load current progress."),
+                        JoinError::StorageUnavailable => Close::reject(RejectCode::Internal, "Server storage requires recovery. Please reconnect after the server restarts."),
+                    })
             })
         };
         let (spawn, online) = joined?;

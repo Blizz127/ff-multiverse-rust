@@ -176,6 +176,15 @@ impl World {
     /// Apply `step` of point `point` to `entity` (module docs: the mirror, the log line, the save, the message, the
     /// placements).
     pub(super) fn apply_story_step(&mut self, entity: EntityId, point: u32, step: StoryStep) {
+        self.apply_story_step_inner(entity, point, step, true);
+    }
+
+    /// Publish a step already acknowledged by durable storage. It must not enqueue a second save.
+    pub(super) fn apply_saved_story_step(&mut self, entity: EntityId, point: u32, step: StoryStep) {
+        self.apply_story_step_inner(entity, point, step, false);
+    }
+
+    fn apply_story_step_inner(&mut self, entity: EntityId, point: u32, step: StoryStep, save: bool) {
         let Some(player) = self.players.get_mut(&entity) else { return };
         // A player in a debug scene preview plays on a made-up story: no step of it is ever kept, saved or told (this is
         // the one place the world saves a story, so this is what keeps the preview from touching a real account).
@@ -192,7 +201,7 @@ impl World {
         // A step may start a countdown, or leave the story past the one the account had (the players are told by the
         // placements below: see the `countdown` module).
         self.countdown_after_step(account, &area_id, &step);
-        if !self.saver.as_ref().is_none_or(|saver| saver.save_story(account, step.progress.clone())) {
+        if save && !self.saver.as_ref().is_none_or(|saver| saver.save_story(account, step.progress.clone())) {
             self.logs.warn(format!("story progress NOT SAVED (the saver has stopped; the player has it, the store does not) account={}", account.0));
         }
 

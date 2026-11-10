@@ -251,9 +251,9 @@ struct Moved {
 }
 
 impl SceneBuilder for Moved {
-    fn build(&mut self, _scene: &str, story: &StoryState, seed: u32) -> Result<Built, String> {
+    fn build(&mut self, _scene: &str, story: &StoryState, seed: u32, resources: fmv_ff7::script::scene::SceneResources) -> Result<Built, String> {
         let area = self.adapter.load_field(&self.def.field).map_err(|e| e.to_string())?;
-        let play = ScenePlay::new(area.field_file(), &self.def, story, seed).map_err(|e| e.to_string())?;
+        let play = ScenePlay::with_resources(area.field_file(), &self.def, story, seed, resources).map_err(|e| e.to_string())?;
         Ok(Built { def: self.def.clone(), source: Box::new(play) })
     }
 
@@ -291,7 +291,7 @@ fn make_rig(real: &Real, def: SceneDef, moved: bool) -> Rig {
     let area = real.adapter.load_field(key).expect("the proof field loads");
     let view = FieldView::ff7_with(&real.adapter, key, true).expect("field view");
     let scale = view.stage.as_ref().expect("the field has a stage").model_scale;
-    let play = ScenePlay::new(area.field_file(), &def, &story, SEED).expect("the proof scene plays here");
+    let play = ScenePlay::with_resources(area.field_file(), &def, &story, SEED, fmv_ff7::script::scene::SceneResources { gil: Some(0) }).expect("the proof scene plays here");
     // The area's own characters, announced as the server announces them, and then the scene's trigger as the server adds it
     // while the scene is on offer.
     let clip = |text: &str, max: usize| -> String { text.chars().filter(|c| !c.is_control()).take(max).collect() };
@@ -397,7 +397,7 @@ fn cast_path(stage: &[Stage]) -> Vec<(u8, f32, f32)> {
 fn scene_path(real: &Real, def: &SceneDef) -> Vec<(u8, f32, f32)> {
     let area = real.adapter.load_field(&def.field).expect("the scene's field loads");
     let story = StoryState::at(*def.trigger.moments.start());
-    let mut play = ScenePlay::new(area.field_file(), def, &story, SEED).expect("the scene plays here");
+    let mut play = ScenePlay::with_resources(area.field_file(), def, &story, SEED, fmv_ff7::script::scene::SceneResources { gil: Some(0) }).expect("the scene plays here");
     let mut stage: Vec<Stage> = play.initial_stage_events().to_vec();
     for _ in 0..200 {
         let beat = play.next(None);
@@ -580,7 +580,7 @@ fn survey(mut def: SceneDef, default: Spot, prefix: &str, mode: Survey) {
     let path = matches!(mode, Survey::Quiet { .. }).then(|| scene_path(&real, &def));
     let mut rig = make_rig(&real, def, true);
     let msg = ServerMsg::SceneStart {
-        run: SceneRunId(1), scene: rig.def.id.clone(), seed: SEED, progress: rig.story.encode(), owner: EntityId(1),
+        run: SceneRunId(1), scene: rig.def.id.clone(), seed: SEED, progress: rig.story.encode(), gil: 0, owner: EntityId(1),
         participants: vec![SceneParticipant { entity: EntityId(1), spot: 0 }], you: SceneRole::Owner,
     };
     assert!(rig.state.apply(0.0, msg).is_none());
@@ -884,6 +884,7 @@ impl Rig {
             scene: self.def.id.clone(),
             seed: SEED,
             progress: self.story.encode(),
+            gil: 0,
             owner: EntityId(1),
             participants,
             you: SceneRole::Owner,

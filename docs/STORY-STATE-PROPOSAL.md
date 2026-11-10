@@ -1,8 +1,9 @@
 # Proposed story state for the post-reactor route
 
 Status (2026-11-10): local implementation authorized by the owner's full FF7/Disc 1 goal.
-Version 3 known-bit banks and exact-base update validation are implemented; scene/world
-integration remains in progress. No live migration or player state has been changed.
+Version 3 known-bit banks and exact-base scene transactions are implemented. Ordinary
+field-point integration, route enablement and fresh-character initialization remain in progress.
+No live migration or player state has been changed.
 See `DISC1-IMPLEMENTATION.md` for current scope and `STATION-TRANSACTION-PROPOSAL.md`
 for the paired story/resource transaction.
 

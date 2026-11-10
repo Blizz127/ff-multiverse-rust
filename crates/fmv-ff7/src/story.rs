@@ -1050,9 +1050,11 @@ impl AreaStory {
 
     /// What reaching point `id` does for `blob` (see `AreaRuntime::story_advance`), for the points the script's text
     /// decides by itself. A talk point has no script here to run and is never reached by this; the adapter asks
-    /// [`AreaStory::advance_with`].
+    /// [`AreaStory::advance_with`]. Version 3 is withheld until this legacy point path has an exact-base transaction:
+    /// publishing its effects through the legacy monotonic merge would discard the new state.
     pub fn advance(&self, blob: &[u8], id: u32) -> Option<StoryStep> {
         let state = StoryState::decode(blob)?;
+        if state.supports_extended() { return None; }
         let point = self.points.get(usize::try_from(id).ok()?)?;
         let next = point.apply(&state)?;
         Some(StoryStep { summary: summary(&state, &next), progress: next.encode(), countdown: point.countdown })
@@ -1063,6 +1065,9 @@ impl AreaStory {
     /// (the moment up, a tracked bit on). A character that is hidden or not to be talked to in that story gives nothing.
     pub fn advance_with(&self, script: &FieldScript<'_>, blob: &[u8], id: u32) -> Option<StoryStep> {
         let state = StoryState::decode(blob)?;
+        // Refuse before interpreting talks/panels or returning a point that could start a battle/reward. The extended
+        // scene path commits against an exact base; these legacy points do not yet carry that transaction.
+        if state.supports_extended() { return None; }
         let point = self.points.get(usize::try_from(id).ok()?)?;
         let (next, countdown) = match &point.trigger {
             Trigger::Talk { entity, .. } => (talk_step(script, *entity, &state)?, None),

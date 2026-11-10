@@ -39,6 +39,9 @@ struct FakeHost {
     /// Whether the hall's story step has its cutscene ([`POINT_SCENE`]).
     cutscene: Mutex<bool>,
     victory: Mutex<bool>,
+    transaction: Mutex<Option<SceneTransaction>>,
+    resources: Mutex<Vec<u32>>,
+    refuse: Mutex<bool>,
 }
 
 impl SceneHost for FakeHost {
@@ -77,8 +80,17 @@ impl SceneHost for FakeHost {
     }
     fn finish(&self, scene: &str, progress: &[u8], seed: u32, answers: &[u8]) -> Option<SceneResult> {
         self.finished.lock().unwrap().push((scene.to_string(), progress.to_vec(), seed, answers.to_vec()));
+        if *self.refuse.lock().unwrap() { return None; }
         let after = if progress == MADE_UP { vec![9, 5] } else { vec![5] };
-        Some(SceneResult { progress: after, changed: true, summary: "moment=1->5".into(), travel: self.travel.lock().unwrap().clone() })
+        Some(SceneResult { progress: after, changed: true, summary: "moment=1->5".into(), travel: self.travel.lock().unwrap().clone(), transaction: *self.transaction.lock().unwrap() })
+    }
+    fn finish_with_resources(&self, scene: &str, progress: &[u8], seed: u32, answers: &[u8], gil: u32) -> Option<SceneResult> {
+        self.resources.lock().unwrap().push(gil);
+        self.finish(scene, progress, seed, answers)
+    }
+    fn finish_preview_with_resources(&self, scene: &str, progress: &[u8], seed: u32, answers: &[u8], gil: u32) -> Option<SceneResult> {
+        self.resources.lock().unwrap().push(gil);
+        self.finish_preview(scene, progress, seed, answers)
     }
 }
 
@@ -503,6 +515,334 @@ fn saved(rx: &mut mpsc::UnboundedReceiver<Msg>) -> Vec<Vec<u8>> {
         }
     }
     out
+}
+
+type SceneAcknowledgement = tokio::sync::oneshot::Sender<Result<crate::saver::SceneSaved, crate::saver::SceneSaveError>>;
+
+fn pending_job(rx: &mut mpsc::UnboundedReceiver<Msg>) -> (crate::saver::SceneSaveJob, SceneAcknowledgement) {
+    let Msg::Scene { job, done } = rx.try_recv().expect("one queued transaction") else { panic!("a scene transaction, not an ordinary save") };
+    assert!(rx.try_recv().is_err(), "queued only once");
+    (job, done)
+}
+
+fn scene_ack(w: &World, account: AccountId, story: &[u8], gil: u32) -> crate::saver::SceneSaved {
+    let game = w.areas.get(&w.home).unwrap().id().game;
+    let mut character = fmv_persist::CharacterProgress::new(account, game, 0, 5, 1000);
+    character.gil = gil;
+    character.exp = 52;
+    character.ap = 7;
+    character.limit = 99;
+    character.inventory = Some(vec![fmv_core::InventoryEntry::new(2, 3)]);
+    crate::saver::SceneSaved { commit: fmv_persist::SceneCommit::Applied, pair: fmv_persist::ProgressPair {
+        story: fmv_persist::Progression::new(account, game, story.to_vec(), 1000), character: Some(character),
+    } }
+}
+
+#[test]
+fn durable_scene_holds_everyone_until_ack_then_publishes_before_release_and_travel() {
+    let (mut w, mut queue, host) = world_with(false, true);
+    let mut now = Instant::now();
+    let mut a = seat(&mut w, "A", &[], now);
+    let mut b = seat(&mut w, "B", &[], now);
+    party(&mut w, &a, &b, now);
+    up_to_the_trigger(&mut w, &mut a, &mut now);
+    up_to_the_trigger(&mut w, &mut b, &mut now);
+    w.players.get_mut(&a.entity).unwrap().progress.as_mut().unwrap().gil = 1;
+    w.players.get_mut(&b.entity).unwrap().progress.as_mut().unwrap().gil = 9;
+    *host.transaction.lock().unwrap() = Some(SceneTransaction { expected_gil: 1, next_gil: 0 });
+    *host.travel.lock().unwrap() = Some(entry_to(HALL));
+    w.press(a.entity, Some(trigger_id()), now);
+    for msgs in [a.drain(), b.drain()] {
+        assert!(msgs.iter().any(|m| matches!(m, ServerMsg::SceneStart { gil: 1, .. })), "every participant gets the owner's resource snapshot");
+    }
+    let run = SceneRunId(1);
+    w.scene_message(a.entity, ClientMsg::SceneEnd { run, skipped: false }, now);
+    let (job, done) = pending_job(&mut queue);
+    assert_eq!((job.account, job.expected_gil, job.next_gil, job.expected_story, job.next_story), (a.account, 1, 0, vec![], vec![5]));
+    assert_eq!(*host.resources.lock().unwrap(), [1]);
+    assert!(w.in_scene(a.entity) && w.in_scene(b.entity));
+    assert_eq!(go(&mut w, &a, 160.0, -100.0, &mut now), MoveOutcome::Frozen);
+    assert_eq!(w.players.get(&a.entity).unwrap().progress.as_ref().unwrap().gil, 1);
+    assert!(a.drain().is_empty() && b.drain().is_empty());
+    w.scene_message(a.entity, ClientMsg::SceneEnd { run, skipped: true }, now);
+    w.scene_message(a.entity, ClientMsg::SceneLeave { run }, now);
+    w.advance_scenes(now + SCENE_MAX_TIME);
+    assert!(queue.try_recv().is_err() && w.scene_count() == 1, "duplicates, leave and timeouts cannot enqueue or cancel a commit");
+    done.send(Ok(scene_ack(&w, a.account, &[5], 0))).unwrap();
+    w.advance_scenes(now);
+    assert_eq!(w.scene_count(), 0);
+    assert_eq!(w.players.get(&a.entity).unwrap().progression, [5]);
+    let p = w.players.get(&a.entity).unwrap().progress.unwrap();
+    assert_eq!((p.gil, p.exp, p.ap, p.limit), (0, 52, 7, 99));
+    assert_eq!(w.players.get(&a.entity).unwrap().inventory.as_ref().unwrap().entries(), [fmv_core::InventoryEntry::new(2, 3)]);
+    let msgs = a.drain();
+    let pos = |test: fn(&ServerMsg) -> bool| msgs.iter().position(test).unwrap();
+    let ended = pos(|m| matches!(m, ServerMsg::SceneEnded { outcome: SceneOutcome::Finished, .. }));
+    assert!(pos(|m| matches!(m, ServerMsg::StoryUpdate { .. })) < ended);
+    assert!(pos(|m| matches!(m, ServerMsg::CharacterProgress { .. })) < ended);
+    assert!(pos(|m| matches!(m, ServerMsg::Inventory { .. })) < ended);
+    assert!(ended < pos(|m| matches!(m, ServerMsg::AreaChange { .. })));
+    assert!(b.drain().iter().any(|m| matches!(m, ServerMsg::AreaChange { .. })));
+    assert!(queue.try_recv().is_err(), "publishing an acknowledged pair never queues another ordinary story save");
+}
+
+#[test]
+fn durable_scene_refused_preconditions_never_publish_or_travel_and_release_watchers() {
+    for error in [crate::saver::SceneSaveError::StaleStory, crate::saver::SceneSaveError::StaleGil,
+        crate::saver::SceneSaveError::InvalidRequest,
+        crate::saver::SceneSaveError::Store(fmv_persist::PersistError::TransactionConflict("different selected outcome".into()))] {
+        let (mut w, mut queue, host, mut a, mut b, now) = two_at_the_trigger();
+        *host.transaction.lock().unwrap() = Some(SceneTransaction { expected_gil: 0, next_gil: 0 });
+        *host.travel.lock().unwrap() = Some(entry_to(HALL));
+        w.press(a.entity, Some(trigger_id()), now);
+        a.drain(); b.drain();
+        w.scene_message(a.entity, ClientMsg::SceneEnd { run: SceneRunId(1), skipped: false }, now);
+        let (_, done) = pending_job(&mut queue);
+        done.send(Err(error)).unwrap();
+        w.advance_scenes(now);
+        assert!(!w.players.contains_key(&a.entity), "the owner must reload authoritative state");
+        assert!(!w.in_scene(b.entity));
+        assert!(!w.scenes.storage_failed && w.players.contains_key(&b.entity), "known no-write refusals leave the store usable");
+        let owner = a.drain();
+        assert!(owner.iter().all(|m| !matches!(m, ServerMsg::StoryUpdate { .. } | ServerMsg::AreaChange { .. } | ServerMsg::SceneEnded { .. })));
+        assert!(owner.iter().any(|m| matches!(m, ServerMsg::Reject { code: fmv_protocol::RejectCode::Internal, .. })));
+        let watcher = b.drain();
+        assert!(watcher.iter().any(|m| matches!(m, ServerMsg::SceneEnded { outcome: SceneOutcome::Aborted, .. })));
+        assert!(watcher.iter().all(|m| !matches!(m, ServerMsg::AreaChange { .. })));
+        assert!(queue.try_recv().is_err());
+    }
+}
+
+#[test]
+fn durable_scene_without_a_saver_refuses_before_releasing_success() {
+    let (mut w, mut queue, host, mut a, mut b, now) = two_at_the_trigger();
+    w.saver = None;
+    *host.transaction.lock().unwrap() = Some(SceneTransaction { expected_gil: 0, next_gil: 0 });
+    w.press(a.entity, Some(trigger_id()), now); a.drain(); b.drain();
+    w.scene_message(a.entity, ClientMsg::SceneEnd { run: SceneRunId(1), skipped: false }, now);
+    assert!(queue.try_recv().is_err());
+    assert!(!w.players.contains_key(&a.entity) && !w.in_scene(b.entity));
+    assert!(!a.drain().iter().any(|m| matches!(m, ServerMsg::SceneEnded { outcome: SceneOutcome::Finished, .. } | ServerMsg::StoryUpdate { .. })));
+}
+
+#[test]
+fn a_stopped_real_saver_stops_every_player_when_a_scene_cannot_be_enqueued() {
+    let (mut w, queue, host, mut a, mut b, now) = two_at_the_trigger();
+    drop(queue);
+    *host.transaction.lock().unwrap() = Some(SceneTransaction { expected_gil: 0, next_gil: 0 });
+    w.press(a.entity, Some(trigger_id()), now); a.drain(); b.drain();
+    w.scene_message(a.entity, ClientMsg::SceneEnd { run: SceneRunId(1), skipped: false }, now);
+    assert_eq!(w.player_count(), 0);
+    assert!(w.scenes.storage_failed);
+    assert!(!a.drain().iter().any(|m| matches!(m, ServerMsg::SceneEnded { outcome: SceneOutcome::Finished, .. } | ServerMsg::StoryUpdate { .. })));
+}
+
+#[test]
+fn an_oversized_scene_result_is_refused_without_stopping_the_healthy_saver() {
+    let (mut w, mut queue, _host, mut a, mut b, now) = two_at_the_trigger();
+    w.press(a.entity, Some(trigger_id()), now); a.drain(); b.drain();
+    let run = SceneRunId(1);
+    let record = w.scenes.runs.remove(&run).unwrap();
+    let result = SceneResult { progress: vec![0; fmv_protocol::MAX_STORY_PROGRESS_BYTES + 1], changed: true,
+        summary: "too large".into(), travel: None, transaction: Some(SceneTransaction { expected_gil: 0, next_gil: 0 }) };
+    w.queue_scene_save(run, record, result, SceneOutcome::Finished);
+    assert!(queue.try_recv().is_err());
+    assert!(!w.scenes.storage_failed && w.players.contains_key(&b.entity));
+    assert!(!w.players.contains_key(&a.entity) && !w.in_scene(b.entity));
+}
+
+#[test]
+fn durable_scene_watcher_can_leave_while_its_owner_is_waiting_for_storage() {
+    let (mut w, mut queue, host, mut a, mut b, now) = two_at_the_trigger();
+    *host.transaction.lock().unwrap() = Some(SceneTransaction { expected_gil: 0, next_gil: 0 });
+    *host.travel.lock().unwrap() = Some(entry_to(HALL));
+    w.press(a.entity, Some(trigger_id()), now); a.drain(); b.drain();
+    let run = SceneRunId(1);
+    w.scene_message(a.entity, ClientMsg::SceneEnd { run, skipped: false }, now);
+    let (_, done) = pending_job(&mut queue);
+    w.scene_message(b.entity, ClientMsg::SceneLeave { run }, now);
+    assert!(!w.in_scene(b.entity) && w.in_scene(a.entity));
+    assert_eq!(ends(&b.drain()), [SceneOutcome::Skipped]);
+    done.send(Ok(scene_ack(&w, a.account, &[5], 0))).unwrap();
+    w.advance_scenes(now);
+    assert!(b.drain().iter().all(|m| !matches!(m, ServerMsg::SceneEnded { .. } | ServerMsg::AreaChange { .. })));
+}
+
+fn reconnect(w: &mut World, account: AccountId, story: &[u8]) -> (NewPlayer, mpsc::Receiver<Outbound>) {
+    let (session, entity) = w.allocate_ids();
+    let (tx, rx) = mpsc::channel(256);
+    (NewPlayer { session, entity, account, avatar: AvatarAppearance { display_name: "reconnected".into(), tint: [1, 2, 3], appearance_ref: None },
+        progression: story.to_vec(), progress: Default::default(), tx, close: Arc::new(watch::channel(false).0) }, rx)
+}
+
+#[test]
+fn a_disconnected_pending_owner_is_reserved_and_stale_admission_is_fenced_even_after_ack() {
+    let (mut w, mut queue, host, mut a, mut b, now) = two_at_the_trigger();
+    *host.transaction.lock().unwrap() = Some(SceneTransaction { expected_gil: 0, next_gil: 0 });
+    *host.travel.lock().unwrap() = Some(entry_to(HALL));
+    let before = w.scene_save_epoch();
+    w.press(a.entity, Some(trigger_id()), now); a.drain(); b.drain();
+    w.scene_message(a.entity, ClientMsg::SceneEnd { run: SceneRunId(1), skipped: false }, now);
+    let (_, done) = pending_job(&mut queue);
+    let during = w.scene_save_epoch();
+    assert_ne!(before, during);
+    assert!(w.leave(a.entity));
+    assert!(w.is_online(a.account), "queued persistence reserves the account after disconnect");
+    let (new, _rx) = reconnect(&mut w, a.account, &[]);
+    assert_eq!(w.join(new, now), Err(crate::world::JoinError::AlreadyOnline));
+    let acknowledged = scene_ack(&w, a.account, &[5], 0);
+    done.send(Ok(acknowledged)).unwrap();
+    w.advance_scenes(now);
+    assert!(!w.is_online(a.account) && w.scene_count() == 0);
+    assert_eq!(ends(&b.drain()), [SceneOutcome::Finished]);
+    assert!(w.players.get(&b.entity).unwrap().transit.is_none(), "an absent owner cannot move its watcher to a stale destination");
+    for snapshot in [before, during] {
+        let (new, _rx) = reconnect(&mut w, a.account, &[]);
+        assert_eq!(w.join_with_scene_epoch(new, now, snapshot), Err(crate::world::JoinError::ProgressChanged));
+    }
+    let fresh = w.scene_save_epoch();
+    let (new, _rx) = reconnect(&mut w, a.account, &[5]);
+    let entity = new.entity;
+    w.join_with_scene_epoch(new, now, fresh).expect("freshly loaded committed story can join");
+    assert_eq!(w.players.get(&entity).unwrap().progression, [5]);
+    assert!(queue.try_recv().is_err());
+}
+
+#[test]
+fn uncertain_scene_storage_disconnects_every_player_and_refuses_admission_until_recovery() {
+    for store_error in [false, true] {
+        let (mut w, mut queue, host, mut a, mut b, now) = two_at_the_trigger();
+        let mut unrelated = seat(&mut w, "unrelated", &[], now);
+        unrelated.drain();
+        *host.transaction.lock().unwrap() = Some(SceneTransaction { expected_gil: 0, next_gil: 0 });
+        w.press(a.entity, Some(trigger_id()), now); a.drain(); b.drain();
+        w.scene_message(a.entity, ClientMsg::SceneEnd { run: SceneRunId(1), skipped: false }, now);
+        let (_, done) = pending_job(&mut queue);
+        if store_error { done.send(Err(crate::saver::SceneSaveError::Store(fmv_persist::PersistError::TransactionRecoveryRequired))).unwrap(); }
+        else { drop(done); }
+        w.advance_scenes(now);
+        assert_eq!(w.player_count(), 0, "every player must stop when the shared store cannot save");
+        for msgs in [a.drain(), b.drain(), unrelated.drain()] {
+            assert!(msgs.iter().any(|m| matches!(m, ServerMsg::Reject { code: fmv_protocol::RejectCode::Internal, .. })));
+            assert!(!msgs.iter().any(|m| matches!(m, ServerMsg::StoryUpdate { .. } | ServerMsg::AreaChange { .. } | ServerMsg::SceneEnded { outcome: SceneOutcome::Finished, .. })));
+        }
+        let epoch = w.scene_save_epoch();
+        let (new, _rx) = reconnect(&mut w, a.account, &[5]);
+        assert_eq!(w.join_with_scene_epoch(new, now, epoch), Err(crate::world::JoinError::StorageUnavailable));
+    }
+}
+
+#[test]
+fn a_refused_scene_interpretation_cannot_be_reported_as_success() {
+    let (mut w, mut queue, host, mut a, mut b, now) = two_at_the_trigger();
+    *host.refuse.lock().unwrap() = true;
+    *host.travel.lock().unwrap() = Some(entry_to(HALL));
+    w.press(a.entity, Some(trigger_id()), now); a.drain(); b.drain();
+    w.scene_message(a.entity, ClientMsg::SceneEnd { run: SceneRunId(1), skipped: false }, now);
+    assert!(queue.try_recv().is_err());
+    assert!(!w.players.contains_key(&a.entity) && !w.in_scene(b.entity));
+    assert_eq!(ends(&b.drain()), [SceneOutcome::Aborted]);
+    assert!(!a.drain().iter().any(|m| matches!(m, ServerMsg::SceneEnded { .. } | ServerMsg::StoryUpdate { .. } | ServerMsg::AreaChange { .. })));
+}
+
+#[test]
+fn an_acknowledged_duplicate_uses_current_progress_without_replaying_the_old_travel() {
+    let (mut w, mut queue, host, mut a, mut b, now) = two_at_the_trigger();
+    *host.transaction.lock().unwrap() = Some(SceneTransaction { expected_gil: 0, next_gil: 0 });
+    *host.travel.lock().unwrap() = Some(entry_to(HALL));
+    w.press(a.entity, Some(trigger_id()), now); a.drain(); b.drain();
+    w.scene_message(a.entity, ClientMsg::SceneEnd { run: SceneRunId(1), skipped: false }, now);
+    let (_, done) = pending_job(&mut queue);
+    let mut ack = scene_ack(&w, a.account, &[7], 20);
+    ack.commit = fmv_persist::SceneCommit::AlreadyApplied;
+    done.send(Ok(ack)).unwrap();
+    w.advance_scenes(now);
+    assert_eq!(w.players.get(&a.entity).unwrap().progression, [7]);
+    assert_eq!(w.players.get(&a.entity).unwrap().progress.unwrap().gil, 20);
+    for msgs in [a.drain(), b.drain()] {
+        assert_eq!(ends(&msgs), [SceneOutcome::Finished]);
+        assert!(!msgs.iter().any(|m| matches!(m, ServerMsg::AreaChange { .. })));
+    }
+}
+
+#[test]
+fn a_pending_destination_is_kept_loaded_until_the_scene_can_travel() {
+    let (mut w, mut queue, host, mut a, mut b, now) = two_at_the_trigger();
+    // Both participants are in the yard: choose it as the protected entry area so the empty
+    // hall is an unloadable destination in this fixture.
+    w.home = YARD.into();
+    w.set_unload_grace(Duration::ZERO);
+    *host.transaction.lock().unwrap() = Some(SceneTransaction { expected_gil: 0, next_gil: 0 });
+    *host.travel.lock().unwrap() = Some(entry_to(HALL));
+    w.press(a.entity, Some(trigger_id()), now); a.drain(); b.drain();
+    w.scene_message(a.entity, ClientMsg::SceneEnd { run: SceneRunId(1), skipped: false }, now);
+    let (_, done) = pending_job(&mut queue);
+    w.manage_areas(now + SCENE_MAX_TIME);
+    assert!(w.areas.contains_key(HALL), "the validated destination stays pinned during storage latency");
+    w.source = None; // A second load would fail; the prepared destination must be retained.
+    done.send(Ok(scene_ack(&w, a.account, &[5], 0))).unwrap();
+    w.advance_scenes(now + SCENE_MAX_TIME);
+    assert!(a.drain().iter().any(|m| matches!(m, ServerMsg::AreaChange { .. })));
+}
+
+#[test]
+fn previews_use_the_resource_snapshot_but_never_queue_the_returned_transaction() {
+    let (mut w, mut queue, host) = world_with(false, true);
+    let mut now = Instant::now();
+    let mut a = seat(&mut w, "A", &[], now);
+    up_to_the_trigger(&mut w, &mut a, &mut now);
+    let player = w.players.get_mut(&a.entity).unwrap();
+    player.preview = Some(Preview { phase: preview_phase(a.account, SCENE) });
+    player.progress.as_mut().unwrap().gil = 3;
+    *host.transaction.lock().unwrap() = Some(SceneTransaction { expected_gil: 3, next_gil: 2 });
+    *host.travel.lock().unwrap() = Some(entry_to(HALL));
+    w.press(a.entity, Some(trigger_id()), now); a.drain();
+    w.scene_message(a.entity, ClientMsg::SceneEnd { run: SceneRunId(1), skipped: false }, now);
+    assert_eq!(*host.resources.lock().unwrap(), [3]);
+    assert!(queue.try_recv().is_err());
+    assert_eq!(w.players.get(&a.entity).unwrap().progress.unwrap().gil, 3);
+    assert_eq!(w.scene_count(), 0);
+    assert!(!a.drain().iter().any(|m| matches!(m, ServerMsg::AreaChange { .. })));
+}
+
+#[test]
+fn the_saved_mirror_keeps_the_active_character_slot_and_clamps_game_caps() {
+    let (mut w, mut queue, host) = world_with(false, true);
+    let mut now = Instant::now();
+    let mut a = seat(&mut w, "A", &[], now);
+    up_to_the_trigger(&mut w, &mut a, &mut now);
+    let slot = w.players.get(&a.entity).unwrap().progress.unwrap().character;
+    *host.transaction.lock().unwrap() = Some(SceneTransaction { expected_gil: 0, next_gil: 0 });
+    w.press(a.entity, Some(trigger_id()), now); a.drain();
+    w.scene_message(a.entity, ClientMsg::SceneEnd { run: SceneRunId(1), skipped: false }, now);
+    let (_, done) = pending_job(&mut queue);
+    let mut ack = scene_ack(&w, a.account, &[5], u32::MAX);
+    let character = ack.pair.character.as_mut().unwrap();
+    character.character = slot.wrapping_add(1);
+    character.level = u8::MAX; character.exp = u32::MAX; character.ap = u32::MAX; character.limit = u16::MAX;
+    done.send(Ok(ack)).unwrap();
+    w.advance_scenes(now);
+    let got = w.players.get(&a.entity).unwrap().progress.unwrap();
+    let caps = w.battle.as_ref().unwrap().rules().progress_limits();
+    assert_eq!((got.character, got.level, got.exp, got.ap, got.limit), (slot, caps.max_level, caps.max_exp, caps.max_ap, caps.max_limit));
+    assert_eq!(got.gil, u32::MAX, "the durable authored gil result stays exact");
+}
+
+#[test]
+fn a_newer_resource_mirror_is_never_overwritten_by_a_delayed_scene_acknowledgment() {
+    let (mut w, mut queue, host) = world_with(false, true);
+    let mut now = Instant::now();
+    let mut a = seat(&mut w, "A", &[], now);
+    up_to_the_trigger(&mut w, &mut a, &mut now);
+    *host.transaction.lock().unwrap() = Some(SceneTransaction { expected_gil: 0, next_gil: 0 });
+    w.press(a.entity, Some(trigger_id()), now); a.drain();
+    w.scene_message(a.entity, ClientMsg::SceneEnd { run: SceneRunId(1), skipped: false }, now);
+    let (_, done) = pending_job(&mut queue);
+    w.players.get_mut(&a.entity).unwrap().progress.as_mut().unwrap().gil = 50;
+    done.send(Ok(scene_ack(&w, a.account, &[5], 0))).unwrap();
+    w.advance_scenes(now);
+    assert!(!w.players.contains_key(&a.entity), "reload when any resource changed during the save");
+    assert!(!a.drain().iter().any(|m| matches!(m, ServerMsg::StoryUpdate { .. } | ServerMsg::CharacterProgress { .. } | ServerMsg::SceneEnded { outcome: SceneOutcome::Finished, .. })));
 }
 
 fn party(w: &mut World, leader: &Seat, member: &Seat, now: Instant) {

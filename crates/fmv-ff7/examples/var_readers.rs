@@ -136,7 +136,7 @@ fn roles(key: &str) -> Roles {
         "GETX" => &[("value", U, 1), ("a", U, 2), ("var", U, 1)],
         "SEARCHX" => &[("search_start", U, 1), ("start", U, 2), ("end", U, 2), ("value", U, 1), ("var_result", U, 1)],
         "STITM" | "DLITM" | "CKITM" => &[("item", R, 2), ("quantity", R, 1)],
-        "GOLDu" | "GOLDd" => &[("amount", R, 4)],
+        "GOLDu" | "GOLDd" => &[("amount_lo", R, 2), ("amount_hi", R, 2)],
         "WNUMB" => &[("value", R, 4)],
         "SMTRA" | "DMTRA" => &[("materia", R, 1), ("ap0", R, 1), ("ap1", R, 1), ("ap2", R, 1)],
         "STTIM" => &[("hours", R, 1), ("minutes", R, 1), ("seconds", R, 1)],

@@ -26,6 +26,7 @@
 use super::player::{Run, SceneCmd, SceneEvent, SceneKey, ScenePlayer, SceneSound, SoundAction};
 use super::source::{NoScenes, SceneBuilder};
 use fmv_ff7::story::StoryState;
+use fmv_ff7::script::scene::SceneResources;
 use fmv_protocol::{SceneOutcome, SceneParticipant, SceneRefusal, SceneRole, SceneRunId, ServerMsg, MAX_SCENE_STEPS};
 use std::collections::VecDeque;
 use winit::keyboard::KeyCode;
@@ -136,8 +137,8 @@ impl SceneClient {
     /// One of the server's scene messages (anything else is not ours). `area` is the key of the field this player stands in.
     pub fn on_message(&mut self, area: &str, msg: ServerMsg) {
         match msg {
-            ServerMsg::SceneStart { run, scene, seed, progress, participants, you, .. } => {
-                self.start(Start { run, scene, seed, progress, participants, you }, area);
+            ServerMsg::SceneStart { run, scene, seed, progress, gil, participants, you, .. } => {
+                self.start(Start { run, scene, seed, progress, gil, participants, you }, area);
             }
             ServerMsg::SceneStep { run, step, answer } => {
                 if let Some(player) = self.player.as_mut().filter(|p| p.run_id() == run) {
@@ -155,7 +156,7 @@ impl SceneClient {
     }
 
     fn start(&mut self, start: Start, area: &str) {
-        let Start { run, scene, seed, progress, participants, you } = start;
+        let Start { run, scene, seed, progress, gil, participants, you } = start;
         // A run still on show is a stale one (the server holds a player in one run at a time): it is replaced.
         self.end_local();
         self.finished = None;
@@ -165,9 +166,12 @@ impl SceneClient {
         if scene == fmv_ff7::script::scene::PROOF_SCENE_ID && participants.len() > 1 && crate::mods::script_source().is_some() {
             self.note("scene: Echo-S bar dialogue is unavailable with watchers; using the original script".into());
         }
+        // The scene belongs to its owner. A watcher's local wallet may be different, and a
+        // missing snapshot must never be reconstructed as zero (protocol 19 requires the field).
+        let resources = SceneResources { gil: Some(gil) };
         let built = match StoryState::decode(&progress) {
-            Some(story) if you == SceneRole::Owner && participants.len() == 1 => self.builder.build_private(&scene, &story, seed),
-            Some(story) => self.builder.build(&scene, &story, seed),
+            Some(story) if you == SceneRole::Owner && participants.len() == 1 => self.builder.build_private(&scene, &story, seed, resources),
+            Some(story) => self.builder.build(&scene, &story, seed, resources),
             None => Err("the story the scene plays against cannot be read here".to_string()),
         };
         match built {
@@ -353,6 +357,7 @@ struct Start {
     scene: String,
     seed: u32,
     progress: Vec<u8>,
+    gil: u32,
     participants: Vec<SceneParticipant>,
     you: SceneRole,
 }

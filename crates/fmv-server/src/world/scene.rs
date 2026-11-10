@@ -19,10 +19,12 @@
 //!   Nothing else is trusted: a step out of order, from a watcher or for another run is dropped.
 //! * **End.** The owner's client reports `SceneEnd` (finished or skipped); the server ends the run itself when the owner
 //!   says nothing for [`SCENE_IDLE_TIMEOUT`], when the run lasts longer than [`SCENE_MAX_TIME`], and aborts it when the
-//!   owner is gone. Every participant is told with `SceneEnded` and released.
+//!   owner is gone. A completed durable scene stays held while its queued transaction is pending.
 //! * **The story.** When a run ends as finished or explicitly skipped, the server runs the scene's script itself, headless,
 //!   with the answers the owner reported ([`SceneHost::finish`]) and applies what that run wrote to the story ONCE: the
-//!   mirror, the saver (which merges, forward only), a `StoryUpdate`, and a placement refresh. A run that is aborted (the
+//!   mirror, a `StoryUpdate`, and a placement refresh. A resource transaction first commits the exact story and gil pair
+//!   through the ordered saver; only its durable acknowledgment publishes the pair and releases participants. A failed or
+//!   uncertain acknowledgment never publishes success. A run that is aborted before queuing (the
 //!   owner disconnected, could not play it, or timed out) applies nothing: the scene can be played again. The run is removed first and every
 //!   message about it afterwards finds nothing, so a second `SceneEnd`, a late step or a repeated timeout changes nothing.
 //!   A party member in the leader's phase does not advance the story there (its own phase did not choose the instance), so
@@ -110,6 +112,15 @@ pub struct SceneResult {
     pub summary: String,
     /// A validated script destination, if this scene ends in a permitted field transition.
     pub travel: Option<fmv_adapter_api::Exit>,
+    /// Resource/story changes that must be acknowledged by durable storage before releasing the scene.
+    pub transaction: Option<SceneTransaction>,
+}
+
+/// Exact game-computed gil transition. Arithmetic, saturation and choice rules belong to the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SceneTransaction {
+    pub expected_gil: u32,
+    pub next_gil: u32,
 }
 
 /// Where the world gets a game's scenes (see the module docs). Implementations read the game's own files; the world calls
@@ -138,9 +149,17 @@ pub trait SceneHost: Send + Sync {
     fn preview_progress(&self, scene: &str) -> Option<Vec<u8>>;
     /// Run scene `scene` headless against the story `progress` with `seed` and the owner's `answers`, and say what it wrote.
     fn finish(&self, scene: &str, progress: &[u8], seed: u32, answers: &[u8]) -> Option<SceneResult>;
+    /// Interpret using the owner's resource snapshot captured when the scene began.
+    fn finish_with_resources(&self, scene: &str, progress: &[u8], seed: u32, answers: &[u8], _gil: u32) -> Option<SceneResult> {
+        self.finish(scene, progress, seed, answers)
+    }
     /// Debug preview runs on made-up state which is never saved and never travels.
     fn finish_preview(&self, scene: &str, progress: &[u8], seed: u32, answers: &[u8]) -> Option<SceneResult> {
         self.finish(scene, progress, seed, answers)
+    }
+    /// A preview uses the same captured resource input as its clients, without a durable write.
+    fn finish_preview_with_resources(&self, scene: &str, progress: &[u8], seed: u32, answers: &[u8], _gil: u32) -> Option<SceneResult> {
+        self.finish_preview(scene, progress, seed, answers)
     }
 }
 
@@ -189,6 +208,8 @@ struct SceneRun {
     seed: u32,
     /// The story the scene plays against (the owner's instance's).
     progress: Vec<u8>,
+    /// The owner's gil when interpretation began, shared with its client and checked again by the saver.
+    gil: u32,
     /// The answers the owner reported, in order.
     answers: Vec<u8>,
     /// The windows the owner has moved past.
@@ -216,6 +237,16 @@ struct PointThen {
     battle: Option<u16>,
 }
 
+struct PendingScene {
+    record: SceneRun,
+    account: AccountId,
+    result: SceneResult,
+    outcome: SceneOutcome,
+    progress: Option<crate::progress::Progress>,
+    inventory: Option<crate::inventory::Inventory>,
+    done: tokio::sync::oneshot::Receiver<Result<crate::saver::SceneSaved, crate::saver::SceneSaveError>>,
+}
+
 /// The scenes of a world.
 #[derive(Default)]
 pub(super) struct SceneWorld {
@@ -226,6 +257,11 @@ pub(super) struct SceneWorld {
     list: Vec<SceneInfo>,
     next_run: u64,
     runs: BTreeMap<SceneRunId, SceneRun>,
+    pending: BTreeMap<SceneRunId, PendingScene>,
+    /// Admission fence: a login that read storage across a scene save must load it again.
+    save_epoch: u64,
+    /// A failed worker or uncertain store write requires recovery before any player may continue.
+    pub(super) storage_failed: bool,
     /// The trigger NPCs asked of the host, by `(scene index, progression)`: the host decodes game files to answer.
     triggers: BTreeMap<(usize, Vec<u8>), Option<TriggerInfo>>,
 }
@@ -261,7 +297,18 @@ impl World {
     /// How many scenes are running.
     #[cfg(test)]
     pub fn scene_count(&self) -> usize {
-        self.scenes.runs.len()
+        self.scenes.runs.len() + self.scenes.pending.len()
+    }
+
+    pub(crate) fn scene_save_epoch(&self) -> u64 { self.scenes.save_epoch }
+
+    /// Validated travel targets stay loaded until the transaction is acknowledged.
+    pub(super) fn pending_scene_destinations(&self) -> impl Iterator<Item = AreaKey> + '_ {
+        self.scenes.pending.values().filter_map(|p| p.result.travel.as_ref().map(|exit| exit.target.clone()))
+    }
+
+    pub(super) fn scene_save_pending(&self, account: AccountId) -> bool {
+        self.scenes.pending.values().any(|pending| pending.account == account)
     }
 
     /// The phase of `player` in `area`: the made-up one of a previewing player, else what the area reads of its progression.
@@ -333,6 +380,7 @@ impl World {
             }
             (p.snapshot.pos, p.area.clone(), p.account)
         };
+        if self.account_in_battle(account) { return; }
         if !info.field.eq_ignore_ascii_case(&area) {
             return;
         }
@@ -357,6 +405,7 @@ impl World {
             watchers,
             seed,
             progress,
+            gil: self.players.get(&entity).and_then(|p| p.progress).map_or(0, |p| p.gil),
             answers: Vec::new(),
             steps: 0,
             started: now,
@@ -398,6 +447,7 @@ impl World {
             }
             (p.account, p.snapshot.pos)
         };
+        if self.account_in_battle(account) { return false; }
         if !self.scenes.list.iter().any(|s| s.id == scene) {
             return false;
         }
@@ -411,6 +461,7 @@ impl World {
             watchers,
             seed,
             progress: before,
+            gil: self.players.get(&entity).and_then(|p| p.progress).map_or(0, |p| p.gil),
             answers: Vec::new(),
             steps: 0,
             started: now,
@@ -499,6 +550,7 @@ impl World {
                 scene: clip(&record.scene, MAX_SCENE_ID_CHARS),
                 seed: record.seed,
                 progress: record.progress.clone(),
+                gil: record.gil,
                 owner: record.owner,
                 participants: participants.clone(),
                 you: role,
@@ -575,6 +627,17 @@ impl World {
 
     /// A participant asks to be let go: the owner abandons the run without applying it; a watcher just stops watching.
     fn scene_leave(&mut self, entity: EntityId, run: SceneRunId, now: Instant) {
+        if let Some(pending) = self.scenes.pending.get_mut(&run) {
+            // A queued commit cannot be cancelled. A watcher may detach without affecting it.
+            if pending.record.owner == entity { return; }
+            if pending.record.watchers.contains(&entity) {
+                pending.record.watchers.retain(|e| *e != entity);
+                let mut failed = Vec::new();
+                self.release(entity, run, SceneOutcome::Skipped, &mut failed);
+                self.drop_failed(failed);
+            }
+            return;
+        }
         let Some(r) = self.scenes.runs.get_mut(&run) else { return };
         if r.owner == entity {
             self.end_run(run, SceneOutcome::Aborted, now);
@@ -601,35 +664,148 @@ impl World {
 
     // ---- the end --------------------------------------------------------------------------------------------
 
-    /// End `run` as `outcome`: release everyone and, unless it was aborted, apply what the scene's script wrote, once. The run
-    /// is taken out first, so nothing that arrives for it afterwards finds it.
+    fn queue_scene_save(&mut self, run: SceneRunId, record: SceneRun, result: SceneResult, outcome: SceneOutcome) {
+        let Some(transaction) = result.transaction else { return };
+        let owner = self.players.get(&record.owner).filter(|p| p.scene == Some(run) && p.preview.is_none());
+        let Some((account, progress, inventory)) = owner.map(|p| (p.account, p.progress, p.inventory.clone())) else {
+            self.fail_scene_save(run, record, "the scene owner is no longer held");
+            return;
+        };
+        if record.then.is_some() || transaction.expected_gil != record.gil || self.account_in_battle(account) {
+            self.fail_scene_save(run, record, "the scene result does not match its resource snapshot");
+            return;
+        }
+        let job = crate::saver::SceneSaveJob {
+            account, scene_key: record.scene.clone(), expected_story: record.progress.clone(), next_story: result.progress.clone(),
+            expected_gil: transaction.expected_gil, next_gil: transaction.next_gil,
+        };
+        let done = self.saver.as_ref().ok_or(crate::saver::SceneSaveError::Stopped).and_then(|saver| saver.save_scene(job));
+        match done {
+            Ok(done) => {
+                self.scenes.save_epoch = self.scenes.save_epoch.wrapping_add(1);
+                self.scenes.pending.insert(run, PendingScene { record, account, result, outcome, progress, inventory, done });
+            }
+            Err(crate::saver::SceneSaveError::Stopped) if self.saver.is_some() => self.stop_for_scene_storage_recovery(),
+            Err(_) => self.fail_scene_save(run, record, "the scene saver is unavailable"),
+        }
+    }
+
+    /// A failed or uncertain commit never publishes a success. The owner reloads authoritative
+    /// state after recovery; watchers have no changed save and can safely leave the presentation.
+    fn fail_scene_save(&mut self, run: SceneRunId, record: SceneRun, reason: &str) {
+        self.logs.warn(format!("scene save not confirmed run={} scene={} reason={reason}", run.0, clip(&record.scene, MAX_SCENE_ID_CHARS)));
+        let mut failed = Vec::new();
+        for watcher in record.watchers {
+            if self.players.get(&watcher).is_some_and(|p| p.scene == Some(run)) {
+                self.release(watcher, run, SceneOutcome::Aborted, &mut failed);
+            }
+        }
+        if self.players.get(&record.owner).is_some_and(|p| p.scene == Some(run)) {
+            self.send_to(record.owner, ServerMsg::Reject {
+                code: fmv_protocol::RejectCode::Internal,
+                reason: "The scene save could not be confirmed. Reconnect after server storage recovery.".into(),
+            }, &mut failed);
+            if let Some(player) = self.remove_player(record.owner, &mut failed) { player.close.send_replace(true); }
+        }
+        self.drop_failed(failed);
+    }
+
+    fn finish_scene_save(&mut self, run: SceneRunId, pending: PendingScene, saved: crate::saver::SceneSaved, now: Instant) {
+        let PendingScene { record, account, result, outcome, progress, inventory: prior_inventory, .. } = pending;
+        let game = self.areas.get(&self.home).map(|area| area.id().game);
+        let valid = saved.pair.story.account_id == account && Some(saved.pair.story.game) == game
+            && saved.pair.story.blob.len() <= fmv_protocol::MAX_STORY_PROGRESS_BYTES
+            && saved.pair.character.as_ref().is_some_and(|c| c.account_id == account && Some(c.game) == game);
+        if !valid {
+            self.fail_scene_save(run, record, "the saver returned a mismatched record");
+            return;
+        }
+        let current_owner = self.players.get(&record.owner).is_some_and(|p| p.account == account && p.scene == Some(run)
+            && p.preview.is_none() && p.progression == record.progress && p.progress == progress && p.inventory == prior_inventory);
+        let at_result = saved.pair.story.blob == result.progress;
+        if current_owner {
+            let character = saved.pair.character.as_ref().expect("validated above");
+            let fixed_character = self.players.get(&record.owner).and_then(|p| p.progress).map_or(character.character, |p| p.character);
+            let stored = crate::progress::Progress::from_record(character);
+            let mut progress = self.battle.as_ref().map_or(stored, |battle| crate::progress::resolve(battle.rules(),
+                &crate::progress::ProgressSeed::of(fixed_character, Some(stored))));
+            // The host already computed the exact authored economic result. Stat repair must
+            // not turn the acknowledged gil after-image into a second, different transaction.
+            progress.gil = stored.gil;
+            let inventory = self.battle.as_ref().map(|battle| crate::inventory::Inventory::resolve(battle.rules(), character.inventory.as_deref()));
+            let player = self.players.get_mut(&record.owner).expect("checked above");
+            player.progress = Some(progress);
+            player.inventory = inventory;
+            let summary = if at_result { result.summary.clone() } else { "current saved story after scene completion".into() };
+            self.apply_saved_story_step(record.owner, SCENE_STEP_POINT, StoryStep { progress: saved.pair.story.blob, summary, countdown: None });
+        } else if self.players.contains_key(&record.owner) {
+            self.fail_scene_save(run, record, "the owner's in-memory story changed while its commit was pending");
+            return;
+        }
+        let mut failed = Vec::new();
+        if current_owner {
+            self.tell_progress(record.owner, false, &mut failed);
+            self.tell_inventory(record.owner, &mut failed);
+        }
+        let participants: Vec<_> = std::iter::once(record.owner).chain(record.watchers.iter().copied())
+            .filter(|entity| self.players.get(entity).is_some_and(|p| p.scene == Some(run))).collect();
+        for &entity in &participants { self.release(entity, run, outcome, &mut failed); }
+        // A duplicate can return later progress. Never send it to the old scene's destination.
+        if current_owner && at_result {
+            if let Some(exit) = &result.travel {
+                for entity in participants {
+                    if let Some((pos, facing)) = self.players.get(&entity).map(|p| (p.snapshot.pos, p.snapshot.facing)) {
+                        self.start_travel(entity, exit, pos, facing, now);
+                    }
+                }
+            }
+        }
+        self.logs.info(format!("scene durably ended run={} scene={} outcome={outcome:?} connected={current_owner}", run.0, record.scene));
+        self.drop_failed(failed);
+    }
+
+    /// End the presentation once. Durable results retain the hold until the saver acknowledges;
+    /// removing the active run first makes repeated ends and timeouts harmless.
     fn end_run(&mut self, run: SceneRunId, outcome: SceneOutcome, now: Instant) {
         let Some(record) = self.scenes.runs.remove(&run) else { return };
-        let mut failed = Vec::new();
-        let mut everyone = vec![record.owner];
-        everyone.extend(record.watchers.iter().copied());
-        for &e in &everyone {
-            self.release(e, run, outcome, &mut failed);
-        }
         let apply = matches!(outcome, SceneOutcome::Finished | SceneOutcome::Skipped);
         let mut result = if !apply || !record.writes_story { None } else {
             self.scenes.host.as_ref().and_then(|host| {
-                if record.preview { host.finish_preview(&record.scene, &record.progress, record.seed, &record.answers) }
-                else { host.finish(&record.scene, &record.progress, record.seed, &record.answers) }
+                if record.preview { host.finish_preview_with_resources(&record.scene, &record.progress, record.seed, &record.answers, record.gil) }
+                else { host.finish_with_resources(&record.scene, &record.progress, record.seed, &record.answers, record.gil) }
             })
         };
+        if apply && record.writes_story && !record.preview && record.then.is_none() && result.is_none() {
+            self.fail_scene_save(run, record, "the scene result could not be interpreted");
+            return;
+        }
+        let durable = !record.preview && result.as_ref().is_some_and(|r| r.transaction.is_some());
         // A story write must not strand a player when its required destination cannot load or
         // place an arrival. The same loaded area and placement are used by start_travel below.
         if !record.preview {
-            if let Some(exit) = result.as_ref().and_then(|result| result.travel.as_ref()) {
-                let valid = self.ensure_area(&exit.target).ok().and_then(|key| self.areas.get(&key))
+            if let Some(exit) = result.as_mut().and_then(|result| result.travel.as_mut()) {
+                let target = self.ensure_area(&exit.target).ok();
+                let valid = target.as_ref().and_then(|key| self.areas.get(key))
                     .is_some_and(|area| area.runtime().place_arrival(exit.arrival, exit.arrival_hint).is_finite());
                 if !valid {
                     self.logs.warn(format!("scene destination unavailable scene={} target={}", clip(&record.scene, MAX_SCENE_ID_CHARS), clip(&exit.target, 128)));
                     result = None;
+                } else if let Some(target) = target {
+                    exit.target = target;
                 }
             }
         }
+        if durable {
+            match result {
+                Some(result) => self.queue_scene_save(run, record, result, outcome),
+                None => self.fail_scene_save(run, record, "the required destination could not be loaded"),
+            }
+            return;
+        }
+        let mut failed = Vec::new();
+        let mut everyone = vec![record.owner];
+        everyone.extend(record.watchers.iter().copied());
+        for &e in &everyone { self.release(e, run, outcome, &mut failed); }
         let story = if record.then.is_some() { "the point's step" } else if !apply { "dropped" } else if !record.writes_story { "none (read-only run)" } else if let Some(result) = &result {
             self.apply_scene_story(&record, result)
         } else { "none (the scene could not be run)" };
@@ -697,12 +873,54 @@ impl World {
         for run in late {
             self.end_run(run, SceneOutcome::TimedOut, now);
         }
+        let ready: Vec<_> = self.scenes.pending.iter_mut().filter_map(|(&run, pending)| {
+            match pending.done.try_recv() {
+                Ok(result) => Some((run, result)),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => None,
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => Some((run, Err(crate::saver::SceneSaveError::WorkerFailed))),
+            }
+        }).collect();
+        for (run, result) in ready {
+            let Some(pending) = self.scenes.pending.remove(&run) else { continue };
+            self.scenes.save_epoch = self.scenes.save_epoch.wrapping_add(1);
+            match result {
+                Ok(saved) => self.finish_scene_save(run, pending, saved, now),
+                Err(error) => {
+                    let fatal = match error {
+                        crate::saver::SceneSaveError::Store(fmv_persist::PersistError::TransactionConflict(_)) => false,
+                        crate::saver::SceneSaveError::WorkerFailed | crate::saver::SceneSaveError::Stopped | crate::saver::SceneSaveError::Store(_) => true,
+                        _ => false,
+                    };
+                    if fatal { self.stop_for_scene_storage_recovery(); }
+                    else { self.fail_scene_save(run, pending.record, "the durable scene preconditions were refused"); }
+                }
+            }
+        }
     }
 
-    /// `entity` left the world (disconnected, dropped): its run is abandoned if it owned one (nothing is written), or it simply
-    /// stops watching one. `held` is the run its player was in.
+    /// The store is shared by every player. Continuing after an uncertain write would publish
+    /// rewards and story updates which its poisoned writer cannot persist.
+    fn stop_for_scene_storage_recovery(&mut self) {
+        self.scenes.storage_failed = true;
+        self.logs.warn("scene storage requires recovery; disconnecting all players and refusing admission".into());
+        let mut failed = Vec::new();
+        let entities: Vec<_> = self.players.keys().copied().collect();
+        for entity in entities {
+            self.send_to(entity, ServerMsg::Reject { code: fmv_protocol::RejectCode::Internal,
+                reason: "Server storage requires recovery. Please reconnect after the server restarts.".into() }, &mut failed);
+            if let Some(player) = self.remove_player(entity, &mut failed) { player.close.send_replace(true); }
+        }
+        self.drop_failed(failed);
+    }
+
+    /// Disconnect abandons a presentation, but cannot cancel a transaction already queued.
+    /// A pending account remains reserved until its acknowledgment; watchers can leave independently.
     pub(super) fn scene_player_gone(&mut self, entity: EntityId, held: Option<SceneRunId>) {
         let Some(run) = held else { return };
+        if let Some(pending) = self.scenes.pending.get_mut(&run) {
+            pending.record.watchers.retain(|w| *w != entity);
+            return; // An owner's disconnect cannot cancel a transaction already queued.
+        }
         let Some(r) = self.scenes.runs.get_mut(&run) else { return };
         if r.owner == entity {
             self.end_run(run, SceneOutcome::Aborted, Instant::now());
@@ -714,7 +932,7 @@ impl World {
     /// The party changed: a watcher that is no longer in its owner's party stops watching.
     pub(super) fn scene_check_parties(&mut self) {
         let mut dropped: Vec<(SceneRunId, EntityId)> = Vec::new();
-        for (id, r) in &self.scenes.runs {
+        for (id, r) in self.scenes.runs.iter().chain(self.scenes.pending.iter().map(|(id, pending)| (id, &pending.record))) {
             let Some(owner) = self.players.get(&r.owner) else { continue };
             let party = self.parties.party_of(owner.account);
             for &w in &r.watchers {
@@ -729,6 +947,7 @@ impl World {
             if let Some(r) = self.scenes.runs.get_mut(&id) {
                 r.watchers.retain(|x| *x != w);
             }
+            if let Some(pending) = self.scenes.pending.get_mut(&id) { pending.record.watchers.retain(|x| *x != w); }
             self.release(w, id, SceneOutcome::Aborted, &mut failed);
         }
         self.drop_failed(failed);
@@ -807,6 +1026,7 @@ impl World {
         let Some(host) = self.scenes.host.clone() else { return };
         let Some(player) = self.players.get(&entity) else { return };
         if player.preview.is_some() || player.transit.is_some() || player.battle.is_some() || player.scene.is_some() { return; }
+        if self.account_in_battle(player.account) { return; }
         let area = player.area.clone();
         // Arrival scenes are private to this player, even when its shared field follows the
         // party leader's phase. Judge and replay only the player's own story, never the leader's.
@@ -816,7 +1036,8 @@ impl World {
         let run = SceneRunId(self.scenes.next_run.max(1));
         self.scenes.next_run = run.0.saturating_add(1);
         let seed = u32::try_from(run.0.wrapping_mul(0x9E37_79B9) & 0xFFFF_FFFF).unwrap_or(1);
-        let record = SceneRun { scene: info.id, owner: entity, watchers: vec![], seed, progress, answers: vec![], steps: 0,
+        let record = SceneRun { scene: info.id, owner: entity, watchers: vec![], seed, progress,
+            gil: player.progress.map_or(0, |p| p.gil), answers: vec![], steps: 0,
             started: now, last_activity: now, writes_story: true, preview: false, then: None };
         self.start_run(run, record, &mut Vec::new());
     }

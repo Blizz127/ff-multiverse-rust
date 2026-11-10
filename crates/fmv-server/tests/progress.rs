@@ -533,12 +533,13 @@ async fn a_member_who_left_mid_battle_is_still_paid_in_the_store() {
 /// an enemy that Poison kills, so its replay would diverge; v14: it never sends `Interact`, so it could not ride the lift,
 /// talk to the characters that move the story or climb a ladder that waits for OK; v15: it cannot decode the `Countdown`
 /// the Guard Scorpion's step starts; v16: it cannot decode a character delete or its answer; v17: it never commands the
-/// canon companions, whose turns a v17 server leaves to the player; v18: it cannot decode a story scene's messages).
+/// canon companions, whose turns a v17 server leaves to the player; v18: it cannot decode a story scene's messages;
+/// v19: earlier peers lack the owner's authoritative gil snapshot for resource-dependent scene branches).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_client_of_the_previous_protocol_version_is_refused_at_the_handshake() {
-    assert_eq!(PROTOCOL_VERSION, 18);
+    assert_eq!(PROTOCOL_VERSION, 19);
     let server = TestServer::start(fast(None)).await;
-    for old_version in [17u16, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4] {
+    for old_version in [18u16, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4] {
         let mut old = Client::connect(server.addr).await;
         // A v8 to v17 Hello asks for a character (and reads as a v18 Hello); the older ones carried a colour and a look.
         let hello = if old_version >= 8 {

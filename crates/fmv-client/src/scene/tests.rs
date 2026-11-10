@@ -18,7 +18,7 @@ use crate::state::{ClientState, NpcView};
 use crate::ui::hud::Subject;
 use fmv_core::{AccountId, AnimState, AreaId, EntityId, GameId, Pos};
 use fmv_ff7::script::dialogue::{Choice, End, Message, MessageOrigin, Piece};
-use fmv_ff7::script::scene::{Beat, CameraOp, CastMember, Look, MoveHow, SceneDef, Spot, Stage, Then, Timed, Trigger, Window};
+use fmv_ff7::script::scene::{Beat, CameraOp, CastMember, SceneResources, Look, MoveHow, SceneDef, Spot, Stage, Then, Timed, Trigger, Window};
 use fmv_protocol::{SceneOutcome, SceneParticipant, SceneRefusal, SceneRole, SceneRunId, ServerMsg, MAX_SCENE_STEPS, SCENE_NPC_ID_BASE};
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -149,11 +149,11 @@ fn private_echo_sends_original_choice_and_voice_cues() {
 fn private_scene_builder_is_used_only_for_a_lone_owner() {
     struct Probe { private: Rc<RefCell<u32>>, regular: Rc<RefCell<u32>> }
     impl SceneBuilder for Probe {
-        fn build(&mut self, _: &str, _: &fmv_ff7::story::StoryState, _: u32) -> Result<Built, String> {
+        fn build(&mut self, _: &str, _: &fmv_ff7::story::StoryState, _: u32, _: SceneResources) -> Result<Built, String> {
             *self.regular.borrow_mut() += 1;
             Err("test".into())
         }
-        fn build_private(&mut self, _: &str, _: &fmv_ff7::story::StoryState, _: u32) -> Result<Built, String> {
+        fn build_private(&mut self, _: &str, _: &fmv_ff7::story::StoryState, _: u32, _: SceneResources) -> Result<Built, String> {
             *self.private.borrow_mut() += 1;
             Err("test".into())
         }
@@ -181,8 +181,9 @@ struct Fake {
 }
 
 impl SceneBuilder for Fake {
-    fn build(&mut self, scene: &str, story: &fmv_ff7::story::StoryState, seed: u32) -> Result<Built, String> {
+    fn build(&mut self, scene: &str, story: &fmv_ff7::story::StoryState, seed: u32, resources: SceneResources) -> Result<Built, String> {
         assert_eq!((scene, story.moment, seed), (SCENE, 72, 5), "the scene, the story and the seed the server sent");
+        assert_eq!(resources.gil, Some(7), "the server snapshot, not an unknown balance");
         *self.built.borrow_mut() += 1;
         if self.fail {
             return Err("test: no data".to_string());
@@ -234,6 +235,7 @@ fn start(run: SceneRunId, you: SceneRole, spots: &[(u64, u8)]) -> ServerMsg {
         scene: SCENE.to_string(),
         seed: 5,
         progress: PROGRESS.to_vec(),
+        gil: 7,
         owner: EntityId(1),
         participants: spots.iter().map(|&(entity, spot)| SceneParticipant { entity: EntityId(entity), spot }).collect(),
         you,
@@ -1943,7 +1945,7 @@ fn a_scene_of_another_field_or_a_story_that_cannot_be_read_is_not_played_either(
     let mut rig = rig_with(talk(), false);
     rig.client.on_message(
         AREA,
-        ServerMsg::SceneStart { run: RUN, scene: SCENE.into(), seed: 5, progress: vec![9, 9, 9, 9], owner: EntityId(1), participants: vec![], you: SceneRole::Watcher },
+        ServerMsg::SceneStart { run: RUN, scene: SCENE.into(), seed: 5, progress: vec![9, 9, 9, 9], gil: 7, owner: EntityId(1), participants: vec![], you: SceneRole::Watcher },
     );
     assert!(!rig.client.is_active());
     assert_eq!(*rig.built.borrow(), 0, "nothing was built from a story that is not readable");
@@ -2224,5 +2226,54 @@ fn scene_sound_clock_prefetch_pause_stop_and_cancel_follow_both_roles() {
         rig.client.take_sounds();
         rig.client.on_message(AREA, ServerMsg::SceneEnded { run: RUN, outcome });
         assert_eq!(rig.client.take_sounds().iter().map(|c| c.action).collect::<Vec<_>>(), [SoundAction::End]);
+    }
+}
+
+#[test]
+fn every_scene_participant_builds_the_branch_from_the_owners_authoritative_gil_snapshot() {
+    // This builder makes the resource-dependent branch visible through the real ScenePlayer:
+    // known zero is the unavailable branch, while even a single gil permits the offer. The same
+    // resource must reach both private and shared construction; watchers never use a local wallet.
+    type Captured = Rc<RefCell<Vec<(bool, SceneResources)>>>;
+    struct ResourceBranch(Captured);
+    impl ResourceBranch {
+        fn make(&mut self, private: bool, resources: SceneResources) -> Result<Built, String> {
+            self.0.borrow_mut().push((private, resources));
+            let gil = resources.gil.ok_or_else(|| "authoritative gil missing".to_string())?;
+            let dialog = if gil == 0 { 10 } else { 11 };
+            Ok(Built { def: def(), source: Box::new(Scripted {
+                initial: places(), beats: vec![say(0, 18, 18, dialog), end(0)].into(), asked: Asked::default(),
+            }) })
+        }
+    }
+    impl SceneBuilder for ResourceBranch {
+        fn build(&mut self, _: &str, _: &fmv_ff7::story::StoryState, _: u32, resources: SceneResources) -> Result<Built, String> {
+            self.make(false, resources)
+        }
+        fn build_private(&mut self, _: &str, _: &fmv_ff7::story::StoryState, _: u32, resources: SceneResources) -> Result<Built, String> {
+            self.make(true, resources)
+        }
+        fn reach(&mut self, _: usize, _: &str) -> Option<f32> { None }
+    }
+    for gil in [0, 1, 500, u32::MAX] {
+        let captured = Captured::default();
+        for (role, spots, private) in [
+            (SceneRole::Owner, vec![(1, 0)], true),
+            (SceneRole::Owner, vec![(1, 0), (2, 1)], false),
+            (SceneRole::Watcher, vec![(1, 0), (2, 1)], false),
+        ] {
+            let mut client = SceneClient::new();
+            client.set_instant(true);
+            client.set_builder(Box::new(ResourceBranch(captured.clone())));
+            let mut message = start(RUN, role, &spots);
+            if let ServerMsg::SceneStart { gil: snapshot, .. } = &mut message { *snapshot = gil; }
+            client.on_message(AREA, message);
+            assert_eq!(captured.borrow().last(), Some(&(private, SceneResources { gil: Some(gil) })));
+            let player = client.player().expect("scene is available");
+            assert_eq!(player.panel().unwrap().window().message.origin, MessageOrigin::Canon {
+                entity: 18, dialog: if gil == 0 { 10 } else { 11 },
+            });
+        }
+        assert_eq!(captured.borrow().len(), 3);
     }
 }

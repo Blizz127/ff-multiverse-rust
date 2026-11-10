@@ -150,7 +150,7 @@ mod saver;
 pub mod scene_host;
 mod world;
 
-pub use world::{SceneHost, SceneInfo, SceneReply, SceneResult, SceneSettings, TriggerInfo};
+pub use world::{SceneHost, SceneInfo, SceneReply, SceneResult, SceneSettings, SceneTransaction, TriggerInfo};
 
 pub use accounts::MAX_APPEARANCE_REF;
 

@@ -26,10 +26,11 @@
 //! names the nibble that governs it (nibble 0 = high nibble of the first bank byte). When a bank
 //! byte serves a single operand its nibble is usually the low one (the pages write that as
 //! `0 / B2`; the owned data confirm it for `INC`, `DEC`, `RANDOM`, `BGCLR`, `DIR`, `TALKR`, ...).
-//! **The exceptions are the 32-bit operands of `WNUMB`, `GOLDu` and `GOLDd`, which use the high
-//! nibble**: the data show non-zero high nibbles and always-zero low nibbles for them, so do not
-//! "fix" those three back to nibble 1 (the `stray_banks` check of the real-data survey would
-//! flag it).
+//! `WNUMB` currently uses a combined 32-bit operand governed by the high nibble.
+//! `GOLDu`/`GOLDd` have two independently banked 16-bit halves (low, then high). The owned
+//! scripts happen to use a literal high half; original-engine disassembly establishes the
+//! second selector as meaningful too (`q-gears-reversing-data`, `opcodes_party.cpp`, 800D3BB4/800D3C44).
+
 
 use super::decode::JumpDir;
 
@@ -153,8 +154,8 @@ pub(crate) fn info(op: u8) -> Option<OpInfo> {
         0x36 => op!("WSPCL", [U8("window"), U8("type"), U8("margin_left"), U8("margin_top")]),
         0x37 => op!("WNUMB", [Banks(1), U8("window"), Bs32("value", 0), U8("digits")]),
         0x38 => op!("STTIM", [Banks(2), Bu8("hours", 0), Bu8("minutes", 1), Bu8("seconds", 2)]),
-        0x39 => op!("GOLDu", [Banks(1), Bs32("amount", 0)]),
-        0x3A => op!("GOLDd", [Banks(1), Bs32("amount", 0)]),
+        0x39 => op!("GOLDu", [Banks(1), Bu16("amount_lo", 0), Bu16("amount_hi", 1)]),
+        0x3A => op!("GOLDd", [Banks(1), Bu16("amount_lo", 0), Bu16("amount_hi", 1)]),
         0x3B => op!("CHGLD", [Banks(1), Bu8("var1", 0), Bu8("var2", 1)]),
         0x3C => op!("HMPMAX1", []),
         0x3D => op!("HMPMAX2", []),

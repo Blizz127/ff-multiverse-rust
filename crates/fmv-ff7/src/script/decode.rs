@@ -383,7 +383,7 @@ impl<'a> Decoder<'a> {
         Ok(())
     }
 
-    fn finish(self, mnemonic: &'static str, sub: Option<(u8, &'static str)>, payload: Vec<u8>) -> Instruction {
+    fn finish(mut self, mnemonic: &'static str, sub: Option<(u8, &'static str)>, payload: Vec<u8>) -> Instruction {
         let stray_banks = (0..self.nibble_count).any(|i| self.used_nibbles & (1u32 << i) == 0 && self.nibbles.get(i).copied().unwrap_or(0) != 0);
         let jump_target = self.jump.as_ref().and_then(|j| {
             let anchor = match j.dir {
@@ -397,6 +397,14 @@ impl<'a> Decoder<'a> {
                 JumpDir::Backward => anchor.checked_sub(distance),
             }
         });
+        // Keep the convenient literal amount for diagnostics. A variable half cannot honestly
+        // be represented by a single banked 32-bit operand, so it gets no such alias.
+        if matches!(self.opcode, 0x39 | 0x3A) {
+            let half = |name| self.operands.iter().find(|o| o.name == name).and_then(Operand::literal);
+            if let (Some(lo), Some(hi)) = (half("amount_lo"), half("amount_hi")) {
+                self.push("amount", ((lo as u32) | ((hi as u32) << 16)) as i32, 0);
+            }
+        }
         Instruction {
             offset: self.offset(),
             len: self.cur - self.start,

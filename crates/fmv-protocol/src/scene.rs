@@ -2,13 +2,14 @@
 //! watch it; its lines are the game's own, read by every client from its own files.
 //!
 //! These messages add variants to [`ClientMsg`](crate::ClientMsg) and [`ServerMsg`](crate::ServerMsg).
-//! Protocol v18 rejects older peers, which cannot decode them or participate in a scene hold.
+//! Protocol v19 requires a scene's starting gil snapshot too: older peers cannot use or supply it,
+//! and are refused at the handshake rather than replaying different money-dependent branches.
 //!
 //! # What crosses the wire, and what does not
 //!
-//! Only ids, numbers and choices: a scene's id, a seed, the story it plays against, who takes part, which window the
+//! Only ids, numbers and choices: a scene's id, a seed, the story and starting gil it plays against, who takes part, which window the
 //! owner has moved past and what it answered. **No dialogue, no model, no script byte ever travels.** Every client builds
-//! the same scene from its OWN copy of the field (`fmv_ff7::script::scene`, deterministic for the same scene, story and
+//! the same scene from its OWN copy of the field (`fmv_ff7::script::scene`, deterministic for the same scene, story, gil and
 //! seed), so the lines of the owner and of the watchers are the same lines in the same order.
 //!
 //! # The flow
@@ -16,7 +17,7 @@
 //! ```text
 //! (S -> C  AreaSnapshot { npcs: [.. a scene NPC, id >= SCENE_NPC_ID_BASE ..] })       the trigger is on offer
 //! C -> S  Interact { npc: Some(SCENE_NPC_ID_BASE + n) }                              OK next to it
-//! S -> C  SceneStart { run, scene, seed, progress, owner, participants, you }        every participant
+//! S -> C  SceneStart { run, scene, seed, progress, gil, owner, participants, you }        every participant
 //!         ... each client plays the scene locally; the player is held (no moves, no encounters, no OK) ...
 //! C -> S  SceneStep { run, step, answer }                                            the owner moved past window `step`
 //! S -> C  SceneStep { run, step, answer }                                            every watcher (not the owner)
@@ -26,7 +27,8 @@
 //!
 //! * A scene is held by the SERVER: it chooses the seed, decides who may watch (party members of the owner that stand in
 //!   the same instance, in range, not in a battle, at most [`MAX_SCENE_WATCHERS`]), numbers the run, enforces time limits
-//!   and ends it whatever a client says or fails to say.
+//!   and ends it whatever a client says or fails to say. The server sends the same starting `gil` to every participant;
+//!   watchers must use that snapshot, never their own balances, when a script reads money.
 //! * The **owner** drives. Its windows open and close on its own keys; each window it moves past is reported once, in
 //!   order (`step` counts from 0), with the absolute line number it chose when the window asked. The server checks the
 //!   order and relays it to the watchers, whose clients open each window when the owner moves past the one before.
@@ -127,12 +129,13 @@ mod tests {
                 scene: "ff7/mds7pb_1/tifa-bar".into(),
                 seed: 41,
                 progress: vec![1, 72, 0],
+                gil: 1,
                 owner: EntityId(3),
                 participants: vec![SceneParticipant { entity: EntityId(3), spot: 0 }, SceneParticipant { entity: EntityId(4), spot: 1 }],
                 you: SceneRole::Watcher,
             },
             concat!(
-                r#"{"SceneStart":{"run":7,"scene":"ff7/mds7pb_1/tifa-bar","seed":41,"progress":[1,72,0],"owner":3,"#,
+                r#"{"SceneStart":{"run":7,"scene":"ff7/mds7pb_1/tifa-bar","seed":41,"progress":[1,72,0],"gil":1,"owner":3,"#,
                 r#""participants":[{"entity":3,"spot":0},{"entity":4,"spot":1}],"you":"Watcher"}}"#
             ),
         );
@@ -143,7 +146,40 @@ mod tests {
 
     #[test]
     fn scenes_require_the_new_protocol() {
-        assert_eq!(crate::PROTOCOL_VERSION, 18);
+        assert_eq!(crate::PROTOCOL_VERSION, 19);
+    }
+
+    #[test]
+    fn a_scene_start_requires_the_servers_gil_snapshot_and_refuses_out_of_range_values() {
+        let old = r#"{"SceneStart":{"run":7,"scene":"ff7/md8_2/station","seed":41,"progress":[1,36,0],"owner":3,"participants":[{"entity":3,"spot":0}],"you":"Owner"}}"#;
+        let err = crate::decode::<ServerMsg>(old.as_bytes()).unwrap_err();
+        assert!(err.to_string().contains("missing field `gil`"), "{err}");
+        for invalid in ["null", "-1", "4294967296", "1.5", "\"1\""] {
+            let bad = old.replace("\"owner\":3", &format!("\"gil\":{invalid},\"owner\":3"));
+            assert!(crate::decode::<ServerMsg>(bad.as_bytes()).is_err(), "accepted gil {invalid}");
+        }
+        let hello_v18 = br#"{"Hello":{"protocol_version":18,"client_build":"c","auth":{"Token":"x"},"character":{"tint":[0,0,0]}}}"#;
+        assert_eq!(crate::probe_hello_version(hello_v18), Some(18));
+        assert_ne!(crate::probe_hello_version(hello_v18), Some(crate::PROTOCOL_VERSION));
+    }
+
+    #[test]
+    fn a_scene_start_round_trips_its_exact_starting_gil_for_owner_and_watchers() {
+        for gil in [0, 1, u32::MAX] {
+            for you in [SceneRole::Owner, SceneRole::Watcher] {
+                let msg = ServerMsg::SceneStart {
+                    run: SceneRunId(7), scene: "ff7/md8_2/station".into(), seed: 41,
+                    progress: vec![1, 36, 0], gil, owner: EntityId(3),
+                    participants: vec![SceneParticipant { entity: EntityId(3), spot: 0 }, SceneParticipant { entity: EntityId(4), spot: 1 }],
+                    you,
+                };
+                let encoded = crate::encode(&msg).unwrap();
+                assert_eq!(u32::from_le_bytes(encoded[..4].try_into().unwrap()) as usize, encoded.len() - 4);
+                assert_eq!(crate::decode::<ServerMsg>(&encoded[4..]).unwrap(), msg);
+                let json: serde_json::Value = serde_json::from_slice(&encoded[4..]).unwrap();
+                assert_eq!(json["SceneStart"]["gil"], gil, "even zero must be present on the wire");
+            }
+        }
     }
 
     #[test]

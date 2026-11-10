@@ -405,6 +405,33 @@ fn a_field_that_never_compares_the_counter_has_one_phase_for_everybody() {
 // ---- story points: a triangle ----
 
 #[test]
+fn extended_saves_withhold_legacy_points_talks_and_panels_until_they_have_exact_base_transactions() {
+    let section = field_script(6, 0, 1, Some(0));
+    let script = FieldScript::parse(&section).unwrap();
+    let mut story = AreaStory::scan(&script, &mesh(13));
+    story.points[0].battle_first = Some(300);
+    assert!(story.advance(&at(1), 0).is_some());
+    assert_eq!(story.battle_of(0), Some(300));
+    let extended = StoryState::at(1).into_extended().unwrap().encode();
+    assert_eq!(story.advance(&extended, 0), None, "no point is published to authorize its battle");
+    assert_eq!(story.advance_with(&script, &extended, 0), None);
+
+    let (section, npcs) = field_with_talks();
+    let script = FieldScript::parse(&section).unwrap();
+    let mut story = AreaStory::scan(&script, &mesh(5));
+    story.add_talk_points(&script, &npcs);
+    assert!(story.advance_with(&script, &at(13), 0).is_some());
+    assert_eq!(story.advance_with(&script, &StoryState::at(13).into_extended().unwrap().encode(), 0), None);
+
+    let section = field_with_player(|s| s.entity("ele", vec![(0, the_panel_with_both_rides())]).entity("lift", vec![(3, concat(&[bitoff(1, 225, 0), ret()]))]));
+    let script = FieldScript::parse(&section).unwrap();
+    let story = AreaStory::scan(&script, &mesh(9));
+    let down = lifted(12);
+    assert!(story.advance_with(&script, &down.encode(), 1).is_some());
+    assert_eq!(story.advance_with(&script, &down.into_extended().unwrap().encode(), 1), None);
+}
+
+#[test]
 fn stepping_onto_the_triangle_of_the_loop_advances_a_player_whose_story_matches() {
     let story = scan(&field_script(6, 0, 1, Some(0)), &mesh(13));
     assert_eq!(story.point_count(), 1);

@@ -43,7 +43,7 @@
 //! checks an exact story predecessor, and commits story and resource changes together. Its receipt
 //! survives reconnects and later rewards. The caller receives a durable acknowledgement before it
 //! may publish progress or release a held scene. An uncertain error is never retried here; the store
-//! must recover first. This queue API is groundwork for the scene world's commit-and-release path.
+//! must recover first. The scene world uses this acknowledgement to commit and release.
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -121,7 +121,7 @@ pub(crate) struct StoryJob {
 }
 
 /// A scene result computed by the authoritative game interpreter. The saver checks the exact
-/// story predecessor and available gil after all earlier queued rewards have reached storage.
+/// story and gil predecessors after all earlier queued rewards have reached storage.
 /// The world must keep participants held until the acknowledgement succeeds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SceneSaveJob {
@@ -129,7 +129,10 @@ pub(crate) struct SceneSaveJob {
     pub scene_key: String,
     pub expected_story: Vec<u8>,
     pub next_story: Vec<u8>,
-    pub gil_debit: u32,
+    /// The authoritative interpreter evaluated the scene against this resource snapshot.
+    pub expected_gil: u32,
+    /// Exact authored result (including the game's saturation rules); the saver never invents arithmetic.
+    pub next_gil: u32,
 }
 
 /// A coherent stored pair after the scene has durably committed. On a duplicate it may contain
@@ -148,8 +151,8 @@ pub(crate) enum SceneSaveError {
     StaleStory,
     #[error("the scene requires existing character progress")]
     MissingCharacter,
-    #[error("there is not enough gil for the scene's selected choice")]
-    InsufficientGil,
+    #[error("the scene's gil precondition changed")]
+    StaleGil,
     #[error("the saver is not accepting scene requests")]
     Stopped,
     #[error("the scene save worker did not complete; reopen the store before retrying")]
@@ -160,11 +163,11 @@ pub(crate) enum SceneSaveError {
 
 impl SceneSaveJob {
     /// Stable selected-result identity. Length framing keeps arbitrary game blobs unambiguous;
-    /// timestamps and character totals are deliberately excluded so later rewards do not cause
-    /// a duplicate command to spend again. The receipt itself binds the prior story and scene.
+    /// timestamps are excluded; the original resource precondition and result remain stable
+    /// across a retry even when later rewards have changed the stored total. The receipt itself binds the prior story and scene.
     fn selected_result(&self) -> Result<Vec<u8>, SceneSaveError> {
-        const HEADER: &[u8] = b"fmv-scene-debit-v1\0";
-        let overhead = HEADER.len() + 8;
+        const HEADER: &[u8] = b"fmv-scene-gil-v2\0";
+        let overhead = HEADER.len() + 12;
         if self.scene_key.is_empty() || self.scene_key.len() > 256 || self.scene_key.chars().any(char::is_control)
             || self.expected_story.len() > fmv_protocol::MAX_STORY_PROGRESS_BYTES
             || self.next_story.len() > fmv_protocol::MAX_STORY_PROGRESS_BYTES {
@@ -174,7 +177,8 @@ impl SceneSaveJob {
         result.extend_from_slice(HEADER);
         result.extend_from_slice(&(self.next_story.len() as u32).to_le_bytes());
         result.extend_from_slice(&self.next_story);
-        result.extend_from_slice(&self.gil_debit.to_le_bytes());
+        result.extend_from_slice(&self.expected_gil.to_le_bytes());
+        result.extend_from_slice(&self.next_gil.to_le_bytes());
         Ok(result)
     }
 }
@@ -352,7 +356,8 @@ pub(crate) fn persist_scene(store: &Store, game: GameId, job: &SceneSaveJob, now
     if before.story.blob != job.expected_story { return Err(SceneSaveError::StaleStory); }
     let mut next = before.clone();
     let character = next.character.as_mut().ok_or(SceneSaveError::MissingCharacter)?;
-    character.gil = character.gil.checked_sub(job.gil_debit).ok_or(SceneSaveError::InsufficientGil)?;
+    if character.gil != job.expected_gil { return Err(SceneSaveError::StaleGil); }
+    character.gil = job.next_gil;
     character.updated_at = now;
     next.story.blob = job.next_story.clone();
     next.story.updated_at = now;
@@ -829,7 +834,7 @@ mod tests {
     }
 
     fn scene_job(account: AccountId, debit: u32) -> SceneSaveJob {
-        SceneSaveJob { account, scene_key: "ff7/md8_2/flower".into(), expected_story: moment(36), next_story: moment(39), gil_debit: debit }
+        SceneSaveJob { account, scene_key: "ff7/md8_2/flower".into(), expected_story: moment(36), next_story: moment(39), expected_gil: 1, next_gil: 1 - debit }
     }
 
     fn scene_store(gil: u32) -> (tempfile::TempDir, Arc<Store>, AccountId) {
@@ -864,10 +869,10 @@ mod tests {
     }
 
     #[test]
-    fn scene_save_refuses_insufficient_funds_stale_story_missing_character_and_oversized_requests_without_writes() {
+    fn scene_save_refuses_stale_gil_or_story_missing_character_and_oversized_requests_without_writes() {
         let (_dir, store, account) = scene_store(0);
         let before = store.get_progress_pair(account, GameId::Ff7).unwrap();
-        assert!(matches!(persist_scene(&store, GameId::Ff7, &scene_job(account, 1), NOW + 1), Err(SceneSaveError::InsufficientGil)));
+        assert!(matches!(persist_scene(&store, GameId::Ff7, &scene_job(account, 1), NOW + 1), Err(SceneSaveError::StaleGil)));
         assert!(matches!(persist_scene(&store, GameId::Ff7, &SceneSaveJob { expected_story: moment(35), ..scene_job(account, 0) }, NOW + 1), Err(SceneSaveError::StaleStory)));
         assert!(matches!(persist_scene(&store, GameId::Ff7, &SceneSaveJob { next_story: vec![0; fmv_protocol::MAX_STORY_PROGRESS_BYTES + 1], ..scene_job(account, 0) }, NOW + 1), Err(SceneSaveError::InvalidRequest)));
         assert!(matches!(persist_scene(&store, GameId::Ff7, &SceneSaveJob { scene_key: "bad\nkey".into(), ..scene_job(account, 0) }, NOW + 1), Err(SceneSaveError::InvalidRequest)));
@@ -893,7 +898,7 @@ mod tests {
     fn scene_save_nonpurchase_advances_the_story_without_changing_resources() {
         let (_dir, store, account) = scene_store(23);
         let mut character = store.get_character_progress(account, GameId::Ff7).unwrap().unwrap();
-        let request = scene_job(account, 0);
+        let request = SceneSaveJob { expected_gil: 23, next_gil: 23, ..scene_job(account, 0) };
         let saved = persist_scene(&store, GameId::Ff7, &request, NOW + 1).unwrap();
         character.schema_version = 2;
         character.updated_at = NOW + 1;
@@ -915,7 +920,7 @@ mod tests {
         let repeated = persist_scene(&reopened, GameId::Ff7, &request, NOW + 3).unwrap();
         assert_eq!(repeated.commit, fmv_persist::SceneCommit::AlreadyApplied);
         assert_eq!(repeated.pair, later, "a duplicate returns current progress including later rewards");
-        let different = SceneSaveJob { gil_debit: 0, ..request };
+        let different = SceneSaveJob { next_gil: 1, ..request };
         assert!(matches!(persist_scene(&reopened, GameId::Ff7, &different, NOW + 3), Err(SceneSaveError::Store(PersistError::TransactionConflict(_)))));
         assert_eq!(reopened.get_progress_pair(account, GameId::Ff7).unwrap(), later);
     }
@@ -925,7 +930,7 @@ mod tests {
         let (_dir, store, account) = scene_store(0);
         let saver = Saver::spawn(Arc::clone(&store), GameId::Ff7, Some(rules()), adapter());
         let handle = saver.handle();
-        assert!(matches!(handle.save_scene(scene_job(account, 1)).unwrap().await.unwrap(), Err(SceneSaveError::InsufficientGil)));
+        assert!(matches!(handle.save_scene(scene_job(account, 1)).unwrap().await.unwrap(), Err(SceneSaveError::StaleGil)));
         assert!(handle.save(job(account, 0, 0, 1, 0)));
         let finished = handle.save_scene(scene_job(account, 1)).unwrap();
         drop(finished); // disconnect after enqueue

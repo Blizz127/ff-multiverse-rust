@@ -56,7 +56,7 @@ impl SceneHost for FakeHost {
     }
     fn finish(&self, _scene: &str, progress: &[u8], _seed: u32, _answers: &[u8]) -> Option<SceneResult> {
         let after = if progress == MADE_UP { vec![9, 5] } else { vec![5] };
-        Some(SceneResult { progress: after, changed: true, summary: "moment=1->5".into(), travel: None })
+        Some(SceneResult { progress: after, changed: true, summary: "moment=1->5".into(), travel: None, transaction: None })
     }
 }
 

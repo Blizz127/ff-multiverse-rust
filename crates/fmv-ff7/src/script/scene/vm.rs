@@ -58,6 +58,34 @@ use std::collections::{BTreeMap, BTreeSet};
 /// Field frames per second (the clock of [`Timed::at`]).
 pub const FRAMES_PER_SECOND: u32 = 30;
 
+/// Authoritative resources at the beginning of a scene. `None` is unknown, never an assumed
+/// balance of zero. A preview may supply an explicitly synthetic balance, but cannot save it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SceneResources {
+    pub gil: Option<u32>,
+}
+
+pub type Resources = SceneResources;
+
+/// Economic instructions in execution order, including reads used by script branches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GilOp {
+    Add(u32),
+    Subtract(u32),
+    Read,
+}
+
+/// Resource observations and after-image. Nothing here changes shared state: the host must
+/// compare the authoritative before-image and durably commit this together with the story.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ResourceOutcome {
+    pub gil_before: Option<u32>,
+    pub gil_after: Option<u32>,
+    pub gil_ops: Vec<GilOp>,
+    /// An instruction needed gil or an amount without an authoritative input. Such a run cannot be committed.
+    pub unknown_gil: bool,
+}
+
 /// Move speed a script has not set (`MSPED`): a walk.
 const DEFAULT_MOVE_SPEED: i32 = 1024;
 /// `MSPED` units per walkmesh unit per frame at field scale 512: 1024 walks at 2 units a frame and 4096 runs at 8,
@@ -557,6 +585,7 @@ pub struct Vm {
     geometry: BTreeMap<u8, (i16, i16, u16, u16)>,
     /// What the scripts did to the party, in the order they did it (setup included): see [`Vm::party_ops`].
     party_ops: Vec<PartyOp>,
+    resources: ResourceOutcome,
     stats: Stats,
 }
 
@@ -596,9 +625,19 @@ impl Vm {
             camera_end: 0,
             geometry: BTreeMap::new(),
             party_ops: Vec::new(),
+            resources: ResourceOutcome::default(),
             stats: Stats::default(),
         }
     }
+
+    pub fn with_resources(vars: SceneVars, seed: u32, limits: Limits, resources: SceneResources) -> Self {
+        let mut vm = Self::new(vars, seed, limits);
+        vm.resources.gil_before = resources.gil;
+        vm.resources.gil_after = resources.gil;
+        vm
+    }
+
+    pub fn resources(&self) -> &ResourceOutcome { &self.resources }
 
     /// The party as the scene's scripts see it: the story's own, with what they have done to it so far.
     fn party_now(&self) -> Vec<u8> {
@@ -769,6 +808,84 @@ impl Vm {
     fn dest(ins: &Instruction, name: &str) -> Option<(u8, u8)> {
         let op = ins.operand(name)?;
         (op.bank != 0).then(|| (op.bank, u8::try_from(op.value & 0xFF).unwrap_or(0)))
+    }
+
+    // Original PSX handlers 800D3BB4/800D3C44 and gil helpers 80025B10/80025B48:
+    // https://github.com/q-gears/q-gears-reversing-data/tree/2b155a8c5455f5fc8addd2eda9e5cd4c226abe34/reversing/ffvii
+    // Amounts consist of two independently banked halves. A selector determines byte/word
+    // access even though the immediate operand occupies two bytes. No code is copied here.
+    // Arithmetic independently agrees with the reconstructed PC FF7MENU.lib helpers
+    // C_006CBC7C/C_006CBCB9 in ergonomy-joe/ff7-worldmap@bc7576e68b118e776ccefecfbc982a702a7f9e0f
+    // (static disassembly; not a byte-match against the owner's original executable).
+    fn resource_half(&self, ins: &Instruction, name: &str) -> Option<u16> {
+        let op = ins.operand(name)?;
+        if op.bank == 0 { return Some(op.value as u16); }
+        let address = (op.value & 255) as u8;
+        let wide = match op.bank {
+            1 | 3 | 5 | 11 | 13 | 15 => false,
+            2 | 4 | 6 | 7 | 12 | 14 => true,
+            _ => return None,
+        };
+        let read = |address| {
+            let value = self.var_byte(op.bank, address);
+            let known = self.vars.story.known_mask(op.bank, address) | self.written_mask(op.bank, address);
+            // Temporary variables have the field's initial zero value; a persistent missing
+            // byte is unknown even if a preview's Given happened to supply a convenient value.
+            (matches!(op.bank, 5 | 6) || known == 255).then_some(value)
+        };
+        let low = read(address)?;
+        Some(if wide { u16::from_le_bytes([low, read(address.checked_add(1)?)?]) } else { u16::from(low) })
+    }
+
+    fn change_gil(&mut self, ins: &Instruction, class: &mut Class) {
+        let amount = self.resource_half(ins, "amount_lo").zip(self.resource_half(ins, "amount_hi"))
+            .map(|(lo, hi)| u32::from(lo) | (u32::from(hi) << 16));
+        let Some(amount) = amount else {
+            self.resources.unknown_gil = true;
+            self.resources.gil_after = None;
+            *class = Class::Unknown;
+            return;
+        };
+        let operation = if ins.opcode == 0x39 { GilOp::Add(amount) } else { GilOp::Subtract(amount) };
+        self.resources.gil_ops.push(operation);
+        let Some(before) = self.resources.gil_after else {
+            self.resources.unknown_gil = true;
+            *class = Class::Ignored;
+            if ins.opcode == 0x39 { self.gift_not_given = true; }
+            return;
+        };
+        // The original helpers saturate at the storage limits, not the displayed 99,999,999.
+        // GOLDd ignores the helper's return, so an insufficient debit reaches zero and continues.
+        let after = if ins.opcode == 0x39 { before.saturating_add(amount) } else { before.saturating_sub(amount) };
+        self.resources.gil_after = Some(after);
+        if after != before { self.epoch = self.epoch.wrapping_add(1); }
+    }
+
+    fn read_gil(&mut self, ins: &Instruction, class: &mut Class) {
+        self.resources.gil_ops.push(GilOp::Read);
+        let Some(gil) = self.resources.gil_after else {
+            self.resources.unknown_gil = true;
+            *class = Class::Ignored;
+            return;
+        };
+        let destination = |name| {
+            let (bank, address) = Self::dest(ins, name)?;
+            let wide = match bank {
+                1 | 3 | 5 | 11 | 13 | 15 => false,
+                2 | 4 | 6 | 7 | 12 | 14 => true,
+                _ => return None,
+            };
+            (!wide || address < 255).then_some((bank, address, wide))
+        };
+        let (Some(low), Some(high)) = (destination("var1"), destination("var2")) else {
+            // The original reports invalid store selectors. Do not publish an incomplete read.
+            *class = Class::Unknown;
+            return;
+        };
+        // CHGLD writes the low half first, then the high half; overlapping destinations matter.
+        for ((bank, address, wide), value) in [(low, gil as u16), (high, (gil >> 16) as u16)] {
+            if wide { self.set_word(bank, address, value); } else { self.set_byte(bank, address, value as u8); }
+        }
     }
 
     fn store(&mut self, (bank, address): (u8, u8), wide: bool, value: i64, saturate: bool) {
@@ -1307,9 +1424,17 @@ impl Vm {
                 Flow::Next
             }
             // Gifts are not given here (the server owns the inventory): the announcement that follows gets a note.
-            0x58 | 0x5B | 0x39 => {
+            0x58 | 0x5B => {
                 *class = Class::Ignored;
                 self.gift_not_given = true;
+                Flow::Next
+            }
+            0x39 | 0x3A => {
+                self.change_gil(ins, class);
+                Flow::Next
+            }
+            0x3B => {
+                self.read_gil(ins, class);
                 Flow::Next
             }
             0x60 => {

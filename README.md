@@ -1738,12 +1738,14 @@ on a real store (the whole state directory is byte for byte what it was before t
 `scripts/scene-smoke.sh` over real processes. `mds7pb_1` is not one of `REVIEWED_FIELDS` either, so its story points are
 withheld anyway: that is a second layer, not the first.
 
-### The wire (protocol v18)
+### The wire (protocol v19)
 
 New in `fmv_protocol::scene`: `ClientMsg::{SceneStep, SceneEnd, SceneLeave, SceneDebugPreview}`,
 `ServerMsg::{SceneStart, SceneStep, SceneEnded, SceneRefused}`, `SceneRunId`, `SceneRole`, `SceneParticipant`,
-`SceneOutcome`, `SceneRefusal`, `SCENE_NPC_ID_BASE`. Only ids, a seed, the story blob and choices cross the wire; every client
-builds the scene from its own files. A peer that predates them cannot decode them and is refused at the handshake.
+`SceneOutcome`, `SceneRefusal`, `SCENE_NPC_ID_BASE`. Only ids, a seed, the story blob, the owner's starting gil and choices
+cross the wire; every client builds the scene from its own files. Protocol 19 makes `SceneStart.gil` mandatory so every
+watcher follows the same resource-dependent branch as the owner. Original and replacement-script equivalence checks use
+that same snapshot. Older peers are refused at the handshake; a missing gil field is never guessed as zero.
 
 ### Checking it
 

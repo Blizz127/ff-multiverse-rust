@@ -2,8 +2,10 @@
 
 Status (2026-11-10): the owner's full FF7/Disc 1 goal authorizes local implementation.
 The store transaction, receipts, recovery and acknowledged saver queue are implemented and
-tested on disposable stores. Scene-world integration is pending; the flower scene remains
-disabled. No live store has been converted.
+tested on disposable stores. Scene completion now holds participants until durable acknowledgement,
+with reconnect checks and a server-wide stop on uncertain storage failure. All five original
+flower choices pass host-to-store tests at 0, 1 and 600 gil. The scene remains unregistered
+pending route/presentation acceptance; no live store has been converted.
 
 The `md8_2` scene has a choice that may subtract one gil and advances the story. The existing
 store keeps story and character progress in separate files. Each file is atomically replaced, but
@@ -11,10 +13,10 @@ two replacements are not one crash-safe transaction. Applying a gil delta and a 
 separate saver jobs can lose, duplicate, or mismatch one side after interruption or replay.
 An owned-data survey of the director at moment 36 found that every sampled branch sets
 `Var[3][66]` bit 0 before writing moment 39; the two sampled purchase branches also execute
-`GOLDd 1` and set `Var[3][111]` bit 0. The current story model carries neither flag. The
+`GOLDd 1` and set `Var[3][111]` bit 0. Version 3 carries both flags with explicit known masks. The
 transaction's story after-image must preserve both effects where the selected script path
-actually produces them; a moment-only update would lose state. The survey uses assumed clear
-values for uncarried flags, so it does not establish every possible prior-state branch.
+actually produces them; a moment-only update would lose state. The earlier legacy survey assumed clear values. The version 3 rerun establishes that these
+flags are bit-write outputs, not prerequisites: their other bits may safely remain unknown.
 
 ## Proposed change
 
@@ -23,15 +25,17 @@ for this scene and its precondition (the account, game, scene id and exact prior
 the validated complete before/after records for story and character progress. The character
 after-image also contains a bounded durable receipt for the scene key and selected result; this is
 an additive character-record schema change. Preserve all existing character fields and inventory.
-The server computes the branch and verifies sufficient funds using the authoritative stored state;
-the adapter decides the game's rules. A matching durable receipt makes a duplicate a no-op. A story
+The server computes the branch from the authoritative resource snapshot and verifies the
+exact prior balance at commit. The original flower script executes `GOLDd 1` without checking
+affordability; the original helper floors an insufficient balance at zero. The saver stores
+that authored result without inventing a rejection or a different arithmetic cap. A matching durable receipt makes a duplicate a no-op. A story
 that moved without the receipt is a conflict, not proof that this transaction happened. An
 incompatible or corrupt record fails closed.
 
 Under the existing single-writer process lock and store writer mutex:
 
 1. Drain earlier saver jobs for the account, then read and validate both records. Refuse a stale
-   precondition, missing required character state, or an invalid/insufficient-funds choice without
+   precondition, missing required character state, or an incomplete interpretation without
    changing either record. Resolve the scene's branch before presenting it for commitment.
 2. Durably write the intent by atomic replacement (file sync, rename, directory sync), then atomically
    replace each record with the exact validated after-image, and sync each containing directory.
@@ -62,7 +66,7 @@ and needs separate owner authorization.
 
 ## Required focused verification before any live use
 
-Use disposable stores only: exercise both answers, exact funds and insufficient funds, duplicate
+Use disposable stores only: exercise all five answer paths, exact funds and zero funds, duplicate
 scene completion, stale preconditions, preserved inventory and other fields, concurrent reward/save
 ordering, disconnect and retry, corrupt and future-format records, and every crash boundary before
 and after intent, each file replacement, and intent removal. Reopen after each interruption, check

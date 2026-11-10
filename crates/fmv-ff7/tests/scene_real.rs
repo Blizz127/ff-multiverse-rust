@@ -1005,22 +1005,30 @@ fn extended_opening_retains_authored_defaults_at_the_first_window_including_zero
 fn extended_flower_paths_retain_each_authored_flag_without_guessing_other_bits() {
     let f = field("md8_2").expect("FMV_FF7_DATA and md8_2");
     let def = fmv_ff7::script::scene::flower_station_scene();
-    // A made-up explicit precondition for exercising these branches, not a claim about a legacy save.
-    let mut story = StoryState::at(36).into_extended().unwrap();
-    story.write_masked(3, 66, 0, 1).unwrap();
-    for (answers, debit) in [(&[2usize][..], false), (&[3, 2, 0][..], true), (&[3, 3, 0][..], true), (&[3, 2, 1][..], false), (&[3, 3, 1][..], false)] {
-        let result = run_to_end(&f, &def, &story, 1, answers).unwrap();
-        assert_eq!(result.end, End::Finished);
-        assert_eq!(result.stats.ignored.contains_key("GOLDd"), debit, "economic effects still require server integration");
-        assert_eq!(result.writes.persistent.get(&(3, 66)), Some(&(1, 1)));
-        assert_eq!(result.writes.persistent.get(&(3, 111)), debit.then_some(&(1, 1)));
-        let mut next = story.clone();
-        assert_eq!(result.writes.apply_extended_to(&mut next, &story), Some(true));
-        assert_eq!(next.moment, 39);
-        assert_eq!(next.known_bit(3, 66, 0), Some(true));
-        assert_eq!(next.known_bit(3, 111, 0), debit.then_some(true));
-        assert_eq!(next.known_bit(3, 66, 1), None);
-        assert_eq!(StoryState::decode(&next.encode()), Some(next));
+    use fmv_ff7::script::scene::{run_to_end_with_resources, SceneResources, GilOp};
+    let story = StoryState::at(36).into_extended().unwrap();
+    // Flags start unknown. BITON defines only the bit it writes; it does not need a fabricated zero.
+    for gil in [0u32, 1, 600] {
+        for (answers, debit) in [(&[2usize][..], false), (&[3, 2, 0][..], true), (&[3, 3, 0][..], true), (&[3, 2, 1][..], false), (&[3, 3, 1][..], false)] {
+            let result = run_to_end_with_resources(&f, &def, &story, 1, SceneResources { gil: Some(gil) }, answers).unwrap();
+            assert_eq!(result.end, End::Finished);
+            assert!(result.is_complete(), "{result:?}");
+            assert!(result.unknown_persistent_reads.is_empty());
+            assert!(!result.stats.ignored.contains_key("GOLDd"));
+            assert_eq!(result.resources.gil_before, Some(gil));
+            // The authored purchase has GOLDd 1 with no affordability branch. Insufficiency floors at zero.
+            assert_eq!(result.resources.gil_after, Some(if debit { gil.saturating_sub(1) } else { gil }));
+            assert_eq!(result.resources.gil_ops, if debit { vec![GilOp::Subtract(1)] } else { vec![] });
+            assert_eq!(result.writes.persistent.get(&(3, 66)), Some(&(1, 1)));
+            assert_eq!(result.writes.persistent.get(&(3, 111)), debit.then_some(&(1, 1)));
+            let mut next = story.clone();
+            assert_eq!(result.writes.apply_extended_to(&mut next, &story), Some(true));
+            assert_eq!(next.moment, 39);
+            assert_eq!(next.known_bit(3, 66, 0), Some(true));
+            assert_eq!(next.known_bit(3, 111, 0), debit.then_some(true));
+            assert_eq!(next.known_bit(3, 66, 1), None);
+            assert_eq!(StoryState::decode(&next.encode()), Some(next));
+        }
     }
 }
 

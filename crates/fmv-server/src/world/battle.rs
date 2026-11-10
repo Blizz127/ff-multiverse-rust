@@ -538,6 +538,14 @@ impl World {
         self.players.get(&entity).is_some_and(|p| p.battle.is_some())
     }
 
+    /// Whether a running battle can still pay this account, including a fighter whose original
+    /// connection left. A replacement session has no battle marker, but its old fighter remains
+    /// in the roster until that battle ends or its last connected player leaves.
+    pub(super) fn account_in_battle(&self, account: AccountId) -> bool {
+        self.battle.as_ref().is_some_and(|world| world.battles.values()
+            .any(|battle| battle.members.iter().any(|member| member.info.account() == Some(account))))
+    }
+
     /// `ClientMsg::RequestEncounter`: start a battle for `entity`'s party, if the server allows
     /// debug encounters. `formation` of `None` lets the server choose.
     pub fn request_encounter(&mut self, entity: EntityId, formation: Option<u16>, now: Instant) -> BattleReply {
@@ -2973,6 +2981,39 @@ mod tests {
         assert!(accounts.contains(&a.account), "{jobs:?}");
         // The one that stayed was told about its own payment only.
         assert_eq!(progress_msgs(&mut a).len(), 2, "the join message and its own payment");
+    }
+
+    #[test]
+    fn a_retained_battle_roster_reserves_its_account_after_relogin_until_the_reward_is_paid() {
+        let rules = player_limit_rules();
+        let t0 = Instant::now();
+        let (mut w, mut rx) = world_with_saver(settings(rules));
+        let (mut a, b) = party_of_two(&mut w, t0);
+        assert!(!w.account_in_battle(a.account) && !w.account_in_battle(b.account));
+        assert_eq!(w.request_encounter(a.entity, Some(0), t0), BattleReply::Done);
+        assert!(w.account_in_battle(a.account) && w.account_in_battle(b.account));
+        let account = b.account;
+        assert!(w.leave(b.entity));
+        drop(b);
+        assert!(w.account_in_battle(account), "a disconnected fighter can still earn a reward");
+
+        let (session, entity) = w.allocate_ids();
+        let (tx, mut messages) = mpsc::channel(4096);
+        let close = Arc::new(watch::channel(false).0);
+        let avatar = AvatarAppearance { display_name: "B again".into(), tint: [1, 2, 3], appearance_ref: None };
+        w.join(NewPlayer { session, entity, account, avatar, progression: Vec::new(), progress: ProgressSeed::default(), tx, close }, t0).unwrap();
+        assert!(!w.in_battle(entity), "the new session did not enter the old battle");
+        assert!(w.account_in_battle(account), "account-level scene gates must still see its old fighter");
+        assert!(!w.account_in_battle(AccountId(u64::MAX)));
+        let before = w.players.get(&entity).unwrap().progress.unwrap();
+        while messages.try_recv().is_ok() {}
+
+        play_out(&mut w, &mut [&mut a], &rules, t0);
+        assert!(!w.account_in_battle(account) && !w.account_in_battle(a.account));
+        let after = w.players.get(&entity).unwrap().progress.unwrap();
+        assert!(after.gil > before.gil && after.exp > before.exp, "the old battle updates the replacement session's mirror");
+        assert!(saved(&mut rx).iter().any(|job| job.account == account), "the same reward reaches persistence");
+        assert!(std::iter::from_fn(|| messages.try_recv().ok()).any(|message| matches!(&*message, ServerMsg::CharacterProgress { gil, .. } if *gil == after.gil)));
     }
 
     /// A payment of nothing (a member that was dead when the others won) changes nothing and is not

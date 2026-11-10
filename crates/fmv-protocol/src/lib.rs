@@ -1,4 +1,10 @@
-//! FF Multiverse wire protocol v18.
+//! FF Multiverse wire protocol v19.
+//!
+//! v19 adds the required `gil` snapshot to [`ServerMsg::SceneStart`]: every participant replays a scene's
+//! money-dependent branches against the same starting balance chosen by the server. An older client would ignore
+//! this balance and could take a different branch, while an older server sends no balance at all, so v18 peers are
+//! refused at the handshake. The value is an input to scene playback, not a client-authorized payment; the server
+//! remains responsible for validating and saving the scene's story and money effects together.
 //!
 //! v18 is v17 plus the STORY SCENES (see [`scene`]): [`ClientMsg::SceneStep`], [`ClientMsg::SceneEnd`],
 //! [`ClientMsg::SceneLeave`] and [`ClientMsg::SceneDebugPreview`], and [`ServerMsg::SceneStart`], [`ServerMsg::SceneStep`],
@@ -424,8 +430,8 @@ pub use fmv_party::{
     PartyEvent, PartyId, Placement,
 };
 
-// Older clients cannot decode scene messages or safely participate in scene holds.
-pub const PROTOCOL_VERSION: u16 = 18;
+// Older peers cannot supply or use the starting balance required for deterministic scene playback.
+pub const PROTOCOL_VERSION: u16 = 19;
 /// Hard cap on a single frame payload (bytes).
 pub const MAX_FRAME: u32 = 256 * 1024;
 
@@ -772,6 +778,9 @@ pub enum ServerMsg {
         scene: String,
         seed: u32,
         progress: Vec<u8>,
+        /// Starting gil of the account whose story the scene plays in, shared by all participants.
+        /// Required since v19: omitting it must never silently choose a zero-balance branch.
+        gil: u32,
         owner: EntityId,
         participants: Vec<SceneParticipant>,
         you: SceneRole,
@@ -935,8 +944,8 @@ mod tests {
     }
 
     #[test]
-    fn the_version_is_eighteen() {
-        assert_eq!(PROTOCOL_VERSION, 18);
+    fn the_version_is_nineteen() {
+        assert_eq!(PROTOCOL_VERSION, 19);
     }
 
     // -----------------------------------------------------------------------------------------

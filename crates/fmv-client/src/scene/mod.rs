@@ -5,7 +5,7 @@
 //!
 //! A player's OK next to a *scene trigger* (a character the server adds to the area's cast while a scene is on offer:
 //! `fmv_protocol::SCENE_NPC_ID_BASE`) starts a scene for that player ([`trigger`]). The server answers every participant with
-//! `SceneStart`; each client then plays the scene LOCALLY, from its own field: nothing but ids, a seed, the story and the
+//! `SceneStart`; each client then plays the scene LOCALLY, from its own field: nothing but ids, a seed, the owner's starting gil, the story and the
 //! owner's choices crosses the wire (see `fmv_protocol::scene`). The canon cast speak their real lines in the order the
 //! game's own field script runs them; the player's own character stands in the scene as a witness, on the spot the scene
 //! names, and never takes a line (Cloud's lines stay Cloud's).

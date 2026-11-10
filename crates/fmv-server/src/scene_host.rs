@@ -12,21 +12,21 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use fmv_core::Pos;
-use fmv_ff7::script::scene::{run_to_end, scenes, trigger_npc, SceneDef};
+use fmv_ff7::script::scene::{run_to_end_with_resources, scenes, trigger_npc, SceneDef, SceneResources};
 use fmv_ff7::story::StoryState;
 use fmv_ff7::{field_direction_to_facing, Ff7Adapter, Ff7FieldArea};
 
-use crate::world::{SceneHost, SceneInfo, SceneResult, TriggerInfo};
+use crate::world::{SceneHost, SceneInfo, SceneResult, SceneTransaction, TriggerInfo};
 
 fn complete_outcome(outcome: &fmv_ff7::script::scene::Outcome) -> bool {
     (match outcome.end {
         fmv_ff7::script::dialogue::End::Finished => outcome.jump.is_none(),
         fmv_ff7::script::dialogue::End::MapJump { field } => outcome.jump.is_some_and(|jump| jump.field == field),
         _ => false,
-    }) && [&outcome.setup_stats, &outcome.stats].iter().all(|s| !s.setup_incomplete && s.unknown.is_empty() && s.unresolved == 0 && s.dropped_requests == 0)
+    }) && !outcome.resources.unknown_gil && [&outcome.setup_stats, &outcome.stats].iter().all(|s| !s.setup_incomplete && s.unknown.is_empty() && s.unresolved == 0 && s.dropped_requests == 0)
 }
 
-fn safe_outcome(outcome: &fmv_ff7::script::scene::Outcome) -> bool {
+fn safe_interpretation(outcome: &fmv_ff7::script::scene::Outcome) -> bool {
     // These ignored instructions read or change the player's resources, inventory, clock or menu-owned state, or split
     // and join the party in ways nothing here models. Advancing past one without carrying it out can lose state or select
     // the wrong branch. They remain blocked until the server implements their effects.
@@ -46,13 +46,19 @@ fn safe_outcome(outcome: &fmv_ff7::script::scene::Outcome) -> bool {
     complete_outcome(outcome)
         && outcome.unknown_persistent_reads.is_empty()
         && [&outcome.setup_stats, &outcome.stats].iter().all(|s| !s.ignored.keys().any(refused))
-        // Banks 1–4 may contain persistent game state (for example Tifa's affection in
-        // bank 1). Local field scratch variables remain allowed, but untracked persistent
-        // writes must not be silently discarded when the story is saved.
-        && !outcome.writes.untracked.keys().any(|(bank, _)| (1..=4).contains(bank))
-        // Version 3 assignments must go through the durable exact-base scene transaction,
-        // never through the legacy asynchronous union saver used by this path.
+        // Every persistent selector must be accounted for, including aliases and the higher banks.
+        && !outcome.writes.untracked.keys().any(|(bank, _)| fmv_ff7::story::canonical_persistent_bank(*bank).is_some())
+}
+
+fn safe_outcome(outcome: &fmv_ff7::script::scene::Outcome) -> bool {
+    safe_interpretation(outcome)
+        // Legacy saves cannot carry exact assignments or economic effects.
         && outcome.writes.persistent.is_empty()
+        && outcome.resources.gil_ops.is_empty()
+}
+
+fn persistable_field_gil(before: u32, after: u32) -> bool {
+    before <= fmv_ff7_battle::kernel::MAX_GIL && after <= fmv_ff7_battle::kernel::MAX_GIL
 }
 
 /// The variables a scene may change in a story that is SAVED while the extended save is off (`Ff7SceneHost::new`): the
@@ -96,13 +102,13 @@ impl Ff7SceneHost {
         fields.entry(name.to_string()).or_insert_with(|| self.adapter.load_field(name).ok().map(Arc::new)).clone()
     }
 
-    fn finish_scene(&self, scene: &str, progress: &[u8], seed: u32, answers: &[u8], preview: bool) -> Option<SceneResult> {
+    fn finish_scene(&self, scene: &str, progress: &[u8], seed: u32, answers: &[u8], preview: bool, gil: Option<u32>) -> Option<SceneResult> {
         let (def, story) = (self.def(scene)?, StoryState::decode(progress)?);
-        if !preview && story.supports_extended() { return None; }
+        if !preview && story.supports_extended() && (!self.extended_save || gil.is_none()) { return None; }
         let area = self.field(&def.field)?;
         let answers: Vec<usize> = answers.iter().map(|&a| usize::from(a)).collect();
-        let outcome = run_to_end(area.field_file(), def, &story, seed, &answers).ok()?;
-        if !(if preview { complete_outcome(&outcome) } else { safe_outcome(&outcome) }) { return None; }
+        let outcome = run_to_end_with_resources(area.field_file(), def, &story, seed, SceneResources { gil }, &answers).ok()?;
+        if !(if preview { complete_outcome(&outcome) } else if story.supports_extended() { safe_interpretation(&outcome) } else { safe_outcome(&outcome) }) { return None; }
         let mut after = story.clone();
         let changed = if story.supports_extended() {
             outcome.writes.apply_extended_to(&mut after, &story)?
@@ -113,6 +119,18 @@ impl Ff7SceneHost {
             if !outcome.party_is_the_storys(&story, &after) { return None; }
             if !self.extended_save && !saves_only_what_was_always_saved(&story, &after) { return None; }
         }
+        let transaction = if !preview && story.supports_extended() {
+            let expected_gil = gil?;
+            if outcome.resources.gil_before != Some(expected_gil) { return None; }
+            let next_gil = outcome.resources.gil_after?;
+            // Login and ordinary resource saves still apply the battle cap. Until those paths
+            // preserve field balances, refuse an out-of-range scene instead of storing a value
+            // a later non-gil operation would silently reduce. The VM retains original u32 math.
+            if !persistable_field_gil(expected_gil, next_gil) { return None; }
+            // The known-bit encoding and the exact original predecessor must survive validation.
+            fmv_ff7::story::compare_exchange_progression(progress, progress, &after.encode())?;
+            Some(SceneTransaction { expected_gil, next_gil })
+        } else { None };
         let mut summary = Vec::new();
         if after.moment != story.moment { summary.push(format!("moment={}->{}", story.moment, after.moment)); }
         for ((bank, address), value) in after.vars() {
@@ -130,7 +148,7 @@ impl Ff7SceneHost {
                 arrival_hint: u32::try_from(jump.triangle).ok(), kind: fmv_adapter_api::ExitKind::Gateway,
             })
         } else { None };
-        Some(SceneResult { progress: after.encode(), changed, summary: summary.join(" "), travel })
+        Some(SceneResult { progress: after.encode(), changed, summary: summary.join(" "), travel, transaction })
     }
 }
 
@@ -200,11 +218,19 @@ impl SceneHost for Ff7SceneHost {
     }
 
     fn finish(&self, scene: &str, progress: &[u8], seed: u32, answers: &[u8]) -> Option<SceneResult> {
-        self.finish_scene(scene, progress, seed, answers, false)
+        self.finish_scene(scene, progress, seed, answers, false, None)
+    }
+
+    fn finish_with_resources(&self, scene: &str, progress: &[u8], seed: u32, answers: &[u8], gil: u32) -> Option<SceneResult> {
+        self.finish_scene(scene, progress, seed, answers, false, Some(gil))
+    }
+
+    fn finish_preview_with_resources(&self, scene: &str, progress: &[u8], seed: u32, answers: &[u8], gil: u32) -> Option<SceneResult> {
+        self.finish_scene(scene, progress, seed, answers, true, Some(gil))
     }
 
     fn finish_preview(&self, scene: &str, progress: &[u8], seed: u32, answers: &[u8]) -> Option<SceneResult> {
-        self.finish_scene(scene, progress, seed, answers, true)
+        self.finish_scene(scene, progress, seed, answers, true, None)
     }
 }
 
@@ -215,7 +241,7 @@ mod tests {
 
     #[test]
     fn incomplete_or_economic_scenes_cannot_advance_or_travel() {
-        let mut outcome = Outcome { end: End::Finished, windows: 0, writes: Writes::default(), jump: None, setup_stats: Stats::default(), questions: 0, unknown_persistent_reads: Default::default(), party: Vec::new(), stats: Stats::default() };
+        let mut outcome = Outcome { end: End::Finished, windows: 0, writes: Writes::default(), jump: None, setup_stats: Stats::default(), questions: 0, unknown_persistent_reads: Default::default(), party: Vec::new(), resources: Default::default(), stats: Stats::default() };
         assert!(safe_outcome(&outcome));
         outcome.unknown_persistent_reads.insert((3, 211));
         assert!(!safe_outcome(&outcome), "assumed persistent inputs cannot drive real progress");
@@ -271,12 +297,85 @@ mod tests {
         assert!(!safe_outcome(&outcome));
     }
 
+    #[test]
+    fn extended_commit_checks_all_persistent_banks_and_never_drops_a_resource_operation() {
+        use fmv_ff7::script::scene::{GilOp, ResourceOutcome};
+        let mut outcome = Outcome { end: End::Finished, windows: 0, writes: Writes::default(), jump: None,
+            setup_stats: Stats::default(), questions: 0, unknown_persistent_reads: Default::default(),
+            party: Vec::new(), resources: ResourceOutcome { gil_before: Some(1), gil_after: Some(0),
+                gil_ops: vec![GilOp::Subtract(1)], unknown_gil: false }, stats: Stats::default() };
+        outcome.writes.persistent.insert((3, 111), (1, 1));
+        assert!(safe_interpretation(&outcome));
+        assert!(!safe_outcome(&outcome), "legacy saver cannot carry economic effects");
+        for bank in [1, 2, 3, 4, 7, 11, 12, 13, 14, 15] {
+            outcome.writes.untracked.insert((bank, 66), 1);
+            assert!(!safe_interpretation(&outcome), "persistent selector {bank} cannot be dropped");
+            outcome.writes.untracked.clear();
+        }
+        outcome.resources.unknown_gil = true;
+        assert!(!complete_outcome(&outcome), "unknown gil cannot choose even a preview branch");
+    }
+
+    #[test]
+    fn scene_commits_refuse_balances_other_save_paths_would_silently_reduce() {
+        let cap = fmv_ff7_battle::kernel::MAX_GIL;
+        assert!(persistable_field_gil(0, cap) && persistable_field_gil(cap, 0));
+        assert!(!persistable_field_gil(cap + 1, cap));
+        assert!(!persistable_field_gil(cap, cap + 1));
+        assert!(!persistable_field_gil(u32::MAX, u32::MAX));
+    }
+
+    #[test]
+    #[ignore = "needs owner's FMV_FF7_DATA; reads owned fields and uses throwaway state only"]
+    fn owned_flower_choices_produce_exact_durable_resource_results() {
+        use crate::ff7::{open_ff7, Ff7Labels, Ff7Source};
+        use crate::saver::{persist_scene, SceneSaveJob};
+        use fmv_core::GameId;
+        use fmv_persist::{CharacterProgress, Progression, Store};
+        use fmv_ff7::script::scene::{flower_station_scene, FLOWER_STATION_SCENE_ID};
+        let data = std::path::PathBuf::from(std::env::var_os("FMV_FF7_DATA").expect("owned field data"));
+        let opened = open_ff7(&Ff7Source::Flevel { path: data.join("field/flevel.lgp"), labels: Ff7Labels::default() }).unwrap();
+        let mut host = Ff7SceneHost::with_extended_save(opened.adapter, true);
+        // Survey definition stays unregistered until the complete route and presentation pass.
+        host.defs.push(flower_station_scene());
+        let before = StoryState::at(36).into_extended().unwrap().encode();
+        for gil in [0u32, 1, 600] {
+            for (answers, bought) in [(&[2u8][..], false), (&[3, 2, 0][..], true), (&[3, 3, 0][..], true), (&[3, 2, 1][..], false), (&[3, 3, 1][..], false)] {
+                let result = host.finish_with_resources(FLOWER_STATION_SCENE_ID, &before, 1, answers, gil).expect("complete original scene");
+                let next_gil = if bought { gil.saturating_sub(1) } else { gil };
+                assert_eq!(result.transaction, Some(SceneTransaction { expected_gil: gil, next_gil }));
+                assert!(result.changed && result.travel.is_none());
+                let dir = tempfile::tempdir().unwrap();
+                let store = Store::open(dir.path()).unwrap();
+                let (account, _token) = store.create_account("Flower test", 1).unwrap();
+                store.put_progression(&Progression::new(account, GameId::Ff7, before.clone(), 1)).unwrap();
+                let character = CharacterProgress { account_id: account, game: GameId::Ff7, gil, ..CharacterProgress::new(account, GameId::Ff7, 0, 6, 1) };
+                store.put_character_progress(&character).unwrap();
+                let job = SceneSaveJob { account, scene_key: FLOWER_STATION_SCENE_ID.into(), expected_story: before.clone(),
+                    next_story: result.progress.clone(), expected_gil: gil, next_gil };
+                let saved = persist_scene(&store, GameId::Ff7, &job, 2).unwrap();
+                assert_eq!(saved.pair.character.as_ref().unwrap().gil, next_gil);
+                assert_eq!(saved.pair.story.blob, result.progress);
+                drop(store);
+                let store = Store::open(dir.path()).unwrap();
+                let repeated = persist_scene(&store, GameId::Ff7, &job, 3).unwrap();
+                assert_eq!(repeated.commit, fmv_persist::SceneCommit::AlreadyApplied);
+                assert_eq!(repeated.pair, saved.pair, "reconnect never charges twice");
+                let preview = host.finish_preview_with_resources(FLOWER_STATION_SCENE_ID, &before, 1, answers, gil).unwrap();
+                assert!(preview.transaction.is_none());
+            }
+        }
+        assert!(host.finish(FLOWER_STATION_SCENE_ID, &before, 1, &[3, 2, 0]).is_none(), "no gil snapshot");
+        host.extended_save = false;
+        assert!(host.finish_with_resources(FLOWER_STATION_SCENE_ID, &before, 1, &[2], 1).is_none(), "explicit v3 save gate");
+    }
+
     /// A scene's party change is accepted only where the story's own party table has the party the scripts leave: the
     /// table is how the change is carried, so a change it has no row for is refused, not dropped.
     #[test]
     fn a_party_change_is_carried_by_the_storys_party_table_or_refused() {
         use fmv_ff7::story::{PartyOp, BARRET, CLOUD};
-        let mut outcome = Outcome { end: End::Finished, windows: 0, writes: Writes::default(), jump: None, setup_stats: Stats::default(), questions: 0, unknown_persistent_reads: Default::default(), party: Vec::new(), stats: Stats::default() };
+        let mut outcome = Outcome { end: End::Finished, windows: 0, writes: Writes::default(), jump: None, setup_stats: Stats::default(), questions: 0, unknown_persistent_reads: Default::default(), party: Vec::new(), resources: Default::default(), stats: Stats::default() };
         let (escaped, split_up) = (StoryState::at(33), StoryState::at(36));
         assert!(outcome.party_is_the_storys(&escaped, &escaped), "a scene that touches no party");
         outcome.party = vec![PartyOp::Remove(BARRET)];
