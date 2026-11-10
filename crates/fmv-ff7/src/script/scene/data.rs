@@ -541,6 +541,29 @@ pub fn jessie_rescue_scene() -> SceneDef {
     }
 }
 
+/// Jessie's first ladder explanation, before the existing talk point advances the story to 14.
+pub const JESSIE_LADDER_SCENE_ID: &str = "ff7/nmkin_3/jessie-ladder";
+
+pub fn jessie_ladder_scene() -> SceneDef {
+    let arrival = Spot { x: 100, y: 1910, triangle: 27, direction: 64 };
+    let cast = [(4, "av_j", "axdc", "acfe"), (5, "po0", "bygf", "byhc")]
+        .into_iter().map(|(entity, name, hrc, idle)| CastMember {
+            entity, name: name.into(), look: Look::Model { hrc: hrc.into(), idle: idle.into() },
+            start: None,
+        }).collect();
+    SceneDef {
+        id: JESSIE_LADDER_SCENE_ID.into(), game: "ff7".into(), field: "nmkin_3".into(),
+        trigger: Trigger { entity: 4, name: "av_j".into(), slot: 1, talk_radius: 0, moments: 0..=13 },
+        setup: [3, 4, 5].into_iter().map(|entity| ScriptRef::new(entity, 0)).collect(),
+        given: vec![], root: vec![Step::Await(ScriptRef::new(4, 1))], cast,
+        speakers: vec![("Jessie".into(), 4)],
+        // The narrow upper platform has no safe automatic sample. This spot was measured against the
+        // walkmesh and Jessie's entire path; extra watchers retain their actual positions.
+        witness: vec![Spot { x: 85, y: 1910, triangle: 42, direction: 64 }], arrival,
+        presents: Some(14), resume_after_battle: None, presents_bit: None,
+    }
+}
+
 /// Offline director survey at moment 51. The route, witness, field effects and party state
 /// have not been verified for live play, so this definition is deliberately unregistered.
 pub fn sector7_station_scene() -> SceneDef {
@@ -735,7 +758,7 @@ pub fn proof_scene() -> SceneDef {
 /// ones before it keep their numbers): the proof, the two the escape from the first reactor ends in, and the cutscenes of the
 /// reactor's own story points.
 pub fn scenes() -> Vec<SceneDef> {
-    vec![proof_scene(), post_escape_scene(), station_scene(), team_talk_scene(), reactor_door_scene(), guard_scorpion_scene(), guard_scorpion_victory_scene(), jessie_rescue_scene()]
+    vec![proof_scene(), post_escape_scene(), station_scene(), team_talk_scene(), reactor_door_scene(), guard_scorpion_scene(), guard_scorpion_victory_scene(), jessie_rescue_scene(), jessie_ladder_scene()]
 }
 
 /// Whether `field` (the archive's spelling; case does not matter) is the field of a scene the game offers: a place a

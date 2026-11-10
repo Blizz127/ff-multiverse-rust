@@ -1266,3 +1266,67 @@ fn jessie_rescue_plays_three_windows_and_matches_the_existing_saved_step() {
         assert!(scenery_gap(&mesh, f32::from(spot.x), f32::from(spot.y)) >= 1.5 * ring);
     }
 }
+
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn jessie_ladder_plays_one_window_and_matches_only_the_existing_moment_step() {
+    use fmv_adapter_api::AreaRuntime;
+    use fmv_core::{EditionProvenance, GameId, Platform};
+    use fmv_ff7::script::scene::{cast_places, jessie_ladder_scene, scene, JESSIE_LADDER_SCENE_ID, ANNOUNCED_STATE_OPS};
+    use fmv_ff7::story::{LIFT_BIT, REACTOR_STATE};
+    let f = field("nmkin_3").expect("FMV_FF7_DATA and nmkin_3");
+    let def = jessie_ladder_scene();
+    assert_eq!(scene(JESSIE_LADDER_SCENE_ID).as_ref(), Some(&def));
+    let provenance = EditionProvenance { game: GameId::Ff7, platform: Platform::Pc, edition: "steam".into(), region: "any".into(), language: "en".into(), revision: "test".into(), sources: vec![], modded: false };
+    let adapter = fmv_ff7::Ff7Adapter::from_flevel_path(flevel_path(&data_dir().unwrap()), provenance).unwrap();
+    let area = adapter.load_field("nmkin_3").unwrap();
+    let mesh = f.walkmesh().unwrap();
+    let parts = mesh_parts(&mesh);
+    let ring = 5.5 * fmv_ff7::default_model_scale(FieldScript::from_field(&f).unwrap().header().scale);
+    for moment in [0, 1, 13] {
+        let mut before = StoryState::at(moment);
+        before.set_bit(REACTOR_STATE.bank, REACTOR_STATE.address, LIFT_BIT, true);
+        let step = area.story_advance(&before.encode(), 0).expect("existing ladder talk point");
+        let after = StoryState::decode(&step.progress).unwrap();
+        assert!(def.presents_step("nmkin_3", &before, &after));
+        assert!(!def.starts_on_arrival() && !def.offered_to(&before));
+        assert!(!def.presents_step("nmkin_3", &after, &after));
+        assert!(!def.presents_step("nmkin_2", &before, &after));
+        assert!(area.story_advance(&step.progress, 0).is_none(), "paid once");
+        let outcome = run_to_end(&f, &def, &before, 1, &[]).unwrap();
+        assert_eq!((outcome.end, outcome.windows, outcome.questions), (End::Finished, 1, 0));
+        assert!(outcome.is_complete(), "{outcome:?}");
+        assert!(outcome.unknown_persistent_reads.is_empty(), "{outcome:?}");
+        assert!(outcome.party.is_empty() && outcome.jump.is_none());
+        assert_eq!(outcome.writes.moment, Some(14));
+        assert!(outcome.writes.tracked.is_empty());
+        assert!(outcome.writes.untracked.keys().all(|(bank, _)| !(1..=4).contains(bank)), "no new saved flags");
+        assert!([&outcome.setup_stats, &outcome.stats].iter().all(|stats| stats.ignored.keys().all(|op| !ANNOUNCED_STATE_OPS.contains(op))));
+        let mut interpreted = before.clone();
+        outcome.writes.apply_to(&mut interpreted);
+        assert_eq!(interpreted, after, "only the existing point's writes");
+        let mut play = ScenePlay::new(&f, &def, &before, 1).unwrap();
+        let mut lines = Vec::new();
+        loop {
+            match play.next(None).then {
+                Then::Window(w) => {
+                    let MessageOrigin::Canon { dialog, .. } = w.message.origin else { panic!("unexpected added line") };
+                    lines.push((w.opener, dialog));
+                },
+                Then::End { how, .. } => { assert_eq!(how, End::Finished); break; },
+            }
+        }
+        assert_eq!(lines, [(4, 72)]);
+        assert_eq!(play.off_cast(), 0);
+        let cast = cast_places(&f, &def, &before, 1).unwrap();
+        for spot in def.witness.iter().chain(std::iter::once(&def.arrival)) {
+            assert!(fmv_ff7::script::triangle_contains_xy(&mesh.triangles[usize::from(spot.triangle)], i32::from(spot.x), i32::from(spot.y)));
+            assert_eq!(parts[usize::from(spot.triangle)], parts[26], "Jessie's upper platform");
+            assert!(cast.iter().all(|&(x, y)| (x - f32::from(spot.x)).hypot(y - f32::from(spot.y)) >= 2.0 * ring + 16.0));
+            assert!(scenery_gap(&mesh, f32::from(spot.x), f32::from(spot.y)) >= 1.5 * ring);
+        }
+    }
+    for moment in [14, 26, 27, 33] {
+        assert!(!def.applies_at(moment));
+    }
+}
