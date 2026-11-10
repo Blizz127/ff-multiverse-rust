@@ -798,12 +798,12 @@ fn damaged_files_are_errors_never_panics_and_never_replaced_by_defaults() {
         &root,
         a,
         "Ff7",
-        &doc(|v| v["schema_version"] = json!(SCHEMA_VERSION + 1)),
+        &doc(|v| v["schema_version"] = json!(3)),
     );
     assert!(matches!(
         store.get_character_progress(a, GameId::Ff7),
         Err(PersistError::FutureSchema { found, supported, .. })
-            if found == SCHEMA_VERSION + 1 && supported == SCHEMA_VERSION
+            if found == 3 && supported == 2
     ));
     // ... and an update refuses to build on such a record rather than overwrite it.
     let mut called = false;

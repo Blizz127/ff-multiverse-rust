@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use fmv_core::{GameId, InventoryEntry};
 
 use super::*;
+use crate::CharacterProgress;
 use crate::character::{GameCharacter, NewPlayerCharacter};
 use crate::model::Registered;
 
@@ -200,7 +201,7 @@ fn a_crash_after_the_plan_leaves_the_account_intact() {
     let a = make(&store, "Aria", 1);
     let before = files(&root);
     {
-        let _writer = store.writer();
+        let _writer = store.writer().unwrap();
         let prepared = store.prepare_delete(a.account_id, NOW).unwrap();
         assert!(prepared.dir.join(MANIFEST_FILE).is_file());
         // ...and the process dies here.
@@ -242,7 +243,7 @@ fn a_crash_after_the_commit_is_finished_when_the_store_opens() {
     let (a, b) = (make(&store, "Aria", 1), make(&store, "Brom", 2));
     let before = files(&root);
     {
-        let _writer = store.writer();
+        let _writer = store.writer().unwrap();
         let prepared = store.prepare_delete(a.account_id, NOW).unwrap();
         store.commit_delete(a.account_id).unwrap();
         assert!(store.find_account_by_name("Aria").is_none(), "the commit freed the name");
@@ -289,7 +290,7 @@ fn a_crash_in_the_middle_of_the_moves_is_finished_when_the_store_opens() {
     let a = make(&store, "Aria", 1);
     let before = files(&root);
     {
-        let _writer = store.writer();
+        let _writer = store.writer().unwrap();
         let prepared = store.prepare_delete(a.account_id, NOW).unwrap();
         store.commit_delete(a.account_id).unwrap();
         // Two of the five files move, and the process dies.
@@ -344,7 +345,7 @@ fn a_manifest_that_names_another_accounts_file_is_refused_and_nothing_is_moved()
     let (a, b) = (make(&store, "Aria", 1), make(&store, "Brom", 2));
     let before = files(&root);
     {
-        let _writer = store.writer();
+        let _writer = store.writer().unwrap();
         let prepared = store.prepare_delete(a.account_id, NOW).unwrap();
         store.commit_delete(a.account_id).unwrap();
         // A damaged or hostile manifest that also names Brom's records.
@@ -416,6 +417,50 @@ fn a_crash_after_a_restore_committed_is_finished_when_the_store_opens() {
 }
 
 #[test]
+fn an_incomplete_committed_restore_blocks_play_until_progress_and_receipts_are_recovered() {
+    let (_guard, root) = state_dir();
+    let store = Store::open(&root).unwrap();
+    let original = make(&store, "Aria", 1);
+    let before = store.get_progress_pair(original.account_id, GameId::Ff7).unwrap();
+    let mut after = before.clone();
+    after.story.blob = vec![1, 39, 0];
+    after.character.as_mut().unwrap().gil -= 1;
+    store.commit_scene_progress_with_result("flower", b"buy-one", &before, &after).unwrap();
+    let deleted = store.delete_account(original.account_id, NOW).unwrap();
+    let next = store.writer().unwrap().next_account_id;
+    // Account/index creation can succeed, but its progression directory cannot be created.
+    let obstruction = root.join(format!("progression/{next}"));
+    fs::write(&obstruction, b"not a directory").unwrap();
+    let restored = store.restore_account(&deleted.entry, NOW + 5).unwrap();
+    assert!(!restored.unfinished.is_empty(), "the admin retains its result and token");
+    let account = restored.account_id;
+    assert_eq!(account.0, next);
+    assert!(matches!(store.authenticate(&restored.token), Err(PersistError::TransactionRecoveryRequired)));
+    assert!(matches!(store.get_progress_pair(account, GameId::Ff7), Err(PersistError::TransactionRecoveryRequired)));
+    assert!(matches!(store.get_progression(account, GameId::Ff7), Err(PersistError::TransactionRecoveryRequired)));
+    assert!(matches!(store.get_character_progress(account, GameId::Ff7), Err(PersistError::TransactionRecoveryRequired)));
+    assert!(matches!(store.put_progression(&Progression::new(account, GameId::Ff7, vec![], NOW)), Err(PersistError::TransactionRecoveryRequired)));
+    assert!(matches!(store.update_progression(account, GameId::Ff7, |_| panic!("no story replacement")), Err(PersistError::TransactionRecoveryRequired)));
+    assert!(matches!(store.put_character_progress(&CharacterProgress::new(account, GameId::Ff7, 1, 7, NOW)), Err(PersistError::TransactionRecoveryRequired)));
+    assert!(matches!(store.update_character_progress(account, GameId::Ff7, |_| panic!("no default replacement")), Err(PersistError::TransactionRecoveryRequired)));
+    assert!(matches!(store.snapshot(root.with_file_name("unsafe-snapshot")), Err(PersistError::TransactionRecoveryRequired)));
+    drop(store);
+
+    // A warning-only open here would allow gameplay to fabricate the still-missing records.
+    assert!(matches!(Store::open(&root), Err(PersistError::Corrupt { .. })));
+    fs::remove_file(obstruction).unwrap();
+    let recovered = Store::open(&root).unwrap();
+    assert_eq!(recovered.authenticate(&restored.token).unwrap(), account);
+    let pair = recovered.get_progress_pair(account, GameId::Ff7).unwrap();
+    assert_eq!(pair.story.blob, after.story.blob);
+    assert_eq!(pair.character.as_ref().unwrap().gil, 54);
+    assert_eq!(pair.character.as_ref().unwrap().inventory, after.character.as_ref().unwrap().inventory);
+    let mut expected_story = before.story;
+    expected_story.account_id = account;
+    assert!(recovered.scene_progress_applied("flower", &expected_story, b"buy-one").unwrap(), "the original receipt survives rekeying and recovery");
+}
+
+#[test]
 fn a_crash_before_a_restore_committed_puts_the_entry_back() {
     let (_guard, root) = state_dir();
     let store = Store::open(&root).unwrap();
@@ -423,7 +468,7 @@ fn a_crash_before_a_restore_committed_puts_the_entry_back() {
     let deleted = store.delete_account(a.account_id, NOW).unwrap();
     let trash_before = files(&root);
     let next = {
-        let counters = store.writer();
+        let counters = store.writer().unwrap();
         (counters.next_account_id, counters.next_avatar_id)
     };
     drop(store);
@@ -455,7 +500,7 @@ fn a_failed_restore_puts_the_entry_back_and_writes_nothing() {
     let a = make(&store, "Aria", 1);
     let deleted = store.delete_account(a.account_id, NOW).unwrap();
     let before = files(&root);
-    let next = store.writer().next_account_id;
+    let next = store.writer().unwrap().next_account_id;
     // The new account's record cannot be written: a directory sits where the file goes.
     fs::create_dir(root.join(format!("accounts/{next}.json"))).unwrap();
     let err = store.restore_account(&deleted.entry, NOW + 5).unwrap_err();

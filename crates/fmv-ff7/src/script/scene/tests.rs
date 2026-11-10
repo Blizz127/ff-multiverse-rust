@@ -1058,6 +1058,101 @@ fn read_audit_conservatively_flags_replacing_an_unknown_persistent_byte() {
     assert!(result.unknown_persistent_reads.contains(&(3, 5)));
 }
 
+#[test]
+fn extended_assignments_preserve_known_zeroes_aliases_clears_and_numeric_order() {
+    let story = StoryState::at(36).into_extended().unwrap();
+    let code = vec![
+        setbyte(1, 4, 30), // authored affection initialization
+        vec![0x85, 0x10, 4, 5], // PLUS 5
+        vec![0x87, 0x10, 4, 2], // MINUS 2
+        setbyte(1, 6, 0), // an explicit zero is known, not an absent guess
+        setword(4, 20, 0x1234), // same bytes as bank 3
+        biton(3, 66, 0),
+        vec![0x83, 0x30, 66, 0], // BITOFF, preserves the explicit clear
+        setword(2, 0, 39),
+    ];
+    let field = field_of(script(vec![("a", vec![(1, code)])], vec![]));
+    let def = demo_def(vec![member(0, "aya")], start(0, 1));
+    let result = run_to_end(&field, &def, &story, 1, &[]).unwrap();
+    assert!(result.unknown_persistent_reads.is_empty(), "{:?}", result.unknown_persistent_reads);
+    assert_eq!(result.writes.persistent.get(&(1, 6)), Some(&(0, 255)));
+    assert_eq!(result.writes.persistent.get(&(3, 66)), Some(&(0, 1)));
+    let mut after = story.clone();
+    assert_eq!(result.writes.apply_extended_to(&mut after, &story), Some(true));
+    assert_eq!(after.known_byte(1, 4), Some(33));
+    assert_eq!(after.known_byte(1, 6), Some(0));
+    assert_eq!(after.known_word(4, 20), Some(0x1234));
+    assert_eq!(after.known_byte(3, 20), Some(0x34));
+    assert_eq!(after.known_bit(3, 66, 0), Some(false));
+    assert_eq!(after.known_bit(3, 66, 1), None);
+    assert_eq!(after.moment, 39);
+    let saved = after.clone();
+    assert_eq!(result.writes.apply_extended_to(&mut after, &story), None, "stale replay cannot overwrite later state");
+    assert_eq!(after, saved);
+    assert_eq!(StoryState::decode(&after.encode()), Some(after));
+}
+
+#[test]
+fn extended_bit_writes_do_not_make_unknown_neighbours_authoritative() {
+    for bank in [3, 4, 7, 15, 11, 12, 13, 14] {
+        let story = StoryState::at(36).into_extended().unwrap();
+        let selected = vec![biton(bank, 66, 0), if_ub(bank, 66, 9, 0, &message(0, 0))];
+        let section = script(vec![("a", vec![(1, selected)])], texts(1));
+        let (beats, vm) = run_with(&section, start(0, 1), &[], vm_for(story.clone(), &[]));
+        assert_eq!(dialogs_of(&beats), [0]);
+        assert!(vm.vars().unknown_persistent_reads().is_empty(), "bank {bank}");
+        for read in [if_ub(bank, 66, 9, 1, &message(0, 0)), if_ub(bank, 66, 0, 1, &message(0, 0))] {
+            let section = script(vec![("a", vec![(1, vec![biton(bank, 66, 0), read])])], texts(1));
+            let (_, vm) = run_with(&section, start(0, 1), &[], vm_for(story.clone(), &[]));
+            assert!(vm.vars().unknown_persistent_reads().contains(&(crate::story::canonical_persistent_bank(bank).unwrap(), 66)));
+        }
+    }
+}
+
+#[test]
+fn extended_given_values_cannot_override_saved_bits_or_hide_unknown_numeric_inputs() {
+    use crate::script::dialogue::StoryVars;
+    let mut story = StoryState::at(36).into_extended().unwrap();
+    story.write_masked(3, 66, 0, 1).unwrap();
+    let vars = SceneVars::new(story.clone(), &[Given { bank: 4, address: 66, value: 255 }]);
+    assert_eq!(vars.byte(3, 66), 254);
+    assert!(vars.unknown_persistent_reads().contains(&(3, 66)));
+    for code in [vec![0x85, 0x10, 4, 5], vec![0x84, 0x30, 66, 1], vec![0x80, 0x53, 7, 66]] {
+        let field = field_of(script(vec![("a", vec![(1, vec![code])])], vec![]));
+        let def = demo_def(vec![member(0, "aya")], start(0, 1));
+        let result = run_to_end(&field, &def, &story, 1, &[]).unwrap();
+        assert!(!result.unknown_persistent_reads.is_empty(), "arithmetic, XOR and copies must retain unknown-input audits");
+    }
+}
+
+#[test]
+fn extended_word_access_cannot_read_or_write_half_a_word_at_the_bank_end() {
+    let mut story = StoryState::at(36).into_extended().unwrap();
+    story.write_masked(3, 255, 7, 255).unwrap();
+    for (code, writing) in [(setword(4, 255, 0x1234), true), (vec![0x81, 0x54, 10, 255, 0], false)] {
+        let field = field_of(script(vec![("a", vec![(1, vec![code])])], vec![]));
+        let def = demo_def(vec![member(0, "aya")], start(0, 1));
+        let result = run_to_end(&field, &def, &story, 1, &[]).unwrap();
+        assert!(result.writes.persistent.is_empty(), "never commit only a low byte");
+        if writing { assert!(result.stats.unresolved > 0); }
+        else { assert!(result.unknown_persistent_reads.contains(&(3, 255))); }
+    }
+}
+
+#[test]
+fn extended_temporary_byte_and_word_selectors_share_storage_without_persisting_it() {
+    let story = StoryState::at(36).into_extended().unwrap();
+    let code = vec![setword(6, 20, 0x1234), if_ub(5, 20, 0, 0x34, &message(0, 0)), if_ub(5, 21, 0, 0x12, &message(0, 1))];
+    let section = script(vec![("a", vec![(1, code.clone())])], texts(2));
+    let (beats, vm) = run_with(&section, start(0, 1), &[], vm_for(story.clone(), &[]));
+    assert_eq!(dialogs_of(&beats), [0, 1]);
+    assert!(vm.vars().unknown_persistent_reads().is_empty());
+    let field = field_of(script(vec![("a", vec![(1, code)])], texts(2)));
+    let result = run_to_end(&field, &demo_def(vec![member(0, "aya")], start(0, 1)), &story, 1, &[]).unwrap();
+    assert!(result.writes.is_story_neutral());
+    assert!(result.writes.persistent.is_empty());
+}
+
 // ---- the party ------------------------------------------------------------------------------------
 
 /// `IFPRTYQ character`: run `body` only if the character is in the party (the jump skips it otherwise).

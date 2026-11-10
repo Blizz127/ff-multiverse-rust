@@ -32,25 +32,26 @@
 //!
 //! # Locks
 //!
-//! Three locks, always taken in this order when more than one is needed:
+//! Locks are taken in this order when more than one is needed:
 //!
 //! 1. **writer** (a `Mutex`): held by every operation that changes anything on disk
 //!    (registration, avatar and progression writes, release, compaction, snapshots) for its
 //!    whole duration. That keeps [`Store::snapshot`] a true point-in-time copy and makes
 //!    "check that the name is free, then take it" one step.
-//! 2. **log** (a `Mutex`): held only while an entry is appended and synced, and by the first
+//! 2. **progress_gate** (an `RwLock`): progression readers and login bookkeeping take it
+//!    shared; progression writes, scene transactions, deletes and restores take it exclusive.
+//!    A reader never sees the middle of a scene's two-record update.
+//! 3. **log** (a `Mutex`): held only while an entry is appended and synced, and by the first
 //!    login of an account, which records that it happened. Short, and never held across
 //!    anything but that one write.
-//! 3. **index** (an `RwLock`): the in-memory lookup tables. Readers hold it for a hash lookup;
+//! 4. **index** (an `RwLock`): the in-memory lookup tables. Readers hold it for a hash lookup;
 //!    a writer takes it for the few microseconds it needs to insert after the entry is durable.
 //!
-//! Everything a login needs ([`Store::authenticate`] and the lookups after it) only reads the
-//! index, so **a login never waits for a registration** or any other disk write, however long
-//! it takes. The exceptions are the very first login of an account, which has to append its
-//! `claim` entry and so waits for the log lock, that is, for at most one other entry's sync, and
-//! the first login of an account that has no player-character record yet (or none for the game it
-//! enters): [`Store::ensure_player_character`] reads lock-free first and takes the writer lock
-//! only to add that record, once per account and game.
+//! Account-only lookups use the index without taking the writer mutex. Logins and progress
+//! reads take the shared progress gate: they wait for a progress update, but not unrelated
+//! registration or avatar writes. A failed scene transaction keeps progress inaccessible
+//! until reopen settles its durable intent. First login also records a claim under the log
+//! mutex; the first login missing a player-character record takes the writer mutex to add it.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -58,6 +59,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use fmv_core::{name_key, AccountId, AvatarAppearance, GameId};
 
@@ -69,11 +71,12 @@ use crate::lock::LockGuard;
 use crate::model::{
     check_new_appearance_ref, game_key, is_safe_key, AccountInfo, AccountRecord, AvatarId,
     AvatarProfile, CharacterProgress, Progression, Registered, MAX_BLOB_BYTES,
-    MAX_CHARACTER_RECORD_BYTES, MAX_RECORD_BYTES, MAX_TOKEN_BYTES, SCHEMA_VERSION,
+    MAX_RECORD_BYTES, MAX_TOKEN_BYTES, SCHEMA_VERSION,
 };
 use crate::snapshot::{self, SnapshotInfo};
 
 mod player_character;
+pub(crate) mod scene;
 pub mod restyle;
 pub mod trash;
 
@@ -138,11 +141,15 @@ pub struct Store {
     max_accounts: u64,
     /// Lock 1, see the module documentation.
     writer: Mutex<Counters>,
-    /// Lock 2.
-    log: Mutex<LogWriter>,
     /// Lock 3.
+    log: Mutex<LogWriter>,
+    /// Lock 4.
     index: RwLock<Index>,
     warnings: Vec<String>,
+    /// Readers take this shared; progression writers take it exclusive after writer.
+    progress_gate: RwLock<()>,
+    /// An uncertain scene commit requires reopen/recovery before any further mutation.
+    transaction_poisoned: AtomicBool,
     /// Last field: the LOCK file is released only after everything else is gone.
     _lock: LockGuard,
 }
@@ -221,16 +228,8 @@ impl Store {
             usize::try_from(options.max_accounts.min(MAX_PRESIZED_ACCOUNTS)).unwrap_or(0);
         opened.index.reserve_for(presized);
 
-        // Settle a delete or a restore a crash interrupted, so that the report below does not mistake its leftovers
-        // for strays (and so that a committed delete is finished before anything reads the records).
-        trash::recover(&root, &opened.index, opened.next_account_id, &mut warnings)?;
-
-        for message in find_unreferenced_records(&root, &opened.index)? {
-            tracing::warn!("{message}");
-            warnings.push(message);
-        }
-
-        Ok(Store {
+        let next_account_id = opened.next_account_id;
+        let mut store = Store {
             root,
             max_accounts: options.max_accounts,
             writer: Mutex::new(Counters {
@@ -240,8 +239,21 @@ impl Store {
             log: Mutex::new(opened.log),
             index: RwLock::new(opened.index),
             warnings,
+            progress_gate: RwLock::new(()),
+            transaction_poisoned: AtomicBool::new(false),
             _lock: lock,
-        })
+        };
+        // A progress intent is settled before trash recovery can move any of its records.
+        store.recover_scene_progress()?;
+        {
+            let index = store.index.read().unwrap_or_else(PoisonError::into_inner);
+            trash::recover(&store.root, &index, next_account_id, &mut store.warnings)?;
+            for message in find_unreferenced_records(&store.root, &index)? {
+                tracing::warn!("{message}");
+                store.warnings.push(message);
+            }
+        }
+        Ok(store)
     }
 
     pub fn root(&self) -> &Path {
@@ -321,21 +333,40 @@ impl Store {
     // is recovered instead of turning one panic into every later call failing.
 
     /// Lock 1. Every operation that writes holds it for its whole duration.
-    fn writer(&self) -> MutexGuard<'_, Counters> {
-        self.writer.lock().unwrap_or_else(PoisonError::into_inner)
+    fn writer(&self) -> Result<MutexGuard<'_, Counters>> {
+        let guard = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        self.ensure_transaction_healthy()?;
+        Ok(guard)
     }
 
-    /// Lock 2.
+    fn ensure_transaction_healthy(&self) -> Result<()> {
+        if self.transaction_poisoned.load(Ordering::Acquire) {
+            return Err(PersistError::TransactionRecoveryRequired);
+        }
+        Ok(())
+    }
+
+    fn progress_read(&self) -> Result<RwLockReadGuard<'_, ()>> {
+        let guard = self.progress_gate.read().unwrap_or_else(PoisonError::into_inner);
+        self.ensure_transaction_healthy()?;
+        Ok(guard)
+    }
+
+    fn progress_write(&self) -> RwLockWriteGuard<'_, ()> {
+        self.progress_gate.write().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Lock 3.
     fn log(&self) -> MutexGuard<'_, LogWriter> {
         self.log.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Lock 3, shared.
+    /// Lock 4, shared.
     fn index(&self) -> RwLockReadGuard<'_, Index> {
         self.index.read().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Lock 3, exclusive: only after the matching log entry is durable.
+    /// Lock 4, exclusive: only after the matching log entry is durable.
     fn index_mut(&self) -> RwLockWriteGuard<'_, Index> {
         self.index.write().unwrap_or_else(PoisonError::into_inner)
     }
@@ -492,7 +523,7 @@ impl Store {
         character: Option<NewPlayerCharacter>,
     ) -> Result<(AccountId, Option<AvatarProfile>, Option<PlayerCharacter>)> {
         let key = name_key(&name);
-        let mut counters = self.writer();
+        let mut counters = self.writer()?;
         {
             let index = self.index();
             if index.len() as u64 >= self.max_accounts {
@@ -580,11 +611,12 @@ impl Store {
     /// Resolve a token to its account. Unknown, malformed and oversized tokens all fail with
     /// [`PersistError::InvalidToken`].
     ///
-    /// Only reads the in-memory index, so it never waits for a registration or any other
-    /// write. The first successful login of an account also records, durably, that its token
+    /// Reads the in-memory index under the shared progress gate, so it waits for a scene
+    /// commit but not unrelated writes. The first successful login also records that its token
     /// has been used (which is what keeps `release_unclaimed` away from it); that is one
     /// appended log entry, and a failure to write it never fails the login.
     pub fn authenticate(&self, token: &str) -> Result<AccountId> {
+        let _read = self.progress_read()?;
         if token.len() > MAX_TOKEN_BYTES {
             return Err(PersistError::InvalidToken);
         }
@@ -606,6 +638,7 @@ impl Store {
     /// refuses) or the release is (and this login fails like any unknown token).
     fn claim(&self, id: u64) -> Result<()> {
         let mut log = self.log();
+        self.ensure_transaction_healthy()?;
         match self.index().account(id) {
             None => return Err(PersistError::InvalidToken),
             Some(entry) if entry.claimed => return Ok(()),
@@ -640,7 +673,9 @@ impl Store {
     /// write the entry is logged, not returned: the account counts as claimed for the rest of this
     /// run and the next run asks again, as for a login.
     pub fn mark_claimed(&self, account: AccountId) -> Result<bool> {
+        let _read = self.progress_read()?;
         let mut log = self.log();
+        self.ensure_transaction_healthy()?;
         match self.index().account(account.0) {
             None => return Err(PersistError::UnknownAccount(account)),
             Some(entry) if entry.claimed => return Ok(false),
@@ -711,7 +746,7 @@ impl Store {
     /// seconds, so a day is generous). Releasing is one synced log entry; removing the record
     /// files afterwards is best effort and any leftover is only reported on the next open.
     pub fn release_unclaimed(&self, account: AccountId) -> Result<()> {
-        let _counters = self.writer();
+        let _counters = self.writer()?;
         let avatar = self
             .index()
             .account(account.0)
@@ -784,7 +819,7 @@ impl Store {
         base_archetype: &str,
         now: u64,
     ) -> Result<AvatarProfile> {
-        let mut counters = self.writer();
+        let mut counters = self.writer()?;
         match self.index().account(account.0) {
             None => return Err(PersistError::UnknownAccount(account)),
             Some(entry) if entry.avatar.is_some() => {
@@ -833,7 +868,7 @@ impl Store {
             .ok_or(PersistError::InvalidName)?;
 
         // Held across the write so snapshots and other writers see whole operations only.
-        let _counters = self.writer();
+        let _counters = self.writer()?;
         {
             let index = self.index();
             let entry = index
@@ -893,6 +928,7 @@ impl Store {
     /// The account's progression for `game`, or an empty default if none was stored yet.
     /// Fails with [`PersistError::UnknownAccount`] for an account that does not exist.
     pub fn get_progression(&self, account: AccountId, game: GameId) -> Result<Progression> {
+        let _read = self.progress_read()?;
         if !self.index().contains_account(account.0) {
             return Err(PersistError::UnknownAccount(account));
         }
@@ -930,7 +966,8 @@ impl Store {
         }
         let path = self.progression_path(progression.account_id.0, progression.game)?;
 
-        let _counters = self.writer();
+        let _counters = self.writer()?;
+        let _progress = self.progress_write();
         if !self.index().contains_account(progression.account_id.0) {
             return Err(PersistError::UnknownAccount(progression.account_id));
         }
@@ -959,7 +996,8 @@ impl Store {
     {
         let path = self.progression_path(account.0, game)?;
 
-        let _counters = self.writer();
+        let _counters = self.writer()?;
+        let _progress = self.progress_write();
         if !self.index().contains_account(account.0) {
             return Err(PersistError::UnknownAccount(account));
         }
@@ -1002,13 +1040,14 @@ impl Store {
     /// from its game's starting stock), which is what every record written before inventories
     /// existed looks like. `Some(vec![])` is a stored, empty inventory.
     ///
-    /// Takes no writer lock: a write replaces the file atomically, so this sees the whole old
-    /// record or the whole new one, and a login never waits for a battle result being saved.
+    /// Takes the shared progress gate, so it cannot observe a partially committed scene.
+    /// Use `get_progress_pair` when both character and story must belong to the same snapshot.
     pub fn get_character_progress(
         &self,
         account: AccountId,
         game: GameId,
     ) -> Result<Option<CharacterProgress>> {
+        let _read = self.progress_read()?;
         if !self.index().contains_account(account.0) {
             return Err(PersistError::UnknownAccount(account));
         }
@@ -1021,10 +1060,11 @@ impl Store {
         game: GameId,
     ) -> Result<Option<CharacterProgress>> {
         let path = self.character_path(account.0, game)?;
-        let Some(record) = fsio::read_json::<CharacterProgress>(&path, MAX_CHARACTER_RECORD_BYTES)?
+        let Some(stored) = scene::CharacterRecord::read(&path)?
         else {
             return Ok(None);
         };
+        let record = stored.progress;
         if record.account_id != account || record.game != game {
             return Err(PersistError::corrupt(
                 &path,
@@ -1060,14 +1100,15 @@ impl Store {
         record.validate()?;
         let path = self.character_path(record.account_id.0, record.game)?;
 
-        let _counters = self.writer();
+        let _counters = self.writer()?;
+        let _progress = self.progress_write();
         if !self.index().contains_account(record.account_id.0) {
             return Err(PersistError::UnknownAccount(record.account_id));
         }
         fsio::ensure_dir(&self.progression_dir(record.account_id.0))?;
         let mut stored = record.clone();
         stored.schema_version = SCHEMA_VERSION;
-        fsio::write_json(&path, &stored, MAX_CHARACTER_RECORD_BYTES)
+        self.write_character_record(&path, stored).map(|_| ())
     }
 
     /// Read-modify-write of the account's [`CharacterProgress`] for `game`, as one step that no
@@ -1094,7 +1135,8 @@ impl Store {
     {
         let path = self.character_path(account.0, game)?;
 
-        let _counters = self.writer();
+        let _counters = self.writer()?;
+        let _progress = self.progress_write();
         if !self.index().contains_account(account.0) {
             return Err(PersistError::UnknownAccount(account));
         }
@@ -1115,8 +1157,7 @@ impl Store {
         next.validate()?;
         next.schema_version = SCHEMA_VERSION;
         fsio::ensure_dir(&self.progression_dir(account.0))?;
-        fsio::write_json(&path, &next, MAX_CHARACTER_RECORD_BYTES)?;
-        Ok(next)
+        self.write_character_record(&path, next)
     }
 
     // ---- maintenance -------------------------------------------------------------------
@@ -1127,7 +1168,7 @@ impl Store {
     /// for an operator who wants it now. Registration waits while it runs (it holds the writer
     /// lock); logins are unaffected except an account's very first one.
     pub fn compact_index(&self) -> Result<()> {
-        let counters = self.writer();
+        let counters = self.writer()?;
         let mut log = self.log();
         let path = self.log_path();
         let (len, _entries) = {
@@ -1164,7 +1205,7 @@ impl Store {
     /// Logins keep working while it runs, apart from an account's very first one in the
     /// moment the log is copied.
     pub fn snapshot(&self, dest: impl AsRef<Path>) -> Result<SnapshotInfo> {
-        let _writers_excluded = self.writer();
+        let _writers_excluded = self.writer()?;
         snapshot::snapshot_tree(&self.root, dest.as_ref(), &self.log)
     }
 }
@@ -1350,7 +1391,7 @@ mod tests {
 
         // A registration (or any writer) holds the writer lock for its whole duration. Nothing a
         // login does may need it.
-        let held = store.writer();
+        let held = store.writer().unwrap();
         let s = Arc::clone(&store);
         let token = reg.token.clone();
         finishes_promptly(move || {
@@ -1387,7 +1428,7 @@ mod tests {
         let (account, token) = store.create_account("Cid", 5).unwrap();
         assert_eq!(store.unclaimed_accounts().len(), 1);
 
-        let held = store.writer();
+        let held = store.writer().unwrap();
         let s = Arc::clone(&store);
         let logged_in = finishes_promptly(move || s.authenticate(&token).unwrap());
         assert_eq!(logged_in, account);

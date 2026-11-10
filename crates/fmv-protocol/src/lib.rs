@@ -428,6 +428,10 @@ pub use fmv_party::{
 pub const PROTOCOL_VERSION: u16 = 18;
 /// Hard cap on a single frame payload (bytes).
 pub const MAX_FRAME: u32 = 256 * 1024;
+
+/// Maximum story snapshot retained by either endpoint. FF7's bounded version 3 bank state
+/// needs at most 5,117 bytes; this leaves room for an adapter header without accepting an entire frame.
+pub const MAX_STORY_PROGRESS_BYTES: usize = 8 * 1024;
 /// Default TCP port for development. Deployment port is UNASSIGNED (see DEPLOYMENT-CONTRACT.md).
 pub const DEFAULT_DEV_PORT: u16 = 47_770;
 

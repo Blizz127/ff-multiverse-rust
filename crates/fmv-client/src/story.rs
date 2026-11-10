@@ -55,8 +55,8 @@ use crate::state::NpcView;
 
 /// Notes kept until the loop prints them; beyond this the oldest are dropped.
 const MAX_NOTES: usize = 32;
-/// Longest progression blob the mirror keeps (the server keeps at most 256 bytes of one).
-pub const MAX_PROGRESS_BYTES: usize = 256;
+/// Longest progression blob the mirror keeps, matching the server's bounded story snapshot.
+pub const MAX_PROGRESS_BYTES: usize = fmv_protocol::MAX_STORY_PROGRESS_BYTES;
 /// Longest summary the notes repeat (characters).
 const MAX_SUMMARY_CHARS: usize = 48;
 

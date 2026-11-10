@@ -271,17 +271,27 @@ impl SceneVars {
     pub fn unknown_persistent_reads(&self) -> std::collections::BTreeSet<(u8, u8)> {
         self.unknown_persistent_reads.borrow().clone()
     }
-}
 
-impl StoryVars for SceneVars {
-    fn byte(&self, bank: u8, address: u8) -> u8 {
-        if (1..=4).contains(&bank) && self.story.known_byte(bank, address).is_none() {
-            self.unknown_persistent_reads.borrow_mut().insert((bank, address));
+    /// Version 3 uses the game's shared byte/word banks; old replays keep their original interpretation.
+    pub(super) fn key(&self, bank: u8, address: u8) -> (u8, u8) {
+        let bank = if self.story.supports_extended() {
+            // Temporary selectors 5/6 share bytes too, but never enter persistent story data.
+            if bank == 6 { 5 } else { crate::story::canonical_persistent_bank(bank).unwrap_or(bank) }
+        } else { bank };
+        (bank, address)
+    }
+
+    /// A preview value without treating an overwrite or comparison for change as a script read.
+    pub(super) fn baseline_byte(&self, bank: u8, address: u8) -> u8 {
+        if self.story.supports_extended() {
+            let key = self.key(bank, address);
+            let mask = self.story.known_mask(bank, address);
+            let given = self.given.iter().find(|g| self.key(g.bank, g.address) == key).map_or(0, |g| g.value);
+            return (self.story.byte(bank, address) & mask) | (given & !mask);
         }
         let moment = bank == MOMENT_BANK && address <= MOMENT_ADDRESS.wrapping_add(1);
         if !moment {
             if let Some(g) = self.given.iter().find(|g| g.bank == bank && g.address == address) {
-                // The bits the story model carries are the player's story's own; the rest are what the scene was found with.
                 return match tracked_var(bank, address) {
                     Some(t) => (g.value & !t.bits) | (self.story.byte(bank, address) & t.bits),
                     None => g.value,
@@ -289,6 +299,22 @@ impl StoryVars for SceneVars {
             }
         }
         self.story.byte(bank, address)
+    }
+
+    fn audit_mask(&self, bank: u8, address: u8, mask: u8) {
+        let persistent = if self.story.supports_extended() {
+            crate::story::canonical_persistent_bank(bank).is_some()
+        } else { (1..=4).contains(&bank) };
+        if persistent && self.story.known_mask(bank, address) & mask != mask {
+            self.unknown_persistent_reads.borrow_mut().insert(self.key(bank, address));
+        }
+    }
+}
+
+impl StoryVars for SceneVars {
+    fn byte(&self, bank: u8, address: u8) -> u8 {
+        self.audit_mask(bank, address, u8::MAX);
+        self.baseline_byte(bank, address)
     }
 
     fn party_member(&self, slot: u8) -> Option<u8> {
@@ -497,6 +523,8 @@ pub struct Vm {
     limits: Limits,
     vars: SceneVars,
     writes: BTreeMap<(u8, u8), u8>,
+    /// Bits assigned by this run. A bit write does not initialize its unknown neighbours.
+    written_masks: BTreeMap<(u8, u8), u8>,
     threads: Vec<Thread>,
     slots: BTreeMap<(usize, u8), usize>,
     seq: u64,
@@ -540,6 +568,7 @@ impl Vm {
             limits,
             vars,
             writes: BTreeMap::new(),
+            written_masks: BTreeMap::new(),
             threads: Vec::new(),
             slots: BTreeMap::new(),
             seq: 0,
@@ -655,23 +684,54 @@ impl Vm {
     // ---- variables --------------------------------------------------------------------------------------------
 
     fn var_byte(&self, bank: u8, address: u8) -> u8 {
-        self.writes.get(&(bank, address)).copied().unwrap_or_else(|| self.vars.byte(bank, address))
+        if !self.vars.story.supports_extended() {
+            return self.writes.get(&(bank, address)).copied().unwrap_or_else(|| self.vars.byte(bank, address));
+        }
+        let key = self.vars.key(bank, address);
+        let written = self.written_masks.get(&key).copied().unwrap_or(0);
+        self.vars.audit_mask(bank, address, !written);
+        self.peek_byte(bank, address)
+    }
+
+    fn peek_byte(&self, bank: u8, address: u8) -> u8 {
+        self.writes.get(&self.vars.key(bank, address)).copied().unwrap_or_else(|| self.vars.baseline_byte(bank, address))
+    }
+
+    pub(super) fn written_mask(&self, bank: u8, address: u8) -> u8 {
+        self.written_masks.get(&self.vars.key(bank, address)).copied().unwrap_or(0)
     }
 
     fn var_word(&self, bank: u8, address: u8) -> u16 {
+        if self.vars.story.supports_extended() && address == u8::MAX {
+            // There is no high byte at this address. Do not let a guessed zero authorize an outcome.
+            self.vars.unknown_persistent_reads.borrow_mut().insert(self.vars.key(bank, address));
+            return 0;
+        }
         let low = self.var_byte(bank, address);
         let high = address.checked_add(1).map_or(0, |a| self.var_byte(bank, a));
         u16::from_le_bytes([low, high])
     }
 
     fn set_byte(&mut self, bank: u8, address: u8, value: u8) {
-        if self.var_byte(bank, address) != value {
+        self.set_masked(bank, address, value, u8::MAX);
+    }
+
+    fn set_masked(&mut self, bank: u8, address: u8, value: u8, mask: u8) {
+        let key = self.vars.key(bank, address);
+        let old = if self.vars.story.supports_extended() { self.peek_byte(bank, address) } else { self.var_byte(bank, address) };
+        let old_mask = self.written_masks.get(&key).copied().unwrap_or(0);
+        if old != value || (self.vars.story.supports_extended() && old_mask & mask != mask) {
             self.epoch = self.epoch.wrapping_add(1);
         }
-        self.writes.insert((bank, address), value);
+        self.writes.insert(key, value);
+        self.written_masks.insert(key, old_mask | mask);
     }
 
     fn set_word(&mut self, bank: u8, address: u8, value: u16) {
+        if self.vars.story.supports_extended() && address == u8::MAX {
+            self.stats.unresolved = self.stats.unresolved.saturating_add(1);
+            return; // Refuse the whole assignment, including its low byte.
+        }
         let [low, high] = value.to_le_bytes();
         self.set_byte(bank, address, low);
         if let Some(next) = address.checked_add(1) {
@@ -699,7 +759,9 @@ impl Vm {
     fn known_operand_bit(&self, ins: &Instruction, name: &str, bit: i32) -> Option<bool> {
         let bit = u8::try_from(bit).ok().filter(|bit| *bit < 8)?;
         let (bank, address) = Self::dest(ins, name)?;
-        self.writes.get(&(bank, address)).map(|value| value & (1 << bit) != 0)
+        self.writes.get(&self.vars.key(bank, address))
+            .filter(|_| !self.vars.story.supports_extended() || self.written_mask(bank, address) & (1 << bit) != 0)
+            .map(|value| value & (1 << bit) != 0)
             .or_else(|| self.vars.story.known_bit(bank, address, bit))
     }
 
@@ -762,13 +824,20 @@ impl Vm {
     fn flip_bit(&mut self, bank: u8, address: u8, bit: i32, op: u8) {
         let byte_at = address.checked_add(u8::try_from(bit / 8).unwrap_or(0));
         let (Some(byte_at), Some(mask)) = (byte_at, 1u8.checked_shl(u32::try_from(bit % 8).unwrap_or(0))) else { return };
-        let cur = self.var_byte(bank, byte_at);
+        let extended = self.vars.story.supports_extended();
+        let cur = if extended {
+            if op != 0x82 && op != 0x83 {
+                // XOR needs the old selected bit; setting or clearing does not.
+                self.vars.audit_mask(bank, byte_at, mask & !self.written_mask(bank, byte_at));
+            }
+            self.peek_byte(bank, byte_at)
+        } else { self.var_byte(bank, byte_at) };
         let new = match op {
             0x82 => cur | mask,
             0x83 => cur & !mask,
             _ => cur ^ mask,
         };
-        self.set_byte(bank, byte_at, new);
+        self.set_masked(bank, byte_at, new, if extended { mask } else { u8::MAX });
     }
 
     fn random(&mut self) -> u8 {

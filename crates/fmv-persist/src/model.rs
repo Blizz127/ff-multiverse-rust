@@ -38,17 +38,12 @@ pub const MAX_INDEX_BYTES: u64 = 16 * 1024 * 1024;
 /// serialized as a list of numbers is several times its size), so a server must keep it in the
 /// store and put only a short key of it (an id, a hash) on the wire.
 pub const MAX_BLOB_BYTES: usize = 256 * 1024;
-/// Largest accepted [`CharacterProgress`] record file: the cap a corrupt or hostile file is held
-/// to, on read (before it is parsed) and on write.
-///
-/// A record without an inventory is about 170 bytes. The store writes pretty-printed JSON, which
-/// costs about 50 bytes per inventory stack (55 when the numbers have five digits), so the
-/// largest valid record ([`MAX_INVENTORY_STACKS`] stacks) is under 18 KB and this cap leaves it
-/// nearly twice that. A record that passes the store's checks can therefore never be refused as
-/// too large; a unit test pins that, so raising the stack limit in `fmv-core` fails there instead
-/// of in production. (Builds from before the inventory held this to 4 KiB, which an inventory
-/// outgrows: see [`CharacterProgress::inventory`].)
-pub const MAX_CHARACTER_RECORD_BYTES: u64 = 32 * 1024;
+/// Largest accepted character-progress file, including its private schema-2 scene receipts.
+/// The original fields and a full inventory use under 18 KiB. Up to
+/// [`MAX_SCENE_RECEIPTS`](crate::MAX_SCENE_RECEIPTS) durable receipt hashes fit alongside them;
+/// those receipts are never evicted. Receipt-bearing records require schema 2, which older
+/// servers refuse to read. Records without receipts retain their original schema-1 shape.
+pub const MAX_CHARACTER_RECORD_BYTES: u64 = 512 * 1024;
 /// Longest accepted `base_archetype` (bytes).
 pub const MAX_ARCHETYPE_BYTES: usize = 64;
 /// Longest accepted per-game appearance reference, in **characters**: exactly the limit the

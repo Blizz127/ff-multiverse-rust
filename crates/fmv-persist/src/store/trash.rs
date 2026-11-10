@@ -74,12 +74,13 @@ use fmv_core::{name_key, AccountId};
 use serde::{Deserialize, Serialize};
 
 use super::{new_token, token_hash, Store, ACCOUNTS_DIR, AVATARS_DIR, CHARACTERS_DIR, PROGRESSION_DIR};
+use super::scene::CharacterRecord;
 use crate::character::{PlayerCharacter, MAX_PLAYER_CHARACTER_BYTES};
 use crate::error::{PersistError, Result};
 use crate::fsio;
 use crate::index::{AccountEntry, Index, Op};
 use crate::model::{
-    is_safe_key, AccountRecord, AvatarId, AvatarProfile, CharacterProgress, Progression, MAX_CHARACTER_RECORD_BYTES,
+    is_safe_key, AccountRecord, AvatarId, AvatarProfile, Progression, MAX_CHARACTER_RECORD_BYTES,
     MAX_RECORD_BYTES, SCHEMA_VERSION,
 };
 
@@ -466,7 +467,7 @@ fn load_records(dir: &Path, manifest: &Manifest) -> Result<EntryRecords> {
 /// A progress record of an entry (story blob or character progress), checked against the account it was filed under.
 enum Progress {
     Story(Progression),
-    Character(CharacterProgress),
+    Character(CharacterRecord),
 }
 
 fn read_progress(path: &Path, rel: &str, account: u64) -> Result<Progress> {
@@ -485,12 +486,11 @@ fn read_progress(path: &Path, rel: &str, account: u64) -> Result<Progress> {
             Ok(Progress::Story(record))
         }
         ProgressKind::Character => {
-            let record: CharacterProgress = fsio::read_json(path, MAX_CHARACTER_RECORD_BYTES)?
+            let record = CharacterRecord::read(path)?
                 .ok_or_else(|| PersistError::corrupt(path, "the manifest lists it but it is not in the entry"))?;
-            if record.account_id.0 != account || !known(record.game) {
+            if record.progress.account_id.0 != account || !known(record.progress.game) {
                 return Err(PersistError::corrupt(path, "the record is not for this account and the game its name says"));
             }
-            record.validate().map_err(|e| PersistError::corrupt(path, e.to_string()))?;
             Ok(Progress::Character(record))
         }
     }
@@ -515,7 +515,8 @@ fn write_progress(root: &Path, dir: &Path, manifest: &Manifest, new_account: u64
                     fsio::write_json(&target, &record, MAX_RECORD_BYTES)
                 }
                 Progress::Character(mut record) => {
-                    record.account_id = AccountId(new_account);
+                    // Keep the durable scene receipts along with the character's earned progress.
+                    record.progress.account_id = AccountId(new_account);
                     fsio::write_json(&target, &record, MAX_CHARACTER_RECORD_BYTES)
                 }
             }
@@ -542,8 +543,8 @@ fn remove_unreferenced_restore_records(root: &Path, plan: &RestorePlan) {
 /// Settle the trash entries a crash (or a failed move) left in flight. Runs when the store opens, after the index is
 /// replayed (`index`, `next_account_id`) and before anything else looks at the records. Only acts on entries whose
 /// account is in the state the entry says: see the module documentation. Whatever it does is a warning, and a
-/// failure to settle one entry is a warning too, not a reason to refuse to open the store (the records it concerns
-/// are unreferenced, and the next open tries again).
+/// failure to settle an uncommitted entry is a warning (the records are unreferenced). A committed restore whose
+/// progress cannot be completed refuses opening: gameplay must never replace its missing progress or scene receipts.
 pub(super) fn recover(root: &Path, index: &Index, next_account_id: u64, warnings: &mut Vec<String>) -> Result<()> {
     let trash = root.join(TRASH_DIR);
     for name in fsio::list_subdirs(&trash)? {
@@ -561,6 +562,9 @@ pub(super) fn recover(root: &Path, index: &Index, next_account_id: u64, warnings
             }
             Ok(None) => {}
             Err(e) => {
+                if matches!(parsed.state, TrashState::Restoring { as_account } if index.contains_account(as_account.0)) {
+                    return Err(PersistError::corrupt(&dir, format!("committed restore could not finish; gameplay remains unavailable: {e}")));
+                }
                 let message = format!("could not settle the trash entry {name}: {e}; it is left as it is and the next open tries again");
                 tracing::warn!("{message}");
                 warnings.push(message);
@@ -675,7 +679,8 @@ impl Store {
     /// not exist (also one that was deleted a moment ago). `now` is the caller's unix time in seconds.
     pub fn delete_account(&self, account: AccountId, now: u64) -> Result<Deleted> {
         // Held for the whole delete: no other write, and no snapshot, sees it half done.
-        let _counters = self.writer();
+        let _counters = self.writer()?;
+        let _progress = self.progress_write();
         let prepared = self.prepare_delete(account, now)?;
         if let Err(e) = self.commit_delete(account) {
             // Nothing was committed: the entry is only a plan. (If this fails, the next open abandons it.)
@@ -850,7 +855,8 @@ impl Store {
     /// Would [`Store::restore_account`] restore `entry` now? Runs every check it runs, writes nothing, and returns the
     /// entry as [`Store::trash_entries`] lists it: for a dry run.
     pub fn restore_check(&self, entry: &str) -> Result<TrashEntry> {
-        let _counters = self.writer();
+        let _counters = self.writer()?;
+        let _progress = self.progress_write();
         let checked = self.check_restorable(entry)?;
         Ok(TrashEntry {
             name: entry.to_owned(),
@@ -874,7 +880,8 @@ impl Store {
     /// [`PersistError::NoSuchTrashEntry`] if `entry` is not there or is not restorable (a delete or a restore in
     /// flight, or one that was restored already).
     pub fn restore_account(&self, entry: &str, now: u64) -> Result<Restored> {
-        let mut counters = self.writer();
+        let mut counters = self.writer()?;
+        let _progress = self.progress_write();
         let Checked { base, dir, mut manifest, records, name, key } = self.check_restorable(entry)?;
         let trash = self.trash_dir();
         let new_account = counters.next_account_id;
@@ -958,6 +965,10 @@ impl Store {
             }
         }
         if !unfinished.is_empty() {
+            // The index already admits the restored account. Do not allow its missing progress to be
+            // mistaken for a fresh character, which would also lose any once-only scene receipts.
+            // Keep the administrative result/token below, but require successful recovery before play.
+            self.transaction_poisoned.store(true, std::sync::atomic::Ordering::Release);
             tracing::warn!(account = new_account, ?unfinished, "a restored account's progress was not all written; the next open of the store finishes it");
         }
         Ok(Restored {

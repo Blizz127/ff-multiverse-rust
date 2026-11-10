@@ -1,6 +1,9 @@
 # Proposed once-only station choice
 
-Status: design for owner decision. Not implemented or authorized for live data.
+Status (2026-11-10): the owner's full FF7/Disc 1 goal authorizes local implementation.
+The store transaction, receipts, recovery and acknowledged saver queue are implemented and
+tested on disposable stores. Scene-world integration is pending; the flower scene remains
+disabled. No live store has been converted.
 
 The `md8_2` scene has a choice that may subtract one gil and advances the story. The existing
 store keeps story and character progress in separate files. Each file is atomically replaced, but
@@ -67,7 +70,6 @@ exactly one debit and consistent story, and ensure concurrent readers and backup
 pair. Verify startup failure and no gameplay on unrecoverable intent, plus compatibility and the
 rollback procedure on a copy. A normal private build then gets a startup check and scene smoke.
 
-Owner decision requested: authorize implementation and, separately, use of this new recoverable
-transaction format on the live private FF Multiverse store after a verified backup and active-player
-protection. Until then the gil-changing scene remains disabled; independent route and presentation
-work can continue without touching the store.
+Local implementation can proceed under the full FF7 goal. Live use still requires a verified
+backup and active-player protection, plus the complete scene integration and verification above.
+The gil-changing scene remains disabled while those implementation steps are unfinished.

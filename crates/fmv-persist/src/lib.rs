@@ -14,8 +14,8 @@
 //!   registration and stopped accepting registrations for good at about 121,000 accounts). The
 //!   number of accounts is bounded by [`StoreOptions::max_accounts`] instead, with a clear
 //!   error ([`PersistError::AccountLimitReached`]) that costs nothing and touches no login.
-//! * **Logins never wait for writes.** Token lookups read in-memory tables; no registration,
-//!   avatar or progression write, and no fsync, ever blocks one.
+//! * **Account lookups avoid unrelated writes.** Token lookups read in-memory tables. Progress
+//!   reads and logins share a progress gate so a scene transaction cannot expose half a result.
 //! * **Atomic registration.** [`Store::register`] validates every input before it writes
 //!   anything, then creates the account and its avatar together; there is no failure path that
 //!   leaves a name taken without a token having been returned. [`Store::release_unclaimed`]
@@ -39,6 +39,12 @@
 //!   stored is absent, not a default (the game's own data supplies the start, so there is nothing
 //!   to migrate), and the game's caps and curves stay with its adapter: the store checks only what
 //!   is true of every game.
+//! * **A scene can update story and character progress together, once.**
+//!   [`Store::commit_scene_progress_with_result`] writes a recoverable intent and durable receipt;
+//!   [`Store::get_progress_pair`] reads both records coherently. An uncertain commit refuses
+//!   further progress reads and mutations until reopening recovers it. Character saves preserve
+//!   receipts automatically. Receipt-bearing character records use schema 2; older servers must
+//!   not be used against these records or an outstanding intent.
 //! * **The story blob moves forward through one atomic step.** [`Progression`] (one opaque blob per
 //!   account and game, read only by the game's adapter) is written with [`Store::put_progression`] or,
 //!   when the new value depends on the old one, [`Store::update_progression`]: a read-modify-write under
@@ -91,7 +97,8 @@
 //!
 //! [`Store`] is `Send + Sync` and every method takes `&self`; share it as `Arc<Store>`. Calls
 //! block on disk I/O, so async code should call them from `spawn_blocking`. Writers are
-//! serialized with each other; readers (everything a login needs) are not blocked by them.
+//! serialized with each other. Progress readers share a gate with progress writers so paired
+//! scene changes are never observed halfway through; account-only lookups use the index.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(
@@ -129,3 +136,4 @@ pub use snapshot::{restore_snapshot, SnapshotInfo};
 pub use store::restyle::{Restyle, RestyleAdded, RestyleError, RestyleReport};
 pub use store::trash::{Deleted, Restored, TrashEntry, TrashState};
 pub use store::{Store, StoreOptions, DEFAULT_MAX_ACCOUNTS};
+pub use store::scene::{ProgressPair, SceneCommit, MAX_SCENE_RECEIPTS};

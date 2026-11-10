@@ -14,9 +14,9 @@
 //!   with those variables after the moment (below). The **empty blob is a new account** and means
 //!   [`NEW_GAME_MOMENT`] (1): the value the opening scene of `md1stin` leaves behind (`SETWORD Var[2][0] =
 //!   1`, then control is handed to the player), so a player starts where the game first lets them walk.
-//!   Every account that exists today has no progression record, or a version 1 one, and is therefore
-//!   exactly as it was. Anything else that is not exactly version 1 or 2 is unreadable and is never
-//!   interpreted, advanced or overwritten.
+//!   A legacy account keeps its recorded state and format until explicitly upgraded. Anything that is not
+//!   exactly a supported canonical version is unreadable and is never
+//!   interpreted, advanced or overwritten. Version 3 adds explicit known-bit persistent banks (below).
 //! * **The phase of an area** ([`AreaStory::phase_key`]): each field is partitioned by the moments
 //!   its own scripts compare `Var[2][0]` against (`==`, `!=`, `<`, `>`, `<=`, `>=` with a literal,
 //!   in any script of the field). Two moments in one interval make every one of those comparisons
@@ -45,6 +45,22 @@
 //! further moment, the union of the set bits. **Rollback:** a build that predates version 2 reads a version 2
 //! blob as unreadable (it plays in a phase of its own and never overwrites the record), as it does any blob
 //! it does not know.
+//!
+//! # Persistent banks (blob version 3)
+//!
+//! Version 3 carries all five persistent field banks with a known-bit mask for every recorded byte.
+//! Aliased byte/word bank selectors address the same underlying bytes; the moment remains in the header.
+//! Missing values stay unknown. A known zero is stored explicitly. [`StoryState::write_masked`],
+//! [`StoryState::write_byte`] and [`StoryState::write_word`] apply authored writes, and
+//! [`StoryState::add_byte_checked`] provides ordered numeric changes with caller-supplied bounds.
+//! Existing version 1/2 states keep their byte-for-byte representation until explicitly promoted;
+//! promotion retains their tracked knowledge and does not infer new-game defaults or past choices.
+//! The largest representation is [`MAX_BANK_BLOB_BYTES`] bytes. Readers must allow that bound before
+//! enabling this format. The legacy union merge refuses version 3: a transactional store must use
+//! [`compare_exchange_progression`] against the exact previous blob, under the same lock as its
+//! scene receipt, so stale saves cannot undo clears or numeric updates. This module performs no I/O.
+//! Version 3 phases include every carried value and knowledge mask; this conservative partition can
+//! later be narrowed with field-specific dependency evidence.
 //!
 //! # Story points
 //!
@@ -158,6 +174,8 @@ use crate::script::dialogue::{self, StoryVars};
 use crate::script::{FieldScript, Instruction, Operand, SCRIPTS_PER_ENTITY};
 
 pub(crate) mod scan;
+mod banks;
+pub use banks::{canonical_persistent_bank, compare_exchange_progression, StoryWriteError, BLOB_VERSION_BANKS, MAX_BANK_BLOB_BYTES};
 
 /// The bank of the main progress counter (`Var[2][0]`).
 pub const MOMENT_BANK: u8 = 2;
@@ -249,13 +267,15 @@ pub fn tracked_var(bank: u8, address: u8) -> Option<TrackedVar> {
     TRACKED_VARS.iter().copied().find(|t| t.bank == bank && t.address == address)
 }
 
-/// An account's FF7 story state: where its main story stands, and the few other variables the model carries.
+/// An account's FF7 story state: its moment, legacy variables, or version 3 persistent bank knowledge.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoryState {
     /// The main progress counter (`Var[2][0]`).
     pub moment: u16,
     /// The tracked variables with a non-zero value, as bytes.
     vars: BTreeMap<(u8, u8), u8>,
+    /// Canonical persistent banks with known-bit masks; absent in the legacy formats.
+    banks: Option<BTreeMap<(u8, u8), banks::KnownByte>>,
 }
 
 impl StoryState {
@@ -266,11 +286,11 @@ impl StoryState {
 
     /// The story at `moment` with every other variable 0.
     pub const fn at(moment: u16) -> Self {
-        Self { moment, vars: BTreeMap::new() }
+        Self { moment, vars: BTreeMap::new(), banks: None }
     }
 
     /// Read a progression blob: empty is a new account, `[1, lo, hi]` a stored moment, a canonical version 2
-    /// blob a moment and variables; anything else is unreadable (`None`).
+    /// blob a moment and variables, version 3 persistent values and known masks; anything else is unreadable (`None`).
     // (`as_chunks` would satisfy the lint but needs Rust 1.88; the workspace keeps `chunks_exact`, see `lgp`.)
     #[allow(clippy::chunks_exact_to_as_chunks)]
     pub fn decode(blob: &[u8]) -> Option<Self> {
@@ -297,13 +317,15 @@ impl StoryState {
                 }
                 Some(state)
             }
+            [BLOB_VERSION_BANKS, ..] => banks::decode(blob),
             _ => None,
         }
     }
 
     /// The blob that stores this state: version 1 (`[1, lo, hi]`, exactly what version 1 builds wrote) when no
-    /// variable is set, else the canonical version 2.
+    /// variable is set, else the canonical version 2; an explicitly extended state always writes version 3.
     pub fn encode(&self) -> Vec<u8> {
+        if let Some(banks) = &self.banks { return banks::encode(self.moment, banks); }
         let [lo, hi] = self.moment.to_le_bytes();
         if self.vars.is_empty() {
             return vec![BLOB_VERSION, lo, hi];
@@ -315,14 +337,17 @@ impl StoryState {
         blob
     }
 
-    /// The value of a variable beyond the moment (0 unless a story step set bits in it).
+    /// The carried value (unknown bits read zero here). Use `known_byte`/`known_bit` for authoritative guards;
+    /// version 3 resolves bank aliases, including the moment's byte view.
     pub fn var(&self, bank: u8, address: u8) -> u8 {
+        if self.supports_extended() { return self.bank_byte(bank, address).value; }
         self.vars.get(&(bank, address)).copied().unwrap_or(0)
     }
 
     /// The variables beyond the moment that are not 0, as `((bank, address), value)`.
     pub fn vars(&self) -> impl Iterator<Item = ((u8, u8), u8)> + '_ {
         self.vars.iter().map(|(&key, &value)| (key, value))
+            .chain(self.banks.iter().flat_map(|b| b.iter()).filter(|(_, b)| b.value != 0).map(|(&key, b)| (key, b.value)))
     }
 
     /// Turn bit `bit` of the tracked variable `bank`/`address` on or off. `true` when that changed the state
@@ -333,6 +358,9 @@ impl StoryState {
         let Some(mask) = 1u8.checked_shl(u32::from(bit)).filter(|m| tracked.bits & m != 0) else { return false };
         if on && tracked.never_set & mask != 0 {
             return false;
+        }
+        if self.supports_extended() {
+            return self.write_masked(bank, address, if on { mask } else { 0 }, mask).unwrap_or(false);
         }
         let old = self.var(bank, address);
         let new = if on { old | mask } else { old & !mask };
@@ -352,6 +380,10 @@ impl StoryState {
     /// The byte at `bank`/`address` when the model knows all of it: the moment's two bytes, or a tracked
     /// variable whose every bit is carried. `None` for anything else (what a guard that reads it cannot decide).
     pub fn known_byte(&self, bank: u8, address: u8) -> Option<u8> {
+        if self.supports_extended() {
+            let byte = self.bank_byte(bank, address);
+            return (byte.mask == 0xFF).then_some(byte.value);
+        }
         if bank == MOMENT_BANK {
             let [lo, hi] = self.moment.to_le_bytes();
             return match address {
@@ -372,6 +404,10 @@ impl StoryState {
     /// (the moment's bytes, or a bit of a tracked variable); `None` otherwise.
     pub fn known_bit(&self, bank: u8, address: u8, bit: u8) -> Option<bool> {
         let mask = 1u8.checked_shl(u32::from(bit))?;
+        if self.supports_extended() {
+            let byte = self.bank_byte(bank, address);
+            return (byte.mask & mask != 0).then_some(byte.value & mask != 0);
+        }
         if bank == MOMENT_BANK {
             return self.known_byte(bank, address).map(|b| b & mask != 0);
         }
@@ -529,9 +565,13 @@ pub fn countdown_live(started: &[u8], now: &[u8]) -> bool {
 /// union of the set variable bits), so that a story never goes back and a late save cannot undo a later one. The
 /// stored bytes come back exactly as they were when the join adds nothing to them (a new account's empty blob
 /// stays empty under an equal story). A `stored` blob that cannot be read stays as it is (it is never
-/// overwritten), and so does one when `advanced` cannot be read.
+/// overwritten), and so does one when `advanced` cannot be read. If either state is version 3 this returns
+/// `stored` unchanged: ordered updates require [`compare_exchange_progression`].
 pub fn merge_progression(stored: &[u8], advanced: &[u8]) -> Vec<u8> {
     let (Some(kept), Some(newer)) = (StoryState::decode(stored), StoryState::decode(advanced)) else { return stored.to_vec() };
+    // A clear or numeric assignment cannot be merged without its exact expected predecessor.
+    // The transaction path must use compare_exchange_progression for version 3.
+    if kept.supports_extended() || newer.supports_extended() { return stored.to_vec(); }
     let joined = kept.join(&newer);
     if joined == kept {
         stored.to_vec()
@@ -929,7 +969,7 @@ fn summary(before: &StoryState, after: &StoryState) -> String {
     if before.moment != after.moment {
         words.push(format!("moment={}->{}", before.moment, after.moment));
     }
-    let keys: BTreeSet<(u8, u8)> = before.vars.keys().chain(after.vars.keys()).copied().collect();
+    let keys: BTreeSet<(u8, u8)> = before.vars().chain(after.vars()).map(|(key, _)| key).collect();
     for (bank, address) in keys {
         let (was, is) = (before.var(bank, address), after.var(bank, address));
         if was != is {
@@ -981,7 +1021,16 @@ impl AreaStory {
     /// [`NEW_GAME_MOMENT`], else a tagged key naming the interval. `None` for a blob that cannot be
     /// read.
     pub fn phase_key(&self, blob: &[u8]) -> Option<PhaseKey> {
-        let start = self.interval_start(StoryState::decode(blob)?.moment);
+        let state = StoryState::decode(blob)?;
+        let start = self.interval_start(state.moment);
+        if state.supports_extended() {
+            // Conservatively partition on all known persistent inputs, including their knownness.
+            // Include the exact moment too: the legacy interval scanner does not yet recognize
+            // every byte-alias/variable comparison that version 3 scripts can make.
+            let mut key = vec![PHASE_TAG, BLOB_VERSION_BANKS];
+            key.extend(blake3::hash(&state.encode()).as_bytes());
+            return Some(PhaseKey(key));
+        }
         if start == self.interval_start(NEW_GAME_MOMENT) {
             return Some(PhaseKey::default());
         }

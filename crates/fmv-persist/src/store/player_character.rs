@@ -101,7 +101,7 @@ impl Store {
 
         // Slow path: add the missing record or entry. Another login of the same account may have done it
         // while this one waited for the lock, so look again under it.
-        let _writers = self.writer();
+        let _writers = self.writer()?;
         let existing = self.read_player_character(account)?;
         if let Some(record) = &existing {
             if record.games.contains_key(&key) {
@@ -152,6 +152,7 @@ impl Store {
     /// [`Store::linked_character_progress`] for a record the caller already holds (a login that has just read or
     /// migrated it): follow its pointer for `game`.
     pub fn follow_character_progress(&self, character: &PlayerCharacter, game: GameId) -> Result<Option<LinkedProgress>> {
+        let _read = self.progress_read()?;
         let Some(ProgressRef::Character { character: expected_character, .. }) = character.game(game).and_then(GameCharacter::character_ref) else {
             return Ok(None);
         };
@@ -194,7 +195,7 @@ mod tests {
         store.ensure_player_character(reg.account_id, GameId::Ff7, 6, legacy).unwrap();
         store.put_character_progress(&CharacterProgress::new(reg.account_id, GameId::Ff7, 1, 7, 6)).unwrap();
 
-        let held = store.writer();
+        let held = store.writer().unwrap();
         let (s, account) = (Arc::clone(&store), reg.account_id);
         finishes_promptly(move || {
             assert!(s.get_player_character(account).unwrap().is_some());
@@ -212,7 +213,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open(dir.path().join("state")).unwrap());
         let reg = store.register("Wedge", [1, 2, 3], "default", None, 5).unwrap();
-        let held = store.writer();
+        let held = store.writer().unwrap();
         let (tx, rx) = mpsc::channel();
         let (s, account) = (Arc::clone(&store), reg.account_id);
         let worker = std::thread::spawn(move || {

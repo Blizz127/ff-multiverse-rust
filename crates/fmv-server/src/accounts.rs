@@ -168,11 +168,11 @@ pub fn phase_key(blob: Vec<u8>) -> PhaseKey {
     PhaseKey(key)
 }
 
-/// Longest progression blob the world keeps per player as it is. A game's own blob is a handful of
-/// bytes (FF7: three); anything longer than this cannot be one and is kept as its digest
+/// Longest progression blob the world keeps per player as it is. This accommodates FF7's bounded
+/// persistent banks; anything longer is kept as its digest
 /// ([`phase_key`]), an unreadable blob of 33 bytes with the same identity, so that a hand-edited
 /// 256 KiB record cannot cost 256 KiB per connected player.
-pub const MAX_PROGRESSION_BYTES: usize = 256;
+pub const MAX_PROGRESSION_BYTES: usize = fmv_protocol::MAX_STORY_PROGRESS_BYTES;
 
 /// The progression the world keeps for a stored blob: the blob itself, or, when it is longer than
 /// [`MAX_PROGRESSION_BYTES`], its digest. Neither is ever written back by the story code (an

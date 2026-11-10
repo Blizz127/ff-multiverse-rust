@@ -19,7 +19,7 @@ use crate::index::{self, LogWriter, INDEX_LOG_FILE};
 use crate::legacy::{self, LegacyState, LEGACY_INDEX_FILE};
 use crate::lock::LOCK_FILE;
 use crate::model::MAX_RECORD_BYTES;
-use crate::store::{ACCOUNTS_DIR, AVATARS_DIR, CHARACTERS_DIR, PROGRESSION_DIR};
+use crate::store::{scene::INTENT_FILE, ACCOUNTS_DIR, AVATARS_DIR, CHARACTERS_DIR, PROGRESSION_DIR};
 
 /// What a snapshot or restore copied.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -54,6 +54,19 @@ pub fn restore_snapshot(
              take a snapshot from a running server instead",
             snapshot_dir.display()
         )));
+    }
+    // A manually copied store can have one record of a scene transaction replaced and the other
+    // still old. Copying only the records would discard the intent needed to recover that pair.
+    let intent = snapshot_dir.join(INTENT_FILE);
+    match fs::symlink_metadata(&intent) {
+        Ok(_) => {
+            return Err(PersistError::Snapshot(format!(
+                "{} contains an unfinished scene transaction; open it through Store to recover, then take a new snapshot",
+                snapshot_dir.display()
+            )));
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(PersistError::io("stat transaction intent", &intent, e)),
     }
     check_snapshot_index(snapshot_dir)?;
     check_destination(snapshot_dir, target)?;
@@ -235,5 +248,26 @@ fn resolve(path: &Path) -> Result<PathBuf> {
             }
             Err(e) => return Err(PersistError::io("resolve path", existing, e)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restoring_a_copy_with_a_scene_intent_refuses_before_creating_a_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("store");
+        let source = temp.path().join("snapshot");
+        let destination = temp.path().join("restored");
+        let store = crate::Store::open(&root).unwrap();
+        store.snapshot(&source).unwrap();
+        let pending = source.join(INTENT_FILE);
+        fs::write(&pending, b"the intent need not parse to make this copy unsafe").unwrap();
+        let error = restore_snapshot(&source, &destination).unwrap_err();
+        assert!(matches!(error, PersistError::Snapshot(_)), "{error}");
+        assert!(!destination.exists());
+        assert!(pending.exists(), "refusal must leave the recovery evidence intact");
     }
 }

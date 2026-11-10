@@ -1434,6 +1434,7 @@ mod tests {
                 Msg::Save(job) => jobs.push(job),
                 // Story saves are `saved_story`'s business (world/story.rs tests), not a payment.
                 Msg::Story(_) => {}
+                Msg::Scene { .. } => panic!("a battle test did not request a scene transaction"),
                 Msg::Stop(_) => panic!("nobody asked the saver to stop"),
             }
         }

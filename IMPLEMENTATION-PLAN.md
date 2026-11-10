@@ -1,6 +1,10 @@
 # FF Multiverse Rust — First-Milestone Implementation Plan
 
-Status: PLANNING NOTES ONLY. Written 2026-11-08 for Devbox task 13252ac0f51b.
+Historical first-milestone plan. The active full-game/Disc 1 scope and current coverage
+are tracked in [docs/DISC1-IMPLEMENTATION.md](docs/DISC1-IMPLEMENTATION.md).
+The following notes describe the original planning state, not today's implementation.
+
+Original status: PLANNING NOTES ONLY. Written 2026-11-08 for Devbox task 13252ac0f51b.
 Nothing here has been implemented, built or tested. No repository exists yet; the
 parent CloudAgent creates it and owns all implementation once its devbox runtime is
 connected. Source: `PROJECT-BRIEF.md` (approved direction: a NEW Rust client and

@@ -50,6 +50,9 @@ fn safe_outcome(outcome: &fmv_ff7::script::scene::Outcome) -> bool {
         // bank 1). Local field scratch variables remain allowed, but untracked persistent
         // writes must not be silently discarded when the story is saved.
         && !outcome.writes.untracked.keys().any(|(bank, _)| (1..=4).contains(bank))
+        // Version 3 assignments must go through the durable exact-base scene transaction,
+        // never through the legacy asynchronous union saver used by this path.
+        && outcome.writes.persistent.is_empty()
 }
 
 /// The variables a scene may change in a story that is SAVED while the extended save is off (`Ff7SceneHost::new`): the
@@ -95,12 +98,15 @@ impl Ff7SceneHost {
 
     fn finish_scene(&self, scene: &str, progress: &[u8], seed: u32, answers: &[u8], preview: bool) -> Option<SceneResult> {
         let (def, story) = (self.def(scene)?, StoryState::decode(progress)?);
+        if !preview && story.supports_extended() { return None; }
         let area = self.field(&def.field)?;
         let answers: Vec<usize> = answers.iter().map(|&a| usize::from(a)).collect();
         let outcome = run_to_end(area.field_file(), def, &story, seed, &answers).ok()?;
         if !(if preview { complete_outcome(&outcome) } else { safe_outcome(&outcome) }) { return None; }
         let mut after = story.clone();
-        let changed = outcome.writes.apply_to(&mut after);
+        let changed = if story.supports_extended() {
+            outcome.writes.apply_extended_to(&mut after, &story)?
+        } else { outcome.writes.apply_to(&mut after) };
         if !preview {
             // The party the scripts leave must be the one the story has from now on (the party table carries it), and the
             // story may hold nothing new to save unless this server was told it may.
@@ -232,6 +238,10 @@ mod tests {
         outcome.writes.untracked.insert((1, 4), 5);
         assert!(!safe_outcome(&outcome), "untracked persistent affection cannot be discarded");
         outcome.writes.untracked.clear();
+        outcome.writes.persistent.insert((3, 66), (1, 1));
+        assert!(!safe_outcome(&outcome), "extended assignments require the acknowledged transaction path");
+        assert!(complete_outcome(&outcome), "extended preview still interprets normally");
+        outcome.writes.persistent.clear();
         outcome.writes.untracked.insert((5, 13), 1);
         assert!(safe_outcome(&outcome), "field-local scratch variables do not require persistence");
         outcome.writes.untracked.clear();

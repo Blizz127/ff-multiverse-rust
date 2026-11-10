@@ -157,7 +157,7 @@ impl Store {
     where
         F: FnOnce(&LegacyView<'_>) -> GameCharacter,
     {
-        let _writers = self.writer();
+        let _writers = self.writer()?;
         let (before, added) = self.plan_player_character(account, game, now, legacy)?;
 
         let mut after = before.clone();
@@ -198,7 +198,7 @@ impl Store {
     where
         F: FnOnce(&LegacyView<'_>) -> GameCharacter,
     {
-        let _writers = self.writer();
+        let _writers = self.writer()?;
         self.plan_player_character(account, game, now, legacy)
     }
 
@@ -269,7 +269,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open(dir.path().join("state")).unwrap());
         let reg = store.register("Wedge", [1, 2, 3], "default", Some((GameId::Ff7, "ff7/tifa")), 5).unwrap();
-        let held = store.writer();
+        let held = store.writer().unwrap();
         let (tx, rx) = mpsc::channel();
         let (s, account) = (Arc::clone(&store), reg.account_id);
         let worker = std::thread::spawn(move || {

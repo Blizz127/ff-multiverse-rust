@@ -144,6 +144,13 @@ pub enum PersistError {
     )]
     IndexPoisoned { detail: String },
 
+    /// A scene intent or committed restore requires recovery before proceeding.
+    #[error("progress update requires recovery; reopen the store before logging in, reading progress or writing")]
+    TransactionRecoveryRequired,
+
+    #[error("scene transaction conflict: {0}")]
+    TransactionConflict(String),
+
     #[error("snapshot: {0}")]
     Snapshot(String),
 

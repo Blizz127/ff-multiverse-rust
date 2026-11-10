@@ -979,6 +979,51 @@ fn reactor_opening_survey_exposes_unsafe_director_tail() {
     }
 }
 
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA); read-only initialization evidence"]
+fn extended_opening_retains_authored_defaults_at_the_first_window_including_zero() {
+    use fmv_ff7::script::scene::{Limits, SceneVars, Vm};
+    let f = field("md1stin").expect("FMV_FF7_DATA and md1stin");
+    let script = FieldScript::from_field(&f).unwrap();
+    let story = StoryState::at(0).into_extended().unwrap();
+    let mut vm = Vm::new(SceneVars::new(story.clone(), &[]), 1, Limits::default());
+    vm.begin(vec![Step::StartMain(0)]);
+    assert!(matches!(vm.resume(&script, None).then, Then::Window(_)));
+    for (address, value) in [(3, 50), (4, 30), (5, 10), (6, 0), (80, 100), (81, 100), (82, 100), (83, 100), (28, 251), (29, 2)] {
+        assert_eq!(vm.writes().get(&(1, address)), Some(&value), "authored byte {address}");
+    }
+    assert!(vm.vars().unknown_persistent_reads().is_empty(), "literal initialization has no old-value dependency");
+    assert_eq!(vm.vars().story, story, "observing the opening never initializes a real save");
+    // The unbounded director tail is still unsafe, regardless of the now-complete assignments.
+    let outcome = run_to_end(&f, &fmv_ff7::script::scene::reactor_opening_scene(), &story, 1, &[]).unwrap();
+    assert!(outcome.stats.unresolved > 0);
+    assert_eq!(outcome.writes.persistent.get(&(1, 6)), Some(&(0, 255)));
+}
+
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA); flower scene is not enabled"]
+fn extended_flower_paths_retain_each_authored_flag_without_guessing_other_bits() {
+    let f = field("md8_2").expect("FMV_FF7_DATA and md8_2");
+    let def = fmv_ff7::script::scene::flower_station_scene();
+    // A made-up explicit precondition for exercising these branches, not a claim about a legacy save.
+    let mut story = StoryState::at(36).into_extended().unwrap();
+    story.write_masked(3, 66, 0, 1).unwrap();
+    for (answers, debit) in [(&[2usize][..], false), (&[3, 2, 0][..], true), (&[3, 3, 0][..], true), (&[3, 2, 1][..], false), (&[3, 3, 1][..], false)] {
+        let result = run_to_end(&f, &def, &story, 1, answers).unwrap();
+        assert_eq!(result.end, End::Finished);
+        assert_eq!(result.stats.ignored.contains_key("GOLDd"), debit, "economic effects still require server integration");
+        assert_eq!(result.writes.persistent.get(&(3, 66)), Some(&(1, 1)));
+        assert_eq!(result.writes.persistent.get(&(3, 111)), debit.then_some(&(1, 1)));
+        let mut next = story.clone();
+        assert_eq!(result.writes.apply_extended_to(&mut next, &story), Some(true));
+        assert_eq!(next.moment, 39);
+        assert_eq!(next.known_bit(3, 66, 0), Some(true));
+        assert_eq!(next.known_bit(3, 111, 0), debit.then_some(true));
+        assert_eq!(next.known_bit(3, 66, 1), None);
+        assert_eq!(StoryState::decode(&next.encode()), Some(next));
+    }
+}
+
 // ---- 1. the trigger is found -----------------------------------------------------------------
 
 #[test]

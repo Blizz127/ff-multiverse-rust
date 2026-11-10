@@ -47,17 +47,22 @@ pub struct Writes {
     pub tracked: Vec<((u8, u8), u8)>,
     /// Every other variable or untracked bit the scene changed: not part of the story model, so not carried.
     pub untracked: BTreeMap<(u8, u8), u8>,
+    /// Version 3 persistent assignments: canonical byte key to (value, assigned bits).
+    /// Includes known zeroes and clears; only [`Writes::apply_extended_to`] applies these.
+    pub persistent: BTreeMap<(u8, u8), (u8, u8)>,
 }
 
 impl Writes {
     /// Whether the scene wrote anything the story carries.
     pub fn is_story_neutral(&self) -> bool {
-        self.moment.is_none() && self.tracked.is_empty()
+        self.moment.is_none() && self.tracked.is_empty() && self.persistent.is_empty()
     }
 
     /// Apply the writes to a story: the moment only goes forward and a tracked bit only goes on (the story model's own
     /// rule: nothing a late or repeated write does can take a story back). Returns whether the story changed.
     pub fn apply_to(&self, state: &mut StoryState) -> bool {
+        // Extended states require ordered, exact-base application, never the legacy union.
+        if state.supports_extended() { return false; }
         let mut changed = false;
         if let Some(moment) = self.moment.filter(|m| *m > state.moment) {
             state.moment = moment;
@@ -73,6 +78,21 @@ impl Writes {
             }
         }
         changed
+    }
+
+    /// Apply an extended outcome only to the snapshot it was interpreted against. Callers must also
+    /// compare that snapshot with durable storage atomically before publishing any resulting state.
+    /// Validation is atomic: an invalid assignment changes nothing.
+    pub fn apply_extended_to(&self, state: &mut StoryState, expected: &StoryState) -> Option<bool> {
+        if state != expected || !state.supports_extended() { return None; }
+        let mut next = state.clone();
+        if let Some(moment) = self.moment { next.moment = moment; }
+        for (&(bank, address), &(value, mask)) in &self.persistent {
+            next.write_masked(bank, address, value, mask).ok()?;
+        }
+        let changed = next != *state;
+        *state = next;
+        Some(changed)
     }
 }
 
@@ -160,6 +180,7 @@ impl Outcome {
             && self.jump == other.jump
             && self.writes.moment == other.writes.moment
             && self.writes.tracked == other.writes.tracked
+            && self.writes.persistent == other.writes.persistent
             && persistent(&self.writes) == persistent(&other.writes)
             && self.party == other.party
             && state_ops(self) == state_ops(other)
@@ -465,20 +486,29 @@ impl ScenePlay {
     pub fn writes(&self) -> Writes {
         let base = self.vm.vars();
         let written = self.vm.writes();
-        let byte = |bank: u8, address: u8| written.get(&(bank, address)).copied().unwrap_or_else(|| {
+        let extended = self.story.supports_extended();
+        let byte = |bank: u8, address: u8| written.get(&base.key(bank, address)).copied().unwrap_or_else(|| {
             use crate::script::dialogue::StoryVars;
-            base.byte(bank, address)
+            if extended { base.baseline_byte(bank, address) } else { base.byte(bank, address) }
         });
         let mut out = Writes::default();
         let lo = byte(MOMENT_BANK, MOMENT_ADDRESS);
         let hi = byte(MOMENT_BANK, MOMENT_ADDRESS.wrapping_add(1));
         let moment = u16::from_le_bytes([lo, hi]);
-        if (written.contains_key(&(MOMENT_BANK, MOMENT_ADDRESS)) || written.contains_key(&(MOMENT_BANK, MOMENT_ADDRESS.wrapping_add(1)))) && moment != self.story.moment {
+        if (written.contains_key(&base.key(MOMENT_BANK, MOMENT_ADDRESS)) || written.contains_key(&base.key(MOMENT_BANK, MOMENT_ADDRESS.wrapping_add(1)))) && moment != self.story.moment {
             out.moment = Some(moment);
         }
         for (&(bank, address), &value) in written {
             use crate::script::dialogue::StoryVars;
-            if bank == MOMENT_BANK && address <= MOMENT_ADDRESS.wrapping_add(1) {
+            if base.key(bank, address).0 == base.key(MOMENT_BANK, MOMENT_ADDRESS).0 && address <= MOMENT_ADDRESS.wrapping_add(1) {
+                continue;
+            }
+            if extended && crate::story::canonical_persistent_bank(bank).is_some() {
+                let mask = self.vm.written_mask(bank, address);
+                // Explicitly writing zero establishes knowledge just as writing a nonzero value does.
+                if mask & !self.story.known_mask(bank, address) != 0 || (value ^ self.story.byte(bank, address)) & mask != 0 {
+                    out.persistent.insert((bank, address), (value & mask, mask));
+                }
                 continue;
             }
             if value == base.byte(bank, address) {
