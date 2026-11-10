@@ -433,6 +433,9 @@ fn real_window_path_finds_the_battle_archive_through_open_ff7() {
 #[test]
 #[ignore = "needs the owner's real FF7 data (FMV_FF7_DATA or FMV_FF7_LIBRARY) and a GPU or software Vulkan/GL driver"]
 fn offscreen_real_ff7_battle_formation() {
+    if let Some(dir) = std::env::var_os("FMV_NINO_TEST") {
+        crate::model_layer::install(Some(std::path::Path::new(&dir)), true);
+    }
     let Some(real) = open_real() else { return };
     let Some(mut gpu) = Offscreen::new() else { return };
     let formation_id: u16 = std::env::var("FMV_BATTLE_FORMATION").ok().and_then(|v| v.parse().ok()).unwrap_or(301);
@@ -481,7 +484,7 @@ fn offscreen_real_ff7_battle_formation() {
                 if r.procedural_idle { "swayed (a still pose)" } else { "plays the clip" }
             );
             if own_body {
-                assert_eq!(r.scale, model::FIELD_TO_BATTLE_SCALE, "the player {i} is its own field body, never a canon battle model");
+                assert_eq!(r.scale, kit.rigs.field_scale(), "the player {i} uses the measured field body scale");
                 assert!(r.attachments.is_empty(), "a field body carries no weapon");
             } else {
                 assert_eq!(r.scale, 1.0, "actor {i} is in battle units, not a field stand-in");
