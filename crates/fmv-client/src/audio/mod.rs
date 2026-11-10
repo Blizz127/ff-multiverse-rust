@@ -837,6 +837,8 @@ mod tests {
         fields: HashMap<String, PlanOf>,
         /// The ids whose clips loop (their loop region is the whole clip).
         loop_ids: Vec<u16>,
+        /// The sound layer's ambience of a field, by key: its section and its fades in and out (seconds).
+        ambience: HashMap<String, (String, f32, f32)>,
         /// Fields that cannot be read.
         broken: Vec<String>,
         /// The voice clips the mod layer has, by `<field>/<dialog>` (or `<field>/<dialog>_<line>`), with their length in frames.
@@ -909,7 +911,15 @@ mod tests {
                         clips.clips.push((id, if s.loop_ids.contains(&id) { clip.with_loop(0, 4_800) } else { clip }));
                     }
                 }
-                Ok(field::FieldRead { plan, clips })
+                let ambience = s.ambience.get(key).map(|(section, fade_in, fade_out)| Box::new(field::ModAmbience {
+                    section: section.clone(),
+                    name: format!("Ambience\\Ambient\\{section}.ogg"),
+                    source: "cosmo",
+                    clip: SfxClip::from_mono(RATE, &vec![0.25; 4_800]).expect("a clip"),
+                    fade_in: std::time::Duration::from_secs_f32(*fade_in),
+                    fade_out: std::time::Duration::from_secs_f32(*fade_out),
+                }));
+                Ok(field::FieldRead { plan, clips, ambience })
             };
             let done = Done::Field { key: key.to_string(), story, read, took: std::time::Duration::from_millis(4) };
             if s.hold { s.held.push(done) } else { s.inbox.push(done) }
@@ -1849,6 +1859,34 @@ mod tests {
         let lines = field_lines(&rig);
         assert_eq!(lines.iter().filter(|l| l.starts_with("field loop start ch3 38")).count(), 1, "the hum was started once, before the fight: {lines:?}");
         assert!(lines.contains(&"field loop start ch2 60".to_string()), "{lines:?}");
+    }
+
+    #[test]
+    fn a_fields_ambience_from_the_sound_layer_fades_in_stops_for_a_battle_comes_back_and_goes_with_the_field() {
+        let mut rig = field_rig("md1stin", plan_of(vec![]), &[]);
+        rig.state.borrow_mut().ambience.insert("md1stin".to_string(), ("field_116".to_string(), 0.5, 0.25));
+        let story = blob(8);
+        follow(&mut rig, &frame("md1stin", &story, 0.0));
+        follow(&mut rig, &frame("md1stin", &story, 0.05));
+        assert_eq!(rig.audio.status().expect("on").loops_playing, 1, "the ambience loops beside the field's own (none here)");
+        assert!(rig.audio.field_loops().is_empty(), "it takes none of the four channels of the game's own sounds");
+        let lines = field_lines(&rig);
+        assert!(lines.contains(&"field md1stin: ambience field_116 from cosmo (Ambience\\Ambient\\field_116.ogg; fades in over 0.50 s, out over 0.25 s)".to_string()), "{lines:?}");
+        assert!(lines.contains(&"field ambience start field_116".to_string()), "{lines:?}");
+        // a fight takes it away, and its end gives it back (once)
+        follow(&mut rig, &FieldFrame { in_battle: true, ..frame("md1stin", &story, 1.0) });
+        follow(&mut rig, &frame("md1stin", &story, 2.0));
+        follow(&mut rig, &frame("md1stin", &story, 2.05));
+        // another field without one: it goes
+        follow(&mut rig, &frame("md1_1", &story, 3.0));
+        follow(&mut rig, &frame("md1_1", &story, 3.05));
+        let lines = field_lines(&rig);
+        let count = |want: &str| lines.iter().filter(|l| l.as_str() == want).count();
+        assert_eq!(count("field ambience start field_116"), 2, "{lines:?}");
+        assert_eq!(count("field ambience stop field_116 (a battle)"), 1, "{lines:?}");
+        assert_eq!(count("field ambience stop field_116 (the field was left)"), 1, "{lines:?}");
+        rig.audio.pump(48_000);
+        assert_eq!(rig.audio.status().expect("on").loops_playing, 0, "faded out and gone");
     }
 
     #[test]

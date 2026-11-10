@@ -32,7 +32,7 @@ use fmv_ff7::sound::{self, PcmClip, SfxBank, SoundError};
 use fmv_ff7::story::{StoryState, TRACKED_VARS};
 use fmv_ff7::Ff7Adapter;
 use fmv_library::ff7::{resolve_audio, ResolvedAudio};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
@@ -75,11 +75,25 @@ struct SoundLayer {
     log: Logger,
     /// The sound ids already said to come from a mod (once each per run: a battle asks for the same ids again and again).
     said: Arc<Mutex<HashSet<u16>>>,
+    /// Field ambiences decoded lately, by clip name, the newest first (a story step reads its field again, and neighbouring
+    /// fields share a clip: `md1stin`, `md1_1` and `md8_1` play the same one), at most [`AMBIENCE_CACHE`].
+    ambiences: Arc<Mutex<VecDeque<(String, SfxClip)>>>,
+    /// How many ambience clips were decoded (tests).
+    decoded: Arc<std::sync::atomic::AtomicUsize>,
 }
+
+/// How many decoded field ambiences [`SoundLayer`] keeps (a long one is tens of MB of samples).
+const AMBIENCE_CACHE: usize = 3;
 
 impl SoundLayer {
     fn new(mods: Option<Arc<Mods>>, log: Logger) -> Self {
-        Self { mods, log, said: Arc::new(Mutex::new(HashSet::new())) }
+        Self {
+            mods,
+            log,
+            said: Arc::new(Mutex::new(HashSet::new())),
+            ambiences: Arc::new(Mutex::new(VecDeque::new())),
+            decoded: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
     }
 
     /// No layer: the original sound (what the tests use).
@@ -108,6 +122,49 @@ impl SoundLayer {
             (self.log)(&format!("sound {id} from {}", first.source));
         }
         Some(clip)
+    }
+
+    /// The ambience the sound layer has for the field with maplist id `field_id`, decoded as a mixer clip that loops whole, or
+    /// `None` (no layer, no section, or the clip does not decode: said once, and the field plays without it).
+    fn ambience(&self, field_id: u16) -> Option<super::field::ModAmbience> {
+        let found = self.mods.as_ref()?.field_ambience(field_id)?;
+        let cached = {
+            let mut cache = self.ambiences.lock().unwrap_or_else(PoisonError::into_inner);
+            let hit = cache.iter().position(|(name, _)| *name == found.clip.name);
+            hit.and_then(|i| cache.remove(i)).map(|entry| {
+                let clip = entry.1.clone();
+                cache.push_front(entry);
+                clip
+            })
+        };
+        let clip = match cached {
+            Some(clip) => clip,
+            None => {
+                let music = match decode_music_bytes(found.clip.bytes, extension_of(&found.clip.name)) {
+                    Ok(music) => music,
+                    Err(e) => {
+                        (self.log)(&format!("ambience {}: {} does not decode ({e}); the field plays without it", found.section, found.clip.name));
+                        return None;
+                    }
+                };
+                let (rate, samples) = pcm_of(&music)?;
+                let clip = SfxClip::from_stereo(rate, samples)?;
+                self.decoded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut cache = self.ambiences.lock().unwrap_or_else(PoisonError::into_inner);
+                cache.push_front((found.clip.name.clone(), clip.clone()));
+                cache.truncate(AMBIENCE_CACHE);
+                clip
+            }
+        };
+        let seconds = |s: f32| std::time::Duration::from_secs_f32(if s.is_finite() { s.clamp(0.0, 60.0) } else { 0.5 });
+        Some(super::field::ModAmbience {
+            section: found.section,
+            name: found.clip.name,
+            source: found.clip.source,
+            clip,
+            fade_in: seconds(found.fade_in),
+            fade_out: seconds(found.fade_out),
+        })
     }
 
     /// Echo-S's track `name` decoded, if the music layer has it and it decodes (else the original plays).
@@ -439,7 +496,9 @@ fn read_field(
     // The clips the plan names, minus the ones the caller holds.
     let wanted: Vec<u16> = plan.ids().into_iter().filter(|id| !have.contains(id)).collect::<BTreeSet<_>>().into_iter().collect();
     let clips = load_sounds_with(files, &wanted, layer, Some(key));
-    Ok(FieldRead { plan, clips })
+    // The sound layer's ambience of the field, by the field's number in the archive's name list (what FFNx names it by).
+    let ambience = maplist.and_then(|m| m.id_of(key)).and_then(|id| layer.ambience(id)).map(Box::new);
+    Ok(FieldRead { plan, clips, ambience })
 }
 
 #[cfg(test)]
@@ -763,6 +822,32 @@ mod tests {
     }
 
     #[test]
+    fn a_fields_ambience_is_decoded_once_however_often_the_field_is_read_and_a_shared_clip_once_for_all_its_fields() {
+        let wav = synthetic_wav(8_000, &[100, -100, 200, -200, 300, -300]);
+        let config = "[field_116]\nsequential = [ \"1503\" ]\nfade_in = 0.5\nfade_out = 0.5\n[field_117]\nsequential = [ \"1503\" ]\n\
+                      [field_118]\nsequential = [ \"1511\" ]\n";
+        let blobs = [
+            ("FA\\Ambient\\config.toml", config.as_bytes().to_vec()),
+            ("Ambience\\Ambient\\1503.wav", wav.clone()),
+            ("Ambience\\Ambient\\1511.wav", wav),
+        ];
+        let (_t, layer, lines) = layer(&EchoSpec::default(), Some(cosmo_archive_blobs(&blobs, None)), Layers::ALL);
+        let a = layer.ambience(116).expect("md1stin's ambience");
+        assert_eq!((a.section.as_str(), a.name.as_str(), a.source, a.clip.rate(), a.clip.frames()), ("field_116", "Ambience\\Ambient\\1503.wav", "cosmo", 8_000, 6));
+        assert_eq!((a.fade_in, a.fade_out), (Duration::from_millis(500), Duration::from_millis(500)));
+        let decoded = || layer.decoded.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(decoded(), 1);
+        // The field read again (a story step), and the next field with the same clip: no decoding.
+        assert!(layer.ambience(116).is_some() && layer.ambience(117).is_some());
+        assert_eq!(decoded(), 1);
+        assert_eq!(layer.ambience(117).unwrap().section, "field_117");
+        // Another clip is decoded once; a field nothing names has none; nothing went wrong.
+        assert!(layer.ambience(118).is_some() && layer.ambience(118).is_some() && layer.ambience(1).is_none());
+        assert_eq!(decoded(), 2);
+        assert!(said(&lines).is_empty(), "{:?}", said(&lines));
+    }
+
+    #[test]
     fn the_layer_off_or_a_clip_that_does_not_decode_leaves_the_original() {
         let blobs = [("Base\\sfx\\6303.ogg", b"OggS-but-not-audio".to_vec())];
         let cosmo = cosmo_archive_blobs(&blobs, Some("[6]\nsequential = [ 6303 ]\n"));
@@ -816,6 +901,35 @@ mod tests {
     /// The owner's real mod clips, read-only and silent (decoding makes no sound): every Echo-S track the music layer offers decodes,
     /// the first clip of every sound id the sound layer names decodes, and every voice found for a window of the reactor fields'
     /// scripts decodes. Counts only; nothing is stored, printed or played.
+    #[test]
+    #[ignore = "needs the owner's Cosmo Memory archive and field archive (FMV_COSMO_IRO, FMV_FF7_DATA)"]
+    fn cosmos_field_ambience_plays_in_the_fields_of_the_route_by_their_maplist_numbers() {
+        let var = |name: &str| std::env::var_os(name).map(PathBuf::from);
+        let (Some(cosmo), Some(data)) = (var("FMV_COSMO_IRO"), var("FMV_FF7_DATA")) else {
+            eprintln!("FMV_COSMO_IRO and FMV_FF7_DATA are needed; skipping");
+            return;
+        };
+        let mods = Arc::new(Mods::open(&ModSources { echo_s: None, cosmo: Some(cosmo), dir: None }, Layers::ALL));
+        assert!(mods.has_cosmo(), "{:?}", mods.notes());
+        let maplist = read_maplist(&data.join("field").join("flevel.lgp")).expect("the archive's name list");
+        let layer = SoundLayer::new(Some(Arc::clone(&mods)), Arc::new(|l: &str| eprintln!("{l}")));
+        let route = ["md1stin", "md1_1", "md1_2", "nrthmk", "nmkin_1", "elevtr1", "nmkin_2", "nmkin_3", "nmkin_4", "nmkin_5", "md8_4", "md8_1"];
+        let mut with = 0;
+        for key in route {
+            let id = maplist.id_of(key).expect("a field of the name list");
+            match layer.ambience(id) {
+                Some(a) => {
+                    with += 1;
+                    println!("{key} (field {id}): {} {} from {}, {:.1} s of sound, fades {:.2} s in, {:.2} s out", a.section, a.name, a.source, a.clip.duration().as_secs_f32(), a.fade_in.as_secs_f32(), a.fade_out.as_secs_f32());
+                    assert_eq!(a.section, format!("field_{id}"));
+                    assert!(a.clip.duration() > Duration::from_millis(500), "{key}: a clip long enough to loop");
+                }
+                None => println!("{key} (field {id}): no ambience"),
+            }
+        }
+        assert!(with >= route.len() / 2, "Cosmo names most fields of the route ({with} of {})", route.len());
+    }
+
     #[test]
     #[ignore = "needs the owner's mod archives and audio data (FMV_ECHO_S_IRO, FMV_COSMO_IRO, FMV_FF7_AUDIO_DATA)"]
     fn the_owners_mod_clips_decode() {

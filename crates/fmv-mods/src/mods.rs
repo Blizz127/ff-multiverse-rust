@@ -65,6 +65,23 @@ use std::sync::{Arc, Mutex, PoisonError};
 pub const MAX_CLIP_BYTES: u64 = 32 * 1024 * 1024;
 /// The biggest music track read (the largest of Echo-S's is 6.6 MB).
 pub const MAX_TRACK_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Cosmo Memory's field-ambience config (its `FA` option: the field ambience alone) and the folder of its clips.
+pub const FIELD_AMBIENCE_CONFIG: &str = "FA\\Ambient\\config.toml";
+pub const FIELD_AMBIENCE_DIR: &str = "Ambience\\Ambient\\";
+/// The fade of an ambience whose section gives none (Cosmo's `FA` sections all give 0.5 s).
+pub const DEFAULT_AMBIENCE_FADE: f32 = 0.5;
+
+/// A field's ambience from the sound layer ([`Mods::field_ambience`]): the clip that loops while the player is in the field, and
+/// how long it fades in and out (seconds).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ambience {
+    /// The config section it comes from (`field_116`).
+    pub section: String,
+    pub clip: Clip,
+    pub fade_in: f32,
+    pub fade_out: f32,
+}
 /// The most `*.iro` files looked at in a mods folder.
 const MAX_CANDIDATES: usize = 64;
 /// Script sections kept in memory (a field's is at most 60 KB).
@@ -193,6 +210,8 @@ struct Shared {
     sfx_config: LayerConfig,
     /// The music layer's section map (`bat`, `bee` and `gun` shuffle among variants).
     music_config: LayerConfig,
+    /// Cosmo's field ambience (`FA\Ambient\config.toml`: `[field_<id>]` sections naming clips of `Ambience\Ambient\`).
+    ambient_config: LayerConfig,
     picker: Picker,
 }
 
@@ -314,7 +333,8 @@ impl Mods {
         let sfx_config =
             read_config(&cosmo, "Base\\sfx\\config.toml").or_else(|| read_config(&echo, "Sound\\sfx\\config.toml")).unwrap_or_default();
         let music_config = read_config(&echo, "EchoeS Of The Planet\\vgmstream\\config.toml").unwrap_or_default();
-        let shared = Shared { scripts: Mutex::new(VecDeque::new()), sfx_config, music_config, picker: Picker::new(0x5EED_F00D_CAFE_1997) };
+        let ambient_config = read_config(&cosmo, FIELD_AMBIENCE_CONFIG).unwrap_or_default();
+        let shared = Shared { scripts: Mutex::new(VecDeque::new()), sfx_config, music_config, ambient_config, picker: Picker::new(0x5EED_F00D_CAFE_1997) };
         Self { echo, cosmo, layers, notes: Arc::new(notes), shared: Arc::new(shared) }
     }
 
@@ -469,6 +489,41 @@ impl Mods {
                         return Some(Clip { name: entry.name.clone(), bytes, source: echo.label() });
                     }
                 }
+            }
+        }
+        None
+    }
+
+    // ---- field ambience --------------------------------------------------------------------------
+
+    /// Cosmo Memory's ambience for the field with maplist id `field_id` (what FFNx's ambient layer plays on entering a field: the
+    /// section `[field_<id>]` of the `FA` ambience config, one clip of `Ambience\Ambient\` in a loop, with the section's fades), or
+    /// `None`: the sound layer is off, there is no Cosmo archive, no section names the field, it says `skip`, or its clip is missing.
+    /// (Cosmo's `BA` and `FA+BA` configs are its battle ambience: not used.)
+    pub fn field_ambience(&self, field_id: u16) -> Option<Ambience> {
+        if !self.layers.sound {
+            return None;
+        }
+        let cosmo = self.cosmo.as_ref()?;
+        let name = format!("field_{field_id}");
+        let section = self.shared.ambient_config.section(&name)?;
+        if section.skip {
+            return None;
+        }
+        let stem = match self.shared.picker.pick(&format!("ambient/{name}"), section) {
+            Some(Pick::Entry(entry)) => entry.stem(),
+            Some(Pick::Silent) | None => return None,
+        };
+        for ext in echo::CLIP_EXTENSIONS {
+            if let Some(entry) = cosmo.archive.find(&format!("{FIELD_AMBIENCE_DIR}{stem}.{ext}")) {
+                let bytes = cosmo.archive.read_limited(entry, MAX_TRACK_BYTES).ok()?;
+                let fade = |s: Option<f64>| s.map_or(DEFAULT_AMBIENCE_FADE, |s| s as f32);
+                return Some(Ambience {
+                    section: name,
+                    clip: Clip { name: entry.name.clone(), bytes, source: cosmo.label() },
+                    fade_in: fade(section.fade_in),
+                    fade_out: fade(section.fade_out),
+                });
             }
         }
         None
@@ -632,6 +687,33 @@ mod tests {
         assert!(Arc::ptr_eq(&a, &b), "the second read is the cached section");
         assert!(m.script_section("nosuchfield").is_none());
         assert_eq!(m.label(), "echo-s 1.24");
+    }
+
+    #[test]
+    fn cosmos_field_ambience_is_its_fa_section_for_the_fields_id_with_its_fades_and_follows_the_sound_switch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = "#field ambient\n[field_116]\nsequential = [ \"1580\" ]\nfade_in = 0.50\nfade_out = 0.25\n\
+                      [field_7]\nsequential = [ \"1581\" ]\n[field_8]\nskip = true\n[field_9]\nsequential = [ \"404\" ]\n";
+        let blobs = [
+            ("FA\\Ambient\\config.toml", config.as_bytes().to_vec()),
+            ("Ambience\\Ambient\\1580.ogg", b"hum".to_vec()),
+            ("Ambience\\Ambient\\1581.ogg", b"wind".to_vec()),
+        ];
+        let path = write(tmp.path(), "cosmo.iro", &crate::testkit::cosmo_archive_blobs(&blobs, None));
+        let m = Mods::open(&ModSources { cosmo: Some(path), ..Default::default() }, Layers::ALL);
+        assert!(m.has_cosmo(), "{:?}", m.notes());
+        let a = m.field_ambience(116).expect("md1stin's section");
+        assert_eq!((a.section.as_str(), a.clip.name.as_str(), a.clip.bytes.as_slice(), a.fade_in, a.fade_out),
+            ("field_116", "Ambience\\Ambient\\1580.ogg", &b"hum"[..], 0.5, 0.25));
+        assert_eq!(a.clip.source, "cosmo");
+        // A section without fades takes the default; a silent one, a missing clip and an unnamed field give nothing.
+        let b = m.field_ambience(7).unwrap();
+        assert_eq!((b.clip.bytes.as_slice(), b.fade_in, b.fade_out), (&b"wind"[..], DEFAULT_AMBIENCE_FADE, DEFAULT_AMBIENCE_FADE));
+        assert!(m.field_ambience(8).is_none() && m.field_ambience(9).is_none() && m.field_ambience(1).is_none());
+        // The sound layer's switch turns it off, and Echo-S alone has none.
+        assert!(m.with_layers(Layers { sound: false, ..Layers::ALL }).field_ambience(116).is_none());
+        let (_t, echo) = open_echo(Layers::ALL);
+        assert!(echo.field_ambience(116).is_none());
     }
 
     #[test]

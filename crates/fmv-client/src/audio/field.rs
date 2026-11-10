@@ -33,6 +33,8 @@ pub const FIELD_SOUNDS_ENV: &str = "FMV_FIELD_SOUNDS";
 /// How loud an ambient loop plays, `0.0..=1.0` before the master volume (the script says no volume: `SOUND` has none, and the
 /// volume envelopes of `AKAO` 160 to 175 are not read; a loop sits under the music and the effects).
 const AMBIENT_GAIN: f32 = 0.6;
+/// How loud a field's ambience from the sound layer plays, before the master volume (as loud as the game's own ambient loops).
+const AMBIENCE_GAIN: f32 = 0.6;
 /// How loud a sound an event plays, `0.0..=1.0` before the master volume.
 const EVENT_GAIN: f32 = 0.8;
 /// An ambient loop fades in over this long.
@@ -175,10 +177,26 @@ impl FieldPlan {
     }
 }
 
-/// What the worker brings back for a field: the plan, and the clips it names that the client did not have.
+/// What the worker brings back for a field: the plan, the clips it names that the client did not have, and the field's ambience
+/// from the sound layer (Cosmo Memory's), when it has one.
 pub struct FieldRead {
     pub plan: FieldPlan,
     pub clips: SoundsRead,
+    /// (Boxed: the worker's answers stay small whatever a clip weighs.)
+    pub ambience: Option<Box<ModAmbience>>,
+}
+
+/// A field's ambience from the sound layer (`fmv_mods::Mods::field_ambience`): one clip that loops, centred, for as long as the
+/// player is in the field and not fighting, fading in and out as the layer's config says. It is the layer's own addition: the
+/// game's scripts play their ambient loops beside it as ever.
+pub struct ModAmbience {
+    /// The config section (`field_116`), the clip's name in the archive, and which mod it comes from.
+    pub section: String,
+    pub name: String,
+    pub source: &'static str,
+    pub clip: SfxClip,
+    pub fade_in: Duration,
+    pub fade_out: Duration,
 }
 
 /// A link of the area the player stands in, with the place the server puts a player at when it fires (the area's own
@@ -248,6 +266,11 @@ pub struct FieldState {
     /// Loops started and sounds played by events, by sound id (the closing line of a run).
     started: BTreeMap<u16, u32>,
     played: BTreeMap<u16, u32>,
+    /// The ambience of the field the player is in, from the sound layer ([`ModAmbience`]), and the loop playing it.
+    ambience: Option<Box<ModAmbience>>,
+    ambience_loop: Option<SfxHandle>,
+    /// How many times an ambience was started (the closing line of a run).
+    ambiences: u32,
 }
 
 impl FieldState {
@@ -272,6 +295,9 @@ impl FieldState {
             last_story: None,
             started: BTreeMap::new(),
             played: BTreeMap::new(),
+            ambience: None,
+            ambience_loop: None,
+            ambiences: 0,
         }
     }
 
@@ -305,7 +331,8 @@ impl FieldState {
     pub fn summary(&self) -> Option<String> {
         let list = |m: &BTreeMap<u16, u32>| m.iter().map(|(id, n)| format!("{id}x{n}")).collect::<Vec<_>>().join(" ");
         let (sounds, loops): (u32, u32) = (self.played.values().sum(), self.started.values().sum());
-        (sounds + loops > 0).then(|| format!("{sounds} sounds ({}), {loops} loops ({})", list(&self.played), list(&self.started)))
+        let ambiences = if self.ambiences > 0 { format!(", {} ambiences", self.ambiences) } else { String::new() };
+        (sounds + loops + self.ambiences > 0).then(|| format!("{sounds} sounds ({}), {loops} loops ({}){ambiences}", list(&self.played), list(&self.started)))
     }
 
     /// Follow the game for one frame: leave and enter fields, ask for plans, start, change and stop loops, detect the
@@ -337,6 +364,7 @@ impl FieldState {
             if self.battle {
                 self.pending.clear();
                 self.stop_all(engine, log, "a battle", FADE_OUT);
+                self.stop_ambience(engine, log, "a battle");
             } else {
                 self.replaced = [false; 4];
             }
@@ -345,6 +373,7 @@ impl FieldState {
             self.detect_link(frame);
             self.play_due(engine, log, frame.now);
             self.apply_ambient(engine, log, frame.now);
+            self.apply_ambience(engine, log);
         }
         self.last_pos = frame.pos;
         self.seen_rejected = frame.rejected;
@@ -353,6 +382,8 @@ impl FieldState {
     /// The player is in another field (or none).
     fn change_field(&mut self, engine: &AudioEngine, log: &Logger, frame: &FieldFrame<'_>) {
         self.stop_all(engine, log, "the field was left", FADE_OUT);
+        self.stop_ambience(engine, log, "the field was left");
+        self.ambience = None;
         self.pending.clear();
         self.replaced = [false; 4];
         let before = self.key.take();
@@ -504,6 +535,22 @@ impl FieldState {
         }
     }
 
+    /// Start the field's ambience from the sound layer when it is here and not playing (the caller does not call this in a battle).
+    fn apply_ambience(&mut self, engine: &AudioEngine, log: &Logger) {
+        let Some(ambience) = self.ambience.as_ref().filter(|_| self.ambience_loop.is_none()) else { return };
+        self.ambience_loop = Some(engine.play_sfx_loop(&ambience.clip, AMBIENCE_GAIN, 0.0, ambience.fade_in));
+        self.ambiences += 1;
+        log(&format!("field ambience start {}", ambience.section));
+    }
+
+    /// Stop the ambience's loop, with its own fade (it starts again by [`FieldState::apply_ambience`] if the field still has it).
+    fn stop_ambience(&mut self, engine: &AudioEngine, log: &Logger, why: &str) {
+        let Some(handle) = self.ambience_loop.take() else { return };
+        let (section, fade) = self.ambience.as_ref().map_or(("?", FADE_OUT), |a| (a.section.as_str(), a.fade_out));
+        engine.stop_sfx_loop(handle, fade);
+        log(&format!("field ambience stop {section} ({why})"));
+    }
+
     /// Stop every loop (the field was left, a battle starts).
     fn stop_all(&mut self, engine: &AudioEngine, log: &Logger, why: &str, fade: Duration) {
         for (index, slot) in self.loops.iter_mut().enumerate() {
@@ -532,6 +579,14 @@ impl FieldState {
         };
         for (id, clip) in read.clips.clips {
             self.clips.insert(id, clip);
+        }
+        // The ambience does not depend on the story: the first read of the field brings it.
+        if let (None, Some(a)) = (self.ambience.as_ref(), read.ambience) {
+            log(&format!(
+                "field {key}: ambience {} from {} ({}; fades in over {:.2} s, out over {:.2} s)",
+                a.section, a.source, a.name, a.fade_in.as_secs_f32(), a.fade_out.as_secs_f32()
+            ));
+            self.ambience = Some(a);
         }
         for (id, why) in &read.clips.missing {
             log(&format!("no clip for field sound {id} ({why}); going on without it"));

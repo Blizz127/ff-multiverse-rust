@@ -71,6 +71,9 @@ pub struct Section {
     pub looped: Option<bool>,
     /// `volume = n` (percent in the voice layer), when set.
     pub volume: Option<f64>,
+    /// `fade_in = s` / `fade_out = s` (seconds, the ambient layer's), when set: finite, at most a minute.
+    pub fade_in: Option<f64>,
+    pub fade_out: Option<f64>,
 }
 
 impl Section {
@@ -162,6 +165,8 @@ impl LayerConfig {
                 "skip" => section.skip = value == "true",
                 "loop" => section.looped = Some(value == "true"),
                 "volume" => section.volume = value.parse::<f64>().ok().filter(|v| v.is_finite()),
+                "fade_in" => section.fade_in = seconds(&value),
+                "fade_out" => section.fade_out = seconds(&value),
                 _ => {}
             }
         }
@@ -221,6 +226,11 @@ fn balanced(value: &str) -> bool {
 }
 
 /// The entries of `[ a, b, "c" ]` and how many items were not understood.
+/// A fade's length in seconds: a finite number from 0 to 60 (anything else is no fade given).
+fn seconds(value: &str) -> Option<f64> {
+    value.parse::<f64>().ok().filter(|v| v.is_finite() && (0.0..=60.0).contains(v))
+}
+
 fn parse_array(value: &str) -> (Vec<Entry>, usize) {
     let inner = value.trim().strip_prefix('[').map(|v| v.trim_end().strip_suffix(']').unwrap_or(v)).unwrap_or(value);
     let mut entries = Vec::new();
@@ -365,6 +375,16 @@ volume = 50
         assert_eq!((l.looped, l.volume), (Some(true), Some(50.0)));
         assert_eq!(l.mode(), None);
         assert!(c.section("nothing").is_none());
+        assert_eq!(c.skipped, 0);
+    }
+
+    #[test]
+    fn the_ambient_layers_fades_are_read_in_seconds_and_nonsense_is_no_fade() {
+        let c = LayerConfig::parse("#field ambient\n[field_116]\nsequential = [ \"1580\" ]\nfade_in = 0.50\nfade_out = 0.2\n[field_2]\nsequential = [ \"9\" ]\nfade_in = -1\nfade_out = nan\n");
+        let a = c.section("field_116").unwrap();
+        assert_eq!((a.entries(), a.fade_in, a.fade_out), (&[Entry::Name("1580".into())][..], Some(0.5), Some(0.2)));
+        let b = c.section("FIELD_2").unwrap();
+        assert_eq!((b.fade_in, b.fade_out), (None, None));
         assert_eq!(c.skipped, 0);
     }
 

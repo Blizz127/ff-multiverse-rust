@@ -39,4 +39,4 @@ pub mod mods;
 pub mod testkit;
 
 pub use iro::{normalize, Compression, IroArchive, IroEntry, IroError};
-pub use mods::{Clip, Layers, ModSources, Mods, ScriptSource, SfxSet};
+pub use mods::{Ambience, Clip, Layers, ModSources, Mods, ScriptSource, SfxSet};

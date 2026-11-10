@@ -2045,9 +2045,20 @@ number); 28 of 32 characters are found in Echo-S's script by name and place (the
 of the 62 lines 50 have a voice on at least one page (56 of 68 pages). Most of those lines are cutscene text, which the scene player will show; the talk
 scripts of these fields are short.
 
+**Field ambience** (Cosmo's `FA` option, what FFNx's ambient layer plays on entering a field). A field's number in the
+archive's name list names its section of `FA\Ambient\config.toml` (`[field_116]` is `md1stin`), which names one clip of
+`Ambience\Ambient\` and its fades; the client's audio worker decodes it with the field's other sounds, and the clip loops,
+centred, beside the game's own ambient loops (it takes none of their four channels) while the player is in the field: it
+fades in on arrival, out for a battle (and back in after it) and out when the field is left. With the sound layer off there
+is none. On the owner's data 8 of the 12 fields of the route have one (`md1stin`, `md1_1` and `md8_1` the same 112 s clip,
+`md1_2` 198 s, `nrthmk` 54 s, `nmkin_1` 87 s, `elevtr1` 2 s, `md8_4` 13 s; none for `nmkin_2` to `nmkin_5`, where the
+game's own hum plays): `audio::ff7::tests::cosmos_field_ambience_plays_in_the_fields_of_the_route_by_their_maplist_numbers`
+(ignored, `FMV_COSMO_IRO` and `FMV_FF7_DATA`). The client log says `field <key>: ambience field_<n> from cosmo (...)` and
+`field ambience start|stop field_<n> (...)`.
+
 **Not done, and why.** Voiced attacks (`battle_char_<index>_<id>` sections of both configs) need to know which character performs a battle sound, which
 the client's battle sounds do not carry. A repeating sound id plays the first of its clips, not each in turn; Cosmo's footsteps
-(`<field>_<triangle>_<id>`), field ambience (`FA\Ambient`), movie sounds and menu sets 2 and 3 are not used; Echo-S's battle lines, `NoCloud` voices,
+(`<field>_<triangle>_<id>`), battle ambience (`BA`, `FA+BA`), movie sounds and menu sets 2 and 3 are not used; Echo-S's battle lines, `NoCloud` voices,
 models, textures and kernel text are not used either. Only characters that talk are voiced: a cutscene's windows will be voiced by the scene player
 through the same cues once it runs Echo-S's section (`mods::script_source()` and `VoiceCue`). A voice does not duck the music.
 

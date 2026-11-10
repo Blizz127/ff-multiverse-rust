@@ -347,7 +347,7 @@ mod tests {
                 // the plan carries the key and the story it was asked for; the clips are those not held
                 let plan = FieldPlan { key: key.to_string(), story: story.to_vec(), ..FieldPlan::default() };
                 let clips = (1..=3u16).filter(|id| !have.contains(id)).map(|id| (id, SfxClip::from_mono(22_050, &[0.1, 0.2]).expect("a clip"))).collect();
-                Ok(FieldRead { plan, clips: SoundsRead { clips, missing: Vec::new() } })
+                Ok(FieldRead { plan, clips: SoundsRead { clips, missing: Vec::new() }, ambience: None })
             }),
         };
         let mut worker = ThreadWorker::start(tasks);
