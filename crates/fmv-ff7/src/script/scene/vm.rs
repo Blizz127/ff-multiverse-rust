@@ -107,8 +107,10 @@ pub struct Timed<T> {
 /// How a walk goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MoveHow {
-    /// `MOVE`, `CMOVE`, `FMOVE`, `MOVA`: walks (or runs: the frames say how long).
+    /// `MOVE`, `CMOVE`, `MOVA`: walks (or runs: the frames say how long).
     Walk,
+    /// `FMOVE`: walks while retaining the current animation instead of selecting a movement clip.
+    WalkKeepAnimation,
     /// `JUMP`.
     Jump,
     /// `LADER`: up or down a ladder.
@@ -1326,12 +1328,14 @@ impl Vm {
             0xA8 | 0xA9 | 0xAD => {
                 let (x, y) = (clamp_i16(self.num(ins, "x", Width::S16)), clamp_i16(self.num(ins, "y", Width::S16)));
                 // Original MOVE selects walk/run from the source MSPED and field scale, not the
-                // presentation's distance or bounded duration. CMOVE/FMOVE clip semantics remain unresolved here.
+                // presentation's distance or bounded duration. FMOVE retains the current animation;
+                // CMOVE clip selection remains unresolved here.
                 let animation = (op == 0xA8).then(|| {
                     let speed = self.speeds.get(&me).copied().unwrap_or(DEFAULT_MOVE_SPEED);
                     if speed <= 3 * i32::from(script.header().scale) { 1 } else { 2 }
                 });
-                self.do_move(idx, me, Goal { x, y, z: None, triangle: None, how: MoveHow::Walk, animation, frames: None });
+                let how = if op == 0xAD { MoveHow::WalkKeepAnimation } else { MoveHow::Walk };
+                self.do_move(idx, me, Goal { x, y, z: None, triangle: None, how, animation, frames: None });
                 Flow::Yield
             }
             0xAA => {

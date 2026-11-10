@@ -441,12 +441,16 @@ fn only_ordinary_move_selects_a_walk_or_run_slot() {
         .entity("target", vec![(1, cat(&[xyzi(40, 0, 0, 0), vec![RET]]))]).build();
     let (beats, vm) = run_root(&section, vec![Step::Await(ScriptRef::new(1, 1)), Step::Start(ScriptRef::new(0, 1))], &[]);
     let moves: Vec<_> = stage(&beats).into_iter().filter_map(|(at, event)| match event {
-        Stage::Move { x, how, animation, .. } => Some((at, x, how, animation)), _ => None,
+        Stage::Move { from, x, y, frames, how, animation, .. } => Some((at, from, (x, y), frames, how, animation)), _ => None,
     }).collect();
     assert_eq!(moves, [
-        (0, 10, MoveHow::Walk, Some(2)), (2, 20, MoveHow::Walk, None), (4, 30, MoveHow::Walk, None),
-        (6, 40, MoveHow::Walk, None), (8, 50, MoveHow::Jump, None), (38, 60, MoveHow::Ladder, None),
-        (53, 70, MoveHow::Walk, Some(1)),
+        (0, Some((0, 0)), (10, 0), 2, MoveHow::Walk, Some(2)),
+        (2, Some((10, 0)), (20, 0), 2, MoveHow::Walk, None),
+        (4, Some((20, 0)), (30, 0), 2, MoveHow::WalkKeepAnimation, None),
+        (6, Some((30, 0)), (40, 0), 2, MoveHow::Walk, None),
+        (8, Some((40, 0)), (50, 0), 30, MoveHow::Jump, None),
+        (38, Some((50, 0)), (60, 0), 15, MoveHow::Ladder, None),
+        (53, Some((60, 0)), (70, 0), 5, MoveHow::Walk, Some(1)),
     ]);
     assert_eq!(windows(&beats)[0].at, 58, "clip metadata leaves the existing movement clock unchanged");
     assert_eq!(end_of(&beats), End::Finished);
@@ -1175,35 +1179,38 @@ fn the_cast_decides_whose_events_are_kept_and_the_ground_gives_every_place_its_h
 
 #[test]
 fn walks_keep_the_actors_floor_across_windows_and_explicit_moves_reset_it() {
-    let jump = cat(&[vec![0xC0, 0, 0], words(&[40, 20, 0, 20])]);
-    let section = script(vec![("a", vec![
-        (3, vec![xyzi(10, 10, 100, 1)]),
-        (1, vec![mov(20, 10), message(0, 0), mov(30, 10), xyzi(10, 10, 0, 0),
-                 mov(20, 20), xyzi(10, 10, 100, 1), jump, mov(30, 20)]),
-    ])], vec![dialog("Aya")]);
-    let mut spec = FieldSpec::with_mesh(vec![
-        [(0, 0, 0), (100, 0, 0), (0, 100, 0)],
-        [(0, 0, 100), (100, 0, 100), (0, 100, 100)],
-    ], vec![[u16::MAX; 3]; 2]);
-    spec.overrides.push((0, section));
-    let field = FieldFile::parse(spec.build()).unwrap();
-    let mut def = demo_def(vec![member(0, "aya")], start(0, 1));
-    def.setup = vec![ScriptRef::new(0, 3)];
-    let mut play = ScenePlay::new(&field, &def, &StoryState::at(4), 1).unwrap();
-    let moves = |beat: &Beat| beat.stage.iter().filter_map(|event| match event.what {
-        Stage::Move { z, how, .. } => Some((z, how)), _ => None,
-    }).collect::<Vec<_>>();
-    let first = play.next(None);
-    assert!(matches!(first.then, Then::Window(_)));
-    assert_eq!(moves(&first), [(Some(100), MoveHow::Walk)], "setup height selects the upper floor");
-    let second = play.next(None);
-    assert!(matches!(second.then, Then::End { how: End::Finished, .. }));
-    assert_eq!(moves(&second), [
-        (Some(100), MoveHow::Walk), // The previous window did not lose the floor.
-        (Some(0), MoveHow::Walk),   // Explicit placement resets the floor.
-        (Some(0), MoveHow::Jump),   // The authored lower-floor jump resets the walking height.
-        (Some(0), MoveHow::Walk),   // The resolved landing resets subsequent walking.
-    ]);
+    for (opcode, how) in [(0xA8, MoveHow::Walk), (0xAD, MoveHow::WalkKeepAnimation)] {
+        let walk = |x, y| cat(&[vec![opcode, 0], words(&[x, y])]);
+        let jump = cat(&[vec![0xC0, 0, 0], words(&[40, 20, 0, 20])]);
+        let section = script(vec![("a", vec![
+            (3, vec![xyzi(10, 10, 100, 1)]),
+            (1, vec![walk(20, 10), message(0, 0), walk(30, 10), xyzi(10, 10, 0, 0),
+                     walk(20, 20), xyzi(10, 10, 100, 1), jump, walk(30, 20)]),
+        ])], vec![dialog("Aya")]);
+        let mut spec = FieldSpec::with_mesh(vec![
+            [(0, 0, 0), (100, 0, 0), (0, 100, 0)],
+            [(0, 0, 100), (100, 0, 100), (0, 100, 100)],
+        ], vec![[u16::MAX; 3]; 2]);
+        spec.overrides.push((0, section));
+        let field = FieldFile::parse(spec.build()).unwrap();
+        let mut def = demo_def(vec![member(0, "aya")], start(0, 1));
+        def.setup = vec![ScriptRef::new(0, 3)];
+        let mut play = ScenePlay::new(&field, &def, &StoryState::at(4), 1).unwrap();
+        let moves = |beat: &Beat| beat.stage.iter().filter_map(|event| match event.what {
+            Stage::Move { z, how, .. } => Some((z, how)), _ => None,
+        }).collect::<Vec<_>>();
+        let first = play.next(None);
+        assert!(matches!(first.then, Then::Window(_)));
+        assert_eq!(moves(&first), [(Some(100), how)], "setup height selects the upper floor: {how:?}");
+        let second = play.next(None);
+        assert!(matches!(second.then, Then::End { how: End::Finished, .. }));
+        assert_eq!(moves(&second), [
+            (Some(100), how), // The previous window did not lose the floor.
+            (Some(0), how),   // Explicit placement resets the floor.
+            (Some(0), MoveHow::Jump),   // The authored lower-floor jump resets the walking height.
+            (Some(0), how),   // The resolved landing resets subsequent walking.
+        ], "{how:?}");
+    }
 }
 
 #[test]

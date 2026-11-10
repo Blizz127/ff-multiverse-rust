@@ -1631,7 +1631,13 @@ other rates keep the usual fallback; the exact original PC render-tick boundary 
 Ordinary `MOVE` also resolves the same model's walk/run slot from the script's movement speed and field scale:
 slot 1 through three times the scale, slot 2 above it. Wedge's reactor approach uses slot 2 (`aaga`, 15 frames),
 then returns to his standing loop. The movement clip advances one frame per scene tick and freezes with dialogue;
-missing or incompatible clips keep the usual walking pose. Other movement opcodes retain their existing clips.
+missing or incompatible clips keep the usual walking pose.
+`FMOVE` preserves an already resolved normal-speed full default loop while moving, through consecutive segments and
+after arrival. Biggs uses slot 3 `cagc` (15 frames) during his two station entry moves, then explicitly selects his
+standing default again. Its phase follows scene time and freezes with dialogue. This follows the original
+[FMOVE handler](https://github.com/Akari1982/q-gears_reverse/blob/e0fabf7e121818e5abe2f873e34a07d0eb32742d/ffvii/DISC/FIELD/FIELD.BIN_event_code_entity.cpp#L462-L502),
+which leaves animation state intact. Holds, Once clips and other rates during FMOVE remain unsupported;
+missing or unsupported loops keep the existing fallback. Movement paths, heading and wait estimates are unchanged.
 Consecutive ordinary `MOVE` segments retain their presentation phase when they meet at exactly the same authored
 time and endpoint and use the same animation slot and resolved clip. Biggs's two departure segments in the team-talk
 scene use slot 1 (`aaff`, 30 frames) without restarting that clip at the corner. An idle gap, overlapping replacement,

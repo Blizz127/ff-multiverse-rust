@@ -9,6 +9,7 @@
 //! * `Move` walks it there over the number of frames the event says (a straight line from where it stood, heading
 //!   toward the target the whole way). A second move of the same actor first finishes the first. A resolved ordinary-MOVE
 //!   clip follows only that move's elapsed time, and yields to the standing default when it arrives.
+//!   FMOVE can instead keep an already resolved normal full loop advancing through movement and arrival.
 //! * `Face` turns it (the short way round), at once or over the frames it says.
 //! * `Show` hides or shows it.
 //! * The player resolves supported `Anim` loops, full Holds and explicit forward Holds against the actor's exact field model.
@@ -56,6 +57,11 @@ struct Walk {
     frames: f32,
     elapsed: f32,
     how: MoveHow,
+    keep_animation: bool,
+}
+
+fn is_walk(how: MoveHow) -> bool {
+    matches!(how, MoveHow::Walk | MoveHow::WalkKeepAnimation)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -155,17 +161,29 @@ impl Actor {
 
     /// Whether it is walking now (what the avatar's clip shows: a walk while this holds, standing otherwise).
     pub fn moving(&self) -> bool {
-        self.walk.is_some_and(|w| w.how == MoveHow::Walk)
+        self.walk.is_some_and(|w| is_walk(w.how))
     }
 
     pub fn walked_frames(&self) -> f32 { self.walked_frames }
 
     pub fn animation(&self) -> Option<(&str, ClipFrame)> {
         if let Some(walk) = self.walk {
-            return (walk.how == MoveHow::Walk).then_some(self.movement_animation.as_ref()).flatten()
+            if walk.keep_animation && self.has_normal_loop() {
+                return self.animation.as_ref().map(|a| (a.clip.as_str(), a.frame));
+            }
+            return is_walk(walk.how).then_some(self.movement_animation.as_ref()).flatten()
                 .map(|a| (a.clip.as_str(), a.frame));
         }
         self.animation.as_ref().map(|a| (a.clip.as_str(), a.frame))
+    }
+
+    fn has_normal_loop(&self) -> bool {
+        self.animation.as_ref().is_some_and(|animation|
+            matches!(animation.frame, ClipFrame::Loop(_)) && animation.rate == 1.0 && !animation.once)
+    }
+
+    fn replace_kept_animation(&mut self) {
+        if let Some(walk) = &mut self.walk { walk.keep_animation = false; }
     }
 
     /// A full Once's verified return clip. The avatar cache resolves the actual length without
@@ -190,6 +208,7 @@ impl Actor {
 
     fn advance(&mut self, frames: f32) {
         let moving_frames = self.walk.map_or(0.0, |w| frames.min((w.frames - w.elapsed).max(0.0)));
+        let keep_animation = self.walk.is_some_and(|walk| walk.keep_animation) && self.has_normal_loop();
         self.advance_walk(frames);
         self.advance_turn(frames);
         if frames.is_finite() {
@@ -199,7 +218,8 @@ impl Actor {
                     ClipFrame::HoldRange { elapsed, .. } | ClipFrame::HoldFull { elapsed } | ClipFrame::OnceFull { elapsed } => Some(elapsed),
                     ClipFrame::Hold(_) => None,
                 };
-                if let Some(frame) = advancing { *frame += (frames - moving_frames).max(0.0) * animation.rate; }
+                let animation_frames = if keep_animation { frames } else { (frames - moving_frames).max(0.0) };
+                if let Some(frame) = advancing { *frame += animation_frames * animation.rate; }
             }
             self.finish_once();
         }
@@ -221,7 +241,7 @@ impl Actor {
 
     fn advance_walk(&mut self, frames: f32) {
         if let Some(walk) = &mut self.walk {
-            if walk.how == MoveHow::Walk {
+            if is_walk(walk.how) {
                 let spent = frames.min((walk.frames - walk.elapsed).max(0.0));
                 self.walked_frames += spent;
                 if let Some(SceneAnimation { frame: ClipFrame::Loop(frame), .. }) = &mut self.movement_animation {
@@ -332,6 +352,7 @@ impl Cast {
     /// Set a resolved normal-speed full-range loop without changing the actor's model or movement.
     pub fn apply_loop(&mut self, entity: u8, slot: u8, clip: &str, overshoot: f32) {
         let Some(actor) = self.actors.get_mut(&entity) else { return self.off_cast() };
+        actor.replace_kept_animation();
         let frame = if overshoot.is_finite() { overshoot.max(0.0) } else { 0.0 };
         actor.default_animation = Some(DefaultAnimation { slot, clip: clip.to_string() });
         actor.animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::Loop(frame), rate: 1.0, once: false });
@@ -350,6 +371,7 @@ impl Cast {
     /// Hold one exact authored frame. The avatar pipeline validates its bounds in the loaded clip.
     pub fn apply_hold(&mut self, entity: u8, clip: &str, frame: u8) {
         let Some(actor) = self.actors.get_mut(&entity) else { return self.off_cast() };
+        actor.replace_kept_animation();
         actor.movement_animation = None;
         actor.animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::Hold(frame), rate: 1.0, once: false });
     }
@@ -358,6 +380,7 @@ impl Cast {
     /// checked by the avatar pipeline before it samples any pose.
     pub fn apply_hold_range(&mut self, entity: u8, clip: &str, first: u8, last: u8, overshoot: f32) {
         let Some(actor) = self.actors.get_mut(&entity) else { return self.off_cast() };
+        actor.replace_kept_animation();
         let elapsed = if overshoot.is_finite() { overshoot.max(0.0) } else { 0.0 };
         actor.movement_animation = None;
         actor.animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::HoldRange { first, last, elapsed }, rate: 1.0, once: false });
@@ -367,6 +390,7 @@ impl Cast {
     /// actual last frame. Sampling resolves the endpoint; this does not change the interpreter's waits.
     pub fn apply_hold_full(&mut self, entity: u8, clip: &str, overshoot: f32, doubled: bool) {
         let Some(actor) = self.actors.get_mut(&entity) else { return self.off_cast() };
+        actor.replace_kept_animation();
         let rate = if doubled { 2.0 } else { 1.0 };
         let elapsed = if overshoot.is_finite() { overshoot.max(0.0) * rate } else { 0.0 };
         actor.movement_animation = None;
@@ -422,11 +446,16 @@ impl Cast {
             Stage::Move { entity, from, x, y, z, triangle, frames, how, .. } => {
                 let Some(actor) = self.actors.get_mut(entity) else { return self.off_cast() };
                 actor.movement_animation = None;
+                // Only a loop already resolved before this FMOVE qualifies. Restoring a Once's
+                // default below must not promote that unsupported movement/gesture combination.
+                let keep_animation = *how == MoveHow::WalkKeepAnimation && actor.has_normal_loop()
+                    && actor.walk.is_none_or(|walk| walk.keep_animation);
                 if actor.animation.as_ref().is_some_and(|animation| animation.once) { actor.restore_default(0.0); }
                 // DFANM is a standing default, not the actor's walk/jump/ladder animation.
                 // Restart it when movement ends; any unused part of a tick advances the idle.
                 match &mut actor.animation {
-                    Some(SceneAnimation { frame: ClipFrame::Loop(frame), .. }) => *frame = 0.0,
+                    Some(SceneAnimation { frame: ClipFrame::Loop(frame), .. }) if !keep_animation => *frame = 0.0,
+                    Some(SceneAnimation { frame: ClipFrame::Loop(_), .. }) => {},
                     _ => actor.animation = None, // A new movement replaces a held pose or range.
                 }
                 // A second move of the same actor starts where the first one was going.
@@ -445,12 +474,12 @@ impl Cast {
                 let z = z.map(f32::from).or_else(|| height(*x, *y, *triangle)).unwrap_or(start[2]);
                 let to = [target_xy.0, target_xy.1, z];
                 let (dx, dy) = (to[0] - start[0], to[1] - start[1]);
-                if *how == MoveHow::Walk && dx.hypot(dy) > 0.5 {
+                if is_walk(*how) && dx.hypot(dy) > 0.5 {
                     actor.heading = dy.atan2(dx);
                     actor.turn = None;
                 }
                 actor.pos = Some(start);
-                actor.walk = Some(Walk { from: start, to, frames: *frames as f32, elapsed: 0.0, how: *how });
+                actor.walk = Some(Walk { from: start, to, frames: *frames as f32, elapsed: 0.0, how: *how, keep_animation });
                 // (a walk of no frames is a jump to the place: `advance` finishes it at once)
                 actor.advance_walk(overshoot);
             }
@@ -471,6 +500,7 @@ impl Cast {
             }
             Stage::Anim { entity, how, .. } => {
                 if let Some(actor) = self.actors.get_mut(entity) {
+                    actor.replace_kept_animation();
                     if *how == AnimHow::Loop { actor.default_animation = None; }
                     actor.animation = None;
                     actor.movement_animation = None;
@@ -481,6 +511,7 @@ impl Cast {
             }
             Stage::AnimSpeed { entity, .. } => {
                 let Some(actor) = self.actors.get_mut(entity) else { return self.off_cast() };
+                actor.replace_kept_animation();
                 // Dynamic speed changes are outside the supported normal-speed loop subset.
                 // A fresh DFANM can establish another supported loop explicitly.
                 actor.default_animation = None;

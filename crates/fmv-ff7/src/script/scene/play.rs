@@ -446,7 +446,8 @@ impl ScenePlay {
                     // The authored landing triangle selects a jump's floor. Walking has no
                     // triangle: prefer its preceding surface where several floors overlap.
                     if z.is_none() {
-                        let hint = (*how == MoveHow::Walk).then(|| self.heights.get(entity).copied()).flatten();
+                        let hint = matches!(*how, MoveHow::Walk | MoveHow::WalkKeepAnimation)
+                            .then(|| self.heights.get(entity).copied()).flatten();
                         *z = self.ground.height(*x, *y, *triangle, hint).map(|h| h.round() as i16);
                     }
                     if let Some(z) = *z { self.heights.insert(*entity, z); }

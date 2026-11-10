@@ -174,16 +174,23 @@ fn the_station_scene_takes_barret_out_of_the_party_and_the_storys_party_table_ag
     let Look::Model { hrc, .. } = &member.look else { panic!("Biggs retains his field model") };
     assert_eq!((biggs_model.hrc_stem(), hrc.as_str()), ("bwfd".to_string(), "bwfd"));
     let default_stem = biggs_model.animations[0].stem();
+    let moving_stem = biggs_model.animations[3].stem();
     let once_stem = biggs_model.animations[4].stem();
-    assert_eq!((default_stem.as_str(), once_stem.as_str()), ("caed", "cagd"));
+    assert_eq!((default_stem.as_str(), moving_stem.as_str(), once_stem.as_str()), ("caed", "cagc", "cagd"));
     let requested = script.disassemble(3, 3).unwrap();
+    let entry = requested.windows(4).find(|entry| entry[0].offset == 0x04B9).unwrap();
+    assert_eq!((entry[0].opcode, entry[0].literal("animation"), entry[0].literal("speed")), (0xA2, Some(3), Some(1)));
+    for (ins, offset, x, y) in [(&entry[1], 0x04BC, 1539, -5357), (&entry[2], 0x04C2, 1487, -5195)] {
+        assert_eq!((ins.offset, ins.opcode, ins.literal("x"), ins.literal("y")), (offset, 0xAD, Some(x), Some(y)), "FMOVE retains the authored animation instead of selecting MOVE's walk/run slot");
+    }
+    assert_eq!((entry[3].offset, entry[3].opcode, entry[3].literal("animation"), entry[3].literal("speed")), (0x04C8, 0xA2, Some(0), Some(1)));
     let pair = requested.windows(2).find(|pair| pair[0].offset == 0x04C8).unwrap();
     assert_eq!((pair[0].opcode, pair[0].literal("animation"), pair[0].literal("speed")), (0xA2, Some(0), Some(1)));
     assert_eq!((pair[1].offset, pair[1].opcode, pair[1].literal("animation"), pair[1].literal("speed")), (0x04CB, 0xA3, Some(4), Some(1)));
     assert!(script.disassemble(3, 0).unwrap().iter().chain(requested.iter()).all(|ins| ins.opcode != 0xBD), "Biggs's init and requested script leave ASPED at its default");
     let mut characters = LgpArchive::open_path(data_dir().unwrap().join("field/char.lgp")).unwrap();
     let model = fmv_ff7::load_field_model(&mut characters, hrc).unwrap();
-    for (stem, frames) in [(&default_stem, 2), (&once_stem, 15)] {
+    for (stem, frames) in [(&default_stem, 2), (&moving_stem, 15), (&once_stem, 15)] {
         let clip = fmv_ff7::load_field_animation(&mut characters, stem).unwrap();
         assert_eq!((clip.frame_count(), clip.bone_count()), (frames, 21), "{stem}");
         assert!(model.fits(&clip), "{stem} fits Biggs's retained model");
@@ -196,14 +203,20 @@ fn the_station_scene_takes_barret_out_of_the_party_and_the_storys_party_table_ag
     }
     let mut play = ScenePlay::new(&f, &def, &before, 1).unwrap();
     assert_eq!(play.animation_clip(3, 0), Some(default_stem.as_str()));
+    assert_eq!(play.animation_clip(3, 3), Some(moving_stem.as_str()));
     assert_eq!(play.animation_clip(3, 4), Some(once_stem.as_str()));
     let mut animations = Vec::new();
+    let mut biggs_stage = Vec::new();
     loop {
         let beat = play.next(None);
-        animations.extend(beat.stage.into_iter().filter_map(|event| match event.what {
-            animation @ Stage::Anim { entity: 3, .. } => Some(animation),
-            _ => None,
-        }));
+        for event in beat.stage {
+            if matches!(event.what, Stage::Anim { entity: 3, .. }) { animations.push(event.what.clone()); }
+            if matches!(event.what, Stage::Place { entity: 3, .. } | Stage::Move { entity: 3, .. }
+                | Stage::Face { entity: 3, .. } | Stage::Show { entity: 3, .. }
+                | Stage::Anim { entity: 3, .. } | Stage::AnimSpeed { entity: 3, .. }) {
+                biggs_stage.push(event.what);
+            }
+        }
         if let Then::End { how, .. } = beat.then {
             assert_eq!(how, End::Finished);
             break;
@@ -214,6 +227,12 @@ fn the_station_scene_takes_barret_out_of_the_party_and_the_storys_party_table_ag
         Stage::Anim { entity: 3, animation: 4, how: AnimHow::Once, first: None, last: None, speed: 16, divisor: 1 },
     ];
     assert!(animations.windows(2).any(|pair| pair == expected), "the registered station scene emits the authored default followed by its full normal-speed Once: {animations:?}");
+    assert!(biggs_stage.windows(4).any(|entry| matches!(entry,
+        [Stage::Anim { entity: 3, animation: 3, how: AnimHow::Loop, first: None, last: None, speed: 16, divisor: 1 },
+         Stage::Move { entity: 3, from: Some((1630, -5357)), x: 1539, y: -5357, how: MoveHow::WalkKeepAnimation, animation: None, .. },
+         Stage::Move { entity: 3, from: Some((1539, -5357)), x: 1487, y: -5195, how: MoveHow::WalkKeepAnimation, animation: None, .. },
+         Stage::Anim { entity: 3, animation: 0, how: AnimHow::Loop, first: None, last: None, speed: 16, divisor: 1 }])),
+        "the two reached FMOVEs keep the authored slot3 loop until DFANM0 replaces it: {biggs_stage:?}");
 }
 
 /// The first scene after the escape touches no party and nothing saved: it ends in the field's own jump to `md8_1`.
@@ -1155,7 +1174,7 @@ fn cast_path(stage: &[Stage]) -> Vec<(u8, f32, f32)> {
             Stage::Move { entity, from, x, y, how, .. } => {
                 let start = from.map(|(fx, fy)| (f32::from(fx), f32::from(fy))).or_else(|| at.get(&entity).copied());
                 let end = (f32::from(x), f32::from(y));
-                if let (Some(a), MoveHow::Walk | MoveHow::Jump | MoveHow::Ladder) = (start, how) {
+                if let (Some(a), MoveHow::Walk | MoveHow::WalkKeepAnimation | MoveHow::Jump | MoveHow::Ladder) = (start, how) {
                     let n = ((end.0 - a.0).hypot(end.1 - a.1) / 10.0).ceil().max(1.0) as u32;
                     for k in 0..=n {
                         let t = k as f32 / n as f32;

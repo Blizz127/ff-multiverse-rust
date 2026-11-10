@@ -851,6 +851,199 @@ mod movement_continuity {
     }
 }
 
+mod fmove_loop_phase {
+    use super::*;
+    use crate::avatar::anim::ClipFrame;
+    use super::super::stage::Cast;
+    use fmv_ff7::script::scene::AnimHow;
+
+    struct Moving(Scripted);
+    impl SceneSource for Moving {
+        fn initial(&self) -> Vec<Stage> { self.0.initial() }
+        fn next(&mut self, answer: Option<usize>) -> Beat { self.0.next(answer) }
+        fn height_at(&self, x: i16, y: i16, triangle: Option<u16>) -> Option<f32> { self.0.height_at(x, y, triangle) }
+        fn animation_clip(&self, entity: u8, slot: u8) -> Option<&str> {
+            if entity != 20 { return None; }
+            match slot { 0 => Some("idle"), 1 => Some("stride"), 3 => Some("other"), _ => None }
+        }
+    }
+
+    fn looping(slot: u8) -> Stage {
+        Stage::Anim { entity: 20, animation: slot, how: AnimHow::Loop, first: None, last: None, speed: 16, divisor: 1 }
+    }
+
+    fn movement(x: i16, y: i16, z: Option<i16>, frames: u32, how: MoveHow) -> Stage {
+        Stage::Move { entity: 20, from: None, x, y, z, triangle: None, frames, how,
+            animation: (how == MoveHow::Walk).then_some(1) }
+    }
+
+    fn player(role: SceneRole, beats: Vec<Beat>) -> ScenePlayer {
+        let mut initial = places();
+        initial.push(looping(0));
+        let mut definition = def();
+        definition.cast[1].look = Look::Model { hrc: "model".into(), idle: "base".into() };
+        ScenePlayer::new(Run { id: RUN, participants: vec![], role }, definition,
+            Box::new(Moving(Scripted { initial, beats: beats.into(), asked: Asked::default() })), false)
+    }
+
+    fn clip(player: &ScenePlayer) -> Option<(String, ClipFrame)> {
+        let actors = cast_players(player);
+        let actor = actors.iter().find(|actor| actor.who == cast_who(20)).unwrap();
+        let npc = actor.npc.unwrap();
+        assert_eq!((npc.model, npc.idle), ("model", Some("base")), "movement never changes the retained model or fallback idle");
+        actor.scene_clip.map(|(stem, frame)| (stem.to_string(), frame))
+    }
+
+    fn phase(player: &ScenePlayer, stem: &str, expected: f32) {
+        let Some((actual, ClipFrame::Loop(frame))) = clip(player) else { panic!("expected {stem} loop") };
+        assert_eq!(actual, stem);
+        assert!((frame - expected).abs() < 0.0001, "expected {expected}, got {frame}");
+    }
+
+    fn pass(player: &mut ScenePlayer, role: SceneRole, index: u32) {
+        if role == SceneRole::Owner { player.key(SceneKey::Confirm); } else { player.on_step(index, None); }
+    }
+
+    #[test]
+    fn normal_loop_survives_two_segments_pause_and_arrival_then_an_ordinary_move_resets_it() {
+        for role in [SceneRole::Owner, SceneRole::Watcher] {
+            let mut player = player(role, vec![
+                Beat { stage: vec![
+                    timed(3, movement(80, 10, None, 6, MoveHow::WalkKeepAnimation)),
+                    timed(9, movement(80, 90, Some(31), 8, MoveHow::WalkKeepAnimation)),
+                ], then: say(13, 20, 20, 1).then },
+                say(10, 20, 20, 2),
+                Beat { stage: vec![timed(0, movement(100, 90, Some(31), 4, MoveHow::Walk))], then: say(6, 20, 20, 3).then },
+            ]);
+            player.advance(2.0 / 30.0);
+            phase(&player, "idle", 2.0);
+            assert!(!player.actor(20).unwrap().moving());
+            player.advance(3.0 / 30.0);
+            phase(&player, "idle", 5.0);
+            let actor = player.actor(20).unwrap();
+            assert!(actor.moving());
+            assert_eq!(actor.pos(), Some([60.0, 10.0, 11.0]));
+            assert_eq!((actor.heading(), actor.walked_frames()), (0.0, 2.0));
+            // One tick crosses the exact segment boundary; the loop advances once, not once per event.
+            player.advance(8.0 / 30.0);
+            assert!(player.has_window());
+            phase(&player, "idle", 13.0);
+            let actor = player.actor(20).unwrap();
+            assert_eq!(actor.pos(), Some([80.0, 50.0, 21.0]));
+            assert!((actor.heading() - std::f32::consts::FRAC_PI_2).abs() < 0.0001);
+            assert_eq!(actor.walked_frames(), 10.0);
+            player.advance(20.0);
+            phase(&player, "idle", 13.0);
+            assert_eq!(player.actor(20).unwrap().pos(), Some([80.0, 50.0, 21.0]), "dialogue freezes geometry and phase together");
+            pass(&mut player, role, 0);
+            player.advance(4.0 / 30.0);
+            phase(&player, "idle", 17.0);
+            let actor = player.actor(20).unwrap();
+            assert!(!actor.moving());
+            assert_eq!((actor.pos(), actor.walked_frames()), (Some([80.0, 90.0, 31.0]), 14.0));
+            player.advance(6.0 / 30.0);
+            phase(&player, "idle", 23.0);
+            assert!(player.has_window());
+            pass(&mut player, role, 1);
+            player.advance(2.0 / 30.0);
+            phase(&player, "stride", 2.0);
+            player.advance(2.0 / 30.0);
+            phase(&player, "idle", 0.0);
+            player.advance(2.0 / 30.0);
+            phase(&player, "idle", 2.0);
+            assert_eq!(player.actor(20).unwrap().walked_frames(), 18.0);
+        }
+    }
+
+    #[test]
+    fn a_single_tick_and_partitioned_ticks_keep_the_same_phase() {
+        for role in [SceneRole::Owner, SceneRole::Watcher] {
+            for chunks in [vec![23.0], vec![2.0, 3.0, 4.0, 8.0, 6.0]] {
+                let mut player = player(role, vec![Beat { stage: vec![
+                    timed(3, movement(80, 10, None, 6, MoveHow::WalkKeepAnimation)),
+                    timed(9, movement(80, 90, Some(31), 8, MoveHow::WalkKeepAnimation)),
+                ], then: say(23, 20, 20, 1).then }]);
+                for frames in chunks { player.advance(frames / 30.0); }
+                phase(&player, "idle", 23.0);
+                assert_eq!((player.actor(20).unwrap().pos(), player.actor(20).unwrap().walked_frames()),
+                    (Some([80.0, 90.0, 31.0]), 14.0));
+            }
+        }
+    }
+
+    #[test]
+    fn replacements_cannot_inherit_the_preserved_clock() {
+        let events = [
+            (looping(3), Some(("other".to_string(), ClipFrame::Loop(2.0)))),
+            (Stage::Anim { entity: 20, animation: 3, how: AnimHow::Hold, first: None, last: None, speed: 16, divisor: 1 },
+                Some(("other".to_string(), ClipFrame::HoldFull { elapsed: 2.0 }))),
+            (Stage::AnimSpeed { entity: 20, speed: 32 }, None),
+            (Stage::Anim { entity: 20, animation: 3, how: AnimHow::Loop, first: None, last: None, speed: 32, divisor: 1 }, None),
+            (looping(99), None),
+        ];
+        for role in [SceneRole::Owner, SceneRole::Watcher] {
+            for (replacement, after) in &events {
+                let mut player = player(role, vec![Beat { stage: vec![
+                    timed(2, movement(90, 10, None, 8, MoveHow::WalkKeepAnimation)),
+                    timed(5, replacement.clone()),
+                ], then: say(12, 20, 20, 1).then }]);
+                player.advance(4.0 / 30.0);
+                phase(&player, "idle", 4.0);
+                player.advance(3.0 / 30.0);
+                assert!(player.actor(20).unwrap().moving());
+                assert_eq!(clip(&player), None, "replacement {replacement:?} uses the existing fallback while moving");
+                player.advance(5.0 / 30.0);
+                assert_eq!(&clip(&player), after, "only time after arrival advances replacement {replacement:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn holds_once_and_a_hidden_ordinary_move_default_do_not_qualify() {
+        let events = [
+            (Stage::Anim { entity: 20, animation: 3, how: AnimHow::Hold, first: Some(0), last: Some(0), speed: 16, divisor: 1 }, false),
+            (Stage::Anim { entity: 20, animation: 3, how: AnimHow::Hold, first: Some(0), last: Some(9), speed: 16, divisor: 1 }, false),
+            (Stage::Anim { entity: 20, animation: 3, how: AnimHow::Hold, first: None, last: None, speed: 32, divisor: 1 }, false),
+            (Stage::Anim { entity: 20, animation: 3, how: AnimHow::Once, first: Some(0), last: Some(19), speed: 16, divisor: 1 }, true),
+            (Stage::Anim { entity: 20, animation: 3, how: AnimHow::Once, first: None, last: None, speed: 16, divisor: 1 }, true),
+            (movement(70, 10, None, 20, MoveHow::Walk), true),
+        ];
+        for role in [SceneRole::Owner, SceneRole::Watcher] {
+            for (preceding, has_default) in &events {
+                let mut player = player(role, vec![Beat { stage: vec![
+                    timed(1, preceding.clone()),
+                    timed(3, movement(90, 10, None, 5, MoveHow::WalkKeepAnimation)),
+                ], then: say(10, 20, 20, 1).then }]);
+                player.advance(6.0 / 30.0);
+                assert!(player.actor(20).unwrap().moving());
+                assert_eq!(clip(&player), None, "preceding {preceding:?} is not an active normal full loop");
+                player.advance(4.0 / 30.0);
+                assert_eq!(clip(&player), has_default.then(|| ("idle".to_string(), ClipFrame::Loop(2.0))),
+                    "the previous cancellation/restoration behavior survives {preceding:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn late_motion_catchup_never_ticks_an_already_advanced_loop_again() {
+        for (late, x, walked) in [(f32::NAN, 50.0, 0.0), (-3.0, 50.0, 0.0), (2.0, 60.0, 2.0), (f32::INFINITY, 70.0, 4.0)] {
+            let mut cast = Cast::new([20]);
+            cast.apply(&Stage::Place { entity: 20, x: 50, y: 10, z: Some(11), triangle: None }, 0.0, &|_, _, _| None);
+            cast.apply_loop(20, 0, "idle", 7.0);
+            cast.advance(3.0);
+            cast.apply(&movement(70, 10, Some(11), 4, MoveHow::WalkKeepAnimation), late, &|_, _, _| None);
+            let actor = cast.actor(20).unwrap();
+            assert_eq!(actor.animation(), Some(("idle", ClipFrame::Loop(10.0))), "late={late}: loop already reached this scene time");
+            assert_eq!((actor.pos(), actor.walked_frames()), (Some([x, 10.0, 11.0]), walked));
+            cast.advance(3.0);
+            assert_eq!(cast.actor(20).unwrap().animation(), Some(("idle", ClipFrame::Loop(13.0))));
+            cast.settle();
+            assert_eq!(cast.actor(20).unwrap().animation(), Some(("idle", ClipFrame::Loop(13.0))), "infinite settling changes geometry, not finite clip phase");
+            assert_eq!(cast.actor(20).unwrap().pos(), Some([70.0, 10.0, 11.0]));
+        }
+    }
+}
+
 #[test]
 fn single_frame_holds_stay_fixed_until_replaced_for_owner_and_watcher() {
     use crate::avatar::anim::ClipFrame;

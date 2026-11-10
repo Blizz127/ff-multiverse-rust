@@ -363,7 +363,7 @@ fn make_rig(real: &Real, def: SceneDef, moved: bool) -> Rig {
 }
 
 /// Every place the cast takes in a played scene, as the interpreter's stage events say it: the initial placements and every
-/// walk (a `Walk`, `Jump` or `Ladder` move), sampled each ten units, hidden actors too. The same rule as `cast_path` in
+/// walk (including `WalkKeepAnimation`, `Jump` or `Ladder`), sampled each ten units, hidden actors too. The same rule as `cast_path` in
 /// `fmv-ff7`'s `tests/scene_real.rs`.
 fn cast_path(stage: &[Stage]) -> Vec<(u8, f32, f32)> {
     let mut at: BTreeMap<u8, (f32, f32)> = BTreeMap::new();
@@ -377,7 +377,7 @@ fn cast_path(stage: &[Stage]) -> Vec<(u8, f32, f32)> {
             Stage::Move { entity, from, x, y, how, .. } => {
                 let start = from.map(|(fx, fy)| (f32::from(fx), f32::from(fy))).or_else(|| at.get(&entity).copied());
                 let end = (f32::from(x), f32::from(y));
-                if let (Some(a), MoveHow::Walk | MoveHow::Jump | MoveHow::Ladder) = (start, how) {
+                if let (Some(a), MoveHow::Walk | MoveHow::WalkKeepAnimation | MoveHow::Jump | MoveHow::Ladder) = (start, how) {
                     let n = ((end.0 - a.0).hypot(end.1 - a.1) / 10.0).ceil().max(1.0) as u32;
                     for k in 0..=n {
                         let t = k as f32 / n as f32;
