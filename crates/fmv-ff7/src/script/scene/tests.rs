@@ -476,6 +476,30 @@ fn animations_come_out_with_how_they_play_and_the_script_waits_where_the_engine_
 }
 
 #[test]
+fn cropped_holds_dispatch_async_b1_and_sync_bc_before_explicit_waits() {
+    for (opcode, last, expected_at) in [(0xB1, 39, 15), (0xBC, 39, 55), (0xB1, 0, 15), (0xBC, 0, 16)] {
+        let section = script(vec![("a", vec![(1, vec![vec![opcode, 5, 0, last, 1], wait(15), message(0, 0)])])], texts(1));
+        let (beats, vm) = run_root(&section, start(0, 1), &[]);
+        assert_eq!(stage(&beats), [(0, Stage::Anim { entity: 0, animation: 5, how: AnimHow::Hold,
+            first: Some(0), last: Some(last), speed: 16, divisor: 1 })]);
+        assert_eq!(windows(&beats)[0].at, expected_at, "opcode {opcode:#x}, last frame {last}: only BC adds the existing clip wait");
+        assert_eq!(end_of(&beats), End::Finished);
+        assert!(vm.writes().is_empty());
+    }
+}
+
+#[test]
+fn animw_joins_the_existing_cropped_hold_deadline() {
+    for (opcode, expected_at) in [(0xB1, 40), (0xBC, 55)] {
+        let section = script(vec![("a", vec![(1, vec![vec![opcode, 5, 0, 39, 1], wait(15), vec![0xAC], message(0, 0)])])], texts(1));
+        let (beats, vm) = run_root(&section, start(0, 1), &[]);
+        assert_eq!(windows(&beats)[0].at, expected_at, "ANIMW joins the original deadline; it does not start another animation wait");
+        assert_eq!(end_of(&beats), End::Finished);
+        assert!(vm.writes().is_empty());
+    }
+}
+
+#[test]
 fn animation_literal_speed_is_preserved_separately_without_changing_waits() {
     let a = vec![vec![0xA2, 3, 2], vec![0xBD, 0, 32, 0], vec![0xAF, 4, 3], vec![0xA2, 5, 0], message(0, 0)];
     let section = script(vec![("a", vec![(1, a)])], texts(1));

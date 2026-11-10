@@ -1396,13 +1396,22 @@ impl Vm {
                 self.do_anim(idx, me, ins, AnimHow::Once, false);
                 Flow::Next
             }
-            0xAF | 0xB1 => {
+            0xAF => {
                 self.do_anim(idx, me, ins, AnimHow::Hold, true);
                 Flow::Yield
             }
-            0xBA | 0xBC => {
+            0xBA => {
                 self.do_anim(idx, me, ins, AnimHow::Hold, false);
                 Flow::Next
+            }
+            // CANM!1 starts asynchronously; CANM!2 waits for the existing clip deadline.
+            0xB1 => {
+                self.do_anim(idx, me, ins, AnimHow::Hold, false);
+                Flow::Next
+            }
+            0xBC => {
+                self.do_anim(idx, me, ins, AnimHow::Hold, true);
+                Flow::Yield
             }
             0xBD => {
                 let speed = u32::try_from(self.num(ins, "speed", Width::U16)).unwrap_or(DEFAULT_ANIM_SPEED);
