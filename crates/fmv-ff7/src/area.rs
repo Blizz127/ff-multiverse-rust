@@ -1054,6 +1054,15 @@ impl AreaRuntime for Ff7FieldArea {
                 if npc.entity_name.eq_ignore_ascii_case("av_j") && matches!(marker, Some(JESSIE_LOWER_PHASE | JESSIE_TRAPPED_PHASE | JESSIE_RESCUED_PHASE)) {
                     npc.pos = Pos::new(-183.0, 1191.0, 1643.0); // owned init: lower platform, triangle 20
                     npc.facing = crate::field_direction_to_facing(if marker == Some(JESSIE_TRAPPED_PHASE) { 0 } else { 128 });
+                    if marker == Some(JESSIE_TRAPPED_PHASE) {
+                        // Reviewed init: DFANM 3, speed 1. Resolve the clip through this field's model
+                        // record; retain the base pose if the record is missing or incomplete.
+                        if let Some(idle) = self.field.model_loader().ok().and_then(|loader| loader.models.into_iter()
+                            .find(|model| model.hrc_stem().eq_ignore_ascii_case(&npc.appearance.model))
+                            .and_then(|model| model.animations.get(3).map(|clip| clip.stem())).filter(|idle| !idle.is_empty())) {
+                            npc.appearance.idle_animation = Some(idle);
+                        }
+                    }
                     // Retain the slot so the other characters keep their server IDs.
                     npc.unconditional = marker != Some(JESSIE_RESCUED_PHASE);
                 }

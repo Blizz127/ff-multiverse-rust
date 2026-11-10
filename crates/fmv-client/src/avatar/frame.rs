@@ -329,7 +329,11 @@ impl Avatars {
                 continue;
             };
             let clip = asset.character.animation(p.anim);
-            let playback = self.animator.advance(p.who, p.anim, dt, clip.frame_count());
+            let playback = if p.npc.is_some() && p.anim == AnimState::Idle {
+                self.animator.advance_npc(p.who, dt, clip.frame_count())
+            } else {
+                self.animator.advance(p.who, p.anim, dt, clip.frame_count())
+            };
             let Some(pose) = clip.pose_at(&asset.character.model.bones, playback.frame) else {
                 markers.push(i);
                 continue;

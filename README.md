@@ -650,7 +650,10 @@ party can do of it. Everything below is pinned against the real data in `crates/
   whether the second door of `nmkin_1` opens. Saving the rescue now changes the `nmkin_3` phase and hides Jessie immediately,
   including after re-login; other NPC slots retain their IDs. Her position and facing follow the existing moment: upper
   platform before 14, downstairs after her ladder explanation, and facing the rescue approach from 27. Her talk target
-  follows the same phase and still checks distance, height and story permission. Her static idle animation and the `nmkin_1` cast/door remain as
+  follows the same phase and still checks distance, height and story permission. While trapped she uses her field's
+  authored 45-frame idle clip; NPC idle clips loop at the field frame rate, while playable-character idle poses stay still.
+  Clip compatibility and playback timing have focused checks; this change has not been inspected on rendered frames.
+  The `nmkin_1` cast/door remain as
   before, and the walkmesh has no door locks). A bot that also travels (`--story-advance --travel`) pursues a story step that OPENS the exit its route
   goes to (the ride back, which is not a step forward) and never one that would CLOSE it (the ride down, forward again once
   the lift is up), so the lift is ridden once each way and never flaps (`StoryBot::set_wanted_exit`). The way out of the reactor is the

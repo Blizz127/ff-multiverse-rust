@@ -130,10 +130,10 @@ pub fn peer_line(peer: &PeerSighting) -> String {
 }
 
 /// The line that says one non-player character of the area: `headless: npc area=<area id> id=<n> name=<enc>
-/// model=<enc>` (the model is the skeleton stem the area's data names, `-` for none). Printed for every character
+/// model=<enc> idle=<enc>` (archive stems, `-` for none). Printed for every character
 /// whenever the area's set of characters changes.
-pub fn npc_line(area: &AreaId, id: u32, name: &str, model: &str) -> String {
-    format!("headless: npc area={area} id={id} name={} model={}", token(Some(name)), token(Some(model)))
+pub fn npc_line(area: &AreaId, id: u32, name: &str, model: &str, idle: Option<&str>) -> String {
+    format!("headless: npc area={area} id={id} name={} model={} idle={}", token(Some(name)), token(Some(model)), token(idle))
 }
 
 /// The fields of the SMOKE line, in the order they are printed (`scripts/smoke.sh` parses the
@@ -332,7 +332,7 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>, mut 
     let mut after_battle: Option<(f32, u64)> = None;
     let mut battles_ended = 0;
     // The area's NPCs as last reported: id, name and model (the snapshot of an area says who they are).
-    let mut last_npcs: Vec<(u32, String, String)> = Vec::new();
+    let mut last_npcs: Vec<(u32, String, String, Option<String>)> = Vec::new();
     // How many other players were in view at the last look (`usize::MAX`: none yet).
     let mut last_in_view = usize::MAX;
     // The version of the area's NPC list the story bot was last told (`u64::MAX`: none yet).
@@ -378,12 +378,12 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>, mut 
         }
         // The music follows the area and the battle (a no-op for a silent bot).
         audio.update_from(&session);
-        let npcs: Vec<(u32, String, String)> = session.state.npc_views().iter().map(|n| (n.id, n.name.clone(), n.model.clone())).collect();
+        let npcs: Vec<_> = session.state.npc_views().iter().map(|n| (n.id, n.name.clone(), n.model.clone(), n.idle_animation.clone())).collect();
         if npcs != last_npcs {
-            let names: Vec<&str> = npcs.iter().map(|(_, name, _)| name.as_str()).collect();
+            let names: Vec<&str> = npcs.iter().map(|(_, name, _, _)| name.as_str()).collect();
             eprintln!("headless: {} NPC(s) in {}: {}", npcs.len(), session.info.area_id, names.join(", "));
-            for (id, name, model) in &npcs {
-                eprintln!("{}", npc_line(&session.info.area_id, *id, name, model));
+            for (id, name, model, idle) in &npcs {
+                eprintln!("{}", npc_line(&session.info.area_id, *id, name, model, idle.as_deref()));
             }
             last_npcs = npcs;
         }
@@ -709,8 +709,8 @@ mod tests {
         assert_eq!(peer_line(&peer), "headless: peer entity=8 name=Wedge tint=c80a0a binding=ff7%2Fbody%2Fslim area=Ff7/md1stin");
         let plain = PeerSighting { binding: None, name: "Red XIII".into(), ..peer };
         assert_eq!(peer_line(&plain), "headless: peer entity=8 name=Red%20XIII tint=c80a0a binding=- area=Ff7/md1stin");
-        assert_eq!(npc_line(&area, 2, "Barret", "acgd"), "headless: npc area=Ff7/md1stin id=2 name=Barret model=acgd");
-        assert_eq!(npc_line(&area, 0, "gu 0", ""), "headless: npc area=Ff7/md1stin id=0 name=gu%200 model=-");
+        assert_eq!(npc_line(&area, 2, "Barret", "acgd", Some("adcb")), "headless: npc area=Ff7/md1stin id=2 name=Barret model=acgd idle=adcb");
+        assert_eq!(npc_line(&area, 0, "gu 0", "", None), "headless: npc area=Ff7/md1stin id=0 name=gu%200 model=- idle=-");
     }
 
     #[test]

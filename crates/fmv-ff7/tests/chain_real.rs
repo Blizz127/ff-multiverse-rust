@@ -1051,6 +1051,7 @@ fn nobody_is_stranded_at_27_or_33_in_any_reviewed_field() {
                 for npc in expected.iter_mut().filter(|npc| npc.entity_name == "av_j") {
                     npc.pos = fmv_core::Pos::new(-183.0, 1191.0, 1643.0);
                     npc.facing = fmv_ff7::field_direction_to_facing(0);
+                    npc.appearance.idle_animation = Some("bygd".into());
                 }
             }
             assert_eq!(area.npcs_in_phase(&phase), expected, "{field} at {name}: only reviewed cast changes");
@@ -1174,6 +1175,9 @@ fn jessies_saved_story_places_her_and_moves_her_talk_target() {
                     _ => {},
                 }
             }
+            if (moment as i16) >= 27 && !rescued {
+                expected[jessie].appearance.idle_animation = Some(field.model_loader().unwrap().models[1].animations[3].stem());
+            }
             assert_eq!(area.npcs_in_phase(&phase), expected, "owned placement, facing, visibility; other slots unchanged at {moment}/{rescued}");
             let points = area.story_points_in_phase(&phase);
             assert_eq!(points.len(), usize::from(expected[jessie].unconditional));
@@ -1193,6 +1197,29 @@ fn jessies_saved_story_places_her_and_moves_her_talk_target() {
     }
     assert_ne!(area.phase_key(&StoryState::at(13).encode()), area.phase_key(&StoryState::at(14).encode()), "ladder step refreshes both players' cast");
     assert_eq!(area.phase_key(&[255, 1, 2]), None, "unreadable progression is not guessed");
+}
+
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn jessies_trapped_idle_is_the_owned_compatible_45_frame_clip() {
+    let dir = data_dir().expect("FMV_FF7_DATA");
+    let mut fields = fmv_ff7::lgp::LgpArchive::open_path(flevel_path(&dir)).unwrap();
+    let field = script_common::load_field(&mut fields, "nmkin_3").unwrap();
+    let script = fmv_ff7::script::FieldScript::from_field(&field).unwrap();
+    assert!(script.disassemble_partial(4, 0).unwrap().instructions.iter().any(|instruction|
+        instruction.mnemonic == "DFANM" && instruction.literal("animation") == Some(3) && instruction.literal("speed") == Some(1)));
+    let loader = field.model_loader().unwrap();
+    let record = &loader.models[1];
+    assert_eq!((record.hrc_stem().as_str(), record.animations[3].stem().as_str()), ("axdc", "bygd"));
+    let mut characters = fmv_ff7::lgp::LgpArchive::open_path(dir.join("field/char.lgp")).unwrap();
+    let model = fmv_ff7::load_field_model(&mut characters, &record.hrc_stem()).unwrap();
+    let clip = fmv_ff7::load_field_animation(&mut characters, &record.animations[3].stem()).unwrap();
+    assert!(model.fits(&clip));
+    assert_eq!((clip.frame_count(), clip.bone_count()), (45, 21));
+    for frame in [0.0, 14.5, 29.5, 44.5, 45.0] {
+        let pose = clip.pose_at(&model.bones, frame).unwrap();
+        assert!(pose.iter().flatten().all(|value| value.is_finite()));
+    }
 }
 
 #[test]

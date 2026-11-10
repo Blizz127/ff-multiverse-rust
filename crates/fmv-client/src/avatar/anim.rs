@@ -11,7 +11,8 @@
 //! The idle clip is a still pose: measured on the owned archive, the idle clips of all eight
 //! playable characters have no motion at all (three of them have two frames, which are identical;
 //! `real_idle_clips_measured` in the avatar screenshot tests prints the numbers), so idle shows
-//! frame 0 and nothing is played.
+//! frame 0 and nothing is played. NPCs have their own authored idle loops (for example trapped
+//! Jessie's 45-frame clip), so [`Animator::advance_npc`] advances those at the field frame rate.
 //!
 //! Remote avatars are driven by what the server reports (`AnimState` in the snapshot); the local
 //! player by the keys (walk with Shift, run otherwise, see `crate::window`). A frame position is
@@ -56,6 +57,8 @@ struct Track {
     phase: f32,
     /// The frame this track was last advanced in (for dropping what has left).
     seen: u64,
+    /// Restart an NPC idle when its clip length changes with its story phase.
+    npc_frames: Option<usize>,
 }
 
 /// One phase per avatar. Call [`Animator::begin_frame`] once per drawn frame, then
@@ -94,15 +97,28 @@ impl Animator {
     /// `frames` is the length of the clip `state` shows ([`fmv_ff7::FieldAnimation::frame_count`]).
     /// A non-finite or negative `dt` counts as no time passing.
     pub fn advance(&mut self, who: Who, state: AnimState, dt: f32, frames: usize) -> Playback {
+        self.advance_inner(who, state, dt, frames, false)
+    }
+
+    /// Advance an NPC's authored standing loop without treating it as a walking player.
+    pub fn advance_npc(&mut self, who: Who, dt: f32, frames: usize) -> Playback {
+        self.advance_inner(who, AnimState::Idle, dt, frames, true)
+    }
+
+    fn advance_inner(&mut self, who: Who, state: AnimState, dt: f32, frames: usize, loop_idle: bool) -> Playback {
         let dt = if dt.is_finite() && dt > 0.0 { dt } else { 0.0 };
         let frames = frames.max(1);
         let track = self.tracks.entry(who).or_default();
         track.seen = self.frame;
+        if loop_idle && track.npc_frames != Some(frames) {
+            track.phase = 0.0;
+            track.npc_frames = Some(frames);
+        }
         let clip = Clip::for_state(state);
         let frame = match clip {
             // A still pose (see the module docs).
-            Clip::Idle => 0.0,
-            Clip::Walk | Clip::Run => {
+            Clip::Idle if !loop_idle => 0.0,
+            _ => {
                 track.phase = (track.phase + dt * FIELD_FPS / frames as f32).rem_euclid(1.0);
                 track.phase * frames as f32
             }
@@ -123,6 +139,25 @@ impl Animator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn npc_idle_loops_wrap_and_reset_for_a_new_clip_while_player_idle_stays_still() {
+        let mut animator = Animator::new();
+        animator.begin_frame();
+        let npc = Who(2);
+        let first = animator.advance_npc(npc, 0.5, 45);
+        assert_eq!(first.clip, Clip::Idle);
+        assert!((first.frame - 15.0).abs() < 0.001);
+        let wrapped = animator.advance_npc(npc, 1.1, 45);
+        assert!((wrapped.frame - 3.0).abs() < 0.001);
+        assert_eq!(animator.advance(Who(1), AnimState::Idle, 0.5, 45).frame, 0.0);
+        assert_eq!(animator.advance_npc(npc, 0.0, 1).frame, 0.0);
+        assert_eq!(animator.advance_npc(npc, 0.0, 45).frame, 0.0, "a changed idle restarts");
+        for dt in [f32::NAN, f32::INFINITY, -1.0, 0.0] {
+            assert_eq!(animator.advance_npc(npc, dt, 45).frame, 0.0);
+        }
+        assert_eq!(animator.tracked(), 2, "same bounded track table");
+    }
 
     const WHO: Who = Who(7);
 
