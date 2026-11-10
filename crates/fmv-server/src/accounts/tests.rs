@@ -386,6 +386,169 @@ fn an_account_that_has_logged_in_is_never_released() {
 
 // ---- character progress at login ---------------------------------------------------------------------
 
+/// Synthetic authored initialization, deliberately distinct from the experience curve's floor.
+struct StartingRules { gil: u32 }
+impl BattleRules for StartingRules {
+    fn build(&self, setup: &fmv_protocol::BattleSetup) -> Result<fmv_ff7_battle::rules::BattleState, fmv_protocol::BattleBuildError> {
+        SyntheticRules::default().build(setup)
+    }
+    fn data_fingerprint(&self) -> fmv_core::Fingerprint { SyntheticRules::default().data_fingerprint() }
+    fn formation(&self, id: u16) -> Option<fmv_protocol::FormationInfo> { SyntheticRules::default().formation(id) }
+    fn starting_level(&self, _character: u8) -> u8 { 5 }
+    fn default_formation(&self) -> Option<u16> { Some(0) }
+    fn starting_exp(&self, _character: u8, _level: u8) -> u32 { 53 }
+    fn starting_gil(&self) -> u32 { self.gil }
+    fn starting_inventory(&self) -> Vec<fmv_core::InventoryEntry> {
+        vec![fmv_core::InventoryEntry::new(3, 1), fmv_core::InventoryEntry::new(0, 3)]
+    }
+}
+
+fn register_with_starting_resources(store: &Store, name: &str) -> Login {
+    let registration = validate_registration(GameId::Ff7, name, &request([0; 3], None, Some(2))).unwrap();
+    register_with_rules(store, GameId::Ff7, registration, NOW, || {}, &StartingRules { gil: 240 }).unwrap()
+}
+
+fn token_with_starting_rules(store: &Store, token: &str, now: u64) -> Result<Login, LoginError> {
+    login_with_token_and_rules(store, GameId::Ff7, &Secret::new(token), [0; 3], now, &StartingRules { gil: 240 })
+}
+
+#[test]
+fn new_registration_commits_authored_starting_resources_once_and_login_never_recredits_them() {
+    let (dir, store) = store();
+    let registered = register_with_starting_resources(&store, "New resources");
+    let initial = registered.progress.stored.unwrap();
+    assert_eq!(initial, Progress { character: 2, level: 5, exp: 53, ap: 0, gil: 240, limit: 0 });
+    assert_eq!(registered.progress.inventory, entries(&[(0, 3), (3, 1)]));
+    let stored = store.get_character_progress(registered.account, GameId::Ff7).unwrap().unwrap();
+    assert_eq!(Progress::from_record(&stored), initial);
+    assert_eq!(stored.inventory, registered.progress.inventory);
+    assert_eq!(stored.updated_at, NOW);
+    let token = registered.issued_token.unwrap();
+    // Spending the entire balance and inventory is distinct from never having a record.
+    store.update_character_progress(registered.account, GameId::Ff7, |old| {
+        let mut next = old.unwrap(); next.gil = 0; next.inventory = Some(vec![]); next.updated_at = NOW + 1; next
+    }).unwrap();
+    let file = progress_file(&dir, registered.account);
+    let before = std::fs::read(&file).unwrap();
+    drop(store);
+    let reopened = Store::open(dir.path().join("state")).unwrap();
+    let login = login_with_token_and_rules(&reopened, GameId::Ff7, &Secret::new(token), [0; 3], NOW + 2, &StartingRules { gil: 999 }).unwrap();
+    assert_eq!(login.progress.stored.unwrap().gil, 0);
+    assert_eq!(login.progress.inventory, Some(vec![]));
+    assert_eq!(std::fs::read(file).unwrap(), before, "login does not rewrite even an exhausted record");
+}
+
+#[test]
+fn a_legacy_account_without_a_record_materializes_its_zero_gil_defaults_without_changing_story() {
+    let (dir, store) = store();
+    let registered = plain_ff7(&store, "Legacy resources").unwrap();
+    assert!(store.get_character_progress(registered.account, GameId::Ff7).unwrap().is_none());
+    let token = registered.issued_token.unwrap();
+    let story = Progression::new(registered.account, GameId::Ff7, vec![1, 9], NOW);
+    store.put_progression(&story).unwrap();
+    let login = token_with_starting_rules(&store, &token, NOW + 1).unwrap();
+    assert_eq!(login.progress.stored, Some(Progress { character: 1, level: 5, exp: 53, ap: 0, gil: 0, limit: 0 }));
+    assert_eq!(login.progress.inventory, entries(&[(0, 3), (3, 1)]));
+    assert_eq!(store.get_progression(registered.account, GameId::Ff7).unwrap(), story);
+    let before = std::fs::read(progress_file(&dir, registered.account)).unwrap();
+    let again = token_with_starting_rules(&store, &token, NOW + 100).unwrap();
+    assert_eq!(again.progress, login.progress);
+    assert_eq!(std::fs::read(progress_file(&dir, registered.account)).unwrap(), before, "the default is inserted only once");
+}
+
+#[test]
+fn initialized_new_and_legacy_characters_can_commit_an_economic_scene_before_any_reward() {
+    for newly_registered in [false, true] {
+        let (_dir, store) = store();
+        let login = if newly_registered {
+            register_with_starting_resources(&store, "Before rewards")
+        } else {
+            let registered = plain_ff7(&store, "Before rewards").unwrap();
+            token_with_starting_rules(&store, &registered.issued_token.unwrap(), NOW + 1).unwrap()
+        };
+        let expected_gil: u32 = if newly_registered { 240 } else { 0 };
+        let next_gil = expected_gil.saturating_sub(1);
+        let job = crate::saver::SceneSaveJob { account: login.account, scene_key: "test/first-economic-scene".into(),
+            expected_story: vec![], next_story: vec![5], expected_gil, next_gil };
+        let saved = crate::saver::persist_scene(&store, GameId::Ff7, &job, NOW + 2).expect("an authoritative record exists before any reward");
+        let character = saved.pair.character.unwrap();
+        assert_eq!(character.gil, next_gil);
+        assert_eq!((character.level, character.exp, character.ap), (5, 53, 0));
+        assert_eq!(character.inventory, entries(&[(0, 3), (3, 1)]));
+        assert_eq!(saved.pair.story.blob, [5]);
+    }
+}
+
+#[test]
+fn resource_aware_login_preserves_existing_records_and_their_inventory_semantics_exactly() {
+    for inventory in [None, Some(vec![]), entries(&[(7, 3)])] {
+        let (dir, store) = store();
+        let registered = plain_ff7(&store, "Existing resources").unwrap();
+        let token = registered.issued_token.unwrap();
+        // Older builds sometimes stored the look's slot: it remains untouched on disk.
+        let mut original = CharacterProgress::new(registered.account, GameId::Ff7, 0, 7, NOW);
+        original.exp = 88; original.gil = 4321; original.ap = 11; original.limit = 37; original.inventory = inventory.clone();
+        store.put_character_progress(&original).unwrap();
+        let file = progress_file(&dir, registered.account);
+        let before = std::fs::read(&file).unwrap();
+        let login = token_with_starting_rules(&store, &token, NOW + 1).unwrap();
+        assert_eq!(login.progress.character, 1, "the character's fixed slot still controls the mirror");
+        assert_eq!(login.progress.stored, Some(Progress::from_record(&original)));
+        assert_eq!(login.progress.inventory, inventory);
+        assert_eq!(std::fs::read(file).unwrap(), before);
+    }
+}
+
+#[test]
+fn resource_aware_login_refuses_corrupt_progress_instead_of_inserting_defaults() {
+    let (dir, store) = store();
+    let registered = register_with_starting_resources(&store, "Corrupt resources");
+    let file = progress_file(&dir, registered.account);
+    std::fs::write(&file, b"{ broken progress").unwrap();
+    let error = token_with_starting_rules(&store, &registered.issued_token.unwrap(), NOW + 1).unwrap_err();
+    assert!(matches!(error, LoginError::Internal(_)));
+    assert_eq!(std::fs::read(file).unwrap(), b"{ broken progress");
+}
+
+#[test]
+fn undelivered_registration_with_untouched_starting_resources_can_still_release_its_name() {
+    let (dir, store) = store();
+    let registered = register_with_starting_resources(&store, "Undelivered resources");
+    assert_eq!(release_unclaimed(&store, registered.account), Release::Released);
+    assert!(!progress_file(&dir, registered.account).exists());
+    assert!(matches!(store.get_character_progress(registered.account, GameId::Ff7), Err(PersistError::UnknownAccount(_))));
+    let replacement = register_with_starting_resources(&store, "Undelivered resources");
+    assert_ne!(replacement.account, registered.account);
+    assert_eq!(replacement.progress.stored.unwrap().gil, 240);
+    claim_delivered(&store, replacement.account).unwrap();
+    assert_eq!(release_unclaimed(&store, replacement.account), Release::NotReleasable);
+}
+
+#[test]
+fn concurrent_legacy_logins_and_a_reward_cannot_replace_earned_progress_with_defaults() {
+    let (_dir, store) = store();
+    let registered = plain_ff7(&store, "Racing resources").unwrap();
+    let token = registered.issued_token.unwrap();
+    let store = Arc::new(store);
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    let mut workers = Vec::new();
+    for _ in 0..2 {
+        let (store, token, barrier) = (Arc::clone(&store), token.clone(), Arc::clone(&barrier));
+        workers.push(std::thread::spawn(move || { barrier.wait(); token_with_starting_rules(&store, &token, NOW + 1).unwrap(); }));
+    }
+    let reward_store = Arc::clone(&store);
+    workers.push(std::thread::spawn(move || {
+        barrier.wait();
+        let job = SaveJob::reward(registered.account, 1, BattleReward::new(registered.account, 5, 25, 2));
+        persist(&reward_store, GameId::Ff7, &StartingRules { gil: 240 }, &job, NOW + 1).unwrap();
+    }));
+    for worker in workers { worker.join().unwrap(); }
+    let final_record = store.get_character_progress(registered.account, GameId::Ff7).unwrap().unwrap();
+    assert_eq!((final_record.exp, final_record.gil, final_record.ap), (58, 25, 2));
+    assert_eq!(crate::inventory::Inventory::resolve(&StartingRules { gil: 240 }, final_record.inventory.as_deref()).entries(),
+        entries(&[(0, 3), (3, 1)]).unwrap(), "a reward that creates the record first may retain legacy unstored-stock semantics");
+}
+
 #[test]
 fn a_new_account_fights_as_the_slot_it_chose_and_has_earned_nothing() {
     let (_dir, store) = store();

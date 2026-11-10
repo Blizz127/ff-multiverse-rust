@@ -662,6 +662,12 @@ pub trait BattleRules: Send + Sync {
         self.exp_for_level(character, level).unwrap_or(0)
     }
 
+    /// The gil assigned once when a genuinely new character is registered. Existing accounts
+    /// without a stored progress record keep their legacy balance; this is not a login fallback.
+    fn starting_gil(&self) -> u32 {
+        0
+    }
+
     /// The caps battle rewards saturate at (FF7's by default).
     fn progress_limits(&self) -> ProgressLimits {
         ProgressLimits::FF7
@@ -1199,6 +1205,11 @@ impl BattleRules for Ff7BattleData {
     /// level (see [`BattleRules::starting_level`]), which their own records do not describe.
     fn starting_exp(&self, character: u8, level: u8) -> u32 {
         CharacterId::from_index(usize::from(character)).and_then(|who| self.kernel.starting_exp(who, level)).unwrap_or(0)
+    }
+
+    /// The kernel's authored new-game balance, without applying the separate battle-reward cap.
+    fn starting_gil(&self) -> u32 {
+        self.kernel.starting_gil().unwrap_or(0)
     }
 
     /// The kernel's starting item stock ([`Kernel::starting_inventory`]): Potion x3, Ether x1 and Phoenix Down
@@ -2519,6 +2530,7 @@ mod tests {
         assert_eq!(rules.exp_for_level(9, 5), None, "there is no tenth character");
         assert_eq!(rules.starting_exp(0, 5), 40, "by default a character starts at the floor of its level");
         assert_eq!(rules.starting_level(0), 5);
+        assert_eq!(rules.starting_gil(), 0, "the synthetic rules award no new-character gil");
         assert_eq!(
             rules.progress_limits(),
             ProgressLimits { max_level: 99, max_exp: 99_999_999, max_gil: 9_999_999, max_ap: 16_777_215, max_limit: 255 }
@@ -2550,6 +2562,7 @@ mod tests {
         let bare = Bare;
         assert_eq!(bare.exp_for_level(0, 5), None);
         assert_eq!(bare.starting_exp(0, 5), 0);
+        assert_eq!(bare.starting_gil(), 0, "older rule implementations need no new method to keep zero starting gil");
         assert_eq!(bare.progress_limits(), ProgressLimits::FF7);
         assert_eq!(bare.formation_scene(0), None, "no placement data unless the rule set has some");
     }

@@ -56,11 +56,14 @@
 //! every progress record), the account gets a **new token** (returned once, only its hash is stored: the old
 //! token went with the client that deleted the character), and the new account is `claimed` (it is not an
 //! orphan, whatever progress it holds). The old entry is renamed to `.restored-<new>`, so it cannot be restored a
-//! second time. The order mirrors a registration: the records that nothing references yet first, then the one
-//! synced `account` entry that makes it real, then the progress records (a registration has none to write), then
+//! second time. The identity records that nothing references go down first, then the one
+//! synced `account` entry that makes it real, then the archived progress records, then
 //! the rename that says "complete". A crash after the commit leaves a `.restoring-<new>` entry whose account is
 //! in the index: opening finishes it (progress records that already exist are never overwritten). A crash before
 //! it leaves one whose account is not: opening puts the entry back and removes the unreferenced records.
+//! An unresolved restore fences writes and gameplay until reopening settles it; the proposed id must never
+//! be reused while an old recovery intent still names it. An uncertain index append preserves both records
+//! and intent so replay can decide whether the restore committed.
 //!
 //! Snapshots (`Store::snapshot`) are rollback images of the live records and do not copy the trash.
 
@@ -98,6 +101,18 @@ const MAX_ENTRY_FILES: usize = 64;
 const PENDING: &str = ".pending";
 const RESTORING: &str = ".restoring-";
 const RESTORED: &str = ".restored-";
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_RESTORE_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_RESTORE_APPEND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_RESTORE_PROGRESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn restore_test_error(path: &Path) -> PersistError {
+    PersistError::io("injected restore failure", path, io::Error::other("restore fault checkpoint"))
+}
 
 // ---- what the store reports ----------------------------------------------------------------------------------------
 
@@ -543,8 +558,8 @@ fn remove_unreferenced_restore_records(root: &Path, plan: &RestorePlan) {
 /// Settle the trash entries a crash (or a failed move) left in flight. Runs when the store opens, after the index is
 /// replayed (`index`, `next_account_id`) and before anything else looks at the records. Only acts on entries whose
 /// account is in the state the entry says: see the module documentation. Whatever it does is a warning, and a
-/// failure to settle an uncommitted entry is a warning (the records are unreferenced). A committed restore whose
-/// progress cannot be completed refuses opening: gameplay must never replace its missing progress or scene receipts.
+/// failure to settle a delete is a warning. Every unresolved restore refuses opening: even an uncommitted
+/// restore must be settled before its proposed account id can be reused by another allocation.
 pub(super) fn recover(root: &Path, index: &Index, next_account_id: u64, warnings: &mut Vec<String>) -> Result<()> {
     let trash = root.join(TRASH_DIR);
     for name in fsio::list_subdirs(&trash)? {
@@ -562,8 +577,8 @@ pub(super) fn recover(root: &Path, index: &Index, next_account_id: u64, warnings
             }
             Ok(None) => {}
             Err(e) => {
-                if matches!(parsed.state, TrashState::Restoring { as_account } if index.contains_account(as_account.0)) {
-                    return Err(PersistError::corrupt(&dir, format!("committed restore could not finish; gameplay remains unavailable: {e}")));
+                if matches!(parsed.state, TrashState::Restoring { .. }) {
+                    return Err(PersistError::corrupt(&dir, format!("restore could not be settled; account allocation and gameplay remain unavailable: {e}")));
                 }
                 let message = format!("could not settle the trash entry {name}: {e}; it is left as it is and the next open tries again");
                 tracing::warn!("{message}");
@@ -631,11 +646,14 @@ fn recover_restoring(
         )));
     }
     // It never committed: put the entry back and remove the records nothing references.
+    // Rename before clearing the plan: an interrupted or failed rename must leave a complete
+    // recovery intent under the `.restoring` name, not an entry recovery can no longer interpret.
     remove_unreferenced_restore_records(root, &plan);
+    let restorable_dir = trash.join(parsed.base);
+    rename_entry(trash, dir, &restorable_dir)?;
     let mut restorable = manifest;
     restorable.restore = None;
-    write_manifest(dir, &restorable)?;
-    rename_entry(trash, dir, &trash.join(parsed.base))?;
+    write_manifest(&restorable_dir, &restorable)?;
     Ok(Some(format!(
         "undid an interrupted restore of {:?}: it was never committed, so the entry is back in the trash",
         restorable.display_name
@@ -893,14 +911,21 @@ impl Store {
         };
         let token = new_token()?;
         let hash = token_hash(&token);
+        self.clear_uncommitted_account_state(new_account)?;
 
         // 1. The intent, so that a crash can be undone or finished: the plan goes into the manifest, and the entry
         //    takes the `.restoring` name.
+        // A failed rename can already have taken effect, and a failed append can have committed.
+        // Keep all callers fenced until either completion or a proven rollback; reopening resolves
+        // uncertainty from the durable index before another allocation can reuse these ids.
+        self.transaction_poisoned.store(true, std::sync::atomic::Ordering::Release);
         let plan = RestorePlan { account_id: new_account, avatar_id: new_avatar, at: now };
         manifest.restore = Some(plan);
         write_manifest(&dir, &manifest)?;
         let restoring = trash.join(format!("{base}{RESTORING}{new_account}"));
         rename_entry(&trash, &dir, &restoring)?;
+        #[cfg(test)]
+        if FAIL_RESTORE_RENAME.with(|flag| flag.replace(false)) { return Err(restore_test_error(&restoring)); }
 
         // 2. The records nothing references yet (what a registration writes before its one log entry).
         let written = (|| -> Result<()> {
@@ -910,6 +935,8 @@ impl Store {
                 display_name: records.account.display_name.clone(),
                 token_hash: hex::encode(hash),
                 created_at: records.account.created_at,
+                // A restored account is already claimed, never an undelivered registration.
+                registration_progress: None,
             };
             fsio::write_json(&self.account_path(new_account), &account, MAX_RECORD_BYTES)?;
             if let (Some(profile), Some(avatar)) = (&records.avatar, new_avatar) {
@@ -940,21 +967,39 @@ impl Store {
             };
             let mut log = self.log();
             log.append(&op)?;
+            #[cfg(test)]
+            if FAIL_RESTORE_APPEND.with(|flag| flag.replace(false)) {
+                // A complete log entry may have reached storage even though append/rollback
+                // failed, leaving the in-memory index and counters unchanged.
+                log.poison("injected uncertain restore append".into());
+                return Err(restore_test_error(&self.log_path()));
+            }
             self.index_mut().add_account(new_account, entry, key);
             Ok(())
         });
         if let Err(e) = committed {
-            // Nothing committed: undo what was written and put the entry back (if this fails, the next open does).
+            // An unhealthy log cannot prove the append was rolled back. Preserve every record
+            // and the restore intent: reopening decides whether to finish or undo the restore.
+            if self.log().ensure_healthy().is_err() { return Err(e); }
+            // A healthy log proves that nothing committed. Leave the fence up if rollback
+            // cannot finish; recovery must settle its intent before these ids can be reused.
             remove_unreferenced_restore_records(&self.root, &plan);
+            rename_entry(&trash, &restoring, &dir)?;
             manifest.restore = None;
-            let _ = write_manifest(&restoring, &manifest);
-            let _ = rename_entry(&trash, &restoring, &dir);
+            write_manifest(&dir, &manifest)?;
+            self.transaction_poisoned.store(false, std::sync::atomic::Ordering::Release);
             return Err(e);
         }
         counters.next_account_id = next_account;
         counters.next_avatar_id = next_avatar;
 
-        // 4. The progress records (after the commit, as a registration's are), then the seal.
+        // 4. The progress records after the restore commit, then the seal. New registrations
+        // write their initial seed before their commit; restores retain their own recovery plan.
+        #[cfg(test)]
+        if FAIL_RESTORE_PROGRESS.with(|flag| flag.replace(false)) {
+            fs::write(self.progression_dir(new_account), b"injected postcommit progress obstacle")
+                .map_err(|e| PersistError::io("inject restore obstacle", &self.progression_dir(new_account), e))?;
+        }
         let mut unfinished = write_progress(&self.root, &restoring, &manifest, new_account);
         let mut final_name = restoring.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
         if unfinished.is_empty() {
@@ -970,6 +1015,8 @@ impl Store {
             // Keep the administrative result/token below, but require successful recovery before play.
             self.transaction_poisoned.store(true, std::sync::atomic::Ordering::Release);
             tracing::warn!(account = new_account, ?unfinished, "a restored account's progress was not all written; the next open of the store finishes it");
+        } else {
+            self.transaction_poisoned.store(false, std::sync::atomic::Ordering::Release);
         }
         Ok(Restored {
             account_id: AccountId(new_account),

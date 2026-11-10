@@ -784,8 +784,12 @@ impl Conn {
         let game = shared.area_id.game;
         let now = unix_now();
         let tint = character.tint;
+        let rules = shared.cfg.battle.as_ref().map(|battle| Arc::clone(&battle.rules));
         let task = match auth {
-            Auth::Token(token) => tokio::task::spawn_blocking(move || accounts::login_with_token(&store, game, &token, tint, now)),
+            Auth::Token(token) => tokio::task::spawn_blocking(move || match rules.as_deref() {
+                Some(rules) => accounts::login_with_token_and_rules(&store, game, &token, tint, now, rules),
+                None => accounts::login_with_token(&store, game, &token, tint, now),
+            }),
             Auth::Register { display_name } => {
                 if !shared.cfg.allow_registration {
                     return Err(Close::reject(RejectCode::RegistrationClosed, REGISTRATION_CLOSED));
@@ -810,7 +814,11 @@ impl Conn {
                     return Err(Close::PeerGone);
                 }
                 tokio::task::spawn_blocking(move || {
-                    accounts::register(&store, game, registration, now, move || permit.commit(Instant::now()))
+                    let on_created = move || permit.commit(Instant::now());
+                    match rules.as_deref() {
+                        Some(rules) => accounts::register_with_rules(&store, game, registration, now, on_created, rules),
+                        None => accounts::register(&store, game, registration, now, on_created),
+                    }
                 })
             }
         };

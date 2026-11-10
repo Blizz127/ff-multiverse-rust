@@ -22,6 +22,9 @@
 //!   removes a registration whose token never reached its client, and [`Store::mark_claimed`] is
 //!   how a server says that one did (the registering session never logs in with the token, so
 //!   without it every player who has not logged in again would look like an orphan).
+//!   [`Store::register_with_character_and_progress`] includes game-authored initial stats,
+//!   money and inventory in that same commit. Only an untouched initial record is still
+//!   releasable as an orphan; earned progress and scene receipts remain protected.
 //! * **Names that cannot impersonate.** Display names are unique by `fmv_core::name_key` (case,
 //!   canonical form, width, invisible characters and look-alike letters make no difference),
 //!   and a new name must come from one writing system.
@@ -127,7 +130,7 @@ pub use character::{
 };
 pub use error::{PersistError, Result};
 pub use model::{
-    game_key, parse_game_key, AccountInfo, AvatarId, AvatarProfile, CharacterProgress, Progression,
+    game_key, parse_game_key, AccountInfo, AvatarId, AvatarProfile, CharacterProgress, NewCharacterProgress, Progression,
     Registered, INDEX_LOG_VERSION, MAX_APPEARANCE_REF_BYTES, MAX_APPEARANCE_REF_CHARS,
     MAX_ARCHETYPE_BYTES, MAX_BLOB_BYTES, MAX_CHARACTER_RECORD_BYTES, MAX_INDEX_BYTES,
     MAX_RECORD_BYTES, MAX_TOKEN_BYTES, SCHEMA_VERSION,

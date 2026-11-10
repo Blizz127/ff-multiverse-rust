@@ -114,6 +114,16 @@ pub(crate) struct AccountRecord {
     /// blake3(token) as lowercase hex. The plaintext token is never stored.
     pub token_hash: String,
     pub created_at: u64,
+    /// An untouched registration seed is still an orphan if its token was never delivered.
+    /// The digest binds the complete initial file, including its account id and timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_progress: Option<RegistrationProgress>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RegistrationProgress {
+    pub game: GameId,
+    pub digest: [u8; 32],
 }
 
 /// Persistent avatar: references only, never mesh or texture bytes.
@@ -400,6 +410,33 @@ pub struct CharacterProgress {
     /// is not a `u16`: the record is [`PersistError::Corrupt`] on read, never clamped.
     #[serde(default, skip_serializing_if = "is_empty_gauge")]
     pub limit: u16,
+}
+
+/// Game-provided initial character progress for an atomic registration. The store supplies
+/// the new account id, record version and creation time; callers cannot seed another account.
+/// The inventory retains the ordinary `None` (never stored) versus `Some([])` distinction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewCharacterProgress {
+    pub game: GameId,
+    pub character: u8,
+    pub level: u8,
+    pub exp: u32,
+    pub ap: u32,
+    pub gil: u32,
+    pub limit: u16,
+    pub inventory: Option<Vec<InventoryEntry>>,
+}
+
+impl NewCharacterProgress {
+    /// A character at `level`, with zero balances and no stored inventory.
+    pub fn new(game: GameId, character: u8, level: u8) -> Self {
+        Self { game, character, level, exp: 0, ap: 0, gil: 0, limit: 0, inventory: None }
+    }
+
+    pub(crate) fn record(&self, account: AccountId, now: u64) -> CharacterProgress {
+        CharacterProgress { exp: self.exp, ap: self.ap, gil: self.gil, limit: self.limit, inventory: self.inventory.clone(),
+            ..CharacterProgress::new(account, self.game, self.character, self.level, now) }
+    }
 }
 
 /// `skip_serializing_if` of [`CharacterProgress::limit`]: an empty gauge is not written.

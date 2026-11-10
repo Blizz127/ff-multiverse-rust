@@ -17,8 +17,8 @@
 //! 1. [`validate_registration`] checks everything the client chose (display name, appearance)
 //!    without touching the store, so a connection can be refused for it BEFORE it takes a place in
 //!    the registration rate limits (`limits`) and before anything is written.
-//! 2. [`register`] creates the account and its avatar in ONE store call (`Store::register`: a
-//!    single committed log entry), and builds the reply from what that call returned without
+//! 2. [`register`] creates the account and its avatar in ONE store call; [`register_with_rules`]
+//!    adds the authored starting progress to that same commit. Both build the reply from its result without
 //!    reading anything else. So once the name is committed there is nothing left that can fail
 //!    before the token is in the caller's hands.
 //! 3. The caller delivers the token immediately. If the `Welcome` that carries it is never
@@ -38,6 +38,10 @@
 //! it fights as, and the progress record is found through the character's pointer; if the record holds another
 //! character than the slot (a rolled-back v7 saved it by look) the slot wins and the mismatch is logged.
 //!
+//! With battle rules available, registration stores the game's starting resources once. Login of an older
+//! account with no progress stores its historical zero-gil defaults before it enters the world. Existing
+//! records, including a missing inventory (`None`) or an explicitly empty one, are read unchanged.
+//!
 //! # Appearance
 //!
 //! The binding is broadcast to every player and names a model, so it is only ever one of the stable ids the hosted
@@ -46,8 +50,8 @@
 //! cannot put an arbitrary string in front of other players either.
 
 use fmv_core::{AccountId, AvatarAppearance, GameId, NameError, PhaseKey};
-use fmv_persist::{CharacterProgress, NewPlayerCharacter, PersistError, Store};
-use fmv_protocol::{CharacterCard, NewCharacter, RejectCode, Secret};
+use fmv_persist::{CharacterProgress, NewCharacterProgress, NewPlayerCharacter, PersistError, Store};
+use fmv_protocol::{BattleRules, CharacterCard, NewCharacter, RejectCode, Secret};
 
 use crate::character::{self, Creation, Refusal};
 use crate::progress::{self, Progress, ProgressSeed};
@@ -81,7 +85,7 @@ pub struct Login {
     /// `Some` only when this call registered the account: the token, to be sent once.
     pub issued_token: Option<String>,
     /// The character it fights as (its combat slot) and what the store holds of its character progress
-    /// (nothing for a new account). Separate from `progression`: see `progress`.
+    /// (initialized during registration when the server has rules). Separate from `progression`: see `progress`.
     pub progress: ProgressSeed,
     /// What the player is told about its own character in `Welcome` (identity, binding, slot).
     pub card: CharacterCard,
@@ -233,6 +237,16 @@ pub fn validate_registration(game: GameId, display_name: &str, requested: &NewCh
 /// (damaged, from a newer build) fails the login like a story blob that cannot be read does, and is never
 /// replaced by a default, which would later overwrite it.
 pub fn login_with_token(store: &Store, game: GameId, token: &Secret, tint: [u8; 3], now: u64) -> Result<Login, LoginError> {
+    login_with_token_inner(store, game, token, tint, now, None)
+}
+
+/// Login with authoritative resource initialization. A missing legacy record is inserted with the
+/// same zero-gil defaults older builds showed; a stored record is never changed by this path.
+pub fn login_with_token_and_rules(store: &Store, game: GameId, token: &Secret, tint: [u8; 3], now: u64, rules: &dyn BattleRules) -> Result<Login, LoginError> {
+    login_with_token_inner(store, game, token, tint, now, Some(rules))
+}
+
+fn login_with_token_inner(store: &Store, game: GameId, token: &Secret, tint: [u8; 3], now: u64, rules: Option<&dyn BattleRules>) -> Result<Login, LoginError> {
     let account = store.authenticate(token.expose()).map_err(map_store_error)?;
     if store.avatar_for_account(account).map_err(map_store_error)?.is_none() {
         // An account without an avatar (made by other tooling): give it one now.
@@ -252,7 +266,7 @@ pub fn login_with_token(store: &Store, game: GameId, token: &Secret, tint: [u8; 
     }
     // Follow the pointer to the progress record. A game without a pointer reads the record of (account, game) all
     // the same: that is where it always was.
-    let stored: Option<CharacterProgress> = match store.follow_character_progress(&record, game).map_err(map_store_error)? {
+    let mut stored: Option<CharacterProgress> = match store.follow_character_progress(&record, game).map_err(map_store_error)? {
         Some(linked) => {
             if !linked.in_sync() {
                 tracing::warn!(
@@ -266,8 +280,18 @@ pub fn login_with_token(store: &Store, game: GameId, token: &Secret, tint: [u8; 
         }
         None => store.get_character_progress(account, game).map_err(map_store_error)?,
     };
+    let slot = record.slot(game).unwrap_or(progress::DEFAULT_CHARACTER);
+    if stored.is_none() {
+        if let Some(rules) = rules {
+            stored = Some(store.ensure_character_progress(account, game, || {
+                let mut initial = progress::fresh(rules, slot).to_record(account, game, now);
+                initial.inventory = Some(crate::inventory::Inventory::resolve(rules, None).entries().to_vec());
+                initial
+            }).map_err(map_store_error)?);
+        }
+    }
     let progress = ProgressSeed {
-        character: record.slot(game).unwrap_or(progress::DEFAULT_CHARACTER),
+        character: slot,
         stored: stored.as_ref().map(Progress::from_record),
         // `None` (a record of an older build, or no record) is "never stored": the starting stock.
         inventory: stored.as_ref().and_then(|record| record.inventory.clone()),
@@ -286,13 +310,28 @@ pub fn login_with_token(store: &Store, game: GameId, token: &Secret, tint: [u8; 
 /// account exists (the registration rate limits count it then; a request that never gets this far counts for
 /// nothing). Nothing after that can fail: the reply is built from what the store returned.
 ///
-/// A brand-new account has no progression (the empty blob: a new account to every game), and nothing
-/// else is read.
+/// This variant has no battle rules, so it leaves character progress unstored. A brand-new account
+/// has no story progression (the empty blob: a new account to every game), and nothing else is read.
 pub fn register(store: &Store, game: GameId, registration: Registration, now: u64, on_created: impl FnOnce()) -> Result<Login, LoginError> {
+    register_inner(store, game, registration, now, on_created, None)
+}
+
+/// Atomically create the identity and its authored starting resources before issuing the token.
+/// The returned progress is the committed record, with an explicit starting inventory.
+pub fn register_with_rules(store: &Store, game: GameId, registration: Registration, now: u64, on_created: impl FnOnce(), rules: &dyn BattleRules) -> Result<Login, LoginError> {
+    register_inner(store, game, registration, now, on_created, Some(rules))
+}
+
+fn register_inner(store: &Store, game: GameId, registration: Registration, now: u64, on_created: impl FnOnce(), rules: Option<&dyn BattleRules>) -> Result<Login, LoginError> {
     let Registration { name, tint, creation } = registration;
+    let initial = rules.map(|rules| {
+        let progress = progress::new_character(rules, creation.entry.slot.unwrap_or(progress::DEFAULT_CHARACTER));
+        NewCharacterProgress { game, character: progress.character, level: progress.level, exp: progress.exp, ap: progress.ap,
+            gil: progress.gil, limit: progress.limit, inventory: Some(crate::inventory::Inventory::resolve(rules, None).entries().to_vec()) }
+    });
     let wanted = NewPlayerCharacter::for_game(creation.body.clone(), game, creation.entry.clone());
-    let registered = store
-        .register_with_character(&name, tint, DEFAULT_ARCHETYPE, creation.v7_look.map(|look| (game, look)), Some(wanted), now)
+    let (registered, initial) = store
+        .register_with_character_and_progress(&name, tint, DEFAULT_ARCHETYPE, creation.v7_look.map(|look| (game, look)), Some(wanted), initial, now)
         .map_err(map_store_error)?;
     on_created();
     // The record the store returned is what was written. (It always returns one when it was given one; the
@@ -307,7 +346,8 @@ pub fn register(store: &Store, game: GameId, registration: Registration, now: u6
         avatar,
         progression: Vec::new(),
         issued_token: Some(registered.token),
-        progress: ProgressSeed::of(slot.unwrap_or(progress::DEFAULT_CHARACTER), None),
+        progress: ProgressSeed { character: slot.unwrap_or(progress::DEFAULT_CHARACTER), stored: initial.as_ref().map(Progress::from_record),
+            inventory: initial.and_then(|record| record.inventory) },
         card,
     })
 }

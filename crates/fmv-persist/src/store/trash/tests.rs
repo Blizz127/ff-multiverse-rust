@@ -428,9 +428,10 @@ fn an_incomplete_committed_restore_blocks_play_until_progress_and_receipts_are_r
     store.commit_scene_progress_with_result("flower", b"buy-one", &before, &after).unwrap();
     let deleted = store.delete_account(original.account_id, NOW).unwrap();
     let next = store.writer().unwrap().next_account_id;
-    // Account/index creation can succeed, but its progression directory cannot be created.
+    // Fail only after the index commit: allocation cleanup must have finished before the
+    // obstruction appears, otherwise this would test an ordinary refused allocation.
     let obstruction = root.join(format!("progression/{next}"));
-    fs::write(&obstruction, b"not a directory").unwrap();
+    FAIL_RESTORE_PROGRESS.with(|flag| flag.set(true));
     let restored = store.restore_account(&deleted.entry, NOW + 5).unwrap();
     assert!(!restored.unfinished.is_empty(), "the admin retains its result and token");
     let account = restored.account_id;
@@ -458,6 +459,110 @@ fn an_incomplete_committed_restore_blocks_play_until_progress_and_receipts_are_r
     let mut expected_story = before.story;
     expected_story.account_id = account;
     assert!(recovered.scene_progress_applied("flower", &expected_story, b"buy-one").unwrap(), "the original receipt survives rekeying and recovery");
+}
+
+#[test]
+fn an_uncertain_restore_append_preserves_its_records_and_recovery_plan() {
+    let (_guard, root) = state_dir();
+    let store = Store::open(&root).unwrap();
+    let original = make(&store, "Aria", 1);
+    let before = store.get_progress_pair(original.account_id, GameId::Ff7).unwrap();
+    let mut after = before.clone();
+    after.story.blob = vec![1, 39, 0];
+    after.character.as_mut().unwrap().gil -= 1;
+    store.commit_scene_progress_with_result("flower", b"buy-one", &before, &after).unwrap();
+    let deleted = store.delete_account(original.account_id, NOW).unwrap();
+    let (next, next_avatar) = {
+        let counters = store.writer().unwrap();
+        (counters.next_account_id, counters.next_avatar_id)
+    };
+    // The account entry reaches disk, but the caller cannot know that its append committed.
+    // In-memory allocation counters have not advanced; cleanup or another allocation would
+    // destroy the records which replay is about to make live.
+    FAIL_RESTORE_APPEND.with(|flag| flag.set(true));
+    assert!(store.restore_account(&deleted.entry, NOW + 5).is_err());
+    let restoring = root.join("trash").join(format!("{}.restoring-{next}", deleted.entry));
+    let plan = read_manifest(&restoring).unwrap().restore.expect("the uncertain commit keeps its recovery plan");
+    assert_eq!((plan.account_id, plan.avatar_id), (next, Some(next_avatar)));
+    assert!(!root.join("trash").join(&deleted.entry).exists());
+    let account_path = root.join(format!("accounts/{next}.json"));
+    let avatar_path = root.join(format!("avatars/{next_avatar}.json"));
+    let character_path = root.join(format!("characters/{next}.json"));
+    let preserved: Vec<_> = [&account_path, &avatar_path, &character_path].into_iter()
+        .map(|path| (path.clone(), fs::read(path).expect("possibly committed records must not be removed"))).collect();
+    let frozen = files(&root);
+    assert!(matches!(store.create_account("Brom", NOW + 6), Err(PersistError::TransactionRecoveryRequired)));
+    assert!(matches!(store.restore_account(&deleted.entry, NOW + 6), Err(PersistError::TransactionRecoveryRequired)));
+    assert!(matches!(store.get_progress_pair(AccountId(next), GameId::Ff7), Err(PersistError::TransactionRecoveryRequired)));
+    assert!(matches!(store.snapshot(root.with_file_name("uncertain-snapshot")), Err(PersistError::TransactionRecoveryRequired)));
+    assert_eq!(files(&root), frozen, "refused operations must preserve all recovery evidence");
+    drop(store);
+
+    let recovered = Store::open(&root).unwrap();
+    let account = AccountId(next);
+    assert_eq!(recovered.find_account_by_name("Aria"), Some(account));
+    assert!(recovered.unclaimed_accounts().is_empty(), "the replayed restore is claimed");
+    for (path, bytes) in preserved { assert_eq!(fs::read(path).unwrap(), bytes); }
+    assert!(!restoring.exists());
+    assert!(root.join("trash").join(format!("{}.restored-{next}", deleted.entry)).is_dir());
+    let pair = recovered.get_progress_pair(account, GameId::Ff7).unwrap();
+    assert_eq!(pair.story.blob, after.story.blob);
+    assert_eq!(pair.character.as_ref().unwrap().gil, 54);
+    assert_eq!(pair.character.as_ref().unwrap().inventory, after.character.as_ref().unwrap().inventory);
+    let mut expected_story = before.story;
+    expected_story.account_id = account;
+    assert!(recovered.scene_progress_applied("flower", &expected_story, b"buy-one").unwrap());
+    let (other, _) = recovered.create_account("Brom", NOW + 7).unwrap();
+    assert!(other.0 > next, "the replayed committed id cannot be reused");
+}
+
+#[test]
+fn a_restore_rename_sync_failure_fences_allocation_until_rollback_finishes() {
+    let (_guard, root) = state_dir();
+    let store = Store::open(&root).unwrap();
+    let original = make(&store, "Aria", 1);
+    let deleted = store.delete_account(original.account_id, NOW).unwrap();
+    let next = store.writer().unwrap().next_account_id;
+    let deleted_path = root.join("trash").join(&deleted.entry);
+    let restoring = root.join("trash").join(format!("{}.restoring-{next}", deleted.entry));
+    // The directory rename happened; its durability acknowledgement failed before any
+    // account record or commit. The still-reserved id must not be reused in this process.
+    FAIL_RESTORE_RENAME.with(|flag| flag.set(true));
+    assert!(store.restore_account(&deleted.entry, NOW + 5).is_err());
+    assert_eq!(read_manifest(&restoring).unwrap().restore.unwrap().account_id, next);
+    assert!(!deleted_path.exists());
+    let frozen = files(&root);
+    assert!(matches!(store.create_account("Brom", NOW + 6), Err(PersistError::TransactionRecoveryRequired)));
+    assert!(matches!(store.restore_account(&deleted.entry, NOW + 6), Err(PersistError::TransactionRecoveryRequired)));
+    assert!(matches!(store.snapshot(root.with_file_name("rename-snapshot")), Err(PersistError::TransactionRecoveryRequired)));
+    assert_eq!(files(&root), frozen);
+    drop(store);
+
+    // Recovery must not admit another allocation while rollback still cannot return the
+    // entry to its deleted name, or a later recovery could erase the new account's files.
+    fs::create_dir(&deleted_path).unwrap();
+    fs::write(deleted_path.join("obstruction"), b"not empty").unwrap();
+    assert!(matches!(Store::open(&root), Err(PersistError::Corrupt { .. })));
+    assert_eq!(read_manifest(&restoring).unwrap().restore.unwrap().account_id, next,
+        "a failed rollback rename must keep its matching plan for the next recovery");
+    fs::remove_dir_all(&deleted_path).unwrap();
+    let recovered = Store::open(&root).unwrap();
+    assert!(!restoring.exists());
+    assert!(read_manifest(&deleted_path).unwrap().restore.is_none());
+    assert!(recovered.find_account_by_name("Aria").is_none());
+    let replacement = recovered.register("Brom", [4, 5, 6], "default", None, NOW + 7).unwrap();
+    assert_eq!(replacement.account_id, AccountId(next), "the settled, uncommitted id is safe to allocate again");
+    let replacement_files = files(&root);
+    drop(recovered);
+    let reopened = Store::open(&root).unwrap();
+    assert_eq!(reopened.authenticate(&replacement.token).unwrap(), replacement.account_id);
+    assert_eq!(reopened.avatar_for_account(replacement.account_id).unwrap(), Some(replacement.avatar));
+    // Authentication appends only the claim; all identity and progress files survive.
+    let mut after = files(&root);
+    let mut before = replacement_files;
+    after.remove("index.log");
+    before.remove("index.log");
+    assert_eq!(after, before);
 }
 
 #[test]

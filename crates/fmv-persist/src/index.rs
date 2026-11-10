@@ -638,14 +638,19 @@ impl LogWriter {
         self.poisoned = Some(detail);
     }
 
+    /// Check before preparing an account allocation: an uncertain prior append may have
+    /// committed the next id even though the in-memory counters have not advanced.
+    pub(crate) fn ensure_healthy(&self) -> Result<()> {
+        match &self.poisoned {
+            Some(detail) => Err(PersistError::IndexPoisoned { detail: detail.clone() }),
+            None => Ok(()),
+        }
+    }
+
     /// Append `op` and make it durable. On failure the file is rolled back to its previous
     /// length; if that fails too the writer refuses everything from then on.
     pub(crate) fn append(&mut self, op: &Op) -> Result<()> {
-        if let Some(detail) = &self.poisoned {
-            return Err(PersistError::IndexPoisoned {
-                detail: detail.clone(),
-            });
-        }
+        self.ensure_healthy()?;
         let line = encode_line(op, &self.path)?;
         let written = self
             .file

@@ -265,11 +265,12 @@ async fn refused_commands_say_why_and_cost_nothing() {
     assert_eq!(fought.outcome, Outcome::Victory);
     drop(a);
     server.shutdown().await;
-    // Nothing item-related was written: the record has no inventory at all (it is a record of numbers).
+    // Registration persisted the starting stock. Refused item commands leave all of it intact.
     let file = state.join("progression");
     let record = std::fs::read_dir(&file).unwrap().next().unwrap().unwrap().path().join("Fixture.character.json");
     let text = std::fs::read_to_string(&record).unwrap();
-    assert!(!text.contains("inventory"), "{text}");
+    let stored: fmv_persist::CharacterProgress = serde_json::from_str(&text).unwrap();
+    assert_eq!(stored.inventory, Some(rules.starting_inventory()));
 }
 
 /// The durability: use a Potion, stop the server gracefully, start another on the same state directory,

@@ -22,7 +22,7 @@ use fmv_core::GameId;
 use fmv_ff7_battle::rules::{BattleEvent, Command, Outcome};
 use fmv_persist::CharacterProgress;
 use fmv_protocol::{
-    ActionRef, ActorId, BattleMember, BattleReplay, BattleReward, BattleSetup, ClientMsg, PartyEvent, RejectCode, ServerMsg,
+    ActionRef, ActorId, BattleMember, BattleReplay, BattleReward, BattleRules, BattleSetup, ClientMsg, PartyEvent, RejectCode, ServerMsg,
     SyntheticRules, Target, PROTOCOL_VERSION,
 };
 use fmv_server::{BattleSettings, ServerConfig};
@@ -160,6 +160,81 @@ async fn a_player_is_told_where_its_character_stands_when_it_joins() {
     let quiet = b.client.drain_for(Duration::from_millis(400)).await;
     assert!(quiet.iter().all(|m| progress_of(m).is_none()), "the FIXTURE server has no characters: {quiet:?}");
     plain.shutdown().await;
+}
+
+/// Synthetic initialization with nonzero authored gil; battles and all other starting resources
+/// retain the fixture rules. This checks registration plumbing, not the amount in FF7's kernel.
+struct InitialResources(u32);
+
+impl BattleRules for InitialResources {
+    fn build(&self, setup: &BattleSetup) -> Result<fmv_ff7_battle::rules::BattleState, fmv_protocol::BattleBuildError> {
+        SyntheticRules::default().build(setup)
+    }
+    fn data_fingerprint(&self) -> fmv_core::Fingerprint { SyntheticRules::default().data_fingerprint() }
+    fn formation(&self, id: u16) -> Option<fmv_protocol::FormationInfo> { SyntheticRules::default().formation(id) }
+    fn starting_level(&self, character: u8) -> u8 { SyntheticRules::default().starting_level(character) }
+    fn default_formation(&self) -> Option<u16> { SyntheticRules::default().default_formation() }
+    fn exp_for_level(&self, character: u8, level: u8) -> Option<u32> { SyntheticRules::default().exp_for_level(character, level) }
+    fn starting_gil(&self) -> u32 { self.0 }
+    fn starting_inventory(&self) -> Vec<fmv_protocol::InventoryEntry> { SyntheticRules::default().starting_inventory() }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authored_starting_gil_is_saved_at_registration_and_never_recredited_to_existing_accounts() {
+    let dir = TempDir::new().unwrap();
+    let state = dir.path().join("server-state");
+    let old = {
+        let store = fmv_persist::Store::open(&state).unwrap();
+        store.register("Legacy start", [0; 3], "default", None, 1_000).unwrap()
+    };
+    let config = |gil| ServerConfig {
+        state_dir: Some(state.clone()),
+        battle: Some(BattleSettings::new(Arc::new(InitialResources(gil)))),
+        ..ServerConfig::default()
+    };
+    let server = TestServer::start(config(240)).await;
+    let mut new = join(server.addr, &uniq("NewStart")).await;
+    let new_account = new.account;
+    let new_token = new.token.clone();
+    let initial = next_progress(&mut new).await;
+    assert_eq!((initial.level, initial.exp, initial.gil), (5, 40, 240));
+    let stock = new.client.until("initial Inventory", |m| match m { ServerMsg::Inventory { items } => Some(items.clone()), _ => None }).await;
+    assert_eq!(stock, SyntheticRules::default().starting_inventory());
+
+    let mut legacy = join_with_token(server.addr, &old.token).await;
+    let initial_legacy = next_progress(&mut legacy).await;
+    assert_eq!((initial_legacy.level, initial_legacy.exp, initial_legacy.gil), (5, 40, 0), "missing legacy progress keeps its historical zero balance");
+    drop((new, legacy));
+    server.shutdown().await;
+
+    let new_file = state.join("progression").join(new_account.0.to_string()).join("Fixture.character.json");
+    let legacy_file = state.join("progression").join(old.account_id.0.to_string()).join("Fixture.character.json");
+    let legacy_bytes = std::fs::read(&legacy_file).unwrap();
+    {
+        let store = fmv_persist::Store::open(&state).unwrap();
+        let initial = store.get_character_progress(new_account, GameId::Fixture).unwrap().unwrap();
+        assert_eq!((initial.level, initial.exp, initial.gil, initial.inventory), (5, 40, 240, Some(stock)));
+        store.update_character_progress(new_account, GameId::Fixture, |record| {
+            let mut spent = record.unwrap();
+            spent.gil = 13;
+            spent.inventory = Some(vec![]);
+            spent
+        }).unwrap();
+    }
+    let spent_bytes = std::fs::read(&new_file).unwrap();
+
+    // New rules would award 480 to a new registration; neither prior account receives it.
+    let restarted = TestServer::start(config(480)).await;
+    let mut new = join_with_token(restarted.addr, &new_token).await;
+    assert_eq!(next_progress(&mut new).await.gil, 13);
+    let items = new.client.until("spent Inventory", |m| match m { ServerMsg::Inventory { items } => Some(items.clone()), _ => None }).await;
+    assert!(items.is_empty(), "empty inventory stays empty after restart");
+    let mut legacy = join_with_token(restarted.addr, &old.token).await;
+    assert_eq!(next_progress(&mut legacy).await.gil, 0);
+    drop((new, legacy));
+    restarted.shutdown().await;
+    assert_eq!(std::fs::read(new_file).unwrap(), spent_bytes, "login never rewrites earned resources");
+    assert_eq!(std::fs::read(legacy_file).unwrap(), legacy_bytes, "legacy defaults are inserted only once");
 }
 
 /// The whole chain on one connection: the second battle's `EncounterStart` carries the level the
@@ -301,7 +376,7 @@ async fn limit_then_run(j: &mut Joined, rules: &SyntheticRules) -> Ran {
 
 /// Protocol v7 over real sockets and a real store: a player whose blows filled its limit gauge gives the
 /// limit, gets blows again and runs away; the battle ends for it in `Escaped` with nothing paid, the gauge
-/// it ended with was saved (a record is made for the account, though it never won) and is the one its next
+/// it ended with was saved in its initial record, though it never won, and is the one its next
 /// battle starts with, also after the server restarted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_limit_and_an_escape_over_the_wire_and_the_gauge_it_ends_with_survives_a_restart() {
@@ -337,10 +412,12 @@ async fn a_limit_and_an_escape_over_the_wire_and_the_gauge_it_ends_with_survives
     drop(a);
     server.shutdown().await;
 
-    // The record was made by the gauge alone: a fresh character's numbers and the gauge.
+    // Registration stored the initial numbers and stock; the battle changes only the gauge.
     let file = state.join("progression").join(account.0.to_string()).join("Fixture.character.json");
     let text = std::fs::read_to_string(&file).unwrap_or_else(|e| panic!("{file:?}: {e}"));
-    assert!(text.contains(&format!("\"limit\": {}", ran.end_gauge)) && text.contains("\"exp\": 40") && !text.contains("inventory"), "{text}");
+    let record: CharacterProgress = serde_json::from_str(&text).unwrap();
+    assert_eq!((record.limit, record.exp, record.gil, record.ap), (ran.end_gauge, 40, 0, 0));
+    assert_eq!(record.inventory, Some(rules.starting_inventory()));
 
     // After a restart the gauge is what the player starts its next battle with, and nothing else changed.
     let restarted = TestServer::start(config(state)).await;
@@ -464,7 +541,7 @@ async fn every_member_of_a_party_is_paid_its_own_share_into_its_own_progress() {
     again.shutdown().await;
 }
 
-/// A defeat pays nothing and tells nobody anything: no message, nothing saved.
+/// A defeat pays nothing and tells nobody anything: no message or change to the durable starting record.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_defeat_pays_nothing_and_sends_no_progress() {
     let rules = SyntheticRules::default();
@@ -474,6 +551,8 @@ async fn a_defeat_pays_nothing_and_sends_no_progress() {
     let mut a = join(server.addr, &uniq("Df")).await;
     let account = a.account;
     let joined = next_progress(&mut a).await;
+    let file = state.join("progression").join(account.0.to_string()).join("Fixture.character.json");
+    let before = std::fs::read(&file).expect("registration durably initialized character progress");
     request(&mut a, 2).await; // one overwhelming enemy
     let lost = fight(&mut a, &rules).await;
     assert_eq!(lost.outcome, Outcome::Defeat);
@@ -482,10 +561,7 @@ async fn a_defeat_pays_nothing_and_sends_no_progress() {
     assert!(after.iter().all(|m| progress_of(m).is_none()), "no progress message after a defeat: {after:?}");
     drop(a);
     server.shutdown().await;
-    assert!(
-        !state.join("progression").join(account.0.to_string()).join("Fixture.character.json").exists(),
-        "nothing was earned, so nothing was written"
-    );
+    assert_eq!(std::fs::read(file).unwrap(), before, "nothing was earned, so the initial record stays byte-identical");
     assert_eq!(joined.exp, 40);
 }
 

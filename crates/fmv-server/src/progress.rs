@@ -41,9 +41,10 @@
 //!
 //! # Defaults
 //!
-//! An account with no stored record starts at its character's starting level and experience from the
-//! game's own data ([`BattleRules::starting_level`], [`BattleRules::starting_exp`]) with no AP and no
-//! gil. Nothing is written until the first payment, so there is nothing to migrate.
+//! A genuinely new character receives the game's starting level, experience and gil once, during
+//! atomic registration. An older account without a record keeps its historical starting level and
+//! experience with zero gil; login materializes that same balance before an economic scene can run.
+//! Existing records are never replaced by either initializer.
 
 use fmv_core::{GameId, InventoryEntry};
 use fmv_persist::CharacterProgress;
@@ -143,7 +144,7 @@ impl Progress {
 pub struct ProgressSeed {
     /// The character the account fights as: its player character's combat slot (see the module docs).
     pub character: u8,
-    /// The stored record, `None` if the account has never earned anything.
+    /// The stored record; `None` for tooling or a server without rules that has not initialized it.
     pub stored: Option<Progress>,
     /// The inventory the stored record holds. `None` is "never stored" (no record, or one of an older build
     /// that had no inventory): the player then starts with the game's starting stock (see
@@ -164,12 +165,18 @@ impl Default for ProgressSeed {
     }
 }
 
-/// A new account's progress as a `character`: its starting level and experience, nothing else.
+/// The historical fallback for an account without a record: starting level and experience, zero gil.
 pub fn fresh(rules: &dyn BattleRules, character: u8) -> Progress {
     let limits = rules.progress_limits();
     let level = rules.starting_level(character).clamp(1, limits.max_level);
     let exp = rules.starting_exp(character, level).min(limits.max_exp);
     Progress { character, level, exp, ap: 0, gil: 0, limit: 0 }
+}
+
+/// A genuinely new character's authored starting resources. Only registration uses this; an older
+/// account with a missing record must use [`fresh`] so an update never retroactively awards gil.
+pub fn new_character(rules: &dyn BattleRules, character: u8) -> Progress {
+    Progress { gil: rules.starting_gil(), ..fresh(rules, character) }
 }
 
 /// Bring a progress inside the game's caps. What is stored is not trusted to fit them: a hand-edited
