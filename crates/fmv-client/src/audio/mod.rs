@@ -1514,7 +1514,7 @@ mod tests {
         }
         assert_eq!(played(&rig), vec!["battle sound 18 (hit)"; 4]);
         assert_eq!(frames(&rig).map(|(_, next)| next), Some(4), "the first, the second, the third and the first again");
-        assert!(rig.audio.live.as_ref().unwrap().battle_variants.get(&5).is_none(), "an id with one clip has no turns");
+        assert!(!rig.audio.live.as_ref().unwrap().battle_variants.contains_key(&5), "an id with one clip has no turns");
     }
 
     #[test]
